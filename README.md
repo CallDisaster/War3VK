@@ -1,119 +1,95 @@
-# War3VK (Warcraft III 画面增强插件)
+# War3VK (Warcraft III Graphics Enhancement Plugin)
 
-**War3VK** 是一个面向玩家的图形增强插件：它在《魔兽争霸III》（经典客户端）中接管 Direct3D 9 的渲染路径，并使用 **Vulkan** 后端与自研画面管线，为游戏加入更现代的阴影与后处理效果。
+[![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)]()
+![Vulkan](https://img.shields.io/badge/Vulkan-Backend-red)
+
+[简体中文](README_CN.md)
+
+**War3VK** is a graphics enhancement plugin for **Warcraft III** (Classic Client). It hooks the Direct3D 9 rendering pipeline and utilizes a custom **Vulkan** backend to introduce modern visual features, including Cascaded Shadow Maps (CSM), Bloom, and advanced post-processing effects.
 
 > [!NOTE]
-> 本项目的目标是“更好看”，而不是“更快”。开启高画质效果后，显卡负载通常会更高，帧率不保证提升。
+> **Target:** Visual Fidelity > Performance.
+> Enabling high-quality effects will increase GPU load. This project aims to make the game look better, not run faster.
 
-## 1. 项目介绍
+## Features
 
-### 这是什么？能带来什么变化？
+- **Vulkan Backend**: Replaces the legacy D3D9 rendering path with a modern Vulkan backend via DXVK-based technology.
+- **Visual Enhancement**:
+  - **Advanced Shadows**: CSM (Cascaded Shadow Maps), PCF/Poisson Sampling.
+  - **Post-Processing**: Bloom, Tone Mapping, Exposure Control.
+  - **Anti-Aliasing**: FXAA, SMAA.
+- **In-Game Overlay**: Built-in **ImGui** panel for real-time configuration.
+- **Pure Visuals**: Does not modify game mechanics or map data.
 
-- **Vulkan 渲染后端**：将游戏的 D3D9 渲染转换为 Vulkan 后端（减少对旧式 D3D9 驱动路径的依赖）。
-- **画质增强**：提供可在游戏内调节的画质面板，支持**阴影质量**、**抗锯齿**、**Bloom**、**曝光**等调节。
-- **纯粹的视觉体验**：不改动玩法，不修改地图数据；主要作用在画面呈现与渲染效果。
+## Prerequisites
 
-## 2. 使用前准备
+### System & Drivers
+- **OS**: Windows 10 / 11 (Recommended).
+- **GPU Driver**: Must support **Vulkan 1.1+**. Please update to the latest drivers.
 
-### 2.1 系统与驱动
+### Game Version
+- **Target**: Warcraft III **1.27a**.
+  - *Note: Other versions may crash due to offset differences in `Game.dll`.*
 
-- **操作系统**：推荐 Windows 10/11。
-- **显卡驱动**：需支持 **Vulkan**（建议更新到官方最新驱动）。
-
-### 2.2 游戏版本
-
-- **面向**：Warcraft III 1.27a（其他版本可能因 `Game.dll` 差异而不兼容）。
-
-### 2.3 兼容性注意
-
+### Compatibility Warning
 > [!WARNING]
-> 游戏目录里如果已经存在其他第三方的 `d3d9.dll`（例如其他画面补丁/注入器/封装器），**需要先移走或二选一**，否则会冲突。
+> Please remove or rename any existing third-party `d3d9.dll` (e.g., other graphical patches or wrappers) in your game directory to avoid conflicts.
 
-## 3. 安装（快速开始）
+## Installation
 
-### 3.1 备份
+1. **Backup**: It is highly recommended to backup your game root directory (especially the original `d3d9.dll` if it exists).
+2. **Copy Files**: Extract the release package into your Warcraft III root directory (where `war3.exe` is located).
+   - `d3d9.dll` (Core Plugin)
+   - `shaderpacks/` (Optional: For post-processing shaders)
+3. **Verify**: Launch the game. A `d3d9.log` file should appear in the root directory. If the game starts and the log is generated, War3VK is loaded successfully.
 
-建议先备份一份游戏根目录（至少备份原有的 `d3d9.dll`、相关插件文件夹）。
+## Usage & Configuration
 
-### 3.2 复制文件
+### Toggle Menu
+Press **`Ctrl + F1`** to toggle the configuration overlay.
 
-将发行包内的文件复制到游戏根目录（通常是 `war3.exe` 所在文件夹）。
+### Key Settings
+- **Unlock FPS**: Uncaps the frame rate limit.
+- **Post-Processing**: Master switch for effects like Bloom and AA.
+- **Enable Shadows**: Master switch for the custom shadow engine.
+- **Shadow Quality**: Low / Medium / High / Ultra.
+- **Shadow Intensity**: Adjusts the darkness of shadows.
+- **Anti-Aliasing**: Off / FXAA / SMAA.
+- **Bloom**: Enables the glow effect.
+- **Exposure**: Adjusts global brightness/exposure.
 
-常见需要放在根目录的文件包括：
-- `d3d9.dll`（核心插件）
-- `shaderpacks/`（可选：用于后处理 ShaderPack）
-- 其他随发行包提供的依赖文件（如有）
+## Uninstallation
 
-### 3.3 启动验证
+Simply delete (or move) `d3d9.dll` from your game directory. You can also remove `d3d9.log` and the `shaderpacks/` folder.
 
-启动游戏后，根目录应生成日志文件：`d3d9.log`。
-若能进入游戏且日志正常生成，说明插件已被加载。
+## FAQ
 
-## 4. 游戏内设置与快捷键
+**Q: Game crashes on startup / Black screen?**
+A: Check if your GPU driver supports Vulkan. Ensure no other `d3d9.dll` exists in the folder. Check `d3d9.log` for error details.
 
-### 4.1 打开/隐藏画质面板
+**Q: Low FPS after installing?**
+A: This is expected on older hardware. Try lowering Shadow Quality, disabling Bloom, or reducing AA settings.
 
-按 **`Ctrl + F1`** 切换面板显示。
+**Q: Visual glitches (flickering shadows) on specific maps?**
+A: Some custom maps use unique rendering tricks. Try disabling shadows or post-processing for those specific maps. Please report the issue with your `d3d9.log`.
 
-### 4.2 常用选项说明
+**Q: Antivirus / Battle Platform interference?**
+A: Since this plugin uses DLL injection/hooking techniques, some platforms may flag it. Use it in a permitted environment.
 
-在“War3VK 画质设置”面板中，你可以进行这些常用操作：
+## Technical Overview
 
-- **突破帧率上限**：解除帧率锁定（不等于帧率一定更高；只是允许超过刷新率）。
-- **启用后处理**：总开关（Bloom / 抗锯齿等依赖它）。
-- **启用阴影**：总开关。
-- **阴影质量**：低 / 中 / 高 / 极致。
-- **阴影强度**：调节阴影深浅。
-- **抗锯齿类型**：关闭 / FXAA / SMAA（多档）。
-- **启用 Bloom**：开启泛光效果。
-- **曝光**：整体亮度/曝光调整。
+- **Backend**: D3D9 to Vulkan translation based on DXVK concepts.
+- **Hooking**: MinHook is used to intercept War3 rendering stages and state changes.
+- **Shadows**: Custom implementation of CSM with Poisson Disk Sampling.
+- **UI**: Integrated **Dear ImGui** for the overlay.
 
-## 5. ShaderPack（可选）
+## Disclaimer
 
-暂未开放
+War3VK is an unofficial third-party plugin. Use it at your own risk. Always backup your game and save files.
 
-## 6. 卸载
+## Acknowledgments
 
-1. 删除（或移走）游戏根目录中的 `d3d9.dll`。
-2. 同时可删除 `d3d9.log`、`shaderpacks/`（如果你不再需要）。
-
-恢复到原版渲染后，游戏将不再加载 War3VK。
-
-## 7. 常见问题（FAQ）
-
-### 7.1 启动黑屏/闪退
-- **原因**：多数与驱动/Vulkan 环境或与其他 `d3d9.dll` 冲突有关。
-- **解决**：尝试更新显卡驱动；确认目录内没有其他同名 DLL；查看 `d3d9.log` 末尾错误信息。
-
-### 7.2 进入游戏后很卡
-- **说明**：本项目以画面为主，不是性能优化插件。
-- **解决**：建议先降低阴影质量、关闭 Bloom、降低抗锯齿档位。
-
-### 7.3 个别地图/模型效果异常（闪烁、阴影抖动等）
-- **原因**：这类问题通常与地图的特殊渲染路径或极端镜头角度有关。
-- **解决**：先尝试关闭阴影或后处理；再把 `d3d9.log` 提供给项目维护者定位。
-
-### 7.4 平台/对战环境拦截第三方 DLL
-- **说明**：某些启动器/平台可能对注入类 DLL 较敏感。
-- **建议**：建议在你确认允许的环境中使用；如平台有明确限制，请遵守平台规则。
-
-## 8. 技术概览
-
-- **渲染后端**：基于 DXVK 的 D3D9 → Vulkan 路径。
-- **游戏侧接入**：通过 Hook 追踪并接管部分 War3 渲染阶段与状态流。
-- **阴影系统**：级联阴影（CSM）+ PCF/Poisson 采样等滤波策略。
-- **后处理**：FXAA / SMAA、Bloom、曝光控制等。
-- **UI**：内置 **Dear ImGui** 画质面板，支持在游戏内实时调参。
-- **日志**：默认输出 `d3d9.log` 便于排错。
-
-## 9. 免责声明
-
-War3VK 为非官方第三方插件，可能存在兼容性问题或未知风险。
-使用前请**备份游戏目录与存档**；由此产生的任何问题需自行承担。
-
-## 10. 致谢
-
-- DXVK
-- Dear ImGui
-- MinHook
-- MemHack
+- **DXVK**
+- **Dear ImGui**
+- **MinHook**
+- **MemHack**
