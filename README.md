@@ -11,46 +11,61 @@
 > **Target:** Visual Fidelity > Performance.
 > Enabling high-quality effects will increase GPU load. This project aims to make the game look better, not run faster.
 
-## Features
+## ⚠️ Target Audience & Limitations (MUST READ)
 
-- **Vulkan Backend**: Replaces the legacy D3D9 rendering path with a modern Vulkan backend via DXVK-based technology.
-- **Visual Enhancement**:
-  - **Advanced Shadows**: CSM (Cascaded Shadow Maps), PCF/Poisson Sampling.
-  - **Post-Processing**: Bloom, Tone Mapping, Exposure Control.
-  - **Anti-Aliasing**: FXAA, SMAA.
-- **In-Game Overlay**: Built-in **ImGui** panel for real-time configuration.
-- **Pure Visuals**: Does not modify game mechanics or map data.
+Please be aware of the following target audience mismatches and limitations before use:
 
-## Prerequisites
+- **Competitive Players (PVP)**: Competitive gameplay often requires maximum clarity. Visual effects like Soft Shadows and Bloom may distract from gameplay. It is recommended to disable these effects or the plugin entirely for competitive matches.
+- **Platform Compatibility**: Many third-party matchmaking platforms (e.g., Netease, W3Champions) may block or delete unauthorized DLLs (like `d3d9.dll`) upon startup. This plugin is primarily designed for **Local / LAN / Single Player** environments.
+- **Map Authors**: Due to the platform restrictions mentioned above, map authors cannot rely on this plugin to distribute custom visual effects, as client-side loading cannot be guaranteed.
 
-### System & Drivers
+## 1. Introduction
+
+### What is this? What does it change?
+
+- **Vulkan Backend**: Translates the legacy D3D9 rendering calls to Vulkan (reducing reliance on legacy drivers).
+- **Visual Enhancement**: Adds an in-game configuration panel for **Shadow Quality**, **Anti-Aliasing**, **Bloom**, **Exposure**, and more.
+- **Pure Visuals**: Does not modify game mechanics or map data; focuses solely on rendering presentation.
+
+## 2. Prerequisites
+
+### 2.1 System & Drivers
 - **OS**: Windows 10 / 11 (Recommended).
 - **GPU Driver**: Must support **Vulkan 1.1+**. Please update to the latest drivers.
 
-### Game Version
+### 2.2 Game Version
 - **Target**: Warcraft III **1.27a**.
-  - *Note: Other versions may crash due to offset differences in `Game.dll`.*
+  - *Note: Other versions may crash due to `Game.dll` offset differences.*
 
-### Compatibility Warning
+### 2.3 Compatibility Warning
 > [!WARNING]
 > Please remove or rename any existing third-party `d3d9.dll` (e.g., other graphical patches or wrappers) in your game directory to avoid conflicts.
 
-## Installation
+## 3. Installation
 
-1. **Backup**: It is highly recommended to backup your game root directory (especially the original `d3d9.dll` if it exists).
-2. **Copy Files**: Extract the release package into your Warcraft III root directory (where `war3.exe` is located).
-   - `d3d9.dll` (Core Plugin)
-   - `shaderpacks/` (Optional: For post-processing shaders)
-3. **Verify**: Launch the game. A `d3d9.log` file should appear in the root directory. If the game starts and the log is generated, War3VK is loaded successfully.
+### 3.1 Backup
+It is highly recommended to backup your game root directory (especially the original `d3d9.dll`).
 
-## Usage & Configuration
+### 3.2 Copy Files
+Extract the release package into your Warcraft III root directory (where `war3.exe` is located).
 
-### Toggle Menu
+Files usually include:
+- `d3d9.dll` (Core Plugin)
+- `shaderpacks/` (Optional: For post-processing shaders)
+
+### 3.3 Verify
+Launch the game. A `d3d9.log` file should appear in the root directory. If the game starts and the log is generated, War3VK is loaded successfully.
+
+## 4. In-Game Settings
+
+### 4.1 Toggle Menu
 Press **`Ctrl + F1`** to toggle the configuration overlay.
 
-### Key Settings
+### 4.2 Key Settings
+In the "War3VK Configuration" panel, you can adjust:
+
 - **Unlock FPS**: Uncaps the frame rate limit.
-- **Post-Processing**: Master switch for effects like Bloom and AA.
+- **Enable Post-Processing**: Master switch for effects like Bloom and AA.
 - **Enable Shadows**: Master switch for the custom shadow engine.
 - **Shadow Quality**: Low / Medium / High / Ultra.
 - **Shadow Intensity**: Adjusts the darkness of shadows.
@@ -58,37 +73,50 @@ Press **`Ctrl + F1`** to toggle the configuration overlay.
 - **Bloom**: Enables the glow effect.
 - **Exposure**: Adjusts global brightness/exposure.
 
-## Uninstallation
+## 5. ShaderPack (Optional)
+*Coming Soon (Not yet available)*
 
-Simply delete (or move) `d3d9.dll` from your game directory. You can also remove `d3d9.log` and the `shaderpacks/` folder.
+## 6. Uninstallation
+1. Delete (or move) `d3d9.dll` from your game directory.
+2. You can also remove `d3d9.log` and the `shaderpacks/` folder.
 
-## FAQ
+Once removed, the game will revert to its original rendering engine.
 
-**Q: Game crashes on startup / Black screen?**
-A: Check if your GPU driver supports Vulkan. Ensure no other `d3d9.dll` exists in the folder. Check `d3d9.log` for error details.
+## 7. FAQ
 
-**Q: Low FPS after installing?**
-A: This is expected on older hardware. Try lowering Shadow Quality, disabling Bloom, or reducing AA settings.
+### 7.1 Game crashes on startup / Black screen?
+- **Cause**: Usually related to incompatible GPU drivers, Vulkan environment issues, or conflicts with other `d3d9.dll` files.
+- **Solution**: Update GPU drivers; ensure no other DLLs conflict; check `d3d9.log` for errors.
 
-**Q: Visual glitches (flickering shadows) on specific maps?**
-A: Some custom maps use unique rendering tricks. Try disabling shadows or post-processing for those specific maps. Please report the issue with your `d3d9.log`.
+### 7.2 Low FPS after installing?
+- **Note**: This project focuses on visual quality, not performance optimization.
+- **Solution**: Lower Shadow Quality, disable Bloom, or reduce Anti-Aliasing settings.
 
-**Q: Antivirus / Battle Platform interference?**
-A: Since this plugin uses DLL injection/hooking techniques, some platforms may flag it. Use it in a permitted environment.
+### 7.3 Visual glitches (flickering) on specific maps?
+- **Cause**: Some maps use unique rendering techniques or extreme camera angles.
+- **Solution**: Try disabling Shadows or Post-Processing; submit your `d3d9.log` for analysis.
 
-## Technical Overview
+### 7.4 Antivirus / Platform interference?
+- **Note**: Since this plugin uses DLL injection, some platforms may flag it.
+- **Solution**: Use in a permitted environment (Local/LAN).
+
+## 8. Technical Overview
 
 - **Backend**: D3D9 to Vulkan translation based on DXVK concepts.
-- **Hooking**: MinHook is used to intercept War3 rendering stages and state changes.
-- **Shadows**: Custom implementation of CSM with Poisson Disk Sampling.
-- **UI**: Integrated **Dear ImGui** for the overlay.
+- **Hooking**: MinHook is used to intercept War3 rendering stages.
+- **Shadows**: 4-Level CSM + Poisson Disk Sampling + Temporal Accumulation.
+- **Post-Processing**: FXAA / SMAA, Bloom, Exposure Control.
+- **UI**: Integrated **Dear ImGui**.
 
-## Disclaimer
-
+## 9. Disclaimer
 War3VK is an unofficial third-party plugin. Use it at your own risk. Always backup your game and save files.
 
-## Acknowledgments
+## 10. Roadmap (Future Plans)
+- **Rendering Optimization**: Rewrite culling logic to migrate from CPU Culling to **GPU Culling**.
+- **Batching**: Refactor the rendering layer to support **Draw Call Batching**, leveraging Vulkan's efficiency.
+- **External Shaders**: The backend supports external shader packs (similar to Minecraft's Optifine/Iris). Documentation for community shaders will be released in the future.
 
+## 11. Acknowledgments
 - **DXVK**
 - **Dear ImGui**
 - **MinHook**
