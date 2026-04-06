@@ -1,0 +1,321 @@
+[DXVK_OutlineAddHandle]
+title = "添加描边对象"
+description = "添加描边对象句柄 ${handle}"
+comment = "jHandle 或对象 ID"
+category = TC_WARVK_OUTLINE
+[[.args]]
+type = integer
+
+[DXVK_OutlineRemoveHandle]
+title = "移除描边对象"
+description = "移除描边对象句柄 ${handle}"
+comment = "jHandle 或对象 ID"
+category = TC_WARVK_OUTLINE
+[[.args]]
+type = integer
+
+[DXVK_OutlineClearHandles]
+title = "清空描边列表"
+description = "清空描边句柄列表"
+comment = ""
+category = TC_WARVK_OUTLINE
+
+[DXVK_BloomAddHandle]
+title = "添加 Bloom 对象"
+description = "标记对象 Bloom 强度 ${handle}, ${boost}"
+comment = "boost > 0 生效"
+category = TC_WARVK_BLOOM
+[[.args]]
+type = integer
+[[.args]]
+type = real
+
+[DXVK_BloomRemoveHandle]
+title = "移除 Bloom 对象"
+description = "移除 Bloom 句柄 ${handle}"
+comment = ""
+category = TC_WARVK_BLOOM
+[[.args]]
+type = integer
+
+[DXVK_BloomClearHandles]
+title = "清空 Bloom 列表"
+description = "清空 Bloom 句柄列表"
+comment = ""
+category = TC_WARVK_BLOOM
+
+[DXVK_SetLightingEnabled]
+title = "启用太阳光照"
+description = "启用太阳光照 ${enabled}"
+comment = ""
+category = TC_WARVK_LIGHT
+[[.args]]
+type = boolean
+
+[DXVK_SetSunDirection]
+title = "设置太阳方向"
+description = "设置太阳方向 (${x}, ${y}, ${z})"
+comment = ""
+category = TC_WARVK_LIGHT
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[DXVK_SetSunColor]
+title = "设置太阳颜色"
+description = "设置太阳颜色 (${r}, ${g}, ${b})"
+comment = ""
+category = TC_WARVK_LIGHT
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[DXVK_SetSunIntensity]
+title = "设置太阳强度"
+description = "设置太阳强度 ${intensity}"
+comment = ""
+category = TC_WARVK_LIGHT
+[[.args]]
+type = real
+
+[DXVK_SetShadowEnabled]
+title = "启用光影"
+description = "启用光影 ${enabled}"
+comment = "包含阴影与光照合成"
+category = TC_WARVK_SHADOW
+[[.args]]
+type = boolean
+
+[DXVK_SetShadowStrength]
+title = "设置阴影强度"
+description = "设置阴影强度 ${strength}"
+comment = "0~1"
+category = TC_WARVK_SHADOW
+[[.args]]
+type = real
+
+[DXVK_SetShadowBias]
+title = "设置阴影偏移"
+description = "设置阴影偏移 ${bias}"
+comment = ""
+category = TC_WARVK_SHADOW
+[[.args]]
+type = real
+
+[DXVK_SetShadowPcfRadius]
+title = "设置 PCF 半径"
+description = "设置 PCF 采样半径 ${radius}"
+comment = ""
+category = TC_WARVK_SHADOW
+[[.args]]
+type = real
+
+[DXVK_SetShadowDebugMode]
+title = "设置阴影调试模式"
+description = "设置阴影调试模式 ${mode}"
+comment = ""
+category = TC_WARVK_DEBUG
+[[.args]]
+type = WARVK_SHADOW_DEBUG
+
+[DXVK_SetPointLightsEnabled]
+title = "启用点光源"
+description = "启用点光源 ${enabled}"
+comment = ""
+category = TC_WARVK_POINTLIGHT
+[[.args]]
+type = boolean
+
+[DXVK_SetPointShadowEnabled]
+title = "启用点光源阴影"
+description = "启用点光源阴影 ${enabled}"
+comment = ""
+category = TC_WARVK_POINTLIGHT
+[[.args]]
+type = boolean
+
+[DXVK_SetOutlineEnabled]
+title = "启用描边"
+description = "启用描边 ${enabled}"
+comment = ""
+category = TC_WARVK_OUTLINE
+[[.args]]
+type = boolean
+
+[DXVK_SetOutlineWidth]
+title = "设置描边宽度"
+description = "设置描边宽度 ${width}"
+comment = "单位像素"
+category = TC_WARVK_OUTLINE
+[[.args]]
+type = real
+
+[DXVK_SetOutlineColor]
+title = "设置描边颜色"
+description = "设置描边颜色 (${r}, ${g}, ${b}, ${a})"
+comment = ""
+category = TC_WARVK_OUTLINE
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[DXVK_SetOutlineMode]
+title = "设置描边模式"
+description = "设置描边模式 ${mode}"
+comment = "0=填充 1=轮廓"
+category = TC_WARVK_OUTLINE
+[[.args]]
+type = WARVK_OUTLINE_MODE
+
+[DXVK_SetOutlineVisibility]
+title = "设置描边可见性"
+description = "设置描边可见/遮挡 (${showVisible}, ${showOccluded})"
+comment = ""
+category = TC_WARVK_OUTLINE
+[[.args]]
+type = boolean
+[[.args]]
+type = boolean
+
+[DXVK_SetPostFxEnabled]
+title = "启用后处理"
+description = "启用后处理 ${enabled}"
+comment = ""
+category = TC_WARVK_POSTFX
+[[.args]]
+type = boolean
+
+[DXVK_SetExposure]
+title = "设置曝光"
+description = "设置曝光 ${exposure}"
+comment = ""
+category = TC_WARVK_POSTFX
+[[.args]]
+type = real
+
+[DXVK_SetBloomEnabled]
+title = "启用 Bloom"
+description = "启用 Bloom ${enabled}"
+comment = ""
+category = TC_WARVK_BLOOM
+[[.args]]
+type = boolean
+
+[DXVK_SetBloomParams]
+title = "设置 Bloom 参数"
+description = "设置 Bloom 参数 (${threshold}, ${softKnee}, ${intensity})"
+comment = ""
+category = TC_WARVK_BLOOM
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[DXVK_SetAcesEnabled]
+title = "启用 ACES"
+description = "启用 ACES ${enabled}"
+comment = ""
+category = TC_WARVK_POSTFX
+[[.args]]
+type = boolean
+
+[DXVK_SetSsaoEnabled]
+title = "启用 SSAO"
+description = "启用 SSAO ${enabled}"
+comment = ""
+category = TC_WARVK_SSAO
+[[.args]]
+type = boolean
+
+[DXVK_SetSsaoParams]
+title = "设置 SSAO 参数"
+description = "设置 SSAO 参数 (${radiusPx}, ${strength}, ${bias}, ${power})"
+comment = ""
+category = TC_WARVK_SSAO
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[DXVK_SetAaMode]
+title = "设置抗锯齿模式"
+description = "设置抗锯齿模式 ${mode}"
+comment = ""
+category = TC_WARVK_AA
+[[.args]]
+type = WARVK_AAMODE
+
+[DXVK_SetFxaaParams]
+title = "设置 FXAA 参数"
+description = "设置 FXAA 参数 (${subpix}, ${edgeThreshold}, ${edgeThresholdMin})"
+comment = ""
+category = TC_WARVK_AA
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[DXVK_SetSmaaParams]
+title = "设置 SMAA 参数"
+description = "设置 SMAA 参数 (${threshold}, ${search}, ${diagSearch})"
+comment = ""
+category = TC_WARVK_AA
+[[.args]]
+type = real
+[[.args]]
+type = integer
+[[.args]]
+type = integer
+
+[DXVK_SetDayNightEnabled]
+title = "启用日夜调节"
+description = "启用日夜调节 ${enabled}"
+comment = ""
+category = TC_WARVK_DAYNIGHT
+[[.args]]
+type = boolean
+
+[DXVK_SetDayNightMinFactor]
+title = "设置日夜最低亮度"
+description = "设置日夜最低亮度 ${minFactor}"
+comment = "0~1"
+category = TC_WARVK_DAYNIGHT
+[[.args]]
+type = real
+
+[DXVK_SetDayNightAmbient]
+title = "设置日夜环境光"
+description = "设置日夜环境光 (${dayR}, ${dayG}, ${dayB}, ${nightR}, ${nightG}, ${nightB})"
+comment = ""
+category = TC_WARVK_DAYNIGHT
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real

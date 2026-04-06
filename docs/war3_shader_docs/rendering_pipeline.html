@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>War3MapReforge 每帧渲染流程详解</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        :root {
+            --bg-1: #f7f2ea;
+            --bg-2: #e9e1d2;
+            --ink: #1f1b16;
+            --ink-soft: #4a4037;
+            --accent: #c2592a;
+            --accent-2: #116466;
+            --panel: rgba(255, 255, 255, 0.78);
+            --line: rgba(31, 27, 22, 0.12);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            color: var(--ink);
+            background:
+                radial-gradient(1200px 800px at 10% 0%, rgba(194, 89, 42, 0.12), transparent 60%),
+                radial-gradient(900px 700px at 90% 10%, rgba(17, 100, 102, 0.16), transparent 55%),
+                linear-gradient(180deg, var(--bg-1), var(--bg-2));
+            font-family: "Space Grotesk", "Noto Sans SC", sans-serif;
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            box-shadow: 0 12px 30px rgba(31, 27, 22, 0.08);
+            backdrop-filter: blur(10px);
+            margin-bottom: 24px;
+        }
+
+        header h1 {
+            font-size: 22px;
+            margin: 0;
+            font-family: "Noto Serif SC", "Source Serif 4", serif;
+        }
+
+        header a {
+            padding: 8px 16px;
+            border-radius: 10px;
+            background: var(--accent-2);
+            color: white;
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        .panel {
+            background: var(--panel);
+            border-radius: 22px;
+            border: 1px solid var(--line);
+            padding: 28px 30px;
+            box-shadow: 0 16px 32px rgba(31, 27, 22, 0.08);
+            backdrop-filter: blur(10px);
+            margin-bottom: 24px;
+        }
+
+        h2 {
+            margin-top: 0;
+            font-size: 24px;
+            font-family: "Noto Serif SC", "Source Serif 4", serif;
+            color: var(--accent);
+        }
+
+        h3 {
+            margin-top: 20px;
+            font-size: 18px;
+            color: var(--ink);
+        }
+
+        .mermaid {
+            background: rgba(255, 255, 255, 0.9);
+            padding: 20px;
+            border-radius: 14px;
+            border: 1px solid var(--line);
+            margin: 16px 0;
+            overflow-x: auto;
+        }
+
+        .note {
+            padding: 12px 14px;
+            border-left: 3px solid var(--accent);
+            background: rgba(194, 89, 42, 0.08);
+            border-radius: 10px;
+            margin: 16px 0;
+        }
+
+        .warn {
+            padding: 12px 14px;
+            border-left: 3px solid #d9534f;
+            background: rgba(217, 83, 79, 0.08);
+            border-radius: 10px;
+            margin: 16px 0;
+        }
+
+        .success {
+            padding: 12px 14px;
+            border-left: 3px solid #5cb85c;
+            background: rgba(92, 184, 92, 0.08);
+            border-radius: 10px;
+            margin: 16px 0;
+        }
+
+        .tag {
+            display: inline-flex;
+            padding: 4px 10px;
+            border-radius: 999px;
+            background: rgba(17, 100, 102, 0.12);
+            color: var(--accent-2);
+            font-size: 12px;
+            margin-right: 6px;
+        }
+
+        code {
+            font-family: "JetBrains Mono", "Fira Code", monospace;
+            font-size: 13px;
+            background: rgba(31, 27, 22, 0.06);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        pre {
+            background: #14110f;
+            color: #f7f2ea;
+            padding: 14px;
+            border-radius: 12px;
+            overflow-x: auto;
+            font-size: 13px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin: 16px 0;
+        }
+
+        .card {
+            border-radius: 14px;
+            border: 1px solid var(--line);
+            padding: 16px;
+            background: rgba(255, 255, 255, 0.65);
+        }
+
+        .card strong {
+            display: block;
+            margin-bottom: 8px;
+            color: var(--accent);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+        }
+
+        th,
+        td {
+            text-align: left;
+            padding: 10px;
+            border-bottom: 1px solid var(--line);
+            font-size: 14px;
+        }
+
+        th {
+            font-weight: 600;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>每帧渲染流程详解</h1>
+            <div>
+                <a href="architecture.html">架构图</a>
+                <a href="index.html" style="margin-left: 8px;">文档首页</a>
+            </div>
+        </header>
+
+        <!-- 最近修复 -->
+        <section class="panel">
+            <h2>最近修复 (2024-12-30)</h2>
+
+            <h3>1. Ring Buffer 竞争崩溃修复</h3>
+            <div class="success">
+                <strong>问题：</strong>在渲染世界对象（CUnit）时，<code>war3_shader_api.cpp</code> 中的
+                <code>std::vector::push_back</code> 触发 Access Violation (0xC0000005)。
+            </div>
+
+            <p><strong>根本原因：</strong></p>
+            <ul>
+                <li><code>std::vector</code> 的 <code>push_back</code> 可能触发内存重分配</li>
+                <li>重分配过程中，如果另一个线程通过 <code>GetDrawCalls</code> 读取同一个 buffer，会访问已释放的内存</li>
+                <li>原子索引只保护了"选哪个 buffer"，没有保护 buffer 内部的堆操作</li>
+            </ul>
+
+            <p><strong>解决方案：</strong>将 <code>std::vector</code> 替换为固定大小的 <code>std::array</code></p>
+            <pre>
+// 修改前
+std::vector&lt;DrawCall&gt; g_drawCallBuffers[kRingBufferSize];
+
+// 修改后
+struct DrawCallBuffer {
+    std::array&lt;DrawCall, kMaxDrawCallCount&gt; items;
+    uint32_t count = 0;
+};
+DrawCallBuffer g_drawCallBuffers[kRingBufferSize];
+</pre>
+        </section>
+
+        <!-- 当前限制 -->
+        <section class="panel">
+            <h2>当前限制</h2>
+
+            <table>
+                <tr>
+                    <th>限制项</th>
+                    <th>当前值</th>
+                    <th>说明</th>
+                </tr>
+                <tr>
+                    <td>最大 DrawCall 数量</td>
+                    <td><code>kMaxDrawCallCount = 8192</code></td>
+                    <td>每帧最多捕获 8192 个 shadowCaster，超出部分将被截断</td>
+                </tr>
+                <tr>
+                    <td>Ring Buffer 大小</td>
+                    <td><code>kRingBufferSize = 3</code></td>
+                    <td>三缓冲，隔离读写线程</td>
+                </tr>
+                <tr>
+                    <td>内存占用</td>
+                    <td>约 <code>sizeof(DrawCall) * 8192 * 3</code></td>
+                    <td>固定静态分配，不使用堆内存</td>
+                </tr>
+            </table>
+
+            <div class="note">
+                <strong>为什么选择固定数组？</strong>
+                固定大小数组完全避免了堆分配和扩容操作，从根本上消除了多线程竞争的风险。
+                对于 War3 这种场景复杂度有限的游戏，8192 条 DrawCall 上限已经足够。
+            </div>
+        </section>
+
+        <!-- 未来改进：三缓冲 + Fence 同步 -->
+        <section class="panel">
+            <h2>未来改进：三缓冲 + Fence 同步</h2>
+
+            <p>如果未来需要突破 8192 上限，可以恢复 <code>std::vector</code> 并实现完整的 CPU Fence 同步：</p>
+
+            <div class="mermaid">
+                sequenceDiagram
+                participant Writer as CS Thread (写)
+                participant Buffer as DrawCallBuffer
+                participant Reader as GetDrawCalls (读)
+
+                Writer->>Buffer: ready.store(false)
+                Writer->>Buffer: items.clear()
+                Writer->>Buffer: push_back(...)
+                Writer->>Buffer: ready.store(true, release)
+                Writer->>Buffer: g_readIndex.store(writeIdx)
+
+                Reader->>Buffer: g_readIndex.load(acquire)
+                Reader->>Buffer: while (!ready.load()) yield
+                Reader->>Buffer: return items.data()
+            </div>
+
+            <h3>实现要点</h3>
+            <pre>
+struct DrawCallBuffer {
+    std::vector&lt;DrawCall&gt; items;
+    std::atomic&lt;bool&gt; ready{ false };  // CPU Fence 标记
+};
+
+// 写入侧
+buf.ready.store(false);  // 开始写，标记未就绪
+buf.items.clear();
+// ... 填充数据 ...
+buf.ready.store(true, std::memory_order_release);  // 写完了
+
+// 读取侧
+while (!buf.ready.load(std::memory_order_acquire)) {
+    std::this_thread::yield();  // 等待写完
+}
+return buf.items.data();
+</pre>
+
+            <div class="warn">
+                <strong>注意：</strong>此方案要求所有读者遵守"不跨帧持有指针"的契约。
+                如果外部模块将 <code>GetDrawCalls</code> 返回的指针缓存到下一帧使用，仍然会导致崩溃。
+            </div>
+        </section>
+
+        <!-- 概述 -->
+        <section class="panel">
+            <h2>概述：两条线程的故事</h2>
+            <p>War3MapReforge 的渲染架构基于 <strong>DXVK 的双线程模型</strong>：</p>
+            <div class="grid">
+                <div class="card">
+                    <strong>App Thread (应用线程)</strong>
+                    <div>运行游戏主逻辑、处理 D3D9 API 调用、<strong>捕获</strong>渲染状态和 DrawCall 数据。</div>
+                </div>
+                <div class="card">
+                    <strong>CS Thread (Command Stream 线程)</strong>
+                    <div>异步执行实际的 Vulkan 渲染命令、<strong>重放</strong>被捕获的 DrawCall、执行阴影/描边/后处理。</div>
+                </div>
+            </div>
+            <div class="note">
+                <strong>关键概念：</strong>App Thread 负责"记录"，CS Thread 负责"执行"。两者通过 <code>EmitCs()</code>
+                传递 Lambda 闭包进行通信。这种设计让游戏主线程不会被 GPU 阻塞。
+            </div>
+        </section>
+
+        <!-- 帧生命周期 -->
+        <section class="panel">
+            <h2>一帧的完整生命周期</h2>
+            <p>从游戏调用 <code>BeginScene()</code> 到 <code>Present()</code>，一帧经历以下阶段：</p>
+
+            <div class="mermaid">
+                sequenceDiagram
+                participant Game as War3.exe (游戏)
+                participant App as App Thread
+                participant CS as CS Thread
+                participant VK as Vulkan GPU
+
+                rect rgb(255, 245, 230)
+                Note over Game,App: 阶段 1: 帧开始
+                Game->>App: IDirect3DDevice9::BeginScene()
+                App->>App: war3shader::internal::BeginFrame()
+                App->>App: 重置帧状态 (m_war3FrameIndex++)
+                end
+
+                rect rgb(230, 255, 230)
+                Note over Game,CS: 阶段 2: 场景捕获 (App Thread)
+                Game->>App: DrawPrimitive() / DrawIndexedPrimitive()
+                App->>App: War3TryCaptureShadowCaster()
+                Note right of App: 收集 VB/IB/纹理/矩阵<br />存入 m_war3Scene.shadowCasters
+                App->>App: 识别渲染阶段 (Terrain/Unit/UI)
+                end
+
+                rect rgb(230, 240, 255)
+                Note over App,CS: 阶段 3: BeforeUI 边界触发
+                App->>App: 检测到 UI 渲染开始
+                App->>App: 打包 War3PipelineInput
+                App->>CS: EmitCs([input] { Pipeline->Execute() })
+                Note right of CS: 异步执行开始
+                end
+
+                rect rgb(255, 230, 230)
+                Note over CS,VK: 阶段 4: CS Thread 执行管线
+                CS->>CS: UpdateRenderContext(input)
+                Note right of CS: 填充 g_drawCallBuffers<br />填充 g_pointLightBuffers
+                CS->>CS: War3Pipeline::Execute()
+                CS->>CS: ShadowCasterPass::Run()
+                CS->>CS: ShadowReceiverPass::Run()
+                CS->>VK: vkCmdDraw...
+                end
+
+                rect rgb(255, 255, 220)
+                Note over Game,VK: 阶段 5: UI 渲染 & Present
+                Game->>App: UI DrawCalls
+                App->>CS: EmitCs(ImGui渲染)
+                Game->>App: IDirect3DDevice9::Present()
+                App->>CS: EmitCs(Swapchain Present)
+                CS->>VK: vkQueuePresent()
+                end
+            </div>
+        </section>
+
+        <!-- Ring Buffer 机制 -->
+        <section class="panel">
+            <h2>Ring Buffer 同步机制</h2>
+            <p>为解决读写竞争，使用三缓冲环形队列（固定大小数组）：</p>
+
+            <div class="mermaid">
+                graph LR
+                subgraph RingBuffer["g_drawCallBuffers[3]"]
+                B0["Buffer 0<br />帧 N-2 数据"]
+                B1["Buffer 1<br />帧 N-1 数据 (可读)"]
+                B2["Buffer 2<br />帧 N 数据 (写入中)"]
+                end
+
+                subgraph Writer["CS Thread (写)"]
+                W1[UpdateRenderContext]
+                end
+
+                subgraph Reader["API (读)"]
+                R1[GetDrawCalls]
+                end
+
+                W1 -->|"frameIndex % 3 = 2"| B2
+                R1 -->|"atomic load = 1"| B1
+
+                style B1 fill:#90EE90
+                style B2 fill:#FFB6C1
+            </div>
+
+            <h3>同步规则</h3>
+            <table>
+                <tr>
+                    <th>操作</th>
+                    <th>变量</th>
+                    <th>语义</th>
+                </tr>
+                <tr>
+                    <td>写入</td>
+                    <td><code>ringIndex = input.frameIndex % 3</code></td>
+                    <td>CS Thread 在 UpdateRenderContext 中写入固定数组</td>
+                </tr>
+                <tr>
+                    <td>发布</td>
+                    <td><code>g_ringBufferIndex.store(ringIndex, release)</code></td>
+                    <td>写完后发布索引给读者</td>
+                </tr>
+                <tr>
+                    <td>读取</td>
+                    <td><code>g_ringBufferIndex.load(acquire)</code></td>
+                    <td>GetDrawCalls 读取最新发布的索引</td>
+                </tr>
+            </table>
+        </section>
+
+        <!-- 关键函数调用链 -->
+        <section class="panel">
+            <h2>关键函数调用链</h2>
+
+            <h3>1. 帧开始阶段</h3>
+            <pre>
+D3D9DeviceEx::BeginScene()
+  |-- war3shader::internal::BeginFrame()
+        |-- g_currentContext.frameIndex++
+        |-- 重置帧时间计数器
+        |-- 清空 context 状态
+</pre>
+
+            <h3>2. DrawCall 捕获阶段</h3>
+            <pre>
+D3D9DeviceEx::DrawPrimitive() / DrawIndexedPrimitive()
+  |-- War3PreDraw()
+        |-- War3TryCaptureShadowCaster()
+              |-- 识别渲染层 (Terrain/WorldObject/UI)
+              |-- 复制 VB/IB Slice 信息
+              |-- 保存 World Matrix
+              |-- 捕获纹理引用
+              |-- push_back 到 m_war3Scene.shadowCasters[]
+</pre>
+
+            <h3>3. BeforeUI 边界 (关键触发点)</h3>
+            <pre>
+D3D9DeviceEx::War3InsertUiPass()  // 当检测到从World切换到UI层
+  |-- 构建 War3PipelineInput
+        |-- input.scene = std::move(m_war3Scene)  // move语义，零拷贝
+        |-- input.colorView = 当前RT
+        |-- input.depthView = 当前深度
+        |-- input.frameIndex = m_war3FrameIndex
+  |-- EmitCs([input] { m_war3Pipeline->Execute(BeforeUi, cmd, input); })
+</pre>
+
+            <h3>4. CS Thread 管线执行</h3>
+            <pre>
+[CS Thread] War3Pipeline::Execute(BeforeUi, cmd, input)
+  |-- war3shader::internal::UpdateRenderContext(input)
+        |-- 填充相机数据 (View/Proj/InvViewProj)
+        |-- 填充光源数据 (Sun + PointLights)
+        |-- 遍历 input.scene.shadowCasters
+        |     |-- 转换为 DrawCall 结构
+        |     |-- 写入 g_drawCallBuffers[ringIndex].items[count++]
+        |-- g_ringBufferIndex.store(ringIndex)  // 发布给读者
+  
+  |-- ShadowCasterPass::Run(cmd, input)
+        |-- 渲染到 CSM 阴影贴图
+  
+  |-- ShadowReceiverPass::Run(cmd, input)
+        |-- 应用阴影到场景
+</pre>
+        </section>
+
+        <!-- 数据流图 -->
+        <section class="panel">
+            <h2>数据流向图</h2>
+            <div class="mermaid">
+                flowchart TB
+                subgraph AppThread["App Thread (捕获)"]
+                A1[DrawPrimitive 调用]
+                A2[War3TryCaptureShadowCaster]
+                A3["m_war3Scene.shadowCasters<br />(std::vector)"]
+                A4[War3PipelineInput]
+                end
+
+                subgraph Transfer["跨线程传递"]
+                B1["EmitCs(lambda)"]
+                B2["std::move(scene)"]
+                end
+
+                subgraph CSThread["CS Thread (执行)"]
+                C1[UpdateRenderContext]
+                C2["g_drawCallBuffers<br />(固定大小数组)"]
+                C3[War3Pipeline::Execute]
+                C4[ShadowCasterPass]
+                C5[ShadowReceiverPass]
+                end
+
+                subgraph External["外部 API"]
+                D1[GetDrawCalls]
+                D2[GetPointLights]
+                D3[DispatchRenderEvent]
+                end
+
+                A1 --> A2
+                A2 --> A3
+                A3 --> A4
+                A4 --> B1
+                B1 --> B2
+                B2 --> C1
+                C1 --> C2
+                C1 --> C3
+                C3 --> C4
+                C3 --> C5
+                C2 -.->|atomic load| D1
+                C1 -.-> D2
+                C3 -.-> D3
+
+                style B1 fill:#f9f,stroke:#333
+                style B2 fill:#f9f,stroke:#333
+            </div>
+
+            <div class="warn">
+                <strong>崩溃风险点：</strong>粉色节点 (<code>EmitCs</code> / <code>std::move</code>) 是跨线程边界。
+                当前使用固定大小数组已消除 buffer 内部的竞争风险。
+            </div>
+        </section>
+
+        <!-- 渲染阶段识别 -->
+        <section class="panel">
+            <h2>渲染阶段识别</h2>
+            <p>系统通过 TLS 标记和 Stage 编号识别当前渲染的内容类型：</p>
+
+            <div class="grid">
+                <div class="card">
+                    <strong>Terrain (地形)</strong>
+                    <div>Stage 9-10, 包含地面、水面、阴影贴花</div>
+                </div>
+                <div class="card">
+                    <strong>WorldObject (世界对象)</strong>
+                    <div>Stage 11-13, 单位、建筑、可破坏物</div>
+                </div>
+                <div class="card">
+                    <strong>UI (界面)</strong>
+                    <div>Layer == UI, 所有 2D 界面元素</div>
+                </div>
+                <div class="card">
+                    <strong>Skybox (天空盒)</strong>
+                    <div>特殊标记, 不参与阴影捕获</div>
+                </div>
+            </div>
+
+            <pre>
+// War3TryCaptureShadowCaster 中的识别逻辑
+const auto layer = War3RenderState::CurrentLayer();
+if (layer == War3RenderLayer::UI) return;  // 跳过 UI
+
+const bool terrainCaster = (stage == 9 || stage == 10);
+const bool objectCaster  = (cat == WorldObject) && (stage == 11 || 12 || 13);
+
+if (!terrainCaster && !objectCaster) return;  // 只捕获有效 caster
+</pre>
+        </section>
+
+        <!-- 调试环境变量 -->
+        <section class="panel">
+            <h2>调试环境变量</h2>
+            <table>
+                <tr>
+                    <th>变量</th>
+                    <th>作用</th>
+                </tr>
+                <tr>
+                    <td><code>DXVK_WAR3_DISABLE_SHADOW_CAPTURE</code></td>
+                    <td>禁用 shadowCaster 捕获</td>
+                </tr>
+                <tr>
+                    <td><code>DXVK_WAR3_SHADOW_FREEZE_DYNAMIC</code></td>
+                    <td>启用动态 VB 冻结复制</td>
+                </tr>
+                <tr>
+                    <td><code>DXVK_WAR3_DISABLE_SHADOWS</code></td>
+                    <td>禁用整个阴影 Pass</td>
+                </tr>
+                <tr>
+                    <td><code>DXVK_LOG_LEVEL=debug</code></td>
+                    <td>启用详细日志</td>
+                </tr>
+            </table>
+        </section>
+
+    </div>
+
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'neutral',
+            flowchart: { useMaxWidth: true },
+            sequence: { useMaxWidth: true }
+        });
+    </script>
+</body>
+
+</html>

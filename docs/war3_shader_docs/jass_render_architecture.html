@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>War3 JASS VM 与渲染架构说明</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg-1: #f6f1e8;
+      --bg-2: #e8dfd1;
+      --ink: #1f1b17;
+      --ink-soft: #4e453b;
+      --accent: #c15c31;
+      --accent-2: #0f6968;
+      --line: rgba(31, 27, 23, 0.14);
+      --panel: rgba(255, 255, 255, 0.8);
+      --ok: #1a7f48;
+      --warn: #9a6515;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 760px at 12% 0%, rgba(193, 92, 49, 0.13), transparent 62%),
+        radial-gradient(900px 680px at 88% 10%, rgba(15, 105, 104, 0.16), transparent 58%),
+        linear-gradient(180deg, var(--bg-1), var(--bg-2));
+      font-family: "Space Grotesk", "Noto Sans SC", sans-serif;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    .container {
+      max-width: 1380px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 20px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+      box-shadow: 0 12px 30px rgba(31, 27, 23, 0.08);
+      backdrop-filter: blur(10px);
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      font-family: "Noto Serif SC", "Source Serif 4", serif;
+      letter-spacing: 0.02em;
+    }
+
+    .meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .badge {
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.72);
+      font-size: 12px;
+      color: var(--ink-soft);
+    }
+
+    .badge.link {
+      color: var(--ink);
+      text-decoration: none;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: 0 14px 32px rgba(31, 27, 23, 0.08);
+      backdrop-filter: blur(10px);
+      padding: 24px 26px;
+      margin-bottom: 18px;
+    }
+
+    h2 {
+      margin: 0 0 10px;
+      font-size: 23px;
+      font-family: "Noto Serif SC", "Source Serif 4", serif;
+      color: var(--accent);
+    }
+
+    h3 {
+      margin: 18px 0 10px;
+      font-size: 17px;
+    }
+
+    p,
+    li {
+      color: var(--ink-soft);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+      margin: 12px 0;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: rgba(255, 255, 255, 0.68);
+    }
+
+    .card strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--ink);
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      background: rgba(255, 255, 255, 0.62);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .table th,
+    .table td {
+      text-align: left;
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      font-size: 13px;
+    }
+
+    .table th {
+      background: rgba(15, 105, 104, 0.10);
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    .status {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .status.ok {
+      color: var(--ok);
+      border-color: rgba(26, 127, 72, 0.26);
+      background: rgba(26, 127, 72, 0.12);
+    }
+
+    .status.warn {
+      color: var(--warn);
+      border-color: rgba(154, 101, 21, 0.26);
+      background: rgba(154, 101, 21, 0.12);
+    }
+
+    .note {
+      border-left: 3px solid var(--accent);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: rgba(193, 92, 49, 0.1);
+      margin: 12px 0;
+      font-size: 13px;
+      color: var(--ink);
+    }
+
+    .mermaid {
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+    }
+
+    code,
+    pre {
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      font-size: 12px;
+    }
+
+    pre {
+      margin: 12px 0;
+      padding: 12px;
+      border-radius: 10px;
+      background: #16130f;
+      color: #f6f1e8;
+      overflow: auto;
+    }
+
+    @media (max-width: 860px) {
+      .container {
+        padding: 16px;
+      }
+
+      .panel {
+        padding: 18px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <header>
+      <h1>War3 JASS VM 与渲染架构说明</h1>
+      <div class="meta">
+        <span class="badge">更新时间：2026-02-22</span>
+        <span class="badge">范围：留言1 ~ 留言4 汇总</span>
+        <a class="badge link" href="index.html">文档首页</a>
+        <a class="badge link" href="refactor_status.html">重构看板</a>
+      </div>
+    </header>
+
+    <section class="panel">
+      <h2>留言任务阶段汇总</h2>
+      <p>本节汇总本阶段“JASS 研究 + 渲染合批 + 阴影链路 + 诊断补强”的实际落地，便于后续继续迭代。</p>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>留言</th>
+            <th>目标</th>
+            <th>实际落地</th>
+            <th>状态</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>留言1</td>
+            <td>评估逻辑层（JASS VM）性能优化空间</td>
+            <td>新增 <code>ExecuteFunctionInternal/MainLoop</code> Hook 统计与预算实验，形成 timeout/paused/错误码分布观察链路。</td>
+            <td><span class="status ok">已落地</span></td>
+          </tr>
+          <tr>
+            <td>留言2</td>
+            <td>以“合并批次提交”为主，先做可生效局部优化</td>
+            <td>Dispatch 局部复用 Begin/End（Local Merge）已接入 Common/Special；帧尾收口防跨帧污染。</td>
+            <td><span class="status ok">已落地</span></td>
+          </tr>
+          <tr>
+            <td>留言3</td>
+            <td>除合批外评估渲染层优化路线并推进</td>
+            <td>新增 Dispatch Tag/Stage 线程本地缓存（本轮实现），减少热路径重复 <code>GetTagStage</code> 哈希探测。</td>
+            <td><span class="status ok">已落地</span></td>
+          </tr>
+          <tr>
+            <td>留言4</td>
+            <td>收敛“静态建筑/可破坏物阴影”上游入口并实现拦截</td>
+            <td>通过 IDA 确认 <code>TerrainShadow_RegisterImageEntry(0x713250)</code> 为核心注册入口，并新增来源拦截（StaticStamp/Emitter）。</td>
+            <td><span class="status ok">已落地</span></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="note">结论：当前优先级仍是“先压缩 DXVK 可控热路径成本，再决定是否进入 War3 主循环级 Patch”。</div>
+      <div class="note">
+        研究文档入口：
+        <a class="badge link" href="../research/war3_render_issues/README.md">统一研究目录</a>
+        <a class="badge link" href="../research/war3_render_issues/06_message_1_4_archive/README.md">留言1~4归档</a>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>留言4：静态阴影研究闭环</h2>
+      <p>本节用于固化“静态阴影”研究结论，避免后续又回到末端 ListA/ListB 粗拦截路线。</p>
+
+      <div class="mermaid">
+        flowchart LR
+          A[ToggleStaticStampFromObject 0x74DB30] --> C[RegisterImageEntry 0x713250]
+          B[ToggleEmitterStamp 0x74DF50] --> C
+          C --> D[ListB Entry 注册]
+          D --> E[TerrainShadow_RenderListB]
+          F[Projector_Add_FromObject/Simple] --> D
+      </div>
+
+      <table class="table">
+        <thead>
+          <tr>
+            <th>问题</th>
+            <th>过去做法</th>
+            <th>本轮做法</th>
+            <th>结论</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>静态阴影与项目阴影叠加</td>
+            <td>在 <code>ListA/ListB</code> 末端按 type 粗拦截</td>
+            <td>在 <code>RegisterImageEntry</code> 上游按来源函数拦截注册</td>
+            <td>上游拦截更精准，误伤雾/边界概率更低</td>
+          </tr>
+          <tr>
+            <td>stage14 直调链路绕过 RenderLayer</td>
+            <td>仅改 <code>RenderLayer(a3)</code></td>
+            <td>保留 ListB 兜底，同时前移到注册入口阻断</td>
+            <td>覆盖面更完整</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="note">关键实现点：新增 <code>Hook_TerrainShadow_RegisterImageEntry</code>，并通过返回地址识别 <code>0x74DB30/0x74DF50</code> 来源。</div>
+    </section>
+
+    <section class="panel">
+      <h2>JASS 虚拟机工作原理</h2>
+      <div class="grid">
+        <div class="card">
+          <strong>入口</strong>
+          <div>游戏入口初始化后，脚本执行通过 <code>ExecuteJassFunction</code> 进入解释器域。</div>
+        </div>
+        <div class="card">
+          <strong>执行核心</strong>
+          <div><code>ExecuteJassFunctionInternal</code> 负责预算切片（opBudget）和上下文准备。</div>
+        </div>
+        <div class="card">
+          <strong>主循环</strong>
+          <div><code>JassInterpreter_MainLoop</code> 迭代字节码，返回 completed/timeout/paused 等状态。</div>
+        </div>
+        <div class="card">
+          <strong>DXVK 接入点</strong>
+          <div>我们只做“观测 + 预算调优 + Native 扩展”，保持原执行语义不被破坏。</div>
+        </div>
+      </div>
+
+      <div class="mermaid">
+        flowchart TD
+          A[GameMain / GameApplication_Init] --> B[InitJassNatives]
+          B --> C[ExecuteJassFunction]
+          C --> D[ExecuteJassFunctionInternal]
+          D --> E[JassInterpreter_MainLoop]
+          E --> F{返回码}
+          F -->|1| G[completed]
+          F -->|2| H[timeout]
+          F -->|4| I[paused]
+          F -->|3/6/7| J[native/stack/arith error]
+          H --> K[下帧继续调度]
+          I --> K
+      </div>
+
+      <h3>JASS VM 实际结构（1.27a AddressBook）</h3>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>函数/节点</th>
+            <th>RVA</th>
+            <th>当前用途</th>
+            <th>落点文件</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>executeJassFunction</code></td>
+            <td><code>0x1BFAC0</code></td>
+            <td>JASS 调用入口追踪（首调用与 CPU scope）</td>
+            <td><code>src/d3d9/war3/hooks/war3_hook_jass.cpp</code></td>
+          </tr>
+          <tr>
+            <td><code>executeJassFunctionInternal</code></td>
+            <td><code>0x7F2D92</code></td>
+            <td>预算策略切入（override/adaptive）</td>
+            <td><code>src/d3d9/war3/hooks/war3_hook_jass.cpp</code></td>
+          </tr>
+          <tr>
+            <td><code>jassInterpreterMainLoop</code></td>
+            <td><code>0x7F1A20</code></td>
+            <td>返回码统计、timeout 监控、预算闭环</td>
+            <td><code>src/d3d9/war3/hooks/war3_hook_jass.cpp</code></td>
+          </tr>
+          <tr>
+            <td><code>initJassNatives</code></td>
+            <td><code>0x1E9A50</code></td>
+            <td>注册 DXVK 内置 Native 与桥接接口</td>
+            <td><code>src/d3d9/war3/hooks/war3_hook_jass.cpp</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>渲染层工作原理与实际结构</h2>
+      <p>当前渲染链路采用“Hook Frontend + Bridge + Pass Pipeline + DXVK Backend”结构：保持原版提交路径，同时在关键节点插入可控扩展。</p>
+
+      <div class="mermaid">
+        flowchart LR
+          A[WorldDispatch / RenderGroup] --> B[RenderQueueTracker]
+          B --> C[Dispatch_Common / Dispatch_Special]
+          C --> D[ExecBatchProcessor Begin/End]
+          D --> E[War3Pipeline]
+          E --> E1[ShadowReceiver]
+          E --> E2[Outline]
+          E --> E3[SSAO/AA/ShaderPack]
+          E1 --> F[DXVK Backend Submit]
+          E2 --> F
+          E3 --> F
+      </div>
+
+      <h3>模块映射（行业结构对应）</h3>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>行业模块</th>
+            <th>当前工程落点</th>
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Runtime / Bootstrap</td>
+            <td><code>d3d9_war3_hook.cpp</code> + <code>war3_hook_lifecycle.cpp</code></td>
+            <td>初始化时序、Hook 安装、帧生命周期入口。</td>
+          </tr>
+          <tr>
+            <td>Render Frontend</td>
+            <td><code>war3_hook_render.cpp</code> + <code>war3_scene_collector.cpp</code></td>
+            <td>对象分组、标签阶段识别、桥接上下文构建。</td>
+          </tr>
+          <tr>
+            <td>Bridge / Data Plane</td>
+            <td><code>war3_render_queue_tracker.cpp</code> + <code>war3_render_exec_batch.cpp</code></td>
+            <td>SceneNode/jHandle/rawcode 关联与热路径缓存。</td>
+          </tr>
+          <tr>
+            <td>Feature Modules</td>
+            <td><code>d3d9_war3_shadow*.cpp</code> + <code>war3_hook_shadow.cpp</code></td>
+            <td>阴影、描边、LOSBlocker 过滤策略。</td>
+          </tr>
+          <tr>
+            <td>Diagnostics</td>
+            <td><code>war3_perf_monitor.cpp</code> + 诊断日志</td>
+            <td>CPU/GPU 分段耗时、覆盖率、追踪回归。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>我们如何修改渲染层（本阶段）</h3>
+      <div class="grid">
+        <div class="card">
+          <strong>1. Hook 域解耦</strong>
+          <div>按生命周期/JASS/UI/Render/Shadow 分域，减少主入口耦合和定位成本。</div>
+        </div>
+        <div class="card">
+          <strong>2. 阴影链路修正</strong>
+          <div>路径阻断器（LOSBlocker）通过 FourCC 黑名单从 ShadowCaster 收集中剔除。</div>
+        </div>
+        <div class="card">
+          <strong>3. 合批局部复用</strong>
+          <div>Dispatch Local Merge 对连续同对象提交复用 Begin/End 上下文。</div>
+        </div>
+        <div class="card">
+          <strong>4. 本轮追加优化</strong>
+          <div>Dispatch Tag/Stage 缓存：降低 <code>GetTagStage</code> 高频查询成本。</div>
+        </div>
+        <div class="card">
+          <strong>5. 静态阴影前移拦截</strong>
+          <div>在 <code>TerrainShadow_RegisterImageEntry</code> 上游按来源阻断注册，而非只在末端渲染过滤。</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>除“合并批次提交”之外的优化路线评估</h2>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>路线</th>
+            <th>预期收益</th>
+            <th>风险</th>
+            <th>本轮动作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Dispatch Tag/Stage 查询缓存</td>
+            <td>减少热路径哈希探测与状态读取</td>
+            <td>低（仅缓存短路径，帧尾清空）</td>
+            <td><span class="status ok">已实现</span></td>
+          </tr>
+          <tr>
+            <td>ExecBatch 对象信息缓存命中率优化</td>
+            <td>减少 Registry 回查与句柄解析</td>
+            <td>中（需避免句柄污染）</td>
+            <td><span class="status warn">下一阶段</span></td>
+          </tr>
+          <tr>
+            <td>FlushSortedItems 接管深优化</td>
+            <td>降低排序与桥接重复成本</td>
+            <td>中高（排序语义回归风险）</td>
+            <td><span class="status warn">实验中</span></td>
+          </tr>
+          <tr>
+            <td>War3 主循环/JASS 调度 Patch</td>
+            <td>可能覆盖大量 Untracked CPU 时间</td>
+            <td>高（逻辑语义与联机稳定性风险）</td>
+            <td><span class="status warn">先研究不默认启用</span></td>
+          </tr>
+          <tr>
+            <td>静态阴影上游注册拦截</td>
+            <td>直接减少静态阴影条目进入渲染列表</td>
+            <td>中（需跨地图验证是否误伤自定义贴花）</td>
+            <td><span class="status ok">已实现</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>本轮已落地代码要点</h3>
+      <pre>// Dispatch 热路径：同 renderablePart 连续查询时复用 Tag/Stage
+if (cache.valid && cache.renderablePart == renderablePart) {
+  outTag = cache.tag;
+  outStage = cache.stage;
+  return true;
+}
+const bool ok = tracker.GetTagStage(renderablePart, outTag, outStage);
+if (ok) cache = { true, renderablePart, outTag, outStage };
+
+// 帧尾在 FlushAndReset 收口阶段清空，避免跨帧污染
+War3HookRender::ResetDispatchMergeContext();</pre>
+
+      <div class="note">建议验证：观察日志 <code>DXVK War3Hook: DispatchTagStageCache ...</code> 的命中率，再结合 PerfMonitor 对比 <code>Hook_Dispatch_Common/Special</code> 均值变化。</div>
+    </section>
+  </div>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'base',
+      themeVariables: {
+        primaryColor: '#f9f4eb',
+        primaryTextColor: '#1f1b17',
+        primaryBorderColor: '#c4b7a8',
+        lineColor: '#6d6256',
+        secondaryColor: '#eef6f6',
+        tertiaryColor: '#fff8ef',
+        fontFamily: 'Space Grotesk, Noto Sans SC, sans-serif'
+      },
+      flowchart: { curve: 'basis' }
+    });
+  </script>
+</body>
+
+</html>

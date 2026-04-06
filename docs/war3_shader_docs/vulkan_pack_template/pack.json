@@ -1,0 +1,25 @@
+{
+  "name": "War3 Vulkan Pack Template",
+  "enabled": false,
+  "render_scale": 1.0,
+  "passes": [
+    {
+      "name": "composite",
+      "shader": "composite.spv",
+      "enabled": true
+    },
+    {
+      "name": "final",
+      "shader": "final.spv",
+      "enabled": true
+    }
+  ],
+  "params": {
+    "0": [
+      1.0,
+      0.5,
+      0.0,
+      0.0
+    ]
+  }
+}

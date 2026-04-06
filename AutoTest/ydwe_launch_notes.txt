@@ -1,0 +1,36 @@
+YDWE 启动链结论（源码定位）
+==========================
+
+1. YDWE 直进地图参数
+--------------------
+- 启动 War3 使用 `-loadfile` 参数。
+- 代码位置：
+  E:\Mycode\Source\Repos\YDWE\Development\Core\YDWEStartup\LaunchWarcraft3.cpp
+  关键注释在约 136 行：`war3.exe -loadfile "xxx.w3x"`
+
+2. 长路径规避策略
+------------------
+- YDWE 注释说明：当地图路径长度较长时，War3 可能无法识别。
+- 解决方式：把地图复制到 War3 目录下固定短路径：
+  `Maps\Test\WorldEditTestMap.w3x`
+- 然后把 `-loadfile` 参数改为该相对路径。
+
+3. 启动参数组装顺序
+--------------------
+- 已知参数（known）：window / opengl / loadfile
+- 其余参数随后追加。
+- 相关实现：
+  E:\Mycode\Source\Repos\YDWE\Development\Core\ydwar3\warcraft3\command_line.cpp
+
+4. 脚本层也复用了同一逻辑
+--------------------------
+- Lua 脚本单测路径使用:
+  `ydwe.exe -war3 -loadfile <map>`
+- 代码位置：
+  E:\Mycode\Source\Repos\YDWE\Development\Component\script\ydwe\ydwe_on_test.lua
+
+5. 对 AutoTest 的直接启发
+--------------------------
+- 只要复刻“复制到固定短路径 + -loadfile 相对路径”，即可稳定直进地图。
+- 不需要先集成 YDWE 注入链（LuaEngine/Storm 替换），即可完成渲染回归自动化。
+

@@ -1,0 +1,79 @@
+{
+    "globals": {
+        "vs": {
+            "ViewProj": 4
+        },
+        "ps": {
+            "LightDir": 8,
+            "LightColor": 9,
+            "AmbientColor": 10,
+            "CameraPos": 11,
+            "FogParams": 12,
+            "FogColor": 13,
+            "TeamColor": 14,
+            "Time": 15,
+            "ScreenParams": 16
+        }
+    },
+    "packs": [
+        {
+            "name": "Default Override",
+            "enabled": false,
+            "passes": {
+                "World": {
+                    "vs": "shaders/war3_default.hlsl",
+                    "ps": "shaders/war3_default.hlsl",
+                    "uniforms": {
+                        "vs": {
+                            "World": 0
+                        }
+                    }
+                },
+                "Outline": {
+                    "vs": "shaders/war3_outline.hlsl",
+                    "ps": "shaders/war3_outline.hlsl",
+                    "uniforms": {
+                        "vs": {
+                            "World": 0,
+                            "ViewProj": 4
+                        },
+                        "ps": {
+                            "OutlineColor": 8,
+                            "OutlineParams": 9
+                        }
+                    },
+                    "render_states": {
+                        "ZENABLE": 1,
+                        "ZWRITEENABLE": 0,
+                        "ZFUNC": 3,
+                        "ALPHABLENDENABLE": 1,
+                        "SRCBLEND": 5,
+                        "DESTBLEND": 6,
+                        "CULLMODE": 2
+                    }
+                }
+            }
+        },
+        {
+            "name": "Debug Red",
+            "enabled": false,
+            "passes": {
+                "Shadow": {
+                    "vs": "shaders/war3_sample.hlsl",
+                    "ps": "shaders/war3_sample.hlsl"
+                }
+            }
+        },
+        {
+            "name": "Debug Triangle",
+            "description": "Rotating gradient triangle test (no textures)",
+            "enabled": true,
+            "passes": {
+                "Overlay": {
+                    "vs": "shaders/war3_test_triangle.hlsl",
+                    "ps": "shaders/war3_test_triangle.hlsl"
+                }
+            }
+        }
+    ]
+}

@@ -1,0 +1,52 @@
+{
+  "version": "0.2.1",
+  "tasks": [
+    {
+      "taskLabel": "1. Meson Setup (初始化)",
+      "appliesTo": "/",
+      "type": "launch",
+      "command": "meson",
+      "args": [
+        "setup",
+        "build32",
+        "--cross-file",
+        "build-win32.txt",
+        "--buildtype",
+        "debug",
+        "--reconfigure"
+      ]
+    },
+    {
+      "taskLabel": "2. Ninja Build (开始编译)",
+      "appliesTo": "/",
+      "type": "default",
+      "command": "ninja",
+      "args": [
+        "-C",
+        "build32"
+      ],
+      "problemMatcher": {
+        "base": "$gcc",
+        "fileLocation": [
+          "relative",
+          "${workspaceRoot}/build32"
+        ]
+      }
+    },
+    {
+      "taskLabel": "任务-compile_log",
+      "appliesTo": "compile_log.txt",
+      "type": "launch"
+    },
+    {
+      "taskLabel": "任务-dxvk",
+      "appliesTo": "/",
+      "type": "launch"
+    },
+    {
+      "taskLabel": "任务-dxvk",
+      "appliesTo": "/",
+      "type": "launch"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+[WarVK_NoEvents]
+title = "暂无事件"
+description = "WarVK 暂未开放事件注册"
+comment = "保留位，后续将提供渲染与游戏事件"
+category = TC_WARVK

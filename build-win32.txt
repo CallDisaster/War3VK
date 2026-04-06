@@ -1,0 +1,21 @@
+[binaries]
+c       = 'E:/Dev/MinGW/bin/i686-w64-mingw32-gcc.exe'
+cpp     = 'E:/Dev/MinGW/bin/i686-w64-mingw32-g++.exe'
+ar      = 'E:/Dev/MinGW/bin/ar.exe'
+strip   = 'E:/Dev/MinGW/bin/strip.exe'
+windres = 'E:/Dev/MinGW/bin/windres.exe'
+
+[properties]
+needs_exe_wrapper = false
+
+[host_machine]
+system = 'windows'
+cpu_family = 'x86'
+cpu = 'i686'
+endian = 'little'
+
+[built-in options]
+c_args = ['-IE:/Dev/Vulkan SDK/Include']
+cpp_args = ['-IE:/Dev/Vulkan SDK/Include']
+c_link_args = ['-LE:/Dev/Vulkan SDK/Lib32', '-LE:/Dev/MinGW/i686-w64-mingw32/lib']
+cpp_link_args = ['-LE:/Dev/Vulkan SDK/Lib32', '-LE:/Dev/MinGW/i686-w64-mingw32/lib']

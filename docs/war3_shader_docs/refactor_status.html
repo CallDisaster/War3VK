@@ -1,0 +1,1569 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>War3MapReforge 行业化重构看板</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg-1: #f3efe7;
+      --bg-2: #e8dfd0;
+      --ink: #1c1a17;
+      --ink-soft: #4b4339;
+      --accent: #bf5b2f;
+      --accent-2: #0f6866;
+      --ok: #1a7f48;
+      --warn: #a56a11;
+      --line: rgba(28, 26, 23, 0.14);
+      --panel: rgba(255, 255, 255, 0.78);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(1000px 700px at 15% 0%, rgba(191, 91, 47, 0.14), transparent 65%),
+        radial-gradient(900px 700px at 90% 8%, rgba(15, 104, 102, 0.16), transparent 60%),
+        linear-gradient(180deg, var(--bg-1), var(--bg-2));
+      font-family: "Space Grotesk", "Noto Sans SC", sans-serif;
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+
+    .app {
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 24px;
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 24px;
+    }
+
+    header {
+      grid-column: 1 / -1;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      box-shadow: 0 14px 30px rgba(28, 26, 23, 0.08);
+      backdrop-filter: blur(10px);
+    }
+
+    header h1 {
+      margin: 0;
+      font-size: 24px;
+      font-family: "Noto Serif SC", "Source Serif 4", serif;
+      letter-spacing: 0.02em;
+    }
+
+    .meta {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      color: var(--ink-soft);
+      font-size: 13px;
+    }
+
+    .badge {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.72);
+      border-radius: 999px;
+      padding: 4px 10px;
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 16px;
+      align-self: start;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+      box-shadow: 0 10px 24px rgba(28, 26, 23, 0.08);
+      backdrop-filter: blur(10px);
+      max-height: calc(100vh - 120px);
+      overflow: auto;
+    }
+
+    .sidebar h3 {
+      margin: 0 0 10px;
+      font-size: 13px;
+      color: var(--ink-soft);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .nav-item {
+      padding: 9px 10px;
+      border-radius: 10px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: all .2s ease;
+    }
+
+    .nav-item:hover {
+      background: rgba(15, 104, 102, 0.10);
+    }
+
+    .nav-item.active {
+      background: rgba(191, 91, 47, 0.12);
+      box-shadow: inset 0 0 0 1px rgba(191, 91, 47, 0.3);
+      color: var(--accent);
+    }
+
+    .content {
+      padding: 6px;
+    }
+
+    .panel {
+      display: none;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 24px 26px;
+      box-shadow: 0 12px 28px rgba(28, 26, 23, 0.08);
+      margin-bottom: 20px;
+      backdrop-filter: blur(10px);
+    }
+
+    .panel.active {
+      display: block;
+    }
+
+    .panel h2 {
+      margin: 0 0 12px;
+      font-size: 25px;
+      font-family: "Noto Serif SC", "Source Serif 4", serif;
+    }
+
+    .panel p {
+      color: var(--ink-soft);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin: 14px 0;
+    }
+
+    .kpi {
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px 14px;
+    }
+
+    .kpi .name {
+      font-size: 12px;
+      color: var(--ink-soft);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .kpi .value {
+      font-size: 30px;
+      font-weight: 600;
+      margin-top: 4px;
+      line-height: 1.1;
+    }
+
+    .kpi .sub {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--ink-soft);
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      background: rgba(255, 255, 255, 0.58);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .table th,
+    .table td {
+      text-align: left;
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      font-size: 13px;
+    }
+
+    .table th {
+      background: rgba(15, 104, 102, 0.10);
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    .status {
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      display: inline-block;
+      border: 1px solid transparent;
+    }
+
+    .status.ok {
+      color: var(--ok);
+      background: rgba(26, 127, 72, 0.12);
+      border-color: rgba(26, 127, 72, 0.25);
+    }
+
+    .status.warn {
+      color: var(--warn);
+      background: rgba(165, 106, 17, 0.12);
+      border-color: rgba(165, 106, 17, 0.25);
+    }
+
+    .note {
+      border-left: 3px solid var(--accent);
+      background: rgba(191, 91, 47, 0.09);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin: 12px 0;
+      font-size: 13px;
+    }
+
+    .progress-wrap {
+      margin-top: 8px;
+    }
+
+    .progress-row {
+      margin-bottom: 10px;
+    }
+
+    .progress-row .label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+
+    .bar {
+      height: 9px;
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.08);
+      overflow: hidden;
+    }
+
+    .bar > span {
+      display: block;
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    }
+
+    pre {
+      margin: 0;
+      padding: 12px;
+      border-radius: 12px;
+      background: #171410;
+      color: #f5efe5;
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      font-size: 12px;
+      overflow: auto;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="app">
+    <header>
+      <h1>War3 行业化重构看板</h1>
+      <div class="meta">
+        <span class="badge">状态: 行业化重构 v1 完成</span>
+        <span class="badge">夜间优化续跑: 2026-03-12</span>
+        <span class="badge">构建: `ninja -C build32` 通过</span>
+        <a class="badge" href="index.html" style="text-decoration:none;color:inherit;">返回文档首页</a>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <h3>目录</h3>
+      <div class="nav-item active" data-target="overview">重构总览</div>
+      <div class="nav-item" data-target="industry">行业模块对齐</div>
+      <div class="nav-item" data-target="milestone">里程碑与提交</div>
+      <div class="nav-item" data-target="arch">当前架构图</div>
+      <div class="nav-item" data-target="notes">留言阶段总结</div>
+      <div class="nav-item" data-target="nightly">今晚收官总结</div>
+      <div class="nav-item" data-target="metrics">数据指标</div>
+    </aside>
+
+    <main class="content">
+      <section class="panel active" data-section="overview">
+        <h2>重构总览</h2>
+        <p>本页用于审阅“行业化标准重构”的当前落地状态。目标不是做抽象层堆叠，而是在不牺牲渲染性能的前提下完成职责解耦、可维护性提升与回归可控。</p>
+
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">Hook 模块文件数</div>
+            <div class="value">18</div>
+            <div class="sub">`src/d3d9/war3/hooks/`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">本轮重构提交</div>
+            <div class="value">14</div>
+            <div class="sub">行业化重构 v1 累计</div>
+          </div>
+          <div class="kpi">
+            <div class="name">主入口行数</div>
+            <div class="value">548</div>
+            <div class="sub">`d3d9_war3_hook.cpp`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">Shadow 主文件行数</div>
+            <div class="value">2734</div>
+            <div class="sub">已拆分 Outline/Resources</div>
+          </div>
+        </div>
+
+        <div class="progress-wrap">
+          <div class="progress-row">
+            <div class="label"><span>入口解耦 (AddressBook + Domain Installer)</span><span>100%</span></div>
+            <div class="bar"><span style="width:100%"></span></div>
+          </div>
+          <div class="progress-row">
+            <div class="label"><span>Shadow 模块化 (Policy + Outline + Resource Split)</span><span>100%</span></div>
+            <div class="bar"><span style="width:100%"></span></div>
+          </div>
+          <div class="progress-row">
+            <div class="label"><span>行业模块对齐文档与可视化</span><span>100%</span></div>
+            <div class="bar"><span style="width:100%"></span></div>
+          </div>
+        </div>
+
+        <div class="note">
+          关键原则：所有重构以“编译通过 + 行为不退化 + 热路径不增开销”为硬约束。
+        </div>
+      </section>
+
+      <section class="panel" data-section="industry">
+        <h2>行业模块对齐</h2>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>行业模块</th>
+              <th>当前实现落点</th>
+              <th>完成度</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Runtime / Bootstrap</td>
+              <td>`src/d3d9/d3d9_war3_hook.cpp` + `war3_hook_address_book.*` + `war3_hook_lifecycle.*` + `war3_runtime_bootstrap.*`</td>
+              <td>主入口编排、版本门禁、地址簿统一完成</td>
+              <td><span class="status ok">已完成主线</span></td>
+            </tr>
+            <tr>
+              <td>Render Frontend</td>
+              <td>`war3/render/war3_scene_collector.*` + `war3_render_exec_batch.*` + `war3_render_queue_tracker.*`</td>
+              <td>对象收集、分类、句柄桥接链路可用</td>
+              <td><span class="status ok">已稳定</span></td>
+            </tr>
+            <tr>
+              <td>Frame / Render Graph</td>
+              <td>`src/d3d9/d3d9_war3_pipeline.*` + `war3/render/war3_frame_graph.*`</td>
+              <td>事件分发已抽离为帧图计划，Pass 调度与插入点编排统一</td>
+              <td><span class="status ok">已完成 v1</span></td>
+            </tr>
+            <tr>
+              <td>Render Backend</td>
+              <td>DXVK `DxvkCommandList` + `d3d9_device.cpp`</td>
+              <td>保持现有高性能提交路径，不做额外抽象层</td>
+              <td><span class="status ok">已对齐策略</span></td>
+            </tr>
+            <tr>
+              <td>Feature Modules</td>
+              <td>Shadow/Outline/SSAO/AA 分散在 `d3d9_war3_*.cpp` 与 hooks</td>
+              <td>Shadow 已做 policy/outline/resources 物理拆分，Hook 侧策略已独立</td>
+              <td><span class="status ok">已完成 v1</span></td>
+            </tr>
+            <tr>
+              <td>Shader / Material</td>
+              <td>`war3_shader_api.cpp` + `war3_shaderpack.cpp` + `war3/shader/*`</td>
+              <td>热更新链路与材质覆盖已具备</td>
+              <td><span class="status ok">已可用</span></td>
+            </tr>
+            <tr>
+              <td>Resource / Streaming</td>
+              <td>`d3d9_war3_shadow_resources.cpp` + DXVK 资源缓存</td>
+              <td>阴影中间资源生命周期已独立模块化并接入构建</td>
+              <td><span class="status ok">已完成 v1</span></td>
+            </tr>
+            <tr>
+              <td>Diagnostics</td>
+              <td>`war3/tools/war3_perf_monitor.*` + `war3_diagnostics_hub.*`</td>
+              <td>热点指标、模块统计与运行态健康日志已统一</td>
+              <td><span class="status ok">已可观测</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" data-section="milestone">
+        <h2>里程碑与提交</h2>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>提交</th>
+              <th>主题</th>
+              <th>影响面</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>025000d</code></td>
+              <td>主入口瘦身 + AddressBook</td>
+              <td>Hook 总装配方式标准化</td>
+            </tr>
+            <tr>
+              <td><code>e968375</code></td>
+              <td>Shadow 过滤策略独立</td>
+              <td>LOS/FourCC 逻辑从 Hook 编排剥离</td>
+            </tr>
+            <tr>
+              <td><code>55a8591</code></td>
+              <td>统一 Hook 安装器</td>
+              <td>Render/Jass/Lifecycle/UI/Shadow 五域一致化</td>
+            </tr>
+            <tr>
+              <td><code>bb3e068</code></td>
+              <td>UI 地址簿接入</td>
+              <td>UI 偏移不再硬编码</td>
+            </tr>
+            <tr>
+              <td><code>26bdc8a</code></td>
+              <td>Shadow 文件物理拆分</td>
+              <td>`d3d9_war3_shadow.cpp` -> core + outline + resources</td>
+            </tr>
+            <tr>
+              <td><code>5338763</code></td>
+              <td>运行时与帧图收官</td>
+              <td>新增 RuntimeBootstrap / FrameGraph / DiagnosticsHub，模块系统增强</td>
+            </tr>
+            <tr>
+              <td><code>d428163</code></td>
+              <td>文档收官</td>
+              <td>架构图与重构看板同步到“行业化重构 v1 完成”</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" data-section="arch">
+        <h2>当前架构图</h2>
+        <div class="mermaid">
+          graph TB
+          subgraph R0["Runtime / Bootstrap"]
+          A["d3d9_war3_hook.cpp"]
+          B["war3_hook_address_book.*"]
+          C["war3_hook_install_util.*"]
+          D0["platform/war3_runtime_bootstrap.*"]
+          end
+
+          subgraph R1["Render Frontend"]
+          D["war3_scene_collector.*"]
+          E["war3_render_exec_batch.*"]
+          F["war3_render_queue_tracker.*"]
+          end
+
+          subgraph R2["Frame / Graph"]
+          G["d3d9_war3_pipeline.*"]
+          G2["render/war3_frame_graph.*"]
+          end
+
+          subgraph R3["Feature Modules"]
+          H1["d3d9_war3_shadow.cpp (core)"]
+          H2["d3d9_war3_shadow_outline.cpp"]
+          H3["d3d9_war3_shadow_resources.cpp"]
+          H4["war3_shadow_filter_policy.*"]
+          H5["d3d9_war3_ssao.cpp / d3d9_war3_aa.cpp"]
+          end
+
+          subgraph R4["Diagnostics"]
+          I["war3_perf_monitor.*"]
+          I2["war3_diagnostics_hub.*"]
+          J["WAR3_RENDER_LOG / Hook logs"]
+          end
+
+          A --> B
+          A --> C
+          A --> D0
+          A --> D
+          A --> E
+          A --> F
+          D --> G
+          E --> G
+          F --> G
+          G --> G2
+          G --> H1
+          H1 --> H2
+          H1 --> H3
+          H1 --> H4
+          G --> H5
+          G --> I
+          G --> I2
+          A --> J
+        </div>
+        <div class="note">Shadow 模块已从“单文件集中实现”转为“核心渲染 / 描边渲染 / 资源管理 / 过滤策略”四块职责拆分。</div>
+      </section>
+
+      <section class="panel" data-section="notes">
+        <h2>留言阶段总结</h2>
+        <p>用于同步“留言1/2/3/4”阶段任务推进状态，方便快速判断下一轮优化入口。</p>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>阶段</th>
+              <th>目标</th>
+              <th>结果</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>留言1</td>
+              <td>JASS VM 运行机制与性能采样</td>
+              <td>已接入 <code>ExecuteInternal/MainLoop</code> 追踪与预算策略。</td>
+              <td><span class="status ok">完成</span></td>
+            </tr>
+            <tr>
+              <td>留言2</td>
+              <td>先落地“局部合并提交”</td>
+              <td>Dispatch Local Merge 已上线，支持帧尾收口。</td>
+              <td><span class="status ok">完成</span></td>
+            </tr>
+            <tr>
+              <td>留言3</td>
+              <td>评估并推进非合批优化 + 文档沉淀</td>
+              <td>新增 Dispatch Tag/Stage 缓存，并补齐 JASS/渲染架构说明文档。</td>
+              <td><span class="status ok">完成</span></td>
+            </tr>
+            <tr>
+              <td>留言4</td>
+              <td>静态阴影根因定位与可落地拦截</td>
+              <td>确认上游入口 <code>TerrainShadow_RegisterImageEntry</code>，并按 StaticStamp/Emitter 来源实现注册阶段拦截。</td>
+              <td><span class="status ok">完成</span></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="note">
+          详细说明请查看：
+          <a href="jass_render_architecture.html" style="color:inherit;font-weight:600;">JASS 与渲染架构说明</a>
+        </div>
+      </section>
+
+      <section class="panel" data-section="nightly">
+        <h2>夜间收官与续跑总结（2026-02-24 ~ 2026-03-12）</h2>
+        <p>本节汇总“第三轮续跑 + 第五轮矩阵补执行 + 第六轮兼容验证 + 2026-03-12 运行时档位矩阵”结果：先建立运行时归因底座，再按模块拆损耗，最后为 ShadowBudget 与超预算治理补结构化证据。</p>
+
+        <h3>2026-03-13：City 场景热修，ShadowCapture 恢复 WorldObjects/单位类 VS caster</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事项</th>
+              <th>本轮落地</th>
+              <th>意图</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>VS caster 门控修正</td>
+              <td>`Shadow/Capture` 不再只允许装饰物走 VS；`WorldObjects`、`Unit/Building/Destructible/Item` 现可进入 VS caster 路径</td>
+              <td>修复 City 中“单位本体阴影丢失、只剩武器/装饰物投影”的问题</td>
+            </tr>
+            <tr>
+              <td>伪 caster 剔除</td>
+              <td>默认 object-caster 集合移除 `S7` 选择圈和 `S12` 范围目标</td>
+              <td>避免 shadow map 被非真实投影几何污染，降低墙面游动和随机闪断</td>
+            </tr>
+            <tr>
+              <td>阶段策略</td>
+              <td>本轮仍优先修输入正确性，不改 PCF/receiver 语义</td>
+              <td>先恢复正确 caster 集合，再继续判断墙面问题究竟来自 CSM/update 还是 receiver 端</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="note">
+          City 当前的核心观察已经从“预算是否炸掉”转成“shadow map 输入是否正确”。这一轮先修复 object caster 收集偏差，再继续签收墙面稳定性。
+        </div>
+
+        <h3>2026-03-12：续跑压缩，默认档重开 ShadowMap 自适应，Shadow/Capture 成为剩余主热点</h3>
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">分析档 FPS</div>
+            <div class="value">123.798</div>
+            <div class="sub">Win32 隔离桌面，续跑后</div>
+          </div>
+          <div class="kpi">
+            <div class="name">Tracked CPU</div>
+            <div class="value">0.635ms</div>
+            <div class="sub">较前一轮 `0.816ms`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">ShadowMap 占比</div>
+            <div class="value">24.542%</div>
+            <div class="sub">前一轮 `39.253%`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">Shadow/Main 占比</div>
+            <div class="value">33.532%</div>
+            <div class="sub">前一轮 `46.461%`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">Shadow/Capture 占比</div>
+            <div class="value">44.736%</div>
+            <div class="sub">当前阴影主链第一热点</div>
+          </div>
+          <div class="kpi">
+            <div class="name">预算语义</div>
+            <div class="value">严格丢弃</div>
+            <div class="sub">BudgetRejected 不再污染整帧</div>
+          </div>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事项</th>
+              <th>本轮落地</th>
+              <th>结果 / 结论</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Budget 语义修正</td>
+              <td>`ShadowFreezeResult::BudgetRejected` 与 `AllocFailed` 拆开；预算超限只丢当前 caster，不再设置 `captureIncomplete`</td>
+              <td>项目已经切换到“严格预算保护”阶段，超预算不再天然意味着 partial shadow map 污染整帧</td>
+            </tr>
+            <tr>
+              <td>默认 ShadowMap 收缩</td>
+              <td>恢复默认 `kShadowAdaptiveMapUpdateEnabled=true`，并把 `period` 收回 `2`</td>
+              <td>`ShadowMap` 自占 CPU `0.320ms -> 0.156ms`，GPU `0.604ms -> 0.303ms`，调用频率从 `0.964/frame` 压到 `0.485/frame`</td>
+            </tr>
+            <tr>
+              <td>默认档预算前置裁决</td>
+              <td>中优先级 caster 的预算前置跳过不再只限实验档，高压力默认档也能触发</td>
+              <td>当前自动化基准图没有再打到 budget edge，但前端裁决已从“实验语义”提升为“默认档可用语义”</td>
+            </tr>
+            <tr>
+              <td>热点迁移</td>
+              <td>`ShadowMap` 与 `Shadow/Main` 已明显回落，`Shadow/Capture` 基本持平</td>
+              <td>下一阶段不用再怀疑 ShadowMap 是否仍是第一瓶颈，默认档剩余最该压的是 `Shadow/Capture` 前端与执行层</td>
+            </tr>
+            <tr>
+              <td>高压证据缺口</td>
+              <td>当前 AutoTest 标准图即使预算设到 `32MB` 也未再次触发超限</td>
+              <td>说明自动化标准图已不再是 budget stress case；后续要补的不是语义，而是真实高压动态图证据</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          证据报告：
+          `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_19_12_46.html`、
+          `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_19_18_30.html`、
+          `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_19_20_14.html`。
+          当前自动化续跑已经说明 ShadowMap/Shadow/Main 压缩有效；剩余要继续下刀的是 ShadowCapture。
+        </div>
+
+        <h3>2026-03-12：热修，撤回默认 ShadowFreeze 复用以修复阴影撕裂</h3>
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">热修后 FPS</div>
+            <div class="value">96.465</div>
+            <div class="sub">默认档 quick autotest</div>
+          </div>
+          <div class="kpi">
+            <div class="name">截图基线</div>
+            <div class="value">2560x1440</div>
+            <div class="sub">内部截图匹配</div>
+          </div>
+          <div class="kpi">
+            <div class="name">预算超限</div>
+            <div class="value">0</div>
+            <div class="sub">本轮默认档回归</div>
+          </div>
+          <div class="kpi">
+            <div class="name">Partial Shadow</div>
+            <div class="value">0</div>
+            <div class="sub">本轮默认档回归</div>
+          </div>
+          <div class="kpi">
+            <div class="name">Device Lost</div>
+            <div class="value">0</div>
+            <div class="sub">本轮默认档回归</div>
+          </div>
+          <div class="kpi">
+            <div class="name">当前策略</div>
+            <div class="value">安全冻结</div>
+            <div class="sub">复用缓存仅保留实验开关</div>
+          </div>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事项</th>
+              <th>本轮落地</th>
+              <th>结果 / 结论</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>问题根因</td>
+              <td>`frozen-slice cache` 在默认档下复用了同一帧内已被重写的动态 buffer 快照</td>
+              <td>阴影会同时残留旧几何与新几何，用户侧直接表现为撕裂、残影和“隐约能看到正确阴影底图”</td>
+            </tr>
+            <tr>
+              <td>热修策略</td>
+              <td>默认关闭 ShadowFreeze 复用；仅在显式设置 `DXVK_WAR3_SHADOW_FREEZE_REUSE=1` 时启用</td>
+              <td>先恢复安全性，再保留实验入口，避免把未完成有效性验证的复用逻辑继续带到默认档</td>
+            </tr>
+            <tr>
+              <td>后续约束</td>
+              <td>若要重新开启默认复用，必须补 source generation/version 级别证据</td>
+              <td>仅靠 `buffer + offset + size` 判等不再被视为有效条件</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          证据报告：
+          `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_18_29_17.html`。
+          当前默认档已回到“安全冻结”模式，复用缓存只作为后续实验能力保留。
+        </div>
+
+        <h3>2026-03-12：续跑补丁，ShadowFreeze 复用缓存与预算复用统计接线完成</h3>
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">默认档 FPS</div>
+            <div class="value">98.200</div>
+            <div class="sub">标准基准图，15s，2K 全屏</div>
+          </div>
+          <div class="kpi">
+            <div class="name">实验档 FPS</div>
+            <div class="value">108.248</div>
+            <div class="sub">同口径 `full_perf_experimental`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">实验档提升</div>
+            <div class="value">+10.048</div>
+            <div class="sub">相对 `full_default`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">Freeze 复用命中</div>
+            <div class="value">0</div>
+            <div class="sub">当前标准基准图 `reusedFreezeHits`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">预算超限</div>
+            <div class="value">0 / 0</div>
+            <div class="sub">默认档 / 实验档，标准基准图</div>
+          </div>
+          <div class="kpi">
+            <div class="name">当前定位</div>
+            <div class="value">结构就位</div>
+            <div class="sub">收益待更高压场景放大</div>
+          </div>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事项</th>
+              <th>本轮落地</th>
+              <th>结果 / 结论</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>ShadowFreeze 复用缓存</td>
+              <td>`d3d9_device` 新增按帧 `frozen-slice cache`，同源动态 VB/IB 切片在同一帧内可直接复用已冻结的 buffer slice</td>
+              <td>避免重复 `copyBuffer` 和重复预算扣减，是 ShadowCapture 去重/复用的第一步正式实现</td>
+            </tr>
+            <tr>
+              <td>预算统计</td>
+              <td>`shadowBudgetSummary` 新增 `reusedFreezeHits / reusedFreezeMb`，AutoTest 和 profile matrix 同步带出</td>
+              <td>后续不再需要只靠代码审查判断复用是否生效，回归可直接看结构化字段</td>
+            </tr>
+            <tr>
+              <td>标准场景验证</td>
+              <td>`full_default=98.200 FPS`，`full_perf_experimental=108.248 FPS`，两者均无预算超限与设备丢失</td>
+              <td>本轮可确认实验档标准场景仍有明显上限优势；复用缓存本身没有引入稳定性回退</td>
+            </tr>
+            <tr>
+              <td>当前残留</td>
+              <td>标准基准图 `reusedFreezeHits=0`，说明它不具备明显的同源动态切片重复冻结特征</td>
+              <td>这一刀更偏架构稳定性和高压场景准备项；真正的回收量要靠更有代表性的重压图才能放大出来</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          证据报告：
+          `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_15_21_20.html`
+          与
+          `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_15_21_41.html`。
+          当前对这条链路的判断应保持克制：
+          结构与统计已经落地，但还需要更高压、更多重复动态几何的场景来验证复用收益上限。
+        </div>
+
+        <h3>2026-03-12：第四至六阶段合并落地，ShadowCapture 前端与实验档一起收口</h3>
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">默认完整栈 FPS</div>
+            <div class="value">97.106</div>
+            <div class="sub">`add_full_default_r1`，矩阵 `20260312_144713`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">实验档 FPS</div>
+            <div class="value">103.493</div>
+            <div class="sub">`add_full_perf_experimental_r1`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">完整栈损耗差值</div>
+            <div class="value">168.644</div>
+            <div class="sub">`dxvk_only=265.75 - full_default=97.106`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">低预算超限（默认档）</div>
+            <div class="value">16</div>
+            <div class="sub">`DXVK_WAR3_SHADOW_FREEZE_BUDGET_MB=32`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">低预算超限（实验档）</div>
+            <div class="value">0</div>
+            <div class="sub">同口径 32MB，`full_perf_experimental`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">三大热点</div>
+            <div class="value">+63.8 / +61.6 / +41.9</div>
+            <div class="sub">关闭 `shadow.receiver / shadow.capture / shadow.map` 的 FPS 回收</div>
+          </div>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事项</th>
+              <th>本轮落地</th>
+              <th>结果 / 结论</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>ShadowCapture 前端</td>
+              <td>新增 `war3_shadow_capture_frontend.*`，把 caster 优先级、软/硬预算、alpha 降级与远端装饰提前跳过收成独立前端裁决</td>
+              <td>这是第一次把 ShadowCapture 从“撞线后再报错”改成“预算前置判断”；同时也是渲染层重构在阴影主链上的第一块实拆</td>
+            </tr>
+            <tr>
+              <td>实验档压力模式</td>
+              <td>`full_perf_experimental` 在预算压力持续时自动切 `StableSphere`、限制 `<=3` cascades、缩短 `maxDistance`，并启用更积极的 ShadowMap adaptive skip</td>
+              <td>实验档正式承担“过载收敛”职责；默认档不默认降画质，继续保画质语义</td>
+            </tr>
+            <tr>
+              <td>AutoTest 预算账本</td>
+              <td>`shadowBudgetSummary` 新增 `skippedPriorityBudget / degradedAlphaBudget`；当底层结构化字段过稀疏时，AutoTest 会用日志关键字回填 `framesBudgetExceeded / framesIncomplete / reuse / partial`</td>
+              <td>低预算强压下不再需要人工翻 `war3_d3d9.log` 才知道预算是否爆线，矩阵和 quick autotest 返回值即可直接审阅</td>
+            </tr>
+            <tr>
+              <td>低预算强压验证</td>
+              <td>默认档：`111.275 FPS`，`framesBudgetExceeded=16`，`framesIncomplete=1`；实验档：`111.137 FPS`，`framesBudgetExceeded=0`</td>
+              <td>说明实验档已能在不崩溃的前提下把显式预算爆线压掉；默认档仍保画质优先，因此会保留有限度的超限告警</td>
+            </tr>
+            <tr>
+              <td>当前性能判断</td>
+              <td>短矩阵仍显示 `shadow.receiver / shadow.capture / shadow.map` 是前三大热点</td>
+              <td>剩余性能回收不该再分散到 DXVK 核心或普通 Hook，应继续沿阴影三段做真成本压缩</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          证据链：
+          `AutoTest/artifacts/profile_matrix/20260312_144713/profile_matrix.json` /
+          `profile_matrix.html`，
+          以及低预算回归报告
+          `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_15_06_05.html`
+          与
+          `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_15_06_20.html`。
+          当前已经形成三档语义：
+          `full_default` 保画质，
+          `full_analysis` 保归因，
+          `full_perf_experimental` 保过载收敛与上限探索。
+        </div>
+
+        <h3>2026-03-12：第三阶段首刀，收掉 ShadowReceiver 的重复 PCF</h3>
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">默认完整栈 FPS</div>
+            <div class="value">101.518</div>
+            <div class="sub">`full_default`，15s，2K 全屏</div>
+          </div>
+          <div class="kpi">
+            <div class="name">关闭 Shadow TAA</div>
+            <div class="value">101.205</div>
+            <div class="sub">`full_default + disable shadow.taa`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">Receiver GPU</div>
+            <div class="value">0.169ms</div>
+            <div class="sub">默认 TAA，`ShadowReceiver` scope</div>
+          </div>
+          <div class="kpi">
+            <div class="name">Receiver GPU（对照）</div>
+            <div class="value">0.480ms</div>
+            <div class="sub">关闭 TAA 后的 `ShadowReceiver`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">总 GPU 帧时间</div>
+            <div class="value">2.172ms</div>
+            <div class="sub">默认 TAA</div>
+          </div>
+          <div class="kpi">
+            <div class="name">总 GPU 帧时间（对照）</div>
+            <div class="value">2.385ms</div>
+            <div class="sub">关闭 TAA</div>
+          </div>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事项</th>
+              <th>本轮落地</th>
+              <th>结果 / 结论</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Receiver Shader</td>
+              <td>`war3_shadow_receiver.frag` 在 TAA 开启时统一复用 `ShadowVisibility` 预计算结果；墙面稳定路径不再在 receiver 中重复 PCF/PCSS</td>
+              <td>默认 TAA 不再比“关闭 TAA”更慢，墙面稳定化路径的重复阴影采样已被收掉</td>
+            </tr>
+            <tr>
+              <td>MotionVector 门控</td>
+              <td>`d3d9_war3_shadow.cpp` 仅在 `history + prevViewProj` 可用时才跑 `Shadow/MotionVector` prepass</td>
+              <td>首帧、reset 后断档帧以及 history 失效帧不再白跑整次 motion-vector</td>
+            </tr>
+            <tr>
+              <td>前台定点回归</td>
+              <td>`dxvk_only=227.357 FPS`、`full_default=101.518 FPS`、`no_shadow_taa=101.205 FPS`</td>
+              <td>说明当前默认档仍然主要受阴影主链约束，但 `receiver + TAA` 这条子项已从“疑似热点”降回到合理区间</td>
+            </tr>
+            <tr>
+              <td>下一阶段重点</td>
+              <td>继续处理 `shadow.map` 与 `shadow.capture`</td>
+              <td>这一轮没有再去碰 UI / AA / SSAO / Queue，优先级保持和阶段二结论一致</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          证据报告：
+          `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_13_49_30.html`
+          与
+          `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_13_50_14.html`。
+          本轮 patch 已确认有效；后续若继续追 FPS，优先级应转向
+          `ShadowMap / ShadowCapture`，而不是回头削弱默认 TAA。
+        </div>
+
+        <h3>2026-03-13：内部测试控制层落地，City 专项稳定性套件完成阶段 A</h3>
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">阶段 A</div>
+            <div class="value">已落地</div>
+            <div class="sub">internal native control plane</div>
+          </div>
+          <div class="kpi">
+            <div class="name">Smoke 轮次</div>
+            <div class="value">3 / 3</div>
+            <div class="sub">小测试图控制链全通过</div>
+          </div>
+          <div class="kpi">
+            <div class="name">ShadowFactor 序列</div>
+            <div class="value">稳定</div>
+            <div class="sub">`flickerSuspect=false`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">当前阻塞</div>
+            <div class="value">City Load</div>
+            <div class="sub">standalone `-loadfile` 未真正进图</div>
+          </div>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事项</th>
+              <th>本轮落地</th>
+              <th>结果</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>内部测试控制层</td>
+              <td>`war3_internal_test_api.*` + `internal_test_request/result.json` 握手；当前发布版已收口为原生运行时链路，内部测试 API 默认为 no-op</td>
+              <td>已能安全执行 `visibility.full_map / camera.snapshot / camera.apply / shadow.debug_mode / capture.final_frame`</td>
+            </tr>
+            <tr>
+              <td>AutoTest 工具层</td>
+              <td>新增 `invoke_internal_test_api`、`set_city_test_view`、`capture_shadow_factor_sequence`、`compare_frame_sequence`、`run_city_shadow_stability_suite`、`run_city_shadow_pressure_suite`</td>
+              <td>小图 3 轮 smoke 中 `launch / ready / API / 序列比较 / stop` 全通过</td>
+            </tr>
+            <tr>
+              <td>轮询入口修正</td>
+              <td>内部测试请求轮询已从仅在深层 Hook 存在时命中的 `EngineTickUpdate` 挪到始终安装的 `EventMessagePump`</td>
+              <td>默认配置下 internal API 已不再超时</td>
+            </tr>
+            <tr>
+              <td>地图启动策略</td>
+              <td>AutoTest 现优先对 War3 根目录内的短路径地图走原位 `-loadfile`，避免不必要 copy</td>
+              <td>`City.w3x` 已验证会走 `Maps\\dz\\rpg\\City.w3x`，但 standalone 仍停在主菜单</td>
+            </tr>
+            <tr>
+              <td>夜间执行约束</td>
+              <td>专项套件改为 `City 优先，失败自动回退到 光影测试.w3x`；夜间 runner 不以中途人工汇总作为停点</td>
+              <td>确保稳定性 / 压力 / 低压回归能持续跑完，不再被单张地图加载兼容性卡死</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          阶段 A 当前已签收“控制层可用”；`City.w3x` 仍是专项优先图，但不再作为夜间执行唯一阻塞项。
+          若 standalone `-loadfile` 仍无法实际进图，自动链路会继续回退到 `光影测试.w3x`，保证稳定性 / 压力 / 低压回归整晚持续执行。
+        </div>
+
+        <h3>2026-03-12：ShadowCapture 安全 geometry 复用落地，默认档零超预算签收</h3>
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">默认档压力签收</div>
+            <div class="value">0 / 0 / 0</div>
+            <div class="sub">`budgetExceeded / incomplete / deviceLost`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">分析档真实复用</div>
+            <div class="value">4452</div>
+            <div class="sub">`actualFreezeReuseHits`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">默认档真实复用</div>
+            <div class="value">49007</div>
+            <div class="sub">`actualFreezeReuseHits`，180 秒样本</div>
+          </div>
+          <div class="kpi">
+            <div class="name">剩余热点</div>
+            <div class="value">Capture</div>
+            <div class="sub">`Shadow/Capture` traced CPU 仍居首</div>
+          </div>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事项</th>
+              <th>本轮落地</th>
+              <th>结果</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>安全 geometry 复用</td>
+              <td>`d3d9_device.cpp` 现在按 `sourceGeometrySignature` 复用首个 object-matrix geometry payload；重复实例只覆盖 `worldMatrix / batchHandle / bounds`</td>
+              <td>原始 HTML 报告已出现 `actualFreezeReuseHits / actualFreezeReuseMb` 非零</td>
+            </tr>
+            <tr>
+              <td>默认档预算语义</td>
+              <td>继续保留 `BudgetRejected` 只丢当前 caster，不污染整帧；默认档允许轻度稳定裁剪，但不缩主阴影语义</td>
+              <td>压力签收 `framesBudgetExceeded=0`、`framesIncomplete=0`</td>
+            </tr>
+            <tr>
+              <td>结构化账本</td>
+              <td>`shadowBudgetSummary` 新增 `actualFreezeReuseHits / Mb`、`reuseEligibleDuplicates`、`uniqueFreezeAcceptedMb`、`duplicateFreezeBypassMb`</td>
+              <td>“理论重复冻结”与“真实吃掉的重复冻结”已能分开观察</td>
+            </tr>
+            <tr>
+              <td>阶段结论</td>
+              <td>项目已进入“零超预算 + 真实复用生效”的稳定阶段</td>
+              <td>下一轮应继续打 capture fast-path，而不是回头削弱 PCF</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          证据报告：`E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_22_57_36.html`
+          与 `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_03_12_23_09_07.html`。
+          其中默认档 180 秒签收已满足“零超预算 / 零 incomplete / 零 device lost”；当前未达成的是
+          `Shadow/Capture` 百分比目标，后续优化主线仍锁定 capture 前端。
+        </div>
+
+        <h3>2026-03-12：唯一几何签名 × Skinned Instancing × 重复预算显性化</h3>
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">阶段语义</div>
+            <div class="value">唯一几何</div>
+            <div class="sub">进入 `geometry + instances` 口径</div>
+          </div>
+          <div class="kpi">
+            <div class="name">复用策略</div>
+            <div class="value">安全实例化</div>
+            <div class="sub">不恢复不安全 frozen-slice cache</div>
+          </div>
+          <div class="kpi">
+            <div class="name">新增实例范围</div>
+            <div class="value">Skinned</div>
+            <div class="sub">同几何 + 不同 paletteOffset</div>
+          </div>
+          <div class="kpi">
+            <div class="name">预算观察口径</div>
+            <div class="value">显性化</div>
+            <div class="sub">重复几何 / 潜在重复冻结单独统计</div>
+          </div>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事项</th>
+              <th>本轮落地</th>
+              <th>目的</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>几何签名</td>
+              <td>`War3ShadowCasterDraw` 新增 `sourceGeometrySignature / renderGeometrySignature / instanceMode`</td>
+              <td>把“同一几何、不同实例数据”从阴影链里正式区分出来</td>
+            </tr>
+            <tr>
+              <td>Skinned Instancing</td>
+              <td>`d3d9_war3_shadow.cpp` + `war3_shadow_caster_vert.vert` 现支持 vertex-blend caster 走实例化，只为每个实例切不同 `paletteOffset`</td>
+              <td>对应“30 个食尸鬼同模型、只是矩阵/调色板不同”的典型场景</td>
+            </tr>
+            <tr>
+              <td>预算账本</td>
+              <td>`shadowBudgetSummary` 新增 `uniqueGeometryCount / uniqueInstanceableGeometryCount / duplicateGeometryInstances / potentialFreezeReuseHits / Mb`</td>
+              <td>后续可直接判断预算压力是来自唯一几何本身，还是来自重复实例</td>
+            </tr>
+            <tr>
+              <td>边界约束</td>
+              <td>默认档继续禁用不安全的 `DXVK_WAR3_SHADOW_FREEZE_REUSE`</td>
+              <td>避免再次回到阴影撕裂 / 残影链路</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          这一轮的意图不是“简单拉高 Budget”，而是把后续 ShadowCapture 真正做成
+          “唯一几何 + 多实例 + 重复预算显性化”的可优化形态。后台回归时应优先观察
+          `Shadow/Capture / ShadowMap / ShadowReceiver` 百分比，以及
+          `potentialFreezeReuseMb` / `instancedGeometryDrawsSaved`。
+        </div>
+
+        <h3>2026-03-12：运行时档位矩阵与 ShadowBudget 账本</h3>
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">阶段二矩阵通过率</div>
+            <div class="value">18 / 20</div>
+            <div class="sub">`profile_matrix 20260312_131100`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">DXVK-only 基线</div>
+            <div class="value">269.000</div>
+            <div class="sub">`add_dxvk_only_r1`，隔离桌面 + benchmark fallback</div>
+          </div>
+          <div class="kpi">
+            <div class="name">默认完整栈 FPS</div>
+            <div class="value">98.746</div>
+            <div class="sub">`add_full_default_r1`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">最大单模块回收</div>
+            <div class="value">+71.016</div>
+            <div class="sub">关闭 `shadow.receiver`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">完整栈损耗差值</div>
+            <div class="value">170.254</div>
+            <div class="sub">`dxvk_only - full_default`</div>
+          </div>
+          <div class="kpi">
+            <div class="name">无效/失败档</div>
+            <div class="value">4</div>
+            <div class="sub">`hooks_minimal / hook.lifecycle / hook.render / shadow_capture_only`</div>
+          </div>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事项</th>
+              <th>本轮落地</th>
+              <th>结果 / 结论</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>运行时档位</td>
+              <td>新增 `DXVK_WAR3_PROFILE` / `DXVK_WAR3_DISABLE`，统一切换 Hook / Render / Shadow / PostFX / diag 模块</td>
+              <td>替代继续改 `war3_internal_test_config.h` 跑矩阵，避免反复污染编译态</td>
+            </tr>
+            <tr>
+              <td>AutoTest</td>
+              <td>新增 `run_profile_matrix`、profile-aware ready 判定、diag 关闭档 benchmark fallback，以及 Win32 隔离桌面启动链</td>
+              <td>阶段二矩阵默认跑在隔离桌面；已验证可启动/进图/截图/静默退出，不再干扰当前桌面工作</td>
+            </tr>
+            <tr>
+              <td>性能报告</td>
+              <td>新增 `runtimeProfile`、`moduleMatrix`、`shadowBudgetSummary`、`topShadowOffenders`</td>
+              <td>后续可直接按 phase 观察 ShadowCapture 超预算，而不是只看散乱日志</td>
+            </tr>
+            <tr>
+              <td>首轮账本</td>
+              <td>`dxvk_only=269.0`、`hooks_default=216.112`、`render_base=244.159`、`shadow_full=88.886`、`full_default=98.746`</td>
+              <td>说明完整栈掉帧主因在阴影链，不在 DXVK 核心；Hook 总成本远低于阴影主链</td>
+            </tr>
+            <tr>
+              <td>减法矩阵结论</td>
+              <td>关闭 `shadow.receiver/map/capture` 的收益分别为 `+71.016 / +67.508 / +67.463 FPS`；关闭 `hook.ui` 仅 `+0.898 FPS`</td>
+              <td>`render.queue/aa/postfx/ssao/shadow.taa` 当前短样本收益接近零或轻微波动，第三阶段优先级明显低于阴影主链</td>
+            </tr>
+            <tr>
+              <td>残留异常</td>
+              <td>`shadow_capture_only` 仍是独立异常 profile；`sub_no_hook_render` 直接卡在 ready 前；`hooks_minimal` 与 `sub_no_hook_lifecycle` 被标记为无效测量</td>
+              <td>阶段二已把“真热点”和“无效样本”拆开，第三阶段不会再被这些 profile 假象误导</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          本轮产物：
+          `AutoTest/artifacts/profile_matrix/20260312_131100/profile_matrix.json`
+          与
+          `AutoTest/artifacts/profile_matrix/20260312_131100/profile_matrix.html`。
+          阶段二结论已经足够明确：第三阶段优先级应固定为
+          `shadow.receiver -> shadow.map -> shadow.capture`，
+          而不是继续分散到 Hook/UI/AA/SSAO。
+        </div>
+
+        <div class="grid">
+          <div class="kpi">
+            <div class="name">画质默认 FPS</div>
+            <div class="value">122.896</div>
+            <div class="sub">`2026-02-25 05:14:58`（E0，60s）</div>
+          </div>
+          <div class="kpi">
+            <div class="name">性能实验上限 FPS</div>
+            <div class="value">209.268</div>
+            <div class="sub">`2026-02-25 05:16:23`（E1，60s）</div>
+          </div>
+          <div class="kpi">
+            <div class="name">默认配置语义</div>
+            <div class="value">画质优先</div>
+            <div class="sub">已恢复 mode1 ShadowCapture</div>
+          </div>
+          <div class="kpi">
+            <div class="name">组合矩阵通过率</div>
+            <div class="value">12 / 12</div>
+            <div class="sub">主矩阵 8/8 + 上限矩阵 4/4</div>
+          </div>
+          <div class="kpi">
+            <div class="name">第四轮逻辑层未知项</div>
+            <div class="value">0.000ms</div>
+            <div class="sub">`avgUntrackedActiveCpuMs`（2026-02-25 04:02:51）</div>
+          </div>
+          <div class="kpi">
+            <div class="name">150+ 目标</div>
+            <div class="value">实验可达成</div>
+            <div class="sub">仅性能实验档（E1）</div>
+          </div>
+        </div>
+
+        <h3>今晚做了什么</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>轮次</th>
+              <th>实施项</th>
+              <th>结果</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>第三轮（续跑）</td>
+              <td>渲染层落实 `C4 + C1`：`Hook_FlushSortedItems` 空队列早退链路 + Dispatch 查询前置归并（复用 stageHint）</td>
+              <td>60 秒 AutoTest 稳定通过，截图基线一致（2560x1440），未出现崩溃或渲染异常</td>
+            </tr>
+            <tr>
+              <td>第五轮</td>
+              <td>渲染优化 P0/P1/P2：关闭高频诊断默认计数、保守接管阈值自适应、透明排序快路径、ShadowMap 自适应隔帧更新</td>
+              <td>AutoTest 两轮稳定通过；FPS 从 100.127 提升到 112.122（峰值），帧时明显下降</td>
+            </tr>
+            <tr>
+              <td>第五轮（补执行矩阵）</td>
+              <td>新增 `round5_perf_matrix` + `round5_extra_matrix`（均 60s），并按矩阵结果回写高性能配置</td>
+              <td>主矩阵最佳 `122.804 FPS`；上限探索 `209.268 FPS`（关闭 mode1 ShadowCapture，仅实验用途）</td>
+            </tr>
+            <tr>
+              <td>第六轮</td>
+              <td>渲染层优化 × 逻辑层优化组合矩阵（8 组）全覆盖验证，自动编译+启动+性能+截图一致性检查</td>
+              <td>初次发现 1 组失败（JASS 深层 Hook）；定位并修复后 8/8 全通过</td>
+            </tr>
+            <tr>
+              <td>第六轮修复</td>
+              <td>`executeJassFunctionInternal` 地址从中段 `0x7F2D92` 修正为入口 `0x7F2B40`；并新增 x86 函数序言校验防误 Hook</td>
+              <td>故障组合复测通过，避免启动期崩溃复现</td>
+            </tr>
+            <tr>
+              <td>第四轮（MainLoop 逻辑层）</td>
+              <td>开启 MainLoop 覆盖分析模式（深层阶段 + Wait 链 + JASS 追踪），并新增 `DispatchModule/*` 语义分桶与 `UntrackedActive` 显式分桶</td>
+              <td>60 秒 AutoTest：主线程活跃段 `avgUntrackedActiveCpuMs=0.000`，覆盖率达到 100%</td>
+            </tr>
+            <tr>
+              <td>第四轮（MainLoop 续作）</td>
+              <td>落实上一轮全部方案：`Dispatch` 循环聚合上报、`TickUpdate` 子路径 `Self/Sub` 拆分、`RunCallbacks` TopN 来源分桶、`PrepareDispatch` 低开销路径</td>
+              <td>60 秒 AutoTest：无崩溃，`avgUntrackedActiveCpuMs=0.000` 持续保持，新增 `TickUpdate/Self` 与 `Caller_*` 证据节点</td>
+            </tr>
+            <tr>
+              <td>第四轮（二次收敛）</td>
+              <td>将 `RunCallbacks/PrepareDispatch/TickUpdate` 从“逐调用上报”改为“每循环聚合批量上报”，减少采样热路径锁开销</td>
+              <td>60 秒 AutoTest：`avgFps=100.883`，`avgFrameTimeMs=9.912`，`avgUntrackedActiveCpuMs=0.000`，稳定无崩溃</td>
+            </tr>
+            <tr>
+              <td>第四轮（报告语义补强）</td>
+              <td>新增四张 MainLoop 深度表：`Dispatch Case`、`Dispatch Module`、`TickUpdate Sub`、`RunCallbacks Caller`；并将 `DispatchModule` 明确标记为 `CaseMapped`</td>
+              <td>报告可直接定位逻辑层热点与归因边界，不再把“语义分桶”误读为“子函数独立 Hook”</td>
+            </tr>
+            <tr>
+              <td>第四/第五轮补齐（IDA MCP）</td>
+              <td>通过 HTTP MCP 直连 IDA，补齐 `0x6F05F710` 根循环 + `0x6F05A310` 分发表 + case0~14 子函数的函数级证据；并新增 `mainLoopFunctionBreakdown / mainLoopDispatchCaseFunctions / mainLoopUnknownAttribution / mainLoopThreadSplit`</td>
+              <td>分析档 60s 达成 `cpuCoveragePct=100%`、`avgUntrackedActiveCpuMs=0.000`，默认档保持性能优先</td>
+            </tr>
+            <tr>
+              <td>第四/第五轮收口（Untracked 查明）</td>
+              <td>开启 MainLoop 分析档后执行 60s 全量验收，严格核对 Unknown 归因与线程拆分口径；同步更新 MainLoop 完整结构报告（函数级链路 + 模块职责 + 时序图）</td>
+              <td>`war3_perf_report_auto_2026_02_25_14_23_51.html`：`cpuCoveragePct=100%`，`avgUntrackedActiveCpuMs=0.000`，未知项已闭环</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>性能障碍与处理路径</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>层级</th>
+              <th>主要障碍</th>
+              <th>证据（本夜报告）</th>
+              <th>处理策略</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>渲染层</td>
+              <td>`Hook_FlushAndReset/Orig`、透明排序与 mode1 阴影捕获链路开销</td>
+              <td>矩阵显示关闭 `mode1 ShadowCapture` 后 FPS 可从 `122.896` 抬升至 `209.268`</td>
+              <td>保守接管自适应、透明排序快路径、ShadowMap 自适应更新；`mode1` 关闭 ShadowCapture 仅用于上限分析</td>
+              <td><span class="status ok">已落地并区分默认/实验档</span></td>
+            </tr>
+            <tr>
+              <td>逻辑层</td>
+              <td>主循环深层采样与 Wait 链路 Hook 会引入额外观测成本；JASS 深层 Hook 有地址漂移风险</td>
+              <td>“全开组合”FPS 低于最佳渲染配置；深层 JASS 组合初测直接失败</td>
+              <td>默认关闭重型逻辑诊断；深层 JASS 改为入口地址 + 函数序言双校验</td>
+              <td><span class="status ok">兼容问题已修复</span></td>
+            </tr>
+            <tr>
+              <td>观测口径</td>
+              <td>性能模式下 `cpuCoveragePct` 下降，易与“未采样”混淆</td>
+              <td>关闭深层计时后覆盖率下降，但 FPS 提升</td>
+              <td>区分“性能模式（低开销）”与“分析模式（高覆盖）”两套配置</td>
+              <td><span class="status warn">需持续宣贯口径</span></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>第六轮组合矩阵（修复后结论）</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>组合</th>
+              <th>说明</th>
+              <th>AutoTest</th>
+              <th>FPS</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>`C0_base`</td>
+              <td>渲染优化基础包 + 逻辑优化关闭</td>
+              <td><span class="status ok">通过</span></td>
+              <td>108.273</td>
+            </tr>
+            <tr>
+              <td>`C1_render_local_merge`</td>
+              <td>基础包 + Dispatch 局部合并</td>
+              <td><span class="status ok">通过</span></td>
+              <td>108.590（矩阵最佳）</td>
+            </tr>
+            <tr>
+              <td>`C2_logic_jass_adaptive`</td>
+              <td>基础包 + JASS 预算自适应</td>
+              <td><span class="status ok">通过</span></td>
+              <td>106.828</td>
+            </tr>
+            <tr>
+              <td>`C3_render_local_merge_plus_jass_adaptive`</td>
+              <td>局部合并 + JASS 自适应</td>
+              <td><span class="status ok">通过</span></td>
+              <td>108.428</td>
+            </tr>
+            <tr>
+              <td>`C4_logic_mainloop_deep`</td>
+              <td>基础包 + MainLoop 深层阶段 Hook</td>
+              <td><span class="status ok">通过</span></td>
+              <td>107.369</td>
+            </tr>
+            <tr>
+              <td>`C5_logic_wait_hooks`</td>
+              <td>基础包 + Wait Hook（含 deep）</td>
+              <td><span class="status ok">通过</span></td>
+              <td>107.402</td>
+            </tr>
+            <tr>
+              <td>`C6_logic_jass_deep_hooks`</td>
+              <td>基础包 + JASS 深层 Hook（高风险）</td>
+              <td><span class="status ok">修复后通过</span></td>
+              <td>108.354（复测）</td>
+            </tr>
+            <tr>
+              <td>`C7_all_optimizations`</td>
+              <td>渲染/逻辑高开关全开</td>
+              <td><span class="status ok">通过</span></td>
+              <td>104.464（观测开销较高）</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          第五轮矩阵证据：`AutoTest/artifacts/round5_matrix/round5_matrix_results.json`、`AutoTest/artifacts/round5_matrix/round5_extra_matrix_results.json`。<br />
+          第五轮关键报告：`war3_perf_report_auto_2026_02_25_05_14_58.html`（E0 基线）、
+          `war3_perf_report_auto_2026_02_25_05_16_23.html`（E1 上限，实验档）、
+          `war3_perf_report_auto_2026_02_25_05_23_00.html`（实验档复测 196.917 FPS）。<br />
+          自动化证据：`AutoTest/artifacts/round6_matrix/round6_matrix_results.json`。<br />
+          第三轮续跑报告：`war3_perf_report_auto_2026_02_25_03_40_41.html`（基线）、
+          `war3_perf_report_auto_2026_02_25_03_44_03.html`（优化后）。<br />
+          第四轮 MainLoop 报告：`war3_perf_report_auto_2026_02_25_04_02_51.html`（逻辑层未知项压缩）。<br />
+          本轮 IDA 逆向文档：`docs/research/war3_render_issues/12_mainloop_full_reverse/README.md`。<br />
+          本轮 60s 验收：`war3_perf_report_auto_2026_02_25_13_13_22.html`（默认档复测）、
+          `war3_perf_report_auto_2026_02_25_13_04_14.html`（分析档，覆盖率 100%）。<br />
+          Untracked 收口验收：`war3_perf_report_auto_2026_02_25_14_23_51.html`（coverage 100%，unknown 0）、
+          `war3_perf_report_auto_2026_02_25_14_36_29.html`（二次复测一致）。<br />
+          第四轮续作报告：`war3_perf_report_auto_2026_02_25_04_29_44.html`（方案全落实 + 60s 稳定性验证）、
+          `war3_perf_report_auto_2026_02_25_04_34_34.html`（补充复测）、
+          `war3_perf_report_auto_2026_02_25_04_45_11.html`（聚合上报二次收敛）。<br />
+          截图链路说明：旧 `CopyFromScreen` 在窗口被覆盖时会抓到桌面；已改为 `PrintWindow` 优先，需 MCP 服务重启后生效。<br />
+          关键报告：`war3_perf_report_auto_2026_02_24_04_03_01.html`（基线）、
+          `war3_perf_report_auto_2026_02_24_04_14_19.html`（第五轮最佳）、
+          `war3_perf_report_auto_2026_02_24_04_32_38.html`（C6 修复后复测）。
+        </div>
+      </section>
+
+      <section class="panel" data-section="metrics">
+        <h2>数据指标</h2>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>指标</th>
+              <th>当前值</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Hook 域源码文件数</td>
+              <td><code>18</code></td>
+              <td>`src/d3d9/war3/hooks/`</td>
+            </tr>
+            <tr>
+              <td>主入口规模</td>
+              <td><code>548</code> 行</td>
+              <td>`src/d3d9/d3d9_war3_hook.cpp`</td>
+            </tr>
+            <tr>
+              <td>Shadow 核心文件规模</td>
+              <td><code>2734</code> 行</td>
+              <td>`src/d3d9/d3d9_war3_shadow.cpp`</td>
+            </tr>
+            <tr>
+              <td>Shadow 描边模块规模</td>
+              <td><code>772</code> 行</td>
+              <td>`src/d3d9/d3d9_war3_shadow_outline.cpp`</td>
+            </tr>
+            <tr>
+              <td>Shadow 资源模块规模</td>
+              <td><code>596</code> 行</td>
+              <td>`src/d3d9/d3d9_war3_shadow_resources.cpp`</td>
+            </tr>
+            <tr>
+              <td>本轮构建验证</td>
+              <td><code>ninja -C build32</code> 通过</td>
+              <td>含新增模块接线与符号链接检查</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>目录快照</h3>
+        <pre>src/d3d9/war3/
+  core/      render/      hooks/      shader/
+  handle/    platform/    state/      tools/
+  native/    reimpl/      ui/         game/</pre>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'base',
+      themeVariables: {
+        primaryColor: '#f9f3ea',
+        primaryTextColor: '#1c1a17',
+        primaryBorderColor: '#c3b7a7',
+        lineColor: '#6f6256',
+        secondaryColor: '#eef5f4',
+        tertiaryColor: '#fff8ef',
+        fontFamily: 'Space Grotesk, Noto Sans SC, sans-serif'
+      },
+      flowchart: { curve: 'basis' }
+    });
+
+    const navItems = document.querySelectorAll('.nav-item');
+    const panels = document.querySelectorAll('.panel');
+
+    navItems.forEach(item => {
+      item.addEventListener('click', () => {
+        const target = item.dataset.target;
+        navItems.forEach(n => n.classList.toggle('active', n === item));
+        panels.forEach(p => p.classList.toggle('active', p.dataset.section === target));
+      });
+    });
+  </script>
+</body>
+
+</html>

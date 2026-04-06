@@ -1,0 +1,2346 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>War3MapReforge Shader Docs</title>
+  <style>
+    :root {
+      --bg-1: #f7f2ea;
+      --bg-2: #e9e1d2;
+      --ink: #1f1b16;
+      --ink-soft: #4a4037;
+      --accent: #c2592a;
+      --accent-2: #116466;
+      --panel: rgba(255, 255, 255, 0.78);
+      --line: rgba(31, 27, 22, 0.12);
+      --glow: rgba(194, 89, 42, 0.22);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 800px at 10% 0%, rgba(194, 89, 42, 0.12), transparent 60%),
+        radial-gradient(900px 700px at 90% 10%, rgba(17, 100, 102, 0.16), transparent 55%),
+        linear-gradient(180deg, var(--bg-1), var(--bg-2));
+      font-family: "Space Grotesk", "Noto Sans SC", sans-serif;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 24px;
+      padding: 24px;
+      max-width: 1400px;
+      margin: 0 auto;
+      animation: pageIn 0.6s ease both;
+    }
+
+    header {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 20px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: 0 12px 30px rgba(31, 27, 22, 0.08);
+      backdrop-filter: blur(10px);
+    }
+
+    header h1 {
+      font-size: 22px;
+      margin: 0;
+      font-family: "Noto Serif SC", "Source Serif 4", serif;
+      letter-spacing: 0.02em;
+    }
+
+    header .meta {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      color: var(--ink-soft);
+      font-size: 13px;
+    }
+
+    .badge {
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.65);
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 16px;
+      align-self: start;
+      padding: 16px;
+      border-radius: 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      box-shadow: 0 10px 26px rgba(31, 27, 22, 0.08);
+      backdrop-filter: blur(10px);
+      height: calc(100vh - 120px);
+      overflow: auto;
+    }
+
+    .nav-group {
+      margin-bottom: 18px;
+    }
+
+    .nav-group h3 {
+      margin: 0 0 10px;
+      font-size: 13px;
+      color: var(--ink-soft);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      border-radius: 10px;
+      font-size: 14px;
+      color: var(--ink);
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .nav-item:hover {
+      background: rgba(17, 100, 102, 0.08);
+    }
+
+    .nav-item.active {
+      background: rgba(194, 89, 42, 0.12);
+      box-shadow: inset 0 0 0 1px rgba(194, 89, 42, 0.25);
+      color: var(--accent);
+    }
+
+    .content {
+      padding: 8px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      padding: 28px 30px;
+      box-shadow: 0 16px 32px rgba(31, 27, 22, 0.08);
+      backdrop-filter: blur(10px);
+      margin-bottom: 24px;
+      display: none;
+      animation: panelIn 0.35s ease both;
+    }
+
+    .panel.active {
+      display: block;
+    }
+
+    .panel h2 {
+      margin-top: 0;
+      font-size: 26px;
+      font-family: "Noto Serif SC", "Source Serif 4", serif;
+    }
+
+    .panel h3 {
+      margin-top: 24px;
+      font-size: 18px;
+    }
+
+    .panel p {
+      color: var(--ink-soft);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin: 16px 0;
+    }
+
+    .card {
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      padding: 12px 14px;
+      background: rgba(255, 255, 255, 0.65);
+      box-shadow: 0 6px 18px rgba(31, 27, 22, 0.05);
+    }
+
+    .card strong {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    code,
+    pre {
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      font-size: 13px;
+    }
+
+    pre {
+      margin: 16px 0;
+      padding: 14px;
+      border-radius: 12px;
+      background: #14110f;
+      color: #f7f2ea;
+      overflow: auto;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(17, 100, 102, 0.12);
+      color: var(--accent-2);
+      font-size: 12px;
+      margin-right: 6px;
+      margin-bottom: 6px;
+    }
+
+    .note {
+      padding: 12px 14px;
+      border-left: 3px solid var(--accent);
+      background: rgba(194, 89, 42, 0.08);
+      border-radius: 10px;
+      color: var(--ink);
+      margin: 16px 0;
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+    }
+
+    .table th,
+    .table td {
+      text-align: left;
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+    }
+
+    .table th {
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    @keyframes pageIn {
+      from {
+        opacity: 0;
+        transform: translateY(12px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @keyframes panelIn {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (max-width: 900px) {
+      .app {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        position: relative;
+        height: auto;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="app">
+    <header>
+      <h1>War3MapReforge Shader 文档</h1>
+      <div class="meta">
+        <span class="badge">War3Material</span>
+        <span class="badge">HLSL + JSON</span>
+        <span class="badge">2026.03.12（运行时档位矩阵与 ShadowBudget 账本）</span>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <div class="nav-group">
+        <h3>概览</h3>
+        <div class="nav-item active" data-target="overview">入口与目标</div>
+        <div class="nav-item" data-target="framework">框架与算法总览</div>
+        <div class="nav-item" data-target="changelog">更新日志</div>
+        <div class="nav-item" data-target="pipeline">渲染阶段</div>
+      </div>
+      <div class="nav-group">
+        <h3>Buffers</h3>
+        <div class="nav-item" data-target="buffer-scene">SceneColor / SceneDepth</div>
+        <div class="nav-item" data-target="buffer-shadowcolor">ShadowColor</div>
+        <div class="nav-item" data-target="buffer-outline">OutlineMask</div>
+      </div>
+      <div class="nav-group">
+        <h3>Uniforms</h3>
+        <div class="nav-item" data-target="uniform-global">全局 Uniform</div>
+        <div class="nav-item" data-target="uniform-material">材质 Uniform</div>
+      </div>
+      <div class="nav-group">
+        <h3>Materials</h3>
+        <div class="nav-item" data-target="material-api">War3Material API</div>
+        <div class="nav-item" data-target="material-json">JSON 配置</div>
+      </div>
+      <div class="nav-group">
+        <h3>Macros</h3>
+        <div class="nav-item" data-target="macros">语义宏与约定</div>
+      </div>
+      <div class="nav-group">
+        <h3>API 参考</h3>
+        <div class="note">建议外部作者直接包含聚合头 <code>src/d3d9/war3_sdk.h</code>，统一获得 Shader API / ShaderPack / 模块系统接口。</div>
+        <div class="nav-item" data-target="api-events">渲染事件系统</div>
+        <div class="nav-item" data-target="api-jass">JASS 脚本 API</div>
+        <div class="nav-item" data-target="api-structs">数据结构</div>
+        <div class="nav-item" data-target="api-vulkan">Vulkan 扩展</div>
+      </div>
+      <div class="nav-group">
+        <h3>UI</h3>
+        <div class="nav-item" data-target="ui-api">ImGui UI API</div>
+      </div>
+      <div class="nav-group">
+        <h3>稳定性</h3>
+        <div class="nav-item" data-target="stability">回退策略</div>
+        <div class="nav-item" data-target="crash-report">崩溃报告</div>
+      </div>
+      <div class="nav-group">
+        <h3>性能</h3>
+        <div class="nav-item" data-target="perf-report">性能报告</div>
+      </div>
+      <div class="nav-group">
+        <h3>示例</h3>
+        <div class="nav-item" data-target="example-hlsl">默认 HLSL</div>
+        <div class="nav-item" data-target="example-outline">描边 HLSL</div>
+        <div class="nav-item" data-target="example-json">ShaderPack 示例</div>
+      </div>
+      <div class="nav-group">
+        <h3>FAQ</h3>
+        <div class="nav-item" data-target="faq">常见问题</div>
+      </div>
+      <div class="nav-group">
+        <h3>架构</h3>
+        <a class="nav-item" href="architecture.html" style="text-decoration:none;color:inherit;">项目架构图 →</a>
+        <a class="nav-item" href="refactor_status.html" style="text-decoration:none;color:inherit;">行业化重构看板 →</a>
+        <a class="nav-item" href="refactor_status.html" style="text-decoration:none;color:inherit;">夜间收官/续跑总结（轮5-6 + 第三轮） →</a>
+        <a class="nav-item" href="jass_render_architecture.html" style="text-decoration:none;color:inherit;">JASS 与渲染架构（留言1-4） →</a>
+        <a class="nav-item" href="rendering_pipeline.html" style="text-decoration:none;color:inherit;">每帧渲染流程 →</a>
+      </div>
+    </aside>
+
+    <main class="content">
+      <section class="panel active" data-section="overview">
+        <h2>入口与目标</h2>
+        <p>War3Material 提供可热重载的 HLSL 管线，目标是把光照、描边等效果从 C++ 硬编码迁移到外部 Shader 资源。引擎只负责提供数据与状态，渲染表现完全由开发者掌控。</p>
+        <div class="grid">
+          <div class="card">
+            <strong>核心思想</strong>
+            <div>寄存器即 Uniform。C++ 将世界状态写入寄存器，HLSL 负责输出风格。</div>
+          </div>
+          <div class="card">
+            <strong>兼容路径</strong>
+            <div>当没有覆盖材质时，渲染路径回退到原生 fixed-function / 旧版 shader。</div>
+          </div>
+          <div class="card">
+            <strong>开放目标</strong>
+            <div>让二开作者像 Iris 一样，把效果做成包、切换包、热改包。</div>
+          </div>
+        </div>
+        <div class="note">提示：默认包已提供世界光照与几何描边示例，启用方式见 JSON 配置页。</div>
+      </section>
+
+      <section class="panel" data-section="framework">
+        <h2>框架与算法总览</h2>
+        <p>此页整理“逻辑层 → 桥接层 → 渲染层 → ShaderPack”的完整路径，并给出当前采用的算法清单与组合评估。</p>
+
+        <h3>分层结构</h3>
+        <div class="grid">
+          <div class="card">
+            <strong>逻辑层</strong>
+            <div>JASS / C API 写入渲染设置与句柄列表，触发事件链。</div>
+          </div>
+          <div class="card">
+            <strong>桥接层</strong>
+            <div>SceneCollector + ExecBatch/TLS 解析 SceneNode → jHandle。</div>
+          </div>
+          <div class="card">
+            <strong>渲染层</strong>
+            <div>War3Pipeline 负责 ShadowReceiver / SSAO / Outline / ShaderPack。</div>
+          </div>
+          <div class="card">
+            <strong>扩展层</strong>
+            <div>ShaderPack JSON + HLSL/GLSL + ImGui 实时调参。</div>
+          </div>
+        </div>
+
+        <h3>算法清单</h3>
+        <div class="grid">
+          <div class="card">
+            <strong>CSM 级联阴影</strong>
+            <div>级联分区 + 过渡带混合，支持 1~4 级联。</div>
+          </div>
+          <div class="card">
+            <strong>PCF / PCSS</strong>
+            <div>PCF 支持 3x3/5x5/Poisson16/Poisson25，旋转可选屏幕/世界稳定。</div>
+          </div>
+          <div class="card">
+            <strong>NormalBias</strong>
+            <div>深度重建法线 + 法线偏移，默认启用以抑制自遮挡条纹。</div>
+          </div>
+          <div class="card">
+            <strong>Alpha Shadow</strong>
+            <div>支持 Hash Alpha / Mip / LOD Bias / 远级联阈值偏移，改善树叶阴影毛刺抖动。</div>
+          </div>
+          <div class="card">
+            <strong>AdaptiveBias</strong>
+            <div>基于入射角的自适应偏移，进一步缓解对象自遮挡条纹。</div>
+          </div>
+          <div class="card">
+            <strong>时间线性阴影高度</strong>
+            <div>用时间线性映射日夜高度，阴影长度变化更均匀。</div>
+          </div>
+          <div class="card">
+            <strong>线性滤波阴影采样</strong>
+            <div>ShadowMap 线性采样，降低树影与墙面闪烁。</div>
+          </div>
+          <div class="card">
+            <strong>轮廓光</strong>
+            <div>基于视角法线的边缘提亮，可用于夜战或英雄强调。</div>
+          </div>
+          <div class="card">
+            <strong>屏幕空间描边</strong>
+            <div>双通道 Mask + 边缘检测，支持可见/遮挡开关。</div>
+          </div>
+          <div class="card">
+            <strong>几何描边</strong>
+            <div>背面扩展 + 轮廓渲染（Silhouette / Fill）。</div>
+          </div>
+          <div class="card">
+            <strong>SSAO</strong>
+            <div>随机采样半径 + 强度曲线 + 距离衰减。</div>
+          </div>
+          <div class="card">
+            <strong>Bloom / 曝光</strong>
+            <div>亮度阈值 + 软膝 + 强度控制。</div>
+          </div>
+          <div class="card">
+            <strong>日夜与环境</strong>
+            <div>日夜光照插值 + 环境光/曝光调整。</div>
+          </div>
+        </div>
+
+        <h3>组合评估</h3>
+        <ul>
+          <li>当前组合（CSM + PCF + NormalBias + 屏幕空间描边）在成本/质量间较平衡，适合主线默认。</li>
+          <li>PCSS 成本较高，推荐用于高端设备或战斗镜头短时启用。</li>
+          <li>几何描边与屏幕描边互斥，避免重复绘制导致过亮或边缘噪点。</li>
+          <li>NormalBias 能明显缓解自遮挡条纹，但过大可能出现“peter-panning”。</li>
+          <li>AdaptiveBias 适合条纹明显的机型，但偏移过大仍可能出现轻微漂浮感。</li>
+          <li>时间线性高度适合强调昼夜均匀变化；真实高度更接近物理轨迹。</li>
+        </ul>
+
+        <h3>已落地的性能优化</h3>
+        <ul>
+          <li><strong>时间平滑（PLL）</strong>：对 <code>War3RenderState::GetGameTime()</code> 的 100ms 台阶做“速度外推 + 误差回正”，把太阳时间从 10Hz 跳变变为逐帧连续，显著降低高机位阴影抖动/刺闪。</li>
+          <li><strong>后处理 Ping-Pong</strong>：BeforeUi 阶段仅一次性拷贝 SceneColor/SceneDepth，并通过 <code>War3PipelineInput.srcColorView</code>/<code>depthCopyView</code> 将输入在 Shadow/SSAO/AA 间串联，减少重复全屏 Copy 的固定带宽税。</li>
+          <li><strong>ShadowCapture 冻结裁剪</strong>：冻结动态 VB/IB 时只 Copy 本次 draw 实际需要的字节范围，并重映射 draw 参数，避免“从 offset 到 buffer 末尾”整段冻结。</li>
+          <li><strong>ShadowMap 级联剔除</strong>：为投射体记录保守包围球（center+radius），ShadowMap 每级联做裁剪空间包围球测试，减少多级联重放的无效 draw（兵海/超大地图收益更明显）。</li>
+          <li><strong>ShadowMap 排序 + 状态去重</strong>：按 pipelineHash/纹理/VB/IB 排序，并缓存 pipeline/纹理/VB/IB 绑定状态，减少 Vulkan 绑定调用次数与 CPU 开销。</li>
+          <li><strong>非骨骼对象 GPU 端 MVP</strong>：将非混合物体 worldMatrix 追加写入矩阵 SSBO，在 VS 内计算 <code>(pos * world) * lightVP</code>；CPU 侧仅推 lightVP + matrixIndex。同时修复矩阵 SSBO 的 set/binding 与 DXVK bindless sampler heap 约定不一致导致的描边/遮罩不生效问题。</li>
+        </ul>
+        <pre><code>// Ping-Pong（BeforeUi）
+copy SceneColor -&gt; Ping
+copy SceneDepth -&gt; DepthCopy
+Shadow(Ping -&gt; Pong) -&gt; SSAO(Pong -&gt; Ping) -&gt; AA(Ping -&gt; SceneColor)
+
+// Indexed 冻结裁剪（示意）
+vbStart = BaseVertexIndex + MinVertexIndex
+vbBytes = NumVertices * stride
+vbOffset += vbStart * stride
+vertexOffset = BaseVertexIndex - vbStart   // == -MinVertexIndex
+
+ibOffset += StartIndex * indexStride
+        ibBytes  = IndexCount * indexStride
+firstIndex = 0</code></pre>
+
+        <h3>Shadow TAA（时域阴影滤波）</h3>
+        <ul>
+          <li><strong>目标</strong>：降低 Alpha-Test（树叶/栅栏等）阴影边缘的帧间闪烁。</li>
+          <li><strong>核心思路</strong>：把“当前帧阴影可见性”与“历史阴影可见性”按运动向量重投影对齐，再做指数移动平均（EMA）。</li>
+          <li><strong>鬼影抑制</strong>：可选 3x3 邻域夹紧（Neighborhood Clamping），将历史值限制在当前邻域的 min/max 范围内。</li>
+          <li><strong>限制</strong>：当前阶段仅生成“相机运动向量”（深度重建 worldPos + prevViewProj 重投影），不包含逐物体动画/位移/骨骼的运动向量。</li>
+          <li><strong>调试</strong>：ShadowDebugMode 新增 <code>MotionVector</code>/<code>ShadowHistory</code> 可视化。</li>
+        </ul>
+        <pre><code>// 1) ShadowVisibility（当前帧）
+vis = PCF/PCSS(ShadowMap, depthReconstructWorldPos)
+write ShadowCurrent(R8)
+
+// 2) MotionVector（相机）
+mv = currUv - prevUv      // 由 depth 重建 worldPos 后重投影
+write MotionVector(RG16F)
+
+// 3) Receiver（时域混合）
+historyUv = uv - mv
+history = sample(ShadowHistory, historyUv)
+history = clamp(history, min/max(ShadowCurrent 3x3))
+finalVis = mix(history, currVis, blendFactor)
+store ShadowHistoryWrite(finalVis)</code></pre>
+        <div class="note">参考：UE4 “High Quality Temporal Supersampling”（Karis, 2014）、Frostbite TAA（Jimenez 等）、SMAA T2x（Jimenez）。</div>
+
+        <h3>可优化方向</h3>
+        <ul>
+          <li>引入 EVSM/VSM 或 caster 端 slope-scale bias，进一步稳定大角度阴影。</li>
+          <li>为 CSM 增加分区稳定化（snap-to-texel），减少相机抖动。</li>
+          <li>描边增加深度+法线边缘检测阈值，提升细节可控性。</li>
+          <li>对 SSAO/PCSS 增加降分辨率与时域降噪，降低帧内开销。</li>
+        </ul>
+
+        <h3>模型管线（逆向中）</h3>
+        <ul>
+          <li>已建立 set_model Hook 与路径重映射入口，用于记录模型加载与预留 FBX 注入点。</li>
+          <li>当前策略为“FBX 预转换为 MDX + 路径替换”，后续可接入实时转换器。</li>
+        </ul>
+      </section>
+
+        <section class="panel" data-section="changelog">
+          <h2>更新日志</h2>
+          <p>以下记录聚焦于渲染管线与工具链的关键更新，方便二开作者跟进。</p>
+          <div class="card">
+            <strong>2026.04.05 | v1.1.0：路径阻断器修复、StormBreaker 内置、GPU Arena 更新、静态模型缓存接线</strong>
+            <ul>
+              <li>修复了路径阻断器被错误渲染进游戏场景的问题，避免无效几何继续污染世界渲染与阴影输入。</li>
+              <li>项目已内置整合 <code>StormBreaker</code>，用于承接更稳定的内存管理与运行时基础设施。</li>
+              <li><code>GPU Arena</code> 本轮继续更新，围绕阴影捕获、几何预算与运行时资源管理做了进一步铺路。</li>
+              <li>缓存机制进入第一阶段：当前只缓存静态模型；动态单位、飞行单位和蒙皮多边形仍明确走非缓存路径，避免阴影静止或姿态错误。</li>
+            </ul>
+            <div class="note">这版重点是“修掉错误输入 + 建好底座 + 点亮静态缓存”。动态 Pose Takeover 仍是下一阶段主任务。</div>
+          </div>
+          <div class="card">
+            <strong>2026.03.13 | City 阴影热修：恢复单位/建筑类 VS caster 采集，移除选择圈/范围目标伪 caster</strong>
+            <ul>
+              <li>`d3d9_device.cpp` 的 `Shadow/Capture` 早期门控已从“VS 仅允许地形/装饰物”收紧为“允许真正的 `WorldObjects`、单位、建筑、可破坏物、物品进入 VS caster 路径”，修正了 City 中“装饰物有阴影、单位几乎不投影”的误筛问题。</li>
+              <li>同步将 `S7` 选择圈与 `S12` 范围目标从默认 object-caster 集合中剔除，避免非真实几何污染 shadow map，降低墙面游动与 shadow map 被伪 caster 占用的风险。</li>
+              <li>这轮目标不是改 PCF 或 receiver，而是先把 shadow map 的输入恢复正确；若单位主体阴影恢复后墙面仍游动，再继续沿 CSM/update 稳定路径收口。</li>
+            </ul>
+            <div class="note">本轮是 City 场景专项止血：先修“谁被收进 shadow map”，再继续看墙面 receiver/CSM 稳定性。</div>
+          </div>
+          <div class="card">
+            <strong>2026.03.13 | 内部测试控制层落地，AutoTest 已可直调原版 native / 控镜头 / 抓 ShadowFactor 序列</strong>
+            <ul>
+              <li>新增 `war3_internal_test_api.*`，通过 `WarVK/Temp/internal_test_request.json -> internal_test_result.json` 在游戏主线程安全点处理内部测试命令，不走鼠标键盘，不改地图脚本。</li>
+              <li>底层现已切换为仅保留原生运行时链路，当前支持 `visibility.full_map`、`camera.snapshot`、`camera.apply`、`camera.sweep_aoa`、`shadow.debug_mode`、`runtime.log_marker`、`capture.final_frame`。</li>
+              <li>AutoTest 新增 `invoke_internal_test_api`、`set_city_test_view`、`capture_shadow_factor_sequence`、`compare_frame_sequence`、`run_city_shadow_stability_suite`、`run_city_shadow_pressure_suite`；其中连续帧比较直接基于最终帧 BMP 抽样，不依赖外部截图工具。</li>
+              <li>阶段 A 已完成 3 轮 smoke：小测试图在 `full_analysis + DXVK_WAR3_INTERNAL_TEST_API=1` 下，`launch / ready / camera.snapshot / ShadowFactor 3 帧序列比较 / silent stop` 全部通过，且 `flickerSuspect=false`、`missingShadowSuspect=false`。</li>
+              <li>AutoTest 启动链现新增“原位短相对路径优先”：若地图本身已位于 War3 根目录内且路径足够短，会直接使用原位 `-loadfile`，不再强制复制到 `Maps\\Test\\WorldEditTestMap.w3x`。</li>
+              <li>当前明确阻塞点是 `City.w3x` 的 standalone 启动兼容性：无论复制短路径还是原位短相对路径，`war3.exe -loadfile` 目前都只会回到主菜单而不真正进图；因此夜间自动链路已改成“City 优先，失败自动回退到 `光影测试.w3x`”，不再被单张地图阻塞。</li>
+              <li>夜间执行策略也已固定到工具链：不中途以人工汇总作为停点，而是持续执行 `稳定性 -> 压力 -> 低压回归`，统一把结果落盘后再审阅。</li>
+            </ul>
+            <div class="note">本轮先签收“控制层可用”；`City.w3x` 仍是专项优先图，但不再作为夜间执行唯一阻塞项。</div>
+          </div>
+          <div class="card">
+            <strong>2026.03.12 | ShadowCapture 进入“安全 geometry 复用”阶段，默认档签收零超预算</strong>
+            <ul>
+              <li>`d3d9_device.cpp` 现新增按 `sourceGeometrySignature` 的安全 geometry 复用表：同一帧内、同源、同布局、同 draw 语义的 object-matrix caster 不再重复冻结或重复组装 draw，而是复用首个 geometry payload，仅覆盖 `worldMatrix / batchHandle / bounds` 等实例字段。</li>
+              <li>默认档继续保持“轻度稳定裁剪”而非粗暴降级；预算超限仍只会 `BudgetRejected` 当前 caster，不会污染整帧。</li>
+              <li>性能报告与 AutoTest 新增 `actualFreezeReuseHits / Mb`、`reuseEligibleDuplicates`、`uniqueFreezeAcceptedMb`、`duplicateFreezeBypassMb`，用于把“理论重复冻结”与“真实吃掉多少重复冻结”彻底分开。</li>
+              <li>后台分析报告 `war3_perf_report_auto_2026_03_12_22_57_36.html` 已出现真实复用：`actualFreezeReuseHits=4452`、`actualFreezeReuseMb=2429.014`；默认档 180 秒签收报告 `war3_perf_report_auto_2026_03_12_23_09_07.html` 中，`framesBudgetExceeded=0`、`framesIncomplete=0`、`actualFreezeReuseHits=49007`、`actualFreezeReuseMb=26737.009`。</li>
+              <li>当前剩余结论也已固定：`Shadow/Capture` 仍是 traced CPU 最大热点，说明本轮已经把项目推进到“零超预算 + 真实复用生效”，下一轮则应继续向更早的 capture fast-path 和更多安全实例路径推进，而不是回头削弱 PCF。</li>
+            </ul>
+            <div class="note">本轮默认档已经签收到“零超预算、零 incomplete、零 device lost”；但 `Shadow/Capture` 百分比仍高，需要继续沿 capture 前端做真实热路径压缩。</div>
+          </div>
+          <div class="card">
+            <strong>2026.03.12 | 五阶段续推：唯一几何签名、Skinned Instancing 与重复预算显性化</strong>
+            <ul>
+              <li>`d3d9_device.cpp` 现为每个 shadow caster 同时记录 `sourceGeometrySignature` 与 `renderGeometrySignature`：前者带上 buffer slice 与 mapping sequence，用于“唯一几何 / 重复预算”统计；后者用于 ShadowMap 分组与实例化。</li>
+              <li>`d3d9_war3_shadow.cpp` 已将实例化范围从“仅非混合物体”扩展到“安全可判定的 vertex-blend 物体”。也就是说，同一套几何但 `paletteOffset` 不同的重复单位，现在可在 shadow caster pass 中走单次 geometry + 多实例绘制，不再被一律拆成独立 draw。</li>
+              <li>当前默认运行时不会恢复那条不安全的 frozen-slice 复用；这轮做的是“渲染级实例化 + 结构化唯一几何账本”，不是再次冒险复用被重写的动态快照。</li>
+              <li>性能报告与 AutoTest 现新增：`uniqueGeometryCount`、`uniqueInstanceableGeometryCount`、`duplicateGeometryInstances`、`potentialFreezeReuseHits / Mb`、`instancedGeometryGroups / Instances / DrawsSaved`。这让后续判断“预算是被唯一几何打爆，还是被重复实例拖爆”变成结构化数据，而不再靠肉眼翻日志。</li>
+              <li>这轮的目标不是直接拉大预算，而是把项目正式转向“唯一几何 + 多实例 + 重复预算显性化”的架构阶段，为后续彻底压 ShadowCapture 超预算打地基。</li>
+            </ul>
+            <div class="note">本轮完成后，下一步后台回归会直接按 `Shadow/Capture / ShadowMap / ShadowReceiver` 百分比和 `potentialFreezeReuseMb` 读取结果，不再只看 FPS。</div>
+          </div>
+          <div class="card">
+            <strong>2026.03.12 | 续跑压缩：默认档重新启用 ShadowMap 自适应更新，预算超限转为严格丢弃语义</strong>
+            <ul>
+              <li>`d3d9_device.cpp` 现将 `ShadowFreeze` 预算超限明确区分为 `BudgetRejected`：这类 caster 会被直接丢弃，不再把整帧标记为 `captureIncomplete`。只有真实的分配失败/上传缺失才会继续污染整帧阴影。</li>
+              <li>`war3_internal_test_config.h` 已将 `kShadowAdaptiveMapUpdateEnabled` 恢复为默认开启，并把默认 `period` 收回到 `2`；`war3_shadow_capture_frontend.cpp` 也把“中优先级 caster 的预算前置跳过”从实验档扩展到默认档高压力场景。</li>
+              <li>后台分析档续跑（Win32 隔离桌面）结果：`ShadowMap` 自占 CPU 从 `39.253%` 压到 `24.542%`，`Shadow/Main` 从 `46.461%` 压到 `33.532%`；但 `Shadow/Capture` 仅从 `0.288ms` 到 `0.284ms`，现在反而成为阴影主链里占比最高的残余热点（`44.736%`）。</li>
+              <li>同口径 GPU 侧也同步下降：`ShadowMap` `0.604ms -> 0.303ms`，`Shadow/Main` `0.874ms -> 0.577ms`。这说明本轮默认档收益主要来自 ShadowMap 更新频率收缩，而不是靠粗暴关特效换帧。</li>
+              <li>当前自动化基准图在 `DXVK_WAR3_SHADOW_FREEZE_BUDGET_MB=32` 下已经不再触发预算超限，报告保持 `framesIncomplete=0 / framesBudgetExceeded=0`。这代表项目已进入“严格预算保护”阶段，但最后一块证据还缺真实高压动态图去打穿 budget-reject 路径。</li>
+            </ul>
+            <div class="note">证据报告：`war3_perf_report_auto_2026_03_12_19_12_46.html`、`war3_perf_report_auto_2026_03_12_19_18_30.html`、`war3_perf_report_auto_2026_03_12_19_20_14.html`。</div>
+          </div>
+          <div class="card">
+            <strong>2026.03.12 | 热修：撤回默认 ShadowFreeze 复用，修复阴影撕裂/残影</strong>
+            <ul>
+              <li>确认问题根因是 `frozen-slice cache` 在默认档下错误复用了“同一帧内已被重写的动态 buffer 快照”，导致阴影里同时残留旧几何与新几何，表现为撕裂、重影和隐约可见的“正确阴影底图”。</li>
+              <li>现已将该复用链默认关闭，只有显式设置 `DXVK_WAR3_SHADOW_FREEZE_REUSE=1` 才会启用；默认运行时重新回到安全冻结模式。</li>
+              <li>这意味着复用缓存目前仍只保留为实验能力，后续若要重新启用，必须补 source generation/version 级别的有效性证据，不能只靠 `buffer + offset + size` 判等。</li>
+              <li>热修后 quick autotest 已通过：`2560x1440` 截图基线匹配，默认档报告 `96.465 FPS`，并且本轮没有再出现预算超限、partial shadow map 或 `DEVICE_LOST`。</li>
+            </ul>
+            <div class="note">证据报告：`war3_perf_report_auto_2026_03_12_18_29_17.html`。</div>
+          </div>
+          <div class="card">
+            <strong>2026.03.12 | 持续续跑：ShadowFreeze 复用缓存接线完成，实验档标准场景提升到 108 FPS 级</strong>
+            <ul>
+              <li>`d3d9_device` 新增按帧 `frozen-slice cache`，当同一帧里阴影捕获重复命中同源动态 VB/IB 切片时，不再重复 `copyBuffer + 预算扣减`，而是直接复用已冻结结果。</li>
+              <li>性能报告与 AutoTest 现新增 `reusedFreezeHits / reusedFreezeMb`，用于直接判断“重复冻结”是否真的被吃掉；相关字段已经进入 `shadowBudgetSummary` 和 profile matrix 汇总。</li>
+              <li>标准基准图前台回归：`full_default=98.200 FPS`，`full_perf_experimental=108.248 FPS`，实验档相对默认档继续抬升约 `+10 FPS`，且没有出现预算超限或设备丢失。</li>
+              <li>当前标准基准图上的 `reusedFreezeHits=0`，说明这张图并不具备明显的“同源动态切片重复冻结”特征；缓存链已就位，但还需要更有代表性的高压图来真正放大这条收益。</li>
+              <li>结论：这轮更偏“架构稳定性 + 高压场景准备项”，而不是一刀立刻回收十几帧；当前可确认的直接收益仍主要来自实验档的 Shadow 压力收敛。</li>
+            </ul>
+            <div class="note">证据报告：`war3_perf_report_auto_2026_03_12_15_21_20.html` 与 `war3_perf_report_auto_2026_03_12_15_21_41.html`。</div>
+          </div>
+          <div class="card">
+            <strong>2026.03.12 | 第四至六阶段落地：ShadowCapture 预算前端、实验档收敛与预算账本回填</strong>
+            <ul>
+              <li>新增 `war3_shadow_capture_frontend.*`，将 ShadowCapture 的“候选优先级 + 预算裁决”从 `d3d9_device.cpp` 热路径中前移：建筑/主单位保留优先级，远端装饰/特效可在逼近预算时提前跳过，alpha caster 可先降级再入图。</li>
+              <li>`d3d9_war3_shadow.cpp` 为 `full_perf_experimental` 新增 pressure mode：预算压力持续时，实验档自动切 `StableSphere`、压到 `<=3` cascades、收短 `maxDistance`，并启用更积极的 ShadowMap adaptive skip；默认档不启用这套画质降级。</li>
+              <li>AutoTest 现会把 `skippedPriorityBudget` / `degradedAlphaBudget` 带入 `shadowBudgetSummary`，并在底层结构化预算字段偏稀疏时，用日志关键字回填 `framesBudgetExceeded / framesIncomplete / framesReuseLastComplete / framesRenderCurrentPartial`。</li>
+              <li>短矩阵（`profile_matrix/20260312_144713`）结果：`dxvk_only=265.75 FPS`，`full_default=97.106 FPS`，`full_perf_experimental=103.493 FPS`；当前完整栈热点仍稳定落在 `shadow.receiver / shadow.capture / shadow.map`。</li>
+              <li>低预算强压（`DXVK_WAR3_SHADOW_FREEZE_BUDGET_MB=32`）结果：默认档 `111.275 FPS`，并出现 `framesBudgetExceeded=16 / framesIncomplete=1`；实验档 `111.137 FPS`，显式预算超限计数降到 `0`，同时未出现 `VK_ERROR_DEVICE_LOST`。</li>
+              <li>当前结论：默认档继续保“画质优先”，实验档正式承担“过载收敛与上限探索”；剩余主战场仍是阴影三段的真成本，而不是 DXVK 核心或普通 Hook。</li>
+            </ul>
+            <div class="note">证据：`AutoTest/artifacts/profile_matrix/20260312_144713/profile_matrix.json`，以及 `war3_perf_report_auto_2026_03_12_15_06_05.html` / `war3_perf_report_auto_2026_03_12_15_06_20.html`。</div>
+          </div>
+          <div class="card">
+            <strong>2026.03.12 | 第三阶段首刀：ShadowReceiver TAA 去重，收掉墙面稳定路径重复 PCF</strong>
+            <ul>
+              <li>`war3_shadow_receiver.frag` 现在线上默认 TAA 路径统一复用 `ShadowVisibility` 预计算结果；墙面稳定路径不再在 receiver 中重复执行一遍 PCF。</li>
+              <li>`d3d9_war3_shadow.cpp` 现仅在 `history` 真正可用时才跑 `Shadow/MotionVector` prepass，避免首帧/断档帧白跑一整次 motion-vector。</li>
+              <li>前台定点回归（15s，2K 全屏）结果：`full_default=101.518 FPS`，`no_shadow_taa=101.205 FPS`，默认 TAA 已不再比“关闭 TAA”更慢。</li>
+              <li>同口径报告中，`ShadowReceiver GPU` 从 `0.480ms`（关闭 TAA）降到 `0.169ms`（默认 TAA），总 GPU 从 `2.385ms` 降到 `2.172ms`。</li>
+              <li>当前结论：receiver 里的重复阴影采样已经止血，下一阶段继续直攻 `shadow.map` 与 `shadow.capture`，不回头重打 UI/AA/SSAO。</li>
+            </ul>
+            <div class="note">证据报告：`war3_perf_report_auto_2026_03_12_13_49_30.html` 与 `war3_perf_report_auto_2026_03_12_13_50_14.html`。</div>
+          </div>
+          <div class="card">
+            <strong>2026.03.12 | 夜间性能归因底座：运行时档位 / Profile Matrix / ShadowBudget 账本</strong>
+            <ul>
+              <li>新增运行时档位接口：`DXVK_WAR3_PROFILE` 与 `DXVK_WAR3_DISABLE`，支持 `dxvk_only / hooks_minimal / hooks_default / render_base / shadow_capture_only / shadow_full / full_default / full_analysis / full_perf_experimental`。</li>
+              <li>AutoTest 新增 `run_profile_matrix`，并为 `diag` 关闭档补齐 runtime benchmark fallback；矩阵现默认跑在 Win32 隔离桌面，不再抢当前工作桌面。</li>
+              <li>AutoTest 现支持 Win32 隔离桌面模式：War3 可被拉起到单独的 `desktop object` 中，不再干扰当前工作桌面；该模式当前主要用于性能/稳定性回归，不用于严格截图基线。</li>
+              <li>性能报告新增结构化字段：`runtimeProfile`、`moduleMatrix`、`shadowBudgetSummary`、`topShadowOffenders`，用于后续 ShadowCapture 超预算与模块损耗账本。</li>
+              <li>阶段二正式矩阵（20 档 x 1 轮 x 5s，隔离桌面）结果：`18/20` 成功，`dxvk_only=269.0 FPS`，`full_default=98.746 FPS`，完整栈差值 `170.254 FPS`。</li>
+              <li>当前有效热点排序：`shadow.receiver (+71.016 FPS)`、`shadow.map (+67.508 FPS)`、`shadow.capture (+67.463 FPS)`，三者全部明显超出预算，是第三阶段的主攻对象。</li>
+              <li>当前非热点结论：`hook.ui` 仅 `+0.898 FPS`，`render.queue` `-0.260 FPS`，`aa/postfx/ssao/shadow.taa` 短窗收益接近零，优先级明显低于阴影主链。</li>
+              <li>当前无效/失败档位已单独标记：`hooks_minimal` 与 `sub_no_hook_lifecycle` 属于“测量快于 dxvk-only”的无效样本；`sub_no_hook_render` 直接卡在 ready 前；`shadow_capture_only` 仍是独立异常 profile。</li>
+            </ul>
+            <div class="note">详见：<a href="refactor_status.html" style="color:inherit;font-weight:600;">行业化重构看板 → 夜间收官与续跑总结</a></div>
+          </div>
+          <div class="card">
+            <strong>2026.02.25 | MainLoop 全量逆向补齐：IDA MCP 函数级证据 + Untracked 收口验收</strong>
+            <ul>
+              <li>新增研究目录：`docs/research/war3_render_issues/12_mainloop_full_reverse/README.md`。</li>
+              <li>新增 IDA 证据包：`ida_mainloop_dump_2026_02_25.json`（根循环、分发表、case0~14 子函数 callees/lookup）。</li>
+              <li>报告层新增数据集：`mainLoopFunctionBreakdown`、`mainLoopDispatchCaseFunctions`、`mainLoopUnknownAttribution`、`mainLoopThreadSplit`。</li>
+              <li>60 秒 AutoTest（分析档收口）：`war3_perf_report_auto_2026_02_25_14_23_51.html`，覆盖率 `100%`，`avgUntrackedActiveCpuMs=0.000`。</li>
+              <li>结论：`Untracked 93%` 根因已查明为“低开销档位观测关闭”，在全量分析档下 MainLoop+Render active 已闭环归因。</li>
+            </ul>
+            <div class="note">详见：<a href="refactor_status.html" style="color:inherit;font-weight:600;">行业化重构看板 → 夜间收官与续跑总结</a></div>
+          </div>
+          <div class="card">
+            <strong>2026.02.25 | 第五轮补执行：配置矩阵收口 + 性能上限探索</strong>
+            <ul>
+              <li>新增矩阵脚本：`round5_perf_matrix.py`（8 组）与 `round5_extra_matrix.py`（4 组），全部按 60 秒 AutoTest 固化证据。</li>
+              <li>画质默认档（保留核心阴影）：`122.804 FPS`（`C2_perf_full_no_local_merge`）。</li>
+              <li>性能实验上限：`209.268 FPS`（关闭 mode1 ShadowCapture，仅用于瓶颈评估，不作为默认配置）。</li>
+              <li>当前默认已回到画质增强语义：恢复 mode1 ShadowCapture，避免以“关核心阴影”换帧率。</li>
+              <li>补充：AutoTest 截图链路改为 `PrintWindow` 优先（修复窗口被遮挡时抓到桌面的问题，需 MCP 重启生效）。</li>
+            </ul>
+            <div class="note">详见：<a href="refactor_status.html" style="color:inherit;font-weight:600;">行业化重构看板 → 夜间收官与续跑总结</a></div>
+          </div>
+          <div class="card">
+            <strong>2026.02.25 | 第三轮续跑：P3 后渲染热路径小步优化 + 60s AutoTest</strong>
+            <ul>
+              <li>落实 `C4`：`Hook_FlushSortedItems` 新增空队列早退链路（保留 state cleanup 语义守护）。</li>
+              <li>落实 `C1`（小步）：`Dispatch_Common/Special` 查询前置归并，使用 `stageHint` 减少重复状态读取。</li>
+              <li>完成 60 秒 AutoTest 对照（2K 全屏，自动进图/截图/报告导出）：基线 `113.735 FPS`，优化后 `118.643 FPS`。</li>
+              <li>结果：本轮 +4.32%（`113.735 -> 118.643`），稳定性通过（无崩溃，截图分辨率一致）。</li>
+            </ul>
+            <div class="note">详见：<a href="refactor_status.html" style="color:inherit;font-weight:600;">行业化重构看板 → 夜间收官与续跑总结</a></div>
+          </div>
+          <div class="card">
+            <strong>2026.02.24 | 夜间优化与兼容收官（第 5-6 轮）</strong>
+            <ul>
+              <li>第五轮：渲染优化落地（保守接管阈值自适应、透明排序快路径、ShadowMap 自适应更新、高频诊断默认关闭）。</li>
+              <li>第六轮：完成渲染/逻辑优化 8 组组合矩阵（编译 + AutoTest + 截图基线），修复唯一不兼容组合。</li>
+              <li>关键修复：`executeJassFunctionInternal` 地址从中段修正到函数入口（`0x7F2B40`），并新增函数序言校验，避免深层 JASS Hook 误挂导致崩溃。</li>
+              <li>结果：基线 `100.127 FPS` 到阶段最佳 `112.122 FPS`，并完成“组合兼容全通过”收官。</li>
+            </ul>
+            <div class="note">详见：<a href="refactor_status.html" style="color:inherit;font-weight:600;">行业化重构看板 → 今晚收官总结</a></div>
+          </div>
+          <div class="card">
+            <strong>2026.01.19 05:34 | ShadowMap 性能优化：级联剔除 &amp; 排序去重 &amp; GPU WorldMatrix</strong>
+            <ul>
+              <li>性能：为 shadow casters 补齐保守 bounds（center+radius），ShadowMap 每级联做裁剪空间包围球剔除，降低多级联重复绘制。</li>
+              <li>性能：ShadowMap 重放按 pipelineHash/纹理/VB/IB 排序并做绑定去重，减少 pipeline/buffer 反复绑定的 CPU 负载。</li>
+              <li>性能：非骨骼对象 worldMatrix 统一上传到矩阵 SSBO，在 VS 中计算 MVP；CPU 侧仅推 lightVP + matrixIndex。</li>
+              <li>修复：war3fx 矩阵 SSBO 统一使用 set=1（set=0 为 DXVK sampler heap），避免资源绑定错位导致描边/遮罩不生效。</li>
+              <li>备份：已创建 git 分支 <code>backup/shadowtaa-perfopt-20260119-0534</code>。</li>
+              <li>构建：<code>ninja -C Build32</code> 通过。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.19 03:58 | Shadow TAA：MotionVector + 阴影时域滤波</strong>
+            <ul>
+              <li>新增：Motion Vector Buffer（<code>R16G16_SFLOAT</code>）与生成 pass <code>war3_motion_vector</code>（深度重建 worldPos + <code>prevViewProj</code> 重投影）。</li>
+              <li>新增：Shadow Visibility Buffer（<code>R8_UNORM</code>）与生成 pass <code>war3_shadow_visibility</code>（从 receiver 中抽离 PCF/PCSS，输出当前帧 <code>vis</code>）。</li>
+              <li>新增：Shadow History（<code>R8_UNORM</code>）Ping-Pong；receiver 内做重投影 + EMA 混合 + 邻域夹紧，并用 <code>imageStore</code> 写回历史。</li>
+              <li>新增：设置项 <code>shadowTaaEnabled</code>/<code>shadowTaaBlendFactor</code>/<code>shadowTaaNeighborClamp</code>，调试输出新增 <code>MotionVector</code>/<code>ShadowHistory</code>。</li>
+              <li>构建：<code>ninja -C build32</code> 通过。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.19 | 夜间修复：日夜阴影瞬移 &amp; 描边不命中 &amp; 冻结拷贝裁剪</strong>
+            <ul>
+              <li>日夜：TIME_OF_DAY 渲染侧做平滑（速度外推 + 误差回正），并改为“单主光源选择”，避免 sunDir/moonDir 近反向时插值奇点导致阴影方向在过渡带内极速乱跳。</li>
+              <li>描边：ShadowCapture 统一记录 <code>batchHandle</code>，描边 pass 不再强依赖 <code>batchTag==WorldObjects</code>；并修复“无阴影/强度为 0 时提前 return 导致描边被跳过”。</li>
+              <li>调试：ImGui 新增“调试：强制所有对象描边”，一键强制关闭常驻描边、仅显示被遮挡描边，用于验证描边链路/Shader 是否正常。</li>
+              <li>性能：冻结动态 VB/IB 的 <code>copyBuffer</code> 按 draw 实际使用范围裁剪，降低带宽与冻结 chunk 压力（Indexed VB 默认不裁剪，可用 <code>DXVK_WAR3_SHADOW_TRIM_INDEXED=1</code> 手动开启；多级联重放收益更明显）。</li>
+              <li>默认：开启 <code>stableSnapWhenSunMoving</code>，并默认启用 Alpha 阴影 Hash + Mip（树叶/栅栏等 Alpha-Test 阴影边缘更稳）。</li>
+              <li>备份：优化前已创建 git 分支 <code>backup/pre-perf-opt-20260119</code>。</li>
+              <li>构建：<code>ninja -C Build32</code> 通过。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.18 04:15 | 修复阴影乱抽/卡顿（time01 回退 + 重放绑定范围）</strong>
+            <ul>
+              <li>修复：渲染侧 <code>time01</code> 平滑器增加“时间回退/重置”处理，避免把轻微回退误判为跨天环回而导致速度估计飙升（太阳/阴影满世界乱跳）。</li>
+              <li>修复：当 <code>realGameTime</code> 暂不可用（切图/运行时重置）时复位平滑器状态，避免下一次恢复真实时间时沿用旧采样基准造成巨大跳变。</li>
+              <li>修复：ShadowMap/Outline/PointShadow 重放绑定 VB/IB 改为使用精确 <code>DxvkResourceBufferInfo.size</code>，避免越界读到冻结 chunk 中“其他 draw 的数据”导致阴影乱飞/抽搐。</li>
+              <li>调整：Indexed draw 的 VB 裁剪默认关闭（可用 <code>DXVK_WAR3_SHADOW_TRIM_INDEXED=1</code> 手动开启），降低 <code>MinVertexIndex/NumVertices</code> 不严格导致越界的概率。</li>
+              <li>优化：CSM 默认回退为 3 级联/2048/稳定球拟合，避免默认即超高分辨率导致明显卡顿。</li>
+              <li>优化：shadow caster 捕获/重放预算按 shadowResolution 做面积缩放并设下限，降低高分辨率多级联下单帧工作量过大引发卡顿/TDR 的概率。</li>
+              <li>构建：<code>ninja -C Build32</code> 通过。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.19 00:30 | 修复进入世界对象触发 VK_ERROR_DEVICE_LOST（防越界/防 TDR）</strong>
+            <ul>
+              <li>修复：屏幕空间遮挡描边（MRT mask pass）此前把 <code>SAMPLED</code> 视图当作 <code>COLOR_ATTACHMENT</code> 使用，且缺少 <code>SHADER_READ_ONLY -&gt; COLOR_ATTACHMENT</code> 的布局切换，属于 Vulkan 未定义行为（易触发 <code>VK_ERROR_DEVICE_LOST</code>）。现已为 mask 资源创建独立的 RenderView，并在写入前后补齐布局切换。</li>
+              <li>修复：ShadowCapture 的 VB/Blend 顶点裁剪仅在“冻结动态缓冲”路径启用；并默认关闭 Indexed draw 的 VB 裁剪（可用 <code>DXVK_WAR3_SHADOW_TRIM_INDEXED=1</code> 手动开启），避免因 <code>MinVertexIndex/NumVertices</code> 不严格导致越界。</li>
+              <li>修复：ShadowMap/OutlineMask/UnitOutline 重放绑定 VB/IB 改为精确绑定 slice size，避免在冻结 chunk 子分配场景下越界读到其它 draw 数据导致阴影乱飞/抽搐。</li>
+              <li>防护：加入投射体数量上限（捕获侧与渲染侧一致），并按 shadowResolution 做预算缩放，降低极端场景触发 Windows TDR（电音/全局卡顿/驱动重置）的概率。</li>
+              <li>排查：若仍出现 <code>VK_ERROR_DEVICE_LOST</code>，可临时设置环境变量 <code>DXVK_WAR3_DISABLE_SHADOW_CAPTURE=1</code> / <code>DXVK_WAR3_DISABLE_POST_CHAIN=1</code> 以确认是否为阴影/后处理链导致。</li>
+              <li>构建：<code>ninja -C Build32</code> 通过。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.18 23:50 | 日夜突变/锁死与描边句柄重映射修复</strong>
+            <ul>
+              <li>修复：<code>m_war3FrameIndex</code> 改为每帧递增（不再依赖 <code>HasAnyRenderListeners</code>），避免 ShadowFreeze ring allocator 长期不 Reset 导致的内存持续增长、阴影闪烁后锁死。</li>
+              <li>新增：环境变量回退开关 <code>DXVK_WAR3_DISABLE_POST_CHAIN=1</code>（禁用 Ping-Pong 后处理链，回退旧路径）与 <code>DXVK_WAR3_DISABLE_SHADOW_TRIM=1</code>（禁用 ShadowCapture VB/IB 裁剪捕获）。</li>
+              <li>日夜：新增 <code>War3RenderState::SetSunRuntime/GetSunRuntime</code>（seqlock 快照），ShadowReceiver 在 CS 线程写入，D3D9 <code>SetLight(0)</code> 主线程读取，移除跨线程直接写 <code>War3RenderSettings</code> 的数据竞争；并增加地平线方向切换迟滞（±1°）避免来回跳。</li>
+              <li>日夜：阴影强度改为“相位因子 × 用户强度”，不再覆盖 <code>settings.shadows.strength</code>（ImGui/JASS 调参生效）。</li>
+              <li>描边：<code>DXVK_OutlineAddHandle</code> 增加 Unit 句柄 → 渲染句柄重映射（handle→obj→unitPtr→findHandleByUnitPtr），解决 <code>no draw match</code>。</li>
+              <li>构建：<code>ninja -C Build32</code> 通过。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.18 14:20 | 修复阴影闪烁/锁死回归（Ping-Pong 链）</strong>
+            <ul>
+              <li>修复：Ping-Pong 后处理链中新建图像真实初始布局为 <code>UNDEFINED</code>，但旧代码错误使用 <code>SHADER_READ_ONLY</code> 作为 <code>oldLayout</code>，可能触发未定义行为（表现为地面阴影闪烁，严重时 GPU hang / 游戏锁死）。</li>
+              <li>修复：新增 <code>m_postColorPingLayout</code>/<code>m_postColorPongLayout</code>/<code>m_postDepthCopyLayout</code> 运行时布局跟踪，所有显式 barrier 统一使用真实 <code>oldLayout</code>；并在每次 barrier 后调用 <code>DxvkImage::trackLayout</code> 同步内部状态。</li>
+              <li>修复：链式执行时若“最后一个 pass 已写入游戏 RT”，将 <code>curSrc</code> 绑定到 <code>input.colorView</code>，避免兜底 copy 误把“最后 pass 之前的中间结果”覆盖回游戏 RT。</li>
+              <li>构建：<code>ninja -C Build32</code> 通过。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.18 06:10 | Ping-Pong 后处理链与 ShadowCapture 裁剪</strong>
+            <ul>
+              <li>时间：渲染侧对 <code>time01</code> 做“速度外推 + 误差回正（PLL）”，把 100ms 台阶时间变为逐帧连续，降低太阳方向/CSM 10Hz 跳变导致的阴影抖动。</li>
+              <li>CSM：默认开启 <code>stableSnapWhenSunMoving</code>，日夜运行时也保持 texel snapping（更适合 RTS 高机位）。</li>
+              <li>管线：BeforeUi 改为 Ping-Pong 后处理链，新增 <code>War3PipelineInput.srcColorView</code>/<code>depthCopyView</code>，Shadow/SSAO/AA 共享一次 copyColor/copyDepth。</li>
+              <li>Pass：Shadow/SSAO/AA <code>Run</code> 统一返回 <code>bool</code>（是否写入 output），链路按返回值决定是否交换 ping/pong，避免 no-op 导致花屏/脏帧。</li>
+              <li>捕获：ShadowCapture 冻结裁剪仅 Copy 本次 draw 的 VB/IB 需要范围，并重映射参数（indexed: <code>firstIndex=0</code>/<code>vertexOffset=-MinVertexIndex</code>；non-indexed: <code>firstVertex=0</code>）。</li>
+              <li>构建：<code>ninja -C Build32</code> 通过。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.18 03:15 | 日夜跳变与描边排查修复</strong>
+            <ul>
+              <li>日夜：地平线 Fade 改为 <code>smoothstep</code>，并让阴影强度额外乘一次 Fade，降低日出/日落阶段“方向切换可见”导致的瞬移感。</li>
+              <li>日夜：保持“昼/夜分段方向 + 强度淡入淡出”策略，避免日落/日出时 sunDir/moonDir 近反向造成的插值奇点。</li>
+              <li>描边：ImGui 新增“描边调试”面板，可一键强制全对象描边（仅世界物体类），并强制仅遮挡描边（Visible=Off, Occluded=On）。</li>
+              <li>描边：内置描边匹配从 <code>batchTag==WorldObjects</code> 改为 <code>StageCategory==WorldObject</code>；DebugAll 模式下不再依赖 <code>batchHandle</code>，可直接验证描边管线/Shader。</li>
+              <li>描边：描边 pass 与阴影强度解耦，即使阴影关闭/强度为 0，只要启用描边且存在句柄仍会执行描边渲染。</li>
+              <li>性能：<code>War3RenderState::ComputeNeedsObjectTracking</code> 改为读取原子计数，避免每帧 <code>shared_mutex</code> 读锁开销。</li>
+              <li>备份：优化前使用 git stash 备份（<code>stash@{0}</code>）。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.17 23:20 | 日夜过渡与 Alpha 阴影修复</strong>
+            <ul>
+              <li>Hash Alpha 改为 ShadowMap 像素稳定噪声（<code>gl_FragCoord</code> 锚定）+ 仅阈值附近抖动，降低树叶阴影边缘抖动/闪烁。</li>
+              <li>日夜光照/阴影强度/方向改为平滑混合，并对齐 <code>dayTransitionStart/End</code>，避免日出前提前出现“白天阴影”。</li>
+              <li>新增 CSM 拟合模式：稳定(球体) / 紧凑(AABB)，高机位可尝试紧凑模式提升清晰度。</li>
+              <li>新增夜间阴影倍率（默认 1），用于控制月光阴影强度；如需夜晚无阴影可设为 0。</li>
+              <li>新增 PCF 级联锐化（按级联缩放 PCF 半径），缓解高机位阴影发糊。</li>
+              <li>新增 Alpha 阴影 Mip LOD Bias 与远级联阈值偏移（alphaRef），进一步降低树叶“尖刺/忽隐忽现”。</li>
+              <li>新增 API：<code>DXVK_SetShadowPcfCascadeRadiusScale</code> / <code>DXVK_SetShadowAlphaMipLodBias</code> / <code>DXVK_SetShadowAlphaFarAlphaRefBias</code>。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.14 02:40 | 阴影稳定性增强</strong>
+            <ul>
+              <li>新增 PCF 旋转模式（屏幕/世界），默认世界空间稳定旋转。</li>
+              <li>新增 Alpha 阴影 Hash 与 Mip 选项，缓解树影毛刺与边缘闪烁。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.14 02:10 | 阴影过滤与偏移优化</strong>
+            <ul>
+              <li>默认接收器改为 NormalBias，法线偏移/常量偏移重新标定。</li>
+              <li>新增 PCF 核选项（3x3/5x5/Poisson16/Poisson25）与 PCF 旋转开关。</li>
+              <li>新增级联偏移缩放与 PCSS 搜索核选项，减轻远级联条纹与抖动。</li>
+              <li>新增 API：<code>DXVK_SetShadowPcfKernel</code> / <code>DXVK_SetShadowPcfRotate</code> / <code>DXVK_SetShadowPcssSearchKernel</code> / <code>DXVK_SetShadowCascadeBiasScale</code>。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.14 01:40 | 阴影稳定性与描边匹配修复</strong>
+            <ul>
+              <li>CSM 光空间深度范围改为 frustum min/max + depthRangeMargin，移除固定 3000 扩展。</li>
+              <li>ShadowCaster 启用深度偏移（常量/斜率/上限），并开放脚本/ImGui 调参。</li>
+              <li>AlphaTest 阴影采样改为 mip nearest + LOD clamp，缓解树影抖动。</li>
+              <li>新增原生阴影模式：保留雾/边界、禁用全部（可在 ImGui/JASS 切换）。</li>
+              <li>新增太阳锁定与“太阳移动时稳定 Snap”开关，便于排查阴影自流动。</li>
+              <li>ExecBatch 保留真实批次句柄，Outline 不再受匹配时机影响。</li>
+              <li>新增 API：<code>DXVK_SetShadowCasterBias</code> / <code>DXVK_SetShadowDepthRangeMargin</code>。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.14 01:32 | 描边互通修复与阴影模式扩展</strong>
+            <ul>
+              <li>RenderObjectRegistry 快照改为 FlushAndReset 发布，JASS 查询不再为空。</li>
+              <li>新增描边调试 API：<code>DXVK_OutlineAddHandleByIndex</code>、<code>DXVK_SetOutlineAllObjectsEnabled</code>、<code>DXVK_SetOutlineForceEnabled</code>。</li>
+              <li>新增阴影接收器 AdaptiveBias 模式与 ImGui 切换。</li>
+              <li>新增阴影高度曲线模式与长度缩放参数（时间线性/真实高度）。</li>
+              <li>新增阴影采样滤波模式（Nearest/Linear），降低树影与墙面闪烁。</li>
+              <li>阴影强度整体下调 10%，长度缩放默认 0.9/0.8。</li>
+              <li>ExecBatch 增加对象追踪早退，降低未启用描边/高亮时的开销。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.14 01:23 | 描边调试与阴影接收器扩展</strong>
+            <ul>
+              <li>新增描边快速校验 API：<code>DXVK_OutlineAddLastRenderHandle</code>。</li>
+              <li>新增渲染对象枚举 API：按索引获取句柄/类型/rawcode。</li>
+              <li>最近渲染句柄改为完整 jHandle（0x100000 基底），便于脚本直接使用。</li>
+              <li>新增 ShadowReceiver NormalBias 模式与法线偏移调参接口。</li>
+              <li>描边/Bloom 句柄数量改为原子缓存，降低 ExecBatch 高频锁开销。</li>
+              <li>新增轮廓光参数（强度/指数）与 ImGui 调节。</li>
+              <li>新增模型加载 Hook（可记录 set_model），提供 FBX→MDX 预映射入口。</li>
+              <li>文档新增“框架与算法总览”与组合评估/优化方向。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.13 01:32 | 描边链路校验与光影平滑</strong>
+            <ul>
+              <li>描边强制开关改为环境变量 <code>DXVK_WAR3_OUTLINE_FORCE</code>，默认不覆盖脚本配置。</li>
+              <li>新增描边/对象追踪查询 API：句柄计数、描边命中、渲染对象数量与追踪状态。</li>
+              <li>ExecBatch 统一标记描边/高亮句柄，Bloom 提示可与描边并行生效。</li>
+              <li>补充描边诊断日志：句柄未追踪、内置描边被覆盖、缺少批次句柄时提示。</li>
+              <li>新增最近渲染句柄查询 API，便于定位实际可描边对象。</li>
+              <li>ImGui 新增阴影方案切换（PCF/PCSS）与 PCSS 参数调节。</li>
+              <li>描边/高亮判定增加空集合快筛，减少 ExecBatch 锁开销。</li>
+              <li>新增阴影接收器 NormalBias 模式与法线偏移参数。</li>
+              <li>日夜阴影长度改为全时段平滑变化，阴影强度下调 10%，最长长度限制为 80%。</li>
+              <li>提高接收端 Bias，缓解单位自遮挡条纹。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.03 | JassEngine 补完与脚本 API 开放</strong>
+            <ul>
+              <li>补齐 JassEngine：新增字符串/句柄转换桥接、ScriptDataTable 查询与闭包栈支持。</li>
+              <li>Japi 参数解析对齐 MemHack：按签名字符串正确打包 REAL/STRING/CODE/BOOLEAN 参数。</li>
+              <li>开放 JASS 渲染控制 API：光影、描边、Bloom、SSAO、AA、日夜参数可脚本化调整。</li>
+              <li>新增全局活跃设备指针，JASS 可安全获取当前渲染设置并动态修改。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.04 | 渲染控制 API 对齐与文档补全</strong>
+            <ul>
+              <li>新增 C++ 渲染设置 API：光影、描边、后处理、日夜参数可在模块侧直接配置。</li>
+              <li>补全点光源与 Bloom 句柄接口，JASS 与 C++ 接口保持一致。</li>
+              <li>文档新增渲染设置 API 表与完整 JASS Native 清单。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.01.02 | Hook 性能优化与对象追踪降载</strong>
+            <ul>
+              <li>WorldObjects/ExecBatch 路径加入“对象追踪按需启用”，未使用描边/高亮时跳过重型映射。</li>
+              <li>RenderQueueTracker 合并 Tag/Stage 查询，减少 ExecBatch 频繁锁开销。</li>
+              <li>对象注册改为“帧起点清理”，避免 FlushAndReset 多次清空带来的重复成本。</li>
+              <li>RenderObjectRegistry 改为批量注册与预分配，降低每对象锁竞争与 rehash。</li>
+              <li>ExecBatch 缓存改为帧级清理，FlushAndReset 不再重复清空导致抖动。</li>
+              <li>Japi 参数打包对齐 MemHack：native 参数计数与调用器扩展至 16 个参数。</li>
+              <li>WorldDispatch 的时间查询降频，避免每个 Stage 都触发 JASS 调用。</li>
+              <li>新增 <code>DXVK_WAR3_FORCE_OBJECT_TRACKING</code> 可强制开启对象追踪。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>2026.02 | 性能树与高阶对象 API</strong>
+            <ul>
+              <li>性能报告改为分层树结构（Draw → Run → Pass），支持展开/折叠定位热区。</li>
+            <li>新增 ShadowCapture CPU 计时，方便定位世界对象数量激增导致的卡顿。</li>
+            <li>点光源通路解耦阴影开关并修复启用标记，点光源可独立生效。</li>
+            <li>新增对象级高阶 API：描边与 Bloom 句柄（可用于快速标记单位高亮）。</li>
+            <li>描边“全对象调试”改为环境变量开关，默认关闭以降低负载。</li>
+          </ul>
+        </div>
+        <div class="card">
+          <strong>2026.01 | 语义分层与稳定性回退</strong>
+          <ul>
+            <li>新增 Effect 语义分层：stage 15/16/18 与 SelectionOverlay 归入特效层，UI 采用 BatchTag/UI layer 兜底区分。</li>
+            <li>DrawCall 新增 layerMask/flags 语义位，支持单位/建筑/特效/透明层快速筛选。</li>
+            <li>渲染 Pass/ShaderPack 运行失败自动禁用并回退：ShaderPack → 内置 → 原版。</li>
+            <li>崩溃报告升级，调试版可输出函数名与源文件行号。</li>
+          </ul>
+        </div>
+        <div class="card">
+          <strong>2025.12 | 后处理与分层修复</strong>
+          <ul>
+            <li>新增 D3D9 后处理管线（Bloom + ACES），入口文件 <code>shaders/war3_postfx.hlsl</code>。</li>
+            <li>加入 <code>War3PostProcess</code> 子系统并在 BeforeUi 阶段注入，避免影响原生 UI。</li>
+            <li>修复 ImGui 分层：UI 阶段渲染后不再被 Present 覆盖。</li>
+            <li>后处理总开关仍由 <code>postFx.enabled</code> 控制，可与 Vulkan Pass 协同。</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="panel" data-section="pipeline">
+        <h2>渲染阶段</h2>
+        <p>当前 War3Material 针对三个关键阶段提供覆盖入口：</p>
+        <div class="grid">
+          <div class="card">
+            <strong>World</strong>
+            <div>世界渲染阶段。用于替换单位/地形的光照逻辑。</div>
+          </div>
+          <div class="card">
+            <strong>Outline</strong>
+            <div>几何描边阶段。配合单位描边列表，重绘轮廓。</div>
+          </div>
+          <div class="card">
+            <strong>PostProcess</strong>
+            <div>后处理阶段。用于全屏合成/色调映射。当前 composite/final 名称会映射到此阶段。</div>
+          </div>
+        </div>
+        <p>阶段选择由 <code>shader_packs.json</code> 中的 <code>passes</code> 指定。</p>
+      </section>
+
+      <section class="panel" data-section="buffer-scene">
+        <h2>SceneColor / SceneDepth</h2>
+        <p>主屏渲染完成后的颜色与深度缓冲。可通过 Shader API 获取：</p>
+        <pre><code class="language-cpp">const auto* color = war3shader::GetRawColorBuffer();
+const auto* depth = war3shader::GetRawDepthBuffer();</code></pre>
+        <div class="note">说明：War3Material 当前直接使用 D3D9 纹理槽（s0...），不直接访问 Vulkan Buffer。若需要读取 SceneColor/SceneDepth，请通过
+          Shader API 获取 vkImageView 并自行管理布局。</div>
+      </section>
+
+      <section class="panel" data-section="buffer-shadowcolor">
+        <h2>ShadowColor</h2>
+        <p class="tag">Buffer</p>
+        <p>Shadow pass 提供两张颜色附件，用于输出阴影数据：<code>shadowcolor0</code> 与 <code>shadowcolor1</code>。</p>
+        <div class="card">
+          <strong>读取</strong>
+          <div>任何 pass 都可以读取 shadowcolor 纹理，用于合成或调试。</div>
+        </div>
+        <div class="card">
+          <strong>写入</strong>
+          <div>shadow / shadowcomp 阶段可写入 shadowcolor。可通过 RENDERTARGETS 选择目标。</div>
+        </div>
+        <div class="card">
+          <strong>格式</strong>
+          <div>默认 RGBA8，可通过 Image Format 指令配置精度。</div>
+        </div>
+        <div class="note">该条目为 Iris 风格示例标签，当前 War3MapReforge 内部实现仍在推进中，具体绑定以版本更新为准。</div>
+      </section>
+
+      <section class="panel" data-section="buffer-outline">
+        <h2>OutlineMask</h2>
+        <p>Outline 相关缓冲包含可见/遮挡两张 mask，用于屏幕空间描边。</p>
+        <ul>
+          <li>Mask 仅在启用屏幕空间描边时生成。</li>
+          <li>若启用 Outline 材质覆盖（几何描边），该路径会被跳过。</li>
+        </ul>
+        <div class="note">调试提示：如需对所有对象强制启用描边，可设置 <code>DXVK_WAR3_OUTLINE_ALL=1</code>，或在脚本中调用 <code>DXVK_SetOutlineAllObjectsEnabled(1)</code>。</div>
+      </section>
+
+      <section class="panel" data-section="uniform-global">
+        <h2>全局 Uniform</h2>
+        <p>全局 Uniform 由 <code>ShaderManager</code> 管理，所有材质共享。建议通过 JSON <code>globals</code> 节点绑定别名。</p>
+
+        <h3>快速查询表</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>建议寄存器</th>
+              <th>类型</th>
+              <th>简要说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>ViewProj</b></td>
+              <td>VS c4</td>
+              <td>float4x4</td>
+              <td>视图 * 投影矩阵</td>
+            </tr>
+            <tr>
+              <td><b>Time</b></td>
+              <td>PS c15</td>
+              <td>float4</td>
+              <td>游戏时间 (x=Time)</td>
+            </tr>
+            <tr>
+              <td><b>ScreenParams</b></td>
+              <td>PS c16</td>
+              <td>float4</td>
+              <td>屏幕尺寸 (w, h, 1/w, 1/h)</td>
+            </tr>
+            <tr>
+              <td><b>CameraPos</b></td>
+              <td>PS c11</td>
+              <td>float4</td>
+              <td>相机世界坐标 (xyz)</td>
+            </tr>
+            <tr>
+              <td><b>LightDir</b></td>
+              <td>PS c8</td>
+              <td>float4</td>
+              <td>主光方向 (xyz) + 强度 (w)</td>
+            </tr>
+            <tr>
+              <td><b>LightColor</b></td>
+              <td>PS c9</td>
+              <td>float4</td>
+              <td>主光颜色 (rgb) + SpecPower (w)</td>
+            </tr>
+            <tr>
+              <td><b>AmbientColor</b></td>
+              <td>PS c10</td>
+              <td>float4</td>
+              <td>环境光颜色 (rgb)</td>
+            </tr>
+            <tr>
+              <td><b>FogParams</b></td>
+              <td>PS c12</td>
+              <td>float4</td>
+              <td>雾参数 (start, end, density, mode)</td>
+            </tr>
+            <tr>
+              <td><b>FogColor</b></td>
+              <td>PS c13</td>
+              <td>float4</td>
+              <td>雾颜色 (rgb) + 开关 (w)</td>
+            </tr>
+            <tr>
+              <td><b>TeamColor</b></td>
+              <td>PS c14</td>
+              <td>float4</td>
+              <td>队伍颜色 (TextureFactor)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>详细定义</h3>
+        <div class="grid">
+          <div class="card">
+            <strong>ViewProj</strong>
+            <code>float4x4</code>
+            <p>将顶点从世界空间转换到裁剪空间。</p>
+          </div>
+          <div class="card">
+            <strong>Time</strong>
+            <code>float4 (Time, 0, 0, 0)</code>
+            <p><code>x</code>: 游戏累积时间（秒）。仅在游戏进行时增加，暂停时不增加。</p>
+          </div>
+          <div class="card">
+            <strong>ScreenParams</strong>
+            <code>float4 (Width, Height, 1/W, 1/H)</code>
+            <p><code>xy</code>: 视口像素尺寸<br><code>zw</code>: 纹素大小 (TexelSize)</p>
+          </div>
+          <div class="card">
+            <strong>CameraPos</strong>
+            <code>float4 (x, y, z, 1)</code>
+            <p>相机在世界空间中的位置。</p>
+          </div>
+          <div class="card">
+            <strong>LightDir</strong>
+            <code>float4 (DirX, DirY, DirZ, Intensity)</code>
+            <p><code>xyz</code>: 指向光源的方向（归一化）。<br><code>w</code>: 光源强度 (默认为 1.0)。</p>
+          </div>
+          <div class="card">
+            <strong>LightColor</strong>
+            <code>float4 (R, G, B, SpecPower)</code>
+            <p><code>rgb</code>: 主光源颜色。<br><code>w</code>: 材质高光指数 (Specular Power)。</p>
+          </div>
+          <div class="card">
+            <strong>FogParams</strong>
+            <code>float4 (Start, End, Density, Mode)</code>
+            <p><code>x/y</code>: 雾起始/结束距离。<br><code>z</code>: 密度。<br><code>w</code>: 模式 (0=None, 1=Lin, 2=Exp, 3=Exp2)。
+            </p>
+          </div>
+        </div>
+        <div class="note">提示：ScreenParams 与 Time 需在 JSON <code>globals</code> 中显式声明别名才能自动更新。</div>
+      </section>
+
+
+      <section class="panel" data-section="uniform-material">
+        <h2>材质 Uniform</h2>
+        <p>材质级 Uniform 由 <code>War3Material</code> 持有，典型用于每个 draw 的 world 矩阵、描边宽度等。</p>
+        <div class="grid">
+          <div class="card">
+            <strong>World</strong>
+            <div>VS c0，当前物体的世界矩阵。</div>
+          </div>
+          <div class="card">
+            <strong>OutlineColor</strong>
+            <div>PS c8，描边颜色。</div>
+          </div>
+          <div class="card">
+            <strong>OutlineParams</strong>
+            <div>PS c9，x=宽度（世界空间）。</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" data-section="material-api">
+        <h2>War3Material API</h2>
+        <p>二开作者可在 C++ 侧直接驱动材质：</p>
+        <pre><code class="language-cpp">auto* mat = dxvk::war3::ShaderManager::get().getMaterial(war3shader::RenderStageId::World);
+if (mat) {
+    mat->setFloat4("TeamColor", {1.0f, 0.3f, 0.2f, 1.0f});
+    mat->setMatrix("World", worldMatrix);
+}</code></pre>
+        <p>关键接口：</p>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>setVertexShaderConstantF</td>
+              <td>直接写 VS 寄存器</td>
+            </tr>
+            <tr>
+              <td>setPixelShaderConstantF</td>
+              <td>直接写 PS 寄存器</td>
+            </tr>
+            <tr>
+              <td>setFloat4 / setMatrix</td>
+              <td>通过名称写入（需 JSON 绑定）</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" data-section="material-json">
+        <h2>JSON 配置</h2>
+        <p>ShaderPack 通过 <code>shader_packs.json</code> 注册材质与寄存器映射。</p>
+        <pre><code class="language-json">{
+  "globals": {
+    "vs": { "ViewProj": 4 },
+    "ps": { "LightDir": 8, "LightColor": 9, "ScreenParams": 16 }
+  },
+  "packs": [
+    {
+      "name": "默认材质覆盖",
+      "enabled": false,
+      "passes": {
+        "World": {
+          "vs": "shaders/war3_default.hlsl",
+          "ps": "shaders/war3_default.hlsl",
+          "uniforms": { "vs": { "World": 0 } }
+        }
+      }
+    }
+  ]
+}</code></pre>
+        <p>可选字段：<code>vs_entry</code>/<code>ps_entry</code>（默认 <code>main_vs</code>/<code>main_ps</code>）。</p>
+        <div class="note">RenderState 可在 <code>render_states</code> 节点中声明，目前支持常用 Z/Blend/Cull 参数。</div>
+        <p>已支持的 RenderState 键：ZENABLE / ZWRITEENABLE / ZFUNC / ALPHABLENDENABLE / SRCBLEND / DESTBLEND / BLENDOP /
+          CULLMODE / ALPHATESTENABLE / ALPHAFUNC / ALPHAREF。</p>
+        <div class="note">可在 <code>defines</code> 节点设置编译宏，支持全局/包/Pass 三级覆盖。</div>
+      </section>
+
+      <section class="panel" data-section="macros">
+        <h2>语义宏与约定</h2>
+        <p>当前推荐的命名规范：</p>
+        <div>
+          <span class="tag">World</span>
+          <span class="tag">ViewProj</span>
+          <span class="tag">LightDir</span>
+          <span class="tag">LightColor</span>
+          <span class="tag">AmbientColor</span>
+          <span class="tag">FogParams</span>
+          <span class="tag">TeamColor</span>
+          <span class="tag">OutlineColor</span>
+        </div>
+        <h3>图层语义（DrawCall.layerMask）</h3>
+        <p>UI 与特效在部分版本可能共享 stage，建议优先使用 layerMask/flags 进行语义判定。</p>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>位掩码</th>
+              <th>语义</th>
+              <th>典型内容</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>DRAWCALL_LAYER_TERRAIN</code></td>
+              <td>地形</td>
+              <td>地表、地块网格</td>
+            </tr>
+            <tr>
+              <td><code>DRAWCALL_LAYER_UNIT</code></td>
+              <td>单位</td>
+              <td>CUnit 模型、单位动画</td>
+            </tr>
+            <tr>
+              <td><code>DRAWCALL_LAYER_BUILDING</code></td>
+              <td>建筑</td>
+              <td>建筑、城墙、可建造物</td>
+            </tr>
+            <tr>
+              <td><code>DRAWCALL_LAYER_EFFECT</code></td>
+              <td>特效</td>
+              <td>技能特效、法术、SelectionOverlay</td>
+            </tr>
+            <tr>
+              <td><code>DRAWCALL_LAYER_TRANSPARENT</code></td>
+              <td>透明层</td>
+              <td>Alpha 混合/加法混合物体</td>
+            </tr>
+            <tr>
+              <td><code>DRAWCALL_LAYER_UI</code></td>
+              <td>UI</td>
+              <td>HUD/菜单/UI 纹理</td>
+            </tr>
+            <tr>
+              <td><code>DRAWCALL_LAYER_POSTPROCESS</code></td>
+              <td>后处理</td>
+              <td>全屏合成/调色</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="note">已支持 <code>defines</code> 编译宏与 <code>#include</code> 资源引用，<code>#include</code> 默认以当前 shader
+          文件目录为相对路径。</p>
+        <div class="note">调试建议：设置 <code>DXVK_WAR3_RENDER_LOG=1</code> 可输出 StageSig 用于对照 stage 语义。</div>
+      </section>
+
+      <section class="panel" data-section="ui-api">
+        <h2>ImGui UI API</h2>
+        <p>引擎提供 UI 绘制回调与矢量图元接口，可用于替代游戏 UI 或做调试覆盖层。</p>
+        <pre><code class="language-cpp">using namespace war3shader;
+
+static void OnUiDraw(const RenderContext* ctx, void* user) {
+    UiSetLayer(UiLayer::Foreground);
+    UiDrawText({20, 20}, {1, 1, 1, 1}, "War3 UI Overlay");
+    UiDrawRect({{16, 60}, {280, 140}}, {0.2f, 0.8f, 0.9f, 1.0f}, 6.0f, 2.0f);
+}
+
+auto id = RegisterUiDrawCallback(OnUiDraw, nullptr);</code></pre>
+        <div class="note">高级用户可通过 <code>GetImGuiContext()</code> 获取上下文后直接调用 ImGui 原生 API。</div>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>类别</th>
+              <th>接口</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>回调</td>
+              <td>RegisterUiDrawCallback</td>
+              <td>注册 UI 绘制入口</td>
+            </tr>
+            <tr>
+              <td>绘制</td>
+              <td>UiDrawLine/Rect/Circle</td>
+              <td>矢量图元绘制</td>
+            </tr>
+            <tr>
+              <td>文本</td>
+              <td>UiDrawText</td>
+              <td>屏幕空间文字</td>
+            </tr>
+            <tr>
+              <td>图像</td>
+              <td>UiDrawImage</td>
+              <td>绘制纹理贴图</td>
+            </tr>
+            <tr>
+              <td>裁剪</td>
+              <td>UiPushClipRect/UiPopClipRect</td>
+              <td>局部裁剪区域</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" data-section="stability">
+        <h2>回退策略</h2>
+        <p>稳定性优先：任何模块异常都会自动降级，避免影响原版渲染。</p>
+        <div class="grid">
+          <div class="card">
+            <strong>ShaderPack 回退</strong>
+            <div>运行/编译失败会自动禁用当前 pack，并记录错误码，需手动 Reload 才会重新启用。</div>
+          </div>
+          <div class="card">
+            <strong>内置 Pass 回退</strong>
+            <div>阴影/描边/SSAO 等内置 Pass 一旦抛出异常会被单独禁用，不影响其它 Pass。</div>
+          </div>
+          <div class="card">
+            <strong>原版回退</strong>
+            <div>后处理失败会自动关闭 <code>postFx.enabled</code>，恢复原版输出。</div>
+          </div>
+        </div>
+        <h3>回退链路</h3>
+        <pre><code>ShaderPack → 内置渲染效果 → 原版渲染</code></pre>
+        <div class="note">建议在二开模块中为关键 Pass 设置开关，以便在异常时快速降级。</div>
+      </section>
+
+      <section class="panel" data-section="crash-report">
+        <h2>崩溃报告</h2>
+        <p>崩溃日志默认输出模块+偏移，调试版可输出函数名与源文件行号。</p>
+        <div class="card">
+          <strong>获取行号</strong>
+          <div>使用 <code>ninja -C build32_debug</code> 编译并保留 PDB，运行时会通过 <code>dbghelp.dll</code> 自动解析。</div>
+        </div>
+        <div class="card">
+          <strong>示例输出</strong>
+          <div><code>DXVK War3Crash: bt[3]=d3d9.dll+0x0014FE3F MyFunc+0x12 src/d3d9/foo.cpp:245</code></div>
+        </div>
+        <div class="note">若缺少符号文件，将仅输出模块与偏移地址。</div>
+      </section>
+
+      <section class="panel" data-section="perf-report">
+        <h2>性能报告</h2>
+        <p>可在 ImGui 的“渲染统计”面板导出 HTML 报告，用于定位卡顿与耗时热点。</p>
+        <div class="grid">
+          <div class="card">
+            <strong>统计窗口</strong>
+            <div>默认 20 分钟，可通过环境变量 <code>DXVK_WAR3_PERF_WINDOW_SEC</code> 调整。</div>
+          </div>
+          <div class="card">
+            <strong>历史缓存</strong>
+            <div>使用 <code>DXVK_WAR3_PERF_HISTORY_FRAMES</code> 或 <code>DXVK_WAR3_PERF_HISTORY_SEC</code> 控制采样上限。</div>
+          </div>
+          <div class="card">
+            <strong>层级树</strong>
+            <div>报告支持 Draw → Run → Pass 的分层展开，便于锁定具体耗时环节。</div>
+          </div>
+        </div>
+        <div class="note">提示：<code>Other/Untracked</code> 表示未显式打点的时间（包括原版渲染与驱动开销）。</div>
+      </section>
+
+      <section class="panel" data-section="example-hlsl">
+        <h2>默认 HLSL（简化版）</h2>
+        <pre><code class="language-hlsl">float4x4 gWorld : register(c0);
+float4x4 gViewProj : register(c4);
+float4 gLightDir : register(c8);
+float4 gLightColor : register(c9);
+
+VS_OUTPUT main_vs(VS_INPUT input) {
+  float4 wp = mul(gWorld, input.position);
+  output.position = mul(gViewProj, wp);
+  return output;
+}</code></pre>
+        <p>完整版本请查看 <code>shaders/war3_default.hlsl</code>。</p>
+      </section>
+
+      <section class="panel" data-section="example-outline">
+        <h2>描边 HLSL</h2>
+        <pre><code class="language-hlsl">float4 gOutlineColor : register(c8);
+float4 gOutlineParams : register(c9); // x=宽度
+
+worldPos.xyz += normalW * gOutlineParams.x;</code></pre>
+        <p>完整版本请查看 <code>shaders/war3_outline.hlsl</code>。</p>
+      </section>
+
+      <section class="panel" data-section="example-json">
+        <h2>ShaderPack 示例</h2>
+        <p>开启默认包：</p>
+        <pre><code class="language-json">{
+  "name": "默认材质覆盖 (Default Override)",
+  "enabled": true
+}</code></pre>
+        <p>热重载：</p>
+        <pre><code class="language-cpp">dxvk::war3::ShaderManager::get().reload();</code></pre>
+      </section>
+
+      <section class="panel" data-section="faq">
+        <h2>常见问题</h2>
+        <div class="card">
+          <strong>为什么 shader 没生效？</strong>
+          <div>确认 pack 已启用、路径正确且 shader 编译通过。可在 ImGui 面板触发 Reload。</div>
+        </div>
+        <div class="card">
+          <strong>为什么画面变黑？</strong>
+          <div>多半是寄存器映射缺失或矩阵顺序错误，检查 <code>uniforms</code> 是否对齐。</div>
+        </div>
+        <div class="card">
+          <strong>描边太粗/太细？</strong>
+          <div>调节 <code>OutlineParams.x</code> 或 JSON 中的参数，必要时修改 HLSL。</div>
+        </div>
+      </section>
+
+      <!-- API 参考：渲染事件系统 -->
+      <section class="panel" data-section="api-events">
+        <h2>渲染事件系统</h2>
+        <p>渲染事件系统允许二开作者在关键渲染阶段注入自定义逻辑，无需修改引擎代码。</p>
+
+        <h3>事件类型</h3>
+        <p>所有事件均在 <code>war3shader::RenderEventID</code> 枚举中定义：</p>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>事件 ID</th>
+              <th>触发时机</th>
+              <th>典型用途</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>FRAME_BEGIN</td>
+              <td>帧开始时</td>
+              <td>初始化帧状态、清理缓冲</td>
+            </tr>
+            <tr>
+              <td>SHADOW_RENDER_BEGIN</td>
+              <td>阴影渲染开始前</td>
+              <td>自定义阴影算法</td>
+            </tr>
+            <tr>
+              <td>SHADOW_RENDER_END</td>
+              <td>阴影渲染结束后</td>
+              <td>阴影后处理</td>
+            </tr>
+            <tr>
+              <td>POST_PROCESS_BEGIN</td>
+              <td>后处理开始前</td>
+              <td>注入自定义后处理</td>
+            </tr>
+            <tr>
+              <td>POST_PROCESS_END</td>
+              <td>后处理结束后</td>
+              <td>调色/合成收尾</td>
+            </tr>
+            <tr>
+              <td>WORLD_RENDER_BEGIN</td>
+              <td>世界渲染开始前</td>
+              <td>注入自定义光照</td>
+            </tr>
+            <tr>
+              <td>WORLD_RENDER_END</td>
+              <td>世界渲染结束后</td>
+              <td>世界后处理、描边</td>
+            </tr>
+            <tr>
+              <td>UI_RENDER_BEGIN</td>
+              <td>UI 渲染开始前</td>
+              <td>UI 背景绘制</td>
+            </tr>
+            <tr>
+              <td>UI_RENDER_END</td>
+              <td>UI 渲染结束后</td>
+              <td>叠加调试信息</td>
+            </tr>
+            <tr>
+              <td>FRAME_END</td>
+              <td>帧结束时</td>
+              <td>最终合成、截图</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>渲染阶段语义</h3>
+        <p><code>war3shader::RenderStageId</code> 定义了稳定的渲染阶段标识：</p>
+        <div>
+          <span class="tag">World</span>
+          <span class="tag">Shadow</span>
+          <span class="tag">Outline</span>
+          <span class="tag">PostProcess</span>
+          <span class="tag">UI</span>
+          <span class="tag">Overlay</span>
+        </div>
+        <div class="note">特效/透明层语义不通过 RenderStageId 区分，请以 <code>DrawCall.layerMask</code> 为准。</div>
+
+        <h3>核心 API 函数</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>
+                <code>uint32_t RegisterRenderEvent(RenderEventID eventId, War3RenderEventFn callback, void* userData)</code>
+              </td>
+              <td>注册渲染事件回调，返回回调 ID 用于注销</td>
+            </tr>
+            <tr>
+              <td><code>bool UnregisterRenderEvent(uint32_t callbackId)</code></td>
+              <td>注销渲染事件回调</td>
+            </tr>
+            <tr>
+              <td><code>bool DisableNativeShadows(bool disable)</code></td>
+              <td>禁用/启用内置阴影渲染</td>
+            </tr>
+            <tr>
+              <td><code>bool DisableNativeLighting(bool disable)</code></td>
+              <td>禁用/启用内置光照计算</td>
+            </tr>
+            <tr>
+              <td><code>bool DisableNativePostProcess(bool disable)</code></td>
+              <td>禁用/启用内置后处理</td>
+            </tr>
+            <tr>
+              <td><code>void AddOutlineHandle(uint32_t handle)</code></td>
+              <td>添加描边对象句柄（单位/建筑等）</td>
+            </tr>
+            <tr>
+              <td><code>bool AddOutlineLastRenderHandle()</code></td>
+              <td>将最近一次渲染捕获的对象加入描边列表</td>
+            </tr>
+            <tr>
+              <td><code>bool AddOutlineHandleByIndex(uint32_t index)</code></td>
+              <td>通过渲染对象索引添加描边（调试互通用）</td>
+            </tr>
+            <tr>
+              <td><code>void RemoveOutlineHandle(uint32_t handle)</code></td>
+              <td>移除描边对象句柄</td>
+            </tr>
+            <tr>
+              <td><code>void ClearOutlineHandles()</code></td>
+              <td>清空描边句柄列表</td>
+            </tr>
+            <tr>
+              <td><code>uint32_t GetOutlineHandleCount()</code></td>
+              <td>获取当前描边句柄数量</td>
+            </tr>
+            <tr>
+              <td><code>bool IsOutlineHandle(uint32_t handle)</code></td>
+              <td>检查句柄是否已加入描边列表</td>
+            </tr>
+            <tr>
+              <td><code>bool SetOutlineAllObjectsEnabled(bool enabled)</code></td>
+              <td>调试：强制描边所有对象</td>
+            </tr>
+            <tr>
+              <td><code>bool SetOutlineForceEnabled(bool enabled)</code></td>
+              <td>调试：强制启用描边设置</td>
+            </tr>
+            <tr>
+              <td><code>void AddBloomHandle(uint32_t handle, float boost)</code></td>
+              <td>标记对象 Bloom 提示（boost &gt; 0 生效）</td>
+            </tr>
+            <tr>
+              <td><code>void RemoveBloomHandle(uint32_t handle)</code></td>
+              <td>移除 Bloom 提示对象</td>
+            </tr>
+            <tr>
+              <td><code>void ClearBloomHandles()</code></td>
+              <td>清空 Bloom 句柄列表</td>
+            </tr>
+            <tr>
+              <td><code>float GetBloomBoost(uint32_t handle)</code></td>
+              <td>获取对象 Bloom 提示强度（CPU 侧工具用）</td>
+            </tr>
+            <tr>
+              <td><code>uint32_t GetBloomHandleCount()</code></td>
+              <td>获取当前 Bloom 句柄数量</td>
+            </tr>
+            <tr>
+              <td><code>bool IsRenderHandleTracked(uint32_t handle)</code></td>
+              <td>查询句柄是否已被渲染对象追踪</td>
+            </tr>
+            <tr>
+              <td><code>uint32_t GetRenderObjectCount()</code></td>
+              <td>获取当前帧可追踪的渲染对象数量</td>
+            </tr>
+            <tr>
+              <td><code>uint32_t GetLastRenderHandle()</code></td>
+              <td>获取最近一次渲染捕获的对象句柄（完整 jHandle）</td>
+            </tr>
+            <tr>
+              <td><code>uint32_t GetRenderObjectHandleByIndex(uint32_t index)</code></td>
+              <td>按索引返回对象句柄（无固定顺序，仅用于调试）</td>
+            </tr>
+            <tr>
+              <td><code>uint32_t GetRenderObjectKindByIndex(uint32_t index)</code></td>
+              <td>按索引返回对象类型（0=Unknown 1=Unit 2=Building 3=Destructible 4=Item 5=Effect）</td>
+            </tr>
+            <tr>
+              <td><code>uint32_t GetRenderObjectRawcodeByIndex(uint32_t index)</code></td>
+              <td>按索引返回对象 rawcode（四字码）</td>
+            </tr>
+            <tr>
+              <td><code>const RenderContext* GetCurrentRenderContext()</code></td>
+              <td>获取当前渲染上下文（可在回调外调用）</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>渲染设置 API（C++）</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>bool SetLightingEnabled(bool enabled)</code></td><td>启用/禁用太阳光照</td></tr>
+            <tr><td><code>bool SetSunDirection(float x, float y, float z)</code></td><td>设置太阳方向</td></tr>
+            <tr><td><code>bool SetSunColor(float r, float g, float b)</code></td><td>设置太阳颜色</td></tr>
+            <tr><td><code>bool SetSunIntensity(float intensity)</code></td><td>设置太阳强度</td></tr>
+            <tr><td><code>bool SetShadowEnabled(bool enabled)</code></td><td>启用/禁用光影整体</td></tr>
+            <tr><td><code>bool SetShadowStrength(float strength)</code></td><td>阴影强度 (0..1)</td></tr>
+            <tr><td><code>bool SetShadowBias(float bias)</code></td><td>阴影偏移</td></tr>
+            <tr><td><code>bool SetShadowCasterBias(float constantBias, float slopeBias, float clamp)</code></td><td>投射器深度偏移（常量/斜率/上限）</td></tr>
+            <tr><td><code>bool SetShadowDepthRangeMargin(float margin)</code></td><td>CSM 深度外扩（光空间 Z 范围）</td></tr>
+            <tr><td><code>bool SetShadowPcfRadius(float radius)</code></td><td>PCF 半径</td></tr>
+            <tr><td><code>bool SetShadowPcfKernel(uint32_t kernel)</code></td><td>PCF 采样核 0=3x3 1=5x5 2=Poisson16 3=Poisson25</td></tr>
+            <tr><td><code>bool SetShadowPcfRotate(bool enabled)</code></td><td>PCF 旋转（Poisson）</td></tr>
+            <tr><td><code>bool SetShadowPcfRotateMode(uint32_t mode)</code></td><td>PCF 旋转模式 0=关闭 1=屏幕 2=世界</td></tr>
+            <tr><td><code>bool SetShadowPcssSearchKernel(uint32_t kernel)</code></td><td>PCSS 搜索核 0=3x3 1=5x5</td></tr>
+            <tr><td><code>bool SetShadowCascadeBiasScale(float scale)</code></td><td>级联偏移缩放 0..1</td></tr>
+            <tr><td><code>bool SetShadowPcfCascadeRadiusScale(float scale)</code></td><td>PCF 级联锐化 0..1（远级联半径更小，缓解高机位发糊）</td></tr>
+            <tr><td><code>bool SetShadowAlphaHashed(bool enabled)</code></td><td>Alpha 阴影 Hash 开关</td></tr>
+            <tr><td><code>bool SetShadowAlphaUseMip(bool enabled)</code></td><td>Alpha 阴影 Mip 采样开关</td></tr>
+            <tr><td><code>bool SetShadowAlphaMipLodBias(float bias)</code></td><td>Alpha 阴影 Mip LOD Bias（仅在启用 Mip 时生效）</td></tr>
+            <tr><td><code>bool SetShadowAlphaFarAlphaRefBias(float bias)</code></td><td>Alpha 远级联阈值偏移（去毛刺）</td></tr>
+            <tr><td><code>bool SetNativeShadowMode(uint32_t mode)</code></td><td>原生阴影模式 0=完整 1=仅雾/边界 2=禁用</td></tr>
+            <tr><td><code>bool SetShadowLockSun(bool enabled)</code></td><td>锁定太阳方向（调试用）</td></tr>
+            <tr><td><code>bool SetShadowLockSunTime(float time01)</code></td><td>锁定太阳时间 0..1（0.5=正午）</td></tr>
+            <tr><td><code>bool SetShadowStableSnapWhenSunMoving(bool enabled)</code></td><td>太阳移动时仍使用稳定 Snap</td></tr>
+            <tr><td><code>bool SetShadowDebugMode(uint32_t mode)</code></td><td>调试模式 0~3</td></tr>
+            <tr><td><code>bool SetShadowReceiverMode(uint32_t mode)</code></td><td>阴影接收器模式 0=Legacy 1=NormalBias 2=AdaptiveBias</td></tr>
+            <tr><td><code>bool SetShadowNormalBiasScale(float scale)</code></td><td>法线偏移比例（与 receiverBias 叠加）</td></tr>
+            <tr><td><code>bool SetShadowFilterMode(uint32_t mode)</code></td><td>阴影采样滤波 0=Nearest 1=Linear</td></tr>
+            <tr><td><code>bool SetShadowAltitudeMode(uint32_t mode)</code></td><td>阴影高度曲线 0=真实高度 1=时间线性</td></tr>
+            <tr><td><code>bool SetShadowLengthScale(float scale)</code></td><td>阴影长度整体缩放（默认 0.9）</td></tr>
+            <tr><td><code>bool SetShadowMaxLengthScale(float scale)</code></td><td>阴影最长长度缩放（默认 0.8）</td></tr>
+            <tr><td><code>bool SetShadowRimIntensity(float intensity)</code></td><td>轮廓光强度（0=关闭）</td></tr>
+            <tr><td><code>bool SetShadowRimPower(float power)</code></td><td>轮廓光指数（越大边缘越细）</td></tr>
+            <tr><td><code>bool SetPointLightsEnabled(bool enabled)</code></td><td>启用/禁用点光源</td></tr>
+            <tr><td><code>bool SetPointShadowEnabled(bool enabled)</code></td><td>启用/禁用点光源阴影</td></tr>
+            <tr><td><code>bool SetOutlineEnabled(bool enabled)</code></td><td>启用/禁用描边</td></tr>
+            <tr><td><code>bool SetOutlineWidth(float widthPx)</code></td><td>描边宽度（像素）</td></tr>
+            <tr><td><code>bool SetOutlineColor(float r, float g, float b, float a)</code></td><td>描边颜色 (rgba)</td></tr>
+            <tr><td><code>bool SetOutlineMode(uint32_t mode)</code></td><td>0=填充 1=轮廓</td></tr>
+            <tr><td><code>bool SetOutlineVisibility(bool showVisible, bool showOccluded)</code></td><td>可见/遮挡开关</td></tr>
+            <tr><td><code>bool SetOutlineScreenSpace(bool enabled)</code></td><td>启用/禁用屏幕空间描边</td></tr>
+            <tr><td><code>bool SetPostFxEnabled(bool enabled)</code></td><td>启用/禁用后处理</td></tr>
+            <tr><td><code>bool SetExposure(float exposure)</code></td><td>设置曝光</td></tr>
+            <tr><td><code>bool SetBloomEnabled(bool enabled)</code></td><td>启用/禁用 Bloom</td></tr>
+            <tr><td><code>bool SetBloomParams(float threshold, float softKnee, float intensity)</code></td><td>Bloom 参数</td></tr>
+            <tr><td><code>bool SetAcesEnabled(bool enabled)</code></td><td>启用/禁用 ACES</td></tr>
+            <tr><td><code>bool SetSsaoEnabled(bool enabled)</code></td><td>启用/禁用 SSAO</td></tr>
+            <tr><td><code>bool SetSsaoParams(float radiusPx, float strength, float bias, float power)</code></td><td>SSAO 参数</td></tr>
+            <tr><td><code>bool SetAaMode(uint32_t mode)</code></td><td>0=None 1=FXAA 2~5=SMAA</td></tr>
+            <tr><td><code>bool SetFxaaParams(float subpix, float edgeThreshold, float edgeThresholdMin)</code></td><td>FXAA 参数</td></tr>
+            <tr><td><code>bool SetSmaaParams(float threshold, int32_t search, int32_t diagSearch)</code></td><td>SMAA 参数</td></tr>
+            <tr><td><code>bool SetDayNightEnabled(bool enabled)</code></td><td>启用/禁用日夜调节</td></tr>
+            <tr><td><code>bool SetDayNightMinFactor(float minFactor)</code></td><td>日出/日落最低亮度比例</td></tr>
+            <tr><td><code>bool SetDayNightAmbient(float dayR, float dayG, float dayB, float nightR, float nightG, float nightB)</code></td><td>设置日/夜环境光颜色</td></tr>
+          </tbody>
+        </table>
+
+        <h3>点光源 API（C++）</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>int32_t AddPointLight(float x, float y, float z, float range, float r, float g, float b, float intensity, float shadowIntensity)</code></td><td>创建点光源并返回 ID</td></tr>
+            <tr><td><code>bool UpdatePointLight(int32_t id, float x, float y, float z, float range, float r, float g, float b, float intensity)</code></td><td>更新点光源参数</td></tr>
+            <tr><td><code>bool RemovePointLight(int32_t id)</code></td><td>移除点光源</td></tr>
+          </tbody>
+        </table>
+
+        <h3>回调函数签名</h3>
+        <pre><code class="language-cpp">// C 风格回调函数类型
+typedef void (*War3RenderEventFn)(RenderEventID eventId, const RenderContext* context, void* userData);</code></pre>
+
+        <h3>使用示例</h3>
+        <pre><code class="language-cpp">void MyWorldEndCallback(war3shader::RenderEventID eventId,
+                        const war3shader::RenderContext* ctx,
+                        void* user) {
+    // 在世界渲染结束后执行自定义逻辑
+    const auto& camera = ctx->camera;
+    const auto& sun = ctx->sunLight;
+    // ...
+}
+
+// 注册回调
+auto id = war3shader::RegisterRenderEvent(
+    war3shader::RenderEventID::WORLD_RENDER_END,
+    MyWorldEndCallback,
+    nullptr
+);
+
+// 注销回调
+war3shader::UnregisterRenderEvent(id);</code></pre>
+        <div class="note">⚠️ 生命周期警告：<code>context</code> 指针仅在回调执行期间有效，请勿缓存跨帧使用。</div>
+      </section>
+
+      <!-- API 参考：JASS 脚本 -->
+      <section class="panel" data-section="api-jass">
+        <h2>JASS 脚本 API</h2>
+        <p>以下为内置 JASS Native（需在游戏内调用）。大多数命名使用 <code>DXVK_</code> 前缀，点光源接口为兼容旧写法保留无前缀版本。</p>
+        <div class="note">提示：JASS 侧签名遵循 MemHack 约定，例如 <code>(RRR)B</code> 表示三个 real 参数返回 boolean。</div>
+
+        <h3>时间/版本</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数名</th>
+              <th>签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>DXVK_GetGameTimeSeconds</code></td><td><code>()R</code></td><td>获取秒级游戏时间</td></tr>
+            <tr><td><code>DXVK_GetTimeOfDay</code></td><td><code>()R</code></td><td>获取 0~24 的昼夜时间</td></tr>
+            <tr><td><code>DXVK_GetGameVersion</code></td><td><code>()I</code></td><td>获取游戏版本号（1.27a 返回 0x27a）</td></tr>
+          </tbody>
+        </table>
+
+        <h3>点光源</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数名</th>
+              <th>签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>AddPointLight</code></td><td><code>(RRRRRRRRR)I</code></td><td>创建点光源并返回 ID</td></tr>
+            <tr><td><code>UpdatePointLight</code></td><td><code>(IRRRRRRRR)B</code></td><td>更新点光源参数</td></tr>
+            <tr><td><code>RemovePointLight</code></td><td><code>(I)B</code></td><td>移除点光源</td></tr>
+          </tbody>
+        </table>
+
+        <h3>光影/阴影</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数名</th>
+              <th>签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>DXVK_SetLightingEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用太阳光照</td></tr>
+            <tr><td><code>DXVK_SetSunDirection</code></td><td><code>(RRR)B</code></td><td>设置太阳方向 (xyz)</td></tr>
+            <tr><td><code>DXVK_SetSunColor</code></td><td><code>(RRR)B</code></td><td>设置太阳颜色 (rgb)</td></tr>
+            <tr><td><code>DXVK_SetSunIntensity</code></td><td><code>(R)B</code></td><td>设置太阳强度</td></tr>
+            <tr><td><code>DXVK_SetShadowEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用光影整体</td></tr>
+            <tr><td><code>DXVK_SetShadowStrength</code></td><td><code>(R)B</code></td><td>调整阴影强度 (0..1)</td></tr>
+            <tr><td><code>DXVK_SetShadowBias</code></td><td><code>(R)B</code></td><td>调整阴影偏移</td></tr>
+            <tr><td><code>DXVK_SetShadowCasterBias</code></td><td><code>(RRR)B</code></td><td>投射器深度偏移（常量/斜率/上限）</td></tr>
+            <tr><td><code>DXVK_SetShadowDepthRangeMargin</code></td><td><code>(R)B</code></td><td>CSM 深度外扩</td></tr>
+            <tr><td><code>DXVK_SetShadowPcfRadius</code></td><td><code>(R)B</code></td><td>调整 PCF 半径</td></tr>
+            <tr><td><code>DXVK_SetShadowPcfKernel</code></td><td><code>(I)B</code></td><td>PCF 采样核 0=3x3 1=5x5 2=Poisson16 3=Poisson25</td></tr>
+            <tr><td><code>DXVK_SetShadowPcfRotate</code></td><td><code>(B)B</code></td><td>PCF 旋转（Poisson）</td></tr>
+            <tr><td><code>DXVK_SetShadowPcfRotateMode</code></td><td><code>(I)B</code></td><td>PCF 旋转模式 0=关闭 1=屏幕 2=世界</td></tr>
+            <tr><td><code>DXVK_SetShadowPcssSearchKernel</code></td><td><code>(I)B</code></td><td>PCSS 搜索核 0=3x3 1=5x5</td></tr>
+            <tr><td><code>DXVK_SetShadowCascadeBiasScale</code></td><td><code>(R)B</code></td><td>级联偏移缩放 0..1</td></tr>
+            <tr><td><code>DXVK_SetShadowAlphaHashed</code></td><td><code>(B)B</code></td><td>Alpha 阴影 Hash 开关</td></tr>
+            <tr><td><code>DXVK_SetShadowAlphaUseMip</code></td><td><code>(B)B</code></td><td>Alpha 阴影 Mip 采样开关</td></tr>
+            <tr><td><code>DXVK_SetNativeShadowMode</code></td><td><code>(I)B</code></td><td>原生阴影模式 0=完整 1=仅雾/边界 2=禁用</td></tr>
+            <tr><td><code>DXVK_SetShadowLockSun</code></td><td><code>(B)B</code></td><td>锁定太阳方向</td></tr>
+            <tr><td><code>DXVK_SetShadowLockSunTime</code></td><td><code>(R)B</code></td><td>锁定太阳时间</td></tr>
+            <tr><td><code>DXVK_SetShadowStableSnapWhenSunMoving</code></td><td><code>(B)B</code></td><td>太阳移动时稳定 Snap</td></tr>
+            <tr><td><code>DXVK_SetShadowDebugMode</code></td><td><code>(I)B</code></td><td>调试模式 0~3</td></tr>
+            <tr><td><code>DXVK_SetShadowReceiverMode</code></td><td><code>(I)B</code></td><td>阴影接收器模式 0=Legacy 1=NormalBias 2=AdaptiveBias</td></tr>
+            <tr><td><code>DXVK_SetShadowNormalBiasScale</code></td><td><code>(R)B</code></td><td>法线偏移比例</td></tr>
+            <tr><td><code>DXVK_SetShadowFilterMode</code></td><td><code>(I)B</code></td><td>阴影采样滤波 0=Nearest 1=Linear</td></tr>
+            <tr><td><code>DXVK_SetShadowAltitudeMode</code></td><td><code>(I)B</code></td><td>阴影高度曲线 0=真实高度 1=时间线性</td></tr>
+            <tr><td><code>DXVK_SetShadowLengthScale</code></td><td><code>(R)B</code></td><td>阴影长度整体缩放（默认 0.9）</td></tr>
+            <tr><td><code>DXVK_SetShadowMaxLengthScale</code></td><td><code>(R)B</code></td><td>阴影最长长度缩放（默认 0.8）</td></tr>
+            <tr><td><code>DXVK_SetShadowRimIntensity</code></td><td><code>(R)B</code></td><td>轮廓光强度（0=关闭）</td></tr>
+            <tr><td><code>DXVK_SetShadowRimPower</code></td><td><code>(R)B</code></td><td>轮廓光指数（越大边缘越细）</td></tr>
+            <tr><td><code>DXVK_SetPointLightsEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用点光源</td></tr>
+            <tr><td><code>DXVK_SetPointShadowEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用点光源阴影</td></tr>
+          </tbody>
+        </table>
+
+        <h3>描边</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数名</th>
+              <th>签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>DXVK_OutlineAddHandle</code></td><td><code>(I)B</code></td><td>添加描边对象句柄</td></tr>
+            <tr><td><code>DXVK_OutlineAddLastRenderHandle</code></td><td><code>()B</code></td><td>使用最近渲染句柄快速添加描边</td></tr>
+            <tr><td><code>DXVK_OutlineAddHandleByIndex</code></td><td><code>(I)B</code></td><td>通过渲染对象索引添加描边</td></tr>
+            <tr><td><code>DXVK_OutlineRemoveHandle</code></td><td><code>(I)B</code></td><td>移除描边对象句柄</td></tr>
+            <tr><td><code>DXVK_OutlineClearHandles</code></td><td><code>()B</code></td><td>清空描边句柄</td></tr>
+            <tr><td><code>DXVK_GetOutlineHandleCount</code></td><td><code>()I</code></td><td>获取描边句柄数量</td></tr>
+            <tr><td><code>DXVK_IsOutlineHandle</code></td><td><code>(I)B</code></td><td>检查句柄是否在描边列表</td></tr>
+            <tr><td><code>DXVK_SetOutlineAllObjectsEnabled</code></td><td><code>(I)B</code></td><td>调试：强制描边所有对象</td></tr>
+            <tr><td><code>DXVK_SetOutlineForceEnabled</code></td><td><code>(I)B</code></td><td>调试：强制启用描边设置</td></tr>
+            <tr><td><code>DXVK_SetOutlineEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用描边</td></tr>
+            <tr><td><code>DXVK_SetOutlineWidth</code></td><td><code>(R)B</code></td><td>描边宽度 (像素)</td></tr>
+            <tr><td><code>DXVK_SetOutlineColor</code></td><td><code>(RRRR)B</code></td><td>描边颜色 (rgba)</td></tr>
+            <tr><td><code>DXVK_SetOutlineMode</code></td><td><code>(I)B</code></td><td>0=填充, 1=轮廓</td></tr>
+            <tr><td><code>DXVK_SetOutlineVisibility</code></td><td><code>(BB)B</code></td><td>可见/遮挡开关</td></tr>
+            <tr><td><code>DXVK_SetOutlineScreenSpace</code></td><td><code>(B)B</code></td><td>屏幕空间描边开关</td></tr>
+          </tbody>
+        </table>
+        <div class="note">描边排查建议：优先在 ImGui → 内置渲染设置 → 描边调试开启“强制全对象描边（仅世界物体类）”。若此时能看到大面积描边，说明描边渲染管线/Shader 正常；再关闭 DebugAll，使用 <code>DXVK_GetLastRenderHandle</code>/<code>DXVK_OutlineAddHandleByIndex</code> 找到并添加正确句柄，定位是否为脚本传参不一致导致的“no draw match”。</div>
+
+        <h3>对象追踪/调试</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数名</th>
+              <th>签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>DXVK_GetRenderObjectCount</code></td><td><code>()I</code></td><td>获取当前帧可追踪对象数量</td></tr>
+            <tr><td><code>DXVK_GetRenderObjectHandleByIndex</code></td><td><code>(I)I</code></td><td>按索引返回对象句柄（无固定顺序，仅调试）</td></tr>
+            <tr><td><code>DXVK_GetRenderObjectKindByIndex</code></td><td><code>(I)I</code></td><td>按索引返回对象类型（0=Unknown 1=Unit 2=Building 3=Destructible 4=Item 5=Effect）</td></tr>
+            <tr><td><code>DXVK_GetRenderObjectRawcodeByIndex</code></td><td><code>(I)I</code></td><td>按索引返回对象 rawcode</td></tr>
+            <tr><td><code>DXVK_IsRenderHandleTracked</code></td><td><code>(I)B</code></td><td>查询句柄是否被渲染层追踪</td></tr>
+            <tr><td><code>DXVK_GetLastRenderHandle</code></td><td><code>()I</code></td><td>获取最近一次渲染捕获的对象句柄（完整 jHandle）</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Bloom 句柄</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数名</th>
+              <th>签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>DXVK_BloomAddHandle</code></td><td><code>(IR)B</code></td><td>标记对象 Bloom 提示（boost &gt; 0 生效）</td></tr>
+            <tr><td><code>DXVK_BloomRemoveHandle</code></td><td><code>(I)B</code></td><td>移除 Bloom 句柄</td></tr>
+            <tr><td><code>DXVK_BloomClearHandles</code></td><td><code>()B</code></td><td>清空 Bloom 句柄</td></tr>
+            <tr><td><code>DXVK_BloomGetBoost</code></td><td><code>(I)R</code></td><td>获取对象 Bloom 强度</td></tr>
+          </tbody>
+        </table>
+
+        <h3>后处理</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数名</th>
+              <th>签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>DXVK_SetPostFxEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用后处理</td></tr>
+            <tr><td><code>DXVK_SetExposure</code></td><td><code>(R)B</code></td><td>设置曝光值</td></tr>
+            <tr><td><code>DXVK_SetBloomEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用 Bloom</td></tr>
+            <tr><td><code>DXVK_SetBloomParams</code></td><td><code>(RRR)B</code></td><td>阈值/软阈值/强度</td></tr>
+            <tr><td><code>DXVK_SetAcesEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用 ACES</td></tr>
+            <tr><td><code>DXVK_SetSsaoEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用 SSAO</td></tr>
+            <tr><td><code>DXVK_SetSsaoParams</code></td><td><code>(RRRR)B</code></td><td>半径/强度/偏移/曲线</td></tr>
+            <tr><td><code>DXVK_SetAaMode</code></td><td><code>(I)B</code></td><td>0=None 1=FXAA 2~5=SMAA</td></tr>
+            <tr><td><code>DXVK_SetFxaaParams</code></td><td><code>(RRR)B</code></td><td>FXAA 参数</td></tr>
+            <tr><td><code>DXVK_SetSmaaParams</code></td><td><code>(RII)B</code></td><td>SMAA 参数</td></tr>
+          </tbody>
+        </table>
+
+        <h3>日夜色调</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数名</th>
+              <th>签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>DXVK_SetDayNightEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用日夜调节</td></tr>
+            <tr><td><code>DXVK_SetDayNightMinFactor</code></td><td><code>(R)B</code></td><td>日出/日落最低亮度比例</td></tr>
+            <tr><td><code>DXVK_SetDayNightAmbient</code></td><td><code>(RRRRRR)B</code></td><td>设置日/夜环境光颜色</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- API 参考：数据结构 -->
+      <section class="panel" data-section="api-structs">
+        <h2>数据结构</h2>
+        <p>以下是 Shader API 使用的核心数据结构，所有结构均为 ABI 稳定设计。</p>
+
+        <h3>基础类型</h3>
+        <div class="grid">
+          <div class="card">
+            <strong>Vector3</strong>
+            <pre><code>struct Vector3 {
+    float x, y, z;
+};</code></pre>
+          </div>
+          <div class="card">
+            <strong>Vector4</strong>
+            <pre><code>struct Vector4 {
+    float x, y, z, w;
+};</code></pre>
+          </div>
+          <div class="card">
+            <strong>Matrix4x4</strong>
+            <pre><code>struct Matrix4x4 {
+    float m[4][4]; // 行优先
+};</code></pre>
+          </div>
+          <div class="card">
+            <strong>UiVec2</strong>
+            <pre><code>struct UiVec2 {
+    float x, y;
+};</code></pre>
+          </div>
+          <div class="card">
+            <strong>UiColor</strong>
+            <pre><code>struct UiColor {
+    float r, g, b, a; // 线性空间 0-1
+};</code></pre>
+          </div>
+          <div class="card">
+            <strong>UiRect</strong>
+            <pre><code>struct UiRect {
+    UiVec2 min;
+    UiVec2 max;
+};</code></pre>
+          </div>
+        </div>
+
+        <h3>视口信息 <span class="tag">Viewport</span></h3>
+        <pre><code class="language-cpp">struct Viewport {
+    uint32_t x;          // 左上角 X
+    uint32_t y;          // 左上角 Y
+    uint32_t width;      // 宽度
+    uint32_t height;     // 高度
+    float minDepth;      // 最小深度 (0.0)
+    float maxDepth;      // 最大深度 (1.0)
+};</code></pre>
+
+        <h3>相机数据 <span class="tag">CameraData</span></h3>
+        <pre><code class="language-cpp">struct CameraData {
+    Matrix4x4 view;          // View 矩阵
+    Matrix4x4 projection;    // Projection 矩阵
+    Matrix4x4 viewProjection;// ViewProj 矩阵
+    Matrix4x4 invView;       // View 逆矩阵
+    Matrix4x4 invProjection; // Projection 逆矩阵
+    Vector3 position;        // 相机世界坐标
+    Vector3 forward;         // 相机前方向
+    Vector3 up;              // 相机上方向
+    Vector3 right;           // 相机右方向
+    float nearPlane;         // 近裁剪面
+    float farPlane;          // 远裁剪面
+    float fov;               // 视场角（弧度）
+    float aspectRatio;       // 宽高比
+    Viewport viewport;       // 视口
+};</code></pre>
+
+        <h3>光源数据 <span class="tag">LightData</span></h3>
+        <pre><code class="language-cpp">enum class LightType : uint32_t {
+    DIRECTIONAL = 0,  // 方向光（太阳）
+    POINT = 1,        // 点光源
+    SPOT = 2,         // 聚光灯（暂不支持）
+};
+
+enum LightFlags : uint32_t {
+    LIGHT_FLAG_NONE         = 0,
+    LIGHT_FLAG_CASTS_SHADOW = 1 << 0,  // 投射阴影
+    LIGHT_FLAG_ACTIVE       = 1 << 1,  // 激活状态
+};
+
+struct LightData {
+    LightType type;      // 光源类型
+    Vector3 position;    // 位置
+    Vector3 direction;   // 方向
+    Vector4 color;       // 颜色 (RGB + 强度)
+    float range;         // 范围
+    float intensity;     // 强度
+    uint32_t flags;      // LightFlags 组合
+};</code></pre>
+
+        <h3>Draw Call 信息 <span class="tag">DrawCall</span></h3>
+        <pre><code class="language-cpp">struct DrawCall {
+    // 几何数据
+    const void* vertexData;      // 顶点数据指针
+    uint32_t vertexCount;        // 顶点数量
+    uint32_t vertexStride;       // 顶点步长
+    VertexFormat positionFormat; // 位置格式
+    uint32_t positionOffset;     // 位置偏移
+    const void* indexData;       // 索引数据指针
+    uint32_t indexCount;         // 索引数量
+    PrimitiveType primitiveType; // 图元类型
+    // 变换
+    Matrix4x4 worldMatrix;       // 世界矩阵
+    // 材质
+    uint32_t textureHandle;      // 主纹理句柄
+    uint32_t textureWidth;       // 主纹理宽度
+    uint32_t textureHeight;      // 主纹理高度
+    // 渲染状态
+    uint32_t flags;              // DrawCallFlags 组合
+    float alphaRef;              // Alpha 参考值
+    // 分类
+    uint32_t layerMask;          // 图层掩码
+    uint32_t objectId;           // 对象唯一标识
+};</code></pre>
+
+        <h3>DrawCallFlags / LayerMask 对照</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>字段</th>
+              <th>位掩码</th>
+              <th>含义</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>flags</td>
+              <td><code>DRAWCALL_FLAG_DEPTH_TEST</code></td>
+              <td>深度测试开启</td>
+            </tr>
+            <tr>
+              <td>flags</td>
+              <td><code>DRAWCALL_FLAG_DEPTH_WRITE</code></td>
+              <td>深度写入开启</td>
+            </tr>
+            <tr>
+              <td>flags</td>
+              <td><code>DRAWCALL_FLAG_ALPHA_TEST</code></td>
+              <td>启用 Alpha 测试</td>
+            </tr>
+            <tr>
+              <td>flags</td>
+              <td><code>DRAWCALL_FLAG_ALPHA_BLEND</code></td>
+              <td>启用 Alpha 混合</td>
+            </tr>
+            <tr>
+              <td>flags</td>
+              <td><code>DRAWCALL_FLAG_ADDITIVE_BLEND</code></td>
+              <td>加法混合（特效常见）</td>
+            </tr>
+            <tr>
+              <td>flags</td>
+              <td><code>DRAWCALL_FLAG_BLOOM_HINT</code></td>
+              <td>Bloom 提示（由高阶 API 标记）</td>
+            </tr>
+            <tr>
+              <td>layerMask</td>
+              <td><code>DRAWCALL_LAYER_WORLD</code></td>
+              <td>世界层主语义（默认回退）</td>
+            </tr>
+            <tr>
+              <td>layerMask</td>
+              <td><code>DRAWCALL_LAYER_EFFECT</code></td>
+              <td>特效层/Overlay</td>
+            </tr>
+            <tr>
+              <td>layerMask</td>
+              <td><code>DRAWCALL_LAYER_TRANSPARENT</code></td>
+              <td>透明/混合层</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>帧缓冲信息 <span class="tag">FrameBuffer</span></h3>
+        <pre><code class="language-cpp">struct FrameBuffer {
+    const void* data;        // 数据指针
+    uint32_t width;          // 宽度
+    uint32_t height;         // 高度
+    TextureFormat format;    // 格式
+    uint32_t mipLevels;      // Mip 级别数
+    uint32_t arrayLayers;    // 数组层数
+    // Vulkan 特定
+    void* vkImage;           // VkImage 句柄
+    void* vkImageView;       // VkImageView 句柄
+    uint32_t vkLayout;       // VkImageLayout
+};</code></pre>
+
+        <h3>渲染上下文 <span class="tag">RenderContext</span></h3>
+        <pre><code class="language-cpp">struct RenderContext {
+    RenderEventID eventId;           // 当前回调事件
+    RenderStageId stageId;           // 渲染阶段语义
+    uint32_t stageCaps;              // 阶段能力掩码
+    // 时间信息
+    float gameTime;                  // 游戏时间 (0-24)
+    float frameTime;                 // 帧时间（秒）
+    float frameTimeCounter;          // 累计时间
+    uint64_t frameIndex;             // 帧序号
+    // 场景数据
+    CameraData camera;               // 相机数据
+    FrameBuffer colorBuffer;         // 颜色缓冲
+    FrameBuffer depthBuffer;         // 深度缓冲
+    LightData sunLight;              // 太阳光
+    uint32_t pointLightCount;        // 点光源数量
+    const LightData* pointLights;    // 点光源数组
+    uint32_t drawCallCount;          // Draw Call 数量
+    const DrawCall* drawCalls;       // Draw Call 数组
+    // 设置
+    bool nativeShadowsEnabled;       // 内置阴影是否启用
+    bool nativeLightingEnabled;      // 内置光照是否启用
+    bool nativePostProcessEnabled;   // 内置后处理是否启用
+};</code></pre>
+      </section>
+
+      <!-- API 参考：Vulkan 扩展 -->
+      <section class="panel" data-section="api-vulkan">
+        <h2>Vulkan 扩展 API</h2>
+        <p>高级 API 允许直接访问底层 Vulkan 资源，适用于需要完全控制渲染管线的场景。</p>
+        <div class="note">⚠️ 警告：这些是高级 API，使用前需熟悉 Vulkan 编程。错误使用可能导致崩溃或渲染异常。</div>
+
+        <h3>设备与实例访问</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数签名</th>
+              <th>返回类型</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>GetVulkanDevice()</code></td>
+              <td><code>VkDevice</code></td>
+              <td>获取 Vulkan 逻辑设备句柄</td>
+            </tr>
+            <tr>
+              <td><code>GetVulkanPhysicalDevice()</code></td>
+              <td><code>VkPhysicalDevice</code></td>
+              <td>获取 Vulkan 物理设备句柄</td>
+            </tr>
+            <tr>
+              <td><code>GetVulkanInstance()</code></td>
+              <td><code>VkInstance</code></td>
+              <td>获取 Vulkan 实例句柄</td>
+            </tr>
+            <tr>
+              <td><code>GetVulkanCommandBuffer()</code></td>
+              <td><code>VkCommandBuffer</code></td>
+              <td>获取当前帧的命令缓冲（仅在事件回调中有效）</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>帧缓冲访问</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>const FrameBuffer* GetRawColorBuffer()</code></td>
+              <td>获取原生颜色缓冲</td>
+            </tr>
+            <tr>
+              <td><code>const FrameBuffer* GetRawDepthBuffer()</code></td>
+              <td>获取原生深度缓冲</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>场景数据访问</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>函数签名</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>const DrawCall* GetDrawCalls(uint32_t* outCount)</code></td>
+              <td>获取当前帧的 Draw Call 列表</td>
+            </tr>
+            <tr>
+              <td><code>const CameraData* GetCameraData()</code></td>
+              <td>获取相机数据</td>
+            </tr>
+            <tr>
+              <td><code>const LightData* GetSunLight()</code></td>
+              <td>获取太阳光数据</td>
+            </tr>
+            <tr>
+              <td><code>const LightData* GetPointLights(uint32_t* outCount)</code></td>
+              <td>获取点光源列表</td>
+            </tr>
+            <tr>
+              <td><code>float GetGameTime()</code></td>
+              <td>获取游戏时间 (0-24)</td>
+            </tr>
+            <tr>
+              <td><code>float GetFrameTime()</code></td>
+              <td>获取帧时间（秒）</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>使用示例</h3>
+        <pre><code class="language-cpp">void MyAdvancedCallback(war3shader::RenderEventID eventId,
+                        const war3shader::RenderContext* ctx,
+                        void* user) {
+    // 获取 Vulkan 设备
+    VkDevice device = (VkDevice)war3shader::GetVulkanDevice();
+    VkCommandBuffer cmd = (VkCommandBuffer)war3shader::GetVulkanCommandBuffer();
+    
+    // 获取帧缓冲（包含 VkImageView）
+    const auto* colorBuffer = war3shader::GetRawColorBuffer();
+    VkImageView colorView = (VkImageView)colorBuffer->vkImageView;
+    
+    // 使用 Vulkan API 执行自定义渲染
+    // vkCmdBindPipeline(cmd, ...);
+    // vkCmdDraw(cmd, ...);
+}</code></pre>
+        <div class="note">提示：在使用 Vulkan API 前，请确保了解 DXVK 的内部资源布局和同步机制。</div>
+
+        <h3>Vulkan ShaderPack</h3>
+        <p>Vulkan ShaderPack 通过 SPIR-V 文件驱动后处理与阴影接收器。当前支持 <code>composite/final</code> pass 以及
+          <code>shadow_receiver</code> 覆盖。
+        </p>
+        <pre><code class="language-json">{
+  "name": "My Vulkan Pack",
+  "enabled": true,
+  "render_scale": 1.0,
+  "shadow_receiver": "shadow_receiver.spv",
+  "passes": [
+    { "name": "composite", "shader": "composite.spv", "enabled": true },
+    { "name": "final", "shader": "final.spv", "enabled": true }
+  ]
+}</code></pre>
+        <div class="note">pack.json 可省略：将 <code>composite.spv</code> / <code>final.spv</code> 放在目录下即可被自动识别。</div>
+        <p>模板目录：<code>docs/war3_shader_docs/vulkan_pack_template</code>（含 <code>pack.json</code>、GLSL 示例与
+          <code>build.bat</code>）。
+        </p>
+        <p>纹理加载：<code>SetTextureFromFile</code> 支持常见图片格式（PNG/JPG/TGA/BMP/GIF/HDR/PNM），相对路径优先以 pack 目录解析，其次尝试原始路径或 MPQ。
+        </p>
+        <p>示例模块：<code>src/d3d9/war3/war3_user_example.cpp</code>，设置环境变量 <code>DXVK_WAR3_USER_EXAMPLE=1</code> 自动加载示例
+          pack。</p>
+        <p>调试提示：ImGui 面板内可切换 <code>Shadow Receiver 覆盖</code>，用于排查自定义阴影接收器导致的崩溃。</p>
+
+        <h3>Shader 输入布局（GLSL）</h3>
+        <pre><code class="language-glsl">#extension GL_EXT_samplerless_texture_functions : require
+
+layout(set = 0, binding = 0) uniform sampler s_samplers[];
+
+layout(set = 1, binding = 0, std140) uniform War3PackUBO {
+  mat4 u_view;
+  mat4 u_proj;
+  mat4 u_invView;
+  mat4 u_invProj;
+  vec3 u_cameraPos;
+  float u_gameTime;
+  vec2 u_resolution;
+  float u_frameTime;
+  float u_totalTime;
+};
+
+layout(set = 1, binding = 1) uniform texture2D u_colorTex;
+layout(set = 1, binding = 2) uniform texture2D u_depthTex;
+layout(set = 1, binding = 3) uniform texture2D u_tex0;
+layout(set = 1, binding = 4) uniform texture2D u_tex1;
+layout(set = 1, binding = 5) uniform texture2D u_tex2;
+layout(set = 1, binding = 6) uniform texture2D u_tex3;
+layout(set = 1, binding = 7) uniform texture2D u_prevPass;
+
+layout(push_constant) uniform War3PackPush {
+  uint u_samplerColor;
+  uint u_samplerDepth;
+  uint u_samplerTex0;
+  uint u_samplerTex1;
+  uint u_samplerTex2;
+  uint u_samplerTex3;
+  uint u_samplerPrev;
+  uint u_samplerPad;
+  vec4 u_params0;
+  vec4 u_params1;
+  vec4 u_params2;
+  vec4 u_params3;
+};
+
+vec4 sampleColor(vec2 uv) {
+  return texture(sampler2D(u_colorTex, s_samplers[u_samplerColor]), uv);
+}</code></pre>
+        <div class="note">当前 Vulkan ShaderPack 仅支持 SampleCount=1 的目标，不支持 MSAA 场景。</div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const navItems = document.querySelectorAll('.nav-item');
+    const panels = document.querySelectorAll('.panel');
+
+    const showPanel = (target) => {
+      panels.forEach(panel => {
+        panel.classList.toggle('active', panel.dataset.section === target);
+      });
+      navItems.forEach(item => {
+        item.classList.toggle('active', item.dataset.target === target);
+      });
+    };
+
+    navItems.forEach(item => {
+      const target = item.dataset.target;
+      if (!target)
+        return;
+      item.addEventListener('click', () => showPanel(target));
+    });
+  </script>
+</body>
+
+</html>

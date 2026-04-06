@@ -1,0 +1,130 @@
+[DXVK_GetGameTimeSeconds]
+title = "获取游戏时间秒"
+description = "获取游戏时间（秒）"
+comment = "返回秒级时间戳"
+category = TC_WARVK_TIME
+returns = real
+
+[DXVK_GetTimeOfDay]
+title = "获取昼夜时间"
+description = "获取昼夜时间（0~24）"
+comment = "0 表示午夜，12 表示中午"
+category = TC_WARVK_TIME
+returns = real
+
+[DXVK_GetGameVersion]
+title = "获取游戏版本"
+description = "获取游戏版本号"
+comment = "1.27a 返回 0x27a"
+category = TC_WARVK_DEBUG
+returns = integer
+
+[DXVK_BloomGetBoost]
+title = "获取 Bloom 强度"
+description = "获取对象 Bloom 提示强度 ${handle}"
+comment = "返回 0 表示未标记"
+category = TC_WARVK_BLOOM
+returns = real
+[[.args]]
+type = integer
+
+[AddPointLight]
+title = "创建点光源"
+description = "创建点光源 ${x}, ${y}, ${z}, ${range}, ${r}, ${g}, ${b}, ${intensity}, ${shadowIntensity}"
+comment = "x,y,z=世界坐标；range=范围；r,g,b=颜色；intensity=强度；shadowIntensity=阴影强度(0=无)"
+category = TC_WARVK_POINTLIGHT
+returns = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[UpdatePointLight]
+title = "更新点光源"
+description = "更新点光源 ${id}, ${x}, ${y}, ${z}, ${range}, ${r}, ${g}, ${b}, ${intensity}"
+comment = "id=点光源ID；x,y,z=世界坐标；range=范围；r,g,b=颜色；intensity=强度"
+category = TC_WARVK_POINTLIGHT
+returns = boolean
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[RemovePointLight]
+title = "移除点光源"
+description = "删除点光源 ${id}"
+comment = "id=点光源ID"
+category = TC_WARVK_POINTLIGHT
+returns = boolean
+[[.args]]
+type = integer
+
+[DXVK_GetPluginVersion]
+title = "获取插件版本"
+description = "获取插件版本"
+comment = "返回插件版本"
+category = TC_WARVK_DEBUG
+returns = integer
+
+[DXVK_GetPluginVersionString]
+title = "获取插件版本字符串"
+description = "获取插件版本字符串"
+comment = "返回插件版本字符串"
+category = TC_WARVK_DEBUG
+returns = string
+
+[TestIntReturn]
+title = "测试整数返回"
+description = "测试整数返回"
+comment = "返回 0"
+category = TC_WARVK_DEBUG
+returns = integer
+
+[TestFloatReturn]
+title = "测试浮点数返回"
+description = "测试浮点数返回"
+comment = "返回 0.0"
+category = TC_WARVK_DEBUG
+returns = real
+
+[TestStringReturn]
+title = "测试字符串返回"
+description = "测试字符串返回"
+comment = "返回 Hello"
+category = TC_WARVK_DEBUG
+returns = string
+
+[TestBooleanReturn]
+title = "测试布尔值返回"
+description = "测试布尔值返回"
+comment = "返回 true"
+category = TC_WARVK_DEBUG
+returns = boolean

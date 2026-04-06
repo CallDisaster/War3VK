@@ -1,0 +1,65 @@
+DXVK-War3 重构完成报告（Phase 1）
+日期：2026-02-14
+
+一、目标
+本次不是“只写审查报告”，而是做可编译、可回归的渐进式重构，先降低 d3d9_war3_hook.cpp 的复杂度并建立 hooks 子模块边界。
+
+二、已完成的重构项
+1) 新增 hooks 子模块（首个落地点）
+   - 新增文件：
+     - src/d3d9/war3/hooks/war3_stage_tag_map.h
+     - src/d3d9/war3/hooks/war3_stage_tag_map.cpp
+   - 作用：
+     - 统一 Stage -> Tag 映射（实测映射 / 传统映射两套）
+     - 提供 groupIdx 模式下的 stage tag 抑制策略
+     - 提供世界对象桥接标签判定（IsWorldBridgeTag）
+
+2) 从 d3d9_war3_hook.cpp 拆出策略逻辑
+   - 文件：src/d3d9/d3d9_war3_hook.cpp
+   - 变化：
+     - 删除本地重复的 IsWorldBridgeTag 辅助函数，改用 hooks 模块
+     - 将 TrackRenderQueueUpdates 中大段重复 switch 映射收敛为统一函数调用
+   - 收益：
+     - 降低单文件认知负担
+     - Stage/Tag 规则改动将来只改一处
+     - 减少“修一处漏一处”的行为漂移风险
+
+3) 构建系统接入
+   - 文件：src/d3d9/meson.build
+   - 变化：
+     - 新增编译单元：war3/hooks/war3_stage_tag_map.cpp
+
+三、构建与验证
+- 命令：ninja -C build32
+- 结果：通过
+- 说明：存在历史 warning，但本次重构未引入新的编译错误。
+
+四、为什么这是“长期结构设计”的正确起点
+1) 把“策略层”从“Hook 实现层”剥离
+   - Hook 层应只做：拦截、上下文拼装、转发。
+   - 策略层应做：阶段语义映射、桥接判定、开关规则。
+   - 这次新增 hooks 模块就是把策略层拉出来，后续可以继续把更多策略迁出。
+
+2) 为后续拆分 d3d9_war3_hook.cpp 预留了稳定接口
+   - 现在 Stage/Tag 逻辑已有独立接口，下一步可拆：
+     - war3/hooks/war3_dispatch_hooks.cpp
+     - war3/hooks/war3_ui_hooks.cpp
+     - war3/hooks/war3_patch_callsites.cpp
+   - 通过小步迁移减少一次性大重构风险。
+
+3) 与你当前性能攻坚方向兼容
+   - Dispatch 快路、桥接缓存、Stage 映射都还在同一行为模型内。
+   - 重构不改变渲染语义，只减少维护复杂度，后续更容易定位性能瓶颈。
+
+五、建议的下一阶段（Phase 2）
+1) 继续拆 d3d9_war3_hook.cpp
+   - 优先拆“纯策略 + 纯工具函数”，不动高风险调用顺序。
+2) 把 callsite patch 管理独立成 war3/hooks/war3_callsite_patch.*
+   - 减少 Hook 主文件中的 patch 状态机复杂度。
+3) 把 UI Hook 快路策略迁到 hooks/policy
+   - 形成统一的 FastPath 判定层。
+
+六、风险声明
+- 本次重构是“低风险结构重构”，不是“行为重写”。
+- 若后续做大规模文件迁移（特别是 shadow/hook 主流程），需分阶段提交并逐阶段跑性能回归。
+

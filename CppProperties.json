@@ -1,0 +1,49 @@
+{
+  "configurations": [
+    {
+      "name": "x86-MinGW-Debug",
+      "intelliSenseMode": "linux-gcc-x86",
+      "compilerSwitches": "-m32 -std=c++17",
+      "inheritEnvironments": [],
+
+      "environments": [
+        {
+          "MINGW_ROOT": "E:/Dev/MinGW",
+          "GCC_VERSION": "15.2.0",
+          "PATH": "${env.MINGW_ROOT}/bin;${env.PATH}",
+          "MINGW_INC": "${env.MINGW_ROOT}/include",
+          "MINGW_SYS_INC": "${env.MINGW_ROOT}/i686-w64-mingw32/include",
+          "GCC_INC": "${env.MINGW_ROOT}/lib/gcc/i686-w64-mingw32/${env.GCC_VERSION}/include"
+        }
+      ],
+
+      "includePath": [
+        // 1. GCC C++ STL
+        "${env.GCC_INC}/c++",
+        "${env.GCC_INC}/c++/i686-w64-mingw32",
+        "${env.GCC_INC}/c++/backward",
+        // 2. GCC Internal
+        "${env.GCC_INC}",
+        // 3. Project
+        "${workspaceRoot}/**",
+        // 4. MinGW System
+        "${env.MINGW_SYS_INC}",
+        "${env.MINGW_INC}"
+      ],
+
+      "forcedInclude": [
+        // 1. 先吃我们的“特效药” (定义 __c_locale, __bf16 等)
+        "${workspaceRoot}/vs_intellisense_fix.h",
+
+        // 2. 再吃 Windows 基础包 (定义 DWORD, HANDLE 等)
+        "${env.MINGW_SYS_INC}/windows.h",
+
+        // 3. 最后吃 C++ 配置 (定义 _GLIBCXX_USE_CXX11_ABI 等)
+        "${env.GCC_INC}/c++/i686-w64-mingw32/bits/c++config.h"
+      ],
+
+      // 清空 defines，全部移交 header 处理，防止 VS 吃空格
+      "defines": []
+    }
+  ]
+}

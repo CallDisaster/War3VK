@@ -1,0 +1,869 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>War3MapReforge 架构图</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        :root {
+            --bg-1: #f7f2ea;
+            --bg-2: #e9e1d2;
+            --ink: #1f1b16;
+            --ink-soft: #4a4037;
+            --accent: #c2592a;
+            --accent-2: #116466;
+            --panel: rgba(255, 255, 255, 0.78);
+            --line: rgba(31, 27, 22, 0.12);
+            --glow: rgba(194, 89, 42, 0.22);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            color: var(--ink);
+            background:
+                radial-gradient(1200px 800px at 10% 0%, rgba(194, 89, 42, 0.12), transparent 60%),
+                radial-gradient(900px 700px at 90% 10%, rgba(17, 100, 102, 0.16), transparent 55%),
+                linear-gradient(180deg, var(--bg-1), var(--bg-2));
+            font-family: "Space Grotesk", "Noto Sans SC", sans-serif;
+            line-height: 1.5;
+            min-height: 100vh;
+        }
+
+        .app {
+            display: grid;
+            grid-template-columns: 260px 1fr;
+            gap: 24px;
+            padding: 24px;
+            max-width: 1600px;
+            margin: 0 auto;
+            animation: pageIn 0.6s ease both;
+        }
+
+        header {
+            grid-column: 1 / -1;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            box-shadow: 0 12px 30px rgba(31, 27, 22, 0.08);
+            backdrop-filter: blur(10px);
+        }
+
+        header h1 {
+            font-size: 22px;
+            margin: 0;
+            font-family: "Noto Serif SC", "Source Serif 4", serif;
+            letter-spacing: 0.02em;
+        }
+
+        header .meta {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        header a {
+            padding: 8px 16px;
+            border-radius: 10px;
+            background: var(--accent-2);
+            color: white;
+            text-decoration: none;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+
+        header a:hover {
+            background: #0d5355;
+            transform: translateY(-1px);
+        }
+
+        .sidebar {
+            position: sticky;
+            top: 16px;
+            align-self: start;
+            padding: 16px;
+            border-radius: 18px;
+            background: var(--panel);
+            border: 1px solid var(--line);
+            box-shadow: 0 10px 26px rgba(31, 27, 22, 0.08);
+            backdrop-filter: blur(10px);
+            max-height: calc(100vh - 120px);
+            overflow: auto;
+        }
+
+        .nav-group {
+            margin-bottom: 18px;
+        }
+
+        .nav-group h3 {
+            margin: 0 0 10px;
+            font-size: 13px;
+            color: var(--ink-soft);
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            margin-bottom: 6px;
+            border-radius: 10px;
+            font-size: 14px;
+            color: var(--ink);
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .nav-item:hover {
+            background: rgba(17, 100, 102, 0.08);
+        }
+
+        .nav-item.active {
+            background: rgba(194, 89, 42, 0.12);
+            box-shadow: inset 0 0 0 1px rgba(194, 89, 42, 0.25);
+            color: var(--accent);
+        }
+
+        .content {
+            padding: 8px;
+        }
+
+        .panel {
+            background: var(--panel);
+            border-radius: 22px;
+            border: 1px solid var(--line);
+            padding: 28px 30px;
+            box-shadow: 0 16px 32px rgba(31, 27, 22, 0.08);
+            backdrop-filter: blur(10px);
+            margin-bottom: 24px;
+            visibility: hidden;
+            position: absolute;
+            left: -9999px;
+            opacity: 0;
+            animation: panelIn 0.35s ease both;
+        }
+
+        .panel.active {
+            visibility: visible;
+            position: relative;
+            left: auto;
+            opacity: 1;
+        }
+
+        .panel h2 {
+            margin-top: 0;
+            font-size: 26px;
+            font-family: "Noto Serif SC", "Source Serif 4", serif;
+        }
+
+        .panel h3 {
+            margin-top: 24px;
+            font-size: 18px;
+        }
+
+        .panel p {
+            color: var(--ink-soft);
+        }
+
+        .mermaid {
+            background: rgba(255, 255, 255, 0.9);
+            padding: 20px;
+            border-radius: 14px;
+            border: 1px solid var(--line);
+            margin: 16px 0;
+            overflow-x: auto;
+        }
+
+        .note {
+            padding: 12px 14px;
+            border-left: 3px solid var(--accent);
+            background: rgba(194, 89, 42, 0.08);
+            border-radius: 10px;
+            color: var(--ink);
+            margin: 16px 0;
+        }
+
+        .tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            background: rgba(17, 100, 102, 0.12);
+            color: var(--accent-2);
+            font-size: 12px;
+            margin-right: 6px;
+            margin-bottom: 6px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin: 16px 0;
+        }
+
+        .card {
+            border-radius: 14px;
+            border: 1px solid var(--line);
+            padding: 16px;
+            background: rgba(255, 255, 255, 0.65);
+            box-shadow: 0 6px 18px rgba(31, 27, 22, 0.05);
+        }
+
+        .card strong {
+            display: block;
+            margin-bottom: 8px;
+            color: var(--accent);
+        }
+
+        code {
+            font-family: "JetBrains Mono", "Fira Code", monospace;
+            font-size: 13px;
+            background: rgba(31, 27, 22, 0.06);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        @keyframes pageIn {
+            from {
+                opacity: 0;
+                transform: translateY(12px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes panelIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @media (max-width: 900px) {
+            .app {
+                grid-template-columns: 1fr;
+            }
+
+            .sidebar {
+                position: relative;
+                max-height: none;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="app">
+        <header>
+            <h1>War3MapReforge 项目架构</h1>
+            <div class="meta">
+                <a href="index.html">← 返回文档</a>
+            </div>
+        </header>
+
+        <aside class="sidebar">
+            <div class="nav-group">
+                <h3>架构图</h3>
+                <div class="nav-item active" data-target="overview">项目概览</div>
+                <div class="nav-item" data-target="layers">项目层次结构</div>
+                <div class="nav-item" data-target="pipeline">渲染管线流程</div>
+                <div class="nav-item" data-target="hook">Hook 系统架构</div>
+                <div class="nav-item" data-target="shader">材质系统架构</div>
+                <div class="nav-item" data-target="dataflow">数据流向</div>
+            </div>
+            <div class="nav-group">
+                <h3>详细文档</h3>
+                <a class="nav-item" href="rendering_pipeline.html" style="text-decoration:none;color:inherit;">每帧渲染流程
+                    →</a>
+                <a class="nav-item" href="refactor_status.html" style="text-decoration:none;color:inherit;">行业化重构看板
+                    →</a>
+            </div>
+        </aside>
+
+        <main class="content">
+            <!-- 项目概览 -->
+            <section class="panel active" data-section="overview">
+                <h2>项目概览</h2>
+                <p>War3MapReforge 基于 DXVK 的 D3D9→Vulkan 转译层，在不改动游戏资源的前提下，通过分域 Hook + 桥接链路插入阴影、描边、材质覆盖与后处理能力。</p>
+                <p><strong>当前架构（2026-02-22）</strong> 已从“单入口大文件”升级为“薄中枢 + 分域模块”：<code>d3d9_war3_hook.cpp</code> 仅负责生命周期编排，渲染/JASS/生命周期/UI/Shadow 逻辑分别驻留在 <code>src/d3d9/war3/hooks/</code>。</p>
+
+                <div class="grid">
+                    <div class="card">
+                        <strong>DXVK Core</strong>
+                        <div>D3D9 API 适配、资源生命周期、命令录制与 Vulkan 提交。</div>
+                    </div>
+                    <div class="card">
+                        <strong>War3 Runtime Orchestrator</strong>
+                        <div><code>d3d9_war3_hook.cpp</code> 负责模块探测、版本门禁、地址解析与分域装配。</div>
+                    </div>
+                    <div class="card">
+                        <strong>Domain Hooks</strong>
+                        <div><code>war3_hook_render/lifecycle/jass/ui/shadow</code> 按职责独立演进。</div>
+                    </div>
+                    <div class="card">
+                        <strong>Bridge + Shader</strong>
+                        <div><code>render/* + shader/*</code> 完成对象桥接、材质覆盖、统计与诊断。</div>
+                    </div>
+                </div>
+
+                <div class="mermaid">
+                    graph TB
+                    subgraph Game["War3 进程"]
+                    A[Game.dll] --> B[d3d9.dll]
+                    end
+
+                    subgraph Entry["薄中枢（d3d9_war3_hook.cpp）"]
+                    B --> C[Bootstrap InstallHooks]
+                    C --> D[ActivateWar3Runtime]
+                    D --> E[InstallGameHooks]
+                    end
+
+                    subgraph Domains["分域 Hook"]
+                    E --> F[War3HookLifecycle]
+                    E --> G[War3HookJass]
+                    E --> H[War3HookRender]
+                    E --> I[War3HookUi]
+                    E --> J[War3HookShadow]
+                    end
+
+                    subgraph Runtime["运行时系统"]
+                    H --> K[RenderQueueTracker / ExecBatch]
+                    J --> L[ShadowCapture / Receiver]
+                    H --> M[ShaderManager / Material]
+                    end
+
+                    subgraph Backend["DXVK / Vulkan"]
+                    K --> N[D3D9Device -> Vulkan]
+                    L --> N
+                    M --> N
+                    end
+                </div>
+            </section>
+
+            <!-- 项目层次结构 -->
+            <section class="panel" data-section="layers">
+                <h2>项目层次结构</h2>
+                <p>当前代码结构采用“入口编排层 / 分域 Hook 层 / 运行时桥接层 / 渲染实现层”的四层模型，减少跨文件耦合和回归扩散。</p>
+
+                <div class="mermaid">
+                    graph TD
+                    subgraph L0["L0 入口编排"]
+                    A1["d3d9_war3_hook.cpp"]
+                    A2["war3_hook_address_book.*"]
+                    A3["platform/war3_runtime_bootstrap.*"]
+                    end
+
+                    subgraph L1["L1 分域 Hook（src/d3d9/war3/hooks）"]
+                    B1["war3_hook_lifecycle.*"]
+                    B2["war3_hook_jass.*"]
+                    B3["war3_hook_render.*"]
+                    B4["war3_hook_ui.*"]
+                    B5["war3_hook_shadow.*"]
+                    B6["war3_shadow_filter_policy.*"]
+                    B7["war3_stage_tag_map.*"]
+                    B8["war3_hook_install_util.*"]
+                    end
+
+                    subgraph L2["L2 运行时桥接"]
+                    C1["render/war3_render_queue_tracker.*"]
+                    C2["render/war3_render_exec_batch.*"]
+                    C3["render/war3_scene_collector.*"]
+                    C4["handle/war3_handle_resolver.*"]
+                    C5["state/war3_render_state.*"]
+                    C6["render/war3_frame_graph.*"]
+                    C7["tools/war3_diagnostics_hub.*"]
+                    end
+
+                    subgraph L3["L3 渲染实现与材质"]
+                    D1["d3d9_device.cpp / d3d9_war3_shadow.cpp"]
+                    D1A["d3d9_war3_shadow_outline.cpp"]
+                    D1B["d3d9_war3_shadow_resources.cpp"]
+                    D2["shader/war3_shader_manager.*"]
+                    D3["war3_shader_api.cpp / shaderpack*"]
+                    end
+
+                    A1 --> B1
+                    A1 --> B2
+                    A1 --> B3
+                    A1 --> B4
+                    A1 --> B5
+                    A1 --> A3
+                    B5 --> B6
+                    B3 --> C1
+                    B3 --> C2
+                    B5 --> C3
+                    C6 --> C7
+                    C1 --> D1
+                    C2 --> D1
+                    D1 --> D1A
+                    D1 --> D1B
+                    C3 --> D2
+                    D2 --> D3
+                </div>
+
+                <h3>目录说明</h3>
+                <div class="grid">
+                    <div class="card">
+                        <strong>src/d3d9/d3d9_war3_hook.cpp</strong>
+                        <div>War3 入口中枢，负责模块校验、版本门禁、生命周期编排与装配。</div>
+                    </div>
+                    <div class="card">
+                        <strong>src/d3d9/war3/hooks/</strong>
+                        <div>分域 Hook 模块，按 Render/JASS/Lifecycle/UI/Shadow 拆分，并将 Shadow 过滤策略独立为 policy。</div>
+                    </div>
+                    <div class="card">
+                        <strong>src/d3d9/war3/render/ + handle/</strong>
+                        <div>桥接链路与对象追踪核心，负责从渲染数据回查逻辑对象身份。</div>
+                    </div>
+                    <div class="card">
+                        <strong>src/d3d9/war3/shader/</strong>
+                        <div>材质系统与全局 Uniform 管理，提供 ShaderPack 接口。</div>
+                    </div>
+                    <div class="card">
+                        <strong>src/d3d9/war3/platform/war3_runtime_bootstrap.*</strong>
+                        <div>运行时核心初始化/重置编排，降低入口文件对细节模块的耦合。</div>
+                    </div>
+                    <div class="card">
+                        <strong>src/d3d9/d3d9_war3_shadow*.cpp</strong>
+                        <div>Shadow 已按 Core / Outline / Resources 拆分，降低单文件耦合与回归扩散。</div>
+                    </div>
+                    <div class="card">
+                        <strong>src/d3d9/war3/render/war3_frame_graph.*</strong>
+                        <div>事件序列帧图计划，统一 BeforeUi/BeforePresent 事件分发顺序。</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 渲染管线流程 -->
+            <section class="panel" data-section="pipeline">
+                <h2>渲染管线流程</h2>
+                <p>当前每帧路径由 Render 域 Hook 驱动，生命周期/Shadow/UI 域分别在关键边界插入状态同步与策略拦截。</p>
+
+                <div class="mermaid">
+                    sequenceDiagram
+                    participant Game as 魔兽争霸III
+                    participant D3D9 as D3D9 Device
+                    participant Hook as Hook Domains
+                    participant Bridge as Render Bridge
+                    participant SM as ShaderManager
+                    participant VK as Vulkan
+
+                    Game->>D3D9: Bootstrap + MainRunner
+                    D3D9->>Hook: War3HookLifecycle 激活 Runtime
+                    Hook->>Hook: InstallGameHooks(分域装配)
+
+                    Game->>D3D9: BeginScene()
+                    D3D9->>Hook: RenderDispatcher/WorldDispatch
+
+                    rect rgb(255, 240, 220)
+                    Note over Game,VK: 阴影阶段
+                    D3D9->>Hook: ShadowDomain(ListA/ListB/Projector)
+                    Hook->>Bridge: 过滤 FourCC/Key
+                    Hook->>SM: 应用阴影策略
+                    SM->>VK: 渲染到阴影贴图
+                    end
+
+                    rect rgb(220, 255, 240)
+                    Note over Game,VK: 世界阶段
+                    D3D9->>Hook: Dispatch_Common / Dispatch_Special
+                    Hook->>Bridge: ExecBatch Begin/End
+                    Bridge->>SM: 绑定材质与 Uniform
+                    SM->>VK: Vulkan Draw
+                    end
+
+                    rect rgb(240, 220, 255)
+                    Note over Game,VK: 描边阶段
+                    Bridge->>SM: 依据 tracked handle 输出描边 mask
+                    SM->>VK: 渲染描边
+                    end
+
+                    rect rgb(255, 255, 220)
+                    Note over Game,VK: UI 阶段
+                    D3D9->>Hook: UiDispatch / UiRenderableRender
+                    Hook->>Hook: FPS Override + UI 层级状态机
+                    Hook->>VK: UI / ImGui
+                    end
+
+                    Game->>D3D9: FlushAndReset + Present
+                    D3D9->>Hook: Lifecycle Flush 收口
+                    D3D9->>VK: 提交到 GPU
+                </div>
+
+                <h3>渲染阶段</h3>
+                <div>
+                    <span class="tag">Shadow</span> 阴影贴图生成
+                    <span class="tag">World</span> 世界场景渲染
+                    <span class="tag">Outline</span> 描边效果
+                    <span class="tag">PostProcess</span> 后处理
+                    <span class="tag">UI</span> 界面渲染
+                    <span class="tag">Overlay</span> 调试叠加层
+                </div>
+            </section>
+
+            <!-- Hook 系统架构 -->
+            <section class="panel" data-section="hook">
+                <h2>Hook 系统架构</h2>
+                <p>Hook 系统采用“统一地址簿 + 分域安装 + 共享运行时状态”模型，支持按域灰度、按域回退。</p>
+
+                <div class="mermaid">
+                    graph TB
+                    subgraph AddressBook["AddressBook"]
+                    A[war3_hook_address_book.h]
+                    B[RVA常量(1.27a)]
+                    end
+
+                    subgraph Entry["入口编排"]
+                    C[d3d9_war3_hook.cpp]
+                    D[版本检查 + MinHook初始化]
+                    end
+
+                    subgraph Domains["分域模块"]
+                    E[war3_hook_lifecycle]
+                    F[war3_hook_jass]
+                    G[war3_hook_render]
+                    H[war3_hook_ui]
+                    I[war3_hook_shadow]
+                    I2[war3_shadow_filter_policy]
+                    I3[war3_hook_install_util]
+                    end
+
+                    subgraph Shared["共享状态"]
+                    J[g_numOfElementsPtr等全局]
+                    K[RenderQueueTracker / ExecBatch]
+                    L[War3RenderState]
+                    end
+
+                    A --> C
+                    B --> C
+                    C --> D
+                    D --> E
+                    D --> F
+                    D --> G
+                    D --> H
+                    D --> I
+                    E --> I3
+                    F --> I3
+                    G --> I3
+                    H --> I3
+                    I --> I3
+                    I --> I2
+                    G --> J
+                    E --> J
+                    G --> K
+                    I --> K
+                    H --> L
+                    G --> L
+                </div>
+
+                <h3>关键 Hook 点</h3>
+                <div class="grid">
+                    <div class="card">
+                        <strong>war3_hook_address_book.*</strong>
+                        <div>所有 1.27a RVA 集中管理，消除多处硬编码。</div>
+                    </div>
+                    <div class="card">
+                        <strong>d3d9_war3_hook.cpp</strong>
+                        <div>瘦身后的中枢文件：生命周期编排 + 域模块装配。</div>
+                    </div>
+                    <div class="card">
+                        <strong>war3_hook_render.*</strong>
+                        <div>RenderDispatcher/WorldDispatch/Dispatch* 主链路拦截。</div>
+                    </div>
+                    <div class="card">
+                        <strong>war3_hook_shadow.*</strong>
+                        <div>ListA/ListB/Projector/WriteEntry 阴影链路拦截与统计编排。</div>
+                    </div>
+                    <div class="card">
+                        <strong>war3_shadow_filter_policy.*</strong>
+                        <div>阴影对象过滤策略（Ubersplat Key/FourCC 提取与黑名单判定）。</div>
+                    </div>
+                    <div class="card">
+                        <strong>war3_hook_install_util.*</strong>
+                        <div>统一 MinHook 安装器，收敛 Create/Enable/错误日志格式。</div>
+                    </div>
+                    <div class="card">
+                        <strong>war3_module_api.*</strong>
+                        <div>模块状态机与运行时统计（dispatch/handler/error）用于健康诊断。</div>
+                    </div>
+                </div>
+
+                <div class="note">Hook 系统基于 MinHook；分域文件保持“薄 Hook + 厚桥接”，入口层不承载域内策略细节。</div>
+            </section>
+
+            <!-- 材质系统架构 -->
+            <section class="panel" data-section="shader">
+                <h2>材质系统架构</h2>
+                <p>ShaderManager 管理 ShaderPack，每个 Pack 包含多个渲染阶段的材质覆盖。</p>
+
+                <div class="mermaid">
+                    graph TB
+                    subgraph Config["配置层"]
+                    A[shader_packs.json]
+                    end
+
+                    subgraph Manager["ShaderManager"]
+                    B[加载配置]
+                    C[编译着色器]
+                    D[管理全局 Uniform]
+                    E[维护激活覆盖]
+                    end
+
+                    subgraph Packs["ShaderPack 集合"]
+                    F1["Pack: Default Override"]
+                    F2["Pack: Debug Red"]
+                    F3["Pack: Custom Effect"]
+                    end
+
+                    subgraph Materials["War3Material"]
+                    G1[World 材质]
+                    G2[Outline 材质]
+                    G3[Shadow 材质]
+                    end
+
+                    subgraph Shaders["HLSL 着色器"]
+                    H1[war3_default.hlsl]
+                    H2[war3_outline.hlsl]
+                    H3[war3_sample.hlsl]
+                    end
+
+                    A --> B
+                    B --> F1 & F2 & F3
+                    F1 --> G1 & G2
+                    G1 --> H1
+                    G2 --> H2
+                    C --> G1 & G2 & G3
+                    D --> G1 & G2 & G3
+                </div>
+
+                <h3>类层次结构</h3>
+                <div class="mermaid">
+                    classDiagram
+                    class ShaderManager {
+                    -m_packs : ShaderPack[]
+                    -m_globalVsConstants : ShaderConstantStore
+                    -m_globalPsConstants : ShaderConstantStore
+                    +loadConfig(path)
+                    +reload()
+                    +getMaterial(stage)
+                    +setGlobalFloat4(name, value)
+                    +applyGlobalUniforms(device)
+                    }
+
+                    class ShaderPack {
+                    +name : string
+                    +enabled : bool
+                    +materials : Map
+                    }
+
+                    class War3Material {
+                    -m_vsPath : string
+                    -m_psPath : string
+                    -m_vs : IDirect3DVertexShader9
+                    -m_ps : IDirect3DPixelShader9
+                    -m_vsConstants : ShaderConstantStore
+                    -m_psConstants : ShaderConstantStore
+                    +compile(device)
+                    +apply(device)
+                    +setFloat4(name, value)
+                    +setMatrix(name, matrix)
+                    }
+
+                    class ShaderConstantStore {
+                    -m_data : float[]
+                    -m_aliases : Map
+                    +setAlias(name, reg)
+                    +setConstantF(reg, data, count)
+                    +setFloat4ByName(name, value)
+                    }
+
+                    ShaderManager "1" --> "*" ShaderPack
+                    ShaderPack "1" --> "*" War3Material
+                    War3Material "1" --> "2" ShaderConstantStore
+                </div>
+
+                <div class="note">材质系统支持热重载，修改 HLSL 文件后可通过 ImGui 面板或 <code>ShaderManager::reload()</code> 即时生效。</div>
+            </section>
+
+            <!-- 数据流向 -->
+            <section class="panel" data-section="dataflow">
+                <h2>数据流向</h2>
+                <p>从游戏批次数据到 Vulkan Draw 的实际数据路径（重构后）。</p>
+
+                <div class="mermaid">
+                    flowchart LR
+                    subgraph Game["Game.dll 数据"]
+                    A1[RenderQueue Element]
+                    A2[SceneNode / LayerState]
+                    A3[CUnit / Handle]
+                    A4[Stage / Group]
+                    end
+
+                    subgraph Hook["Hook Domains"]
+                    B1[WorldDispatch]
+                    B2[Dispatch_Common/Special]
+                    B3[Shadow Hooks]
+                    end
+
+                    subgraph Bridge["Bridge / Tracker"]
+                    C1[RenderQueueTracker: tag+stage]
+                    C2[ExecBatchContext: begin/end]
+                    C3[SceneCollector + HandleResolver]
+                    end
+
+                    subgraph Shader["Shader Runtime"]
+                    D1[ShaderManager Global Uniform]
+                    D2[War3Material 覆盖]
+                    D3[Shadow/Outline 参数]
+                    end
+
+                    subgraph GPU["DXVK / Vulkan"]
+                    E1[D3D9Device 状态映射]
+                    E2[Pipeline + Descriptor]
+                    E3[GPU Draw/Dispatch]
+                    end
+
+                    A4 --> B1 --> C1
+                    A1 --> B2 --> C2
+                    A2 --> B2 --> C2
+                    A3 --> B3 --> C3
+                    C1 --> D1
+                    C2 --> D2
+                    C3 --> D3
+                    D1 --> E1 --> E2 --> E3
+                    D2 --> E1
+                    D3 --> E2
+                </div>
+
+                <h3>Uniform 寄存器分配</h3>
+                <table style="width:100%; border-collapse:collapse; margin-top:12px;">
+                    <thead>
+                        <tr style="border-bottom:2px solid var(--line);">
+                            <th style="text-align:left; padding:10px;">寄存器</th>
+                            <th style="text-align:left; padding:10px;">名称</th>
+                            <th style="text-align:left; padding:10px;">类型</th>
+                            <th style="text-align:left; padding:10px;">说明</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr style="border-bottom:1px solid var(--line);">
+                            <td style="padding:8px;">VS c0</td>
+                            <td>World</td>
+                            <td>float4x4</td>
+                            <td>物体世界矩阵</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid var(--line);">
+                            <td style="padding:8px;">VS c4</td>
+                            <td>ViewProj</td>
+                            <td>float4x4</td>
+                            <td>视图投影矩阵</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid var(--line);">
+                            <td style="padding:8px;">PS c8</td>
+                            <td>LightDir</td>
+                            <td>float4</td>
+                            <td>方向光方向 + 强度</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid var(--line);">
+                            <td style="padding:8px;">PS c9</td>
+                            <td>LightColor</td>
+                            <td>float4</td>
+                            <td>方向光颜色 + 高光指数</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid var(--line);">
+                            <td style="padding:8px;">PS c10</td>
+                            <td>AmbientColor</td>
+                            <td>float4</td>
+                            <td>环境光颜色</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid var(--line);">
+                            <td style="padding:8px;">PS c11</td>
+                            <td>CameraPos</td>
+                            <td>float4</td>
+                            <td>相机世界坐标</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid var(--line);">
+                            <td style="padding:8px;">PS c12</td>
+                            <td>FogParams</td>
+                            <td>float4</td>
+                            <td>雾参数</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid var(--line);">
+                            <td style="padding:8px;">PS c13</td>
+                            <td>FogColor</td>
+                            <td>float4</td>
+                            <td>雾颜色</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid var(--line);">
+                            <td style="padding:8px;">PS c14</td>
+                            <td>TeamColor</td>
+                            <td>float4</td>
+                            <td>队伍色</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid var(--line);">
+                            <td style="padding:8px;">PS c15</td>
+                            <td>Time</td>
+                            <td>float4</td>
+                            <td>游戏时间</td>
+                        </tr>
+                        <tr>
+                            <td style="padding:8px;">PS c16</td>
+                            <td>ScreenParams</td>
+                            <td>float4</td>
+                            <td>屏幕尺寸</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+        </main>
+    </div>
+
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'neutral',
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true
+            }
+        });
+
+        const navItems = document.querySelectorAll('.nav-item');
+        const panels = document.querySelectorAll('.panel');
+
+        const showPanel = (target) => {
+            panels.forEach(panel => {
+                panel.classList.toggle('active', panel.dataset.section === target);
+            });
+            navItems.forEach(item => {
+                item.classList.toggle('active', item.dataset.target === target);
+            });
+        };
+
+        navItems.forEach(item => {
+            item.addEventListener('click', () => showPanel(item.dataset.target));
+        });
+    </script>
+</body>
+
+</html>

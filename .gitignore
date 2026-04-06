@@ -1,0 +1,74 @@
+# Build directories
+build/
+build32/
+build64/
+buildenv.h
+version.h
+!/version.h
+
+# Compiled binaries
+*.dll
+*.exe
+*.so
+*.dylib
+*.a
+*.lib
+
+# Object files
+*.o
+*.obj
+*.res
+
+# Editor files
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Shader intermediate files
+*.spv
+*.h.d
+
+# Meson build files
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# Backup files
+*.bak
+*.backup
+*.zip
+*.tar.gz
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Subproject builds
+subprojects/*/build/
+
+# 本地 Codex/Claude 工作树与权限配置，不应进入主仓库
+.agent/
+Agents/
+.claude/worktrees/
+.claude/settings.local.json
+
+# 本地分析/交接草稿与一次性构建记录，不应进入正式发布
+/architecture_analysis.md
+/build32_explain.txt
+/build32_explain_after_build.txt
+/codex_native_renderer_task.md
+/codex_overnight_prompt.md
+/overnight_report.md
+/README_PLAYER.md
+/README_War3VK.md
+/STATUS.md
+/war3_optimization_plan/

@@ -1,0 +1,36 @@
+[TriggerCategories]
+
+TC_WARVK=[WarVK],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_TIME=[时间],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_LIGHT=[光影],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_SHADOW=[阴影],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_OUTLINE=[描边],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_HANDLE=[句柄],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_POINTLIGHT=[点光源],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_POSTFX=[后处理],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_BLOOM=[Bloom],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_SSAO=[SSAO],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_AA=[抗锯齿],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_DAYNIGHT=[日夜],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WARVK_DEBUG=[调试],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+
+[TriggerTypes]
+WARVK_AAMODE=0,0,0,抗锯齿模式,integer
+WARVK_SHADOW_DEBUG=0,0,0,阴影调试,integer
+WARVK_OUTLINE_MODE=0,0,0,描边模式,integer
+
+[TriggerParams]
+AAMODE_NONE=0,WARVK_AAMODE,"AAMODE_NONE",无
+AAMODE_FXAA=1,WARVK_AAMODE,"AAMODE_FXAA",FXAA
+AAMODE_SMAA_LOW=2,WARVK_AAMODE,"AAMODE_SMAA_LOW",SMAA 低
+AAMODE_SMAA_MEDIUM=3,WARVK_AAMODE,"AAMODE_SMAA_MEDIUM",SMAA 中
+AAMODE_SMAA_HIGH=4,WARVK_AAMODE,"AAMODE_SMAA_HIGH",SMAA 高
+AAMODE_SMAA_ULTRA=5,WARVK_AAMODE,"AAMODE_SMAA_ULTRA",SMAA 极高
+
+SHADOW_DEBUG_NONE=0,WARVK_SHADOW_DEBUG,"WARVK_SHADOW_DEBUG_NONE",无
+SHADOW_DEBUG_CASCADES=1,WARVK_SHADOW_DEBUG,"WARVK_SHADOW_DEBUG_CASCADES",级联调试
+SHADOW_DEBUG_FACTOR=2,WARVK_SHADOW_DEBUG,"WARVK_SHADOW_DEBUG_FACTOR",阴影因子
+SHADOW_DEBUG_DEPTH=3,WARVK_SHADOW_DEBUG,"WARVK_SHADOW_DEBUG_DEPTH",深度
+
+OUTLINE_MODE_FILL=0,WARVK_OUTLINE_MODE,"OUTLINE_MODE_FILL",填充
+OUTLINE_MODE_SILHOUETTE=1,WARVK_OUTLINE_MODE,"OUTLINE_MODE_SILHOUETTE",轮廓
