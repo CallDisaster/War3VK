@@ -21,6 +21,7 @@ struct War3HookAddressBook {
   uintptr_t executeJassFunctionInternal = 0;
   uintptr_t jassInterpreterMainLoop = 0;
   uintptr_t executeNativeFunction = 0;
+  uintptr_t nativeGetFloatGameState = 0;
   uintptr_t jassFuncPauseAndCreateFrame = 0;
   uintptr_t getTlsJassData = 0;
   uintptr_t regFuncAddr2Handle = 0;

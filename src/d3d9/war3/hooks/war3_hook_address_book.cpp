@@ -10,6 +10,7 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x7F2B40, // executeJassFunctionInternal（函数入口，修正中段地址导致的深层 Hook 崩溃）
       0x7F1A20, // jassInterpreterMainLoop
       0x7EF590, // executeNativeFunction
+      0x1E2500, // nativeGetFloatGameState（直接实现入口；也会从注册链按名字校准）
       0x7F1810, // jassFuncPauseAndCreateFrame
       0x7E2FE0, // getTlsJassData
       0x7ECE50, // regFuncAddr2Handle

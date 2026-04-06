@@ -224,6 +224,13 @@ inline constexpr bool kNativeJassNativeCallStatsLogging = false;
 inline constexpr uint32_t kNativeJassNativeCallStatsInterval = 2000;
 inline constexpr uint32_t kNativeJassNativeCallMaxArgs = 64;
 inline constexpr uint32_t kNativeJassNativeCallCacheCapacity = 4096;
+// 诊断：直接调用 GetFloatGameState 实现入口的早期探针。
+// 已确认在 runtime ready 但地图未正式开始前直接探测风险较高，默认关闭。
+inline constexpr bool kNativeDirectGetFloatGameStateProbeEnabled = false;
+inline constexpr uint32_t kNativeGameStateTimeOfDayArg = 2u;
+// 运行期在正式进图后 direct c_call GetFloatGameState。
+// 当前实现按原生返回的 32 位 real 位模式解码，不再按 x87 float 返回值读取。
+inline constexpr bool kNativeDirectGetFloatGameStateRuntimeEnabled = true;
 
 // ========================================================================
 // MainLoop / WinAPI 等待链路追踪

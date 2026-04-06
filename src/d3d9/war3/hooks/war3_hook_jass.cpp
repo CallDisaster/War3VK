@@ -614,7 +614,6 @@ void War3HookJass::Install(uintptr_t gameBase) {
         "DXVK War3Hook[Jass]: helper computeHandleMemoryAddr invalid (%p)\n",
         computeHandleMemoryAddrAddr);
   }
-
   ConfigureNativeCallHelperFns(
       {g_getTlsJassData, g_regFuncAddr2Handle, g_computeHandleMemoryAddr});
   ResetNativeCallPlanCaches();

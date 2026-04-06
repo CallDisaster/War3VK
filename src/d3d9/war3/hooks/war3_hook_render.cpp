@@ -2,11 +2,13 @@
 #include "war3_hook_address_book.h"
 #include "war3_hook_render_identity.h"
 #include "war3_hook_install_util.h"
+#include "war3_jass_native_invoke_x86.h"
 #include "war3_hook_ui.h"
 #include "war3_queue_takeover_policy.h"
 #include "../../d3d9_war3_branding.h"
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_hook.h"
+#include "../../jass/war3_game.h"
 #include "../war3.h"
 
 #include "../core/war3_internal_test_config.h"
@@ -20,6 +22,7 @@
 #include "../tools/war3_perf_monitor.h"
 
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <set>
 
@@ -109,6 +112,77 @@ MakeRenderHookCpuScope(const char *name) {
     return war3::War3PerfMonitor::instance().cpuScope(name);
   }
   return {};
+}
+
+static bool TryFetchNativeTimeOfDay(float &outTimeOfDay) {
+  if constexpr (!dxvk::war3::internal::kNativeDirectGetFloatGameStateRuntimeEnabled) {
+    return false;
+  }
+
+  static void *s_getFloatGameStateFn = nullptr;
+  static bool s_loggedSuccess = false;
+  static bool s_loggedFailure = false;
+  static bool s_loggedMissingRuntime = false;
+  static bool s_loggedMissingFn = false;
+  static bool s_loggedInvokeUnsupported = false;
+
+  if (!::game_war3) {
+    if (!s_loggedMissingRuntime) {
+      s_loggedMissingRuntime = true;
+      war3dbg::Print(
+          "DXVK War3Hook[Time]: native GetFloatGameState skipped (game_war3 not ready)\n");
+    }
+    return false;
+  }
+
+  if (!s_getFloatGameStateFn && ::pGameDLL) {
+    const auto &book = GetWar3HookAddressBook127a();
+    s_getFloatGameStateFn =
+        reinterpret_cast<void *>(::pGameDLL + book.nativeGetFloatGameState);
+  }
+
+  if (!s_getFloatGameStateFn) {
+    if (!s_loggedMissingFn) {
+      s_loggedMissingFn = true;
+      war3dbg::Print(
+          "DXVK War3Hook[Time]: native GetFloatGameState skipped (fn unavailable)\n");
+    }
+    return false;
+  }
+  if (!IsCdeclPackedInvokeSupported()) {
+    if (!s_loggedInvokeUnsupported) {
+      s_loggedInvokeUnsupported = true;
+      war3dbg::Print(
+          "DXVK War3Hook[Time]: native GetFloatGameState skipped (cdecl packed invoke unsupported)\n");
+    }
+    return false;
+  }
+
+  const uint32_t arg = dxvk::war3::internal::kNativeGameStateTimeOfDayArg;
+  const uint32_t rawValue =
+      static_cast<uint32_t>(InvokeCdeclPacked(s_getFloatGameStateFn, &arg, 1));
+  float value = 0.0f;
+  static_assert(sizeof(value) == sizeof(rawValue));
+  std::memcpy(&value, &rawValue, sizeof(value));
+  if (!std::isfinite(value) || value < -0.5f || value > 24.5f) {
+    if (!s_loggedFailure) {
+      s_loggedFailure = true;
+      war3dbg::Print(
+          "DXVK War3Hook[Time]: native GetFloatGameState returned invalid value=%.6f raw=%08X arg=%u\n",
+          static_cast<double>(value), static_cast<unsigned>(rawValue),
+          static_cast<unsigned>(arg));
+    }
+    return false;
+  }
+
+  outTimeOfDay = value;
+  if (!s_loggedSuccess) {
+    s_loggedSuccess = true;
+    war3dbg::Print(
+        "DXVK War3Hook[Time]: native GetFloatGameState first successful retrieval: %.6f\n",
+        static_cast<double>(value));
+  }
+  return true;
 }
 
 struct BatchTagStageScopeLite {
@@ -333,32 +407,62 @@ int __fastcall Hook_WorldDispatch(void *thisPtr, void *edx, int stage, int a3,
     auto timeSyncScope = MakeRenderHookCpuScope("Hook_WorldDispatch/TimeSync");
     if (stage == 0 || stage == 1) {
       // 说明：
-      // - 这里不再强依赖 OnGameStart 事件；
-      // - 若 NetEvent 漏触发，仍可通过有效 TIME_OF_DAY 自恢复时间同步链路。
+      // - 优先直接调用原生 GetFloatGameState(GAME_STATE_TIME_OF_DAY)；
+      // - 若 direct c_call 暂时拿不到合法值，再回退到本地时钟，避免时间链硬断。
       static auto s_lastUpdate = std::chrono::steady_clock::now();
       static auto s_gameClockStart = std::chrono::steady_clock::time_point{};
       static bool s_gameClockValid = false;
       const auto now = std::chrono::steady_clock::now();
+      const bool runtimeReady =
+          dxvk::war3::War3Events::get().isJassReady() && (::game_war3 != nullptr);
       if (std::chrono::duration_cast<std::chrono::milliseconds>(now -
                                                                 s_lastUpdate)
               .count() >= 100) {
         s_lastUpdate = now;
-        if (dxvk::war3::War3Events::get().isGameStarted()) {
-          if (!s_gameClockValid) {
-            s_gameClockValid = true;
-            s_gameClockStart = now;
-          }
+        float gameTime = -1.0f;
+        if (runtimeReady) {
+          const bool usedNative = TryFetchNativeTimeOfDay(gameTime);
 
-          const float gameTime = static_cast<float>(
-              std::chrono::duration_cast<std::chrono::duration<double>>(
-                  now - s_gameClockStart)
-                  .count());
+          if (!usedNative) {
+            if (dxvk::war3::War3Events::get().isGameStarted()) {
+              if (!s_gameClockValid) {
+                s_gameClockValid = true;
+                s_gameClockStart = now;
+              }
+
+              gameTime = static_cast<float>(
+                  std::chrono::duration_cast<std::chrono::duration<double>>(
+                      now - s_gameClockStart)
+                      .count());
+            } else {
+              gameTime = -1.0f;
+            }
+          } else {
+            s_gameClockValid = false;
+          }
+        } else {
+          if (dxvk::war3::War3Events::get().isGameStarted()) {
+            if (!s_gameClockValid) {
+              s_gameClockValid = true;
+              s_gameClockStart = now;
+            }
+
+            gameTime = static_cast<float>(
+                std::chrono::duration_cast<std::chrono::duration<double>>(
+                    now - s_gameClockStart)
+                    .count());
+          } else {
+            s_gameClockValid = false;
+            gameTime = -1.0f;
+          }
+        }
+
+        if (gameTime >= 0.0f || dxvk::war3::War3Events::get().isGameStarted()) {
           War3RenderState::SetGameTime(gameTime);
           War3VKBranding::TryShowBrandingMessage(gameTime);
           war3::ShaderManager::get().setGlobalFloat4(
               "Time", Vector4(gameTime, 0.0f, 0.0f, 0.0f));
         } else {
-          s_gameClockValid = false;
           War3RenderState::SetGameTime(-1.0f);
         }
       }
