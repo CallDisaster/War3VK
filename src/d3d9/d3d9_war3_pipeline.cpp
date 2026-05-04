@@ -7,6 +7,8 @@
 #include "war3/render/war3_render_state.h"
 #include "war3/render/war3_frame_graph.h"
 #include "war3/core/war3_internal_test_config.h"
+#include "war3/core/war3_runtime_profile.h"
+#include "war3/core/war3_semantic_shadow_gate.h"
 #include "d3d9_war3_shadow.h"
 #include "d3d9_war3_debug.h"
 #include "war3/tools/war3_perf_monitor.h"
@@ -17,6 +19,7 @@
 #include "../util/log/log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cmath>
 #include <exception>
@@ -41,6 +44,26 @@ namespace dxvk {
             if (end == v.c_str())
                 return false;
             outValue = f;
+            return true;
+        }
+
+        bool ParseEnvFlagOrDefault(const char* name, bool defaultValue) {
+            const std::string v = env::getEnvVar(name);
+            if (v.empty())
+                return defaultValue;
+            return v == "1" || v == "true" || v == "TRUE" ||
+                   v == "on" || v == "ON" || v == "yes" || v == "YES";
+        }
+
+        bool IsRuntimePipelinePassEnabled(const std::string& name) {
+            using dxvk::war3::runtime::IsWar3RuntimeModuleEnabled;
+            using dxvk::war3::runtime::War3RuntimeModule;
+            if (name == "ShadowReceiver")
+                return IsWar3RuntimeModuleEnabled(War3RuntimeModule::ShadowReceiver);
+            if (name == "SSAO")
+                return IsWar3RuntimeModuleEnabled(War3RuntimeModule::Ssao);
+            if (name == "AA")
+                return IsWar3RuntimeModuleEnabled(War3RuntimeModule::Aa);
             return true;
         }
 
@@ -138,6 +161,59 @@ namespace dxvk {
         float Luminance(const Vector4& color) {
             return color.x * 0.2126f + color.y * 0.7152f + color.z * 0.0722f;
         }
+
+        float Wrap01(float value) {
+            value -= std::floor(value);
+            if (value < 0.0f)
+                value += 1.0f;
+            return value;
+        }
+
+        float ResolvePipelineDayNightTime01(float realGameTime) {
+            if (realGameTime >= 0.0f && realGameTime <= 24.0f)
+                return Wrap01(realGameTime / 24.0f);
+
+            static const auto s_start = std::chrono::steady_clock::now();
+            static uint32_t s_fallbackLogCount = 0u;
+            if (s_fallbackLogCount++ < 4u) {
+                WAR3_RENDER_LOG(
+                    "DXVK War3Pipeline: day-night using fallback time, realGameTime=%.4f\n",
+                    static_cast<double>(realGameTime));
+            }
+
+            constexpr float kFallbackDayLengthSeconds = 480.0f;
+            constexpr float kFallbackStartTime01 = 0.22f;
+            const float elapsed =
+                std::chrono::duration<float>(std::chrono::steady_clock::now() - s_start)
+                    .count();
+            return Wrap01(elapsed / kFallbackDayLengthSeconds +
+                          kFallbackStartTime01);
+        }
+
+        bool ShouldDispatchBeforeUiPreEvent(war3shader::RenderEventID eventId) {
+            if constexpr (!dxvk::war3::internal::kNativeUseRenderSceneAsWorldEventAuthority)
+                return true;
+
+            switch (eventId) {
+                case war3shader::RenderEventID::WORLD_RENDER_BEGIN:
+                case war3shader::RenderEventID::WORLD_RENDER_END:
+                case war3shader::RenderEventID::POST_PROCESS_BEGIN:
+                    break;
+                default:
+                    return true;
+            }
+
+            const bool ready = War3RenderState::HasCompletedWorldRenderSceneThisFrame();
+            if (!ready) {
+                static uint32_t s_skipLogCount = 0;
+                if (s_skipLogCount++ < 8) {
+                    WAR3_RENDER_LOG(
+                        "DXVK War3Pipeline: skip BeforeUi pre-event=%d (RenderScene not completed this frame)\n",
+                        static_cast<int>(eventId));
+                }
+            }
+            return ready;
+        }
     }
 
     War3RenderPipeline::War3RenderPipeline(const Rc<DxvkDevice>& device)
@@ -178,6 +254,39 @@ namespace dxvk {
                 m_settings.shadows.pcfRadius = std::max(pcf, 0.0f);
                 WAR3_RENDER_LOG("DXVK War3Shadow: DXVK_WAR3_SHADOW_PCF=%.3f\n",
                                static_cast<double>(m_settings.shadows.pcfRadius));
+            }
+
+            int cascades = 0;
+            if (ParseEnvInt("DXVK_WAR3_SHADOW_CASCADES", cascades)) {
+                cascades = std::clamp(cascades, 1, 4);
+                m_settings.shadows.csm.cascadeCount = static_cast<uint32_t>(cascades);
+                WAR3_RENDER_LOG("DXVK War3Shadow: DXVK_WAR3_SHADOW_CASCADES=%d\n",
+                               cascades);
+            }
+
+            int shadowRes = 0;
+            if (ParseEnvInt("DXVK_WAR3_SHADOW_RES", shadowRes)) {
+                shadowRes = std::clamp(shadowRes, 512, 4096);
+                m_settings.shadows.csm.shadowResolution =
+                    static_cast<uint32_t>(shadowRes);
+                WAR3_RENDER_LOG("DXVK War3Shadow: DXVK_WAR3_SHADOW_RES=%d\n",
+                               shadowRes);
+            }
+
+            int pcfKernel = -1;
+            if (ParseEnvInt("DXVK_WAR3_SHADOW_PCF_KERNEL", pcfKernel)) {
+                pcfKernel = std::clamp(pcfKernel, 0, 3);
+                m_settings.shadows.pcfKernel =
+                    static_cast<War3ShadowPcfKernel>(pcfKernel);
+                WAR3_RENDER_LOG("DXVK War3Shadow: DXVK_WAR3_SHADOW_PCF_KERNEL=%d\n",
+                               pcfKernel);
+            }
+
+            int shadowTaa = -1;
+            if (ParseEnvInt("DXVK_WAR3_SHADOW_TAA", shadowTaa)) {
+                m_settings.shadows.shadowTaaEnabled = shadowTaa != 0;
+                WAR3_RENDER_LOG("DXVK War3Shadow: DXVK_WAR3_SHADOW_TAA=%d\n",
+                               m_settings.shadows.shadowTaaEnabled ? 1 : 0);
             }
         }
 
@@ -223,6 +332,19 @@ namespace dxvk {
             m_wantsShadowCapture = false;
             m_wantsBeforeUiInsertion = false;
         } else {
+            using dxvk::war3::runtime::IsWar3RuntimeModuleEnabled;
+            using dxvk::war3::runtime::War3RuntimeModule;
+            const bool moduleShadowCapture =
+                IsWar3RuntimeModuleEnabled(War3RuntimeModule::ShadowCapture);
+            const bool moduleShadowMap =
+                IsWar3RuntimeModuleEnabled(War3RuntimeModule::ShadowMap);
+            const bool moduleShadowReceiver =
+                IsWar3RuntimeModuleEnabled(War3RuntimeModule::ShadowReceiver);
+            const bool modulePostFx =
+                IsWar3RuntimeModuleEnabled(War3RuntimeModule::PostFx);
+            const bool moduleSemanticData =
+                IsWar3RuntimeModuleEnabled(War3RuntimeModule::SemanticData);
+
             // ShaderPack 是否启用（需要 BeforeUi 执行）
             bool shaderPackEnabled = false;
             {
@@ -230,16 +352,19 @@ namespace dxvk {
                 war3shader::GetShaderPackInfo(&info);
                 shaderPackEnabled = (info.flags & war3shader::PACK_FLAG_ENABLED) != 0;
             }
+            shaderPackEnabled = shaderPackEnabled && modulePostFx;
 
             // ShadowReceiver/Outline 是否需要（需要 BeforeUi + ShadowCapture）
             bool wantsOutline =
-                m_settings.occludedOutline.enabled && War3RenderState::HasOutlineHandles();
+                moduleShadowReceiver && m_settings.occludedOutline.enabled &&
+                War3RenderState::HasOutlineHandles();
             const uint32_t nativeShadowMode =
                 War3RenderState::GetNativeShadowMode();
             const bool disableWar3Shadow =
                 dxvk::war3::internal::kNativeShadowDisableWar3ShadowReceiverWhenMode1 &&
                 (nativeShadowMode >= 1u);
             const bool wantsShadows =
+                moduleShadowMap && moduleShadowReceiver &&
                 m_settings.shadows.enabled && !disableWar3Shadow;
 
             if (disableWar3Shadow && m_settings.shadows.enabled) {
@@ -263,23 +388,44 @@ namespace dxvk {
                 wantsOutline = false;
             }
             const bool wantsShadowReceiver = wantsShadows || wantsOutline;
+            const bool wantsSemanticShadowScene =
+                moduleSemanticData &&
+                dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled();
+            const bool semanticSceneDisablesLegacyCapture =
+                wantsSemanticShadowScene &&
+                dxvk::war3::internal::
+                    IsSemanticSceneDisableLegacyShadowCaptureRuntimeEnabled();
+            const bool effectiveModuleShadowCapture =
+                moduleShadowCapture && !semanticSceneDisablesLegacyCapture;
+            const bool semanticShadowForcesBeforeUi =
+                wantsSemanticShadowScene &&
+                ParseEnvFlagOrDefault(
+                    "DXVK_WAR3_SEMANTIC_SHADOW_FORCE_BEFOREUI", true);
 
             // 后处理是否需要（需要 BeforeUi）
             const bool wantsPostFx =
-                m_settings.postFx.enabled && !war3shader::internal::IsNativePostProcessDisabled();
+                modulePostFx && m_settings.postFx.enabled &&
+                !war3shader::internal::IsNativePostProcessDisabled();
 
             // SSAO/AA 目前属于 postFx 子项；若未来独立开关，可在此扩展。
 
-            m_wantsShadowCapture = wantsShadowReceiver;
-            m_wantsBeforeUiInsertion = shaderPackEnabled || wantsShadowReceiver || wantsPostFx;
+            // Semantic preview should not change the frame graph by default:
+            // it rides on frames where the normal receiver already runs. A
+            // separate force flag exists only for narrow diagnostics.
+            m_wantsShadowCapture =
+                (effectiveModuleShadowCapture && wantsShadowReceiver) ||
+                semanticShadowForcesBeforeUi;
+            m_wantsBeforeUiInsertion =
+                shaderPackEnabled || wantsShadowReceiver || wantsPostFx ||
+                semanticShadowForcesBeforeUi;
         }
 
         // 日夜色调：在帧开始应用到全局设置，保证主线程渲染状态与后处理能读取到
         const auto& dayNight = m_settings.dayNight;
         if (dayNight.enabled) {
             float realGameTime = War3RenderState::GetGameTime();
-            if (realGameTime >= 0.0f && realGameTime <= 24.0f) {
-                float time01 = realGameTime / 24.0f;
+            {
+                float time01 = ResolvePipelineDayNightTime01(realGameTime);
                 float t = 0.0f;
                 if (ComputeDayNightFactor(time01, dayNight, t)) {
                     if (dayNight.affectAmbient) {
@@ -381,16 +527,68 @@ namespace dxvk {
             !stateKnown;
 
         if (!m_insertedBeforeUi && m_hadWorldDraw) {
-            // Fast-path: commit immediately on the common unknown-signature boundary.
+            // Some machines expose the UI transition as an "unknown-signature"
+            // boundary before the final world draws are truly done. Treat the
+            // first unknown boundary as an arm signal and only commit after the
+            // next matching boundary (or a later strong UI marker). Any real
+            // world draw in between will clear m_armedBeforeUi above.
             if (unknownUiBoundary) {
+                if (m_armedBeforeUi) {
+                    m_insertedBeforeUi = true;
+                    m_armedBeforeUi = false;
+
+                    static uint32_t s_loggedCommitUnknown = 0;
+                    if (s_loggedCommitUnknown < 8) {
+                        s_loggedCommitUnknown++;
+                        WAR3_RENDER_LOG(
+                            "DXVK War3Pipeline: BeforeUi commit (unknown-sig armed) stage=%d disp=%d layer=%d cat=%d tag=%d\n",
+                            stage,
+                            dispStage,
+                            static_cast<int>(layer),
+                            static_cast<int>(category),
+                            static_cast<int>(batchTag));
+                    }
+                    return true;
+                }
+
+                m_armedBeforeUi = true;
+
+                static uint32_t s_loggedArmUnknown = 0;
+                if (s_loggedArmUnknown < 8) {
+                    s_loggedArmUnknown++;
+                    WAR3_RENDER_LOG(
+                        "DXVK War3Pipeline: BeforeUi armed (unknown-sig boundary) stage=%d disp=%d layer=%d cat=%d tag=%d\n",
+                        stage,
+                        dispStage,
+                        static_cast<int>(layer),
+                        static_cast<int>(category),
+                        static_cast<int>(batchTag));
+                }
+                return false;
+            }
+
+            // Slow-path: if we did see a boundary candidate, arm and wait for a stronger UI marker.
+            bool semanticTailBoundary = false;
+            if constexpr (dxvk::war3::internal::
+                              kShadowSemanticCoreSceneTailBoundaryFallbackEnabled) {
+                semanticTailBoundary =
+                    dxvk::war3::internal::
+                        IsSemanticSceneTailBoundaryFallbackRuntimeEnabled() &&
+                    isUiBoundaryDraw &&
+                    (War3RenderState::HasMainWorldCompletedStageThisFrame(21) ||
+                     War3RenderState::HasCompletedStageThisFrame(21) ||
+                     War3RenderState::HasReachedStageThisFrame(21) ||
+                     stage == 21 || dispStage == 21);
+            }
+            if (semanticTailBoundary && !strongUiMarker) {
                 m_insertedBeforeUi = true;
                 m_armedBeforeUi = false;
 
-                static uint32_t s_loggedCommitUnknown = 0;
-                if (s_loggedCommitUnknown < 8) {
-                    s_loggedCommitUnknown++;
+                static uint32_t s_loggedSemanticTailCommit = 0;
+                if (s_loggedSemanticTailCommit < 8) {
+                    s_loggedSemanticTailCommit++;
                     WAR3_RENDER_LOG(
-                        "DXVK War3Pipeline: BeforeUi commit (unknown-sig boundary) stage=%d disp=%d layer=%d cat=%d tag=%d\n",
+                        "DXVK War3Pipeline: BeforeUi commit (semantic scene tail) stage=%d disp=%d layer=%d cat=%d tag=%d\n",
                         stage,
                         dispStage,
                         static_cast<int>(layer),
@@ -400,7 +598,53 @@ namespace dxvk {
                 return true;
             }
 
-            // Slow-path: if we did see a boundary candidate, arm and wait for a stronger UI marker.
+            // Semantic shadow has a stricter, explicit data path than the old
+            // receiver/capture heuristic. Once the device-side boundary
+            // classifier has accepted a non-unknown UI transition after the
+            // world phase, commit it directly instead of waiting for a later
+            // strong UI hook marker that may not exist on all launch paths.
+            //
+            // This is deliberately separate from the tail fallback above:
+            // tail commits can happen on ambiguous stage21/unknown draws and
+            // are useful diagnostics, but they are also the path that can
+            // pollute the main image with a dark receiver overlay. The clean
+            // weak commit still requires the normal device-side RT/DS/camera
+            // and UI-boundary checks before NotifyDraw is called.
+            static const bool s_semanticWeakBeforeUiCommit =
+                ParseEnvFlagOrDefault(
+                    "DXVK_WAR3_SEMANTIC_SHADOW_WEAK_BEFOREUI_COMMIT",
+                    true);
+            const bool semanticWeakBeforeUiCommit =
+                s_semanticWeakBeforeUiCommit &&
+                dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() &&
+                isUiBoundaryDraw &&
+                !unknownUiBoundary &&
+                !strongUiMarker &&
+                (War3RenderState::HasReachedStageThisFrame(15) ||
+                 War3RenderState::HasMainWorldCompletedStageThisFrame(21) ||
+                 War3RenderState::HasCompletedStageThisFrame(21) ||
+                 War3RenderState::HasReachedStageThisFrame(21) ||
+                 stage == 15 ||
+                 stage == 18 ||
+                 dispStage == 67);
+            if (semanticWeakBeforeUiCommit) {
+                m_insertedBeforeUi = true;
+                m_armedBeforeUi = false;
+
+                static uint32_t s_loggedSemanticWeakCommit = 0;
+                if (s_loggedSemanticWeakCommit < 8) {
+                    s_loggedSemanticWeakCommit++;
+                    WAR3_RENDER_LOG(
+                        "DXVK War3Pipeline: BeforeUi commit (semantic weak boundary) stage=%d disp=%d layer=%d cat=%d tag=%d\n",
+                        stage,
+                        dispStage,
+                        static_cast<int>(layer),
+                        static_cast<int>(category),
+                        static_cast<int>(batchTag));
+                }
+                return true;
+            }
+
             if (m_armedBeforeUi) {
                 if (strongUiMarker) {
                     m_insertedBeforeUi = true;
@@ -462,6 +706,8 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
                 const auto& preEvents = frameGraphPlan.Events(
                     dxvk::war3::render::FrameGraphDispatchStage::BeforeUiPrePass);
                 for (auto eventId : preEvents) {
+                    if (!ShouldDispatchBeforeUiPreEvent(eventId))
+                        continue;
                     war3shader::internal::DispatchRenderEvent(eventId);
                 }
             }
@@ -469,6 +715,8 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
 
         for (auto& entry : m_passes) {
             if (!entry.enabled || !entry.pass)
+                continue;
+            if (!IsRuntimePipelinePassEnabled(entry.name))
                 continue;
             if (entry.pass->Point() == point) {
                 try {
@@ -502,7 +750,9 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
                     WAR3_RENDER_LOG("DXVK War3Pipeline: ShaderPack DISABLED by env var\n");
                 }
             }
-            if (!s_disableShaderPack) {
+            if (!s_disableShaderPack &&
+                dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
+                    dxvk::war3::runtime::War3RuntimeModule::PostFx)) {
                 try {
                     auto packScope = perf.cpuScope("ShaderPack");
                     war3shader::internal::RunShaderPackPasses(ctx, input);

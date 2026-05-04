@@ -4,8 +4,11 @@
 
 #include "war3_native_renderer.h"
 #include "../../d3d9_war3_debug.h"
+#include "../debug/war3_debug.h"
+#include "../platform/war3_runtime_bootstrap.h"
 #include "war3_native_hooks.h"
 
+#include <atomic>
 
 namespace war3 {
 namespace native {
@@ -18,6 +21,38 @@ namespace {
 
 bool HasShadowModeOrStage21ListBEntry(const CWorldFrameWar3 *world) {
   return world && world->shadowModeOrStage21ListBEntryIndex != -1;
+}
+
+void LogNativeRenderSceneEntry(const CWorldFrameWar3* world, int reserved,
+                               void* activeQueue, bool hasShadowStageEntry) {
+  static std::atomic<uint32_t> s_entryLogCount{0u};
+  const uint32_t logIndex =
+      s_entryLogCount.fetch_add(1u, std::memory_order_relaxed);
+  if (logIndex >= 16u || world == nullptr)
+    return;
+
+  WAR3_LOG_INFO(
+      "[War3Native] RenderScene entry world=%p reserved=%d activeQueue=%p "
+      "shadowStageEntry=%d shadowModeOrStage21=%d stage17=%d gate0=%d ready0=%d\n",
+      world, reserved, activeQueue, hasShadowStageEntry ? 1 : 0,
+      world->shadowModeOrStage21ListBEntryIndex, world->stage17Enabled ? 1 : 0,
+      world->stage0GateEnabled ? 1 : 0, world->stage0GateReady ? 1 : 0);
+}
+
+void LogNativeShadowGate(const CWorldFrameWar3* world, bool hasShadowStageEntry,
+                         bool nativeShadowPrepared) {
+  static std::atomic<uint32_t> s_gateLogCount{0u};
+  const uint32_t logIndex =
+      s_gateLogCount.fetch_add(1u, std::memory_order_relaxed);
+  if (logIndex >= 16u || world == nullptr)
+    return;
+
+  WAR3_LOG_INFO(
+      "[War3Native] RenderScene shadow gate world=%p shadowStageEntry=%d "
+      "shadowModeOrStage21=%d prepared=%d\n",
+      world, hasShadowStageEntry ? 1 : 0,
+      world->shadowModeOrStage21ListBEntryIndex,
+      nativeShadowPrepared ? 1 : 0);
 }
 
 void ResetRenderStateCaches(CWorldFrameWar3 *world) {
@@ -65,7 +100,9 @@ extern "C" int WAR3_NATIVE_CB Native_CWorld_RenderScene(CWorldFrameWar3 *world,
   ResetRenderStateCaches(world);
 
   void *activeQueue = world->activeRenderQueue;
-  if (HasShadowModeOrStage21ListBEntry(world))
+  const bool hasShadowStageEntry = HasShadowModeOrStage21ListBEntry(world);
+  LogNativeRenderSceneEntry(world, reserved, activeQueue, hasShadowStageEntry);
+  if (hasShadowStageEntry)
     CWorld_SetShadowMode(world->shadowModeOrStage21ListBEntryIndex, 1);
 
   if (world->stage0GateEnabled && world->stage0Context &&
@@ -121,7 +158,10 @@ extern "C" int WAR3_NATIVE_CB Native_CWorld_RenderScene(CWorldFrameWar3 *world,
                                    CategoryMode::Overlay,
                                    RenderCategoryMask::Overlay,
                                    (int)(uintptr_t)activeQueue);
-  if (HasShadowModeOrStage21ListBEntry(world)) {
+  const bool nativeShadowPrepared =
+      dxvk::war3::platform::DriveNativeShadowBackend();
+  LogNativeShadowGate(world, hasShadowStageEntry, nativeShadowPrepared);
+  if (hasShadowStageEntry) {
     CWorld_ToggleGroup1ShadowPass(world, 1);
     Native_RenderWorld_DispatchStage(world, 0, RenderStage::Stage12_Group1,
                                      CategoryMode::Overlay,
@@ -132,10 +172,17 @@ extern "C" int WAR3_NATIVE_CB Native_CWorld_RenderScene(CWorldFrameWar3 *world,
       world, 0, RenderStage::Stage11_TerrainShadow12_Group0,
       CategoryMode::Overlay, RenderCategoryMask::Overlay,
       (int)(uintptr_t)activeQueue);
+  if (nativeShadowPrepared) {
+    const bool nativeExecuted =
+        dxvk::war3::platform::ExecuteNativeShadowBackendPreparedFrame();
+    WAR3_RENDER_LOG("Native_CWorld_RenderScene: native shadow execute prepared=%d "
+                    "executed=%d\n",
+                    nativeShadowPrepared ? 1 : 0, nativeExecuted ? 1 : 0);
+  }
 
   RenderQueue_FlushAndReset();
 
-  if (HasShadowModeOrStage21ListBEntry(world))
+  if (hasShadowStageEntry)
     CWorld_ToggleGroup1ShadowPass(world, 0);
 
   Native_RenderWorld_DispatchStage(world, 0, RenderStage::Stage4_TerrainShadow3,

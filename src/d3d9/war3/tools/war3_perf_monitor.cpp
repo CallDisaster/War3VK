@@ -273,9 +273,97 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.dynamicPoseCount += stats.dynamicPoseCount;
   agg.dynamicSkinnedOutputCount += stats.dynamicSkinnedOutputCount;
   agg.fallbackDrawCount += stats.fallbackDrawCount;
+  agg.fallbackDrawCountTerrain += stats.fallbackDrawCountTerrain;
+  agg.fallbackDrawCountWorldObject += stats.fallbackDrawCountWorldObject;
+  agg.fallbackDrawCountUnitObject += stats.fallbackDrawCountUnitObject;
+  agg.objectFallbackDrawCount +=
+      stats.fallbackDrawCountWorldObject + stats.fallbackDrawCountUnitObject;
   agg.semanticBridgeHit += stats.semanticBridgeHit;
   agg.semanticBridgeMiss += stats.semanticBridgeMiss;
   agg.semanticBridgeBypassed += stats.semanticBridgeBypassed;
+  agg.semanticSceneSubmitted += stats.semanticSceneSubmitted;
+  agg.semanticSceneSubmittedUnit += stats.semanticSceneSubmittedUnit;
+  agg.semanticSceneSubmittedSkinned += stats.semanticSceneSubmittedSkinned;
+  agg.semanticSceneLivePaletteRefreshAttemptCount +=
+      stats.semanticSceneLivePaletteRefreshAttemptCount;
+  agg.semanticSceneLivePaletteRefreshHitCount +=
+      stats.semanticSceneLivePaletteRefreshHitCount;
+  agg.semanticSceneLivePaletteRefreshMissCount +=
+      stats.semanticSceneLivePaletteRefreshMissCount;
+  agg.semanticSceneLivePaletteMotionSampleCount +=
+      stats.semanticSceneLivePaletteMotionSampleCount;
+  agg.semanticSceneLivePaletteMotionNewRuntimeCount +=
+      stats.semanticSceneLivePaletteMotionNewRuntimeCount;
+  agg.semanticSceneLivePaletteMotionRawChangedCount +=
+      stats.semanticSceneLivePaletteMotionRawChangedCount;
+  agg.semanticSceneLivePaletteMotionRawStableCount +=
+      stats.semanticSceneLivePaletteMotionRawStableCount;
+  agg.semanticSceneLivePaletteMotionGroupChangedCount +=
+      stats.semanticSceneLivePaletteMotionGroupChangedCount;
+  agg.semanticSceneLivePaletteMotionGroupStableCount +=
+      stats.semanticSceneLivePaletteMotionGroupStableCount;
+  agg.semanticSceneDrawTimePoseAttemptCount +=
+      stats.semanticSceneDrawTimePoseAttemptCount;
+  agg.semanticSceneDrawTimePosePublishedCount +=
+      stats.semanticSceneDrawTimePosePublishedCount;
+  agg.semanticSceneDrawTimePoseRejectUiOrEffectCount +=
+      stats.semanticSceneDrawTimePoseRejectUiOrEffectCount;
+  agg.semanticSceneDrawTimePoseRejectVertexShaderCount +=
+      stats.semanticSceneDrawTimePoseRejectVertexShaderCount;
+  agg.semanticSceneDrawTimePoseRejectNoVertexBlendCount +=
+      stats.semanticSceneDrawTimePoseRejectNoVertexBlendCount;
+  agg.semanticSceneDrawTimePoseRejectNoContextCount +=
+      stats.semanticSceneDrawTimePoseRejectNoContextCount;
+  agg.semanticSceneDrawTimePoseRejectNoRuntimeModelCount +=
+      stats.semanticSceneDrawTimePoseRejectNoRuntimeModelCount;
+  agg.semanticSceneDrawTimePoseDedupedCount +=
+      stats.semanticSceneDrawTimePoseDedupedCount;
+  agg.semanticSceneDrawTimePoseChangedCount +=
+      stats.semanticSceneDrawTimePoseChangedCount;
+  agg.semanticSceneDrawTimePoseStableCount +=
+      stats.semanticSceneDrawTimePoseStableCount;
+  agg.semanticSceneSubmittedPaletteMotionSampleCount +=
+      stats.semanticSceneSubmittedPaletteMotionSampleCount;
+  agg.semanticSceneSubmittedPaletteMotionNewRuntimeCount +=
+      stats.semanticSceneSubmittedPaletteMotionNewRuntimeCount;
+  agg.semanticSceneSubmittedPaletteMotionChangedCount +=
+      stats.semanticSceneSubmittedPaletteMotionChangedCount;
+  agg.semanticSceneSubmittedPaletteMotionStableCount +=
+      stats.semanticSceneSubmittedPaletteMotionStableCount;
+  agg.semanticSceneSkinnedDynamicIndexSliceCount +=
+      stats.semanticSceneSkinnedDynamicIndexSliceCount;
+  agg.semanticSceneSkinnedFullIndexFallbackCount +=
+      stats.semanticSceneSkinnedFullIndexFallbackCount;
+  agg.semanticSceneSkinnedMissingVisibleIndexSliceRejectCount +=
+      stats.semanticSceneSkinnedMissingVisibleIndexSliceRejectCount;
+  agg.semanticSceneSubmittedFrameLocal +=
+      stats.semanticSceneSubmittedFrameLocal;
+  agg.semanticSceneSubmittedPersistent +=
+      stats.semanticSceneSubmitted > stats.semanticSceneSubmittedFrameLocal
+          ? (stats.semanticSceneSubmitted -
+             stats.semanticSceneSubmittedFrameLocal)
+          : 0u;
+  agg.semanticSceneSkippedUnitsOnlyFilter +=
+      stats.semanticSceneSkippedUnitsOnlyFilter;
+  agg.semanticSceneAcceptedExplicitResourceOwnerRigid +=
+      stats.semanticSceneAcceptedExplicitResourceOwnerRigid;
+  agg.semanticSceneRejectedNoVertex += stats.semanticSceneRejectedNoVertex;
+  agg.semanticSceneRejectedSkinnedContract +=
+      stats.semanticSceneRejectedSkinnedContract;
+  agg.semanticSceneRejectedGeometry += stats.semanticSceneRejectedGeometry;
+  agg.semanticSceneRejectedGeometryFrameLocal +=
+      stats.semanticSceneRejectedGeometryFrameLocal;
+  agg.semanticSceneRejectedGeometryPersistent +=
+      stats.semanticSceneRejectedGeometryPersistent;
+  agg.semanticFallbackPruned += stats.semanticFallbackPruned;
+  agg.semanticFallbackPrunedByHandle +=
+      stats.semanticFallbackPrunedByHandle;
+  agg.semanticFallbackPrunedByWorldObjectEntry +=
+      stats.semanticFallbackPrunedByWorldObjectEntry;
+  agg.semanticFallbackPrunedBySceneNode +=
+      stats.semanticFallbackPrunedBySceneNode;
+  agg.semanticFallbackPrunedByRuntimeModel +=
+      stats.semanticFallbackPrunedByRuntimeModel;
   agg.instancedGeometryInstances += stats.persistentInstanceCount;
   agg.instancedGeometryDrawsSaved += stats.instancedGeometryDrawsSaved;
 }
@@ -292,6 +380,33 @@ void War3PerfMonitor::noteShadowMapFallback(bool reusedLastComplete,
     m_shadowBudgetAggregate.framesReuseLastComplete++;
   if (renderedCurrentPartial)
     m_shadowBudgetAggregate.framesRenderCurrentPartial++;
+}
+
+void War3PerfMonitor::noteShadowReceiverFrame(
+    uint32_t replayCasterCount,
+    uint64_t replayGeometryWork,
+    uint32_t requestedShadowResolution,
+    uint32_t effectiveShadowResolution) {
+  if (!m_enabled.load(std::memory_order_relaxed) ||
+      !m_recording.load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  std::lock_guard lock(m_mutex);
+  auto& agg = m_shadowBudgetAggregate;
+  agg.shadowReceiverFrames++;
+  agg.shadowReceiverReplayCasterCountTotal += replayCasterCount;
+  agg.shadowReceiverReplayCasterCountMax =
+      std::max<uint64_t>(agg.shadowReceiverReplayCasterCountMax,
+                         replayCasterCount);
+  agg.shadowReceiverReplayGeometryWorkTotal += replayGeometryWork;
+  agg.shadowReceiverReplayGeometryWorkMax =
+      std::max<uint64_t>(agg.shadowReceiverReplayGeometryWorkMax,
+                         replayGeometryWork);
+  if (requestedShadowResolution != effectiveShadowResolution)
+    agg.shadowReceiverAdaptiveResolutionFrames++;
+  agg.shadowReceiverRequestedResolutionLast = requestedShadowResolution;
+  agg.shadowReceiverEffectiveResolutionLast = effectiveShadowResolution;
 }
 
 War3PerfMonitor::~War3PerfMonitor() { shutdown(); }
@@ -1293,6 +1408,32 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.framesReuseLastComplete << ",\n";
   json << "    \"framesRenderCurrentPartial\": "
        << shadowAgg.framesRenderCurrentPartial << ",\n";
+  const double shadowReceiverAvgCasters =
+      shadowAgg.shadowReceiverFrames != 0u
+          ? static_cast<double>(shadowAgg.shadowReceiverReplayCasterCountTotal) /
+                static_cast<double>(shadowAgg.shadowReceiverFrames)
+          : 0.0;
+  const double shadowReceiverAvgGeometryWork =
+      shadowAgg.shadowReceiverFrames != 0u
+          ? static_cast<double>(shadowAgg.shadowReceiverReplayGeometryWorkTotal) /
+                static_cast<double>(shadowAgg.shadowReceiverFrames)
+          : 0.0;
+  json << "    \"shadowReceiverFrames\": "
+       << shadowAgg.shadowReceiverFrames << ",\n";
+  json << "    \"shadowReceiverReplayCasterCountAvg\": "
+       << shadowReceiverAvgCasters << ",\n";
+  json << "    \"shadowReceiverReplayCasterCountMax\": "
+       << shadowAgg.shadowReceiverReplayCasterCountMax << ",\n";
+  json << "    \"shadowReceiverReplayGeometryWorkAvg\": "
+       << shadowReceiverAvgGeometryWork << ",\n";
+  json << "    \"shadowReceiverReplayGeometryWorkMax\": "
+       << shadowAgg.shadowReceiverReplayGeometryWorkMax << ",\n";
+  json << "    \"shadowReceiverAdaptiveResolutionFrames\": "
+       << shadowAgg.shadowReceiverAdaptiveResolutionFrames << ",\n";
+  json << "    \"shadowReceiverRequestedResolutionLast\": "
+       << shadowAgg.shadowReceiverRequestedResolutionLast << ",\n";
+  json << "    \"shadowReceiverEffectiveResolutionLast\": "
+       << shadowAgg.shadowReceiverEffectiveResolutionLast << ",\n";
   json << "    \"avgBudgetMb\": "
        << (static_cast<double>(shadowAgg.totalBudgetBytes) / shadowFrames /
            (1024.0 * 1024.0))
@@ -1375,12 +1516,107 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.dynamicSkinnedOutputCount << ",\n";
   json << "    \"fallbackDrawCount\": " << shadowAgg.fallbackDrawCount
        << ",\n";
+  json << "    \"fallbackDrawCountTerrain\": "
+       << shadowAgg.fallbackDrawCountTerrain << ",\n";
+  json << "    \"fallbackDrawCountWorldObject\": "
+       << shadowAgg.fallbackDrawCountWorldObject << ",\n";
+  json << "    \"fallbackDrawCountUnitObject\": "
+       << shadowAgg.fallbackDrawCountUnitObject << ",\n";
+  json << "    \"objectFallbackDrawCount\": "
+       << shadowAgg.objectFallbackDrawCount << ",\n";
   json << "    \"semanticBridgeHit\": " << shadowAgg.semanticBridgeHit
        << ",\n";
   json << "    \"semanticBridgeMiss\": " << shadowAgg.semanticBridgeMiss
        << ",\n";
   json << "    \"semanticBridgeBypassed\": "
        << shadowAgg.semanticBridgeBypassed << ",\n";
+  json << "    \"semanticSceneSubmitted\": "
+       << shadowAgg.semanticSceneSubmitted << ",\n";
+  json << "    \"semanticSceneSubmittedUnit\": "
+       << shadowAgg.semanticSceneSubmittedUnit << ",\n";
+  json << "    \"semanticSceneSubmittedSkinned\": "
+       << shadowAgg.semanticSceneSubmittedSkinned << ",\n";
+  json << "    \"semanticSceneLivePaletteRefreshAttemptCount\": "
+       << shadowAgg.semanticSceneLivePaletteRefreshAttemptCount << ",\n";
+  json << "    \"semanticSceneLivePaletteRefreshHitCount\": "
+       << shadowAgg.semanticSceneLivePaletteRefreshHitCount << ",\n";
+  json << "    \"semanticSceneLivePaletteRefreshMissCount\": "
+       << shadowAgg.semanticSceneLivePaletteRefreshMissCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionSampleCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionSampleCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionNewRuntimeCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionNewRuntimeCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionRawChangedCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionRawChangedCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionRawStableCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionRawStableCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionGroupChangedCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionGroupChangedCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionGroupStableCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionGroupStableCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseAttemptCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseAttemptCount << ",\n";
+  json << "    \"semanticSceneDrawTimePosePublishedCount\": "
+       << shadowAgg.semanticSceneDrawTimePosePublishedCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseRejectUiOrEffectCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseRejectUiOrEffectCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseRejectVertexShaderCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseRejectVertexShaderCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseRejectNoVertexBlendCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseRejectNoVertexBlendCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseRejectNoContextCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseRejectNoContextCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseRejectNoRuntimeModelCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseRejectNoRuntimeModelCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseDedupedCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseDedupedCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseChangedCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseChangedCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseStableCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseStableCount << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionSampleCount\": "
+       << shadowAgg.semanticSceneSubmittedPaletteMotionSampleCount << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionNewRuntimeCount\": "
+       << shadowAgg.semanticSceneSubmittedPaletteMotionNewRuntimeCount << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionChangedCount\": "
+       << shadowAgg.semanticSceneSubmittedPaletteMotionChangedCount << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionStableCount\": "
+       << shadowAgg.semanticSceneSubmittedPaletteMotionStableCount << ",\n";
+  json << "    \"semanticSceneSkinnedDynamicIndexSliceCount\": "
+       << shadowAgg.semanticSceneSkinnedDynamicIndexSliceCount << ",\n";
+  json << "    \"semanticSceneSkinnedFullIndexFallbackCount\": "
+       << shadowAgg.semanticSceneSkinnedFullIndexFallbackCount << ",\n";
+  json << "    \"semanticSceneSkinnedMissingVisibleIndexSliceRejectCount\": "
+       << shadowAgg.semanticSceneSkinnedMissingVisibleIndexSliceRejectCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedFrameLocal\": "
+       << shadowAgg.semanticSceneSubmittedFrameLocal << ",\n";
+  json << "    \"semanticSceneSubmittedPersistent\": "
+       << shadowAgg.semanticSceneSubmittedPersistent << ",\n";
+  json << "    \"semanticSceneSkippedUnitsOnlyFilter\": "
+       << shadowAgg.semanticSceneSkippedUnitsOnlyFilter << ",\n";
+  json << "    \"semanticSceneAcceptedExplicitResourceOwnerRigid\": "
+       << shadowAgg.semanticSceneAcceptedExplicitResourceOwnerRigid << ",\n";
+  json << "    \"semanticSceneRejectedNoVertex\": "
+       << shadowAgg.semanticSceneRejectedNoVertex << ",\n";
+  json << "    \"semanticSceneRejectedSkinnedContract\": "
+       << shadowAgg.semanticSceneRejectedSkinnedContract << ",\n";
+  json << "    \"semanticSceneRejectedGeometry\": "
+       << shadowAgg.semanticSceneRejectedGeometry << ",\n";
+  json << "    \"semanticSceneRejectedGeometryFrameLocal\": "
+       << shadowAgg.semanticSceneRejectedGeometryFrameLocal << ",\n";
+  json << "    \"semanticSceneRejectedGeometryPersistent\": "
+       << shadowAgg.semanticSceneRejectedGeometryPersistent << ",\n";
+  json << "    \"semanticFallbackPruned\": "
+       << shadowAgg.semanticFallbackPruned << ",\n";
+  json << "    \"semanticFallbackPrunedByHandle\": "
+       << shadowAgg.semanticFallbackPrunedByHandle << ",\n";
+  json << "    \"semanticFallbackPrunedByWorldObjectEntry\": "
+       << shadowAgg.semanticFallbackPrunedByWorldObjectEntry << ",\n";
+  json << "    \"semanticFallbackPrunedBySceneNode\": "
+       << shadowAgg.semanticFallbackPrunedBySceneNode << ",\n";
+  json << "    \"semanticFallbackPrunedByRuntimeModel\": "
+       << shadowAgg.semanticFallbackPrunedByRuntimeModel << ",\n";
   json << "    \"instancedGeometryGroups\": "
        << shadowAgg.instancedGeometryGroups << ",\n";
   json << "    \"instancedGeometryInstances\": "
@@ -1455,12 +1691,150 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.dynamicSkinnedOutputCount << ",\n";
   json << "    \"fallbackDrawCount\": " << shadowAgg.fallbackDrawCount
        << ",\n";
+  json << "    \"fallbackDrawCountTerrain\": "
+       << shadowAgg.fallbackDrawCountTerrain << ",\n";
+  json << "    \"fallbackDrawCountWorldObject\": "
+       << shadowAgg.fallbackDrawCountWorldObject << ",\n";
+  json << "    \"fallbackDrawCountUnitObject\": "
+       << shadowAgg.fallbackDrawCountUnitObject << ",\n";
+  json << "    \"objectFallbackDrawCount\": "
+       << shadowAgg.objectFallbackDrawCount << ",\n";
   json << "    \"semanticBridgeHit\": " << shadowAgg.semanticBridgeHit
        << ",\n";
   json << "    \"semanticBridgeMiss\": " << shadowAgg.semanticBridgeMiss
        << ",\n";
   json << "    \"semanticBridgeBypassed\": "
        << shadowAgg.semanticBridgeBypassed << ",\n";
+  json << "    \"semanticSceneSubmitted\": "
+       << shadowAgg.semanticSceneSubmitted << ",\n";
+  json << "    \"semanticSceneSubmittedUnit\": "
+       << shadowAgg.semanticSceneSubmittedUnit << ",\n";
+  json << "    \"semanticSceneSubmittedSkinned\": "
+       << shadowAgg.semanticSceneSubmittedSkinned << ",\n";
+  json << "    \"semanticSceneLivePaletteRefreshAttemptCount\": "
+       << shadowAgg.semanticSceneLivePaletteRefreshAttemptCount << ",\n";
+  json << "    \"semanticSceneLivePaletteRefreshHitCount\": "
+       << shadowAgg.semanticSceneLivePaletteRefreshHitCount << ",\n";
+  json << "    \"semanticSceneLivePaletteRefreshMissCount\": "
+       << shadowAgg.semanticSceneLivePaletteRefreshMissCount << ",\n";
+  json << "    \"semanticSceneLivePaletteRefreshLastRuntimeModelPtr\": "
+       << runtimeSummary.semanticSceneLivePaletteRefreshLastRuntimeModelPtr
+       << ",\n";
+  json << "    \"semanticSceneLivePaletteRefreshLastMatrixCount\": "
+       << runtimeSummary.semanticSceneLivePaletteRefreshLastMatrixCount
+       << ",\n";
+  json << "    \"semanticSceneLivePaletteRefreshLastMatrixHash\": "
+       << runtimeSummary.semanticSceneLivePaletteRefreshLastMatrixHash
+       << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionSampleCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionSampleCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionNewRuntimeCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionNewRuntimeCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionRawChangedCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionRawChangedCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionRawStableCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionRawStableCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionGroupChangedCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionGroupChangedCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionGroupStableCount\": "
+       << shadowAgg.semanticSceneLivePaletteMotionGroupStableCount << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionLastRuntimeModelPtr\": "
+       << runtimeSummary.semanticSceneLivePaletteMotionLastRuntimeModelPtr
+       << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionLastPrevRawHash\": "
+       << runtimeSummary.semanticSceneLivePaletteMotionLastPrevRawHash
+       << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionLastRawHash\": "
+       << runtimeSummary.semanticSceneLivePaletteMotionLastRawHash << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionLastPrevGroupHash\": "
+       << runtimeSummary.semanticSceneLivePaletteMotionLastPrevGroupHash
+       << ",\n";
+  json << "    \"semanticSceneLivePaletteMotionLastGroupHash\": "
+       << runtimeSummary.semanticSceneLivePaletteMotionLastGroupHash << ",\n";
+  json << "    \"semanticSceneDrawTimePoseAttemptCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseAttemptCount << ",\n";
+  json << "    \"semanticSceneDrawTimePosePublishedCount\": "
+       << shadowAgg.semanticSceneDrawTimePosePublishedCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseRejectUiOrEffectCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseRejectUiOrEffectCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseRejectVertexShaderCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseRejectVertexShaderCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseRejectNoVertexBlendCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseRejectNoVertexBlendCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseRejectNoContextCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseRejectNoContextCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseRejectNoRuntimeModelCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseRejectNoRuntimeModelCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseDedupedCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseDedupedCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseChangedCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseChangedCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseStableCount\": "
+       << shadowAgg.semanticSceneDrawTimePoseStableCount << ",\n";
+  json << "    \"semanticSceneDrawTimePoseLastRuntimeModelPtr\": "
+       << runtimeSummary.semanticSceneDrawTimePoseLastRuntimeModelPtr << ",\n";
+  json << "    \"semanticSceneDrawTimePoseLastPrevHash\": "
+       << runtimeSummary.semanticSceneDrawTimePoseLastPrevHash << ",\n";
+  json << "    \"semanticSceneDrawTimePoseLastHash\": "
+       << runtimeSummary.semanticSceneDrawTimePoseLastHash << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionSampleCount\": "
+       << shadowAgg.semanticSceneSubmittedPaletteMotionSampleCount << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionNewRuntimeCount\": "
+       << shadowAgg.semanticSceneSubmittedPaletteMotionNewRuntimeCount << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionChangedCount\": "
+       << shadowAgg.semanticSceneSubmittedPaletteMotionChangedCount << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionStableCount\": "
+       << shadowAgg.semanticSceneSubmittedPaletteMotionStableCount << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionLastRuntimeModelPtr\": "
+       << runtimeSummary.semanticSceneSubmittedPaletteMotionLastRuntimeModelPtr
+       << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionLastPrevHash\": "
+       << runtimeSummary.semanticSceneSubmittedPaletteMotionLastPrevHash
+       << ",\n";
+  json << "    \"semanticSceneSubmittedPaletteMotionLastHash\": "
+       << runtimeSummary.semanticSceneSubmittedPaletteMotionLastHash << ",\n";
+  json << "    \"semanticSceneSkinnedDynamicIndexSliceCount\": "
+       << shadowAgg.semanticSceneSkinnedDynamicIndexSliceCount << ",\n";
+  json << "    \"semanticSceneSkinnedFullIndexFallbackCount\": "
+       << shadowAgg.semanticSceneSkinnedFullIndexFallbackCount << ",\n";
+  json << "    \"semanticSceneSkinnedMissingVisibleIndexSliceRejectCount\": "
+       << shadowAgg.semanticSceneSkinnedMissingVisibleIndexSliceRejectCount
+       << ",\n";
+  json << "    \"semanticSceneSkinnedFullIndexFallbackLastRuntimeModelPtr\": "
+       << runtimeSummary
+              .semanticSceneSkinnedFullIndexFallbackLastRuntimeModelPtr
+       << ",\n";
+  json << "    \"semanticSceneSkinnedFullIndexFallbackLastIndexCount\": "
+       << runtimeSummary.semanticSceneSkinnedFullIndexFallbackLastIndexCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedFrameLocal\": "
+       << shadowAgg.semanticSceneSubmittedFrameLocal << ",\n";
+  json << "    \"semanticSceneSubmittedPersistent\": "
+       << shadowAgg.semanticSceneSubmittedPersistent << ",\n";
+  json << "    \"semanticSceneSkippedUnitsOnlyFilter\": "
+       << shadowAgg.semanticSceneSkippedUnitsOnlyFilter << ",\n";
+  json << "    \"semanticSceneAcceptedExplicitResourceOwnerRigid\": "
+       << shadowAgg.semanticSceneAcceptedExplicitResourceOwnerRigid << ",\n";
+  json << "    \"semanticSceneRejectedNoVertex\": "
+       << shadowAgg.semanticSceneRejectedNoVertex << ",\n";
+  json << "    \"semanticSceneRejectedSkinnedContract\": "
+       << shadowAgg.semanticSceneRejectedSkinnedContract << ",\n";
+  json << "    \"semanticSceneRejectedGeometry\": "
+       << shadowAgg.semanticSceneRejectedGeometry << ",\n";
+  json << "    \"semanticSceneRejectedGeometryFrameLocal\": "
+       << shadowAgg.semanticSceneRejectedGeometryFrameLocal << ",\n";
+  json << "    \"semanticSceneRejectedGeometryPersistent\": "
+       << shadowAgg.semanticSceneRejectedGeometryPersistent << ",\n";
+  json << "    \"semanticFallbackPruned\": "
+       << shadowAgg.semanticFallbackPruned << ",\n";
+  json << "    \"semanticFallbackPrunedByHandle\": "
+       << shadowAgg.semanticFallbackPrunedByHandle << ",\n";
+  json << "    \"semanticFallbackPrunedByWorldObjectEntry\": "
+       << shadowAgg.semanticFallbackPrunedByWorldObjectEntry << ",\n";
+  json << "    \"semanticFallbackPrunedBySceneNode\": "
+       << shadowAgg.semanticFallbackPrunedBySceneNode << ",\n";
+  json << "    \"semanticFallbackPrunedByRuntimeModel\": "
+       << shadowAgg.semanticFallbackPrunedByRuntimeModel << ",\n";
   json << "    \"modelRegistryHit\": " << runtimeSummary.modelRegistryCount
        << ",\n";
   json << "    \"modelRegistryMiss\": 0,\n";
@@ -1484,8 +1858,183 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
   json << "    \"poseCacheMiss\": 0,\n";
   json << "    \"bonePaletteUpdates\": " << runtimeSummary.matrixPaletteCount
        << ",\n";
+  json << "    \"shadowGeosetResourceCount\": "
+       << runtimeSummary.shadowGeosetResourceCount << ",\n";
+  json << "    \"shadowReadyGeosetCount\": "
+       << runtimeSummary.shadowReadyGeosetCount << ",\n";
+  json << "    \"shadowModelResourceCount\": "
+       << runtimeSummary.shadowModelResourceCount << ",\n";
+  json << "    \"shadowRuntimeModelCount\": "
+       << runtimeSummary.shadowRuntimeModelCount << ",\n";
+  json << "    \"visibleRenderableCount\": "
+       << runtimeSummary.visibleRenderableCount << ",\n";
+  json << "    \"visibleRenderableMainCount\": "
+       << runtimeSummary.visibleRenderableMainCount << ",\n";
+  json << "    \"visibleRenderableTransparentCount\": "
+       << runtimeSummary.visibleRenderableTransparentCount << ",\n";
+  json << "    \"semanticVisibleDirectUnitCandidateAccepted\": "
+       << runtimeSummary.semanticVisibleDirectUnitCandidateAccepted << ",\n";
+  json << "    \"semanticVisibleDirectUnitRejectedNotUnitLike\": "
+       << runtimeSummary.semanticVisibleDirectUnitRejectedNotUnitLike << ",\n";
+  json << "    \"semanticVisibleDirectUnitRejectedGroup\": "
+       << runtimeSummary.semanticVisibleDirectUnitRejectedGroup << ",\n";
+  json << "    \"semanticVisibleDirectUnitRejectedNoUnitPtr\": "
+       << runtimeSummary.semanticVisibleDirectUnitRejectedNoUnitPtr << ",\n";
+  json << "    \"semanticVisibleDirectUnitRejectedNoIdentity\": "
+       << runtimeSummary.semanticVisibleDirectUnitRejectedNoIdentity << ",\n";
+  json << "    \"semanticVisibleDirectUnitRejectedNoMesh\": "
+       << runtimeSummary.semanticVisibleDirectUnitRejectedNoMesh << ",\n";
+  json << "    \"semanticVisibleDirectUnitRejectedBuilding\": "
+       << runtimeSummary.semanticVisibleDirectUnitRejectedBuilding << ",\n";
+  json << "    \"semanticVisibleDirectUnitRejectedNoGeoset\": "
+       << runtimeSummary.semanticVisibleDirectUnitRejectedNoGeoset << ",\n";
+  json << "    \"semanticStaticCandidateCount\": "
+       << runtimeSummary.semanticStaticCandidateCount << ",\n";
+  json << "    \"semanticStaticCandidateBuildingCount\": "
+       << runtimeSummary.semanticStaticCandidateBuildingCount << ",\n";
+  json << "    \"semanticStaticCandidateDestructibleCount\": "
+       << runtimeSummary.semanticStaticCandidateDestructibleCount << ",\n";
+  json << "    \"semanticStaticCandidateMaybeDoodadOrEffectCount\": "
+       << runtimeSummary.semanticStaticCandidateMaybeDoodadOrEffectCount
+       << ",\n";
+  json << "    \"semanticStaticCandidateWithStableIdentity\": "
+       << runtimeSummary.semanticStaticCandidateWithStableIdentity << ",\n";
+  json << "    \"semanticStaticCandidateWithMeshData\": "
+       << runtimeSummary.semanticStaticCandidateWithMeshData << ",\n";
+  json << "    \"semanticStaticCandidateWithRuntimeModel\": "
+       << runtimeSummary.semanticStaticCandidateWithRuntimeModel << ",\n";
+  json << "    \"semanticStaticCandidateWithModelResource\": "
+       << runtimeSummary.semanticStaticCandidateWithModelResource << ",\n";
+  json << "    \"semanticStaticCandidateWithResolvedGeoset\": "
+       << runtimeSummary.semanticStaticCandidateWithResolvedGeoset << ",\n";
+  json << "    \"semanticStaticCandidateRejectedUnitsOnlyFilter\": "
+       << runtimeSummary.semanticStaticCandidateRejectedUnitsOnlyFilter
+       << ",\n";
+  json << "    \"semanticStaticCandidateRejectedNoIdentity\": "
+       << runtimeSummary.semanticStaticCandidateRejectedNoIdentity << ",\n";
+  json << "    \"semanticStaticCandidateRejectedNoMeshData\": "
+       << runtimeSummary.semanticStaticCandidateRejectedNoMeshData << ",\n";
+  json << "    \"semanticStaticCandidateRejectedNoResource\": "
+       << runtimeSummary.semanticStaticCandidateRejectedNoResource << ",\n";
+  json << "    \"semanticStaticCandidateRejectedNoGeoset\": "
+       << runtimeSummary.semanticStaticCandidateRejectedNoGeoset << ",\n";
+  json << "    \"semanticStaticCandidateRejectedNonCanonicalKind\": "
+       << runtimeSummary.semanticStaticCandidateRejectedNonCanonicalKind
+       << ",\n";
   json << "    \"shadowPoseReadyCount\": "
        << runtimeSummary.shadowPoseReadyCount << ",\n";
+  json << "    \"upperLayerResolveAttempts\": "
+       << runtimeSummary.upperLayerResolveAttempts << ",\n";
+  json << "    \"upperLayerResolveVisibleMiss\": "
+       << runtimeSummary.upperLayerResolveVisibleMiss << ",\n";
+  json << "    \"upperLayerResolveVisibleUnresolvedGeoset\": "
+       << runtimeSummary.upperLayerResolveVisibleUnresolvedGeoset << ",\n";
+  json << "    \"upperLayerResolveGeosetMiss\": "
+       << runtimeSummary.upperLayerResolveGeosetMiss << ",\n";
+  json << "    \"upperLayerResolvePoseMiss\": "
+       << runtimeSummary.upperLayerResolvePoseMiss << ",\n";
+  json << "    \"upperLayerResolveRuntimeGroupPaletteMiss\": "
+       << runtimeSummary.upperLayerResolveRuntimeGroupPaletteMiss << ",\n";
+  json << "    \"upperLayerResolveAuthoritativeRigid\": "
+       << runtimeSummary.upperLayerResolveAuthoritativeRigid << ",\n";
+  json << "    \"upperLayerResolveAuthoritativeSkinned\": "
+       << runtimeSummary.upperLayerResolveAuthoritativeSkinned << ",\n";
+  json << "    \"upperLayerResolvedAuthoritativeItems\": "
+       << runtimeSummary.upperLayerResolvedAuthoritativeItems << ",\n";
+  json << "    \"upperLayerEmitted\": "
+       << runtimeSummary.upperLayerEmitted << ",\n";
+  json << "    \"upperLayerDuplicateOrSuppressed\": "
+       << runtimeSummary.upperLayerDuplicateOrSuppressed << ",\n";
+  json << "    \"semanticCoreManifestFrameSerial\": "
+       << runtimeSummary.semanticCoreManifestFrameSerial << ",\n";
+  json << "    \"semanticCoreFrameSerial\": "
+       << runtimeSummary.semanticCoreFrameSerial << ",\n";
+  json << "    \"semanticCoreFrameLag\": "
+       << runtimeSummary.semanticCoreFrameLag << ",\n";
+  json << "    \"semanticCoreFrameFresh\": "
+       << (runtimeSummary.semanticCoreFrameFresh ? "true" : "false") << ",\n";
+  json << "    \"semanticCoreConsidered\": "
+       << runtimeSummary.semanticCoreConsidered << ",\n";
+  json << "    \"semanticCoreResolved\": "
+       << runtimeSummary.semanticCoreResolved << ",\n";
+  json << "    \"semanticCoreRigidResolved\": "
+       << runtimeSummary.semanticCoreRigidResolved << ",\n";
+  json << "    \"semanticCoreExplicitResourceOwnerRigidResolved\": "
+       << runtimeSummary.semanticCoreExplicitResourceOwnerRigidResolved
+       << ",\n";
+  json << "    \"semanticCoreExplicitResourceOwnerRigidWorldTransformResolved\": "
+       << runtimeSummary.semanticCoreExplicitResourceOwnerRigidWorldTransformResolved
+       << ",\n";
+  json << "    \"semanticCoreExplicitResourceOwnerRigidNoMatrixPalette\": "
+       << runtimeSummary.semanticCoreExplicitResourceOwnerRigidNoMatrixPalette
+       << ",\n";
+  json << "    \"semanticCoreSkinnedResolved\": "
+       << runtimeSummary.semanticCoreSkinnedResolved << ",\n";
+  json << "    \"semanticCoreExplicitBlendAttempts\": "
+       << runtimeSummary.semanticCoreExplicitBlendAttempts << ",\n";
+  json << "    \"semanticCoreExplicitBlendAttemptWithSpanRemapTable\": "
+       << runtimeSummary.semanticCoreExplicitBlendAttemptWithSpanRemapTable
+       << ",\n";
+  json << "    \"semanticCoreExplicitBlendResolved\": "
+       << runtimeSummary.semanticCoreExplicitBlendResolved << ",\n";
+  json << "    \"semanticCoreExplicitBlendSpanRemapResolved\": "
+       << runtimeSummary.semanticCoreExplicitBlendSpanRemapResolved << ",\n";
+  json << "    \"semanticCoreExplicitBlendStrideSearchMiss\": "
+       << runtimeSummary.semanticCoreExplicitBlendStrideSearchMiss << ",\n";
+  json << "    \"semanticCoreExplicitBlendFinalDecodeMiss\": "
+       << runtimeSummary.semanticCoreExplicitBlendFinalDecodeMiss << ",\n";
+  json << "    \"semanticCoreCoreDrawPacketCount\": "
+       << runtimeSummary.semanticCoreCoreDrawPacketCount << ",\n";
+  json << "    \"semanticCoreUpperLayerResolvedItems\": "
+       << runtimeSummary.semanticCoreUpperLayerResolvedItems << ",\n";
+  json << "    \"semanticCoreSupplementalUpperLayerDrawPacketCount\": "
+       << runtimeSummary.semanticCoreSupplementalUpperLayerDrawPacketCount
+       << ",\n";
+  json << "    \"semanticCoreDrawPacketCount\": "
+       << runtimeSummary.semanticCoreDrawPacketCount << ",\n";
+  json << "    \"semanticCoreSubmittedDrawCount\": "
+       << runtimeSummary.semanticCoreSubmittedDrawCount << ",\n";
+  json << "    \"semanticCoreSkippedNoIdentity\": "
+       << runtimeSummary.semanticCoreSkippedNoIdentity << ",\n";
+  json << "    \"semanticCoreSkippedNoResolvedGeoset\": "
+       << runtimeSummary.semanticCoreSkippedNoResolvedGeoset << ",\n";
+  json << "    \"semanticCoreSkippedNoGeoset\": "
+       << runtimeSummary.semanticCoreSkippedNoGeoset << ",\n";
+  json << "    \"semanticCoreSkippedResourceMiss\": "
+       << runtimeSummary.semanticCoreSkippedResourceMiss << ",\n";
+  json << "    \"semanticCoreSkippedResourceNotReady\": "
+       << runtimeSummary.semanticCoreSkippedResourceNotReady << ",\n";
+  json << "    \"semanticCoreSkippedNoPose\": "
+       << runtimeSummary.semanticCoreSkippedNoPose << ",\n";
+  json << "    \"semanticCoreSkippedNoPoseNoContext\": "
+       << runtimeSummary.semanticCoreSkippedNoPoseNoContext << ",\n";
+  json << "    \"semanticCoreSkippedNoPoseAnonymousSubpart\": "
+       << runtimeSummary.semanticCoreSkippedNoPoseAnonymousSubpart << ",\n";
+  json << "    \"semanticCoreSkippedNoPoseLookupMiss\": "
+       << runtimeSummary.semanticCoreSkippedNoPoseLookupMiss << ",\n";
+  json << "    \"semanticCoreSkippedNoRuntimeGroupPalette\": "
+       << runtimeSummary.semanticCoreSkippedNoRuntimeGroupPalette << ",\n";
+  json << "    \"semanticCoreRuntimeGroupPaletteRescueByMeshPoseContext\": "
+       << runtimeSummary.semanticCoreRuntimeGroupPaletteRescueByMeshPoseContext
+       << ",\n";
+  json << "    \"semanticCoreRuntimeGroupPaletteRescueByResourceMatchedPose\": "
+       << runtimeSummary
+              .semanticCoreRuntimeGroupPaletteRescueByResourceMatchedPose
+       << ",\n";
+  json << "    \"semanticCoreRuntimeGroupPaletteRescueByRuntimeRoot\": "
+       << runtimeSummary.semanticCoreRuntimeGroupPaletteRescueByRuntimeRoot
+       << ",\n";
+  json << "    \"semanticCoreRuntimeGroupPaletteRescueByChildRuntime\": "
+       << runtimeSummary.semanticCoreRuntimeGroupPaletteRescueByChildRuntime
+       << ",\n";
+  json << "    \"semanticCoreRuntimeGroupPaletteRescueByDescendantRuntime\": "
+       << runtimeSummary
+              .semanticCoreRuntimeGroupPaletteRescueByDescendantRuntime
+       << ",\n";
+  json << "    \"semanticCoreRuntimeGroupPaletteResourceMatchedPoseSuppressed\": "
+       << runtimeSummary
+              .semanticCoreRuntimeGroupPaletteResourceMatchedPoseSuppressed
+       << ",\n";
   json << "    \"animationSequenceCount\": 0,\n";
   json << "    \"avgModelResolveCpuMs\": 0.0,\n";
   json << "    \"avgPoseUpdateCpuMs\": 0.0,\n";
@@ -2916,6 +3465,9 @@ void War3PerfMonitor::processExportJob(const ExportJob &job) {
 
         // Summary Cards
         const cycle = (data && data.mainLoopCycle) ? data.mainLoopCycle : null;
+        const runtimeV2 = (data && data.shadowRuntimeV2Summary)
+            ? data.shadowRuntimeV2Summary
+            : {};
         const cardsHtml = `
             <div class="card"><div class="card-value">${f2(data.avgFps)}</div><div class="card-label">Average FPS</div></div>
             <div class="card"><div class="card-value">${f2(data.avgFrameTimeMs)}</div><div class="card-label">Avg CPU Frame (ms)</div></div>
@@ -2943,6 +3495,25 @@ void War3PerfMonitor::processExportJob(const ExportJob &job) {
             <div class="card"><div class="card-value">${data.jank33 || 0}</div><div class="card-label">Jank Frames >33.33ms</div></div>
             <div class="card"><div class="card-value">${data.frameCount || 0}</div><div class="card-label">Frames Recorded</div></div>
             <div class="card"><div class="card-value">${f2(data.windowSec)}s</div><div class="card-label">统计窗口</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.shadowModelResourceCount || 0}</div><div class="card-label">Shadow Model Resources</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.shadowRuntimeModelCount || 0}</div><div class="card-label">Shadow Runtime Models</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.shadowPoseReadyCount || 0}</div><div class="card-label">Shadow Pose Ready</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.upperLayerResolveAttempts || 0}</div><div class="card-label">Upper Resolve Attempts</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.upperLayerResolvedAuthoritativeItems || 0}</div><div class="card-label">Upper Resolved Items</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.upperLayerEmitted || 0}</div><div class="card-label">Upper Emitted</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.upperLayerResolveAuthoritativeRigid || 0}</div><div class="card-label">Upper Rigid Authoritative</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.upperLayerResolveAuthoritativeSkinned || 0}</div><div class="card-label">Upper Skinned Authoritative</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreResolved || 0}</div><div class="card-label">Semantic Core Resolved</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreFrameLag || 0}</div><div class="card-label">Semantic Frame Lag</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreSkinnedResolved || 0}</div><div class="card-label">Semantic Core Skinned</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreExplicitBlendAttempts || 0}</div><div class="card-label">Semantic Explicit Attempts</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreExplicitBlendResolved || 0}</div><div class="card-label">Semantic Explicit Blend</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreExplicitBlendSpanRemapResolved || 0}</div><div class="card-label">Semantic Span Remap</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreExplicitBlendStrideSearchMiss || 0}</div><div class="card-label">Semantic Explicit Stride Miss</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreExplicitBlendFinalDecodeMiss || 0}</div><div class="card-label">Semantic Explicit Final Miss</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreUpperLayerResolvedItems || 0}</div><div class="card-label">Semantic Upper Resolved</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreSupplementalUpperLayerDrawPacketCount || 0}</div><div class="card-label">Semantic Upper Added</div></div>
+            <div class="card"><div class="card-value">${runtimeV2.semanticCoreSubmittedDrawCount || 0}</div><div class="card-label">Semantic Core Submitted</div></div>
         `;
         document.getElementById('summaryCards').innerHTML = cardsHtml;
 

@@ -12,6 +12,7 @@
 #include "../tools/war3_perf_monitor.h"
 #include "../../util/util_env.h"
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <shared_mutex>
@@ -21,6 +22,22 @@
 namespace dxvk {
 namespace war3 {
 namespace render {
+
+namespace {
+
+std::atomic<uint64_t> g_worldObjectListEntryCount{0u};
+std::atomic<uint64_t> g_worldObjectListNullEntryCount{0u};
+std::atomic<uint64_t> g_worldObjectListOwnerHintZeroCount{0u};
+std::atomic<uint64_t> g_worldObjectListOwnerHintNonzeroCount{0u};
+std::atomic<uint64_t> g_worldObjectListOwnerHintHandleCount{0u};
+std::atomic<uint64_t> g_worldObjectListOwnerHintUnitPtrCount{0u};
+std::atomic<uint64_t> g_worldObjectListOwnerHintZeroContextAcceptedCount{0u};
+std::atomic<uint64_t> g_worldObjectListAcceptedIdentityCount{0u};
+std::atomic<uint64_t> g_lastWorldObjectListEntryWorldObjectEntryPtr{0u};
+std::atomic<uint64_t> g_lastWorldObjectListEntryOwnerHintValue{0u};
+std::atomic<uint64_t> g_lastWorldObjectListEntrySceneNodePtr{0u};
+
+} // namespace
 
 /**
  * @brief SceneCollector 热路径可选性能分段。
@@ -307,32 +324,58 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
       for (uint32_t i = 0; i < count; i++) {
         // 读取列表元素 (24字节/6个DWORD)
         // idx * 6 + offset_idx
+        g_worldObjectListEntryCount.fetch_add(1u, std::memory_order_relaxed);
         void *worldObjectEntry =
             (void *)elements[i * 6 + (ListElementOffsets::WorldObjectEntry / 4)];
         uint32_t rawVal = elements[i * 6 + (ListElementOffsets::UnitPtr / 4)];
+        g_lastWorldObjectListEntryWorldObjectEntryPtr.store(
+            uint64_t(reinterpret_cast<uintptr_t>(worldObjectEntry)),
+            std::memory_order_relaxed);
+        g_lastWorldObjectListEntryOwnerHintValue.store(
+            uint64_t(rawVal), std::memory_order_relaxed);
 
-        void *unitPtr = reinterpret_cast<void *>(rawVal);
+        const bool hasOwnerHint = rawVal != 0u;
+        void *unitPtr = hasOwnerHint ? reinterpret_cast<void *>(rawVal)
+                                     : nullptr;
 
         // 判断 rawVal 是指针还是 handleId
         // 如果 < 0x01000000 视为 handleId (较少见)
         // 否则视为 CUnit* 指针 (IsLikelyUnitObjectSoft check omitted for speed,
         // registry handles it)
-        const bool isHandleVal = rawVal < 0x01000000u;
+        const bool isHandleVal = hasOwnerHint && rawVal < 0x01000000u;
 
-        if (!worldObjectEntry || !rawVal)
+        if (!worldObjectEntry) {
+          g_worldObjectListNullEntryCount.fetch_add(1u,
+                                                    std::memory_order_relaxed);
           continue;
+        }
 
-        if (!isHandleVal) {
-          // rawVal 是 CUnit* 指针
-          // [Fix] Ignore 0xFFFFFFFF (Sentinel/Invalid)
-          if (rawVal == 0xFFFFFFFFu)
-            continue;
+        if (!hasOwnerHint) {
+          g_worldObjectListOwnerHintZeroCount.fetch_add(
+              1u, std::memory_order_relaxed);
+        } else {
+          g_worldObjectListOwnerHintNonzeroCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          if (isHandleVal) {
+            g_worldObjectListOwnerHintHandleCount.fetch_add(
+                1u, std::memory_order_relaxed);
+          } else {
+            g_worldObjectListOwnerHintUnitPtrCount.fetch_add(
+                1u, std::memory_order_relaxed);
+          }
+
+          if (!isHandleVal) {
+            // rawVal 是 CUnit* 指针
+            // [Fix] Ignore 0xFFFFFFFF (Sentinel/Invalid)
+            if (rawVal == 0xFFFFFFFFu)
+              continue;
+          }
         }
 
         // 先解析句柄（用于过滤与统计），再决定是否读取 sceneNode（减少不必要的内存读取）。
         uint32_t jHandle = 0;
         if (needHandleResolution) {
-          if (isHandleVal) {
+          if (hasOwnerHint && isHandleVal) {
             jHandle = 0x100000u | rawVal;
           } else if (unitPtr) {
             const auto cacheIt = s_unitHandleCache.find(unitPtr);
@@ -367,7 +410,7 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
 
         RenderObjectBatchItem item;
         item.worldObjectEntry = worldObjectEntry;
-        item.unitPtr = isHandleVal ? nullptr : unitPtr;
+        item.unitPtr = (!hasOwnerHint || isHandleVal) ? nullptr : unitPtr;
         item.groupIdx = groupIdx;
         item.jHandle = jHandle;
 
@@ -383,6 +426,9 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
         } else {
           item.sceneNode = nullptr;
         }
+        g_lastWorldObjectListEntrySceneNodePtr.store(
+            uint64_t(reinterpret_cast<uintptr_t>(item.sceneNode)),
+            std::memory_order_relaxed);
 
         // Probe counters（仅用于统计，不影响逻辑）
         if (item.sceneNode)
@@ -400,6 +446,12 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
         }
 
         s_batchItems.push_back(item);
+        if (!hasOwnerHint) {
+          g_worldObjectListOwnerHintZeroContextAcceptedCount.fetch_add(
+              1u, std::memory_order_relaxed);
+        }
+        g_worldObjectListAcceptedIdentityCount.fetch_add(
+            1u, std::memory_order_relaxed);
 
         // [DEBUG PROBE] Register scene node for reverse lookup
         if (sceneNode) {
@@ -514,6 +566,37 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
     // [DISABLED] Registry fill log
   }
 }
+
+SceneCollectorIdentityProbeSummary QuerySceneCollectorIdentityProbeSummary() {
+  SceneCollectorIdentityProbeSummary summary = {};
+  summary.worldObjectListEntryCount =
+      g_worldObjectListEntryCount.load(std::memory_order_relaxed);
+  summary.worldObjectListNullEntryCount =
+      g_worldObjectListNullEntryCount.load(std::memory_order_relaxed);
+  summary.worldObjectListOwnerHintZeroCount =
+      g_worldObjectListOwnerHintZeroCount.load(std::memory_order_relaxed);
+  summary.worldObjectListOwnerHintNonzeroCount =
+      g_worldObjectListOwnerHintNonzeroCount.load(std::memory_order_relaxed);
+  summary.worldObjectListOwnerHintHandleCount =
+      g_worldObjectListOwnerHintHandleCount.load(std::memory_order_relaxed);
+  summary.worldObjectListOwnerHintUnitPtrCount =
+      g_worldObjectListOwnerHintUnitPtrCount.load(std::memory_order_relaxed);
+  summary.worldObjectListOwnerHintZeroContextAcceptedCount =
+      g_worldObjectListOwnerHintZeroContextAcceptedCount.load(
+          std::memory_order_relaxed);
+  summary.worldObjectListAcceptedIdentityCount =
+      g_worldObjectListAcceptedIdentityCount.load(std::memory_order_relaxed);
+  summary.lastWorldObjectListEntryWorldObjectEntryPtr =
+      g_lastWorldObjectListEntryWorldObjectEntryPtr.load(
+          std::memory_order_relaxed);
+  summary.lastWorldObjectListEntryOwnerHintValue =
+      g_lastWorldObjectListEntryOwnerHintValue.load(
+          std::memory_order_relaxed);
+  summary.lastWorldObjectListEntrySceneNodePtr =
+      g_lastWorldObjectListEntrySceneNodePtr.load(std::memory_order_relaxed);
+  return summary;
+}
+
 } // namespace render
 } // namespace war3
 } // namespace dxvk

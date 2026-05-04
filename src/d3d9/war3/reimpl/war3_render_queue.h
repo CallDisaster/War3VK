@@ -6,15 +6,19 @@
 
 #include "../../d3d9_shader.h"
 #include "../../d3d9_war3_debug.h"
+#include "../core/war3_game_structs.h"
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_memory.h"              // For IsReadableRange
 #include "../render/war3_render_exec_batch.h" // For ExecBatchContext
+#include "../render/war3_render_objects.h"
 #include "../render/war3_render_state.h"      // For War3BatchTag
+#include "../render/war3_visible_renderables.h"
 #include "../tools/war3_perf_monitor.h"       // For cpuScope
 #include "war3_batch_merger.h"
 #include "war3_instance_buffer.h"
 #include "war3_render_types.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <functional> // For std::function
@@ -74,6 +78,296 @@ MakeQueueCpuScope(const char *name) {
     return war3::War3PerfMonitor::instance().cpuScope(name);
   }
   return {};
+}
+
+static inline void LogSemanticDispatchSkip(
+    const char *reason, const RenderBatchElement *batch, void *sceneNode,
+    void *meshData, const dxvk::war3::render::VisibleRenderableRecord *visible,
+    uint32_t meshIndex, uint32_t layerCount) {
+  if constexpr (!dxvk::war3::internal::kShadowSemanticDispatchContractProbeEnabled)
+    return;
+
+  static std::atomic<uint32_t> s_skipLogCount{0};
+  const uint32_t logIndex =
+      s_skipLogCount.fetch_add(1u, std::memory_order_relaxed);
+  if (!(logIndex < 96u || (logIndex % 2048u) == 0u))
+    return;
+
+  dxvk::war3::render::VisibleRenderableRecord empty = {};
+  const auto &record = visible != nullptr ? *visible : empty;
+  dxvk::war3dbg::Print(
+      "DXVK SemanticDispatchSkip: reason=%s part=%p scene=%p mesh=%p "
+      "layer=%u sub=%u state=%p visKind=%u queue=%u runtime=%p model=%p "
+      "meshIdx=%u visLayer=%u layerCount=%u handle=0x%08X raw=0x%08X\n",
+      reason, batch != nullptr ? batch->renderablePart : nullptr, sceneNode,
+      meshData, batch != nullptr ? batch->layerIndex : 0u,
+      batch != nullptr ? batch->subIndex : 0u,
+      batch != nullptr ? batch->layerStatePtr : nullptr,
+      uint32_t(record.identity.kind), uint32_t(record.queueKind),
+      record.runtimeModelPtr, record.modelResourcePtr, meshIndex,
+      record.layerIndex, layerCount, record.identity.jHandle,
+      record.identity.rawcode);
+}
+
+static inline void MaybeLogSemanticDispatchContract(
+    const RenderBatchElement *batch, void *sceneNode, void *meshData) {
+  if constexpr (!dxvk::war3::internal::kShadowSemanticDispatchContractProbeEnabled)
+    return;
+
+  if (batch == nullptr || batch->renderablePart == nullptr || sceneNode == nullptr ||
+      meshData == nullptr) {
+    LogSemanticDispatchSkip("null-args", batch, sceneNode, meshData, nullptr,
+                            dxvk::war3::render::kInvalidVisibleMeshIndex, 0u);
+    return;
+  }
+
+  dxvk::war3::render::VisibleRenderableRecord visible = {};
+  if (!dxvk::war3::render::VisibleRenderableRegistry::instance()
+           .queryByRenderablePart(batch->renderablePart, visible)) {
+    LogSemanticDispatchSkip("registry-miss", batch, sceneNode, meshData, nullptr,
+                            dxvk::war3::render::kInvalidVisibleMeshIndex, 0u);
+    return;
+  }
+
+  if (visible.runtimeModelPtr == nullptr) {
+    LogSemanticDispatchSkip("no-runtime-model", batch, sceneNode, meshData,
+                            &visible, visible.meshIndex, 0u);
+    return;
+  }
+
+  if (visible.identity.kind != dxvk::war3::render::ObjectKind::Unit &&
+      visible.identity.kind != dxvk::war3::render::ObjectKind::Unknown) {
+    LogSemanticDispatchSkip("non-unit-kind", batch, sceneNode, meshData,
+                            &visible, visible.meshIndex, 0u);
+    return;
+  }
+
+  if (visible.queueKind !=
+      dxvk::war3::render::VisibleRenderableQueueKind::MainQueue) {
+    LogSemanticDispatchSkip("non-main-queue", batch, sceneNode, meshData,
+                            &visible, visible.meshIndex, 0u);
+    return;
+  }
+
+  uint32_t meshIndex = visible.meshIndex;
+  if (meshIndex == dxvk::war3::render::kInvalidVisibleMeshIndex &&
+      !dxvk::war3::SafeReadU32Fast(meshData, dxvk::war3::MeshDataOffsets::MeshIndex,
+                                   meshIndex)) {
+    LogSemanticDispatchSkip("mesh-index-miss", batch, sceneNode, meshData,
+                            &visible, meshIndex, 0u);
+    return;
+  }
+
+  void *meshInfoTable = nullptr;
+  if (meshIndex == dxvk::war3::render::kInvalidVisibleMeshIndex ||
+      meshIndex > 4096u ||
+      !dxvk::war3::SafeReadPtrFast(sceneNode,
+                                   dxvk::war3::SceneNodeOffsets::MeshInfoTable,
+                                   meshInfoTable) ||
+      meshInfoTable == nullptr ||
+      !dxvk::war3::IsReadableRange(meshInfoTable,
+                                   (size_t(meshIndex) + 1u) * sizeof(void *))) {
+    LogSemanticDispatchSkip("mesh-info-table", batch, sceneNode, meshData,
+                            &visible, meshIndex, 0u);
+    return;
+  }
+
+  void *meshInfo = nullptr;
+  std::memcpy(&meshInfo,
+              reinterpret_cast<const uint8_t *>(meshInfoTable) +
+                  size_t(meshIndex) * sizeof(void *),
+              sizeof(meshInfo));
+  if (meshInfo == nullptr) {
+    LogSemanticDispatchSkip("mesh-info-null", batch, sceneNode, meshData,
+                            &visible, meshIndex, 0u);
+    return;
+  }
+
+  uint32_t layerCount = 0u;
+  void *layerStates = nullptr;
+  void *layerInfo = nullptr;
+  if (!dxvk::war3::SafeReadU32Fast(meshInfo, dxvk::war3::MeshInfoOffsets::LayerCount,
+                                   layerCount) ||
+      batch->layerIndex >= layerCount ||
+      !dxvk::war3::SafeReadPtrFast(meshInfo,
+                                   dxvk::war3::MeshInfoOffsets::LayerStates,
+                                   layerStates) ||
+      layerStates == nullptr ||
+      !dxvk::war3::SafeReadPtrFast(meshInfo, dxvk::war3::MeshInfoOffsets::LayerInfo,
+                                   layerInfo) ||
+      layerInfo == nullptr) {
+    LogSemanticDispatchSkip("layer-contract", batch, sceneNode, meshData,
+                            &visible, meshIndex, layerCount);
+    return;
+  }
+
+  void *layerRecords = nullptr;
+  if (!dxvk::war3::SafeReadPtrFast(layerInfo,
+                                   dxvk::war3::LayerInfoOffsets::LayerRecords,
+                                   layerRecords) ||
+      layerRecords == nullptr) {
+    LogSemanticDispatchSkip("layer-records", batch, sceneNode, meshData,
+                            &visible, meshIndex, layerCount);
+    return;
+  }
+
+  const auto *canonicalRecordPtr =
+      reinterpret_cast<const uint8_t *>(layerStates) +
+      size_t(batch->layerIndex) * 0x24u;
+  const auto *canonicalViewPtr =
+      canonicalRecordPtr != nullptr ? canonicalRecordPtr + 4u : nullptr;
+  const auto *dispatchPtr =
+      reinterpret_cast<const uint8_t *>(layerRecords) +
+      size_t(batch->layerIndex) * 0x2Cu;
+  if (!dxvk::war3::IsReadableRange(canonicalRecordPtr, 0x24u) ||
+      !dxvk::war3::IsReadableRange(dispatchPtr, 0x2Cu)) {
+    LogSemanticDispatchSkip("layer-range", batch, sceneNode, meshData, &visible,
+                            meshIndex, layerCount);
+    return;
+  }
+
+  uint32_t primaryBinding = 0u;
+  uint32_t blendOrDrawMode = 0u;
+  uint32_t auxEnable0 = 0u;
+  uint32_t auxEnable1 = 0u;
+  dxvk::war3::SafeReadU32Fast(
+      canonicalRecordPtr,
+      dxvk::war3::MeshLayerStateRecordOffsets::PrimaryResourceBinding,
+      primaryBinding);
+  dxvk::war3::SafeReadU32Fast(
+      canonicalRecordPtr, dxvk::war3::MeshLayerStateRecordOffsets::BlendOrDrawMode,
+      blendOrDrawMode);
+  dxvk::war3::SafeReadU32Fast(
+      canonicalRecordPtr, dxvk::war3::MeshLayerStateRecordOffsets::AuxRefEnable0,
+      auxEnable0);
+  dxvk::war3::SafeReadU32Fast(
+      canonicalRecordPtr, dxvk::war3::MeshLayerStateRecordOffsets::AuxRefEnable1,
+      auxEnable1);
+
+  uint32_t auxRefIndex0 = 0u;
+  uint32_t auxRefIndex1 = 0u;
+  uint32_t stageMode0 = 0u;
+  uint32_t stageMode1 = 0u;
+  dxvk::war3::SafeReadU32Fast(dispatchPtr,
+                              dxvk::war3::MeshLayerDispatchRecordOffsets::AuxRefIndex0,
+                              auxRefIndex0);
+  dxvk::war3::SafeReadU32Fast(dispatchPtr,
+                              dxvk::war3::MeshLayerDispatchRecordOffsets::AuxRefIndex1,
+                              auxRefIndex1);
+  dxvk::war3::SafeReadU32Fast(dispatchPtr,
+                              dxvk::war3::MeshLayerDispatchRecordOffsets::StageMode0,
+                              stageMode0);
+  dxvk::war3::SafeReadU32Fast(dispatchPtr,
+                              dxvk::war3::MeshLayerDispatchRecordOffsets::StageMode1,
+                              stageMode1);
+
+  void *auxTable = nullptr;
+  dxvk::war3::SafeReadPtrFast(meshData,
+                              dxvk::war3::MeshDataOffsets::AuxLayerResourceTable,
+                              auxTable);
+
+  const uint8_t *auxEntryPtr0 = nullptr;
+  const uint8_t *auxEntryPtr1 = nullptr;
+  uint32_t auxEntry0Word0 = 0u;
+  uint32_t auxEntry0Binding = 0u;
+  uint32_t auxEntry1Word0 = 0u;
+  uint32_t auxEntry1Binding = 0u;
+  auto readAuxEntry = [&](uint32_t auxIndex, const uint8_t *&outEntryPtr,
+                          uint32_t &outWord0, uint32_t &outBinding) {
+    outEntryPtr = nullptr;
+    outWord0 = 0u;
+    outBinding = 0u;
+    if (auxTable == nullptr || auxIndex > 2048u)
+      return;
+
+    outEntryPtr = reinterpret_cast<const uint8_t *>(auxTable) +
+                  size_t(auxIndex) * 0x2Cu;
+    if (!dxvk::war3::IsReadableRange(outEntryPtr, 0x2Cu)) {
+      outEntryPtr = nullptr;
+      return;
+    }
+
+    dxvk::war3::SafeReadU32Fast(outEntryPtr, 0x00u, outWord0);
+    dxvk::war3::SafeReadU32Fast(
+        outEntryPtr, dxvk::war3::MeshAuxResourceEntryOffsets::ResourceBinding,
+        outBinding);
+  };
+  if (auxEnable0 != 0u)
+    readAuxEntry(auxRefIndex0, auxEntryPtr0, auxEntry0Word0, auxEntry0Binding);
+  if (auxEnable1 != 0u)
+    readAuxEntry(auxRefIndex1, auxEntryPtr1, auxEntry1Word0, auxEntry1Binding);
+
+  void *primaryStreamPtr = nullptr;
+  void *stream1Ptr = nullptr;
+  uint32_t primaryStride = 0u;
+  uint32_t primaryArg0 = 0u;
+  uint32_t stream1Stride = 0u;
+  dxvk::war3::SafeReadPtrFast(meshData,
+                              dxvk::war3::MeshDataOffsets::PrimaryStreamPtr,
+                              primaryStreamPtr);
+  dxvk::war3::SafeReadPtrFast(meshData, dxvk::war3::MeshDataOffsets::Stream1Ptr,
+                              stream1Ptr);
+  dxvk::war3::SafeReadU32Fast(meshData,
+                              dxvk::war3::MeshDataOffsets::PrimaryStreamStride,
+                              primaryStride);
+  dxvk::war3::SafeReadU32Fast(meshData,
+                              dxvk::war3::MeshDataOffsets::PrimaryStreamArg0,
+                              primaryArg0);
+  dxvk::war3::SafeReadU32Fast(meshData, dxvk::war3::MeshDataOffsets::Stream1Stride,
+                              stream1Stride);
+
+  uint32_t batchStateWords[5] = {};
+  if (batch->layerStatePtr != nullptr &&
+      dxvk::war3::IsReadableRange(batch->layerStatePtr, sizeof(batchStateWords))) {
+    std::memcpy(batchStateWords, batch->layerStatePtr, sizeof(batchStateWords));
+  }
+
+  uint32_t canonicalRecordWords[9] = {};
+  std::memcpy(canonicalRecordWords, canonicalRecordPtr, sizeof(canonicalRecordWords));
+
+  static std::atomic<uint32_t> s_probeLogCount{0};
+  const uint32_t logIndex =
+      s_probeLogCount.fetch_add(1u, std::memory_order_relaxed);
+  if (!(logIndex < 48u || (logIndex % 2048u) == 0u))
+    return;
+
+  const long long deltaToRecord =
+      batch->layerStatePtr != nullptr
+          ? static_cast<long long>(
+                reinterpret_cast<const uint8_t *>(batch->layerStatePtr) -
+                canonicalRecordPtr)
+          : 0ll;
+  const long long deltaToView =
+      batch->layerStatePtr != nullptr
+          ? static_cast<long long>(
+                reinterpret_cast<const uint8_t *>(batch->layerStatePtr) -
+                canonicalViewPtr)
+          : 0ll;
+
+  dxvk::war3dbg::Print(
+      "DXVK SemanticDispatchProbe: part=%p scene=%p mesh=%p runtime=%p "
+      "model=%p kind=%u meshIdx=%u layer=%u visLayer=%u "
+      "batchState=%p canon=%p view=%p dRec=%lld dView=%lld "
+      "primary=%p/%u/%u stream1=%p/%u dispatch=%p "
+      "bind[p=%u mode=%u stage=%u/%u a0=%u/%u/%p/%u/%u "
+      "a1=%u/%u/%p/%u/%u] "
+      "batchRaw=%08X/%08X/%08X/%08X/%08X "
+      "canonRaw=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X "
+      "handle=0x%08X raw=0x%08X\n",
+      batch->renderablePart, sceneNode, meshData, visible.runtimeModelPtr,
+      visible.modelResourcePtr, uint32_t(visible.identity.kind), meshIndex,
+      batch->layerIndex, visible.layerIndex, batch->layerStatePtr,
+      canonicalRecordPtr, canonicalViewPtr, deltaToRecord, deltaToView,
+      primaryStreamPtr, primaryStride, primaryArg0, stream1Ptr, stream1Stride,
+      dispatchPtr, primaryBinding, blendOrDrawMode, stageMode0, stageMode1,
+      auxEnable0, auxRefIndex0, auxEntryPtr0, auxEntry0Word0, auxEntry0Binding,
+      auxEnable1, auxRefIndex1, auxEntryPtr1, auxEntry1Word0, auxEntry1Binding,
+      batchStateWords[0], batchStateWords[1], batchStateWords[2],
+      batchStateWords[3], batchStateWords[4], canonicalRecordWords[0],
+      canonicalRecordWords[1], canonicalRecordWords[2], canonicalRecordWords[3],
+      canonicalRecordWords[4], canonicalRecordWords[5], canonicalRecordWords[6],
+      canonicalRecordWords[7], canonicalRecordWords[8], visible.identity.jHandle,
+      visible.identity.rawcode);
 }
 
 // ============================================================================
@@ -1144,6 +1438,8 @@ public:
         if constexpr (kDiagStatsEnabled)
           statsContextMerges++;
       }
+
+      MaybeLogSemanticDispatchContract(batch, sceneNode, meshData);
 
       if (isSpecial) {
         dispatchSpecial(

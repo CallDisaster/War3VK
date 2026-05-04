@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -40,6 +41,29 @@ namespace dxvk::war3::hooks {
 // - FlushAndReset：帧尾收口、可选空队列跳过、状态复位；
 // - GetD3d9Parameters：覆盖 PresentInterval 以解除帧率限制。
 // ---------------------------------------------------------------------------
+
+static bool EnvFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (!value || !*value)
+    return false;
+  if (value[0] == '0')
+    return false;
+  if ((value[0] == 'f' || value[0] == 'F') &&
+      (value[1] == 'a' || value[1] == 'A'))
+    return false;
+  if ((value[0] == 'n' || value[0] == 'N') &&
+      (value[1] == 'o' || value[1] == 'O'))
+    return false;
+  return true;
+}
+
+static bool ShouldBlockGamePauseForAutoTest() {
+  if constexpr (dxvk::war3::internal::kAutoTestDisableGamePause)
+    return true;
+  static const bool s_runtimeEnabled =
+      EnvFlagEnabled("DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE");
+  return s_runtimeEnabled;
+}
 
 using MainRunnerFn = int(__fastcall *)(void *, void *);
 using MainRunnerAltFn = int(__fastcall *)(void *, void *);
@@ -2553,11 +2577,9 @@ void __fastcall Hook_EngineSleepGateInner(uint32_t *thisPtr, void *edx,
 void __fastcall Hook_GamePause(void *gameUi, void *edx, BOOL isPause,
                                uint32_t a2, uint32_t a3, uint32_t a4,
                                uint32_t a5) {
-  if constexpr (dxvk::war3::internal::kAutoTestDisableGamePause) {
-    if (isPause) {
-      Logger::info("DXVK War3Hook[Lifecycle]: blocked GamePause request");
-      return;
-    }
+  if (ShouldBlockGamePauseForAutoTest() && isPause) {
+    Logger::info("DXVK War3Hook[Lifecycle]: blocked GamePause request");
+    return;
   }
 
   if (g_trampolineGamePause) {
@@ -2809,11 +2831,9 @@ void War3HookLifecycle::Install(uintptr_t gameBase) {
                    reinterpret_cast<LPVOID *>(&g_trampolineEngineSleepGateInner),
                    "Lifecycle", "EngineSleepGateInner", false, false);
   }
-  if constexpr (dxvk::war3::internal::kAutoTestDisableGamePause) {
-    InstallMinHook(gamePauseAddr, reinterpret_cast<LPVOID>(&Hook_GamePause),
-                   reinterpret_cast<LPVOID *>(&g_trampolineGamePause),
-                   "Lifecycle", "GamePause", false, false);
-  }
+  InstallMinHook(gamePauseAddr, reinterpret_cast<LPVOID>(&Hook_GamePause),
+                 reinterpret_cast<LPVOID *>(&g_trampolineGamePause),
+                 "Lifecycle", "GamePause", false, false);
   InstallMinHook(flushResetAddr, reinterpret_cast<LPVOID>(&Hook_FlushAndReset),
                  reinterpret_cast<LPVOID *>(&g_trampolineFlushAndReset),
                  "Lifecycle", "FlushAndReset", false, false);

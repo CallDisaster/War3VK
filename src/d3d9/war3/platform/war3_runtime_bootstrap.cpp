@@ -4,6 +4,8 @@
 
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_net_event_hook.h"
+#include "../core/war3_runtime_profile.h"
+#include "../core/war3_semantic_shadow_gate.h"
 #include "../memory/war3_shadow_arena.h"
 #include "../memory/war3_storm_hook.h"
 #include "../memory/war3_tlsf_pool.h"
@@ -12,11 +14,40 @@
 #include "../render/war3_render_queue_tracker.h"
 #include "../render/war3_renderer.h"
 #include "../render/war3_shadow_runtime_bridge.h"
+#include "../shadow/war3_shadow_native_runtime.h"
+#include "../shadow/war3_shadow_renderer_core.h"
+#include "../shadow/war3_shadow_runtime_contract.h"
 #include "../shader/war3_shader_manager.h"
 #include "../state/war3_render_state.h"
+#include "../tools/war3_control_plane.h"
 #include "../war3.h"
 
 namespace dxvk::war3::platform {
+
+namespace {
+
+void AdvanceSmallSemanticBuilds(
+    dxvk::war3::shadow::ShadowValidationRuntime& validationRuntime,
+    uint32_t maxExtraBuildPasses) {
+  validationRuntime.requestLatestFrameBuild();
+  validationRuntime.ensureLatestFrameBuilt();
+
+  // Stage-aware native validation must catch the small supplemented unit frame
+  // in the same render tick. Keep this bounded so a large diagnostic build does
+  // not turn into a frame-time spike.
+  constexpr uint64_t kSmallBuildRecordCeiling = 2048u;
+  for (uint32_t i = 0u; i < maxExtraBuildPasses; ++i) {
+    const auto buildState = validationRuntime.buildStateSnapshot();
+    if (!buildState.buildInProgress && !buildState.buildRequestPending)
+      break;
+    if (buildState.buildInProgress && buildState.buildRecordCount != 0u &&
+        buildState.buildRecordCount > kSmallBuildRecordCeiling)
+      break;
+    validationRuntime.ensureLatestFrameBuilt();
+  }
+}
+
+} // namespace
 
 void InitializeRuntimeCore(uintptr_t gameBase) {
   if (gameBase != 0) {
@@ -27,6 +58,7 @@ void InitializeRuntimeCore(uintptr_t gameBase) {
   }
 
   dxvk::war3::NetEventHook::get().init();
+  dxvk::war3::tools::InitializeWar3ControlPlane();
 
   if constexpr (dxvk::war3::internal::kWar3StormBreakerEnabled) {
     if (!dxvk::war3::memory::TlsfPool_IsInitialized()) {
@@ -68,6 +100,8 @@ void ResetRuntimeCore() {
 
   dxvk::war3::model::Shutdown();
   dxvk::war3::render::ResetShadowRuntimeBridgeState();
+  dxvk::war3::shadow::ShadowValidationRuntime::instance().reset();
+  dxvk::war3::tools::ResetWar3ControlPlaneState();
   dxvk::war3::render::War3Renderer::instance().EndFrame();
   dxvk::war3::render::War3Renderer::instance().BeginFrame();
   dxvk::war3::memory::ShadowArena_Reset();
@@ -76,6 +110,51 @@ void ResetRuntimeCore() {
   dxvk::war3::state::RenderState::instance().setIsLoading(false);
 
   dxvk::war3::NetEventHook::get().cleanup();
+}
+
+void BindNativeShadowDevice(IDirect3DDevice9* device) {
+  dxvk::war3::shadow::NativeD3D9BackendRuntime::instance().setDevice(device);
+}
+
+bool DriveNativeShadowBackend(bool captureLiveState,
+                              uint32_t maxExtraBuildPasses) {
+  if (!dxvk::war3::internal::
+          IsNativeRendererHostExecuteValidationRuntimeEnabled())
+    return false;
+  if (!dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
+          dxvk::war3::runtime::War3RuntimeModule::SemanticData))
+    return false;
+  if (!dxvk::war3::internal::kWar3RuntimeConfigSemanticConsumerEffective)
+    return false;
+
+  if constexpr (dxvk::war3::internal::
+                    kNativeSemanticShadowWorldStageValidationEnabled) {
+    if (!dxvk::war3::internal::
+            IsNativeSemanticShadowWorldStageValidationRuntimeEnabled())
+      return false;
+
+    auto& validationRuntime =
+        dxvk::war3::shadow::ShadowValidationRuntime::instance();
+    if (captureLiveState) {
+      dxvk::war3::render::War3Renderer::instance()
+          .PublishSemanticRegistriesForScene();
+      dxvk::war3::shadow::ShadowRuntimeContractCache::instance()
+          .captureLiveState();
+    }
+    AdvanceSmallSemanticBuilds(validationRuntime, maxExtraBuildPasses);
+  }
+
+  return dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
+      .buildLatestFrame();
+}
+
+bool ExecuteNativeShadowBackendPreparedFrame() {
+  if (!dxvk::war3::internal::
+          IsNativeRendererHostExecuteValidationRuntimeEnabled())
+    return false;
+
+  return dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
+      .executePreparedFrame();
 }
 
 } // namespace dxvk::war3::platform

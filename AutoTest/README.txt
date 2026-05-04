@@ -78,15 +78,18 @@ War3 AutoTest MCP（自动化测试服务）
    - AutoTest 通过 `launch_war3_test` 写入的注册表基线，会在 `stop_war3` 成功结束后自动恢复到 launch 前快照，避免把用户长期锁在测试分辨率。
 
 3) 进入游戏判定
-   - 优先读取项目侧状态文件:
-     WarVK/Temp/runtime_status.json
-     （字段: runtime.runtimeReady / runtime.gameStarted）
-   - `wait_for_game_ready` 现在要求 `runtime.runtimeReady=true` 才会直接按状态文件判成功；
-     单独的 `gameStarted=true` 不再被当成 ready，避免窗口化场景下“刚启动就误判进图”。
-   - 先命中: DXVK War3Hook: JASS runtime fully initialized
-   - 再命中: DXVK War3Shadow: Run frame=... 或 DXVK War3StageSig: stage=19
-   - 若 DBWIN 被占用导致抓不到 DebugString，则自动退化为
-   “窗口存在 + 进程 CPU 累计时间”判定。
+   - `wait_for_game_ready` 默认优先走 DLL named pipe control plane 的
+     `wait_until`。
+   - ready 条件固定为:
+     - `module.state == Running`
+     - `runtime.jassReady == true`
+     - `runtime.runtimeReady == true`
+     - `runtime.gameStarted == true`
+     - `render.inGameRenderReady == true`
+   - `WarVK/Temp/runtime_status.json` 仅保留为兼容/离线诊断 fallback；
+     只有 pipe 不可用时才会退回文件/DBWIN 路径。
+   - 若 DBWIN 被占用导致抓不到 DebugString，则最后才退化为
+     “窗口存在 + 进程 CPU 累计时间”判定。
 
 3.5) 窗口化回归工具（新增）
    - `query_war3_window`
@@ -102,12 +105,11 @@ War3 AutoTest MCP（自动化测试服务）
      - 默认 `enforce_video_baseline=false`，避免窗口化崩溃测试污染用户当前分辨率设置。
 
 3.6) 内部最终帧截图（新增）
-   - `capture_war3_screenshot` 现在优先走项目内握手：
-     - MCP 写入 `WarVK/Temp/frame_capture_request.json`
+   - `capture_war3_screenshot` 现在优先走 named pipe control plane：
+     - MCP 调用 `capture_final_frame`
      - DXVK 在 `Present` 尾部、真正上屏前读取 backbuffer，导出 BMP
-     - 结果写回 `WarVK/Temp/frame_capture_result.json`
    - MCP 收到 BMP 后会自动转成 PNG 返回，便于后续尺寸校验和图片查看。
-   - 只有当内部截图超时/失败时，才会回退到旧的窗口抓图路径。
+   - 只有当 control plane 截图超时/失败时，才会回退到旧的窗口抓图路径。
 
 4) 定时性能测试（新增）
    - `start_periodic_perf_test`：后台定时执行多轮回归（不阻塞会话）
@@ -137,6 +139,26 @@ War3 AutoTest MCP（自动化测试服务）
      - `full_default`
      - `full_analysis`
      - `full_perf_experimental`
+   - 可手动禁用模块：
+     - 渲染层总开关别名：`render`
+       - 等价于关闭 `hook.render,render.queue,shadow.capture,shadow.map,shadow.receiver,shadow.taa,postfx,ssao,aa`
+     - 阴影层总开关别名：`shadow`
+       - 等价于关闭 `shadow.capture,shadow.map,shadow.receiver,shadow.taa`
+     - 上层语义数据链：`semantic.data`
+       - 关闭模型/pose/manifest/semantic contract 采集与消费热路径
+   - 建议排查顺序：
+     - `DXVK_WAR3_PROFILE=dxvk_only`
+       - 纯 DXVK 基线，确认地图/JASS 本身是否慢。
+     - `DXVK_WAR3_PROFILE=full_default` + `DXVK_WAR3_DISABLE=render,semantic.data`
+       - 保留非渲染 hook/control-plane，关闭渲染干涉与上层语义数据。
+     - `DXVK_WAR3_PROFILE=full_default` + `DXVK_WAR3_DISABLE=render`
+       - 只关闭渲染干涉，单独观察上层语义数据链开销。
+     - `DXVK_WAR3_PROFILE=full_default` + `DXVK_WAR3_DISABLE=shadow`
+       - 关闭 shadow capture/map/receiver，但保留 postfx/AA/SSAO。
+     - `DXVK_WAR3_PROFILE=full_default` + `DXVK_WAR3_DISABLE=semantic.data`
+       - 保留渲染层，单独关闭上层语义数据链。
+     - `DXVK_WAR3_PROFILE=full_default`
+       - 全量默认路径，用于和上述结果对比。
    - `run_profile_matrix`
      - 自动执行“加法矩阵 + 减法矩阵”
      - 输出统一 `profile_matrix.json` / `profile_matrix.html`
@@ -192,9 +214,10 @@ War3 AutoTest MCP（自动化测试服务）
    - 这些预设会把场景名写入 `DXVK_WAR3_SCENARIO`，并在报告 JSON 中保留 `scenarioName`。
 
 4.10) 内部测试控制层 / City 专项稳定性套件（新增）
-   - 运行时新增内部测试握手：
-     - 请求：`WarVK/Temp/internal_test_request.json`
-     - 结果：`WarVK/Temp/internal_test_result.json`
+   - 外部测试命令现统一走 DLL named pipe control plane：
+     - `invoke_test_command`
+     - `capture_final_frame`
+     - `shutdown_session`
    - 当前高层命令：
      - `visibility.full_map`
      - `camera.snapshot`
@@ -210,10 +233,9 @@ War3 AutoTest MCP（自动化测试服务）
      - `compare_frame_sequence`
      - `run_city_shadow_stability_suite`
      - `run_city_shadow_pressure_suite`
-   - 安全门控：
-     - 仅在 `DXVK_WAR3_PROFILE=full_analysis/full_perf_experimental`
-     - 且 `DXVK_WAR3_INTERNAL_TEST_API=1`
-     时游戏侧才会响应该控制层。
+   - 仓库内仍保留 legacy JSON 路径名用于清理旧工件/离线诊断；
+     但主动控制链不再写入 `internal_test_request.json` /
+     `internal_test_result.json`。
    - 当前控制层烟测结论：
      - 小测试图已完成 `3` 轮 smoke
      - `launch / ready / camera.snapshot / ShadowFactor 3 帧序列比较 / silent stop` 全通过

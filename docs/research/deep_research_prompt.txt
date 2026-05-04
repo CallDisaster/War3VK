@@ -1,0 +1,92 @@
+# ChatGPT Deep Research 提示词
+# 请将此提示词和 docs/research/war3_render_pipeline_deep_research.txt 一起提交
+
+================================================================================
+研究课题：魔兽争霸3 1.27a 完整渲染管线逆向校验与动态阴影方案设计
+================================================================================
+
+## 背景
+
+我们正在为魔兽争霸3 1.27a 开发一个高质量动态阴影 Mod。项目使用 DXVK 将 D3D9 翻译为 Vulkan，
+并在引擎内部安装 MinHook 来劫持渲染管线。我们已经有大量逆向成果（IDA Pro 反编译 + 运行时
+Hook 验证），但仍有一些关键字段和函数语义未确认。
+
+随附文件 `war3_render_pipeline_deep_research.txt` 包含：
+- 100+ 个渲染管线函数的地址和调用关系图
+- 10+ 个关键结构体的偏移和字段推测
+- CGeosetData_BuildGroupBlendedPalette（调色板混合）的完整反编译
+- RenderQueue_AllocPaletteSlot（槽位分配器）的完整反编译
+- CModel_AllocAndFillGroupPalette（调色板填充）的完整反编译
+- CPU 蒙皮完整数据流描述
+- 7 个明确的研究任务
+
+## 你的任务
+
+请完成随附文件第十部分中列出的所有 7 个研究任务，特别关注：
+
+1. **结构体字段校验** — 逐个验证标记为 [待验证] 和 [未知] 的字段
+2. **CPU蒙皮完整逆向** — 确认从动画计算到顶点变换的每一个环节
+3. **飞行单位路径** — CSpriteMini 的渲染调用链
+4. **技术方案** — 提出一个可行的动态阴影架构
+
+## 输出格式
+
+请按照以下结构组织你的研究结果：
+
+### A. 字段校验结果
+对每个被标记的字段，给出：字段名、偏移、确认后的语义、验证方法（通过哪个函数的读写可以确认）
+
+### B. 函数链修正
+如果发现我们现有函数语义有误，请逐个指出并给出正确语义
+
+### C. 未知函数发现
+如果我们遗漏了重要的渲染管线函数，请补充
+
+### D. 技术方案
+对 7 个问题中列出的阴影同步问题，给出详细的技术方案，包括所需的 Hook 点、数据流、时序图
+
+### E. 开放问题
+列出即使经过深度研究后仍然无法确认的问题，供我们后续运行时验证
+
+================================================================================
+## 附：关键地址速查表
+
+Game.dll 基址下的 RVA:
+
+函数:
+  0x182300  CSpriteUber_PreRenderAndUpdatePosePalette  (vtable 虚函数)
+  0x1825E0  CSpriteMini_PreRender                       (vtable 虚函数)
+  0x12F0A0  CModel_SetWorldMatrixAndEvaluateRootPose
+  0x12E900  CModelComplex_EvaluatePoseAndVisibleParts
+  0x12FED0  CModel_AllocAndFillGroupPalette
+  0x12E600  CGeosetData_BuildGroupBlendedPalette
+  0x12E200  CMatrixGroup_BlendOutputMatrix
+  0x138FF0  RenderQueue_AllocPaletteSlot
+  0x139060  RenderQueue_GetPaletteSlotAddress
+  0x12FDC0  CModel_CopyResolvedPoseMatricesToOutputPalette
+  0x12A5C0  CModelData_PromoteToRuntimeModel
+  0x12A3C0  ModelHandle_TryResolveRuntimeModel
+  0x3681C0  CWorld_RenderScene
+  0x363020  CWorld_DispatchStage
+  0x368E30  CWorld_WorldObjects_RenderGroup
+  0x368480  CWorldFrameWar3_UpdateWorld
+  0x1375C0  RenderBatch_Submit
+  0x13A5E0  RenderQueue_Dispatch_Common
+  0x13A780  RenderQueue_Dispatch_Special
+  0x1380A0  RenderQueue_FlushSortedItems
+  0x126250  CGeoset_CreateFromRawArrays
+  0x131320  CModel_RemapVertexGroupIndicesForGeoset
+  0x0E3510  GetGameFrameCounter
+
+全局变量 (Game.dll RVA):
+  0xBC6BD0  dword_6FBC6BD0  全局调色板缓冲区指针
+  0xBEE648  dword_6FBEE648  全局矩阵池指针
+  0xBDA4C8  dword_6FBDA4C8  每帧偏移计数器
+  0xBDA4CC  dword_6FBDA4CC  帧标识
+  0xBC6BE4  dword_6FBC6BE4  bump 分配器光标
+  0xBC6BAC  rqNumOfElements  RenderQueue 元素计数
+
+VTable:
+  0x9647BC  CSpriteUber::vftable
+  0x9646F4  CSpriteMini::vftable
+  0x96173C  CModel::vftable

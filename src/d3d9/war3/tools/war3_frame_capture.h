@@ -20,6 +20,13 @@ struct War3FrameCaptureResult {
   std::string error;
 };
 
+bool SubmitFrameCaptureRequest(const std::string& requestId,
+                               const std::string& outputPath,
+                               uint32_t timeoutMs = 8000,
+                               War3FrameCaptureResult* outResult = nullptr);
+
+bool HasPendingFrameCaptureRequest();
+
 bool ProcessPendingFrameCapture(D3D9DeviceEx* device, D3D9Surface* sourceSurface,
                                 War3FrameCaptureResult* outResult = nullptr);
 

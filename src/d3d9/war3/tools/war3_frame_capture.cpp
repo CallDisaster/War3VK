@@ -9,8 +9,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <system_error>
 #include <vector>
@@ -20,6 +24,17 @@ namespace dxvk::war3::tools {
 namespace {
 
 using json = nlohmann::json;
+
+struct PendingFrameCaptureRequest {
+  std::string requestId;
+  std::string outputPath;
+  War3FrameCaptureResult result = {};
+  bool done = false;
+  std::condition_variable cv;
+};
+
+std::mutex s_pendingCaptureMutex;
+std::deque<std::shared_ptr<PendingFrameCaptureRequest>> s_pendingCaptureRequests;
 
 std::string FormatHresult(HRESULT hr) {
   std::ostringstream ss;
@@ -282,20 +297,98 @@ War3FrameCaptureResult LoadCaptureRequest(const std::string& requestPath,
   return result;
 }
 
+std::shared_ptr<PendingFrameCaptureRequest> PopPendingMemoryRequest() {
+  std::lock_guard<std::mutex> lock(s_pendingCaptureMutex);
+  if (s_pendingCaptureRequests.empty())
+    return nullptr;
+  auto request = s_pendingCaptureRequests.front();
+  s_pendingCaptureRequests.pop_front();
+  return request;
+}
+
+void CompletePendingMemoryRequest(
+    std::shared_ptr<PendingFrameCaptureRequest>& request,
+    const War3FrameCaptureResult& result) {
+  {
+    std::lock_guard<std::mutex> lock(s_pendingCaptureMutex);
+    request->result = result;
+    request->done = true;
+  }
+  request->cv.notify_all();
+}
+
 } // namespace
+
+bool SubmitFrameCaptureRequest(const std::string& requestId,
+                               const std::string& outputPath,
+                               uint32_t timeoutMs,
+                               War3FrameCaptureResult* outResult) {
+  auto request = std::make_shared<PendingFrameCaptureRequest>();
+  request->requestId = requestId.empty()
+                           ? ("frame_capture_" + std::to_string(GetEpochMs()))
+                           : requestId;
+  request->outputPath = outputPath;
+
+  {
+    std::lock_guard<std::mutex> lock(s_pendingCaptureMutex);
+    s_pendingCaptureRequests.push_back(request);
+  }
+
+  War3FrameCaptureResult result = {};
+  {
+    std::unique_lock<std::mutex> lock(s_pendingCaptureMutex);
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds((std::max)(uint32_t(1), timeoutMs));
+    request->cv.wait_until(lock, deadline, [&]() { return request->done; });
+    if (request->done) {
+      result = request->result;
+    } else {
+      auto it = std::find(s_pendingCaptureRequests.begin(),
+                          s_pendingCaptureRequests.end(), request);
+      if (it != s_pendingCaptureRequests.end())
+        s_pendingCaptureRequests.erase(it);
+      result.handled = true;
+      result.ok = false;
+      result.requestId = request->requestId;
+      result.outputPath = outputPath;
+      result.error = "frame capture request timed out";
+    }
+  }
+
+  if (outResult)
+    *outResult = result;
+  return result.ok;
+}
+
+bool HasPendingFrameCaptureRequest() {
+  {
+    std::lock_guard<std::mutex> lock(s_pendingCaptureMutex);
+    if (!s_pendingCaptureRequests.empty())
+      return true;
+  }
+
+  const std::string& requestPath = GetFrameCaptureRequestPath();
+  if (requestPath.empty())
+    return false;
+  return GetFileAttributesA(requestPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
 
 bool ProcessPendingFrameCapture(D3D9DeviceEx* device, D3D9Surface* sourceSurface,
                                 War3FrameCaptureResult* outResult) {
   War3FrameCaptureResult result = {};
+  auto memoryRequest = PopPendingMemoryRequest();
   const std::string& requestPath = GetFrameCaptureRequestPath();
-  if (requestPath.empty()) {
+  if (requestPath.empty() && memoryRequest == nullptr) {
     if (outResult)
       *outResult = result;
     return false;
   }
 
-  const DWORD attrs = GetFileAttributesA(requestPath.c_str());
-  if (attrs == INVALID_FILE_ATTRIBUTES) {
+  const DWORD attrs =
+      requestPath.empty() ? INVALID_FILE_ATTRIBUTES
+                          : GetFileAttributesA(requestPath.c_str());
+  if (memoryRequest == nullptr && attrs == INVALID_FILE_ATTRIBUTES) {
     if (outResult)
       *outResult = result;
     return false;
@@ -304,16 +397,24 @@ bool ProcessPendingFrameCapture(D3D9DeviceEx* device, D3D9Surface* sourceSurface
   result.handled = true;
 
   bool parseOk = false;
-  result = LoadCaptureRequest(requestPath, &parseOk);
-  result.handled = true;
+  if (memoryRequest != nullptr) {
+    result.requestId = memoryRequest->requestId;
+    result.outputPath = memoryRequest->outputPath;
+    parseOk = true;
+  } else {
+    result = LoadCaptureRequest(requestPath, &parseOk);
+    result.handled = true;
 
-  std::error_code ec;
-  std::filesystem::remove(requestPath, ec);
+    std::error_code ec;
+    std::filesystem::remove(requestPath, ec);
+  }
 
   if (!parseOk) {
     WriteCaptureResultJson(result);
     war3dbg::Print("DXVK War3Capture: request parse failed err=%s\n",
                    result.error.c_str());
+    if (memoryRequest != nullptr)
+      CompletePendingMemoryRequest(memoryRequest, result);
     if (outResult)
       *outResult = result;
     return true;
@@ -324,12 +425,15 @@ bool ProcessPendingFrameCapture(D3D9DeviceEx* device, D3D9Surface* sourceSurface
     WriteCaptureResultJson(result);
     war3dbg::Print("DXVK War3Capture: request=%s invalid outputPath\n",
                    result.requestId.c_str());
+    if (memoryRequest != nullptr)
+      CompletePendingMemoryRequest(memoryRequest, result);
     if (outResult)
       *outResult = result;
     return true;
   }
 
   std::filesystem::path outputPath(result.outputPath);
+  std::error_code ec;
   if (!outputPath.is_absolute())
     outputPath = std::filesystem::absolute(outputPath, ec);
 
@@ -343,6 +447,8 @@ bool ProcessPendingFrameCapture(D3D9DeviceEx* device, D3D9Surface* sourceSurface
     WriteCaptureResultJson(result);
     war3dbg::Print("DXVK War3Capture: request=%s unsupported ext=%s\n",
                    result.requestId.c_str(), outputPath.extension().string().c_str());
+    if (memoryRequest != nullptr)
+      CompletePendingMemoryRequest(memoryRequest, result);
     if (outResult)
       *outResult = result;
     return true;
@@ -352,6 +458,8 @@ bool ProcessPendingFrameCapture(D3D9DeviceEx* device, D3D9Surface* sourceSurface
   result.ok = CaptureSurfaceToBmp(device, sourceSurface, outputPath,
                                   &result.width, &result.height, &result.error);
   WriteCaptureResultJson(result);
+  if (memoryRequest != nullptr)
+    CompletePendingMemoryRequest(memoryRequest, result);
 
   if (result.ok) {
     war3dbg::Print(

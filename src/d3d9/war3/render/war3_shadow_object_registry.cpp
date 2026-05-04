@@ -11,6 +11,40 @@ namespace war3 {
 namespace render {
 
 namespace {
+bool LooksLikeRuntimeModelPtr(void* candidate) {
+  if (candidate == nullptr)
+    return false;
+
+  const uintptr_t candidateValue = reinterpret_cast<uintptr_t>(candidate);
+  if (candidateValue < 0x10000u)
+    return false;
+
+  void* ownedHandlePtr = nullptr;
+  uint32_t runtimeGeosetCount = 0u;
+  void* runtimeGeosets = nullptr;
+  uint32_t finalPoseMatrixCount = 0u;
+  void* finalPoseMatrixArray = nullptr;
+  const bool hasOwnedHandle =
+      SafeReadPtrFast(candidate, dxvk::war3::CModelOffsets::OwnedModelDataHandle,
+                      ownedHandlePtr) &&
+      ownedHandlePtr != nullptr;
+  const bool hasRuntimeGeosets =
+      SafeReadU32Fast(candidate, dxvk::war3::CModelOffsets::RuntimeGeosetCount,
+                      runtimeGeosetCount) &&
+      runtimeGeosetCount < 4096u &&
+      SafeReadPtrFast(candidate, dxvk::war3::CModelOffsets::RuntimeGeosets,
+                      runtimeGeosets) &&
+      runtimeGeosets != nullptr;
+  const bool hasFinalPoseArray =
+      SafeReadU32Fast(candidate, dxvk::war3::CModelOffsets::FinalPoseMatrixCount,
+                      finalPoseMatrixCount) &&
+      finalPoseMatrixCount <= 256u &&
+      SafeReadPtrFast(candidate, dxvk::war3::CModelOffsets::FinalPoseMatrixArray,
+                      finalPoseMatrixArray) &&
+      finalPoseMatrixArray != nullptr;
+  return hasOwnedHandle || hasRuntimeGeosets || hasFinalPoseArray;
+}
+
 void MergeShadowRecord(ShadowObjectRecord &dst,
                        const ShadowObjectRecord &src) {
   if (src.worldObjectEntry)
@@ -87,7 +121,10 @@ void* TryReadRuntimeModelFromSprite(void* spritePtr) {
   void* runtimeModelPtr = nullptr;
   if (!spritePtr)
     return nullptr;
-  SafeReadPtrFast(spritePtr, 0x20, runtimeModelPtr);
+  if (!SafeReadPtrFast(spritePtr, 0x20, runtimeModelPtr) ||
+      !LooksLikeRuntimeModelPtr(runtimeModelPtr)) {
+    return nullptr;
+  }
   return runtimeModelPtr;
 }
 } // namespace
@@ -108,6 +145,11 @@ void ShadowObjectRegistry::endFrame() {
 
 void ShadowObjectRegistry::storeRecord(const ShadowObjectRecord &record) {
   ShadowObjectRecord merged = {};
+  if (record.worldObjectEntry) {
+    auto it = m_byWorldObjectEntry.find(record.worldObjectEntry);
+    if (it != m_byWorldObjectEntry.end())
+      MergeShadowRecord(merged, it->second);
+  }
   if (record.sceneNode) {
     auto it = m_bySceneNode.find(record.sceneNode);
     if (it != m_bySceneNode.end())
@@ -135,6 +177,8 @@ void ShadowObjectRegistry::storeRecord(const ShadowObjectRecord &record) {
   }
   MergeShadowRecord(merged, record);
 
+  if (merged.worldObjectEntry)
+    m_byWorldObjectEntry[merged.worldObjectEntry] = merged;
   if (merged.sceneNode)
     m_bySceneNode[merged.sceneNode] = merged;
   if (merged.unitPtr)
@@ -152,8 +196,28 @@ void ShadowObjectRegistry::noteRenderObject(const RenderObjectInfo &info) {
       !info.hasValidHandle())
     return;
 
-  noteInstanceIdentity(info.worldObjectEntry, info.sceneNode, info.unitPtr,
-                       nullptr, info.jHandle, info.rawcode, info.kind);
+  std::lock_guard<std::mutex> lock(m_mutex);
+  noteInstanceIdentityLocked(info.worldObjectEntry, info.sceneNode, info.unitPtr,
+                             nullptr, info.jHandle, info.rawcode, info.kind);
+}
+
+void ShadowObjectRegistry::noteRenderObjectsBatch(
+    const std::vector<const RenderObjectInfo *> &infos) {
+  if (infos.empty())
+    return;
+
+  std::lock_guard<std::mutex> lock(m_mutex);
+  for (const auto *info : infos) {
+    if (info == nullptr)
+      continue;
+    if (!info->worldObjectEntry && !info->sceneNode && !info->unitPtr &&
+        !info->hasValidHandle()) {
+      continue;
+    }
+    noteInstanceIdentityLocked(info->worldObjectEntry, info->sceneNode,
+                               info->unitPtr, nullptr, info->jHandle,
+                               info->rawcode, info->kind);
+  }
 }
 
 void ShadowObjectRegistry::noteInstanceIdentity(void *worldObjectEntry,
@@ -163,32 +227,72 @@ void ShadowObjectRegistry::noteInstanceIdentity(void *worldObjectEntry,
                                                 uint32_t jHandle,
                                                 uint32_t rawcode,
                                                 ObjectKind kind) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  noteInstanceIdentityLocked(worldObjectEntry, sceneNode, unitPtr, spritePtr,
+                             jHandle, rawcode, kind);
+}
+
+void ShadowObjectRegistry::noteInstanceIdentityLocked(void *worldObjectEntry,
+                                                      void *sceneNode,
+                                                      void *unitPtr,
+                                                      void *spritePtr,
+                                                      uint32_t jHandle,
+                                                      uint32_t rawcode,
+                                                      ObjectKind kind) {
   if (!worldObjectEntry && !sceneNode && !unitPtr && !spritePtr &&
       jHandle == 0u && rawcode == 0u) {
     return;
   }
 
-  std::lock_guard<std::mutex> lock(m_mutex);
   ShadowObjectRecord record = {};
+  if (sceneNode) {
+    auto it = m_bySceneNode.find(sceneNode);
+    if (it != m_bySceneNode.end())
+      MergeShadowRecord(record, it->second);
+  }
+  if (unitPtr) {
+    auto it = m_byUnitPtr.find(unitPtr);
+    if (it != m_byUnitPtr.end())
+      MergeShadowRecord(record, it->second);
+  }
+  if (spritePtr) {
+    auto it = m_bySpritePtr.find(spritePtr);
+    if (it != m_bySpritePtr.end())
+      MergeShadowRecord(record, it->second);
+  }
+  if (jHandle != 0u) {
+    auto it = m_byHandle.find(jHandle);
+    if (it != m_byHandle.end())
+      MergeShadowRecord(record, it->second);
+  }
+
   record.worldObjectEntry = worldObjectEntry;
   record.sceneNode = sceneNode;
   record.unitPtr = unitPtr;
-  record.spritePtr = spritePtr;
-  if (record.unitPtr) {
+  if (spritePtr)
+    record.spritePtr = spritePtr;
+  if (record.unitPtr && record.spritePtr == nullptr) {
     game::UnitWrapper unit(record.unitPtr);
-    if (unit.IsValid() && record.spritePtr == nullptr)
+    if (unit.IsValid())
       record.spritePtr = unit.GetSprite();
   }
-  record.jHandle = jHandle;
-  record.rawcode = rawcode;
-  record.kind = kind;
+  if (jHandle != 0u)
+    record.jHandle = jHandle;
+  if (rawcode != 0u)
+    record.rawcode = rawcode;
+  if (kind != ObjectKind::Unknown)
+    record.kind = kind;
 
-  if (record.spritePtr) {
+  if (record.spritePtr && record.runtimeModelPtr == nullptr) {
     record.runtimeModelPtr = TryReadRuntimeModelFromSprite(record.spritePtr);
     if (record.runtimeModelPtr) {
       model::ModelRegistry::instance().recordRuntimeModelBinding(
           record.spritePtr, record.runtimeModelPtr, nullptr, 0u, 0u);
     }
+  }
+  if (record.spritePtr &&
+      (record.runtimeModelPtr == nullptr || record.modelKey == 0 ||
+       record.modelResourcePtr == nullptr || record.modelPath.empty())) {
     model::ModelResourceRecord modelRecord = {};
     if (model::ModelRegistry::instance().findBySprite(record.spritePtr,
                                                       modelRecord) ||
@@ -366,6 +470,18 @@ void ShadowObjectRegistry::noteSpriteFramePose(
     record.firstSeenFrame = m_frameNumber;
   record.lastSeenFrame = m_frameNumber;
   storeRecord(record);
+}
+
+bool ShadowObjectRegistry::findByWorldObjectEntry(void *worldObjectEntry,
+                                                  ShadowObjectRecord &out) const {
+  if (!worldObjectEntry)
+    return false;
+  std::lock_guard<std::mutex> lock(m_mutex);
+  auto it = m_byWorldObjectEntry.find(worldObjectEntry);
+  if (it == m_byWorldObjectEntry.end())
+    return false;
+  out = it->second;
+  return true;
 }
 
 bool ShadowObjectRegistry::findBySceneNode(void *sceneNode,

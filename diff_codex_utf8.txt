@@ -1,0 +1,1573 @@
+diff --git a/docs/war3_shader_docs/architecture.html b/docs/war3_shader_docs/architecture.html
+index e3f9c43..49f9705 100644
+--- a/docs/war3_shader_docs/architecture.html
++++ b/docs/war3_shader_docs/architecture.html
+@@ -306,7 +306,7 @@
+             <section class="panel active" data-section="overview">
+                 <h2>项目概览</h2>
+                 <p>War3MapReforge 基于 DXVK 的 D3D9→Vulkan 转译层，在不改动游戏资源的前提下，通过分域 Hook + 桥接链路插入阴影、描边、材质覆盖与后处理能力。</p>
+-                <p><strong>当前架构（2026-02-22）</strong> 已从“单入口大文件”升级为“薄中枢 + 分域模块”：<code>d3d9_war3_hook.cpp</code> 仅负责生命周期编排，渲染/JASS/生命周期/UI/Shadow 逻辑分别驻留在 <code>src/d3d9/war3/hooks/</code>。</p>
++                <p><strong>当前架构（2026-04-16）</strong> 已从“单入口大文件”升级为“薄中枢 + 分域模块 + 语义注册表”：<code>d3d9_war3_hook.cpp</code> 负责生命周期编排，Render 域主链则已显式接入 <code>CWorld_RenderScene</code> 与 <code>RenderBatch_Submit</code>，开始从上层语义直接记录最终可见 renderable。</p>
+ 
+                 <div class="grid">
+                     <div class="card">
+@@ -323,7 +323,7 @@
+                     </div>
+                     <div class="card">
+                         <strong>Bridge + Shader</strong>
+-                        <div><code>render/* + shader/*</code> 完成对象桥接、材质覆盖、统计与诊断。</div>
++                        <div><code>render/* + shader/*</code> 完成对象桥接、最终可见 renderable 注册、材质覆盖、统计与诊断。</div>
+                     </div>
+                 </div>
+ 
+@@ -349,12 +349,16 @@
+ 
+                     subgraph Runtime["运行时系统"]
+                     H --> K[RenderQueueTracker / ExecBatch]
++                    H --> K2[VisibleRenderableRegistry]
++                    H --> K3[War3RenderState(RenderScene 边界)]
+                     J --> L[ShadowCapture / Receiver]
+                     H --> M[ShaderManager / Material]
+                     end
+ 
+                     subgraph Backend["DXVK / Vulkan"]
+                     K --> N[D3D9Device -> Vulkan]
++                    K2 --> N
++                    K3 --> N
+                     L --> N
+                     M --> N
+                     end
+@@ -387,10 +391,11 @@
+ 
+                     subgraph L2["L2 运行时桥接"]
+                     C1["render/war3_render_queue_tracker.*"]
++                    C1A["render/war3_visible_renderables.*"]
+                     C2["render/war3_render_exec_batch.*"]
+                     C3["render/war3_scene_collector.*"]
+                     C4["handle/war3_handle_resolver.*"]
+-                    C5["state/war3_render_state.*"]
++                    C5["state/war3_render_state.* + render/war3_render_state.*"]
+                     C6["render/war3_frame_graph.*"]
+                     C7["tools/war3_diagnostics_hub.*"]
+                     end
+@@ -411,10 +416,12 @@
+                     A1 --> A3
+                     B5 --> B6
+                     B3 --> C1
++                    B3 --> C1A
+                     B3 --> C2
+                     B5 --> C3
+                     C6 --> C7
+                     C1 --> D1
++                    C1A --> D1
+                     C2 --> D1
+                     D1 --> D1A
+                     D1 --> D1B
+@@ -434,7 +441,7 @@
+                     </div>
+                     <div class="card">
+                         <strong>src/d3d9/war3/render/ + handle/</strong>
+-                        <div>桥接链路与对象追踪核心，负责从渲染数据回查逻辑对象身份。</div>
++                        <div>桥接链路与对象追踪核心，负责从渲染数据回查逻辑对象身份，并登记最终可见 renderable。</div>
+                     </div>
+                     <div class="card">
+                         <strong>src/d3d9/war3/shader/</strong>
+@@ -458,7 +465,7 @@
+             <!-- 渲染管线流程 -->
+             <section class="panel" data-section="pipeline">
+                 <h2>渲染管线流程</h2>
+-                <p>当前每帧路径由 Render 域 Hook 驱动，生命周期/Shadow/UI 域分别在关键边界插入状态同步与策略拦截。</p>
++                <p>当前每帧路径由 Render 域 Hook 驱动，生命周期/Shadow/UI 域分别在关键边界插入状态同步与策略拦截。自 2026-04-16 起，世界边界已不再只依赖 BeforeUi 猜测，而是显式接入 <code>CWorld_RenderScene</code> 与 <code>RenderBatch_Submit</code>。</p>
+ 
+                 <div class="mermaid">
+                     sequenceDiagram
+@@ -466,6 +473,7 @@
+                     participant D3D9 as D3D9 Device
+                     participant Hook as Hook Domains
+                     participant Bridge as Render Bridge
++                    participant Reg as Semantic Registries
+                     participant SM as ShaderManager
+                     participant VK as Vulkan
+ 
+@@ -485,9 +493,16 @@
+                     end
+ 
+                     rect rgb(220, 255, 240)
+-                    Note over Game,VK: 世界阶段
+-                    D3D9->>Hook: Dispatch_Common / Dispatch_Special
+-                    Hook->>Bridge: ExecBatch Begin/End
++                    Note over Game,VK: 世界阶段（当前主链）
++                    Game->>Hook: Hook_WorldFrameUpdateAndPreparePasses
++                    Game->>Hook: Hook_WorldRenderScene
++                    Hook->>Bridge: WorldObjects_RenderGroup / WorldObjectEntry_Render
++                    Bridge->>Reg: RenderObjectRegistry(sceneNode -> identity)
++                    Bridge->>Hook: RenderQueue_AddBatch
++                    Hook->>Reg: RenderQueueTracker(renderablePart -> tag/stage)
++                    Hook->>Reg: VisibleRenderableRegistry(RenderBatch_Submit 主队列 diff)
++                    Reg->>SM: 提供 identity / visible renderable
++                    Hook->>Bridge: Dispatch_Common / Dispatch_Special
+                     Bridge->>SM: 绑定材质与 Uniform
+                     SM->>VK: Vulkan Draw
+                     end
+@@ -551,6 +566,7 @@
+                     subgraph Shared["共享状态"]
+                     J[g_numOfElementsPtr等全局]
+                     K[RenderQueueTracker / ExecBatch]
++                    K2[VisibleRenderableRegistry]
+                     L[War3RenderState]
+                     end
+ 
+@@ -571,6 +587,7 @@
+                     G --> J
+                     E --> J
+                     G --> K
++                    G --> K2
+                     I --> K
+                     H --> L
+                     G --> L
+diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
+index 52a3cdd..bc14894 100644
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -13,6 +13,8 @@
+ #include "war3/render/war3_shadow_capture_frontend.h"
+ #include "war3/render/war3_shadow_object_registry.h"
+ #include "war3/render/war3_shadow_runtime_bridge.h"
++#include "war3/render/war3_upper_layer_shadow.h"
++#include "war3/render/war3_visible_renderables.h"
+ #include "war3/memory/war3_shadow_arena.h"
+ #include "war3/memory/war3_storm_hook.h"
+ #include "war3/model/war3_model_hook.h"
+@@ -156,6 +158,83 @@ bool War3TryResolveNativeShadowHint(
+          tryByObject(semantic.sceneNode);
+ }
+ 
++const dxvk::war3::render::RenderObjectInfo* War3FindRenderObjectForSemantic(
++    const dxvk::War3ShadowSemanticContext& semantic,
++    const dxvk::war3::render::VisibleRenderableRecord& record) {
++  auto& renderRegistry = dxvk::war3::render::RenderObjectRegistry::instance();
++  if (record.identity.worldObjectEntry != nullptr) {
++    if (const auto* object =
++            renderRegistry.findByEntry(record.identity.worldObjectEntry)) {
++      return object;
++    }
++  }
++  if (record.sceneNode != nullptr) {
++    if (const auto* object = renderRegistry.findBySceneNode(record.sceneNode)) {
++      return object;
++    }
++  }
++  if (semantic.jHandle != 0u) {
++    if (const auto* object = renderRegistry.findByHandle(semantic.jHandle)) {
++      return object;
++    }
++  }
++  if (record.identity.jHandle != 0u) {
++    if (const auto* object = renderRegistry.findByHandle(record.identity.jHandle)) {
++      return object;
++    }
++  }
++  return nullptr;
++}
++
++void War3MergeVisibleRenderableSemantic(
++    dxvk::War3ShadowSemanticContext& semantic,
++    const dxvk::war3::render::VisibleRenderableRecord& record) {
++  if (semantic.renderablePart == nullptr)
++    semantic.renderablePart = record.renderablePart;
++  if (semantic.sceneNode == nullptr)
++    semantic.sceneNode = record.sceneNode;
++  if (semantic.worldObjectEntry == nullptr)
++    semantic.worldObjectEntry = record.identity.worldObjectEntry;
++  if (semantic.runtimeModelPtr == nullptr)
++    semantic.runtimeModelPtr = record.runtimeModelPtr;
++  if (semantic.modelResourcePtr == nullptr)
++    semantic.modelResourcePtr = record.modelResourcePtr;
++  if (semantic.modelKey == 0u)
++    semantic.modelKey = record.modelKey;
++  if (semantic.jHandle == 0u)
++    semantic.jHandle = record.identity.jHandle;
++  if (semantic.rawcode == 0u)
++    semantic.rawcode = record.identity.rawcode;
++  if (semantic.objectKind == dxvk::war3::render::ObjectKind::Unknown)
++    semantic.objectKind = record.identity.kind;
++
++  if (semantic.object == nullptr)
++    semantic.object = War3FindRenderObjectForSemantic(semantic, record);
++}
++
++void War3AugmentShadowSemanticFromVisibleManifest(
++    dxvk::War3ShadowSemanticContext& semantic) {
++  dxvk::war3::render::VisibleRenderableRecord record = {};
++  auto& registry = dxvk::war3::render::VisibleRenderableRegistry::instance();
++
++  if (semantic.renderablePart != nullptr &&
++      registry.queryByRenderablePart(semantic.renderablePart, record)) {
++    War3MergeVisibleRenderableSemantic(semantic, record);
++    return;
++  }
++
++  if (semantic.sceneNode != nullptr &&
++      registry.queryBySceneNode(semantic.sceneNode, record)) {
++    War3MergeVisibleRenderableSemantic(semantic, record);
++    return;
++  }
++
++  if (semantic.runtimeModelPtr != nullptr &&
++      registry.queryByRuntimeModel(semantic.runtimeModelPtr, record)) {
++    War3MergeVisibleRenderableSemantic(semantic, record);
++  }
++}
++
+ uint64_t War3BuildShadowSemanticIdentityHash(
+     const dxvk::War3ShadowSemanticContext& semantic) {
+   uint64_t hash = bit::fnv1a_init();
+@@ -4513,6 +4592,41 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPalette() {
+   return uint32_t(m_war3Scene.shadowPalettes.size() - 1);
+ }
+ 
++uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
++    const Matrix4 *matrices, uint32_t matrixCount) {
++  if (matrices == nullptr || matrixCount == 0)
++    return 0u;
++
++  const uint32_t boundedCount =
++      std::min<uint32_t>(matrixCount, uint32_t(256u));
++
++  uint64_t h = bit::fnv1a_init();
++  h = bit::fnv1a_iter(h, boundedCount);
++  for (uint32_t i = 0; i < boundedCount; ++i) {
++    const Matrix4 &m = matrices[i];
++    for (uint32_t r = 0; r < 4; ++r) {
++      for (uint32_t c = 0; c < 4; ++c)
++        h = bit::fnv1a_iter(h, bit::cast<uint32_t>(m[r][c]));
++    }
++  }
++
++  const size_t bytes = sizeof(Matrix4) * boundedCount;
++  for (uint32_t idx = 0; idx < m_war3Scene.shadowPalettes.size(); ++idx) {
++    auto &existing = m_war3Scene.shadowPalettes[idx];
++    if (existing.hash != h)
++      continue;
++    if (std::memcmp(existing.worldMatrices.data(), matrices, bytes) == 0)
++      return idx;
++  }
++
++  War3ShadowMatrixPalette palette = {};
++  palette.hash = h;
++  for (uint32_t i = 0; i < boundedCount; ++i)
++    palette.worldMatrices[i] = matrices[i];
++  m_war3Scene.shadowPalettes.emplace_back(std::move(palette));
++  return uint32_t(m_war3Scene.shadowPalettes.size() - 1);
++}
++
+ const D3D9DeviceEx::War3ShadowDeclInfo &
+ D3D9DeviceEx::War3GetShadowDeclInfo(D3D9VertexDecl *decl) {
+   auto it = m_war3ShadowDeclCache.find(decl);
+@@ -4690,6 +4804,7 @@ War3ShadowSemanticContext D3D9DeviceEx::War3BuildShadowSemanticContext(
+   }
+ 
+   dxvk::war3::render::AugmentShadowSemanticContext(semantic, currentObj);
++  War3AugmentShadowSemanticFromVisibleManifest(semantic);
+ 
+   if (semantic.tag == War3BatchTag::Unknown) {
+     const auto execTag = War3RenderState::GetTlsBatchTag();
+@@ -12950,50 +13065,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
+     }
+   }
+ 
+-  if (vertexBlendEnabled && semantic.runtimeModelPtr != nullptr &&
+-      semantic.objectKind != dxvk::war3::render::ObjectKind::Unit) {
++  if (vertexBlendEnabled && semantic.runtimeModelPtr != nullptr) {
+     dxvk::war3::model::PoseRecord posePaletteRecord = {};
+     auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
+     if (poseRegistry.findByRuntimeModel(semantic.runtimeModelPtr,
+                                         posePaletteRecord) &&
+         posePaletteRecord.matrixCount != 0 &&
+         !posePaletteRecord.matrixPalette.empty()) {
+-      War3ShadowMatrixPalette palette = {};
+-      const uint32_t count = std::min<uint32_t>(
+-          posePaletteRecord.matrixCount,
+-          uint32_t(posePaletteRecord.matrixPalette.size()));
+-      for (uint32_t i = 0; i < count && i < palette.worldMatrices.size(); ++i)
+-        palette.worldMatrices[i] = posePaletteRecord.matrixPalette[i];
+-
+-      uint64_t h = bit::fnv1a_init();
+-      h = bit::fnv1a_iter(h, count);
+-      for (uint32_t i = 0; i < count && i < palette.worldMatrices.size(); ++i) {
+-        const Matrix4& m = palette.worldMatrices[i];
+-        for (uint32_t r = 0; r < 4; ++r) {
+-          for (uint32_t c = 0; c < 4; ++c)
+-            h = bit::fnv1a_iter(h, bit::cast<uint32_t>(m[r][c]));
+-        }
+-      }
+-      palette.hash = h;
+-
+-      const size_t bytes = sizeof(Matrix4) * palette.worldMatrices.size();
+-      bool foundExisting = false;
+-      for (uint32_t idx = 0; idx < m_war3Scene.shadowPalettes.size(); ++idx) {
+-        auto& existing = m_war3Scene.shadowPalettes[idx];
+-        if (existing.hash != palette.hash)
+-          continue;
+-        if (std::memcmp(existing.worldMatrices.data(),
+-                        palette.worldMatrices.data(), bytes) == 0) {
+-          paletteIndex = idx;
+-          foundExisting = true;
+-          break;
+-        }
+-      }
+-
+-      if (!foundExisting) {
+-        m_war3Scene.shadowPalettes.emplace_back(std::move(palette));
+-        paletteIndex = uint32_t(m_war3Scene.shadowPalettes.size() - 1);
+-      }
++      // 旧的 legacy-freeze fallback 之前对 Unit 排除了 runtime palette
++      // 覆盖，结果就是“单位没进 upper-layer authoritative，又没吃到
++      // CModel 最终 pose palette”，阴影会直接缺失或姿态不对。
++      // 这里统一改成：只要拿得到 runtimeModel 的最终 palette，就优先用
++      // runtime pose，而不是继续依赖 FF vertex-blend 状态。
++      paletteIndex = War3GetOrCreateShadowMatrixPaletteFromData(
++          posePaletteRecord.matrixPalette.data(), posePaletteRecord.matrixCount);
+     }
+   }
+ 
+@@ -13206,6 +13291,251 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
+     }
+   };
+ 
++  auto tryCaptureUpperLayerShadow = [&]() -> bool {
++    if (!dxvk::war3::internal::kUpperLayerShadowConsumerEnabled || !objectCaster)
++      return false;
++
++    dxvk::war3::render::UpperLayerShadowResolvedItem upperItem = {};
++    auto &upperRegistry = dxvk::war3::render::UpperLayerShadowRegistry::instance();
++    if (!upperRegistry.resolve(semantic, upperItem))
++      return false;
++
++    const bool authoritativeRigid = upperItem.HasAuthoritativeRigidPath();
++    const bool authoritativeSkinned = upperItem.HasAuthoritativeSkinnedPath();
++    if (!authoritativeRigid && !authoritativeSkinned)
++      return false;
++
++    const uint32_t vertexCount = std::min<uint32_t>(
++        upperItem.geoset.vertexCount,
++        uint32_t(upperItem.geoset.positions.size() / 3u));
++    if (vertexCount == 0u)
++      return false;
++
++    auto uploadUpperLayerBuffer =
++        [&](const void *src, VkDeviceSize bytes, Rc<DxvkBuffer> &outStorage,
++            DxvkResourceBufferInfo &outInfo) -> bool {
++      outStorage = nullptr;
++      outInfo = {};
++      if (src == nullptr || bytes == 0)
++        return false;
++
++      VkDeviceSize bufferOffset = 0;
++      void *mapPtr = nullptr;
++      outStorage = War3AllocFreezeBuffer(bytes, bufferOffset, true, &mapPtr);
++      if (outStorage == nullptr || mapPtr == nullptr)
++        return false;
++
++      std::memcpy(mapPtr, src, size_t(bytes));
++      outInfo = outStorage->getSliceInfo(bufferOffset, bytes);
++      return outInfo.buffer != VK_NULL_HANDLE && outInfo.size != 0;
++    };
++
++    Rc<DxvkBuffer> positionStorage;
++    DxvkResourceBufferInfo positionInfo = {};
++    const VkDeviceSize positionBytes =
++        VkDeviceSize(upperItem.geoset.positions.size() * sizeof(float));
++    if (!uploadUpperLayerBuffer(upperItem.geoset.positions.data(), positionBytes,
++                                positionStorage, positionInfo)) {
++      return false;
++    }
++
++    Rc<DxvkBuffer> indexStorage;
++    DxvkResourceBufferInfo indexInfo = {};
++    const bool useIndices = !upperItem.geoset.indices.empty();
++    if (useIndices) {
++      const VkDeviceSize indexBytes =
++          VkDeviceSize(upperItem.geoset.indices.size() * sizeof(uint16_t));
++      if (!uploadUpperLayerBuffer(upperItem.geoset.indices.data(), indexBytes,
++                                  indexStorage, indexInfo)) {
++        return false;
++      }
++    }
++
++    Rc<DxvkBuffer> uvStorage;
++    DxvkResourceBufferInfo uvInfo = {};
++    bool resolvedAlphaTest = captureAlphaTest;
++    if (resolvedAlphaTest) {
++      const bool hasUvLayer =
++          !upperItem.geoset.uvLayers.empty() &&
++          !upperItem.geoset.uvLayers[0].uvPairs.empty() &&
++          upperItem.geoset.uvLayers[0].uvPairs.size() >=
++              size_t(vertexCount) * 2u &&
++          diffuseTexView != nullptr;
++      if (!hasUvLayer) {
++        resolvedAlphaTest = false;
++      } else {
++        const auto &uvLayer = upperItem.geoset.uvLayers[0];
++        const VkDeviceSize uvBytes =
++            VkDeviceSize(size_t(vertexCount) * 2u * sizeof(float));
++        if (!uploadUpperLayerBuffer(uvLayer.uvPairs.data(), uvBytes, uvStorage,
++                                    uvInfo)) {
++          resolvedAlphaTest = false;
++          uvStorage = nullptr;
++          uvInfo = {};
++        }
++      }
++    }
++
++    uint32_t upperPaletteIndex = 0u;
++    Rc<DxvkBuffer> blendStorage;
++    DxvkResourceBufferInfo blendInfo = {};
++    if (authoritativeSkinned) {
++      if (upperItem.pose.matrixCount == 0 ||
++          upperItem.pose.matrixCount > 256u ||
++          upperItem.maxReferencedMatrixIndex >= 256u) {
++        return false;
++      }
++
++      upperPaletteIndex = War3GetOrCreateShadowMatrixPaletteFromData(
++          upperItem.pose.matrixPalette.data(), upperItem.pose.matrixCount);
++
++      const uint32_t groupCount = std::min<uint32_t>(
++          upperItem.geoset.matrixGroupCount,
++          uint32_t(upperItem.geoset.matrixGroupSizes.size()));
++      if (groupCount == 0u)
++        return false;
++
++      std::vector<uint32_t> groupBase(groupCount, 0u);
++      uint32_t running = 0u;
++      for (uint32_t i = 0; i < groupCount; ++i) {
++        groupBase[i] = running;
++        running += upperItem.geoset.matrixGroupSizes[i];
++      }
++
++      std::vector<std::array<uint8_t, 4>> blendIndices(vertexCount);
++      for (uint32_t i = 0; i < vertexCount; ++i) {
++        const uint32_t groupSlot = upperItem.geoset.vertexGroupIndices[i];
++        if (groupSlot >= groupCount ||
++            upperItem.geoset.matrixGroupSizes[groupSlot] != 1u) {
++          return false;
++        }
++
++        const uint32_t matrixIndexOffset = groupBase[groupSlot];
++        if (matrixIndexOffset >= upperItem.geoset.matrixIndices.size())
++          return false;
++
++        const uint32_t matrixIndex =
++            upperItem.geoset.matrixIndices[matrixIndexOffset];
++        if (matrixIndex >= 256u)
++          return false;
++
++        blendIndices[i] = {uint8_t(matrixIndex), 0u, 0u, 0u};
++      }
++
++      const VkDeviceSize blendBytes =
++          VkDeviceSize(blendIndices.size() * sizeof(blendIndices[0]));
++      if (!uploadUpperLayerBuffer(blendIndices.data(), blendBytes, blendStorage,
++                                  blendInfo)) {
++        return false;
++      }
++    }
++
++    if (!upperRegistry.tryMarkEmitted(upperItem))
++      return true;
++
++    War3ShadowCasterDraw draw = {};
++    draw.indexed = useIndices;
++    draw.positionStorage = positionStorage;
++    draw.positionInfo = positionInfo;
++    draw.positionStride = sizeof(float) * 3u;
++    draw.positionOffset = 0u;
++    draw.positionFormat = VK_FORMAT_R32G32B32_SFLOAT;
++    draw.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    draw.worldMatrix = authoritativeSkinned ? Matrix4() : currentWorldMatrix;
++    draw.indexStorage = indexStorage;
++    draw.indexInfo = indexInfo;
++    draw.indexType = VK_INDEX_TYPE_UINT16;
++    draw.indexCount = useIndices ? uint32_t(upperItem.geoset.indices.size()) : 0u;
++    draw.firstIndex = 0u;
++    draw.vertexOffset = 0;
++    draw.vertexCount = useIndices ? 0u : vertexCount;
++    draw.firstVertex = 0u;
++    draw.minVertexIndex = 0u;
++    draw.numVertices = vertexCount;
++    draw.vertexBlendEnabled = authoritativeSkinned;
++    draw.vertexBlendIndexed = authoritativeSkinned;
++    draw.vertexBlendCount = authoritativeSkinned ? 0u : 0u;
++    draw.paletteIndex = upperPaletteIndex;
++    draw.blendWeightOffset = 0u;
++    draw.blendWeightFormat = VK_FORMAT_UNDEFINED;
++    draw.blendIndexOffset = 0u;
++    draw.blendIndexFormat = authoritativeSkinned ? VK_FORMAT_R8G8B8A8_USCALED
++                                                 : VK_FORMAT_UNDEFINED;
++    draw.blendStride = authoritativeSkinned ? 4u : 0u;
++    draw.blendBinding = authoritativeSkinned ? 1u : 0u;
++    draw.blendStorage = blendStorage;
++    draw.blendInfo = blendInfo;
++    draw.alphaTestEnabled = resolvedAlphaTest;
++    draw.alphaRef = alphaRefFloat;
++    draw.alphaBlendEnabled = alphaBlend;
++    draw.depthWriteEnabled = zWriteEnabled;
++    draw.depthTestEnabled = zTestEnabled;
++    draw.additiveBlend = additiveBlend;
++    draw.uvStorage = uvStorage;
++    draw.uvInfo = uvInfo;
++    draw.uvStride = resolvedAlphaTest ? sizeof(float) * 2u : 0u;
++    draw.uvOffset = 0u;
++    draw.uvFormat = resolvedAlphaTest ? VK_FORMAT_R32G32_SFLOAT
++                                      : VK_FORMAT_UNDEFINED;
++    draw.diffuseTexture = diffuseTexView;
++    if (resolvedAlphaTest && draw.diffuseTexture != nullptr &&
++        m_shadowReceiverPass != nullptr) {
++      bool alphaUseMip = false;
++      float alphaMipLodBias = 0.0f;
++      if (m_war3Pipeline) {
++        const auto &shadowSettings = m_war3Pipeline->GetSettings().shadows;
++        alphaUseMip = shadowSettings.alphaShadowUseMip;
++        alphaMipLodBias = shadowSettings.alphaShadowMipLodBias;
++      }
++      draw.diffuseSampler =
++          m_shadowReceiverPass->getFallbackSampler(alphaUseMip, alphaMipLodBias);
++      if (draw.diffuseSampler != nullptr)
++        draw.diffuseSamplerIndex =
++            draw.diffuseSampler->getDescriptor().samplerIndex;
++      draw.textureDescriptor = *draw.diffuseTexture->getDescriptor();
++    }
++
++    finalizeShadowDrawCommon(draw);
++
++    War3ShadowInstanceRef instance = {};
++    instance.geometryId = 0u;
++    instance.materialId = 0u;
++    instance.replayDrawIndex = static_cast<uint32_t>(m_war3Scene.shadowCasters.size());
++    instance.batchHandle = batchHandle;
++    instance.paletteIndex = draw.paletteIndex;
++    instance.worldMatrix = draw.worldMatrix;
++    instance.boundsCenter = draw.boundsCenter;
++    instance.boundsRadius = draw.boundsRadius;
++    instance.category = cat;
++    instance.batchTag = (execTag != War3BatchTag::Unknown) ? execTag : tag;
++    instance.objectKind = resolvedObjectKind;
++    instance.mode = authoritativeSkinned ? War3ShadowReplayMode::PaletteSkinnedFF
++                                         : War3ShadowReplayMode::FixedWorld;
++
++    if (authoritativeSkinned)
++      noteDynamicPoseUsage(true);
++
++    m_war3Scene.shadowInstances.emplace_back(std::move(instance));
++    m_war3Scene.shadowCasters.emplace_back(std::move(draw));
++    m_war3Scene.shadowStats.captured++;
++    if (useIndices)
++      m_war3Scene.shadowStats.capturedIndexed++;
++    else
++      m_war3Scene.shadowStats.capturedNonIndexed++;
++    if (objectCaster)
++      m_war3Scene.shadowStats.capturedWorldObject++;
++    if (resolvedObjectKind ==
++        static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit)) {
++      m_war3Scene.shadowStats.capturedUnitObject++;
++      if (authoritativeSkinned)
++        m_war3Scene.shadowStats.capturedUnitVertexBlend++;
++    }
++    return true;
++  };
++
++  if (tryCaptureUpperLayerShadow())
++    return;
++
+   // Capture Resources
+   static const bool s_freezeDynamicShadowBuffers =
+       env::getEnvVar("DXVK_WAR3_SHADOW_FREEZE_DYNAMIC") != "0";
+diff --git a/src/d3d9/d3d9_device.h b/src/d3d9/d3d9_device.h
+index d20fa9a..e296619 100644
+--- a/src/d3d9/d3d9_device.h
++++ b/src/d3d9/d3d9_device.h
+@@ -1241,6 +1241,8 @@ private:
+   // - shadow caster 重放时必须使用当时那一套
+   // palette，否则会出现“阴影残缺/错位/乱飞”。
+   uint32_t War3GetOrCreateShadowMatrixPalette();
++  uint32_t War3GetOrCreateShadowMatrixPaletteFromData(const Matrix4* matrices,
++                                                      uint32_t matrixCount);
+ 
+   // War3：缓存顶点声明解析结果，减少逐 draw 扫描开销
+   const War3ShadowDeclInfo &War3GetShadowDeclInfo(D3D9VertexDecl *decl);
+diff --git a/src/d3d9/d3d9_war3_pipeline.cpp b/src/d3d9/d3d9_war3_pipeline.cpp
+index d0a7717..ae10619 100644
+--- a/src/d3d9/d3d9_war3_pipeline.cpp
++++ b/src/d3d9/d3d9_war3_pipeline.cpp
+@@ -138,6 +138,31 @@ namespace dxvk {
+         float Luminance(const Vector4& color) {
+             return color.x * 0.2126f + color.y * 0.7152f + color.z * 0.0722f;
+         }
++
++        bool ShouldDispatchBeforeUiPreEvent(war3shader::RenderEventID eventId) {
++            if constexpr (!dxvk::war3::internal::kNativeUseRenderSceneAsWorldEventAuthority)
++                return true;
++
++            switch (eventId) {
++                case war3shader::RenderEventID::WORLD_RENDER_BEGIN:
++                case war3shader::RenderEventID::WORLD_RENDER_END:
++                case war3shader::RenderEventID::POST_PROCESS_BEGIN:
++                    break;
++                default:
++                    return true;
++            }
++
++            const bool ready = War3RenderState::HasCompletedWorldRenderSceneThisFrame();
++            if (!ready) {
++                static uint32_t s_skipLogCount = 0;
++                if (s_skipLogCount++ < 8) {
++                    WAR3_RENDER_LOG(
++                        "DXVK War3Pipeline: skip BeforeUi pre-event=%d (RenderScene not completed this frame)\n",
++                        static_cast<int>(eventId));
++                }
++            }
++            return ready;
++        }
+     }
+ 
+     War3RenderPipeline::War3RenderPipeline(const Rc<DxvkDevice>& device)
+@@ -381,23 +406,44 @@ namespace dxvk {
+             !stateKnown;
+ 
+         if (!m_insertedBeforeUi && m_hadWorldDraw) {
+-            // Fast-path: commit immediately on the common unknown-signature boundary.
++            // Some machines expose the UI transition as an "unknown-signature"
++            // boundary before the final world draws are truly done. Treat the
++            // first unknown boundary as an arm signal and only commit after the
++            // next matching boundary (or a later strong UI marker). Any real
++            // world draw in between will clear m_armedBeforeUi above.
+             if (unknownUiBoundary) {
+-                m_insertedBeforeUi = true;
+-                m_armedBeforeUi = false;
++                if (m_armedBeforeUi) {
++                    m_insertedBeforeUi = true;
++                    m_armedBeforeUi = false;
+ 
+-                static uint32_t s_loggedCommitUnknown = 0;
+-                if (s_loggedCommitUnknown < 8) {
+-                    s_loggedCommitUnknown++;
++                    static uint32_t s_loggedCommitUnknown = 0;
++                    if (s_loggedCommitUnknown < 8) {
++                        s_loggedCommitUnknown++;
++                        WAR3_RENDER_LOG(
++                            "DXVK War3Pipeline: BeforeUi commit (unknown-sig armed) stage=%d disp=%d layer=%d cat=%d tag=%d\n",
++                            stage,
++                            dispStage,
++                            static_cast<int>(layer),
++                            static_cast<int>(category),
++                            static_cast<int>(batchTag));
++                    }
++                    return true;
++                }
++
++                m_armedBeforeUi = true;
++
++                static uint32_t s_loggedArmUnknown = 0;
++                if (s_loggedArmUnknown < 8) {
++                    s_loggedArmUnknown++;
+                     WAR3_RENDER_LOG(
+-                        "DXVK War3Pipeline: BeforeUi commit (unknown-sig boundary) stage=%d disp=%d layer=%d cat=%d tag=%d\n",
++                        "DXVK War3Pipeline: BeforeUi armed (unknown-sig boundary) stage=%d disp=%d layer=%d cat=%d tag=%d\n",
+                         stage,
+                         dispStage,
+                         static_cast<int>(layer),
+                         static_cast<int>(category),
+                         static_cast<int>(batchTag));
+                 }
+-                return true;
++                return false;
+             }
+ 
+             // Slow-path: if we did see a boundary candidate, arm and wait for a stronger UI marker.
+@@ -462,6 +508,8 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
+                 const auto& preEvents = frameGraphPlan.Events(
+                     dxvk::war3::render::FrameGraphDispatchStage::BeforeUiPrePass);
+                 for (auto eventId : preEvents) {
++                    if (!ShouldDispatchBeforeUiPreEvent(eventId))
++                        continue;
+                     war3shader::internal::DispatchRenderEvent(eventId);
+                 }
+             }
+diff --git a/src/d3d9/d3d9_window.cpp b/src/d3d9/d3d9_window.cpp
+index fc9ec40..71ef918 100644
+--- a/src/d3d9/d3d9_window.cpp
++++ b/src/d3d9/d3d9_window.cpp
+@@ -158,8 +158,10 @@ namespace dxvk
+           if (clientWidth > 0 && clientHeight > 0) {
+             const D3DPRESENT_PARAMETERS* currentParams =
+               windowData.swapchain->GetPresentParams();
+-            if (currentParams->BackBufferWidth != clientWidth
+-             || currentParams->BackBufferHeight != clientHeight) {
++            const UINT previousWidth = currentParams->BackBufferWidth;
++            const UINT previousHeight = currentParams->BackBufferHeight;
++            if (previousWidth != clientWidth
++             || previousHeight != clientHeight) {
+               D3DPRESENT_PARAMETERS resetParams = *currentParams;
+               resetParams.hDeviceWindow = window;
+               resetParams.Windowed = TRUE;
+@@ -173,7 +175,7 @@ namespace dxvk
+                 windowData.swapchain->SetWindowedLogicalSourceExtent(
+                   VkExtent2D{clientWidth, clientHeight}, false);
+                 dxvk::war3::hooks::TryOverrideWindowedClientSize(
+-                  currentParams->BackBufferWidth, currentParams->BackBufferHeight,
++                  previousWidth, previousHeight,
+                   clientWidth, clientHeight);
+                 dxvk::war3::hooks::TryNotifyWindowedUiSizeChanged(
+                   window, clientWidth, clientHeight);
+@@ -187,7 +189,7 @@ namespace dxvk
+               windowData.swapchain->SetWindowedLogicalSourceExtent(
+                 VkExtent2D{clientWidth, clientHeight}, false);
+               dxvk::war3::hooks::TryOverrideWindowedClientSize(
+-                currentParams->BackBufferWidth, currentParams->BackBufferHeight,
++                previousWidth, previousHeight,
+                 clientWidth, clientHeight);
+               dxvk::war3::hooks::TryNotifyWindowedUiSizeChanged(
+                 window, clientWidth, clientHeight);
+diff --git a/src/d3d9/meson.build b/src/d3d9/meson.build
+index b8cc69a..4acfe38 100644
+--- a/src/d3d9/meson.build
++++ b/src/d3d9/meson.build
+@@ -93,6 +93,8 @@ d3d9_src = [
+   'war3/render/war3_render_queue_tracker.cpp',
+   'war3/render/war3_render_exec_batch.cpp',
+   'war3/render/war3_render_state.cpp',
++  'war3/render/war3_upper_layer_shadow.cpp',
++  'war3/render/war3_visible_renderables.cpp',
+   'war3/render/war3_shadow_capture_frontend.cpp',
+   'war3/render/war3_native_renderer_probe.cpp',
+   'war3/render/war3_post_process.cpp',
+@@ -105,6 +107,7 @@ d3d9_src = [
+   'war3/core/war3_storm.cpp',
+   'war3/core/war3_file_manager.cpp',
+   'war3/model/war3_model_hook.cpp',
++  'war3/model/war3_model_resource_cache.cpp',
+   'war3/model/war3_model_registry.cpp',
+   'war3/native/war3_native_shadow_hint.cpp',
+   'war3/war3_user_example.cpp',
+diff --git a/src/d3d9/war3/core/war3_internal_test_config.h b/src/d3d9/war3/core/war3_internal_test_config.h
+index 9abee16..756c5f7 100644
+--- a/src/d3d9/war3/core/war3_internal_test_config.h
++++ b/src/d3d9/war3/core/war3_internal_test_config.h
+@@ -164,6 +164,26 @@ inline constexpr bool kNativeRenderBatchPrecomputeVisibilityEnabled = true;
+ // 预计算层数上限（防止极端模型导致栈开销过大）
+ inline constexpr uint32_t kNativeRenderBatchPrecomputeMaxLayers = 128;
+ 
++// ========================================================================
++// CWorldFrameWar3 / RenderScene 权威边界
++// ========================================================================
++// 说明：
++// - 0x368480: 世界帧更新与渲染前准备；
++// - 0x3681C0: CWorld_RenderScene，当前确认的权威世界渲染边界；
++// - 该组 Hook 目前先用于“把真实世界边界接入状态机”，不直接改写原生渲染顺序。
++inline constexpr bool kNativeWorldFrameBoundaryHooksEnabled = true;
++
++// 若开启，则 BeforeUi 侧的 WORLD_RENDER_BEGIN / WORLD_RENDER_END 仅在
++// 本帧确实命中过 CWorld_RenderScene 返回后才分发，避免继续把 BeforeUi
++// 当成权威世界边界。
++inline constexpr bool kNativeUseRenderSceneAsWorldEventAuthority = true;
++
++// 是否记录最终可见 renderable manifest。
++// 当前会同时记录：
++// - RenderBatch_Submit 真正写入 main queue 的 opaque/main-queue 项
++// - AUCTransparent_AddEntry 真正写入透明队列的条目
++inline constexpr bool kNativeVisibleRenderableRegistryEnabled = true;
++
+ // ========================================================================
+ // JASS VM 追踪/优化实验
+ // ========================================================================
+@@ -419,7 +439,18 @@ inline constexpr bool kShadowPersistentGeometryCacheEnabled = true;
+ // runtime model hook（CreateSprite / runtimeModel 绑定探针）。
+ // 在关闭 runtime shadow bridge 的阶段，这条链默认一并关闭，避免继续
+ // 在后台做半成品 registry/pose 记账。
+-inline constexpr bool kShadowRuntimeModelHookEnabled = false;
++inline constexpr bool kShadowRuntimeModelHookEnabled = true;
++
++// runtime pose/palette hook（sprite prerender + runtime palette copy）。
++// 上层阴影 consumer 需要这条链提供每帧稳定的 3x4 palette。
++// 如需快速止血，可用 DXVK_WAR3_MODEL_POSE_HOOK=0 关闭。
++inline constexpr bool kShadowRuntimePoseHookEnabled = true;
++
++// 上层语义阴影 consumer：
++// - 依赖 visible manifest + geoset resource cache + pose palette
++// - 当前首版仅对 rigid 与“单矩阵组”skinned geoset 走 authoritative
++// - 多矩阵组 skinned geoset 仍安全回退到旧 capture 路径
++inline constexpr bool kUpperLayerShadowConsumerEnabled = true;
+ 
+ // 是否输出 RenderQueueTracker 命中统计（低频日志）
+ inline constexpr bool kNativeRenderQueueTrackerStatsEnabled = false;
+diff --git a/src/d3d9/war3/hooks/war3_hook_address_book.cpp b/src/d3d9/war3/hooks/war3_hook_address_book.cpp
+index 93b8af4..3e17043 100644
+--- a/src/d3d9/war3/hooks/war3_hook_address_book.cpp
++++ b/src/d3d9/war3/hooks/war3_hook_address_book.cpp
+@@ -62,8 +62,11 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
+ 
+       // Render 域
+       0x7B28F0, // renderDispatcher
++      0x368480, // worldFrameUpdateAndPreparePasses
++      0x3681C0, // worldRenderScene
+       0x139190, // renderQueueAddBatch
+       0x1375C0, // renderBatchSubmit
++      0x137AF0, // aucTransparentAddEntry
+       0x7B7830, // sceneSubmitBatch
+       0x184EE0, // worldObjectEntryRender
+       0x363020, // worldDispatch
+diff --git a/src/d3d9/war3/hooks/war3_hook_address_book.h b/src/d3d9/war3/hooks/war3_hook_address_book.h
+index a0182b9..493778e 100644
+--- a/src/d3d9/war3/hooks/war3_hook_address_book.h
++++ b/src/d3d9/war3/hooks/war3_hook_address_book.h
+@@ -76,8 +76,11 @@ struct War3HookAddressBook {
+   // Render 域
+   // -------------------------------------------------------------------------
+   uintptr_t renderDispatcher = 0;
++  uintptr_t worldFrameUpdateAndPreparePasses = 0;
++  uintptr_t worldRenderScene = 0;
+   uintptr_t renderQueueAddBatch = 0;
+   uintptr_t renderBatchSubmit = 0;
++  uintptr_t aucTransparentAddEntry = 0;
+   uintptr_t sceneSubmitBatch = 0;
+   uintptr_t worldObjectEntryRender = 0;
+   uintptr_t worldDispatch = 0;
+diff --git a/src/d3d9/war3/hooks/war3_hook_render.cpp b/src/d3d9/war3/hooks/war3_hook_render.cpp
+index 0b1ad03..5ab2dcf 100644
+--- a/src/d3d9/war3/hooks/war3_hook_render.cpp
++++ b/src/d3d9/war3/hooks/war3_hook_render.cpp
+@@ -17,6 +17,7 @@
+ #include "../render/war3_render_dispatcher.h"
+ #include "../render/war3_render_exec_batch.h"
+ #include "../render/war3_render_queue_tracker.h"
++#include "../render/war3_render_state.h"
+ #include "../render/war3_renderer.h"
+ #include "../state/war3_render_state.h"
+ #include "../tools/war3_perf_monitor.h"
+@@ -53,6 +54,9 @@ extern dxvk::war3::reimpl::GxCleanupFn g_renderQueueGxCleanup78;
+ namespace dxvk::war3::hooks {
+ 
+ using RenderDispatcherFn = int(__fastcall *)(int, int, int, int, int, int);
++using WorldFrameUpdateAndPreparePassesFn = int(__fastcall *)(void *, void *, int,
++                                                             int, int);
++using WorldRenderSceneFn = int(__fastcall *)(void *, void *);
+ using SceneSubmitBatchFn = int(__fastcall *)(void *, void *, int, int, int,
+                                              void *);
+ using WorldDispatchFn = int(__fastcall *)(void *, void *, int, int, int, int);
+@@ -69,6 +73,13 @@ using TransparentDispatchTypeXFn = void(__fastcall *)(void *);
+ static RenderDispatcherFn g_originalRenderDispatcher = nullptr;
+ static RenderDispatcherFn g_trampolineRenderDispatcher = nullptr;
+ 
++static WorldFrameUpdateAndPreparePassesFn g_originalWorldFrameUpdate = nullptr;
++static WorldFrameUpdateAndPreparePassesFn g_trampolineWorldFrameUpdate =
++    nullptr;
++
++static WorldRenderSceneFn g_originalWorldRenderScene = nullptr;
++static WorldRenderSceneFn g_trampolineWorldRenderScene = nullptr;
++
+ static SceneSubmitBatchFn g_originalSceneSubmitBatch = nullptr;
+ static SceneSubmitBatchFn g_trampolineSceneSubmitBatch = nullptr;
+ 
+@@ -336,6 +347,55 @@ int __fastcall Hook_RenderDispatcher(int ctx1, int ctx2, int typeCode,
+   return result;
+ }
+ 
++int __fastcall Hook_WorldFrameUpdateAndPreparePasses(void *thisPtr, void *edx,
++                                                     int a2, int a3, int a4) {
++  auto perfScope = MakeRenderHookCpuScope("Hook_WorldFramePrepare");
++
++  if constexpr (!dxvk::war3::internal::kNativeWorldFrameBoundaryHooksEnabled) {
++    if (g_trampolineWorldFrameUpdate)
++      return g_trampolineWorldFrameUpdate(thisPtr, edx, a2, a3, a4);
++    if (g_originalWorldFrameUpdate)
++      return g_originalWorldFrameUpdate(thisPtr, edx, a2, a3, a4);
++    return 0;
++  }
++
++  War3RenderState::OnWorldFramePrepareEnter();
++  int result = 0;
++  if (g_trampolineWorldFrameUpdate) {
++    auto origScope = MakeRenderHookCpuScope("Hook_WorldFramePrepare/Orig");
++    result = g_trampolineWorldFrameUpdate(thisPtr, edx, a2, a3, a4);
++  } else if (g_originalWorldFrameUpdate) {
++    auto origScope = MakeRenderHookCpuScope("Hook_WorldFramePrepare/Orig");
++    result = g_originalWorldFrameUpdate(thisPtr, edx, a2, a3, a4);
++  }
++  War3RenderState::OnWorldFramePrepareExit();
++  return result;
++}
++
++int __fastcall Hook_WorldRenderScene(void *thisPtr, void *edx) {
++  auto perfScope = MakeRenderHookCpuScope("Hook_WorldRenderScene");
++
++  if constexpr (!dxvk::war3::internal::kNativeWorldFrameBoundaryHooksEnabled) {
++    if (g_trampolineWorldRenderScene)
++      return g_trampolineWorldRenderScene(thisPtr, edx);
++    if (g_originalWorldRenderScene)
++      return g_originalWorldRenderScene(thisPtr, edx);
++    return 0;
++  }
++
++  War3RenderState::OnWorldRenderSceneEnter();
++  int result = 0;
++  if (g_trampolineWorldRenderScene) {
++    auto origScope = MakeRenderHookCpuScope("Hook_WorldRenderScene/Orig");
++    result = g_trampolineWorldRenderScene(thisPtr, edx);
++  } else if (g_originalWorldRenderScene) {
++    auto origScope = MakeRenderHookCpuScope("Hook_WorldRenderScene/Orig");
++    result = g_originalWorldRenderScene(thisPtr, edx);
++  }
++  War3RenderState::OnWorldRenderSceneExit();
++  return result;
++}
++
+ int __fastcall Hook_SceneSubmitBatch(void *thisPtr, void *edx, int a2, int a3,
+                                      int stage, void *entries) {
+   // SceneSubmitBatch 侧主要做阶段上下文桥接与同步诊断，不修改原提交语义。
+@@ -965,6 +1025,8 @@ void War3HookRender::Install(uintptr_t gameBase) {
+   };
+ 
+   LPVOID renderDispatcherAddr = resolveCode(book.renderDispatcher);
++  LPVOID worldFrameUpdateAddr = resolveCode(book.worldFrameUpdateAndPreparePasses);
++  LPVOID worldRenderSceneAddr = resolveCode(book.worldRenderScene);
+   LPVOID sceneSubmitBatchAddr = resolveCode(book.sceneSubmitBatch);
+   LPVOID worldDispatchAddr = resolveCode(book.worldDispatch);
+   LPVOID worldObjectsGroupAddr = resolveCode(book.worldObjectsRenderGroup);
+@@ -991,6 +1053,10 @@ void War3HookRender::Install(uintptr_t gameBase) {
+ 
+   g_originalRenderDispatcher =
+       reinterpret_cast<RenderDispatcherFn>(renderDispatcherAddr);
++  g_originalWorldFrameUpdate =
++      reinterpret_cast<WorldFrameUpdateAndPreparePassesFn>(worldFrameUpdateAddr);
++  g_originalWorldRenderScene =
++      reinterpret_cast<WorldRenderSceneFn>(worldRenderSceneAddr);
+   g_originalSceneSubmitBatch =
+       reinterpret_cast<SceneSubmitBatchFn>(sceneSubmitBatchAddr);
+   g_originalWorldDispatch =
+@@ -1023,6 +1089,14 @@ void War3HookRender::Install(uintptr_t gameBase) {
+                  reinterpret_cast<LPVOID>(&Hook_RenderDispatcher),
+                  reinterpret_cast<LPVOID *>(&g_trampolineRenderDispatcher),
+                  "Render", "RenderDispatcher", false, false);
++  InstallMinHook(worldFrameUpdateAddr,
++                 reinterpret_cast<LPVOID>(&Hook_WorldFrameUpdateAndPreparePasses),
++                 reinterpret_cast<LPVOID *>(&g_trampolineWorldFrameUpdate),
++                 "Render", "WorldFrameUpdateAndPreparePasses", false, false);
++  InstallMinHook(worldRenderSceneAddr,
++                 reinterpret_cast<LPVOID>(&Hook_WorldRenderScene),
++                 reinterpret_cast<LPVOID *>(&g_trampolineWorldRenderScene),
++                 "Render", "WorldRenderScene", false, false);
+   InstallMinHook(sceneSubmitBatchAddr,
+                  reinterpret_cast<LPVOID>(&Hook_SceneSubmitBatch),
+                  reinterpret_cast<LPVOID *>(&g_trampolineSceneSubmitBatch),
+diff --git a/src/d3d9/war3/hooks/war3_hook_render_identity.cpp b/src/d3d9/war3/hooks/war3_hook_render_identity.cpp
+index 901c2d7..e7271da 100644
+--- a/src/d3d9/war3/hooks/war3_hook_render_identity.cpp
++++ b/src/d3d9/war3/hooks/war3_hook_render_identity.cpp
+@@ -3,17 +3,21 @@
+ #include "war3_hook_address_book.h"
+ #include "war3_hook_install_util.h"
+ #include "../../d3d9_war3_debug.h"
++#include "../core/war3_memory.h"
+ #include "../core/war3_internal_test_config.h"
+ #include "../render/war3_render_identity_bridge.h"
+ #include "../render/war3_render_queue_tracker.h"
+ #include "../render/war3_renderer.h"
+ 
+ #include <atomic>
++#include <cstddef>
++#include <cstdint>
+ 
+ namespace dxvk {
+ 
+ extern std::atomic<bool> g_renderQueueGlobalsValid;
+ extern uint32_t *g_numOfElementsPtr;
++extern uint32_t *g_numOfTransparentPtr;
+ extern void **g_batchArrayPtr;
+ 
+ } // namespace dxvk
+@@ -22,6 +26,9 @@ namespace dxvk::war3::hooks {
+ 
+ using WorldObjectEntryRenderFn = int(__fastcall *)(void *, int);
+ using RenderQueueAddBatchFn = void(__fastcall *)(void *, int);
++using RenderBatchSubmitFn = void(__fastcall *)(void *, int);
++using AucTransparentAddEntryFn =
++    void(__cdecl *)(void *, uint32_t, const float *, uint32_t);
+ 
+ static WorldObjectEntryRenderFn g_originalWorldObjectEntryRender = nullptr;
+ static WorldObjectEntryRenderFn g_trampolineWorldObjectEntryRender = nullptr;
+@@ -29,8 +36,18 @@ static WorldObjectEntryRenderFn g_trampolineWorldObjectEntryRender = nullptr;
+ static RenderQueueAddBatchFn g_originalRenderQueueAddBatch = nullptr;
+ static RenderQueueAddBatchFn g_trampolineRenderQueueAddBatch = nullptr;
+ 
++static RenderBatchSubmitFn g_originalRenderBatchSubmit = nullptr;
++static RenderBatchSubmitFn g_trampolineRenderBatchSubmit = nullptr;
++
++static AucTransparentAddEntryFn g_originalAucTransparentAddEntry = nullptr;
++static AucTransparentAddEntryFn g_trampolineAucTransparentAddEntry = nullptr;
++
+ namespace {
+ 
++void **g_transparentArrayBasePtr = nullptr;
++constexpr size_t kTransparentEntryStride = 24;
++constexpr size_t kTransparentEntryDistSqOffset = 8;
++
+ struct ScopedWorldObjectContext {
+   void *prevEntry = nullptr;
+   void *prevScene = nullptr;
+@@ -54,6 +71,23 @@ struct ScopedWorldObjectContext {
+ 
+ } // namespace
+ 
++static float TryReadTransparentDistanceSq(uint32_t queueSlot) {
++  if (g_transparentArrayBasePtr == nullptr)
++    return 0.0f;
++
++  void *base = *g_transparentArrayBasePtr;
++  if (base == nullptr)
++    return 0.0f;
++
++  float distanceSq = 0.0f;
++  dxvk::war3::SafeReadFast(
++      reinterpret_cast<const std::uint8_t *>(base) +
++          size_t(queueSlot) * kTransparentEntryStride +
++          kTransparentEntryDistSqOffset,
++      0u, distanceSq);
++  return distanceSq;
++}
++
+ static int __fastcall Hook_WorldObjectEntry_Render(void *entry, int reserved) {
+   if (!dxvk::war3::internal::kNativeRenderIdentityBridgeEnabled || !entry) {
+     if (g_trampolineWorldObjectEntryRender)
+@@ -114,6 +148,79 @@ static void __fastcall Hook_RenderQueue_AddBatch(void *sceneNode, int reserved)
+       .PrimeCachedObjectIdentities(batchArray, before, after, identity);
+ }
+ 
++static void __fastcall Hook_RenderBatch_Submit(void *sceneNode, int reserved) {
++  dxvk::war3::render::RenderObjectIdentitySnapshot identity = {};
++  void *batchArrayBefore = nullptr;
++  uint32_t before = 0;
++  bool canCapture = false;
++
++  if (dxvk::war3::internal::kNativeVisibleRenderableRegistryEnabled &&
++      sceneNode != nullptr &&
++      dxvk::g_renderQueueGlobalsValid.load(std::memory_order_relaxed) &&
++      dxvk::g_numOfElementsPtr != nullptr && dxvk::g_batchArrayPtr != nullptr) {
++    before = *dxvk::g_numOfElementsPtr;
++    batchArrayBefore = *dxvk::g_batchArrayPtr;
++    canCapture = true;
++    dxvk::war3::render::TryResolveCurrentRenderObjectIdentity(sceneNode, identity);
++    identity.sceneNode = sceneNode;
++  }
++
++  if (g_trampolineRenderBatchSubmit) {
++    g_trampolineRenderBatchSubmit(sceneNode, reserved);
++  } else if (g_originalRenderBatchSubmit) {
++    g_originalRenderBatchSubmit(sceneNode, reserved);
++  }
++
++  if (!canCapture || dxvk::g_numOfElementsPtr == nullptr ||
++      dxvk::g_batchArrayPtr == nullptr)
++    return;
++
++  const uint32_t after = *dxvk::g_numOfElementsPtr;
++  void *batchArrayAfter = *dxvk::g_batchArrayPtr;
++  void *batchArray =
++      batchArrayAfter != nullptr ? batchArrayAfter : batchArrayBefore;
++  if (batchArray == nullptr || after <= before)
++    return;
++
++  dxvk::war3::render::War3Renderer::instance().OnVisibleRenderables(
++      batchArray, before, after, identity);
++}
++
++static void __cdecl Hook_AUCTransparent_AddEntry(void *payload,
++                                                 uint32_t transparentType,
++                                                 const float *worldPos,
++                                                 uint32_t sortKey) {
++  (void)worldPos;
++  dxvk::war3::render::RenderObjectIdentitySnapshot identity = {};
++  uint32_t before = 0;
++  bool canCapture = false;
++
++  if (dxvk::war3::internal::kNativeVisibleRenderableRegistryEnabled &&
++      dxvk::g_renderQueueGlobalsValid.load(std::memory_order_relaxed) &&
++      dxvk::g_numOfTransparentPtr != nullptr) {
++    before = *dxvk::g_numOfTransparentPtr;
++    canCapture = true;
++    dxvk::war3::render::TryResolveCurrentRenderObjectIdentity(nullptr, identity);
++  }
++
++  if (g_trampolineAucTransparentAddEntry) {
++    g_trampolineAucTransparentAddEntry(payload, transparentType, worldPos, sortKey);
++  } else if (g_originalAucTransparentAddEntry) {
++    g_originalAucTransparentAddEntry(payload, transparentType, worldPos, sortKey);
++  }
++
++  if (!canCapture || dxvk::g_numOfTransparentPtr == nullptr)
++    return;
++
++  const uint32_t after = *dxvk::g_numOfTransparentPtr;
++  if (after <= before)
++    return;
++
++  const float distanceSq = TryReadTransparentDistanceSq(before);
++  dxvk::war3::render::War3Renderer::instance().OnTransparentRenderable(
++      payload, transparentType, before, sortKey, distanceSq, identity);
++}
++
+ void War3HookRenderIdentity::Install(uintptr_t gameBase) {
+   if (!dxvk::war3::internal::kNativeRenderIdentityBridgeEnabled)
+     return;
+@@ -122,14 +229,26 @@ void War3HookRenderIdentity::Install(uintptr_t gameBase) {
+   auto resolveCode = [&](uintptr_t rva) -> LPVOID {
+     return reinterpret_cast<LPVOID>(gameBase + rva);
+   };
++  auto resolveData = [&](uintptr_t rva) -> LPVOID {
++    return reinterpret_cast<LPVOID>(gameBase + rva);
++  };
+ 
+   LPVOID worldObjectEntryRenderAddr = resolveCode(book.worldObjectEntryRender);
+   LPVOID renderQueueAddBatchAddr = resolveCode(book.renderQueueAddBatch);
++  LPVOID renderBatchSubmitAddr = resolveCode(book.renderBatchSubmit);
++  LPVOID aucTransparentAddEntryAddr = resolveCode(book.aucTransparentAddEntry);
++  LPVOID transparentArrayBaseAddr = resolveData(book.rqTransparentArrayBasePtr);
+ 
+   g_originalWorldObjectEntryRender =
+       reinterpret_cast<WorldObjectEntryRenderFn>(worldObjectEntryRenderAddr);
+   g_originalRenderQueueAddBatch =
+       reinterpret_cast<RenderQueueAddBatchFn>(renderQueueAddBatchAddr);
++  g_originalRenderBatchSubmit =
++      reinterpret_cast<RenderBatchSubmitFn>(renderBatchSubmitAddr);
++  g_originalAucTransparentAddEntry =
++      reinterpret_cast<AucTransparentAddEntryFn>(aucTransparentAddEntryAddr);
++  g_transparentArrayBasePtr =
++      reinterpret_cast<void **>(transparentArrayBaseAddr);
+ 
+   InstallMinHook(
+       worldObjectEntryRenderAddr,
+@@ -141,6 +260,16 @@ void War3HookRenderIdentity::Install(uintptr_t gameBase) {
+                  reinterpret_cast<LPVOID>(&Hook_RenderQueue_AddBatch),
+                  reinterpret_cast<LPVOID *>(&g_trampolineRenderQueueAddBatch),
+                  "Render", "RenderQueue_AddBatch", false, true);
++
++  InstallMinHook(renderBatchSubmitAddr,
++                 reinterpret_cast<LPVOID>(&Hook_RenderBatch_Submit),
++                 reinterpret_cast<LPVOID *>(&g_trampolineRenderBatchSubmit),
++                 "Render", "RenderBatch_Submit", false, true);
++
++  InstallMinHook(aucTransparentAddEntryAddr,
++                 reinterpret_cast<LPVOID>(&Hook_AUCTransparent_AddEntry),
++                 reinterpret_cast<LPVOID *>(&g_trampolineAucTransparentAddEntry),
++                 "Render", "AUCTransparent_AddEntry", false, true);
+ }
+ 
+ } // namespace dxvk::war3::hooks
+diff --git a/src/d3d9/war3/model/war3_model_hook.cpp b/src/d3d9/war3/model/war3_model_hook.cpp
+index c3034a6..1d8d41a 100644
+--- a/src/d3d9/war3/model/war3_model_hook.cpp
++++ b/src/d3d9/war3/model/war3_model_hook.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "war3_model_hook.h"
+ 
++#include "war3_model_resource_cache.h"
+ #include "war3_model_registry.h"
+ 
+ #include "../../d3d9_war3_debug.h"
+@@ -29,6 +30,8 @@ using CreateSpriteRuntimeFn = void *(__thiscall *)(void *thisPtr);
+ using SpriteFrameUpdateFn =
+     int(__thiscall *)(int thisPtr, float dt, int a3, unsigned int a4, int a5);
+ using SpriteFrameLiteUpdateFn = int(__thiscall *)(int thisPtr, float dt);
++using CreateGeosetFromRawArraysFn = void *(__fastcall *)(int, int, int, int, int,
++                                                         int, int, int);
+ using RuntimePoseUpdateFn =
+     int(__fastcall *)(int runtimeModel, const __m128i *poseMatrix, float scale,
+                       int a4, int a5);
+@@ -43,6 +46,7 @@ struct HookConfig {
+ };
+ 
+ constexpr uintptr_t kCreateSpriteRuntimeRva = 0x185250;
++constexpr uintptr_t kCreateGeosetFromRawArraysRva = 0x126250;
+ constexpr uintptr_t kSpriteFrameUpdateRva = 0x182300;
+ constexpr uintptr_t kSpriteFrameLiteUpdateRva = 0x1826C0;
+ constexpr uintptr_t kRuntimePoseUpdateRva = 0x12F0A0;
+@@ -59,6 +63,7 @@ std::atomic<uint32_t> g_poseLogCount{0};
+ std::atomic<uint32_t> g_spriteFrameLogCount{0};
+ 
+ CreateSpriteRuntimeFn g_trampolineCreateSpriteRuntime = nullptr;
++CreateGeosetFromRawArraysFn g_trampolineCreateGeosetFromRawArrays = nullptr;
+ SpriteFrameUpdateFn g_trampolineSpriteFrameUpdate = nullptr;
+ SpriteFrameLiteUpdateFn g_trampolineSpriteFrameLiteUpdate = nullptr;
+ RuntimePoseUpdateFn g_trampolineRuntimePoseUpdate = nullptr;
+@@ -252,9 +257,13 @@ void RecordRuntimeModelBinding(void *sourcePtr, void *spritePtr) {
+   auto &modelRegistry = ModelRegistry::instance();
+   modelRegistry.recordRuntimeModelBinding(spritePtr, runtimeModelPtr,
+                                           modelResourcePtr, 0u, sourceFlags);
++  ShadowModelResourceCache::instance().noteModelResourceBinding(modelResourcePtr,
++                                                                0u);
+ 
+   ModelResourceRecord resourceRecord = {};
+   if (modelRegistry.findByRuntimeModel(runtimeModelPtr, resourceRecord)) {
++    ShadowModelResourceCache::instance().noteModelResourceBinding(
++        resourceRecord.modelResourcePtr, resourceRecord.modelKey);
+     render::NoteShadowRuntimeModelBinding(
+         spritePtr, runtimeModelPtr, resourceRecord.modelResourcePtr,
+         resourceRecord.modelPath, resourceRecord.modelType,
+@@ -270,6 +279,12 @@ void RecordRuntimeModelBinding(void *sourcePtr, void *spritePtr) {
+   MaybeLogBinding(spritePtr, runtimeModelPtr, modelResourcePtr, 0u);
+ }
+ 
++void RecordGeosetResource(void *geosetPtr) {
++  if (!geosetPtr)
++    return;
++  ShadowModelResourceCache::instance().recordGeosetCreate(geosetPtr);
++}
++
+ void RecordRuntimePose(int runtimeModel, const __m128i *poseMatrix, float scale) {
+   if (runtimeModel == 0)
+     return;
+@@ -383,6 +398,17 @@ void *__fastcall Hook_CreateSpriteRuntime(void *thisPtr, void *edx) {
+   return spritePtr;
+ }
+ 
++void *__fastcall Hook_CreateGeosetFromRawArrays(int a1, int a2, int a3, int a4,
++                                                int a5, int a6, int a7, int a8) {
++  if (!g_trampolineCreateGeosetFromRawArrays)
++    return nullptr;
++
++  void *geosetPtr =
++      g_trampolineCreateGeosetFromRawArrays(a1, a2, a3, a4, a5, a6, a7, a8);
++  RecordGeosetResource(geosetPtr);
++  return geosetPtr;
++}
++
+ int __fastcall Hook_RuntimePoseUpdate(int runtimeModel,
+                                       const __m128i *poseMatrix, float scale,
+                                       int a4, int a5) {
+@@ -449,6 +475,22 @@ bool InstallCreateSpriteRuntimeHook(uintptr_t gameBase) {
+       "CreateSpriteRuntime", true, g_config.logEnabled);
+ }
+ 
++bool InstallCreateGeosetFromRawArraysHook(uintptr_t gameBase) {
++  const uintptr_t target = gameBase + kCreateGeosetFromRawArraysRva;
++  if (!IsExecutableRange(reinterpret_cast<const void *>(target), 16)) {
++    war3dbg::Print(
++        "DXVK_Model: geoset create 不可执行，跳过 Hook (addr=%p)\n",
++        reinterpret_cast<void *>(target));
++    return false;
++  }
++
++  return hooks::InstallMinHook(
++      reinterpret_cast<LPVOID>(target),
++      reinterpret_cast<LPVOID>(&Hook_CreateGeosetFromRawArrays),
++      reinterpret_cast<LPVOID *>(&g_trampolineCreateGeosetFromRawArrays),
++      "Model", "CreateGeosetFromRawArrays", true, g_config.logEnabled);
++}
++
+ bool InstallSpriteFrameUpdateHook(uintptr_t gameBase) {
+   const uintptr_t target = gameBase + kSpriteFrameUpdateRva;
+   if (!IsExecutableRange(reinterpret_cast<const void *>(target), 16)) {
+@@ -538,12 +580,12 @@ void Init(uintptr_t gameBase) {
+       "DXVK_WAR3_MODEL_HOOK",
+       dxvk::war3::internal::kShadowRuntimeModelHookEnabled);
+   g_config.logEnabled = GetEnvBoolCached("DXVK_WAR3_MODEL_LOG", false);
+-  // runtime-model / pose 链目前已经具备研究/验证价值，但在“上游结构直传 +
+-  // 动态单位姿态主路径”真正接通前，默认常驻开启仍会带来明显 CPU 回退，
+-  // 且动态单位阴影正确性还不够稳定。生产默认保持关闭，按需用环境变量显式
+-  // 开启进行专项验证：
+-  //   DXVK_WAR3_MODEL_POSE_HOOK=1
+-  g_config.poseEnabled = GetEnvBoolCached("DXVK_WAR3_MODEL_POSE_HOOK", false);
++  // 上层语义阴影 consumer 已经开始直接消费 runtime palette，因此这里不再
++  // 保持“默认关闭”。若需要快速止血，仍可通过环境变量显式关闭：
++  //   DXVK_WAR3_MODEL_POSE_HOOK=0
++  g_config.poseEnabled = GetEnvBoolCached(
++      "DXVK_WAR3_MODEL_POSE_HOOK",
++      dxvk::war3::internal::kShadowRuntimePoseHookEnabled);
+ 
+   war3dbg::Print("DXVK_Model: init enabled=%d pose=%d log=%d\n",
+                  g_config.enabled ? 1 : 0, g_config.poseEnabled ? 1 : 0,
+@@ -553,6 +595,7 @@ void Init(uintptr_t gameBase) {
+     return;
+ 
+   bool installed = InstallCreateSpriteRuntimeHook(gameBase);
++  installed = InstallCreateGeosetFromRawArraysHook(gameBase) || installed;
+   if (g_config.poseEnabled)
+     installed = InstallSpriteFrameUpdateHook(gameBase) || installed;
+   if (g_config.poseEnabled)
+diff --git a/src/d3d9/war3/render/war3_render_state.cpp b/src/d3d9/war3/render/war3_render_state.cpp
+index ad10721..a31d51d 100644
+--- a/src/d3d9/war3/render/war3_render_state.cpp
++++ b/src/d3d9/war3/render/war3_render_state.cpp
+@@ -29,6 +29,11 @@ std::atomic<bool> g_stageTouchedThisFrame{false};
+ std::atomic<int> g_maxStageThisFrame{-1};
+ std::atomic<int> g_maxStageCompletedThisFrame{-1};
+ std::atomic<int> g_maxMainWorldStageCompletedThisFrame{-1};
++std::atomic<bool> g_worldFramePrepareTouchedThisFrame{false};
++std::atomic<bool> g_worldFramePrepareCompletedThisFrame{false};
++std::atomic<bool> g_worldRenderSceneTouchedThisFrame{false};
++std::atomic<bool> g_worldRenderSceneCompletedThisFrame{false};
++std::atomic<bool> g_worldRenderSceneActive{false};
+ std::atomic<bool> g_uiDispatchTouchedThisFrame{false};
+ std::atomic<int> g_dispatcherStage{-1};
+ std::atomic<bool> g_dispatcherTouchedThisFrame{false};
+@@ -620,6 +625,11 @@ void War3RenderState::OnFrameStart() {
+   g_maxStageThisFrame.store(-1, std::memory_order_relaxed);
+   g_maxStageCompletedThisFrame.store(-1, std::memory_order_relaxed);
+   g_maxMainWorldStageCompletedThisFrame.store(-1, std::memory_order_relaxed);
++  g_worldFramePrepareTouchedThisFrame.store(false, std::memory_order_relaxed);
++  g_worldFramePrepareCompletedThisFrame.store(false, std::memory_order_relaxed);
++  g_worldRenderSceneTouchedThisFrame.store(false, std::memory_order_relaxed);
++  g_worldRenderSceneCompletedThisFrame.store(false, std::memory_order_relaxed);
++  g_worldRenderSceneActive.store(false, std::memory_order_relaxed);
+   g_stateLayer.store(War3RenderLayer::Unknown, std::memory_order_relaxed);
+   g_uiDispatchTouchedThisFrame.store(false, std::memory_order_relaxed);
+   g_dispatcherTouchedThisFrame.store(false, std::memory_order_relaxed);
+@@ -650,6 +660,26 @@ bool War3RenderState::HasWorldStageThisFrame() {
+   return g_stageTouchedThisFrame.load(std::memory_order_relaxed);
+ }
+ 
++bool War3RenderState::HasWorldFramePrepareThisFrame() {
++  return g_worldFramePrepareTouchedThisFrame.load(std::memory_order_relaxed);
++}
++
++bool War3RenderState::HasCompletedWorldFramePrepareThisFrame() {
++  return g_worldFramePrepareCompletedThisFrame.load(std::memory_order_relaxed);
++}
++
++bool War3RenderState::HasWorldRenderSceneThisFrame() {
++  return g_worldRenderSceneTouchedThisFrame.load(std::memory_order_relaxed);
++}
++
++bool War3RenderState::HasCompletedWorldRenderSceneThisFrame() {
++  return g_worldRenderSceneCompletedThisFrame.load(std::memory_order_relaxed);
++}
++
++bool War3RenderState::IsWorldRenderSceneActive() {
++  return g_worldRenderSceneActive.load(std::memory_order_relaxed);
++}
++
+ bool War3RenderState::HasReachedStageThisFrame(int stage) {
+   return g_maxStageThisFrame.load(std::memory_order_relaxed) >= stage;
+ }
+@@ -663,6 +693,28 @@ bool War3RenderState::HasMainWorldCompletedStageThisFrame(int stage) {
+              std::memory_order_relaxed) >= stage;
+ }
+ 
++void War3RenderState::OnWorldFramePrepareEnter() {
++  g_worldFramePrepareTouchedThisFrame.store(true, std::memory_order_relaxed);
++  g_worldFramePrepareCompletedThisFrame.store(false, std::memory_order_relaxed);
++}
++
++void War3RenderState::OnWorldFramePrepareExit() {
++  g_worldFramePrepareTouchedThisFrame.store(true, std::memory_order_relaxed);
++  g_worldFramePrepareCompletedThisFrame.store(true, std::memory_order_relaxed);
++}
++
++void War3RenderState::OnWorldRenderSceneEnter() {
++  g_worldRenderSceneTouchedThisFrame.store(true, std::memory_order_relaxed);
++  g_worldRenderSceneCompletedThisFrame.store(false, std::memory_order_relaxed);
++  g_worldRenderSceneActive.store(true, std::memory_order_relaxed);
++}
++
++void War3RenderState::OnWorldRenderSceneExit() {
++  g_worldRenderSceneTouchedThisFrame.store(true, std::memory_order_relaxed);
++  g_worldRenderSceneCompletedThisFrame.store(true, std::memory_order_relaxed);
++  g_worldRenderSceneActive.store(false, std::memory_order_relaxed);
++}
++
+ void War3RenderState::OnStageExit(int stage) {
+   int prevMax = g_maxStageCompletedThisFrame.load(std::memory_order_relaxed);
+   while (stage > prevMax && !g_maxStageCompletedThisFrame.compare_exchange_weak(
+@@ -753,6 +805,11 @@ void War3RenderState::ResetRuntimeState() {
+   g_maxStageThisFrame.store(-1, std::memory_order_relaxed);
+   g_maxStageCompletedThisFrame.store(-1, std::memory_order_relaxed);
+   g_maxMainWorldStageCompletedThisFrame.store(-1, std::memory_order_relaxed);
++  g_worldFramePrepareTouchedThisFrame.store(false, std::memory_order_relaxed);
++  g_worldFramePrepareCompletedThisFrame.store(false, std::memory_order_relaxed);
++  g_worldRenderSceneTouchedThisFrame.store(false, std::memory_order_relaxed);
++  g_worldRenderSceneCompletedThisFrame.store(false, std::memory_order_relaxed);
++  g_worldRenderSceneActive.store(false, std::memory_order_relaxed);
+   g_uiDispatchTouchedThisFrame.store(false, std::memory_order_relaxed);
+   g_dispatcherStage.store(-1, std::memory_order_relaxed);
+   g_dispatcherTouchedThisFrame.store(false, std::memory_order_relaxed);
+diff --git a/src/d3d9/war3/render/war3_render_state.h b/src/d3d9/war3/render/war3_render_state.h
+index f32ffe9..e362707 100644
+--- a/src/d3d9/war3/render/war3_render_state.h
++++ b/src/d3d9/war3/render/war3_render_state.h
+@@ -167,10 +167,19 @@ public:
+   static void SetSkipUi(bool skip);
+ 
+   static bool HasWorldStageThisFrame();
++  static bool HasWorldFramePrepareThisFrame();
++  static bool HasCompletedWorldFramePrepareThisFrame();
++  static bool HasWorldRenderSceneThisFrame();
++  static bool HasCompletedWorldRenderSceneThisFrame();
++  static bool IsWorldRenderSceneActive();
+   static bool HasReachedStageThisFrame(int stage);
+   static bool HasCompletedStageThisFrame(int stage);
+   static bool HasMainWorldCompletedStageThisFrame(int stage);
+   static void OnFrameStart();
++  static void OnWorldFramePrepareEnter();
++  static void OnWorldFramePrepareExit();
++  static void OnWorldRenderSceneEnter();
++  static void OnWorldRenderSceneExit();
+ 
+   static void OnUiDispatch();
+   static bool HasUiDispatchThisFrame();
+diff --git a/src/d3d9/war3/render/war3_renderer.cpp b/src/d3d9/war3/render/war3_renderer.cpp
+index e1f4848..5c16bc4 100644
+--- a/src/d3d9/war3/render/war3_renderer.cpp
++++ b/src/d3d9/war3/render/war3_renderer.cpp
+@@ -1,8 +1,11 @@
+ // war3_renderer.cpp - War3 渲染逻辑入口实现
+ 
+ #include "war3_renderer.h"
++#include "../model/war3_model_resource_cache.h"
+ #include "../model/war3_model_registry.h"
+ #include "war3_render_objects.h"
++#include "war3_visible_renderables.h"
++#include "war3_upper_layer_shadow.h"
+ #include "../render/war3_shadow_object_registry.h"
+ #include "war3_scene_collector.h"
+ 
+@@ -20,6 +23,9 @@ War3Renderer& War3Renderer::instance() {
+ 
+ void War3Renderer::BeginFrame() {
+     RenderObjectRegistry::instance().beginFrame();
++    VisibleRenderableRegistry::instance().beginFrame();
++    UpperLayerShadowRegistry::instance().beginFrame();
++    model::ShadowModelResourceCache::instance().beginFrame();
+     model::ModelRegistry::instance().beginFrame();
+     model::ModelInstanceRegistry::instance().beginFrame();
+     model::PoseRegistry::instance().beginFrame();
+@@ -28,6 +34,9 @@ void War3Renderer::BeginFrame() {
+ 
+ void War3Renderer::EndFrame() {
+     RenderObjectRegistry::instance().endFrame();
++    VisibleRenderableRegistry::instance().endFrame();
++    UpperLayerShadowRegistry::instance().endFrame();
++    model::ShadowModelResourceCache::instance().endFrame();
+     model::ModelRegistry::instance().endFrame();
+     model::ModelInstanceRegistry::instance().endFrame();
+     model::PoseRegistry::instance().endFrame();
+@@ -42,6 +51,26 @@ void War3Renderer::OnWorldObjectEntry(void* worldObjectEntry, void* sceneNode) {
+     RenderObjectRegistry::instance().mapSceneNode(worldObjectEntry, sceneNode);
+ }
+ 
++void War3Renderer::OnVisibleRenderables(
++    void* batchArray,
++    uint32_t before,
++    uint32_t after,
++    const RenderObjectIdentitySnapshot& identity) {
++    VisibleRenderableRegistry::instance().registerMainQueueRange(
++        batchArray, before, after, identity);
++}
++
++void War3Renderer::OnTransparentRenderable(
++    void* payload,
++    uint32_t transparentType,
++    uint32_t queueSlot,
++    uint32_t sortKey,
++    float distanceSq,
++    const RenderObjectIdentitySnapshot& identity) {
++    VisibleRenderableRegistry::instance().registerTransparentEntry(
++        payload, transparentType, queueSlot, sortKey, distanceSq, identity);
++}
++
+ void War3Renderer::SetCurrentWorldObjectContext(void* worldObjectEntry, void* sceneNode) {
+     s_tlsWorldObjectEntry = worldObjectEntry;
+     s_tlsSceneNode = sceneNode;
+diff --git a/src/d3d9/war3/render/war3_renderer.h b/src/d3d9/war3/render/war3_renderer.h
+index 75a2ba6..431faa9 100644
+--- a/src/d3d9/war3/render/war3_renderer.h
++++ b/src/d3d9/war3/render/war3_renderer.h
+@@ -6,6 +6,8 @@
+ 
+ namespace dxvk::war3::render {
+ 
++struct RenderObjectIdentitySnapshot;
++
+ class War3Renderer {
+ public:
+     static War3Renderer& instance();
+@@ -19,6 +21,16 @@ public:
+ 
+     // SceneNode 映射
+     void OnWorldObjectEntry(void* worldObjectEntry, void* sceneNode);
++    void OnVisibleRenderables(void* batchArray,
++                              uint32_t before,
++                              uint32_t after,
++                              const RenderObjectIdentitySnapshot& identity);
++    void OnTransparentRenderable(void* payload,
++                                 uint32_t transparentType,
++                                 uint32_t queueSlot,
++                                 uint32_t sortKey,
++                                 float distanceSq,
++                                 const RenderObjectIdentitySnapshot& identity);
+ 
+     // 当前对象上下文（用于同步调试或特殊逻辑）
+     void SetCurrentWorldObjectContext(void* worldObjectEntry, void* sceneNode);
+diff --git a/src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp b/src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp
+index 2be241b..3efadf9 100644
+--- a/src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp
++++ b/src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp
+@@ -1,6 +1,7 @@
+ #include "war3_shadow_runtime_bridge.h"
+ 
+ #include "../model/war3_model_hook.h"
++#include "../model/war3_model_resource_cache.h"
+ #include "../model/war3_model_registry.h"
+ #include "../core/war3_internal_test_config.h"
+ #include "war3_shadow_object_registry.h"
+@@ -190,6 +191,12 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary() {
+       model::PoseRegistry::instance().spriteFramePoseCount();
+   summary.matrixPaletteCount =
+       model::PoseRegistry::instance().matrixPaletteCount();
++  summary.shadowGeosetResourceCount =
++      model::ShadowModelResourceCache::instance().geosetRecordCount();
++  summary.shadowReadyGeosetCount =
++      model::ShadowModelResourceCache::instance().readyGeosetCount();
++  summary.shadowModelResourceCount =
++      model::ShadowModelResourceCache::instance().modelResourceCount();
+   summary.shadowRuntimeBoundCount =
+       ShadowObjectRegistry::instance().runtimeBoundCount();
+   summary.shadowIdentityCount =
+diff --git a/src/d3d9/war3/render/war3_shadow_runtime_bridge.h b/src/d3d9/war3/render/war3_shadow_runtime_bridge.h
+index 67b6387..db48204 100644
+--- a/src/d3d9/war3/render/war3_shadow_runtime_bridge.h
++++ b/src/d3d9/war3/render/war3_shadow_runtime_bridge.h
+@@ -15,6 +15,9 @@ struct ShadowRuntimeBridgeSummary {
+   uint64_t poseReadyCount = 0;
+   uint64_t spriteFramePoseCount = 0;
+   uint64_t matrixPaletteCount = 0;
++  uint64_t shadowGeosetResourceCount = 0;
++  uint64_t shadowReadyGeosetCount = 0;
++  uint64_t shadowModelResourceCount = 0;
+   uint64_t shadowRuntimeBoundCount = 0;
+   uint64_t shadowIdentityCount = 0;
+   uint64_t shadowPoseReadyCount = 0;
+diff --git a/src/d3d9/war3/tools/war3_perf_monitor.cpp b/src/d3d9/war3/tools/war3_perf_monitor.cpp
+index fb9f9c9..f98cb2e 100644
+--- a/src/d3d9/war3/tools/war3_perf_monitor.cpp
++++ b/src/d3d9/war3/tools/war3_perf_monitor.cpp
+@@ -1484,6 +1484,12 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
+   json << "    \"poseCacheMiss\": 0,\n";
+   json << "    \"bonePaletteUpdates\": " << runtimeSummary.matrixPaletteCount
+        << ",\n";
++  json << "    \"shadowGeosetResourceCount\": "
++       << runtimeSummary.shadowGeosetResourceCount << ",\n";
++  json << "    \"shadowReadyGeosetCount\": "
++       << runtimeSummary.shadowReadyGeosetCount << ",\n";
++  json << "    \"shadowModelResourceCount\": "
++       << runtimeSummary.shadowModelResourceCount << ",\n";
+   json << "    \"shadowPoseReadyCount\": "
+        << runtimeSummary.shadowPoseReadyCount << ",\n";
+   json << "    \"animationSequenceCount\": 0,\n";
+diff --git a/subprojects/StormBreaker b/subprojects/StormBreaker
+index 8bf7853..2b287f9 160000
+--- a/subprojects/StormBreaker
++++ b/subprojects/StormBreaker
+@@ -1 +1 @@
+-Subproject commit 8bf78535e736f95bc27aeea20498246cb7645c66
++Subproject commit 2b287f90cb9c9dac553a057e65904708161e3a88

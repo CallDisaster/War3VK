@@ -66,6 +66,8 @@ public:
   void endFrame();
 
   void noteRenderObject(const RenderObjectInfo &info);
+  void noteRenderObjectsBatch(
+      const std::vector<const RenderObjectInfo *> &infos);
   void noteInstanceIdentity(void *worldObjectEntry, void *sceneNode,
                             void *unitPtr, void *spritePtr, uint32_t jHandle,
                             uint32_t rawcode, ObjectKind kind);
@@ -88,6 +90,8 @@ public:
                            uint32_t matrixCount = 0,
                            uint64_t matrixHash = 0);
 
+  bool findByWorldObjectEntry(void *worldObjectEntry,
+                              ShadowObjectRecord &out) const;
   bool findBySceneNode(void *sceneNode, ShadowObjectRecord &out) const;
   bool findByUnitPtr(void *unitPtr, ShadowObjectRecord &out) const;
   bool findByHandle(uint32_t jHandle, ShadowObjectRecord &out) const;
@@ -104,8 +108,13 @@ private:
   ShadowObjectRegistry() = default;
 
   void storeRecord(const ShadowObjectRecord &record);
+  void noteInstanceIdentityLocked(void *worldObjectEntry, void *sceneNode,
+                                  void *unitPtr, void *spritePtr,
+                                  uint32_t jHandle, uint32_t rawcode,
+                                  ObjectKind kind);
 
   mutable std::mutex m_mutex;
+  std::unordered_map<void *, ShadowObjectRecord> m_byWorldObjectEntry;
   std::unordered_map<void *, ShadowObjectRecord> m_bySceneNode;
   std::unordered_map<void *, ShadowObjectRecord> m_byUnitPtr;
   std::unordered_map<void *, ShadowObjectRecord> m_bySpritePtr;

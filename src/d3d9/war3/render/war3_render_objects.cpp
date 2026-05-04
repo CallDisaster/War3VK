@@ -29,6 +29,7 @@ bool ShouldFeedShadowRuntimeRegistries() {
 
 struct BridgeRawcodeState {
   std::unordered_map<uint32_t, uint32_t> handleToRawcode;
+  std::unordered_map<uint32_t, void*> handleToUnitPtr;
   std::unordered_set<uint32_t> failedHandles;
   std::unordered_set<uint32_t> loggedRawcodes;
 };
@@ -89,30 +90,44 @@ uint32_t ResolveRawcodeByHandleCached(uint32_t jHandle, bool *outFromCache) {
     return it->second;
   }
 
-  if (state.failedHandles.find(jHandle) != state.failedHandles.end())
-    return 0;
+  void* unitPtr = nullptr;
+  if (auto it = state.handleToUnitPtr.find(jHandle);
+      it != state.handleToUnitPtr.end()) {
+    unitPtr = it->second;
+  } else {
+    if (state.failedHandles.find(jHandle) != state.failedHandles.end())
+      return 0;
 
-  const uint32_t handleId = GetHandleId(jHandle);
-  if (handleId == 0) {
-    state.failedHandles.insert(jHandle);
-    return 0;
+    const uint32_t handleId = GetHandleId(jHandle);
+    if (handleId == 0) {
+      state.failedHandles.insert(jHandle);
+      return 0;
+    }
+
+    void *objPtr = nullptr;
+    if (!HandleResolver::instance().resolveHandle(handleId, 0, &objPtr) ||
+        !objPtr) {
+      state.failedHandles.insert(jHandle);
+      return 0;
+    }
+
+    game::AgentWrapper agent(objPtr);
+    unitPtr = agent.GetUnitPtr();
+    if (!unitPtr)
+      unitPtr = objPtr; // 兼容“handle 直接指向 CUnit*”路径
+
+    game::UnitWrapper unit(unitPtr);
+    if (!unit.IsValid()) {
+      state.failedHandles.insert(jHandle);
+      return 0;
+    }
+    state.handleToUnitPtr[jHandle] = unitPtr;
   }
-
-  void *objPtr = nullptr;
-  if (!HandleResolver::instance().resolveHandle(handleId, 0, &objPtr) || !objPtr) {
-    state.failedHandles.insert(jHandle);
-    return 0;
-  }
-
-  void *unitPtr = nullptr;
-  game::AgentWrapper agent(objPtr);
-  unitPtr = agent.GetUnitPtr();
-  if (!unitPtr)
-    unitPtr = objPtr; // 兼容“handle 直接指向 CUnit*”路径
 
   game::UnitWrapper unit(unitPtr);
   if (!unit.IsValid()) {
     state.failedHandles.insert(jHandle);
+    state.handleToUnitPtr.erase(jHandle);
     return 0;
   }
 
@@ -124,6 +139,51 @@ uint32_t ResolveRawcodeByHandleCached(uint32_t jHandle, bool *outFromCache) {
 
   state.handleToRawcode[jHandle] = rawcode;
   return rawcode;
+}
+
+void* ResolveUnitPtrByHandleCached(uint32_t jHandle, bool* outFromCache) {
+  if (outFromCache)
+    *outFromCache = false;
+  if (jHandle == 0)
+    return nullptr;
+
+  auto& state = GetBridgeRawcodeState();
+  if (auto it = state.handleToUnitPtr.find(jHandle);
+      it != state.handleToUnitPtr.end()) {
+    if (outFromCache)
+      *outFromCache = true;
+    return it->second;
+  }
+
+  if (state.failedHandles.find(jHandle) != state.failedHandles.end())
+    return nullptr;
+
+  const uint32_t handleId = GetHandleId(jHandle);
+  if (handleId == 0) {
+    state.failedHandles.insert(jHandle);
+    return nullptr;
+  }
+
+  void *objPtr = nullptr;
+  if (!HandleResolver::instance().resolveHandle(handleId, 0, &objPtr) || !objPtr) {
+    state.failedHandles.insert(jHandle);
+    return nullptr;
+  }
+
+  void *unitPtr = nullptr;
+  game::AgentWrapper agent(objPtr);
+  unitPtr = agent.GetUnitPtr();
+  if (!unitPtr)
+    unitPtr = objPtr; // 兼容“handle 直接指向 CUnit*”路径
+
+  game::UnitWrapper unit(unitPtr);
+  if (!unit.IsValid()) {
+    state.failedHandles.insert(jHandle);
+    return nullptr;
+  }
+
+  state.handleToUnitPtr[jHandle] = unitPtr;
+  return unitPtr;
 }
 
 const char *RawcodeSourceToString(RawcodeSource source) {
@@ -156,6 +216,36 @@ void LogRawcodeOnce(uint32_t rawcode, uint32_t jHandle, int groupIdx,
       "handle=0x%08X group=%d kind=%s source=%s\n",
       fourcc, rawcode, jHandle, groupIdx, ObjectKindToString(kind),
       RawcodeSourceToString(source));
+}
+
+ObjectKind GuessObjectKindFromUnitFlags(uint32_t flags5C) {
+  const uint32_t exponent = (flags5C >> 23) & 0xFFu;
+  if (exponent >= 0x3Eu && exponent <= 0x43u &&
+      (flags5C & 0x007FFFFFu) != 0u) {
+    return ObjectKind::Destructible;
+  }
+
+  if ((flags5C & 0x80000000u) != 0u || flags5C > 0x7FFFFFFFu)
+    return ObjectKind::Destructible;
+
+  if ((flags5C & UnitFlags5C::Building) != 0u)
+    return ObjectKind::Building;
+  return ObjectKind::Unit;
+}
+
+bool TryResolveUnitMetadataFast(void *unitPtr, UnitMetaCacheEntry &out) {
+  if (unitPtr == nullptr || !IsReadableRangeFast(unitPtr, 0x64))
+    return false;
+
+  uint32_t rawcode = 0;
+  uint32_t flags5C = 0;
+  SafeReadU32Fast(unitPtr, CUnitOffsets::Rawcode, rawcode);
+  SafeReadU32Fast(unitPtr, CUnitOffsets::Flags5C, flags5C);
+
+  out.rawcode = rawcode;
+  out.flags5C = flags5C;
+  out.kind = GuessObjectKindFromUnitFlags(flags5C);
+  return true;
 }
 
 } // namespace
@@ -304,6 +394,7 @@ void RenderObjectRegistry::registerWorldObjectsBatch(
 
   const bool resolveFull = mode == RenderObjectBatchResolveMode::FullResolve;
   const bool resolveMetadata = mode != RenderObjectBatchResolveMode::IdentityOnly;
+  const bool feedShadowRuntime = ShouldFeedShadowRuntimeRegistries();
 
   Snapshot &snap = writeSnapshot();
   snap.byEntry.reserve(snap.byEntry.size() + items.size());
@@ -311,6 +402,9 @@ void RenderObjectRegistry::registerWorldObjectsBatch(
   // 注意：即便 resolveFull=false，只要 SceneCollector 提供了 jHandle，我们仍会写入 handleToInfo。
   // 因此这里必须始终 reserve，否则在大场景下会频繁 rehash，导致 Hook_WorldObjects_RenderGroup 开销暴涨。
   snap.handleToInfo.reserve(snap.handleToInfo.size() + items.size());
+  std::vector<const RenderObjectInfo *> shadowRuntimeInfos;
+  if (feedShadowRuntime)
+    shadowRuntimeInfos.reserve(items.size());
 
   for (const auto &item : items) {
     if (!item.worldObjectEntry)
@@ -358,6 +452,14 @@ void RenderObjectRegistry::registerWorldObjectsBatch(
       info.flags5C = 0;
       info.kind = ObjectKind::Unknown;
       RawcodeSource rawcodeSource = RawcodeSource::Unknown;
+      bool resolvedUnitFromHandle = false;
+      bool resolvedUnitFromHandleCache = false;
+
+      if (info.unitPtr == nullptr && info.jHandle != 0) {
+        info.unitPtr =
+            ResolveUnitPtrByHandleCached(info.jHandle, &resolvedUnitFromHandleCache);
+        resolvedUnitFromHandle = info.unitPtr != nullptr;
+      }
 
       if (info.unitPtr) {
         const uint64_t cacheKey = BuildUnitMetaCacheKey(info.unitPtr, info.jHandle);
@@ -368,19 +470,26 @@ void RenderObjectRegistry::registerWorldObjectsBatch(
           info.flags5C = cacheIt->second.flags5C;
           info.kind = cacheIt->second.kind;
           if (info.rawcode != 0) {
-            rawcodeSource = RawcodeSource::UnitPtr;
+            rawcodeSource =
+                resolvedUnitFromHandle
+                    ? (resolvedUnitFromHandleCache ? RawcodeSource::HandleCache
+                                                   : RawcodeSource::HandleResolved)
+                    : RawcodeSource::UnitPtr;
           }
         } else {
-          game::UnitWrapper unit(info.unitPtr);
-          if (unit.IsValid()) {
-            info.rawcode = unit.GetRawcode();
-            info.flags5C = unit.GetFlags5C();
-            info.kind = unit.GetKind(0);
+          UnitMetaCacheEntry meta = {};
+          if (TryResolveUnitMetadataFast(info.unitPtr, meta)) {
+            info.rawcode = meta.rawcode;
+            info.flags5C = meta.flags5C;
+            info.kind = meta.kind;
             unitMetaCache.emplace(
-                cacheKey,
-                UnitMetaCacheEntry{info.rawcode, info.flags5C, info.kind});
+                cacheKey, UnitMetaCacheEntry{info.rawcode, info.flags5C, info.kind});
             if (info.rawcode != 0)
-              rawcodeSource = RawcodeSource::UnitPtr;
+              rawcodeSource =
+                  resolvedUnitFromHandle
+                      ? (resolvedUnitFromHandleCache ? RawcodeSource::HandleCache
+                                                     : RawcodeSource::HandleResolved)
+                      : RawcodeSource::UnitPtr;
           }
         }
       }
@@ -410,10 +519,12 @@ void RenderObjectRegistry::registerWorldObjectsBatch(
       snap.sceneToInfo[item.sceneNode] = infoPtr;
     }
 
-    if (ShouldFeedShadowRuntimeRegistries()) {
-      NoteShadowRuntimeRenderObject(info);
-    }
+    if (feedShadowRuntime)
+      shadowRuntimeInfos.push_back(infoPtr);
   }
+
+  if (feedShadowRuntime && !shadowRuntimeInfos.empty())
+    NoteShadowRuntimeRenderObjectsBatch(shadowRuntimeInfos);
 }
 
 void RenderObjectRegistry::mapSceneNode(void *worldObjectEntry,

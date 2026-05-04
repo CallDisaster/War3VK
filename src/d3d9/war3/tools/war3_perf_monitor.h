@@ -159,6 +159,10 @@ public:
     uint32_t getPendingExportCount() const;
     void noteShadowBudgetFrame(const War3ShadowCaptureStats& stats);
     void noteShadowMapFallback(bool reusedLastComplete, bool renderedCurrentPartial);
+    void noteShadowReceiverFrame(uint32_t replayCasterCount,
+                                 uint64_t replayGeometryWork,
+                                 uint32_t requestedShadowResolution,
+                                 uint32_t effectiveShadowResolution);
 
     // 报告导出
     void exportHtmlReport(const std::string& outputPath);
@@ -239,6 +243,14 @@ private:
         uint64_t framesBudgetExceeded = 0;
         uint64_t framesReuseLastComplete = 0;
         uint64_t framesRenderCurrentPartial = 0;
+        uint64_t shadowReceiverFrames = 0;
+        uint64_t shadowReceiverReplayCasterCountTotal = 0;
+        uint64_t shadowReceiverReplayCasterCountMax = 0;
+        uint64_t shadowReceiverReplayGeometryWorkTotal = 0;
+        uint64_t shadowReceiverReplayGeometryWorkMax = 0;
+        uint64_t shadowReceiverAdaptiveResolutionFrames = 0;
+        uint64_t shadowReceiverRequestedResolutionLast = 0;
+        uint64_t shadowReceiverEffectiveResolutionLast = 0;
         uint64_t totalBudgetBytes = 0;
         uint64_t totalUsedBytes = 0;
         uint64_t maxBudgetBytes = 0;
@@ -280,9 +292,56 @@ private:
         uint64_t dynamicPoseCount = 0;
         uint64_t dynamicSkinnedOutputCount = 0;
         uint64_t fallbackDrawCount = 0;
+        uint64_t fallbackDrawCountTerrain = 0;
+        uint64_t fallbackDrawCountWorldObject = 0;
+        uint64_t fallbackDrawCountUnitObject = 0;
+        uint64_t objectFallbackDrawCount = 0;
         uint64_t semanticBridgeHit = 0;
         uint64_t semanticBridgeMiss = 0;
         uint64_t semanticBridgeBypassed = 0;
+        uint64_t semanticSceneSubmitted = 0;
+        uint64_t semanticSceneSubmittedUnit = 0;
+        uint64_t semanticSceneSubmittedSkinned = 0;
+        uint64_t semanticSceneLivePaletteRefreshAttemptCount = 0;
+        uint64_t semanticSceneLivePaletteRefreshHitCount = 0;
+        uint64_t semanticSceneLivePaletteRefreshMissCount = 0;
+        uint64_t semanticSceneLivePaletteMotionSampleCount = 0;
+        uint64_t semanticSceneLivePaletteMotionNewRuntimeCount = 0;
+        uint64_t semanticSceneLivePaletteMotionRawChangedCount = 0;
+        uint64_t semanticSceneLivePaletteMotionRawStableCount = 0;
+        uint64_t semanticSceneLivePaletteMotionGroupChangedCount = 0;
+        uint64_t semanticSceneLivePaletteMotionGroupStableCount = 0;
+        uint64_t semanticSceneDrawTimePoseAttemptCount = 0;
+        uint64_t semanticSceneDrawTimePosePublishedCount = 0;
+        uint64_t semanticSceneDrawTimePoseRejectUiOrEffectCount = 0;
+        uint64_t semanticSceneDrawTimePoseRejectVertexShaderCount = 0;
+        uint64_t semanticSceneDrawTimePoseRejectNoVertexBlendCount = 0;
+        uint64_t semanticSceneDrawTimePoseRejectNoContextCount = 0;
+        uint64_t semanticSceneDrawTimePoseRejectNoRuntimeModelCount = 0;
+        uint64_t semanticSceneDrawTimePoseDedupedCount = 0;
+        uint64_t semanticSceneDrawTimePoseChangedCount = 0;
+        uint64_t semanticSceneDrawTimePoseStableCount = 0;
+        uint64_t semanticSceneSubmittedPaletteMotionSampleCount = 0;
+        uint64_t semanticSceneSubmittedPaletteMotionNewRuntimeCount = 0;
+        uint64_t semanticSceneSubmittedPaletteMotionChangedCount = 0;
+        uint64_t semanticSceneSubmittedPaletteMotionStableCount = 0;
+        uint64_t semanticSceneSkinnedDynamicIndexSliceCount = 0;
+        uint64_t semanticSceneSkinnedFullIndexFallbackCount = 0;
+        uint64_t semanticSceneSkinnedMissingVisibleIndexSliceRejectCount = 0;
+        uint64_t semanticSceneSubmittedFrameLocal = 0;
+        uint64_t semanticSceneSubmittedPersistent = 0;
+        uint64_t semanticSceneSkippedUnitsOnlyFilter = 0;
+        uint64_t semanticSceneAcceptedExplicitResourceOwnerRigid = 0;
+        uint64_t semanticSceneRejectedNoVertex = 0;
+        uint64_t semanticSceneRejectedSkinnedContract = 0;
+        uint64_t semanticSceneRejectedGeometry = 0;
+        uint64_t semanticSceneRejectedGeometryFrameLocal = 0;
+        uint64_t semanticSceneRejectedGeometryPersistent = 0;
+        uint64_t semanticFallbackPruned = 0;
+        uint64_t semanticFallbackPrunedByHandle = 0;
+        uint64_t semanticFallbackPrunedByWorldObjectEntry = 0;
+        uint64_t semanticFallbackPrunedBySceneNode = 0;
+        uint64_t semanticFallbackPrunedByRuntimeModel = 0;
         uint64_t instancedGeometryGroups = 0;
         uint64_t instancedGeometryInstances = 0;
         uint64_t instancedGeometryDrawsSaved = 0;

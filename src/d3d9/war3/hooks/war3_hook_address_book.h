@@ -76,9 +76,13 @@ struct War3HookAddressBook {
   // Render 域
   // -------------------------------------------------------------------------
   uintptr_t renderDispatcher = 0;
+  uintptr_t worldFrameUpdateAndPreparePasses = 0;
+  uintptr_t worldRenderScene = 0;
   uintptr_t renderQueueAddBatch = 0;
   uintptr_t renderBatchSubmit = 0;
+  uintptr_t aucTransparentAddEntry = 0;
   uintptr_t sceneSubmitBatch = 0;
+  uintptr_t worldObjectListEntryWrite = 0;
   uintptr_t worldObjectEntryRender = 0;
   uintptr_t worldDispatch = 0;
   uintptr_t worldObjectsRenderGroup = 0;

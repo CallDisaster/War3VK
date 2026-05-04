@@ -167,10 +167,19 @@ public:
   static void SetSkipUi(bool skip);
 
   static bool HasWorldStageThisFrame();
+  static bool HasWorldFramePrepareThisFrame();
+  static bool HasCompletedWorldFramePrepareThisFrame();
+  static bool HasWorldRenderSceneThisFrame();
+  static bool HasCompletedWorldRenderSceneThisFrame();
+  static bool IsWorldRenderSceneActive();
   static bool HasReachedStageThisFrame(int stage);
   static bool HasCompletedStageThisFrame(int stage);
   static bool HasMainWorldCompletedStageThisFrame(int stage);
   static void OnFrameStart();
+  static void OnWorldFramePrepareEnter();
+  static void OnWorldFramePrepareExit();
+  static void OnWorldRenderSceneEnter();
+  static void OnWorldRenderSceneExit();
 
   static void OnUiDispatch();
   static bool HasUiDispatchThisFrame();

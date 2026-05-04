@@ -4,6 +4,7 @@
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/render/war3_render_objects.h"
 #include "war3/shader/war3_shader_manager.h"
+#include "war3/tools/war3_diagnostics_hub.h"
 #include "war3/tools/war3_perf_monitor.h"
 #include "war3_shader_api.h"
 
@@ -167,6 +168,45 @@ uint32_t ComputeAdaptiveShadowMapPeriod(size_t replayCasterCount) {
   }
 
   return period;
+}
+
+uint64_t EstimateShadowReplayGeometryWork(
+    const std::vector<const War3ShadowCasterDraw*>& replayDraws) {
+  uint64_t work = 0u;
+  for (const auto* draw : replayDraws) {
+    if (draw == nullptr)
+      continue;
+
+    uint32_t primitiveWork = draw->indexed ? draw->indexCount
+                                           : draw->vertexCount;
+    if (primitiveWork == 0u)
+      primitiveWork = draw->numVertices;
+    work += primitiveWork;
+  }
+  return work;
+}
+
+uint32_t ResolveAdaptiveShadowResolution(uint32_t requestedResolution,
+                                         uint64_t geometryWork) {
+  if constexpr (!war3::internal::kShadowAdaptiveResolutionEnabled)
+    return requestedResolution;
+
+  if (requestedResolution <= war3::internal::kShadowAdaptiveResolutionMin)
+    return requestedResolution;
+
+  uint32_t targetResolution = requestedResolution;
+  if (geometryWork >= war3::internal::kShadowAdaptiveResolutionHugeWork) {
+    targetResolution = std::min<uint32_t>(
+        targetResolution, war3::internal::kShadowAdaptiveResolutionHuge);
+  } else if (geometryWork >=
+             war3::internal::kShadowAdaptiveResolutionHighWork) {
+    targetResolution = std::min<uint32_t>(
+        targetResolution, war3::internal::kShadowAdaptiveResolutionHigh);
+  }
+
+  targetResolution = std::max<uint32_t>(
+      targetResolution, war3::internal::kShadowAdaptiveResolutionMin);
+  return targetResolution;
 }
 
 float MaxMatrixAbsDelta(const Matrix4& a, const Matrix4& b) {
@@ -1221,6 +1261,16 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   if (cascadeCount == 0)
     return;
 
+  // 首帧诊断：输出 replay draws 总数，定位渲染端输入量
+  {
+    static uint32_t s_diagLogCounter = 0;
+    if (s_diagLogCounter++ < 5u) {
+      WAR3_RENDER_LOG("DXVK ShadowMap[%u]: replayDraws=%u\n",
+                      s_diagLogCounter - 1u,
+                      static_cast<unsigned>(replayDraws.size()));
+    }
+  }
+
   // 1) 上传矩阵 SSBO：骨骼调色板 + 每个 draw 的 worldMatrix（用于静态物体 GPU
   // 端 MVP 计算）
   DxvkDescriptorWrite paletteDesc = {};
@@ -1285,6 +1335,10 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       static_cast<uint32_t>(replayDraws.size());
   std::vector<PreparedShadowCaster> prepared;
   prepared.resize(casterCount);
+  uint32_t skinnedCasterCount = 0;
+  uint32_t skinnedPreparedCount = 0;
+  uint32_t skinnedInvalidBufferCount = 0;
+  uint32_t skinnedInvalidPipelineCount = 0;
 
   auto len3 = [](float x, float y, float z) {
     return std::sqrt(x * x + y * y + z * z);
@@ -1293,12 +1347,21 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   // 预先准备 Pipeline 与排序 key（与级联无关）
   for (uint32_t i = 0; i < casterCount; i++) {
     const auto &draw = *replayDraws[i];
+    const bool skinnedDraw = draw.vertexBlendEnabled;
+    if (skinnedDraw)
+      skinnedCasterCount++;
     if (draw.positionInfo.buffer == VK_NULL_HANDLE ||
-        draw.positionInfo.size == 0)
+        draw.positionInfo.size == 0) {
+      if (skinnedDraw)
+        skinnedInvalidBufferCount++;
       continue;
+    }
     if (draw.indexed &&
-        (draw.indexInfo.buffer == VK_NULL_HANDLE || draw.indexInfo.size == 0))
+        (draw.indexInfo.buffer == VK_NULL_HANDLE || draw.indexInfo.size == 0)) {
+      if (skinnedDraw)
+        skinnedInvalidBufferCount++;
       continue;
+    }
 
     ShadowCasterPipelineKey key = {};
     key.positionFormat = draw.positionFormat;
@@ -1334,8 +1397,11 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
     PreparedShadowCaster out = {};
     out.pipeline = getShadowCasterPipeline(key);
-    if (out.pipeline.pipeline == VK_NULL_HANDLE)
+    if (out.pipeline.pipeline == VK_NULL_HANDLE) {
+      if (skinnedDraw)
+        skinnedInvalidPipelineCount++;
       continue;
+    }
 
     out.valid = true;
     out.pipelineHash = key.hash();
@@ -1344,6 +1410,8 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     out.alphaImageView = (draw.alphaTestEnabled && draw.diffuseTexture)
                              ? draw.textureDescriptor.legacy.image.imageView
                              : VK_NULL_HANDLE;
+    if (skinnedDraw)
+      skinnedPreparedCount++;
 
     prepared[i] = out;
   }
@@ -1364,10 +1432,17 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
   auto intersectsCascade = [&](const War3ShadowCasterDraw &draw,
                                uint32_t cascadeIdx) -> bool {
+    using war3::render::ObjectKind;
+
     if (draw.category == War3RenderState::StageCategory::Terrain)
       return true;
     if (!(draw.boundsRadius > 0.0f))
       return true;
+    const auto objectKind = static_cast<ObjectKind>(draw.objectKind);
+    if constexpr (war3::internal::kShadowCascadeCullDisableForUnits) {
+      if (objectKind == ObjectKind::Unit)
+        return true;
+    }
 
     const Matrix4 &m = m_csmData.cascades[cascadeIdx].lightViewProj;
     const Vector4 clip = m * draw.boundsCenter;
@@ -1381,17 +1456,42 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     const float ndcZ = clip.z * invW;
 
     const auto &p = cullParams[cascadeIdx];
-    const float r = draw.boundsRadius;
+    float r = draw.boundsRadius;
+    float guard = war3::internal::kShadowCascadeCullGuardBandNdc;
+    float zGuard = guard;
+    if (draw.vertexBlendEnabled) {
+      r = r * war3::internal::kShadowCascadeCullSkinnedRadiusScale +
+          war3::internal::kShadowCascadeCullSkinnedExtraRadius;
+      guard =
+          std::max(guard,
+                   war3::internal::kShadowCascadeCullSkinnedExtraGuardNdc);
+      zGuard =
+          std::max(zGuard,
+                   war3::internal::kShadowCascadeCullSkinnedZExtraGuardNdc);
+    } else if (objectKind == ObjectKind::Building) {
+      r *= war3::internal::kShadowCascadeCullBuildingRadiusScale;
+      guard =
+          std::max(guard,
+                   war3::internal::kShadowCascadeCullBuildingExtraGuardNdc);
+      zGuard = std::max(zGuard, guard);
+    } else if (draw.indexCount >= 8192u || draw.vertexCount >= 8192u ||
+               draw.numVertices >= 8192u) {
+      r *= war3::internal::kShadowCascadeCullLargeDrawRadiusScale;
+      guard =
+          std::max(guard,
+                   war3::internal::kShadowCascadeCullLargeDrawExtraGuardNdc);
+      zGuard = std::max(zGuard, guard);
+    }
     const float rX = r * p.row0Len * invW;
     const float rY = r * p.row1Len * invW;
     const float rZ = r * p.row2Len * invW;
 
-    if (ndcX + rX < -1.0f || ndcX - rX > 1.0f)
+    if (ndcX + rX < -1.0f - guard || ndcX - rX > 1.0f + guard)
       return false;
-    if (ndcY + rY < -1.0f || ndcY - rY > 1.0f)
+    if (ndcY + rY < -1.0f - guard || ndcY - rY > 1.0f + guard)
       return false;
     // Vulkan NDC: z ∈ [0, 1]
-    if (ndcZ + rZ < 0.0f || ndcZ - rZ > 1.0f)
+    if (ndcZ + rZ < -zGuard || ndcZ - rZ > 1.0f + zGuard)
       return false;
 
     return true;
@@ -1401,6 +1501,8 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   drawIndices.reserve(casterCount);
   std::array<uint32_t, 4> culledPerCascade = {};
   std::array<uint32_t, 4> drawnPerCascade = {};
+  std::array<uint32_t, 4> skinnedCulledPerCascade = {};
+  std::array<uint32_t, 4> skinnedDrawnPerCascade = {};
 
   for (uint32_t c = 0; c < cascadeCount; c++) {
     if (!m_shadowMapLayerViews[c])
@@ -1414,6 +1516,8 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       const auto &draw = *replayDraws[i];
       if (!intersectsCascade(draw, c)) {
         culled++;
+        if (draw.vertexBlendEnabled)
+          skinnedCulledPerCascade[c]++;
         continue;
       }
       drawIndices.push_back(i);
@@ -1641,6 +1745,8 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
       drawnCasters++;
       cascadeDrawn++;
+      if (draw.vertexBlendEnabled)
+        skinnedDrawnPerCascade[c]++;
     }
 
     drawnPerCascade[c] = cascadeDrawn;
@@ -1649,13 +1755,26 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
   if (casterCount > 0) {
     static uint32_t s_logDrawn = 0;
-    if (s_logDrawn++ % 300 == 0) {
+    const bool hasSkinnedCasters = skinnedCasterCount > 0u;
+    const uint32_t logIndex = s_logDrawn++;
+    // 前5帧强制日志，验证 renderShadowMap 实际画了多少 caster
+    if (logIndex < 5u ||
+        (hasSkinnedCasters &&
+         (logIndex < 12u || (logIndex % 120u) == 0u)) ||
+        (!hasSkinnedCasters && (logIndex % 300u) == 0u)) {
       WAR3_RENDER_LOG(
           "DXVK ShadowMap: DrawCalls=%u Casters=%u | C0=%u(-%u) C1=%u(-%u) "
-          "C2=%u(-%u) C3=%u(-%u)\n",
+          "C2=%u(-%u) C3=%u(-%u) | Skinned=%u prep=%u badBuf=%u badPipe=%u "
+          "draw=%u/%u/%u/%u cull=%u/%u/%u/%u\n",
           drawnCasters, casterCount, drawnPerCascade[0], culledPerCascade[0],
           drawnPerCascade[1], culledPerCascade[1], drawnPerCascade[2],
-          culledPerCascade[2], drawnPerCascade[3], culledPerCascade[3]);
+          culledPerCascade[2], drawnPerCascade[3], culledPerCascade[3],
+          skinnedCasterCount, skinnedPreparedCount, skinnedInvalidBufferCount,
+          skinnedInvalidPipelineCount, skinnedDrawnPerCascade[0],
+          skinnedDrawnPerCascade[1], skinnedDrawnPerCascade[2],
+          skinnedDrawnPerCascade[3], skinnedCulledPerCascade[0],
+          skinnedCulledPerCascade[1], skinnedCulledPerCascade[2],
+          skinnedCulledPerCascade[3]);
     }
   }
 
@@ -2727,6 +2846,30 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
   const auto replayDraws = BuildShadowReplayDraws(input.scene);
   const size_t replayCasterCount = replayDraws.size();
+  const uint64_t replayGeometryWork =
+      EstimateShadowReplayGeometryWork(replayDraws);
+  const uint32_t requestedShadowResolution = m_csmConfig.shadowResolution;
+  const uint32_t adaptiveShadowResolution =
+      ResolveAdaptiveShadowResolution(requestedShadowResolution,
+                                      replayGeometryWork);
+  if (adaptiveShadowResolution != requestedShadowResolution) {
+    static uint32_t s_adaptiveResolutionLogs = 0;
+    if (s_adaptiveResolutionLogs++ < 12u ||
+        (s_adaptiveResolutionLogs % 240u) == 0u) {
+      WAR3_RENDER_LOG(
+          "DXVK War3Shadow: adaptive shadow resolution %u -> %u "
+          "(casters=%u geometryWork=%llu)\n",
+          static_cast<unsigned>(requestedShadowResolution),
+          static_cast<unsigned>(adaptiveShadowResolution),
+          static_cast<unsigned>(replayCasterCount),
+          static_cast<unsigned long long>(replayGeometryWork));
+    }
+    m_csmConfig.shadowResolution = adaptiveShadowResolution;
+  }
+  war3::War3PerfMonitor::instance().noteShadowReceiverFrame(
+      static_cast<uint32_t>(std::min<size_t>(
+          replayCasterCount, std::numeric_limits<uint32_t>::max())),
+      replayGeometryWork, requestedShadowResolution, m_csmConfig.shadowResolution);
 
   // 计算本帧级联数据（需要外部捕获世界相机矩阵后才会有效）
   War3CsmData newCsm = m_csm.Compute(
@@ -2830,6 +2973,13 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         input.scene.shadowStats.dynamicPoseSignature ==
         m_lastDynamicPoseSignature;
     const auto& st = input.scene.shadowStats;
+    const bool hasDynamicSkinnedCasters =
+        st.dynamicSkinnedOutputCount != 0u ||
+        st.semanticSceneSubmittedSkinned != 0u ||
+        st.capturedUnitVertexBlend != 0u;
+    const bool dynamicContentStable =
+        !hasDynamicSkinnedCasters ||
+        (st.dynamicPoseSignature != 0u && dynamicPoseStable);
     const bool noSemanticOrCaptureInstability =
         st.semanticBridgeMiss == 0 &&
         st.skippedVertexShader == 0 &&
@@ -2844,8 +2994,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         csmDelta <=
             dxvk::war3::internal::kShadowAdaptiveMapUpdateCameraMaxDelta &&
         noSemanticOrCaptureInstability &&
-        input.scene.shadowStats.dynamicSkinnedOutputCount == 0 &&
-        dynamicPoseStable;
+        dynamicContentStable;
   }
 
   if (!reuseLastShadowMap && hasCandidateCsm) {
@@ -2899,12 +3048,18 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   war3::War3PerfMonitor::instance().noteShadowBudgetFrame(
       input.scene.shadowStats);
 
+  if (replayCasterCount > 0) {
+    dxvk::war3::tools::MarkInGameRenderReady("War3Shadow/Replay",
+                                             input.frameIndex);
+  }
+
   static uint32_t s_logTimer = 0;
   if ((s_logTimer++ % 300) == 0 && replayCasterCount > 0) {
     const auto &st = input.scene.shadowStats;
     WAR3_RENDER_LOG("DXVK War3Shadow: Run frame=%u casters=%u instances=%u "
                     "fallbacks=%u liveGeom=%u pool=%llu/%llu "
                     "captured=%u/%u/%u/%u unit=%u unitVB=%u "
+                    "semScene=%u/%u/%u "
                     "forceFreeze=%u/%u dynPose=%u dynSkin=%u "
                     "rej(noId/mode/dyn/alpha/miss/create)=%u/%u/%u/%u/%u/%u "
                     "skip(cap/vs/vb)=%u/%u/%u cascades=%u res=%u\n",
@@ -2924,6 +3079,9 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
                     static_cast<unsigned>(st.capturedWorldObject),
                     static_cast<unsigned>(st.capturedUnitObject),
                     static_cast<unsigned>(st.capturedUnitVertexBlend),
+                    static_cast<unsigned>(st.semanticSceneSubmitted),
+                    static_cast<unsigned>(st.semanticSceneSubmittedUnit),
+                    static_cast<unsigned>(st.semanticSceneSubmittedSkinned),
                     static_cast<unsigned>(st.forcedFallbackWorldFreezeCount),
                     static_cast<unsigned>(st.forcedFallbackUnitFreezeCount),
                     static_cast<unsigned>(st.dynamicPoseCount),

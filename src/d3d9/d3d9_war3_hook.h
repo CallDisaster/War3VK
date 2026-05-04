@@ -125,6 +125,15 @@ public:
    */
   static bool IsInShadowPass();
 
+  /**
+   * @brief 在运行时真正热起来后，惰性安装 native renderer takeover。
+   * @param reason 触发原因（用于诊断日志）。
+   *
+   * 该入口用于避免在 `ActivateWar3Runtime` 或伪 in-game 时机过早改写
+   * `CWorldFrameWar3::RenderScene`，导致地图进入链被冻结。
+   */
+  static void MaybeInstallNativeRendererTakeover(const char *reason = nullptr);
+
 private:
   static std::atomic<int> s_currentStage;
   static bool s_hooksInstalled;

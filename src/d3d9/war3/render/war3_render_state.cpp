@@ -29,6 +29,11 @@ std::atomic<bool> g_stageTouchedThisFrame{false};
 std::atomic<int> g_maxStageThisFrame{-1};
 std::atomic<int> g_maxStageCompletedThisFrame{-1};
 std::atomic<int> g_maxMainWorldStageCompletedThisFrame{-1};
+std::atomic<bool> g_worldFramePrepareTouchedThisFrame{false};
+std::atomic<bool> g_worldFramePrepareCompletedThisFrame{false};
+std::atomic<bool> g_worldRenderSceneTouchedThisFrame{false};
+std::atomic<bool> g_worldRenderSceneCompletedThisFrame{false};
+std::atomic<bool> g_worldRenderSceneActive{false};
 std::atomic<bool> g_uiDispatchTouchedThisFrame{false};
 std::atomic<int> g_dispatcherStage{-1};
 std::atomic<bool> g_dispatcherTouchedThisFrame{false};
@@ -446,9 +451,6 @@ bool War3RenderState::NeedsObjectTracking() {
 
 void War3RenderState::SetShadowSemanticTrackingEnabled(bool enabled) {
   g_needsShadowSemanticTrackingCached.store(enabled, std::memory_order_relaxed);
-  g_needsShadowObjectIdentityCached.store(enabled, std::memory_order_relaxed);
-  g_needsShadowDrawFallbackBridgeCached.store(enabled,
-                                              std::memory_order_relaxed);
 }
 
 bool War3RenderState::NeedsShadowSemanticTracking() {
@@ -620,6 +622,11 @@ void War3RenderState::OnFrameStart() {
   g_maxStageThisFrame.store(-1, std::memory_order_relaxed);
   g_maxStageCompletedThisFrame.store(-1, std::memory_order_relaxed);
   g_maxMainWorldStageCompletedThisFrame.store(-1, std::memory_order_relaxed);
+  g_worldFramePrepareTouchedThisFrame.store(false, std::memory_order_relaxed);
+  g_worldFramePrepareCompletedThisFrame.store(false, std::memory_order_relaxed);
+  g_worldRenderSceneTouchedThisFrame.store(false, std::memory_order_relaxed);
+  g_worldRenderSceneCompletedThisFrame.store(false, std::memory_order_relaxed);
+  g_worldRenderSceneActive.store(false, std::memory_order_relaxed);
   g_stateLayer.store(War3RenderLayer::Unknown, std::memory_order_relaxed);
   g_uiDispatchTouchedThisFrame.store(false, std::memory_order_relaxed);
   g_dispatcherTouchedThisFrame.store(false, std::memory_order_relaxed);
@@ -650,6 +657,26 @@ bool War3RenderState::HasWorldStageThisFrame() {
   return g_stageTouchedThisFrame.load(std::memory_order_relaxed);
 }
 
+bool War3RenderState::HasWorldFramePrepareThisFrame() {
+  return g_worldFramePrepareTouchedThisFrame.load(std::memory_order_relaxed);
+}
+
+bool War3RenderState::HasCompletedWorldFramePrepareThisFrame() {
+  return g_worldFramePrepareCompletedThisFrame.load(std::memory_order_relaxed);
+}
+
+bool War3RenderState::HasWorldRenderSceneThisFrame() {
+  return g_worldRenderSceneTouchedThisFrame.load(std::memory_order_relaxed);
+}
+
+bool War3RenderState::HasCompletedWorldRenderSceneThisFrame() {
+  return g_worldRenderSceneCompletedThisFrame.load(std::memory_order_relaxed);
+}
+
+bool War3RenderState::IsWorldRenderSceneActive() {
+  return g_worldRenderSceneActive.load(std::memory_order_relaxed);
+}
+
 bool War3RenderState::HasReachedStageThisFrame(int stage) {
   return g_maxStageThisFrame.load(std::memory_order_relaxed) >= stage;
 }
@@ -661,6 +688,28 @@ bool War3RenderState::HasCompletedStageThisFrame(int stage) {
 bool War3RenderState::HasMainWorldCompletedStageThisFrame(int stage) {
   return g_maxMainWorldStageCompletedThisFrame.load(
              std::memory_order_relaxed) >= stage;
+}
+
+void War3RenderState::OnWorldFramePrepareEnter() {
+  g_worldFramePrepareTouchedThisFrame.store(true, std::memory_order_relaxed);
+  g_worldFramePrepareCompletedThisFrame.store(false, std::memory_order_relaxed);
+}
+
+void War3RenderState::OnWorldFramePrepareExit() {
+  g_worldFramePrepareTouchedThisFrame.store(true, std::memory_order_relaxed);
+  g_worldFramePrepareCompletedThisFrame.store(true, std::memory_order_relaxed);
+}
+
+void War3RenderState::OnWorldRenderSceneEnter() {
+  g_worldRenderSceneTouchedThisFrame.store(true, std::memory_order_relaxed);
+  g_worldRenderSceneCompletedThisFrame.store(false, std::memory_order_relaxed);
+  g_worldRenderSceneActive.store(true, std::memory_order_relaxed);
+}
+
+void War3RenderState::OnWorldRenderSceneExit() {
+  g_worldRenderSceneTouchedThisFrame.store(true, std::memory_order_relaxed);
+  g_worldRenderSceneCompletedThisFrame.store(true, std::memory_order_relaxed);
+  g_worldRenderSceneActive.store(false, std::memory_order_relaxed);
 }
 
 void War3RenderState::OnStageExit(int stage) {
@@ -753,6 +802,11 @@ void War3RenderState::ResetRuntimeState() {
   g_maxStageThisFrame.store(-1, std::memory_order_relaxed);
   g_maxStageCompletedThisFrame.store(-1, std::memory_order_relaxed);
   g_maxMainWorldStageCompletedThisFrame.store(-1, std::memory_order_relaxed);
+  g_worldFramePrepareTouchedThisFrame.store(false, std::memory_order_relaxed);
+  g_worldFramePrepareCompletedThisFrame.store(false, std::memory_order_relaxed);
+  g_worldRenderSceneTouchedThisFrame.store(false, std::memory_order_relaxed);
+  g_worldRenderSceneCompletedThisFrame.store(false, std::memory_order_relaxed);
+  g_worldRenderSceneActive.store(false, std::memory_order_relaxed);
   g_uiDispatchTouchedThisFrame.store(false, std::memory_order_relaxed);
   g_dispatcherStage.store(-1, std::memory_order_relaxed);
   g_dispatcherTouchedThisFrame.store(false, std::memory_order_relaxed);

@@ -410,6 +410,16 @@ namespace dxvk {
 #endif
 
     try {
+      const bool diagEnabled =
+          !War3UseFpsUnlockOnlyMode() &&
+          dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
+              dxvk::war3::runtime::War3RuntimeModule::Diag);
+      if (diagEnabled || war3::tools::HasPendingFrameCaptureRequest()) {
+        war3::tools::ProcessPendingFrameCapture(
+            m_parent,
+            m_backBuffers.empty() ? nullptr : m_backBuffers[0].ptr());
+      }
+
       // War3 ImGui Render
       if (!War3UseFpsUnlockOnlyMode() &&
           dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
@@ -420,13 +430,6 @@ namespace dxvk {
             war3::War3Imgui::get().render(false);
         }
         war3::War3Imgui::get().endFrame();
-
-        if (dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
-                dxvk::war3::runtime::War3RuntimeModule::Diag)) {
-          war3::tools::ProcessPendingFrameCapture(
-              m_parent,
-              m_backBuffers.empty() ? nullptr : m_backBuffers[0].ptr());
-        }
       }
       
       UpdateWindowedRefreshRate();

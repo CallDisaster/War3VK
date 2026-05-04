@@ -1,0 +1,489 @@
+# WARCRAFT III 1.27a — 完整渲染管线研究课题
+# Date: 2026-05-04
+# 目标：提交给 ChatGPT Deep Research 进行深度校验研究的完整资料包
+
+================================================================================
+第一部分：项目背景与核心问题
+================================================================================
+
+## 我们的项目
+我们在魔兽争霸3 1.27a 中注入了一个 DXVK (Direct3D9 → Vulkan) 翻译层，并在引擎内部安插了
+MinHook 来劫持渲染管线，目的是为所有单位添加高质量的动态阴影。
+
+## 当前阻塞
+1. 阴影的 Pose（动画姿态）刷新率极低，跟不上主场景中模型的动画。
+2. 飞行单位、建筑、可破坏物、装饰物完全没有阴影。
+3. 大量阴影渲染时出现顶点撕裂（顶点拉伸/错乱）。
+
+## 核心矛盾
+我们的阴影贴图在 BeforeUi（主场景渲染前）就烘焙好了，但引擎在主场景渲染过程中才计算
+骨骼动画和写入调色板。因此阴影贴图永远落后主场景至少一帧（甚至更多帧）。
+
+## 你的任务
+1. 校验我们逆向的所有结构体字段是否正确。
+2. 校验我们逆向的所有函数语义是否正确。
+3. 补齐我们不知道的字段语义。
+4. 提出解决上述阻塞问题的技术方案。
+5. 重点关注 CPU 蒙皮（skinning）的完整流程：从动画计算 → 骨骼矩阵 → 调色板混合 → 顶点变换。
+
+================================================================================
+第二部分：完整的渲染管线函数调用图
+================================================================================
+
+## 2.1 MainLoop → RenderScene 主链路
+
+W3_MainLoop_ThreadEntry (0x6F05F710)
+  ├── MainLoop_SelectWorker (0x6F05DE80)
+  ├── MainLoop_PrepareWait (0x6F05DEE0)
+  ├── MainLoop_WaitGate (0x6F158940) → WaitForSingleObject
+  ├── MainLoop_SleepGate (0x6F1648A0) → Sleep
+  ├── MainLoop_PrepareDispatch (0x6F05FCA0) → LoadResourceBlock (0x6F05AE90)
+  ├── MainLoop_RunCallbacks (0x6F0603B0)
+  ├── MainLoop_MessagePump (0x6F059B00) → dispatch events → MainLoop_DispatchEventCase (0x6F05A310)
+  ├── MainLoop_FinalizeDispatch (0x6F05FD10)
+  ├── MainLoop_QueueFlush (0x6F05B080)
+  ├── MainLoop_TickUpdate (0x6F05FC10)
+  ├── MainLoop_FinalizeWorker (0x6F05DCE0)
+  ├── MainLoop_FinalizeTick (0x6F05FB10)
+  ├── MainLoop_ComputeWakeDelta (0x6F060500)
+  └── MainLoop_Reschedule (0x6F05EE90)
+
+MainLoop_DispatchEventCase (0x6F05A310) 中的 case 分发表：
+  Case 0 ~ 14，每个 case 调用不同的子函数（如 0x6F05A060, 0x6F05A0E0 等）。
+  大部分 case 最终汇聚到 LoadResourceBlock (0x6F05AE90)。
+
+## 2.2 渲染场景主链路 (CWorld_RenderScene)
+
+CWorld_RenderScene (0x6F3681C0)
+  ├── StateCleanup (0x6F185450)
+  ├── CWorld_SetShadowMode (0x6F76F550)
+  ├── CWorld_DispatchStage (0x6F363020) ← 核心调度器
+  │     ├── RenderCategory_Enable/Disable
+  │     ├── CWorld_TerrainShadow_Dispatch (0x6F76F060) ← 地形阴影
+  │     │     ├── TerrainShadow_RenderLayer (0x6F737620)
+  │     │     └── TerrainShadow_RenderListB (0x6F737400)
+  │     ├── CWorld_WorldObjects_RenderGroup (0x6F368E30) ← 世界对象渲染
+  │     │     └── WorldObjectEntry_Render (0x6F184EE0) ← 逐对象渲染
+  │     │           └── [调用 CSprite::vtable 中的 PreRender 虚函数]
+  │     │                 └── CSpriteUber__PreRenderAndUpdatePosePalette (0x6F182300)
+  │     └── [其他 Stage 调度函数]
+  ├── RenderQueue_FlushAndReset (0x6F139800) ← 队列刷新
+
+## 2.3 Sprite PreRender → 骨骼计算 → 调色板混合 完整链路
+
+CSpriteUber_PreRenderAndUpdatePosePalette (0x6F182300)  [vtable: 0x6F9647C8]
+  ├── CSpriteMini_PreRender (0x6F1825E0) — 简化版，用于飞行单位/小物体
+  ├── CModel_SetWorldMatrixAndEvaluateRootPose (0x6F12F0A0)
+  │     ├── CModelComplex_EvaluatePoseAndVisibleParts (0x6F12E900)
+  │     │     ├── [计算所有骨骼变换矩阵] → dword_6FBEE648(全局矩阵池)
+  │     │     ├── RenderQueue_AllocPaletteSlot (0x6F138FF0)
+  │     │     │     ├── GetGameFrameCounter (0x6F0E3510) → 帧计数器
+  │     │     │     ├── dword_6FBDA4C8: 每帧重置的偏移
+  │     │     │     ├── dword_6FBDA4CC: 帧标识
+  │     │     │     └── dword_6FBC6BE4: 全局线性 bump 分配器 (0~0x7530=30000)
+  │     │     ├── CModel_AllocAndFillGroupPalette (0x6F12FED0)
+  │     │     │     ├── RenderQueue_AllocPaletteSlot → 分配 slotIndex
+  │     │     │     │   → 写入 RenderablePart+0x08
+  │     │     │     ├── RenderQueue_GetPaletteSlotAddress (0x6F139060) → 槽位地址
+  │     │     │     └── CGeosetData_BuildGroupBlendedPalette (0x6F12E600)
+  │     │     │           └── CMatrixGroup_BlendOutputMatrix (0x6F12E200) [× groupCount]
+  │     │     │                 └── 输出到 dword_6FBC6BD0 + 48*slotIndex
+  │     │     ├── CModel_CopyResolvedPoseMatricesToOutputPalette (0x6F12FDC0)
+  │     │     │     → 复制到 CModel+0x60 (仅 2~3 个根骨骼矩阵)
+  │     │     └── CModel_FlushCurrentPoseStackToMatrices (0x6F12FF50)
+  │     └── CModelComplex_PropagatePoseToChildren (0x6F12EB70)
+  ├── CModel_EvalPoseStackAndChildren (0x6F12F7E0)
+  │     └── CModel_RecurseChildPoseStack (0x6F12EC90)
+  │           └── Controller_DispatchOutputToChildren (0x6F77C280)
+
+## 2.4 渲染队列 (RenderQueue) 链路
+
+RenderQueue_FlushSortedItems (0x6F1380A0)  [qsort 排序 + 两种 Dispatch]
+  ├── qsort (标准C库排序)
+  ├── RenderQueue_Dispatch_Common (0x6F13A5E0)
+  │     ├── RenderQueue_UpdateItemWorldMatrix (0x6F13A510)
+  │     ├── RenderQueue_BindDispatchBlock (0x6F13A710)
+  │     ├── GxDevice_ApplyStateBlock (0x6F0E34B0)
+  │     └── RenderSceneFlush (0x6F0E39E0)
+  └── RenderQueue_Dispatch_Special (0x6F13A780)
+        ├── RenderQueue_IsSpecialBatchStateConsistent (0x6F13AC70)
+        ├── RenderQueue_DispatchSpecialBatch (0x6F13A4A0)
+        └── RenderQueue_DispatchFallbackMultiPass (0x6F13A180)
+
+RenderBatch_Submit (0x6F1375C0) — 起批
+  ├── RenderBatch_CanEnqueueToMainQueue (0x6F1387E0)
+  ├── TransformPoint3x4 (0x6F1AA530) — 对 bounding box 做矩阵变换
+  ├── AUCTransparent_AddEntry (0x6F137AF0) — 透明队列
+  └── RenderQueue_ReserveBatchArray (0x6F139F90)
+
+RenderQueue_AddBatch (0x6F139190) — 添加批次
+  ├── RenderBatch_Submit
+  └── SceneNode_AddTransparentList[0~4] — 透明排序链表
+
+================================================================================
+第三部分：CGeosetData_BuildGroupBlendedPalette 完整反编译
+================================================================================
+
+// 从全局矩阵池读取原始矩阵，为每个矩阵组做混合，输出到目标调色板缓冲区
+// 参数: a1=CGeosetData* (geosetData), a2=全局矩阵池基址(dword_6FBEE648), a3=输出缓冲区
+__m128i *__fastcall CGeosetData_BuildGroupBlendedPalette(_DWORD *a1, const __m128i *a2, __m128i *a3)
+{
+  v4 = a1[60];              // a1 + 0xF0 = MatrixGroupCount
+  if (v4) {
+    v5 = (_DWORD *)a1[64];  // a1 + 0x100 = MatrixIndices (扁平化索引数组)
+    v6 = (unsigned int *)a1[61]; // a1 + 0xF4 = MatrixGroupSizes (每组几个矩阵)
+    do {
+      CMatrixGroup_BlendOutputMatrix((int)a2, v5, *v6, a3);
+      v7 = *v6++;            // 当前组的矩阵数量
+      v5 += v7;              // 索引指针前进 v7 个 uint32_t
+      a3 += 3;               // 输出前进 3 个 __m128i = 48 字节
+      --v4;
+    } while (v4);
+  } else {
+    // 只有单个矩阵：直接拷贝，不做混合
+    *a3 = _mm_loadu_si128(a2);
+    a3[1] = _mm_loadu_si128(a2 + 1);
+    a3[2] = _mm_loadu_si128(a2 + 2);
+  }
+  return a3;
+}
+
+================================================================================
+第四部分：RenderQueue_AllocPaletteSlot 完整反编译
+================================================================================
+
+// 全局调色板槽位的 bump 分配器。返回的 slotIndex 写入 RenderablePart+0x08。
+// 参数 this = 分配大小（来自 meshData+240，通常是矩阵组数量）
+int __thiscall RenderQueue_AllocPaletteSlot(void *this)
+{
+  // 帧检测
+  v3 = GetGameFrameCounter(1);
+  if (v3 == dword_6FBDA4CC) {  // 同一帧
+    v4 = dword_6FBDA4C8;       // 继续从当前偏移累积
+  } else {
+    dword_6FBDA4CC = v3;       // 新帧 → 记录帧标识
+    v4 = 0;                    // 重置每帧偏移
+  }
+  dword_6FBDA4C8 = (int)this + v4;  // 累积偏移 += this(分配大小)
+  
+  // dword_6FBDA4C8 溢出检查 (max 0x3A98=15000)
+  if (this + v4 >= 0x3A98) {
+    dword_6FBDA4C8 = 0;
+  }
+  
+  // dword_6FBC6BE4: 全局线性 bump 分配器
+  v5 = dword_6FBC6BE4;        // 保存旧光标作为返回值
+  if (this + dword_6FBC6BE4 > 0x7530)  // 溢出检查 (max 0x7530=30000)
+    v5 = 0;
+  dword_6FBC6BE4 = (int)this + v5;  // 新光标 = 旧 + 大小
+  return v5;                   // 返回旧光标 = slotIndex
+}
+
+================================================================================
+第五部分：CModel_AllocAndFillGroupPalette 完整反编译
+================================================================================
+
+// 遍历 CModel 的所有 Geoset(RenderablePart)，为每个分配调色板槽位并填充混合调色板
+// 参数: this = CModel*
+_DWORD *__thiscall CModel_AllocAndFillGroupPalette(_DWORD *this)
+{
+  v2 = *(this + 3);        // CModel + 0x0C = geosetCount
+  for (i = (int *)*(this + 4); v2; ++i) {  // CModel + 0x10 = geosetArray
+    v4 = *i;               // 当前 geoset 指针
+    --v2;
+    if (!*(_DWORD *)(*i + 16)) {  // geoset + 0x10 = SkipFlag (0 才执行)
+      v5 = *(_DWORD *)(v4 + 12);  // geoset + 0x0C = meshData 指针
+      if (*(_BYTE *)(result[8] + 16 * *(_DWORD *)(v5 + 284) + 3)) {
+        // meshData + 0x11C → 某个标志字段中的 bit
+        v6 = RenderQueue_AllocPaletteSlot(*(_DWORD *)(v5 + 240));
+        //                                        meshData + 0xF0 = 分配大小
+        *(_DWORD *)(v4 + 8) = v6;  // geoset/RenderablePart + 0x08 = slotIndex
+        v7 = RenderQueue_GetPaletteSlotAddress(v6);
+        //     → 返回 dword_6FBC6BD0 + 48*slotIndex
+        CGeosetData_BuildGroupBlendedPalette(v7);
+        //     → 传入输出缓冲区地址
+      }
+    }
+  }
+  return result;
+}
+
+================================================================================
+第六部分：所有已知结构体定义（来自逆向）
+================================================================================
+
+## 6.1 CModel (Runtime Model) — 运行时模型实例
+
+CModel + 0x00: void** vf_table            // vtable 指针 (CModel::vftable @ 0x6F96173C)
+CModel + 0x04: uint32_t ref_count          // 引用计数
+CModel + 0x08: uint32_t geosetCapacity     // [待验证] Geoset 数组容量
+CModel + 0x0C: uint32_t geosetCount         // Geoset 数组当前数量
+CModel + 0x10: void** geosets               // Geoset 指针数组 (每个元素是 CGeoset*)
+CModel + 0x18: ???                          // [未知] — 可能是 GeosetBindingCapacity
+CModel + 0x1C: ???                          // [未知] — 可能是 GeosetBindingCount
+CModel + 0x20: ???                          // [未知] — 可能是 GeosetBindingRecords
+CModel + 0x28: ???                          // [未知] — 可能是 MaterialCapacity
+CModel + 0x2C: ???                          // [未知] — 可能是 MaterialCount
+CModel + 0x30: ???                          // [未知] — 可能是 Materials
+CModel + 0x48: ???                          // [未知] — 可能是 ExtraHandleCapacity
+CModel + 0x4C: ???                          // [未知] — 可能是 ExtraHandleCount
+CModel + 0x50: ???                          // [未知] — 可能是 ExtraHandles
+CModel + 0x5C: uint32_t finalPoseMatrixCount // 最终 Pose 矩阵数量 (通常 2~3)
+CModel + 0x60: float* finalPoseMatrixArray  // 最终 Pose 矩阵数组 (48字节/矩阵, 3x4格式)
+CModel + 0x64: float[12] worldMatrix3x4    // 世界变换矩阵 (3x4)
+CModel + 0x94: uint32_t flags               // 运行时标志 (Complex/Plain 等)
+CModel + 0x98: void* partStateController   // CModelPartStateController*
+CModel + 0x9C: void* ownedModelDataHandle   // HMODELDATA (持有的模型数据句柄)
+CModel + 0xA0: uint32_t complexExtension    // [待验证] CModelComplex 扩展起始
+CModel + 0xA8: ???                          // [未知]
+CModel + 0xB4: void* localPointOutputArray  // [待验证] 本地点输出数组
+CModel + 0xC4: uint32_t childBucketCount    // 子运行时模型桶数量
+CModel + 0xC8: void* childBuckets           // SceneNodeChildBucket* 子运行时桶
+CModel + 0xD4: uint8_t* childEligibilityCache // [待验证] 子部件资格缓存
+CModel + 0xFC: void* overrideOutputBundle   // [待验证] 重载输出包
+
+## 6.2 CSprite (Base Sprite) — 精灵基类
+
+CSprite + 0x00: void** vf_table            // vtable (CSpriteUber @ 0x6F9647BC, CSpriteMini @ 0x6F9646F4)
+CSprite + 0x04: uint32_t ref_count          // 引用计数
+CSprite + 0x08: ???[0x18]                   // [未知]
+CSprite + 0x20: CModel* model_runtime       // 关联的运行时模型 (CModel*)
+CSprite + 0x28: uint32_t sprite_flags       // Sprite 状态标志
+CSprite + 0x2C: int32_t cached_sequence_id  // 缓存的动画序列ID
+CSprite + 0x30: void* sequence_provider     // 动画序列提供者
+CSprite + 0x34: uint8_t anim_queue_count    // 动画队列当前数量
+CSprite + 0x35: uint8_t anim_queue_head     // 队列头索引
+CSprite + 0x36: uint8_t anim_queue_tail     // 队列尾索引
+CSprite + 0x40: void* anim_queue_entries    // 动画队列条目数组
+
+## 6.3 CSpriteUber (Full Sprite) — 完整精灵/模型实例
+
+CSpriteUber 继承 CSprite (sizeof=0x44):
+CSpriteUber + 0x44: ???[0x50]                 // [未知] 0x50 字节
+CSpriteUber + 0x94: uint32_t anim_time_override_enabled  // 动画时间覆写开关
+CSpriteUber + 0xA0: float anim_time_override_sec         // 覆写的动画时间(秒)
+CSpriteUber + 0xC0: float x                             // 世界坐标 X
+CSpriteUber + 0xC4: float y                             // 世界坐标 Y
+CSpriteUber + 0xC8: float z                             // 世界坐标 Z
+CSpriteUber + 0xE8: float uniform_scale                  // 统一缩放
+CSpriteUber + 0x108: float[12] world_matrix_3x4         // 世界变换矩阵(3x4)
+CSpriteUber + 0x138: uint32_t render_flags              // 渲染标志
+CSpriteUber + 0x148: uint32_t color_rgba                // 颜色RGBA
+
+## 6.4 CGeoset / CGeosetData — 几何体
+
+CGeoset + 0x00: void** vf_table            // vtable
+CGeoset + 0x04: uint32_t ref_count          // 引用计数
+CGeoset + 0x08: uint32_t paletteSlotIndex   // [双语义] 调色板槽位索引 / StagePresetSpanBaseIndex
+CGeoset + 0x0C: void* meshData              // 关联的 MeshData* (CGeosetData)
+CGeoset + 0x10: uint32_t skipFlag           // 跳过标志 (1=跳过调色板分配)
+CGeoset + 0x14: void* sceneNodeBackPtr      // 回指 SceneNode*
+
+CGeosetData (MeshData) 的子结构:
+CGeosetData + 0x0C: uint32_t vertexCount    // 顶点数量
+CGeosetData + 0x10: float* vertexPositions  // 顶点位置 (float3)
+CGeosetData + 0x48: uint32_t vertexGroupCount // [待验证] 骨骼组索引数量
+CGeosetData + 0x4C: uint8_t* vertexGroupIndices // 每顶点的骨骼组索引 (1字节/顶点)
+CGeosetData + 0xF0: uint32_t matrixGroupCount   // 矩阵组的数量
+CGeosetData + 0xF4: uint32_t* matrixGroupSizes  // 每组包含的骨骼矩阵数量
+CGeosetData + 0x100: uint32_t* matrixIndices    // 扁平化的骨骼矩阵索引表
+CGeosetData + 0x11C: uint8_t someFlag            // [待验证] 控制调色板分配的标志
+
+## 6.5 MeshData (动态网格数据) — 渲染时段的动态数据
+
+MeshData + 0x10: float* dynamicPositions     // [待验证] 动态顶点位置 (可能是 post-skin 数据)
+MeshData + 0x48: uint32_t ???               // [待验证] 可能是 stream1 count
+MeshData + 0x4C: uint8_t* auxStream          // [待验证] 辅助 per-vertex stream (blend/remap contract)
+MeshData + 0x58: uint32_t ???               // [待验证] 可能是 stream1 stride
+MeshData + 0xF0: uint32_t matrixGroupCount   // [待验证] binding/pose ctx/merged-slot-like ID
+MeshData + 0xF4: ???                        // [未知]
+MeshData + 0x100: ???                       // [未知]
+MeshData + 0x104: uint32_t meshFlag104       // [待验证] 网格标志
+MeshData + 0x11C: uint8_t paletteFlag        // [待验证] 控制调色板分配的标志
+
+## 6.6 WorldObjectEntry — 世界对象表条目
+
+WorldObjectEntry + 0x00: ???                // [未知]
+WorldObjectEntry + 0x0C: ???                // [未知] 可能引用 CUnit*
+WorldObjectEntry + 0x10: ???                // [未知] 可能引用 CUnit*
+WorldObjectEntry + 0x14: void* ownerHint     // [待验证] 对象所有者提示 (通常为0)
+WorldObjectEntry + 0x20: void* sceneNode     // 关联的 SceneNode*
+
+## 6.7 SceneNode / 场景节点
+
+SceneNode + 0x00: ???                       // [未知]
+SceneNode + 0x04: ???                       // [未知]
+SceneNode + 0x08: ???                       // [未知]
+SceneNode + 0x0C: ???                       // [未知]
+SceneNode + 0x10: ???                       // [未知]
+SceneNode + 0x14: ???                       // [未知]
+SceneNode + 0xC4: uint32_t childCount       // 子节点数量
+SceneNode + 0xC8: void* childBuckets        // SceneNodeChildBucket* 子节点桶
+SceneNode + 0xD4: uint8_t* visibilityCache  // 可见性缓存
+
+================================================================================
+第七部分：CPU 蒙皮 (Skinning) 完整流程
+================================================================================
+
+## 7.1 数据流
+
+[动画数据] → CModelAnimController::AdvanceTime
+  → 计算每根骨骼的局部变换矩阵
+  → 层级传播 (parent→child 矩阵级联)
+  → 写入 全局矩阵池 dword_6FBEE648
+  → CModel_AllocAndFillGroupPalette
+    → 为每个 RenderablePart(Geoset):
+      → RenderQueue_AllocPaletteSlot → 分配 slotIndex → 写入 +0x08
+      → CGeosetData_BuildGroupBlendedPalette:
+        → 读取 CGeosetData+0xF0 → groupCount
+        → 读取 CGeosetData+0xF4 → matrixGroupSizes[i] (每组几个矩阵)
+        → 读取 CGeosetData+0x100 → matrixIndices (扁平化，指向矩阵池中的位置)
+        → CMatrixGroup_BlendOutputMatrix(矩阵池, matrixIndices, matrixGroupSizes[i], 输出):
+          → 单骨骼(1): 直接拷贝矩阵池数据
+          → 双骨骼(2): (矩阵A+矩阵B)×0.5 (等权平均)
+          → N骨骼(N): 累加后÷N (等权平均)
+        → 输出到 dword_6FBC6BD0 + 48*slotIndex + group*48
+  → 渲染时：
+    → GxDevice 读取 CGeosetData+0x4C → vertexGroupIndices[i]
+    → vertexGroupIndices[i] → 索引到 dword_6FBC6BD0 + 48*slotIndex + group*48
+    → 取出混合后的矩阵 → 变换顶点位置 → CPU 蒙皮完成
+    → DrawPrimitiveUP 提交变形后的顶点
+
+## 7.2 关键数据格式
+
+调色板矩阵格式 (3x4, 48 字节):
+  float pose3x4[12];  // 前三行是 3x4 仿射矩阵，第四行隐含为 (0,0,0,1)
+  
+全局缓冲区布局 (dword_6FBC6BD0):
+  dword_6FBC6BD0 → 堆上分配的缓冲区指针
+  每个槽位: 48 字节 × slotIndex 偏移  
+  每个槽位内的布局: [Group0的3x4矩阵(48B)][Group1的3x4矩阵(48B)]...[GroupN的3x4矩阵(48B)]
+
+顶点→矩阵映射:
+  CGeosetData+0x4C → vertexGroupIndices[vertexIndex] = groupSlot
+  groupSlot 直接作为调色板中的索引 → palette[groupSlot] 就是该顶点用的矩阵
+
+## 7.3 未解决的关键问题
+
+Q1: CGeosetData+0x4C 的 vertexGroupIndices 是静态的还是运行时动态计算的？
+    如果是动态的（通过 CModel_RemapVertexGroupIndicesForGeoset 0x6F131320 重映射），
+    那么每帧的重映射逻辑是什么？
+
+Q2: MeshData+0x10 指向的动态顶点位置是什么？是 CPU 蒙皮后（post-skin）的最终顶点吗？
+    如果是，那我们就完全可以直接用这些顶点作为阴影几何，不需要自己再做蒙皮！
+
+Q3: MeshData+0x4C 的辅助 per-vertex stream 包含什么数据？
+    样本: 0x10000101, 0x07030502, 0x24141313, 0x02000202
+    这看起来像 packed byte 流，可能是 blend weights 和 blend indices 的压缩形式。
+
+Q4: RenderablePart 和 Geoset 是同一个对象吗？
+    Geoset+0x08 被读写的时机和 RenderablePart+0x08 被读写的时机是否相同？
+
+Q5: 飞行单位 (CSpriteMini) 是否走 CModel_AllocAndFillGroupPalette？
+    从 callees 看，CSpriteMini_PreRender (0x6F1825E0) 调用了 CModel_EvalPoseStackAndChildren
+    但不直接调用 CModel_AllocAndFillGroupPalette。那么 Mini sprite 的调色板是如何分配的？
+
+Q6: 建筑/可破坏物/装饰物使用什么 Sprite 类型？它们的 PreRender 调用链是什么？
+    是否根本没有通过调色板方式进行蒙皮（因为它们没有骨骼动画）？
+
+Q7: dword_6FBC6BD0 缓冲区在帧之间是否被清空或重用？
+    从 bump 分配器的行为来看（dword_6FBC6BE4 单调递增到 30000 后才回绕），
+    每个 slot 分配后不会被显式释放。但帧间 dword_6FBDA4C8 会重置。
+
+================================================================================
+第八部分：关键全局变量
+================================================================================
+
+变量名                       地址            语义
+────────────────────────────────────────────────────────────────────────────────
+dword_6FBC6BD0               0x6FBC6BD0      全局调色板缓冲区指针 (运行时堆分配)
+dword_6FBEE648               0x6FBEE648      全局骨骼矩阵池指针 (运行时分配)
+dword_6FBDA4C8               0x6FBDA4C8      调色板每帧偏移 (帧切换时归零)
+dword_6FBDA4CC               0x6FBDA4CC      调色板的帧计数器 (用于检测帧切换)
+dword_6FBC6BE4               0x6FBC6BE4      调色板槽位 bump 分配器光标 (单调递增,最大30000)
+dword_6FBC6BAC               0x6FBC6BAC      渲染队列 Opaque 元素计数
+
+================================================================================
+第九部分：Shadow（阴影）相关函数
+================================================================================
+
+CWorld_TerrainShadow_Dispatch (0x6F76F060) — 地形阴影分发
+  └── TerrainShadow_RenderLayer (0x6F737620) — 渲染阴影层
+        └── TerrainShadow_RenderListB (0x6F737400) — 渲染 ListB (type=1/2/3/4)
+              └── TerrainShadow_RenderListBEntry (0x6F737310)
+
+ShadowProjector 系统 (建筑/可破坏物的贴花阴影):
+  ShadowProjector_ToggleEmitterStamp (0x6F74DE40)
+    └── TerrainShadow_RegisterImageEntry (0x6F713250) — 注册阴影贴图
+    
+  ShadowUpdate_WriteEntry (0x6F73F7A0) — 阴影更新写入
+  ShadowProjector_Add_Simple (0x6F764AC0) — 简单投影器添加
+
+================================================================================
+第十部分：ChatGPT Deep Research 研究任务
+================================================================================
+
+## 任务1：结构体字段校验
+
+请逐个校验第六部分中标记为 "[待验证]" 和 "[未知]" 的所有结构体字段。
+对于每个字段，请通过以下方式确认其语义：
+1. 在 IDA 中追踪对该偏移的读写模式（cross-reference → xrefs_to_field）。
+2. 查看读写该字段的函数的上下文。
+3. 特别注意指针类型字段（通过解引用链追踪）。
+
+重点关注的字段：
+- MeshData+0x10: 是否真的是动态/蒙皮后的顶点位置？
+- MeshData+0x4C: 辅助 per-vertex stream 的具体含义
+- CModel+0x18~0x50 的所有未确认字段
+- CGeoset+0x08: stagePresetSpanBaseIndex vs paletteSlotIndex 的双语义真相
+- WorldObjectEntry 的所有字段
+
+## 任务2：函数语义确认
+
+以下函数的真实语义需要验证：
+1. RenderQueue_AllocPaletteSlot (0x6F138FF0): dword_6FBDA4C8 和 dword_6FBC6BE4 的确切关系
+2. CModel_RemapVertexGroupIndicesForGeoset (0x6F131320): 重映射的输入输出
+3. MeshData+0xF0 的语义 — 它是 binding/pose ctx ID 还是真的 matrixGroupCount？
+
+## 任务3：飞行单位 CSpriteMini 的渲染路径
+
+请追踪 CSpriteMini_PreRender (0x6F1825E0) 的完整调用链：
+- 它如何处理动画/骨骼/Pose？
+- 它是否调用 CModel_AllocAndFillGroupPalette？
+- 它的调色板数据最终写到哪里？
+- 它和 CSpriteUber 在渲染路径上的关键差异是什么？
+
+## 任务4：调色板槽位分配与全局缓冲区生命周期
+
+请确认：
+- dword_6FBC6BD0 指向的缓冲区是否在帧间被清空？如果是，什么时候？
+- 同一 RenderablePart 在不同帧是否总是分配到不同的 slotIndex？
+- bump 分配器回绕时（达到 30000），旧 slot 中的数据是否被覆盖？
+
+## 任务5：CWorld_DispatchStage 的阶段映射
+
+请确定在 CWorld_DispatchStage (0x6F363020) 中，各个 Stage(11/12/13/14/15/16/17/18/19/20/21) 分别调度了哪些渲染组，以及它们对应的函数地址。
+
+## 任务6：CSpriteUber VTable 结构
+
+CSpriteUber 的 vtable 在 0x6F9647BC。请列出该 vtable 中每个虚函数的位置和语义。
+已知:
+- vtable[0~10]: CSprite 基类虚函数
+- vtable[11]: CWorldFrameWar3_Update... (0x6F368480 相关)
+- vtable[12]: CWorld_RenderScene (0x6F3681C0)
+- vtable[?]: PreRenderAndUpdatePosePalette (0x6F182300)
+- vtable[?]: PreRenderLight (0x6F1820C0)
+
+## 任务7：提出动态阴影的技术方案
+
+基于以上所有逆向资料，请提出一个可行的技术方案来解决以下问题：
+1. 阴影 Pose 与主场景模型 Pose 同步（消除帧延迟）
+2. 飞行单位/建筑/可破坏物/装饰物的阴影支持
+3. 大量阴影渲染时的顶点撕裂
+
+具体考虑：
+- 方案A：在 CSpriteUber_PreRenderAndUpdatePosePalette 返回点当场捕获调色板
+- 方案B：使用 MeshData+0x10 的 post-skin 顶点直接渲染阴影（完全绕过调色板）
+- 方案C：GPU 蒙皮 — 将调色板上传到 GPU，由顶点着色器完成蒙皮
+- 方案D：混合方案 — 对不同对象类型使用不同策略
+

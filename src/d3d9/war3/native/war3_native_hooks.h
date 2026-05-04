@@ -1,10 +1,8 @@
 #pragma once
 
-#include "war3_native_renderer.h"
+#include <cstdint>
 
-namespace dxvk {
-class D3D9DeviceEx;
-}
+#include "war3_native_renderer.h"
 
 namespace war3 {
 namespace native {
@@ -12,7 +10,7 @@ namespace native {
 // Hook 控制函数
 extern "C" int InstallNativeRendererHooks(void *baseAddress);
 extern "C" int UninstallNativeRendererHooks();
-void InitializeNativeRendererHooks(dxvk::D3D9DeviceEx *device);
+void InitializeNativeRendererHooks(uintptr_t gameBase);
 
 // 原始函数指针访问 (用于逐步还原校验)
 namespace original {

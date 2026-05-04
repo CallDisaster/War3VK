@@ -1,6 +1,16 @@
 // war3_game_structs.h - War3 游戏内部结构定义与常量
 // 整合了 d3d9_war3_structs.h 的结构体定义和偏移常量
 // 完整的游戏结构定义请参考 jass/war3_game_struct.h
+//
+// Important:
+// - This header is a shared ABI/offset surface, not a catalog of every
+//   RTTI-confirmed Blizzard class.
+// - Types imported from jass/war3_game_struct.h may be a mix of:
+//   1) RTTI-confirmed engine/runtime classes, and
+//   2) stable analysis-only records used to name recovered layouts.
+// - Unresolved descriptors/records (for example the current
+//   MeshLayerStateRecord + 0x1C remap/span blocker) must not be promoted here
+//   as if they already had confirmed RTTI names.
 
 #pragma once
 
@@ -16,6 +26,10 @@ namespace dxvk::war3 {
 // ============================================================================
 
 // 使用完整结构定义（来源：jass/war3_game_struct.h）
+//
+// Top-level aliases below should stay limited to RTTI-backed or otherwise
+// long-stable engine object types that we intentionally treat as object-level
+// public ABI.
 using ::HashGroup;
 using ::CWidget;
 using ::CUnit;
@@ -34,6 +48,14 @@ using ::CAnimSequenceProvider;
 using ::AnimationTimeState;
 using ::AnimationSequenceData;
 using ::CEffect;
+using ::JassHandleNode;
+using ::JassHandleTable;
+using ::CGameState;
+using ::CGameWar3;
+
+// Stable layout records that are actively used by the renderer/research path,
+// but are not currently promoted as RTTI-confirmed Blizzard classes.
+namespace analysis {
 using ::SceneNode;
 using ::SceneNodeTintRecord;
 using ::GxStagePresetRecord;
@@ -71,10 +93,7 @@ using ::MeshAuxResourceEntry;
 using ::LayerInfo;
 using ::MeshInfo;
 using ::MeshData;
-using ::JassHandleNode;
-using ::JassHandleTable;
-using ::CGameState;
-using ::CGameWar3;
+} // namespace analysis
 
 // 渲染批次元素（24 字节），ExecBatch 的 element
 struct WorldObjectBatchEntry {

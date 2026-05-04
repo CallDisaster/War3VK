@@ -8,19 +8,30 @@
 #include "../../d3d9_war3_branding.h"
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_hook.h"
+#include "../../d3d9_device.h"
 #include "../../jass/war3_game.h"
 #include "../war3.h"
 
 #include "../core/war3_internal_test_config.h"
+#include "../core/war3_game_structs.h"
+#include "../core/war3_memory.h"
+#include "../core/war3_runtime_profile.h"
+#include "../core/war3_semantic_shadow_gate.h"
 #include "../reimpl/war3_render_queue.h"
 #include "../render/war3_native_renderer_probe.h"
+#include "../render/war3_render_identity_bridge.h"
 #include "../render/war3_render_dispatcher.h"
 #include "../render/war3_render_exec_batch.h"
 #include "../render/war3_render_queue_tracker.h"
+#include "../render/war3_render_state.h"
 #include "../render/war3_renderer.h"
+#include "../render/war3_shadow_runtime_bridge.h"
+#include "../render/war3_visible_renderables.h"
+#include "../platform/war3_runtime_bootstrap.h"
 #include "../state/war3_render_state.h"
 #include "../tools/war3_perf_monitor.h"
 
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -53,6 +64,9 @@ extern dxvk::war3::reimpl::GxCleanupFn g_renderQueueGxCleanup78;
 namespace dxvk::war3::hooks {
 
 using RenderDispatcherFn = int(__fastcall *)(int, int, int, int, int, int);
+using WorldFrameUpdateAndPreparePassesFn = int(__fastcall *)(void *, void *, int,
+                                                             int, int);
+using WorldRenderSceneFn = int(__fastcall *)(void *, void *);
 using SceneSubmitBatchFn = int(__fastcall *)(void *, void *, int, int, int,
                                              void *);
 using WorldDispatchFn = int(__fastcall *)(void *, void *, int, int, int, int);
@@ -68,6 +82,13 @@ using TransparentDispatchTypeXFn = void(__fastcall *)(void *);
 
 static RenderDispatcherFn g_originalRenderDispatcher = nullptr;
 static RenderDispatcherFn g_trampolineRenderDispatcher = nullptr;
+
+static WorldFrameUpdateAndPreparePassesFn g_originalWorldFrameUpdate = nullptr;
+static WorldFrameUpdateAndPreparePassesFn g_trampolineWorldFrameUpdate =
+    nullptr;
+
+static WorldRenderSceneFn g_originalWorldRenderScene = nullptr;
+static WorldRenderSceneFn g_trampolineWorldRenderScene = nullptr;
 
 static SceneSubmitBatchFn g_originalSceneSubmitBatch = nullptr;
 static SceneSubmitBatchFn g_trampolineSceneSubmitBatch = nullptr;
@@ -105,6 +126,321 @@ static TransparentDispatchTypeXFn g_transparentDispatchType4 = nullptr;
       WAR3_RENDER_LOG(fmt, ##__VA_ARGS__);                                     \
     }                                                                          \
   } while (0)
+
+static void MergeRenderObjectIdentity(
+    dxvk::war3::render::RenderObjectIdentitySnapshot& dst,
+    const dxvk::war3::render::RenderObjectIdentitySnapshot& src) {
+  if (dst.worldObjectEntry == nullptr)
+    dst.worldObjectEntry = src.worldObjectEntry;
+  if (dst.sceneNode == nullptr)
+    dst.sceneNode = src.sceneNode;
+  if (dst.unitPtr == nullptr)
+    dst.unitPtr = src.unitPtr;
+  if (dst.agentPtr == nullptr)
+    dst.agentPtr = src.agentPtr;
+  if (dst.handleId == 0u)
+    dst.handleId = src.handleId;
+  if (dst.jHandle == 0u)
+    dst.jHandle = src.jHandle;
+  if (dst.rawcode == 0u)
+    dst.rawcode = src.rawcode;
+  if (dst.agentType == 0u)
+    dst.agentType = src.agentType;
+  if (dst.flags5C == 0u)
+    dst.flags5C = src.flags5C;
+  if (dst.kind == dxvk::war3::render::ObjectKind::Unknown)
+    dst.kind = src.kind;
+  if (dst.groupIdx < 0)
+    dst.groupIdx = src.groupIdx;
+}
+
+static void MergeShadowSemanticTlsIdentity(
+    void* renderablePart,
+    void* sceneNode,
+    dxvk::war3::render::RenderObjectIdentitySnapshot& identity) {
+  const auto& semantic = War3RenderState::GetTlsShadowSemanticState();
+  if (!semantic.HasAnyContext())
+    return;
+  if (semantic.renderablePart != nullptr &&
+      renderablePart != nullptr &&
+      semantic.renderablePart != renderablePart) {
+    return;
+  }
+  if (semantic.sceneNode != nullptr && sceneNode != nullptr &&
+      semantic.sceneNode != sceneNode) {
+    return;
+  }
+
+  if (identity.worldObjectEntry == nullptr)
+    identity.worldObjectEntry = semantic.worldObjectEntry;
+  if (identity.sceneNode == nullptr)
+    identity.sceneNode = semantic.sceneNode;
+  if (identity.jHandle == 0u)
+    identity.jHandle = semantic.jHandle;
+  if (identity.rawcode == 0u)
+    identity.rawcode = semantic.rawcode;
+  if (identity.kind == dxvk::war3::render::ObjectKind::Unknown)
+    identity.kind = semantic.objectKind;
+  if (identity.groupIdx < 0 && semantic.tag == War3BatchTag::WorldObjects)
+    identity.groupIdx = 0;
+  if (semantic.object != nullptr) {
+    auto fromObject =
+        dxvk::war3::render::MakeRenderObjectIdentitySnapshot(*semantic.object);
+    MergeRenderObjectIdentity(identity, fromObject);
+  }
+}
+
+static void TryFillUnitIdentityFromWorldObjectEntry(
+    dxvk::war3::render::RenderObjectIdentitySnapshot& identity) {
+  // entry+0 is not an authoritative CUnit in the current semantic path.  The
+  // previous fallback promoted random object memory into unit flags and marked
+  // most visible records as buildings, which produced construction/scaffold
+  // shadow silhouettes.
+  return;
+
+  if (identity.worldObjectEntry == nullptr)
+    return;
+
+  void* objectPtr = nullptr;
+  if (!dxvk::war3::SafeReadPtrFast(identity.worldObjectEntry, 0u, objectPtr) ||
+      objectPtr == nullptr) {
+    return;
+  }
+  if (!dxvk::war3::IsReadableRangeFast(objectPtr, 0x64))
+    return;
+
+  uint32_t rawcode = 0u;
+  uint32_t flags5C = 0u;
+  dxvk::war3::SafeReadU32Fast(objectPtr, dxvk::war3::CUnitOffsets::Rawcode,
+                              rawcode);
+  dxvk::war3::SafeReadU32Fast(objectPtr, dxvk::war3::CUnitOffsets::Flags5C,
+                              flags5C);
+  if (rawcode == 0u)
+    return;
+
+  if (identity.unitPtr == nullptr)
+    identity.unitPtr = objectPtr;
+  if (identity.rawcode == 0u)
+    identity.rawcode = rawcode;
+  if (identity.flags5C == 0u)
+    identity.flags5C = flags5C;
+  if (identity.kind == dxvk::war3::render::ObjectKind::Unknown) {
+    identity.kind =
+        (flags5C & dxvk::war3::UnitFlags5C::Building) != 0u
+            ? dxvk::war3::render::ObjectKind::Building
+            : dxvk::war3::render::ObjectKind::Unit;
+  }
+
+  uint32_t handle0C = 0u;
+  uint32_t handle10 = 0u;
+  if (identity.jHandle == 0u &&
+      dxvk::war3::SafeReadU32Fast(objectPtr,
+                                  dxvk::war3::CUnitOffsets::HashId0C,
+                                  handle0C) &&
+      dxvk::war3::SafeReadU32Fast(objectPtr,
+                                  dxvk::war3::CUnitOffsets::HashId10,
+                                  handle10) &&
+      handle0C != 0u && handle0C < 0x100000u && handle0C == handle10) {
+    identity.handleId = handle0C;
+    identity.jHandle = 0x100000u | handle0C;
+  }
+}
+
+static void TryFillUnitIdentityFromUnitPtr(
+    dxvk::war3::render::RenderObjectIdentitySnapshot& identity) {
+  struct UnitIdentityHotCacheEntry {
+    void* unitPtr = nullptr;
+    uint32_t rawcode = 0u;
+    uint32_t flags5C = 0u;
+    uint32_t handleId = 0u;
+    uint32_t jHandle = 0u;
+    dxvk::war3::render::ObjectKind kind =
+        dxvk::war3::render::ObjectKind::Unknown;
+    bool valid = false;
+  };
+
+  auto mergeCachedIdentity =
+      [](dxvk::war3::render::RenderObjectIdentitySnapshot& dst,
+         const UnitIdentityHotCacheEntry& cached) {
+        if (dst.rawcode == 0u)
+          dst.rawcode = cached.rawcode;
+        if (dst.flags5C == 0u)
+          dst.flags5C = cached.flags5C;
+        if (dst.kind == dxvk::war3::render::ObjectKind::Unknown)
+          dst.kind = cached.kind;
+        if (dst.jHandle == 0u && cached.jHandle != 0u) {
+          dst.handleId = cached.handleId;
+          dst.jHandle = cached.jHandle;
+        }
+      };
+
+  if (identity.unitPtr == nullptr)
+    return;
+
+  static thread_local std::array<UnitIdentityHotCacheEntry, 1024>
+      s_unitIdentityHotCache = {};
+  const uintptr_t key = reinterpret_cast<uintptr_t>(identity.unitPtr);
+  auto& cacheEntry = s_unitIdentityHotCache[(key >> 4u) &
+                                            (s_unitIdentityHotCache.size() -
+                                             1u)];
+  if (cacheEntry.valid && cacheEntry.unitPtr == identity.unitPtr) {
+    mergeCachedIdentity(identity, cacheEntry);
+    return;
+  }
+
+  if (!dxvk::war3::IsReadableRangeFast(identity.unitPtr, 0x64))
+    return;
+
+  const auto* unitBytes = static_cast<const uint8_t*>(identity.unitPtr);
+  uint32_t rawcode = 0u;
+  uint32_t flags5C = 0u;
+  uint32_t handle0C = 0u;
+  uint32_t handle10 = 0u;
+  std::memcpy(&rawcode, unitBytes + dxvk::war3::CUnitOffsets::Rawcode,
+              sizeof(rawcode));
+  std::memcpy(&flags5C, unitBytes + dxvk::war3::CUnitOffsets::Flags5C,
+              sizeof(flags5C));
+  std::memcpy(&handle0C, unitBytes + dxvk::war3::CUnitOffsets::HashId0C,
+              sizeof(handle0C));
+  std::memcpy(&handle10, unitBytes + dxvk::war3::CUnitOffsets::HashId10,
+              sizeof(handle10));
+  if (rawcode == 0u)
+    return;
+
+  cacheEntry.unitPtr = identity.unitPtr;
+  cacheEntry.rawcode = rawcode;
+  cacheEntry.flags5C = flags5C;
+  cacheEntry.kind =
+      (flags5C & dxvk::war3::UnitFlags5C::Building) != 0u
+          ? dxvk::war3::render::ObjectKind::Building
+          : dxvk::war3::render::ObjectKind::Unit;
+  cacheEntry.handleId = 0u;
+  cacheEntry.jHandle = 0u;
+  if (handle0C != 0u && handle0C < 0x100000u && handle0C == handle10) {
+    cacheEntry.handleId = handle0C;
+    cacheEntry.jHandle = 0x100000u | handle0C;
+  }
+  cacheEntry.valid = true;
+
+  mergeCachedIdentity(identity, cacheEntry);
+}
+
+static void ClassifyWorldTagIdentity(
+    War3BatchTag tag,
+    dxvk::war3::render::RenderObjectIdentitySnapshot& identity) {
+  if (tag == War3BatchTag::WorldObjects) {
+    if (identity.kind == dxvk::war3::render::ObjectKind::Unknown)
+      identity.kind = dxvk::war3::render::ObjectKind::Unit;
+    if (identity.groupIdx < 0)
+      identity.groupIdx = 0;
+  }
+}
+
+static bool HasHotVisibleUnitIdentity(
+    const dxvk::war3::render::RenderObjectIdentitySnapshot& identity) {
+  return identity.unitPtr != nullptr &&
+         identity.rawcode != 0u &&
+         identity.kind != dxvk::war3::render::ObjectKind::Unknown &&
+         identity.groupIdx >= 0;
+}
+
+static inline war3::War3PerfMonitor::ScopedCpuScope
+MakeRenderHookCpuScope(const char *name);
+
+static void PublishVisibleRenderableFromDispatch(
+    void* sceneNode,
+    void* renderablePart,
+    uint32_t layerIndex,
+    void* layerState) {
+  if (!dxvk::war3::internal::kNativeVisibleRenderableRegistryEnabled)
+    return;
+  if (!dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
+          dxvk::war3::runtime::War3RuntimeModule::SemanticData) ||
+      !dxvk::war3::internal::kWar3RuntimeConfigSemanticFrameRegistriesEffective)
+    return;
+  if (renderablePart == nullptr)
+    return;
+
+  void* meshData = nullptr;
+  void* partSceneNode = nullptr;
+  {
+    auto scope =
+        MakeRenderHookCpuScope("Hook_PublishVisible/ReadRenderablePart");
+    dxvk::war3::SafeReadPtrFast(
+        renderablePart, dxvk::war3::RenderablePartFieldOffsets::MeshData,
+        meshData);
+
+    dxvk::war3::SafeReadPtrFast(
+        renderablePart, dxvk::war3::RenderablePartFieldOffsets::SceneNode,
+        partSceneNode);
+    if (sceneNode == nullptr)
+      sceneNode = partSceneNode;
+  }
+
+  if (sceneNode == nullptr && meshData == nullptr)
+    return;
+
+  const War3BatchTag tag = War3RenderState::GetTlsBatchTag();
+  dxvk::war3::render::RenderObjectIdentitySnapshot identity = {};
+  identity.sceneNode = sceneNode;
+  {
+    auto scope = MakeRenderHookCpuScope("Hook_PublishVisible/ResolveIdentity");
+    MergeShadowSemanticTlsIdentity(renderablePart, sceneNode, identity);
+    ClassifyWorldTagIdentity(tag, identity);
+
+    if (!HasHotVisibleUnitIdentity(identity)) {
+      dxvk::war3::render::RenderObjectIdentitySnapshot resolvedIdentity = {};
+      if (dxvk::war3::render::TryResolveCurrentRenderObjectIdentity(
+              sceneNode, resolvedIdentity)) {
+        MergeRenderObjectIdentity(identity, resolvedIdentity);
+      }
+      if (identity.sceneNode == nullptr)
+        identity.sceneNode = sceneNode;
+    }
+
+    if (!HasHotVisibleUnitIdentity(identity)) {
+      dxvk::war3::render::RenderObjectIdentitySnapshot cachedIdentity = {};
+      if (dxvk::war3::render::RenderQueueTracker::instance()
+              .GetCachedObjectIdentity(renderablePart, cachedIdentity)) {
+        MergeRenderObjectIdentity(identity, cachedIdentity);
+      }
+    }
+
+    if (!HasHotVisibleUnitIdentity(identity)) {
+      dxvk::war3::render::VisibleRenderableRecord prior = {};
+      if (dxvk::war3::render::VisibleRenderableRegistry::instance()
+              .queryByRenderablePart(renderablePart, prior)) {
+        MergeRenderObjectIdentity(identity, prior.identity);
+      }
+    }
+  }
+  TryFillUnitIdentityFromWorldObjectEntry(identity);
+  {
+    auto scope = MakeRenderHookCpuScope("Hook_PublishVisible/FillUnitIdentity");
+    if (identity.rawcode == 0u || identity.flags5C == 0u ||
+        identity.jHandle == 0u ||
+        identity.kind == dxvk::war3::render::ObjectKind::Unknown) {
+      TryFillUnitIdentityFromUnitPtr(identity);
+    }
+  }
+  ClassifyWorldTagIdentity(tag, identity);
+
+  dxvk::war3::render::VisibleRenderableRecord record = {};
+  record.queueKind =
+      dxvk::war3::render::VisibleRenderableQueueKind::MainQueue;
+  record.payload = renderablePart;
+  record.renderablePart = renderablePart;
+  record.sceneNode = sceneNode;
+  record.meshData = meshData;
+  record.layerState = layerState;
+  record.layerIndex = layerIndex;
+  record.identity = identity;
+  {
+    auto scope = MakeRenderHookCpuScope("Hook_PublishVisible/Register");
+    dxvk::war3::render::VisibleRenderableRegistry::instance()
+        .registerSemanticCandidate(record);
+  }
+}
 
 static inline war3::War3PerfMonitor::ScopedCpuScope
 MakeRenderHookCpuScope(const char *name) {
@@ -310,6 +646,95 @@ static void TrackRenderQueueUpdates(int stage, uint32_t before,
   }
 }
 
+static void TryNativeSemanticWorldStageValidation(int stage, int a3, int a4,
+                                                  int a5) {
+  if constexpr (!dxvk::war3::internal::kNativeRendererHostExecuteValidationEnabled ||
+                !dxvk::war3::internal::
+                    kNativeSemanticShadowWorldStageValidationEnabled) {
+    return;
+  } else {
+    if (!dxvk::war3::internal::
+            IsNativeRendererHostExecuteValidationRuntimeEnabled() ||
+        !dxvk::war3::internal::
+            IsNativeSemanticShadowWorldStageValidationRuntimeEnabled()) {
+      return;
+    }
+
+    const bool isTargetStage =
+        stage == dxvk::war3::internal::kNativeSemanticShadowPrepareStage ||
+        stage ==
+            dxvk::war3::internal::kNativeSemanticShadowRefreshPrepareStage ||
+        stage == dxvk::war3::internal::kNativeSemanticShadowExecuteStage;
+    if (!isTargetStage)
+      return;
+
+    const bool jassReady = dxvk::war3::War3Events::get().isJassReady();
+    const bool gameStarted = dxvk::war3::War3Events::get().isGameStarted();
+    dxvk::war3::render::NoteNativeSemanticWorldStageCandidate(
+        stage, a3, a4, a5, jassReady, gameStarted);
+
+    // CWorld stage 2/10/11 can appear before the synthetic OnGameStart marker
+    // on fast-loading visual maps. Keep that early validation behind an
+    // explicit runtime switch so normal semantic preview cannot stall map-ready.
+    const bool semanticRuntimeReady =
+        gameStarted ||
+        (jassReady && dxvk::war3::internal::
+                          IsSemanticShadowPreReadyValidationRuntimeEnabled());
+    if (!semanticRuntimeReady) {
+      dxvk::war3::render::NoteNativeSemanticWorldStageSkippedRuntimeNotReady(
+          stage);
+      return;
+    }
+
+    if (stage == dxvk::war3::internal::kNativeSemanticShadowPrepareStage ||
+        stage ==
+            dxvk::war3::internal::kNativeSemanticShadowRefreshPrepareStage) {
+      auto scope = MakeRenderHookCpuScope(
+          "Hook_WorldDispatch/NativeSemanticPrepareStage");
+      const bool refreshStage =
+          stage == dxvk::war3::internal::
+                       kNativeSemanticShadowRefreshPrepareStage;
+      const bool prepared = dxvk::war3::platform::DriveNativeShadowBackend(
+          true, refreshStage ? 8u : 4u);
+      dxvk::war3::render::NoteNativeSemanticWorldStagePrepare(stage,
+                                                              prepared);
+      return;
+    }
+
+    if (stage ==
+        dxvk::war3::internal::kNativeSemanticShadowExecuteStage) {
+      if constexpr (dxvk::war3::internal::
+                        kShadowSemanticCoreSceneSubmissionEnabled) {
+        if (dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled()) {
+          if (auto* device = dxvk::war3::GetActiveDevice()) {
+            device->War3PopulateSemanticShadowSceneForValidation(
+                dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly,
+                false);
+          }
+        }
+      }
+      {
+        auto prepareScope = MakeRenderHookCpuScope(
+            "Hook_WorldDispatch/NativeSemanticFinalPrepareStage");
+        const bool prepared =
+            dxvk::war3::platform::DriveNativeShadowBackend(
+                true, 32u);
+        dxvk::war3::render::NoteNativeSemanticWorldStagePrepare(stage,
+                                                                prepared);
+        if (!prepared)
+          return;
+      }
+
+      auto scope = MakeRenderHookCpuScope(
+          "Hook_WorldDispatch/NativeSemanticExecuteStage");
+      const bool executed =
+          dxvk::war3::platform::ExecuteNativeShadowBackendPreparedFrame();
+      dxvk::war3::render::NoteNativeSemanticWorldStageExecute(stage,
+                                                              executed);
+    }
+  }
+}
+
 int __fastcall Hook_RenderDispatcher(int ctx1, int ctx2, int typeCode,
                                      int stage, int a5, int dataStore) {
   // 负责维护 dispatcher stage 栈，保证递归分发时阶段上下文不串台。
@@ -333,6 +758,55 @@ int __fastcall Hook_RenderDispatcher(int ctx1, int ctx2, int typeCode,
   }
   dxvk::war3::render::War3RenderDispatcher::instance().PopDispatcherStage(
       prevDispatcherStage);
+  return result;
+}
+
+int __fastcall Hook_WorldFrameUpdateAndPreparePasses(void *thisPtr, void *edx,
+                                                     int a2, int a3, int a4) {
+  auto perfScope = MakeRenderHookCpuScope("Hook_WorldFramePrepare");
+
+  if constexpr (!dxvk::war3::internal::kNativeWorldFrameBoundaryHooksEnabled) {
+    if (g_trampolineWorldFrameUpdate)
+      return g_trampolineWorldFrameUpdate(thisPtr, edx, a2, a3, a4);
+    if (g_originalWorldFrameUpdate)
+      return g_originalWorldFrameUpdate(thisPtr, edx, a2, a3, a4);
+    return 0;
+  }
+
+  War3RenderState::OnWorldFramePrepareEnter();
+  int result = 0;
+  if (g_trampolineWorldFrameUpdate) {
+    auto origScope = MakeRenderHookCpuScope("Hook_WorldFramePrepare/Orig");
+    result = g_trampolineWorldFrameUpdate(thisPtr, edx, a2, a3, a4);
+  } else if (g_originalWorldFrameUpdate) {
+    auto origScope = MakeRenderHookCpuScope("Hook_WorldFramePrepare/Orig");
+    result = g_originalWorldFrameUpdate(thisPtr, edx, a2, a3, a4);
+  }
+  War3RenderState::OnWorldFramePrepareExit();
+  return result;
+}
+
+int __fastcall Hook_WorldRenderScene(void *thisPtr, void *edx) {
+  auto perfScope = MakeRenderHookCpuScope("Hook_WorldRenderScene");
+
+  if constexpr (!dxvk::war3::internal::kNativeWorldFrameBoundaryHooksEnabled) {
+    if (g_trampolineWorldRenderScene)
+      return g_trampolineWorldRenderScene(thisPtr, edx);
+    if (g_originalWorldRenderScene)
+      return g_originalWorldRenderScene(thisPtr, edx);
+    return 0;
+  }
+
+  War3RenderState::OnWorldRenderSceneEnter();
+  int result = 0;
+  if (g_trampolineWorldRenderScene) {
+    auto origScope = MakeRenderHookCpuScope("Hook_WorldRenderScene/Orig");
+    result = g_trampolineWorldRenderScene(thisPtr, edx);
+  } else if (g_originalWorldRenderScene) {
+    auto origScope = MakeRenderHookCpuScope("Hook_WorldRenderScene/Orig");
+    result = g_originalWorldRenderScene(thisPtr, edx);
+  }
+  War3RenderState::OnWorldRenderSceneExit();
   return result;
 }
 
@@ -498,6 +972,8 @@ int __fastcall Hook_WorldDispatch(void *thisPtr, void *edx, int stage, int a3,
     TrackRenderQueueUpdates(stage, before, batchArray);
   }
 
+  TryNativeSemanticWorldStageValidation(stage, a3, a4, a5);
+
   War3RenderState::OnStageExit(stage);
   if (a5 == 0) {
     War3RenderState::OnMainWorldStageExit(stage);
@@ -601,11 +1077,36 @@ int __fastcall Hook_WorldObjects_RenderGroup(void *thisPtr, void * /*edx*/,
       beforeGroupTag = *g_numOfElementsPtr;
   }
 
+  const bool needsObjectTracking = War3RenderState::NeedsObjectTracking();
+  const bool needsShadowObjectIdentity =
+      War3RenderState::NeedsShadowObjectIdentity();
+  const bool semanticSceneOwnsUnits =
+      dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() &&
+      dxvk::war3::internal::
+          IsSemanticSceneBypassLegacyUnitCaptureRuntimeEnabled() &&
+      dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly;
+  const bool pathBlockerTrackingOnly =
+      needsObjectTracking && !needsShadowObjectIdentity &&
+      !War3RenderState::HasOutlineHandles() &&
+      !War3RenderState::HasBloomHandles() &&
+      !War3RenderState::IsForceObjectTrackingEnabled() &&
+      !War3RenderState::IsOutlineDebugAllObjectsEnabled() &&
+      dxvk::war3::internal::kWar3RenderModuleTakeoverEnabled &&
+      dxvk::war3::internal::kPathBlockerHideEnabled &&
+      dxvk::war3::internal::kPathBlockerForceBridgeTrackingEnabled;
+  const bool pathBlockerCollectThisGroup =
+      !pathBlockerTrackingOnly ||
+      ((dxvk::war3::internal::kPathBlockerTrackingGroupMask &
+        (1u << uint32_t(groupIdx))) != 0u);
+  const bool allowPathBlockerOnlyCollect =
+      !semanticSceneOwnsUnits || needsShadowObjectIdentity;
   const bool needCollectObjects =
       dxvk::war3::internal::kNativeWorldGroupAlwaysCollectObjects ||
-      War3RenderState::NeedsObjectTracking() ||
-      War3RenderState::NeedsShadowObjectIdentity() ||
-      dxvk::war3::render::NativeRendererProbe::IsEnabled();
+      needsShadowObjectIdentity ||
+      dxvk::war3::render::NativeRendererProbe::IsEnabled() ||
+      (needsObjectTracking &&
+       (!pathBlockerTrackingOnly ||
+        (allowPathBlockerOnlyCollect && pathBlockerCollectThisGroup)));
   if (needCollectObjects) {
     auto collectScope =
         MakeRenderHookCpuScope("Hook_WorldObjects_RenderGroup/CollectObjects");
@@ -640,6 +1141,24 @@ int __fastcall Hook_RenderQueue_Dispatch_Common(void *thisPtr, void *edx,
   // - 无追踪需求时走快速直通；
   // - 需要追踪时走 ExecBatchProcessor 桥接并恢复状态。
   auto perfScope = MakeRenderHookCpuScope("Hook_Dispatch_Common");
+  if constexpr (dxvk::war3::internal::kShadowSemanticDispatchContractProbeEnabled) {
+    dxvk::war3::render::VisibleRenderableRecord visible = {};
+    dxvk::war3::reimpl::RenderBatchElement syntheticBatch = {};
+    syntheticBatch.renderablePart = edx;
+    syntheticBatch.layerIndex = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
+    if (dxvk::war3::render::VisibleRenderableRegistry::instance()
+            .queryByRenderablePart(edx, visible)) {
+      syntheticBatch.layerStatePtr = visible.layerState;
+      syntheticBatch.subIndex = visible.subIndex;
+      dxvk::war3::reimpl::MaybeLogSemanticDispatchContract(
+          &syntheticBatch, thisPtr != nullptr ? thisPtr : visible.sceneNode,
+          visible.meshData);
+    } else {
+      dxvk::war3::reimpl::LogSemanticDispatchSkip(
+          "dispatch-registry-miss", &syntheticBatch, thisPtr, nullptr, nullptr,
+          dxvk::war3::render::kInvalidVisibleMeshIndex, 0u);
+    }
+  }
 
   War3BatchTag tag = War3RenderState::GetTlsBatchTag();
   int elementStage = -1;
@@ -649,23 +1168,33 @@ int __fastcall Hook_RenderQueue_Dispatch_Common(void *thisPtr, void *edx,
   const bool needsShadowFallbackBridge =
       War3RenderState::NeedsShadowDrawFallbackBridge();
   const bool needsShadowSemanticTracking =
-      needsShadowObjectIdentity || needsShadowFallbackBridge;
+      War3RenderState::NeedsShadowSemanticTracking();
   const bool needsBatchTracking = War3RenderState::IsBatchTagTrackingEnabled();
   const bool needsProbe = dxvk::war3::render::NativeRendererProbe::IsEnabled();
+
+  auto publishVisibleAfterDispatch = [&]() {
+    if (!needsShadowSemanticTracking ||
+        !dxvk::war3::hooks::IsWorldBridgeTag(tag))
+      return;
+    const uint32_t layerIndex =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
+    PublishVisibleRenderableFromDispatch(thisPtr, edx, layerIndex, nullptr);
+  };
 
   if (dxvk::war3::internal::kNativeHookFastPathEnabled &&
       dxvk::war3::internal::kNativeHookFastPathSkipBridgeWhenNoTracking &&
       !needsObjectTracking && !needsShadowSemanticTracking &&
       !needsBatchTracking && !needsProbe) {
     const int res = g_trampolineDispatchCommon(thisPtr, edx, a3, a4, a5);
+    publishVisibleAfterDispatch();
     War3RenderState::SetTlsDispatchHandle(0);
     War3RenderState::SetTlsBatchHandle(0);
     return res;
   }
 
   const bool canUseWorldGroupTagFastPath =
-      (needsObjectTracking || needsShadowSemanticTracking) &&
-      !needsBatchTracking && !needsProbe &&
+      needsShadowSemanticTracking && !needsObjectTracking &&
+      !needsShadowObjectIdentity && !needsShadowFallbackBridge && !needsProbe &&
       dxvk::war3::hooks::IsWorldBridgeTag(tag);
 
   if ((!dxvk::war3::internal::kNativeHookFastPathEnabled ||
@@ -683,6 +1212,7 @@ int __fastcall Hook_RenderQueue_Dispatch_Common(void *thisPtr, void *edx,
       tag != War3BatchTag::Unknown &&
       !dxvk::war3::hooks::IsWorldBridgeTag(tag)) {
     const int res = g_trampolineDispatchCommon(thisPtr, edx, a3, a4, a5);
+    publishVisibleAfterDispatch();
     War3RenderState::SetTlsDispatchHandle(0);
     War3RenderState::SetTlsBatchHandle(0);
     return res;
@@ -698,16 +1228,32 @@ int __fastcall Hook_RenderQueue_Dispatch_Common(void *thisPtr, void *edx,
     BatchTagStageScopeLite scope;
     scope.begin(tag, elementStage);
     const int res = g_trampolineDispatchCommon(thisPtr, edx, a3, a4, a5);
+    publishVisibleAfterDispatch();
     scope.end();
     War3RenderState::SetTlsDispatchHandle(0);
     return res;
   }
 
-  dxvk::war3::render::ExecBatchContext ctx =
-      dxvk::war3::render::ExecBatchProcessor::Begin(edx, tag, elementStage,
-                                                    false);
-  int res = g_trampolineDispatchCommon(thisPtr, edx, a3, a4, a5);
-  dxvk::war3::render::ExecBatchProcessor::End(ctx);
+  dxvk::war3::render::ExecBatchContext ctx = {};
+  {
+    auto beginScope = MakeRenderHookCpuScope("Hook_Dispatch_Common/BridgeBegin");
+    ctx = dxvk::war3::render::ExecBatchProcessor::Begin(edx, tag, elementStage,
+                                                        false);
+  }
+  int res = 0;
+  {
+    auto origScope = MakeRenderHookCpuScope("Hook_Dispatch_Common/Orig");
+    res = g_trampolineDispatchCommon(thisPtr, edx, a3, a4, a5);
+  }
+  {
+    auto publishScope =
+        MakeRenderHookCpuScope("Hook_Dispatch_Common/PublishVisible");
+    publishVisibleAfterDispatch();
+  }
+  {
+    auto endScope = MakeRenderHookCpuScope("Hook_Dispatch_Common/BridgeEnd");
+    dxvk::war3::render::ExecBatchProcessor::End(ctx);
+  }
   War3RenderState::SetTlsDispatchHandle(0);
   return res;
 }
@@ -716,6 +1262,24 @@ int __fastcall Hook_RenderQueue_Dispatch_Special(void *thisPtr, void *edx,
                                                  void *a3, void *a4) {
   // Special Dispatch 与 Common Dispatch 对齐同一套快速路径与桥接策略。
   auto perfScope = MakeRenderHookCpuScope("Hook_Dispatch_Special");
+  if constexpr (dxvk::war3::internal::kShadowSemanticDispatchContractProbeEnabled) {
+    dxvk::war3::render::VisibleRenderableRecord visible = {};
+    dxvk::war3::reimpl::RenderBatchElement syntheticBatch = {};
+    syntheticBatch.renderablePart = edx;
+    syntheticBatch.layerIndex = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
+    if (dxvk::war3::render::VisibleRenderableRegistry::instance()
+            .queryByRenderablePart(edx, visible)) {
+      syntheticBatch.layerStatePtr = visible.layerState;
+      syntheticBatch.subIndex = visible.subIndex;
+      dxvk::war3::reimpl::MaybeLogSemanticDispatchContract(
+          &syntheticBatch, thisPtr != nullptr ? thisPtr : visible.sceneNode,
+          visible.meshData);
+    } else {
+      dxvk::war3::reimpl::LogSemanticDispatchSkip(
+          "dispatch-registry-miss", &syntheticBatch, thisPtr, nullptr, nullptr,
+          dxvk::war3::render::kInvalidVisibleMeshIndex, 0u);
+    }
+  }
 
   War3BatchTag tag = War3RenderState::GetTlsBatchTag();
   int elementStage = -1;
@@ -725,23 +1289,33 @@ int __fastcall Hook_RenderQueue_Dispatch_Special(void *thisPtr, void *edx,
   const bool needsShadowFallbackBridge =
       War3RenderState::NeedsShadowDrawFallbackBridge();
   const bool needsShadowSemanticTracking =
-      needsShadowObjectIdentity || needsShadowFallbackBridge;
+      War3RenderState::NeedsShadowSemanticTracking();
   const bool needsBatchTracking = War3RenderState::IsBatchTagTrackingEnabled();
   const bool needsProbe = dxvk::war3::render::NativeRendererProbe::IsEnabled();
+
+  auto publishVisibleAfterDispatch = [&]() {
+    if (!needsShadowSemanticTracking ||
+        !dxvk::war3::hooks::IsWorldBridgeTag(tag))
+      return;
+    const uint32_t layerIndex =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
+    PublishVisibleRenderableFromDispatch(thisPtr, edx, layerIndex, nullptr);
+  };
 
   if (dxvk::war3::internal::kNativeHookFastPathEnabled &&
       dxvk::war3::internal::kNativeHookFastPathSkipBridgeWhenNoTracking &&
       !needsObjectTracking && !needsShadowSemanticTracking &&
       !needsBatchTracking && !needsProbe) {
     const int res = g_trampolineDispatchSpecial(thisPtr, edx, a3, a4);
+    publishVisibleAfterDispatch();
     War3RenderState::SetTlsDispatchHandle(0);
     War3RenderState::SetTlsBatchHandle(0);
     return res;
   }
 
   const bool canUseWorldGroupTagFastPath =
-      (needsObjectTracking || needsShadowSemanticTracking) &&
-      !needsBatchTracking && !needsProbe &&
+      needsShadowSemanticTracking && !needsObjectTracking &&
+      !needsShadowObjectIdentity && !needsShadowFallbackBridge && !needsProbe &&
       dxvk::war3::hooks::IsWorldBridgeTag(tag);
 
   if ((!dxvk::war3::internal::kNativeHookFastPathEnabled ||
@@ -759,6 +1333,7 @@ int __fastcall Hook_RenderQueue_Dispatch_Special(void *thisPtr, void *edx,
       tag != War3BatchTag::Unknown &&
       !dxvk::war3::hooks::IsWorldBridgeTag(tag)) {
     const int res = g_trampolineDispatchSpecial(thisPtr, edx, a3, a4);
+    publishVisibleAfterDispatch();
     War3RenderState::SetTlsDispatchHandle(0);
     War3RenderState::SetTlsBatchHandle(0);
     return res;
@@ -774,16 +1349,32 @@ int __fastcall Hook_RenderQueue_Dispatch_Special(void *thisPtr, void *edx,
     BatchTagStageScopeLite scope;
     scope.begin(tag, elementStage);
     const int res = g_trampolineDispatchSpecial(thisPtr, edx, a3, a4);
+    publishVisibleAfterDispatch();
     scope.end();
     War3RenderState::SetTlsDispatchHandle(0);
     return res;
   }
 
-  dxvk::war3::render::ExecBatchContext ctx =
-      dxvk::war3::render::ExecBatchProcessor::Begin(edx, tag, elementStage,
-                                                    true);
-  int res = g_trampolineDispatchSpecial(thisPtr, edx, a3, a4);
-  dxvk::war3::render::ExecBatchProcessor::End(ctx);
+  dxvk::war3::render::ExecBatchContext ctx = {};
+  {
+    auto beginScope = MakeRenderHookCpuScope("Hook_Dispatch_Special/BridgeBegin");
+    ctx = dxvk::war3::render::ExecBatchProcessor::Begin(edx, tag, elementStage,
+                                                        true);
+  }
+  int res = 0;
+  {
+    auto origScope = MakeRenderHookCpuScope("Hook_Dispatch_Special/Orig");
+    res = g_trampolineDispatchSpecial(thisPtr, edx, a3, a4);
+  }
+  {
+    auto publishScope =
+        MakeRenderHookCpuScope("Hook_Dispatch_Special/PublishVisible");
+    publishVisibleAfterDispatch();
+  }
+  {
+    auto endScope = MakeRenderHookCpuScope("Hook_Dispatch_Special/BridgeEnd");
+    dxvk::war3::render::ExecBatchProcessor::End(ctx);
+  }
   War3RenderState::SetTlsDispatchHandle(0);
   return res;
 }
@@ -828,10 +1419,42 @@ int __cdecl Hook_FlushSortedItems() {
   // - 关闭接管：调用原函数；
   // - 开启接管：走 reimpl RenderQueue 路径。
   auto perfScope = MakeRenderHookCpuScope("Hook_FlushSortedItems");
+  auto maybeLogTakeoverGate = [&](const char *phase,
+                                  const War3QueueTakeoverDecision *decision,
+                                  D3D9DeviceEx *deviceForLog,
+                                  DispatchCommonFn dispatchCommonForLog,
+                                  DispatchSpecialFn dispatchSpecialForLog) {
+    if (!war3dbg::RenderLogEnabled())
+      return;
+    static std::atomic<uint32_t> s_gateLogCount{0};
+    const uint32_t logIndex =
+        s_gateLogCount.fetch_add(1u, std::memory_order_relaxed);
+    if (!(logIndex < 64u || (logIndex % 2048u) == 0u))
+      return;
+
+    const uint32_t opaqueCount = g_numOfElementsPtr ? *g_numOfElementsPtr : 0u;
+    const uint32_t transparentCount =
+        g_numOfTransparentPtr ? *g_numOfTransparentPtr : 0u;
+    const uint32_t mode =
+        decision != nullptr ? uint32_t(decision->mode)
+                            : uint32_t(War3QueueTakeoverMode::Fallback);
+    const uint32_t reason =
+        decision != nullptr ? uint32_t(decision->reason)
+                            : uint32_t(War3QueueTakeoverReason::Unknown);
+    war3dbg::Print(
+        "DXVK SemanticDispatchGate: phase=%s mode=%u reason=%u opaque=%u "
+        "transparent=%u device=%p dispatch=%p/%p batchPtr=%p sortedPtr=%p\n",
+        phase, mode, reason, opaqueCount, transparentCount, deviceForLog,
+        reinterpret_cast<void *>(dispatchCommonForLog),
+        reinterpret_cast<void *>(dispatchSpecialForLog),
+        g_batchArrayPtr ? *g_batchArrayPtr : nullptr,
+        g_sortedBatchPtrs ? reinterpret_cast<void *>(g_sortedBatchPtrs) : nullptr);
+  };
 
   auto *device = dxvk::war3::GetActiveDevice();
   if (!device || !g_numOfElementsPtr || !g_batchArrayPtr ||
       !g_sortedBatchCountPtr || !g_sortedBatchPtrs) {
+    maybeLogTakeoverGate("missing-globals", nullptr, device, nullptr, nullptr);
     return CallOriginalFlushSortedItems();
   }
 
@@ -873,6 +1496,8 @@ int __cdecl Hook_FlushSortedItems() {
 
   // 若关键 dispatch 缺失则回退原生路径，保证稳定性优先。
   if (!dispatchCommon || !dispatchSpecial) {
+    maybeLogTakeoverGate("missing-dispatch", nullptr, device, dispatchCommon,
+                         dispatchSpecial);
     return CallOriginalFlushSortedItems();
   }
 
@@ -895,6 +1520,9 @@ int __cdecl Hook_FlushSortedItems() {
 
   const War3QueueTakeoverDecision decision =
       EvaluateQueueTakeoverDecision(takeoverCtx);
+  maybeLogTakeoverGate(
+      decision.mode == War3QueueTakeoverMode::Fallback ? "fallback" : "takeover",
+      &decision, device, dispatchCommon, dispatchSpecial);
   if (decision.mode == War3QueueTakeoverMode::Fallback) {
     return CallOriginalFlushSortedItems();
   }
@@ -903,8 +1531,11 @@ int __cdecl Hook_FlushSortedItems() {
   bool ok = dxvk::war3::reimpl::RenderQueue::FlushSortedItems_StdSort(
       device, globals, g_renderQueueItemComparator, dispatchCommon,
       dispatchSpecial, fns);
-  if (!ok)
+  if (!ok) {
+    maybeLogTakeoverGate("opaque-failed", &decision, device, dispatchCommon,
+                         dispatchSpecial);
     return CallOriginalFlushSortedItems();
+  }
 
   const uint32_t transparentCount =
       g_numOfTransparentPtr ? *g_numOfTransparentPtr : 0u;
@@ -924,8 +1555,11 @@ int __cdecl Hook_FlushSortedItems() {
       }
     }
 
-    if (!transparentOk)
+    if (!transparentOk) {
+      maybeLogTakeoverGate("transparent-failed", &decision, device,
+                           dispatchCommon, dispatchSpecial);
       return CallOriginalFlushSortedItems();
+    }
   }
 
   return 0;
@@ -965,6 +1599,8 @@ void War3HookRender::Install(uintptr_t gameBase) {
   };
 
   LPVOID renderDispatcherAddr = resolveCode(book.renderDispatcher);
+  LPVOID worldFrameUpdateAddr = resolveCode(book.worldFrameUpdateAndPreparePasses);
+  LPVOID worldRenderSceneAddr = resolveCode(book.worldRenderScene);
   LPVOID sceneSubmitBatchAddr = resolveCode(book.sceneSubmitBatch);
   LPVOID worldDispatchAddr = resolveCode(book.worldDispatch);
   LPVOID worldObjectsGroupAddr = resolveCode(book.worldObjectsRenderGroup);
@@ -991,6 +1627,10 @@ void War3HookRender::Install(uintptr_t gameBase) {
 
   g_originalRenderDispatcher =
       reinterpret_cast<RenderDispatcherFn>(renderDispatcherAddr);
+  g_originalWorldFrameUpdate =
+      reinterpret_cast<WorldFrameUpdateAndPreparePassesFn>(worldFrameUpdateAddr);
+  g_originalWorldRenderScene =
+      reinterpret_cast<WorldRenderSceneFn>(worldRenderSceneAddr);
   g_originalSceneSubmitBatch =
       reinterpret_cast<SceneSubmitBatchFn>(sceneSubmitBatchAddr);
   g_originalWorldDispatch =
@@ -1023,6 +1663,14 @@ void War3HookRender::Install(uintptr_t gameBase) {
                  reinterpret_cast<LPVOID>(&Hook_RenderDispatcher),
                  reinterpret_cast<LPVOID *>(&g_trampolineRenderDispatcher),
                  "Render", "RenderDispatcher", false, false);
+  InstallMinHook(worldFrameUpdateAddr,
+                 reinterpret_cast<LPVOID>(&Hook_WorldFrameUpdateAndPreparePasses),
+                 reinterpret_cast<LPVOID *>(&g_trampolineWorldFrameUpdate),
+                 "Render", "WorldFrameUpdateAndPreparePasses", false, false);
+  InstallMinHook(worldRenderSceneAddr,
+                 reinterpret_cast<LPVOID>(&Hook_WorldRenderScene),
+                 reinterpret_cast<LPVOID *>(&g_trampolineWorldRenderScene),
+                 "Render", "WorldRenderScene", false, false);
   InstallMinHook(sceneSubmitBatchAddr,
                  reinterpret_cast<LPVOID>(&Hook_SceneSubmitBatch),
                  reinterpret_cast<LPVOID *>(&g_trampolineSceneSubmitBatch),

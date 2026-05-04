@@ -165,6 +165,36 @@ inline constexpr bool kNativeRenderBatchPrecomputeVisibilityEnabled = true;
 inline constexpr uint32_t kNativeRenderBatchPrecomputeMaxLayers = 128;
 
 // ========================================================================
+// CWorldFrameWar3 / RenderScene 权威边界
+// ========================================================================
+// 说明：
+// - 0x368480: 世界帧更新与渲染前准备；
+// - 0x3681C0: CWorld_RenderScene，当前确认的权威世界渲染边界；
+// - 该组 Hook 目前先用于“把真实世界边界接入状态机”，不直接改写原生渲染顺序。
+inline constexpr bool kNativeWorldFrameBoundaryHooksEnabled = true;
+
+// 若开启，则 BeforeUi 侧的 WORLD_RENDER_BEGIN / WORLD_RENDER_END 仅在
+// 本帧确实命中过 CWorld_RenderScene 返回后才分发，避免继续把 BeforeUi
+// 当成权威世界边界。
+inline constexpr bool kNativeUseRenderSceneAsWorldEventAuthority = true;
+
+// 是否记录最终可见 renderable manifest。
+// 当前会同时记录：
+// - RenderBatch_Submit 真正写入 main queue 的 opaque/main-queue 项
+// - AUCTransparent_AddEntry 真正写入透明队列的条目
+inline constexpr bool kNativeVisibleRenderableRegistryEnabled = true;
+
+// 透明队列 identity/manifest hook 目前默认关闭。
+//
+// 2026-04-23:
+// - 当前黑屏/早期崩溃已收敛到 RenderQueue_FlushTransparent(type4) family；
+// - 而 AUCTransparent_AddEntry 的 ABI 证据在历史文档里存在冲突，继续默认挂载
+//   identity hook 有把透明 entry 写坏的风险；
+// - 在 ABI 重新用 IDA 收口前，先保留 opaque/main-queue registry，停用透明 registry
+//   hook，优先恢复运行稳定性。
+inline constexpr bool kNativeVisibleRenderableTransparentHookEnabled = false;
+
+// ========================================================================
 // JASS VM 追踪/优化实验
 // ========================================================================
 // 编译版内部测试 API 总闸门（默认关闭，避免发布版直接接触 JASSVM）。
@@ -368,6 +398,194 @@ inline constexpr bool kNativeRenderQueueCacheObjectInfoEnabled = true;
 // - war3shader render listener 的帧事件派发
 inline constexpr bool kWar3RenderModuleTakeoverEnabled = true;
 
+// ========================================================================
+// Runtime profile 编译期分块排查开关
+// ========================================================================
+// 这组开关会被 war3_runtime_profile.cpp 直接编译进 runtime disabledModules。
+// 改这里以后必须重新编译 d3d9.dll。
+//
+// 推荐排查顺序：
+// 1) 先保持当前默认：DisableRenderInterference=true,
+//    DisableSemanticData=false。
+//    作用：关闭 shadow/postfx/AA/SSAO/render queue 等渲染层干涉，但继续保留
+//    上层模型/pose/semantic 数据采集，用来判断“上层数据链本身是否卡”。
+// 2) 若仍卡，把 DisableSemanticData 改为 true。
+//    作用：连上层模型/pose/manifest/contract 数据链也关掉。
+// 3) 若不卡，逐步把 DisableShadowStack / DisablePostFxStack /
+//    DisableRenderInterference 改回 false，定位具体是哪一层拖慢。
+//
+// 注意：这组编译期禁用优先级高于 DXVK_WAR3_PROFILE/DXVK_WAR3_DISABLE；
+// 也就是说，设为 true 后环境变量不能把该模块重新打开。
+inline constexpr bool kWar3RuntimeConfigDxvkOnlyBaseline = false;
+
+// 当前给用户手测的默认状态：先关全部渲染层干涉，保留 semantic.data。
+inline constexpr bool kWar3RuntimeConfigDisableRenderInterference = false;
+
+// 单独关闭 CSM 阴影链：shadow.capture/map/receiver/taa。
+inline constexpr bool kWar3RuntimeConfigDisableShadowStack = false;
+
+// 单独关闭后处理链：postfx/ssao/aa。
+inline constexpr bool kWar3RuntimeConfigDisablePostFxStack = false;
+
+// 单独关闭上层语义数据链：runtime model hook / pose / visible manifest /
+// ShadowRuntimeContractCache / semantic scene/native semantic validation。
+inline constexpr bool kWar3RuntimeConfigDisableSemanticData = false;
+
+// 上层 semantic.data 子模块二分：
+// 当前矩阵第四刀：打开 model/resource + pose + attachment + frame registry，
+// 继续关闭 contract / consumer。若这一刀开始卡，问题集中在 registry
+// begin/end 发布或 registry 数据结构维护；若不卡，再继续打开 contract。
+inline constexpr bool kWar3RuntimeConfigDisableSemanticModelHooks = false;
+
+// 仅关闭 CGeoset/CModelData 资源捕获子路径，保留 model hook 模块和
+// runtime model owner 生产链。用于确认低压图 8 FPS 是否来自
+// CreateGeosetFromRawArrays 后的 resource cache 写入/几何拷贝。
+inline constexpr bool kWar3RuntimeConfigDisableSemanticGeosetResourceCapture =
+    false;
+
+// 仅关闭 pose/palette 相关 hook（sprite frame / runtime matrix copy/flush）。
+// 当前主路径改为 contract capture 阶段按 visible runtimeModel 直读 CModel
+// palette/world transform。高频 pose hook 默认退出主路径，避免 semantic.data
+// 在 SpriteFrameUpdate / runtime matrix publisher 上做 registry storm。
+inline constexpr bool kWar3RuntimeConfigDisableSemanticPoseHooks = true;
+inline constexpr bool kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled =
+    false;
+
+// Pose producer 关闭时是否仍安装 SpriteFrameUpdate 系列 Hook 来补 runtime
+// resource。当前性能二分证明该热路径可能在无 pose 情况下造成未计入的
+// semantic.data 卡顿，默认禁止，后续改成按 visible manifest 延迟补齐。
+inline constexpr bool kWar3RuntimeConfigInstallSpriteFrameHooksWithoutPose =
+    false;
+
+// 仅关闭 attachment/local-point/attached-effect 相关 hook。
+// 用于验证 local-point output / child runtime contract 是否是高开销点。
+inline constexpr bool kWar3RuntimeConfigDisableSemanticAttachmentHooks = false;
+
+// local-point output 的深度逆向探针会扫描 context/argBlock/父子 runtime。
+// 默认只保留生产快路径；需要继续逆向 owner/child 映射时再临时打开。
+inline constexpr bool kWar3RuntimeConfigSemanticAttachmentHeavyProbeEnabled =
+    false;
+
+// 关闭 visible manifest / resource / pose / object registry 的 begin/end 发布。
+inline constexpr bool kWar3RuntimeConfigDisableSemanticFrameRegistries = false;
+
+// semantic.data 性能二分：只禁用可见渲染清单写入，保留其它 frame
+// registry 生命周期。用于确认卡顿是否集中在 VisibleRenderableRegistry。
+inline constexpr bool
+    kWar3RuntimeConfigDisableSemanticVisibleRenderableWrites = false;
+
+// semantic.data 性能二分：可见渲染清单仍写入，但不在热路径做 identity /
+// resource / geoset 的多级补全。用于区分“写一条记录”与“Finalize
+// 补全链”哪个是主成本。
+inline constexpr bool
+    kWar3RuntimeConfigLightweightSemanticVisibleRenderableWrites = true;
+
+// visible manifest 轻量写入后的帧末基础补全。只补 renderablePart 上的
+// sceneNode / meshData，并重建索引；禁止在 register* 热路径做多级补全。
+inline constexpr bool
+    kWar3RuntimeConfigSemanticVisibleEndFrameBasicHydrate = true;
+// 当前 semantic-only caster 必须从真实 visible renderable 获得
+// `RenderablePart/MeshData -> runtimeModel/modelResource/geoset` 绑定。这里在
+// EndFrame 做 O(visible) 轻量补全，避免在 Dispatch 热路径做多 registry join，
+// 也避免继续依赖 RootUnitSupplement 的非当前 geoset 猜测。
+inline constexpr bool
+    kWar3RuntimeConfigSemanticVisibleEndFrameUnitGeosetHydrate = true;
+// Performance-safe static caster hydration: keep hot-path visible writes light,
+// but let Building/Destructible records resolve model/geoset metadata once at
+// EndFrame so full-scene semantic shadows can include static objects.
+// Keep this off in the current units-only semantic scene path: an attempted
+// diagnostic hydrate in that mode was proven unsafe on 2026-04-30 because it
+// starved semantic skinned scene submission and produced a crash dump.
+inline constexpr bool
+    kWar3RuntimeConfigSemanticVisibleEndFrameStaticHydrate = false;
+
+// render queue 刚提交的 renderablePart 属于本帧 War3 自己正在消费的结构，
+// 可以在 visible hydrate 阶段直读固定槽位，避免每条记录触发 VirtualQuery。
+// 若后续遇到异常，可单独关掉退回 SafeReadPtrFast。
+inline constexpr bool
+    kWar3RuntimeConfigTrustVisibleRenderablePartPointers = true;
+
+// visible manifest 轻量模式下，register* 热路径只追加 records，不维护多张
+// unordered_map；索引统一在 endFrame hydrate 后重建。query 侧仍有线性兜底，
+// 避免少量同帧查询失效。
+inline constexpr bool
+    kWar3RuntimeConfigDeferSemanticVisibleIndexBuild = true;
+
+// 数据层性能模式默认不在 endFrame 全量重建 visible manifest 多索引表。
+inline constexpr bool
+    kWar3RuntimeConfigBuildSemanticVisibleIndexesAtEndFrame = false;
+
+// semantic consumer 已经成为主路径后，query 侧不再是“少量”访问：如果完全
+// 不维护索引，queryBy* 会在 capture/consumer 热路径反复线性扫 records。
+// 这里只在 appendRecord 时维护热查询索引，不做 endFrame 全量重建。
+inline constexpr bool
+    kWar3RuntimeConfigMaintainSemanticVisibleHotLookupIndexes = false;
+
+// semantic.data 性能模式：禁止 registry 在 endFrame 对全量历史表做
+// lastSeenFrame 扫描。热路径记录写入时已经携带当前 frameNumber；帧末全表
+// 刷新只适合作为诊断，不应该成为默认数据层成本。
+inline constexpr bool
+    kWar3RuntimeConfigDisableSemanticRegistryEndFrameSweeps = true;
+
+// semantic.data 性能二分：保留 VisibleRenderableRegistry 的正常记录写入，
+// 但按模块关闭 FinalizeVisibleRecord 内部的重补全阶段。
+inline constexpr bool
+    kWar3RuntimeConfigDisableSemanticVisibleFinalizeIdentityResolve = true;
+inline constexpr bool
+    kWar3RuntimeConfigDisableSemanticVisibleFinalizeModelMetadata = true;
+inline constexpr bool
+    kWar3RuntimeConfigDisableSemanticVisibleFinalizeGeosetMetadata = true;
+inline constexpr bool
+    kWar3RuntimeConfigDisableSemanticVisibleFinalizeSiblingRecovery = true;
+
+// ========================================================================
+// 直读 CModel Pose 快路径（绕过 Registry 链路）
+// ========================================================================
+// 启用后，SpriteFrameUpdate Hook 回调跳过所有 Registry 写入。
+// 注意：这个早期实验缓存尚未接入 ShadowPoseStore 消费端，不能作为默认
+// 主路径；真正的直读主路径在 ShadowRuntimeContractCache::captureLiveState。
+inline constexpr bool kWar3SemanticDirectCModelPoseEnabled = false;
+
+// 关闭 ShadowRuntimeContractCache::captureLiveState()。
+inline constexpr bool kWar3RuntimeConfigDisableSemanticContractCapture = false;
+
+// 关闭 semantic scene/native semantic consumer，但保留数据采集。
+inline constexpr bool kWar3RuntimeConfigDisableSemanticConsumer = false;
+
+// semantic.data 子模块的编译期有效状态。
+// 重要：这些 effective 开关用于阻止“producer 已关闭、consumer 仍追帧”
+// 造成的缺数据 build storm。runtime profile / DXVK_WAR3_DISABLE 仍会在调用侧
+// 额外叠加判断。
+inline constexpr bool kWar3RuntimeConfigSemanticModelProducerEffective =
+    !kWar3RuntimeConfigDisableSemanticData &&
+    !kWar3RuntimeConfigDisableSemanticModelHooks;
+inline constexpr bool kWar3RuntimeConfigSemanticPoseProducerEffective =
+    kWar3RuntimeConfigSemanticModelProducerEffective &&
+    !kWar3RuntimeConfigDisableSemanticPoseHooks;
+inline constexpr bool
+    kWar3RuntimeConfigSemanticMatrixPublisherPoseEffective =
+    kWar3RuntimeConfigSemanticModelProducerEffective &&
+    !kWar3RuntimeConfigDisableSemanticPoseHooks;
+inline constexpr bool kWar3RuntimeConfigPreferSemanticRuntimePoseUpdatePalette = false;
+inline constexpr bool kWar3RuntimeConfigSemanticRuntimePoseUpdateEffective =
+    kWar3RuntimeConfigSemanticModelProducerEffective &&
+    !kWar3RuntimeConfigDisableSemanticPoseHooks;
+inline constexpr bool kWar3RuntimeConfigSemanticRuntimeMatrixWriteEffective =
+    kWar3RuntimeConfigSemanticModelProducerEffective &&
+    !kWar3RuntimeConfigDisableSemanticPoseHooks;
+inline constexpr bool kWar3RuntimeConfigSemanticAttachmentProducerEffective =
+    kWar3RuntimeConfigSemanticPoseProducerEffective &&
+    !kWar3RuntimeConfigDisableSemanticAttachmentHooks;
+inline constexpr bool kWar3RuntimeConfigSemanticFrameRegistriesEffective =
+    kWar3RuntimeConfigSemanticModelProducerEffective &&
+    !kWar3RuntimeConfigDisableSemanticFrameRegistries;
+inline constexpr bool kWar3RuntimeConfigSemanticContractCaptureEffective =
+    kWar3RuntimeConfigSemanticFrameRegistriesEffective &&
+    !kWar3RuntimeConfigDisableSemanticContractCapture;
+inline constexpr bool kWar3RuntimeConfigSemanticConsumerEffective =
+    kWar3RuntimeConfigSemanticContractCaptureEffective &&
+    !kWar3RuntimeConfigDisableSemanticConsumer;
+
 // 二分诊断：StormBreaker/TLSF 大块接管总闸门。
 // 关闭后：
 // - 不安装 Storm.dll alloc/free/realloc/getsize Hook
@@ -404,7 +622,7 @@ inline constexpr bool kWar3RenderHookDomainsEnabled =
 // 是否启用“WorldObjectEntry_Render -> RenderQueue_AddBatch”身份桥接。
 // 该桥把 worldObjectEntry / sceneNode / jHandle / rawcode 直接前推到
 // RenderQueueTracker，避免 Dispatch 热路径再做 sceneNode 反查。
-inline constexpr bool kNativeRenderIdentityBridgeEnabled = false;
+inline constexpr bool kNativeRenderIdentityBridgeEnabled = true;
 
 // 半成品运行时阴影桥接（runtime shadow bridge v1）。
 // 当前在超大图/超大量单位场景下仍可能反复触发高成本修复窗口，
@@ -419,7 +637,103 @@ inline constexpr bool kShadowPersistentGeometryCacheEnabled = true;
 // runtime model hook（CreateSprite / runtimeModel 绑定探针）。
 // 在关闭 runtime shadow bridge 的阶段，这条链默认一并关闭，避免继续
 // 在后台做半成品 registry/pose 记账。
-inline constexpr bool kShadowRuntimeModelHookEnabled = false;
+inline constexpr bool kShadowRuntimeModelHookEnabled = true;
+
+// 2026-04-23 crash triage:
+// - “整包 bootstrap provenance hooks”已经被证实会导致隔离桌面下黑屏/早崩；
+// - 但完全关闭 bootstrap hooks 后，又会丢掉 anonymous attachment trio 的
+//   owner-runtime 早期 provenance；
+// - 因此这里改成“只恢复最小 early provenance 子集”的二分模式：
+//   先只试 promote family，继续把 ctor / resolve / init-copy / child-link
+//   这些更重的 early hooks 保持关闭。
+inline constexpr bool kShadowRuntimeModelBootstrapHookEnabled = true;
+inline constexpr bool kShadowRuntimeModelBootstrapPromoteHookEnabled = true;
+inline constexpr bool kShadowRuntimeModelBootstrapResolveHookEnabled = false;
+inline constexpr bool kShadowRuntimeModelBootstrapCtorHooksEnabled = false;
+inline constexpr bool kShadowRuntimeModelBootstrapInitCopyHookEnabled = false;
+inline constexpr bool kShadowRuntimeModelBootstrapChildLinkHookEnabled = true;
+
+// runtime pose/palette hook（sprite prerender + runtime palette copy）。
+// 上层阴影 consumer 需要这条链提供每帧稳定的 3x4 palette。
+// 如需快速止血，可用 DXVK_WAR3_MODEL_POSE_HOOK=0 关闭。
+inline constexpr bool kShadowRuntimePoseHookEnabled = true;
+
+// child/attachment rigid contract:
+// - local-point output -> root runtime -> child runtime
+// - 默认优先只信 slotIndex -> child tag
+// - sourceRecordIndex fallback 只在专项验证确认 slotIndex 长期 0 命中后再打开
+inline constexpr bool kShadowAttachmentRigidContractEnabled = true;
+inline constexpr bool kShadowAttachmentRigidAllowSourceRecordKeyFallback =
+    false;
+
+// 上层语义阴影 consumer：
+// - 依赖 visible manifest + geoset resource cache + pose palette
+// - 当前默认对 rigid 与 matrix-group skinned geoset 都优先走 authoritative
+// - multi-group 的 runtime 矩阵按 War3 原生 `sub_6F12E200` 规则做等权合成
+inline constexpr bool kUpperLayerShadowConsumerEnabled = false;
+
+// 上层语义阴影观测模式：
+// - 继续跑 resolve / stats / manifest / pose / resource 链
+// - 但默认不直接发射新的 object shadow draw
+// - 用于先稳定 AutoTest 与语义数据面，再逐步切回 authoritative
+inline constexpr bool kUpperLayerShadowConsumerObserveOnly = true;
+
+// 独立语义阴影核心验证：
+// - 基于 contract cache 构建 ShadowRendererCore submission。
+// - 现已作为 DXVK 验证基座默认主路径；需要回到旧诊断路径时可用
+//   DXVK_WAR3_SEMANTIC_SHADOW_PREVIEW=0 显式关闭。
+inline constexpr bool kShadowSemanticCoreValidationEnabled = true;
+
+// 语义阴影 frame -> DXVK scene 提交：
+// - 在 BeforeUi 前直接把 ShadowRendererCore packet 落成 shadowInstances/shadowCasters。
+// - 这是当前 object shadow 主路径。普通手动进图默认启用；如需二分旧路径，
+//   可用 DXVK_WAR3_SEMANTIC_SHADOW_SCENE_SUBMISSION=0 显式关闭。
+inline constexpr bool kShadowSemanticCoreSceneSubmissionEnabled = true;
+inline constexpr bool kShadowSemanticCoreSceneUnitsOnly = true;
+inline constexpr bool kShadowSemanticCoreSceneSubmitDrawCapEnabled = false;
+inline constexpr uint32_t kShadowSemanticCoreSceneSubmitDrawCap = 64u;
+inline constexpr bool kShadowSemanticCoreSceneBootstrapCatchupEnabled = false;
+inline constexpr uint32_t kShadowSemanticCoreSceneBootstrapCatchupMaxAttempts = 0u;
+inline constexpr bool kShadowSemanticCoreSceneTailBoundaryFallbackEnabled = false;
+inline constexpr bool kShadowSemanticCoreSceneEndFrameFlushEnabled = false;
+inline constexpr bool kShadowSemanticCoreAllowFrameLocalDynamicGeometry = false;
+inline constexpr bool kShadowSemanticDispatchContractProbeEnabled = false;
+inline constexpr bool kShadowSemanticCoreTreatFrameLocalDynamicMeshAsPreSkinned =
+    false;
+inline constexpr bool kShadowSemanticCorePreferFrameLocalDynamicMeshForSkinned = false;
+// 只有当 semantic scene 的对象级 ownership 已验证稳定后，才允许在 capture
+// 热路径前置旁路 legacy unit fallback。当前默认关闭，避免“只提交了一部分 packet，
+// 却把整类单位 fallback 提前打没”。
+inline constexpr bool kShadowSemanticCoreSceneBypassLegacyUnitCaptureEnabled =
+    true;
+
+// Formal semantic scene builds must consume the visible-renderable manifest.
+// The old pose-resource preview seed pass enumerates the first few geosets of a
+// posed runtime and was useful as a bootstrap probe, but it can submit hidden
+// construction/scaffold or non-current submeshes once the visible path is live.
+inline constexpr bool kShadowSemanticCoreScenePoseResourcePreviewSeedsEnabled =
+    false;
+
+// Formal semantic scene 的 skinned caster 必须来自当前可见 renderable 的
+// primitive/index slice。若 live meshData 存在但无法解析 slice，继续退回整
+// geoset 会把隐藏/建造/非当前子网格投进 ShadowMap，表现为“同一个局部 caster
+// 阴影套到多名单位上”。保留开关便于现场二分。
+inline constexpr bool
+    kShadowSemanticCoreSceneRequireVisibleIndexSliceForSkinned = true;
+
+// RootUnitSupplement 会从 runtime/modelResource 人工补 root geoset 记录；
+// 这在早期“点亮第一帧”很有用，但 formal scene 一旦有 visible manifest，
+// 它没有 meshData/renderablePart，无法携带当前可见 primitive slice，容易把
+// 非当前子网格/局部 geoset 当成所有单位的 caster。正式路径先禁用，逼消费
+// 层使用真实 visible renderable records。
+inline constexpr bool kShadowSemanticCoreSceneRootUnitSupplementEnabled =
+    false;
+
+// 纯上层语义实验：
+// - 对 object caster 不再回退到 legacy freeze/capture
+// - 用于验证“完全不走捕捉冻结 VB/IB”时，当前链路能否直接画出对象阴影
+// - 若需要快速回到混合模式，可改回 false
+inline constexpr bool kUpperLayerShadowObjectNoCaptureFallbackEnabled = false;
 
 // 是否输出 RenderQueueTracker 命中统计（低频日志）
 inline constexpr bool kNativeRenderQueueTrackerStatsEnabled = false;
@@ -438,14 +752,33 @@ inline constexpr bool kNativeRenderWorldGroupEnabled = true;
 // Native Renderer Hook 接管（完全替换原版渲染流程）
 // ========================================================================
 // 是否启用 Native Renderer Hook 接管（替换游戏原生渲染函数）
-// 注意：该路径仍属实验性，若出现渲染异常可先关闭。
+// 注意：该路径当前仍会接管完整 RenderScene 主链；只有在 native-only
+// takeover correctness 已单独验证通过时才应重新打开。默认关闭，避免主场景
+// 贴图/材质被实验性 full-scene takeover 带坏。
 inline constexpr bool kNativeRendererHookTakeoverEnabled = false;
 
 // Native Renderer Hook 详细日志输出（用于调试Hook安装过程）
-inline constexpr bool kNativeRendererHookVerboseLogging = false;
+inline constexpr bool kNativeRendererHookVerboseLogging = true;
 
 // 是否在Hook安装失败时继续运行（仅记录错误）
 inline constexpr bool kNativeRendererHookContinueOnError = false;
+
+// 在当前 DXVK 宿主的语义阴影 pass 中，直接执行 native D3D9 backend 的
+// prepared draws，用于 Phase 5 的宿主内验证。
+// 这不是最终 late-inject 独立宿主形态，但它可以在不接管完整 RenderScene
+// 的前提下，先恢复“主画面正常 + 新阴影链仍可执行”的安全可用态。
+inline constexpr bool kNativeRendererHostExecuteValidationEnabled = false;
+
+// Stage-aware native semantic shadow validation:
+// - 不开启完整 Native_RenderScene takeover；
+// - 在原版 CWorld_DispatchStage 流程中，于 Stage2 后准备 semantic frame；
+// - 于 Stage11 返回后、原版 flush 前执行已准备 native draws。
+// 这条路用于验证“上层语义阴影能进入正确世界渲染时机”，避免继续依赖
+// EndFrame/BeforeUi/tail-frame 作为功能前提。
+inline constexpr bool kNativeSemanticShadowWorldStageValidationEnabled = false;
+inline constexpr int kNativeSemanticShadowPrepareStage = 2;
+inline constexpr int kNativeSemanticShadowRefreshPrepareStage = 10;
+inline constexpr int kNativeSemanticShadowExecuteStage = 11;
 
 // ========================================================================
 // 对象追踪（RenderObjectRegistry/SceneCollector）
@@ -514,9 +847,9 @@ inline bool kShadowRenderDecorations = true; // 默认开启
 // ========================================================================
 // 在“高 caster + 相机/场景稳定”时，允许隔帧复用上一帧 ShadowMap。
 // 注意：该策略偏向性能，若观察到阴影跟随延迟可关闭。
-inline constexpr bool kShadowAdaptiveMapUpdateEnabled = false;
+inline constexpr bool kShadowAdaptiveMapUpdateEnabled = true;
 // 触发自适应的最小 caster 数。
-inline constexpr uint32_t kShadowAdaptiveMapUpdateMinCasters = 128;
+inline constexpr uint32_t kShadowAdaptiveMapUpdateMinCasters = 16;
 // 自适应跳帧周期：2=隔帧更新，3=每三帧更新一次。
 inline constexpr uint32_t kShadowAdaptiveMapUpdatePeriod = 2;
 // 当 caster 数极高时，提高复用周期，避免超大图里“一帧重建太久”。
@@ -528,6 +861,14 @@ inline constexpr uint32_t kShadowAdaptiveMapUpdateHugeCasterPeriod = 6;
 inline constexpr float kShadowAdaptiveMapUpdateCameraMaxDelta = 0.0005f;
 // 判定“场景稳定”的 caster 数变化阈值。
 inline constexpr uint32_t kShadowAdaptiveMapUpdateCasterDelta = 2;
+// ShadowMap 分辨率自适应：只在 caster 几何工作量很高时降低深度图分辨率。
+// 目标是保护 high-pressure 场景的 GPU 时间；低压/普通场景仍保持用户设置的 4096。
+inline constexpr bool kShadowAdaptiveResolutionEnabled = true;
+inline constexpr uint64_t kShadowAdaptiveResolutionHighWork = 240000;
+inline constexpr uint32_t kShadowAdaptiveResolutionHigh = 3072;
+inline constexpr uint64_t kShadowAdaptiveResolutionHugeWork = 600000;
+inline constexpr uint32_t kShadowAdaptiveResolutionHuge = 2048;
+inline constexpr uint32_t kShadowAdaptiveResolutionMin = 2048;
 // 自适应更新是否感知太阳运动（太阳移动时强制每帧更新 ShadowMap）。
 inline constexpr bool kShadowSunMotionAwareAdaptiveUpdate = true;
 // 太阳移动时是否自动关闭 Shadow TAA（避免历史混入导致拖影/波动）。
@@ -536,6 +877,15 @@ inline constexpr bool kShadowSunMotionAwareTaaDisable = false;
 inline constexpr bool kShadowSunTimeQuantizationEnabled = false;
 // 级联剔除是否对建筑默认完全关闭（性能代价较大，发布档默认关闭该极端策略）。
 inline constexpr bool kShadowCascadeCullDisableForBuildings = false;
+// semantic 动态阴影已经进入 no-fallback 主路径后，单位也需要参与安全级联剔除，
+// 否则 skinned caster 会在所有 cascade 中重复重放，dynamic pressure 直接 GPU bound。
+inline constexpr bool kShadowCascadeCullDisableForUnits = false;
+// 蒙皮单位的 bounds 来自 CModel pose/local bounds，当前保守放大后再做级联剔除：
+// 半径偏大会少剔除但不会缺阴影；偏小则会造成远镜头/低 Z 处 caster 缺底。
+inline constexpr float kShadowCascadeCullSkinnedRadiusScale = 1.55f;
+inline constexpr float kShadowCascadeCullSkinnedExtraRadius = 160.0f;
+inline constexpr float kShadowCascadeCullSkinnedExtraGuardNdc = 0.24f;
+inline constexpr float kShadowCascadeCullSkinnedZExtraGuardNdc = 0.32f;
 // 建筑按保守剔除处理时的包围球放大倍率与额外 NDC 保护带。
 inline constexpr float kShadowCascadeCullBuildingRadiusScale = 1.35f;
 inline constexpr float kShadowCascadeCullBuildingExtraGuardNdc = 0.10f;
@@ -557,7 +907,7 @@ inline constexpr float kShadowCaptureCoarseCullGuardNdc = 0.35f;
 // 超大场景下 ShadowMap 重放 caster 数上限。
 // 目标不是追求“所有单位都每帧吃满”，而是优先保证可交互性与核心阴影稳定。
 inline constexpr bool kShadowReplayCasterCapEnabled = false;
-inline constexpr uint32_t kShadowReplayCasterCap = 1024;
+inline constexpr uint32_t kShadowReplayCasterCap = 32;
 // 超大图中，动态冻结路径每帧最多接受的 world/unit caster 数。
 // 目标：优先避免“单帧几千个 fallback 冻结”造成的长时间卡死。
 inline constexpr bool kShadowFallbackFreezeCountCapEnabled = false;
@@ -575,7 +925,7 @@ inline constexpr uint32_t kShadowRunStatsLogIntervalFrames = 300;
 inline bool kPathBlockerDebugEnabled = false; // 启用诊断日志
 inline bool kPathBlockerHideEnabled = true;   // 隐藏路径阻断器渲染
 // 开启路径阻断器隐藏时，是否强制开启桥接追踪（确保 ShadowCapture 能拿到 rawcode）。
-inline constexpr bool kPathBlockerForceBridgeTrackingEnabled = true;
+inline constexpr bool kPathBlockerForceBridgeTrackingEnabled = false;
 // “仅路径阻断器追踪”模式下的组掩码（bit0=group0, bit1=group1 ...）。
 // 默认仅追踪 group0，减少 SceneCollector 在无描边/无 Bloom 时的全组扫描开销。
 inline constexpr uint32_t kPathBlockerTrackingGroupMask = 0x1u;

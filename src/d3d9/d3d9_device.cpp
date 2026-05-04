@@ -4,6 +4,11 @@
 #include "d3d9_war3_pathtrace.h"
 #include "d3d9_war3_pipeline.h"
 #include "war3/core/war3_internal_test_config.h"
+#include "war3/core/war3_game_structs.h"
+#include "war3/core/war3_memory.h"
+#include "war3/core/war3_net_event_hook.h"
+#include "war3/core/war3_runtime_profile.h"
+#include "war3/core/war3_semantic_shadow_gate.h"
 #include "war3/reimpl/war3_render_types.h"
 #include "war3/render/war3_native_renderer_probe.h"
 #include "war3/render/war3_post_process.h"
@@ -13,13 +18,19 @@
 #include "war3/render/war3_shadow_capture_frontend.h"
 #include "war3/render/war3_shadow_object_registry.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
+#include "war3/render/war3_upper_layer_shadow.h"
+#include "war3/render/war3_visible_renderables.h"
 #include "war3/memory/war3_shadow_arena.h"
 #include "war3/memory/war3_storm_hook.h"
 #include "war3/model/war3_model_hook.h"
+#include "war3/model/war3_model_resource_cache.h"
 #include "war3/model/war3_model_registry.h"
 #include "war3/native/war3_native_shadow_hint.h"
+#include "war3/platform/war3_runtime_bootstrap.h"
+#include "war3/shadow/war3_shadow_renderer_core.h"
 #include "war3/shader/war3_shader_manager.h"
 #include "war3/state/war3_render_state.h"
+#include "war3/tools/war3_diagnostics_hub.h"
 #include "war3/tools/war3_perf_monitor.h"
 #include "war3_shader_api.h"
 #include "war3_shaderpack_internal.h"
@@ -49,6 +60,8 @@
 #include "war3/war3.h"
 
 #include "../dxvk/dxvk_adapter.h"
+
+#include <chrono>
 #include "../dxvk/dxvk_instance.h"
 
 #include "../util/util_bit.h"
@@ -61,6 +74,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <unordered_set>
 #include <vector>
 #include <windows.h>
 
@@ -105,9 +119,119 @@ uint32_t War3GetShadowPersistentMaxAgeFrames() {
   return s_age;
 }
 
+bool War3SemanticRequireVisibleIndexSliceForSkinnedRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_REQUIRE_VISIBLE_INDEX_SLICE", 1u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticAllowCanonicalSinglePrimitiveFullIndexRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_ALLOW_SINGLE_PRIM_FULL_INDEX", 0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticValidateUnitCoreRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_VALIDATE_UNIT_CORE", 1u) != 0u;
+  return s_enabled;
+}
+
+bool War3ShadowPassTraceEnabled() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SHADOW_PASS_TRACE", 0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticPublishRegistriesBeforeSceneRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_PUBLISH_REGISTRIES_BEFORE_SCENE",
+                    0u) != 0u;
+  return s_enabled;
+}
+
+uint64_t War3SemanticContractCapturePeriodRuntime() {
+  static const uint64_t s_period =
+      std::max<uint32_t>(
+          1u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_CONTRACT_CAPTURE_PERIOD",
+                            240u));
+  return s_period;
+}
+
+bool War3SemanticSubmitBreakdownRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_SUBMIT_BREAKDOWN", 0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticLivePaletteRefreshRuntime() {
+  // 每帧从 Hook_RuntimeMatrixWrite 捕获的混合调色板缓存读取完整骨骼矩阵
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_LIVE_PALETTE_REFRESH", 1u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticLivePaletteAllowCModelFallbackRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_LIVE_PALETTE_ALLOW_CMODEL_FALLBACK",
+                    0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticDrawTimePoseRuntime() {
+  // Diagnostic only. 2026-05-01 testing showed War3's fixed-function draw path
+  // reaches this hook with vertex blend disabled, so it cannot publish the
+  // animated skeletal palette. The production dirty signal comes from the
+  // final CModel matrix publisher hooks instead.
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_DRAW_TIME_POSE", 0u) != 0u;
+  return s_enabled;
+}
+
+uint32_t War3SemanticSubmitDrawCapRuntime() {
+  static const uint32_t s_cap = War3GetEnvU32(
+      "DXVK_WAR3_SEMANTIC_SUBMIT_DRAW_CAP",
+      dxvk::war3::internal::kShadowSemanticCoreSceneSubmitDrawCap);
+  return s_cap;
+}
+
+war3::War3PerfMonitor::ScopedCpuScope War3SemanticSubmitScope(
+    const char* name) {
+  if (!War3SemanticSubmitBreakdownRuntime())
+    return {};
+  return war3::War3PerfMonitor::instance().cpuScope(name);
+}
+
 VkDeviceSize War3AlignPersistentBytes(VkDeviceSize size) {
   constexpr VkDeviceSize kAlign = 256u;
   return (size + (kAlign - 1u)) & ~(kAlign - 1u);
+}
+
+uint32_t War3NormalizeShadowHandle(uint32_t handle) {
+  if (handle == 0u)
+    return 0u;
+  const uint32_t handleId = handle & 0x0FFFFFu;
+  return handleId != 0u ? (0x100000u | handleId) : 0u;
+}
+
+void War3RecomputeFallbackBreakdown(War3FrameScene& scene) {
+  scene.shadowStats.fallbackDrawCount =
+      static_cast<uint32_t>(scene.shadowFallbacks.size());
+  scene.shadowStats.fallbackDrawCountTerrain = 0u;
+  scene.shadowStats.fallbackDrawCountWorldObject = 0u;
+  scene.shadowStats.fallbackDrawCountUnitObject = 0u;
+  for (const auto& fallback : scene.shadowFallbacks) {
+    if (fallback.snapshot.category == War3RenderState::StageCategory::Terrain)
+      scene.shadowStats.fallbackDrawCountTerrain++;
+    if (fallback.snapshot.category == War3RenderState::StageCategory::WorldObject ||
+        fallback.snapshot.category == War3RenderState::StageCategory::Effect) {
+      scene.shadowStats.fallbackDrawCountWorldObject++;
+    }
+    if (fallback.snapshot.objectKind ==
+        static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit)) {
+      scene.shadowStats.fallbackDrawCountUnitObject++;
+    }
+  }
 }
 
 uint64_t War3GetShadowFallbackBudgetCapBytes() {
@@ -115,6 +239,1263 @@ uint64_t War3GetShadowFallbackBudgetCapBytes() {
       "DXVK_WAR3_SHADOW_FALLBACK_BUDGET_MB",
       dxvk::war3::render::IsShadowArenaCaptureEnabled() ? 1024u : 256u);
   return uint64_t(fallbackMb) * 1024ull * 1024ull;
+}
+
+bool War3IsSemanticUnitObject(
+    dxvk::war3::render::ObjectKind objectKind) {
+  return objectKind == dxvk::war3::render::ObjectKind::Unit;
+}
+
+uint32_t War3SemanticUnitFlags5C(
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
+  if (renderable.unitFlags5C != 0u)
+    return renderable.unitFlags5C;
+
+  uint32_t flags5C = 0u;
+  if (renderable.unitPtr != nullptr &&
+      dxvk::war3::SafeReadU32Fast(renderable.unitPtr,
+                                  dxvk::war3::CUnitOffsets::Flags5C,
+                                  flags5C)) {
+    return flags5C;
+  }
+
+  return 0u;
+}
+
+bool War3SemanticRenderableHasBuildingFlags(
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
+  const uint32_t flags5C = War3SemanticUnitFlags5C(renderable);
+  return (flags5C & dxvk::war3::UnitFlags5C::Building) != 0u;
+}
+
+constexpr uint32_t War3SemanticByteSwapU32(uint32_t v) {
+  return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+         ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
+}
+
+bool War3SemanticFourCcHasPrefix(uint32_t rawcode, char c0, char c1) {
+  const auto matches = [=](uint32_t value) {
+    return ((value >> 24) & 0xFFu) == static_cast<uint8_t>(c0) &&
+           ((value >> 16) & 0xFFu) == static_cast<uint8_t>(c1);
+  };
+  return matches(rawcode) || matches(War3SemanticByteSwapU32(rawcode));
+}
+
+bool War3SemanticFourCcEqualEitherOrder(uint32_t a, uint32_t b) {
+  if (a == b)
+    return true;
+  return a != 0u && b != 0u && War3SemanticByteSwapU32(a) == b;
+}
+
+bool War3SemanticRawcodeLooksStaticWorldCaster(uint32_t rawcode) {
+  if (rawcode == 0u)
+    return false;
+
+  // Trees/pathing doodads such as LTbr/YTxx can share CWidget-like offsets
+  // with CUnit and were observed entering the skinned unit path as obj=Unit.
+  // Keep this as a surgical reject list instead of broad rawcode class guesses.
+  return War3SemanticFourCcHasPrefix(rawcode, 'L', 'T') ||
+         War3SemanticFourCcHasPrefix(rawcode, 'Y', 'T');
+}
+
+bool War3SemanticReadUnitCore(
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable,
+    uint32_t& outRawcode, uint32_t& outFlags5C, void*& outSpritePtr) {
+  outRawcode = 0u;
+  outFlags5C = 0u;
+  outSpritePtr = nullptr;
+  if (renderable.unitPtr == nullptr ||
+      !dxvk::war3::IsReadableRangeFast(renderable.unitPtr, 0x64u)) {
+    return false;
+  }
+
+  if (!dxvk::war3::SafeReadU32Fast(renderable.unitPtr,
+                                   dxvk::war3::CUnitOffsets::Rawcode,
+                                   outRawcode)) {
+    return false;
+  }
+
+  dxvk::war3::SafeReadU32Fast(renderable.unitPtr,
+                              dxvk::war3::CUnitOffsets::Flags5C,
+                              outFlags5C);
+  if (!dxvk::war3::SafeReadPtrFast(renderable.unitPtr,
+                                   dxvk::war3::CUnitOffsets::Sprite,
+                                   outSpritePtr)) {
+    outSpritePtr = nullptr;
+  }
+
+  return true;
+}
+
+bool War3SemanticPacketHasStableUnitResource(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  const auto& renderable = packet.renderable;
+  return renderable.runtimeModelPtr != nullptr &&
+         (renderable.modelResourcePtr != nullptr || renderable.modelKey != 0u ||
+          packet.resource.modelResourcePtr != nullptr ||
+          packet.resource.modelKey != 0u);
+}
+
+struct War3SemanticUnitValidationCacheEntry {
+  void* unitPtr = nullptr;
+  void* runtimeModelPtr = nullptr;
+  uint32_t rawcode = 0u;
+  uint64_t frameSerial = 0u;
+  bool valid = false;
+  bool populated = false;
+};
+
+War3SemanticUnitValidationCacheEntry&
+War3SemanticUnitValidationCacheSlot(
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
+  thread_local std::array<War3SemanticUnitValidationCacheEntry, 2048u> s_cache;
+  uintptr_t hash = reinterpret_cast<uintptr_t>(renderable.unitPtr);
+  hash ^= reinterpret_cast<uintptr_t>(renderable.runtimeModelPtr) >> 4u;
+  hash ^= uintptr_t(renderable.rawcode) * uintptr_t(0x9E3779B1u);
+  hash ^= uintptr_t(renderable.frameSerial) * uintptr_t(0x85EBCA6Bu);
+  return s_cache[hash & (s_cache.size() - 1u)];
+}
+
+bool War3SemanticPacketHasConsistentUnitCore(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  const auto& renderable = packet.renderable;
+  auto& cacheEntry = War3SemanticUnitValidationCacheSlot(renderable);
+  if (cacheEntry.populated && cacheEntry.unitPtr == renderable.unitPtr &&
+      cacheEntry.runtimeModelPtr == renderable.runtimeModelPtr &&
+      cacheEntry.rawcode == renderable.rawcode &&
+      cacheEntry.frameSerial == renderable.frameSerial) {
+    return cacheEntry.valid;
+  }
+
+  uint32_t unitRawcode = 0u;
+  uint32_t unitFlags5C = 0u;
+  void* unitSpritePtr = nullptr;
+  bool valid = War3SemanticReadUnitCore(renderable, unitRawcode, unitFlags5C,
+                                        unitSpritePtr);
+  if (valid)
+    valid = unitSpritePtr != nullptr;
+  if (valid)
+    valid = (unitFlags5C & dxvk::war3::UnitFlags5C::Building) == 0u;
+  const uint32_t semanticRawcode =
+      renderable.rawcode != 0u ? renderable.rawcode : unitRawcode;
+  if (valid) {
+    valid = !War3SemanticRawcodeLooksStaticWorldCaster(semanticRawcode) &&
+            !War3SemanticRawcodeLooksStaticWorldCaster(unitRawcode);
+  }
+  if (valid && renderable.rawcode != 0u && unitRawcode != 0u) {
+    valid =
+        War3SemanticFourCcEqualEitherOrder(renderable.rawcode, unitRawcode);
+  }
+
+  cacheEntry.unitPtr = renderable.unitPtr;
+  cacheEntry.runtimeModelPtr = renderable.runtimeModelPtr;
+  cacheEntry.rawcode = renderable.rawcode;
+  cacheEntry.frameSerial = renderable.frameSerial;
+  cacheEntry.valid = valid;
+  cacheEntry.populated = true;
+  return valid;
+}
+
+bool War3HasSemanticDynamicUnitEvidence(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet);
+
+dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKind(
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable);
+
+bool War3ShouldSubmitSemanticPacket(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    dxvk::war3::render::ObjectKind resolvedObjectKind, bool unitsOnly);
+
+bool War3IsEligibleSemanticDynamicUnit(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    dxvk::war3::render::ObjectKind resolvedObjectKind) {
+  if (!War3IsSemanticUnitObject(resolvedObjectKind))
+    return false;
+
+  return War3HasSemanticDynamicUnitEvidence(packet);
+}
+
+bool War3HasSemanticDynamicUnitEvidence(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  const auto& renderable = packet.renderable;
+  if (renderable.queueKind ==
+      dxvk::war3::render::VisibleRenderableQueueKind::Transparent) {
+    return false;
+  }
+
+  // WorldObjects group 0 is the live unit group. Groups 1/2 carry buildings,
+  // selection/building subparts, doodads and effects; accepting them as
+  // "skinned units" is what produced the flickering construction/scaffold
+  // caster silhouettes and the grey full-scene veil.
+  if (renderable.groupIdx > 0)
+    return false;
+
+  if ((renderable.unitFlags5C & dxvk::war3::UnitFlags5C::Building) != 0u)
+    return false;
+
+  if (!War3SemanticPacketHasStableUnitResource(packet))
+    return false;
+
+  if (renderable.rawcode == 0u && renderable.jHandle == 0u)
+    return false;
+
+  if (renderable.unitPtr == nullptr)
+    return false;
+
+  if (packet.path != dxvk::war3::shadow::ShadowDrawPath::Skinned)
+    return false;
+
+  if (War3SemanticRawcodeLooksStaticWorldCaster(renderable.rawcode))
+    return false;
+
+  if (War3SemanticValidateUnitCoreRuntime())
+    return War3SemanticPacketHasConsistentUnitCore(packet);
+
+  return true;
+}
+
+bool War3SemanticPacketUsesDirectGeosetData(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  return packet.renderable.meshData != nullptr &&
+         packet.renderable.runtimeGeosetDataPtr != nullptr &&
+         packet.renderable.meshData == packet.renderable.runtimeGeosetDataPtr;
+}
+
+dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKindFast(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  if (packet.renderable.objectKind !=
+      dxvk::war3::render::ObjectKind::Unknown) {
+    return packet.renderable.objectKind;
+  }
+
+  if (War3HasSemanticDynamicUnitEvidence(packet))
+    return dxvk::war3::render::ObjectKind::Unit;
+
+  return War3ResolveSemanticPacketObjectKind(packet.renderable);
+}
+
+bool War3ShouldSubmitSemanticPacketFast(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet, bool unitsOnly) {
+  if (unitsOnly) {
+    if (packet.renderable.objectKind !=
+        dxvk::war3::render::ObjectKind::Unknown) {
+      return War3IsEligibleSemanticDynamicUnit(packet,
+                                               packet.renderable.objectKind);
+    }
+    return War3HasSemanticDynamicUnitEvidence(packet);
+  }
+
+  const auto resolvedObjectKind =
+      War3ResolveSemanticPacketObjectKindFast(packet);
+  return War3ShouldSubmitSemanticPacket(packet, resolvedObjectKind, false);
+}
+
+bool War3LooksSubmitEligibleForScoringFast(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet, bool unitsOnly) {
+  if (!unitsOnly)
+    return War3ShouldSubmitSemanticPacketFast(packet, false);
+
+  const auto& renderable = packet.renderable;
+  if (packet.path != dxvk::war3::shadow::ShadowDrawPath::Skinned)
+    return false;
+  if (renderable.queueKind ==
+      dxvk::war3::render::VisibleRenderableQueueKind::Transparent)
+    return false;
+  if (renderable.groupIdx > 0)
+    return false;
+  if (renderable.unitPtr == nullptr)
+    return false;
+  if ((renderable.unitFlags5C & dxvk::war3::UnitFlags5C::Building) != 0u)
+    return false;
+  if (renderable.rawcode == 0u && renderable.jHandle == 0u)
+    return false;
+  if (renderable.objectKind != dxvk::war3::render::ObjectKind::Unknown &&
+      !War3IsSemanticUnitObject(renderable.objectKind))
+    return false;
+  if (War3SemanticRawcodeLooksStaticWorldCaster(renderable.rawcode))
+    return false;
+
+  return War3SemanticPacketHasStableUnitResource(packet);
+}
+
+bool War3IsEligibleSemanticStaticWorldCaster(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    dxvk::war3::render::ObjectKind resolvedObjectKind,
+    bool hasRenderableGeoset, bool hasPacketGeometry) {
+  if constexpr (!dxvk::war3::internal::
+                    kWar3RuntimeConfigSemanticVisibleEndFrameStaticHydrate) {
+    return false;
+  }
+
+  if (resolvedObjectKind != dxvk::war3::render::ObjectKind::Building &&
+      resolvedObjectKind != dxvk::war3::render::ObjectKind::Destructible) {
+    return false;
+  }
+
+  const auto& renderable = packet.renderable;
+  if (renderable.queueKind ==
+      dxvk::war3::render::VisibleRenderableQueueKind::Transparent) {
+    return false;
+  }
+
+  if (packet.path != dxvk::war3::shadow::ShadowDrawPath::Rigid)
+    return false;
+
+  if (renderable.worldObjectEntry == nullptr ||
+      renderable.sceneNode == nullptr) {
+    return false;
+  }
+
+  if (!packet.pose.hasWorldTransform || !hasRenderableGeoset ||
+      !hasPacketGeometry) {
+    return false;
+  }
+
+  // Selection/decoration/effect groups are not stable static-world casters.
+  // Let full static-object support opt in later through a canonical manifest
+  // contract instead of submitting hidden build/effect meshes here.
+  if (renderable.groupIdx > 0)
+    return false;
+
+  return true;
+}
+
+dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKind(
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
+  using dxvk::war3::render::ObjectKind;
+
+  if (renderable.objectKind != ObjectKind::Unknown)
+    return renderable.objectKind;
+
+  auto& renderRegistry = dxvk::war3::render::RenderObjectRegistry::instance();
+  if (renderable.sceneNode != nullptr) {
+    if (const auto* object = renderRegistry.findBySceneNode(renderable.sceneNode))
+      return object->kind;
+  }
+  if (renderable.worldObjectEntry != nullptr) {
+    if (const auto* object =
+            renderRegistry.findByEntry(renderable.worldObjectEntry)) {
+      return object->kind;
+    }
+  }
+  if (renderable.jHandle != 0u) {
+    if (const auto* object = renderRegistry.findByHandle(renderable.jHandle))
+      return object->kind;
+  }
+
+  dxvk::war3::render::ShadowObjectRecord shadowRecord = {};
+  auto& shadowRegistry = dxvk::war3::render::ShadowObjectRegistry::instance();
+  if (renderable.sceneNode != nullptr &&
+      shadowRegistry.findBySceneNode(renderable.sceneNode, shadowRecord)) {
+    return shadowRecord.kind;
+  }
+  if (renderable.worldObjectEntry != nullptr &&
+      shadowRegistry.findByWorldObjectEntry(renderable.worldObjectEntry,
+                                            shadowRecord)) {
+    return shadowRecord.kind;
+  }
+  if (renderable.jHandle != 0u &&
+      shadowRegistry.findByHandle(renderable.jHandle, shadowRecord)) {
+    return shadowRecord.kind;
+  }
+  if (renderable.runtimeModelPtr != nullptr &&
+      shadowRegistry.findByRuntimeModel(renderable.runtimeModelPtr,
+                                        shadowRecord)) {
+    return shadowRecord.kind;
+  }
+
+  return ObjectKind::Unknown;
+}
+
+bool War3ShouldSubmitSemanticPacket(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    dxvk::war3::render::ObjectKind resolvedObjectKind, bool unitsOnly) {
+  const bool hasRenderableGeoset =
+      packet.renderable.runtimeGeosetPtr != nullptr ||
+      packet.renderable.runtimeGeosetDataPtr != nullptr ||
+      packet.renderable.geosetIndex !=
+          dxvk::war3::shadow::kInvalidShadowContractGeosetIndex ||
+      packet.resource.geosetIndex !=
+          dxvk::war3::shadow::kInvalidShadowContractGeosetIndex;
+  const bool hasPacketGeometry =
+      packet.resource.vertexCount != 0u ||
+      (packet.usesDynamicMeshPositions &&
+       packet.resource.dynamicPositionStream != nullptr &&
+       packet.resource.dynamicPositionStride >= 12u);
+  const bool explicitUnknownRigid =
+      resolvedObjectKind == dxvk::war3::render::ObjectKind::Unknown &&
+      packet.path == dxvk::war3::shadow::ShadowDrawPath::Rigid &&
+      packet.renderable.worldObjectEntry != nullptr &&
+      packet.renderable.sceneNode != nullptr &&
+      packet.pose.hasWorldTransform && hasRenderableGeoset &&
+      hasPacketGeometry;
+
+  if (!unitsOnly) {
+    if (War3IsEligibleSemanticDynamicUnit(packet, resolvedObjectKind) ||
+        War3IsEligibleSemanticStaticWorldCaster(
+            packet, resolvedObjectKind, hasRenderableGeoset,
+            hasPacketGeometry))
+      return true;
+    // Keep the explicit resource-owner rigid escape hatch, but do not submit
+    // generic effects/unknown translucent payloads; those were the source of
+    // the dark full-screen overlay in the previous full-scene experiment.
+    return explicitUnknownRigid;
+  }
+
+  return War3IsEligibleSemanticDynamicUnit(packet, resolvedObjectKind);
+}
+
+struct War3SemanticSceneFrameScore {
+  uint32_t inputDrawCount = 0u;
+  uint32_t eligibleDrawCount = 0u;
+  uint32_t skinnedDrawCount = 0u;
+};
+
+War3SemanticSceneFrameScore War3ScoreSemanticSceneFrame(
+    const dxvk::war3::shadow::ShadowSubmissionFrame* frame,
+    bool unitsOnly) {
+  War3SemanticSceneFrameScore score = {};
+  if (frame == nullptr || frame->frameSerial == 0u)
+    return score;
+
+  score.inputDrawCount = static_cast<uint32_t>(
+      std::min<size_t>(frame->draws.size(), size_t(0xFFFFFFFFu)));
+  for (const auto& draw : frame->draws) {
+    const bool eligible = War3LooksSubmitEligibleForScoringFast(draw, unitsOnly);
+    if (eligible)
+      ++score.eligibleDrawCount;
+    if (eligible && draw.path == dxvk::war3::shadow::ShadowDrawPath::Skinned)
+      ++score.skinnedDrawCount;
+  }
+  return score;
+}
+
+bool War3ShouldPreferSemanticSceneFrame(
+    const std::shared_ptr<const dxvk::war3::shadow::ShadowSubmissionFrame>&
+        candidate,
+    const std::shared_ptr<const dxvk::war3::shadow::ShadowSubmissionFrame>&
+        current,
+    bool unitsOnly) {
+  if (candidate == nullptr || candidate->frameSerial == 0u ||
+      candidate->draws.empty())
+    return false;
+  if (current == nullptr || current->frameSerial == 0u ||
+      current->draws.empty())
+    return true;
+  if (candidate.get() == current.get())
+    return false;
+
+  const auto candidateScore =
+      War3ScoreSemanticSceneFrame(candidate.get(), unitsOnly);
+  const auto currentScore = War3ScoreSemanticSceneFrame(current.get(), unitsOnly);
+
+  if (candidateScore.eligibleDrawCount == 0u &&
+      currentScore.eligibleDrawCount != 0u)
+    return false;
+  if (candidateScore.skinnedDrawCount != currentScore.skinnedDrawCount)
+    return candidateScore.skinnedDrawCount > currentScore.skinnedDrawCount;
+  if (candidateScore.eligibleDrawCount != currentScore.eligibleDrawCount)
+    return candidateScore.eligibleDrawCount > currentScore.eligibleDrawCount;
+  if (candidateScore.inputDrawCount != currentScore.inputDrawCount)
+    return candidateScore.inputDrawCount > currentScore.inputDrawCount;
+
+  if (candidate->sourcePublishRevision != current->sourcePublishRevision)
+    return candidate->sourcePublishRevision > current->sourcePublishRevision;
+
+  return candidate->frameSerial > current->frameSerial;
+}
+
+bool War3SemanticDataModuleEnabled() {
+  return war3::runtime::IsWar3RuntimeModuleEnabled(
+      war3::runtime::War3RuntimeModule::SemanticData);
+}
+
+bool War3SemanticModelProducerEnabled() {
+  return War3SemanticDataModuleEnabled() &&
+         dxvk::war3::internal::
+             kWar3RuntimeConfigSemanticModelProducerEffective;
+}
+
+bool War3SemanticFrameRegistriesEnabled() {
+  return War3SemanticModelProducerEnabled() &&
+         dxvk::war3::internal::
+             kWar3RuntimeConfigSemanticFrameRegistriesEffective;
+}
+
+bool War3SemanticContractCaptureEnabled() {
+  return War3SemanticModelProducerEnabled() &&
+         dxvk::war3::internal::
+             kWar3RuntimeConfigSemanticContractCaptureEffective;
+}
+
+bool War3SemanticConsumerEnabled() {
+  return War3SemanticModelProducerEnabled() &&
+         dxvk::war3::internal::
+             kWar3RuntimeConfigSemanticConsumerEffective;
+}
+
+void War3PublishSemanticRegistriesForScene() {
+  // BeforeUi is the first point where the DXVK shadow scene can be submitted,
+  // so publish the write-side semantic registries here instead of waiting for
+  // FlushAndReset/EndFrame. The individual endFrame calls are idempotent
+  // publish/freshness operations; they do not clear the current frame data.
+  dxvk::war3::render::War3Renderer::instance()
+      .PublishSemanticRegistriesForScene();
+}
+
+class War3DxvkSemanticShadowHost final
+    : public dxvk::war3::shadow::IDxvkValidationHost {
+public:
+  explicit War3DxvkSemanticShadowHost(D3D9DeviceEx& device)
+      : m_device(device) {
+  }
+
+  bool shouldSubmitDraw(const dxvk::war3::shadow::ShadowDrawPacket& packet,
+                        bool unitsOnly) const override {
+    return War3ShouldSubmitSemanticPacketFast(packet, unitsOnly);
+  }
+
+  bool submitDrawPacket(
+      const dxvk::war3::shadow::ShadowDrawPacket& packet) override {
+    auto appendScope = []() -> war3::War3PerfMonitor::ScopedCpuScope {
+      if constexpr (dxvk::war3::internal::
+                        kNativeOptimizationPerfTrackingEnabled) {
+        return war3::War3PerfMonitor::instance().cpuScope(
+            "War3SemanticScene/SubmitFrame/AppendPacket");
+      }
+      return {};
+    }();
+    return m_device.War3SubmitSemanticShadowPacketForBackend(packet);
+  }
+
+  uint32_t normalizeHandle(uint32_t handle) const override {
+    return War3NormalizeShadowHandle(handle);
+  }
+
+private:
+  D3D9DeviceEx& m_device;
+};
+
+float War3SemanticBoundsRadiusForObjectKind(uint8_t objectKind) {
+  using dxvk::war3::render::ObjectKind;
+  switch (static_cast<ObjectKind>(objectKind)) {
+  case ObjectKind::Unit:
+    return 260.0f;
+  case ObjectKind::Building:
+    return 900.0f;
+  case ObjectKind::Destructible:
+    return 750.0f;
+  case ObjectKind::Item:
+    return 220.0f;
+  case ObjectKind::Effect:
+    return 900.0f;
+  default:
+    return 0.0f;
+  }
+}
+
+float War3SemanticBoundsMaxScale(const Matrix4& m) {
+  auto axisLen3 = [](const Vector4& v) {
+    return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+  };
+
+  const float sx = axisLen3(m[0]);
+  const float sy = axisLen3(m[1]);
+  const float sz = axisLen3(m[2]);
+  return (std::max)(1.0f, (std::max)(sx, (std::max)(sy, sz)));
+}
+
+Vector4 War3SemanticBoundsTranslation(const Matrix4& m) {
+  return Vector4(m[3].x, m[3].y, m[3].z, 1.0f);
+}
+
+float War3SemanticTranslationDistanceSq(const Matrix4& a, const Matrix4& b) {
+  const float dx = a[3].x - b[3].x;
+  const float dy = a[3].y - b[3].y;
+  const float dz = a[3].z - b[3].z;
+  return dx * dx + dy * dy + dz * dz;
+}
+
+bool War3SemanticTranslationFinite(const Matrix4& m) {
+  return std::isfinite(m[3].x) && std::isfinite(m[3].y) &&
+         std::isfinite(m[3].z);
+}
+
+bool War3SemanticPaletteStorageReadable(const std::vector<Matrix4>& palette) {
+  if (palette.empty())
+    return false;
+  if (palette.size() > 256u)
+    return false;
+  return dxvk::war3::IsReadableRange(
+      palette.data(), palette.size() * sizeof(Matrix4));
+}
+
+template <typename T>
+bool War3SemanticVectorStorageReadable(const std::vector<T>& values,
+                                       size_t requiredCount = 0u) {
+  if (values.size() < requiredCount)
+    return false;
+  if (values.empty())
+    return requiredCount == 0u;
+  return dxvk::war3::IsReadableRange(
+      values.data(), values.size() * sizeof(T));
+}
+
+bool War3SemanticPaletteLooksModelLocal(
+    const Matrix4* palette,
+    uint32_t paletteCount,
+    const Matrix4& worldTransform,
+    uint8_t objectKind,
+    bool checkReadable = true) {
+  if (palette == nullptr || paletteCount == 0u ||
+      (checkReadable &&
+       !dxvk::war3::IsReadableRange(palette,
+                                    size_t(paletteCount) * sizeof(Matrix4))) ||
+      !War3SemanticTranslationFinite(worldTransform))
+    return false;
+
+  const float worldMagSq = worldTransform[3].x * worldTransform[3].x +
+                           worldTransform[3].y * worldTransform[3].y +
+                           worldTransform[3].z * worldTransform[3].z;
+  if (!(worldMagSq > 16.0f))
+    return false;
+
+  float guardRadius = War3SemanticBoundsRadiusForObjectKind(objectKind);
+  if (!(guardRadius > 0.0f))
+    guardRadius = 260.0f;
+  guardRadius = std::max(384.0f, guardRadius * 1.5f);
+  const float thresholdSq = guardRadius * guardRadius;
+
+  float closestSq = std::numeric_limits<float>::max();
+  float closestPaletteMagSq = std::numeric_limits<float>::max();
+  const uint32_t sampleCount =
+      std::min<uint32_t>(paletteCount, 4u);
+  for (uint32_t i = 0u; i < sampleCount; ++i) {
+    if (!War3SemanticTranslationFinite(palette[i]))
+      return false;
+    const float px = palette[i][3].x;
+    const float py = palette[i][3].y;
+    const float pz = palette[i][3].z;
+    closestPaletteMagSq =
+        std::min(closestPaletteMagSq, px * px + py * py + pz * pz);
+    closestSq = std::min(
+        closestSq,
+        War3SemanticTranslationDistanceSq(palette[i], worldTransform));
+  }
+
+  // The shadow caster shader expects world-space fixed-function matrices
+  // because it evaluates `in_pos * paletteMatrix` directly. CModel's live
+  // final-pose array can be model-local on the semantic direct-read path, while
+  // CModel+0x64 carries the runtime world transform. If sampled palette
+  // translations are far from the runtime world origin, treat the palette as
+  // model-local and compose it to the same world-space contract the old D3D
+  // fixed-function path provided.
+  const float localMagLimit = std::max(1024.0f, guardRadius * 2.0f);
+  if (closestPaletteMagSq > localMagLimit * localMagLimit)
+    return false;
+
+  return closestSq > thresholdSq;
+}
+
+bool War3SemanticPaletteLooksModelLocal(
+    const std::vector<Matrix4>& palette,
+    const Matrix4& worldTransform,
+    uint8_t objectKind) {
+  if (!War3SemanticPaletteStorageReadable(palette))
+    return false;
+  return War3SemanticPaletteLooksModelLocal(
+      palette.data(), uint32_t(palette.size()), worldTransform, objectKind,
+      false);
+}
+
+void War3SemanticBuildWorldPaletteIfNeeded(
+    const std::vector<Matrix4>& sourcePalette,
+    const Matrix4& worldTransform,
+    uint8_t objectKind,
+    std::vector<Matrix4>& outPalette) {
+  outPalette.clear();
+  if (!War3SemanticPaletteLooksModelLocal(sourcePalette, worldTransform,
+                                          objectKind)) {
+    return;
+  }
+
+  outPalette.reserve(sourcePalette.size());
+  for (const Matrix4& localMatrix : sourcePalette)
+    outPalette.push_back(worldTransform * localMatrix);
+}
+
+uint64_t War3SemanticHashMatrix4(const Matrix4& matrix) {
+  uint64_t hash = bit::fnv1a_init();
+  for (uint32_t r = 0u; r < 4u; ++r) {
+    hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[r].x));
+    hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[r].y));
+    hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[r].z));
+    hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[r].w));
+  }
+  return hash;
+}
+
+uint64_t War3SemanticHashMatrixPalette(const Matrix4* matrices,
+                                        uint32_t matrixCount) {
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, matrixCount);
+  if (matrices == nullptr || matrixCount == 0u)
+    return hash;
+
+  for (uint32_t i = 0u; i < matrixCount; ++i) {
+    const Matrix4& matrix = matrices[i];
+    for (uint32_t r = 0u; r < 4u; ++r) {
+      hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[r].x));
+      hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[r].y));
+      hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[r].z));
+      hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[r].w));
+    }
+  }
+  return hash;
+}
+
+Matrix4 War3DecodeRuntimePoseMatrix48(const uint8_t* poseBytes) {
+  float pose3x4[12] = {};
+  std::memcpy(pose3x4, poseBytes, sizeof(pose3x4));
+  return Matrix4(Vector4(pose3x4[0], pose3x4[1], pose3x4[2], 0.0f),
+                 Vector4(pose3x4[3], pose3x4[4], pose3x4[5], 0.0f),
+                 Vector4(pose3x4[6], pose3x4[7], pose3x4[8], 0.0f),
+                 Vector4(pose3x4[9], pose3x4[10], pose3x4[11], 1.0f));
+}
+
+bool War3TryReadRuntimePoseArray(void* runtimeModelPtr,
+                                 uint32_t& outPoseCount,
+                                 void*& outPoseArrayPtr) {
+  outPoseCount = 0u;
+  outPoseArrayPtr = nullptr;
+  if (runtimeModelPtr == nullptr)
+    return false;
+
+  if (!dxvk::war3::SafeReadU32Fast(
+          runtimeModelPtr, dxvk::war3::CModelOffsets::FinalPoseMatrixCount,
+          outPoseCount) ||
+      outPoseCount == 0u || outPoseCount > 1024u ||
+      !dxvk::war3::SafeReadPtrFast(
+          runtimeModelPtr, dxvk::war3::CModelOffsets::FinalPoseMatrixArray,
+          outPoseArrayPtr) ||
+      outPoseArrayPtr == nullptr ||
+      !dxvk::war3::IsReadableRange(
+          outPoseArrayPtr, size_t(outPoseCount) * sizeof(float) * 12u)) {
+    outPoseCount = 0u;
+    outPoseArrayPtr = nullptr;
+    return false;
+  }
+  return true;
+}
+
+void* War3ResolveLivePoseRuntimeAlias(void* runtimeModelPtr,
+                                      uint32_t& outPoseCount,
+                                      void*& outPoseArrayPtr) {
+  outPoseCount = 0u;
+  outPoseArrayPtr = nullptr;
+  if (runtimeModelPtr == nullptr)
+    return nullptr;
+
+  constexpr uintptr_t kCModelComplexExtensionOffset = 0xA0u;
+  const uintptr_t value = reinterpret_cast<uintptr_t>(runtimeModelPtr);
+  if (value < 0x10000u)
+    return nullptr;
+
+  std::array<void*, 3> candidates = {
+      reinterpret_cast<void*>(value + kCModelComplexExtensionOffset),
+      runtimeModelPtr,
+      value > kCModelComplexExtensionOffset
+          ? reinterpret_cast<void*>(value - kCModelComplexExtensionOffset)
+          : nullptr};
+
+  for (void* candidate : candidates) {
+    uint32_t poseCount = 0u;
+    void* poseArrayPtr = nullptr;
+    if (!War3TryReadRuntimePoseArray(candidate, poseCount, poseArrayPtr))
+      continue;
+    outPoseCount = poseCount;
+    outPoseArrayPtr = poseArrayPtr;
+    return candidate;
+  }
+
+  return nullptr;
+}
+
+bool War3TryBuildLiveRuntimeGroupPalette(
+    const dxvk::war3::shadow::ShadowPacketResource& resource,
+    void* runtimeModelPtr,
+    void* renderablePart,
+    uint64_t frameSerial,
+    std::vector<Matrix4>& outPalette,
+    uint32_t& outMaxVertexGroupSlot,
+    uint64_t& outHash,
+    uint64_t* outRawPoseHash = nullptr,
+    void** outPoseRuntimeModelPtr = nullptr) {
+  outPalette.clear();
+  outMaxVertexGroupSlot = 0u;
+  outHash = 0u;
+  if (outRawPoseHash != nullptr)
+    *outRawPoseHash = 0u;
+  if (outPoseRuntimeModelPtr != nullptr)
+    *outPoseRuntimeModelPtr = nullptr;
+  if (runtimeModelPtr == nullptr)
+    return false;
+  const auto& vertexGroups = resource.vertexGroupIndexVec();
+  const auto& matrixGroupSizes = resource.matrixGroupSizeVec();
+  const auto& matrixIndices = resource.matrixIndexVec();
+  if (vertexGroups.empty())
+    return false;
+
+  // 首选：从 Hook_RuntimeMatrixWrite 当场捕获的混合调色板读取
+  if (renderablePart != nullptr) {
+    uint32_t slotIndex = 0xFFFFFFFF;
+    if (dxvk::war3::SafeReadU32Fast(renderablePart,
+            dxvk::war3::RenderablePartFieldOffsets::StagePresetSpanBaseIndex,
+            slotIndex) &&
+        slotIndex != 0xFFFFFFFF && slotIndex < 0x3A98) {
+      uint32_t capturedCount = 0u;
+      if (dxvk::war3::model::QueryBlendedPaletteBySlotIndex(
+              slotIndex, &outPalette, capturedCount) &&
+          capturedCount > 0u && capturedCount <= 256u) {
+        outMaxVertexGroupSlot = capturedCount - 1u;
+        outHash = War3SemanticHashMatrixPalette(outPalette.data(), capturedCount);
+        if (outRawPoseHash) *outRawPoseHash = outHash;
+        if (outPoseRuntimeModelPtr) *outPoseRuntimeModelPtr = runtimeModelPtr;
+        return true;
+      }
+    }
+  }
+
+  uint32_t poseCount = 0u;
+  void* poseArrayPtr = nullptr;
+  void* poseRuntimeModelPtr = nullptr;
+  const Matrix4* publishedPoseMatrices = nullptr;
+  uint64_t publishedPoseHash = 0u;
+  dxvk::war3::model::PoseRecord publishedPose = {};
+  auto tryUsePublishedPose = [&](void* candidateRuntimeModelPtr) -> bool {
+    if (candidateRuntimeModelPtr == nullptr)
+      return false;
+    dxvk::war3::model::PoseRecord candidate = {};
+    if (!dxvk::war3::model::PoseRegistry::instance().findByRuntimeModel(
+            candidateRuntimeModelPtr, candidate) ||
+        candidate.matrixCount == 0u || candidate.matrixPalette.empty()) {
+      return false;
+    }
+
+    publishedPose = std::move(candidate);
+    poseRuntimeModelPtr = publishedPose.runtimeModelPtr != nullptr
+                              ? publishedPose.runtimeModelPtr
+                              : candidateRuntimeModelPtr;
+    poseCount = std::min<uint32_t>(
+        publishedPose.matrixCount,
+        uint32_t(std::min<size_t>(publishedPose.matrixPalette.size(),
+                                  size_t(1024u))));
+    if (poseCount == 0u)
+      return false;
+    publishedPoseMatrices = publishedPose.matrixPalette.data();
+    publishedPoseHash =
+        publishedPose.matrixHash != 0u
+            ? publishedPose.matrixHash
+            : War3SemanticHashMatrixPalette(publishedPoseMatrices, poseCount);
+    return true;
+  };
+
+  bool usingPublishedPose = tryUsePublishedPose(runtimeModelPtr);
+  if (!usingPublishedPose) {
+    constexpr uintptr_t kCModelComplexExtensionOffset = 0xA0u;
+    const uintptr_t runtimeValue = reinterpret_cast<uintptr_t>(runtimeModelPtr);
+    if (runtimeValue >= 0x10000u) {
+      if (runtimeValue <= (~uintptr_t(0u)) - kCModelComplexExtensionOffset)
+        usingPublishedPose = tryUsePublishedPose(
+            reinterpret_cast<void*>(runtimeValue + kCModelComplexExtensionOffset));
+      if (!usingPublishedPose && runtimeValue > kCModelComplexExtensionOffset)
+        usingPublishedPose = tryUsePublishedPose(
+            reinterpret_cast<void*>(runtimeValue - kCModelComplexExtensionOffset));
+    }
+  }
+  if (!usingPublishedPose) {
+    poseRuntimeModelPtr = War3ResolveLivePoseRuntimeAlias(
+        runtimeModelPtr, poseCount, poseArrayPtr);
+    if (poseRuntimeModelPtr == nullptr) {
+      return false;
+    }
+    usingPublishedPose = tryUsePublishedPose(poseRuntimeModelPtr);
+    if (!usingPublishedPose) {
+      constexpr uintptr_t kCModelComplexExtensionOffset = 0xA0u;
+      const uintptr_t poseRuntimeValue =
+          reinterpret_cast<uintptr_t>(poseRuntimeModelPtr);
+      if (poseRuntimeValue >= 0x10000u) {
+        if (poseRuntimeValue <=
+            (~uintptr_t(0u)) - kCModelComplexExtensionOffset)
+          usingPublishedPose = tryUsePublishedPose(reinterpret_cast<void*>(
+              poseRuntimeValue + kCModelComplexExtensionOffset));
+        if (!usingPublishedPose &&
+            poseRuntimeValue > kCModelComplexExtensionOffset)
+          usingPublishedPose = tryUsePublishedPose(reinterpret_cast<void*>(
+              poseRuntimeValue - kCModelComplexExtensionOffset));
+      }
+    }
+  }
+  if (poseRuntimeModelPtr == nullptr)
+    return false;
+  if (!usingPublishedPose && !War3SemanticLivePaletteAllowCModelFallbackRuntime())
+    return false;
+  if (outPoseRuntimeModelPtr != nullptr)
+    *outPoseRuntimeModelPtr = poseRuntimeModelPtr;
+
+  const auto* poseBytes = reinterpret_cast<const uint8_t*>(poseArrayPtr);
+  // Most Warcraft III runtime models expose a modest final-pose array here.
+  // Decoding it once per visible packet is cheaper and more deterministic than
+  // repeated matrix-index probes through an on-demand cache.
+  (void)frameSerial;
+  thread_local std::array<Matrix4, 1024> s_posePalette = {};
+  if (usingPublishedPose && publishedPoseMatrices != nullptr) {
+    for (uint32_t i = 0u; i < poseCount; ++i)
+      s_posePalette[i] = publishedPoseMatrices[i];
+  } else {
+    if (poseBytes == nullptr)
+      return false;
+    poseCount = std::min<uint32_t>(poseCount, uint32_t(s_posePalette.size()));
+    for (uint32_t i = 0u; i < poseCount; ++i) {
+      s_posePalette[i] = War3DecodeRuntimePoseMatrix48(
+          poseBytes + size_t(i) * sizeof(float) * 12u);
+    }
+  }
+  if (outRawPoseHash != nullptr) {
+    *outRawPoseHash = usingPublishedPose && publishedPoseHash != 0u
+                          ? publishedPoseHash
+                          : War3SemanticHashMatrixPalette(s_posePalette.data(),
+                                                          poseCount);
+  }
+  auto decodePoseMatrix = [&](uint32_t index, Matrix4& outMatrix) -> bool {
+    if (index >= poseCount)
+      return false;
+    outMatrix = s_posePalette[index];
+    return true;
+  };
+
+  std::array<uint16_t, 256> uniqueGroupSlots = {};
+  uint32_t uniqueGroupSlotCount = 0u;
+  std::array<bool, 256> seenGroupSlots = {};
+  for (const uint8_t groupSlot : vertexGroups) {
+    outMaxVertexGroupSlot =
+        std::max(outMaxVertexGroupSlot, uint32_t(groupSlot));
+    if (!seenGroupSlots[groupSlot]) {
+      seenGroupSlots[groupSlot] = true;
+      uniqueGroupSlots[uniqueGroupSlotCount++] = groupSlot;
+    }
+  }
+
+  auto buildDirectMatrixRemap = [&]() -> bool {
+    if (matrixIndices.empty() ||
+        outMaxVertexGroupSlot >= matrixIndices.size())
+      return false;
+    outPalette.resize(outMaxVertexGroupSlot + 1u);
+    for (uint32_t group = 0u; group <= outMaxVertexGroupSlot; ++group) {
+      const uint32_t matrixIndex = matrixIndices[group];
+      if (!decodePoseMatrix(matrixIndex, outPalette[group]))
+        return false;
+    }
+    return true;
+  };
+
+  auto buildSparseMatrixRemap = [&]() -> bool {
+    if (matrixIndices.empty() || uniqueGroupSlotCount == 0u ||
+        uniqueGroupSlotCount > matrixIndices.size())
+      return false;
+    outPalette.assign(outMaxVertexGroupSlot + 1u, Matrix4(0.0f));
+    for (uint32_t i = 0u; i < uniqueGroupSlotCount; ++i) {
+      const uint32_t matrixIndex = matrixIndices[i];
+      const uint32_t groupSlot = uniqueGroupSlots[i];
+      if (!decodePoseMatrix(matrixIndex, outPalette[groupSlot]))
+        return false;
+    }
+    return true;
+  };
+
+  auto buildDirectPosePalette = [&]() -> bool {
+    if (outMaxVertexGroupSlot >= poseCount)
+      return false;
+    outPalette.resize(outMaxVertexGroupSlot + 1u);
+    for (uint32_t group = 0u; group <= outMaxVertexGroupSlot; ++group) {
+      if (!decodePoseMatrix(group, outPalette[group]))
+        return false;
+    }
+    return true;
+  };
+
+  auto buildSparsePosePalette = [&]() -> bool {
+    if (uniqueGroupSlotCount == 0u || uniqueGroupSlotCount > poseCount)
+      return false;
+    outPalette.assign(outMaxVertexGroupSlot + 1u, Matrix4(0.0f));
+    for (uint32_t i = 0u; i < uniqueGroupSlotCount; ++i) {
+      if (!decodePoseMatrix(i, outPalette[uniqueGroupSlots[i]]))
+        return false;
+    }
+    return true;
+  };
+
+  auto buildUniformPosePalette = [&]() -> bool {
+    Matrix4 firstPose;
+    if (!decodePoseMatrix(0u, firstPose))
+      return false;
+    const uint32_t paletteCount =
+        std::max(outMaxVertexGroupSlot + 1u,
+                 uint32_t(matrixGroupSizes.size()));
+    if (paletteCount == 0u)
+      return false;
+    outPalette.assign(paletteCount, firstPose);
+    return true;
+  };
+
+  const uint32_t groupCount = uint32_t(matrixGroupSizes.size());
+  if (groupCount != 0u) {
+    std::array<uint32_t, 256> prefix = {};
+    if (groupCount <= prefix.size()) {
+    uint32_t running = 0u;
+    for (uint32_t i = 0u; i < groupCount; ++i) {
+      prefix[i] = running;
+      running += matrixGroupSizes[i];
+    }
+    if (running <= matrixIndices.size()) {
+      outPalette.resize(groupCount);
+      bool valid = true;
+      for (uint32_t group = 0u; group < groupCount && valid; ++group) {
+        const uint32_t groupSize = matrixGroupSizes[group];
+        const uint32_t groupBase = prefix[group];
+        if (groupSize == 0u ||
+            (groupBase + groupSize) > matrixIndices.size()) {
+          valid = false;
+          break;
+        }
+        Matrix4 accum(0.0f);
+        for (uint32_t i = 0u; i < groupSize; ++i) {
+          const uint32_t matrixIndex = matrixIndices[groupBase + i];
+          Matrix4 poseMatrix;
+          if (!decodePoseMatrix(matrixIndex, poseMatrix)) {
+            valid = false;
+            break;
+          }
+          accum += poseMatrix;
+        }
+        if (valid)
+          outPalette[group] =
+              groupSize == 1u ? accum : (accum / float(groupSize));
+      }
+      if (valid) {
+        for (const uint8_t groupSlot : vertexGroups) {
+          if (uint32_t(groupSlot) >= groupCount) {
+            valid = false;
+            break;
+          }
+        }
+      }
+      if (valid && !outPalette.empty()) {
+        outHash = War3SemanticHashMatrixPalette(outPalette.data(),
+                                                uint32_t(outPalette.size()));
+        return true;
+      }
+    }
+    }
+  }
+
+  const bool fallbackOk = buildDirectMatrixRemap() || buildSparseMatrixRemap() ||
+                          buildDirectPosePalette() || buildSparsePosePalette() ||
+                          buildUniformPosePalette();
+  if (!fallbackOk || outPalette.empty())
+    return false;
+  outHash = War3SemanticHashMatrixPalette(outPalette.data(),
+                                          uint32_t(outPalette.size()));
+  return true;
+}
+
+struct War3SemanticPaletteMotionEntry {
+  void* runtimeModelPtr = nullptr;
+  uint64_t rawHash = 0u;
+  uint64_t groupHash = 0u;
+  uint64_t frameSerial = 0u;
+};
+
+void War3NoteLivePaletteMotion(War3ShadowCaptureStats& stats,
+                               void* runtimeModelPtr,
+                               uint64_t frameSerial,
+                               uint64_t rawHash,
+                               uint64_t groupHash) {
+  if (runtimeModelPtr == nullptr || rawHash == 0u || groupHash == 0u)
+    return;
+
+  stats.semanticSceneLivePaletteMotionSampleCount++;
+  static std::array<War3SemanticPaletteMotionEntry, 512> s_entries = {};
+  static uint32_t s_replaceCursor = 0u;
+
+  War3SemanticPaletteMotionEntry* entry = nullptr;
+  for (auto& candidate : s_entries) {
+    if (candidate.runtimeModelPtr == runtimeModelPtr) {
+      entry = &candidate;
+      break;
+    }
+  }
+
+  if (entry == nullptr) {
+    for (auto& candidate : s_entries) {
+      if (candidate.runtimeModelPtr == nullptr) {
+        entry = &candidate;
+        break;
+      }
+    }
+  }
+
+  if (entry == nullptr) {
+    entry = &s_entries[s_replaceCursor++ % s_entries.size()];
+  }
+
+  const bool isNewRuntime = entry->runtimeModelPtr != runtimeModelPtr;
+  stats.semanticSceneLivePaletteMotionLastRuntimeModelPtr =
+      reinterpret_cast<uintptr_t>(runtimeModelPtr);
+  stats.semanticSceneLivePaletteMotionLastPrevRawHash =
+      isNewRuntime ? 0u : entry->rawHash;
+  stats.semanticSceneLivePaletteMotionLastRawHash = rawHash;
+  stats.semanticSceneLivePaletteMotionLastPrevGroupHash =
+      isNewRuntime ? 0u : entry->groupHash;
+  stats.semanticSceneLivePaletteMotionLastGroupHash = groupHash;
+
+  if (isNewRuntime) {
+    stats.semanticSceneLivePaletteMotionNewRuntimeCount++;
+  } else {
+    if (entry->rawHash != rawHash)
+      stats.semanticSceneLivePaletteMotionRawChangedCount++;
+    else
+      stats.semanticSceneLivePaletteMotionRawStableCount++;
+
+    if (entry->groupHash != groupHash)
+      stats.semanticSceneLivePaletteMotionGroupChangedCount++;
+    else
+      stats.semanticSceneLivePaletteMotionGroupStableCount++;
+  }
+
+  entry->runtimeModelPtr = runtimeModelPtr;
+  entry->rawHash = rawHash;
+  entry->groupHash = groupHash;
+  entry->frameSerial = frameSerial;
+}
+
+struct War3SemanticHashMotionEntry {
+  void* runtimeModelPtr = nullptr;
+  uint64_t hash = 0u;
+  uint64_t frameSerial = 0u;
+};
+
+void War3NoteDrawTimePoseMotion(War3ShadowCaptureStats& stats,
+                                void* runtimeModelPtr,
+                                uint64_t frameSerial,
+                                uint64_t hash) {
+  if (runtimeModelPtr == nullptr || hash == 0u)
+    return;
+
+  static std::array<War3SemanticHashMotionEntry, 512> s_entries = {};
+  static uint32_t s_replaceCursor = 0u;
+
+  War3SemanticHashMotionEntry* entry = nullptr;
+  for (auto& candidate : s_entries) {
+    if (candidate.runtimeModelPtr == runtimeModelPtr) {
+      entry = &candidate;
+      break;
+    }
+  }
+  if (entry == nullptr) {
+    for (auto& candidate : s_entries) {
+      if (candidate.runtimeModelPtr == nullptr) {
+        entry = &candidate;
+        break;
+      }
+    }
+  }
+  if (entry == nullptr)
+    entry = &s_entries[s_replaceCursor++ % s_entries.size()];
+
+  const bool isNewRuntime = entry->runtimeModelPtr != runtimeModelPtr;
+  stats.semanticSceneDrawTimePoseLastRuntimeModelPtr =
+      reinterpret_cast<uintptr_t>(runtimeModelPtr);
+  stats.semanticSceneDrawTimePoseLastPrevHash =
+      isNewRuntime ? 0u : entry->hash;
+  stats.semanticSceneDrawTimePoseLastHash = hash;
+
+  if (!isNewRuntime) {
+    if (entry->hash != hash)
+      stats.semanticSceneDrawTimePoseChangedCount++;
+    else
+      stats.semanticSceneDrawTimePoseStableCount++;
+  }
+
+  entry->runtimeModelPtr = runtimeModelPtr;
+  entry->hash = hash;
+  entry->frameSerial = frameSerial;
+}
+
+void War3NoteSubmittedPaletteMotion(War3ShadowCaptureStats& stats,
+                                    void* runtimeModelPtr,
+                                    uint64_t frameSerial,
+                                    uint64_t hash) {
+  if (runtimeModelPtr == nullptr || hash == 0u)
+    return;
+
+  stats.semanticSceneSubmittedPaletteMotionSampleCount++;
+  static std::array<War3SemanticHashMotionEntry, 512> s_entries = {};
+  static uint32_t s_replaceCursor = 0u;
+
+  War3SemanticHashMotionEntry* entry = nullptr;
+  for (auto& candidate : s_entries) {
+    if (candidate.runtimeModelPtr == runtimeModelPtr) {
+      entry = &candidate;
+      break;
+    }
+  }
+  if (entry == nullptr) {
+    for (auto& candidate : s_entries) {
+      if (candidate.runtimeModelPtr == nullptr) {
+        entry = &candidate;
+        break;
+      }
+    }
+  }
+  if (entry == nullptr)
+    entry = &s_entries[s_replaceCursor++ % s_entries.size()];
+
+  const bool isNewRuntime = entry->runtimeModelPtr != runtimeModelPtr;
+  stats.semanticSceneSubmittedPaletteMotionLastRuntimeModelPtr =
+      reinterpret_cast<uintptr_t>(runtimeModelPtr);
+  stats.semanticSceneSubmittedPaletteMotionLastPrevHash =
+      isNewRuntime ? 0u : entry->hash;
+  stats.semanticSceneSubmittedPaletteMotionLastHash = hash;
+
+  if (isNewRuntime) {
+    stats.semanticSceneSubmittedPaletteMotionNewRuntimeCount++;
+  } else if (entry->hash != hash) {
+    stats.semanticSceneSubmittedPaletteMotionChangedCount++;
+  } else {
+    stats.semanticSceneSubmittedPaletteMotionStableCount++;
+  }
+
+  entry->runtimeModelPtr = runtimeModelPtr;
+  entry->hash = hash;
+  entry->frameSerial = frameSerial;
+}
+
+void War3ApplySemanticBoundsFromMatrix(War3ShadowCasterDraw& draw,
+                                       const Matrix4& basisMatrix,
+                                       const Vector4& localCenter,
+                                       float localRadius) {
+  Vector4 worldCenter = basisMatrix * localCenter;
+  if (!(worldCenter.w != 0.0f))
+    worldCenter = War3SemanticBoundsTranslation(basisMatrix);
+  else
+    worldCenter /= worldCenter.w;
+  worldCenter.w = 1.0f;
+  draw.boundsCenter = worldCenter;
+  if (localRadius > 0.0f)
+    draw.boundsRadius = localRadius * War3SemanticBoundsMaxScale(basisMatrix);
+  else
+    draw.boundsRadius = 0.0f;
 }
 
 bool War3TryResolveNativeShadowHint(
@@ -154,6 +1535,183 @@ bool War3TryResolveNativeShadowHint(
   return tryByObject(semantic.renderablePart) ||
          tryByObject(semantic.worldObjectEntry) ||
          tryByObject(semantic.sceneNode);
+}
+
+const dxvk::war3::render::RenderObjectInfo* War3FindRenderObjectForSemantic(
+    const dxvk::War3ShadowSemanticContext& semantic,
+    const dxvk::war3::render::VisibleRenderableRecord& record) {
+  auto& renderRegistry = dxvk::war3::render::RenderObjectRegistry::instance();
+  if (record.identity.worldObjectEntry != nullptr) {
+    if (const auto* object =
+            renderRegistry.findByEntry(record.identity.worldObjectEntry)) {
+      return object;
+    }
+  }
+  if (record.sceneNode != nullptr) {
+    if (const auto* object = renderRegistry.findBySceneNode(record.sceneNode)) {
+      return object;
+    }
+  }
+  if (semantic.jHandle != 0u) {
+    if (const auto* object = renderRegistry.findByHandle(semantic.jHandle)) {
+      return object;
+    }
+  }
+  if (record.identity.jHandle != 0u) {
+    if (const auto* object = renderRegistry.findByHandle(record.identity.jHandle)) {
+      return object;
+    }
+  }
+  return nullptr;
+}
+
+void War3MergeVisibleRenderableSemantic(
+    dxvk::War3ShadowSemanticContext& semantic,
+    const dxvk::war3::render::VisibleRenderableRecord& record) {
+  if (semantic.renderablePart == nullptr)
+    semantic.renderablePart = record.renderablePart;
+  if (semantic.sceneNode == nullptr)
+    semantic.sceneNode = record.sceneNode;
+  if (semantic.worldObjectEntry == nullptr)
+    semantic.worldObjectEntry = record.identity.worldObjectEntry;
+  if (semantic.runtimeModelPtr == nullptr)
+    semantic.runtimeModelPtr = record.runtimeModelPtr;
+  if (semantic.modelResourcePtr == nullptr)
+    semantic.modelResourcePtr = record.modelResourcePtr;
+  if (semantic.modelKey == 0u)
+    semantic.modelKey = record.modelKey;
+  if (semantic.jHandle == 0u)
+    semantic.jHandle = record.identity.jHandle;
+  if (semantic.rawcode == 0u)
+    semantic.rawcode = record.identity.rawcode;
+  if (semantic.objectKind == dxvk::war3::render::ObjectKind::Unknown)
+    semantic.objectKind = record.identity.kind;
+
+  if (semantic.object == nullptr)
+    semantic.object = War3FindRenderObjectForSemantic(semantic, record);
+}
+
+void War3AugmentShadowSemanticFromVisibleManifest(
+    dxvk::War3ShadowSemanticContext& semantic) {
+  dxvk::war3::render::VisibleRenderableRecord record = {};
+  auto& registry = dxvk::war3::render::VisibleRenderableRegistry::instance();
+
+  if (semantic.renderablePart != nullptr &&
+      registry.queryByPayload(semantic.renderablePart, record)) {
+    War3MergeVisibleRenderableSemantic(semantic, record);
+    return;
+  }
+
+  if (semantic.renderablePart != nullptr &&
+      registry.queryByRenderablePart(semantic.renderablePart, record)) {
+    War3MergeVisibleRenderableSemantic(semantic, record);
+    return;
+  }
+
+  if (semantic.worldObjectEntry != nullptr &&
+      registry.queryByWorldObjectEntry(semantic.worldObjectEntry, record)) {
+    War3MergeVisibleRenderableSemantic(semantic, record);
+    return;
+  }
+
+  if (semantic.jHandle != 0u && registry.queryByHandle(semantic.jHandle, record)) {
+    War3MergeVisibleRenderableSemantic(semantic, record);
+    return;
+  }
+
+  if (semantic.sceneNode != nullptr &&
+      registry.queryBySceneNode(semantic.sceneNode, record)) {
+    War3MergeVisibleRenderableSemantic(semantic, record);
+    return;
+  }
+
+  if (semantic.runtimeModelPtr != nullptr &&
+      registry.queryByRuntimeModel(semantic.runtimeModelPtr, record)) {
+    War3MergeVisibleRenderableSemantic(semantic, record);
+  }
+}
+
+bool War3PublishSemanticSceneBypassCandidate(
+    const dxvk::War3ShadowSemanticContext& semantic,
+    const dxvk::war3::render::RenderObjectInfo* currentObj) {
+  if (!War3SemanticDataModuleEnabled())
+    return false;
+  if (!War3SemanticFrameRegistriesEnabled())
+    return false;
+
+  dxvk::war3::render::VisibleRenderableRecord record = {};
+  record.queueKind = dxvk::war3::render::VisibleRenderableQueueKind::MainQueue;
+  record.payload = semantic.renderablePart;
+  record.renderablePart = semantic.renderablePart;
+  record.sceneNode = semantic.sceneNode;
+  record.runtimeModelPtr = semantic.runtimeModelPtr;
+  record.modelResourcePtr = semantic.modelResourcePtr;
+  record.modelKey = semantic.modelKey;
+
+  record.identity.worldObjectEntry = semantic.worldObjectEntry;
+  record.identity.sceneNode = semantic.sceneNode;
+  record.identity.jHandle = semantic.jHandle;
+  record.identity.rawcode = semantic.rawcode;
+  record.identity.kind = semantic.objectKind;
+
+  const auto* object = semantic.object != nullptr ? semantic.object : currentObj;
+  if (object != nullptr) {
+    if (record.identity.worldObjectEntry == nullptr)
+      record.identity.worldObjectEntry = object->worldObjectEntry;
+    if (record.identity.sceneNode == nullptr)
+      record.identity.sceneNode = object->sceneNode;
+    if (record.sceneNode == nullptr)
+      record.sceneNode = object->sceneNode;
+    if (record.identity.unitPtr == nullptr)
+      record.identity.unitPtr = object->unitPtr;
+    if (record.identity.agentPtr == nullptr)
+      record.identity.agentPtr = object->agentPtr;
+    if (record.identity.handleId == 0u)
+      record.identity.handleId = object->handleId;
+    if (record.identity.jHandle == 0u)
+      record.identity.jHandle = object->jHandle;
+    if (record.identity.rawcode == 0u)
+      record.identity.rawcode = object->rawcode;
+    if (record.identity.agentType == 0u)
+      record.identity.agentType = object->agentType;
+    if (record.identity.flags5C == 0u)
+      record.identity.flags5C = object->flags5C;
+    if (record.identity.kind == dxvk::war3::render::ObjectKind::Unknown)
+      record.identity.kind = object->kind;
+    if (record.identity.groupIdx < 0)
+      record.identity.groupIdx = static_cast<int8_t>(object->groupIdx);
+  }
+
+  // This publishes only semantic identity/resource context. It deliberately
+  // avoids reading host VB/IB slices or resurrecting the old capture fallback.
+  auto& visibleRegistry =
+      dxvk::war3::render::VisibleRenderableRegistry::instance();
+  const bool registered = visibleRegistry.registerSemanticCandidate(record);
+  if (registered &&
+      War3SemanticDataModuleEnabled() &&
+      War3SemanticContractCaptureEnabled() &&
+      !dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled()) {
+    const uint64_t frameNumber = visibleRegistry.getFrameNumber();
+    const uint64_t visibleCount =
+        static_cast<uint64_t>(visibleRegistry.getVisibleCount());
+    const bool captureMilestone =
+        visibleCount <= 4u ||
+        (visibleCount <= 64u && (visibleCount & (visibleCount - 1u)) == 0u);
+    if (captureMilestone) {
+      static std::atomic<uint64_t> s_lastBypassCaptureKey{0u};
+      const uint64_t key =
+          (frameNumber << 32) |
+          (visibleCount & 0xFFFFFFFFull);
+      uint64_t expected = s_lastBypassCaptureKey.load(std::memory_order_relaxed);
+      if (expected != key &&
+          s_lastBypassCaptureKey.compare_exchange_strong(
+              expected, key, std::memory_order_relaxed)) {
+        dxvk::war3::shadow::ShadowRuntimeContractCache::instance()
+            .captureLiveState();
+      }
+    }
+  }
+  return registered;
 }
 
 uint64_t War3BuildShadowSemanticIdentityHash(
@@ -431,17 +1989,26 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   {
     auto shadowPass = std::make_unique<War3ShadowReceiverPass>(this);
     m_shadowReceiverPass = shadowPass.get();
-    m_war3Pipeline->RegisterPass("ShadowReceiver", std::move(shadowPass), true);
+    m_war3Pipeline->RegisterPass(
+        "ShadowReceiver", std::move(shadowPass),
+        war3::runtime::IsWar3RuntimeModuleEnabled(
+            war3::runtime::War3RuntimeModule::ShadowReceiver));
   }
   {
     auto ssaoPass = std::make_unique<War3SsaoPass>(this);
     m_ssaoPass = ssaoPass.get();
-    m_war3Pipeline->RegisterPass("SSAO", std::move(ssaoPass), true);
+    m_war3Pipeline->RegisterPass(
+        "SSAO", std::move(ssaoPass),
+        war3::runtime::IsWar3RuntimeModuleEnabled(
+            war3::runtime::War3RuntimeModule::Ssao));
   }
   {
     auto aaPass = std::make_unique<War3AAPass>(this);
     m_aaPass = aaPass.get();
-    m_war3Pipeline->RegisterPass("AA", std::move(aaPass), true);
+    m_war3Pipeline->RegisterPass(
+        "AA", std::move(aaPass),
+        war3::runtime::IsWar3RuntimeModuleEnabled(
+            war3::runtime::War3RuntimeModule::Aa));
   }
 
   // War3 初始化已迁移到首次 JASS 执行时触发
@@ -2786,8 +4353,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetRenderState(D3DRENDERSTATETYPE State,
   // correct FF execution. Only block critical states: ColorWrite (Must be 0),
   // ZWrite (Must be 1), ZFunc.
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
-    WAR3_RENDER_LOG("ShadowPass: SetRenderState %d -> %u\n",
-                    static_cast<int>(State), static_cast<unsigned>(Value));
+    if (War3ShadowPassTraceEnabled()) {
+      WAR3_RENDER_LOG("ShadowPass: SetRenderState %d -> %u\n",
+                      static_cast<int>(State), static_cast<unsigned>(Value));
+    }
     if (State == D3DRS_COLORWRITEENABLE || State == D3DRS_COLORWRITEENABLE1 ||
         State == D3DRS_COLORWRITEENABLE2 || State == D3DRS_COLORWRITEENABLE3 ||
         State == D3DRS_ZWRITEENABLE || State == D3DRS_ZFUNC) {
@@ -3340,8 +4909,10 @@ D3D9DeviceEx::SetTexture(DWORD Stage, IDirect3DBaseTexture9 *pTexture) {
   }
 
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
-    WAR3_RENDER_LOG("ShadowPass: SetTexture stage=%u ptr=%p\n",
-                    static_cast<unsigned>(Stage), pTexture);
+    if (War3ShadowPassTraceEnabled()) {
+      WAR3_RENDER_LOG("ShadowPass: SetTexture stage=%u ptr=%p\n",
+                      static_cast<unsigned>(Stage), pTexture);
+    }
   }
   // [War3 Shadow] Shadow Pass: 允许设置纹理（用于 Alpha Test）
   // if (unlikely(dxvk::War3Hook::IsInShadowPass()))
@@ -3748,6 +5319,11 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
                       aBlend ? 1 : 0, aTest ? 1 : 0, hasVS ? 1 : 0,
                       hasPS ? 1 : 0, static_cast<unsigned>(cull));
     }
+
+    if (stage == 19 && terrainActive) {
+      dxvk::war3::tools::MarkInGameRenderReady("War3StageSig/19",
+                                               uint64_t(m_war3FrameIndex));
+    }
   }
 
   // Shadow/PostFx 都依赖 world camera（view/proj + invVP）进行深度重建。
@@ -3843,6 +5419,10 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
         m_war3LastWorldDs = m_state.depthStencil;
 
       War3RecordWorldCamera();
+      if (!dxvk::war3::tools::IsInGameRenderReady()) {
+        dxvk::war3::tools::MarkInGameRenderReady("War3Camera/WorldStage",
+                                                 uint64_t(m_war3FrameIndex));
+      }
       static bool s_loggedCam = false;
       if (!s_loggedCam) {
         s_loggedCam = true;
@@ -3957,6 +5537,7 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
   // - 这里把硬门槛收紧为：至少观测到 stage15（HUD/GameUI 入口）或 stage21
   //   主屏收尾完成，再允许 BeforeUi 边界生效。
   const bool reachedStage15 = War3RenderState::HasReachedStageThisFrame(15);
+  const bool reachedStage21 = War3RenderState::HasReachedStageThisFrame(21);
   const bool completedStage21 = War3RenderState::HasCompletedStageThisFrame(21);
   const bool completedMainWorld21 =
       War3RenderState::HasMainWorldCompletedStageThisFrame(21);
@@ -4149,6 +5730,24 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
     }
   }
 
+  bool semanticSceneTailBoundary = false;
+  if constexpr (dxvk::war3::internal::
+                    kShadowSemanticCoreSceneTailBoundaryFallbackEnabled) {
+    semanticSceneTailBoundary =
+        uiBoundaryTier == 0u &&
+        dxvk::war3::internal::
+            IsSemanticSceneTailBoundaryFallbackRuntimeEnabled() &&
+        inWorldThisFrame &&
+        (completedMainWorld21 || completedStage21 || reachedStage21 ||
+         dispStage == 21) &&
+        haveWorldInput &&
+        !m_war3Pipeline->HasInsertedBeforeUi();
+  }
+  if (semanticSceneTailBoundary) {
+    uiBoundaryTier = 8u;
+    m_war3Scene.shadowStats.semanticSceneTailBoundaryCandidateCount++;
+  }
+
   isUiBoundaryDraw = (uiBoundaryTier != 0u);
 
   // 诊断：如果在对局内观察到大量“疑似 HUD”的 draw，但 layer 未标记为 UI，
@@ -4258,6 +5857,8 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
 
   if (!m_war3Pipeline->NotifyDraw(layer, cat, tag, isUiBoundaryDraw))
     return;
+  if (uiBoundaryTier == 8u)
+    m_war3Scene.shadowStats.semanticSceneTailBoundaryCommitCount++;
 
   War3PipelineInput input;
   // 优先使用“世界阶段缓存的 RT/DS”，避免 UI draw 已切换目标/置空 DS
@@ -4289,6 +5890,26 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
     input.depthView = ds->GetDepthStencilView(true);
   constexpr size_t kMaxShadowCasterReserve = 8192;
   constexpr size_t kMaxShadowPaletteReserve = 256;
+  if (War3SemanticConsumerEnabled() &&
+      dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled()) {
+    // Once we have reached the actual BeforeUi insertion point, semantic scene
+    // submission should no longer depend on the legacy shadow-capture gate.
+    // Otherwise units can disappear after frame 1 when the pipeline decides
+    // receiver/capture heuristics are temporarily unnecessary.
+    War3TryPopulateSemanticShadowScene(
+        dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly);
+  }
+  dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
+
+  static uint32_t s_casterDiag = 0;
+  if (++s_casterDiag < 10u || (s_casterDiag % 300u) == 0u) {
+    uint32_t casterCount = uint32_t(m_war3Scene.shadowCasters.size());
+    uint32_t fallbackCount = uint32_t(m_war3Scene.shadowFallbacks.size());
+    uint32_t paletteCount = uint32_t(m_war3Scene.shadowPalettes.size());
+    WAR3_RENDER_LOG("DXVK BeforeUi: casters=%u fallbacks=%u palettes=%u consumer=%d\n",
+        casterCount, fallbackCount, paletteCount,
+        War3SemanticConsumerEnabled() ? 1 : 0);
+  }
   m_shadowCasterReserveHint = std::min(
       kMaxShadowCasterReserve, std::max(m_shadowCasterReserveHint,
                                         m_war3Scene.shadowCasters.capacity()));
@@ -4298,6 +5919,8 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
                         m_war3Scene.shadowPalettes.capacity()));
   input.scene = std::move(m_war3Scene);
   m_war3Scene = War3FrameScene{};
+  m_war3ShadowPaletteHashIndex.clear();
+  m_war3SemanticPaletteCache.clear();
   m_war3Scene.shadowPersistentPool.bytesCap =
       War3GetShadowPersistentPoolCapBytes();
   m_war3Scene.shadowPersistentPool.bytesUsed =
@@ -4340,16 +5963,27 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
       m_war3FrameIndex; // Capture Current Frame Index for CS Thread
 
   EmitCs([this, cInput = std::move(input)](DxvkContext *ctx) mutable {
-    auto cmd = ctx->beginExternalRendering();
+    Rc<DxvkCommandList> cmd;
+    {
+      auto externalScope = war3::War3PerfMonitor::instance().cpuScope(
+          "War3Pipeline/BeforeUi/BeginExternalRendering");
+      cmd = ctx->beginExternalRendering();
+    }
 
-    // Execute shadow pass if enabled
-    m_war3Pipeline->Execute(War3InsertionPoint::BeforeUi, cmd, cInput);
+    {
+      auto executeScope = war3::War3PerfMonitor::instance().cpuScope(
+          "War3Pipeline/BeforeUi/Execute");
+      // Execute shadow pass if enabled
+      m_war3Pipeline->Execute(War3InsertionPoint::BeforeUi, cmd, cInput);
+    }
   });
 
   const bool inUiPhase = War3RenderState::IsUiPhase();
   const bool uiLikelyStarted = inUiPhase || m_war3UiDrawSeenThisFrame;
   if (dxvk::war3::internal::kWar3RenderModuleTakeoverEnabled &&
-      m_war3PostProcess && m_war3Pipeline) {
+      m_war3PostProcess && m_war3Pipeline &&
+      war3::runtime::IsWar3RuntimeModuleEnabled(
+          war3::runtime::War3RuntimeModule::PostFx)) {
     const auto &settings = m_war3Pipeline->GetSettings();
     if (!uiLikelyStarted && settings.postFx.enabled &&
         !war3shader::internal::IsNativePostProcessDisabled()) {
@@ -4490,11 +6124,17 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPalette() {
     }
   }
 
+  if (m_war3Scene.shadowPalettes.empty() && !m_war3ShadowPaletteHashIndex.empty())
+    m_war3ShadowPaletteHashIndex.clear();
+
   const size_t bytes = sizeof(Matrix4) * 256;
-  for (uint32_t idx = 0; idx < m_war3Scene.shadowPalettes.size(); idx++) {
-    auto &p = m_war3Scene.shadowPalettes[idx];
-    if (p.hash != h)
+  const auto range = m_war3ShadowPaletteHashIndex.equal_range(h);
+  for (auto it = range.first; it != range.second; ++it) {
+    const uint32_t idx = it->second;
+    if (idx >= m_war3Scene.shadowPalettes.size())
       continue;
+
+    auto& p = m_war3Scene.shadowPalettes[idx];
     if (std::memcmp(
             p.worldMatrices.data(),
             &m_state.transforms[GetTransformIndex(D3DTS_WORLDMATRIX(0))],
@@ -4510,7 +6150,141 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPalette() {
         m_state.transforms[GetTransformIndex(D3DTS_WORLDMATRIX(i))];
   }
   m_war3Scene.shadowPalettes.emplace_back(std::move(palette));
-  return uint32_t(m_war3Scene.shadowPalettes.size() - 1);
+  const uint32_t newIndex = uint32_t(m_war3Scene.shadowPalettes.size() - 1);
+  m_war3ShadowPaletteHashIndex.emplace(h, newIndex);
+  return newIndex;
+}
+
+uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
+    const Matrix4 *matrices, uint32_t matrixCount, uint64_t knownHash) {
+  if (matrices == nullptr || matrixCount == 0)
+    return 0u;
+
+  const uint32_t boundedCount =
+      std::min<uint32_t>(matrixCount, uint32_t(256u));
+
+  uint64_t h = knownHash;
+  if (h == 0u) {
+    h = bit::fnv1a_init();
+    h = bit::fnv1a_iter(h, boundedCount);
+    for (uint32_t i = 0; i < boundedCount; ++i) {
+      const Matrix4 &m = matrices[i];
+      for (uint32_t r = 0; r < 4; ++r) {
+        for (uint32_t c = 0; c < 4; ++c)
+          h = bit::fnv1a_iter(h, bit::cast<uint32_t>(m[r][c]));
+      }
+    }
+  }
+
+  if (m_war3Scene.shadowPalettes.empty() && !m_war3ShadowPaletteHashIndex.empty())
+    m_war3ShadowPaletteHashIndex.clear();
+
+  const size_t bytes = sizeof(Matrix4) * boundedCount;
+  const auto range = m_war3ShadowPaletteHashIndex.equal_range(h);
+  for (auto it = range.first; it != range.second; ++it) {
+    const uint32_t idx = it->second;
+    if (idx >= m_war3Scene.shadowPalettes.size())
+      continue;
+
+    auto& existing = m_war3Scene.shadowPalettes[idx];
+    if (std::memcmp(existing.worldMatrices.data(), matrices, bytes) == 0)
+      return idx;
+  }
+
+  War3ShadowMatrixPalette palette = {};
+  palette.hash = h;
+  for (uint32_t i = 0; i < boundedCount; ++i)
+    palette.worldMatrices[i] = matrices[i];
+  m_war3Scene.shadowPalettes.emplace_back(std::move(palette));
+  const uint32_t newIndex = uint32_t(m_war3Scene.shadowPalettes.size() - 1);
+  m_war3ShadowPaletteHashIndex.emplace(h, newIndex);
+  return newIndex;
+}
+
+uint32_t D3D9DeviceEx::War3GetOrCreateSemanticShadowPalette(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    dxvk::war3::render::ObjectKind resolvedObjectKind,
+    const Matrix4* overrideMatrices,
+    uint32_t overrideMatrixCount,
+    uint64_t overrideMatrixHash) {
+  const bool hasOverridePalette =
+      overrideMatrices != nullptr && overrideMatrixCount != 0u;
+  if (!hasOverridePalette &&
+      (!packet.hasRuntimeGroupPalette || packet.runtimeGroupPalette.empty()))
+    return 0u;
+
+  const uint32_t matrixCount = std::min<uint32_t>(
+      hasOverridePalette ? overrideMatrixCount
+                         : uint32_t(packet.runtimeGroupPalette.size()),
+      uint32_t(256u));
+  if (matrixCount == 0u)
+    return 0u;
+
+  const Matrix4* sourceMatrices =
+      hasOverridePalette ? overrideMatrices : packet.runtimeGroupPalette.data();
+  bool composeWorldPalette = false;
+  uint64_t worldHash = 0u;
+  const bool directGeosetUnitPalette =
+      War3SemanticPacketUsesDirectGeosetData(packet) &&
+      War3IsSemanticUnitObject(resolvedObjectKind);
+  if (directGeosetUnitPalette && packet.pose.hasWorldTransform &&
+      War3SemanticPaletteLooksModelLocal(sourceMatrices, matrixCount,
+                                         packet.pose.worldTransform,
+                                         static_cast<uint8_t>(
+                                             resolvedObjectKind),
+                                         false)) {
+    composeWorldPalette = true;
+    worldHash = War3SemanticHashMatrix4(packet.pose.worldTransform);
+  }
+
+  uint64_t matrixHash =
+      overrideMatrixHash != 0u
+          ? overrideMatrixHash
+          : packet.runtimeGroupPaletteHash != 0u
+          ? packet.runtimeGroupPaletteHash
+          : (packet.pose.matrixHash != 0u ? packet.pose.matrixHash
+                                          : packet.resource.contentHash);
+  if (directGeosetUnitPalette && worldHash != 0u)
+    matrixHash = bit::fnv1a_iter(matrixHash, worldHash);
+
+  for (const auto& entry : m_war3SemanticPaletteCache) {
+    if (entry.runtimeModelPtr == packet.renderable.runtimeModelPtr &&
+        entry.matrixHash == matrixHash &&
+        entry.worldHash == worldHash &&
+        entry.matrixCount == matrixCount &&
+        entry.objectKind == static_cast<uint8_t>(resolvedObjectKind) &&
+        entry.composedWorldPalette == composeWorldPalette) {
+      return entry.paletteIndex;
+    }
+  }
+
+  War3SemanticPaletteCacheEntry entry = {};
+  entry.runtimeModelPtr = packet.renderable.runtimeModelPtr;
+  entry.paletteData = sourceMatrices;
+  entry.matrixHash = matrixHash;
+  entry.worldHash = worldHash;
+  entry.matrixCount = matrixCount;
+  entry.objectKind = static_cast<uint8_t>(resolvedObjectKind);
+  entry.composedWorldPalette = composeWorldPalette;
+
+  const Matrix4* effectiveMatrices = sourceMatrices;
+  uint64_t uploadMatrixHash = matrixHash;
+  if (composeWorldPalette) {
+    entry.composedPalette.reserve(matrixCount);
+    for (uint32_t i = 0u; i < matrixCount; ++i)
+      entry.composedPalette.push_back(sourceMatrices[i] *
+                                      packet.pose.worldTransform);
+    effectiveMatrices = entry.composedPalette.data();
+    uploadMatrixHash = War3SemanticHashMatrixPalette(effectiveMatrices,
+                                                     matrixCount);
+  }
+
+  entry.paletteIndex =
+      War3GetOrCreateShadowMatrixPaletteFromData(effectiveMatrices, matrixCount,
+                                                 uploadMatrixHash);
+  const uint32_t paletteIndex = entry.paletteIndex;
+  m_war3SemanticPaletteCache.emplace_back(std::move(entry));
+  return paletteIndex;
 }
 
 const D3D9DeviceEx::War3ShadowDeclInfo &
@@ -4690,6 +6464,7 @@ War3ShadowSemanticContext D3D9DeviceEx::War3BuildShadowSemanticContext(
   }
 
   dxvk::war3::render::AugmentShadowSemanticContext(semantic, currentObj);
+  War3AugmentShadowSemanticFromVisibleManifest(semantic);
 
   if (semantic.tag == War3BatchTag::Unknown) {
     const auto execTag = War3RenderState::GetTlsBatchTag();
@@ -4720,6 +6495,113 @@ War3ShadowReplayMode D3D9DeviceEx::War3ClassifyShadowReplayMode(
   if (vertexBlendEnabled || vertexBlendIndexed)
     return War3ShadowReplayMode::PaletteSkinnedFF;
   return War3ShadowReplayMode::FixedWorld;
+}
+
+bool D3D9DeviceEx::War3TryPublishSemanticDrawTimePose() {
+  if (!War3SemanticDrawTimePoseRuntime())
+    return false;
+  m_war3Scene.shadowStats.semanticSceneDrawTimePoseAttemptCount++;
+
+  const int stage = War3RenderState::GetStage();
+  const auto layer = War3RenderState::CurrentLayer();
+  const auto cat = War3RenderState::GetStageCategory();
+  if (layer == War3RenderLayer::UI ||
+      cat == War3RenderState::StageCategory::PostProcess ||
+      cat == War3RenderState::StageCategory::Skybox ||
+      cat == War3RenderState::StageCategory::UI ||
+      cat == War3RenderState::StageCategory::Effect) {
+    m_war3Scene.shadowStats.semanticSceneDrawTimePoseRejectUiOrEffectCount++;
+    return false;
+  }
+
+  if (m_state.vertexShader != nullptr) {
+    m_war3Scene.shadowStats.semanticSceneDrawTimePoseRejectVertexShaderCount++;
+    return false;
+  }
+
+  const DWORD vbState = m_state.renderStates[D3DRS_VERTEXBLEND];
+  const bool vbIndexed =
+      (m_state.renderStates[D3DRS_INDEXEDVERTEXBLENDENABLE] != FALSE);
+  const bool vertexBlendEnabled =
+      (vbState != D3DVBF_DISABLE || vbIndexed) &&
+      !(vbState == D3DVBF_0WEIGHTS && !vbIndexed);
+  if (!vertexBlendEnabled)
+    m_war3Scene.shadowStats.semanticSceneDrawTimePoseRejectNoVertexBlendCount++;
+  if (!vertexBlendEnabled)
+    return false;
+
+  const auto tag = War3RenderState::GetCurrentBatchTag();
+  const auto execTag = War3RenderState::GetTlsBatchTag();
+  const auto& shadowSemantic = War3RenderState::GetTlsShadowSemanticState();
+  const bool objectCasterByTls =
+      (tag == War3BatchTag::WorldObjects ||
+       tag == War3BatchTag::SelectionOverlay ||
+       tag == War3BatchTag::Decorations ||
+       tag == War3BatchTag::RangeIndicatorTarget ||
+       execTag == War3BatchTag::WorldObjects ||
+       execTag == War3BatchTag::SelectionOverlay ||
+       execTag == War3BatchTag::Decorations ||
+       execTag == War3BatchTag::RangeIndicatorTarget);
+  const bool objectCasterByStage =
+      (cat == War3RenderState::StageCategory::WorldObject) &&
+      (stage == 7 || stage == 10 || stage == 11 || stage == 12);
+  const auto* currentObj = dxvk::war3::render::GetCurrentBatchObject();
+  const bool objectCasterByCurrentObj =
+      currentObj != nullptr &&
+      currentObj->kind != dxvk::war3::render::ObjectKind::Unknown;
+  if (!objectCasterByTls && !objectCasterByStage &&
+      !objectCasterByCurrentObj && !shadowSemantic.HasAnyContext()) {
+    m_war3Scene.shadowStats.semanticSceneDrawTimePoseRejectNoContextCount++;
+    return false;
+  }
+
+  War3ShadowSemanticContext semantic = War3BuildShadowSemanticContext(currentObj);
+  if (semantic.runtimeModelPtr == nullptr) {
+    m_war3Scene.shadowStats
+        .semanticSceneDrawTimePoseRejectNoRuntimeModelCount++;
+    return false;
+  }
+
+  const uint64_t frameSerial = m_war3ShadowPersistentFrameSerial;
+  if (m_war3SemanticDrawTimePoseFrameSerial != frameSerial) {
+    m_war3SemanticDrawTimePoseFrameSerial = frameSerial;
+    m_war3SemanticDrawTimePoseKeys.clear();
+    m_war3SemanticDrawTimePoseKeys.reserve(256u);
+  }
+
+  std::array<Matrix4, 256> palette = {};
+  uint64_t hash = bit::fnv1a_init();
+  for (uint32_t i = 0; i < 256u; ++i) {
+    palette[i] = m_state.transforms[GetTransformIndex(D3DTS_WORLDMATRIX(i))];
+    const Matrix4& m = palette[i];
+    for (uint32_t r = 0; r < 4u; ++r) {
+      hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(m[r].x));
+      hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(m[r].y));
+      hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(m[r].z));
+      hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(m[r].w));
+    }
+  }
+
+  const uint64_t dedupeKey =
+      (uint64_t(reinterpret_cast<uintptr_t>(semantic.runtimeModelPtr)) >> 4u) ^
+      (hash + 0x9E3779B97F4A7C15ull);
+  if (std::find(m_war3SemanticDrawTimePoseKeys.begin(),
+                m_war3SemanticDrawTimePoseKeys.end(),
+                dedupeKey) != m_war3SemanticDrawTimePoseKeys.end()) {
+    m_war3Scene.shadowStats.semanticSceneDrawTimePoseDedupedCount++;
+    return false;
+  }
+  m_war3SemanticDrawTimePoseKeys.push_back(dedupeKey);
+
+  void* unitPtr = semantic.object != nullptr ? semantic.object->unitPtr : nullptr;
+  dxvk::war3::model::PoseRegistry::instance().recordMatrixPalette(
+      semantic.runtimeModelPtr, semantic.sceneNode, unitPtr, palette.data(),
+      uint32_t(palette.size()));
+  m_war3Scene.shadowStats.semanticSceneDrawTimePosePublishedCount++;
+  War3NoteDrawTimePoseMotion(m_war3Scene.shadowStats, semantic.runtimeModelPtr,
+                             frameSerial, hash);
+  m_war3SemanticDrawTimePoseDirtyFrameSerial = frameSerial;
+  return true;
 }
 
 bool D3D9DeviceEx::War3CanPromoteShadowPersistentGeometry(
@@ -4790,34 +6672,62 @@ bool D3D9DeviceEx::War3CanPromoteShadowPersistentGeometry(
 }
 
 bool D3D9DeviceEx::War3CreateShadowPersistentBuffer(
-    const DxvkBufferSlice &srcSlice, VkDeviceSize bytes,
-    VkBufferUsageFlags usage, const char *debugName,
-    Rc<DxvkBuffer> &outStorage, DxvkResourceBufferInfo &outInfo) {
-  if (srcSlice.buffer() == nullptr || bytes == 0)
+    const War3ShadowPersistentUpload &upload, Rc<DxvkBuffer> &outStorage,
+    DxvkResourceBufferInfo &outInfo) {
+  if (upload.bytes == 0)
+    return false;
+
+  const bool hasSliceSource = upload.slice.buffer() != nullptr;
+  const bool hasHostSource = upload.hostData != nullptr;
+  if (!hasSliceSource && !hasHostSource)
     return false;
 
   DxvkBufferCreateInfo info = {};
-  info.size = War3AlignPersistentBytes(bytes);
-  info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | usage;
+  info.size = War3AlignPersistentBytes(upload.bytes);
+  info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | upload.usage;
   info.stages =
       VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
   info.access = VK_ACCESS_TRANSFER_WRITE_BIT |
                 VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
                 VK_ACCESS_INDEX_READ_BIT;
-  info.debugName = debugName;
+  info.debugName = upload.debugName;
 
   auto dst = m_dxvkDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   if (dst == nullptr)
     return false;
 
-  auto srcBuffer = srcSlice.buffer();
-  EmitCs([cDst = dst, cSrc = srcBuffer, cSrcOff = srcSlice.offset(),
-          cBytes = bytes](DxvkContext *ctx) {
-    ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
-  });
+  if (hasHostSource) {
+    DxvkBufferCreateInfo stagingInfo = {};
+    stagingInfo.size = War3AlignPersistentBytes(upload.bytes);
+    stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    stagingInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    stagingInfo.access = VK_ACCESS_TRANSFER_READ_BIT;
+    stagingInfo.debugName = upload.debugName;
+
+    auto staging = m_dxvkDevice->createBuffer(
+        stagingInfo, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (staging == nullptr)
+      return false;
+
+    void* mapPtr = staging->mapPtr(0);
+    if (mapPtr == nullptr)
+      return false;
+
+    std::memcpy(mapPtr, upload.hostData, size_t(upload.bytes));
+    EmitCs([cDst = dst, cSrc = staging, cBytes = upload.bytes](DxvkContext *ctx) {
+      ctx->copyBuffer(cDst, 0, cSrc, 0, cBytes);
+    });
+  } else {
+    auto srcBuffer = upload.slice.buffer();
+    EmitCs([cDst = dst, cSrc = srcBuffer, cSrcOff = upload.slice.offset(),
+            cBytes = upload.bytes](DxvkContext *ctx) {
+      ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+    });
+  }
 
   outStorage = std::move(dst);
-  outInfo = outStorage->getSliceInfo(0, bytes);
+  outInfo = outStorage->getSliceInfo(0, upload.bytes);
   return true;
 }
 
@@ -4876,15 +6786,11 @@ void D3D9DeviceEx::War3GcShadowPersistentGeometry(bool forceTrimToBudget) {
   }
 }
 
-bool D3D9DeviceEx::War3FindOrCreateShadowPersistentGeometry(
-    const War3ShadowGeometryRegistryKey &key,
-    const War3ShadowPersistentGeometry &candidate,
-    const std::array<War3ShadowPersistentUpload, 4> &uploads,
-    uint32_t &outGeometryId, const War3ShadowPersistentGeometry *&outGeometry,
-    bool &outCreatedNew) {
+bool D3D9DeviceEx::War3TryFindShadowPersistentGeometry(
+    const War3ShadowGeometryRegistryKey &key, uint32_t &outGeometryId,
+    const War3ShadowPersistentGeometry *&outGeometry) {
   outGeometryId = 0;
   outGeometry = nullptr;
-  outCreatedNew = false;
 
   auto regIt = m_war3ShadowGeometryRegistry.find(key);
   if (regIt != m_war3ShadowGeometryRegistry.end()) {
@@ -4901,6 +6807,18 @@ bool D3D9DeviceEx::War3FindOrCreateShadowPersistentGeometry(
 
     m_war3ShadowGeometryRegistry.erase(regIt);
   }
+  return false;
+}
+
+bool D3D9DeviceEx::War3FindOrCreateShadowPersistentGeometry(
+    const War3ShadowGeometryRegistryKey &key,
+    const War3ShadowPersistentGeometry &candidate,
+    const std::array<War3ShadowPersistentUpload, 4> &uploads,
+    uint32_t &outGeometryId, const War3ShadowPersistentGeometry *&outGeometry,
+    bool &outCreatedNew) {
+  outCreatedNew = false;
+  if (War3TryFindShadowPersistentGeometry(key, outGeometryId, outGeometry))
+    return true;
 
   uint64_t bytesNeeded = 0;
   for (const auto &upload : uploads)
@@ -4920,33 +6838,25 @@ bool D3D9DeviceEx::War3FindOrCreateShadowPersistentGeometry(
   stored.lastSeenFrame = m_war3ShadowPersistentFrameSerial;
 
   if (uploads[0].bytes > 0) {
-    if (!War3CreateShadowPersistentBuffer(uploads[0].slice, uploads[0].bytes,
-                                          uploads[0].usage, uploads[0].debugName,
-                                          stored.positionStorage,
+    if (!War3CreateShadowPersistentBuffer(uploads[0], stored.positionStorage,
                                           stored.positionInfo)) {
       return false;
     }
   }
   if (uploads[1].bytes > 0) {
-    if (!War3CreateShadowPersistentBuffer(uploads[1].slice, uploads[1].bytes,
-                                          uploads[1].usage, uploads[1].debugName,
-                                          stored.indexStorage,
+    if (!War3CreateShadowPersistentBuffer(uploads[1], stored.indexStorage,
                                           stored.indexInfo)) {
       return false;
     }
   }
   if (uploads[2].bytes > 0) {
-    if (!War3CreateShadowPersistentBuffer(uploads[2].slice, uploads[2].bytes,
-                                          uploads[2].usage, uploads[2].debugName,
-                                          stored.blendStorage,
+    if (!War3CreateShadowPersistentBuffer(uploads[2], stored.blendStorage,
                                           stored.blendInfo)) {
       return false;
     }
   }
   if (uploads[3].bytes > 0) {
-    if (!War3CreateShadowPersistentBuffer(uploads[3].slice, uploads[3].bytes,
-                                          uploads[3].usage, uploads[3].debugName,
-                                          stored.uvStorage,
+    if (!War3CreateShadowPersistentBuffer(uploads[3], stored.uvStorage,
                                           stored.uvInfo)) {
       return false;
     }
@@ -4973,6 +6883,1772 @@ bool D3D9DeviceEx::War3FindOrCreateShadowPersistentGeometry(
   outGeometryId = geometryId;
   outGeometry = &inserted.first->second.geometry;
   outCreatedNew = true;
+  return true;
+}
+
+bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  auto toVkTopology = [](dxvk::war3::shadow::ShadowPrimitiveTopology topology) {
+    switch (topology) {
+    case dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleStrip:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleFan:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    case dxvk::war3::shadow::ShadowPrimitiveTopology::LineList:
+      return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case dxvk::war3::shadow::ShadowPrimitiveTopology::LineStrip:
+      return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList:
+    default:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
+  };
+
+  const auto& packetPositions = packet.resource.positionVec();
+  const auto& packetIndices = packet.resource.indexVec();
+  const auto& packetVertexGroups = packet.resource.vertexGroupIndexVec();
+  const auto& packetBlendWeights = packet.resource.vertexBlendWeightVec();
+  const auto& packetBlendIndices = packet.resource.vertexBlendIndexVec();
+  const auto ownedDynamicIndices = packet.resource.ownedDynamicIndices;
+  const bool hasOwnedDynamicIndexStream =
+      ownedDynamicIndices != nullptr && !ownedDynamicIndices->empty();
+  const bool hasDynamicPositionStream =
+      packet.usesDynamicMeshPositions &&
+      packet.resource.dynamicPositionStream != nullptr &&
+      packet.resource.dynamicPositionStride >= 12u &&
+      packet.resource.vertexCount != 0u;
+  const bool hasDynamicIndexStream =
+      hasOwnedDynamicIndexStream ||
+      (packet.resource.dynamicIndexStream != nullptr &&
+       packet.resource.dynamicIndexCount != 0u);
+  const uint32_t positionVertexCount =
+      hasDynamicPositionStream ? packet.resource.vertexCount
+                               : uint32_t(packetPositions.size() / 3u);
+  const uint32_t declaredVertexCount =
+      packet.resource.vertexCount != 0u ? packet.resource.vertexCount
+                                        : positionVertexCount;
+  const uint32_t vertexCount =
+      (std::min)(declaredVertexCount, positionVertexCount);
+  const auto resolvedObjectKind =
+      War3ResolveSemanticPacketObjectKindFast(packet);
+  if (vertexCount == 0u) {
+    m_war3Scene.shadowStats.semanticSceneRejectedNoVertex++;
+    return false;
+  }
+  if (!hasDynamicPositionStream &&
+      packetPositions.size() < size_t(vertexCount) * 3u) {
+    m_war3Scene.shadowStats.semanticSceneRejectedGeometry++;
+    return false;
+  }
+  if (hasDynamicPositionStream) {
+    const auto* srcBase =
+        reinterpret_cast<const uint8_t*>(packet.resource.dynamicPositionStream);
+    const size_t srcStride = size_t(packet.resource.dynamicPositionStride);
+    const size_t lastReadOffset =
+        vertexCount != 0u ? size_t(vertexCount - 1u) * srcStride : 0u;
+    if (!dxvk::war3::IsReadableRange(srcBase, lastReadOffset + sizeof(float) * 3u)) {
+      m_war3Scene.shadowStats.semanticSceneRejectedGeometry++;
+      return false;
+    }
+  }
+
+  const bool skinned =
+      packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned;
+  const bool useIndices = hasDynamicIndexStream || !packetIndices.empty();
+  if constexpr (dxvk::war3::internal::
+                    kShadowSemanticCoreSceneRequireVisibleIndexSliceForSkinned) {
+    const bool hasLiveVisibleMeshContext =
+        packet.renderable.meshData != nullptr ||
+        packet.renderable.renderablePart != nullptr;
+    const bool allowCanonicalSinglePrimitiveFullIndex =
+        War3SemanticAllowCanonicalSinglePrimitiveFullIndexRuntime() &&
+        War3SemanticPacketUsesDirectGeosetData(packet) &&
+        packet.resource.primitiveRecordCount <= 1u &&
+        War3HasSemanticDynamicUnitEvidence(packet);
+    if (skinned && hasLiveVisibleMeshContext && !hasDynamicIndexStream &&
+        !packetIndices.empty() &&
+        War3SemanticRequireVisibleIndexSliceForSkinnedRuntime() &&
+        !allowCanonicalSinglePrimitiveFullIndex) {
+      m_war3Scene.shadowStats
+          .semanticSceneSkinnedMissingVisibleIndexSliceRejectCount++;
+      return false;
+    }
+  }
+  if (skinned) {
+    if (hasDynamicIndexStream) {
+      m_war3Scene.shadowStats.semanticSceneSkinnedDynamicIndexSliceCount++;
+    } else if (!packetIndices.empty()) {
+      m_war3Scene.shadowStats.semanticSceneSkinnedFullIndexFallbackCount++;
+      m_war3Scene.shadowStats
+          .semanticSceneSkinnedFullIndexFallbackLastRuntimeModelPtr =
+          reinterpret_cast<uintptr_t>(packet.renderable.runtimeModelPtr);
+      m_war3Scene.shadowStats
+          .semanticSceneSkinnedFullIndexFallbackLastIndexCount =
+          uint32_t(packetIndices.size());
+    }
+  }
+  const uint16_t* effectiveIndexData =
+      hasOwnedDynamicIndexStream
+          ? ownedDynamicIndices->data()
+          : hasDynamicIndexStream ? packet.resource.dynamicIndexStream
+                                  : packetIndices.data();
+  const uint32_t effectiveIndexCount =
+      hasOwnedDynamicIndexStream
+          ? uint32_t(ownedDynamicIndices->size())
+          : hasDynamicIndexStream ? packet.resource.dynamicIndexCount
+                                  : uint32_t(packetIndices.size());
+  const VkPrimitiveTopology effectiveTopology =
+      toVkTopology(packet.resource.topology);
+  if (useIndices && !hasDynamicIndexStream &&
+      packetIndices.size() < size_t(effectiveIndexCount)) {
+    m_war3Scene.shadowStats.semanticSceneRejectedGeometry++;
+    return false;
+  }
+  if (hasDynamicIndexStream && !hasOwnedDynamicIndexStream &&
+      !dxvk::war3::IsReadableRange(effectiveIndexData,
+                                   size_t(effectiveIndexCount) *
+                                       sizeof(uint16_t))) {
+    m_war3Scene.shadowStats.semanticSceneRejectedGeometry++;
+    return false;
+  }
+  const uint64_t effectiveModelKey =
+      packet.renderable.modelKey != 0u ? packet.renderable.modelKey
+                                       : packet.resource.modelKey;
+  const auto effectiveAlphaMode = packet.material.alphaMode;
+  const bool alphaCutoutEnabled =
+      effectiveAlphaMode == dxvk::war3::shadow::ShadowAlphaMode::Cutout;
+  const bool alphaBlendEnabled =
+      effectiveAlphaMode == dxvk::war3::shadow::ShadowAlphaMode::AlphaBlend;
+  const float alphaCutoutRef =
+      alphaCutoutEnabled ? packet.material.alphaCutoutRef : 0.5f;
+  std::vector<Matrix4> liveRuntimeGroupPalette;
+  uint32_t liveMaxVertexGroupSlot = 0u;
+  uint64_t liveRuntimeGroupPaletteHash = 0u;
+  uint64_t liveRuntimeRawPaletteHash = 0u;
+  void* liveRuntimePoseModelPtr = nullptr;
+
+  War3ShadowGeometryRegistryKey key = {};
+  key.sourceHash = bit::fnv1a_init();
+  key.sourceHash = bit::fnv1a_iter(key.sourceHash, packet.resource.contentHash);
+  key.sourceHash = bit::fnv1a_iter(key.sourceHash, effectiveModelKey);
+  key.sourceHash = bit::fnv1a_iter(
+      key.sourceHash,
+      reinterpret_cast<uintptr_t>(packet.resource.modelResourcePtr));
+  key.sourceHash = bit::fnv1a_iter(
+      key.sourceHash,
+      reinterpret_cast<uintptr_t>(packet.renderable.modelResourcePtr));
+  key.sourceHash = bit::fnv1a_iter(
+      key.sourceHash,
+      reinterpret_cast<uintptr_t>(packet.renderable.runtimeGeosetPtr));
+  key.sourceHash = bit::fnv1a_iter(
+      key.sourceHash,
+      reinterpret_cast<uintptr_t>(packet.renderable.runtimeGeosetDataPtr));
+  key.sourceHash = bit::fnv1a_iter(
+      key.sourceHash, reinterpret_cast<uintptr_t>(packet.renderable.meshData));
+  key.sourceHash = bit::fnv1a_iter(
+      key.sourceHash,
+      reinterpret_cast<uintptr_t>(packet.renderable.renderablePart));
+  key.sourceHash = bit::fnv1a_iter(
+      key.sourceHash, uint64_t(packet.resource.geosetIndex));
+  key.sourceHash =
+      bit::fnv1a_iter(key.sourceHash, packet.material.signatureHash);
+  key.sourceHash =
+      bit::fnv1a_iter(key.sourceHash, uint32_t(effectiveAlphaMode));
+  key.sourceHash = bit::fnv1a_iter(
+      key.sourceHash, bit::cast<uint32_t>(alphaCutoutRef));
+  if (hasDynamicIndexStream) {
+    key.sourceHash =
+        bit::fnv1a_iter(key.sourceHash, packet.resource.dynamicIndexHash);
+    key.sourceHash = bit::fnv1a_iter(
+        key.sourceHash, packet.resource.dynamicPrimitiveBaseIndex);
+  }
+  key.layoutHash = bit::fnv1a_init();
+  key.layoutHash = bit::fnv1a_iter(key.layoutHash, uint32_t(useIndices ? 1u : 0u));
+  key.layoutHash = bit::fnv1a_iter(key.layoutHash, uint32_t(effectiveTopology));
+  key.layoutHash =
+      bit::fnv1a_iter(key.layoutHash, uint32_t(sizeof(float) * 3u));
+  key.layoutHash =
+      bit::fnv1a_iter(key.layoutHash, uint32_t(VK_FORMAT_R32G32B32_SFLOAT));
+  key.layoutHash = bit::fnv1a_iter(key.layoutHash, vertexCount);
+  key.layoutHash = bit::fnv1a_iter(
+      key.layoutHash, uint32_t(useIndices ? effectiveIndexCount : 0u));
+  if (hasDynamicIndexStream)
+    key.layoutHash = bit::fnv1a_iter(
+        key.layoutHash, packet.resource.dynamicIndexCount);
+  key.layoutHash = bit::fnv1a_iter(key.layoutHash, uint32_t(skinned ? 1u : 0u));
+  key.layoutHash = bit::fnv1a_iter(
+      key.layoutHash, uint32_t(packet.resource.explicitBlendCount));
+  key.layoutHash = bit::fnv1a_iter(
+      key.layoutHash,
+      uint32_t(skinned ? VK_FORMAT_R8G8B8A8_USCALED : VK_FORMAT_UNDEFINED));
+  key.mode = skinned ? War3ShadowReplayMode::PaletteSkinnedFF
+                     : War3ShadowReplayMode::FixedWorld;
+
+  uint32_t cachedGeometryId = 0u;
+  const War3ShadowPersistentGeometry* cachedGeometry = nullptr;
+  const bool cachedPersistentGeometry =
+      !packet.usesDynamicMeshPositions &&
+      War3TryFindShadowPersistentGeometry(key, cachedGeometryId,
+                                          cachedGeometry) &&
+      cachedGeometry != nullptr;
+
+  Matrix4 sceneNodeWorldMatrix = Matrix4();
+  const bool hasSceneNodeWorldMatrix = [&]() {
+    if (!packet.usesDynamicMeshPositions || packet.renderable.sceneNode == nullptr)
+      return false;
+
+    float raw[12] = {};
+    const auto* matrixBase =
+        reinterpret_cast<const uint8_t*>(packet.renderable.sceneNode) +
+        dxvk::war3::SceneNodeOffsets::WorldMatrix;
+    if (!dxvk::war3::IsReadableRange(matrixBase, sizeof(raw)))
+      return false;
+
+    std::memcpy(raw, matrixBase, sizeof(raw));
+    sceneNodeWorldMatrix =
+        Matrix4(Vector4(raw[0], raw[1], raw[2], 0.0f),
+                Vector4(raw[3], raw[4], raw[5], 0.0f),
+                Vector4(raw[6], raw[7], raw[8], 0.0f),
+                Vector4(raw[9], raw[10], raw[11], 1.0f));
+    return true;
+  }();
+
+  uint32_t paletteIndex = 0u;
+  std::vector<std::array<uint8_t, 4>> blendIndices;
+  std::vector<std::array<float, 3>> blendWeights;
+  uint64_t submittedRuntimeGroupPaletteHash = 0u;
+  const bool hasExplicitBlendContract =
+      packet.resource.explicitBlendCount != 0u &&
+      packetBlendWeights.size() >= size_t(vertexCount) &&
+      packetBlendIndices.size() >= size_t(vertexCount);
+  bool liveRuntimeGroupPaletteReady = false;
+  if (skinned && War3SemanticLivePaletteRefreshRuntime()) {
+    m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshAttemptCount++;
+    {
+      auto livePaletteScope = War3SemanticSubmitScope(
+          "War3SemanticScene/SubmitFrame/LivePaletteBuild");
+      liveRuntimeGroupPaletteReady = War3TryBuildLiveRuntimeGroupPalette(
+          packet.resource, packet.renderable.runtimeModelPtr,
+          packet.renderable.renderablePart,
+          m_war3ShadowPersistentFrameSerial,
+          liveRuntimeGroupPalette, liveMaxVertexGroupSlot,
+          liveRuntimeGroupPaletteHash, &liveRuntimeRawPaletteHash,
+          &liveRuntimePoseModelPtr);
+    }
+    if (liveRuntimeGroupPaletteReady) {
+      m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshHitCount++;
+      m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshLastRuntimeModelPtr =
+          reinterpret_cast<uintptr_t>(
+              liveRuntimePoseModelPtr != nullptr ? liveRuntimePoseModelPtr
+                                                 : packet.renderable.runtimeModelPtr);
+      m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshLastMatrixCount =
+          uint32_t(liveRuntimeGroupPalette.size());
+      m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshLastMatrixHash =
+          liveRuntimeGroupPaletteHash;
+      War3NoteLivePaletteMotion(
+          m_war3Scene.shadowStats,
+          liveRuntimePoseModelPtr != nullptr ? liveRuntimePoseModelPtr
+                                             : packet.renderable.runtimeModelPtr,
+          m_war3ShadowPersistentFrameSerial, liveRuntimeRawPaletteHash,
+          liveRuntimeGroupPaletteHash);
+    } else {
+      m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshMissCount++;
+    }
+  }
+  const std::vector<Matrix4>& effectiveRuntimeGroupPalette =
+      liveRuntimeGroupPaletteReady ? liveRuntimeGroupPalette
+                                   : packet.runtimeGroupPalette;
+  const uint32_t effectiveMaxVertexGroupSlot =
+      liveRuntimeGroupPaletteReady ? liveMaxVertexGroupSlot
+                                   : packet.maxVertexGroupSlot;
+  if (skinned) {
+    if ((!liveRuntimeGroupPaletteReady && !packet.hasRuntimeGroupPalette) ||
+        effectiveRuntimeGroupPalette.empty() ||
+        effectiveRuntimeGroupPalette.size() > 256u ||
+        effectiveMaxVertexGroupSlot >= effectiveRuntimeGroupPalette.size() ||
+        (!cachedPersistentGeometry && !hasExplicitBlendContract &&
+         packetVertexGroups.size() < size_t(vertexCount))) {
+      m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
+      return false;
+    }
+
+    const uint64_t submittedPaletteHash =
+        liveRuntimeGroupPaletteReady && liveRuntimeGroupPaletteHash != 0u
+            ? liveRuntimeGroupPaletteHash
+            : packet.runtimeGroupPaletteHash != 0u
+                  ? packet.runtimeGroupPaletteHash
+                  : War3SemanticHashMatrixPalette(
+                        effectiveRuntimeGroupPalette.data(),
+                        uint32_t(effectiveRuntimeGroupPalette.size()));
+    submittedRuntimeGroupPaletteHash = submittedPaletteHash;
+    War3NoteSubmittedPaletteMotion(
+        m_war3Scene.shadowStats, packet.renderable.runtimeModelPtr,
+        m_war3ShadowPersistentFrameSerial, submittedPaletteHash);
+
+    {
+      auto paletteIndexScope = War3SemanticSubmitScope(
+          "War3SemanticScene/SubmitFrame/PaletteIndex");
+      paletteIndex = War3GetOrCreateSemanticShadowPalette(
+          packet, resolvedObjectKind,
+          liveRuntimeGroupPaletteReady ? effectiveRuntimeGroupPalette.data()
+                                       : nullptr,
+          liveRuntimeGroupPaletteReady
+              ? uint32_t(effectiveRuntimeGroupPalette.size())
+              : 0u,
+          liveRuntimeGroupPaletteReady ? liveRuntimeGroupPaletteHash : 0u);
+    }
+
+    if (hasExplicitBlendContract) {
+      auto blendScope = War3SemanticSubmitScope(
+          "War3SemanticScene/SubmitFrame/BlendContract");
+      if (packetBlendWeights.size() < size_t(vertexCount) ||
+          packetBlendIndices.size() < size_t(vertexCount)) {
+        m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
+        return false;
+      }
+      if (!cachedPersistentGeometry) {
+        blendIndices.resize(vertexCount);
+        blendWeights.resize(vertexCount);
+        for (uint32_t i = 0; i < vertexCount; ++i) {
+          blendWeights[i] = packetBlendWeights[i];
+          blendIndices[i] = packetBlendIndices[i];
+          const uint32_t maxInfluence =
+              uint32_t(packet.resource.explicitBlendCount) + 1u;
+          for (uint32_t influence = 0u; influence < maxInfluence; ++influence) {
+          const uint32_t groupSlot = blendIndices[i][influence];
+          if (groupSlot >= effectiveRuntimeGroupPalette.size() ||
+              groupSlot >= 256u) {
+            m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
+            return false;
+            }
+          }
+        }
+      }
+    } else if (!cachedPersistentGeometry) {
+      auto blendScope = War3SemanticSubmitScope(
+          "War3SemanticScene/SubmitFrame/BlendContract");
+      blendIndices.resize(vertexCount);
+      for (uint32_t i = 0; i < vertexCount; ++i) {
+        const uint32_t groupSlot = packetVertexGroups[i];
+        if (groupSlot >= effectiveRuntimeGroupPalette.size() ||
+            groupSlot >= 256u) {
+          m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
+          return false;
+        }
+        blendIndices[i] = {uint8_t(groupSlot), 0u, 0u, 0u};
+      }
+    }
+  }
+
+  std::vector<float> frameLocalDynamicPositions;
+  const std::vector<float>* effectivePositions = &packetPositions;
+  if (hasDynamicPositionStream) {
+    auto dynamicPositionScope = War3SemanticSubmitScope(
+        "War3SemanticScene/SubmitFrame/DynamicPositionCopy");
+    frameLocalDynamicPositions.resize(size_t(vertexCount) * 3u);
+    const auto* srcBase =
+        reinterpret_cast<const uint8_t*>(packet.resource.dynamicPositionStream);
+    const size_t srcStride = size_t(packet.resource.dynamicPositionStride);
+    for (uint32_t i = 0u; i < vertexCount; ++i) {
+      std::memcpy(frameLocalDynamicPositions.data() + size_t(i) * 3u,
+                  srcBase + size_t(i) * srcStride,
+                  sizeof(float) * 3u);
+    }
+    effectivePositions = &frameLocalDynamicPositions;
+  }
+
+  auto computeLocalBounds = [&](Vector4& outCenter, float& outRadius) {
+    outCenter = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+    outRadius = 0.0f;
+    if (effectivePositions->size() < 3u)
+      return;
+
+    float minX = (*effectivePositions)[0];
+    float minY = (*effectivePositions)[1];
+    float minZ = (*effectivePositions)[2];
+    float maxX = minX;
+    float maxY = minY;
+    float maxZ = minZ;
+
+    for (uint32_t i = 0u; i < vertexCount; ++i) {
+      const size_t base = size_t(i) * 3u;
+      const float x = (*effectivePositions)[base + 0u];
+      const float y = (*effectivePositions)[base + 1u];
+      const float z = (*effectivePositions)[base + 2u];
+      minX = std::min(minX, x);
+      minY = std::min(minY, y);
+      minZ = std::min(minZ, z);
+      maxX = std::max(maxX, x);
+      maxY = std::max(maxY, y);
+      maxZ = std::max(maxZ, z);
+    }
+
+    outCenter = Vector4((minX + maxX) * 0.5f, (minY + maxY) * 0.5f,
+                        (minZ + maxZ) * 0.5f, 1.0f);
+    float radiusSq = 0.0f;
+    for (uint32_t i = 0u; i < vertexCount; ++i) {
+      const size_t base = size_t(i) * 3u;
+      const float dx = (*effectivePositions)[base + 0u] - outCenter.x;
+      const float dy = (*effectivePositions)[base + 1u] - outCenter.y;
+      const float dz = (*effectivePositions)[base + 2u] - outCenter.z;
+      radiusSq = std::max(radiusSq, dx * dx + dy * dy + dz * dz);
+    }
+    outRadius = std::sqrt(radiusSq);
+  };
+
+  War3ShadowPersistentGeometry candidate = {};
+  candidate.key = key;
+  candidate.indexed = useIndices;
+  candidate.positionStride = sizeof(float) * 3u;
+  candidate.positionOffset = 0u;
+  candidate.positionFormat = VK_FORMAT_R32G32B32_SFLOAT;
+  candidate.indexType = VK_INDEX_TYPE_UINT16;
+  candidate.vertexBlendEnabled = skinned;
+  candidate.vertexBlendIndexed = skinned;
+  candidate.vertexBlendCount =
+      skinned ? packet.resource.explicitBlendCount : 0u;
+  candidate.blendWeightOffset = 0u;
+  candidate.blendWeightFormat =
+      skinned && hasExplicitBlendContract ? VK_FORMAT_R32G32B32_SFLOAT
+                                          : VK_FORMAT_UNDEFINED;
+  candidate.blendIndexOffset =
+      skinned && hasExplicitBlendContract ? 12u : 0u;
+  candidate.blendIndexFormat =
+      skinned ? VK_FORMAT_R8G8B8A8_USCALED : VK_FORMAT_UNDEFINED;
+  candidate.blendStride =
+      skinned ? (hasExplicitBlendContract ? 16u : 4u) : 0u;
+  candidate.blendBinding = skinned ? 1u : 0u;
+  candidate.alphaTestEnabled = alphaCutoutEnabled;
+  candidate.alphaRef = alphaCutoutRef;
+  candidate.topology = effectiveTopology;
+  candidate.indexCount =
+      useIndices ? effectiveIndexCount : 0u;
+  candidate.firstIndex = 0u;
+  candidate.vertexOffset = 0;
+  candidate.vertexCount = useIndices ? 0u : vertexCount;
+  candidate.firstVertex = 0u;
+  candidate.minVertexIndex = 0u;
+  candidate.numVertices = vertexCount;
+
+  std::array<War3ShadowPersistentUpload, 4> uploads = {};
+  uploads[0].hostData = effectivePositions->data();
+  uploads[0].bytes =
+      VkDeviceSize(effectivePositions->size() * sizeof(float));
+  uploads[0].usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+  uploads[0].debugName = "War3SemanticShadowPos";
+  if (useIndices) {
+    uploads[1].hostData = effectiveIndexData;
+    uploads[1].bytes =
+        VkDeviceSize(size_t(effectiveIndexCount) * sizeof(uint16_t));
+    uploads[1].usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    uploads[1].debugName = "War3SemanticShadowIdx";
+  }
+  struct SemanticBlendVertex {
+    float weights[3];
+    uint8_t indices[4];
+  };
+  std::vector<SemanticBlendVertex> blendVertices;
+  if (skinned && !blendIndices.empty()) {
+    if (hasExplicitBlendContract) {
+      blendVertices.resize(vertexCount);
+      for (uint32_t i = 0u; i < vertexCount; ++i) {
+        blendVertices[i].weights[0] = blendWeights[i][0];
+        blendVertices[i].weights[1] = blendWeights[i][1];
+        blendVertices[i].weights[2] = blendWeights[i][2];
+        blendVertices[i].indices[0] = blendIndices[i][0];
+        blendVertices[i].indices[1] = blendIndices[i][1];
+        blendVertices[i].indices[2] = blendIndices[i][2];
+        blendVertices[i].indices[3] = blendIndices[i][3];
+      }
+      uploads[2].hostData = blendVertices.data();
+      uploads[2].bytes =
+          VkDeviceSize(blendVertices.size() * sizeof(blendVertices[0]));
+    } else {
+      uploads[2].hostData = blendIndices.data();
+      uploads[2].bytes =
+          VkDeviceSize(blendIndices.size() * sizeof(blendIndices[0]));
+    }
+    uploads[2].usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    uploads[2].debugName = "War3SemanticShadowBlend";
+  }
+
+  uint32_t geometryId = 0u;
+  const War3ShadowPersistentGeometry* geometry = nullptr;
+  bool createdNewGeometry = false;
+  const bool frameLocalDynamicGeometry = packet.usesDynamicMeshPositions;
+  if (frameLocalDynamicGeometry &&
+      dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() &&
+      !dxvk::war3::internal::kShadowSemanticCoreAllowFrameLocalDynamicGeometry) {
+    static std::atomic<uint32_t> s_frameLocalRejectLogCount{0u};
+    const uint32_t logIndex =
+        s_frameLocalRejectLogCount.fetch_add(1u, std::memory_order_relaxed);
+    if (logIndex < 16u || (logIndex % 512u) == 0u) {
+      WAR3_RENDER_LOG(
+          "DXVK SemanticShadow: reject frame-local dynamic geometry "
+          "runtime=%p model=%p geoIdx=%u handle=%u raw=%08X scene=%p mesh=%p\n",
+          packet.renderable.runtimeModelPtr, packet.resource.modelResourcePtr,
+          static_cast<unsigned>(packet.resource.geosetIndex),
+          static_cast<unsigned>(packet.renderable.jHandle),
+          static_cast<unsigned>(packet.renderable.rawcode),
+          packet.renderable.sceneNode, packet.renderable.meshData);
+    }
+    m_war3Scene.shadowStats.semanticSceneRejectedGeometry++;
+    m_war3Scene.shadowStats.semanticSceneRejectedGeometryFrameLocal++;
+    return false;
+  }
+  War3ShadowPersistentGeometry frameLocalGeometry = {};
+  {
+  auto geometryScope = War3SemanticSubmitScope(
+      "War3SemanticScene/SubmitFrame/GeometryLookupCreate");
+  if (frameLocalDynamicGeometry) {
+    computeLocalBounds(candidate.localBoundsCenter, candidate.localBoundsRadius);
+    auto uploadFrameLocalBuffer =
+        [this](const War3ShadowPersistentUpload& upload,
+               Rc<DxvkBuffer>& outStorage,
+               DxvkResourceBufferInfo& outInfo) -> bool {
+      if (upload.bytes == 0)
+        return true;
+
+      VkDeviceSize uploadOffset = 0;
+      void* mapPtr = nullptr;
+      auto storage =
+          War3AllocFreezeBuffer(upload.bytes, uploadOffset, true, &mapPtr);
+      if (storage == nullptr || mapPtr == nullptr)
+        return false;
+
+      if (upload.hostData != nullptr) {
+        std::memcpy(mapPtr, upload.hostData, size_t(upload.bytes));
+      } else {
+        auto srcBuffer = upload.slice.buffer();
+        if (srcBuffer == nullptr)
+          return false;
+        void* srcPtr = srcBuffer->mapPtr(upload.slice.offset());
+        if (srcPtr == nullptr)
+          return false;
+        std::memcpy(mapPtr, srcPtr, size_t(upload.bytes));
+      }
+
+      outStorage = storage;
+      outInfo = storage->getSliceInfo(uploadOffset, upload.bytes);
+      return true;
+    };
+
+    frameLocalGeometry = candidate;
+    frameLocalGeometry.key = key;
+    frameLocalGeometry.totalBytes = 0u;
+    frameLocalGeometry.lastSeenFrame = m_war3ShadowPersistentFrameSerial;
+    for (const auto& upload : uploads)
+      frameLocalGeometry.totalBytes += War3AlignPersistentBytes(upload.bytes);
+
+    if (!uploadFrameLocalBuffer(uploads[0], frameLocalGeometry.positionStorage,
+                                frameLocalGeometry.positionInfo) ||
+        !uploadFrameLocalBuffer(uploads[1], frameLocalGeometry.indexStorage,
+                                frameLocalGeometry.indexInfo) ||
+        !uploadFrameLocalBuffer(uploads[2], frameLocalGeometry.blendStorage,
+                                frameLocalGeometry.blendInfo) ||
+        !uploadFrameLocalBuffer(uploads[3], frameLocalGeometry.uvStorage,
+                                frameLocalGeometry.uvInfo)) {
+      m_war3Scene.shadowStats.semanticSceneRejectedGeometry++;
+      m_war3Scene.shadowStats.semanticSceneRejectedGeometryFrameLocal++;
+      return false;
+    }
+
+    geometry = &frameLocalGeometry;
+  } else if (cachedPersistentGeometry) {
+    geometryId = cachedGeometryId;
+    geometry = cachedGeometry;
+  } else {
+    if (!War3TryFindShadowPersistentGeometry(key, geometryId, geometry)) {
+      computeLocalBounds(candidate.localBoundsCenter, candidate.localBoundsRadius);
+      if (!War3FindOrCreateShadowPersistentGeometry(key, candidate, uploads,
+                                                    geometryId, geometry,
+                                                    createdNewGeometry) ||
+          geometry == nullptr) {
+        m_war3Scene.shadowStats.semanticSceneRejectedGeometry++;
+        m_war3Scene.shadowStats.semanticSceneRejectedGeometryPersistent++;
+          return false;
+      }
+    }
+  }
+  }
+
+  auto resolveWorldMatrix = [&]() {
+    if (skinned)
+      return Matrix4();
+    if (packet.usesDynamicMeshPositions && hasSceneNodeWorldMatrix)
+      return sceneNodeWorldMatrix;
+    if (packet.pose.hasWorldTransform)
+      return packet.pose.worldTransform;
+    if (!packet.pose.matrixPalette.empty())
+      return packet.pose.matrixPalette[0];
+    return Matrix4();
+  };
+
+  auto drawBuildScope = War3SemanticSubmitScope(
+      "War3SemanticScene/SubmitFrame/DrawBuild");
+  War3ShadowCasterDraw draw = {};
+  draw.indexed = geometry->indexed;
+  draw.positionStorage = geometry->positionStorage;
+  draw.positionInfo = geometry->positionInfo;
+  draw.positionStride = geometry->positionStride;
+  draw.positionOffset = geometry->positionOffset;
+  draw.positionFormat = geometry->positionFormat;
+  draw.topology = geometry->topology;
+  draw.worldMatrix = resolveWorldMatrix();
+  draw.vertexBlendEnabled = geometry->vertexBlendEnabled;
+  draw.vertexBlendIndexed = geometry->vertexBlendIndexed;
+  draw.vertexBlendCount = geometry->vertexBlendCount;
+  draw.paletteIndex = paletteIndex;
+  draw.blendWeightOffset = geometry->blendWeightOffset;
+  draw.blendWeightFormat = geometry->blendWeightFormat;
+  draw.blendIndexOffset = geometry->blendIndexOffset;
+  draw.blendIndexFormat = geometry->blendIndexFormat;
+  draw.blendBinding = geometry->blendBinding;
+  draw.blendStride = geometry->blendStride;
+  draw.alphaTestEnabled = geometry->alphaTestEnabled;
+  draw.alphaRef = geometry->alphaRef;
+  draw.alphaBlendEnabled = alphaBlendEnabled;
+  draw.depthWriteEnabled = true;
+  draw.depthTestEnabled = true;
+  draw.additiveBlend = false;
+  draw.uvStride = 0u;
+  draw.uvOffset = 0u;
+  draw.uvFormat = VK_FORMAT_UNDEFINED;
+  if (geometry->indexed) {
+    draw.indexStorage = geometry->indexStorage;
+    draw.indexInfo = geometry->indexInfo;
+    draw.indexType = geometry->indexType;
+    draw.indexCount = geometry->indexCount;
+    draw.firstIndex = geometry->firstIndex;
+    draw.vertexOffset = geometry->vertexOffset;
+    draw.vertexCount = 0u;
+    draw.firstVertex = 0u;
+    draw.minVertexIndex = geometry->minVertexIndex;
+    draw.numVertices = geometry->numVertices;
+  } else {
+    draw.indexCount = 0u;
+    draw.firstIndex = 0u;
+    draw.vertexOffset = 0;
+    draw.vertexCount = geometry->vertexCount;
+    draw.firstVertex = geometry->firstVertex;
+    draw.minVertexIndex = geometry->minVertexIndex;
+    draw.numVertices = geometry->numVertices;
+  }
+  if (geometry->blendBinding == 1u) {
+    draw.blendStorage = geometry->blendStorage;
+    draw.blendInfo = geometry->blendInfo;
+  }
+
+  draw.category = War3RenderState::StageCategory::WorldObject;
+  draw.batchTag = War3BatchTag::Unknown;
+  draw.batchHandle = War3NormalizeShadowHandle(packet.renderable.jHandle);
+  draw.objectKind = static_cast<uint8_t>(resolvedObjectKind);
+
+  const bool unitLikeObject = War3IsSemanticUnitObject(resolvedObjectKind);
+  {
+  auto boundsScope = War3SemanticSubmitScope(
+      "War3SemanticScene/SubmitFrame/Bounds");
+  const Matrix4* semanticBoundsMatrix = nullptr;
+  if (skinned) {
+    if (packet.pose.hasWorldTransform)
+      semanticBoundsMatrix = &packet.pose.worldTransform;
+    else if (!packet.pose.matrixPalette.empty())
+      semanticBoundsMatrix = &packet.pose.matrixPalette[0];
+    else if (liveRuntimeGroupPaletteReady && !liveRuntimeGroupPalette.empty())
+      semanticBoundsMatrix = &liveRuntimeGroupPalette[0];
+    else if (!packet.runtimeGroupPalette.empty())
+      semanticBoundsMatrix = &packet.runtimeGroupPalette[0];
+  } else {
+    semanticBoundsMatrix = &draw.worldMatrix;
+  }
+
+  const Vector4 localBoundsCenter =
+      geometry != nullptr ? geometry->localBoundsCenter
+                          : candidate.localBoundsCenter;
+  const float localBoundsRadius =
+      geometry != nullptr ? geometry->localBoundsRadius
+                          : candidate.localBoundsRadius;
+
+  if (semanticBoundsMatrix != nullptr && localBoundsRadius > 0.0f) {
+    War3ApplySemanticBoundsFromMatrix(draw, *semanticBoundsMatrix,
+                                      localBoundsCenter,
+                                      localBoundsRadius);
+  } else {
+    const float baseRadius =
+        War3SemanticBoundsRadiusForObjectKind(draw.objectKind);
+    if (baseRadius > 0.0f) {
+      const Matrix4* boundsMatrix =
+          semanticBoundsMatrix != nullptr ? semanticBoundsMatrix : &draw.worldMatrix;
+      War3ApplySemanticBoundsFromMatrix(draw, *boundsMatrix,
+                                        localBoundsCenter,
+                                        baseRadius);
+    }
+  }
+
+  if (unitLikeObject && skinned && !(draw.boundsRadius > 0.0f)) {
+    float baseRadius =
+        War3SemanticBoundsRadiusForObjectKind(draw.objectKind);
+    if (baseRadius <= 0.0f)
+      baseRadius = 260.0f;
+    if (localBoundsRadius > baseRadius)
+      baseRadius = localBoundsRadius;
+
+    if (semanticBoundsMatrix != nullptr) {
+      War3ApplySemanticBoundsFromMatrix(draw, *semanticBoundsMatrix,
+                                        localBoundsCenter,
+                                        baseRadius);
+    } else {
+      draw.boundsCenter = War3SemanticBoundsTranslation(draw.worldMatrix);
+      draw.boundsRadius =
+          baseRadius * War3SemanticBoundsMaxScale(draw.worldMatrix);
+    }
+  }
+  }
+
+  War3ShadowInstanceRef instance = {};
+  instance.geometryId = geometryId;
+  instance.materialId = uint32_t(packet.material.signatureHash & 0xFFFFFFFFu);
+  instance.replayDrawIndex =
+      static_cast<uint32_t>(m_war3Scene.shadowCasters.size());
+  instance.batchHandle = draw.batchHandle;
+  instance.paletteIndex = draw.paletteIndex;
+  instance.worldMatrix = draw.worldMatrix;
+  instance.boundsCenter = draw.boundsCenter;
+  instance.boundsRadius = draw.boundsRadius;
+  instance.category = draw.category;
+  instance.batchTag = draw.batchTag;
+  instance.objectKind = draw.objectKind;
+  instance.mode = key.mode;
+
+  const bool dynamicSemanticCaster =
+      skinned || packet.usesDynamicMeshPositions || unitLikeObject;
+  if (dynamicSemanticCaster) {
+    m_war3Scene.shadowStats.dynamicPoseCount++;
+    if (skinned)
+      m_war3Scene.shadowStats.dynamicSkinnedOutputCount++;
+
+    uint64_t dynamicHash = bit::fnv1a_init();
+    dynamicHash = bit::fnv1a_iter(
+        dynamicHash,
+        reinterpret_cast<uintptr_t>(packet.renderable.runtimeModelPtr));
+    dynamicHash = bit::fnv1a_iter(dynamicHash, effectiveModelKey);
+    dynamicHash = bit::fnv1a_iter(dynamicHash, packet.renderable.jHandle);
+    if (skinned || packet.usesDynamicMeshPositions ||
+        packet.pose.matrixHash != 0u || packet.pose.matrixCount != 0u) {
+      dynamicHash = bit::fnv1a_iter(dynamicHash, packet.pose.matrixCount);
+      dynamicHash = bit::fnv1a_iter(dynamicHash, packet.pose.matrixHash);
+      for (uint32_t i = 0u; i < 4u; ++i) {
+        dynamicHash = bit::fnv1a_iter(
+            dynamicHash, bit::cast<uint32_t>(draw.worldMatrix[i].x));
+        dynamicHash = bit::fnv1a_iter(
+            dynamicHash, bit::cast<uint32_t>(draw.worldMatrix[i].y));
+        dynamicHash = bit::fnv1a_iter(
+            dynamicHash, bit::cast<uint32_t>(draw.worldMatrix[i].z));
+        dynamicHash = bit::fnv1a_iter(
+            dynamicHash, bit::cast<uint32_t>(draw.worldMatrix[i].w));
+      }
+      dynamicHash = bit::fnv1a_iter(
+          dynamicHash, bit::cast<uint32_t>(draw.boundsCenter.x));
+      dynamicHash = bit::fnv1a_iter(
+          dynamicHash, bit::cast<uint32_t>(draw.boundsCenter.y));
+      dynamicHash = bit::fnv1a_iter(
+          dynamicHash, bit::cast<uint32_t>(draw.boundsCenter.z));
+      dynamicHash = bit::fnv1a_iter(
+          dynamicHash, bit::cast<uint32_t>(draw.boundsRadius));
+      if (skinned) {
+        dynamicHash =
+            bit::fnv1a_iter(dynamicHash, submittedRuntimeGroupPaletteHash);
+        dynamicHash =
+            bit::fnv1a_iter(dynamicHash, uint32_t(effectiveRuntimeGroupPalette.size()));
+        dynamicHash = bit::fnv1a_iter(dynamicHash, effectiveMaxVertexGroupSlot);
+      }
+      if (packet.usesDynamicMeshPositions) {
+        dynamicHash =
+            bit::fnv1a_iter(dynamicHash, packet.resource.contentHash);
+        dynamicHash = bit::fnv1a_iter(
+            dynamicHash, packet.resource.dynamicIndexHash);
+        dynamicHash = bit::fnv1a_iter(
+            dynamicHash, packet.resource.dynamicPrimitiveBaseIndex);
+      }
+      if (liveRuntimeGroupPaletteReady)
+        dynamicHash = bit::fnv1a_iter(dynamicHash, liveRuntimeGroupPaletteHash);
+    } else {
+      for (uint32_t i = 0u; i < 4u; ++i) {
+        dynamicHash = bit::fnv1a_iter(
+            dynamicHash, bit::cast<uint32_t>(draw.worldMatrix[i].x));
+        dynamicHash = bit::fnv1a_iter(
+            dynamicHash, bit::cast<uint32_t>(draw.worldMatrix[i].y));
+        dynamicHash = bit::fnv1a_iter(
+            dynamicHash, bit::cast<uint32_t>(draw.worldMatrix[i].z));
+        dynamicHash = bit::fnv1a_iter(
+            dynamicHash, bit::cast<uint32_t>(draw.worldMatrix[i].w));
+      }
+    }
+
+    if (m_war3Scene.shadowStats.dynamicPoseSignature == 0u)
+      m_war3Scene.shadowStats.dynamicPoseSignature = dynamicHash;
+    else
+      m_war3Scene.shadowStats.dynamicPoseSignature = bit::fnv1a_iter(
+          m_war3Scene.shadowStats.dynamicPoseSignature, dynamicHash);
+  }
+
+  m_war3Scene.shadowInstances.emplace_back(std::move(instance));
+  m_war3Scene.shadowCasters.emplace_back(std::move(draw));
+  m_war3Scene.shadowStats.captured++;
+  if (useIndices)
+    m_war3Scene.shadowStats.capturedIndexed++;
+  else
+    m_war3Scene.shadowStats.capturedNonIndexed++;
+  m_war3Scene.shadowStats.capturedWorldObject++;
+  m_war3Scene.shadowStats.semanticSceneSubmitted++;
+  if (unitLikeObject) {
+    m_war3Scene.shadowStats.capturedUnitObject++;
+    m_war3Scene.shadowStats.persistentUnitInstanceCount++;
+    m_war3Scene.shadowStats.semanticSceneSubmittedUnit++;
+    if (skinned)
+      m_war3Scene.shadowStats.capturedUnitVertexBlend++;
+  }
+  if (skinned)
+    m_war3Scene.shadowStats.semanticSceneSubmittedSkinned++;
+  if (!unitLikeObject && !skinned &&
+      resolvedObjectKind == dxvk::war3::render::ObjectKind::Unknown &&
+      packet.renderable.worldObjectEntry != nullptr &&
+      packet.renderable.sceneNode != nullptr &&
+      packet.pose.hasWorldTransform) {
+    m_war3Scene.shadowStats.semanticSceneAcceptedExplicitResourceOwnerRigid++;
+  }
+  m_war3Scene.shadowStats.persistentInstanceCount++;
+
+  if (!unitLikeObject ||
+      resolvedObjectKind == dxvk::war3::render::ObjectKind::Building ||
+      resolvedObjectKind ==
+          dxvk::war3::render::ObjectKind::Destructible) {
+    m_war3Scene.shadowStats.staticPersistentCount++;
+  }
+
+  if (!frameLocalDynamicGeometry) {
+    if (createdNewGeometry) {
+      m_war3Scene.shadowStats.persistentGeometryCount++;
+      m_war3Scene.shadowStats.uniqueGeometryCount++;
+      m_war3Scene.shadowPersistentPool.promotedThisFrame++;
+    } else {
+      m_war3Scene.shadowStats.duplicateGeometryInstances++;
+      m_war3Scene.shadowStats.reuseEligibleDuplicates++;
+      m_war3Scene.shadowStats.potentialFreezeReuseHits++;
+      m_war3Scene.shadowStats.instancedGeometryDrawsSaved++;
+    }
+  } else {
+    m_war3Scene.shadowStats.semanticSceneSubmittedFrameLocal++;
+  }
+
+  m_war3Scene.shadowPersistentPool.bytesUsed = m_war3ShadowPersistentBytesUsed;
+  m_war3Scene.shadowPersistentPool.bytesEvicted =
+      m_war3ShadowPersistentBytesEvicted;
+  m_war3Scene.shadowPersistentPool.liveGeometryCount =
+      static_cast<uint32_t>(m_war3ShadowPersistentGeometries.size());
+  m_war3Scene.shadowStats.persistentPoolBytesUsed =
+      m_war3ShadowPersistentBytesUsed;
+  m_war3Scene.shadowStats.persistentPoolBytesEvicted =
+      m_war3ShadowPersistentBytesEvicted;
+  return true;
+}
+
+uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
+    bool unitsOnly,
+    bool executeNativeBackendValidation) {
+  m_war3Scene.shadowStats.semanticScenePopulateAttemptCount++;
+  if (unitsOnly)
+    m_war3Scene.shadowStats.semanticScenePopulateUnitsOnlyCount++;
+
+  if (!War3SemanticConsumerEnabled() ||
+      !dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled())
+    return 0u;
+  const bool semanticRuntimeReady =
+      dxvk::war3::War3Events::get().isGameStarted() ||
+      (dxvk::war3::War3Events::get().isJassReady() &&
+       dxvk::war3::internal::IsSemanticShadowPreReadyValidationRuntimeEnabled());
+  if (!semanticRuntimeReady)
+    return 0u;
+  auto populateScope =
+      war3::War3PerfMonitor::instance().cpuScope("War3SemanticScene/Populate");
+  struct SemanticConsumerPerfScope {
+    std::chrono::steady_clock::time_point start =
+        std::chrono::steady_clock::now();
+    ~SemanticConsumerPerfScope() {
+      const auto elapsed =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count();
+      dxvk::war3::render::NoteSemanticDataPerf(
+          dxvk::war3::render::SemanticDataPerfTag::ConsumerBuild,
+          elapsed > 0 ? static_cast<uint64_t>(elapsed) : 0u);
+    }
+  } semanticConsumerPerf;
+
+  if (!War3SemanticContractCaptureEnabled()) {
+    return 0u;
+  }
+  const bool semanticSceneHasSubmittedOnce =
+      m_war3SemanticSceneLastSuccessfulSubmitFrameSerial != 0u;
+  const auto semanticSceneHasReusableSkinnedFrame = [&]() {
+    if (m_war3Scene.shadowStats.semanticSceneLastInputSkinnedCount != 0u)
+      return true;
+    if (!m_war3SemanticSceneLastReusableFrame ||
+        m_war3SemanticSceneLastReusableFrame->frameSerial == 0u ||
+        m_war3SemanticSceneLastReusableFrame->draws.empty())
+      return false;
+    for (const auto& draw : m_war3SemanticSceneLastReusableFrame->draws) {
+      if (draw.path == dxvk::war3::shadow::ShadowDrawPath::Skinned)
+        return true;
+    }
+    return false;
+  };
+  const bool semanticLivePaletteSubmitNeeded =
+      War3SemanticLivePaletteRefreshRuntime() &&
+      semanticSceneHasReusableSkinnedFrame();
+  const uint64_t kSceneContractCaptureSteadyFramePeriod =
+      War3SemanticContractCapturePeriodRuntime();
+  dxvk::war3::shadow::ShadowPublishedContractBundle sceneBundle = {};
+  // The semantic scene may be queried more than once before a DXVK frame is
+  // presented. Capturing the whole live contract on every boundary was the main
+  // source of the semantic.data stall, so make capture single-flight per host
+  // frame and let the core reuse the last completed/pending contract.
+  bool shouldCaptureContract =
+      m_war3SemanticSceneLastCaptureFrameSerial !=
+      m_war3ShadowPersistentFrameSerial;
+  const bool semanticSceneHasCapturedContract =
+      m_war3SemanticSceneLastCapturePublishRevision != 0u;
+  const bool semanticDrawTimePoseDirty =
+      m_war3SemanticDrawTimePoseDirtyFrameSerial ==
+      m_war3ShadowPersistentFrameSerial;
+  const uint64_t matrixPublisherPoseRevision =
+      dxvk::war3::model::RuntimeMatrixPublisherPoseRevision();
+  const bool semanticMatrixPublisherPoseDirty =
+      matrixPublisherPoseRevision != 0u &&
+      matrixPublisherPoseRevision !=
+          m_war3SemanticLastMatrixPublisherPoseRevision;
+  bool shouldCapturePoseOnlyContract = false;
+  if (shouldCaptureContract &&
+      (semanticSceneHasSubmittedOnce || semanticSceneHasCapturedContract)) {
+    const bool capturePeriodElapsed =
+        m_war3SemanticSceneLastCaptureFrameSerial == 0u ||
+        m_war3ShadowPersistentFrameSerial >=
+            m_war3SemanticSceneLastCaptureFrameSerial +
+                kSceneContractCaptureSteadyFramePeriod;
+    // Once packets exist, static topology can be refreshed periodically, but
+    // War3's final matrix publisher is the animated pose source for skinned
+    // semantic units. When it advances, capture the contract this frame instead
+    // of waiting for the steady-state period; otherwise shadows lock to an
+    // old/initial pose for ~DXVK_WAR3_SEMANTIC_CONTRACT_CAPTURE_PERIOD.
+    shouldCapturePoseOnlyContract =
+        semanticMatrixPublisherPoseDirty && semanticSceneHasCapturedContract &&
+        !capturePeriodElapsed;
+    shouldCaptureContract =
+        semanticMatrixPublisherPoseDirty || semanticDrawTimePoseDirty ||
+        capturePeriodElapsed ||
+        m_war3SemanticSceneLastCapturePublishRevision == 0u;
+  }
+  if (shouldCaptureContract) {
+    auto captureScope = war3::War3PerfMonitor::instance().cpuScope(
+        "War3SemanticScene/CaptureContract");
+    if (War3SemanticPublishRegistriesBeforeSceneRuntime())
+      War3PublishSemanticRegistriesForScene();
+    auto& contractCache =
+        dxvk::war3::shadow::ShadowRuntimeContractCache::instance();
+    if (shouldCapturePoseOnlyContract)
+      contractCache.capturePoseOnlyLiveState();
+    else
+      contractCache.captureLiveState();
+    m_war3SemanticSceneLastCaptureFrameSerial =
+        m_war3ShadowPersistentFrameSerial;
+    sceneBundle =
+        contractCache.snapshotBundleShared();
+    m_war3SemanticSceneLastCapturePublishRevision =
+        (sceneBundle.valid() && sceneBundle.manifest != nullptr)
+            ? sceneBundle.manifest->publishRevision
+            : 0u;
+    m_war3SemanticLastMatrixPublisherPoseRevision =
+        matrixPublisherPoseRevision;
+  }
+  if (!sceneBundle.valid()) {
+    auto snapshotScope = war3::War3PerfMonitor::instance().cpuScope(
+        "War3SemanticScene/SnapshotBundle");
+    sceneBundle = dxvk::war3::shadow::ShadowRuntimeContractCache::instance()
+                      .snapshotBundleShared();
+  }
+  if (m_war3SemanticSceneLastSuccessfulSubmitFrameSerial ==
+          m_war3ShadowPersistentFrameSerial &&
+      m_war3SemanticSceneLastSuccessfulSubmitPublishRevision != 0u &&
+      m_war3SemanticSceneLastSuccessfulSubmitPublishRevision ==
+          m_war3SemanticSceneLastCapturePublishRevision &&
+      m_war3SemanticSceneLastSuccessfulSubmitComplete &&
+      m_war3SemanticSceneLastSuccessfulSubmitUnitsOnly == unitsOnly &&
+      (!executeNativeBackendValidation ||
+       m_war3SemanticSceneLastSuccessfulSubmitNativeValidation) &&
+      !semanticLivePaletteSubmitNeeded) {
+    return 0u;
+  }
+  auto& semanticRuntime =
+      dxvk::war3::shadow::ShadowValidationRuntime::instance();
+  auto supplementedBundle = sceneBundle;
+  std::shared_ptr<const dxvk::war3::shadow::ShadowSubmissionFrame>
+      preferredSupplementedFrame;
+  uint64_t preferredSupplementedRevision = 0u;
+  if (supplementedBundle.valid() && supplementedBundle.manifest != nullptr) {
+    const uint64_t desiredRevision =
+        supplementedBundle.manifest->publishRevision;
+    const uint64_t desiredFrameSerial =
+        supplementedBundle.manifest->frameSerial;
+    preferredSupplementedRevision = desiredRevision;
+    // The preview manifest is capped to a small render-thread budget. Consume
+    // a few chunks here so the first semantic frame can progress before the
+    // scene submit gate judges the latest revision as still pending.
+    //
+    // Once the semantic path has produced a complete frame, keep this path
+    // incremental. Re-running several build chunks every BeforeUi frame was
+    // showing up as "UntrackedActive" CPU and could stall low-pressure maps even
+    // when SubmitFrame itself was single-flight.
+    constexpr uint32_t kSceneSupplementedBuildBootstrapPasses = 4u;
+    constexpr uint32_t kSceneSupplementedBuildSteadyPasses = 2u;
+    constexpr uint64_t kSceneSupplementedBuildSteadyFramePeriod = 1u;
+    bool shouldProgressSteadyBuild = !semanticSceneHasSubmittedOnce;
+    if (semanticSceneHasSubmittedOnce) {
+      const auto currentFrame = semanticRuntime.snapshotFrameShared();
+      const auto currentBuildState = semanticRuntime.buildStateSnapshot();
+      const uint64_t currentFrameRevision =
+          currentFrame ? currentFrame->sourcePublishRevision : 0u;
+      const uint64_t currentFrameSerial =
+          currentFrame ? currentFrame->frameSerial : 0u;
+      const bool currentFrameFresh =
+          currentFrame && currentFrame->frameSerial != 0u &&
+          !currentFrame->draws.empty() &&
+          currentFrame->sourcePublishRevision >= desiredRevision &&
+          currentFrameSerial >= desiredFrameSerial;
+      const bool currentFramePoseStale =
+          desiredFrameSerial != 0u &&
+          (currentFrameSerial == 0u ||
+           currentFrameSerial < desiredFrameSerial);
+      // After the first successful semantic scene submit we still need to drain
+      // the chunked build queue. Otherwise the renderer keeps reusing an old
+      // completed frame forever, which makes multiple current casters receive a
+      // stale caster's shadow silhouette. Skinned animation freshness now comes
+      // from PoseRegistry palettes published by War3's source-range matrix
+      // producer, not from raw CModel fallback, so stale packet topology may be
+      // reused only while fresh palettes are available. Keep the drain periodic
+      // to avoid turning freshness into a build storm.
+      const bool steadyBuildPeriodElapsed =
+          m_war3SemanticSceneLastSteadyBuildFrameSerial == 0u ||
+          m_war3ShadowPersistentFrameSerial >=
+              m_war3SemanticSceneLastSteadyBuildFrameSerial +
+                  kSceneSupplementedBuildSteadyFramePeriod;
+      shouldProgressSteadyBuild =
+          (!currentFrameFresh || currentFramePoseStale) &&
+          (currentBuildState.buildInProgress ||
+           currentBuildState.buildRequestPending ||
+           desiredRevision > currentFrameRevision ||
+           currentFramePoseStale) &&
+          steadyBuildPeriodElapsed;
+    }
+    const uint32_t sceneSupplementedBuildMaxPasses =
+        semanticSceneHasSubmittedOnce
+            ? (shouldProgressSteadyBuild ? kSceneSupplementedBuildSteadyPasses
+                                         : 0u)
+            : kSceneSupplementedBuildBootstrapPasses;
+    if (semanticSceneHasSubmittedOnce && sceneSupplementedBuildMaxPasses != 0u)
+      m_war3SemanticSceneLastSteadyBuildFrameSerial =
+          m_war3ShadowPersistentFrameSerial;
+    constexpr uint64_t kSceneSupplementedBuildRecordCeiling = 2048u;
+    auto supplementedBuildScope =
+        sceneSupplementedBuildMaxPasses != 0u
+            ? war3::War3PerfMonitor::instance().cpuScope(
+                  "War3SemanticScene/SupplementedBuild")
+            : war3::War3PerfMonitor::ScopedCpuScope{};
+    for (uint32_t i = 0u; i < sceneSupplementedBuildMaxPasses; ++i) {
+      semanticRuntime.ensureFrameBuiltForContract(
+          supplementedBundle.manifest, supplementedBundle.resources,
+          supplementedBundle.poses, supplementedBundle.attachments);
+      const auto supplementedStats = semanticRuntime.snapshot();
+      auto candidateFrame = semanticRuntime.snapshotFrameShared();
+      if (supplementedStats.sourcePublishRevision == desiredRevision &&
+          supplementedStats.frameSerial >= desiredFrameSerial) {
+        if (candidateFrame && candidateFrame->frameSerial != 0u &&
+            !candidateFrame->draws.empty() &&
+            candidateFrame->sourcePublishRevision == desiredRevision &&
+            candidateFrame->frameSerial >= desiredFrameSerial) {
+          preferredSupplementedFrame = std::move(candidateFrame);
+        }
+        break;
+      }
+      const auto supplementedBuildState =
+          semanticRuntime.buildStateSnapshot();
+      if (!supplementedBuildState.buildInProgress &&
+          !supplementedBuildState.buildRequestPending)
+        break;
+      if (supplementedBuildState.buildInProgress &&
+          supplementedBuildState.buildRecordCount >
+              kSceneSupplementedBuildRecordCeiling) {
+        break;
+      }
+    }
+  }
+  dxvk::war3::shadow::ShadowValidationFrameStats stats = {};
+  dxvk::war3::shadow::ShadowValidationBuildState buildState = {};
+  std::shared_ptr<const dxvk::war3::shadow::ShadowSubmissionFrame> latestFrame;
+  {
+    auto stateScope = war3::War3PerfMonitor::instance().cpuScope(
+        "War3SemanticScene/RequestBuildAndSnapshot");
+    if (supplementedBundle.valid()) {
+      semanticRuntime.requestFrameBuildForContract(
+          supplementedBundle.manifest, supplementedBundle.resources,
+          supplementedBundle.poses, supplementedBundle.attachments);
+    } else {
+      semanticRuntime.requestLatestFrameBuild();
+    }
+    stats = semanticRuntime.snapshot();
+    buildState = semanticRuntime.buildStateSnapshot();
+    latestFrame = semanticRuntime.snapshotFrameShared();
+  }
+  auto semanticCatchupTargetRevision = [&]() {
+    uint64_t target = stats.sourcePublishRevision;
+    if (buildState.buildInProgress)
+      target = std::max(target, buildState.buildPublishRevision);
+    if (buildState.buildRequestPending)
+      target = std::max(target, buildState.pendingPublishRevision);
+    if (preferredSupplementedRevision != 0u)
+      target = std::max(target, preferredSupplementedRevision);
+    return target;
+  };
+  auto semanticCatchupTargetFrameSerial = [&]() {
+    uint64_t target = stats.frameSerial;
+    if (buildState.buildInProgress)
+      target = std::max(target, buildState.buildFrameSerial);
+    if (buildState.buildRequestPending)
+      target = std::max(target, buildState.pendingFrameSerial);
+    if (supplementedBundle.valid() && supplementedBundle.manifest != nullptr)
+      target = std::max(target, supplementedBundle.manifest->frameSerial);
+    return target;
+  };
+  auto semanticFrameSafeForCurrentTarget =
+      [&](const std::shared_ptr<const dxvk::war3::shadow::ShadowSubmissionFrame>&
+              candidate,
+          bool allowNearSteadyReuse) {
+        if (candidate == nullptr || candidate->frameSerial == 0u ||
+            candidate->draws.empty())
+          return false;
+
+        const uint64_t targetRevision = semanticCatchupTargetRevision();
+        const uint64_t targetFrameSerial = semanticCatchupTargetFrameSerial();
+        const bool currentCoreEmpty =
+            stats.sourcePublishRevision != 0u && stats.drawPacketCount == 0u &&
+            stats.resolve.considered == 0u;
+        if (currentCoreEmpty)
+          return allowNearSteadyReuse && semanticSceneHasSubmittedOnce;
+        if (stats.drawPacketCount != 0u &&
+            candidate->draws.size() > stats.drawPacketCount) {
+          return false;
+        }
+
+        if (targetRevision != 0u &&
+            candidate->sourcePublishRevision < targetRevision) {
+          if (!allowNearSteadyReuse)
+            return false;
+          const uint64_t revisionGap =
+              targetRevision - candidate->sourcePublishRevision;
+          if (revisionGap > 2u)
+            return false;
+        }
+        if (targetFrameSerial != 0u &&
+            candidate->frameSerial < targetFrameSerial) {
+          const uint64_t frameGap = targetFrameSerial - candidate->frameSerial;
+          if (!allowNearSteadyReuse || frameGap > 8u)
+            return false;
+        }
+
+        return true;
+      };
+  m_war3Scene.shadowStats.semanticSceneLastTargetPublishRevision =
+      semanticCatchupTargetRevision();
+  if (!semanticLivePaletteSubmitNeeded &&
+      m_war3Scene.shadowStats.semanticSceneLastSubmittedDrawCount != 0u &&
+      stats.drawPacketCount != 0u &&
+      m_war3Scene.shadowStats.semanticSceneLastSourcePublishRevision ==
+          m_war3Scene.shadowStats.semanticSceneLastTargetPublishRevision &&
+      m_war3SemanticSceneLastSuccessfulSubmitComplete &&
+      !buildState.buildInProgress && !buildState.buildRequestPending) {
+    return m_war3Scene.shadowStats.semanticSceneLastSubmittedDrawCount;
+  }
+
+  const uint64_t preEnsureTargetRevision = semanticCatchupTargetRevision();
+  const uint64_t preEnsureTargetFrameSerial =
+      semanticCatchupTargetFrameSerial();
+  const bool canReuseSteadyStateFrame =
+      semanticSceneHasSubmittedOnce && latestFrame &&
+      latestFrame->frameSerial != 0u && !latestFrame->draws.empty();
+  const bool latestFrameAlreadyFresh =
+      latestFrame && latestFrame->frameSerial != 0u && !latestFrame->draws.empty() &&
+      latestFrame->sourcePublishRevision >= preEnsureTargetRevision &&
+      latestFrame->frameSerial >= preEnsureTargetFrameSerial &&
+      !buildState.buildInProgress && !buildState.buildRequestPending;
+  if (!latestFrameAlreadyFresh && !canReuseSteadyStateFrame) {
+    {
+      auto buildScope = war3::War3PerfMonitor::instance().cpuScope(
+          "War3SemanticScene/EnsureLatestFrameBuilt");
+      semanticRuntime.ensureLatestFrameBuilt();
+    }
+    stats = semanticRuntime.snapshot();
+    buildState = semanticRuntime.buildStateSnapshot();
+    latestFrame = semanticRuntime.snapshotFrameShared();
+  }
+  std::shared_ptr<const dxvk::war3::shadow::ShadowSubmissionFrame> frame;
+  {
+    auto selectScope = war3::War3PerfMonitor::instance().cpuScope(
+        "War3SemanticScene/FrameSelect");
+    if (!preferredSupplementedFrame && preferredSupplementedRevision != 0u &&
+        latestFrame && latestFrame->frameSerial != 0u &&
+        !latestFrame->draws.empty() &&
+        latestFrame->sourcePublishRevision == preferredSupplementedRevision &&
+        latestFrame->frameSerial >= semanticCatchupTargetFrameSerial()) {
+      preferredSupplementedFrame = latestFrame;
+    }
+    m_war3Scene.shadowStats.semanticSceneLastTargetPublishRevision =
+        semanticCatchupTargetRevision();
+    frame = preferredSupplementedFrame ? preferredSupplementedFrame
+                                       : latestFrame;
+    if (!semanticFrameSafeForCurrentTarget(frame, canReuseSteadyStateFrame))
+      frame.reset();
+    if (War3ShouldPreferSemanticSceneFrame(latestFrame, frame, unitsOnly))
+      frame = latestFrame;
+    if (!semanticFrameSafeForCurrentTarget(frame, canReuseSteadyStateFrame))
+      frame.reset();
+    auto renderableFrame =
+        dxvk::war3::shadow::ShadowValidationRuntime::instance()
+            .snapshotRenderableFrameShared();
+    if (renderableFrame && renderableFrame->frameSerial != 0u &&
+        !renderableFrame->draws.empty() &&
+        semanticFrameSafeForCurrentTarget(renderableFrame,
+                                          canReuseSteadyStateFrame) &&
+        War3ShouldPreferSemanticSceneFrame(renderableFrame, frame, unitsOnly)) {
+          frame = std::move(renderableFrame);
+    }
+  }
+  auto tryReuseLastNonZeroSemanticFrame = [&]() {
+    if (!m_war3SemanticSceneLastReusableFrame ||
+        m_war3SemanticSceneLastReusableFrame->frameSerial == 0u ||
+        m_war3SemanticSceneLastReusableFrame->draws.empty() ||
+        m_war3SemanticSceneLastReusableUnitsOnly != unitsOnly) {
+      m_war3Scene.shadowStats.semanticSceneReusableFrameUnavailableCount++;
+      return false;
+    }
+    if (executeNativeBackendValidation &&
+        !m_war3SemanticSceneLastReusableNativeValidation) {
+      m_war3Scene.shadowStats
+          .semanticSceneReusableFrameRejectedNativeValidationCount++;
+      return false;
+    }
+    frame = m_war3SemanticSceneLastReusableFrame;
+    m_war3Scene.shadowStats.semanticSceneReusableFrameForcedCount++;
+    m_war3Scene.shadowStats.semanticSceneLastReusableFrameSerial =
+        frame->frameSerial;
+    return true;
+  };
+  auto tryReuseLastNonZeroIfSelectedFrameCannotSubmit = [&]() {
+    const auto selectedScore = War3ScoreSemanticSceneFrame(frame.get(), unitsOnly);
+    if (selectedScore.eligibleDrawCount != 0u)
+      return false;
+    m_war3Scene.shadowStats.semanticSceneSelectedFrameEligibleZeroCount++;
+    return tryReuseLastNonZeroSemanticFrame();
+  };
+  tryReuseLastNonZeroIfSelectedFrameCannotSubmit();
+  if constexpr (dxvk::war3::internal::kShadowSemanticCoreSceneBootstrapCatchupEnabled) {
+    if (dxvk::war3::internal::
+            IsSemanticSceneBootstrapCatchupRuntimeEnabled()) {
+      auto semanticFrameNeedsCatchup = [&]() {
+        if (!frame || frame->frameSerial == 0u || frame->draws.empty())
+          return true;
+        const uint64_t targetRevision = semanticCatchupTargetRevision();
+        if (targetRevision != 0u &&
+            frame->sourcePublishRevision < targetRevision) {
+          return true;
+        }
+        const uint64_t targetFrameSerial = semanticCatchupTargetFrameSerial();
+        if (targetFrameSerial != 0u &&
+            frame->frameSerial < targetFrameSerial) {
+          return true;
+        }
+        return stats.sourcePublishRevision != 0u &&
+               stats.sourcePublishRevision == frame->sourcePublishRevision &&
+               stats.drawPacketCount != 0u &&
+               frame->draws.size() < stats.drawPacketCount;
+      };
+      const uint32_t maxCatchupAttempts =
+          m_war3SemanticSceneLastSuccessfulSubmitFrameSerial != 0u
+              ? 1u
+              : dxvk::war3::internal::
+                    kShadowSemanticCoreSceneBootstrapCatchupMaxAttempts;
+      const bool needInitialBootstrapCatchup =
+          m_war3SemanticSceneLastSuccessfulSubmitFrameSerial == 0u &&
+          semanticFrameNeedsCatchup() &&
+          (buildState.buildInProgress || buildState.buildRequestPending ||
+           stats.submittedDrawCount == 0u);
+      if (!canReuseSteadyStateFrame && needInitialBootstrapCatchup) {
+        for (uint32_t attempt = 0u;
+             attempt < maxCatchupAttempts;
+             ++attempt) {
+          m_war3Scene.shadowStats.semanticSceneCatchupAttemptCount++;
+          auto catchupScope = war3::War3PerfMonitor::instance().cpuScope(
+              "War3SemanticScene/BootstrapCatchup");
+          dxvk::war3::shadow::ShadowValidationRuntime::instance()
+              .ensureLatestFrameBuilt();
+          stats =
+              dxvk::war3::shadow::ShadowValidationRuntime::instance().snapshot();
+          buildState = dxvk::war3::shadow::ShadowValidationRuntime::instance()
+                           .buildStateSnapshot();
+          m_war3Scene.shadowStats.semanticSceneLastTargetPublishRevision =
+              semanticCatchupTargetRevision();
+          latestFrame = dxvk::war3::shadow::ShadowValidationRuntime::instance()
+                            .snapshotFrameShared();
+          if (!preferredSupplementedFrame &&
+              preferredSupplementedRevision != 0u && latestFrame &&
+              latestFrame->frameSerial != 0u && !latestFrame->draws.empty() &&
+              latestFrame->sourcePublishRevision ==
+                  preferredSupplementedRevision &&
+              latestFrame->frameSerial >= semanticCatchupTargetFrameSerial()) {
+            preferredSupplementedFrame = latestFrame;
+          }
+          frame = preferredSupplementedFrame ? preferredSupplementedFrame
+                                             : latestFrame;
+          if (!semanticFrameSafeForCurrentTarget(frame,
+                                                 canReuseSteadyStateFrame))
+            frame.reset();
+          if (War3ShouldPreferSemanticSceneFrame(latestFrame, frame, unitsOnly))
+            frame = latestFrame;
+          if (!semanticFrameSafeForCurrentTarget(frame,
+                                                 canReuseSteadyStateFrame))
+            frame.reset();
+          auto renderableFrame =
+              dxvk::war3::shadow::ShadowValidationRuntime::instance()
+                  .snapshotRenderableFrameShared();
+          if (renderableFrame && renderableFrame->frameSerial != 0u &&
+              !renderableFrame->draws.empty() &&
+              semanticFrameSafeForCurrentTarget(renderableFrame,
+                                                canReuseSteadyStateFrame) &&
+              War3ShouldPreferSemanticSceneFrame(renderableFrame, frame,
+                                                 unitsOnly)) {
+            frame = std::move(renderableFrame);
+          }
+          if (!frame || frame->frameSerial == 0u || frame->draws.empty())
+            tryReuseLastNonZeroSemanticFrame();
+          if (frame && frame->frameSerial != 0u && !frame->draws.empty() &&
+              !semanticFrameNeedsCatchup()) {
+            static std::atomic<uint32_t> s_catchupLogCount{0u};
+            const uint32_t logIndex =
+                s_catchupLogCount.fetch_add(1u, std::memory_order_relaxed);
+            if (logIndex < 4u) {
+              war3dbg::Print(
+                  "DXVK War3Shadow: semantic scene bootstrap catchup success "
+                  "unitsOnly=%d attempts=%u frameSerial=%llu drawCount=%zu\n",
+                  unitsOnly ? 1 : 0, attempt + 1u,
+                  static_cast<unsigned long long>(frame->frameSerial),
+                  frame->draws.size());
+            }
+            m_war3Scene.shadowStats.semanticSceneCatchupSuccessCount++;
+            break;
+          }
+          if (!buildState.buildInProgress && !buildState.buildRequestPending)
+            break;
+        }
+      }
+    }
+  }
+  if (!frame || frame->frameSerial == 0u || frame->draws.empty())
+    tryReuseLastNonZeroSemanticFrame();
+  tryReuseLastNonZeroIfSelectedFrameCannotSubmit();
+  if (!frame || frame->frameSerial == 0u || frame->draws.empty()) {
+    m_war3Scene.shadowStats.semanticSceneSkippedEmptyFrameCount++;
+    static std::atomic<uint32_t> s_emptyLogCount{0u};
+    const uint32_t logIndex =
+        s_emptyLogCount.fetch_add(1u, std::memory_order_relaxed);
+    if (logIndex < 3u) {
+      war3dbg::Print(
+          "DXVK War3Shadow: semantic scene skipped empty frame unitsOnly=%d "
+          "frame=%p frameSerial=%llu drawCount=%zu buildInProgress=%d "
+          "sourceResolved=%llu\n",
+          unitsOnly ? 1 : 0, frame.get(),
+          frame ? static_cast<unsigned long long>(frame->frameSerial) : 0ull,
+          frame ? frame->draws.size() : size_t(0u),
+          buildState.buildInProgress ? 1 : 0,
+          static_cast<unsigned long long>(stats.resolve.resolved));
+    }
+    return 0u;
+  }
+  {
+    auto statsScope = war3::War3PerfMonitor::instance().cpuScope(
+        "War3SemanticScene/FrameStats");
+    m_war3Scene.shadowStats.semanticSceneLastFrameSerial = frame->frameSerial;
+    m_war3Scene.shadowStats.semanticSceneLastSelectedFrameSerial =
+        frame->frameSerial;
+    m_war3Scene.shadowStats.semanticSceneLastSourcePublishRevision =
+        frame->sourcePublishRevision;
+    m_war3Scene.shadowStats.semanticSceneInputDrawCount =
+        static_cast<uint32_t>(
+            std::min<size_t>(frame->draws.size(), size_t(0xFFFFFFFFu)));
+    m_war3Scene.shadowStats.semanticSceneLastInputDrawCount =
+        m_war3Scene.shadowStats.semanticSceneInputDrawCount;
+    uint32_t semanticSceneInputSkinned = 0u;
+    for (const auto& draw : frame->draws) {
+      if (draw.path == dxvk::war3::shadow::ShadowDrawPath::Skinned)
+        ++semanticSceneInputSkinned;
+    }
+    m_war3Scene.shadowStats.semanticSceneInputSkinnedCount =
+        semanticSceneInputSkinned;
+    m_war3Scene.shadowStats.semanticSceneLastInputSkinnedCount =
+        semanticSceneInputSkinned;
+    if (unitsOnly) {
+      uint32_t unitsOnlyFiltered = 0u;
+      for (const auto& draw : frame->draws) {
+        if (!War3LooksSubmitEligibleForScoringFast(draw, true))
+          ++unitsOnlyFiltered;
+      }
+      m_war3Scene.shadowStats.semanticSceneSkippedUnitsOnlyFilter =
+          unitsOnlyFiltered;
+      m_war3Scene.shadowStats.semanticSceneLastUnitsOnlyFilteredCount =
+          unitsOnlyFiltered;
+    }
+  }
+
+  if (frame != latestFrame) {
+    static std::atomic<uint32_t> s_renderableFallbackLogCount{0u};
+    const uint32_t logIndex =
+        s_renderableFallbackLogCount.fetch_add(1u, std::memory_order_relaxed);
+    if (logIndex < 8u) {
+      war3dbg::Print(
+          "DXVK War3Shadow: semantic scene reusing last renderable frame "
+          "unitsOnly=%d latestSerial=%llu latestDraws=%zu renderableSerial=%llu "
+          "renderableDraws=%zu\n",
+          unitsOnly ? 1 : 0,
+          latestFrame
+              ? static_cast<unsigned long long>(latestFrame->frameSerial)
+              : 0ull,
+          latestFrame ? latestFrame->draws.size() : size_t(0u),
+          static_cast<unsigned long long>(frame->frameSerial),
+          frame->draws.size());
+    }
+  }
+
+  constexpr uint64_t kSceneZeroSubmitCooldownFrames = 60u;
+  const uint64_t frameSourceRevision = frame->sourcePublishRevision;
+  const bool zeroSubmitCooldownActive =
+      m_war3SemanticSceneLastSuccessfulSubmitFrameSerial == 0u &&
+      frameSourceRevision != 0u &&
+      m_war3SemanticSceneLastZeroSubmitPublishRevision == frameSourceRevision &&
+      m_war3SemanticSceneLastZeroSubmitUnitsOnly == unitsOnly &&
+      m_war3SemanticSceneLastZeroSubmitNativeValidation ==
+          executeNativeBackendValidation &&
+      m_war3SemanticSceneLastZeroSubmitFrameSerial != 0u &&
+      m_war3ShadowPersistentFrameSerial <
+          m_war3SemanticSceneLastZeroSubmitFrameSerial +
+              kSceneZeroSubmitCooldownFrames;
+  if (zeroSubmitCooldownActive) {
+    return 0u;
+  }
+
+  War3DxvkSemanticShadowHost host(*this);
+  const bool trackSubmittedIdentities =
+      unitsOnly && !m_war3Scene.shadowFallbacks.empty();
+  m_war3SemanticDxvkBackend.configureHost(&host, unitsOnly,
+                                          trackSubmittedIdentities);
+  dxvk::war3::shadow::ShadowRendererCore core = {};
+  {
+    auto submitScope = war3::War3PerfMonitor::instance().cpuScope(
+        "War3SemanticScene/SubmitFrame");
+    uint32_t submitCap = 0u;
+    if constexpr (dxvk::war3::internal::
+                      kShadowSemanticCoreSceneSubmitDrawCapEnabled) {
+      submitCap = War3SemanticSubmitDrawCapRuntime();
+    }
+    core.submitFrameLimited(*frame, m_war3SemanticDxvkBackend, submitCap);
+  }
+  m_war3SemanticDxvkBackend.configureHost(nullptr, false);
+  bool nativePrepared = false;
+  bool nativeExecuted = false;
+  if (executeNativeBackendValidation) {
+    nativePrepared = dxvk::war3::platform::DriveNativeShadowBackend(false, 3u);
+    if (nativePrepared &&
+        dxvk::war3::internal::
+            IsNativeRendererHostExecuteValidationRuntimeEnabled()) {
+      nativeExecuted =
+          dxvk::war3::platform::ExecuteNativeShadowBackendPreparedFrame();
+    }
+  }
+  const uint32_t submitted =
+      static_cast<uint32_t>(m_war3SemanticDxvkBackend.submittedDrawCount());
+  auto postSubmitScope = war3::War3PerfMonitor::instance().cpuScope(
+      "War3SemanticScene/PostSubmit");
+  m_war3Scene.shadowStats.semanticSceneLastSubmittedDrawCount = submitted;
+  const uint64_t submittedTargetRevision = semanticCatchupTargetRevision();
+  const uint64_t submittedTargetFrameSerial =
+      semanticCatchupTargetFrameSerial();
+  const bool submittedFrameCoversCompletedBuild =
+      stats.sourcePublishRevision != 0u &&
+      stats.sourcePublishRevision == frame->sourcePublishRevision &&
+      frame->frameSerial >= submittedTargetFrameSerial &&
+      stats.drawPacketCount != 0u &&
+      frame->draws.size() >= stats.drawPacketCount;
+  const bool semanticSubmitComplete =
+      !buildState.buildInProgress && !buildState.buildRequestPending &&
+      frame->sourcePublishRevision != 0u &&
+      frame->sourcePublishRevision >= submittedTargetRevision &&
+      submittedFrameCoversCompletedBuild;
+
+  if (submitted == 0u) {
+    m_war3SemanticSceneLastZeroSubmitFrameSerial =
+        m_war3ShadowPersistentFrameSerial;
+    m_war3SemanticSceneLastZeroSubmitPublishRevision = frameSourceRevision;
+    m_war3SemanticSceneLastZeroSubmitUnitsOnly = unitsOnly;
+    m_war3SemanticSceneLastZeroSubmitNativeValidation =
+        executeNativeBackendValidation;
+    m_war3Scene.shadowStats.semanticSceneZeroSubmitCount++;
+    static std::atomic<uint32_t> s_zeroSubmitLogCount{0u};
+    const uint32_t logIndex =
+        s_zeroSubmitLogCount.fetch_add(1u, std::memory_order_relaxed);
+    if (logIndex < 3u) {
+      war3dbg::Print(
+          "DXVK War3Shadow: semantic scene submitted 0 draws unitsOnly=%d "
+          "frameSerial=%llu sourceResolved=%llu sourceConsidered=%llu\n",
+          unitsOnly ? 1 : 0,
+          static_cast<unsigned long long>(frame->frameSerial),
+          static_cast<unsigned long long>(stats.resolve.resolved),
+          static_cast<unsigned long long>(stats.resolve.considered));
+    }
+    return 0u;
+  }
+
+  m_war3SemanticSceneLastSuccessfulSubmitFrameSerial =
+      m_war3ShadowPersistentFrameSerial;
+  m_war3SemanticSceneLastSuccessfulSubmitPublishRevision =
+      frame->sourcePublishRevision;
+  m_war3SemanticSceneLastReusableFrame = frame;
+  m_war3SemanticSceneLastSuccessfulSubmitUnitsOnly = unitsOnly;
+  m_war3SemanticSceneLastSuccessfulSubmitNativeValidation =
+      executeNativeBackendValidation && nativeExecuted;
+  m_war3SemanticSceneLastReusableUnitsOnly = unitsOnly;
+  m_war3SemanticSceneLastReusableNativeValidation =
+      executeNativeBackendValidation && nativeExecuted;
+  m_war3SemanticSceneLastSuccessfulSubmitComplete = semanticSubmitComplete;
+  m_war3SemanticSceneLastZeroSubmitFrameSerial = 0u;
+  m_war3SemanticSceneLastZeroSubmitPublishRevision = 0u;
+
+  static std::atomic<uint32_t> s_nonZeroSubmitLogCount{0u};
+  const uint32_t logIndex =
+      s_nonZeroSubmitLogCount.fetch_add(1u, std::memory_order_relaxed);
+  if (logIndex < 3u) {
+    war3dbg::Print(
+        "DXVK War3Shadow: semantic scene submitted draws unitsOnly=%d "
+        "submitted=%u frameSerial=%llu sourceResolved=%llu\n",
+        unitsOnly ? 1 : 0, submitted,
+        static_cast<unsigned long long>(frame->frameSerial),
+        static_cast<unsigned long long>(stats.resolve.resolved));
+  }
+
+  if (nativeExecuted) {
+    static std::atomic<uint32_t> s_nativeExecutedLogCount{0u};
+    const uint32_t nativeLogIndex =
+        s_nativeExecutedLogCount.fetch_add(1u, std::memory_order_relaxed);
+    if (nativeLogIndex < 3u || (nativeLogIndex % 300u) == 0u) {
+      WAR3_RENDER_LOG(
+          "DXVK War3Shadow: host validation executed native backend draws "
+          "unitsOnly=%d submitted=%u\n",
+          unitsOnly ? 1 : 0, submitted);
+    }
+  }
+
+  War3Hook::MaybeInstallNativeRendererTakeover(
+      unitsOnly ? "semantic-shadow-units-warm" : "semantic-shadow-scene-warm");
+
+  static uint32_t s_logCount = 0u;
+  if (unitsOnly) {
+    uint32_t prunedFallbacks = 0u;
+    uint32_t prunedByHandle = 0u;
+    uint32_t prunedByWorldObjectEntry = 0u;
+    uint32_t prunedBySceneNode = 0u;
+    uint32_t prunedByRuntimeModel = 0u;
+    auto newEnd = std::remove_if(
+        m_war3Scene.shadowFallbacks.begin(), m_war3Scene.shadowFallbacks.end(),
+        [&](const War3ShadowFallbackDraw& fallback) {
+          const bool matchesHandle =
+              fallback.normalizedHandle != 0u &&
+              m_war3SemanticDxvkBackend.submittedHandles().find(
+                  fallback.normalizedHandle) !=
+                  m_war3SemanticDxvkBackend.submittedHandles().end();
+          const bool matchesWorldObjectEntry =
+              fallback.worldObjectEntry != nullptr &&
+              m_war3SemanticDxvkBackend.submittedWorldObjectEntries().find(
+                  fallback.worldObjectEntry) !=
+                  m_war3SemanticDxvkBackend.submittedWorldObjectEntries().end();
+          const bool matchesSceneNode =
+              fallback.sceneNode != nullptr &&
+              m_war3SemanticDxvkBackend.submittedSceneNodes().find(
+                  fallback.sceneNode) !=
+                  m_war3SemanticDxvkBackend.submittedSceneNodes().end();
+          const bool matchesRuntimeModel =
+              fallback.runtimeModelPtr != nullptr &&
+              m_war3SemanticDxvkBackend.submittedRuntimeModels().find(
+                  fallback.runtimeModelPtr) !=
+                  m_war3SemanticDxvkBackend.submittedRuntimeModels().end();
+
+          if (!matchesHandle && !matchesWorldObjectEntry && !matchesSceneNode &&
+              !matchesRuntimeModel)
+            return false;
+
+          // unitsOnly 模式下，semantic scene 只会提交单位语义包。
+          // 因此凡是和已提交语义对象在 handle/worldObject/scene/runtimeModel
+          // 任一维度上对齐的 legacy fallback，都视为过期重复项并直接剔除，
+          // 避免“新 semantic 单位阴影 + 旧 fallback 单位阴影”双写成静态重影。
+
+          prunedFallbacks++;
+          if (matchesHandle)
+            prunedByHandle++;
+          if (matchesWorldObjectEntry)
+            prunedByWorldObjectEntry++;
+          if (matchesSceneNode)
+            prunedBySceneNode++;
+          if (matchesRuntimeModel)
+            prunedByRuntimeModel++;
+          return true;
+        });
+    m_war3Scene.shadowFallbacks.erase(newEnd, m_war3Scene.shadowFallbacks.end());
+    War3RecomputeFallbackBreakdown(m_war3Scene);
+    m_war3Scene.shadowStats.semanticFallbackPruned += prunedFallbacks;
+    m_war3Scene.shadowStats.semanticFallbackPrunedByHandle += prunedByHandle;
+    m_war3Scene.shadowStats.semanticFallbackPrunedByWorldObjectEntry +=
+        prunedByWorldObjectEntry;
+    m_war3Scene.shadowStats.semanticFallbackPrunedBySceneNode +=
+        prunedBySceneNode;
+    m_war3Scene.shadowStats.semanticFallbackPrunedByRuntimeModel +=
+        prunedByRuntimeModel;
+
+    if (prunedFallbacks != 0u &&
+        (s_logCount < 12u || (s_logCount % 300u) == 0u)) {
+      WAR3_RENDER_LOG(
+          "DXVK SemanticShadow: fallback prune submitted=%u pruned=%u "
+          "byHandle=%u byEntry=%u byScene=%u byRuntime=%u\n",
+          static_cast<unsigned>(submitted), static_cast<unsigned>(prunedFallbacks),
+          static_cast<unsigned>(prunedByHandle),
+          static_cast<unsigned>(prunedByWorldObjectEntry),
+          static_cast<unsigned>(prunedBySceneNode),
+          static_cast<unsigned>(prunedByRuntimeModel));
+    }
+  }
+
+  if (s_logCount < 12u || (s_logCount % 300u) == 0u) {
+    WAR3_RENDER_LOG(
+        "DXVK SemanticShadow: scene submit frame=%llu submitted=%u "
+        "unitsOnly=%d coreResolved=%llu coreSubmitted=%llu\n",
+        static_cast<unsigned long long>(frame->frameSerial),
+        static_cast<unsigned>(submitted), unitsOnly ? 1 : 0,
+        static_cast<unsigned long long>(stats.resolve.resolved),
+        static_cast<unsigned long long>(stats.submittedDrawCount));
+  }
+  s_logCount++;
+  return submitted;
+}
+
+bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
+    bool unitsOnly,
+    bool executeNativeBackendValidation) {
+  if (!War3SemanticConsumerEnabled() ||
+      !dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled())
+    return false;
+
+  if (m_war3Pipeline == nullptr || m_shadowReceiverPass == nullptr ||
+      !m_war3Pipeline->WantsBeforeUiInsertion()) {
+    return false;
+  }
+
+  const uint32_t submitted = War3TryPopulateSemanticShadowScene(
+      unitsOnly, executeNativeBackendValidation);
+  dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
+  if (submitted == 0u && m_war3Scene.shadowCasters.empty() &&
+      m_war3Scene.shadowFallbacks.empty()) {
+    return false;
+  }
+
+  War3PipelineInput input;
+  auto rt0 = m_war3LastWorldRt0 != nullptr ? m_war3LastWorldRt0
+                                           : m_state.renderTargets[0];
+  if (rt0 == nullptr)
+    return false;
+  input.colorView = rt0->GetRenderTargetView(false);
+
+  auto ds =
+      m_war3LastWorldDs != nullptr ? m_war3LastWorldDs : m_state.depthStencil;
+  if (ds != nullptr)
+    input.depthView = ds->GetDepthStencilView(true);
+
+  input.scene = std::move(m_war3Scene);
+  m_war3Scene = War3FrameScene{};
+  m_war3ShadowPaletteHashIndex.clear();
+  m_war3SemanticPaletteCache.clear();
+  m_war3Scene.shadowPersistentPool.bytesCap =
+      War3GetShadowPersistentPoolCapBytes();
+  m_war3Scene.shadowPersistentPool.bytesUsed =
+      m_war3ShadowPersistentBytesUsed;
+  m_war3Scene.shadowPersistentPool.bytesEvicted =
+      m_war3ShadowPersistentBytesEvicted;
+  m_war3Scene.shadowPersistentPool.liveGeometryCount =
+      static_cast<uint32_t>(m_war3ShadowPersistentGeometries.size());
+  m_war3Scene.shadowStats.persistentPoolBytesUsed =
+      m_war3ShadowPersistentBytesUsed;
+  m_war3Scene.shadowStats.persistentPoolBytesEvicted =
+      m_war3ShadowPersistentBytesEvicted;
+  m_war3Scene.shadowStats.fallbackBudgetBytes =
+      m_war3ShadowFallbackBudgetCapBytes;
+  m_war3Scene.shadowStats.fallbackBudgetUsedBytes =
+      m_war3ShadowFallbackBudgetUsedBytes;
+  m_war3Scene.shadowStats.fallbackArenaBytes =
+      dxvk::war3::memory::ShadowArena_UsedBytes();
+  War3ResetShadowAllocator();
+
+  if (!input.scene.worldCamera.valid && m_war3LastGoodCamera.valid)
+    input.scene.worldCamera = m_war3LastGoodCamera;
+  input.settings = &m_war3Pipeline->GetSettings();
+  input.frameIndex = m_war3FrameIndex;
+
+  EmitCs([this, cInput = std::move(input)](DxvkContext *ctx) mutable {
+    Rc<DxvkCommandList> cmd;
+    {
+      auto externalScope = war3::War3PerfMonitor::instance().cpuScope(
+          "War3Pipeline/SemanticValidation/BeginExternalRendering");
+      cmd = ctx->beginExternalRendering();
+    }
+    if (m_shadowReceiverPass != nullptr) {
+      auto executeScope = war3::War3PerfMonitor::instance().cpuScope(
+          "War3Pipeline/SemanticValidation/RunReceiver");
+      m_shadowReceiverPass->Run(cmd, cInput);
+    }
+  });
+
+  m_dirty.set(D3D9DeviceDirtyFlag::Framebuffer);
+  m_dirty.set(D3D9DeviceDirtyFlag::ViewportScissor);
+  m_dirty.set(D3D9DeviceDirtyFlag::DepthStencilState);
+  m_dirty.set(D3D9DeviceDirtyFlag::BlendState);
+  m_dirty.set(D3D9DeviceDirtyFlag::RasterizerState);
+  EmitCs([](DxvkContext *ctx) {
+    DxvkViewport dummyVP = {};
+    dummyVP.viewport.width = 1.0f;
+    dummyVP.viewport.height = 1.0f;
+    dummyVP.scissor.extent = {1, 1};
+    ctx->setViewports(1, &dummyVP);
+  });
+  BindViewportAndScissor();
+  m_dirty.set(D3D9DeviceDirtyFlag::DepthBias);
+  m_dirty.set(D3D9DeviceDirtyFlag::AlphaTestState);
+  m_dirty.set(D3D9DeviceDirtyFlag::InputLayout);
+  m_dirty.set(D3D9DeviceDirtyFlag::VertexBuffers);
+  m_dirty.set(D3D9DeviceDirtyFlag::IndexBuffer);
+  m_dirty.set(D3D9DeviceDirtyFlag::FFViewport);
+  m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
+  m_dirty.set(D3D9DeviceDirtyFlag::FFPixelData);
   return true;
 }
 
@@ -5577,12 +9253,14 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitive(
   }
 
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
-    WAR3_RENDER_LOG("ShadowPass: DrawIndexedPrimitive type=%d count=%u\n",
-                    static_cast<int>(PrimitiveType), PrimitiveCount);
-    if (m_state.vertexShader != nullptr)
-      WAR3_RENDER_LOG("ShadowPass WARNING: Real Vertex Shader is NOT NULL!\n");
-    if (m_state.pixelShader != nullptr)
-      WAR3_RENDER_LOG("ShadowPass WARNING: Real Pixel Shader is NOT NULL!\n");
+    if (War3ShadowPassTraceEnabled()) {
+      WAR3_RENDER_LOG("ShadowPass: DrawIndexedPrimitive type=%d count=%u\n",
+                      static_cast<int>(PrimitiveType), PrimitiveCount);
+      if (m_state.vertexShader != nullptr)
+        WAR3_RENDER_LOG("ShadowPass WARNING: Real Vertex Shader is NOT NULL!\n");
+      if (m_state.pixelShader != nullptr)
+        WAR3_RENDER_LOG("ShadowPass WARNING: Real Pixel Shader is NOT NULL!\n");
+    }
   }
 
   EmitCs([this, cPrimType = PrimitiveType, cPrimCount = PrimitiveCount,
@@ -6187,8 +9865,10 @@ D3D9DeviceEx::SetVertexShader(IDirect3DVertexShader9 *pShader) {
 
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
     m_shadowFakeVS = pShader;
-    WAR3_RENDER_LOG("ShadowPass: SetVertexShader intercepted ptr=%p\n",
-                    pShader);
+    if (War3ShadowPassTraceEnabled()) {
+      WAR3_RENDER_LOG("ShadowPass: SetVertexShader intercepted ptr=%p\n",
+                      pShader);
+    }
     return D3D_OK;
   }
 
@@ -6271,8 +9951,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetVertexShaderConstantF(
   }
 
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
-    WAR3_RENDER_LOG("ShadowPass: SetVSConstF Start=%u Count=%u\n",
-                    StartRegister, Vector4fCount);
+    if (War3ShadowPassTraceEnabled()) {
+      WAR3_RENDER_LOG("ShadowPass: SetVSConstF Start=%u Count=%u\n",
+                      StartRegister, Vector4fCount);
+    }
   }
 
   return SetShaderConstants<DxsoProgramTypes::VertexShader,
@@ -6334,8 +10016,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetStreamSource(
     return D3DERR_INVALIDCALL;
 
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
-    WAR3_RENDER_LOG("ShadowPass: SetStreamSource stream=%u ptr=%p\n",
-                    static_cast<unsigned>(StreamNumber), pStreamData);
+    if (War3ShadowPassTraceEnabled()) {
+      WAR3_RENDER_LOG("ShadowPass: SetStreamSource stream=%u ptr=%p\n",
+                      static_cast<unsigned>(StreamNumber), pStreamData);
+    }
   }
 
   D3D9VertexBuffer *buffer = static_cast<D3D9VertexBuffer *>(pStreamData);
@@ -6466,7 +10150,8 @@ D3D9DeviceEx::SetIndices(IDirect3DIndexBuffer9 *pIndexData) {
   D3D9DeviceLock lock = LockDevice();
 
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
-    WAR3_RENDER_LOG("ShadowPass: SetIndices ptr=%p\n", pIndexData);
+    if (War3ShadowPassTraceEnabled())
+      WAR3_RENDER_LOG("ShadowPass: SetIndices ptr=%p\n", pIndexData);
   }
 
   D3D9IndexBuffer *buffer = static_cast<D3D9IndexBuffer *>(pIndexData);
@@ -6531,7 +10216,9 @@ D3D9DeviceEx::SetPixelShader(IDirect3DPixelShader9 *pShader) {
 
   if (unlikely(dxvk::War3Hook::IsInShadowPass())) {
     m_shadowFakePS = pShader;
-    WAR3_RENDER_LOG("ShadowPass: SetPixelShader intercepted ptr=%p\n", pShader);
+    if (War3ShadowPassTraceEnabled()) {
+      WAR3_RENDER_LOG("ShadowPass: SetPixelShader intercepted ptr=%p\n", pShader);
+    }
     return D3D_OK;
   }
 
@@ -6881,20 +10568,32 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
   War3RenderState::OnFrameStart();
   const bool wantsShadowCapture =
       m_war3Pipeline && m_war3Pipeline->WantsShadowCapture();
+  const bool wantsSemanticSceneIdentity =
+      War3SemanticConsumerEnabled() &&
+      dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled();
   bool wantsShadowObjectIdentity =
-      wantsShadowCapture && dxvk::war3::internal::kShadowRuntimeBridgeEnabled;
+      (wantsShadowCapture || wantsSemanticSceneIdentity) &&
+      dxvk::war3::internal::kShadowRuntimeBridgeEnabled;
   bool wantsShadowFallbackBridge =
       wantsShadowCapture && dxvk::war3::internal::kShadowRuntimeBridgeEnabled;
-  if (wantsShadowCapture &&
+  if ((wantsShadowCapture || wantsSemanticSceneIdentity) &&
       dxvk::war3::internal::kShadowRuntimeBridgeEnabled) {
     const auto trackingDecision =
         dxvk::war3::render::ComputeShadowRuntimeBridgeTracking();
     wantsShadowObjectIdentity = trackingDecision.wantsObjectIdentity;
-    wantsShadowFallbackBridge = trackingDecision.wantsFallbackBridge;
+    wantsShadowFallbackBridge =
+        wantsShadowCapture && trackingDecision.wantsFallbackBridge;
+  }
+  if (wantsSemanticSceneIdentity &&
+      dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly) {
+    wantsShadowObjectIdentity = true;
   }
   War3RenderState::SetShadowObjectIdentityTrackingEnabled(
       wantsShadowObjectIdentity);
   War3RenderState::SetShadowDrawFallbackBridgeEnabled(
+      wantsShadowFallbackBridge);
+  War3RenderState::SetShadowSemanticTrackingEnabled(
+      wantsSemanticSceneIdentity || wantsShadowObjectIdentity ||
       wantsShadowFallbackBridge);
   bool needsTracking = false;
   {
@@ -6931,6 +10630,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     dxvk::war3::memory::StormHook_PrintPeriodicReport();
   // m_shadowDataPool.newFrame();
   m_war3Scene = War3FrameScene{};
+  m_war3ShadowPaletteHashIndex.clear();
+  m_war3SemanticPaletteCache.clear();
   m_war3ShadowPersistentFrameSerial++;
   War3GcShadowPersistentGeometry(false);
   m_war3ShadowFallbackBudgetCapBytes = War3GetShadowFallbackBudgetCapBytes();
@@ -12440,6 +16141,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     UINT NumVertices, UINT StartVal, UINT CountVal, bool indexed,
     bool DynamicSysmemVBOs, bool DynamicSysmemIBO) {
 
+  if (war3::runtime::IsWar3RuntimeModuleDisabled(
+          war3::runtime::War3RuntimeModule::ShadowCapture))
+    return;
+
   const int stage = War3RenderState::GetStage();
   const auto layer = War3RenderState::CurrentLayer();
   const auto cat = War3RenderState::GetStageCategory();
@@ -12474,6 +16179,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
   if (dxvk::war3::internal::kNativeShadowDisableShadowCaptureWhenMode1 &&
       War3RenderState::GetNativeShadowMode() >= 1u) {
+    return;
+  }
+
+  // DXVK semantic scene submission is the active object-shadow producer in the
+  // new path. Keeping the old draw-time ShadowCapture hook alive here means we
+  // still walk VB/IB/state recovery for every draw even when its output is
+  // intentionally not consumed. Disable that legacy capture surface under the
+  // semantic preview runtime gate; the receiver/shadow-map passes still consume
+  // the semantic packets submitted later in the frame.
+  if (War3SemanticConsumerEnabled() &&
+      dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() &&
+      dxvk::war3::internal::
+          IsSemanticSceneDisableLegacyShadowCaptureRuntimeEnabled()) {
+    War3TryPublishSemanticDrawTimePose();
     return;
   }
 
@@ -12592,6 +16311,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   const bool hasSemanticBridgeContext =
       shadowSemantic.HasAnyContext() || objectCasterByCurrentObj ||
       (needsSemanticContext && semantic.HasStableIdentity());
+  auto noteSemanticSceneBypassCandidate = [&]() {
+    m_war3Scene.shadowStats.semanticBridgeBypassed++;
+    m_war3Scene.shadowStats.semanticSceneBypassUnitLikeCount++;
+    if (semantic.runtimeModelPtr != nullptr)
+      m_war3Scene.shadowStats.semanticSceneBypassUnitLikeWithRuntimeModel++;
+    if (semantic.modelResourcePtr != nullptr || semantic.modelKey != 0u)
+      m_war3Scene.shadowStats.semanticSceneBypassUnitLikeWithModelResource++;
+    if (semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
+        semantic.poseMatrixCount != 0u)
+      m_war3Scene.shadowStats.semanticSceneBypassUnitLikeWithPose++;
+    if (semantic.renderablePart != nullptr || semantic.sceneNode != nullptr ||
+        semantic.worldObjectEntry != nullptr)
+      m_war3Scene.shadowStats.semanticSceneBypassUnitLikeWithRenderable++;
+    if (War3PublishSemanticSceneBypassCandidate(semantic, currentObj))
+      m_war3Scene.shadowStats.semanticSceneBypassPublishedVisibleCandidate++;
+    else
+      m_war3Scene.shadowStats.semanticSceneBypassPublishMiss++;
+  };
 
   if (objectCaster) {
     if (hasSemanticBridgeContext)
@@ -12640,6 +16377,22 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     return;
   }
   m_war3Scene.shadowStats.considered++;
+
+  const bool earlySemanticSceneUnitLikeCandidate =
+      War3SemanticConsumerEnabled() &&
+      dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() &&
+      dxvk::war3::internal::
+          IsSemanticSceneBypassLegacyUnitCaptureRuntimeEnabled() &&
+      dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly &&
+      !terrainCaster &&
+      (semantic.objectKind == dxvk::war3::render::ObjectKind::Unit ||
+       (currentObj != nullptr &&
+        currentObj->kind == dxvk::war3::render::ObjectKind::Unit) ||
+       ((cat == War3RenderState::StageCategory::WorldObject) && stage == 11));
+  if (earlySemanticSceneUnitLikeCandidate) {
+    noteSemanticSceneBypassCandidate();
+    return;
+  }
 
   const bool zTestEnabled = (m_state.renderStates[D3DRS_ZENABLE] != FALSE) &&
                             (m_state.depthStencil != nullptr);
@@ -12950,50 +16703,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
   }
 
-  if (vertexBlendEnabled && semantic.runtimeModelPtr != nullptr &&
-      semantic.objectKind != dxvk::war3::render::ObjectKind::Unit) {
+  if (vertexBlendEnabled && semantic.runtimeModelPtr != nullptr) {
     dxvk::war3::model::PoseRecord posePaletteRecord = {};
     auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
     if (poseRegistry.findByRuntimeModel(semantic.runtimeModelPtr,
                                         posePaletteRecord) &&
         posePaletteRecord.matrixCount != 0 &&
         !posePaletteRecord.matrixPalette.empty()) {
-      War3ShadowMatrixPalette palette = {};
-      const uint32_t count = std::min<uint32_t>(
-          posePaletteRecord.matrixCount,
-          uint32_t(posePaletteRecord.matrixPalette.size()));
-      for (uint32_t i = 0; i < count && i < palette.worldMatrices.size(); ++i)
-        palette.worldMatrices[i] = posePaletteRecord.matrixPalette[i];
-
-      uint64_t h = bit::fnv1a_init();
-      h = bit::fnv1a_iter(h, count);
-      for (uint32_t i = 0; i < count && i < palette.worldMatrices.size(); ++i) {
-        const Matrix4& m = palette.worldMatrices[i];
-        for (uint32_t r = 0; r < 4; ++r) {
-          for (uint32_t c = 0; c < 4; ++c)
-            h = bit::fnv1a_iter(h, bit::cast<uint32_t>(m[r][c]));
-        }
-      }
-      palette.hash = h;
-
-      const size_t bytes = sizeof(Matrix4) * palette.worldMatrices.size();
-      bool foundExisting = false;
-      for (uint32_t idx = 0; idx < m_war3Scene.shadowPalettes.size(); ++idx) {
-        auto& existing = m_war3Scene.shadowPalettes[idx];
-        if (existing.hash != palette.hash)
-          continue;
-        if (std::memcmp(existing.worldMatrices.data(),
-                        palette.worldMatrices.data(), bytes) == 0) {
-          paletteIndex = idx;
-          foundExisting = true;
-          break;
-        }
-      }
-
-      if (!foundExisting) {
-        m_war3Scene.shadowPalettes.emplace_back(std::move(palette));
-        paletteIndex = uint32_t(m_war3Scene.shadowPalettes.size() - 1);
-      }
+      // 旧的 legacy-freeze fallback 之前对 Unit 排除了 runtime palette
+      // 覆盖，结果就是“单位没进 upper-layer authoritative，又没吃到
+      // CModel 最终 pose palette”，阴影会直接缺失或姿态不对。
+      // 这里统一改成：只要拿得到 runtimeModel 的最终 palette，就优先用
+      // runtime pose，而不是继续依赖 FF vertex-blend 状态。
+      paletteIndex = War3GetOrCreateShadowMatrixPaletteFromData(
+          posePaletteRecord.matrixPalette.data(), posePaletteRecord.matrixCount);
     }
   }
 
@@ -13077,12 +16800,31 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
        nativeHint.objectKind == dxvk::war3::render::ObjectKind::Effect);
   const bool forceFreezeUnitLikeOrHint = forceFreezeUnitLikeGeometry ||
                                          nativeHintUnitLike;
-  const bool unitLikeObject =
+  const bool semanticSceneUnitLikeCandidate =
       resolvedObjectKind ==
           static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit) ||
       semantic.objectKind == dxvk::war3::render::ObjectKind::Unit ||
       nativeHintUnitLike ||
-      (semantic.runtimeModelPtr != nullptr && objectCaster);
+      (semantic.runtimeModelPtr != nullptr &&
+       (objectCaster || vertexBlendEnabled || vbIndexed || stage == 11 ||
+        semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
+        semantic.poseMatrixCount != 0u));
+  const bool unitLikeObject = semanticSceneUnitLikeCandidate;
+  const bool semanticSceneOwnsUnitCapture =
+      War3SemanticConsumerEnabled() &&
+      dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() &&
+      dxvk::war3::internal::
+          IsSemanticSceneBypassLegacyUnitCaptureRuntimeEnabled() &&
+      dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly &&
+      semanticSceneUnitLikeCandidate &&
+      (objectCaster || stage == 11 || nativeHintUnitLike ||
+       vertexBlendEnabled || vbIndexed || semantic.runtimeModelPtr != nullptr ||
+       semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
+       semantic.poseMatrixCount != 0u);
+  if (semanticSceneOwnsUnitCapture) {
+    noteSemanticSceneBypassCandidate();
+    return;
+  }
   const bool poseDrivenOrVertexBlendGeometry =
       vertexBlendEnabled || vbIndexed || semantic.runtimeModelPtr != nullptr ||
       semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
@@ -13153,6 +16895,27 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.batchHandle = batchHandle;
     draw.objectKind = resolvedObjectKind;
 
+    const bool dynamicUnitLikeNoCull =
+        unitLikeObject &&
+        (draw.vertexBlendEnabled || semantic.runtimeModelPtr != nullptr ||
+         semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
+         semantic.poseMatrixCount != 0u);
+    if (dynamicUnitLikeNoCull) {
+      const Matrix4* boundsMatrix = &draw.worldMatrix;
+      if (draw.vertexBlendEnabled &&
+          draw.paletteIndex < m_war3Scene.shadowPalettes.size()) {
+        boundsMatrix = &m_war3Scene.shadowPalettes[draw.paletteIndex].worldMatrices[0];
+      }
+      draw.boundsCenter = War3SemanticBoundsTranslation(*boundsMatrix);
+      float baseRadius = War3SemanticBoundsRadiusForObjectKind(draw.objectKind);
+      if (baseRadius <= 0.0f)
+        baseRadius = 260.0f;
+      if (hasNativeHint && nativeHint.radiusHint > baseRadius)
+        baseRadius = nativeHint.radiusHint;
+      draw.boundsRadius = baseRadius * War3SemanticBoundsMaxScale(*boundsMatrix);
+      return;
+    }
+
     if (draw.category == War3RenderState::StageCategory::WorldObject ||
         draw.category == War3RenderState::StageCategory::Effect) {
       float baseRadius = 0.0f;
@@ -13205,6 +16968,383 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       }
     }
   };
+
+  auto tryCaptureUpperLayerShadow = [&]() -> bool {
+    if (!dxvk::war3::internal::kUpperLayerShadowConsumerEnabled || !objectCaster)
+      return false;
+
+    dxvk::war3::render::UpperLayerShadowResolvedItem upperItem = {};
+    auto &upperRegistry = dxvk::war3::render::UpperLayerShadowRegistry::instance();
+    if (!upperRegistry.resolve(semantic, upperItem))
+      return false;
+
+    const bool authoritativeRigid = upperItem.HasAuthoritativeRigidPath();
+    const bool authoritativeSkinned = upperItem.HasAuthoritativeSkinnedPath();
+    if (!authoritativeRigid && !authoritativeSkinned)
+      return false;
+
+    if (dxvk::war3::internal::kUpperLayerShadowConsumerObserveOnly)
+      return false;
+
+    const uint32_t vertexCount = std::min<uint32_t>(
+        upperItem.geoset.vertexCount,
+        uint32_t(upperItem.geoset.positions.size() / 3u));
+    if (vertexCount == 0u)
+      return false;
+    const bool useIndices = !upperItem.geoset.indices.empty();
+    bool resolvedAlphaTest = captureAlphaTest;
+    if (resolvedAlphaTest) {
+      const bool hasUvLayer =
+          !upperItem.geoset.uvLayers.empty() &&
+          !upperItem.geoset.uvLayers[0].uvPairs.empty() &&
+          upperItem.geoset.uvLayers[0].uvPairs.size() >=
+              size_t(vertexCount) * 2u &&
+          diffuseTexView != nullptr;
+      if (!hasUvLayer) {
+        resolvedAlphaTest = false;
+      }
+    }
+
+    uint32_t upperPaletteIndex = 0u;
+    std::vector<std::array<uint8_t, 4>> blendIndices;
+    if (authoritativeSkinned) {
+      if (upperItem.runtimeGroupPalette.empty() ||
+          upperItem.runtimeGroupPalette.size() > 256u ||
+          upperItem.maxVertexGroupSlot >= upperItem.runtimeGroupPalette.size()) {
+        return false;
+      }
+
+      upperPaletteIndex = War3GetOrCreateShadowMatrixPaletteFromData(
+          upperItem.runtimeGroupPalette.data(),
+          uint32_t(upperItem.runtimeGroupPalette.size()));
+
+      if (upperItem.geoset.vertexGroupIndices.size() < size_t(vertexCount))
+        return false;
+
+      blendIndices.resize(vertexCount);
+      for (uint32_t i = 0; i < vertexCount; ++i) {
+        const uint32_t groupSlot = upperItem.geoset.vertexGroupIndices[i];
+        if (groupSlot >= upperItem.runtimeGroupPalette.size() ||
+            groupSlot >= 256u) {
+          return false;
+        }
+
+        blendIndices[i] = {uint8_t(groupSlot), 0u, 0u, 0u};
+      }
+    }
+
+    if (!upperRegistry.tryMarkEmitted(upperItem))
+      return true;
+
+    auto computeUpperLocalBounds =
+        [&](Vector4 &outCenter, float &outRadius) {
+          outCenter = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+          outRadius = 0.0f;
+          if (upperItem.geoset.positions.size() < 3u)
+            return;
+
+          float minX = upperItem.geoset.positions[0];
+          float minY = upperItem.geoset.positions[1];
+          float minZ = upperItem.geoset.positions[2];
+          float maxX = minX;
+          float maxY = minY;
+          float maxZ = minZ;
+
+          for (uint32_t i = 0; i < vertexCount; ++i) {
+            const size_t base = size_t(i) * 3u;
+            const float x = upperItem.geoset.positions[base + 0u];
+            const float y = upperItem.geoset.positions[base + 1u];
+            const float z = upperItem.geoset.positions[base + 2u];
+            minX = std::min(minX, x);
+            minY = std::min(minY, y);
+            minZ = std::min(minZ, z);
+            maxX = std::max(maxX, x);
+            maxY = std::max(maxY, y);
+            maxZ = std::max(maxZ, z);
+          }
+
+          outCenter = Vector4((minX + maxX) * 0.5f, (minY + maxY) * 0.5f,
+                              (minZ + maxZ) * 0.5f, 1.0f);
+          float radiusSq = 0.0f;
+          for (uint32_t i = 0; i < vertexCount; ++i) {
+            const size_t base = size_t(i) * 3u;
+            const float dx = upperItem.geoset.positions[base + 0u] - outCenter.x;
+            const float dy = upperItem.geoset.positions[base + 1u] - outCenter.y;
+            const float dz = upperItem.geoset.positions[base + 2u] - outCenter.z;
+            radiusSq = std::max(radiusSq, dx * dx + dy * dy + dz * dz);
+          }
+          outRadius = std::sqrt(radiusSq);
+        };
+
+    War3ShadowGeometryRegistryKey key = {};
+    key.sourceHash = bit::fnv1a_init();
+    key.sourceHash =
+        bit::fnv1a_iter(key.sourceHash, upperItem.geoset.contentHash);
+    key.sourceHash =
+        bit::fnv1a_iter(key.sourceHash, upperItem.visible.modelKey);
+    key.sourceHash = bit::fnv1a_iter(key.sourceHash,
+                                     uint64_t(upperItem.visible.geosetIndex));
+    key.sourceHash = bit::fnv1a_iter(
+        key.sourceHash,
+        reinterpret_cast<uintptr_t>(upperItem.visible.modelResourcePtr));
+    key.sourceHash = bit::fnv1a_iter(
+        key.sourceHash, reinterpret_cast<uintptr_t>(diffuseTexView.ptr()));
+    key.sourceHash = bit::fnv1a_iter(
+        key.sourceHash, uint32_t(m_state.renderStates[D3DRS_CULLMODE]));
+
+    key.layoutHash = bit::fnv1a_init();
+    key.layoutHash = bit::fnv1a_iter(key.layoutHash, uint32_t(useIndices ? 1u : 0u));
+    key.layoutHash = bit::fnv1a_iter(
+        key.layoutHash, uint32_t(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST));
+    key.layoutHash = bit::fnv1a_iter(key.layoutHash, uint32_t(sizeof(float) * 3u));
+    key.layoutHash = bit::fnv1a_iter(key.layoutHash,
+                                     uint32_t(VK_FORMAT_R32G32B32_SFLOAT));
+    key.layoutHash = bit::fnv1a_iter(key.layoutHash, uint32_t(vertexCount));
+    key.layoutHash = bit::fnv1a_iter(
+        key.layoutHash,
+        uint32_t(useIndices ? upperItem.geoset.indices.size() : 0u));
+    key.layoutHash = bit::fnv1a_iter(
+        key.layoutHash, uint32_t(authoritativeSkinned ? 1u : 0u));
+    key.layoutHash = bit::fnv1a_iter(
+        key.layoutHash,
+        uint32_t(authoritativeSkinned ? VK_FORMAT_R8G8B8A8_USCALED
+                                      : VK_FORMAT_UNDEFINED));
+    key.layoutHash = bit::fnv1a_iter(
+        key.layoutHash, uint32_t(resolvedAlphaTest ? 1u : 0u));
+    key.layoutHash = bit::fnv1a_iter(
+        key.layoutHash,
+        uint32_t(resolvedAlphaTest ? VK_FORMAT_R32G32_SFLOAT
+                                   : VK_FORMAT_UNDEFINED));
+    key.layoutHash = bit::fnv1a_iter(
+        key.layoutHash, bit::cast<uint32_t>(alphaRefFloat));
+    key.mode = authoritativeSkinned ? War3ShadowReplayMode::PaletteSkinnedFF
+                                    : War3ShadowReplayMode::FixedWorld;
+
+    War3ShadowPersistentGeometry candidate = {};
+    candidate.key = key;
+    candidate.indexed = useIndices;
+    candidate.positionStride = sizeof(float) * 3u;
+    candidate.positionOffset = 0u;
+    candidate.positionFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    candidate.indexType = VK_INDEX_TYPE_UINT16;
+    candidate.vertexBlendEnabled = authoritativeSkinned;
+    candidate.vertexBlendIndexed = authoritativeSkinned;
+    candidate.vertexBlendCount = 0u;
+    candidate.blendWeightOffset = 0u;
+    candidate.blendWeightFormat = VK_FORMAT_UNDEFINED;
+    candidate.blendIndexOffset = 0u;
+    candidate.blendIndexFormat = authoritativeSkinned ? VK_FORMAT_R8G8B8A8_USCALED
+                                                      : VK_FORMAT_UNDEFINED;
+    candidate.blendStride = authoritativeSkinned ? 4u : 0u;
+    candidate.blendBinding = authoritativeSkinned ? 1u : 0u;
+    candidate.alphaTestEnabled = resolvedAlphaTest;
+    candidate.alphaRef = alphaRefFloat;
+    candidate.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    candidate.indexCount =
+        useIndices ? uint32_t(upperItem.geoset.indices.size()) : 0u;
+    candidate.firstIndex = 0u;
+    candidate.vertexOffset = 0;
+    candidate.vertexCount = useIndices ? 0u : vertexCount;
+    candidate.firstVertex = 0u;
+    candidate.minVertexIndex = 0u;
+    candidate.numVertices = vertexCount;
+    candidate.uvStride = resolvedAlphaTest ? sizeof(float) * 2u : 0u;
+    candidate.uvOffset = 0u;
+    candidate.uvFormat = resolvedAlphaTest ? VK_FORMAT_R32G32_SFLOAT
+                                           : VK_FORMAT_UNDEFINED;
+    candidate.uvBinding = resolvedAlphaTest ? 2u : 0u;
+    candidate.diffuseTexture = diffuseTexView;
+    if (resolvedAlphaTest && candidate.diffuseTexture != nullptr &&
+        m_shadowReceiverPass != nullptr) {
+      bool alphaUseMip = false;
+      float alphaMipLodBias = 0.0f;
+      if (m_war3Pipeline) {
+        const auto &shadowSettings = m_war3Pipeline->GetSettings().shadows;
+        alphaUseMip = shadowSettings.alphaShadowUseMip;
+        alphaMipLodBias = shadowSettings.alphaShadowMipLodBias;
+      }
+      candidate.diffuseSampler =
+          m_shadowReceiverPass->getFallbackSampler(alphaUseMip, alphaMipLodBias);
+      if (candidate.diffuseSampler != nullptr)
+        candidate.diffuseSamplerIndex =
+            candidate.diffuseSampler->getDescriptor().samplerIndex;
+      candidate.textureDescriptor = *candidate.diffuseTexture->getDescriptor();
+    }
+    computeUpperLocalBounds(candidate.localBoundsCenter,
+                            candidate.localBoundsRadius);
+
+    std::array<War3ShadowPersistentUpload, 4> uploads = {};
+    uploads[0].hostData = upperItem.geoset.positions.data();
+    uploads[0].bytes =
+        VkDeviceSize(upperItem.geoset.positions.size() * sizeof(float));
+    uploads[0].usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    uploads[0].debugName = "War3UpperShadowPos";
+    if (useIndices) {
+      uploads[1].hostData = upperItem.geoset.indices.data();
+      uploads[1].bytes =
+          VkDeviceSize(upperItem.geoset.indices.size() * sizeof(uint16_t));
+      uploads[1].usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+      uploads[1].debugName = "War3UpperShadowIdx";
+    }
+    if (authoritativeSkinned && !blendIndices.empty()) {
+      uploads[2].hostData = blendIndices.data();
+      uploads[2].bytes =
+          VkDeviceSize(blendIndices.size() * sizeof(blendIndices[0]));
+      uploads[2].usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+      uploads[2].debugName = "War3UpperShadowBlend";
+    }
+    if (resolvedAlphaTest) {
+      const auto &uvLayer = upperItem.geoset.uvLayers[0];
+      uploads[3].hostData = uvLayer.uvPairs.data();
+      uploads[3].bytes = VkDeviceSize(size_t(vertexCount) * 2u * sizeof(float));
+      uploads[3].usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+      uploads[3].debugName = "War3UpperShadowUv";
+    }
+
+    uint32_t geometryId = 0u;
+    const War3ShadowPersistentGeometry *geometry = nullptr;
+    bool createdNewGeometry = false;
+    if (!War3FindOrCreateShadowPersistentGeometry(key, candidate, uploads,
+                                                  geometryId, geometry,
+                                                  createdNewGeometry) ||
+        geometry == nullptr) {
+      return false;
+    }
+
+    War3ShadowCasterDraw draw = {};
+    draw.indexed = geometry->indexed;
+    draw.positionStorage = geometry->positionStorage;
+    draw.positionInfo = geometry->positionInfo;
+    draw.positionStride = geometry->positionStride;
+    draw.positionOffset = geometry->positionOffset;
+    draw.positionFormat = geometry->positionFormat;
+    draw.topology = geometry->topology;
+    draw.worldMatrix = authoritativeSkinned ? Matrix4() : currentWorldMatrix;
+    draw.vertexBlendEnabled = geometry->vertexBlendEnabled;
+    draw.vertexBlendIndexed = geometry->vertexBlendIndexed;
+    draw.vertexBlendCount = geometry->vertexBlendCount;
+    draw.paletteIndex = upperPaletteIndex;
+    draw.blendWeightOffset = geometry->blendWeightOffset;
+    draw.blendWeightFormat = geometry->blendWeightFormat;
+    draw.blendIndexOffset = geometry->blendIndexOffset;
+    draw.blendIndexFormat = geometry->blendIndexFormat;
+    draw.blendBinding = geometry->blendBinding;
+    draw.blendStride = geometry->blendStride;
+    draw.alphaTestEnabled = geometry->alphaTestEnabled;
+    draw.alphaRef = geometry->alphaRef;
+    draw.alphaBlendEnabled = alphaBlend;
+    draw.depthWriteEnabled = zWriteEnabled;
+    draw.depthTestEnabled = zTestEnabled;
+    draw.additiveBlend = additiveBlend;
+    draw.uvStride = geometry->uvStride;
+    draw.uvOffset = geometry->uvOffset;
+    draw.uvFormat = geometry->uvFormat;
+    draw.diffuseTexture = geometry->diffuseTexture;
+    draw.diffuseSampler = geometry->diffuseSampler;
+    draw.textureDescriptor = geometry->textureDescriptor;
+    draw.diffuseSamplerIndex = geometry->diffuseSamplerIndex;
+    if (geometry->indexed) {
+      draw.indexStorage = geometry->indexStorage;
+      draw.indexInfo = geometry->indexInfo;
+      draw.indexType = geometry->indexType;
+      draw.indexCount = geometry->indexCount;
+      draw.firstIndex = geometry->firstIndex;
+      draw.vertexOffset = geometry->vertexOffset;
+      draw.vertexCount = 0u;
+      draw.firstVertex = 0u;
+      draw.minVertexIndex = geometry->minVertexIndex;
+      draw.numVertices = geometry->numVertices;
+    } else {
+      draw.indexCount = 0u;
+      draw.firstIndex = 0u;
+      draw.vertexOffset = 0;
+      draw.vertexCount = geometry->vertexCount;
+      draw.firstVertex = geometry->firstVertex;
+      draw.minVertexIndex = geometry->minVertexIndex;
+      draw.numVertices = geometry->numVertices;
+    }
+    if (geometry->blendBinding == 1) {
+      draw.blendStorage = geometry->blendStorage;
+      draw.blendInfo = geometry->blendInfo;
+    }
+    if (geometry->alphaTestEnabled && geometry->uvBinding == 2u) {
+      draw.uvStorage = geometry->uvStorage;
+      draw.uvInfo = geometry->uvInfo;
+    }
+
+    finalizeShadowDrawCommon(draw);
+
+    War3ShadowInstanceRef instance = {};
+    instance.geometryId = geometryId;
+    instance.materialId = 0u;
+    instance.replayDrawIndex =
+        static_cast<uint32_t>(m_war3Scene.shadowCasters.size());
+    instance.batchHandle = batchHandle;
+    instance.paletteIndex = draw.paletteIndex;
+    instance.worldMatrix = draw.worldMatrix;
+    instance.boundsCenter = draw.boundsCenter;
+    instance.boundsRadius = draw.boundsRadius;
+    instance.category = cat;
+    instance.batchTag = (execTag != War3BatchTag::Unknown) ? execTag : tag;
+    instance.objectKind = resolvedObjectKind;
+    instance.mode = key.mode;
+
+    if (authoritativeSkinned)
+      noteDynamicPoseUsage(true);
+
+    m_war3Scene.shadowInstances.emplace_back(std::move(instance));
+    m_war3Scene.shadowCasters.emplace_back(std::move(draw));
+    m_war3Scene.shadowStats.captured++;
+    if (useIndices)
+      m_war3Scene.shadowStats.capturedIndexed++;
+    else
+      m_war3Scene.shadowStats.capturedNonIndexed++;
+    if (objectCaster)
+      m_war3Scene.shadowStats.capturedWorldObject++;
+    if (resolvedObjectKind ==
+        static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit)) {
+      m_war3Scene.shadowStats.capturedUnitObject++;
+      if (authoritativeSkinned)
+        m_war3Scene.shadowStats.capturedUnitVertexBlend++;
+      m_war3Scene.shadowStats.persistentUnitInstanceCount++;
+    }
+    m_war3Scene.shadowStats.persistentInstanceCount++;
+    if (!objectCaster ||
+        resolvedObjectKind ==
+            static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Building) ||
+        resolvedObjectKind == static_cast<uint8_t>(
+                                  dxvk::war3::render::ObjectKind::Destructible)) {
+      m_war3Scene.shadowStats.staticPersistentCount++;
+    }
+    if (createdNewGeometry) {
+      m_war3Scene.shadowStats.persistentGeometryCount++;
+      m_war3Scene.shadowStats.uniqueGeometryCount++;
+      m_war3Scene.shadowPersistentPool.promotedThisFrame++;
+    } else {
+      m_war3Scene.shadowStats.duplicateGeometryInstances++;
+      m_war3Scene.shadowStats.reuseEligibleDuplicates++;
+      m_war3Scene.shadowStats.potentialFreezeReuseHits++;
+      m_war3Scene.shadowStats.instancedGeometryDrawsSaved++;
+    }
+    m_war3Scene.shadowPersistentPool.bytesUsed = m_war3ShadowPersistentBytesUsed;
+    m_war3Scene.shadowPersistentPool.bytesEvicted =
+        m_war3ShadowPersistentBytesEvicted;
+    m_war3Scene.shadowPersistentPool.liveGeometryCount =
+        static_cast<uint32_t>(m_war3ShadowPersistentGeometries.size());
+    m_war3Scene.shadowStats.persistentPoolBytesUsed =
+        m_war3ShadowPersistentBytesUsed;
+    m_war3Scene.shadowStats.persistentPoolBytesEvicted =
+        m_war3ShadowPersistentBytesEvicted;
+    return true;
+  };
+
+  if (tryCaptureUpperLayerShadow())
+    return;
+  if (dxvk::war3::internal::kUpperLayerShadowConsumerEnabled &&
+      dxvk::war3::internal::kUpperLayerShadowObjectNoCaptureFallbackEnabled &&
+      objectCaster) {
+    return;
+  }
 
   // Capture Resources
   static const bool s_freezeDynamicShadowBuffers =
@@ -13619,21 +17759,28 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     candidate.uvBinding = captureAlphaTest ? (uvSharedPos ? 0u : uvSharedBlend ? 1u : 2u) : 0u;
 
     std::array<War3ShadowPersistentUpload, 4> uploads = {};
-    uploads[0] = {posSlice, posBytesNeeded, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                  "War3ShadowPersistentPos"};
+    uploads[0].slice = posSlice;
+    uploads[0].bytes = posBytesNeeded;
+    uploads[0].usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    uploads[0].debugName = "War3ShadowPersistentPos";
     if (indexed) {
-      uploads[1] = {idxSlice, idxBytesNeeded, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                    "War3ShadowPersistentIdx"};
+      uploads[1].slice = idxSlice;
+      uploads[1].bytes = idxBytesNeeded;
+      uploads[1].usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+      uploads[1].debugName = "War3ShadowPersistentIdx";
     }
     if (blendBinding == 1) {
-      uploads[2] = {blendSlice, blendBytesNeeded,
-                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                    "War3ShadowPersistentBlend"};
+      uploads[2].slice = blendSlice;
+      uploads[2].bytes = blendBytesNeeded;
+      uploads[2].usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+      uploads[2].debugName = "War3ShadowPersistentBlend";
     }
     if (captureAlphaTest && !uvSharedPos && !uvSharedBlend && uvAlloc &&
         uvInfo.buffer != VK_NULL_HANDLE && uvInfo.size != 0) {
-      uploads[3] = {uvSlice, uvInfo.size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                    "War3ShadowPersistentUv"};
+      uploads[3].slice = uvSlice;
+      uploads[3].bytes = uvInfo.size;
+      uploads[3].usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+      uploads[3].debugName = "War3ShadowPersistentUv";
     }
 
     uint32_t geometryId = 0;
@@ -14372,9 +18519,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     m_war3Scene.shadowStats.forcedFallbackUnitFreezeCount++;
   }
   m_war3Scene.shadowFallbacks.push_back(
-      {draw, "legacy-freeze", War3ShadowReplayMode::SnapshotFallback});
+      {draw,
+       "legacy-freeze",
+       War3ShadowReplayMode::SnapshotFallback,
+       draw.batchHandle,
+       semantic.worldObjectEntry,
+       semantic.sceneNode,
+       semantic.runtimeModelPtr,
+       semantic.modelKey});
   m_war3Scene.shadowStats.fallbackSnapshotCount++;
-  m_war3Scene.shadowStats.fallbackDrawCount++;
+  War3RecomputeFallbackBreakdown(m_war3Scene);
   m_war3Scene.shadowStats.fallbackArenaBytes =
       dxvk::war3::memory::ShadowArena_UsedBytes();
   m_war3Scene.shadowCasters.emplace_back(std::move(draw));

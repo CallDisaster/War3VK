@@ -44,7 +44,7 @@ inline void Print(const char *fmt, ...) {
   std::fflush(stdout);
 }
 
-inline void InstallCrashHandlerOnce() {}
+void InstallCrashHandlerOnce();
 
 inline bool RenderLogEnabled() {
   static int s_cached = -1;

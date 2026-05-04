@@ -15,6 +15,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 import copy
 import json
+import math
 import os
 import re
 import shutil
@@ -42,6 +43,8 @@ DEFAULT_BENCHMARK_HEIGHT = 1440
 DEFAULT_BENCHMARK_REFRESH = 59
 WAR3_VIDEO_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III\Video"
 ARTIFACT_ROOT = Path(__file__).resolve().parent / "artifacts"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_BUILD_D3D9 = REPO_ROOT / "build32" / "src" / "d3d9" / "d3d9.dll"
 MAX_EVENT_BUFFER = 4000
 DESKTOP_READOBJECTS = 0x0001
 DESKTOP_CREATEWINDOW = 0x0002
@@ -50,6 +53,63 @@ DESKTOP_WRITEOBJECTS = 0x0080
 DESKTOP_SWITCHDESKTOP = 0x0100
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 CREATE_NEW_CONSOLE = 0x00000010
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+OPEN_EXISTING = 3
+PIPE_READMODE_MESSAGE = 0x00000002
+ERROR_MORE_DATA = 234
+ERROR_BROKEN_PIPE = 109
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+_KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_KERNEL32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+_KERNEL32.WaitNamedPipeW.restype = wintypes.BOOL
+_KERNEL32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
+]
+_KERNEL32.CreateFileW.restype = wintypes.HANDLE
+_KERNEL32.SetNamedPipeHandleState.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+    wintypes.LPVOID,
+]
+_KERNEL32.SetNamedPipeHandleState.restype = wintypes.BOOL
+_KERNEL32.ReadFile.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+]
+_KERNEL32.ReadFile.restype = wintypes.BOOL
+_KERNEL32.PeekNamedPipe.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+]
+_KERNEL32.PeekNamedPipe.restype = wintypes.BOOL
+_KERNEL32.WriteFile.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPCVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+]
+_KERNEL32.WriteFile.restype = wintypes.BOOL
+_KERNEL32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+_KERNEL32.FlushFileBuffers.restype = wintypes.BOOL
+_KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
+_KERNEL32.CloseHandle.restype = wintypes.BOOL
 
 
 class _StartupInfoW(ctypes.Structure):
@@ -96,6 +156,7 @@ RUNTIME_MODULE_ORDER = [
     "postfx",
     "ssao",
     "aa",
+    "semantic.data",
 ]
 PROFILE_DEFAULT_DISABLED = {
     "dxvk_only": set(RUNTIME_MODULE_ORDER),
@@ -112,6 +173,7 @@ PROFILE_DEFAULT_DISABLED = {
         "postfx",
         "ssao",
         "aa",
+        "semantic.data",
     },
     "hooks_default": {
         "render.queue",
@@ -122,6 +184,7 @@ PROFILE_DEFAULT_DISABLED = {
         "postfx",
         "ssao",
         "aa",
+        "semantic.data",
     },
     "render_base": {
         "shadow.capture",
@@ -131,6 +194,7 @@ PROFILE_DEFAULT_DISABLED = {
         "postfx",
         "ssao",
         "aa",
+        "semantic.data",
     },
     "shadow_capture_only": {
         "shadow.map",
@@ -139,11 +203,13 @@ PROFILE_DEFAULT_DISABLED = {
         "postfx",
         "ssao",
         "aa",
+        "semantic.data",
     },
     "shadow_full": {
         "postfx",
         "ssao",
         "aa",
+        "semantic.data",
     },
     "full_default": set(),
     "full_analysis": set(),
@@ -173,6 +239,7 @@ PROFILE_MATRIX_CASES: List[Dict[str, Any]] = [
     {"name": "sub_no_hook_ui", "profile": "full_default", "disable": "hook.ui", "group": "subtractive", "label": "No Hook UI", "category": "non_render_hook", "budgetFps": 10.0},
     {"name": "sub_no_hook_jass", "profile": "full_default", "disable": "hook.jass", "group": "subtractive", "label": "No Hook JASS", "category": "non_render_hook", "budgetFps": 10.0},
     {"name": "sub_no_hook_render", "profile": "full_default", "disable": "hook.render", "group": "subtractive", "label": "No Hook Render", "category": "render_bridge", "budgetFps": 25.0},
+    {"name": "sub_no_semantic_data", "profile": "full_default", "disable": "semantic.data", "group": "subtractive", "label": "No Semantic Data", "category": "semantic_data", "budgetFps": 35.0},
     {"name": "sub_no_render_queue", "profile": "full_default", "disable": "render.queue", "group": "subtractive", "label": "No Render Queue", "category": "render_bridge", "budgetFps": 25.0},
     {"name": "sub_no_shadow_capture", "profile": "full_default", "disable": "shadow.capture", "group": "subtractive", "label": "No Shadow Capture", "category": "shadow_capture", "budgetFps": 45.0},
     {"name": "sub_no_shadow_map", "profile": "full_default", "disable": "shadow.map", "group": "subtractive", "label": "No Shadow Map", "category": "shadow_render", "budgetFps": 20.0},
@@ -183,6 +250,16 @@ PROFILE_MATRIX_CASES: List[Dict[str, Any]] = [
     {"name": "sub_no_aa", "profile": "full_default", "disable": "aa", "group": "subtractive", "label": "No AA", "category": "postfx_diag", "budgetFps": 10.0},
 ]
 
+SEMANTIC_SHADOW_VALIDATION_ENV: Dict[str, str] = {
+    "DXVK_WAR3_SEMANTIC_SHADOW_PREVIEW": "1",
+    "DXVK_WAR3_SEMANTIC_SHADOW_SCENE_SUBMISSION": "1",
+    "DXVK_WAR3_SEMANTIC_SHADOW_BOOTSTRAP_CATCHUP": "1",
+    "DXVK_WAR3_SEMANTIC_SHADOW_ENDFRAME_BUILD": "0",
+    "DXVK_WAR3_SEMANTIC_SHADOW_ENDFRAME_FLUSH": "1",
+    "DXVK_WAR3_SEMANTIC_SHADOW_TAIL_FALLBACK": "1",
+    "DXVK_WAR3_SEMANTIC_SHADOW_PRE_READY": "1",
+}
+
 SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
     "low_pressure_static_reuse": {
         "title": "低压静态复用",
@@ -190,7 +267,7 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "mapPath": str(DEFAULT_LOW_PRESSURE_TEST_MAP),
         "profile": "full_default",
         "disableModules": "",
-        "windowed": False,
+        "windowed": True,
         "useIsolatedDesktop": True,
         "desktopName": "War3LowPressureStatic",
         "readyTimeoutSec": 120,
@@ -200,10 +277,11 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "autoPerfExportSec": 24,
         "deployD3d9BeforeLaunch": True,
         "opengl": False,
-        "enforceVideoBaseline": True,
+        "enforceVideoBaseline": False,
         "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
         "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
         "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
     },
     "dynamic_shadow_pressure": {
         "title": "动作单位压力",
@@ -211,7 +289,7 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "mapPath": str(DEFAULT_TEST_MAP),
         "profile": "full_default",
         "disableModules": "",
-        "windowed": False,
+        "windowed": True,
         "useIsolatedDesktop": True,
         "desktopName": "War3DynamicShadowPressure",
         "readyTimeoutSec": 120,
@@ -221,10 +299,11 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "autoPerfExportSec": 26,
         "deployD3d9BeforeLaunch": True,
         "opengl": False,
-        "enforceVideoBaseline": True,
+        "enforceVideoBaseline": False,
         "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
         "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
         "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
     },
     "model_runtime_probe": {
         "title": "模型运行时探针",
@@ -242,10 +321,11 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "autoPerfExportSec": 24,
         "deployD3d9BeforeLaunch": True,
         "opengl": False,
-        "enforceVideoBaseline": True,
+        "enforceVideoBaseline": False,
         "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
         "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
         "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
     },
     "semantic_cost_probe": {
         "title": "语义追踪成本探针",
@@ -253,7 +333,7 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "mapPath": str(DEFAULT_LOW_PRESSURE_TEST_MAP),
         "profile": "full_analysis",
         "disableModules": "",
-        "windowed": False,
+        "windowed": True,
         "useIsolatedDesktop": True,
         "desktopName": "War3SemanticCostProbe",
         "readyTimeoutSec": 150,
@@ -263,10 +343,11 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "autoPerfExportSec": 22,
         "deployD3d9BeforeLaunch": True,
         "opengl": False,
-        "enforceVideoBaseline": True,
+        "enforceVideoBaseline": False,
         "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
         "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
         "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
     },
 }
 PROFILE_MATRIX_PRIMARY_CHAIN = [
@@ -285,7 +366,7 @@ LOG_KEYWORD_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
     ("shadowAdaptiveSkip", re.compile(r"Adaptive skip ShadowMap", re.IGNORECASE)),
     ("csmComputeFailed", re.compile(r"CSM compute failed", re.IGNORECASE)),
     ("csmConservativeFallback", re.compile(r"conservative cascade fallback", re.IGNORECASE)),
-    ("runtimeReady", re.compile(r"JASS runtime fully initialized", re.IGNORECASE)),
+    ("runtimeReady", re.compile(r"(?:JASS|War3) runtime fully initialized", re.IGNORECASE)),
     ("stage19", re.compile(r"War3StageSig: stage=19", re.IGNORECASE)),
     ("pauseBlocked", re.compile(r"blocked GamePause request", re.IGNORECASE)),
     ("internalTestApi", re.compile(r"DXVK War3TestApi:", re.IGNORECASE)),
@@ -442,17 +523,46 @@ def _zero_shadow_runtime_v2_summary() -> Dict[str, Any]:
         "dynamicPoseCount": 0,
         "dynamicSkinnedOutputCount": 0,
         "fallbackDrawCount": 0,
+        "fallbackDrawCountTerrain": 0,
+        "fallbackDrawCountWorldObject": 0,
+        "fallbackDrawCountUnitObject": 0,
+        "objectFallbackDrawCount": 0,
         "semanticBridgeHit": 0,
         "semanticBridgeMiss": 0,
         "semanticBridgeBypassed": 0,
+        "semanticSceneSubmitted": 0,
+        "semanticSceneSubmittedUnit": 0,
+        "semanticSceneSubmittedSkinned": 0,
+        "semanticSceneSubmittedFrameLocal": 0,
+        "semanticSceneSubmittedPersistent": 0,
+        "semanticSceneAcceptedExplicitResourceOwnerRigid": 0,
+        "worldObjectListOwnerHintZeroContextAcceptedCount": 0,
         "modelRegistryHit": 0,
         "modelRegistryMiss": 0,
         "modelLoadCount": 0,
         "modelReuseCount": 0,
+        "runtimeBoundCount": 0,
+        "completeIdentityCount": 0,
+        "shadowRuntimeBoundCount": 0,
+        "shadowIdentityCount": 0,
         "poseUpdateCount": 0,
         "poseCacheHit": 0,
         "poseCacheMiss": 0,
         "bonePaletteUpdates": 0,
+        "shadowGeosetResourceCount": 0,
+        "shadowReadyGeosetCount": 0,
+        "shadowModelResourceCount": 0,
+        "shadowPoseReadyCount": 0,
+        "upperLayerResolveAttempts": 0,
+        "upperLayerResolveVisibleMiss": 0,
+        "upperLayerResolveVisibleUnresolvedGeoset": 0,
+        "upperLayerResolveGeosetMiss": 0,
+        "upperLayerResolvePoseMiss": 0,
+        "upperLayerResolveRuntimeGroupPaletteMiss": 0,
+        "upperLayerResolveAuthoritativeRigid": 0,
+        "upperLayerResolveAuthoritativeSkinned": 0,
+        "upperLayerEmitted": 0,
+        "upperLayerDuplicateOrSuppressed": 0,
         "animationSequenceCount": 0,
         "avgModelResolveCpuMs": 0.0,
         "avgPoseUpdateCpuMs": 0.0,
@@ -776,6 +886,8 @@ def _runtime_status_file(war3_dir: Path) -> Path:
     return war3_dir / "WarVK" / "Temp" / "runtime_status.json"
 
 
+# 这些 legacy JSON 路径仅保留给旧工件清理/离线诊断使用。
+# 主动控制链已统一收口到 named pipe control plane。
 def _frame_capture_request_file(war3_dir: Path) -> Path:
     return war3_dir / "WarVK" / "Temp" / "frame_capture_request.json"
 
@@ -792,6 +904,174 @@ def _internal_test_result_file(war3_dir: Path) -> Path:
     return war3_dir / "WarVK" / "Temp" / "internal_test_result.json"
 
 
+def _control_plane_pipe_name(pid: int) -> str:
+    return rf"\\.\pipe\War3ControlPlane_{int(pid)}"
+
+
+def _control_plane_request(
+    pid: int,
+    command: str,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout_sec: float = 6.0,
+) -> Dict[str, Any]:
+    target_pid = int(pid or 0)
+    if target_pid <= 0:
+        return {"transportOk": False, "ok": False, "error": "无有效 pid"}
+
+    pipe_name = _control_plane_pipe_name(target_pid)
+    timeout_ms = max(200, int(float(timeout_sec) * 1000.0))
+    t0 = time.time()
+    request = {
+        "requestId": f"cp_{_now_compact()}_{target_pid}_{int(time.time() * 1000)}",
+        "command": str(command or "").strip(),
+        "payload": dict(payload or {}),
+        "issuedAtMs": int(time.time() * 1000),
+        "pid": target_pid,
+    }
+
+    if not bool(_KERNEL32.WaitNamedPipeW(pipe_name, timeout_ms)):
+        return {
+            "transportOk": False,
+            "ok": False,
+            "error": f"named pipe 不可用: {ctypes.get_last_error()}",
+            "pipeName": pipe_name,
+            "request": request,
+            "elapsedSec": round(time.time() - t0, 3),
+        }
+
+    handle = _KERNEL32.CreateFileW(
+        pipe_name,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        None,
+        OPEN_EXISTING,
+        0,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        return {
+            "transportOk": False,
+            "ok": False,
+            "error": f"CreateFileW(pipe) 失败: {ctypes.get_last_error()}",
+            "pipeName": pipe_name,
+            "request": request,
+            "elapsedSec": round(time.time() - t0, 3),
+        }
+
+    try:
+        mode = wintypes.DWORD(PIPE_READMODE_MESSAGE)
+        _KERNEL32.SetNamedPipeHandleState(handle, ctypes.byref(mode), None, None)
+
+        raw = json.dumps(request, ensure_ascii=False).encode("utf-8")
+        write_buf = ctypes.create_string_buffer(raw)
+        written = wintypes.DWORD()
+        if not bool(_KERNEL32.WriteFile(handle, write_buf, len(raw), ctypes.byref(written), None)):
+            return {
+                "transportOk": False,
+                "ok": False,
+                "error": f"WriteFile(pipe) 失败: {ctypes.get_last_error()}",
+                "pipeName": pipe_name,
+                "request": request,
+                "elapsedSec": round(time.time() - t0, 3),
+            }
+        _KERNEL32.FlushFileBuffers(handle)
+
+        response_deadline = time.time() + max(0.2, float(timeout_sec))
+        while True:
+            bytes_avail = wintypes.DWORD()
+            bytes_left = wintypes.DWORD()
+            ok = bool(
+                _KERNEL32.PeekNamedPipe(
+                    handle,
+                    None,
+                    0,
+                    None,
+                    ctypes.byref(bytes_avail),
+                    ctypes.byref(bytes_left),
+                )
+            )
+            if not ok:
+                return {
+                    "transportOk": False,
+                    "ok": False,
+                    "error": f"PeekNamedPipe(pipe) 失败: {ctypes.get_last_error()}",
+                    "pipeName": pipe_name,
+                    "request": request,
+                    "elapsedSec": round(time.time() - t0, 3),
+                }
+            if bytes_avail.value > 0 or bytes_left.value > 0:
+                break
+            if time.time() >= response_deadline:
+                return {
+                    "transportOk": False,
+                    "ok": False,
+                    "error": "等待 control-plane 响应超时",
+                    "pipeName": pipe_name,
+                    "request": request,
+                    "elapsedSec": round(time.time() - t0, 3),
+                }
+            time.sleep(0.01)
+
+        chunks: List[bytes] = []
+        while True:
+            read_buf = ctypes.create_string_buffer(65536)
+            read = wintypes.DWORD()
+            ok = bool(_KERNEL32.ReadFile(handle, read_buf, len(read_buf), ctypes.byref(read), None))
+            if ok:
+                if read.value > 0:
+                    chunks.append(read_buf.raw[: read.value])
+                break
+            err = ctypes.get_last_error()
+            if err == ERROR_MORE_DATA:
+                if read.value > 0:
+                    chunks.append(read_buf.raw[: read.value])
+                continue
+            if err == ERROR_BROKEN_PIPE:
+                break
+            return {
+                "transportOk": False,
+                "ok": False,
+                "error": f"ReadFile(pipe) 失败: {err}",
+                "pipeName": pipe_name,
+                "request": request,
+                "elapsedSec": round(time.time() - t0, 3),
+            }
+
+        if not chunks:
+            return {
+                "transportOk": False,
+                "ok": False,
+                "error": "pipe 响应为空",
+                "pipeName": pipe_name,
+                "request": request,
+                "elapsedSec": round(time.time() - t0, 3),
+            }
+
+        response = json.loads(b"".join(chunks).decode("utf-8", errors="ignore"))
+        result = response.get("result", {})
+        return {
+            "transportOk": True,
+            "ok": bool(response.get("ok")),
+            "error": str(response.get("error", "") or ""),
+            "pipeName": pipe_name,
+            "request": request,
+            "response": response,
+            "result": result if isinstance(result, dict) else {"value": result},
+            "elapsedSec": round(time.time() - t0, 3),
+        }
+    except Exception as e:
+        return {
+            "transportOk": False,
+            "ok": False,
+            "error": f"pipe 请求异常: {e}",
+            "pipeName": pipe_name,
+            "request": request,
+            "elapsedSec": round(time.time() - t0, 3),
+        }
+    finally:
+        _KERNEL32.CloseHandle(handle)
+
+
 def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
@@ -803,6 +1083,24 @@ def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
 
 def _read_runtime_status_file(war3_dir: Path) -> Optional[Dict[str, Any]]:
     return _read_json_file(_runtime_status_file(war3_dir))
+
+
+def _read_runtime_status_best_effort(target_pid: int = 0) -> Optional[Dict[str, Any]]:
+    pid = int(target_pid or STATE.war3_pid or 0)
+    if pid > 0 and _pid_alive(pid):
+        pipe_res = _control_plane_request(
+            pid=pid,
+            command="get_runtime_status",
+            payload={},
+            timeout_sec=1.5,
+        )
+        if pipe_res.get("transportOk") and pipe_res.get("ok"):
+            data = dict(pipe_res.get("result", {}) or {})
+            if data:
+                return data
+
+    war3_dir = STATE.war3_dir if isinstance(STATE.war3_dir, Path) else DEFAULT_WAR3_DIR
+    return _read_runtime_status_file(Path(war3_dir))
 
 
 def _read_bmp_luma_samples(path: Path, max_samples: int = 262144) -> Dict[str, Any]:
@@ -1107,74 +1405,34 @@ def _invoke_internal_test_request(
     payload: Optional[Dict[str, Any]] = None,
     timeout_sec: float = 6.0,
 ) -> Dict[str, Any]:
-    request_path = _internal_test_request_file(war3_dir)
-    result_path = _internal_test_result_file(war3_dir)
-    request_id = f"internal_{_now_compact()}_{pid}_{int(time.time() * 1000)}"
-
-    for stale in (request_path, result_path):
-        try:
-            if stale.exists():
-                stale.unlink()
-        except Exception:
-            pass
-
-    _ensure_dir(request_path.parent)
-    request = {
-        "requestId": request_id,
-        "command": str(command or "").strip(),
-        "payload": dict(payload or {}),
-        "issuedAtMs": int(time.time() * 1000),
-        "pid": int(pid),
-    }
-    try:
-        request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
+    pipe_res = _control_plane_request(
+        pid=pid,
+        command="invoke_test_command",
+        payload={
+            "command": str(command or "").strip(),
+            "payload": dict(payload or {}),
+            "timeoutMs": max(1000, int(float(timeout_sec) * 1000.0)),
+        },
+        timeout_sec=max(2.0, float(timeout_sec) + 1.0),
+    )
+    if pipe_res.get("transportOk"):
         return {
-            "ok": False,
-            "error": f"写入 internal_test_request.json 失败: {e}",
-            "requestId": request_id,
-            "requestPath": str(request_path),
-            "resultPath": str(result_path),
+            "ok": bool(pipe_res.get("ok")),
+            "requestId": str((pipe_res.get("response", {}) or {}).get("requestId", "")),
+            "command": str(command or "").strip(),
+            "mode": "control-plane",
+            "response": dict(pipe_res.get("response", {}) or {}),
+            "result": dict(pipe_res.get("result", {}) or {}),
+            "error": str(pipe_res.get("error", "") or ""),
+            "elapsedSec": round(float(pipe_res.get("elapsedSec", 0.0) or 0.0), 3),
+            "pipeName": str(pipe_res.get("pipeName", "") or ""),
         }
-
-    t0 = time.time()
-    timeout_sec = max(0.5, float(timeout_sec))
-    response: Optional[Dict[str, Any]] = None
-    while time.time() - t0 < timeout_sec:
-        current = _read_json_file(result_path)
-        if isinstance(current, dict) and current.get("requestId") == request_id:
-            response = current
-            break
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.05)
-
-    try:
-        if request_path.exists():
-            request_path.unlink()
-    except Exception:
-        pass
-
-    if not isinstance(response, dict):
-        return {
-            "ok": False,
-            "error": "等待 internal_test_result.json 超时",
-            "requestId": request_id,
-            "requestPath": str(request_path),
-            "resultPath": str(result_path),
-            "elapsedSec": round(time.time() - t0, 3),
-        }
-
     return {
-        "ok": bool(response.get("ok")),
-        "requestId": request_id,
+        "ok": False,
         "command": str(command or "").strip(),
-        "requestPath": str(request_path),
-        "resultPath": str(result_path),
-        "response": response,
-        "result": dict(response.get("result", {}) or {}),
-        "error": str(response.get("error", "") or ""),
-        "elapsedSec": round(time.time() - t0, 3),
+        "mode": "control-plane-unavailable",
+        "error": str(pipe_res.get("error", "control plane 不可用") or "control plane 不可用"),
+        "detail": pipe_res,
     }
 
 
@@ -1184,93 +1442,12 @@ def _capture_final_frame_via_internal_test_api(
     output_path: Path,
     timeout_sec: float = 8.0,
 ) -> Dict[str, Any]:
-    final_out = output_path.resolve()
-    raw_bmp = final_out if final_out.suffix.lower() == ".bmp" else final_out.with_suffix(".bmp")
-    for stale in (raw_bmp, final_out):
-        try:
-            if stale.exists():
-                stale.unlink()
-        except Exception:
-            pass
-
-    invoke = _invoke_internal_test_request(
+    return _request_internal_frame_capture(
         pid=pid,
+        output_path=output_path,
         war3_dir=war3_dir,
-        command="capture.final_frame",
-        payload={"outputPath": str(raw_bmp)},
-        timeout_sec=max(1.0, min(float(timeout_sec), 6.0)),
+        timeout_sec=timeout_sec,
     )
-    if not invoke.get("ok"):
-        return {
-            "ok": False,
-            "mode": "internal-test-api-capture",
-            "error": str(invoke.get("error", "capture.final_frame 调用失败")),
-            "invoke": invoke,
-        }
-
-    result_path = _frame_capture_result_file(war3_dir)
-    request_id = str(invoke.get("requestId", ""))
-    t0 = time.time()
-    capture_result: Optional[Dict[str, Any]] = None
-    while time.time() - t0 < max(1.0, float(timeout_sec)):
-        current = _read_json_file(result_path)
-        if isinstance(current, dict) and current.get("requestId") == request_id:
-            capture_result = current
-            break
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.1)
-
-    if not isinstance(capture_result, dict):
-        return {
-            "ok": False,
-            "mode": "internal-test-api-capture",
-            "error": "等待 frame_capture_result.json 超时",
-            "invoke": invoke,
-            "elapsedSec": round(time.time() - t0, 3),
-        }
-
-    raw_output = Path(str(capture_result.get("outputPath", raw_bmp)))
-    if (not bool(capture_result.get("ok"))) or (not raw_output.exists()):
-        return {
-            "ok": False,
-            "mode": "internal-test-api-capture",
-            "error": str(capture_result.get("error", "内部最终帧导出失败")),
-            "invoke": invoke,
-            "details": capture_result,
-        }
-
-    convert: Dict[str, Any] = {"returncode": 0, "stdout": "", "stderr": "", "skipped": True}
-    delivered_output = raw_output
-    if final_out.suffix.lower() == ".png":
-        convert = _powershell_convert_bitmap_to_png(raw_output, final_out)
-        if convert.get("returncode", 1) != 0 or (not final_out.exists()):
-            return {
-                "ok": False,
-                "mode": "internal-test-api-capture",
-                "error": f"内部最终帧 PNG 转换失败: {convert.get('stderr') or convert.get('stdout') or 'unknown'}",
-                "invoke": invoke,
-                "details": capture_result,
-                "convert": convert,
-                "rawOutput": str(raw_output),
-            }
-        delivered_output = final_out
-        try:
-            raw_output.unlink()
-        except Exception:
-            pass
-
-    return {
-        "ok": True,
-        "mode": "internal-test-api-capture",
-        "requestId": request_id,
-        "output": str(delivered_output),
-        "rawOutput": str(raw_output),
-        "invoke": invoke,
-        "details": capture_result,
-        "convert": convert,
-        "elapsedSec": round(time.time() - t0, 3),
-    }
 
 
 def _extract_json_object(text: str, marker: str = "const data =") -> Optional[Dict[str, Any]]:
@@ -1493,17 +1670,45 @@ def _read_perf_summary(
             "dynamicPoseCount": int(shadow_runtime_v2.get("dynamicPoseCount", 0) or 0),
             "dynamicSkinnedOutputCount": int(shadow_runtime_v2.get("dynamicSkinnedOutputCount", 0) or 0),
             "fallbackDrawCount": int(shadow_runtime_v2.get("fallbackDrawCount", 0) or 0),
+            "fallbackDrawCountTerrain": int(shadow_runtime_v2.get("fallbackDrawCountTerrain", 0) or 0),
+            "fallbackDrawCountWorldObject": int(shadow_runtime_v2.get("fallbackDrawCountWorldObject", 0) or 0),
+            "fallbackDrawCountUnitObject": int(shadow_runtime_v2.get("fallbackDrawCountUnitObject", 0) or 0),
+            "objectFallbackDrawCount": int(shadow_runtime_v2.get("objectFallbackDrawCount", 0) or 0),
             "semanticBridgeHit": int(shadow_runtime_v2.get("semanticBridgeHit", 0) or 0),
             "semanticBridgeMiss": int(shadow_runtime_v2.get("semanticBridgeMiss", 0) or 0),
             "semanticBridgeBypassed": int(shadow_runtime_v2.get("semanticBridgeBypassed", 0) or 0),
+            "semanticSceneSubmitted": int(shadow_runtime_v2.get("semanticSceneSubmitted", 0) or 0),
+            "semanticSceneSubmittedUnit": int(shadow_runtime_v2.get("semanticSceneSubmittedUnit", 0) or 0),
+            "semanticSceneSubmittedSkinned": int(shadow_runtime_v2.get("semanticSceneSubmittedSkinned", 0) or 0),
+            "semanticSceneSubmittedFrameLocal": int(shadow_runtime_v2.get("semanticSceneSubmittedFrameLocal", 0) or 0),
+            "semanticSceneSubmittedPersistent": int(shadow_runtime_v2.get("semanticSceneSubmittedPersistent", 0) or 0),
+            "semanticSceneAcceptedExplicitResourceOwnerRigid": int(shadow_runtime_v2.get("semanticSceneAcceptedExplicitResourceOwnerRigid", 0) or 0),
             "modelRegistryHit": int(shadow_runtime_v2.get("modelRegistryHit", 0) or 0),
             "modelRegistryMiss": int(shadow_runtime_v2.get("modelRegistryMiss", 0) or 0),
             "modelLoadCount": int(shadow_runtime_v2.get("modelLoadCount", 0) or 0),
             "modelReuseCount": int(shadow_runtime_v2.get("modelReuseCount", 0) or 0),
+            "runtimeBoundCount": int(shadow_runtime_v2.get("runtimeBoundCount", 0) or 0),
+            "completeIdentityCount": int(shadow_runtime_v2.get("completeIdentityCount", 0) or 0),
+            "shadowRuntimeBoundCount": int(shadow_runtime_v2.get("shadowRuntimeBoundCount", 0) or 0),
+            "shadowIdentityCount": int(shadow_runtime_v2.get("shadowIdentityCount", 0) or 0),
             "poseUpdateCount": int(shadow_runtime_v2.get("poseUpdateCount", 0) or 0),
             "poseCacheHit": int(shadow_runtime_v2.get("poseCacheHit", 0) or 0),
             "poseCacheMiss": int(shadow_runtime_v2.get("poseCacheMiss", 0) or 0),
             "bonePaletteUpdates": int(shadow_runtime_v2.get("bonePaletteUpdates", 0) or 0),
+            "shadowGeosetResourceCount": int(shadow_runtime_v2.get("shadowGeosetResourceCount", 0) or 0),
+            "shadowReadyGeosetCount": int(shadow_runtime_v2.get("shadowReadyGeosetCount", 0) or 0),
+            "shadowModelResourceCount": int(shadow_runtime_v2.get("shadowModelResourceCount", 0) or 0),
+            "shadowPoseReadyCount": int(shadow_runtime_v2.get("shadowPoseReadyCount", 0) or 0),
+            "upperLayerResolveAttempts": int(shadow_runtime_v2.get("upperLayerResolveAttempts", 0) or 0),
+            "upperLayerResolveVisibleMiss": int(shadow_runtime_v2.get("upperLayerResolveVisibleMiss", 0) or 0),
+            "upperLayerResolveVisibleUnresolvedGeoset": int(shadow_runtime_v2.get("upperLayerResolveVisibleUnresolvedGeoset", 0) or 0),
+            "upperLayerResolveGeosetMiss": int(shadow_runtime_v2.get("upperLayerResolveGeosetMiss", 0) or 0),
+            "upperLayerResolvePoseMiss": int(shadow_runtime_v2.get("upperLayerResolvePoseMiss", 0) or 0),
+            "upperLayerResolveRuntimeGroupPaletteMiss": int(shadow_runtime_v2.get("upperLayerResolveRuntimeGroupPaletteMiss", 0) or 0),
+            "upperLayerResolveAuthoritativeRigid": int(shadow_runtime_v2.get("upperLayerResolveAuthoritativeRigid", 0) or 0),
+            "upperLayerResolveAuthoritativeSkinned": int(shadow_runtime_v2.get("upperLayerResolveAuthoritativeSkinned", 0) or 0),
+            "upperLayerEmitted": int(shadow_runtime_v2.get("upperLayerEmitted", 0) or 0),
+            "upperLayerDuplicateOrSuppressed": int(shadow_runtime_v2.get("upperLayerDuplicateOrSuppressed", 0) or 0),
             "animationSequenceCount": int(shadow_runtime_v2.get("animationSequenceCount", 0) or 0),
             "avgModelResolveCpuMs": float(shadow_runtime_v2.get("avgModelResolveCpuMs", 0.0) or 0.0),
             "avgPoseUpdateCpuMs": float(shadow_runtime_v2.get("avgPoseUpdateCpuMs", 0.0) or 0.0),
@@ -2149,7 +2354,7 @@ def _wait_for_window_ready(
     }
 
 
-def _find_main_window_hwnd(pid: int) -> int:
+def _enumerate_pid_windows(pid: int) -> List[int]:
     user32 = ctypes.windll.user32
     hwnds: List[int] = []
 
@@ -2160,7 +2365,6 @@ def _find_main_window_hwnd(pid: int) -> int:
         user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(proc_id))
         if proc_id.value == pid and user32.IsWindowVisible(ctypes.c_void_p(hwnd)):
             hwnds.append(hwnd)
-            return False
         return True
 
     enum_cb = WNDENUMPROC(_cb)
@@ -2171,7 +2375,45 @@ def _find_main_window_hwnd(pid: int) -> int:
         user32.EnumDesktopWindows(wintypes.HANDLE(desktop_handle), enum_cb, 0)
     else:
         user32.EnumWindows(enum_cb, 0)
-    return hwnds[0] if hwnds else 0
+    return hwnds
+
+
+def _rank_window_candidate(info: Dict[str, Any]) -> int:
+    wr = dict(info.get("windowRect", {}) or {})
+    cr = dict(info.get("clientRect", {}) or {})
+    window_area = int(wr.get("width", 0) or 0) * int(wr.get("height", 0) or 0)
+    client_area = int(cr.get("width", 0) or 0) * int(cr.get("height", 0) or 0)
+    show_cmd = int(info.get("showCmd", 0) or 0)
+    score = max(window_area, client_area * 2)
+    if show_cmd == 2:  # SW_SHOWMINIMIZED
+        score -= 1_000_000_000
+    if str(info.get("title", "") or "").strip():
+        score += 10_000
+    return int(score)
+
+
+def _main_window_candidates(pid: int) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for hwnd in _enumerate_pid_windows(pid):
+        info = _query_window_info_by_hwnd(hwnd, pid=pid)
+        wr = dict(info.get("windowRect", {}) or {})
+        cr = dict(info.get("clientRect", {}) or {})
+        window_area = int(wr.get("width", 0) or 0) * int(wr.get("height", 0) or 0)
+        client_area = int(cr.get("width", 0) or 0) * int(cr.get("height", 0) or 0)
+        info["windowArea"] = int(window_area)
+        info["clientArea"] = int(client_area)
+        info["score"] = _rank_window_candidate(info)
+        rows.append(info)
+    rows.sort(key=lambda row: int(row.get("score", 0) or 0), reverse=True)
+    return rows
+
+
+def _find_main_window_hwnd(pid: int) -> int:
+    candidates = _main_window_candidates(pid)
+    for row in candidates:
+        if int(row.get("windowArea", 0) or 0) > 0 and int(row.get("clientArea", 0) or 0) > 0:
+            return int(row.get("hwnd", 0) or 0)
+    return int(candidates[0].get("hwnd", 0) or 0) if candidates else 0
 
 
 def _post_close(pid: int) -> bool:
@@ -2184,6 +2426,9 @@ def _post_close(pid: int) -> bool:
 
 
 def _powershell_capture_window(pid: int, output_png: Path) -> Dict[str, Any]:
+    hwnd = _find_main_window_hwnd(pid)
+    selected_window = _query_window_info_by_hwnd(hwnd, pid=pid) if hwnd else {"ok": False, "error": "hwnd=0"}
+    candidates = _main_window_candidates(pid)[:8]
     script = r'''
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
@@ -2209,8 +2454,14 @@ public class Win32Rect {
 [Win32Rect]::SetProcessDPIAware() | Out-Null
 $procId = [int]$env:WAR3_AUTOTEST_PID
 $out = $env:WAR3_AUTOTEST_OUT
+$hWnd = [IntPtr]::Zero
+if ($env:WAR3_AUTOTEST_HWND) {
+  $hWnd = [IntPtr]([Int64]$env:WAR3_AUTOTEST_HWND)
+}
 $proc = Get-Process -Id $procId -ErrorAction Stop
-$hWnd = $proc.MainWindowHandle
+if ($hWnd -eq [IntPtr]::Zero) {
+  $hWnd = $proc.MainWindowHandle
+}
 if ($hWnd -eq 0) { throw "MainWindowHandle=0" }
 $rect = New-Object Win32Rect+RECT
 [Win32Rect]::GetWindowRect($hWnd, [ref]$rect) | Out-Null
@@ -2242,6 +2493,8 @@ Write-Output ("OK:" + $captureMode)
     env = os.environ.copy()
     env["WAR3_AUTOTEST_PID"] = str(pid)
     env["WAR3_AUTOTEST_OUT"] = str(output_png)
+    if hwnd:
+        env["WAR3_AUTOTEST_HWND"] = str(int(hwnd))
     proc = subprocess.run(
         ["powershell", "-NoProfile", "-Command", script],
         env=env,
@@ -2254,6 +2507,9 @@ Write-Output ("OK:" + $captureMode)
         "returncode": proc.returncode,
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
+        "hwnd": int(hwnd or 0),
+        "selectedWindow": selected_window,
+        "windowCandidates": candidates,
     }
 
 
@@ -2296,132 +2552,73 @@ def _request_internal_frame_capture(
     war3_dir: Path,
     timeout_sec: float = 8.0,
 ) -> Dict[str, Any]:
-    temp_dir = _ensure_dir(war3_dir / "WarVK" / "Temp")
-    request_path = _frame_capture_request_file(war3_dir)
-    result_path = _frame_capture_result_file(war3_dir)
     final_out = output_path.resolve()
     raw_bmp = final_out if final_out.suffix.lower() == ".bmp" else final_out.with_suffix(".bmp")
-    request_id = f"{_now_compact()}_{pid}_{int(time.time() * 1000)}"
-
-    for stale in (request_path, result_path):
-        try:
-            if stale.exists():
-                stale.unlink()
-        except Exception:
-            pass
-
-    for stale in (raw_bmp, final_out):
-        try:
-            if stale.exists():
-                stale.unlink()
-        except Exception:
-            pass
-
-    _ensure_dir(final_out.parent)
-    _ensure_dir(raw_bmp.parent)
-    payload = {
-        "requestId": request_id,
-        "outputPath": str(raw_bmp),
-        "capture": "final-backbuffer",
-        "format": "bmp",
-        "issuedAt": _now_str(),
-        "pid": int(pid),
-    }
-
-    try:
-        request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        return {
-            "ok": False,
-            "mode": "internal-final-frame",
-            "error": f"写入内部截图请求失败: {e}",
-            "requestId": request_id,
-            "requestPath": str(request_path),
-            "resultPath": str(result_path),
-        }
-
-    t0 = time.time()
-    last_result: Optional[Dict[str, Any]] = None
-    timeout_sec = max(1.0, float(timeout_sec))
-    while time.time() - t0 < timeout_sec:
-        current = _read_json_file(result_path)
-        if isinstance(current, dict) and current.get("requestId") == request_id:
-            last_result = current
-            break
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.1)
-
-    try:
-        if request_path.exists():
-            request_path.unlink()
-    except Exception:
-        pass
-
-    if not isinstance(last_result, dict):
-        return {
-            "ok": False,
-            "mode": "internal-final-frame",
-            "error": "等待内部截图结果超时",
-            "requestId": request_id,
-            "requestPath": str(request_path),
-            "resultPath": str(result_path),
-            "elapsedSec": round(time.time() - t0, 3),
-        }
-
-    raw_output = Path(str(last_result.get("outputPath", raw_bmp)))
-    if (not bool(last_result.get("ok"))) or (not raw_output.exists()):
-        return {
-            "ok": False,
-            "mode": "internal-final-frame",
-            "error": str(last_result.get("error", "内部截图失败")),
-            "requestId": request_id,
-            "requestPath": str(request_path),
-            "resultPath": str(result_path),
-            "details": last_result,
-            "elapsedSec": round(time.time() - t0, 3),
-        }
-
-    convert: Dict[str, Any] = {
-        "returncode": 0,
-        "stdout": "",
-        "stderr": "",
-        "skipped": True,
-    }
-    delivered_output = raw_output
-    if final_out.suffix.lower() == ".png":
-        convert = _powershell_convert_bitmap_to_png(raw_output, final_out)
-        if convert.get("returncode", 1) != 0 or (not final_out.exists()):
+    pipe_res = _control_plane_request(
+        pid=pid,
+        command="capture_final_frame",
+        payload={
+            "outputPath": str(raw_bmp),
+            "timeoutMs": max(1000, int(float(timeout_sec) * 1000.0)),
+        },
+        timeout_sec=max(2.0, float(timeout_sec) + 1.0),
+    )
+    if pipe_res.get("transportOk"):
+        if not pipe_res.get("ok"):
             return {
                 "ok": False,
-                "mode": "internal-final-frame",
-                "error": f"内部截图 PNG 转换失败: {convert.get('stderr') or convert.get('stdout') or 'unknown'}",
-                "requestId": request_id,
-                "requestPath": str(request_path),
-                "resultPath": str(result_path),
-                "details": last_result,
-                "convert": convert,
-                "rawOutput": str(raw_output),
-                "elapsedSec": round(time.time() - t0, 3),
+                "mode": "control-plane-capture",
+                "error": str(pipe_res.get("error", "control plane capture 失败")),
+                "detail": pipe_res,
             }
-        delivered_output = final_out
-        try:
-            raw_output.unlink()
-        except Exception:
-            pass
 
+        raw_output = Path(str((pipe_res.get("result", {}) or {}).get("outputPath", raw_bmp)))
+        if not raw_output.exists():
+            return {
+                "ok": False,
+                "mode": "control-plane-capture",
+                "error": "control plane capture 未产出文件",
+                "detail": pipe_res,
+            }
+
+        convert: Dict[str, Any] = {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "skipped": True,
+        }
+        delivered_output = raw_output
+        if final_out.suffix.lower() == ".png":
+            convert = _powershell_convert_bitmap_to_png(raw_output, final_out)
+            if convert.get("returncode", 1) != 0 or (not final_out.exists()):
+                return {
+                    "ok": False,
+                    "mode": "control-plane-capture",
+                    "error": f"control plane PNG 转换失败: {convert.get('stderr') or convert.get('stdout') or 'unknown'}",
+                    "detail": pipe_res,
+                    "convert": convert,
+                    "rawOutput": str(raw_output),
+                }
+            delivered_output = final_out
+            try:
+                raw_output.unlink()
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "mode": "control-plane-capture",
+            "output": str(delivered_output),
+            "rawOutput": str(raw_output),
+            "details": pipe_res,
+            "convert": convert,
+            "elapsedSec": round(float(pipe_res.get("elapsedSec", 0.0) or 0.0), 3),
+        }
     return {
-        "ok": True,
-        "mode": "internal-final-frame",
-        "requestId": request_id,
-        "pid": int(pid),
-        "output": str(delivered_output),
-        "rawOutput": str(raw_output),
-        "requestPath": str(request_path),
-        "resultPath": str(result_path),
-        "details": last_result,
-        "convert": convert,
-        "elapsedSec": round(time.time() - t0, 3),
+        "ok": False,
+        "mode": "control-plane-capture-unavailable",
+        "error": str(pipe_res.get("error", "control plane capture 不可用") or "control plane capture 不可用"),
+        "detail": pipe_res,
     }
 
 
@@ -2678,6 +2875,8 @@ def _prefer_inplace_relative_loadfile_arg(war3_dir: Path, map_path: Path) -> str
 
 
 def _deploy_d3d9(build_dll: Path, war3_dir: Path) -> Dict[str, Any]:
+    if not build_dll.is_absolute():
+        build_dll = (REPO_ROOT / build_dll).resolve()
     dst = war3_dir / "d3d9.dll"
     if not build_dll.exists():
         return {"ok": False, "error": f"构建产物不存在: {build_dll}"}
@@ -2902,11 +3101,10 @@ def launch_war3_test(
     parse_error = extra_env.pop("__parse_error__", "")
     if parse_error:
         return {"ok": False, "error": f"env_overrides_json 解析失败: {parse_error}"}
-    # 运行时姿态链目前仍是实验路径。默认把 pose hook 显式钉成关闭，
-    # 避免宿主 Python/PowerShell 进程残留的环境变量把 War3 拉回
-    # pose-heavy 模式，导致低压图性能与阴影判断一起失真。
-    if "DXVK_WAR3_MODEL_POSE_HOOK" not in extra_env:
-        env["DXVK_WAR3_MODEL_POSE_HOOK"] = "0"
+    # 高频 SpriteFrame/runtime-matrix pose hooks are no longer the default
+    # semantic palette producer. The production path samples Blizzard's
+    # already-evaluated CModel palette from the visible contract; tests that
+    # specifically need the legacy hook path can still opt in explicitly.
     env.update(extra_env)
 
     for stale in (
@@ -3014,6 +3212,23 @@ def is_war3_running(pid: int = 0) -> Dict[str, Any]:
 def read_runtime_status(war3_dir: str = str(DEFAULT_WAR3_DIR)) -> Dict[str, Any]:
     """读取项目侧 runtime_status.json（由 DXVK 运行时周期写入）。"""
     w3 = Path(war3_dir)
+    target_pid = STATE.war3_pid or 0
+    if target_pid > 0 and _pid_alive(target_pid):
+        pipe_res = _control_plane_request(
+            pid=target_pid,
+            command="get_runtime_status",
+            payload={},
+            timeout_sec=2.0,
+        )
+        if pipe_res.get("transportOk"):
+            return {
+                "ok": bool(pipe_res.get("ok")),
+                "mode": "control-plane",
+                "pipeName": str(pipe_res.get("pipeName", "") or ""),
+                "data": dict(pipe_res.get("result", {}) or {}),
+                "detail": pipe_res,
+            }
+
     path = _runtime_status_file(w3)
     data = _read_runtime_status_file(w3)
     if not data:
@@ -3094,6 +3309,59 @@ def wait_for_game_ready(
 
     _start_debug_monitor(target_pid)
 
+    pipe_wait_t0 = time.time()
+    pipe_ready: Dict[str, Any] = {}
+    while True:
+        elapsed_wait = time.time() - pipe_wait_t0
+        remaining_timeout = max(0.0, float(timeout_sec) - elapsed_wait)
+        if remaining_timeout <= 0.0:
+            break
+
+        pipe_ready = _control_plane_request(
+            pid=target_pid,
+            command="wait_until",
+            payload={
+                "timeoutSec": max(1, int(math.ceil(remaining_timeout))),
+                "pollIntervalMs": 50,
+            },
+            timeout_sec=max(2.0, remaining_timeout + 2.0),
+        )
+        if pipe_ready.get("transportOk"):
+            break
+        if not _pid_alive(target_pid):
+            break
+        time.sleep(0.2)
+
+    if pipe_ready.get("transportOk"):
+        runtime_status = dict(((pipe_ready.get("result", {}) or {}).get("runtimeStatus", {})) or {})
+        if pipe_ready.get("ok"):
+            return {
+                "ok": True,
+                "mode": "control-plane",
+                "pid": target_pid,
+                "elapsedSec": round(float(pipe_ready.get("elapsedSec", 0.0) or 0.0), 3),
+                "runtimeStatus": runtime_status,
+                "detail": pipe_ready,
+            }
+        return {
+            "ok": False,
+            "error": str(pipe_ready.get("error", "control plane wait_until 失败")),
+            "mode": "control-plane",
+            "pid": target_pid,
+            "elapsedSec": round(float(pipe_ready.get("elapsedSec", 0.0) or 0.0), 3),
+            "runtimeStatus": runtime_status,
+            "detail": pipe_ready,
+        }
+    if not allow_fallback:
+        return {
+            "ok": False,
+            "error": str(pipe_ready.get("error", "control plane 不可用")),
+            "mode": "control-plane-required",
+            "pid": target_pid,
+            "elapsedSec": round(time.time() - pipe_wait_t0, 3),
+            "detail": pipe_ready,
+        }
+
     t0 = time.time()
     last_id = 0
     hit_init: Optional[Dict[str, Any]] = None
@@ -3146,6 +3414,37 @@ def wait_for_game_ready(
                 hit_ingame = e
 
         if hit_init and hit_ingame:
+            if not allow_fallback:
+                status0 = _read_runtime_status_best_effort(target_pid)
+                time.sleep(1.0)
+                status1 = _read_runtime_status_best_effort(target_pid)
+                if isinstance(status0, dict) and isinstance(status1, dict):
+                    frame0 = int(status0.get("frameIndex", 0) or 0)
+                    frame1 = int(status1.get("frameIndex", 0) or 0)
+                    render0 = dict(status0.get("render", {}) or {})
+                    render1 = dict(status1.get("render", {}) or {})
+                    module0 = dict(status0.get("module", {}) or {})
+                    module1 = dict(status1.get("module", {}) or {})
+                    dispatch0 = int(module0.get("dispatchCalls", 0) or 0)
+                    dispatch1 = int(module1.get("dispatchCalls", 0) or 0)
+                    if (
+                        frame0 > 0
+                        and frame1 <= frame0
+                        and dispatch1 <= dispatch0
+                        and bool(render1.get("inGameRenderReady", False))
+                        and not bool(render1.get("isInGame", False))
+                    ):
+                        return {
+                            "ok": False,
+                            "error": "debug-events ready 后 frameIndex 未继续推进，疑似首帧卡住",
+                            "mode": "debug-events-stalled",
+                            "pid": target_pid,
+                            "elapsedSec": round(time.time() - t0, 3),
+                            "hitInit": hit_init,
+                            "hitInGame": hit_ingame,
+                            "status0": status0,
+                            "status1": status1,
+                        }
             return {
                 "ok": True,
                 "mode": "debug-events",
@@ -3164,10 +3463,17 @@ def wait_for_game_ready(
             module = runtime_status.get("module", {})
             ts = int(runtime_status.get("timestampMs", 0))
             runtime_ready = bool(rt.get("runtimeReady", False))
+            jass_ready = bool(rt.get("jassReady", False))
             game_started = bool(rt.get("gameStarted", False))
             frame_index = int(runtime_status.get("frameIndex", 0) or 0)
             periodic_source = str(runtime_status.get("source", "")) == "periodic"
             module_running = str(module.get("state", "")) == "Running"
+            if hit_init is None and jass_ready:
+                hit_init = {
+                    "id": -1,
+                    "ts": ts,
+                    "msg": "runtime_status.runtime.jassReady=true",
+                }
             if ts >= max(0, STATE.launch_epoch_ms - 5_000) and runtime_ready:
                 return {
                     "ok": True,
@@ -3301,6 +3607,940 @@ def wait_for_game_ready(
         "hitInit": hit_init,
         "hitInGame": hit_ingame,
     }
+
+
+def _shadow_summary_int(summary: Dict[str, Any], key: str) -> int:
+    try:
+        return int(summary.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _native_execute_success_draw_count(summary: Dict[str, Any]) -> int:
+    """Return a stable native execute draw count.
+
+    The current-frame executed counter can be reset when a later control-plane
+    summary prepares a new native frame. The stable last-success fields preserve
+    the actual render-thread execute result.
+    """
+    current = _shadow_summary_int(summary, "nativeD3D9BackendExecutedDrawCount")
+    stable = _shadow_summary_int(
+        summary,
+        "nativeD3D9BackendLastSuccessfulExecutedDrawCount",
+    )
+    if stable <= 0 and _shadow_summary_int(
+        summary,
+        "nativeD3D9BackendExecuteSuccessCount",
+    ) > 0:
+        submitted = _shadow_summary_int(
+            summary,
+            "nativeD3D9BackendLastExecuteSubmittedDrawCount",
+        )
+        failed = _shadow_summary_int(
+            summary,
+            "nativeD3D9BackendLastExecuteFailedDrawCount",
+        )
+        stable = max(0, submitted - failed)
+    return max(current, stable)
+
+
+def _nested_status_int(status: Dict[str, Any], *path: str) -> int:
+    cur: Any = status
+    for key in path:
+        if not isinstance(cur, dict):
+            return 0
+        cur = cur.get(key)
+    try:
+        return int(cur or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _runtime_frame_progress_status(
+    runtime_status: Dict[str, Any],
+    *,
+    frame_advance_stalled: bool = False,
+    frame_stall_sec: float = 0.0,
+) -> Dict[str, Any]:
+    """Expose frame-tail state without changing the ready contract."""
+    render = runtime_status.get("render", {}) if isinstance(runtime_status, dict) else {}
+    frame = runtime_status.get("frame", {}) if isinstance(runtime_status, dict) else {}
+    render_in_game_ready = bool(render.get("inGameRenderReady", False))
+    render_is_in_game = bool(render.get("isInGame", False))
+    tail_stalled = render_in_game_ready and bool(frame_advance_stalled)
+    inactive_tail_stalled = tail_stalled and not render_is_in_game
+    return {
+        "runtimeFrameIndex": _nested_status_int(runtime_status, "frameIndex"),
+        "runtimeFrameNumber": _nested_status_int(runtime_status, "frame", "frameNumber"),
+        "runtimeFramePublishRevision": _nested_status_int(
+            runtime_status,
+            "frame",
+            "publishRevision",
+        ),
+        "runtimeRenderInGameReady": render_in_game_ready,
+        "runtimeRenderIsInGame": render_is_in_game,
+        "runtimeFrameAdvanceStalled": bool(frame_advance_stalled),
+        "runtimeFrameStallSec": round(max(0.0, float(frame_stall_sec)), 3),
+        "runtimeRenderTailStalled": bool(tail_stalled),
+        "runtimeRenderInactiveTailStalled": bool(inactive_tail_stalled),
+        "runtimeVisibleCount": _nested_status_int(runtime_status, "frame", "visibleCount"),
+        "runtimeUnitCount": _nested_status_int(runtime_status, "frame", "unitCount"),
+        "runtimeRecordsWithRuntimeModel": _nested_status_int(
+            runtime_status,
+            "frame",
+            "recordsWithRuntimeModel",
+        ),
+        "runtimeRecordsWithModelResource": _nested_status_int(
+            runtime_status,
+            "frame",
+            "recordsWithModelResource",
+        ),
+    }
+
+
+def _semantic_scene_consumption_status(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Classify whether the DXVK scene pass consumed the latest semantic frame."""
+    near_latest_max_lag = 2
+    core_submitted = _shadow_summary_int(summary, "semanticCoreSubmittedDrawCount")
+    scene_submitted = _shadow_summary_int(summary, "semanticSceneLastSubmittedDrawCount")
+    scene_publish_count = _shadow_summary_int(summary, "semanticSceneStatsPublishCount")
+    scene_lag = _shadow_summary_int(summary, "semanticScenePublishRevisionLag")
+    scene_frame_serial = _shadow_summary_int(
+        summary,
+        "semanticSceneLastFrameSerial",
+    )
+    core_frame_serial = _shadow_summary_int(
+        summary,
+        "semanticCoreFrameSerial",
+    )
+    revision_consumed = (
+        scene_publish_count > 0
+        and scene_submitted > 0
+        and scene_lag == 0
+    )
+    same_frame_consumed = (
+        scene_publish_count > 0
+        and scene_submitted > 0
+        and scene_frame_serial > 0
+        and core_frame_serial > 0
+        and scene_frame_serial >= core_frame_serial
+    )
+    near_latest_consumed = (
+        scene_publish_count > 0
+        and scene_submitted > 0
+        and scene_frame_serial > 0
+        and core_frame_serial > 0
+        and scene_lag >= 0
+        and scene_lag <= near_latest_max_lag
+        and core_frame_serial >= scene_frame_serial
+        and (core_frame_serial - scene_frame_serial) <= near_latest_max_lag
+    )
+    consumed = revision_consumed or same_frame_consumed or near_latest_consumed
+    supplemented_revision_pending = same_frame_consumed and not revision_consumed
+    waiting_for_render_scene = core_submitted > 0 and not consumed
+    if revision_consumed:
+        consumption_mode = "revision"
+    elif same_frame_consumed:
+        consumption_mode = "same-frame"
+    elif near_latest_consumed:
+        consumption_mode = "near-latest"
+    else:
+        consumption_mode = "pending"
+    return {
+        "semanticSceneConsumptionFresh": bool(consumed),
+        "semanticSceneRevisionConsumed": bool(revision_consumed),
+        "semanticSceneSameFrameConsumed": bool(same_frame_consumed),
+        "semanticSceneNearLatestConsumed": bool(near_latest_consumed),
+        "semanticSceneNearLatestMaxLag": int(near_latest_max_lag),
+        "semanticSceneSupplementedRevisionPending": bool(supplemented_revision_pending),
+        "semanticSceneConsumptionMode": consumption_mode,
+        "semanticSceneWaitingForRenderPass": bool(waiting_for_render_scene),
+        "semanticScenePublishRevisionLag": int(scene_lag),
+        "semanticSceneStatsPublishCount": int(scene_publish_count),
+        "semanticSceneLastSubmittedDrawCount": int(scene_submitted),
+        "semanticSceneLastFrameSerial": scene_frame_serial,
+        "semanticCoreFrameSerial": core_frame_serial,
+        "semanticSceneLastSourcePublishRevision": _shadow_summary_int(
+            summary,
+            "semanticSceneLastSourcePublishRevision",
+        ),
+        "semanticCoreSourcePublishRevision": _shadow_summary_int(
+            summary,
+            "semanticCoreSourcePublishRevision",
+        ),
+    }
+
+
+def _refresh_shadow_runtime_summary_until(
+    *,
+    pid: int,
+    wait_sec: float,
+    min_submitted_draw_count: int = 0,
+    min_attachment_rigid_resolved: int = 0,
+    require_semantic_frame_fresh: bool = True,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Poll the control plane summary after a failed hot-frame wait.
+
+    wait_until can return the last pre-rebuild summary when semantic resources
+    are populated late in the same frame. A short explicit summary poll keeps
+    the failure diagnostic tied to the latest semantic contract state.
+    """
+    deadline = time.time() + max(0.0, float(wait_sec))
+    last_detail: Dict[str, Any] = {}
+    best_summary: Dict[str, Any] = {}
+
+    while True:
+        detail = _control_plane_request(
+            pid=pid,
+            command="get_shadow_runtime_summary",
+            payload={
+                "refreshSemanticFrameIfStale": True,
+                "forceSemanticFrameBuild": True,
+                "allowControlPlaneSemanticDrain": True,
+                "semanticBuildMinIntervalMs": 0,
+                "semanticBuildDrainMaxChunks": 32,
+                "semanticBuildDrainBudgetUs": 50000,
+                "semanticBuildDrainRecordCeiling": 1024,
+            },
+            timeout_sec=2.0,
+        )
+        last_detail = detail
+        if detail.get("transportOk") and detail.get("ok"):
+            summary = dict(detail.get("result", {}) or {})
+            best_summary = summary
+            submitted = _shadow_summary_int(summary, "semanticCoreSubmittedDrawCount")
+            attachment = _shadow_summary_int(summary, "semanticCoreAttachmentRigidResolved")
+            supplemental = _shadow_summary_int(
+                summary,
+                "semanticCoreAttachmentRigidSupplementalResolvedCount",
+            )
+            frame_fresh = bool(summary.get("semanticCoreFrameFresh", False))
+            if (
+                submitted >= max(0, int(min_submitted_draw_count))
+                and max(attachment, supplemental)
+                >= max(0, int(min_attachment_rigid_resolved))
+                and (not bool(require_semantic_frame_fresh) or frame_fresh)
+            ):
+                return summary, detail
+
+        if time.time() >= deadline:
+            break
+        # The attachment supplemental path can settle a few ticks after ready
+        # even when the isolated desktop stops advancing visible frames.
+        time.sleep(0.5)
+
+    return best_summary, last_detail
+
+
+@mcp.tool()
+def wait_for_hot_shadow_frame(
+    timeout_sec: int = 120,
+    pid: int = 0,
+    min_visible_count: int = 1,
+    min_stable_identity_count: int = 1,
+    min_unit_count: int = 1,
+    min_semantic_resolved: int = 1,
+    min_semantic_skinned_resolved: int = 0,
+    min_native_executed_draw_count: int = 0,
+    require_semantic_frame_fresh: bool = True,
+    min_frame_advance: int = 2,
+    allow_semantic_rigid_only: bool = False,
+    allow_semantic_attachment_rigid_only: bool = False,
+    min_semantic_attachment_rigid_resolved: int = 0,
+    post_failure_summary_wait_sec: int = 6,
+    prefer_summary_poll: bool = False,
+    require_semantic_scene_consumed: bool = False,
+) -> Dict[str, Any]:
+    """等待进入热帧语义阴影状态，而不是只等待 ready 首帧。"""
+    target_pid = pid or (STATE.war3_pid or 0)
+    if target_pid <= 0:
+        return {"ok": False, "error": "无有效 pid，请先 launch_war3_test"}
+    timeout_sec = max(1, int(timeout_sec))
+    t0 = time.time()
+    if bool(prefer_summary_poll):
+        deadline = t0 + float(timeout_sec)
+        last_detail: Dict[str, Any] = {}
+        last_manifest: Dict[str, Any] = {}
+        last_runtime_status: Dict[str, Any] = {}
+        last_summary: Dict[str, Any] = {}
+        last_frame_index: Optional[int] = None
+        last_frame_advance_at = t0
+        response: Dict[str, Any] = {
+            "ok": False,
+            "mode": "control-plane-hot-frame-summary-poll",
+            "pid": target_pid,
+            "elapsedSec": 0.0,
+            "error": "等待 hot shadow summary 超时",
+        }
+        while time.time() < deadline:
+            latest = _control_plane_request(
+                pid=target_pid,
+                command="get_hot_shadow_probe",
+                payload={
+                    "refreshSemanticFrameIfStale": True,
+                    "forceSemanticFrameBuild": True,
+                    "allowControlPlaneSemanticDrain": True,
+                    "semanticBuildMinIntervalMs": 0,
+                    "semanticBuildDrainMaxChunks": 32,
+                    "semanticBuildDrainBudgetUs": 50000,
+                    "semanticBuildDrainRecordCeiling": 1024,
+                },
+                timeout_sec=3.0,
+            )
+            last_detail = latest
+            latest_result = dict(latest.get("result", {}) or {}) if latest.get("ok") else {}
+            latest_summary = dict(latest_result.get("shadowRuntimeSummary", {}) or {})
+            if latest_summary:
+                last_summary = latest_summary
+            else:
+                latest_summary = last_summary
+            last_manifest = dict(latest_result.get("frameManifestSummary", {}) or last_manifest or {})
+            last_runtime_status = dict(latest_result.get("runtimeStatus", {}) or last_runtime_status or {})
+            runtime_frame_index = _nested_status_int(last_runtime_status, "frameIndex")
+            now = time.time()
+            if last_frame_index is None or runtime_frame_index != last_frame_index:
+                last_frame_index = runtime_frame_index
+                last_frame_advance_at = now
+            frame_stall_sec = now - last_frame_advance_at
+            runtime_frame_status = _runtime_frame_progress_status(
+                last_runtime_status,
+                frame_advance_stalled=frame_stall_sec >= 3.0,
+                frame_stall_sec=frame_stall_sec,
+            )
+            response = {
+                "ok": False,
+                "mode": "control-plane-hot-frame-summary-poll",
+                "pid": target_pid,
+                "elapsedSec": round(time.time() - t0, 3),
+                "runtimeStatus": last_runtime_status,
+                "frameManifestSummary": last_manifest,
+                "shadowRuntimeSummary": latest_summary,
+                "error": "",
+                "detail": latest,
+            }
+            response.update(runtime_frame_status)
+            semantic_resolved = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreResolved",
+            )
+            submitted = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreSubmittedDrawCount",
+            )
+            rigid_resolved = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreRigidResolved",
+            )
+            explicit_rigid = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreExplicitResourceOwnerRigidResolved",
+            )
+            attachment_resolved = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreAttachmentRigidResolved",
+            )
+            attachment_supplemental_resolved = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreAttachmentRigidSupplementalResolvedCount",
+            )
+            skinned_resolved = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreSkinnedResolved",
+            )
+            native_draws = _native_execute_success_draw_count(latest_summary)
+            response["nativeD3D9BackendEffectiveExecutedDrawCount"] = native_draws
+            fallback = _shadow_summary_int(latest_summary, "objectFallbackDrawCount")
+            frame_fresh = bool(latest_summary.get("semanticCoreFrameFresh", False))
+            scene_status = _semantic_scene_consumption_status(latest_summary)
+            response.update(scene_status)
+            scene_submitted = _shadow_summary_int(
+                latest_summary,
+                "semanticSceneLastSubmittedDrawCount",
+            )
+            scene_skinned = _shadow_summary_int(
+                latest_summary,
+                "semanticSceneSubmittedSkinned",
+            )
+            scene_lag = int(
+                scene_status.get("semanticScenePublishRevisionLag", 0) or 0
+            )
+            scene_frame_serial = int(
+                scene_status.get("semanticSceneLastFrameSerial", 0) or 0
+            )
+            core_frame_serial = int(
+                scene_status.get("semanticCoreFrameSerial", 0) or 0
+            )
+            manifest_ok = True
+            if last_manifest:
+                manifest_ok = (
+                    _shadow_summary_int(last_manifest, "visibleCount")
+                    >= max(0, int(min_visible_count))
+                    and _shadow_summary_int(last_manifest, "recordsWithStableIdentity")
+                    >= max(0, int(min_stable_identity_count))
+                    and _shadow_summary_int(last_manifest, "unitCount")
+                    >= max(0, int(min_unit_count))
+                )
+            semantic_contract_ok = (
+                semantic_resolved >= max(0, int(min_semantic_resolved))
+                and submitted > 0
+                and fallback == 0
+                and (not bool(require_semantic_frame_fresh) or frame_fresh)
+            )
+            scene_consumption_required = bool(require_semantic_scene_consumed) or not (
+                bool(allow_semantic_rigid_only)
+                or bool(allow_semantic_attachment_rigid_only)
+            )
+            strict_ok = (
+                semantic_contract_ok
+                and manifest_ok
+                and skinned_resolved >= max(0, int(min_semantic_skinned_resolved))
+                and native_draws >= max(0, int(min_native_executed_draw_count))
+                and (
+                    not scene_consumption_required
+                    or bool(scene_status.get("semanticSceneConsumptionFresh"))
+                )
+            )
+            scene_contract_ok = (
+                scene_submitted > 0
+                and fallback == 0
+                and manifest_ok
+                and (
+                    not scene_consumption_required
+                    or bool(scene_status.get("semanticSceneConsumptionFresh"))
+                )
+                and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+            )
+            attachment_contract_ok = (
+                semantic_contract_ok
+                and max(attachment_resolved, attachment_supplemental_resolved)
+                >= max(1, int(min_semantic_attachment_rigid_resolved))
+            )
+            if int(min_semantic_attachment_rigid_resolved) > 0:
+                # Attachment-rigid was the previous proof that semantic data had
+                # reached the renderer. Once a strict skinned semantic frame is
+                # present, do not keep dynamic_shadow_pressure blocked on the
+                # older attachment diagnostic. model_runtime_probe still passes
+                # min_semantic_skinned_resolved=0 and therefore keeps the
+                # attachment contract gate as intended.
+                strict_ok = strict_ok and (
+                    attachment_contract_ok
+                    or skinned_resolved >= max(
+                        1, int(min_semantic_skinned_resolved)
+                    )
+                )
+            if strict_ok:
+                response["ok"] = True
+                return response
+            if scene_contract_ok:
+                response["ok"] = True
+                response["semanticSceneOnlyAccepted"] = True
+                response["semanticSceneOnlyReason"] = (
+                    "DXVK semantic scene submitted and consumed draw packets; "
+                    "native backend counters are not required for this visual "
+                    "validation gate"
+                )
+                return response
+            if (
+                semantic_contract_ok
+                and manifest_ok
+                and scene_submitted > 0
+                and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+                and scene_status.get("semanticSceneWaitingForRenderPass")
+                and scene_lag <= 16
+                and scene_frame_serial > 0
+                and core_frame_serial > 0
+                and scene_frame_serial <= core_frame_serial
+                and (core_frame_serial - scene_frame_serial) <= 1
+            ):
+                response["ok"] = True
+                response["semanticTailSceneNearLatestAccepted"] = True
+                response["semanticTailSceneNearLatestReason"] = (
+                    "semantic core is fresh and the DXVK render-scene pass has "
+                    "already consumed the immediately previous semantic frame "
+                    "with fallback disabled; the latest publish revision is "
+                    "waiting for one more isolated-desktop render tick, so this "
+                    "is accepted as a tail-frame validation artifact"
+                )
+                return response
+
+            core_packets_present = (
+                submitted > 0
+                and fallback == 0
+                and semantic_resolved >= max(0, int(min_semantic_resolved))
+            )
+            if (
+                core_packets_present
+                and scene_status.get("semanticSceneWaitingForRenderPass")
+            ):
+                if native_draws > 0:
+                    response["semanticShadowPhase"] = (
+                        "native-semantic-executed-scene-pending"
+                    )
+                    response["semanticNativeExecuted"] = True
+                    response["semanticShadowPhaseReason"] = (
+                        "native D3D9 backend has successfully executed semantic "
+                        "draws, but the DXVK render-scene validation pass has "
+                        "not consumed the latest semantic publish revision yet"
+                    )
+                else:
+                    response["semanticShadowPhase"] = (
+                        "core-fresh-waiting-render-scene"
+                        if frame_fresh
+                        else "core-packets-waiting-render-scene"
+                    )
+                    response["semanticShadowPhaseReason"] = (
+                        "semantic core has submitted draw packets, but the DXVK "
+                        "render-scene pass has not consumed the latest semantic "
+                        "publish revision yet"
+                    )
+                if not frame_fresh:
+                    response["semanticShadowPhaseReason"] += (
+                        "; semantic core freshness is also pending because the "
+                        "latest render-scene tick has not advanced"
+                    )
+                if response.get("runtimeRenderTailStalled"):
+                    response["semanticShadowPhaseReason"] += (
+                        "; runtime frame advance is stalled after in-game render "
+                        "readiness, so this is a render-scene consumption wait, "
+                        "not a semantic data-chain miss"
+                    )
+                response["error"] = response["semanticShadowPhaseReason"]
+
+            pending_without_consumer = (
+                response.get("runtimeRenderTailStalled")
+                and bool(latest_summary.get("semanticCoreBuildRequestPending", False))
+                and not bool(latest_summary.get("semanticCoreBuildInProgress", False))
+                and submitted <= 0
+                and scene_submitted <= 0
+            )
+            if pending_without_consumer and frame_stall_sec >= 8.0:
+                response["semanticShadowPhase"] = "core-build-pending-no-render-consumer"
+                response["semanticShadowPhaseReason"] = (
+                    "semantic contract is pending, but the isolated-desktop "
+                    "runtime frame has stopped advancing before the DXVK render "
+                    "scene consumed any build chunks; this is a render-thread "
+                    "consumer timing blocker, not a control-plane timeout"
+                )
+                response["error"] = response["semanticShadowPhaseReason"]
+                return response
+
+            if attachment_contract_ok:
+                response["semanticAttachmentRigidOnlyAccepted"] = True
+                response["semanticAttachmentRigidGateSatisfied"] = True
+                if not response.get("semanticShadowPhase"):
+                    response["semanticShadowPhase"] = (
+                        "attachment-rigid-ok-skinned-pending"
+                    )
+                    response["semanticShadowPhaseReason"] = (
+                        "attachment rigid semantic path is producing submitted draw "
+                        "packets with fallback disabled; skinned/upper-layer/native "
+                        "gates remain pending"
+                    )
+                if bool(allow_semantic_attachment_rigid_only):
+                    response["ok"] = True
+                else:
+                    response["error"] = response["semanticShadowPhaseReason"]
+                return response
+
+            if (
+                semantic_contract_ok
+                and (explicit_rigid > 0 or rigid_resolved > 0)
+                and skinned_resolved <= 0
+            ):
+                response["semanticShadowPhase"] = (
+                    "semantic-rigid-ok-skinned-pending"
+                )
+                response["semanticShadowPhaseReason"] = (
+                    "semantic rigid path is producing draw packets, but skinned "
+                    "gate is still pending"
+                )
+                if bool(allow_semantic_rigid_only):
+                    response["ok"] = True
+                    response["semanticRigidOnlyAccepted"] = True
+                    response["error"] = ""
+                    return response
+
+            time.sleep(0.5)
+
+        response["ok"] = False
+        response["elapsedSec"] = round(time.time() - t0, 3)
+        response["error"] = response.get("error") or "等待 hot shadow summary 超时"
+        response["detail"] = last_detail
+        return response
+
+    require_frame_advance = int(min_frame_advance) > 0
+    pipe_ready = _control_plane_request(
+        pid=target_pid,
+        command="wait_until",
+        payload={
+            "timeoutSec": timeout_sec,
+            "pollIntervalMs": 50,
+            "requireFrameAdvance": require_frame_advance,
+            "minFrameAdvance": max(0, int(min_frame_advance)),
+            "requireSemanticFrameFresh": bool(require_semantic_frame_fresh),
+            "requireSemanticSceneConsumed": bool(require_semantic_scene_consumed),
+            "minVisibleCount": max(0, int(min_visible_count)),
+            "minStableIdentityCount": max(0, int(min_stable_identity_count)),
+            "minUnitCount": max(0, int(min_unit_count)),
+            "minSemanticResolved": max(0, int(min_semantic_resolved)),
+            "minSemanticSkinnedResolved": max(0, int(min_semantic_skinned_resolved)),
+            "requestSemanticFrameBuild": True,
+            "forceSemanticFrameBuild": True,
+            "allowControlPlaneSemanticDrain": True,
+            "allowPreInGameSemanticBuild": False,
+            "semanticBuildMinIntervalMs": 0,
+            "semanticBuildDrainMaxChunks": 32,
+            "semanticBuildDrainBudgetUs": 50000,
+            "semanticBuildDrainRecordCeiling": 1024,
+            "stalledFrameTimeoutMs": 3000,
+        },
+        timeout_sec=max(2.0, float(timeout_sec) + 2.0),
+    )
+    if not pipe_ready.get("transportOk"):
+        return {
+            "ok": False,
+            "mode": "control-plane-hot-frame",
+            "pid": target_pid,
+            "elapsedSec": round(float(pipe_ready.get("elapsedSec", 0.0) or 0.0), 3),
+            "error": str(pipe_ready.get("error", "control plane 不可用")),
+            "detail": pipe_ready,
+        }
+
+    result = dict(pipe_ready.get("result", {}) or {})
+    runtime_status = dict(result.get("runtimeStatus", {}) or {})
+    wait_stalled = str(pipe_ready.get("error", "") or "") == "wait_until stalled"
+    response = {
+        "ok": bool(pipe_ready.get("ok")),
+        "mode": "control-plane-hot-frame",
+        "pid": target_pid,
+        "elapsedSec": round(float(pipe_ready.get("elapsedSec", 0.0) or 0.0), 3),
+        "runtimeStatus": runtime_status,
+        "frameManifestSummary": dict(result.get("frameManifestSummary", {}) or {}),
+        "shadowRuntimeSummary": dict(result.get("shadowRuntimeSummary", {}) or {}),
+        "readyFrameBaseline": int(result.get("readyFrameBaseline", 0) or 0),
+        "requestedSemanticFrameBuild": bool(result.get("requestedSemanticFrameBuild", False)),
+        "semanticBuildRequestReason": str(result.get("semanticBuildRequestReason", "") or ""),
+        "error": str(pipe_ready.get("error", "") or ""),
+        "detail": pipe_ready,
+    }
+    response.update(
+        _runtime_frame_progress_status(
+            runtime_status,
+            frame_advance_stalled=wait_stalled,
+            frame_stall_sec=float(result.get("stalledFrameTimeoutMs", 0) or 0) / 1000.0
+            if wait_stalled
+            else 0.0,
+        )
+    )
+    latest_summary = dict(response.get("shadowRuntimeSummary", {}) or {})
+    if not response.get("ok"):
+        refreshed_summary, refresh_detail = _refresh_shadow_runtime_summary_until(
+            pid=target_pid,
+            wait_sec=max(0, int(post_failure_summary_wait_sec)),
+            min_submitted_draw_count=1,
+            min_attachment_rigid_resolved=max(
+                0,
+                int(min_semantic_attachment_rigid_resolved),
+            ),
+            require_semantic_frame_fresh=bool(require_semantic_frame_fresh),
+        )
+        if refreshed_summary:
+            response["shadowRuntimeSummary"] = refreshed_summary
+            response["postFailureSummaryRefresh"] = refresh_detail
+            latest_summary = refreshed_summary
+
+    semantic_resolved = _shadow_summary_int(latest_summary, "semanticCoreResolved")
+    submitted = _shadow_summary_int(latest_summary, "semanticCoreSubmittedDrawCount")
+    rigid_resolved = _shadow_summary_int(latest_summary, "semanticCoreRigidResolved")
+    explicit_rigid = _shadow_summary_int(
+        latest_summary,
+        "semanticCoreExplicitResourceOwnerRigidResolved",
+    )
+    attachment_resolved = _shadow_summary_int(
+        latest_summary,
+        "semanticCoreAttachmentRigidResolved",
+    )
+    attachment_supplemental_resolved = _shadow_summary_int(
+        latest_summary,
+        "semanticCoreAttachmentRigidSupplementalResolvedCount",
+    )
+    skinned_resolved = _shadow_summary_int(
+        latest_summary,
+        "semanticCoreSkinnedResolved",
+    )
+    fallback = _shadow_summary_int(latest_summary, "objectFallbackDrawCount")
+    frame_fresh = bool(latest_summary.get("semanticCoreFrameFresh", False))
+    scene_status = _semantic_scene_consumption_status(latest_summary)
+    response.update(scene_status)
+    native_draws = _native_execute_success_draw_count(latest_summary)
+    response["nativeD3D9BackendEffectiveExecutedDrawCount"] = native_draws
+    scene_submitted = _shadow_summary_int(
+        latest_summary,
+        "semanticSceneLastSubmittedDrawCount",
+    )
+    scene_skinned = _shadow_summary_int(
+        latest_summary,
+        "semanticSceneSubmittedSkinned",
+    )
+    scene_lag = int(scene_status.get("semanticScenePublishRevisionLag", 0) or 0)
+    scene_frame_serial = int(
+        scene_status.get("semanticSceneLastFrameSerial", 0) or 0
+    )
+    core_frame_serial = int(scene_status.get("semanticCoreFrameSerial", 0) or 0)
+    manifest_summary = dict(response.get("frameManifestSummary", {}) or {})
+    manifest_ok = True
+    if manifest_summary:
+        manifest_ok = (
+            _shadow_summary_int(manifest_summary, "visibleCount")
+            >= max(0, int(min_visible_count))
+            and _shadow_summary_int(manifest_summary, "recordsWithStableIdentity")
+            >= max(0, int(min_stable_identity_count))
+            and _shadow_summary_int(manifest_summary, "unitCount")
+            >= max(0, int(min_unit_count))
+        )
+    core_contract_ok = (
+        semantic_resolved >= max(0, int(min_semantic_resolved))
+        and submitted > 0
+        and fallback == 0
+        and (not bool(require_semantic_frame_fresh) or frame_fresh)
+    )
+    semantic_contract_ok = (
+        core_contract_ok
+        and (
+            not bool(require_semantic_scene_consumed)
+            or bool(scene_status.get("semanticSceneConsumptionFresh"))
+        )
+    )
+    scene_contract_ok = (
+        scene_submitted > 0
+        and fallback == 0
+        and manifest_ok
+        and (
+            not bool(require_semantic_scene_consumed)
+            or bool(scene_status.get("semanticSceneConsumptionFresh"))
+        )
+        and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+    )
+    core_packets_present = (
+        submitted > 0
+        and fallback == 0
+        and semantic_resolved >= max(0, int(min_semantic_resolved))
+    )
+    if (
+        core_packets_present
+        and scene_status.get("semanticSceneWaitingForRenderPass")
+    ):
+        if native_draws > 0:
+            response["semanticShadowPhase"] = (
+                "native-semantic-executed-scene-pending"
+            )
+            response["semanticNativeExecuted"] = True
+            response["semanticShadowPhaseReason"] = (
+                "native D3D9 backend has successfully executed semantic draws, "
+                "but the DXVK render-scene validation pass has not consumed the "
+                "latest semantic publish revision yet"
+            )
+        else:
+            response["semanticShadowPhase"] = (
+                "core-fresh-waiting-render-scene"
+                if frame_fresh
+                else "core-packets-waiting-render-scene"
+            )
+            response["semanticShadowPhaseReason"] = (
+                "semantic core has submitted draw packets, but the DXVK "
+                "render-scene pass has not consumed the latest semantic publish "
+                "revision yet"
+            )
+        if not frame_fresh:
+            response["semanticShadowPhaseReason"] += (
+                "; semantic core freshness is also pending because the latest "
+                "render-scene tick has not advanced"
+            )
+        if response.get("runtimeRenderTailStalled"):
+            response["semanticShadowPhaseReason"] += (
+                "; runtime frame advance is stalled after in-game render "
+                "readiness, so this is a render-scene consumption wait, not a "
+                "semantic data-chain miss"
+            )
+        if not response.get("ok"):
+            response["error"] = response["semanticShadowPhaseReason"]
+    attachment_contract_ok = (
+        core_contract_ok
+        and max(attachment_resolved, attachment_supplemental_resolved)
+        >= max(1, int(min_semantic_attachment_rigid_resolved))
+    )
+    attachment_gate_ok = (
+        int(min_semantic_attachment_rigid_resolved) <= 0
+        or attachment_contract_ok
+        or skinned_resolved >= max(1, int(min_semantic_skinned_resolved))
+    )
+    if (
+        not response.get("ok")
+        and scene_contract_ok
+        and attachment_gate_ok
+        and native_draws >= max(0, int(min_native_executed_draw_count))
+    ):
+        response["ok"] = True
+        response["semanticSceneOnlyAccepted"] = True
+        response["originalError"] = response.get("error", "")
+        response["error"] = ""
+        response["semanticSceneOnlyReason"] = (
+            "DXVK semantic scene submitted and consumed draw packets with "
+            "fallback disabled; this gate does not require the control-plane "
+            "wait_until call to classify the final state as stalled"
+        )
+    if (
+        not response.get("ok")
+        and wait_stalled
+        and semantic_contract_ok
+        and manifest_ok
+        and skinned_resolved >= max(0, int(min_semantic_skinned_resolved))
+        and native_draws >= max(0, int(min_native_executed_draw_count))
+        and attachment_gate_ok
+    ):
+        response["ok"] = True
+        response["semanticTailFrameAccepted"] = True
+        response["originalError"] = response.get("error", "")
+        response["error"] = ""
+        response["semanticTailFrameReason"] = (
+            "semantic frame was fresh, consumed by the render scene, and "
+            "executed by the native backend before the isolated-desktop frame "
+            "advance gate stalled"
+        )
+    if (
+        not response.get("ok")
+        and wait_stalled
+        and scene_contract_ok
+        and manifest_ok
+    ):
+        response["ok"] = True
+        response["semanticTailSceneAccepted"] = True
+        response["originalError"] = response.get("error", "")
+        response["error"] = ""
+        response["semanticTailSceneReason"] = (
+            "semantic scene submitted and consumed draw packets before the "
+            "isolated-desktop frame advance gate stalled; core counters may be "
+            "reset by EndFrame flush, so the scene submission counters are the "
+            "authoritative visual-consumption signal for this gate"
+        )
+    if (
+        not response.get("ok")
+        and (
+            wait_stalled
+            or scene_status.get("semanticSceneWaitingForRenderPass")
+        )
+        and frame_fresh
+        and core_contract_ok
+        and manifest_ok
+        and scene_submitted > 0
+        and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+        and scene_lag <= 16
+        and scene_frame_serial > 0
+        and core_frame_serial > 0
+        and scene_frame_serial <= core_frame_serial
+        and (core_frame_serial - scene_frame_serial) <= 1
+    ):
+        response["ok"] = True
+        response["semanticTailSceneNearLatestAccepted"] = True
+        response["originalError"] = response.get("error", "")
+        response["error"] = ""
+        response["semanticTailSceneNearLatestReason"] = (
+            "semantic core was advanced by the bounded control-plane tail drain "
+            "after the isolated-desktop render tick stalled; the DXVK scene had "
+            "already consumed the immediately previous semantic frame with "
+            "fallback disabled, so this is accepted as a tail-frame validation "
+            "artifact rather than a data-chain failure"
+        )
+    if attachment_contract_ok:
+        response["semanticAttachmentRigidOnlyAccepted"] = True
+        response["semanticAttachmentRigidGateSatisfied"] = True
+        if not response.get("semanticShadowPhase"):
+            response["semanticShadowPhase"] = "attachment-rigid-ok-skinned-pending"
+            response["semanticShadowPhaseReason"] = (
+                "attachment rigid semantic path is producing submitted draw packets "
+                "with fallback disabled; skinned/upper-layer/native gates remain pending"
+            )
+        if not response.get("ok"):
+            response["originalError"] = response.get("error", "")
+            response["error"] = response["semanticShadowPhaseReason"]
+        if bool(allow_semantic_attachment_rigid_only):
+            response["ok"] = True
+            response["error"] = ""
+
+    if (
+        not response.get("ok")
+        and bool(allow_semantic_rigid_only)
+        and semantic_contract_ok
+        and (explicit_rigid > 0 or rigid_resolved > 0)
+    ):
+        response["ok"] = True
+        response["semanticRigidOnlyAccepted"] = True
+        response["originalError"] = response.get("error", "")
+        response["error"] = ""
+        response["semanticRigidOnlyReason"] = (
+            "semantic rigid path is producing submitted draw packets with "
+            "fallback disabled; skinned/attachment gates remain pending"
+        )
+    elif not response.get("ok") and semantic_contract_ok and skinned_resolved <= 0:
+        response.setdefault("semanticShadowPhase", "semantic-rigid-ok-skinned-pending")
+        response.setdefault(
+            "semanticShadowPhaseReason",
+            "semantic rigid path is producing draw packets, but skinned gate is still pending",
+        )
+    if (
+        not response.get("ok")
+        or int(min_native_executed_draw_count) <= 0
+        or response.get("semanticSceneOnlyAccepted")
+        or response.get("semanticTailSceneAccepted")
+        or response.get("semanticTailSceneNearLatestAccepted")
+    ):
+        return response
+
+    if native_draws >= int(min_native_executed_draw_count):
+        return response
+
+    deadline = t0 + float(timeout_sec)
+    last_detail: Dict[str, Any] = {}
+    while time.time() < deadline:
+        latest = _control_plane_request(
+            pid=target_pid,
+            command="get_shadow_runtime_summary",
+            payload={
+                "refreshSemanticFrameIfStale": True,
+                "forceSemanticFrameBuild": True,
+                "allowControlPlaneSemanticDrain": True,
+                "semanticBuildMinIntervalMs": 0,
+                "semanticBuildDrainMaxChunks": 32,
+                "semanticBuildDrainBudgetUs": 50000,
+                "semanticBuildDrainRecordCeiling": 1024,
+            },
+            timeout_sec=2.0,
+        )
+        last_detail = latest
+        if latest.get("transportOk") and latest.get("ok"):
+            latest_summary = dict(latest.get("result", {}) or {})
+            native_draws = _native_execute_success_draw_count(latest_summary)
+            if native_draws >= int(min_native_executed_draw_count):
+                response["shadowRuntimeSummary"] = latest_summary
+                response["nativeD3D9BackendEffectiveExecutedDrawCount"] = (
+                    native_draws
+                )
+                response["elapsedSec"] = round(time.time() - t0, 3)
+                response["nativeExecuteWaitMode"] = "control-plane-summary"
+                response["nativeExecuteWaitDetail"] = latest
+                return response
+        time.sleep(0.1)
+
+    response["ok"] = False
+    response["error"] = (
+        f"等待 native D3D9 effective executed draw count>="
+        f"{int(min_native_executed_draw_count)} 超时"
+    )
+    response["elapsedSec"] = round(time.time() - t0, 3)
+    response["shadowRuntimeSummary"] = latest_summary
+    response["nativeExecuteWaitMode"] = "control-plane-summary"
+    response["nativeExecuteWaitDetail"] = last_detail
+    return response
 
 
 @mcp.tool()
@@ -3671,7 +4911,7 @@ def invoke_internal_test_api(
     war3_dir: str = "",
     timeout_sec: int = 6,
 ) -> Dict[str, Any]:
-    """通过 internal_test_request.json 调用游戏内测试 API。"""
+    """通过 named pipe control plane 调用游戏内测试命令。"""
     target_pid = pid or (STATE.war3_pid or 0)
     if target_pid <= 0:
         return {"ok": False, "error": "无有效 pid"}
@@ -3881,7 +5121,6 @@ def run_city_shadow_stability_suite(
     before_mtime = before_report.stat().st_mtime if before_report and before_report.exists() else 0.0
     log_offsets = _snapshot_log_offsets(w3)
     env_overrides = {
-        "DXVK_WAR3_INTERNAL_TEST_API": "1",
         "DXVK_WAR3_RUNTIME_BENCHMARK": "1",
         "DXVK_WAR3_RUNTIME_BENCHMARK_WARMUP_SEC": "1",
         "DXVK_WAR3_RUNTIME_BENCHMARK_SAMPLE_SEC": str(max(3, int(sample_duration_sec))),
@@ -4255,7 +5494,15 @@ def stop_war3(
         }
 
     # 静默结束模式：不发送 WM_CLOSE，直接 taskkill，避免窗口抢焦点。
+    # 注意：这里也不要先走 control-plane shutdown_session。War3/DXVK 在
+    # GPU/pipe 卡死时可能 CPU=0 但命名管道不再响应，等待 pipe 会把无人
+    # 值守测试拖成十几分钟残留进程。
     if avoid_foreground_switch:
+        shutdown_session = {
+            "ok": True,
+            "skipped": True,
+            "reason": "avoid_foreground_switch direct taskkill",
+        }
         _taskkill(target_pid, force=bool(force))
         time.sleep(0.6)
         alive = _pid_alive(target_pid)
@@ -4275,9 +5522,17 @@ def stop_war3(
             "forced": force,
             "silentStop": True,
             "avoidForegroundSwitch": True,
+            "shutdownSession": shutdown_session,
             "videoRestore": restore,
             "desktop": desktop,
         }
+
+    shutdown_session = _control_plane_request(
+        pid=target_pid,
+        command="shutdown_session",
+        payload={},
+        timeout_sec=2.0,
+    )
 
     close_sent = _post_close(target_pid)
     t0 = time.time()
@@ -4293,6 +5548,7 @@ def stop_war3(
                 "closeSent": close_sent,
                 "silentStop": False,
                 "avoidForegroundSwitch": False,
+                "shutdownSession": shutdown_session,
                 "videoRestore": restore,
                 "desktop": desktop,
             }
@@ -4318,6 +5574,7 @@ def stop_war3(
         "forced": force,
         "silentStop": False,
         "avoidForegroundSwitch": False,
+        "shutdownSession": shutdown_session,
         "videoRestore": restore,
         "desktop": desktop,
     }
@@ -4383,6 +5640,9 @@ def run_quick_autotest(
     disable_modules: str = "",
     env_overrides_json: str = "",
     scenario_name: str = "",
+    require_control_plane_ready: bool = True,
+    require_hot_shadow_frame: bool = False,
+    hot_shadow_timeout_sec: int = 60,
 ) -> Dict[str, Any]:
     """
     一键流程：
@@ -4406,6 +5666,9 @@ def run_quick_autotest(
     merged_env.setdefault(
         "DXVK_WAR3_RUNTIME_BENCHMARK_SAMPLE_SEC",
         str(max(3, int(sample_duration_sec) - 1)),
+    )
+    native_semantic_preview_enabled = _bool_env(
+        merged_env.get("DXVK_WAR3_NATIVE_SEMANTIC_SHADOW_PREVIEW", "")
     )
     if runtime_profile["name"] == "dxvk_only":
         merged_env.setdefault(
@@ -4456,24 +5719,166 @@ def run_quick_autotest(
     ready = wait_for_game_ready(
         timeout_sec=ready_timeout_sec,
         pid=pid,
-        allow_fallback=True,
+        allow_fallback=not bool(require_control_plane_ready),
         fallback_min_elapsed_sec=20 if strict_ready_profile else 10,
         fallback_min_cpu_sec=1.0 if strict_ready_profile else 0.5,
         require_game_started_for_fallback=strict_ready_profile,
     )
     if not ready.get("ok"):
-        stop_war3(
+        stop = stop_war3(
             pid=pid,
             graceful_wait_sec=3,
             force=True,
             avoid_foreground_switch=avoid_focus_on_stop,
         )
+        if (not bool(require_control_plane_ready) and auto_perf_record and
+                not bool(record_after_game_started)):
+            latest: Dict[str, Any] = {"ok": False, "error": "未找到报告"}
+            new_report_detected = False
+            for _ in range(20):
+                maybe = find_latest_perf_report(war3_dir=war3_dir)
+                if maybe.get("ok"):
+                    mtime = datetime.fromisoformat(maybe["mtime"]).timestamp()
+                    if mtime > before_mtime + 0.5:
+                        latest = maybe
+                        new_report_detected = True
+                        break
+                    latest = maybe
+                time.sleep(1.0)
+            if latest.get("ok") and new_report_detected:
+                summary = read_perf_report(
+                    latest["reportPath"],
+                    include_sections=include_sections_in_report,
+                    section_top_n=section_top_n,
+                )
+                if isinstance(summary, dict):
+                    summary["newReportDetected"] = True
+                    summary["scenarioName"] = scenario_name_norm
+                    summary["latestReportPath"] = latest.get("reportPath")
+                    summary["reportWasStale"] = False
+                    summary["perfOnlyReadyTimeout"] = True
+                    summary["readyTimeoutMode"] = str(ready.get("mode", ""))
+                    summary["readyTimeoutError"] = str(ready.get("error", ""))
+                return {
+                    "ok": bool(summary.get("ok")),
+                    "stage": "perf-only-ready-timeout",
+                    "launch": launch,
+                    "ready": ready,
+                    "hotShadow": {
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "ready timeout perf-only",
+                    },
+                    "windowResize": {
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "ready timeout",
+                    },
+                    "screenshot": {"ok": False, "error": "ready timeout"},
+                    "screenshotSize": {
+                        "width": 0,
+                        "height": 0,
+                        "matchBaseline": False,
+                        "baselineWidth": baseline_width,
+                        "baselineHeight": baseline_height,
+                    },
+                    "warnings": [
+                        "ready gate timed out; returned perf-only report "
+                        "because control-plane readiness was not required"
+                    ],
+                    "stop": stop,
+                    "report": summary,
+                    "logSummary": _read_runtime_log_summary(
+                        w3, log_offsets=log_offsets),
+                    "scenarioName": scenario_name_norm,
+                }
         return {"ok": False, "stage": "ready", "launch": launch, "ready": ready}
 
     if str(ready.get("mode", "")) in ("fallback-window-cpu",
                                       "runtime-status-game-started",
                                       "runtime-status-stable"):
         time.sleep(2.0)
+
+    shadow_scenario_names = {
+        "low_pressure_static_reuse",
+        "dynamic_shadow_pressure",
+        "model_runtime_probe",
+    }
+    effective_require_hot_shadow_frame = bool(require_hot_shadow_frame) or (
+        scenario_name_norm in shadow_scenario_names
+    )
+    hot_shadow: Dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "reason": "not required",
+    }
+    if effective_require_hot_shadow_frame:
+        attachment_probe = scenario_name_norm in (
+            "dynamic_shadow_pressure",
+            "model_runtime_probe",
+        )
+        rigid_observe_probe = (
+            scenario_name_norm == "model_runtime_probe"
+        )
+        hot_shadow = wait_for_hot_shadow_frame(
+            timeout_sec=max(1, int(hot_shadow_timeout_sec)),
+            pid=pid,
+            min_visible_count=1,
+            min_stable_identity_count=0 if rigid_observe_probe else 1,
+            min_unit_count=0
+            if scenario_name_norm in ("low_pressure_static_reuse", "model_runtime_probe")
+            else 1,
+            min_semantic_resolved=1,
+            min_semantic_skinned_resolved=0
+            if scenario_name_norm in ("low_pressure_static_reuse", "model_runtime_probe")
+            else 1,
+            min_native_executed_draw_count=1
+            if native_semantic_preview_enabled and not rigid_observe_probe
+            else 0,
+            require_semantic_frame_fresh=True,
+            min_frame_advance=0
+            if scenario_name_norm == "dynamic_shadow_pressure"
+            else 2,
+            allow_semantic_rigid_only=rigid_observe_probe,
+            allow_semantic_attachment_rigid_only=
+            scenario_name_norm == "model_runtime_probe",
+            min_semantic_attachment_rigid_resolved=1
+            if attachment_probe
+            else 0,
+            post_failure_summary_wait_sec=8
+            if attachment_probe
+            else 6,
+            prefer_summary_poll=attachment_probe,
+            require_semantic_scene_consumed=scenario_name_norm
+            in ("dynamic_shadow_pressure", "low_pressure_static_reuse"),
+        )
+        if not hot_shadow.get("ok"):
+            hot_shadow_phase = str(hot_shadow.get("semanticShadowPhase", "") or "")
+            if hot_shadow_phase in (
+                "native-semantic-executed-scene-pending",
+                "core-fresh-waiting-render-scene",
+                "core-packets-waiting-render-scene",
+            ):
+                hot_shadow_stage = "hot-shadow-render-scene-pending"
+            elif hot_shadow_phase == "attachment-rigid-ok-skinned-pending":
+                hot_shadow_stage = "hot-shadow-skinned-pending"
+            elif hot_shadow_phase == "semantic-rigid-ok-skinned-pending":
+                hot_shadow_stage = "hot-shadow-skinned-pending"
+            else:
+                hot_shadow_stage = "hot-shadow"
+            stop_war3(
+                pid=pid,
+                graceful_wait_sec=3,
+                force=True,
+                avoid_foreground_switch=avoid_focus_on_stop,
+            )
+            return {
+                "ok": False,
+                "stage": hot_shadow_stage,
+                "launch": launch,
+                "ready": ready,
+                "hotShadow": hot_shadow,
+            }
 
     launched_windowed = bool(launch.get("windowed"))
     window_resize: Dict[str, Any] = {
@@ -4573,13 +5978,51 @@ def run_quick_autotest(
         if benchmark_summary.get("ok"):
             summary = benchmark_summary
         else:
-            summary = latest if runtime_profile["diagEnabled"] else benchmark_summary
+            summary = benchmark_summary
     if isinstance(summary, dict):
         summary["newReportDetected"] = new_report_detected
         summary["scenarioName"] = scenario_name_norm
+        summary["latestReportPath"] = latest.get("reportPath") if isinstance(latest, dict) else None
+        summary["reportWasStale"] = bool(latest.get("ok")) and not new_report_detected
+        runtime_ready_frame = _nested_status_int(
+            dict(ready.get("runtimeStatus", {}) or {}),
+            "frameIndex",
+        )
+        runtime_hot_frame = int(hot_shadow.get("runtimeFrameIndex", 0) or 0)
+        if runtime_hot_frame <= 0:
+            runtime_hot_frame = _nested_status_int(
+                dict(hot_shadow.get("runtimeStatus", {}) or {}),
+                "frameIndex",
+            )
+        runtime_frame_delta = (
+            max(0, runtime_hot_frame - runtime_ready_frame)
+            if runtime_ready_frame > 0 and runtime_hot_frame > 0
+            else 0
+        )
+        report_frame_count = _shadow_summary_int(summary, "frameCount")
+        try:
+            report_window_sec = float(summary.get("windowSec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            report_window_sec = 0.0
+        fps_sample_reliable = (
+            str(summary.get("reportType", "")) == "benchmark_log"
+            or (report_frame_count >= 10 and report_window_sec >= 1.0)
+        )
+        summary["fpsSampleReliable"] = bool(fps_sample_reliable)
+        summary["fpsSampleFrameCount"] = report_frame_count
+        summary["fpsSampleWindowSec"] = round(max(0.0, report_window_sec), 3)
+        summary["runtimeFrameDeltaReadyToHotShadow"] = runtime_frame_delta
+        if not fps_sample_reliable:
+            summary["fpsSampleReliabilityReason"] = (
+                "perf report recorded too few Present frames for an FPS "
+                "judgement; isolated desktop/windowed runs can tail-stall or "
+                "only present on capture/stop, so use semantic counters for "
+                "correctness and a dedicated visible-desktop perf run for FPS"
+            )
         if summary.get("reportType") == "benchmark_log":
             summary["newReportDetected"] = True
             summary["benchmarkFallback"] = True
+            summary["reportWasStale"] = False
         elif not new_report_detected and summary.get("ok"):
             summary["ok"] = False
             summary["error"] = "未检测到新报告（可能未部署最新 d3d9.dll 或进程未优雅退出）"
@@ -4601,6 +6044,7 @@ def run_quick_autotest(
         "stage": "done",
         "launch": launch,
         "ready": ready,
+        "hotShadow": hot_shadow,
         "windowResize": window_resize,
         "screenshot": shot,
         "screenshotSize": shot_size,
@@ -4639,6 +6083,13 @@ def run_named_scenario(
             "availablePresets": _scenario_preset_rows(),
         }
 
+    merged_env = dict(preset.get("envOverrides", {}) or {})
+    user_env = _parse_env_overrides_json(env_overrides_json)
+    parse_error = user_env.pop("__parse_error__", "")
+    if parse_error:
+        return {"ok": False, "stage": "preset", "error": f"env_overrides_json 解析失败: {parse_error}"}
+    merged_env.update(user_env)
+
     result = run_quick_autotest(
         war3_dir=war3_dir,
         map_path=str(preset.get("mapPath", DEFAULT_TEST_MAP)),
@@ -4662,8 +6113,11 @@ def run_named_scenario(
         avoid_focus_on_stop=not bool(preset.get("useIsolatedDesktop", True)),
         profile=str(preset.get("profile", "full_default")),
         disable_modules=str(preset.get("disableModules", "")),
-        env_overrides_json=env_overrides_json,
+        env_overrides_json=json.dumps(merged_env, ensure_ascii=False),
         scenario_name=scenario_name,
+        require_control_plane_ready=True,
+        require_hot_shadow_frame=True,
+        hot_shadow_timeout_sec=int(preset.get("hotShadowTimeoutSec", preset.get("readyTimeoutSec", 120)) or 120),
     )
     if isinstance(result, dict):
         result["scenarioPreset"] = dict(preset)

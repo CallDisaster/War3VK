@@ -62,9 +62,13 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
 
       // Render 域
       0x7B28F0, // renderDispatcher
+      0x368480, // worldFrameUpdateAndPreparePasses
+      0x3681C0, // worldRenderScene
       0x139190, // renderQueueAddBatch
       0x1375C0, // renderBatchSubmit
+      0x137AF0, // aucTransparentAddEntry
       0x7B7830, // sceneSubmitBatch
+      0x0CB110, // worldObjectListEntryWrite
       0x184EE0, // worldObjectEntryRender
       0x363020, // worldDispatch
       0x368E30, // worldObjectsRenderGroup

@@ -30,6 +30,7 @@
 #include "war3/memory/war3_storm_hook.h"
 #include "war3/memory/war3_tlsf_pool.h"
 #include "war3/model/war3_model_hook.h"
+#include "war3/native/war3_native_hooks.h"
 #include "war3/platform/war3_module_api.h"
 #include "war3/platform/war3_runtime_bootstrap.h"
 #include "war3/reimpl/war3_render_queue.h"
@@ -71,6 +72,8 @@ thread_local bool s_inMainRunner = false;
 std::atomic<bool> g_war3_runtime_activated{false};
 
 namespace {
+
+std::atomic<bool> s_nativeTakeoverInstallAttempted{false};
 
 using dxvk::war3::IsExecutableRange;
 using dxvk::war3::IsReadableRange;
@@ -360,6 +363,7 @@ void ActivateWar3Runtime(uintptr_t gameBase, const char *source) {
   ::war3_init();
   dxvk::war3::War3Events::get().fireOnJassReady();
   war3dbg::Print("DXVK War3Hook: War3 runtime fully initialized\n");
+  war3dbg::Print("DXVK War3Hook: JASS runtime fully initialized\n");
   auto tFull = std::chrono::high_resolution_clock::now();
 
   dxvk::war3::War3Events::get().registerOnGameExit(
@@ -578,10 +582,16 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
   }
 
   if constexpr (dxvk::war3::internal::kWar3ModelHookEnabled) {
-    war3::model::Init(gameInfo.base);
+    war3::model::Init(gameInfo.base, false);
   } else {
     war3dbg::Print(
         "DXVK War3Hook: 二分诊断态关闭 runtime model hook 初始化\n");
+  }
+
+  if constexpr (dxvk::war3::internal::kNativeRendererHookTakeoverEnabled) {
+    war3dbg::Print("DXVK War3Hook: Native renderer hook takeover armed for semantic warmup\n");
+  } else {
+    war3dbg::Print("DXVK War3Hook: Native renderer hook takeover disabled\n");
   }
 
   War3Hook::MarkHooksInstalled();
@@ -589,6 +599,7 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
 
 void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
   s_device = device;
+  dxvk::war3::platform::BindNativeShadowDevice(device);
 
   if (g_bootstrapInstalled.load(std::memory_order_acquire))
     return;
@@ -620,8 +631,42 @@ void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
   // Bootstrap 只做“最早期可安全安装”的生命周期/JASS 入口。
   dxvk::war3::hooks::War3HookJass::Install(gameInfo.base);
   dxvk::war3::hooks::War3HookLifecycle::Install(gameInfo.base);
+  if constexpr (dxvk::war3::internal::kWar3ModelHookEnabled &&
+                dxvk::war3::internal::kShadowRuntimeModelBootstrapHookEnabled) {
+    // owner/source provenance 现在已经收敛到“可能发生在 ActivateWar3Runtime
+    // 之前的更早创建窗”。bootstrap 这里只提前安装 provenance 必需 hooks，
+    // 把 sprite/pose/local-point 这类高侵入 hook 留到 runtime 激活后再装，
+    // 避免把整包 model hook 提前到过早生命周期。
+    war3::model::Init(gameInfo.base, true);
+  }
 
   g_bootstrapInstalled.store(true, std::memory_order_release);
+}
+
+void War3Hook::MaybeInstallNativeRendererTakeover(const char *reason) {
+  if constexpr (!dxvk::war3::internal::kNativeRendererHookTakeoverEnabled)
+    return;
+
+  bool expected = false;
+  if (!s_nativeTakeoverInstallAttempted.compare_exchange_strong(
+          expected, true, std::memory_order_relaxed)) {
+    return;
+  }
+
+  const uintptr_t gameBase = GetGameDllBase();
+  if (gameBase == 0u) {
+    war3dbg::Print(
+        "DXVK War3Hook: Native renderer hook takeover skipped - Game.dll base unavailable reason=%s\n",
+        (reason && reason[0]) ? reason : "(unknown)");
+    s_nativeTakeoverInstallAttempted.store(false, std::memory_order_relaxed);
+    return;
+  }
+
+  war3dbg::Print(
+      "DXVK War3Hook: Installing native renderer hook takeover after semantic warmup reason=%s base=%p\n",
+      (reason && reason[0]) ? reason : "(unknown)",
+      reinterpret_cast<void *>(gameBase));
+  ::war3::native::InitializeNativeRendererHooks(gameBase);
 }
 
 void War3Hook::TriggerShadowReplay() {

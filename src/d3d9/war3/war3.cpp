@@ -86,4 +86,13 @@ War3RenderSettings* GetMutableSettings() {
     return pipeline ? &pipeline->MutableSettings() : nullptr;
 }
 
+bool ExecuteSemanticShadowSceneForValidation(
+    bool unitsOnly,
+    bool executeNativeBackendValidation) {
+    auto* device = GetActiveDevice();
+    return device != nullptr &&
+           device->War3ExecuteSemanticShadowSceneForValidation(
+               unitsOnly, executeNativeBackendValidation);
+}
+
 } // namespace dxvk::war3

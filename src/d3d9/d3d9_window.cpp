@@ -158,8 +158,10 @@ namespace dxvk
           if (clientWidth > 0 && clientHeight > 0) {
             const D3DPRESENT_PARAMETERS* currentParams =
               windowData.swapchain->GetPresentParams();
-            if (currentParams->BackBufferWidth != clientWidth
-             || currentParams->BackBufferHeight != clientHeight) {
+            const UINT previousWidth = currentParams->BackBufferWidth;
+            const UINT previousHeight = currentParams->BackBufferHeight;
+            if (previousWidth != clientWidth
+             || previousHeight != clientHeight) {
               D3DPRESENT_PARAMETERS resetParams = *currentParams;
               resetParams.hDeviceWindow = window;
               resetParams.Windowed = TRUE;
@@ -173,7 +175,7 @@ namespace dxvk
                 windowData.swapchain->SetWindowedLogicalSourceExtent(
                   VkExtent2D{clientWidth, clientHeight}, false);
                 dxvk::war3::hooks::TryOverrideWindowedClientSize(
-                  currentParams->BackBufferWidth, currentParams->BackBufferHeight,
+                  previousWidth, previousHeight,
                   clientWidth, clientHeight);
                 dxvk::war3::hooks::TryNotifyWindowedUiSizeChanged(
                   window, clientWidth, clientHeight);
@@ -187,7 +189,7 @@ namespace dxvk
               windowData.swapchain->SetWindowedLogicalSourceExtent(
                 VkExtent2D{clientWidth, clientHeight}, false);
               dxvk::war3::hooks::TryOverrideWindowedClientSize(
-                currentParams->BackBufferWidth, currentParams->BackBufferHeight,
+                previousWidth, previousHeight,
                 clientWidth, clientHeight);
               dxvk::war3::hooks::TryNotifyWindowedUiSizeChanged(
                 window, clientWidth, clientHeight);
