@@ -38,6 +38,9 @@ struct ShadowMaterialSignature {
   uint32_t layerIndex = 0;
   uint32_t queueKind = 0;
   uint32_t transparentType = 0;
+  bool layerContractResolved = false;
+  uint32_t layerContractMeshIndex = 0;
+  uint32_t layerContractLayerCount = 0;
 
   bool valid() const {
     return signatureHash != 0;

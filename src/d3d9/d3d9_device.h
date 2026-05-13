@@ -57,6 +57,7 @@ struct ShadowSubmissionFrame;
 }
 namespace render {
 enum class ObjectKind : uint8_t;
+struct CurrentDrawAuthoritativeSample;
 }
 }
 } // namespace dxvk
@@ -1233,7 +1234,7 @@ private:
   void DetermineConstantLayouts(bool canSWVP);
 
   // War3 渲染管线插入点检测（BeforeUi）
-  void War3MaybeInsertBeforeUi();
+  void War3MaybeInsertBeforeUi(bool forceFrameEnd = false);
 
   // War3：捕获世界相机与投影（用于 CSM/后处理）
   void War3RecordWorldCamera();
@@ -1879,6 +1880,42 @@ private:
     uint64_t totalBytes = 0;
     uint64_t lastSeenFrame = 0;
   };
+  struct War3SemanticDirectCasterContractKey {
+    uint64_t identityKey = 0;
+    uint64_t sceneNode = 0;
+    uint64_t renderablePart = 0;
+    uint64_t meshData = 0;
+
+    bool operator==(const War3SemanticDirectCasterContractKey& other) const {
+      return identityKey == other.identityKey &&
+             meshData == other.meshData;
+    }
+
+    bool valid() const {
+      return identityKey != 0 && meshData != 0;
+    }
+  };
+  struct War3SemanticDirectCasterContractKeyHash {
+    size_t operator()(const War3SemanticDirectCasterContractKey& key) const {
+      const size_t h1 = std::hash<uint64_t>()(key.identityKey);
+      const size_t h2 = std::hash<uint64_t>()(key.meshData);
+      return h1 ^ (h2 + 0x9e3779b9u + (h1 << 6) + (h1 >> 2));
+    }
+  };
+  struct War3SemanticDirectCasterContractState {
+    uint64_t paletteHash = 0;
+    uint64_t groupHash = 0;
+    uint64_t stableGroupHash = 0;
+    uint64_t stream1Ptr = 0;
+    uint64_t geometrySourceHash = 0;
+    uint64_t lastSeenFrame = 0;
+    Matrix4 palette0 = Matrix4();
+    bool hasPalette0 = false;
+  };
+  using War3SemanticDirectCasterContractMap =
+      std::unordered_map<War3SemanticDirectCasterContractKey,
+                         War3SemanticDirectCasterContractState,
+                         War3SemanticDirectCasterContractKeyHash>;
   using War3ShadowFreezeCache =
       std::unordered_map<War3ShadowFreezeCacheKey, War3ShadowFreezeCacheEntry,
                          War3ShadowFreezeCacheKeyHash>;
@@ -1919,6 +1956,9 @@ private:
   uint64_t m_war3ShadowPersistentFrameSerial = 0;
   uint64_t m_war3SemanticSceneLastCaptureFrameSerial = 0;
   uint64_t m_war3SemanticSceneLastCapturePublishRevision = 0;
+  uint64_t m_war3SemanticSceneLastCapturedVisibleFrameSerial = 0;
+  uint64_t m_war3SemanticSceneLastCoverageRecoveryCaptureFrameSerial = 0;
+  uint64_t m_war3SemanticSceneLastPoseOnlyCaptureFrameSerial = 0;
   uint64_t m_war3SemanticSceneLastSteadyBuildFrameSerial = 0;
   uint64_t m_war3SemanticSceneLastZeroSubmitFrameSerial = 0;
   uint64_t m_war3SemanticSceneLastZeroSubmitPublishRevision = 0;
@@ -1930,10 +1970,93 @@ private:
   uint64_t m_war3SemanticDrawTimePoseDirtyFrameSerial = 0;
   uint64_t m_war3SemanticLastMatrixPublisherPoseRevision = 0;
   std::vector<uint64_t> m_war3SemanticDrawTimePoseKeys;
+  // Phase 7.55 v4：draw-time VB position cache（GPU copy 自有 buffer 版本）。
+  // ring buffer 问题：保存 Rc<DxvkBuffer> 引用不够——War3 后续 draw 会覆盖
+  // 同一 buffer 的不同 offset，cache 里的引用 read 时拿到的是错乱数据。
+  // 解决方案：capture 时用 copyBuffer 把这个 draw 实际使用的 vertex range
+  // 拷贝到我们自己的 device-local buffer。以后再有 draw 覆盖原 buffer 也
+  // 不影响我们的 buffer。
+  struct War3DrawTimeVBEntry {
+    void* renderablePart = nullptr;
+    // 我们自有 GPU buffer（device-local），存 capture 帧的 vertex range bytes。
+    // 包含完整 stride 的 vertex 数据；shader 用 positionStride/positionOffset
+    // 读取 xyz。
+    Rc<DxvkBuffer> positionBuffer;
+    DxvkResourceBufferInfo positionInfo = {};
+    uint32_t positionStride = 0u;
+    uint32_t positionOffset = 0u;
+    VkFormat positionFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    uint32_t vertexCount = 0u;
+    // capture 时存好的 Vulkan vertexOffset 值，consume 端直接用。
+    // 含义：buffer 索引 0 应映射到原 VB 索引哪个位置的偏移修正。
+    //   - wrap path（vRangeStart=0）：vertexOffset = BaseVertexIndex
+    //     （让 final_idx = IB_value + BaseVertexIndex 与 D3D9 一致）
+    //   - standard path（vRangeStart=BaseVertexIndex+MinVertexIndex）：
+    //     vertexOffset = -MinVertexIndex（IB 值 v ∈ [Min, Min+Num)，
+    //     映射到 buffer 索引 v - Min；GPU final = (v - Min) + Min = v ≈ buffer
+    //     索引 v - Min，与 D3D9 GPU 读 BaseVI+v 等价）
+    int32_t consumeVertexOffset = 0;
+    // index buffer（未 rebase；index 值仍指向原 vertex 编号空间）
+    Rc<DxvkBuffer> indexBuffer;
+    DxvkResourceBufferInfo indexInfo = {};
+    VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+    uint32_t indexCount = 0u;
+    uint32_t firstIndex = 0u;
+    bool indexed = false;
+    // capture 时的 D3DTS_WORLD 矩阵。
+    // 动态单位（已 CPU skin）：通常是 identity，顶点已是世界空间。
+    // 静态建筑（未 skin）：是该模型的 world 变换矩阵，顶点是模型本地空间。
+    // consume 时直接用这个矩阵作为 draw.worldMatrix，避免误把本地空间顶点
+    // 当世界空间，让静态建筑阴影跑到世界中心。
+    Matrix4 capturedWorldMatrix = {};
+    // UV buffer（用于 alpha-test shadow）。
+    // 注意：可能与 positionBuffer 不在同一个 stream。capture 时如果 UV stream
+    // 与 position stream 相同，复用 positionBuffer；否则单独 GPU copy 一份。
+    Rc<DxvkBuffer> uvBuffer;
+    DxvkResourceBufferInfo uvInfo = {};
+    uint32_t uvStride = 0u;
+    uint32_t uvOffset = 0u;
+    VkFormat uvFormat = VK_FORMAT_UNDEFINED;
+    bool uvSharesPositionBuffer = false;
+    VkDeviceSize uvCapacity = 0u;
+    // capture 时的 alpha test / blend / texture 状态。
+    // bypass capture 路径不会进入 legacy ShadowCapture 后半段，所以 alpha test
+    // 信息必须在 v4 自己读取。
+    bool alphaTestEnabled = false;
+    bool alphaBlendEnabled = false;
+    float alphaRef = 0.5f;
+    Rc<DxvkImageView> diffuseTexture;
+    // 已分配的 buffer 容量（bytes），用于复用避免反复 createBuffer。
+    VkDeviceSize positionCapacity = 0u;
+    VkDeviceSize indexCapacity = 0u;
+    uint64_t frameSerial = 0u;
+  };
+  std::unordered_map<void*, War3DrawTimeVBEntry> m_war3DrawTimeVBCache;
+  uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;
   bool m_war3SemanticSceneLastZeroSubmitUnitsOnly = true;
   bool m_war3SemanticSceneLastZeroSubmitNativeValidation = false;
   bool m_war3SemanticSceneLastSuccessfulSubmitUnitsOnly = true;
   bool m_war3SemanticSceneLastSuccessfulSubmitNativeValidation = false;
+  // Phase 7.1: 帧间 identity churn 追踪
+  uint64_t m_war3SemanticDirectPrevIdentityHash = 0;
+  // Phase 7.2: 帧间 contract 稳定性 churn 追踪
+  uint64_t m_war3SemanticDirectPrevPaletteHash = 0;
+  uint64_t m_war3SemanticDirectPrevGroupHash = 0;
+  uint64_t m_war3SemanticDirectPrevStableGroupHash = 0;
+  uint64_t m_war3SemanticDirectPrevStream1Ptr = 0;
+  uint64_t m_war3SemanticDirectPrevGeometrySourceHash = 0;
+  uint64_t m_war3SemanticDirectPrevSceneNode = 0;
+  uint64_t m_war3SemanticDirectPrevRenderablePart = 0;
+  uint64_t m_war3SemanticDirectPrevMeshData = 0;
+  std::vector<uint64_t> m_war3SemanticDirectPrevSubmittedIdentityKeys;
+  std::vector<uint64_t> m_war3SemanticDirectPrevSubmittedObjectIdentityKeys;
+  std::vector<uint64_t> m_war3SemanticDirectPrevSubmittedPartIdentityKeys;
+  std::unordered_map<uint64_t, uint64_t>
+      m_war3SemanticDirectSelectionLeaseLastSeen;
+  struct War3SemanticDirectPartPacketLeaseState;
+  std::unique_ptr<War3SemanticDirectPartPacketLeaseState>
+      m_war3SemanticDirectPartPacketLeaseState;
+  War3SemanticDirectCasterContractMap m_war3SemanticDirectCasterContracts;
   bool m_war3SemanticSceneLastReusableUnitsOnly = true;
   bool m_war3SemanticSceneLastReusableNativeValidation = false;
   bool m_war3SemanticSceneLastSuccessfulSubmitComplete = false;
@@ -1984,12 +2107,30 @@ private:
                                   bool DynamicSysmemIBO);
   bool War3TryAppendSemanticShadowPacket(
       const dxvk::war3::shadow::ShadowDrawPacket& packet);
+  bool War3TryAppendSemanticShadowPacket(
+      const dxvk::war3::shadow::ShadowDrawPacket& packet,
+      const dxvk::war3::render::CurrentDrawAuthoritativeSample*
+          directCurrentDrawSample);
+  // Phase 7.30 Step A probe：多接一个"是否来自 core stale-pose restore"的标记，
+  // 提交端 palette 探针据此把 LargeDelta 归因到 stale→live 过渡帧。
+  // 默认重载保持旧语义，新增参数默认 false。
+  bool War3TryAppendSemanticShadowPacket(
+      const dxvk::war3::shadow::ShadowDrawPacket& packet,
+      const dxvk::war3::render::CurrentDrawAuthoritativeSample*
+          directCurrentDrawSample,
+      bool fromStalePoseRestore);
   uint32_t War3GetOrCreateSemanticShadowPalette(
       const dxvk::war3::shadow::ShadowDrawPacket& packet,
       dxvk::war3::render::ObjectKind resolvedObjectKind,
       const Matrix4* overrideMatrices = nullptr,
       uint32_t overrideMatrixCount = 0u,
       uint64_t overrideMatrixHash = 0u);
+  // Phase 7.1: 将两处 direct current-draw loop 合并为 object-grouped submit helper
+  uint32_t War3TryPopulateDirectCurrentDrawGrouped(
+      bool readyOnly,
+      bool unitsOnly,
+      uint64_t currentVisibleFrameSerial,
+      uint64_t currentDrawMinVisibleFrameSerial);
   uint32_t War3TryPopulateSemanticShadowScene(
       bool unitsOnly,
       bool executeNativeBackendValidation = false);

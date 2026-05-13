@@ -37,6 +37,82 @@ namespace dxvk {
         
         Rc<DxvkSampler> getFallbackSampler(bool useMip, float mipLodBias);
 
+        // Phase 7.2: submitted / replay / executed 对账
+        // Run() 每帧会刷新这些字段，调用方在 Run() 返回后可读取并写入 War3ShadowCaptureStats
+        struct ShadowReconciliationCounters {
+          uint32_t shadowCastersCount = 0;
+          uint32_t replayDrawsCount = 0;
+          uint32_t shadowMapDrawnCasters = 0;
+          uint32_t cascadeCulledCount = 0;
+          uint32_t skinnedCasterCount = 0;
+          uint32_t skinnedPreparedCount = 0;
+          uint32_t skinnedInvalidBufferCount = 0;
+          uint32_t skinnedInvalidPipelineCount = 0;
+          uint32_t skinnedDrawnCount = 0;
+          uint32_t shadowTaaActive = 0;
+          uint32_t receiverReuseShadowMap = 0;
+          uint32_t receiverInputValid = 0;
+          uint32_t receiverInputRejectReason = 0;
+          uint32_t receiverNeedPass = 0;
+          uint32_t receiverNeedShadowMap = 0;
+          uint32_t receiverHasCompleteShadowMap = 0;
+          uint32_t receiverHasUsableDirectionalShadow = 0;
+          uint32_t receiverActiveStrengthMilli = 0;
+          uint32_t receiverUboStrengthMilli = 0;
+          uint32_t receiverDebugMode = 0;
+          uint32_t receiverCsmCascadeCount = 0;
+          uint32_t receiverRunEntryFlags = 0;
+          uint32_t receiverRunEarlyReturnReason = 0;
+          uint32_t shadowMapExecutedThisFrame = 0;
+          uint32_t receiverSettingsShadowsEnabled = 0;
+          uint32_t receiverSettingsOutlineEnabled = 0;
+          uint32_t receiverSettingsRawStrengthMilli = 0;
+          uint32_t receiverComputedShadowStrengthMilli = 0;
+          uint32_t receiverHasSunShadow = 0;
+          uint32_t receiverHasPointShadow = 0;
+          uint32_t receiverNeedOutlinePass = 0;
+          uint32_t receiverZeroStrengthFrameCount = 0;
+          uint32_t receiverDrawnWithZeroStrengthCount = 0;
+          uint32_t receiverNoCompleteShadowMapCount = 0;
+          uint32_t receiverNoShadowMapImageCount = 0;
+          uint32_t receiverNoShadowMapSampleViewCount = 0;
+          uint32_t receiverNoCandidateCsmCount = 0;
+          uint32_t receiverCsmFallbackToLastGoodCount = 0;
+          uint32_t receiverHoldInvalidCsmCount = 0;
+          uint32_t receiverHoldEmptyReplayCount = 0;
+          uint32_t receiverHoldIdentityChurnCount = 0;
+          uint32_t receiverReuseInvalidatedAfterEnsureCount = 0;
+          uint32_t shadowMapRenderSkippedNoResourcesCount = 0;
+          uint32_t shadowMapRenderSkippedNoMatrixBufferCount = 0;
+          uint32_t receiverViewportX = 0;
+          uint32_t receiverViewportY = 0;
+          uint32_t receiverViewportWidth = 0;
+          uint32_t receiverViewportHeight = 0;
+          uint64_t shadowMatrixSceneKey = 0;
+          uint64_t shadowMatrixUploadSerial = 0;
+          uint64_t shadowMatrixBufferObjectPtr = 0;
+          uint64_t shadowMatrixBufferOffset = 0;
+          uint64_t shadowMatrixBufferSize = 0;
+          uint64_t shadowMatrixBufferGpuAddress = 0;
+          uint64_t shadowMapRenderSerial = 0;
+          uint64_t shadowMapImagePtr = 0;
+          uint64_t shadowMapSampleViewPtr = 0;
+          uint64_t shadowCurrentImagePtr = 0;
+          uint64_t shadowCurrentViewPtr = 0;
+          uint64_t shadowHistoryReadImagePtr = 0;
+          uint64_t shadowHistoryReadViewPtr = 0;
+          uint64_t shadowHistoryWriteImagePtr = 0;
+          uint64_t shadowHistoryWriteViewPtr = 0;
+          uint32_t shadowVisibilityExecutedThisFrame = 0;
+          uint32_t receiverDrawExecutedThisFrame = 0;
+          uint32_t shadowTaaMode = 0;
+          uint32_t shadowHistoryValidBefore = 0;
+          uint32_t shadowHistoryValidAfter = 0;
+          uint32_t shadowHistoryReadIndex = 0;
+          uint32_t shadowHistoryWriteIndex = 0;
+          uint32_t shadowReceiverSampleSource = 0; // 0 none, 1 map, 2 current, 3 history
+        } reconciliation;
+
     private:
         Rc<DxvkSampler> m_fallbackSampler; // 用于ShadowPass的备用采样器
         Rc<DxvkSampler> m_fallbackSamplerMip; // Alpha阴影允许Mip的采样器
@@ -233,10 +309,28 @@ namespace dxvk {
         uint32_t m_lastShadowMapCasterCount = 0;
         uint64_t m_lastDynamicPoseSignature = 0;
         uint32_t m_shadowAdaptiveFrameIndex = 0;
+        uint32_t m_transientEmptyReplayHoldFramesRemaining = 0;
+        uint32_t m_recentSemanticDynamicHoldFramesRemaining = 0;
+        uint32_t m_semanticIdentityChurnHoldFramesRemaining = 0;
+        uint32_t m_semanticCoverageDropHoldStreak = 0;
+        uint64_t m_lastShadowMapSemanticIdentityHash = 0;
+        uint64_t m_pendingShadowMapSemanticIdentityHash = 0;
+        uint32_t m_pendingShadowMapSemanticIdentityStableFrames = 0;
+        Vector4 m_lastShadowMapSunDir = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
+        float m_lastShadowMapStrength = 0.0f;
+        bool m_hasLastShadowMapLighting = false;
+        War3WorldCameraState m_lastGoodReceiverCamera = {};
+        bool m_hasLastGoodReceiverCamera = false;
 
         // Vertex blending palette buffer (WorldMatrices[paletteIndex*256 + i])
         // Uses a ring buffer to avoid CPU/GPU data races across frames-in-flight.
-        static constexpr uint32_t kPaletteRingCount = 3;
+        // Several passes can consume the shared shadow-matrix SSBO in the same
+        // frame (shadow map, outline mask, unit outline), and high caster load
+        // can leave several frames in flight. Three slices can overwrite a
+        // slice still referenced by queued GPU work, which presents as regular
+        // skinned-shadow flicker. Keep this ring deliberately wider than the
+        // nominal swapchain frame count and per-frame pass count.
+        static constexpr uint32_t kPaletteRingCount = 12;
         Rc<DxvkBuffer> m_vertexBlendPaletteBuffer;
         Rc<DxvkBuffer> m_dummyPaletteBuffer; // 点光源阴影未使用骨骼时的占位SSBO
         void* m_vertexBlendPaletteMapPtr = nullptr;
@@ -252,6 +346,7 @@ namespace dxvk {
         uint32_t m_shadowMatrixObjectBase = 0;    // = paletteCount * 256
         uint64_t m_shadowMatrixSceneKey = 0;       // palette/world-matrix content key for same-frame semantic updates
         uint64_t m_shadowMatrixUploadSerial = 0;   // advances only on real uploads; selects the ring slice
+        uint64_t m_shadowMapRenderSerial = 0;      // advances only after a real shadow map render
 
         Rc<DxvkImage> m_shadowMap;
         Rc<DxvkImageView> m_shadowMapSampleView;
@@ -374,7 +469,7 @@ namespace dxvk {
         void renderShadowVisibility(const Rc<DxvkCommandList>& ctx,
                                     const War3PipelineInput& input);
         void ensureOutlineMaskResources(VkExtent3D extent);
-        void renderShadowMap(
+        bool renderShadowMap(
             const Rc<DxvkCommandList>& ctx,
             const War3PipelineInput& input,
             const std::vector<const War3ShadowCasterDraw*>* replayDraws = nullptr);

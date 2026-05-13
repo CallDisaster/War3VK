@@ -613,7 +613,7 @@ namespace dxvk {
             static const bool s_semanticWeakBeforeUiCommit =
                 ParseEnvFlagOrDefault(
                     "DXVK_WAR3_SEMANTIC_SHADOW_WEAK_BEFOREUI_COMMIT",
-                    true);
+                    false);
             const bool semanticWeakBeforeUiCommit =
                 s_semanticWeakBeforeUiCommit &&
                 dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() &&
@@ -680,6 +680,22 @@ namespace dxvk {
         }
 
         return false;
+    }
+
+    bool War3RenderPipeline::ForceBeforeUiInsertion() {
+        if (!m_wantsBeforeUiInsertion || m_insertedBeforeUi || !m_hadWorldDraw)
+            return false;
+
+        m_insertedBeforeUi = true;
+        m_armedBeforeUi = false;
+
+        static uint32_t s_loggedForce = 0;
+        if (s_loggedForce < 8) {
+            s_loggedForce++;
+            WAR3_RENDER_LOG(
+                "DXVK War3Pipeline: BeforeUi commit (frame-end fallback)\n");
+        }
+        return true;
     }
 
 

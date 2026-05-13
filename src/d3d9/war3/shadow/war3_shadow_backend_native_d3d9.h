@@ -64,6 +64,10 @@ public:
   uint64_t lastExecuteExecutedSkinnedDrawCount() const {
     return m_lastExecuteExecutedSkinnedDrawCount;
   }
+  uint64_t geometryRejectCount() const { return m_geometryRejectCount; }
+  uint64_t paletteRejectCount() const { return m_paletteRejectCount; }
+  uint64_t materialRejectCount() const { return m_materialRejectCount; }
+  uint64_t submitRejectCount() const { return m_submitRejectCount; }
   size_t geometryCount() const { return m_geometryResources.size(); }
   size_t paletteCount() const { return m_paletteResources.size(); }
   size_t materialCount() const { return m_materialResources.size(); }
@@ -157,6 +161,10 @@ private:
   uint64_t m_lastExecuteSubmittedSkinnedDrawCount = 0;
   uint64_t m_lastExecuteExecutedRigidDrawCount = 0;
   uint64_t m_lastExecuteExecutedSkinnedDrawCount = 0;
+  uint64_t m_geometryRejectCount = 0;
+  uint64_t m_paletteRejectCount = 0;
+  uint64_t m_materialRejectCount = 0;
+  uint64_t m_submitRejectCount = 0;
   uint64_t m_nextHandleValue = 2;
   std::unordered_map<uint64_t, uint64_t> m_geometryHandleByKey;
   std::unordered_map<uint64_t, uint64_t> m_paletteHandleByKey;

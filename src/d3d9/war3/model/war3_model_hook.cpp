@@ -17,8 +17,11 @@
 #include "../render/war3_render_identity_bridge.h"
 #include "../render/war3_render_objects.h"
 #include "../render/war3_render_state.h"
+#include "../render/war3_current_draw_contract.h"
 #include "../render/war3_shadow_object_registry.h"
 #include "../render/war3_shadow_runtime_bridge.h"
+#include "../render/war3_visible_renderables.h"
+#include "../state/war3_render_state.h"
 #include "../../util/util_env.h"
 
 #include <emmintrin.h>
@@ -76,6 +79,9 @@ using RuntimePoseUpdateFn =
                       int a4, int a5);
 using RuntimeMatrixWriteFn =
     void(__fastcall *)(int nodePtr, int sourceMatrixPtr, int destMatrixPtr);
+using RuntimeGroupPaletteWrapperFn = int(__fastcall *)(int runtimeModel,
+                                                      int poseStackBasePtr);
+using RuntimeSimpleGroupPaletteFn = void(__thiscall *)(int runtimeModel);
 using RuntimePropagatePoseTreeFn = int(__fastcall *)(int runtimeModel, int a2);
 using RuntimeRecurseChildTreeFn = void(__fastcall *)(int runtimeModel, int a2);
 using RuntimeMatrixRangeCopyFn = int(__fastcall *)(int runtimeModel, int a2,
@@ -170,6 +176,8 @@ constexpr uintptr_t kSpriteFrameUpdateRva = 0x182300;
 constexpr uintptr_t kSpriteFrameLiteUpdateRva = 0x1826C0;
 constexpr uintptr_t kRuntimePoseUpdateRva = 0x12F0A0;
 constexpr uintptr_t kRuntimeMatrixWriteRva = 0x12E600;
+constexpr uintptr_t kRuntimeGroupPaletteWrapperRva = 0x12FED0;
+constexpr uintptr_t kRuntimeSimpleGroupPaletteRva = 0x12FF90;
 constexpr uintptr_t kRuntimePropagatePoseTreeRva = 0x12F7E0;
 constexpr uintptr_t kRuntimeRecurseChildTreeRva = 0x12EC90;
 constexpr uintptr_t kRuntimeMatrixRangeCopyRva = 0x12FDC0;
@@ -184,6 +192,13 @@ constexpr size_t kRuntimeMatrixArrayOffset = 0x60;
 constexpr size_t kRuntimeOverrideOutputBundleOffset = 0xFC;
 constexpr size_t kRuntimeLocalPointOutputArrayOffset = 0xB4;
 constexpr size_t kSpriteHostBoundSpriteOffset = 0x2C;
+constexpr size_t kCModelRenderablePartCountOffset = 0x0C;
+constexpr size_t kCModelRenderablePartArrayOffset = 0x10;
+constexpr size_t kRenderablePartPaletteSlotOffset = 0x08;
+constexpr size_t kRenderablePartGeosetDataOffset = 0x0C;
+constexpr size_t kRenderablePartSkipFlagOffset = 0x10;
+constexpr size_t kGeosetDataGroupCountOffset = 0xF0;
+constexpr uint32_t kMaxRuntimeRenderablePartsForPaletteScan = 4096u;
 
 std::atomic<bool> g_active{false};
 std::atomic<bool> g_bootstrapHooksInstalled{false};
@@ -212,6 +227,8 @@ SpriteFrameUpdateFn g_trampolineSpriteFrameUpdate = nullptr;
 SpriteFrameLiteUpdateFn g_trampolineSpriteFrameLiteUpdate = nullptr;
 RuntimePoseUpdateFn g_trampolineRuntimePoseUpdate = nullptr;
 RuntimeMatrixWriteFn g_trampolineRuntimeMatrixWrite = nullptr;
+RuntimeGroupPaletteWrapperFn g_trampolineRuntimeGroupPaletteWrapper = nullptr;
+RuntimeSimpleGroupPaletteFn g_trampolineRuntimeSimpleGroupPalette = nullptr;
 RuntimePropagatePoseTreeFn g_trampolineRuntimePropagatePoseTree = nullptr;
 RuntimeRecurseChildTreeFn g_trampolineRuntimeRecurseChildTree = nullptr;
 RuntimeMatrixRangeCopyFn g_trampolineRuntimeMatrixRangeCopy = nullptr;
@@ -227,10 +244,73 @@ uintptr_t g_gameBase = 0u;
 
 // 混合调色板缓存 — Hook_RuntimeMatrixWrite 在 CGeosetData_BuildGroupBlendedPalette
 // 写入后当场捕获。slotIndex 从 outputPalette 地址反算：(out - dword_6FBC6BD0)/48。
+//
+// Phase 7.31 Iteration E：性能修复。
+// 原实现是 `std::unordered_map<uint32_t, BlendedPaletteEntry>` +
+// `std::vector<Matrix4>`，P0 让每帧一次性写入 14K+ slot 后哈希表和 vector
+// 分配把 Populate 路径压到 94 ms 单帧。改成固定大小开放寻址数组：
+//   - 容量 64K（slotIndex 上限已由 PublishCurrentDrawContract 检查 < 0x3A98
+//     ≈ 14996，小于 16K；预留 64K 给未来扩展。）
+//   - 直接用 slotIndex 作数组 index，省掉哈希。
+//   - Matrix4 内嵌到 entry，去掉 vector 的堆分配。
+// 查询和写入都是 O(1) 数组访问，没有锁和分配。
+static constexpr uint32_t kRuntimeMatrixBatchMaxCount = 256u;
 struct BlendedPaletteEntry {
-  std::vector<Matrix4> matrices;
+  Matrix4 matrix = Matrix4{};
+  uint32_t frameTag = 0u;
+  uint64_t writeSerial = 0u;
+  bool valid = false;
 };
-static std::unordered_map<uint32_t, BlendedPaletteEntry> s_slotBlendedPaletteCache;
+// 64K entries × (64 + 8 + 1) ≈ 4.6 MB 常驻，换来热路径 O(1) 写。
+static constexpr uint32_t kSlotBlendedPaletteCacheSize = 65536u;
+static std::array<BlendedPaletteEntry, kSlotBlendedPaletteCacheSize>
+    s_slotBlendedPaletteCache = {};
+static std::atomic<uint64_t> s_slotBlendedPaletteWriteSerial{0u};
+
+enum class RuntimeGroupPaletteProducerKind : uint32_t {
+  Unknown = 0u,
+  AllocAndFillWrapper = 1u,
+  SimpleFallback = 2u,
+};
+
+struct RenderablePartPaletteBindingEntry {
+  std::atomic<uintptr_t> renderablePart{0u};
+  std::atomic<uint32_t> paletteSlotIndex{0xFFFFFFFFu};
+  std::atomic<uint32_t> groupCount{0u};
+  std::atomic<uint32_t> frameTag{0u};
+  std::atomic<uint32_t> producerKind{0u};
+  std::atomic<uint64_t> writeSerial{0u};
+  std::atomic<uint64_t> paletteWriteSerial{0u};
+  std::atomic<uint32_t> paletteCount{0u};
+  std::atomic<uint32_t> paletteFrameTag{0u};
+  std::atomic<uint64_t> paletteHash{0u};
+  // Phase 7.51：记录这个 renderablePart 属于哪个 runtimeModel（即 0x12FED0 的
+  // this 参数）。用于在 submit 时通过 renderablePart 反查到 producer 侧真正的
+  // runtimeModel key，再去 PoseRegistry 查 final-pose；这比传入的
+  // packet.renderable.runtimeModelPtr 更可信（后者是 alias 解析后的值，1.27a
+  // 上经常偏移错了）。
+  std::atomic<uintptr_t> runtimeModel{0u};
+  std::array<Matrix4, 64> palette{};
+};
+
+static constexpr size_t kRenderablePartPaletteBindingCacheSize = 8192u;
+static constexpr uint32_t kRenderablePartPaletteSnapshotMaxCount = 64u;
+static std::array<RenderablePartPaletteBindingEntry,
+                  kRenderablePartPaletteBindingCacheSize>
+    s_renderablePartPaletteBindings = {};
+static std::atomic<uint64_t> s_renderablePartPaletteBindingSerial{0u};
+static std::atomic<uint64_t> s_renderablePartPaletteSnapshotSerial{0u};
+static std::atomic<uintptr_t> s_cachedGlobalPaletteBufBase{0u};
+
+bool TryReadCurrentPaletteFrameTag(uint32_t& outFrameTag) {
+  // Phase 7.31 Iteration F：避免每次调用都 syscall GetModuleHandleA。
+  // g_gameBase 在 hook 安装时已缓存。
+  outFrameTag = 0u;
+  if (g_gameBase == 0u)
+    return false;
+  return SafeReadU32Fast(reinterpret_cast<const void*>(g_gameBase + 0xBDA4CCu),
+                         0u, outFrameTag);
+}
 
 class SemanticHookPerfScope {
 public:
@@ -293,6 +373,28 @@ std::atomic<uint64_t> g_runtimePoseUpdateLastMatrixHash{0u};
 std::atomic<uint64_t> g_runtimeMatrixWriteCount{0u};
 std::atomic<uint64_t> g_runtimeMatrixWritePublishCount{0u};
 std::atomic<uint64_t> g_runtimeMatrixWriteMissCount{0u};
+// Phase 7.31 P0：批量捕获 CGeosetData_BuildGroupBlendedPalette 结果。
+// BatchCaptured 累积"被真正缓存的 slot 数"（等于 sum of groupCount），
+// BatchOverflow 是 groupCount > 256 触发裁剪的次数，
+// BatchUnreadable 是目标地址 +count*48 不可读时拒绝写入的次数，
+// BatchLastGroupCount 记录最近一次 hook 看到的 count。
+std::atomic<uint64_t> g_runtimeMatrixWriteBatchCapturedCount{0u};
+std::atomic<uint64_t> g_runtimeMatrixWriteBatchOverflowCount{0u};
+std::atomic<uint64_t> g_runtimeMatrixWriteBatchUnreadableCount{0u};
+std::atomic<uint64_t> g_runtimeMatrixWriteBatchLastGroupCount{0u};
+std::atomic<uint64_t> g_runtimeGroupPaletteWrapperCallCount{0u};
+std::atomic<uint64_t> g_runtimeGroupPaletteWrapperPartCount{0u};
+std::atomic<uint64_t> g_runtimeGroupPaletteWrapperBindingCount{0u};
+std::atomic<uint64_t> g_runtimeSimpleGroupPaletteCallCount{0u};
+std::atomic<uint64_t> g_runtimeSimpleGroupPaletteSlotCapturedCount{0u};
+std::atomic<uint64_t> g_runtimeSimpleGroupPaletteSlotUnreadableCount{0u};
+std::atomic<uint64_t> g_renderablePartPaletteBindingQueryHitCount{0u};
+std::atomic<uint64_t> g_renderablePartPaletteBindingQueryMissCount{0u};
+std::atomic<uint64_t> g_renderablePartPaletteSnapshotCapturedCount{0u};
+std::atomic<uint64_t> g_renderablePartPaletteSnapshotTooLargeCount{0u};
+std::atomic<uint64_t> g_renderablePartPaletteSnapshotUnreadableCount{0u};
+std::atomic<uint64_t> g_renderablePartPaletteSnapshotQueryHitCount{0u};
+std::atomic<uint64_t> g_renderablePartPaletteSnapshotQueryMissCount{0u};
 std::atomic<uint64_t> g_runtimeMatrixWriteLastRuntimeModelPtr{0u};
 std::atomic<uint64_t> g_runtimeMatrixWriteLastMatrixIndex{0u};
 std::atomic<uint64_t> g_runtimeMatrixWriteLastMatrixCount{0u};
@@ -300,6 +402,10 @@ std::atomic<uint64_t> g_runtimeMatrixWriteLastMatrixHash{0u};
 std::atomic<uint64_t> g_runtimeMatrixRangeCopyPalettePublishHitCount{0u};
 std::atomic<uint64_t> g_runtimeMatrixRangeCopyPalettePublishMissCount{0u};
 std::atomic<uint64_t> g_runtimeMatrixRangeCopyPaletteFallbackCModelCount{0u};
+// Phase 7.34 A3 优化：per-runtimeModel hash 稳定跳过计数。
+// 高值说明大部分 range-copy 调用落在"连续帧 palette 不变"的情况，
+// 快退路径消除了重复 PoseRegistry 录入开销。
+std::atomic<uint64_t> g_runtimeMatrixRangeCopyPublishSkippedDedupCount{0u};
 std::atomic<uint64_t> g_runtimeMatrixFlushPaletteSuppressedCount{0u};
 std::atomic<uint64_t> g_runtimeMatrixRangeCopyLastRuntimeModelPtr{0u};
 std::atomic<uint64_t> g_runtimeMatrixRangeCopyLastContextPtr{0u};
@@ -396,6 +502,36 @@ std::atomic<uint64_t> g_attachmentRigidSourceObjectFromRootRuntimeCount{0u};
 std::atomic<uint64_t> g_overrideOutputSampleFrame{0u};
 std::atomic<uint64_t> g_overrideOutputLastActiveFrame{0u};
 std::atomic<uint64_t> g_overridePrimaryPresetWriteCount{0u};
+
+// Phase 7.47 dt gate probe（纯诊断，极低开销）：
+//   这四个原子 counter 记录 CSpriteUber_PreRenderAndUpdatePosePalette_*
+//   的 dt 分布。它们与 `kWar3RuntimeConfigInstallSpriteFrameHooksWithoutPose`
+//   无关——dt probe 走独立 minhook 安装路径。
+std::atomic<uint64_t> g_spriteUberPreRenderTotalCount{0u};
+std::atomic<uint64_t> g_spriteUberPreRenderDtZeroCount{0u};
+std::atomic<uint64_t> g_spriteUberPreRenderDtBelowEpsilonCount{0u};
+std::atomic<uint64_t> g_spriteUberPreRenderDtPositiveCount{0u};
+std::atomic<uint64_t> g_spriteUberPreRenderDtNegativeCount{0u};
+std::atomic<uint32_t> g_spriteUberPreRenderLastDtBits{0u};
+std::atomic<uint32_t> g_spriteUberPreRenderLastZeroDtFrameTag{0u};
+std::atomic<uint32_t> g_spriteUberPreRenderLastPositiveDtFrameTag{0u};
+
+// Per-frameTag 去重计数：writer 在一个 palette frameTag 里首次触发时累加。
+// 让我们可以和 full trace 的每帧 `frameTag` 对齐，判断冻结窗口里
+// writer 到底有没有跑。
+std::atomic<uint32_t> g_runtimeMatrixWriteLastFrameTag{0u};
+std::atomic<uint64_t> g_runtimeMatrixWriteFramesWithHitCount{0u};
+std::atomic<uint64_t> g_runtimeMatrixWriteFramesEmptyCount{0u};
+std::atomic<uint32_t> g_runtimeGroupPaletteWrapperLastFrameTag{0u};
+std::atomic<uint64_t> g_runtimeGroupPaletteWrapperFramesWithHitCount{0u};
+std::atomic<uint64_t> g_runtimeGroupPaletteWrapperFramesEmptyCount{0u};
+std::atomic<uint32_t> g_runtimeSimpleGroupPaletteLastFrameTag{0u};
+std::atomic<uint64_t> g_runtimeSimpleGroupPaletteFramesWithHitCount{0u};
+std::atomic<uint64_t> g_runtimeSimpleGroupPaletteFramesEmptyCount{0u};
+
+// 上一次见到的 palette frameTag（用于"writer 静默帧"统计的发现逻辑）。
+std::atomic<uint32_t> g_paletteFrameTagLastSeen{0u};
+std::atomic<uint64_t> g_paletteFrameTagAdvanceCount{0u};
 std::atomic<uint64_t> g_overrideSharedPresetWriteCount{0u};
 std::atomic<uint64_t> g_overrideLocalPointWriteCount{0u};
 std::atomic<uint64_t> g_overrideLocalPointNonZeroWriteCount{0u};
@@ -2078,6 +2214,284 @@ Matrix4 DecodeRuntimePoseMatrix48(const uint8_t* poseBytes) {
                  Vector4(pose3x4[3], pose3x4[4], pose3x4[5], 0.0f),
                  Vector4(pose3x4[6], pose3x4[7], pose3x4[8], 0.0f),
                  Vector4(pose3x4[9], pose3x4[10], pose3x4[11], 1.0f));
+}
+
+void* TryReadPtrFast(const void* base, size_t offset);
+uint32_t TryReadU32Fast(const void* base, size_t offset);
+
+uintptr_t ResolveGlobalBlendedPaletteBufferBase() {
+  uintptr_t globalPaletteBuf =
+      s_cachedGlobalPaletteBufBase.load(std::memory_order_acquire);
+  if (globalPaletteBuf != 0u || g_gameBase == 0u)
+    return globalPaletteBuf;
+
+  void* bufPtr = nullptr;
+  if (SafeReadPtrFast(reinterpret_cast<const void*>(g_gameBase + 0xBC6BD0u),
+                      0u, bufPtr) &&
+      bufPtr != nullptr) {
+    globalPaletteBuf = reinterpret_cast<uintptr_t>(bufPtr);
+    s_cachedGlobalPaletteBufBase.store(globalPaletteBuf,
+                                       std::memory_order_release);
+  }
+  return globalPaletteBuf;
+}
+
+bool CaptureBlendedPaletteSlotRange(uint32_t startSlotIndex,
+                                    const uint8_t* srcBase,
+                                    uint32_t rawCount,
+                                    uint32_t frameTag,
+                                    std::atomic<uint64_t>* capturedCounter,
+                                    std::atomic<uint64_t>* overflowCounter,
+                                    std::atomic<uint64_t>* unreadableCounter) {
+  if (srcBase == nullptr || rawCount == 0u ||
+      startSlotIndex >= kSlotBlendedPaletteCacheSize)
+    return false;
+
+  const uint32_t capacityRemaining =
+      kSlotBlendedPaletteCacheSize - startSlotIndex;
+  const uint32_t capCount =
+      std::min<uint32_t>(rawCount, kRuntimeMatrixBatchMaxCount);
+  const uint32_t count = std::min<uint32_t>(capCount, capacityRemaining);
+  if (count < rawCount && overflowCounter != nullptr)
+    overflowCounter->fetch_add(1u, std::memory_order_relaxed);
+
+  const size_t spanBytes = size_t(count) * 48u;
+  if (count == 0u ||
+      !dxvk::war3::IsReadableRangeFast(srcBase, spanBytes)) {
+    if (count > 0u && unreadableCounter != nullptr)
+      unreadableCounter->fetch_add(1u, std::memory_order_relaxed);
+    return false;
+  }
+
+  const uint64_t baseSerial =
+      s_slotBlendedPaletteWriteSerial.fetch_add(uint64_t(count),
+                                                std::memory_order_relaxed) +
+      1u;
+  for (uint32_t i = 0u; i < count; ++i) {
+    auto& entry = s_slotBlendedPaletteCache[startSlotIndex + i];
+    entry.frameTag = frameTag;
+    entry.writeSerial = baseSerial + uint64_t(i);
+    entry.valid = true;
+    entry.matrix = DecodeRuntimePoseMatrix48(srcBase + size_t(i) * 48u);
+  }
+
+  if (capturedCounter != nullptr)
+    capturedCounter->fetch_add(uint64_t(count), std::memory_order_relaxed);
+  return true;
+}
+
+static inline bool RenderablePartPaletteSnapshotEnabled() {
+  static const bool enabled =
+      GetEnvBoolCached("DXVK_WAR3_RENDERABLE_PART_PALETTE_SNAPSHOT", true);
+  return enabled;
+}
+
+// Phase 7.47 dt gate probe - only mode。
+// 打开时 Hook_SpriteFrameUpdate 等入口只记一笔 dt 分桶就 return，
+// 不触发 RecordSpriteFramePoseFromSprite 等重路径；用于短时间诊断。
+static inline bool SpriteUberDtProbeEnabled() {
+  static const bool enabled =
+      GetEnvBoolCached("DXVK_WAR3_SPRITE_UBER_DT_PROBE",
+                        dxvk::war3::internal::
+                            kWar3RuntimeConfigInstallSpriteUberDtProbeHooks);
+  return enabled;
+}
+
+void RecordRenderablePartPaletteBinding(
+    void* renderablePart,
+    uint32_t paletteSlotIndex,
+    uint32_t groupCount,
+    uint32_t frameTag,
+    RuntimeGroupPaletteProducerKind producerKind,
+    const uint8_t* paletteBytes = nullptr,
+    uint32_t paletteCount = 0u,
+    void* runtimeModel = nullptr) {
+  if (renderablePart == nullptr || paletteSlotIndex == 0xFFFFFFFFu ||
+      paletteSlotIndex >= 0x3A98u)
+    return;
+
+  const uintptr_t partValue = reinterpret_cast<uintptr_t>(renderablePart);
+  const size_t slot =
+      (partValue >> 4u) % kRenderablePartPaletteBindingCacheSize;
+  auto& entry = s_renderablePartPaletteBindings[slot];
+  entry.paletteSlotIndex.store(paletteSlotIndex, std::memory_order_relaxed);
+  entry.groupCount.store(groupCount, std::memory_order_relaxed);
+  entry.frameTag.store(frameTag, std::memory_order_relaxed);
+  entry.producerKind.store(static_cast<uint32_t>(producerKind),
+                           std::memory_order_relaxed);
+
+  if (RenderablePartPaletteSnapshotEnabled() && paletteBytes != nullptr &&
+      paletteCount != 0u) {
+    if (paletteCount > kRenderablePartPaletteSnapshotMaxCount) {
+      entry.paletteWriteSerial.store(0u, std::memory_order_release);
+      entry.paletteCount.store(0u, std::memory_order_relaxed);
+      entry.paletteHash.store(0u, std::memory_order_relaxed);
+      g_renderablePartPaletteSnapshotTooLargeCount.fetch_add(
+          1u, std::memory_order_relaxed);
+    } else if (!dxvk::war3::IsReadableRangeFast(
+                   paletteBytes, size_t(paletteCount) * 48u)) {
+      entry.paletteWriteSerial.store(0u, std::memory_order_release);
+      entry.paletteCount.store(0u, std::memory_order_relaxed);
+      entry.paletteHash.store(0u, std::memory_order_relaxed);
+      g_renderablePartPaletteSnapshotUnreadableCount.fetch_add(
+          1u, std::memory_order_relaxed);
+    } else {
+      const uint64_t snapshotSerial =
+          s_renderablePartPaletteSnapshotSerial.fetch_add(
+              1u, std::memory_order_relaxed) +
+          1u;
+      entry.paletteWriteSerial.store((snapshotSerial << 1u) | 1u,
+                                     std::memory_order_release);
+      for (uint32_t i = 0u; i < paletteCount; ++i) {
+        entry.palette[i] =
+            DecodeRuntimePoseMatrix48(paletteBytes + size_t(i) * 48u);
+      }
+      const uint64_t paletteHash =
+          HashBytes(entry.palette.data(), size_t(paletteCount) * sizeof(Matrix4));
+      entry.paletteCount.store(paletteCount, std::memory_order_relaxed);
+      entry.paletteFrameTag.store(frameTag, std::memory_order_relaxed);
+      entry.paletteHash.store(paletteHash, std::memory_order_relaxed);
+      entry.paletteWriteSerial.store(snapshotSerial << 1u,
+                                     std::memory_order_release);
+      g_renderablePartPaletteSnapshotCapturedCount.fetch_add(
+          1u, std::memory_order_relaxed);
+    }
+  } else {
+    entry.paletteWriteSerial.store(0u, std::memory_order_release);
+    entry.paletteCount.store(0u, std::memory_order_relaxed);
+    entry.paletteHash.store(0u, std::memory_order_relaxed);
+  }
+
+  entry.writeSerial.store(
+      s_renderablePartPaletteBindingSerial.fetch_add(
+          1u, std::memory_order_relaxed) +
+          1u,
+      std::memory_order_release);
+  // Phase 7.51：保存 producer 侧 runtimeModel，供 submit 时反查 PoseRegistry。
+  entry.runtimeModel.store(
+      reinterpret_cast<uintptr_t>(runtimeModel),
+      std::memory_order_relaxed);
+  entry.renderablePart.store(partValue, std::memory_order_release);
+}
+
+void CaptureRuntimeGroupPaletteBindings(
+    int runtimeModel,
+    RuntimeGroupPaletteProducerKind producerKind,
+    bool captureSimpleFallbackSlots) {
+  if (runtimeModel == 0 || !g_config.enabled)
+    return;
+
+  void* partArrayPtr = nullptr;
+  uint32_t partCount = 0u;
+  const void* runtimeModelPtr =
+      reinterpret_cast<const void*>(uintptr_t(uint32_t(runtimeModel)));
+  if (!SafeReadU32Fast(runtimeModelPtr, kCModelRenderablePartCountOffset,
+                       partCount) ||
+      partCount == 0u ||
+      !SafeReadPtrFast(runtimeModelPtr, kCModelRenderablePartArrayOffset,
+                       partArrayPtr) ||
+      partArrayPtr == nullptr) {
+    return;
+  }
+
+  partCount =
+      std::min<uint32_t>(partCount, kMaxRuntimeRenderablePartsForPaletteScan);
+  uint32_t frameTag = 0u;
+  TryReadCurrentPaletteFrameTag(frameTag);
+
+  const uintptr_t globalPaletteBuf = ResolveGlobalBlendedPaletteBufferBase();
+  uint64_t partSeen = 0u;
+  uint64_t bindingSeen = 0u;
+
+  for (uint32_t i = 0u; i < partCount; ++i) {
+    void* partPtr = nullptr;
+    if (!SafeReadPtrFast(partArrayPtr, size_t(i) * sizeof(uint32_t), partPtr) ||
+        partPtr == nullptr)
+      continue;
+
+    ++partSeen;
+    const uint32_t skipFlag =
+        TryReadU32Fast(partPtr, kRenderablePartSkipFlagOffset);
+    if (skipFlag != 0u)
+      continue;
+
+    uint32_t slotIndex =
+        TryReadU32Fast(partPtr, kRenderablePartPaletteSlotOffset);
+
+    // Phase 7.52 根因修复：FROZEN 段里 War3 引擎的 8-帧 slot cadence 会让部分
+    // renderablePart 的 +0x08 临时归为 0xFFFFFFFFu（slotIndex 未分配）。以前这里
+    // 直接 continue，导致 s_renderablePartPaletteBindings 里这个 part 的 palette
+    // snapshot 不再刷新，submit 端查到的永远是旧 bytes，形成"阴影动 0.5s 停
+    // 0.5s"的视觉冻结。
+    //
+    // 实际情况：
+    //   (1) `Hook_RuntimeMatrixWrite` (0x12E600) 每帧都在把最新的 blended palette
+    //       写入全局 arena，按 slot 索引。
+    //   (2) 同一个 renderablePart 在这 8 帧里通常属于同一个 CModel，它的逻辑
+    //       slot 位置不会在 arena 里迁移。只是 `partPtr+0x08` 这个字段是由
+    //       0x12FED0 每帧重新填写（或者这帧没填），和 writer 分开。
+    //   (3) bindings 表里保留的上一次的 slotIndex 仍然是正确的 arena 位置。
+    //
+    // 因此 FROZEN 段里我们完全可以用 bindings 表上次记录的 slotIndex 去 arena 里
+    // 重新取 fresh bytes，刷新 snapshot。视觉上等于"阴影每帧都跟着主模型走"。
+    if (slotIndex == 0xFFFFFFFFu || slotIndex >= 0x3A98u) {
+      const uintptr_t partValue = reinterpret_cast<uintptr_t>(partPtr);
+      const size_t bindingSlot =
+          (partValue >> 4u) % kRenderablePartPaletteBindingCacheSize;
+      const auto& existingEntry = s_renderablePartPaletteBindings[bindingSlot];
+      if (existingEntry.renderablePart.load(std::memory_order_acquire) ==
+          partValue) {
+        const uint32_t cachedSlotIndex =
+            existingEntry.paletteSlotIndex.load(std::memory_order_relaxed);
+        if (cachedSlotIndex != 0xFFFFFFFFu && cachedSlotIndex < 0x3A98u) {
+          slotIndex = cachedSlotIndex;
+        } else {
+          continue;
+        }
+      } else {
+        continue;
+      }
+    }
+
+    uint32_t groupCount = 1u;
+    if (!captureSimpleFallbackSlots) {
+      if (void* geosetData =
+              TryReadPtrFast(partPtr, kRenderablePartGeosetDataOffset)) {
+        const uint32_t rawGroupCount =
+            TryReadU32Fast(geosetData, kGeosetDataGroupCountOffset);
+        if (rawGroupCount != 0u)
+          groupCount = rawGroupCount;
+      }
+    }
+
+    const uint8_t* matrixBytes = nullptr;
+    if (globalPaletteBuf != 0u && groupCount != 0u &&
+        slotIndex + groupCount <= 0x3A98u) {
+      matrixBytes = reinterpret_cast<const uint8_t*>(
+          globalPaletteBuf + size_t(slotIndex) * 48u);
+    }
+
+    RecordRenderablePartPaletteBinding(partPtr, slotIndex, groupCount, frameTag,
+                                       producerKind, matrixBytes, groupCount,
+                                       // Phase 7.51：传入 producer 侧 runtimeModel，
+                                       // 让 renderablePart 反查能拿到正确的 PoseRegistry key。
+                                       const_cast<void*>(runtimeModelPtr));
+    ++bindingSeen;
+
+    if (captureSimpleFallbackSlots && matrixBytes != nullptr) {
+      CaptureBlendedPaletteSlotRange(
+          slotIndex, matrixBytes, 1u, frameTag,
+          &g_runtimeSimpleGroupPaletteSlotCapturedCount, nullptr,
+          &g_runtimeSimpleGroupPaletteSlotUnreadableCount);
+    }
+  }
+
+  if (producerKind == RuntimeGroupPaletteProducerKind::AllocAndFillWrapper) {
+    g_runtimeGroupPaletteWrapperPartCount.fetch_add(
+        partSeen, std::memory_order_relaxed);
+    g_runtimeGroupPaletteWrapperBindingCount.fetch_add(
+        bindingSeen, std::memory_order_relaxed);
+  }
 }
 
 void *TryReadPtrFast(const void *base, size_t offset) {
@@ -5955,6 +6369,71 @@ constexpr uint32_t kSpriteFrameUpdateKindMini = 0x2u;
 constexpr uint32_t kSpriteFrameUpdateKindLite = 0x4u;
 constexpr uint32_t kSpriteFrameUpdateKindMiniLite = 0x8u;
 
+// Phase 7.47 dt gate probe: 记录 CSpriteUber_PreRender*(dt) 的输入分布。
+// 当 |dt| < FLT_EPSILON (~1.19e-7f) 时，引擎会 skip CModel_EvalPoseStackAndChildren，
+// 整条 palette writer 链路不触发。这个 counter 让 full trace 在冻结窗口里
+// 能直接看到"producer 早退占比"。
+static inline void NoteSpriteUberPreRenderDtBucket(float dt) {
+  g_spriteUberPreRenderTotalCount.fetch_add(1u, std::memory_order_relaxed);
+  uint32_t bits = 0u;
+  std::memcpy(&bits, &dt, sizeof(bits));
+  g_spriteUberPreRenderLastDtBits.store(bits, std::memory_order_relaxed);
+
+  uint32_t frameTag = 0u;
+  TryReadCurrentPaletteFrameTag(frameTag);
+
+  constexpr float kFltEpsilon = 1.1920929e-7f;  // IDA 里看到的 0.00000023841858 是 2*eps
+  const float absDt = dt < 0.0f ? -dt : dt;
+  if (bits == 0u) {
+    g_spriteUberPreRenderDtZeroCount.fetch_add(1u, std::memory_order_relaxed);
+    if (frameTag != 0u)
+      g_spriteUberPreRenderLastZeroDtFrameTag.store(
+          frameTag, std::memory_order_relaxed);
+  } else if (absDt < kFltEpsilon * 2.0f) {
+    // 与 IDA 中 0.00000023841858f (2*FLT_EPSILON) 的门槛对齐：
+    // 小于该值会被 skip。
+    g_spriteUberPreRenderDtBelowEpsilonCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  } else if (dt > 0.0f) {
+    g_spriteUberPreRenderDtPositiveCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (frameTag != 0u)
+      g_spriteUberPreRenderLastPositiveDtFrameTag.store(
+          frameTag, std::memory_order_relaxed);
+  } else {
+    g_spriteUberPreRenderDtNegativeCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+}
+
+// Phase 7.47 writer-per-frame 去重：每个 palette frameTag 第一次触发
+// writer hook 时累加 WithHit；frameTag 从上次推进但当前 writer 没被
+// 调用过，则下次第一次触发会先记一个 Empty。和 full trace 的 frameTag
+// cadence 对齐。
+static inline void NoteWriterHitForFrameTag(
+    std::atomic<uint32_t>& lastFrameTag,
+    std::atomic<uint64_t>& withHitCount,
+    std::atomic<uint64_t>& emptyCount,
+    uint32_t currentFrameTag) {
+  if (currentFrameTag == 0u)
+    return;
+  uint32_t previous = lastFrameTag.load(std::memory_order_relaxed);
+  if (previous == currentFrameTag)
+    return;
+  // CAS 保证每 frameTag 只会被记一次 WithHit，并发安全。
+  if (lastFrameTag.compare_exchange_strong(previous, currentFrameTag,
+                                            std::memory_order_relaxed,
+                                            std::memory_order_relaxed)) {
+    withHitCount.fetch_add(1u, std::memory_order_relaxed);
+    if (previous != 0u && currentFrameTag > previous + 1u) {
+      // 中间跳过 N-1 帧没看到这个 writer：记成 empty。
+      emptyCount.fetch_add(uint64_t(currentFrameTag - previous - 1u),
+                           std::memory_order_relaxed);
+    }
+  }
+}
+
+
 void NoteSpriteFrameAttachmentRuntimeHit(void* spritePtr, void* runtimeModelPtr,
                                          void* contextPtr,
                                          uint32_t updateKind,
@@ -6292,8 +6771,39 @@ bool RecordRuntimeMatrixPaletteFromRangeCopy(int runtimeModel, int contextPtr,
       uint64_t(matrices.size()), std::memory_order_relaxed);
   g_runtimeMatrixRangeCopyLastMatrixHash.store(matrixHash,
                                                std::memory_order_relaxed);
-  if (publishPalette)
+  if (publishPalette) {
+    // Phase 7.34 A3 性能优化：per-runtimeModel 的 lastHash 快退。
+    // 同一模型连续帧如果 palette 完全没变（静态模型 / 同一动画帧重复调用），
+    // PublishRuntimeMatrixPalette 的 ModelRegistry 查询 + PoseRegistry 录入
+    // 重复做了就是白费。用一张固定大小的 TLS-safe 表做 hash 比对快退。
+    // 命中快退时只更新轻量 counter，跳过所有锁/查询/拷贝。
+    //
+    // 回退开关：`DXVK_WAR3_RUNTIME_MATRIX_RANGE_COPY_PUBLISH_DEDUP=0` 可禁用。
+    static const bool s_publishDedupEnabled =
+        GetEnvBoolCached("DXVK_WAR3_RUNTIME_MATRIX_RANGE_COPY_PUBLISH_DEDUP",
+                         true);
+    if (s_publishDedupEnabled) {
+      struct PublishDedupEntry {
+        int runtimeModel = 0;
+        uint64_t hash = 0u;
+      };
+      static constexpr size_t kDedupSize = 512u;
+      thread_local std::array<PublishDedupEntry, kDedupSize> s_dedupTable{};
+      const size_t slot =
+          (static_cast<size_t>(static_cast<uint32_t>(runtimeModel)) >> 4u) %
+          kDedupSize;
+      auto& entry = s_dedupTable[slot];
+      if (entry.runtimeModel == runtimeModel && entry.hash == matrixHash) {
+        // Hash 一致：跳过 PublishRuntimeMatrixPalette，数据本就没变。
+        g_runtimeMatrixRangeCopyPublishSkippedDedupCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        return true;
+      }
+      entry.runtimeModel = runtimeModel;
+      entry.hash = matrixHash;
+    }
     PublishRuntimeMatrixPalette(runtimeModel, matrices, allowResourceBinding);
+  }
   return true;
 }
 
@@ -6943,6 +7453,18 @@ int __fastcall Hook_RuntimePoseUpdate(int runtimeModel,
   return result;
 }
 
+// Phase 7.31 P0（恢复 + 修正）：batch capture 开关。
+// Codex 裁决：`0x12E600` 是 CGeosetData_BuildGroupBlendedPalette，按
+// `*(CGeosetData + 0xF0)` 的 groupCount 连续写 count * 48 字节到 outPalette。
+// Iter F 直接禁用本路径导致 paletteCaptureTrustedSourceMiss ~ 87%
+// （live palette 数据 87% 是 arena 残留）。现按 Codex 要求恢复 batch capture，
+// 并通过 env flag 提供 A/B 回退入口。
+static inline bool RuntimeMatrixBatchCaptureEnabled() {
+  static const bool enabled =
+      GetEnvBoolCached("DXVK_WAR3_RUNTIME_MATRIX_BATCH_CAPTURE", true);
+  return enabled;
+}
+
 void __fastcall Hook_RuntimeMatrixWrite(int nodePtr, int sourceMatrixPtr,
                                         int destMatrixPtr) {
   if (!g_trampolineRuntimeMatrixWrite)
@@ -6951,29 +7473,55 @@ void __fastcall Hook_RuntimeMatrixWrite(int nodePtr, int sourceMatrixPtr,
   g_trampolineRuntimeMatrixWrite(nodePtr, sourceMatrixPtr, destMatrixPtr);
   g_runtimeMatrixWriteCount.fetch_add(1u, std::memory_order_relaxed);
 
-  // 每次写只捕获当前 slot 的 1 个矩阵（之前错误地一次拷贝 groupCount 个，导致
-  // 未写入的槽位被陈旧的 identity/T-Pose 数据污染）。
-  if (g_config.enabled && destMatrixPtr != 0) {
-    uintptr_t gameDllBase =
-        reinterpret_cast<uintptr_t>(::GetModuleHandleA("Game.dll"));
-    if (gameDllBase != 0) {
-      void* globalBufPtr = nullptr;
-      if (SafeReadPtrFast(
-              reinterpret_cast<const void*>(gameDllBase + 0xBC6BD0u), 0,
-              globalBufPtr) &&
-          globalBufPtr != nullptr) {
-        uintptr_t outAddr = uintptr_t(uint32_t(destMatrixPtr));
-        uintptr_t baseAddr = reinterpret_cast<uintptr_t>(globalBufPtr);
-        if (outAddr >= baseAddr) {
-          uint32_t slotIndex = uint32_t((outAddr - baseAddr) / 48u);
-          auto& entry = s_slotBlendedPaletteCache[slotIndex];
-          entry.matrices.resize(1);
-          float m[12] = {};
-          std::memcpy(m, reinterpret_cast<const void*>(uintptr_t(destMatrixPtr)), sizeof(m));
-          entry.matrices[0] = Matrix4(
-              Vector4(m[0], m[1], m[2], 0), Vector4(m[3], m[4], m[5], 0),
-              Vector4(m[6], m[7], m[8], 0), Vector4(m[9], m[10], m[11], 1));
+  // Phase 7.47 dt gate probe：writer per-frameTag 去重
+  {
+    uint32_t frameTagProbe = 0u;
+    if (TryReadCurrentPaletteFrameTag(frameTagProbe) && frameTagProbe != 0u) {
+      NoteWriterHitForFrameTag(g_runtimeMatrixWriteLastFrameTag,
+                               g_runtimeMatrixWriteFramesWithHitCount,
+                               g_runtimeMatrixWriteFramesEmptyCount,
+                               frameTagProbe);
+    }
+  }
+
+  // Phase 7.31 P0 恢复：按 CGeosetData_BuildGroupBlendedPalette 的真实语义
+  // 做 batch capture。关键点：
+  //   (1) `count = *(CGeosetData + 0xF0)`，如果为 0 按 1 处理（simple
+  //       fallback 路径也走同一 hook）。
+  //   (2) 限 count ≤ kRuntimeMatrixBatchMaxCount（与 Query 的 kMaxSlots 对齐）。
+  //   (3) 整段 destMatrixPtr + count * 48 可读才进 batch 写入，否则直接放弃。
+  //   (4) slot cache 仍是固定数组，O(1) 写入；writeSerial 保证严格递增。
+  //
+  // 这样 `paletteCaptureTrustedSourceHit` 率可以从 13% 抬到 90%+，让
+  // PublishCurrentDrawContract 里的 trusted path 真正吃到 writer-side
+  // palette，而不是 arena memcpy 的 86% 残留。
+  uintptr_t globalPaletteBuf = ResolveGlobalBlendedPaletteBufferBase();
+  if (g_config.enabled && destMatrixPtr != 0 &&
+      RuntimeMatrixBatchCaptureEnabled()) {
+    const uintptr_t outAddr = uintptr_t(uint32_t(destMatrixPtr));
+    if (globalPaletteBuf != 0u && outAddr >= globalPaletteBuf) {
+      const uint32_t startSlotIndex =
+          uint32_t((outAddr - globalPaletteBuf) / 48u);
+      if (startSlotIndex < kSlotBlendedPaletteCacheSize) {
+        // 从 CGeosetData+0xF0 读 groupCount；nodePtr 非法时走 simple fallback(1)。
+        uint32_t groupCount = 0u;
+        bool hasGroupCount = false;
+        if (nodePtr != 0) {
+          hasGroupCount = SafeReadU32Fast(
+              reinterpret_cast<const void*>(uint32_t(nodePtr)),
+              0xF0u, groupCount);
         }
+        const uint32_t rawCount =
+            (hasGroupCount && groupCount != 0u) ? groupCount : 1u;
+        g_runtimeMatrixWriteBatchLastGroupCount.store(
+            uint64_t(rawCount), std::memory_order_relaxed);
+        uint32_t frameTag = 0u;
+        TryReadCurrentPaletteFrameTag(frameTag);
+        CaptureBlendedPaletteSlotRange(
+            startSlotIndex, reinterpret_cast<const uint8_t*>(outAddr),
+            rawCount, frameTag, &g_runtimeMatrixWriteBatchCapturedCount,
+            &g_runtimeMatrixWriteBatchOverflowCount,
+            &g_runtimeMatrixWriteBatchUnreadableCount);
       }
     }
   }
@@ -7011,6 +7559,53 @@ void __fastcall Hook_RuntimeMatrixWrite(int nodePtr, int sourceMatrixPtr,
                                            std::memory_order_relaxed);
 }
 
+int __fastcall Hook_RuntimeGroupPaletteWrapper(int runtimeModel,
+                                               int poseStackBasePtr) {
+  if (!g_trampolineRuntimeGroupPaletteWrapper)
+    return 0;
+
+  const int result =
+      g_trampolineRuntimeGroupPaletteWrapper(runtimeModel, poseStackBasePtr);
+  g_runtimeGroupPaletteWrapperCallCount.fetch_add(1u,
+                                                  std::memory_order_relaxed);
+  // Phase 7.47 dt gate probe：writer per-frameTag 去重
+  {
+    uint32_t frameTagProbe = 0u;
+    if (TryReadCurrentPaletteFrameTag(frameTagProbe) && frameTagProbe != 0u) {
+      NoteWriterHitForFrameTag(g_runtimeGroupPaletteWrapperLastFrameTag,
+                               g_runtimeGroupPaletteWrapperFramesWithHitCount,
+                               g_runtimeGroupPaletteWrapperFramesEmptyCount,
+                               frameTagProbe);
+    }
+  }
+  CaptureRuntimeGroupPaletteBindings(
+      runtimeModel, RuntimeGroupPaletteProducerKind::AllocAndFillWrapper,
+      false);
+  return result;
+}
+
+void __fastcall Hook_RuntimeSimpleGroupPalette(int runtimeModel, void* edx) {
+  (void)edx;
+  if (!g_trampolineRuntimeSimpleGroupPalette)
+    return;
+
+  g_trampolineRuntimeSimpleGroupPalette(runtimeModel);
+  g_runtimeSimpleGroupPaletteCallCount.fetch_add(1u,
+                                                 std::memory_order_relaxed);
+  // Phase 7.47 dt gate probe：writer per-frameTag 去重
+  {
+    uint32_t frameTagProbe = 0u;
+    if (TryReadCurrentPaletteFrameTag(frameTagProbe) && frameTagProbe != 0u) {
+      NoteWriterHitForFrameTag(g_runtimeSimpleGroupPaletteLastFrameTag,
+                               g_runtimeSimpleGroupPaletteFramesWithHitCount,
+                               g_runtimeSimpleGroupPaletteFramesEmptyCount,
+                               frameTagProbe);
+    }
+  }
+  CaptureRuntimeGroupPaletteBindings(
+      runtimeModel, RuntimeGroupPaletteProducerKind::SimpleFallback, true);
+}
+
 int __fastcall Hook_RuntimePropagatePoseTree(int runtimeModel, int a2) {
   if (!g_trampolineRuntimePropagatePoseTree)
     return 0;
@@ -7043,9 +7638,16 @@ int __fastcall Hook_SpriteFrameUpdate(int thisPtr, void* edx, float dt, int a3,
   if (!g_trampolineSpriteFrameUpdate)
     return 0;
 
+  // Phase 7.47 dt gate probe：trampoline 前记录 dt（包括早退路径）。
+  NoteSpriteUberPreRenderDtBucket(dt);
+
   const uintptr_t callerPc = GetCallReturnAddress();
   const int result =
       g_trampolineSpriteFrameUpdate(thisPtr, dt, a3, a4, a5);
+  // probe-only 模式下跳过 identity/pose 重路径，只保留 dt 统计。
+  if (!g_config.poseEnabled && SpriteUberDtProbeEnabled()) {
+    return result;
+  }
   if (g_config.poseEnabled) {
     SemanticHookPerfScope perf(
         render::SemanticDataPerfTag::PoseHook,
@@ -7063,9 +7665,15 @@ int __fastcall Hook_SpriteMiniFrameUpdate(int thisPtr, void* edx, float dt,
   if (!g_trampolineSpriteMiniFrameUpdate)
     return 0;
 
+  // Phase 7.47 dt gate probe
+  NoteSpriteUberPreRenderDtBucket(dt);
+
   const uintptr_t callerPc = GetCallReturnAddress();
   const int result =
       g_trampolineSpriteMiniFrameUpdate(thisPtr, dt, a3, a4, a5);
+  if (!g_config.poseEnabled && SpriteUberDtProbeEnabled()) {
+    return result;
+  }
   if (g_config.poseEnabled) {
     SemanticHookPerfScope perf(
         render::SemanticDataPerfTag::PoseHook,
@@ -7082,8 +7690,14 @@ int __fastcall Hook_SpriteFrameLiteUpdate(int thisPtr, void* edx, float dt) {
   if (!g_trampolineSpriteFrameLiteUpdate)
     return 0;
 
+  // Phase 7.47 dt gate probe
+  NoteSpriteUberPreRenderDtBucket(dt);
+
   const uintptr_t callerPc = GetCallReturnAddress();
   const int result = g_trampolineSpriteFrameLiteUpdate(thisPtr, dt);
+  if (!g_config.poseEnabled && SpriteUberDtProbeEnabled()) {
+    return result;
+  }
   RecordSpriteFramePoseFromSprite(thisPtr, dt, nullptr,
                                   kSpriteFrameUpdateKindLite, callerPc);
   return result;
@@ -7094,8 +7708,14 @@ int __fastcall Hook_SpriteMiniFrameLiteUpdate(int thisPtr, void* edx,
   if (!g_trampolineSpriteMiniFrameLiteUpdate)
     return 0;
 
+  // Phase 7.47 dt gate probe
+  NoteSpriteUberPreRenderDtBucket(dt);
+
   const uintptr_t callerPc = GetCallReturnAddress();
   const int result = g_trampolineSpriteMiniFrameLiteUpdate(thisPtr, dt);
+  if (!g_config.poseEnabled && SpriteUberDtProbeEnabled()) {
+    return result;
+  }
   RecordSpriteFramePoseFromSprite(thisPtr, dt, nullptr,
                                   kSpriteFrameUpdateKindMiniLite, callerPc);
   return result;
@@ -7124,16 +7744,28 @@ int __fastcall Hook_RuntimeMatrixRangeCopy(int runtimeModel, int a2, int a3) {
     // 0x6F12FDC0 is the authoritative animated matrix range-copy. Read the
     // exact source segment from its arguments before any later runtime flush can
     // replace CModel+0x60 with the shared reset matrix.
+    //
+    // Phase 7.34 A3: 激活 range-copy 作为 authoritative pose publisher。
+    // 历史上两个分支都传了 publishPalette=false，仅做诊断统计，导致 0x12FDC0
+    // 的权威 final-pose 数据从未写入 PoseRegistry。严格仲裁（A2）开启后，
+    // trusted miss 直接丢弃 publish，视角移动/渲染压力大时对象阴影会一帧消失
+    // 产生"闪烁"。A3 把默认值改成 true，让 0x12FDC0 的完整 final-pose palette
+    // 被发布为 PoseRegistry 的 matrixPalette，作为 trusted cache 的对账 oracle。
+    //
+    // 回滚开关：`DXVK_WAR3_RUNTIME_MATRIX_RANGE_COPY_PUBLISH=0` 可恢复旧行为
+    //（仅写诊断 counter，不发布 palette）。
+    static const bool s_publishRangeCopyPalette =
+        GetEnvBoolCached("DXVK_WAR3_RUNTIME_MATRIX_RANGE_COPY_PUBLISH", true);
     if (preferRuntimePoseUpdate) {
-      // Keep range-copy visible in diagnostics, but do not overwrite the
-      // palette that RuntimePoseUpdate just published. This avoids holding
-      // shadows in the initial/bind pose when the later helper writes a stable
-      // matrix segment for the visible runtime.
+      // preferRuntimePoseUpdate 路径：RuntimePoseUpdate 会在更晚的时机发布
+      // 一段 stable matrix segment。为避免 range-copy 覆盖它的结果，仍保持
+      // publishPalette=false（以该分支的 s_publishRangeCopyPalette 为 false
+      // 更保守，即使 A3 开关打开也不要冲突）。
       RecordRuntimeMatrixPaletteFromRangeCopy(runtimeModel, a2, a3, false,
                                               false);
-    } else if (!RecordRuntimeMatrixPaletteFromRangeCopy(runtimeModel, a2, a3,
-                                                        false) &&
-        RecordRuntimeMatrixPalette(runtimeModel, false)) {
+    } else if (!RecordRuntimeMatrixPaletteFromRangeCopy(
+                   runtimeModel, a2, a3, false, s_publishRangeCopyPalette) &&
+               RecordRuntimeMatrixPalette(runtimeModel, false)) {
       g_runtimeMatrixRangeCopyPaletteFallbackCModelCount.fetch_add(
           1u, std::memory_order_relaxed);
     }
@@ -7510,6 +8142,38 @@ bool InstallRuntimeMatrixWriteHook(uintptr_t gameBase) {
       "RuntimeMatrixWrite", true, g_config.logEnabled);
 }
 
+bool InstallRuntimeGroupPaletteWrapperHook(uintptr_t gameBase) {
+  const uintptr_t target = gameBase + kRuntimeGroupPaletteWrapperRva;
+  if (!IsExecutableRange(reinterpret_cast<const void*>(target), 16)) {
+    war3dbg::Print(
+        "DXVK_Model: runtime group palette wrapper 不可执行，跳过 Hook (addr=%p)\n",
+        reinterpret_cast<void*>(target));
+    return false;
+  }
+
+  return hooks::InstallMinHook(
+      reinterpret_cast<LPVOID>(target),
+      reinterpret_cast<LPVOID>(&Hook_RuntimeGroupPaletteWrapper),
+      reinterpret_cast<LPVOID*>(&g_trampolineRuntimeGroupPaletteWrapper),
+      "Model", "RuntimeGroupPaletteWrapper", true, g_config.logEnabled);
+}
+
+bool InstallRuntimeSimpleGroupPaletteHook(uintptr_t gameBase) {
+  const uintptr_t target = gameBase + kRuntimeSimpleGroupPaletteRva;
+  if (!IsExecutableRange(reinterpret_cast<const void*>(target), 16)) {
+    war3dbg::Print(
+        "DXVK_Model: runtime simple group palette 不可执行，跳过 Hook (addr=%p)\n",
+        reinterpret_cast<void*>(target));
+    return false;
+  }
+
+  return hooks::InstallMinHook(
+      reinterpret_cast<LPVOID>(target),
+      reinterpret_cast<LPVOID>(&Hook_RuntimeSimpleGroupPalette),
+      reinterpret_cast<LPVOID*>(&g_trampolineRuntimeSimpleGroupPalette),
+      "Model", "RuntimeSimpleGroupPalette", true, g_config.logEnabled);
+}
+
 bool InstallRuntimePropagatePoseTreeHook(uintptr_t gameBase) {
   const uintptr_t target = gameBase + kRuntimePropagatePoseTreeRva;
   if (!IsExecutableRange(reinterpret_cast<const void *>(target), 16)) {
@@ -7630,17 +8294,329 @@ bool QueryBlendedPaletteBySlotIndex(uint32_t slotIndex,
   auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
   outPalette.clear();
   outGroupCount = 0u;
+  uint32_t currentFrameTag = 0u;
+  const bool hasCurrentFrameTag = TryReadCurrentPaletteFrameTag(currentFrameTag);
+  uint32_t expectedFrameTag = 0u;
+  uint64_t previousWriteSerial = 0u;
   // 每次写只存了 1 个矩阵，需要遍历连续槽位收集整个 geoset 的调色板
   constexpr uint32_t kMaxSlots = 256u;
   for (uint32_t s = slotIndex; s < slotIndex + kMaxSlots; ++s) {
-    auto it = s_slotBlendedPaletteCache.find(s);
-    if (it == s_slotBlendedPaletteCache.end() || it->second.matrices.empty())
+    if (s >= kSlotBlendedPaletteCacheSize)
       break;
-    outPalette.push_back(it->second.matrices[0]);
+    const auto& entry = s_slotBlendedPaletteCache[s];
+    if (!entry.valid)
+      break;
+    if (expectedFrameTag == 0u) {
+      expectedFrameTag = entry.frameTag;
+      if (hasCurrentFrameTag && expectedFrameTag != currentFrameTag)
+        return false;
+    } else if (entry.frameTag != expectedFrameTag) {
+      break;
+    }
+    if (previousWriteSerial != 0u && entry.writeSerial <= previousWriteSerial)
+      break;
+    previousWriteSerial = entry.writeSerial;
+    outPalette.push_back(entry.matrix);
   }
   if (outPalette.empty())
     return false;
   outGroupCount = uint32_t(outPalette.size());
+  return true;
+}
+
+// Phase 7.30 Action B 第二刀：按 frameTag 校验的精确 query。
+// Phase 7.34 诊断 counter：用于观察 exact/bestEffort 拒绝分布。
+std::atomic<uint64_t> g_queryBlendedPaletteExactHitCount{0u};
+std::atomic<uint64_t> g_queryBlendedPaletteRejectedSlotOverflowCount{0u};
+std::atomic<uint64_t> g_queryBlendedPaletteRejectedInvalidEntryCount{0u};
+std::atomic<uint64_t> g_queryBlendedPaletteRejectedFrameTagMismatchCount{0u};
+std::atomic<uint64_t> g_queryBlendedPaletteRejectedShortResultCount{0u};
+std::atomic<uint64_t> g_queryBlendedPaletteBestEffortHitCount{0u};
+
+// 只要 slotIndex..slotIndex+count-1 每个 entry 的 frameTag 都与当前帧
+// (或请求的 expectedFrameTag) 一致，就返回 palette。不要求 writeSerial
+// 单调递增——引擎的 matrix-write 顺序与 slot 顺序不一定吻合，只要 per-slot
+// 最近一次写就在本帧就是可信的。
+//
+// Phase 7.34 重写：恢复 "Exact" 真正的严格语义。
+// 历史背景：Phase 1 曾把 break 当成 return 部分命中，结果是
+//   `size < expectedCount` 的调用端用零填充后续矩阵 → skinned caster 阴影
+//   数据污染，是用户观察到的"只显示一个部位 + 有闪烁"的直接原因之一。
+//
+// 新语义：
+//   - Exact 版本：所有 expectedCount 个 slot 必须 valid 且 frameTag 同帧
+//     （允许差 1 帧，因为骨骼计算先于 draw）；任何一项失败即 return false，
+//     outPalette 清空。
+//   - BestEffort 版本：保留旧宽松行为，**仅供诊断**，不应参与 ready 仲裁。
+//
+// 调用端必须检查 `outPalette.size() == expectedCount`，否则视为 miss。
+bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
+                                         uint32_t expectedCount,
+                                         uint32_t expectedFrameTag,
+                                         void* outPaletteVec) {
+  auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
+  outPalette.clear();
+  if (expectedCount == 0u || expectedCount > 256u)
+    return false;
+  if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize) {
+    g_queryBlendedPaletteRejectedSlotOverflowCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+  outPalette.reserve(expectedCount);
+  for (uint32_t i = 0u; i < expectedCount; ++i) {
+    const uint32_t s = slotIndex + i;
+    const auto& entry = s_slotBlendedPaletteCache[s];
+    if (!entry.valid) {
+      g_queryBlendedPaletteRejectedInvalidEntryCount.fetch_add(
+          1u, std::memory_order_relaxed);
+      outPalette.clear();
+      return false;
+    }
+    // Phase 7.35 路径 1：原先只允许差 1 帧，但相机移动时骨骼计算 0x12E600
+    // 通常是 pre-pass 先于当帧 draw（observed delta=2 很普遍），24.4% miss 就是
+    // 这一刀切掉的。放宽到 2 帧（与 capture serial diff<=2 保持对齐），压下
+    // `paletteCaptureFrameTagMismatchMissCount`。不往 3+ 放宽：那样骨骼延迟视觉
+    // 可感知，属于 path 2 该解决的问题。
+    if (expectedFrameTag != 0u && entry.frameTag != 0u) {
+      const uint32_t delta = (expectedFrameTag >= entry.frameTag)
+                                 ? (expectedFrameTag - entry.frameTag)
+                                 : (entry.frameTag - expectedFrameTag);
+      if (delta > 2u) {
+        g_queryBlendedPaletteRejectedFrameTagMismatchCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        outPalette.clear();
+        return false;
+      }
+    }
+    outPalette.push_back(entry.matrix);
+  }
+  // 最终完整性复查：任何 partial 情形统一判 fail。
+  if (outPalette.size() != expectedCount) {
+    g_queryBlendedPaletteRejectedShortResultCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    outPalette.clear();
+    return false;
+  }
+  g_queryBlendedPaletteExactHitCount.fetch_add(1u, std::memory_order_relaxed);
+  return true;
+}
+
+// Phase 7.34：诊断用的 best-effort 查询，允许 partial 返回。
+// **不应用于 Ready palette 仲裁**，仅在 counter / 调试日志中使用。
+bool QueryBlendedPaletteBySlotIndexBestEffort(uint32_t slotIndex,
+                                              uint32_t expectedCount,
+                                              uint32_t expectedFrameTag,
+                                              void* outPaletteVec) {
+  auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
+  outPalette.clear();
+  if (expectedCount == 0u || expectedCount > 256u)
+    return false;
+  if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize)
+    return false;
+  outPalette.reserve(expectedCount);
+  for (uint32_t i = 0u; i < expectedCount; ++i) {
+    const uint32_t s = slotIndex + i;
+    const auto& entry = s_slotBlendedPaletteCache[s];
+    if (!entry.valid)
+      break;
+    if (expectedFrameTag != 0u && entry.frameTag != 0u) {
+      const uint32_t delta = (expectedFrameTag >= entry.frameTag)
+                                 ? (expectedFrameTag - entry.frameTag)
+                                 : (entry.frameTag - expectedFrameTag);
+      if (delta > 1u)
+        break;
+    }
+    outPalette.push_back(entry.matrix);
+  }
+  if (!outPalette.empty())
+    g_queryBlendedPaletteBestEffortHitCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  return !outPalette.empty();
+}
+
+bool QueryCurrentPaletteFrameTag(uint32_t& outFrameTag) {
+  return TryReadCurrentPaletteFrameTag(outFrameTag);
+}
+
+bool QueryBlendedPaletteFrameTagRange(uint32_t slotIndex,
+                                      uint32_t expectedCount,
+                                      uint32_t& outMinFrameTag,
+                                      uint32_t& outMaxFrameTag,
+                                      uint32_t& outMissingCount) {
+  outMinFrameTag = 0u;
+  outMaxFrameTag = 0u;
+  outMissingCount = 0u;
+  if (expectedCount == 0u || expectedCount > 256u) {
+    outMissingCount = expectedCount;
+    return false;
+  }
+  if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize) {
+    outMissingCount = expectedCount;
+    return false;
+  }
+
+  bool hasAnyFrameTag = false;
+  for (uint32_t i = 0u; i < expectedCount; ++i) {
+    const auto& entry = s_slotBlendedPaletteCache[slotIndex + i];
+    if (!entry.valid || entry.frameTag == 0u) {
+      outMissingCount++;
+      continue;
+    }
+
+    const uint32_t tag = entry.frameTag;
+    if (!hasAnyFrameTag) {
+      outMinFrameTag = tag;
+      outMaxFrameTag = tag;
+      hasAnyFrameTag = true;
+    } else {
+      outMinFrameTag = std::min(outMinFrameTag, tag);
+      outMaxFrameTag = std::max(outMaxFrameTag, tag);
+    }
+  }
+
+  return hasAnyFrameTag && outMissingCount == 0u;
+}
+
+bool QueryRenderablePartPaletteSlot(void* renderablePart,
+                                    uint32_t& outSlotIndex,
+                                    uint32_t* outGroupCount,
+                                    uint32_t* outFrameTag) {
+  outSlotIndex = 0xFFFFFFFFu;
+  if (outGroupCount != nullptr)
+    *outGroupCount = 0u;
+  if (outFrameTag != nullptr)
+    *outFrameTag = 0u;
+  if (renderablePart == nullptr) {
+    g_renderablePartPaletteBindingQueryMissCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+
+  const uintptr_t partValue = reinterpret_cast<uintptr_t>(renderablePart);
+  const size_t slot =
+      (partValue >> 4u) % kRenderablePartPaletteBindingCacheSize;
+  const auto& entry = s_renderablePartPaletteBindings[slot];
+  if (entry.renderablePart.load(std::memory_order_acquire) != partValue) {
+    g_renderablePartPaletteBindingQueryMissCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+
+  const uint32_t slotIndex =
+      entry.paletteSlotIndex.load(std::memory_order_relaxed);
+  if (slotIndex == 0xFFFFFFFFu || slotIndex >= 0x3A98u) {
+    g_renderablePartPaletteBindingQueryMissCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+
+  outSlotIndex = slotIndex;
+  if (outGroupCount != nullptr)
+    *outGroupCount = entry.groupCount.load(std::memory_order_relaxed);
+  if (outFrameTag != nullptr)
+    *outFrameTag = entry.frameTag.load(std::memory_order_relaxed);
+  g_renderablePartPaletteBindingQueryHitCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  return true;
+}
+
+bool QueryRenderablePartPaletteSnapshot(void* renderablePart,
+                                        uint32_t expectedCount,
+                                        void* outPaletteVec,
+                                        uint64_t* outHash,
+                                        uint32_t* outFrameTag) {
+  auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
+  outPalette.clear();
+  if (outHash != nullptr)
+    *outHash = 0u;
+  if (outFrameTag != nullptr)
+    *outFrameTag = 0u;
+
+  auto noteMiss = [&]() {
+    g_renderablePartPaletteSnapshotQueryMissCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  };
+
+  if (!RenderablePartPaletteSnapshotEnabled() || renderablePart == nullptr ||
+      expectedCount == 0u ||
+      expectedCount > kRenderablePartPaletteSnapshotMaxCount) {
+    return noteMiss();
+  }
+
+  const uintptr_t partValue = reinterpret_cast<uintptr_t>(renderablePart);
+  const size_t slot =
+      (partValue >> 4u) % kRenderablePartPaletteBindingCacheSize;
+  const auto& entry = s_renderablePartPaletteBindings[slot];
+  if (entry.renderablePart.load(std::memory_order_acquire) != partValue)
+    return noteMiss();
+
+  const uint64_t serialBefore =
+      entry.paletteWriteSerial.load(std::memory_order_acquire);
+  if (serialBefore == 0u || (serialBefore & 1u) != 0u)
+    return noteMiss();
+
+  const uint32_t paletteCount =
+      entry.paletteCount.load(std::memory_order_relaxed);
+  if (paletteCount < expectedCount ||
+      paletteCount > kRenderablePartPaletteSnapshotMaxCount) {
+    return noteMiss();
+  }
+
+  outPalette.resize(expectedCount);
+  for (uint32_t i = 0u; i < expectedCount; ++i)
+    outPalette[i] = entry.palette[i];
+
+  const uint64_t serialAfter =
+      entry.paletteWriteSerial.load(std::memory_order_acquire);
+  if (serialBefore != serialAfter || (serialAfter & 1u) != 0u) {
+    outPalette.clear();
+    return noteMiss();
+  }
+
+  const uint32_t frameTag =
+      entry.paletteFrameTag.load(std::memory_order_relaxed);
+  uint64_t paletteHash = 0u;
+  if (paletteCount == expectedCount) {
+    paletteHash = entry.paletteHash.load(std::memory_order_relaxed);
+  }
+  if (paletteHash == 0u)
+    paletteHash = HashMatrixPalette(outPalette);
+
+  if (outHash != nullptr)
+    *outHash = paletteHash;
+  if (outFrameTag != nullptr)
+    *outFrameTag = frameTag;
+  g_renderablePartPaletteSnapshotQueryHitCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  return true;
+}
+
+// Phase 7.51：通过 renderablePart 反查 producer 侧 runtimeModel 指针。
+// 当 0x12FED0/0x12FF90 producer 触发时，我们记了 (renderablePart, runtimeModel)
+// 绑定；submit 时 packet.renderable.runtimeModelPtr 经常是经过 alias 解析的别名
+// 值，PoseRegistry miss，而这里返回的才是 PoseRegistry 的原始 key。
+bool QueryRenderablePartOwnerRuntimeModel(void* renderablePart,
+                                          void** outRuntimeModelPtr) {
+  if (outRuntimeModelPtr != nullptr)
+    *outRuntimeModelPtr = nullptr;
+  if (renderablePart == nullptr || outRuntimeModelPtr == nullptr)
+    return false;
+
+  const uintptr_t partValue = reinterpret_cast<uintptr_t>(renderablePart);
+  const size_t slot =
+      (partValue >> 4u) % kRenderablePartPaletteBindingCacheSize;
+  const auto& entry = s_renderablePartPaletteBindings[slot];
+  if (entry.renderablePart.load(std::memory_order_acquire) != partValue)
+    return false;
+
+  const uintptr_t runtimeValue =
+      entry.runtimeModel.load(std::memory_order_relaxed);
+  if (runtimeValue == 0u)
+    return false;
+
+  *outRuntimeModelPtr = reinterpret_cast<void*>(runtimeValue);
   return true;
 }
 
@@ -7779,6 +8755,73 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
     g_runtimeMatrixWriteCount.store(0u, std::memory_order_relaxed);
     g_runtimeMatrixWritePublishCount.store(0u, std::memory_order_relaxed);
     g_runtimeMatrixWriteMissCount.store(0u, std::memory_order_relaxed);
+    g_runtimeMatrixWriteBatchCapturedCount.store(0u,
+                                                 std::memory_order_relaxed);
+    g_runtimeMatrixWriteBatchOverflowCount.store(0u,
+                                                 std::memory_order_relaxed);
+    g_runtimeMatrixWriteBatchUnreadableCount.store(0u,
+                                                   std::memory_order_relaxed);
+    g_runtimeMatrixWriteBatchLastGroupCount.store(0u,
+                                                  std::memory_order_relaxed);
+    g_runtimeGroupPaletteWrapperCallCount.store(0u,
+                                                std::memory_order_relaxed);
+    g_runtimeGroupPaletteWrapperPartCount.store(0u,
+                                                std::memory_order_relaxed);
+    g_runtimeGroupPaletteWrapperBindingCount.store(0u,
+                                                   std::memory_order_relaxed);
+    g_runtimeSimpleGroupPaletteCallCount.store(0u,
+                                               std::memory_order_relaxed);
+    g_runtimeSimpleGroupPaletteSlotCapturedCount.store(
+        0u, std::memory_order_relaxed);
+    g_runtimeSimpleGroupPaletteSlotUnreadableCount.store(
+        0u, std::memory_order_relaxed);
+    g_renderablePartPaletteBindingQueryHitCount.store(
+        0u, std::memory_order_relaxed);
+    g_renderablePartPaletteBindingQueryMissCount.store(
+        0u, std::memory_order_relaxed);
+    g_renderablePartPaletteSnapshotCapturedCount.store(
+        0u, std::memory_order_relaxed);
+    g_renderablePartPaletteSnapshotTooLargeCount.store(
+        0u, std::memory_order_relaxed);
+    g_renderablePartPaletteSnapshotUnreadableCount.store(
+        0u, std::memory_order_relaxed);
+    g_renderablePartPaletteSnapshotQueryHitCount.store(
+        0u, std::memory_order_relaxed);
+    g_renderablePartPaletteSnapshotQueryMissCount.store(
+        0u, std::memory_order_relaxed);
+    // Phase 7.47 dt gate probe
+    g_spriteUberPreRenderTotalCount.store(0u, std::memory_order_relaxed);
+    g_spriteUberPreRenderDtZeroCount.store(0u, std::memory_order_relaxed);
+    g_spriteUberPreRenderDtBelowEpsilonCount.store(
+        0u, std::memory_order_relaxed);
+    g_spriteUberPreRenderDtPositiveCount.store(0u,
+                                                std::memory_order_relaxed);
+    g_spriteUberPreRenderDtNegativeCount.store(0u,
+                                                std::memory_order_relaxed);
+    g_spriteUberPreRenderLastDtBits.store(0u, std::memory_order_relaxed);
+    g_spriteUberPreRenderLastZeroDtFrameTag.store(
+        0u, std::memory_order_relaxed);
+    g_spriteUberPreRenderLastPositiveDtFrameTag.store(
+        0u, std::memory_order_relaxed);
+    g_runtimeMatrixWriteLastFrameTag.store(0u, std::memory_order_relaxed);
+    g_runtimeMatrixWriteFramesWithHitCount.store(
+        0u, std::memory_order_relaxed);
+    g_runtimeMatrixWriteFramesEmptyCount.store(
+        0u, std::memory_order_relaxed);
+    g_runtimeGroupPaletteWrapperLastFrameTag.store(
+        0u, std::memory_order_relaxed);
+    g_runtimeGroupPaletteWrapperFramesWithHitCount.store(
+        0u, std::memory_order_relaxed);
+    g_runtimeGroupPaletteWrapperFramesEmptyCount.store(
+        0u, std::memory_order_relaxed);
+    g_runtimeSimpleGroupPaletteLastFrameTag.store(
+        0u, std::memory_order_relaxed);
+    g_runtimeSimpleGroupPaletteFramesWithHitCount.store(
+        0u, std::memory_order_relaxed);
+    g_runtimeSimpleGroupPaletteFramesEmptyCount.store(
+        0u, std::memory_order_relaxed);
+    g_paletteFrameTagLastSeen.store(0u, std::memory_order_relaxed);
+    g_paletteFrameTagAdvanceCount.store(0u, std::memory_order_relaxed);
     g_runtimeMatrixWriteLastRuntimeModelPtr.store(
         0u, std::memory_order_relaxed);
     g_runtimeMatrixWriteLastMatrixIndex.store(0u,
@@ -7792,6 +8835,7 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
       g_runtimePoseArrayByModel.clear();
       g_runtimePoseArrayByMatrixPtr.clear();
     }
+    render::ResetCurrentDrawContractCache();
     g_runtimeMatrixRangeCopyPalettePublishHitCount.store(
         0u, std::memory_order_relaxed);
     g_runtimeMatrixRangeCopyPalettePublishMissCount.store(
@@ -8373,7 +9417,8 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
     const bool installSpriteFrameHooks =
         g_config.poseEnabled ||
         dxvk::war3::internal::
-            kWar3RuntimeConfigInstallSpriteFrameHooksWithoutPose;
+            kWar3RuntimeConfigInstallSpriteFrameHooksWithoutPose ||
+        SpriteUberDtProbeEnabled();
     if (installSpriteFrameHooks) {
       fullInstalled = InstallSpriteMiniFrameUpdateHook(gameBase) || fullInstalled;
       fullInstalled =
@@ -8386,6 +9431,17 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
       fullInstalled = InstallRuntimePoseHook(gameBase) || fullInstalled;
     if (g_config.poseEnabled || runtimeMatrixWriteEnabled)
       fullInstalled = InstallRuntimeMatrixWriteHook(gameBase) || fullInstalled;
+    if (g_config.poseEnabled || runtimeMatrixWriteEnabled) {
+      fullInstalled =
+          InstallRuntimeGroupPaletteWrapperHook(gameBase) || fullInstalled;
+      fullInstalled =
+          InstallRuntimeSimpleGroupPaletteHook(gameBase) || fullInstalled;
+    }
+    if (g_config.enabled)
+      fullInstalled =
+          render::InstallCurrentDrawContractHook(gameBase,
+                                                 g_config.logEnabled) ||
+          fullInstalled;
     if (g_config.poseEnabled)
       fullInstalled =
           InstallRuntimePropagatePoseTreeHook(gameBase) || fullInstalled;
@@ -8506,6 +9562,89 @@ RuntimeOverrideOutputProbeSummary QueryRuntimeOverrideOutputProbeSummary() {
       g_runtimeMatrixWritePublishCount.load(std::memory_order_relaxed);
   summary.runtimeMatrixWriteMissCount =
       g_runtimeMatrixWriteMissCount.load(std::memory_order_relaxed);
+  // Phase 7.31 P0 batch-capture 指标直接并入模型 hook summary。
+  summary.runtimeMatrixWriteBatchCapturedCount =
+      g_runtimeMatrixWriteBatchCapturedCount.load(std::memory_order_relaxed);
+  summary.runtimeMatrixWriteBatchOverflowCount =
+      g_runtimeMatrixWriteBatchOverflowCount.load(std::memory_order_relaxed);
+  summary.runtimeMatrixWriteBatchUnreadableCount =
+      g_runtimeMatrixWriteBatchUnreadableCount.load(
+          std::memory_order_relaxed);
+  summary.runtimeMatrixWriteBatchLastGroupCount =
+      g_runtimeMatrixWriteBatchLastGroupCount.load(std::memory_order_relaxed);
+  summary.runtimeGroupPaletteWrapperCallCount =
+      g_runtimeGroupPaletteWrapperCallCount.load(std::memory_order_relaxed);
+  summary.runtimeGroupPaletteWrapperPartCount =
+      g_runtimeGroupPaletteWrapperPartCount.load(std::memory_order_relaxed);
+  summary.runtimeGroupPaletteWrapperBindingCount =
+      g_runtimeGroupPaletteWrapperBindingCount.load(std::memory_order_relaxed);
+  summary.runtimeSimpleGroupPaletteCallCount =
+      g_runtimeSimpleGroupPaletteCallCount.load(std::memory_order_relaxed);
+  summary.runtimeSimpleGroupPaletteSlotCapturedCount =
+      g_runtimeSimpleGroupPaletteSlotCapturedCount.load(
+          std::memory_order_relaxed);
+  summary.runtimeSimpleGroupPaletteSlotUnreadableCount =
+      g_runtimeSimpleGroupPaletteSlotUnreadableCount.load(
+          std::memory_order_relaxed);
+  summary.renderablePartPaletteBindingQueryHitCount =
+      g_renderablePartPaletteBindingQueryHitCount.load(
+          std::memory_order_relaxed);
+  summary.renderablePartPaletteBindingQueryMissCount =
+      g_renderablePartPaletteBindingQueryMissCount.load(
+          std::memory_order_relaxed);
+  summary.renderablePartPaletteSnapshotCapturedCount =
+      g_renderablePartPaletteSnapshotCapturedCount.load(
+          std::memory_order_relaxed);
+  summary.renderablePartPaletteSnapshotTooLargeCount =
+      g_renderablePartPaletteSnapshotTooLargeCount.load(
+          std::memory_order_relaxed);
+  summary.renderablePartPaletteSnapshotUnreadableCount =
+      g_renderablePartPaletteSnapshotUnreadableCount.load(
+          std::memory_order_relaxed);
+  summary.renderablePartPaletteSnapshotQueryHitCount =
+      g_renderablePartPaletteSnapshotQueryHitCount.load(
+          std::memory_order_relaxed);
+  summary.renderablePartPaletteSnapshotQueryMissCount =
+      g_renderablePartPaletteSnapshotQueryMissCount.load(
+          std::memory_order_relaxed);
+  // Phase 7.47 dt gate probe
+  summary.spriteUberPreRenderTotalCount =
+      g_spriteUberPreRenderTotalCount.load(std::memory_order_relaxed);
+  summary.spriteUberPreRenderDtZeroCount =
+      g_spriteUberPreRenderDtZeroCount.load(std::memory_order_relaxed);
+  summary.spriteUberPreRenderDtBelowEpsilonCount =
+      g_spriteUberPreRenderDtBelowEpsilonCount.load(
+          std::memory_order_relaxed);
+  summary.spriteUberPreRenderDtPositiveCount =
+      g_spriteUberPreRenderDtPositiveCount.load(std::memory_order_relaxed);
+  summary.spriteUberPreRenderDtNegativeCount =
+      g_spriteUberPreRenderDtNegativeCount.load(std::memory_order_relaxed);
+  summary.spriteUberPreRenderLastDtBits =
+      uint64_t(g_spriteUberPreRenderLastDtBits.load(
+          std::memory_order_relaxed));
+  summary.spriteUberPreRenderLastZeroDtFrameTag =
+      uint64_t(g_spriteUberPreRenderLastZeroDtFrameTag.load(
+          std::memory_order_relaxed));
+  summary.spriteUberPreRenderLastPositiveDtFrameTag =
+      uint64_t(g_spriteUberPreRenderLastPositiveDtFrameTag.load(
+          std::memory_order_relaxed));
+  summary.runtimeMatrixWriteFramesWithHitCount =
+      g_runtimeMatrixWriteFramesWithHitCount.load(
+          std::memory_order_relaxed);
+  summary.runtimeMatrixWriteFramesEmptyCount =
+      g_runtimeMatrixWriteFramesEmptyCount.load(std::memory_order_relaxed);
+  summary.runtimeGroupPaletteWrapperFramesWithHitCount =
+      g_runtimeGroupPaletteWrapperFramesWithHitCount.load(
+          std::memory_order_relaxed);
+  summary.runtimeGroupPaletteWrapperFramesEmptyCount =
+      g_runtimeGroupPaletteWrapperFramesEmptyCount.load(
+          std::memory_order_relaxed);
+  summary.runtimeSimpleGroupPaletteFramesWithHitCount =
+      g_runtimeSimpleGroupPaletteFramesWithHitCount.load(
+          std::memory_order_relaxed);
+  summary.runtimeSimpleGroupPaletteFramesEmptyCount =
+      g_runtimeSimpleGroupPaletteFramesEmptyCount.load(
+          std::memory_order_relaxed);
   summary.runtimeMatrixWriteLastRuntimeModelPtr =
       g_runtimeMatrixWriteLastRuntimeModelPtr.load(std::memory_order_relaxed);
   summary.runtimeMatrixWriteLastMatrixIndex =
@@ -9343,6 +10482,20 @@ RuntimeOverrideOutputProbeSummary QueryRuntimeOverrideOutputProbeSummary() {
       g_overrideLastLocalPointYBits.load(std::memory_order_relaxed));
   summary.lastLocalPointZ = FloatFromBits(
       g_overrideLastLocalPointZBits.load(std::memory_order_relaxed));
+  // Phase 7.35 路径 1 诊断透传：把 Exact 查询的命中/miss 分桶镜像到
+  // current-draw contract summary，使 AutoTest 一次拉取同时看到
+  // capture 端 miss 分布和 submit 端 lag 分布。
+  dxvk::war3::render::PublishCaptureExactQueryCounters(
+      g_queryBlendedPaletteExactHitCount.load(std::memory_order_relaxed),
+      g_queryBlendedPaletteBestEffortHitCount.load(std::memory_order_relaxed),
+      g_queryBlendedPaletteRejectedSlotOverflowCount.load(
+          std::memory_order_relaxed),
+      g_queryBlendedPaletteRejectedInvalidEntryCount.load(
+          std::memory_order_relaxed),
+      g_queryBlendedPaletteRejectedFrameTagMismatchCount.load(
+          std::memory_order_relaxed),
+      g_queryBlendedPaletteRejectedShortResultCount.load(
+          std::memory_order_relaxed));
   return summary;
 }
 

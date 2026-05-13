@@ -576,6 +576,9 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
     shadowHooks.shadowPathObjectProjectorJassBridgeAddr =
         resolveCode(book.shadowPathObjectProjectorJassBridge,
                     "ShadowPath_ObjectProjector_JassBridge");
+    shadowHooks.shadowPathStaticStampToggleAddr =
+        resolveCode(book.shadowPathStaticStampToggle,
+                    "ShadowPath_StaticStamp_Toggle");
     dxvk::war3::hooks::InstallShadowHooks(shadowHooks);
   } else {
     war3dbg::Print("DXVK War3Hook: 二分诊断态关闭 Shadow hook 安装\n");

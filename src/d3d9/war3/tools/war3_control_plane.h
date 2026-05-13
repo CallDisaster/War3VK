@@ -34,6 +34,12 @@ struct War3FrameManifestSummary {
   uint64_t itemCount = 0;
   uint64_t effectCount = 0;
   uint64_t unknownCount = 0;
+  uint64_t visibleMainQueueRangeCallCount = 0;
+  uint64_t visibleMainQueueRangeRecordCount = 0;
+  uint64_t visibleSemanticCandidateCallCount = 0;
+  uint64_t visibleSemanticCandidateMergedCount = 0;
+  uint64_t visibleSemanticCandidateAppendedCount = 0;
+  uint64_t visibleTransparentEntryCallCount = 0;
   uint64_t rootUnitSupplementSeedCount = 0;
   uint64_t rootUnitSupplementUnitSeedCount = 0;
   uint64_t rootUnitSupplementSkippedNoIdentity = 0;

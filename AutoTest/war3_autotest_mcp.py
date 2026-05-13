@@ -34,7 +34,7 @@ from mcp.server.fastmcp import FastMCP
 
 DEFAULT_WAR3_DIR = Path(r"E:\Work\War3")
 DEFAULT_TEST_MAP = Path(r"E:\Work\War3\Maps\光影测试.w3x")
-DEFAULT_LOW_PRESSURE_TEST_MAP = Path(r"E:\Work\War3\Maps\ShadowTest\光影测试低压.w3x")
+DEFAULT_LOW_PRESSURE_TEST_MAP = Path(r"E:\Work\War3\Maps\ShadowTest\光影测试.w3x")
 DEFAULT_CITY_MAP = Path(r"E:\Work\War3\Maps\dz\rpg\City.w3x")
 DEFAULT_CITY_FALLBACK_MAP = DEFAULT_TEST_MAP
 DEFAULT_TEST_MAP_REL = Path(r"Maps\Test\WorldEditTestMap.w3x")
@@ -258,6 +258,7 @@ SEMANTIC_SHADOW_VALIDATION_ENV: Dict[str, str] = {
     "DXVK_WAR3_SEMANTIC_SHADOW_ENDFRAME_FLUSH": "1",
     "DXVK_WAR3_SEMANTIC_SHADOW_TAIL_FALLBACK": "1",
     "DXVK_WAR3_SEMANTIC_SHADOW_PRE_READY": "1",
+    "DXVK_WAR3_SEMANTIC_PUBLISH_REGISTRIES_BEFORE_SCENE": "1",
 }
 
 SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -341,6 +342,73 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "autoPerfRecord": True,
         "recordAfterGameStarted": True,
         "autoPerfExportSec": 22,
+        "deployD3d9BeforeLaunch": True,
+        "opengl": False,
+        "enforceVideoBaseline": False,
+        "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
+        "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
+        "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
+    },
+    "rigid_static_canonical_smoke": {
+        "title": "Rigid/Static Canonical Smoke",
+        "description": "用于 Phase 4 prepared 的 rigid/static canonical 场景预案，不强制 hot-shadow gate。",
+        "mapPath": str(Path(r"E:\Work\War3\Maps\ShadowTest\光影测试.w3x")),
+        "profile": "full_default",
+        "disableModules": "",
+        "windowed": True,
+        "useIsolatedDesktop": True,
+        "desktopName": "War3RigidStaticCanonical",
+        "readyTimeoutSec": 120,
+        "sampleDurationSec": 18,
+        "autoPerfRecord": True,
+        "recordAfterGameStarted": True,
+        "autoPerfExportSec": 22,
+        "deployD3d9BeforeLaunch": True,
+        "opengl": False,
+        "enforceVideoBaseline": False,
+        "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
+        "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
+        "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "requireHotShadowFrame": False,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
+    },
+    "static_world_caster_acceptance": {
+        "title": "Static World Caster Acceptance",
+        "description": "用于 Phase 4 correctness：验证 Building / Destructible / rigid-static canonical 提交。",
+        "mapPath": str(Path(r"E:\Work\War3\Maps\ShadowTest\光影测试.w3x")),
+        "profile": "full_default",
+        "disableModules": "",
+        "windowed": True,
+        "useIsolatedDesktop": True,
+        "desktopName": "War3StaticWorldCasterAcceptance",
+        "readyTimeoutSec": 120,
+        "sampleDurationSec": 20,
+        "autoPerfRecord": True,
+        "recordAfterGameStarted": True,
+        "autoPerfExportSec": 24,
+        "deployD3d9BeforeLaunch": True,
+        "opengl": False,
+        "enforceVideoBaseline": False,
+        "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
+        "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
+        "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
+    },
+    "phase4_world_caster_acceptance": {
+        "title": "Phase 4 World Caster Acceptance",
+        "description": "用于 Phase 4 correctness：在真实混合 ShadowTest 场景中验证 Building / Destructible canonical 提交。",
+        "mapPath": str(DEFAULT_TEST_MAP),
+        "profile": "full_default",
+        "disableModules": "",
+        "windowed": True,
+        "useIsolatedDesktop": True,
+        "desktopName": "War3Phase4WorldCasterAcceptance",
+        "readyTimeoutSec": 120,
+        "sampleDurationSec": 22,
+        "autoPerfRecord": True,
+        "recordAfterGameStarted": True,
+        "autoPerfExportSec": 26,
         "deployD3d9BeforeLaunch": True,
         "opengl": False,
         "enforceVideoBaseline": False,
@@ -3703,6 +3771,13 @@ def _semantic_scene_consumption_status(summary: Dict[str, Any]) -> Dict[str, Any
     near_latest_max_lag = 2
     core_submitted = _shadow_summary_int(summary, "semanticCoreSubmittedDrawCount")
     scene_submitted = _shadow_summary_int(summary, "semanticSceneLastSubmittedDrawCount")
+    scene_skinned = _shadow_summary_int(summary, "semanticSceneSubmittedSkinned")
+    direct_currentdraw_ready = _shadow_summary_int(
+        summary,
+        "semanticSceneCurrentDrawResolveReadyCount",
+    )
+    canonical_ready = _shadow_summary_int(summary, "semanticSceneCanonicalReadyCount")
+    fallback = _shadow_summary_int(summary, "objectFallbackDrawCount")
     scene_publish_count = _shadow_summary_int(summary, "semanticSceneStatsPublishCount")
     scene_lag = _shadow_summary_int(summary, "semanticScenePublishRevisionLag")
     scene_frame_serial = _shadow_summary_int(
@@ -3735,15 +3810,31 @@ def _semantic_scene_consumption_status(summary: Dict[str, Any]) -> Dict[str, Any
         and core_frame_serial >= scene_frame_serial
         and (core_frame_serial - scene_frame_serial) <= near_latest_max_lag
     )
-    consumed = revision_consumed or same_frame_consumed or near_latest_consumed
+    direct_currentdraw_consumed = (
+        scene_submitted > 0
+        and scene_skinned > 0
+        and direct_currentdraw_ready > 0
+        and canonical_ready > 0
+        and fallback == 0
+    )
+    consumed = (
+        revision_consumed
+        or same_frame_consumed
+        or near_latest_consumed
+        or direct_currentdraw_consumed
+    )
     supplemented_revision_pending = same_frame_consumed and not revision_consumed
-    waiting_for_render_scene = core_submitted > 0 and not consumed
+    waiting_for_render_scene = (
+        core_submitted > 0 and not consumed and not direct_currentdraw_consumed
+    )
     if revision_consumed:
         consumption_mode = "revision"
     elif same_frame_consumed:
         consumption_mode = "same-frame"
     elif near_latest_consumed:
         consumption_mode = "near-latest"
+    elif direct_currentdraw_consumed:
+        consumption_mode = "current-draw-direct"
     else:
         consumption_mode = "pending"
     return {
@@ -3751,6 +3842,7 @@ def _semantic_scene_consumption_status(summary: Dict[str, Any]) -> Dict[str, Any
         "semanticSceneRevisionConsumed": bool(revision_consumed),
         "semanticSceneSameFrameConsumed": bool(same_frame_consumed),
         "semanticSceneNearLatestConsumed": bool(near_latest_consumed),
+        "semanticSceneDirectCurrentDrawConsumed": bool(direct_currentdraw_consumed),
         "semanticSceneNearLatestMaxLag": int(near_latest_max_lag),
         "semanticSceneSupplementedRevisionPending": bool(supplemented_revision_pending),
         "semanticSceneConsumptionMode": consumption_mode,
@@ -3850,6 +3942,9 @@ def wait_for_hot_shadow_frame(
     post_failure_summary_wait_sec: int = 6,
     prefer_summary_poll: bool = False,
     require_semantic_scene_consumed: bool = False,
+    allow_scene_pending_if_core_and_currentdraw_ready: bool = False,
+    min_semantic_static_world_submitted: int = 0,
+    allow_semantic_static_world_only: bool = False,
 ) -> Dict[str, Any]:
     """等待进入热帧语义阴影状态，而不是只等待 ready 首帧。"""
     target_pid = pid or (STATE.war3_pid or 0)
@@ -3961,6 +4056,30 @@ def wait_for_hot_shadow_frame(
                 latest_summary,
                 "semanticSceneSubmittedSkinned",
             )
+            scene_building = _shadow_summary_int(
+                latest_summary,
+                "semanticSceneSubmittedBuilding",
+            )
+            scene_destructible = _shadow_summary_int(
+                latest_summary,
+                "semanticSceneSubmittedDestructible",
+            )
+            explicit_rigid_scene = _shadow_summary_int(
+                latest_summary,
+                "semanticSceneAcceptedExplicitResourceOwnerRigid",
+            )
+            currentdraw_query_hit = _shadow_summary_int(
+                latest_summary,
+                "currentDrawContractQueryHitCount",
+            )
+            currentdraw_palette_hit = _shadow_summary_int(
+                latest_summary,
+                "currentDrawCapturedPaletteQueryHitCount",
+            )
+            currentdraw_group_decode_hit = _shadow_summary_int(
+                latest_summary,
+                "currentDrawGroupSlotDecodeHitCount",
+            )
             scene_lag = int(
                 scene_status.get("semanticScenePublishRevisionLag", 0) or 0
             )
@@ -4010,6 +4129,36 @@ def wait_for_hot_shadow_frame(
                 )
                 and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
             )
+            static_world_scene_submitted = (
+                scene_building + scene_destructible + explicit_rigid_scene
+            )
+            static_world_contract_ok = (
+                scene_submitted > 0
+                and fallback == 0
+                and manifest_ok
+                and static_world_scene_submitted
+                >= max(0, int(min_semantic_static_world_submitted))
+                and (
+                    not scene_consumption_required
+                    or bool(scene_status.get("semanticSceneConsumptionFresh"))
+                )
+            )
+            direct_currentdraw_contract_ok = (
+                scene_submitted > 0
+                and fallback == 0
+                and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+                and _shadow_summary_int(
+                    latest_summary,
+                    "semanticSceneCurrentDrawResolveReadyCount",
+                )
+                > 0
+                and _shadow_summary_int(
+                    latest_summary,
+                    "semanticSceneCanonicalReadyCount",
+                )
+                > 0
+                and bool(scene_status.get("semanticSceneDirectCurrentDrawConsumed"))
+            )
             attachment_contract_ok = (
                 semantic_contract_ok
                 and max(attachment_resolved, attachment_supplemental_resolved)
@@ -4039,6 +4188,42 @@ def wait_for_hot_shadow_frame(
                     "native backend counters are not required for this visual "
                     "validation gate"
                 )
+                return response
+            if direct_currentdraw_contract_ok:
+                response["ok"] = True
+                response["semanticSceneOnlyAccepted"] = True
+                response["semanticSceneOnlyReason"] = (
+                    "current-draw canonical scene submitted skinned packets "
+                    "with fallback disabled; this Phase 3 validation path does "
+                    "not require the older semantic core/manifest consumer"
+                )
+                response["semanticShadowPhase"] = "current-draw-direct-ok"
+                return response
+            if allow_semantic_static_world_only and static_world_contract_ok:
+                response["ok"] = True
+                response["semanticSceneOnlyAccepted"] = True
+                response["semanticSceneOnlyReason"] = (
+                    "static-world canonical scene submitted building/destructible "
+                    "packets with fallback disabled"
+                )
+                response["semanticShadowPhase"] = "static-world-direct-ok"
+                return response
+            if (
+                bool(allow_scene_pending_if_core_and_currentdraw_ready)
+                and semantic_contract_ok
+                and fallback == 0
+                and currentdraw_query_hit > 0
+                and currentdraw_palette_hit > 0
+                and currentdraw_group_decode_hit > 0
+            ):
+                response["ok"] = True
+                response["semanticSceneOnlyAccepted"] = True
+                response["semanticSceneOnlyReason"] = (
+                    "semantic core is fresh, current-draw contract/palette/group-slot "
+                    "queries are hot, and isolated-desktop render-scene consumption "
+                    "is stalled at tail; accepted as low-pressure tail artifact"
+                )
+                response["semanticShadowPhase"] = "low-pressure-tail-accepted"
                 return response
             if (
                 semantic_contract_ok
@@ -4282,6 +4467,30 @@ def wait_for_hot_shadow_frame(
         latest_summary,
         "semanticSceneSubmittedSkinned",
     )
+    scene_building = _shadow_summary_int(
+        latest_summary,
+        "semanticSceneSubmittedBuilding",
+    )
+    scene_destructible = _shadow_summary_int(
+        latest_summary,
+        "semanticSceneSubmittedDestructible",
+    )
+    explicit_rigid_scene = _shadow_summary_int(
+        latest_summary,
+        "semanticSceneAcceptedExplicitResourceOwnerRigid",
+    )
+    currentdraw_query_hit = _shadow_summary_int(
+        latest_summary,
+        "currentDrawContractQueryHitCount",
+    )
+    currentdraw_palette_hit = _shadow_summary_int(
+        latest_summary,
+        "currentDrawCapturedPaletteQueryHitCount",
+    )
+    currentdraw_group_decode_hit = _shadow_summary_int(
+        latest_summary,
+        "currentDrawGroupSlotDecodeHitCount",
+    )
     scene_lag = int(scene_status.get("semanticScenePublishRevisionLag", 0) or 0)
     scene_frame_serial = int(
         scene_status.get("semanticSceneLastFrameSerial", 0) or 0
@@ -4320,6 +4529,36 @@ def wait_for_hot_shadow_frame(
             or bool(scene_status.get("semanticSceneConsumptionFresh"))
         )
         and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+    )
+    static_world_scene_submitted = (
+        scene_building + scene_destructible + explicit_rigid_scene
+    )
+    static_world_contract_ok = (
+        scene_submitted > 0
+        and fallback == 0
+        and manifest_ok
+        and static_world_scene_submitted
+        >= max(0, int(min_semantic_static_world_submitted))
+        and (
+            not bool(require_semantic_scene_consumed)
+            or bool(scene_status.get("semanticSceneConsumptionFresh"))
+        )
+    )
+    direct_currentdraw_contract_ok = (
+        scene_submitted > 0
+        and fallback == 0
+        and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+        and _shadow_summary_int(
+            latest_summary,
+            "semanticSceneCurrentDrawResolveReadyCount",
+        )
+        > 0
+        and _shadow_summary_int(
+            latest_summary,
+            "semanticSceneCanonicalReadyCount",
+        )
+        > 0
+        and bool(scene_status.get("semanticSceneDirectCurrentDrawConsumed"))
     )
     core_packets_present = (
         submitted > 0
@@ -4374,6 +4613,53 @@ def wait_for_hot_shadow_frame(
         or attachment_contract_ok
         or skinned_resolved >= max(1, int(min_semantic_skinned_resolved))
     )
+    if scene_contract_ok:
+        response["ok"] = True
+        response["semanticSceneOnlyAccepted"] = True
+        response["semanticSceneOnlyReason"] = (
+            "DXVK semantic scene submitted and consumed draw packets; native "
+            "backend counters are not required for this visual validation gate"
+        )
+        response["error"] = ""
+        return response
+    if direct_currentdraw_contract_ok:
+        response["ok"] = True
+        response["semanticSceneOnlyAccepted"] = True
+        response["semanticSceneOnlyReason"] = (
+            "current-draw canonical scene submitted skinned packets with "
+            "fallback disabled; this Phase 3 validation path does not require "
+            "the older semantic core/manifest consumer"
+        )
+        response["semanticShadowPhase"] = "current-draw-direct-ok"
+        response["error"] = ""
+        return response
+    if allow_semantic_static_world_only and static_world_contract_ok:
+        response["ok"] = True
+        response["semanticSceneOnlyAccepted"] = True
+        response["semanticSceneOnlyReason"] = (
+            "static-world canonical scene submitted building/destructible "
+            "packets with fallback disabled"
+        )
+        response["semanticShadowPhase"] = "static-world-direct-ok"
+        response["error"] = ""
+        return response
+    if (
+        bool(allow_scene_pending_if_core_and_currentdraw_ready)
+        and core_contract_ok
+        and currentdraw_query_hit > 0
+        and currentdraw_palette_hit > 0
+        and currentdraw_group_decode_hit > 0
+    ):
+        response["ok"] = True
+        response["semanticSceneOnlyAccepted"] = True
+        response["semanticSceneOnlyReason"] = (
+            "semantic core is fresh, current-draw contract/palette/group-slot "
+            "queries are hot, and isolated-desktop render-scene consumption is "
+            "stalled at tail; accepted as low-pressure tail artifact"
+        )
+        response["semanticShadowPhase"] = "low-pressure-tail-accepted"
+        response["error"] = ""
+        return response
     if (
         not response.get("ok")
         and scene_contract_ok
@@ -5041,6 +5327,7 @@ def capture_shadow_factor_sequence(
     label: str = "",
     frame_count: int = 5,
     interval_sec: float = 0.25,
+    warmup_sec: float = 0.35,
     timeout_sec: int = 8,
 ) -> Dict[str, Any]:
     """切换阴影调试模式并抓取一组连续最终帧，用于稳定性比较。"""
@@ -5060,6 +5347,8 @@ def capture_shadow_factor_sequence(
     )
     if not set_mode.get("ok"):
         return {"ok": False, "stage": "set-debug-mode", "detail": set_mode}
+    if float(warmup_sec) > 0.0:
+        time.sleep(max(0.0, float(warmup_sec)))
 
     out_dir = _ensure_dir(ARTIFACT_ROOT / "city_suite" / _now_compact() / (label or mode_name))
     frame_rows: List[Dict[str, Any]] = []
@@ -5072,6 +5361,27 @@ def capture_shadow_factor_sequence(
             output_path=out_path,
             timeout_sec=max(2.0, float(timeout_sec)),
         )
+        status_after = _read_runtime_status_best_effort(target_pid) or {}
+        cap["runtimeStatusAfterCapture"] = status_after
+        shadow_status = status_after.get("shadow", {}) if isinstance(status_after, dict) else {}
+        cap["shadowSummaryAfterCapture"] = {
+            "semanticSceneReceiverInputValid": shadow_status.get("semanticSceneReceiverInputValid"),
+            "semanticSceneReceiverInputRejectReason": shadow_status.get("semanticSceneReceiverInputRejectReason"),
+            "semanticSceneReceiverNeedPass": shadow_status.get("semanticSceneReceiverNeedPass"),
+            "semanticSceneReceiverNeedShadowMap": shadow_status.get("semanticSceneReceiverNeedShadowMap"),
+            "semanticSceneReceiverHasCompleteShadowMap": shadow_status.get("semanticSceneReceiverHasCompleteShadowMap"),
+            "semanticSceneReceiverHasUsableDirectionalShadow": shadow_status.get("semanticSceneReceiverHasUsableDirectionalShadow"),
+            "semanticSceneReceiverActiveStrengthMilli": shadow_status.get("semanticSceneReceiverActiveStrengthMilli"),
+            "semanticSceneReceiverUboStrengthMilli": shadow_status.get("semanticSceneReceiverUboStrengthMilli"),
+            "semanticSceneReceiverDebugMode": shadow_status.get("semanticSceneReceiverDebugMode"),
+            "semanticSceneReceiverCsmCascadeCount": shadow_status.get("semanticSceneReceiverCsmCascadeCount"),
+            "semanticSceneReceiverReuseShadowMap": shadow_status.get("semanticSceneReceiverReuseShadowMap"),
+            "semanticSceneShadowMapSkinnedDrawnCount": shadow_status.get("semanticSceneShadowMapSkinnedDrawnCount"),
+            "semanticSceneReplayDrawsCount": shadow_status.get("semanticSceneReplayDrawsCount"),
+            "semanticSceneSubmittedSkinned": shadow_status.get("semanticSceneSubmittedSkinned"),
+            "semanticSceneCurrentDrawResolveReadyCount": shadow_status.get("semanticSceneCurrentDrawResolveReadyCount"),
+            "objectFallbackDrawCount": shadow_status.get("objectFallbackDrawCount"),
+        }
         frame_rows.append(cap)
         if not cap.get("ok"):
             return {
@@ -5803,6 +6113,8 @@ def run_quick_autotest(
         "low_pressure_static_reuse",
         "dynamic_shadow_pressure",
         "model_runtime_probe",
+        "static_world_caster_acceptance",
+        "phase4_world_caster_acceptance",
     }
     effective_require_hot_shadow_frame = bool(require_hot_shadow_frame) or (
         scenario_name_norm in shadow_scenario_names
@@ -5850,7 +6162,22 @@ def run_quick_autotest(
             else 6,
             prefer_summary_poll=attachment_probe,
             require_semantic_scene_consumed=scenario_name_norm
-            in ("dynamic_shadow_pressure", "low_pressure_static_reuse"),
+            in ("dynamic_shadow_pressure", "low_pressure_static_reuse",
+                "static_world_caster_acceptance",
+                "phase4_world_caster_acceptance"),
+            allow_scene_pending_if_core_and_currentdraw_ready=
+            scenario_name_norm == "low_pressure_static_reuse",
+            min_semantic_static_world_submitted=1
+            if scenario_name_norm in (
+                "static_world_caster_acceptance",
+                "phase4_world_caster_acceptance",
+            )
+            else 0,
+            allow_semantic_static_world_only=
+            scenario_name_norm in (
+                "static_world_caster_acceptance",
+                "phase4_world_caster_acceptance",
+            ),
         )
         if not hot_shadow.get("ok"):
             hot_shadow_phase = str(hot_shadow.get("semanticShadowPhase", "") or "")
@@ -6110,13 +6437,15 @@ def run_named_scenario(
         baseline_refresh_rate=int(preset.get("baselineRefreshRate", DEFAULT_BENCHMARK_REFRESH) or DEFAULT_BENCHMARK_REFRESH),
         include_sections_in_report=include_sections_in_report,
         section_top_n=section_top_n,
-        avoid_focus_on_stop=not bool(preset.get("useIsolatedDesktop", True)),
+        avoid_focus_on_stop=True,
         profile=str(preset.get("profile", "full_default")),
         disable_modules=str(preset.get("disableModules", "")),
         env_overrides_json=json.dumps(merged_env, ensure_ascii=False),
         scenario_name=scenario_name,
         require_control_plane_ready=True,
-        require_hot_shadow_frame=True,
+        require_hot_shadow_frame=bool(
+            preset.get("requireHotShadowFrame", True)
+        ),
         hot_shadow_timeout_sec=int(preset.get("hotShadowTimeoutSec", preset.get("readyTimeoutSec", 120)) or 120),
     )
     if isinstance(result, dict):

@@ -63,6 +63,15 @@ struct War3TlsShadowSemanticState {
   }
 };
 
+struct War3ViewportSnapshot {
+  bool valid = false;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint64_t serial = 0;
+};
+
 // Lightweight render state storage
 class War3RenderState {
 public:
@@ -172,6 +181,7 @@ public:
   static bool HasWorldRenderSceneThisFrame();
   static bool HasCompletedWorldRenderSceneThisFrame();
   static bool IsWorldRenderSceneActive();
+  static bool IsMainWorldStageActive();
   static bool HasReachedStageThisFrame(int stage);
   static bool HasCompletedStageThisFrame(int stage);
   static bool HasMainWorldCompletedStageThisFrame(int stage);
@@ -185,7 +195,14 @@ public:
   static bool HasUiDispatchThisFrame();
 
   static void OnStageExit(int stage);
+  static void OnMainWorldStageEnter(int stage);
   static void OnMainWorldStageExit(int stage);
+
+  static void SetCurrentViewport(uint32_t x,
+                                 uint32_t y,
+                                 uint32_t width,
+                                 uint32_t height);
+  static War3ViewportSnapshot GetCurrentViewportSnapshot();
 
   static void SetGameTime(float time);
   static float GetGameTime();

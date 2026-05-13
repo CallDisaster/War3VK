@@ -61,7 +61,10 @@ struct War3ShadowSettings {
   bool enabled = true;
   War3CsmConfig csm = {};
   float strength = 0.75f;
-  float pcfRadius = 0.95f;
+  // Phase 7.31 Iteration D：从 0.95 降到 0.70，让 Poisson16 的采样落在
+  // 更小的 texel 半径内，shadow edge 更锐。配合 CSM maxDistance 4000 + 
+  // 自适应 min resolution 3072 给用户"清晰 caster"观感。
+  float pcfRadius = 0.70f;
   float receiverBias = 0.004f;
   float cascadeBlendRange = 120.0f;
   War3ShadowPcfKernel pcfKernel = War3ShadowPcfKernel::Poisson16;

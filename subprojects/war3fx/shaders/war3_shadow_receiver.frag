@@ -74,6 +74,19 @@ uniform push_block {
   uint p_shadowSampler;
 };
 
+bool validFloat(float v) {
+  return (v == v) && abs(v) < 1.0e20;
+}
+
+bool validVec3(vec3 v) {
+  return validFloat(v.x) && validFloat(v.y) && validFloat(v.z);
+}
+
+bool validVec4(vec4 v) {
+  return validFloat(v.x) && validFloat(v.y) &&
+         validFloat(v.z) && validFloat(v.w);
+}
+
 float shadowMapDepth(uint cascadeIndex, vec2 uv) {
   return texture(
     sampler2DArray(s_shadow, s_samplers[nonuniformEXT(p_shadowSampler)]),
@@ -328,6 +341,8 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra, v
   // convert NDC->UV with an explicit Y flip.
   vec2 uv0 = n0.xy * 0.5 + 0.5;
   uv0.y = 1.0 - uv0.y;
+  if (uv0.x < 0.0 || uv0.x > 1.0 || uv0.y < 0.0 || uv0.y > 1.0)
+    return 1.0;
   float bias0 = baseBias * computeCascadeBiasScale(c0, cascadeCount, cascadeBiasScale);
   // 关键修复：
   // 之前 refDepth<0 直接返回全亮，会在高视角/远级联下把接触阴影“截掉一块”。
@@ -378,6 +393,8 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra, v
       return vis0;
     vec2 uv1 = n1.xy * 0.5 + 0.5;
     uv1.y = 1.0 - uv1.y;
+    if (uv1.x < 0.0 || uv1.x > 1.0 || uv1.y < 0.0 || uv1.y > 1.0)
+      return vis0;
     float bias1 = baseBias * computeCascadeBiasScale(c1, cascadeCount, cascadeBiasScale);
     float ref1 = clamp(n1.z - bias1, 0.0, 1.0);
     float radius1 = max(ubo.u_params.y, 0.0);
@@ -479,6 +496,10 @@ void main() {
     sampler2DArray(s_depth, s_samplers[nonuniformEXT(p_colorSampler)]),
     ivec3(pix, layer),
     0).r;
+  if (!validFloat(depth)) {
+    o_color = col;
+    return;
+  }
 
   // 仅对主世界 viewport 区域做阴影处理，避免影响 UI/空白区域（例如底部面板）。
   vec2 vpMin  = ubo.u_viewport.xy;
@@ -492,6 +513,19 @@ void main() {
 
   float minZ = ubo.u_viewportZ.x;
   float maxZ = ubo.u_viewportZ.y;
+  float zLo = min(minZ, maxZ);
+  float zHi = max(minZ, maxZ);
+  if (depth < zLo - 1e-5 || depth > zHi + 1e-5) {
+    o_color = col;
+    return;
+  }
+  // Exact clear-depth pixels are background or UI-cleared holes, not stable
+  // world receivers. Keep the epsilon tiny so far terrain quantization remains
+  // eligible for shadows.
+  if (abs(depth - zHi) <= 1e-7) {
+    o_color = col;
+    return;
+  }
   float depthN = depth;
   if (abs(maxZ - minZ) > 1e-6) {
     depthN = (depth - minZ) / (maxZ - minZ);
@@ -560,15 +594,30 @@ void main() {
 
   vec4 worldH = clip * ubo.u_invViewProj;
   // If W is invalid, keep original color to avoid NaNs and screen-space tearing.
-  if (abs(worldH.w) < 1e-6) {
+  if (!validVec4(worldH) || abs(worldH.w) < 1e-6) {
     o_color = col;
     return;
   }
   vec3 worldPos = worldH.xyz / worldH.w;
+  if (!validVec3(worldPos)) {
+    o_color = col;
+    return;
+  }
 
   vec4 viewH = vec4(worldPos, 1.0) * ubo.u_view;
+  if (!validVec4(viewH)) {
+    o_color = col;
+    return;
+  }
   // 兼容 RH/LH：部分投影会让“前方深度”为 -Z，这里取绝对值用于级联选择与过渡。
   float viewDepth = abs(viewH.z);
+  float farSplit = max(max(ubo.u_splitFar.x, ubo.u_splitFar.y),
+                       max(ubo.u_splitFar.z, ubo.u_splitFar.w));
+  if (!validFloat(viewDepth) || !validFloat(farSplit) || farSplit <= 1e-4 ||
+      viewDepth > farSplit + max(64.0, farSplit * 0.05)) {
+    o_color = col;
+    return;
+  }
 
   // Debug outputs
   if (debugMode == 1) {
@@ -690,7 +739,7 @@ void main() {
       currVis = computeShadowVisibility(worldPos, viewDepth, biasExtra, pcfRot, stableWallPath);
     }
 
-    vis = currVis;
+    vis = validFloat(currVis) ? clamp(currVis, 0.0, 1.0) : 1.0;
 
     // Shadow TAA：对 vis 做重投影与时域混合（主要用于 Alpha-Test 阴影稳定）
     if (taaEnabled && !stableWallPath) {
@@ -755,6 +804,7 @@ void main() {
           }
 
           vis = mix(histVis, currVis, adaptiveBlend);
+          vis = validFloat(vis) ? clamp(vis, 0.0, 1.0) : currVis;
         } else {
           vis = currVis;
         }
@@ -777,6 +827,7 @@ void main() {
     }
   }
 
+  vis = validFloat(vis) ? clamp(vis, 0.0, 1.0) : 1.0;
   float mul = 1.0 - strength + strength * vis;
   vec3 baseColor = col.rgb * mul;
   vec3 rimAdd = vec3(0.0);

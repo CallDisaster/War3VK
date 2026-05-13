@@ -12,17 +12,36 @@
 #include "../hooks/war3_hook_render_identity.h"
 #include "../shadow/war3_shadow_native_runtime.h"
 #include "../shadow/war3_shadow_runtime_contract.h"
+#include "../shadow/war3_shadow_alpha_test_payload.h"
 #include "../shadow/war3_shadow_renderer_core.h"
+#include "war3_current_draw_contract.h"
 #include "war3_scene_collector.h"
 #include "war3_shadow_object_registry.h"
 #include "war3_upper_layer_shadow.h"
 #include "war3_visible_renderables.h"
 #include "../state/war3_render_state.h"
+#include "../../util/log/log.h"
+#include "../../util/util_env.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <string>
+#include <windows.h>
+
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 
 namespace dxvk::war3::render {
 
@@ -106,6 +125,56 @@ std::atomic<uint64_t> g_nativeSemanticWorldStageLastExecuteDrawCount{0u};
 std::mutex g_shadowSceneStatsMutex;
 War3ShadowCaptureStats g_shadowSceneStats = {};
 uint64_t g_shadowSceneStatsPublishCount = 0u;
+std::mutex g_shadowCadenceMutex;
+std::array<ShadowRuntimeCadenceSample,
+           kShadowRuntimeCadenceSampleCapacity>
+    g_shadowCadenceSamples = {};
+uint64_t g_shadowCadenceNextSerial = 0u;
+uint64_t g_shadowCadenceSampleCountTotal = 0u;
+uint32_t g_shadowCadenceWriteIndex = 0u;
+uint32_t g_shadowCadenceSampleCount = 0u;
+uint64_t g_shadowCadenceLastDynamicPoseSignature = 0u;
+uint64_t g_shadowCadenceLastSceneFrameSerial = 0u;
+uint64_t g_shadowCadenceSameDynamicPoseStreak = 0u;
+uint64_t g_shadowCadenceSameDynamicPoseStreakMax = 0u;
+uint64_t g_shadowCadenceSameSceneFrameStreak = 0u;
+uint64_t g_shadowCadenceSameSceneFrameStreakMax = 0u;
+uint64_t g_shadowCadenceShadowMapReuseStreak = 0u;
+uint64_t g_shadowCadenceShadowMapReuseStreakMax = 0u;
+
+struct ShadowPoseFullTraceConfigSnapshot {
+  bool enabled = false;
+  bool includePoseRecords = true;
+  bool includeShadowObjectRecords = true;
+  bool includeCurrentDrawRecords = true;
+  bool includeMatrixBytes = false;
+  uint32_t maxSeconds = 15u;
+  uint32_t maxPoseRecords = 0u;
+  uint32_t maxShadowObjectRecords = 0u;
+  uint32_t maxCurrentDrawRecords = 0u;
+  uint64_t epoch = 0u;
+};
+
+std::mutex g_shadowPoseFullTraceMutex;
+std::ofstream g_shadowPoseFullTraceStream;
+bool g_shadowPoseFullTraceEnvLoaded = false;
+bool g_shadowPoseFullTraceEnvEnabled = false;
+bool g_shadowPoseFullTraceManualEnabled = false;
+bool g_shadowPoseFullTraceOpened = false;
+bool g_shadowPoseFullTraceStoppedByLimit = false;
+bool g_shadowPoseFullTraceIncludePoseRecords = true;
+bool g_shadowPoseFullTraceIncludeShadowObjectRecords = true;
+bool g_shadowPoseFullTraceIncludeCurrentDrawRecords = true;
+bool g_shadowPoseFullTraceIncludeMatrixBytes = false;
+uint32_t g_shadowPoseFullTraceMaxSeconds = 15u;
+uint32_t g_shadowPoseFullTraceMaxPoseRecords = 0u;
+uint32_t g_shadowPoseFullTraceMaxShadowObjectRecords = 0u;
+uint32_t g_shadowPoseFullTraceMaxCurrentDrawRecords = 0u;
+uint64_t g_shadowPoseFullTraceEpoch = 0u;
+uint64_t g_shadowPoseFullTraceFrameEventsWritten = 0u;
+uint64_t g_shadowPoseFullTraceRecordEventsWritten = 0u;
+std::chrono::steady_clock::time_point g_shadowPoseFullTraceStart = {};
+std::string g_shadowPoseFullTracePath;
 constexpr size_t kSemanticPerfTagCount =
     static_cast<size_t>(SemanticDataPerfTag::Count);
 std::array<std::atomic<uint64_t>, kSemanticPerfTagCount>
@@ -119,6 +188,866 @@ std::atomic<uint64_t> g_semanticLastHotFunctionUs{0u};
 
 constexpr uint64_t kShadowBridgeRepairBurstFrames = 24u;
 constexpr uint64_t kShadowBridgeRepairCooldownFrames = 120u;
+
+bool ParseTraceBool(const std::string& value, bool defaultValue) {
+  if (value.empty())
+    return defaultValue;
+  return value == "1" || value == "true" || value == "TRUE" ||
+         value == "yes" || value == "YES" || value == "on" ||
+         value == "ON";
+}
+
+uint32_t ParseTraceU32(const std::string& value, uint32_t defaultValue) {
+  if (value.empty())
+    return defaultValue;
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
+  if (end == value.c_str())
+    return defaultValue;
+  return static_cast<uint32_t>((std::min)(parsed, 0xFFFFFFFFul));
+}
+
+std::string ResolveWar3LogDirectory() {
+  char exePath[MAX_PATH] = {};
+  if (::GetModuleFileNameA(nullptr, exePath, MAX_PATH) == 0)
+    return {};
+
+  std::string exeDir(exePath);
+  const size_t slash = exeDir.find_last_of("\\/");
+  if (slash == std::string::npos)
+    return {};
+
+  const std::string warVkDir = exeDir.substr(0, slash + 1u) + "WarVK\\";
+  const std::string logDir = warVkDir + "Log\\";
+  ::CreateDirectoryA(warVkDir.c_str(), nullptr);
+  ::CreateDirectoryA(logDir.c_str(), nullptr);
+  return logDir;
+}
+
+std::string BuildShadowPoseFullTracePath() {
+  const std::string logDir = ResolveWar3LogDirectory();
+  SYSTEMTIME st = {};
+  ::GetLocalTime(&st);
+  char name[160] = {};
+  std::snprintf(name, sizeof(name),
+                "shadow_pose_full_trace_%04u_%02u_%02u_%02u_%02u_%02u.jsonl",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                st.wSecond);
+  return logDir.empty() ? std::string(name) : logDir + name;
+}
+
+void InitializeShadowPoseFullTraceEnvLocked() {
+  if (g_shadowPoseFullTraceEnvLoaded)
+    return;
+  g_shadowPoseFullTraceEnvLoaded = true;
+
+  g_shadowPoseFullTraceEnvEnabled = ParseTraceBool(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE"), false);
+  if (!g_shadowPoseFullTraceEnvEnabled)
+    return;
+
+  g_shadowPoseFullTraceIncludePoseRecords = ParseTraceBool(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_POSES"), true);
+  g_shadowPoseFullTraceIncludeShadowObjectRecords = ParseTraceBool(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_OBJECTS"), true);
+  g_shadowPoseFullTraceIncludeCurrentDrawRecords = ParseTraceBool(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_CONTRACTS"), true);
+  g_shadowPoseFullTraceIncludeMatrixBytes = ParseTraceBool(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MATRIX_BYTES"), false);
+  g_shadowPoseFullTraceMaxSeconds = ParseTraceU32(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MAX_SEC"), 15u);
+  g_shadowPoseFullTraceMaxPoseRecords = ParseTraceU32(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MAX_POSES"), 0u);
+  g_shadowPoseFullTraceMaxShadowObjectRecords = ParseTraceU32(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MAX_OBJECTS"), 0u);
+  g_shadowPoseFullTraceMaxCurrentDrawRecords = ParseTraceU32(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MAX_CONTRACTS"), 0u);
+  ++g_shadowPoseFullTraceEpoch;
+}
+
+ShadowPoseFullTraceConfigSnapshot ShadowPoseFullTraceConfigLocked() {
+  InitializeShadowPoseFullTraceEnvLocked();
+
+  ShadowPoseFullTraceConfigSnapshot config = {};
+  config.enabled =
+      (g_shadowPoseFullTraceEnvEnabled || g_shadowPoseFullTraceManualEnabled) &&
+      !g_shadowPoseFullTraceStoppedByLimit;
+  config.includePoseRecords = g_shadowPoseFullTraceIncludePoseRecords;
+  config.includeShadowObjectRecords =
+      g_shadowPoseFullTraceIncludeShadowObjectRecords;
+  config.includeCurrentDrawRecords =
+      g_shadowPoseFullTraceIncludeCurrentDrawRecords;
+  config.includeMatrixBytes = g_shadowPoseFullTraceIncludeMatrixBytes;
+  config.maxSeconds = g_shadowPoseFullTraceMaxSeconds;
+  config.maxPoseRecords = g_shadowPoseFullTraceMaxPoseRecords;
+  config.maxShadowObjectRecords =
+      g_shadowPoseFullTraceMaxShadowObjectRecords;
+  config.maxCurrentDrawRecords =
+      g_shadowPoseFullTraceMaxCurrentDrawRecords;
+  config.epoch = g_shadowPoseFullTraceEpoch;
+  return config;
+}
+
+bool ShadowPoseFullTraceDeadlineReachedLocked() {
+  if (g_shadowPoseFullTraceMaxSeconds == 0u ||
+      g_shadowPoseFullTraceStart == std::chrono::steady_clock::time_point{}) {
+    return false;
+  }
+  const double elapsedSec = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() -
+                                g_shadowPoseFullTraceStart)
+                                .count();
+  return elapsedSec >= double(g_shadowPoseFullTraceMaxSeconds);
+}
+
+void CloseShadowPoseFullTraceLocked() {
+  if (g_shadowPoseFullTraceStream.is_open()) {
+    g_shadowPoseFullTraceStream.flush();
+    g_shadowPoseFullTraceStream.close();
+  }
+  g_shadowPoseFullTraceOpened = false;
+}
+
+void WriteJsonEscaped(std::ostream& os, const std::string& value) {
+  os << '"';
+  for (const char ch : value) {
+    switch (ch) {
+      case '\\': os << "\\\\"; break;
+      case '"': os << "\\\""; break;
+      case '\n': os << "\\n"; break;
+      case '\r': os << "\\r"; break;
+      case '\t': os << "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(ch) < 0x20u) {
+          os << "\\u"
+             << std::hex << std::setw(4) << std::setfill('0')
+             << unsigned(static_cast<unsigned char>(ch))
+             << std::dec << std::setfill(' ');
+        } else {
+          os << ch;
+        }
+        break;
+    }
+  }
+  os << '"';
+}
+
+void WriteHexValue(std::ostream& os, uint64_t value) {
+  os << "\"0x" << std::hex << std::setw(16) << std::setfill('0') << value
+     << std::dec << std::setfill(' ') << '"';
+}
+
+void WriteHexField(std::ostream& os, const char* name, uint64_t value) {
+  os << ",\"" << name << "\":";
+  WriteHexValue(os, value);
+}
+
+void WritePtrField(std::ostream& os, const char* name, const void* value) {
+  WriteHexField(os, name, uint64_t(reinterpret_cast<uintptr_t>(value)));
+}
+
+void WriteRawHexBytes(std::ostream& os, const void* data, size_t size) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  const auto* bytes = reinterpret_cast<const uint8_t*>(data);
+  os << '"';
+  for (size_t i = 0u; i < size; ++i) {
+    os << kHex[bytes[i] >> 4u] << kHex[bytes[i] & 0x0Fu];
+  }
+  os << '"';
+}
+
+void WriteMatrixJson(std::ostream& os, const Matrix4& matrix) {
+  os << '[';
+  for (uint32_t row = 0u; row < 4u; ++row) {
+    if (row != 0u)
+      os << ',';
+    os << '[';
+    for (uint32_t col = 0u; col < 4u; ++col) {
+      if (col != 0u)
+        os << ',';
+      os << matrix[row][col];
+    }
+    os << ']';
+  }
+  os << ']';
+}
+
+template <typename T>
+uint32_t ApplyTraceRecordLimit(const std::vector<T>& records,
+                               uint32_t maxRecords) {
+  if (maxRecords == 0u)
+    return static_cast<uint32_t>((std::min)(records.size(),
+                                            size_t(0xFFFFFFFFu)));
+  return static_cast<uint32_t>(
+      (std::min)(records.size(), size_t(maxRecords)));
+}
+
+void WriteCadenceJson(std::ostream& os,
+                      const ShadowRuntimeCadenceSample& sample) {
+  os << "\"cadence\":{"
+     << "\"serial\":" << sample.serial
+     << ",\"frameIndex\":" << sample.frameIndex
+     << ",\"sceneFrameSerial\":" << sample.sceneFrameSerial
+     << ",\"selectedFrameSerial\":" << sample.selectedFrameSerial
+     << ",\"reusableFrameSerial\":" << sample.reusableFrameSerial
+     << ",\"sourcePublishRevision\":" << sample.sourcePublishRevision
+     << ",\"targetPublishRevision\":" << sample.targetPublishRevision
+     << ",\"populateReturnReason\":" << sample.populateReturnReason
+     << ",\"inputDrawCount\":" << sample.inputDrawCount
+     << ",\"inputSkinnedCount\":" << sample.inputSkinnedCount
+     << ",\"submittedDrawCount\":" << sample.submittedDrawCount
+     << ",\"submittedSkinnedCount\":" << sample.submittedSkinnedCount
+     << ",\"directSubmittedRecordCount\":"
+     << sample.directSubmittedRecordCount
+     << ",\"directSubmittedObjectCount\":"
+     << sample.directSubmittedObjectCount
+     << ",\"shadowCastersCount\":" << sample.shadowCastersCount
+     << ",\"replayDrawsCount\":" << sample.replayDrawsCount
+     << ",\"shadowMapDrawnCasters\":" << sample.shadowMapDrawnCasters
+     << ",\"shadowMapSkinnedDrawnCount\":"
+     << sample.shadowMapSkinnedDrawnCount
+     << ",\"receiverNeedShadowMap\":" << sample.receiverNeedShadowMap
+     << ",\"receiverHasCompleteShadowMap\":"
+     << sample.receiverHasCompleteShadowMap
+     << ",\"receiverReuseShadowMap\":" << sample.receiverReuseShadowMap
+     << ",\"shadowMapExecutedThisFrame\":"
+     << sample.shadowMapExecutedThisFrame
+     << ",\"receiverRunEarlyReturnReason\":"
+     << sample.receiverRunEarlyReturnReason
+     << ",\"receiverRunEntryFlags\":" << sample.receiverRunEntryFlags
+     << ",\"receiverActiveStrengthMilli\":"
+     << sample.receiverActiveStrengthMilli
+     << ",\"receiverCsmCascadeCount\":" << sample.receiverCsmCascadeCount
+     << ",\"receiverHoldInvalidCsm\":" << sample.receiverHoldInvalidCsm
+     << ",\"receiverHoldEmptyReplay\":" << sample.receiverHoldEmptyReplay
+     << ",\"receiverHoldIdentityChurn\":"
+     << sample.receiverHoldIdentityChurn;
+  WriteHexField(os, "dynamicPoseSignature", sample.dynamicPoseSignature);
+  WriteHexField(os, "submittedIdentityHash", sample.submittedIdentityHash);
+  WriteHexField(os, "lastSubmittedPaletteHash",
+                sample.lastSubmittedPaletteHash);
+  WriteHexField(os, "lastSubmittedGroupHash", sample.lastSubmittedGroupHash);
+  os << ",\"currentDrawPublishReadyCount\":"
+     << sample.currentDrawPublishReadyCount
+     << ",\"currentDrawQueryHitCount\":" << sample.currentDrawQueryHitCount
+     << ",\"currentDrawLastRenderFrameIndex\":"
+     << sample.currentDrawLastRenderFrameIndex
+     << ",\"currentDrawLastFrameTag\":" << sample.currentDrawLastFrameTag
+     << ",\"submitPaletteContentAgeSampleCount\":"
+     << sample.submitPaletteContentAgeSampleCount
+     << ",\"submitPaletteContentAgeLag3PlusCount\":"
+     << sample.submitPaletteContentAgeLag3PlusCount
+     << ",\"shadowMatrixUploadSerial\":"
+     << sample.shadowMatrixUploadSerial
+     << ",\"shadowMatrixBufferOffset\":"
+     << sample.shadowMatrixBufferOffset
+     << ",\"shadowMatrixBufferSize\":" << sample.shadowMatrixBufferSize
+     << ",\"shadowMatrixBufferGpuAddress\":"
+     << sample.shadowMatrixBufferGpuAddress
+     << ",\"shadowMapRenderSerial\":" << sample.shadowMapRenderSerial;
+  WriteHexField(os, "shadowMatrixSceneKey", sample.shadowMatrixSceneKey);
+  WriteHexField(os, "shadowMatrixBufferObjectPtr",
+                sample.shadowMatrixBufferObjectPtr);
+  WriteHexField(os, "shadowMapImagePtr", sample.shadowMapImagePtr);
+  WriteHexField(os, "shadowMapSampleViewPtr",
+                sample.shadowMapSampleViewPtr);
+  WriteHexField(os, "shadowCurrentImagePtr", sample.shadowCurrentImagePtr);
+  WriteHexField(os, "shadowCurrentViewPtr", sample.shadowCurrentViewPtr);
+  WriteHexField(os, "shadowHistoryReadImagePtr",
+                sample.shadowHistoryReadImagePtr);
+  WriteHexField(os, "shadowHistoryReadViewPtr",
+                sample.shadowHistoryReadViewPtr);
+  WriteHexField(os, "shadowHistoryWriteImagePtr",
+                sample.shadowHistoryWriteImagePtr);
+  WriteHexField(os, "shadowHistoryWriteViewPtr",
+                sample.shadowHistoryWriteViewPtr);
+  os << ",\"shadowVisibilityExecutedThisFrame\":"
+     << sample.shadowVisibilityExecutedThisFrame
+     << ",\"receiverDrawExecutedThisFrame\":"
+     << sample.receiverDrawExecutedThisFrame
+     << ",\"shadowTaaMode\":" << sample.shadowTaaMode
+     << ",\"shadowHistoryValidBefore\":"
+     << sample.shadowHistoryValidBefore
+     << ",\"shadowHistoryValidAfter\":"
+     << sample.shadowHistoryValidAfter
+     << ",\"shadowHistoryReadIndex\":" << sample.shadowHistoryReadIndex
+     << ",\"shadowHistoryWriteIndex\":" << sample.shadowHistoryWriteIndex
+     << ",\"shadowReceiverSampleSource\":"
+     << sample.shadowReceiverSampleSource << '}';
+}
+
+void WriteTraceFrameEvent(
+    std::ostream& os,
+    const ShadowPoseFullTraceConfigSnapshot& config,
+    const ShadowRuntimeCadenceSample& sample,
+    const War3ShadowCaptureStats& stats,
+    const CurrentDrawContractDiagnosticsSummary& currentDraw,
+    size_t poseRecordCount,
+    size_t shadowObjectRecordCount,
+    size_t currentDrawRecordCount) {
+  const double elapsedMs =
+      g_shadowPoseFullTraceStart == std::chrono::steady_clock::time_point{}
+          ? 0.0
+          : std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() -
+                g_shadowPoseFullTraceStart)
+                .count();
+
+  os << std::setprecision(9);
+  os << "{\"type\":\"shadowPoseFullTraceFrame\""
+     << ",\"version\":1"
+     << ",\"epoch\":" << config.epoch
+     << ",\"elapsedMs\":" << elapsedMs
+     << ",\"statsSizeBytes\":" << sizeof(War3ShadowCaptureStats)
+     << ",\"currentDrawSummarySizeBytes\":"
+     << sizeof(CurrentDrawContractDiagnosticsSummary)
+     << ",\"poseRegistryFrame\":"
+     << model::PoseRegistry::instance().frameNumber()
+     << ",\"modelInstanceRegistryFrame\":"
+     << model::ModelInstanceRegistry::instance().frameNumber()
+     << ",\"shadowObjectRegistryFrame\":"
+     << ShadowObjectRegistry::instance().frameNumber()
+     << ",\"poseRecordCount\":" << poseRecordCount
+     << ",\"shadowObjectRecordCount\":" << shadowObjectRecordCount
+     << ",\"currentDrawRecordCount\":" << currentDrawRecordCount << ',';
+  WriteCadenceJson(os, sample);
+  os << ",\"keyStats\":{"
+     << "\"semanticSceneSubmitted\":" << stats.semanticSceneSubmitted
+     << ",\"semanticSceneSubmittedSkinned\":"
+     << stats.semanticSceneSubmittedSkinned
+     << ",\"semanticSceneDirectPartLeaseRestoredCount\":"
+     << stats.semanticSceneDirectPartLeaseRestoredCount
+     << ",\"semanticSceneDirectPartLeaseUpdatedCount\":"
+     << stats.semanticSceneDirectPartLeaseUpdatedCount
+     << ",\"semanticSceneShadowManifestObjectCount\":"
+     << stats.semanticSceneShadowManifestObjectCount
+     << ",\"semanticSceneShadowManifestPartCount\":"
+     << stats.semanticSceneShadowManifestPartCount
+     << ",\"semanticSceneShadowManifestFreshPartCount\":"
+     << stats.semanticSceneShadowManifestFreshPartCount
+     << ",\"semanticSceneShadowManifestPoseStalePartCount\":"
+     << stats.semanticSceneShadowManifestPoseStalePartCount
+     << ",\"semanticSceneShadowManifestSliceStalePartCount\":"
+     << stats.semanticSceneShadowManifestSliceStalePartCount
+     << ",\"semanticSceneSubmittedSkinnedPaletteSourceNoneCount\":"
+     << stats.semanticSceneSubmittedSkinnedPaletteSourceNoneCount
+     << ",\"semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount\":"
+     << stats.semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount
+     << ",\"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount\":"
+     << stats
+            .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount
+     << ",\"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount\":"
+     << stats
+            .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount
+     << ",\"semanticSceneSubmittedSkinnedPaletteHashChurnCount\":"
+     << stats.semanticSceneSubmittedSkinnedPaletteHashChurnCount
+     << ",\"semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount\":"
+     << stats.semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount
+     << ",\"semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount\":"
+     << stats.semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount
+     << ",\"semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount\":"
+     << stats.semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount
+     << ",\"semanticSceneShadowManifestPartLeasePaletteRefreshAttemptCount\":"
+     << stats.semanticSceneShadowManifestPartLeasePaletteRefreshAttemptCount
+     << ",\"semanticSceneShadowManifestPartLeasePaletteRefreshHitCount\":"
+     << stats.semanticSceneShadowManifestPartLeasePaletteRefreshHitCount
+     << ",\"semanticSceneShadowManifestPartLeasePaletteRefreshMissCount\":"
+     << stats.semanticSceneShadowManifestPartLeasePaletteRefreshMissCount
+     << ",\"submitPaletteFrameLagSampleCount\":"
+     << currentDraw.submitPaletteFrameLagSampleCount
+     << ",\"submitPaletteFrameLag3To5Count\":"
+     << currentDraw.submitPaletteFrameLag3To5Count
+     << ",\"submitPaletteFrameLag6PlusCount\":"
+     << currentDraw.submitPaletteFrameLag6PlusCount
+     << ",\"submitPaletteFrameLagMax\":"
+     << currentDraw.submitPaletteFrameLagMax
+     << ",\"submitPaletteContentAgeSampleCount\":"
+     << currentDraw.submitPaletteContentAgeSampleCount
+     << ",\"submitPaletteContentAgeLag3To5Count\":"
+     << currentDraw.submitPaletteContentAgeLag3To5Count
+     << ",\"submitPaletteContentAgeLag6PlusCount\":"
+     << currentDraw.submitPaletteContentAgeLag6PlusCount
+     << ",\"submitPaletteContentAgeMax\":"
+     << currentDraw.submitPaletteContentAgeMax
+     // Phase 7.49：per-publish provenance probe
+     << ",\"publishCallCumulative\":"
+     << currentDraw.publishCallCumulative
+     << ",\"publishTrustedHitCumulative\":"
+     << currentDraw.publishTrustedHitCumulative
+     << ",\"publishRawFallbackCumulative\":"
+     << currentDraw.publishRawFallbackCumulative
+     << ",\"publishRejectedNoTrustedCumulative\":"
+     << currentDraw.publishRejectedNoTrustedCumulative
+     << ",\"publishRecordFrameTagSameRunMax\":"
+     << currentDraw.publishRecordFrameTagSameRunMax
+     << ",\"publishRecordFrameTagCurrentSameRun\":"
+     << currentDraw.publishRecordFrameTagCurrentSameRun
+     << ",\"publishRecordFrameTagLast\":"
+     << currentDraw.publishRecordFrameTagLast
+     << ",\"publishLiveGamePaletteFrameTagLast\":"
+     << currentDraw.publishLiveGamePaletteFrameTagLast
+     << ",\"publishLiveGamePaletteFrameTagMin\":"
+     << currentDraw.publishLiveGamePaletteFrameTagMin
+     << ",\"publishLiveGamePaletteFrameTagMax\":"
+     << currentDraw.publishLiveGamePaletteFrameTagMax
+     << ",\"publishRecordFrameTagMin\":"
+     << currentDraw.publishRecordFrameTagMin
+     << ",\"publishRecordFrameTagMax\":"
+     << currentDraw.publishRecordFrameTagMax
+     << ",\"publishRecordFrameTagBehindLiveMaxDelta\":"
+     << currentDraw.publishRecordFrameTagBehindLiveMaxDelta
+     << ",\"publishRecordFrameTagEqualsLiveCount\":"
+     << currentDraw.publishRecordFrameTagEqualsLiveCount
+     << ",\"publishRecordFrameTagBehindLiveCount\":"
+     << currentDraw.publishRecordFrameTagBehindLiveCount
+     << ",\"publishRecordFrameTagAheadLiveCount\":"
+     << currentDraw.publishRecordFrameTagAheadLiveCount;
+  // Phase 7.48：per-frame submitted skinned palette 聚合诊断。
+  // 核心判据：CombinedHash 跨多帧是否也不变 => 真冻结；否则是指标错觉。
+  os << ",\"semanticSceneSubmittedSkinnedPaletteDistinctSampleCount\":"
+     << stats.semanticSceneSubmittedSkinnedPaletteDistinctSampleCount
+     << ",\"semanticSceneSubmittedSkinnedPaletteConsecutiveSameHashCountMax\":"
+     << stats.semanticSceneSubmittedSkinnedPaletteConsecutiveSameHashCountMax
+     << ",\"semanticSceneSubmittedSkinnedPaletteZeroHashCount\":"
+     << stats.semanticSceneSubmittedSkinnedPaletteZeroHashCount;
+  WriteHexField(os, "semanticSceneSubmittedSkinnedPaletteCombinedHash",
+                stats.semanticSceneSubmittedSkinnedPaletteCombinedHash);
+  WriteHexField(os, "semanticSceneSubmittedSkinnedPaletteFirstSubmittedHash",
+                stats.semanticSceneSubmittedSkinnedPaletteFirstSubmittedHash);
+  // Phase 7.47 dt gate probe：查询 probe counter 追加到 keyStats。
+  // 这组数据让 trace 可以直接对齐"dt=0 帧数" vs "writer 静默帧数"。
+  const auto probeSummary = model::QueryRuntimeOverrideOutputProbeSummary();
+  os << ",\"spriteUberPreRenderTotalCount\":"
+     << probeSummary.spriteUberPreRenderTotalCount
+     << ",\"spriteUberPreRenderDtZeroCount\":"
+     << probeSummary.spriteUberPreRenderDtZeroCount
+     << ",\"spriteUberPreRenderDtBelowEpsilonCount\":"
+     << probeSummary.spriteUberPreRenderDtBelowEpsilonCount
+     << ",\"spriteUberPreRenderDtPositiveCount\":"
+     << probeSummary.spriteUberPreRenderDtPositiveCount
+     << ",\"spriteUberPreRenderDtNegativeCount\":"
+     << probeSummary.spriteUberPreRenderDtNegativeCount
+     << ",\"spriteUberPreRenderLastDtBits\":"
+     << probeSummary.spriteUberPreRenderLastDtBits
+     << ",\"spriteUberPreRenderLastZeroDtFrameTag\":"
+     << probeSummary.spriteUberPreRenderLastZeroDtFrameTag
+     << ",\"spriteUberPreRenderLastPositiveDtFrameTag\":"
+     << probeSummary.spriteUberPreRenderLastPositiveDtFrameTag
+     << ",\"runtimeMatrixWriteCount\":"
+     << probeSummary.runtimeMatrixWriteCount
+     << ",\"runtimeMatrixWriteFramesWithHitCount\":"
+     << probeSummary.runtimeMatrixWriteFramesWithHitCount
+     << ",\"runtimeMatrixWriteFramesEmptyCount\":"
+     << probeSummary.runtimeMatrixWriteFramesEmptyCount
+     << ",\"runtimeGroupPaletteWrapperCallCount\":"
+     << probeSummary.runtimeGroupPaletteWrapperCallCount
+     << ",\"runtimeGroupPaletteWrapperFramesWithHitCount\":"
+     << probeSummary.runtimeGroupPaletteWrapperFramesWithHitCount
+     << ",\"runtimeGroupPaletteWrapperFramesEmptyCount\":"
+     << probeSummary.runtimeGroupPaletteWrapperFramesEmptyCount
+     << ",\"runtimeSimpleGroupPaletteCallCount\":"
+     << probeSummary.runtimeSimpleGroupPaletteCallCount
+     << ",\"runtimeSimpleGroupPaletteFramesWithHitCount\":"
+     << probeSummary.runtimeSimpleGroupPaletteFramesWithHitCount
+     << ",\"runtimeSimpleGroupPaletteFramesEmptyCount\":"
+     << probeSummary.runtimeSimpleGroupPaletteFramesEmptyCount
+     // Phase 7.52：把 renderablePart palette snapshot 的捕获/查询计数输出到
+     // full trace keyStats，直接用来判断修复是否生效。
+     // FROZEN 段里如果 CapturedCount 仍然按每帧 ~N 增长，就说明 bindings
+     // 表正在被 arena 最新 bytes 刷新，不再吃旧 snapshot。
+     << ",\"renderablePartPaletteSnapshotCapturedCount\":"
+     << probeSummary.renderablePartPaletteSnapshotCapturedCount
+     << ",\"renderablePartPaletteSnapshotTooLargeCount\":"
+     << probeSummary.renderablePartPaletteSnapshotTooLargeCount
+     << ",\"renderablePartPaletteSnapshotUnreadableCount\":"
+     << probeSummary.renderablePartPaletteSnapshotUnreadableCount
+     << ",\"renderablePartPaletteSnapshotQueryHitCount\":"
+     << probeSummary.renderablePartPaletteSnapshotQueryHitCount
+     << ",\"renderablePartPaletteSnapshotQueryMissCount\":"
+     << probeSummary.renderablePartPaletteSnapshotQueryMissCount
+     << ",\"renderablePartPaletteBindingQueryHitCount\":"
+     << probeSummary.renderablePartPaletteBindingQueryHitCount
+     << ",\"renderablePartPaletteBindingQueryMissCount\":"
+     << probeSummary.renderablePartPaletteBindingQueryMissCount
+     // Phase 7.52 续：submit-live-rebuild counter 纳入 keyStats。
+     // rebuild Hit 应随 Phase 7.52 snapshot 刷新率上升而上升；
+     // Applied 应约等于 Hit（Phase 7.51 EveryFrame=1 默认）。
+     << ",\"submitLiveRebuildAttemptCount\":"
+     << currentDraw.submitLiveRebuildAttemptCount
+     << ",\"submitLiveRebuildHitCount\":"
+     << currentDraw.submitLiveRebuildHitCount
+     << ",\"submitLiveRebuildMissCount\":"
+     << currentDraw.submitLiveRebuildMissCount
+     << ",\"submitLiveRebuildAppliedCount\":"
+     << currentDraw.submitLiveRebuildAppliedCount;
+  // Phase 7.53 producer-side hash 探针：
+  // 直接看 0x12E600 / 0x12FDC0 producer hook 在最后一次写入时的 matrix hash。
+  // 如果这两个值在 CombinedHash FROZEN 窗口里也一起冻结，证明 War3 引擎本身
+  // 就在 8 帧周期内不更新骨骼 pose（producer 早退或 dt gate）；
+  // 如果它们每帧都变但 CombinedHash 还冻结，那是我们读取链路的 bug。
+  WriteHexField(os, "runtimeMatrixWriteLastMatrixHash",
+                probeSummary.runtimeMatrixWriteLastMatrixHash);
+  WriteHexField(os, "runtimeMatrixRangeCopyLastMatrixHash",
+                probeSummary.runtimeMatrixRangeCopyLastMatrixHash);
+  os << ",\"runtimeMatrixWriteLastMatrixCount\":"
+     << probeSummary.runtimeMatrixWriteLastMatrixCount
+     << ",\"runtimeMatrixRangeCopyLastMatrixCount\":"
+     << probeSummary.runtimeMatrixRangeCopyLastMatrixCount;
+  // Phase 7.55：draw-time D3D palette 聚合 hash。
+  // 如果 CombinedHash 冻结但这个值每帧变 → draw-time D3D palette 是 fresh 的。
+  WriteHexField(os, "drawTimeD3DPaletteCombinedHash",
+                stats.semanticSceneDrawTimePoseCombinedHash);
+  os << ",\"drawTimeD3DPaletteCombinedSampleCount\":"
+     << stats.semanticSceneDrawTimePoseCombinedSampleCount
+     << ",\"drawTimeVBCacheCaptureCount\":"
+     << stats.drawTimeVBCacheCaptureCount
+     << ",\"drawTimeVBCacheConsumeHitCount\":"
+     << stats.drawTimeVBCacheConsumeHitCount
+     << ",\"drawTimeVBCacheConsumeMissCount\":"
+     << stats.drawTimeVBCacheConsumeMissCount
+     << ",\"drawTimeVBCacheTotalEntered\":"
+     << stats.drawTimeVBCacheTotalEntered
+     << ",\"drawTimeVBCacheRejectNoRenderablePart\":"
+     << stats.drawTimeVBCacheRejectNoRenderablePart
+     << ",\"drawTimeVBCacheRejectNoDecl\":"
+     << stats.drawTimeVBCacheRejectNoDecl
+     << ",\"drawTimeVBCacheRejectNoPosition\":"
+     << stats.drawTimeVBCacheRejectNoPosition
+     << ",\"drawTimeVBCacheRejectInvalidStride\":"
+     << stats.drawTimeVBCacheRejectInvalidStride
+     << ",\"drawTimeVBCacheRejectNoSlice\":"
+     << stats.drawTimeVBCacheRejectNoSlice
+     << ",\"drawTimeVBCacheRejectInvalidRange\":"
+     << stats.drawTimeVBCacheRejectInvalidRange
+     << ",\"drawTimeVBCacheRejectInsufficientLength\":"
+     << stats.drawTimeVBCacheRejectInsufficientLength
+     << ",\"drawTimeVBCacheRejectNoBuffer\":"
+     << stats.drawTimeVBCacheRejectNoBuffer
+     << ",\"drawTimeD3DPoseAttemptCount\":"
+     << stats.semanticSceneDrawTimePoseAttemptCount
+     << ",\"drawTimeD3DPosePublishedCount\":"
+     << stats.semanticSceneDrawTimePosePublishedCount
+     << ",\"drawTimeD3DPoseRejectNoVertexBlendCount\":"
+     << stats.semanticSceneDrawTimePoseRejectNoVertexBlendCount
+     << ",\"drawTimeD3DPoseRejectNoContextCount\":"
+     << stats.semanticSceneDrawTimePoseRejectNoContextCount
+     << ",\"drawTimeD3DPoseRejectNoRuntimeModelCount\":"
+     << stats.semanticSceneDrawTimePoseRejectNoRuntimeModelCount
+     << ",\"drawTimeD3DPoseDedupedCount\":"
+     << stats.semanticSceneDrawTimePoseDedupedCount;
+  WriteHexField(os, "semanticSceneDirectLastSubmittedIdentityHash",
+                stats.semanticSceneDirectLastSubmittedIdentityHash);
+  WriteHexField(os, "semanticSceneDirectLastSubmittedPaletteHash",
+                stats.semanticSceneDirectLastSubmittedPaletteHash);
+  WriteHexField(os, "semanticSceneDirectLastSubmittedGroupHash",
+                stats.semanticSceneDirectLastSubmittedGroupHash);
+  WriteHexField(os, "dynamicPoseSignature", stats.dynamicPoseSignature);
+  os << ",\"semanticSceneShadowMatrixUploadSerial\":"
+     << stats.semanticSceneShadowMatrixUploadSerial
+     << ",\"semanticSceneShadowMatrixBufferOffset\":"
+     << stats.semanticSceneShadowMatrixBufferOffset
+     << ",\"semanticSceneShadowMatrixBufferSize\":"
+     << stats.semanticSceneShadowMatrixBufferSize
+     << ",\"semanticSceneShadowMatrixBufferGpuAddress\":"
+     << stats.semanticSceneShadowMatrixBufferGpuAddress
+     << ",\"semanticSceneShadowMapRenderSerial\":"
+     << stats.semanticSceneShadowMapRenderSerial;
+  WriteHexField(os, "semanticSceneShadowMatrixSceneKey",
+                stats.semanticSceneShadowMatrixSceneKey);
+  WriteHexField(os, "semanticSceneShadowMatrixBufferObjectPtr",
+                stats.semanticSceneShadowMatrixBufferObjectPtr);
+  WriteHexField(os, "semanticSceneShadowMapImagePtr",
+                stats.semanticSceneShadowMapImagePtr);
+  WriteHexField(os, "semanticSceneShadowMapSampleViewPtr",
+                stats.semanticSceneShadowMapSampleViewPtr);
+  WriteHexField(os, "semanticSceneShadowCurrentImagePtr",
+                stats.semanticSceneShadowCurrentImagePtr);
+  WriteHexField(os, "semanticSceneShadowCurrentViewPtr",
+                stats.semanticSceneShadowCurrentViewPtr);
+  WriteHexField(os, "semanticSceneShadowHistoryReadImagePtr",
+                stats.semanticSceneShadowHistoryReadImagePtr);
+  WriteHexField(os, "semanticSceneShadowHistoryReadViewPtr",
+                stats.semanticSceneShadowHistoryReadViewPtr);
+  WriteHexField(os, "semanticSceneShadowHistoryWriteImagePtr",
+                stats.semanticSceneShadowHistoryWriteImagePtr);
+  WriteHexField(os, "semanticSceneShadowHistoryWriteViewPtr",
+                stats.semanticSceneShadowHistoryWriteViewPtr);
+  os << ",\"semanticSceneShadowVisibilityExecutedThisFrame\":"
+     << stats.semanticSceneShadowVisibilityExecutedThisFrame
+     << ",\"semanticSceneReceiverDrawExecutedThisFrame\":"
+     << stats.semanticSceneReceiverDrawExecutedThisFrame
+     << ",\"semanticSceneShadowTaaMode\":"
+     << stats.semanticSceneShadowTaaMode
+     << ",\"semanticSceneShadowHistoryValidBefore\":"
+     << stats.semanticSceneShadowHistoryValidBefore
+     << ",\"semanticSceneShadowHistoryValidAfter\":"
+     << stats.semanticSceneShadowHistoryValidAfter
+     << ",\"semanticSceneShadowHistoryReadIndex\":"
+     << stats.semanticSceneShadowHistoryReadIndex
+     << ",\"semanticSceneShadowHistoryWriteIndex\":"
+     << stats.semanticSceneShadowHistoryWriteIndex
+     << ",\"semanticSceneShadowReceiverSampleSource\":"
+     << stats.semanticSceneShadowReceiverSampleSource;
+  os << "},\"statsRawHex\":";
+  WriteRawHexBytes(os, &stats, sizeof(stats));
+  os << ",\"currentDrawRawHex\":";
+  WriteRawHexBytes(os, &currentDraw, sizeof(currentDraw));
+  os << "}\n";
+}
+
+void WritePoseRecordEvent(std::ostream& os, uint64_t epoch, uint64_t frameSerial,
+                          uint32_t index,
+                          const model::PoseRecord& record,
+                          bool includeMatrixBytes) {
+  os << std::setprecision(9);
+  os << "{\"type\":\"shadowPoseFullTracePose\""
+     << ",\"epoch\":" << epoch
+     << ",\"frameSerial\":" << frameSerial
+     << ",\"index\":" << index;
+  WritePtrField(os, "runtimeModelPtr", record.runtimeModelPtr);
+  WritePtrField(os, "sceneNode", record.sceneNode);
+  WritePtrField(os, "unitPtr", record.unitPtr);
+  WritePtrField(os, "spritePtr", record.spritePtr);
+  os << ",\"sequenceId\":" << record.sequenceId
+     << ",\"sequenceTime\":" << record.sequenceTime
+     << ",\"scale\":" << record.scale
+     << ",\"yaw\":" << record.yaw
+     << ",\"pitch\":" << record.pitch
+     << ",\"roll\":" << record.roll
+     << ",\"height\":" << record.height
+     << ",\"hasWorldTransform\":" << (record.hasWorldTransform ? 1 : 0)
+     << ",\"worldTransform\":";
+  WriteMatrixJson(os, record.worldTransform);
+  os << ",\"hasSpriteFrameTransform\":"
+     << (record.hasSpriteFrameTransform ? 1 : 0)
+     << ",\"spriteFrameTransform\":";
+  WriteMatrixJson(os, record.spriteFrameTransform);
+  os << ",\"spriteFrameDt\":" << record.spriteFrameDt
+     << ",\"matrixCount\":" << record.matrixCount;
+  WriteHexField(os, "matrixHash", record.matrixHash);
+  os << ",\"matrixPaletteSize\":" << record.matrixPalette.size()
+     << ",\"lastRootPoseFrame\":" << record.lastRootPoseFrame
+     << ",\"lastSpriteFramePoseFrame\":"
+     << record.lastSpriteFramePoseFrame
+     << ",\"lastMatrixPaletteFrame\":" << record.lastMatrixPaletteFrame
+     << ",\"spriteFrameSampleCount\":" << record.spriteFrameSampleCount
+     << ",\"firstSeenFrame\":" << record.firstSeenFrame
+     << ",\"lastSeenFrame\":" << record.lastSeenFrame;
+  if (includeMatrixBytes && !record.matrixPalette.empty()) {
+    os << ",\"matrixPaletteRawHex\":";
+    WriteRawHexBytes(os, record.matrixPalette.data(),
+                     record.matrixPalette.size() * sizeof(Matrix4));
+  }
+  os << "}\n";
+}
+
+void WriteShadowObjectRecordEvent(std::ostream& os, uint64_t epoch,
+                                  uint64_t frameSerial, uint32_t index,
+                                  const ShadowObjectRecord& record) {
+  os << std::setprecision(9);
+  os << "{\"type\":\"shadowPoseFullTraceObject\""
+     << ",\"epoch\":" << epoch
+     << ",\"frameSerial\":" << frameSerial
+     << ",\"index\":" << index;
+  WritePtrField(os, "worldObjectEntry", record.worldObjectEntry);
+  WritePtrField(os, "sceneNode", record.sceneNode);
+  WritePtrField(os, "unitPtr", record.unitPtr);
+  WritePtrField(os, "spritePtr", record.spritePtr);
+  WritePtrField(os, "runtimeModelPtr", record.runtimeModelPtr);
+  WritePtrField(os, "modelResourcePtr", record.modelResourcePtr);
+  os << ",\"modelPath\":";
+  WriteJsonEscaped(os, record.modelPath);
+  os << ",\"jHandle\":" << record.jHandle
+     << ",\"rawcode\":" << record.rawcode
+     << ",\"kind\":" << uint32_t(record.kind);
+  WriteHexField(os, "modelKey", record.modelKey);
+  os << ",\"modelType\":" << record.modelType
+     << ",\"modelFlags\":" << record.modelFlags
+     << ",\"sequenceId\":" << record.sequenceId
+     << ",\"sequenceTime\":" << record.sequenceTime
+     << ",\"scale\":" << record.scale
+     << ",\"yaw\":" << record.yaw
+     << ",\"pitch\":" << record.pitch
+     << ",\"roll\":" << record.roll
+     << ",\"height\":" << record.height
+     << ",\"hasWorldTransform\":" << (record.hasWorldTransform ? 1 : 0)
+     << ",\"worldTransform\":";
+  WriteMatrixJson(os, record.worldTransform);
+  os << ",\"hasSpriteFrameTransform\":"
+     << (record.hasSpriteFrameTransform ? 1 : 0)
+     << ",\"spriteFrameTransform\":";
+  WriteMatrixJson(os, record.spriteFrameTransform);
+  os << ",\"spriteFrameDt\":" << record.spriteFrameDt
+     << ",\"matrixCount\":" << record.matrixCount;
+  WriteHexField(os, "matrixHash", record.matrixHash);
+  os << ",\"lastRootPoseFrame\":" << record.lastRootPoseFrame
+     << ",\"lastSpriteFramePoseFrame\":"
+     << record.lastSpriteFramePoseFrame
+     << ",\"lastMatrixPaletteFrame\":" << record.lastMatrixPaletteFrame
+     << ",\"spriteFrameSampleCount\":" << record.spriteFrameSampleCount
+     << ",\"firstSeenFrame\":" << record.firstSeenFrame
+     << ",\"lastSeenFrame\":" << record.lastSeenFrame
+     << "}\n";
+}
+
+void WriteCurrentDrawRecordEvent(std::ostream& os, uint64_t epoch,
+                                 uint64_t frameSerial, uint32_t index,
+                                 const CurrentDrawContractRecord& record) {
+  os << "{\"type\":\"shadowPoseFullTraceCurrentDraw\""
+     << ",\"epoch\":" << epoch
+     << ",\"frameSerial\":" << frameSerial
+     << ",\"index\":" << index
+     << ",\"known\":" << (record.known ? 1 : 0);
+  WritePtrField(os, "sceneNode", record.sceneNode);
+  WritePtrField(os, "renderablePart", record.renderablePart);
+  WritePtrField(os, "meshPayloadPtr", record.meshPayloadPtr);
+  WritePtrField(os, "worldObjectEntry", record.worldObjectEntry);
+  WritePtrField(os, "unitPtr", record.unitPtr);
+  os << ",\"jHandle\":" << record.jHandle
+     << ",\"rawcode\":" << record.rawcode
+     << ",\"objectKind\":" << uint32_t(record.objectKind)
+     << ",\"layerIndex\":" << record.layerIndex
+     << ",\"paletteSlotIndex\":" << record.paletteSlotIndex;
+  WritePtrField(os, "paletteAddress", record.paletteAddress);
+  os << ",\"payloadWordF0\":" << record.payloadWordF0
+     << ",\"payloadWord104\":" << record.payloadWord104
+     << ",\"payloadWord108\":" << record.payloadWord108
+     << ",\"payloadWord11C\":" << record.payloadWord11C
+     << ",\"payloadWord48\":" << record.payloadWord48;
+  WritePtrField(os, "stream1Ptr", record.stream1Ptr);
+  os << ",\"stream1Stride\":" << record.stream1Stride
+     << ",\"capturedPaletteCount\":" << record.capturedPaletteCount
+     << ",\"frameTag\":" << record.frameTag
+     << ",\"visibleFrameSerial\":" << record.visibleFrameSerial
+     << ",\"renderFrameIndex\":" << record.renderFrameIndex
+     << ",\"captureSerial\":" << record.captureSerial
+     << "}\n";
+}
+
+bool EnsureShadowPoseFullTraceOpenLocked(
+    const ShadowPoseFullTraceConfigSnapshot& config) {
+  if (g_shadowPoseFullTraceOpened && g_shadowPoseFullTraceStream.is_open())
+    return true;
+
+  g_shadowPoseFullTracePath = BuildShadowPoseFullTracePath();
+  g_shadowPoseFullTraceStream.open(g_shadowPoseFullTracePath,
+                                   std::ios::out | std::ios::trunc);
+  if (!g_shadowPoseFullTraceStream.is_open()) {
+    Logger::err("DXVK War3Shadow: failed to open shadow pose full trace log");
+    g_shadowPoseFullTraceStoppedByLimit = true;
+    return false;
+  }
+
+  g_shadowPoseFullTraceOpened = true;
+  g_shadowPoseFullTraceStart = std::chrono::steady_clock::now();
+  g_shadowPoseFullTraceStream
+      << "{\"type\":\"shadowPoseFullTraceMeta\""
+      << ",\"version\":1"
+      << ",\"epoch\":" << config.epoch
+      << ",\"maxSeconds\":" << config.maxSeconds
+      << ",\"maxPoseRecords\":" << config.maxPoseRecords
+      << ",\"maxShadowObjectRecords\":" << config.maxShadowObjectRecords
+      << ",\"maxCurrentDrawRecords\":" << config.maxCurrentDrawRecords
+      << ",\"includePoseRecords\":"
+      << (config.includePoseRecords ? 1 : 0)
+      << ",\"includeShadowObjectRecords\":"
+      << (config.includeShadowObjectRecords ? 1 : 0)
+      << ",\"includeCurrentDrawRecords\":"
+      << (config.includeCurrentDrawRecords ? 1 : 0)
+      << ",\"includeMatrixBytes\":"
+      << (config.includeMatrixBytes ? 1 : 0)
+      << ",\"statsLayout\":\"War3ShadowCaptureStats raw hex uses the current "
+         "src/d3d9/d3d9_war3_scene.h layout\""
+      << ",\"statsSizeBytes\":" << sizeof(War3ShadowCaptureStats)
+      << ",\"currentDrawSummarySizeBytes\":"
+      << sizeof(CurrentDrawContractDiagnosticsSummary)
+      << "}\n";
+  Logger::info("DXVK War3Shadow: shadow pose full trace started: " +
+               g_shadowPoseFullTracePath);
+  return true;
+}
+
+void MaybeWriteShadowPoseFullTrace(
+    const ShadowRuntimeCadenceSample& sample,
+    const War3ShadowCaptureStats& stats,
+    const CurrentDrawContractDiagnosticsSummary& currentDraw) {
+  ShadowPoseFullTraceConfigSnapshot config = {};
+  {
+    std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
+    config = ShadowPoseFullTraceConfigLocked();
+    if (!config.enabled)
+      return;
+    if (ShadowPoseFullTraceDeadlineReachedLocked()) {
+      g_shadowPoseFullTraceStoppedByLimit = true;
+      CloseShadowPoseFullTraceLocked();
+      Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
+                   "duration limit");
+      return;
+    }
+  }
+
+  std::vector<model::PoseRecord> poseRecords;
+  std::vector<ShadowObjectRecord> shadowObjectRecords;
+  std::vector<CurrentDrawContractRecord> currentDrawRecords;
+
+  if (config.includePoseRecords)
+    poseRecords = model::PoseRegistry::instance().snapshot();
+  if (config.includeShadowObjectRecords)
+    shadowObjectRecords = ShadowObjectRegistry::instance().snapshot();
+  if (config.includeCurrentDrawRecords) {
+    CurrentDrawContractSnapshotOptions options = {};
+    options.minVisibleFrameSerial = 0u;
+    options.readyOnly = false;
+    options.maxRecords = config.maxCurrentDrawRecords;
+    options.unitsOnly = false;
+    options.pruneOlderThanMinVisibleFrame = false;
+    currentDrawRecords = SnapshotPublishedCurrentDrawContracts(options);
+  }
+
+  const uint32_t poseLimit =
+      ApplyTraceRecordLimit(poseRecords, config.maxPoseRecords);
+  const uint32_t objectLimit = ApplyTraceRecordLimit(
+      shadowObjectRecords, config.maxShadowObjectRecords);
+  const uint32_t currentDrawLimit = ApplyTraceRecordLimit(
+      currentDrawRecords, config.maxCurrentDrawRecords);
+
+  std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
+  config = ShadowPoseFullTraceConfigLocked();
+  if (!config.enabled)
+    return;
+  if (ShadowPoseFullTraceDeadlineReachedLocked()) {
+    g_shadowPoseFullTraceStoppedByLimit = true;
+    CloseShadowPoseFullTraceLocked();
+    Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
+                 "duration limit");
+    return;
+  }
+  if (!EnsureShadowPoseFullTraceOpenLocked(config))
+    return;
+
+  WriteTraceFrameEvent(g_shadowPoseFullTraceStream, config, sample, stats,
+                       currentDraw, poseRecords.size(),
+                       shadowObjectRecords.size(), currentDrawRecords.size());
+  ++g_shadowPoseFullTraceFrameEventsWritten;
+
+  for (uint32_t i = 0u; i < poseLimit; ++i) {
+    WritePoseRecordEvent(g_shadowPoseFullTraceStream, config.epoch,
+                         sample.serial, i, poseRecords[i],
+                         config.includeMatrixBytes);
+    ++g_shadowPoseFullTraceRecordEventsWritten;
+  }
+  for (uint32_t i = 0u; i < objectLimit; ++i) {
+    WriteShadowObjectRecordEvent(g_shadowPoseFullTraceStream, config.epoch,
+                                 sample.serial, i, shadowObjectRecords[i]);
+    ++g_shadowPoseFullTraceRecordEventsWritten;
+  }
+  for (uint32_t i = 0u; i < currentDrawLimit; ++i) {
+    WriteCurrentDrawRecordEvent(g_shadowPoseFullTraceStream, config.epoch,
+                                sample.serial, i, currentDrawRecords[i]);
+    ++g_shadowPoseFullTraceRecordEventsWritten;
+  }
+  g_shadowPoseFullTraceStream.flush();
+}
 
 uint64_t CurrentRuntimeBridgeFrame() {
   if (model::IsPoseHookEnabled())
@@ -388,8 +1317,419 @@ void NoteShadowRuntimePose(void* runtimeModelPtr, void* sceneNode, void* unitPtr
 
 void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
   std::lock_guard<std::mutex> lock(g_shadowSceneStatsMutex);
-  g_shadowSceneStats = stats;
+  War3ShadowCaptureStats merged = stats;
+  const auto hasReceiverDetails = [](const War3ShadowCaptureStats& value) {
+    return value.semanticSceneShadowMapDrawnCasters != 0u ||
+           value.semanticSceneShadowMapSkinnedPreparedCount != 0u ||
+           value.semanticSceneShadowMapSkinnedInvalidBufferCount != 0u ||
+           value.semanticSceneShadowMapSkinnedInvalidPipelineCount != 0u ||
+           value.semanticSceneShadowMapSkinnedDrawnCount != 0u ||
+           value.semanticSceneReceiverInputValid != 0u ||
+           value.semanticSceneReceiverInputRejectReason != 0u ||
+           value.semanticSceneReceiverNeedPass != 0u ||
+           value.semanticSceneReceiverNeedShadowMap != 0u ||
+           value.semanticSceneReceiverActiveStrengthMilli != 0u ||
+           value.semanticSceneReceiverUboStrengthMilli != 0u ||
+           value.semanticSceneReceiverDebugMode != 0u ||
+           value.semanticSceneReceiverCsmCascadeCount != 0u ||
+           value.semanticSceneReceiverRunEntryFlags != 0u ||
+           value.semanticSceneReceiverRunEarlyReturnReason != 0u ||
+           value.semanticSceneShadowMapExecutedThisFrame != 0u ||
+           value.semanticSceneReceiverSettingsShadowsEnabled != 0u ||
+           value.semanticSceneReceiverSettingsOutlineEnabled != 0u ||
+           value.semanticSceneReceiverSettingsRawStrengthMilli != 0u ||
+           value.semanticSceneReceiverComputedShadowStrengthMilli != 0u ||
+           value.semanticSceneReceiverHasSunShadow != 0u ||
+           value.semanticSceneReceiverHasPointShadow != 0u ||
+           value.semanticSceneReceiverNeedOutlinePass != 0u ||
+           value.semanticSceneReceiverZeroStrengthFrameCount != 0u ||
+           value.semanticSceneReceiverDrawnWithZeroStrengthCount != 0u ||
+           value.semanticSceneReceiverNoCompleteShadowMapCount != 0u ||
+           value.semanticSceneReceiverNoShadowMapImageCount != 0u ||
+           value.semanticSceneReceiverNoShadowMapSampleViewCount != 0u ||
+           value.semanticSceneReceiverNoCandidateCsmCount != 0u ||
+           value.semanticSceneReceiverCsmFallbackToLastGoodCount != 0u ||
+           value.semanticSceneReceiverHoldInvalidCsmCount != 0u ||
+           value.semanticSceneReceiverHoldEmptyReplayCount != 0u ||
+           value.semanticSceneReceiverHoldIdentityChurnCount != 0u ||
+           value.semanticSceneReceiverReuseInvalidatedAfterEnsureCount != 0u ||
+           value.semanticSceneShadowMapRenderSkippedNoResourcesCount != 0u ||
+           value.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount != 0u ||
+           value.semanticSceneShadowMatrixSceneKey != 0u ||
+           value.semanticSceneShadowMatrixUploadSerial != 0u ||
+           value.semanticSceneShadowMapRenderSerial != 0u ||
+           value.semanticSceneShadowMapImagePtr != 0u ||
+           value.semanticSceneShadowMapSampleViewPtr != 0u ||
+           value.semanticSceneShadowTaaMode != 0u ||
+           value.semanticSceneReceiverDrawExecutedThisFrame != 0u ||
+           value.semanticSceneReceiverViewportWidth != 0u ||
+           value.semanticSceneReceiverViewportHeight != 0u;
+  };
+  if (merged.semanticSceneReplayDrawsCount != 0u ||
+      merged.semanticSceneShadowCastersCount != 0u) {
+    const auto& previous = g_shadowSceneStats;
+    const bool incomingHasReceiverDetails = hasReceiverDetails(merged);
+    const bool previousHasReceiverDetails = hasReceiverDetails(previous);
+    // The semantic scene is published once before the receiver pass runs and
+    // again after receiver reconciliation is available. A pre-receiver publish
+    // can legitimately contain replay draws but no receiver fields at all; do
+    // not let that transient placeholder zero the last completed shadow-map /
+    // receiver reconciliation, since hot status polling then reports a global
+    // off-frame even though the replay input is non-empty.
+    if (!incomingHasReceiverDetails && previousHasReceiverDetails) {
+      merged.semanticSceneShadowMapDrawnCasters =
+          previous.semanticSceneShadowMapDrawnCasters;
+      merged.semanticSceneShadowMapCascadeCulledCount =
+          previous.semanticSceneShadowMapCascadeCulledCount;
+      merged.semanticSceneShadowMapSkinnedPreparedCount =
+          previous.semanticSceneShadowMapSkinnedPreparedCount;
+      merged.semanticSceneShadowMapSkinnedInvalidBufferCount =
+          previous.semanticSceneShadowMapSkinnedInvalidBufferCount;
+      merged.semanticSceneShadowMapSkinnedInvalidPipelineCount =
+          previous.semanticSceneShadowMapSkinnedInvalidPipelineCount;
+      merged.semanticSceneShadowMapSkinnedDrawnCount =
+          previous.semanticSceneShadowMapSkinnedDrawnCount;
+      merged.semanticSceneShadowTaaActive =
+          previous.semanticSceneShadowTaaActive;
+      merged.semanticSceneReceiverReuseShadowMap =
+          previous.semanticSceneReceiverReuseShadowMap;
+      merged.semanticSceneReceiverInputValid =
+          previous.semanticSceneReceiverInputValid;
+      merged.semanticSceneReceiverInputRejectReason =
+          previous.semanticSceneReceiverInputRejectReason;
+      merged.semanticSceneReceiverNeedPass =
+          previous.semanticSceneReceiverNeedPass;
+      merged.semanticSceneReceiverNeedShadowMap =
+          previous.semanticSceneReceiverNeedShadowMap;
+      merged.semanticSceneReceiverHasCompleteShadowMap =
+          previous.semanticSceneReceiverHasCompleteShadowMap;
+      merged.semanticSceneReceiverHasUsableDirectionalShadow =
+          previous.semanticSceneReceiverHasUsableDirectionalShadow;
+      merged.semanticSceneReceiverActiveStrengthMilli =
+          previous.semanticSceneReceiverActiveStrengthMilli;
+      merged.semanticSceneReceiverUboStrengthMilli =
+          previous.semanticSceneReceiverUboStrengthMilli;
+      merged.semanticSceneReceiverDebugMode =
+          previous.semanticSceneReceiverDebugMode;
+      merged.semanticSceneReceiverCsmCascadeCount =
+          previous.semanticSceneReceiverCsmCascadeCount;
+      merged.semanticSceneReceiverRunEntryFlags =
+          previous.semanticSceneReceiverRunEntryFlags;
+      merged.semanticSceneReceiverRunEarlyReturnReason =
+          previous.semanticSceneReceiverRunEarlyReturnReason;
+      merged.semanticSceneShadowMapExecutedThisFrame =
+          previous.semanticSceneShadowMapExecutedThisFrame;
+      merged.semanticSceneReceiverSettingsShadowsEnabled =
+          previous.semanticSceneReceiverSettingsShadowsEnabled;
+      merged.semanticSceneReceiverSettingsOutlineEnabled =
+          previous.semanticSceneReceiverSettingsOutlineEnabled;
+      merged.semanticSceneReceiverSettingsRawStrengthMilli =
+          previous.semanticSceneReceiverSettingsRawStrengthMilli;
+      merged.semanticSceneReceiverComputedShadowStrengthMilli =
+          previous.semanticSceneReceiverComputedShadowStrengthMilli;
+      merged.semanticSceneReceiverHasSunShadow =
+          previous.semanticSceneReceiverHasSunShadow;
+      merged.semanticSceneReceiverHasPointShadow =
+          previous.semanticSceneReceiverHasPointShadow;
+      merged.semanticSceneReceiverNeedOutlinePass =
+          previous.semanticSceneReceiverNeedOutlinePass;
+      merged.semanticSceneReceiverZeroStrengthFrameCount =
+          previous.semanticSceneReceiverZeroStrengthFrameCount;
+      merged.semanticSceneReceiverDrawnWithZeroStrengthCount =
+          previous.semanticSceneReceiverDrawnWithZeroStrengthCount;
+      merged.semanticSceneReceiverNoCompleteShadowMapCount =
+          previous.semanticSceneReceiverNoCompleteShadowMapCount;
+      merged.semanticSceneReceiverNoShadowMapImageCount =
+          previous.semanticSceneReceiverNoShadowMapImageCount;
+      merged.semanticSceneReceiverNoShadowMapSampleViewCount =
+          previous.semanticSceneReceiverNoShadowMapSampleViewCount;
+      merged.semanticSceneReceiverNoCandidateCsmCount =
+          previous.semanticSceneReceiverNoCandidateCsmCount;
+      merged.semanticSceneReceiverCsmFallbackToLastGoodCount =
+          previous.semanticSceneReceiverCsmFallbackToLastGoodCount;
+      merged.semanticSceneReceiverHoldInvalidCsmCount =
+          previous.semanticSceneReceiverHoldInvalidCsmCount;
+      merged.semanticSceneReceiverHoldEmptyReplayCount =
+          previous.semanticSceneReceiverHoldEmptyReplayCount;
+      merged.semanticSceneReceiverHoldIdentityChurnCount =
+          previous.semanticSceneReceiverHoldIdentityChurnCount;
+      merged.semanticSceneReceiverReuseInvalidatedAfterEnsureCount =
+          previous.semanticSceneReceiverReuseInvalidatedAfterEnsureCount;
+      merged.semanticSceneShadowMapRenderSkippedNoResourcesCount =
+          previous.semanticSceneShadowMapRenderSkippedNoResourcesCount;
+      merged.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount =
+          previous.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount;
+      merged.semanticSceneShadowMatrixSceneKey =
+          previous.semanticSceneShadowMatrixSceneKey;
+      merged.semanticSceneShadowMatrixUploadSerial =
+          previous.semanticSceneShadowMatrixUploadSerial;
+      merged.semanticSceneShadowMatrixBufferObjectPtr =
+          previous.semanticSceneShadowMatrixBufferObjectPtr;
+      merged.semanticSceneShadowMatrixBufferOffset =
+          previous.semanticSceneShadowMatrixBufferOffset;
+      merged.semanticSceneShadowMatrixBufferSize =
+          previous.semanticSceneShadowMatrixBufferSize;
+      merged.semanticSceneShadowMatrixBufferGpuAddress =
+          previous.semanticSceneShadowMatrixBufferGpuAddress;
+      merged.semanticSceneShadowMapRenderSerial =
+          previous.semanticSceneShadowMapRenderSerial;
+      merged.semanticSceneShadowMapImagePtr =
+          previous.semanticSceneShadowMapImagePtr;
+      merged.semanticSceneShadowMapSampleViewPtr =
+          previous.semanticSceneShadowMapSampleViewPtr;
+      merged.semanticSceneShadowCurrentImagePtr =
+          previous.semanticSceneShadowCurrentImagePtr;
+      merged.semanticSceneShadowCurrentViewPtr =
+          previous.semanticSceneShadowCurrentViewPtr;
+      merged.semanticSceneShadowHistoryReadImagePtr =
+          previous.semanticSceneShadowHistoryReadImagePtr;
+      merged.semanticSceneShadowHistoryReadViewPtr =
+          previous.semanticSceneShadowHistoryReadViewPtr;
+      merged.semanticSceneShadowHistoryWriteImagePtr =
+          previous.semanticSceneShadowHistoryWriteImagePtr;
+      merged.semanticSceneShadowHistoryWriteViewPtr =
+          previous.semanticSceneShadowHistoryWriteViewPtr;
+      merged.semanticSceneShadowVisibilityExecutedThisFrame =
+          previous.semanticSceneShadowVisibilityExecutedThisFrame;
+      merged.semanticSceneReceiverDrawExecutedThisFrame =
+          previous.semanticSceneReceiverDrawExecutedThisFrame;
+      merged.semanticSceneShadowTaaMode =
+          previous.semanticSceneShadowTaaMode;
+      merged.semanticSceneShadowHistoryValidBefore =
+          previous.semanticSceneShadowHistoryValidBefore;
+      merged.semanticSceneShadowHistoryValidAfter =
+          previous.semanticSceneShadowHistoryValidAfter;
+      merged.semanticSceneShadowHistoryReadIndex =
+          previous.semanticSceneShadowHistoryReadIndex;
+      merged.semanticSceneShadowHistoryWriteIndex =
+          previous.semanticSceneShadowHistoryWriteIndex;
+      merged.semanticSceneShadowReceiverSampleSource =
+          previous.semanticSceneShadowReceiverSampleSource;
+      merged.semanticSceneReceiverViewportX =
+          previous.semanticSceneReceiverViewportX;
+      merged.semanticSceneReceiverViewportY =
+          previous.semanticSceneReceiverViewportY;
+      merged.semanticSceneReceiverViewportWidth =
+          previous.semanticSceneReceiverViewportWidth;
+      merged.semanticSceneReceiverViewportHeight =
+          previous.semanticSceneReceiverViewportHeight;
+    }
+  }
+  g_shadowSceneStats = merged;
   ++g_shadowSceneStatsPublishCount;
+}
+
+void NoteShadowFrameCadenceSample(uint64_t frameIndex,
+                                  const War3ShadowCaptureStats& stats) {
+  if (!dxvk::war3::internal::kShadowRuntimeBridgeEnabled)
+    return;
+
+  const auto currentDraw = QueryCurrentDrawContractDiagnosticsSummary();
+
+  ShadowRuntimeCadenceSample sample = {};
+  sample.frameIndex = frameIndex;
+  sample.sceneFrameSerial = stats.semanticSceneLastFrameSerial;
+  sample.selectedFrameSerial = stats.semanticSceneLastSelectedFrameSerial;
+  sample.reusableFrameSerial = stats.semanticSceneLastReusableFrameSerial;
+  sample.sourcePublishRevision = stats.semanticSceneLastSourcePublishRevision;
+  sample.targetPublishRevision = stats.semanticSceneLastTargetPublishRevision;
+  sample.populateReturnReason = stats.semanticScenePopulateLastReturnReason;
+  sample.inputDrawCount = stats.semanticSceneLastInputDrawCount;
+  sample.inputSkinnedCount = stats.semanticSceneLastInputSkinnedCount;
+  sample.submittedDrawCount = stats.semanticSceneLastSubmittedDrawCount;
+  sample.submittedSkinnedCount = stats.semanticSceneSubmittedSkinned;
+  sample.directSubmittedRecordCount =
+      stats.semanticSceneDirectLastSubmittedRecordCount;
+  sample.directSubmittedObjectCount =
+      stats.semanticSceneDirectLastSubmittedObjectCount;
+  sample.shadowCastersCount = stats.semanticSceneShadowCastersCount;
+  sample.replayDrawsCount = stats.semanticSceneReplayDrawsCount;
+  sample.shadowMapDrawnCasters = stats.semanticSceneShadowMapDrawnCasters;
+  sample.shadowMapSkinnedDrawnCount =
+      stats.semanticSceneShadowMapSkinnedDrawnCount;
+  sample.receiverNeedShadowMap = stats.semanticSceneReceiverNeedShadowMap;
+  sample.receiverHasCompleteShadowMap =
+      stats.semanticSceneReceiverHasCompleteShadowMap;
+  sample.receiverReuseShadowMap = stats.semanticSceneReceiverReuseShadowMap;
+  sample.shadowMapExecutedThisFrame =
+      stats.semanticSceneShadowMapExecutedThisFrame;
+  sample.receiverRunEarlyReturnReason =
+      stats.semanticSceneReceiverRunEarlyReturnReason;
+  sample.receiverRunEntryFlags = stats.semanticSceneReceiverRunEntryFlags;
+  sample.receiverActiveStrengthMilli =
+      stats.semanticSceneReceiverActiveStrengthMilli;
+  sample.receiverCsmCascadeCount = stats.semanticSceneReceiverCsmCascadeCount;
+  sample.receiverHoldInvalidCsm =
+      stats.semanticSceneReceiverHoldInvalidCsmCount;
+  sample.receiverHoldEmptyReplay =
+      stats.semanticSceneReceiverHoldEmptyReplayCount;
+  sample.receiverHoldIdentityChurn =
+      stats.semanticSceneReceiverHoldIdentityChurnCount;
+  sample.dynamicPoseSignature = stats.dynamicPoseSignature;
+  sample.submittedIdentityHash =
+      stats.semanticSceneDirectLastSubmittedIdentityHash;
+  sample.lastSubmittedPaletteHash =
+      stats.semanticSceneDirectLastSubmittedPaletteHash;
+  sample.lastSubmittedGroupHash =
+      stats.semanticSceneDirectLastSubmittedGroupHash;
+  sample.currentDrawPublishReadyCount = currentDraw.publishReadyCount;
+  sample.currentDrawQueryHitCount = currentDraw.queryHitCount;
+  sample.currentDrawLastRenderFrameIndex = currentDraw.lastRenderFrameIndex;
+  sample.currentDrawLastFrameTag = currentDraw.lastFrameTag;
+  sample.submitPaletteContentAgeSampleCount =
+      currentDraw.submitPaletteContentAgeSampleCount;
+  sample.submitPaletteContentAgeLag3PlusCount =
+      currentDraw.submitPaletteContentAgeLag3To5Count +
+      currentDraw.submitPaletteContentAgeLag6PlusCount;
+  sample.shadowMatrixSceneKey = stats.semanticSceneShadowMatrixSceneKey;
+  sample.shadowMatrixUploadSerial =
+      stats.semanticSceneShadowMatrixUploadSerial;
+  sample.shadowMatrixBufferObjectPtr =
+      stats.semanticSceneShadowMatrixBufferObjectPtr;
+  sample.shadowMatrixBufferOffset =
+      stats.semanticSceneShadowMatrixBufferOffset;
+  sample.shadowMatrixBufferSize =
+      stats.semanticSceneShadowMatrixBufferSize;
+  sample.shadowMatrixBufferGpuAddress =
+      stats.semanticSceneShadowMatrixBufferGpuAddress;
+  sample.shadowMapRenderSerial = stats.semanticSceneShadowMapRenderSerial;
+  sample.shadowMapImagePtr = stats.semanticSceneShadowMapImagePtr;
+  sample.shadowMapSampleViewPtr =
+      stats.semanticSceneShadowMapSampleViewPtr;
+  sample.shadowCurrentImagePtr =
+      stats.semanticSceneShadowCurrentImagePtr;
+  sample.shadowCurrentViewPtr = stats.semanticSceneShadowCurrentViewPtr;
+  sample.shadowHistoryReadImagePtr =
+      stats.semanticSceneShadowHistoryReadImagePtr;
+  sample.shadowHistoryReadViewPtr =
+      stats.semanticSceneShadowHistoryReadViewPtr;
+  sample.shadowHistoryWriteImagePtr =
+      stats.semanticSceneShadowHistoryWriteImagePtr;
+  sample.shadowHistoryWriteViewPtr =
+      stats.semanticSceneShadowHistoryWriteViewPtr;
+  sample.shadowVisibilityExecutedThisFrame =
+      stats.semanticSceneShadowVisibilityExecutedThisFrame;
+  sample.receiverDrawExecutedThisFrame =
+      stats.semanticSceneReceiverDrawExecutedThisFrame;
+  sample.shadowTaaMode = stats.semanticSceneShadowTaaMode;
+  sample.shadowHistoryValidBefore =
+      stats.semanticSceneShadowHistoryValidBefore;
+  sample.shadowHistoryValidAfter =
+      stats.semanticSceneShadowHistoryValidAfter;
+  sample.shadowHistoryReadIndex = stats.semanticSceneShadowHistoryReadIndex;
+  sample.shadowHistoryWriteIndex =
+      stats.semanticSceneShadowHistoryWriteIndex;
+  sample.shadowReceiverSampleSource =
+      stats.semanticSceneShadowReceiverSampleSource;
+
+  {
+    std::lock_guard<std::mutex> lock(g_shadowCadenceMutex);
+    sample.serial = ++g_shadowCadenceNextSerial;
+    ++g_shadowCadenceSampleCountTotal;
+
+    if (sample.dynamicPoseSignature != 0u &&
+        g_shadowCadenceLastDynamicPoseSignature ==
+            sample.dynamicPoseSignature) {
+      ++g_shadowCadenceSameDynamicPoseStreak;
+    } else {
+      g_shadowCadenceSameDynamicPoseStreak = 0u;
+    }
+    if (sample.dynamicPoseSignature != 0u)
+      g_shadowCadenceLastDynamicPoseSignature = sample.dynamicPoseSignature;
+    g_shadowCadenceSameDynamicPoseStreakMax = std::max(
+        g_shadowCadenceSameDynamicPoseStreakMax,
+        g_shadowCadenceSameDynamicPoseStreak);
+
+    if (sample.sceneFrameSerial != 0u &&
+        g_shadowCadenceLastSceneFrameSerial == sample.sceneFrameSerial) {
+      ++g_shadowCadenceSameSceneFrameStreak;
+    } else {
+      g_shadowCadenceSameSceneFrameStreak = 0u;
+    }
+    if (sample.sceneFrameSerial != 0u)
+      g_shadowCadenceLastSceneFrameSerial = sample.sceneFrameSerial;
+    g_shadowCadenceSameSceneFrameStreakMax =
+        std::max(g_shadowCadenceSameSceneFrameStreakMax,
+                 g_shadowCadenceSameSceneFrameStreak);
+
+    const bool shadowMapReused =
+        sample.receiverReuseShadowMap != 0u ||
+        (sample.receiverNeedShadowMap != 0u &&
+         sample.receiverHasCompleteShadowMap != 0u &&
+         sample.shadowMapExecutedThisFrame == 0u);
+    if (shadowMapReused)
+      ++g_shadowCadenceShadowMapReuseStreak;
+    else
+      g_shadowCadenceShadowMapReuseStreak = 0u;
+    g_shadowCadenceShadowMapReuseStreakMax =
+        std::max(g_shadowCadenceShadowMapReuseStreakMax,
+                 g_shadowCadenceShadowMapReuseStreak);
+
+    g_shadowCadenceSamples[g_shadowCadenceWriteIndex] = sample;
+    g_shadowCadenceWriteIndex =
+        (g_shadowCadenceWriteIndex + 1u) %
+        static_cast<uint32_t>(kShadowRuntimeCadenceSampleCapacity);
+    if (g_shadowCadenceSampleCount < kShadowRuntimeCadenceSampleCapacity)
+      ++g_shadowCadenceSampleCount;
+  }
+
+  MaybeWriteShadowPoseFullTrace(sample, stats, currentDraw);
+}
+
+void StartShadowPoseFullTrace(uint32_t maxSeconds, bool includeMatrixBytes,
+                              uint32_t maxPoseRecords,
+                              uint32_t maxShadowObjectRecords,
+                              uint32_t maxCurrentDrawRecords) {
+  std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
+  InitializeShadowPoseFullTraceEnvLocked();
+  CloseShadowPoseFullTraceLocked();
+  g_shadowPoseFullTraceManualEnabled = true;
+  g_shadowPoseFullTraceStoppedByLimit = false;
+  g_shadowPoseFullTraceIncludePoseRecords = true;
+  g_shadowPoseFullTraceIncludeShadowObjectRecords = true;
+  g_shadowPoseFullTraceIncludeCurrentDrawRecords = true;
+  g_shadowPoseFullTraceIncludeMatrixBytes = includeMatrixBytes;
+  g_shadowPoseFullTraceMaxSeconds = maxSeconds == 0u ? 15u : maxSeconds;
+  g_shadowPoseFullTraceMaxPoseRecords = maxPoseRecords;
+  g_shadowPoseFullTraceMaxShadowObjectRecords = maxShadowObjectRecords;
+  g_shadowPoseFullTraceMaxCurrentDrawRecords = maxCurrentDrawRecords;
+  g_shadowPoseFullTraceFrameEventsWritten = 0u;
+  g_shadowPoseFullTraceRecordEventsWritten = 0u;
+  g_shadowPoseFullTraceStart = {};
+  g_shadowPoseFullTracePath.clear();
+  ++g_shadowPoseFullTraceEpoch;
+}
+
+void StopShadowPoseFullTrace() {
+  std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
+  g_shadowPoseFullTraceManualEnabled = false;
+  g_shadowPoseFullTraceEnvEnabled = false;
+  g_shadowPoseFullTraceStoppedByLimit = false;
+  CloseShadowPoseFullTraceLocked();
+}
+
+ShadowPoseFullTraceStatus QueryShadowPoseFullTraceStatus() {
+  std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
+  const auto config = ShadowPoseFullTraceConfigLocked();
+
+  ShadowPoseFullTraceStatus status = {};
+  status.enabled = config.enabled;
+  status.active = config.enabled && g_shadowPoseFullTraceOpened &&
+                  g_shadowPoseFullTraceStream.is_open();
+  status.includePoseRecords = config.includePoseRecords;
+  status.includeShadowObjectRecords = config.includeShadowObjectRecords;
+  status.includeCurrentDrawRecords = config.includeCurrentDrawRecords;
+  status.includeMatrixBytes = config.includeMatrixBytes;
+  status.stoppedByLimit = g_shadowPoseFullTraceStoppedByLimit;
+  status.maxSeconds = config.maxSeconds;
+  status.maxPoseRecords = config.maxPoseRecords;
+  status.maxShadowObjectRecords = config.maxShadowObjectRecords;
+  status.maxCurrentDrawRecords = config.maxCurrentDrawRecords;
+  status.traceEpoch = config.epoch;
+  status.frameEventsWritten = g_shadowPoseFullTraceFrameEventsWritten;
+  status.recordEventsWritten = g_shadowPoseFullTraceRecordEventsWritten;
+  status.path = g_shadowPoseFullTracePath;
+  return status;
 }
 
 void NoteSemanticDataPerf(SemanticDataPerfTag tag, uint64_t durationUs) {
@@ -456,8 +1796,20 @@ void NoteNativeSemanticWorldStagePrepare(int stage, bool success) {
     g_nativeSemanticWorldStagePrepareSuccessCount.fetch_add(
         1u, std::memory_order_relaxed);
   }
-  const auto nativeSummary =
-      shadow::NativeD3D9BackendRuntime::instance().snapshot();
+  auto& nativeRuntime = shadow::NativeD3D9BackendRuntime::instance();
+  const bool nativePrepared = nativeRuntime.buildLatestFrame();
+  if (nativePrepared &&
+      dxvk::war3::internal::
+          IsNativeRendererHostExecuteValidationRuntimeEnabled()) {
+    const auto nativeBeforeExecute = nativeRuntime.snapshot();
+    const bool needsCanonicalCatchup =
+        nativeBeforeExecute.submittedDrawCount != 0u &&
+        nativeBeforeExecute.frameSerial !=
+            nativeBeforeExecute.lastSuccessfulExecutedFrameSerial;
+    if (needsCanonicalCatchup)
+      nativeRuntime.executePreparedFrame();
+  }
+  const auto nativeSummary = nativeRuntime.snapshot();
   g_nativeSemanticWorldStageLastPrepareStage.store(
       static_cast<uint64_t>(stage), std::memory_order_relaxed);
   g_nativeSemanticWorldStageLastPrepareFrameSerial.store(
@@ -1536,12 +2888,81 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneSubmittedUnit;
     summary.semanticSceneSubmittedSkinned =
         g_shadowSceneStats.semanticSceneSubmittedSkinned;
+    summary.semanticSceneSubmittedSkinnedNonUnitResolvedCount =
+        g_shadowSceneStats.semanticSceneSubmittedSkinnedNonUnitResolvedCount;
+    summary.semanticSceneSubmittedSkinnedUnknownPacketKindCount =
+        g_shadowSceneStats.semanticSceneSubmittedSkinnedUnknownPacketKindCount;
+    summary.semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount;
+    summary.semanticSceneSubmittedSkinnedGroupNonZeroCount =
+        g_shadowSceneStats.semanticSceneSubmittedSkinnedGroupNonZeroCount;
+    summary.semanticSceneSubmittedSkinnedTransparentQueueCount =
+        g_shadowSceneStats.semanticSceneSubmittedSkinnedTransparentQueueCount;
+    summary.semanticSceneSubmittedSkinnedMissingUnitPtrCount =
+        g_shadowSceneStats.semanticSceneSubmittedSkinnedMissingUnitPtrCount;
+    summary.semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount;
+    summary.semanticSceneSubmittedBuilding =
+        g_shadowSceneStats.semanticSceneSubmittedBuilding;
+    summary.semanticSceneSubmittedDestructible =
+        g_shadowSceneStats.semanticSceneSubmittedDestructible;
+    summary.semanticSceneSubmittedCutout =
+        g_shadowSceneStats.semanticSceneSubmittedCutout;
+    summary.semanticSceneSubmittedAlphaBlend =
+        g_shadowSceneStats.semanticSceneSubmittedAlphaBlend;
+    summary.semanticSceneMaterialObservedCutoutCount =
+        g_shadowSceneStats.semanticSceneMaterialObservedCutoutCount;
+    summary.semanticSceneMaterialObservedAlphaBlendCount =
+        g_shadowSceneStats.semanticSceneMaterialObservedAlphaBlendCount;
+    summary.semanticSceneRejectedCutoutSkinnedContract =
+        g_shadowSceneStats.semanticSceneRejectedCutoutSkinnedContract;
+    summary.semanticSceneRejectedAlphaBlendSkinnedContract =
+        g_shadowSceneStats.semanticSceneRejectedAlphaBlendSkinnedContract;
+    summary.semanticSceneRejectedCutoutGeometry =
+        g_shadowSceneStats.semanticSceneRejectedCutoutGeometry;
+    summary.semanticSceneRejectedAlphaBlendGeometry =
+        g_shadowSceneStats.semanticSceneRejectedAlphaBlendGeometry;
+    summary.semanticSceneRejectedCutoutVisualPolicy =
+        g_shadowSceneStats.semanticSceneRejectedCutoutVisualPolicy;
+    summary.semanticSceneRejectedAlphaBlendVisualPolicy =
+        g_shadowSceneStats.semanticSceneRejectedAlphaBlendVisualPolicy;
+    summary.semanticSceneMaterialLayerContractResolvedCount =
+        g_shadowSceneStats.semanticSceneMaterialLayerContractResolvedCount;
+    summary.semanticSceneMaterialLayerContractFailedCount =
+        g_shadowSceneStats.semanticSceneMaterialLayerContractFailedCount;
+    summary.semanticSceneMaterialBlendMode0Count =
+        g_shadowSceneStats.semanticSceneMaterialBlendMode0Count;
+    summary.semanticSceneMaterialBlendMode1Count =
+        g_shadowSceneStats.semanticSceneMaterialBlendMode1Count;
+    summary.semanticSceneMaterialBlendMode2PlusCount =
+        g_shadowSceneStats.semanticSceneMaterialBlendMode2PlusCount;
+    summary.semanticSceneDirectCurrentDrawLayerIndexNonZeroCount =
+        g_shadowSceneStats.semanticSceneDirectCurrentDrawLayerIndexNonZeroCount;
+    summary.semanticSceneMaterialLastMeshIndex =
+        g_shadowSceneStats.semanticSceneMaterialLastMeshIndex;
+    summary.semanticSceneMaterialLastLayerIndex =
+        g_shadowSceneStats.semanticSceneMaterialLastLayerIndex;
+    summary.semanticSceneMaterialLastLayerCount =
+        g_shadowSceneStats.semanticSceneMaterialLastLayerCount;
+    summary.semanticSceneMaterialLastBlendOrDrawMode =
+        g_shadowSceneStats.semanticSceneMaterialLastBlendOrDrawMode;
     summary.semanticSceneLivePaletteRefreshAttemptCount =
         g_shadowSceneStats.semanticSceneLivePaletteRefreshAttemptCount;
     summary.semanticSceneLivePaletteRefreshHitCount =
         g_shadowSceneStats.semanticSceneLivePaletteRefreshHitCount;
     summary.semanticSceneLivePaletteRefreshMissCount =
         g_shadowSceneStats.semanticSceneLivePaletteRefreshMissCount;
+    summary.semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount =
+        g_shadowSceneStats
+            .semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount;
+    summary.semanticScenePaletteOverrideNoComposeCount =
+        g_shadowSceneStats.semanticScenePaletteOverrideNoComposeCount;
+    summary.semanticScenePaletteOverrideWouldComposeCount =
+        g_shadowSceneStats.semanticScenePaletteOverrideWouldComposeCount;
+    summary.semanticScenePalettePacketWorldComposeCount =
+        g_shadowSceneStats.semanticScenePalettePacketWorldComposeCount;
     summary.semanticSceneLivePaletteRefreshLastRuntimeModelPtr =
         g_shadowSceneStats.semanticSceneLivePaletteRefreshLastRuntimeModelPtr;
     summary.semanticSceneLivePaletteRefreshLastMatrixCount =
@@ -1600,6 +3021,72 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneSubmittedPaletteMotionLastHash;
     summary.semanticSceneSkinnedDynamicIndexSliceCount =
         g_shadowSceneStats.semanticSceneSkinnedDynamicIndexSliceCount;
+    summary.semanticSceneSubmittedOwnedGroupSlots =
+        g_shadowSceneStats.semanticSceneSubmittedOwnedGroupSlots;
+    summary.semanticSceneCurrentDrawContractKnownCount =
+        g_shadowSceneStats.semanticSceneCurrentDrawContractKnownCount;
+    summary.semanticSceneCurrentDrawPaletteReadyCount =
+        g_shadowSceneStats.semanticSceneCurrentDrawPaletteReadyCount;
+    summary.semanticSceneCurrentDrawGroupSlotReadyCount =
+        g_shadowSceneStats.semanticSceneCurrentDrawGroupSlotReadyCount;
+    summary.semanticSceneCurrentDrawResolveReadyCount =
+        g_shadowSceneStats.semanticSceneCurrentDrawResolveReadyCount;
+    summary.semanticSceneCurrentDrawMissNoContract =
+        g_shadowSceneStats.semanticSceneCurrentDrawMissNoContract;
+    summary.semanticSceneCurrentDrawMissNoPalette =
+        g_shadowSceneStats.semanticSceneCurrentDrawMissNoPalette;
+    summary.semanticSceneCurrentDrawMissNoGroupSlots =
+        g_shadowSceneStats.semanticSceneCurrentDrawMissNoGroupSlots;
+    summary.semanticSceneCurrentDrawMissStaleVisibleFrame =
+        g_shadowSceneStats.semanticSceneCurrentDrawMissStaleVisibleFrame;
+    summary.semanticSceneCurrentDrawResolveReadyRejectedCount =
+        g_shadowSceneStats.semanticSceneCurrentDrawResolveReadyRejectedCount;
+    summary.semanticSceneCanonicalReadyCount =
+        g_shadowSceneStats.semanticSceneCanonicalReadyCount;
+    summary.semanticSceneCanonicalReadyCutoutCount =
+        g_shadowSceneStats.semanticSceneCanonicalReadyCutoutCount;
+    summary.semanticSceneCanonicalReadyAlphaBlendCount =
+        g_shadowSceneStats.semanticSceneCanonicalReadyAlphaBlendCount;
+    summary.semanticSceneCanonicalRejectNoStableIdentity =
+        g_shadowSceneStats.semanticSceneCanonicalRejectNoStableIdentity;
+    summary.semanticSceneCanonicalRejectNoMesh =
+        g_shadowSceneStats.semanticSceneCanonicalRejectNoMesh;
+    summary.semanticSceneCanonicalRejectNoWorldTransform =
+        g_shadowSceneStats.semanticSceneCanonicalRejectNoWorldTransform;
+    summary.semanticSceneCanonicalRejectNoPalette =
+        g_shadowSceneStats.semanticSceneCanonicalRejectNoPalette;
+    summary.semanticSceneCanonicalRejectNoSlotContract =
+        g_shadowSceneStats.semanticSceneCanonicalRejectNoSlotContract;
+    summary.semanticSceneCanonicalRejectStaleProducer =
+        g_shadowSceneStats.semanticSceneCanonicalRejectStaleProducer;
+    summary.semanticSceneCanonicalRejectInvalidVertexIndex =
+        g_shadowSceneStats.semanticSceneCanonicalRejectInvalidVertexIndex;
+    summary.semanticSceneCanonicalRejectExplicitBlendIncomplete =
+        g_shadowSceneStats.semanticSceneCanonicalRejectExplicitBlendIncomplete;
+    summary.semanticSceneCanonicalRejectAfterReadyCount =
+        g_shadowSceneStats.semanticSceneCanonicalRejectAfterReadyCount;
+    summary.semanticSceneSubmittedExplicitBlendContract =
+        g_shadowSceneStats.semanticSceneSubmittedExplicitBlendContract;
+    summary.semanticSceneSubmittedSingleMatrixGroupSkinning =
+        g_shadowSceneStats.semanticSceneSubmittedSingleMatrixGroupSkinning;
+    summary.semanticSceneSubmittedMultiGroupSlotSkinning =
+        g_shadowSceneStats.semanticSceneSubmittedMultiGroupSlotSkinning;
+    summary.semanticSceneSkinnedMinUniqueGroupSlots =
+        g_shadowSceneStats.semanticSceneSkinnedMinUniqueGroupSlots;
+    summary.semanticSceneSkinnedMaxUniqueGroupSlots =
+        g_shadowSceneStats.semanticSceneSkinnedMaxUniqueGroupSlots;
+    summary.semanticSceneSkinnedGroupSlotsUnique1Count =
+        g_shadowSceneStats.semanticSceneSkinnedGroupSlotsUnique1Count;
+    summary.semanticSceneSkinnedGroupSlotsUnique2To4Count =
+        g_shadowSceneStats.semanticSceneSkinnedGroupSlotsUnique2To4Count;
+    summary.semanticSceneSkinnedGroupSlotsUnique5To8Count =
+        g_shadowSceneStats.semanticSceneSkinnedGroupSlotsUnique5To8Count;
+    summary.semanticSceneSkinnedGroupSlotsUnique9To16Count =
+        g_shadowSceneStats.semanticSceneSkinnedGroupSlotsUnique9To16Count;
+    summary.semanticSceneSkinnedGroupSlotsUnique17PlusCount =
+        g_shadowSceneStats.semanticSceneSkinnedGroupSlotsUnique17PlusCount;
+    summary.semanticSceneExplicitBlendUnavailableCurrentDraw =
+        g_shadowSceneStats.semanticSceneExplicitBlendUnavailableCurrentDraw;
     summary.semanticSceneSkinnedFullIndexFallbackCount =
         g_shadowSceneStats.semanticSceneSkinnedFullIndexFallbackCount;
     summary.semanticSceneSkinnedMissingVisibleIndexSliceRejectCount =
@@ -1632,6 +3119,580 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticScenePopulateAttemptCount;
     summary.semanticScenePopulateUnitsOnlyCount =
         g_shadowSceneStats.semanticScenePopulateUnitsOnlyCount;
+    summary.semanticScenePopulateLastReturnReason =
+        g_shadowSceneStats.semanticScenePopulateLastReturnReason;
+    summary.semanticScenePopulateLastProducerPublishAttemptDelta =
+        g_shadowSceneStats.semanticScenePopulateLastProducerPublishAttemptDelta;
+    summary.semanticScenePopulateLastProducerPublishReadyDelta =
+        g_shadowSceneStats.semanticScenePopulateLastProducerPublishReadyDelta;
+    summary.semanticScenePopulateLastProducerQueryAttemptDelta =
+        g_shadowSceneStats.semanticScenePopulateLastProducerQueryAttemptDelta;
+    summary.semanticScenePopulateLastProducerQueryHitDelta =
+        g_shadowSceneStats.semanticScenePopulateLastProducerQueryHitDelta;
+    summary.semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta =
+        g_shadowSceneStats
+            .semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta;
+    summary.semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta =
+        g_shadowSceneStats
+            .semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta;
+    summary.semanticScenePopulateLastProducerGroupDecodeAttemptDelta =
+        g_shadowSceneStats
+            .semanticScenePopulateLastProducerGroupDecodeAttemptDelta;
+    summary.semanticScenePopulateLastProducerGroupDecodeHitDelta =
+        g_shadowSceneStats
+            .semanticScenePopulateLastProducerGroupDecodeHitDelta;
+    summary.semanticSceneDirectCurrentDrawRecordCount =
+        g_shadowSceneStats.semanticSceneDirectCurrentDrawRecordCount;
+    summary.semanticSceneDirectCurrentDrawBuiltPacketCount =
+        g_shadowSceneStats.semanticSceneDirectCurrentDrawBuiltPacketCount;
+    summary.semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount =
+        g_shadowSceneStats.semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount;
+    summary.semanticSceneDirectCurrentDrawUnitsFilterRejectNonSkinnedCount =
+        g_shadowSceneStats
+            .semanticSceneDirectCurrentDrawUnitsFilterRejectNonSkinnedCount;
+    summary.semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount =
+        g_shadowSceneStats
+            .semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount;
+    summary.semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount =
+        g_shadowSceneStats
+            .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount;
+    // Phase 7.1: caster selection stability diagnostics
+    summary.semanticSceneDirectLastRawRecordCount =
+        g_shadowSceneStats.semanticSceneDirectLastRawRecordCount;
+    summary.semanticSceneDirectLastEligibleRecordCount =
+        g_shadowSceneStats.semanticSceneDirectLastEligibleRecordCount;
+    summary.semanticSceneDirectLastSubmittedRecordCount =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedRecordCount;
+    summary.semanticSceneDirectLastUniqueObjectCount =
+        g_shadowSceneStats.semanticSceneDirectLastUniqueObjectCount;
+    summary.semanticSceneDirectLastSubmittedObjectCount =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedObjectCount;
+    summary.semanticSceneDirectLastRecordCapPartialObjectCount =
+        g_shadowSceneStats.semanticSceneDirectLastRecordCapPartialObjectCount;
+    summary.semanticSceneDirectLastScanCapPartialObjectCount =
+        g_shadowSceneStats.semanticSceneDirectLastScanCapPartialObjectCount;
+    summary.semanticSceneDirectLastMinGeosetsPerObject =
+        g_shadowSceneStats.semanticSceneDirectLastMinGeosetsPerObject;
+    summary.semanticSceneDirectLastMaxGeosetsPerObject =
+        g_shadowSceneStats.semanticSceneDirectLastMaxGeosetsPerObject;
+    summary.semanticSceneDirectLastSubmittedIdentityHash =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedIdentityHash;
+    summary.semanticSceneDirectRecordCapHitCount =
+        g_shadowSceneStats.semanticSceneDirectRecordCapHitCount;
+    summary.semanticSceneDirectRecordCapTruncatedRecordCount =
+        g_shadowSceneStats.semanticSceneDirectRecordCapTruncatedRecordCount;
+    summary.semanticSceneDirectScanCapHitCount =
+        g_shadowSceneStats.semanticSceneDirectScanCapHitCount;
+    summary.semanticSceneDirectIdentityChurnCount =
+        g_shadowSceneStats.semanticSceneDirectIdentityChurnCount;
+    summary.semanticSceneDirectObjectGroupedSubmitCount =
+        g_shadowSceneStats.semanticSceneDirectObjectGroupedSubmitCount;
+    summary.semanticSceneDirectObjectGroupedSkipCount =
+        g_shadowSceneStats.semanticSceneDirectObjectGroupedSkipCount;
+    summary.semanticSceneDirectRecordCapSkipObjectCount =
+        g_shadowSceneStats.semanticSceneDirectRecordCapSkipObjectCount;
+    summary.semanticSceneDirectRecordCapAppendFailCount =
+        g_shadowSceneStats.semanticSceneDirectRecordCapAppendFailCount;
+    summary.semanticSceneDirectSelectionLeaseActiveKeyCount =
+        g_shadowSceneStats.semanticSceneDirectSelectionLeaseActiveKeyCount;
+    summary.semanticSceneDirectSelectionLeasePrunedKeyCount =
+        g_shadowSceneStats.semanticSceneDirectSelectionLeasePrunedKeyCount;
+    summary.semanticSceneDirectSelectionLeaseSubmittedKeyCount =
+        g_shadowSceneStats.semanticSceneDirectSelectionLeaseSubmittedKeyCount;
+    summary.semanticSceneDirectStickyFillBudgetRecordCount =
+        g_shadowSceneStats.semanticSceneDirectStickyFillBudgetRecordCount;
+    summary.semanticSceneDirectStickyFillAppendedCount =
+        g_shadowSceneStats.semanticSceneDirectStickyFillAppendedCount;
+    summary.semanticSceneDirectStickyFillSubmittedCount =
+        g_shadowSceneStats.semanticSceneDirectStickyFillSubmittedCount;
+    summary.semanticSceneDirectStickyFillMissedCount =
+        g_shadowSceneStats.semanticSceneDirectStickyFillMissedCount;
+    summary.semanticSceneDirectPartLeaseRestoredCount =
+        g_shadowSceneStats.semanticSceneDirectPartLeaseRestoredCount;
+    summary.semanticSceneDirectPartLeaseUpdatedCount =
+        g_shadowSceneStats.semanticSceneDirectPartLeaseUpdatedCount;
+    summary.semanticSceneDirectPartLeaseExpiredCount =
+        g_shadowSceneStats.semanticSceneDirectPartLeaseExpiredCount;
+    summary.semanticSceneDirectPartLeaseRejectedDynamicMeshCount =
+        g_shadowSceneStats.semanticSceneDirectPartLeaseRejectedDynamicMeshCount;
+    summary.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount =
+        g_shadowSceneStats
+            .semanticSceneDirectPartLeaseRejectedNotSelfContainedCount;
+    summary.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount =
+        g_shadowSceneStats.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount;
+    summary.semanticSceneDirectPartLeaseRejectedSelfRenewCount =
+        g_shadowSceneStats.semanticSceneDirectPartLeaseRejectedSelfRenewCount;
+    summary.semanticSceneDirectPartLeaseBudgetLimitCount =
+        g_shadowSceneStats.semanticSceneDirectPartLeaseBudgetLimitCount;
+    summary.semanticSceneShadowManifestPartLeaseRestoredCount =
+        g_shadowSceneStats.semanticSceneShadowManifestPartLeaseRestoredCount;
+    summary.semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount;
+    summary.semanticSceneShadowManifestPartLeaseExpiredCount =
+        g_shadowSceneStats.semanticSceneShadowManifestPartLeaseExpiredCount;
+    summary.semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount;
+    summary.semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount;
+    summary.semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount;
+    summary
+        .semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount;
+    summary.semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount;
+    summary.semanticSceneShadowManifestPartLeaseBudgetLimitCount =
+        g_shadowSceneStats.semanticSceneShadowManifestPartLeaseBudgetLimitCount;
+    summary.semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount;
+    summary.semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount;
+    summary.semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount;
+    summary.semanticSceneShadowManifestPartLeasePaletteRefreshAttemptCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeasePaletteRefreshAttemptCount;
+    summary.semanticSceneShadowManifestPartLeasePaletteRefreshHitCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeasePaletteRefreshHitCount;
+    summary.semanticSceneShadowManifestPartLeasePaletteRefreshMissCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeasePaletteRefreshMissCount;
+    summary.semanticSceneShadowManifestPartLeasePaletteRefreshAppliedCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeasePaletteRefreshAppliedCount;
+    summary.semanticSceneShadowManifestPartLeasePaletteRefreshFallbackCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartLeasePaletteRefreshFallbackCount;
+    summary.semanticSceneShadowManifestObjectCoreCompleteCount =
+        g_shadowSceneStats.semanticSceneShadowManifestObjectCoreCompleteCount;
+    summary.semanticSceneShadowManifestObjectCoreIncompleteSkipCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestObjectCoreIncompleteSkipCount;
+    summary.semanticSceneShadowManifestPartOmittedIncompleteCoreCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestPartOmittedIncompleteCoreCount;
+    // Phase 7.25 core epoch planner 专属计数器。
+    summary
+        .semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount;
+    summary
+        .semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount;
+    summary
+        .semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount;
+    summary.semanticSceneShadowManifestObjectCoreEpochMissingPartCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestObjectCoreEpochMissingPartCount;
+    summary
+        .semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount;
+    // Phase 7.28：skinned palette content stability probe。
+    summary.semanticSceneSubmittedSkinnedPaletteSourceNoneCount =
+        g_shadowSceneStats.semanticSceneSubmittedSkinnedPaletteSourceNoneCount;
+    summary.semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount;
+    summary.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount;
+    summary.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount;
+    summary
+        .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount;
+    summary
+        .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount;
+    summary.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteStablePartSampleCount;
+    summary.semanticSceneSubmittedSkinnedPaletteHashChurnCount =
+        g_shadowSceneStats.semanticSceneSubmittedSkinnedPaletteHashChurnCount;
+    summary.semanticSceneSubmittedSkinnedPaletteSourceChurnCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteSourceChurnCount;
+    summary.semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount;
+    summary.semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax;
+    summary.semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax;
+    summary.semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount;
+    summary.semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount;
+    summary.semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount;
+    summary.semanticSceneSubmittedSkinnedPaletteCountChurnCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteCountChurnCount;
+    summary.semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount;
+    summary.semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount;
+    summary.semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount;
+    summary.semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount;
+    summary.semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount;
+    summary
+        .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount;
+    summary
+        .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount;
+    summary
+        .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount;
+    summary.semanticSceneDirectPaletteAttributionSnapshotHitCount =
+        g_shadowSceneStats
+            .semanticSceneDirectPaletteAttributionSnapshotHitCount;
+    summary.semanticSceneDirectPaletteCaptureTrustedSourceHitCount =
+        g_shadowSceneStats
+            .semanticSceneDirectPaletteCaptureTrustedSourceHitCount;
+    summary.semanticSceneDirectPaletteCaptureTrustedSourceMissCount =
+        g_shadowSceneStats
+            .semanticSceneDirectPaletteCaptureTrustedSourceMissCount;
+    // Phase 7.30 Step A：stale→live 过渡归因。
+    summary
+        .semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount;
+    summary
+        .semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount;
+    summary
+        .semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount;
+    summary.semanticSceneDirectStickyPartSelectionRetainedCount =
+        g_shadowSceneStats.semanticSceneDirectStickyPartSelectionRetainedCount;
+    summary.semanticSceneDirectStickyPartSelectionDroppedCount =
+        g_shadowSceneStats.semanticSceneDirectStickyPartSelectionDroppedCount;
+    summary.semanticSceneDirectStickyPartSelectionFallbackCount =
+        g_shadowSceneStats.semanticSceneDirectStickyPartSelectionFallbackCount;
+    // Phase 7.5: object completeness diagnostics
+    summary.semanticSceneDirectManifestObjectCount =
+        g_shadowSceneStats.semanticSceneDirectManifestObjectCount;
+    summary.semanticSceneDirectManifestObservedPartCount =
+        g_shadowSceneStats.semanticSceneDirectManifestObservedPartCount;
+    summary.semanticSceneDirectManifestShadowEligiblePartCount =
+        g_shadowSceneStats.semanticSceneDirectManifestShadowEligiblePartCount;
+    summary.semanticSceneDirectObjectCompleteEligibleCount =
+        g_shadowSceneStats.semanticSceneDirectObjectCompleteEligibleCount;
+    summary.semanticSceneDirectObjectIncompleteByScanCapCount =
+        g_shadowSceneStats.semanticSceneDirectObjectIncompleteByScanCapCount;
+    summary.semanticSceneDirectObjectIncompleteByAlphaPolicyCount =
+        g_shadowSceneStats.semanticSceneDirectObjectIncompleteByAlphaPolicyCount;
+    summary.semanticSceneDirectObjectIncompleteBySliceUnresolvedCount =
+        g_shadowSceneStats
+            .semanticSceneDirectObjectIncompleteBySliceUnresolvedCount;
+    summary.semanticSceneDirectObjectIncompleteByPacketBuildFailCount =
+        g_shadowSceneStats
+            .semanticSceneDirectObjectIncompleteByPacketBuildFailCount;
+    summary.semanticSceneDirectObjectIncompleteByAppendFailCount =
+        g_shadowSceneStats.semanticSceneDirectObjectIncompleteByAppendFailCount;
+    summary.semanticSceneDirectSubmittedCompleteObjectCount =
+        g_shadowSceneStats.semanticSceneDirectSubmittedCompleteObjectCount;
+    summary.semanticSceneDirectSubmittedPartialObjectCount =
+        g_shadowSceneStats.semanticSceneDirectSubmittedPartialObjectCount;
+    summary.semanticSceneDirectPreparedSliceAuthoritativeCount =
+        g_shadowSceneStats.semanticSceneDirectPreparedSliceAuthoritativeCount;
+    summary.semanticSceneDirectPreparedSliceFallbackLayerIndexCount =
+        g_shadowSceneStats
+            .semanticSceneDirectPreparedSliceFallbackLayerIndexCount;
+    summary.semanticSceneDirectPreparedSliceMissingCount =
+        g_shadowSceneStats.semanticSceneDirectPreparedSliceMissingCount;
+    summary.semanticScenePreparedProbeAttemptCount =
+        g_shadowSceneStats.semanticScenePreparedProbeAttemptCount;
+    summary.semanticScenePreparedProbeContextReadyCount =
+        g_shadowSceneStats.semanticScenePreparedProbeContextReadyCount;
+    summary.semanticScenePreparedProbeBackingReadableCount =
+        g_shadowSceneStats.semanticScenePreparedProbeBackingReadableCount;
+    summary.semanticScenePreparedSliceRecordedCount =
+        g_shadowSceneStats.semanticScenePreparedSliceRecordedCount;
+    summary.semanticScenePreparedSliceQueryAttemptCount =
+        g_shadowSceneStats.semanticScenePreparedSliceQueryAttemptCount;
+    summary.semanticScenePreparedSliceQueryHitCount =
+        g_shadowSceneStats.semanticScenePreparedSliceQueryHitCount;
+    summary.semanticScenePreparedSliceQueryMissCount =
+        g_shadowSceneStats.semanticScenePreparedSliceQueryMissCount;
+    summary.semanticSceneShadowManifestObjectCount =
+        g_shadowSceneStats.semanticSceneShadowManifestObjectCount;
+    summary.semanticSceneShadowManifestPartCount =
+        g_shadowSceneStats.semanticSceneShadowManifestPartCount;
+    summary.semanticSceneShadowManifestStableObjectCount =
+        g_shadowSceneStats.semanticSceneShadowManifestStableObjectCount;
+    summary.semanticSceneShadowManifestNewObjectCount =
+        g_shadowSceneStats.semanticSceneShadowManifestNewObjectCount;
+    summary.semanticSceneShadowManifestExpiredObjectCount =
+        g_shadowSceneStats.semanticSceneShadowManifestExpiredObjectCount;
+    summary.semanticSceneShadowManifestFreshPartCount =
+        g_shadowSceneStats.semanticSceneShadowManifestFreshPartCount;
+    summary.semanticSceneShadowManifestLeaseablePartCount =
+        g_shadowSceneStats.semanticSceneShadowManifestLeaseablePartCount;
+    summary.semanticSceneShadowManifestPoseStalePartCount =
+        g_shadowSceneStats.semanticSceneShadowManifestPoseStalePartCount;
+    summary.semanticSceneShadowManifestSliceStalePartCount =
+        g_shadowSceneStats.semanticSceneShadowManifestSliceStalePartCount;
+    summary.semanticSceneShadowManifestExpiredPartCount =
+        g_shadowSceneStats.semanticSceneShadowManifestExpiredPartCount;
+    summary.semanticSceneShadowManifestMultiSlicePartCount =
+        g_shadowSceneStats.semanticSceneShadowManifestMultiSlicePartCount;
+    summary.semanticSceneShadowManifestPayload11CChurnCount =
+        g_shadowSceneStats.semanticSceneShadowManifestPayload11CChurnCount;
+    summary.semanticSceneShadowManifestRenderablePartChurnCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestRenderablePartChurnCount;
+    summary.semanticSceneShadowManifestCModelPoseHitCount =
+        g_shadowSceneStats.semanticSceneShadowManifestCModelPoseHitCount;
+    summary.semanticSceneShadowManifestCModelPoseMissCount =
+        g_shadowSceneStats.semanticSceneShadowManifestCModelPoseMissCount;
+    summary.semanticSceneShadowManifestCModelPoseNoRuntimeCount =
+        g_shadowSceneStats.semanticSceneShadowManifestCModelPoseNoRuntimeCount;
+    summary.semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr;
+    summary.semanticSceneShadowManifestCModelPoseLastMatrixCount =
+        g_shadowSceneStats.semanticSceneShadowManifestCModelPoseLastMatrixCount;
+    summary.semanticSceneShadowManifestCModelPoseLastMatrixHash =
+        g_shadowSceneStats.semanticSceneShadowManifestCModelPoseLastMatrixHash;
+    summary.semanticSceneSubmittedObjectJaccardMilli =
+        g_shadowSceneStats.semanticSceneSubmittedObjectJaccardMilli;
+    summary.semanticSceneSubmittedPartJaccardMilli =
+        g_shadowSceneStats.semanticSceneSubmittedPartJaccardMilli;
+    summary.semanticSceneVisibleLookupPartLayerHitCount =
+        g_shadowSceneStats.semanticSceneVisibleLookupPartLayerHitCount;
+    summary.semanticSceneVisibleLookupSingleFallbackCount =
+        g_shadowSceneStats.semanticSceneVisibleLookupSingleFallbackCount;
+    summary.semanticSceneVisibleLookupMissCount =
+        g_shadowSceneStats.semanticSceneVisibleLookupMissCount;
+    summary.semanticSceneDirectMainWorldBackingNotCheckedCount =
+        g_shadowSceneStats.semanticSceneDirectMainWorldBackingNotCheckedCount;
+    summary.semanticSceneDirectMainWorldBackingPassCount =
+        g_shadowSceneStats.semanticSceneDirectMainWorldBackingPassCount;
+    summary.semanticSceneDirectMainWorldBackingFailNoRenderablePartCount =
+        g_shadowSceneStats
+            .semanticSceneDirectMainWorldBackingFailNoRenderablePartCount;
+    summary.semanticSceneDirectMainWorldBackingFailLookupMissCount =
+        g_shadowSceneStats.semanticSceneDirectMainWorldBackingFailLookupMissCount;
+    summary.semanticSceneDirectMainWorldBackingFailNonMainQueueCount =
+        g_shadowSceneStats
+            .semanticSceneDirectMainWorldBackingFailNonMainQueueCount;
+    summary.semanticSceneDirectMainWorldBackingFailNonWorldGroupCount =
+        g_shadowSceneStats
+            .semanticSceneDirectMainWorldBackingFailNonWorldGroupCount;
+    summary.semanticSceneDirectMainWorldBackingFailIdentityMismatchCount =
+        g_shadowSceneStats
+            .semanticSceneDirectMainWorldBackingFailIdentityMismatchCount;
+    summary.semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount =
+        g_shadowSceneStats
+            .semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount;
+    summary.semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount =
+        g_shadowSceneStats
+            .semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount;
+    // Phase 7.2: single-caster flicker diagnostics
+    summary.semanticSceneDirectLastSubmittedSceneNode =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedSceneNode;
+    summary.semanticSceneDirectLastSubmittedPaletteHash =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedPaletteHash;
+    summary.semanticSceneDirectLastSubmittedGroupHash =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedGroupHash;
+    summary.semanticSceneDirectLastSubmittedStableGroupHash =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedStableGroupHash;
+    summary.semanticSceneDirectLastSubmittedStream1Ptr =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedStream1Ptr;
+    summary.semanticSceneDirectLastSubmittedGeometrySourceHash =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedGeometrySourceHash;
+    summary.semanticSceneDirectLastSubmittedRenderablePart =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedRenderablePart;
+    summary.semanticSceneDirectLastSubmittedMeshData =
+        g_shadowSceneStats.semanticSceneDirectLastSubmittedMeshData;
+    summary.semanticSceneDirectPaletteHashChurnCount =
+        g_shadowSceneStats.semanticSceneDirectPaletteHashChurnCount;
+    summary.semanticSceneDirectGroupHashChurnCount =
+        g_shadowSceneStats.semanticSceneDirectGroupHashChurnCount;
+    summary.semanticSceneDirectStableGroupHashChurnCount =
+        g_shadowSceneStats.semanticSceneDirectStableGroupHashChurnCount;
+    summary.semanticSceneDirectStream1PtrChurnCount =
+        g_shadowSceneStats.semanticSceneDirectStream1PtrChurnCount;
+    summary.semanticSceneDirectGeometrySourceHashChurnCount =
+        g_shadowSceneStats.semanticSceneDirectGeometrySourceHashChurnCount;
+    summary.semanticSceneDirectSameCasterComparisonCount =
+        g_shadowSceneStats.semanticSceneDirectSameCasterComparisonCount;
+    summary.semanticSceneDirectIdentitySkippedChurnCount =
+        g_shadowSceneStats.semanticSceneDirectIdentitySkippedChurnCount;
+    summary.semanticSceneDirectPaletteRootDeltaSampleCount =
+        g_shadowSceneStats.semanticSceneDirectPaletteRootDeltaSampleCount;
+    summary.semanticSceneDirectPaletteRootHashChangedTinyDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneDirectPaletteRootHashChangedTinyDeltaCount;
+    summary.semanticSceneDirectPaletteRootHashChangedSmallDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneDirectPaletteRootHashChangedSmallDeltaCount;
+    summary.semanticSceneDirectPaletteRootHashChangedMediumDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneDirectPaletteRootHashChangedMediumDeltaCount;
+    summary.semanticSceneDirectPaletteRootHashChangedLargeDeltaCount =
+        g_shadowSceneStats
+            .semanticSceneDirectPaletteRootHashChangedLargeDeltaCount;
+    summary.semanticSceneDirectPaletteRootMaxDeltaMilli =
+        g_shadowSceneStats.semanticSceneDirectPaletteRootMaxDeltaMilli;
+    summary.semanticSceneDirectSelectionKeyUnitPtrCount =
+        g_shadowSceneStats.semanticSceneDirectSelectionKeyUnitPtrCount;
+    summary.semanticSceneDirectSelectionKeyJHandleCount =
+        g_shadowSceneStats.semanticSceneDirectSelectionKeyJHandleCount;
+    summary.semanticSceneDirectSelectionKeyRuntimeModelCount =
+        g_shadowSceneStats.semanticSceneDirectSelectionKeyRuntimeModelCount;
+    summary.semanticSceneDirectSelectionKeyWorldObjectCount =
+        g_shadowSceneStats.semanticSceneDirectSelectionKeyWorldObjectCount;
+    summary.semanticSceneDirectSelectionKeySceneNodeCount =
+        g_shadowSceneStats.semanticSceneDirectSelectionKeySceneNodeCount;
+    summary.semanticSceneDirectSelectionKeyModelMeshCount =
+        g_shadowSceneStats.semanticSceneDirectSelectionKeyModelMeshCount;
+    summary.semanticSceneDirectSelectionKeyRenderablePartCount =
+        g_shadowSceneStats.semanticSceneDirectSelectionKeyRenderablePartCount;
+    summary.semanticSceneLastAppendedGeometrySourceHash =
+        g_shadowSceneStats.semanticSceneLastAppendedGeometrySourceHash;
+    summary.semanticSceneLastAppendedGeometryId =
+        g_shadowSceneStats.semanticSceneLastAppendedGeometryId;
+    summary.semanticSceneLastAppendedRenderablePart =
+        g_shadowSceneStats.semanticSceneLastAppendedRenderablePart;
+    summary.semanticSceneLastAppendedMeshData =
+        g_shadowSceneStats.semanticSceneLastAppendedMeshData;
+    // submitted/replay/executed reconciliation
+    summary.semanticSceneShadowCastersCount =
+        g_shadowSceneStats.semanticSceneShadowCastersCount;
+    summary.semanticSceneReplayDrawsCount =
+        g_shadowSceneStats.semanticSceneReplayDrawsCount;
+    summary.semanticSceneShadowMapDrawnCasters =
+        g_shadowSceneStats.semanticSceneShadowMapDrawnCasters;
+    summary.semanticSceneShadowMapCascadeCulledCount =
+        g_shadowSceneStats.semanticSceneShadowMapCascadeCulledCount;
+    summary.semanticSceneShadowMapSkinnedCasterCount =
+        g_shadowSceneStats.semanticSceneShadowMapSkinnedCasterCount;
+    summary.semanticSceneShadowMapSkinnedPreparedCount =
+        g_shadowSceneStats.semanticSceneShadowMapSkinnedPreparedCount;
+    summary.semanticSceneShadowMapSkinnedInvalidBufferCount =
+        g_shadowSceneStats.semanticSceneShadowMapSkinnedInvalidBufferCount;
+    summary.semanticSceneShadowMapSkinnedInvalidPipelineCount =
+        g_shadowSceneStats.semanticSceneShadowMapSkinnedInvalidPipelineCount;
+    summary.semanticSceneShadowMapSkinnedDrawnCount =
+        g_shadowSceneStats.semanticSceneShadowMapSkinnedDrawnCount;
+    summary.semanticSceneShadowTaaActive =
+        g_shadowSceneStats.semanticSceneShadowTaaActive;
+    summary.semanticSceneReceiverReuseShadowMap =
+        g_shadowSceneStats.semanticSceneReceiverReuseShadowMap;
+    summary.semanticSceneReceiverInputValid =
+        g_shadowSceneStats.semanticSceneReceiverInputValid;
+    summary.semanticSceneReceiverInputRejectReason =
+        g_shadowSceneStats.semanticSceneReceiverInputRejectReason;
+    summary.semanticSceneReceiverNeedPass =
+        g_shadowSceneStats.semanticSceneReceiverNeedPass;
+    summary.semanticSceneReceiverNeedShadowMap =
+        g_shadowSceneStats.semanticSceneReceiverNeedShadowMap;
+    summary.semanticSceneReceiverHasCompleteShadowMap =
+        g_shadowSceneStats.semanticSceneReceiverHasCompleteShadowMap;
+    summary.semanticSceneReceiverHasUsableDirectionalShadow =
+        g_shadowSceneStats.semanticSceneReceiverHasUsableDirectionalShadow;
+    summary.semanticSceneReceiverActiveStrengthMilli =
+        g_shadowSceneStats.semanticSceneReceiverActiveStrengthMilli;
+    summary.semanticSceneReceiverUboStrengthMilli =
+        g_shadowSceneStats.semanticSceneReceiverUboStrengthMilli;
+    summary.semanticSceneReceiverDebugMode =
+        g_shadowSceneStats.semanticSceneReceiverDebugMode;
+    summary.semanticSceneReceiverCsmCascadeCount =
+        g_shadowSceneStats.semanticSceneReceiverCsmCascadeCount;
+    summary.semanticSceneReceiverRunEntryFlags =
+        g_shadowSceneStats.semanticSceneReceiverRunEntryFlags;
+    summary.semanticSceneReceiverRunEarlyReturnReason =
+        g_shadowSceneStats.semanticSceneReceiverRunEarlyReturnReason;
+    summary.semanticSceneShadowMapExecutedThisFrame =
+        g_shadowSceneStats.semanticSceneShadowMapExecutedThisFrame;
+    summary.semanticSceneReceiverSettingsShadowsEnabled =
+        g_shadowSceneStats.semanticSceneReceiverSettingsShadowsEnabled;
+    summary.semanticSceneReceiverSettingsOutlineEnabled =
+        g_shadowSceneStats.semanticSceneReceiverSettingsOutlineEnabled;
+    summary.semanticSceneReceiverSettingsRawStrengthMilli =
+        g_shadowSceneStats.semanticSceneReceiverSettingsRawStrengthMilli;
+    summary.semanticSceneReceiverComputedShadowStrengthMilli =
+        g_shadowSceneStats.semanticSceneReceiverComputedShadowStrengthMilli;
+    summary.semanticSceneReceiverHasSunShadow =
+        g_shadowSceneStats.semanticSceneReceiverHasSunShadow;
+    summary.semanticSceneReceiverHasPointShadow =
+        g_shadowSceneStats.semanticSceneReceiverHasPointShadow;
+    summary.semanticSceneReceiverNeedOutlinePass =
+        g_shadowSceneStats.semanticSceneReceiverNeedOutlinePass;
+    summary.semanticSceneReceiverZeroStrengthFrameCount =
+        g_shadowSceneStats.semanticSceneReceiverZeroStrengthFrameCount;
+    summary.semanticSceneReceiverDrawnWithZeroStrengthCount =
+        g_shadowSceneStats.semanticSceneReceiverDrawnWithZeroStrengthCount;
+    summary.semanticSceneReceiverNoCompleteShadowMapCount =
+        g_shadowSceneStats.semanticSceneReceiverNoCompleteShadowMapCount;
+    summary.semanticSceneReceiverNoShadowMapImageCount =
+        g_shadowSceneStats.semanticSceneReceiverNoShadowMapImageCount;
+    summary.semanticSceneReceiverNoShadowMapSampleViewCount =
+        g_shadowSceneStats.semanticSceneReceiverNoShadowMapSampleViewCount;
+    summary.semanticSceneReceiverNoCandidateCsmCount =
+        g_shadowSceneStats.semanticSceneReceiverNoCandidateCsmCount;
+    summary.semanticSceneReceiverCsmFallbackToLastGoodCount =
+        g_shadowSceneStats.semanticSceneReceiverCsmFallbackToLastGoodCount;
+    summary.semanticSceneReceiverHoldInvalidCsmCount =
+        g_shadowSceneStats.semanticSceneReceiverHoldInvalidCsmCount;
+    summary.semanticSceneReceiverHoldEmptyReplayCount =
+        g_shadowSceneStats.semanticSceneReceiverHoldEmptyReplayCount;
+    summary.semanticSceneReceiverHoldIdentityChurnCount =
+        g_shadowSceneStats.semanticSceneReceiverHoldIdentityChurnCount;
+    summary.semanticSceneReceiverReuseInvalidatedAfterEnsureCount =
+        g_shadowSceneStats.semanticSceneReceiverReuseInvalidatedAfterEnsureCount;
+    summary.semanticSceneShadowMapRenderSkippedNoResourcesCount =
+        g_shadowSceneStats.semanticSceneShadowMapRenderSkippedNoResourcesCount;
+    summary.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount =
+        g_shadowSceneStats
+            .semanticSceneShadowMapRenderSkippedNoMatrixBufferCount;
+    summary.semanticSceneReceiverViewportX =
+        g_shadowSceneStats.semanticSceneReceiverViewportX;
+    summary.semanticSceneReceiverViewportY =
+        g_shadowSceneStats.semanticSceneReceiverViewportY;
+    summary.semanticSceneReceiverViewportWidth =
+        g_shadowSceneStats.semanticSceneReceiverViewportWidth;
+    summary.semanticSceneReceiverViewportHeight =
+        g_shadowSceneStats.semanticSceneReceiverViewportHeight;
+    summary.dynamicPoseSignature = g_shadowSceneStats.dynamicPoseSignature;
     summary.semanticSceneLastInputDrawCount =
         g_shadowSceneStats.semanticSceneLastInputDrawCount;
     summary.semanticSceneLastInputSkinnedCount =
@@ -1691,6 +3752,214 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneRejectedGeometryFrameLocal;
     summary.semanticSceneRejectedGeometryPersistent =
         g_shadowSceneStats.semanticSceneRejectedGeometryPersistent;
+    const auto currentDrawSummary =
+        QueryCurrentDrawContractDiagnosticsSummary();
+    summary.currentDrawContractPublishAttemptCount =
+        currentDrawSummary.publishAttemptCount;
+    summary.currentDrawContractPublishReadyCount =
+        currentDrawSummary.publishReadyCount;
+    summary.currentDrawContractPublishMissNoRenderablePart =
+        currentDrawSummary.publishMissNoRenderablePart;
+    summary.currentDrawContractPublishMissNoMeshPayload =
+        currentDrawSummary.publishMissNoMeshPayload;
+    summary.currentDrawContractPublishMissInvalidPaletteSlot =
+        currentDrawSummary.publishMissInvalidPaletteSlot;
+    summary.currentDrawContractPublishMissInvalidPaletteCount =
+        currentDrawSummary.publishMissInvalidPaletteCount;
+    summary.currentDrawContractPublishMissNoGlobalPalette =
+        currentDrawSummary.publishMissNoGlobalPalette;
+    summary.currentDrawContractPublishSkippedNonWorldContext =
+        currentDrawSummary.publishSkippedNonWorldContext;
+    summary.currentDrawContractPublishSkippedSmallViewport =
+        currentDrawSummary.publishSkippedSmallViewport;
+    summary.currentDrawContractQueryAttemptCount =
+        currentDrawSummary.queryAttemptCount;
+    summary.currentDrawContractQueryHitCount =
+        currentDrawSummary.queryHitCount;
+    summary.currentDrawContractQueryMissNoRecord =
+        currentDrawSummary.queryMissNoRecord;
+    summary.currentDrawContractQueryMissFrameTagMismatch =
+        currentDrawSummary.queryMissFrameTagMismatch;
+    summary.currentDrawContractQueryMissCacheCollision =
+        currentDrawSummary.queryMissCacheCollision;
+    summary.currentDrawCapturedPaletteQueryAttemptCount =
+        currentDrawSummary.capturedPaletteQueryAttemptCount;
+    summary.currentDrawCapturedPaletteQueryHitCount =
+        currentDrawSummary.capturedPaletteQueryHitCount;
+    summary.currentDrawCapturedPaletteMissNoContract =
+        currentDrawSummary.capturedPaletteMissNoContract;
+    summary.currentDrawCapturedPaletteMissInvalidCount =
+        currentDrawSummary.capturedPaletteMissInvalidCount;
+    summary.currentDrawCapturedPaletteMissNoSnapshot =
+        currentDrawSummary.capturedPaletteMissNoSnapshot;
+    summary.currentDrawCapturedPaletteMissUnreadablePalette =
+        currentDrawSummary.capturedPaletteMissUnreadablePalette;
+    summary.currentDrawGroupSlotDecodeAttemptCount =
+        currentDrawSummary.groupSlotDecodeAttemptCount;
+    summary.currentDrawGroupSlotDecodeHitCount =
+        currentDrawSummary.groupSlotDecodeHitCount;
+    summary.currentDrawGroupSlotDecodeMissDisabledStream =
+        currentDrawSummary.groupSlotDecodeMissDisabledStream;
+    summary.currentDrawGroupSlotDecodeMissNoStream =
+        currentDrawSummary.groupSlotDecodeMissNoStream;
+    summary.currentDrawGroupSlotDecodeMissUnreadableStream =
+        currentDrawSummary.groupSlotDecodeMissUnreadableStream;
+    summary.currentDrawGroupSlotDecodeMissGroupOutOfRange =
+        currentDrawSummary.groupSlotDecodeMissGroupOutOfRange;
+    summary.currentDrawPreparedSliceProbeAttemptCount =
+        currentDrawSummary.preparedSliceProbeAttemptCount;
+    summary.currentDrawPreparedSliceProbeContextReadyCount =
+        currentDrawSummary.preparedSliceProbeContextReadyCount;
+    summary.currentDrawPreparedSliceProbeBackingReadableCount =
+        currentDrawSummary.preparedSliceProbeBackingReadableCount;
+    summary.currentDrawPreparedSliceRecordedCount =
+        currentDrawSummary.preparedSliceRecordedCount;
+    summary.currentDrawPreparedSliceQueryAttemptCount =
+        currentDrawSummary.preparedSliceQueryAttemptCount;
+    summary.currentDrawPreparedSliceQueryHitCount =
+        currentDrawSummary.preparedSliceQueryHitCount;
+    summary.currentDrawPreparedSliceQueryMissCount =
+        currentDrawSummary.preparedSliceQueryMissCount;
+    summary.currentDrawStream1PublishNoStreamCount =
+        currentDrawSummary.stream1PublishNoStreamCount;
+    summary.currentDrawStream1PublishStride0Count =
+        currentDrawSummary.stream1PublishStride0Count;
+    summary.currentDrawStream1PublishStride1Count =
+        currentDrawSummary.stream1PublishStride1Count;
+    summary.currentDrawStream1PublishStride8Count =
+        currentDrawSummary.stream1PublishStride8Count;
+    summary.currentDrawStream1PublishStride12Count =
+        currentDrawSummary.stream1PublishStride12Count;
+    summary.currentDrawStream1PublishStride16Count =
+        currentDrawSummary.stream1PublishStride16Count;
+    summary.currentDrawStream1PublishStride20Count =
+        currentDrawSummary.stream1PublishStride20Count;
+    summary.currentDrawStream1PublishStrideOtherCount =
+        currentDrawSummary.stream1PublishStrideOtherCount;
+    summary.currentDrawStream1PublishLastRawStride =
+        currentDrawSummary.stream1PublishLastRawStride;
+    summary.currentDrawStream1PublishMaxRawStride =
+        currentDrawSummary.stream1PublishMaxRawStride;
+    summary.currentDrawLastRenderablePart =
+        currentDrawSummary.lastRenderablePart;
+    summary.currentDrawLastSceneNode =
+        currentDrawSummary.lastSceneNode;
+    summary.currentDrawLastMeshPayloadPtr =
+        currentDrawSummary.lastMeshPayloadPtr;
+    summary.currentDrawLastPaletteAddress =
+        currentDrawSummary.lastPaletteAddress;
+    summary.currentDrawLastStream1Ptr =
+        currentDrawSummary.lastStream1Ptr;
+    summary.currentDrawLastCaptureSerial =
+        currentDrawSummary.lastCaptureSerial;
+    summary.currentDrawLastPaletteSlotIndex =
+        currentDrawSummary.lastPaletteSlotIndex;
+    summary.currentDrawLastCapturedPaletteCount =
+        currentDrawSummary.lastCapturedPaletteCount;
+    summary.currentDrawLastStream1Stride =
+        currentDrawSummary.lastStream1Stride;
+    summary.currentDrawLastFrameTag =
+        currentDrawSummary.lastFrameTag;
+    summary.currentDrawLastVisibleFrameSerial =
+        currentDrawSummary.lastVisibleFrameSerial;
+    summary.currentDrawLastRenderFrameIndex =
+        currentDrawSummary.lastRenderFrameIndex;
+    summary.currentDrawLastSmallViewportWidth =
+        currentDrawSummary.lastSmallViewportWidth;
+    summary.currentDrawLastSmallViewportHeight =
+        currentDrawSummary.lastSmallViewportHeight;
+    summary.currentDrawLastMissReason =
+        currentDrawSummary.lastMissReason;
+    // Phase 7.35 Pose-lag 诊断：submit lag 分桶透传。
+    summary.submitPaletteFrameLag0Count =
+        currentDrawSummary.submitPaletteFrameLag0Count;
+    summary.submitPaletteFrameLag1Count =
+        currentDrawSummary.submitPaletteFrameLag1Count;
+    summary.submitPaletteFrameLag2Count =
+        currentDrawSummary.submitPaletteFrameLag2Count;
+    summary.submitPaletteFrameLag3To5Count =
+        currentDrawSummary.submitPaletteFrameLag3To5Count;
+    summary.submitPaletteFrameLag6PlusCount =
+        currentDrawSummary.submitPaletteFrameLag6PlusCount;
+    summary.submitPaletteFrameLagMax =
+        currentDrawSummary.submitPaletteFrameLagMax;
+    summary.submitPaletteFrameLagSampleCount =
+        currentDrawSummary.submitPaletteFrameLagSampleCount;
+    // Phase 7.39：palette 内容年龄分桶透传。
+    summary.submitPaletteContentAgeLag0Count =
+        currentDrawSummary.submitPaletteContentAgeLag0Count;
+    summary.submitPaletteContentAgeLag1Count =
+        currentDrawSummary.submitPaletteContentAgeLag1Count;
+    summary.submitPaletteContentAgeLag2Count =
+        currentDrawSummary.submitPaletteContentAgeLag2Count;
+    summary.submitPaletteContentAgeLag3To5Count =
+        currentDrawSummary.submitPaletteContentAgeLag3To5Count;
+    summary.submitPaletteContentAgeLag6PlusCount =
+        currentDrawSummary.submitPaletteContentAgeLag6PlusCount;
+    summary.submitPaletteContentAgeMax =
+        currentDrawSummary.submitPaletteContentAgeMax;
+    summary.submitPaletteContentAgeSampleCount =
+        currentDrawSummary.submitPaletteContentAgeSampleCount;
+    summary.submitPaletteContentAgeUnknownCount =
+        currentDrawSummary.submitPaletteContentAgeUnknownCount;
+    // Phase 7.35 路径 1 诊断：capture 端 Exact 查询分布透传。
+    summary.paletteCaptureExactHitCount =
+        currentDrawSummary.paletteCaptureExactHitCount;
+    summary.paletteCaptureBestEffortHitCount =
+        currentDrawSummary.paletteCaptureBestEffortHitCount;
+    summary.paletteCaptureSlotOverflowMissCount =
+        currentDrawSummary.paletteCaptureSlotOverflowMissCount;
+    summary.paletteCaptureInvalidEntryMissCount =
+        currentDrawSummary.paletteCaptureInvalidEntryMissCount;
+    summary.paletteCaptureFrameTagMismatchMissCount =
+        currentDrawSummary.paletteCaptureFrameTagMismatchMissCount;
+    summary.paletteCaptureShortResultMissCount =
+        currentDrawSummary.paletteCaptureShortResultMissCount;
+    // Phase 7.35 路径 2 诊断：submit-side live rebuild 分桶透传。
+    summary.submitLiveRebuildAttemptCount =
+        currentDrawSummary.submitLiveRebuildAttemptCount;
+    summary.submitLiveRebuildHitCount =
+        currentDrawSummary.submitLiveRebuildHitCount;
+    summary.submitLiveRebuildMissCount =
+        currentDrawSummary.submitLiveRebuildMissCount;
+    summary.submitLiveRebuildAppliedCount =
+        currentDrawSummary.submitLiveRebuildAppliedCount;
+    // AlphaTest payload plumbing 诊断透传（Claude AlphaTest lane, Phase B）。
+    //
+    // 读取是无锁 atomic load，调用链全程不经过 mutex；即使生产侧与消费侧
+    // 在不同帧/线程并发写入，这里拿到的也只是一份快照，用于 control plane
+    // 侧做趋势判断，不作为帧精确时序的依据。
+    {
+      const auto alphaTestSnapshot =
+          dxvk::war3::shadow::ReadWar3ShadowAlphaTestPayloadCountersSnapshot();
+      summary.shadowAlphaTestPayloadAttemptCount =
+          alphaTestSnapshot.attemptCount;
+      summary.shadowAlphaTestPayloadHitCount = alphaTestSnapshot.hitCount;
+      summary.shadowAlphaTestPayloadMissNoUvCount =
+          alphaTestSnapshot.missNoUvCount;
+      summary.shadowAlphaTestPayloadMissNoDiffuseCount =
+          alphaTestSnapshot.missNoDiffuseCount;
+      summary.shadowAlphaTestPayloadMissStageInvalidCount =
+          alphaTestSnapshot.missStageInvalidCount;
+      summary.shadowAlphaTestPayloadAppliedCount =
+          alphaTestSnapshot.appliedCount;
+      summary.shadowAlphaTestPayloadFallbackRejectCount =
+          alphaTestSnapshot.fallbackRejectCount;
+      summary.shadowAlphaTestPayloadStashCapturedCount =
+          alphaTestSnapshot.stashCapturedCount;
+      summary.shadowAlphaTestPayloadStashSkipNoSemanticKeyCount =
+          alphaTestSnapshot.stashSkipNoSemanticKeyCount;
+      summary.shadowAlphaTestPayloadStashSkipNoUvCount =
+          alphaTestSnapshot.stashSkipNoUvCount;
+      summary.shadowAlphaTestPayloadStashSkipNoDiffuseCount =
+          alphaTestSnapshot.stashSkipNoDiffuseCount;
+      summary.shadowAlphaTestPayloadStashSkipNoUploadCount =
+          alphaTestSnapshot.stashSkipNoUploadCount;
+      summary.shadowAlphaTestPayloadCacheEvictedCount =
+          alphaTestSnapshot.cacheEvictedCount;
+      summary.shadowAlphaTestPayloadCacheSizeGauge =
+          alphaTestSnapshot.cacheSizeGauge;
+    }
     summary.semanticFallbackPruned = g_shadowSceneStats.semanticFallbackPruned;
     summary.semanticFallbackPrunedByHandle =
         g_shadowSceneStats.semanticFallbackPrunedByHandle;
@@ -1706,6 +3975,35 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.duplicateGeometryInstances;
     summary.instancedGeometryDrawsSaved =
         g_shadowSceneStats.instancedGeometryDrawsSaved;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_shadowCadenceMutex);
+    summary.shadowCadenceSampleSerial = g_shadowCadenceNextSerial;
+    summary.shadowCadenceSampleCountTotal = g_shadowCadenceSampleCountTotal;
+    summary.shadowCadenceSameDynamicPoseStreak =
+        g_shadowCadenceSameDynamicPoseStreak;
+    summary.shadowCadenceSameDynamicPoseStreakMax =
+        g_shadowCadenceSameDynamicPoseStreakMax;
+    summary.shadowCadenceSameSceneFrameStreak =
+        g_shadowCadenceSameSceneFrameStreak;
+    summary.shadowCadenceSameSceneFrameStreakMax =
+        g_shadowCadenceSameSceneFrameStreakMax;
+    summary.shadowCadenceShadowMapReuseStreak =
+        g_shadowCadenceShadowMapReuseStreak;
+    summary.shadowCadenceShadowMapReuseStreakMax =
+        g_shadowCadenceShadowMapReuseStreakMax;
+    summary.shadowCadenceSampleCount = g_shadowCadenceSampleCount;
+    const uint32_t first =
+        (g_shadowCadenceWriteIndex +
+         static_cast<uint32_t>(kShadowRuntimeCadenceSampleCapacity) -
+         g_shadowCadenceSampleCount) %
+        static_cast<uint32_t>(kShadowRuntimeCadenceSampleCapacity);
+    for (uint32_t i = 0u; i < g_shadowCadenceSampleCount; ++i) {
+      const uint32_t index =
+          (first + i) %
+          static_cast<uint32_t>(kShadowRuntimeCadenceSampleCapacity);
+      summary.shadowCadenceSamples[i] = g_shadowCadenceSamples[index];
+    }
   }
   const auto semanticCore =
       shadow::ShadowValidationRuntime::instance().snapshot();
@@ -2311,8 +4609,6 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
       semanticPerfCalls(SemanticDataPerfTag::AttachmentOverridePrimaryPreset);
   summary.semanticAttachmentOverridePrimaryPresetUs =
       semanticPerfUs(SemanticDataPerfTag::AttachmentOverridePrimaryPreset);
-  if (semanticSkipReason == SemanticBuildSkippedReason::None)
-    shadow::NativeD3D9BackendRuntime::instance().buildLatestFrame();
   const auto nativeSummary =
       shadow::NativeD3D9BackendRuntime::instance().snapshot();
   summary.nativeD3D9BackendFrameSerial = nativeSummary.frameSerial;
@@ -2359,6 +4655,26 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
     summary.nativeD3D9BackendGeometryCount = nativeSummary.geometryCount;
     summary.nativeD3D9BackendPaletteCount = nativeSummary.paletteCount;
     summary.nativeD3D9BackendMaterialCount = nativeSummary.materialCount;
+    summary.nativeD3D9BackendCanonicalDrawCount =
+        nativeSummary.canonicalDrawCount;
+    summary.nativeD3D9BackendCanonicalFrameSerial =
+        nativeSummary.canonicalFrameSerial;
+    summary.nativeD3D9BackendCanonicalPublishCount =
+        nativeSummary.canonicalPublishCount;
+    summary.nativeD3D9BackendCanonicalPublishRejectNotReadyCount =
+        nativeSummary.canonicalPublishRejectNotReadyCount;
+    summary.nativeD3D9BackendCanonicalPublishRejectNoPositionsCount =
+        nativeSummary.canonicalPublishRejectNoPositionsCount;
+    summary.nativeD3D9BackendGeometryRejectCount =
+        nativeSummary.geometryRejectCount;
+    summary.nativeD3D9BackendPaletteRejectCount =
+        nativeSummary.paletteRejectCount;
+    summary.nativeD3D9BackendMaterialRejectCount =
+        nativeSummary.materialRejectCount;
+    summary.nativeD3D9BackendSubmitRejectCount =
+        nativeSummary.submitRejectCount;
+    summary.nativeD3D9BackendUsedCanonicalFrame =
+        nativeSummary.usedCanonicalFrame;
     summary.nativeD3D9BackendHasDevice = nativeSummary.hasDevice;
     summary.nativeSemanticWorldStageCandidateCount =
         g_nativeSemanticWorldStageCandidateCount.load(
@@ -2462,6 +4778,61 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
       overrideSummary.runtimeMatrixWritePublishCount;
   summary.runtimeMatrixWriteMissCount =
       overrideSummary.runtimeMatrixWriteMissCount;
+  summary.runtimeGroupPaletteWrapperCallCount =
+      overrideSummary.runtimeGroupPaletteWrapperCallCount;
+  summary.runtimeGroupPaletteWrapperPartCount =
+      overrideSummary.runtimeGroupPaletteWrapperPartCount;
+  summary.runtimeGroupPaletteWrapperBindingCount =
+      overrideSummary.runtimeGroupPaletteWrapperBindingCount;
+  summary.runtimeSimpleGroupPaletteCallCount =
+      overrideSummary.runtimeSimpleGroupPaletteCallCount;
+  summary.runtimeSimpleGroupPaletteSlotCapturedCount =
+      overrideSummary.runtimeSimpleGroupPaletteSlotCapturedCount;
+  summary.runtimeSimpleGroupPaletteSlotUnreadableCount =
+      overrideSummary.runtimeSimpleGroupPaletteSlotUnreadableCount;
+  summary.renderablePartPaletteBindingQueryHitCount =
+      overrideSummary.renderablePartPaletteBindingQueryHitCount;
+  summary.renderablePartPaletteBindingQueryMissCount =
+      overrideSummary.renderablePartPaletteBindingQueryMissCount;
+  summary.renderablePartPaletteSnapshotCapturedCount =
+      overrideSummary.renderablePartPaletteSnapshotCapturedCount;
+  summary.renderablePartPaletteSnapshotTooLargeCount =
+      overrideSummary.renderablePartPaletteSnapshotTooLargeCount;
+  summary.renderablePartPaletteSnapshotUnreadableCount =
+      overrideSummary.renderablePartPaletteSnapshotUnreadableCount;
+  summary.renderablePartPaletteSnapshotQueryHitCount =
+      overrideSummary.renderablePartPaletteSnapshotQueryHitCount;
+  summary.renderablePartPaletteSnapshotQueryMissCount =
+      overrideSummary.renderablePartPaletteSnapshotQueryMissCount;
+  // Phase 7.47 dt gate probe
+  summary.spriteUberPreRenderTotalCount =
+      overrideSummary.spriteUberPreRenderTotalCount;
+  summary.spriteUberPreRenderDtZeroCount =
+      overrideSummary.spriteUberPreRenderDtZeroCount;
+  summary.spriteUberPreRenderDtBelowEpsilonCount =
+      overrideSummary.spriteUberPreRenderDtBelowEpsilonCount;
+  summary.spriteUberPreRenderDtPositiveCount =
+      overrideSummary.spriteUberPreRenderDtPositiveCount;
+  summary.spriteUberPreRenderDtNegativeCount =
+      overrideSummary.spriteUberPreRenderDtNegativeCount;
+  summary.spriteUberPreRenderLastDtBits =
+      overrideSummary.spriteUberPreRenderLastDtBits;
+  summary.spriteUberPreRenderLastZeroDtFrameTag =
+      overrideSummary.spriteUberPreRenderLastZeroDtFrameTag;
+  summary.spriteUberPreRenderLastPositiveDtFrameTag =
+      overrideSummary.spriteUberPreRenderLastPositiveDtFrameTag;
+  summary.runtimeMatrixWriteFramesWithHitCount =
+      overrideSummary.runtimeMatrixWriteFramesWithHitCount;
+  summary.runtimeMatrixWriteFramesEmptyCount =
+      overrideSummary.runtimeMatrixWriteFramesEmptyCount;
+  summary.runtimeGroupPaletteWrapperFramesWithHitCount =
+      overrideSummary.runtimeGroupPaletteWrapperFramesWithHitCount;
+  summary.runtimeGroupPaletteWrapperFramesEmptyCount =
+      overrideSummary.runtimeGroupPaletteWrapperFramesEmptyCount;
+  summary.runtimeSimpleGroupPaletteFramesWithHitCount =
+      overrideSummary.runtimeSimpleGroupPaletteFramesWithHitCount;
+  summary.runtimeSimpleGroupPaletteFramesEmptyCount =
+      overrideSummary.runtimeSimpleGroupPaletteFramesEmptyCount;
   summary.runtimeMatrixWriteLastRuntimeModelPtr =
       overrideSummary.runtimeMatrixWriteLastRuntimeModelPtr;
   summary.runtimeMatrixWriteLastMatrixIndex =
@@ -3241,6 +5612,32 @@ void ResetShadowRuntimeBridgeState() {
   g_semanticSummaryRefreshFrameSerial.store(0u, std::memory_order_relaxed);
   g_semanticSummaryRefreshPublishRevision.store(0u,
                                                 std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(g_shadowCadenceMutex);
+    g_shadowCadenceSamples = {};
+    g_shadowCadenceNextSerial = 0u;
+    g_shadowCadenceSampleCountTotal = 0u;
+    g_shadowCadenceWriteIndex = 0u;
+    g_shadowCadenceSampleCount = 0u;
+    g_shadowCadenceLastDynamicPoseSignature = 0u;
+    g_shadowCadenceLastSceneFrameSerial = 0u;
+    g_shadowCadenceSameDynamicPoseStreak = 0u;
+    g_shadowCadenceSameDynamicPoseStreakMax = 0u;
+    g_shadowCadenceSameSceneFrameStreak = 0u;
+    g_shadowCadenceSameSceneFrameStreakMax = 0u;
+    g_shadowCadenceShadowMapReuseStreak = 0u;
+    g_shadowCadenceShadowMapReuseStreakMax = 0u;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
+    CloseShadowPoseFullTraceLocked();
+    g_shadowPoseFullTraceStoppedByLimit = false;
+    g_shadowPoseFullTraceFrameEventsWritten = 0u;
+    g_shadowPoseFullTraceRecordEventsWritten = 0u;
+    g_shadowPoseFullTraceStart = {};
+    g_shadowPoseFullTracePath.clear();
+    ++g_shadowPoseFullTraceEpoch;
+  }
   shadow::NativeD3D9BackendRuntime::instance().reset();
 }
 

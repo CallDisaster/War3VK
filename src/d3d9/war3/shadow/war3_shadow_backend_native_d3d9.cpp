@@ -714,6 +714,10 @@ void NativeD3D9Backend::reset() {
   m_lastExecuteSubmittedSkinnedDrawCount = 0u;
   m_lastExecuteExecutedRigidDrawCount = 0u;
   m_lastExecuteExecutedSkinnedDrawCount = 0u;
+  m_geometryRejectCount = 0u;
+  m_paletteRejectCount = 0u;
+  m_materialRejectCount = 0u;
+  m_submitRejectCount = 0u;
   m_nextHandleValue = 2u;
   m_geometryHandleByKey.clear();
   m_paletteHandleByKey.clear();
@@ -747,14 +751,20 @@ void NativeD3D9Backend::beginFrame(uint64_t frameSerial) {
   m_executedRigidDrawCount = 0u;
   m_executedSkinnedDrawCount = 0u;
   m_executedFrameSerial = 0u;
+  m_geometryRejectCount = 0u;
+  m_paletteRejectCount = 0u;
+  m_materialRejectCount = 0u;
+  m_submitRejectCount = 0u;
   m_submittedDraws.clear();
 }
 
 bool NativeD3D9Backend::ensureGeometry(const ShadowDrawPacket& packet,
                                        ShadowGeometryHandle& outHandle) {
   outHandle.value = 0u;
-  if (m_device == nullptr)
+  if (m_device == nullptr) {
+    ++m_geometryRejectCount;
     return false;
+  }
 
   const uint64_t key = MakeGeometryCacheKey(packet);
   if (const auto it = m_geometryHandleByKey.find(key);
@@ -764,17 +774,23 @@ bool NativeD3D9Backend::ensureGeometry(const ShadowDrawPacket& packet,
   }
 
   std::vector<float> positions;
-  if (!ResolvePositionStream(packet, positions))
+  if (!ResolvePositionStream(packet, positions)) {
+    ++m_geometryRejectCount;
     return false;
+  }
 
   const uint32_t vertexCount = ResolveVertexCount(packet, positions);
-  if (vertexCount == 0u || positions.size() < size_t(vertexCount) * 3u)
+  if (vertexCount == 0u || positions.size() < size_t(vertexCount) * 3u) {
+    ++m_geometryRejectCount;
     return false;
+  }
 
   std::vector<uint16_t> indices;
   const bool indexed = ResolveIndexStream(packet, indices);
-  if (indexed && indices.empty())
+  if (indexed && indices.empty()) {
+    ++m_geometryRejectCount;
     return false;
+  }
 
   std::vector<NativeBlendVertex> blendVertices;
   std::vector<std::array<uint8_t, 4>> blendIndices;
@@ -782,6 +798,7 @@ bool NativeD3D9Backend::ensureGeometry(const ShadowDrawPacket& packet,
   uint8_t explicitBlendCount = 0u;
   if (!ResolveBlendStream(packet, vertexCount, blendVertices, blendIndices,
                           blendStride, explicitBlendCount)) {
+    ++m_geometryRejectCount;
     return false;
   }
 
@@ -799,6 +816,7 @@ bool NativeD3D9Backend::ensureGeometry(const ShadowDrawPacket& packet,
   if (!CreateStaticVertexBuffer(m_device, positions.data(),
                                 positions.size() * sizeof(float),
                                 resource.positionBuffer)) {
+    ++m_geometryRejectCount;
     return false;
   }
 
@@ -806,6 +824,7 @@ bool NativeD3D9Backend::ensureGeometry(const ShadowDrawPacket& packet,
       !CreateStaticIndexBuffer(m_device, indices.data(),
                                indices.size() * sizeof(uint16_t),
                                resource.indexBuffer)) {
+    ++m_geometryRejectCount;
     return false;
   }
 
@@ -813,6 +832,7 @@ bool NativeD3D9Backend::ensureGeometry(const ShadowDrawPacket& packet,
       !CreateStaticVertexBuffer(m_device, blendVertices.data(),
                                 blendVertices.size() * sizeof(blendVertices[0]),
                                 resource.blendBuffer)) {
+    ++m_geometryRejectCount;
     return false;
   }
 
@@ -820,6 +840,7 @@ bool NativeD3D9Backend::ensureGeometry(const ShadowDrawPacket& packet,
       !CreateStaticVertexBuffer(m_device, blendIndices.data(),
                                 blendIndices.size() * sizeof(blendIndices[0]),
                                 resource.blendBuffer)) {
+    ++m_geometryRejectCount;
     return false;
   }
 
@@ -899,6 +920,7 @@ bool NativeD3D9Backend::submitDraw(const ShadowDrawPacket& packet,
                                    const ShadowMaterialHandle& materialHandle) {
   if (m_device == nullptr || geometryHandle.value == 0u ||
       paletteHandle.value == 0u || materialHandle.value == 0u) {
+    ++m_submitRejectCount;
     return false;
   }
 
@@ -908,6 +930,7 @@ bool NativeD3D9Backend::submitDraw(const ShadowDrawPacket& packet,
   if (geometryIt == m_geometryResources.end() ||
       paletteIt == m_paletteResources.end() ||
       materialIt == m_materialResources.end()) {
+    ++m_submitRejectCount;
     return false;
   }
 
@@ -942,6 +965,7 @@ bool NativeD3D9Backend::submitDraw(const ShadowDrawPacket& packet,
         !TryCopyPacketVector(packet.resource.vertexBlendIndices,
                              record.explicitBlendIndices,
                              0u, size_t(16u) * 1024u * 1024u)) {
+      ++m_submitRejectCount;
       return false;
     }
     record.runtimeGroupPalette = packet.runtimeGroupPalette;

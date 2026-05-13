@@ -9,18 +9,284 @@
 #include "../game/war3_unit.h"
 #include "../model/war3_model_resource_cache.h"
 #include "../model/war3_model_registry.h"
+#include "war3_current_draw_contract.h"
 #include "war3_render_objects.h"
 #include "war3_render_queue_tracker.h"
 #include "war3_shadow_object_registry.h"
 #include "war3_shadow_runtime_bridge.h"
+#include "../../util/util_bit.h"
 
 #include <atomic>
+#include <cstdlib>
+#include <unordered_set>
 
 namespace dxvk::war3::render {
 
 namespace {
 
 constexpr size_t kRenderBatchElementStride = 20;
+constexpr uintptr_t kCModelComplexExtensionOffset = 0xA0u;
+
+uint64_t VisibleRenderablePartLayerKey(void* renderablePart,
+                                       uint32_t layerIndex) {
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(
+      hash, uint64_t(reinterpret_cast<uintptr_t>(renderablePart)));
+  hash = bit::fnv1a_iter(hash, layerIndex);
+  return hash;
+}
+
+uint64_t HashTaggedPtr(uint32_t tag, const void* value) {
+  if (value == nullptr)
+    return 0u;
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, tag);
+  hash = bit::fnv1a_iter(
+      hash, uint64_t(reinterpret_cast<uintptr_t>(value)));
+  return hash;
+}
+
+uint64_t HashTaggedU32(uint32_t tag, uint32_t value) {
+  if (value == 0u)
+    return 0u;
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, tag);
+  hash = bit::fnv1a_iter(hash, value);
+  return hash;
+}
+
+uint64_t ShadowManifestObjectKey(
+    const CurrentDrawContractRecord& record) {
+  return VisibleRenderableRegistry::computeShadowManifestObjectKey(record);
+}
+
+uint64_t ShadowManifestPartKey(
+    const CurrentDrawContractRecord& record, uint64_t objectKey) {
+  if (objectKey == 0u)
+    return 0u;
+
+  uint64_t hash = bit::fnv1a_init();
+  // Phase 7.31 Phase 5：destructible 专项。
+  // 背景：大门（可破坏物）在 closed/opening/opened 状态之间切换时，
+  // renderablePart 指针不变，但 slice 的逻辑语义已经变了——这时 lease
+  // 会把 closed 状态下的 packet 继续垫给 opening 的 live packet，
+  // 肉眼看到的就是"大门阴影在 closed/open 之间剧烈闪烁"。
+  //
+  // Iter C 曾经试过给所有对象都在 part key 里混入 payload11C，hot_shadow_poll
+  // 指标很好，但 run_quick_autotest benchmark（14K+ skinned）FPS 从 100+
+  // 崩到 3.7，因为全局 manifest 里 part 数量乘了 2-9 倍，触发了
+  // noteShadowManifestPartGoodPacket 的 O(N²) 扫描。
+  //
+  // 本轮做受限版本：**只对 Destructible 把 payload11C 进 key**。
+  // - Destructible 在场景里数量有限（几十到几百个，远小于 skinned 上万）；
+  // - Unit/其他对象继续走原 key 路径，保持 benchmark FPS 不退化；
+  // - 用户反馈"大门闪得特别厉害"正是 destructible 专属症状，对症下药。
+  hash = bit::fnv1a_iter(hash, 0x72110100u);
+  hash = bit::fnv1a_iter(hash, objectKey);
+  hash = bit::fnv1a_iter(hash, record.layerIndex);
+  hash = bit::fnv1a_iter(hash, record.payloadWord108);
+  if (record.objectKind == dxvk::war3::render::ObjectKind::Destructible) {
+    hash = bit::fnv1a_iter(hash, record.payloadWord11C);
+  }
+  return hash;
+}
+
+uint64_t ShadowManifestPartAnchorKey(
+    const CurrentDrawContractRecord& record, uint64_t objectKey) {
+  if (objectKey == 0u)
+    return 0u;
+
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, 0x72110200u);
+  hash = bit::fnv1a_iter(hash, objectKey);
+  hash = bit::fnv1a_iter(hash, record.payloadWord108);
+  return hash;
+}
+
+uint64_t ShadowManifestSliceKey(
+    const CurrentDrawContractRecord& record) {
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, record.layerIndex);
+  hash = bit::fnv1a_iter(hash, record.payloadWord108);
+  return hash;
+}
+
+void HashBytesFnv64Append(uint64_t& hash, const void* data, size_t size) {
+  const auto* bytes = reinterpret_cast<const uint8_t*>(data);
+  for (size_t i = 0u; i < size; ++i) {
+    hash ^= uint64_t(bytes[i]);
+    hash *= 1099511628211ull;
+  }
+}
+
+// Phase 7.26: CModel pose 探测本身涉及可变长度的矩阵 hash（最多 256 * 48B = 12KB
+// FNV-1a 扫描），在默认 release 配置下属于"不产生行为只产生诊断"的开销。
+// 将其收口到运行时开关后，只有显式开启 pose restore 或 pose 诊断时才执行。
+bool War3SemanticShadowManifestCModelPoseProbeAllowed() {
+  static const bool s_enabled = []() {
+    auto readU32 = [](const char* name, uint32_t fallback) {
+      const char* raw = std::getenv(name);
+      if (raw == nullptr || raw[0] == '\0')
+        return fallback;
+      try {
+        return uint32_t(std::strtoul(raw, nullptr, 0));
+      } catch (...) {
+        return fallback;
+      }
+    };
+    // pose restore 开启时必须允许探测，否则 restore 路径没有判定依据。
+    if (readU32("DXVK_WAR3_SEMANTIC_MANIFEST_CMODEL_POSE_RESTORE", 0u) != 0u)
+      return true;
+    // 单独的诊断开关允许不启用 restore 行为也持续观察 pose 状态。
+    if (readU32("DXVK_WAR3_SEMANTIC_SHADOW_MANIFEST_CMODEL_POSE_DIAG", 0u) != 0u)
+      return true;
+    return false;
+  }();
+  return s_enabled;
+}
+
+bool TryProbeLiveCModelPose(void* runtimeModelPtr,
+                            uint32_t& outMatrixCount,
+                            uint64_t& outMatrixHash) {
+  outMatrixCount = 0u;
+  outMatrixHash = 0u;
+  if (runtimeModelPtr == nullptr)
+    return false;
+
+  uint32_t matrixCount = 0u;
+  void* matrixBase = nullptr;
+  if (!dxvk::war3::SafeReadU32Fast(
+          runtimeModelPtr, dxvk::war3::CModelOffsets::FinalPoseMatrixCount,
+          matrixCount) ||
+      !dxvk::war3::SafeReadPtrFast(
+          runtimeModelPtr, dxvk::war3::CModelOffsets::FinalPoseMatrixArray,
+          matrixBase) ||
+      matrixBase == nullptr || matrixCount == 0u) {
+    return false;
+  }
+
+  matrixCount = (std::min)(matrixCount, 256u);
+  const size_t byteCount = size_t(matrixCount) * 48u;
+  if (!dxvk::war3::IsReadableRange(matrixBase, byteCount))
+    return false;
+
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, matrixCount);
+  HashBytesFnv64Append(hash, matrixBase, byteCount);
+  outMatrixCount = matrixCount;
+  outMatrixHash = hash;
+  return true;
+}
+
+void* TryCanonicalRuntimeModelPtr(void* candidate);
+
+void* ResolveRuntimeModelForCurrentDrawRecord(
+    const VisibleRenderableRegistry::Snapshot& snap,
+    const CurrentDrawContractRecord& record) {
+  auto runtimeFromIndex = [&](uint32_t index) -> void* {
+    if (index >= snap.records.size())
+      return nullptr;
+    void* runtimeModelPtr = snap.records[index].runtimeModelPtr;
+    if (runtimeModelPtr == nullptr)
+      return nullptr;
+    return TryCanonicalRuntimeModelPtr(runtimeModelPtr);
+  };
+
+  if (record.renderablePart != nullptr) {
+    const uint64_t partLayerKey =
+        VisibleRenderablePartLayerKey(record.renderablePart,
+                                      record.layerIndex);
+    const auto partLayerIt = snap.byRenderablePartLayer.find(partLayerKey);
+    if (partLayerIt != snap.byRenderablePartLayer.end()) {
+      if (void* runtimeModelPtr = runtimeFromIndex(partLayerIt->second))
+        return runtimeModelPtr;
+    }
+
+    const auto countIt =
+        snap.renderablePartRecordCount.find(record.renderablePart);
+    if (countIt != snap.renderablePartRecordCount.end() &&
+        countIt->second == 1u) {
+      const auto partIt = snap.byRenderablePart.find(record.renderablePart);
+      if (partIt != snap.byRenderablePart.end()) {
+        if (void* runtimeModelPtr = runtimeFromIndex(partIt->second))
+          return runtimeModelPtr;
+      }
+    }
+  }
+
+  if (record.sceneNode != nullptr) {
+    const auto sceneIt = snap.bySceneNode.find(record.sceneNode);
+    if (sceneIt != snap.bySceneNode.end()) {
+      if (void* runtimeModelPtr = runtimeFromIndex(sceneIt->second))
+        return runtimeModelPtr;
+    }
+  }
+
+  for (const auto& visible : snap.records) {
+    if (record.renderablePart != nullptr &&
+        visible.renderablePart == record.renderablePart &&
+        visible.layerIndex == record.layerIndex) {
+      if (void* runtimeModelPtr =
+              TryCanonicalRuntimeModelPtr(visible.runtimeModelPtr))
+        return runtimeModelPtr;
+    }
+    if (record.sceneNode != nullptr &&
+        (visible.sceneNode == record.sceneNode ||
+         visible.identity.sceneNode == record.sceneNode)) {
+      if (void* runtimeModelPtr =
+              TryCanonicalRuntimeModelPtr(visible.runtimeModelPtr))
+        return runtimeModelPtr;
+    }
+    const bool identityMatch =
+        (record.unitPtr != nullptr &&
+         visible.identity.unitPtr == record.unitPtr) ||
+        (record.jHandle != 0u && visible.identity.jHandle == record.jHandle) ||
+        (record.worldObjectEntry != nullptr &&
+         visible.identity.worldObjectEntry == record.worldObjectEntry) ||
+        (record.sceneNode != nullptr &&
+         (visible.sceneNode == record.sceneNode ||
+          visible.identity.sceneNode == record.sceneNode));
+    if (identityMatch) {
+      if (void* runtimeModelPtr =
+              TryCanonicalRuntimeModelPtr(visible.runtimeModelPtr))
+        return runtimeModelPtr;
+    }
+  }
+
+  model::ModelInstanceRecord instanceRecord = {};
+  auto& instanceRegistry = model::ModelInstanceRegistry::instance();
+  if ((record.unitPtr != nullptr &&
+       instanceRegistry.findByUnitPtr(record.unitPtr, instanceRecord)) ||
+      (record.worldObjectEntry != nullptr &&
+       instanceRegistry.findByWorldObjectEntry(record.worldObjectEntry,
+                                               instanceRecord)) ||
+      (record.sceneNode != nullptr &&
+       instanceRegistry.findBySceneNode(record.sceneNode, instanceRecord)) ||
+      (record.jHandle != 0u &&
+       instanceRegistry.findByHandle(record.jHandle, instanceRecord))) {
+    if (void* runtimeModelPtr =
+            TryCanonicalRuntimeModelPtr(instanceRecord.runtimeModelPtr))
+      return runtimeModelPtr;
+  }
+
+  ShadowObjectRecord shadowRecord = {};
+  auto& shadowRegistry = ShadowObjectRegistry::instance();
+  if ((record.unitPtr != nullptr &&
+       shadowRegistry.findByUnitPtr(record.unitPtr, shadowRecord)) ||
+      (record.worldObjectEntry != nullptr &&
+       shadowRegistry.findByWorldObjectEntry(record.worldObjectEntry,
+                                             shadowRecord)) ||
+      (record.sceneNode != nullptr &&
+       shadowRegistry.findBySceneNode(record.sceneNode, shadowRecord)) ||
+      (record.jHandle != 0u &&
+       shadowRegistry.findByHandle(record.jHandle, shadowRecord))) {
+    if (void* runtimeModelPtr =
+            TryCanonicalRuntimeModelPtr(shadowRecord.runtimeModelPtr))
+      return runtimeModelPtr;
+  }
+
+  return nullptr;
+}
 
 struct RenderablePartBasicFields {
   void *sceneNode = nullptr;
@@ -125,15 +391,39 @@ bool LooksLikeRuntimeModelPtr(void* candidate) {
   return hasRuntimeGeosets || (hasOwnedHandle && hasFinalPoseArray);
 }
 
+template <typename Fn>
+void ForEachRuntimeModelAlias(void* runtimeModelPtr, Fn&& fn) {
+  if (runtimeModelPtr == nullptr)
+    return;
+
+  const uintptr_t value = reinterpret_cast<uintptr_t>(runtimeModelPtr);
+  if (value < 0x10000u)
+    return;
+
+  fn(runtimeModelPtr);
+  if (value <= (~uintptr_t(0u)) - kCModelComplexExtensionOffset)
+    fn(reinterpret_cast<void*>(value + kCModelComplexExtensionOffset));
+  if (value > kCModelComplexExtensionOffset)
+    fn(reinterpret_cast<void*>(value - kCModelComplexExtensionOffset));
+}
+
+void* TryCanonicalRuntimeModelPtr(void* candidate) {
+  void* resolved = nullptr;
+  ForEachRuntimeModelAlias(candidate, [&](void* alias) {
+    if (resolved == nullptr && LooksLikeRuntimeModelPtr(alias))
+      resolved = alias;
+  });
+  return resolved;
+}
+
 void *TryReadRuntimeModelFromSprite(void *spritePtr) {
   void *runtimeModelPtr = nullptr;
   if (!spritePtr)
     return nullptr;
   if (!dxvk::war3::SafeReadPtrFast(spritePtr, dxvk::war3::CSpriteOffsets::Model,
-                                   runtimeModelPtr) ||
-      !LooksLikeRuntimeModelPtr(runtimeModelPtr))
+                                   runtimeModelPtr))
     return nullptr;
-  return runtimeModelPtr;
+  return TryCanonicalRuntimeModelPtr(runtimeModelPtr);
 }
 
 bool IsObviouslyInvalidRuntimeModelForRenderable(
@@ -141,7 +431,7 @@ bool IsObviouslyInvalidRuntimeModelForRenderable(
     void* spritePtr, void* renderablePart, void* meshData) {
   if (runtimeModelPtr == nullptr)
     return true;
-  if (LooksLikeRuntimeModelPtr(runtimeModelPtr))
+  if (TryCanonicalRuntimeModelPtr(runtimeModelPtr) != nullptr)
     return false;
   return runtimeModelPtr == worldObjectEntry || runtimeModelPtr == sceneNode ||
          runtimeModelPtr == spritePtr || runtimeModelPtr == renderablePart ||
@@ -165,6 +455,84 @@ void SanitizeRuntimeModelPtrForRecord(VisibleRenderableRecord& record) {
   record.runtimeModelPtr = nullptr;
 }
 
+void BackfillIdentityFromRuntimeModel(VisibleRenderableRecord& record) {
+  if (record.runtimeModelPtr == nullptr)
+    return;
+
+  if (void* canonicalRuntimeModel = TryCanonicalRuntimeModelPtr(
+          record.runtimeModelPtr)) {
+    record.runtimeModelPtr = canonicalRuntimeModel;
+  } else {
+    return;
+  }
+
+  auto& instanceRegistry = model::ModelInstanceRegistry::instance();
+  auto& shadowRegistry = ShadowObjectRegistry::instance();
+
+  model::ModelInstanceRecord instanceRecord = {};
+  bool hasInstanceRecord = false;
+  ForEachRuntimeModelAlias(record.runtimeModelPtr, [&](void* alias) {
+    if (hasInstanceRecord)
+      return;
+    hasInstanceRecord =
+        instanceRegistry.findByRuntimeModel(alias, instanceRecord) ||
+        instanceRegistry.findOwnerByRuntimeModel(alias, instanceRecord);
+  });
+  if (hasInstanceRecord) {
+    if (record.identity.worldObjectEntry == nullptr)
+      record.identity.worldObjectEntry = instanceRecord.worldObjectEntry;
+    if (record.sceneNode == nullptr)
+      record.sceneNode = instanceRecord.sceneNode;
+    if (record.identity.sceneNode == nullptr)
+      record.identity.sceneNode = instanceRecord.sceneNode;
+    if (record.identity.unitPtr == nullptr)
+      record.identity.unitPtr = instanceRecord.unitPtr;
+    if (record.identity.jHandle == 0u)
+      record.identity.jHandle = instanceRecord.jHandle;
+    if (record.identity.rawcode == 0u)
+      record.identity.rawcode = instanceRecord.rawcode;
+    if (record.modelResourcePtr == nullptr)
+      record.modelResourcePtr = instanceRecord.modelResourcePtr;
+    if (record.modelKey == 0u)
+      record.modelKey = instanceRecord.modelKey;
+    if (record.identity.kind == ObjectKind::Unknown &&
+        (instanceRecord.unitPtr != nullptr || instanceRecord.jHandle != 0u ||
+         instanceRecord.rawcode != 0u)) {
+      record.identity.kind = ObjectKind::Unit;
+    }
+  }
+
+  ShadowObjectRecord shadowRecord = {};
+  bool hasShadowRecord = false;
+  ForEachRuntimeModelAlias(record.runtimeModelPtr, [&](void* alias) {
+    if (!hasShadowRecord)
+      hasShadowRecord = shadowRegistry.findByRuntimeModel(alias, shadowRecord);
+  });
+  if (!hasShadowRecord)
+    return;
+
+  if (record.identity.worldObjectEntry == nullptr)
+    record.identity.worldObjectEntry = shadowRecord.worldObjectEntry;
+  if (record.sceneNode == nullptr)
+    record.sceneNode = shadowRecord.sceneNode;
+  if (record.identity.sceneNode == nullptr)
+    record.identity.sceneNode = shadowRecord.sceneNode;
+  if (record.identity.unitPtr == nullptr)
+    record.identity.unitPtr = shadowRecord.unitPtr;
+  if (record.identity.jHandle == 0u)
+    record.identity.jHandle = shadowRecord.jHandle;
+  if (record.identity.rawcode == 0u)
+    record.identity.rawcode = shadowRecord.rawcode;
+  if (record.modelResourcePtr == nullptr)
+    record.modelResourcePtr = shadowRecord.modelResourcePtr;
+  if (record.modelKey == 0u)
+    record.modelKey = shadowRecord.modelKey;
+  if (record.identity.kind == ObjectKind::Unknown &&
+      shadowRecord.kind != ObjectKind::Unknown) {
+    record.identity.kind = shadowRecord.kind;
+  }
+}
+
 void* TryReadRuntimeModelFromPointerWindow(void* owner, size_t maxOffset) {
   if (owner == nullptr)
     return nullptr;
@@ -176,8 +544,8 @@ void* TryReadRuntimeModelFromPointerWindow(void* owner, size_t maxOffset) {
         candidate == nullptr) {
       continue;
     }
-    if (LooksLikeRuntimeModelPtr(candidate))
-      return candidate;
+    if (void* runtimeModelPtr = TryCanonicalRuntimeModelPtr(candidate))
+      return runtimeModelPtr;
   }
 
   return nullptr;
@@ -192,8 +560,8 @@ void* TryReadRuntimeModelFromMeshData(void* meshData) {
           meshData, dxvk::war3::MeshDataOffsets::TransformOrPoseCtx,
           poseOrTransformCtx) &&
       poseOrTransformCtx != nullptr) {
-    if (LooksLikeRuntimeModelPtr(poseOrTransformCtx))
-      return poseOrTransformCtx;
+    if (void* runtimeModelPtr = TryCanonicalRuntimeModelPtr(poseOrTransformCtx))
+      return runtimeModelPtr;
 
     // Render-dispatch MeshData usually points at a small pose/transform context
     // rather than CModel directly.  Keep this to a tight pointer window so the
@@ -217,8 +585,8 @@ void* TryReadRuntimeModelFromMeshData(void* meshData) {
         candidate == nullptr) {
       continue;
     }
-    if (LooksLikeRuntimeModelPtr(candidate))
-      return candidate;
+    if (void* runtimeModelPtr = TryCanonicalRuntimeModelPtr(candidate))
+      return runtimeModelPtr;
   }
 
   return nullptr;
@@ -636,7 +1004,8 @@ void ResolveModelMetadata(const RenderObjectIdentitySnapshot &identity,
   auto tryDirectRuntimeModel = [&](void* candidatePtr) {
     if (candidatePtr == nullptr || outRuntimeModelPtr != nullptr)
       return;
-    if (!LooksLikeRuntimeModelPtr(candidatePtr))
+    candidatePtr = TryCanonicalRuntimeModelPtr(candidatePtr);
+    if (candidatePtr == nullptr)
       return;
     outRuntimeModelPtr = candidatePtr;
   };
@@ -1084,6 +1453,22 @@ void FinalizeVisibleRecord(VisibleRenderableRegistry::Snapshot &snap,
 
 } // namespace
 
+uint64_t VisibleRenderableRegistry::computeShadowManifestObjectKey(
+    const CurrentDrawContractRecord& record) {
+  if (uint64_t key = HashTaggedU32(0x72110002u, record.jHandle))
+    return key;
+  if (uint64_t key = HashTaggedPtr(0x72110001u, record.unitPtr))
+    return key;
+  if (uint64_t key = HashTaggedPtr(0x72110003u, record.worldObjectEntry))
+    return key;
+  return HashTaggedPtr(0x72110004u, record.sceneNode);
+}
+
+uint64_t VisibleRenderableRegistry::computeShadowManifestPartKey(
+    const CurrentDrawContractRecord& record) {
+  return ShadowManifestPartKey(record, computeShadowManifestObjectKey(record));
+}
+
 VisibleRenderableRegistry &VisibleRenderableRegistry::instance() {
   static VisibleRenderableRegistry *s_instance = new VisibleRenderableRegistry();
   return *s_instance;
@@ -1108,8 +1493,20 @@ void VisibleRenderableRegistry::appendRecord(Snapshot &snap,
                     kWar3RuntimeConfigMaintainSemanticVisibleHotLookupIndexes) {
     if (record.payload != nullptr)
       snap.byPayload[record.payload] = index;
-    if (record.renderablePart != nullptr)
+    if (record.renderablePart != nullptr) {
       snap.byRenderablePart[record.renderablePart] = index;
+      snap.renderablePartRecordCount[record.renderablePart]++;
+      const uint64_t partLayerKey =
+          VisibleRenderablePartLayerKey(record.renderablePart,
+                                        record.layerIndex);
+      const auto existing = snap.byRenderablePartLayer.find(partLayerKey);
+      if (existing == snap.byRenderablePartLayer.end() ||
+          existing->second >= snap.records.size() ||
+          snap.records[existing->second].queueKind !=
+              VisibleRenderableQueueKind::MainQueue) {
+        snap.byRenderablePartLayer[partLayerKey] = index;
+      }
+    }
     if (record.identity.worldObjectEntry != nullptr)
       snap.byWorldObjectEntry[record.identity.worldObjectEntry] = index;
     if (record.identity.jHandle != 0u)
@@ -1125,6 +1522,27 @@ void VisibleRenderableRegistry::appendRecord(Snapshot &snap,
     if (record.runtimeGeosetDataPtr != nullptr)
       snap.byRuntimeGeosetData[record.runtimeGeosetDataPtr] = index;
   }
+  if constexpr (dxvk::war3::internal::
+                    kWar3RuntimeConfigDeferSemanticVisibleIndexBuild &&
+                !dxvk::war3::internal::
+                    kWar3RuntimeConfigMaintainSemanticVisibleHotLookupIndexes &&
+                !dxvk::war3::internal::
+                    kWar3RuntimeConfigBuildSemanticVisibleIndexesAtEndFrame) {
+    if (record.renderablePart != nullptr) {
+      snap.byRenderablePart[record.renderablePart] = index;
+      snap.renderablePartRecordCount[record.renderablePart]++;
+      const uint64_t partLayerKey =
+          VisibleRenderablePartLayerKey(record.renderablePart,
+                                        record.layerIndex);
+      const auto existing = snap.byRenderablePartLayer.find(partLayerKey);
+      if (existing == snap.byRenderablePartLayer.end() ||
+          existing->second >= snap.records.size() ||
+          snap.records[existing->second].queueKind !=
+              VisibleRenderableQueueKind::MainQueue) {
+        snap.byRenderablePartLayer[partLayerKey] = index;
+      }
+    }
+  }
 
   if (record.queueKind == VisibleRenderableQueueKind::Transparent)
     ++snap.transparentCount;
@@ -1139,6 +1557,8 @@ void RebuildVisibleSnapshotIndexes(VisibleRenderableRegistry::Snapshot &snap) {
 
   snap.byPayload.clear();
   snap.byRenderablePart.clear();
+  snap.byRenderablePartLayer.clear();
+  snap.renderablePartRecordCount.clear();
   snap.byWorldObjectEntry.clear();
   snap.byHandle.clear();
   snap.bySceneNode.clear();
@@ -1151,6 +1571,8 @@ void RebuildVisibleSnapshotIndexes(VisibleRenderableRegistry::Snapshot &snap) {
 
   snap.byPayload.reserve(recordCount);
   snap.byRenderablePart.reserve(recordCount);
+  snap.byRenderablePartLayer.reserve(recordCount);
+  snap.renderablePartRecordCount.reserve(recordCount);
   snap.byWorldObjectEntry.reserve(recordCount);
   snap.byHandle.reserve(recordCount);
   snap.bySceneNode.reserve(recordCount);
@@ -1163,8 +1585,20 @@ void RebuildVisibleSnapshotIndexes(VisibleRenderableRegistry::Snapshot &snap) {
     const VisibleRenderableRecord &record = snap.records[index];
     if (record.payload != nullptr)
       snap.byPayload[record.payload] = index;
-    if (record.renderablePart != nullptr)
+    if (record.renderablePart != nullptr) {
       snap.byRenderablePart[record.renderablePart] = index;
+      snap.renderablePartRecordCount[record.renderablePart]++;
+      const uint64_t partLayerKey =
+          VisibleRenderablePartLayerKey(record.renderablePart,
+                                        record.layerIndex);
+      const auto existing = snap.byRenderablePartLayer.find(partLayerKey);
+      if (existing == snap.byRenderablePartLayer.end() ||
+          existing->second >= snap.records.size() ||
+          snap.records[existing->second].queueKind !=
+              VisibleRenderableQueueKind::MainQueue) {
+        snap.byRenderablePartLayer[partLayerKey] = index;
+      }
+    }
     if (record.identity.worldObjectEntry != nullptr)
       snap.byWorldObjectEntry[record.identity.worldObjectEntry] = index;
     if (record.identity.jHandle != 0u)
@@ -1245,6 +1679,28 @@ void HydrateVisibleSnapshotBasicFields(VisibleRenderableRegistry::Snapshot &snap
       if (record.meshData == nullptr && record.renderablePart == nullptr)
         continue;
 
+      const bool needsUnitIdentityBackfill =
+          record.identity.kind != ObjectKind::Unit &&
+          record.identity.unitPtr == nullptr &&
+          record.identity.jHandle == 0u &&
+          record.identity.rawcode == 0u &&
+          record.sceneNode != nullptr;
+      if (needsUnitIdentityBackfill &&
+          (record.runtimeModelPtr == nullptr ||
+           record.modelResourcePtr == nullptr || record.modelKey == 0u)) {
+        ResolveModelMetadata(record.identity, record.sceneNode,
+                             record.renderablePart, record.meshData,
+                             record.runtimeModelPtr, record.modelResourcePtr,
+                             record.modelKey);
+        SanitizeRuntimeModelPtrForRecord(record);
+      }
+      if (record.identity.kind == ObjectKind::Unknown ||
+          record.identity.unitPtr == nullptr ||
+          record.identity.jHandle == 0u ||
+          record.identity.rawcode == 0u) {
+        BackfillIdentityFromRuntimeModel(record);
+      }
+
       const bool unitLike =
           record.identity.kind == ObjectKind::Unit ||
           record.identity.unitPtr != nullptr ||
@@ -1259,6 +1715,10 @@ void HydrateVisibleSnapshotBasicFields(VisibleRenderableRegistry::Snapshot &snap
       const void* beforeGeoset = record.runtimeGeosetPtr;
       const void* beforeGeosetData = record.runtimeGeosetDataPtr;
       const uint32_t beforeGeosetIndex = record.geosetIndex;
+      const bool missingGeosetMetadata =
+          record.runtimeGeosetPtr == nullptr ||
+          record.runtimeGeosetDataPtr == nullptr ||
+          record.geosetIndex == model::kInvalidShadowGeosetIndex;
 
       if (record.runtimeModelPtr == nullptr ||
           record.modelResourcePtr == nullptr || record.modelKey == 0u) {
@@ -1269,10 +1729,12 @@ void HydrateVisibleSnapshotBasicFields(VisibleRenderableRegistry::Snapshot &snap
         SanitizeRuntimeModelPtrForRecord(record);
       }
 
-      ResolveGeosetMetadata(record);
-      if (ResolveRuntimeOwnerFromGeosetBinding(record)) {
-        SanitizeRuntimeModelPtrForRecord(record);
+      if (missingGeosetMetadata) {
         ResolveGeosetMetadata(record);
+        if (ResolveRuntimeOwnerFromGeosetBinding(record)) {
+          SanitizeRuntimeModelPtrForRecord(record);
+          ResolveGeosetMetadata(record);
+        }
       }
 
       changed |= beforeRuntime != record.runtimeModelPtr ||
@@ -1383,6 +1845,12 @@ void VisibleRenderableRegistry::beginFrame() {
   snap.records.clear();
   snap.mainQueueCount = 0;
   snap.transparentCount = 0;
+  snap.mainQueueRangeCallCount = 0u;
+  snap.mainQueueRangeRecordCount = 0u;
+  snap.semanticCandidateCallCount = 0u;
+  snap.semanticCandidateMergedCount = 0u;
+  snap.semanticCandidateAppendedCount = 0u;
+  snap.transparentEntryCallCount = 0u;
   if (reserveRecord)
     snap.records.reserve(reserveRecord);
 
@@ -1395,6 +1863,10 @@ void VisibleRenderableRegistry::beginFrame() {
   if constexpr (kMaintainIndexes) {
     const size_t reservePayload = snap.lastPayloadCount;
     const size_t reserveRenderablePart = snap.lastRenderablePartCount;
+    const size_t reserveRenderablePartLayer =
+        snap.lastRenderablePartLayerCount;
+    const size_t reserveRenderablePartRecord =
+        snap.lastRenderablePartRecordCount;
     const size_t reserveWorldObject = snap.lastWorldObjectCount;
     const size_t reserveHandle = snap.lastHandleCount;
     const size_t reserveSceneNode = snap.lastSceneNodeCount;
@@ -1406,6 +1878,8 @@ void VisibleRenderableRegistry::beginFrame() {
 
     snap.byPayload.clear();
     snap.byRenderablePart.clear();
+    snap.byRenderablePartLayer.clear();
+    snap.renderablePartRecordCount.clear();
     snap.byWorldObjectEntry.clear();
     snap.byHandle.clear();
     snap.bySceneNode.clear();
@@ -1419,6 +1893,10 @@ void VisibleRenderableRegistry::beginFrame() {
       snap.byPayload.reserve(reservePayload);
     if (reserveRenderablePart)
       snap.byRenderablePart.reserve(reserveRenderablePart);
+    if (reserveRenderablePartLayer)
+      snap.byRenderablePartLayer.reserve(reserveRenderablePartLayer);
+    if (reserveRenderablePartRecord)
+      snap.renderablePartRecordCount.reserve(reserveRenderablePartRecord);
     if (reserveWorldObject)
       snap.byWorldObjectEntry.reserve(reserveWorldObject);
     if (reserveHandle)
@@ -1436,12 +1914,28 @@ void VisibleRenderableRegistry::beginFrame() {
     if (reserveModelMetadata)
       snap.modelMetadataBySceneNode.reserve(reserveModelMetadata);
   } else {
-    // 当前数据层性能模式不维护多索引表，避免每帧 clear/reserve 多张
-    // unordered_map。少量查询由 query* 的线性兜底处理。
+    // 当前数据层性能模式不维护全量多索引表，避免每帧
+    // clear/reserve 多张 unordered_map。保留 renderablePart/layer 热索引，
+    // 因为 direct shadow path 会高频使用它来避免 slice 串线。
+    const size_t reserveRenderablePart = snap.lastRenderablePartCount;
+    const size_t reserveRenderablePartLayer =
+        snap.lastRenderablePartLayerCount;
+    const size_t reserveRenderablePartRecord =
+        snap.lastRenderablePartRecordCount;
     if (!snap.byPayload.empty())
       snap.byPayload.clear();
     if (!snap.byRenderablePart.empty())
       snap.byRenderablePart.clear();
+    if (!snap.byRenderablePartLayer.empty())
+      snap.byRenderablePartLayer.clear();
+    if (!snap.renderablePartRecordCount.empty())
+      snap.renderablePartRecordCount.clear();
+    if (reserveRenderablePart)
+      snap.byRenderablePart.reserve(reserveRenderablePart);
+    if (reserveRenderablePartLayer)
+      snap.byRenderablePartLayer.reserve(reserveRenderablePartLayer);
+    if (reserveRenderablePartRecord)
+      snap.renderablePartRecordCount.reserve(reserveRenderablePartRecord);
     if (!snap.byWorldObjectEntry.empty())
       snap.byWorldObjectEntry.clear();
     if (!snap.byHandle.empty())
@@ -1471,6 +1965,8 @@ void VisibleRenderableRegistry::endFrame() {
   snap.lastRecordCount = snap.records.size();
   snap.lastPayloadCount = snap.byPayload.size();
   snap.lastRenderablePartCount = snap.byRenderablePart.size();
+  snap.lastRenderablePartLayerCount = snap.byRenderablePartLayer.size();
+  snap.lastRenderablePartRecordCount = snap.renderablePartRecordCount.size();
   snap.lastWorldObjectCount = snap.byWorldObjectEntry.size();
   snap.lastHandleCount = snap.byHandle.size();
   snap.lastSceneNodeCount = snap.bySceneNode.size();
@@ -1488,7 +1984,9 @@ void VisibleRenderableRegistry::endFrame() {
     dxvk::war3dbg::Print(
         "DXVK VisibleManifest: frame=%llu total=%zu main=%zu transparent=%zu "
         "payload=%zu part=%zu entry=%zu handle=%zu scene=%zu mesh=%zu "
-        "runtime=%zu rtGeo=%zu rtGeoData=%zu\n",
+        "runtime=%zu rtGeo=%zu rtGeoData=%zu ranges=%llu rangeRecords=%llu "
+        "semanticCalls=%llu semanticMerged=%llu semanticAppended=%llu "
+        "transparentCalls=%llu\n",
         static_cast<unsigned long long>(
             m_frameNumber.load(std::memory_order_relaxed)),
         snap.records.size(), snap.mainQueueCount, snap.transparentCount,
@@ -1496,7 +1994,13 @@ void VisibleRenderableRegistry::endFrame() {
         snap.byWorldObjectEntry.size(), snap.byHandle.size(),
         snap.bySceneNode.size(), snap.byMeshData.size(),
         snap.byRuntimeModel.size(), snap.byRuntimeGeoset.size(),
-        snap.byRuntimeGeosetData.size());
+        snap.byRuntimeGeosetData.size(),
+        static_cast<unsigned long long>(snap.mainQueueRangeCallCount),
+        static_cast<unsigned long long>(snap.mainQueueRangeRecordCount),
+        static_cast<unsigned long long>(snap.semanticCandidateCallCount),
+        static_cast<unsigned long long>(snap.semanticCandidateMergedCount),
+        static_cast<unsigned long long>(snap.semanticCandidateAppendedCount),
+        static_cast<unsigned long long>(snap.transparentEntryCallCount));
   }
 }
 
@@ -1514,7 +2018,10 @@ void VisibleRenderableRegistry::registerMainQueueRange(
   if (!batchArray || after <= before)
     return;
 
+  m_renderThreadId = std::this_thread::get_id();
   Snapshot &snap = writeSnapshot();
+  snap.mainQueueRangeCallCount++;
+  snap.mainQueueRangeRecordCount += uint64_t(after - before);
   snap.records.reserve(snap.records.size() + (after - before));
   if constexpr (!dxvk::war3::internal::
                     kWar3RuntimeConfigDeferSemanticVisibleIndexBuild ||
@@ -1605,7 +2112,9 @@ bool VisibleRenderableRegistry::registerSemanticCandidate(
     return false;
   }
 
+  m_renderThreadId = std::this_thread::get_id();
   Snapshot &snap = writeSnapshot();
+  snap.semanticCandidateCallCount++;
   auto canMergeVisibleSubpart =
       [](const VisibleRenderableRecord& existing,
          const VisibleRenderableRecord& incoming) {
@@ -1739,27 +2248,35 @@ bool VisibleRenderableRegistry::registerSemanticCandidate(
       const auto& existing = snap.records[index];
       if (candidate.renderablePart != nullptr &&
           existing.renderablePart == candidate.renderablePart) {
-        if (mergeCandidateIntoExisting(index))
+        if (mergeCandidateIntoExisting(index)) {
+          snap.semanticCandidateMergedCount++;
           return true;
+        }
         continue;
       }
       if (candidate.payload != nullptr && existing.payload == candidate.payload) {
-        if (mergeCandidateIntoExisting(index))
+        if (mergeCandidateIntoExisting(index)) {
+          snap.semanticCandidateMergedCount++;
           return true;
+        }
         continue;
       }
       if (candidate.renderablePart == nullptr && candidate.payload == nullptr &&
           candidate.runtimeGeosetPtr != nullptr &&
           existing.runtimeGeosetPtr == candidate.runtimeGeosetPtr) {
-        if (mergeCandidateIntoExisting(index))
+        if (mergeCandidateIntoExisting(index)) {
+          snap.semanticCandidateMergedCount++;
           return true;
+        }
         continue;
       }
       if (candidate.renderablePart == nullptr && candidate.payload == nullptr &&
           candidate.runtimeGeosetDataPtr != nullptr &&
           existing.runtimeGeosetDataPtr == candidate.runtimeGeosetDataPtr) {
-        if (mergeCandidateIntoExisting(index))
+        if (mergeCandidateIntoExisting(index)) {
+          snap.semanticCandidateMergedCount++;
           return true;
+        }
         continue;
       }
     }
@@ -1769,34 +2286,43 @@ bool VisibleRenderableRegistry::registerSemanticCandidate(
             snap.byRenderablePart.end()) {
       if (mergeCandidateIntoExisting(
               snap.byRenderablePart[candidate.renderablePart])) {
+        snap.semanticCandidateMergedCount++;
         return true;
       }
     }
     if (candidate.payload != nullptr &&
         snap.byPayload.find(candidate.payload) != snap.byPayload.end()) {
-      if (mergeCandidateIntoExisting(snap.byPayload[candidate.payload]))
+      if (mergeCandidateIntoExisting(snap.byPayload[candidate.payload])) {
+        snap.semanticCandidateMergedCount++;
         return true;
+      }
     }
     if (candidate.renderablePart == nullptr && candidate.payload == nullptr &&
         candidate.runtimeGeosetPtr != nullptr &&
         snap.byRuntimeGeoset.find(candidate.runtimeGeosetPtr) !=
             snap.byRuntimeGeoset.end()) {
-      mergeCandidateIntoExisting(snap.byRuntimeGeoset[candidate.runtimeGeosetPtr]);
-      return true;
+      if (mergeCandidateIntoExisting(
+              snap.byRuntimeGeoset[candidate.runtimeGeosetPtr])) {
+        snap.semanticCandidateMergedCount++;
+        return true;
+      }
     }
     if (candidate.renderablePart == nullptr && candidate.payload == nullptr &&
         candidate.runtimeGeosetDataPtr != nullptr &&
         snap.byRuntimeGeosetData.find(candidate.runtimeGeosetDataPtr) !=
             snap.byRuntimeGeosetData.end()) {
-      mergeCandidateIntoExisting(
-          snap.byRuntimeGeosetData[candidate.runtimeGeosetDataPtr]);
-      return true;
+      if (mergeCandidateIntoExisting(
+              snap.byRuntimeGeosetData[candidate.runtimeGeosetDataPtr])) {
+        snap.semanticCandidateMergedCount++;
+        return true;
+      }
     }
   }
 
   VisibleRenderableRecord record = candidate;
   record.queueKind = VisibleRenderableQueueKind::MainQueue;
   appendRecord(snap, record);
+  snap.semanticCandidateAppendedCount++;
   return true;
 }
 
@@ -1815,7 +2341,9 @@ void VisibleRenderableRegistry::registerTransparentEntry(
   if (payload == nullptr && !identity.HasContext())
     return;
 
+  m_renderThreadId = std::this_thread::get_id();
   Snapshot &snap = writeSnapshot();
+  snap.transparentEntryCallCount++;
   snap.records.reserve(snap.records.size() + 1u);
   if constexpr (!dxvk::war3::internal::
                     kWar3RuntimeConfigDeferSemanticVisibleIndexBuild) {
@@ -1880,6 +2408,13 @@ bool VisibleRenderableRegistry::queryByRenderablePart(
   const Snapshot &snap = snapshotForThread();
   const auto it = snap.byRenderablePart.find(renderablePart);
   if (it == snap.byRenderablePart.end() || it->second >= snap.records.size()) {
+    // Phase 7.26：deferred-index 模式下若 record-count 索引里也没有对应项，
+    // 说明本帧 snapshot 根本不包含该 renderablePart，没必要再做 O(records)
+    // 全量扫描。
+    const auto countIt = snap.renderablePartRecordCount.find(renderablePart);
+    if (countIt == snap.renderablePartRecordCount.end())
+      return false;
+
     if constexpr (dxvk::war3::internal::
                       kWar3RuntimeConfigDeferSemanticVisibleIndexBuild) {
       for (const auto& record : snap.records) {
@@ -1894,6 +2429,90 @@ bool VisibleRenderableRegistry::queryByRenderablePart(
 
   out = snap.records[it->second];
   return true;
+}
+
+bool VisibleRenderableRegistry::queryByRenderablePartAndLayer(
+    void *renderablePart, uint32_t layerIndex,
+    VisibleRenderableRecord &out) const {
+  out = {};
+  if (!renderablePart)
+    return false;
+
+  const Snapshot &snap = snapshotForThread();
+  const uint64_t partLayerKey =
+      VisibleRenderablePartLayerKey(renderablePart, layerIndex);
+  const auto layerIt = snap.byRenderablePartLayer.find(partLayerKey);
+  if (layerIt != snap.byRenderablePartLayer.end() &&
+      layerIt->second < snap.records.size()) {
+    out = snap.records[layerIt->second];
+    m_shadowManifestVisibleLookupPartLayerHitCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return true;
+  }
+
+  const auto countIt = snap.renderablePartRecordCount.find(renderablePart);
+  const bool mayUseSoleFallback =
+      countIt != snap.renderablePartRecordCount.end() && countIt->second == 1u;
+  const auto partIt = snap.byRenderablePart.find(renderablePart);
+  if (mayUseSoleFallback && partIt != snap.byRenderablePart.end() &&
+      partIt->second < snap.records.size()) {
+    out = snap.records[partIt->second];
+    m_shadowManifestVisibleLookupSingleFallbackCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return true;
+  }
+
+  // Phase 7.26：当索引表不存在该 renderablePart 时，直接认定为 miss。
+  // 原本在 deferred-index 模式下会对整个 snapshot 做线性扫描，实测
+  // 热路径每帧可产生 1e4 级别全扫描。这些 miss 对 core gate 决策没有
+  // 贡献，shadow submission 已经不依赖 visible lookup 去决定 existence，
+  // 所以提前短路是安全的。
+  if (partIt == snap.byRenderablePart.end() &&
+      countIt == snap.renderablePartRecordCount.end()) {
+    m_shadowManifestVisibleLookupMissCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+
+  if constexpr (dxvk::war3::internal::
+                    kWar3RuntimeConfigDeferSemanticVisibleIndexBuild) {
+    const VisibleRenderableRecord *transparentFallback = nullptr;
+    const VisibleRenderableRecord *solePartRecord = nullptr;
+    uint32_t partRecordCount = 0u;
+    for (const auto &record : snap.records) {
+      if (record.renderablePart != renderablePart)
+        continue;
+      ++partRecordCount;
+      solePartRecord = &record;
+      if (record.layerIndex == layerIndex) {
+        if (record.queueKind == VisibleRenderableQueueKind::MainQueue) {
+          out = record;
+          m_shadowManifestVisibleLookupPartLayerHitCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          return true;
+        }
+        if (transparentFallback == nullptr)
+          transparentFallback = &record;
+      }
+    }
+
+    if (transparentFallback != nullptr) {
+      out = *transparentFallback;
+      m_shadowManifestVisibleLookupPartLayerHitCount.fetch_add(
+          1u, std::memory_order_relaxed);
+      return true;
+    }
+
+    if (partRecordCount == 1u && solePartRecord != nullptr) {
+      out = *solePartRecord;
+      m_shadowManifestVisibleLookupSingleFallbackCount.fetch_add(
+          1u, std::memory_order_relaxed);
+      return true;
+    }
+  }
+  m_shadowManifestVisibleLookupMissCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  return false;
 }
 
 bool VisibleRenderableRegistry::queryByWorldObjectEntry(
@@ -1997,6 +2616,320 @@ bool VisibleRenderableRegistry::queryByRuntimeModel(
   return true;
 }
 
+void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
+    const std::vector<CurrentDrawContractRecord>& records,
+    uint64_t frameNumber) {
+  const uint64_t frame =
+      frameNumber != 0u ? frameNumber : m_frameNumber.load(std::memory_order_relaxed);
+  ShadowManifestSummary summary = {};
+  summary.frameNumber = frame;
+
+  std::unordered_map<uint64_t, uint64_t> firstSliceByPartAnchor;
+  std::unordered_set<uint64_t> multiSlicePartAnchors;
+  std::unordered_set<uint64_t> poseFreshObjects;
+  const Snapshot& visibleSnapshot = snapshotForThread();
+  (void)visibleSnapshot;  // 保留 snapshotForThread() 调用以维持内部快照确认
+  firstSliceByPartAnchor.reserve(records.size());
+  multiSlicePartAnchors.reserve(records.size() / 2u + 1u);
+  poseFreshObjects.reserve(records.size());
+
+  // Phase 7.26：runtimeModelPtr 只在 pose restore/pose 诊断开启时才会被后续
+  // 读取。refresh 阶段的 ResolveRuntimeModelForCurrentDrawRecord 是
+  // O(snapshot.records) 扫描，在 dynamic_shadow_pressure 下占 Populate 主要
+  // CPU。默认 release 下跳过这一步，manifest entry 的 runtimeModelPtr
+  // 保持 nullptr，并由 cModelPoseNoRuntimeCount 显式反映该状态。
+  const bool allowResolveRuntimeModel =
+      War3SemanticShadowManifestCModelPoseProbeAllowed();
+  auto resolveRuntimeModelSafely =
+      [&](const CurrentDrawContractRecord& record) -> void* {
+    if (!allowResolveRuntimeModel)
+      return nullptr;
+    return ResolveRuntimeModelForCurrentDrawRecord(visibleSnapshot, record);
+  };
+
+  for (const auto& record : records) {
+    const uint64_t objectKey = ShadowManifestObjectKey(record);
+    if (objectKey == 0u)
+      continue;
+    poseFreshObjects.insert(objectKey);
+
+    auto objectIt = m_shadowManifestObjects.find(objectKey);
+    if (objectIt == m_shadowManifestObjects.end()) {
+      ShadowManifestObjectEntry entry = {};
+      entry.key = objectKey;
+      entry.firstSeenFrame = frame;
+      entry.lastSeenFrame = frame;
+      entry.observedFrameCount = 1u;
+      objectIt = m_shadowManifestObjects.emplace(objectKey, entry).first;
+      ++summary.newObjectCount;
+    } else {
+      auto& entry = objectIt->second;
+      if (entry.lastSeenFrame != frame)
+        ++entry.observedFrameCount;
+      entry.lastSeenFrame = frame;
+    }
+
+    const uint64_t partKey = ShadowManifestPartKey(record, objectKey);
+    if (partKey == 0u)
+      continue;
+
+    auto partIt = m_shadowManifestParts.find(partKey);
+    if (partIt == m_shadowManifestParts.end()) {
+      ShadowManifestPartEntry entry = {};
+      entry.key = partKey;
+      entry.objectKey = objectKey;
+      entry.firstSeenFrame = frame;
+      entry.lastSeenFrame = frame;
+      entry.lastPoseFrame = frame;
+      entry.lastSliceFrame = frame;
+      entry.lastGoodPacketFrame = 0u;
+      entry.renderablePart = record.renderablePart;
+      entry.sceneNode = record.sceneNode;
+      entry.runtimeModelPtr = resolveRuntimeModelSafely(record);
+      entry.layerIndex = record.layerIndex;
+      entry.payloadWord108 = record.payloadWord108;
+      entry.lastPayloadWord11C = record.payloadWord11C;
+      entry.observedFrameCount = 1u;
+      partIt = m_shadowManifestParts.emplace(partKey, entry).first;
+      // Phase 7.31 Iteration G 回退：sibling propagation 已默认关闭，
+      // 反向索引维护无收益但有插入/擦除开销，撤回索引维护。
+    } else {
+      auto& entry = partIt->second;
+      if (entry.lastSeenFrame != frame)
+        ++entry.observedFrameCount;
+      if (entry.lastPayloadWord11C != record.payloadWord11C)
+        ++summary.payload11CChurnCount;
+      if (entry.renderablePart != nullptr && record.renderablePart != nullptr &&
+          entry.renderablePart != record.renderablePart) {
+        ++summary.renderablePartChurnCount;
+        ++entry.renderablePartChurnCount;
+      }
+      entry.lastSeenFrame = frame;
+      entry.lastPoseFrame = frame;
+      entry.lastSliceFrame = frame;
+      entry.renderablePart = record.renderablePart;
+      entry.sceneNode = record.sceneNode;
+      if (void* runtimeModelPtr = resolveRuntimeModelSafely(record))
+        entry.runtimeModelPtr = runtimeModelPtr;
+      entry.layerIndex = record.layerIndex;
+      entry.payloadWord108 = record.payloadWord108;
+      entry.lastPayloadWord11C = record.payloadWord11C;
+    }
+
+    const uint64_t partAnchorKey =
+        ShadowManifestPartAnchorKey(record, objectKey);
+    if (partAnchorKey != 0u) {
+      const uint64_t sliceKey = ShadowManifestSliceKey(record);
+      const auto inserted =
+          firstSliceByPartAnchor.emplace(partAnchorKey, sliceKey);
+      if (!inserted.second && inserted.first->second != sliceKey)
+        multiSlicePartAnchors.insert(partAnchorKey);
+    }
+  }
+
+  if (!poseFreshObjects.empty()) {
+    // Phase 7.31 Iteration G：用"只对 sibling 少的 object 做 propagation"降本。
+    // 由于撤回了 objectKey→partKey 反向索引，这里回退到全表扫描。
+    // 但只在 poseFreshObjects 非空时才扫描，且检查 entry.objectKey 是否在 set 里。
+    for (auto& [_, entry] : m_shadowManifestParts) {
+      if (poseFreshObjects.find(entry.objectKey) != poseFreshObjects.end())
+        entry.lastPoseFrame = (std::max)(entry.lastPoseFrame, frame);
+    }
+  }
+
+  for (auto it = m_shadowManifestObjects.begin();
+       it != m_shadowManifestObjects.end();) {
+    const uint64_t lastSeen = it->second.lastSeenFrame;
+    if (frame > lastSeen &&
+        frame - lastSeen > kShadowManifestStructureTtlFrames) {
+      it = m_shadowManifestObjects.erase(it);
+      ++summary.expiredObjectCount;
+    } else {
+      ++summary.objectCount;
+      if (it->second.observedFrameCount >= 2u)
+        ++summary.stableObjectCount;
+      ++it;
+    }
+  }
+
+  for (auto it = m_shadowManifestParts.begin();
+       it != m_shadowManifestParts.end();) {
+    const uint64_t lastSeen = it->second.lastSeenFrame;
+    if (frame > lastSeen &&
+        frame - lastSeen > kShadowManifestStructureTtlFrames) {
+      it = m_shadowManifestParts.erase(it);
+      ++summary.expiredPartCount;
+    } else {
+      auto& entry = it->second;
+      ++summary.partCount;
+      if (entry.lastSeenFrame == frame) {
+        ++summary.freshPartCount;
+      } else {
+        const uint64_t packetAge =
+            frame > entry.lastGoodPacketFrame
+                ? frame - entry.lastGoodPacketFrame
+                : 0u;
+        if (entry.lastGoodPacketFrame != 0u &&
+            packetAge <= kShadowManifestLastGoodPacketTtlFrames)
+          ++summary.leaseablePartCount;
+      }
+
+      const uint64_t poseAge =
+          frame > entry.lastPoseFrame ? frame - entry.lastPoseFrame : 0u;
+      if (poseAge > kShadowManifestSkinnedPoseTtlFrames) {
+        ++summary.poseStalePartCount;
+        if (entry.runtimeModelPtr == nullptr) {
+          ++summary.cModelPoseNoRuntimeCount;
+        } else if (!War3SemanticShadowManifestCModelPoseProbeAllowed()) {
+          // Phase 7.26：默认 release 配置下不做每帧 pose hash，避免对每个 stale
+          // part 做一次 12KB 级别的内存扫描。只有显式开启 restore 或诊断才进入。
+          ++summary.cModelPoseNoRuntimeCount;
+        } else {
+          uint32_t matrixCount = 0u;
+          uint64_t matrixHash = 0u;
+          if (TryProbeLiveCModelPose(entry.runtimeModelPtr, matrixCount,
+                                     matrixHash)) {
+            ++summary.cModelPoseHitCount;
+            summary.cModelPoseLastRuntimeModelPtr =
+                uint64_t(reinterpret_cast<uintptr_t>(entry.runtimeModelPtr));
+            summary.cModelPoseLastMatrixCount = matrixCount;
+            summary.cModelPoseLastMatrixHash = matrixHash;
+          } else {
+            ++summary.cModelPoseMissCount;
+          }
+        }
+      }
+
+      const uint64_t sliceAge =
+          frame > entry.lastSliceFrame ? frame - entry.lastSliceFrame : 0u;
+      if (sliceAge > kShadowManifestSliceTtlFrames)
+        ++summary.sliceStalePartCount;
+      ++it;
+    }
+  }
+
+  summary.multiSlicePartCount = multiSlicePartAnchors.size();
+  summary.visibleLookupPartLayerHitCount =
+      m_shadowManifestVisibleLookupPartLayerHitCount.load(
+          std::memory_order_relaxed);
+  summary.visibleLookupSingleFallbackCount =
+      m_shadowManifestVisibleLookupSingleFallbackCount.load(
+          std::memory_order_relaxed);
+  summary.visibleLookupMissCount =
+      m_shadowManifestVisibleLookupMissCount.load(std::memory_order_relaxed);
+  m_shadowManifestSummary = summary;
+}
+
+void VisibleRenderableRegistry::noteShadowManifestPartGoodPacket(
+    uint64_t partKey, uint64_t frameNumber) {
+  if (partKey == 0u)
+    return;
+
+  auto it = m_shadowManifestParts.find(partKey);
+  if (it == m_shadowManifestParts.end())
+    return;
+
+  const uint64_t frame =
+      frameNumber != 0u ? frameNumber : m_frameNumber.load(std::memory_order_relaxed);
+  auto& entry = it->second;
+  entry.lastGoodPacketFrame = frame;
+  entry.lastPoseFrame = (std::max)(entry.lastPoseFrame, frame);
+
+  // Phase 7.31 Iteration G：sibling propagation 默认关闭。
+  // benchmark 下每帧 20K+ 次调用是 Populate 瓶颈之一；Iter B 关闭 stale
+  // restore 后，sibling pose-fresh 保守一点只是让 lease 更不容易命中，
+  // 这是可接受的（live pose 本来就 fresh）。
+  // 保留 env var 开关便于 A/B 复核。
+  static const bool s_siblingPropEnabled =
+      []() {
+        const char* env = std::getenv(
+            "DXVK_WAR3_SEMANTIC_MANIFEST_SIBLING_POSE_PROPAGATION");
+        return env != nullptr && env[0] == '1';
+      }();
+  if (!s_siblingPropEnabled)
+    return;
+  // Pose/palette evidence is object-wide for War3 skinned geosets. Propagating
+  // only the frame number lets sibling parts satisfy pose freshness.
+  // 注：此处回退到线性扫描；benchmark 下仍有性能代价，但 env=0 时已早退。
+  const uint64_t objectKey = entry.objectKey;
+  if (objectKey == 0u)
+    return;
+  for (auto& [otherKey, otherEntry] : m_shadowManifestParts) {
+    if (otherKey == partKey || otherEntry.objectKey != objectKey)
+      continue;
+    otherEntry.lastPoseFrame = (std::max)(otherEntry.lastPoseFrame, frame);
+  }
+}
+
+VisibleRenderableRegistry::ShadowManifestPartLeaseInfo
+VisibleRenderableRegistry::queryShadowManifestPartLeaseInfo(
+    uint64_t partKey, uint64_t frameNumber) const {
+  ShadowManifestPartLeaseInfo info = {};
+  info.partKey = partKey;
+  if (partKey == 0u)
+    return info;
+
+  const auto it = m_shadowManifestParts.find(partKey);
+  if (it == m_shadowManifestParts.end())
+    return info;
+
+  const uint64_t frame =
+      frameNumber != 0u ? frameNumber : m_frameNumber.load(std::memory_order_relaxed);
+  const auto& entry = it->second;
+  info.found = true;
+  info.objectKey = entry.objectKey;
+  info.lastSeenFrame = entry.lastSeenFrame;
+  info.lastPoseFrame = entry.lastPoseFrame;
+  info.lastSliceFrame = entry.lastSliceFrame;
+  info.lastGoodPacketFrame = entry.lastGoodPacketFrame;
+  info.runtimeModelPtr = entry.runtimeModelPtr;
+  info.observedFrameCount = entry.observedFrameCount;
+  info.poseAgeFrames =
+      frame > entry.lastPoseFrame ? frame - entry.lastPoseFrame : 0u;
+  info.sliceAgeFrames =
+      frame > entry.lastSliceFrame ? frame - entry.lastSliceFrame : 0u;
+  info.packetAgeFrames =
+      entry.lastGoodPacketFrame != 0u && frame > entry.lastGoodPacketFrame
+          ? frame - entry.lastGoodPacketFrame
+          : 0u;
+  const uint64_t structureAge =
+      frame > entry.lastSeenFrame ? frame - entry.lastSeenFrame : 0u;
+  info.structureLive = structureAge <= kShadowManifestStructureTtlFrames;
+  info.poseFresh = info.poseAgeFrames <= kShadowManifestSkinnedPoseTtlFrames;
+  info.sliceFresh = info.sliceAgeFrames <= kShadowManifestSliceTtlFrames;
+  info.packetFresh =
+      entry.lastGoodPacketFrame != 0u &&
+      info.packetAgeFrames <= kShadowManifestLastGoodPacketTtlFrames;
+  if (!info.poseFresh && entry.runtimeModelPtr != nullptr &&
+      War3SemanticShadowManifestCModelPoseProbeAllowed()) {
+    uint32_t matrixCount = 0u;
+    uint64_t matrixHash = 0u;
+    if (TryProbeLiveCModelPose(entry.runtimeModelPtr, matrixCount,
+                               matrixHash)) {
+      info.cModelPoseFresh = true;
+      info.cModelPoseMatrixCount = matrixCount;
+      info.cModelPoseMatrixHash = matrixHash;
+    }
+  }
+  info.leaseable =
+      info.structureLive && info.poseFresh && info.sliceFresh && info.packetFresh;
+  return info;
+}
+
+VisibleRenderableRegistry::ShadowManifestSummary
+VisibleRenderableRegistry::queryShadowManifestSummary() const {
+  ShadowManifestSummary summary = m_shadowManifestSummary;
+  summary.visibleLookupPartLayerHitCount =
+      m_shadowManifestVisibleLookupPartLayerHitCount.load(
+          std::memory_order_relaxed);
+  summary.visibleLookupSingleFallbackCount =
+      m_shadowManifestVisibleLookupSingleFallbackCount.load(
+          std::memory_order_relaxed);
+  summary.visibleLookupMissCount =
+      m_shadowManifestVisibleLookupMissCount.load(std::memory_order_relaxed);
+  return summary;
+}
+
 const std::vector<VisibleRenderableRecord>&
 VisibleRenderableRegistry::getAllVisibleView() const {
   return snapshotForThread().records;
@@ -2016,6 +2949,23 @@ size_t VisibleRenderableRegistry::getMainQueueCount() const {
 
 size_t VisibleRenderableRegistry::getTransparentCount() const {
   return snapshotForThread().transparentCount;
+}
+
+VisibleRenderableRegistry::DebugSummary
+VisibleRenderableRegistry::queryDebugSummary() const {
+  const Snapshot& snap = snapshotForThread();
+  DebugSummary summary = {};
+  summary.frameNumber = m_frameNumber.load(std::memory_order_relaxed);
+  summary.visibleCount = snap.records.size();
+  summary.mainQueueCount = snap.mainQueueCount;
+  summary.transparentCount = snap.transparentCount;
+  summary.mainQueueRangeCallCount = snap.mainQueueRangeCallCount;
+  summary.mainQueueRangeRecordCount = snap.mainQueueRangeRecordCount;
+  summary.semanticCandidateCallCount = snap.semanticCandidateCallCount;
+  summary.semanticCandidateMergedCount = snap.semanticCandidateMergedCount;
+  summary.semanticCandidateAppendedCount = snap.semanticCandidateAppendedCount;
+  summary.transparentEntryCallCount = snap.transparentEntryCallCount;
+  return summary;
 }
 
 } // namespace dxvk::war3::render

@@ -284,12 +284,68 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.semanticSceneSubmitted += stats.semanticSceneSubmitted;
   agg.semanticSceneSubmittedUnit += stats.semanticSceneSubmittedUnit;
   agg.semanticSceneSubmittedSkinned += stats.semanticSceneSubmittedSkinned;
+  agg.semanticSceneSubmittedSkinnedNonUnitResolvedCount +=
+      stats.semanticSceneSubmittedSkinnedNonUnitResolvedCount;
+  agg.semanticSceneSubmittedSkinnedUnknownPacketKindCount +=
+      stats.semanticSceneSubmittedSkinnedUnknownPacketKindCount;
+  agg.semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount +=
+      stats.semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount;
+  agg.semanticSceneSubmittedSkinnedGroupNonZeroCount +=
+      stats.semanticSceneSubmittedSkinnedGroupNonZeroCount;
+  agg.semanticSceneSubmittedSkinnedTransparentQueueCount +=
+      stats.semanticSceneSubmittedSkinnedTransparentQueueCount;
+  agg.semanticSceneSubmittedSkinnedMissingUnitPtrCount +=
+      stats.semanticSceneSubmittedSkinnedMissingUnitPtrCount;
+  agg.semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount +=
+      stats.semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount;
+  agg.semanticSceneSubmittedBuilding += stats.semanticSceneSubmittedBuilding;
+  agg.semanticSceneSubmittedDestructible +=
+      stats.semanticSceneSubmittedDestructible;
+  agg.semanticSceneSubmittedCutout += stats.semanticSceneSubmittedCutout;
+  agg.semanticSceneSubmittedAlphaBlend +=
+      stats.semanticSceneSubmittedAlphaBlend;
+  agg.semanticSceneMaterialObservedCutoutCount +=
+      stats.semanticSceneMaterialObservedCutoutCount;
+  agg.semanticSceneMaterialObservedAlphaBlendCount +=
+      stats.semanticSceneMaterialObservedAlphaBlendCount;
+  agg.semanticSceneRejectedCutoutSkinnedContract +=
+      stats.semanticSceneRejectedCutoutSkinnedContract;
+  agg.semanticSceneRejectedAlphaBlendSkinnedContract +=
+      stats.semanticSceneRejectedAlphaBlendSkinnedContract;
+  agg.semanticSceneRejectedCutoutGeometry +=
+      stats.semanticSceneRejectedCutoutGeometry;
+  agg.semanticSceneRejectedAlphaBlendGeometry +=
+      stats.semanticSceneRejectedAlphaBlendGeometry;
+  agg.semanticSceneRejectedCutoutVisualPolicy +=
+      stats.semanticSceneRejectedCutoutVisualPolicy;
+  agg.semanticSceneRejectedAlphaBlendVisualPolicy +=
+      stats.semanticSceneRejectedAlphaBlendVisualPolicy;
+  agg.semanticSceneMaterialLayerContractResolvedCount +=
+      stats.semanticSceneMaterialLayerContractResolvedCount;
+  agg.semanticSceneMaterialLayerContractFailedCount +=
+      stats.semanticSceneMaterialLayerContractFailedCount;
+  agg.semanticSceneMaterialBlendMode0Count +=
+      stats.semanticSceneMaterialBlendMode0Count;
+  agg.semanticSceneMaterialBlendMode1Count +=
+      stats.semanticSceneMaterialBlendMode1Count;
+  agg.semanticSceneMaterialBlendMode2PlusCount +=
+      stats.semanticSceneMaterialBlendMode2PlusCount;
+  agg.semanticSceneDirectCurrentDrawLayerIndexNonZeroCount +=
+      stats.semanticSceneDirectCurrentDrawLayerIndexNonZeroCount;
   agg.semanticSceneLivePaletteRefreshAttemptCount +=
       stats.semanticSceneLivePaletteRefreshAttemptCount;
   agg.semanticSceneLivePaletteRefreshHitCount +=
       stats.semanticSceneLivePaletteRefreshHitCount;
   agg.semanticSceneLivePaletteRefreshMissCount +=
       stats.semanticSceneLivePaletteRefreshMissCount;
+  agg.semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount +=
+      stats.semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount;
+  agg.semanticScenePaletteOverrideNoComposeCount +=
+      stats.semanticScenePaletteOverrideNoComposeCount;
+  agg.semanticScenePaletteOverrideWouldComposeCount +=
+      stats.semanticScenePaletteOverrideWouldComposeCount;
+  agg.semanticScenePalettePacketWorldComposeCount +=
+      stats.semanticScenePalettePacketWorldComposeCount;
   agg.semanticSceneLivePaletteMotionSampleCount +=
       stats.semanticSceneLivePaletteMotionSampleCount;
   agg.semanticSceneLivePaletteMotionNewRuntimeCount +=
@@ -332,6 +388,78 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.semanticSceneSubmittedPaletteMotionStableCount;
   agg.semanticSceneSkinnedDynamicIndexSliceCount +=
       stats.semanticSceneSkinnedDynamicIndexSliceCount;
+  agg.semanticSceneSubmittedOwnedGroupSlots +=
+      stats.semanticSceneSubmittedOwnedGroupSlots;
+  agg.semanticSceneCurrentDrawContractKnownCount +=
+      stats.semanticSceneCurrentDrawContractKnownCount;
+  agg.semanticSceneCurrentDrawPaletteReadyCount +=
+      stats.semanticSceneCurrentDrawPaletteReadyCount;
+  agg.semanticSceneCurrentDrawGroupSlotReadyCount +=
+      stats.semanticSceneCurrentDrawGroupSlotReadyCount;
+  agg.semanticSceneCurrentDrawResolveReadyCount +=
+      stats.semanticSceneCurrentDrawResolveReadyCount;
+  agg.semanticSceneCurrentDrawMissNoContract +=
+      stats.semanticSceneCurrentDrawMissNoContract;
+  agg.semanticSceneCurrentDrawMissNoPalette +=
+      stats.semanticSceneCurrentDrawMissNoPalette;
+  agg.semanticSceneCurrentDrawMissNoGroupSlots +=
+      stats.semanticSceneCurrentDrawMissNoGroupSlots;
+  agg.semanticSceneCurrentDrawMissStaleVisibleFrame +=
+      stats.semanticSceneCurrentDrawMissStaleVisibleFrame;
+  agg.semanticSceneCurrentDrawResolveReadyRejectedCount +=
+      stats.semanticSceneCurrentDrawResolveReadyRejectedCount;
+  agg.semanticSceneCanonicalReadyCount +=
+      stats.semanticSceneCanonicalReadyCount;
+  agg.semanticSceneCanonicalReadyCutoutCount +=
+      stats.semanticSceneCanonicalReadyCutoutCount;
+  agg.semanticSceneCanonicalReadyAlphaBlendCount +=
+      stats.semanticSceneCanonicalReadyAlphaBlendCount;
+  agg.semanticSceneCanonicalRejectNoStableIdentity +=
+      stats.semanticSceneCanonicalRejectNoStableIdentity;
+  agg.semanticSceneCanonicalRejectNoMesh +=
+      stats.semanticSceneCanonicalRejectNoMesh;
+  agg.semanticSceneCanonicalRejectNoWorldTransform +=
+      stats.semanticSceneCanonicalRejectNoWorldTransform;
+  agg.semanticSceneCanonicalRejectNoPalette +=
+      stats.semanticSceneCanonicalRejectNoPalette;
+  agg.semanticSceneCanonicalRejectNoSlotContract +=
+      stats.semanticSceneCanonicalRejectNoSlotContract;
+  agg.semanticSceneCanonicalRejectStaleProducer +=
+      stats.semanticSceneCanonicalRejectStaleProducer;
+  agg.semanticSceneCanonicalRejectInvalidVertexIndex +=
+      stats.semanticSceneCanonicalRejectInvalidVertexIndex;
+  agg.semanticSceneCanonicalRejectExplicitBlendIncomplete +=
+      stats.semanticSceneCanonicalRejectExplicitBlendIncomplete;
+  agg.semanticSceneCanonicalRejectAfterReadyCount +=
+      stats.semanticSceneCanonicalRejectAfterReadyCount;
+  agg.semanticSceneSubmittedExplicitBlendContract +=
+      stats.semanticSceneSubmittedExplicitBlendContract;
+  agg.semanticSceneSubmittedSingleMatrixGroupSkinning +=
+      stats.semanticSceneSubmittedSingleMatrixGroupSkinning;
+  agg.semanticSceneSubmittedMultiGroupSlotSkinning +=
+      stats.semanticSceneSubmittedMultiGroupSlotSkinning;
+  if (stats.semanticSceneSkinnedMinUniqueGroupSlots != 0u &&
+      (agg.semanticSceneSkinnedMinUniqueGroupSlots == 0u ||
+       stats.semanticSceneSkinnedMinUniqueGroupSlots <
+           agg.semanticSceneSkinnedMinUniqueGroupSlots)) {
+    agg.semanticSceneSkinnedMinUniqueGroupSlots =
+        stats.semanticSceneSkinnedMinUniqueGroupSlots;
+  }
+  agg.semanticSceneSkinnedMaxUniqueGroupSlots = std::max<uint64_t>(
+      agg.semanticSceneSkinnedMaxUniqueGroupSlots,
+      stats.semanticSceneSkinnedMaxUniqueGroupSlots);
+  agg.semanticSceneSkinnedGroupSlotsUnique1Count +=
+      stats.semanticSceneSkinnedGroupSlotsUnique1Count;
+  agg.semanticSceneSkinnedGroupSlotsUnique2To4Count +=
+      stats.semanticSceneSkinnedGroupSlotsUnique2To4Count;
+  agg.semanticSceneSkinnedGroupSlotsUnique5To8Count +=
+      stats.semanticSceneSkinnedGroupSlotsUnique5To8Count;
+  agg.semanticSceneSkinnedGroupSlotsUnique9To16Count +=
+      stats.semanticSceneSkinnedGroupSlotsUnique9To16Count;
+  agg.semanticSceneSkinnedGroupSlotsUnique17PlusCount +=
+      stats.semanticSceneSkinnedGroupSlotsUnique17PlusCount;
+  agg.semanticSceneExplicitBlendUnavailableCurrentDraw +=
+      stats.semanticSceneExplicitBlendUnavailableCurrentDraw;
   agg.semanticSceneSkinnedFullIndexFallbackCount +=
       stats.semanticSceneSkinnedFullIndexFallbackCount;
   agg.semanticSceneSkinnedMissingVisibleIndexSliceRejectCount +=
@@ -343,6 +471,497 @@ void War3PerfMonitor::noteShadowBudgetFrame(
           ? (stats.semanticSceneSubmitted -
              stats.semanticSceneSubmittedFrameLocal)
           : 0u;
+  agg.semanticScenePopulateAttemptCount +=
+      stats.semanticScenePopulateAttemptCount;
+  agg.semanticScenePopulateUnitsOnlyCount +=
+      stats.semanticScenePopulateUnitsOnlyCount;
+  agg.semanticScenePopulateLastReturnReason =
+      stats.semanticScenePopulateLastReturnReason;
+  agg.semanticScenePopulateLastProducerPublishAttemptDelta =
+      stats.semanticScenePopulateLastProducerPublishAttemptDelta;
+  agg.semanticScenePopulateLastProducerPublishReadyDelta =
+      stats.semanticScenePopulateLastProducerPublishReadyDelta;
+  agg.semanticScenePopulateLastProducerQueryAttemptDelta =
+      stats.semanticScenePopulateLastProducerQueryAttemptDelta;
+  agg.semanticScenePopulateLastProducerQueryHitDelta =
+      stats.semanticScenePopulateLastProducerQueryHitDelta;
+  agg.semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta =
+      stats.semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta;
+  agg.semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta =
+      stats.semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta;
+  agg.semanticScenePopulateLastProducerGroupDecodeAttemptDelta =
+      stats.semanticScenePopulateLastProducerGroupDecodeAttemptDelta;
+  agg.semanticScenePopulateLastProducerGroupDecodeHitDelta =
+      stats.semanticScenePopulateLastProducerGroupDecodeHitDelta;
+  agg.semanticSceneDirectCurrentDrawRecordCount +=
+      stats.semanticSceneDirectCurrentDrawRecordCount;
+  agg.semanticSceneDirectCurrentDrawBuiltPacketCount +=
+      stats.semanticSceneDirectCurrentDrawBuiltPacketCount;
+  agg.semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount +=
+      stats.semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount;
+  agg.semanticSceneDirectCurrentDrawUnitsFilterRejectNonSkinnedCount +=
+      stats.semanticSceneDirectCurrentDrawUnitsFilterRejectNonSkinnedCount;
+  agg.semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount +=
+      stats.semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount;
+  agg.semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount +=
+      stats
+          .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount;
+  // Phase 7.2: flicker diagnostics + reconciliation
+  agg.semanticSceneDirectLastRawRecordCount = std::max(
+      agg.semanticSceneDirectLastRawRecordCount,
+      uint64_t(stats.semanticSceneDirectLastRawRecordCount));
+  agg.semanticSceneDirectLastEligibleRecordCount = std::max(
+      agg.semanticSceneDirectLastEligibleRecordCount,
+      uint64_t(stats.semanticSceneDirectLastEligibleRecordCount));
+  agg.semanticSceneDirectLastSubmittedRecordCount = std::max(
+      agg.semanticSceneDirectLastSubmittedRecordCount,
+      uint64_t(stats.semanticSceneDirectLastSubmittedRecordCount));
+  agg.semanticSceneDirectLastUniqueObjectCount = std::max(
+      agg.semanticSceneDirectLastUniqueObjectCount,
+      uint64_t(stats.semanticSceneDirectLastUniqueObjectCount));
+  agg.semanticSceneDirectLastSubmittedObjectCount = std::max(
+      agg.semanticSceneDirectLastSubmittedObjectCount,
+      uint64_t(stats.semanticSceneDirectLastSubmittedObjectCount));
+  agg.semanticSceneDirectLastRecordCapPartialObjectCount = std::max(
+      agg.semanticSceneDirectLastRecordCapPartialObjectCount,
+      uint64_t(stats.semanticSceneDirectLastRecordCapPartialObjectCount));
+  agg.semanticSceneDirectLastScanCapPartialObjectCount = std::max(
+      agg.semanticSceneDirectLastScanCapPartialObjectCount,
+      uint64_t(stats.semanticSceneDirectLastScanCapPartialObjectCount));
+  agg.semanticSceneDirectLastMinGeosetsPerObject = std::max(
+      agg.semanticSceneDirectLastMinGeosetsPerObject,
+      uint64_t(stats.semanticSceneDirectLastMinGeosetsPerObject));
+  agg.semanticSceneDirectLastMaxGeosetsPerObject = std::max(
+      agg.semanticSceneDirectLastMaxGeosetsPerObject,
+      uint64_t(stats.semanticSceneDirectLastMaxGeosetsPerObject));
+  agg.semanticSceneDirectLastSubmittedIdentityHash = stats.semanticSceneDirectLastSubmittedIdentityHash;
+  agg.semanticSceneDirectIdentityChurnCount += stats.semanticSceneDirectIdentityChurnCount;
+  agg.semanticSceneDirectRecordCapHitCount += stats.semanticSceneDirectRecordCapHitCount;
+  agg.semanticSceneDirectRecordCapTruncatedRecordCount +=
+      stats.semanticSceneDirectRecordCapTruncatedRecordCount;
+  agg.semanticSceneDirectScanCapHitCount +=
+      stats.semanticSceneDirectScanCapHitCount;
+  agg.semanticSceneDirectObjectGroupedSubmitCount +=
+      stats.semanticSceneDirectObjectGroupedSubmitCount;
+  agg.semanticSceneDirectObjectGroupedSkipCount +=
+      stats.semanticSceneDirectObjectGroupedSkipCount;
+  agg.semanticSceneDirectRecordCapSkipObjectCount += stats.semanticSceneDirectRecordCapSkipObjectCount;
+  agg.semanticSceneDirectRecordCapAppendFailCount += stats.semanticSceneDirectRecordCapAppendFailCount;
+  agg.semanticSceneDirectSelectionLeaseActiveKeyCount = std::max(
+      agg.semanticSceneDirectSelectionLeaseActiveKeyCount,
+      uint64_t(stats.semanticSceneDirectSelectionLeaseActiveKeyCount));
+  agg.semanticSceneDirectSelectionLeasePrunedKeyCount +=
+      stats.semanticSceneDirectSelectionLeasePrunedKeyCount;
+  agg.semanticSceneDirectSelectionLeaseSubmittedKeyCount +=
+      stats.semanticSceneDirectSelectionLeaseSubmittedKeyCount;
+  agg.semanticSceneDirectStickyFillBudgetRecordCount = std::max(
+      agg.semanticSceneDirectStickyFillBudgetRecordCount,
+      uint64_t(stats.semanticSceneDirectStickyFillBudgetRecordCount));
+  agg.semanticSceneDirectStickyFillAppendedCount +=
+      stats.semanticSceneDirectStickyFillAppendedCount;
+  agg.semanticSceneDirectStickyFillSubmittedCount +=
+      stats.semanticSceneDirectStickyFillSubmittedCount;
+  agg.semanticSceneDirectStickyFillMissedCount +=
+      stats.semanticSceneDirectStickyFillMissedCount;
+  agg.semanticSceneDirectPartLeaseRestoredCount +=
+      stats.semanticSceneDirectPartLeaseRestoredCount;
+  agg.semanticSceneDirectPartLeaseUpdatedCount +=
+      stats.semanticSceneDirectPartLeaseUpdatedCount;
+  agg.semanticSceneDirectPartLeaseExpiredCount +=
+      stats.semanticSceneDirectPartLeaseExpiredCount;
+  agg.semanticSceneDirectPartLeaseRejectedDynamicMeshCount +=
+      stats.semanticSceneDirectPartLeaseRejectedDynamicMeshCount;
+  agg.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount +=
+      stats.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount;
+  agg.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount +=
+      stats.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount;
+  agg.semanticSceneDirectPartLeaseRejectedSelfRenewCount +=
+      stats.semanticSceneDirectPartLeaseRejectedSelfRenewCount;
+  agg.semanticSceneDirectPartLeaseBudgetLimitCount +=
+      stats.semanticSceneDirectPartLeaseBudgetLimitCount;
+  agg.semanticSceneShadowManifestPartLeaseRestoredCount +=
+      stats.semanticSceneShadowManifestPartLeaseRestoredCount;
+  agg.semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount +=
+      stats.semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount;
+  agg.semanticSceneShadowManifestPartLeaseExpiredCount +=
+      stats.semanticSceneShadowManifestPartLeaseExpiredCount;
+  agg.semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount +=
+      stats.semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount;
+  agg.semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount +=
+      stats.semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount;
+  agg.semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount +=
+      stats.semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount;
+  agg
+      .semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount +=
+      stats
+          .semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount;
+  agg.semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount +=
+      stats.semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount;
+  agg.semanticSceneShadowManifestPartLeaseBudgetLimitCount +=
+      stats.semanticSceneShadowManifestPartLeaseBudgetLimitCount;
+  agg.semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount +=
+      stats.semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount;
+  agg.semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount +=
+      stats.semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount;
+  agg.semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount +=
+      stats.semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount;
+  agg.semanticSceneShadowManifestObjectCoreCompleteCount +=
+      stats.semanticSceneShadowManifestObjectCoreCompleteCount;
+  agg.semanticSceneShadowManifestObjectCoreIncompleteSkipCount +=
+      stats.semanticSceneShadowManifestObjectCoreIncompleteSkipCount;
+  agg.semanticSceneShadowManifestPartOmittedIncompleteCoreCount +=
+      stats.semanticSceneShadowManifestPartOmittedIncompleteCoreCount;
+  // Phase 7.25 core epoch planner 专属计数器聚合（累加语义，便于整测窗口对比）。
+  agg.semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount +=
+      stats.semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount;
+  agg.semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount +=
+      stats.semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount;
+  agg.semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount +=
+      stats.semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount;
+  agg.semanticSceneShadowManifestObjectCoreEpochMissingPartCount +=
+      stats.semanticSceneShadowManifestObjectCoreEpochMissingPartCount;
+  agg.semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount +=
+      stats.semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount;
+  // Phase 7.28：skinned palette content stability probe（累加 / max）。
+  agg.semanticSceneSubmittedSkinnedPaletteSourceNoneCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteSourceNoneCount;
+  agg.semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount;
+  agg.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount;
+  agg.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount;
+  agg.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount +=
+      stats
+          .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount;
+  agg.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount +=
+      stats
+          .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount;
+  agg.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount;
+  agg.semanticSceneSubmittedSkinnedPaletteHashChurnCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteHashChurnCount;
+  agg.semanticSceneSubmittedSkinnedPaletteSourceChurnCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteSourceChurnCount;
+  agg.semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount;
+  agg.semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax = std::max(
+      agg.semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax,
+      uint64_t(stats.semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax));
+  agg.semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax = std::max(
+      agg.semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax,
+      uint64_t(
+          stats.semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax));
+  agg.semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount;
+  agg.semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount;
+  agg.semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount;
+  agg.semanticSceneSubmittedSkinnedPaletteCountChurnCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteCountChurnCount;
+  agg.semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount +=
+      stats
+          .semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount;
+  agg.semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount +=
+      stats
+          .semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount;
+  agg.semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount;
+  agg.semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount;
+  agg.semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount;
+  agg.semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount +=
+      stats
+          .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount;
+  agg.semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount +=
+      stats
+          .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount;
+  agg.semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount +=
+      stats
+          .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount;
+  agg.semanticSceneDirectPaletteAttributionSnapshotHitCount +=
+      stats.semanticSceneDirectPaletteAttributionSnapshotHitCount;
+  agg.semanticSceneDirectPaletteCaptureTrustedSourceHitCount +=
+      stats.semanticSceneDirectPaletteCaptureTrustedSourceHitCount;
+  agg.semanticSceneDirectPaletteCaptureTrustedSourceMissCount +=
+      stats.semanticSceneDirectPaletteCaptureTrustedSourceMissCount;
+  // Phase 7.30 Step A：stale→live 过渡归因。
+  agg.semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount +=
+      stats
+          .semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount;
+  agg.semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount +=
+      stats
+          .semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount;
+  agg.semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount +=
+      stats.semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount;
+  agg.semanticSceneDirectManifestObjectCount = std::max(
+      agg.semanticSceneDirectManifestObjectCount,
+      uint64_t(stats.semanticSceneDirectManifestObjectCount));
+  agg.semanticSceneDirectManifestObservedPartCount = std::max(
+      agg.semanticSceneDirectManifestObservedPartCount,
+      uint64_t(stats.semanticSceneDirectManifestObservedPartCount));
+  agg.semanticSceneDirectManifestShadowEligiblePartCount = std::max(
+      agg.semanticSceneDirectManifestShadowEligiblePartCount,
+      uint64_t(stats.semanticSceneDirectManifestShadowEligiblePartCount));
+  agg.semanticSceneDirectObjectCompleteEligibleCount = std::max(
+      agg.semanticSceneDirectObjectCompleteEligibleCount,
+      uint64_t(stats.semanticSceneDirectObjectCompleteEligibleCount));
+  agg.semanticSceneDirectObjectIncompleteByScanCapCount +=
+      stats.semanticSceneDirectObjectIncompleteByScanCapCount;
+  agg.semanticSceneDirectObjectIncompleteByAlphaPolicyCount +=
+      stats.semanticSceneDirectObjectIncompleteByAlphaPolicyCount;
+  agg.semanticSceneDirectObjectIncompleteBySliceUnresolvedCount +=
+      stats.semanticSceneDirectObjectIncompleteBySliceUnresolvedCount;
+  agg.semanticSceneDirectObjectIncompleteByPacketBuildFailCount +=
+      stats.semanticSceneDirectObjectIncompleteByPacketBuildFailCount;
+  agg.semanticSceneDirectObjectIncompleteByAppendFailCount +=
+      stats.semanticSceneDirectObjectIncompleteByAppendFailCount;
+  agg.semanticSceneDirectSubmittedCompleteObjectCount = std::max(
+      agg.semanticSceneDirectSubmittedCompleteObjectCount,
+      uint64_t(stats.semanticSceneDirectSubmittedCompleteObjectCount));
+  agg.semanticSceneDirectSubmittedPartialObjectCount = std::max(
+      agg.semanticSceneDirectSubmittedPartialObjectCount,
+      uint64_t(stats.semanticSceneDirectSubmittedPartialObjectCount));
+  agg.semanticSceneDirectPreparedSliceAuthoritativeCount +=
+      stats.semanticSceneDirectPreparedSliceAuthoritativeCount;
+  agg.semanticSceneDirectPreparedSliceFallbackLayerIndexCount +=
+      stats.semanticSceneDirectPreparedSliceFallbackLayerIndexCount;
+  agg.semanticSceneDirectPreparedSliceMissingCount +=
+      stats.semanticSceneDirectPreparedSliceMissingCount;
+  agg.semanticScenePreparedProbeAttemptCount +=
+      stats.semanticScenePreparedProbeAttemptCount;
+  agg.semanticScenePreparedProbeContextReadyCount +=
+      stats.semanticScenePreparedProbeContextReadyCount;
+  agg.semanticScenePreparedProbeBackingReadableCount +=
+      stats.semanticScenePreparedProbeBackingReadableCount;
+  agg.semanticScenePreparedSliceRecordedCount +=
+      stats.semanticScenePreparedSliceRecordedCount;
+  agg.semanticScenePreparedSliceQueryAttemptCount +=
+      stats.semanticScenePreparedSliceQueryAttemptCount;
+  agg.semanticScenePreparedSliceQueryHitCount +=
+      stats.semanticScenePreparedSliceQueryHitCount;
+  agg.semanticScenePreparedSliceQueryMissCount +=
+      stats.semanticScenePreparedSliceQueryMissCount;
+  agg.semanticSceneShadowManifestObjectCount = std::max(
+      agg.semanticSceneShadowManifestObjectCount,
+      uint64_t(stats.semanticSceneShadowManifestObjectCount));
+  agg.semanticSceneShadowManifestPartCount = std::max(
+      agg.semanticSceneShadowManifestPartCount,
+      uint64_t(stats.semanticSceneShadowManifestPartCount));
+  agg.semanticSceneShadowManifestStableObjectCount = std::max(
+      agg.semanticSceneShadowManifestStableObjectCount,
+      uint64_t(stats.semanticSceneShadowManifestStableObjectCount));
+  agg.semanticSceneShadowManifestNewObjectCount +=
+      stats.semanticSceneShadowManifestNewObjectCount;
+  agg.semanticSceneShadowManifestExpiredObjectCount +=
+      stats.semanticSceneShadowManifestExpiredObjectCount;
+  agg.semanticSceneShadowManifestFreshPartCount = std::max(
+      agg.semanticSceneShadowManifestFreshPartCount,
+      uint64_t(stats.semanticSceneShadowManifestFreshPartCount));
+  agg.semanticSceneShadowManifestLeaseablePartCount = std::max(
+      agg.semanticSceneShadowManifestLeaseablePartCount,
+      uint64_t(stats.semanticSceneShadowManifestLeaseablePartCount));
+  agg.semanticSceneShadowManifestPoseStalePartCount = std::max(
+      agg.semanticSceneShadowManifestPoseStalePartCount,
+      uint64_t(stats.semanticSceneShadowManifestPoseStalePartCount));
+  agg.semanticSceneShadowManifestSliceStalePartCount = std::max(
+      agg.semanticSceneShadowManifestSliceStalePartCount,
+      uint64_t(stats.semanticSceneShadowManifestSliceStalePartCount));
+  agg.semanticSceneShadowManifestExpiredPartCount +=
+      stats.semanticSceneShadowManifestExpiredPartCount;
+  agg.semanticSceneShadowManifestMultiSlicePartCount = std::max(
+      agg.semanticSceneShadowManifestMultiSlicePartCount,
+      uint64_t(stats.semanticSceneShadowManifestMultiSlicePartCount));
+  agg.semanticSceneShadowManifestPayload11CChurnCount +=
+      stats.semanticSceneShadowManifestPayload11CChurnCount;
+  agg.semanticSceneShadowManifestRenderablePartChurnCount +=
+      stats.semanticSceneShadowManifestRenderablePartChurnCount;
+  agg.semanticSceneShadowManifestCModelPoseHitCount = std::max(
+      agg.semanticSceneShadowManifestCModelPoseHitCount,
+      uint64_t(stats.semanticSceneShadowManifestCModelPoseHitCount));
+  agg.semanticSceneShadowManifestCModelPoseMissCount = std::max(
+      agg.semanticSceneShadowManifestCModelPoseMissCount,
+      uint64_t(stats.semanticSceneShadowManifestCModelPoseMissCount));
+  agg.semanticSceneShadowManifestCModelPoseNoRuntimeCount = std::max(
+      agg.semanticSceneShadowManifestCModelPoseNoRuntimeCount,
+      uint64_t(stats.semanticSceneShadowManifestCModelPoseNoRuntimeCount));
+  agg.semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr =
+      stats.semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr;
+  agg.semanticSceneShadowManifestCModelPoseLastMatrixCount =
+      stats.semanticSceneShadowManifestCModelPoseLastMatrixCount;
+  agg.semanticSceneShadowManifestCModelPoseLastMatrixHash =
+      stats.semanticSceneShadowManifestCModelPoseLastMatrixHash;
+  agg.semanticSceneSubmittedObjectJaccardMilli = std::max(
+      agg.semanticSceneSubmittedObjectJaccardMilli,
+      uint64_t(stats.semanticSceneSubmittedObjectJaccardMilli));
+  agg.semanticSceneSubmittedPartJaccardMilli = std::max(
+      agg.semanticSceneSubmittedPartJaccardMilli,
+      uint64_t(stats.semanticSceneSubmittedPartJaccardMilli));
+  agg.semanticSceneVisibleLookupPartLayerHitCount =
+      stats.semanticSceneVisibleLookupPartLayerHitCount;
+  agg.semanticSceneVisibleLookupSingleFallbackCount =
+      stats.semanticSceneVisibleLookupSingleFallbackCount;
+  agg.semanticSceneVisibleLookupMissCount =
+      stats.semanticSceneVisibleLookupMissCount;
+  agg.semanticSceneDirectMainWorldBackingNotCheckedCount +=
+      stats.semanticSceneDirectMainWorldBackingNotCheckedCount;
+  agg.semanticSceneDirectMainWorldBackingPassCount +=
+      stats.semanticSceneDirectMainWorldBackingPassCount;
+  agg.semanticSceneDirectMainWorldBackingFailNoRenderablePartCount +=
+      stats.semanticSceneDirectMainWorldBackingFailNoRenderablePartCount;
+  agg.semanticSceneDirectMainWorldBackingFailLookupMissCount +=
+      stats.semanticSceneDirectMainWorldBackingFailLookupMissCount;
+  agg.semanticSceneDirectMainWorldBackingFailNonMainQueueCount +=
+      stats.semanticSceneDirectMainWorldBackingFailNonMainQueueCount;
+  agg.semanticSceneDirectMainWorldBackingFailNonWorldGroupCount +=
+      stats.semanticSceneDirectMainWorldBackingFailNonWorldGroupCount;
+  agg.semanticSceneDirectMainWorldBackingFailIdentityMismatchCount +=
+      stats.semanticSceneDirectMainWorldBackingFailIdentityMismatchCount;
+  agg.semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount +=
+      stats.semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount;
+  agg.semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount +=
+      stats.semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount;
+  agg.semanticSceneDirectPaletteHashChurnCount += stats.semanticSceneDirectPaletteHashChurnCount;
+  agg.semanticSceneDirectGroupHashChurnCount += stats.semanticSceneDirectGroupHashChurnCount;
+  agg.semanticSceneDirectStableGroupHashChurnCount += stats.semanticSceneDirectStableGroupHashChurnCount;
+  agg.semanticSceneDirectStream1PtrChurnCount += stats.semanticSceneDirectStream1PtrChurnCount;
+  agg.semanticSceneDirectGeometrySourceHashChurnCount += stats.semanticSceneDirectGeometrySourceHashChurnCount;
+  agg.semanticSceneDirectSameCasterComparisonCount +=
+      stats.semanticSceneDirectSameCasterComparisonCount;
+  agg.semanticSceneDirectIdentitySkippedChurnCount +=
+      stats.semanticSceneDirectIdentitySkippedChurnCount;
+  agg.semanticSceneDirectPaletteRootDeltaSampleCount +=
+      stats.semanticSceneDirectPaletteRootDeltaSampleCount;
+  agg.semanticSceneDirectPaletteRootHashChangedTinyDeltaCount +=
+      stats.semanticSceneDirectPaletteRootHashChangedTinyDeltaCount;
+  agg.semanticSceneDirectPaletteRootHashChangedSmallDeltaCount +=
+      stats.semanticSceneDirectPaletteRootHashChangedSmallDeltaCount;
+  agg.semanticSceneDirectPaletteRootHashChangedMediumDeltaCount +=
+      stats.semanticSceneDirectPaletteRootHashChangedMediumDeltaCount;
+  agg.semanticSceneDirectPaletteRootHashChangedLargeDeltaCount +=
+      stats.semanticSceneDirectPaletteRootHashChangedLargeDeltaCount;
+  agg.semanticSceneDirectPaletteRootMaxDeltaMilli = std::max(
+      agg.semanticSceneDirectPaletteRootMaxDeltaMilli,
+      uint64_t(stats.semanticSceneDirectPaletteRootMaxDeltaMilli));
+  agg.semanticSceneDirectSelectionKeyUnitPtrCount +=
+      stats.semanticSceneDirectSelectionKeyUnitPtrCount;
+  agg.semanticSceneDirectSelectionKeyJHandleCount +=
+      stats.semanticSceneDirectSelectionKeyJHandleCount;
+  agg.semanticSceneDirectSelectionKeyRuntimeModelCount +=
+      stats.semanticSceneDirectSelectionKeyRuntimeModelCount;
+  agg.semanticSceneDirectSelectionKeyWorldObjectCount +=
+      stats.semanticSceneDirectSelectionKeyWorldObjectCount;
+  agg.semanticSceneDirectSelectionKeySceneNodeCount +=
+      stats.semanticSceneDirectSelectionKeySceneNodeCount;
+  agg.semanticSceneDirectSelectionKeyModelMeshCount +=
+      stats.semanticSceneDirectSelectionKeyModelMeshCount;
+  agg.semanticSceneDirectSelectionKeyRenderablePartCount +=
+      stats.semanticSceneDirectSelectionKeyRenderablePartCount;
+  agg.semanticSceneLastAppendedGeometrySourceHash =
+      stats.semanticSceneLastAppendedGeometrySourceHash;
+  agg.semanticSceneLastAppendedGeometryId =
+      stats.semanticSceneLastAppendedGeometryId;
+  agg.semanticSceneShadowCastersCount = std::max(
+      agg.semanticSceneShadowCastersCount,
+      uint64_t(stats.semanticSceneShadowCastersCount));
+  agg.semanticSceneReplayDrawsCount = std::max(
+      agg.semanticSceneReplayDrawsCount,
+      uint64_t(stats.semanticSceneReplayDrawsCount));
+  agg.semanticSceneShadowMapDrawnCasters = std::max(
+      agg.semanticSceneShadowMapDrawnCasters,
+      uint64_t(stats.semanticSceneShadowMapDrawnCasters));
+  agg.semanticSceneShadowMapCascadeCulledCount += stats.semanticSceneShadowMapCascadeCulledCount;
+  agg.semanticSceneShadowMapSkinnedCasterCount = std::max(
+      agg.semanticSceneShadowMapSkinnedCasterCount,
+      uint64_t(stats.semanticSceneShadowMapSkinnedCasterCount));
+  agg.semanticSceneShadowMapSkinnedPreparedCount = std::max(
+      agg.semanticSceneShadowMapSkinnedPreparedCount,
+      uint64_t(stats.semanticSceneShadowMapSkinnedPreparedCount));
+  agg.semanticSceneShadowMapSkinnedInvalidBufferCount = std::max(
+      agg.semanticSceneShadowMapSkinnedInvalidBufferCount,
+      uint64_t(stats.semanticSceneShadowMapSkinnedInvalidBufferCount));
+  agg.semanticSceneShadowMapSkinnedInvalidPipelineCount = std::max(
+      agg.semanticSceneShadowMapSkinnedInvalidPipelineCount,
+      uint64_t(stats.semanticSceneShadowMapSkinnedInvalidPipelineCount));
+  agg.semanticSceneShadowMapSkinnedDrawnCount = std::max(
+      agg.semanticSceneShadowMapSkinnedDrawnCount,
+      uint64_t(stats.semanticSceneShadowMapSkinnedDrawnCount));
+  agg.semanticSceneShadowTaaActive = std::max(
+      agg.semanticSceneShadowTaaActive,
+      uint64_t(stats.semanticSceneShadowTaaActive));
+  agg.semanticSceneReceiverReuseShadowMap = std::max(
+      agg.semanticSceneReceiverReuseShadowMap,
+      uint64_t(stats.semanticSceneReceiverReuseShadowMap));
+  agg.semanticSceneReceiverInputValid = std::max(
+      agg.semanticSceneReceiverInputValid,
+      uint64_t(stats.semanticSceneReceiverInputValid));
+  agg.semanticSceneReceiverInputRejectReason = std::max(
+      agg.semanticSceneReceiverInputRejectReason,
+      uint64_t(stats.semanticSceneReceiverInputRejectReason));
+  agg.semanticSceneReceiverNeedPass = std::max(
+      agg.semanticSceneReceiverNeedPass,
+      uint64_t(stats.semanticSceneReceiverNeedPass));
+  agg.semanticSceneReceiverNeedShadowMap = std::max(
+      agg.semanticSceneReceiverNeedShadowMap,
+      uint64_t(stats.semanticSceneReceiverNeedShadowMap));
+  agg.semanticSceneReceiverHasCompleteShadowMap = std::max(
+      agg.semanticSceneReceiverHasCompleteShadowMap,
+      uint64_t(stats.semanticSceneReceiverHasCompleteShadowMap));
+  agg.semanticSceneReceiverHasUsableDirectionalShadow = std::max(
+      agg.semanticSceneReceiverHasUsableDirectionalShadow,
+      uint64_t(stats.semanticSceneReceiverHasUsableDirectionalShadow));
+  agg.semanticSceneReceiverActiveStrengthMilli = std::max(
+      agg.semanticSceneReceiverActiveStrengthMilli,
+      uint64_t(stats.semanticSceneReceiverActiveStrengthMilli));
+  agg.semanticSceneReceiverUboStrengthMilli = std::max(
+      agg.semanticSceneReceiverUboStrengthMilli,
+      uint64_t(stats.semanticSceneReceiverUboStrengthMilli));
+  agg.semanticSceneReceiverDebugMode = std::max(
+      agg.semanticSceneReceiverDebugMode,
+      uint64_t(stats.semanticSceneReceiverDebugMode));
+  agg.semanticSceneReceiverCsmCascadeCount = std::max(
+      agg.semanticSceneReceiverCsmCascadeCount,
+      uint64_t(stats.semanticSceneReceiverCsmCascadeCount));
+  agg.semanticSceneReceiverZeroStrengthFrameCount +=
+      stats.semanticSceneReceiverZeroStrengthFrameCount;
+  agg.semanticSceneReceiverDrawnWithZeroStrengthCount +=
+      stats.semanticSceneReceiverDrawnWithZeroStrengthCount;
+  agg.semanticSceneReceiverNoCompleteShadowMapCount +=
+      stats.semanticSceneReceiverNoCompleteShadowMapCount;
+  agg.semanticSceneReceiverNoShadowMapImageCount +=
+      stats.semanticSceneReceiverNoShadowMapImageCount;
+  agg.semanticSceneReceiverNoShadowMapSampleViewCount +=
+      stats.semanticSceneReceiverNoShadowMapSampleViewCount;
+  agg.semanticSceneReceiverNoCandidateCsmCount +=
+      stats.semanticSceneReceiverNoCandidateCsmCount;
+  agg.semanticSceneReceiverCsmFallbackToLastGoodCount +=
+      stats.semanticSceneReceiverCsmFallbackToLastGoodCount;
+  agg.semanticSceneReceiverHoldInvalidCsmCount +=
+      stats.semanticSceneReceiverHoldInvalidCsmCount;
+  agg.semanticSceneReceiverHoldEmptyReplayCount +=
+      stats.semanticSceneReceiverHoldEmptyReplayCount;
+  agg.semanticSceneReceiverHoldIdentityChurnCount +=
+      stats.semanticSceneReceiverHoldIdentityChurnCount;
+  agg.semanticSceneReceiverReuseInvalidatedAfterEnsureCount +=
+      stats.semanticSceneReceiverReuseInvalidatedAfterEnsureCount;
+  agg.semanticSceneShadowMapRenderSkippedNoResourcesCount +=
+      stats.semanticSceneShadowMapRenderSkippedNoResourcesCount;
+  agg.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount +=
+      stats.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount;
+  agg.semanticSceneReceiverViewportX = std::max(
+      agg.semanticSceneReceiverViewportX,
+      uint64_t(stats.semanticSceneReceiverViewportX));
+  agg.semanticSceneReceiverViewportY = std::max(
+      agg.semanticSceneReceiverViewportY,
+      uint64_t(stats.semanticSceneReceiverViewportY));
+  agg.semanticSceneReceiverViewportWidth = std::max(
+      agg.semanticSceneReceiverViewportWidth,
+      uint64_t(stats.semanticSceneReceiverViewportWidth));
+  agg.semanticSceneReceiverViewportHeight = std::max(
+      agg.semanticSceneReceiverViewportHeight,
+      uint64_t(stats.semanticSceneReceiverViewportHeight));
   agg.semanticSceneSkippedUnitsOnlyFilter +=
       stats.semanticSceneSkippedUnitsOnlyFilter;
   agg.semanticSceneAcceptedExplicitResourceOwnerRigid +=
@@ -1536,12 +2155,72 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneSubmittedUnit << ",\n";
   json << "    \"semanticSceneSubmittedSkinned\": "
        << shadowAgg.semanticSceneSubmittedSkinned << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedNonUnitResolvedCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedNonUnitResolvedCount << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedUnknownPacketKindCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedUnknownPacketKindCount << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedGroupNonZeroCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedGroupNonZeroCount << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedTransparentQueueCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedTransparentQueueCount << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedMissingUnitPtrCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedMissingUnitPtrCount << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedBuilding\": "
+       << shadowAgg.semanticSceneSubmittedBuilding << ",\n";
+  json << "    \"semanticSceneSubmittedDestructible\": "
+       << shadowAgg.semanticSceneSubmittedDestructible << ",\n";
+  json << "    \"semanticSceneSubmittedCutout\": "
+       << shadowAgg.semanticSceneSubmittedCutout << ",\n";
+  json << "    \"semanticSceneSubmittedAlphaBlend\": "
+       << shadowAgg.semanticSceneSubmittedAlphaBlend << ",\n";
+  json << "    \"semanticSceneMaterialObservedCutoutCount\": "
+       << shadowAgg.semanticSceneMaterialObservedCutoutCount << ",\n";
+  json << "    \"semanticSceneMaterialObservedAlphaBlendCount\": "
+       << shadowAgg.semanticSceneMaterialObservedAlphaBlendCount << ",\n";
+  json << "    \"semanticSceneRejectedCutoutSkinnedContract\": "
+       << shadowAgg.semanticSceneRejectedCutoutSkinnedContract << ",\n";
+  json << "    \"semanticSceneRejectedAlphaBlendSkinnedContract\": "
+       << shadowAgg.semanticSceneRejectedAlphaBlendSkinnedContract << ",\n";
+  json << "    \"semanticSceneRejectedCutoutGeometry\": "
+       << shadowAgg.semanticSceneRejectedCutoutGeometry << ",\n";
+  json << "    \"semanticSceneRejectedAlphaBlendGeometry\": "
+       << shadowAgg.semanticSceneRejectedAlphaBlendGeometry << ",\n";
+  json << "    \"semanticSceneRejectedCutoutVisualPolicy\": "
+       << shadowAgg.semanticSceneRejectedCutoutVisualPolicy << ",\n";
+  json << "    \"semanticSceneRejectedAlphaBlendVisualPolicy\": "
+       << shadowAgg.semanticSceneRejectedAlphaBlendVisualPolicy << ",\n";
+  json << "    \"semanticSceneMaterialLayerContractResolvedCount\": "
+       << shadowAgg.semanticSceneMaterialLayerContractResolvedCount << ",\n";
+  json << "    \"semanticSceneMaterialLayerContractFailedCount\": "
+       << shadowAgg.semanticSceneMaterialLayerContractFailedCount << ",\n";
+  json << "    \"semanticSceneMaterialBlendMode0Count\": "
+       << shadowAgg.semanticSceneMaterialBlendMode0Count << ",\n";
+  json << "    \"semanticSceneMaterialBlendMode1Count\": "
+       << shadowAgg.semanticSceneMaterialBlendMode1Count << ",\n";
+  json << "    \"semanticSceneMaterialBlendMode2PlusCount\": "
+       << shadowAgg.semanticSceneMaterialBlendMode2PlusCount << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawLayerIndexNonZeroCount\": "
+       << shadowAgg.semanticSceneDirectCurrentDrawLayerIndexNonZeroCount << ",\n";
   json << "    \"semanticSceneLivePaletteRefreshAttemptCount\": "
        << shadowAgg.semanticSceneLivePaletteRefreshAttemptCount << ",\n";
   json << "    \"semanticSceneLivePaletteRefreshHitCount\": "
        << shadowAgg.semanticSceneLivePaletteRefreshHitCount << ",\n";
   json << "    \"semanticSceneLivePaletteRefreshMissCount\": "
        << shadowAgg.semanticSceneLivePaletteRefreshMissCount << ",\n";
+  json << "    \"semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount\": "
+       << shadowAgg.semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount << ",\n";
+  json << "    \"semanticScenePaletteOverrideNoComposeCount\": "
+       << shadowAgg.semanticScenePaletteOverrideNoComposeCount << ",\n";
+  json << "    \"semanticScenePaletteOverrideWouldComposeCount\": "
+       << shadowAgg.semanticScenePaletteOverrideWouldComposeCount << ",\n";
+  json << "    \"semanticScenePalettePacketWorldComposeCount\": "
+       << shadowAgg.semanticScenePalettePacketWorldComposeCount << ",\n";
   json << "    \"semanticSceneLivePaletteMotionSampleCount\": "
        << shadowAgg.semanticSceneLivePaletteMotionSampleCount << ",\n";
   json << "    \"semanticSceneLivePaletteMotionNewRuntimeCount\": "
@@ -1584,6 +2263,76 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneSubmittedPaletteMotionStableCount << ",\n";
   json << "    \"semanticSceneSkinnedDynamicIndexSliceCount\": "
        << shadowAgg.semanticSceneSkinnedDynamicIndexSliceCount << ",\n";
+  json << "    \"semanticSceneSubmittedOwnedGroupSlots\": "
+       << shadowAgg.semanticSceneSubmittedOwnedGroupSlots << ",\n";
+  json << "    \"semanticSceneCurrentDrawContractKnownCount\": "
+       << shadowAgg.semanticSceneCurrentDrawContractKnownCount << ",\n";
+  json << "    \"semanticSceneCurrentDrawPaletteReadyCount\": "
+       << shadowAgg.semanticSceneCurrentDrawPaletteReadyCount << ",\n";
+  json << "    \"semanticSceneCurrentDrawGroupSlotReadyCount\": "
+       << shadowAgg.semanticSceneCurrentDrawGroupSlotReadyCount << ",\n";
+  json << "    \"semanticSceneCurrentDrawResolveReadyCount\": "
+       << shadowAgg.semanticSceneCurrentDrawResolveReadyCount << ",\n";
+  json << "    \"semanticSceneCurrentDrawMissNoContract\": "
+       << shadowAgg.semanticSceneCurrentDrawMissNoContract << ",\n";
+  json << "    \"semanticSceneCurrentDrawMissNoPalette\": "
+       << shadowAgg.semanticSceneCurrentDrawMissNoPalette << ",\n";
+  json << "    \"semanticSceneCurrentDrawMissNoGroupSlots\": "
+       << shadowAgg.semanticSceneCurrentDrawMissNoGroupSlots << ",\n";
+  json << "    \"semanticSceneCurrentDrawMissStaleVisibleFrame\": "
+       << shadowAgg.semanticSceneCurrentDrawMissStaleVisibleFrame << ",\n";
+  json << "    \"semanticSceneCurrentDrawResolveReadyRejectedCount\": "
+       << shadowAgg.semanticSceneCurrentDrawResolveReadyRejectedCount << ",\n";
+  json << "    \"semanticSceneCanonicalReadyCount\": "
+       << shadowAgg.semanticSceneCanonicalReadyCount << ",\n";
+  json << "    \"semanticSceneCanonicalReadyCutoutCount\": "
+       << shadowAgg.semanticSceneCanonicalReadyCutoutCount << ",\n";
+  json << "    \"semanticSceneCanonicalReadyAlphaBlendCount\": "
+       << shadowAgg.semanticSceneCanonicalReadyAlphaBlendCount << ",\n";
+  json << "    \"semanticSceneCanonicalReadyCutoutCount\": "
+       << shadowAgg.semanticSceneCanonicalReadyCutoutCount << ",\n";
+  json << "    \"semanticSceneCanonicalReadyAlphaBlendCount\": "
+       << shadowAgg.semanticSceneCanonicalReadyAlphaBlendCount << ",\n";
+  json << "    \"semanticSceneCanonicalRejectNoStableIdentity\": "
+       << shadowAgg.semanticSceneCanonicalRejectNoStableIdentity << ",\n";
+  json << "    \"semanticSceneCanonicalRejectNoMesh\": "
+       << shadowAgg.semanticSceneCanonicalRejectNoMesh << ",\n";
+  json << "    \"semanticSceneCanonicalRejectNoWorldTransform\": "
+       << shadowAgg.semanticSceneCanonicalRejectNoWorldTransform << ",\n";
+  json << "    \"semanticSceneCanonicalRejectNoPalette\": "
+       << shadowAgg.semanticSceneCanonicalRejectNoPalette << ",\n";
+  json << "    \"semanticSceneCanonicalRejectNoSlotContract\": "
+       << shadowAgg.semanticSceneCanonicalRejectNoSlotContract << ",\n";
+  json << "    \"semanticSceneCanonicalRejectStaleProducer\": "
+       << shadowAgg.semanticSceneCanonicalRejectStaleProducer << ",\n";
+  json << "    \"semanticSceneCanonicalRejectInvalidVertexIndex\": "
+       << shadowAgg.semanticSceneCanonicalRejectInvalidVertexIndex << ",\n";
+  json << "    \"semanticSceneCanonicalRejectExplicitBlendIncomplete\": "
+       << shadowAgg.semanticSceneCanonicalRejectExplicitBlendIncomplete << ",\n";
+  json << "    \"semanticSceneCanonicalRejectAfterReadyCount\": "
+       << shadowAgg.semanticSceneCanonicalRejectAfterReadyCount << ",\n";
+  json << "    \"semanticSceneSubmittedExplicitBlendContract\": "
+       << shadowAgg.semanticSceneSubmittedExplicitBlendContract << ",\n";
+  json << "    \"semanticSceneSubmittedSingleMatrixGroupSkinning\": "
+       << shadowAgg.semanticSceneSubmittedSingleMatrixGroupSkinning << ",\n";
+  json << "    \"semanticSceneSubmittedMultiGroupSlotSkinning\": "
+       << shadowAgg.semanticSceneSubmittedMultiGroupSlotSkinning << ",\n";
+  json << "    \"semanticSceneSkinnedMinUniqueGroupSlots\": "
+       << shadowAgg.semanticSceneSkinnedMinUniqueGroupSlots << ",\n";
+  json << "    \"semanticSceneSkinnedMaxUniqueGroupSlots\": "
+       << shadowAgg.semanticSceneSkinnedMaxUniqueGroupSlots << ",\n";
+  json << "    \"semanticSceneSkinnedGroupSlotsUnique1Count\": "
+       << shadowAgg.semanticSceneSkinnedGroupSlotsUnique1Count << ",\n";
+  json << "    \"semanticSceneSkinnedGroupSlotsUnique2To4Count\": "
+       << shadowAgg.semanticSceneSkinnedGroupSlotsUnique2To4Count << ",\n";
+  json << "    \"semanticSceneSkinnedGroupSlotsUnique5To8Count\": "
+       << shadowAgg.semanticSceneSkinnedGroupSlotsUnique5To8Count << ",\n";
+  json << "    \"semanticSceneSkinnedGroupSlotsUnique9To16Count\": "
+       << shadowAgg.semanticSceneSkinnedGroupSlotsUnique9To16Count << ",\n";
+  json << "    \"semanticSceneSkinnedGroupSlotsUnique17PlusCount\": "
+       << shadowAgg.semanticSceneSkinnedGroupSlotsUnique17PlusCount << ",\n";
+  json << "    \"semanticSceneExplicitBlendUnavailableCurrentDraw\": "
+       << shadowAgg.semanticSceneExplicitBlendUnavailableCurrentDraw << ",\n";
   json << "    \"semanticSceneSkinnedFullIndexFallbackCount\": "
        << shadowAgg.semanticSceneSkinnedFullIndexFallbackCount << ",\n";
   json << "    \"semanticSceneSkinnedMissingVisibleIndexSliceRejectCount\": "
@@ -1593,6 +2342,551 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneSubmittedFrameLocal << ",\n";
   json << "    \"semanticSceneSubmittedPersistent\": "
        << shadowAgg.semanticSceneSubmittedPersistent << ",\n";
+  json << "    \"semanticScenePopulateAttemptCount\": "
+       << shadowAgg.semanticScenePopulateAttemptCount << ",\n";
+  json << "    \"semanticScenePopulateUnitsOnlyCount\": "
+       << shadowAgg.semanticScenePopulateUnitsOnlyCount << ",\n";
+  json << "    \"semanticScenePopulateLastReturnReason\": "
+       << shadowAgg.semanticScenePopulateLastReturnReason << ",\n";
+  json << "    \"semanticScenePopulateLastProducerPublishAttemptDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerPublishAttemptDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerPublishReadyDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerPublishReadyDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerQueryAttemptDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerQueryAttemptDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerQueryHitDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerQueryHitDelta << ",\n";
+  json << "    \"semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta\": "
+       << shadowAgg
+              .semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta\": "
+       << shadowAgg
+              .semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerGroupDecodeAttemptDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerGroupDecodeAttemptDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerGroupDecodeHitDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerGroupDecodeHitDelta
+       << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawRecordCount\": "
+       << shadowAgg.semanticSceneDirectCurrentDrawRecordCount << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawBuiltPacketCount\": "
+       << shadowAgg.semanticSceneDirectCurrentDrawBuiltPacketCount << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount\": "
+       << shadowAgg.semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount
+       << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawUnitsFilterRejectNonSkinnedCount\": "
+       << shadowAgg
+              .semanticSceneDirectCurrentDrawUnitsFilterRejectNonSkinnedCount
+       << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount\": "
+       << shadowAgg
+              .semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount
+       << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount\": "
+        << shadowAgg
+               .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount
+        << ",\n";
+  // Phase 7.2: flicker diagnostics + reconciliation
+  json << "    \"semanticSceneDirectLastRawRecordCount\": "
+       << shadowAgg.semanticSceneDirectLastRawRecordCount << ",\n";
+  json << "    \"semanticSceneDirectLastEligibleRecordCount\": "
+       << shadowAgg.semanticSceneDirectLastEligibleRecordCount << ",\n";
+  json << "    \"semanticSceneDirectLastSubmittedRecordCount\": "
+       << shadowAgg.semanticSceneDirectLastSubmittedRecordCount << ",\n";
+  json << "    \"semanticSceneDirectLastUniqueObjectCount\": "
+       << shadowAgg.semanticSceneDirectLastUniqueObjectCount << ",\n";
+  json << "    \"semanticSceneDirectLastSubmittedObjectCount\": "
+       << shadowAgg.semanticSceneDirectLastSubmittedObjectCount << ",\n";
+  json << "    \"semanticSceneDirectLastRecordCapPartialObjectCount\": "
+       << shadowAgg.semanticSceneDirectLastRecordCapPartialObjectCount << ",\n";
+  json << "    \"semanticSceneDirectLastScanCapPartialObjectCount\": "
+       << shadowAgg.semanticSceneDirectLastScanCapPartialObjectCount << ",\n";
+  json << "    \"semanticSceneDirectLastMinGeosetsPerObject\": "
+       << shadowAgg.semanticSceneDirectLastMinGeosetsPerObject << ",\n";
+  json << "    \"semanticSceneDirectLastMaxGeosetsPerObject\": "
+       << shadowAgg.semanticSceneDirectLastMaxGeosetsPerObject << ",\n";
+  json << "    \"semanticSceneDirectLastSubmittedIdentityHash\": "
+       << shadowAgg.semanticSceneDirectLastSubmittedIdentityHash << ",\n";
+  json << "    \"semanticSceneDirectIdentityChurnCount\": "
+       << shadowAgg.semanticSceneDirectIdentityChurnCount << ",\n";
+  json << "    \"semanticSceneDirectRecordCapHitCount\": "
+       << shadowAgg.semanticSceneDirectRecordCapHitCount << ",\n";
+  json << "    \"semanticSceneDirectRecordCapTruncatedRecordCount\": "
+       << shadowAgg.semanticSceneDirectRecordCapTruncatedRecordCount << ",\n";
+  json << "    \"semanticSceneDirectScanCapHitCount\": "
+       << shadowAgg.semanticSceneDirectScanCapHitCount << ",\n";
+  json << "    \"semanticSceneDirectObjectGroupedSubmitCount\": "
+       << shadowAgg.semanticSceneDirectObjectGroupedSubmitCount << ",\n";
+  json << "    \"semanticSceneDirectObjectGroupedSkipCount\": "
+       << shadowAgg.semanticSceneDirectObjectGroupedSkipCount << ",\n";
+  json << "    \"semanticSceneDirectRecordCapSkipObjectCount\": "
+       << shadowAgg.semanticSceneDirectRecordCapSkipObjectCount << ",\n";
+  json << "    \"semanticSceneDirectRecordCapAppendFailCount\": "
+       << shadowAgg.semanticSceneDirectRecordCapAppendFailCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionLeaseActiveKeyCount\": "
+       << shadowAgg.semanticSceneDirectSelectionLeaseActiveKeyCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionLeasePrunedKeyCount\": "
+       << shadowAgg.semanticSceneDirectSelectionLeasePrunedKeyCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionLeaseSubmittedKeyCount\": "
+       << shadowAgg.semanticSceneDirectSelectionLeaseSubmittedKeyCount << ",\n";
+  json << "    \"semanticSceneDirectStickyFillBudgetRecordCount\": "
+       << shadowAgg.semanticSceneDirectStickyFillBudgetRecordCount << ",\n";
+  json << "    \"semanticSceneDirectStickyFillAppendedCount\": "
+       << shadowAgg.semanticSceneDirectStickyFillAppendedCount << ",\n";
+  json << "    \"semanticSceneDirectStickyFillSubmittedCount\": "
+       << shadowAgg.semanticSceneDirectStickyFillSubmittedCount << ",\n";
+  json << "    \"semanticSceneDirectStickyFillMissedCount\": "
+       << shadowAgg.semanticSceneDirectStickyFillMissedCount << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseRestoredCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseRestoredCount << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseUpdatedCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseUpdatedCount << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseExpiredCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseExpiredCount << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseRejectedDynamicMeshCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseRejectedDynamicMeshCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseRejectedNotSelfContainedCount\": "
+       << shadowAgg
+              .semanticSceneDirectPartLeaseRejectedNotSelfContainedCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseRejectedUnsafeBackingCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseRejectedSelfRenewCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseRejectedSelfRenewCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseBudgetLimitCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseBudgetLimitCount << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRestoredCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartLeaseRestoredCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseExpiredCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartLeaseExpiredCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseBudgetLimitCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartLeaseBudgetLimitCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreCompleteCount\": "
+       << shadowAgg.semanticSceneShadowManifestObjectCoreCompleteCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreIncompleteSkipCount\": "
+       << shadowAgg.semanticSceneShadowManifestObjectCoreIncompleteSkipCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartOmittedIncompleteCoreCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartOmittedIncompleteCoreCount
+       << ",\n";
+  // Phase 7.25 core epoch planner 专属计数器。
+  json << "    \"semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreEpochMissingPartCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestObjectCoreEpochMissingPartCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount
+       << ",\n";
+  // Phase 7.28：skinned palette content stability probe。
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceNoneCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedPaletteSourceNoneCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStablePartSampleCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStablePartSampleCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteHashChurnCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedPaletteHashChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceChurnCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteCountChurnCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedPaletteCountChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteAttributionSnapshotHitCount\": "
+       << shadowAgg
+              .semanticSceneDirectPaletteAttributionSnapshotHitCount
+       << ",\n";
+  json << "    \"semanticSceneDirectManifestObjectCount\": "
+       << shadowAgg.semanticSceneDirectManifestObjectCount << ",\n";
+  json << "    \"semanticSceneDirectManifestObservedPartCount\": "
+       << shadowAgg.semanticSceneDirectManifestObservedPartCount << ",\n";
+  json << "    \"semanticSceneDirectManifestShadowEligiblePartCount\": "
+       << shadowAgg.semanticSceneDirectManifestShadowEligiblePartCount << ",\n";
+  json << "    \"semanticSceneDirectObjectCompleteEligibleCount\": "
+       << shadowAgg.semanticSceneDirectObjectCompleteEligibleCount << ",\n";
+  json << "    \"semanticSceneDirectObjectIncompleteByScanCapCount\": "
+       << shadowAgg.semanticSceneDirectObjectIncompleteByScanCapCount << ",\n";
+  json << "    \"semanticSceneDirectObjectIncompleteByAlphaPolicyCount\": "
+       << shadowAgg.semanticSceneDirectObjectIncompleteByAlphaPolicyCount << ",\n";
+  json << "    \"semanticSceneDirectObjectIncompleteBySliceUnresolvedCount\": "
+       << shadowAgg.semanticSceneDirectObjectIncompleteBySliceUnresolvedCount << ",\n";
+  json << "    \"semanticSceneDirectObjectIncompleteByPacketBuildFailCount\": "
+       << shadowAgg.semanticSceneDirectObjectIncompleteByPacketBuildFailCount << ",\n";
+  json << "    \"semanticSceneDirectObjectIncompleteByAppendFailCount\": "
+       << shadowAgg.semanticSceneDirectObjectIncompleteByAppendFailCount << ",\n";
+  json << "    \"semanticSceneDirectSubmittedCompleteObjectCount\": "
+       << shadowAgg.semanticSceneDirectSubmittedCompleteObjectCount << ",\n";
+  json << "    \"semanticSceneDirectSubmittedPartialObjectCount\": "
+       << shadowAgg.semanticSceneDirectSubmittedPartialObjectCount << ",\n";
+  json << "    \"semanticSceneDirectPreparedSliceAuthoritativeCount\": "
+       << shadowAgg.semanticSceneDirectPreparedSliceAuthoritativeCount << ",\n";
+  json << "    \"semanticSceneDirectPreparedSliceFallbackLayerIndexCount\": "
+       << shadowAgg.semanticSceneDirectPreparedSliceFallbackLayerIndexCount << ",\n";
+  json << "    \"semanticSceneDirectPreparedSliceMissingCount\": "
+       << shadowAgg.semanticSceneDirectPreparedSliceMissingCount << ",\n";
+  json << "    \"semanticScenePreparedProbeAttemptCount\": "
+       << shadowAgg.semanticScenePreparedProbeAttemptCount << ",\n";
+  json << "    \"semanticScenePreparedProbeContextReadyCount\": "
+       << shadowAgg.semanticScenePreparedProbeContextReadyCount << ",\n";
+  json << "    \"semanticScenePreparedProbeBackingReadableCount\": "
+       << shadowAgg.semanticScenePreparedProbeBackingReadableCount << ",\n";
+  json << "    \"semanticScenePreparedSliceRecordedCount\": "
+       << shadowAgg.semanticScenePreparedSliceRecordedCount << ",\n";
+  json << "    \"semanticScenePreparedSliceQueryAttemptCount\": "
+       << shadowAgg.semanticScenePreparedSliceQueryAttemptCount << ",\n";
+  json << "    \"semanticScenePreparedSliceQueryHitCount\": "
+       << shadowAgg.semanticScenePreparedSliceQueryHitCount << ",\n";
+  json << "    \"semanticScenePreparedSliceQueryMissCount\": "
+       << shadowAgg.semanticScenePreparedSliceQueryMissCount << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCount\": "
+       << shadowAgg.semanticSceneShadowManifestObjectCount << ",\n";
+  json << "    \"semanticSceneShadowManifestPartCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestStableObjectCount\": "
+       << shadowAgg.semanticSceneShadowManifestStableObjectCount << ",\n";
+  json << "    \"semanticSceneShadowManifestNewObjectCount\": "
+       << shadowAgg.semanticSceneShadowManifestNewObjectCount << ",\n";
+  json << "    \"semanticSceneShadowManifestExpiredObjectCount\": "
+       << shadowAgg.semanticSceneShadowManifestExpiredObjectCount << ",\n";
+  json << "    \"semanticSceneShadowManifestFreshPartCount\": "
+       << shadowAgg.semanticSceneShadowManifestFreshPartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestLeaseablePartCount\": "
+       << shadowAgg.semanticSceneShadowManifestLeaseablePartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestPoseStalePartCount\": "
+       << shadowAgg.semanticSceneShadowManifestPoseStalePartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestSliceStalePartCount\": "
+       << shadowAgg.semanticSceneShadowManifestSliceStalePartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestExpiredPartCount\": "
+       << shadowAgg.semanticSceneShadowManifestExpiredPartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestMultiSlicePartCount\": "
+       << shadowAgg.semanticSceneShadowManifestMultiSlicePartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestPayload11CChurnCount\": "
+       << shadowAgg.semanticSceneShadowManifestPayload11CChurnCount << ",\n";
+  json << "    \"semanticSceneShadowManifestRenderablePartChurnCount\": "
+       << shadowAgg.semanticSceneShadowManifestRenderablePartChurnCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseHitCount\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseHitCount << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseMissCount\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseMissCount << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseNoRuntimeCount\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseNoRuntimeCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseLastMatrixCount\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseLastMatrixCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseLastMatrixHash\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseLastMatrixHash
+       << ",\n";
+  json << "    \"semanticSceneSubmittedObjectJaccardMilli\": "
+       << shadowAgg.semanticSceneSubmittedObjectJaccardMilli << ",\n";
+  json << "    \"semanticSceneSubmittedPartJaccardMilli\": "
+       << shadowAgg.semanticSceneSubmittedPartJaccardMilli << ",\n";
+  json << "    \"semanticSceneVisibleLookupPartLayerHitCount\": "
+       << shadowAgg.semanticSceneVisibleLookupPartLayerHitCount << ",\n";
+  json << "    \"semanticSceneVisibleLookupSingleFallbackCount\": "
+       << shadowAgg.semanticSceneVisibleLookupSingleFallbackCount << ",\n";
+  json << "    \"semanticSceneVisibleLookupMissCount\": "
+       << shadowAgg.semanticSceneVisibleLookupMissCount << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingNotCheckedCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingNotCheckedCount << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingPassCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingPassCount << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailNoRenderablePartCount\": "
+       << shadowAgg
+              .semanticSceneDirectMainWorldBackingFailNoRenderablePartCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailLookupMissCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingFailLookupMissCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailNonMainQueueCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingFailNonMainQueueCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailNonWorldGroupCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingFailNonWorldGroupCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailIdentityMismatchCount\": "
+       << shadowAgg
+              .semanticSceneDirectMainWorldBackingFailIdentityMismatchCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount\": "
+       << shadowAgg
+              .semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteHashChurnCount\": "
+       << shadowAgg.semanticSceneDirectPaletteHashChurnCount << ",\n";
+  json << "    \"semanticSceneDirectGroupHashChurnCount\": "
+       << shadowAgg.semanticSceneDirectGroupHashChurnCount << ",\n";
+  json << "    \"semanticSceneDirectStableGroupHashChurnCount\": "
+       << shadowAgg.semanticSceneDirectStableGroupHashChurnCount << ",\n";
+  json << "    \"semanticSceneDirectStream1PtrChurnCount\": "
+       << shadowAgg.semanticSceneDirectStream1PtrChurnCount << ",\n";
+  json << "    \"semanticSceneDirectGeometrySourceHashChurnCount\": "
+       << shadowAgg.semanticSceneDirectGeometrySourceHashChurnCount << ",\n";
+  json << "    \"semanticSceneDirectSameCasterComparisonCount\": "
+       << shadowAgg.semanticSceneDirectSameCasterComparisonCount << ",\n";
+  json << "    \"semanticSceneDirectIdentitySkippedChurnCount\": "
+       << shadowAgg.semanticSceneDirectIdentitySkippedChurnCount << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootDeltaSampleCount\": "
+       << shadowAgg.semanticSceneDirectPaletteRootDeltaSampleCount << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootHashChangedTinyDeltaCount\": "
+       << shadowAgg.semanticSceneDirectPaletteRootHashChangedTinyDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootHashChangedSmallDeltaCount\": "
+       << shadowAgg.semanticSceneDirectPaletteRootHashChangedSmallDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootHashChangedMediumDeltaCount\": "
+       << shadowAgg.semanticSceneDirectPaletteRootHashChangedMediumDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootHashChangedLargeDeltaCount\": "
+       << shadowAgg.semanticSceneDirectPaletteRootHashChangedLargeDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootMaxDeltaMilli\": "
+       << shadowAgg.semanticSceneDirectPaletteRootMaxDeltaMilli << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyUnitPtrCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyUnitPtrCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyJHandleCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyJHandleCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyRuntimeModelCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyRuntimeModelCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyWorldObjectCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyWorldObjectCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeySceneNodeCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeySceneNodeCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyModelMeshCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyModelMeshCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyRenderablePartCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyRenderablePartCount
+       << ",\n";
+  json << "    \"semanticSceneLastAppendedGeometrySourceHash\": "
+       << shadowAgg.semanticSceneLastAppendedGeometrySourceHash << ",\n";
+  json << "    \"semanticSceneLastAppendedGeometryId\": "
+       << shadowAgg.semanticSceneLastAppendedGeometryId << ",\n";
+  json << "    \"semanticSceneShadowCastersCount\": "
+       << shadowAgg.semanticSceneShadowCastersCount << ",\n";
+  json << "    \"semanticSceneReplayDrawsCount\": "
+       << shadowAgg.semanticSceneReplayDrawsCount << ",\n";
+  json << "    \"semanticSceneShadowMapDrawnCasters\": "
+       << shadowAgg.semanticSceneShadowMapDrawnCasters << ",\n";
+  json << "    \"semanticSceneShadowMapCascadeCulledCount\": "
+       << shadowAgg.semanticSceneShadowMapCascadeCulledCount << ",\n";
+  json << "    \"semanticSceneShadowMapSkinnedCasterCount\": "
+       << shadowAgg.semanticSceneShadowMapSkinnedCasterCount << ",\n";
+  json << "    \"semanticSceneShadowMapSkinnedPreparedCount\": "
+       << shadowAgg.semanticSceneShadowMapSkinnedPreparedCount << ",\n";
+  json << "    \"semanticSceneShadowMapSkinnedInvalidBufferCount\": "
+       << shadowAgg.semanticSceneShadowMapSkinnedInvalidBufferCount << ",\n";
+  json << "    \"semanticSceneShadowMapSkinnedInvalidPipelineCount\": "
+       << shadowAgg.semanticSceneShadowMapSkinnedInvalidPipelineCount << ",\n";
+  json << "    \"semanticSceneShadowMapSkinnedDrawnCount\": "
+       << shadowAgg.semanticSceneShadowMapSkinnedDrawnCount << ",\n";
+  json << "    \"semanticSceneShadowTaaActive\": "
+       << shadowAgg.semanticSceneShadowTaaActive << ",\n";
+  json << "    \"semanticSceneReceiverReuseShadowMap\": "
+       << shadowAgg.semanticSceneReceiverReuseShadowMap << ",\n";
+  json << "    \"semanticSceneReceiverInputValid\": "
+       << shadowAgg.semanticSceneReceiverInputValid << ",\n";
+  json << "    \"semanticSceneReceiverInputRejectReason\": "
+       << shadowAgg.semanticSceneReceiverInputRejectReason << ",\n";
+  json << "    \"semanticSceneReceiverNeedPass\": "
+       << shadowAgg.semanticSceneReceiverNeedPass << ",\n";
+  json << "    \"semanticSceneReceiverNeedShadowMap\": "
+       << shadowAgg.semanticSceneReceiverNeedShadowMap << ",\n";
+  json << "    \"semanticSceneReceiverHasCompleteShadowMap\": "
+       << shadowAgg.semanticSceneReceiverHasCompleteShadowMap << ",\n";
+  json << "    \"semanticSceneReceiverHasUsableDirectionalShadow\": "
+       << shadowAgg.semanticSceneReceiverHasUsableDirectionalShadow << ",\n";
+  json << "    \"semanticSceneReceiverActiveStrengthMilli\": "
+       << shadowAgg.semanticSceneReceiverActiveStrengthMilli << ",\n";
+  json << "    \"semanticSceneReceiverUboStrengthMilli\": "
+       << shadowAgg.semanticSceneReceiverUboStrengthMilli << ",\n";
+  json << "    \"semanticSceneReceiverDebugMode\": "
+       << shadowAgg.semanticSceneReceiverDebugMode << ",\n";
+  json << "    \"semanticSceneReceiverCsmCascadeCount\": "
+       << shadowAgg.semanticSceneReceiverCsmCascadeCount << ",\n";
+  json << "    \"semanticSceneReceiverZeroStrengthFrameCount\": "
+       << shadowAgg.semanticSceneReceiverZeroStrengthFrameCount << ",\n";
+  json << "    \"semanticSceneReceiverDrawnWithZeroStrengthCount\": "
+       << shadowAgg.semanticSceneReceiverDrawnWithZeroStrengthCount << ",\n";
+  json << "    \"semanticSceneReceiverNoCompleteShadowMapCount\": "
+       << shadowAgg.semanticSceneReceiverNoCompleteShadowMapCount << ",\n";
+  json << "    \"semanticSceneReceiverNoShadowMapImageCount\": "
+       << shadowAgg.semanticSceneReceiverNoShadowMapImageCount << ",\n";
+  json << "    \"semanticSceneReceiverNoShadowMapSampleViewCount\": "
+       << shadowAgg.semanticSceneReceiverNoShadowMapSampleViewCount << ",\n";
+  json << "    \"semanticSceneReceiverNoCandidateCsmCount\": "
+       << shadowAgg.semanticSceneReceiverNoCandidateCsmCount << ",\n";
+  json << "    \"semanticSceneReceiverCsmFallbackToLastGoodCount\": "
+       << shadowAgg.semanticSceneReceiverCsmFallbackToLastGoodCount << ",\n";
+  json << "    \"semanticSceneReceiverHoldInvalidCsmCount\": "
+       << shadowAgg.semanticSceneReceiverHoldInvalidCsmCount << ",\n";
+  json << "    \"semanticSceneReceiverHoldEmptyReplayCount\": "
+       << shadowAgg.semanticSceneReceiverHoldEmptyReplayCount << ",\n";
+  json << "    \"semanticSceneReceiverHoldIdentityChurnCount\": "
+       << shadowAgg.semanticSceneReceiverHoldIdentityChurnCount << ",\n";
+  json << "    \"semanticSceneReceiverReuseInvalidatedAfterEnsureCount\": "
+       << shadowAgg.semanticSceneReceiverReuseInvalidatedAfterEnsureCount
+       << ",\n";
+  json << "    \"semanticSceneShadowMapRenderSkippedNoResourcesCount\": "
+       << shadowAgg.semanticSceneShadowMapRenderSkippedNoResourcesCount
+       << ",\n";
+  json << "    \"semanticSceneShadowMapRenderSkippedNoMatrixBufferCount\": "
+       << shadowAgg.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount
+       << ",\n";
+  json << "    \"semanticSceneReceiverViewportX\": "
+       << shadowAgg.semanticSceneReceiverViewportX << ",\n";
+  json << "    \"semanticSceneReceiverViewportY\": "
+       << shadowAgg.semanticSceneReceiverViewportY << ",\n";
+  json << "    \"semanticSceneReceiverViewportWidth\": "
+       << shadowAgg.semanticSceneReceiverViewportWidth << ",\n";
+  json << "    \"semanticSceneReceiverViewportHeight\": "
+       << shadowAgg.semanticSceneReceiverViewportHeight << ",\n";
   json << "    \"semanticSceneSkippedUnitsOnlyFilter\": "
        << shadowAgg.semanticSceneSkippedUnitsOnlyFilter << ",\n";
   json << "    \"semanticSceneAcceptedExplicitResourceOwnerRigid\": "
@@ -1711,12 +3005,72 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneSubmittedUnit << ",\n";
   json << "    \"semanticSceneSubmittedSkinned\": "
        << shadowAgg.semanticSceneSubmittedSkinned << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedNonUnitResolvedCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedNonUnitResolvedCount << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedUnknownPacketKindCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedUnknownPacketKindCount << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedGroupNonZeroCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedGroupNonZeroCount << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedTransparentQueueCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedTransparentQueueCount << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedMissingUnitPtrCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedMissingUnitPtrCount << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedBuilding\": "
+       << shadowAgg.semanticSceneSubmittedBuilding << ",\n";
+  json << "    \"semanticSceneSubmittedDestructible\": "
+       << shadowAgg.semanticSceneSubmittedDestructible << ",\n";
+  json << "    \"semanticSceneSubmittedCutout\": "
+       << shadowAgg.semanticSceneSubmittedCutout << ",\n";
+  json << "    \"semanticSceneSubmittedAlphaBlend\": "
+       << shadowAgg.semanticSceneSubmittedAlphaBlend << ",\n";
+  json << "    \"semanticSceneMaterialObservedCutoutCount\": "
+       << shadowAgg.semanticSceneMaterialObservedCutoutCount << ",\n";
+  json << "    \"semanticSceneMaterialObservedAlphaBlendCount\": "
+       << shadowAgg.semanticSceneMaterialObservedAlphaBlendCount << ",\n";
+  json << "    \"semanticSceneRejectedCutoutSkinnedContract\": "
+       << shadowAgg.semanticSceneRejectedCutoutSkinnedContract << ",\n";
+  json << "    \"semanticSceneRejectedAlphaBlendSkinnedContract\": "
+       << shadowAgg.semanticSceneRejectedAlphaBlendSkinnedContract << ",\n";
+  json << "    \"semanticSceneRejectedCutoutGeometry\": "
+       << shadowAgg.semanticSceneRejectedCutoutGeometry << ",\n";
+  json << "    \"semanticSceneRejectedAlphaBlendGeometry\": "
+       << shadowAgg.semanticSceneRejectedAlphaBlendGeometry << ",\n";
+  json << "    \"semanticSceneRejectedCutoutVisualPolicy\": "
+       << shadowAgg.semanticSceneRejectedCutoutVisualPolicy << ",\n";
+  json << "    \"semanticSceneRejectedAlphaBlendVisualPolicy\": "
+       << shadowAgg.semanticSceneRejectedAlphaBlendVisualPolicy << ",\n";
+  json << "    \"semanticSceneMaterialLayerContractResolvedCount\": "
+       << shadowAgg.semanticSceneMaterialLayerContractResolvedCount << ",\n";
+  json << "    \"semanticSceneMaterialLayerContractFailedCount\": "
+       << shadowAgg.semanticSceneMaterialLayerContractFailedCount << ",\n";
+  json << "    \"semanticSceneMaterialBlendMode0Count\": "
+       << shadowAgg.semanticSceneMaterialBlendMode0Count << ",\n";
+  json << "    \"semanticSceneMaterialBlendMode1Count\": "
+       << shadowAgg.semanticSceneMaterialBlendMode1Count << ",\n";
+  json << "    \"semanticSceneMaterialBlendMode2PlusCount\": "
+       << shadowAgg.semanticSceneMaterialBlendMode2PlusCount << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawLayerIndexNonZeroCount\": "
+       << shadowAgg.semanticSceneDirectCurrentDrawLayerIndexNonZeroCount << ",\n";
   json << "    \"semanticSceneLivePaletteRefreshAttemptCount\": "
        << shadowAgg.semanticSceneLivePaletteRefreshAttemptCount << ",\n";
   json << "    \"semanticSceneLivePaletteRefreshHitCount\": "
        << shadowAgg.semanticSceneLivePaletteRefreshHitCount << ",\n";
   json << "    \"semanticSceneLivePaletteRefreshMissCount\": "
        << shadowAgg.semanticSceneLivePaletteRefreshMissCount << ",\n";
+  json << "    \"semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount\": "
+       << shadowAgg.semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount << ",\n";
+  json << "    \"semanticScenePaletteOverrideNoComposeCount\": "
+       << shadowAgg.semanticScenePaletteOverrideNoComposeCount << ",\n";
+  json << "    \"semanticScenePaletteOverrideWouldComposeCount\": "
+       << shadowAgg.semanticScenePaletteOverrideWouldComposeCount << ",\n";
+  json << "    \"semanticScenePalettePacketWorldComposeCount\": "
+       << shadowAgg.semanticScenePalettePacketWorldComposeCount << ",\n";
   json << "    \"semanticSceneLivePaletteRefreshLastRuntimeModelPtr\": "
        << runtimeSummary.semanticSceneLivePaletteRefreshLastRuntimeModelPtr
        << ",\n";
@@ -1795,6 +3149,68 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << runtimeSummary.semanticSceneSubmittedPaletteMotionLastHash << ",\n";
   json << "    \"semanticSceneSkinnedDynamicIndexSliceCount\": "
        << shadowAgg.semanticSceneSkinnedDynamicIndexSliceCount << ",\n";
+  json << "    \"semanticSceneSubmittedOwnedGroupSlots\": "
+       << shadowAgg.semanticSceneSubmittedOwnedGroupSlots << ",\n";
+  json << "    \"semanticSceneCurrentDrawContractKnownCount\": "
+       << shadowAgg.semanticSceneCurrentDrawContractKnownCount << ",\n";
+  json << "    \"semanticSceneCurrentDrawPaletteReadyCount\": "
+       << shadowAgg.semanticSceneCurrentDrawPaletteReadyCount << ",\n";
+  json << "    \"semanticSceneCurrentDrawGroupSlotReadyCount\": "
+       << shadowAgg.semanticSceneCurrentDrawGroupSlotReadyCount << ",\n";
+  json << "    \"semanticSceneCurrentDrawResolveReadyCount\": "
+       << shadowAgg.semanticSceneCurrentDrawResolveReadyCount << ",\n";
+  json << "    \"semanticSceneCurrentDrawMissNoContract\": "
+       << shadowAgg.semanticSceneCurrentDrawMissNoContract << ",\n";
+  json << "    \"semanticSceneCurrentDrawMissNoPalette\": "
+       << shadowAgg.semanticSceneCurrentDrawMissNoPalette << ",\n";
+  json << "    \"semanticSceneCurrentDrawMissNoGroupSlots\": "
+       << shadowAgg.semanticSceneCurrentDrawMissNoGroupSlots << ",\n";
+  json << "    \"semanticSceneCurrentDrawMissStaleVisibleFrame\": "
+       << shadowAgg.semanticSceneCurrentDrawMissStaleVisibleFrame << ",\n";
+  json << "    \"semanticSceneCurrentDrawResolveReadyRejectedCount\": "
+       << shadowAgg.semanticSceneCurrentDrawResolveReadyRejectedCount << ",\n";
+  json << "    \"semanticSceneCanonicalReadyCount\": "
+       << shadowAgg.semanticSceneCanonicalReadyCount << ",\n";
+  json << "    \"semanticSceneCanonicalRejectNoStableIdentity\": "
+       << shadowAgg.semanticSceneCanonicalRejectNoStableIdentity << ",\n";
+  json << "    \"semanticSceneCanonicalRejectNoMesh\": "
+       << shadowAgg.semanticSceneCanonicalRejectNoMesh << ",\n";
+  json << "    \"semanticSceneCanonicalRejectNoWorldTransform\": "
+       << shadowAgg.semanticSceneCanonicalRejectNoWorldTransform << ",\n";
+  json << "    \"semanticSceneCanonicalRejectNoPalette\": "
+       << shadowAgg.semanticSceneCanonicalRejectNoPalette << ",\n";
+  json << "    \"semanticSceneCanonicalRejectNoSlotContract\": "
+       << shadowAgg.semanticSceneCanonicalRejectNoSlotContract << ",\n";
+  json << "    \"semanticSceneCanonicalRejectStaleProducer\": "
+       << shadowAgg.semanticSceneCanonicalRejectStaleProducer << ",\n";
+  json << "    \"semanticSceneCanonicalRejectInvalidVertexIndex\": "
+       << shadowAgg.semanticSceneCanonicalRejectInvalidVertexIndex << ",\n";
+  json << "    \"semanticSceneCanonicalRejectExplicitBlendIncomplete\": "
+       << shadowAgg.semanticSceneCanonicalRejectExplicitBlendIncomplete << ",\n";
+  json << "    \"semanticSceneCanonicalRejectAfterReadyCount\": "
+       << shadowAgg.semanticSceneCanonicalRejectAfterReadyCount << ",\n";
+  json << "    \"semanticSceneSubmittedExplicitBlendContract\": "
+       << shadowAgg.semanticSceneSubmittedExplicitBlendContract << ",\n";
+  json << "    \"semanticSceneSubmittedSingleMatrixGroupSkinning\": "
+       << shadowAgg.semanticSceneSubmittedSingleMatrixGroupSkinning << ",\n";
+  json << "    \"semanticSceneSubmittedMultiGroupSlotSkinning\": "
+       << shadowAgg.semanticSceneSubmittedMultiGroupSlotSkinning << ",\n";
+  json << "    \"semanticSceneSkinnedMinUniqueGroupSlots\": "
+       << shadowAgg.semanticSceneSkinnedMinUniqueGroupSlots << ",\n";
+  json << "    \"semanticSceneSkinnedMaxUniqueGroupSlots\": "
+       << shadowAgg.semanticSceneSkinnedMaxUniqueGroupSlots << ",\n";
+  json << "    \"semanticSceneSkinnedGroupSlotsUnique1Count\": "
+       << shadowAgg.semanticSceneSkinnedGroupSlotsUnique1Count << ",\n";
+  json << "    \"semanticSceneSkinnedGroupSlotsUnique2To4Count\": "
+       << shadowAgg.semanticSceneSkinnedGroupSlotsUnique2To4Count << ",\n";
+  json << "    \"semanticSceneSkinnedGroupSlotsUnique5To8Count\": "
+       << shadowAgg.semanticSceneSkinnedGroupSlotsUnique5To8Count << ",\n";
+  json << "    \"semanticSceneSkinnedGroupSlotsUnique9To16Count\": "
+       << shadowAgg.semanticSceneSkinnedGroupSlotsUnique9To16Count << ",\n";
+  json << "    \"semanticSceneSkinnedGroupSlotsUnique17PlusCount\": "
+       << shadowAgg.semanticSceneSkinnedGroupSlotsUnique17PlusCount << ",\n";
+  json << "    \"semanticSceneExplicitBlendUnavailableCurrentDraw\": "
+       << shadowAgg.semanticSceneExplicitBlendUnavailableCurrentDraw << ",\n";
   json << "    \"semanticSceneSkinnedFullIndexFallbackCount\": "
        << shadowAgg.semanticSceneSkinnedFullIndexFallbackCount << ",\n";
   json << "    \"semanticSceneSkinnedMissingVisibleIndexSliceRejectCount\": "
@@ -1811,6 +3227,551 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneSubmittedFrameLocal << ",\n";
   json << "    \"semanticSceneSubmittedPersistent\": "
        << shadowAgg.semanticSceneSubmittedPersistent << ",\n";
+  json << "    \"semanticScenePopulateAttemptCount\": "
+       << shadowAgg.semanticScenePopulateAttemptCount << ",\n";
+  json << "    \"semanticScenePopulateUnitsOnlyCount\": "
+       << shadowAgg.semanticScenePopulateUnitsOnlyCount << ",\n";
+  json << "    \"semanticScenePopulateLastReturnReason\": "
+       << shadowAgg.semanticScenePopulateLastReturnReason << ",\n";
+  json << "    \"semanticScenePopulateLastProducerPublishAttemptDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerPublishAttemptDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerPublishReadyDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerPublishReadyDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerQueryAttemptDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerQueryAttemptDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerQueryHitDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerQueryHitDelta << ",\n";
+  json << "    \"semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta\": "
+       << shadowAgg
+              .semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta\": "
+       << shadowAgg
+              .semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerGroupDecodeAttemptDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerGroupDecodeAttemptDelta
+       << ",\n";
+  json << "    \"semanticScenePopulateLastProducerGroupDecodeHitDelta\": "
+       << shadowAgg.semanticScenePopulateLastProducerGroupDecodeHitDelta
+       << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawRecordCount\": "
+       << shadowAgg.semanticSceneDirectCurrentDrawRecordCount << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawBuiltPacketCount\": "
+       << shadowAgg.semanticSceneDirectCurrentDrawBuiltPacketCount << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount\": "
+       << shadowAgg.semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount
+       << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawUnitsFilterRejectNonSkinnedCount\": "
+       << shadowAgg
+              .semanticSceneDirectCurrentDrawUnitsFilterRejectNonSkinnedCount
+       << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount\": "
+       << shadowAgg
+              .semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount
+       << ",\n";
+  json << "    \"semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount\": "
+        << shadowAgg
+               .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount
+        << ",\n";
+  // Phase 7.2: flicker diagnostics + reconciliation
+  json << "    \"semanticSceneDirectLastRawRecordCount\": "
+       << shadowAgg.semanticSceneDirectLastRawRecordCount << ",\n";
+  json << "    \"semanticSceneDirectLastEligibleRecordCount\": "
+       << shadowAgg.semanticSceneDirectLastEligibleRecordCount << ",\n";
+  json << "    \"semanticSceneDirectLastSubmittedRecordCount\": "
+       << shadowAgg.semanticSceneDirectLastSubmittedRecordCount << ",\n";
+  json << "    \"semanticSceneDirectLastUniqueObjectCount\": "
+       << shadowAgg.semanticSceneDirectLastUniqueObjectCount << ",\n";
+  json << "    \"semanticSceneDirectLastSubmittedObjectCount\": "
+       << shadowAgg.semanticSceneDirectLastSubmittedObjectCount << ",\n";
+  json << "    \"semanticSceneDirectLastRecordCapPartialObjectCount\": "
+       << shadowAgg.semanticSceneDirectLastRecordCapPartialObjectCount << ",\n";
+  json << "    \"semanticSceneDirectLastScanCapPartialObjectCount\": "
+       << shadowAgg.semanticSceneDirectLastScanCapPartialObjectCount << ",\n";
+  json << "    \"semanticSceneDirectLastMinGeosetsPerObject\": "
+       << shadowAgg.semanticSceneDirectLastMinGeosetsPerObject << ",\n";
+  json << "    \"semanticSceneDirectLastMaxGeosetsPerObject\": "
+       << shadowAgg.semanticSceneDirectLastMaxGeosetsPerObject << ",\n";
+  json << "    \"semanticSceneDirectLastSubmittedIdentityHash\": "
+       << shadowAgg.semanticSceneDirectLastSubmittedIdentityHash << ",\n";
+  json << "    \"semanticSceneDirectIdentityChurnCount\": "
+       << shadowAgg.semanticSceneDirectIdentityChurnCount << ",\n";
+  json << "    \"semanticSceneDirectRecordCapHitCount\": "
+       << shadowAgg.semanticSceneDirectRecordCapHitCount << ",\n";
+  json << "    \"semanticSceneDirectRecordCapTruncatedRecordCount\": "
+       << shadowAgg.semanticSceneDirectRecordCapTruncatedRecordCount << ",\n";
+  json << "    \"semanticSceneDirectScanCapHitCount\": "
+       << shadowAgg.semanticSceneDirectScanCapHitCount << ",\n";
+  json << "    \"semanticSceneDirectObjectGroupedSubmitCount\": "
+       << shadowAgg.semanticSceneDirectObjectGroupedSubmitCount << ",\n";
+  json << "    \"semanticSceneDirectObjectGroupedSkipCount\": "
+       << shadowAgg.semanticSceneDirectObjectGroupedSkipCount << ",\n";
+  json << "    \"semanticSceneDirectRecordCapSkipObjectCount\": "
+       << shadowAgg.semanticSceneDirectRecordCapSkipObjectCount << ",\n";
+  json << "    \"semanticSceneDirectRecordCapAppendFailCount\": "
+       << shadowAgg.semanticSceneDirectRecordCapAppendFailCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionLeaseActiveKeyCount\": "
+       << shadowAgg.semanticSceneDirectSelectionLeaseActiveKeyCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionLeasePrunedKeyCount\": "
+       << shadowAgg.semanticSceneDirectSelectionLeasePrunedKeyCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionLeaseSubmittedKeyCount\": "
+       << shadowAgg.semanticSceneDirectSelectionLeaseSubmittedKeyCount << ",\n";
+  json << "    \"semanticSceneDirectStickyFillBudgetRecordCount\": "
+       << shadowAgg.semanticSceneDirectStickyFillBudgetRecordCount << ",\n";
+  json << "    \"semanticSceneDirectStickyFillAppendedCount\": "
+       << shadowAgg.semanticSceneDirectStickyFillAppendedCount << ",\n";
+  json << "    \"semanticSceneDirectStickyFillSubmittedCount\": "
+       << shadowAgg.semanticSceneDirectStickyFillSubmittedCount << ",\n";
+  json << "    \"semanticSceneDirectStickyFillMissedCount\": "
+       << shadowAgg.semanticSceneDirectStickyFillMissedCount << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseRestoredCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseRestoredCount << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseUpdatedCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseUpdatedCount << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseExpiredCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseExpiredCount << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseRejectedDynamicMeshCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseRejectedDynamicMeshCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseRejectedNotSelfContainedCount\": "
+       << shadowAgg
+              .semanticSceneDirectPartLeaseRejectedNotSelfContainedCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseRejectedUnsafeBackingCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseRejectedSelfRenewCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseRejectedSelfRenewCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPartLeaseBudgetLimitCount\": "
+       << shadowAgg.semanticSceneDirectPartLeaseBudgetLimitCount << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRestoredCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartLeaseRestoredCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseExpiredCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartLeaseExpiredCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseBudgetLimitCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartLeaseBudgetLimitCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreCompleteCount\": "
+       << shadowAgg.semanticSceneShadowManifestObjectCoreCompleteCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreIncompleteSkipCount\": "
+       << shadowAgg.semanticSceneShadowManifestObjectCoreIncompleteSkipCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestPartOmittedIncompleteCoreCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartOmittedIncompleteCoreCount
+       << ",\n";
+  // Phase 7.25 core epoch planner 专属计数器。
+  json << "    \"semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreEpochMissingPartCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestObjectCoreEpochMissingPartCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount\": "
+       << shadowAgg
+              .semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount
+       << ",\n";
+  // Phase 7.28：skinned palette content stability probe。
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceNoneCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedPaletteSourceNoneCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStablePartSampleCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStablePartSampleCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteHashChurnCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedPaletteHashChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSourceChurnCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSourceChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteCountChurnCount\": "
+       << shadowAgg.semanticSceneSubmittedSkinnedPaletteCountChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount\": "
+       << shadowAgg
+              .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteAttributionSnapshotHitCount\": "
+       << shadowAgg
+              .semanticSceneDirectPaletteAttributionSnapshotHitCount
+       << ",\n";
+  json << "    \"semanticSceneDirectManifestObjectCount\": "
+       << shadowAgg.semanticSceneDirectManifestObjectCount << ",\n";
+  json << "    \"semanticSceneDirectManifestObservedPartCount\": "
+       << shadowAgg.semanticSceneDirectManifestObservedPartCount << ",\n";
+  json << "    \"semanticSceneDirectManifestShadowEligiblePartCount\": "
+       << shadowAgg.semanticSceneDirectManifestShadowEligiblePartCount << ",\n";
+  json << "    \"semanticSceneDirectObjectCompleteEligibleCount\": "
+       << shadowAgg.semanticSceneDirectObjectCompleteEligibleCount << ",\n";
+  json << "    \"semanticSceneDirectObjectIncompleteByScanCapCount\": "
+       << shadowAgg.semanticSceneDirectObjectIncompleteByScanCapCount << ",\n";
+  json << "    \"semanticSceneDirectObjectIncompleteByAlphaPolicyCount\": "
+       << shadowAgg.semanticSceneDirectObjectIncompleteByAlphaPolicyCount << ",\n";
+  json << "    \"semanticSceneDirectObjectIncompleteBySliceUnresolvedCount\": "
+       << shadowAgg.semanticSceneDirectObjectIncompleteBySliceUnresolvedCount << ",\n";
+  json << "    \"semanticSceneDirectObjectIncompleteByPacketBuildFailCount\": "
+       << shadowAgg.semanticSceneDirectObjectIncompleteByPacketBuildFailCount << ",\n";
+  json << "    \"semanticSceneDirectObjectIncompleteByAppendFailCount\": "
+       << shadowAgg.semanticSceneDirectObjectIncompleteByAppendFailCount << ",\n";
+  json << "    \"semanticSceneDirectSubmittedCompleteObjectCount\": "
+       << shadowAgg.semanticSceneDirectSubmittedCompleteObjectCount << ",\n";
+  json << "    \"semanticSceneDirectSubmittedPartialObjectCount\": "
+       << shadowAgg.semanticSceneDirectSubmittedPartialObjectCount << ",\n";
+  json << "    \"semanticSceneDirectPreparedSliceAuthoritativeCount\": "
+       << shadowAgg.semanticSceneDirectPreparedSliceAuthoritativeCount << ",\n";
+  json << "    \"semanticSceneDirectPreparedSliceFallbackLayerIndexCount\": "
+       << shadowAgg.semanticSceneDirectPreparedSliceFallbackLayerIndexCount << ",\n";
+  json << "    \"semanticSceneDirectPreparedSliceMissingCount\": "
+       << shadowAgg.semanticSceneDirectPreparedSliceMissingCount << ",\n";
+  json << "    \"semanticScenePreparedProbeAttemptCount\": "
+       << shadowAgg.semanticScenePreparedProbeAttemptCount << ",\n";
+  json << "    \"semanticScenePreparedProbeContextReadyCount\": "
+       << shadowAgg.semanticScenePreparedProbeContextReadyCount << ",\n";
+  json << "    \"semanticScenePreparedProbeBackingReadableCount\": "
+       << shadowAgg.semanticScenePreparedProbeBackingReadableCount << ",\n";
+  json << "    \"semanticScenePreparedSliceRecordedCount\": "
+       << shadowAgg.semanticScenePreparedSliceRecordedCount << ",\n";
+  json << "    \"semanticScenePreparedSliceQueryAttemptCount\": "
+       << shadowAgg.semanticScenePreparedSliceQueryAttemptCount << ",\n";
+  json << "    \"semanticScenePreparedSliceQueryHitCount\": "
+       << shadowAgg.semanticScenePreparedSliceQueryHitCount << ",\n";
+  json << "    \"semanticScenePreparedSliceQueryMissCount\": "
+       << shadowAgg.semanticScenePreparedSliceQueryMissCount << ",\n";
+  json << "    \"semanticSceneShadowManifestObjectCount\": "
+       << shadowAgg.semanticSceneShadowManifestObjectCount << ",\n";
+  json << "    \"semanticSceneShadowManifestPartCount\": "
+       << shadowAgg.semanticSceneShadowManifestPartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestStableObjectCount\": "
+       << shadowAgg.semanticSceneShadowManifestStableObjectCount << ",\n";
+  json << "    \"semanticSceneShadowManifestNewObjectCount\": "
+       << shadowAgg.semanticSceneShadowManifestNewObjectCount << ",\n";
+  json << "    \"semanticSceneShadowManifestExpiredObjectCount\": "
+       << shadowAgg.semanticSceneShadowManifestExpiredObjectCount << ",\n";
+  json << "    \"semanticSceneShadowManifestFreshPartCount\": "
+       << shadowAgg.semanticSceneShadowManifestFreshPartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestLeaseablePartCount\": "
+       << shadowAgg.semanticSceneShadowManifestLeaseablePartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestPoseStalePartCount\": "
+       << shadowAgg.semanticSceneShadowManifestPoseStalePartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestSliceStalePartCount\": "
+       << shadowAgg.semanticSceneShadowManifestSliceStalePartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestExpiredPartCount\": "
+       << shadowAgg.semanticSceneShadowManifestExpiredPartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestMultiSlicePartCount\": "
+       << shadowAgg.semanticSceneShadowManifestMultiSlicePartCount << ",\n";
+  json << "    \"semanticSceneShadowManifestPayload11CChurnCount\": "
+       << shadowAgg.semanticSceneShadowManifestPayload11CChurnCount << ",\n";
+  json << "    \"semanticSceneShadowManifestRenderablePartChurnCount\": "
+       << shadowAgg.semanticSceneShadowManifestRenderablePartChurnCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseHitCount\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseHitCount << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseMissCount\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseMissCount << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseNoRuntimeCount\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseNoRuntimeCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseLastMatrixCount\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseLastMatrixCount
+       << ",\n";
+  json << "    \"semanticSceneShadowManifestCModelPoseLastMatrixHash\": "
+       << shadowAgg.semanticSceneShadowManifestCModelPoseLastMatrixHash
+       << ",\n";
+  json << "    \"semanticSceneSubmittedObjectJaccardMilli\": "
+       << shadowAgg.semanticSceneSubmittedObjectJaccardMilli << ",\n";
+  json << "    \"semanticSceneSubmittedPartJaccardMilli\": "
+       << shadowAgg.semanticSceneSubmittedPartJaccardMilli << ",\n";
+  json << "    \"semanticSceneVisibleLookupPartLayerHitCount\": "
+       << shadowAgg.semanticSceneVisibleLookupPartLayerHitCount << ",\n";
+  json << "    \"semanticSceneVisibleLookupSingleFallbackCount\": "
+       << shadowAgg.semanticSceneVisibleLookupSingleFallbackCount << ",\n";
+  json << "    \"semanticSceneVisibleLookupMissCount\": "
+       << shadowAgg.semanticSceneVisibleLookupMissCount << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingNotCheckedCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingNotCheckedCount << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingPassCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingPassCount << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailNoRenderablePartCount\": "
+       << shadowAgg
+              .semanticSceneDirectMainWorldBackingFailNoRenderablePartCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailLookupMissCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingFailLookupMissCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailNonMainQueueCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingFailNonMainQueueCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailNonWorldGroupCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingFailNonWorldGroupCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailIdentityMismatchCount\": "
+       << shadowAgg
+              .semanticSceneDirectMainWorldBackingFailIdentityMismatchCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount\": "
+       << shadowAgg
+              .semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount
+       << ",\n";
+  json << "    \"semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount\": "
+       << shadowAgg.semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteHashChurnCount\": "
+       << shadowAgg.semanticSceneDirectPaletteHashChurnCount << ",\n";
+  json << "    \"semanticSceneDirectGroupHashChurnCount\": "
+       << shadowAgg.semanticSceneDirectGroupHashChurnCount << ",\n";
+  json << "    \"semanticSceneDirectStableGroupHashChurnCount\": "
+       << shadowAgg.semanticSceneDirectStableGroupHashChurnCount << ",\n";
+  json << "    \"semanticSceneDirectStream1PtrChurnCount\": "
+       << shadowAgg.semanticSceneDirectStream1PtrChurnCount << ",\n";
+  json << "    \"semanticSceneDirectGeometrySourceHashChurnCount\": "
+       << shadowAgg.semanticSceneDirectGeometrySourceHashChurnCount << ",\n";
+  json << "    \"semanticSceneDirectSameCasterComparisonCount\": "
+       << shadowAgg.semanticSceneDirectSameCasterComparisonCount << ",\n";
+  json << "    \"semanticSceneDirectIdentitySkippedChurnCount\": "
+       << shadowAgg.semanticSceneDirectIdentitySkippedChurnCount << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootDeltaSampleCount\": "
+       << shadowAgg.semanticSceneDirectPaletteRootDeltaSampleCount << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootHashChangedTinyDeltaCount\": "
+       << shadowAgg.semanticSceneDirectPaletteRootHashChangedTinyDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootHashChangedSmallDeltaCount\": "
+       << shadowAgg.semanticSceneDirectPaletteRootHashChangedSmallDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootHashChangedMediumDeltaCount\": "
+       << shadowAgg.semanticSceneDirectPaletteRootHashChangedMediumDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootHashChangedLargeDeltaCount\": "
+       << shadowAgg.semanticSceneDirectPaletteRootHashChangedLargeDeltaCount
+       << ",\n";
+  json << "    \"semanticSceneDirectPaletteRootMaxDeltaMilli\": "
+       << shadowAgg.semanticSceneDirectPaletteRootMaxDeltaMilli << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyUnitPtrCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyUnitPtrCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyJHandleCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyJHandleCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyRuntimeModelCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyRuntimeModelCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyWorldObjectCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyWorldObjectCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeySceneNodeCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeySceneNodeCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyModelMeshCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyModelMeshCount << ",\n";
+  json << "    \"semanticSceneDirectSelectionKeyRenderablePartCount\": "
+       << shadowAgg.semanticSceneDirectSelectionKeyRenderablePartCount
+       << ",\n";
+  json << "    \"semanticSceneLastAppendedGeometrySourceHash\": "
+       << shadowAgg.semanticSceneLastAppendedGeometrySourceHash << ",\n";
+  json << "    \"semanticSceneLastAppendedGeometryId\": "
+       << shadowAgg.semanticSceneLastAppendedGeometryId << ",\n";
+  json << "    \"semanticSceneShadowCastersCount\": "
+       << shadowAgg.semanticSceneShadowCastersCount << ",\n";
+  json << "    \"semanticSceneReplayDrawsCount\": "
+       << shadowAgg.semanticSceneReplayDrawsCount << ",\n";
+  json << "    \"semanticSceneShadowMapDrawnCasters\": "
+       << shadowAgg.semanticSceneShadowMapDrawnCasters << ",\n";
+  json << "    \"semanticSceneShadowMapCascadeCulledCount\": "
+       << shadowAgg.semanticSceneShadowMapCascadeCulledCount << ",\n";
+  json << "    \"semanticSceneShadowMapSkinnedCasterCount\": "
+       << shadowAgg.semanticSceneShadowMapSkinnedCasterCount << ",\n";
+  json << "    \"semanticSceneShadowMapSkinnedPreparedCount\": "
+       << shadowAgg.semanticSceneShadowMapSkinnedPreparedCount << ",\n";
+  json << "    \"semanticSceneShadowMapSkinnedInvalidBufferCount\": "
+       << shadowAgg.semanticSceneShadowMapSkinnedInvalidBufferCount << ",\n";
+  json << "    \"semanticSceneShadowMapSkinnedInvalidPipelineCount\": "
+       << shadowAgg.semanticSceneShadowMapSkinnedInvalidPipelineCount << ",\n";
+  json << "    \"semanticSceneShadowMapSkinnedDrawnCount\": "
+       << shadowAgg.semanticSceneShadowMapSkinnedDrawnCount << ",\n";
+  json << "    \"semanticSceneShadowTaaActive\": "
+       << shadowAgg.semanticSceneShadowTaaActive << ",\n";
+  json << "    \"semanticSceneReceiverReuseShadowMap\": "
+       << shadowAgg.semanticSceneReceiverReuseShadowMap << ",\n";
+  json << "    \"semanticSceneReceiverInputValid\": "
+       << shadowAgg.semanticSceneReceiverInputValid << ",\n";
+  json << "    \"semanticSceneReceiverInputRejectReason\": "
+       << shadowAgg.semanticSceneReceiverInputRejectReason << ",\n";
+  json << "    \"semanticSceneReceiverNeedPass\": "
+       << shadowAgg.semanticSceneReceiverNeedPass << ",\n";
+  json << "    \"semanticSceneReceiverNeedShadowMap\": "
+       << shadowAgg.semanticSceneReceiverNeedShadowMap << ",\n";
+  json << "    \"semanticSceneReceiverHasCompleteShadowMap\": "
+       << shadowAgg.semanticSceneReceiverHasCompleteShadowMap << ",\n";
+  json << "    \"semanticSceneReceiverHasUsableDirectionalShadow\": "
+       << shadowAgg.semanticSceneReceiverHasUsableDirectionalShadow << ",\n";
+  json << "    \"semanticSceneReceiverActiveStrengthMilli\": "
+       << shadowAgg.semanticSceneReceiverActiveStrengthMilli << ",\n";
+  json << "    \"semanticSceneReceiverUboStrengthMilli\": "
+       << shadowAgg.semanticSceneReceiverUboStrengthMilli << ",\n";
+  json << "    \"semanticSceneReceiverDebugMode\": "
+       << shadowAgg.semanticSceneReceiverDebugMode << ",\n";
+  json << "    \"semanticSceneReceiverCsmCascadeCount\": "
+       << shadowAgg.semanticSceneReceiverCsmCascadeCount << ",\n";
+  json << "    \"semanticSceneReceiverZeroStrengthFrameCount\": "
+       << shadowAgg.semanticSceneReceiverZeroStrengthFrameCount << ",\n";
+  json << "    \"semanticSceneReceiverDrawnWithZeroStrengthCount\": "
+       << shadowAgg.semanticSceneReceiverDrawnWithZeroStrengthCount << ",\n";
+  json << "    \"semanticSceneReceiverNoCompleteShadowMapCount\": "
+       << shadowAgg.semanticSceneReceiverNoCompleteShadowMapCount << ",\n";
+  json << "    \"semanticSceneReceiverNoShadowMapImageCount\": "
+       << shadowAgg.semanticSceneReceiverNoShadowMapImageCount << ",\n";
+  json << "    \"semanticSceneReceiverNoShadowMapSampleViewCount\": "
+       << shadowAgg.semanticSceneReceiverNoShadowMapSampleViewCount << ",\n";
+  json << "    \"semanticSceneReceiverNoCandidateCsmCount\": "
+       << shadowAgg.semanticSceneReceiverNoCandidateCsmCount << ",\n";
+  json << "    \"semanticSceneReceiverCsmFallbackToLastGoodCount\": "
+       << shadowAgg.semanticSceneReceiverCsmFallbackToLastGoodCount << ",\n";
+  json << "    \"semanticSceneReceiverHoldInvalidCsmCount\": "
+       << shadowAgg.semanticSceneReceiverHoldInvalidCsmCount << ",\n";
+  json << "    \"semanticSceneReceiverHoldEmptyReplayCount\": "
+       << shadowAgg.semanticSceneReceiverHoldEmptyReplayCount << ",\n";
+  json << "    \"semanticSceneReceiverHoldIdentityChurnCount\": "
+       << shadowAgg.semanticSceneReceiverHoldIdentityChurnCount << ",\n";
+  json << "    \"semanticSceneReceiverReuseInvalidatedAfterEnsureCount\": "
+       << shadowAgg.semanticSceneReceiverReuseInvalidatedAfterEnsureCount
+       << ",\n";
+  json << "    \"semanticSceneShadowMapRenderSkippedNoResourcesCount\": "
+       << shadowAgg.semanticSceneShadowMapRenderSkippedNoResourcesCount
+       << ",\n";
+  json << "    \"semanticSceneShadowMapRenderSkippedNoMatrixBufferCount\": "
+       << shadowAgg.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount
+       << ",\n";
+  json << "    \"semanticSceneReceiverViewportX\": "
+       << shadowAgg.semanticSceneReceiverViewportX << ",\n";
+  json << "    \"semanticSceneReceiverViewportY\": "
+       << shadowAgg.semanticSceneReceiverViewportY << ",\n";
+  json << "    \"semanticSceneReceiverViewportWidth\": "
+       << shadowAgg.semanticSceneReceiverViewportWidth << ",\n";
+  json << "    \"semanticSceneReceiverViewportHeight\": "
+       << shadowAgg.semanticSceneReceiverViewportHeight << ",\n";
   json << "    \"semanticSceneSkippedUnitsOnlyFilter\": "
        << shadowAgg.semanticSceneSkippedUnitsOnlyFilter << ",\n";
   json << "    \"semanticSceneAcceptedExplicitResourceOwnerRigid\": "

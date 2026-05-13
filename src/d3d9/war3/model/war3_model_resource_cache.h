@@ -104,6 +104,11 @@ public:
   bool findGeosetByPtr(void *geosetPtr, ShadowGeosetResourceRecord &out) const;
   bool findGeosetByData(void *geosetDataPtr,
                         ShadowGeosetResourceRecord &out) const;
+  bool hydrateGeosetByKnownPtrs(void* geosetPtr, void* geosetDataPtr,
+                                ShadowGeosetResourceRecord& out);
+  const ShadowGeosetResourceRecord* findGeosetByPtrRef(void* geosetPtr) const;
+  const ShadowGeosetResourceRecord* findGeosetByDataRef(
+      void* geosetDataPtr) const;
   bool findModelGeoset(void *modelResourcePtr, uint32_t geosetIndex,
                        ShadowGeosetResourceRecord &out) const;
   bool findRuntimeModelGeoset(void *runtimeModelPtr, uint32_t geosetIndex,

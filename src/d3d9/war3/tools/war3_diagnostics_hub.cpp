@@ -367,6 +367,241 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
   summary.semanticSceneSubmittedUnit = bridgeSummary.semanticSceneSubmittedUnit;
   summary.semanticSceneSubmittedSkinned =
       bridgeSummary.semanticSceneSubmittedSkinned;
+  summary.semanticSceneSubmittedSkinnedNonUnitResolvedCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedNonUnitResolvedCount;
+  summary.semanticSceneSubmittedSkinnedUnknownPacketKindCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedUnknownPacketKindCount;
+  summary.semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount;
+  summary.semanticSceneSubmittedSkinnedGroupNonZeroCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedGroupNonZeroCount;
+  summary.semanticSceneSubmittedSkinnedTransparentQueueCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedTransparentQueueCount;
+  summary.semanticSceneSubmittedSkinnedMissingUnitPtrCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedMissingUnitPtrCount;
+  summary.semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount;
+  summary.semanticSceneSubmittedBuilding =
+      bridgeSummary.semanticSceneSubmittedBuilding;
+  summary.semanticSceneSubmittedDestructible =
+      bridgeSummary.semanticSceneSubmittedDestructible;
+  summary.semanticSceneSubmittedCutout =
+      bridgeSummary.semanticSceneSubmittedCutout;
+  summary.semanticSceneSubmittedAlphaBlend =
+      bridgeSummary.semanticSceneSubmittedAlphaBlend;
+  summary.semanticSceneMaterialObservedCutoutCount =
+      bridgeSummary.semanticSceneMaterialObservedCutoutCount;
+  summary.semanticSceneMaterialObservedAlphaBlendCount =
+      bridgeSummary.semanticSceneMaterialObservedAlphaBlendCount;
+  summary.semanticSceneRejectedCutoutSkinnedContract =
+      bridgeSummary.semanticSceneRejectedCutoutSkinnedContract;
+  summary.semanticSceneRejectedAlphaBlendSkinnedContract =
+      bridgeSummary.semanticSceneRejectedAlphaBlendSkinnedContract;
+  summary.semanticSceneRejectedCutoutGeometry =
+      bridgeSummary.semanticSceneRejectedCutoutGeometry;
+  summary.semanticSceneRejectedAlphaBlendGeometry =
+      bridgeSummary.semanticSceneRejectedAlphaBlendGeometry;
+  summary.semanticSceneRejectedCutoutVisualPolicy =
+      bridgeSummary.semanticSceneRejectedCutoutVisualPolicy;
+  summary.semanticSceneRejectedAlphaBlendVisualPolicy =
+      bridgeSummary.semanticSceneRejectedAlphaBlendVisualPolicy;
+  summary.semanticSceneMaterialLayerContractResolvedCount =
+      bridgeSummary.semanticSceneMaterialLayerContractResolvedCount;
+  summary.semanticSceneMaterialLayerContractFailedCount =
+      bridgeSummary.semanticSceneMaterialLayerContractFailedCount;
+  summary.semanticSceneMaterialBlendMode0Count =
+      bridgeSummary.semanticSceneMaterialBlendMode0Count;
+  summary.semanticSceneMaterialBlendMode1Count =
+      bridgeSummary.semanticSceneMaterialBlendMode1Count;
+  summary.semanticSceneMaterialBlendMode2PlusCount =
+      bridgeSummary.semanticSceneMaterialBlendMode2PlusCount;
+  summary.semanticSceneDirectCurrentDrawLayerIndexNonZeroCount =
+      bridgeSummary.semanticSceneDirectCurrentDrawLayerIndexNonZeroCount;
+  summary.semanticSceneMaterialLastMeshIndex =
+      bridgeSummary.semanticSceneMaterialLastMeshIndex;
+  summary.semanticSceneMaterialLastLayerIndex =
+      bridgeSummary.semanticSceneMaterialLastLayerIndex;
+  summary.semanticSceneMaterialLastLayerCount =
+      bridgeSummary.semanticSceneMaterialLastLayerCount;
+  summary.semanticSceneMaterialLastBlendOrDrawMode =
+      bridgeSummary.semanticSceneMaterialLastBlendOrDrawMode;
+  summary.semanticSceneSubmittedOwnedGroupSlots =
+      bridgeSummary.semanticSceneSubmittedOwnedGroupSlots;
+  summary.semanticSceneCurrentDrawContractKnownCount =
+      bridgeSummary.semanticSceneCurrentDrawContractKnownCount;
+  summary.semanticSceneCurrentDrawPaletteReadyCount =
+      bridgeSummary.semanticSceneCurrentDrawPaletteReadyCount;
+  summary.semanticSceneCurrentDrawGroupSlotReadyCount =
+      bridgeSummary.semanticSceneCurrentDrawGroupSlotReadyCount;
+  summary.semanticSceneCurrentDrawResolveReadyCount =
+      bridgeSummary.semanticSceneCurrentDrawResolveReadyCount;
+  summary.semanticSceneCurrentDrawMissNoContract =
+      bridgeSummary.semanticSceneCurrentDrawMissNoContract;
+  summary.semanticSceneCurrentDrawMissNoPalette =
+      bridgeSummary.semanticSceneCurrentDrawMissNoPalette;
+  summary.semanticSceneCurrentDrawMissNoGroupSlots =
+      bridgeSummary.semanticSceneCurrentDrawMissNoGroupSlots;
+  summary.semanticSceneCurrentDrawMissStaleVisibleFrame =
+      bridgeSummary.semanticSceneCurrentDrawMissStaleVisibleFrame;
+  summary.semanticSceneCurrentDrawResolveReadyRejectedCount =
+      bridgeSummary.semanticSceneCurrentDrawResolveReadyRejectedCount;
+  summary.semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount =
+      bridgeSummary.semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount;
+  summary.semanticScenePaletteOverrideNoComposeCount =
+      bridgeSummary.semanticScenePaletteOverrideNoComposeCount;
+  summary.semanticScenePaletteOverrideWouldComposeCount =
+      bridgeSummary.semanticScenePaletteOverrideWouldComposeCount;
+  summary.semanticScenePalettePacketWorldComposeCount =
+      bridgeSummary.semanticScenePalettePacketWorldComposeCount;
+  summary.semanticSceneCanonicalReadyCount =
+      bridgeSummary.semanticSceneCanonicalReadyCount;
+  summary.semanticSceneCanonicalReadyCutoutCount =
+      bridgeSummary.semanticSceneCanonicalReadyCutoutCount;
+  summary.semanticSceneCanonicalReadyAlphaBlendCount =
+      bridgeSummary.semanticSceneCanonicalReadyAlphaBlendCount;
+  summary.semanticSceneCanonicalRejectNoStableIdentity =
+      bridgeSummary.semanticSceneCanonicalRejectNoStableIdentity;
+  summary.semanticSceneCanonicalRejectNoMesh =
+      bridgeSummary.semanticSceneCanonicalRejectNoMesh;
+  summary.semanticSceneCanonicalRejectNoWorldTransform =
+      bridgeSummary.semanticSceneCanonicalRejectNoWorldTransform;
+  summary.semanticSceneCanonicalRejectNoPalette =
+      bridgeSummary.semanticSceneCanonicalRejectNoPalette;
+  summary.semanticSceneCanonicalRejectNoSlotContract =
+      bridgeSummary.semanticSceneCanonicalRejectNoSlotContract;
+  summary.semanticSceneCanonicalRejectStaleProducer =
+      bridgeSummary.semanticSceneCanonicalRejectStaleProducer;
+  summary.semanticSceneCanonicalRejectInvalidVertexIndex =
+      bridgeSummary.semanticSceneCanonicalRejectInvalidVertexIndex;
+  summary.semanticSceneCanonicalRejectExplicitBlendIncomplete =
+      bridgeSummary.semanticSceneCanonicalRejectExplicitBlendIncomplete;
+  summary.semanticSceneCanonicalRejectAfterReadyCount =
+      bridgeSummary.semanticSceneCanonicalRejectAfterReadyCount;
+  summary.currentDrawContractPublishAttemptCount =
+      bridgeSummary.currentDrawContractPublishAttemptCount;
+  summary.currentDrawContractPublishReadyCount =
+      bridgeSummary.currentDrawContractPublishReadyCount;
+  summary.currentDrawContractPublishSkippedNonWorldContext =
+      bridgeSummary.currentDrawContractPublishSkippedNonWorldContext;
+  summary.currentDrawContractPublishSkippedSmallViewport =
+      bridgeSummary.currentDrawContractPublishSkippedSmallViewport;
+  summary.currentDrawContractQueryAttemptCount =
+      bridgeSummary.currentDrawContractQueryAttemptCount;
+  summary.currentDrawContractQueryHitCount =
+      bridgeSummary.currentDrawContractQueryHitCount;
+  summary.currentDrawCapturedPaletteQueryAttemptCount =
+      bridgeSummary.currentDrawCapturedPaletteQueryAttemptCount;
+  summary.currentDrawCapturedPaletteQueryHitCount =
+      bridgeSummary.currentDrawCapturedPaletteQueryHitCount;
+  summary.currentDrawGroupSlotDecodeAttemptCount =
+      bridgeSummary.currentDrawGroupSlotDecodeAttemptCount;
+  summary.currentDrawGroupSlotDecodeHitCount =
+      bridgeSummary.currentDrawGroupSlotDecodeHitCount;
+  summary.currentDrawGroupSlotDecodeMissDisabledStream =
+      bridgeSummary.currentDrawGroupSlotDecodeMissDisabledStream;
+  summary.currentDrawPreparedSliceProbeAttemptCount =
+      bridgeSummary.currentDrawPreparedSliceProbeAttemptCount;
+  summary.currentDrawPreparedSliceProbeContextReadyCount =
+      bridgeSummary.currentDrawPreparedSliceProbeContextReadyCount;
+  summary.currentDrawPreparedSliceProbeBackingReadableCount =
+      bridgeSummary.currentDrawPreparedSliceProbeBackingReadableCount;
+  summary.currentDrawPreparedSliceRecordedCount =
+      bridgeSummary.currentDrawPreparedSliceRecordedCount;
+  summary.currentDrawPreparedSliceQueryAttemptCount =
+      bridgeSummary.currentDrawPreparedSliceQueryAttemptCount;
+  summary.currentDrawPreparedSliceQueryHitCount =
+      bridgeSummary.currentDrawPreparedSliceQueryHitCount;
+  summary.currentDrawPreparedSliceQueryMissCount =
+      bridgeSummary.currentDrawPreparedSliceQueryMissCount;
+  summary.currentDrawStream1PublishNoStreamCount =
+      bridgeSummary.currentDrawStream1PublishNoStreamCount;
+  summary.currentDrawStream1PublishStride0Count =
+      bridgeSummary.currentDrawStream1PublishStride0Count;
+  summary.currentDrawStream1PublishStride1Count =
+      bridgeSummary.currentDrawStream1PublishStride1Count;
+  summary.currentDrawStream1PublishStride8Count =
+      bridgeSummary.currentDrawStream1PublishStride8Count;
+  summary.currentDrawStream1PublishStride12Count =
+      bridgeSummary.currentDrawStream1PublishStride12Count;
+  summary.currentDrawStream1PublishStride16Count =
+      bridgeSummary.currentDrawStream1PublishStride16Count;
+  summary.currentDrawStream1PublishStride20Count =
+      bridgeSummary.currentDrawStream1PublishStride20Count;
+  summary.currentDrawStream1PublishStrideOtherCount =
+      bridgeSummary.currentDrawStream1PublishStrideOtherCount;
+  summary.currentDrawStream1PublishLastRawStride =
+      bridgeSummary.currentDrawStream1PublishLastRawStride;
+  summary.currentDrawStream1PublishMaxRawStride =
+      bridgeSummary.currentDrawStream1PublishMaxRawStride;
+  summary.currentDrawLastVisibleFrameSerial =
+      bridgeSummary.currentDrawLastVisibleFrameSerial;
+  summary.currentDrawLastRenderFrameIndex =
+      bridgeSummary.currentDrawLastRenderFrameIndex;
+  summary.currentDrawLastSmallViewportWidth =
+      bridgeSummary.currentDrawLastSmallViewportWidth;
+  summary.currentDrawLastSmallViewportHeight =
+      bridgeSummary.currentDrawLastSmallViewportHeight;
+  summary.currentDrawLastMissReason =
+      bridgeSummary.currentDrawLastMissReason;
+  summary.submitPaletteContentAgeLag0Count =
+      bridgeSummary.submitPaletteContentAgeLag0Count;
+  summary.submitPaletteContentAgeLag1Count =
+      bridgeSummary.submitPaletteContentAgeLag1Count;
+  summary.submitPaletteContentAgeLag2Count =
+      bridgeSummary.submitPaletteContentAgeLag2Count;
+  summary.submitPaletteContentAgeLag3To5Count =
+      bridgeSummary.submitPaletteContentAgeLag3To5Count;
+  summary.submitPaletteContentAgeLag6PlusCount =
+      bridgeSummary.submitPaletteContentAgeLag6PlusCount;
+  summary.submitPaletteContentAgeMax =
+      bridgeSummary.submitPaletteContentAgeMax;
+  summary.submitPaletteContentAgeSampleCount =
+      bridgeSummary.submitPaletteContentAgeSampleCount;
+  summary.submitPaletteContentAgeUnknownCount =
+      bridgeSummary.submitPaletteContentAgeUnknownCount;
+  summary.semanticScenePopulateLastReturnReason =
+      bridgeSummary.semanticScenePopulateLastReturnReason;
+  summary.semanticScenePopulateLastProducerPublishAttemptDelta =
+      bridgeSummary.semanticScenePopulateLastProducerPublishAttemptDelta;
+  summary.semanticScenePopulateLastProducerPublishReadyDelta =
+      bridgeSummary.semanticScenePopulateLastProducerPublishReadyDelta;
+  summary.semanticScenePopulateLastProducerQueryAttemptDelta =
+      bridgeSummary.semanticScenePopulateLastProducerQueryAttemptDelta;
+  summary.semanticScenePopulateLastProducerQueryHitDelta =
+      bridgeSummary.semanticScenePopulateLastProducerQueryHitDelta;
+  summary.semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta =
+      bridgeSummary
+          .semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta;
+  summary.semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta =
+      bridgeSummary
+          .semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta;
+  summary.semanticScenePopulateLastProducerGroupDecodeAttemptDelta =
+      bridgeSummary
+          .semanticScenePopulateLastProducerGroupDecodeAttemptDelta;
+  summary.semanticScenePopulateLastProducerGroupDecodeHitDelta =
+      bridgeSummary.semanticScenePopulateLastProducerGroupDecodeHitDelta;
+  summary.semanticSceneSubmittedExplicitBlendContract =
+      bridgeSummary.semanticSceneSubmittedExplicitBlendContract;
+  summary.semanticSceneSubmittedSingleMatrixGroupSkinning =
+      bridgeSummary.semanticSceneSubmittedSingleMatrixGroupSkinning;
+  summary.semanticSceneSubmittedMultiGroupSlotSkinning =
+      bridgeSummary.semanticSceneSubmittedMultiGroupSlotSkinning;
+  summary.semanticSceneSkinnedMinUniqueGroupSlots =
+      bridgeSummary.semanticSceneSkinnedMinUniqueGroupSlots;
+  summary.semanticSceneSkinnedMaxUniqueGroupSlots =
+      bridgeSummary.semanticSceneSkinnedMaxUniqueGroupSlots;
+  summary.semanticSceneSkinnedGroupSlotsUnique1Count =
+      bridgeSummary.semanticSceneSkinnedGroupSlotsUnique1Count;
+  summary.semanticSceneSkinnedGroupSlotsUnique2To4Count =
+      bridgeSummary.semanticSceneSkinnedGroupSlotsUnique2To4Count;
+  summary.semanticSceneSkinnedGroupSlotsUnique5To8Count =
+      bridgeSummary.semanticSceneSkinnedGroupSlotsUnique5To8Count;
+  summary.semanticSceneSkinnedGroupSlotsUnique9To16Count =
+      bridgeSummary.semanticSceneSkinnedGroupSlotsUnique9To16Count;
+  summary.semanticSceneSkinnedGroupSlotsUnique17PlusCount =
+      bridgeSummary.semanticSceneSkinnedGroupSlotsUnique17PlusCount;
+  summary.semanticSceneExplicitBlendUnavailableCurrentDraw =
+      bridgeSummary.semanticSceneExplicitBlendUnavailableCurrentDraw;
   summary.semanticSceneSubmittedFrameLocal =
       bridgeSummary.semanticSceneSubmittedFrameLocal;
   summary.semanticSceneSubmittedPersistent =
@@ -439,6 +674,487 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       bridgeSummary.semanticStaticCandidateRejectedNoGeoset;
   summary.semanticStaticCandidateRejectedNonCanonicalKind =
       bridgeSummary.semanticStaticCandidateRejectedNonCanonicalKind;
+  // Phase 7.2: flicker diagnostics + reconciliation
+  summary.semanticSceneDirectLastRawRecordCount =
+      bridgeSummary.semanticSceneDirectLastRawRecordCount;
+  summary.semanticSceneDirectLastEligibleRecordCount =
+      bridgeSummary.semanticSceneDirectLastEligibleRecordCount;
+  summary.semanticSceneDirectLastSubmittedRecordCount =
+      bridgeSummary.semanticSceneDirectLastSubmittedRecordCount;
+  summary.semanticSceneDirectLastUniqueObjectCount =
+      bridgeSummary.semanticSceneDirectLastUniqueObjectCount;
+  summary.semanticSceneDirectLastSubmittedObjectCount =
+      bridgeSummary.semanticSceneDirectLastSubmittedObjectCount;
+  summary.semanticSceneDirectLastRecordCapPartialObjectCount =
+      bridgeSummary.semanticSceneDirectLastRecordCapPartialObjectCount;
+  summary.semanticSceneDirectLastScanCapPartialObjectCount =
+      bridgeSummary.semanticSceneDirectLastScanCapPartialObjectCount;
+  summary.semanticSceneDirectLastMinGeosetsPerObject =
+      bridgeSummary.semanticSceneDirectLastMinGeosetsPerObject;
+  summary.semanticSceneDirectLastMaxGeosetsPerObject =
+      bridgeSummary.semanticSceneDirectLastMaxGeosetsPerObject;
+  summary.semanticSceneDirectLastSubmittedIdentityHash =
+      bridgeSummary.semanticSceneDirectLastSubmittedIdentityHash;
+  summary.semanticSceneDirectIdentityChurnCount =
+      bridgeSummary.semanticSceneDirectIdentityChurnCount;
+  summary.semanticSceneDirectRecordCapHitCount =
+      bridgeSummary.semanticSceneDirectRecordCapHitCount;
+  summary.semanticSceneDirectRecordCapTruncatedRecordCount =
+      bridgeSummary.semanticSceneDirectRecordCapTruncatedRecordCount;
+  summary.semanticSceneDirectScanCapHitCount =
+      bridgeSummary.semanticSceneDirectScanCapHitCount;
+  summary.semanticSceneDirectObjectGroupedSubmitCount =
+      bridgeSummary.semanticSceneDirectObjectGroupedSubmitCount;
+  summary.semanticSceneDirectObjectGroupedSkipCount =
+      bridgeSummary.semanticSceneDirectObjectGroupedSkipCount;
+  summary.semanticSceneDirectRecordCapSkipObjectCount =
+      bridgeSummary.semanticSceneDirectRecordCapSkipObjectCount;
+  summary.semanticSceneDirectRecordCapAppendFailCount =
+      bridgeSummary.semanticSceneDirectRecordCapAppendFailCount;
+  summary.semanticSceneDirectSelectionLeaseActiveKeyCount =
+      bridgeSummary.semanticSceneDirectSelectionLeaseActiveKeyCount;
+  summary.semanticSceneDirectSelectionLeasePrunedKeyCount =
+      bridgeSummary.semanticSceneDirectSelectionLeasePrunedKeyCount;
+  summary.semanticSceneDirectSelectionLeaseSubmittedKeyCount =
+      bridgeSummary.semanticSceneDirectSelectionLeaseSubmittedKeyCount;
+  summary.semanticSceneDirectStickyFillBudgetRecordCount =
+      bridgeSummary.semanticSceneDirectStickyFillBudgetRecordCount;
+  summary.semanticSceneDirectStickyFillAppendedCount =
+      bridgeSummary.semanticSceneDirectStickyFillAppendedCount;
+  summary.semanticSceneDirectStickyFillSubmittedCount =
+      bridgeSummary.semanticSceneDirectStickyFillSubmittedCount;
+  summary.semanticSceneDirectStickyFillMissedCount =
+      bridgeSummary.semanticSceneDirectStickyFillMissedCount;
+  summary.semanticSceneDirectPartLeaseRestoredCount =
+      bridgeSummary.semanticSceneDirectPartLeaseRestoredCount;
+  summary.semanticSceneDirectPartLeaseUpdatedCount =
+      bridgeSummary.semanticSceneDirectPartLeaseUpdatedCount;
+  summary.semanticSceneDirectPartLeaseExpiredCount =
+      bridgeSummary.semanticSceneDirectPartLeaseExpiredCount;
+  summary.semanticSceneDirectPartLeaseRejectedDynamicMeshCount =
+      bridgeSummary.semanticSceneDirectPartLeaseRejectedDynamicMeshCount;
+  summary.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount =
+      bridgeSummary
+          .semanticSceneDirectPartLeaseRejectedNotSelfContainedCount;
+  summary.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount =
+      bridgeSummary.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount;
+  summary.semanticSceneDirectPartLeaseRejectedSelfRenewCount =
+      bridgeSummary.semanticSceneDirectPartLeaseRejectedSelfRenewCount;
+  summary.semanticSceneDirectPartLeaseBudgetLimitCount =
+      bridgeSummary.semanticSceneDirectPartLeaseBudgetLimitCount;
+  summary.semanticSceneShadowManifestPartLeaseRestoredCount =
+      bridgeSummary.semanticSceneShadowManifestPartLeaseRestoredCount;
+  summary.semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount =
+      bridgeSummary.semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount;
+  summary.semanticSceneShadowManifestPartLeaseExpiredCount =
+      bridgeSummary.semanticSceneShadowManifestPartLeaseExpiredCount;
+  summary.semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount =
+      bridgeSummary.semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount;
+  summary.semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount =
+      bridgeSummary.semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount;
+  summary.semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount =
+      bridgeSummary
+          .semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount;
+  summary
+      .semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount =
+      bridgeSummary
+          .semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount;
+  summary.semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount =
+      bridgeSummary
+          .semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount;
+  summary.semanticSceneShadowManifestPartLeaseBudgetLimitCount =
+      bridgeSummary.semanticSceneShadowManifestPartLeaseBudgetLimitCount;
+  summary.semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount =
+      bridgeSummary
+          .semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount;
+  summary.semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount =
+      bridgeSummary
+          .semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount;
+  summary.semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount =
+      bridgeSummary
+          .semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount;
+  summary.semanticSceneShadowManifestObjectCoreCompleteCount =
+      bridgeSummary.semanticSceneShadowManifestObjectCoreCompleteCount;
+  summary.semanticSceneShadowManifestObjectCoreIncompleteSkipCount =
+      bridgeSummary
+          .semanticSceneShadowManifestObjectCoreIncompleteSkipCount;
+  summary.semanticSceneShadowManifestPartOmittedIncompleteCoreCount =
+      bridgeSummary
+          .semanticSceneShadowManifestPartOmittedIncompleteCoreCount;
+  // Phase 7.25 core epoch planner 专属计数器。
+  summary.semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount =
+      bridgeSummary
+          .semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount;
+  summary.semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount =
+      bridgeSummary
+          .semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount;
+  summary.semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount =
+      bridgeSummary
+          .semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount;
+  summary.semanticSceneShadowManifestObjectCoreEpochMissingPartCount =
+      bridgeSummary
+          .semanticSceneShadowManifestObjectCoreEpochMissingPartCount;
+  summary.semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount =
+      bridgeSummary
+          .semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount;
+  // Phase 7.28：skinned palette content stability probe。
+  summary.semanticSceneSubmittedSkinnedPaletteSourceNoneCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedPaletteSourceNoneCount;
+  summary.semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount;
+  summary.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount;
+  summary.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount;
+  summary
+      .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount;
+  summary
+      .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount;
+  summary.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount;
+  summary.semanticSceneSubmittedSkinnedPaletteHashChurnCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedPaletteHashChurnCount;
+  summary.semanticSceneSubmittedSkinnedPaletteSourceChurnCount =
+      bridgeSummary.semanticSceneSubmittedSkinnedPaletteSourceChurnCount;
+  summary.semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount;
+  summary.semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax;
+  summary.semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax;
+  summary.semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount;
+  summary.semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount;
+  summary.semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount;
+  summary.semanticSceneSubmittedSkinnedPaletteCountChurnCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteCountChurnCount;
+  summary.semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount;
+  summary.semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount;
+  summary.semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount;
+  summary.semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount;
+  summary.semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount;
+  summary
+      .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount;
+  summary
+      .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount;
+  summary
+      .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount;
+  summary.semanticSceneDirectPaletteAttributionSnapshotHitCount =
+      bridgeSummary.semanticSceneDirectPaletteAttributionSnapshotHitCount;
+  summary.semanticSceneDirectPaletteCaptureTrustedSourceHitCount =
+      bridgeSummary.semanticSceneDirectPaletteCaptureTrustedSourceHitCount;
+  summary.semanticSceneDirectPaletteCaptureTrustedSourceMissCount =
+      bridgeSummary.semanticSceneDirectPaletteCaptureTrustedSourceMissCount;
+  // Phase 7.30 Step A：stale→live 过渡归因。
+  summary.semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount;
+  summary
+      .semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount;
+  summary.semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount =
+      bridgeSummary
+          .semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount;
+  summary.semanticSceneDirectManifestObjectCount =
+      bridgeSummary.semanticSceneDirectManifestObjectCount;
+  summary.semanticSceneDirectManifestObservedPartCount =
+      bridgeSummary.semanticSceneDirectManifestObservedPartCount;
+  summary.semanticSceneDirectManifestShadowEligiblePartCount =
+      bridgeSummary.semanticSceneDirectManifestShadowEligiblePartCount;
+  summary.semanticSceneDirectObjectCompleteEligibleCount =
+      bridgeSummary.semanticSceneDirectObjectCompleteEligibleCount;
+  summary.semanticSceneDirectObjectIncompleteByScanCapCount =
+      bridgeSummary.semanticSceneDirectObjectIncompleteByScanCapCount;
+  summary.semanticSceneDirectObjectIncompleteByAlphaPolicyCount =
+      bridgeSummary.semanticSceneDirectObjectIncompleteByAlphaPolicyCount;
+  summary.semanticSceneDirectObjectIncompleteBySliceUnresolvedCount =
+      bridgeSummary.semanticSceneDirectObjectIncompleteBySliceUnresolvedCount;
+  summary.semanticSceneDirectObjectIncompleteByPacketBuildFailCount =
+      bridgeSummary.semanticSceneDirectObjectIncompleteByPacketBuildFailCount;
+  summary.semanticSceneDirectObjectIncompleteByAppendFailCount =
+      bridgeSummary.semanticSceneDirectObjectIncompleteByAppendFailCount;
+  summary.semanticSceneDirectSubmittedCompleteObjectCount =
+      bridgeSummary.semanticSceneDirectSubmittedCompleteObjectCount;
+  summary.semanticSceneDirectSubmittedPartialObjectCount =
+      bridgeSummary.semanticSceneDirectSubmittedPartialObjectCount;
+  summary.semanticSceneDirectPreparedSliceAuthoritativeCount =
+      bridgeSummary.semanticSceneDirectPreparedSliceAuthoritativeCount;
+  summary.semanticSceneDirectPreparedSliceFallbackLayerIndexCount =
+      bridgeSummary.semanticSceneDirectPreparedSliceFallbackLayerIndexCount;
+  summary.semanticSceneDirectPreparedSliceMissingCount =
+      bridgeSummary.semanticSceneDirectPreparedSliceMissingCount;
+  summary.semanticScenePreparedProbeAttemptCount =
+      bridgeSummary.semanticScenePreparedProbeAttemptCount;
+  summary.semanticScenePreparedProbeContextReadyCount =
+      bridgeSummary.semanticScenePreparedProbeContextReadyCount;
+  summary.semanticScenePreparedProbeBackingReadableCount =
+      bridgeSummary.semanticScenePreparedProbeBackingReadableCount;
+  summary.semanticScenePreparedSliceRecordedCount =
+      bridgeSummary.semanticScenePreparedSliceRecordedCount;
+  summary.semanticScenePreparedSliceQueryAttemptCount =
+      bridgeSummary.semanticScenePreparedSliceQueryAttemptCount;
+  summary.semanticScenePreparedSliceQueryHitCount =
+      bridgeSummary.semanticScenePreparedSliceQueryHitCount;
+  summary.semanticScenePreparedSliceQueryMissCount =
+      bridgeSummary.semanticScenePreparedSliceQueryMissCount;
+  summary.semanticSceneShadowManifestObjectCount =
+      bridgeSummary.semanticSceneShadowManifestObjectCount;
+  summary.semanticSceneShadowManifestPartCount =
+      bridgeSummary.semanticSceneShadowManifestPartCount;
+  summary.semanticSceneShadowManifestStableObjectCount =
+      bridgeSummary.semanticSceneShadowManifestStableObjectCount;
+  summary.semanticSceneShadowManifestNewObjectCount =
+      bridgeSummary.semanticSceneShadowManifestNewObjectCount;
+  summary.semanticSceneShadowManifestExpiredObjectCount =
+      bridgeSummary.semanticSceneShadowManifestExpiredObjectCount;
+  summary.semanticSceneShadowManifestFreshPartCount =
+      bridgeSummary.semanticSceneShadowManifestFreshPartCount;
+  summary.semanticSceneShadowManifestLeaseablePartCount =
+      bridgeSummary.semanticSceneShadowManifestLeaseablePartCount;
+  summary.semanticSceneShadowManifestPoseStalePartCount =
+      bridgeSummary.semanticSceneShadowManifestPoseStalePartCount;
+  summary.semanticSceneShadowManifestSliceStalePartCount =
+      bridgeSummary.semanticSceneShadowManifestSliceStalePartCount;
+  summary.semanticSceneShadowManifestExpiredPartCount =
+      bridgeSummary.semanticSceneShadowManifestExpiredPartCount;
+  summary.semanticSceneShadowManifestMultiSlicePartCount =
+      bridgeSummary.semanticSceneShadowManifestMultiSlicePartCount;
+  summary.semanticSceneShadowManifestPayload11CChurnCount =
+      bridgeSummary.semanticSceneShadowManifestPayload11CChurnCount;
+  summary.semanticSceneShadowManifestRenderablePartChurnCount =
+      bridgeSummary.semanticSceneShadowManifestRenderablePartChurnCount;
+  summary.semanticSceneShadowManifestCModelPoseHitCount =
+      bridgeSummary.semanticSceneShadowManifestCModelPoseHitCount;
+  summary.semanticSceneShadowManifestCModelPoseMissCount =
+      bridgeSummary.semanticSceneShadowManifestCModelPoseMissCount;
+  summary.semanticSceneShadowManifestCModelPoseNoRuntimeCount =
+      bridgeSummary.semanticSceneShadowManifestCModelPoseNoRuntimeCount;
+  summary.semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr =
+      bridgeSummary.semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr;
+  summary.semanticSceneShadowManifestCModelPoseLastMatrixCount =
+      bridgeSummary.semanticSceneShadowManifestCModelPoseLastMatrixCount;
+  summary.semanticSceneShadowManifestCModelPoseLastMatrixHash =
+      bridgeSummary.semanticSceneShadowManifestCModelPoseLastMatrixHash;
+  summary.semanticSceneSubmittedObjectJaccardMilli =
+      bridgeSummary.semanticSceneSubmittedObjectJaccardMilli;
+  summary.semanticSceneSubmittedPartJaccardMilli =
+      bridgeSummary.semanticSceneSubmittedPartJaccardMilli;
+  summary.semanticSceneVisibleLookupPartLayerHitCount =
+      bridgeSummary.semanticSceneVisibleLookupPartLayerHitCount;
+  summary.semanticSceneVisibleLookupSingleFallbackCount =
+      bridgeSummary.semanticSceneVisibleLookupSingleFallbackCount;
+  summary.semanticSceneVisibleLookupMissCount =
+      bridgeSummary.semanticSceneVisibleLookupMissCount;
+  summary.semanticSceneDirectMainWorldBackingNotCheckedCount =
+      bridgeSummary.semanticSceneDirectMainWorldBackingNotCheckedCount;
+  summary.semanticSceneDirectMainWorldBackingPassCount =
+      bridgeSummary.semanticSceneDirectMainWorldBackingPassCount;
+  summary.semanticSceneDirectMainWorldBackingFailNoRenderablePartCount =
+      bridgeSummary
+          .semanticSceneDirectMainWorldBackingFailNoRenderablePartCount;
+  summary.semanticSceneDirectMainWorldBackingFailLookupMissCount =
+      bridgeSummary.semanticSceneDirectMainWorldBackingFailLookupMissCount;
+  summary.semanticSceneDirectMainWorldBackingFailNonMainQueueCount =
+      bridgeSummary.semanticSceneDirectMainWorldBackingFailNonMainQueueCount;
+  summary.semanticSceneDirectMainWorldBackingFailNonWorldGroupCount =
+      bridgeSummary.semanticSceneDirectMainWorldBackingFailNonWorldGroupCount;
+  summary.semanticSceneDirectMainWorldBackingFailIdentityMismatchCount =
+      bridgeSummary
+          .semanticSceneDirectMainWorldBackingFailIdentityMismatchCount;
+  summary.semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount =
+      bridgeSummary
+          .semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount;
+  summary.semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount =
+      bridgeSummary.semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount;
+  summary.semanticSceneDirectPaletteHashChurnCount =
+      bridgeSummary.semanticSceneDirectPaletteHashChurnCount;
+  summary.semanticSceneDirectGroupHashChurnCount =
+      bridgeSummary.semanticSceneDirectGroupHashChurnCount;
+  summary.semanticSceneDirectStableGroupHashChurnCount =
+      bridgeSummary.semanticSceneDirectStableGroupHashChurnCount;
+  summary.semanticSceneDirectStream1PtrChurnCount =
+      bridgeSummary.semanticSceneDirectStream1PtrChurnCount;
+  summary.semanticSceneDirectGeometrySourceHashChurnCount =
+      bridgeSummary.semanticSceneDirectGeometrySourceHashChurnCount;
+  summary.semanticSceneDirectSameCasterComparisonCount =
+      bridgeSummary.semanticSceneDirectSameCasterComparisonCount;
+  summary.semanticSceneDirectIdentitySkippedChurnCount =
+      bridgeSummary.semanticSceneDirectIdentitySkippedChurnCount;
+  summary.semanticSceneDirectPaletteRootDeltaSampleCount =
+      bridgeSummary.semanticSceneDirectPaletteRootDeltaSampleCount;
+  summary.semanticSceneDirectPaletteRootHashChangedTinyDeltaCount =
+      bridgeSummary.semanticSceneDirectPaletteRootHashChangedTinyDeltaCount;
+  summary.semanticSceneDirectPaletteRootHashChangedSmallDeltaCount =
+      bridgeSummary.semanticSceneDirectPaletteRootHashChangedSmallDeltaCount;
+  summary.semanticSceneDirectPaletteRootHashChangedMediumDeltaCount =
+      bridgeSummary.semanticSceneDirectPaletteRootHashChangedMediumDeltaCount;
+  summary.semanticSceneDirectPaletteRootHashChangedLargeDeltaCount =
+      bridgeSummary.semanticSceneDirectPaletteRootHashChangedLargeDeltaCount;
+  summary.semanticSceneDirectPaletteRootMaxDeltaMilli =
+      bridgeSummary.semanticSceneDirectPaletteRootMaxDeltaMilli;
+  summary.semanticSceneDirectSelectionKeyUnitPtrCount =
+      bridgeSummary.semanticSceneDirectSelectionKeyUnitPtrCount;
+  summary.semanticSceneDirectSelectionKeyJHandleCount =
+      bridgeSummary.semanticSceneDirectSelectionKeyJHandleCount;
+  summary.semanticSceneDirectSelectionKeyRuntimeModelCount =
+      bridgeSummary.semanticSceneDirectSelectionKeyRuntimeModelCount;
+  summary.semanticSceneDirectSelectionKeyWorldObjectCount =
+      bridgeSummary.semanticSceneDirectSelectionKeyWorldObjectCount;
+  summary.semanticSceneDirectSelectionKeySceneNodeCount =
+      bridgeSummary.semanticSceneDirectSelectionKeySceneNodeCount;
+  summary.semanticSceneDirectSelectionKeyModelMeshCount =
+      bridgeSummary.semanticSceneDirectSelectionKeyModelMeshCount;
+  summary.semanticSceneDirectSelectionKeyRenderablePartCount =
+      bridgeSummary.semanticSceneDirectSelectionKeyRenderablePartCount;
+  summary.semanticSceneDirectLastSubmittedSceneNode =
+      bridgeSummary.semanticSceneDirectLastSubmittedSceneNode;
+  summary.semanticSceneDirectLastSubmittedRenderablePart =
+      bridgeSummary.semanticSceneDirectLastSubmittedRenderablePart;
+  summary.semanticSceneDirectLastSubmittedMeshData =
+      bridgeSummary.semanticSceneDirectLastSubmittedMeshData;
+  summary.semanticSceneDirectLastSubmittedPaletteHash =
+      bridgeSummary.semanticSceneDirectLastSubmittedPaletteHash;
+  summary.semanticSceneDirectLastSubmittedGroupHash =
+      bridgeSummary.semanticSceneDirectLastSubmittedGroupHash;
+  summary.semanticSceneDirectLastSubmittedStableGroupHash =
+      bridgeSummary.semanticSceneDirectLastSubmittedStableGroupHash;
+  summary.semanticSceneDirectLastSubmittedStream1Ptr =
+      bridgeSummary.semanticSceneDirectLastSubmittedStream1Ptr;
+  summary.semanticSceneDirectLastSubmittedGeometrySourceHash =
+      bridgeSummary.semanticSceneDirectLastSubmittedGeometrySourceHash;
+  summary.semanticSceneLastAppendedGeometrySourceHash =
+      bridgeSummary.semanticSceneLastAppendedGeometrySourceHash;
+  summary.semanticSceneLastAppendedGeometryId =
+      bridgeSummary.semanticSceneLastAppendedGeometryId;
+  summary.semanticSceneShadowCastersCount =
+      bridgeSummary.semanticSceneShadowCastersCount;
+  summary.semanticSceneReplayDrawsCount =
+      bridgeSummary.semanticSceneReplayDrawsCount;
+  summary.semanticSceneShadowMapDrawnCasters =
+      bridgeSummary.semanticSceneShadowMapDrawnCasters;
+  summary.semanticSceneShadowMapCascadeCulledCount =
+      bridgeSummary.semanticSceneShadowMapCascadeCulledCount;
+  summary.semanticSceneShadowMapSkinnedCasterCount =
+      bridgeSummary.semanticSceneShadowMapSkinnedCasterCount;
+  summary.semanticSceneShadowMapSkinnedPreparedCount =
+      bridgeSummary.semanticSceneShadowMapSkinnedPreparedCount;
+  summary.semanticSceneShadowMapSkinnedInvalidBufferCount =
+      bridgeSummary.semanticSceneShadowMapSkinnedInvalidBufferCount;
+  summary.semanticSceneShadowMapSkinnedInvalidPipelineCount =
+      bridgeSummary.semanticSceneShadowMapSkinnedInvalidPipelineCount;
+  summary.semanticSceneShadowMapSkinnedDrawnCount =
+      bridgeSummary.semanticSceneShadowMapSkinnedDrawnCount;
+  summary.semanticSceneShadowTaaActive =
+      bridgeSummary.semanticSceneShadowTaaActive;
+  summary.semanticSceneReceiverReuseShadowMap =
+      bridgeSummary.semanticSceneReceiverReuseShadowMap;
+  summary.semanticSceneReceiverInputValid =
+      bridgeSummary.semanticSceneReceiverInputValid;
+  summary.semanticSceneReceiverInputRejectReason =
+      bridgeSummary.semanticSceneReceiverInputRejectReason;
+  summary.semanticSceneReceiverNeedPass =
+      bridgeSummary.semanticSceneReceiverNeedPass;
+  summary.semanticSceneReceiverNeedShadowMap =
+      bridgeSummary.semanticSceneReceiverNeedShadowMap;
+  summary.semanticSceneReceiverHasCompleteShadowMap =
+      bridgeSummary.semanticSceneReceiverHasCompleteShadowMap;
+  summary.semanticSceneReceiverHasUsableDirectionalShadow =
+      bridgeSummary.semanticSceneReceiverHasUsableDirectionalShadow;
+  summary.semanticSceneReceiverActiveStrengthMilli =
+      bridgeSummary.semanticSceneReceiverActiveStrengthMilli;
+  summary.semanticSceneReceiverUboStrengthMilli =
+      bridgeSummary.semanticSceneReceiverUboStrengthMilli;
+  summary.semanticSceneReceiverDebugMode =
+      bridgeSummary.semanticSceneReceiverDebugMode;
+  summary.semanticSceneReceiverCsmCascadeCount =
+      bridgeSummary.semanticSceneReceiverCsmCascadeCount;
+  summary.semanticSceneReceiverRunEntryFlags =
+      bridgeSummary.semanticSceneReceiverRunEntryFlags;
+  summary.semanticSceneReceiverRunEarlyReturnReason =
+      bridgeSummary.semanticSceneReceiverRunEarlyReturnReason;
+  summary.semanticSceneShadowMapExecutedThisFrame =
+      bridgeSummary.semanticSceneShadowMapExecutedThisFrame;
+  summary.semanticSceneReceiverSettingsShadowsEnabled =
+      bridgeSummary.semanticSceneReceiverSettingsShadowsEnabled;
+  summary.semanticSceneReceiverSettingsOutlineEnabled =
+      bridgeSummary.semanticSceneReceiverSettingsOutlineEnabled;
+  summary.semanticSceneReceiverSettingsRawStrengthMilli =
+      bridgeSummary.semanticSceneReceiverSettingsRawStrengthMilli;
+  summary.semanticSceneReceiverComputedShadowStrengthMilli =
+      bridgeSummary.semanticSceneReceiverComputedShadowStrengthMilli;
+  summary.semanticSceneReceiverHasSunShadow =
+      bridgeSummary.semanticSceneReceiverHasSunShadow;
+  summary.semanticSceneReceiverHasPointShadow =
+      bridgeSummary.semanticSceneReceiverHasPointShadow;
+  summary.semanticSceneReceiverNeedOutlinePass =
+      bridgeSummary.semanticSceneReceiverNeedOutlinePass;
+  summary.semanticSceneReceiverZeroStrengthFrameCount =
+      bridgeSummary.semanticSceneReceiverZeroStrengthFrameCount;
+  summary.semanticSceneReceiverDrawnWithZeroStrengthCount =
+      bridgeSummary.semanticSceneReceiverDrawnWithZeroStrengthCount;
+  summary.semanticSceneReceiverNoCompleteShadowMapCount =
+      bridgeSummary.semanticSceneReceiverNoCompleteShadowMapCount;
+  summary.semanticSceneReceiverNoShadowMapImageCount =
+      bridgeSummary.semanticSceneReceiverNoShadowMapImageCount;
+  summary.semanticSceneReceiverNoShadowMapSampleViewCount =
+      bridgeSummary.semanticSceneReceiverNoShadowMapSampleViewCount;
+  summary.semanticSceneReceiverNoCandidateCsmCount =
+      bridgeSummary.semanticSceneReceiverNoCandidateCsmCount;
+  summary.semanticSceneReceiverCsmFallbackToLastGoodCount =
+      bridgeSummary.semanticSceneReceiverCsmFallbackToLastGoodCount;
+  summary.semanticSceneReceiverHoldInvalidCsmCount =
+      bridgeSummary.semanticSceneReceiverHoldInvalidCsmCount;
+  summary.semanticSceneReceiverHoldEmptyReplayCount =
+      bridgeSummary.semanticSceneReceiverHoldEmptyReplayCount;
+  summary.semanticSceneReceiverHoldIdentityChurnCount =
+      bridgeSummary.semanticSceneReceiverHoldIdentityChurnCount;
+  summary.semanticSceneReceiverReuseInvalidatedAfterEnsureCount =
+      bridgeSummary.semanticSceneReceiverReuseInvalidatedAfterEnsureCount;
+  summary.semanticSceneShadowMapRenderSkippedNoResourcesCount =
+      bridgeSummary.semanticSceneShadowMapRenderSkippedNoResourcesCount;
+  summary.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount =
+      bridgeSummary.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount;
+  summary.semanticSceneReceiverViewportX =
+      bridgeSummary.semanticSceneReceiverViewportX;
+  summary.semanticSceneReceiverViewportY =
+      bridgeSummary.semanticSceneReceiverViewportY;
+  summary.semanticSceneReceiverViewportWidth =
+      bridgeSummary.semanticSceneReceiverViewportWidth;
+  summary.semanticSceneReceiverViewportHeight =
+      bridgeSummary.semanticSceneReceiverViewportHeight;
   return summary;
 }
 
@@ -579,6 +1295,338 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.semanticSceneSubmittedUnit},
         {"semanticSceneSubmittedSkinned",
          snapshot.shadow.semanticSceneSubmittedSkinned},
+        {"semanticSceneSubmittedSkinnedNonUnitResolvedCount",
+         snapshot.shadow.semanticSceneSubmittedSkinnedNonUnitResolvedCount},
+        {"semanticSceneSubmittedSkinnedUnknownPacketKindCount",
+         snapshot.shadow.semanticSceneSubmittedSkinnedUnknownPacketKindCount},
+        {"semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount},
+        {"semanticSceneSubmittedSkinnedGroupNonZeroCount",
+         snapshot.shadow.semanticSceneSubmittedSkinnedGroupNonZeroCount},
+        {"semanticSceneSubmittedSkinnedTransparentQueueCount",
+         snapshot.shadow.semanticSceneSubmittedSkinnedTransparentQueueCount},
+        {"semanticSceneSubmittedSkinnedMissingUnitPtrCount",
+         snapshot.shadow.semanticSceneSubmittedSkinnedMissingUnitPtrCount},
+        {"semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount},
+        {"semanticSceneSubmittedBuilding",
+         snapshot.shadow.semanticSceneSubmittedBuilding},
+        {"semanticSceneSubmittedDestructible",
+         snapshot.shadow.semanticSceneSubmittedDestructible},
+        {"semanticSceneSubmittedCutout",
+         snapshot.shadow.semanticSceneSubmittedCutout},
+        {"semanticSceneSubmittedAlphaBlend",
+         snapshot.shadow.semanticSceneSubmittedAlphaBlend},
+        {"semanticSceneMaterialObservedCutoutCount",
+         snapshot.shadow.semanticSceneMaterialObservedCutoutCount},
+        {"semanticSceneMaterialObservedAlphaBlendCount",
+         snapshot.shadow.semanticSceneMaterialObservedAlphaBlendCount},
+        {"semanticSceneRejectedCutoutSkinnedContract",
+         snapshot.shadow.semanticSceneRejectedCutoutSkinnedContract},
+        {"semanticSceneRejectedAlphaBlendSkinnedContract",
+         snapshot.shadow.semanticSceneRejectedAlphaBlendSkinnedContract},
+        {"semanticSceneRejectedCutoutGeometry",
+         snapshot.shadow.semanticSceneRejectedCutoutGeometry},
+        {"semanticSceneRejectedAlphaBlendGeometry",
+         snapshot.shadow.semanticSceneRejectedAlphaBlendGeometry},
+        {"semanticSceneRejectedCutoutVisualPolicy",
+         snapshot.shadow.semanticSceneRejectedCutoutVisualPolicy},
+        {"semanticSceneRejectedAlphaBlendVisualPolicy",
+         snapshot.shadow.semanticSceneRejectedAlphaBlendVisualPolicy},
+        {"semanticSceneMaterialLayerContractResolvedCount",
+         snapshot.shadow.semanticSceneMaterialLayerContractResolvedCount},
+        {"semanticSceneMaterialLayerContractFailedCount",
+         snapshot.shadow.semanticSceneMaterialLayerContractFailedCount},
+        {"semanticSceneMaterialBlendMode0Count",
+         snapshot.shadow.semanticSceneMaterialBlendMode0Count},
+        {"semanticSceneMaterialBlendMode1Count",
+         snapshot.shadow.semanticSceneMaterialBlendMode1Count},
+        {"semanticSceneMaterialBlendMode2PlusCount",
+         snapshot.shadow.semanticSceneMaterialBlendMode2PlusCount},
+        {"semanticSceneDirectCurrentDrawLayerIndexNonZeroCount",
+         snapshot.shadow.semanticSceneDirectCurrentDrawLayerIndexNonZeroCount},
+        {"semanticSceneMaterialLastMeshIndex",
+         snapshot.shadow.semanticSceneMaterialLastMeshIndex},
+        {"semanticSceneMaterialLastLayerIndex",
+         snapshot.shadow.semanticSceneMaterialLastLayerIndex},
+        {"semanticSceneMaterialLastLayerCount",
+         snapshot.shadow.semanticSceneMaterialLastLayerCount},
+        {"semanticSceneMaterialLastBlendOrDrawMode",
+         snapshot.shadow.semanticSceneMaterialLastBlendOrDrawMode},
+        {"semanticSceneSubmittedOwnedGroupSlots",
+         snapshot.shadow.semanticSceneSubmittedOwnedGroupSlots},
+        {"semanticSceneCurrentDrawContractKnownCount",
+         snapshot.shadow.semanticSceneCurrentDrawContractKnownCount},
+        {"semanticSceneCurrentDrawPaletteReadyCount",
+         snapshot.shadow.semanticSceneCurrentDrawPaletteReadyCount},
+        {"semanticSceneCurrentDrawGroupSlotReadyCount",
+         snapshot.shadow.semanticSceneCurrentDrawGroupSlotReadyCount},
+        {"semanticSceneCurrentDrawResolveReadyCount",
+         snapshot.shadow.semanticSceneCurrentDrawResolveReadyCount},
+        {"semanticSceneCurrentDrawMissNoContract",
+         snapshot.shadow.semanticSceneCurrentDrawMissNoContract},
+        {"semanticSceneCurrentDrawMissNoPalette",
+         snapshot.shadow.semanticSceneCurrentDrawMissNoPalette},
+        {"semanticSceneCurrentDrawMissNoGroupSlots",
+         snapshot.shadow.semanticSceneCurrentDrawMissNoGroupSlots},
+        {"semanticSceneCurrentDrawMissStaleVisibleFrame",
+         snapshot.shadow.semanticSceneCurrentDrawMissStaleVisibleFrame},
+        {"semanticSceneCurrentDrawResolveReadyRejectedCount",
+         snapshot.shadow.semanticSceneCurrentDrawResolveReadyRejectedCount},
+        {"semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount",
+         snapshot.shadow
+             .semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount},
+        {"semanticScenePaletteOverrideNoComposeCount",
+         snapshot.shadow.semanticScenePaletteOverrideNoComposeCount},
+        {"semanticScenePaletteOverrideWouldComposeCount",
+         snapshot.shadow.semanticScenePaletteOverrideWouldComposeCount},
+        {"semanticScenePalettePacketWorldComposeCount",
+         snapshot.shadow.semanticScenePalettePacketWorldComposeCount},
+        {"semanticSceneCanonicalReadyCount",
+         snapshot.shadow.semanticSceneCanonicalReadyCount},
+        {"semanticSceneCanonicalReadyCutoutCount",
+         snapshot.shadow.semanticSceneCanonicalReadyCutoutCount},
+        {"semanticSceneCanonicalReadyAlphaBlendCount",
+         snapshot.shadow.semanticSceneCanonicalReadyAlphaBlendCount},
+        {"semanticSceneCanonicalRejectNoStableIdentity",
+         snapshot.shadow.semanticSceneCanonicalRejectNoStableIdentity},
+        {"semanticSceneCanonicalRejectNoMesh",
+         snapshot.shadow.semanticSceneCanonicalRejectNoMesh},
+        {"semanticSceneCanonicalRejectNoWorldTransform",
+         snapshot.shadow.semanticSceneCanonicalRejectNoWorldTransform},
+        {"semanticSceneCanonicalRejectNoPalette",
+         snapshot.shadow.semanticSceneCanonicalRejectNoPalette},
+        {"semanticSceneCanonicalRejectNoSlotContract",
+         snapshot.shadow.semanticSceneCanonicalRejectNoSlotContract},
+        {"semanticSceneCanonicalRejectStaleProducer",
+         snapshot.shadow.semanticSceneCanonicalRejectStaleProducer},
+        {"semanticSceneCanonicalRejectInvalidVertexIndex",
+         snapshot.shadow.semanticSceneCanonicalRejectInvalidVertexIndex},
+        {"semanticSceneCanonicalRejectExplicitBlendIncomplete",
+         snapshot.shadow.semanticSceneCanonicalRejectExplicitBlendIncomplete},
+        {"semanticSceneCanonicalRejectAfterReadyCount",
+         snapshot.shadow.semanticSceneCanonicalRejectAfterReadyCount},
+        {"currentDrawContractPublishAttemptCount",
+         snapshot.shadow.currentDrawContractPublishAttemptCount},
+        {"currentDrawContractPublishReadyCount",
+         snapshot.shadow.currentDrawContractPublishReadyCount},
+        {"currentDrawContractPublishSkippedNonWorldContext",
+         snapshot.shadow.currentDrawContractPublishSkippedNonWorldContext},
+        {"currentDrawContractPublishSkippedSmallViewport",
+         snapshot.shadow.currentDrawContractPublishSkippedSmallViewport},
+        {"currentDrawContractQueryAttemptCount",
+         snapshot.shadow.currentDrawContractQueryAttemptCount},
+        {"currentDrawContractQueryHitCount",
+         snapshot.shadow.currentDrawContractQueryHitCount},
+        {"currentDrawCapturedPaletteQueryAttemptCount",
+         snapshot.shadow.currentDrawCapturedPaletteQueryAttemptCount},
+        {"currentDrawCapturedPaletteQueryHitCount",
+         snapshot.shadow.currentDrawCapturedPaletteQueryHitCount},
+        {"currentDrawGroupSlotDecodeAttemptCount",
+         snapshot.shadow.currentDrawGroupSlotDecodeAttemptCount},
+        {"currentDrawGroupSlotDecodeHitCount",
+         snapshot.shadow.currentDrawGroupSlotDecodeHitCount},
+        {"currentDrawGroupSlotDecodeMissDisabledStream",
+         snapshot.shadow.currentDrawGroupSlotDecodeMissDisabledStream},
+        {"currentDrawPreparedSliceProbeAttemptCount",
+         snapshot.shadow.currentDrawPreparedSliceProbeAttemptCount},
+        {"currentDrawPreparedSliceProbeContextReadyCount",
+         snapshot.shadow.currentDrawPreparedSliceProbeContextReadyCount},
+        {"currentDrawPreparedSliceProbeBackingReadableCount",
+         snapshot.shadow.currentDrawPreparedSliceProbeBackingReadableCount},
+        {"currentDrawPreparedSliceRecordedCount",
+         snapshot.shadow.currentDrawPreparedSliceRecordedCount},
+        {"currentDrawPreparedSliceQueryAttemptCount",
+         snapshot.shadow.currentDrawPreparedSliceQueryAttemptCount},
+        {"currentDrawPreparedSliceQueryHitCount",
+         snapshot.shadow.currentDrawPreparedSliceQueryHitCount},
+        {"currentDrawPreparedSliceQueryMissCount",
+         snapshot.shadow.currentDrawPreparedSliceQueryMissCount},
+        {"semanticSceneDirectPreparedSliceAuthoritativeCount",
+         snapshot.shadow.semanticSceneDirectPreparedSliceAuthoritativeCount},
+        {"semanticSceneDirectPreparedSliceFallbackLayerIndexCount",
+         snapshot.shadow
+             .semanticSceneDirectPreparedSliceFallbackLayerIndexCount},
+        {"semanticSceneDirectPreparedSliceMissingCount",
+         snapshot.shadow.semanticSceneDirectPreparedSliceMissingCount},
+        {"semanticScenePreparedProbeAttemptCount",
+         snapshot.shadow.semanticScenePreparedProbeAttemptCount},
+        {"semanticScenePreparedProbeContextReadyCount",
+         snapshot.shadow.semanticScenePreparedProbeContextReadyCount},
+        {"semanticScenePreparedProbeBackingReadableCount",
+         snapshot.shadow.semanticScenePreparedProbeBackingReadableCount},
+        {"semanticScenePreparedSliceRecordedCount",
+         snapshot.shadow.semanticScenePreparedSliceRecordedCount},
+        {"semanticScenePreparedSliceQueryAttemptCount",
+         snapshot.shadow.semanticScenePreparedSliceQueryAttemptCount},
+        {"semanticScenePreparedSliceQueryHitCount",
+         snapshot.shadow.semanticScenePreparedSliceQueryHitCount},
+        {"semanticScenePreparedSliceQueryMissCount",
+         snapshot.shadow.semanticScenePreparedSliceQueryMissCount},
+        {"semanticSceneShadowManifestObjectCount",
+         snapshot.shadow.semanticSceneShadowManifestObjectCount},
+        {"semanticSceneShadowManifestPartCount",
+         snapshot.shadow.semanticSceneShadowManifestPartCount},
+        {"semanticSceneShadowManifestStableObjectCount",
+         snapshot.shadow.semanticSceneShadowManifestStableObjectCount},
+        {"semanticSceneShadowManifestNewObjectCount",
+         snapshot.shadow.semanticSceneShadowManifestNewObjectCount},
+        {"semanticSceneShadowManifestExpiredObjectCount",
+         snapshot.shadow.semanticSceneShadowManifestExpiredObjectCount},
+        {"semanticSceneShadowManifestFreshPartCount",
+         snapshot.shadow.semanticSceneShadowManifestFreshPartCount},
+        {"semanticSceneShadowManifestLeaseablePartCount",
+         snapshot.shadow.semanticSceneShadowManifestLeaseablePartCount},
+        {"semanticSceneShadowManifestPoseStalePartCount",
+         snapshot.shadow.semanticSceneShadowManifestPoseStalePartCount},
+        {"semanticSceneShadowManifestSliceStalePartCount",
+         snapshot.shadow.semanticSceneShadowManifestSliceStalePartCount},
+        {"semanticSceneShadowManifestExpiredPartCount",
+         snapshot.shadow.semanticSceneShadowManifestExpiredPartCount},
+        {"semanticSceneShadowManifestMultiSlicePartCount",
+         snapshot.shadow.semanticSceneShadowManifestMultiSlicePartCount},
+        {"semanticSceneShadowManifestPayload11CChurnCount",
+         snapshot.shadow.semanticSceneShadowManifestPayload11CChurnCount},
+        {"semanticSceneShadowManifestRenderablePartChurnCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestRenderablePartChurnCount},
+        {"semanticSceneShadowManifestCModelPoseHitCount",
+         snapshot.shadow.semanticSceneShadowManifestCModelPoseHitCount},
+        {"semanticSceneShadowManifestCModelPoseMissCount",
+         snapshot.shadow.semanticSceneShadowManifestCModelPoseMissCount},
+        {"semanticSceneShadowManifestCModelPoseNoRuntimeCount",
+         snapshot.shadow.semanticSceneShadowManifestCModelPoseNoRuntimeCount},
+        {"semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr",
+         snapshot.shadow
+             .semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr},
+        {"semanticSceneShadowManifestCModelPoseLastMatrixCount",
+         snapshot.shadow.semanticSceneShadowManifestCModelPoseLastMatrixCount},
+        {"semanticSceneShadowManifestCModelPoseLastMatrixHash",
+         snapshot.shadow.semanticSceneShadowManifestCModelPoseLastMatrixHash},
+        {"semanticSceneSubmittedObjectJaccardMilli",
+         snapshot.shadow.semanticSceneSubmittedObjectJaccardMilli},
+        {"semanticSceneSubmittedPartJaccardMilli",
+         snapshot.shadow.semanticSceneSubmittedPartJaccardMilli},
+        {"semanticSceneVisibleLookupPartLayerHitCount",
+         snapshot.shadow.semanticSceneVisibleLookupPartLayerHitCount},
+        {"semanticSceneVisibleLookupSingleFallbackCount",
+         snapshot.shadow.semanticSceneVisibleLookupSingleFallbackCount},
+        {"semanticSceneVisibleLookupMissCount",
+         snapshot.shadow.semanticSceneVisibleLookupMissCount},
+        {"semanticSceneDirectMainWorldBackingNotCheckedCount",
+         snapshot.shadow.semanticSceneDirectMainWorldBackingNotCheckedCount},
+        {"semanticSceneDirectMainWorldBackingPassCount",
+         snapshot.shadow.semanticSceneDirectMainWorldBackingPassCount},
+        {"semanticSceneDirectMainWorldBackingFailNoRenderablePartCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailNoRenderablePartCount},
+        {"semanticSceneDirectMainWorldBackingFailLookupMissCount",
+         snapshot.shadow.semanticSceneDirectMainWorldBackingFailLookupMissCount},
+        {"semanticSceneDirectMainWorldBackingFailNonMainQueueCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailNonMainQueueCount},
+        {"semanticSceneDirectMainWorldBackingFailNonWorldGroupCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailNonWorldGroupCount},
+        {"semanticSceneDirectMainWorldBackingFailIdentityMismatchCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailIdentityMismatchCount},
+        {"semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount},
+        {"semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount},
+        {"currentDrawStream1PublishNoStreamCount",
+         snapshot.shadow.currentDrawStream1PublishNoStreamCount},
+        {"currentDrawStream1PublishStride0Count",
+         snapshot.shadow.currentDrawStream1PublishStride0Count},
+        {"currentDrawStream1PublishStride1Count",
+         snapshot.shadow.currentDrawStream1PublishStride1Count},
+        {"currentDrawStream1PublishStride8Count",
+         snapshot.shadow.currentDrawStream1PublishStride8Count},
+        {"currentDrawStream1PublishStride12Count",
+         snapshot.shadow.currentDrawStream1PublishStride12Count},
+        {"currentDrawStream1PublishStride16Count",
+         snapshot.shadow.currentDrawStream1PublishStride16Count},
+        {"currentDrawStream1PublishStride20Count",
+         snapshot.shadow.currentDrawStream1PublishStride20Count},
+        {"currentDrawStream1PublishStrideOtherCount",
+         snapshot.shadow.currentDrawStream1PublishStrideOtherCount},
+        {"currentDrawStream1PublishLastRawStride",
+         snapshot.shadow.currentDrawStream1PublishLastRawStride},
+        {"currentDrawStream1PublishMaxRawStride",
+         snapshot.shadow.currentDrawStream1PublishMaxRawStride},
+        {"currentDrawLastVisibleFrameSerial",
+         snapshot.shadow.currentDrawLastVisibleFrameSerial},
+        {"currentDrawLastRenderFrameIndex",
+         snapshot.shadow.currentDrawLastRenderFrameIndex},
+        {"currentDrawLastSmallViewportWidth",
+         snapshot.shadow.currentDrawLastSmallViewportWidth},
+        {"currentDrawLastSmallViewportHeight",
+         snapshot.shadow.currentDrawLastSmallViewportHeight},
+        {"currentDrawLastMissReason",
+         snapshot.shadow.currentDrawLastMissReason},
+        {"submitPaletteContentAgeLag0Count",
+         snapshot.shadow.submitPaletteContentAgeLag0Count},
+        {"submitPaletteContentAgeLag1Count",
+         snapshot.shadow.submitPaletteContentAgeLag1Count},
+        {"submitPaletteContentAgeLag2Count",
+         snapshot.shadow.submitPaletteContentAgeLag2Count},
+        {"submitPaletteContentAgeLag3To5Count",
+         snapshot.shadow.submitPaletteContentAgeLag3To5Count},
+        {"submitPaletteContentAgeLag6PlusCount",
+         snapshot.shadow.submitPaletteContentAgeLag6PlusCount},
+        {"submitPaletteContentAgeMax",
+         snapshot.shadow.submitPaletteContentAgeMax},
+        {"submitPaletteContentAgeSampleCount",
+         snapshot.shadow.submitPaletteContentAgeSampleCount},
+        {"submitPaletteContentAgeUnknownCount",
+         snapshot.shadow.submitPaletteContentAgeUnknownCount},
+        {"semanticScenePopulateLastReturnReason",
+         snapshot.shadow.semanticScenePopulateLastReturnReason},
+        {"semanticScenePopulateLastProducerPublishAttemptDelta",
+         snapshot.shadow.semanticScenePopulateLastProducerPublishAttemptDelta},
+        {"semanticScenePopulateLastProducerPublishReadyDelta",
+         snapshot.shadow.semanticScenePopulateLastProducerPublishReadyDelta},
+        {"semanticScenePopulateLastProducerQueryAttemptDelta",
+         snapshot.shadow.semanticScenePopulateLastProducerQueryAttemptDelta},
+        {"semanticScenePopulateLastProducerQueryHitDelta",
+         snapshot.shadow.semanticScenePopulateLastProducerQueryHitDelta},
+        {"semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta",
+         snapshot.shadow
+             .semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta},
+        {"semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta",
+         snapshot.shadow
+             .semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta},
+        {"semanticScenePopulateLastProducerGroupDecodeAttemptDelta",
+         snapshot.shadow.semanticScenePopulateLastProducerGroupDecodeAttemptDelta},
+        {"semanticScenePopulateLastProducerGroupDecodeHitDelta",
+         snapshot.shadow.semanticScenePopulateLastProducerGroupDecodeHitDelta},
+        {"semanticSceneSubmittedExplicitBlendContract",
+         snapshot.shadow.semanticSceneSubmittedExplicitBlendContract},
+        {"semanticSceneSubmittedSingleMatrixGroupSkinning",
+         snapshot.shadow.semanticSceneSubmittedSingleMatrixGroupSkinning},
+        {"semanticSceneSubmittedMultiGroupSlotSkinning",
+         snapshot.shadow.semanticSceneSubmittedMultiGroupSlotSkinning},
+        {"semanticSceneSkinnedMinUniqueGroupSlots",
+         snapshot.shadow.semanticSceneSkinnedMinUniqueGroupSlots},
+        {"semanticSceneSkinnedMaxUniqueGroupSlots",
+         snapshot.shadow.semanticSceneSkinnedMaxUniqueGroupSlots},
+        {"semanticSceneSkinnedGroupSlotsUnique1Count",
+         snapshot.shadow.semanticSceneSkinnedGroupSlotsUnique1Count},
+        {"semanticSceneSkinnedGroupSlotsUnique2To4Count",
+         snapshot.shadow.semanticSceneSkinnedGroupSlotsUnique2To4Count},
+        {"semanticSceneSkinnedGroupSlotsUnique5To8Count",
+         snapshot.shadow.semanticSceneSkinnedGroupSlotsUnique5To8Count},
+        {"semanticSceneSkinnedGroupSlotsUnique9To16Count",
+         snapshot.shadow.semanticSceneSkinnedGroupSlotsUnique9To16Count},
+        {"semanticSceneSkinnedGroupSlotsUnique17PlusCount",
+         snapshot.shadow.semanticSceneSkinnedGroupSlotsUnique17PlusCount},
+        {"semanticSceneExplicitBlendUnavailableCurrentDraw",
+         snapshot.shadow.semanticSceneExplicitBlendUnavailableCurrentDraw},
         {"semanticSceneSubmittedFrameLocal",
          snapshot.shadow.semanticSceneSubmittedFrameLocal},
         {"semanticSceneSubmittedPersistent",
@@ -651,7 +1699,493 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
         {"semanticStaticCandidateRejectedNoGeoset",
          snapshot.shadow.semanticStaticCandidateRejectedNoGeoset},
         {"semanticStaticCandidateRejectedNonCanonicalKind",
-         snapshot.shadow.semanticStaticCandidateRejectedNonCanonicalKind}}}};
+         snapshot.shadow.semanticStaticCandidateRejectedNonCanonicalKind},
+        // Phase 7.2: flicker diagnostics + reconciliation
+        {"semanticSceneDirectLastRawRecordCount",
+         snapshot.shadow.semanticSceneDirectLastRawRecordCount},
+        {"semanticSceneDirectLastEligibleRecordCount",
+         snapshot.shadow.semanticSceneDirectLastEligibleRecordCount},
+        {"semanticSceneDirectLastSubmittedRecordCount",
+         snapshot.shadow.semanticSceneDirectLastSubmittedRecordCount},
+        {"semanticSceneDirectLastUniqueObjectCount",
+         snapshot.shadow.semanticSceneDirectLastUniqueObjectCount},
+        {"semanticSceneDirectLastSubmittedObjectCount",
+         snapshot.shadow.semanticSceneDirectLastSubmittedObjectCount},
+        {"semanticSceneDirectLastRecordCapPartialObjectCount",
+         snapshot.shadow.semanticSceneDirectLastRecordCapPartialObjectCount},
+        {"semanticSceneDirectLastScanCapPartialObjectCount",
+         snapshot.shadow.semanticSceneDirectLastScanCapPartialObjectCount},
+        {"semanticSceneDirectLastMinGeosetsPerObject",
+         snapshot.shadow.semanticSceneDirectLastMinGeosetsPerObject},
+        {"semanticSceneDirectLastMaxGeosetsPerObject",
+         snapshot.shadow.semanticSceneDirectLastMaxGeosetsPerObject},
+        {"semanticSceneDirectLastSubmittedIdentityHash",
+         snapshot.shadow.semanticSceneDirectLastSubmittedIdentityHash},
+        {"semanticSceneDirectIdentityChurnCount",
+         snapshot.shadow.semanticSceneDirectIdentityChurnCount},
+        {"semanticSceneDirectRecordCapHitCount",
+         snapshot.shadow.semanticSceneDirectRecordCapHitCount},
+        {"semanticSceneDirectRecordCapTruncatedRecordCount",
+         snapshot.shadow.semanticSceneDirectRecordCapTruncatedRecordCount},
+        {"semanticSceneDirectScanCapHitCount",
+         snapshot.shadow.semanticSceneDirectScanCapHitCount},
+        {"semanticSceneDirectObjectGroupedSubmitCount",
+         snapshot.shadow.semanticSceneDirectObjectGroupedSubmitCount},
+        {"semanticSceneDirectObjectGroupedSkipCount",
+         snapshot.shadow.semanticSceneDirectObjectGroupedSkipCount},
+        {"semanticSceneDirectRecordCapSkipObjectCount",
+         snapshot.shadow.semanticSceneDirectRecordCapSkipObjectCount},
+        {"semanticSceneDirectRecordCapAppendFailCount",
+         snapshot.shadow.semanticSceneDirectRecordCapAppendFailCount},
+        {"semanticSceneDirectSelectionLeaseActiveKeyCount",
+         snapshot.shadow.semanticSceneDirectSelectionLeaseActiveKeyCount},
+        {"semanticSceneDirectSelectionLeasePrunedKeyCount",
+         snapshot.shadow.semanticSceneDirectSelectionLeasePrunedKeyCount},
+        {"semanticSceneDirectSelectionLeaseSubmittedKeyCount",
+         snapshot.shadow.semanticSceneDirectSelectionLeaseSubmittedKeyCount},
+        {"semanticSceneDirectStickyFillBudgetRecordCount",
+         snapshot.shadow.semanticSceneDirectStickyFillBudgetRecordCount},
+        {"semanticSceneDirectStickyFillAppendedCount",
+         snapshot.shadow.semanticSceneDirectStickyFillAppendedCount},
+        {"semanticSceneDirectStickyFillSubmittedCount",
+         snapshot.shadow.semanticSceneDirectStickyFillSubmittedCount},
+        {"semanticSceneDirectStickyFillMissedCount",
+         snapshot.shadow.semanticSceneDirectStickyFillMissedCount},
+        {"semanticSceneDirectPartLeaseRestoredCount",
+         snapshot.shadow.semanticSceneDirectPartLeaseRestoredCount},
+        {"semanticSceneDirectPartLeaseUpdatedCount",
+         snapshot.shadow.semanticSceneDirectPartLeaseUpdatedCount},
+        {"semanticSceneDirectPartLeaseExpiredCount",
+         snapshot.shadow.semanticSceneDirectPartLeaseExpiredCount},
+        {"semanticSceneDirectPartLeaseRejectedDynamicMeshCount",
+         snapshot.shadow.semanticSceneDirectPartLeaseRejectedDynamicMeshCount},
+        {"semanticSceneDirectPartLeaseRejectedNotSelfContainedCount",
+         snapshot.shadow
+             .semanticSceneDirectPartLeaseRejectedNotSelfContainedCount},
+        {"semanticSceneDirectPartLeaseRejectedUnsafeBackingCount",
+         snapshot.shadow.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount},
+        {"semanticSceneDirectPartLeaseRejectedSelfRenewCount",
+         snapshot.shadow.semanticSceneDirectPartLeaseRejectedSelfRenewCount},
+        {"semanticSceneDirectPartLeaseBudgetLimitCount",
+         snapshot.shadow.semanticSceneDirectPartLeaseBudgetLimitCount},
+        {"semanticSceneShadowManifestPartLeaseRestoredCount",
+         snapshot.shadow.semanticSceneShadowManifestPartLeaseRestoredCount},
+        {"semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount},
+        {"semanticSceneShadowManifestPartLeaseExpiredCount",
+         snapshot.shadow.semanticSceneShadowManifestPartLeaseExpiredCount},
+        {"semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount},
+        {"semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount},
+        {"semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount},
+        {"semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount},
+        {"semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount},
+        {"semanticSceneShadowManifestPartLeaseBudgetLimitCount",
+         snapshot.shadow.semanticSceneShadowManifestPartLeaseBudgetLimitCount},
+        {"semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount},
+        {"semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount},
+        {"semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount},
+        {"semanticSceneShadowManifestObjectCoreCompleteCount",
+         snapshot.shadow.semanticSceneShadowManifestObjectCoreCompleteCount},
+        {"semanticSceneShadowManifestObjectCoreIncompleteSkipCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestObjectCoreIncompleteSkipCount},
+        {"semanticSceneShadowManifestPartOmittedIncompleteCoreCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestPartOmittedIncompleteCoreCount},
+        {"semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount},
+        {"semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount},
+        {"semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount},
+        {"semanticSceneShadowManifestObjectCoreEpochMissingPartCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestObjectCoreEpochMissingPartCount},
+        {"semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount},
+        // Phase 7.28：skinned palette content stability probe。
+        {"semanticSceneSubmittedSkinnedPaletteSourceNoneCount",
+         snapshot.shadow.semanticSceneSubmittedSkinnedPaletteSourceNoneCount},
+        {"semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount},
+        {"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount},
+        {"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount},
+        {"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount},
+        {"semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount},
+        {"semanticSceneSubmittedSkinnedPaletteStablePartSampleCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteStablePartSampleCount},
+        {"semanticSceneSubmittedSkinnedPaletteHashChurnCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteHashChurnCount},
+        {"semanticSceneSubmittedSkinnedPaletteSourceChurnCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteSourceChurnCount},
+        {"semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount},
+        {"semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax},
+        {"semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax},
+        {"semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount},
+        {"semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount},
+        {"semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount},
+        {"semanticSceneSubmittedSkinnedPaletteCountChurnCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteCountChurnCount},
+        {"semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount},
+        {"semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount},
+        {"semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount},
+        {"semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount},
+        {"semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount},
+        {"semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount},
+        {"semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount},
+        {"semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount},
+        {"semanticSceneDirectPaletteAttributionSnapshotHitCount",
+         snapshot.shadow
+             .semanticSceneDirectPaletteAttributionSnapshotHitCount},
+        {"semanticSceneDirectPaletteCaptureTrustedSourceHitCount",
+         snapshot.shadow
+             .semanticSceneDirectPaletteCaptureTrustedSourceHitCount},
+        {"semanticSceneDirectPaletteCaptureTrustedSourceMissCount",
+         snapshot.shadow
+             .semanticSceneDirectPaletteCaptureTrustedSourceMissCount},
+        {"semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount},
+        {"semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount},
+        {"semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount",
+         snapshot.shadow
+             .semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount},
+        {"semanticSceneDirectManifestObjectCount",
+         snapshot.shadow.semanticSceneDirectManifestObjectCount},
+        {"semanticSceneDirectManifestObservedPartCount",
+         snapshot.shadow.semanticSceneDirectManifestObservedPartCount},
+        {"semanticSceneDirectManifestShadowEligiblePartCount",
+         snapshot.shadow.semanticSceneDirectManifestShadowEligiblePartCount},
+        {"semanticSceneDirectObjectCompleteEligibleCount",
+         snapshot.shadow.semanticSceneDirectObjectCompleteEligibleCount},
+        {"semanticSceneDirectObjectIncompleteByScanCapCount",
+         snapshot.shadow.semanticSceneDirectObjectIncompleteByScanCapCount},
+        {"semanticSceneDirectObjectIncompleteByAlphaPolicyCount",
+         snapshot.shadow.semanticSceneDirectObjectIncompleteByAlphaPolicyCount},
+        {"semanticSceneDirectObjectIncompleteBySliceUnresolvedCount",
+         snapshot.shadow
+             .semanticSceneDirectObjectIncompleteBySliceUnresolvedCount},
+        {"semanticSceneDirectObjectIncompleteByPacketBuildFailCount",
+         snapshot.shadow
+             .semanticSceneDirectObjectIncompleteByPacketBuildFailCount},
+        {"semanticSceneDirectObjectIncompleteByAppendFailCount",
+         snapshot.shadow.semanticSceneDirectObjectIncompleteByAppendFailCount},
+        {"semanticSceneDirectSubmittedCompleteObjectCount",
+         snapshot.shadow.semanticSceneDirectSubmittedCompleteObjectCount},
+        {"semanticSceneDirectSubmittedPartialObjectCount",
+         snapshot.shadow.semanticSceneDirectSubmittedPartialObjectCount},
+        {"semanticSceneDirectPreparedSliceAuthoritativeCount",
+         snapshot.shadow.semanticSceneDirectPreparedSliceAuthoritativeCount},
+        {"semanticSceneDirectPreparedSliceFallbackLayerIndexCount",
+         snapshot.shadow
+             .semanticSceneDirectPreparedSliceFallbackLayerIndexCount},
+        {"semanticSceneDirectPreparedSliceMissingCount",
+         snapshot.shadow.semanticSceneDirectPreparedSliceMissingCount},
+        {"semanticScenePreparedProbeAttemptCount",
+         snapshot.shadow.semanticScenePreparedProbeAttemptCount},
+        {"semanticScenePreparedProbeContextReadyCount",
+         snapshot.shadow.semanticScenePreparedProbeContextReadyCount},
+        {"semanticScenePreparedProbeBackingReadableCount",
+         snapshot.shadow.semanticScenePreparedProbeBackingReadableCount},
+        {"semanticScenePreparedSliceRecordedCount",
+         snapshot.shadow.semanticScenePreparedSliceRecordedCount},
+        {"semanticScenePreparedSliceQueryAttemptCount",
+         snapshot.shadow.semanticScenePreparedSliceQueryAttemptCount},
+        {"semanticScenePreparedSliceQueryHitCount",
+         snapshot.shadow.semanticScenePreparedSliceQueryHitCount},
+        {"semanticScenePreparedSliceQueryMissCount",
+         snapshot.shadow.semanticScenePreparedSliceQueryMissCount},
+        {"semanticSceneShadowManifestObjectCount",
+         snapshot.shadow.semanticSceneShadowManifestObjectCount},
+        {"semanticSceneShadowManifestPartCount",
+         snapshot.shadow.semanticSceneShadowManifestPartCount},
+        {"semanticSceneShadowManifestStableObjectCount",
+         snapshot.shadow.semanticSceneShadowManifestStableObjectCount},
+        {"semanticSceneShadowManifestNewObjectCount",
+         snapshot.shadow.semanticSceneShadowManifestNewObjectCount},
+        {"semanticSceneShadowManifestExpiredObjectCount",
+         snapshot.shadow.semanticSceneShadowManifestExpiredObjectCount},
+        {"semanticSceneShadowManifestFreshPartCount",
+         snapshot.shadow.semanticSceneShadowManifestFreshPartCount},
+        {"semanticSceneShadowManifestLeaseablePartCount",
+         snapshot.shadow.semanticSceneShadowManifestLeaseablePartCount},
+        {"semanticSceneShadowManifestPoseStalePartCount",
+         snapshot.shadow.semanticSceneShadowManifestPoseStalePartCount},
+        {"semanticSceneShadowManifestSliceStalePartCount",
+         snapshot.shadow.semanticSceneShadowManifestSliceStalePartCount},
+        {"semanticSceneShadowManifestExpiredPartCount",
+         snapshot.shadow.semanticSceneShadowManifestExpiredPartCount},
+        {"semanticSceneShadowManifestMultiSlicePartCount",
+         snapshot.shadow.semanticSceneShadowManifestMultiSlicePartCount},
+        {"semanticSceneShadowManifestPayload11CChurnCount",
+         snapshot.shadow.semanticSceneShadowManifestPayload11CChurnCount},
+        {"semanticSceneShadowManifestRenderablePartChurnCount",
+         snapshot.shadow
+             .semanticSceneShadowManifestRenderablePartChurnCount},
+        {"semanticSceneShadowManifestCModelPoseHitCount",
+         snapshot.shadow.semanticSceneShadowManifestCModelPoseHitCount},
+        {"semanticSceneShadowManifestCModelPoseMissCount",
+         snapshot.shadow.semanticSceneShadowManifestCModelPoseMissCount},
+        {"semanticSceneShadowManifestCModelPoseNoRuntimeCount",
+         snapshot.shadow.semanticSceneShadowManifestCModelPoseNoRuntimeCount},
+        {"semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr",
+         snapshot.shadow
+             .semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr},
+        {"semanticSceneShadowManifestCModelPoseLastMatrixCount",
+         snapshot.shadow.semanticSceneShadowManifestCModelPoseLastMatrixCount},
+        {"semanticSceneShadowManifestCModelPoseLastMatrixHash",
+         snapshot.shadow.semanticSceneShadowManifestCModelPoseLastMatrixHash},
+        {"semanticSceneSubmittedObjectJaccardMilli",
+         snapshot.shadow.semanticSceneSubmittedObjectJaccardMilli},
+        {"semanticSceneSubmittedPartJaccardMilli",
+         snapshot.shadow.semanticSceneSubmittedPartJaccardMilli},
+        {"semanticSceneVisibleLookupPartLayerHitCount",
+         snapshot.shadow.semanticSceneVisibleLookupPartLayerHitCount},
+        {"semanticSceneVisibleLookupSingleFallbackCount",
+         snapshot.shadow.semanticSceneVisibleLookupSingleFallbackCount},
+        {"semanticSceneVisibleLookupMissCount",
+         snapshot.shadow.semanticSceneVisibleLookupMissCount},
+        {"semanticSceneDirectMainWorldBackingNotCheckedCount",
+         snapshot.shadow.semanticSceneDirectMainWorldBackingNotCheckedCount},
+        {"semanticSceneDirectMainWorldBackingPassCount",
+         snapshot.shadow.semanticSceneDirectMainWorldBackingPassCount},
+        {"semanticSceneDirectMainWorldBackingFailNoRenderablePartCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailNoRenderablePartCount},
+        {"semanticSceneDirectMainWorldBackingFailLookupMissCount",
+         snapshot.shadow.semanticSceneDirectMainWorldBackingFailLookupMissCount},
+        {"semanticSceneDirectMainWorldBackingFailNonMainQueueCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailNonMainQueueCount},
+        {"semanticSceneDirectMainWorldBackingFailNonWorldGroupCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailNonWorldGroupCount},
+        {"semanticSceneDirectMainWorldBackingFailIdentityMismatchCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailIdentityMismatchCount},
+        {"semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount},
+        {"semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount",
+         snapshot.shadow
+             .semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount},
+        {"semanticSceneDirectPaletteHashChurnCount",
+         snapshot.shadow.semanticSceneDirectPaletteHashChurnCount},
+        {"semanticSceneDirectGroupHashChurnCount",
+         snapshot.shadow.semanticSceneDirectGroupHashChurnCount},
+        {"semanticSceneDirectStableGroupHashChurnCount",
+         snapshot.shadow.semanticSceneDirectStableGroupHashChurnCount},
+        {"semanticSceneDirectStream1PtrChurnCount",
+         snapshot.shadow.semanticSceneDirectStream1PtrChurnCount},
+        {"semanticSceneDirectGeometrySourceHashChurnCount",
+         snapshot.shadow.semanticSceneDirectGeometrySourceHashChurnCount},
+        {"semanticSceneDirectSameCasterComparisonCount",
+         snapshot.shadow.semanticSceneDirectSameCasterComparisonCount},
+        {"semanticSceneDirectIdentitySkippedChurnCount",
+         snapshot.shadow.semanticSceneDirectIdentitySkippedChurnCount},
+        {"semanticSceneDirectPaletteRootDeltaSampleCount",
+         snapshot.shadow.semanticSceneDirectPaletteRootDeltaSampleCount},
+        {"semanticSceneDirectPaletteRootHashChangedTinyDeltaCount",
+         snapshot.shadow
+             .semanticSceneDirectPaletteRootHashChangedTinyDeltaCount},
+        {"semanticSceneDirectPaletteRootHashChangedSmallDeltaCount",
+         snapshot.shadow
+             .semanticSceneDirectPaletteRootHashChangedSmallDeltaCount},
+        {"semanticSceneDirectPaletteRootHashChangedMediumDeltaCount",
+         snapshot.shadow
+             .semanticSceneDirectPaletteRootHashChangedMediumDeltaCount},
+        {"semanticSceneDirectPaletteRootHashChangedLargeDeltaCount",
+         snapshot.shadow
+             .semanticSceneDirectPaletteRootHashChangedLargeDeltaCount},
+        {"semanticSceneDirectPaletteRootMaxDeltaMilli",
+         snapshot.shadow.semanticSceneDirectPaletteRootMaxDeltaMilli},
+        {"semanticSceneDirectSelectionKeyUnitPtrCount",
+         snapshot.shadow.semanticSceneDirectSelectionKeyUnitPtrCount},
+        {"semanticSceneDirectSelectionKeyJHandleCount",
+         snapshot.shadow.semanticSceneDirectSelectionKeyJHandleCount},
+        {"semanticSceneDirectSelectionKeyRuntimeModelCount",
+         snapshot.shadow.semanticSceneDirectSelectionKeyRuntimeModelCount},
+        {"semanticSceneDirectSelectionKeyWorldObjectCount",
+         snapshot.shadow.semanticSceneDirectSelectionKeyWorldObjectCount},
+        {"semanticSceneDirectSelectionKeySceneNodeCount",
+         snapshot.shadow.semanticSceneDirectSelectionKeySceneNodeCount},
+        {"semanticSceneDirectSelectionKeyModelMeshCount",
+         snapshot.shadow.semanticSceneDirectSelectionKeyModelMeshCount},
+        {"semanticSceneDirectSelectionKeyRenderablePartCount",
+         snapshot.shadow.semanticSceneDirectSelectionKeyRenderablePartCount},
+        {"semanticSceneDirectLastSubmittedSceneNode",
+         snapshot.shadow.semanticSceneDirectLastSubmittedSceneNode},
+        {"semanticSceneDirectLastSubmittedPaletteHash",
+         snapshot.shadow.semanticSceneDirectLastSubmittedPaletteHash},
+        {"semanticSceneDirectLastSubmittedGroupHash",
+         snapshot.shadow.semanticSceneDirectLastSubmittedGroupHash},
+        {"semanticSceneDirectLastSubmittedStableGroupHash",
+         snapshot.shadow.semanticSceneDirectLastSubmittedStableGroupHash},
+        {"semanticSceneLastAppendedGeometrySourceHash",
+         snapshot.shadow.semanticSceneLastAppendedGeometrySourceHash},
+        {"semanticSceneLastAppendedGeometryId",
+         snapshot.shadow.semanticSceneLastAppendedGeometryId},
+        {"semanticSceneShadowCastersCount",
+         snapshot.shadow.semanticSceneShadowCastersCount},
+        {"semanticSceneReplayDrawsCount",
+         snapshot.shadow.semanticSceneReplayDrawsCount},
+        {"semanticSceneShadowMapDrawnCasters",
+         snapshot.shadow.semanticSceneShadowMapDrawnCasters},
+        {"semanticSceneShadowMapCascadeCulledCount",
+         snapshot.shadow.semanticSceneShadowMapCascadeCulledCount},
+        {"semanticSceneShadowMapSkinnedCasterCount",
+         snapshot.shadow.semanticSceneShadowMapSkinnedCasterCount},
+        {"semanticSceneShadowMapSkinnedPreparedCount",
+         snapshot.shadow.semanticSceneShadowMapSkinnedPreparedCount},
+        {"semanticSceneShadowMapSkinnedInvalidBufferCount",
+         snapshot.shadow.semanticSceneShadowMapSkinnedInvalidBufferCount},
+        {"semanticSceneShadowMapSkinnedInvalidPipelineCount",
+         snapshot.shadow.semanticSceneShadowMapSkinnedInvalidPipelineCount},
+        {"semanticSceneShadowMapSkinnedDrawnCount",
+         snapshot.shadow.semanticSceneShadowMapSkinnedDrawnCount},
+        {"semanticSceneShadowTaaActive",
+         snapshot.shadow.semanticSceneShadowTaaActive},
+        {"semanticSceneReceiverReuseShadowMap",
+         snapshot.shadow.semanticSceneReceiverReuseShadowMap},
+        {"semanticSceneReceiverInputValid",
+         snapshot.shadow.semanticSceneReceiverInputValid},
+        {"semanticSceneReceiverInputRejectReason",
+         snapshot.shadow.semanticSceneReceiverInputRejectReason},
+        {"semanticSceneReceiverNeedPass",
+         snapshot.shadow.semanticSceneReceiverNeedPass},
+        {"semanticSceneReceiverNeedShadowMap",
+         snapshot.shadow.semanticSceneReceiverNeedShadowMap},
+        {"semanticSceneReceiverHasCompleteShadowMap",
+         snapshot.shadow.semanticSceneReceiverHasCompleteShadowMap},
+        {"semanticSceneReceiverHasUsableDirectionalShadow",
+         snapshot.shadow.semanticSceneReceiverHasUsableDirectionalShadow},
+        {"semanticSceneReceiverActiveStrengthMilli",
+         snapshot.shadow.semanticSceneReceiverActiveStrengthMilli},
+        {"semanticSceneReceiverUboStrengthMilli",
+         snapshot.shadow.semanticSceneReceiverUboStrengthMilli},
+        {"semanticSceneReceiverDebugMode",
+         snapshot.shadow.semanticSceneReceiverDebugMode},
+        {"semanticSceneReceiverCsmCascadeCount",
+         snapshot.shadow.semanticSceneReceiverCsmCascadeCount},
+        {"semanticSceneReceiverRunEntryFlags",
+         snapshot.shadow.semanticSceneReceiverRunEntryFlags},
+        {"semanticSceneReceiverRunEarlyReturnReason",
+         snapshot.shadow.semanticSceneReceiverRunEarlyReturnReason},
+        {"semanticSceneShadowMapExecutedThisFrame",
+         snapshot.shadow.semanticSceneShadowMapExecutedThisFrame},
+        {"semanticSceneReceiverSettingsShadowsEnabled",
+         snapshot.shadow.semanticSceneReceiverSettingsShadowsEnabled},
+        {"semanticSceneReceiverSettingsOutlineEnabled",
+         snapshot.shadow.semanticSceneReceiverSettingsOutlineEnabled},
+        {"semanticSceneReceiverSettingsRawStrengthMilli",
+         snapshot.shadow.semanticSceneReceiverSettingsRawStrengthMilli},
+        {"semanticSceneReceiverComputedShadowStrengthMilli",
+         snapshot.shadow.semanticSceneReceiverComputedShadowStrengthMilli},
+        {"semanticSceneReceiverHasSunShadow",
+         snapshot.shadow.semanticSceneReceiverHasSunShadow},
+        {"semanticSceneReceiverHasPointShadow",
+         snapshot.shadow.semanticSceneReceiverHasPointShadow},
+        {"semanticSceneReceiverNeedOutlinePass",
+         snapshot.shadow.semanticSceneReceiverNeedOutlinePass},
+        {"semanticSceneReceiverZeroStrengthFrameCount",
+         snapshot.shadow.semanticSceneReceiverZeroStrengthFrameCount},
+        {"semanticSceneReceiverDrawnWithZeroStrengthCount",
+         snapshot.shadow.semanticSceneReceiverDrawnWithZeroStrengthCount},
+        {"semanticSceneReceiverNoCompleteShadowMapCount",
+         snapshot.shadow.semanticSceneReceiverNoCompleteShadowMapCount},
+        {"semanticSceneReceiverNoShadowMapImageCount",
+         snapshot.shadow.semanticSceneReceiverNoShadowMapImageCount},
+        {"semanticSceneReceiverNoShadowMapSampleViewCount",
+         snapshot.shadow.semanticSceneReceiverNoShadowMapSampleViewCount},
+        {"semanticSceneReceiverNoCandidateCsmCount",
+         snapshot.shadow.semanticSceneReceiverNoCandidateCsmCount},
+        {"semanticSceneReceiverCsmFallbackToLastGoodCount",
+         snapshot.shadow.semanticSceneReceiverCsmFallbackToLastGoodCount},
+        {"semanticSceneReceiverHoldInvalidCsmCount",
+         snapshot.shadow.semanticSceneReceiverHoldInvalidCsmCount},
+        {"semanticSceneReceiverHoldEmptyReplayCount",
+         snapshot.shadow.semanticSceneReceiverHoldEmptyReplayCount},
+        {"semanticSceneReceiverHoldIdentityChurnCount",
+         snapshot.shadow.semanticSceneReceiverHoldIdentityChurnCount},
+        {"semanticSceneReceiverReuseInvalidatedAfterEnsureCount",
+         snapshot.shadow.semanticSceneReceiverReuseInvalidatedAfterEnsureCount},
+        {"semanticSceneShadowMapRenderSkippedNoResourcesCount",
+         snapshot.shadow.semanticSceneShadowMapRenderSkippedNoResourcesCount},
+        {"semanticSceneShadowMapRenderSkippedNoMatrixBufferCount",
+         snapshot.shadow
+             .semanticSceneShadowMapRenderSkippedNoMatrixBufferCount},
+        {"semanticSceneReceiverViewportX",
+         snapshot.shadow.semanticSceneReceiverViewportX},
+        {"semanticSceneReceiverViewportY",
+         snapshot.shadow.semanticSceneReceiverViewportY},
+        {"semanticSceneReceiverViewportWidth",
+         snapshot.shadow.semanticSceneReceiverViewportWidth},
+        {"semanticSceneReceiverViewportHeight",
+         snapshot.shadow.semanticSceneReceiverViewportHeight}}}};
 }
 
 War3RuntimeStatusSnapshot BuildRuntimeStatusSnapshot(const char* source,

@@ -288,8 +288,8 @@ inline constexpr uint32_t kNativeMainLoopStatsIntervalPumpCalls = 2000;
 inline constexpr bool kNativeMainLoopDeepPhaseHookEnabled =
     kNativeMainLoopCoverageAnalysisMode || false;
 
-// 发布版恢复原生暂停行为，避免单机无法暂停。
-inline constexpr bool kAutoTestDisableGamePause = false;
+// 诊断期阻止 War3 在切出窗口时自动暂停，避免 shadow/pose cadence 日志被前台切换污染。
+inline constexpr bool kAutoTestDisableGamePause = true;
 
 // 调试：忽略 CullTable 可见性（仅用于定位“漏渲染”原因）
 inline constexpr bool kNativeRenderBypassCull = false;
@@ -443,19 +443,33 @@ inline constexpr bool kWar3RuntimeConfigDisableSemanticModelHooks = false;
 inline constexpr bool kWar3RuntimeConfigDisableSemanticGeosetResourceCapture =
     false;
 
-// 仅关闭 pose/palette 相关 hook（sprite frame / runtime matrix copy/flush）。
+// 仅关闭重型 pose 相关 hook（sprite frame / attachment pose 等）。
 // 当前主路径改为 contract capture 阶段按 visible runtimeModel 直读 CModel
-// palette/world transform。高频 pose hook 默认退出主路径，避免 semantic.data
-// 在 SpriteFrameUpdate / runtime matrix publisher 上做 registry storm。
+// palette/world transform。高频 SpriteFrameUpdate hook 默认退出主路径，避免
+// semantic.data 在 SpriteFrameUpdate 上做 registry storm。
 inline constexpr bool kWar3RuntimeConfigDisableSemanticPoseHooks = true;
+// 上层阴影仍需要最终矩阵发布点：RuntimeMatrixRangeCopy 给 PoseRegistry
+// 提供同帧 source-range palette，RuntimeMatrixWrite 给 renderablePart slot
+// 提供引擎已经混合好的 group palette。它们比 SpriteFrame/attachment hook
+// 轻得多，也正是语义阴影摆脱 VB/IB 捕获后的生产数据源。
+inline constexpr bool kWar3RuntimeConfigEnableSemanticMatrixPublisherHooks =
+    true;
 inline constexpr bool kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled =
-    false;
+    true;
 
 // Pose producer 关闭时是否仍安装 SpriteFrameUpdate 系列 Hook 来补 runtime
 // resource。当前性能二分证明该热路径可能在无 pose 情况下造成未计入的
 // semantic.data 卡顿，默认禁止，后续改成按 visible manifest 延迟补齐。
 inline constexpr bool kWar3RuntimeConfigInstallSpriteFrameHooksWithoutPose =
     false;
+
+// Phase 7.47 dt gate probe（独立诊断开关，只用于调查阴影 pose 卡顿）：
+// 打开后，即便 pose hooks 被禁用，仍会安装
+// CSpriteUber_PreRenderAndUpdatePosePalette_{Full,Mini,Lite,MiniLite} 四个
+// hook。hook 实现只额外做一行 dt 分桶计数，不触发原来的 pose/identity
+// registry 写入，避免 semantic storm。
+// 也可通过环境变量 DXVK_WAR3_SPRITE_UBER_DT_PROBE 在运行时开启。
+inline constexpr bool kWar3RuntimeConfigInstallSpriteUberDtProbeHooks = false;
 
 // 仅关闭 attachment/local-point/attached-effect 相关 hook。
 // 用于验证 local-point output / child runtime contract 是否是高开销点。
@@ -565,14 +579,14 @@ inline constexpr bool kWar3RuntimeConfigSemanticPoseProducerEffective =
 inline constexpr bool
     kWar3RuntimeConfigSemanticMatrixPublisherPoseEffective =
     kWar3RuntimeConfigSemanticModelProducerEffective &&
-    !kWar3RuntimeConfigDisableSemanticPoseHooks;
+    kWar3RuntimeConfigEnableSemanticMatrixPublisherHooks;
 inline constexpr bool kWar3RuntimeConfigPreferSemanticRuntimePoseUpdatePalette = false;
 inline constexpr bool kWar3RuntimeConfigSemanticRuntimePoseUpdateEffective =
     kWar3RuntimeConfigSemanticModelProducerEffective &&
     !kWar3RuntimeConfigDisableSemanticPoseHooks;
 inline constexpr bool kWar3RuntimeConfigSemanticRuntimeMatrixWriteEffective =
     kWar3RuntimeConfigSemanticModelProducerEffective &&
-    !kWar3RuntimeConfigDisableSemanticPoseHooks;
+    kWar3RuntimeConfigEnableSemanticMatrixPublisherHooks;
 inline constexpr bool kWar3RuntimeConfigSemanticAttachmentProducerEffective =
     kWar3RuntimeConfigSemanticPoseProducerEffective &&
     !kWar3RuntimeConfigDisableSemanticAttachmentHooks;
@@ -689,18 +703,24 @@ inline constexpr bool kShadowSemanticCoreValidationEnabled = true;
 // - 这是当前 object shadow 主路径。普通手动进图默认启用；如需二分旧路径，
 //   可用 DXVK_WAR3_SEMANTIC_SHADOW_SCENE_SUBMISSION=0 显式关闭。
 inline constexpr bool kShadowSemanticCoreSceneSubmissionEnabled = true;
-inline constexpr bool kShadowSemanticCoreSceneUnitsOnly = true;
+inline constexpr bool kShadowSemanticCoreSceneUnitsOnly = false;
 inline constexpr bool kShadowSemanticCoreSceneSubmitDrawCapEnabled = false;
 inline constexpr uint32_t kShadowSemanticCoreSceneSubmitDrawCap = 64u;
 inline constexpr bool kShadowSemanticCoreSceneBootstrapCatchupEnabled = false;
 inline constexpr uint32_t kShadowSemanticCoreSceneBootstrapCatchupMaxAttempts = 0u;
 inline constexpr bool kShadowSemanticCoreSceneTailBoundaryFallbackEnabled = false;
 inline constexpr bool kShadowSemanticCoreSceneEndFrameFlushEnabled = false;
-inline constexpr bool kShadowSemanticCoreAllowFrameLocalDynamicGeometry = false;
+// 2026-05 current draw contract correction:
+// blocker skinned units do not reliably consume resource-side vertexGroupIndices.
+// Formal semantic scene must allow the frame-local meshData contract through,
+// otherwise we keep proving the right contract upstream and rejecting it during
+// DXVK submission.
+inline constexpr bool kShadowSemanticCoreAllowFrameLocalDynamicGeometry = true;
 inline constexpr bool kShadowSemanticDispatchContractProbeEnabled = false;
 inline constexpr bool kShadowSemanticCoreTreatFrameLocalDynamicMeshAsPreSkinned =
     false;
-inline constexpr bool kShadowSemanticCorePreferFrameLocalDynamicMeshForSkinned = false;
+inline constexpr bool kShadowSemanticCorePreferFrameLocalDynamicMeshForSkinned =
+    true;
 // 只有当 semantic scene 的对象级 ownership 已验证稳定后，才允许在 capture
 // 热路径前置旁路 legacy unit fallback。当前默认关闭，避免“只提交了一部分 packet，
 // 却把整类单位 fallback 提前打没”。
@@ -767,7 +787,7 @@ inline constexpr bool kNativeRendererHookContinueOnError = false;
 // prepared draws，用于 Phase 5 的宿主内验证。
 // 这不是最终 late-inject 独立宿主形态，但它可以在不接管完整 RenderScene
 // 的前提下，先恢复“主画面正常 + 新阴影链仍可执行”的安全可用态。
-inline constexpr bool kNativeRendererHostExecuteValidationEnabled = false;
+inline constexpr bool kNativeRendererHostExecuteValidationEnabled = true;
 
 // Stage-aware native semantic shadow validation:
 // - 不开启完整 Native_RenderScene takeover；
@@ -847,11 +867,11 @@ inline bool kShadowRenderDecorations = true; // 默认开启
 // ========================================================================
 // 在“高 caster + 相机/场景稳定”时，允许隔帧复用上一帧 ShadowMap。
 // 注意：该策略偏向性能，若观察到阴影跟随延迟可关闭。
-inline constexpr bool kShadowAdaptiveMapUpdateEnabled = true;
+inline constexpr bool kShadowAdaptiveMapUpdateEnabled = false;
 // 触发自适应的最小 caster 数。
 inline constexpr uint32_t kShadowAdaptiveMapUpdateMinCasters = 16;
-// 自适应跳帧周期：2=隔帧更新，3=每三帧更新一次。
-inline constexpr uint32_t kShadowAdaptiveMapUpdatePeriod = 2;
+// 自适应跳帧周期：1=每帧更新，2=隔帧更新，3=每三帧更新一次。
+inline constexpr uint32_t kShadowAdaptiveMapUpdatePeriod = 1;
 // 当 caster 数极高时，提高复用周期，避免超大图里“一帧重建太久”。
 inline constexpr uint32_t kShadowAdaptiveMapUpdateHighCasterThreshold = 768;
 inline constexpr uint32_t kShadowAdaptiveMapUpdateHighCasterPeriod = 4;
@@ -861,25 +881,54 @@ inline constexpr uint32_t kShadowAdaptiveMapUpdateHugeCasterPeriod = 6;
 inline constexpr float kShadowAdaptiveMapUpdateCameraMaxDelta = 0.0005f;
 // 判定“场景稳定”的 caster 数变化阈值。
 inline constexpr uint32_t kShadowAdaptiveMapUpdateCasterDelta = 2;
-// ShadowMap 分辨率自适应：只在 caster 几何工作量很高时降低深度图分辨率。
-// 目标是保护 high-pressure 场景的 GPU 时间；低压/普通场景仍保持用户设置的 4096。
+// ShadowMap 分辨率自适应：
+// Phase 7.31 Iteration D + E：用户反馈"阴影边缘糊"。2048 × 4 cascade 在
+// 远景 cascade 下 texel 稀释严重。本轮提高中等压力档位到 3072 缓解此问题。
+// 但 run_quick_autotest benchmark 场景下发现 3072 带来 GPU 压力骤增（3 FPS
+// 退化）。因此策略改为：仅在 light 场景（low geometry work）保留 4096 的
+// 请求；中等以上压力直接降到 2048 保稳。清晰度提升转向 shader 侧（更窄 PCF
+// radius + tight cascade fit）承担，而不是堆 shadow map 分辨率。
 inline constexpr bool kShadowAdaptiveResolutionEnabled = true;
-inline constexpr uint64_t kShadowAdaptiveResolutionHighWork = 240000;
-inline constexpr uint32_t kShadowAdaptiveResolutionHigh = 3072;
-inline constexpr uint64_t kShadowAdaptiveResolutionHugeWork = 600000;
+inline constexpr uint64_t kShadowAdaptiveResolutionHighWork = 3000;
+inline constexpr uint32_t kShadowAdaptiveResolutionHigh = 2048;
+inline constexpr uint64_t kShadowAdaptiveResolutionHugeWork = 12000;
 inline constexpr uint32_t kShadowAdaptiveResolutionHuge = 2048;
 inline constexpr uint32_t kShadowAdaptiveResolutionMin = 2048;
 // 自适应更新是否感知太阳运动（太阳移动时强制每帧更新 ShadowMap）。
 inline constexpr bool kShadowSunMotionAwareAdaptiveUpdate = true;
 // 太阳移动时是否自动关闭 Shadow TAA（避免历史混入导致拖影/波动）。
 inline constexpr bool kShadowSunMotionAwareTaaDisable = false;
+// Semantic dynamic unit shadows are driven by current-draw contracts. Until the
+// receiver has per-caster motion vectors, temporal shadow history can blend an
+// old/static shadow state with the current skinned pose and look like flicker.
+inline constexpr bool kShadowDisableTaaForSemanticDynamicCasters = true;
+// If the receiver reaches a frame with a non-world/invalid CSM candidate after
+// a complete shadow map has already been rendered, keep the last-good map
+// instead of clearing/redrawing it with a likely UI/portrait draw list.
+inline constexpr bool kShadowHoldLastGoodMapOnInvalidCsm = true;
+// Semantic current-draw producers can miss a transient frame at UI/scene
+// boundaries. Hold a recent complete map briefly instead of flashing all
+// shadows off for one bad replay frame.
+inline constexpr bool kShadowHoldLastGoodMapOnTransientEmptyReplay = true;
+inline constexpr uint32_t kShadowTransientEmptyReplayHoldFrames = 8;
+// If semantic dynamic casters were seen recently, an empty replay frame is much
+// more likely to be a producer/boundary miss than a true world-empty state.
+// Hold the last-good map longer so a single bad cadence cannot globally flash
+// every shadow off.
+inline constexpr uint32_t kShadowSemanticDynamicEmptyReplayHoldFrames = 120;
+// If the direct semantic caster identity set churns under current-draw pressure,
+// publishing every newly selected subset makes the whole shadow map blink in
+// sync. Keep the previous complete map through short identity churn windows;
+// once object selection is stable, this gate becomes inactive automatically.
+inline constexpr bool kShadowHoldLastGoodMapOnSemanticIdentityChurn = false;
+inline constexpr uint32_t kShadowSemanticIdentityChurnHoldFrames = 120;
 // 是否启用太阳时间量化（默认关闭，避免方向台阶更新带来的抽动感）。
 inline constexpr bool kShadowSunTimeQuantizationEnabled = false;
 // 级联剔除是否对建筑默认完全关闭（性能代价较大，发布档默认关闭该极端策略）。
 inline constexpr bool kShadowCascadeCullDisableForBuildings = false;
 // semantic 动态阴影已经进入 no-fallback 主路径后，单位也需要参与安全级联剔除，
 // 否则 skinned caster 会在所有 cascade 中重复重放，dynamic pressure 直接 GPU bound。
-inline constexpr bool kShadowCascadeCullDisableForUnits = false;
+inline constexpr bool kShadowCascadeCullDisableForUnits = true;
 // 蒙皮单位的 bounds 来自 CModel pose/local bounds，当前保守放大后再做级联剔除：
 // 半径偏大会少剔除但不会缺阴影；偏小则会造成远镜头/低 Z 处 caster 缺底。
 inline constexpr float kShadowCascadeCullSkinnedRadiusScale = 1.55f;
@@ -949,10 +998,10 @@ inline constexpr bool kNativeShadowDisableShadowCaptureWhenMode1 = false;
 
 // 是否安装 ShadowPath_StaticStamp_Toggle(0x74E420) Hook。
 // 该链路不经过 RegisterImage/ListA/ListB，是静态阴影写入的独立入口。
-inline constexpr bool kNativeShadowStaticStampPathHookEnabled = false;
+inline constexpr bool kNativeShadowStaticStampPathHookEnabled = true;
 
 // mode=1 时是否屏蔽 ShadowPath_StaticStamp_Toggle 的 enable 写入。
-inline constexpr bool kNativeShadowBlockStaticStampPathWhenMode1 = false;
+inline constexpr bool kNativeShadowBlockStaticStampPathWhenMode1 = true;
 
 // mode>=2 时是否屏蔽 ShadowPath_StaticStamp_Toggle 的 enable 写入。
 inline constexpr bool kNativeShadowBlockStaticStampPathWhenMode2 = false;

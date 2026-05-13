@@ -16,6 +16,12 @@ enum class ShadowDrawPath : uint8_t {
   Skinned = 1,
 };
 
+enum class ShadowDynamicIndexSource : uint8_t {
+  None = 0,
+  LayerIndexFallback = 1,
+  PreparedSlice = 2,
+};
+
 struct ShadowPacketResource {
   void* modelResourcePtr = nullptr;
   uint64_t modelKey = 0;
@@ -38,7 +44,10 @@ struct ShadowPacketResource {
   uint32_t dynamicIndexCount = 0;
   uint64_t dynamicIndexHash = 0;
   uint32_t dynamicPrimitiveBaseIndex = 0;
+  ShadowDynamicIndexSource dynamicIndexSource =
+      ShadowDynamicIndexSource::None;
   std::shared_ptr<const std::vector<uint16_t>> ownedDynamicIndices;
+  std::shared_ptr<const void> resourceKeepAlive;
   std::vector<float> ownedPositions;
   std::vector<uint8_t> ownedVertexGroupIndices;
   std::vector<std::array<float, 3>> ownedVertexBlendWeights;
@@ -94,6 +103,9 @@ struct ShadowDrawPacket {
   bool matrixGroupsUseAveraging = false;
   uint32_t maxVertexGroupSlot = 0;
   uint64_t runtimeGroupPaletteHash = 0;
+  uint32_t runtimeGroupPaletteSlotIndex = 0xFFFFFFFFu;
+  uint32_t runtimeGroupPaletteMinFrameTag = 0;
+  uint32_t runtimeGroupPaletteMaxFrameTag = 0;
   std::vector<Matrix4> runtimeGroupPalette;
 };
 
@@ -209,6 +221,25 @@ struct ShadowResolveStats {
   uint64_t slowestAttachmentRigidResolveUs = 0;
 };
 
+struct ShadowExplicitBlendSkinningResult {
+  std::vector<std::array<float, 3>> weights;
+  std::vector<std::array<uint8_t, 4>> indices;
+  std::vector<Matrix4> runtimeGroupPalette;
+  uint32_t maxGroupSlot = 0;
+  uint64_t dynamicHash = 0;
+  uint8_t blendCount = 0;
+  bool usedSpanRemap = false;
+};
+
+bool TryResolveExplicitBlendSkinningForRenderable(
+    const ShadowRenderableRecord& renderable,
+    uint32_t vertexCount,
+    uint32_t posePaletteLimit,
+    uint32_t maxExpectedGroupSize,
+    const ShadowPoseRecord& pose,
+    ShadowExplicitBlendSkinningResult& outResult,
+    ShadowResolveStats* ioStats = nullptr);
+
 class ShadowRendererCore {
 public:
   ShadowResolveStats buildFrame(const ShadowFrameManifest& manifest,
@@ -255,6 +286,21 @@ struct ShadowValidationFrameStats {
   uint64_t submittedDrawCount = 0;
   uint64_t buildDurationUs = 0;
 };
+
+ShadowMaterialSignature BuildShadowMaterialSignatureForRenderable(
+    const ShadowRenderableRecord& renderable);
+
+struct ShadowMaterialBindingDiagnostics {
+  bool resolved = false;
+  uint32_t meshIndex = kInvalidShadowContractGeosetIndex;
+  uint32_t layerIndex = 0;
+  uint32_t layerCount = 0;
+  uint32_t blendOrDrawMode = 0;
+};
+
+bool InspectShadowMaterialBindingForRenderable(
+    const ShadowRenderableRecord& renderable,
+    ShadowMaterialBindingDiagnostics& out);
 
 struct ShadowValidationBuildState {
   bool buildInProgress = false;

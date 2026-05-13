@@ -44,6 +44,8 @@ using ShadowProjectorAddFromObjectFn = int(__fastcall *)(void *, void *, void *,
                                                          int, int);
 using ShadowProjectorAddSimpleFn = int(__fastcall *)(void *, void *, int, int,
                                                      int, int, int, int, int);
+using ShadowPathStaticStampToggleFn = void(__fastcall *)(void *, void *, int,
+                                                         int);
 
 TerrainRenderShadowLayerFn g_originalTerrainShadowLayer = nullptr;
 TerrainRenderShadowLayerFn g_trampolineTerrainShadowLayer = nullptr;
@@ -58,6 +60,8 @@ ShadowProjectorAddFromObjectFn g_trampolineShadowProjectorAddFromObject =
     nullptr;
 ShadowProjectorAddSimpleFn g_originalShadowProjectorAddSimple = nullptr;
 ShadowProjectorAddSimpleFn g_trampolineShadowProjectorAddSimple = nullptr;
+ShadowPathStaticStampToggleFn g_originalShadowPathStaticStampToggle = nullptr;
+ShadowPathStaticStampToggleFn g_trampolineShadowPathStaticStampToggle = nullptr;
 uintptr_t g_shadowPathObjectProjectorRuntimeAddr = 0;
 uintptr_t g_shadowPathObjectProjectorJassBridgeAddr = 0;
 uintptr_t g_shadowProjectorSimpleBridgeAddr = 0;
@@ -119,6 +123,20 @@ int CallShadowProjectorAddSimpleOriginal(void* a1, void* a2, int arg0, int arg1,
                                               arg4, arg5, arg6);
   }
   return -1;
+}
+
+void CallShadowPathStaticStampToggleOriginal(void* thisPtr,
+                                             int shadowObjectPtr,
+                                             int enable) {
+  if (g_trampolineShadowPathStaticStampToggle) {
+    g_trampolineShadowPathStaticStampToggle(thisPtr, nullptr, shadowObjectPtr,
+                                            enable);
+    return;
+  }
+  if (g_originalShadowPathStaticStampToggle) {
+    g_originalShadowPathStaticStampToggle(thisPtr, nullptr, shadowObjectPtr,
+                                          enable);
+  }
 }
 
 struct ShadowCallbackStatEntry {
@@ -528,6 +546,47 @@ int __fastcall Hook_ShadowUpdate_WriteEntry(void *list, void *edx, void *entry,
   return 0;
 }
 
+void __fastcall Hook_ShadowPath_StaticStamp_Toggle(void* thisPtr,
+                                                   void* edx,
+                                                   int shadowObjectPtr,
+                                                   int enable) {
+  (void)edx;
+  const uint32_t mode = War3RenderState::GetNativeShadowMode();
+  bool blocked = false;
+  const char* reason = "PassThrough";
+
+  // Only suppress new static-stamp writes. Disable calls must pass through so
+  // War3 can clear existing stamps instead of leaving stale mask bits behind.
+  if (enable != 0) {
+    if (mode >= 2u &&
+        dxvk::war3::internal::kNativeShadowBlockStaticStampPathWhenMode2) {
+      blocked = true;
+      reason = "Mode>=2_BlockStaticStampPathEnable";
+    } else if (mode == 1u &&
+               dxvk::war3::internal::kNativeShadowBlockStaticStampPathWhenMode1) {
+      blocked = true;
+      reason = "Mode1_BlockStaticStampPathEnable";
+    }
+  }
+
+  if constexpr (dxvk::war3::internal::kNativeShadowStaticStampPathVerboseLogging) {
+    static std::atomic<uint32_t> s_logCount{0};
+    const uint32_t n = s_logCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 80u || (n % 4000u) == 0u) {
+      war3dbg::Print(
+          "DXVK War3Hook: StaticStampPath %s mode=%u this=%p obj=0x%08X "
+          "enable=%d reason=%s\n",
+          blocked ? "BLOCK" : "PASS", static_cast<unsigned>(mode), thisPtr,
+          static_cast<unsigned>(shadowObjectPtr), enable, reason);
+    }
+  }
+
+  if (blocked)
+    return;
+
+  CallShadowPathStaticStampToggleOriginal(thisPtr, shadowObjectPtr, enable);
+}
+
 int __fastcall Hook_ShadowProjector_Add_FromObject(void *a1, void *a2,
                                                    void *arg0, int arg1,
                                                    int arg2) {
@@ -768,6 +827,9 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   g_originalShadowProjectorAddSimple =
       reinterpret_cast<ShadowProjectorAddSimpleFn>(
           addrs.shadowProjectorAddSimpleAddr);
+  g_originalShadowPathStaticStampToggle =
+      reinterpret_cast<ShadowPathStaticStampToggleFn>(
+          addrs.shadowPathStaticStampToggleAddr);
   g_shadowPathObjectProjectorRuntimeAddr =
       reinterpret_cast<uintptr_t>(addrs.shadowPathObjectProjectorRuntimeAddr);
   g_shadowPathObjectProjectorJassBridgeAddr =
@@ -814,6 +876,15 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   } else if constexpr (!dxvk::war3::internal::kWar3ShadowUpdateHookEnabled) {
     war3dbg::Print(
         "DXVK War3Hook: 二分诊断态关闭 Shadow/UpdateWrite hook 安装\n");
+  }
+
+  if constexpr (dxvk::war3::internal::kWar3ShadowUpdateHookEnabled &&
+                dxvk::war3::internal::kNativeShadowStaticStampPathHookEnabled) {
+    anyInstalled |= InstallMinHook(
+        addrs.shadowPathStaticStampToggleAddr,
+        reinterpret_cast<LPVOID>(&Hook_ShadowPath_StaticStamp_Toggle),
+        reinterpret_cast<LPVOID *>(&g_trampolineShadowPathStaticStampToggle),
+        "Shadow", "ShadowPath_StaticStamp_Toggle", false, true);
   }
 
   if constexpr (dxvk::war3::internal::kWar3ShadowProjectorHookEnabled) {

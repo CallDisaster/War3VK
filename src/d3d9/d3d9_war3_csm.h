@@ -18,7 +18,11 @@ namespace dxvk {
         uint32_t cascadeCount = 4;
         uint32_t shadowResolution = 4096;
         float splitLambda = 0.5f;
-        float maxDistance = 8000.0f;
+        // Phase 7.31 Iteration D：从 8000 降到 4000。War3 的 RTS 相机俯角下
+        // 远景很少超过 3000 个单位，8000 会让每个 cascade 覆盖太大范围、
+        // 远景 texel 稀释造成"阴影边缘糊"。4000 配 splitLambda=0.5 近三级
+        // 可以覆盖到 1500~1800，视觉上锐度显著提升。
+        float maxDistance = 4000.0f;
 
         float stableSnap = 1.0f;        // 1 = 开启 texel snapping，0 = 关闭
         float depthRangeMargin = 50.0f; // 额外扩展 Z 范围，减少裁剪

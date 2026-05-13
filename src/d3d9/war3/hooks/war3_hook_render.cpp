@@ -24,15 +24,19 @@
 #include "../render/war3_render_exec_batch.h"
 #include "../render/war3_render_queue_tracker.h"
 #include "../render/war3_render_state.h"
+#include "../render/war3_current_draw_contract.h"
 #include "../render/war3_renderer.h"
 #include "../render/war3_shadow_runtime_bridge.h"
 #include "../render/war3_visible_renderables.h"
 #include "../platform/war3_runtime_bootstrap.h"
 #include "../state/war3_render_state.h"
 #include "../tools/war3_perf_monitor.h"
+#include "../../util/util_bit.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -74,6 +78,7 @@ using WorldObjectsRenderGroupFn = int(__fastcall *)(void *, void *, int);
 using DispatchCommonFn = int(__fastcall *)(void *, void *, void *, void *,
                                            void *);
 using DispatchSpecialFn = int(__fastcall *)(void *, void *, void *, void *);
+using ApplyDrawStateAndDrawFn = int(__fastcall *)(void *, void *, int);
 using TerrainRenderAllTilesFn = void(__fastcall *)(void *, void *);
 using FlushSortedItemsFn = int(__cdecl *)();
 using FlushTransparentFn = int(__cdecl *)();
@@ -104,6 +109,9 @@ static DispatchCommonFn g_trampolineDispatchCommon = nullptr;
 
 static DispatchSpecialFn g_originalExecBatch3 = nullptr;
 static DispatchSpecialFn g_trampolineDispatchSpecial = nullptr;
+
+static ApplyDrawStateAndDrawFn g_originalApplyDrawStateAndDraw = nullptr;
+static ApplyDrawStateAndDrawFn g_trampolineApplyDrawStateAndDraw = nullptr;
 
 static TerrainRenderAllTilesFn g_originalTerrainAllTiles = nullptr;
 static TerrainRenderAllTilesFn g_trampolineTerrainAllTiles = nullptr;
@@ -346,6 +354,112 @@ static bool HasHotVisibleUnitIdentity(
 
 static inline war3::War3PerfMonitor::ScopedCpuScope
 MakeRenderHookCpuScope(const char *name);
+
+static bool War3PreparedSliceProbeRuntimeEnabled() {
+  static const bool s_enabled = [] {
+    const char* value = std::getenv("DXVK_WAR3_PREPARED_SLICE_PROBE");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+  }();
+  return s_enabled;
+}
+
+static uint32_t War3PreparedSliceProbeSampleRate() {
+  static const uint32_t s_sampleRate = [] {
+    const char* value =
+        std::getenv("DXVK_WAR3_PREPARED_SLICE_PROBE_SAMPLE_RATE");
+    if (value == nullptr || value[0] == '\0')
+      return 32u;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || parsed == 0ul)
+      return 32u;
+    return static_cast<uint32_t>((std::min)(parsed, 4096ul));
+  }();
+  return s_sampleRate;
+}
+
+static void TryPublishPreparedSliceProbe(void* batchContext) {
+  if (!War3PreparedSliceProbeRuntimeEnabled())
+    return;
+  const auto drawContext =
+      dxvk::war3::render::GetCurrentDrawDispatchContext();
+  const bool contextReady =
+      drawContext.valid && drawContext.renderablePart != nullptr;
+  const bool interested =
+      contextReady &&
+      dxvk::war3::render::IsCurrentDrawPreparedSliceInterested(
+          drawContext.renderablePart, drawContext.layerIndex);
+  thread_local uint32_t s_probeCallCounter = 0u;
+  const uint32_t sampleRate = War3PreparedSliceProbeSampleRate();
+  if (!interested && sampleRate > 1u &&
+      ((++s_probeCallCounter % sampleRate) != 0u))
+    return;
+
+  void* preparedMeta = nullptr;
+  void* preparedBacking = nullptr;
+  uint32_t primitiveType = 0u;
+  uint32_t preparedCount = 0u;
+  const bool metaReadable =
+      batchContext != nullptr &&
+      dxvk::war3::SafeReadPtrFast(batchContext, 0xCCu, preparedMeta) &&
+      preparedMeta != nullptr &&
+      dxvk::war3::SafeReadU32Fast(preparedMeta, 0u, primitiveType) &&
+      dxvk::war3::SafeReadU32Fast(preparedMeta, 4u, preparedCount);
+  const bool backingReadable =
+      batchContext != nullptr &&
+      dxvk::war3::SafeReadPtrFast(batchContext, 0xE0u, preparedBacking) &&
+      preparedBacking != nullptr &&
+      dxvk::war3::IsReadableRangeFast(preparedBacking, 8u);
+
+  dxvk::war3::render::NoteCurrentDrawPreparedSliceProbe(contextReady,
+                                                        backingReadable);
+  if (!contextReady || !metaReadable || !backingReadable ||
+      primitiveType == 0u || preparedCount == 0u) {
+    return;
+  }
+
+  uint32_t backingWord0 = 0u;
+  uint32_t backingWord1 = 0u;
+  std::memcpy(&backingWord0, preparedBacking, sizeof(backingWord0));
+  std::memcpy(&backingWord1,
+              static_cast<const uint8_t*>(preparedBacking) + 4u,
+              sizeof(backingWord1));
+  uint64_t preparedHash = bit::fnv1a_init();
+  preparedHash = bit::fnv1a_iter(preparedHash, primitiveType);
+  preparedHash = bit::fnv1a_iter(preparedHash, preparedCount);
+  preparedHash = bit::fnv1a_iter(preparedHash, backingWord0);
+  preparedHash = bit::fnv1a_iter(preparedHash, backingWord1);
+
+  dxvk::war3::render::CurrentDrawPreparedSliceRecord record = {};
+  record.known = true;
+  record.sceneNode = drawContext.sceneNode;
+  record.renderablePart = drawContext.renderablePart;
+  record.layerIndex = drawContext.layerIndex;
+  record.primitiveType = primitiveType;
+  record.preparedCount = preparedCount;
+  record.preparedHash = preparedHash;
+  dxvk::war3::render::PublishCurrentDrawPreparedSlice(record);
+}
+
+class CurrentDrawDispatchScope {
+public:
+  CurrentDrawDispatchScope(void* sceneNode,
+                           void* renderablePart,
+                           uint32_t layerIndex)
+      : m_previous(dxvk::war3::render::PushCurrentDrawDispatchContext(
+            sceneNode, renderablePart, layerIndex)) {
+  }
+
+  ~CurrentDrawDispatchScope() {
+    dxvk::war3::render::RestoreCurrentDrawDispatchContext(m_previous);
+  }
+
+  CurrentDrawDispatchScope(const CurrentDrawDispatchScope&) = delete;
+  CurrentDrawDispatchScope& operator=(const CurrentDrawDispatchScope&) = delete;
+
+private:
+  dxvk::war3::render::CurrentDrawDispatchContext m_previous = {};
+};
 
 static void PublishVisibleRenderableFromDispatch(
     void* sceneNode,
@@ -882,7 +996,10 @@ int __fastcall Hook_WorldDispatch(void *thisPtr, void *edx, int stage, int a3,
     if (stage == 0 || stage == 1) {
       // 说明：
       // - 优先直接调用原生 GetFloatGameState(GAME_STATE_TIME_OF_DAY)；
-      // - 若 direct c_call 暂时拿不到合法值，再回退到本地时钟，避免时间链硬断。
+      // - War3RenderState::GameTime is a strict 0..24 TIME_OF_DAY contract.
+      //   Do not publish elapsed seconds here: the shadow receiver treats any
+      //   0..24 value as authoritative time-of-day, so a seconds fallback would
+      //   compress a full day into 24 seconds and globally pulse shadows.
       static auto s_lastUpdate = std::chrono::steady_clock::now();
       static auto s_gameClockStart = std::chrono::steady_clock::time_point{};
       static bool s_gameClockValid = false;
@@ -894,6 +1011,7 @@ int __fastcall Hook_WorldDispatch(void *thisPtr, void *edx, int stage, int a3,
               .count() >= 100) {
         s_lastUpdate = now;
         float gameTime = -1.0f;
+        float elapsedSeconds = -1.0f;
         if (runtimeReady) {
           const bool usedNative = TryFetchNativeTimeOfDay(gameTime);
 
@@ -904,10 +1022,11 @@ int __fastcall Hook_WorldDispatch(void *thisPtr, void *edx, int stage, int a3,
                 s_gameClockStart = now;
               }
 
-              gameTime = static_cast<float>(
+              elapsedSeconds = static_cast<float>(
                   std::chrono::duration_cast<std::chrono::duration<double>>(
                       now - s_gameClockStart)
                       .count());
+              gameTime = -1.0f;
             } else {
               gameTime = -1.0f;
             }
@@ -921,23 +1040,29 @@ int __fastcall Hook_WorldDispatch(void *thisPtr, void *edx, int stage, int a3,
               s_gameClockStart = now;
             }
 
-            gameTime = static_cast<float>(
+            elapsedSeconds = static_cast<float>(
                 std::chrono::duration_cast<std::chrono::duration<double>>(
                     now - s_gameClockStart)
                     .count());
+            gameTime = -1.0f;
           } else {
             s_gameClockValid = false;
             gameTime = -1.0f;
           }
         }
 
-        if (gameTime >= 0.0f || dxvk::war3::War3Events::get().isGameStarted()) {
+        if (gameTime >= 0.0f) {
           War3RenderState::SetGameTime(gameTime);
           War3VKBranding::TryShowBrandingMessage(gameTime);
           war3::ShaderManager::get().setGlobalFloat4(
               "Time", Vector4(gameTime, 0.0f, 0.0f, 0.0f));
         } else {
           War3RenderState::SetGameTime(-1.0f);
+          if (dxvk::war3::War3Events::get().isGameStarted()) {
+            War3VKBranding::TryShowBrandingMessage(elapsedSeconds);
+            war3::ShaderManager::get().setGlobalFloat4(
+                "Time", Vector4(elapsedSeconds, 0.0f, 0.0f, 0.0f));
+          }
         }
       }
     }
@@ -955,6 +1080,9 @@ int __fastcall Hook_WorldDispatch(void *thisPtr, void *edx, int stage, int a3,
   }
 
   War3RenderState::SetStage(stage);
+  if (a5 == 0) {
+    War3RenderState::OnMainWorldStageEnter(stage);
+  }
 
   int result = 0;
   {
@@ -1135,17 +1263,31 @@ int __fastcall Hook_WorldObjects_RenderGroup(void *thisPtr, void * /*edx*/,
   return result;
 }
 
+int __fastcall Hook_ApplyDrawStateAndDraw(void* thisPtr, void* edx,
+                                          int batchSlot) {
+  TryPublishPreparedSliceProbe(thisPtr);
+  if (g_trampolineApplyDrawStateAndDraw)
+    return g_trampolineApplyDrawStateAndDraw(thisPtr, edx, batchSlot);
+  if (g_originalApplyDrawStateAndDraw)
+    return g_originalApplyDrawStateAndDraw(thisPtr, edx, batchSlot);
+  return 0;
+}
+
 int __fastcall Hook_RenderQueue_Dispatch_Common(void *thisPtr, void *edx,
                                                 void *a3, void *a4, void *a5) {
   // Common Dispatch 热路径策略：
   // - 无追踪需求时走快速直通；
   // - 需要追踪时走 ExecBatchProcessor 桥接并恢复状态。
   auto perfScope = MakeRenderHookCpuScope("Hook_Dispatch_Common");
+  const uint32_t currentDrawLayerIndex =
+      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
+  CurrentDrawDispatchScope currentDrawDispatchScope(
+      thisPtr, edx, currentDrawLayerIndex);
   if constexpr (dxvk::war3::internal::kShadowSemanticDispatchContractProbeEnabled) {
     dxvk::war3::render::VisibleRenderableRecord visible = {};
     dxvk::war3::reimpl::RenderBatchElement syntheticBatch = {};
     syntheticBatch.renderablePart = edx;
-    syntheticBatch.layerIndex = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
+    syntheticBatch.layerIndex = currentDrawLayerIndex;
     if (dxvk::war3::render::VisibleRenderableRegistry::instance()
             .queryByRenderablePart(edx, visible)) {
       syntheticBatch.layerStatePtr = visible.layerState;
@@ -1173,12 +1315,13 @@ int __fastcall Hook_RenderQueue_Dispatch_Common(void *thisPtr, void *edx,
   const bool needsProbe = dxvk::war3::render::NativeRendererProbe::IsEnabled();
 
   auto publishVisibleAfterDispatch = [&]() {
-    if (!needsShadowSemanticTracking ||
-        !dxvk::war3::hooks::IsWorldBridgeTag(tag))
+    const bool worldSemanticTag =
+        dxvk::war3::hooks::IsWorldBridgeTag(tag) ||
+        dxvk::War3RenderState::IsWorldObjectPhase();
+    if (!needsShadowSemanticTracking || !worldSemanticTag)
       return;
-    const uint32_t layerIndex =
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
-    PublishVisibleRenderableFromDispatch(thisPtr, edx, layerIndex, nullptr);
+    PublishVisibleRenderableFromDispatch(thisPtr, edx, currentDrawLayerIndex,
+                                         nullptr);
   };
 
   if (dxvk::war3::internal::kNativeHookFastPathEnabled &&
@@ -1262,11 +1405,15 @@ int __fastcall Hook_RenderQueue_Dispatch_Special(void *thisPtr, void *edx,
                                                  void *a3, void *a4) {
   // Special Dispatch 与 Common Dispatch 对齐同一套快速路径与桥接策略。
   auto perfScope = MakeRenderHookCpuScope("Hook_Dispatch_Special");
+  const uint32_t currentDrawLayerIndex =
+      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
+  CurrentDrawDispatchScope currentDrawDispatchScope(
+      thisPtr, edx, currentDrawLayerIndex);
   if constexpr (dxvk::war3::internal::kShadowSemanticDispatchContractProbeEnabled) {
     dxvk::war3::render::VisibleRenderableRecord visible = {};
     dxvk::war3::reimpl::RenderBatchElement syntheticBatch = {};
     syntheticBatch.renderablePart = edx;
-    syntheticBatch.layerIndex = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
+    syntheticBatch.layerIndex = currentDrawLayerIndex;
     if (dxvk::war3::render::VisibleRenderableRegistry::instance()
             .queryByRenderablePart(edx, visible)) {
       syntheticBatch.layerStatePtr = visible.layerState;
@@ -1297,9 +1444,8 @@ int __fastcall Hook_RenderQueue_Dispatch_Special(void *thisPtr, void *edx,
     if (!needsShadowSemanticTracking ||
         !dxvk::war3::hooks::IsWorldBridgeTag(tag))
       return;
-    const uint32_t layerIndex =
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
-    PublishVisibleRenderableFromDispatch(thisPtr, edx, layerIndex, nullptr);
+    PublishVisibleRenderableFromDispatch(thisPtr, edx, currentDrawLayerIndex,
+                                         nullptr);
   };
 
   if (dxvk::war3::internal::kNativeHookFastPathEnabled &&
@@ -1606,6 +1752,7 @@ void War3HookRender::Install(uintptr_t gameBase) {
   LPVOID worldObjectsGroupAddr = resolveCode(book.worldObjectsRenderGroup);
   LPVOID dispatchCommonAddr = resolveCode(book.dispatchCommon);
   LPVOID dispatchSpecialAddr = resolveCode(book.dispatchSpecial);
+  LPVOID applyDrawStateAndDrawAddr = resolveCode(book.applyDrawStateAndDraw);
   LPVOID flushSortedAddr = resolveCode(book.flushSortedItems);
   LPVOID flushTransparentAddr = resolveCode(book.rqFlushTransparent);
   LPVOID terrainAllTilesAddr = resolveCode(book.terrainRenderAllTiles);
@@ -1639,6 +1786,8 @@ void War3HookRender::Install(uintptr_t gameBase) {
       reinterpret_cast<WorldObjectsRenderGroupFn>(worldObjectsGroupAddr);
   g_originalExecBatch0 = reinterpret_cast<DispatchCommonFn>(execBatch0Addr);
   g_originalExecBatch3 = reinterpret_cast<DispatchSpecialFn>(execBatch3Addr);
+  g_originalApplyDrawStateAndDraw =
+      reinterpret_cast<ApplyDrawStateAndDrawFn>(applyDrawStateAndDrawAddr);
   g_originalFlushSortedItems =
       reinterpret_cast<FlushSortedItemsFn>(flushSortedAddr);
   g_originalFlushTransparent =
@@ -1690,6 +1839,13 @@ void War3HookRender::Install(uintptr_t gameBase) {
                  reinterpret_cast<LPVOID>(&Hook_RenderQueue_Dispatch_Special),
                  reinterpret_cast<LPVOID *>(&g_trampolineDispatchSpecial),
                  "Render", "RenderQueue_Dispatch_Special", false, false);
+  if (War3PreparedSliceProbeRuntimeEnabled()) {
+    InstallMinHook(applyDrawStateAndDrawAddr,
+                   reinterpret_cast<LPVOID>(&Hook_ApplyDrawStateAndDraw),
+                   reinterpret_cast<LPVOID *>(
+                       &g_trampolineApplyDrawStateAndDraw),
+                   "Render", "ApplyDrawStateAndDraw", false, false);
+  }
   InstallMinHook(flushSortedAddr, reinterpret_cast<LPVOID>(&Hook_FlushSortedItems),
                  reinterpret_cast<LPVOID *>(&g_trampolineFlushSortedItems),
                  "Render", "FlushSortedItems", false, false);

@@ -14,12 +14,15 @@
 #include "war3/render/war3_post_process.h"
 #include "war3/render/war3_render_exec_batch.h"
 #include "war3/render/war3_render_objects.h"
+#include "war3/render/war3_render_state.h"
 #include "war3/render/war3_renderer.h"
 #include "war3/render/war3_shadow_capture_frontend.h"
 #include "war3/render/war3_shadow_object_registry.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
 #include "war3/render/war3_upper_layer_shadow.h"
 #include "war3/render/war3_visible_renderables.h"
+#include "war3/render/war3_canonical_draw.h"
+#include "war3/render/war3_current_draw_contract.h"
 #include "war3/memory/war3_shadow_arena.h"
 #include "war3/memory/war3_storm_hook.h"
 #include "war3/model/war3_model_hook.h"
@@ -28,6 +31,8 @@
 #include "war3/native/war3_native_shadow_hint.h"
 #include "war3/platform/war3_runtime_bootstrap.h"
 #include "war3/shadow/war3_shadow_renderer_core.h"
+#include "war3/shadow/war3_shadow_native_runtime.h"
+#include "war3/shadow/war3_shadow_alpha_test_payload.h"
 #include "war3/shader/war3_shader_manager.h"
 #include "war3/state/war3_render_state.h"
 #include "war3/tools/war3_diagnostics_hub.h"
@@ -74,6 +79,10 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <windows.h>
@@ -85,6 +94,46 @@
 #include "war3/reimpl/war3_render_queue.h"
 
 namespace dxvk {
+
+struct D3D9DeviceEx::War3SemanticDirectPartPacketLeaseState {
+  struct Entry {
+    war3::shadow::ShadowDrawPacket packet = {};
+    war3::render::CurrentDrawAuthoritativeSample sample = {};
+    const void* sceneNode = nullptr;
+    uint64_t completenessKey = 0u;
+    uint64_t recordSelectionKey = 0u;
+    uint64_t selectionKey = 0u;
+    uint64_t submittedPartIdentityKey = 0u;
+    uint64_t manifestPartLeaseKey = 0u;
+    uint64_t lastSubmittedFrame = 0u;
+  };
+
+  // Phase 7.25 core epoch planner：
+  //   committedPartKeys 是“上一次被 live 观察证明过的完整 core part set”。
+  //   它只在 live 提交集合是 committedPartKeys 的超集（即“覆盖旧 core”）
+  //   时才被替换，不会因为一次 current-draw 观察丢帧而退化。
+  //   observationPartKeys 用于在 committedPartKeys 未建立前做第二帧确认，
+  //   避免把第一次偶然观察到的子集直接固定为 core。
+  //
+  // @thread_safety 仅在渲染线程 PopulateDirectSceneShadow 阶段访问。
+  // @performance 每个 object 仅持有少量 64 位 key，常见规模为 <10 parts。
+  struct ObjectCoreSet {
+    // 已承认的 core part set，用于提交阶段的完整性校验。
+    std::vector<uint64_t> committedPartKeys;
+    // 最近一次看到的 live（非 lease）submitted parts，用于判断是否可以推进
+    // committed set。
+    std::vector<uint64_t> observationPartKeys;
+    // committed 上一次被刷新的帧号（真正的 core epoch 时钟）。
+    uint64_t lastCommitFrame = 0u;
+    // 本对象最近被 live 提交过 part 的帧号，用于淘汰长期消失的对象。
+    uint64_t lastLiveSubmittedFrame = 0u;
+    // 上一次 observation 起始帧，超过 1 帧没有 live 证据时重新开始累积。
+    uint64_t observationStartFrame = 0u;
+  };
+
+  std::unordered_map<uint64_t, Entry> entries;
+  std::unordered_map<uint64_t, ObjectCoreSet> objectCoreSets;
+};
 
 namespace {
 void War3ForceImmediatePresent(D3DPRESENT_PARAMETERS *params) {
@@ -137,6 +186,23 @@ bool War3SemanticValidateUnitCoreRuntime() {
   return s_enabled;
 }
 
+bool War3SemanticRequireDirectUnitVisibleBackingRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_REQUIRE_DIRECT_UNIT_VISIBLE_BACKING",
+                    1u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticDirectExplicitBlendResolveRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_DIRECT_EXPLICIT_BLEND_RESOLVE", 0u) !=
+      0u;
+  return s_enabled;
+}
+
+uint64_t War3SemanticHashMatrixPalette(const Matrix4* matrices,
+                                       uint32_t matrixCount);
+
 bool War3ShadowPassTraceEnabled() {
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SHADOW_PASS_TRACE", 0u) != 0u;
@@ -155,6 +221,14 @@ uint64_t War3SemanticContractCapturePeriodRuntime() {
       std::max<uint32_t>(
           1u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_CONTRACT_CAPTURE_PERIOD",
                             240u));
+  return s_period;
+}
+
+uint64_t War3SemanticPoseOnlyCapturePeriodRuntime() {
+  static const uint64_t s_period =
+      std::max<uint32_t>(
+          1u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_POSE_ONLY_CAPTURE_PERIOD",
+                            4u));
   return s_period;
 }
 
@@ -179,12 +253,12 @@ bool War3SemanticLivePaletteAllowCModelFallbackRuntime() {
 }
 
 bool War3SemanticDrawTimePoseRuntime() {
-  // Diagnostic only. 2026-05-01 testing showed War3's fixed-function draw path
-  // reaches this hook with vertex blend disabled, so it cannot publish the
-  // animated skeletal palette. The production dirty signal comes from the
-  // final CModel matrix publisher hooks instead.
+  // Phase 7.55：强制开启 draw-time D3D palette 捕获，用于验证 frozen 段
+  // 主渲染的 D3DTS_WORLDMATRIX palette 是否每帧 fresh。
+  // 之前默认关闭是因为 2026-05-01 测试发现 vertex blend disabled，
+  // 但那可能是测试场景不对。现在需要在真实 skinned 场景验证。
   static const bool s_enabled =
-      War3GetEnvU32("DXVK_WAR3_SEMANTIC_DRAW_TIME_POSE", 0u) != 0u;
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_DRAW_TIME_POSE", 1u) != 0u;
   return s_enabled;
 }
 
@@ -193,6 +267,423 @@ uint32_t War3SemanticSubmitDrawCapRuntime() {
       "DXVK_WAR3_SEMANTIC_SUBMIT_DRAW_CAP",
       dxvk::war3::internal::kShadowSemanticCoreSceneSubmitDrawCap);
   return s_cap;
+}
+
+uint32_t War3SemanticDirectCurrentDrawRecordCapRuntime() {
+  static const uint32_t s_cap = War3GetEnvU32(
+      "DXVK_WAR3_SEMANTIC_DIRECT_RECORD_CAP", 128u);
+  return s_cap;
+}
+
+uint32_t War3SemanticDirectCurrentDrawScanCapRuntime() {
+  const uint32_t submitCap = War3SemanticDirectCurrentDrawRecordCapRuntime();
+  const uint32_t defaultScanCap =
+      submitCap != 0u ? std::max(144u, submitCap * 4u + submitCap / 2u)
+                      : 144u;
+  static const uint32_t s_cap = War3GetEnvU32(
+      "DXVK_WAR3_SEMANTIC_DIRECT_SCAN_CAP", defaultScanCap);
+  return s_cap;
+}
+
+bool War3SemanticDirectStaticSupplementRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_DIRECT_STATIC_SUPPLEMENT", 0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticSteadySupplementedBuildRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_STEADY_SUPPLEMENTED_BUILD", 0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticBootstrapSupplementedBuildRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_BOOTSTRAP_SUPPLEMENTED_BUILD", 0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticDirectOnlyRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_DIRECT_ONLY", 1u) != 0u;
+  return s_enabled;
+}
+
+// Phase 7.1: object-grouped selection 开关
+// 启用后，同一 caster identity 的所有 eligible record 将作为整体提交或整体剔除，
+// 避免因逐 record 截断导致的 geoset 不完整与帧间闪烁。
+bool War3SemanticObjectGroupedSelectionRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_OBJECT_GROUPED_SELECTION", 1u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticObjectFirstSnapshotRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_OBJECT_FIRST_SNAPSHOT", 0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticStickySelectionLeaseRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_STICKY_SELECTION_LEASE", 1u) != 0u;
+  return s_enabled;
+}
+
+uint32_t War3SemanticStickySelectionLeaseFramesRuntime() {
+  static const uint32_t s_frames = std::max<uint32_t>(
+      1u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_STICKY_SELECTION_LEASE_FRAMES",
+                        120u));
+  return s_frames;
+}
+
+bool War3SemanticStickySelectionBroadLeasePreferenceRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32(
+          "DXVK_WAR3_SEMANTIC_STICKY_SELECTION_BROAD_LEASE_PREFERENCE",
+          0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticStickySelectionFillRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_STICKY_SELECTION_FILL", 1u) != 0u;
+  return s_enabled;
+}
+
+uint32_t War3SemanticStickySelectionFillMarginRuntime() {
+  static const uint32_t s_margin = std::min<uint32_t>(
+      64u,
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_STICKY_SELECTION_FILL_MARGIN", 8u));
+  return s_margin;
+}
+
+bool War3SemanticStickyPartSelectionRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_STICKY_PART_SELECTION", 1u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticDirectPartPacketLeaseRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_DIRECT_PART_PACKET_LEASE", 1u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticShadowManifestDeferProvisionalPartsRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_MANIFEST_DEFER_PROVISIONAL_PARTS",
+                    1u) != 0u;
+  return s_enabled;
+}
+
+uint32_t War3SemanticShadowManifestGeometryCacheFramesRuntime() {
+  // Phase 7.31 Iter H 调整：默认值保持 3，但上限从 4 放宽到 8。
+  // 配合 coreExtendedFrames = * 2，core part 实际可在 6 帧窗口内被 lease 补齐。
+  // 运行时可通过 `DXVK_WAR3_SEMANTIC_MANIFEST_GEOMETRY_CACHE_FRAMES` 调整到
+  // 更大值以覆盖 skinned unit 的更长观察空窗（代价是 pose 感觉更慢）。
+  static const uint32_t s_frames = std::min<uint32_t>(
+      8u, std::max<uint32_t>(
+              1u, War3GetEnvU32(
+                      "DXVK_WAR3_SEMANTIC_MANIFEST_GEOMETRY_CACHE_FRAMES",
+                      3u)));
+  return s_frames;
+}
+
+bool War3SemanticShadowManifestCoreStalePoseOneFrameRestoreRuntime() {
+  // Phase 7.31 Iteration H 回退：默认 **重新开启**。
+  //
+  // 2026-05-11 视觉复核发现：Iter B 关闭 stale restore 后，core part 缺帧
+  // 时直接整对象 skip，用户反馈"截图要多截几轮才能截到有阴影的场景"——
+  // 说明单位阴影在成片帧范围内直接消失，比之前的 stutter-catchup 更糟。
+  //
+  // 结论：stale restore 的首要功能不是"垫 pose 好看"，而是"让对象保持
+  // 可见"。pose 慢一两帧是可以接受的代价；对象整体消失不可接受。
+  //
+  // 恢复默认 on，回到 Phase 7.30 phantom+wide evict 验证过的视觉基线。
+  // Codex 的"不要靠旧数据垫 Jaccard"裁决仍然有效，但那是针对指标伪装的
+  // 警告，不是要求彻底禁用。真正的解决路径应该是修 palette writer 覆盖
+  // 率（让 live 本身更稳），而不是简单关闭 lease。
+  static const bool s_enabled =
+      War3GetEnvU32(
+          "DXVK_WAR3_SEMANTIC_MANIFEST_CORE_STALE_POSE_ONE_FRAME_RESTORE",
+          1u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticShadowManifestCoreEpochPlannerRuntime() {
+  // Phase 7.25 core epoch planner 总开关。默认开启；若出现回归可通过
+  // `DXVK_WAR3_SEMANTIC_MANIFEST_CORE_EPOCH_PLANNER=0` 回退至旧
+  // “live 全覆盖 commit”语义。
+  static const bool s_enabled =
+      War3GetEnvU32(
+          "DXVK_WAR3_SEMANTIC_MANIFEST_CORE_EPOCH_PLANNER",
+          1u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticShadowManifestCModelPoseRestoreRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32(
+          "DXVK_WAR3_SEMANTIC_MANIFEST_CMODEL_POSE_RESTORE",
+          0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticShadowManifestLeasePaletteRefreshRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32(
+          "DXVK_WAR3_SEMANTIC_MANIFEST_LEASE_PALETTE_REFRESH",
+          1u) != 0u;
+  return s_enabled;
+}
+
+uint32_t War3SemanticStickyPartSelectionMinRecordsRuntime() {
+  static const uint32_t s_minRecords = std::max<uint32_t>(
+      1u,
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_STICKY_PART_SELECTION_MIN_RECORDS",
+                    16u));
+  return s_minRecords;
+}
+
+enum class War3SemanticDirectSelectionKeySource : uint32_t {
+  None = 0,
+  UnitPtr,
+  JHandle,
+  RuntimeModel,
+  WorldObject,
+  SceneNode,
+  ModelMesh,
+  RenderablePart,
+};
+
+uint64_t War3SemanticDirectSelectionKey(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    const dxvk::war3::render::CurrentDrawAuthoritativeSample& sample,
+    War3SemanticDirectSelectionKeySource* outSource = nullptr) {
+  auto setSource = [&](War3SemanticDirectSelectionKeySource source) {
+    if (outSource != nullptr)
+      *outSource = source;
+  };
+  auto ptrValue = [](const void* ptr) -> uint64_t {
+    return uint64_t(reinterpret_cast<uintptr_t>(ptr));
+  };
+  auto makeKey = [](uint32_t tag, uint64_t value) -> uint64_t {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    hash = bit::fnv1a_iter(hash, tag);
+    hash = bit::fnv1a_iter(hash, value);
+    return hash;
+  };
+
+  const auto& renderable = packet.renderable;
+  const auto& contract = sample.contract;
+
+  // Prefer true object/runtime identity over sceneNode. A single visible unit can
+  // expose multiple scene nodes or child runtime parts, and grouping by those
+  // draw-local nodes reintroduces cap-boundary flicker.
+  if (renderable.jHandle != 0u) {
+    setSource(War3SemanticDirectSelectionKeySource::JHandle);
+    return makeKey(2u, renderable.jHandle);
+  }
+  if (contract.jHandle != 0u) {
+    setSource(War3SemanticDirectSelectionKeySource::JHandle);
+    return makeKey(2u, contract.jHandle);
+  }
+  if (renderable.unitPtr != nullptr) {
+    setSource(War3SemanticDirectSelectionKeySource::UnitPtr);
+    return makeKey(1u, ptrValue(renderable.unitPtr));
+  }
+  if (contract.unitPtr != nullptr) {
+    setSource(War3SemanticDirectSelectionKeySource::UnitPtr);
+    return makeKey(1u, ptrValue(contract.unitPtr));
+  }
+  if (renderable.runtimeModelPtr != nullptr) {
+    setSource(War3SemanticDirectSelectionKeySource::RuntimeModel);
+    return makeKey(3u, ptrValue(renderable.runtimeModelPtr));
+  }
+  if (renderable.worldObjectEntry != nullptr) {
+    setSource(War3SemanticDirectSelectionKeySource::WorldObject);
+    return makeKey(4u, ptrValue(renderable.worldObjectEntry));
+  }
+  if (contract.worldObjectEntry != nullptr) {
+    setSource(War3SemanticDirectSelectionKeySource::WorldObject);
+    return makeKey(4u, ptrValue(contract.worldObjectEntry));
+  }
+  if (renderable.sceneNode != nullptr) {
+    setSource(War3SemanticDirectSelectionKeySource::SceneNode);
+    return makeKey(5u, ptrValue(renderable.sceneNode));
+  }
+  if (contract.sceneNode != nullptr) {
+    setSource(War3SemanticDirectSelectionKeySource::SceneNode);
+    return makeKey(5u, ptrValue(contract.sceneNode));
+  }
+  if (renderable.modelResourcePtr != nullptr && renderable.meshData != nullptr) {
+    setSource(War3SemanticDirectSelectionKeySource::ModelMesh);
+    uint64_t hash = 0xcbf29ce484222325ull;
+    hash = bit::fnv1a_iter(hash, 6u);
+    hash = bit::fnv1a_iter(hash, ptrValue(renderable.modelResourcePtr));
+    hash = bit::fnv1a_iter(hash, ptrValue(renderable.meshData));
+    return hash;
+  }
+  if (renderable.renderablePart != nullptr) {
+    setSource(War3SemanticDirectSelectionKeySource::RenderablePart);
+    return makeKey(7u, ptrValue(renderable.renderablePart));
+  }
+  if (contract.renderablePart != nullptr) {
+    setSource(War3SemanticDirectSelectionKeySource::RenderablePart);
+    return makeKey(7u, ptrValue(contract.renderablePart));
+  }
+  setSource(War3SemanticDirectSelectionKeySource::None);
+  return 0u;
+}
+
+uint64_t War3SemanticDirectRecordSelectionKey(
+    const dxvk::war3::render::CurrentDrawContractRecord& record) {
+  auto ptrValue = [](const void* ptr) -> uint64_t {
+    return uint64_t(reinterpret_cast<uintptr_t>(ptr));
+  };
+  auto makeKey = [](uint32_t tag, uint64_t value) -> uint64_t {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    hash = bit::fnv1a_iter(hash, tag);
+    hash = bit::fnv1a_iter(hash, value);
+    return hash;
+  };
+
+  // Record-level preselection runs before War3TryBuildShadowPacketFromCurrentDrawRecord()
+  // has a chance to merge VisibleRenderable identity into the packet. If we
+  // group by the raw producer record here but later hash submitted objects by
+  // packet.unitPtr, the temporal lease never matches and the selected caster set
+  // churns every frame under cap pressure. Resolve only the current renderable
+  // record here; this is bounded by the direct scan cap, not every draw hook.
+  if (record.renderablePart != nullptr) {
+    dxvk::war3::render::VisibleRenderableRecord visible = {};
+    if (dxvk::war3::render::VisibleRenderableRegistry::instance()
+            .queryByRenderablePartAndLayer(record.renderablePart,
+                                           record.layerIndex, visible)) {
+      if (visible.identity.jHandle != 0u)
+        return makeKey(2u, visible.identity.jHandle);
+      if (visible.identity.handleId != 0u)
+        return makeKey(2u, visible.identity.handleId | 0x100000u);
+      if (visible.identity.unitPtr != nullptr)
+        return makeKey(1u, ptrValue(visible.identity.unitPtr));
+      if (visible.identity.worldObjectEntry != nullptr)
+        return makeKey(4u, ptrValue(visible.identity.worldObjectEntry));
+      if (visible.sceneNode != nullptr)
+        return makeKey(5u, ptrValue(visible.sceneNode));
+    }
+  }
+
+  if (record.jHandle != 0u)
+    return makeKey(2u, record.jHandle);
+  if (record.unitPtr != nullptr)
+    return makeKey(1u, ptrValue(record.unitPtr));
+  if (record.worldObjectEntry != nullptr)
+    return makeKey(4u, ptrValue(record.worldObjectEntry));
+  if (record.sceneNode != nullptr)
+    return makeKey(5u, ptrValue(record.sceneNode));
+  if (record.meshPayloadPtr != nullptr) {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    hash = bit::fnv1a_iter(hash, 6u);
+    hash = bit::fnv1a_iter(hash, ptrValue(record.meshPayloadPtr));
+    hash = bit::fnv1a_iter(hash, record.payloadWord108);
+    hash = bit::fnv1a_iter(hash, record.payloadWord11C);
+    return hash;
+  }
+  if (record.renderablePart != nullptr)
+    return makeKey(7u, ptrValue(record.renderablePart));
+  return 0u;
+}
+
+bool War3VisibleRecordMatchesCurrentDrawSlice(
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    const dxvk::war3::render::VisibleRenderableRecord& visible) {
+  if (visible.layerIndex != record.layerIndex)
+    return false;
+  if (record.renderablePart != nullptr && visible.renderablePart != nullptr &&
+      record.renderablePart != visible.renderablePart)
+    return false;
+  if (record.sceneNode != nullptr && visible.sceneNode != nullptr &&
+      record.sceneNode != visible.sceneNode)
+    return false;
+  return true;
+}
+
+uint32_t War3SemanticDirectRecordPriorityScore(
+    const dxvk::war3::render::CurrentDrawContractRecord& record) {
+  uint32_t kindPri = 0u;
+  if (record.objectKind == dxvk::war3::render::ObjectKind::Unit)
+    kindPri = 3u;
+  else if (record.unitPtr != nullptr || record.jHandle != 0u ||
+           record.rawcode != 0u)
+    kindPri = 2u;
+  else if (record.worldObjectEntry != nullptr || record.sceneNode != nullptr)
+    kindPri = 1u;
+
+  uint32_t identityScore = 0u;
+  if (record.jHandle != 0u)
+    identityScore += 4u;
+  if (record.rawcode != 0u)
+    identityScore += 3u;
+  if (record.unitPtr != nullptr)
+    identityScore += 2u;
+  if (record.jHandle != 0u || record.rawcode != 0u ||
+      record.unitPtr != nullptr)
+    identityScore += 1u;
+
+  return (kindPri << 28) | ((identityScore & 0xFFFu) << 16);
+}
+
+bool War3SemanticRequireAuthoritativeSkinnedRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_REQUIRE_AUTHORITATIVE_SKINNED", 1u) !=
+      0u;
+  return s_enabled;
+}
+
+bool War3SemanticDirectOwnerScanRuntime() {
+  // Direct current-draw packets already carry renderablePart/meshPayload,
+  // sceneNode and authoritative palette/group-slot data. The legacy owner scan
+  // walks runtime-model records and copies large records per caster; keep it
+  // as an explicit diagnostic fallback instead of the default hot path.
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_DIRECT_OWNER_SCAN", 0u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticRejectUnsafeAlphaCasterRuntime() {
+  // Phase 7.34 AlphaTest 链路已由 Claude heartbeat 2026-05-12 打通：
+  // stash（War3TryCaptureShadowCaster 抓 UV/diffuse/alphaRef）→
+  // lookup（War3TryAppendSemanticShadowPacket 查 cache）→
+  // apply（candidate.alphaTestEnabled + UV/diffuse 注入 draw）。
+  // 当 payload 存在时 reject helper 已自动放行；payload 缺失时仍安全拒绝。
+  // 因此默认值从 1 改为 0，让有 payload 的 cutout/alpha-blend 进入 semantic 路径。
+  // 如果出现方形卡片回归，设 DXVK_WAR3_SEMANTIC_REJECT_UNSAFE_ALPHA_CASTER=1 回退。
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_REJECT_UNSAFE_ALPHA_CASTER", 0u) != 0u;
+  return s_enabled;
+}
+
+uint64_t War3SemanticCurrentDrawMinVisibleFrameSerial(
+    uint64_t currentVisibleFrameSerial) {
+  // The semantic populate boundary is not phase-locked to every native
+  // RenderQueue dispatch. With a two-frame window, a caster that misses one
+  // producer tick is pruned from the direct snapshot and the whole selected
+  // caster set churns, which is visible as synchronized shadow blinking. Keep a
+  // bounded recent window so authoritative, owned palette/group-slot snapshots
+  // can bridge transient producer gaps without re-opening long-lived legacy
+  // semantic frames.
+  //
+  // Phase 7.32: 从 2 帧增大到 8 帧。在 26.7 FPS 的场景中，
+  // PublishCurrentDrawContract 可能连续多帧被 SkippedNonWorldContext 跳过，
+  // 导致 record 的 visibleFrameSerial 落后超过 grace window 被过滤，
+  // 最终 populate 返回空帧触发 shadow map hold/闪烁。
+  static const uint64_t s_graceFrames =
+      std::max<uint32_t>(
+          2u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_CURRENT_DRAW_GRACE_FRAMES",
+                            8u));
+  return currentVisibleFrameSerial > s_graceFrames
+             ? currentVisibleFrameSerial - s_graceFrames
+             : 0u;
 }
 
 war3::War3PerfMonitor::ScopedCpuScope War3SemanticSubmitScope(
@@ -206,6 +697,122 @@ VkDeviceSize War3AlignPersistentBytes(VkDeviceSize size) {
   constexpr VkDeviceSize kAlign = 256u;
   return (size + (kAlign - 1u)) & ~(kAlign - 1u);
 }
+
+// ---------------------------------------------------------------------------
+// AlphaTest lane：semantic shadow path 的 diffuse/UV/alphaRef 活体 payload 缓存。
+//
+// 目的：修复 "semantic cutout caster 投出 full-opaque 方形卡片" 的根因——
+// semantic path 只捕获了 material classification，没有把 UV buffer /
+// diffuse texture view / sampler / 真 alphaRef 真正送到 shadow caster shader。
+//
+// 链路：
+//   draw-time (War3TryCaptureShadowCaster alpha-test 块) →
+//     War3TryStashShadowAlphaTestPayload(...) 把 payload 写入全局 cache
+//   semantic consume-time (War3TryAppendSemanticShadowPacket) →
+//     War3LookupShadowAlphaTestPayload(...) 读 payload 并灌进
+//     War3ShadowPersistentGeometry + War3ShadowCasterDraw
+//
+// 本缓存仅处理 alpha-test 绑定，**不**影响任何 pose/palette/lease/stale restore 行为。
+// ---------------------------------------------------------------------------
+
+namespace dxvk_war3_alpha_test_internal {
+
+using dxvk::war3::shadow::War3ShadowAlphaTestPayload;
+
+std::mutex g_cacheMutex;
+std::unordered_map<uint64_t, War3ShadowAlphaTestPayload> g_cache;
+
+constexpr uint64_t kAlphaTestPayloadTtlFrames = 8;
+constexpr size_t kAlphaTestPayloadCacheSoftCap = 2048;
+
+uint64_t BuildKeyFromSemantic(const War3ShadowSemanticContext& semantic) {
+  if (semantic.renderablePart != nullptr)
+    return reinterpret_cast<uintptr_t>(semantic.renderablePart);
+  if (semantic.sceneNode != nullptr)
+    return reinterpret_cast<uintptr_t>(semantic.sceneNode);
+  if (semantic.worldObjectEntry != nullptr)
+    return reinterpret_cast<uintptr_t>(semantic.worldObjectEntry);
+  return 0u;
+}
+
+uint64_t BuildKeyFromRenderable(
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
+  if (renderable.renderablePart != nullptr)
+    return reinterpret_cast<uintptr_t>(renderable.renderablePart);
+  if (renderable.sceneNode != nullptr)
+    return reinterpret_cast<uintptr_t>(renderable.sceneNode);
+  if (renderable.worldObjectEntry != nullptr)
+    return reinterpret_cast<uintptr_t>(renderable.worldObjectEntry);
+  return 0u;
+}
+
+void GcLocked(uint64_t currentFrame) {
+  if (g_cache.empty())
+    return;
+  const uint64_t ttl = kAlphaTestPayloadTtlFrames;
+  uint64_t evicted = 0u;
+  for (auto it = g_cache.begin(); it != g_cache.end();) {
+    const uint64_t age = (currentFrame >= it->second.frameSerial)
+                             ? (currentFrame - it->second.frameSerial)
+                             : 0u;
+    if (age > ttl) {
+      it = g_cache.erase(it);
+      ++evicted;
+    } else {
+      ++it;
+    }
+  }
+  if (evicted != 0u) {
+    dxvk::war3::shadow::g_war3ShadowAlphaTestPayloadCounters.cacheEvictedCount
+        .fetch_add(evicted, std::memory_order_relaxed);
+  }
+
+  // 软上限：超出后按 frameSerial 最老优先淘汰，避免 cache 膨胀到无限大。
+  if (g_cache.size() > kAlphaTestPayloadCacheSoftCap) {
+    std::vector<std::pair<uint64_t, uint64_t>> ageList;
+    ageList.reserve(g_cache.size());
+    for (const auto& pair : g_cache)
+      ageList.emplace_back(pair.second.frameSerial, pair.first);
+    std::sort(ageList.begin(), ageList.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    size_t removeCount = g_cache.size() - kAlphaTestPayloadCacheSoftCap;
+    for (size_t i = 0u; i < removeCount && i < ageList.size(); ++i)
+      g_cache.erase(ageList[i].second);
+    dxvk::war3::shadow::g_war3ShadowAlphaTestPayloadCounters.cacheEvictedCount
+        .fetch_add(removeCount, std::memory_order_relaxed);
+  }
+
+  dxvk::war3::shadow::g_war3ShadowAlphaTestPayloadCounters.cacheSizeGauge.store(
+      g_cache.size(), std::memory_order_relaxed);
+}
+
+bool LookupPayloadCopy(uint64_t key, uint64_t currentFrame,
+                       War3ShadowAlphaTestPayload& out) {
+  if (key == 0u)
+    return false;
+  std::lock_guard<std::mutex> guard(g_cacheMutex);
+  // GC 仅由 InsertPayloadLocked 负责：lookup 在 reject 检查等热路径上调用，
+  // 不应在这里做清理（currentFrame 可能由调用者传 0 sentinel）。
+  (void)currentFrame;
+  auto it = g_cache.find(key);
+  if (it == g_cache.end())
+    return false;
+  out = it->second;
+  return true;
+}
+
+void InsertPayloadLocked(uint64_t key, War3ShadowAlphaTestPayload&& payload,
+                         uint64_t currentFrame) {
+  if (key == 0u)
+    return;
+  std::lock_guard<std::mutex> guard(g_cacheMutex);
+  GcLocked(currentFrame);
+  g_cache[key] = std::move(payload);
+  dxvk::war3::shadow::g_war3ShadowAlphaTestPayloadCounters.cacheSizeGauge.store(
+      g_cache.size(), std::memory_order_relaxed);
+}
+
+} // namespace dxvk_war3_alpha_test_internal
 
 uint32_t War3NormalizeShadowHandle(uint32_t handle) {
   if (handle == 0u)
@@ -396,6 +1003,119 @@ bool War3SemanticPacketHasConsistentUnitCore(
   return valid;
 }
 
+enum class War3SemanticDirectMainWorldBackingStatus : uint8_t {
+  NotChecked = 0,
+  Pass,
+  NoRenderablePart,
+  LookupMiss,
+  NonMainQueue,
+  NonWorldGroup,
+  IdentityMismatch,
+  SceneNodeMismatch,
+  MeshDataMismatch,
+};
+
+void War3NoteDirectMainWorldBackingStatus(
+    War3ShadowCaptureStats& stats,
+    War3SemanticDirectMainWorldBackingStatus status) {
+  switch (status) {
+  case War3SemanticDirectMainWorldBackingStatus::NotChecked:
+    stats.semanticSceneDirectMainWorldBackingNotCheckedCount++;
+    break;
+  case War3SemanticDirectMainWorldBackingStatus::Pass:
+    stats.semanticSceneDirectMainWorldBackingPassCount++;
+    break;
+  case War3SemanticDirectMainWorldBackingStatus::NoRenderablePart:
+    stats.semanticSceneDirectMainWorldBackingFailNoRenderablePartCount++;
+    break;
+  case War3SemanticDirectMainWorldBackingStatus::LookupMiss:
+    stats.semanticSceneDirectMainWorldBackingFailLookupMissCount++;
+    break;
+  case War3SemanticDirectMainWorldBackingStatus::NonMainQueue:
+    stats.semanticSceneDirectMainWorldBackingFailNonMainQueueCount++;
+    break;
+  case War3SemanticDirectMainWorldBackingStatus::NonWorldGroup:
+    stats.semanticSceneDirectMainWorldBackingFailNonWorldGroupCount++;
+    break;
+  case War3SemanticDirectMainWorldBackingStatus::IdentityMismatch:
+    stats.semanticSceneDirectMainWorldBackingFailIdentityMismatchCount++;
+    break;
+  case War3SemanticDirectMainWorldBackingStatus::SceneNodeMismatch:
+    stats.semanticSceneDirectMainWorldBackingFailSceneNodeMismatchCount++;
+    break;
+  case War3SemanticDirectMainWorldBackingStatus::MeshDataMismatch:
+    stats.semanticSceneDirectMainWorldBackingFailMeshDataMismatchCount++;
+    break;
+  }
+}
+
+bool War3SemanticDirectPacketHasMainWorldVisibleBacking(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    War3SemanticDirectMainWorldBackingStatus* outStatus = nullptr) {
+  auto setStatus = [&](War3SemanticDirectMainWorldBackingStatus status) {
+    if (outStatus != nullptr)
+      *outStatus = status;
+  };
+  const auto& renderable = packet.renderable;
+  if (renderable.renderablePart == nullptr) {
+    setStatus(War3SemanticDirectMainWorldBackingStatus::NoRenderablePart);
+    return false;
+  }
+
+  dxvk::war3::render::VisibleRenderableRecord visible = {};
+  if (!dxvk::war3::render::VisibleRenderableRegistry::instance()
+           .queryByRenderablePartAndLayer(renderable.renderablePart,
+                                          renderable.layerIndex, visible)) {
+    setStatus(War3SemanticDirectMainWorldBackingStatus::LookupMiss);
+    return false;
+  }
+
+  if (visible.queueKind !=
+      dxvk::war3::render::VisibleRenderableQueueKind::MainQueue) {
+    setStatus(War3SemanticDirectMainWorldBackingStatus::NonMainQueue);
+    return false;
+  }
+  if (visible.identity.groupIdx > 0) {
+    setStatus(War3SemanticDirectMainWorldBackingStatus::NonWorldGroup);
+    return false;
+  }
+
+  const auto& identity = visible.identity;
+  bool identityMatches = false;
+  if (renderable.unitPtr != nullptr && identity.unitPtr != nullptr)
+    identityMatches = renderable.unitPtr == identity.unitPtr;
+  if (!identityMatches && renderable.worldObjectEntry != nullptr &&
+      identity.worldObjectEntry != nullptr)
+    identityMatches =
+        renderable.worldObjectEntry == identity.worldObjectEntry;
+  if (!identityMatches && renderable.jHandle != 0u) {
+    identityMatches = identity.jHandle == renderable.jHandle ||
+                      identity.handleId == renderable.jHandle;
+  }
+
+  // Rawcode-only matches are intentionally not accepted here. Portrait/model
+  // preview draws can share the selected unit rawcode while using a separate
+  // UI/preview scene node; the world shadow path needs a live object identity.
+  if (!identityMatches) {
+    setStatus(War3SemanticDirectMainWorldBackingStatus::IdentityMismatch);
+    return false;
+  }
+
+  if (visible.sceneNode != nullptr && renderable.sceneNode != nullptr &&
+      visible.sceneNode != renderable.sceneNode) {
+    setStatus(War3SemanticDirectMainWorldBackingStatus::SceneNodeMismatch);
+    return false;
+  }
+  if (visible.meshData != nullptr && renderable.meshData != nullptr &&
+      visible.meshData != renderable.meshData) {
+    setStatus(War3SemanticDirectMainWorldBackingStatus::MeshDataMismatch);
+    return false;
+  }
+
+  setStatus(War3SemanticDirectMainWorldBackingStatus::Pass);
+  return true;
+}
+
 bool War3HasSemanticDynamicUnitEvidence(
     const dxvk::war3::shadow::ShadowDrawPacket& packet);
 
@@ -461,6 +1181,1210 @@ bool War3SemanticPacketUsesDirectGeosetData(
          packet.renderable.meshData == packet.renderable.runtimeGeosetDataPtr;
 }
 
+using War3DirectPacketGeosetRecord =
+    dxvk::war3::model::ShadowGeosetResourceRecord;
+using War3DirectPacketGeosetCache =
+    std::unordered_map<void*,
+                       std::shared_ptr<const War3DirectPacketGeosetRecord>>;
+
+std::mutex& War3DirectPacketGeosetCacheMutex() {
+  static std::mutex s_mutex;
+  return s_mutex;
+}
+
+War3DirectPacketGeosetCache& War3DirectPacketGeosetResourceCache() {
+  static War3DirectPacketGeosetCache s_cache;
+  return s_cache;
+}
+
+std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>
+War3FindDirectPacketGeosetResource(void* geosetOrDataPtr) {
+  if (geosetOrDataPtr == nullptr)
+    return nullptr;
+
+  std::lock_guard<std::mutex> lock(War3DirectPacketGeosetCacheMutex());
+  const auto& s_cache = War3DirectPacketGeosetResourceCache();
+  const auto it = s_cache.find(geosetOrDataPtr);
+  if (it == s_cache.end() || it->second == nullptr ||
+      !it->second->readyForShadowConsumer()) {
+    return nullptr;
+  }
+  return it->second;
+}
+
+std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>
+War3GetDirectPacketGeosetResource(
+    dxvk::war3::model::ShadowGeosetResourceRecord&& geoset) {
+  void* key = geoset.geosetDataPtr != nullptr ? geoset.geosetDataPtr
+                                              : geoset.geosetPtr;
+  if (key == nullptr)
+    return std::make_shared<War3DirectPacketGeosetRecord>(std::move(geoset));
+
+  std::lock_guard<std::mutex> lock(War3DirectPacketGeosetCacheMutex());
+  auto& cache = War3DirectPacketGeosetResourceCache();
+  const auto it = cache.find(key);
+  if (it != cache.end() && it->second != nullptr &&
+      it->second->contentHash == geoset.contentHash &&
+      it->second->vertexCount == geoset.vertexCount &&
+      it->second->indexCount == geoset.indexCount &&
+      it->second->readyForShadowConsumer()) {
+    return it->second;
+  }
+
+  if (cache.size() > 4096u)
+    cache.clear();
+  auto shared =
+      std::make_shared<War3DirectPacketGeosetRecord>(std::move(geoset));
+  cache[key] = shared;
+  return shared;
+}
+
+bool War3SemanticMaterialSignatureCacheRuntime() {
+  static const bool s_enabled =
+      dxvk::env::getEnvVar("DXVK_WAR3_SEMANTIC_MATERIAL_CACHE") != "0";
+  return s_enabled;
+}
+
+dxvk::war3::shadow::ShadowMaterialSignature
+War3BuildShadowMaterialSignatureCached(
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
+  if (!War3SemanticMaterialSignatureCacheRuntime()) {
+    return dxvk::war3::shadow::BuildShadowMaterialSignatureForRenderable(
+        renderable);
+  }
+
+  struct CacheEntry {
+    bool valid = false;
+    // Phase 7.26：为了提高命中率，去掉 renderablePart 这个每帧抖动的 key 字段。
+    // key 改为 sceneNode + meshIndex + layerIndex + modelResource + flags 组合，
+    // 这些在同一 unit/geoset 上稳定得多。renderablePart/meshData 仍做为校验，
+    // 但进命中判定时作为次要字段。
+    void* sceneNode = nullptr;
+    void* meshData = nullptr;
+    void* layerState = nullptr;
+    void* modelResourcePtr = nullptr;
+    uint64_t modelKey = 0u;
+    uint32_t flags = 0u;
+    uint32_t layerIndex = 0u;
+    uint32_t transparentType = 0u;
+    uint32_t transparentSortKey = 0u;
+    uint32_t meshIndex = 0u;
+    uint32_t queueKind = 0u;
+    dxvk::war3::shadow::ShadowMaterialSignature signature = {};
+  };
+
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, reinterpret_cast<uintptr_t>(renderable.sceneNode));
+  // Phase 7.26：key 不再包含 renderablePart（随帧抖动会让 material cache
+  // miss 率持续偏高）。sceneNode + mesh/layer + modelResource 足以唯一确定
+  // 一个 unit 实例上的一条 material contract。
+  hash = bit::fnv1a_iter(hash, reinterpret_cast<uintptr_t>(renderable.modelResourcePtr));
+  hash = bit::fnv1a_iter(hash, renderable.modelKey);
+  hash = bit::fnv1a_iter(hash, renderable.meshIndex);
+  hash = bit::fnv1a_iter(hash, renderable.layerIndex);
+  hash = bit::fnv1a_iter(hash, renderable.flags);
+  hash = bit::fnv1a_iter(hash, renderable.transparentType);
+  hash = bit::fnv1a_iter(hash, renderable.transparentSortKey);
+  hash = bit::fnv1a_iter(hash, uint32_t(renderable.queueKind));
+
+  static thread_local std::array<CacheEntry, 4096> s_cache = {};
+  auto& entry = s_cache[size_t(hash) & (s_cache.size() - 1u)];
+  if (entry.valid &&
+      entry.sceneNode == renderable.sceneNode &&
+      entry.meshData == renderable.meshData &&
+      entry.layerState == renderable.layerState &&
+      entry.modelResourcePtr == renderable.modelResourcePtr &&
+      entry.modelKey == renderable.modelKey &&
+      entry.flags == renderable.flags &&
+      entry.layerIndex == renderable.layerIndex &&
+      entry.transparentType == renderable.transparentType &&
+      entry.transparentSortKey == renderable.transparentSortKey &&
+      entry.meshIndex == renderable.meshIndex &&
+      entry.queueKind == uint32_t(renderable.queueKind)) {
+    return entry.signature;
+  }
+
+  auto signature =
+      dxvk::war3::shadow::BuildShadowMaterialSignatureForRenderable(renderable);
+  entry.valid = true;
+  entry.sceneNode = renderable.sceneNode;
+  entry.meshData = renderable.meshData;
+  entry.layerState = renderable.layerState;
+  entry.modelResourcePtr = renderable.modelResourcePtr;
+  entry.modelKey = renderable.modelKey;
+  entry.flags = renderable.flags;
+  entry.layerIndex = renderable.layerIndex;
+  entry.transparentType = renderable.transparentType;
+  entry.transparentSortKey = renderable.transparentSortKey;
+  entry.meshIndex = renderable.meshIndex;
+  entry.queueKind = uint32_t(renderable.queueKind);
+  entry.signature = signature;
+  return signature;
+}
+
+void War3NoteSemanticMaterialBindingDiagnostics(
+    War3ShadowCaptureStats& stats,
+    const dxvk::war3::shadow::ShadowMaterialSignature& material) {
+  if (!material.layerContractResolved) {
+    stats.semanticSceneMaterialLayerContractFailedCount++;
+    return;
+  }
+
+  stats.semanticSceneMaterialLayerContractResolvedCount++;
+  stats.semanticSceneMaterialLastMeshIndex = material.layerContractMeshIndex;
+  stats.semanticSceneMaterialLastLayerIndex = material.layerIndex;
+  stats.semanticSceneMaterialLastLayerCount = material.layerContractLayerCount;
+  stats.semanticSceneMaterialLastBlendOrDrawMode = material.blendOrDrawMode;
+  if (material.blendOrDrawMode == 0u) {
+    stats.semanticSceneMaterialBlendMode0Count++;
+  } else if (material.blendOrDrawMode == 1u) {
+    stats.semanticSceneMaterialBlendMode1Count++;
+  } else {
+    stats.semanticSceneMaterialBlendMode2PlusCount++;
+  }
+}
+
+bool War3TryBuildCurrentDrawRecordMaterialSignature(
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    dxvk::war3::shadow::ShadowMaterialSignature& outMaterial) {
+  outMaterial = {};
+  if (record.sceneNode == nullptr || record.meshPayloadPtr == nullptr)
+    return false;
+
+  dxvk::war3::shadow::ShadowRenderableRecord renderable = {};
+  renderable.sceneNode = record.sceneNode;
+  renderable.renderablePart = record.renderablePart;
+  renderable.payload = record.renderablePart;
+  renderable.meshData = record.meshPayloadPtr;
+  renderable.worldObjectEntry = record.worldObjectEntry;
+  renderable.unitPtr = record.unitPtr;
+  renderable.jHandle = record.jHandle;
+  renderable.rawcode = record.rawcode;
+  renderable.objectKind = record.objectKind;
+  renderable.layerIndex = record.layerIndex;
+  renderable.subIndex = record.layerIndex;
+  renderable.meshIndex =
+      record.payloadWord108 != dxvk::war3::model::kInvalidShadowGeosetIndex
+          ? record.payloadWord108
+          : dxvk::war3::shadow::kInvalidShadowContractGeosetIndex;
+  renderable.geosetIndex = dxvk::war3::shadow::kInvalidShadowContractGeosetIndex;
+  renderable.queueKind = dxvk::war3::render::VisibleRenderableQueueKind::MainQueue;
+
+  dxvk::war3::render::VisibleRenderableRecord visible = {};
+  auto& visibleRegistry = dxvk::war3::render::VisibleRenderableRegistry::instance();
+  bool visibleHit = false;
+  if (record.renderablePart != nullptr)
+    visibleHit =
+        visibleRegistry.queryByRenderablePartAndLayer(
+            record.renderablePart, record.layerIndex, visible);
+  if (!visibleHit && record.sceneNode != nullptr)
+    visibleHit = visibleRegistry.queryBySceneNode(record.sceneNode, visible) &&
+                 War3VisibleRecordMatchesCurrentDrawSlice(record, visible);
+  if (!visibleHit && record.meshPayloadPtr != nullptr)
+    visibleHit = visibleRegistry.queryByPayload(record.meshPayloadPtr, visible) &&
+                 War3VisibleRecordMatchesCurrentDrawSlice(record, visible);
+  if (visibleHit) {
+    renderable.payload =
+        visible.payload != nullptr ? visible.payload : renderable.payload;
+    renderable.renderablePart =
+        visible.renderablePart != nullptr ? visible.renderablePart
+                                          : renderable.renderablePart;
+    renderable.sceneNode =
+        visible.sceneNode != nullptr ? visible.sceneNode : renderable.sceneNode;
+    renderable.meshData =
+        visible.meshData != nullptr ? visible.meshData : renderable.meshData;
+    renderable.layerState = visible.layerState;
+    renderable.runtimeModelPtr = visible.runtimeModelPtr;
+    renderable.modelResourcePtr = visible.modelResourcePtr;
+    renderable.runtimeGeosetPtr = visible.runtimeGeosetPtr;
+    renderable.runtimeGeosetDataPtr = visible.runtimeGeosetDataPtr;
+    renderable.modelKey = visible.modelKey;
+    renderable.flags = visible.flags;
+    renderable.layerIndex = visible.layerIndex;
+    renderable.subIndex = visible.subIndex;
+    renderable.transparentType = visible.transparentType;
+    renderable.transparentSortKey = visible.transparentSortKey;
+    renderable.queueKind = visible.queueKind;
+    if (visible.meshIndex != dxvk::war3::render::kInvalidVisibleMeshIndex)
+      renderable.meshIndex = visible.meshIndex;
+    renderable.geosetIndex = visible.geosetIndex;
+    if (visible.identity.worldObjectEntry != nullptr)
+      renderable.worldObjectEntry = visible.identity.worldObjectEntry;
+    if (visible.identity.sceneNode != nullptr)
+      renderable.sceneNode = visible.identity.sceneNode;
+    if (visible.identity.unitPtr != nullptr)
+      renderable.unitPtr = visible.identity.unitPtr;
+    if (visible.identity.jHandle != 0u)
+      renderable.jHandle = visible.identity.jHandle;
+    if (visible.identity.rawcode != 0u)
+      renderable.rawcode = visible.identity.rawcode;
+    if (visible.identity.kind != dxvk::war3::render::ObjectKind::Unknown)
+      renderable.objectKind = visible.identity.kind;
+  }
+
+  outMaterial = War3BuildShadowMaterialSignatureCached(renderable);
+  return outMaterial.valid();
+}
+
+bool War3CurrentDrawRecordIsUnsafeAlphaCaster(
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    dxvk::war3::shadow::ShadowMaterialSignature* outMaterial = nullptr) {
+  if (!War3SemanticRejectUnsafeAlphaCasterRuntime())
+    return false;
+
+  dxvk::war3::shadow::ShadowMaterialSignature material = {};
+  if (!War3TryBuildCurrentDrawRecordMaterialSignature(record, material))
+    return false;
+
+  if (outMaterial != nullptr)
+    *outMaterial = material;
+
+  const bool classifiedAsAlphaCaster =
+      material.alphaMode == dxvk::war3::shadow::ShadowAlphaMode::Cutout ||
+      material.alphaMode == dxvk::war3::shadow::ShadowAlphaMode::AlphaBlend;
+  if (!classifiedAsAlphaCaster)
+    return false;
+
+  // AlphaTest lane softening：如果 draw-time stash 为本对象身份留下了完整且
+  // valid 的 payload，semantic/canonical path 就能在 append 阶段正确接通
+  // UV / diffuse / alphaRef，shadow caster shader 不会再走 full-opaque 分支，
+  // 因此不再以"安全拒绝"的名义把它踢掉。
+  //
+  // payload 缺失（尚未 stash、stash 失败、cache TTL 淘汰）仍然保持原来的
+  // 安全拒绝，避免 cutout caster 退化成 full-opaque 方形卡片。
+  uint64_t payloadKey = 0u;
+  if (record.renderablePart != nullptr)
+    payloadKey = reinterpret_cast<uintptr_t>(record.renderablePart);
+  else if (record.sceneNode != nullptr)
+    payloadKey = reinterpret_cast<uintptr_t>(record.sceneNode);
+  else if (record.worldObjectEntry != nullptr)
+    payloadKey = reinterpret_cast<uintptr_t>(record.worldObjectEntry);
+
+  if (payloadKey != 0u) {
+    dxvk::war3::shadow::War3ShadowAlphaTestPayload payload = {};
+    if (dxvk_war3_alpha_test_internal::LookupPayloadCopy(payloadKey, 0u,
+                                                         payload) &&
+        payload.valid()) {
+      // payload 可用 → 让 semantic path 继续处理，不做 reject。
+      return false;
+    }
+  }
+
+  // payload 缺失 → 维持安全拒绝；bumping fallbackRejectCount 让观测端可以判断
+  // 当前还有多少 cutout 物体被卡在"未接通 payload"的状态。
+  dxvk::war3::shadow::g_war3ShadowAlphaTestPayloadCounters.fallbackRejectCount
+      .fetch_add(1u, std::memory_order_relaxed);
+  return true;
+}
+
+bool War3RejectCurrentDrawRecordByUnsafeAlphaVisualPolicy(
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    War3ShadowCaptureStats& stats) {
+  dxvk::war3::shadow::ShadowMaterialSignature material = {};
+  if (!War3CurrentDrawRecordIsUnsafeAlphaCaster(record, &material))
+    return false;
+
+  War3NoteSemanticMaterialBindingDiagnostics(stats, material);
+  if (material.alphaMode == dxvk::war3::shadow::ShadowAlphaMode::Cutout) {
+    stats.semanticSceneMaterialObservedCutoutCount++;
+    stats.semanticSceneRejectedCutoutVisualPolicy++;
+    stats.semanticSceneRejectedCutoutGeometry++;
+  } else {
+    stats.semanticSceneMaterialObservedAlphaBlendCount++;
+    stats.semanticSceneRejectedAlphaBlendVisualPolicy++;
+    stats.semanticSceneRejectedAlphaBlendGeometry++;
+  }
+  return true;
+}
+
+dxvk::war3::shadow::ShadowPrimitiveTopology
+War3MapCurrentDrawPrimitiveTypeToTopology(uint32_t primitiveType) {
+  switch (primitiveType) {
+  case 4u:
+    return dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleStrip;
+  case 5u:
+    return dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleFan;
+  case 1u:
+    return dxvk::war3::shadow::ShadowPrimitiveTopology::LineList;
+  case 2u:
+    return dxvk::war3::shadow::ShadowPrimitiveTopology::LineStrip;
+  case 3u:
+  default:
+    return dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
+  }
+}
+
+uint64_t War3ComputeCurrentDrawVisibleIndexSliceHash(
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable,
+    const dxvk::war3::model::ShadowGeosetResourceRecord& geoset,
+    uint32_t primitiveIndex, uint32_t baseIndex, uint32_t indexCount,
+    dxvk::war3::shadow::ShadowPrimitiveTopology topology,
+    const uint16_t* indices) {
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, geoset.contentHash);
+  hash = bit::fnv1a_iter(hash, uint64_t(geoset.geosetIndex));
+  hash = bit::fnv1a_iter(hash, renderable.layerIndex);
+  hash = bit::fnv1a_iter(hash, renderable.subIndex);
+  hash = bit::fnv1a_iter(hash, record.layerIndex);
+  hash = bit::fnv1a_iter(hash, record.payloadWord108);
+  hash = bit::fnv1a_iter(hash, record.payloadWord11C);
+  hash = bit::fnv1a_iter(hash, primitiveIndex);
+  hash = bit::fnv1a_iter(hash, baseIndex);
+  hash = bit::fnv1a_iter(hash, indexCount);
+  hash = bit::fnv1a_iter(hash, uint32_t(topology));
+  const uint32_t sampleCount = (std::min)(indexCount, 32u);
+  for (uint32_t i = 0u; i < sampleCount; ++i)
+    hash = bit::fnv1a_iter(hash, uint32_t(indices[i]));
+  if (indexCount > sampleCount) {
+    const uint32_t tailStart = indexCount - sampleCount;
+    for (uint32_t i = tailStart; i < indexCount; ++i)
+      hash = bit::fnv1a_iter(hash, uint32_t(indices[i]));
+  }
+  return hash;
+}
+
+bool War3TryAttachCurrentDrawVisibleIndexSlice(
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    const dxvk::war3::model::ShadowGeosetResourceRecord& geoset,
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable,
+    dxvk::war3::shadow::ShadowPacketResource& resource) {
+  if (renderable.meshData == nullptr ||
+      renderable.runtimeGeosetDataPtr == nullptr ||
+      renderable.meshData != renderable.runtimeGeosetDataPtr ||
+      geoset.indices.empty() || geoset.primitiveRecords.empty()) {
+    return false;
+  }
+
+  auto preparedCountMatchesIndexCount =
+      [](dxvk::war3::shadow::ShadowPrimitiveTopology topology,
+         uint32_t preparedCount, uint32_t indexCount) -> bool {
+    if (preparedCount == 0u || indexCount == 0u)
+      return false;
+    if (preparedCount == indexCount)
+      return true;
+    if (topology == dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList)
+      return preparedCount <= (UINT32_MAX / 3u) &&
+             preparedCount * 3u == indexCount;
+    if (topology == dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleStrip ||
+        topology == dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleFan)
+      return preparedCount <= (UINT32_MAX - 2u) &&
+             preparedCount + 2u == indexCount;
+    return false;
+  };
+
+  auto tryPrimitiveIndex = [&](uint32_t primitiveIndex,
+                               dxvk::war3::shadow::ShadowDynamicIndexSource source,
+                               uint64_t preparedHash = 0u) -> bool {
+    if (primitiveIndex >= geoset.primitiveRecords.size())
+      return false;
+
+    uint32_t baseIndex = 0u;
+    for (uint32_t i = 0u; i < primitiveIndex; ++i) {
+      const uint32_t count = geoset.primitiveRecords[i].indexCount;
+      if (count == 0u || count > geoset.indices.size() ||
+          baseIndex > geoset.indices.size() - count) {
+        return false;
+      }
+      baseIndex += count;
+    }
+
+    const auto& primitive = geoset.primitiveRecords[primitiveIndex];
+    const uint32_t count = primitive.indexCount;
+    if (count == 0u || count > geoset.indices.size() ||
+        baseIndex > geoset.indices.size() - count) {
+      return false;
+    }
+
+    auto owned = std::make_shared<std::vector<uint16_t>>(
+        geoset.indices.begin() + baseIndex,
+        geoset.indices.begin() + baseIndex + count);
+    if (owned->empty())
+      return false;
+
+    const auto topology = War3MapCurrentDrawPrimitiveTypeToTopology(
+        primitive.primitiveTypeOrMaterialSlot);
+    resource.ownedDynamicIndices = owned;
+    resource.dynamicIndexStream = owned->data();
+    resource.dynamicIndexCount = uint32_t(owned->size());
+    resource.dynamicPrimitiveBaseIndex = baseIndex;
+    resource.dynamicIndexHash = War3ComputeCurrentDrawVisibleIndexSliceHash(
+        record, renderable, geoset, primitiveIndex, baseIndex, count, topology,
+        owned->data());
+    if (preparedHash != 0u)
+      resource.dynamicIndexHash =
+          bit::fnv1a_iter(resource.dynamicIndexHash, preparedHash);
+    resource.topology = topology;
+    resource.dynamicIndexSource = source;
+    return true;
+  };
+
+  dxvk::war3::render::CurrentDrawPreparedSliceRecord preparedSlice = {};
+  if (dxvk::war3::render::QueryCurrentDrawPreparedSlice(
+          record.renderablePart, record.layerIndex, preparedSlice)) {
+    const auto preparedTopology =
+        War3MapCurrentDrawPrimitiveTypeToTopology(preparedSlice.primitiveType);
+    auto preparedMatchesPrimitive = [&](uint32_t primitiveIndex) -> bool {
+      if (primitiveIndex >= geoset.primitiveRecords.size())
+        return false;
+      const auto& primitive = geoset.primitiveRecords[primitiveIndex];
+      const auto primitiveTopology = War3MapCurrentDrawPrimitiveTypeToTopology(
+          primitive.primitiveTypeOrMaterialSlot);
+      return primitiveTopology == preparedTopology &&
+             preparedCountMatchesIndexCount(preparedTopology,
+                                            preparedSlice.preparedCount,
+                                            primitive.indexCount);
+    };
+    auto tryPreparedPrimitiveIndex = [&](uint32_t primitiveIndex) -> bool {
+      if (!preparedMatchesPrimitive(primitiveIndex))
+        return false;
+      return tryPrimitiveIndex(
+          primitiveIndex,
+          dxvk::war3::shadow::ShadowDynamicIndexSource::PreparedSlice,
+          preparedSlice.preparedHash);
+    };
+
+    if ((preparedSlice.sceneNode == nullptr ||
+         record.sceneNode == nullptr ||
+         preparedSlice.sceneNode == record.sceneNode) &&
+        tryPreparedPrimitiveIndex(renderable.layerIndex)) {
+      return true;
+    }
+    if (renderable.subIndex != renderable.layerIndex &&
+        tryPreparedPrimitiveIndex(renderable.subIndex)) {
+      return true;
+    }
+
+    uint32_t matchIndex = UINT32_MAX;
+    uint32_t matchCount = 0u;
+    for (uint32_t i = 0u; i < geoset.primitiveRecords.size(); ++i) {
+      if (!preparedMatchesPrimitive(i))
+        continue;
+      matchIndex = i;
+      matchCount++;
+    }
+    if (matchCount == 1u &&
+        tryPrimitiveIndex(
+            matchIndex,
+            dxvk::war3::shadow::ShadowDynamicIndexSource::PreparedSlice,
+            preparedSlice.preparedHash)) {
+      return true;
+    }
+  }
+
+  if (tryPrimitiveIndex(
+          renderable.layerIndex,
+          dxvk::war3::shadow::ShadowDynamicIndexSource::LayerIndexFallback))
+    return true;
+  if (renderable.subIndex != renderable.layerIndex &&
+      tryPrimitiveIndex(
+          renderable.subIndex,
+          dxvk::war3::shadow::ShadowDynamicIndexSource::LayerIndexFallback)) {
+    return true;
+  }
+  return false;
+}
+
+void War3UpdateSemanticReplayInputDiagnostics(War3FrameScene& scene) {
+  auto& stats = scene.shadowStats;
+  stats.semanticSceneShadowCastersCount =
+      uint32_t((std::min)(scene.shadowCasters.size(),
+                          size_t(std::numeric_limits<uint32_t>::max())));
+
+  uint32_t replayCount = 0u;
+  uint32_t skinnedReplayCount = 0u;
+  auto noteReplayDraw = [&](const War3ShadowCasterDraw& draw) {
+    if constexpr (dxvk::war3::internal::kShadowReplayCasterCapEnabled) {
+      const uint32_t cap =
+          (std::max)(dxvk::war3::internal::kShadowReplayCasterCap, 1u);
+      if (replayCount >= cap)
+        return;
+    }
+    replayCount++;
+    if (draw.vertexBlendEnabled)
+      skinnedReplayCount++;
+  };
+
+  for (const auto& instance : scene.shadowInstances) {
+    if (instance.replayDrawIndex >= scene.shadowCasters.size())
+      continue;
+    noteReplayDraw(scene.shadowCasters[instance.replayDrawIndex]);
+  }
+  for (const auto& fallback : scene.shadowFallbacks)
+    noteReplayDraw(fallback.snapshot);
+
+  stats.semanticSceneReplayDrawsCount = replayCount;
+  if (stats.semanticSceneShadowMapSkinnedCasterCount == 0u)
+    stats.semanticSceneShadowMapSkinnedCasterCount = skinnedReplayCount;
+}
+
+// Phase 7.50：前向声明 + enum 完整定义前移，供
+// War3TryBuildShadowPacketFromCurrentDrawRecord 在 Resolve 失败时调用
+// live palette rebuild。实际的 War3TryBuildLiveRuntimeGroupPalette 函数体
+// 在本文件后面定义（~line 3100），此处只做声明。
+// Phase 7.28：skinned palette content stability probe。
+// 当 skinned packet 的 palette 在 submit 阶段完成选择后，我们需要知道这份
+// palette 具体是从哪条来源读回的。不同来源在稳定性、读取时机和时效性上差距
+// 极大，也就是用户观察到的"储物桶(rigid)不闪、skinned 单位闪"的真正分水岭。
+// 该枚举刻意保持 "submit 端视角"：DrawTimeCaptured 才是和 current-draw 同
+// 帧同事件捕获到的真源；其它分支都涉及一次性重读或跨帧缓存。
+enum class War3SemanticPaletteSource : uint32_t {
+  None = 0,                           // 没有 live palette，fallback 到 packet 原始 palette
+  DrawTimeCaptured = 1,               // current-draw 同步捕获的 palette（最稳定）
+  SubmitTimeGlobalSlot = 2,           // Game.dll + 0xBC6BD0 全局 palette 通路，slotIndex 通过 renderablePart+0x08 读取
+  SubmitTimeBlendedPaletteCache = 3,  // QueryBlendedPaletteBySlotIndex（Hook_RuntimeMatrixWrite 同帧捕获）
+  SubmitTimePublishedPoseRegistry = 4, // 发布过的 PoseRegistry record
+  SubmitTimeCModelFallback = 5,       // CModel +0x5C/+0x60 的 FinalPoseMatrixArray（当前 1.27a 偏移不可信）
+};
+
+bool War3TryBuildLiveRuntimeGroupPalette(
+    const dxvk::war3::shadow::ShadowPacketResource& resource,
+    void* runtimeModelPtr,
+    void* renderablePart,
+    uint64_t frameSerial,
+    std::vector<Matrix4>& outPalette,
+    uint32_t& outMaxVertexGroupSlot,
+    uint64_t& outHash,
+    uint64_t* outRawPoseHash,
+    void** outPoseRuntimeModelPtr,
+    bool allowCModelFallbackForCall,
+    War3SemanticPaletteSource* outPaletteSource,
+    uint32_t* outPaletteSlotIndex,
+    uint32_t* outPaletteMinFrameTag,
+    uint32_t* outPaletteMaxFrameTag);
+
+bool War3TryBuildShadowPacketFromCurrentDrawRecord(
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    uint64_t fallbackFrameSerial,
+    dxvk::war3::shadow::ShadowDrawPacket& out,
+    dxvk::war3::render::CurrentDrawAuthoritativeSample*
+        outDirectCurrentDrawSample = nullptr) {
+  auto directBuildScope =
+      War3SemanticSubmitScope("War3SemanticScene/Direct/BuildPacket");
+  out = {};
+  if (outDirectCurrentDrawSample != nullptr)
+    *outDirectCurrentDrawSample = {};
+  if (record.renderablePart == nullptr || record.meshPayloadPtr == nullptr)
+    return false;
+
+  auto& resourceCache = dxvk::war3::model::ShadowModelResourceCache::instance();
+  dxvk::war3::model::ShadowGeosetResourceRecord geosetLocal = {};
+  std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>
+      sharedGeoset;
+  const dxvk::war3::model::ShadowGeosetResourceRecord* geoset = nullptr;
+  bool geosetHit = false;
+  {
+    auto geosetLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/GeosetLookup");
+    sharedGeoset = War3FindDirectPacketGeosetResource(record.meshPayloadPtr);
+    geoset = sharedGeoset.get();
+    geosetHit = geoset != nullptr;
+    if (!geosetHit) {
+      geosetHit =
+          resourceCache.findGeosetByData(record.meshPayloadPtr, geosetLocal) ||
+          resourceCache.findGeosetByPtr(record.meshPayloadPtr, geosetLocal);
+      if (geosetHit)
+        geoset = &geosetLocal;
+    }
+  }
+  dxvk::war3::model::ShadowModelResourceRecord ownerRecord = {};
+  bool ownerHit = false;
+  {
+    auto ownerLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerLookup");
+    if (geosetHit) {
+      ownerHit = resourceCache.findRuntimeModelOwnerIndexed(
+          geoset->geosetPtr, geoset->geosetDataPtr, ownerRecord);
+      if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
+        ownerHit =
+            resourceCache.findRuntimeModelOwner(geoset->geosetPtr,
+                                                geoset->geosetDataPtr,
+                                                geoset->geosetIndex,
+                                                geoset->modelResourcePtr,
+                                                ownerRecord);
+      }
+    }
+    if (!ownerHit) {
+      ownerHit = resourceCache.findRuntimeModelOwnerIndexed(
+          nullptr, record.meshPayloadPtr, ownerRecord);
+      if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
+        ownerHit = resourceCache.findRuntimeModelOwner(
+            nullptr, record.meshPayloadPtr,
+            dxvk::war3::model::kInvalidShadowGeosetIndex, nullptr,
+            ownerRecord);
+      }
+    }
+  }
+  dxvk::war3::model::ModelInstanceRecord instanceRecord = {};
+  auto& instanceRegistry = dxvk::war3::model::ModelInstanceRegistry::instance();
+  bool instanceHit = false;
+  {
+    auto instanceLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/InstanceLookup");
+    if (record.sceneNode != nullptr)
+      instanceHit = instanceRegistry.findBySceneNode(record.sceneNode, instanceRecord);
+    if (!instanceHit && record.unitPtr != nullptr)
+      instanceHit = instanceRegistry.findByUnitPtr(record.unitPtr, instanceRecord);
+    if (!instanceHit && record.worldObjectEntry != nullptr)
+      instanceHit = instanceRegistry.findByWorldObjectEntry(record.worldObjectEntry, instanceRecord);
+    if (!instanceHit && ownerHit && ownerRecord.runtimeModelPtr != nullptr)
+      instanceHit = instanceRegistry.findByRuntimeModel(ownerRecord.runtimeModelPtr,
+                                                        instanceRecord);
+  }
+
+  if (!geosetHit) {
+    auto geosetFallbackScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/GeosetFallback");
+    uint32_t meshIndex = dxvk::war3::model::kInvalidShadowGeosetIndex;
+    if (instanceHit && instanceRecord.runtimeModelPtr != nullptr &&
+        dxvk::war3::SafeReadU32Fast(record.meshPayloadPtr,
+                                    dxvk::war3::MeshDataOffsets::MeshIndex,
+                                    meshIndex) &&
+        meshIndex != dxvk::war3::model::kInvalidShadowGeosetIndex &&
+        resourceCache.findRuntimeModelGeoset(instanceRecord.runtimeModelPtr,
+                                             meshIndex, geosetLocal)) {
+      geosetHit = true;
+      geoset = &geosetLocal;
+    }
+  }
+
+  if (!geosetHit) {
+    auto ownerScanFallbackScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerGeosetScan");
+    if (ownerHit && ownerRecord.runtimeModelPtr != nullptr) {
+      for (uint32_t i = 0u; i < ownerRecord.geosetCount; ++i) {
+        if (i < ownerRecord.geosetDataPtrs.size() &&
+            ownerRecord.geosetDataPtrs[i] == record.meshPayloadPtr &&
+            resourceCache.findRuntimeModelGeoset(ownerRecord.runtimeModelPtr, i,
+                                                 geosetLocal)) {
+          geosetHit = true;
+          geoset = &geosetLocal;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!geosetHit && instanceHit && instanceRecord.runtimeModelPtr != nullptr) {
+    auto instanceScanFallbackScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/InstanceGeosetScan");
+    dxvk::war3::model::ShadowModelResourceRecord instanceOwnerRecord = {};
+    if (resourceCache.findRuntimeModelResource(instanceRecord.runtimeModelPtr,
+                                               instanceOwnerRecord)) {
+      for (uint32_t i = 0u; i < instanceOwnerRecord.geosetCount; ++i) {
+        const bool dataMatch =
+            i < instanceOwnerRecord.geosetDataPtrs.size() &&
+            instanceOwnerRecord.geosetDataPtrs[i] == record.meshPayloadPtr;
+        const bool ptrMatch =
+            i < instanceOwnerRecord.geosetPtrs.size() &&
+            instanceOwnerRecord.geosetPtrs[i] == record.meshPayloadPtr;
+        if ((dataMatch || ptrMatch) &&
+            resourceCache.findRuntimeModelGeoset(instanceRecord.runtimeModelPtr,
+                                                 i, geosetLocal)) {
+          geosetHit = true;
+          geoset = &geosetLocal;
+          break;
+        }
+      }
+    }
+  }
+
+  if ((!geosetHit || geoset == nullptr || !geoset->readyForShadowConsumer()) &&
+      resourceCache.hydrateGeosetByKnownPtrs(record.renderablePart,
+                                             record.meshPayloadPtr,
+                                             geosetLocal)) {
+    geosetHit = true;
+    geoset = &geosetLocal;
+  }
+
+  if (!geosetHit || geoset == nullptr || !geoset->readyForShadowConsumer())
+    return false;
+
+  if (!ownerHit) {
+    auto ownerPostLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerPostLookup");
+    ownerHit = resourceCache.findRuntimeModelOwnerIndexed(
+        geoset->geosetPtr, geoset->geosetDataPtr, ownerRecord);
+    if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
+      ownerHit =
+          resourceCache.findRuntimeModelOwner(geoset->geosetPtr,
+                                              geoset->geosetDataPtr,
+                                              geoset->geosetIndex,
+                                              geoset->modelResourcePtr,
+                                              ownerRecord);
+    }
+  }
+  if (!instanceHit && ownerHit && ownerRecord.runtimeModelPtr != nullptr) {
+    auto instancePostLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/InstancePostLookup");
+    instanceHit = instanceRegistry.findByRuntimeModel(ownerRecord.runtimeModelPtr,
+                                                      instanceRecord);
+  }
+
+  const dxvk::war3::render::RenderObjectInfo* renderObject = nullptr;
+  {
+    auto renderObjectLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/RenderObjectLookup");
+    auto& renderRegistry = dxvk::war3::render::RenderObjectRegistry::instance();
+    if (record.worldObjectEntry != nullptr)
+      renderObject = renderRegistry.findByEntry(record.worldObjectEntry);
+    if (renderObject == nullptr && record.sceneNode != nullptr)
+      renderObject = renderRegistry.findBySceneNode(record.sceneNode);
+    if (renderObject == nullptr && record.jHandle != 0u)
+      renderObject = renderRegistry.findByHandle(record.jHandle);
+  }
+
+  dxvk::war3::render::ShadowObjectRecord shadowRecord = {};
+  bool shadowHit = false;
+  {
+    auto shadowObjectLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/ShadowObjectLookup");
+    auto& shadowRegistry = dxvk::war3::render::ShadowObjectRegistry::instance();
+    if (record.worldObjectEntry != nullptr)
+      shadowHit = shadowRegistry.findByWorldObjectEntry(record.worldObjectEntry,
+                                                        shadowRecord);
+    if (!shadowHit && record.sceneNode != nullptr)
+      shadowHit = shadowRegistry.findBySceneNode(record.sceneNode, shadowRecord);
+    if (!shadowHit && record.jHandle != 0u)
+      shadowHit = shadowRegistry.findByHandle(record.jHandle, shadowRecord);
+    if (!shadowHit && ownerHit && ownerRecord.runtimeModelPtr != nullptr)
+      shadowHit =
+          shadowRegistry.findByRuntimeModel(ownerRecord.runtimeModelPtr, shadowRecord);
+    if (!shadowHit && instanceHit && instanceRecord.runtimeModelPtr != nullptr)
+      shadowHit = shadowRegistry.findByRuntimeModel(instanceRecord.runtimeModelPtr,
+                                                    shadowRecord);
+  }
+
+  dxvk::war3::render::VisibleRenderableRecord visibleRecord = {};
+  bool visibleHit = false;
+  {
+    auto visibleLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/VisibleLookup");
+    auto& visibleRegistry = dxvk::war3::render::VisibleRenderableRegistry::instance();
+    if (record.renderablePart != nullptr)
+      visibleHit = visibleRegistry.queryByRenderablePartAndLayer(
+          record.renderablePart, record.layerIndex, visibleRecord);
+    if (!visibleHit && record.renderablePart != nullptr)
+      visibleHit = visibleRegistry.queryByPayload(record.renderablePart,
+                                                  visibleRecord) &&
+                   War3VisibleRecordMatchesCurrentDrawSlice(record,
+                                                            visibleRecord);
+    if (!visibleHit && record.sceneNode != nullptr)
+      visibleHit = visibleRegistry.queryBySceneNode(record.sceneNode,
+                                                   visibleRecord) &&
+                   War3VisibleRecordMatchesCurrentDrawSlice(record,
+                                                            visibleRecord);
+  }
+
+  dxvk::war3::model::PoseRecord poseRecord = {};
+  bool poseHit = false;
+  const void* effectiveRuntimeModelPtr =
+      instanceHit && instanceRecord.runtimeModelPtr != nullptr
+          ? instanceRecord.runtimeModelPtr
+          : ownerHit && ownerRecord.runtimeModelPtr != nullptr
+                ? ownerRecord.runtimeModelPtr
+                : shadowHit && shadowRecord.runtimeModelPtr != nullptr
+                      ? shadowRecord.runtimeModelPtr
+                      : nullptr;
+  {
+    auto poseLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/PoseLookup");
+    auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
+    if (effectiveRuntimeModelPtr != nullptr)
+      poseHit = poseRegistry.findByRuntimeModel(const_cast<void*>(effectiveRuntimeModelPtr),
+                                               poseRecord);
+    if (!poseHit && record.sceneNode != nullptr)
+      poseHit = poseRegistry.findBySceneNode(record.sceneNode, poseRecord);
+    if (!poseHit && record.unitPtr != nullptr)
+      poseHit = poseRegistry.findByUnitPtr(record.unitPtr, poseRecord);
+  }
+
+  auto& renderable = out.renderable;
+  renderable.worldObjectEntry =
+      record.worldObjectEntry != nullptr
+          ? record.worldObjectEntry
+          : instanceHit && instanceRecord.worldObjectEntry != nullptr
+                ? instanceRecord.worldObjectEntry
+                : shadowHit ? shadowRecord.worldObjectEntry
+                            : renderObject != nullptr
+                                  ? renderObject->worldObjectEntry
+                                  : nullptr;
+  renderable.sceneNode =
+      record.sceneNode != nullptr
+          ? record.sceneNode
+          : instanceHit && instanceRecord.sceneNode != nullptr
+                ? instanceRecord.sceneNode
+                : shadowHit ? shadowRecord.sceneNode
+                            : renderObject != nullptr
+                                  ? renderObject->sceneNode
+                                  : nullptr;
+  renderable.unitPtr =
+      record.unitPtr != nullptr
+          ? record.unitPtr
+          : instanceHit && instanceRecord.unitPtr != nullptr
+                ? instanceRecord.unitPtr
+                : shadowHit ? shadowRecord.unitPtr
+                            : renderObject != nullptr ? renderObject->unitPtr
+                                                      : nullptr;
+  renderable.renderablePart = record.renderablePart;
+  renderable.payload = record.renderablePart;
+  renderable.meshData = record.meshPayloadPtr;
+  if (visibleHit) {
+    if (renderable.payload == nullptr)
+      renderable.payload = visibleRecord.payload;
+    renderable.layerState = visibleRecord.layerState;
+    renderable.transparentType = visibleRecord.transparentType;
+    renderable.transparentSortKey = visibleRecord.transparentSortKey;
+    renderable.queueKind = visibleRecord.queueKind;
+  }
+  renderable.runtimeModelPtr = const_cast<void*>(effectiveRuntimeModelPtr);
+  renderable.modelResourcePtr = geoset->modelResourcePtr != nullptr
+                                    ? geoset->modelResourcePtr
+                                    : instanceHit &&
+                                              instanceRecord.modelResourcePtr != nullptr
+                                          ? instanceRecord.modelResourcePtr
+                                          : ownerHit ? ownerRecord.modelResourcePtr
+                                                     : shadowHit ? shadowRecord.modelResourcePtr
+                                                                 : nullptr;
+  renderable.runtimeGeosetPtr = geoset->geosetPtr;
+  renderable.runtimeGeosetDataPtr = geoset->geosetDataPtr;
+  renderable.modelKey = geoset->modelKey != 0u
+                            ? geoset->modelKey
+                            : instanceHit && instanceRecord.modelKey != 0u
+                                  ? instanceRecord.modelKey
+                                  : ownerHit && ownerRecord.modelKey != 0u
+                                        ? ownerRecord.modelKey
+                                        : shadowHit ? shadowRecord.modelKey
+                                                    : 0u;
+  renderable.flags = 0u;
+  renderable.jHandle = record.jHandle != 0u
+                           ? record.jHandle
+                           : instanceHit && instanceRecord.jHandle != 0u
+                                 ? instanceRecord.jHandle
+                                 : shadowHit ? shadowRecord.jHandle
+                                             : renderObject != nullptr
+                                                   ? renderObject->jHandle
+                                                   : 0u;
+  renderable.rawcode = record.rawcode != 0u
+                           ? record.rawcode
+                           : instanceHit && instanceRecord.rawcode != 0u
+                                 ? instanceRecord.rawcode
+                                 : shadowHit ? shadowRecord.rawcode
+                                             : renderObject != nullptr
+                                                   ? renderObject->rawcode
+                                                   : 0u;
+  renderable.unitFlags5C =
+      renderObject != nullptr ? renderObject->flags5C : 0u;
+  // In the current-draw contract `payload + 0x108` is the selector used for
+  // sceneNode->meshInfoTable. It is not a material layer index. When the
+  // visible registry does not provide a layer, default to layer 0; using the
+  // selector as a layer made first-layer cutout/alpha records read the wrong
+  // material contract and collapse to opaque.
+  renderable.layerIndex = visibleHit ? visibleRecord.layerIndex
+                                     : record.layerIndex;
+  renderable.subIndex = visibleHit ? visibleRecord.subIndex
+                                   : record.layerIndex;
+  if (!visibleHit) {
+    renderable.transparentType = 0u;
+    renderable.transparentSortKey = 0u;
+    renderable.queueKind =
+        dxvk::war3::render::VisibleRenderableQueueKind::MainQueue;
+  }
+  const uint32_t drawMeshSelector =
+      record.payloadWord108 != dxvk::war3::model::kInvalidShadowGeosetIndex
+          ? record.payloadWord108
+          : geoset->geosetIndex;
+  renderable.meshIndex =
+      visibleHit &&
+              visibleRecord.meshIndex !=
+                  dxvk::war3::render::kInvalidVisibleMeshIndex
+          ? visibleRecord.meshIndex
+          : drawMeshSelector;
+  renderable.geosetIndex = geoset->geosetIndex;
+  renderable.objectKind = record.objectKind != dxvk::war3::render::ObjectKind::Unknown
+                              ? record.objectKind
+                              : renderObject != nullptr
+                                    ? renderObject->kind
+                                    : shadowHit ? shadowRecord.kind
+                                                : dxvk::war3::render::ObjectKind::Unknown;
+  renderable.groupIdx =
+      visibleHit ? visibleRecord.identity.groupIdx
+                 : renderObject != nullptr ? int8_t(renderObject->groupIdx)
+                                           : int8_t(0);
+  renderable.frameSerial =
+      record.visibleFrameSerial != 0u ? record.visibleFrameSerial
+                                      : fallbackFrameSerial;
+  if (renderable.unitPtr != nullptr && renderable.unitFlags5C == 0u) {
+    dxvk::war3::SafeReadU32Fast(renderable.unitPtr,
+                                dxvk::war3::CUnitOffsets::Flags5C,
+                                renderable.unitFlags5C);
+  }
+
+  if (sharedGeoset == nullptr)
+    sharedGeoset =
+        War3GetDirectPacketGeosetResource(std::move(geosetLocal));
+  const auto& geo = *sharedGeoset;
+
+  auto& resource = out.resource;
+  resource.resourceKeepAlive = sharedGeoset;
+  resource.modelResourcePtr = renderable.modelResourcePtr;
+  resource.modelKey = renderable.modelKey;
+  resource.geosetIndex = geo.geosetIndex;
+  resource.vertexCount = geo.vertexCount;
+  resource.primitiveRecordCount = geo.primitiveCount;
+  resource.explicitBlendCount = 0u;
+  resource.contentHash = geo.contentHash;
+  resource.topology = dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
+  resource.positions = &geo.positions;
+  resource.vertexGroupIndices = &geo.vertexGroupIndices;
+  resource.indices = &geo.indices;
+  resource.matrixGroupSizes = &geo.matrixGroupSizes;
+  resource.matrixIndices = &geo.matrixIndices;
+  War3TryAttachCurrentDrawVisibleIndexSlice(record, geo, renderable, resource);
+  bool directExplicitBlendResolved = false;
+  uint32_t directExplicitBlendMaxGroupSlot = 0u;
+
+  dxvk::war3::render::CurrentDrawAuthoritativeSample directCurrentDrawSample = {};
+  dxvk::war3::render::CurrentDrawResolveStatus directResolveStatus;
+  {
+    auto directResolveScope = War3SemanticSubmitScope(
+        "War3SemanticScene/Direct/AuthoritativeDecode");
+    directResolveStatus =
+        dxvk::war3::render::ResolveCurrentDrawAuthoritativeSampleFromRecord(
+            record,
+            resource.vertexCount != 0u
+                ? resource.vertexCount
+                : uint32_t(resource.positionVec().size() / 3u),
+            renderable.frameSerial,
+            directCurrentDrawSample);
+  }
+  const bool likelySkinned =
+      record.payloadWord104 != 0u || record.payloadWordF0 != 0u ||
+      geo.hasSkinningData();
+  const bool authoritativeSkinnedRequired =
+      War3SemanticRequireAuthoritativeSkinnedRuntime() &&
+      likelySkinned &&
+      (record.objectKind == dxvk::war3::render::ObjectKind::Unit ||
+       renderable.unitPtr != nullptr);
+  // Phase 7.50 核心修复：
+  //   Resolve 失败在 War3 的 8 帧 palette-slot cadence 下是正常现象
+  //   （`CModel_AllocAndFillGroupPalette` 在部分帧不给 renderablePart 分配新 slot，
+  //    +0x08 读到 0xFFFFFFFFu，Publish 早退，snapshot 未更新）。
+  //   历史兜底 `KeepReadySnapshotOnInvalidCurrentDraw` 在这种场景下让 Resolve Ready
+  //   返回 *上一次 ready publish 的 palette*，submit 连续 7-8 帧吃同一份旧数据
+  //   → 用户视频"阴影动 0.5s 停 0.5s"。Phase 7.49 确认了这个因果链。
+  //
+  //   单纯关掉兜底会让整个 caster 这帧 skip（authoritativeSkinnedRequired 触发
+  //   return false），视觉是"阴影消失"——Phase 7.50 用户反馈了这个副作用。
+  //
+  //   真正修复：Resolve 不 Ready 时**不 return false**，先尝试 live rebuild。
+  //   `War3TryBuildLiveRuntimeGroupPalette` 会按以下优先级拿 fresh palette：
+  //     1) Phase 7.46 renderablePart snapshot（0x12FED0 producer 同帧捕获）
+  //     2) Game.dll global palette arena + slotIndex 直读
+  //     3) PoseRegistry（0x12FDC0 publish 的 authoritative final-pose）重建
+  //     4) CModel+0x60 fallback（仅 allowCModelFallbackForCall=true 时）
+  //   任一路径成功就用 live palette 组装 packet 继续 submit；全部失败才 skip。
+  //   这样三种情况都正确：
+  //     - 1 帧 miss：live rebuild 命中 → 阴影跟上 pose
+  //     - 连续 N 帧 miss：每帧 live rebuild 命中 → 阴影跟随
+  //     - 所有来源都失败（罕见）：skip 这帧（比冻结 7 帧观感更可接受）
+  bool liveRebuildUsed = false;
+  std::vector<Matrix4> liveRebuiltPalette;
+  uint32_t liveRebuiltMaxGroupSlot = 0u;
+  uint64_t liveRebuiltHash = 0u;
+  uint32_t liveRebuiltSlotIndex = 0xFFFFFFFFu;
+  uint32_t liveRebuiltMinFrameTag = 0u;
+  uint32_t liveRebuiltMaxFrameTag = 0u;
+  War3SemanticPaletteSource liveRebuiltSource =
+      War3SemanticPaletteSource::None;
+  if (authoritativeSkinnedRequired &&
+      directResolveStatus !=
+          dxvk::war3::render::CurrentDrawResolveStatus::Ready) {
+    // Resolve 失败（InvalidPaletteSlot / MissingPalette 等）时尝试 live rebuild。
+    // 注意 allowCModelFallbackForCall 保持 false，避免 1.27a 上 CModel 直读拿到
+    // 错对象的已知 bug。
+    liveRebuildUsed = War3TryBuildLiveRuntimeGroupPalette(
+        resource,
+        renderable.runtimeModelPtr,
+        record.renderablePart,
+        renderable.frameSerial,
+        liveRebuiltPalette,
+        liveRebuiltMaxGroupSlot,
+        liveRebuiltHash,
+        nullptr,
+        nullptr,
+        /*allowCModelFallbackForCall=*/false,
+        &liveRebuiltSource,
+        &liveRebuiltSlotIndex,
+        &liveRebuiltMinFrameTag,
+        &liveRebuiltMaxFrameTag);
+    if (!liveRebuildUsed || liveRebuiltPalette.empty()) {
+      // live rebuild 也失败：这是真正的"没数据"，只能 skip 这帧。
+      return false;
+    }
+  }
+  if (directResolveStatus ==
+          dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
+      directCurrentDrawSample.paletteReady()) {
+    const bool directGroupSlotsReady =
+        directCurrentDrawSample.groupSlotsReady();
+    if (outDirectCurrentDrawSample != nullptr) {
+      *outDirectCurrentDrawSample = {};
+      outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
+      outDirectCurrentDrawSample->paletteCount =
+          directCurrentDrawSample.paletteCount;
+      outDirectCurrentDrawSample->paletteHash =
+          directCurrentDrawSample.paletteHash;
+      outDirectCurrentDrawSample->palette = directCurrentDrawSample.palette;
+      outDirectCurrentDrawSample->groupSlots = directCurrentDrawSample.groupSlots;
+      outDirectCurrentDrawSample->groupHash = directCurrentDrawSample.groupHash;
+      outDirectCurrentDrawSample->stableGroupHash = directCurrentDrawSample.stableGroupHash;
+      outDirectCurrentDrawSample->status = directCurrentDrawSample.status;
+    }
+    out.runtimeGroupPalette = std::move(directCurrentDrawSample.palette);
+    out.runtimeGroupPaletteHash = directCurrentDrawSample.paletteHash;
+    out.runtimeGroupPaletteSlotIndex =
+        directCurrentDrawSample.contract.paletteSlotIndex;
+    out.runtimeGroupPaletteMinFrameTag =
+        directCurrentDrawSample.contract.frameTag;
+    out.runtimeGroupPaletteMaxFrameTag =
+        directCurrentDrawSample.contract.frameTag;
+    out.hasRuntimeGroupPalette = true;
+    if (directGroupSlotsReady) {
+      resource.ownedVertexGroupIndices =
+          std::move(directCurrentDrawSample.groupSlots);
+      resource.vertexGroupIndices = &resource.ownedVertexGroupIndices;
+    }
+  } else if (liveRebuildUsed && !liveRebuiltPalette.empty()) {
+    // Phase 7.50：Resolve 不 Ready 但 live rebuild 成功，用 fresh palette 组装。
+    // 注意 directGroupSlots 此路径拿不到，groupSlots 留给 resource 原有的
+    // geoset.vertexGroupIndices 填充。out.maxVertexGroupSlot 在函数末尾由
+    // effectiveGroupSlots 推算，不需要在这里提前写死。
+    out.runtimeGroupPalette = std::move(liveRebuiltPalette);
+    out.runtimeGroupPaletteHash = liveRebuiltHash;
+    out.runtimeGroupPaletteSlotIndex = liveRebuiltSlotIndex;
+    out.runtimeGroupPaletteMinFrameTag = liveRebuiltMinFrameTag;
+    out.runtimeGroupPaletteMaxFrameTag = liveRebuiltMaxFrameTag;
+    out.hasRuntimeGroupPalette = true;
+    if (outDirectCurrentDrawSample != nullptr) {
+      // 用 stale directCurrentDrawSample 的 contract + rebuild 后的 palette
+      // 构造一个 "fresh-palette sample" 给调用方，保留 contract/identity 信息。
+      *outDirectCurrentDrawSample = {};
+      outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
+      outDirectCurrentDrawSample->paletteCount =
+          uint32_t(out.runtimeGroupPalette.size());
+      outDirectCurrentDrawSample->paletteHash = liveRebuiltHash;
+      outDirectCurrentDrawSample->palette = out.runtimeGroupPalette;
+      outDirectCurrentDrawSample->status =
+          dxvk::war3::render::CurrentDrawResolveStatus::Ready;
+    }
+  } else if (outDirectCurrentDrawSample != nullptr) {
+    *outDirectCurrentDrawSample = std::move(directCurrentDrawSample);
+  }
+
+  auto& pose = out.pose;
+  if (poseHit) {
+    pose.runtimeModelPtr =
+        poseRecord.runtimeModelPtr != nullptr ? poseRecord.runtimeModelPtr
+                                              : const_cast<void*>(effectiveRuntimeModelPtr);
+    pose.sceneNode = poseRecord.sceneNode;
+    pose.unitPtr = poseRecord.unitPtr;
+    pose.matrixCount = poseRecord.matrixCount;
+    pose.matrixHash = poseRecord.matrixHash;
+    pose.matrixPalette = std::move(poseRecord.matrixPalette);
+    pose.hasWorldTransform = poseRecord.hasWorldTransform;
+    if (poseRecord.hasWorldTransform)
+      pose.worldTransform = poseRecord.worldTransform;
+    pose.frameSerial = renderable.frameSerial;
+  }
+
+  if (War3SemanticDirectExplicitBlendResolveRuntime() && likelySkinned &&
+      directResolveStatus ==
+          dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
+      out.hasRuntimeGroupPalette && !out.runtimeGroupPalette.empty()) {
+    dxvk::war3::shadow::ShadowPoseRecord explicitPose = pose;
+    explicitPose.matrixPalette = out.runtimeGroupPalette;
+    explicitPose.matrixCount = uint32_t(out.runtimeGroupPalette.size());
+    explicitPose.matrixHash = out.runtimeGroupPaletteHash;
+    explicitPose.runtimeModelPtr =
+        renderable.runtimeModelPtr != nullptr ? renderable.runtimeModelPtr
+                                              : pose.runtimeModelPtr;
+    explicitPose.sceneNode =
+        renderable.sceneNode != nullptr ? renderable.sceneNode : pose.sceneNode;
+    explicitPose.unitPtr =
+        renderable.unitPtr != nullptr ? renderable.unitPtr : pose.unitPtr;
+    explicitPose.frameSerial = renderable.frameSerial;
+
+    uint32_t maxExpectedGroupSize = 0u;
+    for (uint32_t groupSize : geo.matrixGroupSizes)
+      maxExpectedGroupSize = std::max(maxExpectedGroupSize, groupSize);
+
+    dxvk::war3::shadow::ShadowExplicitBlendSkinningResult explicitBlend = {};
+    const uint32_t explicitVertexCount =
+        resource.vertexCount != 0u
+            ? resource.vertexCount
+            : uint32_t(resource.positionVec().size() / 3u);
+    const uint32_t explicitPaletteLimit =
+        std::min<uint32_t>(uint32_t(explicitPose.matrixPalette.size()), 256u);
+    if (explicitVertexCount != 0u && explicitPaletteLimit != 0u &&
+        dxvk::war3::shadow::TryResolveExplicitBlendSkinningForRenderable(
+            renderable, explicitVertexCount, explicitPaletteLimit,
+            maxExpectedGroupSize, explicitPose, explicitBlend, nullptr)) {
+      resource.ownedVertexBlendWeights = std::move(explicitBlend.weights);
+      resource.vertexBlendWeights = &resource.ownedVertexBlendWeights;
+      resource.ownedVertexBlendIndices = std::move(explicitBlend.indices);
+      resource.vertexBlendIndices = &resource.ownedVertexBlendIndices;
+      resource.explicitBlendCount = explicitBlend.blendCount;
+      resource.contentHash =
+          bit::fnv1a_iter(resource.contentHash, explicitBlend.dynamicHash);
+      if (!explicitBlend.runtimeGroupPalette.empty()) {
+        out.runtimeGroupPalette = std::move(explicitBlend.runtimeGroupPalette);
+        out.runtimeGroupPaletteHash = War3SemanticHashMatrixPalette(
+            out.runtimeGroupPalette.data(),
+            uint32_t(out.runtimeGroupPalette.size()));
+      }
+      directExplicitBlendResolved = true;
+      directExplicitBlendMaxGroupSlot = explicitBlend.maxGroupSlot;
+    }
+  }
+
+  {
+    auto materialScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/MaterialSignature");
+    out.material = War3BuildShadowMaterialSignatureCached(renderable);
+  }
+
+  const bool looksSkinned =
+      directResolveStatus ==
+          dxvk::war3::render::CurrentDrawResolveStatus::Ready ||
+      likelySkinned;
+  out.path = looksSkinned ? dxvk::war3::shadow::ShadowDrawPath::Skinned
+                          : dxvk::war3::shadow::ShadowDrawPath::Rigid;
+  out.usesDynamicMeshPositions = false;
+  if (!out.hasRuntimeGroupPalette && !authoritativeSkinnedRequired)
+    out.hasRuntimeGroupPalette =
+        pose.matrixCount != 0u && !pose.matrixPalette.empty();
+  out.matrixGroupsUseAveraging =
+      directExplicitBlendResolved ? false : !geo.matrixGroupSizes.empty();
+  uint32_t maxSlot = 0u;
+  const auto& effectiveGroupSlots =
+      !resource.ownedVertexGroupIndices.empty() ? resource.ownedVertexGroupIndices
+                                                : geo.vertexGroupIndices;
+  for (uint8_t slot : effectiveGroupSlots)
+    maxSlot = std::max(maxSlot, uint32_t(slot));
+  if (directExplicitBlendResolved)
+    maxSlot = std::max(maxSlot, directExplicitBlendMaxGroupSlot);
+  out.maxVertexGroupSlot = maxSlot;
+  if (out.runtimeGroupPaletteHash == 0u && !authoritativeSkinnedRequired) {
+    out.runtimeGroupPaletteHash = pose.matrixHash;
+    out.runtimeGroupPalette = pose.matrixPalette;
+    out.runtimeGroupPaletteSlotIndex = 0xFFFFFFFFu;
+    out.runtimeGroupPaletteMinFrameTag = 0u;
+    out.runtimeGroupPaletteMaxFrameTag = 0u;
+  }
+  return true;
+}
+
 dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKindFast(
     const dxvk::war3::shadow::ShadowDrawPacket& packet) {
   if (packet.renderable.objectKind !=
@@ -518,12 +2442,91 @@ bool War3LooksSubmitEligibleForScoringFast(
   return War3SemanticPacketHasStableUnitResource(packet);
 }
 
+bool War3LooksSubmitEligibleForDirectCurrentDrawFast(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    bool unitsOnly,
+    const dxvk::war3::render::CurrentDrawAuthoritativeSample*
+        directCurrentDrawSample,
+    War3SemanticDirectMainWorldBackingStatus* outMainWorldBackingStatus =
+        nullptr) {
+  if (outMainWorldBackingStatus != nullptr) {
+    *outMainWorldBackingStatus =
+        War3SemanticDirectMainWorldBackingStatus::NotChecked;
+  }
+  if (!unitsOnly)
+    return War3ShouldSubmitSemanticPacketFast(packet, false);
+
+  const auto& renderable = packet.renderable;
+  if (packet.path != dxvk::war3::shadow::ShadowDrawPath::Skinned)
+    return false;
+  if (directCurrentDrawSample == nullptr ||
+      directCurrentDrawSample->status !=
+          dxvk::war3::render::CurrentDrawResolveStatus::Ready) {
+    return false;
+  }
+  const uint32_t vertexCount =
+      packet.resource.vertexCount != 0u
+          ? packet.resource.vertexCount
+          : uint32_t(packet.resource.positionVec().size() / 3u);
+  if (vertexCount == 0u || !packet.hasRuntimeGroupPalette ||
+      packet.runtimeGroupPalette.empty() ||
+      packet.resource.ownedVertexGroupIndices.size() < size_t(vertexCount)) {
+    return false;
+  }
+  if (renderable.groupIdx > 0)
+    return false;
+  if (renderable.unitPtr == nullptr)
+    return false;
+  const bool requireMainWorldVisibleBacking =
+      War3SemanticRequireDirectUnitVisibleBackingRuntime();
+  if (outMainWorldBackingStatus != nullptr ||
+      requireMainWorldVisibleBacking) {
+    const bool hasMainWorldVisibleBacking =
+        War3SemanticDirectPacketHasMainWorldVisibleBacking(
+            packet, outMainWorldBackingStatus);
+    if (requireMainWorldVisibleBacking && !hasMainWorldVisibleBacking)
+      return false;
+  }
+  if ((renderable.unitFlags5C & dxvk::war3::UnitFlags5C::Building) != 0u)
+    return false;
+  if (renderable.rawcode == 0u && renderable.jHandle == 0u)
+    return false;
+  if (renderable.objectKind != dxvk::war3::render::ObjectKind::Unknown &&
+      !War3IsSemanticUnitObject(renderable.objectKind))
+    return false;
+  if (War3SemanticRawcodeLooksStaticWorldCaster(renderable.rawcode))
+    return false;
+  if (!War3SemanticPacketHasStableUnitResource(packet))
+    return false;
+  if (War3SemanticValidateUnitCoreRuntime())
+    return War3SemanticPacketHasConsistentUnitCore(packet);
+  return true;
+}
+
+bool War3SemanticMaterialIsSafeOpaqueWorldCaster(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  if (!War3SemanticRejectUnsafeAlphaCasterRuntime())
+    return true;
+
+  const auto& material = packet.material;
+  if (!material.valid() || !material.layerContractResolved)
+    return false;
+
+  if (material.queueKind !=
+      uint32_t(dxvk::war3::render::VisibleRenderableQueueKind::MainQueue)) {
+    return false;
+  }
+
+  return material.alphaMode == dxvk::war3::shadow::ShadowAlphaMode::Opaque &&
+         material.blendOrDrawMode == 0u;
+}
+
 bool War3IsEligibleSemanticStaticWorldCaster(
     const dxvk::war3::shadow::ShadowDrawPacket& packet,
     dxvk::war3::render::ObjectKind resolvedObjectKind,
     bool hasRenderableGeoset, bool hasPacketGeometry) {
-  if constexpr (!dxvk::war3::internal::
-                    kWar3RuntimeConfigSemanticVisibleEndFrameStaticHydrate) {
+  if (!dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() ||
+      dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly) {
     return false;
   }
 
@@ -537,6 +2540,9 @@ bool War3IsEligibleSemanticStaticWorldCaster(
       dxvk::war3::render::VisibleRenderableQueueKind::Transparent) {
     return false;
   }
+
+  if (!War3SemanticMaterialIsSafeOpaqueWorldCaster(packet))
+    return false;
 
   if (packet.path != dxvk::war3::shadow::ShadowDrawPath::Rigid)
     return false;
@@ -628,7 +2634,9 @@ bool War3ShouldSubmitSemanticPacket(
       packet.renderable.worldObjectEntry != nullptr &&
       packet.renderable.sceneNode != nullptr &&
       packet.pose.hasWorldTransform && hasRenderableGeoset &&
-      hasPacketGeometry;
+      hasPacketGeometry &&
+      War3SemanticMaterialIsSafeOpaqueWorldCaster(packet) &&
+      War3SemanticDirectPacketHasMainWorldVisibleBacking(packet);
 
   if (!unitsOnly) {
     if (War3IsEligibleSemanticDynamicUnit(packet, resolvedObjectKind) ||
@@ -752,7 +2760,45 @@ public:
 
   bool shouldSubmitDraw(const dxvk::war3::shadow::ShadowDrawPacket& packet,
                         bool unitsOnly) const override {
-    return War3ShouldSubmitSemanticPacketFast(packet, unitsOnly);
+    const bool accepted = War3ShouldSubmitSemanticPacketFast(packet, unitsOnly);
+    if (!accepted &&
+        packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
+      static std::atomic<uint32_t> s_rejectLogCount{0u};
+      const uint32_t logIndex =
+          s_rejectLogCount.fetch_add(1u, std::memory_order_relaxed);
+      if (logIndex < 64u) {
+        const auto& r = packet.renderable;
+        const auto kind = War3ResolveSemanticPacketObjectKindFast(packet);
+        const bool stableResource = War3SemanticPacketHasStableUnitResource(packet);
+        const bool staticWorldRawcode =
+            War3SemanticRawcodeLooksStaticWorldCaster(r.rawcode);
+        war3dbg::Print(
+            "DXVK SemanticHostReject: unitsOnly=%d kind=%u q=%u group=%d "
+            "unitPtr=%p handle=0x%08X raw=0x%08X building=%d stableRes=%d "
+            "skinned=%d runtime=%p model=%p scene=%p mesh=%p part=%p\n",
+            unitsOnly ? 1 : 0, uint32_t(kind), uint32_t(r.queueKind),
+            int(r.groupIdx), r.unitPtr, r.jHandle, r.rawcode,
+            (r.unitFlags5C & dxvk::war3::UnitFlags5C::Building) != 0u ? 1 : 0,
+            stableResource ? 1 : 0, 1,
+            r.runtimeModelPtr, r.modelResourcePtr, r.sceneNode, r.meshData,
+            r.renderablePart);
+        war3dbg::Print(
+            "DXVK SemanticHostRejectReason: nonUnit=%d transparent=%d group=%d "
+            "building=%d noStableRes=%d noIdentity=%d noUnit=%d staticRaw=%d\n",
+            !War3IsSemanticUnitObject(kind) ? 1 : 0,
+            r.queueKind ==
+                    dxvk::war3::render::VisibleRenderableQueueKind::Transparent
+                ? 1
+                : 0,
+            r.groupIdx > 0 ? 1 : 0,
+            (r.unitFlags5C & dxvk::war3::UnitFlags5C::Building) != 0u ? 1 : 0,
+            stableResource ? 0 : 1,
+            (r.rawcode == 0u && r.jHandle == 0u) ? 1 : 0,
+            r.unitPtr == nullptr ? 1 : 0,
+            staticWorldRawcode ? 1 : 0);
+      }
+    }
+    return accepted;
   }
 
   bool submitDrawPacket(
@@ -1021,6 +3067,42 @@ void* War3ResolveLivePoseRuntimeAlias(void* runtimeModelPtr,
   return nullptr;
 }
 
+// Phase 7.50：`War3SemanticPaletteSource` enum 定义已前移到文件顶部（line ~1720
+// 附近），以便 `War3TryBuildShadowPacketFromCurrentDrawRecord` 可以在 Resolve
+// 失败时直接调用 live palette rebuild。此处保留空注释仅作历史标记。
+
+void War3RebindShadowPacketOwnedResourcePointers(
+    dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  // ShadowPacketResource stores pointer aliases into its owned vectors. Default
+  // copy/move keeps the old addresses, so lease records must rebind before use.
+  auto& resource = packet.resource;
+  if (!resource.ownedPositions.empty())
+    resource.positions = &resource.ownedPositions;
+  if (!resource.ownedVertexGroupIndices.empty())
+    resource.vertexGroupIndices = &resource.ownedVertexGroupIndices;
+  if (!resource.ownedVertexBlendWeights.empty())
+    resource.vertexBlendWeights = &resource.ownedVertexBlendWeights;
+  if (!resource.ownedVertexBlendIndices.empty())
+    resource.vertexBlendIndices = &resource.ownedVertexBlendIndices;
+  if (!resource.ownedIndices.empty())
+    resource.indices = &resource.ownedIndices;
+  if (!resource.ownedMatrixGroupSizes.empty())
+    resource.matrixGroupSizes = &resource.ownedMatrixGroupSizes;
+  if (!resource.ownedMatrixIndices.empty())
+    resource.matrixIndices = &resource.ownedMatrixIndices;
+}
+
+template <typename EligibleRecordT>
+void War3RebindEligibleRecordPacket(EligibleRecordT& eligible) {
+  War3RebindShadowPacketOwnedResourcePointers(eligible.packet);
+}
+
+template <typename EligibleRecordT>
+void War3RebindEligibleRecordPackets(std::vector<EligibleRecordT>& records) {
+  for (auto& eligible : records)
+    War3RebindEligibleRecordPacket(eligible);
+}
+
 bool War3TryBuildLiveRuntimeGroupPalette(
     const dxvk::war3::shadow::ShadowPacketResource& resource,
     void* runtimeModelPtr,
@@ -1030,7 +3112,17 @@ bool War3TryBuildLiveRuntimeGroupPalette(
     uint32_t& outMaxVertexGroupSlot,
     uint64_t& outHash,
     uint64_t* outRawPoseHash = nullptr,
-    void** outPoseRuntimeModelPtr = nullptr) {
+    void** outPoseRuntimeModelPtr = nullptr,
+    bool allowCModelFallbackForCall = false,
+    War3SemanticPaletteSource* outPaletteSource = nullptr,
+    uint32_t* outPaletteSlotIndex = nullptr,
+    uint32_t* outPaletteMinFrameTag = nullptr,
+    uint32_t* outPaletteMaxFrameTag = nullptr) {
+  auto markSource = [&](War3SemanticPaletteSource source) {
+    if (outPaletteSource != nullptr)
+      *outPaletteSource = source;
+  };
+  markSource(War3SemanticPaletteSource::None);
   outPalette.clear();
   outMaxVertexGroupSlot = 0u;
   outHash = 0u;
@@ -1038,7 +3130,13 @@ bool War3TryBuildLiveRuntimeGroupPalette(
     *outRawPoseHash = 0u;
   if (outPoseRuntimeModelPtr != nullptr)
     *outPoseRuntimeModelPtr = nullptr;
-  if (runtimeModelPtr == nullptr)
+  if (outPaletteSlotIndex != nullptr)
+    *outPaletteSlotIndex = 0xFFFFFFFFu;
+  if (outPaletteMinFrameTag != nullptr)
+    *outPaletteMinFrameTag = 0u;
+  if (outPaletteMaxFrameTag != nullptr)
+    *outPaletteMaxFrameTag = 0u;
+  if (runtimeModelPtr == nullptr && renderablePart == nullptr)
     return false;
   const auto& vertexGroups = resource.vertexGroupIndexVec();
   const auto& matrixGroupSizes = resource.matrixGroupSizeVec();
@@ -1046,21 +3144,174 @@ bool War3TryBuildLiveRuntimeGroupPalette(
   if (vertexGroups.empty())
     return false;
 
+  for (const uint8_t groupSlot : vertexGroups)
+    outMaxVertexGroupSlot =
+        std::max(outMaxVertexGroupSlot, uint32_t(groupSlot));
+  const uint32_t requiredPaletteCount = outMaxVertexGroupSlot + 1u;
+  if (requiredPaletteCount == 0u || requiredPaletteCount > 256u)
+    return false;
+
+  auto resolvePaletteSlotIndex = [&](void* partPtr) -> uint32_t {
+    if (partPtr == nullptr)
+      return 0xFFFFFFFFu;
+
+    struct PaletteSlotCacheEntry {
+      void* renderablePart = nullptr;
+      uint32_t paletteSlotIndex = 0xFFFFFFFFu;
+      uint64_t lastSeenFrameSerial = 0u;
+    };
+
+    static constexpr size_t kMaxPaletteSlotCacheEntries = 4096u;
+    static thread_local std::array<PaletteSlotCacheEntry,
+                                   kMaxPaletteSlotCacheEntries>
+        s_paletteSlotCache = {};
+    static thread_local size_t s_paletteSlotCacheCursor = 0u;
+
+    uint32_t currentSlotIndex = 0xFFFFFFFFu;
+    dxvk::war3::SafeReadU32Fast(
+        partPtr, dxvk::war3::RenderablePartFieldOffsets::StagePresetSpanBaseIndex,
+        currentSlotIndex);
+
+    auto queryProducerBindingSlot = [&]() -> uint32_t {
+      uint32_t boundSlotIndex = 0xFFFFFFFFu;
+      uint32_t boundGroupCount = 0u;
+      uint32_t boundFrameTag = 0u;
+      if (dxvk::war3::model::QueryRenderablePartPaletteSlot(
+              partPtr, boundSlotIndex, &boundGroupCount, &boundFrameTag) &&
+          boundSlotIndex != 0xFFFFFFFFu && boundSlotIndex < 0x3A98u) {
+        return boundSlotIndex;
+      }
+      return 0xFFFFFFFFu;
+    };
+
+    for (auto& entry : s_paletteSlotCache) {
+      if (entry.renderablePart != partPtr)
+        continue;
+      entry.lastSeenFrameSerial = frameSerial;
+      if (currentSlotIndex != 0xFFFFFFFFu && currentSlotIndex < 0x3A98u) {
+        entry.paletteSlotIndex = currentSlotIndex;
+        return currentSlotIndex;
+      }
+      const uint32_t producerSlotIndex = queryProducerBindingSlot();
+      if (producerSlotIndex != 0xFFFFFFFFu) {
+        entry.paletteSlotIndex = producerSlotIndex;
+        return producerSlotIndex;
+      }
+      return entry.paletteSlotIndex;
+    }
+
+    if (currentSlotIndex == 0xFFFFFFFFu || currentSlotIndex >= 0x3A98u) {
+      const uint32_t producerSlotIndex = queryProducerBindingSlot();
+      if (producerSlotIndex == 0xFFFFFFFFu)
+        return currentSlotIndex;
+      currentSlotIndex = producerSlotIndex;
+    }
+
+    auto& entry =
+        s_paletteSlotCache[s_paletteSlotCacheCursor++ %
+                           kMaxPaletteSlotCacheEntries];
+    entry.renderablePart = partPtr;
+    entry.paletteSlotIndex = currentSlotIndex;
+    entry.lastSeenFrameSerial = frameSerial;
+    return currentSlotIndex;
+  };
+
   // 首选：从 Hook_RuntimeMatrixWrite 当场捕获的混合调色板读取
   if (renderablePart != nullptr) {
-    uint32_t slotIndex = 0xFFFFFFFF;
-    if (dxvk::war3::SafeReadU32Fast(renderablePart,
-            dxvk::war3::RenderablePartFieldOffsets::StagePresetSpanBaseIndex,
-            slotIndex) &&
-        slotIndex != 0xFFFFFFFF && slotIndex < 0x3A98) {
+    const uint32_t slotIndex = resolvePaletteSlotIndex(renderablePart);
+    if (outPaletteSlotIndex != nullptr && slotIndex != 0xFFFFFFFFu)
+      *outPaletteSlotIndex = slotIndex;
+    if (slotIndex != 0xFFFFFFFFu && slotIndex < 0x3A98u) {
+      uint32_t slotMinFrameTag = 0u;
+      uint32_t slotMaxFrameTag = 0u;
+      uint32_t slotMissingCount = 0u;
+      const bool slotFrameTagReady =
+          dxvk::war3::model::QueryBlendedPaletteFrameTagRange(
+              slotIndex, requiredPaletteCount, slotMinFrameTag,
+              slotMaxFrameTag, slotMissingCount);
+      auto publishSlotFrameTags = [&]() {
+        if (!slotFrameTagReady)
+          return;
+        if (outPaletteMinFrameTag != nullptr)
+          *outPaletteMinFrameTag = slotMinFrameTag;
+        if (outPaletteMaxFrameTag != nullptr)
+          *outPaletteMaxFrameTag = slotMaxFrameTag;
+      };
+      // Phase 7.46：优先消费 0x12FED0/0x12FF90 producer hook 按
+      // renderablePart 记录的完整 palette snapshot。相比重新按 slot 读
+      // Game.dll 全局 palette，这条路径和主模型 renderablePart 的 writer
+      // 绑定更紧，能规避 slot 复用/相位差造成的 stale bytes。
+      uint64_t producerPartPaletteHash = 0u;
+      uint32_t producerPartFrameTag = 0u;
+      if (dxvk::war3::model::QueryRenderablePartPaletteSnapshot(
+              renderablePart, requiredPaletteCount, &outPalette,
+              &producerPartPaletteHash, &producerPartFrameTag) &&
+          !outPalette.empty()) {
+        outHash = producerPartPaletteHash != 0u
+                      ? producerPartPaletteHash
+                      : War3SemanticHashMatrixPalette(
+                            outPalette.data(), uint32_t(outPalette.size()));
+        if (outRawPoseHash != nullptr)
+          *outRawPoseHash = outHash;
+        if (outPoseRuntimeModelPtr != nullptr)
+          *outPoseRuntimeModelPtr = runtimeModelPtr;
+        if (producerPartFrameTag != 0u) {
+          if (outPaletteMinFrameTag != nullptr)
+            *outPaletteMinFrameTag = producerPartFrameTag;
+          if (outPaletteMaxFrameTag != nullptr)
+            *outPaletteMaxFrameTag = producerPartFrameTag;
+        } else {
+          publishSlotFrameTags();
+        }
+        markSource(War3SemanticPaletteSource::SubmitTimeBlendedPaletteCache);
+        return true;
+      }
+      // 与 2026-05-03 的动态阴影修复路线保持一致：优先直接读取引擎的
+      // group-blended 调色板缓冲区，而不是继续依赖较晚阶段的 pose 重建。
+      const uintptr_t gameDllBase =
+          reinterpret_cast<uintptr_t>(::GetModuleHandleA("Game.dll"));
+      if (gameDllBase != 0u) {
+        void* globalPaletteBufferPtr = nullptr;
+        if (dxvk::war3::SafeReadPtrFast(
+                reinterpret_cast<const void*>(gameDllBase + 0xBC6BD0u), 0u,
+                globalPaletteBufferPtr) &&
+            globalPaletteBufferPtr != nullptr) {
+          const auto* enginePalette = reinterpret_cast<const uint8_t*>(
+              reinterpret_cast<uintptr_t>(globalPaletteBufferPtr) +
+              size_t(slotIndex) * 48u);
+          const size_t requiredBytes = size_t(requiredPaletteCount) * 48u;
+          if (dxvk::war3::IsReadableRange(enginePalette, requiredBytes)) {
+            outPalette.resize(requiredPaletteCount);
+            for (uint32_t i = 0u; i < requiredPaletteCount; ++i) {
+              outPalette[i] =
+                  War3DecodeRuntimePoseMatrix48(enginePalette + size_t(i) * 48u);
+            }
+            outHash = War3SemanticHashMatrixPalette(outPalette.data(),
+                                                    requiredPaletteCount);
+            if (outRawPoseHash != nullptr)
+              *outRawPoseHash = outHash;
+            if (outPoseRuntimeModelPtr != nullptr)
+              *outPoseRuntimeModelPtr = runtimeModelPtr;
+            publishSlotFrameTags();
+            markSource(War3SemanticPaletteSource::SubmitTimeGlobalSlot);
+            return true;
+          }
+        }
+      }
+
       uint32_t capturedCount = 0u;
       if (dxvk::war3::model::QueryBlendedPaletteBySlotIndex(
               slotIndex, &outPalette, capturedCount) &&
-          capturedCount > 0u && capturedCount <= 256u) {
-        outMaxVertexGroupSlot = capturedCount - 1u;
-        outHash = War3SemanticHashMatrixPalette(outPalette.data(), capturedCount);
+          capturedCount >= requiredPaletteCount && capturedCount <= 256u &&
+          outPalette.size() >= requiredPaletteCount) {
+        if (outPalette.size() > requiredPaletteCount)
+          outPalette.resize(requiredPaletteCount);
+        outHash = War3SemanticHashMatrixPalette(outPalette.data(),
+                                                requiredPaletteCount);
         if (outRawPoseHash) *outRawPoseHash = outHash;
         if (outPoseRuntimeModelPtr) *outPoseRuntimeModelPtr = runtimeModelPtr;
+        publishSlotFrameTags();
+        markSource(War3SemanticPaletteSource::SubmitTimeBlendedPaletteCache);
         return true;
       }
     }
@@ -1113,6 +3364,19 @@ bool War3TryBuildLiveRuntimeGroupPalette(
             reinterpret_cast<void*>(runtimeValue - kCModelComplexExtensionOffset));
     }
   }
+  // Phase 7.51：前 3 次 tryUsePublishedPose 用的是 caller 传进来的 runtimeModelPtr
+  // 及其 +/-0xA0 偏移；但 PoseRegistry 的真实 key 是 producer hook (0x12FED0) 的
+  // this 参数。两者在 1.27a 上经常不一致（alias、bucket 偏移）。这里直接用
+  // renderablePart 反查 producer 侧的 runtimeModel，这才是 PoseRegistry 的原始 key。
+  if (!usingPublishedPose && renderablePart != nullptr) {
+    void* producerOwnerRuntimeModel = nullptr;
+    if (dxvk::war3::model::QueryRenderablePartOwnerRuntimeModel(
+            renderablePart, &producerOwnerRuntimeModel) &&
+        producerOwnerRuntimeModel != nullptr &&
+        producerOwnerRuntimeModel != runtimeModelPtr) {
+      usingPublishedPose = tryUsePublishedPose(producerOwnerRuntimeModel);
+    }
+  }
   if (!usingPublishedPose) {
     poseRuntimeModelPtr = War3ResolveLivePoseRuntimeAlias(
         runtimeModelPtr, poseCount, poseArrayPtr);
@@ -1138,7 +3402,8 @@ bool War3TryBuildLiveRuntimeGroupPalette(
   }
   if (poseRuntimeModelPtr == nullptr)
     return false;
-  if (!usingPublishedPose && !War3SemanticLivePaletteAllowCModelFallbackRuntime())
+  if (!usingPublishedPose && !allowCModelFallbackForCall &&
+      !War3SemanticLivePaletteAllowCModelFallbackRuntime())
     return false;
   if (outPoseRuntimeModelPtr != nullptr)
     *outPoseRuntimeModelPtr = poseRuntimeModelPtr;
@@ -1178,8 +3443,6 @@ bool War3TryBuildLiveRuntimeGroupPalette(
   uint32_t uniqueGroupSlotCount = 0u;
   std::array<bool, 256> seenGroupSlots = {};
   for (const uint8_t groupSlot : vertexGroups) {
-    outMaxVertexGroupSlot =
-        std::max(outMaxVertexGroupSlot, uint32_t(groupSlot));
     if (!seenGroupSlots[groupSlot]) {
       seenGroupSlots[groupSlot] = true;
       uniqueGroupSlots[uniqueGroupSlotCount++] = groupSlot;
@@ -1293,6 +3556,12 @@ bool War3TryBuildLiveRuntimeGroupPalette(
       if (valid && !outPalette.empty()) {
         outHash = War3SemanticHashMatrixPalette(outPalette.data(),
                                                 uint32_t(outPalette.size()));
+        // Phase 7.28：标注 palette 来源。walk-through 分支同样依赖
+        // decodePoseMatrix 返回的 s_posePalette 内容，实际来源取决于上方
+        // tryUsePublishedPose 的结果。
+        markSource(usingPublishedPose
+                       ? War3SemanticPaletteSource::SubmitTimePublishedPoseRegistry
+                       : War3SemanticPaletteSource::SubmitTimeCModelFallback);
         return true;
       }
     }
@@ -1306,6 +3575,11 @@ bool War3TryBuildLiveRuntimeGroupPalette(
     return false;
   outHash = War3SemanticHashMatrixPalette(outPalette.data(),
                                           uint32_t(outPalette.size()));
+  // Phase 7.28：fallback 分支（matrix remap / pose palette / uniform pose）同样
+  // 消费的是 s_posePalette。来源判定沿用上方 tryUsePublishedPose 结果。
+  markSource(usingPublishedPose
+                 ? War3SemanticPaletteSource::SubmitTimePublishedPoseRegistry
+                 : War3SemanticPaletteSource::SubmitTimeCModelFallback);
   return true;
 }
 
@@ -1687,10 +3961,13 @@ bool War3PublishSemanticSceneBypassCandidate(
   auto& visibleRegistry =
       dxvk::war3::render::VisibleRenderableRegistry::instance();
   const bool registered = visibleRegistry.registerSemanticCandidate(record);
-  if (registered &&
-      War3SemanticDataModuleEnabled() &&
-      War3SemanticContractCaptureEnabled() &&
-      !dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled()) {
+  const bool wantsSceneBypassCapture =
+      !dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() ||
+      dxvk::war3::internal::
+          IsSemanticSceneDisableLegacyShadowCaptureRuntimeEnabled();
+  if (registered && War3SemanticDataModuleEnabled() &&
+      War3SemanticContractCaptureEnabled() && wantsSceneBypassCapture) {
+    War3PublishSemanticRegistriesForScene();
     const uint64_t frameNumber = visibleRegistry.getFrameNumber();
     const uint64_t visibleCount =
         static_cast<uint64_t>(visibleRegistry.getVisibleCount());
@@ -2577,6 +4854,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::Present(const RECT *pSourceRect,
                                                 const RECT *pDestRect,
                                                 HWND hDestWindowOverride,
                                                 const RGNDATA *pDirtyRegion) {
+  War3MaybeInsertBeforeUi(true);
   War3ResetShadowAllocator();
 
   // War3: 增加帧计数
@@ -3659,6 +5937,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetRenderTargetInternal(
       m_dirty.set(D3D9DeviceDirtyFlag::PointScale);
       m_dirty.set(D3D9DeviceDirtyFlag::ViewportScissor);
       m_state.viewport = viewport;
+      War3RenderState::SetCurrentViewport(viewport.X, viewport.Y,
+                                          viewport.Width, viewport.Height);
     }
 
     if (m_state.scissorRect != scissorRect) {
@@ -4071,6 +6351,9 @@ D3D9DeviceEx::SetViewport(const D3DVIEWPORT9 *pViewport) {
 
   if (unlikely(ShouldRecord()))
     return m_recorder->SetViewport(pViewport);
+
+  War3RenderState::SetCurrentViewport(pViewport->X, pViewport->Y,
+                                      pViewport->Width, pViewport->Height);
 
   if (m_state.viewport == *pViewport)
     return D3D_OK;
@@ -5227,7 +7510,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitive(
   return D3D_OK;
 }
 
-void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
+void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   if (!m_war3Pipeline)
     return;
 
@@ -5747,6 +8030,10 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
     uiBoundaryTier = 8u;
     m_war3Scene.shadowStats.semanticSceneTailBoundaryCandidateCount++;
   }
+  if (forceFrameEnd && uiBoundaryTier == 0u && inWorldThisFrame &&
+      haveWorldInput && !m_war3Pipeline->HasInsertedBeforeUi()) {
+    uiBoundaryTier = 9u;
+  }
 
   isUiBoundaryDraw = (uiBoundaryTier != 0u);
 
@@ -5855,7 +8142,11 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
     }
   }
 
-  if (!m_war3Pipeline->NotifyDraw(layer, cat, tag, isUiBoundaryDraw))
+  const bool shouldInsertBeforeUi =
+      forceFrameEnd
+          ? (isUiBoundaryDraw && m_war3Pipeline->ForceBeforeUiInsertion())
+          : m_war3Pipeline->NotifyDraw(layer, cat, tag, isUiBoundaryDraw);
+  if (!shouldInsertBeforeUi)
     return;
   if (uiBoundaryTier == 8u)
     m_war3Scene.shadowStats.semanticSceneTailBoundaryCommitCount++;
@@ -5899,6 +8190,7 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
     War3TryPopulateSemanticShadowScene(
         dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly);
   }
+  War3UpdateSemanticReplayInputDiagnostics(m_war3Scene);
   dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
 
   static uint32_t s_casterDiag = 0;
@@ -5975,6 +8267,162 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi() {
           "War3Pipeline/BeforeUi/Execute");
       // Execute shadow pass if enabled
       m_war3Pipeline->Execute(War3InsertionPoint::BeforeUi, cmd, cInput);
+      if (m_shadowReceiverPass != nullptr) {
+        const auto& rec = m_shadowReceiverPass->reconciliation;
+        cInput.scene.shadowStats.semanticSceneShadowCastersCount =
+            rec.shadowCastersCount;
+        cInput.scene.shadowStats.semanticSceneReplayDrawsCount =
+            rec.replayDrawsCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapDrawnCasters =
+            rec.shadowMapDrawnCasters;
+        cInput.scene.shadowStats.semanticSceneShadowMapCascadeCulledCount =
+            rec.cascadeCulledCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapSkinnedCasterCount =
+            rec.skinnedCasterCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapSkinnedPreparedCount =
+            rec.skinnedPreparedCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapSkinnedInvalidBufferCount =
+            rec.skinnedInvalidBufferCount;
+        cInput.scene.shadowStats
+            .semanticSceneShadowMapSkinnedInvalidPipelineCount =
+            rec.skinnedInvalidPipelineCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapSkinnedDrawnCount =
+            rec.skinnedDrawnCount;
+        cInput.scene.shadowStats.semanticSceneShadowTaaActive =
+            rec.shadowTaaActive;
+        cInput.scene.shadowStats.semanticSceneReceiverReuseShadowMap =
+            rec.receiverReuseShadowMap;
+        cInput.scene.shadowStats.semanticSceneReceiverInputValid =
+            rec.receiverInputValid;
+        cInput.scene.shadowStats.semanticSceneReceiverInputRejectReason =
+            rec.receiverInputRejectReason;
+        cInput.scene.shadowStats.semanticSceneReceiverNeedPass =
+            rec.receiverNeedPass;
+        cInput.scene.shadowStats.semanticSceneReceiverNeedShadowMap =
+            rec.receiverNeedShadowMap;
+        cInput.scene.shadowStats.semanticSceneReceiverHasCompleteShadowMap =
+            rec.receiverHasCompleteShadowMap;
+        cInput.scene.shadowStats
+            .semanticSceneReceiverHasUsableDirectionalShadow =
+            rec.receiverHasUsableDirectionalShadow;
+        cInput.scene.shadowStats.semanticSceneReceiverActiveStrengthMilli =
+            rec.receiverActiveStrengthMilli;
+        cInput.scene.shadowStats.semanticSceneReceiverUboStrengthMilli =
+            rec.receiverUboStrengthMilli;
+        cInput.scene.shadowStats.semanticSceneReceiverDebugMode =
+            rec.receiverDebugMode;
+        cInput.scene.shadowStats.semanticSceneReceiverCsmCascadeCount =
+            rec.receiverCsmCascadeCount;
+        cInput.scene.shadowStats.semanticSceneReceiverRunEntryFlags =
+            rec.receiverRunEntryFlags;
+        cInput.scene.shadowStats.semanticSceneReceiverRunEarlyReturnReason =
+            rec.receiverRunEarlyReturnReason;
+        cInput.scene.shadowStats.semanticSceneShadowMapExecutedThisFrame =
+            rec.shadowMapExecutedThisFrame;
+        cInput.scene.shadowStats.semanticSceneReceiverSettingsShadowsEnabled =
+            rec.receiverSettingsShadowsEnabled;
+        cInput.scene.shadowStats.semanticSceneReceiverSettingsOutlineEnabled =
+            rec.receiverSettingsOutlineEnabled;
+        cInput.scene.shadowStats.semanticSceneReceiverSettingsRawStrengthMilli =
+            rec.receiverSettingsRawStrengthMilli;
+        cInput.scene.shadowStats
+            .semanticSceneReceiverComputedShadowStrengthMilli =
+            rec.receiverComputedShadowStrengthMilli;
+        cInput.scene.shadowStats.semanticSceneReceiverHasSunShadow =
+            rec.receiverHasSunShadow;
+        cInput.scene.shadowStats.semanticSceneReceiverHasPointShadow =
+            rec.receiverHasPointShadow;
+        cInput.scene.shadowStats.semanticSceneReceiverNeedOutlinePass =
+            rec.receiverNeedOutlinePass;
+        cInput.scene.shadowStats.semanticSceneReceiverZeroStrengthFrameCount =
+            rec.receiverZeroStrengthFrameCount;
+        cInput.scene.shadowStats.semanticSceneReceiverDrawnWithZeroStrengthCount =
+            rec.receiverDrawnWithZeroStrengthCount;
+        cInput.scene.shadowStats.semanticSceneReceiverNoCompleteShadowMapCount =
+            rec.receiverNoCompleteShadowMapCount;
+        cInput.scene.shadowStats.semanticSceneReceiverNoShadowMapImageCount =
+            rec.receiverNoShadowMapImageCount;
+        cInput.scene.shadowStats
+            .semanticSceneReceiverNoShadowMapSampleViewCount =
+            rec.receiverNoShadowMapSampleViewCount;
+        cInput.scene.shadowStats.semanticSceneReceiverNoCandidateCsmCount =
+            rec.receiverNoCandidateCsmCount;
+        cInput.scene.shadowStats
+            .semanticSceneReceiverCsmFallbackToLastGoodCount =
+            rec.receiverCsmFallbackToLastGoodCount;
+        cInput.scene.shadowStats.semanticSceneReceiverHoldInvalidCsmCount =
+            rec.receiverHoldInvalidCsmCount;
+        cInput.scene.shadowStats.semanticSceneReceiverHoldEmptyReplayCount =
+            rec.receiverHoldEmptyReplayCount;
+        cInput.scene.shadowStats.semanticSceneReceiverHoldIdentityChurnCount =
+            rec.receiverHoldIdentityChurnCount;
+        cInput.scene.shadowStats
+            .semanticSceneReceiverReuseInvalidatedAfterEnsureCount =
+            rec.receiverReuseInvalidatedAfterEnsureCount;
+        cInput.scene.shadowStats
+            .semanticSceneShadowMapRenderSkippedNoResourcesCount =
+            rec.shadowMapRenderSkippedNoResourcesCount;
+        cInput.scene.shadowStats
+            .semanticSceneShadowMapRenderSkippedNoMatrixBufferCount =
+            rec.shadowMapRenderSkippedNoMatrixBufferCount;
+        cInput.scene.shadowStats.semanticSceneReceiverViewportX =
+            rec.receiverViewportX;
+        cInput.scene.shadowStats.semanticSceneReceiverViewportY =
+            rec.receiverViewportY;
+        cInput.scene.shadowStats.semanticSceneReceiverViewportWidth =
+            rec.receiverViewportWidth;
+        cInput.scene.shadowStats.semanticSceneReceiverViewportHeight =
+            rec.receiverViewportHeight;
+        cInput.scene.shadowStats.semanticSceneShadowMatrixSceneKey =
+            rec.shadowMatrixSceneKey;
+        cInput.scene.shadowStats.semanticSceneShadowMatrixUploadSerial =
+            rec.shadowMatrixUploadSerial;
+        cInput.scene.shadowStats.semanticSceneShadowMatrixBufferObjectPtr =
+            rec.shadowMatrixBufferObjectPtr;
+        cInput.scene.shadowStats.semanticSceneShadowMatrixBufferOffset =
+            rec.shadowMatrixBufferOffset;
+        cInput.scene.shadowStats.semanticSceneShadowMatrixBufferSize =
+            rec.shadowMatrixBufferSize;
+        cInput.scene.shadowStats.semanticSceneShadowMatrixBufferGpuAddress =
+            rec.shadowMatrixBufferGpuAddress;
+        cInput.scene.shadowStats.semanticSceneShadowMapRenderSerial =
+            rec.shadowMapRenderSerial;
+        cInput.scene.shadowStats.semanticSceneShadowMapImagePtr =
+            rec.shadowMapImagePtr;
+        cInput.scene.shadowStats.semanticSceneShadowMapSampleViewPtr =
+            rec.shadowMapSampleViewPtr;
+        cInput.scene.shadowStats.semanticSceneShadowCurrentImagePtr =
+            rec.shadowCurrentImagePtr;
+        cInput.scene.shadowStats.semanticSceneShadowCurrentViewPtr =
+            rec.shadowCurrentViewPtr;
+        cInput.scene.shadowStats.semanticSceneShadowHistoryReadImagePtr =
+            rec.shadowHistoryReadImagePtr;
+        cInput.scene.shadowStats.semanticSceneShadowHistoryReadViewPtr =
+            rec.shadowHistoryReadViewPtr;
+        cInput.scene.shadowStats.semanticSceneShadowHistoryWriteImagePtr =
+            rec.shadowHistoryWriteImagePtr;
+        cInput.scene.shadowStats.semanticSceneShadowHistoryWriteViewPtr =
+            rec.shadowHistoryWriteViewPtr;
+        cInput.scene.shadowStats.semanticSceneShadowVisibilityExecutedThisFrame =
+            rec.shadowVisibilityExecutedThisFrame;
+        cInput.scene.shadowStats.semanticSceneReceiverDrawExecutedThisFrame =
+            rec.receiverDrawExecutedThisFrame;
+        cInput.scene.shadowStats.semanticSceneShadowTaaMode =
+            rec.shadowTaaMode;
+        cInput.scene.shadowStats.semanticSceneShadowHistoryValidBefore =
+            rec.shadowHistoryValidBefore;
+        cInput.scene.shadowStats.semanticSceneShadowHistoryValidAfter =
+            rec.shadowHistoryValidAfter;
+        cInput.scene.shadowStats.semanticSceneShadowHistoryReadIndex =
+            rec.shadowHistoryReadIndex;
+        cInput.scene.shadowStats.semanticSceneShadowHistoryWriteIndex =
+            rec.shadowHistoryWriteIndex;
+        cInput.scene.shadowStats.semanticSceneShadowReceiverSampleSource =
+            rec.shadowReceiverSampleSource;
+        dxvk::war3::render::NoteShadowSceneStats(cInput.scene.shadowStats);
+        dxvk::war3::render::NoteShadowFrameCadenceSample(
+            uint64_t(cInput.frameIndex), cInput.scene.shadowStats);
+      }
     }
   });
 
@@ -6058,6 +8506,7 @@ void D3D9DeviceEx::War3RecordWorldCamera() {
   cam.invViewProj = inverse(cam.viewProj);
   cam.viewport = m_state.viewport;
   cam.scissor = m_state.scissorRect;
+  cam.frameIndex = m_war3FrameIndex;
   // 仅在“可解析的透视投影”下认为相机有效（CSM 依赖 near/far 与透视 frustum）。
   // 允许 m23 = ±1：兼容 LH/RH 的常见投影形式。
   const float m23 = cam.proj[2][3];
@@ -6227,14 +8676,21 @@ uint32_t D3D9DeviceEx::War3GetOrCreateSemanticShadowPalette(
   const bool directGeosetUnitPalette =
       War3SemanticPacketUsesDirectGeosetData(packet) &&
       War3IsSemanticUnitObject(resolvedObjectKind);
-  if (directGeosetUnitPalette && packet.pose.hasWorldTransform &&
-      War3SemanticPaletteLooksModelLocal(sourceMatrices, matrixCount,
-                                         packet.pose.worldTransform,
-                                         static_cast<uint8_t>(
-                                             resolvedObjectKind),
-                                         false)) {
-    composeWorldPalette = true;
-    worldHash = War3SemanticHashMatrix4(packet.pose.worldTransform);
+  if (directGeosetUnitPalette && packet.pose.hasWorldTransform) {
+    const bool looksModelLocal = War3SemanticPaletteLooksModelLocal(
+        sourceMatrices, matrixCount, packet.pose.worldTransform,
+        static_cast<uint8_t>(resolvedObjectKind), false);
+    if (hasOverridePalette) {
+      m_war3Scene.shadowStats.semanticScenePaletteOverrideNoComposeCount++;
+      if (looksModelLocal) {
+        m_war3Scene.shadowStats
+            .semanticScenePaletteOverrideWouldComposeCount++;
+      }
+    } else if (looksModelLocal) {
+      composeWorldPalette = true;
+      worldHash = War3SemanticHashMatrix4(packet.pose.worldTransform);
+      m_war3Scene.shadowStats.semanticScenePalettePacketWorldComposeCount++;
+    }
   }
 
   uint64_t matrixHash =
@@ -6598,6 +9054,14 @@ bool D3D9DeviceEx::War3TryPublishSemanticDrawTimePose() {
       semantic.runtimeModelPtr, semantic.sceneNode, unitPtr, palette.data(),
       uint32_t(palette.size()));
   m_war3Scene.shadowStats.semanticSceneDrawTimePosePublishedCount++;
+  // Phase 7.55：累积 draw-time D3D palette hash 到 per-frame 聚合值。
+  if (m_war3Scene.shadowStats.semanticSceneDrawTimePoseCombinedHash == 0u)
+    m_war3Scene.shadowStats.semanticSceneDrawTimePoseCombinedHash = hash;
+  else
+    m_war3Scene.shadowStats.semanticSceneDrawTimePoseCombinedHash =
+        bit::fnv1a_iter(
+            m_war3Scene.shadowStats.semanticSceneDrawTimePoseCombinedHash, hash);
+  m_war3Scene.shadowStats.semanticSceneDrawTimePoseCombinedSampleCount++;
   War3NoteDrawTimePoseMotion(m_war3Scene.shadowStats, semantic.runtimeModelPtr,
                              frameSerial, hash);
   m_war3SemanticDrawTimePoseDirtyFrameSerial = frameSerial;
@@ -6888,6 +9352,22 @@ bool D3D9DeviceEx::War3FindOrCreateShadowPersistentGeometry(
 
 bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     const dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  return War3TryAppendSemanticShadowPacket(packet, nullptr, false);
+}
+
+bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    const dxvk::war3::render::CurrentDrawAuthoritativeSample*
+        directCurrentDrawSample) {
+  return War3TryAppendSemanticShadowPacket(packet, directCurrentDrawSample,
+                                           false);
+}
+
+bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    const dxvk::war3::render::CurrentDrawAuthoritativeSample*
+        directCurrentDrawSample,
+    bool fromStalePoseRestore) {
   auto toVkTopology = [](dxvk::war3::shadow::ShadowPrimitiveTopology topology) {
     switch (topology) {
     case dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleStrip:
@@ -6906,9 +9386,6 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
 
   const auto& packetPositions = packet.resource.positionVec();
   const auto& packetIndices = packet.resource.indexVec();
-  const auto& packetVertexGroups = packet.resource.vertexGroupIndexVec();
-  const auto& packetBlendWeights = packet.resource.vertexBlendWeightVec();
-  const auto& packetBlendIndices = packet.resource.vertexBlendIndexVec();
   const auto ownedDynamicIndices = packet.resource.ownedDynamicIndices;
   const bool hasOwnedDynamicIndexStream =
       ownedDynamicIndices != nullptr && !ownedDynamicIndices->empty();
@@ -6954,6 +9431,10 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
 
   const bool skinned =
       packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned;
+  const bool directAuthoritativeCurrentDrawReady =
+      directCurrentDrawSample != nullptr &&
+      directCurrentDrawSample->status ==
+          dxvk::war3::render::CurrentDrawResolveStatus::Ready;
   const bool useIndices = hasDynamicIndexStream || !packetIndices.empty();
   if constexpr (dxvk::war3::internal::
                     kShadowSemanticCoreSceneRequireVisibleIndexSliceForSkinned) {
@@ -6965,10 +9446,16 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         War3SemanticPacketUsesDirectGeosetData(packet) &&
         packet.resource.primitiveRecordCount <= 1u &&
         War3HasSemanticDynamicUnitEvidence(packet);
+    const bool allowDirectAuthoritativeCurrentDrawFullIndex =
+        directAuthoritativeCurrentDrawReady &&
+        War3SemanticPacketUsesDirectGeosetData(packet) &&
+        packet.hasRuntimeGroupPalette &&
+        packet.resource.ownedVertexGroupIndices.size() >= size_t(vertexCount);
     if (skinned && hasLiveVisibleMeshContext && !hasDynamicIndexStream &&
         !packetIndices.empty() &&
         War3SemanticRequireVisibleIndexSliceForSkinnedRuntime() &&
-        !allowCanonicalSinglePrimitiveFullIndex) {
+        !allowCanonicalSinglePrimitiveFullIndex &&
+        !allowDirectAuthoritativeCurrentDrawFullIndex) {
       m_war3Scene.shadowStats
           .semanticSceneSkinnedMissingVisibleIndexSliceRejectCount++;
       return false;
@@ -7021,11 +9508,258 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       effectiveAlphaMode == dxvk::war3::shadow::ShadowAlphaMode::AlphaBlend;
   const float alphaCutoutRef =
       alphaCutoutEnabled ? packet.material.alphaCutoutRef : 0.5f;
+  const auto notePhase5SkinnedContractReject = [&]() {
+    if (effectiveAlphaMode == dxvk::war3::shadow::ShadowAlphaMode::Cutout)
+      m_war3Scene.shadowStats.semanticSceneRejectedCutoutSkinnedContract++;
+    else if (effectiveAlphaMode ==
+             dxvk::war3::shadow::ShadowAlphaMode::AlphaBlend)
+      m_war3Scene.shadowStats.semanticSceneRejectedAlphaBlendSkinnedContract++;
+  };
+  const auto notePhase5GeometryReject = [&]() {
+    if (effectiveAlphaMode == dxvk::war3::shadow::ShadowAlphaMode::Cutout)
+      m_war3Scene.shadowStats.semanticSceneRejectedCutoutGeometry++;
+    else if (effectiveAlphaMode ==
+             dxvk::war3::shadow::ShadowAlphaMode::AlphaBlend)
+      m_war3Scene.shadowStats.semanticSceneRejectedAlphaBlendGeometry++;
+  };
   std::vector<Matrix4> liveRuntimeGroupPalette;
   uint32_t liveMaxVertexGroupSlot = 0u;
   uint64_t liveRuntimeGroupPaletteHash = 0u;
   uint64_t liveRuntimeRawPaletteHash = 0u;
   void* liveRuntimePoseModelPtr = nullptr;
+  const bool packetAuthoritativeSkinnedContractReady =
+      skinned && packet.hasRuntimeGroupPalette &&
+      packet.resource.ownedVertexGroupIndices.size() >= size_t(vertexCount);
+  dxvk::war3::render::CurrentDrawAuthoritativeSample currentDrawSampleStorage =
+      {};
+  const dxvk::war3::render::CurrentDrawAuthoritativeSample*
+      currentDrawSample =
+          directCurrentDrawSample != nullptr ? directCurrentDrawSample : nullptr;
+  const bool directCurrentDrawSampleProvided =
+      directCurrentDrawSample != nullptr;
+  const auto currentDrawResolveStatus =
+      directCurrentDrawSampleProvided && skinned
+          ? currentDrawSample->status
+          : packetAuthoritativeSkinnedContractReady
+          ? dxvk::war3::render::CurrentDrawResolveStatus::Ready
+          : skinned && packet.renderable.renderablePart != nullptr
+          ? dxvk::war3::render::ResolveCurrentDrawAuthoritativeSample(
+                packet.renderable.renderablePart, vertexCount,
+                packet.renderable.frameSerial, currentDrawSampleStorage)
+          : dxvk::war3::render::CurrentDrawResolveStatus::MissingContract;
+  if (!directCurrentDrawSampleProvided &&
+      currentDrawResolveStatus !=
+          dxvk::war3::render::CurrentDrawResolveStatus::MissingContract) {
+    currentDrawSample = &currentDrawSampleStorage;
+  }
+  const auto* authoritativeDrawContract =
+      currentDrawSample != nullptr ? &currentDrawSample->contract : nullptr;
+  const bool authoritativeDrawContractKnown =
+      packetAuthoritativeSkinnedContractReady ||
+      (currentDrawSample != nullptr && currentDrawSample->contractKnown());
+  const std::vector<Matrix4>* drawTimeCapturedPalette =
+      packetAuthoritativeSkinnedContractReady
+          ? &packet.runtimeGroupPalette
+          : currentDrawSample != nullptr ? &currentDrawSample->palette
+                                         : nullptr;
+  uint32_t drawTimeCapturedPaletteCount =
+      packetAuthoritativeSkinnedContractReady
+          ? uint32_t(packet.runtimeGroupPalette.size())
+          : currentDrawSample != nullptr ? currentDrawSample->paletteCount : 0u;
+  uint64_t drawTimeCapturedPaletteHash =
+      packetAuthoritativeSkinnedContractReady
+          ? (packet.runtimeGroupPaletteHash != 0u
+                 ? packet.runtimeGroupPaletteHash
+                 : War3SemanticHashMatrixPalette(packet.runtimeGroupPalette.data(),
+                                                 uint32_t(packet.runtimeGroupPalette.size())))
+          : currentDrawSample != nullptr ? currentDrawSample->paletteHash : 0u;
+  bool drawTimeCapturedPaletteReady =
+      packetAuthoritativeSkinnedContractReady
+          ? !packet.runtimeGroupPalette.empty()
+          : currentDrawSample != nullptr && currentDrawSample->paletteReady();
+  uint32_t drawTimeCapturedPaletteSlotIndex =
+      packetAuthoritativeSkinnedContractReady
+          ? packet.runtimeGroupPaletteSlotIndex
+          : currentDrawSample != nullptr
+                ? currentDrawSample->contract.paletteSlotIndex
+                : 0xFFFFFFFFu;
+  uint32_t drawTimeCapturedPaletteMinFrameTag =
+      packetAuthoritativeSkinnedContractReady
+          ? packet.runtimeGroupPaletteMinFrameTag
+          : currentDrawSample != nullptr ? currentDrawSample->contract.frameTag
+                                         : 0u;
+  uint32_t drawTimeCapturedPaletteMaxFrameTag =
+      packetAuthoritativeSkinnedContractReady
+          ? packet.runtimeGroupPaletteMaxFrameTag
+          : currentDrawSample != nullptr ? currentDrawSample->contract.frameTag
+                                         : 0u;
+  // Phase 7.35 路径 2：submit 端 live palette rebuild。
+  // 背景：Phase 7.35 诊断 counter 证实 50.2% 的 submit 在用 >=1 帧旧的 palette
+  // （Lag>=1），其中 Lag>=3 占 38.2%，视觉上对应"Pose 停一下再追帧"。
+  // 根因：当 `drawTimeCapturedPalette` 指向的 currentDrawSample 来自几帧前的
+  // capture（record.renderFrameIndex << currentFrame），submit 就沿用了旧 palette，
+  // 和 capture 是否 hit 无关，纯粹是 manifest/lease TTL 的副作用。
+  // 修复：检测 lag >= 阈值时，用 `War3TryBuildLiveRuntimeGroupPalette` 从
+  // PoseRegistry（即 0x12FDC0 CModel_CopyPoseMatrixRangeFromStack 的 publish
+  // 目标）重建 fresh palette。成功则覆盖 drawTimeCapturedPalette 指针，让下游
+  // canonicalItem / effectiveRuntimeGroupPalette 直接用 live 数据。
+  // 失败（PoseRegistry miss）→ 沿用原 palette，不退化。
+  //
+  // lifetime：`submitLiveRebuildScratchTls` 必须活到 canonicalItem build 完成，
+  // 放在外层 scope；BuildCanonicalShadowDrawItem 只读 palette 内容做 hash/copy，
+  // 不持有指针。
+  thread_local std::vector<Matrix4> submitLiveRebuildScratchTls;
+  {
+    static const bool kSubmitLiveRebuildOnLag = []() -> bool {
+      char buf[16] = {};
+      const DWORD len = ::GetEnvironmentVariableA(
+          "DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_ON_LAG", buf, sizeof(buf));
+      // 默认开（len==0），显式 "0" 关闭。
+      return len == 0u || buf[0] != '0';
+    }();
+    // Phase 7.38：诊断数据证实 Pose 卡顿根因是 record 帧龄导致的 palette 延迟。
+    // paletteCaptureExactHit=100%，submitLiveRebuild=100% 命中，但 Lag>=3 仍占 36.5%。
+    // 将默认阈值从 3 降到 1：只要 record 不是当前帧就立即用 PoseRegistry 刷新。
+    // 环境变量 DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_LAG_THRESHOLD 可覆盖。
+    static const uint32_t kSubmitLiveRebuildLagThreshold = []() -> uint32_t {
+      char buf[16] = {};
+      const DWORD len = ::GetEnvironmentVariableA(
+          "DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_LAG_THRESHOLD", buf, sizeof(buf));
+      if (len == 0u) return 1u;
+      char* end = nullptr;
+      const unsigned long v = std::strtoul(buf, &end, 0);
+      return (end != buf && v >= 1u) ? uint32_t(v) : 1u;
+    }();
+    // Phase 7.51：skinned 单位每帧无条件尝试 live rebuild，不再只在 lag >= 阈值时触发。
+    // 根因是 Resolve 会被 KeepReadySnapshotOnInvalidCurrentDraw 兜底保留上次 record，
+    // 导致"record 时间上是当前帧但 palette bytes 是旧的"的情况无法被 lag 检测到。
+    // 每帧做一次 rebuild 成本在 Phase 7.49 数据里约 100 次 / 帧，每次 60 字节级矩阵运算，
+    // 对 CPU 压力可忽略；收益是 FROZEN 8 帧段里都能拿到 PoseRegistry 的当前帧 pose。
+    // 若 rebuild hash 和现有 palette hash 不同，覆盖；相同则保持原 palette（避免无意义分配）。
+    static const bool kSubmitLiveRebuildEveryFrame = []() -> bool {
+      char buf[16] = {};
+      const DWORD len = ::GetEnvironmentVariableA(
+          "DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_EVERY_FRAME", buf, sizeof(buf));
+      return len == 0u || buf[0] != '0';
+    }();
+    if (kSubmitLiveRebuildOnLag && skinned && drawTimeCapturedPaletteReady &&
+        currentDrawSample != nullptr && currentDrawSample->contract.known &&
+        currentDrawSample->contract.renderFrameIndex != 0u) {
+      // 注意：此处故意不排除 packetAuthoritativeSkinnedContractReady。
+      // 当 packet.hasRuntimeGroupPalette 为 true 时，packet 的 palette 只是
+      // 更早一帧从 currentDrawSample 复制来的快照，同样会随 lease 长久持有
+      // 变旧。因此 lag 判断与 packet 是否自带 palette 无关。
+      const uint64_t currentFrame = uint64_t(
+          dxvk::war3::state::RenderState::instance().getFrameIndex());
+      const uint64_t recordFrame =
+          uint64_t(currentDrawSample->contract.renderFrameIndex);
+      // Phase 7.51：改为 (EveryFrame OR LagExceedsThreshold)。
+      // EveryFrame=1（默认）时即使 lag=0 也尝试 rebuild，用 hash 对比决定是否覆盖。
+      const bool shouldAttempt =
+          kSubmitLiveRebuildEveryFrame ||
+          (currentFrame > recordFrame &&
+           (currentFrame - recordFrame) >=
+               uint64_t(kSubmitLiveRebuildLagThreshold));
+      if (shouldAttempt) {
+        dxvk::war3::render::NoteSubmitLiveRebuildAttempt();
+        submitLiveRebuildScratchTls.clear();
+        uint32_t rebuildMaxSlot = 0u;
+        uint64_t rebuildHash = 0u;
+        uint64_t rebuildRawHash = 0u;
+        void* rebuildRuntimeModelPtr = nullptr;
+        War3SemanticPaletteSource rebuildSource =
+            War3SemanticPaletteSource::None;
+        uint32_t rebuildSlotIndex = 0xFFFFFFFFu;
+        uint32_t rebuildMinFrameTag = 0u;
+        uint32_t rebuildMaxFrameTag = 0u;
+        const bool rebuildOk = War3TryBuildLiveRuntimeGroupPalette(
+            packet.resource, packet.renderable.runtimeModelPtr,
+            packet.renderable.renderablePart,
+            m_war3ShadowPersistentFrameSerial,
+            submitLiveRebuildScratchTls, rebuildMaxSlot, rebuildHash,
+            &rebuildRawHash, &rebuildRuntimeModelPtr,
+            /*allowCModelFallbackForCall=*/false,
+            &rebuildSource, &rebuildSlotIndex, &rebuildMinFrameTag,
+            &rebuildMaxFrameTag);
+        if (rebuildOk && !submitLiveRebuildScratchTls.empty()) {
+          dxvk::war3::render::NoteSubmitLiveRebuildHit();
+          // 覆盖 drawTimeCapturedPalette 指针 + 计数 + hash + ready。
+          drawTimeCapturedPalette = &submitLiveRebuildScratchTls;
+          drawTimeCapturedPaletteCount =
+              uint32_t(submitLiveRebuildScratchTls.size());
+          drawTimeCapturedPaletteHash =
+              rebuildHash != 0u
+                  ? rebuildHash
+                  : War3SemanticHashMatrixPalette(
+                        submitLiveRebuildScratchTls.data(),
+                        uint32_t(submitLiveRebuildScratchTls.size()));
+          drawTimeCapturedPaletteReady = true;
+          drawTimeCapturedPaletteSlotIndex = rebuildSlotIndex;
+          drawTimeCapturedPaletteMinFrameTag = rebuildMinFrameTag;
+          drawTimeCapturedPaletteMaxFrameTag = rebuildMaxFrameTag;
+          dxvk::war3::render::NoteSubmitLiveRebuildApplied();
+        } else {
+          // PoseRegistry miss：沿用原 palette，行为等同未打开该功能。
+          dxvk::war3::render::NoteSubmitLiveRebuildMiss();
+        }
+      }
+    }
+  }
+  const std::vector<uint8_t>* authoritativeGroupSlots =
+      packetAuthoritativeSkinnedContractReady
+          ? &packet.resource.ownedVertexGroupIndices
+          : currentDrawSample != nullptr ? &currentDrawSample->groupSlots
+                                         : nullptr;
+  const uint64_t authoritativeGroupHash =
+      packetAuthoritativeSkinnedContractReady
+          ? bit::fnv1a_hash(packet.resource.ownedVertexGroupIndices.data(),
+                            packet.resource.ownedVertexGroupIndices.size())
+          : currentDrawSample != nullptr ? currentDrawSample->groupHash : 0u;
+  // Phase 7.2: stable group hash（不含 stream1Ptr），用于 geometry key 稳定身份
+  const uint64_t authoritativeStableGroupHash =
+      currentDrawSample != nullptr && currentDrawSample->stableGroupHash != 0u
+          ? currentDrawSample->stableGroupHash
+          : packetAuthoritativeSkinnedContractReady
+                ? authoritativeGroupHash  // ownedVertexGroupIndices 已不含 stream 指针
+                : 0u;
+  if (skinned) {
+    if (authoritativeDrawContractKnown)
+      m_war3Scene.shadowStats.semanticSceneCurrentDrawContractKnownCount++;
+    if (drawTimeCapturedPaletteReady)
+      m_war3Scene.shadowStats.semanticSceneCurrentDrawPaletteReadyCount++;
+    if (packetAuthoritativeSkinnedContractReady ||
+        (currentDrawSample != nullptr && currentDrawSample->groupSlotsReady()))
+      m_war3Scene.shadowStats.semanticSceneCurrentDrawGroupSlotReadyCount++;
+    switch (currentDrawResolveStatus) {
+    case dxvk::war3::render::CurrentDrawResolveStatus::MissingContract:
+      m_war3Scene.shadowStats.semanticSceneCurrentDrawMissNoContract++;
+      break;
+    case dxvk::war3::render::CurrentDrawResolveStatus::MissingPalette:
+      m_war3Scene.shadowStats.semanticSceneCurrentDrawMissNoPalette++;
+      break;
+    case dxvk::war3::render::CurrentDrawResolveStatus::MissingGroupSlots:
+      m_war3Scene.shadowStats.semanticSceneCurrentDrawMissNoGroupSlots++;
+      break;
+    case dxvk::war3::render::CurrentDrawResolveStatus::StaleVisibleFrame:
+      m_war3Scene.shadowStats.semanticSceneCurrentDrawMissStaleVisibleFrame++;
+      break;
+    case dxvk::war3::render::CurrentDrawResolveStatus::Ready:
+      m_war3Scene.shadowStats.semanticSceneCurrentDrawResolveReadyCount++;
+      break;
+    }
+  }
+  const bool authoritativeGroupSlotsReady =
+      skinned &&
+      (packetAuthoritativeSkinnedContractReady ||
+       (currentDrawSample != nullptr && currentDrawSample->groupSlotsReady())) &&
+      currentDrawResolveStatus !=
+          dxvk::war3::render::CurrentDrawResolveStatus::StaleVisibleFrame &&
+      authoritativeGroupSlots != nullptr &&
+      authoritativeGroupSlots->size() >= size_t(vertexCount);
+  const bool stableAuthoritativeSkinnedGeometryKey =
+      skinned && authoritativeGroupSlotsReady && drawTimeCapturedPaletteReady &&
+      currentDrawResolveStatus ==
+          dxvk::war3::render::CurrentDrawResolveStatus::Ready;
 
   War3ShadowGeometryRegistryKey key = {};
   key.sourceHash = bit::fnv1a_init();
@@ -7037,17 +9771,19 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   key.sourceHash = bit::fnv1a_iter(
       key.sourceHash,
       reinterpret_cast<uintptr_t>(packet.renderable.modelResourcePtr));
-  key.sourceHash = bit::fnv1a_iter(
-      key.sourceHash,
-      reinterpret_cast<uintptr_t>(packet.renderable.runtimeGeosetPtr));
-  key.sourceHash = bit::fnv1a_iter(
-      key.sourceHash,
-      reinterpret_cast<uintptr_t>(packet.renderable.runtimeGeosetDataPtr));
-  key.sourceHash = bit::fnv1a_iter(
-      key.sourceHash, reinterpret_cast<uintptr_t>(packet.renderable.meshData));
-  key.sourceHash = bit::fnv1a_iter(
-      key.sourceHash,
-      reinterpret_cast<uintptr_t>(packet.renderable.renderablePart));
+  if (!stableAuthoritativeSkinnedGeometryKey) {
+    key.sourceHash = bit::fnv1a_iter(
+        key.sourceHash,
+        reinterpret_cast<uintptr_t>(packet.renderable.runtimeGeosetPtr));
+    key.sourceHash = bit::fnv1a_iter(
+        key.sourceHash,
+        reinterpret_cast<uintptr_t>(packet.renderable.runtimeGeosetDataPtr));
+    key.sourceHash = bit::fnv1a_iter(
+        key.sourceHash, reinterpret_cast<uintptr_t>(packet.renderable.meshData));
+    key.sourceHash = bit::fnv1a_iter(
+        key.sourceHash,
+        reinterpret_cast<uintptr_t>(packet.renderable.renderablePart));
+  }
   key.sourceHash = bit::fnv1a_iter(
       key.sourceHash, uint64_t(packet.resource.geosetIndex));
   key.sourceHash =
@@ -7086,15 +9822,43 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
 
   uint32_t cachedGeometryId = 0u;
   const War3ShadowPersistentGeometry* cachedGeometry = nullptr;
-  const bool cachedPersistentGeometry =
-      !packet.usesDynamicMeshPositions &&
-      War3TryFindShadowPersistentGeometry(key, cachedGeometryId,
-                                          cachedGeometry) &&
-      cachedGeometry != nullptr;
+  bool cachedPersistentGeometry = false;
+
+  dxvk::war3::model::PoseRecord livePoseRecord = {};
+  const bool hasLivePoseWorldTransform = [&]() {
+    auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
+    if (packet.renderable.runtimeModelPtr != nullptr &&
+        poseRegistry.findByRuntimeModel(packet.renderable.runtimeModelPtr,
+                                       livePoseRecord)) {
+      return livePoseRecord.hasSpriteFrameTransform ||
+             livePoseRecord.hasWorldTransform;
+    }
+    if (packet.renderable.sceneNode != nullptr &&
+        poseRegistry.findBySceneNode(packet.renderable.sceneNode,
+                                     livePoseRecord)) {
+      return livePoseRecord.hasSpriteFrameTransform ||
+             livePoseRecord.hasWorldTransform;
+    }
+    if (packet.renderable.unitPtr != nullptr &&
+        poseRegistry.findByUnitPtr(packet.renderable.unitPtr,
+                                   livePoseRecord)) {
+      return livePoseRecord.hasSpriteFrameTransform ||
+             livePoseRecord.hasWorldTransform;
+    }
+    return false;
+  }();
+  const Matrix4* liveWorldTransform =
+      hasLivePoseWorldTransform
+          ? (livePoseRecord.hasSpriteFrameTransform
+                 ? &livePoseRecord.spriteFrameTransform
+                 : &livePoseRecord.worldTransform)
+          : nullptr;
 
   Matrix4 sceneNodeWorldMatrix = Matrix4();
   const bool hasSceneNodeWorldMatrix = [&]() {
-    if (!packet.usesDynamicMeshPositions || packet.renderable.sceneNode == nullptr)
+    auto worldMatrixScope = War3SemanticSubmitScope(
+        "War3SemanticScene/SubmitFrame/SceneNodeWorldMatrix");
+    if (packet.renderable.sceneNode == nullptr)
       return false;
 
     float raw[12] = {};
@@ -7117,23 +9881,55 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   std::vector<std::array<uint8_t, 4>> blendIndices;
   std::vector<std::array<float, 3>> blendWeights;
   uint64_t submittedRuntimeGroupPaletteHash = 0u;
-  const bool hasExplicitBlendContract =
-      packet.resource.explicitBlendCount != 0u &&
-      packetBlendWeights.size() >= size_t(vertexCount) &&
-      packetBlendIndices.size() >= size_t(vertexCount);
   bool liveRuntimeGroupPaletteReady = false;
+  // Phase 7.28：本次 submit 对应的 palette 来源 + slotIndex 记录。
+  War3SemanticPaletteSource paletteSourceThisSubmit = War3SemanticPaletteSource::None;
+  uint32_t paletteSlotIndexThisSubmit = drawTimeCapturedPaletteSlotIndex;
+  uint32_t paletteMinFrameTagThisSubmit = drawTimeCapturedPaletteMinFrameTag;
+  uint32_t paletteMaxFrameTagThisSubmit = drawTimeCapturedPaletteMaxFrameTag;
   if (skinned && War3SemanticLivePaletteRefreshRuntime()) {
     m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshAttemptCount++;
-    {
+    const bool shouldAvoidLegacyLivePaletteFallback =
+        authoritativeDrawContractKnown &&
+        authoritativeDrawContract != nullptr &&
+        authoritativeDrawContract->payloadWord48 != 0u &&
+        authoritativeDrawContract->stream1Ptr != nullptr;
+    if (drawTimeCapturedPaletteReady) {
+      liveMaxVertexGroupSlot =
+          drawTimeCapturedPaletteCount != 0u ? drawTimeCapturedPaletteCount - 1u
+                                             : 0u;
+      liveRuntimeGroupPaletteHash = drawTimeCapturedPaletteHash;
+      liveRuntimeRawPaletteHash = drawTimeCapturedPaletteHash;
+      liveRuntimePoseModelPtr = packet.renderable.runtimeModelPtr;
+      liveRuntimeGroupPaletteReady = true;
+      paletteSourceThisSubmit = War3SemanticPaletteSource::DrawTimeCaptured;
+      paletteSlotIndexThisSubmit = drawTimeCapturedPaletteSlotIndex;
+      paletteMinFrameTagThisSubmit = drawTimeCapturedPaletteMinFrameTag;
+      paletteMaxFrameTagThisSubmit = drawTimeCapturedPaletteMaxFrameTag;
+    } else if (shouldAvoidLegacyLivePaletteFallback) {
+      // Current-draw skinned packets must stay on the owned draw-time palette.
+      // Slot-index live reads happen later than the producer capture and can
+      // sample a recycled palette slot, which shows up as regular pose flicker.
+      m_war3Scene.shadowStats
+          .semanticSceneAuthoritativePaletteLiveSlotFallbackBlockedCount++;
+    } else if (!shouldAvoidLegacyLivePaletteFallback) {
       auto livePaletteScope = War3SemanticSubmitScope(
           "War3SemanticScene/SubmitFrame/LivePaletteBuild");
+      uint32_t livePaletteMinFrameTag = 0u;
+      uint32_t livePaletteMaxFrameTag = 0u;
       liveRuntimeGroupPaletteReady = War3TryBuildLiveRuntimeGroupPalette(
           packet.resource, packet.renderable.runtimeModelPtr,
           packet.renderable.renderablePart,
           m_war3ShadowPersistentFrameSerial,
           liveRuntimeGroupPalette, liveMaxVertexGroupSlot,
           liveRuntimeGroupPaletteHash, &liveRuntimeRawPaletteHash,
-          &liveRuntimePoseModelPtr);
+          &liveRuntimePoseModelPtr, /*allowCModelFallbackForCall=*/false,
+          &paletteSourceThisSubmit, &paletteSlotIndexThisSubmit,
+          &livePaletteMinFrameTag, &livePaletteMaxFrameTag);
+      if (liveRuntimeGroupPaletteReady) {
+        paletteMinFrameTagThisSubmit = livePaletteMinFrameTag;
+        paletteMaxFrameTagThisSubmit = livePaletteMaxFrameTag;
+      }
     }
     if (liveRuntimeGroupPaletteReady) {
       m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshHitCount++;
@@ -7142,7 +9938,9 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
               liveRuntimePoseModelPtr != nullptr ? liveRuntimePoseModelPtr
                                                  : packet.renderable.runtimeModelPtr);
       m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshLastMatrixCount =
-          uint32_t(liveRuntimeGroupPalette.size());
+          drawTimeCapturedPaletteReady
+              ? drawTimeCapturedPaletteCount
+              : uint32_t(liveRuntimeGroupPalette.size());
       m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshLastMatrixHash =
           liveRuntimeGroupPaletteHash;
       War3NoteLivePaletteMotion(
@@ -7155,70 +9953,632 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       m_war3Scene.shadowStats.semanticSceneLivePaletteRefreshMissCount++;
     }
   }
-  const std::vector<Matrix4>& effectiveRuntimeGroupPalette =
-      liveRuntimeGroupPaletteReady ? liveRuntimeGroupPalette
-                                   : packet.runtimeGroupPalette;
+  const std::vector<Matrix4>* effectiveRuntimeGroupPalette =
+      liveRuntimeGroupPaletteReady
+          ? (drawTimeCapturedPaletteReady ? drawTimeCapturedPalette
+                                          : &liveRuntimeGroupPalette)
+          : &packet.runtimeGroupPalette;
   const uint32_t effectiveMaxVertexGroupSlot =
       liveRuntimeGroupPaletteReady ? liveMaxVertexGroupSlot
                                    : packet.maxVertexGroupSlot;
+  dxvk::war3::render::CanonicalShadowDrawItem canonicalItem = {};
+  {
+    auto canonicalScope = War3SemanticSubmitScope(
+        "War3SemanticScene/SubmitFrame/CanonicalBuild");
+    dxvk::war3::render::CanonicalShadowBuildInputs canonicalInputs = {};
+    canonicalInputs.packet = &packet;
+    canonicalInputs.resolvedObjectKind = resolvedObjectKind;
+    canonicalInputs.vertexCount = vertexCount;
+    canonicalInputs.useIndices = useIndices;
+    canonicalInputs.effectiveIndexCount = effectiveIndexCount;
+    canonicalInputs.currentDrawSample = currentDrawSample;
+    canonicalInputs.effectiveRuntimeGroupPalette = effectiveRuntimeGroupPalette;
+    canonicalInputs.effectiveRuntimeGroupPaletteHash =
+        liveRuntimeGroupPaletteReady && liveRuntimeGroupPaletteHash != 0u
+            ? liveRuntimeGroupPaletteHash
+            : packet.runtimeGroupPaletteHash;
+    canonicalInputs.effectiveMaxVertexGroupSlot =
+        effectiveMaxVertexGroupSlot;
+    canonicalInputs.liveRuntimeGroupPaletteReady =
+        liveRuntimeGroupPaletteReady;
+    canonicalInputs.authoritativeGroupSlots = authoritativeGroupSlots;
+    canonicalInputs.authoritativeGroupSlotsReady =
+        authoritativeGroupSlotsReady;
+    canonicalInputs.liveWorldTransform = liveWorldTransform;
+    canonicalInputs.sceneNodeWorldMatrix = &sceneNodeWorldMatrix;
+    canonicalInputs.hasSceneNodeWorldMatrix = hasSceneNodeWorldMatrix;
+    canonicalInputs.ownSkinContracts =
+        dxvk::war3::internal::IsNativeRendererHostExecuteValidationRuntimeEnabled();
+    dxvk::war3::render::BuildCanonicalShadowDrawItem(canonicalInputs,
+                                                     canonicalItem);
+  }
+  const auto& canonicalIdentity = canonicalItem.instance.identity;
+  const auto& canonicalMesh = canonicalItem.instance.mesh;
+  const auto& canonicalSkin = canonicalItem.instance.skin;
+  const auto& canonicalMaterial = canonicalItem.instance.material;
+  const auto& canonicalWorldTransform = canonicalItem.instance.worldTransform;
+  {
+    auto materialDiagScope = War3SemanticSubmitScope(
+        "War3SemanticScene/SubmitFrame/MaterialDiag");
+    War3NoteSemanticMaterialBindingDiagnostics(m_war3Scene.shadowStats,
+                                               packet.material);
+  }
+  if (canonicalMaterial.alphaMode ==
+      dxvk::war3::shadow::ShadowAlphaMode::Cutout) {
+    m_war3Scene.shadowStats.semanticSceneMaterialObservedCutoutCount++;
+  } else if (canonicalMaterial.alphaMode ==
+             dxvk::war3::shadow::ShadowAlphaMode::AlphaBlend) {
+    m_war3Scene.shadowStats.semanticSceneMaterialObservedAlphaBlendCount++;
+  }
+  const auto noteCanonicalReadiness = [&]() {
+    using dxvk::war3::render::CanonicalShadowReadinessReason;
+    if (canonicalItem.readyForShadowConsumer()) {
+      m_war3Scene.shadowStats.semanticSceneCanonicalReadyCount++;
+      if (canonicalMaterial.alphaMode ==
+          dxvk::war3::shadow::ShadowAlphaMode::Cutout) {
+        m_war3Scene.shadowStats.semanticSceneCanonicalReadyCutoutCount++;
+      } else if (canonicalMaterial.alphaMode ==
+                 dxvk::war3::shadow::ShadowAlphaMode::AlphaBlend) {
+        m_war3Scene.shadowStats.semanticSceneCanonicalReadyAlphaBlendCount++;
+      }
+      return;
+    }
+
+    switch (canonicalItem.readinessReason) {
+    case CanonicalShadowReadinessReason::NoStableIdentity:
+      m_war3Scene.shadowStats.semanticSceneCanonicalRejectNoStableIdentity++;
+      break;
+    case CanonicalShadowReadinessReason::NoMesh:
+      m_war3Scene.shadowStats.semanticSceneCanonicalRejectNoMesh++;
+      break;
+    case CanonicalShadowReadinessReason::NoWorldTransform:
+      m_war3Scene.shadowStats.semanticSceneCanonicalRejectNoWorldTransform++;
+      break;
+    case CanonicalShadowReadinessReason::NoPalette:
+      m_war3Scene.shadowStats.semanticSceneCanonicalRejectNoPalette++;
+      break;
+    case CanonicalShadowReadinessReason::NoSlotContract:
+      m_war3Scene.shadowStats.semanticSceneCanonicalRejectNoSlotContract++;
+      break;
+    case CanonicalShadowReadinessReason::StaleProducerSample:
+      m_war3Scene.shadowStats.semanticSceneCanonicalRejectStaleProducer++;
+      break;
+    case CanonicalShadowReadinessReason::InvalidVertexOrIndexSlice:
+      m_war3Scene.shadowStats.semanticSceneCanonicalRejectInvalidVertexIndex++;
+      break;
+    case CanonicalShadowReadinessReason::ExplicitBlendIncomplete:
+      m_war3Scene.shadowStats
+          .semanticSceneCanonicalRejectExplicitBlendIncomplete++;
+      break;
+    case CanonicalShadowReadinessReason::Ready:
+      break;
+    }
+  };
+  noteCanonicalReadiness();
+  if (!canonicalItem.readyForShadowConsumer()) {
+    if (currentDrawResolveStatus ==
+        dxvk::war3::render::CurrentDrawResolveStatus::Ready) {
+      m_war3Scene.shadowStats
+          .semanticSceneCurrentDrawResolveReadyRejectedCount++;
+    }
+    return false;
+  }
+  if (War3SemanticRejectUnsafeAlphaCasterRuntime()) {
+    if (canonicalMaterial.alphaMode ==
+        dxvk::war3::shadow::ShadowAlphaMode::AlphaBlend) {
+      m_war3Scene.shadowStats.semanticSceneRejectedAlphaBlendVisualPolicy++;
+      m_war3Scene.shadowStats.semanticSceneRejectedAlphaBlendGeometry++;
+      return false;
+    }
+    if (canonicalMaterial.alphaMode ==
+        dxvk::war3::shadow::ShadowAlphaMode::Cutout) {
+      m_war3Scene.shadowStats.semanticSceneRejectedCutoutVisualPolicy++;
+      m_war3Scene.shadowStats.semanticSceneRejectedCutoutGeometry++;
+      return false;
+    }
+  }
+  const bool usesOwnedGroupSlots =
+      skinned &&
+      canonicalSkin.groupSlotSource ==
+          dxvk::war3::render::CanonicalGroupSlotSource::ResourceVertexGroups &&
+      packet.resource.vertexGroupIndices ==
+          &packet.resource.ownedVertexGroupIndices &&
+      !packet.resource.ownedVertexGroupIndices.empty();
+  const bool usesExplicitBlendContract =
+      skinned && canonicalSkin.usesExplicitBlendContract();
+  uint32_t nonExplicitUniqueGroupSlotCount = 0u;
+  bool nonExplicitUniqueGroupSlotCountValid = false;
+  if (authoritativeGroupSlotsReady) {
+    key.sourceHash = bit::fnv1a_iter(key.sourceHash,
+        authoritativeStableGroupHash != 0u ? authoritativeStableGroupHash
+                                            : authoritativeGroupHash);
+  }
+  cachedPersistentGeometry =
+      [&]() {
+        auto cacheProbeScope = War3SemanticSubmitScope(
+            "War3SemanticScene/SubmitFrame/GeometryCacheProbe");
+        return canonicalMesh.geometrySource !=
+                   dxvk::war3::render::CanonicalGeometrySource::DynamicPositionStream &&
+               War3TryFindShadowPersistentGeometry(key, cachedGeometryId,
+                                                   cachedGeometry) &&
+               cachedGeometry != nullptr;
+      }();
   if (skinned) {
-    if ((!liveRuntimeGroupPaletteReady && !packet.hasRuntimeGroupPalette) ||
-        effectiveRuntimeGroupPalette.empty() ||
-        effectiveRuntimeGroupPalette.size() > 256u ||
-        effectiveMaxVertexGroupSlot >= effectiveRuntimeGroupPalette.size() ||
-        (!cachedPersistentGeometry && !hasExplicitBlendContract &&
-         packetVertexGroups.size() < size_t(vertexCount))) {
+    std::vector<Matrix4> trimmedCanonicalPalette;
+    const auto& canonicalPaletteVec = canonicalSkin.paletteVec();
+    const auto& canonicalGroupSlots = canonicalSkin.groupSlotsVec();
+    if (!usesExplicitBlendContract &&
+        canonicalGroupSlots.size() >= size_t(vertexCount)) {
+      std::array<bool, 256> seenGroupSlots = {};
+      for (uint32_t i = 0u; i < vertexCount; ++i) {
+        const uint32_t groupSlot = uint32_t(canonicalGroupSlots[i]);
+        if (groupSlot < seenGroupSlots.size() && !seenGroupSlots[groupSlot]) {
+          seenGroupSlots[groupSlot] = true;
+          nonExplicitUniqueGroupSlotCount++;
+        }
+      }
+      nonExplicitUniqueGroupSlotCountValid = true;
+    }
+    const std::vector<Matrix4>* effectiveCanonicalPalette =
+        &canonicalPaletteVec;
+    uint32_t effectiveCanonicalPaletteCount = canonicalSkin.paletteCount;
+    if (canonicalSkin.paletteReady() &&
+        canonicalPaletteVec.size() > 256u &&
+        canonicalSkin.maxVertexGroupSlot < 256u) {
+      effectiveCanonicalPaletteCount =
+          (std::min)(uint32_t(256u), canonicalSkin.maxVertexGroupSlot + 1u);
+      trimmedCanonicalPalette.assign(canonicalPaletteVec.begin(),
+                                     canonicalPaletteVec.begin() +
+                                         effectiveCanonicalPaletteCount);
+      effectiveCanonicalPalette = &trimmedCanonicalPalette;
+    }
+
+    if (!canonicalSkin.paletteReady() ||
+        effectiveCanonicalPaletteCount == 0u ||
+        effectiveCanonicalPalette->size() < effectiveCanonicalPaletteCount ||
+        effectiveCanonicalPaletteCount > 256u ||
+        canonicalSkin.maxVertexGroupSlot >= effectiveCanonicalPaletteCount ||
+        (!cachedPersistentGeometry &&
+         !canonicalSkin.hasUsableVertexContract(vertexCount))) {
       m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
+      notePhase5SkinnedContractReject();
       return false;
     }
 
     const uint64_t submittedPaletteHash =
-        liveRuntimeGroupPaletteReady && liveRuntimeGroupPaletteHash != 0u
-            ? liveRuntimeGroupPaletteHash
-            : packet.runtimeGroupPaletteHash != 0u
-                  ? packet.runtimeGroupPaletteHash
-                  : War3SemanticHashMatrixPalette(
-                        effectiveRuntimeGroupPalette.data(),
-                        uint32_t(effectiveRuntimeGroupPalette.size()));
+        canonicalSkin.paletteHash != 0u &&
+                effectiveCanonicalPaletteCount == canonicalSkin.paletteCount
+            ? canonicalSkin.paletteHash
+            : War3SemanticHashMatrixPalette(effectiveCanonicalPalette->data(),
+                                            effectiveCanonicalPaletteCount);
     submittedRuntimeGroupPaletteHash = submittedPaletteHash;
     War3NoteSubmittedPaletteMotion(
-        m_war3Scene.shadowStats, packet.renderable.runtimeModelPtr,
+        m_war3Scene.shadowStats, canonicalIdentity.runtimeModelPtr,
         m_war3ShadowPersistentFrameSerial, submittedPaletteHash);
+
+    // Phase 7.28：skinned palette content stability probe。
+    // 以 manifestPartLeaseKey 作为稳定 part 身份，记录本帧提交的
+    // palette source / slotIndex / hash；并与上一帧同 key 的数据做比对。
+    // 目标是验证用户观察——"rigid 不闪、skinned 闪"——是否来自
+    // "part 稳定但 palette 内容每帧抖动"。
+    // 仅在该 submit 真实归属于某个 stable part 时做采样；每个 thread 保持
+    // 一份独立表，避免多线程交叉污染。
+    if (skinned) {
+      auto& stats = m_war3Scene.shadowStats;
+      // palette source 分桶。
+      switch (paletteSourceThisSubmit) {
+      case War3SemanticPaletteSource::None:
+        stats.semanticSceneSubmittedSkinnedPaletteSourceNoneCount++;
+        break;
+      case War3SemanticPaletteSource::DrawTimeCaptured:
+        stats.semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount++;
+        // Phase 1：DrawTimeCaptured 内部按 provenance 细分。
+        if (currentDrawSample != nullptr) {
+          using PP = dxvk::war3::render::PaletteProvenance;
+          switch (currentDrawSample->paletteProvenance) {
+          case PP::TrustedBlendedWriter:
+            stats.semanticSceneSubmittedSkinnedPaletteProvenanceTrustedBlendedWriterCount++;
+            break;
+          case PP::RawGlobalArena:
+            stats.semanticSceneSubmittedSkinnedPaletteProvenanceRawGlobalArenaCount++;
+            break;
+          case PP::ProducerPartPacket:
+            stats.semanticSceneSubmittedSkinnedPaletteProvenanceProducerPartPacketCount++;
+            break;
+          case PP::RangeCopyPoseRebuild:
+            stats.semanticSceneSubmittedSkinnedPaletteProvenanceRangeCopyPoseRebuildCount++;
+            break;
+          case PP::CModelFallback:
+            stats.semanticSceneSubmittedSkinnedPaletteProvenanceCModelFallbackCount++;
+            break;
+          default:
+            stats.semanticSceneSubmittedSkinnedPaletteProvenanceUnknownCount++;
+            break;
+          }
+        } else {
+          stats.semanticSceneSubmittedSkinnedPaletteProvenanceUnknownCount++;
+        }
+        break;
+      case War3SemanticPaletteSource::SubmitTimeGlobalSlot:
+        stats.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeGlobalSlotCount++;
+        break;
+      case War3SemanticPaletteSource::SubmitTimeBlendedPaletteCache:
+        stats.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeBlendedCacheCount++;
+        break;
+      case War3SemanticPaletteSource::SubmitTimePublishedPoseRegistry:
+        stats.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimePublishedRegistryCount++;
+        break;
+      case War3SemanticPaletteSource::SubmitTimeCModelFallback:
+        stats.semanticSceneSubmittedSkinnedPaletteSourceSubmitTimeCModelFallbackCount++;
+        break;
+      }
+
+      // 稳定 part 身份下的帧间稳定性采样：仅在能从 manifestPartLeaseKey
+      // 确认 part 身份时才入表。无 lease key 的 skinned packet 不参与。
+      uint64_t stablePartKey = 0u;
+      uint32_t contractPayloadWord11C = 0u;
+      uint32_t contractCapturedPaletteCount = 0u;
+      if (currentDrawSample != nullptr) {
+        stablePartKey = dxvk::war3::render::VisibleRenderableRegistry::
+            computeShadowManifestPartKey(currentDrawSample->contract);
+        contractPayloadWord11C = currentDrawSample->contract.payloadWord11C;
+        contractCapturedPaletteCount =
+            currentDrawSample->contract.capturedPaletteCount;
+      }
+      // Phase 7.29：在 leaseKey 基础上叠加 payload11C 作为 strict slice 判定。
+      // 这把 key 只用于 probe，不替代 lease 身份；目的是回答"是否
+      // paletteCountChurn / LargeDelta 在 strict 粒度下消失"。
+      uint64_t strictSliceKey = 0u;
+      if (stablePartKey != 0u) {
+        strictSliceKey = bit::fnv1a_init();
+        strictSliceKey = bit::fnv1a_iter(strictSliceKey, stablePartKey);
+        strictSliceKey =
+            bit::fnv1a_iter(strictSliceKey, contractPayloadWord11C);
+      }
+      if (stablePartKey != 0u && submittedPaletteHash != 0u) {
+        struct PaletteProbeEntry {
+          uint64_t lastFrame = 0u;
+          uint64_t lastHash = 0u;
+          uint32_t lastSlotIndex = 0xFFFFFFFFu;
+          War3SemanticPaletteSource lastSource =
+              War3SemanticPaletteSource::None;
+          std::array<uint64_t, 4> hashWindow = {0u, 0u, 0u, 0u};
+          std::array<uint32_t, 4> slotWindow = {
+              0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+          uint8_t windowCursor = 0u;
+          uint8_t windowFill = 0u;
+          // Phase 7.28：记录上一帧提交时第一根矩阵的 translation 与 count，
+          // 用来估算帧间 palette 是连续动画（小位移）还是跳变（大位移）。
+          float lastFirstMatrixTx = 0.0f;
+          float lastFirstMatrixTy = 0.0f;
+          float lastFirstMatrixTz = 0.0f;
+          uint32_t lastPaletteCount = 0u;
+          bool hasLastFirstMatrix = false;
+          // Phase 7.30 Step A：记录上一帧该 stable part 是否来自 core stale-pose
+          // restore（allowStalePoseForCore 分支）；用来把本帧的 LargeDelta 
+          // 分类为 stale→live 过渡 vs live→live 真动画。
+          bool lastFromStaleRestore = false;
+        };
+        // thread_local 开放寻址小型 LRU：key 碰撞时直接覆盖，采样本身允许
+        // 丢失；目标是提供"大多数 stable part 的 palette hash 稳不稳"
+        // 的观察，不是精确审计。
+        static constexpr size_t kPaletteProbeEntries = 8192u;
+        static thread_local std::array<uint64_t, kPaletteProbeEntries>
+            s_paletteProbeKeys = {};
+        static thread_local std::array<PaletteProbeEntry, kPaletteProbeEntries>
+            s_paletteProbeEntries = {};
+        const size_t slot =
+            size_t(stablePartKey) & (kPaletteProbeEntries - 1u);
+        auto& storedKey = s_paletteProbeKeys[slot];
+        auto& entry = s_paletteProbeEntries[slot];
+        const bool sameKey = storedKey == stablePartKey;
+        // Phase 7.28：抓本帧 first matrix 的 translation 做帧间幅度比较。
+        float currentFirstTx = 0.0f;
+        float currentFirstTy = 0.0f;
+        float currentFirstTz = 0.0f;
+        bool hasCurrentFirstMatrix = false;
+        if (effectiveCanonicalPalette != nullptr &&
+            !effectiveCanonicalPalette->empty()) {
+          const Matrix4& first = (*effectiveCanonicalPalette)[0];
+          // Matrix4 用列优先保存；translation 在最后一列（row .w）。
+          currentFirstTx = first[3][0];
+          currentFirstTy = first[3][1];
+          currentFirstTz = first[3][2];
+          hasCurrentFirstMatrix = true;
+        }
+        if (sameKey) {
+          stats.semanticSceneSubmittedSkinnedPaletteStablePartSampleCount++;
+          if (entry.lastHash != submittedPaletteHash) {
+            stats.semanticSceneSubmittedSkinnedPaletteHashChurnCount++;
+          }
+          if (entry.lastSource != paletteSourceThisSubmit) {
+            stats.semanticSceneSubmittedSkinnedPaletteSourceChurnCount++;
+          }
+          if (entry.lastSlotIndex != paletteSlotIndexThisSubmit &&
+              paletteSourceThisSubmit ==
+                  War3SemanticPaletteSource::SubmitTimeGlobalSlot &&
+              entry.lastSlotIndex != 0xFFFFFFFFu &&
+              paletteSlotIndexThisSubmit != 0xFFFFFFFFu) {
+            stats.semanticSceneSubmittedSkinnedPaletteSlotIndexChurnCount++;
+          }
+          // Phase 7.28：帧间 first-matrix translation delta 分桶。
+          // 连续动画一般 < 0.1f；>= 1.0f 更像 slot 被别的对象覆盖导致错读。
+          // palette count 变化也作为"结构性错位"的旁证。
+          if (entry.hasLastFirstMatrix && hasCurrentFirstMatrix &&
+              entry.lastHash != submittedPaletteHash) {
+            const float dx = currentFirstTx - entry.lastFirstMatrixTx;
+            const float dy = currentFirstTy - entry.lastFirstMatrixTy;
+            const float dz = currentFirstTz - entry.lastFirstMatrixTz;
+            const float deltaSq = dx * dx + dy * dy + dz * dz;
+            if (deltaSq > 1.0f) {
+              // 大跳变：疑似 slot 复用错读。
+              stats
+                  .semanticSceneSubmittedSkinnedPaletteFirstMatrixLargeDeltaCount++;
+              // Phase 7.30 Step A：按"上一帧是否 stale restore"归因。
+              //   stale→live：Codex 判定的 stutter-catchup 过渡，属于"不是真动画"。
+              //   live→live：连续两帧都 live 时仍跳，属于"真动画" 或 "arena 错读"。
+              // 注意这一帧本身是否 stale 不影响归因，重点是"上一帧是否用旧 pose 垫"。
+              if (entry.lastFromStaleRestore && !fromStalePoseRestore) {
+                stats
+                    .semanticSceneSubmittedSkinnedPaletteAfterStaleRestoreLargeDeltaCount++;
+              } else if (!entry.lastFromStaleRestore && !fromStalePoseRestore) {
+                stats
+                    .semanticSceneSubmittedSkinnedPaletteLiveToLiveLargeDeltaCount++;
+              }
+            } else if (deltaSq > 0.01f) {
+              // 中等跳变：可见的动画或相机切换。
+              stats
+                  .semanticSceneSubmittedSkinnedPaletteFirstMatrixMediumDeltaCount++;
+            } else {
+              // 小位移：正常连续动画。
+              stats
+                  .semanticSceneSubmittedSkinnedPaletteFirstMatrixSmallDeltaCount++;
+            }
+          }
+          if (entry.lastPaletteCount != 0u &&
+              entry.lastPaletteCount != effectiveCanonicalPaletteCount) {
+            stats.semanticSceneSubmittedSkinnedPaletteCountChurnCount++;
+          }
+        } else {
+          // 新 key 或被别的 key 冲掉的 slot：重置历史窗口。
+          entry = PaletteProbeEntry{};
+          storedKey = stablePartKey;
+        }
+        // 环形窗口：记录最近 4 帧的 hash 与 slotIndex，用于 unique-in-window。
+        entry.hashWindow[entry.windowCursor] = submittedPaletteHash;
+        entry.slotWindow[entry.windowCursor] = paletteSlotIndexThisSubmit;
+        entry.windowCursor = (entry.windowCursor + 1u) % uint8_t(4u);
+        if (entry.windowFill < 4u) {
+          entry.windowFill++;
+        } else {
+          // 满窗口后才统计 uniqueness，避免早期数据污染。
+          std::array<uint64_t, 4> uniqueHashes = {0u, 0u, 0u, 0u};
+          std::array<uint32_t, 4> uniqueSlots = {
+              0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+          uint32_t uniqueHashCount = 0u;
+          uint32_t uniqueSlotCount = 0u;
+          for (uint32_t i = 0u; i < 4u; ++i) {
+            const uint64_t h = entry.hashWindow[i];
+            bool seen = false;
+            for (uint32_t j = 0u; j < uniqueHashCount; ++j) {
+              if (uniqueHashes[j] == h) {
+                seen = true;
+                break;
+              }
+            }
+            if (!seen)
+              uniqueHashes[uniqueHashCount++] = h;
+            const uint32_t s = entry.slotWindow[i];
+            if (s == 0xFFFFFFFFu)
+              continue;
+            bool seenSlot = false;
+            for (uint32_t j = 0u; j < uniqueSlotCount; ++j) {
+              if (uniqueSlots[j] == s) {
+                seenSlot = true;
+                break;
+              }
+            }
+            if (!seenSlot)
+              uniqueSlots[uniqueSlotCount++] = s;
+          }
+          if (uniqueHashCount >
+              stats.semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax) {
+            stats.semanticSceneSubmittedSkinnedPaletteHashUniqueInWindowMax =
+                uniqueHashCount;
+          }
+          if (uniqueSlotCount >
+              stats
+                  .semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax) {
+            stats
+                .semanticSceneSubmittedSkinnedPaletteSlotIndexUniqueInWindowMax =
+                uniqueSlotCount;
+          }
+        }
+        entry.lastFrame = m_war3ShadowPersistentFrameSerial;
+        entry.lastHash = submittedPaletteHash;
+        entry.lastSlotIndex = paletteSlotIndexThisSubmit;
+        entry.lastSource = paletteSourceThisSubmit;
+        if (hasCurrentFirstMatrix) {
+          entry.lastFirstMatrixTx = currentFirstTx;
+          entry.lastFirstMatrixTy = currentFirstTy;
+          entry.lastFirstMatrixTz = currentFirstTz;
+          entry.hasLastFirstMatrix = true;
+        }
+        entry.lastPaletteCount = effectiveCanonicalPaletteCount;
+        // Phase 7.30 Step A：把"本帧这份 packet 是 stale-pose restored"的状态
+        // 落进 entry，下一帧 deltaSq>=1.0 分类时就能识别 stale→live 过渡。
+        entry.lastFromStaleRestore = fromStalePoseRestore;
+        if (fromStalePoseRestore) {
+          stats
+              .semanticSceneSubmittedSkinnedPaletteStaleRestoreSubmittedCount++;
+        }
+
+        // Phase 7.29：在 leaseKey 下聚合 payload11C / capturedPaletteCount
+        // 的"多值存在"证据。只要本帧同一个 leaseKey 看到过第二个不同的
+        // payload11C 或 paletteCount，就说明 leaseKey 对 palette attribution
+        // 来说是过粗的。用单帧 thread_local 小型表累积；在 stats 里只计
+        // "本次采样首次检测到多值"的事件数，避免同帧重复累加。
+        struct LeaseKeyAttributionEntry {
+          uint64_t leaseKey = 0u;
+          uint64_t frame = 0u;
+          uint32_t firstPayload11C = 0u;
+          uint32_t firstPaletteCount = 0u;
+          bool multi11CReported = false;
+          bool multiPaletteCountReported = false;
+        };
+        static constexpr size_t kLeaseAttrEntries = 8192u;
+        static thread_local std::array<LeaseKeyAttributionEntry,
+                                       kLeaseAttrEntries>
+            s_leaseAttrEntries = {};
+        const size_t leaseAttrSlot =
+            size_t(stablePartKey) & (kLeaseAttrEntries - 1u);
+        auto& leaseAttrEntry = s_leaseAttrEntries[leaseAttrSlot];
+        if (leaseAttrEntry.leaseKey != stablePartKey ||
+            leaseAttrEntry.frame != m_war3ShadowPersistentFrameSerial) {
+          leaseAttrEntry = LeaseKeyAttributionEntry{};
+          leaseAttrEntry.leaseKey = stablePartKey;
+          leaseAttrEntry.frame = m_war3ShadowPersistentFrameSerial;
+          leaseAttrEntry.firstPayload11C = contractPayloadWord11C;
+          leaseAttrEntry.firstPaletteCount = contractCapturedPaletteCount;
+        } else {
+          if (!leaseAttrEntry.multi11CReported &&
+              leaseAttrEntry.firstPayload11C != contractPayloadWord11C) {
+            leaseAttrEntry.multi11CReported = true;
+            stats
+                .semanticSceneSubmittedSkinnedPaletteLeaseKeyPayload11CMultiValueCount++;
+          }
+          if (!leaseAttrEntry.multiPaletteCountReported &&
+              leaseAttrEntry.firstPaletteCount != contractCapturedPaletteCount) {
+            leaseAttrEntry.multiPaletteCountReported = true;
+            stats
+                .semanticSceneSubmittedSkinnedPaletteLeaseKeyPaletteCountMultiValueCount++;
+          }
+        }
+      }
+
+      // Phase 7.29：strict slice probe。
+      // 如果在 strict key 下 paletteCountChurn / LargeDelta 基本归零，
+      // 说明问题是 lease key 粒度过粗；capture/snapshot 机制本身没有
+      // 错配。此时下一刀应该是"给 palette attribution 专门拆一把
+      // 包含 payload11C（甚至 F0）的 key"，而不是迁移 snapshot key。
+      if (strictSliceKey != 0u && submittedPaletteHash != 0u) {
+        struct StrictProbeEntry {
+          uint64_t lastFrame = 0u;
+          uint64_t lastHash = 0u;
+          uint32_t lastPaletteCount = 0u;
+          float lastFirstMatrixTx = 0.0f;
+          float lastFirstMatrixTy = 0.0f;
+          float lastFirstMatrixTz = 0.0f;
+          bool hasLastFirstMatrix = false;
+        };
+        static constexpr size_t kStrictProbeEntries = 8192u;
+        static thread_local std::array<uint64_t, kStrictProbeEntries>
+            s_strictProbeKeys = {};
+        static thread_local std::array<StrictProbeEntry, kStrictProbeEntries>
+            s_strictProbeEntries = {};
+        const size_t strictSlot =
+            size_t(strictSliceKey) & (kStrictProbeEntries - 1u);
+        auto& strictStoredKey = s_strictProbeKeys[strictSlot];
+        auto& strictEntry = s_strictProbeEntries[strictSlot];
+        const bool strictSameKey = strictStoredKey == strictSliceKey;
+        float strictCurrentTx = 0.0f;
+        float strictCurrentTy = 0.0f;
+        float strictCurrentTz = 0.0f;
+        bool strictHasCurrentFirstMatrix = false;
+        if (effectiveCanonicalPalette != nullptr &&
+            !effectiveCanonicalPalette->empty()) {
+          const Matrix4& first = (*effectiveCanonicalPalette)[0];
+          strictCurrentTx = first[3][0];
+          strictCurrentTy = first[3][1];
+          strictCurrentTz = first[3][2];
+          strictHasCurrentFirstMatrix = true;
+        }
+        if (strictSameKey) {
+          stats.semanticSceneSubmittedSkinnedPaletteStrictSliceSampleCount++;
+          if (strictEntry.lastHash != submittedPaletteHash) {
+            stats
+                .semanticSceneSubmittedSkinnedPaletteStrictSliceHashChurnCount++;
+          }
+          if (strictEntry.hasLastFirstMatrix && strictHasCurrentFirstMatrix &&
+              strictEntry.lastHash != submittedPaletteHash) {
+            const float dx = strictCurrentTx - strictEntry.lastFirstMatrixTx;
+            const float dy = strictCurrentTy - strictEntry.lastFirstMatrixTy;
+            const float dz = strictCurrentTz - strictEntry.lastFirstMatrixTz;
+            const float deltaSq = dx * dx + dy * dy + dz * dz;
+            if (deltaSq > 1.0f) {
+              stats
+                  .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixLargeDeltaCount++;
+            } else if (deltaSq > 0.01f) {
+              stats
+                  .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixMediumDeltaCount++;
+            } else {
+              stats
+                  .semanticSceneSubmittedSkinnedPaletteStrictSliceFirstMatrixSmallDeltaCount++;
+            }
+          }
+          if (strictEntry.lastPaletteCount != 0u &&
+              strictEntry.lastPaletteCount != effectiveCanonicalPaletteCount) {
+            stats
+                .semanticSceneSubmittedSkinnedPaletteStrictSliceCountChurnCount++;
+          }
+        } else {
+          strictEntry = StrictProbeEntry{};
+          strictStoredKey = strictSliceKey;
+        }
+        strictEntry.lastFrame = m_war3ShadowPersistentFrameSerial;
+        strictEntry.lastHash = submittedPaletteHash;
+        strictEntry.lastPaletteCount = effectiveCanonicalPaletteCount;
+        if (strictHasCurrentFirstMatrix) {
+          strictEntry.lastFirstMatrixTx = strictCurrentTx;
+          strictEntry.lastFirstMatrixTy = strictCurrentTy;
+          strictEntry.lastFirstMatrixTz = strictCurrentTz;
+          strictEntry.hasLastFirstMatrix = true;
+        }
+      }
+    }
 
     {
       auto paletteIndexScope = War3SemanticSubmitScope(
           "War3SemanticScene/SubmitFrame/PaletteIndex");
       paletteIndex = War3GetOrCreateSemanticShadowPalette(
           packet, resolvedObjectKind,
-          liveRuntimeGroupPaletteReady ? effectiveRuntimeGroupPalette.data()
-                                       : nullptr,
-          liveRuntimeGroupPaletteReady
-              ? uint32_t(effectiveRuntimeGroupPalette.size())
+          canonicalSkin.paletteSource !=
+                  dxvk::war3::render::CanonicalPaletteSource::PacketRuntimePalette
+              ? effectiveCanonicalPalette->data()
+              : nullptr,
+          canonicalSkin.paletteSource !=
+                  dxvk::war3::render::CanonicalPaletteSource::PacketRuntimePalette
+              ? effectiveCanonicalPaletteCount
               : 0u,
-          liveRuntimeGroupPaletteReady ? liveRuntimeGroupPaletteHash : 0u);
+          canonicalSkin.paletteSource !=
+                  dxvk::war3::render::CanonicalPaletteSource::PacketRuntimePalette
+              ? submittedPaletteHash
+              : 0u);
     }
 
-    if (hasExplicitBlendContract) {
+    if (canonicalSkin.usesExplicitBlendContract()) {
       auto blendScope = War3SemanticSubmitScope(
           "War3SemanticScene/SubmitFrame/BlendContract");
-      if (packetBlendWeights.size() < size_t(vertexCount) ||
-          packetBlendIndices.size() < size_t(vertexCount)) {
+      if (canonicalSkin.explicitBlendWeights.size() < size_t(vertexCount) ||
+          canonicalSkin.explicitBlendIndices.size() < size_t(vertexCount)) {
         m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
+        notePhase5SkinnedContractReject();
         return false;
       }
       if (!cachedPersistentGeometry) {
         blendIndices.resize(vertexCount);
         blendWeights.resize(vertexCount);
         for (uint32_t i = 0; i < vertexCount; ++i) {
-          blendWeights[i] = packetBlendWeights[i];
-          blendIndices[i] = packetBlendIndices[i];
+          blendWeights[i] = canonicalSkin.explicitBlendWeights[i];
+          blendIndices[i] = canonicalSkin.explicitBlendIndices[i];
           const uint32_t maxInfluence =
-              uint32_t(packet.resource.explicitBlendCount) + 1u;
+              uint32_t(canonicalSkin.explicitBlendCount) + 1u;
           for (uint32_t influence = 0u; influence < maxInfluence; ++influence) {
           const uint32_t groupSlot = blendIndices[i][influence];
-          if (groupSlot >= effectiveRuntimeGroupPalette.size() ||
+          if (groupSlot >= effectiveCanonicalPaletteCount ||
               groupSlot >= 256u) {
             m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
+            notePhase5SkinnedContractReject();
             return false;
             }
           }
@@ -7229,10 +10589,11 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           "War3SemanticScene/SubmitFrame/BlendContract");
       blendIndices.resize(vertexCount);
       for (uint32_t i = 0; i < vertexCount; ++i) {
-        const uint32_t groupSlot = packetVertexGroups[i];
-        if (groupSlot >= effectiveRuntimeGroupPalette.size() ||
+        const uint32_t groupSlot = uint32_t(canonicalGroupSlots[i]);
+        if (groupSlot >= effectiveCanonicalPaletteCount ||
             groupSlot >= 256u) {
           m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
+          notePhase5SkinnedContractReject();
           return false;
         }
         blendIndices[i] = {uint8_t(groupSlot), 0u, 0u, 0u};
@@ -7240,22 +10601,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     }
   }
 
-  std::vector<float> frameLocalDynamicPositions;
-  const std::vector<float>* effectivePositions = &packetPositions;
-  if (hasDynamicPositionStream) {
-    auto dynamicPositionScope = War3SemanticSubmitScope(
-        "War3SemanticScene/SubmitFrame/DynamicPositionCopy");
-    frameLocalDynamicPositions.resize(size_t(vertexCount) * 3u);
-    const auto* srcBase =
-        reinterpret_cast<const uint8_t*>(packet.resource.dynamicPositionStream);
-    const size_t srcStride = size_t(packet.resource.dynamicPositionStride);
-    for (uint32_t i = 0u; i < vertexCount; ++i) {
-      std::memcpy(frameLocalDynamicPositions.data() + size_t(i) * 3u,
-                  srcBase + size_t(i) * srcStride,
-                  sizeof(float) * 3u);
-    }
-    effectivePositions = &frameLocalDynamicPositions;
-  }
+  const std::vector<float>* effectivePositions = &canonicalMesh.effectivePositionVec();
 
   auto computeLocalBounds = [&](Vector4& outCenter, float& outRadius) {
     outCenter = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -7303,21 +10649,29 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   candidate.positionOffset = 0u;
   candidate.positionFormat = VK_FORMAT_R32G32B32_SFLOAT;
   candidate.indexType = VK_INDEX_TYPE_UINT16;
+
+  // Phase 7.55：draw-time VB position override for skinned casters。
+  // 如果 draw-time VB cache 里有这个 renderablePart 的 pre-skinned position，
+  // 用它替换 bind-pose position 并关闭 GPU skinning。
+  // TODO Phase 7.55 Step 3：接入 consume 端，让 shadow caster 直接绑定 draw-time VB。
+  // 当前暂时不接入（需要改 War3ShadowCasterDraw 的 positionInfo 绑定逻辑）。
+  bool drawTimeVBOverride = false;
+  void* drawTimeVBRenderablePart = packet.renderable.renderablePart;
+  (void)drawTimeVBOverride;
+  (void)drawTimeVBRenderablePart;
+
   candidate.vertexBlendEnabled = skinned;
   candidate.vertexBlendIndexed = skinned;
   candidate.vertexBlendCount =
-      skinned ? packet.resource.explicitBlendCount : 0u;
+      skinned ? canonicalSkin.explicitBlendCount : 0u;
   candidate.blendWeightOffset = 0u;
   candidate.blendWeightFormat =
-      skinned && hasExplicitBlendContract ? VK_FORMAT_R32G32B32_SFLOAT
-                                          : VK_FORMAT_UNDEFINED;
-  candidate.blendIndexOffset =
-      skinned && hasExplicitBlendContract ? 12u : 0u;
+      skinned ? VK_FORMAT_R32G32B32_SFLOAT : VK_FORMAT_UNDEFINED;
+  candidate.blendIndexOffset = skinned ? 12u : 0u;
   candidate.blendIndexFormat =
-      skinned ? VK_FORMAT_R8G8B8A8_USCALED : VK_FORMAT_UNDEFINED;
-  candidate.blendStride =
-      skinned ? (hasExplicitBlendContract ? 16u : 4u) : 0u;
-  candidate.blendBinding = skinned ? 1u : 0u;
+      (skinned) ? VK_FORMAT_R8G8B8A8_USCALED : VK_FORMAT_UNDEFINED;
+  candidate.blendStride = (skinned) ? 16u : 0u;
+  candidate.blendBinding = (skinned) ? 1u : 0u;
   candidate.alphaTestEnabled = alphaCutoutEnabled;
   candidate.alphaRef = alphaCutoutRef;
   candidate.topology = effectiveTopology;
@@ -7329,6 +10683,77 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   candidate.firstVertex = 0u;
   candidate.minVertexIndex = 0u;
   candidate.numVertices = vertexCount;
+
+  // AlphaTest lane lookup：semantic path 消费侧。
+  //
+  // 若 draw-time stash 已经为当前 packet 身份留下 payload（UV snapshot +
+  // diffuse view/sampler/descriptor/samplerIndex + 真实 alphaRef），
+  // 我们在构造 candidate 时直接把这些资源灌入 War3ShadowPersistentGeometry，
+  // 后续 `War3FindOrCreateShadowPersistentGeometry` 看到 uploads[3].bytes==0
+  // 就不会覆盖这些字段，persistent geometry 缓存条目会保留 payload 的
+  // UV buffer 与 diffuse 绑定；draw-copy 阶段再把它们传给 `War3ShadowCasterDraw`，
+  // shadow caster shader 的 `pc.flags & 0x4u` 因此可以正常激活。
+  //
+  // 安全保持：payload 缺失 → candidate 维持 current behaviour
+  //（alphaTestEnabled 从 material classification 设定、uv/diffuse 字段为空），
+  // reject 路径已经过 softening 在无 payload 时拒绝 cutout caster，
+  // 所以语义上不可能走到"alphaTest=true 但 diffuse=null"的下游渲染分支。
+  bool alphaTestPayloadApplied = false;
+  dxvk::war3::shadow::War3ShadowAlphaTestPayload alphaTestPayload = {};
+  {
+    auto& atCounters =
+        dxvk::war3::shadow::g_war3ShadowAlphaTestPayloadCounters;
+    const bool classifiedCutoutOrAlpha = alphaCutoutEnabled || alphaBlendEnabled;
+    if (classifiedCutoutOrAlpha) {
+      atCounters.attemptCount.fetch_add(1u, std::memory_order_relaxed);
+      const uint64_t payloadKey =
+          dxvk_war3_alpha_test_internal::BuildKeyFromRenderable(
+              packet.renderable);
+      if (payloadKey == 0u) {
+        atCounters.missStageInvalidCount.fetch_add(
+            1u, std::memory_order_relaxed);
+      } else {
+        if (dxvk_war3_alpha_test_internal::LookupPayloadCopy(
+                payloadKey, m_war3ShadowPersistentFrameSerial,
+                alphaTestPayload)) {
+          if (alphaTestPayload.uvStorage == nullptr ||
+              alphaTestPayload.uvInfo.buffer == VK_NULL_HANDLE ||
+              alphaTestPayload.uvInfo.size == 0u ||
+              alphaTestPayload.uvFormat == VK_FORMAT_UNDEFINED ||
+              alphaTestPayload.uvStride == 0u) {
+            atCounters.missNoUvCount.fetch_add(
+                1u, std::memory_order_relaxed);
+          } else if (alphaTestPayload.diffuseTexture == nullptr) {
+            atCounters.missNoDiffuseCount.fetch_add(
+                1u, std::memory_order_relaxed);
+          } else {
+            atCounters.hitCount.fetch_add(1u, std::memory_order_relaxed);
+            // 用 payload 的真实 alphaRef 覆盖 classification 默认的 0.5，
+            // 确保 shader 在边缘采样上和 draw-time D3DRS_ALPHAREF 一致。
+            candidate.alphaTestEnabled = true;
+            candidate.alphaRef = alphaTestPayload.alphaRef;
+            candidate.uvStride = alphaTestPayload.uvStride;
+            candidate.uvOffset = alphaTestPayload.uvOffset;
+            candidate.uvFormat = alphaTestPayload.uvFormat;
+            candidate.uvBinding = alphaTestPayload.uvBinding;
+            candidate.uvStorage = alphaTestPayload.uvStorage;
+            candidate.uvInfo = alphaTestPayload.uvInfo;
+            candidate.diffuseTexture = alphaTestPayload.diffuseTexture;
+            candidate.diffuseSampler = alphaTestPayload.diffuseSampler;
+            candidate.textureDescriptor = alphaTestPayload.textureDescriptor;
+            candidate.diffuseSamplerIndex =
+                alphaTestPayload.diffuseSamplerIndex;
+            alphaTestPayloadApplied = true;
+            atCounters.appliedCount.fetch_add(
+                1u, std::memory_order_relaxed);
+          }
+        } else {
+          atCounters.missStageInvalidCount.fetch_add(
+              1u, std::memory_order_relaxed);
+        }
+      }
+    }
+  }
 
   std::array<War3ShadowPersistentUpload, 4> uploads = {};
   uploads[0].hostData = effectivePositions->data();
@@ -7349,25 +10774,25 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   };
   std::vector<SemanticBlendVertex> blendVertices;
   if (skinned && !blendIndices.empty()) {
-    if (hasExplicitBlendContract) {
-      blendVertices.resize(vertexCount);
-      for (uint32_t i = 0u; i < vertexCount; ++i) {
+    blendVertices.resize(vertexCount);
+    for (uint32_t i = 0u; i < vertexCount; ++i) {
+      if (usesExplicitBlendContract) {
         blendVertices[i].weights[0] = blendWeights[i][0];
         blendVertices[i].weights[1] = blendWeights[i][1];
         blendVertices[i].weights[2] = blendWeights[i][2];
-        blendVertices[i].indices[0] = blendIndices[i][0];
-        blendVertices[i].indices[1] = blendIndices[i][1];
-        blendVertices[i].indices[2] = blendIndices[i][2];
-        blendVertices[i].indices[3] = blendIndices[i][3];
+      } else {
+        blendVertices[i].weights[0] = 0.0f;
+        blendVertices[i].weights[1] = 0.0f;
+        blendVertices[i].weights[2] = 0.0f;
       }
-      uploads[2].hostData = blendVertices.data();
-      uploads[2].bytes =
-          VkDeviceSize(blendVertices.size() * sizeof(blendVertices[0]));
-    } else {
-      uploads[2].hostData = blendIndices.data();
-      uploads[2].bytes =
-          VkDeviceSize(blendIndices.size() * sizeof(blendIndices[0]));
+      blendVertices[i].indices[0] = blendIndices[i][0];
+      blendVertices[i].indices[1] = blendIndices[i][1];
+      blendVertices[i].indices[2] = blendIndices[i][2];
+      blendVertices[i].indices[3] = blendIndices[i][3];
     }
+    uploads[2].hostData = blendVertices.data();
+    uploads[2].bytes =
+        VkDeviceSize(blendVertices.size() * sizeof(blendVertices[0]));
     uploads[2].usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
     uploads[2].debugName = "War3SemanticShadowBlend";
   }
@@ -7375,7 +10800,9 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   uint32_t geometryId = 0u;
   const War3ShadowPersistentGeometry* geometry = nullptr;
   bool createdNewGeometry = false;
-  const bool frameLocalDynamicGeometry = packet.usesDynamicMeshPositions;
+  const bool frameLocalDynamicGeometry =
+      canonicalMesh.geometrySource ==
+      dxvk::war3::render::CanonicalGeometrySource::DynamicPositionStream;
   if (frameLocalDynamicGeometry &&
       dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() &&
       !dxvk::war3::internal::kShadowSemanticCoreAllowFrameLocalDynamicGeometry) {
@@ -7386,14 +10813,15 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       WAR3_RENDER_LOG(
           "DXVK SemanticShadow: reject frame-local dynamic geometry "
           "runtime=%p model=%p geoIdx=%u handle=%u raw=%08X scene=%p mesh=%p\n",
-          packet.renderable.runtimeModelPtr, packet.resource.modelResourcePtr,
-          static_cast<unsigned>(packet.resource.geosetIndex),
-          static_cast<unsigned>(packet.renderable.jHandle),
-          static_cast<unsigned>(packet.renderable.rawcode),
-          packet.renderable.sceneNode, packet.renderable.meshData);
+          canonicalIdentity.runtimeModelPtr, canonicalMesh.modelResourcePtr,
+          static_cast<unsigned>(canonicalMesh.geosetIndex),
+          static_cast<unsigned>(canonicalIdentity.jHandle),
+          static_cast<unsigned>(canonicalIdentity.rawcode),
+          canonicalIdentity.sceneNode, canonicalIdentity.meshDataPtr);
     }
     m_war3Scene.shadowStats.semanticSceneRejectedGeometry++;
     m_war3Scene.shadowStats.semanticSceneRejectedGeometryFrameLocal++;
+    notePhase5GeometryReject();
     return false;
   }
   War3ShadowPersistentGeometry frameLocalGeometry = {};
@@ -7450,6 +10878,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
                                 frameLocalGeometry.uvInfo)) {
       m_war3Scene.shadowStats.semanticSceneRejectedGeometry++;
       m_war3Scene.shadowStats.semanticSceneRejectedGeometryFrameLocal++;
+      notePhase5GeometryReject();
       return false;
     }
 
@@ -7466,6 +10895,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           geometry == nullptr) {
         m_war3Scene.shadowStats.semanticSceneRejectedGeometry++;
         m_war3Scene.shadowStats.semanticSceneRejectedGeometryPersistent++;
+        notePhase5GeometryReject();
           return false;
       }
     }
@@ -7473,14 +10903,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   }
 
   auto resolveWorldMatrix = [&]() {
-    if (skinned)
-      return Matrix4();
-    if (packet.usesDynamicMeshPositions && hasSceneNodeWorldMatrix)
-      return sceneNodeWorldMatrix;
-    if (packet.pose.hasWorldTransform)
-      return packet.pose.worldTransform;
-    if (!packet.pose.matrixPalette.empty())
-      return packet.pose.matrixPalette[0];
+    if (canonicalWorldTransform.valid)
+      return canonicalWorldTransform.matrix;
     return Matrix4();
   };
 
@@ -7504,6 +10928,93 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   draw.blendIndexOffset = geometry->blendIndexOffset;
   draw.blendIndexFormat = geometry->blendIndexFormat;
   draw.blendBinding = geometry->blendBinding;
+
+  // Phase 7.55 v4 consume 端：draw-time VB override（GPU copy 自有 buffer 版本）。
+  // key = renderablePart（per-part 精确，和 capture 端一致）。
+  // capture 时已用 GPU copyBuffer 把 vertex range + index range 拷到我们自有
+  // device-local buffer。这里直接绑定，无须 lazy upload。
+  // 注意：positionBuffer 起点对应原 VB 的 vRangeStart 处，所以原 IB 的 index
+  // 仍指向原 vertex 编号空间。Vulkan vertexOffset = -vertexBaseIndex（int32_t
+  // 支持负数）让 GPU 在采样时正确映射到我们 buffer 的 (idx - vRangeStart)。
+  bool drawTimeVBOverrideApplied = false;
+  if (geometry->vertexBlendEnabled) {
+    void* consumeKey = packet.renderable.renderablePart;
+    if (consumeKey != nullptr) {
+      auto vbIt = m_war3DrawTimeVBCache.find(consumeKey);
+      // freshness 放宽到 8 帧：某些 part 不是每帧都 draw（sub-mesh 切换、
+      // 状态切换），3 帧太严会造成低频"消失一帧"的视觉闪烁。
+      const bool entryFresh =
+          vbIt != m_war3DrawTimeVBCache.end() &&
+          vbIt->second.vertexCount > 0u &&
+          vbIt->second.positionBuffer != nullptr &&
+          vbIt->second.positionInfo.buffer != VK_NULL_HANDLE &&
+          vbIt->second.frameSerial + 8u >= m_war3ShadowPersistentFrameSerial;
+      if (entryFresh) {
+        const auto& entry = vbIt->second;
+        // 用 capture 时拷的 device-local buffer
+        draw.positionStorage = entry.positionBuffer;
+        draw.positionInfo = entry.positionInfo;
+        draw.positionStride = entry.positionStride;
+        draw.positionOffset = entry.positionOffset;
+        draw.positionFormat = entry.positionFormat;
+        // 关闭 GPU skinning：positions 已是 CPU skin 后的世界空间顶点
+        draw.vertexBlendEnabled = false;
+        draw.vertexBlendIndexed = false;
+        draw.vertexBlendCount = 0u;
+        draw.blendBinding = 0u;
+        draw.blendStride = 0u;
+        draw.blendStorage = nullptr;
+        draw.blendInfo = {};
+        // worldMatrix 用 capture 时的 D3DTS_WORLD：
+        //   - 动态单位（CPU skin 后）：通常是 identity，顶点已在世界空间
+        //   - 静态建筑（未 skin）：是该模型的 world 变换，顶点是模型本地空间
+        // 不能强制 identity，否则静态建筑的本地空间顶点会跑到世界中心。
+        draw.worldMatrix = entry.capturedWorldMatrix;
+        // 接入对应 IB（capture 已 copy）。
+        // capture 时存好的 consumeVertexOffset 直接用：
+        //   - wrap path：= BaseVertexIndex（让 GPU final = BaseVI + IB_value）
+        //   - standard path：= -MinVertexIndex（通常 0）
+        // 这样我们 buffer 起点对应原 VB 索引 K，buffer 索引 i 对应原 VB K+i，
+        // 而 GPU 期望的位置 = BaseVI + IB_value，差值就是 vertexOffset。
+        if (entry.indexed && entry.indexBuffer != nullptr &&
+            entry.indexInfo.buffer != VK_NULL_HANDLE) {
+          draw.indexed = true;
+          draw.indexStorage = entry.indexBuffer;
+          draw.indexInfo = entry.indexInfo;
+          draw.indexType = entry.indexType;
+          draw.indexCount = entry.indexCount;
+          draw.firstIndex = 0u;
+          draw.vertexOffset = entry.consumeVertexOffset;
+        } else {
+          // non-indexed：按 capture 顺序画 v0..vN-1
+          draw.indexed = false;
+          draw.indexCount = 0u;
+          draw.firstIndex = 0u;
+          draw.vertexOffset = 0;
+          draw.vertexCount = entry.vertexCount;
+          draw.firstVertex = 0u;
+        }
+        draw.minVertexIndex = 0u;
+        draw.numVertices = entry.vertexCount;
+        // UV override：capture 时拷的 UV buffer。
+        // 若 capture 没拿到 UV（uvFormat==UNDEFINED），保留 geometry 默认 UV
+        // 让后面的 alpha-test lane 自己决定。
+        if (entry.uvFormat != VK_FORMAT_UNDEFINED &&
+            entry.uvBuffer != nullptr &&
+            entry.uvInfo.buffer != VK_NULL_HANDLE) {
+          draw.uvStorage = entry.uvBuffer;
+          draw.uvInfo = entry.uvInfo;
+          draw.uvStride = entry.uvStride;
+          draw.uvOffset = entry.uvOffset;
+          draw.uvFormat = entry.uvFormat;
+        }
+        drawTimeVBOverrideApplied = true;
+        m_war3Scene.shadowStats.drawTimeVBCacheConsumeHitCount++;
+      } else {
+        m_war3Scene.shadowStats.drawTimeVBCacheConsumeMissCount++;
+      }
+    }
+  }
   draw.blendStride = geometry->blendStride;
   draw.alphaTestEnabled = geometry->alphaTestEnabled;
   draw.alphaRef = geometry->alphaRef;
@@ -7511,37 +11022,114 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   draw.depthWriteEnabled = true;
   draw.depthTestEnabled = true;
   draw.additiveBlend = false;
-  draw.uvStride = 0u;
-  draw.uvOffset = 0u;
-  draw.uvFormat = VK_FORMAT_UNDEFINED;
-  if (geometry->indexed) {
-    draw.indexStorage = geometry->indexStorage;
-    draw.indexInfo = geometry->indexInfo;
-    draw.indexType = geometry->indexType;
-    draw.indexCount = geometry->indexCount;
-    draw.firstIndex = geometry->firstIndex;
-    draw.vertexOffset = geometry->vertexOffset;
-    draw.vertexCount = 0u;
-    draw.firstVertex = 0u;
-    draw.minVertexIndex = geometry->minVertexIndex;
-    draw.numVertices = geometry->numVertices;
-  } else {
-    draw.indexCount = 0u;
-    draw.firstIndex = 0u;
-    draw.vertexOffset = 0;
-    draw.vertexCount = geometry->vertexCount;
-    draw.firstVertex = geometry->firstVertex;
-    draw.minVertexIndex = geometry->minVertexIndex;
-    draw.numVertices = geometry->numVertices;
+  // Phase 7.55 v4：capture 时记录的 alpha test 状态覆盖 geometry 默认值。
+  // bypass capture 路径不会进入 legacy ShadowCapture 后段的 alpha-test 块，
+  // 所以 geometry->alphaTestEnabled 永远是 false。这里用我们 capture 的状态。
+  if (drawTimeVBOverrideApplied) {
+    void* consumeKey = packet.renderable.renderablePart;
+    auto vbIt = m_war3DrawTimeVBCache.find(consumeKey);
+    if (vbIt != m_war3DrawTimeVBCache.end()) {
+      const auto& entry = vbIt->second;
+      // alpha-test 等价：原本就是 alpha test，或者带 UV+diffuse 的 alpha blend
+      // 也升级为 alpha test discard（避免黑色实心方块）。
+      const bool effectiveAlphaTest =
+          entry.alphaTestEnabled ||
+          (entry.alphaBlendEnabled &&
+           entry.diffuseTexture != nullptr &&
+           entry.uvFormat != VK_FORMAT_UNDEFINED &&
+           entry.uvStride > 0u);
+      draw.alphaTestEnabled = effectiveAlphaTest;
+      draw.alphaRef = effectiveAlphaTest ? entry.alphaRef : 0.0f;
+      draw.alphaBlendEnabled = entry.alphaBlendEnabled;
+    }
   }
-  if (geometry->blendBinding == 1u) {
-    draw.blendStorage = geometry->blendStorage;
-    draw.blendInfo = geometry->blendInfo;
+  // AlphaTest lane：把 persistent geometry 里的 UV/diffuse 绑定继续传给
+  // War3ShadowCasterDraw。shadow caster shader 的 pc.flags bit2 与 descriptor
+  // 绑定条件都是 `draw.alphaTestEnabled && draw.diffuseTexture`，所以这四段
+  // 必须与 geometry 的 uv*/diffuseTexture* 同步。
+  // 注意：v4 命中时不要覆盖 uvStride/uvOffset/uvFormat（已用 draw-time UV），
+  // 但 diffuseTexture/diffuseSampler/textureDescriptor 与 vertex 数据无关，
+  // 仍来自 geometry。
+  if (!drawTimeVBOverrideApplied) {
+    draw.uvStride = geometry->uvStride;
+    draw.uvOffset = geometry->uvOffset;
+    draw.uvFormat = geometry->uvFormat;
+  }
+  draw.diffuseTexture = geometry->diffuseTexture;
+  draw.diffuseSampler = geometry->diffuseSampler;
+  draw.textureDescriptor = geometry->textureDescriptor;
+  draw.diffuseSamplerIndex = geometry->diffuseSamplerIndex;
+  // v4 命中时，capture 已记录 stage 0 纹理。geometry->diffuseTexture
+  // 在 bypass path 下为 nullptr，必须覆盖让 alpha-test discard 拿到真纹理。
+  if (drawTimeVBOverrideApplied && draw.alphaTestEnabled) {
+    void* consumeKey = packet.renderable.renderablePart;
+    auto vbIt = m_war3DrawTimeVBCache.find(consumeKey);
+    if (vbIt != m_war3DrawTimeVBCache.end() &&
+        vbIt->second.diffuseTexture != nullptr) {
+      draw.diffuseTexture = vbIt->second.diffuseTexture;
+      // 派生 sampler 和 textureDescriptor（参考 line 25140）。
+      bool alphaUseMip = false;
+      float alphaMipLodBias = 0.0f;
+      if (m_war3Pipeline) {
+        const auto& shadowSettings = m_war3Pipeline->GetSettings().shadows;
+        alphaUseMip = shadowSettings.alphaShadowUseMip;
+        alphaMipLodBias = shadowSettings.alphaShadowMipLodBias;
+      }
+      if (m_shadowReceiverPass != nullptr) {
+        draw.diffuseSampler =
+            m_shadowReceiverPass->getFallbackSampler(alphaUseMip,
+                                                     alphaMipLodBias);
+        if (draw.diffuseSampler != nullptr) {
+          draw.diffuseSamplerIndex =
+              draw.diffuseSampler->getDescriptor().samplerIndex;
+        }
+      }
+      draw.textureDescriptor = *draw.diffuseTexture->getDescriptor();
+    } else {
+      // 没拿到 stage 0 纹理：禁用 alpha test，避免 shader 端崩溃。
+      draw.alphaTestEnabled = false;
+    }
+  }
+  // v4 命中时跳过 geometry 的 IB/storage 默认覆盖，保留 draw-time VB/IB。
+  if (!drawTimeVBOverrideApplied) {
+    if (geometry->indexed) {
+      draw.indexStorage = geometry->indexStorage;
+      draw.indexInfo = geometry->indexInfo;
+      draw.indexType = geometry->indexType;
+      draw.indexCount = geometry->indexCount;
+      draw.firstIndex = geometry->firstIndex;
+      draw.vertexOffset = geometry->vertexOffset;
+      draw.vertexCount = 0u;
+      draw.firstVertex = 0u;
+      draw.minVertexIndex = geometry->minVertexIndex;
+      draw.numVertices = geometry->numVertices;
+    } else {
+      draw.indexCount = 0u;
+      draw.firstIndex = 0u;
+      draw.vertexOffset = 0;
+      draw.vertexCount = geometry->vertexCount;
+      draw.firstVertex = geometry->firstVertex;
+      draw.minVertexIndex = geometry->minVertexIndex;
+      draw.numVertices = geometry->numVertices;
+    }
+    if (geometry->blendBinding == 1u) {
+      draw.blendStorage = geometry->blendStorage;
+      draw.blendInfo = geometry->blendInfo;
+    }
+  }
+  // AlphaTest lane：把 persistent geometry 的 UV storage 传给 draw。
+  // 若 geometry 没有 UV（opaque caster），storage 为 nullptr 不会触发
+  // shadow caster 的 alpha-test 绑定路径，行为与改动前等价。
+  // v4 命中时已设置 draw-time UV storage，不要覆盖。
+  if (!drawTimeVBOverrideApplied && geometry->alphaTestEnabled &&
+      geometry->uvStorage != nullptr) {
+    draw.uvStorage = geometry->uvStorage;
+    draw.uvInfo = geometry->uvInfo;
   }
 
   draw.category = War3RenderState::StageCategory::WorldObject;
   draw.batchTag = War3BatchTag::Unknown;
-  draw.batchHandle = War3NormalizeShadowHandle(packet.renderable.jHandle);
+  draw.batchHandle = War3NormalizeShadowHandle(canonicalIdentity.jHandle);
   draw.objectKind = static_cast<uint8_t>(resolvedObjectKind);
 
   const bool unitLikeObject = War3IsSemanticUnitObject(resolvedObjectKind);
@@ -7550,14 +11138,15 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       "War3SemanticScene/SubmitFrame/Bounds");
   const Matrix4* semanticBoundsMatrix = nullptr;
   if (skinned) {
-    if (packet.pose.hasWorldTransform)
-      semanticBoundsMatrix = &packet.pose.worldTransform;
-    else if (!packet.pose.matrixPalette.empty())
-      semanticBoundsMatrix = &packet.pose.matrixPalette[0];
-    else if (liveRuntimeGroupPaletteReady && !liveRuntimeGroupPalette.empty())
-      semanticBoundsMatrix = &liveRuntimeGroupPalette[0];
-    else if (!packet.runtimeGroupPalette.empty())
-      semanticBoundsMatrix = &packet.runtimeGroupPalette[0];
+    const bool currentDrawPaletteWorldSpace =
+        canonicalSkin.paletteSource ==
+        dxvk::war3::render::CanonicalPaletteSource::CurrentDrawCapturedPalette;
+    if (currentDrawPaletteWorldSpace && canonicalSkin.paletteReady())
+      semanticBoundsMatrix = &canonicalSkin.paletteVec()[0];
+    else if (canonicalWorldTransform.valid)
+      semanticBoundsMatrix = &canonicalWorldTransform.matrix;
+    else if (canonicalSkin.paletteReady())
+      semanticBoundsMatrix = &canonicalSkin.paletteVec()[0];
   } else {
     semanticBoundsMatrix = &draw.worldMatrix;
   }
@@ -7607,10 +11196,19 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
 
   War3ShadowInstanceRef instance = {};
   instance.geometryId = geometryId;
-  instance.materialId = uint32_t(packet.material.signatureHash & 0xFFFFFFFFu);
+  instance.materialId = uint32_t(canonicalMaterial.signatureHash & 0xFFFFFFFFu);
   instance.replayDrawIndex =
       static_cast<uint32_t>(m_war3Scene.shadowCasters.size());
   instance.batchHandle = draw.batchHandle;
+  // Phase 7.55 v4：当我们用 draw-time VB 时，bounds 计算可能不可靠：
+  //   - 动态单位 v4 路径 worldMatrix=identity，translation=(0,0,0)，
+  //     若 palette stale 也是 (0,0,0)，bounds 中心错算成世界原点
+  //   - 这导致视角离开 (0,0,0) 时 cull 全部判定为不可见 → 大面积闪烁
+  // 修复：v4 hit 时把 boundsRadius 设为 0，让 cull 走"无效 bounds = 通过"路径。
+  // 性能影响小：v4 hit 的 caster 本来就在 capture 时被引擎绘制，必然在视野内。
+  if (drawTimeVBOverrideApplied) {
+    draw.boundsRadius = 0.0f;
+  }
   instance.paletteIndex = draw.paletteIndex;
   instance.worldMatrix = draw.worldMatrix;
   instance.boundsCenter = draw.boundsCenter;
@@ -7621,7 +11219,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   instance.mode = key.mode;
 
   const bool dynamicSemanticCaster =
-      skinned || packet.usesDynamicMeshPositions || unitLikeObject;
+      skinned || frameLocalDynamicGeometry || unitLikeObject;
   if (dynamicSemanticCaster) {
     m_war3Scene.shadowStats.dynamicPoseCount++;
     if (skinned)
@@ -7630,13 +11228,16 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     uint64_t dynamicHash = bit::fnv1a_init();
     dynamicHash = bit::fnv1a_iter(
         dynamicHash,
-        reinterpret_cast<uintptr_t>(packet.renderable.runtimeModelPtr));
+        reinterpret_cast<uintptr_t>(canonicalIdentity.runtimeModelPtr));
     dynamicHash = bit::fnv1a_iter(dynamicHash, effectiveModelKey);
-    dynamicHash = bit::fnv1a_iter(dynamicHash, packet.renderable.jHandle);
-    if (skinned || packet.usesDynamicMeshPositions ||
-        packet.pose.matrixHash != 0u || packet.pose.matrixCount != 0u) {
-      dynamicHash = bit::fnv1a_iter(dynamicHash, packet.pose.matrixCount);
-      dynamicHash = bit::fnv1a_iter(dynamicHash, packet.pose.matrixHash);
+    dynamicHash = bit::fnv1a_iter(dynamicHash, canonicalIdentity.jHandle);
+    if (skinned || frameLocalDynamicGeometry ||
+        canonicalIdentity.poseMatrixHash != 0u ||
+        canonicalIdentity.poseMatrixCount != 0u) {
+      dynamicHash =
+          bit::fnv1a_iter(dynamicHash, canonicalIdentity.poseMatrixCount);
+      dynamicHash =
+          bit::fnv1a_iter(dynamicHash, canonicalIdentity.poseMatrixHash);
       for (uint32_t i = 0u; i < 4u; ++i) {
         dynamicHash = bit::fnv1a_iter(
             dynamicHash, bit::cast<uint32_t>(draw.worldMatrix[i].x));
@@ -7659,16 +11260,16 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         dynamicHash =
             bit::fnv1a_iter(dynamicHash, submittedRuntimeGroupPaletteHash);
         dynamicHash =
-            bit::fnv1a_iter(dynamicHash, uint32_t(effectiveRuntimeGroupPalette.size()));
-        dynamicHash = bit::fnv1a_iter(dynamicHash, effectiveMaxVertexGroupSlot);
+            bit::fnv1a_iter(dynamicHash, uint32_t(canonicalSkin.paletteVec().size()));
+        dynamicHash = bit::fnv1a_iter(dynamicHash, canonicalSkin.maxVertexGroupSlot);
       }
-      if (packet.usesDynamicMeshPositions) {
+      if (frameLocalDynamicGeometry) {
         dynamicHash =
-            bit::fnv1a_iter(dynamicHash, packet.resource.contentHash);
+            bit::fnv1a_iter(dynamicHash, canonicalMesh.contentHash);
         dynamicHash = bit::fnv1a_iter(
-            dynamicHash, packet.resource.dynamicIndexHash);
+            dynamicHash, canonicalMesh.dynamicIndexHash);
         dynamicHash = bit::fnv1a_iter(
-            dynamicHash, packet.resource.dynamicPrimitiveBaseIndex);
+            dynamicHash, canonicalMesh.dynamicPrimitiveBaseIndex);
       }
       if (liveRuntimeGroupPaletteReady)
         dynamicHash = bit::fnv1a_iter(dynamicHash, liveRuntimeGroupPaletteHash);
@@ -7694,6 +11295,194 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
 
   m_war3Scene.shadowInstances.emplace_back(std::move(instance));
   m_war3Scene.shadowCasters.emplace_back(std::move(draw));
+  // Phase 7.2: 记录实际 append 时的 geometry key 和 identity 用于诊断
+  m_war3Scene.shadowStats.semanticSceneLastAppendedGeometrySourceHash =
+      key.sourceHash;
+  m_war3Scene.shadowStats.semanticSceneLastAppendedGeometryId = geometryId;
+  m_war3Scene.shadowStats.semanticSceneLastAppendedRenderablePart =
+      reinterpret_cast<uint64_t>(packet.renderable.renderablePart);
+  m_war3Scene.shadowStats.semanticSceneLastAppendedMeshData =
+      reinterpret_cast<uint64_t>(packet.renderable.meshData);
+  if (stableAuthoritativeSkinnedGeometryKey && currentDrawSample != nullptr) {
+    auto& st = m_war3Scene.shadowStats;
+    const uint64_t contractIdentityKey =
+        War3SemanticDirectSelectionKey(packet, *currentDrawSample);
+    const War3SemanticDirectCasterContractKey casterKey = {
+        contractIdentityKey,
+        reinterpret_cast<uint64_t>(packet.renderable.sceneNode),
+        reinterpret_cast<uint64_t>(packet.renderable.renderablePart),
+        reinterpret_cast<uint64_t>(packet.renderable.meshData)};
+    if (casterKey.valid()) {
+      const uint64_t currentStableGroupHash =
+          authoritativeStableGroupHash != 0u ? authoritativeStableGroupHash
+                                             : currentDrawSample->stableGroupHash;
+      st.semanticSceneDirectLastSubmittedSceneNode = casterKey.sceneNode;
+      st.semanticSceneDirectLastSubmittedRenderablePart =
+          casterKey.renderablePart;
+      st.semanticSceneDirectLastSubmittedMeshData = casterKey.meshData;
+      st.semanticSceneDirectLastSubmittedPaletteHash =
+          currentDrawSample->paletteHash != 0u ? currentDrawSample->paletteHash
+                                               : drawTimeCapturedPaletteHash;
+      st.semanticSceneDirectLastSubmittedGroupHash = authoritativeGroupHash;
+      st.semanticSceneDirectLastSubmittedStableGroupHash =
+          currentStableGroupHash;
+      st.semanticSceneDirectLastSubmittedStream1Ptr =
+          reinterpret_cast<uint64_t>(currentDrawSample->contract.stream1Ptr);
+      st.semanticSceneDirectLastSubmittedGeometrySourceHash = key.sourceHash;
+      // Phase 7.48：per-frame submitted skinned palette 聚合（只对 skinned 生效）。
+      // 目的见 d3d9_war3_scene.h 的字段注释。
+      if (skinned) {
+        const uint64_t curPaletteHash =
+            st.semanticSceneDirectLastSubmittedPaletteHash;
+        if (curPaletteHash == 0u) {
+          st.semanticSceneSubmittedSkinnedPaletteZeroHashCount++;
+        }
+        if (st.semanticSceneSubmittedSkinnedPaletteFirstSubmittedHash == 0u)
+          st.semanticSceneSubmittedSkinnedPaletteFirstSubmittedHash =
+              curPaletteHash;
+        if (st.semanticSceneSubmittedSkinnedPaletteCombinedHash == 0u) {
+          st.semanticSceneSubmittedSkinnedPaletteCombinedHash =
+              curPaletteHash != 0u ? curPaletteHash : 0x9E3779B97F4A7C15ULL;
+          st.semanticSceneSubmittedSkinnedPaletteDistinctSampleCount = 1u;
+          st.semanticSceneSubmittedSkinnedPaletteRunningLastHash =
+              curPaletteHash;
+          st.semanticSceneSubmittedSkinnedPaletteRunningSameHashRun = 1u;
+          st.semanticSceneSubmittedSkinnedPaletteConsecutiveSameHashCountMax =
+              1u;
+        } else {
+          // 滚动 FNV1a：把 hash 按字节序列迭代进去。只要任一 caster 的 palette 变化，
+          // CombinedHash 就会变；如果整帧所有 caster 都换了同一套 palette，
+          // CombinedHash 就锁住。
+          const uint32_t lo = uint32_t(curPaletteHash & 0xFFFFFFFFu);
+          const uint32_t hi = uint32_t((curPaletteHash >> 32u) & 0xFFFFFFFFu);
+          st.semanticSceneSubmittedSkinnedPaletteCombinedHash =
+              bit::fnv1a_iter(
+                  bit::fnv1a_iter(
+                      st.semanticSceneSubmittedSkinnedPaletteCombinedHash, lo),
+                  hi);
+          if (curPaletteHash !=
+              st.semanticSceneSubmittedSkinnedPaletteRunningLastHash) {
+            st.semanticSceneSubmittedSkinnedPaletteDistinctSampleCount++;
+            st.semanticSceneSubmittedSkinnedPaletteRunningLastHash =
+                curPaletteHash;
+            st.semanticSceneSubmittedSkinnedPaletteRunningSameHashRun = 1u;
+          } else {
+            st.semanticSceneSubmittedSkinnedPaletteRunningSameHashRun++;
+            if (st.semanticSceneSubmittedSkinnedPaletteRunningSameHashRun >
+                st.semanticSceneSubmittedSkinnedPaletteConsecutiveSameHashCountMax) {
+              st.semanticSceneSubmittedSkinnedPaletteConsecutiveSameHashCountMax =
+                  st.semanticSceneSubmittedSkinnedPaletteRunningSameHashRun;
+            }
+          }
+        }
+      }
+      const bool hasCurrentPalette0 =
+          currentDrawSample->paletteReady() &&
+          !currentDrawSample->palette.empty();
+      const Matrix4 currentPalette0 =
+          hasCurrentPalette0 ? currentDrawSample->palette[0] : Matrix4();
+
+      auto updateChurn = [](uint64_t& previous, uint64_t current,
+                            uint32_t& churnCounter) {
+        if (previous != 0u && previous != current)
+          churnCounter++;
+        previous = current;
+      };
+      auto matrixMaxAbsDelta = [](const Matrix4& a,
+                                  const Matrix4& b) -> float {
+        float result = 0.0f;
+        for (uint32_t row = 0u; row < 4u; ++row) {
+          result = std::max(result, std::fabs(a[row].x - b[row].x));
+          result = std::max(result, std::fabs(a[row].y - b[row].y));
+          result = std::max(result, std::fabs(a[row].z - b[row].z));
+          result = std::max(result, std::fabs(a[row].w - b[row].w));
+        }
+        return result;
+      };
+      auto stateIt = m_war3SemanticDirectCasterContracts.find(casterKey);
+      if (stateIt != m_war3SemanticDirectCasterContracts.end()) {
+        st.semanticSceneDirectSameCasterComparisonCount++;
+        auto& previous = stateIt->second;
+        if (previous.paletteHash != 0u &&
+            previous.paletteHash !=
+                st.semanticSceneDirectLastSubmittedPaletteHash &&
+            previous.hasPalette0 && hasCurrentPalette0) {
+          const float palette0Delta =
+              matrixMaxAbsDelta(previous.palette0, currentPalette0);
+          st.semanticSceneDirectPaletteRootDeltaSampleCount++;
+          const uint32_t deltaMilli = uint32_t(std::min<float>(
+              4294967295.0f, palette0Delta * 1000.0f));
+          st.semanticSceneDirectPaletteRootMaxDeltaMilli = std::max(
+              st.semanticSceneDirectPaletteRootMaxDeltaMilli, deltaMilli);
+          if (palette0Delta < 0.0001f)
+            st.semanticSceneDirectPaletteRootHashChangedTinyDeltaCount++;
+          else if (palette0Delta < 0.05f)
+            st.semanticSceneDirectPaletteRootHashChangedSmallDeltaCount++;
+          else if (palette0Delta < 0.5f)
+            st.semanticSceneDirectPaletteRootHashChangedMediumDeltaCount++;
+          else
+            st.semanticSceneDirectPaletteRootHashChangedLargeDeltaCount++;
+        }
+        updateChurn(previous.paletteHash,
+                    st.semanticSceneDirectLastSubmittedPaletteHash,
+                    st.semanticSceneDirectPaletteHashChurnCount);
+        updateChurn(previous.groupHash,
+                    st.semanticSceneDirectLastSubmittedGroupHash,
+                    st.semanticSceneDirectGroupHashChurnCount);
+        updateChurn(previous.stableGroupHash,
+                    st.semanticSceneDirectLastSubmittedStableGroupHash,
+                    st.semanticSceneDirectStableGroupHashChurnCount);
+        updateChurn(previous.stream1Ptr,
+                    st.semanticSceneDirectLastSubmittedStream1Ptr,
+                    st.semanticSceneDirectStream1PtrChurnCount);
+        updateChurn(previous.geometrySourceHash, key.sourceHash,
+                    st.semanticSceneDirectGeometrySourceHashChurnCount);
+        previous.lastSeenFrame = m_war3ShadowPersistentFrameSerial;
+        if (hasCurrentPalette0) {
+          previous.palette0 = currentPalette0;
+          previous.hasPalette0 = true;
+        }
+      } else {
+        if (!m_war3SemanticDirectCasterContracts.empty())
+          st.semanticSceneDirectIdentitySkippedChurnCount++;
+        auto inserted = m_war3SemanticDirectCasterContracts.emplace(
+            casterKey,
+            War3SemanticDirectCasterContractState{
+                st.semanticSceneDirectLastSubmittedPaletteHash,
+                st.semanticSceneDirectLastSubmittedGroupHash,
+                st.semanticSceneDirectLastSubmittedStableGroupHash,
+                st.semanticSceneDirectLastSubmittedStream1Ptr,
+                key.sourceHash,
+                m_war3ShadowPersistentFrameSerial});
+        if (inserted.second && hasCurrentPalette0) {
+          inserted.first->second.palette0 = currentPalette0;
+          inserted.first->second.hasPalette0 = true;
+        }
+      }
+
+      if (m_war3SemanticDirectCasterContracts.size() > 4096u) {
+        const uint64_t keepAfter =
+            m_war3ShadowPersistentFrameSerial > 180u
+                ? m_war3ShadowPersistentFrameSerial - 180u
+                : 0u;
+        for (auto it = m_war3SemanticDirectCasterContracts.begin();
+             it != m_war3SemanticDirectCasterContracts.end();) {
+          if (it->second.lastSeenFrame < keepAfter)
+            it = m_war3SemanticDirectCasterContracts.erase(it);
+          else
+            ++it;
+        }
+        if (m_war3SemanticDirectCasterContracts.size() > 4096u)
+          m_war3SemanticDirectCasterContracts.clear();
+      }
+    }
+  }
+  if (dxvk::war3::internal::IsNativeRendererHostExecuteValidationRuntimeEnabled()) {
+    dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
+        .publishCanonicalDrawPrepared(
+            canonicalItem, *effectivePositions, effectiveIndexData,
+            useIndices ? effectiveIndexCount : 0u);
+  }
   m_war3Scene.shadowStats.captured++;
   if (useIndices)
     m_war3Scene.shadowStats.capturedIndexed++;
@@ -7701,6 +11490,38 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     m_war3Scene.shadowStats.capturedNonIndexed++;
   m_war3Scene.shadowStats.capturedWorldObject++;
   m_war3Scene.shadowStats.semanticSceneSubmitted++;
+  // Phase 7.35 Pose-lag 诊断：在 submit 成功处记录一次时间滞后。
+  // 只要 directCurrentDrawSample 存在就用它的 contract.renderFrameIndex
+  // 作为 record publish 帧号；没有 sample（fallback 路径）按 0 处理即 Lag0。
+  if (directCurrentDrawSample != nullptr &&
+      directCurrentDrawSample->contract.known) {
+    dxvk::war3::render::NoteSubmitPaletteFrameLag(
+        directCurrentDrawSample->contract.renderFrameIndex);
+  } else {
+    dxvk::war3::render::NoteSubmitPaletteFrameLag(0u);
+  }
+  if (skinned) {
+    uint32_t currentPaletteFrameTag = 0u;
+    const uint32_t paletteContentFrameTag =
+        paletteMinFrameTagThisSubmit != 0u ? paletteMinFrameTagThisSubmit
+                                           : paletteMaxFrameTagThisSubmit;
+    if (paletteContentFrameTag != 0u &&
+        dxvk::war3::model::QueryCurrentPaletteFrameTag(
+            currentPaletteFrameTag)) {
+      dxvk::war3::render::NoteSubmitPaletteContentAge(
+          paletteContentFrameTag, currentPaletteFrameTag);
+    } else {
+      dxvk::war3::render::NoteSubmitPaletteContentAgeUnknown();
+    }
+  }
+  if (resolvedObjectKind == dxvk::war3::render::ObjectKind::Building)
+    m_war3Scene.shadowStats.semanticSceneSubmittedBuilding++;
+  if (resolvedObjectKind == dxvk::war3::render::ObjectKind::Destructible)
+    m_war3Scene.shadowStats.semanticSceneSubmittedDestructible++;
+  if (effectiveAlphaMode == dxvk::war3::shadow::ShadowAlphaMode::Cutout)
+    m_war3Scene.shadowStats.semanticSceneSubmittedCutout++;
+  if (effectiveAlphaMode == dxvk::war3::shadow::ShadowAlphaMode::AlphaBlend)
+    m_war3Scene.shadowStats.semanticSceneSubmittedAlphaBlend++;
   if (unitLikeObject) {
     m_war3Scene.shadowStats.capturedUnitObject++;
     m_war3Scene.shadowStats.persistentUnitInstanceCount++;
@@ -7708,13 +11529,52 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     if (skinned)
       m_war3Scene.shadowStats.capturedUnitVertexBlend++;
   }
-  if (skinned)
+  if (skinned) {
     m_war3Scene.shadowStats.semanticSceneSubmittedSkinned++;
+    if (!usesExplicitBlendContract && authoritativeDrawContractKnown)
+      m_war3Scene.shadowStats.semanticSceneExplicitBlendUnavailableCurrentDraw++;
+    if (!usesExplicitBlendContract && nonExplicitUniqueGroupSlotCountValid) {
+      if (nonExplicitUniqueGroupSlotCount <= 1u)
+        m_war3Scene.shadowStats
+            .semanticSceneSubmittedSingleMatrixGroupSkinning++;
+      else
+        m_war3Scene.shadowStats.semanticSceneSubmittedMultiGroupSlotSkinning++;
+
+      auto& minUnique =
+          m_war3Scene.shadowStats.semanticSceneSkinnedMinUniqueGroupSlots;
+      auto& maxUnique =
+          m_war3Scene.shadowStats.semanticSceneSkinnedMaxUniqueGroupSlots;
+      if (minUnique == 0u || nonExplicitUniqueGroupSlotCount < minUnique)
+        minUnique = nonExplicitUniqueGroupSlotCount;
+      maxUnique = std::max(maxUnique, nonExplicitUniqueGroupSlotCount);
+      if (nonExplicitUniqueGroupSlotCount <= 1u) {
+        m_war3Scene.shadowStats.semanticSceneSkinnedGroupSlotsUnique1Count++;
+      } else if (nonExplicitUniqueGroupSlotCount <= 4u) {
+        m_war3Scene.shadowStats
+            .semanticSceneSkinnedGroupSlotsUnique2To4Count++;
+      } else if (nonExplicitUniqueGroupSlotCount <= 8u) {
+        m_war3Scene.shadowStats
+            .semanticSceneSkinnedGroupSlotsUnique5To8Count++;
+      } else if (nonExplicitUniqueGroupSlotCount <= 16u) {
+        m_war3Scene.shadowStats
+            .semanticSceneSkinnedGroupSlotsUnique9To16Count++;
+      } else {
+        m_war3Scene.shadowStats
+            .semanticSceneSkinnedGroupSlotsUnique17PlusCount++;
+      }
+    }
+  }
+  if (authoritativeGroupSlotsReady)
+    m_war3Scene.shadowStats.semanticSceneSubmittedOwnedGroupSlots++;
+  if (usesOwnedGroupSlots)
+    m_war3Scene.shadowStats.semanticSceneSubmittedOwnedGroupSlots++;
+  if (usesExplicitBlendContract)
+    m_war3Scene.shadowStats.semanticSceneSubmittedExplicitBlendContract++;
   if (!unitLikeObject && !skinned &&
       resolvedObjectKind == dxvk::war3::render::ObjectKind::Unknown &&
-      packet.renderable.worldObjectEntry != nullptr &&
-      packet.renderable.sceneNode != nullptr &&
-      packet.pose.hasWorldTransform) {
+      canonicalIdentity.worldObjectEntry != nullptr &&
+      canonicalIdentity.sceneNode != nullptr &&
+      canonicalWorldTransform.valid) {
     m_war3Scene.shadowStats.semanticSceneAcceptedExplicitResourceOwnerRigid++;
   }
   m_war3Scene.shadowStats.persistentInstanceCount++;
@@ -7753,22 +11613,1838 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   return true;
 }
 
+// Phase 7.1: object-grouped direct current-draw submit helper
+// 将两处几乎相同的 direct loop 统一为一个函数，支持 caster identity 级分组提交。
+// 同一 caster identity 的所有 eligible record 作为整体提交或整体跳过，避免
+// 因逐 record 截断导致的 geoset 不完整与帧间闪烁。
+uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
+    bool readyOnly,
+    bool unitsOnly,
+    uint64_t currentVisibleFrameSerial,
+    uint64_t currentDrawMinVisibleFrameSerial) {
+  const uint32_t directRecordCap =
+      War3SemanticDirectCurrentDrawRecordCapRuntime();
+  const uint32_t directScanCap =
+      War3SemanticDirectCurrentDrawScanCapRuntime();
+  const bool useObjectGrouped = War3SemanticObjectGroupedSelectionRuntime();
+  const bool useObjectFirstSnapshot =
+      useObjectGrouped && War3SemanticObjectFirstSnapshotRuntime();
+  const bool stickySelectionLease = War3SemanticStickySelectionLeaseRuntime();
+  const bool stickySelectionFill =
+      stickySelectionLease && War3SemanticStickySelectionFillRuntime() &&
+      directRecordCap != 0u;
+  const uint32_t stickySelectionFillMargin =
+      stickySelectionFill ? War3SemanticStickySelectionFillMarginRuntime() : 0u;
+  const uint32_t directStickyRecordBudget =
+      stickySelectionFill
+          ? directRecordCap + stickySelectionFillMargin
+          : directRecordCap;
+  m_war3Scene.shadowStats.semanticSceneDirectStickyFillBudgetRecordCount =
+      directStickyRecordBudget;
+
+  // Prefer the last actually submitted caster set. The historical lease map is
+  // useful as a diagnostic/fallback, but using every key seen during the lease
+  // window as "preferred" makes the preferred set grow until it covers most
+  // candidates, which reintroduces cap-boundary identity churn.
+  std::vector<uint64_t> previousSubmittedSelectionKeys =
+      m_war3SemanticDirectPrevSubmittedIdentityKeys;
+  std::vector<uint64_t> previousSubmittedObjectIdentityKeys =
+      m_war3SemanticDirectPrevSubmittedObjectIdentityKeys;
+  std::vector<uint64_t> previousSubmittedPartIdentityKeys =
+      m_war3SemanticDirectPrevSubmittedPartIdentityKeys;
+  std::vector<uint64_t> leasedSelectionKeys;
+  if (stickySelectionLease) {
+    const uint64_t currentFrame = m_war3ShadowPersistentFrameSerial;
+    const uint64_t leaseFrames = War3SemanticStickySelectionLeaseFramesRuntime();
+    const uint64_t keepAfter =
+        currentFrame > leaseFrames ? currentFrame - leaseFrames : 0u;
+    for (auto it = m_war3SemanticDirectSelectionLeaseLastSeen.begin();
+         it != m_war3SemanticDirectSelectionLeaseLastSeen.end();) {
+      if (it->second < keepAfter) {
+        it = m_war3SemanticDirectSelectionLeaseLastSeen.erase(it);
+        m_war3Scene.shadowStats
+            .semanticSceneDirectSelectionLeasePrunedKeyCount++;
+      } else {
+        leasedSelectionKeys.push_back(it->first);
+        ++it;
+      }
+    }
+  }
+  std::vector<uint64_t> preferredSelectionKeys =
+      previousSubmittedSelectionKeys;
+  if (stickySelectionLease &&
+      (preferredSelectionKeys.empty() ||
+       War3SemanticStickySelectionBroadLeasePreferenceRuntime())) {
+    preferredSelectionKeys.insert(preferredSelectionKeys.end(),
+                                  leasedSelectionKeys.begin(),
+                                  leasedSelectionKeys.end());
+  }
+  if (!preferredSelectionKeys.empty()) {
+    std::sort(preferredSelectionKeys.begin(), preferredSelectionKeys.end());
+    preferredSelectionKeys.erase(
+        std::unique(preferredSelectionKeys.begin(), preferredSelectionKeys.end()),
+        preferredSelectionKeys.end());
+  }
+  m_war3Scene.shadowStats.semanticSceneDirectSelectionLeaseActiveKeyCount =
+      stickySelectionLease ? uint32_t(leasedSelectionKeys.size()) : 0u;
+
+  // --- Step 1: snapshot raw records ---
+  dxvk::war3::render::CurrentDrawContractSnapshotOptions snapshotOptions = {};
+  snapshotOptions.minVisibleFrameSerial = currentDrawMinVisibleFrameSerial;
+  snapshotOptions.readyOnly = readyOnly;
+  snapshotOptions.maxRecords = useObjectFirstSnapshot ? 0u : directScanCap;
+  snapshotOptions.unitsOnly = unitsOnly;
+  snapshotOptions.preferredSelectionKeys = preferredSelectionKeys;
+  std::vector<dxvk::war3::render::CurrentDrawContractRecord> directRecords;
+  {
+    auto snapshotScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/Snapshot");
+    directRecords =
+        dxvk::war3::render::SnapshotPublishedCurrentDrawContracts(
+            snapshotOptions);
+  }
+  auto& visibleRegistry =
+      dxvk::war3::render::VisibleRenderableRegistry::instance();
+  const uint64_t manifestFrame =
+      currentVisibleFrameSerial != 0u ? currentVisibleFrameSerial
+                                      : visibleRegistry.getFrameNumber();
+  auto publishShadowManifestSummary =
+      [&](const std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+              manifestRecords) {
+    visibleRegistry.refreshShadowManifestFromCurrentDraw(manifestRecords,
+                                                         manifestFrame);
+    const auto manifestSummary =
+        visibleRegistry.queryShadowManifestSummary();
+    auto& stats = m_war3Scene.shadowStats;
+    stats.semanticSceneShadowManifestObjectCount =
+        uint32_t(manifestSummary.objectCount);
+    stats.semanticSceneShadowManifestPartCount =
+        uint32_t(manifestSummary.partCount);
+    stats.semanticSceneShadowManifestStableObjectCount =
+        uint32_t(manifestSummary.stableObjectCount);
+    stats.semanticSceneShadowManifestNewObjectCount =
+        uint32_t(manifestSummary.newObjectCount);
+    stats.semanticSceneShadowManifestExpiredObjectCount =
+        uint32_t(manifestSummary.expiredObjectCount);
+    stats.semanticSceneShadowManifestFreshPartCount =
+        uint32_t(manifestSummary.freshPartCount);
+    stats.semanticSceneShadowManifestLeaseablePartCount =
+        uint32_t(manifestSummary.leaseablePartCount);
+    stats.semanticSceneShadowManifestPoseStalePartCount =
+        uint32_t(manifestSummary.poseStalePartCount);
+    stats.semanticSceneShadowManifestSliceStalePartCount =
+        uint32_t(manifestSummary.sliceStalePartCount);
+    stats.semanticSceneShadowManifestExpiredPartCount =
+        uint32_t(manifestSummary.expiredPartCount);
+    stats.semanticSceneShadowManifestMultiSlicePartCount =
+        uint32_t(manifestSummary.multiSlicePartCount);
+    stats.semanticSceneShadowManifestPayload11CChurnCount =
+        uint32_t(manifestSummary.payload11CChurnCount);
+    stats.semanticSceneShadowManifestRenderablePartChurnCount =
+        uint32_t(manifestSummary.renderablePartChurnCount);
+    stats.semanticSceneShadowManifestCModelPoseHitCount =
+        uint32_t(manifestSummary.cModelPoseHitCount);
+    stats.semanticSceneShadowManifestCModelPoseMissCount =
+        uint32_t(manifestSummary.cModelPoseMissCount);
+    stats.semanticSceneShadowManifestCModelPoseNoRuntimeCount =
+        uint32_t(manifestSummary.cModelPoseNoRuntimeCount);
+    stats.semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr =
+        manifestSummary.cModelPoseLastRuntimeModelPtr;
+    stats.semanticSceneShadowManifestCModelPoseLastMatrixCount =
+        uint32_t(manifestSummary.cModelPoseLastMatrixCount);
+    stats.semanticSceneShadowManifestCModelPoseLastMatrixHash =
+        manifestSummary.cModelPoseLastMatrixHash;
+    stats.semanticSceneVisibleLookupPartLayerHitCount =
+        uint32_t(manifestSummary.visibleLookupPartLayerHitCount);
+    stats.semanticSceneVisibleLookupSingleFallbackCount =
+        uint32_t(manifestSummary.visibleLookupSingleFallbackCount);
+    stats.semanticSceneVisibleLookupMissCount =
+        uint32_t(manifestSummary.visibleLookupMissCount);
+  };
+  if (directRecords.empty()) {
+    static const std::vector<dxvk::war3::render::CurrentDrawContractRecord>
+        kEmptyManifestRecords;
+    publishShadowManifestSummary(kEmptyManifestRecords);
+    return 0u;
+  }
+
+  const uint32_t rawRecordCount = uint32_t(directRecords.size());
+  // 诊断: raw 层
+  m_war3Scene.shadowStats.semanticSceneDirectLastRawRecordCount = rawRecordCount;
+  m_war3Scene.shadowStats.semanticSceneDirectCurrentDrawRecordCount +=
+      rawRecordCount;
+  if (useObjectFirstSnapshot && directScanCap != 0u &&
+      rawRecordCount >= directScanCap) {
+    m_war3Scene.shadowStats.semanticSceneDirectScanCapHitCount++;
+  }
+  if (snapshotOptions.maxRecords != 0u && rawRecordCount >= directScanCap) {
+    m_war3Scene.shadowStats.semanticSceneDirectScanCapHitCount++;
+  }
+
+  for (const auto& record : directRecords) {
+    if (record.layerIndex != 0u)
+      m_war3Scene.shadowStats
+          .semanticSceneDirectCurrentDrawLayerIndexNonZeroCount++;
+  }
+
+  struct DirectObjectCompletenessBucket {
+    uint32_t observedParts = 0u;
+    uint32_t alphaRejectedParts = 0u;
+    uint32_t shadowEligibleParts = 0u;
+    uint32_t packetBuildFailParts = 0u;
+    uint32_t eligibleParts = 0u;
+    uint32_t submittedParts = 0u;
+    uint32_t preparedSliceParts = 0u;
+    uint32_t fallbackSliceParts = 0u;
+    uint32_t missingSliceParts = 0u;
+  };
+  std::unordered_map<uint64_t, DirectObjectCompletenessBucket>
+      completenessBuckets;
+  completenessBuckets.reserve(rawRecordCount);
+  auto completenessKeyForRecord =
+      [](const dxvk::war3::render::CurrentDrawContractRecord& record)
+          -> uint64_t {
+    uint64_t key = War3SemanticDirectRecordSelectionKey(record);
+    if (key != 0u)
+      return key;
+    uint64_t fallback = bit::fnv1a_init();
+    fallback = bit::fnv1a_iter(fallback, 0x75000000u);
+    fallback = bit::fnv1a_iter(
+        fallback, uint64_t(reinterpret_cast<uintptr_t>(record.sceneNode)));
+    fallback = bit::fnv1a_iter(
+        fallback, uint64_t(reinterpret_cast<uintptr_t>(record.renderablePart)));
+    fallback = bit::fnv1a_iter(
+        fallback, uint64_t(reinterpret_cast<uintptr_t>(record.meshPayloadPtr)));
+    fallback = bit::fnv1a_iter(fallback, record.layerIndex);
+    return fallback;
+  };
+  auto completenessBucketForRecord =
+      [&](const dxvk::war3::render::CurrentDrawContractRecord& record)
+          -> DirectObjectCompletenessBucket& {
+    return completenessBuckets[completenessKeyForRecord(record)];
+  };
+  auto completenessBucketForKey =
+      [&](uint64_t key) -> DirectObjectCompletenessBucket& {
+    return completenessBuckets[key];
+  };
+  auto submittedPartIdentityKeyForRecord =
+      [](const dxvk::war3::render::CurrentDrawContractRecord& record,
+         uint64_t stableObjectKey) -> uint64_t {
+    if (stableObjectKey == 0u)
+      return 0u;
+    // Phase 7.24: submitted/sticky part identity is stable object identity +
+    // layerIndex + payloadWord108. It deliberately excludes renderablePart,
+    // meshPayloadPtr, stream1Ptr and payloadWord11C because all four have shown
+    // draw-local or view-local churn. The object key may come from the packet
+    // after visible identity backfill, which is more stable than the raw
+    // current-draw record for legal unit-owned child slices.
+    uint64_t hash = bit::fnv1a_init();
+    hash = bit::fnv1a_iter(hash, 0x72400100u);
+    hash = bit::fnv1a_iter(hash, stableObjectKey);
+    hash = bit::fnv1a_iter(hash, record.layerIndex);
+    hash = bit::fnv1a_iter(hash, record.payloadWord108);
+    return hash;
+  };
+  for (const auto& record : directRecords)
+    completenessBucketForRecord(record).observedParts++;
+
+  std::vector<dxvk::war3::render::CurrentDrawContractRecord> recordsForBuild;
+  bool recordsForBuildAlphaPrefiltered = false;
+  if (useObjectGrouped && directRecordCap != 0u) {
+    struct PreselectedRecord {
+      dxvk::war3::render::CurrentDrawContractRecord record = {};
+      uint64_t selectionKey = 0u;
+      uint32_t priorityScore = 0u;
+      bool previouslySelected = false;
+    };
+    struct PreselectedGroup {
+      uint64_t selectionKey = 0u;
+      uint32_t startIdx = 0u;
+      uint32_t count = 0u;
+      uint32_t priorityScore = 0u;
+      bool previouslySelected = false;
+    };
+
+    const std::unordered_set<uint64_t> previousSubmittedKeys(
+        preferredSelectionKeys.begin(),
+        preferredSelectionKeys.end());
+    std::vector<PreselectedRecord> preselectedRecords;
+    preselectedRecords.reserve(rawRecordCount);
+    for (const auto& record : directRecords) {
+      auto& bucket = completenessBucketForRecord(record);
+      if (War3RejectCurrentDrawRecordByUnsafeAlphaVisualPolicy(
+              record, m_war3Scene.shadowStats)) {
+        bucket.alphaRejectedParts++;
+        continue;
+      }
+      bucket.shadowEligibleParts++;
+
+      const uint64_t selectionKey = War3SemanticDirectRecordSelectionKey(record);
+      preselectedRecords.push_back(
+          {record,
+           selectionKey,
+           War3SemanticDirectRecordPriorityScore(record),
+           selectionKey != 0u &&
+               previousSubmittedKeys.find(selectionKey) !=
+                   previousSubmittedKeys.end()});
+    }
+
+    std::stable_sort(
+        preselectedRecords.begin(), preselectedRecords.end(),
+        [](const PreselectedRecord& a, const PreselectedRecord& b) {
+          if (a.selectionKey != b.selectionKey)
+            return a.selectionKey < b.selectionKey;
+          if (a.record.layerIndex != b.record.layerIndex)
+            return a.record.layerIndex < b.record.layerIndex;
+          if (a.record.payloadWord108 != b.record.payloadWord108)
+            return a.record.payloadWord108 < b.record.payloadWord108;
+          return uintptr_t(a.record.renderablePart) <
+                 uintptr_t(b.record.renderablePart);
+        });
+
+    std::vector<PreselectedGroup> preselectedGroups;
+    preselectedGroups.reserve(preselectedRecords.size());
+    for (uint32_t i = 0u; i < uint32_t(preselectedRecords.size());) {
+      const uint64_t selectionKey = preselectedRecords[i].selectionKey;
+      const uint32_t startIdx = i;
+      uint32_t priorityScore = preselectedRecords[i].priorityScore;
+      bool previouslySelected = preselectedRecords[i].previouslySelected;
+      while (i < uint32_t(preselectedRecords.size()) &&
+             preselectedRecords[i].selectionKey == selectionKey) {
+        priorityScore = std::max(priorityScore,
+                                 preselectedRecords[i].priorityScore);
+        previouslySelected =
+            previouslySelected || preselectedRecords[i].previouslySelected;
+        ++i;
+      }
+      preselectedGroups.push_back(
+          {selectionKey, startIdx, i - startIdx, priorityScore,
+           previouslySelected});
+    }
+
+    std::sort(preselectedGroups.begin(), preselectedGroups.end(),
+              [](const PreselectedGroup& a, const PreselectedGroup& b) {
+                if (a.previouslySelected != b.previouslySelected)
+                  return a.previouslySelected;
+                if (a.priorityScore != b.priorityScore)
+                  return a.priorityScore > b.priorityScore;
+                return a.selectionKey < b.selectionKey;
+              });
+
+    recordsForBuild.reserve(directStickyRecordBudget);
+    const bool stickyLease =
+        War3SemanticStickySelectionLeaseRuntime() &&
+        !previousSubmittedKeys.empty();
+    const size_t stickyMinRecords =
+        stickyLease ? std::max<size_t>(1u, (size_t(directRecordCap) * 3u) / 4u)
+                    : 0u;
+
+    auto tryAppendPreselectedGroup = [&](const PreselectedGroup& group,
+                                         size_t groupBudget) {
+      if (recordsForBuild.size() + group.count > groupBudget) {
+        m_war3Scene.shadowStats.semanticSceneDirectObjectGroupedSkipCount++;
+        m_war3Scene.shadowStats.semanticSceneDirectRecordCapTruncatedRecordCount +=
+            group.count;
+        if (stickySelectionFill && group.previouslySelected)
+          m_war3Scene.shadowStats.semanticSceneDirectStickyFillMissedCount +=
+              group.count;
+        return false;
+      }
+      const size_t beforeSize = recordsForBuild.size();
+      for (uint32_t i = group.startIdx; i < group.startIdx + group.count; ++i)
+        recordsForBuild.push_back(preselectedRecords[i].record);
+      if (stickySelectionFill && group.previouslySelected &&
+          recordsForBuild.size() > size_t(directRecordCap)) {
+        const size_t extraBefore =
+            beforeSize > size_t(directRecordCap)
+                ? beforeSize - size_t(directRecordCap)
+                : 0u;
+        const size_t extraAfter =
+            recordsForBuild.size() - size_t(directRecordCap);
+        m_war3Scene.shadowStats.semanticSceneDirectStickyFillAppendedCount +=
+            uint32_t(extraAfter - extraBefore);
+      }
+      if (beforeSize < size_t(directRecordCap) &&
+          recordsForBuild.size() >= size_t(directRecordCap)) {
+        m_war3Scene.shadowStats.semanticSceneDirectRecordCapHitCount++;
+      }
+      return recordsForBuild.size() < groupBudget;
+    };
+
+    if (stickyLease) {
+      for (const auto& group : preselectedGroups) {
+        if (!group.previouslySelected)
+          continue;
+        const size_t groupBudget =
+            stickySelectionFill ? size_t(directStickyRecordBudget)
+                                : size_t(directRecordCap);
+        if (!tryAppendPreselectedGroup(group, groupBudget))
+          break;
+      }
+    }
+
+    if (!stickyLease || recordsForBuild.size() < stickyMinRecords) {
+      for (const auto& group : preselectedGroups) {
+        if (stickyLease && group.previouslySelected)
+          continue;
+        if (!tryAppendPreselectedGroup(group, size_t(directRecordCap)))
+          break;
+      }
+    }
+    recordsForBuildAlphaPrefiltered = true;
+  } else {
+    recordsForBuild = directRecords;
+  }
+
+  // --- Step 2: build eligible record list (per-record filtering) ---
+  // eligible record = 通过 alpha/cutout visual policy + packet build 成功
+  struct EligibleRecord {
+    dxvk::war3::shadow::ShadowDrawPacket packet;
+    dxvk::war3::render::CurrentDrawAuthoritativeSample sample;
+    const void* sceneNode = nullptr;
+    uint64_t completenessKey = 0u;
+    uint64_t recordSelectionKey = 0u;
+    uint64_t selectionKey = 0u;
+    uint64_t submittedPartIdentityKey = 0u;
+    uint64_t manifestPartLeaseKey = 0u;
+    bool previouslySubmittedPart = false;
+    // Phase 7.25 part lease 路径恢复出来的 packet 标记。
+    bool fromPartPacketLease = false;
+    // Phase 7.30 Step A probe：本 packet 是不是用"core stale pose restore"
+    // 的宽限路径恢复出来的（pose 不 fresh、仅因为 isManifestCoreLeasePart
+    // 被允许通行）。提交端用它归因 LargeDelta 是否集中在 stale→live 过渡帧。
+    bool fromStalePoseRestore = false;
+  };
+  const bool useDirectPartPacketLease =
+      War3SemanticDirectPartPacketLeaseRuntime();
+  if (m_war3SemanticDirectPartPacketLeaseState == nullptr) {
+    m_war3SemanticDirectPartPacketLeaseState =
+        std::make_unique<War3SemanticDirectPartPacketLeaseState>();
+  }
+  auto* directPartPacketLeaseState =
+      m_war3SemanticDirectPartPacketLeaseState.get();
+  if (!useDirectPartPacketLease && directPartPacketLeaseState != nullptr) {
+    directPartPacketLeaseState->entries.clear();
+    directPartPacketLeaseState->objectCoreSets.clear();
+  }
+  auto& directPartPacketLeases = directPartPacketLeaseState->entries;
+  auto& manifestObjectCoreSets = directPartPacketLeaseState->objectCoreSets;
+  const uint64_t manifestGeometryCacheFrames =
+      War3SemanticShadowManifestGeometryCacheFramesRuntime();
+  const uint64_t directPartPacketLeaseFrame =
+      m_war3ShadowPersistentFrameSerial;
+  if (useDirectPartPacketLease && !manifestObjectCoreSets.empty()) {
+    // Phase 7.25 core epoch：以 lastLiveSubmittedFrame 为淘汰时钟。
+    // Phase 7.31 Iteration H：恢复 core set 扩展窗口（默认 6 帧）。
+    // 2026-05-11 视觉复核证实：没有扩展窗口时对象阴影会整片消失。
+    // 核心 set 多保留 3 帧让短时遮挡/LOS 空窗不会把 core 整体清掉，再出现
+    // 时不需要两帧观察期重建。
+    const uint64_t coreEvictionFrames = manifestGeometryCacheFrames * 2u;
+    for (auto it = manifestObjectCoreSets.begin();
+         it != manifestObjectCoreSets.end();) {
+      const uint64_t lastFrame = it->second.lastLiveSubmittedFrame;
+      if (lastFrame == 0u ||
+          (directPartPacketLeaseFrame > lastFrame &&
+           directPartPacketLeaseFrame - lastFrame > coreEvictionFrames)) {
+        it = manifestObjectCoreSets.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  auto packetSafeForDirectPartLease = [this](
+      const EligibleRecord& eligible,
+      bool forLiveLeaseUpdate) {
+    auto& stats = m_war3Scene.shadowStats;
+    if (forLiveLeaseUpdate && eligible.fromPartPacketLease) {
+      stats.semanticSceneDirectPartLeaseRejectedSelfRenewCount++;
+      stats.semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount++;
+      // Phase 7.25 core epoch：restored/leased packet 试图自续 committed core，
+      // 统一在此拦截，提供独立证据链。
+      stats
+          .semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount++;
+      return false;
+    }
+    if (eligible.packet.path != dxvk::war3::shadow::ShadowDrawPath::Skinned)
+      return false;
+    if (eligible.manifestPartLeaseKey == 0u) {
+      stats.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount++;
+      stats.semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount++;
+      return false;
+    }
+    const auto& packet = eligible.packet;
+    if (packet.usesDynamicMeshPositions) {
+      stats.semanticSceneDirectPartLeaseRejectedDynamicMeshCount++;
+      stats.semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount++;
+      return false;
+    }
+    if (packet.resource.dynamicIndexStream != nullptr &&
+        packet.resource.dynamicIndexCount != 0u &&
+        (packet.resource.ownedDynamicIndices == nullptr ||
+         packet.resource.ownedDynamicIndices->empty())) {
+      stats.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount++;
+      stats.semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount++;
+      return false;
+    }
+    if (!packet.hasRuntimeGroupPalette || packet.runtimeGroupPalette.empty() ||
+        packet.resource.ownedVertexGroupIndices.empty()) {
+      stats.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount++;
+      stats.semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount++;
+      return false;
+    }
+    War3SemanticDirectMainWorldBackingStatus backingStatus =
+        War3SemanticDirectMainWorldBackingStatus::NotChecked;
+    if (!War3SemanticDirectPacketHasMainWorldVisibleBacking(packet,
+                                                           &backingStatus)) {
+      stats.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount++;
+      stats.semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount++;
+      return false;
+    }
+    return true;
+  };
+  std::vector<EligibleRecord> submittedPartPacketLeaseRecords;
+  // 使用固定大小预分配避免多次 realloc
+  std::vector<EligibleRecord> eligibleRecords;
+  eligibleRecords.reserve(std::min<uint32_t>(
+      uint32_t(recordsForBuild.size()),
+      directRecordCap != 0u ? directRecordCap * 2u
+                            : uint32_t(recordsForBuild.size())));
+  std::vector<dxvk::war3::render::CurrentDrawContractRecord>
+      shadowEligibleManifestRecords;
+  shadowEligibleManifestRecords.reserve(recordsForBuild.size());
+  auto manifestRecordForEligible =
+      [](const dxvk::war3::render::CurrentDrawContractRecord& record,
+         const dxvk::war3::shadow::ShadowDrawPacket& packet,
+         const dxvk::war3::render::CurrentDrawAuthoritativeSample& sample) {
+        auto manifestRecord = record;
+        const auto& renderable = packet.renderable;
+        const auto& contract = sample.contract;
+        if (manifestRecord.unitPtr == nullptr) {
+          if (renderable.unitPtr != nullptr)
+            manifestRecord.unitPtr = renderable.unitPtr;
+          else if (contract.unitPtr != nullptr)
+            manifestRecord.unitPtr = contract.unitPtr;
+        }
+        if (manifestRecord.jHandle == 0u) {
+          if (renderable.jHandle != 0u)
+            manifestRecord.jHandle = renderable.jHandle;
+          else if (contract.jHandle != 0u)
+            manifestRecord.jHandle = contract.jHandle;
+        }
+        if (manifestRecord.worldObjectEntry == nullptr) {
+          if (renderable.worldObjectEntry != nullptr) {
+            manifestRecord.worldObjectEntry = renderable.worldObjectEntry;
+          } else if (contract.worldObjectEntry != nullptr) {
+            manifestRecord.worldObjectEntry = contract.worldObjectEntry;
+          }
+        }
+        if (manifestRecord.sceneNode == nullptr) {
+          if (renderable.sceneNode != nullptr)
+            manifestRecord.sceneNode = renderable.sceneNode;
+          else if (contract.sceneNode != nullptr)
+            manifestRecord.sceneNode = contract.sceneNode;
+        }
+        return manifestRecord;
+      };
+
+  for (const auto& record : recordsForBuild) {
+    auto& bucket = completenessBucketForRecord(record);
+    if (!recordsForBuildAlphaPrefiltered &&
+        War3RejectCurrentDrawRecordByUnsafeAlphaVisualPolicy(
+            record, m_war3Scene.shadowStats)) {
+      bucket.alphaRejectedParts++;
+      continue;
+    }
+    if (!recordsForBuildAlphaPrefiltered)
+      bucket.shadowEligibleParts++;
+    EligibleRecord eligible = {};
+    eligible.completenessKey = completenessKeyForRecord(record);
+    {
+      auto buildPacketScope =
+          War3SemanticSubmitScope("War3SemanticScene/Direct/BuildPacketCall");
+      if (!War3TryBuildShadowPacketFromCurrentDrawRecord(
+              record,
+              currentDrawMinVisibleFrameSerial,
+              eligible.packet,
+              &eligible.sample)) {
+        bucket.packetBuildFailParts++;
+        continue;
+      }
+    }
+    m_war3Scene.shadowStats.semanticSceneDirectCurrentDrawBuiltPacketCount++;
+    if (eligible.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned)
+      m_war3Scene.shadowStats
+          .semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount++;
+    // unitsOnly eligibility 过滤
+    War3SemanticDirectMainWorldBackingStatus mainWorldBackingStatus =
+        War3SemanticDirectMainWorldBackingStatus::NotChecked;
+    bool directSubmitEligible = true;
+    if (unitsOnly) {
+      directSubmitEligible = War3LooksSubmitEligibleForDirectCurrentDrawFast(
+          eligible.packet, true, &eligible.sample, &mainWorldBackingStatus);
+    }
+    // Phase 7.26：移除非 unitsOnly 路径下的 skinned 纯诊断 backing 调用。
+    // 这里只是为了分类统计而再次做 visible lookup，实际决策路径并不使用，
+    // 每帧会对 ~100 个 skinned record 进行 O(records) 扫描。
+    War3NoteDirectMainWorldBackingStatus(m_war3Scene.shadowStats,
+                                         mainWorldBackingStatus);
+    if (!directSubmitEligible) {
+      if (eligible.packet.path != dxvk::war3::shadow::ShadowDrawPath::Skinned ||
+          eligible.packet.renderable.queueKind ==
+              dxvk::war3::render::VisibleRenderableQueueKind::Transparent ||
+          eligible.packet.renderable.groupIdx > 0) {
+        m_war3Scene.shadowStats
+            .semanticSceneDirectCurrentDrawUnitsFilterRejectNonSkinnedCount++;
+      } else if (eligible.packet.renderable.unitPtr == nullptr ||
+                 (eligible.packet.renderable.jHandle == 0u &&
+                  eligible.packet.renderable.rawcode == 0u)) {
+        m_war3Scene.shadowStats
+            .semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount++;
+      } else {
+        m_war3Scene.shadowStats
+            .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount++;
+      }
+      continue;
+    }
+    const auto manifestRecord =
+        manifestRecordForEligible(record, eligible.packet, eligible.sample);
+    eligible.manifestPartLeaseKey =
+        dxvk::war3::render::VisibleRenderableRegistry::
+            computeShadowManifestPartKey(manifestRecord);
+    shadowEligibleManifestRecords.push_back(manifestRecord);
+    bucket.eligibleParts++;
+    if (eligible.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
+      if (eligible.packet.resource.dynamicIndexStream != nullptr &&
+          eligible.packet.resource.dynamicIndexCount != 0u) {
+        if (eligible.packet.resource.dynamicIndexSource ==
+            dxvk::war3::shadow::ShadowDynamicIndexSource::PreparedSlice) {
+          bucket.preparedSliceParts++;
+        } else {
+          bucket.fallbackSliceParts++;
+        }
+      } else {
+        bucket.missingSliceParts++;
+      }
+    }
+    eligible.sceneNode = eligible.packet.renderable.sceneNode;
+    eligible.recordSelectionKey =
+        War3SemanticDirectRecordSelectionKey(record);
+    War3SemanticDirectSelectionKeySource selectionKeySource =
+        War3SemanticDirectSelectionKeySource::None;
+    eligible.selectionKey =
+        War3SemanticDirectSelectionKey(
+            eligible.packet, eligible.sample, &selectionKeySource);
+    const bool selectionKeyIsStableObject =
+        selectionKeySource == War3SemanticDirectSelectionKeySource::UnitPtr ||
+        selectionKeySource == War3SemanticDirectSelectionKeySource::JHandle ||
+        selectionKeySource == War3SemanticDirectSelectionKeySource::WorldObject ||
+        selectionKeySource == War3SemanticDirectSelectionKeySource::SceneNode;
+    eligible.submittedPartIdentityKey =
+        selectionKeyIsStableObject && eligible.selectionKey != 0u
+            ? submittedPartIdentityKeyForRecord(manifestRecord,
+                                                eligible.selectionKey)
+            : submittedPartIdentityKeyForRecord(
+                  manifestRecord,
+                  dxvk::war3::render::VisibleRenderableRegistry::
+                      computeShadowManifestObjectKey(manifestRecord));
+    if (!m_war3SemanticDirectPrevSubmittedPartIdentityKeys.empty()) {
+      eligible.previouslySubmittedPart =
+          std::binary_search(
+              m_war3SemanticDirectPrevSubmittedPartIdentityKeys.begin(),
+              m_war3SemanticDirectPrevSubmittedPartIdentityKeys.end(),
+              eligible.submittedPartIdentityKey);
+    }
+    switch (selectionKeySource) {
+    case War3SemanticDirectSelectionKeySource::UnitPtr:
+      m_war3Scene.shadowStats.semanticSceneDirectSelectionKeyUnitPtrCount++;
+      break;
+    case War3SemanticDirectSelectionKeySource::JHandle:
+      m_war3Scene.shadowStats.semanticSceneDirectSelectionKeyJHandleCount++;
+      break;
+    case War3SemanticDirectSelectionKeySource::RuntimeModel:
+      m_war3Scene.shadowStats
+          .semanticSceneDirectSelectionKeyRuntimeModelCount++;
+      break;
+    case War3SemanticDirectSelectionKeySource::WorldObject:
+      m_war3Scene.shadowStats
+          .semanticSceneDirectSelectionKeyWorldObjectCount++;
+      break;
+    case War3SemanticDirectSelectionKeySource::SceneNode:
+      m_war3Scene.shadowStats.semanticSceneDirectSelectionKeySceneNodeCount++;
+      break;
+    case War3SemanticDirectSelectionKeySource::ModelMesh:
+      m_war3Scene.shadowStats.semanticSceneDirectSelectionKeyModelMeshCount++;
+      break;
+    case War3SemanticDirectSelectionKeySource::RenderablePart:
+      m_war3Scene.shadowStats
+          .semanticSceneDirectSelectionKeyRenderablePartCount++;
+      break;
+    case War3SemanticDirectSelectionKeySource::None:
+      break;
+    }
+    eligibleRecords.push_back(std::move(eligible));
+    War3RebindEligibleRecordPacket(eligibleRecords.back());
+  }
+
+  publishShadowManifestSummary(shadowEligibleManifestRecords);
+
+  if (War3SemanticShadowManifestDeferProvisionalPartsRuntime() &&
+      !eligibleRecords.empty()) {
+    std::vector<EligibleRecord> stableEligibleRecords;
+    stableEligibleRecords.reserve(eligibleRecords.size());
+    for (auto& eligible : eligibleRecords) {
+      if (eligible.manifestPartLeaseKey == 0u ||
+          eligible.previouslySubmittedPart) {
+        stableEligibleRecords.push_back(std::move(eligible));
+        War3RebindEligibleRecordPacket(stableEligibleRecords.back());
+        continue;
+      }
+      const auto leaseInfo =
+          visibleRegistry.queryShadowManifestPartLeaseInfo(
+              eligible.manifestPartLeaseKey, manifestFrame);
+      if (leaseInfo.found && leaseInfo.observedFrameCount < 2u)
+        continue;
+      stableEligibleRecords.push_back(std::move(eligible));
+      War3RebindEligibleRecordPacket(stableEligibleRecords.back());
+    }
+    eligibleRecords = std::move(stableEligibleRecords);
+    War3RebindEligibleRecordPackets(eligibleRecords);
+  }
+
+  // Phase 7.31 Iteration H 恢复：core part 专用扩展 TTL。
+  // 之前 Iter F 撤回此逻辑后，用户实机验证阴影会成片消失（截图要多截
+  // 几轮才能截到有阴影的场景）。核心 part 必须有比 non-core 更长的容忍
+  // 窗口，这样 core gate 还在要求它的时候 lease 才不会提前消失。
+  // 保留 phantom shrink 作为 committed core 收缩机制（避免幻部件冻结）。
+  const uint64_t coreExtendedFrames = manifestGeometryCacheFrames * 2u;
+  auto isCommittedCorePartKey =
+      [&](uint64_t objectKey, uint64_t partKey) -> bool {
+    if (objectKey == 0u || partKey == 0u)
+      return false;
+    const auto coreIt = manifestObjectCoreSets.find(objectKey);
+    if (coreIt == manifestObjectCoreSets.end())
+      return false;
+    return std::binary_search(coreIt->second.committedPartKeys.begin(),
+                              coreIt->second.committedPartKeys.end(),
+                              partKey);
+  };
+
+  if (useDirectPartPacketLease && !directPartPacketLeases.empty()) {
+    for (auto it = directPartPacketLeases.begin();
+         it != directPartPacketLeases.end();) {
+      const uint64_t lastFrame = it->second.lastSubmittedFrame;
+      // core part 6 帧，non-core 3 帧。
+      const uint64_t effectiveExpiryFrames =
+          isCommittedCorePartKey(it->second.selectionKey, it->first)
+              ? coreExtendedFrames
+              : manifestGeometryCacheFrames;
+      if (directPartPacketLeaseFrame > lastFrame &&
+          directPartPacketLeaseFrame - lastFrame > effectiveExpiryFrames) {
+        m_war3Scene.shadowStats.semanticSceneDirectPartLeaseExpiredCount++;
+        m_war3Scene.shadowStats
+            .semanticSceneShadowManifestPartLeaseExpiredCount++;
+        it = directPartPacketLeases.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    std::unordered_set<uint64_t> currentPartKeys;
+    currentPartKeys.reserve(eligibleRecords.size() * 2u + 1u);
+    for (const auto& eligible : eligibleRecords) {
+      if (eligible.manifestPartLeaseKey != 0u)
+        currentPartKeys.insert(eligible.manifestPartLeaseKey);
+    }
+
+    const size_t leaseBudget =
+        directRecordCap != 0u ? size_t(directStickyRecordBudget)
+                              : eligibleRecords.size() + size_t(64u);
+    std::vector<uint64_t> leaseKeys;
+    leaseKeys.reserve(directPartPacketLeases.size());
+    for (const auto& [key, _] : directPartPacketLeases)
+      leaseKeys.push_back(key);
+    std::sort(leaseKeys.begin(), leaseKeys.end());
+    std::vector<EligibleRecord> restoredLeaseRecords;
+    restoredLeaseRecords.reserve(leaseKeys.size());
+    const bool allowCoreStalePoseOneFrameRestore =
+        War3SemanticShadowManifestCoreStalePoseOneFrameRestoreRuntime();
+    auto isManifestCoreLeasePart =
+        [&](uint64_t objectKey, uint64_t partKey) -> bool {
+      return isCommittedCorePartKey(objectKey, partKey);
+    };
+    auto tryRefreshLeasedPaletteFromProducerFacts =
+        [&](EligibleRecord& leased,
+            const dxvk::war3::render::VisibleRenderableRegistry::
+                ShadowManifestPartLeaseInfo& leaseInfo,
+            bool& outAttempted) -> bool {
+      outAttempted = false;
+      if (!War3SemanticShadowManifestLeasePaletteRefreshRuntime())
+        return false;
+      if (leased.packet.path !=
+          dxvk::war3::shadow::ShadowDrawPath::Skinned) {
+        return false;
+      }
+
+      outAttempted = true;
+      m_war3Scene.shadowStats
+          .semanticSceneShadowManifestPartLeasePaletteRefreshAttemptCount++;
+
+      void* runtimeModelPtr =
+          leased.packet.renderable.runtimeModelPtr != nullptr
+              ? leased.packet.renderable.runtimeModelPtr
+              : leaseInfo.runtimeModelPtr;
+      std::vector<Matrix4> liveRuntimeGroupPalette;
+      uint32_t liveMaxVertexGroupSlot = 0u;
+      uint64_t liveRuntimeGroupPaletteHash = 0u;
+      uint64_t liveRuntimeRawPaletteHash = 0u;
+      void* liveRuntimePoseModelPtr = nullptr;
+      War3SemanticPaletteSource livePaletteSource =
+          War3SemanticPaletteSource::None;
+      uint32_t livePaletteSlotIndex = 0xFFFFFFFFu;
+      uint32_t livePaletteMinFrameTag = 0u;
+      uint32_t livePaletteMaxFrameTag = 0u;
+      const bool rebuilt = War3TryBuildLiveRuntimeGroupPalette(
+          leased.packet.resource, runtimeModelPtr,
+          leased.packet.renderable.renderablePart,
+          m_war3ShadowPersistentFrameSerial, liveRuntimeGroupPalette,
+          liveMaxVertexGroupSlot, liveRuntimeGroupPaletteHash,
+          &liveRuntimeRawPaletteHash, &liveRuntimePoseModelPtr,
+          /*allowCModelFallbackForCall=*/false, &livePaletteSource,
+          &livePaletteSlotIndex, &livePaletteMinFrameTag,
+          &livePaletteMaxFrameTag);
+      const bool producerPaletteSource =
+          livePaletteSource == War3SemanticPaletteSource::SubmitTimeGlobalSlot ||
+          livePaletteSource ==
+              War3SemanticPaletteSource::SubmitTimeBlendedPaletteCache;
+      if (!rebuilt || liveRuntimeGroupPalette.empty() ||
+          !producerPaletteSource) {
+        m_war3Scene.shadowStats
+            .semanticSceneShadowManifestPartLeasePaletteRefreshMissCount++;
+        return false;
+      }
+
+      leased.packet.runtimeGroupPalette = std::move(liveRuntimeGroupPalette);
+      leased.packet.hasRuntimeGroupPalette = true;
+      leased.packet.maxVertexGroupSlot = liveMaxVertexGroupSlot;
+      leased.packet.runtimeGroupPaletteHash = liveRuntimeGroupPaletteHash;
+      leased.packet.runtimeGroupPaletteSlotIndex = livePaletteSlotIndex;
+      leased.packet.runtimeGroupPaletteMinFrameTag = livePaletteMinFrameTag;
+      leased.packet.runtimeGroupPaletteMaxFrameTag = livePaletteMaxFrameTag;
+      if (liveRuntimePoseModelPtr != nullptr) {
+        leased.packet.renderable.runtimeModelPtr = liveRuntimePoseModelPtr;
+      } else if (runtimeModelPtr != nullptr) {
+        leased.packet.renderable.runtimeModelPtr = runtimeModelPtr;
+      }
+      m_war3Scene.shadowStats
+          .semanticSceneShadowManifestPartLeasePaletteRefreshHitCount++;
+      m_war3Scene.shadowStats
+          .semanticSceneShadowManifestPartLeasePaletteRefreshAppliedCount++;
+      War3NoteLivePaletteMotion(
+          m_war3Scene.shadowStats, leased.packet.renderable.runtimeModelPtr,
+          m_war3ShadowPersistentFrameSerial, liveRuntimeRawPaletteHash,
+          liveRuntimeGroupPaletteHash);
+      return true;
+    };
+    auto tryFreshenLeasedPoseFromCModel =
+        [&](EligibleRecord& leased,
+            const dxvk::war3::render::VisibleRenderableRegistry::
+                ShadowManifestPartLeaseInfo& leaseInfo) -> bool {
+      if (!War3SemanticShadowManifestCModelPoseRestoreRuntime())
+        return false;
+      if (leaseInfo.poseFresh || !leaseInfo.cModelPoseFresh ||
+          leaseInfo.runtimeModelPtr == nullptr ||
+          leased.packet.path !=
+              dxvk::war3::shadow::ShadowDrawPath::Skinned) {
+        return false;
+      }
+
+      std::vector<Matrix4> liveRuntimeGroupPalette;
+      uint32_t liveMaxVertexGroupSlot = 0u;
+      uint64_t liveRuntimeGroupPaletteHash = 0u;
+      uint64_t liveRuntimeRawPaletteHash = 0u;
+      void* liveRuntimePoseModelPtr = nullptr;
+      if (!War3TryBuildLiveRuntimeGroupPalette(
+              leased.packet.resource, leaseInfo.runtimeModelPtr, nullptr,
+              m_war3ShadowPersistentFrameSerial, liveRuntimeGroupPalette,
+              liveMaxVertexGroupSlot, liveRuntimeGroupPaletteHash,
+              &liveRuntimeRawPaletteHash, &liveRuntimePoseModelPtr, true) ||
+          liveRuntimeGroupPalette.empty()) {
+        m_war3Scene.shadowStats
+            .semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount++;
+        return false;
+      }
+
+      leased.packet.runtimeGroupPalette = std::move(liveRuntimeGroupPalette);
+      leased.packet.hasRuntimeGroupPalette = true;
+      leased.packet.maxVertexGroupSlot = liveMaxVertexGroupSlot;
+      leased.packet.runtimeGroupPaletteHash = liveRuntimeGroupPaletteHash;
+      leased.packet.runtimeGroupPaletteSlotIndex = 0xFFFFFFFFu;
+      leased.packet.runtimeGroupPaletteMinFrameTag = 0u;
+      leased.packet.runtimeGroupPaletteMaxFrameTag = 0u;
+      leased.packet.renderable.runtimeModelPtr =
+          liveRuntimePoseModelPtr != nullptr ? liveRuntimePoseModelPtr
+                                             : leaseInfo.runtimeModelPtr;
+      m_war3Scene.shadowStats
+          .semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount++;
+      War3NoteLivePaletteMotion(
+          m_war3Scene.shadowStats, leased.packet.renderable.runtimeModelPtr,
+          m_war3ShadowPersistentFrameSerial, liveRuntimeRawPaletteHash,
+          liveRuntimeGroupPaletteHash);
+      return true;
+    };
+
+    for (size_t leaseIndex = 0u; leaseIndex < leaseKeys.size();
+         ++leaseIndex) {
+      if (restoredLeaseRecords.size() >= leaseBudget) {
+        m_war3Scene.shadowStats.semanticSceneDirectPartLeaseBudgetLimitCount +=
+            uint32_t(leaseKeys.size() - leaseIndex);
+        m_war3Scene.shadowStats
+            .semanticSceneShadowManifestPartLeaseBudgetLimitCount +=
+            uint32_t(leaseKeys.size() - leaseIndex);
+        break;
+      }
+      const uint64_t key = leaseKeys[leaseIndex];
+      if (currentPartKeys.find(key) != currentPartKeys.end())
+        continue;
+      const auto leaseIt = directPartPacketLeases.find(key);
+      if (leaseIt == directPartPacketLeases.end())
+        continue;
+      if (directPartPacketLeaseFrame <= leaseIt->second.lastSubmittedFrame)
+        continue;
+      const auto leaseInfo =
+          visibleRegistry.queryShadowManifestPartLeaseInfo(key, manifestFrame);
+      // Phase 7.31 Iteration H：core part 的 geometry cache 窗口同步扩展到
+      // coreExtendedFrames（默认 6 帧）。与 eviction/restore 策略一致。
+      const bool leaseIsCorePart =
+          isCommittedCorePartKey(leaseIt->second.selectionKey, key);
+      const uint64_t effectiveGeometryCacheFrames =
+          leaseIsCorePart ? coreExtendedFrames : manifestGeometryCacheFrames;
+      const bool geometryFresh =
+          leaseInfo.lastGoodPacketFrame != 0u &&
+          leaseInfo.packetAgeFrames <= effectiveGeometryCacheFrames;
+      if (!leaseInfo.found || !leaseInfo.structureLive || !geometryFresh) {
+        m_war3Scene.shadowStats.semanticSceneDirectPartLeaseExpiredCount++;
+        m_war3Scene.shadowStats
+            .semanticSceneShadowManifestPartLeaseExpiredCount++;
+        directPartPacketLeases.erase(leaseIt);
+        continue;
+      }
+      const uint64_t directLeaseAge =
+          directPartPacketLeaseFrame > leaseIt->second.lastSubmittedFrame
+              ? directPartPacketLeaseFrame - leaseIt->second.lastSubmittedFrame
+              : 0u;
+      EligibleRecord leased = {};
+      leased.packet = leaseIt->second.packet;
+      War3RebindShadowPacketOwnedResourcePointers(leased.packet);
+      leased.sample = leaseIt->second.sample;
+      leased.sceneNode = leaseIt->second.sceneNode;
+      leased.completenessKey = leaseIt->second.completenessKey;
+      leased.recordSelectionKey = leaseIt->second.recordSelectionKey;
+      leased.selectionKey = leaseIt->second.selectionKey;
+      leased.submittedPartIdentityKey =
+          leaseIt->second.submittedPartIdentityKey != 0u
+              ? leaseIt->second.submittedPartIdentityKey
+              : key;
+      leased.manifestPartLeaseKey =
+          leaseIt->second.manifestPartLeaseKey != 0u
+              ? leaseIt->second.manifestPartLeaseKey
+              : key;
+      leased.previouslySubmittedPart = true;
+      leased.fromPartPacketLease = true;
+      bool leasePaletteRefreshAttempted = false;
+      const bool paletteFreshenedFromProducer =
+          tryRefreshLeasedPaletteFromProducerFacts(
+              leased, leaseInfo, leasePaletteRefreshAttempted);
+      const bool poseFreshenedFromCModel =
+          paletteFreshenedFromProducer
+              ? false
+              : tryFreshenLeasedPoseFromCModel(leased, leaseInfo);
+      const bool poseFreshForLease =
+          leaseInfo.poseFresh || paletteFreshenedFromProducer ||
+          poseFreshenedFromCModel;
+      const bool allowStalePoseForCore =
+          allowCoreStalePoseOneFrameRestore && !poseFreshForLease &&
+          // Phase 7.31 Iteration H：恢复 core part stale-pose 容忍到
+          // coreExtendedFrames（默认 6 帧）。用户实机验证：3 帧窗口下
+          // 对象阴影会成片消失，6 帧窗口的 Phase 7.30 基线才是可接受的
+          // 视觉起点。stutter-catchup 的代价比阴影缺失小得多。
+          directLeaseAge <= coreExtendedFrames &&
+          isManifestCoreLeasePart(leaseIt->second.selectionKey, key);
+      if (!poseFreshForLease && !allowStalePoseForCore) {
+        m_war3Scene.shadowStats
+            .semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount++;
+        continue;
+      }
+      // Phase 7.30 Step A probe：标记"通过 stale-pose 宽限门通过"。
+      // 这份 packet 的 pose 不是本帧 live（poseFreshForLease=false），
+      // 仅靠 core gate 的 allowStalePoseForCore 分支救回来。
+      // 提交端会用这个标记把 LargeDelta 归因到"stale→live 过渡帧"而非
+      // "连续两帧都 live 时的真动画"，用于判定 stutter-catchup 来源。
+      if (!poseFreshForLease && allowStalePoseForCore)
+        leased.fromStalePoseRestore = true;
+      if (!packetSafeForDirectPartLease(leased, false))
+        continue;
+      if (!leaseInfo.sliceFresh &&
+          leased.packet.resource.dynamicIndexStream != nullptr &&
+          leased.packet.resource.dynamicIndexCount != 0u &&
+          (leased.packet.resource.ownedDynamicIndices == nullptr ||
+           leased.packet.resource.ownedDynamicIndices->empty())) {
+        m_war3Scene.shadowStats
+            .semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount++;
+        continue;
+      }
+      auto& bucket = completenessBucketForKey(leased.completenessKey);
+      bucket.shadowEligibleParts++;
+      bucket.eligibleParts++;
+      if (leased.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
+        if (leased.packet.resource.dynamicIndexStream != nullptr &&
+            leased.packet.resource.dynamicIndexCount != 0u) {
+          if (leased.packet.resource.dynamicIndexSource ==
+              dxvk::war3::shadow::ShadowDynamicIndexSource::PreparedSlice) {
+            bucket.preparedSliceParts++;
+          } else {
+            bucket.fallbackSliceParts++;
+          }
+        } else {
+          bucket.missingSliceParts++;
+        }
+      }
+      if (leasePaletteRefreshAttempted && !paletteFreshenedFromProducer &&
+          !poseFreshenedFromCModel) {
+        m_war3Scene.shadowStats
+            .semanticSceneShadowManifestPartLeasePaletteRefreshFallbackCount++;
+      }
+      restoredLeaseRecords.push_back(std::move(leased));
+      War3RebindEligibleRecordPacket(restoredLeaseRecords.back());
+      m_war3Scene.shadowStats.semanticSceneDirectPartLeaseRestoredCount++;
+      m_war3Scene.shadowStats
+          .semanticSceneShadowManifestPartLeaseRestoredCount++;
+      if (allowStalePoseForCore) {
+        m_war3Scene.shadowStats
+            .semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount++;
+      }
+      currentPartKeys.insert(key);
+    }
+
+    if (!restoredLeaseRecords.empty()) {
+      std::vector<EligibleRecord> mergedRecords;
+      mergedRecords.reserve(restoredLeaseRecords.size() +
+                            eligibleRecords.size());
+      for (auto& restored : restoredLeaseRecords) {
+        mergedRecords.push_back(std::move(restored));
+        War3RebindEligibleRecordPacket(mergedRecords.back());
+      }
+      for (auto& live : eligibleRecords) {
+        mergedRecords.push_back(std::move(live));
+        War3RebindEligibleRecordPacket(mergedRecords.back());
+      }
+      eligibleRecords = std::move(mergedRecords);
+      War3RebindEligibleRecordPackets(eligibleRecords);
+    }
+  }
+
+  uint32_t eligibleRecordCount = uint32_t(eligibleRecords.size());
+  m_war3Scene.shadowStats.semanticSceneDirectLastEligibleRecordCount = eligibleRecordCount;
+  if (eligibleRecordCount == 0u)
+    return 0u;
+
+  if (useObjectGrouped && War3SemanticStickyPartSelectionRuntime() &&
+      !m_war3SemanticDirectPrevSubmittedPartIdentityKeys.empty()) {
+    const bool underPreselectionPressure =
+        m_war3Scene.shadowStats.semanticSceneDirectScanCapHitCount != 0u ||
+        m_war3Scene.shadowStats.semanticSceneDirectRecordCapHitCount != 0u ||
+        eligibleRecordCount >= directRecordCap;
+    if (underPreselectionPressure) {
+      std::vector<EligibleRecord> retainedRecords;
+      retainedRecords.reserve(eligibleRecords.size());
+      for (auto& eligible : eligibleRecords) {
+        if (eligible.previouslySubmittedPart) {
+          retainedRecords.push_back(std::move(eligible));
+          War3RebindEligibleRecordPacket(retainedRecords.back());
+        }
+      }
+      const uint32_t minStickyPartRecords =
+          std::min<uint32_t>(
+              uint32_t(m_war3SemanticDirectPrevSubmittedPartIdentityKeys.size()),
+              War3SemanticStickyPartSelectionMinRecordsRuntime());
+      if (uint32_t(retainedRecords.size()) >= minStickyPartRecords) {
+        m_war3Scene.shadowStats
+            .semanticSceneDirectStickyPartSelectionRetainedCount =
+            uint32_t(retainedRecords.size());
+        m_war3Scene.shadowStats
+            .semanticSceneDirectStickyPartSelectionDroppedCount =
+            uint32_t(eligibleRecords.size() - retainedRecords.size());
+        eligibleRecords = std::move(retainedRecords);
+        War3RebindEligibleRecordPackets(eligibleRecords);
+        eligibleRecordCount = uint32_t(eligibleRecords.size());
+        m_war3Scene.shadowStats.semanticSceneDirectLastEligibleRecordCount =
+            eligibleRecordCount;
+      } else {
+        m_war3Scene.shadowStats
+            .semanticSceneDirectStickyPartSelectionFallbackCount++;
+      }
+    }
+  }
+
+  // --- Step 3: submit ---
+  uint32_t submitted = 0u;
+  // Phase 7.3: track submitted caster identity keys for stable selection hash.
+  std::unordered_set<uint64_t> submittedIdentityKeys;
+  std::unordered_set<uint64_t> submittedPreferenceKeys;
+  std::vector<uint64_t> submittedPartIdentityKeys;
+  submittedPartPacketLeaseRecords.reserve(eligibleRecordCount);
+  std::unordered_map<uint64_t, std::vector<uint64_t>>
+      liveSubmittedCorePartsByObject;
+
+  auto noteSubmittedKeys = [&](const EligibleRecord& eligible) {
+    if (eligible.selectionKey != 0u) {
+      submittedIdentityKeys.insert(eligible.selectionKey);
+      submittedPreferenceKeys.insert(eligible.selectionKey);
+    }
+    if (eligible.recordSelectionKey != 0u)
+      submittedPreferenceKeys.insert(eligible.recordSelectionKey);
+    if (eligible.submittedPartIdentityKey != 0u)
+      submittedPartIdentityKeys.push_back(eligible.submittedPartIdentityKey);
+    if (useDirectPartPacketLease &&
+        packetSafeForDirectPartLease(eligible, true)) {
+      submittedPartPacketLeaseRecords.push_back(eligible);
+      War3RebindEligibleRecordPacket(submittedPartPacketLeaseRecords.back());
+      if (!eligible.fromPartPacketLease && eligible.selectionKey != 0u &&
+          eligible.manifestPartLeaseKey != 0u) {
+        liveSubmittedCorePartsByObject[eligible.selectionKey].push_back(
+            eligible.manifestPartLeaseKey);
+      }
+    }
+    if (eligible.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
+      const auto& renderable = eligible.packet.renderable;
+      const auto resolvedObjectKind =
+          War3ResolveSemanticPacketObjectKindFast(eligible.packet);
+      if (!War3IsSemanticUnitObject(resolvedObjectKind))
+        m_war3Scene.shadowStats
+            .semanticSceneSubmittedSkinnedNonUnitResolvedCount++;
+      if (renderable.objectKind == dxvk::war3::render::ObjectKind::Unknown)
+        m_war3Scene.shadowStats
+            .semanticSceneSubmittedSkinnedUnknownPacketKindCount++;
+      if (renderable.unitPtr != nullptr &&
+          !War3IsSemanticUnitObject(resolvedObjectKind)) {
+        m_war3Scene.shadowStats
+            .semanticSceneSubmittedSkinnedUnitPtrNonUnitResolvedCount++;
+      }
+      if (renderable.groupIdx > 0)
+        m_war3Scene.shadowStats
+            .semanticSceneSubmittedSkinnedGroupNonZeroCount++;
+      if (renderable.queueKind ==
+          dxvk::war3::render::VisibleRenderableQueueKind::Transparent) {
+        m_war3Scene.shadowStats
+            .semanticSceneSubmittedSkinnedTransparentQueueCount++;
+      }
+      if (renderable.unitPtr == nullptr)
+        m_war3Scene.shadowStats
+            .semanticSceneSubmittedSkinnedMissingUnitPtrCount++;
+      if (War3HasSemanticDynamicUnitEvidence(eligible.packet))
+        m_war3Scene.shadowStats
+            .semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount++;
+    }
+  };
+
+  if (!useObjectGrouped) {
+    // 回退路径：逐 record 提交（与原始行为一致）
+    for (auto& eligible : eligibleRecords) {
+      auto appendScope =
+          War3SemanticSubmitScope("War3SemanticScene/Direct/Append");
+      if (War3TryAppendSemanticShadowPacket(eligible.packet, &eligible.sample,
+                                            eligible.fromStalePoseRestore)) {
+        ++submitted;
+        completenessBucketForKey(eligible.completenessKey).submittedParts++;
+        noteSubmittedKeys(eligible);
+        if (directRecordCap != 0u && submitted >= directRecordCap)
+          break;
+      }
+    }
+  } else {
+    // object-grouped 提交路径
+    m_war3Scene.shadowStats.semanticSceneDirectObjectGroupedSubmitCount++;
+
+    // Step 3a: 按 stable caster identity 分组（使用线性扫描 + 小 vector 避免 hash map）
+    struct ObjectGroup {
+      uint64_t selectionKey;
+      uint32_t startIdx;
+      uint32_t count;
+      // 稳定排序 key：object kind priority + stable identity score
+      uint32_t priorityScore;
+      bool previouslySelected;
+    };
+    std::vector<ObjectGroup> objectGroups;
+    objectGroups.reserve(eligibleRecordCount);
+    std::unordered_set<uint64_t> previousSubmittedKeys(
+        preferredSelectionKeys.begin(),
+        preferredSelectionKeys.end());
+
+    // 先按 stable identity 排序以利于分组（稳定排序保持 record 内部顺序）
+    std::vector<uint32_t> originalIndices(eligibleRecordCount);
+    for (uint32_t i = 0u; i < eligibleRecordCount; ++i)
+      originalIndices[i] = i;
+    std::stable_sort(originalIndices.begin(), originalIndices.end(),
+        [&eligibleRecords](uint32_t a, uint32_t b) {
+          return eligibleRecords[a].selectionKey <
+                 eligibleRecords[b].selectionKey;
+        });
+    // 按排序后重排 eligibleRecords
+    {
+      std::vector<EligibleRecord> sorted;
+      sorted.reserve(eligibleRecordCount);
+      for (uint32_t idx : originalIndices) {
+        sorted.push_back(std::move(eligibleRecords[idx]));
+        War3RebindEligibleRecordPacket(sorted.back());
+      }
+      eligibleRecords = std::move(sorted);
+      War3RebindEligibleRecordPackets(eligibleRecords);
+    }
+
+    // 分组并计算 priorityScore
+    // priorityScore 优先级：
+    //   bit 28-31: object kind priority (Unit=3, known unit=2, other=1, unknown=0)
+    //   bit 16-27: stable identity score (有 jHandle(4)+rawcode(3)+unitPtr(2)+modelKey(1))
+    //   bit 0-15:  reserved. Do not rank by transient group count; it can vary
+    //               with alpha/material rejection and reintroduce cap-edge churn.
+    for (uint32_t i = 0u; i < eligibleRecordCount; ) {
+      const uint64_t currentSelectionKey = eligibleRecords[i].selectionKey;
+      uint32_t groupStart = i;
+      while (i < eligibleRecordCount &&
+             eligibleRecords[i].selectionKey == currentSelectionKey)
+        ++i;
+      const uint32_t groupCount = i - groupStart;
+      // 取 group 第一个 record 的信息作为 object 身份
+      auto& firstEligible = eligibleRecords[groupStart];
+      uint32_t kindPri = 0u;
+      uint32_t objectKindNum = static_cast<uint32_t>(firstEligible.sample.contract.objectKind);
+      if (objectKindNum == static_cast<uint32_t>(dxvk::war3::render::ObjectKind::Unit))
+        kindPri = 3u;
+      else if (firstEligible.sample.contract.unitPtr != nullptr ||
+               firstEligible.sample.contract.jHandle != 0u ||
+               firstEligible.sample.contract.rawcode != 0u)
+        kindPri = 2u;
+      else
+        kindPri = 1u;
+      uint32_t identityScore = 0u;
+      if (firstEligible.sample.contract.jHandle != 0u) identityScore += 4u;
+      if (firstEligible.sample.contract.rawcode != 0u)  identityScore += 3u;
+      if (firstEligible.sample.contract.unitPtr != nullptr) identityScore += 2u;
+      if (firstEligible.sample.contract.jHandle != 0u ||
+          firstEligible.sample.contract.rawcode != 0u ||
+          firstEligible.sample.contract.unitPtr != nullptr)
+        identityScore += 1u;
+      uint32_t score = (kindPri << 28) | ((identityScore & 0xFFFu) << 16);
+      objectGroups.push_back(
+          {currentSelectionKey, groupStart, groupCount, score,
+           currentSelectionKey != 0u &&
+               previousSubmittedKeys.find(currentSelectionKey) !=
+                   previousSubmittedKeys.end()});
+    }
+
+    // 稳定排序：上一帧已经提交的 caster 先获得 lease，再按
+    // priorityScore 补足预算。cap 压力下稳定性比“最新高分候选”更重要，
+    // 否则 shadow map 会每帧换一批 caster 形成规律闪烁。
+    std::sort(objectGroups.begin(), objectGroups.end(),
+        [](const ObjectGroup& a, const ObjectGroup& b) {
+          if (a.previouslySelected != b.previouslySelected)
+            return a.previouslySelected;
+          if (a.priorityScore != b.priorityScore)
+            return a.priorityScore > b.priorityScore;
+          return a.selectionKey < b.selectionKey;
+        });
+
+    // 诊断：unique object count 和 geoset 分布
+    const uint32_t uniqueObjectCount = uint32_t(objectGroups.size());
+    m_war3Scene.shadowStats.semanticSceneDirectLastUniqueObjectCount = uniqueObjectCount;
+    uint32_t minGeosets = UINT32_MAX;
+    uint32_t maxGeosets = 0u;
+    for (const auto& group : objectGroups) {
+      minGeosets = std::min(minGeosets, group.count);
+      maxGeosets = std::max(maxGeosets, group.count);
+    }
+    m_war3Scene.shadowStats.semanticSceneDirectLastMinGeosetsPerObject =
+        minGeosets != UINT32_MAX ? minGeosets : 0u;
+    m_war3Scene.shadowStats.semanticSceneDirectLastMaxGeosetsPerObject = maxGeosets;
+
+    // Step 3b: 按 object group 整体提交
+    uint32_t submittedObjects = 0u;
+    uint32_t recordCapPartialObjects = 0u;
+    uint32_t recordCapAppendFailCount = 0u;
+    // Phase 7.26：core gate 热路径缓冲复用。绝大多数对象 parts < 32，
+    // 使用栈上定长数组 + 仅在超过时 fallback 到 heap，可避免每 object 一次
+    // vector 分配与析构。
+    constexpr size_t kCoreGateStackBudget = 32u;
+    uint64_t coreGateStack[kCoreGateStackBudget];
+    std::vector<uint64_t> coreGateHeap;
+    for (const auto& group : objectGroups) {
+      // Phase 7.25 core epoch：如果对象已存在 committed core set，
+      // 只接受“live + safe-lease 可完整覆盖 committed core”的整 group。
+      // 允许用 lease 补齐（counts as RestoredComplete），但
+      // 仅 live 不足且 lease 也不足时整个 object 跳过，避免提交不完整 silhouette。
+      const auto coreIt = group.selectionKey != 0u
+                              ? manifestObjectCoreSets.find(group.selectionKey)
+                              : manifestObjectCoreSets.end();
+      if (coreIt != manifestObjectCoreSets.end() &&
+          !coreIt->second.committedPartKeys.empty()) {
+        uint64_t* groupPartKeys = coreGateStack;
+        size_t groupPartKeyCount = 0u;
+        const size_t worstCase = group.count;
+        bool useHeap = worstCase > kCoreGateStackBudget;
+        if (useHeap) {
+          coreGateHeap.clear();
+          coreGateHeap.reserve(worstCase);
+        }
+        uint32_t liveInGroup = 0u;
+        for (uint32_t j = group.startIdx; j < group.startIdx + group.count;
+             ++j) {
+          const auto& eligible = eligibleRecords[j];
+          const uint64_t partKey = eligible.manifestPartLeaseKey;
+          if (partKey != 0u) {
+            if (useHeap) {
+              coreGateHeap.push_back(partKey);
+            } else {
+              groupPartKeys[groupPartKeyCount++] = partKey;
+            }
+          }
+          if (!eligible.fromPartPacketLease)
+            ++liveInGroup;
+        }
+        uint64_t* begin = useHeap ? coreGateHeap.data() : groupPartKeys;
+        size_t count = useHeap ? coreGateHeap.size() : groupPartKeyCount;
+        std::sort(begin, begin + count);
+        count = size_t(std::unique(begin, begin + count) - begin);
+        uint64_t* end = begin + count;
+
+        uint32_t missingCoreParts = 0u;
+        for (uint64_t corePartKey : coreIt->second.committedPartKeys) {
+          if (corePartKey == 0u)
+            continue;
+          if (!std::binary_search(begin, end, corePartKey)) {
+            ++missingCoreParts;
+            // Phase 7.26 快退：只要检测到缺件就直接退出 core gate 决策，
+            // 精确缺件数量不是 gate 行为必需品。
+            break;
+          }
+        }
+        if (missingCoreParts != 0u) {
+          // Phase 7.30：撤回 Phase 7.27.3 的 tolerance 分支。
+          // 实战证明：允许 partial 提交会让同一 stable part 每帧少 1-2 片，
+          // 肉眼就是"单位某部位阴影每帧闪消失/回来"。宁可整对象这一帧跳过
+          // 也不提交残缺 silhouette；下一帧 live+lease 凑齐后再出现。
+          // lease path 会继续在 eligibleRecords 里补 missing parts（通过
+          // stalePose one-frame restore），所以真正出现"整对象跳过"的频次
+          // 会很低；而且优于 partial-flicker。
+          m_war3Scene.shadowStats
+              .semanticSceneShadowManifestObjectCoreIncompleteSkipCount++;
+          m_war3Scene.shadowStats
+              .semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount++;
+          m_war3Scene.shadowStats
+              .semanticSceneShadowManifestObjectCoreEpochMissingPartCount +=
+              missingCoreParts;
+          m_war3Scene.shadowStats
+              .semanticSceneShadowManifestPartOmittedIncompleteCoreCount +=
+              group.count;
+          m_war3Scene.shadowStats.semanticSceneDirectObjectGroupedSkipCount++;
+          continue;
+        } else {
+          m_war3Scene.shadowStats
+              .semanticSceneShadowManifestObjectCoreCompleteCount++;
+          // live 不足但 lease 补齐：记录 RestoredComplete。
+          if (liveInGroup < group.count) {
+            m_war3Scene.shadowStats
+                .semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount++;
+          }
+        }
+      }
+
+      if (directRecordCap != 0u && !group.previouslySelected &&
+          submitted >= directRecordCap) {
+        m_war3Scene.shadowStats.semanticSceneDirectRecordCapHitCount++;
+        break;
+      }
+      const uint32_t groupBudget =
+          stickySelectionFill && group.previouslySelected
+              ? directStickyRecordBudget
+              : directRecordCap;
+      if (directRecordCap != 0u && submitted + group.count > groupBudget) {
+        recordCapPartialObjects++;
+        m_war3Scene.shadowStats.semanticSceneDirectObjectGroupedSkipCount++;
+        m_war3Scene.shadowStats.semanticSceneDirectRecordCapTruncatedRecordCount +=
+            group.count;
+        if (stickySelectionFill && group.previouslySelected)
+          m_war3Scene.shadowStats.semanticSceneDirectStickyFillMissedCount +=
+              group.count;
+        continue;
+      }
+      uint32_t groupSubmitted = 0u;
+      const uint32_t beforeSubmitted = submitted;
+      for (uint32_t j = group.startIdx; j < group.startIdx + group.count; ++j) {
+        auto& eligible = eligibleRecords[j];
+        auto appendScope =
+            War3SemanticSubmitScope("War3SemanticScene/Direct/Append");
+        if (War3TryAppendSemanticShadowPacket(eligible.packet, &eligible.sample,
+                                              eligible.fromStalePoseRestore)) {
+          ++groupSubmitted;
+          completenessBucketForKey(eligible.completenessKey).submittedParts++;
+          noteSubmittedKeys(eligible);
+        } else {
+          recordCapAppendFailCount++;
+        }
+      }
+      submitted += groupSubmitted;
+      if (stickySelectionFill && group.previouslySelected &&
+          directRecordCap != 0u && submitted > directRecordCap) {
+        const uint32_t extraBefore =
+            beforeSubmitted > directRecordCap
+                ? beforeSubmitted - directRecordCap
+                : 0u;
+        const uint32_t extraAfter = submitted - directRecordCap;
+        m_war3Scene.shadowStats.semanticSceneDirectStickyFillSubmittedCount +=
+            extraAfter - extraBefore;
+      }
+      if (groupSubmitted > 0u) {
+        submittedObjects++;
+      }
+      if (directRecordCap != 0u && submitted >= groupBudget) {
+        m_war3Scene.shadowStats.semanticSceneDirectRecordCapHitCount++;
+        break;
+      }
+    }
+
+    m_war3Scene.shadowStats.semanticSceneDirectLastSubmittedObjectCount = submittedObjects;
+    m_war3Scene.shadowStats.semanticSceneDirectLastRecordCapPartialObjectCount =
+        recordCapPartialObjects;
+    m_war3Scene.shadowStats.semanticSceneDirectRecordCapSkipObjectCount =
+        recordCapPartialObjects;
+    m_war3Scene.shadowStats.semanticSceneDirectRecordCapAppendFailCount =
+        recordCapAppendFailCount;
+  }
+
+  if (useDirectPartPacketLease) {
+    for (const auto& eligible : submittedPartPacketLeaseRecords) {
+      if (eligible.manifestPartLeaseKey == 0u)
+        continue;
+      auto& lease = directPartPacketLeases[eligible.manifestPartLeaseKey];
+      lease.packet = eligible.packet;
+      War3RebindShadowPacketOwnedResourcePointers(lease.packet);
+      lease.sample = eligible.sample;
+      lease.sceneNode = eligible.sceneNode;
+      lease.completenessKey = eligible.completenessKey;
+      lease.recordSelectionKey = eligible.recordSelectionKey;
+      lease.selectionKey = eligible.selectionKey;
+      lease.submittedPartIdentityKey = eligible.submittedPartIdentityKey;
+      lease.manifestPartLeaseKey = eligible.manifestPartLeaseKey;
+      lease.lastSubmittedFrame = directPartPacketLeaseFrame;
+      visibleRegistry.noteShadowManifestPartGoodPacket(
+          eligible.manifestPartLeaseKey, manifestFrame);
+      m_war3Scene.shadowStats.semanticSceneDirectPartLeaseUpdatedCount++;
+      m_war3Scene.shadowStats
+          .semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount++;
+    }
+
+    for (auto& [objectKey, partKeys] : liveSubmittedCorePartsByObject) {
+      if (objectKey == 0u || partKeys.empty())
+        continue;
+      std::sort(partKeys.begin(), partKeys.end());
+      partKeys.erase(std::unique(partKeys.begin(), partKeys.end()),
+                     partKeys.end());
+      auto& coreSet = manifestObjectCoreSets[objectKey];
+      coreSet.lastLiveSubmittedFrame = directPartPacketLeaseFrame;
+
+      // Phase 7.25 旧语义回退路径：直接覆盖，保持与 7.24 行为一致，
+      // 便于 A/B 和回归排查。
+      if (!War3SemanticShadowManifestCoreEpochPlannerRuntime()) {
+        coreSet.committedPartKeys = partKeys;
+        coreSet.lastCommitFrame = directPartPacketLeaseFrame;
+        coreSet.observationPartKeys.clear();
+        coreSet.observationStartFrame = 0u;
+        continue;
+      }
+
+      // Phase 7.25 core epoch 推进规则：
+      //   1) committed 为空：
+      //       - 先把本帧观测存进 observationPartKeys；
+      //       - 若上一帧的 observation 与本帧 partKeys 完全一致，
+      //         则将其作为 committed（两帧独立观察确认）。
+      //       - 这可避免把偶然一次残缺观察固化成 core。
+      //   2) committed 非空且 live partKeys 包含 committed（超集）：
+      //       - 更新 committed 为本帧 partKeys（允许 core 扩容），
+      //         同时刷新 lastCommitFrame。
+      //   3) 其它情况（live 未覆盖 committed）：
+      //       - 保留 committed 不动（避免退化），但刷新 observation，
+      //         下一帧再做一次判断。
+      const bool covers = std::includes(
+          partKeys.begin(), partKeys.end(),
+          coreSet.committedPartKeys.begin(),
+          coreSet.committedPartKeys.end());
+      if (coreSet.committedPartKeys.empty()) {
+        // 两帧独立观察，若本帧 partKeys 是上一帧 observation 的超集或相等，
+        // 则把本帧作为 committed。严格“完全一致”会因为运行中单帧抖动
+        // 导致 core 永远无法建立；改为“超集即提升”是更务实的收敛策略，
+        // 仍不会因为第一次残缺观察而被固化成 core（只有被下一帧再次覆盖或扩容时才 commit）。
+        const bool observationFresh =
+            !coreSet.observationPartKeys.empty() &&
+            directPartPacketLeaseFrame > coreSet.observationStartFrame &&
+            directPartPacketLeaseFrame - coreSet.observationStartFrame <=
+                manifestGeometryCacheFrames;
+        const bool supersedesObservation =
+            observationFresh &&
+            std::includes(partKeys.begin(), partKeys.end(),
+                          coreSet.observationPartKeys.begin(),
+                          coreSet.observationPartKeys.end());
+        if (supersedesObservation) {
+          coreSet.committedPartKeys = partKeys;
+          coreSet.lastCommitFrame = directPartPacketLeaseFrame;
+          coreSet.observationPartKeys.clear();
+          coreSet.observationStartFrame = 0u;
+          m_war3Scene.shadowStats
+              .semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount++;
+        } else {
+          coreSet.observationPartKeys = partKeys;
+          coreSet.observationStartFrame = directPartPacketLeaseFrame;
+        }
+      } else if (covers) {
+        coreSet.committedPartKeys = partKeys;
+        coreSet.lastCommitFrame = directPartPacketLeaseFrame;
+        coreSet.observationPartKeys.clear();
+        coreSet.observationStartFrame = 0u;
+        m_war3Scene.shadowStats
+            .semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount++;
+      } else {
+        // Phase 7.30：尝试从 committed 里移除 phantom parts。
+        // 一个 committed part 如果同时满足：
+        //   - 不在本帧 live partKeys 里；
+        //   - 也不在 directPartPacketLeases 表里（已被 TTL 淘汰）；
+        // 说明这片 part 已经离开 manifestGeometryCacheFrames 窗口，不会再回来。
+        // 如果继续留在 committed，core gate 会永远要求它，
+        // 然后就会出现"整对象反复跳过 / 阴影规律闪烁"。
+        // 只做收缩不做扩容：这里不会把本帧新 live 的 part 塞进 committed，
+        // 仍然由上面的 covers/supersedesObservation 分支负责扩容，
+        // 保持 core 的"谁承诺、谁验证"契约。
+        std::vector<uint64_t> shrunken;
+        shrunken.reserve(coreSet.committedPartKeys.size());
+        for (uint64_t partKey : coreSet.committedPartKeys) {
+          const bool inLive = std::binary_search(partKeys.begin(),
+                                                 partKeys.end(), partKey);
+          const bool inLease =
+              directPartPacketLeases.find(partKey) !=
+              directPartPacketLeases.end();
+          if (inLive || inLease)
+            shrunken.push_back(partKey);
+        }
+        if (shrunken.size() < coreSet.committedPartKeys.size()) {
+          coreSet.committedPartKeys = std::move(shrunken);
+          coreSet.lastCommitFrame = directPartPacketLeaseFrame;
+        }
+        // live 暂时不覆盖 committed：不退化 committed 结构（除去 phantom），
+        // 只刷新 observation 以便下一帧继续判断。
+        coreSet.observationPartKeys = partKeys;
+        coreSet.observationStartFrame = directPartPacketLeaseFrame;
+      }
+    }
+  }
+
+  {
+    uint32_t manifestObjectCount = 0u;
+    uint32_t observedPartCount = 0u;
+    uint32_t shadowEligiblePartCount = 0u;
+    uint32_t completeEligibleObjectCount = 0u;
+    uint32_t alphaPolicyObjectCount = 0u;
+    uint32_t sliceUnresolvedObjectCount = 0u;
+    uint32_t packetBuildFailObjectCount = 0u;
+    uint32_t appendFailObjectCount = 0u;
+    uint32_t submittedCompleteObjectCount = 0u;
+    uint32_t submittedPartialObjectCount = 0u;
+    uint32_t preparedSliceCount = 0u;
+    uint32_t fallbackSliceCount = 0u;
+    uint32_t missingSliceCount = 0u;
+    for (const auto& [_, bucket] : completenessBuckets) {
+      if (bucket.observedParts == 0u)
+        continue;
+      manifestObjectCount++;
+      observedPartCount += bucket.observedParts;
+      shadowEligiblePartCount += bucket.shadowEligibleParts;
+      preparedSliceCount += bucket.preparedSliceParts;
+      fallbackSliceCount += bucket.fallbackSliceParts;
+      missingSliceCount += bucket.missingSliceParts;
+      if (bucket.alphaRejectedParts != 0u)
+        alphaPolicyObjectCount++;
+      if (bucket.packetBuildFailParts != 0u)
+        packetBuildFailObjectCount++;
+      if (bucket.missingSliceParts != 0u)
+        sliceUnresolvedObjectCount++;
+      const bool completeEligible =
+          bucket.shadowEligibleParts != 0u &&
+          bucket.packetBuildFailParts == 0u &&
+          bucket.missingSliceParts == 0u &&
+          bucket.eligibleParts == bucket.shadowEligibleParts;
+      if (completeEligible)
+        completeEligibleObjectCount++;
+      if (bucket.submittedParts != 0u) {
+        if (bucket.submittedParts == bucket.eligibleParts && completeEligible) {
+          submittedCompleteObjectCount++;
+        } else {
+          submittedPartialObjectCount++;
+          appendFailObjectCount++;
+        }
+      }
+    }
+    auto& stats = m_war3Scene.shadowStats;
+    stats.semanticSceneDirectManifestObjectCount = manifestObjectCount;
+    stats.semanticSceneDirectManifestObservedPartCount = observedPartCount;
+    stats.semanticSceneDirectManifestShadowEligiblePartCount =
+        shadowEligiblePartCount;
+    stats.semanticSceneDirectObjectCompleteEligibleCount =
+        completeEligibleObjectCount;
+    stats.semanticSceneDirectObjectIncompleteByScanCapCount =
+        (!useObjectFirstSnapshot && snapshotOptions.maxRecords != 0u &&
+         rawRecordCount >= directScanCap)
+            ? manifestObjectCount
+            : 0u;
+    stats.semanticSceneDirectObjectIncompleteByAlphaPolicyCount =
+        alphaPolicyObjectCount;
+    stats.semanticSceneDirectObjectIncompleteBySliceUnresolvedCount =
+        sliceUnresolvedObjectCount;
+    stats.semanticSceneDirectObjectIncompleteByPacketBuildFailCount =
+        packetBuildFailObjectCount;
+    stats.semanticSceneDirectObjectIncompleteByAppendFailCount =
+        appendFailObjectCount;
+    stats.semanticSceneDirectSubmittedCompleteObjectCount =
+        submittedCompleteObjectCount;
+    stats.semanticSceneDirectSubmittedPartialObjectCount =
+        submittedPartialObjectCount;
+    stats.semanticSceneDirectPreparedSliceAuthoritativeCount =
+        preparedSliceCount;
+    stats.semanticSceneDirectPreparedSliceFallbackLayerIndexCount =
+        fallbackSliceCount;
+    stats.semanticSceneDirectPreparedSliceMissingCount = missingSliceCount;
+  }
+
+  // --- Step 4: 填充诊断 gauge ---
+  m_war3Scene.shadowStats.semanticSceneDirectLastSubmittedRecordCount = submitted;
+
+  // identity hash: 基于实际提交的 stable caster identity 集合
+  {
+    auto computeJaccardMilli = [](std::vector<uint64_t> previousKeys,
+                                  std::vector<uint64_t> currentKeys)
+        -> uint32_t {
+      std::sort(previousKeys.begin(), previousKeys.end());
+      previousKeys.erase(std::unique(previousKeys.begin(), previousKeys.end()),
+                         previousKeys.end());
+      std::sort(currentKeys.begin(), currentKeys.end());
+      currentKeys.erase(std::unique(currentKeys.begin(), currentKeys.end()),
+                        currentKeys.end());
+      if (previousKeys.empty() && currentKeys.empty())
+        return 1000u;
+      size_t previousIndex = 0u;
+      size_t currentIndex = 0u;
+      uint64_t intersection = 0u;
+      while (previousIndex < previousKeys.size() &&
+             currentIndex < currentKeys.size()) {
+        if (previousKeys[previousIndex] == currentKeys[currentIndex]) {
+          ++intersection;
+          ++previousIndex;
+          ++currentIndex;
+        } else if (previousKeys[previousIndex] < currentKeys[currentIndex]) {
+          ++previousIndex;
+        } else {
+          ++currentIndex;
+        }
+      }
+      const uint64_t unionCount =
+          uint64_t(previousKeys.size() + currentKeys.size()) - intersection;
+      if (unionCount == 0u)
+        return 1000u;
+      return uint32_t((intersection * 1000u) / unionCount);
+    };
+
+    uint64_t identityHash = 0xcbf29ce484222325ull;
+    std::vector<uint64_t> sortedKeys = submittedPartIdentityKeys;
+    if (sortedKeys.empty()) {
+      for (uint64_t key : submittedIdentityKeys)
+        sortedKeys.push_back(key);
+    }
+    std::sort(sortedKeys.begin(), sortedKeys.end());
+    sortedKeys.erase(std::unique(sortedKeys.begin(), sortedKeys.end()),
+                     sortedKeys.end());
+    for (uint64_t key : sortedKeys) {
+      identityHash = bit::fnv1a_iter(identityHash, key);
+    }
+    m_war3Scene.shadowStats.semanticSceneDirectLastSubmittedIdentityHash = identityHash;
+
+    std::vector<uint64_t> sortedObjectKeys;
+    sortedObjectKeys.reserve(submittedIdentityKeys.size());
+    for (uint64_t key : submittedIdentityKeys)
+      sortedObjectKeys.push_back(key);
+    m_war3Scene.shadowStats.semanticSceneSubmittedObjectJaccardMilli =
+        computeJaccardMilli(previousSubmittedObjectIdentityKeys,
+                            sortedObjectKeys);
+    m_war3Scene.shadowStats.semanticSceneSubmittedPartJaccardMilli =
+        computeJaccardMilli(previousSubmittedPartIdentityKeys, sortedKeys);
+
+    if (m_war3SemanticDirectPrevIdentityHash != 0u &&
+        m_war3SemanticDirectPrevIdentityHash != identityHash) {
+      m_war3Scene.shadowStats.semanticSceneDirectIdentityChurnCount++;
+    }
+    m_war3SemanticDirectPrevIdentityHash = identityHash;
+    if (stickySelectionLease) {
+      const uint64_t currentFrame = m_war3ShadowPersistentFrameSerial;
+      for (uint64_t key : submittedPreferenceKeys) {
+        if (key != 0u)
+          m_war3SemanticDirectSelectionLeaseLastSeen[key] = currentFrame;
+      }
+      m_war3Scene.shadowStats
+          .semanticSceneDirectSelectionLeaseSubmittedKeyCount +=
+          uint32_t(submittedPreferenceKeys.size());
+    }
+    std::vector<uint64_t> sortedPreferenceKeys;
+    sortedPreferenceKeys.reserve(submittedPreferenceKeys.size());
+    for (uint64_t key : submittedPreferenceKeys)
+      sortedPreferenceKeys.push_back(key);
+    std::sort(sortedPreferenceKeys.begin(), sortedPreferenceKeys.end());
+    sortedPreferenceKeys.erase(
+        std::unique(sortedPreferenceKeys.begin(), sortedPreferenceKeys.end()),
+        sortedPreferenceKeys.end());
+    m_war3SemanticDirectPrevSubmittedIdentityKeys =
+        std::move(sortedPreferenceKeys);
+    std::sort(sortedObjectKeys.begin(), sortedObjectKeys.end());
+    sortedObjectKeys.erase(
+        std::unique(sortedObjectKeys.begin(), sortedObjectKeys.end()),
+        sortedObjectKeys.end());
+    m_war3SemanticDirectPrevSubmittedObjectIdentityKeys =
+        std::move(sortedObjectKeys);
+    m_war3SemanticDirectPrevSubmittedPartIdentityKeys = std::move(sortedKeys);
+  }
+
+  // 更新 frame serial
+  if (submitted != 0u) {
+    m_war3Scene.shadowStats.semanticSceneLastFrameSerial =
+        currentVisibleFrameSerial != 0u ? currentVisibleFrameSerial
+                                        : m_war3ShadowPersistentFrameSerial;
+    m_war3Scene.shadowStats.semanticSceneLastSelectedFrameSerial =
+        m_war3Scene.shadowStats.semanticSceneLastFrameSerial;
+    m_war3Scene.shadowStats.semanticSceneLastSubmittedDrawCount = submitted;
+  }
+  return submitted;
+}
+
 uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     bool unitsOnly,
     bool executeNativeBackendValidation) {
+  enum : uint32_t {
+    kPopulateReturnUnknown = 0u,
+    kPopulateReturnConsumerDisabled = 1u,
+    kPopulateReturnRuntimeNotReady = 2u,
+    kPopulateReturnContractCaptureDisabled = 3u,
+    kPopulateReturnSameFrameReuse = 4u,
+    kPopulateReturnStableSubmittedReuse = 5u,
+    kPopulateReturnEmptyFrame = 6u,
+    kPopulateReturnZeroSubmitCooldown = 7u,
+    kPopulateReturnSubmittedZero = 8u,
+    kPopulateReturnSubmittedNonZero = 9u,
+  };
+
   m_war3Scene.shadowStats.semanticScenePopulateAttemptCount++;
   if (unitsOnly)
     m_war3Scene.shadowStats.semanticScenePopulateUnitsOnlyCount++;
+  const auto currentDrawDiagAtEntry =
+      dxvk::war3::render::QueryCurrentDrawContractDiagnosticsSummary();
+  uint32_t populateReturnReason = kPopulateReturnUnknown;
+  struct PopulateCurrentDrawDeltaScope {
+    War3ShadowCaptureStats* shadowStats = nullptr;
+    dxvk::war3::render::CurrentDrawContractDiagnosticsSummary entry = {};
+    uint32_t* reason = nullptr;
+    bool flushed = false;
+    void flush() {
+      if (flushed)
+        return;
+      flushed = true;
+      if (shadowStats == nullptr || reason == nullptr)
+        return;
+      const auto exit =
+          dxvk::war3::render::QueryCurrentDrawContractDiagnosticsSummary();
+      shadowStats->semanticScenePopulateLastReturnReason = *reason;
+      shadowStats->semanticScenePopulateLastProducerPublishAttemptDelta =
+          uint32_t(exit.publishAttemptCount - entry.publishAttemptCount);
+      shadowStats->semanticScenePopulateLastProducerPublishReadyDelta =
+          uint32_t(exit.publishReadyCount - entry.publishReadyCount);
+      shadowStats->semanticScenePopulateLastProducerQueryAttemptDelta =
+          uint32_t(exit.queryAttemptCount - entry.queryAttemptCount);
+      shadowStats->semanticScenePopulateLastProducerQueryHitDelta =
+          uint32_t(exit.queryHitCount - entry.queryHitCount);
+      shadowStats
+          ->semanticScenePopulateLastProducerCapturedPaletteQueryAttemptDelta =
+          uint32_t(exit.capturedPaletteQueryAttemptCount -
+                   entry.capturedPaletteQueryAttemptCount);
+      shadowStats
+          ->semanticScenePopulateLastProducerCapturedPaletteQueryHitDelta =
+          uint32_t(exit.capturedPaletteQueryHitCount -
+                   entry.capturedPaletteQueryHitCount);
+      shadowStats->semanticScenePopulateLastProducerGroupDecodeAttemptDelta =
+          uint32_t(exit.groupSlotDecodeAttemptCount -
+                   entry.groupSlotDecodeAttemptCount);
+      shadowStats->semanticScenePopulateLastProducerGroupDecodeHitDelta =
+          uint32_t(exit.groupSlotDecodeHitCount -
+                   entry.groupSlotDecodeHitCount);
+      // Phase 7.30 Action B：attribution-key snapshot 命中次数直接从
+      // producer diag 中拉取差量，挂到 shadow stats，方便 AutoTest 验收。
+      // 注意：capture 端（PublishCurrentDrawContract）发生在
+      // RenderQueueUpdateItemWorldMatrix hook 内，通常在 Populate 窗口外。
+      // 所以 `exit - entry` 在 Populate 周期里往往是 0。这里改用累加到 scene
+      // stats 的做法（scene stats 本身按帧重置），直接写入绝对值以保证
+      // AutoTest 能看到 trusted source 是否被实际命中。
+      shadowStats->semanticSceneDirectPaletteAttributionSnapshotHitCount =
+          uint32_t(exit.paletteAttributionSnapshotHitCount);
+      shadowStats->semanticSceneDirectPaletteCaptureTrustedSourceHitCount =
+          uint32_t(exit.paletteCaptureTrustedSourceHitCount);
+      shadowStats->semanticSceneDirectPaletteCaptureTrustedSourceMissCount =
+          uint32_t(exit.paletteCaptureTrustedSourceMissCount);
+      shadowStats->semanticScenePreparedProbeAttemptCount =
+          uint32_t(exit.preparedSliceProbeAttemptCount -
+                   entry.preparedSliceProbeAttemptCount);
+      shadowStats->semanticScenePreparedProbeContextReadyCount =
+          uint32_t(exit.preparedSliceProbeContextReadyCount -
+                   entry.preparedSliceProbeContextReadyCount);
+      shadowStats->semanticScenePreparedProbeBackingReadableCount =
+          uint32_t(exit.preparedSliceProbeBackingReadableCount -
+                   entry.preparedSliceProbeBackingReadableCount);
+      shadowStats->semanticScenePreparedSliceRecordedCount =
+          uint32_t(exit.preparedSliceRecordedCount -
+                   entry.preparedSliceRecordedCount);
+      shadowStats->semanticScenePreparedSliceQueryAttemptCount =
+          uint32_t(exit.preparedSliceQueryAttemptCount -
+                   entry.preparedSliceQueryAttemptCount);
+      shadowStats->semanticScenePreparedSliceQueryHitCount =
+          uint32_t(exit.preparedSliceQueryHitCount -
+                   entry.preparedSliceQueryHitCount);
+      shadowStats->semanticScenePreparedSliceQueryMissCount =
+          uint32_t(exit.preparedSliceQueryMissCount -
+                   entry.preparedSliceQueryMissCount);
+    }
+    ~PopulateCurrentDrawDeltaScope() {
+      flush();
+    }
+  } populateCurrentDrawDeltaScope = {
+      &m_war3Scene.shadowStats, currentDrawDiagAtEntry, &populateReturnReason};
 
   if (!War3SemanticConsumerEnabled() ||
-      !dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled())
+      !dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled()) {
+    populateReturnReason = kPopulateReturnConsumerDisabled;
+    populateCurrentDrawDeltaScope.flush();
+    dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
     return 0u;
+  }
   const bool semanticRuntimeReady =
       dxvk::war3::War3Events::get().isGameStarted() ||
       (dxvk::war3::War3Events::get().isJassReady() &&
        dxvk::war3::internal::IsSemanticShadowPreReadyValidationRuntimeEnabled());
-  if (!semanticRuntimeReady)
+  if (!semanticRuntimeReady) {
+    populateReturnReason = kPopulateReturnRuntimeNotReady;
+    populateCurrentDrawDeltaScope.flush();
+    dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
     return 0u;
+  }
   auto populateScope =
       war3::War3PerfMonitor::instance().cpuScope("War3SemanticScene/Populate");
   struct SemanticConsumerPerfScope {
@@ -7786,6 +13462,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
   } semanticConsumerPerf;
 
   if (!War3SemanticContractCaptureEnabled()) {
+    populateReturnReason = kPopulateReturnContractCaptureDisabled;
+    populateCurrentDrawDeltaScope.flush();
+    dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
     return 0u;
   }
   const bool semanticSceneHasSubmittedOnce =
@@ -7818,6 +13497,47 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
       m_war3ShadowPersistentFrameSerial;
   const bool semanticSceneHasCapturedContract =
       m_war3SemanticSceneLastCapturePublishRevision != 0u;
+  const uint64_t currentVisibleFrameSerial =
+      dxvk::war3::render::VisibleRenderableRegistry::instance().getFrameNumber();
+  const uint64_t currentDrawMinVisibleFrameSerial =
+      War3SemanticCurrentDrawMinVisibleFrameSerial(currentVisibleFrameSerial);
+  const uint64_t canonicalNativeFrameSerial =
+      currentVisibleFrameSerial != 0u
+          ? currentVisibleFrameSerial
+          : m_war3ShadowPersistentFrameSerial != 0u
+                ? m_war3ShadowPersistentFrameSerial
+                : uint64_t(1u);
+  dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
+      .beginCanonicalFrame(canonicalNativeFrameSerial);
+  if (War3SemanticDirectOnlyRuntime()) {
+    // Phase 7.1: 使用 object-grouped helper 替代原始逐 record 提交
+    const uint32_t directSubmitted = War3TryPopulateDirectCurrentDrawGrouped(
+        /*readyOnly=*/true, unitsOnly,
+        currentVisibleFrameSerial, currentDrawMinVisibleFrameSerial);
+    if (directSubmitted != 0u) {
+      if (dxvk::war3::internal::
+              IsNativeRendererHostExecuteValidationRuntimeEnabled()) {
+        const bool canonicalPrepared =
+            dxvk::war3::platform::DriveNativeShadowBackend(false, 0u);
+        if (canonicalPrepared)
+          dxvk::war3::platform::ExecuteNativeShadowBackendPreparedFrame();
+      }
+      populateReturnReason = kPopulateReturnSubmittedNonZero;
+      populateCurrentDrawDeltaScope.flush();
+      dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
+      return directSubmitted;
+    }
+    m_war3Scene.shadowStats.semanticSceneSkippedEmptyFrameCount++;
+    populateReturnReason = kPopulateReturnEmptyFrame;
+    populateCurrentDrawDeltaScope.flush();
+    dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
+    return 0u;
+  }
+  const bool visibleFrameAheadOfLastCapture =
+      currentVisibleFrameSerial != 0u &&
+      currentVisibleFrameSerial > m_war3SemanticSceneLastCapturedVisibleFrameSerial;
+  if (visibleFrameAheadOfLastCapture)
+    shouldCaptureContract = true;
   const bool semanticDrawTimePoseDirty =
       m_war3SemanticDrawTimePoseDirtyFrameSerial ==
       m_war3ShadowPersistentFrameSerial;
@@ -7827,6 +13547,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
       matrixPublisherPoseRevision != 0u &&
       matrixPublisherPoseRevision !=
           m_war3SemanticLastMatrixPublisherPoseRevision;
+  const auto preCaptureSemanticStats =
+      dxvk::war3::shadow::ShadowValidationRuntime::instance().snapshot();
+  const bool semanticCoverageNeedsRecovery =
+      semanticSceneHasCapturedContract &&
+      !semanticSceneHasSubmittedOnce &&
+      preCaptureSemanticStats.resolve.skippedResourceMiss != 0u;
   bool shouldCapturePoseOnlyContract = false;
   if (shouldCaptureContract &&
       (semanticSceneHasSubmittedOnce || semanticSceneHasCapturedContract)) {
@@ -7835,6 +13561,21 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
         m_war3ShadowPersistentFrameSerial >=
             m_war3SemanticSceneLastCaptureFrameSerial +
                 kSceneContractCaptureSteadyFramePeriod;
+    const uint64_t poseOnlyCapturePeriod =
+        War3SemanticPoseOnlyCapturePeriodRuntime();
+    const bool poseOnlyCapturePeriodElapsed =
+        m_war3SemanticSceneLastPoseOnlyCaptureFrameSerial == 0u ||
+        m_war3ShadowPersistentFrameSerial >=
+            m_war3SemanticSceneLastPoseOnlyCaptureFrameSerial +
+                poseOnlyCapturePeriod;
+    constexpr uint64_t kCoverageRecoveryFramePeriod = 8u;
+    const bool coverageRecoveryPeriodElapsed =
+        m_war3SemanticSceneLastCoverageRecoveryCaptureFrameSerial == 0u ||
+        m_war3ShadowPersistentFrameSerial >=
+            m_war3SemanticSceneLastCoverageRecoveryCaptureFrameSerial +
+                kCoverageRecoveryFramePeriod;
+    const bool forceFullCaptureForCoverage =
+        semanticCoverageNeedsRecovery && coverageRecoveryPeriodElapsed;
     // Once packets exist, static topology can be refreshed periodically, but
     // War3's final matrix publisher is the animated pose source for skinned
     // semantic units. When it advances, capture the contract this frame instead
@@ -7842,10 +13583,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     // old/initial pose for ~DXVK_WAR3_SEMANTIC_CONTRACT_CAPTURE_PERIOD.
     shouldCapturePoseOnlyContract =
         semanticMatrixPublisherPoseDirty && semanticSceneHasCapturedContract &&
-        !capturePeriodElapsed;
+        !capturePeriodElapsed && !forceFullCaptureForCoverage &&
+        poseOnlyCapturePeriodElapsed;
     shouldCaptureContract =
         semanticMatrixPublisherPoseDirty || semanticDrawTimePoseDirty ||
-        capturePeriodElapsed ||
+        capturePeriodElapsed || forceFullCaptureForCoverage ||
         m_war3SemanticSceneLastCapturePublishRevision == 0u;
   }
   if (shouldCaptureContract) {
@@ -7867,6 +13609,16 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
         (sceneBundle.valid() && sceneBundle.manifest != nullptr)
             ? sceneBundle.manifest->publishRevision
             : 0u;
+    m_war3SemanticSceneLastCapturedVisibleFrameSerial =
+        (sceneBundle.valid() && sceneBundle.manifest != nullptr)
+            ? sceneBundle.manifest->frameSerial
+            : currentVisibleFrameSerial;
+    if (shouldCapturePoseOnlyContract)
+      m_war3SemanticSceneLastPoseOnlyCaptureFrameSerial =
+          m_war3ShadowPersistentFrameSerial;
+    if (!shouldCapturePoseOnlyContract)
+      m_war3SemanticSceneLastCoverageRecoveryCaptureFrameSerial =
+          m_war3ShadowPersistentFrameSerial;
     m_war3SemanticLastMatrixPublisherPoseRevision =
         matrixPublisherPoseRevision;
   }
@@ -7886,6 +13638,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
       (!executeNativeBackendValidation ||
        m_war3SemanticSceneLastSuccessfulSubmitNativeValidation) &&
       !semanticLivePaletteSubmitNeeded) {
+    populateReturnReason = kPopulateReturnSameFrameReuse;
     return 0u;
   }
   auto& semanticRuntime =
@@ -7908,9 +13661,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     // incremental. Re-running several build chunks every BeforeUi frame was
     // showing up as "UntrackedActive" CPU and could stall low-pressure maps even
     // when SubmitFrame itself was single-flight.
-    constexpr uint32_t kSceneSupplementedBuildBootstrapPasses = 4u;
-    constexpr uint32_t kSceneSupplementedBuildSteadyPasses = 2u;
-    constexpr uint64_t kSceneSupplementedBuildSteadyFramePeriod = 1u;
+    constexpr uint32_t kSceneSupplementedBuildBootstrapPasses = 1u;
+    constexpr uint32_t kSceneSupplementedBuildSteadyPasses = 1u;
+    constexpr uint64_t kSceneSupplementedBuildSteadyFramePeriod = 4u;
     bool shouldProgressSteadyBuild = !semanticSceneHasSubmittedOnce;
     if (semanticSceneHasSubmittedOnce) {
       const auto currentFrame = semanticRuntime.snapshotFrameShared();
@@ -7919,11 +13672,19 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
           currentFrame ? currentFrame->sourcePublishRevision : 0u;
       const uint64_t currentFrameSerial =
           currentFrame ? currentFrame->frameSerial : 0u;
-      const bool currentFrameFresh =
+      const bool livePaletteCanKeepAnimationFresh =
+          semanticLivePaletteSubmitNeeded &&
+          currentFrame &&
+          currentFrame->frameSerial != 0u &&
+          !currentFrame->draws.empty();
+      const bool currentFrameTopologyFresh =
           currentFrame && currentFrame->frameSerial != 0u &&
           !currentFrame->draws.empty() &&
-          currentFrame->sourcePublishRevision >= desiredRevision &&
-          currentFrameSerial >= desiredFrameSerial;
+          currentFrame->sourcePublishRevision >= desiredRevision;
+      const bool currentFrameFresh =
+          currentFrameTopologyFresh &&
+          (currentFrameSerial >= desiredFrameSerial ||
+           livePaletteCanKeepAnimationFresh);
       const bool currentFramePoseStale =
           desiredFrameSerial != 0u &&
           (currentFrameSerial == 0u ||
@@ -7941,19 +13702,25 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
           m_war3ShadowPersistentFrameSerial >=
               m_war3SemanticSceneLastSteadyBuildFrameSerial +
                   kSceneSupplementedBuildSteadyFramePeriod;
+      const bool poseStaleNeedsSupplementedBuild =
+          currentFramePoseStale && !livePaletteCanKeepAnimationFresh;
       shouldProgressSteadyBuild =
-          (!currentFrameFresh || currentFramePoseStale) &&
+          (!currentFrameFresh || poseStaleNeedsSupplementedBuild) &&
           (currentBuildState.buildInProgress ||
            currentBuildState.buildRequestPending ||
            desiredRevision > currentFrameRevision ||
-           currentFramePoseStale) &&
+           poseStaleNeedsSupplementedBuild) &&
           steadyBuildPeriodElapsed;
     }
     const uint32_t sceneSupplementedBuildMaxPasses =
         semanticSceneHasSubmittedOnce
-            ? (shouldProgressSteadyBuild ? kSceneSupplementedBuildSteadyPasses
+            ? ((War3SemanticSteadySupplementedBuildRuntime() &&
+                shouldProgressSteadyBuild)
+                   ? kSceneSupplementedBuildSteadyPasses
                                          : 0u)
-            : kSceneSupplementedBuildBootstrapPasses;
+            : (War3SemanticBootstrapSupplementedBuildRuntime()
+                   ? kSceneSupplementedBuildBootstrapPasses
+                   : 0u);
     if (semanticSceneHasSubmittedOnce && sceneSupplementedBuildMaxPasses != 0u)
       m_war3SemanticSceneLastSteadyBuildFrameSerial =
           m_war3ShadowPersistentFrameSerial;
@@ -8075,6 +13842,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
           m_war3Scene.shadowStats.semanticSceneLastTargetPublishRevision &&
       m_war3SemanticSceneLastSuccessfulSubmitComplete &&
       !buildState.buildInProgress && !buildState.buildRequestPending) {
+    populateReturnReason = kPopulateReturnStableSubmittedReuse;
     return m_war3Scene.shadowStats.semanticSceneLastSubmittedDrawCount;
   }
 
@@ -8263,7 +14031,51 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
   if (!frame || frame->frameSerial == 0u || frame->draws.empty())
     tryReuseLastNonZeroSemanticFrame();
   tryReuseLastNonZeroIfSelectedFrameCannotSubmit();
-  if (!frame || frame->frameSerial == 0u || frame->draws.empty()) {
+    if (!frame || frame->frameSerial == 0u || frame->draws.empty()) {
+    // Phase 7.1: 使用 object-grouped helper 替代原始逐 record 提交（fallback 路径，readyOnly=false）
+    if (const uint32_t directSubmitted = War3TryPopulateDirectCurrentDrawGrouped(
+            /*readyOnly=*/false, unitsOnly,
+            currentVisibleFrameSerial, currentDrawMinVisibleFrameSerial);
+        directSubmitted != 0u) {
+      bool nativeDirectPrepared = false;
+      bool nativeDirectExecuted = false;
+      if (executeNativeBackendValidation) {
+        nativeDirectPrepared =
+            dxvk::war3::platform::DriveNativeShadowBackend(false, 3u);
+        if (nativeDirectPrepared &&
+            dxvk::war3::internal::
+                IsNativeRendererHostExecuteValidationRuntimeEnabled()) {
+          nativeDirectExecuted =
+              dxvk::war3::platform::ExecuteNativeShadowBackendPreparedFrame();
+        }
+      }
+      if (dxvk::war3::internal::
+              IsNativeRendererHostExecuteValidationRuntimeEnabled()) {
+        auto nativeCanonicalScope = war3::War3PerfMonitor::instance().cpuScope(
+            "War3SemanticScene/NativeCanonicalExecute");
+        const bool canonicalPrepared =
+            dxvk::war3::platform::DriveNativeShadowBackend(false, 0u);
+        if (canonicalPrepared) {
+          nativeDirectExecuted =
+              dxvk::war3::platform::ExecuteNativeShadowBackendPreparedFrame() ||
+              nativeDirectExecuted;
+        }
+      }
+      if (nativeDirectExecuted) {
+        static std::atomic<uint32_t> s_nativeDirectExecutedLogCount{0u};
+        const uint32_t nativeLogIndex =
+            s_nativeDirectExecutedLogCount.fetch_add(
+                1u, std::memory_order_relaxed);
+        if (nativeLogIndex < 3u || (nativeLogIndex % 300u) == 0u) {
+          WAR3_RENDER_LOG(
+              "DXVK War3Shadow: direct current-draw path executed native "
+              "backend draws unitsOnly=%d submitted=%u\n",
+              unitsOnly ? 1 : 0, directSubmitted);
+        }
+      }
+      populateReturnReason = kPopulateReturnSubmittedNonZero;
+      return directSubmitted;
+    }
     m_war3Scene.shadowStats.semanticSceneSkippedEmptyFrameCount++;
     static std::atomic<uint32_t> s_emptyLogCount{0u};
     const uint32_t logIndex =
@@ -8279,6 +14091,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
           buildState.buildInProgress ? 1 : 0,
           static_cast<unsigned long long>(stats.resolve.resolved));
     }
+    populateReturnReason = kPopulateReturnEmptyFrame;
     return 0u;
   }
   {
@@ -8349,6 +14162,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
           m_war3SemanticSceneLastZeroSubmitFrameSerial +
               kSceneZeroSubmitCooldownFrames;
   if (zeroSubmitCooldownActive) {
+    populateReturnReason = kPopulateReturnZeroSubmitCooldown;
     return 0u;
   }
 
@@ -8357,6 +14171,34 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
       unitsOnly && !m_war3Scene.shadowFallbacks.empty();
   m_war3SemanticDxvkBackend.configureHost(&host, unitsOnly,
                                           trackSubmittedIdentities);
+  auto driveNativeSemanticValidation = [&]() -> std::pair<bool, bool> {
+    bool nativePreparedLocal = false;
+    bool nativeExecutedLocal = false;
+    if (executeNativeBackendValidation) {
+      nativePreparedLocal =
+          dxvk::war3::platform::DriveNativeShadowBackend(false, 3u);
+      if (nativePreparedLocal &&
+          dxvk::war3::internal::
+              IsNativeRendererHostExecuteValidationRuntimeEnabled()) {
+        nativeExecutedLocal =
+            dxvk::war3::platform::ExecuteNativeShadowBackendPreparedFrame();
+      }
+    }
+    if (dxvk::war3::internal::
+            IsNativeRendererHostExecuteValidationRuntimeEnabled()) {
+      auto nativeCanonicalScope = war3::War3PerfMonitor::instance().cpuScope(
+          "War3SemanticScene/NativeCanonicalExecute");
+      const bool canonicalPrepared =
+          dxvk::war3::platform::DriveNativeShadowBackend(false, 0u);
+      if (canonicalPrepared) {
+        nativeExecutedLocal =
+            dxvk::war3::platform::ExecuteNativeShadowBackendPreparedFrame() ||
+            nativeExecutedLocal;
+      }
+      nativePreparedLocal = nativePreparedLocal || canonicalPrepared;
+    }
+    return {nativePreparedLocal, nativeExecutedLocal};
+  };
   dxvk::war3::shadow::ShadowRendererCore core = {};
   {
     auto submitScope = war3::War3PerfMonitor::instance().cpuScope(
@@ -8371,20 +14213,177 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
   m_war3SemanticDxvkBackend.configureHost(nullptr, false);
   bool nativePrepared = false;
   bool nativeExecuted = false;
-  if (executeNativeBackendValidation) {
-    nativePrepared = dxvk::war3::platform::DriveNativeShadowBackend(false, 3u);
-    if (nativePrepared &&
-        dxvk::war3::internal::
-            IsNativeRendererHostExecuteValidationRuntimeEnabled()) {
-      nativeExecuted =
-          dxvk::war3::platform::ExecuteNativeShadowBackendPreparedFrame();
-    }
-  }
+  std::tie(nativePrepared, nativeExecuted) = driveNativeSemanticValidation();
   const uint32_t submitted =
       static_cast<uint32_t>(m_war3SemanticDxvkBackend.submittedDrawCount());
+  auto trySupplementManifestStaticScene = [&]() -> uint32_t {
+    if (unitsOnly || !supplementedBundle.valid() ||
+        supplementedBundle.manifest == nullptr ||
+        supplementedBundle.resources == nullptr) {
+      return 0u;
+    }
+
+    std::unordered_set<uint64_t> seen;
+    uint32_t supplemented = 0u;
+    for (const auto& record : supplementedBundle.manifest->records) {
+      const bool staticCanonicalCandidate =
+          record.objectKind == dxvk::war3::render::ObjectKind::Building ||
+          record.objectKind ==
+              dxvk::war3::render::ObjectKind::Destructible;
+      if (!staticCanonicalCandidate)
+        continue;
+
+      const uint64_t dedupeKey =
+          (uint64_t(reinterpret_cast<uintptr_t>(record.sceneNode)) >> 4u) ^
+          (uint64_t(reinterpret_cast<uintptr_t>(record.meshData)) << 1u) ^
+          (uint64_t(record.geosetIndex) << 32u) ^
+          uint64_t(record.objectKind);
+      if (!seen.insert(dedupeKey).second)
+        continue;
+
+      dxvk::war3::shadow::ShadowModelResourceRecord resourceRecord = {};
+      bool resourceHit = false;
+      if (record.runtimeGeosetDataPtr != nullptr)
+        resourceHit = supplementedBundle.resources->findByRuntimeGeosetData(
+            record.runtimeGeosetDataPtr, resourceRecord);
+      if (!resourceHit && record.runtimeGeosetPtr != nullptr)
+        resourceHit = supplementedBundle.resources->findByRuntimeGeoset(
+            record.runtimeGeosetPtr, resourceRecord);
+      if (!resourceHit && record.runtimeModelPtr != nullptr &&
+          record.geosetIndex !=
+              dxvk::war3::shadow::kInvalidShadowContractGeosetIndex) {
+        resourceHit = supplementedBundle.resources->findByRuntimeModel(
+            record.runtimeModelPtr, record.geosetIndex, resourceRecord);
+      }
+      if (!resourceHit && record.modelResourcePtr != nullptr &&
+          record.geosetIndex !=
+              dxvk::war3::shadow::kInvalidShadowContractGeosetIndex) {
+        resourceHit = supplementedBundle.resources->findByModelResource(
+            record.modelResourcePtr, record.geosetIndex, resourceRecord);
+      }
+      if (!resourceHit || !resourceRecord.readyForConsumer())
+        continue;
+
+      dxvk::war3::shadow::ShadowDrawPacket packet = {};
+      packet.renderable = record;
+      packet.resource.modelResourcePtr = resourceRecord.modelResourcePtr;
+      packet.resource.modelKey = resourceRecord.modelKey;
+      packet.resource.geosetIndex = resourceRecord.geosetIndex;
+      packet.resource.vertexCount = resourceRecord.vertexCount;
+      packet.resource.primitiveRecordCount =
+          uint32_t(resourceRecord.primitiveRecords.size());
+      packet.resource.contentHash = resourceRecord.contentHash;
+      packet.resource.topology =
+          dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
+      packet.resource.positions = &resourceRecord.positions;
+      packet.resource.vertexGroupIndices = &resourceRecord.vertexGroupIndices;
+      packet.resource.indices = &resourceRecord.indices;
+      packet.resource.matrixGroupSizes = &resourceRecord.matrixGroupSizes;
+      packet.resource.matrixIndices = &resourceRecord.matrixIndices;
+      packet.path = dxvk::war3::shadow::ShadowDrawPath::Rigid;
+      packet.usesDynamicMeshPositions = false;
+      packet.hasRuntimeGroupPalette = false;
+      packet.matrixGroupsUseAveraging = false;
+      packet.maxVertexGroupSlot = 0u;
+      packet.material.signatureHash =
+          resourceRecord.contentHash != 0u
+              ? resourceRecord.contentHash
+              : (uint64_t(record.layerIndex) << 32u) | uint64_t(record.subIndex);
+      packet.material.alphaMode = dxvk::war3::shadow::ShadowAlphaMode::Opaque;
+      packet.material.alphaCutoutRef = 0.5f;
+      packet.material.blendOrDrawMode = 0u;
+      packet.material.layerIndex = record.layerIndex;
+      packet.material.queueKind = 0u;
+      packet.material.transparentType = record.transparentType;
+
+      if (supplementedBundle.poses != nullptr) {
+        dxvk::war3::shadow::ShadowPoseRecord poseRecord = {};
+        bool poseHit = false;
+        if (record.runtimeModelPtr != nullptr)
+          poseHit = supplementedBundle.poses->findByRuntimeModel(
+              record.runtimeModelPtr, poseRecord);
+        if (!poseHit && record.sceneNode != nullptr)
+          poseHit = supplementedBundle.poses->findBySceneNode(record.sceneNode,
+                                                              poseRecord);
+        if (!poseHit && record.unitPtr != nullptr)
+          poseHit = supplementedBundle.poses->findByUnitPtr(record.unitPtr,
+                                                            poseRecord);
+        if (poseHit)
+          packet.pose = poseRecord;
+      }
+
+      if (War3TryAppendSemanticShadowPacket(packet))
+        ++supplemented;
+    }
+
+    return supplemented;
+  };
+  const uint32_t staticManifestSupplemented =
+      trySupplementManifestStaticScene();
+  auto trySupplementDirectCurrentDrawStaticScene = [&]() -> uint32_t {
+    if (unitsOnly || !War3SemanticDirectStaticSupplementRuntime())
+      return 0u;
+
+    std::unordered_set<void*> directSeenRenderableParts;
+
+    dxvk::war3::render::CurrentDrawContractSnapshotOptions snapshotOptions = {};
+    snapshotOptions.minVisibleFrameSerial = currentDrawMinVisibleFrameSerial;
+    snapshotOptions.readyOnly = false;
+    snapshotOptions.maxRecords = War3SemanticDirectCurrentDrawScanCapRuntime();
+    snapshotOptions.unitsOnly = false;
+    const auto directRecords =
+        dxvk::war3::render::SnapshotPublishedCurrentDrawContracts(
+            snapshotOptions);
+    if (directRecords.empty())
+      return 0u;
+
+    uint32_t supplemented = 0u;
+    for (const auto& record : directRecords) {
+      if (record.renderablePart == nullptr ||
+          !directSeenRenderableParts.insert(record.renderablePart).second) {
+        continue;
+      }
+
+      dxvk::war3::shadow::ShadowDrawPacket packet = {};
+      dxvk::war3::render::CurrentDrawAuthoritativeSample
+          directCurrentDrawSample = {};
+      if (!War3TryBuildShadowPacketFromCurrentDrawRecord(
+              record,
+              currentDrawMinVisibleFrameSerial,
+              packet,
+              &directCurrentDrawSample)) {
+        continue;
+      }
+
+      const auto resolvedObjectKind =
+          War3ResolveSemanticPacketObjectKindFast(packet);
+      const bool explicitUnknownRigid =
+          resolvedObjectKind == dxvk::war3::render::ObjectKind::Unknown &&
+          packet.path == dxvk::war3::shadow::ShadowDrawPath::Rigid &&
+          packet.renderable.worldObjectEntry != nullptr &&
+          packet.renderable.sceneNode != nullptr &&
+          packet.renderable.modelResourcePtr != nullptr;
+      const bool staticCanonicalCandidate =
+          resolvedObjectKind == dxvk::war3::render::ObjectKind::Building ||
+          resolvedObjectKind ==
+              dxvk::war3::render::ObjectKind::Destructible ||
+          explicitUnknownRigid;
+      if (!staticCanonicalCandidate)
+        continue;
+
+      if (War3TryAppendSemanticShadowPacket(packet, &directCurrentDrawSample)) {
+        ++supplemented;
+      }
+    }
+
+    return supplemented;
+  };
+  const uint32_t staticSupplemented =
+      staticManifestSupplemented + trySupplementDirectCurrentDrawStaticScene();
   auto postSubmitScope = war3::War3PerfMonitor::instance().cpuScope(
       "War3SemanticScene/PostSubmit");
-  m_war3Scene.shadowStats.semanticSceneLastSubmittedDrawCount = submitted;
+  const uint32_t totalSubmitted = submitted + staticSupplemented;
+  m_war3Scene.shadowStats.semanticSceneLastSubmittedDrawCount = totalSubmitted;
   const uint64_t submittedTargetRevision = semanticCatchupTargetRevision();
   const uint64_t submittedTargetFrameSerial =
       semanticCatchupTargetFrameSerial();
@@ -8400,7 +14399,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
       frame->sourcePublishRevision >= submittedTargetRevision &&
       submittedFrameCoversCompletedBuild;
 
-  if (submitted == 0u) {
+  if (totalSubmitted == 0u) {
     m_war3SemanticSceneLastZeroSubmitFrameSerial =
         m_war3ShadowPersistentFrameSerial;
     m_war3SemanticSceneLastZeroSubmitPublishRevision = frameSourceRevision;
@@ -8420,6 +14419,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
           static_cast<unsigned long long>(stats.resolve.resolved),
           static_cast<unsigned long long>(stats.resolve.considered));
     }
+    populateReturnReason = kPopulateReturnSubmittedZero;
     return 0u;
   }
 
@@ -8444,8 +14444,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
   if (logIndex < 3u) {
     war3dbg::Print(
         "DXVK War3Shadow: semantic scene submitted draws unitsOnly=%d "
-        "submitted=%u frameSerial=%llu sourceResolved=%llu\n",
-        unitsOnly ? 1 : 0, submitted,
+        "submitted=%u staticSupplemented=%u frameSerial=%llu sourceResolved=%llu\n",
+        unitsOnly ? 1 : 0, totalSubmitted, staticSupplemented,
         static_cast<unsigned long long>(frame->frameSerial),
         static_cast<unsigned long long>(stats.resolve.resolved));
   }
@@ -8457,8 +14457,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     if (nativeLogIndex < 3u || (nativeLogIndex % 300u) == 0u) {
       WAR3_RENDER_LOG(
           "DXVK War3Shadow: host validation executed native backend draws "
-          "unitsOnly=%d submitted=%u\n",
-          unitsOnly ? 1 : 0, submitted);
+          "unitsOnly=%d submitted=%u staticSupplemented=%u\n",
+          unitsOnly ? 1 : 0, totalSubmitted, staticSupplemented);
     }
   }
 
@@ -8532,7 +14532,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
       WAR3_RENDER_LOG(
           "DXVK SemanticShadow: fallback prune submitted=%u pruned=%u "
           "byHandle=%u byEntry=%u byScene=%u byRuntime=%u\n",
-          static_cast<unsigned>(submitted), static_cast<unsigned>(prunedFallbacks),
+          static_cast<unsigned>(totalSubmitted), static_cast<unsigned>(prunedFallbacks),
           static_cast<unsigned>(prunedByHandle),
           static_cast<unsigned>(prunedByWorldObjectEntry),
           static_cast<unsigned>(prunedBySceneNode),
@@ -8543,14 +14543,16 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
   if (s_logCount < 12u || (s_logCount % 300u) == 0u) {
     WAR3_RENDER_LOG(
         "DXVK SemanticShadow: scene submit frame=%llu submitted=%u "
-        "unitsOnly=%d coreResolved=%llu coreSubmitted=%llu\n",
+        "staticSupplemented=%u unitsOnly=%d coreResolved=%llu coreSubmitted=%llu\n",
         static_cast<unsigned long long>(frame->frameSerial),
-        static_cast<unsigned>(submitted), unitsOnly ? 1 : 0,
+        static_cast<unsigned>(totalSubmitted), static_cast<unsigned>(staticSupplemented),
+        unitsOnly ? 1 : 0,
         static_cast<unsigned long long>(stats.resolve.resolved),
         static_cast<unsigned long long>(stats.submittedDrawCount));
   }
   s_logCount++;
-  return submitted;
+  populateReturnReason = kPopulateReturnSubmittedNonZero;
+  return totalSubmitted;
 }
 
 bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
@@ -8567,6 +14569,7 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
 
   const uint32_t submitted = War3TryPopulateSemanticShadowScene(
       unitsOnly, executeNativeBackendValidation);
+  War3UpdateSemanticReplayInputDiagnostics(m_war3Scene);
   dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
   if (submitted == 0u && m_war3Scene.shadowCasters.empty() &&
       m_war3Scene.shadowFallbacks.empty()) {
@@ -8625,6 +14628,83 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
       auto executeScope = war3::War3PerfMonitor::instance().cpuScope(
           "War3Pipeline/SemanticValidation/RunReceiver");
       m_shadowReceiverPass->Run(cmd, cInput);
+      // Phase 7.2: 读取对账计数器并写回统计
+      auto& rec = m_shadowReceiverPass->reconciliation;
+      cInput.scene.shadowStats.semanticSceneShadowCastersCount = rec.shadowCastersCount;
+      cInput.scene.shadowStats.semanticSceneReplayDrawsCount = rec.replayDrawsCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapDrawnCasters = rec.shadowMapDrawnCasters;
+      cInput.scene.shadowStats.semanticSceneShadowMapCascadeCulledCount = rec.cascadeCulledCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapSkinnedCasterCount = rec.skinnedCasterCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapSkinnedPreparedCount = rec.skinnedPreparedCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapSkinnedInvalidBufferCount = rec.skinnedInvalidBufferCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapSkinnedInvalidPipelineCount = rec.skinnedInvalidPipelineCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapSkinnedDrawnCount = rec.skinnedDrawnCount;
+      cInput.scene.shadowStats.semanticSceneShadowTaaActive = rec.shadowTaaActive;
+      cInput.scene.shadowStats.semanticSceneReceiverReuseShadowMap = rec.receiverReuseShadowMap;
+      cInput.scene.shadowStats.semanticSceneReceiverInputValid = rec.receiverInputValid;
+      cInput.scene.shadowStats.semanticSceneReceiverInputRejectReason = rec.receiverInputRejectReason;
+      cInput.scene.shadowStats.semanticSceneReceiverNeedPass = rec.receiverNeedPass;
+      cInput.scene.shadowStats.semanticSceneReceiverNeedShadowMap = rec.receiverNeedShadowMap;
+      cInput.scene.shadowStats.semanticSceneReceiverHasCompleteShadowMap = rec.receiverHasCompleteShadowMap;
+      cInput.scene.shadowStats.semanticSceneReceiverHasUsableDirectionalShadow = rec.receiverHasUsableDirectionalShadow;
+      cInput.scene.shadowStats.semanticSceneReceiverActiveStrengthMilli = rec.receiverActiveStrengthMilli;
+      cInput.scene.shadowStats.semanticSceneReceiverUboStrengthMilli = rec.receiverUboStrengthMilli;
+      cInput.scene.shadowStats.semanticSceneReceiverDebugMode = rec.receiverDebugMode;
+      cInput.scene.shadowStats.semanticSceneReceiverCsmCascadeCount = rec.receiverCsmCascadeCount;
+      cInput.scene.shadowStats.semanticSceneReceiverRunEntryFlags = rec.receiverRunEntryFlags;
+      cInput.scene.shadowStats.semanticSceneReceiverRunEarlyReturnReason = rec.receiverRunEarlyReturnReason;
+      cInput.scene.shadowStats.semanticSceneShadowMapExecutedThisFrame = rec.shadowMapExecutedThisFrame;
+      cInput.scene.shadowStats.semanticSceneReceiverSettingsShadowsEnabled = rec.receiverSettingsShadowsEnabled;
+      cInput.scene.shadowStats.semanticSceneReceiverSettingsOutlineEnabled = rec.receiverSettingsOutlineEnabled;
+      cInput.scene.shadowStats.semanticSceneReceiverSettingsRawStrengthMilli = rec.receiverSettingsRawStrengthMilli;
+      cInput.scene.shadowStats.semanticSceneReceiverComputedShadowStrengthMilli = rec.receiverComputedShadowStrengthMilli;
+      cInput.scene.shadowStats.semanticSceneReceiverHasSunShadow = rec.receiverHasSunShadow;
+      cInput.scene.shadowStats.semanticSceneReceiverHasPointShadow = rec.receiverHasPointShadow;
+      cInput.scene.shadowStats.semanticSceneReceiverNeedOutlinePass = rec.receiverNeedOutlinePass;
+      cInput.scene.shadowStats.semanticSceneReceiverZeroStrengthFrameCount = rec.receiverZeroStrengthFrameCount;
+      cInput.scene.shadowStats.semanticSceneReceiverDrawnWithZeroStrengthCount = rec.receiverDrawnWithZeroStrengthCount;
+      cInput.scene.shadowStats.semanticSceneReceiverNoCompleteShadowMapCount = rec.receiverNoCompleteShadowMapCount;
+      cInput.scene.shadowStats.semanticSceneReceiverNoShadowMapImageCount = rec.receiverNoShadowMapImageCount;
+      cInput.scene.shadowStats.semanticSceneReceiverNoShadowMapSampleViewCount = rec.receiverNoShadowMapSampleViewCount;
+      cInput.scene.shadowStats.semanticSceneReceiverNoCandidateCsmCount = rec.receiverNoCandidateCsmCount;
+      cInput.scene.shadowStats.semanticSceneReceiverCsmFallbackToLastGoodCount = rec.receiverCsmFallbackToLastGoodCount;
+      cInput.scene.shadowStats.semanticSceneReceiverHoldInvalidCsmCount = rec.receiverHoldInvalidCsmCount;
+      cInput.scene.shadowStats.semanticSceneReceiverHoldEmptyReplayCount = rec.receiverHoldEmptyReplayCount;
+      cInput.scene.shadowStats.semanticSceneReceiverHoldIdentityChurnCount = rec.receiverHoldIdentityChurnCount;
+      cInput.scene.shadowStats.semanticSceneReceiverReuseInvalidatedAfterEnsureCount = rec.receiverReuseInvalidatedAfterEnsureCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapRenderSkippedNoResourcesCount = rec.shadowMapRenderSkippedNoResourcesCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount = rec.shadowMapRenderSkippedNoMatrixBufferCount;
+      cInput.scene.shadowStats.semanticSceneReceiverViewportX = rec.receiverViewportX;
+      cInput.scene.shadowStats.semanticSceneReceiverViewportY = rec.receiverViewportY;
+      cInput.scene.shadowStats.semanticSceneReceiverViewportWidth = rec.receiverViewportWidth;
+      cInput.scene.shadowStats.semanticSceneReceiverViewportHeight = rec.receiverViewportHeight;
+      cInput.scene.shadowStats.semanticSceneShadowMatrixSceneKey = rec.shadowMatrixSceneKey;
+      cInput.scene.shadowStats.semanticSceneShadowMatrixUploadSerial = rec.shadowMatrixUploadSerial;
+      cInput.scene.shadowStats.semanticSceneShadowMatrixBufferObjectPtr = rec.shadowMatrixBufferObjectPtr;
+      cInput.scene.shadowStats.semanticSceneShadowMatrixBufferOffset = rec.shadowMatrixBufferOffset;
+      cInput.scene.shadowStats.semanticSceneShadowMatrixBufferSize = rec.shadowMatrixBufferSize;
+      cInput.scene.shadowStats.semanticSceneShadowMatrixBufferGpuAddress = rec.shadowMatrixBufferGpuAddress;
+      cInput.scene.shadowStats.semanticSceneShadowMapRenderSerial = rec.shadowMapRenderSerial;
+      cInput.scene.shadowStats.semanticSceneShadowMapImagePtr = rec.shadowMapImagePtr;
+      cInput.scene.shadowStats.semanticSceneShadowMapSampleViewPtr = rec.shadowMapSampleViewPtr;
+      cInput.scene.shadowStats.semanticSceneShadowCurrentImagePtr = rec.shadowCurrentImagePtr;
+      cInput.scene.shadowStats.semanticSceneShadowCurrentViewPtr = rec.shadowCurrentViewPtr;
+      cInput.scene.shadowStats.semanticSceneShadowHistoryReadImagePtr = rec.shadowHistoryReadImagePtr;
+      cInput.scene.shadowStats.semanticSceneShadowHistoryReadViewPtr = rec.shadowHistoryReadViewPtr;
+      cInput.scene.shadowStats.semanticSceneShadowHistoryWriteImagePtr = rec.shadowHistoryWriteImagePtr;
+      cInput.scene.shadowStats.semanticSceneShadowHistoryWriteViewPtr = rec.shadowHistoryWriteViewPtr;
+      cInput.scene.shadowStats.semanticSceneShadowVisibilityExecutedThisFrame = rec.shadowVisibilityExecutedThisFrame;
+      cInput.scene.shadowStats.semanticSceneReceiverDrawExecutedThisFrame = rec.receiverDrawExecutedThisFrame;
+      cInput.scene.shadowStats.semanticSceneShadowTaaMode = rec.shadowTaaMode;
+      cInput.scene.shadowStats.semanticSceneShadowHistoryValidBefore = rec.shadowHistoryValidBefore;
+      cInput.scene.shadowStats.semanticSceneShadowHistoryValidAfter = rec.shadowHistoryValidAfter;
+      cInput.scene.shadowStats.semanticSceneShadowHistoryReadIndex = rec.shadowHistoryReadIndex;
+      cInput.scene.shadowStats.semanticSceneShadowHistoryWriteIndex = rec.shadowHistoryWriteIndex;
+      cInput.scene.shadowStats.semanticSceneShadowReceiverSampleSource = rec.shadowReceiverSampleSource;
+      // Phase 7.2: 重新发布 stats 使对账计数器进入 bridge/perf
+      dxvk::war3::render::NoteShadowSceneStats(cInput.scene.shadowStats);
+      dxvk::war3::render::NoteShadowFrameCadenceSample(
+          uint64_t(cInput.frameIndex), cInput.scene.shadowStats);
     }
   });
 
@@ -10562,6 +16642,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
                                                   HWND hDestWindowOverride,
                                                   const RGNDATA *pDirtyRegion,
                                                   DWORD dwFlags) {
+  War3MaybeInsertBeforeUi(true);
   if (m_war3Pipeline) {
     m_war3Pipeline->OnFrameStart();
   }
@@ -10603,7 +16684,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     const bool debugTracking = War3RenderState::GetDebugRenderMode() !=
                                    War3RenderState::DebugRenderMode::Normal ||
                                War3RenderState::ShouldSkipUi();
+    const bool wantsSemanticTracking =
+        War3RenderState::NeedsShadowSemanticTracking();
     needsTracking = wantsPipelineTracking || debugTracking ||
+                    wantsSemanticTracking ||
                     War3RenderState::NeedsObjectTracking() ||
                     dxvk::war3::render::NativeRendererProbe::IsEnabled();
     War3RenderState::SetBatchTagTrackingEnabled(needsTracking);
@@ -10634,6 +16718,22 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
   m_war3SemanticPaletteCache.clear();
   m_war3ShadowPersistentFrameSerial++;
   War3GcShadowPersistentGeometry(false);
+  // Phase 7.55 v4：每 60 帧清理一次 draw-time VB cache 中的 stale entry。
+  // 超过 16 帧没被刷新的 entry 视为对应 part 已下场，释放 host 数据 + GPU buffer。
+  if (m_war3ShadowPersistentFrameSerial >=
+      m_war3DrawTimeVBCacheLastCleanFrame + 60u) {
+    m_war3DrawTimeVBCacheLastCleanFrame = m_war3ShadowPersistentFrameSerial;
+    const uint64_t maxAge = 16u;
+    for (auto it = m_war3DrawTimeVBCache.begin();
+         it != m_war3DrawTimeVBCache.end();) {
+      if (it->second.frameSerial + maxAge <
+          m_war3ShadowPersistentFrameSerial) {
+        it = m_war3DrawTimeVBCache.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
   m_war3ShadowFallbackBudgetCapBytes = War3GetShadowFallbackBudgetCapBytes();
   m_war3ShadowFallbackBudgetUsedBytes = 0;
   m_war3ShadowFallbackBudgetExceeded = false;
@@ -16193,6 +22293,407 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       dxvk::war3::internal::
           IsSemanticSceneDisableLegacyShadowCaptureRuntimeEnabled()) {
     War3TryPublishSemanticDrawTimePose();
+
+    const auto earlyTag = War3RenderState::GetCurrentBatchTag();
+    const bool earlyTerrainTileCaster = War3RenderState::IsTerrainRendering();
+    const bool earlyTerrainDoodadCaster =
+        (cat == War3RenderState::StageCategory::Terrain) && (stage == 10);
+    const bool earlyTerrainS1Caster =
+        (cat == War3RenderState::StageCategory::Terrain) && (stage == 1);
+    const bool earlyTerrainCaster =
+        earlyTerrainTileCaster || earlyTerrainDoodadCaster ||
+        earlyTerrainS1Caster;
+    const bool earlyObjectCasterByTls =
+        (earlyTag == War3BatchTag::WorldObjects ||
+         earlyTag == War3BatchTag::SelectionOverlay ||
+         earlyTag == War3BatchTag::Decorations ||
+         earlyTag == War3BatchTag::RangeIndicatorTarget);
+    const bool earlyObjectCasterByStage =
+        (cat == War3RenderState::StageCategory::WorldObject) &&
+        (stage == 7 || stage == 10 || stage == 11 || stage == 12);
+    const auto* earlyCurrentObj =
+        earlyTerrainCaster ? nullptr : dxvk::war3::render::GetCurrentBatchObject();
+    const bool earlyObjectCasterByCurrentObj =
+        earlyCurrentObj != nullptr &&
+        earlyCurrentObj->kind != dxvk::war3::render::ObjectKind::Unknown;
+    const bool earlyNeedsSemanticContext =
+        !earlyTerrainCaster &&
+        (earlyObjectCasterByTls || earlyObjectCasterByStage ||
+         earlyObjectCasterByCurrentObj || shadowSemantic.HasAnyContext());
+    if (earlyNeedsSemanticContext) {
+      War3ShadowSemanticContext semantic =
+          War3BuildShadowSemanticContext(earlyCurrentObj);
+      const bool earlySemanticSceneUnitLikeCandidate =
+          dxvk::war3::internal::
+              IsSemanticSceneBypassLegacyUnitCaptureRuntimeEnabled() &&
+          dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly &&
+          !earlyTerrainCaster &&
+          (semantic.objectKind == dxvk::war3::render::ObjectKind::Unit ||
+           (earlyCurrentObj != nullptr &&
+            earlyCurrentObj->kind == dxvk::war3::render::ObjectKind::Unit) ||
+           ((cat == War3RenderState::StageCategory::WorldObject) &&
+            stage == 11));
+      if (earlySemanticSceneUnitLikeCandidate) {
+        m_war3Scene.shadowStats.semanticBridgeBypassed++;
+        m_war3Scene.shadowStats.semanticSceneBypassUnitLikeCount++;
+        if (semantic.runtimeModelPtr != nullptr)
+          m_war3Scene.shadowStats.semanticSceneBypassUnitLikeWithRuntimeModel++;
+        if (semantic.modelResourcePtr != nullptr || semantic.modelKey != 0u) {
+          m_war3Scene.shadowStats
+              .semanticSceneBypassUnitLikeWithModelResource++;
+        }
+        if (semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
+            semantic.poseMatrixCount != 0u) {
+          m_war3Scene.shadowStats.semanticSceneBypassUnitLikeWithPose++;
+        }
+        if (semantic.renderablePart != nullptr || semantic.sceneNode != nullptr ||
+            semantic.worldObjectEntry != nullptr) {
+          m_war3Scene.shadowStats
+              .semanticSceneBypassUnitLikeWithRenderable++;
+        }
+        if (War3PublishSemanticSceneBypassCandidate(semantic, earlyCurrentObj))
+          m_war3Scene.shadowStats
+              .semanticSceneBypassPublishedVisibleCandidate++;
+        else
+          m_war3Scene.shadowStats.semanticSceneBypassPublishMiss++;
+      }
+
+      // Phase 7.55 v4：draw-time VB GPU copy capture for semantic skinned casters。
+      // ring buffer 问题：必须立即把 vertex range copy 到我们自己的 device-local
+      // buffer——后续 draw 会覆盖原 ring buffer。
+      // CPU memcpy 不可行（device-local buffer 没 mapPtr），改用 GPU copyBuffer。
+      m_war3Scene.shadowStats.drawTimeVBCacheTotalEntered++;
+      do {
+        void* vbCacheKey = semantic.renderablePart;
+        if (vbCacheKey == nullptr) {
+          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoRenderablePart++;
+          break;
+        }
+        auto *decl = m_state.vertexDecl.ptr();
+        if (decl == nullptr) {
+          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoDecl++;
+          break;
+        }
+        const auto &declInfo = War3GetShadowDeclInfo(decl);
+        if (!declInfo.hasPosition || declInfo.posCompCount < 3 ||
+            declInfo.posStream >= caps::MaxStreams) {
+          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoPosition++;
+          break;
+        }
+        const uint32_t posStream = declInfo.posStream;
+        DxvkBufferSlice posSlice;
+        uint32_t posStride = 0u;
+        if (DynamicSysmemVBOs &&
+            m_war3PerDrawUpload.vbValid[posStream]) {
+          posSlice = m_war3PerDrawUpload.vbSlices[posStream];
+          posStride = m_war3PerDrawUpload.vbStrides[posStream];
+        } else {
+          auto *vb = m_state.vertexBuffers[posStream].vertexBuffer.ptr();
+          if (vb) {
+            auto *vbCommon = vb->GetCommonBuffer();
+            if (vbCommon) {
+              posSlice =
+                  vbCommon->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
+                      m_state.vertexBuffers[posStream].offset);
+              posStride = m_state.vertexBuffers[posStream].stride;
+            }
+          }
+        }
+        if (posStride < sizeof(float) * 3u) {
+          m_war3Scene.shadowStats.drawTimeVBCacheRejectInvalidStride++;
+          break;
+        }
+        if (posSlice.buffer() == nullptr) {
+          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoSlice++;
+          break;
+        }
+        // 计算这个 draw 实际使用的 vertex range
+        // K = vRangeStart：我们从原 VB 索引 K 起拷 vRangeCount 个 vertex。
+        // consume 端用 vertexOffset = BaseVertexIndex - K：
+        //   - wrap path（K=0）：vertexOffset = BaseVertexIndex
+        //   - standard path（K=BaseVI+MinVI）：vertexOffset = -MinVertexIndex
+        int32_t vRangeStart = 0;
+        uint32_t vRangeCount = 0;
+        int32_t consumeVertexOffset = 0;
+        if (indexed) {
+          if (NumVertices > 0u) {
+            vRangeStart = BaseVertexIndex + int32_t(MinVertexIndex);
+            vRangeCount = NumVertices;
+            consumeVertexOffset = -int32_t(MinVertexIndex);
+          } else {
+            // DXVK 内部 wrap 调用没传 MinVertexIndex/NumVertices。
+            // 从原 VB 索引 0 起拷 totalVerts 个；vertexOffset = BaseVertexIndex。
+            // 若 totalVerts 超过 65536，放弃 capture（很罕见，War3 模型一般 <几千）。
+            vRangeStart = 0;
+            const uint64_t totalVerts =
+                (posStride > 0u) ? (posSlice.length() / posStride) : 0u;
+            if (totalVerts == 0u || totalVerts > 65536u) {
+              m_war3Scene.shadowStats.drawTimeVBCacheRejectInvalidRange++;
+              break;
+            }
+            vRangeCount = uint32_t(totalVerts);
+            consumeVertexOffset = BaseVertexIndex;
+          }
+        } else {
+          vRangeStart = int32_t(StartVal);
+          vRangeCount = CountVal;
+          consumeVertexOffset = 0;
+        }
+        if (vRangeStart < 0 || vRangeCount == 0u || vRangeCount > 65536u) {
+          m_war3Scene.shadowStats.drawTimeVBCacheRejectInvalidRange++;
+          break;
+        }
+        const VkDeviceSize posSrcOffset =
+            posSlice.offset() +
+            VkDeviceSize(vRangeStart) * VkDeviceSize(posStride);
+        const VkDeviceSize posBytes =
+            VkDeviceSize(vRangeCount) * VkDeviceSize(posStride);
+        if (posSlice.length() <
+            VkDeviceSize(vRangeStart + vRangeCount) *
+                VkDeviceSize(posStride)) {
+          m_war3Scene.shadowStats.drawTimeVBCacheRejectInsufficientLength++;
+          break;
+        }
+        auto& entry = m_war3DrawTimeVBCache[vbCacheKey];
+        entry.renderablePart = semantic.renderablePart;
+        entry.vertexCount = vRangeCount;
+        entry.frameSerial = m_war3ShadowPersistentFrameSerial;
+        entry.positionStride = posStride;
+        entry.positionOffset = uint32_t(declInfo.posOffset);
+        entry.positionFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        entry.consumeVertexOffset = consumeVertexOffset;
+        // 记录 capture 时的 D3DTS_WORLD 矩阵。静态建筑（未 skin）顶点是
+        // 模型本地空间，必须用这个矩阵变换到世界；动态单位（CPU skin 后）
+        // 矩阵通常是 identity，效果等价。
+        entry.capturedWorldMatrix =
+            m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
+
+        // 记录 alpha test / blend / 纹理状态。
+        // bypass capture 路径不会走 legacy ShadowCapture 的 alpha-test 分支，
+        // 所以这里自己读 D3D state 给 consume 端用。
+        const bool atState =
+            m_state.renderStates[D3DRS_ALPHATESTENABLE] != FALSE;
+        const bool atFunc =
+            m_state.renderStates[D3DRS_ALPHAFUNC] != D3DCMP_ALWAYS;
+        entry.alphaTestEnabled = atState && atFunc;
+        entry.alphaBlendEnabled =
+            m_state.renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
+        const DWORD alphaRefDword =
+            entry.alphaTestEnabled
+                ? m_state.renderStates[D3DRS_ALPHAREF]
+                : DWORD(128);
+        entry.alphaRef = float(alphaRefDword & 0xFFu) / 255.0f;
+        // 取 stage 0 纹理（diffuse）。
+        entry.diffuseTexture = nullptr;
+        if (m_state.textures[0] != nullptr) {
+          auto* commonTex = GetCommonTexture(m_state.textures[0]);
+          if (commonTex) {
+            entry.diffuseTexture = commonTex->GetSampleView(false);
+          }
+        }
+
+        // 分配/复用 device-local position buffer
+        if (entry.positionBuffer == nullptr ||
+            entry.positionCapacity < posBytes) {
+          DxvkBufferCreateInfo posInfoCi = {};
+          posInfoCi.size = War3AlignPersistentBytes(posBytes);
+          posInfoCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+          posInfoCi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+          posInfoCi.access = VK_ACCESS_TRANSFER_WRITE_BIT |
+                             VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+          posInfoCi.debugName = "War3DrawTimeVBPos";
+          auto buf = m_dxvkDevice->createBuffer(
+              posInfoCi, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+          if (buf != nullptr) {
+            entry.positionBuffer = std::move(buf);
+            entry.positionCapacity = posInfoCi.size;
+          }
+        }
+        if (entry.positionBuffer == nullptr) {
+          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoBuffer++;
+          break;
+        }
+        auto srcBuf = posSlice.buffer();
+        EmitCs([cDst = entry.positionBuffer, cSrc = srcBuf,
+                cSrcOff = posSrcOffset,
+                cBytes = posBytes](DxvkContext *ctx) {
+          ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+        });
+        entry.positionInfo = entry.positionBuffer->getSliceInfo(0, posBytes);
+
+        // ===== UV capture：同帧拷一份 UV 给 alpha-test shadow =====
+        // 重置上一帧的 UV 状态
+        entry.uvStride = 0u;
+        entry.uvOffset = 0u;
+        entry.uvFormat = VK_FORMAT_UNDEFINED;
+        entry.uvSharesPositionBuffer = false;
+        // 扫 vertex decl 找 TEXCOORD0
+        const D3DVERTEXELEMENT9* uvElem = nullptr;
+        for (const auto& e : decl->GetElements()) {
+          if (e.Usage == D3DDECLUSAGE_TEXCOORD && e.UsageIndex == 0) {
+            uvElem = &e;
+            break;
+          }
+        }
+        if (uvElem != nullptr && uvElem->Stream < caps::MaxStreams) {
+          const VkFormat uvFmt = DecodeDecltype(D3DDECLTYPE(uvElem->Type));
+          if (uvFmt != VK_FORMAT_UNDEFINED) {
+            const uint32_t uvStream = uvElem->Stream;
+            // case 1：UV 与 position 在同一 stream → 已经 copy 在 positionBuffer
+            // 里，直接复用，offset 就是 uvElem->Offset。
+            if (uvStream == posStream) {
+              entry.uvSharesPositionBuffer = true;
+              entry.uvStride = posStride;
+              entry.uvOffset = uvElem->Offset;
+              entry.uvFormat = uvFmt;
+              entry.uvBuffer = entry.positionBuffer;
+              entry.uvInfo = entry.positionInfo;
+            } else {
+              // case 2：UV 在另一个 stream → 需要单独 GPU copy。
+              DxvkBufferSlice uvSrcSlice;
+              uint32_t uvStride = 0u;
+              if (DynamicSysmemVBOs &&
+                  m_war3PerDrawUpload.vbValid[uvStream]) {
+                uvSrcSlice = m_war3PerDrawUpload.vbSlices[uvStream];
+                uvStride = m_war3PerDrawUpload.vbStrides[uvStream];
+              } else {
+                auto* uvVb =
+                    m_state.vertexBuffers[uvStream].vertexBuffer.ptr();
+                if (uvVb) {
+                  auto* uvCommon = uvVb->GetCommonBuffer();
+                  if (uvCommon) {
+                    uvSrcSlice =
+                        uvCommon
+                            ->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
+                                m_state.vertexBuffers[uvStream].offset);
+                    uvStride = m_state.vertexBuffers[uvStream].stride;
+                  }
+                }
+              }
+              if (uvSrcSlice.buffer() != nullptr && uvStride > 0u) {
+                const VkDeviceSize uvSrcOffset =
+                    uvSrcSlice.offset() +
+                    VkDeviceSize(vRangeStart) * VkDeviceSize(uvStride);
+                const VkDeviceSize uvBytes =
+                    VkDeviceSize(vRangeCount) * VkDeviceSize(uvStride);
+                if (uvSrcSlice.length() >=
+                    VkDeviceSize(vRangeStart + vRangeCount) *
+                        VkDeviceSize(uvStride)) {
+                  if (entry.uvBuffer == nullptr ||
+                      entry.uvCapacity < uvBytes) {
+                    DxvkBufferCreateInfo uvCi = {};
+                    uvCi.size = War3AlignPersistentBytes(uvBytes);
+                    uvCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                    uvCi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                  VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+                    uvCi.access = VK_ACCESS_TRANSFER_WRITE_BIT |
+                                  VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+                    uvCi.debugName = "War3DrawTimeVBUv";
+                    auto uvBuf = m_dxvkDevice->createBuffer(
+                        uvCi, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    if (uvBuf != nullptr) {
+                      entry.uvBuffer = std::move(uvBuf);
+                      entry.uvCapacity = uvCi.size;
+                    }
+                  }
+                  if (entry.uvBuffer != nullptr) {
+                    auto uvSrcBuf = uvSrcSlice.buffer();
+                    EmitCs([cDst = entry.uvBuffer, cSrc = uvSrcBuf,
+                            cSrcOff = uvSrcOffset,
+                            cBytes = uvBytes](DxvkContext* ctx) {
+                      ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+                    });
+                    entry.uvInfo =
+                        entry.uvBuffer->getSliceInfo(0, uvBytes);
+                    entry.uvStride = uvStride;
+                    entry.uvOffset = uvElem->Offset;
+                    entry.uvFormat = uvFmt;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // 同样 GPU copy index range 到我们自有 buffer。
+        // 不 rebase——consume 端用 vertexOffset = -vRangeStart 抵消。
+        bool idxOk = false;
+        if (indexed) {
+          auto* ib = m_state.indices.ptr();
+          DxvkBufferSlice ibSlice;
+          VkIndexType ibType = VK_INDEX_TYPE_UINT16;
+          if (DynamicSysmemIBO && m_war3PerDrawUpload.ibValid) {
+            ibSlice = m_war3PerDrawUpload.ibSlice;
+            ibType = m_war3PerDrawUpload.ibType;
+          } else if (ib) {
+            auto* ibCommon = ib->GetCommonBuffer();
+            if (ibCommon) {
+              ibSlice = ibCommon->GetBufferSlice<
+                  D3D9_COMMON_BUFFER_TYPE_REAL>();
+              D3DINDEXBUFFER_DESC ibDesc = {};
+              ib->GetDesc(&ibDesc);
+              ibType = (ibDesc.Format == D3DFMT_INDEX32)
+                           ? VK_INDEX_TYPE_UINT32
+                           : VK_INDEX_TYPE_UINT16;
+            }
+          }
+          if (ibSlice.buffer() != nullptr) {
+            const VkDeviceSize idxStride =
+                (ibType == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
+            const VkDeviceSize idxSrcOffset =
+                ibSlice.offset() + VkDeviceSize(StartVal) * idxStride;
+            const VkDeviceSize idxBytes =
+                VkDeviceSize(CountVal) * idxStride;
+            if (ibSlice.length() >=
+                VkDeviceSize(StartVal + CountVal) * idxStride) {
+              if (entry.indexBuffer == nullptr ||
+                  entry.indexCapacity < idxBytes) {
+                DxvkBufferCreateInfo idxInfoCi = {};
+                idxInfoCi.size = War3AlignPersistentBytes(idxBytes);
+                idxInfoCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+                idxInfoCi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                   VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+                idxInfoCi.access = VK_ACCESS_TRANSFER_WRITE_BIT |
+                                   VK_ACCESS_INDEX_READ_BIT;
+                idxInfoCi.debugName = "War3DrawTimeVBIdx";
+                auto idxBuf = m_dxvkDevice->createBuffer(
+                    idxInfoCi, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (idxBuf != nullptr) {
+                  entry.indexBuffer = std::move(idxBuf);
+                  entry.indexCapacity = idxInfoCi.size;
+                }
+              }
+              if (entry.indexBuffer != nullptr) {
+                auto idxSrcBuf = ibSlice.buffer();
+                EmitCs([cDst = entry.indexBuffer, cSrc = idxSrcBuf,
+                        cSrcOff = idxSrcOffset,
+                        cBytes = idxBytes](DxvkContext *ctx) {
+                  ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+                });
+                entry.indexInfo =
+                    entry.indexBuffer->getSliceInfo(0, idxBytes);
+                entry.indexed = true;
+                entry.indexCount = CountVal;
+                entry.indexType = ibType;
+                entry.firstIndex = 0u;
+                idxOk = true;
+              }
+            }
+          }
+        }
+        if (!idxOk) {
+          entry.indexed = false;
+          entry.indexCount = 0u;
+        }
+        m_war3Scene.shadowStats.drawTimeVBCacheCaptureCount++;
+      } while (false);
+    }
     return;
   }
 
@@ -16821,6 +23322,171 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
        vertexBlendEnabled || vbIndexed || semantic.runtimeModelPtr != nullptr ||
        semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
        semantic.poseMatrixCount != 0u);
+  // ===== AlphaTest lane: stash diffuse/UV/alphaRef payload =====
+  //
+  // 目的：把 draw-time 可见的 alpha-test 资源按对象身份 stash 到进程级 cache，
+  // 让 semantic `War3TryAppendSemanticShadowPacket` 消费时能取回 UV buffer /
+  // diffuse view / sampler / 真 alphaRef 并真正接通 shadow caster shader。
+  //
+  // 约束：本块仅写 cache，不改渲染行为。cache 命中方（lookup + 灌入 candidate）
+  // 由 AlphaTest lane 下一步 heartbeat 接线；当前 d3d9.dll 不会因为本块的存在
+  // 而改变 cutout caster 输出（payload 还没被消费方读取）。
+  if (captureAlphaTest && diffuseTexView != nullptr) {
+    auto& atCounters =
+        dxvk::war3::shadow::g_war3ShadowAlphaTestPayloadCounters;
+    const uint64_t payloadKey =
+        dxvk_war3_alpha_test_internal::BuildKeyFromSemantic(semantic);
+    if (payloadKey == 0u) {
+      atCounters.stashSkipNoSemanticKeyCount.fetch_add(
+          1u, std::memory_order_relaxed);
+    } else if (uvStream >= caps::MaxStreams || uvStride == 0u ||
+               uvFormat == VK_FORMAT_UNDEFINED) {
+      atCounters.stashSkipNoUvCount.fetch_add(1u, std::memory_order_relaxed);
+    } else {
+      // 取 D3D9 UV VB slice。legacy path 已经保证 uvStream == posStream，
+      // 但在 stash 内再单独取一次，避免依赖后续代码顺序。
+      DxvkBufferSlice stashUvSlice;
+      if (DynamicSysmemVBOs && m_war3PerDrawUpload.vbValid[uvStream]) {
+        stashUvSlice = m_war3PerDrawUpload.vbSlices[uvStream];
+      } else {
+        auto* vb = m_state.vertexBuffers[uvStream].vertexBuffer.ptr();
+        if (vb) {
+          auto* vbCommon = vb->GetCommonBuffer();
+          if (vbCommon) {
+            stashUvSlice =
+                vbCommon->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
+                    m_state.vertexBuffers[uvStream].offset);
+          }
+        }
+      }
+
+      if (stashUvSlice.buffer() == nullptr) {
+        atCounters.stashSkipNoUvCount.fetch_add(1u,
+                                                std::memory_order_relaxed);
+      } else {
+        const DxvkResourceBufferInfo stashUvSrcInfo =
+            stashUvSlice.getSliceInfo();
+        VkDeviceSize stashUvBytes = stashUvSrcInfo.size;
+        // 与 legacy position 路径对齐：按 draw range 裁剪复制范围。
+        int64_t stashVertexEnd = -1;
+        if (indexed && NumVertices > 0) {
+          const int64_t start =
+              static_cast<int64_t>(BaseVertexIndex) +
+              static_cast<int64_t>(MinVertexIndex);
+          const int64_t end = start + static_cast<int64_t>(NumVertices);
+          if (start >= 0 && end > start)
+            stashVertexEnd = end;
+        } else if (!indexed && CountVal > 0) {
+          const int64_t start = static_cast<int64_t>(StartVal);
+          const int64_t end = start + static_cast<int64_t>(CountVal);
+          if (start >= 0 && end > start)
+            stashVertexEnd = end;
+        }
+        if (stashVertexEnd > 0 && uvStride != 0u) {
+          const VkDeviceSize wanted =
+              static_cast<VkDeviceSize>(stashVertexEnd) *
+              static_cast<VkDeviceSize>(uvStride);
+          if (wanted > 0 && wanted < stashUvBytes)
+            stashUvBytes = wanted;
+        }
+
+        if (stashUvBytes == 0u) {
+          atCounters.stashSkipNoUvCount.fetch_add(1u,
+                                                  std::memory_order_relaxed);
+        } else {
+          War3ShadowPersistentUpload uvUpload = {};
+          uvUpload.slice = stashUvSlice;
+          uvUpload.bytes = stashUvBytes;
+          uvUpload.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+          uvUpload.debugName = "War3AlphaTestStashUv";
+          Rc<DxvkBuffer> stashUvStorage;
+          DxvkResourceBufferInfo stashUvInfo = {};
+          if (!War3CreateShadowPersistentBuffer(uvUpload, stashUvStorage,
+                                                stashUvInfo) ||
+              stashUvStorage == nullptr) {
+            atCounters.stashSkipNoUploadCount.fetch_add(
+                1u, std::memory_order_relaxed);
+          } else {
+            dxvk::war3::shadow::War3ShadowAlphaTestPayload payload = {};
+            payload.alphaTestEnabled = true;
+            payload.alphaRef = alphaRefFloat;
+            payload.uvFormat = uvFormat;
+            payload.uvStride = uvStride;
+            payload.uvOffset = uvOffset;
+            // semantic 消费方现阶段只识别 uvBinding=2（与 blend binding 区分）；
+            // 稍后 lookup 接线时再根据实际 binding 决策。
+            payload.uvBinding = (uvStream == posStream) ? 0u : 2u;
+            payload.uvStorage = std::move(stashUvStorage);
+            payload.uvInfo = stashUvInfo;
+            payload.diffuseTexture = diffuseTexView;
+
+            // 解析 fallback sampler + 完整 descriptor（bindless 接线）。
+            if (m_shadowReceiverPass != nullptr) {
+              bool useMip = false;
+              float mipLodBias = 0.0f;
+              if (m_war3Pipeline) {
+                const auto& shadowSettings =
+                    m_war3Pipeline->GetSettings().shadows;
+                useMip = shadowSettings.alphaShadowUseMip;
+                mipLodBias = shadowSettings.alphaShadowMipLodBias;
+              }
+              payload.diffuseSampler =
+                  m_shadowReceiverPass->getFallbackSampler(useMip, mipLodBias);
+              if (payload.diffuseSampler != nullptr) {
+                payload.diffuseSamplerIndex =
+                    payload.diffuseSampler->getDescriptor().samplerIndex;
+              }
+              if (payload.diffuseTexture != nullptr) {
+                payload.textureDescriptor =
+                    *payload.diffuseTexture->getDescriptor();
+              }
+            }
+
+            if (payload.diffuseTexture == nullptr ||
+                payload.uvStorage == nullptr) {
+              atCounters.stashSkipNoDiffuseCount.fetch_add(
+                  1u, std::memory_order_relaxed);
+            } else {
+              payload.frameSerial = m_war3ShadowPersistentFrameSerial;
+              // Snapshot payload identity before move for the throttled probe log.
+              const uint32_t logUvFormat = uint32_t(payload.uvFormat);
+              const uint32_t logDiffuseSamplerIndex =
+                  payload.diffuseSamplerIndex;
+              const float logAlphaRef = payload.alphaRef;
+              dxvk_war3_alpha_test_internal::InsertPayloadLocked(
+                  payloadKey, std::move(payload),
+                  m_war3ShadowPersistentFrameSerial);
+              atCounters.stashCapturedCount.fetch_add(
+                  1u, std::memory_order_relaxed);
+              // AlphaTest lane (heartbeat 7): throttled probe so DbWinListener
+              // can verify the stash fires at runtime without depending on the
+              // bridge-summary JSON path. First 10 events verbatim, then every
+              // 500th thereafter — enough to prove the pipeline is alive
+              // without flooding OutputDebugString.
+              {
+                static std::atomic<uint32_t> s_probeLogCount{0u};
+                const uint32_t n = s_probeLogCount.fetch_add(
+                    1u, std::memory_order_relaxed);
+                if (n < 10u || (n % 500u) == 0u) {
+                  WAR3_RENDER_LOG(
+                      "DXVK War3AlphaTestStash: n=%u key=0x%08X uvFormat=%u "
+                      "samplerIndex=%u alphaRef=%.3f stage=%d cat=%d\n",
+                      n + 1u,
+                      static_cast<uint32_t>(payloadKey & 0xFFFFFFFFu),
+                      logUvFormat,
+                      logDiffuseSamplerIndex,
+                      static_cast<double>(logAlphaRef),
+                      stage,
+                      static_cast<int>(cat));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   if (semanticSceneOwnsUnitCapture) {
     noteSemanticSceneBypassCandidate();
     return;

@@ -368,6 +368,8 @@ void War3ShadowReceiverPass::ensureShadowResources(uint32_t cascadeCount,
   m_shadowMapLayerViews = {};
   m_hasCompleteShadowMap = false;
   m_lastShadowMapCasterCount = 0;
+  m_transientEmptyReplayHoldFramesRemaining = 0;
+  m_recentSemanticDynamicHoldFramesRemaining = 0;
   m_shadowAdaptiveFrameIndex = 0;
 
   DxvkImageCreateInfo info = {};

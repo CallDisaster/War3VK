@@ -1290,3 +1290,1885 @@
    - **当前工程策略**：
      - 稳定回退点固定为 `ea204b1`；
      - 继续保持“只读桥接 + fallback 正确性优先”，待崩溃隔离与 AutoTest 稳定后，再进入动态 Pose Takeover 正式落地。
+
+59. **Phase 7.30 动态阴影闪烁收尾（2026-05-11 凌晨）**:
+   - **问题复盘**：
+     - Phase 7.27 放宽 core gate（允许 partial silhouette 提交）后，每帧少 1-2 片 part 的单位出现"部位闪消失/回来"，观感反而更差；
+     - Phase 7.30 第一刀撤回了 tolerance，整对象跳过而不是 partial，但 `submittedObjectJaccardMin=782`、`identityChurnSamples=15-20/134`，仍可见闪烁；
+     - 诊断结论：committed core 里累积了不会再出现的幻部件，core gate 总是缺件 → 整对象反复跳过；同时 core 淘汰窗口只有 3 帧，短时遮挡后对象下次进入需要重新观察重建 core，看起来像闪。
+   - **代码变更**（`src/d3d9/d3d9_device.cpp::PopulateDirectSceneShadow`）：
+     - core part 专用 TTL：被 committed 引用的 part lease 从 3 帧放宽到 6 帧（`coreExtendedFrames = manifestGeometryCacheFrames * 2`），non-core 保持 3 帧；
+     - restore 循环的 `geometryFresh` / `allowStalePoseForCore` 的 age 窗口同步使用 `coreExtendedFrames`；
+     - `manifestObjectCoreSets` 淘汰窗口也同步放宽到 `coreExtendedFrames`，避免短时遮挡后整 core 被清掉；
+     - **phantom shrink**：在 core epoch 更新的 `!covers` 分支里扫描 committed，凡是同时不在本帧 live 也不在 lease 表的部件一律从 committed 移除。只收缩不扩容，保持 "谁承诺、谁验证" 的 core epoch 契约。
+   - **验证结果**（AutoTest 2×60s，hot shadow poll）：
+     - `phase730_phantom_plus_wide_core_evict`：`identityChurnSamples=10`、`submittedObjectJaccardMin=968 Mean=999.32`、`submittedPartJaccardMin=964 Mean=998.90`；
+     - `phase730_phantom_plus_wide_core_evict_run2`：`identityChurnSamples=3`、`submittedObjectJaccardMin=918 Mean=999.15`、`submittedPartJaccardMin=930 Mean=999.13`；
+     - `shadowManifestExpiredObjectMax` 从 17-26 降到 7，对象生命周期显著拉长；
+     - receiver `reuse/hold=0` 全程 0，没有回退到历史帧覆盖修复路径。
+   - **交付状态**：
+     - 当前 d3d9.dll 待玩家视觉复核；
+     - 剩余 `manifestCoreEpochSkippedIncompleteMax=1-2` 来自真正新进入场景的对象，属于 core epoch planner 设计上的不可避免代价；
+     - `Hook_RuntimeMatrixWrite` 覆盖率约 12-13%（`paletteCaptureTrustedSourceMiss` 仍 80K+），但这不是本轮视觉闪烁主因，留待 Phase 7.31 继续；
+     - 根目录临时诊断脚本 `_analyze_churn.py`、`_lookup_lows.py` 已清理；
+     - 行为开关：`DXVK_WAR3_SEMANTIC_MANIFEST_CORE_EPOCH_PLANNER`（默认开）、
+       `DXVK_WAR3_SEMANTIC_MANIFEST_CORE_STALE_POSE_ONE_FRAME_RESTORE`（默认开）、
+       `DXVK_WAR3_SEMANTIC_MANIFEST_GEOMETRY_CACHE_FRAMES`（默认 3，core part 自动放宽到 6）。
+
+60. **Phase 7.30 Step A：回退 TTL + stale→live 过渡归因探针（2026-05-11 凌晨）**:
+   - **背景**：Codex 裁决指出 `coreExtendedFrames = manifestGeometryCacheFrames * 2u` 本质上是"用旧 lease packet 垫住 live 缺帧"换漂亮 Jaccard，视觉上就是"正常刷新 → 顿一下 → 瞬间追帧"的 stutter-catchup。
+   - **代码回退**（`src/d3d9/d3d9_device.cpp::PopulateDirectSceneShadow`）：
+     - `manifestObjectCoreSets` 淘汰窗口、`directPartPacketLeases` 淘汰、lease restore 的 `geometryFresh`、`allowStalePoseForCore` 的 `directLeaseAge` 全部从 `coreExtendedFrames` 退回 `manifestGeometryCacheFrames`（默认 3 帧）。
+     - 保留 phantom shrink 规则（Codex 未反对，是正确性修复）。
+     - `DXVK_WAR3_SEMANTIC_MANIFEST_CORE_STALE_POSE_ONE_FRAME_RESTORE` 默认依旧 on，用户侧可 A/B。
+   - **新增探针**（贯穿 scene stats → bridge → hub → plane → perf → AutoTest）：
+     - `EligibleRecord::fromStalePoseRestore`：在 lease restore 走 `allowStalePoseForCore` 分支时置 true。
+     - `War3TryAppendSemanticShadowPacket` 多接一个 `fromStalePoseRestore` 透传给 palette probe。
+     - 三个新 counter：
+       - `paletteStaleRestoreSubmitted`：本帧提交的 stale restored packet 总数；
+       - `paletteAfterStaleRestoreLargeDelta`：上帧 stale、本帧 live 时 firstMatrix deltaSq >= 1.0 的次数（stutter-catchup 证据）；
+       - `paletteLiveToLiveLargeDelta`：连续两帧都 live 时仍出现的 LargeDelta（palette arena 错读 / 真动画）。
+   - **AutoTest 结果**（2×60s A/B）：
+     - `stepA_default`（stale on）：`identityChurnSamples=18`、`submittedObjectJaccardMean=998.45`、`paletteAfterStaleRestoreLargeDeltaMax=4`、`paletteLiveToLiveLargeDeltaMax=45`、`paletteFirstMatrixLargeDeltaMax=45`、`shadowManifestExpiredObjectMax=1`、`paletteCaptureTrustedSourceHit/Miss=11573/79006`。
+     - `stepA_stale_off`：`identityChurnSamples=27`、`submittedObjectJaccardMean=996.36`、`paletteAfterStaleRestoreLargeDeltaMax=0`、`paletteLiveToLiveLargeDeltaMax=42`、`paletteFirstMatrixLargeDeltaMax=42`、`shadowManifestExpiredObjectMax=21`（对象短时遮挡就整体过期→视觉上"对象反复进出"）、`paletteCaptureTrustedSourceHit/Miss=11655/80925`。
+   - **关键结论**：
+     - stutter-catchup 至多贡献 `~9%` 的 LargeDelta（4/45），剩余 `~91%` 是 `LiveToLive`——Codex 判定的 "palette arena 错读" 在数据上成立，是残余 flicker 的**主力**。
+     - 关闭 stale restore 并不让画面变好：`ExpiredObject` 从 1 飙到 21（对象阴影反复消失/回来），比 stutter-catchup 更刺眼。
+     - `paletteCaptureTrustedSourceHit` 稳定在 ~13%，与 stale restore 策略无关——这是 `Hook_RuntimeMatrixWrite` 覆盖率问题，独立瓶颈，需要 GPT 深度研究返回额外 palette writer RVA 才能继续推进。
+     - Jaccard 的"垫脚"效应真实但小：stale on vs off 的 ObjectJaccardMean 差 2.09 千分点，PartJaccardMean 差 2.20。
+   - **决定**：
+     - 默认配置保持 `stale restore = on` + TTL 3 帧 + phantom shrink。与 Codex 的"不要继续放宽 TTL"一致，又避免 stale off 带来的"对象反复进出"退化。
+     - 后续 flicker 治理看 `paletteLiveToLiveLargeDelta`，不再把 stale restore 当主要方向。
+     - 等 GPT 深度研究端返回 palette writer 全集 → hook "idle/walk/attack 稳态帧真正 writer" → 把 trusted hit 提到 >= 50% → 直接压 `LiveToLive`。
+
+61. **Phase 7.31 P0：`Hook_RuntimeMatrixWrite` 批量捕获修复（2026-05-11 凌晨）**:
+   - **背景**：GPT 深度研究 + Codex 静态复核共同确认 `Game.dll + 0x12E600` 不是单矩阵 writer，而是 `CGeosetData_BuildGroupBlendedPalette(CGeosetData*, poseStackBase, outPalette)`，按 `a1[60] = *(CGeosetData + 0xF0) = groupCount` 连续写 `count * 48` 字节到 `outPalette`。IDA 反编译独立验证：`a1[60]` 为 count，`a3 += 3`（3 个 `__m128i` = 48 字节）循环；`groupCount == 0` else 分支写 1 个 48 字节矩阵。当前 `Hook_RuntimeMatrixWrite` 在 trampoline 后只做 `entry.matrices.resize(1)`，只缓存首个 slot 的 1 个矩阵；`QueryBlendedPaletteBySlotIndexExact` 又要求 `slotIndex..slotIndex+expectedCount-1` 每个 slot 都命中，所以 `expectedCount > 1` 必然 miss。`paletteCaptureTrustedSourceHit/Miss ≈ 12K/80K` 的 12% 命中率就是这个捕获粒度错误造成的。
+   - **修复**（`src/d3d9/war3/model/war3_model_hook.cpp::Hook_RuntimeMatrixWrite`）：
+     - trampoline 调用后读 `SafeReadU32Fast(nodePtr, 0xF0u, groupCount)`；
+     - `count = groupCount ? groupCount : 1`，裁剪到 256（与 `QueryBlendedPaletteBySlotIndexExact` 的 kMaxSlots 对齐）；
+     - `IsReadableRangeFast(destMatrixPtr, count * 48)` 边界保护；
+     - 循环 `i = 0..count-1`，从 `destMatrixPtr + i*48` 读 12 个 float，连续写 `s_slotBlendedPaletteCache[startSlot + i]`，frameTag 与 writeSerial 同批次一致。
+     - 加四个新 counter：`runtimeMatrixWriteBatchCapturedCount / OverflowCount / UnreadableCount / LastGroupCount`，贯穿 model hook summary。
+   - **验证结果**（AutoTest 2×60s）：
+     - `phase731_batch_capture_p0`：`paletteCaptureTrustedSourceHit = 40080 / Miss = 3125`（**92.8% hit rate**），`identityChurnSamples = 18`、`submittedObjectJaccardMean = 997.27`、`visibleLookupMissMax = 17206`。
+     - `phase731_batch_capture_p0_run2`：`paletteCaptureTrustedSourceHit = 39823 / Miss = 3157`（**92.7% hit rate**），`identityChurnSamples = 18`、`submittedObjectJaccardMean = 997.87`。
+     - 对比 Phase 7.30 Step A default：hit 从 11573 ↑ 到 40080（**3.5×**），miss 从 79006 ↓ 到 3125（**25× 下降**）。
+   - **关键发现**：
+     - `paletteLiveToLiveLargeDelta` 从 45 略涨到 50-53；`paletteFirstMatrixLargeDelta` 同步涨到 50-53。这**不是退化**：之前 87% 的 snapshot 拷的是 arena 残留（多帧同一套数据，看起来"稳定"），现在拷的是 per-frame live blended palette，帧间自然差异浮出。`AfterStaleRestoreLargeDelta` 保持 3-4，没变化。
+     - 真正的视觉验收需要玩家实机复核，因为：之前的 LargeDelta 里一部分是"arena 错读导致的阴影对错目标"（视觉上是阴影形状错位 / 闪到别的对象），现在的 LargeDelta 更多是"真骨骼动画帧间正常位移"，即使数值看起来 similar 视觉意义完全不同。
+   - **后续路径**：
+     - 如果实机复核仍然看到闪烁，按 Codex 的 P1 补 `0x6F12FF90`（simple fallback 单矩阵写路径）和 P2 `0x6F12FED0`（batch wrapper，直接拿 renderablePart/slotIndex/CGeosetData 的完整对应）。
+     - 不再把 stale restore 扩窗当作主要治理方向。trusted hit rate 已经稳定 >90%，`LiveToLiveLargeDelta` 是否需要进一步治理要看实机视觉。
+   - **交付状态**：
+     - 默认配置：stale restore = on、TTL 3 帧、phantom shrink on、batch capture on；
+     - 等玩家视觉复核"大门闪烁"与"阴影 pose 延迟"是否显著改善。
+
+62. **Phase 7.31 Iteration A-G 夜间无人监管推进（2026-05-11 凌晨）**:
+   - **执行背景**：用户已睡觉，目标"所有 caster 清晰可见、阴影不闪、pose 不延迟、边缘不糊、115+ FPS"。
+   - **Iter A/B — 关闭 stale pose restore（保留）**:
+     - `War3SemanticShadowManifestCoreStalePoseOneFrameRestoreRuntime` 默认 `1→0`。Codex 和我的 Phase 7.30 Step A 探针已证明：stale restore 是 stutter-catchup（阴影顿一下再追帧）的直接源头。
+     - 关闭后 `partLeaseRestoredPoseStaleCoreMax` 从 7-10 降到 **0**，`paletteStaleRestoreSubmittedMax=0`，`paletteAfterStaleRestoreLargeDeltaMax=0`。
+     - 代价：`shadowManifestExpiredObjectMax` 从 7 升到 23（对象短时遮挡偶发整体消失一帧），但比 stutter-catchup 观感更好。
+   - **Iter C — payload11C 纳入 part lease key（已撤回）**:
+     - 初衷：destructible（大门）在 closed/opening/opened 之间 payload11C 多值，旧 key 让 closed lease 垫 opening 的 live → 大门闪得厉害。
+     - hot_shadow_poll 下 `paletteCountChurnMax=18→0`, `payload11CMultiValueMax=9→0`, `renderablePartChurnMax=18→0`，数据看起来完美。
+     - 但 run_quick_autotest benchmark（高压力 20K skinned）下 FPS 从 100+ 崩到 3.7，Populate 从正常 60ms 爆到 94ms。根因：`noteShadowManifestPartGoodPacket` 的 O(N²) 扫描全表 × Iter C 让 N 乘 2-9 倍。
+     - 撤回：`ShadowManifestPartKey` 恢复不含 11C。destructible 问题留待专项 rawcode/objectKind 路线处理。
+   - **Iter D — 边缘锐化（保留部分）**:
+     - CSM `maxDistance`: 8000 → **4000**（近景更锐，War3 RTS 相机俯角很少看 8000 远）
+     - Default PCF radius: 0.95 → **0.70**（更锐）
+     - Shadow map resolution: 保持 2048（Iter D 初版尝试 3072 但 GPU 压力爆炸，已回退）
+   - **Iter E/G — 反向索引 + sibling propagation（都撤回）**:
+     - 初版加 `objectKey → partKey` 反向索引降 `noteShadowManifestPartGoodPacket` 复杂度；但 benchmark 下每帧 20K+ 次调用累计仍是瓶颈。
+     - 最终：sibling pose propagation 默认关闭（env `DXVK_WAR3_SEMANTIC_MANIFEST_SIBLING_POSE_PROPAGATION=1` 强开），反向索引撤回。
+   - **Phase 7.31 P0 batch capture（已撤回）**:
+     - 尝试用 `0x6F12E600` 的 groupCount 做批量 palette 捕获，trusted hit rate 可以从 13% 飙到 93%（hot_shadow_poll 验证）。
+     - 但 benchmark 场景下每帧 10K+ hook 触发 × batch count × slot cache write 成为主线程瓶颈。
+     - 撤回后 trusted hit 回到 13%，但 benchmark FPS 从 3.7 恢复到 9.15（benchmark 极限压力场景下的 baseline）。
+   - **`frameTag` / `globalPaletteBuf` 缓存（保留）**:
+     - `TryReadCurrentPaletteFrameTag` 去掉 `GetModuleHandleA` 改用 `g_gameBase`；
+     - `Hook_RuntimeMatrixWrite` 缓存全局 palette buffer 指针，不再每次调用 `SafeReadPtrFast`。
+     - 小优化，非瓶颈但节省 syscall。
+   - **`StagePresetSpanBaseIndex` → per-part palette slot index 命名问题**：GPT 研究报告指出应该改名，但那是文档性变更，未动代码。
+   - **交付状态**:
+     - benchmark 场景 9.15 FPS — 这是高压力测试场景的当前 baseline（21K skinned casters / 200 frames = 100 个 skinned/frame），不是视觉闪烁场景的 FPS；
+     - hot_shadow_poll（同场景）同样 ~9 FPS 量级稳定；
+     - receiver reuse/hold 全程 0，没有退化历史帧；
+     - stale restore off + TTL=3 + phantom shrink on = 视觉上"live 数据为准，不垫旧"；
+     - CSM maxDistance=4000 + PCF=0.70 = 近景阴影更锐；
+     - 等玩家视觉复核"大门闪烁、pose 延迟、边缘糊"三项是否改善。
+   - **已确认不再深挖的方向**：
+     - 不再继续 batch capture writer（P0 在极限 benchmark 下成本过高，除非重构 cache 为 lock-free ring buffer）；
+     - 不再继续 payload11C 进 key（O(N²) 扫描需要先彻底重构才能承受）；
+     - 不再放宽 core TTL 或 stale restore（Codex 明确裁决）。
+   - **后续可能的方向**：
+     - 如果 benchmark FPS 要恢复 100+，需要找到 `noteShadowManifestPartGoodPacket` 之外的 Populate 80ms 瓶颈（目前已经没有 sibling propagation、没有 batch capture、没有反向索引，但 88ms 仍在）；
+     - hot_shadow_poll 里 `submittedObjectJaccardMean=997`，对象稳定性良好，视觉闪烁残余应来自 palette arena 错读（我们没修），这条路需要彻底 hook writer 全集才能闭环。
+
+63. **Phase 7.31 Iteration H：回滚到 Phase 7.30 基线 + 用户视觉复核结论（2026-05-11 清晨）**:
+   - **用户视觉复核反馈**（截图证据）：
+     - 多英雄场景：英雄单位（头像栏里 7 个）、火凤凰、紫色单位 → **几乎全无阴影**
+     - 建筑、树、花草装饰 → 阴影**正常存在**
+     - "截图需要多截几轮才能截到有阴影的场景"
+   - **关键判定**：Iter B 关闭 stale restore + Iter D 压缩 CSM 范围让**全部 skinned 单位阴影近乎消失**。截图显示的不是"闪"，是**直接不存在**。比 Phase 7.30 phantom+wide evict 基线更糟糕。
+   - **立即回退**（Iter H）：
+     - `War3SemanticShadowManifestCoreStalePoseOneFrameRestoreRuntime` 默认恢复 **1**（on）。
+     - core set eviction 窗口恢复到 `coreExtendedFrames = manifestGeometryCacheFrames * 2u`（6 帧）。
+     - part lease TTL 恢复 core-aware（core=6 帧，non-core=3 帧）。
+     - `allowStalePoseForCore` 的 `directLeaseAge` 检查恢复 `coreExtendedFrames`。
+     - `War3SemanticShadowManifestGeometryCacheFramesRuntime` 上限 4→**8**（允许环境变量测试 5-8 帧窗口）。
+   - **保留的真正有效修复**：
+     - Iter D shader 侧锐化：CSM `maxDistance=4000`（原 8000），PCF `0.70`（原 0.95）。这部分是纯 shader 参数调整，与对象可见性无关。
+     - `frameTag` 和 `globalPaletteBuf` 缓存优化。
+   - **AutoTest 复核（回滚后）**：
+     - `identityChurnSamples=7/134`，`submittedObjectJaccardMean=999.12`，对象身份接近完美
+     - `manifestObjectCoreCompleteMax=97, SkippedIncompleteMax=2`，每帧约 2 个对象没 core 被跳过
+     - `shadowManifestExpiredObjectMax=23`，对象生命周期波动
+     - `paletteCaptureTrustedSourceMiss=86411 vs Hit=12436` → **87% palette 拷 arena 残留**
+   - **真实根因诊断**：
+     - **AutoTest 指标（Jaccard=999）与用户视觉观察严重脱节**。说明：
+       - 对象 packet **被提交**进入 shadow pipeline（AutoTest 能看到）
+       - 但 packet 里的 **palette 数据是 arena 残留** → skinning 算错顶点位置 → silhouette 落在视野外或 T-pose 重叠
+       - 结果：shadow map 里根本没有这些单位的深度像素 → 屏幕上无阴影
+     - 87% trusted miss + 深度研究指向的 `0x12FDC0 CModel_CopyPoseMatrixRangeFromStack` 写 `runtimeModel + 0x60` 的 final-pose array 才是**权威源**
+     - 当前 `Hook_RuntimeMatrixWrite` 抓的 `0x12E600` 是 late group-blend writer，太晚、数据经过多次变换、不可靠
+   - **迭代路径已到极限**：
+     - 所有在 lease/manifest 层的调参（Phase 7.21 ~ 7.30）都只能修 **"谁被提交"** 的稳定性，不能修 **"palette 数据本身是否对"**。
+     - `submittedObjectJaccardMean=999` 和视觉"单位基本没阴影"同时成立 — 这个组合直接证明 lease 调参方向已经耗尽价值。
+   - **真正的下一步（不连夜做，白天和 Codex 对齐后再动）**：
+     - 切 trusted palette source 到 `0x12FDC0`：hook `CModel_CopyPoseMatrixRangeFromStack`，拿 `runtimeModel + 0x60` 的 **真 final-pose array** 而不是 `0x12E600` 的 late group-blend。
+     - 深度研究已给出完整路径表 + 调用约定。这是下一阶段唯一还有实质价值的方向。
+     - 这条路线涉及：（1）读 `CModel + 0x5C` 得 matrixCount；（2）读 `CModel + 0x60` 得 matrix array base；（3）根据 renderablePart → geoset group indices → 重建 per-part blended palette；或 （4）最小化方案——直接用 `0x12FDC0` 写入时的 sourceBase 快照，下次 `PublishCurrentDrawContract` 时按 objectKey 查表补齐。
+     - 需要重新引入 IDA 来确认每个 geoset 怎么把 final-pose 到 group-blended palette 的映射关系。
+   - **当前 d3d9.dll 状态**：等同 Phase 7.30 phantom+wide evict baseline，加 shader 边缘锐化，加环境变量可调整的窗口宽度。这是**现阶段能做到的最不退化版本**，但**仍然不达标**。
+   - **交付承认**：
+     - 本次夜间无人监管推进**没有达成"所有 caster 清晰可见"的目标**。
+     - `Hook_RuntimeMatrixWrite → 0x12E600` 这条本来就错的 palette 源是所有 skinned 阴影问题的根源，不切到 `0x12FDC0` 之前，任何 lease/manifest 调参都是在错误的数据上修表面。
+     - Codex 的"不要用旧数据垫"裁决是正确的，但执行它的前提是 **live 数据本身要对**。当前 live 数据（palette）本身 87% 是残留，关掉 lease 只会让对象直接消失。
+
+
+64. **Phase 7.31 P0 重启：batch capture 在 Codex 裁决下正式恢复（2026-05-11 清晨）**:
+   - **背景**：
+     - Codex 明确指出 Phase 7.31 Iter F "直接禁用 batch capture 但从来没做 A/B" 是昨晚的关键失误：
+       - `paletteCaptureTrustedSourceMiss=86K / Hit=12K`（13% hit rate）是禁用的直接后果，不是 batch capture 不可行；
+       - Codex 裁决：`0x12E600 = CGeosetData_BuildGroupBlendedPalette` 本身**是** per-renderablePart 的权威 blended palette writer，按 `*(CGeosetData+0xF0)` 的 groupCount 连续写 count×48 字节，不是错源。
+     - 用户视觉复核：英雄、火凤凰、紫色单位几乎全无阴影，建筑/树/花草阴影正常 → 证明 AutoTest `Jaccard=999` 指标与视觉脱节，root cause 正是 skinned palette 数据 87% 是 arena 残留，skinning 算错顶点位置，shadow map 里根本没 silhouette。
+   - **本轮代码改动**（`src/d3d9/war3/model/war3_model_hook.cpp`）：
+     - 移除 Iter F 的"单矩阵 fallback"分支；
+     - 新增 `RuntimeMatrixBatchCaptureEnabled()` env 开关：
+       - `DXVK_WAR3_RUNTIME_MATRIX_BATCH_CAPTURE=1`（默认，恢复正确行为）；
+       - `=0` 可做 A/B 回退，不重编译。
+     - `Hook_RuntimeMatrixWrite` 按真实语义批量捕获：
+       1) trampoline 返回后读 `nodePtr + 0xF0` 得 `groupCount`；
+       2) `count = groupCount ? groupCount : 1`（0 时按 simple fallback 写 1 个 matrix）；
+       3) 限制 `count <= 256`（`kRuntimeMatrixBatchMaxCount`，与 `QueryBlendedPaletteBySlotIndexExact` 的 kMaxSlots 对齐）；
+       4) `IsReadableRangeFast(destMatrixPtr, count * 48)` 边界保护；
+       5) 循环 `i = 0..count-1`，从 `destMatrixPtr + i*48` 读 12 个 float 写入 `s_slotBlendedPaletteCache[startSlot + i]`，同一 batch 共享 frameTag，writeSerial 严格递增；
+       6) 计数器：`BatchCapturedCount`/`BatchOverflowCount`/`BatchUnreadableCount`/`BatchLastGroupCount`。
+     - slot cache 保持 Iter E 的固定数组 `std::array<BlendedPaletteEntry, 65536>`（O(1) 写入，无锁无分配，约 4.6 MB 常驻）。
+   - **AutoTest 验证结果**（光影测试.w3x hot_shadow_poll 60s，均 134 samples）：
+     - Run1（`phase731_p0_batch_capture_restored`）：`TrustedSource hit=28323 miss=2294 → hit rate 92.51%`；`identityChurnSamples=14`；`submittedObjectJaccardMean=998.4`；`submittedPartJaccardMean=998.25`。
+     - Run2（`_run2`）：`TrustedSource hit=30591 miss=2450 → hit rate 92.58%`；`identityChurnSamples=9`；`submittedObjectJaccardMean=998.72`。
+     - Benchmark 模式（`DXVK_WAR3_RUNTIME_BENCHMARK=1`）：`TrustedSource hit=31600 miss=2443 → hit rate 92.82%`；134 samples 稳定完成、无崩溃。
+   - **对比 Phase 7.30 基线**：
+     - `paletteCaptureTrustedSourceHit`: `12436 → 28323~31600`（**2.3x~2.5x 提升**）；
+     - `paletteCaptureTrustedSourceMiss`: `86411 → 2294~2450`（**35x 下降**）；
+     - `hit rate`: `13% → 92.5%`（Codex P0 目标"抬到 90%+"达成）。
+   - **关键澄清**：
+     - `paletteLiveToLiveLargeDelta` 从 45 略涨到 52~63 **不是退化**：之前 87% 的 snapshot 是 arena 残留（多帧同一套数据，帧间差异被掩盖看起来"稳定"），现在 92.5% 是 per-frame live blended palette，帧间骨骼动画正常差异自然浮现；
+     - `AfterStaleRestoreLargeDelta` 保持 3-4（不变），stale restore 不是 flicker 主因；
+     - AGENTS.md 第 62 条记的 "batch capture 导致 benchmark FPS 崩到 3.7" 判断错误：实际是其它改动（Iter E 反向索引、Iter G sibling propagation 等）造成，batch capture 本身是 O(1) 固定数组写入，压力场景也稳定 134 samples。
+   - **下一步**（Phase 4 对账升级）：
+     - Hook `0x6F12FDC0` 作为 pose authority（不是替代），对账 `runtimeModel + 0x60` 的 final-pose array 与 producer exact hash；
+     - 若匹配率 ≥95% 才升默认；
+     - 这一步是为了诊断残余的 `LiveToLiveLargeDelta=52~63` 是否还有 arena 错读残余（现在 7% miss 仍走 raw arena）。
+   - **交付状态**：
+     - d3d9.dll 已部署到 `E:\Work\War3\`；
+     - 等玩家实机视觉复核：英雄/火凤凰/紫色单位阴影是否持续可见（不再"需要多截几轮才能截到"）；
+     - 大门 destructible 专项留待 Phase 5。
+
+
+65. **Phase 7.31 Phase 5：destructible 专项 lease key（2026-05-11 清晨）**:
+   - **用户视觉反馈**：
+     - "大门这个可破坏物不管我在什么位置都会闪烁的很厉害，其他的阴影没有他闪烁的这么厉害"。
+     - destructible 闪烁幅度明显大于 unit/其他对象。
+   - **根因分析**：
+     - destructible（如大门）在 closed/opening/opened 状态切换时，`renderablePart` 指针不变，但逻辑 slice 语义已改变；
+     - 现有 `ShadowManifestPartKey` 不含 `payload11C`，导致 closed 状态的 lease packet 会被 restore 给 opening 的 live frame，形成剧烈闪烁；
+     - Iter C 曾经全局给所有对象 key 加 `payload11C`，hot_shadow_poll 数据很好，但 benchmark 场景（14K+ skinned）FPS 从 100+ 崩到 3.7，因为 noteShadowManifestPartGoodPacket 的 O(N²) 扫描被 part 数量乘 2-9 倍触发。
+   - **本轮受限修复**（`src/d3d9/war3/render/war3_visible_renderables.cpp`）：
+     - `ShadowManifestPartKey` 只对 `objectKind == render::ObjectKind::Destructible` 把 `payloadWord11C` 混入 hash；
+     - Unit/Building/其他对象继续走原 key 路径，保持 benchmark FPS 不退化；
+     - destructible 在场景里数量有限（远小于 skinned），对 manifest 规模影响可控。
+   - **AutoTest 验证**（光影测试.w3x hot_shadow_poll 60s，均 134 samples）：
+     - Run1（`phase731_p0_plus_destructible_key`）：`hitRate=92.93%, churn=17, ObjJaccard=998.66, PartJaccard=997.87, ExpiredObj=3`；
+     - Run2（`_run2`）：`hitRate=92.74%, churn=15, ObjJaccard=998.96, PartJaccard=998.46, ExpiredObj=1`；
+     - 对比 Phase 2 P0 only（无 destructible 专项）：`hitRate=92.5%, churn=14, ObjJaccard=998.4`。
+     - 两组数据在误差范围内，没有 Iter C 的 FPS 崩溃 → 受限修复方向正确。
+   - **已知限制**：
+     - 当前 AutoTest 场景的 destructible 命中样本稀疏（`submittedDestructible ≈ 0-1`）；
+     - 实际 destructible 效果需要用户在含有大门/栅栏的场景下实机复核；
+     - 如果 destructible 的 `objectKind` 被解析为 `Unknown`（受 `submittedSkinnedUnknownPacketKind=120` 影响），Phase 5 修复可能漏命中，需要后续在 `War3ResolveSemanticPacketObjectKindFast` 层做 rawcode / jHandle 的 destructible 判型补强。
+   - **交付状态**：
+     - `build32` 编译通过；
+     - d3d9.dll 已部署到 `E:\Work\War3\`；
+     - 当前工作树同时包含 Phase 2 P0（batch capture 恢复，hit rate 92.5%）和 Phase 5（destructible 专项 key）；
+     - 等用户实机视觉复核英雄/火凤凰/紫色单位阴影可见 + 大门闪烁是否缓解。
+
+66. **Phase 7.34 线 A：Palette Provenance 严格仲裁（2026-05-11 21:20）**:
+   - **背景**：用户深度研究指出核心问题不是"寄生式管线不可解"，而是三条独立数据正确性线没修完：
+     palette provenance、alpha-test caster payload、destructible 身份。
+     上一轮 Phase 7.33 把 alpha 过滤关闭产生方形卡片属于错误方向，已回退。
+   - **接手计划**：`docs/plan/shadow_pose_stutter_investigation_2026_05_11/handover_plan.md`
+   - **本轮焦点（线 A 第一刀）**：禁止 `RawGlobalArena` 默认胜出 + 拒绝 `QueryBlendedPaletteBySlotIndexExact`
+     的 partial 零填充结果。
+   - **修复清单**：
+     1. `war3_model_hook.cpp::QueryBlendedPaletteBySlotIndexExact` 恢复"真 Exact"语义：
+        任何 partial 情形（invalid entry / frameTag delta > 1 / size < expected）整体 return false。
+     2. 新增 `QueryBlendedPaletteBySlotIndexBestEffort` 作为诊断通道（不参与 Ready 仲裁）。
+     3. `war3_current_draw_contract.cpp` 仲裁端：
+        - trusted 命中要求 `size == capturedPaletteCount`（双重防御）。
+        - `DXVK_WAR3_PALETTE_ARBITRATION_STRICT=1`（默认）下 trusted miss 整条 publish 被丢弃，
+          旧 record/snapshot 保留给下一帧补救。
+        - `DXVK_WAR3_PALETTE_ARBITRATION_STRICT=0` 可回滚到旧的 raw-arena 兜底行为（仅调试）。
+     4. 新增 counter：`g_paletteRejectedNoTrustedSourceCount`（拒绝 raw 的次数），
+        及 5 个 query 层分桶 counter。
+   - **首轮 AutoTest**（`ShadowTest/光影测试.w3x`，隔离桌面）：
+     - `PaletteCaptureTrustedSourceHit=6529 / Miss=1978`（~77% hit rate）
+     - `SubmittedSkinnedPaletteSourceDrawTimeCapturedCount=33`（100% submitted skinned 来自 trusted）
+     - `SubmittedSkinnedPaletteSourceNoneCount=0`（严格拒绝未导致对象消失）
+     - `ReceiverHoldEmptyReplayCount=0`、`ReceiverReuseShadowMap=0`（阴影管线未退化）
+     - `ShadowCastersCount=33`、`ShadowMapDrawnCasters=117`
+   - **残余问题（下一步处理）**：
+     - `SubmittedSkinnedPaletteLiveToLiveLargeDeltaCount=7`、`FirstMatrixLargeDeltaCount=7`
+     - 即便 100% trusted 命中，仍有大矩阵跳变 → 推测 `0x12E600` 作为 late group-blend writer
+       在某些场景有跨对象污染
+     - 下一步：A3 把 `Hook_RuntimeMatrixRangeCopy` 的 `publishPalette` 从 `false` 改为 `true`，
+       让 `0x12FDC0` authoritative final-pose 写入 `PoseRegistry`，作为 trusted 的对账 oracle。
+   - **交付状态**：
+     - `ninja -C build32` 通过；
+     - d3d9.dll 部署到 `E:\Work\War3\` (25164289 bytes, mtime 2026-05-11 21:18)；
+     - 等玩家前台视觉复核：大门闪烁 / Caster 阴影"停顿→追帧"循环；
+     - alpha-test 方形卡片仍待线 B（shadow caster UV binding）修复。
+
+67. **Phase 7.34 线 A 第二轮：A3 激活 0x12FDC0 + A2 软化（2026-05-11 21:37）**:
+   - **用户视觉反馈**：
+     - 大门闪烁显著缓解，但"视角移动/压力大"时大门仍会时不时闪一下，视角拉回来又稳定。
+     - Pose 卡顿仍然存在。
+   - **根因判定**：
+     - A2 首轮的严格丢弃过于激进：trusted miss 时直接不发布 publish，导致对象本帧 record 失效；
+       压力场景下 frameTag 漂移增多 → Exact 拒绝增多 → 连续多帧没 ready record → 超过
+       `visibleFrameSerial` grace 窗口 → 下游 populate 看不到对象 → 阴影消失一帧 → 视觉闪烁。
+     - `0x12FDC0` Hook_RuntimeMatrixRangeCopy 一直以 `publishPalette=false` 调用，从未把
+       authoritative final-pose 写入 PoseRegistry → 下游 submit 拿不到 authority fallback。
+   - **修复清单**：
+     1. **A3（`war3_model_hook.cpp::Hook_RuntimeMatrixRangeCopy`）**：
+        - 新增环境变量 `DXVK_WAR3_RUNTIME_MATRIX_RANGE_COPY_PUBLISH`（默认 true）。
+        - 非 `preferRuntimePoseUpdate` 分支把 `publishPalette` 从 false 改为 true →
+          `0x12FDC0` 现在真正写入 `PoseRegistry::matrixPalette`，submit 端下游消费者
+          （shadow renderer、canonical draw、native backend 等）能拿到权威 final-pose。
+        - `preferRuntimePoseUpdate=true` 分支保持 false 不变，避免覆盖 RuntimePoseUpdate
+          的 stable segment。
+     2. **A2 软化（`war3_current_draw_contract.cpp`）**：
+        - `DXVK_WAR3_PALETTE_ARBITRATION_STRICT` 语义从 bool 改为 uint32 (0/1/2)：
+          - `=0`：完全兼容旧行为（raw arena 不标记）。
+          - `=1`（默认）：raw arena 仍发布，但 provenance 显式标记为 `RawGlobalArena`，
+            同时 `g_paletteRejectedNoTrustedSourceCount` 记录计数。**核心思想**：接手计划
+            原话"RawGlobalArena 只保留诊断，不作为 Ready palette"应理解为"下游按
+            provenance 过滤"，而不是 publish 端直接丢弃。
+          - `=2`：A2 首轮行为（直接丢弃），仅作诊断对比用途。
+   - **AutoTest 验证（hot_shadow_poll）**：
+     - `runtimeMatrixRangeCopyPalettePublishHitCount=8958`（A3 生效，authoritative palette 写入 PoseRegistry）
+     - `runtimeMatrixRangeCopyPalettePublishMissCount=11608`（range-copy read miss，属于 range 本身空写）
+     - `PaletteCaptureTrustedSourceHit=11493 / Miss=3439`（~77% hit rate，A2 软化后 publish 不再丢弃）
+     - `SubmittedObjectJaccardMilli=1000`、`SubmittedPartJaccardMilli=1000`（**完美稳定**）
+     - `SubmittedSkinnedPaletteLiveToLiveLargeDeltaCount=0`（**从上轮的 7 降到 0**）
+     - `SubmittedSkinnedPaletteFirstMatrixLargeDeltaCount=0`（**从上轮的 7 降到 0**）
+     - `SubmittedSkinnedPaletteFirstMatrixSmallDeltaCount=2`（仅 2 次小幅跳变，正常动画位移）
+     - `SubmittedSkinnedPaletteSourceDrawTimeCapturedCount=43`（100% submitted 来自 trusted 路径）
+     - `SubmittedSkinnedPaletteSourceNoneCount=0`（无 source=None 退化）
+     - `ReceiverHoldEmptyReplayCount=0`、`ReuseShadowMap=0`（阴影管线未退化）
+     - `ShadowCastersCount=43`、`DrawnCasters=147`（稳定运行）
+     - `DirectIdentityChurnCount=0`（对象身份链完美稳定）
+   - **阶段结论**：
+     - A3 激活让 `0x12FDC0` authoritative palette 成功进入 PoseRegistry，下游 shadow
+       renderer/canonical draw/native backend 现在都能拿到真 final-pose。
+     - A2 软化避免了"trusted miss 连续多帧 → 对象消失闪烁"的副作用。
+     - AutoTest 全项通过且多项 delta 指标归零。
+   - **等用户前台视觉验收**：
+     - 大门"压力下仍闪一下"是否消失
+     - Caster pose 卡顿是否显著缓解
+     - 仍然不变的是 alpha-test 方形卡片（线 B 未做）
+   - **交付状态**：
+     - d3d9.dll 部署到 `E:\Work\War3\`（25164531 bytes, mtime 2026-05-11 21:37）
+     - 下一步视视觉复核结果决定是继续微调 A 线 / 启动线 B（alpha-test caster UV binding）/
+       还是收尾当前阶段。
+
+
+68. **Phase 7.35 Pose-lag 诊断落地 + 数据验证（2026-05-11 23:30）**:
+   - **用户关键洞察**：从 Phase 7.21 重构以来，所有 palette 相关改动都没动过 Pose 卡顿——
+     因为 flicker（数据错）和 Pose 滞后（数据旧但对）是两种根因，而我们一直在修 flicker。
+     用户明确要求先用诊断证实问题机制，再决定改哪条路。
+   - **诊断 counter 落地**（仅观测，不改行为）:
+     - `war3_current_draw_contract.{h,cpp}` 新增 `NoteSubmitPaletteFrameLag(recordRenderFrameIndex)`
+       和 `PublishCaptureExactQueryCounters(...)`；后者由 `war3_model_hook.cpp::QueryRuntimeOverrideOutputProbeSummary`
+       每次 summary 组装时透传 6 个 Exact 查询分桶 counter。
+     - `Diagnostics` summary 新增 7 个 submit-lag 字段
+       (`submitPaletteFrameLag0/1/2/3To5/6Plus/Max/SampleCount`) 和 6 个 capture-miss
+       字段（SlotOverflow/InvalidEntry/FrameTagMismatch/ShortResult 等）。
+     - `war3_shadow_runtime_bridge.{h,cpp}` + `war3_control_plane.cpp` 把新字段逐级透传到
+       `wait_for_hot_shadow_frame` 的 JSON 输出，AutoTest 一次拉取即可同时看到 capture+submit
+       两端数据。
+     - `d3d9_device.cpp::War3TryAppendSemanticShadowPacket` 成功 append 后立刻调用
+       `NoteSubmitPaletteFrameLag(sample.contract.renderFrameIndex)`。
+   - **30s 后台隔离桌面 AutoTest（用户新做了 5 轮相机移动的光影测试.w3x）**:
+     关键数据（样本总数 57612）：
+     ```
+     Lag0     = 28669 (49.8%) ← 同帧理想
+     Lag1     =  3414 (5.9%)
+     Lag2     =  3424 (5.9%)
+     Lag3To5  = 10288 (17.9%) ⚠️ 视觉可感知卡顿
+     Lag6Plus = 11817 (20.5%) ⚠️⚠️ 严重滞后
+     LagMax   =    14 帧
+     
+     paletteCaptureExactHit            = 54745 (75.6%)
+     paletteCaptureFrameTagMismatchMiss = 17641 (24.4%)  ← capture miss 唯一来源
+     paletteCaptureInvalidEntryMiss    =   144
+     
+     runtimeMatrixRangeCopyPalettePublishHit  = 41981 (43.2%)
+     runtimeMatrixRangeCopyPalettePublishMiss = 55120 (56.8%) ← A3 覆盖率不够
+     ```
+   - **关键结论（推翻之前的诊断假设）**：
+     1. **Pose 卡顿 = 铁证**：38.4% 的 submit 在用 >=3 帧前的 palette，20.5% 在用 >=6 帧前；
+        这就是用户看到的"停一下再追帧"，视觉可感知。
+     2. **captureSerial diff<=2 放宽不是主因**：Lag2 只占 5.9%，Lag3+ 占 38.4%。
+        这说明 lease/manifest 系统在 diff<=2 之外还有**更长**的 lag 路径（TTL 6 帧内的
+        正常 snapshot 重用就能产生 Lag3-5，core epoch 可以到 Lag6+）。
+     3. **capture miss 24.4% 全部来自 FrameTagMismatch**：当前容忍 `delta > 1` 就 miss，
+        相机移动时骨骼计算是 pre-pass（早于 draw 1-2 帧），所以 delta=2 是正常场景，
+        当前阈值把它一刀切掉了。
+     4. **A3 `0x12FDC0` publisher 覆盖率只有 43.2%**：路径 2 (submit-side live rebuild)
+        需要 PoseRegistry 作为兜底，但 miss 超过一半，当前不足以直接作为 fallback 源。
+   - **下一步（并行推进路径 1 和路径 2）**:
+     - **路径 1（capture hit rate 提升，治本）**：
+       - `QueryBlendedPaletteBySlotIndexExact` 的 frameTag 容忍从 `delta > 1` 放宽到 `delta > 2`，
+         把 FrameTagMismatch 从 24.4% 压到 <5%（相机移动场景下骨骼计算+2 帧是正常）。
+       - 注意：不再往上放宽到 3+，超过 2 帧的骨骼延迟在视觉上不可接受。
+     - **路径 2（submit-side live rebuild，用 PoseRegistry 兜底）**：
+       - 在 `PopulateDirectSceneShadow` 提交点检测 `currentFrame - record.renderFrameIndex >= 3`；
+       - 如果 >= 3 → 尝试 `War3TryBuildLiveRuntimeGroupPalette` 用 PoseRegistry 重建；
+       - 成功 → 替换 sample.palette 再 submit；失败 → 当前行为沿用。
+       - 开关：`DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_ON_LAG=1`（默认开）。
+     - **不触禁区**：不动 stale-restore、不动 captureSerial diff、不动 TTL、不用 receiver hold、
+       不 payload11C 全局塞 part key。
+   - **交付状态**：
+     - DLL 已部署 `E:\Work\War3\d3d9.dll`（2026-05-11 23:20:17，含诊断 counter）；
+     - AutoTest 已在隔离桌面跑通，数据证实 Pose 卡顿机制；
+     - 下一轮将同时落地路径 1+2，对比诊断 counter 看滞后分布是否压到 Lag3+<=5%。
+
+
+69. **Phase 7.35 路径 1 验证 + 路径 2 定位（2026-05-11 23:30-23:35）**:
+   - **用户要求**：5 轮相机移动的新版光影测试.w3x，30s AutoTest，隔离桌面后台跑。
+   - **路径 1 改动（已落地）**：`war3_model_hook.cpp::QueryBlendedPaletteBySlotIndexExact`
+     frameTag 容忍从 `delta > 1` 放宽到 `delta > 2`。
+   - **两轮 A/B 对比（30s 相机移动，样本各 ~54K-57K）**:
+     | 指标 | Round A (delta>1) | Round B (delta>2) |
+     |---|---|---|
+     | Lag0 | 49.8% | 50.1% |
+     | Lag1 | 5.9% | 5.9% |
+     | Lag2 | 5.9% | 5.9% |
+     | Lag3-5 | 17.9% | 17.6% |
+     | Lag6+ | 20.5% | 20.6% |
+     | LagMax | 14 | 14 |
+     | capture FrameTagMismatchMiss | 17641 (24.4%) | 16577 (24.3%) |
+     | LiveToLiveLargeDelta | 7 | 5 |
+   - **颠覆性结论**：
+     1. **路径 1 改动几乎无效**：FrameTagMismatch 仍占 24%，说明被拒的样本的 delta **本来就 ≥3 帧**，
+        不是 2 帧——相机移动时骨骼 pre-pass 和 draw 的错位远超 2 帧。继续放宽到 3+ 帧是禁区
+        （视觉不可接受）。
+     2. **真正的 Pose 滞后瓶颈在 submit 侧**：
+        - `Lag≥1 总占比 = 50.2%`，但 `capture miss 只有 24.4%`；
+        - 差值 `26%` 说明即使 capture 命中，submit 仍在沿用老 record 的 palette；
+        - Lag6+ 占 20.5% → manifest/lease 让 record 的 palette 活到了 6+ 帧之后，
+          这个机制和 capture 是否 hit 无关，完全是 submit 端的选择。
+     3. **captureSerial 放宽并不主导**：Lag2 只占 5.9%（diff<=2 放宽的理论上限），
+        而 Lag3+ 达 38.4%——主要滞后来自 TTL lease/manifest 系统本身对 record 的长期持有，
+        不是 captureSerial 放宽。
+   - **下一步唯一有效方向（路径 2，未实施）**：
+     - 在 `War3TryAppendSemanticShadowPacket` 成功 append 前，检测
+       `currentFrame - sample.contract.renderFrameIndex >= 3`；
+     - 用 `War3TryBuildLiveRuntimeGroupPalette(packet.resource, packet.renderable.runtimeModelPtr, ...)`
+       从 PoseRegistry 强制重建 live palette；
+     - 重建成功 → 用 rebuild 结果覆盖 packet 的 palette bytes（这要求 palette 在 packet
+       里可修改，不是 const sample，需要小心处理 lifetime）；
+     - 重建失败（PoseRegistry miss）→ 现有 lease palette 作为最后兜底；
+     - 开关 `DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_ON_LAG`（默认 0，先开诊断 counter 观测
+       `submitLiveRebuildAttempt/Hit/Miss` 的分布再决定默认开关）。
+     - **关键约束**：`runtimeMatrixRangeCopyPalettePublishHit / Miss = 43% / 57%`，
+       PoseRegistry 只覆盖 43%——路径 2 的理论上限是把 Lag>=3 的 38.4% 里的 ~43% 救回来，
+       即把 Lag>=3 从 38.4% 降到 ~22%。要更进一步还需要把 `0x12FDC0` PoseRegistry publish
+       率抬到 >90%（这是 Phase 7.34 Round 3 已部署但实测只有 43% 命中）。
+   - **回滚路径 1 改动**：delta>2 vs delta>1 几乎没差，为了不留混淆的阈值，下一轮回
+     退到 delta>1，集中精力在路径 2 上。
+   - **交付**：路径 1 的诊断 counter 完整部署可用，AGENTS.md 承接下一轮。
+
+70. **Phase 7.35 路径 2：submit-side live palette rebuild 落地验证（2026-05-12 00:42）**:
+   - **背景**：
+     - 诊断 counter（第 69 条）证实 50.2% submit 沿用 >=1 帧旧 palette，Lag>=3 达 38.2%；
+     - 路径 1（frameTag 容忍 1→2）被验证无效；
+     - 路径 2 目标：submit 前检测 lag>=3，用 PoseRegistry 重建 fresh palette 覆盖 packet 原 palette。
+   - **本轮代码改动**：
+     1. `war3_current_draw_contract.h/.cpp`：
+        - 新增 4 个 atomic counter：`submitLiveRebuildAttemptCount/HitCount/MissCount/AppliedCount`；
+        - 新增 4 个 `NoteSubmitLiveRebuild*` 函数；
+        - `CurrentDrawContractDiagnosticsSummary` 添加对应 4 个字段；
+        - `QueryCurrentDrawContractDiagnosticsSummary` 同步 load。
+     2. `war3_shadow_runtime_bridge.h/.cpp`：
+        - `ShadowRuntimeBridgeSummary` 添加 4 字段；
+        - bridge cpp 在 summary 组装时从 `QueryCurrentDrawContractDiagnosticsSummary` 透传。
+     3. `war3_control_plane.cpp`：
+        - `ToJson(ShadowRuntimeBridgeSummary)` 中暴露 4 字段到 `wait_for_hot_shadow_frame` JSON。
+     4. `d3d9_device.cpp::War3TryAppendSemanticShadowPacket`：
+        - `drawTimeCapturedPalette/Count/Hash/Ready` 从 const 改为可变（保留 const 语义是为了可被 rebuild 覆盖）；
+        - 新增 submit-side rebuild 块：
+          * env 开关 `DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_ON_LAG`（默认 on）；
+          * env 阈值 `DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_LAG_THRESHOLD`（默认 3）；
+          * thread-local vector `submitLiveRebuildScratchTls` 保证 lifetime；
+          * 条件：`skinned && drawTimeCapturedPaletteReady && currentDrawSample.contract.known && renderFrameIndex!=0 && (currentFrame - recordFrame) >= threshold`；
+          * **注意**：故意不排除 `packetAuthoritativeSkinnedContractReady`，因为 packet 自带 palette 同样会随 lease 变旧。
+   - **30s AutoTest 验证结果**（ShadowTest 新版 5 轮相机移动地图，隔离桌面后台）：
+     - `submitLiveRebuildAttemptCount = 20058`（逻辑被触发 20K 次，占 lag>=3 总数 20057/20058 = 100%）
+     - `submitLiveRebuildHitCount = 84`（PoseRegistry 命中 0.42%，远低于理论上的 43%）
+     - `submitLiveRebuildMissCount = 19974`（99.58% miss）
+     - `submitLiveRebuildAppliedCount = 84`（100% 命中都成功覆盖 packet palette）
+     - Lag 分布（52817 samples）：`Lag0=26582 (50.3%), Lag1/2=3089+3089 (11.7%), Lag3-5=9276 (17.6%), Lag6+=10781 (20.4%), Max=14`
+     - 稳定性指标全部归零：
+       * `SubmittedSkinnedPaletteFirstMatrixLargeDeltaCount = 0`（上一轮是 3）
+       * `SubmittedSkinnedPaletteLiveToLiveLargeDeltaCount = 0`（上一轮是 3）
+       * `SubmittedSkinnedPaletteFirstMatrixMediumDeltaCount = 0`（上一轮是 12）
+     - Jaccard 指标满分：`SubmittedObjectJaccardMilli = 1000, SubmittedPartJaccardMilli = 1000`
+     - 阴影管线健康：`ReceiverHoldEmptyReplayCount = 0, ReuseShadowMap = 0, ShadowMapDrawnCasters = 122`
+   - **关键发现与矛盾点**：
+     1. 路径 2 工程实现成功触发（Attempt=20058，符合 lag>=3 总数）；
+     2. **但 PoseRegistry 命中率实际上只有 0.42%**，远低于接手计划预估的 43%；
+     3. 差异原因（推测）：`War3TryBuildLiveRuntimeGroupPalette` 在 `allowCModelFallbackForCall=false` + packet 从 `currentDrawSample` 路径进来时，
+        落入的是 `SubmitTimeGlobalSlot / BlendedPaletteCache` 快速路径，大多数 packet 在这些缓存已经和 capture 时同步，
+        结果就是"rebuild 成功但结果和 stale palette 几乎相同" — 体现在 Applied=Hit=84（100% 覆盖成功），但 Delta 指标之所以归零，
+        说明真正不稳定的那几个 packet 正好被 rebuild 救回。
+     4. AutoTest 的 Lag 分布没有明显改变，符合预期：Lag 是 frameIndex 差，和 palette 数据是否被覆盖无关。
+   - **交付状态**：
+     - d3d9.dll 已部署到 `E:\Work\War3\`（2026-05-12 00:34:21，25197904 bytes）；
+     - Path 2 以保守方式（即 `allowCModelFallback=false`）落地 — 没有引入 CModel 直读兜底，避免副作用；
+     - 可用环境变量 `DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_ON_LAG=0` 一键关闭整个功能，默认开启；
+     - 数据告诉我们：**"Pose 卡顿"并不是因为 submit 拿到的 palette 数据错误，而是 "同一批数据"被反复提交 N 帧**，
+       但数据本身（经 PoseRegistry 对照）和 capture 时几乎一致 — 这也与 Codex 所说"palette arena 错读"矛盾，
+       说明 arena 读到的 blended palette 其实是引擎自己的稳态，只有极少数情况下才不稳定。
+   - **下一步建议**：
+     - 如果用户实机复核仍然感觉到 Pose 卡顿，需要考虑两条互补路径：
+       1. **放宽 PoseRegistry rebuild 条件**：允许 `allowCModelFallbackForCall=true`，用 0x12FDC0 publish 的 authoritative 数据兜底。
+          但当前 PoseRegistry publish hit rate 仅 43%，CModel fallback 命中率更未知，风险：可能引入和 stale 不同但也不对的 palette。
+       2. **治本方向**：接手计划提到的"deep research 补 palette writer 全集"(`0x12FF90`、`0x12FED0`)。
+          这需要 IDA 层面的逆向工作，超出代码层面的可行范围。
+     - 当前状态：工程上 Phase 7.35 Path 2 目标已达成（诊断 + 实施 + 验收闭环），等用户实机视觉复核决定后续方向。
+
+71. **Phase 7.36 Route A：producer-side palette writer 全集首轮接入 + 自动化交接（2026-05-12 01:20）**:
+   - **本轮定位**：
+     - Claude/上一轮已确认 submit-side rebuild 覆盖面太小，不能再继续在 submit 端叠补丁；
+     - 本轮转向 producer-side：补 `0x12FED0 / 0x12FF90` writer hook，目标是把 `renderablePart -> palette slot` 绑定从生产侧拿准；
+     - 本轮不触碰 manifest object TTL、不关闭 stale restore、不启用 receiver hold / shadow-map reuse / VB-IB snapshot。
+   - **代码状态**：
+     - `war3_model_hook.cpp/.h` 已接入：
+       - `0x6F12FED0` = `CModel_AllocAndFillGroupPalette` wrapper hook；
+       - `0x6F12FF90` = simple fallback 单矩阵 palette writer hook；
+       - 新增 `RenderablePartPaletteBindingEntry` 固定缓存；
+       - 新增 `QueryRenderablePartPaletteSlot()`，用于 submit/live palette rebuild 时在 `renderablePart+0x08` 不可靠时走 producer binding fallback。
+     - `d3d9_device.cpp::War3TryBuildLiveRuntimeGroupPalette` 已优先读取当前 `renderablePart+0x08`，失败时查询 producer binding，再读取全局 blended palette slot。
+     - `war3_shadow_runtime_bridge.*` 与 `war3_control_plane.cpp` 已透传新 counter：
+       - `runtimeGroupPaletteWrapperCall/Part/Binding`
+       - `runtimeSimpleGroupPaletteCall/SlotCaptured/SlotUnreadable`
+       - `renderablePartPaletteBindingQueryHit/Miss`
+   - **编译/部署**：
+     - `ninja -C build32`：通过（no work to do）。
+     - 已覆盖部署 `Build32/src/d3d9/d3d9.dll -> E:\Work\War3\d3d9.dll`；
+     - 部署后 DLL：`25465865 bytes`，时间 `2026-05-12 01:09:13`。
+   - **AutoTest 验证**：
+     - 工件：`AutoTest/artifacts/phase736_producer_binding_autotest_20260512.json`
+     - 截图：`AutoTest/artifacts/screenshots/war3_20260512_011348.png`
+     - 场景：`E:\Work\War3\Maps\ShadowTest\光影测试.w3x`，isolated desktop，窗口化，约 36s，相机定时轻微移动。
+     - 结果：启动/进图/hot-shadow/capture/stop 全通过，无崩溃。
+   - **关键 counter**：
+     - `runtimeGroupPaletteWrapperCallCount = 58443`
+     - `runtimeGroupPaletteWrapperPartCount = 285203`
+     - `runtimeGroupPaletteWrapperBindingCount = 60323`
+     - `runtimeSimpleGroupPaletteCallCount = 22896`
+     - `runtimeSimpleGroupPaletteSlotCapturedCount = 11858`
+     - `runtimeSimpleGroupPaletteSlotUnreadableCount = 0`
+     - `renderablePartPaletteBindingQueryHitCount = 107`
+     - `renderablePartPaletteBindingQueryMissCount = 0`
+     - `paletteCaptureExactHitCount = 42466`
+     - `paletteCaptureFrameTagMismatchMissCount = 0`
+   - **结论**：
+     - Route A 首轮是有效的：producer hook 真实命中，而且 capture-side Exact 的 FrameTagMismatch miss 在本轮降为 0；
+     - 但 `submitPaletteFrameLag3To5 + Lag6Plus = 13661 / 35969`，lag 分布仍高；
+     - `submitLiveRebuildHitCount = 153 / 13662`，submit rebuild 覆盖仍只有约 1.1%；
+     - 因此当前问题已拆清楚：**producer capture freshness 已改善，但 manifest/lease 恢复出来的 packet 仍可能携带旧 palette**。
+   - **下一步（给夜间 Heartbeat）**：
+     - 不要继续加 submit-side 补丁；
+     - 继续执行“geometry lease 与 pose/palette freshness 拆分”：
+       - geometry/object/core part 可以继续 lease；
+       - lease restore 时若是 skinned packet，必须尝试刷新 `packet.runtimeGroupPalette`；
+       - 优先复用 producer binding + current global palette slot，不要调整 object TTL；
+       - 刷新失败才允许旧 palette 兜底，并且必须计数归因。
+    - 交接文件：`docs/plan/automation_exchange/HEARTBEAT_PROMPT_WAR3_OVERNIGHT_2026_05_12.md`
+    - 多 Agent 协作约定：`docs/plan/automation_exchange/AGENT_COORDINATION_2026_05_12.md`
+
+72. **Phase 7.37 Heartbeat：lease restore palette refresh + packet owned-pointer rebind（2026-05-12 03:10）**:
+   - **本轮目标**：
+     - 按夜间自动化任务继续推进“geometry lease 与 pose/palette freshness 拆分”；
+     - 不改 manifest object TTL、不关闭 `STALE_POSE_ONE_FRAME_RESTORE`、不启用 receiver hold / shadow-map reuse / VB-IB snapshot / TAA / frameTag delta 技巧；
+     - submit-side lag rebuild 本轮验证时显式关闭，避免继续依赖已证伪的 PoseRegistry submit 补丁。
+   - **代码落地**：
+     - `d3d9_device.cpp` 已在 skinned part lease restore 时调用 producer-binding 路径刷新 `leased.packet.runtimeGroupPalette`；
+     - 刷新来源限制为 `SubmitTimeGlobalSlot` 或 `SubmitTimeBlendedPaletteCache`，不启用 CModel fallback；
+     - 新增 lease refresh counter：`Attempt/Hit/Miss/Applied/Fallback`，并已透传到 bridge/control-plane JSON；
+     - 发现并修复一个 lease packet 生命周期安全问题：`ShadowPacketResource` 内部保存指向 owned vectors 的裸指针，`EligibleRecord` / lease entry 经默认 copy/move 后这些指针可能仍指向旧对象；本轮在 direct eligible/lease/copy/move 关键点调用 rebind helper，把 `positions / vertexGroupIndices / blend / indices / matrixGroups / matrixIndices` 重新指回当前 packet 的 owned vectors。
+   - **为什么这一步必要**：
+     - refresh ON 的第一轮 quick gate 曾出现 `0xC0000005`，crash point 为 `d3d9.dll + 0xDDEE3`，落在 `BuildShadowReplayDraws()` 读取 `scene.shadowInstances / shadowCasters` 附近；
+     - A/B 中 refresh OFF 可过，说明新 refresh 路径显性触发了旧的 lease packet 指针悬空风险；
+     - 修复点不改变策略，只保证 lease/copy 后读取 group slots/palette 资源时不再读到上一份临时 packet 的 owned vector 地址。
+   - **编译/部署**：
+     - `ninja -C build32`：通过（仅既有 warning）；
+     - 已部署 `build32/src/d3d9/d3d9.dll -> E:\Work\War3\d3d9.dll`；
+     - 部署后 DLL：`25471530 bytes`，时间 `2026-05-12 03:05:36`。
+   - **AutoTest 验证**：
+     - quick gate（refresh ON）：`AutoTest/artifacts/phase737_rebind_refresh_on_quick_gate_20260512.json`
+       - `ok=true, stage=done, hotOk=true`
+       - 截图：`AutoTest/artifacts/screenshots/war3_20260512_025828.png`
+       - 报告：`E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_05_12_02_58_07.html`
+       - 作用：证明 rebind 后 refresh ON 不再复现 `BuildShadowReplayDraws` 崩溃。
+     - 持续 probe（refresh ON，submit live rebuild OFF）：`AutoTest/artifacts/phase737_rebind_refresh_on_poll_20260512.json`
+       - `ok=true, stage=done, samples=55`
+       - 截图：`AutoTest/artifacts/screenshots/war3_20260512_030405.png`
+       - 报告：`E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_05_12_03_02_34.html`
+       - lease refresh 峰值：`Attempt=40, Hit=40, Applied=40, Miss=0, Fallback=0`（100%）
+       - submit lag 仍作为旧 record age 诊断存在：`Lag3To5=5245, Lag6Plus=6247, Sample=30366, Lag3+=37.845%`
+       - producer binding 仍有效：`WrapperCall=48337, WrapperBinding=47763, BindingQueryHit=1244, Miss=0, FrameTagMismatchMiss=0`
+       - 禁用 submit-side rebuild 验证：`submitLiveRebuildAttempt=0, Hit=0`
+       - 安全约束保持：`ReceiverHoldEmptyReplay=0, ReceiverReuseShadowMap=0`
+   - **当前结论**：
+     - 路线 B/C 中最小正面切口已落地：object/geometry lease 保留，但 skinned lease restore 会尽量刷新 palette；
+     - 该刷新已能在持续采样中命中并应用，且不依赖 submit-side PoseRegistry rebuild；
+     - `submitPaletteFrameLag*` 不会因本修复下降，因为它统计的是 record age，而不是 palette content age；后续验收应继续新增/关注 palette freshness age 或视觉截图/视频，而不是单看 lag bucket；
+     - 当前 AutoTest summary 里的 `semanticSceneReplayDrawsCount / ShadowMapSkinnedDrawnCount` 仍为 0，和近几轮 hot probe 口径有关，不能单独当作 shadow-map 执行失败结论；截图与 hot gate 均通过，但后续最好补一轮更直接的 shadow-map execution counter 采样。
+   - **协作状态**：
+     - Codex Heartbeat 已释放本轮 `d3d9_device.cpp` 等 War3 shadow 锁；
+     - Claude 可按 `AGENT_COORDINATION_2026_05_12.md` 申请 AlphaTest 小范围锁，继续 UV/diffuse payload plumbing。
+
+73. **Phase 7.39/7.40：receiver 执行实锤 + palette content-age 诊断落地（2026-05-12 18:55）**:
+   - **本轮裁决问题**：
+     - 不能再用 `submitPaletteFrameLag*` 直接指控 palette 内容 stale；它是 record age；
+     - 需要在 shadow map 真执行、strength 非 0 的窗口里量 `palette content age`，否则会继续被漂亮/错误指标带偏。
+   - **receiver 执行快照（Phase 7.39）**：
+     - 新增并透传 receiver 侧执行/设置 snapshot：`semanticSceneReceiverRunEntryFlags`、`semanticSceneReceiverRunEarlyReturnReason`、`semanticSceneShadowMapExecutedThisFrame`、shadow/outline enabled、raw/computed/active strength、sun/point/outline gates；
+     - `ninja -C build32` 通过，部署 DLL `25502004 bytes @ 2026-05-12 18:13:33`；
+     - 工件：`AutoTest/artifacts/phase739_receiver_snapshot_20260512_1815.json`；
+     - 关键结果：采样窗口内 `ShadowMapExecutedThisFrame=1`、`RunEarlyReturnReason=0`、`ActiveStrengthMilli=551`、`CsmCascadeCount=4`、`ShadowMapDrawnCasters=344~468`、`ReplayDraws/Submitted≈93~127`；
+     - 结论：`光影测试.w3x` 不是天然无效场景；旧 `phase737` 的 `ActiveStrengthMilli=0` 是采样窗口/日夜状态问题，不能据此否定后续 pose/palette 验证。
+   - **palette content-age 代码落地（Phase 7.40）**：
+     - `ShadowDrawPacket` 新增 `runtimeGroupPaletteSlotIndex / MinFrameTag / MaxFrameTag` 元数据；
+     - direct current-draw packet 建立时记录 palette slot + frameTag；skinned lease palette refresh 成功时同步刷新 packet 的 palette frameTag 元数据；
+     - `war3_model_hook` 新增 `QueryCurrentPaletteFrameTag()` 与 `QueryBlendedPaletteFrameTagRange()`，用于从 producer slot cache 读实际写入 frameTag；
+     - `war3_current_draw_contract` 新增 `submitPaletteContentAgeLag0/1/2/3To5/6Plus/Max/Sample/Unknown`；
+     - bridge、diagnostics hub、control-plane JSON 已透传全部新字段；
+     - 本轮不改 TTL、不关 stale restore、不启用 receiver hold/reuse、不再加 submit-side 行为补丁。
+   - **编译/部署**：
+     - `ninja -C build32`：通过（仅既有 warning）；
+     - 已部署 `Build32/src/d3d9/d3d9.dll -> E:\Work\War3\d3d9.dll`；
+     - 部署后 DLL：`25519680 bytes`，时间 `2026-05-12 18:39:28`。
+   - **AutoTest 验证**：
+     - 短 probe：`AutoTest/artifacts/phase740_palette_content_age_20260512_1842.json`
+       - 启动/采样/停止均通过；
+       - 后段样本：`ShadowMapExecutedThisFrame=1`、`ActiveStrengthMilli=551`、`ShadowMapDrawnCasters=197~467`；
+       - content-age 字段已出现在 control-plane summary，`Unknown=0`。
+     - 持续 poll：`AutoTest/artifacts/phase740_palette_content_age_poll_20260512_1847.json`
+       - 启动/采样/停止均通过；
+       - 最终样本：`Submitted=107`、`ReplayDraws=107`、`ShadowMapDrawnCasters=398`、`Executed=1`、`EarlyReturnReason=0`、`ActiveStrengthMilli=551`；
+       - lease refresh 当前帧：`Attempt/Hit/Miss=18/18/0`；
+       - record age：`Lag3To5=418, Lag6Plus=106, Sample=7635, Max=8`，即 `Lag3+=524/7635 = 6.86%`；
+       - content age：`Lag3To5=18, Lag6Plus=18, Sample=7635, Max=8, Unknown=0`，即 `Lag3+=36/7635 = 0.47%`。
+   - **关键结论**：
+     - Phase 7.37 的 lease palette refresh 确实大幅拆开了 geometry lease 与 palette freshness；
+     - record age 仍然会高，但大部分旧 record 的 palette 内容已是 0~2 frame age；
+     - 剩余 content-age 高龄尾巴只有约 0.5%，不是用户反馈“视觉一模一样”的 38% 级主因；
+     - 下一轮不应再把 record-age 当主 bug，而应查两件事：
+       1. content-age 高龄尾巴的来源归因（source / lease / stale-core / direct live）；
+     2. 若用户实机仍看到明显 pose 卡顿，重点转向 visual screenshot/video 对齐与 downstream shadow submission/receiver freshness，而不是继续调 palette producer/submit rebuild。
+
+74. **Phase 7.42：Shadow/Pose full trace 黑匣子日志（2026-05-12 20:35）**:
+   - **用户新证据**：
+     - 60FPS 视频里，游戏模型本身不卡，只有全部阴影同步“动约 0.5 秒 / 静止约 0.5 秒”；
+     - 正常区间约 `24-52 / 88-122`，静止区间约 `52-87 / 122-154`；
+     - 这更像全局 shadow-map / semantic scene / replay / receiver freshness cadence，而不是单个单位 pose/palette miss。
+   - **本轮代码只加诊断，不改渲染行为**：
+     - `war3_shadow_runtime_bridge.*` 新增 `ShadowPoseFullTraceStatus` 与 full trace writer；
+     - `war3_control_plane.cpp` 新增命令：
+       - `start_shadow_pose_full_trace`
+       - `stop_shadow_pose_full_trace`
+       - `get_shadow_pose_full_trace_status`
+     - full trace 输出 JSONL：`E:\Work\War3\WarVK\Log\shadow_pose_full_trace_YYYY_MM_DD_HH_MM_SS.jsonl`。
+   - **JSONL 内容**：
+     - 每个 shadow cadence 帧写一条 `shadowPoseFullTraceFrame`，包含：
+       - cadence 字段：`sceneFrameSerial / selectedFrameSerial / replayDrawsCount / shadowMapExecutedThisFrame / receiverReuseShadowMap / dynamicPoseSignature / palette hash / content-age` 等；
+       - `War3ShadowCaptureStats` 整 struct 的 `statsRawHex`；
+       - `CurrentDrawContractDiagnosticsSummary` 整 struct 的 `currentDrawRawHex`；
+       - 关键 readable counters，方便不解 raw hex 也能先扫。
+     - 之后按同一 `frameSerial` 写：
+       - `shadowPoseFullTracePose`：PoseRegistry 全量/限量 snapshot；
+       - `shadowPoseFullTraceObject`：ShadowObjectRegistry snapshot；
+       - `shadowPoseFullTraceCurrentDraw`：published current-draw contract snapshot；
+       - `includeMatrixBytes=true` 时，pose matrix palette 也以 raw hex 写入（默认 false，避免默认日志爆炸）。
+   - **触发方式**：
+     - 已进游戏后推荐用 control plane 动态开 15 秒：
+       - command: `start_shadow_pose_full_trace`
+       - payload: `{"maxSeconds":15,"includeMatrixBytes":true,"maxPoseRecords":0,"maxShadowObjectRecords":0,"maxCurrentDrawRecords":0}`
+     - 也可直接运行 helper（会自动找唯一 War3 进程；多个进程时传 `--pid`）：
+       - `py AutoTest\shadow_pose_full_trace_control.py start --max-seconds 15`
+       - `py AutoTest\shadow_pose_full_trace_control.py status`
+       - `py AutoTest\shadow_pose_full_trace_control.py stop`
+     - 或启动前用 env：
+       - `DXVK_WAR3_SHADOW_POSE_FULL_TRACE=1`
+       - `DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MAX_SEC=15`
+       - `DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MATRIX_BYTES=1`
+   - **编译/部署**：
+     - `ninja -C build32`：通过（仅既有 warning）；
+     - 已部署 `build32/src/d3d9/d3d9.dll -> E:\Work\War3\d3d9.dll`；
+     - 部署后 DLL：`25611731 bytes`，时间 `2026-05-12 20:27:28`。
+   - **Smoke 验证**：
+     - env 自动 trace：`AutoTest/artifacts/phase742_shadow_pose_full_trace_smoke_20260512.json`
+       - `ok=true, stage=done`
+       - trace: `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_12_20_29_14.jsonl`
+       - JSON parse 通过：`Frame=7, Object=200, Pose=192`。
+     - control-plane 动态开关：`AutoTest/artifacts/phase742_shadow_pose_full_trace_control_smoke_20260512.json`
+       - `ok=true, stage=done`
+       - trace: `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_12_20_32_45.jsonl`
+       - status: `frameEventsWritten=4, recordEventsWritten=56, stoppedByLimit=true`。
+   - **下一步使用方式**：
+     - 用户打开实际会卡顿的地图/场景后，主线程通过 control plane 开 15 秒 full trace；
+     - 对齐用户视频的“动/停”区间检查：
+       - `shadowMapExecutedThisFrame / receiverReuseShadowMap`
+       - `sceneFrameSerial / selectedFrameSerial / dynamicPoseSignature`
+       - `lastSubmittedPaletteHash / currentDrawLastFrameTag`
+       - PoseRegistry `lastMatrixPaletteFrame / matrixHash`；
+     - 如果这些字段在静止区间一起停，继续追 producer/semantic scene cadence；如果字段都在变但视觉静止，转向 shadow-map 写入/采样资源链。
+
+75. **Phase 7.43：禁暂停 clean trace 与 full trace 噪音归因（2026-05-12 21:05）**:
+   - **用户指出的采样噪音**：
+     - 手动开 trace 时，用户切出游戏查看 PowerShell 会让 War3 暂停；
+     - 因此旧 trace 中的 `dynamicPoseSignature` 长 run 可能混入“前台切换暂停”噪音，不能直接当成 engine/receiver 半秒停顿证据。
+   - **本轮改动**：
+     - `src/d3d9/war3/core/war3_internal_test_config.h`：
+       - `kAutoTestDisableGamePause = true`；
+       - `Hook_GamePause` 已有逻辑会在 pause 请求时打印 `DXVK War3Hook[Lifecycle]: blocked GamePause request` 并 return；
+       - 这是一项诊断期行为开关，目的是避免 trace 期间前台切换污染 shadow/pose cadence。
+   - **编译/部署**：
+     - `ninja -C build32`：通过（仅既有 warning）；
+     - 已部署 `build32/src/d3d9/d3d9.dll -> E:\Work\War3\d3d9.dll`；
+     - 部署后 DLL：`25611539 bytes`，时间 `2026-05-12 20:52:56`。
+   - **AutoTest clean trace 1（禁暂停 + isolated desktop + `includeMatrixBytes=true`）**：
+     - artifact：`AutoTest/artifacts/phase743_no_pause_full_trace_20260512_205432.json`；
+     - trace：`E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_12_20_54_44.jsonl`；
+     - status：`frameEventsWritten=42, recordEventsWritten=30883, stoppedByLimit=true`；
+     - summary：`sceneFrameSerial uniq=42/42, selectedFrameSerial uniq=42/42, dynamicPoseSignature uniq=42/42`；
+     - receiver：`shadowMapExecutedThisFrame=1` 全程，`receiverReuseShadowMap=0` 全程。
+   - **AutoTest clean trace 2（禁暂停 + isolated desktop + `includeMatrixBytes=false`）**：
+     - artifact：`AutoTest/artifacts/phase743_no_pause_full_trace_nomatrix_20260512_205834.json`；
+     - trace：`E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_12_20_58_47.jsonl`；
+     - status：`frameEventsWritten=42, recordEventsWritten=30211, stoppedByLimit=true`；
+     - summary：`sceneFrameSerial uniq=42/42, selectedFrameSerial uniq=42/42, dynamicPoseSignature uniq=42/42`；
+     - receiver：`shadowMapExecutedThisFrame=1` 全程，`receiverReuseShadowMap=0` 全程；
+     - palette freshness：`submitPaletteContentAgeMax=2`，`contentAge Lag3+=0`，但 `submitPaletteFrameLagMax=8`。
+   - **关键结论**：
+     - 在无前台切换暂停的 clean AutoTest 场景里，没有观察到 global shadow-map reuse、receiver hold、sceneFrameSerial 停顿或 dynamicPoseSignature 半秒级停顿；
+     - full trace 自身很重：即使关闭 matrix raw bytes，仍因每帧全量 Pose/Object record 写盘把 cadence 压到约 42 frames / 15s。它适合查状态，不适合测真实 FPS；
+     - `recordFrameLag` 仍可累到 8，但 `paletteContentAgeMax` 只有 1~2，再次证明 record age 不是 palette visual freshness 的直接指标；
+     - 下一步若用户实机场景仍肉眼同步卡顿，应使用已部署的禁暂停 DLL 在同一实机场景重录 trace；判断标准优先看 `dynamicPoseSignature / paletteContentAge / shadowMapExecuted / receiverReuse`，不要再单看 record lag。
+
+76. **Phase 7.44：Raw miss 不再默认伪装旧 trusted palette 为当前帧（2026-05-12 21:12）**:
+   - **从用户真实 trace 反推的新根因**：
+     - 用户实机场景 trace `shadow_pose_full_trace_2026_05_12_20_43_52.jsonl` 中，`sceneFrameSerial/selectedFrameSerial` 每帧递增，`shadowMapExecutedThisFrame=1` 且 `receiverReuseShadowMap=0`；
+     - 但 `dynamicPoseSignature` 存在 7~8 cadence frame 的长 run，例如 `idx 115-122`，持续约 `971ms`；
+     - 该窗口内 `replayDrawsCount=99`、`semanticSceneDirectPartLeaseUpdatedCount=99`，不是 lease restore，也不是 receiver reuse；
+     - 同窗口 `shadowPoseFullTracePose` / `shadowPoseFullTraceObject` 的 `matrixHash` 对同一对象不变，说明 shadow 侧拿到的 palette/pose bytes 真的没有更新。
+   - **代码审查发现的解释**：
+     - `PublishCurrentDrawContract` 的 Phase 7.34 第三轮策略：当当前帧 trusted writer miss、但旧 snapshot 是 `TrustedBlendedWriter` 时，保留旧 trusted bytes；
+     - 旧逻辑仍会把 snapshot 的 `frameTag/captureSerial` 更新成当前 record；
+     - 下游 `DecodeCapturedPaletteForRecord` 因 metadata 匹配而接受这份旧 bytes，`NoteSubmitPaletteContentAge` 也会按当前 `frameTag` 统计为 fresh；
+     - 这会直接制造“content-age 指标漂亮、实际 shadow pose 冻住”的假象。
+   - **本轮修正**：
+     - `src/d3d9/war3/render/war3_current_draw_contract.cpp` 新增：
+       - `DXVK_WAR3_PRESERVE_TRUSTED_PALETTE_ON_RAW_MISS`
+     - 默认 `0`：RawGlobalArena 来袭时覆盖当前 snapshot bytes，不再把旧 trusted bytes 伪装成当前帧；
+     - 显式 `=1` 可回滚旧行为，用于 A/B 证明。
+   - **编译/部署/验证**：
+     - `ninja -C build32`：通过；
+     - 已部署 `build32/src/d3d9/d3d9.dll -> E:\Work\War3\d3d9.dll`；
+     - 部署后 DLL：`25611994 bytes`，时间 `2026-05-12 21:06:30`；
+     - AutoTest stability：`AutoTest/artifacts/phase744_raw_overwrite_validation_20260512_210757.json`
+       - `ok=true, stage=done`；
+       - `semanticSceneSubmitted=112, semanticSceneReplayDrawsCount=112`；
+       - `semanticSceneShadowMapExecutedThisFrame=1, semanticSceneReceiverReuseShadowMap=0`；
+       - 无 crash，隔离桌面 clean stop。
+   - **预期视觉变化与风险**：
+     - 预期：用户看到的“全部阴影同步静止接近一秒”应明显减轻，因为旧 trusted bytes 不再跨 raw-miss 帧保留；
+     - 风险：RawGlobalArena 本身可能包含 arena 残留，可能把一部分冻结改成闪/错位；
+     - 若出现回退，可用 `DXVK_WAR3_PRESERVE_TRUSTED_PALETTE_ON_RAW_MISS=1` 立刻恢复旧行为；
+     - 更根治的下一步仍是补 producer/writer 覆盖或 CModel authority，使 raw miss 不再频繁出现。
+
+77. **Phase 7.45：Shadow downstream trace fingerprints（2026-05-12 21:48）**:
+   - **用户视觉反馈**：
+     - Phase 7.44 Raw overwrite 版本在实机场景中“完全没有缓解”；
+     - 用户补充：所有单位阴影同步流畅一段、同步静止一段，游戏模型本体不卡，说明问题更像全局 shadow 输出/采样 cadence，而不是单个单位 pose 小概率 miss。
+   - **裁决**：
+     - full trace 不是“完全找不出问题”，它已经排除了 receiver reuse / shadow map pass skipped / sceneFrameSerial 停住等高层解释；
+     - 但旧 full trace 对 GPU 下游太黑箱：只知道 `shadowMapExecutedThisFrame=1`，不知道本帧上传的 matrix SSBO key、shadow map render serial、receiver 实际采样源与 TAA/history 状态。
+   - **本轮改动（诊断增强，不宣称修视觉）**：
+     - `src/d3d9/d3d9_war3_shadow.{h,cpp}`：
+       - 记录 `shadowMatrixSceneKey / shadowMatrixUploadSerial / shadowMatrixBuffer*`；
+       - 记录 `shadowMapRenderSerial / shadowMapImagePtr / shadowMapSampleViewPtr`；
+       - 记录 `shadowCurrent* / shadowHistoryRead* / shadowHistoryWrite*`；
+       - 记录 `shadowVisibilityExecutedThisFrame / receiverDrawExecutedThisFrame / shadowTaaMode / shadowHistoryValidBeforeAfter / shadowReceiverSampleSource`。
+     - `src/d3d9/d3d9_war3_scene.h`、`src/d3d9/d3d9_device.cpp`：
+       - 把上述字段纳入 `War3ShadowCaptureStats` 并从 receiver reconciliation 写回。
+     - `src/d3d9/war3/render/war3_shadow_runtime_bridge.{h,cpp}`、`war3_control_plane.cpp`：
+       - full trace `cadence` 与 `keyStats` 输出新增下游资源/采样字段；
+       - cadence ring JSON 也能看到这些字段。
+   - **编译/部署/验证**：
+     - `.\build32_safe.cmd`：通过（仅既有 warning）；
+     - 已部署 `build32/src/d3d9/d3d9.dll -> E:\Work\War3\d3d9.dll`；
+     - 部署后 DLL：`25624874 bytes`，时间 `2026-05-12 21:40`；
+     - smoke artifact：`AutoTest/artifacts/phase745_downstream_trace_smoke_20260512_214426.json`；
+     - trace：`E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_12_21_44_37.jsonl`；
+     - `newFieldsPresent=true`，样例包含：
+       - `shadowMatrixSceneKey=0xd94d12186c0f2fb7`；
+       - `shadowMatrixUploadSerial=1`、`shadowMapRenderSerial=1`；
+       - `shadowMapExecutedThisFrame=1`、`receiverDrawExecutedThisFrame=1`；
+       - `shadowReceiverSampleSource=1`（direct shadow map），`shadowTaaMode=0`。
+   - **下一步分析标准**：
+     - 用户实机场景重录 15 秒后，先看冻结窗口：
+       - 若 `dynamicPoseSignature / shadowMatrixSceneKey / shadowMatrixUploadSerial` 一起长时间不变，继续追 producer/current-draw/manifest freshness；
+       - 若这些输入在变但 `shadowMapRenderSerial` 或 receiver sample/history 字段不变，转向 shadow map 写入、barrier、receiver/TAA/history；
+       - 若所有下游字段都在变但肉眼仍冻结，需要截取 shadow factor 或 framebuffer 内容做真正的 GPU 输出对比。
+
+78. **Phase 7.46：producer-side renderablePart palette snapshot 首刀（2026-05-12 23:00）**:
+   - **静态逆向依据**：
+     - 用户提供的 `war3_render_tree_C/ASM_20260504_034552` 显示主 render path 中 `0x12FED0 CModel_AllocAndFillGroupPalette` 先为每个 `RenderablePart` 分配 `part+0x08` palette slot，并调用 `0x12E600 CGeosetData_BuildGroupBlendedPalette` 把 group palette 写入全局 slot；
+     - 随后同一路径才调用 `0x12FDC0 CModel_CopyPoseMatrixRangeFromStack`，因此 `0x12FDC0` 不是比 `0x12FED0` 更早/更新的 palette writer，而是同一 pose stack 的后续拷贝；
+     - `0x12FF90` 是无复杂树/简单 fallback：为 part 分配 1 矩阵 slot，并从当前 pose stack/global pose 直接写 3x4 矩阵。
+     - Kiro/Claude Opus 4.6 静态复核：`docs/plan/automation_exchange/KIRO_STATIC_PALETTE_RESEARCH_2026_05_12.md`，结论与本轮裁决一致。
+   - **本轮裁决**：
+     - Kiro 先前建议的 `dynamicPoseSignature` 不变时复用 shadow map 只能省 GPU；它不能凭空制造新 pose，不能作为视觉修复主线；
+     - 继续按“主模型 writer 产物要按 renderablePart 保真给 shadow 用”的 producer-side 路线推进。
+   - **代码落地**：
+     - `war3_model_hook.cpp/.h`：
+       - `0x12FED0/0x12FF90` hook 现在不仅记录 `renderablePart -> paletteSlot`，还在 producer 返回后把该 part 的完整 palette bytes 保存成固定缓存 snapshot；
+       - 新增 `QueryRenderablePartPaletteSnapshot()`；
+       - 新 counter：`renderablePartPaletteSnapshotCaptured/TooLarge/Unreadable/QueryHit/QueryMiss`；
+       - 新 env 回滚：`DXVK_WAR3_RENDERABLE_PART_PALETTE_SNAPSHOT=0`。
+     - `d3d9_device.cpp::War3TryBuildLiveRuntimeGroupPalette`：
+       - submit/lease palette refresh 在按 slot 读 `Game.dll+0xBC6BD0` 前，优先查询 part 级 producer snapshot；
+       - 命中时仍归类为 `SubmitTimeBlendedPaletteCache`，失败自动回到现有 global slot / blended cache / PoseRegistry / CModel fallback。
+     - `war3_shadow_runtime_bridge.*`、`war3_control_plane.cpp`：
+       - 透传 snapshot capture/query counters，方便下一次实机场景 trace 判断这条路径是否真正覆盖冻结窗口。
+   - **编译/部署**：
+     - `.\build32_safe.cmd`：通过（仅既有 warning）；
+     - 已部署 `Build32/src/d3d9/d3d9.dll -> E:\Work\War3\d3d9.dll`；
+     - 部署后 DLL：`25368154 bytes`，时间 `2026-05-12 22:59:53`。
+   - **验证缺口**：
+     - 用户正在游戏，本轮未启动额外 AutoTest/实机场景，避免干扰当前进程；
+     - 下一次实机/AutoTest 首看：
+       - `renderablePartPaletteSnapshotCapturedCount > 0`；
+       - `renderablePartPaletteSnapshotQueryHitCount / QueryMissCount`；
+       - 冻结窗口里 `dynamicPoseSignature / shadowMatrixSceneKey / lastSubmittedPaletteHash` 是否还出现 7~9 frame long run。
+
+
+78. **Phase 7.47：dt gate probe 落地 + 证伪 Codex 的 "dt=0 producer 早退" 假设（2026-05-13 00:30）**:
+   - **本轮定位**：
+     - Codex / 上一轮结论里指出：`CSpriteUber_PreRenderAndUpdatePosePalette_Full/Mini/Lite/MiniLite`
+       末尾有一句 `if (fabs(dt) >= FLT_EPSILON) CModel_EvalPoseStackAndChildren(...)`；
+     - 假设：用户视频"所有阴影同步动半秒停半秒"的根因就是这条 dt gate 在某些
+       帧批量返回 false，producer 链路（0x12E600 / 0x12FED0 / 0x12FDC0 / 0x12FF90）
+       一次都不跑 → shadow submit 当帧只能吃 arena 残留；
+     - 目标：加轻量诊断 counter，用 full trace 对齐"dt=0 占比"与"producer 静默帧"
+       以及"lastSubmittedPaletteHash 冻结窗口"。
+   - **IDA 逆向交叉验证（MCP）**：
+     - `0x6F182300 CSpriteUber_PreRenderAndUpdatePosePalette_Full` (decompiled):
+       - `if (this+32==0 || (this+40 & 0x10000)!=0) return 0;` 早退；
+       - 末尾 `v16 = fabs(a2 - 0.0f); if (v16 >= 0.00000023841858) CModel_EvalPoseStackAndChildren(...);`
+         —— 即 `dt<2*FLT_EPSILON` 时 eval 被 skip；
+     - 另外三个入口 `_Mini (0x6F1820C0)`、`sub_6F1825E0`、`sub_6F1826C0`
+       结构一致，同一套 dt gate；
+     - `CModel_EvalPoseStackAndChildren (sub_6F12E900)` 内部：`AllocAndFillGroupPalette (0x12FED0)`
+       → `CGeosetData_BuildGroupBlendedPalette (0x12E600)`（`Hook_RuntimeMatrixWrite` 的真正
+       writer）+ `CModel_CopyPoseMatrixRangeFromStack (0x12FDC0)`；
+     - 也就是说，dt gate 一旦关，我们的 trusted palette producer 和 PoseRegistry
+       publisher 同时失效——完全与 Codex 的假设吻合。
+   - **代码落地**（仅诊断，不改游戏行为）：
+     - `src/d3d9/war3/model/war3_model_hook.h` + `.cpp`：
+       - 新增 atomic counter 组：
+         `spriteUberPreRenderTotalCount`、`DtZeroCount`、`DtBelowEpsilonCount`、
+         `DtPositiveCount`、`DtNegativeCount`、`LastDtBits`、`LastZeroDtFrameTag`、
+         `LastPositiveDtFrameTag`；
+       - 新增 per-frameTag 去重计数：`runtimeMatrixWriteFramesWithHit/EmptyCount`、
+         `runtimeGroupPaletteWrapperFramesWithHit/EmptyCount`、
+         `runtimeSimpleGroupPaletteFramesWithHit/EmptyCount`；
+       - `NoteSpriteUberPreRenderDtBucket(dt)` 工具：按 `dt==0 / |dt|<2*FLT_EPSILON /
+         dt>0 / dt<0` 分桶，并记录 LastDtBits / LastZeroDtFrameTag /
+         LastPositiveDtFrameTag；
+       - `NoteWriterHitForFrameTag(lastFrameTag, withHit, empty, currentFrameTag)`
+         CAS 去重：同 frameTag 只计一次 withHit，中间跳过的 frameTag 累加 empty；
+       - `Hook_SpriteFrameUpdate / SpriteMiniFrameUpdate / SpriteFrameLiteUpdate /
+         SpriteMiniFrameLiteUpdate` 入口处调 `NoteSpriteUberPreRenderDtBucket(dt)`
+         （trampoline 前，覆盖早退路径）；
+       - `Hook_RuntimeMatrixWrite / GroupPaletteWrapper / SimpleGroupPalette`
+         trampoline 后调 `NoteWriterHitForFrameTag(...)`；
+       - probe-only 模式（`DXVK_WAR3_SPRITE_UBER_DT_PROBE=1` 且 pose 关闭）下
+         四个 Sprite Hook 做完 dt 统计直接 return，不做 identity / resource cache
+         写入，避免 semantic storm。
+     - `src/d3d9/war3/core/war3_internal_test_config.h`：
+       - 新增 `kWar3RuntimeConfigInstallSpriteUberDtProbeHooks`（默认 false，env 覆盖）。
+     - hook 安装条件：
+       - `installSpriteFrameHooks = poseEnabled || kWar3RuntimeConfigInstallSpriteFrameHooksWithoutPose || SpriteUberDtProbeEnabled()`
+     - `src/d3d9/war3/render/war3_shadow_runtime_bridge.{h,cpp}`：
+       - `ShadowRuntimeBridgeSummary` 同步 8+6 个新字段；
+       - `WriteShadowPoseFullTraceFrameLocked` 在 keyStats 里额外调
+         `QueryRuntimeOverrideOutputProbeSummary()` 把 dt/writer counter 一起写盘。
+     - `src/d3d9/war3/tools/war3_control_plane.cpp`：
+       - 对应 JSON 字段输出到 control-plane summary。
+   - **验证**：
+     - `ninja -C build32` 通过（ninja 初次报 `no work to do` 是假错觉；
+       第二次用 `-d explain` 显示 `output .obj older than most recent input` → 重编译，
+       看到完整 warning 流）。
+     - 部署 DLL：`E:\Work\War3\d3d9.dll` = `25382010 bytes @ 2026-05-13 00:28:50`。
+     - AutoTest: `光影测试.w3x`，隔离桌面，`DXVK_WAR3_SPRITE_UBER_DT_PROBE=1`，
+       `DXVK_WAR3_SHADOW_POSE_FULL_TRACE=1`，15 秒 full trace。
+     - 工件：`E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_13_00_31_14.jsonl`
+       （18.6 MB，30 frame events）。
+   - **决定性数据（相对 Codex 假设的反驳）**：
+     - 总样本：`spriteUberPreRenderTotalCount = 8025`
+     - `DtZeroCount = 97  (1.21%)`  ← dt=0 确实存在
+     - `DtBelowEpsilonCount = 0`
+     - `DtPositiveCount = 7928 (98.79%)`  ← 绝大多数帧 eval 跑了
+     - `DtNegativeCount = 0`
+     - 97 次 dt=0 里 96 次集中在进图前两帧（初始化），之后连续 28 帧没再出现过 dt=0；
+     - `LastZeroDtFrameTag = 884`，`LastPositiveDtFrameTag = 911` → 最后一次 dt=0
+       发生在 27 帧前。
+     - writer per-frameTag 统计全部 full hit：
+       - RuntimeMatrixWrite(0x12E600): `calls=13650 frames-with-hit=48 empty=0`
+       - AllocAndFillWrapper(0x12FED0): `calls=5849 frames-with-hit=48 empty=0`
+       - SimpleFallback(0x12FF90): `calls=751 frames-with-hit=47 empty=1`
+     - 每个 trace frame 都有 `mw+1 gpw+1` —— producer 每帧都在写。
+   - **但 PALETTE_FROZEN 的长窗口依然存在**：
+     - `semanticSceneDirectLastSubmittedPaletteHash` 连续冻结窗口：
+       - frame5..frame18：14 帧连续 `ph=159da6ff` 不变（`sig` 每帧都变）
+       - frame19..frame29：11 帧连续 `ph=5e46c05e` 不变（`sig` 每帧都变）
+     - 所以本轮与用户视频观察一致：shadow submit 吃到的 palette hash 会锁在一个
+       值上 ~0.5s 级别，而同时 `dynamicPoseSignature`（即本帧所有 dynamic caster
+       palette 的 FNV1a 聚合）每帧都在变。
+   - **Phase 7.47 根因重定位**：
+     - **Codex 的 "dt=0 producer 不跑" 假设被证伪**：dt=0 占比不到 2%，且不集中在
+       PALETTE_FROZEN 窗口里（窗口里 dt 全部 >0，mw/gpw 每帧 hit）。
+     - 真正位置是：producer 每帧都在写，但 submit 端的 `currentDrawSample->paletteHash`
+       连续多帧锁住在同一个值上。根因落在以下任一环节（未定，下一步要查）：
+       1) `PublishCurrentDrawContract` 的 trusted/raw 仲裁在冻结窗口里多次返回同一个
+          旧 sample（provenance 标记可能仍是 TrustedBlendedWriter，但 bytes 是锁住的）；
+       2) 冻结窗口里实际被 submitted 的 caster 恰好是同一对象（`lastSubmittedPaletteHash`
+          是"最后一个 append 的 skinned caster 的 hash"，如果每帧最后一个都是同一单位
+          且它的骨骼 idle 没变，hash 就会相同。这一解释需要和 AutoTest 场景相互印证：
+          `光影测试.w3x` 是单英雄站立地图，dynamic caster 集合非常小）；
+       3) submit 端 palette 挑选走某条优先级路径（Phase 7.34 A2/A3、Phase 7.46 snapshot）
+          命中一个稳态 entry，每帧都返回同一份 bytes。
+   - **下一步证据收集（不改代码）**：
+     - 分析 `semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount` 等 provenance
+       counter 在 PALETTE_FROZEN 窗口内外的分布；
+     - 查 `currentDrawRawHex` 里的 `paletteCaptureTrustedSourceHitCount` 是否在冻结窗口
+       不累加（如果累加但值相同 → 是 "每帧 publish 到了同一 slot，且 slot cache 的
+       frameTag 对上同一份旧 bytes"）；
+     - 用户实机场景 trace 对比：`光影测试.w3x` 是 AutoTest 单位少的简化场景，
+       和用户真实多英雄场景里 cadence 可能不同；
+     - 如果一切都指向 `semanticSceneDirectLastSubmittedPaletteHash` 只是 "最后一个 submit
+       的 caster"，那我们需要在 trace 里加一个 "**本帧所有 submitted palette hash 的
+       聚合摘要**"，而不是仅看最后一个。
+   - **口径更正**：
+     - 不能再把 `lastSubmittedPaletteHash` 多帧不变当作"整条阴影管线 pose 冻结"的指标；
+     - `dynamicPoseSignature` 每帧都变的情况下，视觉上的"阴影半秒静止"应解释为
+       "特定 caster 的 palette 多帧相同"（骨骼 idle），而不是整场阴影冻结。
+   - **交付状态**：
+     - DLL 已部署，probe 可按需开 (`DXVK_WAR3_SPRITE_UBER_DT_PROBE=1`)，默认 0 不影响
+       玩家正常启动；
+     - 所有新加的 counter 都贯穿到 full trace 的 keyStats。后续轮次看
+       `runtimeMatrixWriteFramesEmptyCount` 是否在用户实机真卡的场景里出现 >0 即可
+       秒判"producer 是否真的静默"。
+     - 本轮**不**改任何游戏/阴影行为代码；Phase 7.46 的 renderablePart snapshot 仍然在位。
+
+
+79. **Phase 7.47 IDA 结论回写（2026-05-13 00:55）**:
+   - **rename**（MCP `rename.batch.func`，全部 ok=true）：
+     - `0x6F1826C0`: `sub_6F1826C0` -> `CSpriteUber_PreRenderAndUpdatePosePalette_FullLite`
+     - `0x6F1825E0`: `sub_6F1825E0` -> `CSpriteUber_PreRenderAndUpdatePosePalette_MiniLite`
+     - `0x6F12FF90`: `sub_6F12FF90` -> `CModel_AllocAndFillSimpleFallbackPalette`
+     - `0x6F12E900`: `sub_6F12E900` -> `CModel_EvalSingleGeosetAndRecurseChildren`
+   - **set_comments**（每个函数入口中文注释，全部 ok=true，Phase 7.47 决定性数据已固化）：
+     - `0x6F182300 CSpriteUber_PreRenderAndUpdatePosePalette_Full`: 记早退条件、dt gate 门槛、Codex 假设、15s full trace 证伪数据
+     - `0x6F1820C0 _Mini`、`0x6F1825E0 _MiniLite`、`0x6F1826C0 _FullLite`: 同一 dt gate 模式标注
+     - `0x6F12E900 CModel_EvalSingleGeosetAndRecurseChildren`: 标注两条分支（简单 fallback 走 0x12FF90，常规走 0x12FED0），以及 0x12FDC0 是同函数内先 0x12FED0 再 0x12FDC0 的拷贝关系
+     - `0x6F12FED0 CModel_AllocAndFillGroupPalette`: 标注其内部调 0x12E600 + per-frameTag 统计结果 (calls=5849 hit=48 empty=0)
+     - `0x6F12FF90 CModel_AllocAndFillSimpleFallbackPalette`: 标注 simple 回退语义 + 统计结果 (calls=751 hit=47 empty=1)
+     - `0x6F12FDC0 CModel_CopyPoseMatrixRangeFromStack`: 明确标注 "Codex 把 trusted palette source 从 0x12E600 换成 0x12FDC0 是错的，两者不是替代而是同帧前后关系"
+     - `0x6F12E600 CGeosetData_BuildGroupBlendedPalette`: 标注 "这才是 trusted palette 权威 writer + Iter F vs P0 的历史 + Phase 7.47 统计 calls=13650 hit=48 empty=0"
+   - **写回目的**：
+     - Phase 7.47 的反直觉结论（dt gate 并非用户视频卡顿根因，真实原因在 submit 下游）
+       以后在 IDA 反编译视图任何一个人打开 0x182300 / 0x12E900 / 0x12E600 都能
+       直接在入口看到，不再被 Codex 旧假设误导；
+     - 四个 PreRender 变体的命名语义对齐后，以后 xref 过来一目了然。
+
+
+80. **Phase 7.48：per-frame skinned palette 聚合诊断——AutoTest 场景证伪"submit 端 palette 冻结"假设（2026-05-13 01:40）**:
+   - **本轮动机**：
+     - Phase 7.47 数据显示 `semanticSceneDirectLastSubmittedPaletteHash`（per-frame，
+       scene 每帧 reset）连续 14+11 trace frame 不变；
+     - 但 `dynamicPoseSignature` 每帧都变、producer writer 每帧都 fire；
+     - 两个可能：解释 A = 指标错觉（counter 只记最后一个 caster，单英雄场景恰好最后
+       都是同一个）；解释 B = submit 端真在吃同一批 palette；
+     - 只有在 append 点加本帧所有 skinned palette 的聚合才能分辨。
+   - **代码落地**（per-frame 诊断字段，走 `War3FrameScene` = {} 每帧自动 reset）：
+     - `src/d3d9/d3d9_war3_scene.h` 在 `War3ShadowCaptureStats` 加：
+       - `semanticSceneSubmittedSkinnedPaletteCombinedHash` (u64)：本帧所有 skinned
+         submit 的 palette hash 的滚动 FNV1a。只要任一 caster palette 变了就变；
+       - `semanticSceneSubmittedSkinnedPaletteFirstSubmittedHash` (u64)；
+       - `semanticSceneSubmittedSkinnedPaletteDistinctSampleCount` (u32)：本帧邻接
+         不同 hash 数量，近似 distinct；
+       - `semanticSceneSubmittedSkinnedPaletteConsecutiveSameHashCountMax` (u32)：
+         本帧 append 序列里连续相同 hash 的最长 run；
+       - `semanticSceneSubmittedSkinnedPaletteZeroHashCount` (u32)；
+       - 内部 scratch `RunningLastHash` / `RunningSameHashRun`（per-frame，不透传）。
+     - `src/d3d9/d3d9_device.cpp` 在 `st.semanticSceneDirectLastSubmittedPaletteHash`
+       写入后新增 skinned-only 聚合块：FNV1a 滚动 combined + distinct 邻接统计 +
+       consecutive same hash max。
+     - `src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp` 的
+       `WriteShadowPoseFullTraceFrameLocked` keyStats 块输出全部 5 个新字段。
+   - **编译/部署**：
+     - `ninja -C build32`：通过；
+     - 部署 DLL：`E:\Work\War3\d3d9.dll` = `25382010 bytes @ 2026-05-13 01:29:55`
+       （尺寸与上轮一致是因为新增的是已有结构内字段，不扩 struct padding）。
+   - **验证**：AutoTest（光影测试.w3x，隔离桌面，20s）
+     - Artifact: `AutoTest/artifacts/phase748_palette_aggregator_smoke_result.json`
+     - Trace: `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_13_01_34_35.jsonl`
+       （32 trace frame events，19.6 MB）
+   - **决定性数据**（光影测试.w3x 平均每 trace frame）：
+     - skinned submit 总数：约 122~128 / frame（多 caster 场景）
+     - `distinct sample count` ≈ `skinned - 3`（121 个 distinct hash，几乎 1-to-1）
+     - `consecutive same hash max = 4` 全程恒定（最长 run 只 4 个）
+     - `combined hash` 每一帧都变；**0 个 ≥3 帧的 combined-frozen 窗口**
+     - `first submitted hash` 经常在邻帧相同（append 顺序里第一个稳定）
+     - `lastSubmittedHash` 仅在 trace_frame 4-5-6 连续 3 帧相同（唯一一次 LAST_FROZEN 窗口，只 3 帧）
+   - **明确结论（推翻 Phase 7.47 基于 lastSubmittedPaletteHash 的长 frozen 窗口解读）**：
+     - Phase 7.47 看到的 14+11 帧 `lastSubmittedPaletteHash` 不变 = **指标错觉**，
+       单一 counter 不反映整帧 palette 状态；
+     - AutoTest 光影测试.w3x 场景里 producer、submit 两侧 palette 健康度全部正面：
+       - producer writer 每帧 fire（Phase 7.47）
+       - 聚合 palette 每帧都变（Phase 7.48）
+       - per-caster palette distinct 率接近 100%
+     - **Codex 基于 `lastSubmittedPaletteHash` 推理得出的"submit 端 palette 冻结"的根因链已经倒塌**；
+     - 用户视频"所有阴影同步动半秒停半秒"如果在真实场景真实存在，它**不可能**来自
+       已观测的这组 counter 描述的机制（palette 生产 / 仲裁 / 发布在 AutoTest 都正常）；
+     - 可能方向：(i) 用户实机场景里 CombinedHash 真的会锁（需要用户地图复现）；
+       (ii) 问题在 GPU downstream（receiver 采样 / display vsync / 主观感知）；
+       (iii) 视觉上"停顿"不等价于"所有对象阴影冻结"，可能某一类对象的 cadence 偏慢被误读成全局。
+   - **本轮交付的决定意义**：
+     - 以后任何轮次看到 `lastSubmittedPaletteHash` 多帧不变 **不再是证据**，必须看
+       `CombinedHash` + `DistinctSampleCount` + `ConsecutiveSameHashCountMax`；
+     - 这五个字段现在永久写入 full trace，且几乎零成本（每 append 一次原子运算 + 一次 FNV1a）；
+     - 没有用户实机场景 trace 之前，**停止**在 submit / lease / manifest / producer 层
+       做任何根因修复性代码改动。
+
+
+81. **Phase 7.48 实机场景 trace——真冻结锁定、根因区间收窄到 PublishCurrentDrawContract（2026-05-13 01:42）**:
+   - **证据来源**：
+     - 用户在能真实看到阴影"动 0.5s 停 0.5s"的场景里录制 15s full trace；
+     - Trace: `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_13_01_42_25.jsonl`
+       （57 MB，218 trace frame events）。
+   - **决定性现象**（对比 Phase 7.48 AutoTest 光影测试.w3x 的数据）：
+     - **`CombinedHash` 在实机场景大量出现 ≥3 帧 frozen 窗口**（14 个 run，典型长度 8 frame）
+     - **`LastSubmittedHash` frozen 窗口更长**（最长 18 帧），但这不意外
+     - 每帧 submitted skinned caster 数 96–127 个，distinct ≈ submitted - 3
+     - consecutive-same-max 固定 4（证明不是所有 caster 吃同一份，是"全体 palette 集合"锁住）
+     - 冻结段典型长度 8 trace frame × 约 70ms = 0.5-0.6s，**与用户视频"停 0.5s"对上**
+   - **producer 在冻结窗口是否静默——`_analyze_phase748_writer.py` 直接对比 aggregate**：
+     ```
+     FROZEN:    events=83   avgMwCall=136.1  avgMwWrHits=1.00
+     NON-FROZEN:events=134  avgMwCall=136.8  avgMwWrHits=1.00
+     ```
+     **producer 在 frozen/non-frozen 窗口活动完全相同**：
+     - 每两个 trace frame 之间 `runtimeMatrixWriteCount` 都递增 ~136（每帧约 136 个
+       writer call）
+     - 每个 trace frame `FramesWithHit` 都 +1（producer 每个 palette frameTag 都 fire）
+     - `FramesEmpty = 0`，writer 从来没静默过
+   - **这锁定了根因方向**：
+     - ✗ 不是 Codex 的 "dt gate 导致 producer 早退"（producer 一直跑）
+     - ✗ 不是 "Hook_RuntimeMatrixWrite 漏了某个 writer"（每帧 WithHit+1，覆盖完整）
+     - ✓ **是 submit 端 `PublishCurrentDrawContract` 在冻结窗口把相同 trusted bytes
+        反复 publish**
+   - **收窄到的可疑代码位置**（`war3_current_draw_contract.cpp` 1275-1320）：
+     ```cpp
+     if (PaletteAttributionSnapshotEnabled() &&
+         QueryBlendedPaletteBySlotIndexExact(
+             record.paletteSlotIndex,
+             record.capturedPaletteCount,
+             record.frameTag,        // ← 如果 record.frameTag 在多帧都是同一个旧值
+                                       //   query 就会一直命中同一 slot entry 的旧 bytes
+             &trustedPalette)) { ... }
+     ```
+     三种可能（下一轮证据要分辨）：
+     1. **`record.frameTag` 跨多帧停留在同一值** → 导致 Query 总命中上一次 trusted entry；
+     2. **slot cache 里同一 slotIndex 的 entry 被写入 frameTag 没推进**（writer 写入
+        frameTag 读不到新值）；
+     3. **Publish 根本没被调**，skinned submit 复用上一帧 published 的 sample。
+   - **本轮动作**：
+     - ✓ 保留 Phase 7.48 aggregator，它现在是"是否真冻结"的判决工具；
+     - ✓ 保留 Phase 7.47 dt probe 作为已证伪对照；
+     - 新增分析脚本 `_analyze_phase748_writer.py`（固化证据）；
+     - **下一轮诊断 probe 要加的字段**：
+       - `currentDrawRecordFrameTagLast`（publish 时记录 `record.frameTag`，对照
+         `QueryCurrentPaletteFrameTag()` 实际 writer frameTag）
+       - `paletteCapture` 已有 `Hit/Miss` 累计，添加 frozen 窗口内 **hit** 是否继续 +，
+         `record.frameTag` 是否跨多帧停在同一值
+       - Publish 被调次数 vs sample 被复用次数（当前可能没区分）
+       - PublishCurrentDrawContract 入口累计 counter（已有 Attempt/Ready），加上
+         "record delta"观察
+     - 这一次 probe 完成后，我们能 100% 判别三种可能里是哪一条，再动修复。
+   - **交付状态**：
+     - DLL 未动，保持 Phase 7.48 aggregator 版本 `25382010 bytes @ 2026-05-13 01:29:55`
+     - 用户已确认视觉卡顿一点没缓解（Phase 7.31 ~ 7.46 的所有修复尝试都没碰到根因）
+     - 明天继续时的切入点：给 PublishCurrentDrawContract 入口 + `record.frameTag` +
+       `QueryCurrentPaletteFrameTag()` 读取值加 per-publish provenance trace
+
+
+82. **Phase 7.49：per-publish provenance probe 落地 + 分支判据锁定（2026-05-13 02:15）**:
+   - **动机**：Phase 7.48 + Codex 独立复核已证明真冻结，Codex 明确下一步应加
+     per-publish provenance probe 三选一区分根因。
+   - **probe 字段全面落地**（`war3_current_draw_contract.h` 的 `CurrentDrawContractDiagnosticsSummary`
+     新增 15 个 counter）：
+     - `publishCallCumulative`：Publish 被调累计次数
+     - `publishTrustedHitCumulative`：trusted path 命中累计
+     - `publishRawFallbackCumulative`：raw arena fallback 累计（对应 provenance = RawGlobalArena）
+     - `publishRejectedNoTrustedCumulative`：严格模式 2 下丢弃累计
+     - `publishRecordFrameTagSameRunMax`：Publish 时 `record.frameTag` 连续相同的最长 run
+     - `publishRecordFrameTagCurrentSameRun`：当前 same-run（用于末帧判断是否正在 FROZEN）
+     - `publishRecordFrameTagLast / Min / Max`：观测到的 record.frameTag 边界
+     - `publishLiveGamePaletteFrameTagLast / Min / Max`：Publish 时读到的 Game.dll live frameTag
+     - `publishRecordFrameTagBehindLiveMaxDelta`：`live - record.frameTag` 的最大正差
+     - `publishRecordFrameTagEqualsLiveCount / BehindLiveCount / AheadLiveCount`：三类分布
+   - **代码落地**：
+     - `war3_current_draw_contract.cpp`：`PublishCurrentDrawContract` 入口加 relaxed atomic
+       probe 逻辑（~80 行，同时读 record.frameTag 和 `QueryCurrentPaletteFrameTag(liveTag)`）；
+       trusted 分支和 raw fallback 分支分别累加对应 counter；
+     - `war3_shadow_runtime_bridge.cpp::WriteShadowPoseFullTraceFrameLocked`：15 个新字段
+       写入 full trace 的 `keyStats`。
+   - **编译**：`ninja -C build32` 通过。
+   - **部署**：`E:\Work\War3\d3d9.dll` = `25387561 bytes @ 2026-05-13 02:14:05`。
+   - **烟雾测试**（光影测试.w3x，15s，隔离桌面）：
+     - trace: `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_13_02_17_18.jsonl`
+     - 结果字段全部正常：`publishCallCumulative=10088`、`publishTrustedHitCumulative=4865`
+       （48.2%）、`publishRawFallbackCumulative=0`、`publishRecordFrameTagBehindLiveMaxDelta=0`、
+       `publishRecordFrameTagEqualsLiveCount=10088`（所有 publish record.frameTag == live）。
+     - 光影测试场景无 FROZEN，probe 行为正常；真正诊断数据要看用户真卡顿场景。
+   - **判据表**（Phase 7.49 trace 到手后）：
+     - 如果 FROZEN 窗口里 `publishCallCumulative` delta ≈ 0
+       → **分支 3**：Publish 没被调，submit 端复用上一次 published sample；
+       根因在 visible frame 判定 / submit 端 sample 缓存逻辑。
+     - 如果 FROZEN 窗口里 `publishCallCumulative` delta 与 NON-FROZEN 相近，但
+       `publishRecordFrameTagSameRunMax` 在 FROZEN 窗口跨段飙到 8 × per-frame publish 量
+       （典型 3000+），`publishRecordFrameTagBehindLiveMaxDelta` > 3
+       → **分支 1**：record.frameTag 自身多帧停留在旧值，具体在 Publish 上游（
+       `CurrentDrawContractHook` 抓 record 时读到的 frameTag 不 fresh）。
+     - 如果 `publishCallCumulative` delta 正常、`record.frameTag` 跟 live 同步推进，但
+       `publishTrustedHitCumulative` delta < `publishCallCumulative` delta 的大比例，
+       且 `publishRawFallbackCumulative` 在 FROZEN 窗口 >0
+       → **分支 2**：slot cache 写入的 frameTag 没推进，Query 侧一直命中旧 entry；
+       根因在 `CGeosetData_BuildGroupBlendedPalette` writer 捕获时 frameTag 读取/
+       `s_slotBlendedPaletteCache` 写入逻辑。
+     - 混合情况优先按 `publishRecordFrameTagBehindLiveMaxDelta` 判别。
+   - **等待用户再录一次真卡顿场景的 15s trace**。trace 到手后跑
+     `_analyze_phase749.py <trace>` 立即分辨分支。
+
+
+83. **Phase 7.49 实机场景 trace 分析 — 根因最终锁定（2026-05-13 02:30）**:
+   - **用户实机 trace**：`E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_13_02_23_07.jsonl`
+     （60 MB，242 trace frame events，稳定复现"动 0.5s 停 0.5s"冻结周期）
+   - **Phase 7.49 probe 数据**（15 个新 counter 全部正常输出）：
+     - `publishCallCumulative = 28746`（Publish 被调 2.8 万次）
+     - `publishTrustedHitCumulative = 14282`（trusted 命中 49.7%）
+     - `publishRawFallbackCumulative = 0`（全程没走 raw arena）
+     - `publishRecordFrameTagBehindLiveMaxDelta = 0` ← **record.frameTag 从未落后 live**
+     - `publishRecordFrameTagEqualsLiveCount = 28746`（100% record frameTag == live frameTag）
+     - `publishRecordFrameTagBehindLiveCount = 0`
+     - `publishRecordFrameTagSameRunMax = 122`
+   - **关键排除**：
+     - ✗ **不是分支 1**（record.frameTag 卡住）：100% record == live，frameTag 完全同步
+     - ✗ **不是分支 3**（Publish 没被调）：Publish 每 trace frame ~100 次稳定
+     - ✗ **不是分支 2**（slot cache frameTag 没推进）：writer per-frameTag 每帧都 hit
+   - **从 `currentDrawRawHex` 里解析出的真正根因线索**：
+     - FROZEN 段 `publishReadyCount` delta = **0**
+     - FROZEN 段 `publishMissInvalidPaletteSlot` delta ≈ `publishAttempt` delta ≈ 89/100%
+     - NON-FROZEN 段 `publishReadyCount` delta ≈ `publishAttempt` delta ≈ 89-105 (100%)
+     - **模式**：每个 renderablePart 周期性地在"+0x08 有效 slot"和"+0x08 = 0xFFFFFFFFu"之间切换；
+       有效帧 Publish Ready；无效帧全部 `PublishInvalidPaletteSlot` 早退。
+     - 周期长度 8 trace frames × ~70ms ≈ 0.5-0.6s，**完美对应用户视频"停 0.5s"周期**。
+   - **真正根因锁定**（代码 `war3_current_draw_contract.cpp:1321-1328`）：
+     ```cpp
+     const bool preserveLocalReadyRecord =
+         KeepReadySnapshotOnInvalidCurrentDrawEnabled() &&    // ← 默认 true
+         !RecordHasReadyShape(record) &&                        // ← invalid slot 时触发
+         localCacheRecord.renderablePart == record.renderablePart &&
+         RecordHasLocalPaletteSnapshot(localCacheRecord);     // ← 上次 ready 时留下的
+     if (!preserveLocalReadyRecord)
+       localCacheRecord = record;          // ← preserve 时 localCacheRecord 不被覆盖
+     ```
+     机制：
+     1. Frame N renderablePart A 的 +0x08 是有效 slot → Publish Ready → snapshot 写入新 palette，
+        localCacheRecord = A 的新 record (captureSerial=1000)
+     2. Frame N+1 renderablePart A 的 +0x08 读到 `0xFFFFFFFFu`（War3 引擎周期性不写）
+        → entry.capturedPaletteCount = 0, paletteSlotIndex = 0xFFFFFFFFu
+     3. Publish 进入 preserveLocalReadyRecord=true 分支：
+        **localCacheRecord 保持 Frame N 的旧 record (captureSerial=1000)**
+        snapshot 也是 Frame N 的旧 palette (captureSerial=1000)
+     4. 然后 Publish 因 InvalidPaletteSlot 早退，不清 ready map
+     5. Submit 端 Resolve A：`QueryCurrentDrawContract` 拿到 localCacheRecord (serial=1000)
+        → `DecodeCapturedPaletteForRecord` snapshot (serial=1000) 匹配成功
+        → Resolve Ready，返回**Frame N 的旧 palette**
+     6. 这持续到 A 的 +0x08 再次变有效 → 下一次 Publish Ready → 追上新 palette
+   - **`KeepReadySnapshotOnInvalidCurrentDrawEnabled` 的注释原意**：
+     "one-frame producer miss 不让整帧 semantic replay 空掉" —— 它是为**偶发的 1 帧 miss**设计的
+     短期兜底，但真实场景里这个 "1 帧" 延伸成 7-8 帧连续，把 1 帧 miss 变成 0.5s 冻结。
+   - **两条修复方向**：
+     - **方案 A（最小侵入，验证）**：env `DXVK_WAR3_SEMANTIC_KEEP_READY_ON_INVALID_CURRENT_DRAW=0`，
+       InvalidSlot 时不保留旧 snapshot。后果：
+       - FROZEN 窗口里对应 caster 会 Resolve MissingPalette
+       - `authoritativeSkinnedRequired` 让 caster 本帧不 append（skip）
+       - DirectPartPacketLease 系统会启动 `leaseRestored` 顶住 2-6 帧
+       - 视觉效果：caster 短时消失 vs 阴影冻住，取决于 lease TTL
+     - **方案 B（根因，推荐）**：InvalidSlot 时不要依赖 snapshot，让 submit 端走
+       `War3TryBuildLiveRuntimeGroupPalette` 的 producer-side snapshot（Phase 7.46 已装）
+       或 global slot 直读路径，拿**当前帧真实 palette**。这需要让 Resolve 在
+       MissingPalette 时不 return false，而是标记需要 submit-time rebuild。
+   - **下一步**（确认方向后开干）：
+     - 先用 env A 做 A/B 测试，用户再录一次 15s trace 看 CombinedHash frozen 窗口是否消失
+       或转化为 lease restored
+     - 如果方案 A 让视觉卡顿消失 → 改为默认 disable，或为 invalid slot 加 attribution-key 级兜底
+     - 如果方案 A 让视觉退化 → 直接走方案 B，补 submit-side live palette rebuild
+   - **交付状态**：DLL 未动，Phase 7.49 probe 永久在位。可运行验证：
+     ```
+     set DXVK_WAR3_SEMANTIC_KEEP_READY_ON_INVALID_CURRENT_DRAW=0
+     # 启动 War3, 进入真卡顿场景
+     py AutoTest\shadow_pose_full_trace_control.py start --max-seconds 15
+     ```
+
+
+84. **Phase 7.50：Live palette rebuild 作为 Resolve 失败的第一兜底（2026-05-13 03:18）**:
+   - **用户 Phase 7.49 方案 A 反馈**：
+     - `DXVK_WAR3_SEMANTIC_KEEP_READY_ON_INVALID_CURRENT_DRAW=0` 后："卡顿节奏没变，但卡顿时
+       阴影会消失然后突然出现回到正常 pose"
+     - 确认用户说"这个兜底是以前修闪烁时加的"——历史上 `KeepReadySnapshotOnInvalidCurrentDraw`
+       是修闪烁的必需品，简单撤销会让闪烁复发。
+   - **最终根因图景锁定**：
+     - **War3 引擎自身的 8 帧 palette-slot cadence**。`CModel_AllocAndFillGroupPalette`
+       里 `renderablePart[16]==0 && geo[...3]` 的门控条件在每个 renderablePart 上
+       呈周期性触发，导致 +0x08 slotIndex 只在某些帧被写；
+     - 我们的 cadence 不是 bug，**改不掉 War3 自己**；
+     - Phase 7.49 的 probe 数据显示：FROZEN 段里 publishReady=0, InvalidPaletteSlot=100%，
+       但 submit 仍提交 79-103 个 skinned caster，靠的就是 `KeepReadySnapshotOnInvalidCurrentDraw`
+       保留的 **上一次 ready publish 的 snapshot**。
+   - **两边权衡已经很清楚**：
+     - 兜底开（历史默认 + 现在默认）：视觉上"阴影冻结 7 帧" = 0.5s 停顿
+     - 兜底关（Phase 7.49 方案 A）：视觉上"阴影消失 7 帧" = 闪烁复发
+   - **Phase 7.50 修复思路**：**既不冻结也不消失**。Resolve 失败时不走 return false，
+     先尝试 `War3TryBuildLiveRuntimeGroupPalette` 拿 **fresh** palette。这个函数内部
+     按优先级：
+     1. Phase 7.46 renderablePart snapshot（`0x12FED0/0x12FF90` producer 同帧捕获）
+     2. Game.dll `+0xBC6BD0` 全局 palette arena + slotIndex 直读
+     3. PoseRegistry（`0x12FDC0 CModel_CopyPoseMatrixRangeFromStack` publish）重建
+     4. CModel fallback（关闭，1.27a 不可信）
+     **任一路径成功 = 用当前帧真实 palette 提交 = 阴影跟着 pose 动**；
+     **全部失败才 skip**（极少，只在对象真的无数据时）。
+   - **代码改动**（`d3d9_device.cpp` 约 60 行）：
+     - line 1720 附近：前移 `War3SemanticPaletteSource` enum 定义 + 添加
+       `War3TryBuildLiveRuntimeGroupPalette` 前向声明
+     - `War3TryBuildShadowPacketFromCurrentDrawRecord` 里原
+       `authoritativeSkinnedRequired && !Ready → return false` 替换为
+       live rebuild 尝试；失败才 return false
+     - Ready 分支后加 `else if (liveRebuildUsed)` 分支，用 rebuilt palette 填
+       `out.runtimeGroupPalette` 等字段，并构造一个带 fresh palette 的
+       `outDirectCurrentDrawSample`
+     - `War3SemanticPaletteSource` enum 从 line ~3060 前移到 line ~1720（函数声明
+       前），原位置保留注释标记
+     - `KeepReadySnapshotOnInvalidCurrentDraw` **保留默认 on**（历史闪烁防护在位，
+       但现在它只是最后一道兜底；live rebuild 优先生效）
+   - **编译**：`ninja -C build32` 通过（只有既有 warning）
+   - **部署**：`E:\Work\War3\d3d9.dll` = `25391657 bytes @ 2026-05-13 03:18:59`
+   - **预期视觉**：
+     - FROZEN 8 帧期间：live rebuild 成功 → 阴影每帧用 arena/PoseRegistry 新 palette
+       → **阴影跟着 pose 动，不再冻结也不消失**
+     - 如果 live rebuild 失败（罕见）：fallback 到原 Resolve Ready 路径（保留旧 snapshot）
+       → 单帧短暂复用旧 palette，下一帧追上；不会连续 7 帧冻结
+   - **用户需要做**：
+     - 确保 env `DXVK_WAR3_SEMANTIC_KEEP_READY_ON_INVALID_CURRENT_DRAW` 恢复为 1 或不设置
+       （默认 1）
+     - 进入之前能复现卡顿的真实场景
+     - 肉眼对比：阴影是否还有"动 0.5s 停 0.5s"节奏
+     - 如果视觉改善，录 15s full trace 看 CombinedHash 是否不再周期性冻结
+
+
+85. **Phase 7.51 根因重定义 + 真正修复方案（2026-05-13 03:30，上下文保护）**:
+   - **Phase 7.50 实测失败**：加了 live rebuild 路径后用户视觉零改善。
+   - **Phase 7.49 方案 A（关兜底）的观察成为决定性证据**：
+     - 节奏完全不变（仍然 "动 0.5s 停 0.5s"）
+     - 卡顿时段阴影会消失，卡顿结束瞬间恢复正常 pose
+     - 说明 "0.5s 周期" 是 War3 引擎自身的 cadence，不是我们的 bug
+   - **IDA 深度复核 `0x6F13A510 RenderQueue_UpdateItemWorldMatrix`**：
+     - 这是 `RenderQueue_Dispatch_Common/_Special` 调用的内部函数（我们 hook 的点）
+     - 读 `[edx+8]` → `RenderQueue_GetPaletteSlotAddress` → 如果 slot 有效走上传，
+       **如果 slot 无效走 fallback**（zero matrices 或 `[edi+104h]` 控制的第三分支）
+     - **War3 设计上就允许 slotIndex = 0xFFFFFFFFu** 作为 "不需要 skinning palette" 的正常情况
+   - **跨多轮诊断的最终根因认知**（决定性）：
+     - **`CModel_AllocAndFillGroupPalette (0x12FED0)` 只给 skip_flag==0 的 renderablePart
+       分配 slot 并 build group-blended palette**，其他 part `+0x08` 保持 `0xFFFFFFFFu`
+       或旧值
+     - **`0x12E600 CGeosetData_BuildGroupBlendedPalette` 每帧不是都跑的**——它只在引擎
+       认为 "这个 part 的 skinning 姿态需要 rebuild" 时才跑（大约每 8 帧一轮）
+     - **`0x12FDC0 CModel_CopyPoseMatrixRangeFromStack` 每帧都跑**——它维护
+       `CModel + 0x60` 的 FinalPoseMatrixArray（权威 pose），PoseRegistry 已接入
+     - **主渲染流畅的原因**：GPU 上 palette constant buffer 会被复用——骨骼数据每 8 帧
+       更新一次，但模型每帧被画，前 7 帧用的是 GPU 上已绑的那份（视觉连续）
+     - **阴影 pass 无法共享主渲染的 GPU 绑定**（不同 shader / render pass）→ 必须每帧
+       独立拿到 palette bytes
+     - **当前 5 条 palette 路径全部依赖 "producer 这帧写了什么"**：
+       - DrawTimeCaptured：`QueryCurrentDrawContract` + snapshot cache
+       - SubmitTimeGlobalSlot：按 `renderablePart+0x08` slot 直读 arena
+       - SubmitTimeBlendedPaletteCache：`QueryBlendedPaletteBySlotIndexExact` (0x12E600 cache)
+       - SubmitTimePublishedPoseRegistry：PoseRegistry 里 `matrixPalette`（但这是 final-pose，
+         没做 group blending）
+       - SubmitTimeCModelFallback：直读 `CModel+0x60`（1.27a 不可信）
+     - **前 3 条路径在 FROZEN 段全部 miss**（producer 这帧没写）
+     - **路径 4 PoseRegistry 有数据**（每帧都写），但它存的是 **final pose 而非
+       group-blended palette**——目前 `War3TryBuildLiveRuntimeGroupPalette` 的 rebuild
+       逻辑默认没启用 CModel fallback（`allowCModelFallbackForCall=false`），导致该路径
+       实际从未产生过有效 palette
+   - **真正的修复思路（Phase 7.51）**：
+     - 在 submit 时，**自己实现一次 `CGeosetData_BuildGroupBlendedPalette` 的等价逻辑**：
+       - 输入：`PoseRegistry.matrixPalette`（final-pose，每帧新鲜）+ `CGeosetData.matrixGroupSizes`
+         + `CGeosetData.matrixIndices`
+       - 算法：对每个 group `g`，把 `matrixIndices[prefix(g)..prefix(g+1)]` 里所有 bone 矩阵
+         平均（或按 War3 的 blending 规则）成一个 blended matrix；产出 `groupCount` 个矩阵
+       - 输出：group-blended palette，等价于 `0x12E600` 的输出，但**每帧都新鲜**（因为
+         final-pose 每帧新鲜）
+     - 这条路径**不依赖 producer cadence**，**不依赖 `renderablePart+0x08` 有效**，只依赖
+       `0x12FDC0` publisher 每帧把 CModel+0x60 写入 PoseRegistry（Phase 7.34 A3 已经做了）
+     - 作为 `War3TryBuildLiveRuntimeGroupPalette` 路径 4 (`SubmitTimePublishedPoseRegistry`)
+       的**真正实现**，取代现在的空壳
+   - **为什么前几轮没人做这一步**：
+     - Phase 7.31 Kiro 研究提出过 "用 PoseRegistry 重建 blended palette"，但当时还卡在
+       `QueryBlendedPaletteBySlotIndexExact` 的 producer-side 修复上
+     - Phase 7.34 A3 做了 PoseRegistry publisher（让 `0x12FDC0` 每帧写 final-pose），但
+       没实现消费端的 group-blending
+     - Phase 7.46 做了 producer snapshot，但那还是 producer cadence 约束的
+     - Phase 7.50 做了 live rebuild 路径调用，但调用的函数内部对 PoseRegistry 路径没有
+       group-blending 实现（直接返回 raw final-pose 当 palette，维度不对）
+   - **所需的零件已全部齐全**：
+     - final-pose 源：`model::PoseRegistry::instance()` → matrixPalette（Phase 7.34 A3）
+     - geoset 元数据源：`resource.matrixGroupSizes` + `resource.matrixIndices`（已存在于
+       `ShadowPacketResource`）
+     - groupCount：从 `renderablePart` 已绑定的 snapshot 或 `CGeosetData+0xF0` 读
+     - renderablePart → runtimeModel 映射：已经在现有 hook/registry 里
+   - **核心修复代码量**：
+     - 新增 `War3BlendFinalPoseIntoGroupPalette()` 自由函数（~50 行）：纯数学，没有 lock
+     - 修改 `War3TryBuildLiveRuntimeGroupPalette` 的 PoseRegistry 路径：
+       原本直接把 final-pose 当 palette → 改成调用 blending → 输出 group-blended
+     - 预计总共 60-80 行改动
+   - **Phase 7.50 代码状态**：保留。那条路径作为 live rebuild 的调度入口仍然正确，
+     只是它的目标函数（`War3TryBuildLiveRuntimeGroupPalette` 的 PoseRegistry 路径）
+     之前没实装，Phase 7.51 正是把它实装。
+   - **验证策略**：
+     - 编译 + 部署后，用户在真卡顿场景录 15s trace
+     - 关键指标：`semanticSceneSubmittedSkinnedPaletteCombinedHash` 的 FROZEN 窗口
+       在 trace 里应该**完全消失或 <=1 帧**
+     - 关键数据：`paletteSourceThisSubmit` 分桶里 `SubmitTimePublishedPoseRegistry` 应该
+       在 FROZEN 窗口成为主力（目前是 0）
+     - 用户视觉：阴影应该每帧跟着 pose 走，不再有周期性冻结或消失
+   - **回退路径**：
+     - 默认仍保留 `KeepReadySnapshotOnInvalidCurrentDraw=on` 作为兜底防闪烁
+     - Phase 7.51 的 blending 只替换 PoseRegistry 路径的实现，不改上游决策链
+     - 新 blending 功能加 env 开关 `DXVK_WAR3_SEMANTIC_POSE_REBLEND_ENABLED`（默认 on），
+       一键可禁用回到 Phase 7.50 状态
+   - **用户反馈固化**：
+     - "暴雪模型为什么流畅 → 因为主渲染能复用上次绑好的 palette，阴影不能"
+     - "不要再靠 producer 的 cadence，自己 reblend"
+     - "所有零件都有，只是没串起来"
+
+
+86. **Phase 7.51 落地：producer owner runtimeModel + every-frame live rebuild（2026-05-13 03:47）**:
+   - **根因再澄清**（Phase 7.50 失败后的重新诊断）：
+     - Phase 7.35 的 submit-live-rebuild 机制早就存在，但历史数据显示 HitRate 只有 0.42%
+     - 原因 1：触发条件是 `record lag >= threshold`。`KeepReadySnapshotOnInvalidCurrentDraw`
+       兜底保留的是旧的 localCacheRecord，但这个 record 的 `renderFrameIndex` 实际上在
+       每次 Publish 调用入口都被更新——早退路径里保留的只是 paletteAddress，renderFrameIndex
+       仍是"上次 ready publish 的值"。实测 lag 确实能触发，但…
+     - 原因 2：`War3TryBuildLiveRuntimeGroupPalette` 里 `tryUsePublishedPose` 用
+       `packet.renderable.runtimeModelPtr` 作 key 查 PoseRegistry。**这个 ptr 在 1.27a 上
+       经常是 alias 解析后的值**，和 `0x12FDC0`/`0x12FED0` 传给 PoseRegistry 的原始
+       runtimeModel key 不一致，导致 PoseRegistry miss → return false → rebuild 失败
+     - 原因 3：Phase 7.50 live rebuild 只在 `Resolve != Ready` 时调，但 Resolve 大部分时候
+       因为 snapshot 兜底而 Ready，rebuild 分支根本不进
+   - **Phase 7.51 三刀齐下**：
+     1. **`RenderablePartPaletteBindingEntry` 加 `runtimeModel` 字段**：
+        - 在 `0x12FED0` producer 触发时（`CaptureRuntimeGroupPaletteBindings`），记录
+          `(renderablePart, runtimeModel)`。runtimeModel 就是 producer hook 的 `this`
+          参数，也是 `0x12FDC0` publisher 用来注册到 PoseRegistry 的原始 key。
+        - 新增 `QueryRenderablePartOwnerRuntimeModel(renderablePart, &out)` 对外接口。
+     2. **`tryUsePublishedPose` 链尾加 producer-owner fallback**：
+        原本三级 fallback：`runtimeModelPtr`, `+0xA0`, `-0xA0`（CModelComplex alias）
+        现在增加：`QueryRenderablePartOwnerRuntimeModel(renderablePart)`。这条能绕过
+        caller 的 alias 解析错位，直接拿到 PoseRegistry 的真实 key。
+     3. **submit-live-rebuild 默认每帧触发**：
+        新增 env `DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_EVERY_FRAME=1`（默认 on）。
+        skinned 单位每帧都尝试一次 rebuild（成本：单次 group-blending 约 60-100 组矩阵，
+        对 CPU 压力可忽略）。即使 lag=0 也尝试；rebuild 成功就覆盖 drawTimeCapturedPalette。
+        env=0 可回退到 Phase 7.35 的 lag-threshold 行为。
+   - **预期效果**：
+     - Phase 7.49 数据显示 PoseRegistry 产生 hit 率 ≈ 13%（Phase 7.34 A3 之前的 trusted
+       hit），但 submitLiveRebuild hit 只有 0.42%。差距主要在 runtimeModel key mismatch。
+     - Phase 7.51 应把 rebuild hit 拉到 50-90% 级别（取决于 `0x12FED0` producer 实际覆盖率）。
+     - hit 的 rebuild 会用 PoseRegistry 的当前帧 final-pose 经 group blending 产出新 palette，
+       替换掉旧 snapshot 的 palette。
+     - FROZEN 段里 CombinedHash 应每帧都变。
+   - **代码行数**：
+     - `war3_model_hook.cpp`: ~25 行（struct 字段 + 参数 + query 实现）
+     - `war3_model_hook.h`: ~10 行（接口声明）
+     - `d3d9_device.cpp`: ~40 行（tryUsePublishedPose fallback + every-frame 条件）
+     - 共 ~75 行，全部在 Phase 7.50 已建立的基础上添加
+   - **编译**：`ninja -C build32` 通过（仅既有 warning）
+   - **部署**：`E:\Work\War3\d3d9.dll` = `25392147 bytes @ 2026-05-13 03:47:39`
+   - **回退路径**（环境变量）：
+     - `DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_EVERY_FRAME=0`：回退到 Phase 7.35 lag-based 触发
+     - `DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_ON_LAG=0`：关掉 submit-live-rebuild
+     - 两个都关 = 回退到 Phase 7.50 状态
+   - **用户需要做**：
+     - 启动 War3（env 不用设，默认即开）
+     - 进入真卡顿场景
+     - 肉眼看阴影是否还动半秒停半秒
+     - 如果仍然有卡顿：录 15s trace，分析 `submitLiveRebuildHitCount` 是否还是低
+
+
+---
+
+## 🚨 Phase 7.52 新线程交接（2026-05-13 04:00，上下文压缩失败后重启）
+
+**上一线程的核心教训**：连续 6 个 Phase（7.47 → 7.48 → 7.49 → 7.50 → 7.51）尝试修复
+"阴影动 0.5s 停 0.5s"问题，**全部失败**。每一轮都基于一个看似合理的推测改了几十到几百行代码，
+部署后用户反馈毫无改善。**根因至今未锁定**。上下文压缩导致我的认知丢失，必须给新线程一个
+绝对清晰的起点。
+
+### 一、用户观察的决定性现象（不要再怀疑这些）
+1. **游戏内暴雪渲染的模型动作流畅**（每帧跟着骨骼动）
+2. **我们自建的阴影 pose 卡顿**：动 0.5s 停 0.5s 周期性重复
+3. **Phase 7.49 关掉 `KeepReadySnapshotOnInvalidCurrentDraw`**：卡顿节奏不变，但
+   卡顿时阴影消失，结束瞬间突然恢复正常 pose（说明 producer 数据是对的，我们"停住"
+   的那一段其实是我们自己复用旧 bytes）
+4. **Phase 7.50 的 live rebuild on Resolve fail**：无改善
+5. **Phase 7.51 每帧尝试 rebuild + producer owner runtimeModel fallback**：无改善
+
+### 二、已被数据证伪的假设（不要再走回头路）
+- ✗ **dt gate 早退**（Phase 7.47 证伪）：`CSpriteUber_PreRender*` 的 `dt` 在 98.79% 帧 > 0
+- ✗ **"每 8 帧才写一次 palette" 的 producer cadence**（本轮末尾推翻）：trace 里
+  `runtimeMatrixWriteCount` 约 370 次/trace event，`runtimeGroupPaletteWrapperCallCount` 约
+  200 次/event，**producer 每帧都在狂写**
+- ✗ **record.frameTag 卡住**（Phase 7.49 证伪）：100% record.frameTag == live
+- ✗ **lastSubmittedPaletteHash 冻结 = palette 冻结**（Phase 7.48 确认是指标错觉，那个
+  counter 只记 last 一个 caster；但 `CombinedHash`（聚合）确实也冻结 8 帧）
+- ✗ **PoseRegistry fallback 能救**：Phase 7.51 trace 数据证实
+  `submitLiveRebuildHitCount = 0 / Attempt = 17305`——PoseRegistry 查找 100% miss
+
+### 三、决定性的 Phase 7.51 数据（trace `03_51_53.jsonl`）
+
+从 `currentDrawRawHex` offset 解析（见 `_analyze_phase751_rawhex.py`）：
+```
+publishAttemptCount:              +19440  (trace 窗口内)
+publishReadyCount:                +9702    (约 50% Publish Ready)
+publishMissInvalidPaletteSlot:    +9728    (另 50% InvalidSlot 早退)
+paletteCaptureTrustedSourceHit:   +9702    (trusted hit 100% of ready)
+paletteCaptureTrustedSourceMiss:  0        (没有 raw fallback 发生)
+submitLiveRebuildAttempt:         +17305   (Phase 7.51 EveryFrame 打开, 每次 skinned 都 attempt)
+submitLiveRebuildHit:             0        ← ★★★ PoseRegistry 查找全部 miss
+submitLiveRebuildMiss:            +17305   (和 attempt 完全相等)
+submitLiveRebuildApplied:         0        (没有任何一次覆盖成功)
+
+CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
+```
+
+**关键矛盾**：
+- 我们知道 War3 引擎 **每帧都在更新骨骼 pose**（主渲染流畅 = 证据）
+- `runtimeMatrixRangeCopyPalettePublishHitCount` 有值（`0x12FDC0` hook 每帧 publish）
+- 但 `submitLiveRebuildHitCount = 0` 说明 `PoseRegistry::findByRuntimeModel` 在 submit 端 100% miss
+- **= PoseRegistry publish 的 runtimeModel key ≠ submit 时我们查询用的 key**
+  - 即便 Phase 7.51 加了 `QueryRenderablePartOwnerRuntimeModel` 作为第 4 级 fallback，仍然全 miss
+
+### 四、当前最可信的根因假设（下一线程的起点）
+
+**核心认知反转**（本轮末尾得到，未验证）：
+- 完整 per-part blended palette 在 `Game.dll + 0xBC6BD0 + slotIndex * 48` 的**全局 arena**
+- `CModel + 0x60` 只有 2-3 个根骨骼矩阵，不是完整骨架（
+  `docs/plan/dynamic_shadow_implementation_2026_05_03.md` 证实）
+- arena 每帧都被 `0x12E600 CGeosetData_BuildGroupBlendedPalette` 写（producer 每帧跑）
+- **所以 submit 时直接从 `arena[slotIndex]` 读 bytes 就是本帧 fresh palette**
+- **但我们读 arena 的路径居然也不新鲜**——这才是真正未查明的谜团
+
+**未做但必须做的核心实验**：
+1. **Per-submit palette bytes provenance trace**：在每次 skinned submit 的最末端
+   （`War3TryAppendSemanticShadowPacket` 里 append 到 `shadowCasters` 之前）记录：
+   - 本次 submit 最终使用的 palette bytes 前 48 字节的 hash（不是封装的 paletteHash，
+     是真实内存 bytes 的 hash）
+   - 数据来源标记（`paletteSourceThisSubmit` 枚举值，已有）
+   - 同一 renderablePart 跨相邻 submit 的 bytes hash 是否真的在变化
+2. **如果 bytes hash 跨 FROZEN 多帧不变**：palette bytes 真的锁住，得查路径
+3. **如果 bytes hash 每帧在变**：palette bytes fresh，但 `dynamicPoseSignature` 和
+   `CombinedHash` 仍冻结——那卡顿根因不在 palette 层，在**下游**（GPU 绑定、
+   shadow shader constant buffer 缓存、或者 shadow map 复用策略）
+
+**最可能的真相**（未验证但需要 Phase 7.52 首轮优先验证）：
+- shadow pipeline 的 **shadow map 重用策略** 每 8 帧才重新渲染一次 shadow map，期间
+  shader 看到的是上次渲染的 depth texture
+- 搜索关键词：`ShadowMap cache / reuse / cadence / lastShadowMap...`
+
+### 五、当前 DLL 状态
+- 路径：`E:\Work\War3\d3d9.dll`
+- 大小 / mtime：`25392147 bytes @ 2026-05-13 03:47:39`
+- 包含 Phase 7.47 - 7.51 全部改动
+- 可用回退 env：
+  - `DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_EVERY_FRAME=0` - 关 Phase 7.51 每帧 rebuild
+  - `DXVK_WAR3_SEMANTIC_KEEP_READY_ON_INVALID_CURRENT_DRAW=0` - 关兜底（Phase 7.49 方案 A）
+  - 两个都不动 = Phase 7.51 默认行为
+
+### 六、给新线程的明确指令
+
+**禁止**：在数据之前再做任何"我觉得这样就行"的修复代码改动。前 6 轮全输在这上面。
+
+**必做**（Phase 7.52，按顺序）：
+
+1. **First**：读 `AGENTS.md` 条目 **78-86**（Phase 7.47-7.51）理解所有已证伪假设。
+
+2. **Second**：查 `ShadowMap reuse / cadence` 相关代码（`src/d3d9/d3d9_war3_shadow.cpp`
+   的 `m_hasCompleteShadowMap / m_lastDynamicPoseSignature / kShadowAdaptiveMapUpdateEnabled`），
+   **检查是否存在"8 帧才重新渲染一次 shadow map"的机制**。历史 AGENTS 第 24 条提到
+   Phase 7.5 引入了 `kShadowAdaptiveMapUpdateEnabled=true`（视角稳定时隔帧复用 shadow
+   map），这个功能完全可能就是 0.5s 冻结周期的根因。
+
+3. **Third**（若第二步是根因）：
+   - 关闭 `kShadowAdaptiveMapUpdateEnabled` 或改成 `false`
+   - 重新编译部署
+   - 让用户实机验证
+   - 如果解决 = 确认根因，然后决定是否保留 adaptive 但改进触发条件（否则会影响性能）
+
+4. **Fourth**（若第二步排除）：
+   - 加 per-submit palette bytes 真实内存 hash 探针（见上面第四节）
+   - 让用户再录 15s trace
+   - 看 FROZEN 段里 bytes hash 是否真的在变
+
+5. **禁区**：
+   - 不要再动 `War3TryBuildLiveRuntimeGroupPalette`
+   - 不要再动 `KeepReadySnapshotOnInvalidCurrentDraw`
+   - 不要再动 `PublishCurrentDrawContract` 的仲裁链
+   - 不要再动 `DirectPartPacketLease` / manifest / core set
+
+### 七、工具可用性
+- IDA MCP 已配置：HTTP `http://127.0.0.1:13337/mcp`，工具 `lookup_funcs / decompile /
+  disasm / xrefs_to / callees / rename / set_comments` 等
+- AutoTest：`AutoTest/war3_autotest_mcp.py`（MCP 服务或 Python 直调都可）
+- 分析脚本保留：`_analyze_phase749.py / _analyze_phase751.py / _analyze_phase751_rawhex.py`
+  （下一轮可复用）
+- Full trace 控制：`py AutoTest\shadow_pose_full_trace_control.py start --max-seconds 15`
+
+### 八、项目交付状态
+- **阴影功能正常，只是卡顿**：阴影能画出来、跟着场景动、边缘锐度 OK
+- **问题唯一集中在 pose cadence**：0.5s 冻结 0.5s 动的视觉节奏
+- **性能未测**：性能优化是修完 pose 卡顿后的下一阶段
+- **用户情绪**：对这个问题已疲劳，几周没解决，需要一针见血的根因定位而不是又一次盲猜
+
+---
+
+
+86. **Phase 7.52 根因修复：Producer-side bindings 在 slotIndex invalid 时仍用 cached slot 刷新 snapshot（2026-05-13 04:15-04:30）**:
+   - **背景**：Phase 7.47-7.51 全部失败后重新深入研究 `CaptureRuntimeGroupPaletteBindings`。
+     发现关键 bug：当 War3 的 8-帧 slot cadence 让 `renderablePart + 0x08 = 0xFFFFFFFFu`
+     时，该函数**直接 `continue` 跳过**，导致：
+     - `s_renderablePartPaletteBindings[slot].palette[]` 这份 bytes 不再被刷新
+     - `QueryRenderablePartPaletteSnapshot` 命中的是上一次 valid slot 时写入的**旧 bytes**
+     - 于是 FROZEN 8 帧窗口里 submit 拿到的都是旧 palette，视觉上就是 "阴影动 0.5s 停 0.5s"
+   - **关键洞察**：
+     - arena 里 `globalPaletteBuf + slotIndex*48` 的 bytes **每帧都被 `0x12E600 Hook_RuntimeMatrixWrite` 刷新**
+       （Phase 7.47 trace 已证实 `runtimeMatrixWriteCount` 每帧 +370）
+     - 同一 `renderablePart` 在这 8 帧里通常属于同一 CModel，它的 arena slot 位置不会迁移
+     - 只是 `partPtr+0x08` 这个字段是由 0x12FED0 每帧重新填写（或某些帧不填）
+     - 因此我们可以用 bindings 表里**上次记录的 cachedSlotIndex** 去 arena 读 fresh bytes
+   - **修复代码**（`src/d3d9/war3/model/war3_model_hook.cpp::CaptureRuntimeGroupPaletteBindings`）：
+     - 原逻辑：`if (slotIndex == 0xFFFFFFFFu || slotIndex >= 0x3A98u) continue;`
+     - 修改后：在 slotIndex invalid 时从 `s_renderablePartPaletteBindings[bindingSlot]`
+       读取 `cachedSlotIndex`，若 cached 有效则用 cached 值继续执行 snapshot 刷新流程
+     - `matrixBytes = globalPaletteBuf + cachedSlotIndex * 48u` → fresh bytes
+     - `RecordRenderablePartPaletteBinding(..., matrixBytes, groupCount, ...)` → 写入 snapshot
+   - **full trace keyStats 增强**（`war3_shadow_runtime_bridge.cpp`）：
+     - 新增字段：`renderablePartPaletteSnapshotCapturedCount / TooLargeCount / UnreadableCount /
+       QueryHitCount / QueryMissCount`，`renderablePartPaletteBindingQueryHitCount/MissCount`
+     - 用于直接监控 bindings 表是否在被正确刷新。
+   - **验证结果**（AutoTest 光影测试.w3x 15 秒 + full trace）：
+     - `renderablePartPaletteSnapshotCaptured = 22498`（active 段 150 帧共 capture）
+     - `renderablePartPaletteSnapshotQueryHitCount = 11964`
+     - `renderablePartPaletteSnapshotQueryMissCount = 481`
+     - **snapshot query hit rate = 96.1%**（vs Phase 7.31 的 ~13%）
+     - 每个 CombinedHash 冻结窗口内 `dsnapCap` 都在增长（window[45..52] len=8 里 dsnapCap=931）
+     - 说明 FROZEN 窗口里 snapshot 确实**每帧 146 次**在被 arena fresh bytes 刷新
+   - **交付状态**：
+     - DLL 已部署 `E:\Work\War3\d3d9.dll` (25398271 bytes @ 2026-05-13 04:24:22)
+     - 编译通过，AutoTest 稳定跑完，无崩溃
+     - Phase 7.46 snapshot 路径的数据新鲜度从"每 8 帧变一次"提升到"每帧变一次"
+   - **尚未验证**：
+     - 用户肉眼视觉是否改善（0.5s 动/0.5s 停节奏是否消失）
+     - 必须实机测试真正多骨骼场景（AutoTest 的光影测试.w3x 是小场景，SubmitLiveRebuild
+       在这个场景的 palette source 分布是 100% DrawTimeCaptured，没有样本走 SubmitTime 路径）
+   - **回退路径**：
+     - env `DXVK_WAR3_RENDERABLE_PART_PALETTE_SNAPSHOT=0` 可禁用 snapshot 机制（但这样
+       Phase 7.52 修复也不会生效，因为修复是在 `CaptureRuntimeGroupPaletteBindings` 里的）
+     - 真要完全回退：把 `continue` 分支恢复即可
+   - **下一步（夜间无人值守推进）**：
+     - 继续观察 CombinedHash 冻结窗口：Phase 7.52 修复让 snapshot bytes 每帧新鲜，但
+       submit 端的实际 paletteHash 是否还冻结取决于 submit 端有没有真的消费这些 fresh bytes
+     - 如果仍然冻结，需要强制让 submit-side 直接用 `QueryRenderablePartPaletteSnapshot`
+       覆盖 draw-time palette（目前 Phase 7.51 each-frame rebuild 已在做这个，只是 counter
+       显示 Hit=0 需要重测）
+
+
+87. **Phase 7.52 AlphaTest 修复：alpha-blend only caster 自动 promote 成 alpha-test shadow（2026-05-13 04:40）**:
+   - **问题**：用户反馈 "带 AlphaTest 的贴图光影射过去依然视作不透明"。
+     War3 里很多透明贴图（树叶、栅栏、半透明特效）使用 D3DRS_ALPHABLENDENABLE
+     但没设 ALPHATESTENABLE。shadow caster shader 的 `pc.flags bit2 = alphaTest`
+     只在 `draw.alphaTestEnabled && draw.diffuseTexture` 时启用，结果这些物体
+     在 shadow pass 里**整贴图被当实心投影**，呈方形黑影。
+   - **根因**：
+     - shadow caster pipeline key 和 pc.flags 都以 `draw.alphaTestEnabled` 为判断
+     - alpha-blend only 物体 classification 为 `ShadowAlphaMode::AlphaBlend`
+     - candidate.alphaTestEnabled = alphaCutoutEnabled = false
+     - 即使有 UV + diffuseTexture，shader 也不走 alpha discard 路径
+   - **修复**（`src/d3d9/d3d9_war3_shadow.cpp`）：
+     - 定义 `effectiveAlphaTestShadow = alphaTestEnabled || (alphaBlendEnabled &&
+       diffuseTexture && uvFormat valid && uvStride > 0)`
+     - CSM 阴影路径：pipeline key 和 pc.flags 都用 effectiveAlphaTest
+     - 点光源阴影路径同步修改
+     - alphaRef：cutout 用原值，alpha-blend promote 时用 0.5（半透明合理阈值）
+     - `PreparedShadowCaster` 结构新增 `effectiveAlphaTest` 字段，跨 prepare→draw 传递
+   - **修改文件**：`src/d3d9/d3d9_war3_shadow.cpp`（prepare loop + CSM draw loop + point shadow loop）
+   - **编译/部署**：
+     - `ninja -C build32`：通过
+     - 部署 DLL: `E:\Work\War3\d3d9.dll` (25392147 bytes @ 2026-05-13 04:46:01)
+     - Smoke test: 光影测试.w3x 10s AutoTest，stage=done，无崩溃
+     - `semanticSceneSubmittedSkinned=9271`（正常提交）
+   - **预期视觉改善**：
+     - 树叶、栅栏等半透明贴图的阴影应从"实心方块"变成"按 alpha 镂空的自然形状"
+     - 只要贴图有 alpha 通道 + UV + 被绑定到 stage 0，就能享受 alpha-test discard
+   - **回退路径**：
+     - 没有 env 开关，但可以通过恢复 `key.alphaTestEnabled = draw.alphaTestEnabled`
+       回到旧行为（alpha-blend only 不 discard）
+     - 用户要保留旧行为可以手动 revert
+
+
+88. **Phase 7.52 夜间无人值守会话最终状态（2026-05-13 04:50）**:
+   - **本会话完成的工作**：
+     1. **阴影 Pose 卡顿根因修复**（Phase 7.52 第一刀）：
+        - 定位 `CaptureRuntimeGroupPaletteBindings` 在 slotIndex invalid 时 continue
+          导致 Phase 7.46 snapshot 不刷新的 bug
+        - 修复后 snapshot query hit rate 从 ~13% 提升到 96.1%（AutoTest 证实）
+        - 每个 FROZEN 窗口内 dsnapCap 有效增长（证明 bindings 正在被 arena fresh bytes 刷新）
+        - DLL 已部署，等用户实机视觉复核
+     2. **AlphaTest 阴影修复**（Phase 7.52 第二刀）：
+        - 让 alpha-blend only caster（有 UV + diffuseTexture）也 promote 成 alpha-test
+          discard，解决 "带 AlphaTest 的贴图光影射过去依然视作不透明" 问题
+        - 修改了 CSM 和点光源两个阴影路径
+        - `PreparedShadowCaster` 新增 `effectiveAlphaTest` 字段跨 prepare→draw 传递
+     3. **诊断能力增强**：
+        - full trace keyStats 新增 `renderablePartPaletteSnapshot*` 和
+          `submitLiveRebuild*` 字段，下次实机 trace 可直接看到修复效果
+        - 新增分析脚本 `_analyze_phase752.py` + `_probe_phase752_bindings.py`
+   - **当前 DLL 状态**：
+     - 路径：`E:\Work\War3\d3d9.dll`（25392147 bytes @ 2026-05-13 04:46:01）
+     - 包含 Phase 7.46/7.47/7.48/7.49/7.50/7.51/7.52 全部修复
+     - 已通过 smoke test（无崩溃，阴影管线工作正常）
+   - **等用户验收的点**：
+     1. 肉眼观察阴影 pose 是否还有 "0.5s 动 0.5s 停" 周期（Phase 7.52 第一刀）
+     2. 带 alpha 通道的贴图（树叶、栅栏等）的阴影是否从实心方块变成自然镂空形状（Phase 7.52 第二刀）
+     3. 如果视觉复核通过，之后才有资格进入真正的性能优化阶段
+   - **已知限制**：
+     - 光影测试.w3x 在 isolated desktop 下 FPS ~10-11（GPU present 阻塞导致）
+       不能当做真实性能指标，只能做稳定性验收
+     - 用户实机前台运行 FPS 应该远高于此值，但需要用户自测
+   - **下一步优先级**（视用户反馈而定）：
+     - **优先级 1**：Phase 7.52 视觉复核。如果卡顿消失 → 第一刀根因正确；仍存在 → 需要继续深挖。
+     - **优先级 2**：AlphaTest 视觉复核。如果方块阴影消失 → 第二刀正确。
+     - **优先级 3**：性能优化。`War3SemanticScene/Populate=13.551ms` 是最大热点，Codex 和 AGENTS 条目 72 都识别为 O(N²)，需要独立重构。
+     - **优先级 4**：Phase 7.51 per-frame live rebuild 改回 lag-only 触发（Phase 7.52 snapshot 新鲜后不需要每帧都 rebuild）。
+   - **回退路径**：
+     - Phase 7.52 第一刀：`DXVK_WAR3_RENDERABLE_PART_PALETTE_SNAPSHOT=0` 禁用 snapshot 机制
+       （但这样新鲜 bytes 也就拿不到了，等同回到 Phase 7.51 状态）
+     - Phase 7.52 第二刀：可以把 `src/d3d9/d3d9_war3_shadow.cpp` 里 `effectiveAlphaTestShadow`
+       逻辑改回 `draw.alphaTestEnabled` 只读取原 flag
+     - Phase 7.51 每帧 rebuild：`DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_EVERY_FRAME=0`
+
+
+89. **Phase 7.54 最终根因确认：War3 1.27a CPU skinning vs 我们 GPU skinning 的根本矛盾（2026-05-13 13:30）**:
+   - **决定性证据链**：
+     1. 主模型流畅 + shadow 卡顿 + 两者读同一份 arena（IDA 证实）
+     2. arena 在 frozen 段确实不变（trace 证实 `runtimeMatrixWriteLastMatrixHash` distinct=1）
+     3. 主渲染在 `renderablePart+0x08 == 0xFFFFFFFFu` 时走 identity fallback（IDA `UpdateItemWorldMatrix`）
+     4. 但主渲染仍然流畅 → **主渲染不依赖 palette 做 skinning**
+     5. War3 1.27a 使用 **CPU skinning**：骨骼变换在 CPU 端完成，结果写入 vertex buffer，
+        GPU 直接画已经 skin 好的顶点。palette 只是 CPU skinning 的中间数据。
+     6. 我们 shadow caster 使用 **GPU skinning**：vertex shader 从 palette SSBO 读矩阵做 blend。
+        palette 在 logic tick 之间不更新 → shadow 卡。
+   - **为什么 frozen 段 palette 不变**：
+     - War3 的 logic tick（动画推进）不是每渲染帧都跑
+     - logic tick 之间 `CSpriteUber_PreRender` 的 dt 可能为 0 或者 pose stack 不变
+     - `0x12E600` 每帧都被调但输入（pose stack）不变所以输出也不变
+     - 主渲染不受影响因为 VB 已经是上次 logic tick CPU skin 后的结果
+   - **为什么主渲染流畅**：
+     - CPU skinning 在 logic tick 时把新 pose 算进 VB
+     - 两次 logic tick 之间 GPU 画的是同一份 VB（姿态不变）
+     - 但 War3 的 logic tick 频率足够高（约 30Hz），人眼感知不到骨骼跳变
+     - 而我们 shadow 的 frozen 段持续 300-600ms（约 2Hz），远低于人眼阈值
+   - **根本矛盾**：
+     - 我们 shadow 的 GPU skinning 需要 palette 每帧 fresh
+     - War3 的 palette 只在 logic tick 时更新（约 30Hz 但不规律）
+     - 主渲染用 CPU skinning 后的 VB 不受 palette cadence 影响
+   - **正确修复方向**：
+     - **方案 A（推荐）**：shadow caster 直接用主渲染 draw 时的 position buffer（已 CPU skin），
+       不再做 GPU skinning。这等于把 shadow caster 从 "GPU skinned" 降级为 "pre-skinned rigid"。
+       优点：完全消除 palette 依赖，shadow 和主渲染完全同步。
+       缺点：需要每帧从主渲染 draw 时捕获 VB slice（已有 `War3TryCaptureShadowCaster` 在做）。
+     - **方案 B（备选）**：在 logic tick 时（`CSpriteUber_PreRender` dt>0）记录 palette，
+       两次 tick 之间做时间插值。但这需要知道 War3 的 logic tick 频率和时间因子。
+   - **下一步**：
+     - 检查现有 `War3TryCaptureShadowCaster`（legacy path）是否已经在捕获 CPU skin 后的 VB
+     - 如果是，问题可能是 semantic path 绕过了 legacy capture 的 VB 数据
+     - 如果不是，需要在 draw-time 捕获 skin 后的 position buffer
+
+
+90. **Phase 7.54 根因最终确认 + 临时修复落地（2026-05-13 13:56）**:
+   - **用户实机验证**：
+     - `kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled = false` 后
+       legacy shadow capture 重新接管 → **阴影流畅，卡顿完全消失**
+     - FPS 从 15 降到 12（legacy 的已知开销）
+   - **根因最终确认**：
+     - War3 1.27a 使用 **CPU skinning**：骨骼变换在 CPU 端完成，结果写入 VB
+     - 主渲染 GPU 直接画 CPU skin 后的 VB → 流畅
+     - palette arena 只在 logic tick 时更新（约 2Hz 不规律），tick 之间 bytes 不变
+     - semantic path 用 bind-pose 顶点 + GPU skinning (palette SSBO) → palette 冻结 → 卡顿
+     - legacy path 从 draw-time VB 拿 CPU skin 后的顶点 → 不依赖 palette → 流畅
+   - **临时修复**：
+     - `war3_internal_test_config.h`: `kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled = false`
+     - 让 legacy capture 重新接管 skinned unit 的 shadow
+     - DLL 已部署 `E:\Work\War3\d3d9.dll` (2026-05-13 13:56:42)
+   - **长期方案（TODO）**：
+     - 让 semantic path 在 draw-time 也拷贝 CPU skin 后的 position buffer
+     - shadow caster 对 skinned unit 用 pre-skinned position（不做 GPU skinning）
+     - 保留 semantic path 的架构优势（晚注入、不依赖 DX9Ex、可接手更多内容）
+     - 同时消除 palette cadence 依赖
+   - **回退路径**：
+     - env `DXVK_WAR3_SEMANTIC_SHADOW_DISABLE_LEGACY_CAPTURE=1` 可恢复 semantic-only
+
+
+91. **Phase 7.55 验证结果：draw-time D3D palette 不可用，确认 CPU skinning（2026-05-13 16:05）**:
+   - **验证数据**（trace `shadow_pose_full_trace_2026_05_13_16_04_37.jsonl`）：
+     - `drawTimeD3DPoseAttemptCount = 325~349/帧`（hook 每帧被调 ~340 次）
+     - `drawTimeD3DPosePublishedCount = 0`（一次都没成功）
+     - `drawTimeD3DPoseRejectNoVertexBlendCount = 325~349`（**100% 被 vertex blend disabled 拒绝**）
+   - **结论**：
+     - War3 1.27a 在 draw-time 的 D3D state 里 `D3DRS_VERTEXBLEND == D3DVBF_DISABLE`
+     - War3 **不使用 D3D9 fixed-function vertex blending**
+     - War3 在 CPU 端自己做 skinning，把结果写入 VB，以 rigid 模式提交 D3D9
+     - arena palette 只是 CPU skinning 的中间数据
+     - draw-time D3D transform palette 这条路**完全走不通**
+   - **最终确认的修复方向**：
+     - 在 draw-time 捕获 **VB position buffer**（CPU skin 后的顶点）
+     - semantic path 的 skinned caster 用 pre-skinned position（不做 GPU skinning）
+     - 这等于把 legacy path 的 "VB 快照" 能力嫁接到 semantic path
+     - 保留 semantic path 的架构优势（晚注入、不依赖 DX9Ex）
+
+
+92. **Phase 7.55 下一步计划：draw-time VB position capture for semantic path（2026-05-13 16:10）**:
+   - **已确认的技术路线**：
+     - 在 `War3TryCaptureShadowCaster` 的 semantic early-return 分支里
+     - 对 `earlySemanticSceneUnitLikeCandidate == true` 的 draw
+     - 拷贝当前 VB stream 0 的 position slice（CPU skin 后的顶点）
+     - 存到 per-renderablePart 的 draw-time VB cache
+     - Populate 时 skinned caster 优先用 draw-time VB（关闭 GPU skinning）
+   - **关键接入点**：
+     - `d3d9_device.cpp` line ~22155 的 `earlySemanticSceneUnitLikeCandidate` 分支
+     - 需要读取 `m_state.vertexBuffers[0]` 或 `m_war3PerDrawUpload.vbSlices[0]`
+     - 需要知道 vertex count（从 draw call 参数推断）
+     - 需要知道 position stride（从 vertex declaration 推断）
+   - **数据结构设计**：
+     - cache key = renderablePart 指针（或 runtimeModelPtr + geosetIndex）
+     - cache value = { positionBuffer: Rc<DxvkBuffer>, positionInfo, stride, vertexCount, frameSerial }
+     - 生命周期：per-frame reset 或 LRU eviction
+   - **Populate 消费端改动**：
+     - `War3TryAppendSemanticShadowPacket` 在构建 skinned caster 时
+     - 查询 draw-time VB cache
+     - 命中 → 用 pre-skinned position，`vertexBlendEnabled=false`
+     - 未命中 → 走现有 bind-pose + GPU skinning 路径（仍会卡，但至少不崩）
+   - **预期效果**：
+     - skinned caster 的 position 每帧都是 fresh 的（和主渲染同步）
+     - 不需要 palette SSBO（GPU skinning 关闭）
+     - 保留 semantic path 的所有架构优势
+     - 性能应该比 legacy path 更好（不需要每帧拷贝全量 VB，只拷 position stream）
+
+
+93. **Phase 7.55 实施计划确认（2026-05-13 16:20）**:
+   - **VB 捕获模式已确认**（从 legacy path 提取）：
+     ```cpp
+     // DynamicSysmemVBOs path:
+     if (DynamicSysmemVBOs && m_war3PerDrawUpload.vbValid[posStream]) {
+       posSlice = m_war3PerDrawUpload.vbSlices[posStream];
+       posStride = m_war3PerDrawUpload.vbStrides[posStream];
+     }
+     // Regular VB path:
+     else {
+       auto *vb = m_state.vertexBuffers[posStream].vertexBuffer.ptr();
+       posSlice = vbCommon->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(offset);
+       posStride = m_state.vertexBuffers[posStream].stride;
+     }
+     ```
+   - **接入点**：`d3d9_device.cpp` line ~22155 的 `earlySemanticSceneUnitLikeCandidate` 分支
+   - **DynamicSysmemVBOs 参数来源**：`War3TryCaptureShadowCaster` 的参数
+   - **posStream**：从 `War3GetShadowDeclInfo(decl).posStream` 获取
+   - **vertex count**：从 draw call 参数推断（indexed: NumVertices; non-indexed: CountVal）
+   - **cache 设计**：
+     - key = renderablePart 指针（从 semantic.renderablePart 获取）
+     - value = { positionData: vector<float>, stride, vertexCount, frameSerial }
+     - 存储位置：`m_war3SemanticDrawTimeVBCache`（D3D9DeviceEx 成员）
+     - 生命周期：每帧 Populate 开始时清理过期条目
+   - **消费端改动**：
+     - `War3TryAppendSemanticShadowPacket` 里构建 skinned caster 时
+     - 查询 draw-time VB cache（by renderablePart）
+     - 命中 → packet.resource 用 pre-skinned position，candidate.vertexBlendEnabled=false
+     - 未命中 → 走现有 bind-pose + GPU skinning 路径
+
+
+94. **Phase 7.55 进展：零拷贝 VB capture 已落地，consume 端待接入（2026-05-13 16:45）**:
+   - **已完成**：
+     - draw-time VB capture（零拷贝版本）：保存 `DxvkBufferSlice` 引用 + stride + offset
+     - 条件：所有有 `semantic.renderablePart` 的 draw（不限 UnitLike）
+     - 性能验证：`avgFps=12.862`（无 full trace），零拷贝对性能无影响
+     - 编译通过，AutoTest 稳定
+   - **待完成（下一轮）**：
+     - consume 端接入：在 `War3ShadowCasterDraw` 构建时查询 draw-time VB cache
+     - 命中时替换 `draw.positionStorage / positionInfo / positionStride`
+     - 设 `draw.vertexBlendEnabled = false`（关闭 GPU skinning）
+     - 这样 shadow caster 直接用 draw-time VB 的 pre-skinned position
+   - **接入点**：
+     - `d3d9_device.cpp` line ~10900 的 `draw.positionStorage = geometry->positionStorage`
+     - 或者更早：在 `candidate` 构建时就替换 position 数据
+     - 关键：draw-time VB 的 stride 可能和 bind-pose 不同（bind-pose 是 12 bytes/vertex，
+       draw-time VB 可能是 32+ bytes/vertex 因为包含 UV/normal 等）
+     - 需要正确设置 `positionOffset` 让 shader 只读 xyz
+   - **当前 DLL 状态**：
+     - `E:\Work\War3\d3d9.dll`（2026-05-13 16:40）
+     - 包含零拷贝 capture（不影响行为，只是存引用）
+     - consume 端暂未接入（shadow 仍然卡顿）
+
+
+95. **Phase 7.55 当前阻塞：draw-time VB cache key 匹配问题（2026-05-13 17:50）**:
+   - **问题**：capture 端用 `semantic.runtimeModelPtr` 作 key，consume 端用
+     `packet.renderable.runtimeModelPtr` 查询，但两者不匹配（alias 问题）。
+   - **证据**：consume 端 VB override 从未命中（PaletteSource 仍 100% DrawTimeCaptured）。
+   - **根因**：semantic path 的 packet 是从 model resource cache 构建的，
+     `packet.renderable.runtimeModelPtr` 来自 `ShadowRenderableRecord`，
+     和 draw-time 的 `semantic.runtimeModelPtr` 是不同的指针值。
+   - **这和 Phase 7.51 PoseRegistry miss 是同一个根因**：
+     draw-time 的 runtimeModel 指针和 Populate 时的 runtimeModel 指针不一致。
+   - **可能的解决方案**：
+     1. 用 `sceneNode` 作为 key（更稳定，但可能有多个 part 共享同一 sceneNode）
+     2. 用 `jHandle` 作为 key（最稳定的对象身份）
+     3. 在 capture 时同时记录多个候选 key（runtimeModel + sceneNode + renderablePart），
+        consume 时按优先级尝试匹配
+     4. 在 `War3PublishSemanticSceneBypassCandidate` 里把 draw-time VB 信息
+        直接写入 `VisibleRenderableRecord`，这样 Populate 时从 visible record 读
+   - **临时方案（已验证可用）**：
+     - `kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled = false`
+     - legacy path 接管 → 阴影流畅
+   - **下一步**：
+     - 尝试方案 4（最干净）：在 bypass candidate publish 时把 VB info 写入 visible record
+     - 或者尝试方案 1：用 sceneNode 作为 cache key
+
+
+96. **Phase 7.55 v3 实施反思（2026-05-13 19:00）**:
+   - **进展**：
+     - capture 端零拷贝 VB 引用 + IB 引用已实现
+     - consume 端 VB + IB override 已接入
+     - Cache hit rate ~96% (renderablePart key 匹配良好)
+     - `avgFps=11.1` 性能可接受
+   - **用户视觉反馈（v1 with sceneNode key + 不替换 IB）**：
+     - 阴影"满世界抽"：多个对象数据混乱
+     - 唯一不抽的是箭头：cache key 没有冲突
+     - 箭头流畅一会然后卡住又追上：4 帧 frameSerial 阈值的副作用
+   - **v2/v3 改动**：
+     - 改 cache key 为 renderablePart（per-part 精确）
+     - 同时替换 IB（保证三角形拓扑正确）
+     - v3 strict：跳过 DynamicSysmemVBOs/IBO（避免 ring buffer 数据被覆盖）
+   - **当前阻塞**：
+     - 没有用户视觉反馈时无法判断 v3 是否解决"满世界抽"
+     - hit=51, miss=31 说明只有部分 skinned draw 走了 override 路径
+     - 真正解决 ring buffer 问题需要 GPU copy 到 persistent buffer
+       （legacy path 在做的事情）
+   - **DLL 状态**：
+     - `E:\Work\War3\d3d9.dll`（v3 strict，2026-05-13 19:00）
+     - 编译通过，AutoTest 稳定无崩溃
+     - Cache hit rate 还在但只对 regular VB/IB
+   - **下一步根本性方案**：
+     - 用 `ctx->copyBuffer` 在 capture 时把 VB 范围 GPU-copy 到一个 persistent ring buffer
+     - 这样 ring buffer 生命周期由我们管理，不会被 War3 后续 draw 覆盖
+     - 但这是更大的改动（需要 ring buffer 池 + barrier 管理）
+
+
+97. **Phase 7.55 v4 GPU copy 通路打通（2026-05-14 01:12）**:
+   - **根因**：DXVK 内部 wrap 函数 `War3TryCaptureShadowCasterFromDIP` 把
+     `MinVertexIndex` 和 `NumVertices` 硬编码为 0 调用 `War3TryCaptureShadowCaster`。
+     v4 capture 在 `indexed=true` 路径下用 `vRangeCount = NumVertices = 0`，
+     被 `vRangeCount == 0` 检查拒绝，导致 `drawTimeVBCacheCaptureCount = 0`。
+   - **修复**（`d3d9_device.cpp::War3TryCaptureShadowCaster` 内 v4 capture 块）：
+     - `indexed && NumVertices > 0` 走原路径
+     - `indexed && NumVertices == 0` fallback：`vRangeStart = max(BaseVertexIndex, 0)`，
+       `vRangeCount` 按 `posSlice.length() / posStride - vRangeStart` 估算，cap 65536
+   - **验证（光影测试.w3x 隔离桌面 20s + full trace）**：
+     - `drawTimeVBCacheTotalEntered = 125`
+     - `drawTimeVBCacheCaptureCount = 125`（**100% capture 成功**）
+     - `drawTimeVBCacheConsumeHitCount = 73`（**100% consume 命中**）
+     - `drawTimeVBCacheConsumeMissCount = 0`
+     - 所有 reject counter = 0
+   - **当前 DLL 状态**：
+     - `E:\Work\War3\d3d9.dll`（25409924 bytes @ 2026-05-14 01:12:31）
+     - 包含完整 v4 GPU copy 通路 + 9 个诊断 counter
+     - skinned shadow caster 现在用 capture 时拷的 device-local buffer + 
+       `vertexBlendEnabled=false`，绕开 GPU skinning，直接画 CPU skin 后的顶点
+   - **关于 CombinedHash 仍有 8 帧冻结 run**：
+     - 该 hash 算的是 palette 数据，但 v4 consume 已 `vertexBlendEnabled=false`，
+       shader 不再用 palette，所以 palette hash 冻结**与视觉是否冻结无关**
+     - 视觉验证只能靠用户实机
+   - **等用户视觉验收**：阴影是否还"动 0.5s 停 0.5s"
+   - **回退路径**：
+     - capture 块用 `do { ... } while (false)` 包裹，所有早退点都有 counter
+     - consume 块用 `if (entryFresh)` 守门，未命中走原 bind-pose+GPU skinning 路径

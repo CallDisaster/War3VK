@@ -1152,6 +1152,15 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
     runtimeModelPtr = nullptr;
 
   modelResourcePtr = TryResolveDirectModelResourcePtr(modelResourcePtr);
+  if (modelResourcePtr == nullptr && runtimeModelPtr != nullptr) {
+    void* ownedModelDataHandle = nullptr;
+    if (TryReadPtrFast(runtimeModelPtr,
+                       dxvk::war3::CModelOffsets::OwnedModelDataHandle,
+                       ownedModelDataHandle) &&
+        ownedModelDataHandle != nullptr) {
+      modelResourcePtr = TryResolveDirectModelResourcePtr(ownedModelDataHandle);
+    }
+  }
 
   ShadowGeosetResourceRecord geosetRecord = {};
   bool alreadyRefreshedThisFrame = false;
@@ -1296,6 +1305,18 @@ bool ShadowModelResourceCache::findGeosetByPtr(
   return true;
 }
 
+const ShadowGeosetResourceRecord* ShadowModelResourceCache::findGeosetByPtrRef(
+    void* geosetPtr) const {
+  if (geosetPtr == nullptr)
+    return nullptr;
+
+  std::lock_guard<std::mutex> lock(m_mutex);
+  const auto it = m_byGeoset.find(geosetPtr);
+  if (it == m_byGeoset.end())
+    return nullptr;
+  return &it->second;
+}
+
 bool ShadowModelResourceCache::findGeosetByData(
     void *geosetDataPtr, ShadowGeosetResourceRecord &out) const {
   out = {};
@@ -1308,6 +1329,57 @@ bool ShadowModelResourceCache::findGeosetByData(
     return false;
   out = it->second;
   return true;
+}
+
+bool ShadowModelResourceCache::hydrateGeosetByKnownPtrs(
+    void* geosetPtr, void* geosetDataPtr, ShadowGeosetResourceRecord& out) {
+  out = {};
+  if (geosetPtr == nullptr && geosetDataPtr == nullptr)
+    return false;
+
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (geosetPtr != nullptr) {
+      const auto it = m_byGeoset.find(geosetPtr);
+      if (it != m_byGeoset.end() && it->second.readyForShadowConsumer()) {
+        out = it->second;
+        return true;
+      }
+    }
+    if (geosetDataPtr != nullptr) {
+      const auto it = m_byGeosetData.find(geosetDataPtr);
+      if (it != m_byGeosetData.end() && it->second.readyForShadowConsumer()) {
+        out = it->second;
+        return true;
+      }
+    }
+  }
+
+  ShadowGeosetResourceRecord hydrated = {};
+  if (!CaptureGeosetRecordFromKnownPtrs(geosetPtr, geosetDataPtr, hydrated))
+    return false;
+  if (!hydrated.readyForShadowConsumer())
+    return false;
+
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (hydrated.firstSeenFrame == 0)
+    hydrated.firstSeenFrame = m_frameNumber;
+  hydrated.lastSeenFrame = m_frameNumber;
+  storeGeosetRecord(hydrated);
+  out = hydrated;
+  return true;
+}
+
+const ShadowGeosetResourceRecord* ShadowModelResourceCache::findGeosetByDataRef(
+    void* geosetDataPtr) const {
+  if (geosetDataPtr == nullptr)
+    return nullptr;
+
+  std::lock_guard<std::mutex> lock(m_mutex);
+  const auto it = m_byGeosetData.find(geosetDataPtr);
+  if (it == m_byGeosetData.end())
+    return nullptr;
+  return &it->second;
 }
 
 bool ShadowModelResourceCache::findModelGeoset(

@@ -88,6 +88,7 @@ struct War3HookAddressBook {
   uintptr_t worldObjectsRenderGroup = 0;
   uintptr_t dispatchCommon = 0;
   uintptr_t dispatchSpecial = 0;
+  uintptr_t applyDrawStateAndDraw = 0;
   uintptr_t flushSortedItems = 0;
   uintptr_t terrainRenderAllTiles = 0;
 

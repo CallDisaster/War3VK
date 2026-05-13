@@ -663,6 +663,62 @@ void MergeAttachmentRootPoseCandidate(const ShadowPoseRecord& candidate,
 constexpr size_t kRuntimeMatrixCountOffset = 0x5Cu;
 constexpr size_t kRuntimeMatrixArrayOffset = 0x60u;
 
+// 全局调色板缓冲区基址的 RVA
+// dword_6FBC6BD0 = Game.dll + 0xBC6BD0
+// 这是引擎在 CModel_AllocAndFillGroupPalette 中使用的全局缓冲区
+constexpr uintptr_t kGlobalPaletteBufferRva = 0xBC6BD0;
+
+// 调色板槽位索引缓存：记录每个 RenderablePart 最近成功读取的调色板槽位索引
+// 用于解决 RenderablePart + 0x08 在某些帧没有被更新的问题
+struct PaletteSlotCacheEntry {
+  void* renderablePart = nullptr;
+  uint32_t paletteSlotIndex = 0xFFFFFFFF;
+  uint64_t lastUpdateFrame = 0;
+};
+static constexpr size_t kMaxPaletteSlotCacheEntries = 4096;
+static thread_local PaletteSlotCacheEntry s_paletteSlotCache[kMaxPaletteSlotCacheEntries];
+static thread_local size_t s_paletteSlotCacheIndex = 0;
+static std::atomic<uint64_t> g_paletteSlotCacheHitCount{0};
+static std::atomic<uint64_t> g_paletteSlotCacheMissCount{0};
+
+// 查找或更新调色板槽位索引缓存
+static uint32_t FindOrUpdatePaletteSlotCache(void* renderablePart, uint32_t currentSlotIndex) {
+  if (renderablePart == nullptr)
+    return 0xFFFFFFFF;
+
+  // 查找缓存
+  for (size_t i = 0; i < kMaxPaletteSlotCacheEntries; ++i) {
+    if (s_paletteSlotCache[i].renderablePart == renderablePart) {
+      // 找到缓存条目
+      if (currentSlotIndex != 0xFFFFFFFF && currentSlotIndex < 0x3A98) {
+        // 更新缓存
+        s_paletteSlotCache[i].paletteSlotIndex = currentSlotIndex;
+        s_paletteSlotCache[i].lastUpdateFrame = g_paletteSlotCacheHitCount.load(std::memory_order_relaxed);
+        g_paletteSlotCacheHitCount.fetch_add(1u, std::memory_order_relaxed);
+        return currentSlotIndex;
+      } else {
+        // 使用缓存的值
+        g_paletteSlotCacheHitCount.fetch_add(1u, std::memory_order_relaxed);
+        return s_paletteSlotCache[i].paletteSlotIndex;
+      }
+    }
+  }
+
+  // 没有找到缓存条目，添加新的
+  if (currentSlotIndex != 0xFFFFFFFF && currentSlotIndex < 0x3A98) {
+    const size_t cacheSlot = s_paletteSlotCacheIndex % kMaxPaletteSlotCacheEntries;
+    s_paletteSlotCache[cacheSlot].renderablePart = renderablePart;
+    s_paletteSlotCache[cacheSlot].paletteSlotIndex = currentSlotIndex;
+    s_paletteSlotCache[cacheSlot].lastUpdateFrame = g_paletteSlotCacheHitCount.load(std::memory_order_relaxed);
+    s_paletteSlotCacheIndex++;
+    g_paletteSlotCacheMissCount.fetch_add(1u, std::memory_order_relaxed);
+    return currentSlotIndex;
+  }
+
+  g_paletteSlotCacheMissCount.fetch_add(1u, std::memory_order_relaxed);
+  return 0xFFFFFFFF;
+}
+
 uint64_t HashMatrixPalette(const std::vector<Matrix4>& matrices) {
   uint64_t hash = 1469598103934665603ull;
   const auto* bytes = reinterpret_cast<const uint8_t*>(matrices.data());
@@ -1393,6 +1449,9 @@ struct MeshLayerBindingContract {
   }
 };
 
+bool TryResolveMeshLayerBindingContract(const ShadowRenderableRecord& renderable,
+                                        MeshLayerBindingContract& out);
+
 ShadowAlphaMode ResolveShadowAlphaMode(
     const ShadowRenderableRecord& renderable,
     const MeshLayerBindingContract* layerContract) {
@@ -1430,6 +1489,11 @@ ShadowMaterialSignature BuildShadowMaterialSignature(
           ? 1u
           : 0u;
   signature.transparentType = renderable.transparentType;
+  signature.layerContractResolved = layerContract != nullptr;
+  if (layerContract != nullptr) {
+    signature.layerContractMeshIndex = layerContract->meshIndex;
+    signature.layerContractLayerCount = layerContract->layerCount;
+  }
 
   uint64_t hash = bit::fnv1a_init();
   hash = bit::fnv1a_iter(hash, renderable.flags);
@@ -1465,6 +1529,35 @@ ShadowMaterialSignature BuildShadowMaterialSignature(
   signature.signatureHash = hash != 0u ? hash : 1u;
   return signature;
 }
+
+} // namespace
+
+ShadowMaterialSignature BuildShadowMaterialSignatureForRenderable(
+    const ShadowRenderableRecord& renderable) {
+  MeshLayerBindingContract layerContract = {};
+  const bool hasLayerContract =
+      TryResolveMeshLayerBindingContract(renderable, layerContract);
+  return BuildShadowMaterialSignature(renderable,
+                                      hasLayerContract ? &layerContract : nullptr);
+}
+
+bool InspectShadowMaterialBindingForRenderable(
+    const ShadowRenderableRecord& renderable,
+    ShadowMaterialBindingDiagnostics& out) {
+  out = {};
+  MeshLayerBindingContract layerContract = {};
+  if (!TryResolveMeshLayerBindingContract(renderable, layerContract))
+    return false;
+
+  out.resolved = true;
+  out.meshIndex = layerContract.meshIndex;
+  out.layerIndex = layerContract.layerIndex;
+  out.layerCount = layerContract.layerCount;
+  out.blendOrDrawMode = layerContract.blendOrDrawMode;
+  return true;
+}
+
+namespace {
 
 constexpr int kDynamicAuxCandidateStream1 = -1;
 constexpr int kDynamicAuxCandidatePrimaryStream = -2;
@@ -1624,7 +1717,7 @@ std::vector<DynamicAuxStreamCandidate> CollectDynamicAuxStreamCandidates(
   AppendDynamicAuxCandidate(
       candidates, stream1Ptr,
       MakeDynamicAuxStrideHints(std::array<uint32_t, 4>{
-          declaredStride, 4u, 8u, 12u}),
+          declaredStride, 1u, 4u, 8u}),
       false, kDynamicAuxCandidateStream1);
 
   if (layerContract != nullptr && layerContract->prefersPrimaryStreamAuxView()) {
@@ -1714,16 +1807,16 @@ std::vector<DynamicAuxStreamCandidate> CollectDynamicAuxStreamCandidates(
   const uint32_t aux1CountHint =
       layerContract->hasAuxEntry1Snapshot ? layerContract->auxEntry1Word0 : 0u;
   appendDirectPointerCandidate(layerContract->layerStateWord1C,
-                               {aux0CountHint, declaredStride, primaryStride, 8u},
+                               {aux0CountHint, declaredStride, primaryStride, 1u},
                                kDynamicAuxCandidateLayerState0);
   appendDirectPointerCandidate(layerContract->layerStateWord20,
-                               {aux1CountHint, declaredStride, primaryStride, 8u},
+                               {aux1CountHint, declaredStride, primaryStride, 1u},
                                kDynamicAuxCandidateLayerState1);
   appendIndirectPointerCandidate(layerContract->layerStateWord1C,
-                                 {declaredStride, 4u, 8u, 12u},
+                                 {declaredStride, 1u, 4u, 8u},
                                  kDynamicAuxCandidateLayerState0Indirect);
   appendIndirectPointerCandidate(layerContract->layerStateWord20,
-                                 {declaredStride, 4u, 8u, 12u},
+                                 {declaredStride, 1u, 4u, 8u},
                                  kDynamicAuxCandidateLayerState1Indirect);
 
   auto appendAuxStreamCandidate = [&](uintptr_t auxStreamPtr, uint32_t auxWord0,
@@ -1734,10 +1827,10 @@ std::vector<DynamicAuxStreamCandidate> CollectDynamicAuxStreamCandidates(
     AppendDynamicAuxCandidate(
         candidates, reinterpret_cast<const void*>(auxStreamPtr),
         MakeDynamicAuxStrideHints(
-            std::array<uint32_t, 4>{auxStride, auxWord0, declaredStride, 8u}),
+            std::array<uint32_t, 4>{auxStride, auxWord0, declaredStride, 1u}),
         false, directTag);
     appendIndirectPointerCandidate(
-        uint32_t(auxStreamPtr), {auxStride, declaredStride, 4u, 8u}, indirectTag);
+        uint32_t(auxStreamPtr), {auxStride, declaredStride, 1u, 4u}, indirectTag);
   };
   appendAuxStreamCandidate(layerContract->auxStreamPtr0, layerContract->auxEntry0Word0,
                            layerContract->auxStreamStride0,
@@ -1756,8 +1849,7 @@ bool TryResolveMeshLayerBindingContract(const ShadowRenderableRecord& renderable
   out = {};
 
   if (renderable.queueKind != render::VisibleRenderableQueueKind::MainQueue ||
-      renderable.meshData == nullptr || renderable.sceneNode == nullptr ||
-      ShouldSkipLegacyMeshDataDecode(renderable)) {
+      renderable.meshData == nullptr || renderable.sceneNode == nullptr) {
     return false;
   }
 
@@ -4536,14 +4628,17 @@ bool TryResolveMeshDynamicGroupSlots(const ShadowRenderableRecord& renderable,
 
     std::array<bool, 257> seenStride = {};
     for (uint32_t stride : candidate.strides) {
-      if (stride < 4u || stride >= seenStride.size())
+      // Current-draw group-slot contracts are not always packed dwords. Some
+      // unit paths expose a 1-byte-per-vertex slot stream, so semantic shadow
+      // must treat R8 and packed auxiliary layouts as first-class candidates.
+      if (stride == 0u || stride >= seenStride.size())
         continue;
       if (seenStride[stride])
         continue;
       seenStride[stride] = true;
 
       const uint64_t requiredBytes =
-          uint64_t(vertexCount - 1u) * uint64_t(stride) + 4u;
+          uint64_t(vertexCount - 1u) * uint64_t(stride) + 1u;
       if (requiredBytes > (64ull * 1024ull * 1024ull))
         continue;
       if (!dxvk::war3::IsReadableRange(candidate.ptr, size_t(requiredBytes)))
@@ -6223,6 +6318,9 @@ bool TryConvertUpperLayerResolvedItem(
   outPacket.hasRuntimeGroupPalette = src.hasRuntimeGroupPalette;
   outPacket.matrixGroupsUseAveraging = src.matrixGroupsUseAveraging;
   outPacket.maxVertexGroupSlot = src.maxVertexGroupSlot;
+  outPacket.runtimeGroupPaletteSlotIndex = 0xFFFFFFFFu;
+  outPacket.runtimeGroupPaletteMinFrameTag = 0u;
+  outPacket.runtimeGroupPaletteMaxFrameTag = 0u;
   outPacket.runtimeGroupPalette = src.runtimeGroupPalette;
   outPacket.runtimeGroupPaletteHash =
       outPacket.runtimeGroupPalette.empty()
@@ -6270,6 +6368,69 @@ bool TryBuildRuntimeGroupPalette(const ShadowModelResourceRecord& resource,
     const uint8_t groupSlot = resource.vertexGroupIndices[i];
     outMaxVertexGroupSlot =
         (std::max)(outMaxVertexGroupSlot, uint32_t(groupSlot));
+  }
+
+  // 尝试从引擎的全局调色板缓冲区读取完整骨架
+  // 这解决了 CModel + 0x60 只有 2-3 个根骨骼矩阵的问题
+  auto tryEngineDirectPosePalette = [&]() -> bool {
+    // 尝试从 RenderablePart + 0x08 读取调色板槽位索引
+    // 注意：RenderablePartFieldOffsets 中该字段名为 StagePresetSpanBaseIndex
+    // 但在 CModel_AllocAndFillGroupPalette 中实际用作 palette slot index
+    uint32_t paletteSlotIndex = 0xFFFFFFFF;
+    if (renderable.renderablePart != nullptr) {
+      dxvk::war3::SafeReadU32Fast(
+          renderable.renderablePart,
+          dxvk::war3::RenderablePartFieldOffsets::StagePresetSpanBaseIndex,
+          paletteSlotIndex);
+    }
+
+    // 使用缓存机制：如果当前帧没有更新槽位索引，使用上一帧的值
+    paletteSlotIndex = FindOrUpdatePaletteSlotCache(
+        renderable.renderablePart, paletteSlotIndex);
+    
+    if (paletteSlotIndex == 0xFFFFFFFF || paletteSlotIndex >= 0x3A98)
+      return false;
+
+    uintptr_t gameDllBase = reinterpret_cast<uintptr_t>(::GetModuleHandleA("Game.dll"));
+    if (gameDllBase == 0) return false;
+
+    // dword_6FBC6BD0 是动态分配的调色板缓冲区地址，需要解引用
+    // sub_6F139060(slotIndex) 返回 dword_6FBC6BD0 + 48 * slotIndex
+    void* globalPaletteBufferPtr = nullptr;
+    if (!dxvk::war3::SafeReadPtrFast(
+            reinterpret_cast<const void*>(gameDllBase + kGlobalPaletteBufferRva),
+            0, globalPaletteBufferPtr) || globalPaletteBufferPtr == nullptr) {
+      return false;
+    }
+    const uintptr_t globalPaletteBufferBase = reinterpret_cast<uintptr_t>(globalPaletteBufferPtr);
+    
+    const uint32_t requiredCount = outMaxVertexGroupSlot + 1u;
+    if (requiredCount == 0 || requiredCount > 256) return false;
+    
+    // 引擎使用 3x4 矩阵（48字节），使用 DecodeRuntimePoseMatrix48 解析
+    const uint8_t* enginePalette = reinterpret_cast<const uint8_t*>(globalPaletteBufferBase + 48u * paletteSlotIndex);
+    
+    // 检查内存可读性
+    if (!dxvk::war3::IsReadableRange(enginePalette, requiredCount * 48u))
+      return false;
+    
+    outPalette.resize(requiredCount);
+    for (uint32_t i = 0; i < requiredCount; ++i) {
+      outPalette[i] = DecodeRuntimePoseMatrix48(enginePalette + i * 48u);
+    }
+    
+    outUsesAveraging = false; 
+    return true;
+  };
+
+  // 优先使用引擎的全局调色板缓冲区
+  if (tryEngineDirectPosePalette()) {
+    NoteRuntimeGroupPaletteMiss(outMissDetail, RuntimeGroupPaletteMissReason::None,
+                                pose.matrixCount,
+                                uint32_t(resource.matrixGroupSizes.size()),
+                                outMaxVertexGroupSlot,
+                                uint32_t(resource.matrixIndices.size()));
+    return true;
   }
 
   NoteRuntimeGroupPaletteMiss(outMissDetail, RuntimeGroupPaletteMissReason::None,
@@ -6728,6 +6889,37 @@ bool ShouldBuildAttachmentSupplementalForChunk(uint64_t maxDurationUs) {
 }
 
 } // namespace
+
+bool TryResolveExplicitBlendSkinningForRenderable(
+    const ShadowRenderableRecord& renderable,
+    uint32_t vertexCount,
+    uint32_t posePaletteLimit,
+    uint32_t maxExpectedGroupSize,
+    const ShadowPoseRecord& pose,
+    ShadowExplicitBlendSkinningResult& outResult,
+    ShadowResolveStats* ioStats) {
+  outResult = {};
+
+  MeshLayerBindingContract layerContract = {};
+  if (!TryResolveMeshLayerBindingContract(renderable, layerContract))
+    return false;
+
+  ExplicitBlendSkinResult internal = {};
+  if (!TryResolveMeshDynamicExplicitBlendSkinning(
+          renderable, vertexCount, posePaletteLimit, maxExpectedGroupSize,
+          pose, &layerContract, internal, ioStats)) {
+    return false;
+  }
+
+  outResult.weights = std::move(internal.weights);
+  outResult.indices = std::move(internal.indices);
+  outResult.runtimeGroupPalette = std::move(internal.runtimeGroupPalette);
+  outResult.maxGroupSlot = internal.maxGroupSlot;
+  outResult.dynamicHash = internal.dynamicHash;
+  outResult.blendCount = internal.blendCount;
+  outResult.usedSpanRemap = internal.usedSpanRemap;
+  return true;
+}
 
 ShadowResolveStats ShadowRendererCore::buildFrame(
     const ShadowFrameManifest& manifest, const ShadowModelResourceStore& resources,
@@ -7446,10 +7638,10 @@ bool ShadowRendererCore::resolveRecord(const ShadowRenderableRecord& record,
           meshPoseRuntimeModelPtr != nullptr;
       if (meshPoseHit && meshPose.matrixCount > dynamicPose.matrixCount)
         dynamicPose = meshPose;
-      if (!TryResolveMeshPrimaryDynamicStream(resolvedRecord, *resource, dynamicStreamPtr,
-                                             dynamicHash, dynamicStride)) {
-        return false;
-      }
+      const bool hasDynamicPrimaryStream =
+          TryResolveMeshPrimaryDynamicStream(resolvedRecord, *resource,
+                                             dynamicStreamPtr, dynamicHash,
+                                             dynamicStride);
       if (dynamicVertexCount == 0u || dynamicVertexCount > 200000u)
         dynamicVertexCount = resource->vertexCount;
       TryResolveMeshDynamicIndexStream(
@@ -7464,6 +7656,15 @@ bool ShadowRendererCore::resolveRecord(const ShadowRenderableRecord& record,
       uint32_t maxExpectedGroupSize = 0u;
       for (uint32_t groupSize : resource->matrixGroupSizes)
         maxExpectedGroupSize = (std::max)(maxExpectedGroupSize, groupSize);
+      const uint32_t dynamicContractGroupSlotLimit = [&]() {
+        if (!resource->matrixGroupSizes.empty()) {
+          return (std::min)(255u,
+                            uint32_t(resource->matrixGroupSizes.size() - 1u));
+        }
+        if (dynamicPosePaletteLimit != 0u)
+          return dynamicPosePaletteLimit - 1u;
+        return 255u;
+      }();
       const bool hasPackedDynamicGroups =
           dynamicPosePaletteLimit != 0u &&
           TryResolveMeshDynamicPackedRuntimeGroups(
@@ -7482,9 +7683,9 @@ bool ShadowRendererCore::resolveRecord(const ShadowRenderableRecord& record,
       }
       const bool hasDynamicGroupSlots =
           hasPackedDynamicGroups ||
-          (dynamicPosePaletteLimit != 0u &&
+          (dynamicContractGroupSlotLimit < 256u &&
             TryResolveMeshDynamicGroupSlots(resolvedRecord, dynamicVertexCount,
-                                            dynamicPosePaletteLimit - 1u,
+                                            dynamicContractGroupSlotLimit,
                                             dynamicGroupSlots,
                                             dynamicMaxGroupSlot, dynamicGroupHash,
                                             dynamicGroupStride,
@@ -7524,6 +7725,9 @@ bool ShadowRendererCore::resolveRecord(const ShadowRenderableRecord& record,
           sceneSubmissionRuntime &&
           dxvk::war3::internal::
               kShadowSemanticCorePreferFrameLocalDynamicMeshForSkinned;
+      const bool allowLivePaletteOnlySkinned =
+          sceneSubmissionRuntime && hasDynamicGroupSlots &&
+          dynamicMaxGroupSlot <= dynamicContractGroupSlotLimit;
       const bool preferStaticSkinnedRescue =
           !preferFrameLocalDynamicMesh &&
           staticGeometryReadyForSkinnedRescue &&
@@ -7534,12 +7738,21 @@ bool ShadowRendererCore::resolveRecord(const ShadowRenderableRecord& record,
               kShadowSemanticCoreTreatFrameLocalDynamicMeshAsPreSkinned;
       const bool finalDynamicSkin =
           effectiveDynamicSkin && !treatFrameLocalAsPreSkinned;
+      const bool finalLivePaletteOnlySkinned =
+          !finalDynamicSkin && allowLivePaletteOnlySkinned;
+
+      if (!hasDynamicPrimaryStream && !preferStaticSkinnedRescue &&
+          !finalLivePaletteOnlySkinned) {
+        return false;
+      }
 
       finalizeResolvedPacket(resolvedRecord);
       outPacket.resource = MakePacketResourceRef(*resource);
       outPacket.resource.vertexCount =
-          preferStaticSkinnedRescue ? staticVertexCount : dynamicVertexCount;
-      if (!preferStaticSkinnedRescue) {
+          (preferStaticSkinnedRescue || finalLivePaletteOnlySkinned)
+              ? staticVertexCount
+              : dynamicVertexCount;
+      if (!preferStaticSkinnedRescue && !finalLivePaletteOnlySkinned) {
         outPacket.resource.dynamicPositionStream = dynamicStreamPtr;
         outPacket.resource.dynamicPositionStride = dynamicStride;
         if (dynamicIndexStream != nullptr && dynamicIndexCount != 0u &&
@@ -7563,15 +7776,20 @@ bool ShadowRendererCore::resolveRecord(const ShadowRenderableRecord& record,
             bit::fnv1a_iter(outPacket.resource.contentHash, dynamicGroupHash);
       }
       outPacket.pose = dynamicPose;
-      outPacket.usesDynamicMeshPositions = !preferStaticSkinnedRescue;
+      outPacket.usesDynamicMeshPositions =
+          !preferStaticSkinnedRescue && !finalLivePaletteOnlySkinned;
       outPacket.path =
-          finalDynamicSkin ? ShadowDrawPath::Skinned : ShadowDrawPath::Rigid;
+          (finalDynamicSkin || finalLivePaletteOnlySkinned)
+              ? ShadowDrawPath::Skinned
+              : ShadowDrawPath::Rigid;
       outPacket.hasRuntimeGroupPalette = finalDynamicSkin;
       outPacket.matrixGroupsUseAveraging =
           finalDynamicSkin && hasPackedDynamicGroups &&
           dynamicTupleGroups.usesAveraging;
       outPacket.maxVertexGroupSlot =
-          finalDynamicSkin ? dynamicMaxGroupSlot : 0u;
+          (finalDynamicSkin || finalLivePaletteOnlySkinned)
+              ? dynamicMaxGroupSlot
+              : 0u;
       outPacket.runtimeGroupPalette = finalDynamicSkin
                                           ? std::move(dynamicRuntimeGroupPalette)
                                           : std::vector<Matrix4>{};

@@ -70,6 +70,7 @@ namespace dxvk {
                         War3RenderState::StageCategory category,
                         War3BatchTag batchTag,
                         bool isUiBoundaryDraw);
+        bool ForceBeforeUiInsertion();
 
         void Execute(War3InsertionPoint point,
                      const Rc<DxvkCommandList>& ctx,

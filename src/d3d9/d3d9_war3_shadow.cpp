@@ -3,6 +3,7 @@
 #include "d3d9_war3_debug.h"
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/render/war3_render_objects.h"
+#include "war3/render/war3_shadow_runtime_bridge.h"
 #include "war3/shader/war3_shader_manager.h"
 #include "war3/tools/war3_diagnostics_hub.h"
 #include "war3/tools/war3_perf_monitor.h"
@@ -32,12 +33,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
 #include "d3d9_device.h"
 #include "d3d9_texture.h"
 #include "d3d9_war3_hook.h"
+#include "../util/util_env.h"
 
 namespace dxvk {
 
@@ -60,6 +63,237 @@ struct ShadowCasterPushConstants {
   uint32_t padding[3];    // Padding to 96 bytes (16-byte alignment)
   float outlineColor[4];  // [NEW] Outline Color (RGBA) -> Total 112 bytes
 };
+
+enum class ReceiverInputRejectReason : uint32_t {
+  None = 0,
+  MissingColor = 1,
+  MissingDepth = 2,
+  MissingCamera = 3,
+  EmptyExtent = 4,
+  ExtentMismatch = 5,
+  BadViewport = 6,
+  SmallViewport = 7,
+  BadDepthRange = 8,
+  BadMatrix = 9,
+  StaleCamera = 10,
+};
+
+const char* ReceiverInputRejectReasonName(ReceiverInputRejectReason reason) {
+  switch (reason) {
+  case ReceiverInputRejectReason::None:
+    return "none";
+  case ReceiverInputRejectReason::MissingColor:
+    return "missing-color";
+  case ReceiverInputRejectReason::MissingDepth:
+    return "missing-depth";
+  case ReceiverInputRejectReason::MissingCamera:
+    return "missing-camera";
+  case ReceiverInputRejectReason::EmptyExtent:
+    return "empty-extent";
+  case ReceiverInputRejectReason::ExtentMismatch:
+    return "extent-mismatch";
+  case ReceiverInputRejectReason::BadViewport:
+    return "bad-viewport";
+  case ReceiverInputRejectReason::SmallViewport:
+    return "small-viewport";
+  case ReceiverInputRejectReason::BadDepthRange:
+    return "bad-depth-range";
+  case ReceiverInputRejectReason::BadMatrix:
+    return "bad-matrix";
+  case ReceiverInputRejectReason::StaleCamera:
+    return "stale-camera";
+  }
+  return "unknown";
+}
+
+bool IsFiniteMatrix(const Matrix4& matrix) {
+  for (uint32_t r = 0; r < 4; r++) {
+    for (uint32_t c = 0; c < 4; c++) {
+      if (!std::isfinite(matrix[r][c]))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool EnvFlagDefault(const char* name, bool fallback) {
+  const std::string value = env::getEnvVar(name);
+  if (value.empty())
+    return fallback;
+  if (value == "0" || value == "false" || value == "FALSE" ||
+      value == "off" || value == "OFF")
+    return false;
+  if (value == "1" || value == "true" || value == "TRUE" ||
+      value == "on" || value == "ON")
+    return true;
+  return fallback;
+}
+
+template <typename T>
+uint64_t War3RcObjectId(const Rc<T>& object) {
+  return uint64_t(reinterpret_cast<uintptr_t>(object.ptr()));
+}
+
+float EnvFloatDefault(const char* name, float fallback) {
+  const std::string value = env::getEnvVar(name);
+  if (value.empty())
+    return fallback;
+  char* end = nullptr;
+  const float parsed = std::strtof(value.c_str(), &end);
+  return end != value.c_str() && std::isfinite(parsed) ? parsed : fallback;
+}
+
+uint32_t EnvU32Default(const char* name, uint32_t fallback) {
+  const std::string value = env::getEnvVar(name);
+  if (value.empty())
+    return fallback;
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
+  if (end == value.c_str())
+    return fallback;
+  return static_cast<uint32_t>(
+      std::min<unsigned long>(parsed, std::numeric_limits<uint32_t>::max()));
+}
+
+bool SemanticReceiverStabilityModeEnabled() {
+  static const bool s_enabled = EnvFlagDefault(
+      "DXVK_WAR3_SEMANTIC_RECEIVER_STABILITY_MODE", false);
+  return s_enabled;
+}
+
+bool SemanticReceiverFreezeLastGoodLightingEnabled() {
+  static const bool s_enabled = EnvFlagDefault(
+      "DXVK_WAR3_SEMANTIC_RECEIVER_FREEZE_LAST_GOOD_LIGHTING", true);
+  return s_enabled;
+}
+
+enum class ReceiverRunEarlyReturnReason : uint32_t {
+  None = 0u,
+  InvalidInput = 1u,
+  ShadowsAndOutlineDisabled = 2u,
+  NoWorkNeeded = 3u,
+  CsmComputeFailed = 4u,
+};
+
+enum ReceiverRunEntryFlag : uint32_t {
+  ReceiverRunEntryInputValid = 1u << 0,
+  ReceiverRunEntryShadowsEnabled = 1u << 1,
+  ReceiverRunEntryOutlineEnabled = 1u << 2,
+  ReceiverRunEntryHasSunShadow = 1u << 3,
+  ReceiverRunEntryHasPointShadow = 1u << 4,
+  ReceiverRunEntryHasPointLights = 1u << 5,
+  ReceiverRunEntryNeedOutlinePass = 1u << 6,
+  ReceiverRunEntryNeedsShadowMap = 1u << 7,
+  ReceiverRunEntryNeedsReceiverPass = 1u << 8,
+  ReceiverRunEntryHasReplayDraws = 1u << 9,
+  ReceiverRunEntryShadowMapExecuted = 1u << 10,
+  ReceiverRunEntryDebugShadow = 1u << 11,
+};
+
+float SemanticReceiverStableStrengthClamp() {
+  static const float s_clamp = EnvFloatDefault(
+      "DXVK_WAR3_SEMANTIC_RECEIVER_STABILITY_STRENGTH_CLAMP", 0.55f);
+  return s_clamp;
+}
+
+float SemanticReceiverStablePcfRadiusOverride() {
+  static const float s_radius = EnvFloatDefault(
+      "DXVK_WAR3_SEMANTIC_RECEIVER_STABILITY_PCF_RADIUS", -1.0f);
+  return s_radius;
+}
+
+bool SemanticReceiverHoldUntilStableIdentityEnabled() {
+  static const bool s_enabled = EnvFlagDefault(
+      "DXVK_WAR3_SEMANTIC_HOLD_SHADOWMAP_UNTIL_STABLE_IDENTITY", true);
+  return s_enabled;
+}
+
+uint32_t SemanticReceiverStableIdentityFramesBeforeRedraw() {
+  static const uint32_t s_frames = EnvU32Default(
+      "DXVK_WAR3_SEMANTIC_IDENTITY_STABLE_FRAMES_BEFORE_REDRAW", 2u);
+  return std::max<uint32_t>(1u, s_frames);
+}
+
+bool SemanticReceiverHoldOnCoverageDropEnabled() {
+  static const bool s_enabled = EnvFlagDefault(
+      "DXVK_WAR3_SEMANTIC_HOLD_SHADOWMAP_ON_COVERAGE_DROP", true);
+  return s_enabled;
+}
+
+uint32_t SemanticReceiverCoverageDropTolerance() {
+  static const uint32_t s_tolerance = EnvU32Default(
+      "DXVK_WAR3_SEMANTIC_COVERAGE_DROP_TOLERANCE", 0u);
+  return s_tolerance;
+}
+
+uint32_t SemanticReceiverCoverageDropMaxHoldFrames() {
+  static const uint32_t s_frames = EnvU32Default(
+      "DXVK_WAR3_SEMANTIC_COVERAGE_DROP_MAX_HOLD_FRAMES", 30u);
+  return s_frames;
+}
+
+bool SemanticReceiverDisablePointLightsEnabled() {
+  static const bool s_enabled = EnvFlagDefault(
+      "DXVK_WAR3_SEMANTIC_RECEIVER_DISABLE_POINT_LIGHTS", true);
+  return s_enabled;
+}
+
+ReceiverInputRejectReason ValidateMainWorldReceiverInput(
+    const War3PipelineInput& input, VkExtent3D* colorExtentOut = nullptr,
+    VkExtent3D* depthExtentOut = nullptr) {
+  if (!input.colorView)
+    return ReceiverInputRejectReason::MissingColor;
+  if (!input.depthView)
+    return ReceiverInputRejectReason::MissingDepth;
+  if (!input.scene.worldCamera.valid)
+    return ReceiverInputRejectReason::MissingCamera;
+
+  const VkExtent3D colorExtent = input.colorView->mipLevelExtent(0u);
+  const VkExtent3D depthExtent = input.depthView->mipLevelExtent(0u);
+  if (colorExtentOut)
+    *colorExtentOut = colorExtent;
+  if (depthExtentOut)
+    *depthExtentOut = depthExtent;
+
+  if (colorExtent.width == 0u || colorExtent.height == 0u ||
+      depthExtent.width == 0u || depthExtent.height == 0u)
+    return ReceiverInputRejectReason::EmptyExtent;
+
+  if (colorExtent.width != depthExtent.width ||
+      colorExtent.height != depthExtent.height)
+    return ReceiverInputRejectReason::ExtentMismatch;
+
+  const auto& cam = input.scene.worldCamera;
+  if (cam.frameIndex != 0u && input.frameIndex != 0u &&
+      cam.frameIndex != input.frameIndex)
+    return ReceiverInputRejectReason::StaleCamera;
+
+  const auto& vp = cam.viewport;
+  if (vp.Width == 0u || vp.Height == 0u || vp.X >= colorExtent.width ||
+      vp.Y >= colorExtent.height)
+    return ReceiverInputRejectReason::BadViewport;
+
+  const uint64_t vpRight = uint64_t(vp.X) + uint64_t(vp.Width);
+  const uint64_t vpBottom = uint64_t(vp.Y) + uint64_t(vp.Height);
+  if (vpRight > colorExtent.width || vpBottom > colorExtent.height)
+    return ReceiverInputRejectReason::BadViewport;
+
+  const uint64_t vpArea = uint64_t(vp.Width) * uint64_t(vp.Height);
+  const uint64_t colorArea =
+      uint64_t(colorExtent.width) * uint64_t(colorExtent.height);
+  if (colorArea == 0u || vpArea * 4u < colorArea)
+    return ReceiverInputRejectReason::SmallViewport;
+
+  if (!std::isfinite(vp.MinZ) || !std::isfinite(vp.MaxZ) ||
+      vp.MinZ < 0.0f || vp.MaxZ > 1.0f || vp.MaxZ <= vp.MinZ)
+    return ReceiverInputRejectReason::BadDepthRange;
+
+  if (!IsFiniteMatrix(cam.view) || !IsFiniteMatrix(cam.proj) ||
+      !IsFiniteMatrix(cam.viewProj) || !IsFiniteMatrix(cam.invViewProj))
+    return ReceiverInputRejectReason::BadMatrix;
+
+  return ReceiverInputRejectReason::None;
+}
 
 std::vector<const War3ShadowCasterDraw*> BuildShadowReplayDraws(
     const War3FrameScene& scene) {
@@ -1235,15 +1469,25 @@ void War3ShadowReceiverPass::renderShadowVisibility(
   ctx->track(m_shadowUniformBuffer, DxvkAccess::Read);
   ctx->track(m_samplerLinear);
   ctx->track(m_shadowSamplerActive);
+  reconciliation.shadowVisibilityExecutedThisFrame = 1u;
 }
 
-void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
+bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
                                              const War3PipelineInput &input,
                                              const std::vector<
                                                  const War3ShadowCasterDraw*>*
                                                  replayDrawOverride) {
   if (!m_shadowMap || !m_shadowMapSampleView)
-    return;
+  {
+    reconciliation.shadowMapRenderSkippedNoResourcesCount = 1u;
+    return false;
+  }
+
+  reconciliation.shadowMapDrawnCasters = 0u;
+  reconciliation.cascadeCulledCount = 0u;
+  reconciliation.skinnedCasterCount = 0u;
+  reconciliation.skinnedPreparedCount = 0u;
+  reconciliation.skinnedDrawnCount = 0u;
 
   const auto localReplayDraws = BuildShadowReplayDraws(input.scene);
   const auto& replayDraws =
@@ -1259,7 +1503,7 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   const uint32_t cascadeCount =
       std::min<uint32_t>(std::max<uint32_t>(m_csmData.cascadeCount, 1u), 4u);
   if (cascadeCount == 0)
-    return;
+    return false;
 
   // 首帧诊断：输出 replay draws 总数，定位渲染端输入量
   {
@@ -1276,8 +1520,19 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   DxvkDescriptorWrite paletteDesc = {};
   paletteDesc.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   paletteDesc.buffer = ensureShadowMatrixBuffer(ctx, input, &replayDraws);
-  if (paletteDesc.buffer.buffer == VK_NULL_HANDLE)
-    return;
+  if (paletteDesc.buffer.buffer == VK_NULL_HANDLE) {
+    reconciliation.shadowMapRenderSkippedNoMatrixBufferCount = 1u;
+    return false;
+  }
+  reconciliation.shadowMatrixSceneKey = m_shadowMatrixSceneKey;
+  reconciliation.shadowMatrixUploadSerial = m_shadowMatrixUploadSerial;
+  reconciliation.shadowMatrixBufferObjectPtr =
+      War3RcObjectId(m_vertexBlendPaletteBuffer);
+  reconciliation.shadowMatrixBufferOffset =
+      uint64_t(paletteDesc.buffer.offset);
+  reconciliation.shadowMatrixBufferSize = uint64_t(paletteDesc.buffer.size);
+  reconciliation.shadowMatrixBufferGpuAddress =
+      uint64_t(paletteDesc.buffer.gpuAddress);
 
   const uint32_t objectBase = m_shadowMatrixObjectBase;
 
@@ -1329,6 +1584,10 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     VkImageView alphaImageView = VK_NULL_HANDLE;
     VkBuffer positionBuffer = VK_NULL_HANDLE;
     VkBuffer indexBuffer = VK_NULL_HANDLE;
+    // Phase 7.52 AlphaTest 修复：把 prepare 阶段决定的 effective alpha-test 决策
+    // 跨阶段传给 pc.flags 写入。alpha-blend only + 有 UV + 有 diffuse 的物体
+    // 会被 promote 成 alpha-test，以解决 "带 AlphaTest 的贴图投实心阴影" 问题。
+    bool effectiveAlphaTest = false;
   };
 
   const uint32_t casterCount =
@@ -1388,8 +1647,21 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     key.blendBinding = draw.blendBinding;
     key.blendStride = draw.blendStride;
 
-    key.alphaTestEnabled = draw.alphaTestEnabled;
-    if (draw.alphaTestEnabled) {
+    // Phase 7.52 AlphaTest 修复：把 alpha-blend only 物体（有 UV + diffuseTexture，
+    // 但 classification 认为是 AlphaBlend 不是 Cutout）也 promote 成 alpha-test
+    // caster。原因：War3 很多透明贴图（树叶、栅栏、半透明特效等）走的是
+    // D3DRS_ALPHABLENDENABLE 但没设 ALPHATESTENABLE。如果 shadow caster 不做
+    // alpha discard，整个贴图投出实心方块阴影，这正是用户反馈的
+    // "带 AlphaTest 的贴图光影射过去依然视作不透明"。
+    // 约束：必须同时有 UV 数据（uvFormat 有效 + uvStride > 0）和 diffuseTexture，
+    // 否则 shader 取不到真实 alpha。
+    const bool effectiveAlphaTestShadow =
+        draw.alphaTestEnabled ||
+        (draw.alphaBlendEnabled && draw.diffuseTexture &&
+         draw.uvFormat != VK_FORMAT_UNDEFINED && draw.uvStride > 0u);
+
+    key.alphaTestEnabled = effectiveAlphaTestShadow;
+    if (effectiveAlphaTestShadow) {
       key.uvFormat = draw.uvFormat;
       key.uvOffset = draw.uvOffset;
       key.uvStride = draw.uvStride;
@@ -1407,7 +1679,10 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     out.pipelineHash = key.hash();
     out.positionBuffer = draw.positionInfo.buffer;
     out.indexBuffer = draw.indexed ? draw.indexInfo.buffer : VK_NULL_HANDLE;
-    out.alphaImageView = (draw.alphaTestEnabled && draw.diffuseTexture)
+    // Phase 7.52 AlphaTest 修复：保留 prepare 阶段的 effective alpha-test 决定，
+    // 让 pc.flags 写入循环直接复用，不再仅看 draw.alphaTestEnabled。
+    out.effectiveAlphaTest = effectiveAlphaTestShadow;
+    out.alphaImageView = (effectiveAlphaTestShadow && draw.diffuseTexture)
                              ? draw.textureDescriptor.legacy.image.imageView
                              : VK_NULL_HANDLE;
     if (skinnedDraw)
@@ -1623,12 +1898,17 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         pc.paletteOffset = objectBase + idx;
       }
 
-      if (draw.alphaTestEnabled && draw.diffuseTexture) {
+      if (prep.effectiveAlphaTest && draw.diffuseTexture) {
         pc.flags |= 0x4u; // bit2 = alphaTest启用
         if (alphaShadowHashed)
           pc.flags |= 0x8u; // bit3 = Hash Alpha
+        // Phase 7.52 AlphaTest 修复：alpha-blend only 物体被 promote 成 alpha-test 时，
+        // 使用 0.5 作为默认 alphaRef（半透明判断的合理阈值）；
+        // classification 为 Cutout 时使用 draw.alphaRef 真实值。
+        const float effectiveAlphaRef =
+            draw.alphaTestEnabled ? draw.alphaRef : 0.5f;
         pc.alphaRef =
-            std::clamp(draw.alphaRef + alphaRefBiasCascade, 0.0f, 1.0f);
+            std::clamp(effectiveAlphaRef + alphaRefBiasCascade, 0.0f, 1.0f);
         pc.samplerIndex = draw.diffuseSamplerIndex;
       }
 
@@ -1643,7 +1923,7 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       descriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       descriptors[0].buffer = paletteDesc.buffer;
 
-      if (draw.alphaTestEnabled && draw.diffuseTexture) {
+      if (prep.effectiveAlphaTest && draw.diffuseTexture) {
         descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         descriptors[1].descriptor = &draw.textureDescriptor;
         ctx->track(draw.diffuseTexture->image(), DxvkAccess::Read);
@@ -1757,6 +2037,20 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     static uint32_t s_logDrawn = 0;
     const bool hasSkinnedCasters = skinnedCasterCount > 0u;
     const uint32_t logIndex = s_logDrawn++;
+    // Phase 7.2: 对账计数器（每帧填充）
+    reconciliation.shadowMapDrawnCasters = drawnCasters;
+    reconciliation.skinnedCasterCount = skinnedCasterCount;
+    reconciliation.skinnedPreparedCount = skinnedPreparedCount;
+    reconciliation.skinnedInvalidBufferCount = skinnedInvalidBufferCount;
+    reconciliation.skinnedInvalidPipelineCount = skinnedInvalidPipelineCount;
+    uint32_t totalCulled = 0u;
+    uint32_t totalSkinnedDrawn = 0u;
+    for (uint32_t c = 0; c < cascadeCount; ++c) {
+      totalCulled += culledPerCascade[c];
+      totalSkinnedDrawn += skinnedDrawnPerCascade[c];
+    }
+    reconciliation.cascadeCulledCount = totalCulled;
+    reconciliation.skinnedDrawnCount = totalSkinnedDrawn;
     // 前5帧强制日志，验证 renderShadowMap 实际画了多少 caster
     if (logIndex < 5u ||
         (hasSkinnedCasters &&
@@ -1798,6 +2092,9 @@ void War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   }
 
   ctx->track(m_shadowMap, DxvkAccess::Write);
+  reconciliation.shadowMapExecutedThisFrame = 1u;
+  reconciliation.shadowMapRenderSerial = ++m_shadowMapRenderSerial;
+  return true;
 }
 
 // [NEW] Point Light Cube Shadow Rendering
@@ -1966,8 +2263,14 @@ void War3ShadowReceiverPass::renderPointShadow(const Rc<DxvkCommandList> &ctx,
       key.blendBinding = draw.blendBinding;
       key.blendStride = draw.blendStride;
 
-      key.alphaTestEnabled = draw.alphaTestEnabled;
-      if (draw.alphaTestEnabled) {
+      // Phase 7.52 AlphaTest 修复（点光源阴影路径）：同主 CSM 路径。
+      const bool effectiveAlphaTestShadowPoint =
+          draw.alphaTestEnabled ||
+          (draw.alphaBlendEnabled && draw.diffuseTexture &&
+           draw.uvFormat != VK_FORMAT_UNDEFINED && draw.uvStride > 0u);
+
+      key.alphaTestEnabled = effectiveAlphaTestShadowPoint;
+      if (effectiveAlphaTestShadowPoint) {
         key.uvFormat = draw.uvFormat;
         key.uvOffset = draw.uvOffset;
         key.uvStride = draw.uvStride;
@@ -1995,11 +2298,14 @@ void War3ShadowReceiverPass::renderPointShadow(const Rc<DxvkCommandList> &ctx,
         pc.paletteOffset = objectBase + drawIdx;
       }
 
-      if (draw.alphaTestEnabled && draw.diffuseTexture) {
+      if (effectiveAlphaTestShadowPoint && draw.diffuseTexture) {
         pc.flags |= 0x4u;
         if (alphaShadowHashed)
           pc.flags |= 0x8u;
-        pc.alphaRef = draw.alphaRef;
+        // Phase 7.52 AlphaTest 修复：alpha-blend only promote 时使用 0.5 默认 alphaRef。
+        const float effectiveAlphaRef =
+            draw.alphaTestEnabled ? draw.alphaRef : 0.5f;
+        pc.alphaRef = effectiveAlphaRef;
         pc.samplerIndex = draw.diffuseSamplerIndex;
       }
 
@@ -2007,7 +2313,7 @@ void War3ShadowReceiverPass::renderPointShadow(const Rc<DxvkCommandList> &ctx,
       std::array<DxvkDescriptorWrite, 2> descriptors = {};
       descriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       descriptors[0].buffer = paletteDesc.buffer;
-      if (draw.alphaTestEnabled && draw.diffuseTexture) {
+      if (effectiveAlphaTestShadowPoint && draw.diffuseTexture) {
         descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         descriptors[1].descriptor = &draw.textureDescriptor;
         ctx->track(draw.diffuseTexture->image(), DxvkAccess::Read);
@@ -2301,6 +2607,7 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
     ctx->track(m_shadowHistory[writeIndex], DxvkAccess::Write);
   ctx->track(m_samplerLinear);
   ctx->track(m_shadowSamplerActive);
+  reconciliation.receiverDrawExecutedThisFrame = 1u;
 }
 
 void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
@@ -2308,34 +2615,285 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   // [Perf] Add timing scope for Shadow/Outline pass
   auto perfScope = war3::War3PerfMonitor::instance().scope("Shadow/Main", ctx);
 
+  // Phase 7.2: 每帧重置对账计数器
+  reconciliation = {};
+  reconciliation.shadowMapRenderSerial = m_shadowMapRenderSerial;
+  const auto strengthToMilli = [](float value) -> uint32_t {
+    return uint32_t(std::clamp(value, 0.0f, 1.0f) * 1000.0f + 0.5f);
+  };
+  const auto recordShadowResourceFingerprint =
+      [&](uint32_t historyReadIndex, uint32_t historyWriteIndex) {
+        reconciliation.shadowMapImagePtr = War3RcObjectId(m_shadowMap);
+        reconciliation.shadowMapSampleViewPtr =
+            War3RcObjectId(m_shadowMapSampleView);
+        reconciliation.shadowCurrentImagePtr =
+            War3RcObjectId(m_shadowCurrent);
+        reconciliation.shadowCurrentViewPtr =
+            War3RcObjectId(m_shadowCurrentView);
+        reconciliation.shadowHistoryReadImagePtr =
+            historyReadIndex < m_shadowHistory.size()
+                ? War3RcObjectId(m_shadowHistory[historyReadIndex])
+                : 0u;
+        reconciliation.shadowHistoryReadViewPtr =
+            historyReadIndex < m_shadowHistoryView.size()
+                ? War3RcObjectId(m_shadowHistoryView[historyReadIndex])
+                : 0u;
+        reconciliation.shadowHistoryWriteImagePtr =
+            historyWriteIndex < m_shadowHistory.size()
+                ? War3RcObjectId(m_shadowHistory[historyWriteIndex])
+                : 0u;
+        reconciliation.shadowHistoryWriteViewPtr =
+            historyWriteIndex < m_shadowHistoryStorageView.size()
+                ? War3RcObjectId(m_shadowHistoryStorageView[historyWriteIndex])
+                : 0u;
+      };
+  const auto setReceiverRunEntryFlags =
+      [&](bool inputValid, bool shadowsEnabled, bool outlineEnabled,
+          bool hasSunShadow, bool hasPointShadow, bool hasPointLights,
+          bool needOutlinePass, bool receiverNeedsShadowMap,
+          bool needReceiverPass, bool hasReplayDraws,
+          bool shadowMapExecuted, bool debugShadow) {
+        uint32_t flags = 0u;
+        if (inputValid)
+          flags |= ReceiverRunEntryInputValid;
+        if (shadowsEnabled)
+          flags |= ReceiverRunEntryShadowsEnabled;
+        if (outlineEnabled)
+          flags |= ReceiverRunEntryOutlineEnabled;
+        if (hasSunShadow)
+          flags |= ReceiverRunEntryHasSunShadow;
+        if (hasPointShadow)
+          flags |= ReceiverRunEntryHasPointShadow;
+        if (hasPointLights)
+          flags |= ReceiverRunEntryHasPointLights;
+        if (needOutlinePass)
+          flags |= ReceiverRunEntryNeedOutlinePass;
+        if (receiverNeedsShadowMap)
+          flags |= ReceiverRunEntryNeedsShadowMap;
+        if (needReceiverPass)
+          flags |= ReceiverRunEntryNeedsReceiverPass;
+        if (hasReplayDraws)
+          flags |= ReceiverRunEntryHasReplayDraws;
+        if (shadowMapExecuted)
+          flags |= ReceiverRunEntryShadowMapExecuted;
+        if (debugShadow)
+          flags |= ReceiverRunEntryDebugShadow;
+        reconciliation.receiverRunEntryFlags = flags;
+      };
+  const auto publishReconciliationStats = [&]() {
+    auto stats = input.scene.shadowStats;
+    stats.semanticSceneShadowCastersCount = reconciliation.shadowCastersCount;
+    stats.semanticSceneReplayDrawsCount = reconciliation.replayDrawsCount;
+    stats.semanticSceneShadowMapDrawnCasters =
+        reconciliation.shadowMapDrawnCasters;
+    stats.semanticSceneShadowMapCascadeCulledCount =
+        reconciliation.cascadeCulledCount;
+    stats.semanticSceneShadowMapSkinnedCasterCount =
+        reconciliation.skinnedCasterCount;
+    stats.semanticSceneShadowMapSkinnedPreparedCount =
+        reconciliation.skinnedPreparedCount;
+    stats.semanticSceneShadowMapSkinnedInvalidBufferCount =
+        reconciliation.skinnedInvalidBufferCount;
+    stats.semanticSceneShadowMapSkinnedInvalidPipelineCount =
+        reconciliation.skinnedInvalidPipelineCount;
+    stats.semanticSceneShadowMapSkinnedDrawnCount =
+        reconciliation.skinnedDrawnCount;
+    stats.semanticSceneShadowTaaActive = reconciliation.shadowTaaActive;
+    stats.semanticSceneReceiverReuseShadowMap =
+        reconciliation.receiverReuseShadowMap;
+    stats.semanticSceneReceiverInputValid =
+        reconciliation.receiverInputValid;
+    stats.semanticSceneReceiverInputRejectReason =
+        reconciliation.receiverInputRejectReason;
+    stats.semanticSceneReceiverNeedPass = reconciliation.receiverNeedPass;
+    stats.semanticSceneReceiverNeedShadowMap =
+        reconciliation.receiverNeedShadowMap;
+    stats.semanticSceneReceiverHasCompleteShadowMap =
+        reconciliation.receiverHasCompleteShadowMap;
+    stats.semanticSceneReceiverHasUsableDirectionalShadow =
+        reconciliation.receiverHasUsableDirectionalShadow;
+    stats.semanticSceneReceiverActiveStrengthMilli =
+        reconciliation.receiverActiveStrengthMilli;
+    stats.semanticSceneReceiverUboStrengthMilli =
+        reconciliation.receiverUboStrengthMilli;
+    stats.semanticSceneReceiverDebugMode = reconciliation.receiverDebugMode;
+    stats.semanticSceneReceiverCsmCascadeCount =
+        reconciliation.receiverCsmCascadeCount;
+    stats.semanticSceneReceiverRunEntryFlags =
+        reconciliation.receiverRunEntryFlags;
+    stats.semanticSceneReceiverRunEarlyReturnReason =
+        reconciliation.receiverRunEarlyReturnReason;
+    stats.semanticSceneShadowMapExecutedThisFrame =
+        reconciliation.shadowMapExecutedThisFrame;
+    stats.semanticSceneReceiverSettingsShadowsEnabled =
+        reconciliation.receiverSettingsShadowsEnabled;
+    stats.semanticSceneReceiverSettingsOutlineEnabled =
+        reconciliation.receiverSettingsOutlineEnabled;
+    stats.semanticSceneReceiverSettingsRawStrengthMilli =
+        reconciliation.receiverSettingsRawStrengthMilli;
+    stats.semanticSceneReceiverComputedShadowStrengthMilli =
+        reconciliation.receiverComputedShadowStrengthMilli;
+    stats.semanticSceneReceiverHasSunShadow =
+        reconciliation.receiverHasSunShadow;
+    stats.semanticSceneReceiverHasPointShadow =
+        reconciliation.receiverHasPointShadow;
+    stats.semanticSceneReceiverNeedOutlinePass =
+        reconciliation.receiverNeedOutlinePass;
+    stats.semanticSceneReceiverZeroStrengthFrameCount =
+        reconciliation.receiverZeroStrengthFrameCount;
+    stats.semanticSceneReceiverDrawnWithZeroStrengthCount =
+        reconciliation.receiverDrawnWithZeroStrengthCount;
+    stats.semanticSceneReceiverNoCompleteShadowMapCount =
+        reconciliation.receiverNoCompleteShadowMapCount;
+    stats.semanticSceneReceiverNoShadowMapImageCount =
+        reconciliation.receiverNoShadowMapImageCount;
+    stats.semanticSceneReceiverNoShadowMapSampleViewCount =
+        reconciliation.receiverNoShadowMapSampleViewCount;
+    stats.semanticSceneReceiverNoCandidateCsmCount =
+        reconciliation.receiverNoCandidateCsmCount;
+    stats.semanticSceneReceiverCsmFallbackToLastGoodCount =
+        reconciliation.receiverCsmFallbackToLastGoodCount;
+    stats.semanticSceneReceiverHoldInvalidCsmCount =
+        reconciliation.receiverHoldInvalidCsmCount;
+    stats.semanticSceneReceiverHoldEmptyReplayCount =
+        reconciliation.receiverHoldEmptyReplayCount;
+    stats.semanticSceneReceiverHoldIdentityChurnCount =
+        reconciliation.receiverHoldIdentityChurnCount;
+    stats.semanticSceneReceiverReuseInvalidatedAfterEnsureCount =
+        reconciliation.receiverReuseInvalidatedAfterEnsureCount;
+    stats.semanticSceneShadowMapRenderSkippedNoResourcesCount =
+        reconciliation.shadowMapRenderSkippedNoResourcesCount;
+    stats.semanticSceneShadowMapRenderSkippedNoMatrixBufferCount =
+        reconciliation.shadowMapRenderSkippedNoMatrixBufferCount;
+    stats.semanticSceneReceiverViewportX = reconciliation.receiverViewportX;
+    stats.semanticSceneReceiverViewportY = reconciliation.receiverViewportY;
+    stats.semanticSceneReceiverViewportWidth =
+        reconciliation.receiverViewportWidth;
+    stats.semanticSceneReceiverViewportHeight =
+        reconciliation.receiverViewportHeight;
+    stats.semanticSceneShadowMatrixSceneKey =
+        reconciliation.shadowMatrixSceneKey;
+    stats.semanticSceneShadowMatrixUploadSerial =
+        reconciliation.shadowMatrixUploadSerial;
+    stats.semanticSceneShadowMatrixBufferObjectPtr =
+        reconciliation.shadowMatrixBufferObjectPtr;
+    stats.semanticSceneShadowMatrixBufferOffset =
+        reconciliation.shadowMatrixBufferOffset;
+    stats.semanticSceneShadowMatrixBufferSize =
+        reconciliation.shadowMatrixBufferSize;
+    stats.semanticSceneShadowMatrixBufferGpuAddress =
+        reconciliation.shadowMatrixBufferGpuAddress;
+    stats.semanticSceneShadowMapRenderSerial =
+        reconciliation.shadowMapRenderSerial;
+    stats.semanticSceneShadowMapImagePtr = reconciliation.shadowMapImagePtr;
+    stats.semanticSceneShadowMapSampleViewPtr =
+        reconciliation.shadowMapSampleViewPtr;
+    stats.semanticSceneShadowCurrentImagePtr =
+        reconciliation.shadowCurrentImagePtr;
+    stats.semanticSceneShadowCurrentViewPtr =
+        reconciliation.shadowCurrentViewPtr;
+    stats.semanticSceneShadowHistoryReadImagePtr =
+        reconciliation.shadowHistoryReadImagePtr;
+    stats.semanticSceneShadowHistoryReadViewPtr =
+        reconciliation.shadowHistoryReadViewPtr;
+    stats.semanticSceneShadowHistoryWriteImagePtr =
+        reconciliation.shadowHistoryWriteImagePtr;
+    stats.semanticSceneShadowHistoryWriteViewPtr =
+        reconciliation.shadowHistoryWriteViewPtr;
+    stats.semanticSceneShadowVisibilityExecutedThisFrame =
+        reconciliation.shadowVisibilityExecutedThisFrame;
+    stats.semanticSceneReceiverDrawExecutedThisFrame =
+        reconciliation.receiverDrawExecutedThisFrame;
+    stats.semanticSceneShadowTaaMode = reconciliation.shadowTaaMode;
+    stats.semanticSceneShadowHistoryValidBefore =
+        reconciliation.shadowHistoryValidBefore;
+    stats.semanticSceneShadowHistoryValidAfter =
+        reconciliation.shadowHistoryValidAfter;
+    stats.semanticSceneShadowHistoryReadIndex =
+        reconciliation.shadowHistoryReadIndex;
+    stats.semanticSceneShadowHistoryWriteIndex =
+        reconciliation.shadowHistoryWriteIndex;
+    stats.semanticSceneShadowReceiverSampleSource =
+        reconciliation.shadowReceiverSampleSource;
+    dxvk::war3::render::NoteShadowSceneStats(stats);
+    war3::War3PerfMonitor::instance().noteShadowBudgetFrame(stats);
+  };
+
   static bool s_first = true;
   if (s_first) {
     s_first = false;
     WAR3_RENDER_LOG("DXVK War3ShadowReceiverPass: FIRST_CALL (BeforeUi)\n");
   }
 
-  if (!input.colorView)
-    return;
-  if (!input.depthView || !input.scene.worldCamera.valid) {
-    static bool s_warned = false;
-    if (!s_warned) {
-      s_warned = true;
-      WAR3_RENDER_LOG("DXVK War3ShadowReceiverPass: skip (missing "
-                      "depth/camera) depth=%d camera=%d\n",
-                      input.depthView ? 1 : 0,
-                      input.scene.worldCamera.valid ? 1 : 0);
+  VkExtent3D receiverColorExtent = {};
+  VkExtent3D receiverDepthExtent = {};
+  const ReceiverInputRejectReason receiverInputRejectReason =
+      ValidateMainWorldReceiverInput(input, &receiverColorExtent,
+                                     &receiverDepthExtent);
+  reconciliation.receiverInputRejectReason =
+      static_cast<uint32_t>(receiverInputRejectReason);
+  reconciliation.receiverInputValid =
+      receiverInputRejectReason == ReceiverInputRejectReason::None ? 1u : 0u;
+  if (receiverInputRejectReason != ReceiverInputRejectReason::None) {
+    reconciliation.receiverRunEarlyReturnReason =
+        static_cast<uint32_t>(ReceiverRunEarlyReturnReason::InvalidInput);
+    setReceiverRunEntryFlags(false, false, false, false, false, false, false,
+                             false, false, false, false, false);
+    static uint32_t s_rejectLogs[16] = {};
+    const uint32_t reasonIndex =
+        std::min<uint32_t>(static_cast<uint32_t>(receiverInputRejectReason),
+                           15u);
+    if (s_rejectLogs[reasonIndex]++ < 8u) {
+      const auto& vp = input.scene.worldCamera.viewport;
+      WAR3_RENDER_LOG(
+          "DXVK War3ShadowReceiverPass: skip invalid receiver input "
+          "reason=%s frame=%u cameraFrame=%u color=%ux%u depth=%ux%u "
+          "vp=%ux%u@(%u,%u) z=(%.3f,%.3f)\n",
+          ReceiverInputRejectReasonName(receiverInputRejectReason),
+          static_cast<unsigned>(input.frameIndex),
+          static_cast<unsigned>(input.scene.worldCamera.frameIndex),
+          static_cast<unsigned>(receiverColorExtent.width),
+          static_cast<unsigned>(receiverColorExtent.height),
+          static_cast<unsigned>(receiverDepthExtent.width),
+          static_cast<unsigned>(receiverDepthExtent.height),
+          static_cast<unsigned>(vp.Width), static_cast<unsigned>(vp.Height),
+          static_cast<unsigned>(vp.X), static_cast<unsigned>(vp.Y),
+          static_cast<double>(vp.MinZ), static_cast<double>(vp.MaxZ));
     }
     if (War3RenderState::HasOutlineHandles() && !war3dbg::RenderLogEnabled()) {
       static uint32_t s_outlineSkipLogs = 0;
       if (s_outlineSkipLogs++ < 3) {
-        war3dbg::Print("DXVK_Outline: skip (missing depth/camera) depth=%d "
-                       "camera=%d handles=%u\n",
-                       input.depthView ? 1 : 0,
-                       input.scene.worldCamera.valid ? 1 : 0,
+        war3dbg::Print("DXVK_Outline: skip (invalid receiver input) reason=%s "
+                       "handles=%u\n",
+                       ReceiverInputRejectReasonName(receiverInputRejectReason),
                        War3RenderState::GetOutlineHandleCount());
       }
     }
+    publishReconciliationStats();
     return;
+  }
+  {
+    const auto& vp = input.scene.worldCamera.viewport;
+    reconciliation.receiverViewportX = vp.X;
+    reconciliation.receiverViewportY = vp.Y;
+    reconciliation.receiverViewportWidth = vp.Width;
+    reconciliation.receiverViewportHeight = vp.Height;
+    static uint32_t s_validLogs = 0;
+    if (s_validLogs++ < 3u) {
+      WAR3_RENDER_LOG(
+          "DXVK War3ShadowReceiverPass: receiver input valid frame=%u "
+          "cameraFrame=%u color=%ux%u depth=%ux%u vp=%ux%u@(%u,%u) "
+          "z=(%.3f,%.3f)\n",
+          static_cast<unsigned>(input.frameIndex),
+          static_cast<unsigned>(input.scene.worldCamera.frameIndex),
+          static_cast<unsigned>(receiverColorExtent.width),
+          static_cast<unsigned>(receiverColorExtent.height),
+          static_cast<unsigned>(receiverDepthExtent.width),
+          static_cast<unsigned>(receiverDepthExtent.height),
+          static_cast<unsigned>(vp.Width), static_cast<unsigned>(vp.Height),
+          static_cast<unsigned>(vp.X), static_cast<unsigned>(vp.Y),
+          static_cast<double>(vp.MinZ), static_cast<double>(vp.MaxZ));
+    }
   }
 
   War3RenderSettings defaultSettings = {};
@@ -2365,7 +2923,16 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   }
   const bool shadowsEnabled = settings->shadows.enabled;
   const bool outlineEnabled = settings->occludedOutline.enabled;
+  reconciliation.receiverSettingsShadowsEnabled = shadowsEnabled ? 1u : 0u;
+  reconciliation.receiverSettingsOutlineEnabled = outlineEnabled ? 1u : 0u;
+  reconciliation.receiverSettingsRawStrengthMilli =
+      strengthToMilli(settings->shadows.strength);
+  setReceiverRunEntryFlags(true, shadowsEnabled, outlineEnabled, false, false,
+                           false, false, false, false, false, false, false);
   if (!shadowsEnabled && !outlineEnabled) {
+    reconciliation.receiverRunEarlyReturnReason =
+        static_cast<uint32_t>(
+            ReceiverRunEarlyReturnReason::ShadowsAndOutlineDisabled);
     if (War3RenderState::HasOutlineHandles()) {
       static bool s_loggedOutlineDisabled = false;
       if (!s_loggedOutlineDisabled) {
@@ -2382,6 +2949,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         }
       }
     }
+    publishReconciliationStats();
     return;
   }
 
@@ -2511,13 +3079,19 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         m_time01LastRaw = rawTime01;
 
         // 时间被脚本/触发器重置时可能会出现大跳变；此时直接对齐，避免“极速追赶”
-        if (rawDt > 0.0f && rawDt < 2.0f && rawDelta < 0.25f) {
-          const float newSpeed = rawDelta / rawDt;
-          // 合理上限：允许加速（比如加速昼夜），但避免异常值把系统带飞
-          const float maxSpeed = 1.0f / 5.0f; // 5 秒跑完一天已经非常夸张
-          m_time01Speed = std::clamp(newSpeed, 0.0f, maxSpeed);
+        if constexpr (dxvk::war3::internal::kShadowTimeAdaptiveSpeedEnabled) {
+          if (rawDt > 0.0f && rawDt < 2.0f && rawDelta < 0.25f) {
+            const float newSpeed = rawDelta / rawDt;
+            // 合理上限：允许加速（比如加速昼夜），但避免异常值把系统带飞
+            const float maxSpeed = 1.0f / 5.0f; // 5 秒跑完一天已经非常夸张
+            m_time01Speed = std::clamp(newSpeed, 0.0f, maxSpeed);
+          } else {
+            m_time01Smoothed = rawTime01;
+            m_time01Speed = 1.0f / std::max(1.0f, m_dayLengthSeconds);
+          }
         } else {
-          m_time01Smoothed = rawTime01;
+          if (rawDelta >= 0.25f || rawDt >= 2.0f)
+            m_time01Smoothed = rawTime01;
           m_time01Speed = 1.0f / std::max(1.0f, m_dayLengthSeconds);
         }
       }
@@ -2609,10 +3183,13 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   // Angle -180 (PI) = West (-X).
   // 所以我们让 azimuth 从 0 变到 -PI
 
-  // [Fix] 量化 time01 以减少逐帧太阳方向微调导致的阴影抖动。
-  // 步进值 0.0002 约等于 4-5 秒游戏时间，足以消除 PLL 平滑引入的逐帧噪声。
+  // [Fix] Optional time quantization for diagnosis. Default stays smooth:
+  // quantized sun steps can look like periodic shadow pops when visual QA is
+  // focused on flicker.
   const float kSunQuantStep = 0.0002f;
-  float quantizedTime01 = std::round(time01 / kSunQuantStep) * kSunQuantStep;
+  float quantizedTime01 = time01;
+  if constexpr (dxvk::war3::internal::kShadowSunTimeQuantizationEnabled)
+    quantizedTime01 = std::round(time01 / kSunQuantStep) * kSunQuantStep;
 
   float rawDayPhase = (quantizedTime01 - 0.25f) / 0.5f;
   float sunYaw = -rawDayPhase * 3.14159265f;
@@ -2749,18 +3326,20 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   bool isRising = std::cos(time01 * (2.0f * 3.14159265f)) >= 0.0f;
   UpdatePhase(realAltitudeRad, isRising, kTransitionRad);
 
-  // 【关键修复】将计算出的光照参数写回全局设置，确保影响后续渲染/游戏光照
+  // Feed the computed day/night light back into the shared sun settings so the
+  // fixed-function main light and volumetric pass can see the same cold/warm
+  // cycle. Only direction/color are synchronized here; shadow strength stays
+  // local so shadow-specific tuning is not hard-overwritten every frame.
   auto *globalSettings = const_cast<War3RenderSettings *>(settings);
   if (globalSettings) {
     globalSettings->sun.direction = finalLightDir;
     globalSettings->sun.color = finalLightColor;
-    globalSettings->shadows.strength = finalShadowStrength;
-
-    // 同步更新本地副本以供后续 CSM 计算
-    mutableSettings.sun.direction = finalLightDir;
-    mutableSettings.sun.color = finalLightColor;
-    mutableSettings.shadows.strength = finalShadowStrength;
   }
+
+  // Shadow-specific day-night strength remains local to this pass.
+  mutableSettings.sun.direction = finalLightDir;
+  mutableSettings.sun.color = finalLightColor;
+  mutableSettings.shadows.strength = finalShadowStrength;
 
   // 调试输出 (每 60 帧或满足条件时)
   /*         static int s_logTimer = 0;
@@ -2811,12 +3390,29 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
   const bool needOutlinePass =
       outlineEnabled && War3RenderState::HasOutlineHandles();
+  const float activeShadowStrengthForGates =
+      shadowsEnabled ? mutableSettings.shadows.strength : 0.0f;
+  reconciliation.receiverComputedShadowStrengthMilli =
+      strengthToMilli(mutableSettings.shadows.strength);
+  reconciliation.receiverActiveStrengthMilli =
+      strengthToMilli(activeShadowStrengthForGates);
+  reconciliation.receiverDebugMode =
+      uint32_t(static_cast<int>(shadowSettings.debugMode));
+  reconciliation.receiverHasSunShadow = hasSunShadow ? 1u : 0u;
+  reconciliation.receiverHasPointShadow = hasPointShadow ? 1u : 0u;
+  reconciliation.receiverNeedOutlinePass = needOutlinePass ? 1u : 0u;
+  setReceiverRunEntryFlags(true, shadowsEnabled, outlineEnabled, hasSunShadow,
+                           hasPointShadow, m_hasPointLights, needOutlinePass,
+                           false, false, false, false, debugShadow);
   if (!hasSunShadow && !hasPointShadow && !m_hasPointLights &&
       !needOutlinePass) {
+    reconciliation.receiverRunEarlyReturnReason =
+        static_cast<uint32_t>(ReceiverRunEarlyReturnReason::NoWorkNeeded);
     if (hasListeners) {
       war3shader::internal::DispatchRenderEvent(
           war3shader::RenderEventID::SHADOW_PASS_END);
     }
+    publishReconciliationStats();
     return;
   }
   {
@@ -2872,9 +3468,22 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       replayGeometryWork, requestedShadowResolution, m_csmConfig.shadowResolution);
 
   // 计算本帧级联数据（需要外部捕获世界相机矩阵后才会有效）
+  War3WorldCameraState effectiveWorldCamera = input.scene.worldCamera;
   War3CsmData newCsm = m_csm.Compute(
-      input.scene.worldCamera, mutableSettings.sun.direction, m_csmConfig);
+      effectiveWorldCamera, mutableSettings.sun.direction, m_csmConfig);
   const bool hasCandidateCsm = newCsm.cascadeCount != 0;
+  if (!hasCandidateCsm)
+    reconciliation.receiverNoCandidateCsmCount = 1u;
+  if (hasCandidateCsm) {
+    m_lastGoodReceiverCamera = effectiveWorldCamera;
+    m_hasLastGoodReceiverCamera = true;
+  }
+  const bool csmFallbackToLastGood =
+      !hasCandidateCsm && m_csmData.cascadeCount != 0;
+  if (csmFallbackToLastGood)
+    reconciliation.receiverCsmFallbackToLastGoodCount = 1u;
+  if (csmFallbackToLastGood && m_hasLastGoodReceiverCamera)
+    effectiveWorldCamera = m_lastGoodReceiverCamera;
 
   if (!hasCandidateCsm) {
     // 容错：偶发相机矩阵被 overlay/正交污染时，CSM 计算可能失败。
@@ -2884,7 +3493,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       if (!s_loggedFallback) {
         s_loggedFallback = true;
         WAR3_RENDER_LOG("DXVK War3ShadowReceiverPass: CSM compute failed, "
-                        "fallback to last-good CSM\n");
+                        "fallback to last-good CSM/camera\n");
       }
     } else {
       static bool s_warned = false;
@@ -2901,6 +3510,9 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         war3shader::internal::DispatchRenderEvent(
             war3shader::RenderEventID::SHADOW_PASS_END);
       }
+      reconciliation.receiverRunEarlyReturnReason =
+          static_cast<uint32_t>(ReceiverRunEarlyReturnReason::CsmComputeFailed);
+      publishReconciliationStats();
       return;
     }
   }
@@ -2919,11 +3531,114 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       (shadowsEnabled && ((debugModeEnum != War3ShadowDebugMode::None) ||
                           (activeShadowStrength > 1e-3f))) ||
       m_hasPointLights;
+  reconciliation.receiverNeedShadowMap = receiverNeedsShadowMap ? 1u : 0u;
+  reconciliation.receiverNeedPass = needReceiverPass ? 1u : 0u;
+  reconciliation.receiverActiveStrengthMilli =
+      strengthToMilli(activeShadowStrength);
+  reconciliation.receiverDebugMode =
+      uint32_t(static_cast<int>(debugModeEnum));
+  setReceiverRunEntryFlags(true, shadowsEnabled, outlineEnabled, hasSunShadow,
+                           hasPointShadow, m_hasPointLights, needOutlinePass,
+                           receiverNeedsShadowMap, needReceiverPass,
+                           replayCasterCount != 0u, false, debugShadow);
 
   // Phase 4：shadow map 优先由 instances + fallbacks 双通道重放生成。
   // shadowCasters 仍保留为兼容容器，但不再作为 directional shadow 的主输入。
   // 即便本帧 caster 为空，也会清屏 shadow map（全亮）以避免复用旧 shadow
   // map 导致拖影。
+
+  // Phase 7.2: 对账计数器
+  reconciliation.shadowCastersCount =
+      static_cast<uint32_t>(input.scene.shadowCasters.size());
+  reconciliation.replayDrawsCount = static_cast<uint32_t>(replayCasterCount);
+
+  const auto& st = input.scene.shadowStats;
+  const bool semanticDynamicCastersActive =
+      st.semanticSceneSubmittedSkinned != 0u ||
+      st.dynamicSkinnedOutputCount != 0u ||
+      st.capturedUnitVertexBlend != 0u;
+  const bool semanticReceiverStabilityActive =
+      SemanticReceiverStabilityModeEnabled() && semanticDynamicCastersActive &&
+      debugModeEnum == War3ShadowDebugMode::None;
+  const uint64_t semanticIdentityHash =
+      st.semanticSceneDirectLastSubmittedIdentityHash;
+  const bool semanticIdentityKnown =
+      semanticDynamicCastersActive && semanticIdentityHash != 0u;
+  if (semanticIdentityKnown) {
+    if (semanticIdentityHash == m_pendingShadowMapSemanticIdentityHash) {
+      m_pendingShadowMapSemanticIdentityStableFrames =
+          std::min<uint32_t>(m_pendingShadowMapSemanticIdentityStableFrames + 1u,
+                             0x7fffffffu);
+    } else {
+      m_pendingShadowMapSemanticIdentityHash = semanticIdentityHash;
+      m_pendingShadowMapSemanticIdentityStableFrames = 1u;
+    }
+  } else {
+    m_pendingShadowMapSemanticIdentityHash = 0u;
+    m_pendingShadowMapSemanticIdentityStableFrames = 0u;
+  }
+  const bool semanticIdentityChanged =
+      semanticIdentityKnown && m_lastShadowMapSemanticIdentityHash != 0u &&
+      semanticIdentityHash != m_lastShadowMapSemanticIdentityHash;
+  const uint32_t requiredStableIdentityFrames =
+      SemanticReceiverStableIdentityFramesBeforeRedraw();
+  const bool semanticIdentityStableForRedraw =
+      !semanticIdentityChanged ||
+      !SemanticReceiverHoldUntilStableIdentityEnabled() ||
+      m_pendingShadowMapSemanticIdentityStableFrames >=
+          requiredStableIdentityFrames;
+  if (semanticDynamicCastersActive && replayCasterCount != 0u) {
+    m_recentSemanticDynamicHoldFramesRemaining =
+        dxvk::war3::internal::kShadowSemanticDynamicEmptyReplayHoldFrames;
+  } else if (m_recentSemanticDynamicHoldFramesRemaining != 0u) {
+    m_recentSemanticDynamicHoldFramesRemaining--;
+  }
+  const bool canHoldCompleteShadowMap =
+      receiverNeedsShadowMap && m_hasCompleteShadowMap && m_shadowMap &&
+      m_shadowMapSampleView;
+  const bool holdForInvalidCsm =
+      dxvk::war3::internal::kShadowHoldLastGoodMapOnInvalidCsm &&
+      canHoldCompleteShadowMap && csmFallbackToLastGood;
+  const bool holdForTransientEmptyReplay =
+      dxvk::war3::internal::kShadowHoldLastGoodMapOnTransientEmptyReplay &&
+      canHoldCompleteShadowMap && replayCasterCount == 0u &&
+      m_lastShadowMapCasterCount != 0u &&
+      m_transientEmptyReplayHoldFramesRemaining != 0u;
+  const bool holdForSemanticDynamicEmptyReplay =
+      dxvk::war3::internal::kShadowHoldLastGoodMapOnTransientEmptyReplay &&
+      canHoldCompleteShadowMap && replayCasterCount == 0u &&
+      m_lastShadowMapCasterCount != 0u &&
+      m_recentSemanticDynamicHoldFramesRemaining != 0u;
+  const bool holdForSemanticIdentityChurn =
+      dxvk::war3::internal::kShadowHoldLastGoodMapOnSemanticIdentityChurn &&
+      canHoldCompleteShadowMap && replayCasterCount != 0u &&
+      semanticIdentityChanged &&
+      (!SemanticReceiverHoldUntilStableIdentityEnabled()
+           ? m_semanticIdentityChurnHoldFramesRemaining != 0u
+           : !semanticIdentityStableForRedraw);
+  const bool semanticSelectionUnderCapPressure =
+      st.semanticSceneDirectScanCapHitCount != 0u ||
+      st.semanticSceneDirectRecordCapHitCount != 0u;
+  const uint32_t coverageDropMaxHoldFrames =
+      SemanticReceiverCoverageDropMaxHoldFrames();
+  const bool semanticCoverageDropCandidate =
+      SemanticReceiverHoldOnCoverageDropEnabled() &&
+      dxvk::war3::internal::kShadowHoldLastGoodMapOnSemanticIdentityChurn &&
+      canHoldCompleteShadowMap && replayCasterCount != 0u &&
+      m_lastShadowMapCasterCount != 0u && semanticDynamicCastersActive &&
+      semanticSelectionUnderCapPressure &&
+      uint32_t(replayCasterCount) + SemanticReceiverCoverageDropTolerance() <
+          m_lastShadowMapCasterCount;
+  const bool holdForSemanticCoverageDrop =
+      semanticCoverageDropCandidate &&
+      (coverageDropMaxHoldFrames == 0u ||
+       m_semanticCoverageDropHoldStreak < coverageDropMaxHoldFrames);
+  if (holdForInvalidCsm)
+    reconciliation.receiverHoldInvalidCsmCount = 1u;
+  if (holdForTransientEmptyReplay || holdForSemanticDynamicEmptyReplay)
+    reconciliation.receiverHoldEmptyReplayCount = 1u;
+  if (holdForSemanticIdentityChurn || holdForSemanticCoverageDrop)
+    reconciliation.receiverHoldIdentityChurnCount = 1u;
 
   // 诊断：若 caster
   // 数量在相邻帧间频繁变化，通常意味着“阶段/批次识别不稳定”或“插入点时机漂移”，
@@ -2997,27 +3712,166 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         dynamicContentStable;
   }
 
+  if (holdForInvalidCsm || holdForTransientEmptyReplay ||
+      holdForSemanticDynamicEmptyReplay || holdForSemanticIdentityChurn ||
+      holdForSemanticCoverageDrop) {
+    reuseLastShadowMap = true;
+    if (holdForTransientEmptyReplay &&
+        m_transientEmptyReplayHoldFramesRemaining != 0u) {
+      m_transientEmptyReplayHoldFramesRemaining--;
+    }
+    if (holdForSemanticIdentityChurn &&
+        !SemanticReceiverHoldUntilStableIdentityEnabled() &&
+        m_semanticIdentityChurnHoldFramesRemaining != 0u) {
+      m_semanticIdentityChurnHoldFramesRemaining--;
+    }
+    if (holdForSemanticCoverageDrop)
+      m_semanticCoverageDropHoldStreak =
+          std::min<uint32_t>(m_semanticCoverageDropHoldStreak + 1u,
+                             0x7fffffffu);
+
+    static uint32_t s_loggedHold = 0;
+    if (s_loggedHold < 16u || (s_loggedHold % 240u) == 0u) {
+      s_loggedHold++;
+      WAR3_RENDER_LOG(
+          "DXVK War3ShadowReceiverPass: hold last-good shadow map reason=%s "
+          "replay=%u lastReplay=%u csmCandidate=%d semanticDynamic=%d "
+          "holdFrames=%u semanticHoldFrames=%u identityHoldFrames=%u "
+          "identityHash=%llu lastIdentityHash=%llu\n",
+          holdForInvalidCsm
+              ? "invalid-csm"
+              : (holdForSemanticCoverageDrop
+                     ? "semantic-coverage-drop"
+                     : (holdForSemanticIdentityChurn
+                            ? "semantic-identity-churn"
+                            : (holdForSemanticDynamicEmptyReplay
+                                   ? "semantic-empty-replay"
+                                   : "empty-replay"))),
+          static_cast<unsigned>(replayCasterCount),
+          static_cast<unsigned>(m_lastShadowMapCasterCount),
+          hasCandidateCsm ? 1 : 0, semanticDynamicCastersActive ? 1 : 0,
+          static_cast<unsigned>(m_transientEmptyReplayHoldFramesRemaining),
+          static_cast<unsigned>(
+              m_recentSemanticDynamicHoldFramesRemaining),
+          static_cast<unsigned>(
+              m_semanticIdentityChurnHoldFramesRemaining),
+          static_cast<unsigned long long>(semanticIdentityHash),
+          static_cast<unsigned long long>(
+              m_lastShadowMapSemanticIdentityHash));
+    }
+  } else if (!semanticCoverageDropCandidate) {
+    m_semanticCoverageDropHoldStreak = 0u;
+  }
+
   if (!reuseLastShadowMap && hasCandidateCsm) {
     m_csmData = newCsm;
   }
 
-  // CSM 阴影资源初始化 + caster pass（按需）
-  ensureShadowResources(m_csmData.cascadeCount, m_csmConfig.shadowResolution);
   if (receiverNeedsShadowMap) {
+    // When the frame chooses to reuse the last complete map, keep the old
+    // image dimensions alive. Recreating here clears m_hasCompleteShadowMap and
+    // turns a stability hold into a forced redraw, which presents as rhythmic
+    // whole-scene shadow pulsing under semantic identity churn.
+    const bool shadowMapResourcesUsable =
+        m_hasCompleteShadowMap && m_shadowMap && m_shadowMapSampleView;
+    if (!reuseLastShadowMap || !shadowMapResourcesUsable) {
+      ensureShadowResources(m_csmData.cascadeCount, m_csmConfig.shadowResolution);
+    }
+    if (reuseLastShadowMap &&
+        (!m_hasCompleteShadowMap || !m_shadowMap || !m_shadowMapSampleView)) {
+      reconciliation.receiverReuseInvalidatedAfterEnsureCount = 1u;
+      static uint32_t s_loggedInvalidReuse = 0;
+      if (s_loggedInvalidReuse++ < 16u ||
+          (s_loggedInvalidReuse % 240u) == 0u) {
+        WAR3_RENDER_LOG(
+            "DXVK War3ShadowReceiverPass: cancel shadow map reuse after "
+            "resource ensure invalidated completeness (replay=%u "
+            "layers=%u res=%u)\n",
+            static_cast<unsigned>(replayCasterCount),
+            static_cast<unsigned>(m_csmData.cascadeCount),
+            static_cast<unsigned>(m_csmConfig.shadowResolution));
+      }
+      reuseLastShadowMap = false;
+    }
     if (reuseLastShadowMap) {
       war3::War3PerfMonitor::instance().noteShadowMapFallback(true, false);
+      reconciliation.receiverReuseShadowMap = 1u;
     } else {
       auto perfScope = war3::War3PerfMonitor::instance().scope("ShadowMap", ctx);
-      renderShadowMap(ctx, input, &replayDraws);
-      m_hasCompleteShadowMap = true;
-      m_lastShadowMapCasterCount = static_cast<uint32_t>(replayCasterCount);
-      m_lastDynamicPoseSignature = input.scene.shadowStats.dynamicPoseSignature;
+      const bool renderedShadowMap = renderShadowMap(ctx, input, &replayDraws);
+      if (renderedShadowMap) {
+        m_semanticCoverageDropHoldStreak = 0u;
+        m_hasCompleteShadowMap = true;
+        m_lastShadowMapCasterCount = static_cast<uint32_t>(replayCasterCount);
+        m_lastDynamicPoseSignature =
+            input.scene.shadowStats.dynamicPoseSignature;
+        m_lastShadowMapSunDir = mutableSettings.sun.direction;
+        m_lastShadowMapStrength = activeShadowStrength;
+        m_hasLastShadowMapLighting = true;
+        if (semanticIdentityHash != 0u) {
+          m_lastShadowMapSemanticIdentityHash = semanticIdentityHash;
+          m_semanticIdentityChurnHoldFramesRemaining =
+              dxvk::war3::internal::kShadowSemanticIdentityChurnHoldFrames;
+        } else if (!semanticDynamicCastersActive) {
+          m_lastShadowMapSemanticIdentityHash = 0u;
+          m_pendingShadowMapSemanticIdentityHash = 0u;
+          m_pendingShadowMapSemanticIdentityStableFrames = 0u;
+          m_semanticIdentityChurnHoldFramesRemaining = 0u;
+        }
+        m_transientEmptyReplayHoldFramesRemaining =
+            replayCasterCount != 0u
+                ? dxvk::war3::internal::kShadowTransientEmptyReplayHoldFrames
+                : 0u;
+      } else if (!m_hasCompleteShadowMap) {
+        m_lastShadowMapCasterCount = 0u;
+        m_lastDynamicPoseSignature = 0u;
+        m_lastShadowMapSemanticIdentityHash = 0u;
+        m_pendingShadowMapSemanticIdentityHash = 0u;
+        m_pendingShadowMapSemanticIdentityStableFrames = 0u;
+        m_semanticIdentityChurnHoldFramesRemaining = 0u;
+        m_transientEmptyReplayHoldFramesRemaining = 0u;
+        m_hasLastShadowMapLighting = false;
+      }
     }
   }
   m_shadowAdaptiveFrameIndex++;
+  reconciliation.receiverHasCompleteShadowMap =
+      (m_hasCompleteShadowMap && m_shadowMap && m_shadowMapSampleView) ? 1u
+                                                                       : 0u;
+  reconciliation.receiverCsmCascadeCount = m_csmData.cascadeCount;
+  recordShadowResourceFingerprint(m_shadowHistoryIndex & 1u,
+                                  (m_shadowHistoryIndex & 1u) ^ 1u);
+  if (receiverNeedsShadowMap) {
+    if (!m_hasCompleteShadowMap)
+      reconciliation.receiverNoCompleteShadowMapCount = 1u;
+    if (!m_shadowMap)
+      reconciliation.receiverNoShadowMapImageCount = 1u;
+    if (!m_shadowMapSampleView)
+      reconciliation.receiverNoShadowMapSampleViewCount = 1u;
+  }
+
+  float receiverShadowStrength = activeShadowStrength;
+  Vector4 receiverSunDirSource = mutableSettings.sun.direction;
+  if (semanticReceiverStabilityActive &&
+      SemanticReceiverFreezeLastGoodLightingEnabled() && reuseLastShadowMap &&
+      m_hasLastShadowMapLighting) {
+    receiverShadowStrength = m_lastShadowMapStrength;
+    receiverSunDirSource = m_lastShadowMapSunDir;
+  }
+  if (semanticReceiverStabilityActive) {
+    const float strengthClamp = SemanticReceiverStableStrengthClamp();
+    if (strengthClamp >= 0.0f)
+      receiverShadowStrength =
+          std::min(receiverShadowStrength, std::clamp(strengthClamp, 0.0f, 1.0f));
+  }
 
   // [NEW] Point Light Cube Shadow（如果启用）
-  if (m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&
+  const bool semanticReceiverPointLightsAllowed =
+      !semanticReceiverStabilityActive ||
+      !SemanticReceiverDisablePointLightsEnabled();
+
+  if (semanticReceiverPointLightsAllowed && m_pointLightsEnabled &&
+      mutableSettings.shadows.pointShadowEnabled &&
       mutableSettings.shadows.pointShadowMaxLights > 0 && m_hasPointLights) {
     renderPointShadow(ctx, input);
   }
@@ -3044,9 +3898,6 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       copyDepth(ctx, input.depthView);
     }
   }
-
-  war3::War3PerfMonitor::instance().noteShadowBudgetFrame(
-      input.scene.shadowStats);
 
   if (replayCasterCount > 0) {
     dxvk::war3::tools::MarkInGameRenderReady("War3Shadow/Replay",
@@ -3123,8 +3974,15 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   }
 
   if (needReceiverPass || needOutlineDepth) {
+    const bool shadowTaaBlockedForSemanticDynamic =
+        dxvk::war3::internal::kShadowDisableTaaForSemanticDynamicCasters &&
+        semanticDynamicCastersActive;
     const bool shadowTaaActive =
-        settings->shadows.shadowTaaEnabled && receiverNeedsShadowMap;
+        settings->shadows.shadowTaaEnabled && receiverNeedsShadowMap &&
+        !shadowTaaBlockedForSemanticDynamic && !csmFallbackToLastGood;
+    reconciliation.shadowTaaActive = shadowTaaActive ? 1u : 0u;
+    if (shadowTaaBlockedForSemanticDynamic)
+      m_shadowHistoryValid = false;
     const bool debugMotionVector =
         (debugModeEnum == War3ShadowDebugMode::MotionVector);
     const bool debugShadowHistory =
@@ -3140,11 +3998,19 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     if (shadowTaaActive || debugShadowHistory) {
       ensureShadowTaaResources(extent);
     }
+    const bool shadowHistoryValidBefore = m_shadowHistoryValid;
+    const uint32_t historyReadIndex = m_shadowHistoryIndex & 1u;
+    const uint32_t historyWriteIndex = historyReadIndex ^ 1u;
+    reconciliation.shadowHistoryValidBefore =
+        shadowHistoryValidBefore ? 1u : 0u;
+    reconciliation.shadowHistoryReadIndex = historyReadIndex;
+    reconciliation.shadowHistoryWriteIndex = historyWriteIndex;
+    recordShadowResourceFingerprint(historyReadIndex, historyWriteIndex);
 
     // Update receiver uniforms (device-local UBO via cmdUpdateBuffer)
     ShadowReceiverUniform ubo = {};
-    ubo.view = input.scene.worldCamera.view;
-    ubo.invViewProj = input.scene.worldCamera.invViewProj;
+    ubo.view = effectiveWorldCamera.view;
+    ubo.invViewProj = effectiveWorldCamera.invViewProj;
 
     for (uint32_t i = 0; i < 4; i++) {
       ubo.lightViewProj[i] =
@@ -3162,8 +4028,25 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         (m_csmData.cascadeCount > 3) ? m_csmData.cascades[3].splitFar : split2;
     ubo.splitFar = Vector4(split0, split1, split2, split3);
 
-    const float uboShadowStrength = activeShadowStrength;
-    const float pcfRadius = settings->shadows.pcfRadius;
+    const bool receiverHasUsableDirectionalShadow =
+        receiverNeedsShadowMap && m_hasCompleteShadowMap && m_shadowMap &&
+        m_shadowMapSampleView;
+    const float uboShadowStrength = receiverShadowStrength;
+    reconciliation.receiverHasUsableDirectionalShadow =
+        receiverHasUsableDirectionalShadow ? 1u : 0u;
+    reconciliation.receiverUboStrengthMilli =
+        strengthToMilli(uboShadowStrength);
+    if (needReceiverPass && receiverNeedsShadowMap &&
+        uboShadowStrength <= 1e-4f) {
+      reconciliation.receiverZeroStrengthFrameCount = 1u;
+      reconciliation.receiverDrawnWithZeroStrengthCount = 1u;
+    }
+    float pcfRadius = settings->shadows.pcfRadius;
+    if (semanticReceiverStabilityActive) {
+      const float pcfOverride = SemanticReceiverStablePcfRadiusOverride();
+      if (pcfOverride >= 0.0f)
+        pcfRadius = pcfOverride;
+    }
     const float invShadowRes =
         1.0f / float(std::max<uint32_t>(m_shadowMapResolution, 1u));
     ubo.params = Vector4(uboShadowStrength, pcfRadius, invShadowRes,
@@ -3174,14 +4057,20 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     const float debugModeF =
         float(static_cast<int>(settings->shadows.debugMode));
     const float pointLightsEnabled =
-        (m_pointLightsEnabled && m_hasPointLights) ? 1.0f : 0.0f;
+        (semanticReceiverPointLightsAllowed && m_pointLightsEnabled &&
+         m_hasPointLights)
+            ? 1.0f
+            : 0.0f;
     ubo.params2 = Vector4(receiverBias, cascadeBlendRange, debugModeF,
                           pointLightsEnabled);
 
-    const auto &vp = input.scene.worldCamera.viewport;
+    const auto &vp = effectiveWorldCamera.viewport;
     const float invViewportW = 1.0f / float(std::max<DWORD>(vp.Width, 1u));
     const float invViewportH = 1.0f / float(std::max<DWORD>(vp.Height, 1u));
-    const float pcssEnable = settings->shadows.pcssEnabled ? 1.0f : 0.0f;
+    const float pcssEnable =
+        (!semanticReceiverStabilityActive && settings->shadows.pcssEnabled)
+            ? 1.0f
+            : 0.0f;
     const float pcssSearchRadius =
         std::max(settings->shadows.pcssSearchRadius, 0.0f);
     ubo.params3 =
@@ -3197,7 +4086,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     ubo.params4 =
         Vector4(pcssMinRadius, pcssMaxRadius, pcssDepthScale, cascadeBiasScale);
 
-    Vector4 sunDir = mutableSettings.sun.direction;
+    Vector4 sunDir = receiverSunDirSource;
     const float sunLen2 =
         sunDir.x * sunDir.x + sunDir.y * sunDir.y + sunDir.z * sunDir.z;
     if (sunLen2 > 1e-6f) {
@@ -3209,17 +4098,24 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     ubo.sunDir = sunDir;
 
     const float normalBiasScale =
-        std::max(settings->shadows.normalBiasScale, 0.0f);
+        semanticReceiverStabilityActive
+            ? 0.0f
+            : std::max(settings->shadows.normalBiasScale, 0.0f);
     const float receiverMode =
-        float(static_cast<uint32_t>(settings->shadows.receiverMode));
-    const float rimIntensity = std::max(settings->shadows.rimIntensity, 0.0f);
+        semanticReceiverStabilityActive
+            ? float(static_cast<uint32_t>(War3ShadowReceiverMode::Legacy))
+            : float(static_cast<uint32_t>(settings->shadows.receiverMode));
+    const float rimIntensity =
+        semanticReceiverStabilityActive
+            ? 0.0f
+            : std::max(settings->shadows.rimIntensity, 0.0f);
     const float rimPower = std::max(settings->shadows.rimPower, 0.1f);
     ubo.params5 =
         Vector4(normalBiasScale, rimIntensity, rimPower, receiverMode);
     const float pcfKernel =
         float(static_cast<uint32_t>(settings->shadows.pcfKernel));
     const float pcfRotateMode =
-        settings->shadows.pcfRotate
+        (!semanticReceiverStabilityActive && settings->shadows.pcfRotate)
             ? float(static_cast<uint32_t>(settings->shadows.pcfRotateMode))
             : 0.0f;
     const float pcssSearchKernel =
@@ -3229,13 +4125,28 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     ubo.params6 = Vector4(pcfKernel, pcfRotateMode, pcssSearchKernel,
                           pcfCascadeRadiusScale);
 
+    if (semanticReceiverStabilityActive) {
+      static uint32_t s_loggedSemanticReceiverStability = 0;
+      if (s_loggedSemanticReceiverStability++ < 8u ||
+          (s_loggedSemanticReceiverStability % 240u) == 0u) {
+        WAR3_RENDER_LOG(
+            "DXVK War3ShadowReceiverPass: semantic receiver stability active "
+            "reuse=%d strength=%.3f->%.3f normalBias=0 pcfRotate=0 pcss=0 "
+            "lastLighting=%d\n",
+            reuseLastShadowMap ? 1 : 0,
+            static_cast<double>(activeShadowStrength),
+            static_cast<double>(uboShadowStrength),
+            m_hasLastShadowMapLighting ? 1 : 0);
+      }
+    }
+
     ubo.viewport =
         Vector4(float(vp.X), float(vp.Y), float(vp.Width), float(vp.Height));
     ubo.viewportZ = Vector4(vp.MinZ, vp.MaxZ, 0.0f, 0.0f);
 
     // Shadow TAA / Motion Vector：上一帧 ViewProj（无上一帧时用当前帧填充，保证
     // mv=0）
-    const Matrix4 currentViewProj = input.scene.worldCamera.viewProj;
+    const Matrix4 currentViewProj = effectiveWorldCamera.viewProj;
     ubo.prevViewProj = m_hasPrevFrameData ? m_prevViewProj : currentViewProj;
 
     // Shadow TAA 参数：
@@ -3254,6 +4165,13 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         settings->shadows.shadowTaaNeighborClamp ? 1.0f : 0.0f;
     const float taaHasHistory = m_shadowHistoryValid ? 1.0f : 0.0f;
     ubo.taaParams = Vector4(taaMode, taaBlend, taaClamp, taaHasHistory);
+    reconciliation.shadowTaaMode = uint32_t(taaMode + 0.5f);
+    reconciliation.shadowReceiverSampleSource =
+        receiverHasUsableDirectionalShadow
+            ? (shadowTaaActive
+                   ? (reconciliation.shadowTaaMode >= 2u ? 3u : 2u)
+                   : 1u)
+            : 0u;
 
     auto uboInfo =
         m_shadowUniformBuffer->getSliceInfo(0u, sizeof(ShadowReceiverUniform));
@@ -3289,9 +4207,6 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
           war3::War3PerfMonitor::instance().scope("Shadow/Visibility", ctx);
       renderShadowVisibility(ctx, input);
     }
-
-    const uint32_t historyReadIndex = m_shadowHistoryIndex & 1u;
-    const uint32_t historyWriteIndex = historyReadIndex ^ 1u;
 
     // History 读写同步：
     // - 读：上一帧 storage 写入 -> 本帧 fragment 采样
@@ -3365,6 +4280,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       m_shadowHistoryIndex = historyWriteIndex;
       m_shadowHistoryValid = true;
     }
+    reconciliation.shadowHistoryValidAfter =
+        m_shadowHistoryValid ? 1u : 0u;
 
     // 记录本帧是否执行过 TAA（用于下一帧决定是否允许混合历史）
     m_shadowTaaWasActiveLastFrame = shadowTaaActive;
@@ -3385,10 +4302,18 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         war3shader::RenderEventID::SHADOW_PASS_END);
   }
 
+  setReceiverRunEntryFlags(true, shadowsEnabled, outlineEnabled, hasSunShadow,
+                           hasPointShadow, m_hasPointLights, needOutlinePass,
+                           receiverNeedsShadowMap, needReceiverPass,
+                           replayCasterCount != 0u,
+                           reconciliation.shadowMapExecutedThisFrame != 0u,
+                           debugShadow);
+  publishReconciliationStats();
+
   // 保存上一帧相机矩阵（用于 Motion Vector / ShadowTAA 重投影）
-  m_prevViewMatrix = input.scene.worldCamera.view;
-  m_prevProjMatrix = input.scene.worldCamera.proj;
-  m_prevViewProj = input.scene.worldCamera.viewProj;
+  m_prevViewMatrix = effectiveWorldCamera.view;
+  m_prevProjMatrix = effectiveWorldCamera.proj;
+  m_prevViewProj = effectiveWorldCamera.viewProj;
   m_hasPrevFrameData = true;
 }
 

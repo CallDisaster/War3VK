@@ -74,6 +74,7 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x368E30, // worldObjectsRenderGroup
       0x13A5E0, // dispatchCommon
       0x13A780, // dispatchSpecial
+      0x138F70, // applyDrawStateAndDraw (ApplyDrawStateAndSamplerPair -> Gx draw)
       0x1380A0, // flushSortedItems
       0x737110, // terrainRenderAllTiles
 

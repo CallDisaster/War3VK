@@ -342,11 +342,20 @@ void MaybePublishVisibleUnitGeosetBinding(ShadowRenderableRecord& record) {
 void DemandFillVisibleUnitGeosetBindings(ShadowFrameManifest& manifest) {
   auto demandFillScope = ContractCpuScope(
       "War3SemanticScene/CaptureContract/VisibleGeosetDemandFill");
-  constexpr uint32_t kMaxDemandFillPerCapture = 8u;
+  constexpr uint32_t kMaxDemandFillPerCapture = 64u;
+  static std::atomic<uint64_t> s_demandFillCursor{0u};
   std::unordered_set<void*> seenMissingGeosetData;
   uint32_t capturedThisFrame = 0u;
+  if (manifest.records.empty())
+    return;
 
-  for (auto& record : manifest.records) {
+  const size_t recordCount = manifest.records.size();
+  const size_t startIndex =
+      size_t(s_demandFillCursor.fetch_add(1u, std::memory_order_relaxed) %
+             uint64_t(recordCount));
+
+  for (size_t offset = 0u; offset < recordCount; ++offset) {
+    auto& record = manifest.records[(startIndex + offset) % recordCount];
     if (!IsContractUnitCandidate(record))
       continue;
     if (record.runtimeModelPtr == nullptr ||
@@ -3707,10 +3716,10 @@ void ShadowRuntimeContractCache::capturePoseOnlyLiveState() {
     m_stats = std::move(stats);
   }
 
-  if (dxvk::war3::internal::IsSemanticCoreValidationRuntimeEnabled() ||
-      dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled()) {
-    ShadowValidationRuntime::instance().requestLatestFrameBuild();
-  }
+  // Pose-only publish must not enqueue a new semantic build. The production
+  // path keeps animation fresh via submit-time live palette refresh; forcing a
+  // rebuild here turns every pose tick into a full semantic-frame rebuild and
+  // collapses performance on real maps.
 }
 
 ShadowFrameManifest ShadowRuntimeContractCache::snapshotManifest() const {

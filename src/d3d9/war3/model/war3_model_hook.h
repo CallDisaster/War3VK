@@ -1,6 +1,8 @@
 // war3_model_hook.h - 魔兽模型加载探针与路径重映射
 #pragma once
 
+#include "../render/war3_current_draw_contract.h"
+
 #include <cstdint>
 
 namespace dxvk {
@@ -40,6 +42,45 @@ struct RuntimeOverrideOutputProbeSummary {
   uint64_t runtimeMatrixWriteCount = 0;
   uint64_t runtimeMatrixWritePublishCount = 0;
   uint64_t runtimeMatrixWriteMissCount = 0;
+  // Phase 7.31 P0：CGeosetData_BuildGroupBlendedPalette 的批量捕获统计。
+  uint64_t runtimeMatrixWriteBatchCapturedCount = 0;
+  uint64_t runtimeMatrixWriteBatchOverflowCount = 0;
+  uint64_t runtimeMatrixWriteBatchUnreadableCount = 0;
+  uint64_t runtimeMatrixWriteBatchLastGroupCount = 0;
+  // Phase 7.36 Route A：补全 palette producer wrapper/simple fallback 观测。
+  uint64_t runtimeGroupPaletteWrapperCallCount = 0;
+  uint64_t runtimeGroupPaletteWrapperPartCount = 0;
+  uint64_t runtimeGroupPaletteWrapperBindingCount = 0;
+  uint64_t runtimeSimpleGroupPaletteCallCount = 0;
+  uint64_t runtimeSimpleGroupPaletteSlotCapturedCount = 0;
+  uint64_t runtimeSimpleGroupPaletteSlotUnreadableCount = 0;
+  uint64_t renderablePartPaletteBindingQueryHitCount = 0;
+  uint64_t renderablePartPaletteBindingQueryMissCount = 0;
+  uint64_t renderablePartPaletteSnapshotCapturedCount = 0;
+  uint64_t renderablePartPaletteSnapshotTooLargeCount = 0;
+  uint64_t renderablePartPaletteSnapshotUnreadableCount = 0;
+  uint64_t renderablePartPaletteSnapshotQueryHitCount = 0;
+  uint64_t renderablePartPaletteSnapshotQueryMissCount = 0;
+  // Phase 7.47 dt gate probe（只读诊断，不改游戏行为）：
+  // CSpriteUber_PreRenderAndUpdatePosePalette_Full/Mini/Lite/MiniLite 在
+  // |dt| < FLT_EPSILON 时会 skip CModel_EvalPoseStackAndChildren，整条
+  // 0x12E600/0x12FED0/0x12FDC0 writer 链路不触发。此处记录 dt 分布和
+  // "当前 palette frameTag 下 writer 首次触发次数"，用于对齐视觉冻结
+  // 窗口与 producer 早退分布。
+  uint64_t spriteUberPreRenderTotalCount = 0;
+  uint64_t spriteUberPreRenderDtZeroCount = 0;
+  uint64_t spriteUberPreRenderDtBelowEpsilonCount = 0;
+  uint64_t spriteUberPreRenderDtPositiveCount = 0;
+  uint64_t spriteUberPreRenderDtNegativeCount = 0;
+  uint64_t spriteUberPreRenderLastDtBits = 0;
+  uint64_t spriteUberPreRenderLastZeroDtFrameTag = 0;
+  uint64_t spriteUberPreRenderLastPositiveDtFrameTag = 0;
+  uint64_t runtimeMatrixWriteFramesWithHitCount = 0;
+  uint64_t runtimeMatrixWriteFramesEmptyCount = 0;
+  uint64_t runtimeGroupPaletteWrapperFramesWithHitCount = 0;
+  uint64_t runtimeGroupPaletteWrapperFramesEmptyCount = 0;
+  uint64_t runtimeSimpleGroupPaletteFramesWithHitCount = 0;
+  uint64_t runtimeSimpleGroupPaletteFramesEmptyCount = 0;
   uint64_t runtimeMatrixWriteLastRuntimeModelPtr = 0;
   uint64_t runtimeMatrixWriteLastMatrixIndex = 0;
   uint64_t runtimeMatrixWriteLastMatrixCount = 0;
@@ -400,6 +441,61 @@ bool TryBootstrapRuntimeChildLineageFromParentModelData(
 bool QueryBlendedPaletteBySlotIndex(uint32_t slotIndex,
                                      void* outPaletteVec,
                                      uint32_t& outGroupCount);
+
+// Phase 7.30 Action B 第二刀：按精确 count + frameTag 校验的 query。
+// 相比 QueryBlendedPaletteBySlotIndex，该版本不要求 writeSerial 单调递增，
+// 只要求 slotIndex..slotIndex+expectedCount-1 每个 entry 的 frameTag 都与
+// 当前帧（expectedFrameTag）一致。命中时 palette 可直接用于 snapshot 源。
+//
+// Phase 7.34 语义重声明：Exact 版本严格要求所有 expectedCount 个 slot 都同帧
+// valid；任何 partial 情形整体 return false 且 outPalette 清空。调用端**不需要**
+// 再检查 size == expectedCount（但建议 double-check 作为防御）。
+bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
+                                         uint32_t expectedCount,
+                                         uint32_t expectedFrameTag,
+                                         void* outPaletteVec);
+
+// Phase 7.34：诊断用 best-effort 查询，允许 partial。
+// **不应用于 Ready palette 仲裁**，仅在 counter / 调试日志中使用。
+bool QueryBlendedPaletteBySlotIndexBestEffort(uint32_t slotIndex,
+                                              uint32_t expectedCount,
+                                              uint32_t expectedFrameTag,
+                                              void* outPaletteVec);
+
+// Phase 7.39：查询 slot-backed blended palette 的实际写入 frameTag 范围。
+// 用于 submit 端 palette-content-age 诊断，区别 record age 与 palette 内容年龄。
+bool QueryCurrentPaletteFrameTag(uint32_t& outFrameTag);
+
+bool QueryBlendedPaletteFrameTagRange(uint32_t slotIndex,
+                                      uint32_t expectedCount,
+                                      uint32_t& outMinFrameTag,
+                                      uint32_t& outMaxFrameTag,
+                                      uint32_t& outMissingCount);
+
+// Phase 7.36 Route A：从 CModel_AllocAndFillGroupPalette / simple fallback
+// producer hook 记录的 renderablePart -> palette slot 绑定中查询最新映射。
+// 用作直接读 renderablePart+0x08 失败时的 producer-side 兜底，不改变 TTL 语义。
+bool QueryRenderablePartPaletteSlot(void* renderablePart,
+                                    uint32_t& outSlotIndex,
+                                    uint32_t* outGroupCount = nullptr,
+                                    uint32_t* outFrameTag = nullptr);
+
+// Phase 7.46：producer-side part palette snapshot.
+// 0x12FED0/0x12FF90 know the exact renderablePart whose palette was just
+// emitted. Querying by part avoids later global-slot reuse/phase ambiguity.
+bool QueryRenderablePartPaletteSnapshot(void* renderablePart,
+                                        uint32_t expectedCount,
+                                        void* outPaletteVec,
+                                        uint64_t* outHash = nullptr,
+                                        uint32_t* outFrameTag = nullptr);
+
+// Phase 7.51：从 producer hook 记录里查出这个 renderablePart 属于哪个 runtimeModel。
+// 用途：submit 端在 PoseRegistry 用 packet.renderable.runtimeModelPtr 查不到时，
+// 可以通过 renderablePart 反查到 producer 侧真正的 runtimeModel key，再重试
+// PoseRegistry 查询。1.27a 上 packet.renderable.runtimeModelPtr 经常是 alias 值，
+// 和 0x12FED0 的 this 参数不一致，导致 PoseRegistry miss；本函数给出 producer 原始 key。
+bool QueryRenderablePartOwnerRuntimeModel(void* renderablePart,
+                                          void** outRuntimeModelPtr);
 
 } // namespace model
 } // namespace war3
