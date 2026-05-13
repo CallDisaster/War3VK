@@ -3172,3 +3172,51 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
    - **回退路径**：
      - capture 块用 `do { ... } while (false)` 包裹，所有早退点都有 counter
      - consume 块用 `if (entryFresh)` 守门，未命中走原 bind-pose+GPU skinning 路径
+
+
+98. **Phase 7.55 v4 收口（2026-05-14 03:54）**:
+   - **当前稳定状态**（commit `2d1fd41`，已部署 `25416150 bytes`）：
+     - ✓ pose 流畅（draw-time VB GPU copy 通路）
+     - ✓ AlphaTest 镂空（capture 端读 D3D state + 复制 UV stream，consume 端
+       覆盖 alphaTestEnabled/alphaRef/diffuseTexture，派生 sampler/textureDescriptor）
+     - ✓ 静态建筑阴影位置正确（worldMatrix 用 capture 时的 D3DTS_WORLD）
+     - ✓ frustum cull 不再误杀 v4 caster（hit 时强制 boundsRadius=0）
+     - ✓ 无撕裂、无进图卡顿
+   - **未解决的已知问题**：
+     - 远离世界中心 + 少 caster（火凤凰单独 / 小怪死光后）→ 周期性阴影
+       闪烁/卡顿。约 49 帧周期里有 16 帧 `directSubmitted=0`。
+     - 核心数据：trace `2026_05_14_02_58_12.jsonl` 显示 491 帧里 161 帧
+       (33%) `submitted=0`，连续 16 帧/run；CENTER trace `02_54_22` 显示
+       100% 帧 submit > 0。
+     - 触发链：War3 引擎本身不每帧派发所有 caster draw call →
+       少 caster 场景某些帧 `currentDraw contract` 0 record →
+       `War3TryPopulateDirectCurrentDrawGrouped(readyOnly=true)` 返回 0 →
+       directOnly 分支 `EmptyFrame return` → 整帧无阴影。
+   - **失败的修复尝试**：
+     - **尝试 1**：让 directSubmitted=0 时 fallthrough 到下游 reuse/fallback
+       路径。失败：触发 `readyOnly=false` 第二次调用 + native backend 二次
+       执行 + sceneBundle/catchup 副作用 → 撕裂 + 进图卡顿。已撤销。
+     - **尝试 2**：directOnly 分支内部 snapshot `m_war3Scene.shadowCasters`
+       和 `shadowInstances`，directSubmitted=0 时整套 copy 回当前帧。
+       失败：reuse 整套 caster 的 worldMatrix 是上一帧的，但物体在动 →
+       阴影画在历史位置 → 主渲染当前位置 → 持续性撕裂。已撤销。
+   - **下一步真正方向（未实施）**：
+     - reuse caster 集合本身可以，但每个 caster 的 worldMatrix（或 palette
+       第一根矩阵）必须用 **当前帧的最新值**，避免位置滞后。
+     - 数据源：`PoseRegistry` 或 `Hook_RuntimeMatrixWrite` 已经每帧更新；
+       caster 里存稳定 key（renderablePart / runtimeModel）即可反查。
+     - 改动范围：reuse 时不要 plain copy，要逐 caster 重建 worldMatrix +
+       boundsCenter。涉及：
+       1. caster snapshot 时保存稳定 key（runtimeModelPtr 或 renderablePart）
+       2. reuse 时为每个 caster 查 PoseRegistry 拿当前帧 first matrix
+       3. 用 first matrix.translation 重算 boundsCenter
+       4. 用当前帧 matrix 替换 worldMatrix（如果是 skinned）
+     - 风险：PoseRegistry 在某些帧也可能没更新某个 runtimeModel（火凤凰
+       特别罕见 caster），需要 graceful fallback。
+   - **暂停修复理由**：
+     - 当前稳定版（pose 流畅 + AlphaTest + 建筑位置）已是用户长期反馈的
+       核心痛点全部解决；
+     - 远离原点的周期性闪烁是 War3 引擎本身 cadence 的产物，需要在
+       caster reuse 维度做"每 caster fresh worldMatrix"重建才能根治；
+     - 这条路径技术上可行但工程量大且需要额外 IDA 验证 PoseRegistry 在
+       caster 缺席帧的更新覆盖率，留给下次有充分时间时做。
