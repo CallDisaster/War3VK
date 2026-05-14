@@ -705,6 +705,16 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCacheConsumeHitCount
      << ",\"drawTimeVBCacheConsumeMissCount\":"
      << stats.drawTimeVBCacheConsumeMissCount
+     << ",\"drawTimeSemanticProducerVisibleCandidateCount\":"
+     << stats.drawTimeSemanticProducerVisibleCandidateCount
+     << ",\"drawTimeSemanticProducerFreshEntryCount\":"
+     << stats.drawTimeSemanticProducerFreshEntryCount
+     << ",\"drawTimeSemanticProducerSubmittedCount\":"
+     << stats.drawTimeSemanticProducerSubmittedCount
+     << ",\"drawTimeSemanticProducerMissNoFreshEntryCount\":"
+     << stats.drawTimeSemanticProducerMissNoFreshEntryCount
+     << ",\"drawTimeSemanticProducerFallbackCurrentDrawCount\":"
+     << stats.drawTimeSemanticProducerFallbackCurrentDrawCount
      << ",\"drawTimeVBCacheTotalEntered\":"
      << stats.drawTimeVBCacheTotalEntered
      << ",\"drawTimeVBCacheRejectNoRenderablePart\":"

@@ -3214,9 +3214,222 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      - 风险：PoseRegistry 在某些帧也可能没更新某个 runtimeModel（火凤凰
        特别罕见 caster），需要 graceful fallback。
    - **暂停修复理由**：
-     - 当前稳定版（pose 流畅 + AlphaTest + 建筑位置）已是用户长期反馈的
-       核心痛点全部解决；
-     - 远离原点的周期性闪烁是 War3 引擎本身 cadence 的产物，需要在
-       caster reuse 维度做"每 caster fresh worldMatrix"重建才能根治；
-     - 这条路径技术上可行但工程量大且需要额外 IDA 验证 PoseRegistry 在
-       caster 缺席帧的更新覆盖率，留给下次有充分时间时做。
+   - 当前稳定版（pose 流畅 + AlphaTest + 建筑位置）已是用户长期反馈的
+     核心痛点全部解决；
+   - 远离原点的周期性闪烁是 War3 引擎本身 cadence 的产物，需要在
+     caster reuse 维度做"每 caster fresh worldMatrix"重建才能根治；
+   - 这条路径技术上可行但工程量大且需要额外 IDA 验证 PoseRegistry 在
+     caster 缺席帧的更新覆盖率，留给下次有充分时间时做。
+
+
+99. **Phase 7.56 窄实验：empty readyOnly snapshot 不再提前 return，放行现有 part lease restore（2026-05-14 13:31）**:
+   - **动机**：
+     - Phase 7.55 v4 已证明当前核心问题不再是 pose source 本身，而是
+       少 caster 场景下 `War3TryPopulateDirectCurrentDrawGrouped(readyOnly=true)`
+       周期性拿到 `directRecords.empty()`，随后 helper 立即 `return 0u`；
+     - 这让函数后半段已经存在的 `DirectPartPacketLease` 恢复逻辑根本没有机会运行。
+   - **这次改动只有一处**：
+     - 删除 `src/d3d9/d3d9_device.cpp::War3TryPopulateDirectCurrentDrawGrouped`
+       里 `if (directRecords.empty()) { publishShadowManifestSummary(empty); return 0u; }`
+       的早退；
+     - 保留后续整个 helper 原有流程不变：空 live records 继续进入
+       `eligibleRecords` 构建空路径、`publishShadowManifestSummary(empty)`、
+       `DirectPartPacketLease` 恢复、object-grouped submit。
+   - **为什么这和前面失败的 fallthrough 不一样**：
+     - 不会第二次调用 `War3TryPopulateDirectCurrentDrawGrouped(readyOnly=false)`；
+     - 不会进入 directOnly 之外那条包含 native backend / sceneBundle / catchup
+       副作用的下游路径；
+     - 只是在 helper 内部允许"空快照帧也试试 per-part lease restore"。
+   - **当前判断**：
+     - 这是一个低风险实验，目标是把"少 caster 时整帧无阴影"先收敛成
+       "如果 lease 里还有安全 packet，就继续提交"；
+     - 它**不保证**彻底根治 16 帧 cadence，因为 draw-time VB capture 在这些
+       空帧里也可能没有新样本；但至少先验证"真正缺的是 lease restore 机会"
+       还是"就算放开 lease restore 也不够"。
+   - **编译 / 部署**：
+     - `ninja -C build32` 通过；
+     - `E:\Work\War3\d3d9.dll` = `25414573 bytes @ 2026-05-14 13:31:43`。
+   - **待用户实机验证**：
+     - 多 caster 场景是否仍保持当前的流畅状态；
+     - 少 caster 场景是否从"整段闪没 / 卡住"收敛到更连续的阴影提交；
+     - 若仍有明显卡顿，下一步优先转向"lease restore 时给 v4 caster 回填当前帧
+       的 live world/root transform"，而不是再碰 fallthrough。
+
+
+100. **Phase 7.57 长期主线切换：unitsOnly/directOnly 优先消费 draw-time semantic producer（2026-05-14 14:14）**:
+   - **用户裁决**：
+     - 明确要求后续主线里不再看到 legacy 回退；
+     - 以黑匣子 trace 为准，不接受"少 caster 仍周期性空帧"的方案。
+   - **关键黑匣子再解读**（不是新 trace，而是对 Phase 7.55 far trace 的修正理解）：
+     - `shadow_pose_full_trace_2026_05_14_02_58_12.jsonl` 的 zero-submit 窗口里，
+       `drawTimeVBCacheCaptureCount = 28`、`drawTimeVBCacheTotalEntered = 28`
+       **每帧都稳定非零**；
+     - 这说明少 caster 的 16 帧空窗里，**draw-time GPU copy producer 本身没有停**，
+       停的是 `currentDraw readyOnly` 这条 consumer；
+     - 根因因此从"没有 fresh pose"正式收窄成：
+       **有 fresh pre-skinned draw-time data，但 semantic direct-only 提交链没消费它。**
+   - **长期主线实现**（本轮已落代码，不走 legacy）：
+     - `d3d9_device.cpp` 新增 `War3TryPopulateDrawTimeSemanticProducer(bool unitsOnly)`；
+     - `unitsOnly + directOnly` 路径现在优先消费
+       `VisibleRenderableRegistry::getAllVisibleView()` + `m_war3DrawTimeVBCache`：
+       - `VisibleRenderableRecord` 提供当前帧可见对象集合与稳定身份；
+       - `War3DrawTimeVBEntry` 提供当帧 GPU copy 后的 pre-skinned VB/IB/UV/worldMatrix；
+       - 命中 same-frame fresh entry 时直接构造 `War3ShadowCasterDraw` +
+         `War3ShadowInstanceRef`，**不再经过 current-draw contract / palette / slot
+         contract 这套 consumer 链**。
+     - 只有当 draw-time producer 本帧完全没有可提交 entry 时，才回退到
+       现有 `War3TryPopulateDirectCurrentDrawGrouped(readyOnly=true, ...)`。
+   - **代码改动**：
+     - `src/d3d9/d3d9_device.h`
+       - `War3DrawTimeVBEntry` 新增 `topology`
+       - 新增 `War3TryPopulateDrawTimeSemanticProducer(...)` 声明
+     - `src/d3d9/d3d9_device.cpp`
+       - 新增 runtime gate `DXVK_WAR3_SEMANTIC_DRAW_TIME_DIRECT_PRODUCER`
+         （默认 on）
+       - 新增 `War3TryPopulateDrawTimeSemanticProducer(...)`
+       - `War3TryCaptureShadowCaster` 的 v4 capture 记录 `entry.topology`
+       - `War3TryPopulateSemanticShadowScene` directOnly 分支优先走 draw-time
+         producer；新的 `populateReturnReason = 10` 表示"draw-time producer submitted"
+     - `src/d3d9/d3d9_war3_scene.h`
+       - 新增 black-box 计数：
+         `drawTimeSemanticProducerVisibleCandidateCount`
+         `drawTimeSemanticProducerFreshEntryCount`
+         `drawTimeSemanticProducerSubmittedCount`
+         `drawTimeSemanticProducerMissNoFreshEntryCount`
+         `drawTimeSemanticProducerFallbackCurrentDrawCount`
+     - `src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp`
+       - full trace `keyStats` 输出上述 5 个新字段
+     - `AutoTest/_phase756_drawtime_producer.py`
+       - 新增 trace 分析脚本，直接统计 zero-submit run、producer 提交帧比例、
+         fallback 回 current-draw 的帧数
+   - **预期黑匣子验收**：
+     - 少 caster trace 里 `semanticSceneSubmitted == 0` 的 16/17 帧 run 应显著收缩，
+       理想情况归零；
+     - `populateReturnReason = 10` 应在 unitsOnly/directOnly 场景大量出现；
+     - `drawTimeSemanticProducerSubmittedCount` 应与
+       `drawTimeSemanticProducerFreshEntryCount` 同量级，且在原 zero-submit 窗口里保持非零；
+     - 若仍有 flicker，则下一个真正 blocker 不再是 current-draw starvation，
+       而是 draw-time producer 自身的去重/对象筛选准确性。
+   - **编译 / 部署**：
+     - `ninja -C build32` 通过；
+     - `E:\Work\War3\d3d9.dll` = `25419248 bytes @ 2026-05-14 14:14:42`
+
+
+101. **Phase 7.57 修正：draw-time producer 首轮完全没生效，原因是挂在了 `unitsOnly` 条件下（2026-05-14 14:30）**:
+   - **黑匣子复核**：
+     - 用户录制的两份 trace：
+       - cluster: `shadow_pose_full_trace_2026_05_14_14_18_55.jsonl`
+       - single-caster: `shadow_pose_full_trace_2026_05_14_14_21_16.jsonl`
+     - `_phase756_drawtime_producer.py` 结果：
+       - `drawTimeSemanticProducerVisibleCandidateCount = 0`
+       - `drawTimeSemanticProducerFreshEntryCount = 0`
+       - `drawTimeSemanticProducerSubmittedCount = 0`
+       - `populateReturnReason = 10` 也为 0
+     - 结论：**不是 producer 命中率低，而是 producer 根本没进入执行条件。**
+   - **根因**：
+     - `BeforeUi` 主调用点传的是
+       `War3TryPopulateSemanticShadowScene(kShadowSemanticCoreSceneUnitsOnly)`；
+     - `kShadowSemanticCoreSceneUnitsOnly` 当前配置值是 `false`
+       （`war3_internal_test_config.h:706`）；
+     - 首轮实现把 draw-time producer 挂在 `if (unitsOnly && ...)` 下，因此整条
+       路在线上配置里被完全短路。
+   - **修正后的长期主线**：
+     - 不再把 draw-time producer 当成"替代 whole-scene directOnly"；
+     - 改成：
+       1. 现有 `War3TryPopulateDirectCurrentDrawGrouped(readyOnly=true, ...)`
+          先跑，负责 whole scene；
+       2. draw-time producer 再跑一次，但**只补单位**，并且只补
+          `renderablePart` 不在本帧已提交集合里的项；
+       3. 这样 cluster 场景里 current-draw 漏掉的一部分单位也能被 draw-time
+          producer 补上，single-caster 场景则能在 current-draw 全空时接住。
+   - **代码修正**：
+     - `d3d9_device.h`
+       - 新增 `m_war3SemanticSubmittedRenderablePartsThisFrame`
+     - `d3d9_device.cpp`
+       - `War3TryPopulateSemanticShadowScene` 开头清空上述 set
+       - `War3TryAppendSemanticShadowPacket` 成功 append 后记录本帧已提交的
+         `renderablePart`
+       - `War3TryPopulateDrawTimeSemanticProducer` 改成始终只处理
+         `ObjectKind::Unit`
+       - directOnly 分支改为：
+         `direct current-draw submit` → `draw-time producer supplement` → 合并返回
+   - **重新编译 / 部署**：
+     - `ninja -C build32` 通过
+     - `E:\Work\War3\d3d9.dll` = `25419118 bytes @ 2026-05-14 14:30:11`
+   - **下一步验收**：
+     - 让用户重新录同样两份 trace；
+     - 若这次 `drawTimeSemanticProducerSubmittedCount` 仍是 0，
+       下一轮优先查 `VisibleRenderableRegistry::getAllVisibleView()` 在 BeforeUi
+       时的生存期/读写面；
+     - 若 producer 计数非零但 flicker 仍在，则问题从"producer 没跑"正式转成
+       "producer 去重/补位粒度不准"。
+
+
+102. **Phase 7.57 实机黑匣子确认：single-caster zero-submit 已归零，多-caster 由 producer 补缺口（2026-05-14 14:40）**:
+   - **用户视觉反馈**：
+     - “这轮完全不闪了，远离其他Caster也不会卡了”
+   - **用户 trace**：
+     - multi-caster: `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_14_14_38_34.jsonl`
+     - single-caster: `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_14_14_39_47.jsonl`
+   - **single-caster 黑匣子结果**（对比失败版 `14_21_16`）：
+     - 旧：`submitted=0` = `306 / 695` 帧（44.0%），最长 run 88 帧
+     - 新：`submitted=0` = `0 / 674` 帧（0.0%）
+     - `populateReturnReason = 10` = `256 / 674` 帧
+     - `drawTimeSemanticProducerVisibleCandidateCount ≈ 10.0 / frame`
+     - `drawTimeSemanticProducerFreshEntryCount ≈ 3.1 / frame`
+     - `drawTimeSemanticProducerSubmittedCount ≈ 3.1 / frame`
+     - 解释：single-caster 场景下，current-draw 仍会有长空窗，但 draw-time producer
+       已经在这些帧里独立提交单位阴影，把 zero-submit 窗口完全抹平。
+   - **multi-caster 黑匣子结果**：
+     - `submitted=0` = `0 / 161` 帧（保持稳定）
+     - `populateReturnReason = 10` = `0 / 161` 帧
+     - 但 `drawTimeSemanticProducerSubmittedCount ≈ 15.3 / frame`
+     - `drawTimeSemanticProducerVisibleCandidateCount ≈ 124 / frame`
+     - 解释：cluster 场景里 current-draw 仍是主体（所以 return reason 还是 9），
+       draw-time producer 作为 supplement 补上每帧漏掉的单位 caster，这正对应
+       用户此前肉眼看到的“集群里仍有一部分 caster 固定时间闪烁”。
+   - **结论**：
+     - 这次修复真正解决的不是 palette writer，也不是 manifest TTL；
+     - 它解决的是 **semantic direct-only consumer 对 sparse current-draw 的饥饿问题**：
+       - whole-scene 提交仍靠 current-draw
+       - 单位 pose 正确性由 draw-time pre-skinned VB producer 补位保证
+     - 在现有真实场景和黑匣子数据下，少 caster / 多 caster 两类闪烁都已被压平。
+
+
+103. **Phase 7.57 稳定基线恢复 + 安全性能优化（2026-05-14 15:57）**:
+   - **为什么恢复基线**：
+     - 用户后续 single-caster trace `shadow_pose_full_trace_2026_05_14_15_30_12.jsonl`
+       显示卡顿回归；
+     - 黑匣子里 `drawTimeSemanticProducerVisibleCandidateCount = 0`，
+       说明问题不是 producer 主机制失效，而是后续“更严单位筛选”把真实单位候选
+       挡在了入口外；
+     - 因此撤销那层收紧筛选，回到最后一次已知可用的补位逻辑，优先守住视觉基线。
+   - **恢复后的状态**：
+     - 保留：
+       - `current-draw submit` + `draw-time producer supplement`
+       - `m_war3SemanticSubmittedRenderablePartsThisFrame` 去重
+       - draw-time producer 黑匣子计数
+     - 撤销：
+       - 那层导致 `RejectNonUnitLike / RejectNoIdentity` 误杀的更严单位筛选
+   - **本轮安全性能优化**：
+     - 目标：降低 draw-time producer supplement 的 CPU 成本，同时不改补位语义。
+     - 原逻辑：
+       - 每帧遍历 `VisibleRenderableRegistry::getAllVisibleView()` 的全量 visible records；
+       - 再查 `m_war3DrawTimeVBCache` 是否有 fresh entry。
+     - 新逻辑：
+       - 先遍历 `m_war3DrawTimeVBCache` 中本帧 fresh 的条目；
+       - 再通过 `VisibleRenderableRegistry::queryByRenderablePart(...)`
+         反查当前可见语义；
+       - 这把扫描成本从“全量 visible records”降成了“fresh draw-time cache 条目数”，
+         对 cluster 场景尤其更划算，而补位语义不变。
+   - **代码改动**：
+     - `src/d3d9/d3d9_device.cpp`
+       - `War3TryPopulateDrawTimeSemanticProducer()` 改为
+         “fresh cache → renderablePart 反查 visible” 的遍历方式
+       - 不改提交条件、不改补位去重、不改 worldMatrix/IB/UV 消费
+   - **编译 / 部署**：
+     - `ninja -C build32` 通过
+     - `E:\Work\War3\d3d9.dll` = `25419248 bytes @ 2026-05-14 15:57:09`
+   - **运行时验证状态**：
+     - 用户当时外出，本轮还未做新的实机黑匣子复核；
+     - 下一步应先用 single-caster 场景确认视觉基线恢复，再继续观察 perf。

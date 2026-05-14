@@ -1986,6 +1986,7 @@ private:
     uint32_t positionStride = 0u;
     uint32_t positionOffset = 0u;
     VkFormat positionFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     uint32_t vertexCount = 0u;
     // capture 时存好的 Vulkan vertexOffset 值，consume 端直接用。
     // 含义：buffer 索引 0 应映射到原 VB 索引哪个位置的偏移修正。
@@ -2033,6 +2034,7 @@ private:
   };
   std::unordered_map<void*, War3DrawTimeVBEntry> m_war3DrawTimeVBCache;
   uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;
+  std::unordered_set<void*> m_war3SemanticSubmittedRenderablePartsThisFrame;
   bool m_war3SemanticSceneLastZeroSubmitUnitsOnly = true;
   bool m_war3SemanticSceneLastZeroSubmitNativeValidation = false;
   bool m_war3SemanticSceneLastSuccessfulSubmitUnitsOnly = true;
@@ -2119,6 +2121,7 @@ private:
       const dxvk::war3::render::CurrentDrawAuthoritativeSample*
           directCurrentDrawSample,
       bool fromStalePoseRestore);
+  uint32_t War3TryPopulateDrawTimeSemanticProducer();
   uint32_t War3GetOrCreateSemanticShadowPalette(
       const dxvk::war3::shadow::ShadowDrawPacket& packet,
       dxvk::war3::render::ObjectKind resolvedObjectKind,

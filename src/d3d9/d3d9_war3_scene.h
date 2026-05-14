@@ -385,6 +385,11 @@ namespace dxvk {
         uint32_t drawTimeVBCacheRejectInsufficientLength = 0;
         uint32_t drawTimeVBCacheRejectNoBuffer = 0;
         uint32_t drawTimeVBCacheTotalEntered = 0;
+        uint32_t drawTimeSemanticProducerVisibleCandidateCount = 0;
+        uint32_t drawTimeSemanticProducerFreshEntryCount = 0;
+        uint32_t drawTimeSemanticProducerSubmittedCount = 0;
+        uint32_t drawTimeSemanticProducerMissNoFreshEntryCount = 0;
+        uint32_t drawTimeSemanticProducerFallbackCurrentDrawCount = 0;
         uint32_t semanticSceneSubmittedPaletteMotionSampleCount = 0;
         uint32_t semanticSceneSubmittedPaletteMotionNewRuntimeCount = 0;
         uint32_t semanticSceneSubmittedPaletteMotionChangedCount = 0;
