@@ -4155,3 +4155,68 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
          A/B（先看 cull 命中率，再决定默认值）。
      - 任意一步落地之前都必须先用 full trace 复核：
        `submitted=0 == 0` / `shadowMapExecuted=1` / `historyValid=1` / 视觉抽样。
+
+117. **Phase 7.71 撤销 + Phase 7.72 真正修复路径阻断器（2026-05-15 04:10）**:
+   - **Phase 7.71 实机回归（已撤销）**：
+     - 用户实机：path blocker 阴影**仍然存在**，**且 FPS 骤降约 20**。
+     - 撤销提交：`6e7e55d / c6a7123`，DLL 回到 Phase 7.70 (`26767310 bytes`)。
+     - 失败原因复盘：
+       - `War3TryCaptureShadowCaster` 是**旧路径**（legacy ShadowCapture）。在 semantic
+         runtime 默认开启的情况下（`kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled = true`），
+         legacy 早期 bypass 一旦触发就 `return` 不再走 legacy 主体，path blocker
+         **根本没经过我加的检查**。
+       - 我在函数最入口加的 TLS rawcode + `shadowSemantic.object->rawcode` 检查
+         每次 draw 都会执行，War3 一帧几万次 draw call，叠加每次 `shadowSemantic.object`
+         指针解引用的潜在 cache miss，性能掉了 20 FPS。
+       - 视觉验证一直拿 `光影测试.w3x` 跑，但那是个 path blocker 极少的场景，
+         拒绝 counter 才 3.16/帧，根本看不出 fix 是否真的拦住实机场景里的 path blocker。
+   - **Phase 7.72 真正根因**：
+     - path blocker 是 **destructible/rigid**，不是 skinned。新长期路线下：
+       - SceneCollector → Visible registry 收 destructible
+       - `War3ShouldSubmitSemanticPacket` → `War3IsEligibleSemanticStaticWorldCaster`
+         **允许 destructible 提交**（`kShadowSemanticCoreSceneUnitsOnly = false`）
+       - `War3TryAppendSemanticShadowPacket` 主入口**没有 LOS 检查**，rigid 路径
+         全程不会进 v4 vertex-blend 分支里那个嵌套的 LOS 拒绝
+       - producer 路径有 LOS 检查但下一行 `if (objectKind != Unit) continue` 把
+         destructible 过滤了；
+       - fast-append 也有 LOS 检查但下一行 `if (resolvedObjectKind != Unit) return`
+         把 destructible 过滤了。
+       - 结果：path blocker **作为静态 caster 一路通过 eligibility，提交到 shadowCasters
+         向量，被 4 个 CSM cascade 各画一遍**。
+   - **Phase 7.72 修复**（`src/d3d9/d3d9_device.cpp`）：
+     - 在 `War3ShouldSubmitSemanticPacket` 入口（eligibility 层）加：
+       ```cpp
+       if (kPathBlockerHideEnabled && packet.renderable.rawcode != 0u &&
+           IsLosBlockerFourCc(packet.renderable.rawcode)) return false;
+       ```
+       上游 producer 看到 false 就跳过这条 packet，连 packet 构建都省了。
+     - 在 `War3TryAppendSemanticShadowPacket` 主入口加同样的拒绝，并附带 jHandle
+       兜底 `RenderObjectRegistry::findByHandle` 反查，覆盖 packet rawcode 没填
+       但 jHandle 存在的情况。这是冗余安全网，append 一帧只调 100-300 次，不影响热路径。
+     - 在文件顶部 anonymous namespace 加 `inline bool IsLosBlockerFourCc(uint32_t);`
+       前置声明，因为 helper 定义在文件后段。
+   - **不动的部分**：
+     - 不改 `War3TryCaptureShadowCaster`（legacy）；
+     - 不改 producer / fast-append 现有 LOS 检查；
+     - 不动 `IsLosBlockerFourCc` 黑名单；
+     - 不动 manifest TTL / stale restore / receiver hold / TAA / VB cache。
+   - **验证**：
+     - `ninja -C build32` 通过；
+     - `E:\Work\War3\d3d9.dll = 26768513 bytes @ 2026-05-15 04:08:46`；
+     - AutoTest 15s full trace（光影测试.w3x，1007 帧）：
+       - `submitted=0` = 0/1007 ✓
+       - `historyValid` = 1.0/帧 ✓
+       - `producer fallback to current-draw` = 0 ✓
+       - **`path blocker reject` = 6.19/帧**（之前 3.16/帧，**翻倍**——证明
+         新拦截入口确实多拦了一批 destructible path blocker，不是 noise）
+     - 3 轮 perf（光影测试.w3x，无 trace）：
+       - 110.21 / 123.70 / 120.62 → 平均 **118.18 FPS**
+       - vs Phase 7.70 baseline 98.88 FPS：**+19.3 FPS**
+       - 性能反而提升的合理解释：path blocker 之前作为 rigid caster 一路走完
+         整 packet 构建 + 4 个 CSM cascade 全画。现在在 eligibility 层直接拒掉，
+         省了相当于 ~6 个/帧 caster 的全 4 cascade replay。
+   - **实机预期**：
+     - path blocker 阴影应当消失（新长期路线下 semantic packet append 是 caster
+       的唯一入口）；
+     - 性能应回到正常或略有提升；
+     - 调试：`kPathBlockerDebugEnabled = true` 可在 DebugView 看到 reject 命中。
