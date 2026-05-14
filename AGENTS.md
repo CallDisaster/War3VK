@@ -3811,3 +3811,57 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
        问题；
      - 下一步优化优先看 `Shadow/Main` / receiver / TAA GPU 成本和
        `Other/UntrackedActive`，避免重新改 Pose 数据层。
+
+
+111. **Phase 7.66 shadow map cascade sort de-dup（2026-05-14 21:28）**:
+   - **目标**：
+     - 继续在 shadow map pass 内部做低风险 CPU 优化；
+     - 不改变 caster 输入、不改变 Pose 来源、不改变 AlphaTest/TAA/receiver。
+   - **代码改动**：
+     - `src/d3d9/d3d9_war3_shadow.cpp`
+       - 原逻辑每个 cascade 都先过滤 `drawIndices` 再按
+         pipeline / texture / VB / IB 排序；
+       - 新逻辑先对所有有效 prepared draw 建立一次全局排序列表，
+         每个 cascade 只沿这个排序列表做 cull/filter；
+       - 排序 comparator 与 tie-breaker `a < b` 保持不变，因此每个
+         cascade 的最终 draw 顺序等价于原来的“过滤后排序”。
+     - `src/d3d9/d3d9_war3_shadow.h`
+       - 新增 `m_shadowSortedDrawIndicesScratch` 复用排序 scratch。
+   - **黑匣子验收**：
+     - trace：
+       `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_14_21_23_20.jsonl`
+     - `_phase756_drawtime_producer.py`：
+       - `submitted=0` = `0 / 950`
+       - producer visible candidates ≈ `96.3 / frame`
+       - producer fresh entries ≈ `20.6 / frame`
+       - producer submitted ≈ `20.6 / frame`
+       - producer miss-no-fresh = `0.0 / frame`
+       - producer fallback to current-draw = `0 / 950`
+     - TAA / receiver trace：
+       - `semanticSceneShadowTaaMode`: 前 2 帧 `1`，随后 948 帧 `2`
+       - `semanticSceneShadowReceiverSampleSource`: 前 2 帧 `2`，随后 948 帧 `3`
+       - `semanticSceneShadowHistoryValidAfter`: `950 / 950`
+       - `semanticSceneReceiverDrawExecutedThisFrame`: `950 / 950`
+       - `semanticSceneShadowVisibilityExecutedThisFrame`: `950 / 950`
+       - `semanticSceneShadowMapRenderSerial`: `1..950` 连续推进
+     - prebuild bypass：
+       - Attempt = `72766`
+       - Hit = `72266`
+       - hit rate ≈ `99.31%`
+   - **性能证据**：
+     - pure perf rerun：
+       `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_05_14_21_22_54.html`
+     - `avgFps = 110.777`
+     - `avgFrameTimeMs = 9.027`
+     - `avgGpuTimeMs = 1.590`
+     - `avgProcessCpuMs = 7.797`
+     - `avgMainThreadCpuMs = 5.469`
+     - `War3SemanticScene/Populate` ≈ `0.350ms/frame`
+     - `Shadow/Main` ≈ `0.495ms CPU / 0.673ms GPU`
+     - `ShadowMap` ≈ `0.279ms CPU / 0.111ms GPU`
+     - `PostFX/AA` ≈ `0.029ms CPU / 0.247ms GPU`
+   - **注意事项**：
+     - 一次与 full trace 并发的 perf 报告
+       `war3_perf_report_auto_2026_05_14_21_20_28.html` 受双 War3 进程污染，
+       不作为结论；
+     - 这轮收益很小，但方向安全：减少重复排序，不碰数据层。

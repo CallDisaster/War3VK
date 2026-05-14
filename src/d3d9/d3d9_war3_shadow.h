@@ -244,6 +244,7 @@ namespace dxvk {
         std::unordered_map<PipelineKey, Pipeline, DxvkHash, DxvkEq> m_pipelines;
         std::unordered_map<ShadowCasterPipelineKey, ShadowCasterPipeline, DxvkHash, DxvkEq> m_shadowCasterPipelines;
         std::vector<PreparedShadowCaster> m_shadowPreparedScratch;
+        std::vector<uint32_t> m_shadowSortedDrawIndicesScratch;
         std::vector<uint32_t> m_shadowDrawIndicesScratch;
 
         // ShadowTAA 相关全屏 pass（固定输出格式，单例 pipeline）

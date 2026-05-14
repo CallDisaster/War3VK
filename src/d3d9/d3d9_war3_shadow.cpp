@@ -1764,8 +1764,32 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     return true;
   };
 
+  m_shadowSortedDrawIndicesScratch.clear();
+  m_shadowSortedDrawIndicesScratch.reserve(casterCount);
+  auto& sortedDrawIndices = m_shadowSortedDrawIndicesScratch;
+  for (uint32_t i = 0; i < casterCount; i++) {
+    if (prepared[i].valid)
+      sortedDrawIndices.push_back(i);
+  }
+  if (sortedDrawIndices.size() > 1) {
+    std::sort(sortedDrawIndices.begin(), sortedDrawIndices.end(),
+              [&](uint32_t a, uint32_t b) {
+                const auto &ka = prepared[a];
+                const auto &kb = prepared[b];
+                if (ka.pipelineHash != kb.pipelineHash)
+                  return ka.pipelineHash < kb.pipelineHash;
+                if (ka.alphaImageView != kb.alphaImageView)
+                  return ka.alphaImageView < kb.alphaImageView;
+                if (ka.positionBuffer != kb.positionBuffer)
+                  return ka.positionBuffer < kb.positionBuffer;
+                if (ka.indexBuffer != kb.indexBuffer)
+                  return ka.indexBuffer < kb.indexBuffer;
+                return a < b;
+              });
+  }
+
   m_shadowDrawIndicesScratch.clear();
-  m_shadowDrawIndicesScratch.reserve(casterCount);
+  m_shadowDrawIndicesScratch.reserve(sortedDrawIndices.size());
   auto& drawIndices = m_shadowDrawIndicesScratch;
   std::array<uint32_t, 4> culledPerCascade = {};
   std::array<uint32_t, 4> drawnPerCascade = {};
@@ -1778,9 +1802,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
     drawIndices.clear();
     uint32_t culled = 0;
-    for (uint32_t i = 0; i < casterCount; i++) {
-      if (!prepared[i].valid)
-        continue;
+    for (uint32_t i : sortedDrawIndices) {
       const auto &draw = *replayDraws[i];
       if (!intersectsCascade(draw, c)) {
         culled++;
@@ -1792,23 +1814,6 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     }
 
     culledPerCascade[c] = culled;
-
-    if (drawIndices.size() > 1) {
-      std::sort(drawIndices.begin(), drawIndices.end(),
-                [&](uint32_t a, uint32_t b) {
-                  const auto &ka = prepared[a];
-                  const auto &kb = prepared[b];
-                  if (ka.pipelineHash != kb.pipelineHash)
-                    return ka.pipelineHash < kb.pipelineHash;
-                  if (ka.alphaImageView != kb.alphaImageView)
-                    return ka.alphaImageView < kb.alphaImageView;
-                  if (ka.positionBuffer != kb.positionBuffer)
-                    return ka.positionBuffer < kb.positionBuffer;
-                  if (ka.indexBuffer != kb.indexBuffer)
-                    return ka.indexBuffer < kb.indexBuffer;
-                  return a < b;
-                });
-    }
 
     const float alphaRefBiasCascade =
         (cascadeCount > 1)
