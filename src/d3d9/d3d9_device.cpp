@@ -82,6 +82,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1255,8 +1256,11 @@ using War3DirectPacketGeosetCache =
     std::unordered_map<void*,
                        std::shared_ptr<const War3DirectPacketGeosetRecord>>;
 
-std::mutex& War3DirectPacketGeosetCacheMutex() {
-  static std::mutex s_mutex;
+// Phase 7.76：从 std::mutex 切到 shared_mutex 让 Find 走 shared_lock，
+// 同帧 BuildPacket 的并发 lookup 不再相互排队。Get 的 read-only 命中分支也
+// 走 shared，只有 cache miss/insert 才升级到 unique_lock。
+std::shared_mutex& War3DirectPacketGeosetCacheMutex() {
+  static std::shared_mutex s_mutex;
   return s_mutex;
 }
 
@@ -1270,7 +1274,7 @@ War3FindDirectPacketGeosetResource(void* geosetOrDataPtr) {
   if (geosetOrDataPtr == nullptr)
     return nullptr;
 
-  std::lock_guard<std::mutex> lock(War3DirectPacketGeosetCacheMutex());
+  std::shared_lock<std::shared_mutex> lock(War3DirectPacketGeosetCacheMutex());
   const auto& s_cache = War3DirectPacketGeosetResourceCache();
   const auto it = s_cache.find(geosetOrDataPtr);
   if (it == s_cache.end() || it->second == nullptr ||
@@ -1288,8 +1292,25 @@ War3GetDirectPacketGeosetResource(
   if (key == nullptr)
     return std::make_shared<War3DirectPacketGeosetRecord>(std::move(geoset));
 
-  std::lock_guard<std::mutex> lock(War3DirectPacketGeosetCacheMutex());
+  // Step 1：fast path 走 shared_lock 看缓存命中。
+  {
+    std::shared_lock<std::shared_mutex> lock(
+        War3DirectPacketGeosetCacheMutex());
+    const auto& cache = War3DirectPacketGeosetResourceCache();
+    const auto it = cache.find(key);
+    if (it != cache.end() && it->second != nullptr &&
+        it->second->contentHash == geoset.contentHash &&
+        it->second->vertexCount == geoset.vertexCount &&
+        it->second->indexCount == geoset.indexCount &&
+        it->second->readyForShadowConsumer()) {
+      return it->second;
+    }
+  }
+
+  // Step 2：miss / 内容变化，升级到 unique_lock 写。
+  std::unique_lock<std::shared_mutex> lock(War3DirectPacketGeosetCacheMutex());
   auto& cache = War3DirectPacketGeosetResourceCache();
+  // 重新检查（双锁释放/获取之间可能其他线程已写入）。
   const auto it = cache.find(key);
   if (it != cache.end() && it->second != nullptr &&
       it->second->contentHash == geoset.contentHash &&
