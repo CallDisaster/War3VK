@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -429,7 +430,12 @@ struct RuntimePoseArrayRange {
   uint32_t matrixCount = 0u;
 };
 
-std::mutex g_runtimePoseArrayRangeMutex;
+// Phase 7.79：从 std::mutex 切到 shared_mutex。
+// `TryFindRuntimePoseArrayRangeForMatrix` 在 hot path（Hook_RuntimeMatrixWrite）
+// 每帧 13K-30K 次访问，TLS hot cache miss 时进入 read 路径。注册写入路径
+// （RegisterRuntimePoseArrayRange / clear）远少于查询读。reader 走 shared_lock，
+// 让多读者并发；writer 走 unique_lock，互斥语义保持原状。
+std::shared_mutex g_runtimePoseArrayRangeMutex;
 std::unordered_map<uintptr_t, RuntimePoseArrayRange> g_runtimePoseArrayByModel;
 std::unordered_map<uintptr_t, RuntimePoseArrayRange>
     g_runtimePoseArrayByMatrixPtr;
@@ -5852,7 +5858,7 @@ void RememberRuntimePoseArrayRange(int runtimeModel) {
   if (!TryReadRuntimePoseArrayRange(runtimeModel, range))
     return;
 
-  std::lock_guard<std::mutex> lock(g_runtimePoseArrayRangeMutex);
+  std::unique_lock<std::shared_mutex> lock(g_runtimePoseArrayRangeMutex);
   auto previous = g_runtimePoseArrayByModel.find(range.runtimeModel);
   if (previous != g_runtimePoseArrayByModel.end()) {
     const auto old = previous->second;
@@ -5888,7 +5894,8 @@ bool TryFindRuntimePoseArrayRangeForMatrix(int destMatrixPtr,
     return true;
   }
 
-  std::lock_guard<std::mutex> lock(g_runtimePoseArrayRangeMutex);
+  // Phase 7.79：reader 走 shared_lock，让 hook 高频 hot path 不再串行化。
+  std::shared_lock<std::shared_mutex> lock(g_runtimePoseArrayRangeMutex);
   auto it = g_runtimePoseArrayByMatrixPtr.find(dest);
   if (it == g_runtimePoseArrayByMatrixPtr.end())
     return false;
@@ -8836,7 +8843,7 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
     g_runtimeMatrixWriteLastMatrixHash.store(0u,
                                              std::memory_order_relaxed);
     {
-      std::lock_guard<std::mutex> lock(g_runtimePoseArrayRangeMutex);
+      std::unique_lock<std::shared_mutex> lock(g_runtimePoseArrayRangeMutex);
       g_runtimePoseArrayByModel.clear();
       g_runtimePoseArrayByMatrixPtr.clear();
     }
