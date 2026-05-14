@@ -420,6 +420,28 @@ namespace dxvk {
         uint32_t drawTimeSemanticProducerMissNoFreshEntryCount = 0;
         uint32_t drawTimeSemanticProducerFallbackCurrentDrawCount = 0;
         uint32_t semanticSceneRejectedPathBlockerCount = 0;
+        // Phase 7.73：路径阻断器拒绝来源分桶。每个 reject 站点用独立 counter，
+        // 让 full trace 能直接指认 path blocker 走的是哪条出口。
+        // - EarlyBypass：早期 bypass 分支（非 terrain，已构建 semantic 后）
+        // - EligibilityGate：War3ShouldSubmitSemanticPacket 入口
+        // - AppendEntry：War3TryAppendSemanticShadowPacket 主入口（packet.rawcode）
+        // - AppendEntryByJHandle：append 入口的 jHandle 兜底反查
+        // - AppendVbBlend：append 函数内 v4 vertex-blend 分支（skinned 命中）
+        // - FastAppend：tryAppendDrawTimeFastEligible（先看 packet 后看 entry.rawcode）
+        // - DirectGroupedRecords：directRecords 完整重建 / 简化重建路径
+        // - Producer：War3TryPopulateDrawTimeSemanticProducer 提交时
+        // - StaticSupplement：trySupplementDirectCurrentDrawStaticScene
+        // - LegacyCapture：War3TryCaptureShadowCaster legacy 主体（很少触发）
+        uint32_t semanticSceneRejectedPathBlockerEarlyBypassCount = 0;
+        uint32_t semanticSceneRejectedPathBlockerEligibilityGateCount = 0;
+        uint32_t semanticSceneRejectedPathBlockerAppendEntryCount = 0;
+        uint32_t semanticSceneRejectedPathBlockerAppendEntryByJHandleCount = 0;
+        uint32_t semanticSceneRejectedPathBlockerAppendVbBlendCount = 0;
+        uint32_t semanticSceneRejectedPathBlockerFastAppendCount = 0;
+        uint32_t semanticSceneRejectedPathBlockerDirectGroupedCount = 0;
+        uint32_t semanticSceneRejectedPathBlockerProducerCount = 0;
+        uint32_t semanticSceneRejectedPathBlockerStaticSupplementCount = 0;
+        uint32_t semanticSceneRejectedPathBlockerLegacyCaptureCount = 0;
         uint32_t semanticSceneDirectDrawTimePrebuildBypassAttemptCount = 0;
         uint32_t semanticSceneDirectDrawTimePrebuildBypassHitCount = 0;
         uint32_t semanticSceneSubmittedPaletteMotionSampleCount = 0;

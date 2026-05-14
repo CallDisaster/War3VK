@@ -1189,6 +1189,11 @@ bool War3ShouldSubmitSemanticPacket(
 // 等 eligibility helper 想用的话需要这个前置声明。
 inline bool IsLosBlockerFourCc(uint32_t rawcode);
 
+// Phase 7.73：eligibility gate 拒绝路径阻断器的全局计数（atomic relaxed）。
+// 该函数定义在 anonymous namespace，没有 D3D9DeviceEx 上下文，因此用全局
+// 原子计数。D3D9DeviceEx 每帧 reset shadow scene 时把累加值移入 shadowStats。
+inline std::atomic<uint32_t> g_pathBlockerEligibilityGateRejectCount{0u};
+
 bool War3IsEligibleSemanticDynamicUnit(
     const dxvk::war3::shadow::ShadowDrawPacket& packet,
     dxvk::war3::render::ObjectKind resolvedObjectKind) {
@@ -2734,9 +2739,13 @@ bool War3ShouldSubmitSemanticPacket(
     dxvk::war3::render::ObjectKind resolvedObjectKind, bool unitsOnly) {
   // Phase 7.72：路径阻断器在 eligibility 层就拦掉，避免上游 producer 还要继续
   // 走完整 packet 构建。这里只读 packet.renderable.rawcode，无堆/无锁。
+  // Phase 7.73：拒绝时累加全局原子计数，由 D3D9DeviceEx 在 caster reset 时
+  // 折进 shadowStats，让 trace 看到 eligibility 层的命中量。
   if (dxvk::war3::internal::kPathBlockerHideEnabled &&
       packet.renderable.rawcode != 0u &&
       IsLosBlockerFourCc(packet.renderable.rawcode)) {
+    g_pathBlockerEligibilityGateRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
     return false;
   }
   const bool hasRenderableGeoset =
@@ -9563,6 +9572,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   // 因此每帧上千次调用也只是几个常量比较+大小写归一化。
   if (dxvk::war3::internal::kPathBlockerHideEnabled) {
     bool blocked = false;
+    bool blockedByJHandle = false;
     if (packet.renderable.rawcode != 0u &&
         IsLosBlockerFourCc(packet.renderable.rawcode)) {
       blocked = true;
@@ -9572,15 +9582,33 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       if (const auto* obj =
               dxvk::war3::render::RenderObjectRegistry::instance()
                   .findByHandle(packet.renderable.jHandle)) {
-        if (obj->rawcode != 0u && IsLosBlockerFourCc(obj->rawcode))
+        if (obj->rawcode != 0u && IsLosBlockerFourCc(obj->rawcode)) {
           blocked = true;
+          blockedByJHandle = true;
+        }
       }
     }
     if (blocked) {
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      if (blockedByJHandle) {
+        m_war3Scene.shadowStats
+            .semanticSceneRejectedPathBlockerAppendEntryByJHandleCount++;
+      } else {
+        m_war3Scene.shadowStats
+            .semanticSceneRejectedPathBlockerAppendEntryCount++;
+      }
       m_war3Scene.shadowStats.skippedNotCaster++;
       return false;
     }
+  }
+  // Phase 7.73：把 eligibility gate（File-scope helper）累计的拒绝数折进
+  // 当前帧 shadowStats，每个 append 调用都偷一次。如果 eligibility 拦截能起
+  // 作用，这个 counter 应该在持续上升。
+  if (uint32_t pending = g_pathBlockerEligibilityGateRejectCount.exchange(
+          0u, std::memory_order_relaxed)) {
+    m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount += pending;
+    m_war3Scene.shadowStats
+        .semanticSceneRejectedPathBlockerEligibilityGateCount += pending;
   }
 
   auto toVkTopology = [](dxvk::war3::shadow::ShadowPrimitiveTopology topology) {
@@ -11171,6 +11199,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
             (War3ShadowIsLosBlocker(packet) ||
              IsLosBlockerFourCc(entry.rawcode))) {
           m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+          m_war3Scene.shadowStats
+              .semanticSceneRejectedPathBlockerAppendVbBlendCount++;
           m_war3Scene.shadowStats.skippedNotCaster++;
           return false;
         }
@@ -11861,6 +11891,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     if (dxvk::war3::internal::kPathBlockerHideEnabled &&
         (War3ShadowIsLosBlocker(record) || IsLosBlockerFourCc(entry.rawcode))) {
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats
+          .semanticSceneRejectedPathBlockerProducerCount++;
       m_war3Scene.shadowStats.skippedNotCaster++;
       entry.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
       continue;
@@ -12278,6 +12310,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       if (dxvk::war3::internal::kPathBlockerHideEnabled &&
           War3ShadowIsLosBlocker(record)) {
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+        m_war3Scene.shadowStats
+            .semanticSceneRejectedPathBlockerDirectGroupedCount++;
         m_war3Scene.shadowStats.skippedNotCaster++;
         continue;
       }
@@ -12708,6 +12742,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (dxvk::war3::internal::kPathBlockerHideEnabled &&
         War3ShadowIsLosBlocker(record)) {
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats
+          .semanticSceneRejectedPathBlockerDirectGroupedCount++;
       m_war3Scene.shadowStats.skippedNotCaster++;
       continue;
     }
@@ -13321,8 +13357,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (eligible.packet.path != dxvk::war3::shadow::ShadowDrawPath::Skinned)
       return false;
     if (dxvk::war3::internal::kPathBlockerHideEnabled &&
-        War3ShadowIsLosBlocker(eligible.packet))
+        War3ShadowIsLosBlocker(eligible.packet)) {
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats
+          .semanticSceneRejectedPathBlockerFastAppendCount++;
+      m_war3Scene.shadowStats.skippedNotCaster++;
       return false;
+    }
 
     const auto resolvedObjectKind =
         War3ResolveSemanticPacketObjectKindFast(eligible.packet);
@@ -13350,6 +13391,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (dxvk::war3::internal::kPathBlockerHideEnabled &&
         IsLosBlockerFourCc(entry.rawcode)) {
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats
+          .semanticSceneRejectedPathBlockerFastAppendCount++;
       m_war3Scene.shadowStats.skippedNotCaster++;
       entry.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
       return false;
@@ -15106,6 +15149,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
       if (dxvk::war3::internal::kPathBlockerHideEnabled &&
           War3ShadowIsLosBlocker(record)) {
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+        m_war3Scene.shadowStats
+            .semanticSceneRejectedPathBlockerStaticSupplementCount++;
         m_war3Scene.shadowStats.skippedNotCaster++;
         continue;
       }
@@ -23110,6 +23155,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       if (dxvk::war3::internal::kPathBlockerHideEnabled &&
           War3ShadowIsLosBlocker(semantic, earlyCurrentObj)) {
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+        m_war3Scene.shadowStats
+            .semanticSceneRejectedPathBlockerEarlyBypassCount++;
         m_war3Scene.shadowStats.skippedNotCaster++;
         return;
       }
@@ -24220,6 +24267,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                           "(0x%08X), handle=0x%X\n",
                           rawcodeStr, rawcode, batchHandle);
         }
+        m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+        m_war3Scene.shadowStats
+            .semanticSceneRejectedPathBlockerLegacyCaptureCount++;
         m_war3Scene.shadowStats.skippedNotCaster++;
         return;
       }

@@ -717,6 +717,26 @@ void WriteTraceFrameEvent(
      << stats.drawTimeSemanticProducerFallbackCurrentDrawCount
      << ",\"semanticSceneRejectedPathBlockerCount\":"
      << stats.semanticSceneRejectedPathBlockerCount
+     << ",\"semanticSceneRejectedPathBlockerEarlyBypassCount\":"
+     << stats.semanticSceneRejectedPathBlockerEarlyBypassCount
+     << ",\"semanticSceneRejectedPathBlockerEligibilityGateCount\":"
+     << stats.semanticSceneRejectedPathBlockerEligibilityGateCount
+     << ",\"semanticSceneRejectedPathBlockerAppendEntryCount\":"
+     << stats.semanticSceneRejectedPathBlockerAppendEntryCount
+     << ",\"semanticSceneRejectedPathBlockerAppendEntryByJHandleCount\":"
+     << stats.semanticSceneRejectedPathBlockerAppendEntryByJHandleCount
+     << ",\"semanticSceneRejectedPathBlockerAppendVbBlendCount\":"
+     << stats.semanticSceneRejectedPathBlockerAppendVbBlendCount
+     << ",\"semanticSceneRejectedPathBlockerFastAppendCount\":"
+     << stats.semanticSceneRejectedPathBlockerFastAppendCount
+     << ",\"semanticSceneRejectedPathBlockerDirectGroupedCount\":"
+     << stats.semanticSceneRejectedPathBlockerDirectGroupedCount
+     << ",\"semanticSceneRejectedPathBlockerProducerCount\":"
+     << stats.semanticSceneRejectedPathBlockerProducerCount
+     << ",\"semanticSceneRejectedPathBlockerStaticSupplementCount\":"
+     << stats.semanticSceneRejectedPathBlockerStaticSupplementCount
+     << ",\"semanticSceneRejectedPathBlockerLegacyCaptureCount\":"
+     << stats.semanticSceneRejectedPathBlockerLegacyCaptureCount
      << ",\"semanticSceneDirectDrawTimePrebuildBypassAttemptCount\":"
      << stats.semanticSceneDirectDrawTimePrebuildBypassAttemptCount
      << ",\"semanticSceneDirectDrawTimePrebuildBypassHitCount\":"
