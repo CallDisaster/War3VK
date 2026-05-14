@@ -22993,6 +22993,30 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   const auto cat = War3RenderState::GetStageCategory();
   const auto &shadowSemantic = War3RenderState::GetTlsShadowSemanticState();
 
+  // Phase 7.71：路径阻断器最早期拦截。
+  // 路径阻断器（YTab/YTac/YTpb/YTpc/YTfb/YTfc/YTlb/YTlc 等）在游戏内不可见，
+  // 但在我们走过的多条阴影路径里都能被错误地写入阴影。新长期路线把对象身份
+  // 收束到 ExecBatch -> TlsShadowSemanticState 的桥，rawcode 在 TLS 上立刻就有。
+  // 这里直接看 TLS rawcode + TLS 对象指针；命中就退出，不再让 v4 capture / 早期
+  // bypass / legacy 主体三条路径任意一条把它写进 shadowCasters。这个分支非常
+  // 便宜（一个 32-bit 比较 + 大小写归一化 + 8 个常量比较），即便 path-blocker
+  // 隐藏被关闭也只多一次 bool load。
+  if (dxvk::war3::internal::kPathBlockerHideEnabled) {
+    if (shadowSemantic.rawcode != 0u &&
+        IsLosBlockerFourCc(shadowSemantic.rawcode)) {
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats.skippedNotCaster++;
+      return;
+    }
+    if (shadowSemantic.object != nullptr &&
+        shadowSemantic.object->rawcode != 0u &&
+        IsLosBlockerFourCc(shadowSemantic.object->rawcode)) {
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats.skippedNotCaster++;
+      return;
+    }
+  }
+
   // [诊断] 极致暴力诊断：记录所有进入逻辑的 Draw Call
   static uint32_t s_rawCallCount = 0;
   s_rawCallCount++;
@@ -24142,6 +24166,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     batchHandle = handleId ? (0x100000u | handleId) : 0u;
   }
 
+  // Phase 7.71：路径阻断器拦截入口。
+  // 旧实现只看 `pathBlockObj->rawcode`，依赖 currentObj 或 RenderObjectRegistry
+  // 解析出 RenderObjectInfo。新长期路线（语义桥）让 destructible/decoration 的
+  // rawcode 经常只落在 `semantic.rawcode`（来自 TLS 桥 / 对象指针 / runtime hint），
+  // RenderObjectRegistry 此时可能没注册到该 jHandle。结果就是 path blocker 走完
+  // 早期 bypass 分支前的 terrain/Decoration 判定后绕过 LOS 过滤，进入 legacy 主体
+  // 投影到阴影。
+  // 修复：和早期 bypass 分支保持一致，统一调用 War3ShadowIsLosBlocker(semantic,
+  // currentObj)，它会同时检查 semantic.rawcode / semantic.object->rawcode /
+  // currentObj->rawcode；再叠加原有的 batchHandle->RegistryLookup 兜底。
   const dxvk::war3::render::RenderObjectInfo *pathBlockObj = currentObj;
   if ((!pathBlockObj || pathBlockObj->rawcode == 0) && batchHandle != 0) {
     if (const auto *lookupObj =
@@ -24151,37 +24185,37 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
   }
 
-  if (dxvk::war3::internal::kPathBlockerHideEnabled && pathBlockObj) {
-    if (pathBlockObj->rawcode != 0) {
-      const uint32_t rawcode = pathBlockObj->rawcode;
+  if (dxvk::war3::internal::kPathBlockerHideEnabled) {
+    const bool blockedBySemantic =
+        War3ShadowIsLosBlocker(semantic, currentObj);
+    const bool blockedByLookup =
+        pathBlockObj != nullptr && pathBlockObj != currentObj &&
+        IsLosBlockerFourCc(pathBlockObj->rawcode);
+    if (blockedBySemantic || blockedByLookup) {
+      // 还原一份用于诊断日志的 rawcode：优先用 semantic.rawcode，再退到 object 链。
+      uint32_t rawcodeForLog = semantic.rawcode;
+      if (rawcodeForLog == 0u && semantic.object != nullptr)
+        rawcodeForLog = semantic.object->rawcode;
+      if (rawcodeForLog == 0u && currentObj != nullptr)
+        rawcodeForLog = currentObj->rawcode;
+      if (rawcodeForLog == 0u && pathBlockObj != nullptr)
+        rawcodeForLog = pathBlockObj->rawcode;
 
       if (dxvk::war3::internal::kPathBlockerDebugEnabled) {
-        static uint32_t s_debugLog = 0;
-        if (s_debugLog < 50) {
-          s_debugLog++;
-          char rawcodeStr[5] = {0};
-          FormatFourCcEditorString(rawcode, rawcodeStr);
-          WAR3_RENDER_LOG("DXVK: Shadow caster rawcode='%s' (0x%08X), "
-                          "handle=0x%X, groupIdx=%d\n",
-                          rawcodeStr, rawcode, batchHandle,
-                          pathBlockObj->groupIdx);
-        }
-      }
-
-      if (IsLosBlockerFourCc(rawcode)) {
         static uint32_t s_blockerLog = 0;
-        if (s_blockerLog < 10 &&
-            dxvk::war3::internal::kPathBlockerDebugEnabled) {
+        if (s_blockerLog < 10) {
           s_blockerLog++;
           char rawcodeStr[5] = {0};
-          FormatFourCcEditorString(rawcode, rawcodeStr);
+          FormatFourCcEditorString(rawcodeForLog, rawcodeStr);
           WAR3_RENDER_LOG("DXVK: Skipping path blocker shadow, rawcode='%s' "
-                          "(0x%08X), handle=0x%X\n",
-                          rawcodeStr, rawcode, batchHandle);
+                          "(0x%08X), handle=0x%X, src=%s\n",
+                          rawcodeStr, rawcodeForLog, batchHandle,
+                          blockedBySemantic ? "semantic" : "registryLookup");
         }
-        m_war3Scene.shadowStats.skippedNotCaster++;
-        return;
       }
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats.skippedNotCaster++;
+      return;
     }
   }
 
