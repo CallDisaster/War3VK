@@ -12333,6 +12333,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         preferredSelectionKeys.end());
     std::vector<PreselectedRecord> preselectedRecords;
     preselectedRecords.reserve(rawRecordCount);
+    auto preselectScope = War3SemanticSubmitScope(
+        "War3SemanticScene/Direct/Preselect");
     for (const auto& record : directRecords) {
       auto& bucket = completenessBucketForRecord(record);
       if (dxvk::war3::internal::kPathBlockerHideEnabled &&

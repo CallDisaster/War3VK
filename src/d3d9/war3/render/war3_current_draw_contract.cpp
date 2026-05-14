@@ -1,8 +1,10 @@
 #include "war3_current_draw_contract.h"
 
 #include "../../d3d9_war3_debug.h"
+#include "../core/war3_internal_test_config.h"
 #include "../core/war3_memory.h"
 #include "../hooks/war3_hook_install_util.h"
+#include "../tools/war3_perf_monitor.h"
 #include "war3_render_state.h"
 #include "war3_render_objects.h"
 #include "../state/war3_render_state.h"
@@ -1191,6 +1193,16 @@ bool QueryCurrentDrawPreparedSlice(void* renderablePart,
 }
 
 void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
+  // Phase 7.74：把 Publish 的 CPU 时间显式归类。constexpr 门控；release 默认
+  // 编译期 strip。该函数每帧约 10K-30K 次（每个 RenderQueue_UpdateItemWorldMatrix
+  // 都会触发一次），是 OutsideMainLoop/Tracked 的潜在大头。
+  auto publishScope = [&]() -> dxvk::war3::War3PerfMonitor::ScopedCpuScope {
+    if constexpr (dxvk::war3::internal::kNativeOptimizationPerfTrackingEnabled) {
+      return dxvk::war3::War3PerfMonitor::instance().cpuScope(
+          "Shadow/Publish/CurrentDraw");
+    }
+    return {};
+  }();
   g_publishAttemptCount.fetch_add(1u, std::memory_order_relaxed);
   if (record.renderablePart == nullptr) {
     g_publishMissNoRenderablePart.fetch_add(1u, std::memory_order_relaxed);
