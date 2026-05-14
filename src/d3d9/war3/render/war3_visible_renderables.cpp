@@ -2244,6 +2244,28 @@ bool VisibleRenderableRegistry::registerSemanticCandidate(
                     kWar3RuntimeConfigDeferSemanticVisibleIndexBuild &&
                 !dxvk::war3::internal::
                     kWar3RuntimeConfigMaintainSemanticVisibleHotLookupIndexes) {
+    auto tryMergeIndexedCandidate = [&](uint32_t index) {
+      if (index < snap.records.size() && mergeCandidateIntoExisting(index)) {
+        snap.semanticCandidateMergedCount++;
+        return true;
+      }
+      return false;
+    };
+    if (candidate.renderablePart != nullptr) {
+      const uint64_t partLayerKey =
+          VisibleRenderablePartLayerKey(candidate.renderablePart,
+                                        candidate.layerIndex);
+      const auto layerIt = snap.byRenderablePartLayer.find(partLayerKey);
+      if (layerIt != snap.byRenderablePartLayer.end() &&
+          tryMergeIndexedCandidate(layerIt->second)) {
+        return true;
+      }
+      const auto partIt = snap.byRenderablePart.find(candidate.renderablePart);
+      if (partIt != snap.byRenderablePart.end() &&
+          tryMergeIndexedCandidate(partIt->second)) {
+        return true;
+      }
+    }
     for (uint32_t index = 0u; index < snap.records.size(); ++index) {
       const auto& existing = snap.records[index];
       if (candidate.renderablePart != nullptr &&

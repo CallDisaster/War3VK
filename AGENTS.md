@@ -3670,3 +3670,81 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
        的剩余 CPU 热点；
      - 每轮仍必须用 full trace 复核 `submitted=0 == 0` 和 TAA history
        稳定状态，视觉正确性优先级高于 FPS。
+
+
+109. **Phase 7.62-7.64 draw-time prebuild bypass + 关闭 matrix publisher hooks（2026-05-14 21:05）**:
+   - **目标**：
+     - 继续长期 semantic draw-time 主线，不走 legacy route；
+     - 保留 draw-time VB/IB/UV GPU copy 作为当前 Pose 权威源；
+     - 去掉不再参与当前 Pose 正确性的 matrix/palette publisher 热路径成本。
+   - **代码改动**：
+     - `src/d3d9/d3d9_device.cpp`
+       - 新增 `DXVK_WAR3_SEMANTIC_DRAW_TIME_PREBUILD_BYPASS`，默认开启；
+       - 当 current draw record 命中当前帧 draw-time VB cache 且是稳定 Unit
+         skinned path 时，直接构造供 fast append 消费的 lightweight packet，
+         跳过 `War3TryBuildShadowPacketFromCurrentDrawRecord()` 的 bind-pose /
+         palette 数据层构建；
+       - 新增 `DXVK_WAR3_SEMANTIC_BYPASS_INLINE_REGISTRY_PUBLISH`，默认关闭，
+         避免每个 bypass candidate 内联发布 semantic registries；
+     - `src/d3d9/d3d9_war3_scene.h` 与
+       `src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp`
+       - 新增并输出
+         `semanticSceneDirectDrawTimePrebuildBypassAttemptCount` /
+         `semanticSceneDirectDrawTimePrebuildBypassHitCount`；
+     - `src/d3d9/war3/render/war3_visible_renderables.cpp`
+       - `registerSemanticCandidate()` 在 deferred-index 模式下先查
+         `byRenderablePartLayer` / `byRenderablePart`，命中后仍走原有
+         `mergeCandidateIntoExisting()`，减少线性扫描；
+     - `src/d3d9/war3/core/war3_internal_test_config.h`
+       - `kWar3RuntimeConfigEnableSemanticMatrixPublisherHooks = false`。
+   - **为什么这次关闭 publisher 是安全的**：
+     - 当前 skinned Pose 已经由 draw-time pre-skinned VB/IB/UV copy 提供；
+     - full trace 中 matrix/palette publisher 计数归零，但 draw-time VB capture
+       与 producer submit 仍持续工作；
+     - 这条路没有重新依赖 stale lease / palette rebuild / legacy capture。
+   - **黑匣子验收**：
+     - trace：
+       `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_14_20_56_46.jsonl`
+     - `_phase756_drawtime_producer.py`：
+       - `submitted=0` = `0 / 701`
+       - `submitted_min = 69`
+       - producer visible candidates ≈ `95.2 / frame`
+       - producer fresh entries ≈ `21.4 / frame`
+       - producer submitted ≈ `21.4 / frame`
+       - producer miss-no-fresh = `0.0 / frame`
+       - producer fallback to current-draw = `0 / 701`
+     - TAA / receiver trace：
+       - `semanticSceneShadowTaaMode`: 前 2 帧 `1`，随后 699 帧 `2`
+       - `semanticSceneShadowReceiverSampleSource`: 前 2 帧 `2`，随后 699 帧 `3`
+       - `semanticSceneShadowHistoryValidAfter`: `701 / 701`
+       - shadow map execute / receiver draw: `701 / 701`
+     - prebuild bypass：
+       - Attempt = `52228`
+       - Hit = `52051`
+       - hit rate ≈ `99.66%`
+   - **性能证据**：
+     - matrix publisher hooks 关闭前：
+       - `war3_perf_report_auto_2026_05_14_20_48_57.html`
+       - `avgFps ≈ 14.36`
+     - 关闭后 quick perf：
+       - `war3_perf_report_auto_2026_05_14_20_57_08.html`
+       - `avgFps = 61.473`
+     - 关闭后 breakdown：
+       - `war3_perf_report_auto_2026_05_14_20_59_33.html`
+       - `avgFps = 98.690`
+       - `avgFrameTimeMs = 10.133`
+       - `avgGpuTimeMs = 1.627`
+       - `avgProcessCpuMs = 8.591`
+       - `avgMainThreadCpuMs = 6.124`
+       - `War3SemanticScene/Populate` ≈ `0.492ms/frame`
+       - `War3SemanticScene/Direct/BuildPacket` ≈ `0.038ms/frame`
+       - `War3SemanticScene/Direct/Append` ≈ `0.110ms/frame`
+       - `SubmitFrame/PaletteIndex` ≈ `0.002ms/frame`
+   - **结论**：
+     - 这轮是目前最关键的性能突破：此前用户看到的 10FPS 本质上不是
+       shadow map GPU 压力，而是 semantic.data 的 matrix/palette publisher
+       数据层热路径成本；
+     - 当前主线已经接近旧 VB/IB intercept 的 `110 FPS` 基线；
+     - 后续优化应优先小步削 `Shadow/Main`、TAA/AA/receiver 和剩余
+       untracked CPU，不再回头恢复 matrix publisher hooks，除非黑匣子证明
+       draw-time VB producer 在某个实机场景失效。

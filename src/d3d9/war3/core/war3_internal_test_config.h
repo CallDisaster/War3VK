@@ -453,7 +453,7 @@ inline constexpr bool kWar3RuntimeConfigDisableSemanticPoseHooks = true;
 // 提供引擎已经混合好的 group palette。它们比 SpriteFrame/attachment hook
 // 轻得多，也正是语义阴影摆脱 VB/IB 捕获后的生产数据源。
 inline constexpr bool kWar3RuntimeConfigEnableSemanticMatrixPublisherHooks =
-    true;
+    false;
 inline constexpr bool kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled =
     true;
 

@@ -715,6 +715,10 @@ void WriteTraceFrameEvent(
      << stats.drawTimeSemanticProducerMissNoFreshEntryCount
      << ",\"drawTimeSemanticProducerFallbackCurrentDrawCount\":"
      << stats.drawTimeSemanticProducerFallbackCurrentDrawCount
+     << ",\"semanticSceneDirectDrawTimePrebuildBypassAttemptCount\":"
+     << stats.semanticSceneDirectDrawTimePrebuildBypassAttemptCount
+     << ",\"semanticSceneDirectDrawTimePrebuildBypassHitCount\":"
+     << stats.semanticSceneDirectDrawTimePrebuildBypassHitCount
      << ",\"drawTimeVBCacheTotalEntered\":"
      << stats.drawTimeVBCacheTotalEntered
      << ",\"drawTimeVBCacheRejectNoRenderablePart\":"

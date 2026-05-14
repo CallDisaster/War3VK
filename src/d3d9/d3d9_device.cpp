@@ -382,6 +382,24 @@ bool War3SemanticDrawTimeFastAppendRuntime() {
   return s_enabled;
 }
 
+bool War3SemanticDrawTimePrebuildBypassRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_DRAW_TIME_PREBUILD_BYPASS", 1u) != 0u;
+  return s_enabled;
+}
+
+bool War3SemanticBypassInlineRegistryPublishRuntime() {
+  // The direct draw-time producer consumes the write-side visible snapshot on
+  // the render thread. Publishing all semantic registries for every draw-time
+  // bypass candidate was useful as an early bootstrap fallback, but it now
+  // creates a large untracked semantic.data cost. Keep it as an opt-in escape
+  // hatch for old validation paths.
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_BYPASS_INLINE_REGISTRY_PUBLISH", 0u) !=
+      0u;
+  return s_enabled;
+}
+
 bool War3SemanticShadowManifestDeferProvisionalPartsRuntime() {
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SEMANTIC_MANIFEST_DEFER_PROVISIONAL_PARTS",
@@ -4059,7 +4077,8 @@ bool War3PublishSemanticSceneBypassCandidate(
       !dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() ||
       dxvk::war3::internal::
           IsSemanticSceneDisableLegacyShadowCaptureRuntimeEnabled();
-  if (registered && War3SemanticDataModuleEnabled() &&
+  if (registered && War3SemanticBypassInlineRegistryPublishRuntime() &&
+      War3SemanticDataModuleEnabled() &&
       War3SemanticContractCaptureEnabled() && wantsSceneBypassCapture) {
     War3PublishSemanticRegistriesForScene();
     const uint64_t frameNumber = visibleRegistry.getFrameNumber();
@@ -12282,6 +12301,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // 的宽限路径恢复出来的（pose 不 fresh、仅因为 isManifestCoreLeasePart
     // 被允许通行）。提交端用它归因 LargeDelta 是否集中在 stale→live 过渡帧。
     bool fromStalePoseRestore = false;
+    // Phase 7.62: draw-time VB 已经给出当前帧预变形几何时，跳过
+    // BuildPacket 的 bind-pose/palette 数据层构建。该 packet 只供 fast append
+    // 消费，不允许写入跨帧 part lease。
+    bool fromDrawTimePrebuildBypass = false;
   };
   const bool useDirectPartPacketLease =
       War3SemanticDirectPartPacketLeaseRuntime();
@@ -12324,6 +12347,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       const EligibleRecord& eligible,
       bool forLiveLeaseUpdate) {
     auto& stats = m_war3Scene.shadowStats;
+    if (eligible.fromDrawTimePrebuildBypass)
+      return false;
     if (forLiveLeaseUpdate && eligible.fromPartPacketLease) {
       stats.semanticSceneDirectPartLeaseRejectedSelfRenewCount++;
       stats.semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount++;
@@ -12415,6 +12440,147 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         return manifestRecord;
       };
 
+  auto tryBuildDrawTimePrebuildBypassEligible =
+      [&](const dxvk::war3::render::CurrentDrawContractRecord& record,
+          EligibleRecord& eligible) {
+    if (!War3SemanticDrawTimePrebuildBypassRuntime() ||
+        !War3SemanticDrawTimeFastAppendRuntime()) {
+      return false;
+    }
+
+    m_war3Scene.shadowStats
+        .semanticSceneDirectDrawTimePrebuildBypassAttemptCount++;
+
+    if (record.renderablePart == nullptr)
+      return false;
+    auto vbIt = m_war3DrawTimeVBCache.find(record.renderablePart);
+    if (vbIt == m_war3DrawTimeVBCache.end())
+      return false;
+    const auto& entry = vbIt->second;
+    const bool entryFresh =
+        entry.frameSerial == m_war3ShadowPersistentFrameSerial &&
+        entry.vertexCount != 0u &&
+        entry.positionBuffer != nullptr &&
+        entry.positionInfo.buffer != VK_NULL_HANDLE &&
+        (!entry.indexed ||
+         (entry.indexBuffer != nullptr &&
+          entry.indexInfo.buffer != VK_NULL_HANDLE &&
+          entry.indexCount != 0u));
+    if (!entryFresh)
+      return false;
+
+    dxvk::war3::render::VisibleRenderableRecord visible = {};
+    if (!visibleRegistry.queryByRenderablePartAndLayer(
+            record.renderablePart, record.layerIndex, visible)) {
+      return false;
+    }
+    if (visible.queueKind !=
+        dxvk::war3::render::VisibleRenderableQueueKind::MainQueue) {
+      return false;
+    }
+    if (visible.identity.groupIdx > 0)
+      return false;
+
+    if (!visible.HasStableIdentity())
+      return false;
+
+    auto objectKind =
+        visible.identity.kind != dxvk::war3::render::ObjectKind::Unknown
+            ? visible.identity.kind
+            : record.objectKind;
+    if (objectKind == dxvk::war3::render::ObjectKind::Unknown) {
+      objectKind = dxvk::war3::render::ObjectKind::Unit;
+    }
+    if (objectKind != dxvk::war3::render::ObjectKind::Unit)
+      return false;
+
+    dxvk::war3::shadow::ShadowRenderableRecord renderable = {};
+    renderable.renderablePart =
+        visible.renderablePart != nullptr ? visible.renderablePart
+                                          : record.renderablePart;
+    renderable.payload =
+        visible.payload != nullptr ? visible.payload : record.renderablePart;
+    renderable.meshData =
+        visible.meshData != nullptr ? visible.meshData : record.meshPayloadPtr;
+    renderable.layerState = visible.layerState;
+    renderable.runtimeModelPtr = visible.runtimeModelPtr;
+    renderable.modelResourcePtr = visible.modelResourcePtr;
+    renderable.runtimeGeosetPtr = visible.runtimeGeosetPtr;
+    renderable.runtimeGeosetDataPtr = visible.runtimeGeosetDataPtr;
+    renderable.modelKey = visible.modelKey;
+    renderable.flags = visible.flags;
+    renderable.worldObjectEntry =
+        visible.identity.worldObjectEntry != nullptr
+            ? visible.identity.worldObjectEntry
+            : record.worldObjectEntry;
+    renderable.sceneNode =
+        visible.identity.sceneNode != nullptr
+            ? visible.identity.sceneNode
+            : (visible.sceneNode != nullptr ? visible.sceneNode
+                                            : record.sceneNode);
+    renderable.unitPtr =
+        visible.identity.unitPtr != nullptr ? visible.identity.unitPtr
+                                            : record.unitPtr;
+    renderable.jHandle =
+        visible.identity.jHandle != 0u
+            ? visible.identity.jHandle
+            : (record.jHandle != 0u ? record.jHandle
+                                    : visible.identity.handleId);
+    renderable.rawcode =
+        visible.identity.rawcode != 0u ? visible.identity.rawcode
+                                       : record.rawcode;
+    renderable.unitFlags5C = visible.identity.flags5C;
+    if (renderable.unitPtr != nullptr && renderable.unitFlags5C == 0u)
+      War3TryReadUnitFlags5CCached(renderable.unitPtr,
+                                   renderable.unitFlags5C);
+    renderable.layerIndex = visible.layerIndex;
+    renderable.subIndex = visible.subIndex;
+    renderable.transparentType = visible.transparentType;
+    renderable.transparentSortKey = visible.transparentSortKey;
+    renderable.meshIndex =
+        visible.meshIndex != dxvk::war3::render::kInvalidVisibleMeshIndex
+            ? visible.meshIndex
+            : record.payloadWord108;
+    renderable.geosetIndex = visible.geosetIndex;
+    renderable.objectKind = objectKind;
+    renderable.queueKind = visible.queueKind;
+    renderable.groupIdx = visible.identity.groupIdx;
+    renderable.frameSerial =
+        record.visibleFrameSerial != 0u ? record.visibleFrameSerial
+                                        : currentVisibleFrameSerial;
+
+    if (renderable.unitPtr != nullptr &&
+        (renderable.unitFlags5C & dxvk::war3::UnitFlags5C::Building) != 0u) {
+      return false;
+    }
+    if (War3SemanticRawcodeLooksStaticWorldCaster(renderable.rawcode))
+      return false;
+    if (!renderable.hasStableIdentity())
+      return false;
+
+    dxvk::war3::shadow::ShadowDrawPacket packet = {};
+    packet.renderable = renderable;
+    packet.path = dxvk::war3::shadow::ShadowDrawPath::Skinned;
+    packet.resource.modelResourcePtr = renderable.modelResourcePtr;
+    packet.resource.modelKey = renderable.modelKey;
+    packet.resource.geosetIndex = renderable.geosetIndex;
+    packet.resource.vertexCount = entry.vertexCount;
+    packet.resource.topology =
+        dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
+    packet.usesDynamicMeshPositions = true;
+
+    eligible.packet = std::move(packet);
+    eligible.sample = {};
+    eligible.sample.contract = record;
+    eligible.sample.status =
+        dxvk::war3::render::CurrentDrawResolveStatus::MissingPalette;
+    eligible.sceneNode = renderable.sceneNode;
+    eligible.fromDrawTimePrebuildBypass = true;
+    m_war3Scene.shadowStats
+        .semanticSceneDirectDrawTimePrebuildBypassHitCount++;
+    return true;
+  };
+
   for (const auto& record : recordsForBuild) {
     auto& bucket = completenessBucketForRecord(record);
     if (!recordsForBuildAlphaPrefiltered &&
@@ -12427,7 +12593,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       bucket.shadowEligibleParts++;
     EligibleRecord eligible = {};
     eligible.completenessKey = completenessKeyForRecord(record);
-    {
+    const bool drawTimePrebuildBypassed =
+        tryBuildDrawTimePrebuildBypassEligible(record, eligible);
+    if (!drawTimePrebuildBypassed) {
       auto buildPacketScope =
           War3SemanticSubmitScope("War3SemanticScene/Direct/BuildPacketCall");
       if (!War3TryBuildShadowPacketFromCurrentDrawRecord(
@@ -12438,16 +12606,16 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         bucket.packetBuildFailParts++;
         continue;
       }
+      m_war3Scene.shadowStats.semanticSceneDirectCurrentDrawBuiltPacketCount++;
+      if (eligible.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned)
+        m_war3Scene.shadowStats
+            .semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount++;
     }
-    m_war3Scene.shadowStats.semanticSceneDirectCurrentDrawBuiltPacketCount++;
-    if (eligible.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned)
-      m_war3Scene.shadowStats
-          .semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount++;
     // unitsOnly eligibility 过滤
     War3SemanticDirectMainWorldBackingStatus mainWorldBackingStatus =
         War3SemanticDirectMainWorldBackingStatus::NotChecked;
     bool directSubmitEligible = true;
-    if (unitsOnly) {
+    if (unitsOnly && !drawTimePrebuildBypassed) {
       directSubmitEligible = War3LooksSubmitEligibleForDirectCurrentDrawFast(
           eligible.packet, true, &eligible.sample, &mainWorldBackingStatus);
     }
@@ -12490,6 +12658,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         } else {
           bucket.fallbackSliceParts++;
         }
+      } else if (drawTimePrebuildBypassed) {
+        bucket.preparedSliceParts++;
       } else {
         bucket.missingSliceParts++;
       }
