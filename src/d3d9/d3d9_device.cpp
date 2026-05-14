@@ -1263,8 +1263,9 @@ War3BuildShadowMaterialSignatureCached(
     bool valid = false;
     // Phase 7.26：为了提高命中率，去掉 renderablePart 这个每帧抖动的 key 字段。
     // key 改为 sceneNode + meshIndex + layerIndex + modelResource + flags 组合，
-    // 这些在同一 unit/geoset 上稳定得多。renderablePart/meshData 仍做为校验，
-    // 但进命中判定时作为次要字段。
+    // 这些在同一 unit/geoset 上稳定得多。renderablePart 不参与命中；meshData
+    // 在当前 canonical layer contract 路径下只是 draw-local 输入，可能随帧
+    // 抖动，因此不再作为命中硬条件。
     void* sceneNode = nullptr;
     void* meshData = nullptr;
     void* layerState = nullptr;
@@ -1289,15 +1290,15 @@ War3BuildShadowMaterialSignatureCached(
   hash = bit::fnv1a_iter(hash, renderable.meshIndex);
   hash = bit::fnv1a_iter(hash, renderable.layerIndex);
   hash = bit::fnv1a_iter(hash, renderable.flags);
+  hash = bit::fnv1a_iter(hash, reinterpret_cast<uintptr_t>(renderable.layerState));
   hash = bit::fnv1a_iter(hash, renderable.transparentType);
   hash = bit::fnv1a_iter(hash, renderable.transparentSortKey);
   hash = bit::fnv1a_iter(hash, uint32_t(renderable.queueKind));
 
-  static thread_local std::array<CacheEntry, 4096> s_cache = {};
+  static thread_local std::array<CacheEntry, 16384> s_cache = {};
   auto& entry = s_cache[size_t(hash) & (s_cache.size() - 1u)];
   if (entry.valid &&
       entry.sceneNode == renderable.sceneNode &&
-      entry.meshData == renderable.meshData &&
       entry.layerState == renderable.layerState &&
       entry.modelResourcePtr == renderable.modelResourcePtr &&
       entry.modelKey == renderable.modelKey &&
@@ -10943,6 +10944,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   // 仍指向原 vertex 编号空间。Vulkan vertexOffset = -vertexBaseIndex（int32_t
   // 支持负数）让 GPU 在采样时正确映射到我们 buffer 的 (idx - vRangeStart)。
   bool drawTimeVBOverrideApplied = false;
+  const War3DrawTimeVBEntry* drawTimeVBEntry = nullptr;
   if (geometry->vertexBlendEnabled) {
     void* consumeKey = packet.renderable.renderablePart;
     if (consumeKey != nullptr) {
@@ -10957,6 +10959,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           vbIt->second.frameSerial + 8u >= m_war3ShadowPersistentFrameSerial;
       if (entryFresh) {
         const auto& entry = vbIt->second;
+        drawTimeVBEntry = &entry;
         // 用 capture 时拷的 device-local buffer
         draw.positionStorage = entry.positionBuffer;
         draw.positionInfo = entry.positionInfo;
@@ -11031,23 +11034,19 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   // Phase 7.55 v4：capture 时记录的 alpha test 状态覆盖 geometry 默认值。
   // bypass capture 路径不会进入 legacy ShadowCapture 后段的 alpha-test 块，
   // 所以 geometry->alphaTestEnabled 永远是 false。这里用我们 capture 的状态。
-  if (drawTimeVBOverrideApplied) {
-    void* consumeKey = packet.renderable.renderablePart;
-    auto vbIt = m_war3DrawTimeVBCache.find(consumeKey);
-    if (vbIt != m_war3DrawTimeVBCache.end()) {
-      const auto& entry = vbIt->second;
-      // alpha-test 等价：原本就是 alpha test，或者带 UV+diffuse 的 alpha blend
-      // 也升级为 alpha test discard（避免黑色实心方块）。
-      const bool effectiveAlphaTest =
-          entry.alphaTestEnabled ||
-          (entry.alphaBlendEnabled &&
-           entry.diffuseTexture != nullptr &&
-           entry.uvFormat != VK_FORMAT_UNDEFINED &&
-           entry.uvStride > 0u);
-      draw.alphaTestEnabled = effectiveAlphaTest;
-      draw.alphaRef = effectiveAlphaTest ? entry.alphaRef : 0.0f;
-      draw.alphaBlendEnabled = entry.alphaBlendEnabled;
-    }
+  if (drawTimeVBOverrideApplied && drawTimeVBEntry != nullptr) {
+    const auto& entry = *drawTimeVBEntry;
+    // alpha-test 等价：原本就是 alpha test，或者带 UV+diffuse 的 alpha blend
+    // 也升级为 alpha test discard（避免黑色实心方块）。
+    const bool effectiveAlphaTest =
+        entry.alphaTestEnabled ||
+        (entry.alphaBlendEnabled &&
+         entry.diffuseTexture != nullptr &&
+         entry.uvFormat != VK_FORMAT_UNDEFINED &&
+         entry.uvStride > 0u);
+    draw.alphaTestEnabled = effectiveAlphaTest;
+    draw.alphaRef = effectiveAlphaTest ? entry.alphaRef : 0.0f;
+    draw.alphaBlendEnabled = entry.alphaBlendEnabled;
   }
   // AlphaTest lane：把 persistent geometry 里的 UV/diffuse 绑定继续传给
   // War3ShadowCasterDraw。shadow caster shader 的 pc.flags bit2 与 descriptor
@@ -11068,11 +11067,9 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   // v4 命中时，capture 已记录 stage 0 纹理。geometry->diffuseTexture
   // 在 bypass path 下为 nullptr，必须覆盖让 alpha-test discard 拿到真纹理。
   if (drawTimeVBOverrideApplied && draw.alphaTestEnabled) {
-    void* consumeKey = packet.renderable.renderablePart;
-    auto vbIt = m_war3DrawTimeVBCache.find(consumeKey);
-    if (vbIt != m_war3DrawTimeVBCache.end() &&
-        vbIt->second.diffuseTexture != nullptr) {
-      draw.diffuseTexture = vbIt->second.diffuseTexture;
+    if (drawTimeVBEntry != nullptr &&
+        drawTimeVBEntry->diffuseTexture != nullptr) {
+      draw.diffuseTexture = drawTimeVBEntry->diffuseTexture;
       // 派生 sampler 和 textureDescriptor（参考 line 25140）。
       bool alphaUseMip = false;
       float alphaMipLodBias = 0.0f;
@@ -11497,8 +11494,9 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   m_war3Scene.shadowStats.capturedWorldObject++;
   m_war3Scene.shadowStats.semanticSceneSubmitted++;
   if (packet.renderable.renderablePart != nullptr) {
-    m_war3SemanticSubmittedRenderablePartsThisFrame.insert(
-        packet.renderable.renderablePart);
+    auto vbIt = m_war3DrawTimeVBCache.find(packet.renderable.renderablePart);
+    if (vbIt != m_war3DrawTimeVBCache.end())
+      vbIt->second.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
   }
   // Phase 7.35 Pose-lag 诊断：在 submit 成功处记录一次时间滞后。
   // 只要 directCurrentDrawSample 存在就用它的 contract.renderFrameIndex
@@ -11630,7 +11628,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     return 0u;
 
   uint32_t submitted = 0u;
-  for (const auto& [renderablePart, entry] : m_war3DrawTimeVBCache) {
+  for (auto& [renderablePart, entry] : m_war3DrawTimeVBCache) {
     if (renderablePart == nullptr)
       continue;
     if (entry.frameSerial != m_war3ShadowPersistentFrameSerial)
@@ -11655,9 +11653,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     }
 
     m_war3Scene.shadowStats.drawTimeSemanticProducerVisibleCandidateCount++;
-    if (m_war3SemanticSubmittedRenderablePartsThisFrame.find(
-            record.renderablePart) !=
-        m_war3SemanticSubmittedRenderablePartsThisFrame.end()) {
+    if (entry.submittedFrameSerial == m_war3ShadowPersistentFrameSerial) {
       continue;
     }
 
@@ -11798,7 +11794,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     m_war3Scene.shadowStats.dynamicPoseCount++;
     m_war3Scene.shadowStats.dynamicSkinnedOutputCount++;
     m_war3Scene.shadowStats.drawTimeSemanticProducerSubmittedCount++;
-    m_war3SemanticSubmittedRenderablePartsThisFrame.insert(record.renderablePart);
+    entry.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
     ++submitted;
   }
 
@@ -13534,7 +13530,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
   m_war3Scene.shadowStats.semanticScenePopulateAttemptCount++;
   if (unitsOnly)
     m_war3Scene.shadowStats.semanticScenePopulateUnitsOnlyCount++;
-  m_war3SemanticSubmittedRenderablePartsThisFrame.clear();
   const auto currentDrawDiagAtEntry =
       dxvk::war3::render::QueryCurrentDrawContractDiagnosticsSummary();
   uint32_t populateReturnReason = kPopulateReturnUnknown;

@@ -2031,10 +2031,10 @@ private:
     VkDeviceSize positionCapacity = 0u;
     VkDeviceSize indexCapacity = 0u;
     uint64_t frameSerial = 0u;
+    uint64_t submittedFrameSerial = 0u;
   };
   std::unordered_map<void*, War3DrawTimeVBEntry> m_war3DrawTimeVBCache;
   uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;
-  std::unordered_set<void*> m_war3SemanticSubmittedRenderablePartsThisFrame;
   bool m_war3SemanticSceneLastZeroSubmitUnitsOnly = true;
   bool m_war3SemanticSceneLastZeroSubmitNativeValidation = false;
   bool m_war3SemanticSceneLastSuccessfulSubmitUnitsOnly = true;

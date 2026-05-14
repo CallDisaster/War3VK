@@ -3472,3 +3472,66 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
        2. 是否出现明显拖影/历史残留
        3. 在 TAA 默认开启的情况下，是否仍保持 draw-time producer 基线的
           single-caster 无卡顿
+
+
+106. **Phase 7.59 无语义改动的 producer/material 热点削减 + 黑匣子复核（2026-05-14 16:35）**:
+   - **自动化续跑**：
+     - 已确认 heartbeat 自动化 `war3-shadow-optimization-continuation` 处于 ACTIVE；
+     - 频率：`RRULE:FREQ=MINUTELY;INTERVAL=20`；
+     - 提示词要求继续 War3 shadow 优化、以 full trace 为验收、禁止 legacy 路线。
+   - **本轮性能小改原则**：
+     - 不改 current-draw + draw-time producer supplement 的提交语义；
+     - 不收紧 producer 过滤；
+     - 不碰 AlphaTest / draw-time VB GPU copy / TAA history 生命周期。
+   - **代码改动**：
+     - `src/d3d9/d3d9_device.h`
+       - `War3DrawTimeVBEntry` 新增 `submittedFrameSerial`；
+       - 移除每帧 `m_war3SemanticSubmittedRenderablePartsThisFrame` `unordered_set`。
+     - `src/d3d9/d3d9_device.cpp`
+       - 成功 append 后把对应 draw-time VB cache entry 标记为本帧已提交；
+       - producer supplement 用 `entry.submittedFrameSerial == m_war3ShadowPersistentFrameSerial`
+         判重，避免每帧清空/填充 hash set；
+       - `War3TryAppendSemanticShadowPacket` 保存一次 `drawTimeVBEntry` 指针，
+         后续 AlphaTest/texture 派生复用，减少重复 `m_war3DrawTimeVBCache.find`；
+       - `War3BuildShadowMaterialSignatureCached`：
+         - cache 槽位 `4096 -> 16384`；
+         - hash 纳入 `layerState`；
+         - 不再把 `meshData` 作为命中硬条件，因为当前 canonical layer contract
+           路径以 `sceneNode/layerState/modelResource` 为稳定语义，`meshData`
+           可能是 draw-local/churny 输入。
+   - **性能证据**：
+     - 改前 breakdown `war3_perf_report_auto_2026_05_14_16_22_11.html`：
+       - `War3SemanticScene/Populate` ≈ `16.174ms/frame`
+       - `Direct/BuildPacketCall` ≈ `9.232ms/frame`
+       - `Direct/BuildPacket` ≈ `9.128ms/frame`
+       - `Direct/MaterialSignature` ≈ `3.619ms/frame`
+     - material cache 改后 breakdown `war3_perf_report_auto_2026_05_14_16_29_41.html`：
+       - `War3SemanticScene/Populate` ≈ `12.751ms/frame`
+       - `Direct/BuildPacketCall` ≈ `5.794ms/frame`
+       - `Direct/BuildPacket` ≈ `5.694ms/frame`
+       - `Direct/MaterialSignature` 不再进入主要热点列表。
+     - 最新 full trace AutoTest `war3_perf_report_auto_2026_05_14_16_31_42.html`：
+       - `avgFps = 11.169`
+       - `avgGpuTimeMs = 1.822`
+       - 说明当前瓶颈仍主要在 CPU/main-thread populate 侧，离旧 VB/IB
+         拦截方案约 `110 FPS` 的目标仍很远。
+   - **黑匣子验收**：
+     - 最新 trace：`E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_14_16_31_21.jsonl`
+     - `_phase756_drawtime_producer.py`：
+       - `submitted=0` = `0 / 163`
+       - producer visible candidates ≈ `95.8 / frame`
+       - producer fresh entries ≈ `15.0 / frame`
+       - producer submitted ≈ `15.0 / frame`
+       - producer miss-no-fresh = `0.0 / frame`
+     - TAA trace 字段：
+       - `semanticSceneShadowTaaMode`: 前 2 帧 `1`，随后 `2`
+       - `semanticSceneShadowHistoryValidAfter`: `1 / 163` 后全部有效
+       - `semanticSceneShadowReceiverSampleSource`: 前 2 帧 `2`，随后 `3`
+       - 解释：history ping-pong 已进入稳定采样；full trace keyStats
+         当前没有单独输出 `semanticSceneShadowTaaActive` 字段，后续若需要可补。
+   - **结论**：
+     - 本轮是可保留的安全优化：黑匣子没有出现 zero-submit 回潮；
+     - 它只削掉 material/去重层的部分 CPU 成本，未触及更大的
+       `Direct/Append` 与 `BuildPacket` 自身耗时；
+     - 下一轮性能主线应继续细分 `War3TryAppendSemanticShadowPacket` 内部热点，
+       但每次仍必须先用 full trace 验证 `submitted=0 == 0`。
