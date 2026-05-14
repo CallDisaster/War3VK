@@ -90,7 +90,7 @@ struct War3ShadowSettings {
   float alphaShadowMipLodBias = 0.5f;
   float alphaShadowFarAlphaRefBias = 0.05f;
 
-  bool shadowTaaEnabled = false;
+  bool shadowTaaEnabled = true;
   float shadowTaaBlendFactor = 0.05f;
   bool shadowTaaNeighborClamp = true;
 

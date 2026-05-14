@@ -3974,8 +3974,13 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   }
 
   if (needReceiverPass || needOutlineDepth) {
+    static const bool s_disableTaaForSemanticDynamic = []() {
+      const char* env = std::getenv(
+          "DXVK_WAR3_SHADOW_DISABLE_TAA_FOR_SEMANTIC_DYNAMIC");
+      return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
     const bool shadowTaaBlockedForSemanticDynamic =
-        dxvk::war3::internal::kShadowDisableTaaForSemanticDynamicCasters &&
+        s_disableTaaForSemanticDynamic &&
         semanticDynamicCastersActive;
     const bool shadowTaaActive =
         settings->shadows.shadowTaaEnabled && receiverNeedsShadowMap &&

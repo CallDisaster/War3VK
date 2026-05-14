@@ -3433,3 +3433,42 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
    - **运行时验证状态**：
      - 用户当时外出，本轮还未做新的实机黑匣子复核；
      - 下一步应先用 single-caster 场景确认视觉基线恢复，再继续观察 perf。
+
+
+105. **Phase 7.58 无人值守推进：默认启用 Shadow TAA + 保留动态语义 caster 的历史混合（2026-05-14 16:10）**:
+   - **用户新要求**：
+     - 进入无人值守模式继续推进；
+     - 当前线路存在“没有 Shadow TAA 导致阴影抖动较重”的体感；
+     - 开始在不让视觉正确性开倒车的前提下追赶旧 VB/IB 方案约 110 FPS 的基线。
+   - **代码现状确认**：
+     - `d3d9_war3_settings.h` 里 `shadowTaaEnabled` 默认是 `false`；
+     - `d3d9_war3_shadow.cpp` 里只要
+       `kShadowDisableTaaForSemanticDynamicCasters && semanticDynamicCastersActive`
+       就会把 TAA 整体挡掉，并清空 history；
+     - 这意味着当前语义动态单位阴影即使有 history 资源，也默认不参与 Shadow TAA。
+   - **本轮改动**：
+     - `src/d3d9/d3d9_war3_settings.h`
+       - `shadowTaaEnabled` 默认值改为 `true`
+     - `src/d3d9/d3d9_war3_shadow.cpp`
+       - 把“semantic dynamic 一刀切禁用 TAA”改成运行时开关：
+         `DXVK_WAR3_SHADOW_DISABLE_TAA_FOR_SEMANTIC_DYNAMIC`
+       - 默认 **不禁用**；只有显式设环境变量才会回到旧行为
+   - **为什么这仍然是保守改动**：
+     - 没有碰 history ping-pong、barrier、motion vector 资源生命周期；
+     - 没有碰 draw-time producer / current-draw supplement 主线；
+     - 保留了现有的断档保护：
+       - invalid CSM / empty replay / history invalidation / previous-frame gates
+   - **回退路径**：
+     - `DXVK_WAR3_SHADOW_TAA=0` 可整体验证关闭 TAA
+     - `DXVK_WAR3_SHADOW_DISABLE_TAA_FOR_SEMANTIC_DYNAMIC=1` 可恢复旧的
+       “动态语义 caster 不参与 TAA” 行为
+   - **编译 / 部署**：
+     - `ninja -C build32` 通过
+     - `E:\Work\War3\d3d9.dll` = `25419546 bytes @ 2026-05-14 16:10:13`
+   - **验证状态**：
+     - 用户外出，本轮仍未做新的视觉/黑匣子复核；
+     - 返回后应重点看：
+       1. 单/多 caster 的 Shadow TAA 是否真正 active（`semanticSceneShadowTaaActive`）
+       2. 是否出现明显拖影/历史残留
+       3. 在 TAA 默认开启的情况下，是否仍保持 draw-time producer 基线的
+          single-caster 无卡顿
