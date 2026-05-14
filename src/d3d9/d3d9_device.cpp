@@ -1316,6 +1316,15 @@ bool War3SemanticMaterialSignatureCacheRuntime() {
 dxvk::war3::shadow::ShadowMaterialSignature
 War3BuildShadowMaterialSignatureCached(
     const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
+  // Phase 7.74：把 material signature 计算的 CPU 时间显式归类为
+  // Shadow/DrawTime/MaterialSig，避免它继续藏在 OutsideMainLoop/Tracked。
+  auto matScope = [&]() -> war3::War3PerfMonitor::ScopedCpuScope {
+    if constexpr (dxvk::war3::internal::kNativeOptimizationPerfTrackingEnabled) {
+      return war3::War3PerfMonitor::instance().cpuScope(
+          "Shadow/DrawTime/MaterialSig");
+    }
+    return {};
+  }();
   if (!War3SemanticMaterialSignatureCacheRuntime()) {
     return dxvk::war3::shadow::BuildShadowMaterialSignatureForRenderable(
         renderable);
@@ -3908,6 +3917,15 @@ bool War3TryResolveNativeShadowHint(
     const dxvk::War3ShadowSemanticContext& semantic,
     const dxvk::war3::render::RenderObjectInfo* currentObj,
     dxvk::war3::native::War3NativeShadowHint& outHint) {
+  // Phase 7.74：把 native shadow hint 解析的 CPU 时间显式归类为
+  // Shadow/DrawTime/NativeHint。
+  auto hintScope = [&]() -> war3::War3PerfMonitor::ScopedCpuScope {
+    if constexpr (dxvk::war3::internal::kNativeOptimizationPerfTrackingEnabled) {
+      return war3::War3PerfMonitor::instance().cpuScope(
+          "Shadow/DrawTime/NativeHint");
+    }
+    return {};
+  }();
   auto& registry = dxvk::war3::native::War3NativeShadowHintRegistry::instance();
 
   auto tryByObject = [&](void* objectPtr) {
@@ -9087,6 +9105,16 @@ Rc<DxvkBuffer> D3D9DeviceEx::War3AllocFreezeBuffer(VkDeviceSize size,
 
 War3ShadowSemanticContext D3D9DeviceEx::War3BuildShadowSemanticContext(
     const dxvk::war3::render::RenderObjectInfo *currentObj) const {
+  // Phase 7.74：把 BuildShadowSemanticContext 的 CPU 时间显式归类为
+  // Shadow/DrawTime/BuildSemantic，避免它继续藏在 OutsideMainLoop/Tracked。
+  // constexpr 门控；release 默认编译期 strip。
+  auto buildScope = [&]() -> war3::War3PerfMonitor::ScopedCpuScope {
+    if constexpr (dxvk::war3::internal::kNativeOptimizationPerfTrackingEnabled) {
+      return war3::War3PerfMonitor::instance().cpuScope(
+          "Shadow/DrawTime/BuildSemantic");
+    }
+    return {};
+  }();
   War3ShadowSemanticContext semantic = {};
   const auto &tls = War3RenderState::GetTlsShadowSemanticState();
 
