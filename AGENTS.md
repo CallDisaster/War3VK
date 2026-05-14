@@ -4077,3 +4077,81 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
        3. 研究 CSM cascade cull / per-cascade replay，因为当前 4 个 cascade 几乎画同一批 caster；
        4. 在任何优化前后都用 full trace 验证 producer submitted/fresh/miss 与
           shadow map executed/history valid，避免视觉正确性开倒车。
+
+115. **Phase 7.70 同帧 draw-time VB capture 去重 + 显式 perf 归类（2026-05-15 03:00）**:
+   - **目标**：
+     - 在不动 producer/consumer 主线、不改 manifest/lease/stale-restore 等掩盖逻辑前提下，
+       把 `War3TryCaptureShadowCaster` 同一帧内对同一 `renderablePart` 的重复 GPU copy
+       拦掉，并把 draw-time 捕获的 CPU 时间从 `OutsideMainLoop/Tracked` 拆出来，
+       让后续可观察的拆分有路径依据。
+   - **代码改动（单点低风险）**：
+     - `src/d3d9/d3d9_device.h`
+       - `War3DrawTimeVBEntry` 新增 `lastCaptureFingerprint`，记录上次 capture 的
+         源数据指纹（不持久化跨帧，由 `frameSerial` 覆盖语义控制）。
+     - `src/d3d9/d3d9_war3_scene.h`
+       - `War3ShadowCaptureStats` 新增同帧去重账本：
+         `drawTimeVBCacheSameFrameDedupHit` / `DedupMiss` / `StateRefresh`。
+     - `src/d3d9/d3d9_device.cpp` (`War3TryCaptureShadowCaster` v4 capture 块)：
+       - 在拿到 `posSlice/vRangeStart/vRangeCount/posStride` 后立即生成
+         64-bit fingerprint（FNV1a 风格 mix），覆盖 position 源 buffer 指针、
+         offset、length、range start/count、stride、posOffset，并把 `indexed +
+         StartVal/CountVal` 折进去；
+       - 在 `m_war3DrawTimeVBCache[vbCacheKey]` 之前先 `find`：若 `frameSerial ==
+         currentFrame && lastCaptureFingerprint match && positionBuffer 完整 &&
+         vertexCount/positionStride 匹配`，则只刷新易变状态（alphaTest/Blend、
+         alphaRef、stage0 SRV、capturedWorldMatrix），不再发任何 EmitCs(copyBuffer)；
+       - 记 `DedupHit + StateRefresh`；同帧但 fingerprint 不一致（真实数据变更）
+         记 `DedupMiss`，仍走原有完整 capture；
+       - 完整 capture 路径末尾写入 `entry.lastCaptureFingerprint = captureFingerprint`。
+       - 整个 capture 块外部包一层运行时 perf scope `Shadow/DrawTime/Capture`
+         （constexpr 门控），这条路径会被分类器命中
+         `Semantic/MainLoop/Render/Shadow`，不再落 `OutsideMainLoop/Tracked`。
+     - `src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp`
+       - keyStats 输出 `drawTimeVBCacheSameFrameDedupHit / DedupMiss / StateRefresh`，
+         full trace 可直接观察去重命中率。
+   - **黑匣子验证**（光影测试.w3x，隔离桌面，15s full trace）：
+     - 新 trace：`E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_15_02_44_10.jsonl`
+     - 帧数 919：
+       - `submitted=0` = `0 / 919`
+       - `shadowMapExec` = `1.0 / frame`
+       - `historyValid` = `1.0 / frame`
+       - `producer fallback to current-draw` = `0 / 919`
+       - `producer miss-no-fresh` = `0 / 919`
+       - `path blocker reject` = `3.16 / frame`
+     - 去重账本：
+       - `drawTimeVBCacheTotalEntered` = `119.96 / frame`
+       - `drawTimeVBCacheCaptureCount` = `98.83 / frame`（slow path）
+       - `drawTimeVBCacheSameFrameDedupHit` = `21.13 / frame`（去重命中）
+       - `drawTimeVBCacheSameFrameDedupMiss` = `4.99 / frame`（同帧但数据真变）
+       - 与 Phase 7.69 基线对比：`PositionCopyCount 119.66 → 98.83`（约 17.4% 命令数下降）
+       - `PositionCopyBytes` 因为 dedup HIT 比 MISS 多对应于 stride/range 较小的 sub-draw，
+         整体仅微降到 `464152 B/frame`（约 +0.3%）。
+   - **性能 A/B**（无 full trace 干扰，3 轮 × 20s）：
+     - 基线 mean = `(96.42 + 98.04 + 100.62) / 3 = 98.36 FPS`
+     - Phase 7.70 mean = `(98.26 + 97.44 + 100.96) / 3 = 98.88 FPS`
+     - delta = +0.52 FPS（+0.53%）；样本噪声 ±2-3 FPS，单看本场景无显著加速。
+   - **解读 / 边界**：
+     - 收益小是因为 EmitCs(copyBuffer) 的同步成本主要由 DXVK 命令录制完成，
+       worker 线程异步消费；主线程只省到“一次 record 调用 + state read”。
+     - 这条改动的真正价值是：
+       (a) 把 draw-time 捕获 CPU 时间拆出 `OutsideMainLoop/Tracked`，
+           为下一轮拆 `Direct/BuildPacket / Append / fast-append / state read`
+           留出可对比的归类基线；
+       (b) `DedupMiss=4.99/frame` 直接定位“同 part 同帧多种数据来源”是否是新引入的 churn，
+           不再是黑盒；
+       (c) 复杂度只在 capture 入口加一处早返回，没有触碰 producer/consumer 任何
+           过滤、TTL、stale-restore、lease、manifest、receiver hold 路线。
+   - **当前部署**：
+     - `E:\Work\War3\d3d9.dll`（Phase 7.70）`= 26767310 bytes @ 2026-05-15 02:42:54`
+       并经 commit `fe26653 war3: dedup same-frame draw-time VB capture (Phase 7.70)`。
+   - **下一步性能路线（不在本轮做）**：
+     - 单 PositionCopyCount = 98.83/frame，空间还有：
+       - 把同帧第一次 capture 后的 entry 标记 `geometryStableThisFrame`，对真正“引擎重复
+         同帧多次 draw 同 part 同数据”的 case，第二次 capture 也跳过 `entry[]` 写入；
+       - 探索：单一 copy 命令一次性拷贝多个 entry 的 sub-range（合批 EmitCs）；
+       - CSM 4 cascade 全画同一批 caster：先做安全 bounds（v4 fast-append 当前
+         强制 `boundsRadius=0`），改为从 capture worldMatrix + 基于 vertex range 的
+         保守 AABB 估算；和 `kShadowCascadeCullDisableForUnits=true` 的当前默认形成
+         A/B（先看 cull 命中率，再决定默认值）。
+     - 任意一步落地之前都必须先用 full trace 复核：
+       `submitted=0 == 0` / `shadowMapExecuted=1` / `historyValid=1` / 视觉抽样。
