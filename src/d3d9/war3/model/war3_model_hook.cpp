@@ -7473,15 +7473,19 @@ void __fastcall Hook_RuntimeMatrixWrite(int nodePtr, int sourceMatrixPtr,
   g_trampolineRuntimeMatrixWrite(nodePtr, sourceMatrixPtr, destMatrixPtr);
   g_runtimeMatrixWriteCount.fetch_add(1u, std::memory_order_relaxed);
 
+  // Phase 7.78：把 frameTag 读取从 dt-gate probe 与 batch-capture 两段
+  // 各做一次合并到一次。每帧 13K-30K 次 hook 调用，避免重复读全局 palette
+  // frameTag 指针。
+  uint32_t frameTagProbe = 0u;
+  const bool frameTagOk =
+      TryReadCurrentPaletteFrameTag(frameTagProbe) && frameTagProbe != 0u;
+
   // Phase 7.47 dt gate probe：writer per-frameTag 去重
-  {
-    uint32_t frameTagProbe = 0u;
-    if (TryReadCurrentPaletteFrameTag(frameTagProbe) && frameTagProbe != 0u) {
-      NoteWriterHitForFrameTag(g_runtimeMatrixWriteLastFrameTag,
-                               g_runtimeMatrixWriteFramesWithHitCount,
-                               g_runtimeMatrixWriteFramesEmptyCount,
-                               frameTagProbe);
-    }
+  if (frameTagOk) {
+    NoteWriterHitForFrameTag(g_runtimeMatrixWriteLastFrameTag,
+                             g_runtimeMatrixWriteFramesWithHitCount,
+                             g_runtimeMatrixWriteFramesEmptyCount,
+                             frameTagProbe);
   }
 
   // Phase 7.31 P0 恢复：按 CGeosetData_BuildGroupBlendedPalette 的真实语义
@@ -7515,8 +7519,9 @@ void __fastcall Hook_RuntimeMatrixWrite(int nodePtr, int sourceMatrixPtr,
             (hasGroupCount && groupCount != 0u) ? groupCount : 1u;
         g_runtimeMatrixWriteBatchLastGroupCount.store(
             uint64_t(rawCount), std::memory_order_relaxed);
-        uint32_t frameTag = 0u;
-        TryReadCurrentPaletteFrameTag(frameTag);
+        // Phase 7.78：复用顶部已读到的 frameTag。frameTagOk=false 时
+        // 退回到 0（与原行为一致：CaptureBlendedPaletteSlotRange 内部能处理）。
+        const uint32_t frameTag = frameTagOk ? frameTagProbe : 0u;
         CaptureBlendedPaletteSlotRange(
             startSlotIndex, reinterpret_cast<const uint8_t*>(outAddr),
             rawCount, frameTag, &g_runtimeMatrixWriteBatchCapturedCount,
