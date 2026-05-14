@@ -4220,3 +4220,53 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
        的唯一入口）；
      - 性能应回到正常或略有提升；
      - 调试：`kPathBlockerDebugEnabled = true` 可在 DebugView 看到 reject 命中。
+
+118. **Phase 7.73-7.80 夜间无人值守迭代（2026-05-15 03:00-05:58）**:
+   - **目标**：用户睡了，按计划自动推进。Phase 7.71 已 revert（实机翻车），
+     Phase 7.72 已落地（path blocker 在 eligibility/append 入口拦截）。
+     这一轮按 sub-agent 扫描的 ranked candidate 推进低风险高收益项。
+   - **commit 链**：
+     - `777e4ed` Phase 7.73：path blocker reject 来源分桶 counter（10 个 bucket）+
+       trace JSON 透传 + `_phase773_buckets.py` 分析脚本。
+     - `bc20d47` Phase 7.74：BuildSemantic / MaterialSig / NativeHint 加 cpuScope。
+     - `51fc174` Phase 7.75：CurrentDraw Publish + Populate Preselect 加 cpuScope。
+     - `ac3aea3` Phase 7.76：DirectPacketGeosetCache `std::mutex → std::shared_mutex`。
+     - `9495f56` Phase 7.77：默认关闭 PublishCurrentDrawContract Phase 7.49 probe，
+       env `DXVK_WAR3_PUBLISH_PROBE=1` 重新启用。
+     - `4b7a380` Phase 7.78：Hook_RuntimeMatrixWrite frameTag 双读合并为单读。
+     - `0317481` Phase 7.79：runtimePoseArrayRange `std::mutex → std::shared_mutex`。
+     - `b523fae` Phase 7.80：HydrateVisibleSnapshotBasicFields partCache thread_local 复用。
+   - **代码改动总览**：
+     - 8 commits，9 个文件，纯增 atomic counter / cpuScope / shared_mutex / TLS 缓存。
+     - 没有改 producer / consumer 主线 / manifest TTL / stale restore /
+       receiver hold / path blocker FourCC 黑名单。
+   - **trace 黑匣子（每个 phase 都验过）**：
+     - `submitted=0` 全帧 0
+     - `historyValid` 1.0/帧
+     - `producer fallback` 0
+     - `path blocker reject` 6.19 → 8.99 / 帧（trace 走访 9 个 bucket，三大主路径
+       是 EarlyBypass/AppendEntry/FastAppend）
+     - `producer submitted` ~20/帧 稳定
+   - **性能账本**：
+     - Phase 7.72 baseline ≈ 118 FPS
+     - Phase 7.76 (shared_mutex on geoset cache)：3 轮 mean **124.81 FPS** (+7)
+     - Phase 7.77-7.80：mean ~123 FPS（小幅波动，未单独显著贡献，但 Phase 7.49
+       probe 关掉后在 publish 大量调用的场景应该有 0.3-1ms 隐式收益）
+   - **下一阶段（醒来后路线建议）**：
+     - 用户实机复核 Phase 7.72 path blocker fix。如果还漏：
+       - 跑一份实机 trace，用 `_phase773_buckets.py` 看哪个 bucket 没记到漏掉的 path blocker。
+       - 如果全部 bucket 都没数，意味着它走了 `War3TryCaptureShadowCaster` 的另一条出口
+         （legacy 主体 line 24171 已加 `LegacyCaptureCount`，那也是 bucket 之一）。
+       - 唯一兜底：在 `War3TryAppendSemanticShadowPacket` 入口除了 rawcode + jHandle
+         反查外，再加一个 visibleRegistry → identity.rawcode 反查。
+     - CSM cascade cull for v4 fast-append（Step B 待做）：需要可靠 bounds，
+       优先级在 path blocker 视觉验收之后。
+     - PoseRegistry / VisibleRegistry hot index 改 vector 的实验：风险较高，
+       建议在白天有人 review 时再做。
+   - **当前 DLL**：
+     - `E:\Work\War3\d3d9.dll = 26768707 bytes @ 2026-05-15 05:57+`
+     - 包含 Phase 7.70-7.80 所有改动
+   - **回退路径**：
+     - 每个 phase 独立 commit，可以单独 revert 任意一个
+     - 性能侧改动（7.76/7.77/7.79/7.80）影响主路径，回滚要小心
+     - 诊断侧改动（7.73/7.74/7.75/7.78）纯加观察点，可任意保留或回滚
