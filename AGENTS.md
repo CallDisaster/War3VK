@@ -3599,3 +3599,74 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
        失败于 named pipe 不可用。这不是游戏崩溃，也不是渲染回归。
      - 下一轮性能主线应优先调查 `SubmitFrame/PaletteIndex`，但仍需保持
        每次改动后 full trace `submitted=0 == 0`。
+
+
+108. **Phase 7.61 draw-time VB fast append 实验转主线 + 黑匣子验收（2026-05-14 17:15）**:
+   - **目标**：
+     - 继续沿长期主线优化 semantic draw-time pre-skinned VB/IB/UV 路径；
+     - 不引入 legacy route；
+     - 不改变稀疏 caster 的 producer supplement 正确性前提；
+     - 只在已有当前帧 draw-time VB cache 的 skinned unit 上减少 append 侧 CPU 绕路。
+   - **代码改动**：
+     - `src/d3d9/d3d9_device.cpp`
+       - 新增运行时开关
+         `DXVK_WAR3_SEMANTIC_DRAW_TIME_FAST_APPEND`，默认开启；
+       - 在 `War3TryPopulateDirectCurrentDrawGrouped()` submit 阶段新增
+         `tryAppendDrawTimeFastEligible(...)`；
+       - 命中条件很窄：
+         - 非 `fromPartPacketLease`；
+         - 非 `fromStalePoseRestore`；
+         - packet path 必须是 `Skinned`；
+         - object kind 必须解析为 `Unit`；
+         - `renderablePart` 必须命中 `m_war3DrawTimeVBCache`；
+         - cache entry 必须是当前 `m_war3ShadowPersistentFrameSerial`；
+         - position/index GPU copy buffer 必须完整；
+       - 命中后直接构造 `War3ShadowCasterDraw`：
+         - position/index/UV/diffuse/alpha 来自 draw-time cache；
+         - `vertexBlendEnabled=false`；
+         - `worldMatrix=entry.capturedWorldMatrix`；
+         - `War3ShadowReplayMode::FixedWorld`；
+         - `boundsRadius=0`，沿用 v4 的 no-cull 策略；
+       - 未命中时立即回落到原 `War3TryAppendSemanticShadowPacket()`。
+   - **为什么这不是新 correctness 路线**：
+     - fast append 只消费 Phase 7.55 已验证的 draw-time GPU copy 数据；
+     - 不从 palette / manifest / lease / legacy capture 重新取 pose；
+     - 不扩大 stale restore 或 lease record 的适用范围；
+     - 不改变对象选择、grouping、sticky selection、part lease 记录逻辑。
+   - **黑匣子验收**：
+     - trace：
+       `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_14_17_08_40.jsonl`
+     - `_phase756_drawtime_producer.py`：
+       - `submitted=0` = `0 / 201`
+       - `submitted_min = 69`
+       - producer visible candidates ≈ `96.6 / frame`
+       - producer fresh entries ≈ `12.6 / frame`
+       - producer submitted ≈ `12.6 / frame`
+       - producer miss-no-fresh = `0.0 / frame`
+       - producer fallback to current-draw = `0 / 201`
+     - TAA / receiver trace：
+       - `semanticSceneShadowTaaMode`: 前 2 帧 `1`，随后 199 帧 `2`
+       - `semanticSceneShadowReceiverSampleSource`: 前 2 帧 `2`，随后 199 帧 `3`
+       - `semanticSceneShadowHistoryValidAfter`: `201 / 201`
+   - **性能证据**：
+     - breakdown：
+       `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_05_14_17_11_02.html`
+     - `avgFps = 14.131`
+     - `avgGpuTimeMs = 1.638`
+     - `avgProcessCpuMs = 72.170`
+     - `War3SemanticScene/Populate` ≈ `7.176ms/frame`
+     - `Direct/BuildPacket` ≈ `2.407ms/frame`
+     - `Direct/Append` ≈ `4.036ms/frame`
+     - `SubmitFrame/PaletteIndex` ≈ `0.378ms/frame`
+   - **对比 Phase 7.60**：
+     - `War3SemanticScene/Populate`: `8.654ms -> 7.176ms`
+     - `SubmitFrame/PaletteIndex`: `0.833ms -> 0.378ms`
+     - 黑匣子 `submitted=0` 仍为 0，未出现少 caster 卡顿回潮。
+   - **回退路径**：
+     - `DXVK_WAR3_SEMANTIC_DRAW_TIME_FAST_APPEND=0`
+       可关闭 fast append，回到 Phase 7.60 的稳定路径。
+   - **下一步**：
+     - 继续拆 `War3SemanticScene/Direct/BuildPacket` 和 `Direct/Append`
+       的剩余 CPU 热点；
+     - 每轮仍必须用 full trace 复核 `submitted=0 == 0` 和 TAA history
+       稳定状态，视觉正确性优先级高于 FPS。

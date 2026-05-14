@@ -376,6 +376,12 @@ bool War3SemanticDrawTimeDirectProducerRuntime() {
   return s_enabled;
 }
 
+bool War3SemanticDrawTimeFastAppendRuntime() {
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_DRAW_TIME_FAST_APPEND", 1u) != 0u;
+  return s_enabled;
+}
+
 bool War3SemanticShadowManifestDeferProvisionalPartsRuntime() {
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SEMANTIC_MANIFEST_DEFER_PROVISIONAL_PARTS",
@@ -13009,12 +13015,180 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
   };
 
+  auto tryAppendDrawTimeFastEligible = [&](EligibleRecord& eligible) {
+    if (!War3SemanticDrawTimeFastAppendRuntime())
+      return false;
+    if (eligible.fromPartPacketLease || eligible.fromStalePoseRestore)
+      return false;
+    if (eligible.packet.path != dxvk::war3::shadow::ShadowDrawPath::Skinned)
+      return false;
+
+    const auto resolvedObjectKind =
+        War3ResolveSemanticPacketObjectKindFast(eligible.packet);
+    if (resolvedObjectKind != dxvk::war3::render::ObjectKind::Unit)
+      return false;
+
+    void* consumeKey = eligible.packet.renderable.renderablePart;
+    if (consumeKey == nullptr)
+      return false;
+    auto vbIt = m_war3DrawTimeVBCache.find(consumeKey);
+    if (vbIt == m_war3DrawTimeVBCache.end())
+      return false;
+    auto& entry = vbIt->second;
+    const bool entryFresh =
+        entry.frameSerial == m_war3ShadowPersistentFrameSerial &&
+        entry.vertexCount != 0u &&
+        entry.positionBuffer != nullptr &&
+        entry.positionInfo.buffer != VK_NULL_HANDLE &&
+        (!entry.indexed ||
+         (entry.indexBuffer != nullptr &&
+          entry.indexInfo.buffer != VK_NULL_HANDLE &&
+          entry.indexCount != 0u));
+    if (!entryFresh)
+      return false;
+
+    War3ShadowCasterDraw draw = {};
+    draw.indexed = entry.indexed;
+    draw.positionStorage = entry.positionBuffer;
+    draw.positionInfo = entry.positionInfo;
+    draw.positionStride = entry.positionStride;
+    draw.positionOffset = entry.positionOffset;
+    draw.positionFormat = entry.positionFormat;
+    draw.topology = entry.topology;
+    draw.worldMatrix = entry.capturedWorldMatrix;
+    draw.vertexBlendEnabled = false;
+    draw.vertexBlendIndexed = false;
+    draw.vertexBlendCount = 0u;
+    draw.paletteIndex = 0u;
+    draw.blendWeightOffset = 0u;
+    draw.blendWeightFormat = VK_FORMAT_UNDEFINED;
+    draw.blendIndexOffset = 0u;
+    draw.blendIndexFormat = VK_FORMAT_UNDEFINED;
+    draw.blendStride = 0u;
+    draw.blendBinding = 0u;
+    draw.blendStorage = nullptr;
+    draw.blendInfo = {};
+
+    const bool effectiveAlphaTest =
+        entry.alphaTestEnabled ||
+        (entry.alphaBlendEnabled &&
+         entry.diffuseTexture != nullptr &&
+         entry.uvFormat != VK_FORMAT_UNDEFINED &&
+         entry.uvStride > 0u);
+    draw.alphaTestEnabled = effectiveAlphaTest;
+    draw.alphaRef = effectiveAlphaTest ? entry.alphaRef : 0.0f;
+    draw.alphaBlendEnabled = entry.alphaBlendEnabled;
+    draw.depthWriteEnabled = true;
+    draw.depthTestEnabled = true;
+    draw.additiveBlend = false;
+    draw.uvStride = entry.uvStride;
+    draw.uvOffset = entry.uvOffset;
+    draw.uvFormat = entry.uvFormat;
+    if (entry.uvFormat != VK_FORMAT_UNDEFINED && entry.uvStride != 0u) {
+      if (entry.uvSharesPositionBuffer) {
+        draw.uvStorage = entry.positionBuffer;
+        draw.uvInfo = entry.positionInfo;
+      } else {
+        draw.uvStorage = entry.uvBuffer;
+        draw.uvInfo = entry.uvInfo;
+      }
+    }
+    draw.diffuseTexture = entry.diffuseTexture;
+    if (draw.alphaTestEnabled && draw.diffuseTexture != nullptr &&
+        m_shadowReceiverPass != nullptr) {
+      bool alphaUseMip = false;
+      float alphaMipLodBias = 0.0f;
+      if (m_war3Pipeline) {
+        const auto& shadowSettings = m_war3Pipeline->GetSettings().shadows;
+        alphaUseMip = shadowSettings.alphaShadowUseMip;
+        alphaMipLodBias = shadowSettings.alphaShadowMipLodBias;
+      }
+      draw.diffuseSampler =
+          m_shadowReceiverPass->getFallbackSampler(alphaUseMip,
+                                                   alphaMipLodBias);
+      if (draw.diffuseSampler != nullptr)
+        draw.diffuseSamplerIndex =
+            draw.diffuseSampler->getDescriptor().samplerIndex;
+      draw.textureDescriptor = *draw.diffuseTexture->getDescriptor();
+    } else if (draw.alphaTestEnabled) {
+      draw.alphaTestEnabled = false;
+      draw.alphaRef = 0.0f;
+    }
+
+    if (entry.indexed) {
+      draw.indexStorage = entry.indexBuffer;
+      draw.indexInfo = entry.indexInfo;
+      draw.indexType = entry.indexType;
+      draw.indexCount = entry.indexCount;
+      draw.firstIndex = 0u;
+      draw.vertexOffset = entry.consumeVertexOffset;
+      draw.vertexCount = 0u;
+      draw.firstVertex = 0u;
+      draw.minVertexIndex = 0u;
+      draw.numVertices = entry.vertexCount;
+    } else {
+      draw.indexCount = 0u;
+      draw.firstIndex = 0u;
+      draw.vertexOffset = 0;
+      draw.vertexCount = entry.vertexCount;
+      draw.firstVertex = 0u;
+      draw.minVertexIndex = 0u;
+      draw.numVertices = entry.vertexCount;
+    }
+
+    draw.category = War3RenderState::StageCategory::WorldObject;
+    draw.batchTag = War3BatchTag::WorldObjects;
+    draw.batchHandle = eligible.packet.renderable.jHandle != 0u
+                           ? eligible.packet.renderable.jHandle
+                           : eligible.sample.contract.jHandle;
+    draw.objectKind = static_cast<uint8_t>(resolvedObjectKind);
+    draw.boundsCenter = War3SemanticBoundsTranslation(draw.worldMatrix);
+    draw.boundsRadius = 0.0f;
+
+    War3ShadowInstanceRef instance = {};
+    instance.geometryId = 0u;
+    instance.materialId = 0u;
+    instance.replayDrawIndex =
+        static_cast<uint32_t>(m_war3Scene.shadowCasters.size());
+    instance.batchHandle = draw.batchHandle;
+    instance.paletteIndex = 0u;
+    instance.worldMatrix = draw.worldMatrix;
+    instance.boundsCenter = draw.boundsCenter;
+    instance.boundsRadius = draw.boundsRadius;
+    instance.category = draw.category;
+    instance.batchTag = draw.batchTag;
+    instance.objectKind = draw.objectKind;
+    instance.mode = War3ShadowReplayMode::FixedWorld;
+
+    m_war3Scene.shadowInstances.emplace_back(std::move(instance));
+    m_war3Scene.shadowCasters.emplace_back(std::move(draw));
+    m_war3Scene.shadowStats.captured++;
+    if (entry.indexed)
+      m_war3Scene.shadowStats.capturedIndexed++;
+    else
+      m_war3Scene.shadowStats.capturedNonIndexed++;
+    m_war3Scene.shadowStats.capturedWorldObject++;
+    m_war3Scene.shadowStats.capturedUnitObject++;
+    m_war3Scene.shadowStats.persistentUnitInstanceCount++;
+    m_war3Scene.shadowStats.semanticSceneSubmitted++;
+    m_war3Scene.shadowStats.semanticSceneSubmittedUnit++;
+    m_war3Scene.shadowStats.semanticSceneSubmittedSkinned++;
+    m_war3Scene.shadowStats
+        .semanticSceneSubmittedSkinnedDynamicUnitEvidenceCount++;
+    m_war3Scene.shadowStats.dynamicPoseCount++;
+    m_war3Scene.shadowStats.dynamicSkinnedOutputCount++;
+    m_war3Scene.shadowStats.drawTimeVBCacheConsumeHitCount++;
+    entry.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
+    return true;
+  };
+
   if (!useObjectGrouped) {
     // 回退路径：逐 record 提交（与原始行为一致）
     for (auto& eligible : eligibleRecords) {
       auto appendScope =
           War3SemanticSubmitScope("War3SemanticScene/Direct/Append");
-      if (War3TryAppendSemanticShadowPacket(eligible.packet, &eligible.sample,
+      if (tryAppendDrawTimeFastEligible(eligible) ||
+          War3TryAppendSemanticShadowPacket(eligible.packet, &eligible.sample,
                                             eligible.fromStalePoseRestore)) {
         ++submitted;
         completenessBucketForKey(eligible.completenessKey).submittedParts++;
@@ -13245,7 +13419,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         auto& eligible = eligibleRecords[j];
         auto appendScope =
             War3SemanticSubmitScope("War3SemanticScene/Direct/Append");
-        if (War3TryAppendSemanticShadowPacket(eligible.packet, &eligible.sample,
+        if (tryAppendDrawTimeFastEligible(eligible) ||
+            War3TryAppendSemanticShadowPacket(eligible.packet, &eligible.sample,
                                               eligible.fromStalePoseRestore)) {
           ++groupSubmitted;
           completenessBucketForKey(eligible.completenessKey).submittedParts++;
