@@ -3748,3 +3748,66 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      - 后续优化应优先小步削 `Shadow/Main`、TAA/AA/receiver 和剩余
        untracked CPU，不再回头恢复 matrix publisher hooks，除非黑匣子证明
        draw-time VB producer 在某个实机场景失效。
+
+
+110. **Phase 7.65 shadow map scratch buffer reuse（2026-05-14 21:20）**:
+   - **目标**：
+     - 继续长期 semantic draw-time 主线；
+     - 不碰 Pose 来源、不恢复 legacy route、不改变 AlphaTest / TAA 语义；
+     - 只削 shadow map pass 内部每帧临时分配和重复 replay-list 构造。
+   - **代码改动**：
+     - `src/d3d9/d3d9_war3_shadow.cpp`
+       - `War3ShadowReceiverPass::renderShadowMap()` 在调用方已经传入
+         `replayDrawOverride` 时不再额外调用 `BuildShadowReplayDraws()`；
+       - 原本每帧局部创建的 `prepared` 与 `drawIndices` 改为复用
+         `War3ShadowReceiverPass` 成员 scratch vector；
+     - `src/d3d9/d3d9_war3_shadow.h`
+       - 将 `PreparedShadowCaster` 提升为 receiver pass 私有结构；
+       - 新增 `m_shadowPreparedScratch` 与
+         `m_shadowDrawIndicesScratch`。
+   - **为什么这轮 correctness 风险低**：
+     - scratch vector 每次 `renderShadowMap()` 入口都会 `clear()/resize()`，
+       不跨帧保留 caster 决策；
+     - 没有改变 draw-time VB/IB/UV GPU copy、prebuild bypass、
+       fast append、TAA history、receiver sample source 或 matrix publisher
+       hooks 的开关状态；
+     - 只改变容器生命周期，不改变容器里的数据来源和提交顺序。
+   - **黑匣子验收**：
+     - trace：
+       `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_14_21_11_35.jsonl`
+     - `_phase756_drawtime_producer.py`：
+       - `submitted=0` = `0 / 885`
+       - `submitted_min = 69`
+       - producer visible candidates ≈ `96.5 / frame`
+       - producer fresh entries ≈ `20.8 / frame`
+       - producer submitted ≈ `20.8 / frame`
+       - producer miss-no-fresh = `0.0 / frame`
+       - producer fallback to current-draw = `0 / 885`
+     - TAA / receiver trace：
+       - `semanticSceneShadowTaaMode`: 前 2 帧 `1`，随后 883 帧 `2`
+       - `semanticSceneShadowReceiverSampleSource`: 前 2 帧 `2`，随后 883 帧 `3`
+       - `semanticSceneShadowHistoryValidAfter`: `885 / 885`
+       - `semanticSceneReceiverDrawExecutedThisFrame`: `885 / 885`
+       - `semanticSceneShadowMapRenderSerial`: `1..885` 连续推进
+     - prebuild bypass：
+       - Attempt = `67913`
+       - Hit = `67334`
+       - hit rate ≈ `99.15%`
+   - **性能证据**：
+     - pure perf rerun：
+       `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_05_14_21_16_02.html`
+     - `avgFps = 109.307`
+     - `avgFrameTimeMs = 9.149`
+     - `avgGpuTimeMs = 1.581`
+     - `avgProcessCpuMs = 7.580`
+     - `avgMainThreadCpuMs = 5.345`
+     - `War3SemanticScene/Populate` ≈ `0.394ms/frame`
+     - `Shadow/Main` ≈ `0.512ms CPU / 0.668ms GPU`
+     - `ShadowMap` ≈ `0.297ms CPU / 0.112ms GPU`
+     - `PostFX/AA` ≈ `0.032ms CPU / 0.248ms GPU`
+   - **结论**：
+     - 当前长期 semantic draw-time 主线已经基本追平旧 VB/IB intercept
+       `110 FPS` 基线，同时黑匣子没有回到少 caster `submitted=0`
+       问题；
+     - 下一步优化优先看 `Shadow/Main` / receiver / TAA GPU 成本和
+       `Other/UntrackedActive`，避免重新改 Pose 数据层。

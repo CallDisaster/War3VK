@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <functional> // [Fix] for std::function
 #include <algorithm>  // [Fix] for std::max/min
+#include <vector>
 #include "d3d9_util.h"
 
 namespace dxvk {
@@ -200,6 +201,16 @@ namespace dxvk {
             VkPipeline pipeline = VK_NULL_HANDLE;
         };
 
+        struct PreparedShadowCaster {
+            bool valid = false;
+            ShadowCasterPipeline pipeline = {};
+            size_t pipelineHash = 0;
+            VkImageView alphaImageView = VK_NULL_HANDLE;
+            VkBuffer positionBuffer = VK_NULL_HANDLE;
+            VkBuffer indexBuffer = VK_NULL_HANDLE;
+            bool effectiveAlphaTest = false;
+        };
+
         struct OutlineEdgePipelineKey {
             VkFormat format = VK_FORMAT_UNDEFINED;
 
@@ -232,6 +243,8 @@ namespace dxvk {
 
         std::unordered_map<PipelineKey, Pipeline, DxvkHash, DxvkEq> m_pipelines;
         std::unordered_map<ShadowCasterPipelineKey, ShadowCasterPipeline, DxvkHash, DxvkEq> m_shadowCasterPipelines;
+        std::vector<PreparedShadowCaster> m_shadowPreparedScratch;
+        std::vector<uint32_t> m_shadowDrawIndicesScratch;
 
         // ShadowTAA 相关全屏 pass（固定输出格式，单例 pipeline）
         VkPipeline m_motionVectorPipeline = VK_NULL_HANDLE;      // R16G16_SFLOAT

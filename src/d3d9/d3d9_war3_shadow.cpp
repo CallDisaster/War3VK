@@ -1489,9 +1489,14 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   reconciliation.skinnedPreparedCount = 0u;
   reconciliation.skinnedDrawnCount = 0u;
 
-  const auto localReplayDraws = BuildShadowReplayDraws(input.scene);
-  const auto& replayDraws =
-      replayDrawOverride ? *replayDrawOverride : localReplayDraws;
+  std::vector<const War3ShadowCasterDraw*> localReplayDraws;
+  const std::vector<const War3ShadowCasterDraw*>* replayDrawsPtr =
+      replayDrawOverride;
+  if (replayDrawsPtr == nullptr) {
+    localReplayDraws = BuildShadowReplayDraws(input.scene);
+    replayDrawsPtr = &localReplayDraws;
+  }
+  const auto& replayDraws = *replayDrawsPtr;
 
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
@@ -1576,24 +1581,11 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   const VkExtent3D extent = {m_shadowMapResolution, m_shadowMapResolution, 1u};
   uint32_t drawnCasters = 0;
 
-  // ===== 级联剔除 + 排序：减少每级联的无效重放 =====
-  struct PreparedShadowCaster {
-    bool valid = false;
-    ShadowCasterPipeline pipeline = {};
-    size_t pipelineHash = 0;
-    VkImageView alphaImageView = VK_NULL_HANDLE;
-    VkBuffer positionBuffer = VK_NULL_HANDLE;
-    VkBuffer indexBuffer = VK_NULL_HANDLE;
-    // Phase 7.52 AlphaTest 修复：把 prepare 阶段决定的 effective alpha-test 决策
-    // 跨阶段传给 pc.flags 写入。alpha-blend only + 有 UV + 有 diffuse 的物体
-    // 会被 promote 成 alpha-test，以解决 "带 AlphaTest 的贴图投实心阴影" 问题。
-    bool effectiveAlphaTest = false;
-  };
-
   const uint32_t casterCount =
       static_cast<uint32_t>(replayDraws.size());
-  std::vector<PreparedShadowCaster> prepared;
-  prepared.resize(casterCount);
+  m_shadowPreparedScratch.clear();
+  m_shadowPreparedScratch.resize(casterCount);
+  auto& prepared = m_shadowPreparedScratch;
   uint32_t skinnedCasterCount = 0;
   uint32_t skinnedPreparedCount = 0;
   uint32_t skinnedInvalidBufferCount = 0;
@@ -1772,8 +1764,9 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     return true;
   };
 
-  std::vector<uint32_t> drawIndices;
-  drawIndices.reserve(casterCount);
+  m_shadowDrawIndicesScratch.clear();
+  m_shadowDrawIndicesScratch.reserve(casterCount);
+  auto& drawIndices = m_shadowDrawIndicesScratch;
   std::array<uint32_t, 4> culledPerCascade = {};
   std::array<uint32_t, 4> drawnPerCascade = {};
   std::array<uint32_t, 4> skinnedCulledPerCascade = {};
