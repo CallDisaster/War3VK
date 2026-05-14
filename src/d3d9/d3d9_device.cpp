@@ -23112,6 +23112,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       // buffer——后续 draw 会覆盖原 ring buffer。
       // CPU memcpy 不可行（device-local buffer 没 mapPtr），改用 GPU copyBuffer。
       m_war3Scene.shadowStats.drawTimeVBCacheTotalEntered++;
+      // Phase 7.70：把 draw-time capture 的 CPU 时间从 OutsideMainLoop/Tracked
+      // 里拆出来，便于后续按热点细分（fingerprint 计算、buffer 分配、EmitCs 入队）。
+      auto captureScope = [&]() -> war3::War3PerfMonitor::ScopedCpuScope {
+        if constexpr (dxvk::war3::internal::
+                          kNativeOptimizationPerfTrackingEnabled) {
+          return war3::War3PerfMonitor::instance().cpuScope(
+              "Shadow/DrawTime/Capture");
+        }
+        return {};
+      }();
       do {
         void* vbCacheKey = semantic.renderablePart;
         if (vbCacheKey == nullptr) {
@@ -23204,6 +23214,89 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 VkDeviceSize(posStride)) {
           m_war3Scene.shadowStats.drawTimeVBCacheRejectInsufficientLength++;
           break;
+        }
+        // Phase 7.70：同帧去重指纹（仅源数据相关字段）。
+        //
+        // 这里我们已经知道 position 源的 buffer/offset/range。一帧里同一个
+        // renderablePart 常被反复 draw（多 layer / sub-mesh），如果源数据没变，
+        // 之前那次 capture 就把同样的 bytes 拷进了我们自有 buffer。第二次进来
+        // 重新 EmitCs(copyBuffer) 是纯浪费。指纹越严越保守：
+        //   - position 源 buffer 指针、offset、本次 range start/count、stride
+        //   - indexed 标志 + StartVal + CountVal（间接表达 IB 源 range）
+        // 我们在拿到 IB 源 buffer 指针之后，再把 IB 指针折进去做最终指纹比较。
+        const auto fold = [](uint64_t h, uint64_t v) -> uint64_t {
+          // 标准 64-bit splittable mix
+          h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+          h *= 0x100000001b3ull;
+          return h;
+        };
+        uint64_t captureFingerprint = 0xcbf29ce484222325ull;
+        captureFingerprint = fold(captureFingerprint,
+            reinterpret_cast<uintptr_t>(posSlice.buffer().ptr()));
+        captureFingerprint = fold(captureFingerprint,
+            uint64_t(posSlice.offset()));
+        captureFingerprint = fold(captureFingerprint,
+            uint64_t(posSlice.length()));
+        captureFingerprint = fold(captureFingerprint,
+            uint64_t(uint32_t(vRangeStart)) | (uint64_t(vRangeCount) << 32));
+        captureFingerprint = fold(captureFingerprint,
+            uint64_t(posStride) | (uint64_t(uint32_t(declInfo.posOffset)) << 32));
+        captureFingerprint = fold(captureFingerprint,
+            indexed ? (uint64_t(StartVal) | (uint64_t(CountVal) << 32))
+                    : (uint64_t(StartVal) | (uint64_t(CountVal) << 32)
+                       | (1ull << 63)));
+        // Phase 7.70：fast path — 同帧、同源数据指纹命中时只刷新易变状态。
+        //
+        // 易变状态指 capture 时 D3D state 中可能在同一 renderablePart 不同
+        // sub-draw 里发生变化的字段：alphaTestEnabled、alphaBlendEnabled、
+        // alphaRef、diffuseTexture（stage0 SRV）、capturedWorldMatrix。这些
+        // 全部不涉及 GPU copy，开销可忽略。下游消费时谁后写谁生效，符合
+        // 既有“最后一次 draw 决定 caster 状态”的语义。
+        {
+          auto fastIt = m_war3DrawTimeVBCache.find(vbCacheKey);
+          if (fastIt != m_war3DrawTimeVBCache.end()) {
+            auto& cached = fastIt->second;
+            const bool sameFrame =
+                cached.frameSerial == m_war3ShadowPersistentFrameSerial;
+            const bool fingerprintMatch =
+                cached.lastCaptureFingerprint == captureFingerprint;
+            const bool buffersIntact =
+                cached.positionBuffer != nullptr &&
+                cached.positionInfo.buffer != VK_NULL_HANDLE &&
+                cached.vertexCount == vRangeCount &&
+                cached.positionStride == posStride;
+            if (sameFrame && fingerprintMatch && buffersIntact) {
+              // 刷新一份新的 D3D 状态快照，避免拿陈旧 alpha/纹理。
+              const bool atState =
+                  m_state.renderStates[D3DRS_ALPHATESTENABLE] != FALSE;
+              const bool atFunc =
+                  m_state.renderStates[D3DRS_ALPHAFUNC] != D3DCMP_ALWAYS;
+              cached.alphaTestEnabled = atState && atFunc;
+              cached.alphaBlendEnabled =
+                  m_state.renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
+              const DWORD alphaRefDword =
+                  cached.alphaTestEnabled
+                      ? m_state.renderStates[D3DRS_ALPHAREF]
+                      : DWORD(128);
+              cached.alphaRef = float(alphaRefDword & 0xFFu) / 255.0f;
+              cached.diffuseTexture = nullptr;
+              if (m_state.textures[0] != nullptr) {
+                auto* commonTex = GetCommonTexture(m_state.textures[0]);
+                if (commonTex)
+                  cached.diffuseTexture = commonTex->GetSampleView(false);
+              }
+              cached.capturedWorldMatrix =
+                  m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
+              m_war3Scene.shadowStats.drawTimeVBCacheSameFrameDedupHit++;
+              m_war3Scene.shadowStats.drawTimeVBCacheSameFrameStateRefresh++;
+              break;
+            }
+            if (sameFrame) {
+              // 同帧但数据指纹不一致：必须重做 GPU copy。记账以便观察是否
+              // 真的存在“同一 part 多种数据来源”这种 churn。
+              m_war3Scene.shadowStats.drawTimeVBCacheSameFrameDedupMiss++;
+            }
+          }
         }
         auto& entry = m_war3DrawTimeVBCache[vbCacheKey];
         entry.renderablePart = semantic.renderablePart;
@@ -23502,6 +23595,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheAlphaBlendStateCaptureCount++;
         if (entry.diffuseTexture != nullptr)
           m_war3Scene.shadowStats.drawTimeVBCacheDiffuseTextureCaptureCount++;
+        // Phase 7.70：记下本次 capture 的源数据指纹。
+        // 同帧后续相同来源的 capture 会命中上方 fast path 并跳过 GPU copy。
+        entry.lastCaptureFingerprint = captureFingerprint;
       } while (false);
     }
     return;

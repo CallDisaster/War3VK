@@ -407,6 +407,13 @@ namespace dxvk {
         uint32_t drawTimeVBCacheAlphaTestStateCaptureCount = 0;
         uint32_t drawTimeVBCacheAlphaBlendStateCaptureCount = 0;
         uint32_t drawTimeVBCacheDiffuseTextureCaptureCount = 0;
+        // Phase 7.70：同帧重复捕获去重账本。
+        // SameFrameDedupHit 是命中“数据指纹未变”的次数（跳过 GPU copy）。
+        // SameFrameDedupMiss 是数据真的变了，必须重做 GPU copy 的次数。
+        // SameFrameStateRefresh 是去重命中后仍然刷新了 alpha/world/texture 状态。
+        uint32_t drawTimeVBCacheSameFrameDedupHit = 0;
+        uint32_t drawTimeVBCacheSameFrameDedupMiss = 0;
+        uint32_t drawTimeVBCacheSameFrameStateRefresh = 0;
         uint32_t drawTimeSemanticProducerVisibleCandidateCount = 0;
         uint32_t drawTimeSemanticProducerFreshEntryCount = 0;
         uint32_t drawTimeSemanticProducerSubmittedCount = 0;

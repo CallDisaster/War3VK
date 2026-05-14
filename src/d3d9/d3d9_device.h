@@ -2038,6 +2038,16 @@ private:
     uint32_t jHandle = 0u;
     war3::render::ObjectKind objectKind =
         static_cast<war3::render::ObjectKind>(0);
+    // Phase 7.70：同帧重复捕获去重指纹。
+    // 同一 renderablePart 在一帧里常被多次 draw（sub-mesh、layer pass、补光），
+    // 每次都会重做 EmitCs(copyBuffer)。如果数据来源（VB/IB slice + range）没变，
+    // 我们已经把该范围拷贝到自有 buffer，第二次进来只需更新 alpha-test / 世界
+    // 矩阵 / 纹理这些便宜的状态，跳过 GPU copy 命令。指纹覆盖：
+    //   - position 源 buffer 指针、偏移、本次 range（start/count/stride）
+    //   - UV 源（若与 position 不同 stream）
+    //   - index 源（若 indexed）
+    //   - 一个简单 mix-hash，不持久化跨帧
+    uint64_t lastCaptureFingerprint = 0u;
   };
   std::unordered_map<void*, War3DrawTimeVBEntry> m_war3DrawTimeVBCache;
   uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;

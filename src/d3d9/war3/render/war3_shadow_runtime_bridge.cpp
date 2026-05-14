@@ -777,6 +777,12 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCacheAlphaBlendStateCaptureCount
      << ",\"drawTimeVBCacheDiffuseTextureCaptureCount\":"
      << stats.drawTimeVBCacheDiffuseTextureCaptureCount
+     << ",\"drawTimeVBCacheSameFrameDedupHit\":"
+     << stats.drawTimeVBCacheSameFrameDedupHit
+     << ",\"drawTimeVBCacheSameFrameDedupMiss\":"
+     << stats.drawTimeVBCacheSameFrameDedupMiss
+     << ",\"drawTimeVBCacheSameFrameStateRefresh\":"
+     << stats.drawTimeVBCacheSameFrameStateRefresh
      << ",\"drawTimeD3DPoseAttemptCount\":"
      << stats.semanticSceneDrawTimePoseAttemptCount
      << ",\"drawTimeD3DPosePublishedCount\":"
