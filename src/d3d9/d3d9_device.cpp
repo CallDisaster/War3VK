@@ -1185,6 +1185,10 @@ bool War3ShouldSubmitSemanticPacket(
     const dxvk::war3::shadow::ShadowDrawPacket& packet,
     dxvk::war3::render::ObjectKind resolvedObjectKind, bool unitsOnly);
 
+// 路径阻断器 FourCC 黑名单匹配。定义在文件后段；此前 War3ShouldSubmit*
+// 等 eligibility helper 想用的话需要这个前置声明。
+inline bool IsLosBlockerFourCc(uint32_t rawcode);
+
 bool War3IsEligibleSemanticDynamicUnit(
     const dxvk::war3::shadow::ShadowDrawPacket& packet,
     dxvk::war3::render::ObjectKind resolvedObjectKind) {
@@ -2728,6 +2732,13 @@ dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKind(
 bool War3ShouldSubmitSemanticPacket(
     const dxvk::war3::shadow::ShadowDrawPacket& packet,
     dxvk::war3::render::ObjectKind resolvedObjectKind, bool unitsOnly) {
+  // Phase 7.72：路径阻断器在 eligibility 层就拦掉，避免上游 producer 还要继续
+  // 走完整 packet 构建。这里只读 packet.renderable.rawcode，无堆/无锁。
+  if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+      packet.renderable.rawcode != 0u &&
+      IsLosBlockerFourCc(packet.renderable.rawcode)) {
+    return false;
+  }
   const bool hasRenderableGeoset =
       packet.renderable.runtimeGeosetPtr != nullptr ||
       packet.renderable.runtimeGeosetDataPtr != nullptr ||
@@ -9542,6 +9553,36 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     const dxvk::war3::render::CurrentDrawAuthoritativeSample*
         directCurrentDrawSample,
     bool fromStalePoseRestore) {
+  // Phase 7.72：路径阻断器（YT?? 系列）在新长期路线下走 destructible/rigid
+  // 入口，无 vertexBlend，原先在 v4 vertex-blend 分支里的 LOS 检查根本不会触发；
+  // 同时 War3ShouldSubmitSemanticPacket 让 destructible 通过，导致路径阻断器
+  // 被作为 static-world caster 提交、投出阴影。
+  // 这里在 packet append 入口最早期、单次便宜的 helper 调用就能挡住所有 path：
+  // semantic / v4 / fast-append / current-draw 全部统一从这里走。检测只看
+  // packet.renderable.rawcode，不读 currentObj 也不查 RenderObjectRegistry，
+  // 因此每帧上千次调用也只是几个常量比较+大小写归一化。
+  if (dxvk::war3::internal::kPathBlockerHideEnabled) {
+    bool blocked = false;
+    if (packet.renderable.rawcode != 0u &&
+        IsLosBlockerFourCc(packet.renderable.rawcode)) {
+      blocked = true;
+    } else if (packet.renderable.jHandle != 0u) {
+      // 兜底：rawcode 没填但 jHandle 存在时，做一次 RenderObjectRegistry 反查。
+      // 单次 hashmap 查询；append 一帧只调 100-300 次，可接受。
+      if (const auto* obj =
+              dxvk::war3::render::RenderObjectRegistry::instance()
+                  .findByHandle(packet.renderable.jHandle)) {
+        if (obj->rawcode != 0u && IsLosBlockerFourCc(obj->rawcode))
+          blocked = true;
+      }
+    }
+    if (blocked) {
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats.skippedNotCaster++;
+      return false;
+    }
+  }
+
   auto toVkTopology = [](dxvk::war3::shadow::ShadowPrimitiveTopology topology) {
     switch (topology) {
     case dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleStrip:
