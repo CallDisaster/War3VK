@@ -1631,8 +1631,12 @@ void HydrateVisibleSnapshotBasicFields(VisibleRenderableRegistry::Snapshot &snap
     return;
 
   bool changed = false;
-  std::unordered_map<void *, RenderablePartBasicFields> partCache;
-  partCache.reserve(snap.records.size());
+  // Phase 7.79：thread_local 复用 partCache 避免每帧 alloc/free。
+  static thread_local std::unordered_map<void *, RenderablePartBasicFields>
+      s_partCache;
+  s_partCache.clear();
+  s_partCache.reserve(snap.records.size());
+  auto &partCache = s_partCache;
 
   for (VisibleRenderableRecord &record : snap.records) {
     if (record.payload == nullptr)
