@@ -3535,3 +3535,67 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
        `Direct/Append` 与 `BuildPacket` 自身耗时；
      - 下一轮性能主线应继续细分 `War3TryAppendSemanticShadowPacket` 内部热点，
        但每次仍必须先用 full trace 验证 `submitted=0 == 0`。
+
+
+107. **Phase 7.60 无语义改动的 unit flags 热点缓存 + breakdown 细分（2026-05-14 16:55）**:
+   - **自动化状态**：
+     - 已确认 heartbeat 自动化 `war3-shadow-optimization-continuation` 仍为 ACTIVE；
+     - 未创建重复自动化，避免同一线程被多份 heartbeat 争用。
+   - **本轮原则**：
+     - 继续只做 draw-time semantic 主线性能优化；
+     - 不引入 legacy route；
+     - 不改 current-draw + draw-time producer supplement 的提交语义；
+     - 不收紧 producer 过滤，不动 AlphaTest / draw-time VB GPU copy / Shadow TAA。
+   - **代码改动**：
+     - `src/d3d9/d3d9_device.cpp`
+       - 新增 `War3TryReadUnitFlags5CCached(...)`：
+         - thread-local 4096 槽 direct-mapped cache；
+         - key 为 `unitPtr`；
+         - 缓存 `unit+0x5C` 是否可读及 flags 值；
+         - 替换 hot path 中重复 `SafeReadU32Fast(unitPtr, Flags5C, ...)`。
+       - `War3TryBuildShadowPacketFromCurrentDrawRecord()` 内增加 gated breakdown scopes：
+         - `RenderableSetup`
+         - `ResourceSetup`
+         - `SkinningDecision`
+         - `PaletteInstall`
+         - `PoseInstall`
+         - `ExplicitBlendResolve`
+         - `PathFinalize`
+         - `MaxGroupSlotScan`
+       - 这些 breakdown 仅在
+         `DXVK_WAR3_SEMANTIC_SUBMIT_BREAKDOWN=1` 时启用，默认不写入 perf 树。
+   - **性能证据**：
+     - 改后 quick full-trace perf：
+       - `war3_perf_report_auto_2026_05_14_16_52_56.html`
+       - `avgFps = 14.116`
+       - `avgGpuTimeMs = 1.647`
+       - `avgProcessCpuMs = 73.836`
+       - `avgMainThreadCpuMs = 65.411`
+     - 改后 breakdown：
+       - `war3_perf_report_auto_2026_05_14_16_53_40.html`
+       - `War3SemanticScene/Populate` ≈ `8.654ms/frame`
+       - `Direct/BuildPacket` ≈ `2.509ms/frame`
+       - `Direct/RenderableSetup` ≈ `0.024ms/frame`
+       - `SubmitFrame/PaletteIndex` ≈ `0.833ms/frame`
+       - 对比上一轮 cached-flags 前的 `RenderableSetup` 约 `3.3-3.6ms/frame`，
+         说明主要成本确实来自 repeated safe-read / memory-probe 类操作。
+   - **黑匣子验收**：
+     - 最新 trace：
+       - `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_14_16_52_34.jsonl`
+     - `_phase756_drawtime_producer.py`：
+       - `submitted=0` = `0 / 212`
+       - `submitted_min = 69`
+       - producer visible candidates ≈ `97.6 / frame`
+       - producer fresh entries ≈ `14.8 / frame`
+       - producer submitted ≈ `14.8 / frame`
+       - producer miss-no-fresh = `0.0 / frame`
+     - TAA trace 字段：
+       - `semanticSceneShadowTaaMode`: 前 2 帧 `1`，随后 210 帧 `2`
+       - `semanticSceneShadowHistoryValidAfter`: `1 / 212`
+       - `semanticSceneShadowReceiverSampleSource`: 前 2 帧 `2`，随后 210 帧 `3`
+   - **注意事项**：
+     - 本轮未使用 pure perf 并发结果作为结论；一次并发 `perf.py` 与
+       `perf_breakdown.py` 争用了 isolated desktop/control-plane，`perf.py`
+       失败于 named pipe 不可用。这不是游戏崩溃，也不是渲染回归。
+     - 下一轮性能主线应优先调查 `SubmitFrame/PaletteIndex`，但仍需保持
+       每次改动后 full trace `submitted=0 == 0`。

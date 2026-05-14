@@ -859,16 +859,45 @@ bool War3IsSemanticUnitObject(
   return objectKind == dxvk::war3::render::ObjectKind::Unit;
 }
 
+bool War3TryReadUnitFlags5CCached(void* unitPtr, uint32_t& outFlags5C) {
+  outFlags5C = 0u;
+  if (unitPtr == nullptr)
+    return false;
+
+  struct UnitFlagsCacheEntry {
+    void* unitPtr = nullptr;
+    uint32_t flags5C = 0u;
+    bool readable = false;
+    bool valid = false;
+  };
+  static thread_local std::array<UnitFlagsCacheEntry, 4096> s_cache = {};
+  const uintptr_t key = reinterpret_cast<uintptr_t>(unitPtr);
+  auto& entry = s_cache[(key >> 4u) & (s_cache.size() - 1u)];
+  if (entry.valid && entry.unitPtr == unitPtr) {
+    outFlags5C = entry.flags5C;
+    return entry.readable;
+  }
+
+  uint32_t flags5C = 0u;
+  const bool readable =
+      dxvk::war3::SafeReadU32Fast(unitPtr,
+                                  dxvk::war3::CUnitOffsets::Flags5C,
+                                  flags5C);
+  entry.unitPtr = unitPtr;
+  entry.flags5C = readable ? flags5C : 0u;
+  entry.readable = readable;
+  entry.valid = true;
+  outFlags5C = entry.flags5C;
+  return readable;
+}
+
 uint32_t War3SemanticUnitFlags5C(
     const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
   if (renderable.unitFlags5C != 0u)
     return renderable.unitFlags5C;
 
   uint32_t flags5C = 0u;
-  if (renderable.unitPtr != nullptr &&
-      dxvk::war3::SafeReadU32Fast(renderable.unitPtr,
-                                  dxvk::war3::CUnitOffsets::Flags5C,
-                                  flags5C)) {
+  if (War3TryReadUnitFlags5CCached(renderable.unitPtr, flags5C)) {
     return flags5C;
   }
 
@@ -2007,124 +2036,141 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   }
 
   auto& renderable = out.renderable;
-  renderable.worldObjectEntry =
-      record.worldObjectEntry != nullptr
-          ? record.worldObjectEntry
-          : instanceHit && instanceRecord.worldObjectEntry != nullptr
-                ? instanceRecord.worldObjectEntry
-                : shadowHit ? shadowRecord.worldObjectEntry
-                            : renderObject != nullptr
-                                  ? renderObject->worldObjectEntry
-                                  : nullptr;
-  renderable.sceneNode =
-      record.sceneNode != nullptr
-          ? record.sceneNode
-          : instanceHit && instanceRecord.sceneNode != nullptr
-                ? instanceRecord.sceneNode
-                : shadowHit ? shadowRecord.sceneNode
-                            : renderObject != nullptr
-                                  ? renderObject->sceneNode
-                                  : nullptr;
-  renderable.unitPtr =
-      record.unitPtr != nullptr
-          ? record.unitPtr
-          : instanceHit && instanceRecord.unitPtr != nullptr
-                ? instanceRecord.unitPtr
-                : shadowHit ? shadowRecord.unitPtr
-                            : renderObject != nullptr ? renderObject->unitPtr
-                                                      : nullptr;
-  renderable.renderablePart = record.renderablePart;
-  renderable.payload = record.renderablePart;
-  renderable.meshData = record.meshPayloadPtr;
-  if (visibleHit) {
-    if (renderable.payload == nullptr)
-      renderable.payload = visibleRecord.payload;
-    renderable.layerState = visibleRecord.layerState;
-    renderable.transparentType = visibleRecord.transparentType;
-    renderable.transparentSortKey = visibleRecord.transparentSortKey;
-    renderable.queueKind = visibleRecord.queueKind;
-  }
-  renderable.runtimeModelPtr = const_cast<void*>(effectiveRuntimeModelPtr);
-  renderable.modelResourcePtr = geoset->modelResourcePtr != nullptr
-                                    ? geoset->modelResourcePtr
-                                    : instanceHit &&
-                                              instanceRecord.modelResourcePtr != nullptr
-                                          ? instanceRecord.modelResourcePtr
-                                          : ownerHit ? ownerRecord.modelResourcePtr
-                                                     : shadowHit ? shadowRecord.modelResourcePtr
-                                                                 : nullptr;
-  renderable.runtimeGeosetPtr = geoset->geosetPtr;
-  renderable.runtimeGeosetDataPtr = geoset->geosetDataPtr;
-  renderable.modelKey = geoset->modelKey != 0u
-                            ? geoset->modelKey
-                            : instanceHit && instanceRecord.modelKey != 0u
-                                  ? instanceRecord.modelKey
-                                  : ownerHit && ownerRecord.modelKey != 0u
-                                        ? ownerRecord.modelKey
-                                        : shadowHit ? shadowRecord.modelKey
-                                                    : 0u;
-  renderable.flags = 0u;
-  renderable.jHandle = record.jHandle != 0u
-                           ? record.jHandle
-                           : instanceHit && instanceRecord.jHandle != 0u
-                                 ? instanceRecord.jHandle
-                                 : shadowHit ? shadowRecord.jHandle
-                                             : renderObject != nullptr
-                                                   ? renderObject->jHandle
-                                                   : 0u;
-  renderable.rawcode = record.rawcode != 0u
-                           ? record.rawcode
-                           : instanceHit && instanceRecord.rawcode != 0u
-                                 ? instanceRecord.rawcode
-                                 : shadowHit ? shadowRecord.rawcode
-                                             : renderObject != nullptr
-                                                   ? renderObject->rawcode
-                                                   : 0u;
-  renderable.unitFlags5C =
-      renderObject != nullptr ? renderObject->flags5C : 0u;
-  // In the current-draw contract `payload + 0x108` is the selector used for
-  // sceneNode->meshInfoTable. It is not a material layer index. When the
-  // visible registry does not provide a layer, default to layer 0; using the
-  // selector as a layer made first-layer cutout/alpha records read the wrong
-  // material contract and collapse to opaque.
-  renderable.layerIndex = visibleHit ? visibleRecord.layerIndex
+  {
+    auto renderableSetupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/RenderableSetup");
+    const bool renderObjectHasKind =
+        renderObject != nullptr &&
+        renderObject->kind != dxvk::war3::render::ObjectKind::Unknown;
+    renderable.worldObjectEntry =
+        record.worldObjectEntry != nullptr
+            ? record.worldObjectEntry
+            : instanceHit && instanceRecord.worldObjectEntry != nullptr
+                  ? instanceRecord.worldObjectEntry
+                  : shadowHit ? shadowRecord.worldObjectEntry
+                              : renderObject != nullptr &&
+                                        renderObject->worldObjectEntry != nullptr
+                                    ? renderObject->worldObjectEntry
+                                    : nullptr;
+    renderable.sceneNode =
+        record.sceneNode != nullptr
+            ? record.sceneNode
+            : instanceHit && instanceRecord.sceneNode != nullptr
+                  ? instanceRecord.sceneNode
+                  : shadowHit ? shadowRecord.sceneNode
+                              : renderObject != nullptr &&
+                                        renderObject->sceneNode != nullptr
+                                    ? renderObject->sceneNode
+                                    : nullptr;
+    renderable.unitPtr =
+        record.unitPtr != nullptr
+            ? record.unitPtr
+            : instanceHit && instanceRecord.unitPtr != nullptr
+                  ? instanceRecord.unitPtr
+                  : shadowHit ? shadowRecord.unitPtr
+                              : renderObject != nullptr &&
+                                        renderObject->unitPtr != nullptr
+                                    ? renderObject->unitPtr
+                                    : nullptr;
+    renderable.renderablePart = record.renderablePart;
+    renderable.payload = record.renderablePart;
+    renderable.meshData = record.meshPayloadPtr;
+    if (visibleHit) {
+      if (renderable.payload == nullptr)
+        renderable.payload = visibleRecord.payload;
+      renderable.layerState = visibleRecord.layerState;
+      renderable.transparentType = visibleRecord.transparentType;
+      renderable.transparentSortKey = visibleRecord.transparentSortKey;
+      renderable.queueKind = visibleRecord.queueKind;
+    }
+    renderable.runtimeModelPtr = const_cast<void*>(effectiveRuntimeModelPtr);
+    renderable.modelResourcePtr =
+        geoset->modelResourcePtr != nullptr
+            ? geoset->modelResourcePtr
+            : instanceHit && instanceRecord.modelResourcePtr != nullptr
+                  ? instanceRecord.modelResourcePtr
+                  : ownerHit ? ownerRecord.modelResourcePtr
+                             : shadowHit ? shadowRecord.modelResourcePtr
+                                         : nullptr;
+    renderable.runtimeGeosetPtr = geoset->geosetPtr;
+    renderable.runtimeGeosetDataPtr = geoset->geosetDataPtr;
+    renderable.modelKey =
+        geoset->modelKey != 0u
+            ? geoset->modelKey
+            : instanceHit && instanceRecord.modelKey != 0u
+                  ? instanceRecord.modelKey
+                  : ownerHit && ownerRecord.modelKey != 0u
+                        ? ownerRecord.modelKey
+                        : shadowHit ? shadowRecord.modelKey : 0u;
+    renderable.flags = 0u;
+    renderable.jHandle =
+        record.jHandle != 0u
+            ? record.jHandle
+            : instanceHit && instanceRecord.jHandle != 0u
+                  ? instanceRecord.jHandle
+                  : shadowHit ? shadowRecord.jHandle
+                              : renderObject != nullptr &&
+                                        renderObject->jHandle != 0u
+                                    ? renderObject->jHandle
+                                    : 0u;
+    renderable.rawcode =
+        record.rawcode != 0u
+            ? record.rawcode
+            : instanceHit && instanceRecord.rawcode != 0u
+                  ? instanceRecord.rawcode
+                  : shadowHit ? shadowRecord.rawcode
+                              : renderObject != nullptr &&
+                                        renderObject->rawcode != 0u
+                                    ? renderObject->rawcode
+                                    : 0u;
+    renderable.unitFlags5C =
+        renderObject != nullptr && renderObject->flags5C != 0u
+            ? renderObject->flags5C
+            : 0u;
+    // In the current-draw contract `payload + 0x108` is the selector used for
+    // sceneNode->meshInfoTable. It is not a material layer index. When the
+    // visible registry does not provide a layer, default to layer 0; using the
+    // selector as a layer made first-layer cutout/alpha records read the wrong
+    // material contract and collapse to opaque.
+    renderable.layerIndex = visibleHit ? visibleRecord.layerIndex
+                                       : record.layerIndex;
+    renderable.subIndex = visibleHit ? visibleRecord.subIndex
                                      : record.layerIndex;
-  renderable.subIndex = visibleHit ? visibleRecord.subIndex
-                                   : record.layerIndex;
-  if (!visibleHit) {
-    renderable.transparentType = 0u;
-    renderable.transparentSortKey = 0u;
-    renderable.queueKind =
-        dxvk::war3::render::VisibleRenderableQueueKind::MainQueue;
-  }
-  const uint32_t drawMeshSelector =
-      record.payloadWord108 != dxvk::war3::model::kInvalidShadowGeosetIndex
-          ? record.payloadWord108
-          : geoset->geosetIndex;
-  renderable.meshIndex =
-      visibleHit &&
-              visibleRecord.meshIndex !=
-                  dxvk::war3::render::kInvalidVisibleMeshIndex
-          ? visibleRecord.meshIndex
-          : drawMeshSelector;
-  renderable.geosetIndex = geoset->geosetIndex;
-  renderable.objectKind = record.objectKind != dxvk::war3::render::ObjectKind::Unknown
-                              ? record.objectKind
-                              : renderObject != nullptr
-                                    ? renderObject->kind
-                                    : shadowHit ? shadowRecord.kind
-                                                : dxvk::war3::render::ObjectKind::Unknown;
-  renderable.groupIdx =
-      visibleHit ? visibleRecord.identity.groupIdx
-                 : renderObject != nullptr ? int8_t(renderObject->groupIdx)
-                                           : int8_t(0);
-  renderable.frameSerial =
-      record.visibleFrameSerial != 0u ? record.visibleFrameSerial
-                                      : fallbackFrameSerial;
-  if (renderable.unitPtr != nullptr && renderable.unitFlags5C == 0u) {
-    dxvk::war3::SafeReadU32Fast(renderable.unitPtr,
-                                dxvk::war3::CUnitOffsets::Flags5C,
-                                renderable.unitFlags5C);
+    if (!visibleHit) {
+      renderable.transparentType = 0u;
+      renderable.transparentSortKey = 0u;
+      renderable.queueKind =
+          dxvk::war3::render::VisibleRenderableQueueKind::MainQueue;
+    }
+    const uint32_t drawMeshSelector =
+        record.payloadWord108 != dxvk::war3::model::kInvalidShadowGeosetIndex
+            ? record.payloadWord108
+            : geoset->geosetIndex;
+    renderable.meshIndex =
+        visibleHit &&
+                visibleRecord.meshIndex !=
+                    dxvk::war3::render::kInvalidVisibleMeshIndex
+            ? visibleRecord.meshIndex
+            : drawMeshSelector;
+    renderable.geosetIndex = geoset->geosetIndex;
+    renderable.objectKind =
+        record.objectKind != dxvk::war3::render::ObjectKind::Unknown
+            ? record.objectKind
+            : renderObjectHasKind
+                  ? renderObject->kind
+                  : shadowHit ? shadowRecord.kind
+                              : dxvk::war3::render::ObjectKind::Unknown;
+    renderable.groupIdx =
+        visibleHit ? visibleRecord.identity.groupIdx
+                   : renderObject != nullptr ? int8_t(renderObject->groupIdx)
+                                             : int8_t(0);
+    renderable.frameSerial =
+        record.visibleFrameSerial != 0u ? record.visibleFrameSerial
+                                        : fallbackFrameSerial;
+    if (renderable.unitPtr != nullptr && renderable.unitFlags5C == 0u) {
+      War3TryReadUnitFlags5CCached(renderable.unitPtr,
+                                   renderable.unitFlags5C);
+    }
   }
 
   if (sharedGeoset == nullptr)
@@ -2133,21 +2179,26 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   const auto& geo = *sharedGeoset;
 
   auto& resource = out.resource;
-  resource.resourceKeepAlive = sharedGeoset;
-  resource.modelResourcePtr = renderable.modelResourcePtr;
-  resource.modelKey = renderable.modelKey;
-  resource.geosetIndex = geo.geosetIndex;
-  resource.vertexCount = geo.vertexCount;
-  resource.primitiveRecordCount = geo.primitiveCount;
-  resource.explicitBlendCount = 0u;
-  resource.contentHash = geo.contentHash;
-  resource.topology = dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
-  resource.positions = &geo.positions;
-  resource.vertexGroupIndices = &geo.vertexGroupIndices;
-  resource.indices = &geo.indices;
-  resource.matrixGroupSizes = &geo.matrixGroupSizes;
-  resource.matrixIndices = &geo.matrixIndices;
-  War3TryAttachCurrentDrawVisibleIndexSlice(record, geo, renderable, resource);
+  {
+    auto resourceSetupScope = War3SemanticSubmitScope(
+        "War3SemanticScene/Direct/ResourceSetup");
+    resource.resourceKeepAlive = sharedGeoset;
+    resource.modelResourcePtr = renderable.modelResourcePtr;
+    resource.modelKey = renderable.modelKey;
+    resource.geosetIndex = geo.geosetIndex;
+    resource.vertexCount = geo.vertexCount;
+    resource.primitiveRecordCount = geo.primitiveCount;
+    resource.explicitBlendCount = 0u;
+    resource.contentHash = geo.contentHash;
+    resource.topology =
+        dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
+    resource.positions = &geo.positions;
+    resource.vertexGroupIndices = &geo.vertexGroupIndices;
+    resource.indices = &geo.indices;
+    resource.matrixGroupSizes = &geo.matrixGroupSizes;
+    resource.matrixIndices = &geo.matrixIndices;
+    War3TryAttachCurrentDrawVisibleIndexSlice(record, geo, renderable, resource);
+  }
   bool directExplicitBlendResolved = false;
   uint32_t directExplicitBlendMaxGroupSlot = 0u;
 
@@ -2165,14 +2216,20 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             renderable.frameSerial,
             directCurrentDrawSample);
   }
-  const bool likelySkinned =
-      record.payloadWord104 != 0u || record.payloadWordF0 != 0u ||
-      geo.hasSkinningData();
-  const bool authoritativeSkinnedRequired =
-      War3SemanticRequireAuthoritativeSkinnedRuntime() &&
-      likelySkinned &&
-      (record.objectKind == dxvk::war3::render::ObjectKind::Unit ||
-       renderable.unitPtr != nullptr);
+  bool likelySkinned = false;
+  bool authoritativeSkinnedRequired = false;
+  {
+    auto skinningDecisionScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/SkinningDecision");
+    likelySkinned =
+        record.payloadWord104 != 0u || record.payloadWordF0 != 0u ||
+        geo.hasSkinningData();
+    authoritativeSkinnedRequired =
+        War3SemanticRequireAuthoritativeSkinnedRuntime() &&
+        likelySkinned &&
+        (record.objectKind == dxvk::war3::render::ObjectKind::Unit ||
+         renderable.unitPtr != nullptr);
+  }
   // Phase 7.50 核心修复：
   //   Resolve 失败在 War3 的 8 帧 palette-slot cadence 下是正常现象
   //   （`CModel_AllocAndFillGroupPalette` 在部分帧不给 renderablePart 分配新 slot，
@@ -2230,128 +2287,143 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       return false;
     }
   }
-  if (directResolveStatus ==
-          dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
-      directCurrentDrawSample.paletteReady()) {
-    const bool directGroupSlotsReady =
-        directCurrentDrawSample.groupSlotsReady();
-    if (outDirectCurrentDrawSample != nullptr) {
-      *outDirectCurrentDrawSample = {};
-      outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
-      outDirectCurrentDrawSample->paletteCount =
-          directCurrentDrawSample.paletteCount;
-      outDirectCurrentDrawSample->paletteHash =
-          directCurrentDrawSample.paletteHash;
-      outDirectCurrentDrawSample->palette = directCurrentDrawSample.palette;
-      outDirectCurrentDrawSample->groupSlots = directCurrentDrawSample.groupSlots;
-      outDirectCurrentDrawSample->groupHash = directCurrentDrawSample.groupHash;
-      outDirectCurrentDrawSample->stableGroupHash = directCurrentDrawSample.stableGroupHash;
-      outDirectCurrentDrawSample->status = directCurrentDrawSample.status;
+  {
+    auto paletteInstallScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/PaletteInstall");
+    if (directResolveStatus ==
+            dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
+        directCurrentDrawSample.paletteReady()) {
+      const bool directGroupSlotsReady =
+          directCurrentDrawSample.groupSlotsReady();
+      if (outDirectCurrentDrawSample != nullptr) {
+        *outDirectCurrentDrawSample = {};
+        outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
+        outDirectCurrentDrawSample->paletteCount =
+            directCurrentDrawSample.paletteCount;
+        outDirectCurrentDrawSample->paletteHash =
+            directCurrentDrawSample.paletteHash;
+        outDirectCurrentDrawSample->palette = directCurrentDrawSample.palette;
+        outDirectCurrentDrawSample->groupSlots =
+            directCurrentDrawSample.groupSlots;
+        outDirectCurrentDrawSample->groupHash = directCurrentDrawSample.groupHash;
+        outDirectCurrentDrawSample->stableGroupHash =
+            directCurrentDrawSample.stableGroupHash;
+        outDirectCurrentDrawSample->status = directCurrentDrawSample.status;
+      }
+      out.runtimeGroupPalette = std::move(directCurrentDrawSample.palette);
+      out.runtimeGroupPaletteHash = directCurrentDrawSample.paletteHash;
+      out.runtimeGroupPaletteSlotIndex =
+          directCurrentDrawSample.contract.paletteSlotIndex;
+      out.runtimeGroupPaletteMinFrameTag =
+          directCurrentDrawSample.contract.frameTag;
+      out.runtimeGroupPaletteMaxFrameTag =
+          directCurrentDrawSample.contract.frameTag;
+      out.hasRuntimeGroupPalette = true;
+      if (directGroupSlotsReady) {
+        resource.ownedVertexGroupIndices =
+            std::move(directCurrentDrawSample.groupSlots);
+        resource.vertexGroupIndices = &resource.ownedVertexGroupIndices;
+      }
+    } else if (liveRebuildUsed && !liveRebuiltPalette.empty()) {
+      // Phase 7.50：Resolve 不 Ready 但 live rebuild 成功，用 fresh palette 组装。
+      // 注意 directGroupSlots 此路径拿不到，groupSlots 留给 resource 原有的
+      // geoset.vertexGroupIndices 填充。out.maxVertexGroupSlot 在函数末尾由
+      // effectiveGroupSlots 推算，不需要在这里提前写死。
+      out.runtimeGroupPalette = std::move(liveRebuiltPalette);
+      out.runtimeGroupPaletteHash = liveRebuiltHash;
+      out.runtimeGroupPaletteSlotIndex = liveRebuiltSlotIndex;
+      out.runtimeGroupPaletteMinFrameTag = liveRebuiltMinFrameTag;
+      out.runtimeGroupPaletteMaxFrameTag = liveRebuiltMaxFrameTag;
+      out.hasRuntimeGroupPalette = true;
+      if (outDirectCurrentDrawSample != nullptr) {
+        // 用 stale directCurrentDrawSample 的 contract + rebuild 后的 palette
+        // 构造一个 "fresh-palette sample" 给调用方，保留 contract/identity 信息。
+        *outDirectCurrentDrawSample = {};
+        outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
+        outDirectCurrentDrawSample->paletteCount =
+            uint32_t(out.runtimeGroupPalette.size());
+        outDirectCurrentDrawSample->paletteHash = liveRebuiltHash;
+        outDirectCurrentDrawSample->palette = out.runtimeGroupPalette;
+        outDirectCurrentDrawSample->status =
+            dxvk::war3::render::CurrentDrawResolveStatus::Ready;
+      }
+    } else if (outDirectCurrentDrawSample != nullptr) {
+      *outDirectCurrentDrawSample = std::move(directCurrentDrawSample);
     }
-    out.runtimeGroupPalette = std::move(directCurrentDrawSample.palette);
-    out.runtimeGroupPaletteHash = directCurrentDrawSample.paletteHash;
-    out.runtimeGroupPaletteSlotIndex =
-        directCurrentDrawSample.contract.paletteSlotIndex;
-    out.runtimeGroupPaletteMinFrameTag =
-        directCurrentDrawSample.contract.frameTag;
-    out.runtimeGroupPaletteMaxFrameTag =
-        directCurrentDrawSample.contract.frameTag;
-    out.hasRuntimeGroupPalette = true;
-    if (directGroupSlotsReady) {
-      resource.ownedVertexGroupIndices =
-          std::move(directCurrentDrawSample.groupSlots);
-      resource.vertexGroupIndices = &resource.ownedVertexGroupIndices;
-    }
-  } else if (liveRebuildUsed && !liveRebuiltPalette.empty()) {
-    // Phase 7.50：Resolve 不 Ready 但 live rebuild 成功，用 fresh palette 组装。
-    // 注意 directGroupSlots 此路径拿不到，groupSlots 留给 resource 原有的
-    // geoset.vertexGroupIndices 填充。out.maxVertexGroupSlot 在函数末尾由
-    // effectiveGroupSlots 推算，不需要在这里提前写死。
-    out.runtimeGroupPalette = std::move(liveRebuiltPalette);
-    out.runtimeGroupPaletteHash = liveRebuiltHash;
-    out.runtimeGroupPaletteSlotIndex = liveRebuiltSlotIndex;
-    out.runtimeGroupPaletteMinFrameTag = liveRebuiltMinFrameTag;
-    out.runtimeGroupPaletteMaxFrameTag = liveRebuiltMaxFrameTag;
-    out.hasRuntimeGroupPalette = true;
-    if (outDirectCurrentDrawSample != nullptr) {
-      // 用 stale directCurrentDrawSample 的 contract + rebuild 后的 palette
-      // 构造一个 "fresh-palette sample" 给调用方，保留 contract/identity 信息。
-      *outDirectCurrentDrawSample = {};
-      outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
-      outDirectCurrentDrawSample->paletteCount =
-          uint32_t(out.runtimeGroupPalette.size());
-      outDirectCurrentDrawSample->paletteHash = liveRebuiltHash;
-      outDirectCurrentDrawSample->palette = out.runtimeGroupPalette;
-      outDirectCurrentDrawSample->status =
-          dxvk::war3::render::CurrentDrawResolveStatus::Ready;
-    }
-  } else if (outDirectCurrentDrawSample != nullptr) {
-    *outDirectCurrentDrawSample = std::move(directCurrentDrawSample);
   }
 
   auto& pose = out.pose;
-  if (poseHit) {
-    pose.runtimeModelPtr =
-        poseRecord.runtimeModelPtr != nullptr ? poseRecord.runtimeModelPtr
-                                              : const_cast<void*>(effectiveRuntimeModelPtr);
-    pose.sceneNode = poseRecord.sceneNode;
-    pose.unitPtr = poseRecord.unitPtr;
-    pose.matrixCount = poseRecord.matrixCount;
-    pose.matrixHash = poseRecord.matrixHash;
-    pose.matrixPalette = std::move(poseRecord.matrixPalette);
-    pose.hasWorldTransform = poseRecord.hasWorldTransform;
-    if (poseRecord.hasWorldTransform)
-      pose.worldTransform = poseRecord.worldTransform;
-    pose.frameSerial = renderable.frameSerial;
+  {
+    auto poseInstallScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/PoseInstall");
+    if (poseHit) {
+      pose.runtimeModelPtr =
+          poseRecord.runtimeModelPtr != nullptr
+              ? poseRecord.runtimeModelPtr
+              : const_cast<void*>(effectiveRuntimeModelPtr);
+      pose.sceneNode = poseRecord.sceneNode;
+      pose.unitPtr = poseRecord.unitPtr;
+      pose.matrixCount = poseRecord.matrixCount;
+      pose.matrixHash = poseRecord.matrixHash;
+      pose.matrixPalette = std::move(poseRecord.matrixPalette);
+      pose.hasWorldTransform = poseRecord.hasWorldTransform;
+      if (poseRecord.hasWorldTransform)
+        pose.worldTransform = poseRecord.worldTransform;
+      pose.frameSerial = renderable.frameSerial;
+    }
   }
 
-  if (War3SemanticDirectExplicitBlendResolveRuntime() && likelySkinned &&
-      directResolveStatus ==
-          dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
-      out.hasRuntimeGroupPalette && !out.runtimeGroupPalette.empty()) {
-    dxvk::war3::shadow::ShadowPoseRecord explicitPose = pose;
-    explicitPose.matrixPalette = out.runtimeGroupPalette;
-    explicitPose.matrixCount = uint32_t(out.runtimeGroupPalette.size());
-    explicitPose.matrixHash = out.runtimeGroupPaletteHash;
-    explicitPose.runtimeModelPtr =
-        renderable.runtimeModelPtr != nullptr ? renderable.runtimeModelPtr
-                                              : pose.runtimeModelPtr;
-    explicitPose.sceneNode =
-        renderable.sceneNode != nullptr ? renderable.sceneNode : pose.sceneNode;
-    explicitPose.unitPtr =
-        renderable.unitPtr != nullptr ? renderable.unitPtr : pose.unitPtr;
-    explicitPose.frameSerial = renderable.frameSerial;
+  {
+    auto explicitBlendScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/ExplicitBlendResolve");
+    if (War3SemanticDirectExplicitBlendResolveRuntime() && likelySkinned &&
+        directResolveStatus ==
+            dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
+        out.hasRuntimeGroupPalette && !out.runtimeGroupPalette.empty()) {
+      dxvk::war3::shadow::ShadowPoseRecord explicitPose = pose;
+      explicitPose.matrixPalette = out.runtimeGroupPalette;
+      explicitPose.matrixCount = uint32_t(out.runtimeGroupPalette.size());
+      explicitPose.matrixHash = out.runtimeGroupPaletteHash;
+      explicitPose.runtimeModelPtr =
+          renderable.runtimeModelPtr != nullptr ? renderable.runtimeModelPtr
+                                                : pose.runtimeModelPtr;
+      explicitPose.sceneNode =
+          renderable.sceneNode != nullptr ? renderable.sceneNode : pose.sceneNode;
+      explicitPose.unitPtr =
+          renderable.unitPtr != nullptr ? renderable.unitPtr : pose.unitPtr;
+      explicitPose.frameSerial = renderable.frameSerial;
 
-    uint32_t maxExpectedGroupSize = 0u;
-    for (uint32_t groupSize : geo.matrixGroupSizes)
-      maxExpectedGroupSize = std::max(maxExpectedGroupSize, groupSize);
+      uint32_t maxExpectedGroupSize = 0u;
+      for (uint32_t groupSize : geo.matrixGroupSizes)
+        maxExpectedGroupSize = std::max(maxExpectedGroupSize, groupSize);
 
-    dxvk::war3::shadow::ShadowExplicitBlendSkinningResult explicitBlend = {};
-    const uint32_t explicitVertexCount =
-        resource.vertexCount != 0u
-            ? resource.vertexCount
-            : uint32_t(resource.positionVec().size() / 3u);
-    const uint32_t explicitPaletteLimit =
-        std::min<uint32_t>(uint32_t(explicitPose.matrixPalette.size()), 256u);
-    if (explicitVertexCount != 0u && explicitPaletteLimit != 0u &&
-        dxvk::war3::shadow::TryResolveExplicitBlendSkinningForRenderable(
-            renderable, explicitVertexCount, explicitPaletteLimit,
-            maxExpectedGroupSize, explicitPose, explicitBlend, nullptr)) {
-      resource.ownedVertexBlendWeights = std::move(explicitBlend.weights);
-      resource.vertexBlendWeights = &resource.ownedVertexBlendWeights;
-      resource.ownedVertexBlendIndices = std::move(explicitBlend.indices);
-      resource.vertexBlendIndices = &resource.ownedVertexBlendIndices;
-      resource.explicitBlendCount = explicitBlend.blendCount;
-      resource.contentHash =
-          bit::fnv1a_iter(resource.contentHash, explicitBlend.dynamicHash);
-      if (!explicitBlend.runtimeGroupPalette.empty()) {
-        out.runtimeGroupPalette = std::move(explicitBlend.runtimeGroupPalette);
-        out.runtimeGroupPaletteHash = War3SemanticHashMatrixPalette(
-            out.runtimeGroupPalette.data(),
-            uint32_t(out.runtimeGroupPalette.size()));
+      dxvk::war3::shadow::ShadowExplicitBlendSkinningResult explicitBlend = {};
+      const uint32_t explicitVertexCount =
+          resource.vertexCount != 0u
+              ? resource.vertexCount
+              : uint32_t(resource.positionVec().size() / 3u);
+      const uint32_t explicitPaletteLimit =
+          std::min<uint32_t>(uint32_t(explicitPose.matrixPalette.size()), 256u);
+      if (explicitVertexCount != 0u && explicitPaletteLimit != 0u &&
+          dxvk::war3::shadow::TryResolveExplicitBlendSkinningForRenderable(
+              renderable, explicitVertexCount, explicitPaletteLimit,
+              maxExpectedGroupSize, explicitPose, explicitBlend, nullptr)) {
+        resource.ownedVertexBlendWeights = std::move(explicitBlend.weights);
+        resource.vertexBlendWeights = &resource.ownedVertexBlendWeights;
+        resource.ownedVertexBlendIndices = std::move(explicitBlend.indices);
+        resource.vertexBlendIndices = &resource.ownedVertexBlendIndices;
+        resource.explicitBlendCount = explicitBlend.blendCount;
+        resource.contentHash =
+            bit::fnv1a_iter(resource.contentHash, explicitBlend.dynamicHash);
+        if (!explicitBlend.runtimeGroupPalette.empty()) {
+          out.runtimeGroupPalette = std::move(explicitBlend.runtimeGroupPalette);
+          out.runtimeGroupPaletteHash = War3SemanticHashMatrixPalette(
+              out.runtimeGroupPalette.data(),
+              uint32_t(out.runtimeGroupPalette.size()));
+        }
+        directExplicitBlendResolved = true;
+        directExplicitBlendMaxGroupSlot = explicitBlend.maxGroupSlot;
       }
-      directExplicitBlendResolved = true;
-      directExplicitBlendMaxGroupSlot = explicitBlend.maxGroupSlot;
     }
   }
 
@@ -2361,27 +2433,36 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     out.material = War3BuildShadowMaterialSignatureCached(renderable);
   }
 
-  const bool looksSkinned =
-      directResolveStatus ==
-          dxvk::war3::render::CurrentDrawResolveStatus::Ready ||
-      likelySkinned;
-  out.path = looksSkinned ? dxvk::war3::shadow::ShadowDrawPath::Skinned
-                          : dxvk::war3::shadow::ShadowDrawPath::Rigid;
-  out.usesDynamicMeshPositions = false;
-  if (!out.hasRuntimeGroupPalette && !authoritativeSkinnedRequired)
-    out.hasRuntimeGroupPalette =
-        pose.matrixCount != 0u && !pose.matrixPalette.empty();
-  out.matrixGroupsUseAveraging =
-      directExplicitBlendResolved ? false : !geo.matrixGroupSizes.empty();
-  uint32_t maxSlot = 0u;
-  const auto& effectiveGroupSlots =
-      !resource.ownedVertexGroupIndices.empty() ? resource.ownedVertexGroupIndices
-                                                : geo.vertexGroupIndices;
-  for (uint8_t slot : effectiveGroupSlots)
-    maxSlot = std::max(maxSlot, uint32_t(slot));
-  if (directExplicitBlendResolved)
-    maxSlot = std::max(maxSlot, directExplicitBlendMaxGroupSlot);
-  out.maxVertexGroupSlot = maxSlot;
+  {
+    auto pathFinalizeScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/PathFinalize");
+    const bool looksSkinned =
+        directResolveStatus ==
+            dxvk::war3::render::CurrentDrawResolveStatus::Ready ||
+        likelySkinned;
+    out.path = looksSkinned ? dxvk::war3::shadow::ShadowDrawPath::Skinned
+                            : dxvk::war3::shadow::ShadowDrawPath::Rigid;
+    out.usesDynamicMeshPositions = false;
+    if (!out.hasRuntimeGroupPalette && !authoritativeSkinnedRequired)
+      out.hasRuntimeGroupPalette =
+          pose.matrixCount != 0u && !pose.matrixPalette.empty();
+    out.matrixGroupsUseAveraging =
+        directExplicitBlendResolved ? false : !geo.matrixGroupSizes.empty();
+  }
+  {
+    auto maxSlotScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/MaxGroupSlotScan");
+    uint32_t maxSlot = 0u;
+    const auto& effectiveGroupSlots =
+        !resource.ownedVertexGroupIndices.empty()
+            ? resource.ownedVertexGroupIndices
+            : geo.vertexGroupIndices;
+    for (uint8_t slot : effectiveGroupSlots)
+      maxSlot = std::max(maxSlot, uint32_t(slot));
+    if (directExplicitBlendResolved)
+      maxSlot = std::max(maxSlot, directExplicitBlendMaxGroupSlot);
+    out.maxVertexGroupSlot = maxSlot;
+  }
   if (out.runtimeGroupPaletteHash == 0u && !authoritativeSkinnedRequired) {
     out.runtimeGroupPaletteHash = pose.matrixHash;
     out.runtimeGroupPalette = pose.matrixPalette;
