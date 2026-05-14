@@ -3865,3 +3865,215 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
        `war3_perf_report_auto_2026_05_14_21_20_28.html` 受双 War3 进程污染，
        不作为结论；
      - 这轮收益很小，但方向安全：减少重复排序，不碰数据层。
+
+
+112. **Phase 7.67 semantic path-blocker filter + tree-shadow TAA stabilization（2026-05-14 23:40）**:
+   - **目标**：
+     - 保持长期 semantic draw-time 主线，不恢复 legacy route；
+     - 恢复 Warcraft III LOS/path blocker 的阴影屏蔽能力，避免 `YTab/YTac/YTpb/YTpc/YTfb/YTfc/YTlb/YTlc`
+       这类不可见路径阻断器在增强阴影里变成小方块；
+     - 降低树木 alpha-test 阴影的细碎抖动，同时不牺牲 Pose/AlphaTest 正确性。
+   - **代码改动**：
+     - `src/d3d9/d3d9_device.cpp`
+       - 新增 `War3ShadowIsLosBlocker(...)` overload，统一走现有
+         `IsLosBlockerFourCc()` / 第二字符大小写归一化；
+       - 在 semantic draw-time producer、current-draw grouped 两阶段、
+         direct draw-time fast append、static direct supplement、以及早期
+         semantic capture 分支加入 path-blocker reject；
+       - `War3DrawTimeVBEntry` 记录 `rawcode/jHandle/objectKind`，让 draw-time
+         VB cache 命中后也能继续识别 path blocker。
+     - `src/d3d9/d3d9_war3_scene.h` 与
+       `src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp`
+       - 新增并导出 `semanticSceneRejectedPathBlockerCount`，用于 full trace
+         直接确认过滤是否在语义阴影路径内生效。
+     - `subprojects/war3fx/shaders/war3_shadow_caster_frag.frag`
+       - alpha-test hash 不再使用 ShadowMap 像素 / palette offset 作为噪声锚点；
+       - dither 改为绑定 alpha 贴图 texel，使树叶遮罩的随机模板跟着纹理图案走，
+         避免 CSM / camera 微动时模板在叶片上滑动；
+       - 缩窄 hash 过渡带，减少树叶边缘的随机覆盖面积。
+     - `subprojects/war3fx/shaders/war3_shadow_visibility.frag`
+       - TAA current-visibility prepass 回到稳定 4 tap，树叶稳定性主要交给
+         texture-anchored caster dither + receiver history；
+     - `subprojects/war3fx/shaders/war3_shadow_receiver.frag`
+       - history 采样使用连续 UV；
+       - motion-adaptive 新帧权重从较激进的 `0.18 / mv*12` 收敛到
+         `0.12 / mv*8`，让树影 history 更愿意积累。
+   - **黑匣子验收**：
+     - trace：
+       `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_14_23_39_47.jsonl`
+     - `_phase756_drawtime_producer.py`：
+       - `submitted=0` = `0 / 166`
+       - producer visible candidates ≈ `94.8 / frame`
+       - producer fresh entries ≈ `22.5 / frame`
+       - producer submitted ≈ `22.5 / frame`
+       - producer miss-no-fresh = `0.0 / frame`
+       - producer fallback to current-draw = `0 / 166`
+     - TAA / receiver trace：
+       - `semanticSceneShadowTaaMode`: 首帧 current-only，随后 tail 全为 `2`
+       - `semanticSceneShadowReceiverSampleSource`: tail 全为 `3`
+       - `semanticSceneShadowHistoryValidAfter`: `166 / 166`
+       - `semanticSceneReceiverDrawExecutedThisFrame`: `166 / 166`
+       - `semanticSceneShadowVisibilityExecutedThisFrame`: `166 / 166`
+       - `semanticSceneShadowMapRenderSerial`: tail `157..166` 连续推进
+     - path blocker：
+       - `semanticSceneRejectedPathBlockerCount` 最大值 `15`
+       - tail 为稳定的 `4`，证明测试图里已经有阻断器被 semantic shadow 路径过滤。
+   - **性能记录**：
+     - 当前 23:30 之后的 AutoTest perf 样本不作为代码性能结论：
+       - full profile、`shadow.taa` disabled、`aa` disabled、甚至 `shadow`
+         disabled 都只有约 `12-14 FPS`；
+       - 这说明本轮 perf 环境 / War3 runtime 状态已被污染，不能用来裁决
+         TAA/path-blocker 改动；
+       - 最近仍可信的性能基线是 Phase 7.66 的
+         `war3_perf_report_auto_2026_05_14_21_22_54.html`（`110.777 FPS`）
+         和本轮早些时候的
+         `war3_perf_report_auto_2026_05_14_23_20_48.html`（`88.384 FPS`）。
+   - **结论**：
+     - path blocker 屏蔽已经接入长期 semantic 路线，不依赖 legacy；
+     - 树影 TAA 的主要抖动源从“ShadowMap 像素模板滑动”改为“纹理遮罩稳定模板”，
+       理论上更适合配合 receiver history 收敛；
+     - 后续若用户视觉仍看到树影抖动，优先比较同一视角下 alpha-hash
+       贴图锚定前后的录屏，不应再回到 Pose/producer 数据层乱改。
+
+
+113. **Phase 7.68 CSM quality baseline + deterministic alpha shadow（2026-05-15 01:05）**:
+   - **用户反馈**：
+     - Phase 7.67 后树木阴影边缘仍严重抖动；
+     - 只有压低视角、让近级联实际吃到高分辨率时，树叶缝隙才勉强清楚；
+     - 手动降低 shadow resolution 对 FPS 提升很小，说明当前视觉问题不能继续靠
+       2048 自适应降级换性能。
+   - **legacy / 当前差异复核**：
+     - 旧 `b193367` 基线请求 `4096` shadow map，未发现当前
+       `ResolveAdaptiveShadowResolution` 这类把 4096 静默降到 2048 的路径；
+     - 旧 shadow map prepare 只对 `draw.alphaTestEnabled` 做 alpha-test；
+     - 当前长期 semantic 路线为了修实心方块，已经把 `alphaBlend + diffuse + UV`
+       物体 promote 成 alpha shadow，这对树叶是正确方向，但若再走 hashed
+       fractional coverage + mip sampler，就会在 CSM/TAA 后表现为树影噪声和糊边。
+   - **代码改动**：
+     - `src/d3d9/war3/core/war3_internal_test_config.h`
+       - `kShadowAdaptiveResolutionEnabled=false`；
+       - 默认保留用户请求的 `4096`，不再因 replay geometry work 自动降到 `2048`。
+     - `src/d3d9/d3d9_war3_settings.h`
+       - `alphaShadowHashed=false`；
+       - `alphaShadowUseMip=false`；
+       - `alphaShadowMipLodBias=0.0f`；
+       - 树叶 / 栅栏等 alpha cutout 默认走确定性 hard cutoff，避免 dither 模板或 mip
+         采样把叶片缝隙打散。
+     - `src/d3d9/d3d9_war3_pipeline.cpp`
+       - 新增环境变量便于 A/B：
+         `DXVK_WAR3_SHADOW_ALPHA_HASH`、
+         `DXVK_WAR3_SHADOW_ALPHA_MIP`、
+         `DXVK_WAR3_SHADOW_ALPHA_MIP_BIAS`。
+   - **验证**：
+     - `ninja -C build32` 通过；
+     - 部署 DLL：
+       `E:\Work\War3\d3d9.dll = 26759116 bytes @ 2026-05-15 00:58:26`；
+     - AutoTest：
+       `py AutoTest\_phase755_v4_quick.py` 通过，报告：
+       `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_05_15_00_59_11.html`
+       - `avgFps = 79.316`
+       - `avgGpuTimeMs = 2.087`
+       - `shadowReceiverAdaptiveResolutionFrames = 0`
+       - requested/effective resolution = `4096 / 4096`
+       - `ShadowMap ≈ 0.288ms CPU / 0.352ms GPU`
+       - `Shadow/Main ≈ 0.452ms CPU / 0.912ms GPU`
+     - 黑匣子：
+       `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_15_00_58_49.jsonl`
+       - `_phase756_drawtime_producer.py`：
+         `submitted=0 = 0 / 1001`；
+         producer fallback to current-draw = `0 / 1001`；
+       - TAA / receiver：
+         `shadowTaaMode` tail 全为 `2`；
+         `shadowReceiverSampleSource` tail 全为 `3`；
+         `shadowHistoryValidAfter = 1001 / 1001`；
+         `receiverDrawExecutedThisFrame = 1001 / 1001`；
+         `shadowVisibilityExecutedThisFrame = 1001 / 1001`；
+         `shadowMapRenderSerial = 1..1001` 连续，无 gap；
+       - path blocker：
+         `semanticSceneRejectedPathBlockerCount` tail 稳定为 `4`，最大 `36`。
+   - **结论 / 风险**：
+     - 这轮不触碰 Pose、draw-time producer、VB cache、path-blocker 过滤或 legacy；
+     - 视觉上应显著改善树叶 cutout 清晰度和 dither 抖动；
+     - 风险是 promoted alpha-blend foliage 现在用硬阈值，个别半透明特效的阴影可能变硬；
+       若用户视觉确认过硬，再用新增 env 精确 A/B，而不是回到全局 hashed 默认。
+
+
+114. **Phase 7.69 数据层性能账本 + indexed range 修复（2026-05-15 02:15）**:
+   - **用户校正的基线定义**：
+     - `legacy` 指旧 VB/IB intercept 阴影路线，不是“落后路线”；
+     - 它目前仍是视觉稳定性和性能的追赶基准，semantic 路线不能用指标自夸替代视觉事实；
+     - 本轮目标改为先把所有性能大块记录清楚，再攻击最大块，且不能让 Pose/AlphaTest/path-blocker 回退。
+   - **新增性能账本**：
+     - `War3ShadowCaptureStats` / full trace `keyStats` 增加 draw-time VB cache 成本：
+       - position/UV/index copy count、bytes、alloc count；
+       - indexed unknown-range fallback；
+       - unit/building/destructible/effect/other capture；
+       - alpha-test/alpha-blend/diffuse texture capture。
+     - shadow map 侧增加 prepare/replay 分类：
+       - prepared draw、alpha-test prepared、alpha-promoted prepared；
+       - dynamic/static/other prepared；
+       - cascade 0..3 drawn / culled。
+   - **第一个确定大块与修复**：
+     - 账本揭示旧逻辑每帧 `drawTimeVBCachePositionCopyBytes ≈ 62,914,560`
+       bytes（约 63MB/frame），而 `IndexCopyBytes ≈ 71,898`；
+     - 根因是 `War3TryCaptureShadowCasterDrawIndexed()` 丢弃了
+       `MinVertexIndex/NumVertices`，传入 `0,0`，使 capture 走 unknown indexed
+       range fallback，按巨大完整 VB slice 复制；
+     - 修复：`War3TryCaptureShadowCasterDrawIndexed` 签名与
+       `DrawIndexedPrimitive` / `DrawIndexedPrimitiveUP` caller 贯通
+       `MinVertexIndex, NumVertices`。
+   - **修复后黑匣子结果**：
+     - trace：
+       `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_05_15_02_13_00.jsonl`
+     - `frames = 961`；`shadowMapExecuted = 961 / 961`；`receiverReuse = 0`；
+     - `drawTimeVBCachePositionCopyCount ≈ 119.66 / frame`；
+     - `drawTimeVBCachePositionCopyBytes ≈ 504,814 / frame`；
+     - `drawTimeVBCacheIndexCopyBytes ≈ 66,080 / frame`；
+     - `drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0`；
+     - `drawTimeSemanticProducerVisibleCandidateCount ≈ 93.37 / frame`；
+     - `drawTimeSemanticProducerSubmittedCount ≈ 20.37 / frame`；
+     - `drawTimeSemanticProducerMissNoFreshEntryCount = 0`；
+     - `drawTimeSemanticProducerFallbackCurrentDrawCount = 0`；
+     - `semanticSceneShadowMapPreparedDrawCount ≈ 96.76 / frame`；
+     - per-cascade drawn 仍为 `96.76 / 96.76 / 96.76 / 96.76`，
+       cull 全为 0，说明级联重放仍是下一块可攻性能面；
+     - `semanticSceneShadowTaaMode` tail 已稳定为 2，
+       `shadowReceiverSampleSource` tail 稳定为 3，history 全程 valid。
+   - **性能报告**：
+     - `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_05_15_02_13_22.html`
+       - `avgFps = 78.091`；
+       - `avgFrameTimeMs = 12.806`；
+       - `avgGpuTimeMs = 2.057`；
+       - `avgProcessCpuMs = 11.767`；
+       - `War3SemanticScene/Populate ≈ 0.989ms CPU`；
+       - `Shadow/Main ≈ 0.518ms CPU / 0.895ms GPU`；
+       - `ShadowMap ≈ 0.323ms CPU / 0.351ms GPU`；
+       - `Shadow/Visibility ≈ 0.012ms CPU / 0.194ms GPU`；
+       - `ShadowCopy ≈ 0.014ms CPU / 0.107ms GPU`；
+       - 仍有 `Semantic/OutsideMainLoop/Tracked ≈ 4.626ms CPU` 未细分，
+         大概率包含 draw-time producer/capture hook 与其它非 main-loop 采样。
+   - **安全修复**：
+     - `d3d9_war3_shadow_outline.cpp` 中内置 outline pipeline 的 vertex attribute
+       数组从 3 扩到 4；
+     - 原因：alpha-test + skinned outline 最多会写 position / blend weight /
+       blend index / UV 四个 attribute，原数组会栈越界；
+     - 修复后连续 AutoTest 没有生成新的 crash dump，最近 crash 仍停在
+       `2026-05-15 01:56:44`。
+   - **失败优化记录，禁止直接重试**：
+     - 曾尝试只对 unit-like draw 做 draw-time VB copy，跳过 building/destructible/other；
+     - 结果：copy bytes 下降，但 `drawTimeSemanticProducerSubmittedCount`
+       从约 `20/frame` 降到约 `6.8/frame`，
+       `War3SemanticScene/Populate` 从约 `1.0ms` 飙到约 `7.35ms`，
+       FPS 跌到约 `49.6`；
+     - 结论：当前 draw-time cache 不只是“多余 copy”，它也是 producer 稳定性的入口。
+       不要再简单按 object kind 跳过 capture。后续要优化 copy 次数，必须先设计
+       “保 producer 身份/新鲜度，但合并 copy command 或复用 range”的方案。
+   - **下一步性能路线**：
+     - 最大明确收益已完成：63MB/frame → 0.50MB/frame；
+     - 下一块不应再砍 producer，而应：
+       1. 继续细分 `OutsideMainLoop/Tracked`，确认 draw-time hook 自身 CPU 分布；
+       2. 研究 draw-time VB/IB copy command 合批或 range reuse，目标是降低
+          `~120 copy commands/frame`；
+       3. 研究 CSM cascade cull / per-cascade replay，因为当前 4 个 cascade 几乎画同一批 caster；
+       4. 在任何优化前后都用 full trace 验证 producer submitted/fresh/miss 与
+          shadow map executed/history valid，避免视觉正确性开倒车。

@@ -204,6 +204,20 @@ float sampleShadowFast4(uint cascadeIndex, vec2 uv, float refDepth) {
   return sum * 0.25;
 }
 
+float sampleShadowCross5(uint cascadeIndex, vec2 uv, float refDepth, float radiusTexel) {
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+    return 1.0;
+
+  float invRes = ubo.u_params.z;
+  float radius = max(radiusTexel, 0.75) * invRes;
+  float sum = shadowCompare(cascadeIndex, uv, refDepth);
+  sum += shadowCompare(cascadeIndex, uv + vec2( radius, 0.0), refDepth);
+  sum += shadowCompare(cascadeIndex, uv + vec2(-radius, 0.0), refDepth);
+  sum += shadowCompare(cascadeIndex, uv + vec2(0.0,  radius), refDepth);
+  sum += shadowCompare(cascadeIndex, uv + vec2(0.0, -radius), refDepth);
+  return sum * 0.2;
+}
+
 vec3 computeViewNormal(vec3 viewPos) {
   // Use derivatives for stable slope estimation on steep walls and props.
   vec3 dX = dFdx(viewPos);
@@ -305,7 +319,8 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra, v
   if (stableWallPath)
     return sampleShadowStableWall(uint(c0), uv0, ref0, radius0);
 
-  // TAA pre-pass: use fast 4-tap PCF on regular receivers.
+  // TAA pre-pass: keep current visibility cheap and deterministic. Alpha-test
+  // foliage stability is handled by texture-anchored caster dither plus history.
   return sampleShadowFast4(uint(c0), uv0, ref0);
 }
 

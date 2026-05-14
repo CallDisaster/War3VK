@@ -385,11 +385,34 @@ namespace dxvk {
         uint32_t drawTimeVBCacheRejectInsufficientLength = 0;
         uint32_t drawTimeVBCacheRejectNoBuffer = 0;
         uint32_t drawTimeVBCacheTotalEntered = 0;
+        // Phase 7.69：draw-time GPU copy 成本账本。semantic 路线为了 Pose 正确
+        // 每帧冻结 War3 当帧 VB/IB slice；这里记录 copy 命令数、字节数和 buffer
+        // reallocation，以便和 legacy VB/IB intercept 基线对账。
+        uint32_t drawTimeVBCachePositionCopyCount = 0;
+        uint64_t drawTimeVBCachePositionCopyBytes = 0;
+        uint32_t drawTimeVBCachePositionAllocCount = 0;
+        uint32_t drawTimeVBCacheUvCopyCount = 0;
+        uint64_t drawTimeVBCacheUvCopyBytes = 0;
+        uint32_t drawTimeVBCacheUvSharedPositionCount = 0;
+        uint32_t drawTimeVBCacheUvAllocCount = 0;
+        uint32_t drawTimeVBCacheIndexCopyCount = 0;
+        uint64_t drawTimeVBCacheIndexCopyBytes = 0;
+        uint32_t drawTimeVBCacheIndexAllocCount = 0;
+        uint32_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
+        uint32_t drawTimeVBCacheUnitCaptureCount = 0;
+        uint32_t drawTimeVBCacheBuildingCaptureCount = 0;
+        uint32_t drawTimeVBCacheDestructibleCaptureCount = 0;
+        uint32_t drawTimeVBCacheEffectCaptureCount = 0;
+        uint32_t drawTimeVBCacheOtherKindCaptureCount = 0;
+        uint32_t drawTimeVBCacheAlphaTestStateCaptureCount = 0;
+        uint32_t drawTimeVBCacheAlphaBlendStateCaptureCount = 0;
+        uint32_t drawTimeVBCacheDiffuseTextureCaptureCount = 0;
         uint32_t drawTimeSemanticProducerVisibleCandidateCount = 0;
         uint32_t drawTimeSemanticProducerFreshEntryCount = 0;
         uint32_t drawTimeSemanticProducerSubmittedCount = 0;
         uint32_t drawTimeSemanticProducerMissNoFreshEntryCount = 0;
         uint32_t drawTimeSemanticProducerFallbackCurrentDrawCount = 0;
+        uint32_t semanticSceneRejectedPathBlockerCount = 0;
         uint32_t semanticSceneDirectDrawTimePrebuildBypassAttemptCount = 0;
         uint32_t semanticSceneDirectDrawTimePrebuildBypassHitCount = 0;
         uint32_t semanticSceneSubmittedPaletteMotionSampleCount = 0;
@@ -710,6 +733,20 @@ namespace dxvk {
         uint32_t semanticSceneReplayDrawsCount = 0;                   // replayDraws count 本帧
         uint32_t semanticSceneShadowMapDrawnCasters = 0;              // renderShadowMap 实际 draw 调用数
         uint32_t semanticSceneShadowMapCascadeCulledCount = 0;        // cascade cull 跳过数
+        uint32_t semanticSceneShadowMapPreparedDrawCount = 0;         // 有效 prepared draw 数（排序/级联重放输入）
+        uint32_t semanticSceneShadowMapAlphaTestPreparedCount = 0;    // prepare 后会执行 alpha discard 的 draw 数
+        uint32_t semanticSceneShadowMapAlphaPromotedPreparedCount = 0; // alphaBlend+UV+diffuse promote 成 alpha shadow 的 draw 数
+        uint32_t semanticSceneShadowMapDynamicPreparedCount = 0;      // Unit/Effect/skinned prepared draw 数
+        uint32_t semanticSceneShadowMapStaticPreparedCount = 0;       // Building/Destructible/Terrain prepared draw 数
+        uint32_t semanticSceneShadowMapOtherPreparedCount = 0;        // 其他分类 prepared draw 数
+        uint32_t semanticSceneShadowMapCascade0DrawnCount = 0;
+        uint32_t semanticSceneShadowMapCascade1DrawnCount = 0;
+        uint32_t semanticSceneShadowMapCascade2DrawnCount = 0;
+        uint32_t semanticSceneShadowMapCascade3DrawnCount = 0;
+        uint32_t semanticSceneShadowMapCascade0CulledCount = 0;
+        uint32_t semanticSceneShadowMapCascade1CulledCount = 0;
+        uint32_t semanticSceneShadowMapCascade2CulledCount = 0;
+        uint32_t semanticSceneShadowMapCascade3CulledCount = 0;
         uint32_t semanticSceneShadowMapSkinnedCasterCount = 0;        // replay 中的 skinned caster 数
         uint32_t semanticSceneShadowMapSkinnedPreparedCount = 0;      // 实际 prepared 的 skinned 数
         uint32_t semanticSceneShadowMapSkinnedInvalidBufferCount = 0; // skinned replay 因 buffer 无效被拒绝

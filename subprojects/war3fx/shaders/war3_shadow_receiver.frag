@@ -755,11 +755,11 @@ void main() {
           pix,
           0).xy;
 
-        // 运动自适应混合：当运动向量较大时，提高新帧权重以加快收敛
-        // 典型相机俯仰变化时 mv 幅度约 0.01~0.05，阈值 0.005 开始增加权重
+        // 运动自适应混合：阴影历史比颜色历史更需要稳定。相机移动时可以
+        // 提高新帧权重，但上限保持偏低，避免树影 alpha/hash 噪声重新显形。
         float mvLen = length(mv);
-        float motionScale = clamp(mvLen * 20.0, 0.0, 1.0); // 0.05 -> 1.0
-        float adaptiveBlend = mix(blend, max(blend, 0.3), motionScale);
+        float motionScale = clamp(mvLen * 8.0, 0.0, 1.0);
+        float adaptiveBlend = mix(blend, max(blend, 0.12), motionScale);
 
         // historyUv = uv - mv（mv = curr - prev）
         vec2 historyUv = uvVp - mv;
@@ -773,10 +773,14 @@ void main() {
 
         float histVis = currVis;
         if (validHistory) {
-          histVis = texelFetch(
+          vec2 historyTexSize = vec2(textureSize(
             sampler2D(s_shadowHistory, s_samplers[nonuniformEXT(p_colorSampler)]),
-            histPix,
-            0).r;
+            0));
+          vec2 historyTexUv =
+            (histPixF + vec2(0.5)) / max(historyTexSize, vec2(1.0));
+          histVis = texture(
+            sampler2D(s_shadowHistory, s_samplers[nonuniformEXT(p_colorSampler)]),
+            historyTexUv).r;
 
           // 邻域夹紧：使用十字形采样（5 点）代替 3x3（9 点）以节省性能
           if (clampEnabled) {

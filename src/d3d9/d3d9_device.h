@@ -1263,6 +1263,8 @@ private:
   // draw（Terrain/Units/Buildings/Destructibles）
   void War3TryCaptureShadowCasterDrawIndexed(D3DPRIMITIVETYPE PrimitiveType,
                                              INT BaseVertexIndex,
+                                             UINT MinVertexIndex,
+                                             UINT NumVertices,
                                              UINT StartIndex, UINT IndexCount,
                                              bool DynamicSysmemVBOs,
                                              bool DynamicSysmemIBO);
@@ -2032,6 +2034,10 @@ private:
     VkDeviceSize indexCapacity = 0u;
     uint64_t frameSerial = 0u;
     uint64_t submittedFrameSerial = 0u;
+    uint32_t rawcode = 0u;
+    uint32_t jHandle = 0u;
+    war3::render::ObjectKind objectKind =
+        static_cast<war3::render::ObjectKind>(0);
   };
   std::unordered_map<void*, War3DrawTimeVBEntry> m_war3DrawTimeVBCache;
   uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;

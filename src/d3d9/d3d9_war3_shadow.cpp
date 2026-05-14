@@ -1485,6 +1485,20 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
   reconciliation.shadowMapDrawnCasters = 0u;
   reconciliation.cascadeCulledCount = 0u;
+  reconciliation.shadowMapPreparedDrawCount = 0u;
+  reconciliation.shadowMapAlphaTestPreparedCount = 0u;
+  reconciliation.shadowMapAlphaPromotedPreparedCount = 0u;
+  reconciliation.shadowMapDynamicPreparedCount = 0u;
+  reconciliation.shadowMapStaticPreparedCount = 0u;
+  reconciliation.shadowMapOtherPreparedCount = 0u;
+  reconciliation.shadowMapCascade0DrawnCount = 0u;
+  reconciliation.shadowMapCascade1DrawnCount = 0u;
+  reconciliation.shadowMapCascade2DrawnCount = 0u;
+  reconciliation.shadowMapCascade3DrawnCount = 0u;
+  reconciliation.shadowMapCascade0CulledCount = 0u;
+  reconciliation.shadowMapCascade1CulledCount = 0u;
+  reconciliation.shadowMapCascade2CulledCount = 0u;
+  reconciliation.shadowMapCascade3CulledCount = 0u;
   reconciliation.skinnedCasterCount = 0u;
   reconciliation.skinnedPreparedCount = 0u;
   reconciliation.skinnedDrawnCount = 0u;
@@ -1590,6 +1604,12 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   uint32_t skinnedPreparedCount = 0;
   uint32_t skinnedInvalidBufferCount = 0;
   uint32_t skinnedInvalidPipelineCount = 0;
+  uint32_t preparedDrawCount = 0;
+  uint32_t alphaTestPreparedCount = 0;
+  uint32_t alphaPromotedPreparedCount = 0;
+  uint32_t dynamicPreparedCount = 0;
+  uint32_t staticPreparedCount = 0;
+  uint32_t otherPreparedCount = 0;
 
   auto len3 = [](float x, float y, float z) {
     return std::sqrt(x * x + y * y + z * z);
@@ -1651,6 +1671,9 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         draw.alphaTestEnabled ||
         (draw.alphaBlendEnabled && draw.diffuseTexture &&
          draw.uvFormat != VK_FORMAT_UNDEFINED && draw.uvStride > 0u);
+    const bool alphaPromotedShadow =
+        effectiveAlphaTestShadow && !draw.alphaTestEnabled &&
+        draw.alphaBlendEnabled;
 
     key.alphaTestEnabled = effectiveAlphaTestShadow;
     if (effectiveAlphaTestShadow) {
@@ -1677,6 +1700,23 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     out.alphaImageView = (effectiveAlphaTestShadow && draw.diffuseTexture)
                              ? draw.textureDescriptor.legacy.image.imageView
                              : VK_NULL_HANDLE;
+    preparedDrawCount++;
+    if (effectiveAlphaTestShadow)
+      alphaTestPreparedCount++;
+    if (alphaPromotedShadow)
+      alphaPromotedPreparedCount++;
+    const auto preparedKind =
+        static_cast<war3::render::ObjectKind>(draw.objectKind);
+    if (skinnedDraw || preparedKind == war3::render::ObjectKind::Unit ||
+        preparedKind == war3::render::ObjectKind::Effect) {
+      dynamicPreparedCount++;
+    } else if (draw.category == War3RenderState::StageCategory::Terrain ||
+               preparedKind == war3::render::ObjectKind::Building ||
+               preparedKind == war3::render::ObjectKind::Destructible) {
+      staticPreparedCount++;
+    } else {
+      otherPreparedCount++;
+    }
     if (skinnedDraw)
       skinnedPreparedCount++;
 
@@ -2041,6 +2081,13 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     reconciliation.skinnedPreparedCount = skinnedPreparedCount;
     reconciliation.skinnedInvalidBufferCount = skinnedInvalidBufferCount;
     reconciliation.skinnedInvalidPipelineCount = skinnedInvalidPipelineCount;
+    reconciliation.shadowMapPreparedDrawCount = preparedDrawCount;
+    reconciliation.shadowMapAlphaTestPreparedCount = alphaTestPreparedCount;
+    reconciliation.shadowMapAlphaPromotedPreparedCount =
+        alphaPromotedPreparedCount;
+    reconciliation.shadowMapDynamicPreparedCount = dynamicPreparedCount;
+    reconciliation.shadowMapStaticPreparedCount = staticPreparedCount;
+    reconciliation.shadowMapOtherPreparedCount = otherPreparedCount;
     uint32_t totalCulled = 0u;
     uint32_t totalSkinnedDrawn = 0u;
     for (uint32_t c = 0; c < cascadeCount; ++c) {
@@ -2049,6 +2096,14 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     }
     reconciliation.cascadeCulledCount = totalCulled;
     reconciliation.skinnedDrawnCount = totalSkinnedDrawn;
+    reconciliation.shadowMapCascade0DrawnCount = drawnPerCascade[0];
+    reconciliation.shadowMapCascade1DrawnCount = drawnPerCascade[1];
+    reconciliation.shadowMapCascade2DrawnCount = drawnPerCascade[2];
+    reconciliation.shadowMapCascade3DrawnCount = drawnPerCascade[3];
+    reconciliation.shadowMapCascade0CulledCount = culledPerCascade[0];
+    reconciliation.shadowMapCascade1CulledCount = culledPerCascade[1];
+    reconciliation.shadowMapCascade2CulledCount = culledPerCascade[2];
+    reconciliation.shadowMapCascade3CulledCount = culledPerCascade[3];
     // 前5帧强制日志，验证 renderShadowMap 实际画了多少 caster
     if (logIndex < 5u ||
         (hasSkinnedCasters &&

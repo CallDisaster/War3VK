@@ -4193,6 +4193,38 @@ inline bool IsLosBlockerFourCc(uint32_t rawcode) {
   }
 }
 
+inline bool War3ShadowIsLosBlocker(
+    uint32_t rawcode,
+    const dxvk::war3::render::RenderObjectInfo* object = nullptr) {
+  if (IsLosBlockerFourCc(rawcode))
+    return true;
+  return object != nullptr && IsLosBlockerFourCc(object->rawcode);
+}
+
+inline bool War3ShadowIsLosBlocker(
+    const dxvk::War3ShadowSemanticContext& semantic,
+    const dxvk::war3::render::RenderObjectInfo* currentObj) {
+  if (War3ShadowIsLosBlocker(semantic.rawcode, semantic.object))
+    return true;
+  return War3ShadowIsLosBlocker(currentObj != nullptr ? currentObj->rawcode : 0u,
+                                currentObj);
+}
+
+inline bool War3ShadowIsLosBlocker(
+    const dxvk::war3::render::VisibleRenderableRecord& record) {
+  return IsLosBlockerFourCc(record.identity.rawcode);
+}
+
+inline bool War3ShadowIsLosBlocker(
+    const dxvk::war3::render::CurrentDrawContractRecord& record) {
+  return IsLosBlockerFourCc(record.rawcode);
+}
+
+inline bool War3ShadowIsLosBlocker(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  return IsLosBlockerFourCc(packet.renderable.rawcode);
+}
+
 inline void FormatFourCcEditorString(uint32_t rawcode, char out[5]) {
   const uint32_t fourcc = NormalizeFourCcEditorOrder(rawcode);
   out[0] = static_cast<char>((fourcc >> 24) & 0xFFu);
@@ -8390,6 +8422,35 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
             rec.shadowMapDrawnCasters;
         cInput.scene.shadowStats.semanticSceneShadowMapCascadeCulledCount =
             rec.cascadeCulledCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapPreparedDrawCount =
+            rec.shadowMapPreparedDrawCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapAlphaTestPreparedCount =
+            rec.shadowMapAlphaTestPreparedCount;
+        cInput.scene.shadowStats
+            .semanticSceneShadowMapAlphaPromotedPreparedCount =
+            rec.shadowMapAlphaPromotedPreparedCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapDynamicPreparedCount =
+            rec.shadowMapDynamicPreparedCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapStaticPreparedCount =
+            rec.shadowMapStaticPreparedCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapOtherPreparedCount =
+            rec.shadowMapOtherPreparedCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapCascade0DrawnCount =
+            rec.shadowMapCascade0DrawnCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapCascade1DrawnCount =
+            rec.shadowMapCascade1DrawnCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapCascade2DrawnCount =
+            rec.shadowMapCascade2DrawnCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapCascade3DrawnCount =
+            rec.shadowMapCascade3DrawnCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapCascade0CulledCount =
+            rec.shadowMapCascade0CulledCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapCascade1CulledCount =
+            rec.shadowMapCascade1CulledCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapCascade2CulledCount =
+            rec.shadowMapCascade2CulledCount;
+        cInput.scene.shadowStats.semanticSceneShadowMapCascade3CulledCount =
+            rec.shadowMapCascade3CulledCount;
         cInput.scene.shadowStats.semanticSceneShadowMapSkinnedCasterCount =
             rec.skinnedCasterCount;
         cInput.scene.shadowStats.semanticSceneShadowMapSkinnedPreparedCount =
@@ -11065,6 +11126,13 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           vbIt->second.frameSerial + 8u >= m_war3ShadowPersistentFrameSerial;
       if (entryFresh) {
         const auto& entry = vbIt->second;
+        if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+            (War3ShadowIsLosBlocker(packet) ||
+             IsLosBlockerFourCc(entry.rawcode))) {
+          m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+          m_war3Scene.shadowStats.skippedNotCaster++;
+          return false;
+        }
         drawTimeVBEntry = &entry;
         // 用 capture 时拷的 device-local buffer
         draw.positionStorage = entry.positionBuffer;
@@ -11749,6 +11817,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     }
     if (record.renderablePart == nullptr || !record.HasStableIdentity())
       continue;
+    if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+        (War3ShadowIsLosBlocker(record) || IsLosBlockerFourCc(entry.rawcode))) {
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats.skippedNotCaster++;
+      entry.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
+      continue;
+    }
 
     const auto objectKind =
         record.identity.kind != dxvk::war3::render::ObjectKind::Unknown
@@ -12159,6 +12234,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     preselectedRecords.reserve(rawRecordCount);
     for (const auto& record : directRecords) {
       auto& bucket = completenessBucketForRecord(record);
+      if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+          War3ShadowIsLosBlocker(record)) {
+        m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+        m_war3Scene.shadowStats.skippedNotCaster++;
+        continue;
+      }
       if (War3RejectCurrentDrawRecordByUnsafeAlphaVisualPolicy(
               record, m_war3Scene.shadowStats)) {
         bucket.alphaRejectedParts++;
@@ -12583,6 +12664,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
   for (const auto& record : recordsForBuild) {
     auto& bucket = completenessBucketForRecord(record);
+    if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+        War3ShadowIsLosBlocker(record)) {
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats.skippedNotCaster++;
+      continue;
+    }
     if (!recordsForBuildAlphaPrefiltered &&
         War3RejectCurrentDrawRecordByUnsafeAlphaVisualPolicy(
             record, m_war3Scene.shadowStats)) {
@@ -13192,6 +13279,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       return false;
     if (eligible.packet.path != dxvk::war3::shadow::ShadowDrawPath::Skinned)
       return false;
+    if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+        War3ShadowIsLosBlocker(eligible.packet))
+      return false;
 
     const auto resolvedObjectKind =
         War3ResolveSemanticPacketObjectKindFast(eligible.packet);
@@ -13216,6 +13306,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           entry.indexCount != 0u));
     if (!entryFresh)
       return false;
+    if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+        IsLosBlockerFourCc(entry.rawcode)) {
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats.skippedNotCaster++;
+      entry.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
+      return false;
+    }
 
     War3ShadowCasterDraw draw = {};
     draw.indexed = entry.indexed;
@@ -14965,6 +15062,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
           !directSeenRenderableParts.insert(record.renderablePart).second) {
         continue;
       }
+      if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+          War3ShadowIsLosBlocker(record)) {
+        m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+        m_war3Scene.shadowStats.skippedNotCaster++;
+        continue;
+      }
 
       dxvk::war3::shadow::ShadowDrawPacket packet = {};
       dxvk::war3::render::CurrentDrawAuthoritativeSample
@@ -15256,6 +15359,20 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
       cInput.scene.shadowStats.semanticSceneReplayDrawsCount = rec.replayDrawsCount;
       cInput.scene.shadowStats.semanticSceneShadowMapDrawnCasters = rec.shadowMapDrawnCasters;
       cInput.scene.shadowStats.semanticSceneShadowMapCascadeCulledCount = rec.cascadeCulledCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapPreparedDrawCount = rec.shadowMapPreparedDrawCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapAlphaTestPreparedCount = rec.shadowMapAlphaTestPreparedCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapAlphaPromotedPreparedCount = rec.shadowMapAlphaPromotedPreparedCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapDynamicPreparedCount = rec.shadowMapDynamicPreparedCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapStaticPreparedCount = rec.shadowMapStaticPreparedCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapOtherPreparedCount = rec.shadowMapOtherPreparedCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapCascade0DrawnCount = rec.shadowMapCascade0DrawnCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapCascade1DrawnCount = rec.shadowMapCascade1DrawnCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapCascade2DrawnCount = rec.shadowMapCascade2DrawnCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapCascade3DrawnCount = rec.shadowMapCascade3DrawnCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapCascade0CulledCount = rec.shadowMapCascade0CulledCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapCascade1CulledCount = rec.shadowMapCascade1CulledCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapCascade2CulledCount = rec.shadowMapCascade2CulledCount;
+      cInput.scene.shadowStats.semanticSceneShadowMapCascade3CulledCount = rec.shadowMapCascade3CulledCount;
       cInput.scene.shadowStats.semanticSceneShadowMapSkinnedCasterCount = rec.skinnedCasterCount;
       cInput.scene.shadowStats.semanticSceneShadowMapSkinnedPreparedCount = rec.skinnedPreparedCount;
       cInput.scene.shadowStats.semanticSceneShadowMapSkinnedInvalidBufferCount = rec.skinnedInvalidBufferCount;
@@ -15355,10 +15472,12 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
 }
 
 void D3D9DeviceEx::War3TryCaptureShadowCasterDrawIndexed(
-    D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT StartIndex,
-    UINT IndexCount, bool DynamicSysmemVBOs, bool DynamicSysmemIBO) {
-  War3TryCaptureShadowCaster(PrimitiveType, BaseVertexIndex, 0, 0, StartIndex,
-                             IndexCount, true, DynamicSysmemVBOs,
+    D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex,
+    UINT MinVertexIndex, UINT NumVertices, UINT StartIndex, UINT IndexCount,
+    bool DynamicSysmemVBOs, bool DynamicSysmemIBO) {
+  War3TryCaptureShadowCaster(PrimitiveType, BaseVertexIndex, MinVertexIndex,
+                             NumVertices, StartIndex, IndexCount, true,
+                             DynamicSysmemVBOs,
                              DynamicSysmemIBO);
 }
 
@@ -15847,6 +15966,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitive(
                     BaseVertexIndex, &dynamicSysmemVBOs, &dynamicSysmemIBO);
 
   War3TryCaptureShadowCasterDrawIndexed(PrimitiveType, BaseVertexIndex,
+                                        MinVertexIndex, NumVertices,
                                         StartIndex, indexCount,
                                         dynamicSysmemVBOs, dynamicSysmemIBO);
 
@@ -16194,7 +16314,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitiveUP(
     m_war3PerDrawUpload.ibValid = true;
     m_war3PerDrawUpload.ibStorage = m_war3PerDrawUpload.storage;
   }
-  War3TryCaptureShadowCasterDrawIndexed(PrimitiveType, 0, 0, vertexCount, true,
+  War3TryCaptureShadowCasterDrawIndexed(PrimitiveType, 0, MinVertexIndex,
+                                        NumVertices, 0, vertexCount, true,
                                         true);
   /**
    * 此段代码的作用：
@@ -22945,6 +23066,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     if (earlyNeedsSemanticContext) {
       War3ShadowSemanticContext semantic =
           War3BuildShadowSemanticContext(earlyCurrentObj);
+      if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+          War3ShadowIsLosBlocker(semantic, earlyCurrentObj)) {
+        m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+        m_war3Scene.shadowStats.skippedNotCaster++;
+        return;
+      }
       const bool earlySemanticSceneUnitLikeCandidate =
           dxvk::war3::internal::
               IsSemanticSceneBypassLegacyUnitCaptureRuntimeEnabled() &&
@@ -23046,6 +23173,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             // DXVK 内部 wrap 调用没传 MinVertexIndex/NumVertices。
             // 从原 VB 索引 0 起拷 totalVerts 个；vertexOffset = BaseVertexIndex。
             // 若 totalVerts 超过 65536，放弃 capture（很罕见，War3 模型一般 <几千）。
+            m_war3Scene.shadowStats
+                .drawTimeVBCacheIndexedUnknownRangeFallbackCount++;
             vRangeStart = 0;
             const uint64_t totalVerts =
                 (posStride > 0u) ? (posSlice.length() / posStride) : 0u;
@@ -23078,6 +23207,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
         auto& entry = m_war3DrawTimeVBCache[vbCacheKey];
         entry.renderablePart = semantic.renderablePart;
+        entry.rawcode = semantic.rawcode;
+        entry.jHandle = semantic.jHandle;
+        entry.objectKind = semantic.objectKind;
         entry.vertexCount = vRangeCount;
         entry.frameSerial = m_war3ShadowPersistentFrameSerial;
         entry.positionStride = posStride;
@@ -23150,6 +23282,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           if (buf != nullptr) {
             entry.positionBuffer = std::move(buf);
             entry.positionCapacity = posInfoCi.size;
+            m_war3Scene.shadowStats.drawTimeVBCachePositionAllocCount++;
           }
         }
         if (entry.positionBuffer == nullptr) {
@@ -23162,6 +23295,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 cBytes = posBytes](DxvkContext *ctx) {
           ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
         });
+        m_war3Scene.shadowStats.drawTimeVBCachePositionCopyCount++;
+        m_war3Scene.shadowStats.drawTimeVBCachePositionCopyBytes +=
+            uint64_t(posBytes);
         entry.positionInfo = entry.positionBuffer->getSliceInfo(0, posBytes);
 
         // ===== UV capture：同帧拷一份 UV 给 alpha-test shadow =====
@@ -23191,6 +23327,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               entry.uvFormat = uvFmt;
               entry.uvBuffer = entry.positionBuffer;
               entry.uvInfo = entry.positionInfo;
+              m_war3Scene.shadowStats.drawTimeVBCacheUvSharedPositionCount++;
             } else {
               // case 2：UV 在另一个 stream → 需要单独 GPU copy。
               DxvkBufferSlice uvSrcSlice;
@@ -23239,6 +23376,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     if (uvBuf != nullptr) {
                       entry.uvBuffer = std::move(uvBuf);
                       entry.uvCapacity = uvCi.size;
+                      m_war3Scene.shadowStats.drawTimeVBCacheUvAllocCount++;
                     }
                   }
                   if (entry.uvBuffer != nullptr) {
@@ -23248,6 +23386,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                             cBytes = uvBytes](DxvkContext* ctx) {
                       ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
                     });
+                    m_war3Scene.shadowStats.drawTimeVBCacheUvCopyCount++;
+                    m_war3Scene.shadowStats.drawTimeVBCacheUvCopyBytes +=
+                        uint64_t(uvBytes);
                     entry.uvInfo =
                         entry.uvBuffer->getSliceInfo(0, uvBytes);
                     entry.uvStride = uvStride;
@@ -23307,6 +23448,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 if (idxBuf != nullptr) {
                   entry.indexBuffer = std::move(idxBuf);
                   entry.indexCapacity = idxInfoCi.size;
+                  m_war3Scene.shadowStats.drawTimeVBCacheIndexAllocCount++;
                 }
               }
               if (entry.indexBuffer != nullptr) {
@@ -23316,6 +23458,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                         cBytes = idxBytes](DxvkContext *ctx) {
                   ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
                 });
+                m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyCount++;
+                m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyBytes +=
+                    uint64_t(idxBytes);
                 entry.indexInfo =
                     entry.indexBuffer->getSliceInfo(0, idxBytes);
                 entry.indexed = true;
@@ -23332,6 +23477,31 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.indexCount = 0u;
         }
         m_war3Scene.shadowStats.drawTimeVBCacheCaptureCount++;
+        switch (semantic.objectKind) {
+        case dxvk::war3::render::ObjectKind::Unit:
+          m_war3Scene.shadowStats.drawTimeVBCacheUnitCaptureCount++;
+          break;
+        case dxvk::war3::render::ObjectKind::Building:
+          m_war3Scene.shadowStats.drawTimeVBCacheBuildingCaptureCount++;
+          break;
+        case dxvk::war3::render::ObjectKind::Destructible:
+          m_war3Scene.shadowStats.drawTimeVBCacheDestructibleCaptureCount++;
+          break;
+        case dxvk::war3::render::ObjectKind::Effect:
+          m_war3Scene.shadowStats.drawTimeVBCacheEffectCaptureCount++;
+          break;
+        case dxvk::war3::render::ObjectKind::Item:
+        case dxvk::war3::render::ObjectKind::Unknown:
+        default:
+          m_war3Scene.shadowStats.drawTimeVBCacheOtherKindCaptureCount++;
+          break;
+        }
+        if (entry.alphaTestEnabled)
+          m_war3Scene.shadowStats.drawTimeVBCacheAlphaTestStateCaptureCount++;
+        if (entry.alphaBlendEnabled)
+          m_war3Scene.shadowStats.drawTimeVBCacheAlphaBlendStateCaptureCount++;
+        if (entry.diffuseTexture != nullptr)
+          m_war3Scene.shadowStats.drawTimeVBCacheDiffuseTextureCaptureCount++;
       } while (false);
     }
     return;

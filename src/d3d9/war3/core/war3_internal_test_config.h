@@ -882,13 +882,11 @@ inline constexpr float kShadowAdaptiveMapUpdateCameraMaxDelta = 0.0005f;
 // 判定“场景稳定”的 caster 数变化阈值。
 inline constexpr uint32_t kShadowAdaptiveMapUpdateCasterDelta = 2;
 // ShadowMap 分辨率自适应：
-// Phase 7.31 Iteration D + E：用户反馈"阴影边缘糊"。2048 × 4 cascade 在
-// 远景 cascade 下 texel 稀释严重。本轮提高中等压力档位到 3072 缓解此问题。
-// 但 run_quick_autotest benchmark 场景下发现 3072 带来 GPU 压力骤增（3 FPS
-// 退化）。因此策略改为：仅在 light 场景（low geometry work）保留 4096 的
-// 请求；中等以上压力直接降到 2048 保稳。清晰度提升转向 shader 侧（更窄 PCF
-// radius + tight cascade fit）承担，而不是堆 shadow map 分辨率。
-inline constexpr bool kShadowAdaptiveResolutionEnabled = true;
+// Phase 7.68：视觉验证显示树叶/细枝阴影主要受有效 CSM 分辨率影响；旧策略会在
+// replay geometry work 较高时把用户请求的 4096 静默降到 2048，导致 alpha
+// cutout 细节被 texel 稀释。性能报告同时显示近期瓶颈不在 ShadowMap 分辨率本身，
+// 因此默认保留请求分辨率，后续若需要再通过明确的质量档位重新引入。
+inline constexpr bool kShadowAdaptiveResolutionEnabled = false;
 inline constexpr uint64_t kShadowAdaptiveResolutionHighWork = 3000;
 inline constexpr uint32_t kShadowAdaptiveResolutionHigh = 2048;
 inline constexpr uint64_t kShadowAdaptiveResolutionHugeWork = 12000;

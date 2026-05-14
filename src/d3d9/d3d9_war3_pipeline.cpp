@@ -288,6 +288,33 @@ namespace dxvk {
                 WAR3_RENDER_LOG("DXVK War3Shadow: DXVK_WAR3_SHADOW_TAA=%d\n",
                                m_settings.shadows.shadowTaaEnabled ? 1 : 0);
             }
+
+            int alphaHash = -1;
+            if (ParseEnvInt("DXVK_WAR3_SHADOW_ALPHA_HASH", alphaHash)) {
+                m_settings.shadows.alphaShadowHashed = alphaHash != 0;
+                WAR3_RENDER_LOG(
+                    "DXVK War3Shadow: DXVK_WAR3_SHADOW_ALPHA_HASH=%d\n",
+                    m_settings.shadows.alphaShadowHashed ? 1 : 0);
+            }
+
+            int alphaMip = -1;
+            if (ParseEnvInt("DXVK_WAR3_SHADOW_ALPHA_MIP", alphaMip)) {
+                m_settings.shadows.alphaShadowUseMip = alphaMip != 0;
+                WAR3_RENDER_LOG(
+                    "DXVK War3Shadow: DXVK_WAR3_SHADOW_ALPHA_MIP=%d\n",
+                    m_settings.shadows.alphaShadowUseMip ? 1 : 0);
+            }
+
+            float alphaMipBias = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_SHADOW_ALPHA_MIP_BIAS",
+                              alphaMipBias)) {
+                m_settings.shadows.alphaShadowMipLodBias =
+                    std::clamp(alphaMipBias, -4.0f, 4.0f);
+                WAR3_RENDER_LOG(
+                    "DXVK War3Shadow: DXVK_WAR3_SHADOW_ALPHA_MIP_BIAS=%.3f\n",
+                    static_cast<double>(
+                        m_settings.shadows.alphaShadowMipLodBias));
+            }
         }
 
         // 抗锯齿参数：可用环境变量快速切换 AA 模式

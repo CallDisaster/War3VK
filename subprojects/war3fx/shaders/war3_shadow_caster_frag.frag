@@ -38,17 +38,21 @@ void main() {
     if (hashed) {
       // Hash Alpha：为 Alpha-Test 阴影提供“分数覆盖率”的近似
       // 关键点：
-      // - 噪声必须锚定在“ShadowMap 像素网格”上，否则 UV/投影的微小漂移会导致噪声本身变化，
-      //   进而表现为树叶阴影边缘抖动/闪烁（尤其是高机位/远级联）。
-      // - 因此这里使用 gl_FragCoord（当前 ShadowMap 像素坐标）生成稳定随机阈值。
-      float hashWidth = 0.08 + 0.08 * (1.0 - p_alphaRef);
+      // - 噪声锚定到 alpha 贴图 texel，而不是 ShadowMap 像素。这样 CSM/相机
+      //   轻微漂移时，dither 模板仍跟随树叶纹理本身，不会在叶片上滑动。
+      // - 不要混入 palette/matrix offset：draw-time buffer 排布可能随帧变化，
+      //   把它作为盐会让整棵树的 dither 模板每帧换一张。
+      float hashWidth = 0.06 + 0.05 * (1.0 - p_alphaRef);
       float delta = alpha - p_alphaRef;
       if (delta <= -hashWidth) {
         discard;
       } else if (delta < hashWidth) {
         float t = (delta + hashWidth) / (2.0 * hashWidth);
-        ivec2 pix = ivec2(gl_FragCoord.xy);
-        vec2 hashP = vec2(pix) + vec2(float(p_samplerIndex) * 0.37, float(p_paletteOffset) * 0.13);
+        ivec2 texSize = textureSize(
+          sampler2D(u_alphaTex, s_samplers[nonuniformEXT(p_samplerIndex)]),
+          0);
+        vec2 texel = floor(fract(v_uv) * max(vec2(texSize), vec2(1.0)));
+        vec2 hashP = texel + vec2(float(p_samplerIndex) * 17.0, 0.0);
         float noise = hash12(hashP);
         if (t < noise) {
           discard;

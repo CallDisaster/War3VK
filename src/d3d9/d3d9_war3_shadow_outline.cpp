@@ -670,7 +670,10 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
         bindings[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
       }
 
-      std::array<VkVertexInputAttributeDescription, 3> attributes = {};
+      // Alpha-tested skinned outline draws may need position + blend weight +
+      // blend index + UV. Keep the outline VI layout capacity in sync with the
+      // caster path to avoid corrupting the stack when all four are present.
+      std::array<VkVertexInputAttributeDescription, 4> attributes = {};
       uint32_t attributeCount = 0;
 
       // 位置 (location = 0)

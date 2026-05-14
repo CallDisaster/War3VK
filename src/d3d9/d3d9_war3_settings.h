@@ -85,9 +85,12 @@ struct War3ShadowSettings {
   War3ShadowPcssSearchKernel pcssSearchKernel =
       War3ShadowPcssSearchKernel::Grid3x3;
 
-  bool alphaShadowHashed = true;
-  bool alphaShadowUseMip = true;
-  float alphaShadowMipLodBias = 0.5f;
+  // Alpha foliage shadows must be deterministic by default. Hashed coverage
+  // helps fractional transparency, but on tree cutouts it shows up as edge
+  // shimmer after CSM/TAA. Keep the hard cutoff path as the visual baseline.
+  bool alphaShadowHashed = false;
+  bool alphaShadowUseMip = false;
+  float alphaShadowMipLodBias = 0.0f;
   float alphaShadowFarAlphaRefBias = 0.05f;
 
   bool shadowTaaEnabled = true;

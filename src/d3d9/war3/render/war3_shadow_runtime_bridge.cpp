@@ -715,6 +715,8 @@ void WriteTraceFrameEvent(
      << stats.drawTimeSemanticProducerMissNoFreshEntryCount
      << ",\"drawTimeSemanticProducerFallbackCurrentDrawCount\":"
      << stats.drawTimeSemanticProducerFallbackCurrentDrawCount
+     << ",\"semanticSceneRejectedPathBlockerCount\":"
+     << stats.semanticSceneRejectedPathBlockerCount
      << ",\"semanticSceneDirectDrawTimePrebuildBypassAttemptCount\":"
      << stats.semanticSceneDirectDrawTimePrebuildBypassAttemptCount
      << ",\"semanticSceneDirectDrawTimePrebuildBypassHitCount\":"
@@ -737,6 +739,44 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCacheRejectInsufficientLength
      << ",\"drawTimeVBCacheRejectNoBuffer\":"
      << stats.drawTimeVBCacheRejectNoBuffer
+     << ",\"drawTimeVBCachePositionCopyCount\":"
+     << stats.drawTimeVBCachePositionCopyCount
+     << ",\"drawTimeVBCachePositionCopyBytes\":"
+     << stats.drawTimeVBCachePositionCopyBytes
+     << ",\"drawTimeVBCachePositionAllocCount\":"
+     << stats.drawTimeVBCachePositionAllocCount
+     << ",\"drawTimeVBCacheUvCopyCount\":"
+     << stats.drawTimeVBCacheUvCopyCount
+     << ",\"drawTimeVBCacheUvCopyBytes\":"
+     << stats.drawTimeVBCacheUvCopyBytes
+     << ",\"drawTimeVBCacheUvSharedPositionCount\":"
+     << stats.drawTimeVBCacheUvSharedPositionCount
+     << ",\"drawTimeVBCacheUvAllocCount\":"
+     << stats.drawTimeVBCacheUvAllocCount
+     << ",\"drawTimeVBCacheIndexCopyCount\":"
+     << stats.drawTimeVBCacheIndexCopyCount
+     << ",\"drawTimeVBCacheIndexCopyBytes\":"
+     << stats.drawTimeVBCacheIndexCopyBytes
+     << ",\"drawTimeVBCacheIndexAllocCount\":"
+     << stats.drawTimeVBCacheIndexAllocCount
+     << ",\"drawTimeVBCacheIndexedUnknownRangeFallbackCount\":"
+     << stats.drawTimeVBCacheIndexedUnknownRangeFallbackCount
+     << ",\"drawTimeVBCacheUnitCaptureCount\":"
+     << stats.drawTimeVBCacheUnitCaptureCount
+     << ",\"drawTimeVBCacheBuildingCaptureCount\":"
+     << stats.drawTimeVBCacheBuildingCaptureCount
+     << ",\"drawTimeVBCacheDestructibleCaptureCount\":"
+     << stats.drawTimeVBCacheDestructibleCaptureCount
+     << ",\"drawTimeVBCacheEffectCaptureCount\":"
+     << stats.drawTimeVBCacheEffectCaptureCount
+     << ",\"drawTimeVBCacheOtherKindCaptureCount\":"
+     << stats.drawTimeVBCacheOtherKindCaptureCount
+     << ",\"drawTimeVBCacheAlphaTestStateCaptureCount\":"
+     << stats.drawTimeVBCacheAlphaTestStateCaptureCount
+     << ",\"drawTimeVBCacheAlphaBlendStateCaptureCount\":"
+     << stats.drawTimeVBCacheAlphaBlendStateCaptureCount
+     << ",\"drawTimeVBCacheDiffuseTextureCaptureCount\":"
+     << stats.drawTimeVBCacheDiffuseTextureCaptureCount
      << ",\"drawTimeD3DPoseAttemptCount\":"
      << stats.semanticSceneDrawTimePoseAttemptCount
      << ",\"drawTimeD3DPosePublishedCount\":"
@@ -765,7 +805,35 @@ void WriteTraceFrameEvent(
      << ",\"semanticSceneShadowMatrixBufferGpuAddress\":"
      << stats.semanticSceneShadowMatrixBufferGpuAddress
      << ",\"semanticSceneShadowMapRenderSerial\":"
-     << stats.semanticSceneShadowMapRenderSerial;
+     << stats.semanticSceneShadowMapRenderSerial
+     << ",\"semanticSceneShadowMapPreparedDrawCount\":"
+     << stats.semanticSceneShadowMapPreparedDrawCount
+     << ",\"semanticSceneShadowMapAlphaTestPreparedCount\":"
+     << stats.semanticSceneShadowMapAlphaTestPreparedCount
+     << ",\"semanticSceneShadowMapAlphaPromotedPreparedCount\":"
+     << stats.semanticSceneShadowMapAlphaPromotedPreparedCount
+     << ",\"semanticSceneShadowMapDynamicPreparedCount\":"
+     << stats.semanticSceneShadowMapDynamicPreparedCount
+     << ",\"semanticSceneShadowMapStaticPreparedCount\":"
+     << stats.semanticSceneShadowMapStaticPreparedCount
+     << ",\"semanticSceneShadowMapOtherPreparedCount\":"
+     << stats.semanticSceneShadowMapOtherPreparedCount
+     << ",\"semanticSceneShadowMapCascade0DrawnCount\":"
+     << stats.semanticSceneShadowMapCascade0DrawnCount
+     << ",\"semanticSceneShadowMapCascade1DrawnCount\":"
+     << stats.semanticSceneShadowMapCascade1DrawnCount
+     << ",\"semanticSceneShadowMapCascade2DrawnCount\":"
+     << stats.semanticSceneShadowMapCascade2DrawnCount
+     << ",\"semanticSceneShadowMapCascade3DrawnCount\":"
+     << stats.semanticSceneShadowMapCascade3DrawnCount
+     << ",\"semanticSceneShadowMapCascade0CulledCount\":"
+     << stats.semanticSceneShadowMapCascade0CulledCount
+     << ",\"semanticSceneShadowMapCascade1CulledCount\":"
+     << stats.semanticSceneShadowMapCascade1CulledCount
+     << ",\"semanticSceneShadowMapCascade2CulledCount\":"
+     << stats.semanticSceneShadowMapCascade2CulledCount
+     << ",\"semanticSceneShadowMapCascade3CulledCount\":"
+     << stats.semanticSceneShadowMapCascade3CulledCount;
   WriteHexField(os, "semanticSceneShadowMatrixSceneKey",
                 stats.semanticSceneShadowMatrixSceneKey);
   WriteHexField(os, "semanticSceneShadowMatrixBufferObjectPtr",
@@ -1334,6 +1402,11 @@ void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
   War3ShadowCaptureStats merged = stats;
   const auto hasReceiverDetails = [](const War3ShadowCaptureStats& value) {
     return value.semanticSceneShadowMapDrawnCasters != 0u ||
+           value.semanticSceneShadowMapPreparedDrawCount != 0u ||
+           value.semanticSceneShadowMapAlphaTestPreparedCount != 0u ||
+           value.semanticSceneShadowMapDynamicPreparedCount != 0u ||
+           value.semanticSceneShadowMapStaticPreparedCount != 0u ||
+           value.semanticSceneShadowMapCascade0DrawnCount != 0u ||
            value.semanticSceneShadowMapSkinnedPreparedCount != 0u ||
            value.semanticSceneShadowMapSkinnedInvalidBufferCount != 0u ||
            value.semanticSceneShadowMapSkinnedInvalidPipelineCount != 0u ||
@@ -1395,6 +1468,34 @@ void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
           previous.semanticSceneShadowMapDrawnCasters;
       merged.semanticSceneShadowMapCascadeCulledCount =
           previous.semanticSceneShadowMapCascadeCulledCount;
+      merged.semanticSceneShadowMapPreparedDrawCount =
+          previous.semanticSceneShadowMapPreparedDrawCount;
+      merged.semanticSceneShadowMapAlphaTestPreparedCount =
+          previous.semanticSceneShadowMapAlphaTestPreparedCount;
+      merged.semanticSceneShadowMapAlphaPromotedPreparedCount =
+          previous.semanticSceneShadowMapAlphaPromotedPreparedCount;
+      merged.semanticSceneShadowMapDynamicPreparedCount =
+          previous.semanticSceneShadowMapDynamicPreparedCount;
+      merged.semanticSceneShadowMapStaticPreparedCount =
+          previous.semanticSceneShadowMapStaticPreparedCount;
+      merged.semanticSceneShadowMapOtherPreparedCount =
+          previous.semanticSceneShadowMapOtherPreparedCount;
+      merged.semanticSceneShadowMapCascade0DrawnCount =
+          previous.semanticSceneShadowMapCascade0DrawnCount;
+      merged.semanticSceneShadowMapCascade1DrawnCount =
+          previous.semanticSceneShadowMapCascade1DrawnCount;
+      merged.semanticSceneShadowMapCascade2DrawnCount =
+          previous.semanticSceneShadowMapCascade2DrawnCount;
+      merged.semanticSceneShadowMapCascade3DrawnCount =
+          previous.semanticSceneShadowMapCascade3DrawnCount;
+      merged.semanticSceneShadowMapCascade0CulledCount =
+          previous.semanticSceneShadowMapCascade0CulledCount;
+      merged.semanticSceneShadowMapCascade1CulledCount =
+          previous.semanticSceneShadowMapCascade1CulledCount;
+      merged.semanticSceneShadowMapCascade2CulledCount =
+          previous.semanticSceneShadowMapCascade2CulledCount;
+      merged.semanticSceneShadowMapCascade3CulledCount =
+          previous.semanticSceneShadowMapCascade3CulledCount;
       merged.semanticSceneShadowMapSkinnedPreparedCount =
           previous.semanticSceneShadowMapSkinnedPreparedCount;
       merged.semanticSceneShadowMapSkinnedInvalidBufferCount =
