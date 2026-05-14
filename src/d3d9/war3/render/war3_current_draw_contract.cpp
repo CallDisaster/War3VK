@@ -2068,7 +2068,11 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
   const std::unordered_set<uint64_t> preferredKeySet(
       options.preferredSelectionKeys.begin(),
       options.preferredSelectionKeys.end());
-  std::unordered_map<uint64_t, uint64_t> preferredVisibleKeyCache;
+  // Phase 7.81：thread_local 复用 preferredVisibleKeyCache。
+  static thread_local std::unordered_map<uint64_t, uint64_t>
+      s_preferredVisibleKeyCache;
+  s_preferredVisibleKeyCache.clear();
+  auto& preferredVisibleKeyCache = s_preferredVisibleKeyCache;
   const auto makePreferredKey = [](uint32_t tag, uint64_t value) -> uint64_t {
     uint64_t hash = bit::fnv1a_init();
     hash = bit::fnv1a_iter(hash, tag);
@@ -2128,7 +2132,12 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
       return pa;
     return BetterSnapshotRecord(a, b, options.unitsOnly);
   };
-  std::unordered_map<uint64_t, size_t> unlimitedDedupeIndex;
+  // Phase 7.81：thread_local 复用 unlimitedDedupeIndex，避免每帧多次调用
+  // SnapshotPublishedCurrentDrawContracts 时反复 alloc/free + reserve(4096)。
+  static thread_local std::unordered_map<uint64_t, size_t>
+      s_unlimitedDedupeIndex;
+  s_unlimitedDedupeIndex.clear();
+  auto& unlimitedDedupeIndex = s_unlimitedDedupeIndex;
   auto unlimitedDedupeKey = [](const CurrentDrawContractRecord& r) -> uint64_t {
     uint64_t h = bit::fnv1a_init();
     h = bit::fnv1a_iter(h, uint64_t(reinterpret_cast<uintptr_t>(r.renderablePart)));
