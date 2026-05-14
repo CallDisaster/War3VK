@@ -421,6 +421,17 @@ bool LastSampleDiagnosticsEnabled() {
   return enabled;
 }
 
+// Phase 7.77：Phase 7.49 用来诊断 Pose stutter / FROZEN 段的 publish-side
+// probe 在 PublishCurrentDrawContract 主路径里**始终运行**，每次 publish 至少
+// 5 次 atomic CAS-loop + frameTag 内存读，每帧 10K-30K publish 调用累计 1-3
+// ms 纯诊断开销。Phase 7.55 v4 + Phase 7.57 producer 已闭环 stutter 根因，
+// 所以默认关掉这一组诊断，只有 `DXVK_WAR3_PUBLISH_PROBE=1` 显式开启时才执行。
+bool Phase749PublishProbeEnabled() {
+  static const bool enabled =
+      ReadEnvU32("DXVK_WAR3_PUBLISH_PROBE", 0u) != 0u;
+  return enabled;
+}
+
 void NotePublishedStream1Layout(const CurrentDrawContractRecord& record) {
   if (record.stream1Ptr == nullptr) {
     g_stream1PublishNoStreamCount.fetch_add(1u, std::memory_order_relaxed);
@@ -1218,7 +1229,11 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
   //   - record.frameTag 是否多帧不变（FROZEN 的 record-side 假设）
   //   - live writer frameTag 是否推进（producer-side 对照）
   //   - 二者差值是否在 FROZEN 段里扩大（record 落后 writer 多帧）
-  {
+  // Phase 7.77：默认关闭这一组诊断（每帧 10K-30K 次 publish × 5+ atomic
+  // CAS-loop 累计 1-3ms）。Phase 7.55 v4 + Phase 7.57 producer 已闭环
+  // stutter 根因，probe 不再属于主路径所需。需要重启诊断时设
+  // `DXVK_WAR3_PUBLISH_PROBE=1`。
+  if (Phase749PublishProbeEnabled()) {
     g_publishCallCumulative.fetch_add(1u, std::memory_order_relaxed);
     const uint32_t recordTag = record.frameTag;
     // 更新 record.frameTag same-run 与 min/max。注意 relaxed 即可，这是

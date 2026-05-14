@@ -9653,11 +9653,16 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   // Phase 7.73：把 eligibility gate（File-scope helper）累计的拒绝数折进
   // 当前帧 shadowStats，每个 append 调用都偷一次。如果 eligibility 拦截能起
   // 作用，这个 counter 应该在持续上升。
-  if (uint32_t pending = g_pathBlockerEligibilityGateRejectCount.exchange(
-          0u, std::memory_order_relaxed)) {
-    m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount += pending;
-    m_war3Scene.shadowStats
-        .semanticSceneRejectedPathBlockerEligibilityGateCount += pending;
+  // Phase 7.76：先用 relaxed load 看是否有待 flush 数据，避免每个 append 都做
+  // 一次 atomic RMW；只有真正非零时才走 exchange。
+  if (g_pathBlockerEligibilityGateRejectCount.load(std::memory_order_relaxed)
+        != 0u) {
+    if (uint32_t pending = g_pathBlockerEligibilityGateRejectCount.exchange(
+            0u, std::memory_order_relaxed)) {
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount += pending;
+      m_war3Scene.shadowStats
+          .semanticSceneRejectedPathBlockerEligibilityGateCount += pending;
+    }
   }
 
   auto toVkTopology = [](dxvk::war3::shadow::ShadowPrimitiveTopology topology) {
