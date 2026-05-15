@@ -23344,8 +23344,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           break;
         }
         // Phase 7.96：在 GPU copy 之前拦截路径阻断器，避免无意义的 VB 拷贝。
+        // 路径阻断器（path blocker）是 War3 引擎用来阻挡单位通行的不可见对象，
+        // 不应该投射阴影。如果 semantic.rawcode 已经填充则直接判定；否则尝试
+        // 通过 jHandle 反查 RenderObjectRegistry 拿到 rawcode 兜底（path blocker
+        // 在某些 dispatch 路径下 rawcode 可能未及时填充到 TLS）。
+        uint32_t pathBlockerRawcode = semantic.rawcode;
+        if (pathBlockerRawcode == 0u && semantic.jHandle != 0u) {
+          if (auto* info = dxvk::war3::render::RenderObjectRegistry::instance()
+                               .findByHandle(semantic.jHandle)) {
+            pathBlockerRawcode = info->rawcode;
+          }
+        }
         if (dxvk::war3::internal::kPathBlockerHideEnabled &&
-            semantic.rawcode != 0u && IsLosBlockerFourCc(semantic.rawcode)) {
+            pathBlockerRawcode != 0u &&
+            IsLosBlockerFourCc(pathBlockerRawcode)) {
           m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
           break;
         }
@@ -23522,7 +23534,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         auto& entry = m_war3DrawTimeVBCache[vbCacheKey];
         entry.renderablePart = semantic.renderablePart;
         entry.sceneNode = semantic.sceneNode;
-        entry.rawcode = semantic.rawcode;
+        // Phase 7.96：使用 path blocker 兜底反查后的 rawcode，让下游
+        // producer / fast-append 路径也能正确识别 path blocker。
+        entry.rawcode = pathBlockerRawcode != 0u ? pathBlockerRawcode
+                                                  : semantic.rawcode;
         entry.jHandle = semantic.jHandle;
         entry.objectKind = semantic.objectKind;
         entry.vertexCount = vRangeCount;
