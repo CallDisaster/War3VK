@@ -13347,12 +13347,25 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   // --- Step 3: submit ---
   uint32_t submitted = 0u;
   // Phase 7.3: track submitted caster identity keys for stable selection hash.
-  std::unordered_set<uint64_t> submittedIdentityKeys;
-  std::unordered_set<uint64_t> submittedPreferenceKeys;
-  std::vector<uint64_t> submittedPartIdentityKeys;
+  // Phase 7.83 Top #8：thread_local 复用 scratch container 避免每帧 alloc/free。
+  // 进入时 .clear() 释放上帧内容但保留 bucket 容量。函数局部 reference 让原代码
+  // 不动。
+  static thread_local std::unordered_set<uint64_t> s_submittedIdentityKeys;
+  static thread_local std::unordered_set<uint64_t> s_submittedPreferenceKeys;
+  static thread_local std::vector<uint64_t> s_submittedPartIdentityKeys;
+  static thread_local std::unordered_map<uint64_t, std::vector<uint64_t>>
+      s_liveSubmittedCorePartsByObject;
+  s_submittedIdentityKeys.clear();
+  s_submittedPreferenceKeys.clear();
+  s_submittedPartIdentityKeys.clear();
+  for (auto& kv : s_liveSubmittedCorePartsByObject)
+    kv.second.clear();
+  s_liveSubmittedCorePartsByObject.clear();
+  auto& submittedIdentityKeys = s_submittedIdentityKeys;
+  auto& submittedPreferenceKeys = s_submittedPreferenceKeys;
+  auto& submittedPartIdentityKeys = s_submittedPartIdentityKeys;
   submittedPartPacketLeaseRecords.reserve(eligibleRecordCount);
-  std::unordered_map<uint64_t, std::vector<uint64_t>>
-      liveSubmittedCorePartsByObject;
+  auto& liveSubmittedCorePartsByObject = s_liveSubmittedCorePartsByObject;
 
   auto noteSubmittedKeys = [&](const EligibleRecord& eligible) {
     if (eligible.selectionKey != 0u) {

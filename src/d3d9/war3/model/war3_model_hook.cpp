@@ -3892,9 +3892,11 @@ void RecordRuntimeChildLinkBuild(
         render::SemanticDataPerfTag::ModelHook,
         render::SemanticDataPerfTag::ModelRuntimeChildParentMap);
     std::lock_guard<std::mutex> lock(g_runtimeParentLinkMutex);
-    const uint64_t frame = PoseRegistry::instance().frameNumber() != 0u
-                               ? PoseRegistry::instance().frameNumber()
-                               : ModelInstanceRegistry::instance().frameNumber();
+    // Phase 7.83：PoseRegistry::frameNumber 已 atomic，用单次 load 替代
+    // ternary 双读。
+    uint64_t frame = PoseRegistry::instance().frameNumber();
+    if (frame == 0u)
+      frame = ModelInstanceRegistry::instance().frameNumber();
     g_runtimeParentLinks.reserve(g_runtimeParentLinks.size() + childLinks.size());
     for (const auto& childLink : childLinks) {
       if (!LooksLikeRuntimeModelPtr(childLink.childRuntimeModelPtr))
@@ -3967,9 +3969,10 @@ void RecordObservedRuntimeChildLink(void* parentRuntimeModelPtr,
 
   {
     std::lock_guard<std::mutex> lock(g_runtimeParentLinkMutex);
-    const uint64_t frame = PoseRegistry::instance().frameNumber() != 0u
-                               ? PoseRegistry::instance().frameNumber()
-                               : ModelInstanceRegistry::instance().frameNumber();
+    // Phase 7.83：单次 load + fallback。
+    uint64_t frame = PoseRegistry::instance().frameNumber();
+    if (frame == 0u)
+      frame = ModelInstanceRegistry::instance().frameNumber();
     RuntimeParentLinkRecord& record = g_runtimeParentLinks[childRuntimeModelPtr];
     record.parentRuntimeModelPtr = parentRuntimeModelPtr;
     record.sourceMeta = sourceMeta;
