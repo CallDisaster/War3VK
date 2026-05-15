@@ -3351,7 +3351,7 @@ void ShadowRuntimeContractCache::captureLiveState() {
   const size_t currentAttachmentRecordCount =
       kCaptureAttachmentRigidContracts ? attachmentRegistry.recordCount() : 0u;
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     const bool samePublishedFrame =
         m_manifest != nullptr &&
         m_manifest->frameSerial == manifest.frameSerial;
@@ -3460,7 +3460,7 @@ void ShadowRuntimeContractCache::captureLiveState() {
   std::shared_ptr<ShadowModelResourceStore> resourcesPtr;
   bool rebuiltResourceStore = false;
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     priorManifest = m_manifest;
     constexpr uint64_t kResourceStoreRefreshIntervalFrames = 30u;
     const bool resourceStoreLooksUsable =
@@ -3574,7 +3574,7 @@ void ShadowRuntimeContractCache::captureLiveState() {
   {
     auto publishScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/Publish");
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     const bool isEmptyCapture =
         manifest.records.empty() && manifest.visibleCount == 0u &&
         manifest.mainQueueCount == 0u && manifest.transparentCount == 0u;
@@ -3660,7 +3660,7 @@ void ShadowRuntimeContractCache::capturePoseOnlyLiveState() {
   auto attachmentsPtr = std::shared_ptr<ShadowAttachmentRigidStore>{};
   ShadowFrameStats stats = {};
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     if (m_manifest == nullptr || m_resources == nullptr ||
         m_attachments == nullptr || m_manifest->records.empty()) {
       return;
@@ -3701,7 +3701,7 @@ void ShadowRuntimeContractCache::capturePoseOnlyLiveState() {
   {
     auto publishScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/PoseOnlyPublish");
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     auto liveManifest = std::make_shared<ShadowFrameManifest>(*manifestPtr);
     liveManifest->frameSerial = poseFrameSerial;
     // Pose-only captures keep the topology revision stable but advance the
@@ -3723,35 +3723,35 @@ void ShadowRuntimeContractCache::capturePoseOnlyLiveState() {
 }
 
 ShadowFrameManifest ShadowRuntimeContractCache::snapshotManifest() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_manifest != nullptr ? *m_manifest : ShadowFrameManifest{};
 }
 
 std::shared_ptr<const ShadowFrameManifest>
 ShadowRuntimeContractCache::snapshotManifestShared() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_manifest;
 }
 
 ShadowModelResourceStore ShadowRuntimeContractCache::snapshotResources() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_resources != nullptr ? *m_resources : ShadowModelResourceStore{};
 }
 
 std::shared_ptr<const ShadowModelResourceStore>
 ShadowRuntimeContractCache::snapshotResourcesShared() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_resources;
 }
 
 ShadowPoseStore ShadowRuntimeContractCache::snapshotPoses() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_poses != nullptr ? *m_poses : ShadowPoseStore{};
 }
 
 std::shared_ptr<const ShadowPoseStore>
 ShadowRuntimeContractCache::snapshotPosesShared() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_poses;
 }
 
@@ -3760,7 +3760,7 @@ ShadowAttachmentRigidStore ShadowRuntimeContractCache::snapshotAttachments()
   std::shared_ptr<const ShadowAttachmentRigidStore> attachments;
   std::shared_ptr<const ShadowFrameManifest> manifest;
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     attachments = m_attachments;
     manifest = m_manifest;
   }
@@ -3780,7 +3780,7 @@ ShadowRuntimeContractCache::snapshotAttachmentsShared() const {
   std::shared_ptr<const ShadowAttachmentRigidStore> attachments;
   std::shared_ptr<const ShadowFrameManifest> manifest;
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     attachments = m_attachments;
     manifest = m_manifest;
   }
@@ -3795,7 +3795,7 @@ ShadowRuntimeContractCache::snapshotAttachmentsShared() const {
 }
 
 ShadowFrameStats ShadowRuntimeContractCache::snapshotStats() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_stats;
 }
 
@@ -3803,7 +3803,7 @@ ShadowPublishedContractBundle
 ShadowRuntimeContractCache::snapshotBundleShared() const {
   ShadowPublishedContractBundle bundle = {};
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     bundle.manifest = m_manifest;
     bundle.resources = m_resources;
     bundle.poses = m_poses;

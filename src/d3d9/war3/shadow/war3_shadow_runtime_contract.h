@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -343,7 +344,9 @@ public:
 private:
   ShadowRuntimeContractCache() = default;
 
-  mutable std::mutex m_mutex;
+  // Phase 7.87：reader 路径（snapshot*/snapshotShared/snapshotStats/buildState）
+  // 每帧多次，writer 路径（captureLiveState/capturePoseOnly/reset）每帧 1 次。
+  mutable std::shared_mutex m_mutex;
   std::shared_ptr<ShadowFrameManifest> m_manifest =
       std::make_shared<ShadowFrameManifest>();
   std::shared_ptr<ShadowModelResourceStore> m_resources =
