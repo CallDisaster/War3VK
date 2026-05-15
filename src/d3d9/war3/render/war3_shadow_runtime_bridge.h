@@ -396,6 +396,15 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticContractCaptureSkippedStableSameFrame = 0;
   uint64_t semanticContractCaptureSkippedEmpty = 0;
   uint64_t semanticContractCaptureSkippedDuplicateSameFrame = 0;
+  // Phase 7.97 诊断：ManifestCopy 路径实际处理了多少 visible record
+  // 与最终 push 进 manifest 的数量。bridge 透传到 control plane，配合
+  // perf 报告里的 ManifestCopy avgCpuMs，能量化"per-record 成本 = 总 ms / scan 数"。
+  uint64_t semanticManifestCopyVisibleScanned = 0;
+  uint64_t semanticManifestCopyAppended = 0;
+  uint64_t semanticManifestCopyDeduplicatedSkipped = 0;
+  uint64_t semanticManifestCopyRejectedSkipped = 0;
+  // sameFrameDataNotGrowing 早退累计（atomic，实时）。
+  uint64_t semanticManifestCopySkipStableCount = 0;
   uint64_t semanticConsumerBuildCalls = 0;
   uint64_t semanticConsumerBuildUs = 0;
   uint64_t semanticConsumerBuildSkippedFresh = 0;

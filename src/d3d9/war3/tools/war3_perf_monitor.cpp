@@ -3849,6 +3849,17 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << runtimeSummary.semanticVisibleDirectUnitRejectedBuilding << ",\n";
   json << "    \"semanticVisibleDirectUnitRejectedNoGeoset\": "
        << runtimeSummary.semanticVisibleDirectUnitRejectedNoGeoset << ",\n";
+  // Phase 7.97 诊断：ManifestCopy 实际 scan/append 数量。
+  json << "    \"semanticManifestCopyVisibleScanned\": "
+       << runtimeSummary.semanticManifestCopyVisibleScanned << ",\n";
+  json << "    \"semanticManifestCopyAppended\": "
+       << runtimeSummary.semanticManifestCopyAppended << ",\n";
+  json << "    \"semanticManifestCopyDeduplicatedSkipped\": "
+       << runtimeSummary.semanticManifestCopyDeduplicatedSkipped << ",\n";
+  json << "    \"semanticManifestCopyRejectedSkipped\": "
+       << runtimeSummary.semanticManifestCopyRejectedSkipped << ",\n";
+  json << "    \"semanticManifestCopySkipStableCount\": "
+       << runtimeSummary.semanticManifestCopySkipStableCount << ",\n";
   json << "    \"semanticStaticCandidateCount\": "
        << runtimeSummary.semanticStaticCandidateCount << ",\n";
   json << "    \"semanticStaticCandidateBuildingCount\": "

@@ -280,6 +280,13 @@ struct ShadowFrameStats {
   uint64_t contractCaptureSkippedStableSameFrame = 0;
   uint64_t contractCaptureSkippedEmpty = 0;
   uint64_t contractCaptureSkippedDuplicateSameFrame = 0;
+  // Phase 7.97: ManifestCopy 诊断 — 跟踪本次 capture 实际遍历多少 visible
+  // record 与最终 push 进 manifest 的数量。这是桥/斜坡场景下 ManifestCopy
+  // 2.2ms/frame 的根因定位入口，让 control-plane 直接看到爆炸倍数。
+  uint64_t manifestCopyVisibleScanned = 0;
+  uint64_t manifestCopyAppended = 0;
+  uint64_t manifestCopyDeduplicatedSkipped = 0;
+  uint64_t manifestCopyRejectedSkipped = 0;
   uint64_t rootUnitSupplementSeedCount = 0;
   uint64_t rootUnitSupplementUnitSeedCount = 0;
   uint64_t rootUnitSupplementSkippedNoIdentity = 0;
@@ -359,6 +366,37 @@ private:
   uint64_t m_resourceRevision = 0;
   uint64_t m_resourceRefreshFrameSerial = 0;
   uint64_t m_publishRevision = 0;
+
+  // Phase 7.97：ManifestCopy 实时诊断 atomic counter（每次 captureLiveState
+  // 进入 ManifestCopy 都覆盖更新，与 m_stats 不同：m_stats 受 sameFrameDataNotGrowing
+  // 早退影响，可能多帧不变；这两个 counter 永远反映最近一次实际遍历）。
+  mutable std::atomic<uint64_t> m_lastManifestCopyVisibleScanned{0};
+  mutable std::atomic<uint64_t> m_lastManifestCopyAppended{0};
+  mutable std::atomic<uint64_t> m_lastManifestCopyDeduplicatedSkipped{0};
+  mutable std::atomic<uint64_t> m_lastManifestCopyRejectedSkipped{0};
+  mutable std::atomic<uint64_t> m_manifestCopyEnterCount{0};
+  mutable std::atomic<uint64_t> m_manifestCopySkipStableCount{0};
+public:
+  // Phase 7.97 reader：bridge 透传时拉取最近一次 ManifestCopy 的实际遍历
+  // 与 publish 跳过统计。
+  uint64_t lastManifestCopyVisibleScanned() const {
+    return m_lastManifestCopyVisibleScanned.load(std::memory_order_relaxed);
+  }
+  uint64_t lastManifestCopyAppended() const {
+    return m_lastManifestCopyAppended.load(std::memory_order_relaxed);
+  }
+  uint64_t lastManifestCopyDeduplicatedSkipped() const {
+    return m_lastManifestCopyDeduplicatedSkipped.load(std::memory_order_relaxed);
+  }
+  uint64_t lastManifestCopyRejectedSkipped() const {
+    return m_lastManifestCopyRejectedSkipped.load(std::memory_order_relaxed);
+  }
+  uint64_t manifestCopyEnterCount() const {
+    return m_manifestCopyEnterCount.load(std::memory_order_relaxed);
+  }
+  uint64_t manifestCopySkipStableCount() const {
+    return m_manifestCopySkipStableCount.load(std::memory_order_relaxed);
+  }
 };
 
 } // namespace dxvk::war3::shadow

@@ -4164,6 +4164,21 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
       publishedBundle.stats.contractCaptureSkippedEmpty;
   summary.semanticContractCaptureSkippedDuplicateSameFrame =
       publishedBundle.stats.contractCaptureSkippedDuplicateSameFrame;
+  // Phase 7.97 诊断：直接拉 atomic getter，反映最近一次 ManifestCopy 真实
+  // 遍历情况（不受 sameFrameDataNotGrowing publish 早退掩盖）。
+  {
+    auto& contractCache = shadow::ShadowRuntimeContractCache::instance();
+    summary.semanticManifestCopyVisibleScanned =
+        contractCache.lastManifestCopyVisibleScanned();
+    summary.semanticManifestCopyAppended =
+        contractCache.lastManifestCopyAppended();
+    summary.semanticManifestCopyDeduplicatedSkipped =
+        contractCache.lastManifestCopyDeduplicatedSkipped();
+    summary.semanticManifestCopyRejectedSkipped =
+        contractCache.lastManifestCopyRejectedSkipped();
+    summary.semanticManifestCopySkipStableCount =
+        contractCache.manifestCopySkipStableCount();
+  }
   summary.semanticVisibleDirectUnitCandidateAccepted =
       publishedBundle.stats.visibleDirectUnitCandidateAccepted;
   summary.semanticVisibleDirectUnitRejectedNotUnitLike =

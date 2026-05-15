@@ -3431,6 +3431,7 @@ void ShadowRuntimeContractCache::captureLiveState() {
         m_stats.shadowReadyGeosetCount != 0u;
     if (sameFrameDataNotGrowing && priorContractUsable) {
       ++m_stats.contractCaptureSkippedStableSameFrame;
+      m_manifestCopySkipStableCount.fetch_add(1, std::memory_order_relaxed);
       return;
     }
   }
@@ -3457,6 +3458,8 @@ void ShadowRuntimeContractCache::captureLiveState() {
         seenVecSmall.reserve(visibleRecords.size());
       }
     }
+    // Phase 7.97 诊断：记录本帧实际遍历的 visible records 数。
+    stats.manifestCopyVisibleScanned = uint64_t(visibleRecords.size());
     for (const auto& record : visibleRecords) {
       if constexpr (dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly) {
         const uint32_t rejectReason =
@@ -3486,22 +3489,40 @@ void ShadowRuntimeContractCache::captureLiveState() {
             ++stats.visibleDirectUnitRejectedNoGeoset;
             break;
           }
+          ++stats.manifestCopyRejectedSkipped;
           continue;
         }
         ++stats.visibleDirectUnitCandidateAccepted;
         const uint64_t directUnitKey = MakeVisibleDirectUnitKey(record);
         if (useHashSet) {
-          if (!seenSetLarge.insert(directUnitKey).second) continue;
+          if (!seenSetLarge.insert(directUnitKey).second) {
+            ++stats.manifestCopyDeduplicatedSkipped;
+            continue;
+          }
         } else {
           if (std::find(seenVecSmall.begin(), seenVecSmall.end(),
                         directUnitKey) != seenVecSmall.end()) {
+            ++stats.manifestCopyDeduplicatedSkipped;
             continue;
           }
           seenVecSmall.push_back(directUnitKey);
         }
       }
       manifest.records.push_back(ConvertVisible(record, manifest.frameSerial));
+      ++stats.manifestCopyAppended;
     }
+    // Phase 7.97：在 ManifestCopy 出口写 atomic counter。即使本次 capture
+    // 后续被 publish 阶段以 sameFrameDuplicateOrRegression 丢弃，atomic 仍记录
+    // 真实遍历数量。这就是桥/斜坡 record 数量爆炸定位的入口。
+    m_manifestCopyEnterCount.fetch_add(1, std::memory_order_relaxed);
+    m_lastManifestCopyVisibleScanned.store(stats.manifestCopyVisibleScanned,
+                                           std::memory_order_relaxed);
+    m_lastManifestCopyAppended.store(stats.manifestCopyAppended,
+                                     std::memory_order_relaxed);
+    m_lastManifestCopyDeduplicatedSkipped.store(
+        stats.manifestCopyDeduplicatedSkipped, std::memory_order_relaxed);
+    m_lastManifestCopyRejectedSkipped.store(stats.manifestCopyRejectedSkipped,
+                                            std::memory_order_relaxed);
   }
   DemandFillVisibleUnitGeosetBindings(manifest);
   resourceRevision = resourceCache.revision();
