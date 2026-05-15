@@ -44,6 +44,29 @@
 - `21_render_logic_bridge_optimization_notes/README.md`：渲染层对象到逻辑层 `CAgent/CUnit` 桥接的现状、热点和低损耗入口盘点。
 - `22_cmodel_pose_palette_reverse/README.md`：`CModelData/CGeosetData -> matrix-group remap -> CModel 最终 3x4 pose palette -> attachment/runtimeModel` 专题逆向。
 - `23_blob_shadow_lista_upstream_reverse/README.md`：`Blob 阴影 / ListA` 上游写入链专题逆向，收口 `StaticStamp / RegisterImage / UberSplat / ListA mixed layer` 的真实关系。
+- `24_cdoodads_static_shadow_upstream/README.md`：**`CDoodads + CUnit + FogMask` 静态阴影完整逆向（v3）**。
+  v1 误以为 CDoodads 是建筑阴影主治理点；v2 误以为 CUnit ShadowProjector 是。
+  **v3 决定性发现**：建筑预渲染贴花阴影既不走 CDoodads 也不走 CUnit ShadowProjector，
+  而是通过 `TerrainShadow_WriteMaskRegion (0x234710)` 直接修改 `CFogMaskTable` 的 16-bit mask grid
+  （和战争迷雾、视野、路径阻挡共享）。这解释了为什么历史所有针对 RegisterImage / StaticStamp / ListA/B
+  的拦截都不能消除建筑阴影（包括 AGENTS 第 57 条 `Mode1_BlockAllRegisterImage` 极限实验）。
+  CDoodads `a6` mask 注入仍能关树木阴影；建筑阴影必须 hook `WriteMaskRegion` 按 type code bit
+  做精细屏蔽（不能整体 return，否则同时关 fog/视野）。
+- `../../plan/overnight_render_paper_2026_05_15/06_fogmask_static_shadow.md`：
+  **24 文档 v3 之后的完整 FogMask 论文（2026-05-15 夜间无人值守新增）**。
+  揭示真正的根因：
+  (1) 4 个并行 mask layer 实际是 *2 mask + 2 elevation grid*：
+      `+0x2C` clearMaskBase / `+0x30` setMaskBase / `+0x38` elevationMaskBase / `+0x3C` aboveCurrentMaskBase；
+  (2) `WriteMaskRegion` 的 `a3 type code` 第 0..11 位是 *12 个 player slot 共享视野 mask*，
+      不是"类型分桶"；
+  (3) 真正决定"在哪份 mask 上写"的是对象 `+0x10C` 字段的 `mask idx`：
+      `idx=0 fog / idx=1 LOS / idx=2 path / idx=3 shadow footprint / idx=4 flying`；
+  (4) **静态阴影治理最干净方案**：hook `WriteMaskRegion` + 仅当 `*(a2+0x10C) == 3` 拦截，
+      不影响 fog/LOS/path；
+  (5) `CWidget_RegisterFootprintAndShadowMask (0x65A140)` 30+ caller 完整分桶；
+  (6) `magic 0x2B5DB42C` 是 `CWidget` 类型签名，仅注册 widget 才有；
+  (7) 4 次历史失败拦截尝试的反证表。
+  ★ 所有结论已通过 IDA 写回（41 处 rename + 14 条 set_comments，全部 ok）。
 - `24_crash_tracking_autotest/README.md`：War3 未处理异常 `.dmp + JSON` 崩溃摘要落盘，以及 AutoTest 对最近崩溃证据的回收。
 - `native/README.md`：基于 ASM 的魔兽原生渲染链还原进度与优化方案草案。
 - `14_2026_02_26_static_shadow_write_gate_closeout/README.md`：静态阴影“写入端五轮计划”收官报告（证据、验收与残余风险）。
@@ -82,6 +105,27 @@
 - 已新增 `23_blob_shadow_lista_upstream_reverse/README.md`：
   - 已修正“`RegisterImageEntry = ListA 本体上游`”这一旧结论，确认 `0x713250` 更接近 stamp/image 注册池，而 `ListA` 本体网格由 `0x738ED0 -> 0x73DC00 -> 0x73D9F0` 批量构建。
   - 已确认建筑静态阴影真正的高层生产者是 `ShadowPath_StaticStamp_Toggle / TerrainShadow_ToggleStaticStampFromObject / TerrainShadow_ToggleEmitterStamp / CTerrainUberSplats(WithParams)`，并由 `0x74D500/0x751290/0x759880/0x7599F0/0x75C5F0` 这一对象级调度层统一开关。
+- 已新增 `24_cdoodads_static_shadow_upstream/README.md`（v3 重大修正版）：
+  - **v1 误判**：把 `CDoodads` 5 个调度器当成"建筑/可破坏物/装饰物的真正治理点"——错。`CDoodads` 只管树木/装饰物/腐地，不管建筑。
+  - **v2 误判**：把 CUnit `ShadowProjector` 列表当成"建筑阴影路径"——也错。那是单位脚下方块 emitter，不画建筑底部矩形贴花。
+  - **v3 决定性发现**（本轮）：通过 `list_funcs("TerrainShadow")` 发现一组之前所有研究都未提及的函数：
+    - `TerrainShadow_WriteMaskRegion (0x234710)` — 真正的写入函数；
+    - `TerrainShadow_WriteMaskRegion_ForObject (0x234620)`；
+    - `TerrainShadow_WriteMaskRegion_FromActorRuntime (0x3DB260)`；
+    - `TerrainShadow_RebuildMaskFromObjectLists (0x233E90)`。
+  - 这条路径**完全绕过 ListA/ListB/RegisterImage/Stamp 任何注册池**，直接修改 `CFogMaskTable`（源文件
+    `War3\Source\Game\CFogMaskTable.h`）的 16-bit mask grid，由地形渲染管线在画地面 tile 时按 mask bit 着色。
+  - 6 个 caller 中包含两个关键中央点：
+    - `sub_6F65A140` → `CWidget_RegisterFootprintAndShadowMask`（30+ caller，几乎所有 unit 状态变化）；
+    - `sub_6F514F40` → `CUnit_StampBuildingShadowFootprint`（CUnit lifecycle helper）。
+  - **反证证据**：AGENTS 第 57 条 `Mode1_BlockAllRegisterImage` 极限实验把 RegisterImage 全部封堵后游戏崩溃，
+    但建筑阴影并没消失——证明 RegisterImage 根本不是建筑阴影的写入路径。
+  - **正确治理路径**：hook `TerrainShadow_WriteMaskRegion` 本身，按 `a3 type code` 的 16 bit 拆分屏蔽（高 7 bit 是 elevation、低 9 bit 是
+    type 标志；具体哪一 bit 是 building shadow footprint 需要下一轮 in-game A/B 实验逐 bit 锁定），
+    **绝不能整体 return**（会同时关 fog-of-war / 视野 / 路径阻挡）。
+  - CDoodads `a6` mask 注入方案（v1/v2 蓝图）仍然有效，可独立关树木/装饰物/腐地阴影；
+    CUnit ShadowProjector hook 只能关单位脚下方块那种 emitter 阴影。
+  - 已把 14+8 个关键函数（CDoodads / CUnit / FogMask 三套）命名 + 中文注释回写到 IDA。
 - 已基于 ASM 确认 `TerrainShadow_RenderLayer` 的参数语义：`a2` 控制 ListA，`a3` 控制 ListB。
 - 已基于 ASM 追加确认：`CWorld_TerrainShadow_Dispatch(stage14)` 会直调 `TerrainShadow_RenderListB(type=4)`，不经过 `RenderLayer(a3)`。
 - 已补齐 `ShadowProjector_Add_FromObject / ShadowProjector_Add_Simple` Hook 入口，接入可配置拦截策略。
