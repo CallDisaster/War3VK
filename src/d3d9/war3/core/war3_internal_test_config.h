@@ -924,9 +924,9 @@ inline constexpr uint32_t kShadowSemanticIdentityChurnHoldFrames = 120;
 inline constexpr bool kShadowSunTimeQuantizationEnabled = false;
 // 级联剔除是否对建筑默认完全关闭（性能代价较大，发布档默认关闭该极端策略）。
 inline constexpr bool kShadowCascadeCullDisableForBuildings = false;
-// semantic 动态阴影已经进入 no-fallback 主路径后，单位也需要参与安全级联剔除，
-// 否则 skinned caster 会在所有 cascade 中重复重放，dynamic pressure 直接 GPU bound。
-inline constexpr bool kShadowCascadeCullDisableForUnits = true;
+// Phase 7.92：cascade 2/3 only cull + entry.sceneNode 世界位置。
+// 近 cascade 0/1 始终不 cull（intersectsCascade 里 cascadeIdx < 2 直接 return true）。
+inline constexpr bool kShadowCascadeCullDisableForUnits = false;
 // 蒙皮单位的 bounds 来自 CModel pose/local bounds，当前保守放大后再做级联剔除：
 // 半径偏大会少剔除但不会缺阴影；偏小则会造成远镜头/低 Z 处 caster 缺底。
 inline constexpr float kShadowCascadeCullSkinnedRadiusScale = 1.55f;

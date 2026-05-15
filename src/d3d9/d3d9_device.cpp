@@ -11502,14 +11502,27 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   instance.replayDrawIndex =
       static_cast<uint32_t>(m_war3Scene.shadowCasters.size());
   instance.batchHandle = draw.batchHandle;
-  // Phase 7.55 v4：当我们用 draw-time VB 时，bounds 计算可能不可靠：
-  //   - 动态单位 v4 路径 worldMatrix=identity，translation=(0,0,0)，
-  //     若 palette stale 也是 (0,0,0)，bounds 中心错算成世界原点
-  //   - 这导致视角离开 (0,0,0) 时 cull 全部判定为不可见 → 大面积闪烁
-  // 修复：v4 hit 时把 boundsRadius 设为 0，让 cull 走"无效 bounds = 通过"路径。
-  // 性能影响小：v4 hit 的 caster 本来就在 capture 时被引擎绘制，必然在视野内。
+  // Phase 7.92：v4 hit 时从 entry.sceneNode 读世界位置用于远 cascade cull。
+  // cascade 0/1 不 cull（intersectsCascade 里 cascadeIdx<2 直接 return true），
+  // 所以即使 bounds 不完美也不会让近处阴影消失。
   if (drawTimeVBOverrideApplied) {
-    draw.boundsRadius = 0.0f;
+    if (drawTimeVBEntry != nullptr && drawTimeVBEntry->sceneNode != nullptr) {
+      const auto* matBase = reinterpret_cast<const uint8_t*>(
+          drawTimeVBEntry->sceneNode) + dxvk::war3::SceneNodeOffsets::WorldMatrix;
+      float raw[12] = {};
+      if (dxvk::war3::IsReadableRangeFast(matBase, sizeof(raw))) {
+        std::memcpy(raw, matBase, sizeof(raw));
+        draw.boundsCenter = Vector4(raw[9], raw[10], raw[11], 1.0f);
+        float baseR = War3SemanticBoundsRadiusForObjectKind(draw.objectKind);
+        if (baseR <= 0.0f) baseR = 260.0f;
+        draw.boundsRadius = baseR +
+            dxvk::war3::internal::kShadowCascadeCullSkinnedExtraRadius;
+      } else {
+        draw.boundsRadius = 0.0f;
+      }
+    } else {
+      draw.boundsRadius = 0.0f;
+    }
   }
   instance.paletteIndex = draw.paletteIndex;
   instance.worldMatrix = draw.worldMatrix;
@@ -12074,8 +12087,26 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     draw.batchTag = War3BatchTag::WorldObjects;
     draw.batchHandle = record.identity.jHandle;
     draw.objectKind = static_cast<uint8_t>(objectKind);
-    draw.boundsCenter = War3SemanticBoundsTranslation(draw.worldMatrix);
-    draw.boundsRadius = 0.0f;
+    // Phase 7.92：从 entry.sceneNode 读世界位置用于远 cascade cull。
+    if (entry.sceneNode != nullptr) {
+      const auto* matBase = reinterpret_cast<const uint8_t*>(entry.sceneNode)
+          + dxvk::war3::SceneNodeOffsets::WorldMatrix;
+      float raw[12] = {};
+      if (dxvk::war3::IsReadableRangeFast(matBase, sizeof(raw))) {
+        std::memcpy(raw, matBase, sizeof(raw));
+        draw.boundsCenter = Vector4(raw[9], raw[10], raw[11], 1.0f);
+        float baseR = War3SemanticBoundsRadiusForObjectKind(draw.objectKind);
+        if (baseR <= 0.0f) baseR = 260.0f;
+        draw.boundsRadius = baseR +
+            dxvk::war3::internal::kShadowCascadeCullSkinnedExtraRadius;
+      } else {
+        draw.boundsCenter = War3SemanticBoundsTranslation(draw.worldMatrix);
+        draw.boundsRadius = 0.0f;
+      }
+    } else {
+      draw.boundsCenter = War3SemanticBoundsTranslation(draw.worldMatrix);
+      draw.boundsRadius = 0.0f;
+    }
 
     War3ShadowInstanceRef instance = {};
     instance.geometryId = 0u;
@@ -13566,8 +13597,26 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                            ? eligible.packet.renderable.jHandle
                            : eligible.sample.contract.jHandle;
     draw.objectKind = static_cast<uint8_t>(resolvedObjectKind);
-    draw.boundsCenter = War3SemanticBoundsTranslation(draw.worldMatrix);
-    draw.boundsRadius = 0.0f;
+    // Phase 7.92：从 entry.sceneNode 读世界位置用于远 cascade cull。
+    if (entry.sceneNode != nullptr) {
+      const auto* matBase = reinterpret_cast<const uint8_t*>(entry.sceneNode)
+          + dxvk::war3::SceneNodeOffsets::WorldMatrix;
+      float raw[12] = {};
+      if (dxvk::war3::IsReadableRangeFast(matBase, sizeof(raw))) {
+        std::memcpy(raw, matBase, sizeof(raw));
+        draw.boundsCenter = Vector4(raw[9], raw[10], raw[11], 1.0f);
+        float baseR = War3SemanticBoundsRadiusForObjectKind(draw.objectKind);
+        if (baseR <= 0.0f) baseR = 260.0f;
+        draw.boundsRadius = baseR +
+            dxvk::war3::internal::kShadowCascadeCullSkinnedExtraRadius;
+      } else {
+        draw.boundsCenter = War3SemanticBoundsTranslation(draw.worldMatrix);
+        draw.boundsRadius = 0.0f;
+      }
+    } else {
+      draw.boundsCenter = War3SemanticBoundsTranslation(draw.worldMatrix);
+      draw.boundsRadius = 0.0f;
+    }
 
     War3ShadowInstanceRef instance = {};
     instance.geometryId = 0u;

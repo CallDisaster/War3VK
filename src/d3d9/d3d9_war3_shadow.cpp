@@ -1745,6 +1745,10 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       return true;
     if (!(draw.boundsRadius > 0.0f))
       return true;
+    // Phase 7.92：适配 War3 RTS 俯视镜头。cascade 0/1 覆盖玩家视野核心区域，
+    // 不做 cull 保证近处阴影完整；cascade 2/3 覆盖远处，做 cull 省 draw。
+    if (cascadeIdx < 2u)
+      return true;
     const auto objectKind = static_cast<ObjectKind>(draw.objectKind);
     if constexpr (war3::internal::kShadowCascadeCullDisableForUnits) {
       if (objectKind == ObjectKind::Unit)
