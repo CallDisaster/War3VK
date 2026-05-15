@@ -12142,11 +12142,15 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   // useful as a diagnostic/fallback, but using every key seen during the lease
   // window as "preferred" makes the preferred set grow until it covers most
   // candidates, which reintroduces cap-boundary identity churn.
+  // Phase 7.85：previousSubmittedObjectIdentityKeys / PartIdentityKeys 只在
+  // 函数末尾被 computeJaccardMilli 读取，不会被修改 → 改成 const reference
+  // 省下两次 vector 拷贝。previousSubmittedSelectionKeys 仍要拷贝因为下游
+  // preferredSelectionKeys 会从它复制后修改。
   std::vector<uint64_t> previousSubmittedSelectionKeys =
       m_war3SemanticDirectPrevSubmittedIdentityKeys;
-  std::vector<uint64_t> previousSubmittedObjectIdentityKeys =
+  const std::vector<uint64_t>& previousSubmittedObjectIdentityKeys =
       m_war3SemanticDirectPrevSubmittedObjectIdentityKeys;
-  std::vector<uint64_t> previousSubmittedPartIdentityKeys =
+  const std::vector<uint64_t>& previousSubmittedPartIdentityKeys =
       m_war3SemanticDirectPrevSubmittedPartIdentityKeys;
   std::vector<uint64_t> leasedSelectionKeys;
   if (stickySelectionLease) {
