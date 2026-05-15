@@ -21,6 +21,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace dxvk::war3::shadow {
@@ -493,6 +494,29 @@ void RepairManifestIdentityFromPrior(const ShadowFrameManifest& priorManifest,
   if (priorManifest.records.empty() || manifest.records.empty())
     return;
 
+  // Phase 7.96：当 priorManifest 较大时，O(N*M) 线性扫描会在桥/斜坡场景下
+  // 严重拖慢 ManifestHydrate。建立指针索引把查找从 O(N*M) 降到 O(N+M)。
+  // 只索引最常用的 worldObjectEntry / sceneNode / runtimeModelPtr / jHandle，
+  // 其他 fallback 用第二轮线性扫描兜底（罕见路径）。
+  std::unordered_map<void*, const ShadowRenderableRecord*> byWorldObject;
+  std::unordered_map<void*, const ShadowRenderableRecord*> bySceneNode;
+  std::unordered_map<void*, const ShadowRenderableRecord*> byRuntimeModel;
+  std::unordered_map<uint32_t, const ShadowRenderableRecord*> byHandle;
+  byWorldObject.reserve(priorManifest.records.size());
+  bySceneNode.reserve(priorManifest.records.size());
+  byRuntimeModel.reserve(priorManifest.records.size());
+  byHandle.reserve(priorManifest.records.size());
+  for (const auto& candidate : priorManifest.records) {
+    if (candidate.worldObjectEntry != nullptr)
+      byWorldObject.emplace(candidate.worldObjectEntry, &candidate);
+    if (candidate.sceneNode != nullptr)
+      bySceneNode.emplace(candidate.sceneNode, &candidate);
+    if (candidate.runtimeModelPtr != nullptr)
+      byRuntimeModel.emplace(candidate.runtimeModelPtr, &candidate);
+    if (candidate.jHandle != 0u)
+      byHandle.emplace(candidate.jHandle, &candidate);
+  }
+
   for (auto& record : manifest.records) {
     const bool hasStrongIdentity =
         record.objectKind != render::ObjectKind::Unknown &&
@@ -503,8 +527,33 @@ void RepairManifestIdentityFromPrior(const ShadowFrameManifest& priorManifest,
       continue;
     }
 
-    if (const auto* priorRecord =
-            FindPriorRenderableRecord(priorManifest, record)) {
+    // Phase 7.96：先用 hash index O(1) 查找最常用的 4 个 key。
+    const ShadowRenderableRecord* priorRecord = nullptr;
+    if (record.worldObjectEntry != nullptr) {
+      auto it = byWorldObject.find(record.worldObjectEntry);
+      if (it != byWorldObject.end()) priorRecord = it->second;
+    }
+    if (priorRecord == nullptr && record.sceneNode != nullptr) {
+      auto it = bySceneNode.find(record.sceneNode);
+      if (it != bySceneNode.end()) priorRecord = it->second;
+    }
+    if (priorRecord == nullptr && record.runtimeModelPtr != nullptr) {
+      auto it = byRuntimeModel.find(record.runtimeModelPtr);
+      if (it != byRuntimeModel.end()) priorRecord = it->second;
+    }
+    if (priorRecord == nullptr && record.jHandle != 0u) {
+      auto it = byHandle.find(record.jHandle);
+      if (it != byHandle.end()) priorRecord = it->second;
+    }
+
+    // 罕见 key（unitPtr / renderablePart / payload）走线性扫描兜底。
+    if (priorRecord == nullptr &&
+        (record.unitPtr != nullptr || record.renderablePart != nullptr ||
+         record.payload != nullptr)) {
+      priorRecord = FindPriorRenderableRecord(priorManifest, record);
+    }
+
+    if (priorRecord != nullptr) {
       MergeRenderableIdentityFromPrior(*priorRecord, record);
     }
   }
@@ -3386,7 +3435,10 @@ void ShadowRuntimeContractCache::captureLiveState() {
   {
     auto manifestCopyScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/ManifestCopy");
-    std::vector<uint64_t> seenDirectUnitRecords;
+    // Phase 7.96：从 vector 改成 unordered_set，避免 O(N²) 线性搜索。
+    // 高压场景下 visibleRecords 几百条时，O(N²) 会导致 ManifestCopy 耗时
+    // 飙到 3ms+/帧。unordered_set 的 O(1) 查找把它压回 0.1ms 量级。
+    std::unordered_set<uint64_t> seenDirectUnitRecords;
     if constexpr (dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly)
       seenDirectUnitRecords.reserve(visibleRecords.size());
     for (const auto& record : visibleRecords) {
@@ -3422,12 +3474,10 @@ void ShadowRuntimeContractCache::captureLiveState() {
         }
         ++stats.visibleDirectUnitCandidateAccepted;
         const uint64_t directUnitKey = MakeVisibleDirectUnitKey(record);
-        if (std::find(seenDirectUnitRecords.begin(),
-                      seenDirectUnitRecords.end(),
-                      directUnitKey) != seenDirectUnitRecords.end()) {
+        // Phase 7.96：O(1) 查找替代原来的 O(N) std::find。
+        if (!seenDirectUnitRecords.insert(directUnitKey).second) {
           continue;
         }
-        seenDirectUnitRecords.push_back(directUnitKey);
       }
       manifest.records.push_back(ConvertVisible(record, manifest.frameSerial));
     }

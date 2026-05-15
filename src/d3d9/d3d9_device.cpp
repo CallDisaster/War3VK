@@ -9284,13 +9284,12 @@ bool D3D9DeviceEx::War3TryPublishSemanticDrawTimePose() {
   const uint64_t dedupeKey =
       (uint64_t(reinterpret_cast<uintptr_t>(semantic.runtimeModelPtr)) >> 4u) ^
       (hash + 0x9E3779B97F4A7C15ull);
-  if (std::find(m_war3SemanticDrawTimePoseKeys.begin(),
-                m_war3SemanticDrawTimePoseKeys.end(),
-                dedupeKey) != m_war3SemanticDrawTimePoseKeys.end()) {
+  // Phase 7.96：unordered_set::insert 返回 (iter, inserted)，第二个是 bool。
+  // false 表示 key 已存在，等价于原来的 std::find != end。
+  if (!m_war3SemanticDrawTimePoseKeys.insert(dedupeKey).second) {
     m_war3Scene.shadowStats.semanticSceneDrawTimePoseDedupedCount++;
     return false;
   }
-  m_war3SemanticDrawTimePoseKeys.push_back(dedupeKey);
 
   void* unitPtr = semantic.object != nullptr ? semantic.object->unitPtr : nullptr;
   dxvk::war3::model::PoseRegistry::instance().recordMatrixPalette(
