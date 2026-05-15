@@ -4,7 +4,9 @@
 #include "../../../util/util_matrix.h"
 
 #include <cstdint>
+#include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -128,11 +130,13 @@ private:
                                       void *runtimeModelPtr,
                                       uint32_t modelType, uint32_t flags);
 
-  mutable std::mutex m_mutex;
+  // Phase 7.83：reader 路径主走 findBySprite/findByRuntimeModel/findByPath，
+  // writer 路径只在 noteResource* / beginFrame / endFrame 调用。
+  mutable std::shared_mutex m_mutex;
   std::unordered_map<void *, ModelResourceRecord> m_bySprite;
   std::unordered_map<void *, ModelResourceRecord> m_byRuntimeModel;
   std::unordered_map<std::string, ModelResourceRecord> m_byPath;
-  uint64_t m_frameNumber = 0;
+  std::atomic<uint64_t> m_frameNumber{0};
 };
 
 class ModelInstanceRegistry {
@@ -203,7 +207,9 @@ private:
   void propagateRuntimeOwnerIdentityLocked(
       void *rootRuntimeModelPtr, const ModelInstanceRecord &ownerRecord);
 
-  mutable std::mutex m_mutex;
+  // Phase 7.83：与 PoseRegistry 同模式。reader 路径（findBy*/snapshot/*Count
+  // /frameNumber）每帧 400-3000 次。
+  mutable std::shared_mutex m_mutex;
   std::unordered_map<void *, ModelInstanceRecord> m_byWorldObjectEntry;
   std::unordered_map<void *, ModelInstanceRecord> m_bySceneNode;
   std::unordered_map<void *, ModelInstanceRecord> m_byUnitPtr;
@@ -213,7 +219,7 @@ private:
   std::unordered_map<void*, ModelInstanceRecord> m_bySourceObject;
   std::unordered_map<void*, ModelInstanceRecord> m_bySourceSpriteObject;
   std::unordered_map<uint32_t, ModelInstanceRecord> m_byHandle;
-  uint64_t m_frameNumber = 0;
+  std::atomic<uint64_t> m_frameNumber{0};
 };
 
 class PoseRegistry {
@@ -254,11 +260,16 @@ private:
 
   void storeRecord(const PoseRecord &record);
 
-  mutable std::mutex m_mutex;
+  // Phase 7.83：reader 路径（findBy*/snapshot/*Count）每帧 200-2000 次，
+  // 写路径（recordPose/recordSpriteFramePose/recordMatrixPalette/begin/endFrame）
+  // 远少于 read。改 shared_mutex 后 reader 走 shared_lock，writer 走 unique_lock。
+  // m_frameNumber 是 begin/endFrame 单调写、reader 高频读，改 atomic 让
+  // frameNumber() 走 relaxed load 避免锁。
+  mutable std::shared_mutex m_mutex;
   std::unordered_map<void *, PoseRecord> m_byRuntimeModel;
   std::unordered_map<void *, PoseRecord> m_bySceneNode;
   std::unordered_map<void *, PoseRecord> m_byUnitPtr;
-  uint64_t m_frameNumber = 0;
+  std::atomic<uint64_t> m_frameNumber{0};
 };
 
 class AttachmentRigidRegistry {
@@ -312,7 +323,8 @@ private:
 
   void storeRecord(const AttachmentRigidRecord& record);
 
-  mutable std::mutex m_mutex;
+  // Phase 7.83：reader 高频，writer 低频。
+  mutable std::shared_mutex m_mutex;
   std::unordered_map<void*, AttachmentRigidRecord> m_byChildRuntimeModel;
   std::unordered_map<void*, AttachmentRigidRecord> m_byOwnerRuntimeModel;
   std::unordered_map<void*, AttachmentRigidRecord> m_byRootRuntimeModel;
@@ -320,7 +332,7 @@ private:
   std::unordered_map<void*, AttachmentRigidRecord> m_bySceneNode;
   std::unordered_map<void*, AttachmentRigidRecord> m_byUnitPtr;
   std::unordered_map<uint32_t, AttachmentRigidRecord> m_byHandle;
-  uint64_t m_frameNumber = 0;
+  std::atomic<uint64_t> m_frameNumber{0};
 };
 
 } // namespace model

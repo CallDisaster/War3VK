@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -143,15 +145,19 @@ private:
   void storeModelRecord(const ShadowModelResourceRecord &record);
   void storeRuntimeModelRecord(const ShadowModelResourceRecord &record);
 
-  mutable std::mutex m_mutex;
+  // Phase 7.83：reader 路径（findGeoset*/findModel*/findRuntime*/snapshot*/*Count）
+  // 远多于 writer。改 shared_mutex 让 reader 走 shared_lock，writer 走 unique_lock。
+  // m_frameNumber / m_revision 是单调写、reader 高频读，改 atomic 让 const 读
+  // 路径走 relaxed load。
+  mutable std::shared_mutex m_mutex;
   std::unordered_map<void *, ShadowGeosetResourceRecord> m_byGeoset;
   std::unordered_map<void *, ShadowGeosetResourceRecord> m_byGeosetData;
   std::unordered_map<void *, ShadowModelResourceRecord> m_byModelResource;
   std::unordered_map<void *, ShadowModelResourceRecord> m_byRuntimeModel;
   std::unordered_map<void *, void *> m_runtimeOwnerByGeoset;
   std::unordered_map<void *, void *> m_runtimeOwnerByGeosetData;
-  uint64_t m_frameNumber = 0;
-  uint64_t m_revision = 0;
+  std::atomic<uint64_t> m_frameNumber{0};
+  std::atomic<uint64_t> m_revision{0};
 };
 
 } // namespace dxvk::war3::model

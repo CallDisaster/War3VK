@@ -4,8 +4,10 @@
 #include "war3_render_objects.h"
 #include "../../../util/util_matrix.h"
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -113,14 +115,15 @@ private:
                                   uint32_t jHandle, uint32_t rawcode,
                                   ObjectKind kind);
 
-  mutable std::mutex m_mutex;
+  // Phase 7.83：reader 路径（findBy*/snapshot/recordCount/frameNumber）远多于 writer。
+  mutable std::shared_mutex m_mutex;
   std::unordered_map<void *, ShadowObjectRecord> m_byWorldObjectEntry;
   std::unordered_map<void *, ShadowObjectRecord> m_bySceneNode;
   std::unordered_map<void *, ShadowObjectRecord> m_byUnitPtr;
   std::unordered_map<void *, ShadowObjectRecord> m_bySpritePtr;
   std::unordered_map<void *, ShadowObjectRecord> m_byRuntimeModel;
   std::unordered_map<uint32_t, ShadowObjectRecord> m_byHandle;
-  uint64_t m_frameNumber = 0;
+  std::atomic<uint64_t> m_frameNumber{0};
 };
 
 } // namespace render

@@ -1,4 +1,4 @@
-// war3_shadow_object_registry.cpp - 阴影对象运行时骨架实现
+﻿// war3_shadow_object_registry.cpp - 闃村奖瀵硅薄杩愯鏃堕鏋跺疄鐜?
 
 #include "war3_shadow_object_registry.h"
 
@@ -135,12 +135,12 @@ ShadowObjectRegistry &ShadowObjectRegistry::instance() {
 }
 
 void ShadowObjectRegistry::beginFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  ++m_frameNumber;
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void ShadowObjectRegistry::endFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
 }
 
 void ShadowObjectRegistry::storeRecord(const ShadowObjectRecord &record) {
@@ -196,7 +196,7 @@ void ShadowObjectRegistry::noteRenderObject(const RenderObjectInfo &info) {
       !info.hasValidHandle())
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   noteInstanceIdentityLocked(info.worldObjectEntry, info.sceneNode, info.unitPtr,
                              nullptr, info.jHandle, info.rawcode, info.kind);
 }
@@ -206,7 +206,7 @@ void ShadowObjectRegistry::noteRenderObjectsBatch(
   if (infos.empty())
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   for (const auto *info : infos) {
     if (info == nullptr)
       continue;
@@ -227,7 +227,7 @@ void ShadowObjectRegistry::noteInstanceIdentity(void *worldObjectEntry,
                                                 uint32_t jHandle,
                                                 uint32_t rawcode,
                                                 ObjectKind kind) {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   noteInstanceIdentityLocked(worldObjectEntry, sceneNode, unitPtr, spritePtr,
                              jHandle, rawcode, kind);
 }
@@ -309,8 +309,8 @@ void ShadowObjectRegistry::noteInstanceIdentityLocked(void *worldObjectEntry,
   }
 
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -324,7 +324,7 @@ void ShadowObjectRegistry::noteModelBinding(void *spritePtr,
   if (!spritePtr || (!runtimeModelPtr && modelKey == 0 && modelPath.empty()))
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ShadowObjectRecord record = {};
   auto itSprite = m_bySpritePtr.find(spritePtr);
   if (itSprite != m_bySpritePtr.end())
@@ -359,8 +359,8 @@ void ShadowObjectRegistry::noteModelBinding(void *spritePtr,
   if (modelFlags != 0)
     record.modelFlags = modelFlags;
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -374,7 +374,7 @@ void ShadowObjectRegistry::notePose(void *runtimeModelPtr, void *sceneNode,
   if (!runtimeModelPtr && !sceneNode && !unitPtr)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ShadowObjectRecord record = {};
   if (runtimeModelPtr) {
     auto it = m_byRuntimeModel.find(runtimeModelPtr);
@@ -413,10 +413,10 @@ void ShadowObjectRegistry::notePose(void *runtimeModelPtr, void *sceneNode,
   }
   record.matrixCount = matrixCount;
   record.matrixHash = matrixHash;
-  record.lastRootPoseFrame = m_frameNumber;
+  record.lastRootPoseFrame = m_frameNumber.load(std::memory_order_relaxed);
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -428,7 +428,7 @@ void ShadowObjectRegistry::noteSpriteFramePose(
   if (!runtimeModelPtr && !spritePtr && !sceneNode && !unitPtr)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ShadowObjectRecord record = {};
   if (runtimeModelPtr) {
     auto it = m_byRuntimeModel.find(runtimeModelPtr);
@@ -464,11 +464,11 @@ void ShadowObjectRegistry::noteSpriteFramePose(
     record.matrixCount = matrixCount;
     record.matrixHash = matrixHash;
   }
-  record.lastSpriteFramePoseFrame = m_frameNumber;
+  record.lastSpriteFramePoseFrame = m_frameNumber.load(std::memory_order_relaxed);
   record.spriteFrameSampleCount = 1;
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -476,7 +476,7 @@ bool ShadowObjectRegistry::findByWorldObjectEntry(void *worldObjectEntry,
                                                   ShadowObjectRecord &out) const {
   if (!worldObjectEntry)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byWorldObjectEntry.find(worldObjectEntry);
   if (it == m_byWorldObjectEntry.end())
     return false;
@@ -488,7 +488,7 @@ bool ShadowObjectRegistry::findBySceneNode(void *sceneNode,
                                            ShadowObjectRecord &out) const {
   if (!sceneNode)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySceneNode.find(sceneNode);
   if (it == m_bySceneNode.end())
     return false;
@@ -500,7 +500,7 @@ bool ShadowObjectRegistry::findByUnitPtr(void *unitPtr,
                                          ShadowObjectRecord &out) const {
   if (!unitPtr)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byUnitPtr.find(unitPtr);
   if (it == m_byUnitPtr.end())
     return false;
@@ -512,7 +512,7 @@ bool ShadowObjectRegistry::findByHandle(uint32_t jHandle,
                                         ShadowObjectRecord &out) const {
   if (jHandle == 0)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byHandle.find(jHandle);
   if (it == m_byHandle.end())
     return false;
@@ -524,7 +524,7 @@ bool ShadowObjectRegistry::findBySpritePtr(void *spritePtr,
                                            ShadowObjectRecord &out) const {
   if (!spritePtr)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySpritePtr.find(spritePtr);
   if (it == m_bySpritePtr.end())
     return false;
@@ -536,7 +536,7 @@ bool ShadowObjectRegistry::findByRuntimeModel(void *runtimeModelPtr,
                                               ShadowObjectRecord &out) const {
   if (!runtimeModelPtr)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byRuntimeModel.find(runtimeModelPtr);
   if (it == m_byRuntimeModel.end())
     return false;
@@ -545,7 +545,7 @@ bool ShadowObjectRegistry::findByRuntimeModel(void *runtimeModelPtr,
 }
 
 std::vector<ShadowObjectRecord> ShadowObjectRegistry::snapshot() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   std::vector<ShadowObjectRecord> out;
   out.reserve(m_bySceneNode.size() + m_bySpritePtr.size() + m_byRuntimeModel.size());
   for (const auto &it : m_bySceneNode)
@@ -558,7 +558,7 @@ std::vector<ShadowObjectRecord> ShadowObjectRegistry::snapshot() const {
 }
 
 size_t ShadowObjectRegistry::runtimeBoundCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto& it : m_byRuntimeModel) {
     const auto& record = it.second;
@@ -569,7 +569,7 @@ size_t ShadowObjectRegistry::runtimeBoundCount() const {
 }
 
 size_t ShadowObjectRegistry::completeIdentityCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto& it : m_byRuntimeModel) {
     const auto& record = it.second;
@@ -583,7 +583,7 @@ size_t ShadowObjectRegistry::completeIdentityCount() const {
 }
 
 size_t ShadowObjectRegistry::poseReadyCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto& it : m_byRuntimeModel) {
     const auto& record = it.second;
@@ -597,8 +597,8 @@ size_t ShadowObjectRegistry::poseReadyCount() const {
 }
 
 uint64_t ShadowObjectRegistry::frameNumber() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  return m_frameNumber;
+  // Phase 7.83锛歛tomic 鐩存帴 load銆?
+  return m_frameNumber.load(std::memory_order_relaxed);
 }
 
 } // namespace render

@@ -1,4 +1,4 @@
-// war3_model_registry.cpp - War3 模型资源/实例/姿态运行时骨架实现
+﻿// war3_model_registry.cpp - War3 濡€崇€风挧鍕爱/鐎圭偘绶?婵寧鈧浇绻嶇悰灞炬妤犮劍鐏︾€圭偟骞?
 
 #include "war3_model_registry.h"
 
@@ -357,21 +357,21 @@ uint64_t ModelRegistry::HashRuntimeModelKey(void *modelResourcePtr,
 }
 
 void ModelRegistry::beginFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  ++m_frameNumber;
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void ModelRegistry::endFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   if constexpr (dxvk::war3::internal::
                     kWar3RuntimeConfigDisableSemanticRegistryEndFrameSweeps)
     return;
   for (auto &it : m_bySprite)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_byRuntimeModel)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_byPath)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
 }
 
 void ModelRegistry::recordSpriteModelPath(void *spritePtr, const char *modelPath,
@@ -379,7 +379,7 @@ void ModelRegistry::recordSpriteModelPath(void *spritePtr, const char *modelPath
   if (!spritePtr || !modelPath || !modelPath[0])
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ModelResourceRecord record = {};
   auto it = m_bySprite.find(spritePtr);
   if (it != m_bySprite.end())
@@ -394,8 +394,8 @@ void ModelRegistry::recordSpriteModelPath(void *spritePtr, const char *modelPath
                                 record.modelType, record.flags)
           : HashModelKey(record.modelPath, record.modelType, record.flags);
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   m_bySprite[spritePtr] = record;
   if (record.runtimeModelPtr)
     m_byRuntimeModel[record.runtimeModelPtr] = record;
@@ -410,7 +410,7 @@ void ModelRegistry::recordRuntimeModelBinding(void *spritePtr,
   if (!spritePtr || !runtimeModelPtr)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ModelResourceRecord record = {};
   auto itSprite = m_bySprite.find(spritePtr);
   if (itSprite != m_bySprite.end())
@@ -431,8 +431,8 @@ void ModelRegistry::recordRuntimeModelBinding(void *spritePtr,
                                         record.runtimeModelPtr,
                                         record.modelType, record.flags);
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
 
   m_bySprite[spritePtr] = record;
   m_byRuntimeModel[runtimeModelPtr] = record;
@@ -444,7 +444,7 @@ bool ModelRegistry::findBySprite(void *spritePtr, ModelResourceRecord &out) cons
   if (!spritePtr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySprite.find(spritePtr);
   if (it == m_bySprite.end())
     return false;
@@ -457,7 +457,7 @@ bool ModelRegistry::findByRuntimeModel(void *runtimeModelPtr,
   if (!runtimeModelPtr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byRuntimeModel.find(runtimeModelPtr);
   if (it == m_byRuntimeModel.end())
     return false;
@@ -470,7 +470,7 @@ bool ModelRegistry::findByPath(const std::string &modelPath,
   if (modelPath.empty())
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byPath.find(modelPath);
   if (it == m_byPath.end())
     return false;
@@ -479,7 +479,7 @@ bool ModelRegistry::findByPath(const std::string &modelPath,
 }
 
 std::vector<ModelResourceRecord> ModelRegistry::snapshot() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   std::vector<ModelResourceRecord> out;
   out.reserve(m_bySprite.size());
   for (const auto &it : m_bySprite)
@@ -488,13 +488,13 @@ std::vector<ModelResourceRecord> ModelRegistry::snapshot() const {
 }
 
 size_t ModelRegistry::recordCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_byRuntimeModel.size();
 }
 
 uint64_t ModelRegistry::frameNumber() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  return m_frameNumber;
+  // Phase 7.83锛歮_frameNumber 宸叉敼 atomic锛屼笉鍐嶉渶瑕侀攣銆?
+  return m_frameNumber.load(std::memory_order_relaxed);
 }
 
 ModelInstanceRegistry &ModelInstanceRegistry::instance() {
@@ -503,33 +503,33 @@ ModelInstanceRegistry &ModelInstanceRegistry::instance() {
 }
 
 void ModelInstanceRegistry::beginFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  ++m_frameNumber;
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void ModelInstanceRegistry::endFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   if constexpr (dxvk::war3::internal::
                     kWar3RuntimeConfigDisableSemanticRegistryEndFrameSweeps)
     return;
   for (auto &it : m_byWorldObjectEntry)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_bySceneNode)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_byUnitPtr)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_bySpritePtr)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_byRuntimeModel)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_runtimeOwnerByRuntimeModel)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto& it : m_bySourceObject)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto& it : m_bySourceSpriteObject)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_byHandle)
-    it.second.lastSeenFrame = m_frameNumber;
+    it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
 }
 
 void ModelInstanceRegistry::storeRecord(const ModelInstanceRecord &record) {
@@ -603,7 +603,7 @@ void ModelInstanceRegistry::propagateRuntimeOwnerIdentityLocked(
 
   const auto itExisting = m_runtimeOwnerByRuntimeModel.find(rootRuntimeModelPtr);
   if (itExisting != m_runtimeOwnerByRuntimeModel.end() &&
-      itExisting->second.lastSeenFrame == m_frameNumber &&
+      itExisting->second.lastSeenFrame == m_frameNumber.load(std::memory_order_relaxed) &&
       HasSameRuntimeOwnerIdentity(itExisting->second, ownerRecord)) {
     return;
   }
@@ -627,8 +627,8 @@ void ModelInstanceRegistry::propagateRuntimeOwnerIdentityLocked(
     MergeModelInstanceRecord(merged, ownerRecord);
     merged.runtimeModelPtr = runtimeModelPtr;
     if (merged.firstSeenFrame == 0)
-      merged.firstSeenFrame = m_frameNumber;
-    merged.lastSeenFrame = m_frameNumber;
+      merged.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+    merged.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
     m_runtimeOwnerByRuntimeModel[runtimeModelPtr] = merged;
   }
 }
@@ -660,8 +660,8 @@ void ModelInstanceRegistry::propagateRuntimeSourceObjectLocked(
     if (sourceRecord.sourceSpriteObjectPtr != nullptr)
       merged.sourceSpriteObjectPtr = sourceRecord.sourceSpriteObjectPtr;
     if (merged.firstSeenFrame == 0)
-      merged.firstSeenFrame = m_frameNumber;
-    merged.lastSeenFrame = m_frameNumber;
+      merged.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+    merged.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
     m_byRuntimeModel[runtimeModelPtr] = merged;
   }
 }
@@ -671,7 +671,7 @@ void ModelInstanceRegistry::noteRenderObject(const render::RenderObjectInfo &inf
       !info.hasValidHandle())
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   noteInstanceIdentityLocked(info.worldObjectEntry, info.sceneNode, info.unitPtr,
                              nullptr, info.jHandle, info.rawcode);
 }
@@ -681,7 +681,7 @@ void ModelInstanceRegistry::noteRenderObjectsBatch(
   if (infos.empty())
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   for (const auto *info : infos) {
     if (info == nullptr)
       continue;
@@ -701,7 +701,7 @@ void ModelInstanceRegistry::noteInstanceIdentity(void *worldObjectEntry,
                                                  void *spritePtr,
                                                  uint32_t jHandle,
                                                  uint32_t rawcode) {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   noteInstanceIdentityLocked(worldObjectEntry, sceneNode, unitPtr, spritePtr,
                              jHandle, rawcode);
 }
@@ -779,8 +779,8 @@ void ModelInstanceRegistry::noteInstanceIdentityLocked(void *worldObjectEntry,
     }
   }
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
   if (record.runtimeModelPtr != nullptr && HasRuntimeOwnerIdentity(record))
     propagateRuntimeOwnerIdentityLocked(record.runtimeModelPtr, record);
@@ -790,7 +790,7 @@ void ModelInstanceRegistry::bindSpriteToInstance(void *unitPtr, void *spritePtr)
   if (!unitPtr || !spritePtr)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ModelInstanceRecord &record = m_byUnitPtr[unitPtr];
   record.unitPtr = unitPtr;
   record.spritePtr = spritePtr;
@@ -814,8 +814,8 @@ void ModelInstanceRegistry::bindSpriteToInstance(void *unitPtr, void *spritePtr)
     record.modelResourcePtr = modelRecord.modelResourcePtr;
   }
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
   if (record.runtimeModelPtr != nullptr)
     propagateRuntimeOwnerIdentityLocked(record.runtimeModelPtr, record);
@@ -829,7 +829,7 @@ void ModelInstanceRegistry::bindRuntimeModelToSprite(void *spritePtr,
   if (!spritePtr || !runtimeModelPtr)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ModelInstanceRecord record = {};
   auto itSprite = m_bySpritePtr.find(spritePtr);
   if (itSprite != m_bySpritePtr.end())
@@ -845,8 +845,8 @@ void ModelInstanceRegistry::bindRuntimeModelToSprite(void *spritePtr,
   if (modelResourcePtr)
     record.modelResourcePtr = modelResourcePtr;
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
   if (propagateOwnerIdentity && record.runtimeModelPtr != nullptr)
     propagateRuntimeOwnerIdentityLocked(record.runtimeModelPtr, record);
@@ -860,7 +860,7 @@ void ModelInstanceRegistry::noteRuntimeCreationProvenance(void *runtimeModelPtr,
   if (modelDataPtr == nullptr && callerRva == 0u)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ModelInstanceRecord record = {};
   auto itRuntime = m_byRuntimeModel.find(runtimeModelPtr);
   if (itRuntime != m_byRuntimeModel.end())
@@ -872,8 +872,8 @@ void ModelInstanceRegistry::noteRuntimeCreationProvenance(void *runtimeModelPtr,
   if (callerRva != 0u)
     record.runtimeCreatorCallerRva = callerRva;
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -885,7 +885,7 @@ void ModelInstanceRegistry::noteRuntimeResolveProvenance(void *runtimeModelPtr,
   if (creatorHandlePtr == nullptr && callerRva == 0u)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ModelInstanceRecord record = {};
   auto itRuntime = m_byRuntimeModel.find(runtimeModelPtr);
   if (itRuntime != m_byRuntimeModel.end())
@@ -897,8 +897,8 @@ void ModelInstanceRegistry::noteRuntimeResolveProvenance(void *runtimeModelPtr,
   if (callerRva != 0u)
     record.runtimeResolveCallerRva = callerRva;
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -911,7 +911,7 @@ void ModelInstanceRegistry::noteRuntimeSourceObject(void *runtimeModelPtr,
   if (!sourceObjectPtr && !sourceSpriteObjectPtr)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ModelInstanceRecord record = {};
   auto itRuntime = m_byRuntimeModel.find(runtimeModelPtr);
   if (itRuntime != m_byRuntimeModel.end())
@@ -930,8 +930,8 @@ void ModelInstanceRegistry::noteRuntimeSourceObject(void *runtimeModelPtr,
   if (sourceSpriteObjectPtr)
     record.sourceSpriteObjectPtr = sourceSpriteObjectPtr;
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
   if (record.runtimeModelPtr != nullptr)
     propagateRuntimeSourceObjectLocked(record.runtimeModelPtr, record);
@@ -953,7 +953,7 @@ void ModelInstanceRegistry::noteRuntimeOwnerIdentity(void *runtimeModelPtr,
     return;
   }
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ModelInstanceRecord record = {};
   auto itOwner = m_runtimeOwnerByRuntimeModel.find(runtimeModelPtr);
   if (itOwner != m_runtimeOwnerByRuntimeModel.end())
@@ -1001,8 +1001,8 @@ void ModelInstanceRegistry::noteRuntimeOwnerIdentity(void *runtimeModelPtr,
   if (rawcode != 0u)
     record.rawcode = rawcode;
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
 
   storeRecord(record);
   propagateRuntimeOwnerIdentityLocked(runtimeModelPtr, record);
@@ -1013,13 +1013,13 @@ void ModelInstanceRegistry::bindModelToInstance(void *sceneNode,
   if (!sceneNode || modelKey == 0)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ModelInstanceRecord &record = m_bySceneNode[sceneNode];
   record.sceneNode = sceneNode;
   record.modelKey = modelKey;
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   if (record.spritePtr)
     m_bySpritePtr[record.spritePtr] = record;
   if (record.runtimeModelPtr)
@@ -1031,7 +1031,7 @@ bool ModelInstanceRegistry::findByWorldObjectEntry(void *worldObjectEntry,
   if (!worldObjectEntry)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byWorldObjectEntry.find(worldObjectEntry);
   if (it == m_byWorldObjectEntry.end())
     return false;
@@ -1044,7 +1044,7 @@ bool ModelInstanceRegistry::findBySceneNode(void *sceneNode,
   if (!sceneNode)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySceneNode.find(sceneNode);
   if (it == m_bySceneNode.end())
     return false;
@@ -1057,7 +1057,7 @@ bool ModelInstanceRegistry::findByUnitPtr(void *unitPtr,
   if (!unitPtr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byUnitPtr.find(unitPtr);
   if (it == m_byUnitPtr.end())
     return false;
@@ -1070,7 +1070,7 @@ bool ModelInstanceRegistry::findBySpritePtr(void *spritePtr,
   if (!spritePtr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySpritePtr.find(spritePtr);
   if (it == m_bySpritePtr.end())
     return false;
@@ -1083,7 +1083,7 @@ bool ModelInstanceRegistry::findByRuntimeModel(void *runtimeModelPtr,
   if (!runtimeModelPtr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byRuntimeModel.find(runtimeModelPtr);
   if (it == m_byRuntimeModel.end())
     return false;
@@ -1097,7 +1097,7 @@ bool ModelInstanceRegistry::findBySourceObject(void* sourceObjectPtr,
   if (!sourceObjectPtr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySourceObject.find(sourceObjectPtr);
   if (it == m_bySourceObject.end())
     return false;
@@ -1111,7 +1111,7 @@ bool ModelInstanceRegistry::findBySourceSpriteObject(
   if (!sourceSpriteObjectPtr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySourceSpriteObject.find(sourceSpriteObjectPtr);
   if (it == m_bySourceSpriteObject.end())
     return false;
@@ -1125,7 +1125,7 @@ bool ModelInstanceRegistry::findOwnerByRuntimeModel(void *runtimeModelPtr,
   if (!runtimeModelPtr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_runtimeOwnerByRuntimeModel.find(runtimeModelPtr);
   if (it == m_runtimeOwnerByRuntimeModel.end())
     return false;
@@ -1138,7 +1138,7 @@ bool ModelInstanceRegistry::findByHandle(uint32_t jHandle,
   if (jHandle == 0)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byHandle.find(jHandle);
   if (it == m_byHandle.end())
     return false;
@@ -1147,7 +1147,7 @@ bool ModelInstanceRegistry::findByHandle(uint32_t jHandle,
 }
 
 std::vector<ModelInstanceRecord> ModelInstanceRegistry::snapshot() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   std::vector<ModelInstanceRecord> out;
   out.reserve(m_bySceneNode.size());
   for (const auto &it : m_bySceneNode)
@@ -1156,12 +1156,12 @@ std::vector<ModelInstanceRecord> ModelInstanceRegistry::snapshot() const {
 }
 
 size_t ModelInstanceRegistry::recordCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_byRuntimeModel.size();
 }
 
 size_t ModelInstanceRegistry::runtimeBoundCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto &it : m_byRuntimeModel) {
     const auto &record = it.second;
@@ -1172,7 +1172,7 @@ size_t ModelInstanceRegistry::runtimeBoundCount() const {
 }
 
 size_t ModelInstanceRegistry::runtimeCreationProvenanceCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto &it : m_byRuntimeModel) {
     const auto &record = it.second;
@@ -1185,7 +1185,7 @@ size_t ModelInstanceRegistry::runtimeCreationProvenanceCount() const {
 }
 
 size_t ModelInstanceRegistry::runtimeResolveProvenanceCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto& it : m_byRuntimeModel) {
     const auto& record = it.second;
@@ -1198,7 +1198,7 @@ size_t ModelInstanceRegistry::runtimeResolveProvenanceCount() const {
 }
 
 size_t ModelInstanceRegistry::runtimeSourceObjectCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto &it : m_byRuntimeModel) {
     const auto &record = it.second;
@@ -1211,7 +1211,7 @@ size_t ModelInstanceRegistry::runtimeSourceObjectCount() const {
 }
 
 size_t ModelInstanceRegistry::runtimeOwnerIdentityCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto &it : m_runtimeOwnerByRuntimeModel) {
     const auto &record = it.second;
@@ -1225,7 +1225,7 @@ size_t ModelInstanceRegistry::runtimeOwnerIdentityCount() const {
 }
 
 size_t ModelInstanceRegistry::completeIdentityCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto &it : m_byRuntimeModel) {
     const auto &record = it.second;
@@ -1239,8 +1239,8 @@ size_t ModelInstanceRegistry::completeIdentityCount() const {
 }
 
 uint64_t ModelInstanceRegistry::frameNumber() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  return m_frameNumber;
+  // Phase 7.83锛歮_frameNumber 宸叉敼 atomic锛屼笉鍐嶉渶瑕侀攣銆?
+  return m_frameNumber.load(std::memory_order_relaxed);
 }
 
 PoseRegistry &PoseRegistry::instance() {
@@ -1249,12 +1249,12 @@ PoseRegistry &PoseRegistry::instance() {
 }
 
 void PoseRegistry::beginFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  ++m_frameNumber;
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void PoseRegistry::endFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
 }
 
 void PoseRegistry::storeRecord(const PoseRecord &record) {
@@ -1293,7 +1293,7 @@ void PoseRegistry::recordPose(void *runtimeModelPtr, void *sceneNode,
   if (!runtimeModelPtr && !sceneNode && !unitPtr)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   PoseRecord record = {};
   record.runtimeModelPtr = runtimeModelPtr;
   record.sceneNode = sceneNode;
@@ -1309,10 +1309,10 @@ void PoseRegistry::recordPose(void *runtimeModelPtr, void *sceneNode,
     record.hasWorldTransform = true;
     record.worldTransform = *worldTransform;
   }
-  record.lastRootPoseFrame = m_frameNumber;
+  record.lastRootPoseFrame = m_frameNumber.load(std::memory_order_relaxed);
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -1327,7 +1327,7 @@ void PoseRegistry::recordSpriteFramePose(void *runtimeModelPtr, void *spritePtr,
   if (!runtimeModelPtr && !spritePtr && !sceneNode && !unitPtr)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   PoseRecord record = {};
   record.runtimeModelPtr = runtimeModelPtr;
   record.spritePtr = spritePtr;
@@ -1345,11 +1345,11 @@ void PoseRegistry::recordSpriteFramePose(void *runtimeModelPtr, void *spritePtr,
     record.hasSpriteFrameTransform = true;
     record.spriteFrameTransform = *worldTransform;
   }
-  record.lastSpriteFramePoseFrame = m_frameNumber;
+  record.lastSpriteFramePoseFrame = m_frameNumber.load(std::memory_order_relaxed);
   record.spriteFrameSampleCount = 1;
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -1360,7 +1360,7 @@ void PoseRegistry::recordMatrixPalette(void* runtimeModelPtr, void* sceneNode,
       matrixCount == 0)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   PoseRecord record = {};
   record.runtimeModelPtr = runtimeModelPtr;
   record.sceneNode = sceneNode;
@@ -1369,10 +1369,10 @@ void PoseRegistry::recordMatrixPalette(void* runtimeModelPtr, void* sceneNode,
   record.matrixPalette.assign(matrices, matrices + matrixCount);
   record.matrixHash = Fnv1a64(record.matrixPalette.data(),
                              record.matrixPalette.size() * sizeof(Matrix4));
-  record.lastMatrixPaletteFrame = m_frameNumber;
+  record.lastMatrixPaletteFrame = m_frameNumber.load(std::memory_order_relaxed);
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -1381,7 +1381,7 @@ bool PoseRegistry::findByRuntimeModel(void *runtimeModelPtr,
   if (!runtimeModelPtr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byRuntimeModel.find(runtimeModelPtr);
   if (it == m_byRuntimeModel.end())
     return false;
@@ -1393,7 +1393,7 @@ bool PoseRegistry::findBySceneNode(void *sceneNode, PoseRecord &out) const {
   if (!sceneNode)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySceneNode.find(sceneNode);
   if (it == m_bySceneNode.end())
     return false;
@@ -1405,7 +1405,7 @@ bool PoseRegistry::findByUnitPtr(void *unitPtr, PoseRecord &out) const {
   if (!unitPtr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byUnitPtr.find(unitPtr);
   if (it == m_byUnitPtr.end())
     return false;
@@ -1414,7 +1414,7 @@ bool PoseRegistry::findByUnitPtr(void *unitPtr, PoseRecord &out) const {
 }
 
 std::vector<PoseRecord> PoseRegistry::snapshot() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   std::vector<PoseRecord> out;
   out.reserve(m_byRuntimeModel.size() + m_bySceneNode.size());
   for (const auto& it : m_byRuntimeModel)
@@ -1427,12 +1427,12 @@ std::vector<PoseRecord> PoseRegistry::snapshot() const {
 }
 
 size_t PoseRegistry::recordCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_byRuntimeModel.size();
 }
 
 size_t PoseRegistry::readyPoseCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto &it : m_byRuntimeModel) {
     const auto &record = it.second;
@@ -1447,7 +1447,7 @@ size_t PoseRegistry::readyPoseCount() const {
 }
 
 size_t PoseRegistry::spriteFramePoseCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto& it : m_byRuntimeModel) {
     if (it.second.lastSpriteFramePoseFrame != 0)
@@ -1457,7 +1457,7 @@ size_t PoseRegistry::spriteFramePoseCount() const {
 }
 
 size_t PoseRegistry::matrixPaletteCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto& it : m_byRuntimeModel) {
     if (it.second.lastMatrixPaletteFrame != 0 &&
@@ -1470,8 +1470,8 @@ size_t PoseRegistry::matrixPaletteCount() const {
 }
 
 uint64_t PoseRegistry::frameNumber() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  return m_frameNumber;
+  // Phase 7.83锛歮_frameNumber 宸叉敼 atomic锛屼笉鍐嶉渶瑕侀攣銆?
+  return m_frameNumber.load(std::memory_order_relaxed);
 }
 
 AttachmentRigidRegistry& AttachmentRigidRegistry::instance() {
@@ -1480,12 +1480,12 @@ AttachmentRigidRegistry& AttachmentRigidRegistry::instance() {
 }
 
 void AttachmentRigidRegistry::beginFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  ++m_frameNumber;
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void AttachmentRigidRegistry::endFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
 }
 
 void AttachmentRigidRegistry::storeRecord(
@@ -1550,7 +1550,7 @@ void AttachmentRigidRegistry::noteAttachmentRigid(
   if (rootRuntimeModelPtr == nullptr || childRuntimeModelPtr == nullptr)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   AttachmentRigidRecord record = {};
   record.rootRuntimeModelPtr = rootRuntimeModelPtr;
   record.ownerRuntimeModelPtr = ownerRuntimeModelPtr;
@@ -1570,8 +1570,8 @@ void AttachmentRigidRegistry::noteAttachmentRigid(
   record.localPointY = localPointY;
   record.localPointZ = localPointZ;
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -1587,7 +1587,7 @@ void AttachmentRigidRegistry::noteRuntimeIdentity(
     return;
   }
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   AttachmentRigidRecord record = {};
   auto itChild = m_byChildRuntimeModel.find(runtimeModelPtr);
   if (itChild != m_byChildRuntimeModel.end())
@@ -1620,8 +1620,8 @@ void AttachmentRigidRegistry::noteRuntimeIdentity(
   if (rawcode != 0u)
     record.rawcode = rawcode;
   if (record.firstSeenFrame == 0u)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeRecord(record);
 }
 
@@ -1632,7 +1632,7 @@ bool AttachmentRigidRegistry::promoteAttachmentChildRuntime(
   if (parentRuntimeModelPtr == nullptr || childRuntimeModelPtr == nullptr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   AttachmentRigidRecord record = {};
   bool found = false;
   auto itOwner = m_byOwnerRuntimeModel.find(parentRuntimeModelPtr);
@@ -1655,8 +1655,8 @@ bool AttachmentRigidRegistry::promoteAttachmentChildRuntime(
   if (childSpritePtr != nullptr)
     record.childSpritePtr = childSpritePtr;
   if (record.firstSeenFrame == 0u)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
 
   if (previousChildRuntimeModelPtr != nullptr &&
       previousChildRuntimeModelPtr != childRuntimeModelPtr) {
@@ -1674,7 +1674,7 @@ bool AttachmentRigidRegistry::findByChildRuntimeModel(
   out = {};
   if (childRuntimeModelPtr == nullptr)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byChildRuntimeModel.find(childRuntimeModelPtr);
   if (it == m_byChildRuntimeModel.end())
     return false;
@@ -1687,7 +1687,7 @@ bool AttachmentRigidRegistry::findByOwnerRuntimeModel(
   out = {};
   if (ownerRuntimeModelPtr == nullptr)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byOwnerRuntimeModel.find(ownerRuntimeModelPtr);
   if (it == m_byOwnerRuntimeModel.end())
     return false;
@@ -1700,7 +1700,7 @@ bool AttachmentRigidRegistry::findByRootRuntimeModel(
   out = {};
   if (rootRuntimeModelPtr == nullptr)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byRootRuntimeModel.find(rootRuntimeModelPtr);
   if (it == m_byRootRuntimeModel.end())
     return false;
@@ -1713,7 +1713,7 @@ bool AttachmentRigidRegistry::findByAnyRuntimeModel(
   out = {};
   if (runtimeModelPtr == nullptr)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto itChild = m_byChildRuntimeModel.find(runtimeModelPtr);
   if (itChild != m_byChildRuntimeModel.end()) {
     out = itChild->second;
@@ -1737,7 +1737,7 @@ bool AttachmentRigidRegistry::findByWorldObjectEntry(
   out = {};
   if (worldObjectEntry == nullptr)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byWorldObjectEntry.find(worldObjectEntry);
   if (it == m_byWorldObjectEntry.end())
     return false;
@@ -1750,7 +1750,7 @@ bool AttachmentRigidRegistry::findBySceneNode(void* sceneNode,
   out = {};
   if (sceneNode == nullptr)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySceneNode.find(sceneNode);
   if (it == m_bySceneNode.end())
     return false;
@@ -1763,7 +1763,7 @@ bool AttachmentRigidRegistry::findByUnitPtr(void* unitPtr,
   out = {};
   if (unitPtr == nullptr)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byUnitPtr.find(unitPtr);
   if (it == m_byUnitPtr.end())
     return false;
@@ -1776,7 +1776,7 @@ bool AttachmentRigidRegistry::findByHandle(uint32_t jHandle,
   out = {};
   if (jHandle == 0u)
     return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byHandle.find(jHandle);
   if (it == m_byHandle.end())
     return false;
@@ -1785,7 +1785,7 @@ bool AttachmentRigidRegistry::findByHandle(uint32_t jHandle,
 }
 
 std::vector<AttachmentRigidRecord> AttachmentRigidRegistry::snapshot() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   std::vector<AttachmentRigidRecord> out;
   out.reserve(m_byChildRuntimeModel.size() + m_bySceneNode.size());
   for (const auto& it : m_byChildRuntimeModel)
@@ -1798,13 +1798,13 @@ std::vector<AttachmentRigidRecord> AttachmentRigidRegistry::snapshot() const {
 }
 
 size_t AttachmentRigidRegistry::recordCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_byChildRuntimeModel.size();
 }
 
 uint64_t AttachmentRigidRegistry::frameNumber() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  return m_frameNumber;
+  // Phase 7.83锛歮_frameNumber 宸叉敼 atomic锛屼笉鍐嶉渶瑕侀攣銆?
+  return m_frameNumber.load(std::memory_order_relaxed);
 }
 
 } // namespace model

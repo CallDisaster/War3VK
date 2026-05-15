@@ -1,4 +1,4 @@
-#include "war3_model_resource_cache.h"
+﻿#include "war3_model_resource_cache.h"
 
 #include "../../d3d9_war3_debug.h"
 #include "../core/war3_game_structs.h"
@@ -794,12 +794,12 @@ ShadowModelResourceCache &ShadowModelResourceCache::instance() {
 }
 
 void ShadowModelResourceCache::beginFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  ++m_frameNumber;
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void ShadowModelResourceCache::endFrame() {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
 }
 
 void ShadowModelResourceCache::storeGeosetRecord(
@@ -835,7 +835,7 @@ void ShadowModelResourceCache::storeGeosetRecord(
   if (merged.geosetDataPtr != nullptr)
     m_byGeosetData[merged.geosetDataPtr] = merged;
   if (changed)
-    ++m_revision;
+    m_revision.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void ShadowModelResourceCache::storeModelRecord(
@@ -857,7 +857,7 @@ void ShadowModelResourceCache::storeModelRecord(
   if (!hadExisting ||
       !HasSameModelConsumerContent(m_byModelResource[record.modelResourcePtr],
                                    existing)) {
-    ++m_revision;
+    m_revision.fetch_add(1u, std::memory_order_relaxed);
   }
 }
 
@@ -885,7 +885,7 @@ void ShadowModelResourceCache::storeRuntimeModelRecord(
     NoteRuntimeOwnerIndex(m_runtimeOwnerByGeosetData, geosetDataPtr,
                           stored.runtimeModelPtr);
   if (!hadExisting || !HasSameModelConsumerContent(stored, existing))
-    ++m_revision;
+    m_revision.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void ShadowModelResourceCache::recordGeosetCreate(void *geosetPtr) {
@@ -893,24 +893,24 @@ void ShadowModelResourceCache::recordGeosetCreate(void *geosetPtr) {
   if (!CaptureGeosetHeaderRecord(geosetPtr, record))
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   if (record.geosetPtr != nullptr) {
     const auto it = m_byGeoset.find(record.geosetPtr);
     if (it != m_byGeoset.end() && it->second.readyForShadowConsumer()) {
-      it->second.lastSeenFrame = m_frameNumber;
+      it->second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
       return;
     }
   }
   if (record.geosetDataPtr != nullptr) {
     const auto it = m_byGeosetData.find(record.geosetDataPtr);
     if (it != m_byGeosetData.end() && it->second.readyForShadowConsumer()) {
-      it->second.lastSeenFrame = m_frameNumber;
+      it->second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
       return;
     }
   }
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber;
-  record.lastSeenFrame = m_frameNumber;
+    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeGeosetRecord(record);
 }
 
@@ -939,13 +939,13 @@ void ShadowModelResourceCache::noteModelResourceBinding(void *modelResourcePtr,
   }
 
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     auto it = m_byModelResource.find(modelResourcePtr);
     if (it != m_byModelResource.end() &&
         it->second.readyForShadowConsumer() &&
         (modelKey == 0 || it->second.modelKey == 0 ||
          it->second.modelKey == modelKey)) {
-      it->second.lastSeenFrame = m_frameNumber;
+      it->second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
       if (it->second.modelKey == 0 && modelKey != 0)
         it->second.modelKey = modelKey;
       return;
@@ -982,10 +982,10 @@ void ShadowModelResourceCache::noteModelResourceBinding(void *modelResourcePtr,
   modelRecord.geosetPtrs = geosetPtrs;
   modelRecord.geosetDataPtrs.resize(geosetPtrs.size(), nullptr);
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   if (modelRecord.firstSeenFrame == 0)
-    modelRecord.firstSeenFrame = m_frameNumber;
-  modelRecord.lastSeenFrame = m_frameNumber;
+    modelRecord.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  modelRecord.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
 
   for (uint32_t i = 0; i < modelRecord.geosetCount; ++i) {
     ShadowGeosetResourceRecord geosetRecord = {};
@@ -995,7 +995,7 @@ void ShadowModelResourceCache::noteModelResourceBinding(void *modelResourcePtr,
       geosetRecord = itGeoset->second;
     } else if (CaptureGeosetRecord(geosetPtrs[i], geosetRecord)) {
       if (geosetRecord.firstSeenFrame == 0)
-        geosetRecord.firstSeenFrame = m_frameNumber;
+        geosetRecord.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
     } else if (itGeoset != m_byGeoset.end()) {
       geosetRecord = itGeoset->second;
     } else {
@@ -1006,7 +1006,7 @@ void ShadowModelResourceCache::noteModelResourceBinding(void *modelResourcePtr,
     if (modelKey != 0)
       geosetRecord.modelKey = modelKey;
     geosetRecord.geosetIndex = i;
-    geosetRecord.lastSeenFrame = m_frameNumber;
+    geosetRecord.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
     storeGeosetRecord(geosetRecord);
 
     modelRecord.geosetDataPtrs[i] = geosetRecord.geosetDataPtr;
@@ -1034,7 +1034,7 @@ void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
   modelResourcePtr = TryResolveDirectModelResourcePtr(modelResourcePtr);
 
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     auto it = m_byRuntimeModel.find(runtimeModelPtr);
     if (it != m_byRuntimeModel.end() &&
         it->second.readyForShadowConsumer() &&
@@ -1043,7 +1043,7 @@ void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
          it->second.modelResourcePtr == modelResourcePtr) &&
         (modelKey == 0 || it->second.modelKey == 0 ||
          it->second.modelKey == modelKey)) {
-      it->second.lastSeenFrame = m_frameNumber;
+      it->second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
       if (it->second.modelResourcePtr == nullptr && modelResourcePtr != nullptr)
         it->second.modelResourcePtr = modelResourcePtr;
       if (it->second.modelKey == 0 && modelKey != 0)
@@ -1061,8 +1061,8 @@ void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
         if (modelKey != 0)
           runtimeAlias.modelKey = modelKey;
         if (runtimeAlias.firstSeenFrame == 0)
-          runtimeAlias.firstSeenFrame = m_frameNumber;
-        runtimeAlias.lastSeenFrame = m_frameNumber;
+          runtimeAlias.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+        runtimeAlias.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
         storeRuntimeModelRecord(runtimeAlias);
         return;
       }
@@ -1087,15 +1087,15 @@ void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
   runtimeRecord.geosetPtrs = geosetPtrs;
   runtimeRecord.geosetDataPtrs.resize(geosetPtrs.size(), nullptr);
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   if (runtimeRecord.firstSeenFrame == 0)
-    runtimeRecord.firstSeenFrame = m_frameNumber;
-  runtimeRecord.lastSeenFrame = m_frameNumber;
+    runtimeRecord.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  runtimeRecord.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
 
   if (!hasRuntimeGeosets) {
-    // 有些 runtimeModel 运行态已经可稳定识别，但并不总能安全读到 geoset 数组。
-    // 这里仍保留最小 runtime record，避免 runtimeModel lineage 完全丢失；
-    // 后续若通过 runtimeGeoset/runtimeGeosetData 进一步补齐，会在同一 record 上增量合并。
+    // 閺堝绨?runtimeModel 鏉╂劘顢戦幀浣稿嚒缂佸繐褰茬粙鍐茬暰鐠囧棗鍩嗛敍灞肩稻楠炴湹绗夐幀鏄忓厴鐎瑰鍙忕拠璇插煂 geoset 閺佹壆绮嶉妴?
+    // 鏉╂瑩鍣锋禒宥勭箽閻ｆ瑦娓剁亸?runtime record閿涘矂浼╅崗?runtimeModel lineage 鐎瑰苯鍙忔稉銏犮亼閿?
+    // 閸氬海鐢婚懟銉┾偓姘崇箖 runtimeGeoset/runtimeGeosetData 鏉╂稐绔村銉ㄋ夋鎰剁礉娴兼艾婀崥灞肩 record 娑撳﹤顤冮柌蹇撴値楠炶翰鈧?
     storeRuntimeModelRecord(runtimeRecord);
     if (modelResourcePtr != nullptr) {
       ShadowModelResourceRecord modelAlias = runtimeRecord;
@@ -1113,18 +1113,18 @@ void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
     } else {
       geosetRecord.geosetPtr = geosetPtrs[i];
       TryReadGeosetDataPtr(geosetPtrs[i], geosetRecord.geosetDataPtr);
-      geosetRecord.firstSeenFrame = m_frameNumber;
+      geosetRecord.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
     }
 
     geosetRecord.geosetPtr = geosetPtrs[i];
     geosetRecord.geosetIndex = i;
     if (geosetRecord.firstSeenFrame == 0)
-      geosetRecord.firstSeenFrame = m_frameNumber;
+      geosetRecord.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
     if (modelResourcePtr != nullptr)
       geosetRecord.modelResourcePtr = modelResourcePtr;
     if (modelKey != 0)
       geosetRecord.modelKey = modelKey;
-    geosetRecord.lastSeenFrame = m_frameNumber;
+    geosetRecord.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
     storeGeosetRecord(geosetRecord);
 
     runtimeRecord.geosetDataPtrs[i] = geosetRecord.geosetDataPtr;
@@ -1165,14 +1165,14 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
   ShadowGeosetResourceRecord geosetRecord = {};
   bool alreadyRefreshedThisFrame = false;
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     if (runtimeGeosetPtr != nullptr) {
       const auto itGeoset = m_byGeoset.find(runtimeGeosetPtr);
       if (itGeoset != m_byGeoset.end()) {
         geosetRecord = itGeoset->second;
         alreadyRefreshedThisFrame =
             geosetRecord.prefersRuntimeContract &&
-            geosetRecord.lastRuntimeRefreshFrame == m_frameNumber;
+            geosetRecord.lastRuntimeRefreshFrame == m_frameNumber.load(std::memory_order_relaxed);
       }
     }
     if (geosetRecord.geosetPtr == nullptr && runtimeGeosetDataPtr != nullptr) {
@@ -1181,7 +1181,7 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
         geosetRecord = itGeosetData->second;
         alreadyRefreshedThisFrame =
             geosetRecord.prefersRuntimeContract &&
-            geosetRecord.lastRuntimeRefreshFrame == m_frameNumber;
+            geosetRecord.lastRuntimeRefreshFrame == m_frameNumber.load(std::memory_order_relaxed);
       }
     }
   }
@@ -1204,7 +1204,7 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
     return;
   }
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   ShadowModelResourceRecord existingRuntimeRecord = {};
   bool hasExistingRuntimeRecord = false;
   if (runtimeModelPtr != nullptr) {
@@ -1223,10 +1223,10 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
     modelKey = existingRuntimeRecord.modelKey;
   }
   if (geosetRecord.firstSeenFrame == 0)
-    geosetRecord.firstSeenFrame = m_frameNumber;
-  geosetRecord.lastSeenFrame = m_frameNumber;
+    geosetRecord.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  geosetRecord.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   geosetRecord.prefersRuntimeContract = true;
-  geosetRecord.lastRuntimeRefreshFrame = m_frameNumber;
+  geosetRecord.lastRuntimeRefreshFrame = m_frameNumber.load(std::memory_order_relaxed);
   if (runtimeGeosetPtr != nullptr)
     geosetRecord.geosetPtr = runtimeGeosetPtr;
   if (runtimeGeosetDataPtr != nullptr)
@@ -1254,8 +1254,8 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
     if (modelKey != 0)
       runtimeRecord.modelKey = modelKey;
     if (runtimeRecord.firstSeenFrame == 0)
-      runtimeRecord.firstSeenFrame = m_frameNumber;
-    runtimeRecord.lastSeenFrame = m_frameNumber;
+      runtimeRecord.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+    runtimeRecord.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
     EnsureModelRecordCapacity(runtimeRecord, geosetIndex);
     runtimeRecord.geosetPtrs[geosetIndex] = geosetRecord.geosetPtr;
     runtimeRecord.geosetDataPtrs[geosetIndex] = geosetRecord.geosetDataPtr;
@@ -1280,8 +1280,8 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
     if (modelKey != 0)
       modelAlias.modelKey = modelKey;
     if (modelAlias.firstSeenFrame == 0)
-      modelAlias.firstSeenFrame = m_frameNumber;
-    modelAlias.lastSeenFrame = m_frameNumber;
+      modelAlias.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+    modelAlias.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
     EnsureModelRecordCapacity(modelAlias, geosetIndex);
     modelAlias.geosetPtrs[geosetIndex] = geosetRecord.geosetPtr;
     modelAlias.geosetDataPtrs[geosetIndex] = geosetRecord.geosetDataPtr;
@@ -1297,7 +1297,7 @@ bool ShadowModelResourceCache::findGeosetByPtr(
   if (geosetPtr == nullptr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byGeoset.find(geosetPtr);
   if (it == m_byGeoset.end())
     return false;
@@ -1310,7 +1310,7 @@ const ShadowGeosetResourceRecord* ShadowModelResourceCache::findGeosetByPtrRef(
   if (geosetPtr == nullptr)
     return nullptr;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byGeoset.find(geosetPtr);
   if (it == m_byGeoset.end())
     return nullptr;
@@ -1323,7 +1323,7 @@ bool ShadowModelResourceCache::findGeosetByData(
   if (geosetDataPtr == nullptr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byGeosetData.find(geosetDataPtr);
   if (it == m_byGeosetData.end())
     return false;
@@ -1338,7 +1338,7 @@ bool ShadowModelResourceCache::hydrateGeosetByKnownPtrs(
     return false;
 
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     if (geosetPtr != nullptr) {
       const auto it = m_byGeoset.find(geosetPtr);
       if (it != m_byGeoset.end() && it->second.readyForShadowConsumer()) {
@@ -1361,10 +1361,10 @@ bool ShadowModelResourceCache::hydrateGeosetByKnownPtrs(
   if (!hydrated.readyForShadowConsumer())
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   if (hydrated.firstSeenFrame == 0)
-    hydrated.firstSeenFrame = m_frameNumber;
-  hydrated.lastSeenFrame = m_frameNumber;
+    hydrated.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+  hydrated.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   storeGeosetRecord(hydrated);
   out = hydrated;
   return true;
@@ -1375,7 +1375,7 @@ const ShadowGeosetResourceRecord* ShadowModelResourceCache::findGeosetByDataRef(
   if (geosetDataPtr == nullptr)
     return nullptr;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byGeosetData.find(geosetDataPtr);
   if (it == m_byGeosetData.end())
     return nullptr;
@@ -1389,7 +1389,7 @@ bool ShadowModelResourceCache::findModelGeoset(
   if (modelResourcePtr == nullptr || geosetIndex == kInvalidShadowGeosetIndex)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   const auto itModel = m_byModelResource.find(modelResourcePtr);
   if (itModel == m_byModelResource.end())
     return false;
@@ -1429,7 +1429,7 @@ bool ShadowModelResourceCache::findRuntimeModelGeoset(
   if (runtimeModelPtr == nullptr || geosetIndex == kInvalidShadowGeosetIndex)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   const auto itRuntime = m_byRuntimeModel.find(runtimeModelPtr);
   if (itRuntime == m_byRuntimeModel.end())
     return false;
@@ -1472,7 +1472,7 @@ bool ShadowModelResourceCache::findRuntimeModelOwner(
 
   modelResourcePtr = TryResolveDirectModelResourcePtr(modelResourcePtr);
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto tryIndexedOwner = [&](const std::unordered_map<void*, void*>& index,
                              void* key) -> bool {
     if (key == nullptr)
@@ -1534,7 +1534,7 @@ bool ShadowModelResourceCache::findRuntimeModelOwnerIndexed(
   if (runtimeGeosetPtr == nullptr && runtimeGeosetDataPtr == nullptr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   auto tryIndexedOwner = [&](const std::unordered_map<void*, void*>& index,
                              void* key) -> bool {
     if (key == nullptr)
@@ -1562,7 +1562,7 @@ bool ShadowModelResourceCache::findModelResource(
   if (modelResourcePtr == nullptr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byModelResource.find(modelResourcePtr);
   if (it == m_byModelResource.end())
     return false;
@@ -1576,7 +1576,7 @@ bool ShadowModelResourceCache::findRuntimeModelResource(
   if (runtimeModelPtr == nullptr)
     return false;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byRuntimeModel.find(runtimeModelPtr);
   if (it == m_byRuntimeModel.end())
     return false;
@@ -1596,7 +1596,7 @@ void* ShadowModelResourceCache::resolveDirectModelResourcePtr(
 
 std::vector<ShadowGeosetResourceRecord>
 ShadowModelResourceCache::snapshotGeosets() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   std::vector<ShadowGeosetResourceRecord> out;
   out.reserve(m_byGeoset.size() + m_byGeosetData.size());
   for (const auto &it : m_byGeoset)
@@ -1613,7 +1613,7 @@ ShadowModelResourceCache::snapshotGeosets() const {
 }
 
 std::vector<ShadowModelResourceRecord> ShadowModelResourceCache::snapshotModels() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   std::vector<ShadowModelResourceRecord> out;
   out.reserve(m_byModelResource.size());
   for (const auto &it : m_byModelResource)
@@ -1623,7 +1623,7 @@ std::vector<ShadowModelResourceRecord> ShadowModelResourceCache::snapshotModels(
 
 std::vector<ShadowModelResourceRecord>
 ShadowModelResourceCache::snapshotRuntimeModels() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   std::vector<ShadowModelResourceRecord> out;
   out.reserve(m_byRuntimeModel.size());
   for (const auto& it : m_byRuntimeModel)
@@ -1632,7 +1632,7 @@ ShadowModelResourceCache::snapshotRuntimeModels() const {
 }
 
 size_t ShadowModelResourceCache::geosetRecordCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = m_byGeoset.size();
   for (const auto& it : m_byGeosetData) {
     if (it.second.geosetPtr != nullptr &&
@@ -1645,7 +1645,7 @@ size_t ShadowModelResourceCache::geosetRecordCount() const {
 }
 
 size_t ShadowModelResourceCache::readyGeosetCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto &it : m_byGeoset) {
     if (it.second.readyForShadowConsumer())
@@ -1663,23 +1663,23 @@ size_t ShadowModelResourceCache::readyGeosetCount() const {
 }
 
 size_t ShadowModelResourceCache::modelResourceCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_byModelResource.size();
 }
 
 size_t ShadowModelResourceCache::runtimeModelRecordCount() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_byRuntimeModel.size();
 }
 
 uint64_t ShadowModelResourceCache::frameNumber() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  return m_frameNumber;
+  // Phase 7.83锛歛tomic 鐩存帴 load锛屾棤闇€閿併€?
+  return m_frameNumber.load(std::memory_order_relaxed);
 }
 
 uint64_t ShadowModelResourceCache::revision() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  return m_revision;
+  // Phase 7.83锛歛tomic 鐩存帴 load锛屾棤闇€閿併€?
+  return m_revision.load(std::memory_order_relaxed);
 }
 
 } // namespace dxvk::war3::model
