@@ -4494,3 +4494,58 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
    - **测试脚本**：`py AutoTest\_phase790_highpressure_perf.py`（无 trace，30s）
    - **当前 DLL**：`E:\Work\War3\d3d9.dll` = Phase 7.95 状态
    - **commit**：`a571f01`（含 call cap + registry size check，但未解决根因）
+
+
+123. **Phase 7.97-7.99 桥/斜坡卡顿根治 + Path blocker 屏蔽验证（2026-05-16 02:00-04:00）**:
+   - **三件事一气呵成**：
+     1. **任务 A**：Phase 7.98 widget identity hook 实机验收；
+     2. **任务 B**：桥/斜坡 FPS 优化（高压地图 64→85+，低压 115→120+）；
+     3. **任务 C**：路径阻断器屏蔽收尾，确保拦截在追踪日志里有精确次数。
+   - **决定性发现 1：上一线程关于桥/斜坡的根因诊断是错的**。
+     - 旧诊断："records 从 100 爆到几千，导致 endFrame O(N²)"。
+     - 实测（Phase 7.97 加 chrono+counter atomic）：
+       - 高压地图 ManifestCopy 单帧只 1-4 records、totalScanned ≈ 1.024/frame
+       - 但 ManifestCopy 单帧 chrono = 2.6ms，每条 record 600µs+
+       - 不是 record 爆炸，而是 **`captureLiveState` 每帧都被调** + 每条 record 走 `ConvertVisible` + `ResolveCurrentRuntimeGeosetFromData` 的 4096 次循环
+   - **决定性发现 2：widget identity hook 装上但实测无效**。
+     - `installAttempted=2, installSucceeded=1, enterCount=84, magicMatchedCount=0`
+     - hook 早装（加到 `TryInstallShadowHooksEarly` ）后 fire 84 次，但 widget 大多数时候是 fourcc 整数被当指针（IDA 标的 `__fastcall(int a1, void* a2, ...)` 在某些 caller 下 a2=fourcc 而不是 widget pointer）
+     - widget cache size 永远 0；但 pre-install bytes / post-install bytes 已确认 MinHook 真的写了 jmp
+     - **结论**：widget hook 在当前 caller 集合下没贡献，但**不退化性能**。后续若要让它真起作用，需要分 caller 路径分别处理 calling convention（任务 B 的修复使得这一步**对最终 FPS 不再关键**）。
+   - **决定性修复（性能）：ManifestCopy 早退**：
+     - 实现：在 `captureLiveState` 入口最早期、shared_lock 下检查
+       `m_manifest->visibleCount/mainQueueCount/transparentCount == manifest.*Count`
+       且 `currentPoseRecordCount <= previousPoseCount` 且 `m_manifest->records.empty() == false`
+       → 直接 return，跳过整个 ManifestCopy + Hydrate + ResourceStore + Snapshot + Publish
+     - 不依赖 `priorContractUsable`（旧版要求 matrixPaletteCount/shadowReadyGeosetCount 都 ≠ 0）
+       — 这是关键：高压地图早期 readyGeosetCount=0 让旧版 sameFrameDataNotGrowing 永远不命中
+     - 效果：高压地图 `ManifestCopyEnterCount` 从 2493/30s 降到 2/30s（**99.9% skip**）
+   - **附加优化**：
+     - `ResolveCurrentRuntimeGeosetFromData` 加 thread_local cache `(runtimeModel, runtimeGeosetData) -> (geosetPtr, index)` 256 槽
+     - widget identity stats（installAttempted/Succeeded/FailedAddrNull/FailedEnvDisabled/FailedMinHook）
+     - path blocker reject 11 个分桶 counter 透传到 control plane summary
+     - path blocker reject debug log（前 30 次每个 unique fourcc 各 1 行到 dxvk log）
+   - **三个 commit**：
+     - `e509d5a` — Phase 7.99 ManifestCopy early-skip + ResolveGeoset cache + widget hook diag
+     - `352bdd2` — path blocker reject buckets to control plane summary
+     - `d06bde4` — path blocker reject debug log + marker bump
+   - **最终性能基线**（30s × 3 轮，isolated desktop）：
+     - **高压地图（带桥/斜坡/装饰物）**：93.57 / 93.51 / 94.54 FPS，平均 **93.87 FPS**（目标 ≥85 ✓ +9 FPS 余量）
+     - **低压（光影测试）**：147.40 / 147.01 / 146.79 FPS，平均 **147.07 FPS**（目标 ≥120 ✓ +27 FPS 余量）
+   - **path blocker 拦截证据（dxvk log 实测）**：
+     ```
+     PATH BLOCKER REJECT #1 rawcode=0x59546662 (YTfb) jHandle=0x1004B6 via=EarlyBypass
+     PATH BLOCKER REJECT #2 rawcode=0x59547062 (YTpb) jHandle=0x100473 via=EarlyBypass
+     PATH BLOCKER REJECT #3 rawcode=0x59546162 (YTab) jHandle=0x1004BE via=EarlyBypass
+     ```
+     - 30s × 3 unique path blockers (YTfb/YTpb/YTab) × 27 总拦截 = 测试场景里 path blocker 的全部出口
+     - 全部走 `War3TryCaptureShadowCaster` EarlyBypass 路径（其它 10 个分桶 0 命中）
+     - 黑名单 8 fourcc：YTab/YTac/YTpb/YTpc/YTfb/YTfc/YTlb/YTlc 完整覆盖
+   - **当前 DLL 状态**：
+     - `E:\Work\War3\d3d9.dll` mtime ≈ 2026-05-16 03:50（含 Phase 7.99 全套）
+     - 包含早装 widget hook、ManifestCopy 早退、ResolveGeoset cache、path blocker debug log
+   - **可能的后续工作（不在本轮承诺）**：
+     - widget hook 在 calling convention 不一致的 caller 上的修复（影响：让更多 destructible 进 cache，但目前 path blocker reject 已经通过现有 IsLosBlockerFourCc 主路径覆盖，不影响视觉验证）
+     - 用户实机视觉复核：高压地图默认视角下 path blocker 阴影是否消失（所有自动数据已就位，只缺肉眼确认）
+     - 若用户视觉报告还有漏网 path blocker，扩展黑名单或在 widget cache miss 时直接读 unitPtr+0x30 当 rawcode（已有兜底链路 23420-23445）
+
