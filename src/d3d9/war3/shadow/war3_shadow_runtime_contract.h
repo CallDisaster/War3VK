@@ -376,6 +376,12 @@ private:
   mutable std::atomic<uint64_t> m_lastManifestCopyRejectedSkipped{0};
   mutable std::atomic<uint64_t> m_manifestCopyEnterCount{0};
   mutable std::atomic<uint64_t> m_manifestCopySkipStableCount{0};
+  // 累积 max，避免短暂触发 Scanned=0 时被覆盖。
+  mutable std::atomic<uint64_t> m_manifestCopyMaxScanned{0};
+  mutable std::atomic<uint64_t> m_manifestCopyTotalScanned{0};
+  // Phase 7.97：用 std::chrono 直接测 ManifestCopy 墙钟时间，绕开 perf monitor。
+  mutable std::atomic<uint64_t> m_manifestCopyTotalChronoNs{0};
+  mutable std::atomic<uint64_t> m_manifestCopyMaxChronoNs{0};
 public:
   // Phase 7.97 reader：bridge 透传时拉取最近一次 ManifestCopy 的实际遍历
   // 与 publish 跳过统计。
@@ -396,6 +402,18 @@ public:
   }
   uint64_t manifestCopySkipStableCount() const {
     return m_manifestCopySkipStableCount.load(std::memory_order_relaxed);
+  }
+  uint64_t manifestCopyMaxScanned() const {
+    return m_manifestCopyMaxScanned.load(std::memory_order_relaxed);
+  }
+  uint64_t manifestCopyTotalScanned() const {
+    return m_manifestCopyTotalScanned.load(std::memory_order_relaxed);
+  }
+  uint64_t manifestCopyTotalChronoNs() const {
+    return m_manifestCopyTotalChronoNs.load(std::memory_order_relaxed);
+  }
+  uint64_t manifestCopyMaxChronoNs() const {
+    return m_manifestCopyMaxChronoNs.load(std::memory_order_relaxed);
   }
 };
 

@@ -3445,6 +3445,10 @@ void ShadowRuntimeContractCache::captureLiveState() {
   {
     auto manifestCopyScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/ManifestCopy");
+    // Phase 7.97 直接计时：用 std::chrono 测 ManifestCopy 真实墙钟时间，
+    // 与 perf monitor 报告对比。如果 perf monitor 显示 2ms 但 chrono 显示 ~0us，
+    // 说明 scope 计时被外部因素干扰（perf monitor 自身锁竞争）。
+    const auto manifestCopyTickStart = std::chrono::steady_clock::now();
     // Phase 7.96：record 多时用 unordered_set 避免 O(N²)，少时用 vector
     // 利用 cache friendly 优势。阈值 64 经验值，同 RepairManifestIdentity。
     constexpr size_t kHashSetThreshold = 64u;
@@ -3523,6 +3527,32 @@ void ShadowRuntimeContractCache::captureLiveState() {
         stats.manifestCopyDeduplicatedSkipped, std::memory_order_relaxed);
     m_lastManifestCopyRejectedSkipped.store(stats.manifestCopyRejectedSkipped,
                                             std::memory_order_relaxed);
+    // 累积 total/max，避免最近一次极小覆盖。
+    m_manifestCopyTotalScanned.fetch_add(stats.manifestCopyVisibleScanned,
+                                         std::memory_order_relaxed);
+    {
+      uint64_t cur = m_manifestCopyMaxScanned.load(std::memory_order_relaxed);
+      while (stats.manifestCopyVisibleScanned > cur &&
+             !m_manifestCopyMaxScanned.compare_exchange_weak(
+                 cur, stats.manifestCopyVisibleScanned,
+                 std::memory_order_relaxed))
+        ;
+    }
+    // Phase 7.97：用 chrono 直接测 ManifestCopy 墙钟时间。
+    const auto manifestCopyTickEnd = std::chrono::steady_clock::now();
+    const uint64_t manifestCopyChronoNs = uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            manifestCopyTickEnd - manifestCopyTickStart).count());
+    m_manifestCopyTotalChronoNs.fetch_add(manifestCopyChronoNs,
+                                          std::memory_order_relaxed);
+    {
+      uint64_t cur =
+          m_manifestCopyMaxChronoNs.load(std::memory_order_relaxed);
+      while (manifestCopyChronoNs > cur &&
+             !m_manifestCopyMaxChronoNs.compare_exchange_weak(
+                 cur, manifestCopyChronoNs, std::memory_order_relaxed))
+        ;
+    }
   }
   DemandFillVisibleUnitGeosetBindings(manifest);
   resourceRevision = resourceCache.revision();

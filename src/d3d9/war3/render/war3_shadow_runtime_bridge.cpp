@@ -4178,6 +4178,17 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         contractCache.lastManifestCopyRejectedSkipped();
     summary.semanticManifestCopySkipStableCount =
         contractCache.manifestCopySkipStableCount();
+    // 透传 ManifestCopy 真实进入次数（应该 ≈ 帧数）
+    summary.semanticManifestCopyEnterCount =
+        contractCache.manifestCopyEnterCount();
+    summary.semanticManifestCopyMaxScanned =
+        contractCache.manifestCopyMaxScanned();
+    summary.semanticManifestCopyTotalScanned =
+        contractCache.manifestCopyTotalScanned();
+    summary.semanticManifestCopyTotalChronoNs =
+        contractCache.manifestCopyTotalChronoNs();
+    summary.semanticManifestCopyMaxChronoNs =
+        contractCache.manifestCopyMaxChronoNs();
   }
   summary.semanticVisibleDirectUnitCandidateAccepted =
       publishedBundle.stats.visibleDirectUnitCandidateAccepted;

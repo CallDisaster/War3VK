@@ -3860,6 +3860,16 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << runtimeSummary.semanticManifestCopyRejectedSkipped << ",\n";
   json << "    \"semanticManifestCopySkipStableCount\": "
        << runtimeSummary.semanticManifestCopySkipStableCount << ",\n";
+  json << "    \"semanticManifestCopyEnterCount\": "
+       << runtimeSummary.semanticManifestCopyEnterCount << ",\n";
+  json << "    \"semanticManifestCopyMaxScanned\": "
+       << runtimeSummary.semanticManifestCopyMaxScanned << ",\n";
+  json << "    \"semanticManifestCopyTotalScanned\": "
+       << runtimeSummary.semanticManifestCopyTotalScanned << ",\n";
+  json << "    \"semanticManifestCopyTotalChronoNs\": "
+       << runtimeSummary.semanticManifestCopyTotalChronoNs << ",\n";
+  json << "    \"semanticManifestCopyMaxChronoNs\": "
+       << runtimeSummary.semanticManifestCopyMaxChronoNs << ",\n";
   json << "    \"semanticStaticCandidateCount\": "
        << runtimeSummary.semanticStaticCandidateCount << ",\n";
   json << "    \"semanticStaticCandidateBuildingCount\": "

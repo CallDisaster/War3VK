@@ -405,6 +405,11 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticManifestCopyRejectedSkipped = 0;
   // sameFrameDataNotGrowing 早退累计（atomic，实时）。
   uint64_t semanticManifestCopySkipStableCount = 0;
+  uint64_t semanticManifestCopyEnterCount = 0;
+  uint64_t semanticManifestCopyMaxScanned = 0;
+  uint64_t semanticManifestCopyTotalScanned = 0;
+  uint64_t semanticManifestCopyTotalChronoNs = 0;
+  uint64_t semanticManifestCopyMaxChronoNs = 0;
   uint64_t semanticConsumerBuildCalls = 0;
   uint64_t semanticConsumerBuildUs = 0;
   uint64_t semanticConsumerBuildSkippedFresh = 0;
