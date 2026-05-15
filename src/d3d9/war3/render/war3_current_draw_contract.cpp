@@ -1,6 +1,7 @@
 #include "war3_current_draw_contract.h"
 
 #include "../../d3d9_war3_debug.h"
+#include "../../d3d9_war3_hook.h"
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_memory.h"
 #include "../hooks/war3_hook_install_util.h"
@@ -875,6 +876,13 @@ int __fastcall Hook_RenderQueueUpdateItemWorldMatrix(int sceneNodePtr,
                                                      int meshPayloadPtr) {
   if (!g_trampolineRenderQueueUpdateItemWorldMatrix)
     return 0;
+
+  // Phase 7.89：退出地图后 producer 降级为纯透传。跳过 entry 构建 + publish +
+  // visible registry 查询 + palette slot 读取，避免主界面无消费者时仍全速运行。
+  if (!dxvk::g_war3_runtime_activated.load(std::memory_order_relaxed)) {
+    return g_trampolineRenderQueueUpdateItemWorldMatrix(
+        sceneNodePtr, renderablePartPtr, meshPayloadPtr);
+  }
 
   const bool allowWorldPublish = IsWorldCurrentDrawPublishContext();
 

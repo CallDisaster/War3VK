@@ -7,6 +7,7 @@
 #include "war3_direct_pose_cache.h"
 
 #include "../../d3d9_war3_debug.h"
+#include "../../d3d9_war3_hook.h"
 #include "../core/war3_game_structs.h"
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_memory.h"
@@ -7482,6 +7483,13 @@ void __fastcall Hook_RuntimeMatrixWrite(int nodePtr, int sourceMatrixPtr,
 
   g_trampolineRuntimeMatrixWrite(nodePtr, sourceMatrixPtr, destMatrixPtr);
   g_runtimeMatrixWriteCount.fetch_add(1u, std::memory_order_relaxed);
+
+  // Phase 7.89：退出地图后 producer 降级为纯透传。g_war3_runtime_activated
+  // 在 ResetWar3RuntimeState 时置 false，此后所有 shadow 数据层操作（batch
+  // capture / slot cache / frameTag 统计 / PoseRegistry publish）全部跳过，
+  // 避免主界面无消费者时仍全速运行导致卡顿。
+  if (!dxvk::g_war3_runtime_activated.load(std::memory_order_relaxed))
+    return;
 
   // Phase 7.78：把 frameTag 读取从 dt-gate probe 与 batch-capture 两段
   // 各做一次合并到一次。每帧 13K-30K 次 hook 调用，避免重复读全局 palette

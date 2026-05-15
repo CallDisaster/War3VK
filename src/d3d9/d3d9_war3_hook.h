@@ -167,4 +167,9 @@ void ActivateWar3Runtime(uintptr_t gameBase, const char *source);
  * 失败后会由常规运行时初始化路径兜底，不应在热路径反复做重探测。
  */
 void TryInstallShadowHooksEarly(uintptr_t gameBase, const char *source);
+
+// Phase 7.89：shadow 数据层 producer 在退出地图后的门控标志。
+// 定义在 d3d9_war3_hook.cpp（namespace dxvk 内）。退出地图时置 false，进入地图时置 true。
+extern std::atomic<bool> g_war3_runtime_activated;
+
 } // namespace dxvk

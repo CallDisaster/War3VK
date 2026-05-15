@@ -23147,6 +23147,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           war3::runtime::War3RuntimeModule::ShadowCapture))
     return;
 
+  // Phase 7.89：退出地图后整个 shadow capture 降级为空操作。
+  // 主界面仍有 draw call 进来（UI 模型动画），但 consumer 端已因
+  // semanticRuntimeReady=false 不消费任何数据。producer 端继续跑只是浪费。
+  if (!dxvk::g_war3_runtime_activated.load(std::memory_order_relaxed))
+    return;
+
   const int stage = War3RenderState::GetStage();
   const auto layer = War3RenderState::CurrentLayer();
   const auto cat = War3RenderState::GetStageCategory();
