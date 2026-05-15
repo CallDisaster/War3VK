@@ -170,23 +170,58 @@ void War3Renderer::PublishSemanticRegistriesForScene() {
     const bool semanticData = AreSemanticFrameRegistriesEnabled();
     SemanticPerfScope semanticPerf(
         SemanticDataPerfTag::FrameRegistryPublish, semanticData);
-    if (ShouldTrackRenderObjects())
+    if (ShouldTrackRenderObjects()) {
+        auto scope = war3::War3PerfMonitor::instance().cpuScope(
+            "War3Renderer/EndFrame/Registries/RenderObject");
         RenderObjectRegistry::instance().endFrame();
+    }
     if (!semanticData)
         return;
 
-    if (ShouldPublishVisibleRenderableRegistry())
-        VisibleRenderableRegistry::instance().endFrame();
-    if (ShouldPublishUpperLayerShadowRegistry())
-        UpperLayerShadowRegistry::instance().endFrame();
-    model::ShadowModelResourceCache::instance().endFrame();
-    model::ModelRegistry::instance().endFrame();
-    model::ModelInstanceRegistry::instance().endFrame();
-    if (ShouldPublishPoseRegistry())
-        model::PoseRegistry::instance().endFrame();
-    if (ShouldPublishAttachmentRigidRegistry())
-        model::AttachmentRigidRegistry::instance().endFrame();
-    ShadowObjectRegistry::instance().endFrame();
+    {
+        auto scope = war3::War3PerfMonitor::instance().cpuScope(
+            "War3Renderer/EndFrame/Registries/Visible");
+        if (ShouldPublishVisibleRenderableRegistry())
+            VisibleRenderableRegistry::instance().endFrame();
+    }
+    {
+        auto scope = war3::War3PerfMonitor::instance().cpuScope(
+            "War3Renderer/EndFrame/Registries/UpperLayer");
+        if (ShouldPublishUpperLayerShadowRegistry())
+            UpperLayerShadowRegistry::instance().endFrame();
+    }
+    {
+        auto scope = war3::War3PerfMonitor::instance().cpuScope(
+            "War3Renderer/EndFrame/Registries/ModelResource");
+        model::ShadowModelResourceCache::instance().endFrame();
+    }
+    {
+        auto scope = war3::War3PerfMonitor::instance().cpuScope(
+            "War3Renderer/EndFrame/Registries/Model");
+        model::ModelRegistry::instance().endFrame();
+    }
+    {
+        auto scope = war3::War3PerfMonitor::instance().cpuScope(
+            "War3Renderer/EndFrame/Registries/ModelInstance");
+        model::ModelInstanceRegistry::instance().endFrame();
+    }
+    {
+        auto scope = war3::War3PerfMonitor::instance().cpuScope(
+            "War3Renderer/EndFrame/Registries/Pose");
+        if (ShouldPublishPoseRegistry())
+            model::PoseRegistry::instance().endFrame();
+    }
+    {
+        auto scope = war3::War3PerfMonitor::instance().cpuScope(
+            "War3Renderer/EndFrame/Registries/Attachment");
+        if (ShouldPublishAttachmentRigidRegistry())
+            model::AttachmentRigidRegistry::instance().endFrame();
+    }
+    {
+        auto scope = war3::War3PerfMonitor::instance().cpuScope(
+            "War3Renderer/EndFrame/Registries/ShadowObject");
+        ShadowObjectRegistry::instance().endFrame();
+    }
 }
 
 void War3Renderer::EndFrame() {

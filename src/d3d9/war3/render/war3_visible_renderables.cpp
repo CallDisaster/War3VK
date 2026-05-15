@@ -1959,12 +1959,21 @@ void VisibleRenderableRegistry::beginFrame() {
   }
 
   m_frameNumber.fetch_add(1, std::memory_order_relaxed);
+  m_recordCapReached.store(false, std::memory_order_relaxed);
 }
 
 void VisibleRenderableRegistry::endFrame() {
   Snapshot &snap = m_snapshots[m_writeIndex];
-  HydrateVisibleSnapshotBasicFields(snap);
-  HydrateVisibleSnapshotStaticSemanticFields(snap);
+
+  // Phase 7.96：桥/斜坡/升降机等地形结构附近 War3 引擎会 dispatch 大量对象，
+  // hydrate 里的 BackfillIdentityFromRuntimeModel 对每条 record 做多次
+  // registry 查找，在高压场景下 registry 本身有几千条 entries，导致 O(N*M)
+  // 行为耗时 30ms+。draw-time producer 不依赖 hydrate 结果，因此安全跳过。
+  constexpr size_t kHydrateMaxRecords = 128u;
+  if (snap.records.size() <= kHydrateMaxRecords) {
+    HydrateVisibleSnapshotBasicFields(snap);
+    HydrateVisibleSnapshotStaticSemanticFields(snap);
+  }
 
   snap.lastRecordCount = snap.records.size();
   snap.lastPayloadCount = snap.byPayload.size();
@@ -2022,29 +2031,48 @@ void VisibleRenderableRegistry::registerMainQueueRange(
   if (!batchArray || after <= before)
     return;
 
+  // Phase 7.96：cap 已触发后，后续调用在入口直接 return，避免函数调用累积开销。
+  if (m_recordCapReached.load(std::memory_order_relaxed))
+    return;
+
   m_renderThreadId = std::this_thread::get_id();
   Snapshot &snap = writeSnapshot();
+
+  // Phase 7.96：record 数量超过阈值时拒绝新增，从源头控制 endFrame 成本。
+  if (snap.records.size() >=
+      dxvk::war3::internal::kWar3RuntimeConfigSemanticVisibleEndFrameMaxRecords) {
+    m_recordCapReached.store(true, std::memory_order_relaxed);
+    return;
+  }
+
+  // Phase 7.96：限制单次调用写入的 record 数量，避免单次 batch 写入几千条。
+  const uint32_t maxRemaining = static_cast<uint32_t>(
+      dxvk::war3::internal::kWar3RuntimeConfigSemanticVisibleEndFrameMaxRecords -
+      snap.records.size());
+  const uint32_t effectiveAfter =
+      (after - before > maxRemaining) ? (before + maxRemaining) : after;
+
   snap.mainQueueRangeCallCount++;
-  snap.mainQueueRangeRecordCount += uint64_t(after - before);
-  snap.records.reserve(snap.records.size() + (after - before));
+  snap.mainQueueRangeRecordCount += uint64_t(effectiveAfter - before);
+  snap.records.reserve(snap.records.size() + (effectiveAfter - before));
   if constexpr (!dxvk::war3::internal::
                     kWar3RuntimeConfigDeferSemanticVisibleIndexBuild ||
                 dxvk::war3::internal::
                     kWar3RuntimeConfigMaintainSemanticVisibleHotLookupIndexes) {
-    snap.byPayload.reserve(snap.byPayload.size() + (after - before));
-    snap.byRenderablePart.reserve(snap.byRenderablePart.size() + (after - before));
-    snap.byWorldObjectEntry.reserve(snap.byWorldObjectEntry.size() + (after - before));
-    snap.byHandle.reserve(snap.byHandle.size() + (after - before));
-    snap.bySceneNode.reserve(snap.bySceneNode.size() + (after - before));
-    snap.byMeshData.reserve(snap.byMeshData.size() + (after - before));
-    snap.byRuntimeModel.reserve(snap.byRuntimeModel.size() + (after - before));
-    snap.byRuntimeGeoset.reserve(snap.byRuntimeGeoset.size() + (after - before));
+    snap.byPayload.reserve(snap.byPayload.size() + (effectiveAfter - before));
+    snap.byRenderablePart.reserve(snap.byRenderablePart.size() + (effectiveAfter - before));
+    snap.byWorldObjectEntry.reserve(snap.byWorldObjectEntry.size() + (effectiveAfter - before));
+    snap.byHandle.reserve(snap.byHandle.size() + (effectiveAfter - before));
+    snap.bySceneNode.reserve(snap.bySceneNode.size() + (effectiveAfter - before));
+    snap.byMeshData.reserve(snap.byMeshData.size() + (effectiveAfter - before));
+    snap.byRuntimeModel.reserve(snap.byRuntimeModel.size() + (effectiveAfter - before));
+    snap.byRuntimeGeoset.reserve(snap.byRuntimeGeoset.size() + (effectiveAfter - before));
     snap.byRuntimeGeosetData.reserve(
-        snap.byRuntimeGeosetData.size() + (after - before));
+        snap.byRuntimeGeosetData.size() + (effectiveAfter - before));
   }
 
   auto *base = reinterpret_cast<std::uint8_t *>(batchArray);
-  for (uint32_t i = before; i < after; ++i) {
+  for (uint32_t i = before; i < effectiveAfter; ++i) {
     auto *element = base + i * kRenderBatchElementStride;
 
     VisibleRenderableRecord record = {};
@@ -2118,6 +2146,18 @@ bool VisibleRenderableRegistry::registerSemanticCandidate(
 
   m_renderThreadId = std::this_thread::get_id();
   Snapshot &snap = writeSnapshot();
+
+  // Phase 7.96：cap 已触发后直接 return。
+  if (m_recordCapReached.load(std::memory_order_relaxed))
+    return false;
+
+  // Phase 7.96：record 数量超过阈值时拒绝新增，从源头控制 endFrame 成本。
+  if (snap.records.size() >=
+      dxvk::war3::internal::kWar3RuntimeConfigSemanticVisibleEndFrameMaxRecords) {
+    m_recordCapReached.store(true, std::memory_order_relaxed);
+    return false;
+  }
+
   snap.semanticCandidateCallCount++;
   auto canMergeVisibleSubpart =
       [](const VisibleRenderableRecord& existing,
@@ -2367,8 +2407,20 @@ void VisibleRenderableRegistry::registerTransparentEntry(
   if (payload == nullptr && !identity.HasContext())
     return;
 
+  // Phase 7.96：cap 已触发后直接 return。
+  if (m_recordCapReached.load(std::memory_order_relaxed))
+    return;
+
   m_renderThreadId = std::this_thread::get_id();
   Snapshot &snap = writeSnapshot();
+
+  // Phase 7.96：record 数量超过阈值时拒绝新增，从源头控制 endFrame 成本。
+  if (snap.records.size() >=
+      dxvk::war3::internal::kWar3RuntimeConfigSemanticVisibleEndFrameMaxRecords) {
+    m_recordCapReached.store(true, std::memory_order_relaxed);
+    return;
+  }
+
   snap.transparentEntryCallCount++;
   snap.records.reserve(snap.records.size() + 1u);
   if constexpr (!dxvk::war3::internal::

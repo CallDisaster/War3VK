@@ -23344,6 +23344,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoRenderablePart++;
           break;
         }
+        // Phase 7.96：在 GPU copy 之前拦截路径阻断器，避免无意义的 VB 拷贝。
+        if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+            semantic.rawcode != 0u && IsLosBlockerFourCc(semantic.rawcode)) {
+          m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+          break;
+        }
         auto *decl = m_state.vertexDecl.ptr();
         if (decl == nullptr) {
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoDecl++;

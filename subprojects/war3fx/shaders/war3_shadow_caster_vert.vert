@@ -32,7 +32,7 @@ void main() {
 
   // 非混合模式：GPU 端 MVP 计算（worldMatrix 从 SSBO 读取）
   if ((p_flags & 0x1u) == 0u) {
-    mat4 wm = u_worldMatrices[p_paletteOffset];
+    mat4 wm = u_worldMatrices[p_paletteOffset + uint(gl_InstanceIndex)];
     gl_Position = (in_pos * wm) * p_mvp;
     return;
   }

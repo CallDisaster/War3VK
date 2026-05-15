@@ -262,6 +262,8 @@ private:
   uint32_t m_writeIndex = 0;
   std::thread::id m_renderThreadId = {};
   std::atomic<uint64_t> m_frameNumber{0};
+  // Phase 7.96：record cap 触发后置 true，后续 register 调用在入口直接 return。
+  std::atomic<bool> m_recordCapReached{false};
   std::unordered_map<uint64_t, ShadowManifestObjectEntry>
       m_shadowManifestObjects;
   std::unordered_map<uint64_t, ShadowManifestPartEntry> m_shadowManifestParts;

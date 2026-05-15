@@ -498,12 +498,20 @@ inline constexpr bool
 // sceneNode / meshData，并重建索引；禁止在 register* 热路径做多级补全。
 inline constexpr bool
     kWar3RuntimeConfigSemanticVisibleEndFrameBasicHydrate = true;
+// Phase 7.96：当 visible snapshot 的 record 数量超过此阈值时，跳过 hydrate
+// 和 index rebuild，避免桥/斜坡/升降机等大量对象场景下 endFrame 耗时 30ms+。
+// draw-time producer 不依赖 hydrate 结果（它直接用 VB cache entry），因此
+// 跳过 hydrate 不影响 Pose 正确性和 shadow 提交。
+inline constexpr size_t
+    kWar3RuntimeConfigSemanticVisibleEndFrameMaxRecords = 256u;
 // 当前 semantic-only caster 必须从真实 visible renderable 获得
 // `RenderablePart/MeshData -> runtimeModel/modelResource/geoset` 绑定。这里在
 // EndFrame 做 O(visible) 轻量补全，避免在 Dispatch 热路径做多 registry join，
 // 也避免继续依赖 RootUnitSupplement 的非当前 geoset 猜测。
+// Phase 7.96：高压场景下 BackfillIdentityFromRuntimeModel 的 registry 查找
+// 成本 O(N*M) 导致 30ms+ 卡顿。draw-time producer 不依赖此补全，关闭。
 inline constexpr bool
-    kWar3RuntimeConfigSemanticVisibleEndFrameUnitGeosetHydrate = true;
+    kWar3RuntimeConfigSemanticVisibleEndFrameUnitGeosetHydrate = false;
 // Performance-safe static caster hydration: keep hot-path visible writes light,
 // but let Building/Destructible records resolve model/geoset metadata once at
 // EndFrame so full-scene semantic shadows can include static objects.
