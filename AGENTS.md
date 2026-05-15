@@ -4437,3 +4437,28 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      - 用户实机看看 Phase 7.83-7.86 的整体效果（mutex 收益在
        cluster 场景才显现）
      - 没回退的话继续 visible registry dedup
+
+
+121. **Phase 7.88-7.91 CSM cascade cull 两次尝试均回退 + SunkenCity 诊断准备（2026-05-15 14:20-16:15）**:
+   - **Phase 7.88 第一次尝试**：从 sceneNode 读世界位置 + 保守 radius，启用 Unit cull。
+     结果：cascade 0 全部被误杀（0 drawn），视觉回退。回退。
+   - **Phase 7.91 第二次尝试**：只对 cascade 2/3 做 cull（cascade 0/1 不 cull）。
+     结果：cascade 2/3 仍然 0 culled，因为 v4 fast-append 路径的
+     `packet.renderable.sceneNode == nullptr`（fast-append 跳过了完整 packet build，
+     sceneNode 没被填充到 packet 里）。额外的 `IsReadableRangeFast` 探测反而增加了
+     CPU 成本，FPS 从 81.6 降到 76.9。回退。
+   - **根因**：v4 fast-append 的 `eligible.sceneNode` 和 `packet.renderable.sceneNode`
+     在 prebuild bypass 路径下确实有值（从 visible record 填充），但在 producer 路径
+     （`War3TryPopulateDrawTimeSemanticProducer`）里 `record.sceneNode` 来自
+     `VisibleRenderableRecord`，也应该有值。问题可能是 `record.identity.sceneNode`
+     为 nullptr 或者 `IsReadableRangeFast` 在某些 sceneNode 上失败。
+   - **正确的下一步**：在 v4 capture 阶段（`War3TryCaptureShadowCaster` 的 v4 块）
+     把 `semantic.sceneNode` 存到 `War3DrawTimeVBEntry` 里。这样 producer/fast-append
+     路径都能从 entry 直接读到 sceneNode，不需要依赖 packet/record 的 sceneNode。
+   - **SunkenCity.w3x 诊断**：AutoTest 跑了但相机固定，没触发用户报告的 1FPS 卡顿。
+     需要用户手动操作时开 trace（`DXVK_WAR3_SHADOW_POSE_FULL_TRACE=1`），或者
+     用 control plane 动态开 15 秒 trace 在卡顿发生时。
+   - **高压地图基线（无 trace）**：
+     - Phase 7.89 当前：**81.6 FPS**（`mainThread=8.4ms`, `GPU=2.9ms`）
+     - 804 shadow map draw calls/frame（201 casters × 4 cascades）
+   - **当前 DLL**：`E:\Work\War3\d3d9.dll` = Phase 7.89 状态（CSM cull 已回退）
