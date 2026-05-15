@@ -32,6 +32,8 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <windows.h>
@@ -122,7 +124,10 @@ std::atomic<uint64_t> g_nativeSemanticWorldStageLastPrepareFrameSerial{0u};
 std::atomic<uint64_t> g_nativeSemanticWorldStageLastExecuteFrameSerial{0u};
 std::atomic<uint64_t> g_nativeSemanticWorldStageLastPrepareDrawCount{0u};
 std::atomic<uint64_t> g_nativeSemanticWorldStageLastExecuteDrawCount{0u};
-std::mutex g_shadowSceneStatsMutex;
+// Phase 7.86：reader 路径每帧 1+ 次（trace JSON 生成 / status query），
+// writer 路径每帧 1 次（NoteShadowSceneStats）。改 shared_mutex 让 reader
+// 路径不互斥，trace 拉取与统计写入并发更安全。
+std::shared_mutex g_shadowSceneStatsMutex;
 War3ShadowCaptureStats g_shadowSceneStats = {};
 uint64_t g_shadowSceneStatsPublishCount = 0u;
 std::mutex g_shadowCadenceMutex;
@@ -1424,7 +1429,7 @@ void NoteShadowRuntimePose(void* runtimeModelPtr, void* sceneNode, void* unitPtr
 }
 
 void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
-  std::lock_guard<std::mutex> lock(g_shadowSceneStatsMutex);
+  std::unique_lock<std::shared_mutex> lock(g_shadowSceneStatsMutex);
   War3ShadowCaptureStats merged = stats;
   const auto hasReceiverDetails = [](const War3ShadowCaptureStats& value) {
     return value.semanticSceneShadowMapDrawnCasters != 0u ||
@@ -3013,7 +3018,7 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
   summary.upperLayerDuplicateOrSuppressed =
       upperLayerStats.duplicateOrSuppressed;
   {
-    std::lock_guard<std::mutex> lock(g_shadowSceneStatsMutex);
+    std::shared_lock<std::shared_mutex> lock(g_shadowSceneStatsMutex);
     summary.fallbackDrawCount = g_shadowSceneStats.fallbackDrawCount;
     summary.fallbackDrawCountTerrain =
         g_shadowSceneStats.fallbackDrawCountTerrain;
