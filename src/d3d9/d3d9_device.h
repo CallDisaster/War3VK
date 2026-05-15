@@ -1980,6 +1980,9 @@ private:
   // 不影响我们的 buffer。
   struct War3DrawTimeVBEntry {
     void* renderablePart = nullptr;
+    // Phase 7.92：capture 时保存 sceneNode，让 producer/fast-append 路径能
+    // 从 entry 直接读到世界位置用于 CSM cascade cull。
+    void* sceneNode = nullptr;
     // 我们自有 GPU buffer（device-local），存 capture 帧的 vertex range bytes。
     // 包含完整 stride 的 vertex 数据；shader 用 positionStride/positionOffset
     // 读取 xyz。

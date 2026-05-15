@@ -23467,6 +23467,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
         auto& entry = m_war3DrawTimeVBCache[vbCacheKey];
         entry.renderablePart = semantic.renderablePart;
+        entry.sceneNode = semantic.sceneNode;
         entry.rawcode = semantic.rawcode;
         entry.jHandle = semantic.jHandle;
         entry.objectKind = semantic.objectKind;
