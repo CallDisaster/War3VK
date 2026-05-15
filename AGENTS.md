@@ -4462,3 +4462,35 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      - Phase 7.89 当前：**81.6 FPS**（`mainThread=8.4ms`, `GPU=2.9ms`）
      - 804 shadow map draw calls/frame（201 casters × 4 cascades）
    - **当前 DLL**：`E:\Work\War3\d3d9.dll` = Phase 7.89 状态（CSM cull 已回退）
+
+
+122. **Phase 7.95 桥/斜坡卡顿根因定位（2026-05-15 17:00-18:10）**:
+   - **用户复现条件**：高压地图放置桥/斜坡/升降机装饰物后，FPS 从 80+ 降到 20 左右。
+     SunkenCity.w3x 更极端（0.5-4 FPS）。原版魔兽不卡。
+   - **隔离测试结果**：
+     - `DXVK_WAR3_PROFILE=dxvk_only` → 不卡（DXVK 基础层没问题）
+     - `DXVK_WAR3_DISABLE=semantic.data` → 不卡（确认是 semantic.data 模块）
+     - `DISABLE_SHADOW_CAPTURE + DISABLE_PUBLISH_CONTRACT + MATRIX_BATCH_CAPTURE=0` → 还卡
+     - `DXVK_WAR3_DISABLE=hook.render,render.queue` → 还卡
+   - **perf report 决定性数据**（高压地图带桥，21 FPS）：
+     - `avgMainThreadCpuMs = 44ms`，`avgGpuTimeMs = 2.6ms`（纯 CPU 瓶颈）
+     - **`War3Renderer/EndFrame/Registries` = 30.7ms/帧**（占总帧时间 70%）
+     - `War3Renderer/EndFrame/CaptureLiveState` = 2.8ms/帧（不是主因）
+     - `Semantic/OutsideMainLoop/Tracked` = 40.5ms/帧（包含 Registries）
+   - **根因**：`PublishSemanticRegistriesForScene()` 里调用的 registry `endFrame()` 链。
+     虽然 `ModelInstanceRegistry::endFrame()` 的 sweep 已被 `kWar3RuntimeConfigDisableSemanticRegistryEndFrameSweeps=true` 编译期跳过，
+     但 **`VisibleRenderableRegistry::endFrame()`** 做的 `HydrateVisibleSnapshotBasicFields` +
+     `HydrateVisibleSnapshotStaticSemanticFields` 在桥/斜坡场景下可能有 O(N²) 行为
+     （`BackfillIdentityFromRuntimeModel` 对每个 record 做 registry 查找）。
+   - **为什么桥/斜坡触发**：War3 引擎在这些地形结构附近 dispatch 大量对象
+     （pathblocker/destructible/doodad），导致 `VisibleRenderableRegistry` 的 record 数
+     从正常的 ~100 爆到几千。hydrate 的 O(N) 或 O(N²) 遍历在 N=几千时爆到 30ms。
+   - **下一步（新线程必做）**：
+     1. 在 `PublishSemanticRegistriesForScene()` 里给每个 `endFrame()` 加独立 cpuScope
+     2. 重跑高压地图（带桥），确认是 `VisibleRenderableRegistry::endFrame()` 还是其他
+     3. 对 hydrate 做 size cap 或 early-exit（record 数 > 阈值时跳过 hydrate）
+     4. 验证高压地图 FPS 恢复到 80+
+   - **测试地图**：`E:\Work\War3\Maps\ShadowTest\光影测试(高压).w3x`（已放置桥/斜坡）
+   - **测试脚本**：`py AutoTest\_phase790_highpressure_perf.py`（无 trace，30s）
+   - **当前 DLL**：`E:\Work\War3\d3d9.dll` = Phase 7.95 状态
+   - **commit**：`a571f01`（含 call cap + registry size check，但未解决根因）
