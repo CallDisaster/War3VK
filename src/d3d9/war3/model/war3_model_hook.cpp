@@ -440,6 +440,8 @@ std::shared_mutex g_runtimePoseArrayRangeMutex;
 std::unordered_map<uintptr_t, RuntimePoseArrayRange> g_runtimePoseArrayByModel;
 std::unordered_map<uintptr_t, RuntimePoseArrayRange>
     g_runtimePoseArrayByMatrixPtr;
+// Phase 7.95：registry size 原子计数，让 TryFind 的 empty-check 快路径生效。
+std::atomic<uint32_t> g_runtimePoseArrayRegistrySize{0u};
 
 std::atomic<uint64_t> g_attachmentChildLineageBootstrapAttemptCount{0u};
 std::atomic<uint64_t> g_attachmentChildLineageBootstrapSuccessCount{0u};
@@ -5877,6 +5879,11 @@ void RememberRuntimePoseArrayRange(int runtimeModel) {
   g_runtimePoseArrayByModel[range.runtimeModel] = range;
   for (uint32_t i = 0u; i < range.matrixCount; ++i)
     g_runtimePoseArrayByMatrixPtr[range.matrixArray + size_t(i) * 48u] = range;
+
+  // Phase 7.95：更新 size 原子计数，让 TryFind 的 empty-check 快路径生效。
+  g_runtimePoseArrayRegistrySize.store(
+      uint32_t(g_runtimePoseArrayByMatrixPtr.size()),
+      std::memory_order_relaxed);
 }
 
 bool TryFindRuntimePoseArrayRangeForMatrix(int destMatrixPtr,
@@ -5885,6 +5892,12 @@ bool TryFindRuntimePoseArrayRangeForMatrix(int destMatrixPtr,
   out = {};
   outMatrixIndex = 0u;
   if (destMatrixPtr == 0)
+    return false;
+
+  // Phase 7.95：如果 pose range registry 为空（没有注册任何 CModel pose range），
+  // 直接 return false 不做 lock。在桥/斜坡场景下 War3 可能每帧 50K+ matrix write，
+  // 全部 miss 但仍付 shared_lock + hashmap.find 成本。这个 relaxed load 几乎零成本。
+  if (g_runtimePoseArrayRegistrySize.load(std::memory_order_relaxed) == 0u)
     return false;
 
   const uintptr_t dest = uintptr_t(uint32_t(destMatrixPtr));
@@ -7483,6 +7496,25 @@ void __fastcall Hook_RuntimeMatrixWrite(int nodePtr, int sourceMatrixPtr,
 
   g_trampolineRuntimeMatrixWrite(nodePtr, sourceMatrixPtr, destMatrixPtr);
   g_runtimeMatrixWriteCount.fetch_add(1u, std::memory_order_relaxed);
+
+  // Phase 7.95：每帧调用次数上限。在桥/斜坡场景下 War3 可能每帧 50K-100K 次
+  // matrix write，TryFindRuntimePoseArrayRangeForMatrix 的 shared_lock + hashmap
+  // lookup 累积到 40ms+。超过阈值后直接跳过数据层工作。
+  // 阈值 20000 足够覆盖正常场景（13K-30K），但能截断极端场景。
+  static thread_local uint64_t s_lastFrameTag = 0u;
+  static thread_local uint32_t s_frameCallCount = 0u;
+  {
+    uint32_t currentTag = 0u;
+    TryReadCurrentPaletteFrameTag(currentTag);
+    if (currentTag != 0u && currentTag != s_lastFrameTag) {
+      s_lastFrameTag = currentTag;
+      s_frameCallCount = 0u;
+    }
+  }
+  ++s_frameCallCount;
+  constexpr uint32_t kMaxCallsPerFrame = 20000u;
+  if (s_frameCallCount > kMaxCallsPerFrame)
+    return;
 
   // Phase 7.89：退出地图后 producer 降级为纯透传。g_war3_runtime_activated
   // 在 ResetWar3RuntimeState 时置 false，此后所有 shadow 数据层操作（batch
