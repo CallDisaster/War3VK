@@ -9069,7 +9069,7 @@ void ShadowValidationRuntime::requestFrameBuildForContract(
   if (!manifest || !resources || !poses || !attachments)
     return;
 
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   const uint64_t supplementalCandidateCount =
       CountAttachmentSupplementalCandidates(attachments);
   const bool attachmentSupplementalNeedsRebuild =
@@ -9106,7 +9106,7 @@ void ShadowValidationRuntime::ensureLatestFrameBuilt() {
   std::shared_ptr<const ShadowPoseStore> poses;
   std::shared_ptr<const ShadowAttachmentRigidStore> attachments;
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     if (m_buildInProgress && m_buildWork != nullptr) {
       const bool hasNewerPending =
           m_pendingManifest && m_pendingResources && m_pendingPoses &&
@@ -9207,7 +9207,7 @@ void ShadowValidationRuntime::ensureFrameBuiltForContract(
   manifest = MaybeCapPreviewManifest(std::move(manifest), *resources, *poses);
   std::shared_ptr<ShadowValidationBuildWork> buildWork;
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     const uint64_t supplementalCandidateCount =
         CountAttachmentSupplementalCandidates(attachments);
     const bool attachmentSupplementalNeedsRebuild =
@@ -9273,7 +9273,7 @@ void ShadowValidationRuntime::ensureFrameBuiltForContract(
     if (buildWork->frame.frameSerial != 0u && !buildWork->frame.draws.empty()) {
       auto partialFrame =
           std::make_shared<ShadowSubmissionFrame>(buildWork->frame);
-      std::lock_guard<std::mutex> lock(m_mutex);
+      std::unique_lock<std::shared_mutex> lock(m_mutex);
       if (ShouldPreferRenderableSubmissionFrame(partialFrame.get(),
                                                 m_lastRenderableFrame.get())) {
         m_lastRenderableFrame = std::move(partialFrame);
@@ -9341,7 +9341,7 @@ void ShadowValidationRuntime::ensureFrameBuiltForContract(
   buildWork->stats.buildDurationUs = buildWork->totalBuildDurationUs;
 
   {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     m_lastBuildDurationUs = buildWork->stats.buildDurationUs;
     m_lastStats = buildWork->stats;
     auto completedFrame =
@@ -9395,7 +9395,7 @@ void ShadowValidationRuntime::runObserveValidation() {
 }
 
 void ShadowValidationRuntime::reset() {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
   m_buildInProgress = false;
   m_buildFrameSerial = 0;
   m_buildPublishRevision = 0;
@@ -9411,7 +9411,7 @@ void ShadowValidationRuntime::reset() {
 }
 
 ShadowValidationFrameStats ShadowValidationRuntime::snapshot() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   if (m_buildInProgress && m_buildWork != nullptr) {
     ShadowValidationFrameStats stats = m_buildWork->stats;
     stats.coreDrawPacketCount = m_buildWork->frame.draws.size();
@@ -9423,7 +9423,7 @@ ShadowValidationFrameStats ShadowValidationRuntime::snapshot() const {
 }
 
 ShadowValidationBuildState ShadowValidationRuntime::buildStateSnapshot() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   ShadowValidationBuildState state = {};
   state.buildInProgress = m_buildInProgress;
   state.buildRequestPending =
@@ -9447,19 +9447,19 @@ ShadowValidationBuildState ShadowValidationRuntime::buildStateSnapshot() const {
 }
 
 ShadowSubmissionFrame ShadowValidationRuntime::snapshotFrame() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_lastFrame != nullptr ? *m_lastFrame : ShadowSubmissionFrame{};
 }
 
 std::shared_ptr<const ShadowSubmissionFrame>
 ShadowValidationRuntime::snapshotFrameShared() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   return m_lastFrame;
 }
 
 std::shared_ptr<const ShadowSubmissionFrame>
 ShadowValidationRuntime::snapshotRenderableFrameShared() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   if (m_lastRenderableFrame != nullptr &&
       m_lastRenderableFrame->frameSerial != 0u &&
       !m_lastRenderableFrame->draws.empty() &&

@@ -7,6 +7,7 @@
 #include <array>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <vector>
 
 namespace dxvk::war3::shadow {
@@ -362,7 +363,8 @@ private:
 
   void clearPendingBuildLocked();
 
-  mutable std::mutex m_mutex;
+  // Phase 7.87：reader 路径（snapshot*/buildState*/snapshotFrame*）每帧多次。
+  mutable std::shared_mutex m_mutex;
   bool m_buildInProgress = false;
   uint64_t m_buildFrameSerial = 0;
   uint64_t m_buildPublishRevision = 0;
