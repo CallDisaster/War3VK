@@ -704,8 +704,10 @@ inline constexpr bool kShadowSemanticCoreValidationEnabled = true;
 //   可用 DXVK_WAR3_SEMANTIC_SHADOW_SCENE_SUBMISSION=0 显式关闭。
 inline constexpr bool kShadowSemanticCoreSceneSubmissionEnabled = true;
 inline constexpr bool kShadowSemanticCoreSceneUnitsOnly = false;
-inline constexpr bool kShadowSemanticCoreSceneSubmitDrawCapEnabled = false;
-inline constexpr uint32_t kShadowSemanticCoreSceneSubmitDrawCap = 64u;
+// Phase 7.93：启用 shadow caster 数量上限。SunkenCity 某些视角有 700+ caster
+// 导致 1FPS。设 256 上限：足够覆盖正常高压场景（~200），截断极端场景。
+inline constexpr bool kShadowSemanticCoreSceneSubmitDrawCapEnabled = true;
+inline constexpr uint32_t kShadowSemanticCoreSceneSubmitDrawCap = 256u;
 inline constexpr bool kShadowSemanticCoreSceneBootstrapCatchupEnabled = false;
 inline constexpr uint32_t kShadowSemanticCoreSceneBootstrapCatchupMaxAttempts = 0u;
 inline constexpr bool kShadowSemanticCoreSceneTailBoundaryFallbackEnabled = false;
