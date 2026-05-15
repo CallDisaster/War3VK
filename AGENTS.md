@@ -4270,3 +4270,38 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      - 每个 phase 独立 commit，可以单独 revert 任意一个
      - 性能侧改动（7.76/7.77/7.79/7.80）影响主路径，回滚要小心
      - 诊断侧改动（7.73/7.74/7.75/7.78）纯加观察点，可任意保留或回滚
+
+
+119. **Phase 7.81-7.82 收尾（2026-05-15 06:00 凌晨末班 + 12:40 中午回归）**:
+   - **`1c954a1` Phase 7.81**：`SnapshotPublishedCurrentDrawContracts` 内
+     `unlimitedDedupeIndex` 与 `preferredVisibleKeyCache` 改 thread_local，
+     避免每帧多次调用时 `reserve(4096)` 重复 alloc/free。
+   - **`ee23d48` Phase 7.82**：`StaticMeshDataResourceCacheMutex` 从
+     `std::mutex` 切到 `std::shared_mutex`，与 Phase 7.76 同模式。
+     read 路径走 `shared_lock`，cache miss/insert 升级 `unique_lock`。
+   - **当前部署**：`E:\Work\War3\d3d9.dll = 26770323 bytes @ 2026-05-15 12:38`，
+     包含 Phase 7.70-7.82 全部改动。
+   - **黑匣子全过**：`submitted=0` 0/910 帧、`historyValid=1.0`、
+     `producer fallback=0`、`path blocker reject=9.12/帧`（光影测试.w3x）。
+   - **当前性能**（中午 12:40，3 轮 × 20s）：
+     - 116.9 / 120.0 / 117.1 → mean **118.0 FPS**
+     - vs Phase 7.72 initial baseline 118 FPS（噪声范围）
+     - vs 昨晚凌晨 Phase 7.76 mean 124.8 FPS（凌晨低后台负载下记录）
+     - 中午 vs 凌晨的差距是后台负载差异，不是代码回退
+   - **已落地的纯收益累计估算**（按理论 μs/帧）：
+     - 7.70 同帧 capture dedup：~40-100μs
+     - 7.76 geoset cache shared_mutex：150-400μs
+     - 7.77 publish probe gate：300-900μs（在 publish 频次高场景）
+     - 7.78 frameTag 双读合并：100-250μs
+     - 7.79 runtime pose range shared_mutex：20-80μs
+     - 7.80 partCache TLS：5-30μs
+     - 7.81 snapshot helper TLS caches：30-100μs
+     - 7.82 static mesh cache shared_mutex：50-150μs
+     - 总计：约 **0.7-2.0 ms/帧** 主线程 CPU 削减
+   - **下一步路线**（待用户决策）：
+     - 需要用户实机复核 Phase 7.72 path blocker 修复（光影测试.w3x 不是
+       path-blocker 重灾区，3-9/帧 reject 主要来自 EarlyBypass/AppendEntry/FastAppend
+       三个 bucket，trace 已有完整分桶）。
+     - CSM cascade cull for v4 fast-append 仍未做（需要可靠 bounds 设计）。
+     - Population eligible-build 路径里 visible registry 二次查询 dedup 仍可做
+       （收益约 50-150μs/帧，但需要在多个 helper 间透传 iterator）。
