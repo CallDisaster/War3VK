@@ -135,6 +135,7 @@ d3d9_src = [
   'war3/hooks/war3_hook_address_book.cpp',
   'war3/hooks/war3_hook_ui.cpp',
   'war3/hooks/war3_hook_shadow.cpp',
+  'war3/hooks/war3_hook_widget_identity.cpp',
   'war3/hooks/war3_hook_install_util.cpp',
   'war3/hooks/war3_hook_render_identity.cpp',
   'war3/hooks/war3_dispatch_contract.cpp',

@@ -118,6 +118,11 @@ struct War3HookAddressBook {
   uintptr_t shadowRegisterRetFromPoint = 0;       // 0x76D69A
   uintptr_t shadowRegisterRetFromTwoPoints = 0;   // 0x76D719
 
+  // CWidget lifecycle 中央 sync 入口（30+ caller 都会调）。
+  // 用于在 destructible/building/unit 创建/销毁/移动等任意 lifecycle 事件时
+  // 抓取 widget 身份链（rawcode + jHandle），喂给 RenderObjectRegistry 兜底。
+  uintptr_t widgetRegisterFootprintAndShadowMask = 0;  // 0x65A140
+
   // -------------------------------------------------------------------------
   // RenderQueue 数据区
   // -------------------------------------------------------------------------

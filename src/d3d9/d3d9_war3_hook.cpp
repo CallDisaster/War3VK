@@ -26,6 +26,7 @@
 #include "war3/hooks/war3_hook_lifecycle.h"
 #include "war3/hooks/war3_hook_render.h"
 #include "war3/hooks/war3_hook_shadow.h"
+#include "war3/hooks/war3_hook_widget_identity.h"
 #include "war3/hooks/war3_hook_ui.h"
 #include "war3/memory/war3_storm_hook.h"
 #include "war3/memory/war3_tlsf_pool.h"
@@ -580,6 +581,16 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
         resolveCode(book.shadowPathStaticStampToggle,
                     "ShadowPath_StaticStamp_Toggle");
     dxvk::war3::hooks::InstallShadowHooks(shadowHooks);
+
+    // Phase 7.98：CWidget 身份链中央 sync Hook。
+    // 这是 path blocker / destructible / building / unit 等所有 CWidget 派生类
+    // lifecycle 事件的统一入口（30+ caller）。挂在这里就能拿到 widget+0x30
+    // 的 rawcode 与对应 jHandle，喂给 RenderObjectRegistry 的兜底查询，让
+    // 路径阻断器拦截、描边、Bloom 在 destructible 上也能稳定生效。
+    LPVOID widgetRegisterAddr = resolveCode(
+        book.widgetRegisterFootprintAndShadowMask,
+        "CWidget_RegisterFootprintAndShadowMask");
+    dxvk::war3::hooks::InstallWidgetIdentityHook(widgetRegisterAddr);
   } else {
     war3dbg::Print("DXVK War3Hook: 二分诊断态关闭 Shadow hook 安装\n");
   }

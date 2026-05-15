@@ -100,6 +100,7 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x76D5A4, // shadowRegisterRetMarkOcclusion
       0x76D69A, // shadowRegisterRetFromPoint
       0x76D719, // shadowRegisterRetFromTwoPoints
+      0x65A140, // widgetRegisterFootprintAndShadowMask（论文第6章中央 sync 入口）
 
       // RenderQueue 数据区
       0xBC6BAC, // rqNumOfElements

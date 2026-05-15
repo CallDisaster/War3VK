@@ -23,6 +23,8 @@
 #include "war3/render/war3_visible_renderables.h"
 #include "war3/render/war3_canonical_draw.h"
 #include "war3/render/war3_current_draw_contract.h"
+#include "war3/handle/war3_handle_resolver.h"
+#include "war3/hooks/war3_hook_widget_identity.h"
 #include "war3/memory/war3_shadow_arena.h"
 #include "war3/memory/war3_storm_hook.h"
 #include "war3/model/war3_model_hook.h"
@@ -2767,16 +2769,30 @@ dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKind(
 bool War3ShouldSubmitSemanticPacket(
     const dxvk::war3::shadow::ShadowDrawPacket& packet,
     dxvk::war3::render::ObjectKind resolvedObjectKind, bool unitsOnly) {
-  // Phase 7.72：路径阻断器在 eligibility 层就拦掉，避免上游 producer 还要继续
-  // 走完整 packet 构建。这里只读 packet.renderable.rawcode，无堆/无锁。
+  // Phase 7.72/7.98：路径阻断器在 eligibility 层就拦掉，避免上游 producer
+  // 还要继续走完整 packet 构建。
+  //   - rawcode 已知（>0）：直接判定（O(1)）。
+  //   - rawcode 未知（==0）但 jHandle 已知：兜底通过 widget identity cache
+  //     反查（destructible 走 CWidget_RegisterFootprintAndShadowMask hook
+  //     注册路径，不进 Hook_WorldObjects_RenderGroup，单纯 RenderObjectRegistry
+  //     抓不到）。
   // Phase 7.73：拒绝时累加全局原子计数，由 D3D9DeviceEx 在 caster reset 时
   // 折进 shadowStats，让 trace 看到 eligibility 层的命中量。
-  if (dxvk::war3::internal::kPathBlockerHideEnabled &&
-      packet.renderable.rawcode != 0u &&
-      IsLosBlockerFourCc(packet.renderable.rawcode)) {
-    g_pathBlockerEligibilityGateRejectCount.fetch_add(
-        1u, std::memory_order_relaxed);
-    return false;
+  if (dxvk::war3::internal::kPathBlockerHideEnabled) {
+    bool isPathBlocker = false;
+    if (packet.renderable.rawcode != 0u) {
+      isPathBlocker = IsLosBlockerFourCc(packet.renderable.rawcode);
+    } else if (packet.renderable.jHandle != 0u) {
+      const uint32_t cachedRawcode =
+          dxvk::war3::hooks::QueryWidgetRawcodeByHandle(
+              packet.renderable.jHandle);
+      isPathBlocker = cachedRawcode != 0u && IsLosBlockerFourCc(cachedRawcode);
+    }
+    if (isPathBlocker) {
+      g_pathBlockerEligibilityGateRejectCount.fetch_add(
+          1u, std::memory_order_relaxed);
+      return false;
+    }
   }
   const bool hasRenderableGeoset =
       packet.renderable.runtimeGeosetPtr != nullptr ||
@@ -4260,28 +4276,80 @@ inline bool War3ShadowIsLosBlocker(
   return object != nullptr && IsLosBlockerFourCc(object->rawcode);
 }
 
+// Phase 7.98：destructible / path blocker 不进 RenderGroup，rawcode 可能在
+// 调用点尚未填好；当 rawcode==0 但 jHandle 已知时，先通过 widget identity
+// 缓存兜底拿 rawcode（缓存由 CWidget_RegisterFootprintAndShadowMask hook
+// 维护），再判断是否为路径阻断器。
+//
+// 性能说明：本函数仅在「rawcode 已确认为 0」的回退路径调用，正常单位
+// (rawcode 已填) 不会进入此函数；因此 shared_mutex 的成本只发生在每帧一小撮
+// 空 rawcode 包上（destructible / late tag 等），不会在描边/阴影热路径
+// 产生额外开销。
+inline bool War3ShadowIsLosBlockerByJHandleFallback(uint32_t jHandle) {
+  if (jHandle == 0u)
+    return false;
+  // 1) 每帧 RenderObjectRegistry（命中走 group 0/1/2 的对象）。
+  if (const auto* info = dxvk::war3::render::RenderObjectRegistry::instance()
+                              .findByHandle(jHandle)) {
+    if (info->rawcode != 0u)
+      return IsLosBlockerFourCc(info->rawcode);
+  }
+  // 2) widget identity cache（destructible 永久身份）。
+  const uint32_t cachedRawcode =
+      dxvk::war3::hooks::QueryWidgetRawcodeByHandle(jHandle);
+  return cachedRawcode != 0u && IsLosBlockerFourCc(cachedRawcode);
+}
+
 inline bool War3ShadowIsLosBlocker(
     const dxvk::War3ShadowSemanticContext& semantic,
     const dxvk::war3::render::RenderObjectInfo* currentObj) {
   if (War3ShadowIsLosBlocker(semantic.rawcode, semantic.object))
     return true;
-  return War3ShadowIsLosBlocker(currentObj != nullptr ? currentObj->rawcode : 0u,
-                                currentObj);
+  if (War3ShadowIsLosBlocker(currentObj != nullptr ? currentObj->rawcode : 0u,
+                              currentObj))
+    return true;
+  // Phase 7.98：仅当上述两条 rawcode 都没拿到时才走 widget cache。
+  const bool semanticRawcodeKnown =
+      semantic.rawcode != 0u ||
+      (semantic.object != nullptr && semantic.object->rawcode != 0u);
+  const bool currentRawcodeKnown =
+      currentObj != nullptr && currentObj->rawcode != 0u;
+  if (!semanticRawcodeKnown && !currentRawcodeKnown) {
+    if (War3ShadowIsLosBlockerByJHandleFallback(semantic.jHandle))
+      return true;
+    if (currentObj != nullptr &&
+        War3ShadowIsLosBlockerByJHandleFallback(currentObj->jHandle))
+      return true;
+  }
+  return false;
 }
 
 inline bool War3ShadowIsLosBlocker(
     const dxvk::war3::render::VisibleRenderableRecord& record) {
-  return IsLosBlockerFourCc(record.identity.rawcode);
+  if (IsLosBlockerFourCc(record.identity.rawcode))
+    return true;
+  // Phase 7.98：rawcode 缺失时走 widget cache 兜底。
+  if (record.identity.rawcode == 0u)
+    return War3ShadowIsLosBlockerByJHandleFallback(record.identity.jHandle);
+  return false;
 }
 
 inline bool War3ShadowIsLosBlocker(
     const dxvk::war3::render::CurrentDrawContractRecord& record) {
-  return IsLosBlockerFourCc(record.rawcode);
+  if (IsLosBlockerFourCc(record.rawcode))
+    return true;
+  if (record.rawcode == 0u)
+    return War3ShadowIsLosBlockerByJHandleFallback(record.jHandle);
+  return false;
 }
 
 inline bool War3ShadowIsLosBlocker(
     const dxvk::war3::shadow::ShadowDrawPacket& packet) {
-  return IsLosBlockerFourCc(packet.renderable.rawcode);
+  if (IsLosBlockerFourCc(packet.renderable.rawcode))
+    return true;
+  if (packet.renderable.rawcode == 0u)
+    return War3ShadowIsLosBlockerByJHandleFallback(packet.renderable.jHandle);
+  return false;
 }
 
 inline void FormatFourCcEditorString(uint32_t rawcode, char out[5]) {
@@ -23344,17 +23412,28 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoRenderablePart++;
           break;
         }
-        // Phase 7.96：在 GPU copy 之前拦截路径阻断器，避免无意义的 VB 拷贝。
+        // Phase 7.96/7.98：在 GPU copy 之前拦截路径阻断器，避免无意义的 VB 拷贝。
         // 路径阻断器（path blocker）是 War3 引擎用来阻挡单位通行的不可见对象，
-        // 不应该投射阴影。如果 semantic.rawcode 已经填充则直接判定；否则尝试
-        // 通过 jHandle 反查 RenderObjectRegistry 拿到 rawcode 兜底（path blocker
-        // 在某些 dispatch 路径下 rawcode 可能未及时填充到 TLS）。
+        // 不应该投射阴影。
+        // 三级查找路径：
+        //   1) semantic.rawcode 直接命中（ExecBatch tls 已填）
+        //   2) jHandle 反查 RenderObjectRegistry（命中通过 group 0/1/2 注册的对象）
+        //   3) widget identity cache 兜底（CWidget_RegisterFootprintAndShadowMask
+        //      hook 维护，覆盖 destructible/path blocker 等不进 RenderGroup 的对象）
         uint32_t pathBlockerRawcode = semantic.rawcode;
         if (pathBlockerRawcode == 0u && semantic.jHandle != 0u) {
           if (auto* info = dxvk::war3::render::RenderObjectRegistry::instance()
                                .findByHandle(semantic.jHandle)) {
             pathBlockerRawcode = info->rawcode;
           }
+        }
+        // Phase 7.98：destructible/path blocker 在 War3 主流程里不会经过
+        // Hook_WorldObjects_RenderGroup（它们只通过 CWidget lifecycle 注册
+        // footprint），因此 RenderObjectRegistry 拿不到。这里通过 widget
+        // identity cache 做最后兜底。
+        if (pathBlockerRawcode == 0u && semantic.jHandle != 0u) {
+          pathBlockerRawcode =
+              dxvk::war3::hooks::QueryWidgetRawcodeByHandle(semantic.jHandle);
         }
         if (dxvk::war3::internal::kPathBlockerHideEnabled &&
             pathBlockerRawcode != 0u &&
