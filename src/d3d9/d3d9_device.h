@@ -1971,7 +1971,7 @@ private:
   uint64_t m_war3SemanticDrawTimePoseFrameSerial = 0;
   uint64_t m_war3SemanticDrawTimePoseDirtyFrameSerial = 0;
   uint64_t m_war3SemanticLastMatrixPublisherPoseRevision = 0;
-  std::unordered_set<uint64_t> m_war3SemanticDrawTimePoseKeys;
+  std::vector<uint64_t> m_war3SemanticDrawTimePoseKeys;
   // Phase 7.55 v4：draw-time VB position cache（GPU copy 自有 buffer 版本）。
   // ring buffer 问题：保存 Rc<DxvkBuffer> 引用不够——War3 后续 draw 会覆盖
   // 同一 buffer 的不同 offset，cache 里的引用 read 时拿到的是错乱数据。

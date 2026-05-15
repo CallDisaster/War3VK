@@ -496,25 +496,29 @@ void RepairManifestIdentityFromPrior(const ShadowFrameManifest& priorManifest,
 
   // Phase 7.96：当 priorManifest 较大时，O(N*M) 线性扫描会在桥/斜坡场景下
   // 严重拖慢 ManifestHydrate。建立指针索引把查找从 O(N*M) 降到 O(N+M)。
-  // 只索引最常用的 worldObjectEntry / sceneNode / runtimeModelPtr / jHandle，
-  // 其他 fallback 用第二轮线性扫描兜底（罕见路径）。
+  // 阈值 64：N <= 64 时线性扫描的 cache friendly 优势 > hash 索引开销；
+  // N > 64 时 hash 索引构建+查找的总成本明显低于 N*M。
+  constexpr size_t kHashIndexThreshold = 64u;
+  const bool useHashIndex = priorManifest.records.size() > kHashIndexThreshold;
   std::unordered_map<void*, const ShadowRenderableRecord*> byWorldObject;
   std::unordered_map<void*, const ShadowRenderableRecord*> bySceneNode;
   std::unordered_map<void*, const ShadowRenderableRecord*> byRuntimeModel;
   std::unordered_map<uint32_t, const ShadowRenderableRecord*> byHandle;
-  byWorldObject.reserve(priorManifest.records.size());
-  bySceneNode.reserve(priorManifest.records.size());
-  byRuntimeModel.reserve(priorManifest.records.size());
-  byHandle.reserve(priorManifest.records.size());
-  for (const auto& candidate : priorManifest.records) {
-    if (candidate.worldObjectEntry != nullptr)
-      byWorldObject.emplace(candidate.worldObjectEntry, &candidate);
-    if (candidate.sceneNode != nullptr)
-      bySceneNode.emplace(candidate.sceneNode, &candidate);
-    if (candidate.runtimeModelPtr != nullptr)
-      byRuntimeModel.emplace(candidate.runtimeModelPtr, &candidate);
-    if (candidate.jHandle != 0u)
-      byHandle.emplace(candidate.jHandle, &candidate);
+  if (useHashIndex) {
+    byWorldObject.reserve(priorManifest.records.size());
+    bySceneNode.reserve(priorManifest.records.size());
+    byRuntimeModel.reserve(priorManifest.records.size());
+    byHandle.reserve(priorManifest.records.size());
+    for (const auto& candidate : priorManifest.records) {
+      if (candidate.worldObjectEntry != nullptr)
+        byWorldObject.emplace(candidate.worldObjectEntry, &candidate);
+      if (candidate.sceneNode != nullptr)
+        bySceneNode.emplace(candidate.sceneNode, &candidate);
+      if (candidate.runtimeModelPtr != nullptr)
+        byRuntimeModel.emplace(candidate.runtimeModelPtr, &candidate);
+      if (candidate.jHandle != 0u)
+        byHandle.emplace(candidate.jHandle, &candidate);
+    }
   }
 
   for (auto& record : manifest.records) {
@@ -527,29 +531,34 @@ void RepairManifestIdentityFromPrior(const ShadowFrameManifest& priorManifest,
       continue;
     }
 
-    // Phase 7.96：先用 hash index O(1) 查找最常用的 4 个 key。
     const ShadowRenderableRecord* priorRecord = nullptr;
-    if (record.worldObjectEntry != nullptr) {
-      auto it = byWorldObject.find(record.worldObjectEntry);
-      if (it != byWorldObject.end()) priorRecord = it->second;
-    }
-    if (priorRecord == nullptr && record.sceneNode != nullptr) {
-      auto it = bySceneNode.find(record.sceneNode);
-      if (it != bySceneNode.end()) priorRecord = it->second;
-    }
-    if (priorRecord == nullptr && record.runtimeModelPtr != nullptr) {
-      auto it = byRuntimeModel.find(record.runtimeModelPtr);
-      if (it != byRuntimeModel.end()) priorRecord = it->second;
-    }
-    if (priorRecord == nullptr && record.jHandle != 0u) {
-      auto it = byHandle.find(record.jHandle);
-      if (it != byHandle.end()) priorRecord = it->second;
-    }
+    if (useHashIndex) {
+      // Phase 7.96：hash index O(1) 查找最常用的 4 个 key。
+      if (record.worldObjectEntry != nullptr) {
+        auto it = byWorldObject.find(record.worldObjectEntry);
+        if (it != byWorldObject.end()) priorRecord = it->second;
+      }
+      if (priorRecord == nullptr && record.sceneNode != nullptr) {
+        auto it = bySceneNode.find(record.sceneNode);
+        if (it != bySceneNode.end()) priorRecord = it->second;
+      }
+      if (priorRecord == nullptr && record.runtimeModelPtr != nullptr) {
+        auto it = byRuntimeModel.find(record.runtimeModelPtr);
+        if (it != byRuntimeModel.end()) priorRecord = it->second;
+      }
+      if (priorRecord == nullptr && record.jHandle != 0u) {
+        auto it = byHandle.find(record.jHandle);
+        if (it != byHandle.end()) priorRecord = it->second;
+      }
 
-    // 罕见 key（unitPtr / renderablePart / payload）走线性扫描兜底。
-    if (priorRecord == nullptr &&
-        (record.unitPtr != nullptr || record.renderablePart != nullptr ||
-         record.payload != nullptr)) {
+      // 罕见 key（unitPtr / renderablePart / payload）走线性扫描兜底。
+      if (priorRecord == nullptr &&
+          (record.unitPtr != nullptr || record.renderablePart != nullptr ||
+           record.payload != nullptr)) {
+        priorRecord = FindPriorRenderableRecord(priorManifest, record);
+      }
+    } else {
+      // 小规模直接线性扫描（cache friendly）。
       priorRecord = FindPriorRenderableRecord(priorManifest, record);
     }
 
@@ -3435,12 +3444,19 @@ void ShadowRuntimeContractCache::captureLiveState() {
   {
     auto manifestCopyScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/ManifestCopy");
-    // Phase 7.96：从 vector 改成 unordered_set，避免 O(N²) 线性搜索。
-    // 高压场景下 visibleRecords 几百条时，O(N²) 会导致 ManifestCopy 耗时
-    // 飙到 3ms+/帧。unordered_set 的 O(1) 查找把它压回 0.1ms 量级。
-    std::unordered_set<uint64_t> seenDirectUnitRecords;
-    if constexpr (dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly)
-      seenDirectUnitRecords.reserve(visibleRecords.size());
+    // Phase 7.96：record 多时用 unordered_set 避免 O(N²)，少时用 vector
+    // 利用 cache friendly 优势。阈值 64 经验值，同 RepairManifestIdentity。
+    constexpr size_t kHashSetThreshold = 64u;
+    const bool useHashSet = visibleRecords.size() > kHashSetThreshold;
+    std::unordered_set<uint64_t> seenSetLarge;
+    std::vector<uint64_t> seenVecSmall;
+    if constexpr (dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly) {
+      if (useHashSet) {
+        seenSetLarge.reserve(visibleRecords.size());
+      } else {
+        seenVecSmall.reserve(visibleRecords.size());
+      }
+    }
     for (const auto& record : visibleRecords) {
       if constexpr (dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly) {
         const uint32_t rejectReason =
@@ -3474,9 +3490,14 @@ void ShadowRuntimeContractCache::captureLiveState() {
         }
         ++stats.visibleDirectUnitCandidateAccepted;
         const uint64_t directUnitKey = MakeVisibleDirectUnitKey(record);
-        // Phase 7.96：O(1) 查找替代原来的 O(N) std::find。
-        if (!seenDirectUnitRecords.insert(directUnitKey).second) {
-          continue;
+        if (useHashSet) {
+          if (!seenSetLarge.insert(directUnitKey).second) continue;
+        } else {
+          if (std::find(seenVecSmall.begin(), seenVecSmall.end(),
+                        directUnitKey) != seenVecSmall.end()) {
+            continue;
+          }
+          seenVecSmall.push_back(directUnitKey);
         }
       }
       manifest.records.push_back(ConvertVisible(record, manifest.frameSerial));
