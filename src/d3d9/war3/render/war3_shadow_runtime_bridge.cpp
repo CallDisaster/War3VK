@@ -4186,6 +4186,36 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         widgetStats.installFailedEnvDisabled;
     summary.widgetIdentityInstallFailedMinHook =
         widgetStats.installFailedMinHook;
+    // Phase 7.99：path blocker 拦截分桶（让 trace + control plane 直接看到
+    // 拦了多少 + 在哪条出口）。
+    {
+      std::shared_lock<std::shared_mutex> sceneLock(g_shadowSceneStatsMutex);
+      summary.semanticSceneRejectedPathBlockerCount =
+          g_shadowSceneStats.semanticSceneRejectedPathBlockerCount;
+      summary.semanticSceneRejectedPathBlockerEarlyBypassCount =
+          g_shadowSceneStats.semanticSceneRejectedPathBlockerEarlyBypassCount;
+      summary.semanticSceneRejectedPathBlockerEligibilityGateCount =
+          g_shadowSceneStats.semanticSceneRejectedPathBlockerEligibilityGateCount;
+      summary.semanticSceneRejectedPathBlockerAppendEntryCount =
+          g_shadowSceneStats.semanticSceneRejectedPathBlockerAppendEntryCount;
+      summary.semanticSceneRejectedPathBlockerAppendEntryByJHandleCount =
+          g_shadowSceneStats
+              .semanticSceneRejectedPathBlockerAppendEntryByJHandleCount;
+      summary.semanticSceneRejectedPathBlockerAppendVbBlendCount =
+          g_shadowSceneStats.semanticSceneRejectedPathBlockerAppendVbBlendCount;
+      summary.semanticSceneRejectedPathBlockerFastAppendCount =
+          g_shadowSceneStats.semanticSceneRejectedPathBlockerFastAppendCount;
+      summary.semanticSceneRejectedPathBlockerDirectGroupedCount =
+          g_shadowSceneStats.semanticSceneRejectedPathBlockerDirectGroupedCount;
+      summary.semanticSceneRejectedPathBlockerProducerCount =
+          g_shadowSceneStats.semanticSceneRejectedPathBlockerProducerCount;
+      summary.semanticSceneRejectedPathBlockerStaticSupplementCount =
+          g_shadowSceneStats
+              .semanticSceneRejectedPathBlockerStaticSupplementCount;
+      summary.semanticSceneRejectedPathBlockerLegacyCaptureCount =
+          g_shadowSceneStats
+              .semanticSceneRejectedPathBlockerLegacyCaptureCount;
+    }
   }
   // Phase 7.97 诊断：直接拉 atomic getter，反映最近一次 ManifestCopy 真实
   // 遍历情况（不受 sameFrameDataNotGrowing publish 早退掩盖）。

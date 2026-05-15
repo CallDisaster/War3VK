@@ -410,6 +410,19 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t widgetIdentityInstallFailedAddrNull = 0;
   uint64_t widgetIdentityInstallFailedEnvDisabled = 0;
   uint64_t widgetIdentityInstallFailedMinHook = 0;
+  // Phase 7.99：path blocker 拦截分桶（让 trace 直接看到 path blocker
+  // 在哪条出口被挡住）。
+  uint64_t semanticSceneRejectedPathBlockerCount = 0;
+  uint64_t semanticSceneRejectedPathBlockerEarlyBypassCount = 0;
+  uint64_t semanticSceneRejectedPathBlockerEligibilityGateCount = 0;
+  uint64_t semanticSceneRejectedPathBlockerAppendEntryCount = 0;
+  uint64_t semanticSceneRejectedPathBlockerAppendEntryByJHandleCount = 0;
+  uint64_t semanticSceneRejectedPathBlockerAppendVbBlendCount = 0;
+  uint64_t semanticSceneRejectedPathBlockerFastAppendCount = 0;
+  uint64_t semanticSceneRejectedPathBlockerDirectGroupedCount = 0;
+  uint64_t semanticSceneRejectedPathBlockerProducerCount = 0;
+  uint64_t semanticSceneRejectedPathBlockerStaticSupplementCount = 0;
+  uint64_t semanticSceneRejectedPathBlockerLegacyCaptureCount = 0;
   // Phase 7.97 诊断：ManifestCopy 路径实际处理了多少 visible record
   // 与最终 push 进 manifest 的数量。bridge 透传到 control plane，配合
   // perf 报告里的 ManifestCopy avgCpuMs，能量化"per-record 成本 = 总 ms / scan 数"。
