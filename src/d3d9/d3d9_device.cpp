@@ -1,3 +1,4 @@
+// Phase 7.99 marker bump 034957
 #include "d3d9_device.h"
 #include "d3d9_war3_debug.h"
 #include "d3d9_war3_hook.h"
@@ -23350,6 +23351,48 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           War3BuildShadowSemanticContext(earlyCurrentObj);
       if (dxvk::war3::internal::kPathBlockerHideEnabled &&
           War3ShadowIsLosBlocker(semantic, earlyCurrentObj)) {
+        // Phase 7.99：日志记录 path blocker 拦截信息（前 30 次每个 fourcc 各 1 行）。
+        // 让用户能直接看到拦了什么、jHandle 是什么。
+        static std::atomic<uint32_t> s_pathBlockerLogCount{0};
+        static std::atomic<uint32_t> s_pathBlockerLogged[16] = {};
+        const uint32_t totalLogged =
+            s_pathBlockerLogCount.load(std::memory_order_relaxed);
+        if (totalLogged < 30u) {
+          uint32_t fourcc = semantic.rawcode;
+          if (fourcc == 0u && earlyCurrentObj != nullptr)
+            fourcc = earlyCurrentObj->rawcode;
+          // 检查这个 fourcc 是不是首次记录
+          bool firstSeen = true;
+          uint32_t freeSlot = 16u;
+          for (uint32_t i = 0u; i < 16u; ++i) {
+            const uint32_t cur =
+                s_pathBlockerLogged[i].load(std::memory_order_relaxed);
+            if (cur == fourcc) {
+              firstSeen = false;
+              break;
+            }
+            if (cur == 0u && freeSlot == 16u)
+              freeSlot = i;
+          }
+          if (firstSeen && freeSlot < 16u) {
+            uint32_t expected = 0u;
+            if (s_pathBlockerLogged[freeSlot].compare_exchange_strong(
+                    expected, fourcc, std::memory_order_relaxed)) {
+              const uint32_t logIdx =
+                  s_pathBlockerLogCount.fetch_add(1, std::memory_order_relaxed);
+              char buf[160];
+              char fc[5] = {char((fourcc >> 24) & 0xFF),
+                            char((fourcc >> 16) & 0xFF),
+                            char((fourcc >> 8) & 0xFF),
+                            char(fourcc & 0xFF), 0};
+              snprintf(buf, sizeof(buf),
+                       "DXVK War3Hook[Shadow]: PATH BLOCKER REJECT #%u rawcode=0x%08X (%s) jHandle=0x%X via=EarlyBypass",
+                       logIdx + 1, fourcc, fc,
+                       unsigned(semantic.jHandle));
+              ::dxvk::Logger::info(buf);
+            }
+          }
+        }
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerEarlyBypassCount++;
