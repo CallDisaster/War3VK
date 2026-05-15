@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -316,8 +317,11 @@ struct StaticMeshDataResourceCacheEntry {
   ShadowModelResourceRecord resource;
 };
 
-std::mutex& StaticMeshDataResourceCacheMutex() {
-  static std::mutex mutex;
+// Phase 7.82：Static mesh resource cache 改 shared_mutex。
+// 主路径在 PrepareStaticGeometryFromMeshData 里 read-only 查询；只有 cache miss
+// 才需要写。
+std::shared_mutex& StaticMeshDataResourceCacheMutex() {
+  static std::shared_mutex mutex;
   return mutex;
 }
 
@@ -487,7 +491,8 @@ const ShadowModelResourceRecord* TryFindStaticMeshDataResource(
 
   const size_t resourceRecordCount = resources.records().size();
   {
-    std::lock_guard<std::mutex> lock(StaticMeshDataResourceCacheMutex());
+    std::shared_lock<std::shared_mutex> lock(
+        StaticMeshDataResourceCacheMutex());
     auto& cache = StaticMeshDataResourceCache();
     const auto it = cache.find(record.meshData);
     if (it != cache.end() &&
@@ -586,7 +591,8 @@ const ShadowModelResourceRecord* TryFindStaticMeshDataResource(
     entry.primaryStride = primaryStride;
     entry.meshIndex = meshIndex;
     entry.hasResult = false;
-    std::lock_guard<std::mutex> lock(StaticMeshDataResourceCacheMutex());
+    std::unique_lock<std::shared_mutex> lock(
+        StaticMeshDataResourceCacheMutex());
     StaticMeshDataResourceCache()[record.meshData] = std::move(entry);
     return nullptr;
   }
@@ -601,7 +607,8 @@ const ShadowModelResourceRecord* TryFindStaticMeshDataResource(
   entry.hasResult = true;
   entry.resource = outResource;
   {
-    std::lock_guard<std::mutex> lock(StaticMeshDataResourceCacheMutex());
+    std::unique_lock<std::shared_mutex> lock(
+        StaticMeshDataResourceCacheMutex());
     StaticMeshDataResourceCache()[record.meshData] = std::move(entry);
   }
   return &outResource;
