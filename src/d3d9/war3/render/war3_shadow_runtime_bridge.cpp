@@ -10,6 +10,7 @@
 #include "../core/war3_runtime_profile.h"
 #include "../core/war3_semantic_shadow_gate.h"
 #include "../hooks/war3_hook_render_identity.h"
+#include "../hooks/war3_hook_widget_identity.h"
 #include "../shadow/war3_shadow_native_runtime.h"
 #include "../shadow/war3_shadow_runtime_contract.h"
 #include "../shadow/war3_shadow_alpha_test_payload.h"
@@ -4164,6 +4165,28 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
       publishedBundle.stats.contractCaptureSkippedEmpty;
   summary.semanticContractCaptureSkippedDuplicateSameFrame =
       publishedBundle.stats.contractCaptureSkippedDuplicateSameFrame;
+  // Phase 7.98 mini probe：widget identity hook 状态。
+  {
+    const auto widgetStats =
+        ::dxvk::war3::hooks::GetWidgetIdentityHookStats();
+    summary.widgetIdentityEnterCount = widgetStats.enterCount;
+    summary.widgetIdentityMagicMatchedCount = widgetStats.magicMatchedCount;
+    summary.widgetIdentityMagicMismatchCount = widgetStats.magicMismatchCount;
+    summary.widgetIdentityCacheInsertCount = widgetStats.cacheInsertCount;
+    summary.widgetIdentityCacheUpdateCount = widgetStats.cacheUpdateCount;
+    summary.widgetIdentityHandleResolvedCount = widgetStats.handleResolvedCount;
+    summary.widgetIdentityHandleMissingCount = widgetStats.handleMissingCount;
+    summary.widgetIdentityCacheSize =
+        ::dxvk::war3::hooks::GetWidgetIdentityCacheSize();
+    summary.widgetIdentityInstallAttempted = widgetStats.installAttempted;
+    summary.widgetIdentityInstallSucceeded = widgetStats.installSucceeded;
+    summary.widgetIdentityInstallFailedAddrNull =
+        widgetStats.installFailedAddrNull;
+    summary.widgetIdentityInstallFailedEnvDisabled =
+        widgetStats.installFailedEnvDisabled;
+    summary.widgetIdentityInstallFailedMinHook =
+        widgetStats.installFailedMinHook;
+  }
   // Phase 7.97 诊断：直接拉 atomic getter，反映最近一次 ManifestCopy 真实
   // 遍历情况（不受 sameFrameDataNotGrowing publish 早退掩盖）。
   {

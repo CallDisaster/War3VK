@@ -65,6 +65,12 @@ struct WidgetIdentityHookStats {
   uint64_t cacheUpdateCount = 0;
   uint64_t handleResolvedCount = 0;
   uint64_t handleMissingCount = 0;
+  // Phase 7.99：install 状态诊断字段（让外部直接知道 hook 装没装上）。
+  uint64_t installAttempted = 0;
+  uint64_t installSucceeded = 0;
+  uint64_t installFailedAddrNull = 0;
+  uint64_t installFailedEnvDisabled = 0;
+  uint64_t installFailedMinHook = 0;
 };
 
 WidgetIdentityHookStats GetWidgetIdentityHookStats();

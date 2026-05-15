@@ -397,6 +397,46 @@ void ActivateWar3Runtime(uintptr_t gameBase, const char *source) {
 void TryInstallShadowHooksEarly(uintptr_t gameBase, const char *source) {
   (void)gameBase;
   TryInstallStormBreakerEarly(source);
+
+  // Phase 7.99：CWidget identity hook 必须早装。地图加载阶段就会大量
+  // 触发 widget create/setHidden/setKilled 等 lifecycle 事件，如果等
+  // ActivateWar3Runtime 之后才装会错过整批 path blocker / destructible 创建。
+  if constexpr (dxvk::war3::internal::kWar3ShadowHookEnabled) {
+    static std::atomic<bool> s_earlyAttempted{false};
+    bool expected = false;
+    if (s_earlyAttempted.compare_exchange_strong(expected, true,
+                                                  std::memory_order_acq_rel)) {
+      const auto& book =
+          dxvk::war3::hooks::GetWar3HookAddressBook127a();
+      const uintptr_t rva =
+          book.widgetRegisterFootprintAndShadowMask;
+      if (rva != 0u && gameBase != 0u) {
+        if (!EnsureMinHookInitialized()) {
+          Logger::info(str::format(
+              "DXVK War3Hook: WidgetIdentity early MinHook init failed "
+              "source=", source));
+          s_earlyAttempted.store(false, std::memory_order_release);
+          return;
+        }
+        const uintptr_t addr = gameBase + rva;
+        if (!IsExecutableRange(reinterpret_cast<const void*>(addr), 16) ||
+            !IsReadableRange(reinterpret_cast<const void*>(addr), 16)) {
+          Logger::info(str::format(
+              "DXVK War3Hook: WidgetIdentity early skip - bad addr=0x",
+              std::hex, addr, std::dec, " source=", source));
+          s_earlyAttempted.store(false, std::memory_order_release);
+          return;
+        }
+        const bool ok = dxvk::war3::hooks::InstallWidgetIdentityHook(
+            reinterpret_cast<LPVOID>(addr));
+        Logger::info(str::format(
+            "DXVK War3Hook: WidgetIdentity early install addr=0x",
+            std::hex, addr, std::dec,
+            " result=", (ok ? "ok" : "fail"),
+            " source=", source));
+      }
+    }
+  }
 }
 
 void War3Hook::InstallGameHooks(uintptr_t gameBase) {
@@ -590,7 +630,32 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
     LPVOID widgetRegisterAddr = resolveCode(
         book.widgetRegisterFootprintAndShadowMask,
         "CWidget_RegisterFootprintAndShadowMask");
-    dxvk::war3::hooks::InstallWidgetIdentityHook(widgetRegisterAddr);
+    Logger::info(str::format(
+        "DXVK War3Hook: WidgetIdentity gameBase=0x",
+        std::hex, gameInfo.base, std::dec,
+        " RVA=0x", std::hex, book.widgetRegisterFootprintAndShadowMask,
+        std::dec));
+    // Phase 7.99 诊断：install 前后读目标地址前 8 字节，确认 MinHook 真的写了 jmp。
+    auto formatBytes = [](LPVOID addr) {
+      if (!addr) return std::string("(null)");
+      const uint8_t* p = static_cast<const uint8_t*>(addr);
+      char buf[64];
+      snprintf(buf, sizeof(buf),
+               "%02X %02X %02X %02X %02X %02X %02X %02X",
+               p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+      return std::string(buf);
+    };
+    Logger::info(str::format(
+        "DXVK War3Hook: WidgetIdentity pre-install bytes@",
+        std::hex, reinterpret_cast<uintptr_t>(widgetRegisterAddr),
+        std::dec, " = ", formatBytes(widgetRegisterAddr)));
+    const bool widgetOk =
+        dxvk::war3::hooks::InstallWidgetIdentityHook(widgetRegisterAddr);
+    Logger::info(str::format(
+        "DXVK War3Hook: WidgetIdentity install addr=0x",
+        std::hex, reinterpret_cast<uintptr_t>(widgetRegisterAddr),
+        std::dec, " result=", (widgetOk ? "ok" : "fail"),
+        " post-install bytes=", formatBytes(widgetRegisterAddr)));
   } else {
     war3dbg::Print("DXVK War3Hook: 二分诊断态关闭 Shadow hook 安装\n");
   }

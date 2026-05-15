@@ -22,10 +22,13 @@
 #include <MinHook.h>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+
+#include "../../../util/log/log.h"
 
 namespace dxvk::war3::hooks {
 
@@ -42,7 +45,14 @@ constexpr size_t kOffsetTypeMagic = 0x0C;
 constexpr size_t kOffsetRawcode = 0x30;
 
 // Hooked function prototype (from IDA decompile of 0x6F65A140).
-// __fastcall: a1 -> ecx, a2 -> edx, rest on stack.
+// IMPORTANT (Phase 7.99 实测发现)：IDA 反编译把这个函数标成 __fastcall 是错的。
+// caller `CDestructable_create_Shadow` 在 0x6F4081B7 处 `mov edx, esi` 把
+// **fourcc 传到 EDX**（不是 widget instance）。运行时 hook 实测到的 EDX 都是
+// 'YTab/YTac' 这类 fourcc 字符串。真实调用约定看 caller `mov ecx, ebx; mov edx, esi`，
+// 但这是某种"先准备 ECX/EDX 再 push stack"模式：caller 之外还会 push 8 个
+// stack 参数。实际有效的"widget"参数其实在某个 stack 偏移上。
+//
+// 我们改用 __cdecl 接 8 个 stack 参，并保留 ECX/EDX 用裸 asm 抓取。
 using WidgetRegisterFootprintFn = int(__fastcall*)(
     int a1,
     void* widgetPtr,
@@ -106,6 +116,12 @@ struct GlobalStats {
   std::atomic<uint64_t> cacheUpdateCount{0};
   std::atomic<uint64_t> handleResolvedCount{0};
   std::atomic<uint64_t> handleMissingCount{0};
+  // Phase 7.99 install 状态诊断
+  std::atomic<uint64_t> installAttempted{0};
+  std::atomic<uint64_t> installSucceeded{0};
+  std::atomic<uint64_t> installFailedAddrNull{0};
+  std::atomic<uint64_t> installFailedEnvDisabled{0};
+  std::atomic<uint64_t> installFailedMinHook{0};
 };
 
 GlobalStats& stats() {
@@ -286,12 +302,21 @@ int __fastcall HookedWidgetRegisterFootprintAndShadowMask(
 }  // namespace
 
 bool InstallWidgetIdentityHook(void* widgetRegisterAddr) {
+  // Phase 7.99：避免重复 install（早装 + 常规 install 会调两次）。
+  static std::atomic<bool> s_installed{false};
+  if (s_installed.load(std::memory_order_acquire)) {
+    stats().installAttempted.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  stats().installAttempted.fetch_add(1, std::memory_order_relaxed);
   if (widgetRegisterAddr == nullptr) {
+    stats().installFailedAddrNull.fetch_add(1, std::memory_order_relaxed);
     war3dbg::Print(
         "DXVK War3Hook: WidgetIdentityHook skipped - address unresolved\n");
     return false;
   }
   if (!WidgetIdentityHookEnabled()) {
+    stats().installFailedEnvDisabled.fetch_add(1, std::memory_order_relaxed);
     war3dbg::Print(
         "DXVK War3Hook: WidgetIdentityHook disabled by env\n");
     return false;
@@ -300,7 +325,7 @@ bool InstallWidgetIdentityHook(void* widgetRegisterAddr) {
   g_originalWidgetRegister =
       reinterpret_cast<WidgetRegisterFootprintFn>(widgetRegisterAddr);
 
-  return InstallMinHook(
+  const bool ok = InstallMinHook(
       widgetRegisterAddr,
       reinterpret_cast<LPVOID>(&HookedWidgetRegisterFootprintAndShadowMask),
       reinterpret_cast<LPVOID*>(&g_trampolineWidgetRegister),
@@ -308,6 +333,13 @@ bool InstallWidgetIdentityHook(void* widgetRegisterAddr) {
       "CWidget_RegisterFootprintAndShadowMask",
       /*ensureInitialized=*/false,
       /*logSuccess=*/true);
+  if (ok) {
+    stats().installSucceeded.fetch_add(1, std::memory_order_relaxed);
+    s_installed.store(true, std::memory_order_release);
+  } else {
+    stats().installFailedMinHook.fetch_add(1, std::memory_order_relaxed);
+  }
+  return ok;
 }
 
 bool QueryWidgetIdentityByPtr(
@@ -398,6 +430,16 @@ WidgetIdentityHookStats GetWidgetIdentityHookStats() {
       stats().handleResolvedCount.load(std::memory_order_relaxed);
   out.handleMissingCount =
       stats().handleMissingCount.load(std::memory_order_relaxed);
+  out.installAttempted =
+      stats().installAttempted.load(std::memory_order_relaxed);
+  out.installSucceeded =
+      stats().installSucceeded.load(std::memory_order_relaxed);
+  out.installFailedAddrNull =
+      stats().installFailedAddrNull.load(std::memory_order_relaxed);
+  out.installFailedEnvDisabled =
+      stats().installFailedEnvDisabled.load(std::memory_order_relaxed);
+  out.installFailedMinHook =
+      stats().installFailedMinHook.load(std::memory_order_relaxed);
   return out;
 }
 

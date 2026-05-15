@@ -396,6 +396,20 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticContractCaptureSkippedStableSameFrame = 0;
   uint64_t semanticContractCaptureSkippedEmpty = 0;
   uint64_t semanticContractCaptureSkippedDuplicateSameFrame = 0;
+  // Phase 7.98 诊断：widget identity hook 实时计数（mini probe，无人值守用）。
+  uint64_t widgetIdentityEnterCount = 0;
+  uint64_t widgetIdentityMagicMatchedCount = 0;
+  uint64_t widgetIdentityMagicMismatchCount = 0;
+  uint64_t widgetIdentityCacheInsertCount = 0;
+  uint64_t widgetIdentityCacheUpdateCount = 0;
+  uint64_t widgetIdentityHandleResolvedCount = 0;
+  uint64_t widgetIdentityHandleMissingCount = 0;
+  uint64_t widgetIdentityCacheSize = 0;
+  uint64_t widgetIdentityInstallAttempted = 0;
+  uint64_t widgetIdentityInstallSucceeded = 0;
+  uint64_t widgetIdentityInstallFailedAddrNull = 0;
+  uint64_t widgetIdentityInstallFailedEnvDisabled = 0;
+  uint64_t widgetIdentityInstallFailedMinHook = 0;
   // Phase 7.97 诊断：ManifestCopy 路径实际处理了多少 visible record
   // 与最终 push 进 manifest 的数量。bridge 透传到 control plane，配合
   // perf 报告里的 ManifestCopy avgCpuMs，能量化"per-record 成本 = 总 ms / scan 数"。

@@ -181,6 +181,29 @@ void ResolveCurrentRuntimeGeosetFromData(ShadowRenderableRecord& record) {
   if (record.runtimeModelPtr == nullptr)
     return;
 
+  // Phase 7.99：thread_local cache `(runtimeModel, runtimeGeosetDataPtr) -> (geosetPtr, index)`。
+  // 桥/斜坡场景下 ManifestCopy 单 record 慢的根因是这里最差走 4096 次
+  // SafeReadPtrFast 循环。同 caller 在多帧调用时键完全相同。
+  struct ResolveCacheEntry {
+    void* runtimeModel = nullptr;
+    void* runtimeGeosetData = nullptr;
+    void* geosetPtr = nullptr;
+    uint32_t index = 0;
+    bool valid = false;
+  };
+  thread_local std::array<ResolveCacheEntry, 256u> s_cache = {};
+  const uintptr_t hk = (reinterpret_cast<uintptr_t>(record.runtimeModelPtr) ^
+                        reinterpret_cast<uintptr_t>(record.runtimeGeosetDataPtr));
+  const size_t slot = (hk >> 4) & (s_cache.size() - 1u);
+  ResolveCacheEntry& entry = s_cache[slot];
+  if (entry.valid && entry.runtimeModel == record.runtimeModelPtr &&
+      entry.runtimeGeosetData == record.runtimeGeosetDataPtr) {
+    record.runtimeGeosetPtr = entry.geosetPtr;
+    record.meshIndex = entry.index;
+    record.geosetIndex = entry.index;
+    return;
+  }
+
   uint32_t runtimeGeosetCount = 0;
   void* runtimeGeosets = nullptr;
   if (!dxvk::war3::SafeReadU32Fast(
@@ -213,6 +236,12 @@ void ResolveCurrentRuntimeGeosetFromData(ShadowRenderableRecord& record) {
     record.runtimeGeosetPtr = geosetPtr;
     record.meshIndex = i;
     record.geosetIndex = i;
+    // 写 cache
+    entry.runtimeModel = record.runtimeModelPtr;
+    entry.runtimeGeosetData = record.runtimeGeosetDataPtr;
+    entry.geosetPtr = geosetPtr;
+    entry.index = i;
+    entry.valid = true;
     return;
   }
 }
@@ -3408,6 +3437,31 @@ void ShadowRuntimeContractCache::captureLiveState() {
   const size_t currentPoseRecordCount = poseRegistry.recordCount();
   const size_t currentAttachmentRecordCount =
       kCaptureAttachmentRigidContracts ? attachmentRegistry.recordCount() : 0u;
+  // Phase 7.99：在 lock 之前先做一次 cheap 的 "samePublishedFrame + 内容
+  // 等同于上一次 publish" 检查，避免桥/斜坡场景下每帧都要做 1.9ms 的 ManifestCopy。
+  // 这是 sameFrameDataNotGrowing 的 frame-aware 增强：在 visibleCount/mainQueue/
+  // transparent 全部相等时直接跳过，因为 ManifestCopy 的 records 完全由 visibleRecords 决定。
+  // 注意：不要求 priorContractUsable，因为高压地图的 readyGeosetCount 可能长期为 0
+  // （地图还没初始化全 geoset），但 ManifestCopy 已经在反复重做。
+  {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    if (m_manifest != nullptr &&
+        m_manifest->visibleCount == manifest.visibleCount &&
+        m_manifest->mainQueueCount == manifest.mainQueueCount &&
+        m_manifest->transparentCount == manifest.transparentCount) {
+      const size_t previousPoseCount =
+          m_poses != nullptr ? m_poses->records().size() : 0u;
+      const size_t previousAttachmentCount =
+          m_attachments != nullptr ? m_attachments->records().size() : 0u;
+      // 如果 pose 与 attachment 也未增长，本帧没有新内容，整段 capture 跳过。
+      if (currentPoseRecordCount <= previousPoseCount &&
+          currentAttachmentRecordCount <= previousAttachmentCount &&
+          !m_manifest->records.empty()) {
+        m_manifestCopySkipStableCount.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+  }
   {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     const bool samePublishedFrame =
