@@ -877,9 +877,17 @@ int __fastcall Hook_RenderQueueUpdateItemWorldMatrix(int sceneNodePtr,
   if (!g_trampolineRenderQueueUpdateItemWorldMatrix)
     return 0;
 
-  // Phase 7.89：退出地图后 producer 降级为纯透传。跳过 entry 构建 + publish +
-  // visible registry 查询 + palette slot 读取，避免主界面无消费者时仍全速运行。
+  // Phase 7.89：退出地图后 producer 降级为纯透传。
   if (!dxvk::g_war3_runtime_activated.load(std::memory_order_relaxed)) {
+    return g_trampolineRenderQueueUpdateItemWorldMatrix(
+        sceneNodePtr, renderablePartPtr, meshPayloadPtr);
+  }
+
+  // Phase 7.94：诊断用 — 完全禁用 publish contract hook 的数据层工作。
+  // 用于隔离"是 publish hook 导致卡顿还是其他 hook"。
+  static const bool s_disablePublish =
+      ReadEnvU32("DXVK_WAR3_DISABLE_PUBLISH_CONTRACT", 0u) != 0u;
+  if (s_disablePublish) {
     return g_trampolineRenderQueueUpdateItemWorldMatrix(
         sceneNodePtr, renderablePartPtr, meshPayloadPtr);
   }
