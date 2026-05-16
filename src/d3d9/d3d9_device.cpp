@@ -9717,7 +9717,17 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     //      直接命中）；
     //   2) miss 才走 SafeReadU32Fast 直读 widget+0x0C / +0x30；
     //   3) 直读成功后 write-through 写回 widget cache，下次 O(1) 命中。
-    if (!blocked && packet.renderable.unitPtr != nullptr) {
+    //
+    // Phase 7.104：实测 27 次 path blocker 拦截全部走 EarlyBypass 出口，
+    // AppendEntry 这一层在当前游戏里从未命中。改为 env gate，默认关闭，
+    // 避免对每个 destructible packet 都做 widget cache 查询和 SafeRead。
+    static const bool s_appendEntryFallbackEnabled = []() {
+      const char* env = std::getenv("DXVK_WAR3_APPEND_ENTRY_PATHBLOCKER");
+      // 默认关闭：EarlyBypass 已经覆盖。env=1 强制启用 belt-and-suspenders。
+      return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    if (s_appendEntryFallbackEnabled && !blocked &&
+        packet.renderable.unitPtr != nullptr) {
       const uint32_t cachedRawcode =
           dxvk::war3::hooks::QueryWidgetRawcodeByPtr(packet.renderable.unitPtr);
       if (cachedRawcode != 0u) {
@@ -9759,12 +9769,17 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       return false;
     }
 
-    // Phase 7.102 destructible rawcode 调查日志：
+    // Phase 7.102 destructible rawcode 调查日志（env gate，默认关）：
     // 用户报告 path blocker 屏蔽视觉验证不通过；可能存在 IsLosBlockerFourCc
-    // 没收录的 fourcc 变体。在所有 destructible packet append 时，前 30 次
-    // 每个 unique fourcc 各 1 行写入 dxvk log，便于复盘是否需要扩展黑名单。
-    // 仅取所有 destructible：rawcode 通过 widget cache 或 unitPtr+0x30 已经填好。
-    if (packet.renderable.unitPtr != nullptr) {
+    // 没收录的 fourcc 变体。env=1 时前 30 次每个 unique fourcc 各 1 行写入
+    // dxvk log，便于复盘是否需要扩展黑名单。
+    //
+    // Phase 7.104 perf 优化：default false，env=1 才执行 atomic load + SafeRead。
+    static const bool s_destructibleSurveyEnabled = []() {
+      const char* env = std::getenv("DXVK_WAR3_DESTRUCTIBLE_SURVEY");
+      return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    if (s_destructibleSurveyEnabled && packet.renderable.unitPtr != nullptr) {
       uint32_t surveyRawcode = packet.renderable.rawcode;
       if (surveyRawcode == 0u) {
         surveyRawcode = dxvk::war3::hooks::QueryWidgetRawcodeByPtr(
