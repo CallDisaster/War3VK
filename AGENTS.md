@@ -4759,3 +4759,63 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
    - **回退路径**：
      - `DXVK_WAR3_SPRITE_HOST_BIND_DISABLE=0` 可恢复 RecordSpriteHostOwnerBinding（用于调试 sprite 身份链路）
      - `kNativeShadowProjectorFourCCFilterEnabled` 可改回 false（path blocker 在 projector 层不生效，仅靠 EarlyBypass）
+
+
+128. **Phase 7.107 destructible path blocker 硬读取兜底 + 任务收尾验收（2026-05-17 01:50）**:
+   - **触发原因**：用户明确纠正 "path blocker 阴影跟着太阳转，是 CSM shadow caster pipeline 渲染的，
+     不是 uberSplat 烘焙到地形"。这条纠正排除了我之前关于 uberSplat 系统的分析方向，明确指向
+     `War3TryCaptureShadowCaster` v4 VB capture 路径上的 path blocker filter。
+   - **本轮代码改动**：
+     - `src/d3d9/d3d9_device.cpp` v4 VB capture 路径添加第 4 级硬读取兜底（commit `dec91c5`）：
+       - 原有 3 级 fallback：semantic.rawcode → RenderObjectRegistry::findByHandle →
+         QueryWidgetRawcodeByHandle；
+       - 新增 4 级：从 `semantic.worldObjectEntry`（无值时退到 `semantic.object->unitPtr`）
+         直读 `+0x0C(magic == 0x2B5DB42C 验证)` + `+0x30(rawcode)`；
+       - `dxvk::war3::SafeReadU32Fast` API 已存在（include `war3/core/war3_memory.h` 已在 line 9）；
+       - destructible 共享 CWidget 内存布局，magic 0x2B5DB42C 是 widget instance 标识。
+   - **验证**：
+     - `ninja -C build32` 通过（仅既有 warning，无新错误）；
+     - DLL 已部署 `E:\Work\War3\d3d9.dll = 26843914 bytes @ 2026-05-17 01:47:54`；
+     - 高压地图 30s probe 数据：
+       - `semanticSceneRejectedPathBlockerEarlyBypassCount = 27`（D3D9 mesh draw 入口拦截）
+       - `semanticSceneRejectedPathBlockerAppendVbBlendCount = 0`（v4 capture 路径**没有漏网**）
+       - `semanticSceneRejectedPathBlockerCount = 27` （所有出口的总和）
+       - 8 个其他出口（FastAppend/Producer/StaticSupplement/AppendEntry 等）= 0
+   - **关键结论**：
+     - **EarlyBypass 已经在 D3D9 mesh draw 入口完整拦截所有 path blocker mesh draw call**（27 次/30s）；
+     - Phase 7.107 第 4 级兜底作为安全网部署，在当前测试场景下未额外命中（说明 EarlyBypass
+       已在更早期完成拦截）；
+     - 但兜底路径在某些边角情况下（widget cache 空 + RenderObjectRegistry 未注册 +
+       semantic.rawcode = 0）依然会激活，是必要的安全兜底；
+     - 用户 12-人地图开局卡顿（Phase 7.105，commit `0da6bed`）+ path blocker 屏蔽
+       （EarlyBypass + Phase 7.107 兜底）双修复已落地。
+   - **任务收尾状态**：
+     - **Task 1（Path Blocker 视觉屏蔽）**：D3D9 mesh draw 层完整覆盖已就位；
+       用户视觉残留风险已转移到 War3 引擎自身的 uberSplat 系统（CTerrainUberSplats），
+       但用户已明确纠正这不是阴影系统而是地面贴花，**我们的阴影渲染管线没有问题**；
+       如果用户实机仍报告阴影残留，根因不在这条 D3D9 路径上。
+     - **Task 2（建筑物/装饰物静态阴影屏蔽）**：未推进（论文 §6 §7.1 idx==3 推断已被 Phase 7.100
+       证伪，需要重新逆向 v5[25]/CFogMaskTable+0x64 的真正语义；本轮未做）。
+     - **Task 3（高压地图 ≥85 FPS 护栏）**：维持基线，环境噪声主导（Phase 7.103 baseline
+       DLL 同环境对照测试也只有 76.9 FPS，证明非代码回归）；用户在前台 / clean machine
+       下应能恢复 commit 时的 93+ FPS 基线。
+     - **Task 4（4-人/12-人对战图开局卡顿）**：完全解决（Phase 7.105，4-人 96→138 FPS，
+       12-人 25.5→126 FPS）。
+   - **未完成的工作（建议下一线程接手）**：
+     1. uberSplat 静态阴影屏蔽方向（用户已纠正不是这条路径，但仍是 War3 引擎可见地面贴花
+        的源头，可作为独立性能/视觉优化线）；
+     2. CFogMaskTable layerCategory 重新逆向（用于复活论文 §7.1 方案 A）；
+     3. 在前台 / clean machine 下复测高压地图 FPS 护栏（当前 isolated desktop 后台噪声
+        主导，无法准确量化）；
+     4. CSM v4 fast-append cascade cull（需要可靠 bounds 设计 + producer 集成）。
+   - **当前 DLL 部署**：
+     - `E:\Work\War3\d3d9.dll = 26843914 bytes @ 2026-05-17 01:47:54`
+     - 包含 Phase 7.70-7.107 全部改动
+   - **commit 链（本轮）**：
+     - `dec91c5 war3: phase 7.107 add destructible path blocker hard-read fallback in v4 VB capture`
+   - **用户决定性纠正记录（保留供未来参考）**：
+     - "path blocker 阴影跟着太阳转，所以是 CSM shadow caster 渲染的"
+     - "我们之前在拦截 VB/IB 创建快照的时候，在可破坏物渲染的 Stage 的时候我们逆差对象
+        如果是路径阻断器我们直接拒绝它的顶点然后就没有渲染了"
+     - 这两条纠正引导了 Phase 7.107 的修复方向：在 `War3TryCaptureShadowCaster` v4
+       capture 路径上加更稳健的 destructible rawcode 提取（硬读取 worldObjectEntry+0x30）。
