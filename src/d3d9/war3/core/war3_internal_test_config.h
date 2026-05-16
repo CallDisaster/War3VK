@@ -1059,8 +1059,11 @@ inline constexpr bool kWar3ShadowProjectorNativeHintEnabled = false;
 // 说明：
 // - 这条链会走 TryExtractShadowObjectFourCC -> Unit/Agent 解析；
 // - 对超大地图而言，这是一个非常昂贵的高频热路径；
-// - 当前默认关闭，只有在确实需要 PathBlocker/FourCC 精确拦截时再打开。
-inline constexpr bool kNativeShadowProjectorFourCCFilterEnabled = false;
+// - Phase 7.106：用户视觉验证不通过的根因是 path blocker 在 uberSplat 系统
+//   留下贴花阴影，必须 hook ShadowProjector_Add_FromObject + 按 FourCC 拦截
+//   才能消除。该 hook 在 Add_FromObject 调用一帧只触发数十次（非热路径），
+//   每次 FourCC 提取也是 cached unit-wrapper 路径，开销可控。开启它。
+inline constexpr bool kNativeShadowProjectorFourCCFilterEnabled = true;
 
 // 影子投影器调试日志（打印少量关键数据）
 inline constexpr bool kNativeShadowProjectorVerboseLogging = false;
