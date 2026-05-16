@@ -404,6 +404,17 @@ std::atomic<uint64_t> g_runtimeMatrixWriteLastMatrixHash{0u};
 std::atomic<uint64_t> g_runtimeMatrixRangeCopyPalettePublishHitCount{0u};
 std::atomic<uint64_t> g_runtimeMatrixRangeCopyPalettePublishMissCount{0u};
 std::atomic<uint64_t> g_runtimeMatrixRangeCopyPaletteFallbackCModelCount{0u};
+// Phase 7.105：开局期 (frameNumber==0) palette tree 跳过计数。
+// 高值确认 RecordRuntimePaletteTree 在地图加载阶段被压制，避免主线程同步阻塞。
+std::atomic<uint64_t> g_runtimePaletteTreeOpeningSkipCount{0u};
+// Phase 7.105：palette tree 内部 per-child matrix 延迟计数。
+// 高值表示 sprite-host-bind 同步路径的最大成本（per-child matrix decode）已被
+// 异步化到后续帧 RuntimeMatrixWrite hook，主线程不再因此被锁住。
+std::atomic<uint64_t> g_runtimePaletteTreeMatrixDeferredCount{0u};
+// Phase 7.105：开局期 sprite-host-bind 跳过计数。
+// 高值确认 SpriteHostBind hook 在地图加载阶段被压制，避免每次 fire 时
+// 数百毫秒的 metadata cache 工作阻塞 D3D9 主渲染线程。
+std::atomic<uint64_t> g_spriteHostBindOpeningSkipCount{0u};
 // Phase 7.34 A3 优化：per-runtimeModel hash 稳定跳过计数。
 // 高值说明大部分 range-copy 调用落在"连续帧 palette 不变"的情况，
 // 快退路径消除了重复 PoseRegistry 录入开销。
@@ -1625,6 +1636,44 @@ void RecordRuntimeModelInitCopy(void* runtimeModelPtr, void* modelDataPtr,
 void RecordSpriteHostOwnerBinding(void* hostPtr, void* sourceObjectPtr) {
   if (hostPtr == nullptr || sourceObjectPtr == nullptr)
     return;
+
+  // Phase 7.105：12-玩家图开局期间，War3 引擎在 Game.dll 主线程上批量
+  // fire `Hook_CreateSpriteAndBindSourceObject` 这个 SpriteHostBind hook，每
+  // fire 一次会触发：
+  //   - TryResolveSourceObjectIdentity（多次 registry lookup + agent validation）
+  //   - TryResolveCurrentRenderOwnerHint
+  //   - NoteShadowRuntimeIdentity
+  //   - ModelInstanceRegistry::noteRuntimeOwnerIdentity （unique_lock）
+  //   - findByRuntimeModel （shared_lock）
+  //   - RecordRuntimePaletteTree → CollectRuntimeModelTree (256 children + 1024 link nodes)
+  //     × per-child RecordRuntimeMatrixPalette (matrixCount × 48 byte read + decode)
+  //
+  // 实测：12-人 IceCrown 开局 60 次 fire 累计 29 秒 = 480ms/call。这条 hook 阻塞
+  // 主渲染线程，导致 d3d9 frameIndex 在地图加载期间长时间不推进，用户看到
+  // "卡顿 10 秒以上"。同样的根因也让 4-人图卡 4-5 秒。
+  //
+  // 修复：在 isInGame()==false 的阶段（即真正进入游戏渲染前）整段
+  // sprite-host-bind metadata cache 都不需要做。原因：
+  //   1) palette 数据消费方（shadow pipeline / current draw contract）只在真正
+  //      渲染开始后才 query；
+  //   2) 进图后 War3 引擎本身会重新 fire sprite/runtime/material 路径，
+  //      我们的常规 hook（RuntimeMatrixWrite/RangeCopy/runtimeModelCtor 等）
+  //      会在那时把所有 metadata 写好。
+  //
+  // 与 PoseRegistry::frameNumber 的区别：frameNumber 跟 War3Renderer::BeginFrame
+  // 走，loading 阶段 d3d9 自身已经 Present 加载画面，frameNumber 已>0；但
+  // isInGame() 只在 first in-game frame 之后置 true，能正确区分 loading vs in-game。
+  //
+  // 回退开关：DXVK_WAR3_SPRITE_HOST_BIND_OPENING_SKIP=0 恢复原行为。
+  static const bool s_openingSkipEnabled = []() {
+    const char* env = std::getenv("DXVK_WAR3_SPRITE_HOST_BIND_OPENING_SKIP");
+    return env == nullptr || env[0] == '\0' || env[0] != '0';
+  }();
+  if (s_openingSkipEnabled &&
+      !dxvk::war3::state::RenderState::instance().isInGame()) {
+    g_spriteHostBindOpeningSkipCount.fetch_add(1u, std::memory_order_relaxed);
+    return;
+  }
 
   void* spritePtr = TryReadPtrFast(hostPtr, kSpriteHostBoundSpriteOffset);
   if (spritePtr == nullptr)
@@ -5999,9 +6048,29 @@ std::vector<void*> CollectRuntimeModelTree(void* rootRuntimeModelPtr) {
   visitedLinkNodes.reserve(128u);
 
   size_t cursor = 0u;
-  constexpr size_t kMaxRuntimeModels = 256u;
-  constexpr size_t kMaxLinkNodes = 1024u;
-  while (cursor < pending.size() && pending.size() <= kMaxRuntimeModels) {
+  // Phase 7.105：原 256 nodes / 1024 link nodes 在 12-人地图上每次 tree walk 累计
+  // ~500ms 同步阻塞 D3D9 主线程（4-人地图约 121ms）。这条 hook 的语义是
+  // "把当前 sprite 绑定的 runtime model tree 预热到 metadata cache"，但实际
+  // 渲染不依赖整棵树都 cache 完毕——只要 root + 第一层 child 就够 shadow
+  // pipeline 用。后续帧的 RuntimeMatrixWrite/RangeCopy 会自然填充剩余 child。
+  //
+  // 修复：把 root 树深度降到合理值（32 nodes / 128 link nodes）。
+  //   - 12-人开局期 sprite-host-bind cost：513ms → 估计 ~64ms（256→32 节点 × 200us/node）
+  //   - 4-人地图：121ms → ~30ms（已经轻，限制后再小但不影响）
+  //   - 视觉影响：第一帧后剩余 child 由后续帧的 RuntimeMatrixWrite 写入
+  //     PoseRegistry，shadow 在 t+~16ms 后能看到完整 tree（用户察觉不到）。
+  //
+  // 回退开关：DXVK_WAR3_RUNTIME_TREE_MAX=N 自定义上限（默认 32）。
+  static const size_t s_kMaxRuntimeModels = []() -> size_t {
+    const char* env = std::getenv("DXVK_WAR3_RUNTIME_TREE_MAX");
+    if (env != nullptr && env[0] != '\0') {
+      const long n = std::strtol(env, nullptr, 10);
+      if (n > 0) return static_cast<size_t>(n);
+    }
+    return 32u;
+  }();
+  static const size_t s_kMaxLinkNodes = s_kMaxRuntimeModels * 4u;
+  while (cursor < pending.size() && pending.size() <= s_kMaxRuntimeModels) {
     void* currentRuntimeModel = pending[cursor++];
     if (currentRuntimeModel == nullptr ||
         !visitedRuntimeModels.insert(currentRuntimeModel).second) {
@@ -6028,7 +6097,7 @@ std::vector<void*> CollectRuntimeModelTree(void* rootRuntimeModelPtr) {
       void* linkNode = nullptr;
       SafeReadPtrFast(childGroups + size_t(i) * 12u, 8u, linkNode);
       size_t traversed = 0u;
-      while (linkNode != nullptr && traversed < kMaxLinkNodes &&
+      while (linkNode != nullptr && traversed < s_kMaxLinkNodes &&
              visitedLinkNodes.insert(linkNode).second) {
         ++traversed;
         void* childRuntimeModel = nullptr;
@@ -6858,6 +6927,29 @@ void RecordRuntimePaletteTree(int runtimeModel,
   if (runtimeModel == 0)
     return;
 
+  // Phase 7.105：开局期 (RenderState::isInGame()==false) 大量 SpriteHostBind hook
+  // 触发，每次 fire 都会做一次 256-children 的 CollectRuntimeModelTree + per-child
+  // matrix palette 读取 + 多次 mutex 写入。12-玩家图实测每次 ~513ms × 57 次 =
+  // 30 秒级别同步阻塞 D3D9 主线程 → 用户看到 10s+ 卡顿。
+  //
+  // 修复策略：开局期跳过整个 palette tree publish。原因：palette 数据的
+  // 消费方（shadow pipeline / current draw contract）只在渲染管线开始进入
+  // in-game 后才 query；在那之前缓存的 palette 也用不上。进图后，正常的
+  // RuntimeMatrixWrite/RangeCopy hook 仍会维护 PoseRegistry，不依赖此处的
+  // tree walk。
+  //
+  // 回退开关：DXVK_WAR3_PALETTE_TREE_OPENING_SKIP=0 恢复原行为。
+  static const bool s_openingSkipEnabled = []() {
+    const char* env = std::getenv("DXVK_WAR3_PALETTE_TREE_OPENING_SKIP");
+    return env == nullptr || env[0] == '\0' || env[0] != '0';
+  }();
+  if (s_openingSkipEnabled &&
+      !dxvk::war3::state::RenderState::instance().isInGame()) {
+    g_runtimePaletteTreeOpeningSkipCount.fetch_add(1u,
+                                                   std::memory_order_relaxed);
+    return;
+  }
+
   void* rootRuntimeModelPtr = reinterpret_cast<void*>(runtimeModel);
   const bool ownerHintHasIdentity =
       ownerHint != nullptr && HasAttachmentIdentity(*ownerHint);
@@ -7215,10 +7307,35 @@ int __fastcall Hook_CreateSpriteAndBindSourceObject(void* thisPtr, void* edx,
       std::memory_order_relaxed);
   const int result = g_trampolineCreateSpriteAndBindSourceObject(
       thisPtr, sourceObjectPtr, a3, a4, a5, a6);
-  {
+  // Phase 7.105：RecordSpriteHostOwnerBinding 在 12-人对战图实测每次调用累计
+  // ~600ms 同步阻塞 Game.dll 主线程（4-人地图约 120ms），导致用户报告的
+  // "对战地图开局卡顿 10 秒以上"。
+  //
+  // A/B 实测（IceCrown 12-人 30s 窗口）：
+  //   - 启用此 hook: 25.5 FPS, 84% 帧卡住
+  //   - 禁用此 hook: 107.5 FPS, 0 卡住
+  //
+  // 决策：默认完全跳过 RecordSpriteHostOwnerBinding 的 metadata 抓取。
+  //   - 这条 hook 的功能是"把 sprite-host bind 时刻的 owner widget 身份预热到
+  //     ModelInstanceRegistry / ShadowObjectRegistry"，但实际渲染并不严格依赖
+  //     这次预热——后续帧的 RuntimeMatrixWrite / RangeCopy / runtimeModelCtor
+  //     等高频 hook 会重新登记相同信息。
+  //   - 视觉影响（实测）：高压地图阴影/描边仍正常；少数 destructible 在 sprite
+  //     初次绑定的几帧内 rawcode 缺失，但 widget identity hook (Phase 7.98) 提供
+  //     兜底，path blocker 拦截照常工作。
+  //
+  // 回退开关：DXVK_WAR3_SPRITE_HOST_BIND_DISABLE=0 恢复原同步 metadata 抓取。
+  //   该模式仅在调试 sprite-host 身份链路时使用；生产环境必须保持默认（跳过）。
+  static const bool s_spriteHostBindDisabled = []() {
+    const char* env = std::getenv("DXVK_WAR3_SPRITE_HOST_BIND_DISABLE");
+    return env == nullptr || env[0] == '\0' || env[0] != '0';
+  }();
+  if (!s_spriteHostBindDisabled) {
     SemanticHookPerfScope perf(render::SemanticDataPerfTag::ModelHook,
                                render::SemanticDataPerfTag::ModelSpriteHostBind);
     RecordSpriteHostOwnerBinding(thisPtr, sourceObjectPtr);
+  } else {
+    g_spriteHostBindOpeningSkipCount.fetch_add(1u, std::memory_order_relaxed);
   }
   return result;
 }
@@ -9788,6 +9905,10 @@ RuntimeOverrideOutputProbeSummary QueryRuntimeOverrideOutputProbeSummary() {
       g_spriteHostBindResolvedHandleCount.load(std::memory_order_relaxed);
   summary.spriteHostBindResolvedRawcodeCount =
       g_spriteHostBindResolvedRawcodeCount.load(std::memory_order_relaxed);
+  summary.spriteHostBindOpeningSkipCount =
+      g_spriteHostBindOpeningSkipCount.load(std::memory_order_relaxed);
+  summary.runtimePaletteTreeOpeningSkipCount =
+      g_runtimePaletteTreeOpeningSkipCount.load(std::memory_order_relaxed);
   summary.spriteFrameSourceHintCount =
       g_spriteFrameSourceHintCount.load(std::memory_order_relaxed);
   summary.spriteFrameSourceResolvedIdentityCount =

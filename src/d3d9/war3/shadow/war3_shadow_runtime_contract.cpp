@@ -982,17 +982,16 @@ void SupplementPosesFromLiveCModels(
   // High-frequency SpriteFrameUpdate hooks should not rebuild registry joins.
   constexpr size_t kMaxDirectPoseAttemptsPerFrame = 768u;
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  std::vector<void*> visited;
+  // Phase 7.105：opening 期 12-player 地图大量对象加载，原 std::vector<void*>
+  // + std::find 是 O(N²)，N 可达数百时每帧吃几 ms。改成 unordered_set。
+  std::unordered_set<void*> visited;
   visited.reserve(manifest.records.size() * 3u +
                   attachments.records().size() * 6u + 256u);
 
   auto markVisited = [&](void* ptr) {
     if (ptr == nullptr)
       return false;
-    if (std::find(visited.begin(), visited.end(), ptr) != visited.end())
-      return false;
-    visited.push_back(ptr);
-    return true;
+    return visited.insert(ptr).second;
   };
 
   auto tryRuntime = [&](void* runtimeModelPtr, void* sceneNode, void* unitPtr) {
@@ -1049,9 +1048,28 @@ void SupplementPosesFromLiveCModels(
   // cache; sample the global runtime list only as a cold-start fallback. On hot
   // frames the visible manifest already names the runtimes that can cast this
   // frame; sweeping every known runtime turns a safety net into a per-frame tax.
-  if (stats.directPoseSupplementResolvedCount == 0u) {
+  //
+  // Phase 7.105：12-player opening 期间 manifest.records 可能为空，导致
+  // directPoseSupplementResolvedCount==0 每帧触发 → 全 registry sweep。runtime
+  // model 数量可达数百，配合 tryRuntime 的 SafeRead 与 ForEachRuntimeAlias，
+  // 单次 sweep 可能 >10ms。我们已经把 visited 改成 unordered_set，但 sweep
+  // 本身仍要做 N 次 SafeRead。这里再加一个全局 attempt 上限：
+  //   - 已经命中 kMaxDirectPoseAttemptsPerFrame 上限 = 软尾巴，仍跑
+  //   - manifest.records 为空（cold start）= 限制只走前 64 个 runtime
+  //   - 否则正常完成（manifest 提供了真正可见的对象，已经走完）
+  if (stats.directPoseSupplementResolvedCount == 0u &&
+      stats.directPoseSupplementAttemptCount <
+          kMaxDirectPoseAttemptsPerFrame) {
+    constexpr size_t kColdStartSweepBudget = 64u;
+    size_t coldStartAttempts = 0u;
     for (const auto& runtimeRecord : resourceCache.snapshotRuntimeModels()) {
+      if (coldStartAttempts >= kColdStartSweepBudget)
+        break;
+      const size_t attemptsBefore = stats.directPoseSupplementAttemptCount;
       tryRuntime(runtimeRecord.runtimeModelPtr, nullptr, nullptr);
+      // 只在真的尝试了（不是 visited 提前 dedup）才计 budget。
+      if (stats.directPoseSupplementAttemptCount > attemptsBefore)
+        ++coldStartAttempts;
     }
   }
 }

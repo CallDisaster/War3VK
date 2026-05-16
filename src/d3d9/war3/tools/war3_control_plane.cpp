@@ -2785,6 +2785,11 @@ json ToJson(const render::ShadowRuntimeBridgeSummary& summary) {
        summary.spriteHostBindResolvedHandleCount},
       {"spriteHostBindResolvedRawcodeCount",
        summary.spriteHostBindResolvedRawcodeCount},
+      // Phase 7.105 opening-skip 诊断。
+      {"spriteHostBindOpeningSkipCount",
+       summary.spriteHostBindOpeningSkipCount},
+      {"runtimePaletteTreeOpeningSkipCount",
+       summary.runtimePaletteTreeOpeningSkipCount},
       {"spriteFrameSourceHintCount", summary.spriteFrameSourceHintCount},
       {"spriteFrameSourceResolvedIdentityCount",
        summary.spriteFrameSourceResolvedIdentityCount},

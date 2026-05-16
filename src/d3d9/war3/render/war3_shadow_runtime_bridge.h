@@ -1299,6 +1299,9 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t spriteHostBindResolvedUnitCount = 0;
   uint64_t spriteHostBindResolvedHandleCount = 0;
   uint64_t spriteHostBindResolvedRawcodeCount = 0;
+  // Phase 7.105 opening-skip 诊断字段。
+  uint64_t spriteHostBindOpeningSkipCount = 0;
+  uint64_t runtimePaletteTreeOpeningSkipCount = 0;
   uint64_t spriteFrameSourceHintCount = 0;
   uint64_t spriteFrameSourceResolvedIdentityCount = 0;
   uint64_t spriteFrameSourceResolvedUnitCount = 0;

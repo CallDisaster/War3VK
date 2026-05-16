@@ -5127,6 +5127,11 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
       overrideSummary.spriteHostBindResolvedHandleCount;
   summary.spriteHostBindResolvedRawcodeCount =
       overrideSummary.spriteHostBindResolvedRawcodeCount;
+  // Phase 7.105 opening-skip 诊断透传。
+  summary.spriteHostBindOpeningSkipCount =
+      overrideSummary.spriteHostBindOpeningSkipCount;
+  summary.runtimePaletteTreeOpeningSkipCount =
+      overrideSummary.runtimePaletteTreeOpeningSkipCount;
   summary.spriteFrameSourceHintCount =
       overrideSummary.spriteFrameSourceHintCount;
   summary.spriteFrameSourceResolvedIdentityCount =
