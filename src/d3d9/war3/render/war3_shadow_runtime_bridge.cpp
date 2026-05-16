@@ -4237,6 +4237,21 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         ::dxvk::war3::hooks::QueryWriteMaskRegionPassPathCount();
     summary.writeMaskRegionPassOtherCount =
         ::dxvk::war3::hooks::QueryWriteMaskRegionPassOtherCount();
+    // Phase 7.112：caller-aware 静态阴影屏蔽。
+    summary.writeMaskRegionFromBuildingStampCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionFromBuildingStampCount();
+    summary.writeMaskRegionRejectedBuildingCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionRejectedBuildingCount();
+    summary.writeMaskRegionFromRegisterFootprintCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionFromRegisterFootprintCount();
+    summary.writeMaskRegionFromRebuildMaskCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionFromRebuildMaskCount();
+    summary.writeMaskRegionFromActorRuntimeCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionFromActorRuntimeCount();
+    summary.writeMaskRegionFromForObjectCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionFromForObjectCount();
+    summary.writeMaskRegionFromOtherCallerCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionFromOtherCallerCount();
     // Phase 7.108：ShadowProjector 永久统计。
     summary.projectorAddFromObjectEnterCount =
         ::dxvk::war3::hooks::QueryShadowProjectorAddFromObjectEnterCount();

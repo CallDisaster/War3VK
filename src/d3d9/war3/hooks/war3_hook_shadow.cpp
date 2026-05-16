@@ -914,6 +914,31 @@ std::atomic<uint64_t> g_writeMaskRegionPassLosCount{0};   // idx==1
 std::atomic<uint64_t> g_writeMaskRegionPassPathCount{0};  // idx==2
 std::atomic<uint64_t> g_writeMaskRegionPassOtherCount{0};
 
+// Phase 7.112：caller-aware 拦截统计。
+std::atomic<uint64_t> g_writeMaskRegionFromBuildingStampCount{0};
+std::atomic<uint64_t> g_writeMaskRegionRejectedBuildingCount{0};
+std::atomic<uint64_t> g_writeMaskRegionFromRegisterFootprintCount{0};
+std::atomic<uint64_t> g_writeMaskRegionFromRebuildMaskCount{0};
+std::atomic<uint64_t> g_writeMaskRegionFromActorRuntimeCount{0};
+std::atomic<uint64_t> g_writeMaskRegionFromForObjectCount{0};
+std::atomic<uint64_t> g_writeMaskRegionFromOtherCallerCount{0};
+
+// 静态地址：CUnit_StampBuildingShadowFootprint @ Game.dll+0x514F40，size 0x81
+constexpr uintptr_t kCUnitStampBuildingShadowFootprintRva = 0x514F40u;
+constexpr uintptr_t kCUnitStampBuildingShadowFootprintSize = 0x81u;
+// CWidget_RegisterFootprintAndShadowMask @ Game.dll+0x65A140, size 0x3FE
+constexpr uintptr_t kCWidgetRegisterFootprintRva = 0x65A140u;
+constexpr uintptr_t kCWidgetRegisterFootprintSize = 0x3FEu;
+// TerrainShadow_RebuildMaskFromObjectLists @ Game.dll+0x233E90, size 0x513
+constexpr uintptr_t kTerrainShadowRebuildMaskRva = 0x233E90u;
+constexpr uintptr_t kTerrainShadowRebuildMaskSize = 0x513u;
+// TerrainShadow_WriteMaskRegion_FromActorRuntime @ Game.dll+0x3DB260, size 0x128
+constexpr uintptr_t kTerrainShadowFromActorRuntimeRva = 0x3DB260u;
+constexpr uintptr_t kTerrainShadowFromActorRuntimeSize = 0x128u;
+// TerrainShadow_WriteMaskRegion_ForObject @ Game.dll+0x2346FC, size 0xE9
+constexpr uintptr_t kTerrainShadowForObjectRva = 0x2346FCu;
+constexpr uintptr_t kTerrainShadowForObjectSize = 0xE9u;
+
 // Phase 7.108：ShadowProjector 永久 atomic 计数器。
 // 这条路径独立于 D3D9 mesh draw（CTerrainUberSplats 系统），
 // 必须永久计数才能在不开 verbose 编译期开关时也判断
@@ -923,91 +948,208 @@ int __thiscall Hook_TerrainShadow_WriteMaskRegion(void *thisPtr, void *a2,
                                                    int a3, void *a4, int a5) {
   g_writeMaskRegionEnterCount.fetch_add(1, std::memory_order_relaxed);
 
-  // 与论文 §7.1 伪代码完全一致：a4 != NULL 时强制 idx=4（飞行单位特殊路径，
-  // 不是 shadow footprint）；否则从对象 +0x10C 读 uint16 maskIdx。
-  uint32_t maskIdx = 0xFFFFu;
-  if (a4 != nullptr) {
-    maskIdx = 4u;
-  } else if (a2 != nullptr) {
-    uint32_t idx32 = 0;
-    if (::dxvk::war3::SafeReadU32Fast(a2, 0x10Cu, idx32))
-      maskIdx = idx32 & 0xFFFFu;  // 只取低 16 位
+  // Phase 7.112：caller-aware 静态阴影屏蔽。
+  // 通过返回地址判定调用来源，仅拦截"建筑物 shadow footprint"路径。
+  // fog/LOS/path/visibility 等共享路径完全不受影响。
+  // GCC/MinGW 用 __builtin_return_address；MSVC 用 _ReturnAddress。
+#if defined(_MSC_VER) && !defined(__GNUC__)
+  const uintptr_t retAddr = reinterpret_cast<uintptr_t>(_ReturnAddress());
+#else
+  const uintptr_t retAddr =
+      reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+#endif
+  const uintptr_t gameBase = GetGameDllBase();
+  const uintptr_t buildingStampStart = gameBase + kCUnitStampBuildingShadowFootprintRva;
+  const uintptr_t registerFootprintStart = gameBase + kCWidgetRegisterFootprintRva;
+  const uintptr_t rebuildMaskStart = gameBase + kTerrainShadowRebuildMaskRva;
+  const uintptr_t fromActorRuntimeStart = gameBase + kTerrainShadowFromActorRuntimeRva;
+  const uintptr_t forObjectStart = gameBase + kTerrainShadowForObjectRva;
+
+  const bool fromBuildingStamp = IsAddrInFuncRange(
+      retAddr, buildingStampStart, kCUnitStampBuildingShadowFootprintSize);
+  const bool fromRegisterFootprint = IsAddrInFuncRange(
+      retAddr, registerFootprintStart, kCWidgetRegisterFootprintSize);
+  const bool fromRebuildMask = IsAddrInFuncRange(
+      retAddr, rebuildMaskStart, kTerrainShadowRebuildMaskSize);
+  const bool fromActorRuntime = IsAddrInFuncRange(
+      retAddr, fromActorRuntimeStart, kTerrainShadowFromActorRuntimeSize);
+  const bool fromForObject = IsAddrInFuncRange(
+      retAddr, forObjectStart, kTerrainShadowForObjectSize);
+
+  // 来源分桶（永久统计，可用 control plane summary 实时验证）
+  if (fromBuildingStamp) {
+    g_writeMaskRegionFromBuildingStampCount.fetch_add(
+        1, std::memory_order_relaxed);
+  } else if (fromRegisterFootprint) {
+    g_writeMaskRegionFromRegisterFootprintCount.fetch_add(
+        1, std::memory_order_relaxed);
+  } else if (fromRebuildMask) {
+    g_writeMaskRegionFromRebuildMaskCount.fetch_add(
+        1, std::memory_order_relaxed);
+  } else if (fromActorRuntime) {
+    g_writeMaskRegionFromActorRuntimeCount.fetch_add(
+        1, std::memory_order_relaxed);
+  } else if (fromForObject) {
+    g_writeMaskRegionFromForObjectCount.fetch_add(
+        1, std::memory_order_relaxed);
+  } else {
+    g_writeMaskRegionFromOtherCallerCount.fetch_add(
+        1, std::memory_order_relaxed);
   }
 
-  // Phase 7.100 诊断：前 8 次 fire 时 dump 各种字段，看 maskIdx 实际从哪里读出来的。
+  // Phase 7.112 第一刀：仅 reject 来自 CUnit_StampBuildingShadowFootprint 的写入。
+  // 该 caller 只在建筑物 lifecycle 调用，是建筑预渲染贴花阴影的唯一专属入口。
+  // 不影响 fog/LOS/path 或 visibility（它们走 RebuildMask / RegisterFootprint /
+  // ForObject 等其它 caller）。
+  if (fromBuildingStamp &&
+      dxvk::war3::internal::kNativeStaticShadowHideBuildingFootprintEnabled) {
+    const uint64_t logIdx = g_writeMaskRegionRejectedBuildingCount.fetch_add(
+        1, std::memory_order_relaxed);
+    if (dxvk::war3::internal::
+            kNativeStaticShadowHideBuildingFootprintDebugLog &&
+        logIdx < 8u) {
+      uint32_t magic = 0u;
+      uint32_t rawcode = 0u;
+      if (a2) {
+        ::dxvk::war3::SafeReadU32Fast(a2, 0x0Cu, magic);
+        ::dxvk::war3::SafeReadU32Fast(a2, 0x30u, rawcode);
+      }
+      char fc[5] = {char((rawcode >> 24) & 0xFF),
+                    char((rawcode >> 16) & 0xFF),
+                    char((rawcode >> 8) & 0xFF), char(rawcode & 0xFF), 0};
+      char buf[200];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: BUILDING SHADOW REJECT #%llu "
+               "widget=%p magic=0x%08X rawcode=0x%08X (%s) a3=0x%X a4=%p",
+               static_cast<unsigned long long>(logIdx + 1u), a2,
+               static_cast<unsigned int>(magic),
+               static_cast<unsigned int>(rawcode),
+               (rawcode != 0u ? fc : "----"),
+               static_cast<unsigned int>(a3), a4);
+      ::dxvk::Logger::info(buf);
+    }
+    return 0;
+  }
+
+  // Phase 7.112 第二刀：检查 widget+0x60 的 SHADOW_FOOTPRINT_PRESENT 标志位。
+  // 来自 CUnit_StampBuildingShadowFootprint 反编译：
+  //   *(_DWORD *)(unit + 96) |= 0x400u;   // (unit+0x60) bit10 = SHADOW_FOOTPRINT_FLAG
+  // 当 widget 在 lifecycle 中已经被标记为"具备 shadow footprint"，无论它现在
+  // 走的是 RebuildMask / ForObject / RegisterFootprint 哪条 caller，
+  // 这次 WriteMaskRegion 调用的写入对象都涉及该 widget 的 shadow footprint mask bit。
+  //
+  // 这条规则比"caller=BuildingStamp"覆盖更广（建筑物会被定时刷新走 RebuildMask，
+  // 此时 caller 已经不是 BuildingStamp，但 widget 标志位仍然在）。
+  // 对应的 widget 类型主要是 building / destructible 静态对象。
+  //
+  // 风险：fog/LOS/visibility 不依赖这个标志位，不会受影响。
+
+  // Phase 7.112 第二刀诊断：前 12 次 fire 时 dump widget +0x60 +0x14C 字段语义。
   {
-    static std::atomic<uint32_t> s_dumpCount{0};
-    const uint32_t cur = s_dumpCount.fetch_add(1, std::memory_order_relaxed);
-    if (cur < 8 && a2 != nullptr) {
-      uint32_t magic = 0;
-      uint32_t rawcode = 0;
-      uint32_t idxAtBC = 0;
-      uint32_t idxAt100 = 0;
-      uint32_t idxAt104 = 0;
-      uint32_t idxAt108 = 0;
-      uint32_t idxAt10C = 0;
-      uint32_t idxAt110 = 0;
-      uint32_t idxAt114 = 0;
+    static std::atomic<uint32_t> s_dump60{0};
+    const uint32_t cur = s_dump60.fetch_add(1, std::memory_order_relaxed);
+    if (cur < 12u && a2 != nullptr) {
+      uint32_t magic = 0u;
+      uint32_t rawcode = 0u;
+      uint32_t flags60 = 0u;
+      uint32_t flags20 = 0u;
+      uint32_t flagsCC = 0u;
+      uint32_t flags14C = 0u;
+      uint32_t flags5C = 0u;
       ::dxvk::war3::SafeReadU32Fast(a2, 0x0Cu, magic);
       ::dxvk::war3::SafeReadU32Fast(a2, 0x30u, rawcode);
-      ::dxvk::war3::SafeReadU32Fast(a2, 0xBCu, idxAtBC);
-      ::dxvk::war3::SafeReadU32Fast(a2, 0x100u, idxAt100);
-      ::dxvk::war3::SafeReadU32Fast(a2, 0x104u, idxAt104);
-      ::dxvk::war3::SafeReadU32Fast(a2, 0x108u, idxAt108);
-      ::dxvk::war3::SafeReadU32Fast(a2, 0x10Cu, idxAt10C);
-      ::dxvk::war3::SafeReadU32Fast(a2, 0x110u, idxAt110);
-      ::dxvk::war3::SafeReadU32Fast(a2, 0x114u, idxAt114);
-      char fc[5] = {char((rawcode >> 24) & 0xFF), char((rawcode >> 16) & 0xFF),
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x60u, flags60);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x20u, flags20);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0xCCu, flagsCC);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x14Cu, flags14C);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x5Cu, flags5C);
+      char fc[5] = {char((rawcode >> 24) & 0xFF),
+                    char((rawcode >> 16) & 0xFF),
                     char((rawcode >> 8) & 0xFF), char(rawcode & 0xFF), 0};
       char buf[280];
       snprintf(buf, sizeof(buf),
-               "DXVK War3Hook[Shadow] WMR_DUMP #%u a2=%p a3=0x%X a4=%p a5=0x%X "
+               "DXVK War3Hook[Shadow] WMR_FLAGS #%u widget=%p a3=0x%X a4=%p "
                "magic=0x%08X raw=0x%08X(%s) "
-               "+BC=0x%08X +100=0x%08X +104=0x%08X +108=0x%08X "
-               "+10C=0x%08X +110=0x%08X +114=0x%08X",
-               cur + 1, a2, static_cast<unsigned>(a3), a4,
-               static_cast<unsigned>(a5), magic, rawcode,
-               (rawcode != 0 ? fc : "----"), idxAtBC, idxAt100, idxAt104,
-               idxAt108, idxAt10C, idxAt110, idxAt114);
+               "+0x20=0x%08X +0x5C=0x%08X +0x60=0x%08X +0xCC=0x%08X +0x14C=0x%08X",
+               cur + 1, a2, static_cast<unsigned>(a3), a4, magic, rawcode,
+               (rawcode != 0u ? fc : "----"), flags20, flags5C, flags60,
+               flagsCC, flags14C);
       ::dxvk::Logger::info(buf);
     }
   }
-
-  // 命中 idx==3：拒绝。返回 0 模拟"无写入"，不调 trampoline。
-  if constexpr (dxvk::war3::internal::kNativeStaticShadowMaskHideEnabled) {
-    if (maskIdx == 3u) {
-      const uint64_t logIdx = g_writeMaskRegionRejectedIdx3Count.fetch_add(
+  if (a2 != nullptr &&
+      dxvk::war3::internal::kNativeStaticShadowHideBuildingFootprintEnabled) {
+    uint32_t widgetFlags = 0u;
+    if (::dxvk::war3::SafeReadU32Fast(a2, 0x60u, widgetFlags) &&
+        (widgetFlags & 0x400u) != 0u) {
+      const uint64_t logIdx = g_writeMaskRegionRejectedBuildingCount.fetch_add(
           1, std::memory_order_relaxed);
-      if constexpr (dxvk::war3::internal::kNativeStaticShadowMaskHideDebugLog) {
-        if (logIdx < 6u) {
-          uint32_t rawcode = 0;
-          if (a2)
-            ::dxvk::war3::SafeReadU32Fast(a2, 0x30u, rawcode);
-          char fc[5] = {char((rawcode >> 24) & 0xFF),
-                        char((rawcode >> 16) & 0xFF),
-                        char((rawcode >> 8) & 0xFF),
-                        char(rawcode & 0xFF), 0};
-          char buf[200];
-          snprintf(buf, sizeof(buf),
-                   "DXVK War3Hook[Shadow]: STATIC SHADOW REJECT #%llu "
-                   "widget=%p rawcode=0x%08X (%s) maskIdx=%u",
-                   static_cast<unsigned long long>(logIdx + 1u), a2,
-                   static_cast<unsigned int>(rawcode),
-                   (rawcode != 0u ? fc : "----"),
-                   static_cast<unsigned int>(maskIdx));
-          ::dxvk::Logger::info(buf);
-        }
+      if (dxvk::war3::internal::
+              kNativeStaticShadowHideBuildingFootprintDebugLog &&
+          logIdx < 16u) {
+        uint32_t magic = 0u;
+        uint32_t rawcode = 0u;
+        ::dxvk::war3::SafeReadU32Fast(a2, 0x0Cu, magic);
+        ::dxvk::war3::SafeReadU32Fast(a2, 0x30u, rawcode);
+        char fc[5] = {char((rawcode >> 24) & 0xFF),
+                      char((rawcode >> 16) & 0xFF),
+                      char((rawcode >> 8) & 0xFF),
+                      char(rawcode & 0xFF), 0};
+        char callerKind[24] = "Other";
+        if (fromRebuildMask)
+          std::strcpy(callerKind, "RebuildMask");
+        else if (fromForObject)
+          std::strcpy(callerKind, "ForObject");
+        else if (fromRegisterFootprint)
+          std::strcpy(callerKind, "RegisterFootprint");
+        else if (fromActorRuntime)
+          std::strcpy(callerKind, "ActorRuntime");
+        char buf[260];
+        snprintf(buf, sizeof(buf),
+                 "DXVK War3Hook[Shadow]: BUILDING SHADOW (FlagPath) REJECT #%llu "
+                 "widget=%p flags+60=0x%08X magic=0x%08X rawcode=0x%08X (%s) "
+                 "a3=0x%X a4=%p caller=%s",
+                 static_cast<unsigned long long>(logIdx + 1u), a2,
+                 static_cast<unsigned int>(widgetFlags),
+                 static_cast<unsigned int>(magic),
+                 static_cast<unsigned int>(rawcode),
+                 (rawcode != 0u ? fc : "----"),
+                 static_cast<unsigned int>(a3), a4, callerKind);
+        ::dxvk::Logger::info(buf);
       }
       return 0;
     }
   }
 
-  // 路径放行：累计语义分桶（极轻），便于后续验证 idx 推断。
-  switch (maskIdx) {
-  case 0u: g_writeMaskRegionPassFogCount.fetch_add(1, std::memory_order_relaxed); break;
-  case 1u: g_writeMaskRegionPassLosCount.fetch_add(1, std::memory_order_relaxed); break;
-  case 2u: g_writeMaskRegionPassPathCount.fetch_add(1, std::memory_order_relaxed); break;
-  default: g_writeMaskRegionPassOtherCount.fetch_add(1, std::memory_order_relaxed); break;
+  // 历史 idx==3 推断已被推翻（保留代码做 A/B 对照），默认关闭。
+  if constexpr (dxvk::war3::internal::kNativeStaticShadowMaskHideEnabled) {
+    uint32_t maskIdx = 0xFFFFu;
+    if (a4 != nullptr) {
+      maskIdx = 4u;
+    } else if (a2 != nullptr) {
+      uint32_t idx32 = 0;
+      if (::dxvk::war3::SafeReadU32Fast(a2, 0x10Cu, idx32))
+        maskIdx = idx32 & 0xFFFFu;
+    }
+    if (maskIdx == 3u) {
+      g_writeMaskRegionRejectedIdx3Count.fetch_add(
+          1, std::memory_order_relaxed);
+      return 0;
+    }
+    switch (maskIdx) {
+    case 0u:
+      g_writeMaskRegionPassFogCount.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case 1u:
+      g_writeMaskRegionPassLosCount.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case 2u:
+      g_writeMaskRegionPassPathCount.fetch_add(1, std::memory_order_relaxed);
+      break;
+    default:
+      g_writeMaskRegionPassOtherCount.fetch_add(1, std::memory_order_relaxed);
+      break;
+    }
   }
 
   if (g_trampolineTerrainShadowWriteMaskRegion)
@@ -1038,6 +1180,29 @@ uint64_t QueryWriteMaskRegionPassPathCount() {
 }
 uint64_t QueryWriteMaskRegionPassOtherCount() {
   return g_writeMaskRegionPassOtherCount.load(std::memory_order_relaxed);
+}
+
+// Phase 7.112：caller-aware 静态阴影屏蔽诊断 atomic 读取器。
+uint64_t QueryWriteMaskRegionFromBuildingStampCount() {
+  return g_writeMaskRegionFromBuildingStampCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionRejectedBuildingCount() {
+  return g_writeMaskRegionRejectedBuildingCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionFromRegisterFootprintCount() {
+  return g_writeMaskRegionFromRegisterFootprintCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionFromRebuildMaskCount() {
+  return g_writeMaskRegionFromRebuildMaskCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionFromActorRuntimeCount() {
+  return g_writeMaskRegionFromActorRuntimeCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionFromForObjectCount() {
+  return g_writeMaskRegionFromForObjectCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionFromOtherCallerCount() {
+  return g_writeMaskRegionFromOtherCallerCount.load(std::memory_order_relaxed);
 }
 
 // Phase 7.108：ShadowProjector 永久 atomic 读取器。

@@ -999,6 +999,30 @@ inline constexpr bool kNativeStaticShadowMaskHideEnabled = false;
 inline constexpr bool kNativeStaticShadowMaskHideDebugLog = false;
 // 安装 hook 但不 reject（仅诊断，0 行为代价）。Phase 7.101 默认开。
 inline constexpr bool kNativeStaticShadowMaskHookInstall = true;
+
+// ============================================================================
+// Phase 7.112：建筑物 / 装饰物原生静态阴影屏蔽（caller-aware）
+// ============================================================================
+// 论文 §7.1 idx==3 推断已被 Phase 7.100 实测推翻。
+// Phase 7.112 第一刀（caller=BuildingStamp）实测 enterCount=0，证明
+// CUnit_StampBuildingShadowFootprint 在重建期间不会被高频调用。
+// Phase 7.112 第二刀（widget+0x60 & 0x400）实测 6300 次 enter 全部 widget+0x60=0，
+// 证明 RebuildMask 路径上的 a2 不是 widget 而是 player object（CGameWar3 槽位）。
+//
+// 真正的建筑/装饰物 shadow footprint 写入路径在 TerrainShadow_DispatchToShape
+// （0x234420）→ TerrainShadow_BoxFastpath / PolyFastpath（0x1F5180/0x1F500C），
+// 它们独立于 WriteMaskRegion，无法用 WriteMaskRegion hook 拦截。
+//
+// **当前默认禁用 reject**，仅保留 caller-aware 诊断 counter。下一阶段需要
+// hook BoxFastpath/PolyFastpath 直接拦截，或通过 widget+0x14C/+0x60 寻找
+// 真正的"builder shadow"标志位（可能在 unit data table 中而非 widget 实例）。
+inline constexpr bool kNativeStaticShadowHideBuildingFootprintEnabled = false;
+inline constexpr bool kNativeStaticShadowHideBuildingFootprintDebugLog = false;
+// 装饰物（destructible / doodad）静态阴影屏蔽。这条会同时影响装饰物
+// 注册路径中"shadow + visibility"双 layer 写入；先默认关闭，等用户视觉验收
+// 建筑阴影屏蔽后再考虑启用。
+inline constexpr bool kNativeStaticShadowHideDestructibleFootprintEnabled =
+    false;
 // 开启路径阻断器隐藏时，是否强制开启桥接追踪（确保 ShadowCapture 能拿到 rawcode）。
 inline constexpr bool kPathBlockerForceBridgeTrackingEnabled = false;
 // “仅路径阻断器追踪”模式下的组掩码（bit0=group0, bit1=group1 ...）。

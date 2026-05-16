@@ -431,6 +431,15 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t writeMaskRegionPassPathCount = 0;
   uint64_t writeMaskRegionPassOtherCount = 0;
 
+  // Phase 7.112：caller-aware 静态阴影屏蔽诊断。
+  uint64_t writeMaskRegionFromBuildingStampCount = 0;
+  uint64_t writeMaskRegionRejectedBuildingCount = 0;
+  uint64_t writeMaskRegionFromRegisterFootprintCount = 0;
+  uint64_t writeMaskRegionFromRebuildMaskCount = 0;
+  uint64_t writeMaskRegionFromActorRuntimeCount = 0;
+  uint64_t writeMaskRegionFromForObjectCount = 0;
+  uint64_t writeMaskRegionFromOtherCallerCount = 0;
+
   // Phase 7.108：ShadowProjector 永久 atomic 计数（独立于 D3D9 mesh draw 路径）。
   uint64_t projectorAddFromObjectEnterCount = 0;
   uint64_t projectorAddFromObjectBlockedCount = 0;

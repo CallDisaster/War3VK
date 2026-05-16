@@ -121,6 +121,15 @@ uint64_t QueryWriteMaskRegionPassLosCount();
 uint64_t QueryWriteMaskRegionPassPathCount();
 uint64_t QueryWriteMaskRegionPassOtherCount();
 
+// Phase 7.112：caller-aware 静态阴影屏蔽诊断（control plane 透传）。
+uint64_t QueryWriteMaskRegionFromBuildingStampCount();
+uint64_t QueryWriteMaskRegionRejectedBuildingCount();
+uint64_t QueryWriteMaskRegionFromRegisterFootprintCount();
+uint64_t QueryWriteMaskRegionFromRebuildMaskCount();
+uint64_t QueryWriteMaskRegionFromActorRuntimeCount();
+uint64_t QueryWriteMaskRegionFromForObjectCount();
+uint64_t QueryWriteMaskRegionFromOtherCallerCount();
+
 // Phase 7.108：ShadowProjector 诊断计数器（control plane 透传用）。
 // 这条路径是 Game.dll 自己的"投影器阴影"系统（CTerrainUberSplats），
 // 与 D3D9 mesh draw 完全独立——path blocker 视觉残留可能就来自这条
