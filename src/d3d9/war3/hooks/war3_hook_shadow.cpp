@@ -1,3 +1,4 @@
+// Phase 7.100 marker bump 102042
 #include "war3_hook_shadow.h"
 #include "war3_hook_install_util.h"
 #include "war3_shadow_filter_policy.h"
@@ -12,7 +13,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <unordered_set>
+
+#include "../../../util/log/log.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -809,7 +813,172 @@ int __fastcall Hook_ShadowProjector_Add_Simple(void *a1, void *a2, int arg0,
                                               arg4, arg5, arg6);
 }
 
+// =====================================================================
+// Phase 7.100: TerrainShadow_WriteMaskRegion hook (静态阴影治理方案 A)
+// =====================================================================
+// 论文 §6 §7.1 决定性发现：War3 1.27a 的建筑/装饰物预渲染贴花阴影
+// (我们项目一直无法剔除的"魔兽自带的静态阴影")真正写入路径就是
+// TerrainShadow_WriteMaskRegion @ 0x6F234710。30+ caller 全部汇聚到这。
+//
+// IDA 反编译验证（0x6F234710）：
+//   if (a4) result = 4;
+//   else    result = *(unsigned __int16 *)(a2 + 268);   // a2 + 0x10C
+// 这个 result 就是 maskIdx。idx==3 是 shadow footprint，idx==0/1/2 分别对应
+// fog/LOS/path（共享 mask grid 但语义独立）。
+//
+// 拦截 idx==3 即可干净屏蔽建筑阴影，对 fog/LOS/path 零影响。
+typedef int (__thiscall *TerrainShadowWriteMaskRegionFn)(void *thisPtr, void *a2,
+                                                         int a3, void *a4,
+                                                         int a5);
+TerrainShadowWriteMaskRegionFn g_trampolineTerrainShadowWriteMaskRegion = nullptr;
+
+std::atomic<uint64_t> g_writeMaskRegionEnterCount{0};
+std::atomic<uint64_t> g_writeMaskRegionRejectedIdx3Count{0};
+std::atomic<uint64_t> g_writeMaskRegionPassFogCount{0};   // idx==0
+std::atomic<uint64_t> g_writeMaskRegionPassLosCount{0};   // idx==1
+std::atomic<uint64_t> g_writeMaskRegionPassPathCount{0};  // idx==2
+std::atomic<uint64_t> g_writeMaskRegionPassOtherCount{0};
+
+int __thiscall Hook_TerrainShadow_WriteMaskRegion(void *thisPtr, void *a2,
+                                                   int a3, void *a4, int a5) {
+  g_writeMaskRegionEnterCount.fetch_add(1, std::memory_order_relaxed);
+
+  // 与论文 §7.1 伪代码完全一致：a4 != NULL 时强制 idx=4（飞行单位特殊路径，
+  // 不是 shadow footprint）；否则从对象 +0x10C 读 uint16 maskIdx。
+  uint32_t maskIdx = 0xFFFFu;
+  if (a4 != nullptr) {
+    maskIdx = 4u;
+  } else if (a2 != nullptr) {
+    uint32_t idx32 = 0;
+    if (::dxvk::war3::SafeReadU32Fast(a2, 0x10Cu, idx32))
+      maskIdx = idx32 & 0xFFFFu;  // 只取低 16 位
+  }
+
+  // Phase 7.100 诊断：前 8 次 fire 时 dump 各种字段，看 maskIdx 实际从哪里读出来的。
+  {
+    static std::atomic<uint32_t> s_dumpCount{0};
+    const uint32_t cur = s_dumpCount.fetch_add(1, std::memory_order_relaxed);
+    if (cur < 8 && a2 != nullptr) {
+      uint32_t magic = 0;
+      uint32_t rawcode = 0;
+      uint32_t idxAtBC = 0;
+      uint32_t idxAt100 = 0;
+      uint32_t idxAt104 = 0;
+      uint32_t idxAt108 = 0;
+      uint32_t idxAt10C = 0;
+      uint32_t idxAt110 = 0;
+      uint32_t idxAt114 = 0;
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x0Cu, magic);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x30u, rawcode);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0xBCu, idxAtBC);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x100u, idxAt100);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x104u, idxAt104);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x108u, idxAt108);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x10Cu, idxAt10C);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x110u, idxAt110);
+      ::dxvk::war3::SafeReadU32Fast(a2, 0x114u, idxAt114);
+      char fc[5] = {char((rawcode >> 24) & 0xFF), char((rawcode >> 16) & 0xFF),
+                    char((rawcode >> 8) & 0xFF), char(rawcode & 0xFF), 0};
+      char buf[280];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow] WMR_DUMP #%u a2=%p a3=0x%X a4=%p a5=0x%X "
+               "magic=0x%08X raw=0x%08X(%s) "
+               "+BC=0x%08X +100=0x%08X +104=0x%08X +108=0x%08X "
+               "+10C=0x%08X +110=0x%08X +114=0x%08X",
+               cur + 1, a2, static_cast<unsigned>(a3), a4,
+               static_cast<unsigned>(a5), magic, rawcode,
+               (rawcode != 0 ? fc : "----"), idxAtBC, idxAt100, idxAt104,
+               idxAt108, idxAt10C, idxAt110, idxAt114);
+      ::dxvk::Logger::info(buf);
+    }
+  }
+
+  // 命中 idx==3：拒绝。返回 0 模拟"无写入"，不调 trampoline。
+  if constexpr (dxvk::war3::internal::kNativeStaticShadowMaskHideEnabled) {
+    if (maskIdx == 3u) {
+      const uint64_t logIdx = g_writeMaskRegionRejectedIdx3Count.fetch_add(
+          1, std::memory_order_relaxed);
+      if constexpr (dxvk::war3::internal::kNativeStaticShadowMaskHideDebugLog) {
+        if (logIdx < 6u) {
+          uint32_t rawcode = 0;
+          if (a2)
+            ::dxvk::war3::SafeReadU32Fast(a2, 0x30u, rawcode);
+          char fc[5] = {char((rawcode >> 24) & 0xFF),
+                        char((rawcode >> 16) & 0xFF),
+                        char((rawcode >> 8) & 0xFF),
+                        char(rawcode & 0xFF), 0};
+          char buf[200];
+          snprintf(buf, sizeof(buf),
+                   "DXVK War3Hook[Shadow]: STATIC SHADOW REJECT #%llu "
+                   "widget=%p rawcode=0x%08X (%s) maskIdx=%u",
+                   static_cast<unsigned long long>(logIdx + 1u), a2,
+                   static_cast<unsigned int>(rawcode),
+                   (rawcode != 0u ? fc : "----"),
+                   static_cast<unsigned int>(maskIdx));
+          ::dxvk::Logger::info(buf);
+        }
+      }
+      return 0;
+    }
+  }
+
+  // 路径放行：累计语义分桶（极轻），便于后续验证 idx 推断。
+  switch (maskIdx) {
+  case 0u: g_writeMaskRegionPassFogCount.fetch_add(1, std::memory_order_relaxed); break;
+  case 1u: g_writeMaskRegionPassLosCount.fetch_add(1, std::memory_order_relaxed); break;
+  case 2u: g_writeMaskRegionPassPathCount.fetch_add(1, std::memory_order_relaxed); break;
+  default: g_writeMaskRegionPassOtherCount.fetch_add(1, std::memory_order_relaxed); break;
+  }
+
+  if (g_trampolineTerrainShadowWriteMaskRegion)
+    return g_trampolineTerrainShadowWriteMaskRegion(thisPtr, a2, a3, a4, a5);
+  return 0;
+}
+
 } // namespace
+
+// Phase 7.100：跨 TU 暴露的 WriteMaskRegion 诊断 atomic 读取器。
+// 实现放在 anonymous namespace 之内不可见；这里把读取器函数定义在
+// dxvk::war3::hooks 命名空间内，引用 anonymous namespace 内的 atomic。
+// 注意：anonymous namespace 内的 globals 可以被同 TU 的非匿名函数访问。
+uint64_t QueryWriteMaskRegionEnterCount() {
+  return g_writeMaskRegionEnterCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionRejectedIdx3Count() {
+  return g_writeMaskRegionRejectedIdx3Count.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionPassFogCount() {
+  return g_writeMaskRegionPassFogCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionPassLosCount() {
+  return g_writeMaskRegionPassLosCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionPassPathCount() {
+  return g_writeMaskRegionPassPathCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryWriteMaskRegionPassOtherCount() {
+  return g_writeMaskRegionPassOtherCount.load(std::memory_order_relaxed);
+}
+
+// Phase 7.100：跨 TU 暴露的 WriteMaskRegion 诊断 atomic 读取器。
+// 这些函数声明在 dxvk::war3::hooks 命名空间内、anonymous namespace 之外，
+// bridge.cpp 可以直接调用。
+uint64_t QueryWriteMaskRegionEnterCount();
+uint64_t QueryWriteMaskRegionRejectedIdx3Count();
+uint64_t QueryWriteMaskRegionPassFogCount();
+uint64_t QueryWriteMaskRegionPassLosCount();
+uint64_t QueryWriteMaskRegionPassPathCount();
+uint64_t QueryWriteMaskRegionPassOtherCount();
+
+// Phase 7.100：跨 TU 暴露的 WriteMaskRegion 诊断 atomic 读取器。
+// 这些函数声明在 dxvk::war3::hooks 命名空间内、anonymous namespace 之外，
+// bridge.cpp 可以直接调用。
+uint64_t QueryWriteMaskRegionEnterCount();
+uint64_t QueryWriteMaskRegionRejectedIdx3Count();
+uint64_t QueryWriteMaskRegionPassFogCount();
+uint64_t QueryWriteMaskRegionPassLosCount();
+uint64_t QueryWriteMaskRegionPassPathCount();
+uint64_t QueryWriteMaskRegionPassOtherCount();
 
 bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   // 先保存原函数指针与来源地址，再执行分项安装，保证失败时仍可回退。
@@ -902,6 +1071,20 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   } else {
     war3dbg::Print(
         "DXVK War3Hook: 二分诊断态关闭 Shadow/Projector hook 安装\n");
+  }
+
+  // Phase 7.100/7.101: TerrainShadow_WriteMaskRegion hook 安装。
+  // 实测推翻论文 idx==3 推断（详见 war3_internal_test_config.h 注释）。
+  // 当前默认 kNativeStaticShadowMaskHideEnabled=false：装上 hook + 保留
+  // 诊断 counter，但不 reject。装入 gate 单独由 kNativeStaticShadowMaskHookInstall 控制。
+  if constexpr (dxvk::war3::internal::kNativeStaticShadowMaskHookInstall) {
+    if (addrs.terrainShadowWriteMaskRegionAddr != nullptr) {
+      anyInstalled |= InstallMinHook(
+          addrs.terrainShadowWriteMaskRegionAddr,
+          reinterpret_cast<LPVOID>(&Hook_TerrainShadow_WriteMaskRegion),
+          reinterpret_cast<LPVOID *>(&g_trampolineTerrainShadowWriteMaskRegion),
+          "Shadow", "TerrainShadow_WriteMaskRegion", false, true);
+    }
   }
   return anyInstalled;
 }

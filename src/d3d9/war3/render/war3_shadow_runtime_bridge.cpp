@@ -10,6 +10,7 @@
 #include "../core/war3_runtime_profile.h"
 #include "../core/war3_semantic_shadow_gate.h"
 #include "../hooks/war3_hook_render_identity.h"
+#include "../hooks/war3_hook_shadow.h"
 #include "../hooks/war3_hook_widget_identity.h"
 #include "../shadow/war3_shadow_native_runtime.h"
 #include "../shadow/war3_shadow_runtime_contract.h"
@@ -4216,6 +4217,19 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
           g_shadowSceneStats
               .semanticSceneRejectedPathBlockerLegacyCaptureCount;
     }
+    // Phase 7.100：WriteMaskRegion 静态阴影治理统计。
+    summary.writeMaskRegionEnterCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionEnterCount();
+    summary.writeMaskRegionRejectedIdx3Count =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionRejectedIdx3Count();
+    summary.writeMaskRegionPassFogCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionPassFogCount();
+    summary.writeMaskRegionPassLosCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionPassLosCount();
+    summary.writeMaskRegionPassPathCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionPassPathCount();
+    summary.writeMaskRegionPassOtherCount =
+        ::dxvk::war3::hooks::QueryWriteMaskRegionPassOtherCount();
   }
   // Phase 7.97 诊断：直接拉 atomic getter，反映最近一次 ManifestCopy 真实
   // 遍历情况（不受 sameFrameDataNotGrowing publish 早退掩盖）。

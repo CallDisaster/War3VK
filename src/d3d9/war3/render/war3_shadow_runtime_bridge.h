@@ -423,6 +423,13 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneRejectedPathBlockerProducerCount = 0;
   uint64_t semanticSceneRejectedPathBlockerStaticSupplementCount = 0;
   uint64_t semanticSceneRejectedPathBlockerLegacyCaptureCount = 0;
+  // Phase 7.100：建筑/装饰物静态阴影 mask 写入拦截统计。
+  uint64_t writeMaskRegionEnterCount = 0;
+  uint64_t writeMaskRegionRejectedIdx3Count = 0;
+  uint64_t writeMaskRegionPassFogCount = 0;
+  uint64_t writeMaskRegionPassLosCount = 0;
+  uint64_t writeMaskRegionPassPathCount = 0;
+  uint64_t writeMaskRegionPassOtherCount = 0;
   // Phase 7.97 诊断：ManifestCopy 路径实际处理了多少 visible record
   // 与最终 push 进 manifest 的数量。bridge 透传到 control plane，配合
   // perf 报告里的 ManifestCopy avgCpuMs，能量化"per-record 成本 = 总 ms / scan 数"。

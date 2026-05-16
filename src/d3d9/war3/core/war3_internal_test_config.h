@@ -981,6 +981,24 @@ inline constexpr uint32_t kShadowRunStatsLogIntervalFrames = 300;
 // ========================================================================
 inline bool kPathBlockerDebugEnabled = false; // 启用诊断日志
 inline bool kPathBlockerHideEnabled = true;   // 隐藏路径阻断器渲染
+
+// Phase 7.100：建筑/装饰物静态阴影治理。
+// 论文 §7.1 推断 hook TerrainShadow_WriteMaskRegion (0x234710) + 拦截
+// maskIdx==3 即可干净屏蔽。但 Phase 7.101 实测推翻：
+//   1) 6300/30s 次 fire 中所有样本 a2 的 magic 不是 0x2B5DB42C，说明 a2 不是
+//      CWidget instance；
+//   2) 8 个 WMR_DUMP 样本里 a2+0x10C 低 16 位都是 6/7/9，没有出现 0/1/2/3；
+//   3) 这条函数实际是 fog/LOS/path 三套 mask grid 的 *形状* 写入，不是
+//      建筑预渲染贴花阴影（uberSplat / buildingShadow 路径在
+//      CTerrainUberSplats.cpp，不走 mask grid）。
+// 因此 WriteMaskRegion 在 Phase 7.101 改为只装 hook 和保留诊断 counter，
+// 不再 reject 任何东西。建筑/装饰物静态阴影屏蔽改走 D3D9 draw call 层
+// （已有 path blocker reject 链），下一阶段补 alpha-blend 贴花纹理识别。
+inline constexpr bool kNativeStaticShadowMaskHideEnabled = false;
+// 调试日志：保留前几次 fire 的 WMR_DUMP，便于后续验证 a2 真实结构。
+inline constexpr bool kNativeStaticShadowMaskHideDebugLog = false;
+// 安装 hook 但不 reject（仅诊断，0 行为代价）。Phase 7.101 默认开。
+inline constexpr bool kNativeStaticShadowMaskHookInstall = true;
 // 开启路径阻断器隐藏时，是否强制开启桥接追踪（确保 ShadowCapture 能拿到 rawcode）。
 inline constexpr bool kPathBlockerForceBridgeTrackingEnabled = false;
 // “仅路径阻断器追踪”模式下的组掩码（bit0=group0, bit1=group1 ...）。

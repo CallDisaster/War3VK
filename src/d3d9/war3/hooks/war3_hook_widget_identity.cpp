@@ -410,6 +410,68 @@ uint32_t QueryWidgetRawcodeByHandle(uint32_t jHandle) {
   return ptrIt->second.rawcode;
 }
 
+void NoteWidgetIdentityFromDrawcall(
+    void* widgetPtr,
+    uint32_t rawcode,
+    uint32_t jHandle) {
+  // Phase 7.101 write-through：D3D9 draw call 路径已经直读 magic + rawcode 验证，
+  // 把结果写回 widget cache，下次同 widgetPtr/jHandle 直接 O(1) 命中。
+  // 与 ProcessWidgetRegister 的 cache 复用同一份 std::shared_mutex / unordered_map。
+  if (widgetPtr == nullptr || rawcode == 0)
+    return;
+  if (!WidgetIdentityHookEnabled())
+    return;
+
+  // Quick read-only probe: 已存在且 rawcode/jHandle 一致就跳过 unique_lock。
+  {
+    std::shared_lock<std::shared_mutex> rl(cache().mutex);
+    auto it = cache().byPtr.find(widgetPtr);
+    if (it != cache().byPtr.end()) {
+      const auto& rec = it->second;
+      if (rec.rawcode == rawcode && (jHandle == 0 || rec.jHandle == jHandle)) {
+        it->second.hitCount.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+  }
+
+  WidgetIdentityRecord rec;
+  rec.widgetPtr = widgetPtr;
+  rec.rawcode = rawcode;
+  rec.jHandle = jHandle;
+  rec.handleId = (jHandle != 0u) ? (jHandle & ~0x100000u) : 0u;
+  rec.agentPtr = nullptr;
+  rec.agentType = 0;
+  rec.kind = dxvk::war3::render::ObjectKind::Unknown;
+
+  std::unique_lock<std::shared_mutex> wl(cache().mutex);
+  auto it = cache().byPtr.find(widgetPtr);
+  if (it == cache().byPtr.end()) {
+    auto [insertedIt, inserted] =
+        cache().byPtr.emplace(widgetPtr, std::move(rec));
+    if (inserted) {
+      stats().cacheInsertCount.fetch_add(1, std::memory_order_relaxed);
+      if (jHandle != 0u)
+        cache().byHandle[jHandle] = widgetPtr;
+    }
+  } else {
+    auto& existing = it->second;
+    bool changed = false;
+    if (existing.rawcode != rawcode) {
+      existing.rawcode = rawcode;
+      changed = true;
+    }
+    if (jHandle != 0u && existing.jHandle != jHandle) {
+      existing.jHandle = jHandle;
+      existing.handleId = jHandle & ~0x100000u;
+      cache().byHandle[jHandle] = widgetPtr;
+      changed = true;
+    }
+    if (changed)
+      stats().cacheUpdateCount.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 uint64_t GetWidgetIdentityCacheSize() {
   std::shared_lock<std::shared_mutex> rl(cache().mutex);
   return cache().byPtr.size();

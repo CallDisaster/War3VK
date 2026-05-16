@@ -123,6 +123,14 @@ struct War3HookAddressBook {
   // 抓取 widget 身份链（rawcode + jHandle），喂给 RenderObjectRegistry 兜底。
   uintptr_t widgetRegisterFootprintAndShadowMask = 0;  // 0x65A140
 
+  // Phase 7.100：TerrainShadow_WriteMaskRegion 是 War3 1.27a 静态阴影
+  // (建筑/可破坏物的预渲染贴花阴影) 的真正写入函数。所有 30+ 个 mask 写入
+  // 路径都汇聚到这里。详细论证见
+  // docs/plan/overnight_render_paper_2026_05_15/06_fogmask_static_shadow.md §7.1。
+  // hook 后按 maskIdx == 3 (shadow footprint) 拒绝即可干净屏蔽建筑阴影，
+  // 不影响 fog/LOS/path 这三个共享 mask grid 的子系统。
+  uintptr_t terrainShadowWriteMaskRegion = 0;  // 0x234710
+
   // -------------------------------------------------------------------------
   // RenderQueue 数据区
   // -------------------------------------------------------------------------

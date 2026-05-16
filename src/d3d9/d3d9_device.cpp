@@ -9706,6 +9706,46 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         }
       }
     }
+    // Phase 7.100/7.101 终极兜底：先查 widget identity cache，再 fallback 到
+    // unitPtr+0x0C(magic) + +0x30(rawcode) 直读。
+    //
+    // destructible / path blocker 不进 Hook_WorldObjects_RenderGroup，
+    // RenderObjectRegistry::findByHandle 永远 miss；widget hook 在 lifecycle
+    // 早期 fire 时由于 calling convention 问题，magicMatchedCount 长期为 0，
+    // cache 早期为空。Phase 7.101 改进：
+    //   1) 先 O(1) 查 widget cache（如果别的 path 已经 NoteWidgetIdentityFromDrawcall，
+    //      直接命中）；
+    //   2) miss 才走 SafeReadU32Fast 直读 widget+0x0C / +0x30；
+    //   3) 直读成功后 write-through 写回 widget cache，下次 O(1) 命中。
+    if (!blocked && packet.renderable.unitPtr != nullptr) {
+      const uint32_t cachedRawcode =
+          dxvk::war3::hooks::QueryWidgetRawcodeByPtr(packet.renderable.unitPtr);
+      if (cachedRawcode != 0u) {
+        if (IsLosBlockerFourCc(cachedRawcode)) {
+          blocked = true;
+          blockedByJHandle = true;
+        }
+      } else {
+        uint32_t magic = 0;
+        if (dxvk::war3::SafeReadU32Fast(packet.renderable.unitPtr, 0x0Cu,
+                                        magic) &&
+            magic == 0x2B5DB42Cu) {
+          uint32_t rawcode = 0;
+          if (dxvk::war3::SafeReadU32Fast(packet.renderable.unitPtr, 0x30u,
+                                          rawcode) &&
+              rawcode != 0u) {
+            // Write-through：让 widget cache 接管之后的 O(1) 查询。
+            dxvk::war3::hooks::NoteWidgetIdentityFromDrawcall(
+                packet.renderable.unitPtr, rawcode,
+                packet.renderable.jHandle);
+            if (IsLosBlockerFourCc(rawcode)) {
+              blocked = true;
+              blockedByJHandle = true;
+            }
+          }
+        }
+      }
+    }
     if (blocked) {
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
       if (blockedByJHandle) {

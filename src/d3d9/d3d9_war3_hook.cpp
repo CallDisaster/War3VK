@@ -620,6 +620,10 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
     shadowHooks.shadowPathStaticStampToggleAddr =
         resolveCode(book.shadowPathStaticStampToggle,
                     "ShadowPath_StaticStamp_Toggle");
+    // Phase 7.100：静态阴影 mask grid 写入函数。
+    shadowHooks.terrainShadowWriteMaskRegionAddr =
+        resolveCode(book.terrainShadowWriteMaskRegion,
+                    "TerrainShadow_WriteMaskRegion");
     dxvk::war3::hooks::InstallShadowHooks(shadowHooks);
 
     // Phase 7.98：CWidget 身份链中央 sync Hook。

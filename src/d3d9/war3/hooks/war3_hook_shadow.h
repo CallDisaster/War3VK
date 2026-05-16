@@ -96,6 +96,12 @@ struct ShadowHookAddresses {
   LPVOID shadowRegisterRetMarkOcclusionAddr = nullptr;         // 0x76D5A4
   LPVOID shadowRegisterRetFromPointAddr = nullptr;             // 0x76D69A
   LPVOID shadowRegisterRetFromTwoPointsAddr = nullptr;         // 0x76D719
+
+  /** @brief Phase 7.100: TerrainShadow_WriteMaskRegion (静态阴影治理方案 A)。
+   * 30+ 写入路径的最终汇聚点，hook 后按 maskIdx==3 拒绝可干净屏蔽建筑/装饰物
+   * 静态阴影，不影响 fog/LOS/path。详见
+   * docs/plan/overnight_render_paper_2026_05_15/06_fogmask_static_shadow.md §7.1。 */
+  LPVOID terrainShadowWriteMaskRegionAddr = nullptr;           // 0x234710
 };
 
 /**
@@ -106,5 +112,13 @@ struct ShadowHookAddresses {
  * @warning 调用方必须确保地址已完成版本校验与可执行性检查。
  */
 bool InstallShadowHooks(const ShadowHookAddresses &addrs);
+
+// Phase 7.100：WriteMaskRegion 诊断计数器（control plane 透传用）。
+uint64_t QueryWriteMaskRegionEnterCount();
+uint64_t QueryWriteMaskRegionRejectedIdx3Count();
+uint64_t QueryWriteMaskRegionPassFogCount();
+uint64_t QueryWriteMaskRegionPassLosCount();
+uint64_t QueryWriteMaskRegionPassPathCount();
+uint64_t QueryWriteMaskRegionPassOtherCount();
 
 } // namespace dxvk::war3::hooks

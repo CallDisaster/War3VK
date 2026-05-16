@@ -54,6 +54,16 @@ bool QueryWidgetIdentityByHandle(
 uint32_t QueryWidgetRawcodeByPtr(void* widgetPtr);
 uint32_t QueryWidgetRawcodeByHandle(uint32_t jHandle);
 
+// Phase 7.101 write-through cache：从 D3D9 draw call 路径已经验证过 magic
+// 并直读到 rawcode 后调用本接口写入 cache，下次同 widgetPtr/jHandle 即可
+// O(1) 命中、避免重复 SafeRead。线程安全（unique_lock）。
+// 当 widgetPtr/rawcode 为空或新值与已有不一致时直接覆盖（widget 在 War3
+// 1.27a 上不会复用指针 + rawcode 不变更，参见论文第 6 章）。
+void NoteWidgetIdentityFromDrawcall(
+    void* widgetPtr,
+    uint32_t rawcode,
+    uint32_t jHandle);
+
 // Diagnostics.
 uint64_t GetWidgetIdentityCacheSize();
 
