@@ -1078,20 +1078,48 @@ inline constexpr uint32_t kNativeShadowBlockedUbersplatKeyCount =
     sizeof(kNativeShadowBlockedUbersplatKeys) /
     sizeof(kNativeShadowBlockedUbersplatKeys[0]);
 
-// 需要拦截的四字码（LOS 阻断器等）
-// 注意：运行时会做第二字符大小写归一化
-inline constexpr uint32_t kNativeShadowBlockedFourCCs[] = {
-    0x59546162u, // 'YTab'
-    0x59546163u, // 'YTac'
-    0x59547062u, // 'YTpb'
-    0x59547063u, // 'YTpc'
-    0x59546662u, // 'YTfb'
-    0x59546663u, // 'YTfc'
-    0x59546C62u, // 'YTlb'
-    0x59546C63u, // 'YTlc'
+// ============================================================================
+// 路径阻断器统一黑名单（Phase 7.110）
+// ============================================================================
+// 这是项目里"path blocker / 视野阻断器"屏蔽的**唯一权威**配置。两条独立链路
+// 都从这里读：
+//   1) D3D9 mesh draw 拦截：d3d9_device.cpp::IsLosBlockerFourCc
+//      作用于 War3TryCaptureShadowCaster EarlyBypass + 9 个 producer/consumer。
+//      目前你看到的 path blocker 拦截全部由这条覆盖。
+//   2) Game.dll ShadowProjector 拦截：war3_hook_shadow.cpp::Hook_ShadowProjector_Add_FromObject
+//      只在 War3 自己的 CTerrainUberSplats（贴花阴影）系统调用时生效。
+//      实测在大多数地图上 enterCount=0，是兜底，不是主路径。
+//
+// 两条链路都做"第二字符大小写归一化"（兼容 YTlc / Ytlc 等编辑器输出差异）以及
+// 编辑器顺序 vs 内存顺序的字节序识别，所以这里**只填编辑器显示的 fourcc 字符**
+// 即可，运行时自动归一化。
+//
+// 编辑器原值（"path blocker" 8 个 + 用户实测命中的伪装 model）：
+//   YTab YTac YTpb YTpc YTfb YTfc YTlb YTlc
+//
+// 注意 — 用户在编辑器看到的 path blocker 实例可能"借用装饰物 model 当外观"，
+// 这种情况下命中的 fourcc 不是 YT* 而是被借用的装饰物自身（如 LT* 树木系列）。
+// 该问题属于地图数据层伪装，不属于这里的"path blocker 黑名单"语义；要拦
+// 这种情况应该在地图编辑器修正数据，或者用更上层的"光线传播阻断器命中检测"
+// 而不是在这里塞所有可能被借用的装饰物 fourcc。
+inline constexpr uint32_t kPathBlockerFourCCs[] = {
+    0x59546162u, // 'YTab' - 路径阻断器(空)
+    0x59546163u, // 'YTac' - 路径阻断器(空)(大)
+    0x59547062u, // 'YTpb' - 路径阻断器(陆)
+    0x59547063u, // 'YTpc' - 路径阻断器(陆)(大)
+    0x59546662u, // 'YTfb' - 路径阻断器(全部)
+    0x59546663u, // 'YTfc' - 路径阻断器(全部)(大)
+    0x59546C62u, // 'YTlb' - 视野阻断器
+    0x59546C63u, // 'YTlc' - 视野阻断器(大)
 };
+inline constexpr uint32_t kPathBlockerFourCCsCount =
+    sizeof(kPathBlockerFourCCs) / sizeof(kPathBlockerFourCCs[0]);
+
+// 兼容旧名字（Phase 7.108 之前 Hook_ShadowProjector 使用的别名）。
+// 新代码统一用 kPathBlockerFourCCs；旧引用通过 alias 指向同一份数据。
+inline constexpr const uint32_t* kNativeShadowBlockedFourCCs = kPathBlockerFourCCs;
 inline constexpr uint32_t kNativeShadowBlockedFourCCsCount =
-    sizeof(kNativeShadowBlockedFourCCs) / sizeof(kNativeShadowBlockedFourCCs[0]);
+    kPathBlockerFourCCsCount;
 
 // ========================================================================
 // 阴影更新链路拦截（Shadow_UpdateList_Run / Shadow_UpdateEntry_Write）

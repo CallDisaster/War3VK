@@ -4301,20 +4301,22 @@ inline uint32_t NormalizeFourCcEditorOrder(uint32_t rawcode) {
 }
 
 inline bool IsLosBlockerFourCc(uint32_t rawcode) {
-  const uint32_t fourcc = NormalizeFourCcEditorOrder(rawcode);
-  switch (fourcc) {
-  case PackFourCcEditor('Y', 'T', 'a', 'b'):
-  case PackFourCcEditor('Y', 'T', 'a', 'c'):
-  case PackFourCcEditor('Y', 'T', 'p', 'b'):
-  case PackFourCcEditor('Y', 'T', 'p', 'c'):
-  case PackFourCcEditor('Y', 'T', 'f', 'b'):
-  case PackFourCcEditor('Y', 'T', 'f', 'c'):
-  case PackFourCcEditor('Y', 'T', 'l', 'b'):
-  case PackFourCcEditor('Y', 'T', 'l', 'c'):
-    return true;
-  default:
+  if (rawcode == 0u)
     return false;
+
+  // Phase 7.110：单一权威黑名单。所有 path blocker 拦截链路都读
+  // war3_internal_test_config.h::kPathBlockerFourCCs，避免历史包袱里
+  // d3d9_device.cpp 与 ShadowProjector hook 各维护一份的语义漂移。
+  //
+  // 归一化策略：编辑器顺序 vs 内存顺序双向尝试，第二字符大小写归一化，
+  // 与 NormalizeFourCcEditorOrder 保持一致。
+  const uint32_t normalized = NormalizeFourCcEditorOrder(rawcode);
+  for (uint32_t i = 0u;
+       i < dxvk::war3::internal::kPathBlockerFourCCsCount; ++i) {
+    if (normalized == dxvk::war3::internal::kPathBlockerFourCCs[i])
+      return true;
   }
+  return false;
 }
 
 inline bool War3ShadowIsLosBlocker(
