@@ -430,6 +430,26 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t writeMaskRegionPassLosCount = 0;
   uint64_t writeMaskRegionPassPathCount = 0;
   uint64_t writeMaskRegionPassOtherCount = 0;
+
+  // Phase 7.108：ShadowProjector 永久 atomic 计数（独立于 D3D9 mesh draw 路径）。
+  uint64_t projectorAddFromObjectEnterCount = 0;
+  uint64_t projectorAddFromObjectBlockedCount = 0;
+  uint64_t projectorAddFromObjectFourCCExtractedCount = 0;
+  uint64_t projectorAddFromObjectFourCCMissCount = 0;
+  uint64_t projectorAddFromObjectBlockedFourCCCount = 0;
+  uint64_t projectorAddSimpleEnterCount = 0;
+  uint64_t projectorAddSimpleBlockedCount = 0;
+  // 前 8 个 unique observed / blocked fourcc。
+  uint32_t projectorObservedFourCCSamples[8] = {};
+  uint32_t projectorBlockedFourCCSamples[8] = {};
+
+  // Phase 7.108b：Shadow caster append survey — 实际进入 shadowCasters 的 rawcode 分布。
+  // 用于直接验证：是否有 path blocker 的 fourcc 还能漏到 caster 集合里（绕开
+  // 9 个拦截点）。如果用户实机仍看到阴影但这里没有 path blocker fourcc，
+  // 那 path blocker 阴影就**不来自我们的 CSM caster 集合**。
+  uint32_t shadowAppendRawcodeSamples[16] = {};
+  uint64_t shadowAppendRawcodeUniqueCount = 0;
+  uint64_t shadowAppendTotalCount = 0;
   // Phase 7.97 诊断：ManifestCopy 路径实际处理了多少 visible record
   // 与最终 push 进 manifest 的数量。bridge 透传到 control plane，配合
   // perf 报告里的 ManifestCopy avgCpuMs，能量化"per-record 成本 = 总 ms / scan 数"。

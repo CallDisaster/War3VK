@@ -147,6 +147,54 @@ void War3ForceImmediatePresent(D3DPRESENT_PARAMETERS *params) {
     params->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
+// Phase 7.108b：Shadow append survey — 实际进入 shadowCasters 的 rawcode 分布。
+// 用于直接验证：path blocker 拦截后是否还有漏网到 caster 集合。
+// 不做拦截动作，只观察。
+std::array<std::atomic<uint32_t>, 16> g_shadowAppendRawcodeSamples{};
+std::atomic<uint64_t> g_shadowAppendRawcodeUniqueCount{0};
+std::atomic<uint64_t> g_shadowAppendTotalCount{0};
+
+inline void NoteShadowAppendRawcode(uint32_t rawcode) {
+  g_shadowAppendTotalCount.fetch_add(1, std::memory_order_relaxed);
+  if (rawcode == 0u)
+    return;
+  uint32_t freeSlot = 16u;
+  for (uint32_t i = 0u; i < 16u; ++i) {
+    const uint32_t cur =
+        g_shadowAppendRawcodeSamples[i].load(std::memory_order_relaxed);
+    if (cur == rawcode)
+      return;
+    if (cur == 0u && freeSlot == 16u)
+      freeSlot = i;
+  }
+  if (freeSlot < 16u) {
+    uint32_t expected = 0u;
+    if (g_shadowAppendRawcodeSamples[freeSlot].compare_exchange_strong(
+            expected, rawcode, std::memory_order_relaxed)) {
+      g_shadowAppendRawcodeUniqueCount.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+  }
+}
+
+} // namespace
+
+namespace war3_diag {
+uint64_t QueryShadowAppendTotal() {
+  return g_shadowAppendTotalCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowAppendUnique() {
+  return g_shadowAppendRawcodeUniqueCount.load(std::memory_order_relaxed);
+}
+uint32_t QueryShadowAppendRawcodeAt(uint32_t idx) {
+  if (idx >= g_shadowAppendRawcodeSamples.size())
+    return 0u;
+  return g_shadowAppendRawcodeSamples[idx].load(std::memory_order_relaxed);
+}
+} // namespace war3_diag
+
+namespace {
+
 uint32_t War3GetEnvU32(const char *name, uint32_t fallback) {
   const std::string v = env::getEnvVar(name);
   if (v.empty())
@@ -11800,10 +11848,10 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
 
   m_war3Scene.shadowInstances.emplace_back(std::move(instance));
   m_war3Scene.shadowCasters.emplace_back(std::move(draw));
+  // Phase 7.108b：记录实际 append 进 caster 的 rawcode 分布。
+  // path blocker 不应该出现在这里——如果出现了，说明拦截链路有漏。
+  NoteShadowAppendRawcode(packet.renderable.rawcode);
   // Phase 7.2: 记录实际 append 时的 geometry key 和 identity 用于诊断
-  m_war3Scene.shadowStats.semanticSceneLastAppendedGeometrySourceHash =
-      key.sourceHash;
-  m_war3Scene.shadowStats.semanticSceneLastAppendedGeometryId = geometryId;
   m_war3Scene.shadowStats.semanticSceneLastAppendedRenderablePart =
       reinterpret_cast<uint64_t>(packet.renderable.renderablePart);
   m_war3Scene.shadowStats.semanticSceneLastAppendedMeshData =
@@ -12315,6 +12363,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
 
     m_war3Scene.shadowInstances.emplace_back(std::move(instance));
     m_war3Scene.shadowCasters.emplace_back(std::move(draw));
+    // Phase 7.108b：survey rawcode（draw-time producer 路径）。
+    NoteShadowAppendRawcode(entry.rawcode);
     m_war3Scene.shadowStats.semanticSceneSubmitted++;
     m_war3Scene.shadowStats.semanticSceneSubmittedUnit++;
     m_war3Scene.shadowStats.semanticSceneSubmittedSkinned++;
@@ -13825,6 +13875,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
     m_war3Scene.shadowInstances.emplace_back(std::move(instance));
     m_war3Scene.shadowCasters.emplace_back(std::move(draw));
+    // Phase 7.108b：survey rawcode（fast-append 路径）。
+    NoteShadowAppendRawcode(eligible.packet.renderable.rawcode != 0u
+                                ? eligible.packet.renderable.rawcode
+                                : entry.rawcode);
     m_war3Scene.shadowStats.captured++;
     if (entry.indexed)
       m_war3Scene.shadowStats.capturedIndexed++;

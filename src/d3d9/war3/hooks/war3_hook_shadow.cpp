@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <unordered_set>
 
 #include "../../../util/log/log.h"
@@ -69,6 +70,22 @@ ShadowPathStaticStampToggleFn g_trampolineShadowPathStaticStampToggle = nullptr;
 uintptr_t g_shadowPathObjectProjectorRuntimeAddr = 0;
 uintptr_t g_shadowPathObjectProjectorJassBridgeAddr = 0;
 uintptr_t g_shadowProjectorSimpleBridgeAddr = 0;
+
+// Phase 7.108：ShadowProjector 永久 atomic 计数器。
+// 这条路径独立于 D3D9 mesh draw（CTerrainUberSplats 系统），
+// 必须永久计数才能在不开 verbose 编译期开关时也判断
+// path blocker 是否走这条路径。
+std::atomic<uint64_t> g_projectorAddFromObjectEnterCount{0};
+std::atomic<uint64_t> g_projectorAddFromObjectBlockedCount{0};
+std::atomic<uint64_t> g_projectorAddFromObjectFourCCExtractedCount{0};
+std::atomic<uint64_t> g_projectorAddFromObjectFourCCMissCount{0};
+std::atomic<uint64_t> g_projectorAddFromObjectBlockedFourCCCount{0};
+std::atomic<uint64_t> g_projectorAddSimpleEnterCount{0};
+std::atomic<uint64_t> g_projectorAddSimpleBlockedCount{0};
+
+// 环形采样：被 reject 的 fourcc 与近期 observed fourcc（前 8 个 unique）。
+std::array<std::atomic<uint32_t>, 8> g_projectorBlockedFourCCSamples{};
+std::array<std::atomic<uint32_t>, 8> g_projectorObservedFourCCSamples{};
 
 // 获取 Game.dll 基址，供回调 RVA 统计与路径识别使用。
 uintptr_t GetGameDllBase() {
@@ -598,9 +615,13 @@ int __fastcall Hook_ShadowProjector_Add_FromObject(void *a1, void *a2,
   // 1) 识别调用来源（Runtime/JassBridge）；
   // 2) 采样 key；
   // 3) 执行 key/FourCC 规则拦截。
-  const bool needsFourCCInspection =
-      dxvk::war3::internal::kNativeShadowProjectorFourCCFilterEnabled ||
-      dxvk::war3::internal::kNativeShadowProjectorVerboseLogging;
+
+  // Phase 7.108：永久计数本 hook enter 数。
+  g_projectorAddFromObjectEnterCount.fetch_add(1, std::memory_order_relaxed);
+
+  // FourCC 检查路径无条件启用（轻量，只读 +0x30 一次），用于诊断
+  // path blocker 的真实路径。
+  const bool needsFourCCInspection = true;
   const bool needsSourcePath =
       dxvk::war3::internal::kNativeShadowBlockProjectorFromObjectEnabled ||
       dxvk::war3::internal::kNativeShadowBlockProjectorFromAltEnabled ||
@@ -685,6 +706,54 @@ int __fastcall Hook_ShadowProjector_Add_FromObject(void *a1, void *a2,
     }
   }
 
+  // Phase 7.108：无条件累加诊断 counter，记录 path blocker 究竟走没走这条路径。
+  if (arg0FourCC != 0u) {
+    g_projectorAddFromObjectFourCCExtractedCount.fetch_add(
+        1, std::memory_order_relaxed);
+    // 环形采样 observed fourcc（前 8 个 unique）。
+    bool seen = false;
+    uint32_t freeSlot = 8u;
+    for (uint32_t i = 0u; i < 8u; ++i) {
+      const uint32_t cur =
+          g_projectorObservedFourCCSamples[i].load(std::memory_order_relaxed);
+      if (cur == arg0FourCC) {
+        seen = true;
+        break;
+      }
+      if (cur == 0u && freeSlot == 8u)
+        freeSlot = i;
+    }
+    if (!seen && freeSlot < 8u) {
+      uint32_t expected = 0u;
+      g_projectorObservedFourCCSamples[freeSlot].compare_exchange_strong(
+          expected, arg0FourCC, std::memory_order_relaxed);
+    }
+  } else if (arg0 != nullptr) {
+    g_projectorAddFromObjectFourCCMissCount.fetch_add(
+        1, std::memory_order_relaxed);
+  }
+  if (blocked && reason && std::strcmp(reason, "BlockedFourCC") == 0) {
+    g_projectorAddFromObjectBlockedFourCCCount.fetch_add(
+        1, std::memory_order_relaxed);
+    bool seen = false;
+    uint32_t freeSlot = 8u;
+    for (uint32_t i = 0u; i < 8u; ++i) {
+      const uint32_t cur =
+          g_projectorBlockedFourCCSamples[i].load(std::memory_order_relaxed);
+      if (cur == arg0FourCC) {
+        seen = true;
+        break;
+      }
+      if (cur == 0u && freeSlot == 8u)
+        freeSlot = i;
+    }
+    if (!seen && freeSlot < 8u) {
+      uint32_t expected = 0u;
+      g_projectorBlockedFourCCSamples[freeSlot].compare_exchange_strong(
+          expected, arg0FourCC, std::memory_order_relaxed);
+    }
+  }
+
   if constexpr (dxvk::war3::internal::kNativeShadowProjectorVerboseLogging) {
     static std::atomic<uint32_t> s_logCount{0};
     const uint32_t n = s_logCount.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -718,6 +787,7 @@ int __fastcall Hook_ShadowProjector_Add_FromObject(void *a1, void *a2,
   }
 
   if (blocked) {
+    g_projectorAddFromObjectBlockedCount.fetch_add(1, std::memory_order_relaxed);
     if constexpr (dxvk::war3::internal::kNativeShadowProjectorStatsLogging)
       s_blocked.fetch_add(1, std::memory_order_relaxed);
     return -1;
@@ -730,6 +800,10 @@ int __fastcall Hook_ShadowProjector_Add_Simple(void *a1, void *a2, int arg0,
                                                int arg1, int arg2, int arg3,
                                                int arg4, int arg5, int arg6) {
   // Add_Simple 覆盖 FromObject 之外的投影链路，作为静态阴影补充拦截点。
+
+  // Phase 7.108：永久计数。
+  g_projectorAddSimpleEnterCount.fetch_add(1, std::memory_order_relaxed);
+
   const bool needsSourcePath =
       dxvk::war3::internal::kNativeShadowProjectorVerboseLogging ||
       dxvk::war3::internal::kNativeShadowProjectorStatsLogging ||
@@ -804,6 +878,7 @@ int __fastcall Hook_ShadowProjector_Add_Simple(void *a1, void *a2, int arg0,
   }
 
   if (blocked) {
+    g_projectorAddSimpleBlockedCount.fetch_add(1, std::memory_order_relaxed);
     if constexpr (dxvk::war3::internal::kNativeShadowProjectorStatsLogging)
       s_blocked.fetch_add(1, std::memory_order_relaxed);
     return -1;
@@ -838,6 +913,11 @@ std::atomic<uint64_t> g_writeMaskRegionPassFogCount{0};   // idx==0
 std::atomic<uint64_t> g_writeMaskRegionPassLosCount{0};   // idx==1
 std::atomic<uint64_t> g_writeMaskRegionPassPathCount{0};  // idx==2
 std::atomic<uint64_t> g_writeMaskRegionPassOtherCount{0};
+
+// Phase 7.108：ShadowProjector 永久 atomic 计数器。
+// 这条路径独立于 D3D9 mesh draw（CTerrainUberSplats 系统），
+// 必须永久计数才能在不开 verbose 编译期开关时也判断
+// path blocker 是否走这条路径。
 
 int __thiscall Hook_TerrainShadow_WriteMaskRegion(void *thisPtr, void *a2,
                                                    int a3, void *a4, int a5) {
@@ -958,6 +1038,42 @@ uint64_t QueryWriteMaskRegionPassPathCount() {
 }
 uint64_t QueryWriteMaskRegionPassOtherCount() {
   return g_writeMaskRegionPassOtherCount.load(std::memory_order_relaxed);
+}
+
+// Phase 7.108：ShadowProjector 永久 atomic 读取器。
+uint64_t QueryShadowProjectorAddFromObjectEnterCount() {
+  return g_projectorAddFromObjectEnterCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowProjectorAddFromObjectBlockedCount() {
+  return g_projectorAddFromObjectBlockedCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowProjectorAddFromObjectFourCCExtractedCount() {
+  return g_projectorAddFromObjectFourCCExtractedCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryShadowProjectorAddFromObjectFourCCMissCount() {
+  return g_projectorAddFromObjectFourCCMissCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryShadowProjectorAddFromObjectBlockedFourCCCount() {
+  return g_projectorAddFromObjectBlockedFourCCCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryShadowProjectorAddSimpleEnterCount() {
+  return g_projectorAddSimpleEnterCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryShadowProjectorAddSimpleBlockedCount() {
+  return g_projectorAddSimpleBlockedCount.load(std::memory_order_relaxed);
+}
+uint32_t QueryShadowProjectorBlockedFourCCSampleAt(uint32_t idx) {
+  if (idx >= g_projectorBlockedFourCCSamples.size())
+    return 0u;
+  return g_projectorBlockedFourCCSamples[idx].load(std::memory_order_relaxed);
+}
+uint32_t QueryShadowProjectorObservedFourCCSampleAt(uint32_t idx) {
+  if (idx >= g_projectorObservedFourCCSamples.size())
+    return 0u;
+  return g_projectorObservedFourCCSamples[idx].load(std::memory_order_relaxed);
 }
 
 // Phase 7.100：跨 TU 暴露的 WriteMaskRegion 诊断 atomic 读取器。

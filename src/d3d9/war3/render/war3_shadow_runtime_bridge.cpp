@@ -47,6 +47,13 @@
 #undef max
 #endif
 
+// Phase 7.108b：shadow append survey 在 d3d9_device.cpp 实现。
+namespace dxvk::war3_diag {
+  uint64_t QueryShadowAppendTotal();
+  uint64_t QueryShadowAppendUnique();
+  uint32_t QueryShadowAppendRawcodeAt(uint32_t idx);
+}
+
 namespace dxvk::war3::render {
 
 namespace {
@@ -4230,6 +4237,36 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         ::dxvk::war3::hooks::QueryWriteMaskRegionPassPathCount();
     summary.writeMaskRegionPassOtherCount =
         ::dxvk::war3::hooks::QueryWriteMaskRegionPassOtherCount();
+    // Phase 7.108：ShadowProjector 永久统计。
+    summary.projectorAddFromObjectEnterCount =
+        ::dxvk::war3::hooks::QueryShadowProjectorAddFromObjectEnterCount();
+    summary.projectorAddFromObjectBlockedCount =
+        ::dxvk::war3::hooks::QueryShadowProjectorAddFromObjectBlockedCount();
+    summary.projectorAddFromObjectFourCCExtractedCount =
+        ::dxvk::war3::hooks::QueryShadowProjectorAddFromObjectFourCCExtractedCount();
+    summary.projectorAddFromObjectFourCCMissCount =
+        ::dxvk::war3::hooks::QueryShadowProjectorAddFromObjectFourCCMissCount();
+    summary.projectorAddFromObjectBlockedFourCCCount =
+        ::dxvk::war3::hooks::QueryShadowProjectorAddFromObjectBlockedFourCCCount();
+    summary.projectorAddSimpleEnterCount =
+        ::dxvk::war3::hooks::QueryShadowProjectorAddSimpleEnterCount();
+    summary.projectorAddSimpleBlockedCount =
+        ::dxvk::war3::hooks::QueryShadowProjectorAddSimpleBlockedCount();
+    for (uint32_t i = 0u; i < 8u; ++i) {
+      summary.projectorObservedFourCCSamples[i] =
+          ::dxvk::war3::hooks::QueryShadowProjectorObservedFourCCSampleAt(i);
+      summary.projectorBlockedFourCCSamples[i] =
+          ::dxvk::war3::hooks::QueryShadowProjectorBlockedFourCCSampleAt(i);
+    }
+    // Phase 7.108b：shadowCasters append survey。
+    summary.shadowAppendTotalCount =
+        ::dxvk::war3_diag::QueryShadowAppendTotal();
+    summary.shadowAppendRawcodeUniqueCount =
+        ::dxvk::war3_diag::QueryShadowAppendUnique();
+    for (uint32_t i = 0u; i < 16u; ++i) {
+      summary.shadowAppendRawcodeSamples[i] =
+          ::dxvk::war3_diag::QueryShadowAppendRawcodeAt(i);
+    }
   }
   // Phase 7.97 诊断：直接拉 atomic getter，反映最近一次 ManifestCopy 真实
   // 遍历情况（不受 sameFrameDataNotGrowing publish 早退掩盖）。

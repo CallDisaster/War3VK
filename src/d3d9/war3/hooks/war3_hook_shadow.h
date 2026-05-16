@@ -121,4 +121,20 @@ uint64_t QueryWriteMaskRegionPassLosCount();
 uint64_t QueryWriteMaskRegionPassPathCount();
 uint64_t QueryWriteMaskRegionPassOtherCount();
 
+// Phase 7.108：ShadowProjector 诊断计数器（control plane 透传用）。
+// 这条路径是 Game.dll 自己的"投影器阴影"系统（CTerrainUberSplats），
+// 与 D3D9 mesh draw 完全独立——path blocker 视觉残留可能就来自这条
+// 路径，但当前 stats 只在 Verbose/Stats 编译期开关下计数，关闭时计数为 0。
+// 这里把它升级为永久 atomic，方便实测分辨究竟哪条路径在画 path blocker。
+uint64_t QueryShadowProjectorAddFromObjectEnterCount();
+uint64_t QueryShadowProjectorAddFromObjectBlockedCount();
+uint64_t QueryShadowProjectorAddFromObjectFourCCExtractedCount();
+uint64_t QueryShadowProjectorAddFromObjectFourCCMissCount();
+uint64_t QueryShadowProjectorAddFromObjectBlockedFourCCCount();
+uint64_t QueryShadowProjectorAddSimpleEnterCount();
+uint64_t QueryShadowProjectorAddSimpleBlockedCount();
+// 最近被 reject 的 fourcc（环形采样，前 8 个 unique）。
+uint32_t QueryShadowProjectorBlockedFourCCSampleAt(uint32_t idx);
+uint32_t QueryShadowProjectorObservedFourCCSampleAt(uint32_t idx);
+
 } // namespace dxvk::war3::hooks
