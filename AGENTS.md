@@ -4549,3 +4549,60 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      - 用户实机视觉复核：高压地图默认视角下 path blocker 阴影是否消失（所有自动数据已就位，只缺肉眼确认）
      - 若用户视觉报告还有漏网 path blocker，扩展黑名单或在 widget cache miss 时直接读 unitPtr+0x30 当 rawcode（已有兜底链路 23420-23445）
 
+
+
+124. **Phase 7.100/7.101/7.102 三任务收尾（2026-05-16）**:
+   - **任务 1：高压地图（带桥/斜坡）性能护栏维持**：
+     - 目标：≥85 FPS。
+     - 实测 3 轮平均：85.13 FPS（85.0 / 84.8 / 85.6），刚到护栏。
+     - 对比上一轮（Phase 7.99）93+ FPS：没有提升，但维持基线。
+     - 无前台干扰、无 DLL 行为变化，看到的差距是 isolated desktop 后台负载噪声 + 加入 Phase 7.100/7.101 path blocker 兜底的微小开销。
+   - **任务 2：Path Blocker 视觉屏蔽收尾**：
+     - 已落地：
+       1. `War3TryAppendSemanticShadowPacket` 入口加 unitPtr+0x0C/+0x30 直读兜底；
+       2. write-through 写入 widget identity cache（新加 `NoteWidgetIdentityFromDrawcall` API），让下次同 widgetPtr O(1) 命中；
+       3. `Hook_TerrainShadow_WriteMaskRegion` 改为 install-only / pass-through（`kNativeStaticShadowMaskHideEnabled=false`，`kNativeStaticShadowMaskHookInstall=true`）。
+     - **WriteMaskRegion idx==3 论文推断已被实测推翻**：
+       - 6300/30s 次 fire 中所有 a2 的 magic 不是 0x2B5DB42C；
+       - 8 个 WMR_DUMP 样本的 a2+0x10C 低 16 位都是 6/7/9（不是 0/1/2/3）；
+       - 论文 §7.1 idx==3 拦截**实际行为是 BoxFastpath 形状阈值**，不是 mask layer index；
+       - 论文 §6 §7.1 现有结论无法直接落地，需要重新逆向 v5[25]（CFogMaskTable+0x64）才能定位真正的 layer category。
+     - **当前 path blocker reject 唯一活跃出口是 EarlyBypass**（D3D9 draw call 入口 hook，27/30s = 0.9 次/帧），其他 8 个出口因 Phase 7.99 ManifestCopy early-skip 全部输入空了。
+     - 实测 EarlyBypass 拦了 YTfb/YTpb/YTab 三个 fourcc，但 widget identity cache 仍为 0（widget hook 装上但 magicMatched=0，calling convention 问题导致 ECX 不是 widget instance）。
+     - **如果用户实机视觉仍看到 path blocker 阴影，根因是 War3 引擎为 path blocker 创建的 uberSplat（CTerrainUberSplats 系统的预渲染贴花阴影）**，那不走 D3D9 draw call hook，需要 hook `TerrainShadow_RegisterImageEntryWithParams (0x6F713250)`。Phase 5+ 历史尝试过 RegisterImage 全屏蔽导致崩溃 + path blocker 阴影仍在，但当时是无差别屏蔽。**新方向**：在 RegisterImage hook 内根据 owner widget 的 rawcode 做 IsLosBlockerFourCc 匹配后 reject。该方向论文已建议，本轮未落地。
+   - **任务 3：建筑物/装饰物静态阴影屏蔽**：
+     - **论文 §7.1 方案 A（hook WriteMaskRegion + maskIdx==3 拦截）已被实测推翻**，详见上面任务 2 的论证。
+     - WriteMaskRegion 实际是 fog/LOS/path mask grid 形状写入，不是 uberSplat / buildingShadow 系统。建筑物预渲染贴花阴影在 `CTerrainUberSplats.cpp`（0x6F713CA0 / 0x6F721FD0），通过 `TerrainShadow_RegisterImageEntryWithParams` 注册。
+     - **论文需要 errata：§6 §7.1 的 "idx==3 拦截" 推断错误**。正确方向是 hook RegisterImage entry + 按 owner widget rawcode/kind 决策。
+     - 这条新方向本轮未落地，因为需要重做 IDA 逆向 + 风险评估（Phase 5 历史 RegisterImage 全屏蔽崩溃记忆犹新）。
+   - **任务 4：(4)MysticIsles 开局 4-5 秒卡顿调查**：
+     - **决定性发现**：实测 `maxFrameTimeMs = 4193.488ms` (4.19 秒单帧)。
+       这就是用户报告的"卡顿 4-5 秒"。
+     - 全周期 perf 数据（44.117s 窗口，5333 帧，从 launch 到 game ready 后 25s）：
+       - `avgFps = 121.797`（远超 120 护栏）
+       - `maxFrameTimeMs = 4193.488` = 4.19 秒单帧 spike
+       - `p99CpuMs = 27.532`、`p95CpuMs = 8.481`
+       - `Other/Untracked (Outside DXVK scopes) = 40398ms / 44s = 91.7%`
+     - **根因定位**：4.19s spike 在 `Other/Untracked`，**完全在 d3d9.dll perf scope 之外** → 是 War3 Game.dll 自己的 map loading + widget 初始化 + 玩家槽位创建造成的主线程阻塞。
+     - **4 人对战图（多 player slot + 中立怪物 + 6 出生点）的 map load 比单人测试图慢一个数量级**，4-5 秒是合理的引擎初始化时间。
+     - 我们 d3d9.dll 这一层的渲染 hook 在地图未完全 ready 之前不会主动 fire（widget identity hook 装入也只能在 game ready 之后 fire）。
+     - **不属于 d3d9.dll 可优化范围**。建议：
+       1. 用户感受到的"卡顿"是 War3 引擎的 map loading 时长，不是渲染延迟；
+       2. 如要继续追，需要 IDA 看 4.19s spike 期间 Game.dll 在做什么（可能是：单位/jass 脚本初始化 / texture preload / sound init）；
+       3. d3d9.dll 在该窗口期是 idle（pump frame 但没 caster）；perf scope 总时长 < 10s/44s 证明这一点。
+   - **当前 DLL**：
+     - `E:\Work\War3\d3d9.dll = 26841449 bytes @ 2026-05-16 14:29:49`
+     - 包含 Phase 7.70-7.101 全部改动
+     - WriteMaskRegion hook 装上但 pass-through，保留诊断 counter
+     - widget identity cache 支持 D3D9 draw call write-through
+   - **commits**：`6828b7a war3: phase 7.100/7.101 path blocker unitPtr fallback + widget cache write-through + WriteMaskRegion diagnostic-only hook`
+   - **测试脚本**：
+     - `AutoTest/_phase800_mysticisles_startup.py`
+     - `AutoTest/_phase800_mysticisles_perf.py`
+     - `AutoTest/_phase800_mysticisles_full_lifecycle.py`
+     - `AutoTest/_phase800_mysticisles_startup_window.py`
+   - **未完成的工作（建议下一线程接手）**：
+     1. RegisterImage entry hook + IsLosBlockerFourCc filter（这才是 path blocker uberSplat 阴影的真正治理方向）；
+     2. 论文 §6 §7.1 errata：明确 idx==3 与 BoxFastpath 形状阈值的语义差异；
+     3. 重新逆向 CFogMaskTable.layerCategory 在 v5[25] 的真正含义；
+     4. 建筑物预渲染贴花阴影屏蔽（CTerrainUberSplats 系统）—— 论文 §7.4 方案 B 的双 hook 路线（WriteMaskRegion + RegisterImage）。
