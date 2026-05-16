@@ -23584,6 +23584,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         //   2) jHandle 反查 RenderObjectRegistry（命中通过 group 0/1/2 注册的对象）
         //   3) widget identity cache 兜底（CWidget_RegisterFootprintAndShadowMask
         //      hook 维护，覆盖 destructible/path blocker 等不进 RenderGroup 的对象）
+        //   4) Phase 7.107：从 worldObjectEntry / object->unitPtr 直读 +0x30 兜底。
+        //      destructible 不进 RenderGroup，widget cache 在某些 path 也可能空，
+        //      但 worldObjectEntry 通常直接指向 CWidget instance，+0x30 = rawcode
+        //      是稳定的硬读取（unit/destructible 共享 CWidget 布局）。
         uint32_t pathBlockerRawcode = semantic.rawcode;
         if (pathBlockerRawcode == 0u && semantic.jHandle != 0u) {
           if (auto* info = dxvk::war3::render::RenderObjectRegistry::instance()
@@ -23598,6 +23602,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         if (pathBlockerRawcode == 0u && semantic.jHandle != 0u) {
           pathBlockerRawcode =
               dxvk::war3::hooks::QueryWidgetRawcodeByHandle(semantic.jHandle);
+        }
+        // Phase 7.107：硬读取兜底。worldObjectEntry / object->unitPtr 直接是
+        // CWidget 实例指针（path blocker 是 destructible，CWidget magic 0x2B5DB42C，
+        // +0x30 = rawcode）。这条 fallback 不依赖任何 cache，能拦掉 widget hook
+        // 没记录到的 destructible（widgetIdentityCacheSize=0 / magicMatched=0
+        // 的情况下，前面 3 级 fallback 全部 miss，但这条直读还是能拿到 rawcode）。
+        if (pathBlockerRawcode == 0u) {
+          void* widgetCandidate = semantic.worldObjectEntry;
+          if (widgetCandidate == nullptr && semantic.object != nullptr)
+            widgetCandidate = semantic.object->unitPtr;
+          if (widgetCandidate != nullptr) {
+            uint32_t magic = 0u;
+            if (dxvk::war3::SafeReadU32Fast(widgetCandidate, 0x0Cu, magic) &&
+                magic == 0x2B5DB42Cu) {
+              dxvk::war3::SafeReadU32Fast(widgetCandidate, 0x30u,
+                                          pathBlockerRawcode);
+            }
+          }
         }
         if (dxvk::war3::internal::kPathBlockerHideEnabled &&
             pathBlockerRawcode != 0u &&
