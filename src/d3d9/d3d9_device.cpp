@@ -980,7 +980,7 @@ uint32_t War3SemanticUnitFlags5C(
   return 0u;
 }
 
-bool War3SemanticRenderableHasBuildingFlags(
+[[maybe_unused]] bool War3SemanticRenderableHasBuildingFlags(
     const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
   const uint32_t flags5C = War3SemanticUnitFlags5C(renderable);
   return (flags5C & dxvk::war3::UnitFlags5C::Building) != 0u;
@@ -3181,7 +3181,7 @@ bool War3SemanticPaletteLooksModelLocal(
       false);
 }
 
-void War3SemanticBuildWorldPaletteIfNeeded(
+[[maybe_unused]] void War3SemanticBuildWorldPaletteIfNeeded(
     const std::vector<Matrix4>& sourcePalette,
     const Matrix4& worldTransform,
     uint8_t objectKind,
@@ -11235,7 +11235,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   //（alphaTestEnabled 从 material classification 设定、uv/diffuse 字段为空），
   // reject 路径已经过 softening 在无 payload 时拒绝 cutout caster，
   // 所以语义上不可能走到"alphaTest=true 但 diffuse=null"的下游渲染分支。
-  bool alphaTestPayloadApplied = false;
+  [[maybe_unused]] bool alphaTestPayloadApplied = false;
   dxvk::war3::shadow::War3ShadowAlphaTestPayload alphaTestPayload = {};
   {
     auto& atCounters =
