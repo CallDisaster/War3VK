@@ -950,52 +950,79 @@ int __thiscall Hook_TerrainShadow_WriteMaskRegion(void *thisPtr, void *a2,
 
   // Phase 7.112：caller-aware 静态阴影屏蔽。
   // 通过返回地址判定调用来源，仅拦截"建筑物 shadow footprint"路径。
-  // fog/LOS/path/visibility 等共享路径完全不受影响。
+  // fog/LOS/visibility 等共享路径完全不受影响。
   // GCC/MinGW 用 __builtin_return_address；MSVC 用 _ReturnAddress。
+  //
+  // 性能：caller 分桶 + reject 检查只在配置开关启用时执行，默认情况下
+  // hook 仅做 enter counter 的原子累加（开销 ~5ns/call × 6300/frame = 32us/frame）。
+  const bool needsCallerInspection =
+      dxvk::war3::internal::kNativeStaticShadowHideBuildingFootprintEnabled ||
+      dxvk::war3::internal::kNativeStaticShadowHideDestructibleFootprintEnabled ||
+      dxvk::war3::internal::kNativeStaticShadowMaskCallerDiagnostics ||
+      dxvk::war3::internal::kNativeStaticShadowMaskHideEnabled;
+
+  bool fromBuildingStamp = false;
+  bool fromRegisterFootprint = false;
+  bool fromRebuildMask = false;
+  bool fromActorRuntime = false;
+  bool fromForObject = false;
+
+  if (needsCallerInspection) {
 #if defined(_MSC_VER) && !defined(__GNUC__)
-  const uintptr_t retAddr = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uintptr_t retAddr = reinterpret_cast<uintptr_t>(_ReturnAddress());
 #else
-  const uintptr_t retAddr =
-      reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    const uintptr_t retAddr =
+        reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 #endif
-  const uintptr_t gameBase = GetGameDllBase();
-  const uintptr_t buildingStampStart = gameBase + kCUnitStampBuildingShadowFootprintRva;
-  const uintptr_t registerFootprintStart = gameBase + kCWidgetRegisterFootprintRva;
-  const uintptr_t rebuildMaskStart = gameBase + kTerrainShadowRebuildMaskRva;
-  const uintptr_t fromActorRuntimeStart = gameBase + kTerrainShadowFromActorRuntimeRva;
-  const uintptr_t forObjectStart = gameBase + kTerrainShadowForObjectRva;
+    const uintptr_t gameBase = GetGameDllBase();
+    const uintptr_t buildingStampStart =
+        gameBase + kCUnitStampBuildingShadowFootprintRva;
+    const uintptr_t registerFootprintStart =
+        gameBase + kCWidgetRegisterFootprintRva;
+    const uintptr_t rebuildMaskStart = gameBase + kTerrainShadowRebuildMaskRva;
+    const uintptr_t fromActorRuntimeStart =
+        gameBase + kTerrainShadowFromActorRuntimeRva;
+    const uintptr_t forObjectStart = gameBase + kTerrainShadowForObjectRva;
 
-  const bool fromBuildingStamp = IsAddrInFuncRange(
-      retAddr, buildingStampStart, kCUnitStampBuildingShadowFootprintSize);
-  const bool fromRegisterFootprint = IsAddrInFuncRange(
-      retAddr, registerFootprintStart, kCWidgetRegisterFootprintSize);
-  const bool fromRebuildMask = IsAddrInFuncRange(
-      retAddr, rebuildMaskStart, kTerrainShadowRebuildMaskSize);
-  const bool fromActorRuntime = IsAddrInFuncRange(
-      retAddr, fromActorRuntimeStart, kTerrainShadowFromActorRuntimeSize);
-  const bool fromForObject = IsAddrInFuncRange(
-      retAddr, forObjectStart, kTerrainShadowForObjectSize);
+    fromBuildingStamp = IsAddrInFuncRange(
+        retAddr, buildingStampStart, kCUnitStampBuildingShadowFootprintSize);
+    fromRegisterFootprint = IsAddrInFuncRange(
+        retAddr, registerFootprintStart, kCWidgetRegisterFootprintSize);
+    fromRebuildMask = IsAddrInFuncRange(retAddr, rebuildMaskStart,
+                                         kTerrainShadowRebuildMaskSize);
+    fromActorRuntime = IsAddrInFuncRange(retAddr, fromActorRuntimeStart,
+                                          kTerrainShadowFromActorRuntimeSize);
+    fromForObject = IsAddrInFuncRange(retAddr, forObjectStart,
+                                       kTerrainShadowForObjectSize);
 
-  // 来源分桶（永久统计，可用 control plane summary 实时验证）
-  if (fromBuildingStamp) {
-    g_writeMaskRegionFromBuildingStampCount.fetch_add(
-        1, std::memory_order_relaxed);
-  } else if (fromRegisterFootprint) {
-    g_writeMaskRegionFromRegisterFootprintCount.fetch_add(
-        1, std::memory_order_relaxed);
-  } else if (fromRebuildMask) {
-    g_writeMaskRegionFromRebuildMaskCount.fetch_add(
-        1, std::memory_order_relaxed);
-  } else if (fromActorRuntime) {
-    g_writeMaskRegionFromActorRuntimeCount.fetch_add(
-        1, std::memory_order_relaxed);
-  } else if (fromForObject) {
-    g_writeMaskRegionFromForObjectCount.fetch_add(
-        1, std::memory_order_relaxed);
-  } else {
-    g_writeMaskRegionFromOtherCallerCount.fetch_add(
-        1, std::memory_order_relaxed);
+    // 来源分桶（仅诊断开启时累加）
+    if (dxvk::war3::internal::kNativeStaticShadowMaskCallerDiagnostics) {
+      if (fromBuildingStamp)
+        g_writeMaskRegionFromBuildingStampCount.fetch_add(
+            1, std::memory_order_relaxed);
+      else if (fromRegisterFootprint)
+        g_writeMaskRegionFromRegisterFootprintCount.fetch_add(
+            1, std::memory_order_relaxed);
+      else if (fromRebuildMask)
+        g_writeMaskRegionFromRebuildMaskCount.fetch_add(
+            1, std::memory_order_relaxed);
+      else if (fromActorRuntime)
+        g_writeMaskRegionFromActorRuntimeCount.fetch_add(
+            1, std::memory_order_relaxed);
+      else if (fromForObject)
+        g_writeMaskRegionFromForObjectCount.fetch_add(
+            1, std::memory_order_relaxed);
+      else
+        g_writeMaskRegionFromOtherCallerCount.fetch_add(
+            1, std::memory_order_relaxed);
+    }
   }
+
+  // 静态消除未使用变量警告（reject 路径未启用时编译器可能优化掉）。
+  (void)fromRegisterFootprint;
+  (void)fromRebuildMask;
+  (void)fromActorRuntime;
+  (void)fromForObject;
 
   // Phase 7.112 第一刀：仅 reject 来自 CUnit_StampBuildingShadowFootprint 的写入。
   // 该 caller 只在建筑物 lifecycle 调用，是建筑预渲染贴花阴影的唯一专属入口。
@@ -1045,7 +1072,9 @@ int __thiscall Hook_TerrainShadow_WriteMaskRegion(void *thisPtr, void *a2,
   // 风险：fog/LOS/visibility 不依赖这个标志位，不会受影响。
 
   // Phase 7.112 第二刀诊断：前 12 次 fire 时 dump widget +0x60 +0x14C 字段语义。
-  {
+  // 默认关闭——已经 dump 过 12 次确认 widget 字段语义（见 AGENTS Phase 7.112 节）。
+  // 需要再 dump 时启用 kNativeStaticShadowHideBuildingFootprintDebugLog。
+  if constexpr (false) {  // disabled by default
     static std::atomic<uint32_t> s_dump60{0};
     const uint32_t cur = s_dump60.fetch_add(1, std::memory_order_relaxed);
     if (cur < 12u && a2 != nullptr) {

@@ -1023,6 +1023,12 @@ inline constexpr bool kNativeStaticShadowHideBuildingFootprintDebugLog = false;
 // 建筑阴影屏蔽后再考虑启用。
 inline constexpr bool kNativeStaticShadowHideDestructibleFootprintEnabled =
     false;
+
+// caller-aware 诊断 counter 是否启用。每次 WriteMaskRegion fire 都做 5 次
+// IsAddrInFuncRange 比较 + 6 次 atomic add；6300 次/帧总开销约 38000 个比较
+// 与原子 add，可观察的性能影响极小（<0.05ms）。但既然默认未启用 reject，
+// 把 caller 分桶也门控起来减少不必要常驻开销。需要调试时启用。
+inline constexpr bool kNativeStaticShadowMaskCallerDiagnostics = false;
 // 开启路径阻断器隐藏时，是否强制开启桥接追踪（确保 ShadowCapture 能拿到 rawcode）。
 inline constexpr bool kPathBlockerForceBridgeTrackingEnabled = false;
 // “仅路径阻断器追踪”模式下的组掩码（bit0=group0, bit1=group1 ...）。
