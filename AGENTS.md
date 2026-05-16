@@ -4633,3 +4633,38 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      3. 如果 RegisterImage hook 成功 reject path blocker uberSplat，把它接入
         `kPathBlockerHideEnabled` 总开关，与 EarlyBypass 配合形成"双保险"。
    - **当前 DLL**：`E:\Work\War3\d3d9.dll = 26841809 bytes @ 2026-05-16 14:48:32`
+
+
+126. **Phase 7.104 / 三任务最终交付汇总（2026-05-16 15:17）**:
+   - **任务汇总（按用户提出顺序）**：
+     - **任务 1（path blocker 视觉屏蔽）**：未完全解决。
+       - 已落地：unitPtr+0x30 兜底（默认 env-gated 关）、widget cache write-through、destructible survey log（默认 env-gated 关）；
+       - EarlyBypass 30s 内拦截 27 次 path blocker mesh draw call (YTfb/YTpb/YTab)；
+       - **如果用户视觉仍看到 path blocker 阴影，根因不在 D3D9 mesh draw 层**，而是 War3 的 `TerrainShadow_RegisterImageEntry @ 0x6F713250` 注册的 uberSplat 贴花阴影。需要新一轮 IDA 工作 + 实测验证才能落地。
+     - **任务 2（建筑物/装饰物静态阴影屏蔽）**：未解决。
+       - 论文 §6 §7.1 的 idx==3 推断**实测被推翻**（`+0x10C` 低 16 位实际是 BoxFastpath 形状阈值，全部样本是 6/7/9 不是 0/1/2/3）；
+       - WriteMaskRegion hook 已装上但 pass-through 不 reject（`kNativeStaticShadowMaskHideEnabled=false`，`kNativeStaticShadowMaskHookInstall=true` 保留诊断）；
+       - 需要重新逆向 v5[25] (CFogMaskTable+0x64) 来找真正的 mask layer category 字段。
+     - **任务 3（高压地图桥/斜坡卡顿）**：维持基线。
+       - Phase 7.99 ManifestCopy early-skip 仍在生效，未回退；
+       - 当前 5 轮高压 mean = 73.44 FPS（环境噪声主导，非代码回归）；
+       - 同一时间窗口测 Phase 7.99 baseline DLL 也只有 74.05 FPS — **证明性能掉落与 Phase 7.100-7.104 改动无关**，是 Windows 后台负载（Defender 扫描 / 热节流 / 等）；
+       - 用户在前台运行游戏（非 isolated desktop）+ 无后台干扰时，应能恢复 commit 时的 93+ FPS 基线。
+     - **任务 4（MysticIsles 开局 4-5 秒卡顿）**：定位完成。
+       - **根因**：War3 引擎自身的 map loading 阻塞 main thread 4.19 秒（实测 `maxFrameTimeMs=4193.488`）；
+       - 4 人对战图（多 player slot + 中立怪 + 6 出生点）的初始化时间显著长于单人测试图；
+       - **不属于 d3d9.dll 优化范围**（`Other/Untracked` 占总 CPU 的 91.7%，DXVK perf scope 仅 < 10s/44s）。
+   - **关键交付状态**：
+     - DLL：`E:\Work\War3\d3d9.dll = 26842584 bytes @ 2026-05-16 15:17:00`
+     - 包含 Phase 7.70-7.104 全部改动
+     - 所有诊断路径已 env-gated（默认 0 cost）：
+       - `DXVK_WAR3_DESTRUCTIBLE_SURVEY=1` 启用 destructible rawcode 调查日志
+       - `DXVK_WAR3_APPEND_ENTRY_PATHBLOCKER=1` 启用 AppendEntry path blocker 兜底（belt-and-suspenders）
+   - **下一线程明确接力点**：
+     - **首要**：hook `TerrainShadow_RegisterImageEntry @ 0x6F713250`（论文方案 B 双 hook 路线之一）；按 caller stack 提取 owner widget pointer + IsLosBlockerFourCc 匹配 reject。这是用户视觉问题的关键路径，但风险高（Phase 5 全屏蔽崩溃记忆）；
+     - **次要**：重新逆向 CFogMaskTable.layerCategory 在 v5[25] 的真正含义，复活 §7.1 方案 A；
+     - **不可接力**：MysticIsles 开局卡顿（引擎自身行为，无法在 d3d9 层修复）。
+   - **commit 链**：
+     - `6828b7a war3: phase 7.100/7.101 path blocker unitPtr fallback + widget cache write-through + WriteMaskRegion diagnostic-only hook`
+     - `d771728 war3: phase 7.103 destructible rawcode survey log + AGENTS verdict on path blocker uberSplat root cause`
+     - `e5491c9 war3: phase 7.104 gate path blocker AppendEntry fallback + destructible survey behind env vars (default off)`
