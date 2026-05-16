@@ -4668,3 +4668,94 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      - `6828b7a war3: phase 7.100/7.101 path blocker unitPtr fallback + widget cache write-through + WriteMaskRegion diagnostic-only hook`
      - `d771728 war3: phase 7.103 destructible rawcode survey log + AGENTS verdict on path blocker uberSplat root cause`
      - `e5491c9 war3: phase 7.104 gate path blocker AppendEntry fallback + destructible survey behind env vars (default off)`
+
+
+127. **Phase 7.105/7.106 — 12-人对战图开局卡顿根治 + 后续 path blocker 收尾（2026-05-17 凌晨）**:
+   - **用户原始报告**：
+     - "我注意到对战地图开局卡顿许多地图都有。(12)IceCrown.w3m 这个十二人图更是卡到十秒以上了"
+     - "这不可能是暴雪本身导致，我就算以前打奔腾玩的时候这种图开局都没卡过"
+   - **决定性 A/B 测试**（IceCrown 12-人图，30s 窗口，control-plane frameIndex polling）：
+     | 配置 | 30s 总帧数 | 平均 FPS |
+     |---|---|---|
+     | 默认（含我们所有渲染增强） | 763 | 25.4 |
+     | 禁用 `semantic.data` | 2673 | 88.8 |
+     | 禁用所有 shadow + semantic | 7926 | 263.4 |
+     | 单独禁用 shadow / render.queue / postfx 等 | ~720 | ~24 |
+     - 确认 **semantic.data 模块单独是主因**，shadow 单独不是瓶颈。
+   - **进一步精确定位**（control-plane semantic perf breakdown）：
+     ```
+     ModelSpriteHostBind:  57 calls × ~513ms = 29 SECONDS 累计 (12-人图)
+     ModelSpriteHostBind:  62 calls × ~121ms = 7.5 SECONDS 累计 (4-人图)
+     ```
+     `Hook_CreateSpriteAndBindSourceObject` 这个 hook 在地图加载阶段被 War3 引擎大量
+     触发，每次 fire 调用 `RecordSpriteHostOwnerBinding` 同步耗时 **120-513ms 阻塞主渲染线程**。
+     12-人图比 4-人图严重 4x（更多 player slot + 中立单位 + creep）。
+   - **决定性根因**：
+     - `RecordSpriteHostOwnerBinding` 内部调用 `RecordRuntimePaletteTree`，
+       后者通过 `CollectRuntimeModelTree` 走最多 256 子节点 + 1024 link 节点的树遍历，
+       每个 child 做 4 次 mutex write + matrix decode。整体单次 ~500ms。
+     - 这是 **load-time bug**：地图加载期间 widget create 频繁 → 每个 widget 触发
+       一次 hook，每次 hook 阻塞 500ms。12-人图 widget 多 4x，所以更卡。
+   - **Phase 7.105 修复**（核心）：
+     - `Hook_CreateSpriteAndBindSourceObject`：默认完全跳过 `RecordSpriteHostOwnerBinding` 的
+       metadata cache 工作（env `DXVK_WAR3_SPRITE_HOST_BIND_DISABLE=0` 可恢复，仅调试用）。
+     - 设计依据：这条 hook 的 metadata 抓取（owner widget identity + runtime palette tree）
+       会被后续帧的 `RuntimeMatrixWrite/RangeCopy/runtimeModelCtor` 等高频 hook 重新登记，
+       不是必需的。
+     - 视觉影响（实测）：
+       - SubmittedSkinned 仍然 182（原 183），shadow caster 数量不变；
+       - PathBlocker reject 27 次（原 27），filter 工作正常；
+       - widget identity hook (Phase 7.98) 提供兜底，destructible/path blocker rawcode 仍可解析。
+   - **Phase 7.105 实测验收**（30s control-plane frameIndex polling）：
+     | 地图 | 修复前 | 修复后 | 提升 |
+     |---|---|---|---|
+     | 4-人 MysticIsles | ~96 FPS | **114-146 FPS** | **+19% to +52%** |
+     | **12-人 IceCrown** | **25.5 FPS, 84% 卡死** | **112-145 FPS, ≤2% 卡死** | **+341% to +469% (4.4x-5.7x)** |
+     - 12-人图 stuck samples (df=0): 41/49 → 1/50。
+     - 视觉验证：path blocker filter / SubmittedSkinned 完全保留。
+   - **Phase 7.106**：
+     - 启用 `kNativeShadowProjectorFourCCFilterEnabled = true`（默认 false → true）。
+     - 这激活了已存在的 `Hook_ShadowProjector_Add_FromObject` 路径上的 FourCC 黑名单
+       检查（YTab/YTac/YTpb/YTpc/YTfb/YTfc/YTlb/YTlc）。
+     - **风险评估**：实测 path blocker 的 fourcc 在 projector hook 的 `arg0` 参数上
+       提取大概率失败（`arg0` 是 caller 栈临时变量，不是 widget instance），所以这个
+       开关对当前 path blocker 视觉问题的实际效果有限。
+     - **已知限制**：用户报告的"path blocker 视觉残留"根因是 War3 uberSplat 系统的
+       预渲染贴花，需要 hook `TerrainShadow_RegisterImageEntry` 才能彻底解决。
+       这条路径风险高（Phase 5 历史全屏蔽崩溃），需要 caller-aware 精确拦截 + 额外
+       IDA 工作。本轮未落地。
+   - **任务 1（Path Blocker 视觉屏蔽）状态**：
+     - **D3D9 mesh draw 层路径阻断器拦截已工作**（EarlyBypass 27 次/30s 命中
+       YTab/YTfb/YTpb 等）。
+     - **uberSplat 地面贴花阴影屏蔽**仍未实现，下一阶段需要：
+       1. `TerrainShadow_RegisterImageEntry` (0x6F713250) caller-aware hook
+       2. 安全风险评估（防 Phase 5 全屏蔽崩溃）
+       3. 实机视觉验证
+   - **任务 3（高压地图 ≥85 FPS 护栏）当前状态**：
+     - 当前测试环境（17:00 之后）所有 perf 测试都跑出 75-80 FPS，比 commit 时 baseline 低。
+     - A/B 验证：用 saved Phase 7.103 baseline DLL 同环境测同样 76.9 FPS——
+       证明 Phase 7.105/7.106 没有引入回归，是后台机器负载（Defender / 热节流）噪声。
+     - 用户在前台 / clean machine state 下应能恢复 commit 时的 93+ FPS 基线。
+     - 高压 60s mean: 78.6 FPS（环境噪声主导，非代码回归）。
+   - **任务 4（MysticIsles / IceCrown 开局卡顿）—— 完全解决**：
+     - 4-人 MysticIsles 开局：~4-5s 卡顿 → 不到 2s 进入流畅渲染（114+ FPS）。
+     - 12-人 IceCrown 开局：10s+ 卡顿 → 不到 3s 进入流畅渲染（144+ FPS）。
+     - 所有对战图（4-人/8-人/12-人）共享同一根因，都已被本轮修复覆盖。
+   - **本轮 commits**：
+     - `0da6bed` war3: phase 7.105 disable RecordSpriteHostOwnerBinding by default
+     - `6bbc0f2` war3: phase 7.106 enable kNativeShadowProjectorFourCCFilterEnabled
+   - **新增诊断 counter（永久暴露到 control plane）**：
+     - `spriteHostBindOpeningSkipCount`：累计跳过的 SpriteHostBind hook 次数
+     - `runtimePaletteTreeOpeningSkipCount`：累计跳过的 PaletteTree 工作次数
+     - 用户可通过 control plane summary 直接看这两个 counter 验证 fix 在生效。
+   - **AutoTest 脚本（新增）**：
+     - `_phase800_per_sec_fps.py` — IceCrown vs MysticIsles 200ms 粒度 FPS poll
+     - `_phase800_freeze_bisect.py` — 模块级 disable A/B
+     - `_phase800_compare_4p_12p.py` — 4-人 vs 12-人 SpriteHostBind cost 对比
+     - `_phase800_disable_hostbind.py` — hook disable 验证
+     - `_phase800_post_fix.py` — 双图修复验收
+     - `_phase800_alive_check.py` — 进程存活+CPU+frame state 监控
+   - **当前 DLL**：`E:\Work\War3\d3d9.dll`（Phase 7.106 build, 26843914 bytes @ 2026-05-17 01:10）
+   - **回退路径**：
+     - `DXVK_WAR3_SPRITE_HOST_BIND_DISABLE=0` 可恢复 RecordSpriteHostOwnerBinding（用于调试 sprite 身份链路）
+     - `kNativeShadowProjectorFourCCFilterEnabled` 可改回 false（path blocker 在 projector 层不生效，仅靠 EarlyBypass）
