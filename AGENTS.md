@@ -4819,3 +4819,25 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
         如果是路径阻断器我们直接拒绝它的顶点然后就没有渲染了"
      - 这两条纠正引导了 Phase 7.107 的修复方向：在 `War3TryCaptureShadowCaster` v4
        capture 路径上加更稳健的 destructible rawcode 提取（硬读取 worldObjectEntry+0x30）。
+
+
+129. **Phase 7.111 path blocker 视觉残留终极判定（2026-05-17 04:35）**:
+   - **问题反复**：用户填全 8 个 YT* fourcc，27 次 EarlyBypass 拦截工作，414K caster append 全无 YT* 漏网，但视觉上 path blocker 阴影**仍然存在**。
+   - **决定性数据**：
+     - `kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled = true`：semantic 模式下 legacy capture **完全关闭**。
+     - `kShadowSemanticCoreSceneUnitsOnly = false`：semantic 路径会处理装饰物 / 建筑物 / Destructible。
+     - 30s 高压地图 caster append 列表 16 个 unique rawcode 里出现 LT* 装饰物（LTbr / LTlt）。
+     - LT* 全前缀拦截后 path blocker 阴影**消失**，**但所有真树阴影也一起消失**。
+   - **真实根因（高置信度）**：
+     - 用户编辑器看到的 8 个 path blocker 类型本身使用 8 个 YT* fourcc，但**地图上实际放置的 path blocker 实物**可能在数据层把 Art-Model File 字段被指向其他装饰物 model（LTat/LTbr/LTcw 等），所以渲染层的 fourcc **不再是 YT***，而是被借用的装饰物自身 fourcc。
+     - 用户截图里"小方块石塔阴影"形状与 LTat/LTbr 类石柱装饰物吻合。
+     - 因此 D3D9 渲染层无法仅靠 fourcc 黑名单完全拦掉它——渲染时它就是"合法装饰物"。
+   - **不能盲做的事**：
+     - LT* 全前缀拦截 → 误伤真树阴影。
+     - 在 D3D9 层做 footprint 计算 → 性能不可接受。
+   - **可行方案（待用户决定）**：
+     - 方案 A（推荐）：用户启动游戏后我们已部署的 caster append survey 会自动收集当前地图的 16 个 unique rawcode，把"path blocker 实物对应的 fourcc"加到 `kPathBlockerFourCCs`。每张地图维护一份。
+     - 方案 B：从 War3 widget 数据反查 "is path blocker" 标志（需要进一步 IDA 逆向）。
+     - 方案 C：把 `kPathBlockerFourCCs` 改为运行时 JSON/INI 配置（用户自助维护）。
+   - **本轮交付**：研究/根因记录到位，DLL 保持 Phase 7.110 unified config 状态（8 个 YT* 已生效）。
+   - **Codex 判定**：path blocker 视觉残留**不是 D3D9 渲染层 bug**，是 War3 地图数据层的"合法装饰物伪装路径阻断器"模式造成的。**不能在不和用户对接具体 fourcc 的情况下盲改代码**。下一步交给用户做"实物 fourcc 现场采集"。
