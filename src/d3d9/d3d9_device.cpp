@@ -9758,6 +9758,72 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       m_war3Scene.shadowStats.skippedNotCaster++;
       return false;
     }
+
+    // Phase 7.102 destructible rawcode 调查日志：
+    // 用户报告 path blocker 屏蔽视觉验证不通过；可能存在 IsLosBlockerFourCc
+    // 没收录的 fourcc 变体。在所有 destructible packet append 时，前 30 次
+    // 每个 unique fourcc 各 1 行写入 dxvk log，便于复盘是否需要扩展黑名单。
+    // 仅取所有 destructible：rawcode 通过 widget cache 或 unitPtr+0x30 已经填好。
+    if (packet.renderable.unitPtr != nullptr) {
+      uint32_t surveyRawcode = packet.renderable.rawcode;
+      if (surveyRawcode == 0u) {
+        surveyRawcode = dxvk::war3::hooks::QueryWidgetRawcodeByPtr(
+            packet.renderable.unitPtr);
+      }
+      if (surveyRawcode == 0u) {
+        uint32_t magic = 0;
+        if (dxvk::war3::SafeReadU32Fast(packet.renderable.unitPtr, 0x0Cu,
+                                        magic) &&
+            magic == 0x2B5DB42Cu) {
+          dxvk::war3::SafeReadU32Fast(packet.renderable.unitPtr, 0x30u,
+                                      surveyRawcode);
+        }
+      }
+      if (surveyRawcode != 0u) {
+        // 仅 dump 在 IsLosBlockerFourCc 之外（看起来像 destructible/path blocker
+        // 的对象但黑名单没拦下）。这条日志能直接告诉用户：还有哪些 fourcc 该
+        // 加进黑名单。
+        const uint32_t normalized = NormalizeFourCcEditorOrder(surveyRawcode);
+        const bool already = IsLosBlockerFourCc(normalized);
+        if (!already) {
+          static std::atomic<uint32_t> s_surveyLogCount{0};
+          static std::atomic<uint32_t> s_surveyLogged[32] = {};
+          const uint32_t totalLogged =
+              s_surveyLogCount.load(std::memory_order_relaxed);
+          if (totalLogged < 30u) {
+            bool firstSeen = true;
+            uint32_t freeSlot = 32u;
+            for (uint32_t i = 0u; i < 32u; ++i) {
+              const uint32_t cur =
+                  s_surveyLogged[i].load(std::memory_order_relaxed);
+              if (cur == normalized) { firstSeen = false; break; }
+              if (cur == 0u && freeSlot == 32u) freeSlot = i;
+            }
+            if (firstSeen && freeSlot < 32u) {
+              uint32_t expected = 0u;
+              if (s_surveyLogged[freeSlot].compare_exchange_strong(
+                      expected, normalized, std::memory_order_relaxed)) {
+                const uint32_t logIdx = s_surveyLogCount.fetch_add(
+                    1, std::memory_order_relaxed);
+                char fc[5] = {char((normalized >> 24) & 0xFF),
+                              char((normalized >> 16) & 0xFF),
+                              char((normalized >> 8) & 0xFF),
+                              char(normalized & 0xFF), 0};
+                char buf[200];
+                std::snprintf(buf, sizeof(buf),
+                              "DXVK War3Hook[Shadow]: DESTRUCTIBLE SURVEY #%u "
+                              "rawcode=0x%08X (%s) widgetPtr=%p jHandle=0x%X "
+                              "(unrecognized; consider adding to IsLosBlockerFourCc)",
+                              logIdx + 1u, normalized, fc,
+                              packet.renderable.unitPtr,
+                              unsigned(packet.renderable.jHandle));
+                ::dxvk::Logger::info(buf);
+              }
+            }
+          }
+        }
+      }
+    }
   }
   // Phase 7.73：把 eligibility gate（File-scope helper）累计的拒绝数折进
   // 当前帧 shadowStats，每个 append 调用都偷一次。如果 eligibility 拦截能起

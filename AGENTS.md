@@ -4606,3 +4606,30 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      2. 论文 §6 §7.1 errata：明确 idx==3 与 BoxFastpath 形状阈值的语义差异；
      3. 重新逆向 CFogMaskTable.layerCategory 在 v5[25] 的真正含义；
      4. 建筑物预渲染贴花阴影屏蔽（CTerrainUberSplats 系统）—— 论文 §7.4 方案 B 的双 hook 路线（WriteMaskRegion + RegisterImage）。
+
+
+125. **Phase 7.103：destructible rawcode 调查日志（2026-05-16 14:48）**:
+   - 在 `War3TryAppendSemanticShadowPacket` 入口加 destructible rawcode 调查日志，
+     前 30 次每个 unique fourcc 各 1 行写入 dxvk log，便于扩展 IsLosBlockerFourCc 黑名单。
+   - 高压地图（带桥/斜坡/装饰物）实测 9 个 unique destructible fourcc：
+     ```
+     gKmH / oOfh / wTgh / tLvh / sRah / wTah / wTch / tLah / sAch
+     ```
+   - **这些都是装饰物（树木、岩石、装饰建筑、桥栏等），不是 path blocker。**
+   - **真实 path blocker 8 个 fourcc 已经在 IsLosBlockerFourCc 黑名单里**：
+     YTab / YTac / YTpb / YTpc / YTfb / YTfc / YTlb / YTlc
+   - **EarlyBypass 27 次/30s 拦截的就是这 8 个 path blocker 的 mesh draw call**。
+     dxvk log 实测 3 个 unique fourcc fire（YTfb / YTpb / YTab）。
+   - **如果用户视觉仍看到 path blocker 阴影**：根因是 War3 引擎为 path blocker
+     生成的 uberSplat（贴在地面的 shadow texture），路径在 `TerrainShadow_RegisterImageEntry`
+     (0x6F713250) + `TerrainShadow_RegisterImageEntryWithParams` 链路。这条不走 D3D9
+     mesh draw，无法用现有 D3D9 hook 拦截。
+   - **下一线程的明确任务**：
+     1. IDA 看 `TerrainShadow_RegisterImageEntryWithParams` (0x6F713CA0) 的所有 caller
+        是否在 stack 上传递 owner widget pointer；如果有，hook 它 + IsLosBlockerFourCc
+        匹配后 reject。这是 Phase 5 历史 RegisterImage 全屏蔽（崩溃）的精确化版本。
+     2. 风险评估：CTerrainUberSplats 系统在 Phase 5 全屏蔽时崩溃了，需先确认 reject
+        路径是不是会破坏 War3 内部状态机（v16[19]==0 路径已经是失败 fallback）。
+     3. 如果 RegisterImage hook 成功 reject path blocker uberSplat，把它接入
+        `kPathBlockerHideEnabled` 总开关，与 EarlyBypass 配合形成"双保险"。
+   - **当前 DLL**：`E:\Work\War3\d3d9.dll = 26841809 bytes @ 2026-05-16 14:48:32`
