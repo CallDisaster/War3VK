@@ -1145,7 +1145,10 @@ inline constexpr bool kNativeShadowProjectorFourCCFilterEnabled = true;
 inline constexpr bool kNativeShadowProjectorVerboseLogging = false;
 
 // 影子投影器低频统计日志（calls/blocked/path 分布）
-inline constexpr bool kNativeShadowProjectorStatsLogging = false;
+// Phase 7.130：默认打开，让用户起床后能直接在 dxvk.log 里看到 ShadowProjector
+// 是否真的 fire（验证 path blocker 视觉残留是否走这条 native projector 路径）。
+// 频率：calls % 4000，每 4000 次写 1 行，开销可忽略。
+inline constexpr bool kNativeShadowProjectorStatsLogging = true;
 
 // 需要拦截的 UberSplat 关键字（用于建筑阴影）
 // 说明：这些 key 通常来自单位数据表的 UberSplat 字段（例如 OLAR）。
