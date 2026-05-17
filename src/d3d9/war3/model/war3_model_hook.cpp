@@ -7612,7 +7612,18 @@ void __fastcall Hook_RuntimeMatrixWrite(int nodePtr, int sourceMatrixPtr,
     return;
 
   g_trampolineRuntimeMatrixWrite(nodePtr, sourceMatrixPtr, destMatrixPtr);
-  g_runtimeMatrixWriteCount.fetch_add(1u, std::memory_order_relaxed);
+  // Phase 7.131：把 g_runtimeMatrixWriteCount 的 atomic fetch_add 累计到
+  // thread_local，每 256 次合并一次。每帧 13K-30K 次调用 × 256 = ~50-120 次
+  // 真正的 atomic op，节约 99% 的 atomic ping。counter 仍是 monotonic 增长，
+  // summary 读取时拿到的是稍旧但准确数量级的值（diagnostics 用途够了）。
+  {
+    static thread_local uint64_t s_localCounter = 0u;
+    if (++s_localCounter >= 256u) {
+      g_runtimeMatrixWriteCount.fetch_add(s_localCounter,
+                                          std::memory_order_relaxed);
+      s_localCounter = 0u;
+    }
+  }
 
   // Phase 7.95：每帧调用次数上限。在桥/斜坡场景下 War3 可能每帧 50K-100K 次
   // matrix write，TryFindRuntimePoseArrayRangeForMatrix 的 shared_lock + hashmap
