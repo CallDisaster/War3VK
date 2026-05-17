@@ -150,11 +150,24 @@ void War3ForceImmediatePresent(D3DPRESENT_PARAMETERS *params) {
 // Phase 7.108b：Shadow append survey — 实际进入 shadowCasters 的 rawcode 分布。
 // 用于直接验证：path blocker 拦截后是否还有漏网到 caster 集合。
 // 不做拦截动作，只观察。
+//
+// Phase 7.128：默认禁用，env=DXVK_WAR3_SHADOW_APPEND_SURVEY=1 才启用。
+// 每帧 100-200 次调用，每次 fetch_add + 16 槽线性扫描，关掉能节约 10-20μs/帧。
 std::array<std::atomic<uint32_t>, 16> g_shadowAppendRawcodeSamples{};
 std::atomic<uint64_t> g_shadowAppendRawcodeUniqueCount{0};
 std::atomic<uint64_t> g_shadowAppendTotalCount{0};
 
+inline bool ShadowAppendSurveyEnabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("DXVK_WAR3_SHADOW_APPEND_SURVEY");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  return enabled;
+}
+
 inline void NoteShadowAppendRawcode(uint32_t rawcode) {
+  if (!ShadowAppendSurveyEnabled())
+    return;
   g_shadowAppendTotalCount.fetch_add(1, std::memory_order_relaxed);
   if (rawcode == 0u)
     return;
