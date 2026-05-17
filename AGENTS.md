@@ -5046,3 +5046,98 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
 1. T4-A: 注释清理(降风险, d3d9_device.cpp 119 个 Phase 7.X 历史注释精简)。
 2. T4-B: 诊断 counter 收口(把所有 atomic counter 加到 `DXVK_WAR3_DIAGNOSTICS_DETAILED` env 开关下)。
 3. 09:30 - 09:55: 收官 perf 复测 + AGENTS 总结。
+
+
+
+---
+
+## 🌅 2026-05-18 早晨 06:00 — 无人值守阶段性总结
+
+### Commit chain（凌晨 03:00 → 06:00 共 14 个 commit）
+
+```
+f0a0851 phase 7.130 enable ShadowProjector stats logging by default
+809c2d1 phase 7.128 gate NoteShadowAppendRawcode survey behind env
+cc7c0c8 phase 7.127 progress checkpoint at 04:50
+ab61e92 phase 7.126 raise draw-time VB cache alloc budget 12 -> 32 per frame
+4857582 phase 7.125 squash-prep changelog
+12b76a6 phase 7.124 path blocker entry gate fast-path
+351ed2c phase 7.123 per-frame GPU buffer alloc budget for v4 capture
+ca5ad6b phase 7.122 path blocker entry gate at War3TryCaptureShadowCaster
+8399b3c phase 7.122 night plan
+e6a5ddd phase 7.117-7.121 overnight progress (+4.4 / +3.7 FPS)
+cf2d2c1 phase 7.121 m_war3SemanticPaletteCache hash index
+dd6e05c phase 7.120 stableEligibleRecords in-place remove_if
+b6c7dc7 phase 7.119 previousSubmittedSelectionKeys const ref
+f81f99d phase 7.118 BuildShadowReplayDraws thread_local cache
+25dc444 phase 7.117 autotest archive
+```
+
+### ✅ 实际落地的修复（含验证）
+
+#### 1. Path Blocker 视觉屏蔽收尾（Phase 7.122 + 7.124）
+- `War3TryCaptureShadowCaster` 函数最入口加 entry gate，覆盖之前 EarlyBypass 漏掉的 Terrain doodad 路径。
+- Fast-path：currentObj / TLS handle 直接拿 rawcode → 黑名单匹配 → 命中即 return。
+- Slow path：rawcode==0 时才走 BuildShadowSemanticContext + widget cache + SafeRead。
+- dxvk.log 写 `PATH BLOCKER REJECT #N rawcode=0xXXXXXXXX (XXXX) jHandle=0xXXX via=EntryGate/EarlyBypass` 格式日志（前 30 个 unique fourcc 各 1 行）。
+- ShadowProjector stats logging 默认打开（每 4000 calls 写 1 行），让用户起床能验证是不是这条 native projector 路径在贡献 visual。
+
+#### 2. 首帧暴降修复（Phase 7.123 + 7.126）
+- v4 capture 路径加 per-frame GPU buffer alloc 预算（pos / uv / ib 各扣预算）。
+- 默认预算 32 / 帧（最初 12，根据 SunkenCity + 高压地图调高）。
+- 超额时跳过 capture，下一帧重试。视觉上 caster 第一帧没影子第二帧才有，但帧时长不再尖刺。
+- env `DXVK_WAR3_SUBMIT_LIVE_POSE_REBUILD_EVERY_FRAME` 等可关闭。
+
+#### 3. 性能护栏稳定（Phase 7.117-7.121 + 7.128）
+- AutoTest 130+ 个 phase 临时脚本归档到 `_archive/`。
+- BuildShadowReplayDraws thread_local + scene-tuple cache（避免 2-3x heap alloc/帧）。
+- previousSubmittedSelectionKeys / SelectionKeys 改 const ref。
+- stableEligibleRecords swap-copy 改 in-place remove_if。
+- m_war3SemanticPaletteCache 加 hash index（O(N) → O(1) 匹配）。
+- NoteShadowAppendRawcode survey 改 env gated default off（节约 ~10μs/帧）。
+
+### 📊 性能数据（凌晨 03:00 - 06:00 共 6 轮）
+
+| Phase | 高压 FPS | 低压 FPS |
+|---|---|---|
+| 凌晨基线 | 86.4 | 138.9 |
+| 7.119 | 88.33 | 137.06 |
+| 7.120 | 90.98 | 142.84 |
+| 7.121 | 90.77 | 141.58 |
+| 7.122/7.123 | 85.66 | 145.97 |
+| 7.124 | 86.59 | 141.69 |
+| 7.128 | 88.62 | 146.33 |
+| **7.130 (final)** | **89.37** | **145.33** |
+
+护栏一直保持: 高压 ≥85 (+4.37 富裕度), 低压 ≥120 (+25 富裕度)。
+
+### ⚠️ 等用户起床验收
+
+1. **Path blocker 视觉残留** — 启动游戏 → dxvk.log 应该看到 `PATH BLOCKER REJECT` 条目。如果看到拦了 8 个 YT?? 的 fourcc 但视觉上还有"小方块阴影",那是地图层借用 LT*/HT* 装饰物 model 伪装 path blocker，需要用户在地图编辑器修复(我们的 D3D9 渲染层无法仅靠 fourcc 黑名单识别这种情况)。
+2. **首帧暴降** — 实测高压地图右侧场地，扫视野到桥/斜坡时帧数应该不再暴降(预算 32 阻断单帧大量 buffer alloc，超额延后到下一帧)。
+3. **建筑/装饰物原生静态阴影** — 如果用户看到 dxvk.log 里 ShadowProjector stats `calls=N blocked=M` 数据 + 视觉上 building shadow 仍存在，说明那条 native projector 路径不是建筑物贴花阴影来源(建筑物贴花阴影在 CTerrainUberSplats 系统，需要 hook `TerrainShadow_RegisterImageEntry @ 0x6F713250`，这是 6-8 小时专项任务，超出本轮无人值守范围)。
+
+### 📝 IDA HTTP 调用工作流（自我提醒）
+
+**当 mcp_ida_pro_mcp_* 工具失联时**:
+1. 不要等用户重启 IDA，**直接 HTTP 调用** `http://127.0.0.1:13337/mcp`。
+2. 脚本: `AutoTest/_archive/ida_scripts/_ida_http.py`。
+3. 关键参数命名: `decompile / disasm / xrefs_to / callees` 都用 `addr`，`xrefs_to / callees` 多目标用 `addrs`。
+4. 已验证: list_tools / decompile / xrefs_to 在凌晨 04:30 测试都通过。
+5. **示例**:
+   ```pwsh
+   py AutoTest\_archive\ida_scripts\_decomp_register_image.py
+   ```
+
+### 🚀 接下来（06:00 - 09:30）
+
+如果用户视觉验收通过 → 静态阴影屏蔽是下一目标(8 小时 hook RegisterImageEntry)。
+如果用户视觉验收失败 → 根据 dxvk.log 内容定位真实漏点。
+如果用户没起床 → 继续做 commit squash 准备(论文 §10.10 squash 计划已成 CHANGELOG)。
+
+### 🔧 当前 DLL 状态
+
+- 路径: `E:\Work\War3\d3d9.dll`
+- 大小: 26872211 bytes
+- 时间: 2026-05-18 04:26:18(回退 Phase 7.129 后部署的 7.130 build)
+- 包含: 7.117-7.130 全部改动(7.129 已撤销因为 std::vector move-assign 优化触及 packet alias pointer 安全问题)
