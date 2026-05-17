@@ -8536,6 +8536,7 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   m_war3Scene = War3FrameScene{};
   m_war3ShadowPaletteHashIndex.clear();
   m_war3SemanticPaletteCache.clear();
+  m_war3SemanticPaletteCacheHashIndex.clear();
   m_war3Scene.shadowPersistentPool.bytesCap =
       War3GetShadowPersistentPoolCapBytes();
   m_war3Scene.shadowPersistentPool.bytesUsed =
@@ -9055,7 +9056,12 @@ uint32_t D3D9DeviceEx::War3GetOrCreateSemanticShadowPalette(
   if (directGeosetUnitPalette && worldHash != 0u)
     matrixHash = bit::fnv1a_iter(matrixHash, worldHash);
 
-  for (const auto& entry : m_war3SemanticPaletteCache) {
+  // Phase 7.121：通过 m_war3SemanticPaletteCacheHashIndex 做 O(1) 查找，
+  // 替代原本的 O(N) 线性扫描。同 matrixHash 多个 entry 时（极少发生）
+  // 仍然走完整字段比较，确保命中语义和原线性扫描一致。
+  auto hashRange = m_war3SemanticPaletteCacheHashIndex.equal_range(matrixHash);
+  for (auto it = hashRange.first; it != hashRange.second; ++it) {
+    const auto& entry = m_war3SemanticPaletteCache[it->second];
     if (entry.runtimeModelPtr == packet.renderable.runtimeModelPtr &&
         entry.matrixHash == matrixHash &&
         entry.worldHash == worldHash &&
@@ -9091,7 +9097,10 @@ uint32_t D3D9DeviceEx::War3GetOrCreateSemanticShadowPalette(
       War3GetOrCreateShadowMatrixPaletteFromData(effectiveMatrices, matrixCount,
                                                  uploadMatrixHash);
   const uint32_t paletteIndex = entry.paletteIndex;
+  // Phase 7.121：写入向量同时更新 hash index，保证下一次命中走 O(1)。
+  const uint32_t cacheIndex = uint32_t(m_war3SemanticPaletteCache.size());
   m_war3SemanticPaletteCache.emplace_back(std::move(entry));
+  m_war3SemanticPaletteCacheHashIndex.emplace(matrixHash, cacheIndex);
   return paletteIndex;
 }
 
@@ -15785,6 +15794,7 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
   m_war3Scene = War3FrameScene{};
   m_war3ShadowPaletteHashIndex.clear();
   m_war3SemanticPaletteCache.clear();
+  m_war3SemanticPaletteCacheHashIndex.clear();
   m_war3Scene.shadowPersistentPool.bytesCap =
       War3GetShadowPersistentPoolCapBytes();
   m_war3Scene.shadowPersistentPool.bytesUsed =
@@ -17927,6 +17937,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
   m_war3Scene = War3FrameScene{};
   m_war3ShadowPaletteHashIndex.clear();
   m_war3SemanticPaletteCache.clear();
+  m_war3SemanticPaletteCacheHashIndex.clear();
   m_war3ShadowPersistentFrameSerial++;
   War3GcShadowPersistentGeometry(false);
   // Phase 7.55 v4：每 60 帧清理一次 draw-time VB cache 中的 stale entry。

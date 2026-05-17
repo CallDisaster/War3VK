@@ -1634,6 +1634,12 @@ private:
     std::vector<Matrix4> composedPalette;
   };
   std::vector<War3SemanticPaletteCacheEntry> m_war3SemanticPaletteCache;
+  // Phase 7.121：用 multimap<matrixHash, vector_index> 把
+  // War3GetOrCreateSemanticShadowPalette 的"线性扫描 m_war3SemanticPaletteCache"
+  // 改成 hash 查找。matrixHash 已经把 runtimeModelPtr / pose / worldHash 等
+  // 都揉进去，命中后还要做完整的 entry 比较（runtimeModelPtr / matrixCount /
+  // worldHash / objectKind / composedWorldPalette），命中率与之前完全一致。
+  std::unordered_multimap<uint64_t, uint32_t> m_war3SemanticPaletteCacheHashIndex;
   // War3：当 D3D9 走 UploadPerDrawData（SYSTEMMEM|DYNAMIC/UP 路径）时，
   // 实际 draw 绑定的 VB/IB 会被替换为 UP buffer 的子切片，且底层 VkBuffer
   // 可能被 invalidate。 为了让 shadow caster drawlist 在 BeforeUi
