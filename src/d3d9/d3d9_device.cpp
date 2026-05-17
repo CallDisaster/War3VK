@@ -23473,6 +23473,122 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   if (!dxvk::g_war3_runtime_activated.load(std::memory_order_relaxed))
     return;
 
+  // Phase 7.122：path blocker 终极拦截总闸。
+  //
+  // 用户视觉问题再次报告：8 个 YT?? fourcc 全在黑名单里、EarlyBypass 30s 拦
+  // 27 次，但游戏内仍能看到 path blocker 阴影。复盘整个 capture path：
+  //   1) EarlyBypass 段 `earlyNeedsSemanticContext` 在 Terrain stage（cat=Terrain
+  //      或 stage=10/1 doodad）被排除，path blocker 走 Terrain doodad 路径会
+  //      绕过 EarlyBypass。
+  //   2) Legacy capture 主路径的 path blocker check 在 line 24766 用
+  //      `pathBlockObj->rawcode`，但 path blocker 不进 RenderObjectRegistry，
+  //      `findByHandle` 大概率 miss，rawcode 为 0 → 拦不到。
+  //   3) 同样原因在 v4 / fast-append / static-supplement 路径都可能发生。
+  //
+  // 根本性修复：在函数最入口、做任何分支决策之前，**直接从
+  // `War3BuildShadowSemanticContext` + widget instance 直读** 拿到 rawcode，
+  // 然后做 path blocker 检查。这样不管下游走哪条路（EarlyBypass / v4 /
+  // legacy / fallback），都会被这一道闸门预先 reject。
+  //
+  // 性能影响：每次调用多一次 BuildShadowSemanticContext + 可选的 1-2 次
+  // SafeReadU32Fast。BuildShadowSemanticContext 已经是热路径里第一段调用的
+  // 工具，多查一次 rawcode 几乎零开销。
+  if (dxvk::war3::internal::kPathBlockerHideEnabled) {
+    const auto *currentObjForBlocker = dxvk::war3::render::GetCurrentBatchObject();
+    War3ShadowSemanticContext semanticForBlocker =
+        War3BuildShadowSemanticContext(currentObjForBlocker);
+    uint32_t blockerRawcode = semanticForBlocker.rawcode;
+    if (blockerRawcode == 0u && currentObjForBlocker != nullptr)
+      blockerRawcode = currentObjForBlocker->rawcode;
+    // jHandle reverse lookup（与 War3TryAppendSemanticShadowPacket 保持一致）。
+    if (blockerRawcode == 0u && semanticForBlocker.jHandle != 0u) {
+      if (const auto *obj =
+              dxvk::war3::render::RenderObjectRegistry::instance().findByHandle(
+                  semanticForBlocker.jHandle)) {
+        if (obj->rawcode != 0u)
+          blockerRawcode = obj->rawcode;
+      }
+    }
+    // widget identity cache。
+    if (blockerRawcode == 0u) {
+      void *widgetCandidate = semanticForBlocker.worldObjectEntry;
+      if (widgetCandidate == nullptr && semanticForBlocker.object != nullptr)
+        widgetCandidate = semanticForBlocker.object->unitPtr;
+      if (widgetCandidate != nullptr) {
+        const uint32_t cached =
+            dxvk::war3::hooks::QueryWidgetRawcodeByPtr(widgetCandidate);
+        if (cached != 0u)
+          blockerRawcode = cached;
+      }
+    }
+    // widget+0x0C(magic) + +0x30(rawcode) 直读兜底。这一步可以 catch 那些
+    // 完全不进 RenderObjectRegistry / widget cache 的 destructible/path blocker。
+    if (blockerRawcode == 0u) {
+      void *widgetCandidate = semanticForBlocker.worldObjectEntry;
+      if (widgetCandidate == nullptr && semanticForBlocker.object != nullptr)
+        widgetCandidate = semanticForBlocker.object->unitPtr;
+      if (widgetCandidate != nullptr) {
+        uint32_t magic = 0u;
+        if (dxvk::war3::SafeReadU32Fast(widgetCandidate, 0x0Cu, magic) &&
+            magic == 0x2B5DB42Cu) {
+          uint32_t rawcode = 0u;
+          if (dxvk::war3::SafeReadU32Fast(widgetCandidate, 0x30u, rawcode) &&
+              rawcode != 0u) {
+            blockerRawcode = rawcode;
+            if (widgetCandidate != nullptr) {
+              dxvk::war3::hooks::NoteWidgetIdentityFromDrawcall(
+                  widgetCandidate, rawcode, semanticForBlocker.jHandle);
+            }
+          }
+        }
+      }
+    }
+    if (blockerRawcode != 0u && IsLosBlockerFourCc(blockerRawcode)) {
+      // 进入 dxvk log（前 30 个不同 fourcc 各 1 行）。和 EarlyBypass 同款日志格式。
+      static std::atomic<uint32_t> s_entryGateLogCount{0};
+      static std::atomic<uint32_t> s_entryGateLogged[16] = {};
+      const uint32_t totalLogged =
+          s_entryGateLogCount.load(std::memory_order_relaxed);
+      if (totalLogged < 30u) {
+        bool firstSeen = true;
+        uint32_t freeSlot = 16u;
+        for (uint32_t i = 0u; i < 16u; ++i) {
+          const uint32_t cur =
+              s_entryGateLogged[i].load(std::memory_order_relaxed);
+          if (cur == blockerRawcode) {
+            firstSeen = false;
+            break;
+          }
+          if (cur == 0u && freeSlot == 16u)
+            freeSlot = i;
+        }
+        if (firstSeen && freeSlot < 16u) {
+          uint32_t expected = 0u;
+          if (s_entryGateLogged[freeSlot].compare_exchange_strong(
+                  expected, blockerRawcode, std::memory_order_relaxed)) {
+            const uint32_t logIdx =
+                s_entryGateLogCount.fetch_add(1, std::memory_order_relaxed);
+            char fc[5] = {char((blockerRawcode >> 24) & 0xFF),
+                          char((blockerRawcode >> 16) & 0xFF),
+                          char((blockerRawcode >> 8) & 0xFF),
+                          char(blockerRawcode & 0xFF), 0};
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "DXVK War3Hook[Shadow]: PATH BLOCKER REJECT #%u rawcode=0x%08X (%s) jHandle=0x%X via=EntryGate",
+                     logIdx + 1, blockerRawcode, fc,
+                     unsigned(semanticForBlocker.jHandle));
+            ::dxvk::Logger::info(buf);
+          }
+        }
+      }
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      // 复用已有 EntryGateCount 字段不存在，用 Producer 字段做 catch-all。
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerProducerCount++;
+      m_war3Scene.shadowStats.skippedNotCaster++;
+      return;
+    }
+  }
+
   const int stage = War3RenderState::GetStage();
   const auto layer = War3RenderState::CurrentLayer();
   const auto cat = War3RenderState::GetStageCategory();
