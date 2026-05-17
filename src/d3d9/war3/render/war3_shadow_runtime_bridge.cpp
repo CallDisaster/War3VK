@@ -4252,6 +4252,18 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         ::dxvk::war3::hooks::QueryWriteMaskRegionFromForObjectCount();
     summary.writeMaskRegionFromOtherCallerCount =
         ::dxvk::war3::hooks::QueryWriteMaskRegionFromOtherCallerCount();
+
+    // Phase 7.116：DispatchToShape (建筑/装饰物/可破坏物 shadow footprint)。
+    summary.dispatchToShapeEnterCount =
+        ::dxvk::war3::hooks::QueryDispatchToShapeEnterCount();
+    summary.dispatchToShapeRejectedCount =
+        ::dxvk::war3::hooks::QueryDispatchToShapeRejectedCount();
+    summary.dispatchToShapeFromRebuildMaskCount =
+        ::dxvk::war3::hooks::QueryDispatchToShapeFromRebuildMaskCount();
+    summary.dispatchToShapeFromShadowSetupCount =
+        ::dxvk::war3::hooks::QueryDispatchToShapeFromShadowSetupCount();
+    summary.dispatchToShapeFromOtherCallerCount =
+        ::dxvk::war3::hooks::QueryDispatchToShapeFromOtherCallerCount();
     // Phase 7.108：ShadowProjector 永久统计。
     summary.projectorAddFromObjectEnterCount =
         ::dxvk::war3::hooks::QueryShadowProjectorAddFromObjectEnterCount();

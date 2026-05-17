@@ -102,6 +102,13 @@ struct ShadowHookAddresses {
    * 静态阴影，不影响 fog/LOS/path。详见
    * docs/plan/overnight_render_paper_2026_05_15/06_fogmask_static_shadow.md §7.1。 */
   LPVOID terrainShadowWriteMaskRegionAddr = nullptr;           // 0x234710
+
+  /** @brief Phase 7.116: TerrainShadow_DispatchToShape - 建筑/装饰物/可破坏物
+   * 静态阴影 footprint 写入的唯一汇聚点。内部走 BoxFastpath/PolyFastpath
+   * 直接修改 mask grid，与 fog/LOS/path/visibility（走 WriteMaskRegion）完全独立。
+   * 5 个 caller 全部是 shadow path，hook 入口直接 return 0 即可干净屏蔽
+   * 所有建筑/装饰物/可破坏物 footprint shadow，不影响其他 mask 写入。 */
+  LPVOID terrainShadowDispatchToShapeAddr = nullptr;           // 0x234420
 };
 
 /**
@@ -129,6 +136,13 @@ uint64_t QueryWriteMaskRegionFromRebuildMaskCount();
 uint64_t QueryWriteMaskRegionFromActorRuntimeCount();
 uint64_t QueryWriteMaskRegionFromForObjectCount();
 uint64_t QueryWriteMaskRegionFromOtherCallerCount();
+
+// Phase 7.116：DispatchToShape (建筑/装饰物/可破坏物 shadow footprint) 诊断。
+uint64_t QueryDispatchToShapeEnterCount();
+uint64_t QueryDispatchToShapeRejectedCount();
+uint64_t QueryDispatchToShapeFromRebuildMaskCount();
+uint64_t QueryDispatchToShapeFromShadowSetupCount();
+uint64_t QueryDispatchToShapeFromOtherCallerCount();
 
 // Phase 7.108：ShadowProjector 诊断计数器（control plane 透传用）。
 // 这条路径是 Game.dll 自己的"投影器阴影"系统（CTerrainUberSplats），

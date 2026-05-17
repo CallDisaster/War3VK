@@ -101,6 +101,7 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x76D69A, // shadowRegisterRetFromPoint
       0x76D719, // shadowRegisterRetFromTwoPoints
       0x65A140, // widgetRegisterFootprintAndShadowMask（论文第6章中央 sync 入口）
+      0x234420, // terrainShadowDispatchToShape（Phase 7.116 建筑/装饰物 shadow 真正路径）
       0x234710, // terrainShadowWriteMaskRegion（论文 §6.7.1 方案 A）
 
       // RenderQueue 数据区

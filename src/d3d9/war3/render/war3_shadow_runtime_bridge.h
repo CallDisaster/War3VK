@@ -440,6 +440,13 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t writeMaskRegionFromForObjectCount = 0;
   uint64_t writeMaskRegionFromOtherCallerCount = 0;
 
+  // Phase 7.116：DispatchToShape (建筑/装饰物/可破坏物原生静态阴影) 屏蔽诊断。
+  uint64_t dispatchToShapeEnterCount = 0;
+  uint64_t dispatchToShapeRejectedCount = 0;
+  uint64_t dispatchToShapeFromRebuildMaskCount = 0;
+  uint64_t dispatchToShapeFromShadowSetupCount = 0;
+  uint64_t dispatchToShapeFromOtherCallerCount = 0;
+
   // Phase 7.108：ShadowProjector 永久 atomic 计数（独立于 D3D9 mesh draw 路径）。
   uint64_t projectorAddFromObjectEnterCount = 0;
   uint64_t projectorAddFromObjectBlockedCount = 0;

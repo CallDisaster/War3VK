@@ -624,6 +624,10 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
     shadowHooks.terrainShadowWriteMaskRegionAddr =
         resolveCode(book.terrainShadowWriteMaskRegion,
                     "TerrainShadow_WriteMaskRegion");
+    // Phase 7.116：建筑/装饰物/可破坏物原生静态阴影 footprint 真正写入路径。
+    shadowHooks.terrainShadowDispatchToShapeAddr =
+        resolveCode(book.terrainShadowDispatchToShape,
+                    "TerrainShadow_DispatchToShape");
     dxvk::war3::hooks::InstallShadowHooks(shadowHooks);
 
     // Phase 7.98：CWidget 身份链中央 sync Hook。

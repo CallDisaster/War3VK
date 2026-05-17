@@ -907,12 +907,26 @@ typedef int (__thiscall *TerrainShadowWriteMaskRegionFn)(void *thisPtr, void *a2
                                                          int a5);
 TerrainShadowWriteMaskRegionFn g_trampolineTerrainShadowWriteMaskRegion = nullptr;
 
+// Phase 7.116：DispatchToShape 签名（__thiscall, this+a2+a3）。
+// IDA: int __thiscall TerrainShadow_DispatchToShape(_DWORD *this, _DWORD *a2, int a3)
+typedef int (__thiscall *TerrainShadowDispatchToShapeFn)(void *thisPtr, void *a2,
+                                                         int a3);
+TerrainShadowDispatchToShapeFn g_trampolineTerrainShadowDispatchToShape = nullptr;
+
 std::atomic<uint64_t> g_writeMaskRegionEnterCount{0};
 std::atomic<uint64_t> g_writeMaskRegionRejectedIdx3Count{0};
 std::atomic<uint64_t> g_writeMaskRegionPassFogCount{0};   // idx==0
 std::atomic<uint64_t> g_writeMaskRegionPassLosCount{0};   // idx==1
 std::atomic<uint64_t> g_writeMaskRegionPassPathCount{0};  // idx==2
 std::atomic<uint64_t> g_writeMaskRegionPassOtherCount{0};
+
+// Phase 7.116：DispatchToShape 永久 atomic 计数器。
+// reject 默认开启，counter 永久累加（用于 control plane 验证拦截命中频率）。
+std::atomic<uint64_t> g_dispatchToShapeEnterCount{0};
+std::atomic<uint64_t> g_dispatchToShapeRejectedCount{0};
+std::atomic<uint64_t> g_dispatchToShapeFromRebuildMaskCount{0};
+std::atomic<uint64_t> g_dispatchToShapeFromShadowSetupCount{0};
+std::atomic<uint64_t> g_dispatchToShapeFromOtherCallerCount{0};
 
 // Phase 7.112：caller-aware 拦截统计。
 std::atomic<uint64_t> g_writeMaskRegionFromBuildingStampCount{0};
@@ -938,6 +952,17 @@ constexpr uintptr_t kTerrainShadowFromActorRuntimeSize = 0x128u;
 // TerrainShadow_WriteMaskRegion_ForObject @ Game.dll+0x2346FC, size 0xE9
 constexpr uintptr_t kTerrainShadowForObjectRva = 0x2346FCu;
 constexpr uintptr_t kTerrainShadowForObjectSize = 0xE9u;
+
+// Phase 7.116：DispatchToShape caller 范围。
+// sub_6F21A890 (widget shadow setup), 0xAF
+constexpr uintptr_t kShadowSetup21A890Rva = 0x21A890u;
+constexpr uintptr_t kShadowSetup21A890Size = 0xAFu;
+// sub_6F21A9A0, 0x73
+constexpr uintptr_t kShadowSetup21A9A0Rva = 0x21A9A0u;
+constexpr uintptr_t kShadowSetup21A9A0Size = 0x73u;
+// sub_6F21AA60, 0x6F
+constexpr uintptr_t kShadowSetup21AA60Rva = 0x21AA60u;
+constexpr uintptr_t kShadowSetup21AA60Size = 0x6Fu;
 
 // Phase 7.108：ShadowProjector 永久 atomic 计数器。
 // 这条路径独立于 D3D9 mesh draw（CTerrainUberSplats 系统），
@@ -1186,6 +1211,76 @@ int __thiscall Hook_TerrainShadow_WriteMaskRegion(void *thisPtr, void *a2,
   return 0;
 }
 
+// Phase 7.116：TerrainShadow_DispatchToShape hook。
+// 这是建筑/装饰物/可破坏物原生静态阴影 footprint 写入的唯一汇聚点。
+// 5 个 caller 全部是 shadow path（见 war3_internal_test_config.h §Phase 7.116），
+// 与 fog/LOS/path/visibility 完全独立。开关启用时入口直接 return -1（caller
+// 把 DispatchToShape 返回值当 result 索引，-1 / 任意非命中值会让 caller 跳过
+// 后续 Box/Poly 写入），不调 trampoline，零 fog/LOS/path 副作用。
+int __thiscall Hook_TerrainShadow_DispatchToShape(void *thisPtr, void *a2,
+                                                   int a3) {
+  g_dispatchToShapeEnterCount.fetch_add(1, std::memory_order_relaxed);
+
+  // caller 分桶诊断（默认关，需要调试时开 kNativeStaticShadowDispatchToShapeCallerDiagnostics）。
+  if constexpr (dxvk::war3::internal::
+                    kNativeStaticShadowDispatchToShapeCallerDiagnostics) {
+#if defined(_MSC_VER) && !defined(__GNUC__)
+    const uintptr_t retAddr = reinterpret_cast<uintptr_t>(_ReturnAddress());
+#else
+    const uintptr_t retAddr =
+        reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+#endif
+    const uintptr_t gameBase = GetGameDllBase();
+    const bool fromRebuild =
+        IsAddrInFuncRange(retAddr, gameBase + kTerrainShadowRebuildMaskRva,
+                          kTerrainShadowRebuildMaskSize);
+    const bool fromSetup21A890 = IsAddrInFuncRange(
+        retAddr, gameBase + kShadowSetup21A890Rva, kShadowSetup21A890Size);
+    const bool fromSetup21A9A0 = IsAddrInFuncRange(
+        retAddr, gameBase + kShadowSetup21A9A0Rva, kShadowSetup21A9A0Size);
+    const bool fromSetup21AA60 = IsAddrInFuncRange(
+        retAddr, gameBase + kShadowSetup21AA60Rva, kShadowSetup21AA60Size);
+    if (fromRebuild) {
+      g_dispatchToShapeFromRebuildMaskCount.fetch_add(
+          1, std::memory_order_relaxed);
+    } else if (fromSetup21A890 || fromSetup21A9A0 || fromSetup21AA60) {
+      g_dispatchToShapeFromShadowSetupCount.fetch_add(
+          1, std::memory_order_relaxed);
+    } else {
+      g_dispatchToShapeFromOtherCallerCount.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+  }
+
+  // reject 默认开启 — 干净屏蔽建筑/装饰物/可破坏物 footprint shadow。
+  if constexpr (dxvk::war3::internal::
+                    kNativeStaticShadowDispatchToShapeRejectEnabled) {
+    const uint64_t logIdx = g_dispatchToShapeRejectedCount.fetch_add(
+        1, std::memory_order_relaxed);
+    if constexpr (dxvk::war3::internal::
+                      kNativeStaticShadowDispatchToShapeDebugLog) {
+      if (logIdx < 8u) {
+        char buf[200];
+        snprintf(buf, sizeof(buf),
+                 "DXVK War3Hook[Shadow]: STATIC SHADOW DISPATCH REJECT #%llu "
+                 "this=%p a2=%p a3=0x%X",
+                 static_cast<unsigned long long>(logIdx + 1u), thisPtr, a2,
+                 static_cast<unsigned int>(a3));
+        ::dxvk::Logger::info(buf);
+      }
+    }
+    // 返回 0：caller 用返回值当形状写入完成标记或下一步 result 索引；
+    // 返回非命中值让上游 caller 跳过 Box/Poly 写入即可。
+    // 历史 Add_FromObject hook 拒绝时也用 -1，DispatchToShape 没有形状命中时
+    // 默认返回 result（switch fall-through），非命中值即可。这里返回 0。
+    return 0;
+  }
+
+  if (g_trampolineTerrainShadowDispatchToShape)
+    return g_trampolineTerrainShadowDispatchToShape(thisPtr, a2, a3);
+  return 0;
+}
+
 } // namespace
 
 // Phase 7.100：跨 TU 暴露的 WriteMaskRegion 诊断 atomic 读取器。
@@ -1268,6 +1363,23 @@ uint32_t QueryShadowProjectorObservedFourCCSampleAt(uint32_t idx) {
   if (idx >= g_projectorObservedFourCCSamples.size())
     return 0u;
   return g_projectorObservedFourCCSamples[idx].load(std::memory_order_relaxed);
+}
+
+// Phase 7.116：DispatchToShape 永久 atomic 读取器。
+uint64_t QueryDispatchToShapeEnterCount() {
+  return g_dispatchToShapeEnterCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryDispatchToShapeRejectedCount() {
+  return g_dispatchToShapeRejectedCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryDispatchToShapeFromRebuildMaskCount() {
+  return g_dispatchToShapeFromRebuildMaskCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryDispatchToShapeFromShadowSetupCount() {
+  return g_dispatchToShapeFromShadowSetupCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryDispatchToShapeFromOtherCallerCount() {
+  return g_dispatchToShapeFromOtherCallerCount.load(std::memory_order_relaxed);
 }
 
 // Phase 7.100：跨 TU 暴露的 WriteMaskRegion 诊断 atomic 读取器。
@@ -1394,6 +1506,38 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
           reinterpret_cast<LPVOID>(&Hook_TerrainShadow_WriteMaskRegion),
           reinterpret_cast<LPVOID *>(&g_trampolineTerrainShadowWriteMaskRegion),
           "Shadow", "TerrainShadow_WriteMaskRegion", false, true);
+    }
+  }
+
+  // Phase 7.116：TerrainShadow_DispatchToShape hook 安装。
+  // 这是建筑/装饰物/可破坏物 shadow footprint 的真正写入路径。
+  // 与 fog/LOS/path/visibility 完全独立，hook 入口直接 return 0 即可干净屏蔽。
+  if constexpr (dxvk::war3::internal::
+                    kNativeStaticShadowDispatchToShapeRejectEnabled ||
+                dxvk::war3::internal::
+                    kNativeStaticShadowDispatchToShapeCallerDiagnostics) {
+    {
+      char buf[160];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: DispatchToShape install attempt addr=%p",
+               addrs.terrainShadowDispatchToShapeAddr);
+      ::dxvk::Logger::info(buf);
+    }
+    if (addrs.terrainShadowDispatchToShapeAddr != nullptr) {
+      const bool ok = InstallMinHook(
+          addrs.terrainShadowDispatchToShapeAddr,
+          reinterpret_cast<LPVOID>(&Hook_TerrainShadow_DispatchToShape),
+          reinterpret_cast<LPVOID *>(&g_trampolineTerrainShadowDispatchToShape),
+          "Shadow", "TerrainShadow_DispatchToShape", false, true);
+      anyInstalled |= ok;
+      char buf[100];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: DispatchToShape install result=%s",
+               ok ? "ok" : "fail");
+      ::dxvk::Logger::info(buf);
+    } else {
+      ::dxvk::Logger::info(
+          "DXVK War3Hook[Shadow]: DispatchToShape install SKIPPED - nullptr");
     }
   }
   return anyInstalled;

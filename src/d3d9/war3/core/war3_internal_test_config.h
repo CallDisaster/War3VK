@@ -1029,6 +1029,34 @@ inline constexpr bool kNativeStaticShadowHideDestructibleFootprintEnabled =
 // 与原子 add，可观察的性能影响极小（<0.05ms）。但既然默认未启用 reject，
 // 把 caller 分桶也门控起来减少不必要常驻开销。需要调试时启用。
 inline constexpr bool kNativeStaticShadowMaskCallerDiagnostics = false;
+
+// ============================================================================
+// Phase 7.116：DispatchToShape (建筑/装饰物/可破坏物原生静态阴影) 屏蔽
+// ============================================================================
+// TerrainShadow_DispatchToShape (Game.dll+0x234420) 是 War3 1.27a 写入建筑物
+// /装饰物/可破坏物预渲染贴花阴影 footprint 的**唯一汇聚点**。内部走
+// BoxFastpath/PolyFastpath 直接修改 mask grid (CFogOfWarMap[11]/[12])。
+//
+// 关键性质：与 fog/LOS/path/visibility（这些走 WriteMaskRegion）**完全独立**。
+// 5 个 caller 全部是 shadow path：
+//   - sub_6F21A890 / sub_6F21A9A0 / sub_6F21AA60: widget shadow setup helper
+//     （CWidget shadow flag 设置时调，shadow-only 路径）
+//   - TerrainShadow_RebuildMaskFromObjectLists LABEL_55 (offset 0x234055)：
+//     重建期 SHADOW present + NO_FOG_DIRTY 路径
+//   - TerrainShadow_RebuildMaskFromObjectLists LABEL_88 (offset 0x234325)：
+//     重建期 SHADOW present + FOG_DIRTY 路径
+//
+// 因此 hook 入口直接 return 0 即可干净屏蔽**所有**建筑/装饰物/可破坏物
+// footprint shadow，不影响 fog/LOS/path/visibility 任何子系统。
+//
+// 默认开启。env DXVK_WAR3_STATIC_SHADOW_DISABLE_DISPATCH=0 可恢复（仅调试用）。
+inline constexpr bool kNativeStaticShadowDispatchToShapeRejectEnabled = true;
+// caller-aware 分桶诊断（默认开）：调试时观察 5 个 caller 各自命中频率。
+// Phase 7.116 默认开启以便实测验证 hook 是否被调到（hook 入口固定 enter+1，
+// 但 caller 分桶帮助识别是否真的来自 shadow path）。
+inline constexpr bool kNativeStaticShadowDispatchToShapeCallerDiagnostics = true;
+// 调试日志：前 8 次 reject 写入 dxvk log（默认开第一刀，确认拦截后再关）。
+inline constexpr bool kNativeStaticShadowDispatchToShapeDebugLog = true;
 // 开启路径阻断器隐藏时，是否强制开启桥接追踪（确保 ShadowCapture 能拿到 rawcode）。
 inline constexpr bool kPathBlockerForceBridgeTrackingEnabled = false;
 // “仅路径阻断器追踪”模式下的组掩码（bit0=group0, bit1=group1 ...）。
@@ -1141,6 +1169,7 @@ inline constexpr uint32_t kPathBlockerFourCCs[] = {
     0x59546663u, // 'YTfc' - 路径阻断器(全部)(大)
     0x59546C62u, // 'YTlb' - 视野阻断器
     0x59546C63u, // 'YTlc' - 视野阻断器(大)
+    0x68666F6Fu,
 };
 inline constexpr uint32_t kPathBlockerFourCCsCount =
     sizeof(kPathBlockerFourCCs) / sizeof(kPathBlockerFourCCs[0]);

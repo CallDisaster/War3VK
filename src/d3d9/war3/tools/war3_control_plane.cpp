@@ -1241,6 +1241,17 @@ json ToJson(const render::ShadowRuntimeBridgeSummary& summary) {
        summary.writeMaskRegionFromForObjectCount},
       {"writeMaskRegionFromOtherCallerCount",
        summary.writeMaskRegionFromOtherCallerCount},
+      // Phase 7.116：DispatchToShape (建筑/装饰物/可破坏物原生静态阴影)。
+      {"dispatchToShapeEnterCount",
+       summary.dispatchToShapeEnterCount},
+      {"dispatchToShapeRejectedCount",
+       summary.dispatchToShapeRejectedCount},
+      {"dispatchToShapeFromRebuildMaskCount",
+       summary.dispatchToShapeFromRebuildMaskCount},
+      {"dispatchToShapeFromShadowSetupCount",
+       summary.dispatchToShapeFromShadowSetupCount},
+      {"dispatchToShapeFromOtherCallerCount",
+       summary.dispatchToShapeFromOtherCallerCount},
       // Phase 7.108：ShadowProjector 永久统计。
       {"projectorAddFromObjectEnterCount",
        summary.projectorAddFromObjectEnterCount},

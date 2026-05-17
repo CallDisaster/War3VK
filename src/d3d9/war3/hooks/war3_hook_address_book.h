@@ -123,6 +123,16 @@ struct War3HookAddressBook {
   // 抓取 widget 身份链（rawcode + jHandle），喂给 RenderObjectRegistry 兜底。
   uintptr_t widgetRegisterFootprintAndShadowMask = 0;  // 0x65A140
 
+  // Phase 7.116：建筑/装饰物/可破坏物原生静态阴影屏蔽的真正路径。
+  // TerrainShadow_DispatchToShape 是 shadow footprint 写入的唯一汇聚点，
+  // 内部走 BoxFastpath/PolyFastpath 直接修改 mask grid。它的 5 个 caller
+  // 全部是 shadow path：
+  //   - sub_6F21A890 / sub_6F21A9A0 / sub_6F21AA60: widget shadow setup helper
+  //   - RebuildMaskFromObjectLists LABEL_55 / LABEL_88: 整体重建 shadow 路径
+  // 与 fog/LOS/path/visibility（走 WriteMaskRegion）完全独立，hook 入口直接
+  // return 0 即可干净屏蔽所有建筑/装饰物/可破坏物 footprint shadow。
+  uintptr_t terrainShadowDispatchToShape = 0;  // 0x234420
+
   // Phase 7.100：TerrainShadow_WriteMaskRegion 是 War3 1.27a 静态阴影
   // (建筑/可破坏物的预渲染贴花阴影) 的真正写入函数。所有 30+ 个 mask 写入
   // 路径都汇聚到这里。详细论证见
