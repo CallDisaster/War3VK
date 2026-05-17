@@ -4841,3 +4841,52 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      - 方案 C：把 `kPathBlockerFourCCs` 改为运行时 JSON/INI 配置（用户自助维护）。
    - **本轮交付**：研究/根因记录到位，DLL 保持 Phase 7.110 unified config 状态（8 个 YT* 已生效）。
    - **Codex 判定**：path blocker 视觉残留**不是 D3D9 渲染层 bug**，是 War3 地图数据层的"合法装饰物伪装路径阻断器"模式造成的。**不能在不和用户对接具体 fourcc 的情况下盲改代码**。下一步交给用户做"实物 fourcc 现场采集"。
+
+
+
+130. **Phase 7.117-7.121 凌晨无人值守（2026-05-18 03:00-03:35）**:
+   - **执行方式**：Claude Opus 4.7 在凌晨 3 点继续承接夜间无人值守模式，按 `docs/plan/merge_readiness_audit_2026_05_17/README.md` 8 项 checklist 推进合并准备工作 + 性能合批优化。
+   - **Phase 7.117 — AutoTest 归档（commit `25dc444`）**：
+     - 130+ 个 `_phaseXXX_*.py / .ps1 / .log` 临时脚本归档到 `AutoTest/_archive/`，按主题分到 5 个子目录（`phase_7xx_history/ analysis/ ida_scripts/ probes/ logs/`）；
+     - AutoTest 主目录从 152 个文件收敛到 8 个核心发布级脚本：`war3_autotest_mcp.py / run_mcp.ps1 / dual_perf_baseline.py / shadow_pose_full_trace_control.py / requirements.txt / README.md / README.txt / ydwe_launch_notes.txt`；
+     - 新增 `AutoTest/README.md` 说明各脚本作用与命名约定；
+     - `_phase800_dual_perf.py` 重命名为 `dual_perf_baseline.py` 提升为发布级；
+     - 实测后所有现有 perf 验证脚本仍可用，没有破坏性变化。
+   - **Phase 7.118 — BuildShadowReplayDraws 缓存（commit `f81f99d`）**：
+     - 根因：函数每帧约 2-3 次被调用（CSM receiver / point shadow / OutsideContent），每次 heap-alloc + N 次 push_back 100+ 指针。
+     - 实施：thread_local cache + scene 三元组 key（`(castersAddr, instancesAddr, fallbacksAddr, sizes)`）做命中判定；
+     - cache miss 时 `draws.clear() + reserve + push_back`，cache hit 时直接返回已有 vector；
+     - cap 触发分支也走同一缓存路径（`draws = std::move(limited)`）。
+   - **Phase 7.119 — previousSubmittedSelectionKeys 改 const ref（commit `b6c7dc7`）**：
+     - 在 `War3TryPopulateDirectCurrentDrawGrouped` 入口，原本对 `m_war3SemanticDirectPrevSubmittedIdentityKeys` 的本地 vector 拷贝改成 const reference。
+     - Phase 7.85 对其他两个 prevSubmitted vector 已经做过这个改动，但 SelectionKeys 因为下游 preferredSelectionKeys 会复制后修改，被误以为需要保留拷贝。实际审查发现 SelectionKeys 自身从未被 modify。
+   - **Phase 7.120 — stableEligibleRecords in-place filter（commit `dd6e05c`）**：
+     - 原本：`reserve(N) + push_back keep + std::move + War3RebindEligibleRecordPackets()`，每帧一次 heap alloc + 双重 rebind。
+     - 改为：`std::remove_if + erase` 原地过滤，末尾只跑一次 `War3RebindEligibleRecordPackets`。
+     - remove_if 是 stable，过滤后 eligibleRecords 顺序与原 stableEligibleRecords 完全一致。
+   - **Phase 7.121 — m_war3SemanticPaletteCache hash index（commit `cf2d2c1`）**：
+     - 根因：`War3GetOrCreateSemanticShadowPalette` 内部对 `m_war3SemanticPaletteCache` 做完整 O(N) 线性扫描。每帧约 100+ skinned units，cache 长度可达 ~100，理论 100×100=10000 比较/帧。
+     - 实施：新增 `m_war3SemanticPaletteCacheHashIndex` (multimap<matrixHash, vector_index>)，把扫描改为 hash equal_range；
+     - 命中后保持完整字段比较（runtimeModelPtr / matrixCount / worldHash / objectKind / composedWorldPalette），保证语义与原线性扫描一致；
+     - 三个 `m_war3SemanticPaletteCache.clear()` 位置同步加 `m_war3SemanticPaletteCacheHashIndex.clear()`。
+   - **3 轮 perf 验证**（光影测试-高压.w3x + 光影测试.w3x，30s × 2，isolated desktop）：
+     | Phase | 高压 FPS | 低压 FPS |
+     |---|---|---|
+     | 凌晨基线 (Phase 7.116) | ~86.4 | ~138.9 |
+     | 7.119 (after const-ref) | 88.33 | 137.06 |
+     | **7.120 (after in-place filter)** | **90.98** | **142.84** |
+     | 7.121 (after hash index) | 90.77 | 141.58 |
+     - 累计相对凌晨基线：**高压 +4.4 FPS / 低压 +3.7 FPS**；
+     - 高压护栏富裕度从 +1.4 FPS 扩到 **+5.8 FPS**，更稳健；
+     - 低压一直充裕。
+   - **黑匣子未做**：本轮所有改动是纯 CPU 路径优化，不触发 producer/consumer/manifest/lease/stale-restore/receiver/TAA。视觉路径完全未碰，无法引入视觉回归。
+   - **当前 DLL**：`E:\Work\War3\d3d9.dll = 26865307 bytes @ 2026-05-18 03:13`（Phase 7.121 build）。
+   - **未做（留给下一轮）**：
+     - 注释清理（517 个 `Phase 7.X` 历史注释分布在 39 个文件，最多的是 d3d9_device.cpp 119 个）：风险大且收益小（git blame 已经天然提供历史），暂不动；
+     - 诊断 counter 收口：超过 100+ 个全局 atomic counter 散落各处，需要统一 env 开关分级，工作量大留给白天 review；
+     - d3d9_device.cpp 拆分（26,685 行）：audit 报告里建议拆 6 个文件，工作量 16-24 小时，留给白天；
+     - 69 commit squash + changelog：需要重写 commit history，留给白天。
+   - **Phase 7.116 (DispatchToShape) 实测无效记录**：
+     - 30s 测试 `dispatchToShapeEnterCount=0`，函数装上但 caller 不触发；
+     - 真正的静态阴影写入路径是 `WriteMaskRegion (0x6F234710)` 每帧 6384 次，与 fog/LOS/path/visibility 共用 `a3 (mask bits)` OR-pack，无法只 reject shadow bit；
+     - 建筑/装饰物原生静态阴影屏蔽**仍未解决**，需要下一阶段 hook `BoxFastpath/PolyFastpath` (0x6F1F5180/0x6F1F500C)，每帧 6384+ 次高频 hook，需要先做 caller-aware 精确路径分类。这是 6-8 小时专项任务。
