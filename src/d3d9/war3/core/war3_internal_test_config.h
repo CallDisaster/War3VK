@@ -982,6 +982,23 @@ inline constexpr uint32_t kShadowRunStatsLogIntervalFrames = 300;
 inline bool kPathBlockerDebugEnabled = false; // 启用诊断日志
 inline bool kPathBlockerHideEnabled = true;   // 隐藏路径阻断器渲染
 
+// ========================================================================
+// Phase 7.123：draw-time VB cache 单帧 GPU buffer alloc 预算
+// ========================================================================
+// 用户报告：高压地图里"刚把视野从未观察过的桥/斜坡上扫过去会触发首帧暴降"。
+// 根因：v4 capture 在 cache miss 时同步 createBuffer (DEVICE_LOCAL) +
+// EmitCs(copyBuffer)，一帧内大量新 caster 集中进入视野时这些 alloc 一次性
+// 发生，主线程阻塞数十毫秒。
+//
+// 修复：单帧 alloc 预算上限。超过预算的 cache miss 跳过 capture，等下一帧
+// 重新尝试。视觉上 caster 第一帧没影子第二帧才有，但帧时长不再尖刺。
+//
+// 预算大小：12 个 / 帧。一个典型 caster 需要 1-3 个 buffer alloc（pos + 可选
+// uv + 可选 ib），所以 12 大约支持 4-12 个新 caster / 帧。一秒内可以处理
+// 240-720 个新 caster，远高于实机镜头扫过桥/斜坡区域的瞬时新 caster 量级。
+inline constexpr uint32_t kShadowDrawTimeVBCacheAllocBudgetPerFrame = 12u;
+inline constexpr bool kShadowDrawTimeVBCacheAllocBudgetEnabled = true;
+
 // Phase 7.100：建筑/装饰物静态阴影治理。
 // 论文 §7.1 推断 hook TerrainShadow_WriteMaskRegion (0x234710) + 拦截
 // maskIdx==3 即可干净屏蔽。但 Phase 7.101 实测推翻：

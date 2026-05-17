@@ -24058,8 +24058,33 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
 
         // 分配/复用 device-local position buffer
-        if (entry.positionBuffer == nullptr ||
-            entry.positionCapacity < posBytes) {
+        // Phase 7.123：单帧 alloc 预算 gate。如果本帧已经创建超过 N 个新 buffer
+        // 就把这个 cache miss 推到下一帧，避免主线程被一批 vkAllocateMemory
+        // 同步阻塞。已存在足够 capacity 的 entry 直接走，不消耗预算。
+        const bool needsNewPositionBuffer =
+            entry.positionBuffer == nullptr ||
+            entry.positionCapacity < posBytes;
+        if (needsNewPositionBuffer &&
+            dxvk::war3::internal::kShadowDrawTimeVBCacheAllocBudgetEnabled) {
+          // 预算每帧自动重置（按 m_war3ShadowPersistentFrameSerial）。
+          if (m_war3DrawTimeVBCacheAllocBudgetFrame !=
+              m_war3ShadowPersistentFrameSerial) {
+            m_war3DrawTimeVBCacheAllocBudgetFrame =
+                m_war3ShadowPersistentFrameSerial;
+            m_war3DrawTimeVBCacheAllocBudgetThisFrame = 0u;
+            m_war3DrawTimeVBCacheBudgetDeferredCount = 0u;
+          }
+          if (m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
+              dxvk::war3::internal::
+                  kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
+            m_war3DrawTimeVBCacheBudgetDeferredCount++;
+            // 不增加 capture / position copy 计数，让下游知道这条 entry 还没
+            // 完成。下游 producer/consumer 看到 positionBuffer==nullptr 自动
+            // skip，等下一帧再来。
+            break;
+          }
+        }
+        if (needsNewPositionBuffer) {
           DxvkBufferCreateInfo posInfoCi = {};
           posInfoCi.size = War3AlignPersistentBytes(posBytes);
           posInfoCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -24076,6 +24101,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             entry.positionBuffer = std::move(buf);
             entry.positionCapacity = posInfoCi.size;
             m_war3Scene.shadowStats.drawTimeVBCachePositionAllocCount++;
+            // Phase 7.123：扣减预算。
+            m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
           }
         }
         if (entry.positionBuffer == nullptr) {
@@ -24154,6 +24181,17 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                         VkDeviceSize(uvStride)) {
                   if (entry.uvBuffer == nullptr ||
                       entry.uvCapacity < uvBytes) {
+                    // Phase 7.123：UV buffer alloc 也扣预算（同帧多次 alloc
+                    // 才是真正的卡点）。如果预算耗尽就保留 entry 现有 uvBuffer
+                    // 状态（可能是 nullptr → 下游 alpha-test 暂时不可用，但
+                    // position 已经 ready，可以照常画硬阴影）。
+                    if (dxvk::war3::internal::
+                            kShadowDrawTimeVBCacheAllocBudgetEnabled &&
+                        m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
+                            dxvk::war3::internal::
+                                kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
+                      m_war3DrawTimeVBCacheBudgetDeferredCount++;
+                    } else {
                     DxvkBufferCreateInfo uvCi = {};
                     uvCi.size = War3AlignPersistentBytes(uvBytes);
                     uvCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -24170,7 +24208,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                       entry.uvBuffer = std::move(uvBuf);
                       entry.uvCapacity = uvCi.size;
                       m_war3Scene.shadowStats.drawTimeVBCacheUvAllocCount++;
+                      // Phase 7.123：扣 UV alloc 预算。
+                      m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
                     }
+                    } // end Phase 7.123 budget else
                   }
                   if (entry.uvBuffer != nullptr) {
                     auto uvSrcBuf = uvSrcSlice.buffer();
@@ -24227,6 +24268,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 VkDeviceSize(StartVal + CountVal) * idxStride) {
               if (entry.indexBuffer == nullptr ||
                   entry.indexCapacity < idxBytes) {
+                // Phase 7.123：IB alloc 也扣预算。预算耗尽时跳过 IB alloc，
+                // 整条 entry 留作"无 IB 状态"。下游消费者看到 indexBuffer ==
+                // nullptr 会跳过这次 caster 提交，第二帧补齐。
+                if (dxvk::war3::internal::
+                        kShadowDrawTimeVBCacheAllocBudgetEnabled &&
+                    m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
+                        dxvk::war3::internal::
+                            kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
+                  m_war3DrawTimeVBCacheBudgetDeferredCount++;
+                } else {
                 DxvkBufferCreateInfo idxInfoCi = {};
                 idxInfoCi.size = War3AlignPersistentBytes(idxBytes);
                 idxInfoCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -24242,7 +24293,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   entry.indexBuffer = std::move(idxBuf);
                   entry.indexCapacity = idxInfoCi.size;
                   m_war3Scene.shadowStats.drawTimeVBCacheIndexAllocCount++;
+                  // Phase 7.123：扣 IB alloc 预算。
+                  m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
                 }
+                } // end Phase 7.123 budget else
               }
               if (entry.indexBuffer != nullptr) {
                 auto idxSrcBuf = ibSlice.buffer();

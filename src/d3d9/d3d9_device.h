@@ -2060,6 +2060,15 @@ private:
   };
   std::unordered_map<void*, War3DrawTimeVBEntry> m_war3DrawTimeVBCache;
   uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;
+  // Phase 7.123：per-frame GPU buffer alloc 预算，限制单帧 capture 端创建多少
+  // 新的 device-local buffer。当一批新 caster 同时进入视野（如桥/斜坡/装饰物
+  // 集中区域）时，原本会一次性触发数十次 createBuffer + EmitCs(copyBuffer)，
+  // 阻塞主线程产生首帧暴降。预算耗尽后剩余的 cache miss 会被推到下一帧。
+  // 视觉上 caster 的 shadow 第一帧缺失，第二帧才出现，但帧时长不再尖刺。
+  uint32_t m_war3DrawTimeVBCacheAllocBudgetThisFrame = 0u;
+  uint64_t m_war3DrawTimeVBCacheAllocBudgetFrame = 0u;
+  // Phase 7.123：每帧因预算耗尽而被推迟的 cache miss 计数（诊断用）。
+  uint32_t m_war3DrawTimeVBCacheBudgetDeferredCount = 0u;
   bool m_war3SemanticSceneLastZeroSubmitUnitsOnly = true;
   bool m_war3SemanticSceneLastZeroSubmitNativeValidation = false;
   bool m_war3SemanticSceneLastSuccessfulSubmitUnitsOnly = true;
