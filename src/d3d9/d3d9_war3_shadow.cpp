@@ -295,9 +295,61 @@ ReceiverInputRejectReason ValidateMainWorldReceiverInput(
   return ReceiverInputRejectReason::None;
 }
 
+// 同一帧内 BuildShadowReplayDraws 会被多个调用点重复调（executePassImpl 入口、
+// renderPointShadow 等）。每次调用都做 heap allocation + N 次 push_back + 可能
+// 还会做 stable_sort，是干净的合批/缓存机会。
+//
+// 缓存采用 thread_local + scene 三元组（地址 + size）作为命中 key：
+//   - scene 的 shadowCasters / shadowInstances / shadowFallbacks 是
+//     `War3FrameScene` 的成员 vector，scene 在每帧初被 reset({})，向量地址保持
+//     稳定但内容可能改变；
+//   - 同一帧内 vector 不会再被 push（这点由 BeforeUi 的 publish 流程保证），
+//     所以 (address, size, capacity) 三元组对"同帧同 scene"是稳定的标识。
+//   - 不同帧 scene 重新填充会改 size，cache 自动失效。
+//   - 跨线程调用走各自 thread_local 副本，无锁竞争。
+struct ReplayDrawsCacheKey {
+  const void* castersAddr = nullptr;
+  const void* instancesAddr = nullptr;
+  const void* fallbacksAddr = nullptr;
+  size_t castersSize = 0u;
+  size_t instancesSize = 0u;
+  size_t fallbacksSize = 0u;
+
+  bool operator==(const ReplayDrawsCacheKey& rhs) const {
+    return castersAddr == rhs.castersAddr &&
+           instancesAddr == rhs.instancesAddr &&
+           fallbacksAddr == rhs.fallbacksAddr &&
+           castersSize == rhs.castersSize &&
+           instancesSize == rhs.instancesSize &&
+           fallbacksSize == rhs.fallbacksSize;
+  }
+};
+
+struct ReplayDrawsCache {
+  ReplayDrawsCacheKey key{};
+  bool valid = false;
+  std::vector<const War3ShadowCasterDraw*> draws;
+};
+
 std::vector<const War3ShadowCasterDraw*> BuildShadowReplayDraws(
     const War3FrameScene& scene) {
-  std::vector<const War3ShadowCasterDraw*> draws;
+  // thread_local 缓存：同一帧内重复调用直接复用上次的 draws 向量。
+  thread_local ReplayDrawsCache cache;
+
+  ReplayDrawsCacheKey key;
+  key.castersAddr = scene.shadowCasters.data();
+  key.instancesAddr = scene.shadowInstances.data();
+  key.fallbacksAddr = scene.shadowFallbacks.data();
+  key.castersSize = scene.shadowCasters.size();
+  key.instancesSize = scene.shadowInstances.size();
+  key.fallbacksSize = scene.shadowFallbacks.size();
+
+  if (cache.valid && cache.key == key) {
+    return cache.draws;
+  }
+
+  std::vector<const War3ShadowCasterDraw*>& draws = cache.draws;
+  draws.clear();
   draws.reserve(scene.shadowInstances.size() + scene.shadowFallbacks.size());
 
   for (const auto& instance : scene.shadowInstances) {
@@ -309,13 +361,19 @@ std::vector<const War3ShadowCasterDraw*> BuildShadowReplayDraws(
   for (const auto& fallback : scene.shadowFallbacks)
     draws.push_back(&fallback.snapshot);
 
-  if (!war3::internal::kShadowReplayCasterCapEnabled)
+  if (!war3::internal::kShadowReplayCasterCapEnabled) {
+    cache.key = key;
+    cache.valid = true;
     return draws;
+  }
 
   const size_t cap =
       std::max<size_t>(war3::internal::kShadowReplayCasterCap, 1u);
-  if (draws.size() <= cap)
+  if (draws.size() <= cap) {
+    cache.key = key;
+    cache.valid = true;
     return draws;
+  }
 
   auto computeTier = [](const War3ShadowCasterDraw& draw) {
     if (draw.category == War3RenderState::StageCategory::Terrain)
@@ -384,7 +442,12 @@ std::vector<const War3ShadowCasterDraw*> BuildShadowReplayDraws(
         static_cast<unsigned>(draws.size() - limited.size()));
   }
 
-  return limited;
+  // 把裁剪后的 limited 写回 cache.draws（覆盖 unfiltered draws），后续同 scene
+  // 调用直接命中。
+  draws = std::move(limited);
+  cache.key = key;
+  cache.valid = true;
+  return draws;
 }
 
 uint32_t ComputeAdaptiveShadowMapPeriod(size_t replayCasterCount) {
