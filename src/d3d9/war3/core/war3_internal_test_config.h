@@ -993,10 +993,11 @@ inline bool kPathBlockerHideEnabled = true;   // 隐藏路径阻断器渲染
 // 修复：单帧 alloc 预算上限。超过预算的 cache miss 跳过 capture，等下一帧
 // 重新尝试。视觉上 caster 第一帧没影子第二帧才有，但帧时长不再尖刺。
 //
-// 预算大小：12 个 / 帧。一个典型 caster 需要 1-3 个 buffer alloc（pos + 可选
-// uv + 可选 ib），所以 12 大约支持 4-12 个新 caster / 帧。一秒内可以处理
-// 240-720 个新 caster，远高于实机镜头扫过桥/斜坡区域的瞬时新 caster 量级。
-inline constexpr uint32_t kShadowDrawTimeVBCacheAllocBudgetPerFrame = 12u;
+// 预算大小：32 个 / 帧。一个典型 caster 需要 1-3 个 buffer alloc（pos + 可选
+// uv + 可选 ib），所以 32 大约支持 11-32 个新 caster / 帧。一秒内可以处理
+// 660-1920 个新 caster，覆盖电影模式视角压低后大量装饰物同时入视野 + 实机
+// 桥/斜坡突然出现的瞬时新 caster 量级。
+inline constexpr uint32_t kShadowDrawTimeVBCacheAllocBudgetPerFrame = 32u;
 inline constexpr bool kShadowDrawTimeVBCacheAllocBudgetEnabled = true;
 
 // Phase 7.100：建筑/装饰物静态阴影治理。
