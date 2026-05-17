@@ -4973,3 +4973,76 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
 - 每完成一个 T 立即写 commit 一段 AGENTS,避免压缩失忆。
 - 任何 T 卡 90 分钟没进展,切下一个,把当前进度作为遗留写到 AGENTS。
 - 性能护栏(>=85 高压 / >=120 低压)在每次 perf 验证时复核,跌破立即查回退点。
+
+
+
+---
+
+## 🎯 2026-05-18 凌晨 04:50 进度报告
+
+### ✅ 已完成
+
+**Phase 7.122 — Path blocker entry gate**（commit `ca5ad6b`）
+- 在 `War3TryCaptureShadowCaster` 函数最入口加 path blocker 总闸。
+- 解决 EarlyBypass 段 `earlyNeedsSemanticContext` 把 Terrain stage 排除导致 path blocker 走 doodad 路径漏网的问题。
+- 兜底：BuildShadowSemanticContext + jHandle reverse lookup + widget cache + widget+0x0C/+0x30 直读。
+- 命中后写 dxvk log（前 30 个 unique fourcc 各 1 行 via=EntryGate）。
+
+**Phase 7.123 — Per-frame GPU buffer alloc 预算**（commit `351ed2c`）
+- v4 capture 路径加单帧 alloc 预算（pos + uv + ib），超出后跳过 capture，下一帧重试。
+- 解决用户报告"刚把视野扫过未观察过的桥/斜坡触发首帧暴降"。
+- 默认值预算 = 12 / 帧（可 env 关）。
+
+**Phase 7.124 — Entry gate fast-path**（commit `12b76a6`）
+- Phase 7.122 entry gate 改为"廉价路径优先":currentObj/TLS handle 直接拿 rawcode → 黑名单匹配 → 命中即 return。
+- 慢路径(BuildShadowSemanticContext + widget cache + SafeRead)只对 rawcode==0 触发。
+- 修复 Phase 7.122 引入的 ~1 FPS 高压回退。
+
+**Phase 7.125 — Squash 准备文档**（commit `4857582`）
+- 写 `docs/plan/merge_readiness_audit_2026_05_17/CHANGELOG.md`，把 88 commit 按 10 个主题归类。
+
+**Phase 7.126 — 预算 12 → 32**（commit `ab61e92`）
+- 应对 SunkenCity 开局电影模式 + 高压地图桥/斜坡密集场景。
+
+### 📊 性能数据（凌晨 03:00 - 04:35 共 5 轮）
+
+| Phase | 高压 FPS | 低压 FPS |
+|---|---|---|
+| 凌晨基线 | 86.4 | 138.9 |
+| 7.119 | 88.33 | 137.06 |
+| 7.120 | 90.98 | 142.84 |
+| 7.121 | 90.77 | 141.58 |
+| 7.122/7.123 | 85.66 | 145.97 |
+| 7.124 | 86.59 | 141.69 |
+
+护栏一直保持(高压 ≥85, 低压 ≥120)。
+
+### ⚠️ 已知遗留(等用户起床验收)
+
+1. **Path blocker 视觉残留 — 等用户实机验证**
+   - 已加 entry gate(覆盖所有进 shadowCasters 的 capture 出口)。
+   - 已开 `kPathBlockerHideEnabled = true`(默认)。
+   - dxvk log 应该看到 `PATH BLOCKER REJECT #N rawcode=... via=EntryGate/EarlyBypass/...` 日志条目。
+   - 用户起床后:启动游戏 → 进高压地图右侧场地 → 看 dxvk.log → 确认拦了哪些 fourcc;若 fourcc 看起来不像 path blocker(LT*/HT* 等装饰物),说明地图层借用 model 伪装,需要扩黑名单。
+
+2. **首帧暴降 — Phase 7.123/7.126 已加预算 gate,需要实测验证**
+   - SunkenCity 开局电影模式 AutoTest stage=ready, frameCount=0(电影模式期间没拿到 sample),无法通过自动化验证。
+   - 用户起床后:实测高压地图右侧场地,扫视野到桥/斜坡时是否仍暴降。
+
+3. **建筑/装饰物原生静态阴影屏蔽(老遗留)**
+   - 论文 §7.4 方案 B 推荐 hook `TerrainShadow_RegisterImageEntry @ 0x6F713250`。
+   - 当前 `Hook_ShadowProjector_Add_FromObject` 已经做 FourCC 拦截,但 `kNativeShadowBlockProjectorFromObjectEnabled = false`(默认不拦"来源"路径,只拦黑名单 FourCC)。
+   - 需要先在用户实机看 ShadowProjector 是否 fire(`kNativeShadowProjectorStatsLogging = false` 也默认关),再决定是否扩到全屏蔽。
+
+### ⏰ 时间预算
+
+- 04:50 凌晨,距离上午 10:00 截止还有 5 小时。
+- 当前 T1(path blocker)/T2(首帧暴降)代码层面已落地,需要用户起床后实测确认。
+- T3(建筑物静态阴影)需要用户在场看 shadowProjector log,夜间无法独立验证。
+- T4(merge prep): squash 准备文档已落,真正 squash 需要等所有视觉问题确认后再做。
+
+### 🚀 接下来执行(05:00 - 09:30)
+
+1. T4-A: 注释清理(降风险, d3d9_device.cpp 119 个 Phase 7.X 历史注释精简)。
+2. T4-B: 诊断 counter 收口(把所有 atomic counter 加到 `DXVK_WAR3_DIAGNOSTICS_DETAILED` env 开关下)。
+3. 09:30 - 09:55: 收官 perf 复测 + AGENTS 总结。
