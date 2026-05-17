@@ -4890,3 +4890,86 @@ CombinedHash frozen windows:      12 / 131 segments, avg length 5 frames
      - 30s 测试 `dispatchToShapeEnterCount=0`，函数装上但 caller 不触发；
      - 真正的静态阴影写入路径是 `WriteMaskRegion (0x6F234710)` 每帧 6384 次，与 fog/LOS/path/visibility 共用 `a3 (mask bits)` OR-pack，无法只 reject shadow bit；
      - 建筑/装饰物原生静态阴影屏蔽**仍未解决**，需要下一阶段 hook `BoxFastpath/PolyFastpath` (0x6F1F5180/0x6F1F500C)，每帧 6384+ 次高频 hook，需要先做 caller-aware 精确路径分类。这是 6-8 小时专项任务。
+
+
+
+---
+
+## 🌙 2026-05-18 凌晨 03:50 — 新一轮无人值守任务大纲
+
+**用户当前会话指令(精确还原)**:
+1. **首帧卡顿问题(NEW,优先级最高)**:
+   - SunkenCity.w3x 开局电影模式下视角压得很低,出现阴影时有时无 + 地面装饰物阴影不渲染。怀疑魔兽自身视锥剔除在电影视角下行为反常。
+   - 正式游戏期间四处挪镜头,**只要桥/斜坡从视野外刚进入视野就会触发首帧暴降**(过一下子又涨回来),不论之前看过没。
+   - 高压地图右侧场地实测:看到没出现在视野中的桥/斜坡时帧数暴降。
+   - 用户判定这与之前桥/斜坡卡顿是同一类问题,要求彻查。
+2. **路径阻断器阴影残留(老遗留 — 上一轮我宣称已修但用户实际仍可见)**:
+   - 当前 D3D9 mesh draw 层 EarlyBypass 30s 拦了 27 次 path blocker mesh draw call。
+   - 但**用户实际视觉上仍能看到 path blocker 阴影**。
+   - 历史关键线索: path blocker 阴影会跟着太阳转,所以是 CSM shadow caster 渲染的,不是 uberSplat 烘焙到地形。
+   - **意味着我们的拦截路径不完整 — 还有别的入口在把 path blocker 写进 shadowCasters**。需要重新调研。
+3. **建筑/装饰物/可破坏物原生静态阴影屏蔽(老遗留)**:
+   - 论文 §6 §7.1 idx==3 假设已被 Phase 7.100 实测推翻。
+   - Phase 7.116 DispatchToShape hook 装上但 enterCount=0,被实测推翻。
+   - 真正路径(论文 §7.4 方案 B):需要 caller-aware 拦 `BoxFastpath/PolyFastpath` (0x6F1F5180/0x6F1F500C) 或 `TerrainShadow_RegisterImageEntry` (0x6F713250)。
+   - 必须**真正在游戏里看到拦截日志生效 + 视觉确认无阴影**才算完。
+4. **完成上述全部后自找任务**:
+   - 主线: 合并提交准备(audit `docs/plan/merge_readiness_audit_2026_05_17/README.md`)。
+   - 重点: 注释清理 / 诊断 counter 收口 / d3d9_device.cpp 拆分 / 69 commit squash + changelog。
+
+**用户约束**:
+- 上午 10:00 前完成,监控时间不要死磕单一任务,任何方向卡 90 分钟必须切到下一项。
+- 切记**随时更新 AGENTS.md**,Kiro 上下文被压缩时只剩这份能恢复目标。
+- 上一轮我做了 Phase 7.117-7.121 性能优化 + AutoTest 归档,**但完全没做静态阴影/路径阻断器视觉问题** — 用户明确批评"上一轮你根本没去解决就收官了"。本轮必须先优先收掉这两个。
+
+---
+
+## 🛠️ IDA 手动调用约定(自我提醒,Kiro 压缩后必读)
+
+工具状态判断顺序:
+1. 先尝试 `mcp_ida_pro_mcp_*` / `kiro_powers_*` MCP 工具(如果会话注册了)。
+2. 失联报错或工具列表里看不到 → **不要等待,不要回头要用户重启**,直接走 HTTP 兜底。
+3. HTTP 兜底脚本: `AutoTest/_archive/ida_scripts/_ida_http.py`。
+4. 服务地址: `http://127.0.0.1:13337/mcp`(JSON-RPC 标准)。
+5. 已经验证可用工具: `tools/list / lookup_funcs / decompile / disasm / xrefs_to / xrefs_from / callees / callers / rename / set_comments / list_strings / search_strings`。
+6. 关键参数命名(踩过的坑):
+   - `callees` 用 `addrs`,不是 `function_address`;
+   - 参数大都是 hex 字符串(如 `"0x6F12FED0"`)或 RVA 数值,具体看 `tools/list` 返回的 inputSchema。
+7. 凡需要做"**逆向 + 落到代码**"的任务,先用 HTTP 拿反编译 + 调用关系,再用 `rename`/`set_comments` 把当前轮次的关键结论写回 IDA(避免下一轮失忆)。
+
+---
+
+## 🎯 今晚执行计划(按优先级 + 时间预算)
+
+03:50 - 04:50 (T1):
+- 路径阻断器阴影残留根因调查。
+- 步骤: 在 `War3TryAppendSemanticShadowPacket` / 所有产生 `shadowCasters.push_back` 的位置加更细的 path blocker reject 分桶 + dxvk log 强制输出 fourcc;启动游戏让用户(或 AutoTest 替代场景)采集证据;若发现非 EarlyBypass 入口漏网就补拦截。
+- 失败兜底: 如果代码层确认所有入口都拦了仍然可见,转去查地图层借用 LT* 装饰物 model 的可能性 + Hook `TerrainShadow_RegisterImageEntry` (uberSplat 路径)。
+
+04:50 - 06:30 (T2):
+- 首帧卡顿根因调查。
+- 假设 1: VB/IB capture 在对象首次进入视野时做大量 GPU copy 一次性发出。
+- 假设 2: shadow caster pipeline 第一次创建 shader pipeline 触发 long-tail 编译。
+- 假设 3: `m_war3DrawTimeVBCache` / `m_war3SemanticPaletteCache` 在第一次 miss 时出现 unordered_map rehash 或 large allocation。
+- 假设 4: model resource cache miss 触发 ShadowModelResourceStore 重建。
+- 步骤: 加 frame-time spike 探针(`maxFrameTimeMs > 16` 时 dump 当帧 hot-path counter 增量到 dxvk log),运行 SunkenCity + 高压地图采集证据。
+
+06:30 - 08:00 (T3):
+- 建筑/装饰物原生静态阴影屏蔽。
+- 走论文 §7.4 方案 B: caller-aware hook `TerrainShadow_RegisterImageEntry` + 按 owner widget rawcode/objectKind 决策。
+- 风险点: Phase 5 历史全屏蔽崩溃记忆。先 install-only + log 30s 验证 caller stack,然后才加 reject 逻辑。
+
+08:00 - 09:30 (T4):
+- 自找任务: 合并提交准备。优先级:
+  1. 69 commit squash 为 ~10 主题(最低风险高收益,不动代码);
+  2. 一遍最严重屎山文件的"考古注释"清理(d3d9_device.cpp 119 个 Phase 7.X);
+  3. 诊断 counter 收口到统一 env 开关(`DXVK_WAR3_DIAGNOSTICS_DETAILED`)。
+- 不动文件拆分(高风险,留给白天 review)。
+
+09:30 - 10:00 (T5):
+- 收官写 AGENTS 总结 + 部署最终 DLL + perf 双图 baseline 验证 +commit。
+
+**自我监控规则**:
+- 每完成一个 T 立即写 commit 一段 AGENTS,避免压缩失忆。
+- 任何 T 卡 90 分钟没进展,切下一个,把当前进度作为遗留写到 AGENTS。
+- 性能护栏(>=85 高压 / >=120 低压)在每次 perf 验证时复核,跌破立即查回退点。
