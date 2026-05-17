@@ -13226,24 +13226,37 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
   if (War3SemanticShadowManifestDeferProvisionalPartsRuntime() &&
       !eligibleRecords.empty()) {
-    std::vector<EligibleRecord> stableEligibleRecords;
-    stableEligibleRecords.reserve(eligibleRecords.size());
-    for (auto& eligible : eligibleRecords) {
-      if (eligible.manifestPartLeaseKey == 0u ||
-          eligible.previouslySubmittedPart) {
-        stableEligibleRecords.push_back(std::move(eligible));
-        War3RebindEligibleRecordPacket(stableEligibleRecords.back());
-        continue;
-      }
-      const auto leaseInfo =
-          visibleRegistry.queryShadowManifestPartLeaseInfo(
-              eligible.manifestPartLeaseKey, manifestFrame);
-      if (leaseInfo.found && leaseInfo.observedFrameCount < 2u)
-        continue;
-      stableEligibleRecords.push_back(std::move(eligible));
-      War3RebindEligibleRecordPacket(stableEligibleRecords.back());
+    // Phase 7.120：把"eligibleRecords 二次过滤"从"分配新向量 + 双向移动 + swap"
+    // 改成"原地 std::remove_if + 末尾 erase"。
+    //
+    // 旧逻辑每帧：
+    //   1) reserve(eligibleRecords.size()) — 一次 heap alloc；
+    //   2) move 全部 keep 元素 — 每次 push_back move + RebindPacket；
+    //   3) operator= swap 让 eligibleRecords 接管新向量；
+    //   4) War3RebindEligibleRecordPackets 再次扫一遍重 rebind。
+    //
+    // 新逻辑：
+    //   1) std::remove_if 移走 reject 元素到末尾，无 heap alloc；
+    //   2) 一次 erase(末尾) 释放被淘汰元素；
+    //   3) 整体只在末尾跑一次 War3RebindEligibleRecordPackets 重 rebind。
+    //
+    // 行为完全等价：被淘汰的 record 不再出现在向量里，保留的 record 顺序与
+    // 原 stableEligibleRecords 一致（remove_if 是 stable）。
+    auto rejectIt = std::remove_if(
+        eligibleRecords.begin(), eligibleRecords.end(),
+        [&](EligibleRecord& eligible) -> bool {
+          if (eligible.manifestPartLeaseKey == 0u ||
+              eligible.previouslySubmittedPart) {
+            return false;
+          }
+          const auto leaseInfo =
+              visibleRegistry.queryShadowManifestPartLeaseInfo(
+                  eligible.manifestPartLeaseKey, manifestFrame);
+          return leaseInfo.found && leaseInfo.observedFrameCount < 2u;
+        });
+    if (rejectIt != eligibleRecords.end()) {
+      eligibleRecords.erase(rejectIt, eligibleRecords.end());
     }
-    eligibleRecords = std::move(stableEligibleRecords);
     War3RebindEligibleRecordPackets(eligibleRecords);
   }
 
