@@ -5141,3 +5141,20 @@ f81f99d phase 7.118 BuildShadowReplayDraws thread_local cache
 - 大小: 26872211 bytes
 - 时间: 2026-05-18 04:26:18(回退 Phase 7.129 后部署的 7.130 build)
 - 包含: 7.117-7.130 全部改动(7.129 已撤销因为 std::vector move-assign 优化触及 packet alias pointer 安全问题)
+
+
+
+131. **Phase 7.134 path blocker 决定性结论（2026-05-18 14:30）**:
+   - **用户实机验证结果**：
+     - dxvk.log 显示 `PATH BLOCKER REJECT #1-3 rawcode=YTfb/YTpb/YTab via=EntryGate`
+     - **但游戏内 path blocker 阴影仍然可见**
+   - **决定性结论**：
+     - 我们的 D3D9 CSM shadow caster pipeline 拦截**已经完整工作**（log 证明 mesh draw call 被拦截，不进 shadowCasters）
+     - **path blocker 阴影来自 War3 引擎自身的原生 TerrainShadow 系统**（`TerrainShadow_RegisterImageEntry @ 0x6F713250`），不是我们的 D3D9 CSM pipeline
+     - 用户之前说"阴影跟着太阳转"让我误判为 CSM，但 War3 原生 terrain shadow 贴花也会跟太阳方向变化
+   - **下一步（真正修复 path blocker 视觉残留）**：
+     - 必须 hook `TerrainShadow_RegisterImageEntry @ 0x6F713250`
+     - 在 hook 内按 caller stack 提取 owner widget pointer → rawcode → IsLosBlockerFourCc 匹配 → reject
+     - 这是 6-8 小时专项任务（论文 §7.4 方案 B），风险高（Phase 5 历史全屏蔽崩溃）
+     - 需要 IDA 逆向确认每个 caller 的 owner widget 参数位置
+   - **当前 DLL 状态**：Phase 7.134 build，D3D9 层 path blocker 拦截完整，但原生 TerrainShadow 系统未拦截

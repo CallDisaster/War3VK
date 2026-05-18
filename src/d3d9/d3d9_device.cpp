@@ -23693,51 +23693,41 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         (cat == War3RenderState::StageCategory::WorldObject) &&
         (stage == 7 || stage == 10 || stage == 11 || stage == 12);
     const auto* earlyCurrentObj =
-        (earlyTerrainCaster && !earlyTerrainDoodadCaster)
-            ? nullptr
-            : dxvk::war3::render::GetCurrentBatchObject();
+        earlyTerrainCaster ? nullptr : dxvk::war3::render::GetCurrentBatchObject();
     const bool earlyObjectCasterByCurrentObj =
         earlyCurrentObj != nullptr &&
         earlyCurrentObj->kind != dxvk::war3::render::ObjectKind::Unknown;
     const bool earlyNeedsSemanticContext =
-        (!earlyTerrainCaster || earlyTerrainDoodadCaster) &&
+        !earlyTerrainCaster &&
         (earlyObjectCasterByTls || earlyObjectCasterByStage ||
-         earlyObjectCasterByCurrentObj || shadowSemantic.HasAnyContext() ||
-         earlyTerrainDoodadCaster);
-    if (earlyNeedsSemanticContext) {
-      War3ShadowSemanticContext semantic =
-          War3BuildShadowSemanticContext(earlyCurrentObj);
-      // Phase 7.134：标准 path blocker 检查（rawcode + jHandle fallback）。
-      bool earlyPathBlockerBlocked =
-          dxvk::war3::internal::kPathBlockerHideEnabled &&
-          War3ShadowIsLosBlocker(semantic, earlyCurrentObj);
-      // Phase 7.134 补充：Terrain doodad 路径下 TLS 全空，标准检查 miss。
-      // 做一次 widget+0x0C/+0x30 直读作为最终兜底。
-      if (!earlyPathBlockerBlocked &&
-          dxvk::war3::internal::kPathBlockerHideEnabled &&
-          earlyTerrainDoodadCaster &&
-          semantic.rawcode == 0u &&
-          (earlyCurrentObj == nullptr || earlyCurrentObj->rawcode == 0u)) {
-        void* widgetCandidate = semantic.worldObjectEntry;
-        if (widgetCandidate == nullptr && semantic.object != nullptr)
-          widgetCandidate = semantic.object->worldObjectEntry;
-        if (widgetCandidate == nullptr)
-          widgetCandidate = shadowSemantic.worldObjectEntry;
-        if (widgetCandidate != nullptr) {
-          uint32_t magic = 0u;
-          if (dxvk::war3::SafeReadU32Fast(widgetCandidate, 0x0Cu, magic) &&
-              magic == 0x2B5DB42Cu) {
-            uint32_t rawcode = 0u;
-            if (dxvk::war3::SafeReadU32Fast(widgetCandidate, 0x30u, rawcode) &&
-                rawcode != 0u && IsLosBlockerFourCc(rawcode)) {
-              earlyPathBlockerBlocked = true;
-              // 写回 semantic.rawcode 让下面的日志能输出 fourcc。
-              semantic.rawcode = rawcode;
-            }
+         earlyObjectCasterByCurrentObj || shadowSemantic.HasAnyContext());
+    // Phase 7.135：terrain doodad path blocker 轻量拦截。
+    // 不走 BuildShadowSemanticContext（太贵，terrain doodad 每帧数千次），
+    // 直接从 shadowSemantic.worldObjectEntry 做 widget+0x30 直读。
+    if (!earlyNeedsSemanticContext && earlyTerrainDoodadCaster &&
+        dxvk::war3::internal::kPathBlockerHideEnabled) {
+      void* widgetCandidate = shadowSemantic.worldObjectEntry;
+      if (widgetCandidate != nullptr) {
+        uint32_t magic = 0u;
+        if (dxvk::war3::SafeReadU32Fast(widgetCandidate, 0x0Cu, magic) &&
+            magic == 0x2B5DB42Cu) {
+          uint32_t rawcode = 0u;
+          if (dxvk::war3::SafeReadU32Fast(widgetCandidate, 0x30u, rawcode) &&
+              rawcode != 0u && IsLosBlockerFourCc(rawcode)) {
+            m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+            m_war3Scene.shadowStats
+                .semanticSceneRejectedPathBlockerEarlyBypassCount++;
+            m_war3Scene.shadowStats.skippedNotCaster++;
+            return;
           }
         }
       }
-      if (earlyPathBlockerBlocked) {
+    }
+    if (earlyNeedsSemanticContext) {
+      War3ShadowSemanticContext semantic =
+          War3BuildShadowSemanticContext(earlyCurrentObj);
+      if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+          War3ShadowIsLosBlocker(semantic, earlyCurrentObj)) {
         // Phase 7.99：日志记录 path blocker 拦截信息（前 30 次每个 fourcc 各 1 行）。
         // 让用户能直接看到拦了什么、jHandle 是什么。
         static std::atomic<uint32_t> s_pathBlockerLogCount{0};
