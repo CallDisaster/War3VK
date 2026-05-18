@@ -1,4 +1,4 @@
-"""Phase 7.113: 双图性能基线（高压+低压）"""
+"""Phase 7.137: 双图性能基线（不用 isolated desktop，直接前台跑）"""
 import sys
 sys.path.insert(0, '.')
 from war3_autotest_mcp import run_quick_autotest
@@ -14,11 +14,11 @@ def get_perf(r):
         'frameCount': rep.get('frameCount', 0),
     }
 
-print("\n========== HIGH PRESSURE (光影测试-高压) 30s ==========")
+print("\n========== HIGH PRESSURE (光影测试-高压) 30s [NO isolated desktop] ==========")
 r1 = run_quick_autotest(
     map_path=r"E:\Work\War3\Maps\ShadowTest\光影测试(高压).w3x",
     sample_duration_sec=30,
-    use_isolated_desktop=False,  # Phase 7.137：前台模式更稳定，isolated desktop 会让 GPU present 被 compositor 阻塞导致高压 FPS 假降 5-10
+    use_isolated_desktop=False,  # 关键：不隔离桌面
     deploy_d3d9_before_launch=False,
 )
 p1 = get_perf(r1)
@@ -26,11 +26,11 @@ print(f"  ok={r1.get('ok')} stage={r1.get('stage')}")
 for k,v in p1.items():
     print(f"  {k}={v}")
 
-print("\n========== LOW PRESSURE (光影测试) 30s ==========")
+print("\n========== LOW PRESSURE (光影测试) 30s [NO isolated desktop] ==========")
 r2 = run_quick_autotest(
     map_path=r"E:\Work\War3\Maps\ShadowTest\光影测试.w3x",
     sample_duration_sec=30,
-    use_isolated_desktop=False,  # Phase 7.137：同上
+    use_isolated_desktop=False,
     deploy_d3d9_before_launch=False,
 )
 p2 = get_perf(r2)
