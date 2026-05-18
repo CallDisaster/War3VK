@@ -5158,3 +5158,36 @@ f81f99d phase 7.118 BuildShadowReplayDraws thread_local cache
      - 这是 6-8 小时专项任务（论文 §7.4 方案 B），风险高（Phase 5 历史全屏蔽崩溃）
      - 需要 IDA 逆向确认每个 caller 的 owner widget 参数位置
    - **当前 DLL 状态**：Phase 7.134 build，D3D9 层 path blocker 拦截完整，但原生 TerrainShadow 系统未拦截
+
+
+
+---
+
+## 🌙 2026-05-19 凌晨 01:50 — 新一轮无人值守起点
+
+### 用户的关键校正（path blocker 视觉残留）
+
+用户明确指正我之前的判断：
+- **War3 贴花阴影是静止的**，不会跟太阳转
+- **path blocker 在原版游戏里就是不可见的**（编辑器隐形 marker），不可能渲染 model
+- 所以"阴影跟着太阳转 + 精细" = **必定是我们的 CSM pipeline 在画**
+- 但 dxvk.log 显示 `PATH BLOCKER REJECT #1-3 rawcode=YTfb/YTpb/YTab via=EntryGate` 命中了
+
+**结论**：path blocker 有另一条进入 shadowCasters 的路径**没被我的 dxvk.log 覆盖**。我的 PATH BLOCKER REJECT log 只在 EntryGate 和 EarlyBypass 两处写。其他 9+ 个拦截分桶（Producer / FastAppend / DirectGrouped / StaticSupplement / AppendVbBlend / AppendEntry / LegacyCapture）只 ++counter 不写 log。**path blocker 可能走了某个 semantic 路径但没被我加 log，或者拦截链有漏网点**。
+
+### 当前 perf 基线对照实验
+
+凌晨 01:45 跑两次 dual_perf_baseline:
+- Phase 7.135: 高压 80.39 / 低压 129.38
+- Phase 7.130 (回退所有 7.133/7.134/7.135): 高压 80.83 / 低压 138.86
+
+**结论**：回退不能恢复高压性能 — 不是 path blocker 改动引入的回退，是机器/环境噪声。低压 130-145 浮动，高压 80-89 浮动，跟昨晚凌晨基线 86-90 / 138-145 比都偏低。
+
+### 今晚执行计划
+
+1. **T1 (01:50-03:00)**: path blocker 视觉残留 — 给所有 11 个拦截分桶加 dxvk.log，找出 path blocker 实际走的是哪条路径
+2. **T2 (03:00-04:30)**: 根据 T1 数据修复漏网路径
+3. **T3 (04:30-06:00)**: 首帧暴降优化（GPU buffer alloc budget 已加，验证用户实机感受）
+4. **T4 (06:00-08:00)**: 性能优化 / merge prep
+5. **T5 (08:00-09:00)**: 收官 perf + AGENTS 总结
+
