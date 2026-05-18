@@ -307,23 +307,11 @@ static std::atomic<uintptr_t> s_cachedGlobalPaletteBufBase{0u};
 bool TryReadCurrentPaletteFrameTag(uint32_t& outFrameTag) {
   // Phase 7.31 Iteration F：避免每次调用都 syscall GetModuleHandleA。
   // g_gameBase 在 hook 安装时已缓存。
-  // Phase 7.140：每次 SafeReadU32Fast 内部都 IsReadableRangeFast。frameTag 地址
-  // 是 War3 全局变量 (g_gameBase + 0xBDA4CCu)，进程生命周期内不会消失。
-  // 用 thread_local 缓存一次"地址可读"的判定，后续直接 raw read。
   outFrameTag = 0u;
   if (g_gameBase == 0u)
     return false;
-  const uint32_t* frameTagPtr =
-      reinterpret_cast<const uint32_t*>(g_gameBase + 0xBDA4CCu);
-  static thread_local const uint32_t* s_validatedPtr = nullptr;
-  if (s_validatedPtr != frameTagPtr) {
-    if (!dxvk::war3::IsReadableRangeFast(frameTagPtr, sizeof(uint32_t)))
-      return false;
-    s_validatedPtr = frameTagPtr;
-  }
-  // 直接读：地址已在本线程内 validated，跳过每次 IsReadableRangeFast。
-  outFrameTag = *frameTagPtr;
-  return true;
+  return SafeReadU32Fast(reinterpret_cast<const void*>(g_gameBase + 0xBDA4CCu),
+                         0u, outFrameTag);
 }
 
 class SemanticHookPerfScope {
