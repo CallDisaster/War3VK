@@ -4593,6 +4593,12 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   m_war3Pipeline = new War3RenderPipeline(m_dxvkDevice);
   m_war3PostProcess = new War3PostProcess(this);
   war3::SetActiveDevice(this);
+  // Phase 7.132：预 reserve draw-time VB cache 容量，避免实机首次进入桥/斜坡
+  // 密集场景时 unordered_map rehash 阻塞主线程。typical 高压地图运行态约
+  // 200-400 唯一 renderablePart，1024 槽留够余量；factor 0.6 让 max_load
+  // 不触发 rehash。
+  m_war3DrawTimeVBCache.reserve(1024u);
+  m_war3DrawTimeVBCache.max_load_factor(0.6f);
   war3shader::internal::InitShaderPackRuntime(m_dxvkDevice);
   war3shader::internal::SetVulkanHandles(
       reinterpret_cast<void *>(m_dxvkDevice->instance()->handle()),
