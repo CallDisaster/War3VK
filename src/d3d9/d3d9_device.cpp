@@ -190,6 +190,57 @@ inline void NoteShadowAppendRawcode(uint32_t rawcode) {
   }
 }
 
+// Phase 7.136：path blocker 拦截路径分桶 dxvk.log helper。
+// 用户报告 EntryGate/EarlyBypass log 命中 YT* 但视觉仍可见 path blocker 阴影。
+// 这意味着 path blocker 走了**其他 9+ 个拦截分桶**之一，但那些分桶只 ++counter
+// 不写 log，所以无法直接验证。本 helper 给所有分桶统一格式：前 30 个 unique
+// (rawcode, via) 组合各写 1 行到 dxvk.log。
+//
+// 注意：我们之前的 EntryGate/EarlyBypass log 已经存在，本 helper 用于 *其他*
+// 分桶（Producer/FastAppend/DirectGrouped/StaticSupplement/AppendVbBlend/
+// AppendEntry/LegacyCapture）。
+inline void NotePathBlockerRejectLog(uint32_t rawcode, uint32_t jHandle,
+                                     const char* via) {
+  if (rawcode == 0u || via == nullptr)
+    return;
+  // 全局 dedup：(rawcode << 4) | via_hash，前 30 个 unique 写 log。
+  // via 用 string pointer 简单 hash（每个 string literal 都是稳定指针）。
+  const uint64_t key =
+      (uint64_t(rawcode) << 16) ^ (reinterpret_cast<uintptr_t>(via) & 0xFFFFu);
+  static std::atomic<uint32_t> s_logCount{0};
+  static std::atomic<uint64_t> s_logged[32] = {};
+  const uint32_t totalLogged =
+      s_logCount.load(std::memory_order_relaxed);
+  if (totalLogged >= 30u)
+    return;
+  bool firstSeen = true;
+  uint32_t freeSlot = 32u;
+  for (uint32_t i = 0u; i < 32u; ++i) {
+    const uint64_t cur = s_logged[i].load(std::memory_order_relaxed);
+    if (cur == key) {
+      firstSeen = false;
+      break;
+    }
+    if (cur == 0u && freeSlot == 32u)
+      freeSlot = i;
+  }
+  if (!firstSeen || freeSlot >= 32u)
+    return;
+  uint64_t expected = 0u;
+  if (!s_logged[freeSlot].compare_exchange_strong(expected, key,
+                                                  std::memory_order_relaxed))
+    return;
+  const uint32_t logIdx = s_logCount.fetch_add(1, std::memory_order_relaxed);
+  char fc[5] = {char((rawcode >> 24) & 0xFF), char((rawcode >> 16) & 0xFF),
+                char((rawcode >> 8) & 0xFF), char(rawcode & 0xFF), 0};
+  char buf[200];
+  snprintf(buf, sizeof(buf),
+           "DXVK War3Hook[Shadow]: PATH BLOCKER REJECT #%u rawcode=0x%08X "
+           "(%s) jHandle=0x%X via=%s",
+           logIdx + 1, rawcode, fc, unsigned(jHandle), via);
+  ::dxvk::Logger::info(buf);
+}
+
 } // namespace
 
 namespace war3_diag {
@@ -9833,9 +9884,14 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       if (blockedByJHandle) {
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerAppendEntryByJHandleCount++;
+        NotePathBlockerRejectLog(packet.renderable.rawcode,
+                                  packet.renderable.jHandle,
+                                  "AppendEntryByJHandle");
       } else {
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerAppendEntryCount++;
+        NotePathBlockerRejectLog(packet.renderable.rawcode,
+                                  packet.renderable.jHandle, "AppendEntry");
       }
       m_war3Scene.shadowStats.skippedNotCaster++;
       return false;
@@ -11517,6 +11573,10 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
           m_war3Scene.shadowStats
               .semanticSceneRejectedPathBlockerAppendVbBlendCount++;
+          NotePathBlockerRejectLog(
+              packet.renderable.rawcode != 0u ? packet.renderable.rawcode
+                                              : entry.rawcode,
+              packet.renderable.jHandle, "AppendVbBlend");
           m_war3Scene.shadowStats.skippedNotCaster++;
           return false;
         }
@@ -12222,6 +12282,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
       m_war3Scene.shadowStats
           .semanticSceneRejectedPathBlockerProducerCount++;
+      NotePathBlockerRejectLog(
+          record.identity.rawcode != 0u ? record.identity.rawcode
+                                        : entry.rawcode,
+          record.identity.jHandle, "Producer");
       m_war3Scene.shadowStats.skippedNotCaster++;
       entry.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
       continue;
@@ -12668,6 +12732,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerDirectGroupedCount++;
+        NotePathBlockerRejectLog(record.rawcode, record.jHandle,
+                                  "DirectGrouped/Preselect");
         m_war3Scene.shadowStats.skippedNotCaster++;
         continue;
       }
@@ -13100,6 +13166,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
       m_war3Scene.shadowStats
           .semanticSceneRejectedPathBlockerDirectGroupedCount++;
+      NotePathBlockerRejectLog(record.rawcode, record.jHandle,
+                                "DirectGrouped/Build");
       m_war3Scene.shadowStats.skippedNotCaster++;
       continue;
     }
@@ -13743,6 +13811,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
       m_war3Scene.shadowStats
           .semanticSceneRejectedPathBlockerFastAppendCount++;
+      NotePathBlockerRejectLog(eligible.packet.renderable.rawcode,
+                                eligible.packet.renderable.jHandle,
+                                "FastAppend/Pre");
       m_war3Scene.shadowStats.skippedNotCaster++;
       return false;
     }
@@ -13775,6 +13846,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
       m_war3Scene.shadowStats
           .semanticSceneRejectedPathBlockerFastAppendCount++;
+      NotePathBlockerRejectLog(entry.rawcode,
+                                eligible.packet.renderable.jHandle,
+                                "FastAppend/EntryRawcode");
       m_war3Scene.shadowStats.skippedNotCaster++;
       entry.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
       return false;
@@ -15555,6 +15629,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerStaticSupplementCount++;
+        NotePathBlockerRejectLog(record.rawcode, record.jHandle,
+                                  "StaticSupplement");
         m_war3Scene.shadowStats.skippedNotCaster++;
         continue;
       }
@@ -24995,6 +25071,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerLegacyCaptureCount++;
+        NotePathBlockerRejectLog(rawcode, batchHandle, "LegacyCapture/Main");
         m_war3Scene.shadowStats.skippedNotCaster++;
         return;
       }
@@ -25037,6 +25114,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
           m_war3Scene.shadowStats
               .semanticSceneRejectedPathBlockerLegacyCaptureCount++;
+          NotePathBlockerRejectLog(terrainRawcode, batchHandle,
+                                    "LegacyCapture/TerrainDoodadFallback");
           m_war3Scene.shadowStats.skippedNotCaster++;
           return;
         }
