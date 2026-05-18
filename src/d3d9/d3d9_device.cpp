@@ -3375,10 +3375,12 @@ void* War3ResolveLivePoseRuntimeAlias(void* runtimeModelPtr,
 // 附近），以便 `War3TryBuildShadowPacketFromCurrentDrawRecord` 可以在 Resolve
 // 失败时直接调用 live palette rebuild。此处保留空注释仅作历史标记。
 
-void War3RebindShadowPacketOwnedResourcePointers(
+inline void War3RebindShadowPacketOwnedResourcePointers(
     dxvk::war3::shadow::ShadowDrawPacket& packet) {
   // ShadowPacketResource stores pointer aliases into its owned vectors. Default
   // copy/move keeps the old addresses, so lease records must rebind before use.
+  // Phase 7.139：inline + 显式标记 likely-非空 hint。每个 caster 的 lease
+  // restore / move 都会调一次，每帧 100+ 次，合起来不可忽略。
   auto& resource = packet.resource;
   if (!resource.ownedPositions.empty())
     resource.positions = &resource.ownedPositions;
