@@ -24979,6 +24979,49 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
   }
 
+  // Phase 7.133：Terrain doodad 路径的 path blocker 兜底。
+  //
+  // 根因：path blocker 走 terrainDoodadCaster (cat=Terrain, stage=10)，
+  // 此时 currentObj=nullptr、needsSemanticContext=false、semantic 不构建、
+  // batchHandle=0、pathBlockObj=nullptr → 上面的 pathBlockObj 检查完全跳过。
+  //
+  // 修复：在 pathBlockObj miss 且 terrainDoodadCaster 时，从 TLS semantic
+  // state 的 worldObjectEntry 做 widget+0x0C/+0x30 直读。Terrain doodad
+  // 路径里 TLS 的 worldObjectEntry 可能被 Hook_WorldDispatch 在 stage=10
+  // 之前填充（如果 ExecBatchProcessor 在 Terrain tag 下也 fire 的话）。
+  // 即使 TLS 也是空的，shadowSemantic（函数参数）可能有 worldObjectEntry。
+  if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+      !pathBlockObj && terrainDoodadCaster) {
+    // 尝试从 shadowSemantic（TLS 快照）拿 worldObjectEntry。
+    void* terrainWidgetCandidate = shadowSemantic.worldObjectEntry;
+    if (terrainWidgetCandidate == nullptr && shadowSemantic.object != nullptr)
+      terrainWidgetCandidate = shadowSemantic.object->worldObjectEntry;
+    // 尝试从 TLS semantic state 直接读。
+    if (terrainWidgetCandidate == nullptr) {
+      const auto& tls = War3RenderState::GetTlsShadowSemanticState();
+      terrainWidgetCandidate = tls.worldObjectEntry;
+      if (terrainWidgetCandidate == nullptr && tls.object != nullptr)
+        terrainWidgetCandidate = tls.object->worldObjectEntry;
+    }
+    if (terrainWidgetCandidate != nullptr) {
+      uint32_t magic = 0u;
+      if (dxvk::war3::SafeReadU32Fast(terrainWidgetCandidate, 0x0Cu, magic) &&
+          magic == 0x2B5DB42Cu) {
+        uint32_t terrainRawcode = 0u;
+        if (dxvk::war3::SafeReadU32Fast(terrainWidgetCandidate, 0x30u,
+                                        terrainRawcode) &&
+            terrainRawcode != 0u &&
+            IsLosBlockerFourCc(terrainRawcode)) {
+          m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+          m_war3Scene.shadowStats
+              .semanticSceneRejectedPathBlockerLegacyCaptureCount++;
+          m_war3Scene.shadowStats.skippedNotCaster++;
+          return;
+        }
+      }
+    }
+  }
+
   const uint8_t resolvedObjectKind =
       currentObj && currentObj->kind != dxvk::war3::render::ObjectKind::Unknown
           ? static_cast<uint8_t>(currentObj->kind)
