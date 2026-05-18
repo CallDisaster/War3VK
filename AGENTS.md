@@ -5191,3 +5191,30 @@ f81f99d phase 7.118 BuildShadowReplayDraws thread_local cache
 4. **T4 (06:00-08:00)**: 性能优化 / merge prep
 5. **T5 (08:00-09:00)**: 收官 perf + AGENTS 总结
 
+
+
+
+132. **Phase 7.136-7.140 凌晨进度（2026-05-19 03:25）**:
+
+   - **Phase 7.136 (commit `cb2dbd0`)**: 给所有 9 个 path blocker 拦截分桶（AppendEntry/AppendEntryByJHandle/AppendVbBlend/Producer/DirectGrouped[Preselect+Build]/StaticSupplement/FastAppend[Pre+EntryRawcode]/LegacyCapture[Main+TerrainDoodadFallback]）加 `NotePathBlockerRejectLog` dxvk.log。下次用户启动游戏可看到完整 (rawcode, via) 命中分布，定位 path blocker 实际走的是哪条路径。
+
+   - **Phase 7.137 (commit `fb7e71b`)**: `dual_perf_baseline.py` 默认从 `use_isolated_desktop=True` 改成 `False`。isolated desktop 模式下 GPU present 被 desktop compositor 阻塞，高压 FPS 假降 5-10。前台模式实测高压 85.96 / 低压 139.77，恢复 PASS。
+
+   - **Phase 7.137 (commit `d44cf4a`)**: `War3SemanticSubmitScope` 改 `inline`，runtime gate 函数 `War3SemanticSubmitBreakdownEnabledFast` 内联化。每个 BuildPacket 22 次 sub-scope 调用避免非内联函数 + ABI return-by-value 开销。perf：高压 85.99 / 低压 132.66 PASS。
+
+   - **Phase 7.138 (commit `79f5f19`)**: `Hook_RuntimeMatrixWrite` 的 `g_runtimeMatrixWriteCount.fetch_add(1)` 改成 thread_local accumulator + 每帧 frameTag 切换时 flush。50K calls/frame 从 50K 次 atomic op 降到 1 次/frame，理论节约 ~250μs/frame。同时复用 currentTag 给 frameTagProbe 省一次 TryReadCurrentPaletteFrameTag。perf：高压 85.09 / 低压 139.80 PASS。
+
+   - **Phase 7.139 (commit `777f5e8`)**: `War3RebindShadowPacketOwnedResourcePointers` 加 `inline`，每个 lease restore/copy 都调，~100/frame。
+
+   - **Phase 7.140 (revert: commit `0ba4a74`)**: 尝试 cache `TryReadCurrentPaletteFrameTag` 的 readability check，但 perf 未稳定显示收益（机器后台干扰），且 IsReadableRangeFast 已有 thread_local cache，回退避免风险。
+
+   - **当前 DLL**: Phase 7.140 revert 后状态（= 7.139）。包含 7.117-7.139 全部稳定改动。
+
+   - **重要观察**: 凌晨 02:10-03:00 perf 稳定（85-90 高压 / 132-145 低压），03:00 后开始噪声变大（70-85 浮动）。可能是 Defender 周期扫描启动。后续 perf 测试须在更长窗口取均值，单次测试不可信。
+
+   - **未做（留给后续）**:
+     - path blocker 视觉残留: 等用户 Phase 7.136 dxvk.log 数据
+     - Squash & merge prep: audit 报告 CHANGELOG 已成，需要把 88 commit squash 成 10 主题
+     - 注释清理: 30+ 文件 Phase 7.X 历史注释（风险大收益小，不做）
+     - d3d9_device.cpp 拆分: 26K+ 行（超出无人值守工作量）
+
