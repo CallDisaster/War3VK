@@ -7612,23 +7612,39 @@ void __fastcall Hook_RuntimeMatrixWrite(int nodePtr, int sourceMatrixPtr,
     return;
 
   g_trampolineRuntimeMatrixWrite(nodePtr, sourceMatrixPtr, destMatrixPtr);
-  g_runtimeMatrixWriteCount.fetch_add(1u, std::memory_order_relaxed);
+
+  // Phase 7.138：thread_local accumulator + flush-when-frameTag-changes 模式。
+  //
+  // 之前每次 fetch_add(1) 都做 atomic op（5ns/次 × 50K-100K calls/帧 = 250-500μs/帧）。
+  // 改成：本线程 thread_local s_localCount 累加；每帧 frameTag 变化时 flush 到
+  // global atomic（一次 fetch_add(N)）。
+  //
+  // 相比 Phase 7.131 的 "每 256 次 flush" 失败（thread_local TLS 访问反而慢），
+  // 本方案利用已经存在的 s_lastFrameTag/s_frameCallCount thread_local 状态，
+  // 不引入额外 TLS slot：直接复用 s_frameCallCount 自身就是个 thread_local 计数器。
+  //
+  // global atomic 仅在 frameTag 变化时刷新，比较 (currentTag != s_lastFrameTag)
+  // 是 thread_local read，零开销。
+  static thread_local uint64_t s_lastFrameTag = 0u;
+  static thread_local uint32_t s_frameCallCount = 0u;
+  uint32_t currentTag = 0u;
+  TryReadCurrentPaletteFrameTag(currentTag);
+  if (currentTag != 0u && currentTag != s_lastFrameTag) {
+    // frame 切换：把上一帧累计的 s_frameCallCount flush 到 global atomic，
+    // 然后重置 thread_local。
+    if (s_frameCallCount != 0u) {
+      g_runtimeMatrixWriteCount.fetch_add(uint64_t(s_frameCallCount),
+                                          std::memory_order_relaxed);
+    }
+    s_lastFrameTag = currentTag;
+    s_frameCallCount = 0u;
+  }
+  ++s_frameCallCount;
 
   // Phase 7.95：每帧调用次数上限。在桥/斜坡场景下 War3 可能每帧 50K-100K 次
   // matrix write，TryFindRuntimePoseArrayRangeForMatrix 的 shared_lock + hashmap
   // lookup 累积到 40ms+。超过阈值后直接跳过数据层工作。
   // 阈值 20000 足够覆盖正常场景（13K-30K），但能截断极端场景。
-  static thread_local uint64_t s_lastFrameTag = 0u;
-  static thread_local uint32_t s_frameCallCount = 0u;
-  {
-    uint32_t currentTag = 0u;
-    TryReadCurrentPaletteFrameTag(currentTag);
-    if (currentTag != 0u && currentTag != s_lastFrameTag) {
-      s_lastFrameTag = currentTag;
-      s_frameCallCount = 0u;
-    }
-  }
-  ++s_frameCallCount;
   constexpr uint32_t kMaxCallsPerFrame = 20000u;
   if (s_frameCallCount > kMaxCallsPerFrame)
     return;
@@ -7643,9 +7659,9 @@ void __fastcall Hook_RuntimeMatrixWrite(int nodePtr, int sourceMatrixPtr,
   // Phase 7.78：把 frameTag 读取从 dt-gate probe 与 batch-capture 两段
   // 各做一次合并到一次。每帧 13K-30K 次 hook 调用，避免重复读全局 palette
   // frameTag 指针。
-  uint32_t frameTagProbe = 0u;
-  const bool frameTagOk =
-      TryReadCurrentPaletteFrameTag(frameTagProbe) && frameTagProbe != 0u;
+  // Phase 7.138：复用上面已经读过的 currentTag，省一次 TryReadCurrentPaletteFrameTag。
+  const uint32_t frameTagProbe = currentTag;
+  const bool frameTagOk = currentTag != 0u;
 
   // Phase 7.47 dt gate probe：writer per-frameTag 去重
   if (frameTagOk) {
