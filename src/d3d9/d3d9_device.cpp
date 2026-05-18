@@ -348,10 +348,21 @@ uint64_t War3SemanticPoseOnlyCapturePeriodRuntime() {
   return s_period;
 }
 
-bool War3SemanticSubmitBreakdownRuntime() {
+// Phase 7.137：runtime gate 改成内联 static + atomic bool 缓存。
+// 原 War3SemanticSubmitScope 函数每个 sub-scope 调用一次（每个 caster 22 次），
+// hot-path 上的非内联函数调用 + ABI return-by-value 开销不容忽视。
+// 改成 inline，编译器能 strip 掉 disabled 分支的 ScopedCpuScope 对象创建。
+inline bool War3SemanticSubmitBreakdownEnabledFast() {
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SEMANTIC_SUBMIT_BREAKDOWN", 0u) != 0u;
   return s_enabled;
+}
+
+inline war3::War3PerfMonitor::ScopedCpuScope War3SemanticSubmitScopeFast(
+    const char* name) {
+  if (!War3SemanticSubmitBreakdownEnabledFast())
+    return {};
+  return war3::War3PerfMonitor::instance().cpuScope(name);
 }
 
 bool War3SemanticLivePaletteRefreshRuntime() {
@@ -832,9 +843,11 @@ uint64_t War3SemanticCurrentDrawMinVisibleFrameSerial(
              : 0u;
 }
 
-war3::War3PerfMonitor::ScopedCpuScope War3SemanticSubmitScope(
+inline war3::War3PerfMonitor::ScopedCpuScope War3SemanticSubmitScope(
     const char* name) {
-  if (!War3SemanticSubmitBreakdownRuntime())
+  // Phase 7.137：fast-path 通过 War3SemanticSubmitBreakdownEnabledFast 短路。
+  // 默认 disabled 时不会进函数主体，只做一次 atomic load + branch + 空对象 return。
+  if (!War3SemanticSubmitBreakdownEnabledFast())
     return {};
   return war3::War3PerfMonitor::instance().cpuScope(name);
 }
