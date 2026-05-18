@@ -314,18 +314,27 @@ bool TryReadCurrentPaletteFrameTag(uint32_t& outFrameTag) {
                          0u, outFrameTag);
 }
 
+// Phase 7.142：前向声明，让 SemanticHookPerfScope 能用。
+bool GetEnvBoolCached(const char *name, bool defaultValue);
+
 class SemanticHookPerfScope {
 public:
   explicit SemanticHookPerfScope(render::SemanticDataPerfTag tag)
       : m_aggregateTag(tag), m_detailTag(tag),
-        m_start(std::chrono::steady_clock::now()) {}
+        m_start(SemanticPerfEnabled() ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{}) {}
 
   SemanticHookPerfScope(render::SemanticDataPerfTag aggregateTag,
                         render::SemanticDataPerfTag detailTag)
       : m_aggregateTag(aggregateTag), m_detailTag(detailTag),
-        m_start(std::chrono::steady_clock::now()) {}
+        m_start(SemanticPerfEnabled() ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{}) {}
 
   ~SemanticHookPerfScope() {
+    // Phase 7.142：env-gated。默认 disabled 时 m_start 是默认值，clock_now()
+    // 也跳过；只剩两次 SemanticDataPerfTag 字段拷贝 + 一次 if 判定。
+    if (!SemanticPerfEnabled())
+      return;
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - m_start)
                              .count();
@@ -334,6 +343,15 @@ public:
     render::NoteSemanticDataPerf(m_aggregateTag, elapsedUs);
     if (m_detailTag != m_aggregateTag)
       render::NoteSemanticDataPerf(m_detailTag, elapsedUs);
+  }
+
+  // Phase 7.142：env-gated SemanticPerfEnabled — DXVK_WAR3_SEMANTIC_PERF_TRACK
+  // 默认关。每帧 50K-150K SemanticHookPerfScope 构造析构 × chrono/atomic 开销
+  // 累计 1ms+/帧。需要诊断时通过 env 启用。
+  static bool SemanticPerfEnabled() {
+    static const bool enabled =
+        GetEnvBoolCached("DXVK_WAR3_SEMANTIC_PERF_TRACK", false);
+    return enabled;
   }
 
 private:
