@@ -5798,3 +5798,41 @@ Phase 7.143 hook `0x7370A0 (ListA_RenderPreparedGroups)` + `0x737110
 2. Problem 2：看到桥/斜坡 → 离开 → 再回来，是否还卡。
 3. Problem 1：看 war3_d3d9.log 的 DoodadStaticStamp blocked 计数是否增长。
 4. 整体：阴影是否还有高频闪烁（Phase 7.148 应已消除）。
+
+
+### Phase 7.154 — 用户实测三问题全未解决 → 转纯证据采集（always-on 诊断）
+
+**关键发现（从用户 3:32 实测日志）**：
+- path blocker 在 **5 个 gate 全部命中拦截**（EntryGate / DirectGrouped/Preselect /
+  Producer / FastAppend / AppendEntry），日志 rawcode 都是正确的 YTfb/YTpb/YTab。
+  说明我的 Phase 7.150 gate 确实在跑且命中。
+- **但 `DoodadStaticStamp` 日志一行都没有** → `ToggleStaticStampFromObject (0x74DB30)`
+  hook 装了但**从未 fire**（install ok，但 0 次调用）。说明 path blocker/装饰物的
+  native 贴花阴影**不走这条注册路径**。
+- IDA xrefs 确认 `RegisterImageEntry (0x713250)` 有 6+ 条注册路径：ToggleStaticStamp
+  (我 hook 的) / ToggleEmitterStamp(__userpurge 没 hook) / RegisterImageEntryWithParams
+  / FromPoint / FromTwoPoints / ShadowProjector(0x76D...)。我只覆盖了 1 条。
+
+**核心矛盾**：CSM 在 5 个 gate 拦了 path blocker，但用户仍看到阴影 + 阴影跟着太阳转
+（CSM 行为）。两种可能未排除：
+  1. 借用 model：path blocker 用可见装饰物 model（LT* 等）当外观，渲染时 rawcode
+     不是 YT* → 我的黑名单不命中 → 当普通装饰物阴影画出来。
+  2. 不是我们的 CSM（但"跟着太阳转"又指向 CSM）。
+
+**本轮不再盲改，改为 always-on 诊断（写 war3_d3d9.log，无需设 env）**：
+1. `CASTER COMPOSITION`（每 240 帧 1 行）：shadow map 实际 caster 总数 / blend 数 /
+   **匿名 rigid 数（rawcode=0 非 blend，path blocker 漏网嫌疑）** / 各 objectKind 分布
+   / 第一个匿名 rigid 的世界坐标。
+2. `VB ALLOC SPIKE`（本帧 createBuffer >= 8 时 1 行，最多 80 条）：定位问题2 卡顿
+   是否来自 VB 分配突发。
+3. `SHADOW DRAW SURVEY`（前 40 个 unique caster）：改为**默认开启**，列出 shadow map
+   画的每个对象 rawcode + 几何签名 + 世界坐标。
+
+**下一次用户测试后我要看的**：
+- 若 `CASTER COMPOSITION anonRigid > 0` → CSM 有 path blocker 漏网（继续堵）。
+- 若 `anonRigid == 0` 但用户仍见 path blocker 阴影 → 是借用 model 装饰物或 native，
+  看 SHADOW DRAW SURVEY 里 path blocker 位置上是什么 rawcode 的 caster。
+- 若 `VB ALLOC SPIKE` 在卡顿时频繁出现 → 问题2 确实是 VB 分配，需要更激进的
+  静态常驻 / 预算策略；若不出现 → 问题2 根因不在 VB 分配，要换方向查。
+
+**部署**：DLL 26905966 bytes，已部署 E:\Work\War3\d3d9.dll。诊断默认开，用户正常玩即可。
