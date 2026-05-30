@@ -5567,3 +5567,53 @@ Phase 7.143 hook `0x7370A0 (ListA_RenderPreparedGroups)` + `0x737110
 ### 当前状态
 - 所有破坏性 hook 已禁用，DLL 恢复到"不破坏悬崖"状态。
 - 三个问题回到起点，但排除了一条错误路径（ListA != 阴影）。
+
+
+---
+
+## 🔬 2026-05-31 第四轮：撤销破坏 + 改用证据驱动（draw-time survey）
+
+### 处置
+- Phase 7.144：禁用破坏性 ListA hook（已恢复悬崖）。
+- Phase 7.145：在 `BuildShadowReplayDraws`（所有 shadow caster 汇聚到 GPU
+  shadow map 渲染前的**唯一收集点**）加：
+  1. **最终 path blocker 防线**：用 `draw.batchHandle`（jHandle）→ widget
+     identity cache 反查 rawcode → 黑名单匹配，reject 任何上游漏判的 path
+     blocker（覆盖 rawcode 在上游为 0 的泄漏路径）。
+  2. **shadow draw survey**：env `DXVK_WAR3_SHADOW_DRAW_SURVEY=1` 时，前 40 个
+     unique caster（rawcode 或 batchHandle）各写 1 行到 war3_d3d9.log，
+     **直接告诉我们 shadow map 实际画了哪些对象**。
+- 给 doodad `ToggleStaticStampFromObject (0x74DB30)` hook 加 `Logger::info`
+  安装确认。
+
+### 关键事实澄清（修正之前的错误认知）
+- `War3ShadowCasterDraw`（draw-time 结构）**只有 batchHandle + objectKind**，
+  没有 rawcode/jHandle 字段。所以 draw-time 识别 path blocker 只能靠
+  batchHandle → widget cache。这也解释了为什么有些 path blocker 在 draw-time
+  无法识别（widget cache 未命中，AGENTS 7.99 已记录 magicMatched=0）。
+- ListA（0x7370A0/0x737110）= **悬崖/地形 tile 渲染**，不是阴影。已永久禁用。
+- FogMask WriteMaskRegion = fog/LOS/path，不是阴影。已确认不碰。
+
+### 三个问题的当前诚实状态
+1. **静态阴影禁用**：producer 端 `ToggleStaticStampFromObject` hook 已装
+   （mode>=1 拦截 doodad 静态 stamp 注册），但**预置 doodad 在 hook 前已注册**，
+   且 stamp 渲染消费点尚未确定（不是 ListA）。**未解决**。
+2. **桥/斜坡卡顿**：静态 VB cache 持久化已落地（非破坏性），但根因可能是
+   `captureLiveState` 的 per-record populate 成本（AGENTS 7.95-7.99），
+   不只是 VB alloc。**未验证**。
+3. **path blocker 泄漏**：draw-time 最终防线 + survey 已落地。**需要 survey
+   数据定位真正泄漏源**。
+
+### 给用户的测试请求（下次有空时）
+启动游戏前设环境变量 `DXVK_WAR3_SHADOW_DRAW_SURVEY=1`，进图后看
+`war3_d3d9.log` 里的 `SHADOW DRAW SURVEY #N rawcode=... (XXXX) ...` 行。
+这会列出 shadow map 实际画的对象 fourcc。如果里面有 path blocker 的 fourcc
+或 building/doodad，就能确定泄漏源；如果全是正常单位，说明可见的"静态阴影"
+是 native War3 渲染的（不是我们的 CSM）。
+
+也可在 ImGui 面板把"原生阴影"切到"禁用"(mode2) + 把我们的阴影开关关掉，
+做 A/B：哪个开关让静态/path blocker 阴影消失，就锁定了来源。
+
+### 当前 DLL
+`E:\Work\War3\d3d9.dll`（26905337 @ 0:40），含 7.144 回退 + 7.145 survey。
+悬崖正常，无破坏性 hook。

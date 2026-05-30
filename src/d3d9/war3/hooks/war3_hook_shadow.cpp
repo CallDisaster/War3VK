@@ -1692,11 +1692,19 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   // 特效，不是静态阴影本体）。
   if constexpr (dxvk::war3::internal::kNativeShadowDoodadStampHookEnabled) {
     if (addrs.terrainShadowToggleStaticStampFromObjectAddr != nullptr) {
-      anyInstalled |= InstallMinHook(
+      const bool ok = InstallMinHook(
           addrs.terrainShadowToggleStaticStampFromObjectAddr,
           reinterpret_cast<LPVOID>(&Hook_Doodad_ToggleStaticStampFromObject),
           reinterpret_cast<LPVOID *>(&g_trampolineDoodadStaticStamp),
           "Shadow", "TerrainShadow_ToggleStaticStampFromObject", false, true);
+      anyInstalled |= ok;
+      char buf[120];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: ToggleStaticStampFromObject install "
+               "addr=%p result=%s",
+               addrs.terrainShadowToggleStaticStampFromObjectAddr,
+               ok ? "ok" : "fail");
+      ::dxvk::Logger::info(buf);
     }
   }
 
