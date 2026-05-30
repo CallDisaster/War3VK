@@ -417,7 +417,18 @@ inline void War3ReplayDrawSurvey(const War3ShadowCasterDraw& draw) {
   static std::array<std::atomic<uint32_t>, 40> s_logged{};
   if (s_logCount.load(std::memory_order_relaxed) >= 40u)
     return;
-  const uint32_t logKey = rawcode != 0u ? rawcode : (0x80000000u | handle);
+  // 2026-05-31：rawcode/handle 都为 0 的"匿名 caster"才是 path blocker 漏网
+  // 的嫌疑对象（上游没识别到身份）。用 (category, vertexCount) 合成一个 dedup
+  // key，确保这类匿名几何也能被记录一次（否则旧逻辑 logKey=0 直接 return，
+  // 恰好把最需要看的对象漏掉）。
+  uint32_t logKey;
+  if (rawcode != 0u)
+    logKey = rawcode;
+  else if (handle != 0u)
+    logKey = 0x80000000u | handle;
+  else
+    logKey = 0x40000000u | ((uint32_t(draw.category) & 0xFFu) << 20) |
+             (draw.numVertices & 0xFFFFFu);
   if (logKey == 0u)
     return;
   uint32_t freeSlot = 40u;
@@ -437,12 +448,21 @@ inline void War3ReplayDrawSurvey(const War3ShadowCasterDraw& draw) {
   const uint32_t idx = s_logCount.fetch_add(1, std::memory_order_relaxed);
   char fc[5] = {char((rawcode >> 24) & 0xFF), char((rawcode >> 16) & 0xFF),
                 char((rawcode >> 8) & 0xFF), char(rawcode & 0xFF), 0};
-  char buf[220];
+  // 2026-05-31：补充几何签名 + 世界坐标。path blocker 漏网时 rawcode/handle
+  // 多半为 0，靠"顶点数 + 世界位置（在悬崖上）+ objectKind"才能确认它就是
+  // 那个看不见的 marker。worldMatrix 第 4 行是平移（DXVK 列存：m[3] = 平移）。
+  const float wx = draw.worldMatrix[3].x;
+  const float wy = draw.worldMatrix[3].y;
+  const float wz = draw.worldMatrix[3].z;
+  char buf[320];
   snprintf(buf, sizeof(buf),
            "DXVK War3Shadow: SHADOW DRAW SURVEY #%u rawcode=0x%08X (%s) "
-           "batchHandle=0x%X kind=%u cat=%d",
+           "batchHandle=0x%X kind=%u cat=%d vtx=%u idx=%u blend=%d "
+           "pos=(%.0f,%.0f,%.0f)",
            idx + 1, rawcode, (rawcode != 0u ? fc : "----"), unsigned(handle),
-           unsigned(draw.objectKind), int(draw.category));
+           unsigned(draw.objectKind), int(draw.category),
+           unsigned(draw.numVertices), unsigned(draw.indexCount),
+           int(draw.vertexBlendEnabled), double(wx), double(wy), double(wz));
   ::dxvk::Logger::info(buf);
 }
 
