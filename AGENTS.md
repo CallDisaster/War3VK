@@ -5522,3 +5522,48 @@ Projector），从没拦到真正画 stamp 的这两个函数。
 - 视觉：静态阴影 + path blocker 阴影是否消失，fog/视野/边界是否正常；
 - 若出现边界条纹伪影（doc 24 §8.2 历史风险）→ 改用更细粒度的 entry 级过滤。
 - 回退开关：`kNativeShadowBlockListARenderWhenMode1=false`。
+
+
+---
+
+## ❌ 2026-05-31 第三轮：Phase 7.143 ListA hook 证伪 + 重新调查
+
+### 用户实测反馈（决定性）
+"你把所有放置 pathblock 的悬崖全部干掉了，现在游戏中所有悬崖地形全部不渲染了。
+另外两个问题也完全没解决。"
+
+### 证伪结论
+Phase 7.143 hook `0x7370A0 (ListA_RenderPreparedGroups)` + `0x737110
+(ShadowListA_RenderAllEntries)` 是**破坏性错误**：
+- 这两个函数渲染的是**悬崖/地形 tile 几何本身**，不是阴影贴花。
+- IDA 复核 `sub_6F725F80`：返回 148 字节/tile 的地形 tile 几何结构
+  （`*(this+73) + 148 * (tileX + tileY * stride)`），`RenderEntryComplex` 里的
+  `GxDevice_DrawIndexedRange` 画的是地形 tile 网格。
+- **"TerrainShadow" / "ShadowListA" 命名严重误导**——它其实是 War3 的地形
+  渲染系统（含悬崖墙面），不是阴影系统。
+
+### 已立即处置
+- `kNativeShadowListARenderHookEnabled = false`、
+  `kNativeShadowBlockListARenderWhenMode1 = false`（编译期禁用，禁止再开）。
+- 重新编译 + 部署 `E:\Work\War3\d3d9.dll`（26900359 @ 0:31），悬崖恢复渲染。
+
+### 关键教训（第三次踩坑）
+1. **不能靠函数名（"Shadow"）判断功能**——必须看它实际 draw 什么几何。
+2. `CWorld_TerrainShadow_Dispatch` 这个 IDA 名字里的 "Shadow" 是误导，它是
+   地形渲染分发器，case0 画的是地形 tile（含悬崖）。
+3. 三个问题**全部仍未解决**，且我之前所有关于"静态阴影渲染消费点"的推断都建立
+   在错误的函数语义上。
+
+### 重新调查方向（必须换方法）
+不能再靠函数名猜。正确方法：
+1. **静态阴影**：魔兽自带的 doodad/建筑地面贴花阴影。需要确认它到底是
+   (a) 一个独立的贴花 draw（有特定 texture/blend state），还是
+   (b) 地形 tile 着色的一部分（mask 驱动）。
+   → 应该从 D3D9 draw call 的 **render state / texture** 特征识别，而不是函数名。
+2. **path blocker**：用户说"放 pathblock 的悬崖"——可能 path blocker 和悬崖
+   绑定，需要区分"path blocker 的阴影"和"悬崖几何"。
+3. **桥/斜坡卡顿**：仍未验证根因。
+
+### 当前状态
+- 所有破坏性 hook 已禁用，DLL 恢复到"不破坏悬崖"状态。
+- 三个问题回到起点，但排除了一条错误路径（ListA != 阴影）。

@@ -1176,9 +1176,13 @@ inline constexpr uint32_t kNativeShadowDoodadStampStatsInterval = 4000;
 // mode>=1 时 hook 这两个函数直接 return，干净屏蔽魔兽自带可见静态阴影 +
 // path blocker 地面阴影。fog/LOS/path 走独立 FogMask grid（terrain tile 着色
 // 消费），不受影响。两函数仅被 Dispatch 调用，hook 安全。
-inline constexpr bool kNativeShadowListARenderHookEnabled = true;
+// ⚠️ 2026-05-31 已证伪并禁用：用户实测 hook 0x7370A0/0x737110 会让**所有悬崖
+// 地形不渲染**。说明这两个函数渲染的是悬崖/地形几何本身，不是阴影专用。
+// "TerrainShadow" 命名误导。**禁止再开启此 hook**。保留代码仅作历史记录。
+inline constexpr bool kNativeShadowListARenderHookEnabled = false;
 // mode=1 时屏蔽 ListA stamp 渲染（doodad/建筑/path blocker 地面贴花阴影）。
-inline constexpr bool kNativeShadowBlockListARenderWhenMode1 = true;
+// ⚠️ 已证伪：会干掉悬崖地形，保持 false。
+inline constexpr bool kNativeShadowBlockListARenderWhenMode1 = false;
 // ListA 渲染拦截统计日志（低频，默认关闭）。
 inline constexpr bool kNativeShadowListARenderStatsLogging = false;
 inline constexpr uint32_t kNativeShadowListARenderStatsInterval = 600;
