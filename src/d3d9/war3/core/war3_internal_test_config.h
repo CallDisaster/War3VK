@@ -1000,6 +1000,32 @@ inline bool kPathBlockerHideEnabled = true;   // 隐藏路径阻断器渲染
 inline constexpr uint32_t kShadowDrawTimeVBCacheAllocBudgetPerFrame = 32u;
 inline constexpr bool kShadowDrawTimeVBCacheAllocBudgetEnabled = true;
 
+// ========================================================================
+// 2026-05-30 问题2：桥/斜坡卡顿根治（静态几何 VB cache 常驻）
+// ========================================================================
+// 现象：游戏中看到桥/斜坡/装饰物就卡顿，过一会恢复；对象离开视野后再次看到
+// 又卡，再过一会又不卡。
+//
+// 根因：桥/斜坡/建筑/装饰物/可破坏物是静态几何（CPU skin 后顶点固定、
+// worldMatrix 固定），却被当成动态对象按 16 帧 TTL 淘汰 + 每次重新 GPU copy。
+// 离开视野 16 帧后 entry 的 GPU buffer 被释放，再次进入视野必须重新
+// createBuffer（vkAllocateMemory 同步阻塞主线程）→ 复现卡顿。
+//
+// 修复：静态几何 entry 标记为常驻，离开视野后**不释放 GPU buffer**，再次
+// 进入视野时 O(1) 复用（无 createBuffer / 无 copyBuffer）。受总字节上限约束
+// 做 LRU 淘汰，防止超大地图无限增长。
+inline constexpr bool kShadowDrawTimeVBCacheStaticPersistEnabled = true;
+// 静态几何常驻 cache 的总字节上限（pos+uv+idx 合计）。超过后按
+// lastAccessFrameSerial LRU 淘汰最久未访问的静态 entry。
+// 64 MiB 足够容纳一张大图的全部桥/斜坡/装饰物 VB（典型单 doodad VB 几 KB）。
+inline constexpr uint64_t kShadowDrawTimeVBCacheStaticPersistMaxBytes =
+    64ull * 1024ull * 1024ull;
+// 静态 entry 即使常驻，超过此帧数未被访问仍会被回收（避免切图后残留）。
+// 设得很大（约 30 分钟 @ 60fps），实际主要靠字节上限 LRU 控制。
+inline constexpr uint64_t kShadowDrawTimeVBCacheStaticMaxIdleFrames = 108000u;
+// 非静态（动态单位）entry 的 TTL（帧）。保持原 16 帧淘汰。
+inline constexpr uint64_t kShadowDrawTimeVBCacheDynamicMaxAgeFrames = 16u;
+
 // Phase 7.100：建筑/装饰物静态阴影治理。
 // 论文 §7.1 推断 hook TerrainShadow_WriteMaskRegion (0x234710) + 拦截
 // maskIdx==3 即可干净屏蔽。但 Phase 7.101 实测推翻：
@@ -1110,6 +1136,52 @@ inline constexpr bool kNativeShadowBlockStaticStampPathWhenMode2 = false;
 
 // ShadowPath_StaticStamp_Toggle 调试日志（默认关闭）。
 inline constexpr bool kNativeShadowStaticStampPathVerboseLogging = false;
+
+// ========================================================================
+// CDoodads 贴花阴影治理（2026-05-30 接手：魔兽自带静态阴影禁用 + path blocker）
+// ========================================================================
+// IDA 已确认（doc 24 + 本轮复核）：树木/装饰物/可破坏物/path blocker 的
+// "魔兽自带可见地面贴花阴影"走两条 RegisterImageEntry 链：
+//   - TerrainShadow_ToggleStaticStampFromObject (0x74DB30)  → RegisterImage(type=0)
+//   - TerrainShadow_ToggleEmitterStamp (0x74DE40)           → RegisterImage(type=4)
+// 这两条由 CDoodads_CreateDoodadAndActivate / EnableFeatures / SetTodAndRefresh
+// 在对象创建、特性重激活、时间(TOD)变化时调用。历史上只拦了 ListA 直写路径
+// (ShadowPath_StaticStamp_Toggle 0x74E420)，**没有拦这两条 RegisterImage 贴花
+// 路径**，所以魔兽自带的树木/装饰物地面贴花阴影一直可见。
+//
+// 直接 hook 这两个 Toggle 函数的入口、在 mode>=1 时跳过 enable!=0 的写入，
+// 即可覆盖 create / EnableFeatures / TOD-refresh 全部 caller（单点拦截），
+// 且完全不动 fog/LOS/path（那是 FogMask 路径，与此无关）。
+inline constexpr bool kNativeShadowDoodadStampHookEnabled = true;
+// mode=1（仅雾/边界）时屏蔽 doodad 静态贴花阴影注册。
+inline constexpr bool kNativeShadowBlockDoodadStaticStampWhenMode1 = true;
+// mode=1 时屏蔽 doodad emitter 贴花阴影注册。
+inline constexpr bool kNativeShadowBlockDoodadEmitterStampWhenMode1 = true;
+// doodad 贴花阴影拦截统计日志（低频，默认关闭）。
+inline constexpr bool kNativeShadowDoodadStampStatsLogging = false;
+inline constexpr uint32_t kNativeShadowDoodadStampStatsInterval = 4000;
+
+// ========================================================================
+// 2026-05-30 根因突破：ListA stamp 渲染消费点拦截（真正生效的静态阴影治理）
+// ========================================================================
+// IDA 决定性证据：CWorld_TerrainShadow_Dispatch (0x6F7369B4) case0 主渲染路径
+// 直接调用 TerrainShadow_ListA_RenderPreparedGroups (0x7370A0) 和
+// Terrain_ShadowListA_RenderAllEntries (0x737110) 来渲染所有 doodad/建筑/
+// path blocker 的地面贴花阴影 stamp。这两个函数**绕过项目所有现有 hook**
+// （历史只 hook 了 Terrain_RenderShadowLayer 0x737620，那只是其中一个子调用）。
+//
+// 这就是"历史所有静态阴影/path blocker 拦截全部无效"的根因：拦的都是
+// producer（注册）或错误的 consumer，没拦真正画 stamp 的这两个函数。
+//
+// mode>=1 时 hook 这两个函数直接 return，干净屏蔽魔兽自带可见静态阴影 +
+// path blocker 地面阴影。fog/LOS/path 走独立 FogMask grid（terrain tile 着色
+// 消费），不受影响。两函数仅被 Dispatch 调用，hook 安全。
+inline constexpr bool kNativeShadowListARenderHookEnabled = true;
+// mode=1 时屏蔽 ListA stamp 渲染（doodad/建筑/path blocker 地面贴花阴影）。
+inline constexpr bool kNativeShadowBlockListARenderWhenMode1 = true;
+// ListA 渲染拦截统计日志（低频，默认关闭）。
+inline constexpr bool kNativeShadowListARenderStatsLogging = false;
+inline constexpr uint32_t kNativeShadowListARenderStatsInterval = 600;
 
 // 是否拦截建筑阴影投影器（用于“仅保留雾/边界”的实验）
 inline constexpr bool kNativeShadowBlockBuildingProjectorEnabled = false;

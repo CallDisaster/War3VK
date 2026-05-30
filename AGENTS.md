@@ -2,8 +2,46 @@
 
 ## 📅 项目当前状态 (Current Status)
 
-**最后更新**: 2026-04-05
-**当前阶段**: 稳定回退点已建立（`ea204b1`），进入 v2.5：`runtime shadow bridge v1` 收口 + 动态 Pose Takeover 前置阶段
+**最后更新**: 2026-05-19
+**当前阶段**: 渲染层逆向论文 v1 完成 + 性能优化主线稳定 + 静态阴影治理待落地
+
+### 📊 逆向论文交付状态（2026-05-19）
+
+| 章节 | 行数 | 深度 | IDA rename | IDA comments |
+|---|---|---|---|---|
+| 第 1 章 剔除→渲染过渡 | ~750 | 架构+调用链 | 26 | 6 |
+| 第 2 章 RenderQueue 完整数据流 | ~1100 | 架构+算法 | 23 | 13 |
+| 第 3 章 CSprite 动画系统 | ~750 | 架构+CFG | 7 | 0 |
+| 第 4 章 Pose 数据流（重中之重） | ~990 | **完整算法** | 24 | 13 |
+| 第 5 章 CGeosetData 顶点/skinning | ~500 | 架构+算法 | 15 | 6 |
+| 第 6 章 FogMask 静态阴影治理 | ~600 | **完整算法** | 41 | 14 |
+| 第 7 章 Light/Shadow pass | ~450 | 架构+路径 | 30 | 4 |
+| 第 8 章 D3D9 State Bridge | ~300 | 架构+vtable | 8 | 2 |
+| 第 9 章 UI 渲染分支 | ~150 | 架构 | 11 | 0 |
+| 第 10 章 粒子/Effect | ~120 | 架构+算法 | 3 | 0 |
+| 第 11 章 深度算法参考 | ~600 | **完整算法** | 18 | 7 |
+| 第 12 章 材质/状态机/批次 | ~500 | **完整算法** | 30 | 6 |
+| 第 13 章 Sprite/RenderQueue/Entry | ~400 | **完整算法** | 6 | 6 |
+| **总计** | **~7300 行** | | **~280** | **~101** |
+
+### 🔧 关键逆向结论
+
+1. **War3 CPU skinning**：War3 1.27a 不使用 D3D9 vertex blending（`D3DRS_VERTEXBLEND=D3DVBF_DISABLE`），所有骨骼变换在 CPU 端完成。draw-time VB capture 是正确的 shadow pose 修复方向。
+2. **Path blocker 视觉残留**：D3D9 CSM 层拦截完整（6 个 shadowCasters 站点全覆盖），残留来自 War3 原生 TerrainShadow 系统的 `WriteMaskRegion` 路径。
+3. **建筑阴影屏蔽**：`WriteMaskRegion` hook 已实现但 `kNativeStaticShadowMaskHideEnabled=false` 导致拦截被编译期移除。**下一步应启用做 A/B 实验。**
+4. **RenderQueue 排序**：5 级优先级链 = special → transparent → layerState → meshData → 内容比较。
+5. **CSpriteUber dt gate**：4 变体共享 `fabs(dt)>=2*FLT_EPSILON` 门控，dt>0 占 98.79%。
+
+### 📈 性能优化累计收益（Phase 7.70-7.86）
+
+| 优化项 | 理论 CPU 削减 |
+|---|---|
+| 同帧 draw-time VB capture dedup | ~40-100μs/帧 |
+| 6 个全局 mutex → shared_mutex | ~0.6-1.5ms/帧 |
+| Phase 7.49 publish probe 默认关 | ~0.3-0.9ms/帧 |
+| frameTag/frameNumber load 合并 | ~0.15-0.4ms/帧 |
+| 4 个 thread_local scratch caches | ~0.1-0.3ms/帧 |
+| **总计** | **~1.1-2.7ms/帧** |
 
 ### 🔖 当前稳定回退点（2026-04-05）
 1. **稳定提交点**：`ea204b1`（`checkpoint runtime shadow bridge and dynamic unit fallback fixes`）。
@@ -5218,3 +5256,269 @@ f81f99d phase 7.118 BuildShadowReplayDraws thread_local cache
      - 注释清理: 30+ 文件 Phase 7.X 历史注释（风险大收益小，不做）
      - d3d9_device.cpp 拆分: 26K+ 行（超出无人值守工作量）
 
+
+
+133. **论文第 5/7/8 章完成 + IDA 大批量 rename（2026-05-19 04:00）**:
+   - **论文交付**:
+     - 第 5 章 `05_cgeoset_vertex_skinning.md`（~500 行）: CGeosetData 数据结构、顶点格式、CPU skinning 流程、Matrix Group Remap、draw-time VB capture 原理
+     - 第 7 章 `07_light_shadow_pass.md`（~450 行）: War3 原生 TerrainShadow 三条路径、项目 CSM pipeline、Shadow TAA、路径阻断器 11 分桶、Alpha Shadow 处理
+     - 第 8 章 `08_d3d9_state_bridge.md`（~300 行）: GxDevice vtable 结构、状态块系统、D3D9 hook 接管点、CGxMat 材质系统
+   - **IDA 写回**:
+     - **CGeosetData 系列**（15 处 rename）: BuildFromRawArrays / Initialize / BuildPrefixSums / DedupGroupsToRuntime / MatrixGroupRemap 系列 / CMatrixGroup_BlendOutputMatrix / AppendVertexArray / AppendIndexArray / BindMaterialLayout / AllocDefaultGroups / FinalizeVertexGroups + 6 条注释
+     - **TerrainShadow 系列**（30 处 rename）: Dispatch / FlushPass / RenderListA / RenderListB / RenderLayer / RegisterImageEntry / RegisterImageEntryWithParams / ToggleStaticStampFromObject / ToggleEmitterStamp / WriteMaskRegion / RebuildMaskFromObjectLists / Node7E4_Render / DispatchToShape / WriteMaskRegion_ForObject / WriteMaskRegion_FromActorRuntime / TickAndRunUpdateList / List78C_RenderOne / ListA_PrepareSortableGroups / RenderListBEntry / ListA_RenderPreparedGroups / RefreshStampScaleResource / RegisterImageEntryFromPoint / RegisterImageEntryFromTwoPoints / RefreshEntryResourceByPos / PolyFastpath / BoxFastpath / ScanlineFastpath / ListA_HeapPopByColorKey + 4 条注释
+     - **GxDevice 系列**（8 处 rename）: gxApplyStateBlock / gxDrawCore / gxPreparePrimitive / gxCleanup74 / gxCleanup78 / gxRenderSceneFlush / gxUpdateStage / gxColorSlotWrite + 2 条注释
+     - **总计本轮**: 53 处 rename + 12 条 set_comments，全部 ok=true
+   - **累计 IDA 写回**: ~184 处 rename + ~67 条 set_comments
+   - **论文 v1 完整度更新**:
+     - ✅ 第 1 章 剔除→渲染过渡（~750 行）
+     - ✅ 第 2 章 RenderQueue 完整数据流（~1100 行）
+     - ✅ 第 3 章 CSprite 动画系统（~750 行）
+     - ✅ 第 4 章 Pose 数据流（~990 行，重中之重）
+     - ✅ 第 5 章 CGeosetData 顶点/skinning（~500 行）**本轮新增**
+     - ✅ 第 6 章 FogMask 静态阴影治理（~600 行）
+     - ✅ 第 7 章 Light/Shadow pass（~450 行）**本轮新增**
+     - ✅ 第 8 章 D3D9 State Bridge（~300 行）**本轮新增**
+     - ✅ 第 9 章 UI 渲染分支（~150 行）**本轮新增**
+     - ✅ 第 10 章 粒子/Effect（~120 行）**本轮新增**
+     - **10 章全部完成，覆盖"逻辑层 → GPU draw call"全链路 + 静态阴影 + shadow pipeline + D3D9 bridge + UI + 粒子**
+   - **关键逻辑推断结论**:
+     1. **path blocker 视觉残留**: D3D9 CSM pipeline 拦截已完整覆盖所有 6 个 shadowCasters.emplace_back 站点（EntryGate + EarlyBypass + Producer + FastAppend + LegacyCapture + StaticSupplement）。残留来自 War3 原生 TerrainShadow 系统的 `WriteMaskRegion` 路径（路径 Z），需要 hook `0x6F234710` + `maskIdx==3` 才能彻底屏蔽。
+     2. **建筑/装饰物原生静态阴影**: 24 文档 v3 已给出完整方案（CDoodads 路径 A1 注入 a6=6 + CUnit 路径 B1 按 isBldg 拦）。WriteMaskRegion 是建筑阴影的唯一可行拦截点。
+     3. **War3 CPU skinning 确认**: War3 1.27a 不使用 D3D9 vertex blending（D3DRS_VERTEXBLEND=D3DVBF_DISABLE），所有骨骼变换在 CPU 端完成。这是 draw-time VB capture 方案的根本依据。
+     4. **WriteMaskRegion hook 现状**: hook 已完整实现（war3_hook_shadow.cpp:972-1212），包含 caller-aware + maskIdx==3 + widget+0x60 flag 三种拦截路径。但 `kNativeStaticShadowMaskHideEnabled=false` 和 `kNativeStaticShadowHideBuildingFootprintEnabled=false` 导致所有拦截被 `if constexpr(false)` 编译期移除。唯一活跃的是 `DispatchToShape` 拦截（`kNativeStaticShadowDispatchToShapeRejectEnabled=true`）。Phase 7.100 的"idx==3 被推翻"结论**可能错误**——探针只采样了少量调用，读到的 6/7/9 可能来自非标准 widget。**下一步应启用 `kNativeStaticShadowMaskHideEnabled=true` 做 A/B 实验。**
+   - **IDA 写回统计**:
+     - CGeosetData: 15 rename + 6 comments
+     - TerrainShadow: 30 rename + 4 comments
+     - GxDevice: 8 rename + 2 comments
+     - WriteMaskRegion 相关: 8 comments
+     - UI 渲染: 11 rename
+     - **累计**: ~198 rename + ~75 comments，全部 ok=true
+   - **论文交付**: 10 章全部完成，总计约 5800 行，覆盖 War3 1.27a 渲染层完整链路
+   - **算法级补全（第 11 章）**: 深度算法参考文档，覆盖 RenderQueue 排序 comparator 完整优先级链、Dispatch_Special fallback multipass 算法、AUCTransparent 5 种分发类型、CMatrixGroup_BlendOutputMatrix 多骨骼加权混合、CFogMask 节点表构建、RenderQueue_StageUpdate 刷新机制、GxDevice 状态机、粒子系统物理模拟算法
+   - **IDA 算法级 rename**: 18 处 RenderQueue 核心函数 rename + 7 条算法级注释（排序 comparator / 透明分发 / 矩阵混合 / mask 构建 / stage 更新）
+   - **深度逆向续作（第 12 章）**: CGxMat 材质系统完整映射（layer color/alpha 寄存器、tint 组合、texture stage mode、special batch 一致性检查）、CUnit 状态机完整事件分发表（15 个事件 ID + 7 张状态 vtable + 建筑/普通分流）、RenderBatch_Submit 完整算法（opaque/transparent 分流逻辑）、FlushSortedItems 完整算法（排序→dispatch→StageUpdate→cleanup）
+   - **IDA 大批量 rename（CUnit + 材质系统）**: 30 处 rename + 6 条注释，覆盖 CUnit shadow 全生命周期（create/destroy/morph/changeOwner/load/visible/hidden/pathing/lifecycle）+ 材质系统核心函数（ApplyLayerColorAlpha/ComposeLayerTintAndAlpha/ApplyTextureStageMode/IsSpecialBatchStateConsistent/ApplyDrawStateAndSamplerPair）
+   - **累计 IDA 写回**: ~264 处 rename + ~95 条 set_comments
+   - **深度逆向续作（第 13 章）**: CSpriteUber_PreRender 4 变体精确对比（Full/Mini/MiniLite/FullLite 的参数、flags 分支、子对象递归差异）、WorldObjectEntry_Render 完整流程（vtable[5] PreRender → sceneNode 检查 → AddBatch）、RenderQueue_AddBatch 完整流程（Submit → 透明列表 → 子节点递归）
+   - **IDA 写回统计更新**: ~280 处 rename + ~101 条 set_comments
+
+
+
+---
+
+## 📋 2026-05-19 逆向工作完整总结
+
+### 一、论文交付（13 章，~7300 行）
+
+本会话完成了 War3 1.27a 渲染层的系统性逆向，交付 13 章论文：
+
+**架构级（第 1-10 章）**：覆盖"逻辑层剔除 → 渲染层过渡 → RenderQueue → CSprite 动画 → Pose palette → CGeosetData 顶点/skinning → FogMask 静态阴影 → Light/Shadow pass → D3D9 State Bridge → UI 渲染 → 粒子/Effect"完整链路。
+
+**算法级（第 11-13 章）**：补全所有关键函数的完整内部逻辑：
+- RenderQueue 排序 comparator 5 级优先级链
+- Dispatch_Special fallback multipass 算法
+- AUCTransparent 5 种分发类型
+- CMatrixGroup_BlendOutputMatrix 多骨骼加权混合
+- CFogMask 节点表构建 + WriteMaskRegion 双缓冲写入
+- CGxMat 材质系统 texture stage state 映射
+- CUnit 状态机 15 个事件 ID + 7 张 vtable
+- RenderBatch_Submit / FlushSortedItems 完整算法
+- CSpriteUber_PreRender 4 变体精确对比
+- WorldObjectEntry_Render / RenderQueue_AddBatch 完整流程
+
+### 二、IDA 写回（~280 rename + ~101 comments）
+
+所有逆向结论已写回 IDA，后续打开反编译视图时关键函数直接显示中文语义+背景注释。覆盖：
+- CGeosetData（15 rename + 6 comments）
+- TerrainShadow（30 rename + 4 comments）
+- GxDevice（8 rename + 2 comments）
+- RenderQueue 核心（18 rename + 7 comments）
+- CUnit + 材质系统（30 rename + 6 comments）
+- CSpriteUber + Entry（6 rename + 6 comments）
+- WriteMaskRegion 相关（8 comments）
+- UI 渲染（11 rename）
+- 其他历史累计（~162 rename + ~62 comments）
+
+### 三、关键逻辑推断
+
+1. **War3 CPU skinning 确认**：War3 1.27a 不使用 D3D9 vertex blending，所有骨骼变换在 CPU 端完成。这是 draw-time VB capture 方案的根本依据。
+
+2. **Path blocker 视觉残留根因**：D3D9 CSM 层拦截完整（6 个 shadowCasters 站点全覆盖），残留来自 War3 原生 TerrainShadow 系统的 `WriteMaskRegion` 路径。
+
+3. **建筑阴影屏蔽方案**：`WriteMaskRegion` hook 已实现（war3_hook_shadow.cpp:972-1212），包含 caller-aware + maskIdx==3 + widget+0x60 flag 三种拦截路径。但 `kNativeStaticShadowMaskHideEnabled=false` 导致拦截被编译期移除。Phase 7.100 的"idx==3 被推翻"结论可能错误——探针读到了非标准 widget 的值。
+
+4. **RenderQueue 排序算法**：5 级优先级链 = special flag → transparent flag → layerState ptr → meshData ptr → layerState 内容前 20B → 稳定排序。
+
+5. **CSpriteUber dt gate**：4 个变体共享 `fabs(dt) >= 2*FLT_EPSILON` 门控，Phase 7.47 实测 dt>0 占 98.79%，dt==0 仅 1.21% 且集中在进图前两帧。
+
+### 四、待解决问题
+
+1. **建筑阴影屏蔽**：需要启用 `kNativeStaticShadowMaskHideEnabled=true` 做 A/B 实验
+2. **Path blocker 原生阴影**：需要 hook `TerrainShadow_WriteMaskRegion` + `maskIdx==3`
+3. **CEffect 派生类**：IDA 中未找到直接命名的函数（可能被内联或使用不同命名约定）
+4. **D3D9 state block 字段级文档**：需要逆向 GxDevice 内部实现
+
+### 五、性能优化累计收益（Phase 7.70-7.86）
+
+| 优化项 | 理论 CPU 削减 |
+|---|---|
+| 同帧 draw-time VB capture dedup | ~40-100μs/帧 |
+| 6 个全局 mutex → shared_mutex | ~0.6-1.5ms/帧 |
+| Phase 7.49 publish probe 默认关 | ~0.3-0.9ms/帧 |
+| frameTag/frameNumber load 合并 | ~0.15-0.4ms/帧 |
+| 4 个 thread_local scratch caches | ~0.1-0.3ms/帧 |
+| **总计** | **~1.1-2.7ms/帧** |
+
+### 六、下一步建议
+
+1. **最高优先**：启用 `kNativeStaticShadowMaskHideEnabled=true` 做 A/B 实验，验证 idx==3 拦截是否真正有效
+2. **次要**：hook `TerrainShadow_WriteMaskRegion` + `maskIdx==3` 彻底屏蔽建筑阴影
+3. **合并准备**：69 commit squash + changelog（audit 报告已就绪）
+4. **性能优化**：继续削减 Shadow/Main / receiver / TAA GPU 成本
+
+
+
+---
+
+## 🔧 2026-05-30 接手：三大顽固问题统一治理（Claude Opus 4.8）
+
+> 约束：先理论成立后开发；内存/CPU 紧张暂不跑 AutoTest；IDA 已开启继续逆向。
+> 目标问题：(1) 魔兽自带静态阴影禁用 (2) 桥/斜坡卡顿 (3) path blocker 渲染泄漏。
+> 计划文档：`docs/plan/three_problems_resolution_2026_05_30/README.md`
+
+### 一、本轮 IDA 复核结论（理论奠基）
+
+1. **路径 Z（FogMask WriteMaskRegion 0x234710）确认不是建筑阴影**：
+   - 重新反编译 `WriteMaskRegion` + `DispatchToShape (0x234420)`：
+     `a2+0x10C` 是 footprint 形状 result（`a4 ? 4 : *(u16*)(a2+0x10C)`），不是 mask
+     layer index；`a3` 是 16-bit player-slot 可见性位 + 形状位，与 fog/LOS/path
+     共享 mask grid。caller 全是 RebuildMask / WriteMaskRegion_ForObject /
+     FromActorRuntime / CUnit_StampBuildingShadowFootprint /
+     CWidget_RegisterFootprintAndShadowMask。
+   - **结论与 Phase 7.100 一致**：这是 fog/视野/路径阻挡 mask，不能拦（会破坏迷雾）。
+     `idx==3` 推断已被推翻。**放弃路径 Z 作为阴影治理点。**
+
+2. **路径 X（CDoodads 贴花阴影）才是"魔兽自带可见静态阴影"治理点**：
+   - `CDoodads_CreateDoodadAndActivate (0x74D5AE)` 在 `a6=0` 时调用三件事：
+     a) `ShadowPath_StaticStamp_Toggle (0x74E420)` — ListA 直写 **【已被项目拦】**
+     b) `TerrainShadow_ToggleStaticStampFromObject (0x74DB30)` → RegisterImage(type=0)
+        **【历史未拦 → 树木/装饰物地面贴花阴影一直可见】**
+     c) `TerrainShadow_ToggleEmitterStamp (0x74DE40)` → RegisterImage(type=4) 发光体/特效
+   - `0x74DB30` 调用者全是 CDoodads_*（Create/Destroy/EnableFeatures/DisableFeatures）
+     + `CDoodads_SetTodAndRefreshStamp (0x75C5F0)`（TOD 变化重写）。
+   - **path blocker 在 War3 里就是 doodad，走同一条 CDoodads 路径**，所以拦
+     `0x74DB30` 同时治理问题 1 和问题 3 的 native 阴影部分。
+
+3. **桥/斜坡卡顿根因（draw-time VB cache 16 帧淘汰）**：
+   - 桥/斜坡/建筑/装饰物是静态几何（CPU skin 后顶点固定、worldMatrix 固定），
+     却被当动态对象按 16 帧 TTL 淘汰 + 每次重新 GPU copy（`d3d9_device.cpp:18050`）。
+   - 离开视野 16 帧后 entry 的 GPU buffer 释放，再次进入视野必须重新
+     createBuffer（vkAllocateMemory 同步阻塞主线程）→ **复现"看到桥/斜坡卡，离开
+     再回来又卡"**。
+
+### 二、本轮代码改动（已编译通过 `ninja -C build32`，仅既有 warning）
+
+**问题 1 + 3（CDoodads 贴花阴影拦截）**：
+- `war3_internal_test_config.h`：新增 `kNativeShadowDoodadStampHookEnabled=true`、
+  `kNativeShadowBlockDoodadStaticStampWhenMode1=true`、
+  `kNativeShadowBlockDoodadEmitterStampWhenMode1=true`（emitter 暂未真正拦）、
+  stats 开关。
+- `war3_hook_address_book.h/.cpp`：新增 `terrainShadowToggleStaticStampFromObject
+  (0x74DB30)` 与 `terrainShadowToggleEmitterStamp (0x74DE40)`。
+- `war3_hook_shadow.h/.cpp`：新增 `Hook_Doodad_ToggleStaticStampFromObject`
+  （`__fastcall(this,edx,doodadSlot,enable)`，mode>=1 且 enable!=0 时 return 0
+  跳过贴花阴影注册；enable==0 移除必须放行）+ 4 个诊断 counter + query。
+  install 在 `InstallShadowHooks` 内挂 `0x74DB30`。
+- **关键安全决策**：`ToggleEmitterStamp (0x74DE40)` 是 `__userpurge`（edi=this 隐式
+  参数），不能用标准 __fastcall trampoline 安全 hook（passthrough 会丢 edi），
+  本轮**不拦它**（它是发光体/特效/腐地 puff，不是静态树木/建筑阴影本体）。
+  只拦 `0x74DB30`（type=0 静态贴花阴影主路径，干净 __thiscall 已 IDA 验证）。
+- 与现有 `Hook_ShadowPath_StaticStamp_Toggle (0x74E420)` 一起，覆盖 CDoodads 两条
+  阴影写入链（ListA 直写 + RegisterImage type=0）。
+
+**问题 2（桥/斜坡卡顿 — 静态几何 VB cache 常驻）**：
+- `War3DrawTimeVBEntry`（d3d9_device.h）新增 `isStaticGeometry / lastAccessFrameSerial
+  / ownedGpuBytes`。
+- `war3_internal_test_config.h`：新增
+  `kShadowDrawTimeVBCacheStaticPersistEnabled=true`、
+  `kShadowDrawTimeVBCacheStaticPersistMaxBytes=64MiB`、
+  `kShadowDrawTimeVBCacheStaticMaxIdleFrames=108000`、
+  `kShadowDrawTimeVBCacheDynamicMaxAgeFrames=16`。
+- capture 末端：`objectKind==Building||Destructible` 标记为静态几何 + 记录占用字节。
+- cache cleanup（d3d9_device.cpp ~18050）：静态几何不按 16 帧淘汰，常驻复用
+  GPU buffer；只在长期闲置（~30 分钟）或超 64MiB 字节上限时按 lastAccessFrameSerial
+  LRU 回收。动态对象保持原 16 帧 TTL。
+
+### 三、待验证（用户内存空闲后实机 + AutoTest）
+- 问题 1/3：mode=1 下树木/装饰物/path blocker 的 native 地面贴花阴影是否消失，
+  且 fog/视野/路径阻挡不受影响。
+- 问题 2：桥/斜坡反复进出视野是否不再卡（静态 entry 复用，无 createBuffer）。
+- 风险回退开关：
+  - `kNativeShadowDoodadStampHookEnabled=false` 关闭 doodad 贴花拦截。
+  - `kShadowDrawTimeVBCacheStaticPersistEnabled=false` 回到 16 帧 TTL。
+
+### 四、下一步（仍需推进）
+- 问题 3 的 CSM 泄漏部分：核对 EntryGate 是否覆盖所有 6 个 shadowCasters
+  emplace_back 站点；path blocker mesh 是否仍被 capture 进 shadowCasters。
+- 若 doodad 贴花拦截不彻底（EnableFeatures 在 hook 安装前已创建的 doodad），
+  考虑 `CDoodads_CreateDoodadAndActivate` a6 注入 + 早装。
+
+
+---
+
+## 🎯 2026-05-30 第二轮：根因突破（用户反馈"三个修复全无效"后）
+
+### 用户反馈
+"你的修复没有一个是生效的，问题全都是老问题。"
+
+### 诊断（拿硬证据，不再猜）
+1. 读 `E:\Work\War3\war3_d3d9.log`（23:49，晚于 23:28 部署）：确认 DLL 是我的版本，
+   含我的新字符串，hook 安装日志正常（DispatchToShape/WidgetIdentity install ok）。
+2. 确认 path blocker CSM 拦截在跑：EntryGate/Producer/FastAppend/AppendEntry 全部
+   命中 YTfb/YTpb/YTab 并 `return false`（6 个 emplace_back 站点核对，拦截正确）。
+3. **但用户仍看到静态阴影 + path blocker 阴影。** 说明可见阴影根本不是我们的 CSM 画的。
+
+### 根因（IDA 决定性证据）
+反编译 `CWorld_TerrainShadow_Dispatch (0x6F7369B4)` case0（主渲染路径），它直接调用：
+```
+TerrainShadow_ListA_RenderPreparedGroups (0x7370A0)   ← 画 ListA 分组 stamp
+Terrain_ShadowListA_RenderAllEntries (0x737110)       ← 画所有 ListA stamp
+```
+这两个函数是**真正画 doodad/建筑/path blocker 地面贴花阴影 stamp 的消费点**，
+它们消费 `RegisterImageEntry`（ToggleStaticStampFromObject/EmitterStamp）注册进
+ListA stamp 池的条目，逐条调 `Terrain_ShadowListA_RenderEntryComplex`。
+
+**它们绕过项目所有现有 hook**：
+- 历史只 hook 了 `Terrain_RenderShadowLayer (0x737620)`，mode=1 只关它的 a3(ListB)；
+- 但 case0 里 `ListA_RenderPreparedGroups` + `ShadowListA_RenderAllEntries` 是
+  **直接调用**，不经过 RenderShadowLayer，所以从没被拦到。
+- xrefs 确认这两个函数**仅被 CWorld_TerrainShadow_Dispatch 调用**，专职 ListA
+  shadow stamp 渲染，不涉及 fog/visibility/border（那些走独立 FogMask grid）。
+
+这一次性解释了为什么**历史所有静态阴影/path blocker 拦截全部无效**：
+拦的都是 producer（RegisterImage/StaticStamp）或错误 consumer（ListB/RenderLayer/
+Projector），从没拦到真正画 stamp 的这两个函数。
+
+### 本轮修复（已编译 + 部署，d3d9.dll 26904889 @ 0:03）
+- 新增 hook：`Hook_TerrainShadow_ListA_RenderPreparedGroups (0x7370A0)` +
+  `Hook_TerrainShadow_ListA_RenderAllEntries (0x737110)`，均 `__fastcall(this,edx)`。
+  mode>=1 时直接 return（什么都不画）。
+- 配置：`kNativeShadowListARenderHookEnabled=true`、
+  `kNativeShadowBlockListARenderWhenMode1=true`。
+- 安装日志用 `Logger::info` 写进 war3_d3d9.log（`war3dbg::Print` 走 DebugView 不进
+  文件，这是上轮"看不到 doodad hook 日志"的原因）。
+- 保留上轮 producer 端 `ToggleStaticStampFromObject` hook 作为兜底。
+
+### 关键经验教训
+1. `war3dbg::Print` 走 DebugView（OutputDebugString），**不写 war3_d3d9.log**；
+   `Logger::info` 才写文件。验证 hook 是否安装必须用 Logger::info。
+2. 拦截"producer 注册"不等于阻止"consumer 渲染"——地图预置对象在 hook 前已注册，
+   必须在 consumer 端拦才彻底。
+3. 一个渲染系统可能有多个 render 入口，hook 一个不够，要 xrefs 找全所有 consumer。
+
+### 待实机验证
+- 下次启动看 war3_d3d9.log 是否有 `ListA_RenderPreparedGroups install ... result=ok`
+  与 `ListA_RenderAllEntries install ... result=ok`；
+- 视觉：静态阴影 + path blocker 阴影是否消失，fog/视野/边界是否正常；
+- 若出现边界条纹伪影（doc 24 §8.2 历史风险）→ 改用更细粒度的 entry 级过滤。
+- 回退开关：`kNativeShadowBlockListARenderWhenMode1=false`。

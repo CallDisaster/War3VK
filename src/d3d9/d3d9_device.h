@@ -2047,6 +2047,19 @@ private:
     uint32_t jHandle = 0u;
     war3::render::ObjectKind objectKind =
         static_cast<war3::render::ObjectKind>(0);
+    // 2026-05-30 问题2（桥/斜坡卡顿）：静态几何标记。
+    // 桥/斜坡/建筑/装饰物/可破坏物是静态几何——CPU skin 之后顶点不再变化，
+    // worldMatrix 也固定。它们离开视野后被 16 帧 TTL 淘汰 + GPU buffer 释放，
+    // 再次进入视野时必须重新 createBuffer + copyBuffer（vkAllocateMemory 同步
+    // 阻塞主线程）→ 复现"看到桥/斜坡就卡，过一会好，离开再回来又卡"。
+    // 标记为静态后用更长 TTL（近似常驻），再次进入视野直接 O(1) 复用已有
+    // GPU buffer，不再 createBuffer。受 cache 总字节上限约束做 LRU 淘汰。
+    bool isStaticGeometry = false;
+    // 上次被消费端（producer/fast-append/consumer）实际复用的帧号。
+    // 静态几何 LRU 淘汰时按此排序，保证"最近还在看的桥/斜坡"优先保留。
+    uint64_t lastAccessFrameSerial = 0u;
+    // 该 entry 持有的 GPU buffer 总字节（pos + uv + idx），用于字节上限统计。
+    uint64_t ownedGpuBytes = 0u;
     // Phase 7.70：同帧重复捕获去重指纹。
     // 同一 renderablePart 在一帧里常被多次 draw（sub-mesh、layer pass、补光），
     // 每次都会重做 EmitCs(copyBuffer)。如果数据来源（VB/IB slice + range）没变，

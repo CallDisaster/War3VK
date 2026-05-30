@@ -628,6 +628,20 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
     shadowHooks.terrainShadowDispatchToShapeAddr =
         resolveCode(book.terrainShadowDispatchToShape,
                     "TerrainShadow_DispatchToShape");
+    // 2026-05-30：CDoodads 贴花阴影对象级注册入口（魔兽自带可见静态阴影治理）。
+    shadowHooks.terrainShadowToggleStaticStampFromObjectAddr =
+        resolveCode(book.terrainShadowToggleStaticStampFromObject,
+                    "TerrainShadow_ToggleStaticStampFromObject");
+    shadowHooks.terrainShadowToggleEmitterStampAddr =
+        resolveCode(book.terrainShadowToggleEmitterStamp,
+                    "TerrainShadow_ToggleEmitterStamp");
+    // 2026-05-30 根因突破：ListA stamp 渲染消费点（真正画静态阴影/path blocker）。
+    shadowHooks.terrainShadowListARenderPreparedGroupsAddr =
+        resolveCode(book.terrainShadowListARenderPreparedGroups,
+                    "TerrainShadow_ListA_RenderPreparedGroups");
+    shadowHooks.terrainShadowListARenderAllEntriesAddr =
+        resolveCode(book.terrainShadowListARenderAllEntries,
+                    "Terrain_ShadowListA_RenderAllEntries");
     dxvk::war3::hooks::InstallShadowHooks(shadowHooks);
 
     // Phase 7.98：CWidget 身份链中央 sync Hook。

@@ -889,6 +889,167 @@ int __fastcall Hook_ShadowProjector_Add_Simple(void *a1, void *a2, int arg0,
 }
 
 // =====================================================================
+// 2026-05-30: CDoodads 贴花阴影拦截（魔兽自带可见静态阴影 + path blocker 治理）
+// =====================================================================
+// TerrainShadow_ToggleStaticStampFromObject (0x74DB30) 是 CDoodads
+// （树木/装饰物/可破坏物/path blocker）的"地面贴花阴影"对象级注册入口
+// （写 RegisterImage type=0）。它由 CDoodads_CreateDoodadAndActivate /
+// EnableFeatures / SetTodAndRefreshStamp 在对象创建、特性重激活、TOD 变化时
+// 调用。历史上只拦了 ListA 直写路径（ShadowPath_StaticStamp_Toggle 0x74E420），
+// **没有拦这条 RegisterImage 贴花路径**，所以魔兽自带的树木/装饰物地面贴花
+// 阴影一直可见。
+//
+// 这是干净 __thiscall(this, doodadSlot, enable)，可安全 hook。
+// 策略：mode>=1 且 enable!=0 时直接跳过 enable 写入（return 0），让贴花阴影
+// 不被注册。enable==0（移除）必须放行，确保已注册的 stamp 能被清除。
+//
+// 注意：姊妹函数 ToggleEmitterStamp (0x74DE40) 是 __userpurge（edi=this 作为
+// 隐式参数），不能用标准 __fastcall trampoline 安全 hook（passthrough 会丢
+// edi）。emitter stamp（type=4）主要是发光体/技能特效/腐地 puff，不是静态
+// 树木/建筑阴影本体，因此本轮不拦它，只拦 StaticStamp（type=0）这条阴影主路径。
+using TerrainShadowToggleStaticStampFn = int(__fastcall *)(void *, void *, int,
+                                                           int);
+TerrainShadowToggleStaticStampFn g_trampolineDoodadStaticStamp = nullptr;
+
+std::atomic<uint64_t> g_doodadStaticStampEnterCount{0};
+std::atomic<uint64_t> g_doodadStaticStampBlockedCount{0};
+std::atomic<uint64_t> g_doodadEmitterStampEnterCount{0};
+std::atomic<uint64_t> g_doodadEmitterStampBlockedCount{0};
+
+int __fastcall Hook_Doodad_ToggleStaticStampFromObject(void *thisPtr, void *edx,
+                                                       int doodadSlot,
+                                                       int enable) {
+  g_doodadStaticStampEnterCount.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t mode = War3RenderState::GetNativeShadowMode();
+  bool blocked = false;
+  // 只屏蔽"启用"写入；"移除"必须放行以清除既有 stamp。
+  if (enable != 0) {
+    if ((mode == 1u &&
+         dxvk::war3::internal::kNativeShadowBlockDoodadStaticStampWhenMode1) ||
+        mode >= 2u) {
+      blocked = true;
+    }
+  }
+
+  if constexpr (dxvk::war3::internal::kNativeShadowDoodadStampStatsLogging) {
+    static std::atomic<uint32_t> s_calls{0};
+    const uint32_t calls = s_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((calls % dxvk::war3::internal::kNativeShadowDoodadStampStatsInterval) ==
+        0u) {
+      war3dbg::Print(
+          "DXVK War3Hook: DoodadStaticStamp calls=%u blocked=%llu mode=%u "
+          "enable=%d\n",
+          static_cast<unsigned>(calls),
+          static_cast<unsigned long long>(
+              g_doodadStaticStampBlockedCount.load(std::memory_order_relaxed)),
+          static_cast<unsigned>(mode), enable);
+    }
+  }
+
+  if (blocked) {
+    g_doodadStaticStampBlockedCount.fetch_add(1, std::memory_order_relaxed);
+    // 返回 0 表示"无 stamp 写入"；调用方据此不回填 stamp index（保持 -1）。
+    return 0;
+  }
+
+  if (g_trampolineDoodadStaticStamp)
+    return g_trampolineDoodadStaticStamp(thisPtr, edx, doodadSlot, enable);
+  return 0;
+}
+
+// =====================================================================
+// 2026-05-30 根因突破: ListA stamp 渲染消费点拦截
+// =====================================================================
+// CWorld_TerrainShadow_Dispatch (0x6F7369B4) case0 直接调用这两个函数渲染
+// 所有 doodad/建筑/path blocker 的地面贴花阴影 stamp。它们是 __thiscall(this)
+// 单参函数。mode>=1 时直接 return（什么都不画），干净屏蔽魔兽自带可见静态
+// 阴影 + path blocker 地面阴影。fog/LOS/path 走独立 FogMask grid，不受影响。
+//
+// 安全性：xrefs 确认这两个函数仅被 CWorld_TerrainShadow_Dispatch 调用，
+// 专职 ListA shadow stamp 渲染，不涉及 fog/visibility/border。
+// 这是真正生效的拦截点——历史所有拦截（RegisterImage/ListB/Projector/
+// RenderLayer）都没拦到这里，所以静态阴影/path blocker 一直可见。
+using TerrainShadowListARenderFn = int(__fastcall *)(void *, void *);
+TerrainShadowListARenderFn g_trampolineListARenderPreparedGroups = nullptr;
+TerrainShadowListARenderFn g_trampolineListARenderAllEntries = nullptr;
+
+std::atomic<uint64_t> g_listARenderPreparedGroupsEnterCount{0};
+std::atomic<uint64_t> g_listARenderPreparedGroupsBlockedCount{0};
+std::atomic<uint64_t> g_listARenderAllEntriesEnterCount{0};
+std::atomic<uint64_t> g_listARenderAllEntriesBlockedCount{0};
+
+int __fastcall Hook_TerrainShadow_ListA_RenderPreparedGroups(void *thisPtr,
+                                                             void *edx) {
+  g_listARenderPreparedGroupsEnterCount.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t mode = War3RenderState::GetNativeShadowMode();
+  const bool blocked =
+      (mode == 1u &&
+       dxvk::war3::internal::kNativeShadowBlockListARenderWhenMode1) ||
+      mode >= 2u;
+
+  if constexpr (dxvk::war3::internal::kNativeShadowListARenderStatsLogging) {
+    static std::atomic<uint32_t> s_calls{0};
+    const uint32_t calls = s_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((calls % dxvk::war3::internal::kNativeShadowListARenderStatsInterval) ==
+        0u) {
+      war3dbg::Print(
+          "DXVK War3Hook: ListA_RenderPreparedGroups calls=%u blocked=%llu "
+          "mode=%u\n",
+          static_cast<unsigned>(calls),
+          static_cast<unsigned long long>(
+              g_listARenderPreparedGroupsBlockedCount.load(
+                  std::memory_order_relaxed)),
+          static_cast<unsigned>(mode));
+    }
+  }
+
+  if (blocked) {
+    g_listARenderPreparedGroupsBlockedCount.fetch_add(
+        1, std::memory_order_relaxed);
+    return 0;
+  }
+
+  if (g_trampolineListARenderPreparedGroups)
+    return g_trampolineListARenderPreparedGroups(thisPtr, edx);
+  return 0;
+}
+
+int __fastcall Hook_TerrainShadow_ListA_RenderAllEntries(void *thisPtr,
+                                                         void *edx) {
+  g_listARenderAllEntriesEnterCount.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t mode = War3RenderState::GetNativeShadowMode();
+  const bool blocked =
+      (mode == 1u &&
+       dxvk::war3::internal::kNativeShadowBlockListARenderWhenMode1) ||
+      mode >= 2u;
+
+  if constexpr (dxvk::war3::internal::kNativeShadowListARenderStatsLogging) {
+    static std::atomic<uint32_t> s_calls{0};
+    const uint32_t calls = s_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((calls % dxvk::war3::internal::kNativeShadowListARenderStatsInterval) ==
+        0u) {
+      war3dbg::Print(
+          "DXVK War3Hook: ListA_RenderAllEntries calls=%u blocked=%llu "
+          "mode=%u\n",
+          static_cast<unsigned>(calls),
+          static_cast<unsigned long long>(
+              g_listARenderAllEntriesBlockedCount.load(
+                  std::memory_order_relaxed)),
+          static_cast<unsigned>(mode));
+    }
+  }
+
+  if (blocked) {
+    g_listARenderAllEntriesBlockedCount.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+  }
+
+  if (g_trampolineListARenderAllEntries)
+    return g_trampolineListARenderAllEntries(thisPtr, edx);
+  return 0;
+}
+
+// =====================================================================
 // Phase 7.100: TerrainShadow_WriteMaskRegion hook (静态阴影治理方案 A)
 // =====================================================================
 // 论文 §6 §7.1 决定性发现：War3 1.27a 的建筑/装饰物预渲染贴花阴影
@@ -1368,8 +1529,7 @@ uint32_t QueryShadowProjectorObservedFourCCSampleAt(uint32_t idx) {
 // Phase 7.116：DispatchToShape 永久 atomic 读取器。
 uint64_t QueryDispatchToShapeEnterCount() {
   return g_dispatchToShapeEnterCount.load(std::memory_order_relaxed);
-}
-uint64_t QueryDispatchToShapeRejectedCount() {
+}uint64_t QueryDispatchToShapeRejectedCount() {
   return g_dispatchToShapeRejectedCount.load(std::memory_order_relaxed);
 }
 uint64_t QueryDispatchToShapeFromRebuildMaskCount() {
@@ -1380,6 +1540,35 @@ uint64_t QueryDispatchToShapeFromShadowSetupCount() {
 }
 uint64_t QueryDispatchToShapeFromOtherCallerCount() {
   return g_dispatchToShapeFromOtherCallerCount.load(std::memory_order_relaxed);
+}
+
+// 2026-05-30：CDoodads 贴花阴影拦截诊断读取器。
+uint64_t QueryDoodadStaticStampEnterCount() {
+  return g_doodadStaticStampEnterCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryDoodadStaticStampBlockedCount() {
+  return g_doodadStaticStampBlockedCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryDoodadEmitterStampEnterCount() {
+  return g_doodadEmitterStampEnterCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryDoodadEmitterStampBlockedCount() {
+  return g_doodadEmitterStampBlockedCount.load(std::memory_order_relaxed);
+}
+
+// 2026-05-30 根因突破：ListA stamp 渲染拦截诊断读取器。
+uint64_t QueryListARenderPreparedGroupsEnterCount() {
+  return g_listARenderPreparedGroupsEnterCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryListARenderPreparedGroupsBlockedCount() {
+  return g_listARenderPreparedGroupsBlockedCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryListARenderAllEntriesEnterCount() {
+  return g_listARenderAllEntriesEnterCount.load(std::memory_order_relaxed);
+}
+uint64_t QueryListARenderAllEntriesBlockedCount() {
+  return g_listARenderAllEntriesBlockedCount.load(std::memory_order_relaxed);
 }
 
 // Phase 7.100：跨 TU 暴露的 WriteMaskRegion 诊断 atomic 读取器。
@@ -1493,6 +1682,60 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   } else {
     war3dbg::Print(
         "DXVK War3Hook: 二分诊断态关闭 Shadow/Projector hook 安装\n");
+  }
+
+  // 2026-05-30：CDoodads 贴花阴影拦截（魔兽自带可见静态阴影 + path blocker）。
+  // ToggleStaticStampFromObject 是树木/装饰物/可破坏物/path blocker 地面贴花
+  // 阴影的对象级注册入口（RegisterImage type=0）。在 mode>=1 时跳过 enable!=0
+  // 写入即可干净屏蔽魔兽自带可见静态阴影，不影响 fog/LOS/path。
+  // EmitterStamp(0x74DE40) 是 __userpurge，不安全 hook，本轮不拦（它是发光体/
+  // 特效，不是静态阴影本体）。
+  if constexpr (dxvk::war3::internal::kNativeShadowDoodadStampHookEnabled) {
+    if (addrs.terrainShadowToggleStaticStampFromObjectAddr != nullptr) {
+      anyInstalled |= InstallMinHook(
+          addrs.terrainShadowToggleStaticStampFromObjectAddr,
+          reinterpret_cast<LPVOID>(&Hook_Doodad_ToggleStaticStampFromObject),
+          reinterpret_cast<LPVOID *>(&g_trampolineDoodadStaticStamp),
+          "Shadow", "TerrainShadow_ToggleStaticStampFromObject", false, true);
+    }
+  }
+
+  // 2026-05-30 根因突破：ListA stamp 渲染消费点拦截。
+  // 这是真正画 doodad/建筑/path blocker 地面贴花阴影的两个函数，
+  // 绕过所有历史 hook。mode>=1 时直接 return 屏蔽。用 Logger::info 打安装结果
+  // 到 war3_d3d9.log（war3dbg::Print 走 DebugView，不进文件），便于实机验证。
+  if constexpr (dxvk::war3::internal::kNativeShadowListARenderHookEnabled) {
+    if (addrs.terrainShadowListARenderPreparedGroupsAddr != nullptr) {
+      const bool ok = InstallMinHook(
+          addrs.terrainShadowListARenderPreparedGroupsAddr,
+          reinterpret_cast<LPVOID>(
+              &Hook_TerrainShadow_ListA_RenderPreparedGroups),
+          reinterpret_cast<LPVOID *>(&g_trampolineListARenderPreparedGroups),
+          "Shadow", "TerrainShadow_ListA_RenderPreparedGroups", false, true);
+      anyInstalled |= ok;
+      char buf[120];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: ListA_RenderPreparedGroups install "
+               "addr=%p result=%s",
+               addrs.terrainShadowListARenderPreparedGroupsAddr,
+               ok ? "ok" : "fail");
+      ::dxvk::Logger::info(buf);
+    }
+    if (addrs.terrainShadowListARenderAllEntriesAddr != nullptr) {
+      const bool ok = InstallMinHook(
+          addrs.terrainShadowListARenderAllEntriesAddr,
+          reinterpret_cast<LPVOID>(&Hook_TerrainShadow_ListA_RenderAllEntries),
+          reinterpret_cast<LPVOID *>(&g_trampolineListARenderAllEntries),
+          "Shadow", "TerrainShadow_ListA_RenderAllEntries", false, true);
+      anyInstalled |= ok;
+      char buf[120];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: ListA_RenderAllEntries install "
+               "addr=%p result=%s",
+               addrs.terrainShadowListARenderAllEntriesAddr,
+               ok ? "ok" : "fail");
+      ::dxvk::Logger::info(buf);
+    }
   }
 
   // Phase 7.100/7.101: TerrainShadow_WriteMaskRegion hook 安装。

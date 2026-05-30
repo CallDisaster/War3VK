@@ -18045,19 +18045,62 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
   m_war3ShadowPersistentFrameSerial++;
   War3GcShadowPersistentGeometry(false);
   // Phase 7.55 v4：每 60 帧清理一次 draw-time VB cache 中的 stale entry。
-  // 超过 16 帧没被刷新的 entry 视为对应 part 已下场，释放 host 数据 + GPU buffer。
+  // 2026-05-30 问题2：静态几何（桥/斜坡/建筑/装饰物/可破坏物）常驻，
+  // 离开视野后不淘汰 GPU buffer，再次进入视野 O(1) 复用；只有动态对象按
+  // 16 帧 TTL 淘汰。静态常驻受总字节上限约束做 LRU 回收，防止超大地图无限增长。
   if (m_war3ShadowPersistentFrameSerial >=
       m_war3DrawTimeVBCacheLastCleanFrame + 60u) {
     m_war3DrawTimeVBCacheLastCleanFrame = m_war3ShadowPersistentFrameSerial;
-    const uint64_t maxAge = 16u;
+    const uint64_t dynamicMaxAge =
+        dxvk::war3::internal::kShadowDrawTimeVBCacheDynamicMaxAgeFrames;
+    const uint64_t staticMaxIdle =
+        dxvk::war3::internal::kShadowDrawTimeVBCacheStaticMaxIdleFrames;
+    uint64_t staticBytesLive = 0u;
     for (auto it = m_war3DrawTimeVBCache.begin();
          it != m_war3DrawTimeVBCache.end();) {
-      if (it->second.frameSerial + maxAge <
-          m_war3ShadowPersistentFrameSerial) {
-        it = m_war3DrawTimeVBCache.erase(it);
-      } else {
+      const auto &e = it->second;
+      const uint64_t age = (m_war3ShadowPersistentFrameSerial >= e.frameSerial)
+                               ? (m_war3ShadowPersistentFrameSerial -
+                                  e.frameSerial)
+                               : 0u;
+      if (e.isStaticGeometry) {
+        // 静态几何：仅在长期闲置（约 30 分钟）时回收，否则常驻。
+        if (age > staticMaxIdle) {
+          it = m_war3DrawTimeVBCache.erase(it);
+          continue;
+        }
+        staticBytesLive += e.ownedGpuBytes;
         ++it;
+      } else {
+        // 动态对象：保持原 16 帧 TTL 淘汰。
+        if (e.frameSerial + dynamicMaxAge < m_war3ShadowPersistentFrameSerial) {
+          it = m_war3DrawTimeVBCache.erase(it);
+        } else {
+          ++it;
+        }
       }
+    }
+
+    // 静态常驻字节上限 LRU：超过上限时回收最久未访问（lastAccessFrameSerial
+    // 最小）的静态 entry，直到回到上限以下。
+    const uint64_t staticCap =
+        dxvk::war3::internal::kShadowDrawTimeVBCacheStaticPersistMaxBytes;
+    while (staticBytesLive > staticCap) {
+      auto victim = m_war3DrawTimeVBCache.end();
+      uint64_t oldestAccess = UINT64_MAX;
+      for (auto it = m_war3DrawTimeVBCache.begin();
+           it != m_war3DrawTimeVBCache.end(); ++it) {
+        if (!it->second.isStaticGeometry)
+          continue;
+        if (it->second.lastAccessFrameSerial < oldestAccess) {
+          oldestAccess = it->second.lastAccessFrameSerial;
+          victim = it;
+        }
+      }
+      if (victim == m_war3DrawTimeVBCache.end())
+        break;
+      staticBytesLive -= victim->second.ownedGpuBytes;
+      m_war3DrawTimeVBCache.erase(victim);
     }
   }
   m_war3ShadowFallbackBudgetCapBytes = War3GetShadowFallbackBudgetCapBytes();
@@ -24502,6 +24545,22 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // Phase 7.70：记下本次 capture 的源数据指纹。
         // 同帧后续相同来源的 capture 会命中上方 fast path 并跳过 GPU copy。
         entry.lastCaptureFingerprint = captureFingerprint;
+
+        // 2026-05-30 问题2：标记静态几何 + 记录占用字节用于 LRU。
+        // 静态几何 = 建筑/可破坏物（顶点固定、worldMatrix 固定）。
+        // 这类 entry 离开视野后不释放 GPU buffer，再次进入视野 O(1) 复用，
+        // 消除"看到桥/斜坡就卡，离开再回来又卡"的根因。
+        // Unit 是动态骨骼动画对象，绝不能常驻（pose 每帧变）。
+        entry.isStaticGeometry =
+            dxvk::war3::internal::kShadowDrawTimeVBCacheStaticPersistEnabled &&
+            (semantic.objectKind ==
+                 dxvk::war3::render::ObjectKind::Building ||
+             semantic.objectKind ==
+                 dxvk::war3::render::ObjectKind::Destructible);
+        entry.lastAccessFrameSerial = m_war3ShadowPersistentFrameSerial;
+        entry.ownedGpuBytes =
+            uint64_t(entry.positionCapacity) + uint64_t(entry.indexCapacity) +
+            (entry.uvSharesPositionBuffer ? 0u : uint64_t(entry.uvCapacity));
       } while (false);
     }
     return;

@@ -109,6 +109,23 @@ struct ShadowHookAddresses {
    * 5 个 caller 全部是 shadow path，hook 入口直接 return 0 即可干净屏蔽
    * 所有建筑/装饰物/可破坏物 footprint shadow，不影响其他 mask 写入。 */
   LPVOID terrainShadowDispatchToShapeAddr = nullptr;           // 0x234420
+
+  /** @brief 2026-05-30: TerrainShadow_ToggleStaticStampFromObject (0x74DB30)。
+   * 树木/装饰物/可破坏物/path blocker 的"地面贴花阴影"对象级注册入口
+   * （写 RegisterImage type=0）。mode>=1 时跳过 enable!=0 写入即可屏蔽
+   * 魔兽自带的可见静态贴花阴影，不影响 fog/LOS/path。 */
+  LPVOID terrainShadowToggleStaticStampFromObjectAddr = nullptr;  // 0x74DB30
+  /** @brief 2026-05-30: TerrainShadow_ToggleEmitterStamp (0x74DE40)。
+   * doodad emitter 贴花阴影注册入口（写 RegisterImage type=4）。 */
+  LPVOID terrainShadowToggleEmitterStampAddr = nullptr;           // 0x74DE40
+
+  /** @brief 2026-05-30 根因突破: ListA stamp 渲染消费点。
+   * CWorld_TerrainShadow_Dispatch case0 直接调用这两个函数渲染所有 doodad/
+   * 建筑/path blocker 的地面贴花阴影 stamp，绕过所有现有 hook。mode>=1 时
+   * hook 它们直接 return 即可干净屏蔽魔兽自带可见静态阴影 + path blocker 阴影，
+   * 不影响 fog/LOS/path（独立 FogMask grid）。仅被 Dispatch 调用，hook 安全。 */
+  LPVOID terrainShadowListARenderPreparedGroupsAddr = nullptr;  // 0x7370A0
+  LPVOID terrainShadowListARenderAllEntriesAddr = nullptr;      // 0x737110
 };
 
 /**
@@ -143,6 +160,18 @@ uint64_t QueryDispatchToShapeRejectedCount();
 uint64_t QueryDispatchToShapeFromRebuildMaskCount();
 uint64_t QueryDispatchToShapeFromShadowSetupCount();
 uint64_t QueryDispatchToShapeFromOtherCallerCount();
+
+// 2026-05-30：CDoodads 贴花阴影拦截诊断（control plane 透传用）。
+uint64_t QueryDoodadStaticStampEnterCount();
+uint64_t QueryDoodadStaticStampBlockedCount();
+uint64_t QueryDoodadEmitterStampEnterCount();
+uint64_t QueryDoodadEmitterStampBlockedCount();
+
+// 2026-05-30 根因突破：ListA stamp 渲染拦截诊断（control plane 透传用）。
+uint64_t QueryListARenderPreparedGroupsEnterCount();
+uint64_t QueryListARenderPreparedGroupsBlockedCount();
+uint64_t QueryListARenderAllEntriesEnterCount();
+uint64_t QueryListARenderAllEntriesBlockedCount();
 
 // Phase 7.108：ShadowProjector 诊断计数器（control plane 透传用）。
 // 这条路径是 Game.dll 自己的"投影器阴影"系统（CTerrainUberSplats），

@@ -123,6 +123,22 @@ struct War3HookAddressBook {
   // 抓取 widget 身份链（rawcode + jHandle），喂给 RenderObjectRegistry 兜底。
   uintptr_t widgetRegisterFootprintAndShadowMask = 0;  // 0x65A140
 
+  // 2026-05-30：CDoodads 贴花阴影治理（魔兽自带可见静态阴影 + path blocker）。
+  // 这两个 Toggle 函数是树木/装饰物/可破坏物/path blocker 的"地面贴花阴影"
+  // 唯一对象级注册入口，分别写 RegisterImage(type=0) 与 RegisterImage(type=4)。
+  // hook 入口在 mode>=1 时跳过 enable!=0 写入即可干净屏蔽，不影响 fog/LOS/path。
+  uintptr_t terrainShadowToggleStaticStampFromObject = 0;  // 0x74DB30
+  uintptr_t terrainShadowToggleEmitterStamp = 0;           // 0x74DE40
+
+  // 2026-05-30 根因突破：ListA stamp 渲染消费点。
+  // CWorld_TerrainShadow_Dispatch case0 直接调用这两个函数渲染所有
+  // doodad/建筑/path blocker 的地面贴花阴影 stamp，绕过所有现有 hook。
+  // mode>=1 时 hook 它们直接 return 即可干净屏蔽魔兽自带可见静态阴影 +
+  // path blocker 阴影，不影响 fog/LOS/path（那些走独立的 FogMask grid）。
+  // 这两个函数仅被 CWorld_TerrainShadow_Dispatch 调用，hook 安全。
+  uintptr_t terrainShadowListARenderPreparedGroups = 0;  // 0x7370A0
+  uintptr_t terrainShadowListARenderAllEntries = 0;      // 0x737110
+
   // Phase 7.116：建筑/装饰物/可破坏物原生静态阴影屏蔽的真正路径。
   // TerrainShadow_DispatchToShape 是 shadow footprint 写入的唯一汇聚点，
   // 内部走 BoxFastpath/PolyFastpath 直接修改 mask grid。它的 5 个 caller
