@@ -25570,6 +25570,38 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                        : (pathBlockObj != nullptr ? pathBlockObj->rawcode : 0u);
     draw.jHandle = batchHandle;
 
+    // 2026-05-31 根因修复（legacy 路径）：rawcode 仍为 0 时，从 semantic 的
+    // worldObjectEntry / unitPtr widget 指针直读 +0x0C(magic)/+0x30(rawcode)。
+    // 这与 semantic 路径 War3PacketIsPathBlocker 用同一稳定身份判定，覆盖
+    // Terrain doodad path blocker（currentObj/pathBlockObj 都为空、走 legacy
+    // capture）这条漏网。命中后直接置空几何，所有 consumer skip（不画 shadow
+    // map / outline / 矩阵 SSBO）。用稳定 widget 指针判定，不会逐帧抖动。
+    if (dxvk::war3::internal::kPathBlockerHideEnabled) {
+      bool isBlocker =
+          draw.rawcode != 0u && IsLosBlockerFourCc(draw.rawcode);
+      if (!isBlocker && draw.rawcode == 0u) {
+        void* widgetCandidate = semantic.worldObjectEntry;
+        if (widgetCandidate == nullptr && semantic.object != nullptr)
+          widgetCandidate = semantic.object->unitPtr;
+        if (War3ShadowIsLosBlockerByWidgetPtr(widgetCandidate,
+                                              semantic.jHandle)) {
+          isBlocker = true;
+        }
+      }
+      if (isBlocker) {
+        m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+        m_war3Scene.shadowStats
+            .semanticSceneRejectedPathBlockerLegacyCaptureCount++;
+        draw.positionStorage = nullptr;
+        draw.indexStorage = nullptr;
+        draw.indexCount = 0u;
+        draw.vertexCount = 0u;
+        draw.numVertices = 0u;
+        draw.boundsRadius = 0.0f;
+        return;
+      }
+    }
+
     const bool dynamicUnitLikeNoCull =
         unitLikeObject &&
         (draw.vertexBlendEnabled || semantic.runtimeModelPtr != nullptr ||
