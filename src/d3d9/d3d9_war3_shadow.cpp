@@ -2,6 +2,7 @@
 #include "d3d9_shader.h"
 #include "d3d9_war3_debug.h"
 #include "war3/core/war3_internal_test_config.h"
+#include "war3/hooks/war3_hook_widget_identity.h"
 #include "war3/render/war3_render_objects.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
 #include "war3/shader/war3_shader_manager.h"
@@ -331,6 +332,114 @@ struct ReplayDrawsCache {
   std::vector<const War3ShadowCasterDraw*> draws;
 };
 
+// =====================================================================
+// 2026-05-31: Path blocker 最终防线（draw-time chokepoint）
+// =====================================================================
+// BuildShadowReplayDraws 是所有 shadow caster（来自 6+ 个 append 站点）汇聚到
+// GPU shadow map 渲染前的**唯一收集点**，每个 War3ShadowCasterDraw 都带
+// rawcode / jHandle / batchHandle。在这里做最终 path blocker 过滤，覆盖任何
+// 上游漏判（包括 rawcode 在上游为 0、到这里才被 widget cache 解析出来的情况）。
+//
+// 用户实测：上游 EntryGate/Producer 日志命中 YTfb/YTpb/YTab，但视觉仍可见。
+// 说明存在某条路径，caster 在上游 rawcode=0 未被识别就 append 了。这里用
+// rawcode + jHandle 双通道兜底，是 D3D9 CSM 侧最后一道闸。
+//
+// 诊断：env DXVK_WAR3_SHADOW_DRAW_SURVEY=1 时，前 40 个 unique rawcode 各写
+// 1 行到 war3_d3d9.log，直接告诉我们 shadow map 实际画了哪些对象。
+
+std::atomic<uint64_t> g_shadowReplayPathBlockerRejectCount{0};
+
+inline uint32_t War3ReplayNormalizeFourCc(uint32_t rawcode) {
+  if (rawcode == 0u)
+    return 0u;
+  // 第二字符大小写归一化（兼容 YTlc/Ytlc 编辑器输出差异）。
+  auto normChar2 = [](uint32_t code) -> uint32_t {
+    const uint8_t c1 = uint8_t((code >> 16) & 0xFFu);
+    if (c1 >= 'A' && c1 <= 'Z')
+      return (code & 0xFF00FFFFu) | (uint32_t(c1 - 'A' + 'a') << 16);
+    return code;
+  };
+  return normChar2(rawcode);
+}
+
+inline bool War3ReplayIsPathBlockerRawcode(uint32_t rawcode) {
+  if (rawcode == 0u)
+    return false;
+  const uint32_t norm = War3ReplayNormalizeFourCc(rawcode);
+  // 同时尝试字节翻转（内存序 vs 编辑器序）。
+  const uint32_t swapped = War3ReplayNormalizeFourCc(
+      ((rawcode & 0xFFu) << 24) | ((rawcode & 0xFF00u) << 8) |
+      ((rawcode >> 8) & 0xFF00u) | ((rawcode >> 24) & 0xFFu));
+  for (uint32_t i = 0u; i < dxvk::war3::internal::kPathBlockerFourCCsCount;
+       ++i) {
+    const uint32_t b = dxvk::war3::internal::kPathBlockerFourCCs[i];
+    if (norm == b || swapped == b || rawcode == b)
+      return true;
+  }
+  return false;
+}
+
+inline bool War3ReplayDrawIsPathBlocker(const War3ShadowCasterDraw& draw) {
+  if (!dxvk::war3::internal::kPathBlockerHideEnabled)
+    return false;
+  // War3ShadowCasterDraw 在 draw-time 只携带 batchHandle（jHandle，来自 ExecBatch
+  // TLS）+ objectKind，没有 rawcode 字段。用 batchHandle 走 widget identity cache
+  // 反查 rawcode，再做 path blocker 匹配。
+  const uint32_t handle = draw.batchHandle;
+  if (handle != 0u) {
+    const uint32_t cached =
+        dxvk::war3::hooks::QueryWidgetRawcodeByHandle(handle);
+    if (cached != 0u && War3ReplayIsPathBlockerRawcode(cached))
+      return true;
+  }
+  return false;
+}
+
+inline void War3ReplayDrawSurvey(const War3ShadowCasterDraw& draw) {
+  static const bool enabled = []() {
+    const char* env = std::getenv("DXVK_WAR3_SHADOW_DRAW_SURVEY");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  if (!enabled)
+    return;
+  const uint32_t handle = draw.batchHandle;
+  // survey 以 batchHandle 反查 rawcode；handle=0 的 caster 记一个特殊 0 槽，
+  // 用于统计"无身份 caster"数量（path blocker 若走无身份路径会落这里）。
+  const uint32_t rawcode =
+      handle != 0u ? dxvk::war3::hooks::QueryWidgetRawcodeByHandle(handle) : 0u;
+  static std::atomic<uint32_t> s_logCount{0};
+  static std::array<std::atomic<uint32_t>, 40> s_logged{};
+  if (s_logCount.load(std::memory_order_relaxed) >= 40u)
+    return;
+  const uint32_t logKey = rawcode != 0u ? rawcode : (0x80000000u | handle);
+  if (logKey == 0u)
+    return;
+  uint32_t freeSlot = 40u;
+  for (uint32_t i = 0u; i < 40u; ++i) {
+    const uint32_t cur = s_logged[i].load(std::memory_order_relaxed);
+    if (cur == logKey)
+      return;
+    if (cur == 0u && freeSlot == 40u)
+      freeSlot = i;
+  }
+  if (freeSlot >= 40u)
+    return;
+  uint32_t expected = 0u;
+  if (!s_logged[freeSlot].compare_exchange_strong(expected, logKey,
+                                                  std::memory_order_relaxed))
+    return;
+  const uint32_t idx = s_logCount.fetch_add(1, std::memory_order_relaxed);
+  char fc[5] = {char((rawcode >> 24) & 0xFF), char((rawcode >> 16) & 0xFF),
+                char((rawcode >> 8) & 0xFF), char(rawcode & 0xFF), 0};
+  char buf[220];
+  snprintf(buf, sizeof(buf),
+           "DXVK War3Shadow: SHADOW DRAW SURVEY #%u rawcode=0x%08X (%s) "
+           "batchHandle=0x%X kind=%u cat=%d",
+           idx + 1, rawcode, (rawcode != 0u ? fc : "----"), unsigned(handle),
+           unsigned(draw.objectKind), int(draw.category));
+  ::dxvk::Logger::info(buf);
+}
+
 std::vector<const War3ShadowCasterDraw*> BuildShadowReplayDraws(
     const War3FrameScene& scene) {
   // thread_local 缓存：同一帧内重复调用直接复用上次的 draws 向量。
@@ -355,11 +464,26 @@ std::vector<const War3ShadowCasterDraw*> BuildShadowReplayDraws(
   for (const auto& instance : scene.shadowInstances) {
     if (instance.replayDrawIndex >= scene.shadowCasters.size())
       continue;
-    draws.push_back(&scene.shadowCasters[instance.replayDrawIndex]);
+    const auto& caster = scene.shadowCasters[instance.replayDrawIndex];
+    // 2026-05-31：draw-time 最终 path blocker 防线（覆盖所有上游漏判）。
+    if (War3ReplayDrawIsPathBlocker(caster)) {
+      g_shadowReplayPathBlockerRejectCount.fetch_add(
+          1, std::memory_order_relaxed);
+      continue;
+    }
+    War3ReplayDrawSurvey(caster);
+    draws.push_back(&caster);
   }
 
-  for (const auto& fallback : scene.shadowFallbacks)
+  for (const auto& fallback : scene.shadowFallbacks) {
+    if (War3ReplayDrawIsPathBlocker(fallback.snapshot)) {
+      g_shadowReplayPathBlockerRejectCount.fetch_add(
+          1, std::memory_order_relaxed);
+      continue;
+    }
+    War3ReplayDrawSurvey(fallback.snapshot);
     draws.push_back(&fallback.snapshot);
+  }
 
   if (!war3::internal::kShadowReplayCasterCapEnabled) {
     cache.key = key;
