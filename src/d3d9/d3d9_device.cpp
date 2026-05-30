@@ -1930,7 +1930,13 @@ void War3UpdateSemanticReplayInputDiagnostics(War3FrameScene& scene) {
   // （各 append 站点已填充），命中 path blocker 就把 positionStorage 置空 +
   // 计数清零。所有 consumer 都检查 positionStorage（null 即 skip），因此这是
   // 覆盖全部渲染路径的单点根治。
-  if (dxvk::war3::internal::kPathBlockerHideEnabled) {
+  //
+  // 2026-05-31 回退：默认关闭（kPathBlockerDrawTimeSweepEnabled=false）。
+  // 原因：rawcode 缺失时走 batchHandle→widget cache 反查会把真实单位误判成
+  // path blocker，导致同一 caster 逐帧"保留/置空"抖动 → 高频阴影闪烁。
+  // 上游 eligibility/capture 拦截仍然生效，这里仅作为可选兜底。
+  if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+      dxvk::war3::internal::kPathBlockerDrawTimeSweepEnabled) {
     uint32_t sweptCount = 0u;
     for (auto& caster : scene.shadowCasters) {
       if (caster.positionStorage == nullptr)

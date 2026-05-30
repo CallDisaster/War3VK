@@ -983,6 +983,20 @@ inline bool kPathBlockerDebugEnabled = false; // 启用诊断日志
 inline bool kPathBlockerHideEnabled = true;   // 隐藏路径阻断器渲染
 
 // ========================================================================
+// 2026-05-31：draw-time path blocker 最终清扫开关（Phase 7.145/7.147）
+// ========================================================================
+// 这两处 sweep（BuildShadowReplayDraws + War3UpdateSemanticReplayInputDiagnostics）
+// 在所有 consumer 之前，按 caster 的 rawcode / jHandle / batchHandle 做最终
+// path blocker 判定并置空几何。问题：caster.rawcode 在部分帧解析得到、部分帧
+// 为 0；rawcode=0 时走 batchHandle→widget cache 反查，可能把真实单位误判成
+// path blocker → 同一 caster 在"保留 / 置空"之间逐帧抖动 → 高频阴影闪烁。
+//
+// 默认关闭：上游 eligibility/capture 阶段（EntryGate / Producer / FastAppend）
+// 的 path blocker 拦截不受影响，仍然生效（那条链路 caster 还没进 shadowCasters，
+// 不会逐帧抖动）。仅当确认需要 draw-time 兜底且不引入闪烁时再开。
+inline bool kPathBlockerDrawTimeSweepEnabled = false;
+
+// ========================================================================
 // Phase 7.123：draw-time VB cache 单帧 GPU buffer alloc 预算
 // ========================================================================
 // 用户报告：高压地图里"刚把视野从未观察过的桥/斜坡上扫过去会触发首帧暴降"。

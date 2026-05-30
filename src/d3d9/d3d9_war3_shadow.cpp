@@ -382,6 +382,11 @@ inline bool War3ReplayIsPathBlockerRawcode(uint32_t rawcode) {
 inline bool War3ReplayDrawIsPathBlocker(const War3ShadowCasterDraw& draw) {
   if (!dxvk::war3::internal::kPathBlockerHideEnabled)
     return false;
+  // 2026-05-31 回退：默认关闭 draw-time sweep（避免 rawcode=0 时 batchHandle
+  // 误判真实单位为 path blocker，引发逐帧阴影闪烁）。上游 capture/eligibility
+  // 拦截仍然生效；这里仅在显式开启时作为兜底。
+  if (!dxvk::war3::internal::kPathBlockerDrawTimeSweepEnabled)
+    return false;
   // 2026-05-31：caster 现在自带 rawcode（各 append 站点填充）。优先用它，
   // 其次用 batchHandle → widget cache 兜底。
   if (War3ReplayIsPathBlockerRawcode(draw.rawcode))
