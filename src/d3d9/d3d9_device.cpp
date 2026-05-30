@@ -1321,6 +1321,11 @@ inline bool IsLosBlockerFourCc(uint32_t rawcode);
 // 2026-05-31：path blocker 最终清扫用 jHandle 兜底（定义在文件后段）。
 inline bool War3ShadowIsLosBlockerByJHandleFallback(uint32_t jHandle);
 
+// 2026-05-31 根因修复：统一 packet 级 path blocker 判定（rawcode / jHandle /
+// widget 指针直读三通道），用于堵死 explicitUnknownRigid 漏网。定义在文件后段。
+inline bool War3PacketIsPathBlocker(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet);
+
 // Phase 7.73：eligibility gate 拒绝路径阻断器的全局计数（atomic relaxed）。
 // 该函数定义在 anonymous namespace，没有 D3D9DeviceEx 上下文，因此用全局
 // 原子计数。D3D9DeviceEx 每帧 reset shadow scene 时把累加值移入 shadowStats。
@@ -2956,19 +2961,14 @@ bool War3ShouldSubmitSemanticPacket(
   //     反查（destructible 走 CWidget_RegisterFootprintAndShadowMask hook
   //     注册路径，不进 Hook_WorldObjects_RenderGroup，单纯 RenderObjectRegistry
   //     抓不到）。
+  //   - 2026-05-31 根因修复：rawcode==0 且 jHandle 兜底也 miss 时，再从
+  //     worldObjectEntry / unitPtr widget 指针直读 +0x0C(magic)/+0x30(rawcode)。
+  //     这是堵死 explicitUnknownRigid 漏网的关键——path blocker 的匿名 rigid
+  //     packet 此前从这里漏过去被当成"未知 world caster"提交。
   // Phase 7.73：拒绝时累加全局原子计数，由 D3D9DeviceEx 在 caster reset 时
   // 折进 shadowStats，让 trace 看到 eligibility 层的命中量。
   if (dxvk::war3::internal::kPathBlockerHideEnabled) {
-    bool isPathBlocker = false;
-    if (packet.renderable.rawcode != 0u) {
-      isPathBlocker = IsLosBlockerFourCc(packet.renderable.rawcode);
-    } else if (packet.renderable.jHandle != 0u) {
-      const uint32_t cachedRawcode =
-          dxvk::war3::hooks::QueryWidgetRawcodeByHandle(
-              packet.renderable.jHandle);
-      isPathBlocker = cachedRawcode != 0u && IsLosBlockerFourCc(cachedRawcode);
-    }
-    if (isPathBlocker) {
+    if (War3PacketIsPathBlocker(packet)) {
       g_pathBlockerEligibilityGateRejectCount.fetch_add(
           1u, std::memory_order_relaxed);
       return false;
@@ -4483,6 +4483,74 @@ inline bool War3ShadowIsLosBlockerByJHandleFallback(uint32_t jHandle) {
       dxvk::war3::hooks::QueryWidgetRawcodeByHandle(jHandle);
   return cachedRawcode != 0u && IsLosBlockerFourCc(cachedRawcode);
 }
+
+// ============================================================================
+// 2026-05-31 根因修复：从 widget 指针直读 rawcode 的 path blocker 判定
+// ============================================================================
+// 根因（本轮 IDA + 代码定位）：path blocker 是 rigid doodad（无 vertexBlend），
+// 在新长期 semantic 路线下走 War3ShouldSubmitSemanticPacket 的 explicitUnknownRigid
+// /static-world 分支。当它的：
+//   - renderable.rawcode == 0（visible registry 没抓到它的 rawcode）
+//   - renderable.jHandle 在 RenderObjectRegistry / widget cache 都 miss
+//   - objectKind == Unknown
+// 三者同时成立时，rawcode/jHandle 两条判定全部失效，explicitUnknownRigid
+// 让它作为"未知 rigid world caster"通过 → 被提交进 shadowCasters → 投出阴影。
+//
+// 这就是"日志里看到 path blocker 被拦截，但游戏内仍渲染"的根因：
+// 日志命中的是**同一 path blocker 的其它 packet 实例**（rawcode 已解析的那些，
+// 在 EntryGate/FastAppend/AppendEntry 被拦），而 rawcode=0 的这条实例从
+// explicitUnknownRigid 漏过，且不会写任何 reject 日志。
+//
+// 修复手段：复用 EntryGate 已验证可行的"widget 指针直读"——
+//   widget+0x0C == 0x2B5DB42C(CWidget magic) 时，widget+0x30 是 rawcode。
+// path blocker 的 worldObjectEntry / unitPtr 就是这个 widget instance。
+// 命中后 write-through 写回 widget cache，后续 O(1) 命中。
+//
+// 性能：仅在 rawcode==0 且 jHandle 兜底失败时才走这条直读路径（每帧极少数
+// 匿名 rigid 包），不影响正常单位/建筑热路径。
+inline bool War3ShadowIsLosBlockerByWidgetPtr(void* widgetPtr,
+                                              uint32_t jHandleForCache) {
+  if (widgetPtr == nullptr)
+    return false;
+  // 先查 widget identity cache（可能别的 path 已 NoteWidgetIdentityFromDrawcall）。
+  const uint32_t cached =
+      dxvk::war3::hooks::QueryWidgetRawcodeByPtr(widgetPtr);
+  if (cached != 0u)
+    return IsLosBlockerFourCc(cached);
+  // miss → 直读 widget+0x0C(magic) + +0x30(rawcode)。
+  uint32_t magic = 0u;
+  if (!dxvk::war3::SafeReadU32Fast(widgetPtr, 0x0Cu, magic) ||
+      magic != 0x2B5DB42Cu) {
+    return false;
+  }
+  uint32_t rawcode = 0u;
+  if (!dxvk::war3::SafeReadU32Fast(widgetPtr, 0x30u, rawcode) || rawcode == 0u)
+    return false;
+  // Write-through：让 widget cache 接管后续 O(1) 查询。
+  dxvk::war3::hooks::NoteWidgetIdentityFromDrawcall(widgetPtr, rawcode,
+                                                    jHandleForCache);
+  return IsLosBlockerFourCc(rawcode);
+}
+
+// 统一 packet 级 path blocker 判定（覆盖 rawcode / jHandle / widget 直读三通道）。
+// 用于 eligibility 层堵死 explicitUnknownRigid / static-world 漏网。
+inline bool War3PacketIsPathBlocker(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet) {
+  const auto& r = packet.renderable;
+  if (r.rawcode != 0u)
+    return IsLosBlockerFourCc(r.rawcode);
+  // rawcode==0：jHandle 兜底（registry + widget cache）。
+  if (r.jHandle != 0u && War3ShadowIsLosBlockerByJHandleFallback(r.jHandle))
+    return true;
+  // 仍未命中：widget 指针直读（worldObjectEntry / unitPtr）。
+  if (War3ShadowIsLosBlockerByWidgetPtr(r.worldObjectEntry, r.jHandle))
+    return true;
+  if (r.unitPtr != r.worldObjectEntry &&
+      War3ShadowIsLosBlockerByWidgetPtr(r.unitPtr, r.jHandle))
+    return true;
+  return false;
+}
+
 
 inline bool War3ShadowIsLosBlocker(
     const dxvk::War3ShadowSemanticContext& semantic,
@@ -9880,77 +9948,16 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   // semantic / v4 / fast-append / current-draw 全部统一从这里走。检测只看
   // packet.renderable.rawcode，不读 currentObj 也不查 RenderObjectRegistry，
   // 因此每帧上千次调用也只是几个常量比较+大小写归一化。
+  //
+  // 2026-05-31 根因修复：统一走 War3PacketIsPathBlocker（rawcode / jHandle /
+  // widget 指针直读三通道）。这一层与 eligibility 层 War3ShouldSubmitSemanticPacket
+  // 用同一判定，确保任何绕过 eligibility 直接调 append 的 producer
+  // （fast-append / current-draw / v4）也被堵死。widget 直读不再 env-gate，
+  // 因为它正是 explicitUnknownRigid 漏网（rawcode=0 且 jHandle miss）的兜底。
   if (dxvk::war3::internal::kPathBlockerHideEnabled) {
-    bool blocked = false;
-    bool blockedByJHandle = false;
-    if (packet.renderable.rawcode != 0u &&
-        IsLosBlockerFourCc(packet.renderable.rawcode)) {
-      blocked = true;
-    } else if (packet.renderable.jHandle != 0u) {
-      // 兜底：rawcode 没填但 jHandle 存在时，做一次 RenderObjectRegistry 反查。
-      // 单次 hashmap 查询；append 一帧只调 100-300 次，可接受。
-      if (const auto* obj =
-              dxvk::war3::render::RenderObjectRegistry::instance()
-                  .findByHandle(packet.renderable.jHandle)) {
-        if (obj->rawcode != 0u && IsLosBlockerFourCc(obj->rawcode)) {
-          blocked = true;
-          blockedByJHandle = true;
-        }
-      }
-    }
-    // Phase 7.100/7.101 终极兜底：先查 widget identity cache，再 fallback 到
-    // unitPtr+0x0C(magic) + +0x30(rawcode) 直读。
-    //
-    // destructible / path blocker 不进 Hook_WorldObjects_RenderGroup，
-    // RenderObjectRegistry::findByHandle 永远 miss；widget hook 在 lifecycle
-    // 早期 fire 时由于 calling convention 问题，magicMatchedCount 长期为 0，
-    // cache 早期为空。Phase 7.101 改进：
-    //   1) 先 O(1) 查 widget cache（如果别的 path 已经 NoteWidgetIdentityFromDrawcall，
-    //      直接命中）；
-    //   2) miss 才走 SafeReadU32Fast 直读 widget+0x0C / +0x30；
-    //   3) 直读成功后 write-through 写回 widget cache，下次 O(1) 命中。
-    //
-    // Phase 7.104：实测 27 次 path blocker 拦截全部走 EarlyBypass 出口，
-    // AppendEntry 这一层在当前游戏里从未命中。改为 env gate，默认关闭，
-    // 避免对每个 destructible packet 都做 widget cache 查询和 SafeRead。
-    static const bool s_appendEntryFallbackEnabled = []() {
-      const char* env = std::getenv("DXVK_WAR3_APPEND_ENTRY_PATHBLOCKER");
-      // 默认关闭：EarlyBypass 已经覆盖。env=1 强制启用 belt-and-suspenders。
-      return env != nullptr && env[0] != '\0' && env[0] != '0';
-    }();
-    if (s_appendEntryFallbackEnabled && !blocked &&
-        packet.renderable.unitPtr != nullptr) {
-      const uint32_t cachedRawcode =
-          dxvk::war3::hooks::QueryWidgetRawcodeByPtr(packet.renderable.unitPtr);
-      if (cachedRawcode != 0u) {
-        if (IsLosBlockerFourCc(cachedRawcode)) {
-          blocked = true;
-          blockedByJHandle = true;
-        }
-      } else {
-        uint32_t magic = 0;
-        if (dxvk::war3::SafeReadU32Fast(packet.renderable.unitPtr, 0x0Cu,
-                                        magic) &&
-            magic == 0x2B5DB42Cu) {
-          uint32_t rawcode = 0;
-          if (dxvk::war3::SafeReadU32Fast(packet.renderable.unitPtr, 0x30u,
-                                          rawcode) &&
-              rawcode != 0u) {
-            // Write-through：让 widget cache 接管之后的 O(1) 查询。
-            dxvk::war3::hooks::NoteWidgetIdentityFromDrawcall(
-                packet.renderable.unitPtr, rawcode,
-                packet.renderable.jHandle);
-            if (IsLosBlockerFourCc(rawcode)) {
-              blocked = true;
-              blockedByJHandle = true;
-            }
-          }
-        }
-      }
-    }
-    if (blocked) {
+    if (War3PacketIsPathBlocker(packet)) {
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
-      if (blockedByJHandle) {
+      if (packet.renderable.rawcode == 0u) {
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerAppendEntryByJHandleCount++;
         NotePathBlockerRejectLog(packet.renderable.rawcode,
