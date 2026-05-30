@@ -24620,17 +24620,29 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // 同帧后续相同来源的 capture 会命中上方 fast path 并跳过 GPU copy。
         entry.lastCaptureFingerprint = captureFingerprint;
 
-        // 2026-05-30 问题2：标记静态几何 + 记录占用字节用于 LRU。
-        // 静态几何 = 建筑/可破坏物（顶点固定、worldMatrix 固定）。
-        // 这类 entry 离开视野后不释放 GPU buffer，再次进入视野 O(1) 复用，
-        // 消除"看到桥/斜坡就卡，离开再回来又卡"的根因。
-        // Unit 是动态骨骼动画对象，绝不能常驻（pose 每帧变）。
+        // 2026-05-30/05-31 问题2 根因修复：标记静态几何 + 记录占用字节用于 LRU。
+        //
+        // 旧逻辑只把 objectKind==Building/Destructible 当静态 → 桥/斜坡/装饰物
+        // 这类 **generic doodad** 解析出来是 ObjectKind::Unknown/Item（落到
+        // OtherKind 统计桶），不被标记静态 → 走 16 帧动态 TTL → 离开视野后
+        // GPU buffer 被释放 → 再次进入视野必须重新 createBuffer(vkAllocateMemory
+        // 同步阻塞主线程) → 这就是用户报告的"看到桥/斜坡卡，离开再回来又卡"。
+        //
+        // 新逻辑：静态几何 = **非动态单位的 rigid 几何**。判定标准：
+        //   - 不是 Unit（Unit 是骨骼动画对象，pose 每帧变，绝不能常驻）；
+        //   - 没有 runtime pose / sprite pose / pose palette（再次排除动态对象）。
+        // 满足上述即视为静态（顶点本地空间固定 + worldMatrix 固定），离开视野
+        // 后常驻、再次进入 O(1) 复用。桥/斜坡/建筑/装饰物/可破坏物全部覆盖。
+        const bool semanticHasDynamicPose =
+            semantic.runtimeModelPtr != nullptr ||
+            semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
+            semantic.poseMatrixCount != 0u;
+        const bool isDynamicUnit =
+            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit ||
+            semanticHasDynamicPose;
         entry.isStaticGeometry =
             dxvk::war3::internal::kShadowDrawTimeVBCacheStaticPersistEnabled &&
-            (semantic.objectKind ==
-                 dxvk::war3::render::ObjectKind::Building ||
-             semantic.objectKind ==
-                 dxvk::war3::render::ObjectKind::Destructible);
+            !isDynamicUnit;
         entry.lastAccessFrameSerial = m_war3ShadowPersistentFrameSerial;
         entry.ownedGpuBytes =
             uint64_t(entry.positionCapacity) + uint64_t(entry.indexCapacity) +
