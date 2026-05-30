@@ -45,6 +45,32 @@ CPU skinned 顶点直接走 GPU copy 给 shadow caster，绕开 palette cadence 
 - 7.122：path blocker entry gate at `War3TryCaptureShadowCaster` 函数最入口
 - 7.124：entry gate fast-path（廉价 currentObj/handle 优先，慢路径只对 rawcode=0）
 
+## 主题 4b — 静态阴影 / Path Blocker 真正根因（Phase 7.143，2026-05-30）⭐
+
+**这是 2026-05-30 的决定性突破，纠正了主题 4 + 历史所有静态阴影拦截的方向。**
+
+用户反馈"所有静态阴影/path blocker 拦截全部无效"。根因（IDA 反编译 `CWorld_
+TerrainShadow_Dispatch 0x6F7369B4` case0 确认）：
+
+- 真正画 doodad/建筑/path blocker 地面贴花阴影 stamp 的是
+  `TerrainShadow_ListA_RenderPreparedGroups (0x7370A0)` 和
+  `Terrain_ShadowListA_RenderAllEntries (0x737110)`，它们在 dispatch case0 里
+  **直接调用，绕过项目所有现有 hook**（历史只 hook 了 Terrain_RenderShadowLayer
+  0x737620，那只是另一个子调用）。
+- 历史拦截全在 producer（RegisterImage/StaticStamp）或错误 consumer（ListB/
+  RenderLayer/Projector），从没拦到这两个真正的 stamp 渲染消费点。
+- xrefs 确认这两个函数仅被 Dispatch 调用，`RenderEntryComplex` 内部纯
+  `GxDevice_DrawIndexedRange` 画 stamp 几何，不涉及 fog/visibility/border。
+
+修复：mode>=1 时 hook 这两个函数直接 return。
+- 配置：`kNativeShadowListARenderHookEnabled` / `kNativeShadowBlockListARenderWhenMode1`
+- 兜底：保留 CDoodads `ToggleStaticStampFromObject (0x74DB30)` producer hook
+- 安装日志用 `Logger::info` 写进 war3_d3d9.log（验证 hook 安装的正确通道）
+
+**经验教训**：(1) `war3dbg::Print` 走 DebugView 不进日志文件，验证 hook 必须用
+`Logger::info`；(2) 拦 producer 注册 ≠ 阻止 consumer 渲染（预置对象已注册）；
+(3) 一个渲染系统多个 render 入口，必须 xrefs 找全所有 consumer。
+
 ## 主题 5 — 12-人对战图开局卡顿修复（Phase 7.99 + 7.105）
 
 map load 期间引擎重 widget create cadence 导致 main thread 阻塞 4-10 秒。
