@@ -5659,3 +5659,142 @@ Phase 7.143 hook `0x7370A0 (ListA_RenderPreparedGroups)` + `0x737110
 2. 静态阴影（树/建筑 native 贴花）：producer 端 `ToggleStaticStampFromObject`
    hook 已装，但 consumer 渲染点仍待定（不是 ListA=悬崖）。**未解决**。
 3. 桥/斜坡卡顿：静态 VB 持久化已落地，未验证。
+
+
+---
+
+## 🌙 2026-05-31 凌晨无人值守：三问题根因彻查（Claude Opus 4.8）
+
+### Phase 7.148 — 修复闪烁回归（上一会话引入）
+- 根因：Phase 7.145/7.147 的 draw-time path blocker sweep（在 BuildShadowReplayDraws +
+  War3UpdateSemanticReplayInputDiagnostics）按 caster 的 batchHandle/jHandle → widget
+  cache 反查置空几何。caster.rawcode 部分帧解析得到、部分帧为 0；rawcode=0 时走
+  batchHandle 反查可能把真实单位误判成 path blocker → 同一 caster 逐帧"保留/置空"
+  抖动 → 高频阴影闪烁。
+- 修复：新增 `kPathBlockerDrawTimeSweepEnabled = false`（默认关），把两处 sweep 门控掉。
+  上游 eligibility/capture 拦截（EntryGate/Producer/FastAppend）不受影响，仍生效。
+- 文件：`war3_internal_test_config.h`、`d3d9_device.cpp`(~1933)、`d3d9_war3_shadow.cpp`。
+
+### Phase 7.149 — 增强 shadow draw survey（证据工具，零行为改动）
+- `War3ReplayDrawSurvey` 现输出几何签名（vtx/idx/blend）+ 世界坐标 + 匿名 caster
+  (rawcode=0/handle=0) 也能被记录（用 category+vertexCount 合成 dedup key）。
+- 用法：env `DXVK_WAR3_SHADOW_DRAW_SURVEY=1`，前 40 个 unique caster 写 war3_d3d9.log。
+
+### Phase 7.150 — 🎯 Problem 3（path blocker 泄漏）根因找到并修复
+
+**决定性根因链（代码 + IDA 定位）**：
+1. path blocker（YTab/YTpb/YTfb...）是 **rigid doodad**（无 vertexBlend）。
+2. 新长期 semantic 路线 `kShadowSemanticCoreSceneUnitsOnly = false`，rigid 对象走
+   `War3ShouldSubmitSemanticPacket` 的 `!unitsOnly` 分支。
+3. 该分支末尾有 `explicitUnknownRigid` 逃生通道：接受
+   `objectKind==Unknown + rigid + worldObjectEntry + sceneNode + geometry +
+   safeOpaqueMaterial + mainWorldVisibleBacking` 的 caster。
+4. 当 path blocker 的某个 packet 实例满足：
+   - `renderable.rawcode == 0`（visible registry 没抓到它的 rawcode）
+   - `renderable.jHandle` 在 RenderObjectRegistry / widget cache 都 miss
+   - `objectKind == Unknown`
+   → rawcode/jHandle 两条判定全失效，`explicitUnknownRigid==true` 让它通过 →
+   提交进 shadowCasters → CSM 投出阴影。
+5. **这就是"日志命中拦截但仍渲染"的真相**：日志命中的是**同一 path blocker 的
+   其它 packet 实例**（rawcode 已解析的，在 EntryGate/FastAppend/AppendEntry 被拦），
+   而 rawcode=0 的匿名 rigid 实例从 explicitUnknownRigid 漏过，**不写任何 reject 日志**。
+
+**修复（Phase 7.150）**：
+- 新增统一判定 `War3PacketIsPathBlocker(packet)`，三通道：
+  1. `rawcode != 0` → `IsLosBlockerFourCc`
+  2. `jHandle` → RenderObjectRegistry + widget cache 反查
+  3. **widget 指针直读**：`worldObjectEntry`/`unitPtr` 的 `+0x0C`(magic 0x2B5DB42C)
+     + `+0x30`(rawcode)，命中后 write-through 写回 widget cache。
+  这第 3 条是堵 explicitUnknownRigid 漏网的关键（rawcode=0 时唯一能拿到身份的路径）。
+- 在两个统一 chokepoint 调用它：
+  - `War3ShouldSubmitSemanticPacket`（eligibility 层，在 explicitUnknownRigid 之前）
+  - `War3TryAppendSemanticShadowPacket`（append 入口，覆盖直接调 append 的 producer）
+- widget 直读不再 env-gate（之前 Phase 7.104 默认关，导致这条兜底失效）。
+- 与 Phase 7.148 闪烁修复的区别：这是在 **packet 提交前** 用 **稳定的 widget 指针**
+  判定（worldObjectEntry/unitPtr 跨帧稳定），不是 draw-time 用易变 batchHandle 猜测，
+  因此不会引入闪烁。
+- 文件：`d3d9_device.cpp`（War3PacketIsPathBlocker 定义 ~4490、前向声明 ~1323、
+  eligibility 调用 ~2960、append 调用 ~9940）。
+- 编译通过，DLL 已部署。**待用户实机视觉验证 path blocker 阴影是否消失。**
+- 验证辅助：开 `DXVK_WAR3_SHADOW_DRAW_SURVEY=1`，若 survey 里不再出现匿名 rigid
+  caster（rawcode=0, kind=0, 小 vtx, 在悬崖位置），即证明漏网已堵。
+
+
+### Phase 7.151 — 🎯 Problem 2（桥/斜坡卡顿）根因找到并修复
+
+**决定性根因（代码定位）**：
+- 上一会话（Phase 7.99）已把高压地图 ManifestCopy 优化好（64→93 FPS），ManifestCopy
+  早退 + ResolveGeoset cache 让 view-entry 的 record 增长只产生**一帧**成本，不是持续卡顿。
+- 真正的"看到桥/斜坡卡 + 离开再回来又卡"根因在 **draw-time VB cache 的静态几何分类**：
+  - `entry.isStaticGeometry` **只**对 `ObjectKind::Building / Destructible` 置 true；
+  - 但**桥/斜坡/装饰物是 generic doodad**，解析出来是 `ObjectKind::Unknown` 或 `Item`
+    （落到 `drawTimeVBCacheOtherKindCaptureCount` 统计桶）；
+  - 所以它们**没被标记静态** → 走 16 帧动态 TTL → 离开视野 16 帧后 GPU buffer 被
+    erase 释放 → 再次进入视野 `needsNewPositionBuffer==true` → 重新 `createBuffer`
+    (vkAllocateMemory 同步阻塞主线程) → **复现"离开再回来又卡"**。
+- 验证逻辑：capture 路径 `needsNewPositionBuffer = (positionBuffer==nullptr ||
+  positionCapacity < posBytes)`。只要 entry 留在 cache 里（容量够），再次进入视野
+  就 O(1) 复用，不再 createBuffer。所以"让静态 entry 常驻"直接消除 re-entry 卡顿。
+
+**修复（Phase 7.151）**：
+- 把 `isStaticGeometry` 分类从"仅 Building/Destructible"扩大为"**非动态单位的 rigid
+  几何**"：
+  - 排除 `ObjectKind::Unit`（骨骼动画，pose 每帧变，绝不能常驻）；
+  - 排除有 runtime pose / sprite pose / pose palette 的对象（再次排除动态）；
+  - 其余（Building/Destructible/Item/Unknown 的桥/斜坡/装饰物）= 静态，常驻复用。
+- 静态常驻仍受 64MiB LRU 上限 + 30 分钟闲置回收约束（不会无限增长）。
+- 回退开关：`kShadowDrawTimeVBCacheStaticPersistEnabled = false` → 回到全 16 帧 TTL。
+- 文件：`d3d9_device.cpp`(~24628 v4 capture 分类)。编译通过，DLL 已部署。
+- **待用户实机验证**：桥/斜坡首次进视野后，离开再回来不再卡。
+  - 首次进视野仍可能有 alloc budget 摊销的短暂分帧（32/帧），属预期，非硬卡顿。
+
+
+### Phase 7.152/7.153 — Problem 1 诊断 + Problem 3 legacy 路径补全
+
+**Phase 7.152（Problem 1 静态阴影 — 诊断）**：
+- `kNativeShadowDoodadStampStatsLogging` 默认改为 true，且日志从 `war3dbg::Print`
+  （DebugView，工具读不到）改为 `Logger::info`（写 war3_d3d9.log）。
+- 用户起床后可在 war3_d3d9.log 看 `DoodadStaticStamp calls=N blocked=M mode=1`，
+  验证 `ToggleStaticStampFromObject (0x74DB30)` hook 是否对 pre-placed 路径阻断器/
+  装饰物 native 贴花阴影注册命中。
+- IDA 已确认 `0x74DB30` 被 `CDoodads_CreateDoodadAndActivate`（含 pre-placed 加载）
+  + `EnableFeatures` 调用，hook 在 MainRunner_ENTER（map load 前）安装，理论覆盖
+  pre-placed doodad。default mode=1，block 路径生效。
+
+**Phase 7.153（Problem 3 — legacy capture 路径补全）**：
+- 发现 Problem 3 还有第三条 caster-creation 路径未覆盖：legacy
+  `War3TryCaptureShadowCaster` → `finalizeShadowDrawCommon` → `shadowCasters.emplace_back`
+  （Terrain doodad path blocker：currentObj/pathBlockObj 都空，走 legacy capture，
+  semantic 两个 gate 管不到）。
+- 在 `finalizeShadowDrawCommon` 加 path blocker guard：rawcode==0 时从
+  `semantic.worldObjectEntry`/`semantic.object->unitPtr` 做 widget 直读
+  （`War3ShadowIsLosBlockerByWidgetPtr`，稳定指针），命中就置空几何 → 所有 consumer skip。
+
+**Problem 3 现在三条 caster-creation 路径全覆盖（统一用稳定 widget 身份）**：
+1. semantic eligibility gate（`War3ShouldSubmitSemanticPacket` → `War3PacketIsPathBlocker`）
+2. semantic append gate（`War3TryAppendSemanticShadowPacket` → `War3PacketIsPathBlocker`）
+3. legacy finalize（`finalizeShadowDrawCommon` → `War3ShadowIsLosBlockerByWidgetPtr`）
+全部用 worldObjectEntry/unitPtr 稳定指针 + widget +0x0C/+0x30 直读，跨帧稳定，
+不会引入 Phase 7.145/7.147 那种 batchHandle 逐帧抖动闪烁。
+
+---
+
+## 📋 2026-05-31 凌晨无人值守总结（三问题根因 + 修复）
+
+| 问题 | 根因 | 修复 Phase | 状态 |
+|---|---|---|---|
+| 闪烁回归（本会话引入） | 7.145/7.147 draw-time sweep 用易变 batchHandle 逐帧抖动 | 7.148 默认关 sweep | ✅ 已修 |
+| Problem 3 path blocker 泄漏 | rawcode=0 匿名 rigid path blocker 从 explicitUnknownRigid 漏过；legacy Terrain doodad 路径也漏 | 7.150 + 7.153 统一 widget 直读判定，3 条路径全覆盖 | ✅ 根因已修，待视觉验证 |
+| Problem 2 桥/斜坡卡顿 | 静态 VB cache 只认 Building/Destructible，桥/斜坡是 Unknown/Item doodad → 16 帧 TTL → re-entry 重新 createBuffer | 7.151 静态分类扩为"非动态单位 rigid 几何" | ✅ 根因已修，待视觉验证 |
+| Problem 1 静态阴影（最低优先） | pre-placed doodad native 贴花阴影；producer hook 已装但需验证命中 | 7.152 诊断日志到文件 | ⏳ 诊断就绪，待日志验证 |
+
+**所有修复都有 config 回退开关，编译通过，DLL 已部署 E:\Work\War3\d3d9.dll。**
+**等用户实机验证后再决定是否需要进一步调整。**
+
+验证清单（用户起床后）：
+1. Problem 3：进游戏看 path blocker 阴影是否消失。若仍有，开
+   `DXVK_WAR3_SHADOW_DRAW_SURVEY=1` 看 war3_d3d9.log 的 SHADOW DRAW SURVEY 行，
+   匿名 rigid caster（rawcode=0, kind=0, 小 vtx, 悬崖位置）应已消失。
+2. Problem 2：看到桥/斜坡 → 离开 → 再回来，是否还卡。
+3. Problem 1：看 war3_d3d9.log 的 DoodadStaticStamp blocked 计数是否增长。
+4. 整体：阴影是否还有高频闪烁（Phase 7.148 应已消除）。
