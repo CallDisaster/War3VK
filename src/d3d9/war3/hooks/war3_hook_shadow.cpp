@@ -936,13 +936,17 @@ int __fastcall Hook_Doodad_ToggleStaticStampFromObject(void *thisPtr, void *edx,
     const uint32_t calls = s_calls.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((calls % dxvk::war3::internal::kNativeShadowDoodadStampStatsInterval) ==
         0u) {
-      war3dbg::Print(
-          "DXVK War3Hook: DoodadStaticStamp calls=%u blocked=%llu mode=%u "
-          "enable=%d\n",
-          static_cast<unsigned>(calls),
-          static_cast<unsigned long long>(
-              g_doodadStaticStampBlockedCount.load(std::memory_order_relaxed)),
-          static_cast<unsigned>(mode), enable);
+      // 写 war3_d3d9.log（Logger::info），不是 DebugView，方便用户直接读取。
+      char buf[160];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: DoodadStaticStamp calls=%u blocked=%llu "
+               "mode=%u enable=%d",
+               static_cast<unsigned>(calls),
+               static_cast<unsigned long long>(
+                   g_doodadStaticStampBlockedCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned>(mode), enable);
+      ::dxvk::Logger::info(buf);
     }
   }
 

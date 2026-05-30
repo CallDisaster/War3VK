@@ -1171,8 +1171,11 @@ inline constexpr bool kNativeShadowDoodadStampHookEnabled = true;
 inline constexpr bool kNativeShadowBlockDoodadStaticStampWhenMode1 = true;
 // mode=1 时屏蔽 doodad emitter 贴花阴影注册。
 inline constexpr bool kNativeShadowBlockDoodadEmitterStampWhenMode1 = true;
-// doodad 贴花阴影拦截统计日志（低频，默认关闭）。
-inline constexpr bool kNativeShadowDoodadStampStatsLogging = false;
+// doodad 贴花阴影拦截统计日志（低频，默认开启用于验证 hook 命中）。
+// 2026-05-31：默认打开。每 kNativeShadowDoodadStampStatsInterval 次调用写 1 行，
+// 让用户能在 war3_d3d9.log 直接看到 DoodadStaticStamp calls/blocked，验证
+// pre-placed 路径阻断器/装饰物是否走这条 native stamp 注册路径。
+inline constexpr bool kNativeShadowDoodadStampStatsLogging = true;
 inline constexpr uint32_t kNativeShadowDoodadStampStatsInterval = 4000;
 
 // ========================================================================
