@@ -5617,3 +5617,45 @@ Phase 7.143 hook `0x7370A0 (ListA_RenderPreparedGroups)` + `0x737110
 ### 当前 DLL
 `E:\Work\War3\d3d9.dll`（26905337 @ 0:40），含 7.144 回退 + 7.145 survey。
 悬崖正常，无破坏性 hook。
+
+
+---
+
+## 🎯 2026-05-31 第五轮：path blocker 权威清扫 + 澄清"合批优化"
+
+### 用户两个关键澄清
+1. **"路径阻断器被拦截了，但依然渲染了 ShadowMap"** —— reject 日志命中，但仍画。
+2. **"合并批量提交优化" = 渲染层的合批提交优化（batch merge）**，不是 git commit。
+
+### Phase 7.147：path blocker 权威清扫（根治问题 3 的 CSM 泄漏）
+- **根因**：`shadowCasters` 有 3+ 个**直接** consumer：
+  - `BuildShadowReplayDraws`（我之前只在这里加了网）
+  - `war3_shader_api.cpp`（直接遍历 shadowCasters 建 DrawCall）
+  - `d3d9_war3_shadow_resources.cpp`（直接用 shadowCasters[i] 建矩阵 SSBO）
+  - 某条 append 路径在 rawcode=0 时漏判 path blocker，进了 shadowCasters，
+    被未过滤的 consumer 画出 → "日志 reject 但仍渲染"。
+- **修复**：
+  1. `War3ShadowCasterDraw` 新增 `rawcode`/`jHandle` 字段；
+  2. 4 个 append 站点（canonical / DirectGrouped / FastAppend / legacy）都把
+     已解析的 rawcode/jHandle 写入 caster；
+  3. 在 `War3UpdateSemanticReplayInputDiagnostics`（**所有 consumer 之前的唯一
+     finalize 闸门**）做权威清扫：命中 path blocker（caster.rawcode 或 jHandle
+     兜底）就把 `positionStorage=nullptr`+counts=0。所有 consumer 都检查
+     positionStorage（null→skip），因此**覆盖全部渲染路径，consumer-agnostic**。
+- 这是问题 3 真正完整的修法：不依赖哪条 append 路径，最终统一清扫。
+- 当前 DLL：`E:\Work\War3\d3d9.dll`（26905207 @ 2:32）。
+
+### 渲染层合批优化现状（待推进，不盲改）
+- `kNativeQueueAutoInstancingEnabled`（默认 false）是真正的实例化合批开关，
+  但有 TeamColor/layer 污染风险（config 注释警告）。
+- `War3BatchMerger` 只是分析器（统计潜在可省 drawcall），不实际合批。
+- `FlushSortedItems_StdSort`（war3_render_queue.h）是 RenderQueue flush 主路径。
+- **不盲目开启实例化**（本会话已多次栽在盲改上）。需要先逆向确认合批安全条件
+  + 可回归验证再动。
+
+### 待用户验证
+1. path blocker：Phase 7.147 finalize 清扫应彻底（不再"日志拦了还渲染"）。
+   若仍可见，开 `DXVK_WAR3_SHADOW_DRAW_SURVEY=1` 看 survey 行确认泄漏 fourcc。
+2. 静态阴影（树/建筑 native 贴花）：producer 端 `ToggleStaticStampFromObject`
+   hook 已装，但 consumer 渲染点仍待定（不是 ListA=悬崖）。**未解决**。
+3. 桥/斜坡卡顿：静态 VB 持久化已落地，未验证。
