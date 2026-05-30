@@ -1977,6 +1977,85 @@ void War3UpdateSemanticReplayInputDiagnostics(War3FrameScene& scene) {
       uint32_t((std::min)(scene.shadowCasters.size(),
                           size_t(std::numeric_limits<uint32_t>::max())));
 
+  // ============================================================
+  // 2026-05-31：caster 成分诊断（节流文件日志，定位 path blocker / 静态阴影来源）
+  // ============================================================
+  // 用户实测三问题均未解决。需要 ground truth：shadow map 到底画了哪些 caster。
+  // 每 ~240 帧打 1 行到 war3_d3d9.log，统计 caster 总数、匿名 rigid（rawcode==0
+  // 且非 vertexBlend，path blocker 漏网嫌疑）、各 objectKind 分布、以及前几个
+  // 匿名 rigid caster 的世界坐标（path blocker 在悬崖上）。env
+  // DXVK_WAR3_CASTER_COMPOSITION=0 可关闭。
+  {
+    static const bool s_compEnabled = []() {
+      const char* env = std::getenv("DXVK_WAR3_CASTER_COMPOSITION");
+      return env == nullptr || env[0] == '\0' || env[0] != '0';
+    }();
+    if (s_compEnabled) {
+      static std::atomic<uint32_t> s_frameTick{0};
+      const uint32_t tick = s_frameTick.fetch_add(1, std::memory_order_relaxed);
+      if ((tick % 240u) == 0u) {
+        uint32_t total = 0u, anonRigid = 0u, blendCount = 0u;
+        uint32_t kUnit = 0u, kBuilding = 0u, kDestructible = 0u,
+                 kItem = 0u, kEffect = 0u, kUnknown = 0u, kOther = 0u;
+        float anon0x = 0.f, anon0y = 0.f, anon0z = 0.f;
+        bool gotAnon = false;
+        for (const auto& c : scene.shadowCasters) {
+          if (c.positionStorage == nullptr)
+            continue;
+          total++;
+          if (c.vertexBlendEnabled)
+            blendCount++;
+          if (c.rawcode == 0u && !c.vertexBlendEnabled) {
+            anonRigid++;
+            if (!gotAnon) {
+              anon0x = c.worldMatrix[3].x;
+              anon0y = c.worldMatrix[3].y;
+              anon0z = c.worldMatrix[3].z;
+              gotAnon = true;
+            }
+          }
+          switch (static_cast<dxvk::war3::render::ObjectKind>(c.objectKind)) {
+          case dxvk::war3::render::ObjectKind::Unit: kUnit++; break;
+          case dxvk::war3::render::ObjectKind::Building: kBuilding++; break;
+          case dxvk::war3::render::ObjectKind::Destructible: kDestructible++; break;
+          case dxvk::war3::render::ObjectKind::Item: kItem++; break;
+          case dxvk::war3::render::ObjectKind::Effect: kEffect++; break;
+          case dxvk::war3::render::ObjectKind::Unknown: kUnknown++; break;
+          default: kOther++; break;
+          }
+        }
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+                 "DXVK War3Shadow: CASTER COMPOSITION total=%u blend=%u "
+                 "anonRigid=%u kind[U=%u B=%u D=%u I=%u E=%u Unk=%u Oth=%u] "
+                 "anon0pos=(%.0f,%.0f,%.0f)",
+                 total, blendCount, anonRigid, kUnit, kBuilding, kDestructible,
+                 kItem, kEffect, kUnknown, kOther,
+                 double(anon0x), double(anon0y), double(anon0z));
+        ::dxvk::Logger::info(buf);
+      }
+      // VB alloc 突发检测（问题2 卡顿证据）：本帧新建 GPU buffer 数量较高时
+      // 立即打 1 行，定位"看到桥/斜坡/视野切换时的 createBuffer 突发"。
+      const uint32_t posAlloc = stats.drawTimeVBCachePositionAllocCount;
+      const uint32_t idxAlloc = stats.drawTimeVBCacheIndexAllocCount;
+      if (posAlloc + idxAlloc >= 8u) {
+        static std::atomic<uint32_t> s_allocSpikeLog{0};
+        if (s_allocSpikeLog.fetch_add(1, std::memory_order_relaxed) < 80u) {
+          char buf2[220];
+          snprintf(buf2, sizeof(buf2),
+                   "DXVK War3Shadow: VB ALLOC SPIKE posAlloc=%u idxAlloc=%u "
+                   "capture=%u totalEntered=%u staticPersist=%d",
+                   posAlloc, idxAlloc, stats.drawTimeVBCacheCaptureCount,
+                   stats.drawTimeVBCacheTotalEntered,
+                   int(dxvk::war3::internal::
+                           kShadowDrawTimeVBCacheStaticPersistEnabled));
+          ::dxvk::Logger::info(buf2);
+        }
+      }
+    }
+  }
+
+
   uint32_t replayCount = 0u;
   uint32_t skinnedReplayCount = 0u;
   auto noteReplayDraw = [&](const War3ShadowCasterDraw& draw) {

@@ -402,9 +402,12 @@ inline bool War3ReplayDrawIsPathBlocker(const War3ShadowCasterDraw& draw) {
 }
 
 inline void War3ReplayDrawSurvey(const War3ShadowCasterDraw& draw) {
+  // 2026-05-31：survey 默认开启（一次性 40 条，节流），让下一次实机测试
+  // 自动把 shadow map 实际画的对象身份写进 war3_d3d9.log，不再依赖用户设 env。
+  // env DXVK_WAR3_SHADOW_DRAW_SURVEY=0 可显式关闭。
   static const bool enabled = []() {
     const char* env = std::getenv("DXVK_WAR3_SHADOW_DRAW_SURVEY");
-    return env != nullptr && env[0] != '\0' && env[0] != '0';
+    return env == nullptr || env[0] == '\0' || env[0] != '0';
   }();
   if (!enabled)
     return;
