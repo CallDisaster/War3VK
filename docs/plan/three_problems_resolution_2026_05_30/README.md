@@ -216,3 +216,48 @@ path blocker 在 War3 里是 doodad。它的阴影有两个来源：
 2. 桥/斜坡反复进出视野不再卡（静态 entry 复用）。
 3. 若仍有残留：开 `kNativeShadowDoodadStampStatsLogging=true` 看 DoodadStaticStamp
    blocked 计数，确认 hook 命中。
+
+
+---
+
+## 7. 2026-05-31 凌晨：三问题根因彻查结论（Claude Opus 4.8 无人值守）
+
+### 7.1 闪烁回归（上一会话引入，先修）
+- 根因：Phase 7.145/7.147 的 draw-time sweep 用 caster.batchHandle（易变值）逐帧
+  反查置空几何，把真实单位误判成 path blocker → 逐帧抖动 → 高频闪烁。
+- 修复 Phase 7.148：新增 `kPathBlockerDrawTimeSweepEnabled=false`（默认关）。
+
+### 7.2 Problem 3（path blocker 泄漏）— 根因找到
+- **真相**：path blocker 是 rigid doodad，rawcode=0 的匿名实例从
+  `War3ShouldSubmitSemanticPacket` 的 `explicitUnknownRigid` 逃生通道漏过被提交。
+  日志命中的是同一 path blocker 的其它 rawcode 已解析实例（被拦），rawcode=0 的
+  实例不写日志直接漏过 → "日志拦了但仍渲染"。
+- **修复 Phase 7.150 + 7.153**：统一 `War3PacketIsPathBlocker`（rawcode/jHandle/
+  widget 指针直读三通道）+ legacy `finalizeShadowDrawCommon` 守卫，3 条 caster
+  创建路径全覆盖，全部用稳定 widget 指针（worldObjectEntry/unitPtr 的 +0x0C magic
+  + +0x30 rawcode），跨帧稳定不抖动。
+
+### 7.3 Problem 2（桥/斜坡卡顿）— 根因找到
+- **真相**：draw-time VB cache 的 `isStaticGeometry` 只认 Building/Destructible，
+  桥/斜坡是 generic doodad（ObjectKind::Unknown/Item）→ 不标记静态 → 16 帧 TTL →
+  离开视野后 GPU buffer 释放 → 再次进入视野重新 createBuffer 阻塞主线程 → 复现
+  "离开再回来又卡"。
+- **修复 Phase 7.151**：静态分类扩为"非动态单位的 rigid 几何"（排除 Unit + 排除
+  有 runtime/sprite pose 的对象），桥/斜坡/装饰物全部常驻复用。
+
+### 7.4 Problem 1（静态阴影，最低优先）— 诊断就绪
+- producer hook `ToggleStaticStampFromObject (0x74DB30)` 已装，IDA 确认覆盖
+  pre-placed doodad（CreateDoodadAndActivate）+ EnableFeatures，mode=1 block 生效。
+- Phase 7.152：stats 日志改写 war3_d3d9.log，用户可验证 hook 命中计数。
+- IDA 确认 native 贴花阴影渲染消费点是 `Terrain_ShadowListA_RenderAllEntries
+  (0x737110)`，但它同时渲染悬崖地形（Phase 7.143 证伪），不能 wholesale 拦。
+  producer-side 拦截（阻止 stamp 注册）是正确方向。
+
+### 7.5 关键经验
+- "日志拦截命中" ≠ "全部实例被拦"：同一对象会产生多个 packet 实例，rawcode
+  解析成功的被拦+记日志，rawcode=0 的匿名实例漏过且不记日志。这是 problem 3
+  几周无法解决的核心误导。
+- 拦截必须用**稳定身份**（widget 指针），不能用**易变身份**（batchHandle），
+  否则逐帧抖动闪烁。
+- 静态几何分类不能只按 objectKind 白名单（Building/Destructible），generic doodad
+  解析为 Unknown，必须用"非动态"反向判定。
