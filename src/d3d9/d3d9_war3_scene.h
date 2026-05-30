@@ -105,6 +105,11 @@ namespace dxvk {
         War3BatchTag batchTag = War3BatchTag::Unknown;
         uint32_t batchHandle = 0; // jHandle（来自 ExecBatch TLS），用于描边筛选
         uint8_t objectKind = 0;   // dxvk::war3::render::ObjectKind
+        // 2026-05-31：caster 自带身份，供 finalize 阶段权威 path blocker 清扫。
+        // 各 append 站点已解析的 rawcode/jHandle 直接写入，draw-time consumer
+        // 无需依赖 widget cache 反查。
+        uint32_t rawcode = 0;
+        uint32_t jHandle = 0;
 
         // ===== 级联阴影剔除（粗略包围球）=====
         // 说明：用于 CPU 端对每个 CSM 级联做保守剔除，减少“每级联全量重放”的 drawcall 膨胀。

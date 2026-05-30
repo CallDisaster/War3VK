@@ -1318,6 +1318,9 @@ bool War3ShouldSubmitSemanticPacket(
 // 等 eligibility helper 想用的话需要这个前置声明。
 inline bool IsLosBlockerFourCc(uint32_t rawcode);
 
+// 2026-05-31：path blocker 最终清扫用 jHandle 兜底（定义在文件后段）。
+inline bool War3ShadowIsLosBlockerByJHandleFallback(uint32_t jHandle);
+
 // Phase 7.73：eligibility gate 拒绝路径阻断器的全局计数（atomic relaxed）。
 // 该函数定义在 anonymous namespace，没有 D3D9DeviceEx 上下文，因此用全局
 // 原子计数。D3D9DeviceEx 每帧 reset shadow scene 时把累加值移入 shadowStats。
@@ -1914,6 +1917,51 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
 
 void War3UpdateSemanticReplayInputDiagnostics(War3FrameScene& scene) {
   auto& stats = scene.shadowStats;
+
+  // ============================================================
+  // 2026-05-31：path blocker 最终权威清扫（所有 consumer 之前的唯一闸门）
+  // ============================================================
+  // 用户实测：path blocker 在上游 reject 日志里命中，但 shadow map 仍渲染。
+  // 根因：shadowCasters 有 3+ 个直接 consumer（BuildShadowReplayDraws /
+  // war3_shader_api / d3d9_war3_shadow_resources），上游某条 append 路径在
+  // rawcode=0 时漏判，path blocker 进了 shadowCasters，被未过滤的 consumer 画出。
+  //
+  // 这里在所有 consumer 之前做权威清扫：caster 现在自带 rawcode/jHandle
+  // （各 append 站点已填充），命中 path blocker 就把 positionStorage 置空 +
+  // 计数清零。所有 consumer 都检查 positionStorage（null 即 skip），因此这是
+  // 覆盖全部渲染路径的单点根治。
+  if (dxvk::war3::internal::kPathBlockerHideEnabled) {
+    uint32_t sweptCount = 0u;
+    for (auto& caster : scene.shadowCasters) {
+      if (caster.positionStorage == nullptr)
+        continue;
+      bool isBlocker = false;
+      if (caster.rawcode != 0u && IsLosBlockerFourCc(caster.rawcode)) {
+        isBlocker = true;
+      } else {
+        // rawcode 缺失：用 jHandle/batchHandle 走 widget cache 兜底。
+        const uint32_t handle =
+            caster.jHandle != 0u ? caster.jHandle : caster.batchHandle;
+        if (handle != 0u &&
+            War3ShadowIsLosBlockerByJHandleFallback(handle)) {
+          isBlocker = true;
+        }
+      }
+      if (!isBlocker)
+        continue;
+      // 置空几何 → 所有 consumer 跳过（不画 shadow map / outline / 矩阵 SSBO）。
+      caster.positionStorage = nullptr;
+      caster.indexStorage = nullptr;
+      caster.indexCount = 0u;
+      caster.vertexCount = 0u;
+      caster.numVertices = 0u;
+      caster.boundsRadius = 0.0f;
+      sweptCount++;
+    }
+    if (sweptCount != 0u)
+      stats.semanticSceneRejectedPathBlockerCount += sweptCount;
+  }
+
   stats.semanticSceneShadowCastersCount =
       uint32_t((std::min)(scene.shadowCasters.size(),
                           size_t(std::numeric_limits<uint32_t>::max())));
@@ -11770,6 +11818,9 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   draw.batchTag = War3BatchTag::Unknown;
   draw.batchHandle = War3NormalizeShadowHandle(canonicalIdentity.jHandle);
   draw.objectKind = static_cast<uint8_t>(resolvedObjectKind);
+  // 2026-05-31：身份写入 caster，供最终统一 path blocker 清扫。
+  draw.rawcode = canonicalIdentity.rawcode;
+  draw.jHandle = canonicalIdentity.jHandle;
 
   const bool unitLikeObject = War3IsSemanticUnitObject(resolvedObjectKind);
   {
@@ -12428,6 +12479,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     draw.batchTag = War3BatchTag::WorldObjects;
     draw.batchHandle = record.identity.jHandle;
     draw.objectKind = static_cast<uint8_t>(objectKind);
+    // 2026-05-31：身份写入 caster，供最终统一 path blocker 清扫。
+    draw.rawcode =
+        record.identity.rawcode != 0u ? record.identity.rawcode : entry.rawcode;
+    draw.jHandle =
+        record.identity.jHandle != 0u ? record.identity.jHandle : entry.jHandle;
     // Phase 7.92：从 entry.sceneNode 读世界位置用于远 cascade cull。
     if (entry.sceneNode != nullptr) {
       const auto* matBase = reinterpret_cast<const uint8_t*>(entry.sceneNode)
@@ -13964,6 +14020,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                            ? eligible.packet.renderable.jHandle
                            : eligible.sample.contract.jHandle;
     draw.objectKind = static_cast<uint8_t>(resolvedObjectKind);
+    // 2026-05-31：身份写入 caster，供最终统一 path blocker 清扫。
+    draw.rawcode = eligible.packet.renderable.rawcode != 0u
+                       ? eligible.packet.renderable.rawcode
+                       : entry.rawcode;
+    draw.jHandle = draw.batchHandle;
     // Phase 7.92：从 entry.sceneNode 读世界位置用于远 cascade cull。
     if (entry.sceneNode != nullptr) {
       const auto* matBase = reinterpret_cast<const uint8_t*>(entry.sceneNode)
@@ -25478,6 +25539,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.batchTag = (execTag != War3BatchTag::Unknown) ? execTag : tag;
     draw.batchHandle = batchHandle;
     draw.objectKind = resolvedObjectKind;
+    // 2026-05-31：把已解析的身份写入 caster，供最终统一 path blocker 清扫。
+    draw.rawcode = semantic.rawcode != 0u
+                       ? semantic.rawcode
+                       : (pathBlockObj != nullptr ? pathBlockObj->rawcode : 0u);
+    draw.jHandle = batchHandle;
 
     const bool dynamicUnitLikeNoCull =
         unitLikeObject &&

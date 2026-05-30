@@ -382,10 +382,11 @@ inline bool War3ReplayIsPathBlockerRawcode(uint32_t rawcode) {
 inline bool War3ReplayDrawIsPathBlocker(const War3ShadowCasterDraw& draw) {
   if (!dxvk::war3::internal::kPathBlockerHideEnabled)
     return false;
-  // War3ShadowCasterDraw 在 draw-time 只携带 batchHandle（jHandle，来自 ExecBatch
-  // TLS）+ objectKind，没有 rawcode 字段。用 batchHandle 走 widget identity cache
-  // 反查 rawcode，再做 path blocker 匹配。
-  const uint32_t handle = draw.batchHandle;
+  // 2026-05-31：caster 现在自带 rawcode（各 append 站点填充）。优先用它，
+  // 其次用 batchHandle → widget cache 兜底。
+  if (War3ReplayIsPathBlockerRawcode(draw.rawcode))
+    return true;
+  const uint32_t handle = draw.jHandle != 0u ? draw.jHandle : draw.batchHandle;
   if (handle != 0u) {
     const uint32_t cached =
         dxvk::war3::hooks::QueryWidgetRawcodeByHandle(handle);
@@ -402,11 +403,11 @@ inline void War3ReplayDrawSurvey(const War3ShadowCasterDraw& draw) {
   }();
   if (!enabled)
     return;
-  const uint32_t handle = draw.batchHandle;
-  // survey 以 batchHandle 反查 rawcode；handle=0 的 caster 记一个特殊 0 槽，
-  // 用于统计"无身份 caster"数量（path blocker 若走无身份路径会落这里）。
-  const uint32_t rawcode =
-      handle != 0u ? dxvk::war3::hooks::QueryWidgetRawcodeByHandle(handle) : 0u;
+  // 优先用 caster 自带 rawcode；为 0 时用 batchHandle 查 widget cache。
+  uint32_t rawcode = draw.rawcode;
+  const uint32_t handle = draw.jHandle != 0u ? draw.jHandle : draw.batchHandle;
+  if (rawcode == 0u && handle != 0u)
+    rawcode = dxvk::war3::hooks::QueryWidgetRawcodeByHandle(handle);
   static std::atomic<uint32_t> s_logCount{0};
   static std::array<std::atomic<uint32_t>, 40> s_logged{};
   if (s_logCount.load(std::memory_order_relaxed) >= 40u)
