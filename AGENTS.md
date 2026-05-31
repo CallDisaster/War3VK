@@ -5836,3 +5836,33 @@ Phase 7.143 hook `0x7370A0 (ListA_RenderPreparedGroups)` + `0x737110
   静态常驻 / 预算策略；若不出现 → 问题2 根因不在 VB 分配，要换方向查。
 
 **部署**：DLL 26905966 bytes，已部署 E:\Work\War3\d3d9.dll。诊断默认开，用户正常玩即可。
+
+
+### Phase 7.155 — 证据驱动修复（用户 11:20 实测日志分析）
+
+**Problem 3 决定性证据**：
+- `CASTER COMPOSITION anonRigid=18/6/3/14/10` — **匿名 rigid caster 确实在 shadowCasters 里**。
+- SHADOW DRAW SURVEY #34-40：`rawcode=0x00000000, batchHandle=0x0, kind=1(Unit), blend=0,
+  vtx=6~198, pos=(-928,288,0)/(684,234,192)` — 完全匿名、rigid、小几何、在悬崖坐标。
+- **关键发现**：path blocker 被错误分类为 `ObjectKind::Unit`（kind=1），不是 Unknown！
+  所以它通过了 `War3IsEligibleSemanticDynamicUnit`（接受 Unit），不是 `explicitUnknownRigid`。
+  我之前的 Phase 7.150 假设（explicitUnknownRigid 漏网）是错的。
+- **真正漏网路径**：path blocker 以 `rawcode=0 + jHandle=0 + worldObjectEntry=nullptr +
+  unitPtr=nullptr + objectKind=Unit + rigid + 小几何` 的完全匿名形态通过 Unit 路径。
+  所有基于身份的拦截（rawcode/jHandle/widget 直读）全部失效（没有任何身份指针）。
+- **修复**：在 `War3PacketIsPathBlocker` 末尾加启发式兜底：
+  `jHandle==0 && worldObjectEntry==nullptr && unitPtr==nullptr && vtxCount<=200 && path==Rigid`
+  → 判定为 path blocker。真实单位总有至少一个身份字段；path blocker 是唯一"完全匿名
+  rigid 小几何"的对象。
+
+**Problem 2 决定性证据**：
+- `VB ALLOC SPIKE posAlloc=16 idxAlloc=16` **每帧**，持续 10+ 帧 → 每帧 32 次
+  `createBuffer`（vkAllocateMemory 同步阻塞）→ 240→50 FPS 暴降。
+- 原预算 32/帧 = 等于不限制（pos+idx 各 16 = 32 刚好用完）。
+- **修复**：预算从 32 降到 **4/帧**。200 个新 entry 分摊到 ~50 帧（~0.8s @ 60fps），
+  阴影逐步出现，无硬卡顿。
+- 附加发现：`staticPersist=1` 但 alloc 仍频繁 → 因为所有 caster 被分类为 Unit（kind=1），
+  我的 Phase 7.151 静态分类排除了 Unit → 桥/斜坡也被排除 → 仍走 16 帧 TTL。
+  这是 objectKind 分辨率问题（TLS 污染），但 budget=4 已经从根本上限制了 alloc 突发。
+
+**DLL 已部署**：26910330 bytes @ 12:00。用户可立即测试。
