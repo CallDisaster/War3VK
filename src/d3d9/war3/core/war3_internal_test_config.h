@@ -1011,11 +1011,7 @@ inline bool kPathBlockerDrawTimeSweepEnabled = false;
 // uv + 可选 ib），所以 32 大约支持 11-32 个新 caster / 帧。一秒内可以处理
 // 660-1920 个新 caster，覆盖电影模式视角压低后大量装饰物同时入视野 + 实机
 // 桥/斜坡突然出现的瞬时新 caster 量级。
-// 2026-05-31 Phase 7.155：用户实测日志显示 posAlloc=16 idxAlloc=16 每帧，
-// 总计 32 allocs/帧 = 32 次 vkAllocateMemory 同步阻塞 → 240→50 FPS 暴降。
-// 原预算 32 太高（等于不限制）。降到 4：每帧最多 4 次 createBuffer，
-// 200+ 新 entry 分摊到 ~50 帧（~0.8s @ 60fps）逐步出现阴影，无硬卡顿。
-inline constexpr uint32_t kShadowDrawTimeVBCacheAllocBudgetPerFrame = 4u;
+inline constexpr uint32_t kShadowDrawTimeVBCacheAllocBudgetPerFrame = 32u;
 inline constexpr bool kShadowDrawTimeVBCacheAllocBudgetEnabled = true;
 
 // ========================================================================

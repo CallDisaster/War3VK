@@ -4613,16 +4613,6 @@ inline bool War3ShadowIsLosBlockerByWidgetPtr(void* widgetPtr,
 
 // 统一 packet 级 path blocker 判定（覆盖 rawcode / jHandle / widget 直读三通道）。
 // 用于 eligibility 层堵死 explicitUnknownRigid / static-world 漏网。
-//
-// 2026-05-31 Phase 7.155 追加：用户实测日志显示 path blocker 以 rawcode=0 /
-// jHandle=0 / batchHandle=0 / objectKind=Unit / blend=0 (rigid) / 小顶点数
-// 的"完全匿名 rigid Unit"形态泄漏进 shadowCasters。widget 直读也无法命中
-// （worldObjectEntry/unitPtr 都是 nullptr）。这类 caster 的特征是：
-//   - rawcode == 0 且 jHandle == 0（无身份）
-//   - rigid（非 vertex blend）
-//   - 小几何（vtx <= 200）
-// 真实单位（英雄/士兵）总是有 rawcode 或 jHandle。path blocker 是唯一满足
-// "无身份 + rigid + 小几何"的对象。用此启发式作为最终兜底。
 inline bool War3PacketIsPathBlocker(
     const dxvk::war3::shadow::ShadowDrawPacket& packet) {
   const auto& r = packet.renderable;
@@ -4637,18 +4627,6 @@ inline bool War3PacketIsPathBlocker(
   if (r.unitPtr != r.worldObjectEntry &&
       War3ShadowIsLosBlockerByWidgetPtr(r.unitPtr, r.jHandle))
     return true;
-  // Phase 7.155 最终兜底：完全匿名 rigid 小几何 = path blocker。
-  // 真实单位总有 rawcode 或 jHandle；path blocker 是唯一"无身份 + rigid + 小"的对象。
-  if (r.jHandle == 0u && r.worldObjectEntry == nullptr && r.unitPtr == nullptr) {
-    // 无任何身份指针。检查几何特征：rigid + 小顶点。
-    const uint32_t vtxCount = packet.resource.vertexCount != 0u
-                                  ? packet.resource.vertexCount
-                                  : uint32_t(packet.resource.positionVec().size() / 3u);
-    if (vtxCount > 0u && vtxCount <= 200u &&
-        packet.path == dxvk::war3::shadow::ShadowDrawPath::Rigid) {
-      return true;
-    }
-  }
   return false;
 }
 
