@@ -1936,10 +1936,8 @@ void War3UpdateSemanticReplayInputDiagnostics(War3FrameScene& scene) {
   // 计数清零。所有 consumer 都检查 positionStorage（null 即 skip），因此这是
   // 覆盖全部渲染路径的单点根治。
   //
-  // 2026-05-31 回退：默认关闭（kPathBlockerDrawTimeSweepEnabled=false）。
-  // 原因：rawcode 缺失时走 batchHandle→widget cache 反查会把真实单位误判成
-  // path blocker，导致同一 caster 逐帧"保留/置空"抖动 → 高频阴影闪烁。
-  // 上游 eligibility/capture 拦截仍然生效，这里仅作为可选兜底。
+  // 2026-06-12：默认只启用 rawcode 明确命中的最终清扫。rawcode 缺失时的
+  // handle 兜底保持独立 opt-in，避免把真实单位误判成 path blocker 后逐帧抖动。
   if (dxvk::war3::internal::kPathBlockerHideEnabled &&
       dxvk::war3::internal::kPathBlockerDrawTimeSweepEnabled) {
     uint32_t sweptCount = 0u;
@@ -1949,7 +1947,9 @@ void War3UpdateSemanticReplayInputDiagnostics(War3FrameScene& scene) {
       bool isBlocker = false;
       if (caster.rawcode != 0u && IsLosBlockerFourCc(caster.rawcode)) {
         isBlocker = true;
-      } else {
+      } else if (
+          dxvk::war3::internal::
+              kPathBlockerDrawTimeSweepHandleFallbackEnabled) {
         // rawcode 缺失：用 jHandle/batchHandle 走 widget cache 兜底。
         const uint32_t handle =
             caster.jHandle != 0u ? caster.jHandle : caster.batchHandle;
@@ -4440,7 +4440,7 @@ bool War3PublishSemanticSceneBypassCandidate(
   return registered;
 }
 
-uint64_t War3BuildShadowSemanticIdentityHash(
+[[maybe_unused]] uint64_t War3BuildShadowSemanticIdentityHash(
     const dxvk::War3ShadowSemanticContext& semantic) {
   uint64_t hash = bit::fnv1a_init();
   if (semantic.modelKey != 0u) {
@@ -4469,6 +4469,28 @@ uint64_t War3BuildShadowSemanticIdentityHash(
                          reinterpret_cast<uintptr_t>(semantic.sceneNode));
   hash = bit::fnv1a_iter(hash,
                          reinterpret_cast<uintptr_t>(semantic.renderablePart));
+  return hash;
+}
+
+uint64_t War3BuildShadowStaticPersistentSourceHash(
+    const dxvk::War3ShadowSemanticContext& semantic) {
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, semantic.modelKey);
+  hash = bit::fnv1a_iter(
+      hash, reinterpret_cast<uintptr_t>(semantic.modelResourcePtr));
+  hash = bit::fnv1a_iter(
+      hash, reinterpret_cast<uintptr_t>(semantic.runtimeModelPtr));
+  hash = bit::fnv1a_iter(hash, uint64_t(semantic.rawcode));
+  hash = bit::fnv1a_iter(hash, uint64_t(semantic.jHandle));
+  hash = bit::fnv1a_iter(
+      hash, reinterpret_cast<uintptr_t>(semantic.worldObjectEntry));
+  hash = bit::fnv1a_iter(hash,
+                         reinterpret_cast<uintptr_t>(semantic.sceneNode));
+  hash = bit::fnv1a_iter(hash,
+                         reinterpret_cast<uintptr_t>(semantic.renderablePart));
+  hash = bit::fnv1a_iter(hash, uint32_t(semantic.objectKind));
+  hash = bit::fnv1a_iter(hash, uint32_t(semantic.tag));
+  hash = bit::fnv1a_iter(hash, uint32_t(semantic.stage));
   return hash;
 }
 
@@ -4609,6 +4631,138 @@ inline bool War3ShadowIsLosBlockerByWidgetPtr(void* widgetPtr,
   dxvk::war3::hooks::NoteWidgetIdentityFromDrawcall(widgetPtr, rawcode,
                                                     jHandleForCache);
   return IsLosBlockerFourCc(rawcode);
+}
+
+inline bool War3AnonymousRigidMarkerGeometryFits(uint32_t vertexCount,
+                                                 uint32_t indexCount) {
+  if (vertexCount == 0u ||
+      vertexCount >
+          dxvk::war3::internal::kPathBlockerAnonymousRigidMarkerMaxVertices) {
+    return false;
+  }
+  return indexCount == 0u ||
+         indexCount <=
+             dxvk::war3::internal::kPathBlockerAnonymousRigidMarkerMaxIndices;
+}
+
+inline bool War3SemanticContextHasDynamicPoseEvidence(
+    const War3ShadowSemanticContext& semantic) {
+  return semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
+         semantic.poseMatrixCount != 0u || semantic.poseMatrixHash != 0u;
+}
+
+inline bool War3SemanticContextHasIdentityOrResourceEvidence(
+    const War3ShadowSemanticContext& semantic) {
+  // Anonymous path-blocker fallback must stay very narrow: any resolved object
+  // or model resource means this may be a legitimate visible doodad.
+  return semantic.object != nullptr || semantic.worldObjectEntry != nullptr ||
+         semantic.jHandle != 0u || semantic.rawcode != 0u ||
+         semantic.runtimeModelPtr != nullptr ||
+         semantic.modelResourcePtr != nullptr || semantic.modelKey != 0u;
+}
+
+inline bool War3SemanticContextHasPersistentGeometryIdentity(
+    const War3ShadowSemanticContext& semantic) {
+  return semantic.renderablePart != nullptr || semantic.sceneNode != nullptr ||
+         semantic.worldObjectEntry != nullptr ||
+         semantic.runtimeModelPtr != nullptr ||
+         semantic.modelResourcePtr != nullptr || semantic.modelKey != 0u ||
+         semantic.jHandle != 0u || semantic.rawcode != 0u;
+}
+
+inline bool War3SemanticContextHasPersistentGeometrySubobjectIdentity(
+    const War3ShadowSemanticContext& semantic) {
+  return semantic.renderablePart != nullptr || semantic.sceneNode != nullptr ||
+         semantic.runtimeModelPtr != nullptr ||
+         semantic.modelResourcePtr != nullptr || semantic.modelKey != 0u;
+}
+
+inline bool War3SemanticContextHasDynamicUnitObjectEvidence(
+    const War3ShadowSemanticContext& semantic) {
+  const bool unitRenderLane =
+      semantic.tag == War3BatchTag::WorldObjects ||
+      semantic.tag == War3BatchTag::SelectionOverlay ||
+      semantic.stage == 11;
+
+  // For static VB persistence, a model resource is not unit identity. Bridges
+  // and ramps can have a stable CModel/model key/rawcode while being rigid
+  // terrain/decor geometry.
+  if (unitRenderLane &&
+      (semantic.jHandle != 0u || semantic.rawcode != 0u ||
+       semantic.runtimeModelPtr != nullptr ||
+       semantic.worldObjectEntry != nullptr || semantic.sceneNode != nullptr)) {
+    return true;
+  }
+
+  if (semantic.object != nullptr) {
+    if (semantic.object->unitPtr != nullptr ||
+        semantic.object->agentPtr != nullptr) {
+      return true;
+    }
+    if (semantic.object->groupIdx == 0 &&
+        semantic.object->kind == dxvk::war3::render::ObjectKind::Unit) {
+      return true;
+    }
+    if (semantic.object->kind == dxvk::war3::render::ObjectKind::Unit &&
+        unitRenderLane &&
+        (semantic.object->jHandle != 0u || semantic.object->rawcode != 0u)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+inline bool War3LegacyDrawIsAnonymousRigidMarkerCandidate(
+    const War3ShadowCasterDraw& draw,
+    const War3ShadowSemanticContext& semantic) {
+  if (!dxvk::war3::internal::kPathBlockerAnonymousRigidMarkerGateEnabled)
+    return false;
+
+  const bool terrainOrDecoration =
+      draw.category == War3RenderState::StageCategory::Terrain ||
+      draw.batchTag == War3BatchTag::Terrain ||
+      draw.batchTag == War3BatchTag::Decorations;
+  if (!terrainOrDecoration)
+    return false;
+
+  if (draw.rawcode != 0u || draw.jHandle != 0u || draw.batchHandle != 0u ||
+      War3SemanticContextHasIdentityOrResourceEvidence(semantic)) {
+    return false;
+  }
+  if (draw.vertexBlendEnabled || draw.vertexBlendIndexed ||
+      War3SemanticContextHasDynamicPoseEvidence(semantic)) {
+    return false;
+  }
+  if (draw.objectKind !=
+          static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unknown) &&
+      draw.objectKind !=
+          static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit)) {
+    return false;
+  }
+
+  return War3AnonymousRigidMarkerGeometryFits(draw.numVertices,
+                                              draw.indexCount);
+}
+
+inline void NoteAnonymousRigidMarkerRejectLog(
+    const War3ShadowCasterDraw& draw, const char* via) {
+  if (via == nullptr)
+    return;
+  static std::atomic<uint32_t> s_logCount{0};
+  const uint32_t logIdx =
+      s_logCount.fetch_add(1u, std::memory_order_relaxed);
+  if (logIdx >= 24u)
+    return;
+
+  char buf[240];
+  snprintf(buf, sizeof(buf),
+           "DXVK War3Hook[Shadow]: PATH BLOCKER REJECT #%u rawcode=0x00000000 "
+           "(anon) jHandle=0x0 via=%s kind=%u cat=%d tag=%d vtx=%u idx=%u",
+           logIdx + 1u, via, unsigned(draw.objectKind), int(draw.category),
+           int(draw.batchTag), unsigned(draw.numVertices),
+           unsigned(draw.indexCount));
+  ::dxvk::Logger::info(buf);
 }
 
 // 统一 packet 级 path blocker 判定（覆盖 rawcode / jHandle / widget 直读三通道）。
@@ -9727,7 +9881,7 @@ bool D3D9DeviceEx::War3CanPromoteShadowPersistentGeometry(
     const Rc<DxvkBuffer> &posStorage,
     const Rc<DxvkBuffer> &blendStorage,
     const Rc<DxvkBuffer> &indexStorage) const {
-  if (!semantic.HasStableIdentity())
+  if (!War3SemanticContextHasPersistentGeometryIdentity(semantic))
     return false;
   if (!(mode == War3ShadowReplayMode::FixedWorld ||
         mode == War3ShadowReplayMode::PaletteSkinnedFF)) {
@@ -9739,14 +9893,29 @@ bool D3D9DeviceEx::War3CanPromoteShadowPersistentGeometry(
   if (mode == War3ShadowReplayMode::PaletteSkinnedFF)
     return false;
   using dxvk::war3::render::ObjectKind;
-  const bool poseDrivenObject =
-      semantic.runtimeModelPtr != nullptr || semantic.hasPoseTransform ||
-      semantic.poseFromSpriteFrame || semantic.poseMatrixCount != 0u;
+  const bool semanticHasDynamicPose =
+      War3SemanticContextHasDynamicPoseEvidence(semantic);
+  const bool unitlessRigidStatic =
+      dxvk::war3::internal::
+          kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled &&
+      semantic.objectKind == ObjectKind::Unit && !semanticHasDynamicPose &&
+      !War3SemanticContextHasDynamicUnitObjectEvidence(semantic);
+  const bool genericRigidStaticWorldObject =
+      !semanticHasDynamicPose &&
+      !War3SemanticContextHasDynamicUnitObjectEvidence(semantic) &&
+      (semantic.objectKind == ObjectKind::Item ||
+       semantic.objectKind == ObjectKind::Unknown);
+  const bool staticWorldObject =
+      semantic.objectKind == ObjectKind::Building ||
+      semantic.objectKind == ObjectKind::Destructible ||
+      semantic.objectKind == ObjectKind::Item || unitlessRigidStatic ||
+      genericRigidStaticWorldObject;
+  const bool poseDrivenObject = semanticHasDynamicPose;
   const bool runtimeAnimatedObject =
       poseDrivenObject &&
       semantic.objectKind != ObjectKind::Building &&
       semantic.objectKind != ObjectKind::Destructible;
-  if (semantic.objectKind == ObjectKind::Unit ||
+  if ((semantic.objectKind == ObjectKind::Unit && !unitlessRigidStatic) ||
       semantic.objectKind == ObjectKind::Effect || runtimeAnimatedObject)
     return false;
   if (posStorage == nullptr)
@@ -9766,7 +9935,16 @@ bool D3D9DeviceEx::War3CanPromoteShadowPersistentGeometry(
     switch (semantic.objectKind) {
     case ObjectKind::Building:
     case ObjectKind::Destructible:
+    case ObjectKind::Item:
       break;
+    case ObjectKind::Unit:
+      if (unitlessRigidStatic)
+        break;
+      return false;
+    case ObjectKind::Unknown:
+      if (genericRigidStaticWorldObject)
+        break;
+      return false;
     default:
       return false;
     }
@@ -9776,9 +9954,7 @@ bool D3D9DeviceEx::War3CanPromoteShadowPersistentGeometry(
       dynamicSysmemVBOs || dynamicSysmemIBO || posDynamic || blendDynamic ||
       ibDynamic;
   const bool allowDynamicSourceForStaticWorldObject =
-      objectCaster &&
-      (semantic.objectKind == dxvk::war3::render::ObjectKind::Building ||
-       semantic.objectKind == dxvk::war3::render::ObjectKind::Destructible);
+      objectCaster && staticWorldObject;
 
   if (dynamicSource && !allowDynamicSourceForStaticWorldObject)
     return false;
@@ -18212,13 +18388,13 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     for (auto it = m_war3DrawTimeVBCache.begin();
          it != m_war3DrawTimeVBCache.end();) {
       const auto &e = it->second;
-      const uint64_t age = (m_war3ShadowPersistentFrameSerial >= e.frameSerial)
-                               ? (m_war3ShadowPersistentFrameSerial -
-                                  e.frameSerial)
-                               : 0u;
       if (e.isStaticGeometry) {
         // 静态几何：仅在长期闲置（约 30 分钟）时回收，否则常驻。
-        if (age > staticMaxIdle) {
+        const uint64_t idleAge =
+            (m_war3ShadowPersistentFrameSerial >= e.lastAccessFrameSerial)
+                ? (m_war3ShadowPersistentFrameSerial - e.lastAccessFrameSerial)
+                : 0u;
+        if (idleAge > staticMaxIdle) {
           it = m_war3DrawTimeVBCache.erase(it);
           continue;
         }
@@ -24246,6 +24422,37 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheRejectInvalidRange++;
           break;
         }
+        if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+            pathBlockerRawcode == 0u &&
+            dxvk::war3::internal::
+                kPathBlockerAnonymousRigidMarkerGateEnabled) {
+          const bool anonymousTerrainMarker =
+              earlyTerrainDoodadCaster || earlyTag == War3BatchTag::Decorations;
+          const bool unitPollutedOrUnknown =
+              semantic.objectKind == dxvk::war3::render::ObjectKind::Unknown ||
+              semantic.objectKind == dxvk::war3::render::ObjectKind::Unit;
+          const bool noUnitIdentity =
+              !War3SemanticContextHasIdentityOrResourceEvidence(semantic);
+          const bool noDynamicPose =
+              !War3SemanticContextHasDynamicPoseEvidence(semantic);
+          const DWORD earlyVbState = m_state.renderStates[D3DRS_VERTEXBLEND];
+          const bool earlyVbIndexed =
+              (m_state.renderStates[D3DRS_INDEXEDVERTEXBLENDENABLE] != FALSE);
+          const bool earlyVertexBlendEnabled =
+              (earlyVbState != D3DVBF_DISABLE || earlyVbIndexed) &&
+              !(earlyVbState == D3DVBF_0WEIGHTS && !earlyVbIndexed);
+          const uint32_t markerIndexCount = indexed ? CountVal : 0u;
+          if (anonymousTerrainMarker && unitPollutedOrUnknown &&
+              noUnitIdentity && noDynamicPose &&
+              !earlyVertexBlendEnabled && !earlyVbIndexed &&
+              War3AnonymousRigidMarkerGeometryFits(vRangeCount,
+                                                   markerIndexCount)) {
+            m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+            m_war3Scene.shadowStats
+                .semanticSceneRejectedPathBlockerEarlyBypassCount++;
+            break;
+          }
+        }
         const VkDeviceSize posSrcOffset =
             posSlice.offset() +
             VkDeviceSize(vRangeStart) * VkDeviceSize(posStride);
@@ -24707,18 +24914,27 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // GPU buffer 被释放 → 再次进入视野必须重新 createBuffer(vkAllocateMemory
         // 同步阻塞主线程) → 这就是用户报告的"看到桥/斜坡卡，离开再回来又卡"。
         //
-        // 新逻辑：静态几何 = **非动态单位的 rigid 几何**。判定标准：
-        //   - 不是 Unit（Unit 是骨骼动画对象，pose 每帧变，绝不能常驻）；
-        //   - 没有 runtime pose / sprite pose / pose palette（再次排除动态对象）。
-        // 满足上述即视为静态（顶点本地空间固定 + worldMatrix 固定），离开视野
-        // 后常驻、再次进入 O(1) 复用。桥/斜坡/建筑/装饰物/可破坏物全部覆盖。
+        // 新逻辑：静态几何 = **没有动态姿态证据的 rigid 几何**。
+        // 注意：实机日志显示桥/斜坡/阻断器会被污染成 ObjectKind::Unit，
+        // 但同时没有 unit/rawcode/handle/runtime pose。若继续把这种匿名
+        // Unit 当动态单位，它会按 16 帧 TTL 回收，导致离开视野后再次进入
+        // 时重复 createBuffer。真正的动态单位必须有稳定单位身份或 pose。
         const bool semanticHasDynamicPose =
-            semantic.runtimeModelPtr != nullptr ||
-            semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
-            semantic.poseMatrixCount != 0u;
+            War3SemanticContextHasDynamicPoseEvidence(semantic);
+        const bool unitKindWithIdentity =
+            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+            War3SemanticContextHasDynamicUnitObjectEvidence(semantic);
+        const bool unitKindWithoutIdentity =
+            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+            !unitKindWithIdentity && !semanticHasDynamicPose;
+        const bool treatUnitlessRigidAsStatic =
+            dxvk::war3::internal::
+                kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled &&
+            unitKindWithoutIdentity;
         const bool isDynamicUnit =
-            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit ||
-            semanticHasDynamicPose;
+            semanticHasDynamicPose ||
+            (semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+             !treatUnitlessRigidAsStatic);
         entry.isStaticGeometry =
             dxvk::war3::internal::kShadowDrawTimeVBCacheStaticPersistEnabled &&
             !isDynamicUnit;
@@ -25366,11 +25582,26 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       currentObj && currentObj->kind != dxvk::war3::render::ObjectKind::Unknown
           ? static_cast<uint8_t>(currentObj->kind)
           : static_cast<uint8_t>(semantic.objectKind);
+  const bool legacyHasDynamicPose =
+      War3SemanticContextHasDynamicPoseEvidence(semantic);
+  const bool legacyHasDynamicUnitObjectEvidence =
+      War3SemanticContextHasDynamicUnitObjectEvidence(semantic);
+  const bool legacyUnitKindWithoutIdentity =
+      (resolvedObjectKind ==
+           static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit) ||
+       semantic.objectKind == dxvk::war3::render::ObjectKind::Unit) &&
+      !legacyHasDynamicPose &&
+      !legacyHasDynamicUnitObjectEvidence;
+  const bool treatLegacyUnitlessRigidAsStatic =
+      dxvk::war3::internal::
+          kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled &&
+      legacyUnitKindWithoutIdentity;
   const bool forceFreezeUnitLikeGeometry =
-      resolvedObjectKind ==
-          static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit) ||
+      (resolvedObjectKind ==
+           static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit) &&
+       !treatLegacyUnitlessRigidAsStatic) ||
       ((cat == War3RenderState::StageCategory::WorldObject) && stage == 11) ||
-      (semantic.runtimeModelPtr != nullptr &&
+      (legacyHasDynamicPose && semantic.runtimeModelPtr != nullptr &&
        (objectCaster ||
         semantic.objectKind == dxvk::war3::render::ObjectKind::Unit)) ||
       ((cat == War3RenderState::StageCategory::WorldObject) &&
@@ -25385,14 +25616,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   const bool forceFreezeUnitLikeOrHint = forceFreezeUnitLikeGeometry ||
                                          nativeHintUnitLike;
   const bool semanticSceneUnitLikeCandidate =
-      resolvedObjectKind ==
-          static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit) ||
-      semantic.objectKind == dxvk::war3::render::ObjectKind::Unit ||
+      (resolvedObjectKind ==
+           static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit) &&
+       !treatLegacyUnitlessRigidAsStatic) ||
+      (semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+       !treatLegacyUnitlessRigidAsStatic) ||
       nativeHintUnitLike ||
       (semantic.runtimeModelPtr != nullptr &&
+       legacyHasDynamicUnitObjectEvidence &&
        (objectCaster || vertexBlendEnabled || vbIndexed || stage == 11 ||
-        semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
-        semantic.poseMatrixCount != 0u));
+        legacyHasDynamicPose));
   const bool unitLikeObject = semanticSceneUnitLikeCandidate;
   const bool semanticSceneOwnsUnitCapture =
       War3SemanticConsumerEnabled() &&
@@ -25403,8 +25636,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       semanticSceneUnitLikeCandidate &&
       (objectCaster || stage == 11 || nativeHintUnitLike ||
        vertexBlendEnabled || vbIndexed || semantic.runtimeModelPtr != nullptr ||
-       semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
-       semantic.poseMatrixCount != 0u);
+       legacyHasDynamicPose);
   // ===== AlphaTest lane: stash diffuse/UV/alphaRef payload =====
   //
   // 目的：把 draw-time 可见的 alpha-test 资源按对象身份 stash 到进程级 cache，
@@ -25575,9 +25807,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     return;
   }
   const bool poseDrivenOrVertexBlendGeometry =
-      vertexBlendEnabled || vbIndexed || semantic.runtimeModelPtr != nullptr ||
-      semantic.hasPoseTransform || semantic.poseFromSpriteFrame ||
-      semantic.poseMatrixCount != 0u;
+      vertexBlendEnabled || vbIndexed ||
+      War3SemanticContextHasDynamicPoseEvidence(semantic);
   const Matrix4 currentWorldMatrix =
       m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
   auto matrixTranslationLenSq = [](const Matrix4 &m) {
@@ -25638,7 +25869,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           bit::fnv1a_iter(m_war3Scene.shadowStats.dynamicPoseSignature, hash);
   };
 
-  auto finalizeShadowDrawCommon = [&](War3ShadowCasterDraw &draw) {
+  auto finalizeShadowDrawCommon = [&](War3ShadowCasterDraw &draw) -> bool {
     draw.category = cat;
     draw.batchTag = (execTag != War3BatchTag::Unknown) ? execTag : tag;
     draw.batchHandle = batchHandle;
@@ -25647,7 +25878,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.rawcode = semantic.rawcode != 0u
                        ? semantic.rawcode
                        : (pathBlockObj != nullptr ? pathBlockObj->rawcode : 0u);
-    draw.jHandle = batchHandle;
+    draw.jHandle = semantic.jHandle != 0u ? semantic.jHandle : batchHandle;
 
     // 2026-05-31 根因修复（legacy 路径）：rawcode 仍为 0 时，从 semantic 的
     // worldObjectEntry / unitPtr widget 指针直读 +0x0C(magic)/+0x30(rawcode)。
@@ -25659,6 +25890,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       bool isBlocker =
           draw.rawcode != 0u && IsLosBlockerFourCc(draw.rawcode);
       if (!isBlocker && draw.rawcode == 0u) {
+        if (War3ShadowIsLosBlockerByJHandleFallback(draw.jHandle)) {
+          isBlocker = true;
+        }
+      }
+      if (!isBlocker && draw.rawcode == 0u) {
         void* widgetCandidate = semantic.worldObjectEntry;
         if (widgetCandidate == nullptr && semantic.object != nullptr)
           widgetCandidate = semantic.object->unitPtr;
@@ -25667,17 +25903,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           isBlocker = true;
         }
       }
+      if (!isBlocker &&
+          War3LegacyDrawIsAnonymousRigidMarkerCandidate(draw, semantic)) {
+        isBlocker = true;
+        NoteAnonymousRigidMarkerRejectLog(draw, "LegacyCapture/AnonymousRigid");
+      }
       if (isBlocker) {
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerLegacyCaptureCount++;
+        NotePathBlockerRejectLog(draw.rawcode, draw.jHandle,
+                                  "LegacyCapture/Finalize");
         draw.positionStorage = nullptr;
         draw.indexStorage = nullptr;
         draw.indexCount = 0u;
         draw.vertexCount = 0u;
         draw.numVertices = 0u;
         draw.boundsRadius = 0.0f;
-        return;
+        return false;
       }
     }
 
@@ -25699,7 +25942,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       if (hasNativeHint && nativeHint.radiusHint > baseRadius)
         baseRadius = nativeHint.radiusHint;
       draw.boundsRadius = baseRadius * War3SemanticBoundsMaxScale(*boundsMatrix);
-      return;
+      return true;
     }
 
     if (draw.category == War3RenderState::StageCategory::WorldObject ||
@@ -25753,6 +25996,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         draw.boundsRadius = baseRadius * maxScale;
       }
     }
+    return true;
   };
 
   auto tryCaptureUpperLayerShadow = [&]() -> bool {
@@ -26058,7 +26302,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       draw.uvInfo = geometry->uvInfo;
     }
 
-    finalizeShadowDrawCommon(draw);
+    if (!finalizeShadowDrawCommon(draw))
+      return true;
 
     War3ShadowInstanceRef instance = {};
     instance.geometryId = geometryId;
@@ -26385,7 +26630,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
   War3PersistentRejectReason persistentRejectReason =
       War3PersistentRejectReason::None;
-  if (!semantic.HasStableIdentity()) {
+  if (!War3SemanticContextHasPersistentGeometryIdentity(semantic)) {
     persistentRejectReason = War3PersistentRejectReason::NoIdentity;
   } else if (!(replayMode == War3ShadowReplayMode::FixedWorld ||
                replayMode == War3ShadowReplayMode::PaletteSkinnedFF)) {
@@ -26437,7 +26682,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     uint64_t sourceHash = bit::fnv1a_init();
     if (dynamicPersistentSource) {
       sourceHash = bit::fnv1a_iter(sourceHash,
-                                   War3BuildShadowSemanticIdentityHash(semantic));
+          War3BuildShadowStaticPersistentSourceHash(semantic));
       sourceHash = bit::fnv1a_iter(
           sourceHash,
           reinterpret_cast<uintptr_t>(GetCommonTexture(m_state.textures[0])));
@@ -26462,14 +26707,18 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     // dynamic/per-draw upload 往往只是在大 ring/upload buffer 中换了一套
     // 打包偏移；真正的模型/子网格并没有变。把这些“偏移类 draw 参数”塞进
     // key 会导致相同单位/相同 geoset 永远 miss，persistent pool 很快被
-    // 新 key 灌满却一个 hit 都没有。
+    // 新 key 灌满却一个 hit 都没有。但只有 rawcode/jHandle 的弱身份不够区分
+    // 同模型多子片，必须保留 offsets 防止跨子网格串用。
+    const bool normalizeDynamicDrawOffsets =
+        dynamicPersistentSource &&
+        War3SemanticContextHasPersistentGeometrySubobjectIdentity(semantic);
     layoutHash = bit::fnv1a_iter(
-        layoutHash, uint32_t(dynamicPersistentSource ? 0u : StartVal));
+        layoutHash, uint32_t(normalizeDynamicDrawOffsets ? 0u : StartVal));
     layoutHash = bit::fnv1a_iter(
-        layoutHash, uint32_t(dynamicPersistentSource ? 0u : MinVertexIndex));
+        layoutHash, uint32_t(normalizeDynamicDrawOffsets ? 0u : MinVertexIndex));
     layoutHash = bit::fnv1a_iter(layoutHash, uint32_t(NumVertices));
     layoutHash = bit::fnv1a_iter(
-        layoutHash, uint32_t(dynamicPersistentSource ? 0u : BaseVertexIndex));
+        layoutHash, uint32_t(normalizeDynamicDrawOffsets ? 0u : BaseVertexIndex));
     layoutHash = bit::fnv1a_iter(layoutHash, uint32_t(vbCount));
     layoutHash = bit::fnv1a_iter(layoutHash, uint32_t(vbIndexed ? 1u : 0u));
     layoutHash = bit::fnv1a_iter(layoutHash, uint32_t(blendBinding));
@@ -26658,7 +26907,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
       }
 
-      finalizeShadowDrawCommon(compatDraw);
+      if (!finalizeShadowDrawCommon(compatDraw))
+        return;
       instance.boundsCenter = compatDraw.boundsCenter;
       instance.boundsRadius = compatDraw.boundsRadius;
 
@@ -27295,7 +27545,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   draw.depthWriteEnabled = zWriteEnabled;
   draw.depthTestEnabled = zTestEnabled;
   draw.additiveBlend = additiveBlend;
-  finalizeShadowDrawCommon(draw);
+  if (!finalizeShadowDrawCommon(draw))
+    return;
   if (forceFreezeFallbackWorldGeometry) {
     m_war3Scene.shadowStats.forcedFallbackWorldFreezeCount++;
   }

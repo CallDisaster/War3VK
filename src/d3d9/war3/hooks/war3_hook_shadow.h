@@ -97,17 +97,13 @@ struct ShadowHookAddresses {
   LPVOID shadowRegisterRetFromPointAddr = nullptr;             // 0x76D69A
   LPVOID shadowRegisterRetFromTwoPointsAddr = nullptr;         // 0x76D719
 
-  /** @brief Phase 7.100: TerrainShadow_WriteMaskRegion (静态阴影治理方案 A)。
-   * 30+ 写入路径的最终汇聚点，hook 后按 maskIdx==3 拒绝可干净屏蔽建筑/装饰物
-   * 静态阴影，不影响 fog/LOS/path。详见
-   * docs/plan/overnight_render_paper_2026_05_15/06_fogmask_static_shadow.md §7.1。 */
+  /** @brief Phase 7.100: TerrainShadow_WriteMaskRegion 诊断入口。
+   * 后续实测证明它与 fog/LOS/path/visibility 共享 mask grid，生产默认不再
+   * 整体 reject；仅保留安装/计数能力用于灰度诊断。 */
   LPVOID terrainShadowWriteMaskRegionAddr = nullptr;           // 0x234710
 
-  /** @brief Phase 7.116: TerrainShadow_DispatchToShape - 建筑/装饰物/可破坏物
-   * 静态阴影 footprint 写入的唯一汇聚点。内部走 BoxFastpath/PolyFastpath
-   * 直接修改 mask grid，与 fog/LOS/path/visibility（走 WriteMaskRegion）完全独立。
-   * 5 个 caller 全部是 shadow path，hook 入口直接 return 0 即可干净屏蔽
-   * 所有建筑/装饰物/可破坏物 footprint shadow，不影响其他 mask 写入。 */
+  /** @brief Phase 7.116: TerrainShadow_DispatchToShape 旧实验入口。
+   * 30s 实测 enterCount=0，生产默认已关闭；只在重新 A/B 该假设时安装。 */
   LPVOID terrainShadowDispatchToShapeAddr = nullptr;           // 0x234420
 
   /** @brief 2026-05-30: TerrainShadow_ToggleStaticStampFromObject (0x74DB30)。
@@ -119,11 +115,9 @@ struct ShadowHookAddresses {
    * doodad emitter 贴花阴影注册入口（写 RegisterImage type=4）。 */
   LPVOID terrainShadowToggleEmitterStampAddr = nullptr;           // 0x74DE40
 
-  /** @brief 2026-05-30 根因突破: ListA stamp 渲染消费点。
-   * CWorld_TerrainShadow_Dispatch case0 直接调用这两个函数渲染所有 doodad/
-   * 建筑/path blocker 的地面贴花阴影 stamp，绕过所有现有 hook。mode>=1 时
-   * hook 它们直接 return 即可干净屏蔽魔兽自带可见静态阴影 + path blocker 阴影，
-   * 不影响 fog/LOS/path（独立 FogMask grid）。仅被 Dispatch 调用，hook 安全。 */
+  /** @brief 2026-05-30 ListA 粗拦截旧实验。
+   * Phase 7.143 已证伪：这两个函数会影响悬崖/地形 tile 渲染，生产默认禁用，
+   * 仅保留地址字段和 query 计数作历史诊断。 */
   LPVOID terrainShadowListARenderPreparedGroupsAddr = nullptr;  // 0x7370A0
   LPVOID terrainShadowListARenderAllEntriesAddr = nullptr;      // 0x737110
 };

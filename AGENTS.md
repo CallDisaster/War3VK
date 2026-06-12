@@ -2,8 +2,8 @@
 
 ## 📅 项目当前状态 (Current Status)
 
-**最后更新**: 2026-05-19
-**当前阶段**: 渲染层逆向论文 v1 完成 + 性能优化主线稳定 + 静态阴影治理待落地
+**最后更新**: 2026-06-05
+**当前阶段**: 渲染层逆向论文 v1 完成 + Phase 7.171 static VB idle LRU 修正
 
 ### 📊 逆向论文交付状态（2026-05-19）
 
@@ -27,8 +27,8 @@
 ### 🔧 关键逆向结论
 
 1. **War3 CPU skinning**：War3 1.27a 不使用 D3D9 vertex blending（`D3DRS_VERTEXBLEND=D3DVBF_DISABLE`），所有骨骼变换在 CPU 端完成。draw-time VB capture 是正确的 shadow pose 修复方向。
-2. **Path blocker 视觉残留**：D3D9 CSM 层拦截完整（6 个 shadowCasters 站点全覆盖），残留来自 War3 原生 TerrainShadow 系统的 `WriteMaskRegion` 路径。
-3. **建筑阴影屏蔽**：`WriteMaskRegion` hook 已实现但 `kNativeStaticShadowMaskHideEnabled=false` 导致拦截被编译期移除。**下一步应启用做 A/B 实验。**
+2. **Path blocker 视觉残留**：D3D9 CSM 层以 rawcode / jHandle / widget 直读为主，匿名 Terrain/Decorations rigid marker 只在有阶段上下文的路径兜底；原生 TerrainShadow 残留优先走 `RegisterImage` producer 端治理。
+3. **建筑/原生静态阴影屏蔽**：当前默认链路收敛到 `StaticStampPath + ToggleStaticStampFromObject + RegisterImage` producer 端精确治理；`DispatchToShape/WriteMaskRegion/ListA/ListB` 仍默认关闭，避免历史雾/边界/悬崖地形误伤。
 4. **RenderQueue 排序**：5 级优先级链 = special → transparent → layerState → meshData → 内容比较。
 5. **CSpriteUber dt gate**：4 变体共享 `fabs(dt)>=2*FLT_EPSILON` 门控，dt>0 占 98.79%。
 
@@ -5285,7 +5285,7 @@ f81f99d phase 7.118 BuildShadowReplayDraws thread_local cache
      1. **path blocker 视觉残留**: D3D9 CSM pipeline 拦截已完整覆盖所有 6 个 shadowCasters.emplace_back 站点（EntryGate + EarlyBypass + Producer + FastAppend + LegacyCapture + StaticSupplement）。残留来自 War3 原生 TerrainShadow 系统的 `WriteMaskRegion` 路径（路径 Z），需要 hook `0x6F234710` + `maskIdx==3` 才能彻底屏蔽。
      2. **建筑/装饰物原生静态阴影**: 24 文档 v3 已给出完整方案（CDoodads 路径 A1 注入 a6=6 + CUnit 路径 B1 按 isBldg 拦）。WriteMaskRegion 是建筑阴影的唯一可行拦截点。
      3. **War3 CPU skinning 确认**: War3 1.27a 不使用 D3D9 vertex blending（D3DRS_VERTEXBLEND=D3DVBF_DISABLE），所有骨骼变换在 CPU 端完成。这是 draw-time VB capture 方案的根本依据。
-     4. **WriteMaskRegion hook 现状**: hook 已完整实现（war3_hook_shadow.cpp:972-1212），包含 caller-aware + maskIdx==3 + widget+0x60 flag 三种拦截路径。但 `kNativeStaticShadowMaskHideEnabled=false` 和 `kNativeStaticShadowHideBuildingFootprintEnabled=false` 导致所有拦截被 `if constexpr(false)` 编译期移除。唯一活跃的是 `DispatchToShape` 拦截（`kNativeStaticShadowDispatchToShapeRejectEnabled=true`）。Phase 7.100 的"idx==3 被推翻"结论**可能错误**——探针只采样了少量调用，读到的 6/7/9 可能来自非标准 widget。**下一步应启用 `kNativeStaticShadowMaskHideEnabled=true` 做 A/B 实验。**
+     4. **WriteMaskRegion hook 现状（历史记录，已被 Phase 7.169 回收默认开关）**: hook 已完整实现（war3_hook_shadow.cpp:972-1212），包含 caller-aware + maskIdx==3 + widget+0x60 flag 三种拦截路径。但 `kNativeStaticShadowMaskHideEnabled=false` 和 `kNativeStaticShadowHideBuildingFootprintEnabled=false` 导致所有拦截被 `if constexpr(false)` 编译期移除。该阶段唯一活跃的是 `DispatchToShape` 拦截（当时 `kNativeStaticShadowDispatchToShapeRejectEnabled=true`，现已改回 false）。Phase 7.100 的"idx==3 被推翻"结论**可能错误**——探针只采样了少量调用，读到的 6/7/9 可能来自非标准 widget。**下一步应启用 `kNativeStaticShadowMaskHideEnabled=true` 做 A/B 实验。**
    - **IDA 写回统计**:
      - CGeosetData: 15 rename + 6 comments
      - TerrainShadow: 30 rename + 4 comments
@@ -5866,3 +5866,516 @@ Phase 7.143 hook `0x7370A0 (ListA_RenderPreparedGroups)` + `0x737110
   这是 objectKind 分辨率问题（TLS 污染），但 budget=4 已经从根本上限制了 alloc 突发。
 
 **DLL 已部署**：26910330 bytes @ 12:00。用户可立即测试。
+
+### Phase 7.156 — 三问题理论修复首批落地（2026-06-05）
+
+**本轮约束**：
+- 用户明确要求当前不要启动 War3 / AutoTest（内存紧张、CPU 高），因此本轮只做
+  静态逆向、代码落地与 `ninja -C build32` 编译验证。
+- HEAD 已回退 Phase 7.155 的高风险改动：宽泛匿名小网格规则会误杀真实单位子网格；
+  alloc budget 从 32 降到 4 会造成阴影不完整。因此本轮不能重复这两条路线。
+
+**Problem 1：魔兽原生静态阴影禁用（RegisterImage 上游主控）**：
+- IDA 重新确认 `TerrainShadow_RegisterImageEntry @ 0x6F713250` 是 TerrainShadow
+  图像/stamp entry 的核心注册函数：写 size/pos/type，调用资源解析，资源无效时返回
+  `-1`，成功才设置 active bit 并返回 slot index。
+- IDA 重新确认关键 caller 的 `-1` 契约：
+  - `TerrainShadow_ToggleStaticStampFromObject @ 0x6F74DB30`：`enable` 分支把返回值写入
+    `a2+136`，随后只有 `result != -1` 才设置可见；删除分支同样按 `-1` 跳过。
+  - `TerrainShadow_ToggleEmitterStamp @ 0x6F74DE40`：写 `a3+144`，删除分支按 `-1`
+    跳过。
+  - `RegisterImageEntryWithParams @ 0x6F7290B0`：RegisterImage 返回 `-1` 时直接返回 0。
+- 代码落地：
+  - `war3_hook_shadow.cpp` 新增 `Hook_TerrainShadow_RegisterImageEntry`，用
+    `_ReturnAddress()/__builtin_return_address(0)` 做 8 个 caller 返回地址分桶；
+  - owner 解析尝试 `ownerArg / ownerArg-0x0C / ownerArg-0x10`，按
+    widget magic `0x2B5DB42C` + rawcode + flags `0x10000` 识别 Building/Destructible/Unit；
+  - `war3_shadow_filter_policy.cpp::DecideRegisterImage` 继续作为统一策略入口；
+  - `mode=1` 下启用严格 owner-aware 策略，StaticStamp 与 Building/Destructible owner
+    被拒绝，Selection/MarkOcclusion 保留。
+- 目的：避免再依赖 ListA/ListB/WriteMaskRegion 这类已证明不稳定的下游消费者过滤。
+
+**Problem 2：桥/斜坡首次看见大量卡顿，离开再回来又卡**：
+- 已知实测证据是 `VB ALLOC SPIKE posAlloc=16 idxAlloc=16` 多帧连续，根因是
+  draw-time VB cache 的动态 TTL 回收后再次进视野重复 `createBuffer(vkAllocateMemory)`。
+- 7.155 的 `budget=4` 虽能限流，但会导致阴影逐步缺失/不完整，已回退。
+- 本轮保留 budget=32，改根因分类：
+  - 真实动态单位仍必须有 unit/rawcode/handle/model/pose 等至少一条稳定证据；
+  - 桥/斜坡/装饰物/path blocker 这类被 TLS 污染成 `ObjectKind::Unit`、但完全没有身份
+    与动态 pose 证据的 rigid 几何，改走 static persist；
+  - static persist 只保留 GPU buffer 容量，仍会在可见 draw 时 copy 最新 VB 数据，不会冻结
+    动态姿态。
+- 新开关：`kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled=true`。
+
+**Problem 3：Path blocker 被 ShadowMap 渲染出来**：
+- 7.155 的宽泛规则（`jHandle==0 && widget==nullptr && vtx<=200 && path==Rigid`）
+  已被回退，因为会误杀真实单位子网格。
+- 本轮改成窄门控：
+  - 只在 `PathBlockerHideEnabled` 且 rawcode 仍为 0 时启用；
+  - 只接受 Terrain doodad / Decorations 路径；
+  - 必须没有 unit/handle/rawcode/object/worldObject/model/pose 证据；
+  - 必须是 rigid、非 transparent、无 vertex blend；
+  - 几何上限：`vtx<=200` 且 `idx<=900`。
+- 覆盖点：
+  - `War3PacketIsPathBlocker` 的 packet 统一判定；
+  - draw-time VB cache GPU copy 前 early reject，避免无效 marker 进入 cache；
+  - legacy `finalizeShadowDrawCommon` 兜底，避免绕过 semantic packet 的路径漏网。
+- 新开关：
+  - `kPathBlockerAnonymousRigidMarkerGateEnabled=true`
+  - `kPathBlockerAnonymousRigidMarkerMaxVertices=200`
+  - `kPathBlockerAnonymousRigidMarkerMaxIndices=900`
+
+**验证**：
+- `ninja -C build32` 通过，生成 `src/d3d9/d3d9.dll`。
+- 未运行 AutoTest / 未启动 War3，符合用户本轮约束。
+- 剩余风险：需要用户后续允许实机时验证视觉结果；当前只能证明逆向契约与编译成立。
+
+### Phase 7.157 — RegisterImage 主 key 阻断恢复 + 匿名 marker 误杀面收口（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做 IDA 静态逆向、代码收口与编译验证。
+
+**Path blocker 安全纠偏**：
+- 复审 Phase 7.156 发现：draw-time VB copy 前与 legacy finalize 两处匿名 marker
+  判断都有 Terrain/Decorations 阶段上下文；但 packet 级 `War3PacketIsPathBlocker`
+  没有 stage/tag/category 字段，若在 packet 层使用 “无身份 + rigid + 小几何” 启发式，
+  理论上仍可能复现 Phase 7.155 对真实单位小子网格的误杀。
+- 代码收口：
+  - 移除 packet 层匿名 marker 兜底；
+  - 保留 packet 层 rawcode / jHandle / widget 直读三通道；
+  - 匿名无身份兜底仅保留在具备阶段上下文的 draw-time VB copy 前与 legacy finalize。
+- 结论：Path blocker 的匿名兜底仍覆盖用户日志中的 Terrain/Decorations 漏网形态，
+  但不再在无阶段上下文的 packet 统一 gate 中放大误杀面。
+
+**静态阴影 RegisterImage 策略补强**：
+- IDA xrefs 重新确认 `TerrainShadow_RegisterImageEntry @ 0x6F713250` 共有 8 个关键
+  callsite，地址簿当前返回地址组匹配：
+  `0x7291DC, 0x74DAB6, 0x74DBFA, 0x74DF55, 0x76D44A, 0x76D5A4, 0x76D69A, 0x76D719`。
+- IDA 重新确认：
+  - `RegisterImageEntryWithParams @ 0x6F7290B0` 返回 `-1` 时直接返回 0；
+  - `RegisterImageEntryFromPoint @ 0x6F76D5F0` 与
+    `RegisterImageEntryFromTwoPoints @ 0x6F76D6D0` 都是直接包装 RegisterImage；
+  - 因此在 RegisterImage hook 内返回 `-1` 仍符合 War3 原生失败契约。
+- 根据历史 Phase 7.55/7.56 实测证据恢复 producer 级默认阻断：
+  - `kNativeShadowRegisterBlockShadowTextureKeyWhenMode1=true`
+    （阻断 `ReplaceableTextures\\Shadows\\*`、`Shadow`、`ShadowFlyer`、`BuildingShadow*`）；
+  - `kNativeShadowRegisterBlockWithParamsUberSplatWhenMode1=true`
+    （阻断 WithParams + `*UberSplat` 静态阴影残留主路径）。
+- 保持不启用 ListA/ListB/WriteMaskRegion 消费侧拦截：这些路径历史上存在雾/边界/地形
+  误伤风险，本轮继续优先使用 RegisterImage 上游 producer 主控。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- 仅新增/既有 warning，无阻塞错误；未运行 AutoTest / 未启动 War3。
+
+### Phase 7.158 — RegisterImage 调用约定审计与来源统计补强（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做 IDA 静态逆向、代码补强与编译验证。
+
+**调用约定与 caller 语义复核**：
+- `TerrainShadow_RegisterImageEntry @ 0x6F713250` 是 `__thiscall(this, key, size, pos, ownerArg, typeArg)`；
+  hook 继续使用 32-bit thiscall 常用的 `__fastcall(this, edx, ...)` 包装方式。
+- IDA 反汇编确认：
+  - `0x74DAB1` callsite 注册后立即写 `entry+0x8C`，随后构造
+    `"SelectionCircle" / "ColorFriend"`，属于选择圈/友军颜色标记，应白名单放行；
+  - `0x76D5A4` 附近构造 `"Occlusion" / "MarkColor"`，属于遮挡标记颜色，应白名单放行；
+  - `0x76D400 -> 0x76D445` 是坐标/范围包装器，返回值直接来自 RegisterImage；
+  - `0x76D5F0 -> 0x76D695` 与 `0x76D6D0 -> 0x76D719` 分别是 FromPoint/FromTwoPoints
+    包装器，失败返回 `-1` 的契约仍成立。
+
+**代码补强**：
+- `war3_hook_shadow.cpp`：
+  - RegisterImage 来源统计从 4 桶扩展到完整 8 桶：
+    StaticStamp / EmitterStamp / Selection / Occlusion / WithParams / ObjectBridge /
+    FromPoint / FromTwoPoints / Unknown；
+  - 低频日志字段改为 `srcStatic/srcEmitter/srcSelection/srcOcclusion/...`，
+    后续实机不用 verbose 也能判断白名单和主阻断来源是否命中；
+  - `ResolveShadowRegisterOwnerKind` 增加 `ownerArg <= 0` 早退，避免把负数/空值扩展成
+    巨大地址再做无意义探测。
+
+**IDA 同步**：
+- rename：
+  - `0x6F76D400 -> TerrainShadow_RegisterImageEntry_ObjectBridge`
+  - `0x6F76D5F0 -> TerrainShadow_RegisterImageEntryFromPoint`
+  - `0x6F76D6D0 -> TerrainShadow_RegisterImageEntryFromTwoPoints`
+- comments：
+  - 8 个 RegisterImage callsite 均已补充 source/type/owner/返回契约说明；
+  - 特别标注 `SelectionCircle/ColorFriend` 与 `MarkColor/Occlusion` 为 mode1 白名单来源，
+    不属于阴影本体。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.159 — 桥/斜坡 unitless rigid 静态持久化补强（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做静态复核、代码补强与编译验证。
+
+**桥/斜坡卡顿根因收敛**：
+- 用户描述是“第一次看到桥/斜坡大量卡顿，过一会正常；离开识别后下一次看到又卡”，
+  这更符合 draw-time VB cache 条目按动态 16 帧 TTL 被回收后重新 `createBuffer/copyBuffer`，
+  而不是 Phase 7.95 已修过的 registry/hydration O(N²) 或 matrix writer 高频问题。
+- 复审 Phase 7.156 代码发现：`War3SemanticContextHasUnitIdentityEvidence` 把
+  `modelResourcePtr/modelKey` 也算作“单位身份”。桥/斜坡/升降机这类 rigid world geometry
+  即使没有 `unit/rawcode/handle/runtime pose`，也可能有稳定模型资源；若因此被视为
+  `ObjectKind::Unit + identity`，仍会走动态 TTL，重现“离开视野后再进入重新分配”的尖刺。
+
+**代码补强**：
+- `d3d9_device.cpp` 拆分两类证据函数：
+  - `War3SemanticContextHasIdentityOrResourceEvidence`：仅用于匿名 Path blocker 兜底，继续要求
+    “完全无对象/资源证据”，避免误杀真实可见小型 doodad；
+  - `War3SemanticContextHasDynamicUnitObjectEvidence`：仅用于 VB cache 静态持久化判定，动态单位证据限定为
+    `jHandle/rawcode/runtimeModelPtr`、`RenderObjectInfo.unitPtr/agentPtr/rawcode/jHandle/group0`，
+    或 `WorldObjects/SelectionOverlay` 渲染通道；**不再把纯 model resource 当动态单位身份**。
+- 结果：被污染成 `ObjectKind::Unit` 但无真实单位对象/pose 的桥、斜坡、阻断器 rigid geometry
+  可以落入 `kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled`，离开视野后走静态长 TTL/LRU，
+  再次进入时复用已有 GPU buffer 容量，避免重复分配尖刺。
+- 真正动态单位仍保守留在动态路径：只要有 handle/rawcode/runtime pose、CUnit/agent 指针、
+  group0 或 WorldObjects/SelectionOverlay lane，就不会被当作静态 unitless rigid。
+
+**静态复核**：
+- IDA 再次确认 RegisterImage 8 个 xref：
+  `0x7291D7, 0x74DAB1, 0x74DBF5, 0x74DF50, 0x76D445, 0x76D59F, 0x76D695, 0x76D714`；
+  地址簿保存的是对应返回地址：
+  `0x7291DC, 0x74DAB6, 0x74DBFA, 0x74DF55, 0x76D44A, 0x76D5A4, 0x76D69A, 0x76D719`。
+- `TerrainShadow_RegisterImageEntry @ 0x6F713250` 反汇编确认 `retn 14h`，
+  hook 的 `__fastcall(this, edx, key, size, pos, owner, type)` 包装与 thiscall 契约匹配。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅输出既有 CRLF 工作区提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+**后续实机验证口径（等用户允许测试时）**：
+- 桥/斜坡：观察 `DXVK War3Shadow: VB ALLOC SPIKE` 是否只在首次进入区域出现，
+  离开再回来不应重复出现同等级 pos/idx alloc 尖刺。
+- 静态阴影：观察 `RegisterImage stats` 的 `blocked/srcStatic/srcWithParams/srcFromPoint/srcFromTwoPoints`
+  是否命中；Selection/Occlusion 来源应继续放行。
+- Path blocker：若仍可见，先判断是 D3D9 CSM caster 漏网还是 native RegisterImage/UberSplat 残留，
+  不要重新打开无阶段上下文的 packet 级匿名几何启发式。
+
+### Phase 7.160 — runtimeModelPtr 与动态姿态证据解耦（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做源码复核、代码补强与编译验证。
+
+**复核结论**：
+- `VisibleRenderableRegistry` 与 model hook 里大量路径会从 `sceneNode/meshData/sprite`
+  解析出 `runtimeModelPtr`。这只能证明“有可识别 CModel/资源谱系”，不能单独证明该对象是动态单位。
+- draw-time VB cache 的跨帧消费端有 freshness gate：
+  - semantic skinned consume 只接受 `frameSerial + 8 >= currentFrame`；
+  - fast append / prebuild bypass 只接受当前帧 entry；
+  - 因此 `isStaticGeometry` 主要决定 cache 清理 TTL 与 GPU buffer 容量是否保留，不会让过期动态 pose 无限期直接消费。
+- Phase 7.159 仍把 `runtimeModelPtr` 列为动态单位证据，若桥/斜坡/升降机这类静态 rigid doodad
+  也被解析出 CModel，仍可能继续按 16 帧动态 TTL 被清理，重复进入视野时继续触发分配尖刺。
+
+**代码补强**：
+- `War3SemanticContextHasDynamicPoseEvidence` 改为只看真实 pose 信号：
+  `hasPoseTransform / poseFromSpriteFrame / poseMatrixCount / poseMatrixHash`；
+  不再把 `runtimeModelPtr` alone 当作动态姿态。
+- `War3SemanticContextHasDynamicUnitObjectEvidence` 进一步收窄：
+  - `jHandle/rawcode` 仍是动态单位证据；
+  - `runtimeModelPtr` 只有在 `WorldObjects/SelectionOverlay` lane 中才算动态单位证据；
+  - `RenderObjectInfo.unitPtr/agentPtr/jHandle/rawcode/group0` 仍保护真实 CUnit；
+  - Decorations/Terrain lane 里的纯 CModel rigid geometry 不再因此被排除出静态持久化。
+- `War3LegacyDrawIsAnonymousRigidMarkerCandidate` 改为复用
+  `War3SemanticContextHasIdentityOrResourceEvidence`，确保只要有 object/world/model/resource 任一证据，
+  匿名 Path blocker 兜底就不触碰，避免 runtimeModelPtr 解耦后扩大误杀面。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.161 — legacy fallback 静态持久化与 Path blocker final gate 收口（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做理论复核、源码修正与编译验证。
+
+**桥/斜坡卡顿补充根因**：
+- Phase 7.159/7.160 已修 draw-time VB cache 的 `isStaticGeometry` TTL 分类，但 legacy fallback/persistent 晋升链仍有两处旧动态判定：
+  - `War3CanPromoteShadowPersistentGeometry` 仍把 `ObjectKind::Unit` 一律拒绝；
+  - legacy capture 的 `forceFreezeUnitLikeGeometry / semanticSceneUnitLikeCandidate`
+    仍可能把“被 Unit 污染但无 jHandle/rawcode/pose 的刚性桥/斜坡”拉回 fallback freeze。
+- 这会导致桥/斜坡即使在 draw-time cache 层常驻，仍可能在 legacy fallback 层因不能晋升 persistent 而反复分配/冻结。
+
+**代码补强**：
+- `War3CanPromoteShadowPersistentGeometry` 新增 `unitlessRigidStatic` 分支：
+  - `ObjectKind::Unit` 但无动态 pose、无动态单位身份时允许作为静态 world object 晋升 persistent；
+  - dynamic sysmem source 对这类静态 rigid 也允许进入 static persistent，避免重复 `createBuffer/copyBuffer`。
+- legacy capture 侧同步使用 `legacyHasDynamicPose / legacyHasDynamicUnitObjectEvidence`：
+  - `runtimeModelPtr` 不再单独触发 unit-like force-freeze；
+  - `semanticSceneUnitLikeCandidate` 只有在真实单位身份/pose 存在时才成立；
+  - Decorations/Terrain lane 的纯 CModel rigid geometry 保持静态处理。
+- `finalizeShadowDrawCommon` 从 `void` 改为 `bool`：
+  - rawcode / jHandle fallback / widget 直读 / 匿名 Terrain-Decorations marker 命中 Path blocker 时返回 `false`；
+  - upper-layer、compat persistent、legacy fallback 三个最终 append 点直接停止提交，不再 append 空 `shadowCasters`/`shadowInstances`。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.162 — rawcode/jHandle 污染收窄与 Item/Unknown 静态晋升（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做源码边界复核、代码补强与编译验证。
+
+**桥/斜坡卡顿进一步收敛**：
+- 复核 7.161 后发现一个剩余误判口：`War3SemanticContextHasDynamicUnitObjectEvidence`
+  仍把 `rawcode/jHandle != 0` 一律当动态单位身份。若桥/斜坡/升降机 doodad 拿到了 rawcode，
+  但 batch/tag 被污染成 `ObjectKind::Unit`，它仍会被踢回动态 TTL/fallback 路径。
+- 另一个剩余口：`War3CanPromoteShadowPersistentGeometry` 的 objectCaster 白名单只允许
+  Building/Destructible/UnitlessRigid，导致 `ObjectKind::Item/Unknown` 的桥/斜坡刚性几何仍不能晋升 persistent。
+
+**代码补强**：
+- `War3SemanticContextHasDynamicUnitObjectEvidence` 改为：
+  - `rawcode/jHandle/runtimeModelPtr/worldObjectEntry/sceneNode` 只有在
+    `WorldObjects/SelectionOverlay/stage11` 单位渲染通道才算动态单位证据；
+  - `RenderObjectInfo.unitPtr/agentPtr/group0 Unit` 仍直接保护真实 CUnit；
+  - Terrain/Decorations lane 中的纯 rawcode/model doodad 不再被误判为动态单位。
+- `War3CanPromoteShadowPersistentGeometry` 新增 `genericRigidStaticWorldObject`：
+  - 无动态 pose、无动态单位对象证据的 `ObjectKind::Item/Unknown` 允许作为静态 world object 晋升 persistent；
+  - dynamic sysmem source 对这类静态 rigid 也允许进入 static persistent，避免桥/斜坡反复分配。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.163 — static persistent source-key 安全收口（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做理论闭环、源码补强与编译验证。
+
+**桥/斜坡卡顿风险复核**：
+- Phase 7.162 放宽 `Item/Unknown/unitless rigid` 静态晋升后，dynamic sysmem source
+  路径会走 persistent cache，但旧的 `War3BuildShadowSemanticIdentityHash` 对
+  `modelKey/rawcode` 采用早返回。
+- 这个 key 对“相同 rawcode / 相同模型 key 下有多个 renderablePart/sceneNode 分片”的桥、
+  斜坡、升降机类几何过粗，理论上可能造成 persistent geometry 串用；若为了避开串用又频繁
+  miss，则会回到“每次重新看到就 warm-up 卡顿”的问题形态。
+
+**代码补强**：
+- 新增 `War3SemanticContextHasPersistentGeometryIdentity`，persistent 静态晋升不再接受
+  objectKind-only 的弱身份，必须至少有 `renderablePart/sceneNode/worldObjectEntry/runtimeModelPtr/
+  modelResourcePtr/modelKey/jHandle/rawcode` 之一。
+- 新增 `War3BuildShadowStaticPersistentSourceHash`，dynamic-source static persistent key 改为同时纳入：
+  `modelKey/modelResourcePtr/runtimeModelPtr/rawcode/jHandle/worldObjectEntry/sceneNode/renderablePart/
+  objectKind/tag/stage`。
+- `War3CanPromoteShadowPersistentGeometry` 与 `War3TryCaptureShadowCaster` 的 persistent reject
+  统一使用几何级 identity 准入；保留原 `War3BuildShadowSemanticIdentityHash` 给非本轮路径使用。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.164 — native FourCC 归一化收口（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做源码审计、补丁与编译验证。
+
+**Path blocker 原生侧盲点**：
+- D3D9 CSM 主路径的 `IsLosBlockerFourCc` 已经同时尝试编辑器顺序与内存顺序，并对
+  `YTlc/Ytlc` 这类第二字符大小写差异做归一化。
+- 但 `war3_shadow_filter_policy.cpp::IsBlockedFourCC` 只按一套字节位移归一化，和
+  `kPathBlockerFourCCs` 的编辑器顺序配置不完全对齐。若 RegisterImage owner rawcode 或
+  ShadowProjector rawcode 以另一种字节序/大小写进入，native 侧可能漏掉 path blocker。
+
+**代码补强**：
+- 在 shadow filter policy 内新增本地 `ByteSwapU32 / NormalizeFourCcEditorSecondChar /
+  MatchesBlockedFourCC`。
+- `IsBlockedFourCC` 改为同时检查：
+  - raw direct；
+  - byte-swapped；
+  - direct 的编辑器第二字符大写归一化；
+  - swapped 的编辑器第二字符大写归一化。
+- 这样 RegisterImage owner filter 与 ShadowProjector native 兜底和 D3D9 mesh gate 共享同一
+  “编辑器 fourcc 配置、运行时双字节序识别”的语义。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.165 — weak identity offset 安全收口（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做源码审计、补丁与编译验证。
+
+**桥/斜坡 persistent key 复核**：
+- Phase 7.163 已把 dynamic-source static persistent 的 source hash 加强到几何级身份；
+  但 layoutHash 仍对所有 dynamic source 统一把 `StartVal/MinVertexIndex/BaseVertexIndex` 归零。
+- 该归零对有 `renderablePart/sceneNode/runtimeModelPtr/modelResourcePtr/modelKey` 的桥/斜坡
+  是必要的，否则 per-draw upload ring offset 会让同一子网格永远 miss。
+- 但若某条静态几何只剩 `rawcode/jHandle` 弱身份，offset 归零会降低子网格区分度，理论上仍有
+  同 rawcode 多子片串用风险。
+
+**代码补强**：
+- 新增 `War3SemanticContextHasPersistentGeometrySubobjectIdentity`，只把
+  `renderablePart/sceneNode/runtimeModelPtr/modelResourcePtr/modelKey` 视为可安全归零 draw offsets
+  的子对象/资源级身份。
+- `layoutHash` 的 dynamic offset 归零改为：
+  - 有子对象/资源身份：继续归零 offsets，保证桥/斜坡 stable geoset 命中；
+  - 只有 rawcode/jHandle 弱身份：保留 `StartVal/MinVertexIndex/BaseVertexIndex`，安全区分子片。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.166 — replay FourCC final gate 收口（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做源码审计、补丁与编译验证。
+
+**Path blocker 最终防线盲点**：
+- `d3d9_war3_shadow.cpp::BuildShadowReplayDraws` 是所有 shadow caster 进入 GPU shadow map
+  前的最终收集点，理论上应覆盖所有上游漏判。
+- 复核发现 `War3ReplayNormalizeFourCc` 把第二字符从大写转小写，但权威黑名单
+  `kPathBlockerFourCCs` 保存的是编辑器显示顺序的大写 `YT*`。因此 direct rawcode 可命中，
+  但 `Ytlc/Yt*` 这类大小写变体在最终 replay sweep 可能漏掉。
+
+**代码补强**：
+- `War3ReplayNormalizeFourCc` 改为将第二字符小写归一到大写，与
+  `d3d9_device.cpp::NormalizeFourCcEditorOrder`、`war3_shadow_filter_policy.cpp::IsBlockedFourCC`
+  和 `war3_shadow_renderer_core.cpp::IsBlockedSemanticFourCc` 保持一致。
+- 最终 replay gate 继续同时尝试 direct 与 byte-swapped rawcode；本轮只修大小写方向，不扩大
+  rawcode 黑名单语义。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.167 — replay rawcode final gate 常开（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做源码审计、补丁与编译验证。
+
+**Path blocker 最终防线语义修正**：
+- Phase 7.166 修了 `War3ReplayNormalizeFourCc` 的大小写方向，但继续审计发现：
+  `War3ReplayDrawIsPathBlocker` 在检查 caster 自带 rawcode 前，就先受
+  `kPathBlockerDrawTimeSweepEnabled=false` 门控返回。
+- 这会导致 “append 站点已经填了 rawcode 的 path blocker” 在最终 GPU shadow-map replay
+  收集点无法被兜底拦截；上轮 FourCC 修复实际只有在显式打开 sweep 时才生效。
+- 历史上关闭 sweep 的原因是 rawcode=0 时用 batchHandle → widget cache 反查可能误判真实单位，
+  造成阴影闪烁；这个风险不适用于 caster.rawcode 直判。
+
+**代码补强**：
+- `War3ReplayDrawIsPathBlocker` 改为：
+  - `draw.rawcode` 命中 `kPathBlockerFourCCs` 时无条件返回 true；
+  - 只有 rawcode=0 的 `jHandle/batchHandle → widget cache` 兜底仍受
+    `kPathBlockerDrawTimeSweepEnabled` 门控。
+- 这样最终 replay gate 不再被历史诊断开关整体关掉，同时保留对 batchHandle 抖动风险的隔离。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.168 — RegisterImage owner cache 分类（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做源码审计、补丁与编译验证。
+
+**静态阴影 owner 分类复核**：
+- RegisterImage hook 的 `ResolveShadowRegisterOwnerKind` 原先只用 `CWidget magic + rawcode + flags5C`
+  做本地猜测：
+  - `flags5C & Building` 判 Building；
+  - rawcode 命中 path-blocker FourCC 判 Destructible；
+  - 其他全部退成 Unit。
+- 项目里已经有 `CWidget_RegisterFootprintAndShadowMask` 身份缓存，能基于 handle/agent type/flags
+  识别 `Building / Destructible / Item / Unit`，且正是为 destructible/path-blocker rawcode 缺失问题建立。
+- 如果 RegisterImage owner 指针已在该缓存中，继续只靠本地猜测会让普通 destructible / item owner
+  过滤不够准，影响“魔兽原生静态阴影禁用”的 producer 端覆盖。
+
+**代码补强**：
+- `war3_hook_shadow.cpp` 引入 `war3_hook_widget_identity.h`。
+- `ResolveShadowRegisterOwnerKind` 对 `ownerArg / ownerArg-0x0C / ownerArg-0x10` 三个候选指针先调用
+  `QueryWidgetIdentityByPtr`：
+  - 命中时复用缓存 rawcode；
+  - 按缓存 `ObjectKind` 映射到 `ShadowOwnerKind`；
+  - 缓存未命中或 kind unknown 时继续走旧 magic/rawcode/flags 兜底。
+- 这是增量分类增强，不改变缓存未命中的 RegisterImage 行为。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.169 — DispatchToShape 默认回收与证据链对齐（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做文档/源码审计与保守配置修正。
+
+**审计结论**：
+- 复读历史证据后确认 `TerrainShadow_DispatchToShape` 不应继续作为生产默认静态阴影闸门：
+  - AGENTS Phase 7.116 已记录 30s 实测 `dispatchToShapeEnterCount=0`，hook 装上但无调用；
+  - Phase 7.143 又证明 `ListA_RenderPreparedGroups / ShadowListA_RenderAllEntries` 粗拦截会误伤所有悬崖/地形 tile；
+  - `WriteMaskRegion` / FogMask 路径仍是 fog/LOS/path/visibility 共享 mask grid，不能整体 return。
+- 因此当前默认策略必须保持在已验证更低风险的 producer 端：
+  `StaticStampPath + ToggleStaticStampFromObject + RegisterImage 精确策略`；
+  D3D9 CSM path blocker 则继续依赖 rawcode / jHandle / widget / replay final gate。
+
+**代码修正**：
+- `war3_internal_test_config.h`：
+  - `kNativeStaticShadowDispatchToShapeRejectEnabled=false`
+  - `kNativeStaticShadowDispatchToShapeCallerDiagnostics=false`
+  - `kNativeStaticShadowDispatchToShapeDebugLog=false`
+- `war3_hook_shadow.cpp` 同步注释为“旧实验 hook / 灰度诊断”，不再写“唯一汇聚点”或“默认开启”。
+
+**风险说明**：
+- 这不是宣布静态阴影已彻底解决；只是撤回一个已被实测推翻、且可能误导后续开发的默认开关。
+- 后续若要继续研究静态阴影残留，优先补 producer 早装/预置对象清理证据，或基于 draw call state/texture 做精确识别，不再启用 ListA/WriteMaskRegion 粗拦截。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.170 — Shadow producer 早装补齐（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做安装时机审计、代码补丁与编译验证。
+
+**发现的真实缺口**：
+- AGENTS 历史段落写过 `TryInstallShadowHooksEarly` 已接入 `MainRunner_ENTER`，理论覆盖
+  pre-placed doodad / path blocker 注册。
+- 但源码复核发现 `TryInstallShadowHooksEarly` 实际只早装了
+  `CWidget_RegisterFootprintAndShadowMask` 身份 hook，**没有早装**
+  `ShadowPath_StaticStamp_Toggle`、`TerrainShadow_ToggleStaticStampFromObject`、
+  `TerrainShadow_RegisterImageEntry` 等 producer hook。
+- 结果是地图预置 doodad/path blocker 的 native stamp 可能在 `ActivateWar3Runtime`
+  之前已经写入，producer 端策略来得太晚。这是“静态阴影/path blocker native 残留”
+  的高可信理论原因之一。
+
+**代码修正**：
+- `d3d9_war3_hook.cpp` 新增 `BuildShadowHookAddresses(...)`，常规安装与早装共用同一套
+  Shadow 地址解析，避免字段漂移。
+- `TryInstallShadowHooksEarly` 在 `MainRunner_ENTER / MainRunner_Alt_ENTER` 中：
+  - 先确保 MinHook 初始化；
+  - 校验 `Game.dll` PE 信息；
+  - 继续早装 `WidgetIdentity`；
+  - 随后调用 `InstallShadowHooks(BuildShadowHookAddresses(...))`，让
+    `RegisterImage / StaticStampPath / ToggleStaticStampFromObject / Projector` 等 Shadow 域
+    hook 真正早于主循环原逻辑执行。
+- 常规 `InstallGameHooks` 改用同一 helper，后续重复安装由 `InstallMinHook`
+  的 `MH_ERROR_ALREADY_CREATED / MH_ERROR_ENABLED` 兼容路径兜底。
+- `war3_hook_shadow.h` 同步清理 `WriteMaskRegion / DispatchToShape / ListA` 旧字段注释，
+  明确它们是诊断/旧实验，不再是生产默认治理点。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。
+
+### Phase 7.171 — static VB cache idle LRU 修正（2026-06-05）
+
+**本轮继续遵守约束**：不启动 War3 / AutoTest，只做源码审计、低风险补丁与编译验证。
+
+**桥/斜坡卡顿链路复核**：
+- `m_war3DrawTimeVBCache` 已把无动态姿态/无真实单位身份的 rigid geometry 标为 static，
+  离开视野后不再按 16 帧动态 TTL 删除，回来时可复用已有 GPU buffer 容量，避免重复
+  `createBuffer/vkAllocateMemory`。
+- 继续审计发现 static entry 的“长期闲置回收”虽然注释写的是 idle，但代码实际用
+  `frameSerial` 计算年龄；如果某个桥/斜坡 entry 长时间存在且被持续访问，理论上仍会在
+  达到 `kShadowDrawTimeVBCacheStaticMaxIdleFrames` 后被当作老 entry 回收。
+
+**代码修正**：
+- static cleanup 改为用 `lastAccessFrameSerial` 计算 `idleAge`；
+- 仍保留动态对象的 `frameSerial + DynamicMaxAge` 16 帧 TTL；
+- 字节上限 LRU 仍按 `lastAccessFrameSerial` 淘汰最久未访问的 static entry。
+
+**验证**：
+- `ninja -C build32` 通过并重新链接 `src/d3d9/d3d9.dll`。
+- `git diff --check` 仅有既有 CRLF 提示，无 whitespace error。
+- 未运行 AutoTest / 未启动 War3。

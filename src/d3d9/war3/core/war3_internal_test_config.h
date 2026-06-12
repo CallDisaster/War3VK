@@ -986,15 +986,22 @@ inline bool kPathBlockerHideEnabled = true;   // 隐藏路径阻断器渲染
 // 2026-05-31：draw-time path blocker 最终清扫开关（Phase 7.145/7.147）
 // ========================================================================
 // 这两处 sweep（BuildShadowReplayDraws + War3UpdateSemanticReplayInputDiagnostics）
-// 在所有 consumer 之前，按 caster 的 rawcode / jHandle / batchHandle 做最终
-// path blocker 判定并置空几何。问题：caster.rawcode 在部分帧解析得到、部分帧
-// 为 0；rawcode=0 时走 batchHandle→widget cache 反查，可能把真实单位误判成
-// path blocker → 同一 caster 在"保留 / 置空"之间逐帧抖动 → 高频阴影闪烁。
-//
-// 默认关闭：上游 eligibility/capture 阶段（EntryGate / Producer / FastAppend）
-// 的 path blocker 拦截不受影响，仍然生效（那条链路 caster 还没进 shadowCasters，
-// 不会逐帧抖动）。仅当确认需要 draw-time 兜底且不引入闪烁时再开。
-inline bool kPathBlockerDrawTimeSweepEnabled = false;
+// 在所有 consumer 之前，按 caster 的 rawcode 做最终 path blocker 判定并置空
+// 几何。它覆盖“上游日志已命中 blocker，但同一对象的另一条实例仍漏进 CSM”
+// 这类最终列表漏网。
+inline bool kPathBlockerDrawTimeSweepEnabled = true;
+// rawcode=0 时的 jHandle/batchHandle 兜底历史上会把真实单位误判成 path blocker，
+// 导致同一 caster 在“保留 / 置空”之间逐帧抖动，因此保持显式 opt-in。
+inline bool kPathBlockerDrawTimeSweepHandleFallbackEnabled = false;
+
+// Phase 7.156：匿名 rigid marker 兜底。
+// 最新实机日志显示仍有 rawcode=0 / handle=0 / no-widget 的小型 rigid caster
+// 进入 ShadowMap；它们多出现在 Terrain/Decorations 阶段，且常被污染为
+// ObjectKind::Unit。Phase 7.155 的宽泛 vtx<=200 规则误杀了真实单位子网格，
+// 因此这里仅作为“完全匿名 + rigid + 无稳定单位资源/动态姿态”的最后防线。
+inline constexpr bool kPathBlockerAnonymousRigidMarkerGateEnabled = true;
+inline constexpr uint32_t kPathBlockerAnonymousRigidMarkerMaxVertices = 200u;
+inline constexpr uint32_t kPathBlockerAnonymousRigidMarkerMaxIndices = 900u;
 
 // ========================================================================
 // Phase 7.123：draw-time VB cache 单帧 GPU buffer alloc 预算
@@ -1029,6 +1036,11 @@ inline constexpr bool kShadowDrawTimeVBCacheAllocBudgetEnabled = true;
 // 进入视野时 O(1) 复用（无 createBuffer / 无 copyBuffer）。受总字节上限约束
 // 做 LRU 淘汰，防止超大地图无限增长。
 inline constexpr bool kShadowDrawTimeVBCacheStaticPersistEnabled = true;
+// ObjectKind 被污染为 Unit 但没有 unit/rawcode/handle/runtime pose 的 rigid
+// doodad/bridge/ramp 不应按动态单位 16 帧 TTL 回收；否则离开视野再看到时会
+// 重新 createBuffer，形成用户报告的桥/斜坡首帧卡顿。
+inline constexpr bool kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled =
+    true;
 // 静态几何常驻 cache 的总字节上限（pos+uv+idx 合计）。超过后按
 // lastAccessFrameSerial LRU 淘汰最久未访问的静态 entry。
 // 64 MiB 足够容纳一张大图的全部桥/斜坡/装饰物 VB（典型单 doodad VB 几 KB）。
@@ -1089,32 +1101,22 @@ inline constexpr bool kNativeStaticShadowHideDestructibleFootprintEnabled =
 inline constexpr bool kNativeStaticShadowMaskCallerDiagnostics = false;
 
 // ============================================================================
-// Phase 7.116：DispatchToShape (建筑/装饰物/可破坏物原生静态阴影) 屏蔽
+// Phase 7.116：DispatchToShape 旧实验开关（默认关闭）
 // ============================================================================
-// TerrainShadow_DispatchToShape (Game.dll+0x234420) 是 War3 1.27a 写入建筑物
-// /装饰物/可破坏物预渲染贴花阴影 footprint 的**唯一汇聚点**。内部走
-// BoxFastpath/PolyFastpath 直接修改 mask grid (CFogOfWarMap[11]/[12])。
+// 历史假设：TerrainShadow_DispatchToShape (Game.dll+0x234420) 是建筑/装饰物/
+// 可破坏物 footprint shadow 的独立写入点，可以入口 return 0。
 //
-// 关键性质：与 fog/LOS/path/visibility（这些走 WriteMaskRegion）**完全独立**。
-// 5 个 caller 全部是 shadow path：
-//   - sub_6F21A890 / sub_6F21A9A0 / sub_6F21AA60: widget shadow setup helper
-//     （CWidget shadow flag 设置时调，shadow-only 路径）
-//   - TerrainShadow_RebuildMaskFromObjectLists LABEL_55 (offset 0x234055)：
-//     重建期 SHADOW present + NO_FOG_DIRTY 路径
-//   - TerrainShadow_RebuildMaskFromObjectLists LABEL_88 (offset 0x234325)：
-//     重建期 SHADOW present + FOG_DIRTY 路径
-//
-// 因此 hook 入口直接 return 0 即可干净屏蔽**所有**建筑/装饰物/可破坏物
-// footprint shadow，不影响 fog/LOS/path/visibility 任何子系统。
-//
-// 默认开启。env DXVK_WAR3_STATIC_SHADOW_DISABLE_DISPATCH=0 可恢复（仅调试用）。
-inline constexpr bool kNativeStaticShadowDispatchToShapeRejectEnabled = true;
-// caller-aware 分桶诊断（默认开）：调试时观察 5 个 caller 各自命中频率。
-// Phase 7.116 默认开启以便实测验证 hook 是否被调到（hook 入口固定 enter+1，
-// 但 caller 分桶帮助识别是否真的来自 shadow path）。
-inline constexpr bool kNativeStaticShadowDispatchToShapeCallerDiagnostics = true;
-// 调试日志：前 8 次 reject 写入 dxvk log（默认开第一刀，确认拦截后再关）。
-inline constexpr bool kNativeStaticShadowDispatchToShapeDebugLog = true;
+// 后续实测已经推翻该默认路径：Phase 7.116 记录 30s 内
+// dispatchToShapeEnterCount=0；Phase 7.143 又证明 ListA consumer 粗拦截会误伤
+// 悬崖/地形 tile。当前生产默认不再把 DispatchToShape 当静态阴影解法，只保留
+// 下方 reject/diagnostics 作为灰度实验入口。真正默认治理链路是
+// StaticStampPath + ToggleStaticStampFromObject + RegisterImage 精确策略 + D3D9
+// shadow caster final gate。
+inline constexpr bool kNativeStaticShadowDispatchToShapeRejectEnabled = false;
+// caller-aware 分桶诊断。需要重新验证 DispatchToShape 是否在特定地图触发时再开。
+inline constexpr bool kNativeStaticShadowDispatchToShapeCallerDiagnostics = false;
+// reject 调试日志。仅在上面的 reject 开关开启时有意义。
+inline constexpr bool kNativeStaticShadowDispatchToShapeDebugLog = false;
 // 开启路径阻断器隐藏时，是否强制开启桥接追踪（确保 ShadowCapture 能拿到 rawcode）。
 inline constexpr bool kPathBlockerForceBridgeTrackingEnabled = false;
 // “仅路径阻断器追踪”模式下的组掩码（bit0=group0, bit1=group1 ...）。
@@ -1123,8 +1125,10 @@ inline constexpr uint32_t kPathBlockerTrackingGroupMask = 0x1u;
 // ========================================================================
 // 阴影投影器过滤（建筑阴影拦截）
 // ========================================================================
-// 原生阴影默认模式：0=原样，1=仅雾/边界，2=完全禁用
-inline constexpr uint32_t kNativeShadowDefaultMode = 1;
+// 原生阴影默认模式：0=原样，1=仅雾/边界，2=完全禁用。
+// 2026-06-12：默认回到 0。当前 RegisterImage/StaticStamp 系列拦截会误伤
+// 建筑施工/落地贴图，在没有 owner/key 精确证据前不作为生产默认项启用。
+inline constexpr uint32_t kNativeShadowDefaultMode = 0;
 
 // 当原生阴影模式为“仅雾/边界/禁用”时，是否同步关闭 War3ShadowReceiver（CSM）
 inline constexpr bool kNativeShadowDisableWar3ShadowReceiverWhenMode1 = false;
@@ -1322,10 +1326,10 @@ inline constexpr uint32_t kNativeShadowBlockedCallbackRvasCount =
 // 阴影注册入口拦截（TerrainShadow_RegisterImageEntry）
 // ========================================================================
 // 是否安装注册入口 Hook（上游拦截，优先于 ListA/ListB 渲染末端过滤）
-inline constexpr bool kNativeShadowRegisterImageHookEnabled = false;
+inline constexpr bool kNativeShadowRegisterImageHookEnabled = true;
 
 // mode>=1 时是否拦截 StaticStamp 来源（0x74DB30）注册
-inline constexpr bool kNativeShadowBlockStaticStampRegisterWhenMode1 = false;
+inline constexpr bool kNativeShadowBlockStaticStampRegisterWhenMode1 = true;
 
 // mode>=1 时是否拦截 EmitterStamp 来源注册
 // - 函数入口：0x74DE40
@@ -1337,13 +1341,13 @@ inline constexpr bool kNativeShadowBlockStaticStampRegisterWhenMode1 = false;
 inline constexpr bool kNativeShadowBlockEmitterStampRegisterWhenMode1 = false;
 
 // 注册入口低频统计日志
-inline constexpr bool kNativeShadowRegisterImageStatsLogging = false;
+inline constexpr bool kNativeShadowRegisterImageStatsLogging = true;
 
 // 注册入口详细日志
 inline constexpr bool kNativeShadowRegisterImageVerboseLogging = false;
 
 // RegisterImage 来源分桶统计日志（按返回地址来源）。
-inline constexpr bool kNativeShadowRegisterSourceStatsLogging = false;
+inline constexpr bool kNativeShadowRegisterSourceStatsLogging = true;
 
 // RegisterImage 来源详细日志（高频，默认关闭）。
 inline constexpr bool kNativeShadowRegisterSourceVerboseLogging = false;
@@ -1352,7 +1356,7 @@ inline constexpr bool kNativeShadowRegisterSourceVerboseLogging = false;
 inline constexpr uint32_t kNativeShadowRegisterStatsInterval = 4000;
 
 // mode=1 严格策略开关：启用 owner-aware 决策规则。
-inline constexpr bool kNativeShadowRegisterPolicyStrictMode1 = false;
+inline constexpr bool kNativeShadowRegisterPolicyStrictMode1 = true;
 
 // mode=1 是否直接屏蔽所有 RegisterImage 写入（极限诊断开关）。
 // 用途：验证“可见阴影是否仍走 RegisterImage 路径”。
@@ -1363,17 +1367,19 @@ inline constexpr bool kNativeShadowRegisterBlockAllWhenMode1 = false;
 // 说明：
 // - 该规则用于直接抑制建筑/可破坏物静态阴影主贴图路径；
 // - 比拦截 Splats（地面贴花融合）更贴近“只去阴影”的目标。
-inline constexpr bool kNativeShadowRegisterBlockShadowTextureKeyWhenMode1 = false;
+inline constexpr bool kNativeShadowRegisterBlockShadowTextureKeyWhenMode1 = true;
 
 // mode=1 时是否拦截 WithParams + UberSplat。
 // 说明：
-// - UberSplat 通常用于建筑与地面交界贴花，不等同于阴影本体；
-// - 默认关闭，避免把“贴花融合”当成“阴影”误杀。
+// - 历史实测中静态阴影残留会以 WithParams + Human/Orc/Undead/*UberSplat
+//   形式继续注册；mode1 目标是禁用 War3 原生静态阴影，因此默认阻断。
+// - 如后续实机确认某些地图依赖非阴影 UberSplat 贴花，可单独收窄 key 规则，
+//   不回退 RegisterImage 上游主控。
 inline constexpr bool kNativeShadowRegisterBlockWithParamsUberSplatWhenMode1 =
-    false;
+    true;
 
 // 是否启用 RegisterImage owner 类型过滤（Building/Destructible 精确拦截）。
-inline constexpr bool kNativeShadowRegisterOwnerKindFilterEnabled = false;
+inline constexpr bool kNativeShadowRegisterOwnerKindFilterEnabled = true;
 
 // Unknown owner 是否启用 "argType={0,4} + 建筑样式 key" 兜底拦截。
 // 关闭后 Unknown owner 始终放行（用于回滚 Round3 条件）。

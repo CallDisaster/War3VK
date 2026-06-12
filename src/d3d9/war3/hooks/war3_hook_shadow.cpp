@@ -1,6 +1,7 @@
 // Phase 7.100 marker bump 102042
 #include "war3_hook_shadow.h"
 #include "war3_hook_install_util.h"
+#include "war3_hook_widget_identity.h"
 #include "war3_shadow_filter_policy.h"
 
 #include "../../d3d9_war3_debug.h"
@@ -49,6 +50,8 @@ using ShadowProjectorAddFromObjectFn = int(__fastcall *)(void *, void *, void *,
                                                          int, int);
 using ShadowProjectorAddSimpleFn = int(__fastcall *)(void *, void *, int, int,
                                                      int, int, int, int, int);
+using ShadowRegisterImageEntryFn = int(__fastcall *)(void *, void *, int,
+                                                     void *, void *, int, int);
 using ShadowPathStaticStampToggleFn = void(__fastcall *)(void *, void *, int,
                                                          int);
 
@@ -65,11 +68,21 @@ ShadowProjectorAddFromObjectFn g_trampolineShadowProjectorAddFromObject =
     nullptr;
 ShadowProjectorAddSimpleFn g_originalShadowProjectorAddSimple = nullptr;
 ShadowProjectorAddSimpleFn g_trampolineShadowProjectorAddSimple = nullptr;
+ShadowRegisterImageEntryFn g_originalShadowRegisterImageEntry = nullptr;
+ShadowRegisterImageEntryFn g_trampolineShadowRegisterImageEntry = nullptr;
 ShadowPathStaticStampToggleFn g_originalShadowPathStaticStampToggle = nullptr;
 ShadowPathStaticStampToggleFn g_trampolineShadowPathStaticStampToggle = nullptr;
 uintptr_t g_shadowPathObjectProjectorRuntimeAddr = 0;
 uintptr_t g_shadowPathObjectProjectorJassBridgeAddr = 0;
 uintptr_t g_shadowProjectorSimpleBridgeAddr = 0;
+uintptr_t g_shadowRegisterRetWithParamsAddr = 0;
+uintptr_t g_shadowRegisterRetSelectionCircleAddr = 0;
+uintptr_t g_shadowRegisterRetStaticStampAddr = 0;
+uintptr_t g_shadowRegisterRetEmitterStampAddr = 0;
+uintptr_t g_shadowRegisterRetObjectBridgeAddr = 0;
+uintptr_t g_shadowRegisterRetMarkOcclusionAddr = 0;
+uintptr_t g_shadowRegisterRetFromPointAddr = 0;
+uintptr_t g_shadowRegisterRetFromTwoPointsAddr = 0;
 
 // Phase 7.108：ShadowProjector 永久 atomic 计数器。
 // 这条路径独立于 D3D9 mesh draw（CTerrainUberSplats 系统），
@@ -82,6 +95,17 @@ std::atomic<uint64_t> g_projectorAddFromObjectFourCCMissCount{0};
 std::atomic<uint64_t> g_projectorAddFromObjectBlockedFourCCCount{0};
 std::atomic<uint64_t> g_projectorAddSimpleEnterCount{0};
 std::atomic<uint64_t> g_projectorAddSimpleBlockedCount{0};
+std::atomic<uint64_t> g_registerImageEnterCount{0};
+std::atomic<uint64_t> g_registerImageBlockedCount{0};
+std::atomic<uint64_t> g_registerImageStaticStampCount{0};
+std::atomic<uint64_t> g_registerImageEmitterStampCount{0};
+std::atomic<uint64_t> g_registerImageSelectionCount{0};
+std::atomic<uint64_t> g_registerImageOcclusionCount{0};
+std::atomic<uint64_t> g_registerImageWithParamsCount{0};
+std::atomic<uint64_t> g_registerImageObjectBridgeCount{0};
+std::atomic<uint64_t> g_registerImageFromPointCount{0};
+std::atomic<uint64_t> g_registerImageFromTwoPointsCount{0};
+std::atomic<uint64_t> g_registerImageUnknownSourceCount{0};
 
 // 环形采样：被 reject 的 fourcc 与近期 observed fourcc（前 8 个 unique）。
 std::array<std::atomic<uint32_t>, 8> g_projectorBlockedFourCCSamples{};
@@ -144,6 +168,106 @@ int CallShadowProjectorAddSimpleOriginal(void* a1, void* a2, int arg0, int arg1,
                                               arg4, arg5, arg6);
   }
   return -1;
+}
+
+int CallShadowRegisterImageEntryOriginal(void* thisPtr, int keyPtr,
+                                         void* sizePtr, void* posPtr,
+                                         int ownerArg, int typeArg) {
+  if (g_trampolineShadowRegisterImageEntry) {
+    return g_trampolineShadowRegisterImageEntry(thisPtr, nullptr, keyPtr,
+                                                sizePtr, posPtr, ownerArg,
+                                                typeArg);
+  }
+  if (g_originalShadowRegisterImageEntry) {
+    return g_originalShadowRegisterImageEntry(thisPtr, nullptr, keyPtr,
+                                              sizePtr, posPtr, ownerArg,
+                                              typeArg);
+  }
+  return -1;
+}
+
+ShadowRegisterSource ResolveShadowRegisterSource(uintptr_t retAddr) {
+  if (retAddr == g_shadowRegisterRetStaticStampAddr)
+    return ShadowRegisterSource::StaticStamp;
+  if (retAddr == g_shadowRegisterRetEmitterStampAddr)
+    return ShadowRegisterSource::EmitterStamp;
+  if (retAddr == g_shadowRegisterRetSelectionCircleAddr)
+    return ShadowRegisterSource::SelectionCircleColorFriend;
+  if (retAddr == g_shadowRegisterRetMarkOcclusionAddr)
+    return ShadowRegisterSource::MarkColorOcclusion;
+  if (retAddr == g_shadowRegisterRetWithParamsAddr)
+    return ShadowRegisterSource::WithParams;
+  if (retAddr == g_shadowRegisterRetObjectBridgeAddr)
+    return ShadowRegisterSource::ObjectBridge;
+  if (retAddr == g_shadowRegisterRetFromPointAddr)
+    return ShadowRegisterSource::FromPoint;
+  if (retAddr == g_shadowRegisterRetFromTwoPointsAddr)
+    return ShadowRegisterSource::FromTwoPoints;
+  return ShadowRegisterSource::Unknown;
+}
+
+ShadowOwnerKind ToShadowOwnerKind(dxvk::war3::render::ObjectKind kind) {
+  switch (kind) {
+  case dxvk::war3::render::ObjectKind::Building:
+    return ShadowOwnerKind::Building;
+  case dxvk::war3::render::ObjectKind::Destructible:
+    return ShadowOwnerKind::Destructible;
+  case dxvk::war3::render::ObjectKind::Item:
+    return ShadowOwnerKind::Item;
+  case dxvk::war3::render::ObjectKind::Unit:
+    return ShadowOwnerKind::Unit;
+  default:
+    return ShadowOwnerKind::Unknown;
+  }
+}
+
+ShadowOwnerKind ResolveShadowRegisterOwnerKind(int ownerArg,
+                                               uint32_t& outRawcode) {
+  outRawcode = 0u;
+  if (ownerArg <= 0)
+    return ShadowOwnerKind::Unknown;
+
+  const uintptr_t owner = static_cast<uintptr_t>(ownerArg);
+  const uintptr_t candidates[] = {
+      owner,
+      owner >= 0x0Cu ? owner - 0x0Cu : 0u,
+      owner >= 0x10u ? owner - 0x10u : 0u,
+  };
+
+  for (uintptr_t candidate : candidates) {
+    if (candidate == 0u)
+      continue;
+    dxvk::war3::render::RenderObjectInfo cachedIdentity = {};
+    if (QueryWidgetIdentityByPtr(reinterpret_cast<void*>(candidate),
+                                 cachedIdentity)) {
+      if (cachedIdentity.rawcode != 0u)
+        outRawcode = cachedIdentity.rawcode;
+      const ShadowOwnerKind cachedKind =
+          ToShadowOwnerKind(cachedIdentity.kind);
+      if (cachedKind != ShadowOwnerKind::Unknown)
+        return cachedKind;
+    }
+
+    uint32_t magic = 0u;
+    if (!ReadU32Safe(reinterpret_cast<const void *>(candidate), 0x0Cu, magic) ||
+        magic != 0x2B5DB42Cu) {
+      continue;
+    }
+    uint32_t rawcode = 0u;
+    ReadU32Safe(reinterpret_cast<const void *>(candidate), 0x30u, rawcode);
+    if (rawcode != 0u)
+      outRawcode = rawcode;
+
+    uint32_t flags5C = 0u;
+    ReadU32Safe(reinterpret_cast<const void *>(candidate), 0x5Cu, flags5C);
+    if ((flags5C & 0x10000u) != 0u)
+      return ShadowOwnerKind::Building;
+    if (rawcode != 0u && shadowfilter::IsBlockedFourCC(rawcode))
+      return ShadowOwnerKind::Destructible;
+    return ShadowOwnerKind::Unit;
+  }
+
+  return ShadowOwnerKind::Unknown;
 }
 
 void CallShadowPathStaticStampToggleOriginal(void* thisPtr,
@@ -888,6 +1012,163 @@ int __fastcall Hook_ShadowProjector_Add_Simple(void *a1, void *a2, int arg0,
                                               arg4, arg5, arg6);
 }
 
+int __fastcall Hook_TerrainShadow_RegisterImageEntry(void *thisPtr, void *edx,
+                                                     int keyPtr, void *sizePtr,
+                                                     void *posPtr,
+                                                     int ownerArg,
+                                                     int typeArg) {
+  (void)edx;
+  (void)sizePtr;
+  (void)posPtr;
+
+  g_registerImageEnterCount.fetch_add(1, std::memory_order_relaxed);
+
+  const uint32_t mode = War3RenderState::GetNativeShadowMode();
+#if defined(_MSC_VER)
+  const uintptr_t retAddr = reinterpret_cast<uintptr_t>(_ReturnAddress());
+#elif defined(__GNUC__)
+  const uintptr_t retAddr =
+      reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+#else
+  const uintptr_t retAddr = 0u;
+#endif
+  const uintptr_t gameBase = GetGameDllBase();
+  const uint32_t retRva =
+      (gameBase != 0u && retAddr >= gameBase)
+          ? static_cast<uint32_t>(retAddr - gameBase)
+          : 0u;
+  const ShadowRegisterSource source = ResolveShadowRegisterSource(retAddr);
+  switch (source) {
+  case ShadowRegisterSource::StaticStamp:
+    g_registerImageStaticStampCount.fetch_add(1, std::memory_order_relaxed);
+    break;
+  case ShadowRegisterSource::EmitterStamp:
+    g_registerImageEmitterStampCount.fetch_add(1, std::memory_order_relaxed);
+    break;
+  case ShadowRegisterSource::SelectionCircleColorFriend:
+    g_registerImageSelectionCount.fetch_add(1, std::memory_order_relaxed);
+    break;
+  case ShadowRegisterSource::MarkColorOcclusion:
+    g_registerImageOcclusionCount.fetch_add(1, std::memory_order_relaxed);
+    break;
+  case ShadowRegisterSource::WithParams:
+    g_registerImageWithParamsCount.fetch_add(1, std::memory_order_relaxed);
+    break;
+  case ShadowRegisterSource::ObjectBridge:
+    g_registerImageObjectBridgeCount.fetch_add(1, std::memory_order_relaxed);
+    break;
+  case ShadowRegisterSource::FromPoint:
+    g_registerImageFromPointCount.fetch_add(1, std::memory_order_relaxed);
+    break;
+  case ShadowRegisterSource::FromTwoPoints:
+    g_registerImageFromTwoPointsCount.fetch_add(1, std::memory_order_relaxed);
+    break;
+  case ShadowRegisterSource::Unknown:
+    g_registerImageUnknownSourceCount.fetch_add(1, std::memory_order_relaxed);
+    break;
+  default:
+    break;
+  }
+
+  char keyBuf[128] = {};
+  const bool hasKey = shadowfilter::ReadAsciiCStringSafe(
+      reinterpret_cast<const char *>(static_cast<uintptr_t>(keyPtr)), keyBuf,
+      sizeof(keyBuf));
+
+  uint32_t ownerRawcode = 0u;
+  const ShadowOwnerKind ownerKind =
+      ResolveShadowRegisterOwnerKind(ownerArg, ownerRawcode);
+
+  ShadowRegisterContext ctx = {};
+  ctx.mode = mode;
+  ctx.source = source;
+  ctx.ownerKind = ownerKind;
+  ctx.ownerRawcode = ownerRawcode;
+  ctx.retRva = retRva;
+  ctx.argType = typeArg;
+  ctx.hasKey = hasKey;
+  ctx.key = hasKey ? keyBuf : nullptr;
+
+  const ShadowRegisterDecision decision =
+      shadowfilter::DecideRegisterImage(ctx);
+  if (decision.blocked)
+    g_registerImageBlockedCount.fetch_add(1, std::memory_order_relaxed);
+
+  if constexpr (dxvk::war3::internal::kNativeShadowRegisterImageVerboseLogging) {
+    static std::atomic<uint32_t> s_verboseCount{0};
+    const uint32_t n = s_verboseCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 80u || (n % 1000u) == 0u) {
+      war3dbg::Print(
+          "DXVK War3Hook: RegisterImage %s mode=%u source=%s owner=%s "
+          "raw=0x%08X type=%d key='%s' ret=0x%08X reason=%s\n",
+          decision.blocked ? "BLOCK" : "PASS", static_cast<unsigned>(mode),
+          shadowfilter::ToString(source), shadowfilter::ToString(ownerKind),
+          static_cast<unsigned>(ownerRawcode), typeArg,
+          hasKey ? keyBuf : "(null)", static_cast<unsigned>(retRva),
+          decision.reason);
+    }
+  }
+
+  if constexpr (dxvk::war3::internal::kNativeShadowRegisterImageStatsLogging ||
+                dxvk::war3::internal::kNativeShadowRegisterSourceStatsLogging) {
+    const uint64_t calls =
+        g_registerImageEnterCount.load(std::memory_order_relaxed);
+    if ((calls % dxvk::war3::internal::kNativeShadowRegisterStatsInterval) ==
+        0u) {
+      char buf[640];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: RegisterImage stats calls=%llu "
+               "blocked=%llu srcStatic=%llu srcEmitter=%llu "
+               "srcSelection=%llu srcOcclusion=%llu srcWithParams=%llu "
+               "srcObjectBridge=%llu srcFromPoint=%llu "
+               "srcFromTwoPoints=%llu srcUnknown=%llu mode=%u "
+               "lastSource=%s lastOwner=%s lastType=%d lastKey=%s "
+               "lastReason=%s",
+               static_cast<unsigned long long>(calls),
+               static_cast<unsigned long long>(
+                   g_registerImageBlockedCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_registerImageStaticStampCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_registerImageEmitterStampCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_registerImageSelectionCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_registerImageOcclusionCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_registerImageWithParamsCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_registerImageObjectBridgeCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_registerImageFromPointCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_registerImageFromTwoPointsCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_registerImageUnknownSourceCount.load(
+                       std::memory_order_relaxed)),
+               static_cast<unsigned>(mode), shadowfilter::ToString(source),
+               shadowfilter::ToString(ownerKind), typeArg,
+               hasKey ? keyBuf : "(null)", decision.reason);
+      ::dxvk::Logger::info(buf);
+    }
+  }
+
+  if (decision.blocked)
+    return -1;
+
+  return CallShadowRegisterImageEntryOriginal(thisPtr, keyPtr, sizePtr, posPtr,
+                                              ownerArg, typeArg);
+}
+
 // =====================================================================
 // 2026-05-30: CDoodads 贴花阴影拦截（魔兽自带可见静态阴影 + path blocker 治理）
 // =====================================================================
@@ -1085,8 +1366,8 @@ std::atomic<uint64_t> g_writeMaskRegionPassLosCount{0};   // idx==1
 std::atomic<uint64_t> g_writeMaskRegionPassPathCount{0};  // idx==2
 std::atomic<uint64_t> g_writeMaskRegionPassOtherCount{0};
 
-// Phase 7.116：DispatchToShape 永久 atomic 计数器。
-// reject 默认开启，counter 永久累加（用于 control plane 验证拦截命中频率）。
+// Phase 7.116：DispatchToShape 旧实验 atomic 计数器。
+// 默认不安装 hook；灰度开启时用于 control plane 验证拦截命中频率。
 std::atomic<uint64_t> g_dispatchToShapeEnterCount{0};
 std::atomic<uint64_t> g_dispatchToShapeRejectedCount{0};
 std::atomic<uint64_t> g_dispatchToShapeFromRebuildMaskCount{0};
@@ -1376,12 +1657,10 @@ int __thiscall Hook_TerrainShadow_WriteMaskRegion(void *thisPtr, void *a2,
   return 0;
 }
 
-// Phase 7.116：TerrainShadow_DispatchToShape hook。
-// 这是建筑/装饰物/可破坏物原生静态阴影 footprint 写入的唯一汇聚点。
-// 5 个 caller 全部是 shadow path（见 war3_internal_test_config.h §Phase 7.116），
-// 与 fog/LOS/path/visibility 完全独立。开关启用时入口直接 return -1（caller
-// 把 DispatchToShape 返回值当 result 索引，-1 / 任意非命中值会让 caller 跳过
-// 后续 Box/Poly 写入），不调 trampoline，零 fog/LOS/path 副作用。
+// Phase 7.116：TerrainShadow_DispatchToShape 旧实验 hook。
+// 历史假设认为它是建筑/装饰物/可破坏物 footprint shadow 的独立写入点；
+// 后续实测 dispatchToShapeEnterCount=0，生产默认已关闭，仅保留灰度诊断。
+// 若重新开启 reject，入口 return 0，caller 侧应把它当非命中 shape/result。
 int __thiscall Hook_TerrainShadow_DispatchToShape(void *thisPtr, void *a2,
                                                    int a3) {
   g_dispatchToShapeEnterCount.fetch_add(1, std::memory_order_relaxed);
@@ -1417,7 +1696,7 @@ int __thiscall Hook_TerrainShadow_DispatchToShape(void *thisPtr, void *a2,
     }
   }
 
-  // reject 默认开启 — 干净屏蔽建筑/装饰物/可破坏物 footprint shadow。
+  // reject 默认关闭；仅用于重新 A/B DispatchToShape 假设。
   if constexpr (dxvk::war3::internal::
                     kNativeStaticShadowDispatchToShapeRejectEnabled) {
     const uint64_t logIdx = g_dispatchToShapeRejectedCount.fetch_add(
@@ -1533,7 +1812,8 @@ uint32_t QueryShadowProjectorObservedFourCCSampleAt(uint32_t idx) {
 // Phase 7.116：DispatchToShape 永久 atomic 读取器。
 uint64_t QueryDispatchToShapeEnterCount() {
   return g_dispatchToShapeEnterCount.load(std::memory_order_relaxed);
-}uint64_t QueryDispatchToShapeRejectedCount() {
+}
+uint64_t QueryDispatchToShapeRejectedCount() {
   return g_dispatchToShapeRejectedCount.load(std::memory_order_relaxed);
 }
 uint64_t QueryDispatchToShapeFromRebuildMaskCount() {
@@ -1575,26 +1855,6 @@ uint64_t QueryListARenderAllEntriesBlockedCount() {
   return g_listARenderAllEntriesBlockedCount.load(std::memory_order_relaxed);
 }
 
-// Phase 7.100：跨 TU 暴露的 WriteMaskRegion 诊断 atomic 读取器。
-// 这些函数声明在 dxvk::war3::hooks 命名空间内、anonymous namespace 之外，
-// bridge.cpp 可以直接调用。
-uint64_t QueryWriteMaskRegionEnterCount();
-uint64_t QueryWriteMaskRegionRejectedIdx3Count();
-uint64_t QueryWriteMaskRegionPassFogCount();
-uint64_t QueryWriteMaskRegionPassLosCount();
-uint64_t QueryWriteMaskRegionPassPathCount();
-uint64_t QueryWriteMaskRegionPassOtherCount();
-
-// Phase 7.100：跨 TU 暴露的 WriteMaskRegion 诊断 atomic 读取器。
-// 这些函数声明在 dxvk::war3::hooks 命名空间内、anonymous namespace 之外，
-// bridge.cpp 可以直接调用。
-uint64_t QueryWriteMaskRegionEnterCount();
-uint64_t QueryWriteMaskRegionRejectedIdx3Count();
-uint64_t QueryWriteMaskRegionPassFogCount();
-uint64_t QueryWriteMaskRegionPassLosCount();
-uint64_t QueryWriteMaskRegionPassPathCount();
-uint64_t QueryWriteMaskRegionPassOtherCount();
-
 bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   // 先保存原函数指针与来源地址，再执行分项安装，保证失败时仍可回退。
   g_originalTerrainShadowLayer =
@@ -1611,6 +1871,9 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   g_originalShadowProjectorAddSimple =
       reinterpret_cast<ShadowProjectorAddSimpleFn>(
           addrs.shadowProjectorAddSimpleAddr);
+  g_originalShadowRegisterImageEntry =
+      reinterpret_cast<ShadowRegisterImageEntryFn>(
+          addrs.shadowRegisterImageEntryAddr);
   g_originalShadowPathStaticStampToggle =
       reinterpret_cast<ShadowPathStaticStampToggleFn>(
           addrs.shadowPathStaticStampToggleAddr);
@@ -1620,6 +1883,22 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
       reinterpret_cast<uintptr_t>(addrs.shadowPathObjectProjectorJassBridgeAddr);
   g_shadowProjectorSimpleBridgeAddr =
       reinterpret_cast<uintptr_t>(addrs.shadowProjectorSimpleBridgeAddr);
+  g_shadowRegisterRetWithParamsAddr =
+      reinterpret_cast<uintptr_t>(addrs.shadowRegisterRetWithParamsAddr);
+  g_shadowRegisterRetSelectionCircleAddr =
+      reinterpret_cast<uintptr_t>(addrs.shadowRegisterRetSelectionCircleAddr);
+  g_shadowRegisterRetStaticStampAddr =
+      reinterpret_cast<uintptr_t>(addrs.shadowRegisterRetStaticStampAddr);
+  g_shadowRegisterRetEmitterStampAddr =
+      reinterpret_cast<uintptr_t>(addrs.shadowRegisterRetEmitterStampAddr);
+  g_shadowRegisterRetObjectBridgeAddr =
+      reinterpret_cast<uintptr_t>(addrs.shadowRegisterRetObjectBridgeAddr);
+  g_shadowRegisterRetMarkOcclusionAddr =
+      reinterpret_cast<uintptr_t>(addrs.shadowRegisterRetMarkOcclusionAddr);
+  g_shadowRegisterRetFromPointAddr =
+      reinterpret_cast<uintptr_t>(addrs.shadowRegisterRetFromPointAddr);
+  g_shadowRegisterRetFromTwoPointsAddr =
+      reinterpret_cast<uintptr_t>(addrs.shadowRegisterRetFromTwoPointsAddr);
 
   bool anyInstalled = false;
   if constexpr (dxvk::war3::internal::kWar3ShadowTerrainHookEnabled) {
@@ -1686,6 +1965,26 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   } else {
     war3dbg::Print(
         "DXVK War3Hook: 二分诊断态关闭 Shadow/Projector hook 安装\n");
+  }
+
+  if constexpr (dxvk::war3::internal::kNativeShadowRegisterImageHookEnabled) {
+    if (addrs.shadowRegisterImageEntryAddr != nullptr) {
+      const bool ok = InstallMinHook(
+          addrs.shadowRegisterImageEntryAddr,
+          reinterpret_cast<LPVOID>(&Hook_TerrainShadow_RegisterImageEntry),
+          reinterpret_cast<LPVOID *>(&g_trampolineShadowRegisterImageEntry),
+          "Shadow", "TerrainShadow_RegisterImageEntry", false, true);
+      anyInstalled |= ok;
+      char buf[120];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: RegisterImageEntry install addr=%p "
+               "result=%s",
+               addrs.shadowRegisterImageEntryAddr, ok ? "ok" : "fail");
+      ::dxvk::Logger::info(buf);
+    } else {
+      ::dxvk::Logger::info(
+          "DXVK War3Hook[Shadow]: RegisterImageEntry install SKIPPED - nullptr");
+    }
   }
 
   // 2026-05-30：CDoodads 贴花阴影拦截（魔兽自带可见静态阴影 + path blocker）。
@@ -1764,9 +2063,8 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
     }
   }
 
-  // Phase 7.116：TerrainShadow_DispatchToShape hook 安装。
-  // 这是建筑/装饰物/可破坏物 shadow footprint 的真正写入路径。
-  // 与 fog/LOS/path/visibility 完全独立，hook 入口直接 return 0 即可干净屏蔽。
+  // Phase 7.116：TerrainShadow_DispatchToShape 旧实验 hook 安装。
+  // 默认不安装；仅在 reject 或 caller diagnostics 灰度开关打开时接入。
   if constexpr (dxvk::war3::internal::
                     kNativeStaticShadowDispatchToShapeRejectEnabled ||
                 dxvk::war3::internal::

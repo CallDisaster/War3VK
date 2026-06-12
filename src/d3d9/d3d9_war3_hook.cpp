@@ -95,6 +95,7 @@ struct FileVersion {
 std::once_flag g_minhookInitOnce;
 std::atomic<MH_STATUS> g_minhookInitStatus{MH_UNKNOWN};
 std::atomic<bool> g_bootstrapInstalled{false};
+constexpr size_t kHookProbeSize = 32;
 
 // ---------------------------------------------------------------------------
 // 模块信息与版本探测
@@ -266,6 +267,91 @@ uintptr_t GetGameDllBase() {
   return reinterpret_cast<uintptr_t>(::GetModuleHandleA("Game.dll"));
 }
 
+LPVOID ResolveHookCodeAddress(const ModuleInfo &gameInfo, uintptr_t rva,
+                              const char *name, const char *source) {
+  const uintptr_t addr = gameInfo.base + rva;
+  if (!IsAddressInModule(addr, gameInfo) ||
+      !IsExecutableRange(reinterpret_cast<const void *>(addr), kHookProbeSize) ||
+      !IsReadableRange(reinterpret_cast<const void *>(addr), kHookProbeSize)) {
+    war3dbg::Print("DXVK War3Hook: 跳过 %s (rva=0x%08X addr=%p source=%s) - "
+                   "地址不可读/不可执行或版本不匹配\n",
+                   name, static_cast<unsigned>(rva),
+                   reinterpret_cast<void *>(addr),
+                   (source && source[0]) ? source : "(unknown)");
+    return nullptr;
+  }
+  return reinterpret_cast<LPVOID>(addr);
+}
+
+dxvk::war3::hooks::ShadowHookAddresses
+BuildShadowHookAddresses(const ModuleInfo &gameInfo, const char *source) {
+  const auto &book = dxvk::war3::hooks::GetWar3HookAddressBook127a();
+  auto resolve = [&](uintptr_t rva, const char *name) -> LPVOID {
+    return ResolveHookCodeAddress(gameInfo, rva, name, source);
+  };
+
+  dxvk::war3::hooks::ShadowHookAddresses shadowHooks = {};
+  shadowHooks.terrainShadowLayerAddr =
+      resolve(book.terrainShadowLayer, "Terrain_RenderShadowLayer");
+  shadowHooks.terrainRenderListAAddr =
+      resolve(book.terrainShadowListA, "TerrainShadow_RenderListA");
+  shadowHooks.terrainRenderListBAddr =
+      resolve(book.terrainShadowListB, "TerrainShadow_RenderListB");
+  shadowHooks.shadowUpdateWriteEntryAddr =
+      resolve(book.shadowUpdateWriteEntry, "ShadowUpdate_WriteEntry");
+  shadowHooks.shadowProjectorAddSimpleAddr =
+      resolve(book.shadowProjectorAddSimple, "ShadowProjector_Add_Simple");
+  shadowHooks.shadowProjectorAddFromObjectAddr =
+      resolve(book.shadowProjectorAddFromObject, "ShadowProjector_Add_FromObject");
+  shadowHooks.shadowRegisterImageEntryAddr =
+      resolve(book.shadowRegisterImageEntry, "TerrainShadow_RegisterImageEntry");
+  shadowHooks.shadowProjectorSimpleBridgeAddr =
+      resolve(book.shadowProjectorSimpleBridge,
+              "ShadowPath_ObjectProjector_SimpleBridge");
+  shadowHooks.shadowPathObjectProjectorRuntimeAddr =
+      resolve(book.shadowPathObjectProjectorRuntime,
+              "ShadowPath_ObjectProjector_Runtime");
+  shadowHooks.shadowPathObjectProjectorJassBridgeAddr =
+      resolve(book.shadowPathObjectProjectorJassBridge,
+              "ShadowPath_ObjectProjector_JassBridge");
+  shadowHooks.shadowPathStaticStampToggleAddr =
+      resolve(book.shadowPathStaticStampToggle, "ShadowPath_StaticStamp_Toggle");
+  shadowHooks.shadowRegisterRetWithParamsAddr =
+      resolve(book.shadowRegisterRetWithParams, "RegisterImageRet_WithParams");
+  shadowHooks.shadowRegisterRetSelectionCircleAddr =
+      resolve(book.shadowRegisterRetSelectionCircle,
+              "RegisterImageRet_SelectionCircle");
+  shadowHooks.shadowRegisterRetStaticStampAddr =
+      resolve(book.shadowRegisterRetStaticStamp, "RegisterImageRet_StaticStamp");
+  shadowHooks.shadowRegisterRetEmitterStampAddr =
+      resolve(book.shadowRegisterRetEmitterStamp, "RegisterImageRet_EmitterStamp");
+  shadowHooks.shadowRegisterRetObjectBridgeAddr =
+      resolve(book.shadowRegisterRetObjectBridge, "RegisterImageRet_ObjectBridge");
+  shadowHooks.shadowRegisterRetMarkOcclusionAddr =
+      resolve(book.shadowRegisterRetMarkOcclusion, "RegisterImageRet_MarkOcclusion");
+  shadowHooks.shadowRegisterRetFromPointAddr =
+      resolve(book.shadowRegisterRetFromPoint, "RegisterImageRet_FromPoint");
+  shadowHooks.shadowRegisterRetFromTwoPointsAddr =
+      resolve(book.shadowRegisterRetFromTwoPoints, "RegisterImageRet_FromTwoPoints");
+  shadowHooks.terrainShadowWriteMaskRegionAddr =
+      resolve(book.terrainShadowWriteMaskRegion, "TerrainShadow_WriteMaskRegion");
+  shadowHooks.terrainShadowDispatchToShapeAddr =
+      resolve(book.terrainShadowDispatchToShape, "TerrainShadow_DispatchToShape");
+  shadowHooks.terrainShadowToggleStaticStampFromObjectAddr =
+      resolve(book.terrainShadowToggleStaticStampFromObject,
+              "TerrainShadow_ToggleStaticStampFromObject");
+  shadowHooks.terrainShadowToggleEmitterStampAddr =
+      resolve(book.terrainShadowToggleEmitterStamp,
+              "TerrainShadow_ToggleEmitterStamp");
+  shadowHooks.terrainShadowListARenderPreparedGroupsAddr =
+      resolve(book.terrainShadowListARenderPreparedGroups,
+              "TerrainShadow_ListA_RenderPreparedGroups");
+  shadowHooks.terrainShadowListARenderAllEntriesAddr =
+      resolve(book.terrainShadowListARenderAllEntries,
+              "Terrain_ShadowListA_RenderAllEntries");
+  return shadowHooks;
+}
+
 // 地图退出时重置运行时状态，避免跨局残留。
 void ResetWar3RuntimeState() {
   g_war3_runtime_activated.store(false, std::memory_order_release);
@@ -398,43 +484,60 @@ void TryInstallShadowHooksEarly(uintptr_t gameBase, const char *source) {
   (void)gameBase;
   TryInstallStormBreakerEarly(source);
 
-  // Phase 7.99：CWidget identity hook 必须早装。地图加载阶段就会大量
-  // 触发 widget create/setHidden/setKilled 等 lifecycle 事件，如果等
-  // ActivateWar3Runtime 之后才装会错过整批 path blocker / destructible 创建。
+  // Phase 7.99/7.170：CWidget identity 与 Shadow producer hooks 必须早装。
+  // 地图加载阶段会大量触发 widget/stamp/register 写入；如果等
+  // ActivateWar3Runtime 之后才装，会错过预置 path blocker / destructible /
+  // doodad 静态阴影注册。
   if constexpr (dxvk::war3::internal::kWar3ShadowHookEnabled) {
     static std::atomic<bool> s_earlyAttempted{false};
     bool expected = false;
     if (s_earlyAttempted.compare_exchange_strong(expected, true,
                                                   std::memory_order_acq_rel)) {
+      if (!EnsureMinHookInitialized()) {
+        Logger::info(str::format(
+            "DXVK War3Hook: Shadow early MinHook init failed source=", source));
+        s_earlyAttempted.store(false, std::memory_order_release);
+        return;
+      }
+
+      ModuleInfo gameInfo = {};
+      if (gameBase == 0u || !GetModuleInfo(reinterpret_cast<HMODULE>(gameBase),
+                                           gameInfo)) {
+        Logger::info(str::format(
+            "DXVK War3Hook: Shadow early skip - bad Game.dll base=0x",
+            std::hex, gameBase, std::dec, " source=", source));
+        s_earlyAttempted.store(false, std::memory_order_release);
+        return;
+      }
+
       const auto& book =
           dxvk::war3::hooks::GetWar3HookAddressBook127a();
       const uintptr_t rva =
           book.widgetRegisterFootprintAndShadowMask;
       if (rva != 0u && gameBase != 0u) {
-        if (!EnsureMinHookInitialized()) {
-          Logger::info(str::format(
-              "DXVK War3Hook: WidgetIdentity early MinHook init failed "
-              "source=", source));
-          s_earlyAttempted.store(false, std::memory_order_release);
-          return;
-        }
         const uintptr_t addr = gameBase + rva;
         if (!IsExecutableRange(reinterpret_cast<const void*>(addr), 16) ||
             !IsReadableRange(reinterpret_cast<const void*>(addr), 16)) {
           Logger::info(str::format(
               "DXVK War3Hook: WidgetIdentity early skip - bad addr=0x",
               std::hex, addr, std::dec, " source=", source));
-          s_earlyAttempted.store(false, std::memory_order_release);
-          return;
+        } else {
+          const bool ok = dxvk::war3::hooks::InstallWidgetIdentityHook(
+              reinterpret_cast<LPVOID>(addr));
+          Logger::info(str::format(
+              "DXVK War3Hook: WidgetIdentity early install addr=0x",
+              std::hex, addr, std::dec,
+              " result=", (ok ? "ok" : "fail"),
+              " source=", source));
         }
-        const bool ok = dxvk::war3::hooks::InstallWidgetIdentityHook(
-            reinterpret_cast<LPVOID>(addr));
-        Logger::info(str::format(
-            "DXVK War3Hook: WidgetIdentity early install addr=0x",
-            std::hex, addr, std::dec,
-            " result=", (ok ? "ok" : "fail"),
-            " source=", source));
       }
+
+      const dxvk::war3::hooks::ShadowHookAddresses shadowHooks =
+          BuildShadowHookAddresses(gameInfo, source);
+      const bool shadowOk = dxvk::war3::hooks::InstallShadowHooks(shadowHooks);
+      Logger::info(str::format(
+          "DXVK War3Hook: Shadow early producer install result=",
+          (shadowOk ? "ok" : "fail"), " source=", source));
     }
   }
 }
@@ -466,8 +569,6 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
     War3Hook::MarkHooksInstalled();
     return;
   }
-
-  constexpr size_t kHookProbeSize = 32;
 
   auto resolveCode = [&](uintptr_t rva, const char *name) -> LPVOID {
     const uintptr_t addr = gameInfo.base + rva;
@@ -594,54 +695,8 @@ void War3Hook::InstallGameHooks(uintptr_t gameBase) {
   }
 
   if constexpr (dxvk::war3::internal::kWar3ShadowHookEnabled) {
-    dxvk::war3::hooks::ShadowHookAddresses shadowHooks = {};
-    shadowHooks.terrainShadowLayerAddr =
-        resolveCode(book.terrainShadowLayer, "Terrain_RenderShadowLayer");
-    shadowHooks.terrainRenderListAAddr =
-        resolveCode(book.terrainShadowListA, "TerrainShadow_RenderListA");
-    shadowHooks.terrainRenderListBAddr =
-        resolveCode(book.terrainShadowListB, "TerrainShadow_RenderListB");
-    shadowHooks.shadowUpdateWriteEntryAddr =
-        resolveCode(book.shadowUpdateWriteEntry, "ShadowUpdate_WriteEntry");
-    shadowHooks.shadowProjectorAddSimpleAddr =
-        resolveCode(book.shadowProjectorAddSimple, "ShadowProjector_Add_Simple");
-    shadowHooks.shadowProjectorAddFromObjectAddr =
-        resolveCode(book.shadowProjectorAddFromObject,
-                    "ShadowProjector_Add_FromObject");
-    shadowHooks.shadowProjectorSimpleBridgeAddr =
-        resolveCode(book.shadowProjectorSimpleBridge,
-                    "ShadowPath_ObjectProjector_SimpleBridge");
-    shadowHooks.shadowPathObjectProjectorRuntimeAddr =
-        resolveCode(book.shadowPathObjectProjectorRuntime,
-                    "ShadowPath_ObjectProjector_Runtime");
-    shadowHooks.shadowPathObjectProjectorJassBridgeAddr =
-        resolveCode(book.shadowPathObjectProjectorJassBridge,
-                    "ShadowPath_ObjectProjector_JassBridge");
-    shadowHooks.shadowPathStaticStampToggleAddr =
-        resolveCode(book.shadowPathStaticStampToggle,
-                    "ShadowPath_StaticStamp_Toggle");
-    // Phase 7.100：静态阴影 mask grid 写入函数。
-    shadowHooks.terrainShadowWriteMaskRegionAddr =
-        resolveCode(book.terrainShadowWriteMaskRegion,
-                    "TerrainShadow_WriteMaskRegion");
-    // Phase 7.116：建筑/装饰物/可破坏物原生静态阴影 footprint 真正写入路径。
-    shadowHooks.terrainShadowDispatchToShapeAddr =
-        resolveCode(book.terrainShadowDispatchToShape,
-                    "TerrainShadow_DispatchToShape");
-    // 2026-05-30：CDoodads 贴花阴影对象级注册入口（魔兽自带可见静态阴影治理）。
-    shadowHooks.terrainShadowToggleStaticStampFromObjectAddr =
-        resolveCode(book.terrainShadowToggleStaticStampFromObject,
-                    "TerrainShadow_ToggleStaticStampFromObject");
-    shadowHooks.terrainShadowToggleEmitterStampAddr =
-        resolveCode(book.terrainShadowToggleEmitterStamp,
-                    "TerrainShadow_ToggleEmitterStamp");
-    // 2026-05-30 根因突破：ListA stamp 渲染消费点（真正画静态阴影/path blocker）。
-    shadowHooks.terrainShadowListARenderPreparedGroupsAddr =
-        resolveCode(book.terrainShadowListARenderPreparedGroups,
-                    "TerrainShadow_ListA_RenderPreparedGroups");
-    shadowHooks.terrainShadowListARenderAllEntriesAddr =
-        resolveCode(book.terrainShadowListARenderAllEntries,
-                    "Terrain_ShadowListA_RenderAllEntries");
+    const dxvk::war3::hooks::ShadowHookAddresses shadowHooks =
+        BuildShadowHookAddresses(gameInfo, "InstallGameHooks");
     dxvk::war3::hooks::InstallShadowHooks(shadowHooks);
 
     // Phase 7.98：CWidget 身份链中央 sync Hook。

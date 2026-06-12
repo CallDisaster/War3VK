@@ -139,6 +139,29 @@ bool IsLikelySelectionTextureKey(const char* key) {
   return ContainsIgnoreCaseAscii(key, "replaceabletextures\\selection\\");
 }
 
+uint32_t ByteSwapU32(uint32_t v) {
+  return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+         ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
+}
+
+uint32_t NormalizeFourCcEditorSecondChar(uint32_t v) {
+  const uint32_t c1 = (v >> 16) & 0xFFu;
+  if (c1 >= static_cast<uint32_t>('a') &&
+      c1 <= static_cast<uint32_t>('z')) {
+    v = (v & 0xFF00FFFFu) | ((c1 - 0x20u) << 16);
+  }
+  return v;
+}
+
+bool MatchesBlockedFourCC(uint32_t fourcc) {
+  for (uint32_t i = 0;
+       i < dxvk::war3::internal::kNativeShadowBlockedFourCCsCount; ++i) {
+    if (fourcc == dxvk::war3::internal::kNativeShadowBlockedFourCCs[i])
+      return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 const char* ToString(ShadowRegisterSource source) {
@@ -323,19 +346,13 @@ bool IsBlockedFourCC(uint32_t fourcc) {
   if (fourcc == 0)
     return false;
 
-  // 兼容第二字符大小写（例如 YTlc / Ytlc）。
-  const uint32_t c1 = (fourcc >> 8) & 0xFFu;
-  if (c1 >= static_cast<uint32_t>('a') &&
-      c1 <= static_cast<uint32_t>('z')) {
-    fourcc = (fourcc & 0xFFFF00FFu) | ((c1 - 0x20u) << 8);
-  }
-
-  for (uint32_t i = 0;
-       i < dxvk::war3::internal::kNativeShadowBlockedFourCCsCount; ++i) {
-    if (fourcc == dxvk::war3::internal::kNativeShadowBlockedFourCCs[i])
-      return true;
-  }
-  return false;
+  // 与 D3D9 mesh gate 保持一致：黑名单以编辑器显示顺序保存，但运行时
+  // 可能读到编辑器序或内存序；两种都尝试，并兼容 YTlc/Ytlc 第二字符大小写。
+  const uint32_t direct = fourcc;
+  const uint32_t swapped = ByteSwapU32(fourcc);
+  return MatchesBlockedFourCC(direct) || MatchesBlockedFourCC(swapped) ||
+         MatchesBlockedFourCC(NormalizeFourCcEditorSecondChar(direct)) ||
+         MatchesBlockedFourCC(NormalizeFourCcEditorSecondChar(swapped));
 }
 
 bool TryExtractShadowObjectFourCC(void* obj, uint32_t& outFourCC) {
