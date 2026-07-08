@@ -1,5 +1,20 @@
 # 更新日志
 
+## WarVK 静态阴影解决版 - 2026-07-08
+
+### 重点更新
+
+- 解决 Warcraft III 原生建筑静态阴影残留问题：默认在 `CUnitUIManager_RecordSetStructureShadow` 写入 `buildingShadow(+0x50)` 时阻断阴影文件名进入 UnitUI 类型记录。
+- 保留并默认移除 `TerrainShadow_RenderListB` 旧版单位黑色圆影，让画面不再叠加原版 blob 阴影。
+- 退役 `WriteMaskRegion / StaticStampPath / RegisterImage / DoodadStamp` 等历史静态阴影实验默认路径，保留为证伪资料和专项诊断入口。
+- 整理静态阴影研究文档，明确 `CUnit+0x50` 不是阴影字符串，真正生产点是 UnitUI type record `+0x50 = buildingShadow`。
+
+### 验证结果
+
+- 实机日志确认 `DXVK War3Hook: CUnitUI buildingShadow BLOCK calls=768 blocked=768 mode=0 ... name=ShadowTreeofLife`。
+- 用户实机确认建筑阴影完全不可见。
+- `ninja -C build32` 通过。
+
 ## v1.1.0 - 2026-04-05
 
 ### 重点更新

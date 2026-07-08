@@ -316,6 +316,9 @@ BuildShadowHookAddresses(const ModuleInfo &gameInfo, const char *source) {
               "ShadowPath_ObjectProjector_JassBridge");
   shadowHooks.shadowPathStaticStampToggleAddr =
       resolve(book.shadowPathStaticStampToggle, "ShadowPath_StaticStamp_Toggle");
+  shadowHooks.cunitUiRecordSetStructureShadowAddr =
+      resolve(book.cunitUiRecordSetStructureShadow,
+              "CUnitUIManager_RecordSetStructureShadow");
   shadowHooks.shadowRegisterRetWithParamsAddr =
       resolve(book.shadowRegisterRetWithParams, "RegisterImageRet_WithParams");
   shadowHooks.shadowRegisterRetSelectionCircleAddr =
@@ -780,9 +783,9 @@ void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
     return;
   }
 
-  // StormBreaker 越早装收益越大：优先在首个 D3D9 bootstrap 时尝试安装，
-  // 若此时 Storm.dll 尚未完全就绪，再由 MainRunner_ENTER 补一次兜底。
-  TryInstallStormBreakerEarly("Bootstrap");
+  // Shadow producer/StormBreaker 越早装越好：优先在首个 D3D9 bootstrap
+  // 尝试安装，若此时依赖尚未就绪，再由 MainRunner_ENTER 补一次兜底。
+  TryInstallShadowHooksEarly(gameInfo.base, "Bootstrap");
 
   // Bootstrap 只做“最早期可安全安装”的生命周期/JASS 入口。
   dxvk::war3::hooks::War3HookJass::Install(gameInfo.base);

@@ -199,6 +199,12 @@ inline constexpr bool kNativeVisibleRenderableTransparentHookEnabled = false;
 // ========================================================================
 // 编译版内部测试 API 总闸门（默认关闭，避免发布版直接接触 JASSVM）。
 inline constexpr bool kNativeInternalTestApiEnabled = false;
+// WarVK 无声明 JASS command bridge。
+// 说明：
+// - 不注册新 native，不 patch JASS opcode；
+// - 仅包裹 Preloader/GetLocalizedHotkey/GetLocalizedString 三个低频原生函数；
+// - 只有第一个字符串参数以 "warvk:" 开头时才被 WarVK 消费，其余调用完全透传。
+inline constexpr bool kWar3JassCommandBridgeEnabled = true;
 // 是否启用 JASS VM 主循环追踪（MainLoop / ExecuteInternal 分段）。
 // 性能优先默认关闭，排障时再开启。
 inline constexpr bool kNativeJassVmPerfTrackingEnabled = false;
@@ -629,12 +635,13 @@ inline constexpr bool kWar3ModelHookEnabled = true;
 inline constexpr bool kWar3ShadowTerrainHookEnabled = true;
 inline constexpr bool kWar3ShadowProjectorHookEnabled = true;
 inline constexpr bool kWar3ShadowUpdateHookEnabled = true;
+inline constexpr bool kWar3ShadowTypeRecordHookEnabled = true;
 
-// 阴影总闸门自动跟随三个子域，避免出现“子域全开但父开关仍是 false”
+// 阴影总闸门自动跟随四个子域，避免出现“子域全开但父开关仍是 false”
 // 导致 Shadow 域实际上根本没有安装的误判。
 inline constexpr bool kWar3ShadowHookEnabled =
     kWar3ShadowTerrainHookEnabled || kWar3ShadowProjectorHookEnabled ||
-    kWar3ShadowUpdateHookEnabled;
+    kWar3ShadowUpdateHookEnabled || kWar3ShadowTypeRecordHookEnabled;
 
 // 汇总闸门：只要任一渲染子域开启，就视为“渲染域 Hook 已启用”。
 inline constexpr bool kWar3RenderHookDomainsEnabled =
@@ -1067,8 +1074,9 @@ inline constexpr uint64_t kShadowDrawTimeVBCacheDynamicMaxAgeFrames = 16u;
 inline constexpr bool kNativeStaticShadowMaskHideEnabled = false;
 // 调试日志：保留前几次 fire 的 WMR_DUMP，便于后续验证 a2 真实结构。
 inline constexpr bool kNativeStaticShadowMaskHideDebugLog = false;
-// 安装 hook 但不 reject（仅诊断，0 行为代价）。Phase 7.101 默认开。
-inline constexpr bool kNativeStaticShadowMaskHookInstall = true;
+// 历史诊断 hook：2026-07-08 已被 UnitUI buildingShadow producer gate 取代，
+// 生产默认不再安装，避免静态阴影治理路径继续分散。
+inline constexpr bool kNativeStaticShadowMaskHookInstall = false;
 
 // ============================================================================
 // Phase 7.112：建筑物 / 装饰物原生静态阴影屏蔽（caller-aware）
@@ -1109,9 +1117,8 @@ inline constexpr bool kNativeStaticShadowMaskCallerDiagnostics = false;
 // 后续实测已经推翻该默认路径：Phase 7.116 记录 30s 内
 // dispatchToShapeEnterCount=0；Phase 7.143 又证明 ListA consumer 粗拦截会误伤
 // 悬崖/地形 tile。当前生产默认不再把 DispatchToShape 当静态阴影解法，只保留
-// 下方 reject/diagnostics 作为灰度实验入口。真正默认治理链路是
-// StaticStampPath + ToggleStaticStampFromObject + RegisterImage 精确策略 + D3D9
-// shadow caster final gate。
+// 下方 reject/diagnostics 作为灰度实验入口。2026-07-08 后真正默认治理链路是
+// UnitUI buildingShadow producer gate；ListB 仅负责旧版单位 blob 圆影移除。
 inline constexpr bool kNativeStaticShadowDispatchToShapeRejectEnabled = false;
 // caller-aware 分桶诊断。需要重新验证 DispatchToShape 是否在特定地图触发时再开。
 inline constexpr bool kNativeStaticShadowDispatchToShapeCallerDiagnostics = false;
@@ -1126,8 +1133,8 @@ inline constexpr uint32_t kPathBlockerTrackingGroupMask = 0x1u;
 // 阴影投影器过滤（建筑阴影拦截）
 // ========================================================================
 // 原生阴影默认模式：0=原样，1=仅雾/边界，2=完全禁用。
-// 2026-06-12：默认回到 0。当前 RegisterImage/StaticStamp 系列拦截会误伤
-// 建筑施工/落地贴图，在没有 owner/key 精确证据前不作为生产默认项启用。
+// 2026-07-08：默认仍为 0，但 UnitUI buildingShadow producer gate 会独立生效。
+// NativeShadowMode 保留给开发期模式切换，不再决定建筑静态阴影的默认移除。
 inline constexpr uint32_t kNativeShadowDefaultMode = 0;
 
 // 当原生阴影模式为“仅雾/边界/禁用”时，是否同步关闭 War3ShadowReceiver（CSM）
@@ -1142,9 +1149,10 @@ inline constexpr bool kNativeShadowDisableOutlineWhenMode1 = false;
 // 默认必须关闭该开关：项目定位是“画质增强”，不应默认关闭核心阴影链路。
 inline constexpr bool kNativeShadowDisableShadowCaptureWhenMode1 = false;
 
-// 是否安装 ShadowPath_StaticStamp_Toggle(0x74E420) Hook。
-// 该链路不经过 RegisterImage/ListA/ListB，是静态阴影写入的独立入口。
-inline constexpr bool kNativeShadowStaticStampPathHookEnabled = true;
+// 旧静态阴影实验：ShadowPath_StaticStamp_Toggle(0x74E420)。
+// 2026-07-08 实机确认建筑阴影应在 UnitUI buildingShadow 写入点治理；
+// StaticStampPath 默认退役，仅保留给后续专项诊断。
+inline constexpr bool kNativeShadowStaticStampPathHookEnabled = false;
 
 // mode=1 时是否屏蔽 ShadowPath_StaticStamp_Toggle 的 enable 写入。
 inline constexpr bool kNativeShadowBlockStaticStampPathWhenMode1 = true;
@@ -1154,6 +1162,21 @@ inline constexpr bool kNativeShadowBlockStaticStampPathWhenMode2 = false;
 
 // ShadowPath_StaticStamp_Toggle 调试日志（默认关闭）。
 inline constexpr bool kNativeShadowStaticStampPathVerboseLogging = false;
+
+// UnitUI.slk buildingShadow producer 端治理（2026-07-08 实机断点确认）。
+// CUnit 实例 +0x50 不是阴影字符串；真正的建筑静态阴影文件名写入
+// CUnitUIManager type record +0x50，入口为 RecordSetStructureShadow(0x335A00)。
+// 这条写入发生在极早期 UnitUI/SLK loading 阶段，晚于进图再切 mode 会错过。
+inline constexpr bool kNativeShadowCUnitUiBuildingShadowHookEnabled = true;
+// 生产默认：NativeShadowMode=0 时也阻断 UnitUI type record +0x50 写入。
+// 实机日志已验证：CUnitUI buildingShadow BLOCK calls=768 blocked=768，
+// ShadowTreeofLife / ShadowAltarofKings 等建筑阴影文件名不再进入类型记录。
+inline constexpr bool kNativeShadowBlockCUnitUiBuildingShadowByDefault = true;
+inline constexpr bool kNativeShadowBlockCUnitUiBuildingShadowWhenMode1 = true;
+inline constexpr bool kNativeShadowBlockCUnitUiBuildingShadowWhenMode2 = true;
+inline constexpr bool kNativeShadowCUnitUiBuildingShadowStatsLogging = true;
+inline constexpr uint32_t kNativeShadowCUnitUiBuildingShadowStatsInterval = 128;
+inline constexpr bool kNativeShadowCUnitUiBuildingShadowVerboseLogging = false;
 
 // ========================================================================
 // CDoodads 贴花阴影治理（2026-05-30 接手：魔兽自带静态阴影禁用 + path blocker）
@@ -1167,10 +1190,9 @@ inline constexpr bool kNativeShadowStaticStampPathVerboseLogging = false;
 // (ShadowPath_StaticStamp_Toggle 0x74E420)，**没有拦这两条 RegisterImage 贴花
 // 路径**，所以魔兽自带的树木/装饰物地面贴花阴影一直可见。
 //
-// 直接 hook 这两个 Toggle 函数的入口、在 mode>=1 时跳过 enable!=0 的写入，
-// 即可覆盖 create / EnableFeatures / TOD-refresh 全部 caller（单点拦截），
-// 且完全不动 fog/LOS/path（那是 FogMask 路径，与此无关）。
-inline constexpr bool kNativeShadowDoodadStampHookEnabled = true;
+// 该实验曾用于 create / EnableFeatures / TOD-refresh caller 覆盖验证。
+// 2026-07-08 后默认关闭，避免与 UnitUI buildingShadow 生产主路径混杂。
+inline constexpr bool kNativeShadowDoodadStampHookEnabled = false;
 // mode=1（仅雾/边界）时屏蔽 doodad 静态贴花阴影注册。
 inline constexpr bool kNativeShadowBlockDoodadStaticStampWhenMode1 = true;
 // mode=1 时屏蔽 doodad emitter 贴花阴影注册。
@@ -1179,30 +1201,21 @@ inline constexpr bool kNativeShadowBlockDoodadEmitterStampWhenMode1 = true;
 // 2026-05-31：默认打开。每 kNativeShadowDoodadStampStatsInterval 次调用写 1 行，
 // 让用户能在 war3_d3d9.log 直接看到 DoodadStaticStamp calls/blocked，验证
 // pre-placed 路径阻断器/装饰物是否走这条 native stamp 注册路径。
-inline constexpr bool kNativeShadowDoodadStampStatsLogging = true;
+inline constexpr bool kNativeShadowDoodadStampStatsLogging = false;
 inline constexpr uint32_t kNativeShadowDoodadStampStatsInterval = 4000;
 
 // ========================================================================
-// 2026-05-30 根因突破：ListA stamp 渲染消费点拦截（真正生效的静态阴影治理）
+// Phase 7.143 证伪归档：ListA render hook（禁止作为静态阴影治理）
 // ========================================================================
-// IDA 决定性证据：CWorld_TerrainShadow_Dispatch (0x6F7369B4) case0 主渲染路径
-// 直接调用 TerrainShadow_ListA_RenderPreparedGroups (0x7370A0) 和
-// Terrain_ShadowListA_RenderAllEntries (0x737110) 来渲染所有 doodad/建筑/
-// path blocker 的地面贴花阴影 stamp。这两个函数**绕过项目所有现有 hook**
-// （历史只 hook 了 Terrain_RenderShadowLayer 0x737620，那只是其中一个子调用）。
-//
-// 这就是"历史所有静态阴影/path blocker 拦截全部无效"的根因：拦的都是
-// producer（注册）或错误的 consumer，没拦真正画 stamp 的这两个函数。
-//
-// mode>=1 时 hook 这两个函数直接 return，干净屏蔽魔兽自带可见静态阴影 +
-// path blocker 地面阴影。fog/LOS/path 走独立 FogMask grid（terrain tile 着色
-// 消费），不受影响。两函数仅被 Dispatch 调用，hook 安全。
-// ⚠️ 2026-05-31 已证伪并禁用：用户实测 hook 0x7370A0/0x737110 会让**所有悬崖
-// 地形不渲染**。说明这两个函数渲染的是悬崖/地形几何本身，不是阴影专用。
-// "TerrainShadow" 命名误导。**禁止再开启此 hook**。保留代码仅作历史记录。
+// 2026-05-30 曾误判 CWorld_TerrainShadow_Dispatch case0 中的
+// 0x7370A0/0x737110 是 doodad/建筑/path blocker 贴花阴影 consumer。
+// 2026-05-31 用户实机证明该 hook 会让所有悬崖/地形 tile 不渲染。
+// 2026-07-08 IDA 复核：0x737110 -> sub_6F725F80 按
+// `148 * (tileX + tileY * stride)` 取 terrain tile geometry，随后提交
+// GxDevice_DrawIndexedRange。结论：这两个函数不是安全阴影消费点。
+// 保留地址和计数器只作历史诊断；生产默认必须保持关闭。
 inline constexpr bool kNativeShadowListARenderHookEnabled = false;
-// mode=1 时屏蔽 ListA stamp 渲染（doodad/建筑/path blocker 地面贴花阴影）。
-// ⚠️ 已证伪：会干掉悬崖地形，保持 false。
+// 已证伪：开启会干掉悬崖地形，保持 false。
 inline constexpr bool kNativeShadowBlockListARenderWhenMode1 = false;
 // ListA 渲染拦截统计日志（低频，默认关闭）。
 inline constexpr bool kNativeShadowListARenderStatsLogging = false;
@@ -1219,6 +1232,13 @@ inline constexpr bool kNativeShadowBlockProjectorFromAltEnabled = false;
 
 // 是否拦截 0x76D800 来源的投影器（Shadow_AddProjectorFromObject）
 inline constexpr bool kNativeShadowBlockProjectorFromObjectEnabled = false;
+
+// 退役兜底：若未来某个加载模式错过 UnitUI.slk buildingShadow 写入，可临时在
+// CUnit_ActivateBuildingShadowProjector -> ShadowPath_ObjectProjector_Runtime
+// -> ShadowProjector_Add_FromObject 这条 consumer 链上阻断 runtime object
+// projector。生产默认关闭，主路径必须依赖早期 CUnitUI producer gate。
+inline constexpr bool kNativeShadowBlockRuntimeObjectProjectorFallback = false;
+inline constexpr bool kNativeShadowRuntimeObjectProjectorFallbackLogging = false;
 
 // 是否拦截 0x76D790 来源的投影器（Shadow_AddProjectorSimple）
 inline constexpr bool kNativeShadowBlockProjectorSimpleEnabled = false;
@@ -1325,8 +1345,10 @@ inline constexpr uint32_t kNativeShadowBlockedCallbackRvasCount =
 // ========================================================================
 // 阴影注册入口拦截（TerrainShadow_RegisterImageEntry）
 // ========================================================================
-// 是否安装注册入口 Hook（上游拦截，优先于 ListA/ListB 渲染末端过滤）
-inline constexpr bool kNativeShadowRegisterImageHookEnabled = true;
+// 旧静态阴影实验：RegisterImage 来源分类。
+// 2026-07-08 后默认退役，避免误伤贴花/施工落地纹理；生产主路径改为
+// CUnitUIManager_RecordSetStructureShadow + ListB legacy blob removal。
+inline constexpr bool kNativeShadowRegisterImageHookEnabled = false;
 
 // mode>=1 时是否拦截 StaticStamp 来源（0x74DB30）注册
 inline constexpr bool kNativeShadowBlockStaticStampRegisterWhenMode1 = true;
@@ -1341,13 +1363,13 @@ inline constexpr bool kNativeShadowBlockStaticStampRegisterWhenMode1 = true;
 inline constexpr bool kNativeShadowBlockEmitterStampRegisterWhenMode1 = false;
 
 // 注册入口低频统计日志
-inline constexpr bool kNativeShadowRegisterImageStatsLogging = true;
+inline constexpr bool kNativeShadowRegisterImageStatsLogging = false;
 
 // 注册入口详细日志
 inline constexpr bool kNativeShadowRegisterImageVerboseLogging = false;
 
 // RegisterImage 来源分桶统计日志（按返回地址来源）。
-inline constexpr bool kNativeShadowRegisterSourceStatsLogging = true;
+inline constexpr bool kNativeShadowRegisterSourceStatsLogging = false;
 
 // RegisterImage 来源详细日志（高频，默认关闭）。
 inline constexpr bool kNativeShadowRegisterSourceVerboseLogging = false;
@@ -1407,29 +1429,33 @@ inline constexpr bool kNativeShadowListAWhitelistVerboseLogging = false;
 inline constexpr bool kNativeShadowListAStatsLogging = false;
 
 // ========================================================================
-// 阴影列表B 过滤（静态建筑阴影链路）   有问题不要开
+// 阴影列表B 过滤（旧版单位动态黑色圆影）
 // ========================================================================
-// 是否安装 ListB Hook（默认关闭，按需开启）
-inline constexpr bool kNativeShadowListBHookEnabled = false;
+// 2026-07-08 用户实机确认：建筑静态阴影由 UnitUI buildingShadow producer gate
+// 稳定解决；ListB 保留为默认移除，用来干掉老版单位脚下黑色 blob 圆影。
+inline constexpr bool kNativeShadowListBHookEnabled = true;
+
+// 生产默认：不依赖 NativeShadowMode，直接拦截全部 ListB。
+inline constexpr bool kNativeShadowListBBlockAllByDefault = true;
 
 // mode=1 时是否拦截 type=4（stage14 直调链路）
 inline constexpr bool kNativeShadowListBBlockType4WhenMode1 = false;
 
 // mode=1 时拦截 type=4 是否仅限 stage14 调用点（return RVA=0x007378FA）。
-// 默认开启：避免把其它 type=4 的贴花路径一并误杀。
+// 历史实验开关；当前默认全阻断 ListB 时不会走到这条细分规则。
 inline constexpr bool kNativeShadowListBType4Stage14OnlyWhenMode1 = false;
 
 // mode=1 时是否拦截 type=3（静态阴影残留常见路径）
 inline constexpr bool kNativeShadowListBBlockType3WhenMode1 = false;
 
 // mode=1 时是否拦截全部 ListB（极限诊断开关）
-inline constexpr bool kNativeShadowListBBlockAllWhenMode1 = false;
+inline constexpr bool kNativeShadowListBBlockAllWhenMode1 = true;
 
 // mode>=2 时是否拦截全部 ListB
-inline constexpr bool kNativeShadowListBBlockAllWhenMode2 = false;
+inline constexpr bool kNativeShadowListBBlockAllWhenMode2 = true;
 
 // ListB 低频统计日志
-inline constexpr bool kNativeShadowListBStatsLogging = false;
+inline constexpr bool kNativeShadowListBStatsLogging = true;
 
 // ListB 详细日志
 inline constexpr bool kNativeShadowListBVerboseLogging = false;

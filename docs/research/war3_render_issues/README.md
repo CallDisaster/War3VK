@@ -1,5 +1,18 @@
 # War3 渲染问题统一研究目录
 
+## 当前阶段（2026-07-08）
+- **建筑静态阴影已收敛到稳定生产方案**：hook
+  `CUnitUIManager_RecordSetStructureShadow(0x6F335A00 / RVA 0x335A00)`，
+  在 UnitUI/type record 写入 `buildingShadow(+0x50)` 时直接传空值，阻止
+  `ShadowAltarofKings / ShadowTreeofLife / ShadowCannonTower` 等原生建筑阴影文件名进入类型记录。
+- **实机验证已通过**：DebugView 捕获
+  `DXVK War3Hook: CUnitUI buildingShadow BLOCK calls=768 blocked=768 mode=0 ... name=ShadowTreeofLife`，
+  用户确认建筑阴影完全不可见。
+- **历史实验默认退役**：`WriteMaskRegion / StaticStampPath / RegisterImage / DoodadStamp`
+  不再作为生产默认链路，只保留证伪资料与专项诊断入口；`ListA` 末端过滤保持关闭。
+- **ListB 保留默认移除**：`TerrainShadow_RenderListB` 现在被定义为旧版单位脚下黑色 blob/圆影治理入口，
+  默认全阻断，不再作为建筑静态阴影主方案。
+
 ## 当前阶段（2026-04-05）
 - **代码稳定回退点**：`ea204b1`，作为当前进入下一阶段前的安全基线。
 - **桥接现状**：
@@ -23,7 +36,8 @@
 ## 目录说明
 - `01_batch_merge/README.md`：渲染对象批次合并（Queue Takeover + Instancing）研究与推进记录。
 - `02_los_blocker_shadow/README.md`：路径阻断器（LOSBlocker）误入阴影采集问题研究与修复记录。
-- `03_building_static_shadow/README.md`：建筑静态阴影在“关闭阴影”后仍渲染的问题研究与修复记录。
+- `03_building_static_shadow/README.md`：建筑静态阴影在“关闭阴影”后仍渲染的问题研究与修复记录；2026-07-08 已收敛到
+  `CUnitUIManager_RecordSetStructureShadow -> buildingShadow(+0x50)` 生产端阻断。
 - `04_architecture_refactor/README.md`：Hook 框架/桥接层/运行时生命周期的重构方案与里程碑。
 - `05_jass_vm_and_partial_batch_submit/README.md`：JASS VM 主循环画像与渲染层“局部合并提交”专项。
 - `06_message_1_4_archive/README.md`：留言1~4夜间专项的统一归档（目标/实现/证据/验证清单）。
@@ -44,7 +58,10 @@
 - `21_render_logic_bridge_optimization_notes/README.md`：渲染层对象到逻辑层 `CAgent/CUnit` 桥接的现状、热点和低损耗入口盘点。
 - `22_cmodel_pose_palette_reverse/README.md`：`CModelData/CGeosetData -> matrix-group remap -> CModel 最终 3x4 pose palette -> attachment/runtimeModel` 专题逆向。
 - `23_blob_shadow_lista_upstream_reverse/README.md`：`Blob 阴影 / ListA` 上游写入链专题逆向，收口 `StaticStamp / RegisterImage / UberSplat / ListA mixed layer` 的真实关系。
-- `24_cdoodads_static_shadow_upstream/README.md`：**`CDoodads + CUnit + FogMask` 静态阴影完整逆向（v3）**。
+- `24_cdoodads_static_shadow_upstream/README.md`：**`CDoodads + CUnit + FogMask` 静态阴影完整逆向（v3，历史证据链）**。
+  注意：该 v3 的 FogMask/WriteMaskRegion 方向已被 2026-07-08 的 UnitUI `buildingShadow` 写入端治理取代，
+  不再作为建筑静态阴影生产默认方案。
+  原始结论如下：
   v1 误以为 CDoodads 是建筑阴影主治理点；v2 误以为 CUnit ShadowProjector 是。
   **v3 决定性发现**：建筑预渲染贴花阴影既不走 CDoodads 也不走 CUnit ShadowProjector，
   而是通过 `TerrainShadow_WriteMaskRegion (0x234710)` 直接修改 `CFogMaskTable` 的 16-bit mask grid
@@ -129,14 +146,15 @@
 - 已基于 ASM 确认 `TerrainShadow_RenderLayer` 的参数语义：`a2` 控制 ListA，`a3` 控制 ListB。
 - 已基于 ASM 追加确认：`CWorld_TerrainShadow_Dispatch(stage14)` 会直调 `TerrainShadow_RenderListB(type=4)`，不经过 `RenderLayer(a3)`。
 - 已补齐 `ShadowProjector_Add_FromObject / ShadowProjector_Add_Simple` Hook 入口，接入可配置拦截策略。
-- 已新增 `TerrainShadow_RenderListB` Hook：mode=1 定向拦截 `type=4`，mode>=2 可全拦截 ListB。
+- 已新增 `TerrainShadow_RenderListB` Hook：历史上用于 mode=1/type=4 诊断；2026-07-08 起改为默认全阻断，
+  专门移除旧版单位脚下黑色 blob/圆影。
 - 方向2（LOSBlocker）已完成结项：`rawcode` + `Sprite->Model` 双通道过滤稳定生效，阻断器阴影已清除。
 - 已修复合批 fallback 状态位回归：`SingletonBypass`/尾部 fallback 恢复原始 `layerChanged/stateChanged` 计算，不再强制 `1/1`。
 - 已新增 `native` 研究目录，开始按 ASM 固化渲染主链（`CWorld_RenderScene -> DispatchStage -> RenderGroup -> Submit/Dispatch -> Flush`）与阴影分支链路。
 - 已新增 `src/d3d9/war3/native/address_book/README.md`，沉淀地址、调用约定、阶段映射和未还原点清单。
 - `src/d3d9/war3/native/war3_native_renderer.cpp` 已按 ASM 顺序重排主调度链（含两次 Flush 时机与 group 分发偏移）。
 - `DispatchStage case16/18/21` 已按 ASM 补到 native 参考代码，`RenderQueue_StageUpdate(0x6F13A9B0)` 初始化路径与关键全局地址已确认。
-- 已回退会误杀贴花的阴影粗拦截策略（Projector mode>=1 全拦截 / ListB type4 默认拦截）。
+- 已回退会误杀贴花的阴影粗拦截策略（Projector mode>=1 全拦截 / 历史 ListB type4 建筑静态阴影假设）。
 - 已补齐 LOSBlocker 桥接链路：PathBlocker 强制桥接扩展到 WorldObjects/Selection/Decorations，作为维护态回归保障。
 - 已新增静态阴影上游诊断：`ShadowUpdate cbTop` 回调频次统计 + `Projector key sample` 采样。
 - 已新增 JASS VM 追踪专项：`ExecuteJassFunctionInternal + JassInterpreter_MainLoop` 双钩子、返回码统计与预算策略开关。
@@ -184,7 +202,7 @@
 |---|---|---|---|
 | 方向1 合批 | 合批框架已工作，但仍有较高单发与回退成本 | 在 `BatchMergeStats` 基础上新增回退原因分桶（`NoShader/StateMismatch/AppendBreak/...`）并按场景量化 | `FQ_Dispatch_Opaque` 占比下降；`dispatchCommon` 调用数下降 |
 | 方向2 LOSBlocker | 已收敛：原版阻断器 FourCC 已稳定从 ShadowCapture 拒绝 | 进入维护：仅保留自定义地图变体抽样与黑名单补充；透明材质描边问题转入独立专项 | 阻断器不再进入阴影，且无“全体描边”回归 |
-| 方向3 静态阴影 | 已掌握 `ListB type=4`、`RegisterImage` 与 `StaticStampPath` 三条入口 | 以前移的 `StaticStampPath + RegisterImage` 拦截为主，`ListA` 末端仅保守兜底 | 建筑静态阴影消失且雾/边界/贴花不误伤 |
+| 方向3 静态阴影 | 2026-07-08 已收敛到 UnitUI `buildingShadow(+0x50)` 写入端 | 默认安装 `CUnitUIManager_RecordSetStructureShadow` producer gate；旧 `WriteMaskRegion/StaticStamp/RegisterImage/DoodadStamp` 实验退役；ListB 默认全阻断用于单位 blob 圆影 | 建筑静态阴影消失，且不再误伤雾/边界/贴花 |
 | 方向4 架构重构 | P1/P2 已落地：主入口瘦身 + 分域接线 + AddressBook | 持续推进统一 Hook 注册器、诊断分级与桥接契约化 | `d3d9_war3_hook.cpp` 持续保持“薄中枢”，分域可独立回归 |
 | 方向5 JASS+局部合并提交 | 已完成 JASS 主循环入口定位与 Hook（`0x7F1A20/0x7F2D92`） | 先以“同 renderablePart 局部上下文复用”压低 Dispatch CPU，再决定是否扩大到全队列接管合批 | `Hook_Dispatch_*` CPU 下降，`DispatchLocalMerge reusePct` 稳定上升且画面无回归 |
 
@@ -201,7 +219,7 @@
 |---|---|---|
 | 01 合批/批次提交 | 进行中（阶段性） | 已形成“保守接管 + 局部合并 + 透明排序快路径”可用组合，收益稳定；全量接管仍需按场景继续 A/B。 |
 | 02 LOSBlocker 阴影 | 已结项 | 已稳定屏蔽阻断器阴影，且保持描边链路可用。 |
-| 03 建筑静态阴影 | 进行中（高级阶段） | 已从末端拦截转向上游写入链治理；当前主治理点是 `StaticStampPath`，`RegisterImageEntry` 退回到配套来源分类与兜底角色。 |
+| 03 建筑静态阴影 | 已结项（生产默认） | 稳定治理点为 `CUnitUIManager_RecordSetStructureShadow(0x335A00)`，阻断 UnitUI type record `buildingShadow(+0x50)`；ListB 默认移除旧单位 blob 圆影。 |
 | 04 架构重构 | 已完成 v1 | 入口瘦身、分域 Hook、AddressBook 与模块化文档已完成。 |
 | 05 JASS VM + 局部提交 | 已完成阶段目标 | 已建立 JASS 追踪与预算策略、局部合并提交实验链路，并纳入自动化回归。 |
 | 07/08 MainLoop 与 WaitGate | 进行中（方法论稳定） | 已完成深层拆解与口径澄清，默认采用“性能模式/分析模式”双配置。 |

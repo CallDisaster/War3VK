@@ -1,0 +1,1176 @@
+#include "war3_jass_command_bridge.h"
+
+#include "../../d3d9_war3_debug.h"
+#ifndef WAR3_SHADER_API_INTERNAL
+#define WAR3_SHADER_API_INTERNAL 1
+#endif
+#include "../../war3_shader_api.h"
+#include "../core/war3_internal_test_config.h"
+#include "../core/war3_memory.h"
+#include "../render/war3_lightning_runtime.h"
+
+#include "../../jass/war3_jass_convert.h"
+#include "../../jass/war3_jass_types.h"
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace dxvk::war3::hooks {
+
+namespace {
+
+constexpr size_t kNativeEntryFuncPtrOffset = 0x1C;
+constexpr size_t kNativeEntryParamCountOffset = 0x20;
+constexpr size_t kNativeEntrySigPtrOffset = 0x24;
+constexpr size_t kNativeEntryRetTypeOffset = 0x38;
+
+constexpr const char *kWarVkPrefix = "warvk:";
+constexpr uint32_t kMaxNativeStringBytes = 2048;
+
+using NativeVoidStringFn = void(__cdecl *)(uint32_t);
+using NativeIntStringFn = int(__cdecl *)(uint32_t);
+using NativeStringStringFn = uint32_t(__cdecl *)(uint32_t);
+using NativePlayerFn = uint32_t(__cdecl *)(int);
+using NativeGetLocalPlayerFn = uint32_t(__cdecl *)();
+using NativeDisplayTextToPlayerFn =
+    void(__cdecl *)(uint32_t, float *, float *, uint32_t);
+using NativeDisplayTimedTextToPlayerFn =
+    void(__cdecl *)(uint32_t, float *, float *, float *, uint32_t);
+
+enum class CarrierKind {
+  Command,
+  IntQuery,
+  StringQuery,
+};
+
+struct CarrierPatch {
+  const char *name = nullptr;
+  CarrierKind kind = CarrierKind::Command;
+  void *bridgeFn = nullptr;
+  std::atomic<uintptr_t> originalFn{0};
+  std::atomic<uintptr_t> entry{0};
+  std::atomic<uint64_t> handled{0};
+  std::atomic<uint64_t> passedThrough{0};
+  std::atomic<uint64_t> installCount{0};
+};
+
+struct BridgeState {
+  uint64_t commandCount = 0;
+  uint64_t intQueryCount = 0;
+  uint64_t stringQueryCount = 0;
+  int lastErrorCode = 0;
+  std::string lastErrorText = "ok";
+  std::string lastResult = "WarVK JASS bridge ready";
+};
+
+std::atomic<uintptr_t> s_lookupFn{0};
+std::atomic<bool> s_allInstalled{false};
+std::atomic<uint64_t> s_installAttempts{0};
+std::atomic<uint64_t> s_installSuccesses{0};
+std::mutex s_installMutex;
+std::mutex s_stateMutex;
+BridgeState s_state;
+
+bool StartsWith(const std::string &value, const char *prefix) {
+  const size_t n = std::strlen(prefix);
+  return value.size() >= n && std::memcmp(value.data(), prefix, n) == 0;
+}
+
+std::vector<std::string> SplitPipeArgs(const std::string &value) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (start <= value.size()) {
+    const size_t pos = value.find('|', start);
+    if (pos == std::string::npos) {
+      out.emplace_back(value.substr(start));
+      break;
+    }
+    out.emplace_back(value.substr(start, pos - start));
+    start = pos + 1;
+  }
+  return out;
+}
+
+bool ParseBoolArg(const std::string &value, bool &out) {
+  if (value == "1" || value == "true" || value == "TRUE" || value == "True") {
+    out = true;
+    return true;
+  }
+  if (value == "0" || value == "false" || value == "FALSE" ||
+      value == "False") {
+    out = false;
+    return true;
+  }
+  return false;
+}
+
+bool ParseIntArg(const std::string &value, int32_t &out) {
+  if (value.empty())
+    return false;
+  char *end = nullptr;
+  const long parsed = std::strtol(value.c_str(), &end, 0);
+  if (!end || *end != '\0')
+    return false;
+  out = static_cast<int32_t>(parsed);
+  return true;
+}
+
+bool ParseUIntArg(const std::string &value, uint32_t &out) {
+  int32_t parsed = 0;
+  if (!ParseIntArg(value, parsed) || parsed < 0)
+    return false;
+  out = static_cast<uint32_t>(parsed);
+  return true;
+}
+
+bool ParseFloatArg(const std::string &value, float &out) {
+  if (value.empty())
+    return false;
+  char *end = nullptr;
+  const float parsed = std::strtof(value.c_str(), &end);
+  if (!end || *end != '\0')
+    return false;
+  out = parsed;
+  return true;
+}
+
+void SetCommandOk(BridgeState &state, const std::string &result,
+                  std::string *stringResult) {
+  state.lastErrorCode = 0;
+  state.lastErrorText = "ok";
+  state.lastResult = result;
+  if (stringResult)
+    *stringResult = result;
+}
+
+int SetCommandFailure(BridgeState &state, int code, const std::string &message,
+                      std::string *stringResult) {
+  state.lastErrorCode = code;
+  state.lastErrorText = message;
+  state.lastResult = message;
+  if (stringResult)
+    *stringResult = message;
+  return code;
+}
+
+int HandleShaderApiCommand(BridgeState &state, const std::string &command,
+                           std::string *stringResult) {
+  const std::vector<std::string> args = SplitPipeArgs(command);
+  if (args.empty() || args[0].empty())
+    return SetCommandFailure(state, -400, "empty shader command",
+                             stringResult);
+
+  auto failArgs = [&]() {
+    return SetCommandFailure(state, -401, "bad args for command: " + args[0],
+                             stringResult);
+  };
+  auto okBool = [&](bool success) {
+    if (!success)
+      return SetCommandFailure(state, -500, "shader api failed: " + args[0],
+                               stringResult);
+    SetCommandOk(state, "ok:" + args[0], stringResult);
+    return 1;
+  };
+  auto parseBoolAt = [&](size_t index, bool &value) {
+    return index < args.size() && ParseBoolArg(args[index], value);
+  };
+  auto parseIntAt = [&](size_t index, int32_t &value) {
+    return index < args.size() && ParseIntArg(args[index], value);
+  };
+  auto parseUIntAt = [&](size_t index, uint32_t &value) {
+    return index < args.size() && ParseUIntArg(args[index], value);
+  };
+  auto parseFloatAt = [&](size_t index, float &value) {
+    return index < args.size() && ParseFloatArg(args[index], value);
+  };
+
+  if (args[0] == "add-point-light") {
+    float x, y, z, range, r, g, b, intensity, shadowIntensity;
+    if (args.size() != 10 || !parseFloatAt(1, x) || !parseFloatAt(2, y) ||
+        !parseFloatAt(3, z) || !parseFloatAt(4, range) ||
+        !parseFloatAt(5, r) || !parseFloatAt(6, g) ||
+        !parseFloatAt(7, b) || !parseFloatAt(8, intensity) ||
+        !parseFloatAt(9, shadowIntensity))
+      return failArgs();
+    const int32_t id = war3shader::AddPointLight(
+        x, y, z, range, r, g, b, intensity, shadowIntensity);
+    SetCommandOk(state, std::to_string(id), stringResult);
+    return id;
+  }
+
+  if (args[0] == "update-point-light") {
+    int32_t id;
+    float x, y, z, range, r, g, b, intensity;
+    if (args.size() != 10 || !parseIntAt(1, id) || !parseFloatAt(2, x) ||
+        !parseFloatAt(3, y) || !parseFloatAt(4, z) ||
+        !parseFloatAt(5, range) || !parseFloatAt(6, r) ||
+        !parseFloatAt(7, g) || !parseFloatAt(8, b) ||
+        !parseFloatAt(9, intensity))
+      return failArgs();
+    return okBool(war3shader::UpdatePointLight(id, x, y, z, range, r, g, b,
+                                               intensity));
+  }
+
+  if (args[0] == "remove-point-light") {
+    int32_t id;
+    if (args.size() != 2 || !parseIntAt(1, id))
+      return failArgs();
+    return okBool(war3shader::RemovePointLight(id));
+  }
+
+  if (args[0] == "outline-add-handle") {
+    uint32_t handle;
+    if (args.size() != 2 || !parseUIntAt(1, handle))
+      return failArgs();
+    war3shader::AddOutlineHandle(handle);
+    SetCommandOk(state, "ok:" + args[0], stringResult);
+    return 1;
+  }
+
+  if (args[0] == "outline-remove-handle") {
+    uint32_t handle;
+    if (args.size() != 2 || !parseUIntAt(1, handle))
+      return failArgs();
+    war3shader::RemoveOutlineHandle(handle);
+    SetCommandOk(state, "ok:" + args[0], stringResult);
+    return 1;
+  }
+
+  if (args[0] == "outline-clear-handles") {
+    war3shader::ClearOutlineHandles();
+    SetCommandOk(state, "ok:" + args[0], stringResult);
+    return 1;
+  }
+
+  if (args[0] == "bloom-add-handle") {
+    uint32_t handle;
+    float boost;
+    if (args.size() != 3 || !parseUIntAt(1, handle) || !parseFloatAt(2, boost))
+      return failArgs();
+    war3shader::AddBloomHandle(handle, boost);
+    SetCommandOk(state, "ok:" + args[0], stringResult);
+    return 1;
+  }
+
+  if (args[0] == "bloom-remove-handle") {
+    uint32_t handle;
+    if (args.size() != 2 || !parseUIntAt(1, handle))
+      return failArgs();
+    war3shader::RemoveBloomHandle(handle);
+    SetCommandOk(state, "ok:" + args[0], stringResult);
+    return 1;
+  }
+
+  if (args[0] == "bloom-clear-handles") {
+    war3shader::ClearBloomHandles();
+    SetCommandOk(state, "ok:" + args[0], stringResult);
+    return 1;
+  }
+
+  if (args[0] == "set-lighting-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetLightingEnabled(enabled));
+  }
+
+  if (args[0] == "set-sun-direction") {
+    float x, y, z;
+    if (args.size() != 4 || !parseFloatAt(1, x) || !parseFloatAt(2, y) ||
+        !parseFloatAt(3, z))
+      return failArgs();
+    return okBool(war3shader::SetSunDirection(x, y, z));
+  }
+
+  if (args[0] == "set-sun-color") {
+    float r, g, b;
+    if (args.size() != 4 || !parseFloatAt(1, r) || !parseFloatAt(2, g) ||
+        !parseFloatAt(3, b))
+      return failArgs();
+    return okBool(war3shader::SetSunColor(r, g, b));
+  }
+
+  if (args[0] == "set-sun-intensity") {
+    float value;
+    if (args.size() != 2 || !parseFloatAt(1, value))
+      return failArgs();
+    return okBool(war3shader::SetSunIntensity(value));
+  }
+
+  if (args[0] == "set-shadow-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetShadowEnabled(enabled));
+  }
+
+  if (args[0] == "set-shadow-strength") {
+    float value;
+    if (args.size() != 2 || !parseFloatAt(1, value))
+      return failArgs();
+    return okBool(war3shader::SetShadowStrength(value));
+  }
+
+  if (args[0] == "set-shadow-bias") {
+    float value;
+    if (args.size() != 2 || !parseFloatAt(1, value))
+      return failArgs();
+    return okBool(war3shader::SetShadowBias(value));
+  }
+
+  if (args[0] == "set-shadow-pcf-radius") {
+    float value;
+    if (args.size() != 2 || !parseFloatAt(1, value))
+      return failArgs();
+    return okBool(war3shader::SetShadowPcfRadius(value));
+  }
+
+  if (args[0] == "set-shadow-debug-mode") {
+    uint32_t mode;
+    if (args.size() != 2 || !parseUIntAt(1, mode))
+      return failArgs();
+    return okBool(war3shader::SetShadowDebugMode(mode));
+  }
+
+  if (args[0] == "set-point-lights-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetPointLightsEnabled(enabled));
+  }
+
+  if (args[0] == "set-point-shadow-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetPointShadowEnabled(enabled));
+  }
+
+  if (args[0] == "set-outline-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetOutlineEnabled(enabled));
+  }
+
+  if (args[0] == "set-outline-width") {
+    float value;
+    if (args.size() != 2 || !parseFloatAt(1, value))
+      return failArgs();
+    return okBool(war3shader::SetOutlineWidth(value));
+  }
+
+  if (args[0] == "set-outline-color") {
+    float r, g, b, a;
+    if (args.size() != 5 || !parseFloatAt(1, r) || !parseFloatAt(2, g) ||
+        !parseFloatAt(3, b) || !parseFloatAt(4, a))
+      return failArgs();
+    return okBool(war3shader::SetOutlineColor(r, g, b, a));
+  }
+
+  if (args[0] == "set-outline-mode") {
+    uint32_t mode;
+    if (args.size() != 2 || !parseUIntAt(1, mode))
+      return failArgs();
+    return okBool(war3shader::SetOutlineMode(mode));
+  }
+
+  if (args[0] == "set-outline-visibility") {
+    bool visible, occluded;
+    if (args.size() != 3 || !parseBoolAt(1, visible) ||
+        !parseBoolAt(2, occluded))
+      return failArgs();
+    return okBool(war3shader::SetOutlineVisibility(visible, occluded));
+  }
+
+  if (args[0] == "set-postfx-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetPostFxEnabled(enabled));
+  }
+
+  if (args[0] == "set-exposure") {
+    float value;
+    if (args.size() != 2 || !parseFloatAt(1, value))
+      return failArgs();
+    return okBool(war3shader::SetExposure(value));
+  }
+
+  if (args[0] == "set-bloom-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetBloomEnabled(enabled));
+  }
+
+  if (args[0] == "set-bloom-params") {
+    float threshold, softKnee, intensity;
+    if (args.size() != 4 || !parseFloatAt(1, threshold) ||
+        !parseFloatAt(2, softKnee) || !parseFloatAt(3, intensity))
+      return failArgs();
+    return okBool(war3shader::SetBloomParams(threshold, softKnee, intensity));
+  }
+
+  if (args[0] == "set-aces-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetAcesEnabled(enabled));
+  }
+
+  if (args[0] == "set-ssao-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetSsaoEnabled(enabled));
+  }
+
+  if (args[0] == "set-ssao-params") {
+    float radius, strength, bias, power;
+    if (args.size() != 5 || !parseFloatAt(1, radius) ||
+        !parseFloatAt(2, strength) || !parseFloatAt(3, bias) ||
+        !parseFloatAt(4, power))
+      return failArgs();
+    return okBool(war3shader::SetSsaoParams(radius, strength, bias, power));
+  }
+
+  if (args[0] == "set-aa-mode") {
+    uint32_t mode;
+    if (args.size() != 2 || !parseUIntAt(1, mode))
+      return failArgs();
+    return okBool(war3shader::SetAaMode(mode));
+  }
+
+  if (args[0] == "set-fxaa-params") {
+    float subpix, threshold, minThreshold;
+    if (args.size() != 4 || !parseFloatAt(1, subpix) ||
+        !parseFloatAt(2, threshold) || !parseFloatAt(3, minThreshold))
+      return failArgs();
+    return okBool(war3shader::SetFxaaParams(subpix, threshold, minThreshold));
+  }
+
+  if (args[0] == "set-smaa-params") {
+    float threshold;
+    int32_t search, diagSearch;
+    if (args.size() != 4 || !parseFloatAt(1, threshold) ||
+        !parseIntAt(2, search) || !parseIntAt(3, diagSearch))
+      return failArgs();
+    return okBool(war3shader::SetSmaaParams(threshold, search, diagSearch));
+  }
+
+  if (args[0] == "set-day-night-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetDayNightEnabled(enabled));
+  }
+
+  if (args[0] == "set-day-night-min-factor") {
+    float value;
+    if (args.size() != 2 || !parseFloatAt(1, value))
+      return failArgs();
+    return okBool(war3shader::SetDayNightMinFactor(value));
+  }
+
+  if (args[0] == "set-day-night-ambient") {
+    float dayR, dayG, dayB, nightR, nightG, nightB;
+    if (args.size() != 7 || !parseFloatAt(1, dayR) ||
+        !parseFloatAt(2, dayG) || !parseFloatAt(3, dayB) ||
+        !parseFloatAt(4, nightR) || !parseFloatAt(5, nightG) ||
+        !parseFloatAt(6, nightB))
+      return failArgs();
+    return okBool(war3shader::SetDayNightAmbient(dayR, dayG, dayB, nightR,
+                                                 nightG, nightB));
+  }
+
+  if (args[0] == "lightning-create") {
+    float x0, y0, z0, x1, y1, z1;
+    if (args.size() != 7 || !parseFloatAt(1, x0) || !parseFloatAt(2, y0) ||
+        !parseFloatAt(3, z0) || !parseFloatAt(4, x1) ||
+        !parseFloatAt(5, y1) || !parseFloatAt(6, z1)) {
+      dxvk::war3::render::War3LightningRuntime::instance().noteCommandFailure();
+      return failArgs();
+    }
+    dxvk::war3::render::War3LightningCreateDesc desc = {};
+    desc.start = {x0, y0, z0};
+    desc.end = {x1, y1, z1};
+    const int32_t id =
+        dxvk::war3::render::War3LightningRuntime::instance().create(desc);
+    SetCommandOk(state, std::to_string(id), stringResult);
+    return id;
+  }
+
+  if (args[0] == "lightning-move") {
+    int32_t id;
+    float x0, y0, z0, x1, y1, z1;
+    if (args.size() != 8 || !parseIntAt(1, id) || !parseFloatAt(2, x0) ||
+        !parseFloatAt(3, y0) || !parseFloatAt(4, z0) ||
+        !parseFloatAt(5, x1) || !parseFloatAt(6, y1) ||
+        !parseFloatAt(7, z1)) {
+      dxvk::war3::render::War3LightningRuntime::instance().noteCommandFailure();
+      return failArgs();
+    }
+    return okBool(dxvk::war3::render::War3LightningRuntime::instance().move(
+        id, {x0, y0, z0}, {x1, y1, z1}));
+  }
+
+  if (args[0] == "lightning-destroy") {
+    int32_t id;
+    if (args.size() != 2 || !parseIntAt(1, id)) {
+      dxvk::war3::render::War3LightningRuntime::instance().noteCommandFailure();
+      return failArgs();
+    }
+    return okBool(
+        dxvk::war3::render::War3LightningRuntime::instance().destroy(id));
+  }
+
+  if (args[0] == "lightning-set-color") {
+    int32_t id;
+    float r0, g0, b0, a0, r1, g1, b1, a1;
+    if (args.size() != 10 || !parseIntAt(1, id) || !parseFloatAt(2, r0) ||
+        !parseFloatAt(3, g0) || !parseFloatAt(4, b0) ||
+        !parseFloatAt(5, a0) || !parseFloatAt(6, r1) ||
+        !parseFloatAt(7, g1) || !parseFloatAt(8, b1) ||
+        !parseFloatAt(9, a1)) {
+      dxvk::war3::render::War3LightningRuntime::instance().noteCommandFailure();
+      return failArgs();
+    }
+    return okBool(dxvk::war3::render::War3LightningRuntime::instance().setColor(
+        id, r0, g0, b0, a0, r1, g1, b1, a1));
+  }
+
+  if (args[0] == "lightning-set-width") {
+    int32_t id;
+    float startWidth, endWidth;
+    if (args.size() != 4 || !parseIntAt(1, id) ||
+        !parseFloatAt(2, startWidth) || !parseFloatAt(3, endWidth)) {
+      dxvk::war3::render::War3LightningRuntime::instance().noteCommandFailure();
+      return failArgs();
+    }
+    return okBool(dxvk::war3::render::War3LightningRuntime::instance().setWidth(
+        id, startWidth, endWidth));
+  }
+
+  if (args[0] == "lightning-set-curve") {
+    int32_t id;
+    float curve, noise;
+    uint32_t segments, branches;
+    if (args.size() != 6 || !parseIntAt(1, id) ||
+        !parseFloatAt(2, curve) || !parseFloatAt(3, noise) ||
+        !parseUIntAt(4, segments) || !parseUIntAt(5, branches)) {
+      dxvk::war3::render::War3LightningRuntime::instance().noteCommandFailure();
+      return failArgs();
+    }
+    return okBool(dxvk::war3::render::War3LightningRuntime::instance().setCurve(
+        id, curve, noise, segments, branches));
+  }
+
+  if (args[0] == "lightning-set-lifetime") {
+    int32_t id;
+    float lifetime, fadeIn, fadeOut;
+    if (args.size() != 5 || !parseIntAt(1, id) ||
+        !parseFloatAt(2, lifetime) || !parseFloatAt(3, fadeIn) ||
+        !parseFloatAt(4, fadeOut)) {
+      dxvk::war3::render::War3LightningRuntime::instance().noteCommandFailure();
+      return failArgs();
+    }
+    return okBool(
+        dxvk::war3::render::War3LightningRuntime::instance().setLifetime(
+            id, lifetime, fadeIn, fadeOut));
+  }
+
+  if (args[0] == "lightning-set-pulse") {
+    int32_t id;
+    float amplitude, frequencyHz;
+    if (args.size() != 4 || !parseIntAt(1, id) ||
+        !parseFloatAt(2, amplitude) || !parseFloatAt(3, frequencyHz)) {
+      dxvk::war3::render::War3LightningRuntime::instance().noteCommandFailure();
+      return failArgs();
+    }
+    return okBool(dxvk::war3::render::War3LightningRuntime::instance().setPulse(
+        id, amplitude, frequencyHz));
+  }
+
+  if (args[0] == "lightning-active-count") {
+    const auto summary =
+        dxvk::war3::render::War3LightningRuntime::instance().snapshot();
+    SetCommandOk(state, std::to_string(summary.activeCount), stringResult);
+    return static_cast<int>(summary.activeCount);
+  }
+
+  if (args[0] == "lightning-stats") {
+    const std::string stats =
+        dxvk::war3::render::War3LightningRuntime::instance().statsString();
+    SetCommandOk(state, stats, stringResult);
+    return static_cast<int>(
+        dxvk::war3::render::War3LightningRuntime::instance()
+            .snapshot()
+            .activeCount);
+  }
+
+  // Unknown cmd: commands are accepted as a forward-compatible smoke path.
+  SetCommandOk(state, "accepted:" + command, stringResult);
+  war3dbg::Print("DXVK War3JassBridge: accepted generic command '%s'\n",
+                 command.c_str());
+  return 1;
+}
+
+bool CopyCStringBounded(const char *src, std::string &out) {
+  out.clear();
+  if (!src)
+    return false;
+
+  for (uint32_t i = 0; i < kMaxNativeStringBytes; ++i) {
+    if (!dxvk::war3::IsReadableRange(src + i, 1))
+      return false;
+
+    const char c = src[i];
+    if (c == '\0')
+      return true;
+    out.push_back(c);
+  }
+
+  out.clear();
+  return false;
+}
+
+bool ReadCStringPtr(const void *base, size_t offset, std::string &out) {
+  const char *str = nullptr;
+  if (!dxvk::war3::SafeRead<const char *>(base, offset, str))
+    return false;
+  return CopyCStringBounded(str, out);
+}
+
+bool DecodeNativeStringArg(uint32_t nativeArg, std::string &out) {
+  out.clear();
+  if (!nativeArg)
+    return false;
+
+  const void *arg = reinterpret_cast<const void *>(static_cast<uintptr_t>(nativeArg));
+
+  // Original ExecuteNativeFunction converts JASS string handles to native string
+  // memory. In 1.27a this is normally RCString*, whose +0x8 points to CStringRep
+  // and CStringRep+0x1C points to the char buffer.
+  void *rep = nullptr;
+  if (dxvk::war3::SafeReadPtr(arg, 0x8, rep) && rep &&
+      ReadCStringPtr(rep, 0x1C, out)) {
+    return true;
+  }
+
+  // Some string helpers work directly with CStringRep*.
+  if (ReadCStringPtr(arg, 0x1C, out))
+    return true;
+
+  // Last-resort safety net for functions that may receive const char*.
+  return CopyCStringBounded(reinterpret_cast<const char *>(arg), out);
+}
+
+bool ReadNativeMeta(void *entry, void *&funcPtr, const char *&sigPtr,
+                    uint32_t &paramCount, uint32_t &retType) {
+  if (!entry)
+    return false;
+  if (!dxvk::war3::SafeReadPtr(entry, kNativeEntryFuncPtrOffset, funcPtr))
+    return false;
+  if (!dxvk::war3::SafeRead<const char *>(entry, kNativeEntrySigPtrOffset,
+                                          sigPtr))
+    return false;
+  if (!dxvk::war3::SafeReadU32(entry, kNativeEntryParamCountOffset, paramCount))
+    return false;
+  if (!dxvk::war3::SafeReadU32(entry, kNativeEntryRetTypeOffset, retType))
+    return false;
+  return funcPtr && sigPtr;
+}
+
+void *LookupNativeEntry(const char *name) {
+  const auto lookupFn = reinterpret_cast<GetTlsJassDataFn>(
+      s_lookupFn.load(std::memory_order_relaxed));
+  if (!lookupFn || !name)
+    return nullptr;
+  return lookupFn(const_cast<char *>(name));
+}
+
+void *ReadCurrentNativeFunc(void *entry) {
+  void *funcPtr = nullptr;
+  if (!entry)
+    return nullptr;
+  if (!dxvk::war3::SafeReadPtr(entry, kNativeEntryFuncPtrOffset, funcPtr))
+    return nullptr;
+  return funcPtr;
+}
+
+bool SignatureLooksLikeOneStringArg(const char *sigPtr) {
+  if (!sigPtr || !dxvk::war3::IsReadableRange(sigPtr, 4))
+    return false;
+  return sigPtr[0] == '(' && sigPtr[1] == 'S';
+}
+
+bool WriteNativeFuncPtr(void *entry, void *bridgeFn) {
+  if (!entry || !bridgeFn)
+    return false;
+
+  void **slot = reinterpret_cast<void **>(
+      reinterpret_cast<uint8_t *>(entry) + kNativeEntryFuncPtrOffset);
+  if (!dxvk::war3::IsReadableRange(slot, sizeof(void *)))
+    return false;
+
+  DWORD oldProtect = 0;
+  if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &oldProtect))
+    return false;
+  *slot = bridgeFn;
+  FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void *));
+  DWORD ignored = 0;
+  VirtualProtect(slot, sizeof(void *), oldProtect, &ignored);
+  return true;
+}
+
+int HandleWarVkPayload(CarrierKind kind, const std::string &payload,
+                       std::string *stringResult) {
+  std::lock_guard<std::mutex> lock(s_stateMutex);
+  switch (kind) {
+  case CarrierKind::Command:
+    s_state.commandCount += 1;
+    break;
+  case CarrierKind::IntQuery:
+    s_state.intQueryCount += 1;
+    break;
+  case CarrierKind::StringQuery:
+    s_state.stringQueryCount += 1;
+    break;
+  }
+
+  if (payload == "ping") {
+    s_state.lastErrorCode = 0;
+    s_state.lastErrorText = "ok";
+    s_state.lastResult = "pong";
+    if (stringResult)
+      *stringResult = s_state.lastResult;
+    return 1;
+  }
+
+  if (payload == "version") {
+    s_state.lastErrorCode = 0;
+    s_state.lastErrorText = "ok";
+    s_state.lastResult = "WarVK JASS bridge v1";
+    if (stringResult)
+      *stringResult = s_state.lastResult;
+    return 1;
+  }
+
+  if (payload == "plugin-version") {
+    s_state.lastErrorCode = 0;
+    s_state.lastErrorText = "ok";
+    s_state.lastResult = "1";
+    if (stringResult)
+      *stringResult = s_state.lastResult;
+    return 1;
+  }
+
+  if (payload == "game-version") {
+    s_state.lastErrorCode = 0;
+    s_state.lastErrorText = "ok";
+    s_state.lastResult = "634";
+    if (stringResult)
+      *stringResult = s_state.lastResult;
+    return 0x27A;
+  }
+
+  if (payload == "game-time-ms") {
+    const int gameTimeMs =
+        static_cast<int>(war3shader::GetGameTime() * 1000.0f);
+    s_state.lastErrorCode = 0;
+    s_state.lastErrorText = "ok";
+    s_state.lastResult = std::to_string(gameTimeMs);
+    if (stringResult)
+      *stringResult = s_state.lastResult;
+    return gameTimeMs;
+  }
+
+  if (payload == "last-error") {
+    if (stringResult)
+      *stringResult = s_state.lastErrorText;
+    return s_state.lastErrorCode;
+  }
+
+  if (payload == "last-result") {
+    if (stringResult)
+      *stringResult = s_state.lastResult;
+    return s_state.lastErrorCode == 0 ? 1 : s_state.lastErrorCode;
+  }
+
+  if (payload == "stats") {
+    if (stringResult) {
+      char buffer[256] = {};
+      std::snprintf(
+          buffer, sizeof(buffer),
+          "commands=%llu intQueries=%llu stringQueries=%llu lastError=%d",
+          static_cast<unsigned long long>(s_state.commandCount),
+          static_cast<unsigned long long>(s_state.intQueryCount),
+          static_cast<unsigned long long>(s_state.stringQueryCount),
+          s_state.lastErrorCode);
+      *stringResult = buffer;
+    }
+    return 1;
+  }
+
+  if (StartsWith(payload, "log:")) {
+    s_state.lastErrorCode = 0;
+    s_state.lastErrorText = "ok";
+    s_state.lastResult = payload.substr(4);
+    war3dbg::Print("DXVK War3JassBridge: script log: %s\n",
+                   s_state.lastResult.c_str());
+    if (stringResult)
+      *stringResult = s_state.lastResult;
+    return 1;
+  }
+
+  if (StartsWith(payload, "cmd:")) {
+    return HandleShaderApiCommand(s_state, payload.substr(4), stringResult);
+  }
+
+  s_state.lastErrorCode = -404;
+  s_state.lastErrorText = "unknown command: " + payload;
+  s_state.lastResult = s_state.lastErrorText;
+  if (stringResult)
+    *stringResult = s_state.lastErrorText;
+  war3dbg::Print("DXVK War3JassBridge: unknown command '%s'\n",
+                 payload.c_str());
+  return s_state.lastErrorCode;
+}
+
+bool TryHandleCarrier(CarrierPatch &patch, uint32_t nativeArg, int *intResult,
+                      uint32_t *stringResult) {
+  std::string command;
+  if (!DecodeNativeStringArg(nativeArg, command) || !StartsWith(command, kWarVkPrefix)) {
+    patch.passedThrough.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  const std::string payload = command.substr(std::strlen(kWarVkPrefix));
+  std::string text;
+  const int code = HandleWarVkPayload(patch.kind, payload, &text);
+  patch.handled.fetch_add(1, std::memory_order_relaxed);
+
+  if (intResult)
+    *intResult = code;
+  if (stringResult) {
+    const jString s = jass::convert::to_jString(text);
+    *stringResult = s;
+    if (!s) {
+      std::lock_guard<std::mutex> lock(s_stateMutex);
+      s_state.lastErrorCode = -501;
+      s_state.lastErrorText = "to_jString failed";
+      s_state.lastResult = s_state.lastErrorText;
+    }
+  }
+  return true;
+}
+
+uint32_t MakeSyntheticNativeStringArg(const char *text) {
+  struct SyntheticCStringRep {
+    void **vfTable = nullptr;
+    uint32_t refCount = 1;
+    int32_t stringHash = 0;
+    uint32_t reserved0C = 0;
+    const SyntheticCStringRep *nextString = nullptr;
+    uint32_t reserved14 = 0;
+    uint32_t reserved18 = 0;
+    const char *str = "";
+  };
+
+  struct SyntheticRCString {
+    void **vfTable = nullptr;
+    uint32_t refCount = 1;
+    const SyntheticCStringRep *stringRep = nullptr;
+  };
+
+  struct SyntheticNativeString {
+    SyntheticCStringRep rep;
+    SyntheticRCString rc;
+  };
+
+  static_assert(offsetof(SyntheticRCString, stringRep) == 0x8,
+                "SyntheticRCString must match RCString string_rep offset");
+  static_assert(offsetof(SyntheticCStringRep, str) == 0x1C,
+                "SyntheticCStringRep must match CStringRep str offset");
+
+  thread_local SyntheticNativeString s = {};
+  s.rep.str = text ? text : "";
+  s.rc.stringRep = &s.rep;
+  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&s.rc));
+}
+
+void __cdecl Bridge_Preloader(uint32_t nativeArg);
+int __cdecl Bridge_GetLocalizedHotkey(uint32_t nativeArg);
+uint32_t __cdecl Bridge_GetLocalizedString(uint32_t nativeArg);
+
+CarrierPatch s_preloader{
+    "Preloader", CarrierKind::Command,
+    reinterpret_cast<void *>(&Bridge_Preloader)};
+CarrierPatch s_hotkey{
+    "GetLocalizedHotkey", CarrierKind::IntQuery,
+    reinterpret_cast<void *>(&Bridge_GetLocalizedHotkey)};
+CarrierPatch s_string{
+    "GetLocalizedString", CarrierKind::StringQuery,
+    reinterpret_cast<void *>(&Bridge_GetLocalizedString)};
+
+CarrierPatch *AllCarriers[] = {&s_preloader, &s_hotkey, &s_string};
+
+void CallOriginalVoid(CarrierPatch &patch, uint32_t nativeArg) {
+  const auto fn = reinterpret_cast<NativeVoidStringFn>(
+      patch.originalFn.load(std::memory_order_relaxed));
+  if (fn)
+    fn(nativeArg);
+}
+
+int CallOriginalInt(CarrierPatch &patch, uint32_t nativeArg) {
+  const auto fn = reinterpret_cast<NativeIntStringFn>(
+      patch.originalFn.load(std::memory_order_relaxed));
+  return fn ? fn(nativeArg) : 0;
+}
+
+uint32_t CallOriginalString(CarrierPatch &patch, uint32_t nativeArg) {
+  const auto fn = reinterpret_cast<NativeStringStringFn>(
+      patch.originalFn.load(std::memory_order_relaxed));
+  return fn ? fn(nativeArg) : 0;
+}
+
+void __cdecl Bridge_Preloader(uint32_t nativeArg) {
+  if (!dxvk::war3::internal::kWar3JassCommandBridgeEnabled) {
+    CallOriginalVoid(s_preloader, nativeArg);
+    return;
+  }
+  if (TryHandleCarrier(s_preloader, nativeArg, nullptr, nullptr))
+    return;
+  CallOriginalVoid(s_preloader, nativeArg);
+}
+
+int __cdecl Bridge_GetLocalizedHotkey(uint32_t nativeArg) {
+  if (!dxvk::war3::internal::kWar3JassCommandBridgeEnabled)
+    return CallOriginalInt(s_hotkey, nativeArg);
+
+  int result = 0;
+  if (TryHandleCarrier(s_hotkey, nativeArg, &result, nullptr))
+    return result;
+  return CallOriginalInt(s_hotkey, nativeArg);
+}
+
+uint32_t __cdecl Bridge_GetLocalizedString(uint32_t nativeArg) {
+  if (!dxvk::war3::internal::kWar3JassCommandBridgeEnabled)
+    return CallOriginalString(s_string, nativeArg);
+
+  uint32_t result = 0;
+  if (TryHandleCarrier(s_string, nativeArg, nullptr, &result)) {
+    if (result)
+      return result;
+    return CallOriginalString(s_string, nativeArg);
+  }
+  return CallOriginalString(s_string, nativeArg);
+}
+
+bool InstallCarrier(GetTlsJassDataFn lookupFn, CarrierPatch &patch) {
+  if (!lookupFn || !patch.name || !patch.bridgeFn)
+    return false;
+
+  void *entry = lookupFn(const_cast<char *>(patch.name));
+  if (!entry)
+    return false;
+
+  void *funcPtr = nullptr;
+  const char *sigPtr = nullptr;
+  uint32_t paramCount = 0;
+  uint32_t retType = 0;
+  if (!ReadNativeMeta(entry, funcPtr, sigPtr, paramCount, retType))
+    return false;
+  if (paramCount != 1 || !SignatureLooksLikeOneStringArg(sigPtr)) {
+    war3dbg::Print(
+        "DXVK War3JassBridge: skip %s unexpected signature sig=%s argc=%u ret=%u\n",
+        patch.name, sigPtr ? sigPtr : "<null>", paramCount, retType);
+    return false;
+  }
+
+  if (funcPtr == patch.bridgeFn) {
+    patch.entry.store(reinterpret_cast<uintptr_t>(entry),
+                      std::memory_order_relaxed);
+    return true;
+  }
+
+  patch.originalFn.store(reinterpret_cast<uintptr_t>(funcPtr),
+                         std::memory_order_relaxed);
+  if (!WriteNativeFuncPtr(entry, patch.bridgeFn))
+    return false;
+
+  patch.entry.store(reinterpret_cast<uintptr_t>(entry),
+                    std::memory_order_relaxed);
+  patch.installCount.fetch_add(1, std::memory_order_relaxed);
+  war3dbg::Print(
+      "DXVK War3JassBridge: installed carrier %s entry=%p original=%p bridge=%p sig=%s ret=%u\n",
+      patch.name, entry, funcPtr, patch.bridgeFn, sigPtr, retType);
+  return true;
+}
+
+} // namespace
+
+void ConfigureJassCommandBridge(GetTlsJassDataFn lookupFn) {
+  s_lookupFn.store(reinterpret_cast<uintptr_t>(lookupFn),
+                   std::memory_order_relaxed);
+  s_allInstalled.store(false, std::memory_order_relaxed);
+}
+
+void ResetJassCommandBridgeInstallState() {
+  std::lock_guard<std::mutex> lock(s_installMutex);
+  s_allInstalled.store(false, std::memory_order_release);
+  for (CarrierPatch *patch : AllCarriers) {
+    patch->entry.store(0, std::memory_order_relaxed);
+    patch->originalFn.store(0, std::memory_order_relaxed);
+  }
+}
+
+void TryInstallJassCommandBridge(const char *reason) {
+  if constexpr (!dxvk::war3::internal::kWar3JassCommandBridgeEnabled) {
+    return;
+  }
+
+  if (s_allInstalled.load(std::memory_order_acquire))
+    return;
+
+  const auto lookupFn = reinterpret_cast<GetTlsJassDataFn>(
+      s_lookupFn.load(std::memory_order_relaxed));
+  if (!lookupFn)
+    return;
+
+  std::lock_guard<std::mutex> lock(s_installMutex);
+  if (s_allInstalled.load(std::memory_order_relaxed))
+    return;
+
+  const uint64_t attempt =
+      s_installAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  bool allOk = true;
+  for (CarrierPatch *patch : AllCarriers) {
+    allOk = InstallCarrier(lookupFn, *patch) && allOk;
+  }
+
+  if (allOk) {
+    s_allInstalled.store(true, std::memory_order_release);
+    const uint64_t success =
+        s_installSuccesses.fetch_add(1, std::memory_order_relaxed) + 1;
+    war3dbg::Print(
+        "DXVK War3JassBridge: all carriers installed reason=%s attempt=%llu success=%llu\n",
+        reason ? reason : "<unknown>",
+        static_cast<unsigned long long>(attempt),
+        static_cast<unsigned long long>(success));
+  } else if (attempt <= 8 || (attempt % 128) == 0) {
+    war3dbg::Print(
+        "DXVK War3JassBridge: carrier install incomplete reason=%s attempt=%llu preloader=%p hotkey=%p string=%p\n",
+        reason ? reason : "<unknown>",
+        static_cast<unsigned long long>(attempt),
+        reinterpret_cast<void *>(s_preloader.entry.load(std::memory_order_relaxed)),
+        reinterpret_cast<void *>(s_hotkey.entry.load(std::memory_order_relaxed)),
+        reinterpret_cast<void *>(s_string.entry.load(std::memory_order_relaxed)));
+  }
+}
+
+bool IsJassCommandBridgeInstalled() {
+  return s_allInstalled.load(std::memory_order_acquire);
+}
+
+JassCommandBridgeSelfTestResult RunJassCommandBridgeSelfTest(bool displayText) {
+  JassCommandBridgeSelfTestResult result = {};
+
+  TryInstallJassCommandBridge("selftest");
+  result.installed = IsJassCommandBridgeInstalled();
+  if (!result.installed) {
+    result.error = "bridge carriers are not installed";
+    return result;
+  }
+
+  auto *preEntry = reinterpret_cast<void *>(
+      s_preloader.entry.load(std::memory_order_relaxed));
+  auto *hotkeyEntry =
+      reinterpret_cast<void *>(s_hotkey.entry.load(std::memory_order_relaxed));
+  auto *stringEntry =
+      reinterpret_cast<void *>(s_string.entry.load(std::memory_order_relaxed));
+
+  const auto preloaderFn =
+      reinterpret_cast<NativeVoidStringFn>(ReadCurrentNativeFunc(preEntry));
+  const auto hotkeyFn =
+      reinterpret_cast<NativeIntStringFn>(ReadCurrentNativeFunc(hotkeyEntry));
+  const auto stringFn = reinterpret_cast<NativeStringStringFn>(
+      ReadCurrentNativeFunc(stringEntry));
+
+  if (!preloaderFn || !hotkeyFn || !stringFn) {
+    result.error = "failed to read carrier native function pointers";
+    return result;
+  }
+
+  preloaderFn(MakeSyntheticNativeStringArg("warvk:log:selftest-from-native"));
+  result.preloaderOk = true;
+
+  result.pingCode = hotkeyFn(MakeSyntheticNativeStringArg("warvk:ping"));
+  result.intQueryOk = result.pingCode == 1;
+
+  result.versionStringHandle =
+      stringFn(MakeSyntheticNativeStringArg("warvk:version"));
+  if (result.versionStringHandle != 0) {
+    const char *text = jass::convert::to_CString(result.versionStringHandle);
+    result.versionText = text ? text : "";
+    result.stringQueryOk = result.versionText.find("WarVK JASS bridge") !=
+                           std::string::npos;
+  }
+
+  if (displayText) {
+    result.displayTextAttempted = true;
+    void *playerEntry = LookupNativeEntry("Player");
+    void *localPlayerEntry = LookupNativeEntry("GetLocalPlayer");
+    void *displayEntry = LookupNativeEntry("DisplayTextToPlayer");
+    void *timedDisplayEntry = LookupNativeEntry("DisplayTimedTextToPlayer");
+    const auto playerFn =
+        reinterpret_cast<NativePlayerFn>(ReadCurrentNativeFunc(playerEntry));
+    const auto localPlayerFn = reinterpret_cast<NativeGetLocalPlayerFn>(
+        ReadCurrentNativeFunc(localPlayerEntry));
+    const auto displayFn = reinterpret_cast<NativeDisplayTextToPlayerFn>(
+        ReadCurrentNativeFunc(displayEntry));
+    const auto timedDisplayFn = reinterpret_cast<NativeDisplayTimedTextToPlayerFn>(
+        ReadCurrentNativeFunc(timedDisplayEntry));
+    if ((!playerFn && !localPlayerFn) || (!displayFn && !timedDisplayFn)) {
+      result.error =
+          "failed to resolve player getter or DisplayTextToPlayer/DisplayTimedTextToPlayer";
+      return result;
+    }
+
+    result.playerHandle = localPlayerFn ? localPlayerFn() : 0;
+    if (!result.playerHandle && playerFn)
+      result.playerHandle = playerFn(0);
+    if (!result.playerHandle) {
+      result.error = "GetLocalPlayer/Player(0) returned null handle";
+      return result;
+    }
+
+    float x = 0.02f;
+    float y = 0.18f;
+    uint32_t messageArg = MakeSyntheticNativeStringArg(
+        "WarVK direct native call OK: DisplayTimedTextToPlayer");
+    if (timedDisplayFn) {
+      float duration = 60.0f;
+      timedDisplayFn(result.playerHandle, &x, &y, &duration, messageArg);
+    } else {
+      displayFn(result.playerHandle, &x, &y, messageArg);
+    }
+    result.displayTextOk = true;
+  }
+
+  if (!result.intQueryOk || !result.stringQueryOk) {
+    result.error = "carrier selftest did not return expected values";
+  }
+  return result;
+}
+
+} // namespace dxvk::war3::hooks

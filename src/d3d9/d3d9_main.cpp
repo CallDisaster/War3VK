@@ -1,11 +1,18 @@
 #include "../dxvk/dxvk_instance.h"
 
+#include "d3d9_war3_hook.h"
 #include "d3d9_interface.h"
 #include "d3d9_shader_validator.h"
+#include "war3/hooks/war3_hook_jass.h"
+#include "war3/platform/war3_native_device_resolver.h"
 
 #include "d3d9_annotation.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 class D3DFE_PROCESSVERTICES;
 using PSGPERRORID = UINT;
@@ -25,7 +32,140 @@ HRESULT CreateD3D9(bool Extended, IDirect3D9Ex **ppDirect3D9Ex,
 }
 } // namespace dxvk
 
+namespace {
+
+std::atomic<bool> g_warVkDirectLoadBootstrapStarted{false};
+
+void AppendWarVkBootstrapMarker(const char *phase, const char *source) {
+  char tempPath[MAX_PATH] = {};
+  const DWORD tempLen = ::GetTempPathA(sizeof(tempPath), tempPath);
+  if (tempLen == 0 || tempLen >= sizeof(tempPath))
+    return;
+
+  char markerPath[MAX_PATH] = {};
+  std::snprintf(markerPath, sizeof(markerPath),
+                "%swarvk_bootstrap_marker_%lu.log", tempPath,
+                static_cast<unsigned long>(::GetCurrentProcessId()));
+
+  HANDLE file = ::CreateFileA(markerPath, FILE_APPEND_DATA,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE)
+    return;
+
+  char line[256] = {};
+  const int len = std::snprintf(
+      line, sizeof(line), "tick=%lu phase=%s source=%s gameDll=%p\n",
+      static_cast<unsigned long>(::GetTickCount()),
+      phase ? phase : "<null>", source ? source : "<null>",
+      ::GetModuleHandleA("Game.dll"));
+  if (len > 0) {
+    DWORD written = 0;
+    ::WriteFile(file, line, static_cast<DWORD>(std::min<int>(len, sizeof(line))),
+                &written, nullptr);
+  }
+  ::CloseHandle(file);
+}
+
+DWORD WINAPI WarVkDirectLoadBootstrapThread(LPVOID) {
+  AppendWarVkBootstrapMarker("thread-start", "direct-load");
+  OutputDebugStringA("DXVK WarVK: direct-load bootstrap thread started\n");
+
+  // JASS-side loaders may LoadLibrary this DLL after Game.dll is already
+  // present, but waiting a little makes the entry safe for earlier injectors too.
+  uintptr_t gameBase = 0;
+  for (uint32_t i = 0; i < 200; ++i) {
+    gameBase = reinterpret_cast<uintptr_t>(::GetModuleHandleA("Game.dll"));
+    if (gameBase != 0)
+      break;
+    ::Sleep(50);
+  }
+
+  if (gameBase != 0) {
+    AppendWarVkBootstrapMarker("activate-runtime-begin", "direct-load");
+    dxvk::TryInstallShadowHooksEarly(gameBase, "DirectLoadBootstrap_PreActivate");
+    dxvk::ActivateWar3Runtime(gameBase, "DirectLoadBootstrap");
+    AppendWarVkBootstrapMarker("activate-runtime-end", "direct-load");
+    const bool bridgeInstalled =
+        dxvk::war3::hooks::War3HookJass::InstallCommandBridgeOnly(
+            gameBase, "DirectLoadBootstrap");
+    AppendWarVkBootstrapMarker(bridgeInstalled ? "jass-bridge-installed"
+                                               : "jass-bridge-incomplete",
+                               "direct-load");
+  } else {
+    AppendWarVkBootstrapMarker("no-game-dll", "direct-load");
+  }
+
+  // In proxy mode the device is passed through Direct3DCreate9. In mid-game
+  // LoadLibrary mode War3 already owns the native D3D9 device, so resolve the
+  // CGxDeviceD3d singleton instead. Keep this bounded and non-fatal.
+  for (uint32_t i = 0; i < 240; ++i) {
+    if (dxvk::war3::platform::TryBindNativeDeviceFromWar3Globals(
+            "DirectLoadBootstrap", i == 0u)) {
+      AppendWarVkBootstrapMarker("native-device-bound", "direct-load");
+      break;
+    }
+    ::Sleep(500);
+  }
+  return 0;
+}
+
+void StartWarVkDirectLoadBootstrap(const char *source) {
+  bool expected = false;
+  if (!g_warVkDirectLoadBootstrapStarted.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  char buffer[160] = {};
+  std::snprintf(buffer, sizeof(buffer),
+                "DXVK WarVK: direct-load bootstrap requested source=%s\n",
+                source ? source : "<unknown>");
+  OutputDebugStringA(buffer);
+  AppendWarVkBootstrapMarker("request", source);
+
+  HANDLE thread =
+      ::CreateThread(nullptr, 0, &WarVkDirectLoadBootstrapThread, nullptr, 0,
+                     nullptr);
+  if (thread) {
+    ::CloseHandle(thread);
+  } else {
+    g_warVkDirectLoadBootstrapStarted.store(false, std::memory_order_release);
+    AppendWarVkBootstrapMarker("thread-create-failed", source);
+  }
+}
+
+bool ShouldBootstrapFromDllMain() {
+  const char *value = std::getenv("DXVK_WARVK_BOOTSTRAP_ON_DLLMAIN");
+  if (!value)
+    return false;
+  return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+         std::strcmp(value, "TRUE") == 0 || std::strcmp(value, "True") == 0;
+}
+
+} // namespace
+
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
+  if (reason == DLL_PROCESS_ATTACH) {
+    ::DisableThreadLibraryCalls(instance);
+    if (ShouldBootstrapFromDllMain())
+      StartWarVkDirectLoadBootstrap("DllMain");
+  }
+  return TRUE;
+}
+
 extern "C" {
+
+DLLEXPORT int __stdcall WarVK_Initialize(void) {
+  AppendWarVkBootstrapMarker("export-call", "WarVK_Initialize");
+  StartWarVkDirectLoadBootstrap("WarVK_Initialize");
+  return 1;
+}
+
+DLLEXPORT void __stdcall Initialize(void) {
+  AppendWarVkBootstrapMarker("export-call", "Initialize");
+  StartWarVkDirectLoadBootstrap("Initialize");
+}
 
 DLLEXPORT IDirect3D9 *__stdcall Direct3DCreate9(UINT nSDKVersion) {
   OutputDebugStringA("DXVK: Direct3DCreate9 called\n");

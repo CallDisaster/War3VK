@@ -12,6 +12,7 @@
 #include "../model/war3_model_hook.h"
 #include "../render/war3_render_exec_batch.h"
 #include "../render/war3_render_queue_tracker.h"
+#include "../render/war3_lightning_runtime.h"
 #include "../render/war3_renderer.h"
 #include "../render/war3_shadow_runtime_bridge.h"
 #include "../shadow/war3_shadow_native_runtime.h"
@@ -100,6 +101,7 @@ void ResetRuntimeCore() {
 
   dxvk::war3::model::Shutdown();
   dxvk::war3::render::ResetShadowRuntimeBridgeState();
+  dxvk::war3::render::War3LightningRuntime::instance().reset();
   dxvk::war3::shadow::ShadowValidationRuntime::instance().reset();
   dxvk::war3::tools::ResetWar3ControlPlaneState();
   dxvk::war3::render::War3Renderer::instance().EndFrame();
@@ -114,24 +116,27 @@ void ResetRuntimeCore() {
 
 void BindNativeShadowDevice(IDirect3DDevice9* device) {
   dxvk::war3::shadow::NativeD3D9BackendRuntime::instance().setDevice(device);
+  dxvk::war3::render::War3LightningRuntime::instance().setDevice(device);
 }
 
 bool DriveNativeShadowBackend(bool captureLiveState,
                               uint32_t maxExtraBuildPasses) {
+  const bool lightningActive =
+      dxvk::war3::render::War3LightningRuntime::instance().hasActive();
   if (!dxvk::war3::internal::
           IsNativeRendererHostExecuteValidationRuntimeEnabled())
-    return false;
+    return lightningActive;
   if (!dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
           dxvk::war3::runtime::War3RuntimeModule::SemanticData))
-    return false;
+    return lightningActive;
   if (!dxvk::war3::internal::kWar3RuntimeConfigSemanticConsumerEffective)
-    return false;
+    return lightningActive;
 
   if constexpr (dxvk::war3::internal::
                     kNativeSemanticShadowWorldStageValidationEnabled) {
     if (!dxvk::war3::internal::
             IsNativeSemanticShadowWorldStageValidationRuntimeEnabled())
-      return false;
+      return lightningActive;
 
     auto& validationRuntime =
         dxvk::war3::shadow::ShadowValidationRuntime::instance();
@@ -145,16 +150,21 @@ bool DriveNativeShadowBackend(bool captureLiveState,
   }
 
   return dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
-      .buildLatestFrame();
+             .buildLatestFrame() ||
+         lightningActive;
 }
 
 bool ExecuteNativeShadowBackendPreparedFrame() {
-  if (!dxvk::war3::internal::
-          IsNativeRendererHostExecuteValidationRuntimeEnabled())
-    return false;
-
-  return dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
-      .executePreparedFrame();
+  const bool shadowOk =
+      dxvk::war3::internal::
+          IsNativeRendererHostExecuteValidationRuntimeEnabled()
+          ? dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
+                .executePreparedFrame()
+          : false;
+  const bool lightningOk =
+      dxvk::war3::render::War3LightningRuntime::instance()
+          .executePreparedFrame();
+  return shadowOk || lightningOk;
 }
 
 } // namespace dxvk::war3::platform

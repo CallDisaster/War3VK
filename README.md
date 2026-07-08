@@ -7,6 +7,8 @@
 
 WarVK is a Warcraft III 1.27a graphics enhancement project built on top of a DXVK-derived D3D9-to-Vulkan path. It focuses on visual fidelity and rendering experimentation for the classic client, including modern shadows, post-processing, runtime diagnostics, and engine-facing rendering research.
 
+The latest experimental branch has intentionally moved away from the old rendering approach. Instead of treating Warcraft III as a black-box D3D9 draw stream and trying to replay whatever the fixed-function renderer submitted, WarVK now tries to read higher-level Warcraft III runtime data directly: visible renderables, object identity, model resources, pose/palette facts, material information, and draw-time geometry. Those semantic records are then used to build WarVK's own shadow map and receiver passes.
+
 > [!NOTE]
 > WarVK targets visual quality first. High-quality effects usually increase GPU load, and enabling more features does not guarantee higher FPS.
 
@@ -18,13 +20,25 @@ WarVK is a Warcraft III 1.27a graphics enhancement project built on top of a DXV
 - Adds in-game graphics controls for shadows, anti-aliasing, bloom, and exposure
 - Improves visual presentation without modifying map data or gameplay rules
 
+### Static Shadow Fixed Milestone
+
+- Fixed Warcraft III's built-in static building shadow residue by hooking `CUnitUIManager_RecordSetStructureShadow` early and blocking `buildingShadow(+0x50)` writes into UnitUI type records
+- Removed the legacy `TerrainShadow_RenderListB` black blob unit shadow by default so it no longer stacks with WarVK shadows
+- Retired the old `WriteMaskRegion / StaticStampPath / RegisterImage / DoodadStamp` static-shadow experiments from the default production path
+- Kept the research trail documented so the older paths remain available as evidence and diagnostic references
+
 ### 1.1.0 Highlights
 
 - Added a logic-to-render bridge so object identity can be tracked more reliably across the game pipeline
-- Blocked all path blocker shadow rendering to prevent invalid blocker geometry from leaking into scene shadows
+- Reworked the experimental shadow path around upper-level Warcraft III runtime facts instead of relying only on legacy D3D9 draw replay
 - Integrated StormBreaker directly into the project as part of the runtime foundation
 - Upgraded GPU Arena to avoid driver overload caused by freeze-and-snapshot shadow capture on dynamic VB/IB workloads
 - Added the first stage of static model caching to reduce GPU Arena pressure
+
+### Current known issues
+
+- Looking at bridge, ramp, and similar decorative/static geometry can still cause a short stall. The current static VB cache and LRU work reduce repeat stalls after the first sighting, but they are a mitigation rather than a complete fix.
+- Path blocker CSM shadows can still leak into WarVK's shadow map. The project can identify some blocker render objects by FourCC, but one or more instances still survive into the final CSM caster list.
 
 ### Audience and limitations
 
@@ -78,9 +92,11 @@ Typical release contents:
 
 ### Project status
 
-Current version: `v1.1.0`
+Current WarVK milestone: `静态阴影解决版 (2026-07-08)`
 
 WarVK is in a stage where the gameplay-facing bridge, GPU Arena, StormBreaker integration, and first-stage static model cache are already in place. Dynamic pose takeover is still under active research and has not fully replaced the fallback shadow path.
+
+The active experimental shadow branch is no longer a simple "capture D3D9 draw calls and replay them later" renderer. The intended path is semantic: hook Warcraft III's upper render/runtime layers, reconstruct stable object and renderable identity, pull model/pose/material facts near their producer, and submit a WarVK-owned shadow scene. Legacy draw capture still exists as a compatibility and diagnostic fallback, but the long-term direction is to render the shadow map from Warcraft III runtime semantics rather than from the old fixed-function stream alone.
 
 ### Core architecture
 

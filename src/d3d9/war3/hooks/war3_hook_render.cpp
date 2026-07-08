@@ -25,9 +25,11 @@
 #include "../render/war3_render_queue_tracker.h"
 #include "../render/war3_render_state.h"
 #include "../render/war3_current_draw_contract.h"
+#include "../render/war3_lightning_runtime.h"
 #include "../render/war3_renderer.h"
 #include "../render/war3_shadow_runtime_bridge.h"
 #include "../render/war3_visible_renderables.h"
+#include "../platform/war3_native_device_resolver.h"
 #include "../platform/war3_runtime_bootstrap.h"
 #include "../state/war3_render_state.h"
 #include "../tools/war3_perf_monitor.h"
@@ -849,6 +851,25 @@ static void TryNativeSemanticWorldStageValidation(int stage, int a3, int a4,
   }
 }
 
+static void TryWarVkLightningWorldStageDraw(int stage, int a5) {
+  if (stage != dxvk::war3::internal::kNativeSemanticShadowExecuteStage)
+    return;
+  if (a5 != 0)
+    return;
+  if (!dxvk::war3::War3Events::get().isJassReady())
+    return;
+
+  auto& lightning = dxvk::war3::render::War3LightningRuntime::instance();
+  if (!lightning.hasActive())
+    return;
+
+  dxvk::war3::platform::TryBindNativeDeviceFromWar3Globals(
+      "WarVKLightningWorldStage", false);
+
+  auto scope = MakeRenderHookCpuScope("Hook_WorldDispatch/WarVKLightning");
+  lightning.executePreparedFrame();
+}
+
 int __fastcall Hook_RenderDispatcher(int ctx1, int ctx2, int typeCode,
                                      int stage, int a5, int dataStore) {
   // 负责维护 dispatcher stage 栈，保证递归分发时阶段上下文不串台。
@@ -1101,6 +1122,7 @@ int __fastcall Hook_WorldDispatch(void *thisPtr, void *edx, int stage, int a3,
   }
 
   TryNativeSemanticWorldStageValidation(stage, a3, a4, a5);
+  TryWarVkLightningWorldStageDraw(stage, a5);
 
   War3RenderState::OnStageExit(stage);
   if (a5 == 0) {

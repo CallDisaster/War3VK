@@ -300,15 +300,17 @@ ReceiverInputRejectReason ValidateMainWorldReceiverInput(
 // renderPointShadow 等）。每次调用都做 heap allocation + N 次 push_back + 可能
 // 还会做 stable_sort，是干净的合批/缓存机会。
 //
-// 缓存采用 thread_local + scene 三元组（地址 + size）作为命中 key：
+// 缓存采用 thread_local + frameIndex + scene 三元组（地址 + size）作为命中 key：
 //   - scene 的 shadowCasters / shadowInstances / shadowFallbacks 是
 //     `War3FrameScene` 的成员 vector，scene 在每帧初被 reset({})，向量地址保持
 //     稳定但内容可能改变；
 //   - 同一帧内 vector 不会再被 push（这点由 BeforeUi 的 publish 流程保证），
-//     所以 (address, size, capacity) 三元组对"同帧同 scene"是稳定的标识。
-//   - 不同帧 scene 重新填充会改 size，cache 自动失效。
+//     所以 frameIndex + (address, size) 三元组对"同帧同 scene"是稳定的标识。
+//   - 不同帧 scene 重新填充时，即使 vector 地址与 size 偶然不变，也必须重跑
+//     path blocker / alpha caster 等最终过滤逻辑。
 //   - 跨线程调用走各自 thread_local 副本，无锁竞争。
 struct ReplayDrawsCacheKey {
+  uint32_t frameIndex = 0u;
   const void* castersAddr = nullptr;
   const void* instancesAddr = nullptr;
   const void* fallbacksAddr = nullptr;
@@ -317,7 +319,8 @@ struct ReplayDrawsCacheKey {
   size_t fallbacksSize = 0u;
 
   bool operator==(const ReplayDrawsCacheKey& rhs) const {
-    return castersAddr == rhs.castersAddr &&
+    return frameIndex == rhs.frameIndex &&
+           castersAddr == rhs.castersAddr &&
            instancesAddr == rhs.instancesAddr &&
            fallbacksAddr == rhs.fallbacksAddr &&
            castersSize == rhs.castersSize &&
@@ -471,11 +474,12 @@ inline void War3ReplayDrawSurvey(const War3ShadowCasterDraw& draw) {
 }
 
 std::vector<const War3ShadowCasterDraw*> BuildShadowReplayDraws(
-    const War3FrameScene& scene) {
+    const War3FrameScene& scene, uint32_t frameIndex) {
   // thread_local 缓存：同一帧内重复调用直接复用上次的 draws 向量。
   thread_local ReplayDrawsCache cache;
 
   ReplayDrawsCacheKey key;
+  key.frameIndex = frameIndex;
   key.castersAddr = scene.shadowCasters.data();
   key.instancesAddr = scene.shadowInstances.data();
   key.fallbacksAddr = scene.shadowFallbacks.data();
@@ -1724,7 +1728,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   const std::vector<const War3ShadowCasterDraw*>* replayDrawsPtr =
       replayDrawOverride;
   if (replayDrawsPtr == nullptr) {
-    localReplayDraws = BuildShadowReplayDraws(input.scene);
+    localReplayDraws = BuildShadowReplayDraws(input.scene, input.frameIndex);
     replayDrawsPtr = &localReplayDraws;
   }
   const auto& replayDraws = *replayDrawsPtr;
@@ -2377,7 +2381,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 void War3ShadowReceiverPass::renderPointShadow(const Rc<DxvkCommandList> &ctx,
                                                const War3PipelineInput &input) {
   auto perfScope = war3::War3PerfMonitor::instance().scope("PointShadow", ctx);
-  const auto replayDraws = BuildShadowReplayDraws(input.scene);
+  const auto replayDraws = BuildShadowReplayDraws(input.scene, input.frameIndex);
 
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
@@ -3714,7 +3718,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     }
   }
 
-  const auto replayDraws = BuildShadowReplayDraws(input.scene);
+  const auto replayDraws = BuildShadowReplayDraws(input.scene, input.frameIndex);
   const size_t replayCasterCount = replayDraws.size();
   const uint64_t replayGeometryWork =
       EstimateShadowReplayGeometryWork(replayDraws);

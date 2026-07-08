@@ -6,6 +6,7 @@
 #include "war3_shaderpack_internal.h"
 #include "war3/render/war3_render_state.h"
 #include "war3/render/war3_frame_graph.h"
+#include "war3/render/war3_lightning_runtime.h"
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/core/war3_runtime_profile.h"
 #include "war3/core/war3_semantic_shadow_gate.h"
@@ -435,6 +436,9 @@ namespace dxvk {
                 !war3shader::internal::IsNativePostProcessDisabled();
 
             // SSAO/AA 目前属于 postFx 子项；若未来独立开关，可在此扩展。
+            const bool wantsLightning =
+                dxvk::war3::render::War3LightningRuntime::instance()
+                    .hasActive();
 
             // Semantic preview should not change the frame graph by default:
             // it rides on frames where the normal receiver already runs. A
@@ -444,7 +448,7 @@ namespace dxvk {
                 semanticShadowForcesBeforeUi;
             m_wantsBeforeUiInsertion =
                 shaderPackEnabled || wantsShadowReceiver || wantsPostFx ||
-                semanticShadowForcesBeforeUi;
+                semanticShadowForcesBeforeUi || wantsLightning;
         }
 
         // 日夜色调：在帧开始应用到全局设置，保证主线程渲染状态与后处理能读取到

@@ -71,12 +71,16 @@
 - hook `CDoodads_SetTodAndRefreshStamp (0x75C5F0)`，`mode>=1` 时 return，
   避免 TOD 刷新重新写 stamp；
 - **关键**：必须在地图加载 doodad 之前安装（早装）。已存在的 doodad 需要
-  通过现有 `ShadowPath_StaticStamp_Toggle / ToggleStaticStampFromObject` 拦截
-  + 现有 ListA/Stamp 拦截作为兜底。
+  通过现有 `ShadowPath_StaticStamp_Toggle / ToggleStaticStampFromObject` 与
+  `RegisterImageEntry` producer 端策略兜底；不要再依赖已证伪的 ListA consumer
+  粗拦截。
 
-**当前状态评估**：项目 `kNativeShadowDefaultMode=1`，且 StaticStampPath / Projector
-FourCC 拦截已部分启用。需要核对 `kNativeShadowBlockStaticStampPathWhenMode1`
-是否为 true，若 false 则它正是"自带静态阴影仍可见"的原因之一。
+**当前状态评估（2026-07-08 复核）**：源码当前
+`kNativeShadowDefaultMode=0`，即默认保留 War3 原生阴影，避免误伤建筑施工/
+落地贴图。StaticStampPath / ToggleStaticStampFromObject / RegisterImage
+策略均已接线，但只有运行时切到 `NativeShadowMode=1` 后才会执行 mode1 阻断。
+验证静态阴影治理时应显式在 ImGui/JASS/API 设置 mode=1，并观察
+`RegisterImage stats` 与 `DoodadStaticStamp` 日志。
 
 ---
 
@@ -206,7 +210,7 @@ path blocker 在 War3 里是 doodad。它的阴影有两个来源：
 两条都覆盖后，path blocker 阴影应彻底消失。
 
 ### 回退开关
-- `kNativeShadowDoodadStampHookEnabled=false`：关 doodad 贴花拦截（回到只拦 ListA）。
+- `kNativeShadowDoodadStampHookEnabled=false`：关 doodad 贴花注册入口拦截。
 - `kShadowDrawTimeVBCacheStaticPersistEnabled=false`：回到 16 帧 TTL（问题 2 回退）。
 - `War3RenderState::SetNativeShadowMode(0)`：完全恢复魔兽原生阴影。
 

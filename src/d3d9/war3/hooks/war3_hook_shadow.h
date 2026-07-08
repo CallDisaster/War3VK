@@ -86,6 +86,8 @@ struct ShadowHookAddresses {
   LPVOID shadowPathObjectProjectorJassBridgeAddr = nullptr;
   /** @brief ShadowPath_StaticStamp_Toggle（静态 stamp 直写链路）。 */
   LPVOID shadowPathStaticStampToggleAddr = nullptr;
+  /** @brief CUnitUIManager_RecordSetStructureShadow：buildingShadow 写入 +0x50。 */
+  LPVOID cunitUiRecordSetStructureShadowAddr = nullptr;       // 0x335A00
 
   // RegisterImage 调用点返回地址（用于精确来源判定）
   LPVOID shadowRegisterRetWithParamsAddr = nullptr;            // 0x7291DC

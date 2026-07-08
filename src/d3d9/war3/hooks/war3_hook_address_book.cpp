@@ -89,6 +89,7 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x74DB30, // shadowToggleStaticStampFromObject
       0x74DE40, // shadowToggleEmitterStamp (函数入口，74DF50 为内部 call 点)
       0x74E420, // shadowPathStaticStampToggle
+      0x335A00, // cunitUiRecordSetStructureShadow（UnitUI.slk buildingShadow -> record +0x50）
       0x764AC0, // shadowProjectorSimpleBridge
       0x38D7A0, // shadowPathObjectProjectorRuntime
       0x1DEEA0, // shadowPathObjectProjectorJassBridge
@@ -103,10 +104,10 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x65A140, // widgetRegisterFootprintAndShadowMask（论文第6章中央 sync 入口）
       0x74DB30, // terrainShadowToggleStaticStampFromObject（2026-05-30 doodad 贴花阴影）
       0x74DE40, // terrainShadowToggleEmitterStamp（2026-05-30 doodad emitter 贴花阴影）
-      0x7370A0, // terrainShadowListARenderPreparedGroups（2026-05-30 ListA stamp 消费点）
-      0x737110, // terrainShadowListARenderAllEntries（2026-05-30 ListA stamp 消费点）
-      0x234420, // terrainShadowDispatchToShape（Phase 7.116 建筑/装饰物 shadow 真正路径）
-      0x234710, // terrainShadowWriteMaskRegion（论文 §6.7.1 方案 A）
+      0x7370A0, // terrainShadowListARenderPreparedGroups（Phase 7.143 证伪：地形/悬崖 tile）
+      0x737110, // terrainShadowListARenderAllEntries（Phase 7.143 证伪：地形/悬崖 tile）
+      0x234420, // terrainShadowDispatchToShape（旧实验诊断入口，默认关闭）
+      0x234710, // terrainShadowWriteMaskRegion（idx==3 方案已证伪，诊断-only）
 
       // RenderQueue 数据区
       0xBC6BAC, // rqNumOfElements
@@ -120,6 +121,8 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0xBDA4D4, // rqStateCleanupPending
       0xBE40A8, // handleManager
       0xBE4238, // gameWar3
+      0xBC5420, // gxDevice (global CGxDevice/CGxDeviceD3d singleton pointer)
+      0x584, // gxDeviceD3dNativeDeviceOffset (IDirect3DDevice9*)
 
       // RenderQueue/设备辅助函数
       0x1378B0, // rqItemComparator

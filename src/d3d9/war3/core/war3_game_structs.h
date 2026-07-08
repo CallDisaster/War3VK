@@ -160,11 +160,63 @@ namespace CUnitOffsets {
     constexpr size_t HashId10     = 0x10;  // 备用 hashId
     constexpr size_t Sprite       = 0x28;  // CSprite*
     constexpr size_t Rawcode      = 0x30;  // 四字码 (如 'hfoo')
+    constexpr size_t RuntimeNode48 = 0x48; // 2026-07-08 实机：非 buildingShadow 字符串
+    constexpr size_t RuntimeNode50 = 0x50; // 2026-07-08 实机：运行期 node/list，非 buildingShadow
     constexpr size_t OwnerId      = 0x58;  // 所有者玩家ID
     constexpr size_t Flags5C      = 0x5C;  // 标志位
     constexpr size_t Flags60      = 0x60;  // 更多标志
     constexpr size_t FlyHeight    = 0x208; // 当前飞行高度
+
+    constexpr uint32_t FlagBuilding = 0x00010000u;
 }
+
+// CUnitUIManager 每个 unit type 的 UI/type record。该记录不是 CUnit 实例本体：
+// CUnit+0x50 实机确认是运行期 node/list；UnitUI.slk 的 unitShadow/buildingShadow
+// 字符串写在本 record 的 +0x4C/+0x50。
+namespace CUnitUiTypeRecordOffsets {
+    constexpr size_t VTable                = 0x00;
+    constexpr size_t RawcodeFourCC         = 0x18; // 数值 rawcode；内存字节为 little-endian 反序
+    constexpr size_t RawcodeAscii          = 0x1C; // inline ASCII，如 "halt"/"hctw"
+    constexpr size_t ModelPath0            = 0x34; // char*
+    constexpr size_t ModelPath1            = 0x38; // char*
+    constexpr size_t UberSplatKey          = 0x48; // char*，如 "HMED"/"HSMA"
+    constexpr size_t UnitShadowTexture     = 0x4C; // char*，UnitUI.slk unitShadow
+    constexpr size_t BuildingShadowTexture = 0x50; // char*，UnitUI.slk buildingShadow
+    constexpr size_t ShadowOffsetX         = 0x80;
+    constexpr size_t ShadowOffsetY         = 0x84;
+    constexpr size_t ShadowSizeX           = 0x88;
+    constexpr size_t ShadowSizeY           = 0x8C;
+    constexpr size_t ShadowOnWater         = 0x90;
+}
+
+// Analysis-only 32-bit layout for CUnitUiTypeRecord. Pointer-valued fields are
+// stored as uint32_t so the documented offsets remain stable in host tools.
+struct CUnitUiTypeRecord32 {
+    uint32_t vtable;                  // 0x00
+    uint8_t pad_0x04[0x14];           // 0x04
+    uint32_t rawcodeFourCC;           // 0x18
+    uint32_t rawcodeAscii;            // 0x1C
+    uint8_t pad_0x20[0x14];           // 0x20
+    uint32_t modelPath0;              // 0x34
+    uint32_t modelPath1;              // 0x38
+    uint8_t pad_0x3C[0x0C];           // 0x3C
+    uint32_t uberSplatKey;            // 0x48
+    uint32_t unitShadowTexture;       // 0x4C
+    uint32_t buildingShadowTexture;   // 0x50
+    uint8_t pad_0x54[0x2C];           // 0x54
+    float shadowOffsetX;              // 0x80
+    float shadowOffsetY;              // 0x84
+    float shadowSizeX;                // 0x88
+    float shadowSizeY;                // 0x8C
+    uint32_t shadowOnWater;           // 0x90
+};
+
+static_assert(offsetof(CUnitUiTypeRecord32, buildingShadowTexture) ==
+                  CUnitUiTypeRecordOffsets::BuildingShadowTexture,
+              "CUnitUiTypeRecord32 buildingShadow offset mismatch");
+static_assert(offsetof(CUnitUiTypeRecord32, shadowOnWater) ==
+                  CUnitUiTypeRecordOffsets::ShadowOnWater,
+              "CUnitUiTypeRecord32 shadowOnWater offset mismatch");
 
 namespace CWidgetOffsets {
     constexpr size_t VTable       = 0x00;

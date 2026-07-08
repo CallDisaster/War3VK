@@ -3,6 +3,7 @@
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_settings.h"
 
+#include "../hooks/war3_jass_command_bridge.h"
 #include "../war3.h"
 
 #include <nlohmann/json.hpp>
@@ -170,6 +171,26 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     result.ok = applied;
     if (!applied)
       result.error = "SetShadowDebugMode failed";
+  } else if (state->request.command == "jass.bridge_selftest") {
+    const bool displayText = payload.value("displayText", false);
+    const auto test =
+        dxvk::war3::hooks::RunJassCommandBridgeSelfTest(displayText);
+    response["installed"] = test.installed;
+    response["preloaderOk"] = test.preloaderOk;
+    response["intQueryOk"] = test.intQueryOk;
+    response["stringQueryOk"] = test.stringQueryOk;
+    response["displayTextAttempted"] = test.displayTextAttempted;
+    response["displayTextOk"] = test.displayTextOk;
+    response["pingCode"] = test.pingCode;
+    response["versionStringHandle"] = test.versionStringHandle;
+    response["versionText"] = test.versionText;
+    response["playerHandle"] = test.playerHandle;
+    result.ok = test.installed && test.preloaderOk && test.intQueryOk &&
+                test.stringQueryOk &&
+                (!test.displayTextAttempted || test.displayTextOk);
+    if (!result.ok)
+      result.error = test.error.empty() ? "jass bridge selftest failed"
+                                        : test.error;
   } else if (state->request.command == "shutdown.session") {
     response["accepted"] = true;
     response["softOnly"] = true;

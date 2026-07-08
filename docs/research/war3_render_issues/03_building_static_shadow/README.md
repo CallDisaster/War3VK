@@ -1,5 +1,49 @@
 # 研究方向三：建筑静态阴影无法屏蔽
 
+## 2026-07-08 最终稳定结论：UnitUI buildingShadow 写入端治理
+本轮 x32dbg + IDA + 实机日志确认，建筑底部那类原生静态阴影的最高价值治理点不是
+`CUnit+0x50`、`ListA/ListB`、`RegisterImage`、`StaticStampPath` 或
+`WriteMaskRegion`，而是 **UnitUI 类型记录的 `buildingShadow` 字段写入点**：
+
+- 函数：`CUnitUIManager_RecordSetStructureShadow`
+- IDA VA：`0x6F335A00`
+- RVA：`0x335A00`
+- 写入点：`0x6F335A65`，将解析后的 shadow 字符串/资源指针写到 type record `+0x50`
+- 调用来源：`CUnitUIManager_LoadSlkRows(0x6F66BA00)`，callsite `0x6F66BF5F`
+- SLK 字段描述：`buildingShadow` descriptor offset `1304`，`unitShadow` descriptor offset `1292`
+- 类型记录偏移：`+0x4C = unitShadow`，`+0x50 = buildingShadow`，`+0x48 = UberSplat key`
+
+关键纠偏：
+
+- `CUnit+0x50` 不是 `buildingShadow` 字符串，而是运行期节点/列表类字段；
+- `CUnit+0x28` 更接近 `CSprite*`，`CSprite+0x20` 可对应 scene node；
+- 真正决定建筑默认静态阴影文件名的是 UnitUI/type record `+0x50`；
+- `halt` 的默认值可落到 `ShadowAltarofKings`，`hctw` 可落到 `ShadowCannonTower`，
+  实机还捕获到 `ShadowTreeofLife`。
+
+生产方案已经落地：
+
+- 默认安装 `CUnitUIManager_RecordSetStructureShadow` hook；
+- 默认在 `NativeShadowMode=0` 时也阻断非空 `buildingShadow` 写入；
+- hook 调原函数时传入 `shadowNamePtr=0`，保留原 setter 对旧 record 字段的释放/清理行为；
+- direct-load/bootstrap 阶段提前安装，避免等 JASS 或插件中途加载时已经错过 SLK/type record 写入；
+- 验证日志：`DXVK War3Hook: CUnitUI buildingShadow BLOCK calls=768 blocked=768 mode=0 ... name=ShadowTreeofLife`；
+- 用户实机确认：建筑阴影完全不可见。
+
+当前默认策略：
+
+- 建筑静态阴影：以 `CUnitUIManager_RecordSetStructureShadow` producer gate 为唯一生产主路径；
+- `TerrainShadow_RenderListB`：保留并默认全阻断，用来移除老版单位脚下黑色 blob/圆影；
+- `WriteMaskRegion / StaticStampPath / RegisterImage / DoodadStamp` 等历史静态阴影实验默认退役，
+  仅保留为证伪资料和必要时的专项诊断入口；
+- `ListA` 末端过滤继续关闭，避免误伤战争迷雾、边界、悬崖/地形 tile。
+
+后续若要支持“JASS 后中途加载插件”，必须注意：已经在 UnitUI/type record 中写入的
+`buildingShadow` 不会被这条 producer gate 反向清除；因此稳定方案必须在 Game.dll 早期
+bootstrap 或 D3D9 direct-load 阶段安装。
+
+下面 2026-02 至 2026-05 的内容保留为历史证据链，其中多条假设已被本节结论取代。
+
 ## 2026-04-04 更正结论
 1. 本页 2026-02-22 那段“`TerrainShadow_RegisterImageEntry(0x713250)` 是 ListA 静态建筑阴影核心上游入口”的表述，已经被后续更深一轮逆向推翻。
 2. 当前高置信度结论是：
@@ -175,10 +219,10 @@
 ## 2026-04-04 修正说明：ListA 混层 vs RegisterImage
 这轮重新沿 `0x738ED0 -> 0x73DC00 -> 0x73D9F0` 和 `CTerrainUberSplats.cpp` 复核后，需要修正两点：
 
-1. `0x713250(TerrainShadow_RegisterImageEntry)` 不是 `ListAEntry(0x94)` 的初始化函数。  
+1. `0x713250(TerrainShadow_RegisterImageEntry)` 不是 `ListAEntry(0x94)` 的初始化函数。
    它更接近 `0xA0` 的 stamp/image 注册池入口。
 
-2. `ListA` 本身是地形阴影/雾/边界/贴花的混合结果层。  
+2. `ListA` 本身是地形阴影/雾/边界/贴花的混合结果层。
    建筑静态阴影真正的高层写入者是：
    - `ShadowPath_StaticStamp_Toggle(0x74E420)`
    - `TerrainShadow_ToggleStaticStampFromObject(0x74DB30)`
@@ -195,6 +239,6 @@
 所以当前更准确的治理原则是：
 1. 主治理点前移到 `StaticStampPath + RegisterImage 来源分类`；
 2. `ListA` 末端继续只做保守兜底；
-3. 不再把“从 ListA 里分离建筑阴影”当成主方向。  
+3. 不再把“从 ListA 里分离建筑阴影”当成主方向。
 
 详见：`../23_blob_shadow_lista_upstream_reverse/README.md`

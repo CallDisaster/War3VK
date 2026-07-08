@@ -54,6 +54,7 @@ using ShadowRegisterImageEntryFn = int(__fastcall *)(void *, void *, int,
                                                      void *, void *, int, int);
 using ShadowPathStaticStampToggleFn = void(__fastcall *)(void *, void *, int,
                                                          int);
+using CUnitUiRecordSetStructureShadowFn = int(__fastcall *)(void *, int);
 
 TerrainRenderShadowLayerFn g_originalTerrainShadowLayer = nullptr;
 TerrainRenderShadowLayerFn g_trampolineTerrainShadowLayer = nullptr;
@@ -72,6 +73,10 @@ ShadowRegisterImageEntryFn g_originalShadowRegisterImageEntry = nullptr;
 ShadowRegisterImageEntryFn g_trampolineShadowRegisterImageEntry = nullptr;
 ShadowPathStaticStampToggleFn g_originalShadowPathStaticStampToggle = nullptr;
 ShadowPathStaticStampToggleFn g_trampolineShadowPathStaticStampToggle = nullptr;
+CUnitUiRecordSetStructureShadowFn
+    g_originalCUnitUiRecordSetStructureShadow = nullptr;
+CUnitUiRecordSetStructureShadowFn
+    g_trampolineCUnitUiRecordSetStructureShadow = nullptr;
 uintptr_t g_shadowPathObjectProjectorRuntimeAddr = 0;
 uintptr_t g_shadowPathObjectProjectorJassBridgeAddr = 0;
 uintptr_t g_shadowProjectorSimpleBridgeAddr = 0;
@@ -106,6 +111,8 @@ std::atomic<uint64_t> g_registerImageObjectBridgeCount{0};
 std::atomic<uint64_t> g_registerImageFromPointCount{0};
 std::atomic<uint64_t> g_registerImageFromTwoPointsCount{0};
 std::atomic<uint64_t> g_registerImageUnknownSourceCount{0};
+std::atomic<uint64_t> g_cunitUiRecordSetStructureShadowEnterCount{0};
+std::atomic<uint64_t> g_cunitUiRecordSetStructureShadowBlockedCount{0};
 
 // 环形采样：被 reject 的 fourcc 与近期 observed fourcc（前 8 个 unique）。
 std::array<std::atomic<uint32_t>, 8> g_projectorBlockedFourCCSamples{};
@@ -127,6 +134,29 @@ bool ReadU32Safe(const void *base, size_t offset, uint32_t &outValue) {
     return false;
   outValue = *reinterpret_cast<const uint32_t *>(p);
   return true;
+}
+
+bool ReadCStringPreview(int strPtr, char *out, size_t outSize) {
+  if (!out || outSize == 0)
+    return false;
+  out[0] = '\0';
+  if (strPtr == 0)
+    return false;
+
+  const auto *p =
+      reinterpret_cast<const char *>(
+          static_cast<uintptr_t>(static_cast<uint32_t>(strPtr)));
+  size_t n = 0;
+  for (; n + 1 < outSize; ++n) {
+    if (!IsReadableRange(p + n, 1))
+      break;
+    const char c = p[n];
+    if (c == '\0')
+      break;
+    out[n] = (c >= 0x20 && c < 0x7F) ? c : '?';
+  }
+  out[n] = '\0';
+  return n > 0;
 }
 
 // 判断返回地址是否落在指定函数范围内，用于识别调用来源路径。
@@ -184,6 +214,15 @@ int CallShadowRegisterImageEntryOriginal(void* thisPtr, int keyPtr,
                                               typeArg);
   }
   return -1;
+}
+
+int CallCUnitUiRecordSetStructureShadowOriginal(void *thisPtr,
+                                                int shadowNamePtr) {
+  if (g_trampolineCUnitUiRecordSetStructureShadow)
+    return g_trampolineCUnitUiRecordSetStructureShadow(thisPtr, shadowNamePtr);
+  if (g_originalCUnitUiRecordSetStructureShadow)
+    return g_originalCUnitUiRecordSetStructureShadow(thisPtr, shadowNamePtr);
+  return 0;
 }
 
 ShadowRegisterSource ResolveShadowRegisterSource(uintptr_t retAddr) {
@@ -352,6 +391,87 @@ void DumpShadowCallbackTopStats(uint32_t calls, uint32_t mode) {
       static_cast<unsigned>(top4.rva), static_cast<unsigned>(top4.count));
 }
 
+bool ShouldBlockCUnitUiBuildingShadowWrite(uint32_t mode) {
+  if constexpr (
+      dxvk::war3::internal::kNativeShadowBlockCUnitUiBuildingShadowByDefault) {
+    return true;
+  }
+  if (mode >= 2u)
+    return dxvk::war3::internal::
+        kNativeShadowBlockCUnitUiBuildingShadowWhenMode2;
+  if (mode == 1u)
+    return dxvk::war3::internal::
+        kNativeShadowBlockCUnitUiBuildingShadowWhenMode1;
+  return false;
+}
+
+int __fastcall Hook_CUnitUIManager_RecordSetStructureShadow(void *thisPtr,
+                                                            int shadowNamePtr) {
+  const uint64_t calls =
+      g_cunitUiRecordSetStructureShadowEnterCount.fetch_add(
+          1, std::memory_order_relaxed) +
+      1;
+  const uint32_t mode = War3RenderState::GetNativeShadowMode();
+  const bool blocked =
+      shadowNamePtr != 0 && ShouldBlockCUnitUiBuildingShadowWrite(mode);
+
+  if constexpr (dxvk::war3::internal::
+                    kNativeShadowCUnitUiBuildingShadowStatsLogging) {
+    if (!blocked && calls <= 16u) {
+      char name[96] = {};
+      if (shadowNamePtr == 0) {
+        snprintf(name, sizeof(name), "(null)");
+      } else if (!ReadCStringPreview(shadowNamePtr, name, sizeof(name))) {
+        snprintf(name, sizeof(name), "(unreadable)");
+      }
+      war3dbg::Print(
+          "DXVK War3Hook: CUnitUI buildingShadow PASS calls=%llu mode=%u "
+          "this=%p shadow=0x%08X name=%s\n",
+          static_cast<unsigned long long>(calls), static_cast<unsigned>(mode),
+          thisPtr, static_cast<unsigned>(static_cast<uint32_t>(shadowNamePtr)),
+          name);
+    }
+  }
+
+  if (blocked) {
+    const uint64_t blockedCount =
+        g_cunitUiRecordSetStructureShadowBlockedCount.fetch_add(
+            1, std::memory_order_relaxed) +
+        1;
+
+    if constexpr (dxvk::war3::internal::
+                      kNativeShadowCUnitUiBuildingShadowStatsLogging ||
+                  dxvk::war3::internal::
+                      kNativeShadowCUnitUiBuildingShadowVerboseLogging) {
+      const bool sample =
+          blockedCount <= 16u ||
+          (dxvk::war3::internal::
+                   kNativeShadowCUnitUiBuildingShadowStatsInterval != 0u &&
+           (calls % dxvk::war3::internal::
+                        kNativeShadowCUnitUiBuildingShadowStatsInterval) == 0u);
+      if (sample || dxvk::war3::internal::
+                        kNativeShadowCUnitUiBuildingShadowVerboseLogging) {
+        char name[96] = {};
+        if (!ReadCStringPreview(shadowNamePtr, name, sizeof(name)))
+          snprintf(name, sizeof(name), "(unreadable)");
+        war3dbg::Print(
+            "DXVK War3Hook: CUnitUI buildingShadow BLOCK calls=%llu "
+            "blocked=%llu mode=%u this=%p shadow=0x%08X name=%s\n",
+            static_cast<unsigned long long>(calls),
+            static_cast<unsigned long long>(blockedCount),
+            static_cast<unsigned>(mode), thisPtr,
+            static_cast<unsigned>(static_cast<uint32_t>(shadowNamePtr)), name);
+      }
+    }
+
+    // Preserve Blizzard's cleanup path: the original function frees the old
+    // record +0x50 string first, then only writes a new copy when EDX != 0.
+    return CallCUnitUiRecordSetStructureShadowOriginal(thisPtr, 0);
+  }
+
+  return CallCUnitUiRecordSetStructureShadowOriginal(thisPtr, shadowNamePtr);
+}
+
 // 地形阴影层入口：
 // - mode=1：关闭该入口触发的 ListB（stage14 直调链路由 ListB Hook 处理）
 // - mode>=2：完全禁用原生阴影层
@@ -491,14 +611,23 @@ int __fastcall Hook_Terrain_RenderListA(void *thisPtr, void *edx, void *entry) {
 // - stage14 直调链路会直接走 argType=4，不经过 Terrain_RenderShadowLayer(a3)。
 void __fastcall Hook_Terrain_RenderListB(void *thisPtr, void *edx, int argType,
                                          int passMode) {
-  // ListB 是静态建筑阴影重点链路：支持按 mode + type 精确拦截。
+  // 2026-07-08 复核：建筑静态阴影已前移到 UnitUI buildingShadow producer
+  // gate；ListB 现在作为旧版单位动态黑色 blob 圆影默认移除。
   const uint32_t mode = War3RenderState::GetNativeShadowMode();
   bool blocked = false;
   const char *reason = "PassThrough";
 
-  if (mode >= 2u && dxvk::war3::internal::kNativeShadowListBBlockAllWhenMode2) {
+  if constexpr (dxvk::war3::internal::kNativeShadowListBBlockAllByDefault) {
+    blocked = true;
+    reason = "Default_BlockAllListB";
+  } else if (mode >= 2u &&
+             dxvk::war3::internal::kNativeShadowListBBlockAllWhenMode2) {
     blocked = true;
     reason = "Mode>=2_BlockAllListB";
+  } else if (mode == 1u &&
+             dxvk::war3::internal::kNativeShadowListBBlockAllWhenMode1) {
+    blocked = true;
+    reason = "Mode1_BlockAllListB";
   } else if (mode == 1u &&
              dxvk::war3::internal::kNativeShadowListBBlockType4WhenMode1 &&
              argType == 4) {
@@ -747,6 +876,7 @@ int __fastcall Hook_ShadowProjector_Add_FromObject(void *a1, void *a2,
   // path blocker 的真实路径。
   const bool needsFourCCInspection = true;
   const bool needsSourcePath =
+      dxvk::war3::internal::kNativeShadowBlockRuntimeObjectProjectorFallback ||
       dxvk::war3::internal::kNativeShadowBlockProjectorFromObjectEnabled ||
       dxvk::war3::internal::kNativeShadowBlockProjectorFromAltEnabled ||
       dxvk::war3::internal::kNativeShadowProjectorVerboseLogging ||
@@ -805,6 +935,12 @@ int __fastcall Hook_ShadowProjector_Add_FromObject(void *a1, void *a2,
       dxvk::war3::internal::kNativeShadowBlockProjectorFromObjectEnabled) {
     blocked = true;
     reason = "BlockFromObjectPath";
+  }
+
+  if (!blocked && fromRuntimePath &&
+      dxvk::war3::internal::kNativeShadowBlockRuntimeObjectProjectorFallback) {
+    blocked = true;
+    reason = "FallbackBlockRuntimeObjectProjector";
   }
 
   if (!blocked && fromAltPath &&
@@ -914,6 +1050,22 @@ int __fastcall Hook_ShadowProjector_Add_FromObject(void *a1, void *a2,
     g_projectorAddFromObjectBlockedCount.fetch_add(1, std::memory_order_relaxed);
     if constexpr (dxvk::war3::internal::kNativeShadowProjectorStatsLogging)
       s_blocked.fetch_add(1, std::memory_order_relaxed);
+    if constexpr (dxvk::war3::internal::
+                      kNativeShadowRuntimeObjectProjectorFallbackLogging) {
+      static std::atomic<uint32_t> s_fallbackLogCount{0};
+      const uint32_t n =
+          s_fallbackLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 64u || (n % 1000u) == 0u) {
+        war3dbg::Print(
+            "DXVK War3Hook: RuntimeObjectProjectorFallback BLOCK n=%u mode=%u "
+            "fromRuntime=%d fromAlt=%d key='%s' arg0=%p fourcc=0x%08X "
+            "a1=%p reason=%s\n",
+            static_cast<unsigned>(n), static_cast<unsigned>(mode),
+            fromRuntimePath ? 1 : 0, fromAltPath ? 1 : 0,
+            hasKey ? keyBuf : "(null)", arg0,
+            static_cast<unsigned>(arg0FourCC), a1, reason);
+      }
+    }
     return -1;
   }
 
@@ -1243,17 +1395,12 @@ int __fastcall Hook_Doodad_ToggleStaticStampFromObject(void *thisPtr, void *edx,
 }
 
 // =====================================================================
-// 2026-05-30 根因突破: ListA stamp 渲染消费点拦截
+// Phase 7.143 证伪归档: ListA render hook
 // =====================================================================
-// CWorld_TerrainShadow_Dispatch (0x6F7369B4) case0 直接调用这两个函数渲染
-// 所有 doodad/建筑/path blocker 的地面贴花阴影 stamp。它们是 __thiscall(this)
-// 单参函数。mode>=1 时直接 return（什么都不画），干净屏蔽魔兽自带可见静态
-// 阴影 + path blocker 地面阴影。fog/LOS/path 走独立 FogMask grid，不受影响。
-//
-// 安全性：xrefs 确认这两个函数仅被 CWorld_TerrainShadow_Dispatch 调用，
-// 专职 ListA shadow stamp 渲染，不涉及 fog/visibility/border。
-// 这是真正生效的拦截点——历史所有拦截（RegisterImage/ListB/Projector/
-// RenderLayer）都没拦到这里，所以静态阴影/path blocker 一直可见。
+// 0x7370A0 / 0x737110 曾被误判为静态阴影 consumer。用户实机验证会
+// 破坏悬崖/地形 tile；IDA 复核显示 RenderAllEntries 通过 sub_6F725F80
+// 按 148-byte stride 取 terrain tile geometry。此 hook 保留作历史诊断，
+// 默认禁止安装，不应再作为静态阴影/path blocker 方案启用。
 using TerrainShadowListARenderFn = int(__fastcall *)(void *, void *);
 TerrainShadowListARenderFn g_trampolineListARenderPreparedGroups = nullptr;
 TerrainShadowListARenderFn g_trampolineListARenderAllEntries = nullptr;
@@ -1335,19 +1482,15 @@ int __fastcall Hook_TerrainShadow_ListA_RenderAllEntries(void *thisPtr,
 }
 
 // =====================================================================
-// Phase 7.100: TerrainShadow_WriteMaskRegion hook (静态阴影治理方案 A)
+// Phase 7.100/7.101: TerrainShadow_WriteMaskRegion hook (diagnostic-only)
 // =====================================================================
-// 论文 §6 §7.1 决定性发现：War3 1.27a 的建筑/装饰物预渲染贴花阴影
-// (我们项目一直无法剔除的"魔兽自带的静态阴影")真正写入路径就是
-// TerrainShadow_WriteMaskRegion @ 0x6F234710。30+ caller 全部汇聚到这。
-//
-// IDA 反编译验证（0x6F234710）：
+// 论文 §6 §7.1 曾推断：
 //   if (a4) result = 4;
 //   else    result = *(unsigned __int16 *)(a2 + 268);   // a2 + 0x10C
-// 这个 result 就是 maskIdx。idx==3 是 shadow footprint，idx==0/1/2 分别对应
-// fog/LOS/path（共享 mask grid 但语义独立）。
-//
-// 拦截 idx==3 即可干净屏蔽建筑阴影，对 fog/LOS/path 零影响。
+// 其中 result 是 maskIdx，idx==3 可屏蔽建筑阴影。后续实测推翻：
+// a2+0x10C 是 footprint/shape 结果，样本为 6/7/9；该函数服务
+// fog/LOS/path/footprint 共享 mask grid，不能作为生产 reject 点。
+// 当前默认仅安装 hook 与计数器，reject 开关保持关闭。
 typedef int (__thiscall *TerrainShadowWriteMaskRegionFn)(void *thisPtr, void *a2,
                                                          int a3, void *a4,
                                                          int a5);
@@ -1495,10 +1638,8 @@ int __thiscall Hook_TerrainShadow_WriteMaskRegion(void *thisPtr, void *a2,
   (void)fromActorRuntime;
   (void)fromForObject;
 
-  // Phase 7.112 第一刀：仅 reject 来自 CUnit_StampBuildingShadowFootprint 的写入。
-  // 该 caller 只在建筑物 lifecycle 调用，是建筑预渲染贴花阴影的唯一专属入口。
-  // 不影响 fog/LOS/path 或 visibility（它们走 RebuildMask / RegisterFootprint /
-  // ForObject 等其它 caller）。
+  // Phase 7.112 第一刀旧实验：仅 reject 来自 CUnit_StampBuildingShadowFootprint。
+  // 后续实测该 caller 在重建窗口 enterCount=0，默认关闭，仅保留作 A/B 诊断。
   if (fromBuildingStamp &&
       dxvk::war3::internal::kNativeStaticShadowHideBuildingFootprintEnabled) {
     const uint64_t logIdx = g_writeMaskRegionRejectedBuildingCount.fetch_add(
@@ -1529,18 +1670,14 @@ int __thiscall Hook_TerrainShadow_WriteMaskRegion(void *thisPtr, void *a2,
     return 0;
   }
 
-  // Phase 7.112 第二刀：检查 widget+0x60 的 SHADOW_FOOTPRINT_PRESENT 标志位。
+  // Phase 7.112 第二刀旧实验：检查 widget+0x60 的 SHADOW_FOOTPRINT_PRESENT 标志位。
   // 来自 CUnit_StampBuildingShadowFootprint 反编译：
   //   *(_DWORD *)(unit + 96) |= 0x400u;   // (unit+0x60) bit10 = SHADOW_FOOTPRINT_FLAG
   // 当 widget 在 lifecycle 中已经被标记为"具备 shadow footprint"，无论它现在
   // 走的是 RebuildMask / ForObject / RegisterFootprint 哪条 caller，
   // 这次 WriteMaskRegion 调用的写入对象都涉及该 widget 的 shadow footprint mask bit。
   //
-  // 这条规则比"caller=BuildingStamp"覆盖更广（建筑物会被定时刷新走 RebuildMask，
-  // 此时 caller 已经不是 BuildingStamp，但 widget 标志位仍然在）。
-  // 对应的 widget 类型主要是 building / destructible 静态对象。
-  //
-  // 风险：fog/LOS/visibility 不依赖这个标志位，不会受影响。
+  // 后续 WMR dump 显示 RebuildMask 路径上的 a2 不是标准 widget，默认关闭。
 
   // Phase 7.112 第二刀诊断：前 12 次 fire 时 dump widget +0x60 +0x14C 字段语义。
   // 默认关闭——已经 dump 过 12 次确认 widget 字段语义（见 AGENTS Phase 7.112 节）。
@@ -1877,6 +2014,9 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   g_originalShadowPathStaticStampToggle =
       reinterpret_cast<ShadowPathStaticStampToggleFn>(
           addrs.shadowPathStaticStampToggleAddr);
+  g_originalCUnitUiRecordSetStructureShadow =
+      reinterpret_cast<CUnitUiRecordSetStructureShadowFn>(
+          addrs.cunitUiRecordSetStructureShadowAddr);
   g_shadowPathObjectProjectorRuntimeAddr =
       reinterpret_cast<uintptr_t>(addrs.shadowPathObjectProjectorRuntimeAddr);
   g_shadowPathObjectProjectorJassBridgeAddr =
@@ -1950,6 +2090,35 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
         "Shadow", "ShadowPath_StaticStamp_Toggle", false, true);
   }
 
+  if constexpr (dxvk::war3::internal::kWar3ShadowTypeRecordHookEnabled &&
+                dxvk::war3::internal::
+                    kNativeShadowCUnitUiBuildingShadowHookEnabled) {
+    if (addrs.cunitUiRecordSetStructureShadowAddr != nullptr) {
+      const bool ok = InstallMinHook(
+          addrs.cunitUiRecordSetStructureShadowAddr,
+          reinterpret_cast<LPVOID>(
+              &Hook_CUnitUIManager_RecordSetStructureShadow),
+          reinterpret_cast<LPVOID *>(
+              &g_trampolineCUnitUiRecordSetStructureShadow),
+          "Shadow", "CUnitUIManager_RecordSetStructureShadow", false, true);
+      anyInstalled |= ok;
+      char buf[160];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: CUnitUI RecordSetStructureShadow "
+               "install addr=%p result=%s defaultBlock=%d",
+               addrs.cunitUiRecordSetStructureShadowAddr, ok ? "ok" : "fail",
+               dxvk::war3::internal::
+                   kNativeShadowBlockCUnitUiBuildingShadowByDefault
+                   ? 1
+                   : 0);
+      ::dxvk::Logger::info(buf);
+    } else {
+      ::dxvk::Logger::info(
+          "DXVK War3Hook[Shadow]: CUnitUI RecordSetStructureShadow install "
+          "SKIPPED - nullptr");
+    }
+  }
+
   if constexpr (dxvk::war3::internal::kWar3ShadowProjectorHookEnabled) {
     anyInstalled |= InstallMinHook(
         addrs.shadowProjectorAddFromObjectAddr,
@@ -2011,10 +2180,9 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
     }
   }
 
-  // 2026-05-30 根因突破：ListA stamp 渲染消费点拦截。
-  // 这是真正画 doodad/建筑/path blocker 地面贴花阴影的两个函数，
-  // 绕过所有历史 hook。mode>=1 时直接 return 屏蔽。用 Logger::info 打安装结果
-  // 到 war3_d3d9.log（war3dbg::Print 走 DebugView，不进文件），便于实机验证。
+  // Phase 7.143 证伪归档：这两个 ListA render hook 会破坏悬崖/地形 tile。
+  // 默认不开，仅保留安装代码作历史 A/B 诊断。用 Logger::info 打安装结果
+  // 到 war3_d3d9.log（war3dbg::Print 走 DebugView，不进文件）。
   if constexpr (dxvk::war3::internal::kNativeShadowListARenderHookEnabled) {
     if (addrs.terrainShadowListARenderPreparedGroupsAddr != nullptr) {
       const bool ok = InstallMinHook(

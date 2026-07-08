@@ -1,3 +1,87 @@
+[WarVK_Load]
+title = "启动 WarVK 加载"
+description = "启动 WarVK 加载并返回当前是否已经就绪"
+comment = "第一次调用通常返回 false，因为加载请求和轮询是异步的"
+category = TC_WARVK_LOADER
+returns = boolean
+
+[WarVK_IsLoaded]
+title = "WarVK 是否已加载"
+description = "检查 WarVK bridge 是否已经就绪"
+comment = "返回 true 后即可调用渲染、闪电与调试 API"
+category = TC_WARVK_LOADER
+returns = boolean
+
+[WarVK_RequestDllLoadByLua]
+title = "请求 Lua 加载 WarVK"
+description = "通过 YDWE exec-lua 请求加载 WarVK.dll"
+comment = "需要地图/环境已有 exec-lua 支持"
+category = TC_WARVK_LOADER
+returns = boolean
+
+[WarVK_RequestDllLoadByMemory]
+title = "请求内存桥加载 WarVK"
+description = "尝试通过非 Lua 内存桥加载 WarVK.dll"
+comment = "当前只是 clean-room 占位，返回 false；没有复制 MemHack 实现"
+category = TC_WARVK_LOADER
+returns = boolean
+
+[WarVK_RequestDllLoadByAi]
+title = "请求 AI 桥加载 WarVK"
+description = "通过 StartCampaignAI 启动 warvk.ai"
+comment = "当前 warvk.ai 会优先从地图导出 warvk.blp 到临时 DLL 后加载，失败再尝试 LoadLibraryA(\"WarVK.dll\")"
+category = TC_WARVK_LOADER
+returns = boolean
+
+[WarVK_GetLoaderMode]
+title = "获取 WarVK 加载模式"
+description = "获取 WarVK 当前加载模式"
+comment = "0=外部加载，1=YDWE exec-lua，2=内存桥，3=AI桥"
+category = TC_WARVK_LOADER
+returns = WARVK_LOADER_MODE
+
+[WarVK_GetLoaderModeString]
+title = "获取加载模式文本"
+description = "获取 WarVK 当前加载模式文本"
+comment = "便于在地图内显示调试信息"
+category = TC_WARVK_LOADER
+returns = string
+
+[WarVK_GetLastLoadRouteString]
+title = "获取最后加载路线"
+description = "获取 WarVK 最后一次请求加载的路线"
+comment = "例如 exec-lua:warvk_loader"
+category = TC_WARVK_LOADER
+returns = string
+
+[WarVK_GetLocalLoadErrorString]
+title = "获取本地加载错误"
+description = "获取 WarVK JASS 层记录的加载错误"
+comment = "bridge 未就绪时优先看这个"
+category = TC_WARVK_LOADER
+returns = string
+
+[WarVK_GetLastErrorString]
+title = "获取 WarVK 最后错误"
+description = "获取 WarVK 最后错误"
+comment = "bridge ready 后读取 DLL 侧错误；未 ready 时返回 JASS 本地加载错误"
+category = TC_WARVK_LOADER
+returns = string
+
+[WarVK_GetVersionString]
+title = "获取 WarVK 版本文本"
+description = "获取 WarVK DLL 版本文本"
+comment = "未加载时返回空字符串"
+category = TC_WARVK_DEBUG
+returns = string
+
+[WarVK_GetStatsString]
+title = "获取 WarVK 状态文本"
+description = "获取 WarVK DLL 状态文本"
+comment = "未加载时返回空字符串"
+category = TC_WARVK_DEBUG
+returns = string
+
 [DXVK_GetGameTimeSeconds]
 title = "获取游戏时间秒"
 description = "获取游戏时间（秒）"

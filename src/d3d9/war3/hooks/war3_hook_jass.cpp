@@ -1,6 +1,7 @@
 #include "war3_hook_jass.h"
 #include "war3_hook_address_book.h"
 #include "war3_hook_install_util.h"
+#include "war3_jass_command_bridge.h"
 #include "war3_jass_native_plan_cache.h"
 #include "../../d3d9_war3_debug.h"
 
@@ -343,6 +344,9 @@ static int __cdecl Hook_InitJassNatives() {
     result = g_trampolineInitJassNatives();
   }
 
+  ResetJassCommandBridgeInstallState();
+  TryInstallJassCommandBridge("InitJassNatives");
+
   war3dbg::Print("DXVK War3Hook: Hook_InitJassNatives EXIT\n");
   return result;
 }
@@ -375,6 +379,8 @@ int __fastcall Hook_ExecuteJassFunction(void *thisPtr, void *edx, int a2,
           dxvk::war3::internal::kNativeJassNativeCallStatsLogging ? 1 : 0);
     }
   }
+
+  TryInstallJassCommandBridge("ExecuteJassFunction");
 
   war3::War3PerfMonitor::ScopedCpuScope perfScope;
   if constexpr (dxvk::war3::internal::kNativeJassVmPerfTrackingEnabled) {
@@ -616,6 +622,7 @@ void War3HookJass::Install(uintptr_t gameBase) {
   }
   ConfigureNativeCallHelperFns(
       {g_getTlsJassData, g_regFuncAddr2Handle, g_computeHandleMemoryAddr});
+  ConfigureJassCommandBridge(g_getTlsJassData);
   ResetNativeCallPlanCaches();
   if constexpr (dxvk::war3::internal::kNativeJassNativeCallHookEnabled) {
     war3dbg::Print(
@@ -747,6 +754,74 @@ void War3HookJass::Install(uintptr_t gameBase) {
     war3dbg::Print(
         "DXVK War3Hook[Jass]: Deep VM hooks disabled (ExecuteInternal/MainLoop)\n");
   }
+}
+
+bool War3HookJass::InstallCommandBridgeOnly(uintptr_t gameBase,
+                                            const char *reason) {
+  if (gameBase == 0u) {
+    war3dbg::Print(
+        "DXVK War3Hook[Jass]: bridge-only install skipped - Game.dll base is null reason=%s\n",
+        reason ? reason : "<unknown>");
+    return false;
+  }
+
+  const auto &book = GetWar3HookAddressBook127a();
+  constexpr size_t kProbeSize = 32;
+  auto resolveCode = [&](uintptr_t rva) -> LPVOID {
+    return reinterpret_cast<LPVOID>(gameBase + rva);
+  };
+
+  LPVOID getTlsJassDataAddr = resolveCode(book.getTlsJassData);
+  LPVOID regFuncAddr2HandleAddr = resolveCode(book.regFuncAddr2Handle);
+  LPVOID computeHandleMemoryAddrAddr =
+      resolveCode(book.computeHandleMemoryAddr);
+
+  g_getTlsJassData = nullptr;
+  g_regFuncAddr2Handle = nullptr;
+  g_computeHandleMemoryAddr = nullptr;
+
+  if (IsExecutableReadableRange(getTlsJassDataAddr, kProbeSize)) {
+    g_getTlsJassData = reinterpret_cast<GetTlsJassDataFn>(getTlsJassDataAddr);
+  } else {
+    war3dbg::Print(
+        "DXVK War3Hook[Jass]: bridge-only helper getTlsJassData invalid (%p) reason=%s\n",
+        getTlsJassDataAddr, reason ? reason : "<unknown>");
+  }
+
+  if (IsExecutableReadableRange(regFuncAddr2HandleAddr, kProbeSize)) {
+    g_regFuncAddr2Handle =
+        reinterpret_cast<RegFuncAddr2HandleFn>(regFuncAddr2HandleAddr);
+  } else {
+    war3dbg::Print(
+        "DXVK War3Hook[Jass]: bridge-only helper regFuncAddr2Handle invalid (%p) reason=%s\n",
+        regFuncAddr2HandleAddr, reason ? reason : "<unknown>");
+  }
+
+  if (IsExecutableReadableRange(computeHandleMemoryAddrAddr, kProbeSize)) {
+    g_computeHandleMemoryAddr =
+        reinterpret_cast<ComputeHandleMemoryAddrFn>(
+            computeHandleMemoryAddrAddr);
+  } else {
+    war3dbg::Print(
+        "DXVK War3Hook[Jass]: bridge-only helper computeHandleMemoryAddr invalid (%p) reason=%s\n",
+        computeHandleMemoryAddrAddr, reason ? reason : "<unknown>");
+  }
+
+  ConfigureNativeCallHelperFns(
+      {g_getTlsJassData, g_regFuncAddr2Handle, g_computeHandleMemoryAddr});
+  ConfigureJassCommandBridge(g_getTlsJassData);
+  ResetNativeCallPlanCaches();
+  ResetJassCommandBridgeInstallState();
+  TryInstallJassCommandBridge(reason ? reason : "CommandBridgeOnly");
+
+  const bool installed = IsJassCommandBridgeInstalled();
+  war3dbg::Print(
+      "DXVK War3Hook[Jass]: bridge-only install reason=%s installed=%d tls=%p regCode=%p handleMem=%p\n",
+      reason ? reason : "<unknown>", installed ? 1 : 0,
+      reinterpret_cast<void *>(g_getTlsJassData),
+      reinterpret_cast<void *>(g_regFuncAddr2Handle),
+      reinterpret_cast<void *>(g_computeHandleMemoryAddr));
+  return installed;
 }
 
 } // namespace dxvk::war3::hooks

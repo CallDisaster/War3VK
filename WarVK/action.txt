@@ -1,3 +1,29 @@
+[WarVK_Init]
+title = "初始化 WarVK"
+description = "初始化 WarVK 并启动 DLL 加载轮询"
+comment = "不声明 native；默认通过 YDWE exec-lua 请求加载，若 DLL 已加载则直接就绪"
+category = TC_WARVK_LOADER
+
+[WarVK_RequestDllLoad]
+title = "请求加载 WarVK.dll"
+description = "按当前 WarVK 加载模式请求加载 DLL"
+comment = "默认模式为 YDWE exec-lua；非 Lua memory bridge 目前只是 clean-room 占位"
+category = TC_WARVK_LOADER
+
+[WarVK_ShowLoaderStatus]
+title = "显示 WarVK 加载状态"
+description = "显示 WarVK 是否已加载及最后一次加载错误"
+comment = "用于手动测试地图里的加载链路"
+category = TC_WARVK_LOADER
+
+[WarVK_Log]
+title = "写入 WarVK 日志"
+description = "写入 WarVK 日志 ${message}"
+comment = "仅在 WarVK bridge ready 后生效"
+category = TC_WARVK_DEBUG
+[[.args]]
+type = string
+
 [DXVK_OutlineAddHandle]
 title = "添加描边对象"
 description = "添加描边对象句柄 ${handle}"

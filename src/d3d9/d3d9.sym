@@ -17,6 +17,8 @@
     Direct3D9EnableMaximizedWindowedModeShim;
     DXVK_RegisterAnnotation;
     DXVK_UnRegisterAnnotation;
+    Initialize;
+    WarVK_Initialize;
     Direct3D9ForceHybridEnumeration;
     Direct3DCreate9On12;
     Direct3DCreate9On12Ex;

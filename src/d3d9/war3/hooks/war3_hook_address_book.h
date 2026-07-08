@@ -105,6 +105,8 @@ struct War3HookAddressBook {
   uintptr_t shadowToggleStaticStampFromObject = 0;
   uintptr_t shadowToggleEmitterStamp = 0;
   uintptr_t shadowPathStaticStampToggle = 0;
+  // UnitUI.slk buildingShadow 字段写入 CUnitUIManager type record +0x50。
+  uintptr_t cunitUiRecordSetStructureShadow = 0;  // 0x335A00
   uintptr_t shadowProjectorSimpleBridge = 0;
   uintptr_t shadowPathObjectProjectorRuntime = 0;
   uintptr_t shadowPathObjectProjectorJassBridge = 0;
@@ -130,31 +132,20 @@ struct War3HookAddressBook {
   uintptr_t terrainShadowToggleStaticStampFromObject = 0;  // 0x74DB30
   uintptr_t terrainShadowToggleEmitterStamp = 0;           // 0x74DE40
 
-  // 2026-05-30 根因突破：ListA stamp 渲染消费点。
-  // CWorld_TerrainShadow_Dispatch case0 直接调用这两个函数渲染所有
-  // doodad/建筑/path blocker 的地面贴花阴影 stamp，绕过所有现有 hook。
-  // mode>=1 时 hook 它们直接 return 即可干净屏蔽魔兽自带可见静态阴影 +
-  // path blocker 阴影，不影响 fog/LOS/path（那些走独立的 FogMask grid）。
-  // 这两个函数仅被 CWorld_TerrainShadow_Dispatch 调用，hook 安全。
+  // Phase 7.143 证伪归档：这两个 ListA 函数不是静态阴影消费点。
+  // 实机验证表明 hook 后会干掉悬崖/地形 tile；IDA 复核显示
+  // RenderAllEntries -> sub_6F725F80 按 148-byte stride 取地形 tile 几何。
+  // 地址仅保留作历史诊断，生产默认禁止安装对应 hook。
   uintptr_t terrainShadowListARenderPreparedGroups = 0;  // 0x7370A0
   uintptr_t terrainShadowListARenderAllEntries = 0;      // 0x737110
 
-  // Phase 7.116：建筑/装饰物/可破坏物原生静态阴影屏蔽的真正路径。
-  // TerrainShadow_DispatchToShape 是 shadow footprint 写入的唯一汇聚点，
-  // 内部走 BoxFastpath/PolyFastpath 直接修改 mask grid。它的 5 个 caller
-  // 全部是 shadow path：
-  //   - sub_6F21A890 / sub_6F21A9A0 / sub_6F21AA60: widget shadow setup helper
-  //   - RebuildMaskFromObjectLists LABEL_55 / LABEL_88: 整体重建 shadow 路径
-  // 与 fog/LOS/path/visibility（走 WriteMaskRegion）完全独立，hook 入口直接
-  // return 0 即可干净屏蔽所有建筑/装饰物/可破坏物 footprint shadow。
+  // Phase 7.116 旧实验地址：后续实测 dispatchToShapeEnterCount=0，
+  // 默认不再作为静态阴影治理点。仅在显式诊断开关打开时用于灰度验证。
   uintptr_t terrainShadowDispatchToShape = 0;  // 0x234420
 
-  // Phase 7.100：TerrainShadow_WriteMaskRegion 是 War3 1.27a 静态阴影
-  // (建筑/可破坏物的预渲染贴花阴影) 的真正写入函数。所有 30+ 个 mask 写入
-  // 路径都汇聚到这里。详细论证见
-  // docs/plan/overnight_render_paper_2026_05_15/06_fogmask_static_shadow.md §7.1。
-  // hook 后按 maskIdx == 3 (shadow footprint) 拒绝即可干净屏蔽建筑阴影，
-  // 不影响 fog/LOS/path 这三个共享 mask grid 的子系统。
+  // Phase 7.100/7.101 诊断地址：idx==3/maskIdx 方案已被实测推翻。
+  // 该路径属于 fog/LOS/path/footprint 共享 mask grid，默认仅安装诊断 hook，
+  // 不做 reject。静态阴影生产治理改走 RegisterImage/StaticStamp producer 端。
   uintptr_t terrainShadowWriteMaskRegion = 0;  // 0x234710
 
   // -------------------------------------------------------------------------
@@ -171,6 +162,11 @@ struct War3HookAddressBook {
   uintptr_t rqStateCleanupPending = 0;
   uintptr_t handleManager = 0;
   uintptr_t gameWar3 = 0;
+  uintptr_t gxDevice = 0;
+
+  // CGxDeviceD3d object layout offsets. `gxDevice + 0x584` is the
+  // IDirect3DDevice9* written by IDirect3D9::CreateDevice in 0x6F0EC400.
+  uintptr_t gxDeviceD3dNativeDeviceOffset = 0;
 
   // -------------------------------------------------------------------------
   // RenderQueue/设备辅助函数

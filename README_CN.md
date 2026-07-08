@@ -4,6 +4,8 @@
 
 WarVK 是一个面向 Warcraft III 1.27a 的画面增强项目。它基于 DXVK 派生出的 D3D9 到 Vulkan 渲染路径，在经典客户端中加入更现代的阴影、后处理、运行时诊断，以及面向引擎研究的渲染改造能力。
 
+当前最新实验分支已经有意抛弃旧的渲染思路：不再把魔兽争霸 3 当成一个只能被动观察的 D3D9 draw stream，然后试图把固定管线提交过的内容原样重放。新的方向是直接从魔兽争霸 3 的上层运行时拿数据，包括可见 renderable、对象身份、模型资源、pose/palette、材质信息和 draw-time 几何，再由 WarVK 自己构建 ShadowMap 与阴影接收流程。
+
 > [!NOTE]
 > WarVK 的目标是优先提升画面表现，而不是单纯追求更高帧率。开启高质量效果后，显卡负载通常会升高。
 
@@ -15,13 +17,25 @@ WarVK 是一个面向 Warcraft III 1.27a 的画面增强项目。它基于 DXVK 
 - 在游戏内提供阴影、抗锯齿、Bloom、曝光等图形调节选项
 - 只改变画面呈现，不改玩法规则，也不修改地图数据
 
+### 静态阴影解决版重点
+
+- 已解决 Warcraft III 原生建筑静态阴影残留：通过早期 Hook `CUnitUIManager_RecordSetStructureShadow`，阻断 UnitUI 类型记录中的 `buildingShadow(+0x50)` 写入
+- 默认移除 `TerrainShadow_RenderListB` 旧版单位黑色圆影，避免原版 blob 阴影和 WarVK 阴影叠加
+- 退役 `WriteMaskRegion / StaticStampPath / RegisterImage / DoodadStamp` 等历史静态阴影实验默认路径，减少误伤地形、雾、贴花的风险
+- 保留静态阴影研究证据链，后续需要专项诊断时仍可回看历史路径
+
 ### 1.1.0 版本重点
 
 - 打通了游戏逻辑层到渲染层的对象语义桥梁，增强对象身份追踪能力
-- 拦截了所有路径阻断器的阴影渲染，避免无效阻断器阴影污染场景
+- 将最新实验阴影路径迁移到“魔兽上层运行时语义数据驱动”，而不是只依赖旧 D3D9 draw replay
 - 将 StormBreaker 直接内置进项目运行时
 - 升级了 GPU Arena，降低因 VB/IB 冻结快照式阴影捕获导致的显卡驱动压力
 - 接入了第一阶段静态模型缓存，减少 GPU Arena 的占用
+
+### 当前已知问题
+
+- 看到桥、斜坡等装饰性/静态几何时仍可能短暂卡顿。当前 static VB cache 与 LRU 只能缓解重复进入视野后的卡顿，第一次看到时仍可能发生短暂停顿，尚未根治。
+- 路径阻断器的 CSM 阴影仍可能漏进 WarVK 的 ShadowMap。项目已经能通过 FourCC 识别一部分路径阻断器渲染对象，但仍有实例没有在最终 CSM caster 列表中被剔除。
 
 ### 适用人群与局限
 
@@ -75,7 +89,7 @@ WarVK 是一个面向 Warcraft III 1.27a 的画面增强项目。它基于 DXVK 
 
 ### 当前阶段
 
-当前版本：`v1.1.0`
+当前 WarVK 里程碑：`静态阴影解决版 (2026-07-08)`
 
 当前版本已经具备：
 
@@ -85,6 +99,8 @@ WarVK 是一个面向 Warcraft III 1.27a 的画面增强项目。它基于 DXVK 
 - 第一阶段静态模型缓存
 
 动态 Pose 接管仍在继续推进，目前还没有完全替代回退阴影路径。
+
+当前活跃的实验阴影分支已经不再是简单的“捕获 D3D9 draw call 后延迟重放”。长期目标是语义化渲染：Hook 魔兽争霸 3 的上层渲染/运行时数据流，重建稳定的对象与 renderable 身份，在数据生产侧附近拿到模型、姿态、材质和几何事实，然后提交 WarVK 自己的 shadow scene。旧 draw capture 仍保留为兼容与诊断回退，但主方向是从魔兽运行时语义直接渲染 ShadowMap。
 
 ### 代码结构
 

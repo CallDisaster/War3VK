@@ -16,5 +16,20 @@ public:
    * @param gameBase Game.dll 基址。
    */
   static void Install(uintptr_t gameBase);
+
+  /**
+   * @brief 仅安装 WarVK JASS 命令桥 carrier。
+   *
+   * 用于 `.ai`/LoadLibrary 中途载入路径：此时 InitJassNatives 通常已经
+   * 结束，不应再晚装完整 JASS/生命周期 Hook；只需要把
+   * Preloader/GetLocalizedHotkey/GetLocalizedString 三个低频 carrier 指向
+   * WarVK 自己的命令桥。
+   *
+   * @param gameBase Game.dll 基址。
+   * @param reason 诊断来源。
+   * @return true 表示 carrier 已安装完成。
+   */
+  static bool InstallCommandBridgeOnly(uintptr_t gameBase,
+                                       const char *reason);
 };
 } // namespace dxvk::war3::hooks

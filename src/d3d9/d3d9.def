@@ -23,6 +23,8 @@ EXPORTS
 
   DXVK_RegisterAnnotation @28257 NONAME
   DXVK_UnRegisterAnnotation @28258 NONAME
+  Initialize @28259
+  WarVK_Initialize @28260
 
   Direct3D9ForceHybridEnumeration @16 NONAME PRIVATE
   
