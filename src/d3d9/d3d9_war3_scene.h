@@ -202,11 +202,24 @@ namespace dxvk {
         void* shadowRenderablePart = nullptr;
         uint32_t shadowLayerIndex = 0u;
         uint64_t shadowMetadataKeyHash = 0u;
+        // Collision-resistant current-frame geometry identity.  Kept
+        // separate from metadataKeyHash so a cache hash can never masquerade
+        // as proof that blocker/alpha metadata was actually found.
+        uint64_t shadowExactGeometryKeyHash = 0u;
+        // Explicit authoritative Unit identity proof for anonymous Stage11
+        // draws. ObjectKind and metadata/cache hashes are not identity proof:
+        // both can be inherited or synthesized by fallback producers.
+        bool shadowUnitIdentityProven = false;
         uint64_t alphaMetadataFrameSerial = 0u;
         uint8_t shadowMetadataBlockerReason = 0u;
         War3ShadowPartLifecycleState shadowPartLifecycleState =
             War3ShadowPartLifecycleState::RequiredCurrent;
         bool alphaPayloadComplete = false;
+        uint32_t shadowActualIndexMin = 0u;
+        uint32_t shadowActualIndexMax = 0u;
+        bool shadowActualIndexDomainKnown = false;
+        bool shadowFullVertexDomainFallback = false;
+        bool shadowIndexHintMismatch = false;
 
         // ===== 级联阴影剔除（粗略包围球）=====
         // 说明：用于 CPU 端对每个 CSM 级联做保守剔除，减少“每级联全量重放”的 drawcall 膨胀。

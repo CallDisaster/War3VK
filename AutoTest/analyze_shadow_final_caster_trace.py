@@ -355,7 +355,10 @@ def stage11_alpha_payload_gap(record: dict[str, Any], frame_serial: int) -> bool
     return (
         not int(record.get("alphaPayloadComplete", 0))
         or alpha_frame not in valid_source_frames
-        or is_zero_hex(record.get("metadataKeyHash", "0x0"))
+        or (
+            is_zero_hex(record.get("metadataKeyHash", "0x0"))
+            and is_zero_hex(record.get("exactGeometryKeyHash", "0x0"))
+        )
     )
 
 

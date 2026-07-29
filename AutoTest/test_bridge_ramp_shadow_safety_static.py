@@ -155,17 +155,21 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
         name = "DXVK_WAR3_DRAWTIME_VB_CACHE"
         self.assertIn(f'"{name}", 0u', self.device)
         self.assertIn(f'"{name}"', self.monitor)
-        capture = self.device.index(
-            "War3ShadowDrawTimeCapturePhase::IdentityResolve"
+        capture_gate = self.device.index(
+            "const bool currentFrameStage11Geometry ="
         )
-        capture_prefix = self.device[capture - 420:capture]
+        capture_identity = self.device.index(
+            "War3ShadowDrawTimeCapturePhase::IdentityResolve",
+            capture_gate,
+        )
+        capture_gate_block = self.device[capture_gate:capture_identity]
         self.assertIn(
             "stage == 11 && War3DrawTimeCurrentFrameGeometryRuntime()",
-            capture_prefix,
+            capture_gate_block,
         )
         self.assertIn(
             "if (!currentFrameStage11Geometry && !War3DrawTimeVBCacheRuntime())",
-            capture_prefix,
+            capture_gate_block,
         )
         producer = self.device.index(
             "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"

@@ -5312,8 +5312,8 @@ inline bool War3CasterIsAnonymousSmallPathBlockerMarker(
   const bool exactCurrentDrawContractBacked =
       static_cast<dxvk::war3::render::ObjectKind>(draw.objectKind) ==
           dxvk::war3::render::ObjectKind::Unit &&
+      draw.shadowUnitIdentityProven &&
       draw.shadowRenderablePart != nullptr &&
-      draw.shadowMetadataKeyHash != 0u &&
       draw.shadowPartLifecycleState ==
           War3ShadowPartLifecycleState::RequiredCurrent;
   if (exactCurrentDrawContractBacked)
@@ -8506,8 +8506,9 @@ inline bool War3ComputePacketLocalBounds(
   return true;
 }
 
-inline bool War3ComputeMappedLocalBoundsFromSlice(
-    const DxvkBufferSlice& positionSlice, uint32_t positionStride,
+inline bool War3ComputeMappedLocalBoundsFromBytes(
+    const void* positionBytes, VkDeviceSize positionByteLength,
+    uint32_t positionStride,
     uint32_t positionOffset, VkFormat positionFormat, uint32_t firstVertex,
     uint32_t vertexCount, War3LocalGeometryBounds& outBounds) {
   if (vertexCount == 0u || positionStride < 12u)
@@ -8523,11 +8524,11 @@ inline bool War3ComputeMappedLocalBoundsFromSlice(
       (uint64_t(firstVertex) + uint64_t(vertexCount - 1u)) *
           uint64_t(positionStride) +
       uint64_t(positionOffset) + 12ull;
-  if (lastByte > positionSlice.length())
+  if (lastByte > positionByteLength)
     return false;
 
   const auto* base =
-      reinterpret_cast<const uint8_t*>(positionSlice.mapPtr(0u));
+      reinterpret_cast<const uint8_t*>(positionBytes);
   if (base == nullptr)
     return false;
 
@@ -8558,6 +8559,15 @@ inline bool War3ComputeMappedLocalBoundsFromSlice(
     outBounds.maxZ = (std::max)(outBounds.maxZ, z);
   }
   return true;
+}
+
+inline bool War3ComputeMappedLocalBoundsFromSlice(
+    const DxvkBufferSlice& positionSlice, uint32_t positionStride,
+    uint32_t positionOffset, VkFormat positionFormat, uint32_t firstVertex,
+    uint32_t vertexCount, War3LocalGeometryBounds& outBounds) {
+  return War3ComputeMappedLocalBoundsFromBytes(
+      positionSlice.mapPtr(0u), positionSlice.length(), positionStride,
+      positionOffset, positionFormat, firstVertex, vertexCount, outBounds);
 }
 
 inline uint64_t War3ComputeTerrainBoundsContentKey(
@@ -19938,6 +19948,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
           packet.renderable.renderablePart,
           packet.renderable.layerIndex, &contract);
+      if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
+        return false;
       const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
       if (vbIt != m_war3DrawTimeVBCache.end() &&
           vbIt->second.MatchesKey(cacheKey) &&
@@ -22586,6 +22598,29 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   return true;
 }
 
+void D3D9DeviceEx::War3MarkDrawTimeExactRejectedCurrentFrame(
+    const War3DrawTimeVBCacheKey& key) {
+  if (key.renderablePart == nullptr || key.meshPayloadPtr == nullptr ||
+      (key.instanceIdentity == nullptr && key.jHandle == 0u)) {
+    return;
+  }
+  if (m_war3DrawTimeExactRejectedFrameSerial !=
+      m_war3ShadowPersistentFrameSerial) {
+    m_war3DrawTimeExactRejectedKeys.clear();
+    m_war3DrawTimeExactRejectedFrameSerial =
+        m_war3ShadowPersistentFrameSerial;
+  }
+  m_war3DrawTimeExactRejectedKeys.insert(key);
+}
+
+bool D3D9DeviceEx::War3DrawTimeExactRejectedCurrentFrame(
+    const War3DrawTimeVBCacheKey& key) const {
+  return m_war3DrawTimeExactRejectedFrameSerial ==
+             m_war3ShadowPersistentFrameSerial &&
+         m_war3DrawTimeExactRejectedKeys.find(key) !=
+             m_war3DrawTimeExactRejectedKeys.end();
+}
+
 uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
   auto& visibleRegistry =
       dxvk::war3::render::VisibleRenderableRegistry::instance();
@@ -22604,6 +22639,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
       continue;
     }
     if (entry.frameSerial != m_war3ShadowPersistentFrameSerial)
+      continue;
+    if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
       continue;
 
     dxvk::war3::render::VisibleRenderableRecord record = {};
@@ -22649,7 +22686,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
             : visibleRecordExact && record.identity.kind !=
                       dxvk::war3::render::ObjectKind::Unknown
                   ? record.identity.kind
-                  : dxvk::war3::render::ObjectKind::Unit;
+                  : dxvk::war3::render::ObjectKind::Unknown;
     const bool staticWorldCasterRawcode =
         War3SemanticRawcodeLooksStaticWorldCaster(exactOwnerRawcode);
     // LT/YT trees and pathing doodads can inherit a stale Unit classification
@@ -22661,6 +22698,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
       objectKind = dxvk::war3::render::ObjectKind::Destructible;
     }
     const bool exactNativeObjectSupported =
+        objectKind == dxvk::war3::render::ObjectKind::Unknown ||
         objectKind == dxvk::war3::render::ObjectKind::Unit ||
         objectKind == dxvk::war3::render::ObjectKind::Building ||
         objectKind == dxvk::war3::render::ObjectKind::Destructible;
@@ -22689,8 +22727,45 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     entry.exactOwnerFrameSerial = m_war3ShadowPersistentFrameSerial;
     m_war3Scene.shadowStats.drawTimeSemanticProducerClaimedCount++;
 
+    // Metadata capture runs earlier in the same Stage11 draw and can classify
+    // anonymous path/LOS markers that do not have a usable rawcode.  Consume
+    // that exact identity before constructing a caster.  A hit is a terminal
+    // owner decision for this frame and must suppress grouped/lease fallback.
+    dxvk::war3::shadow::War3ShadowDrawMetadataQuery blockerQuery = {};
+    blockerQuery.instanceIdentity = cacheKey.instanceIdentity;
+    blockerQuery.sceneNode = entry.sceneNode;
+    blockerQuery.renderablePart = cacheKey.renderablePart;
+    blockerQuery.meshPayloadPtr = cacheKey.meshPayloadPtr;
+    blockerQuery.worldObjectEntry = entry.worldObjectEntry;
+    blockerQuery.unitPtr = entry.unitPtr;
+    blockerQuery.jHandle = cacheKey.jHandle;
+    blockerQuery.layerIndex = cacheKey.layerIndex;
+    blockerQuery.producerStage = exactProducerStage;
+    blockerQuery.payloadWord108 = cacheKey.payloadWord108;
+    blockerQuery.payloadWord11C = cacheKey.payloadWord11C;
+    blockerQuery.materialSignatureHash = 0u;
+    dxvk::war3::shadow::War3ShadowMetadataBlockerReason
+        metadataBlockerReason =
+            dxvk::war3::shadow::War3ShadowMetadataBlockerReason::None;
+    uint64_t metadataBlockerKeyHash = 0u;
+    const bool metadataRejectedBlocker =
+        dxvk::war3::shadow::War3ShadowDrawMetadataStore().lookupBlocker(
+            blockerQuery, m_war3ShadowPersistentFrameSerial,
+            metadataBlockerReason, &metadataBlockerKeyHash);
+    if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+        metadataRejectedBlocker) {
+      War3MarkDrawTimeExactRejectedCurrentFrame(cacheKey);
+      m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+      m_war3Scene.shadowStats
+          .semanticSceneRejectedPathBlockerProducerCount++;
+      m_war3Scene.shadowStats.skippedNotCaster++;
+      entry.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
+      continue;
+    }
+
     if (dxvk::war3::internal::kPathBlockerHideEnabled &&
         drawTimeEntryIsPathBlocker) {
+      War3MarkDrawTimeExactRejectedCurrentFrame(cacheKey);
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
       m_war3Scene.shadowStats
           .semanticSceneRejectedPathBlockerProducerCount++;
@@ -22724,16 +22799,22 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     // misreport the entry-backed native cutout payload as missing metadata.
     draw.shadowRenderablePart = renderablePart;
     draw.shadowLayerIndex = cacheKey.layerIndex;
-    draw.shadowMetadataKeyHash =
+    draw.shadowExactGeometryKeyHash =
         uint64_t(War3DrawTimeVBCacheKeyHash{}(cacheKey));
-    if (draw.shadowMetadataKeyHash == 0u)
-      draw.shadowMetadataKeyHash = 1u;
+    if (draw.shadowExactGeometryKeyHash == 0u)
+      draw.shadowExactGeometryKeyHash = 1u;
+    draw.shadowMetadataKeyHash = 0u;
     draw.alphaMetadataFrameSerial =
         entry.alphaTestEnabled ? entry.frameSerial : 0u;
     draw.shadowPartLifecycleState =
         War3ShadowPartLifecycleState::RequiredCurrent;
     draw.alphaPayloadComplete =
         !entry.alphaTestEnabled || entry.HasCompleteAlphaPayload();
+    draw.shadowActualIndexMin = entry.actualIndexMin;
+    draw.shadowActualIndexMax = entry.actualIndexMax;
+    draw.shadowActualIndexDomainKnown = entry.actualIndexDomainKnown;
+    draw.shadowFullVertexDomainFallback = entry.fullVertexDomainFallback;
+    draw.shadowIndexHintMismatch = entry.indexHintMismatch;
     draw.indexed = entry.indexed;
     draw.positionStorage = entry.positionBuffer;
     draw.positionInfo = entry.positionInfo;
@@ -22828,6 +22909,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
                                                 ? record.identity.jHandle
                                                 : 0u;
     draw.objectKind = static_cast<uint8_t>(objectKind);
+    draw.shadowUnitIdentityProven =
+        objectKind == dxvk::war3::render::ObjectKind::Unit &&
+        entry.unitIdentityProven;
     // 2026-05-31：身份写入 caster，供最终统一 path blocker 清扫。
     draw.rawcode = exactOwnerRawcode;
     draw.jHandle = entry.jHandle != 0u ? entry.jHandle
@@ -22938,6 +23022,9 @@ bool D3D9DeviceEx::War3DrainShadowCasterTombstones() {
     m_war3SemanticDirectPrevSubmittedPartIdentityKeys.clear();
     m_war3SemanticDirectCasterContracts.clear();
     m_war3DrawTimeVBCache.clear();
+    m_war3DrawTimeExactRejectedKeys.clear();
+    m_war3DrawTimeExactRejectedFrameSerial =
+        m_war3ShadowPersistentFrameSerial;
     m_war3Stage13RetainedCasters.clear();
     m_war3S1TerrainCasterStash.clear();
     dxvk::war3::shadow::War3ShadowDrawMetadataStore().clear();
@@ -23414,6 +23501,19 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       };
   const auto currentFrameDrawTimeProducerOwnsRecord =
       [&](const dxvk::war3::render::CurrentDrawContractRecord& record) {
+        const int16_t effectiveProducerStage =
+            record.producerStage >= 0 ? record.producerStage : record.stage;
+        if (War3DrawTimeCurrentFrameGeometryRuntime() &&
+            effectiveProducerStage == 11 &&
+            record.renderablePart != nullptr &&
+            War3CurrentDrawContractNamesExactSlice(
+                record.renderablePart, record.layerIndex, record)) {
+          const War3DrawTimeVBCacheKey cacheKey =
+              War3MakeDrawTimeVBCacheKey(
+                  record.renderablePart, record.layerIndex, &record);
+          if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
+            return true;
+        }
         return currentFrameDrawTimeProducerEntry(record) != nullptr;
       };
 
@@ -23872,10 +23972,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     exactRecord.jHandle =
         entry.jHandle != 0u ? entry.jHandle : entry.contractJHandle;
     exactRecord.rawcode = entry.rawcode;
-    exactRecord.objectKind =
-        entry.objectKind != dxvk::war3::render::ObjectKind::Unknown
-            ? entry.objectKind
-            : dxvk::war3::render::ObjectKind::Unit;
+    // Preserve Unknown.  A cache/part identity is not proof that this draw is
+    // a Unit; promoting it here allowed anonymous path markers to enter the
+    // Unit-only final-caster exemption.
+    exactRecord.objectKind = entry.objectKind;
     exactRecord.layerIndex = entry.layerIndex;
     if (War3SemanticRawcodeLooksStaticWorldCaster(exactRecord.rawcode)) {
       exactRecord.objectKind =
@@ -24737,6 +24837,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         const War3DrawTimeVBCacheKey currentKey =
             War3MakeDrawTimeVBCacheKey(
                 leasedPart, leasedLayer, &currentContract);
+        if (War3DrawTimeExactRejectedCurrentFrame(currentKey)) {
+          currentPartKeys.insert(key);
+          m_war3Scene.shadowStats
+              .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
+          continue;
+        }
         const auto currentVbIt = m_war3DrawTimeVBCache.find(currentKey);
         if (currentVbIt != m_war3DrawTimeVBCache.end() &&
             currentVbIt->second.MatchesKey(currentKey) &&
@@ -30232,6 +30338,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitiveUP(
     m_war3PerDrawUpload.vbSlices[0] = upSlice.slice;
     m_war3PerDrawUpload.vbStrides[0] = VertexStreamZeroStride;
     m_war3PerDrawUpload.vbValid[0] = true;
+    m_war3PerDrawUpload.vbUploadBytes[0] = upSlice.mapPtr;
+    m_war3PerDrawUpload.vbUploadLength[0] = bufferSize;
   }
   War3TryCaptureShadowCasterDrawNonIndexed(PrimitiveType, 0, vertexCount, true);
 
@@ -30339,12 +30447,16 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitiveUP(
         upSlice.slice.subSlice(0, vertexBufferSize);
     m_war3PerDrawUpload.vbStrides[0] = VertexStreamZeroStride;
     m_war3PerDrawUpload.vbValid[0] = true;
+    m_war3PerDrawUpload.vbUploadBytes[0] = data;
+    m_war3PerDrawUpload.vbUploadLength[0] = vertexBufferSize;
     m_war3PerDrawUpload.ibSlice = upSlice.slice.subSlice(
         vertexBufferSize, upSlice.slice.length() - vertexBufferSize);
     m_war3PerDrawUpload.ibType =
         DecodeIndexType(static_cast<D3D9Format>(IndexDataFormat));
     m_war3PerDrawUpload.ibValid = true;
     m_war3PerDrawUpload.ibStorage = m_war3PerDrawUpload.storage;
+    m_war3PerDrawUpload.ibUploadBytes = data + vertexBufferSize;
+    m_war3PerDrawUpload.ibUploadLength = indicesSize;
   }
   War3TryCaptureShadowCasterDrawIndexed(PrimitiveType, 0, MinVertexIndex,
                                         NumVertices, 0, vertexCount, true,
@@ -32352,11 +32464,14 @@ D3D9BufferSlice D3D9DeviceEx::AllocUPBuffer(VkDeviceSize size) {
 
     DxvkBufferCreateInfo info;
     info.size = std::max(UPBufferSize, size);
-    info.usage =
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     info.access =
-        VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
-    info.stages = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+        VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+        VK_ACCESS_TRANSFER_READ_BIT;
+    info.stages =
+        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     info.debugName = "UP buffer";
 
     Rc<DxvkBuffer> buffer = m_dxvkDevice->createBuffer(info, memoryFlags);
@@ -33897,6 +34012,12 @@ void D3D9DeviceEx::UploadPerDrawData(UINT &FirstVertexIndex, UINT NumVertices,
         m_war3PerDrawUpload.vbSlices[i] = vboSlice;
         m_war3PerDrawUpload.vbStrides[i] = copy.copyElementSize;
         m_war3PerDrawUpload.vbValid[i] = true;
+        if (copy.copyBufferLength != 0u) {
+          m_war3PerDrawUpload.vbUploadBytes[i] =
+              reinterpret_cast<const uint8_t*>(upSlice.mapPtr) +
+              copy.dstOffset;
+          m_war3PerDrawUpload.vbUploadLength[i] = copy.copyBufferLength;
+        }
         if (sourceBase != nullptr) {
           m_war3PerDrawUpload.vbSourceBase[i] = sourceBase;
           m_war3PerDrawUpload.vbSourceOffset[i] = copy.srcOffset;
@@ -33959,6 +34080,8 @@ void D3D9DeviceEx::UploadPerDrawData(UINT &FirstVertexIndex, UINT NumVertices,
         m_war3PerDrawUpload.ibType = indexType;
         m_war3PerDrawUpload.ibValid = true;
         m_war3PerDrawUpload.ibStorage = m_war3PerDrawUpload.storage;
+        m_war3PerDrawUpload.ibUploadBytes = data;
+        m_war3PerDrawUpload.ibUploadLength = iboUPBufferSize;
         m_war3PerDrawUpload.ibSourceResource =
             reinterpret_cast<uintptr_t>(ibo);
         m_war3PerDrawUpload.ibSourceIdentityGeneration =
@@ -37784,6 +37907,9 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
           fromWidgetIdentity || blockerRawcode == 0u
               ? War3ShadowMetadataBlockerReason::WidgetIdentity
               : War3ShadowMetadataBlockerReason::KnownRawcode);
+      War3MarkDrawTimeExactRejectedCurrentFrame(
+          War3MakeDrawTimeVBCacheKey(
+              renderablePart, dispatch.layerIndex, &contract));
       return true;
     }
   }
@@ -37826,19 +37952,50 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
     if (declInfo.hasPosition && declInfo.posCompCount >= 3u &&
         declInfo.posStream < caps::MaxStreams) {
       const uint32_t positionStream = declInfo.posStream;
-      DxvkBufferSlice positionSlice;
       uint32_t positionStride = 0u;
-      if (dynamicSysmemVbos && m_war3PerDrawUpload.vbValid[positionStream]) {
-        positionSlice = m_war3PerDrawUpload.vbSlices[positionStream];
-        positionStride = m_war3PerDrawUpload.vbStrides[positionStream];
+      const uint8_t* positionBytes = nullptr;
+      VkDeviceSize positionByteLength = 0u;
+      Rc<DxvkResourceAllocation> positionMappedAllocation = nullptr;
+      if (dynamicSysmemVbos) {
+        // Metadata runs before the exact producer.  It may classify a blocker
+        // only from the same immutable UP generation as the main draw; a
+        // missing proof stays diagnostic-only and must not fall back to the
+        // original D3D9 VB.
+        const auto& uploadSlice =
+            m_war3PerDrawUpload.vbSlices[positionStream];
+        if (m_war3PerDrawUpload.vbValid[positionStream] &&
+            uploadSlice.buffer() != nullptr &&
+            m_war3PerDrawUpload.storage != nullptr &&
+            m_war3PerDrawUpload.vbUploadBytes[positionStream] != nullptr &&
+            m_war3PerDrawUpload.vbUploadLength[positionStream] != 0u &&
+            VkDeviceSize(
+                m_war3PerDrawUpload.vbUploadLength[positionStream]) >=
+                uploadSlice.length()) {
+          positionBytes = reinterpret_cast<const uint8_t*>(
+              m_war3PerDrawUpload.vbUploadBytes[positionStream]);
+          positionByteLength =
+              m_war3PerDrawUpload.vbUploadLength[positionStream];
+          positionStride =
+              m_war3PerDrawUpload.vbStrides[positionStream];
+        }
       } else {
         auto* vb = m_state.vertexBuffers[positionStream].vertexBuffer.ptr();
         if (vb != nullptr) {
           auto* common = vb->GetCommonBuffer();
-          if (common != nullptr) {
-            positionSlice =
-                common->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
-                    m_state.vertexBuffers[positionStream].offset);
+          const VkDeviceSize bindingOffset =
+              m_state.vertexBuffers[positionStream].offset;
+          if (common != nullptr && !common->NeedsReadback() &&
+              bindingOffset <= common->Desc()->Size) {
+            positionMappedAllocation = common->GetMappedSlice();
+            const auto* mappedBase = positionMappedAllocation != nullptr
+                ? reinterpret_cast<const uint8_t*>(
+                      positionMappedAllocation->mapPtr())
+                : nullptr;
+            if (mappedBase != nullptr) {
+              positionBytes = mappedBase + bindingOffset;
+              positionByteLength =
+                  VkDeviceSize(common->Desc()->Size) - bindingOffset;
+            }
             positionStride = m_state.vertexBuffers[positionStream].stride;
           }
         }
@@ -37878,11 +38035,16 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
       if (War3LegacyDrawIsPathBlockerGeometryMarkerCandidate(markerProbe,
                                                              semantic)) {
         War3LocalGeometryBounds bounds = {};
-        const bool readable = positionSlice.buffer() != nullptr &&
+        // Indexed MinVertexIndex/NumVertices are only D3D9 hints and are known
+        // to disagree with Warcraft III geoset indices.  Metadata therefore
+        // never makes a positive anonymous-blocker decision for indexed draws;
+        // the exact lane scans the immutable IB and performs that test later.
+        const bool readable = !indexed && positionBytes != nullptr &&
             positionStride >= 12u && firstPositionVertex >= 0 &&
             positionVertexCount != 0u &&
-            War3ComputeMappedLocalBoundsFromSlice(
-                positionSlice, positionStride, declInfo.posOffset,
+            War3ComputeMappedLocalBoundsFromBytes(
+                positionBytes, positionByteLength, positionStride,
+                declInfo.posOffset,
                 declInfo.posFormat, uint32_t(firstPositionVertex),
                 positionVertexCount, bounds);
         if (!readable) {
@@ -37891,6 +38053,9 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
           publishBlocker(War3ShadowMetadataBlockerReason::Unreadable);
         } else if (War3BelowGroundFlatMarkerBoundsFit(bounds)) {
           publishBlocker(War3ShadowMetadataBlockerReason::BelowGround);
+          War3MarkDrawTimeExactRejectedCurrentFrame(
+              War3MakeDrawTimeVBCacheKey(
+                  renderablePart, dispatch.layerIndex, &contract));
           NotePathBlockerGeometryMarkerRejectLog(
               markerProbe, "Metadata/BelowGroundFlat", &bounds);
           return true;
@@ -37901,6 +38066,18 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
 
   if (!War3ShadowMetadataAlphaRuntime() || !nativeAlphaTest)
     return false;
+  // Indexed MinVertexIndex/NumVertices are not an authoritative Warcraft III
+  // geoset domain.  Freezing alpha UV from that hint can undersize the payload
+  // or pair it with a differently cropped generic geometry.  Stage11 exact
+  // captures indexed cutout UV after scanning the immutable IB; metadata stays
+  // a non-indexed fallback only until it can share that same actual domain.
+  if (indexed) {
+    counters.metadataRejectedNoUvCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    counters.stashSkipNoUvCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
   counters.metadataClassifiedCount.fetch_add(1u,
                                              std::memory_order_relaxed);
   dxvk::war3::render::NoteShadowStageMetadataClassified(int(stage));
@@ -37968,7 +38145,21 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
   const uint32_t uvStream = texcoord->Stream;
   uint32_t uvStride = m_state.vertexBuffers[uvStream].stride;
   DxvkBufferSlice uvSlice;
-  if (dynamicSysmemVbos && m_war3PerDrawUpload.vbValid[uvStream]) {
+  if (dynamicSysmemVbos) {
+    const auto& uploadSlice = m_war3PerDrawUpload.vbSlices[uvStream];
+    if (!m_war3PerDrawUpload.vbValid[uvStream] ||
+        uploadSlice.buffer() == nullptr ||
+        m_war3PerDrawUpload.storage == nullptr ||
+        m_war3PerDrawUpload.vbUploadBytes[uvStream] == nullptr ||
+        m_war3PerDrawUpload.vbUploadLength[uvStream] == 0u ||
+        VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[uvStream]) <
+            uploadSlice.length()) {
+      counters.metadataRejectedNoUvCount.fetch_add(
+          1u, std::memory_order_relaxed);
+      counters.stashSkipNoUvCount.fetch_add(1u,
+                                            std::memory_order_relaxed);
+      return false;
+    }
     uvSlice = m_war3PerDrawUpload.vbSlices[uvStream];
     if (m_war3PerDrawUpload.vbStrides[uvStream] != 0u)
       uvStride = m_war3PerDrawUpload.vbStrides[uvStream];
@@ -37977,6 +38168,16 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
     if (uvVb != nullptr) {
       auto* common = uvVb->GetCommonBuffer();
       if (common != nullptr) {
+        // Metadata is captured before PrepareDraw.  Queue the immutable
+        // staging upload now so the following REAL->metadata copy observes
+        // the same generation as the main draw and cannot race a later Lock.
+        if (common->NeedsUpload() && FAILED(FlushBuffer(common))) {
+          counters.metadataRejectedUploadCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          counters.stashSkipNoUploadCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          return false;
+        }
         uvSlice = common->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
             m_state.vertexBuffers[uvStream].offset);
       }
@@ -38210,6 +38411,72 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       isStage13WorldObjectDraw &&
       dxvk::war3::render::IsStage13ImmediateLegacyShadowOwnerEnabled();
   const auto &shadowSemantic = War3RenderState::GetTlsShadowSemanticState();
+  const auto markCurrentStage11ExactRejected =
+      [&](const War3ShadowSemanticContext* semanticContext,
+          const dxvk::war3::render::RenderObjectInfo* objectContext) {
+        if (stage != 11 || !War3DrawTimeCurrentFrameGeometryRuntime())
+          return;
+        const auto dispatch =
+            dxvk::war3::render::GetCurrentDrawDispatchContext();
+        if (!dispatch.valid || dispatch.renderablePart == nullptr)
+          return;
+        void* const renderablePart =
+            semanticContext != nullptr &&
+                    semanticContext->renderablePart != nullptr
+                ? semanticContext->renderablePart
+                : shadowSemantic.renderablePart != nullptr
+                    ? shadowSemantic.renderablePart
+                    : dispatch.renderablePart;
+        if (renderablePart != dispatch.renderablePart)
+          return;
+        const auto* identityObject =
+            semanticContext != nullptr && semanticContext->object != nullptr
+                ? semanticContext->object
+                : shadowSemantic.object != nullptr
+                    ? shadowSemantic.object
+                    : objectContext;
+        void* const sceneNode =
+            semanticContext != nullptr && semanticContext->sceneNode != nullptr
+                ? semanticContext->sceneNode
+                : shadowSemantic.sceneNode != nullptr
+                    ? shadowSemantic.sceneNode
+                    : dispatch.sceneNode;
+        void* const worldObjectEntry =
+            semanticContext != nullptr &&
+                    semanticContext->worldObjectEntry != nullptr
+                ? semanticContext->worldObjectEntry
+                : shadowSemantic.worldObjectEntry != nullptr
+                    ? shadowSemantic.worldObjectEntry
+                    : identityObject != nullptr
+                        ? identityObject->worldObjectEntry
+                        : nullptr;
+        void* const unitPtr =
+            identityObject != nullptr ? identityObject->unitPtr : nullptr;
+        const uint32_t jHandle =
+            semanticContext != nullptr && semanticContext->jHandle != 0u
+                ? semanticContext->jHandle
+                : shadowSemantic.jHandle != 0u
+                    ? shadowSemantic.jHandle
+                    : identityObject != nullptr && identityObject->jHandle != 0u
+                        ? identityObject->jHandle
+                        : War3RenderState::GetTlsBatchHandle();
+        const uint32_t currentRenderFrameIndex =
+            dxvk::war3::state::RenderState::instance().getFrameIndex();
+        dxvk::war3::render::CurrentDrawContractRecord contract = {};
+        if (!dxvk::war3::render::QueryCurrentDrawGeometryContract(
+                renderablePart, sceneNode, worldObjectEntry, unitPtr, jHandle,
+                currentRenderFrameIndex, contract) ||
+            contract.renderFrameIndex != currentRenderFrameIndex ||
+            contract.producerStage != 11 ||
+            !contract.producerFreshThisFrame || contract.fromGrace ||
+            !War3CurrentDrawContractNamesExactSlice(
+                renderablePart, dispatch.layerIndex, contract)) {
+          return;
+        }
+        War3MarkDrawTimeExactRejectedCurrentFrame(
+            War3MakeDrawTimeVBCacheKey(
+                renderablePart, dispatch.layerIndex, &contract));
+      };
   if (isStage13WorldObjectDraw)
     m_war3Scene.shadowStats.stage13CaptureAttemptCount++;
   if (gpuSkinResolvedExact && stage == 11)
@@ -38298,6 +38565,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       }
     }
     if (fastRawcode != 0u && IsLosBlockerFourCc(fastRawcode)) {
+      markCurrentStage11ExactRejected(nullptr, currentObjForBlocker);
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerProducerCount++;
       m_war3Scene.shadowStats.skippedNotCaster++;
@@ -38409,6 +38677,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
         }
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+        markCurrentStage11ExactRejected(&semanticForBlocker,
+                                        currentObjForBlocker);
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerProducerCount++;
         m_war3Scene.shadowStats.skippedNotCaster++;
@@ -38605,6 +38875,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           if (dxvk::war3::SafeReadU32Fast(widgetCandidate, 0x30u, rawcode) &&
               rawcode != 0u && IsLosBlockerFourCc(rawcode)) {
             m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+            markCurrentStage11ExactRejected(nullptr, shadowSemantic.object);
             m_war3Scene.shadowStats
                 .semanticSceneRejectedPathBlockerEarlyBypassCount++;
             m_war3Scene.shadowStats.skippedNotCaster++;
@@ -38681,6 +38952,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
         }
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+        markCurrentStage11ExactRejected(&semantic, earlyCurrentObj);
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerEarlyBypassCount++;
         m_war3Scene.shadowStats.skippedNotCaster++;
@@ -38720,6 +38992,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
       }
       if (metadataRejectedBlocker) {
+        markCurrentStage11ExactRejected(&semantic, earlyCurrentObj);
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerEarlyBypassCount++;
@@ -38938,6 +39211,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             (vbCacheContract.pathBlocker ||
              (pathBlockerRawcode != 0u &&
               IsLosBlockerFourCc(pathBlockerRawcode)))) {
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
           m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
           break;
         }
@@ -38977,6 +39251,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             ((!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) ||
              (semanticAlphaNeedsUv && !gpuSkinSemanticOutputHasUv))) {
           m_war3DrawTimeVBCache.erase(vbCacheKey);
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
           noteGpuSkinBackingReject();
           failGpuSkinShadowConsumer();
           break;
@@ -38985,53 +39260,299 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             War3ShadowDrawTimeCapturePhase::PositionSource);
         auto *decl = m_state.vertexDecl.ptr();
         if (decl == nullptr) {
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoDecl++;
           break;
         }
         const auto &declInfo = War3GetShadowDeclInfo(decl);
         if (!declInfo.hasPosition || declInfo.posCompCount < 3 ||
             declInfo.posStream >= caps::MaxStreams) {
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoPosition++;
           break;
         }
+        const bool nativePositionFormatSupported =
+            declInfo.posType == D3DDECLTYPE_FLOAT3 ||
+            declInfo.posType == D3DDECLTYPE_FLOAT4;
+        const uint32_t nativePositionElementSize =
+            GetDecltypeSize(declInfo.posType);
         const uint32_t posStream = declInfo.posStream;
         DxvkBufferSlice posSlice;
         uint32_t posStride = 0u;
+        D3D9CommonBuffer* posCommon = nullptr;
+        Rc<DxvkResourceAllocation> posMappedAllocation = nullptr;
+        const uint8_t* posCanonicalBytes = nullptr;
+        VkDeviceSize posCanonicalLength = 0u;
         if (gpuSkinSemanticBacking) {
           posSlice = gpuSkinResolved->lease.slice;
           posStride = gpuSkinResolved->lease.desc.vertexStride;
         } else if (gpuSkinSemanticDirectOnly) {
           posSlice = gpuSkinSemanticInput.staticSource;
           posStride = sizeof(float) * 3u;
-        } else if (DynamicSysmemVBOs &&
-            m_war3PerDrawUpload.vbValid[posStream]) {
+        } else if (DynamicSysmemVBOs) {
+          // The main draw has already been rewritten to this per-draw upload.
+          // Missing upload evidence is therefore terminal: falling back to the
+          // original D3D9 VB would combine a different vertex generation with
+          // the current draw's index/palette state.
+          if (!m_war3PerDrawUpload.vbValid[posStream] ||
+              m_war3PerDrawUpload.vbSlices[posStream].buffer() == nullptr ||
+              m_war3PerDrawUpload.storage == nullptr ||
+              m_war3PerDrawUpload.vbUploadBytes[posStream] == nullptr ||
+              m_war3PerDrawUpload.vbUploadLength[posStream] == 0u ||
+              VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream]) <
+                  m_war3PerDrawUpload.vbSlices[posStream].length()) {
+            War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectNoSlice++;
+            break;
+          }
           posSlice = m_war3PerDrawUpload.vbSlices[posStream];
           posStride = m_war3PerDrawUpload.vbStrides[posStream];
+          posCanonicalBytes = reinterpret_cast<const uint8_t*>(
+              m_war3PerDrawUpload.vbUploadBytes[posStream]);
+          posCanonicalLength =
+              m_war3PerDrawUpload.vbUploadLength[posStream];
         } else {
           auto *vb = m_state.vertexBuffers[posStream].vertexBuffer.ptr();
           if (vb) {
-            auto *vbCommon = vb->GetCommonBuffer();
-            if (vbCommon) {
-              posSlice =
-                  vbCommon->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
-                      m_state.vertexBuffers[posStream].offset);
+            posCommon = vb->GetCommonBuffer();
+            if (posCommon) {
+              const VkDeviceSize bindingOffset =
+                  m_state.vertexBuffers[posStream].offset;
+              // Capture precedes PrepareDraw.  A BUFFER/MANAGED resource with
+              // pending CPU writes still has the previous generation in REAL.
+              // FlushBuffer first copies those bytes into its own immutable
+              // staging slice and queues staging->REAL; our subsequent
+              // REAL->exact copy is ordered after it.  Reading MAPPING directly
+              // would race the application's next Lock after this Draw returns.
+              if (posCommon->NeedsUpload() &&
+                  FAILED(FlushBuffer(posCommon))) {
+                War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+                m_war3Scene.shadowStats.drawTimeVBCacheRejectNoSlice++;
+                break;
+              }
+              posSlice = posCommon
+                  ->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
+                      bindingOffset);
               posStride = m_state.vertexBuffers[posStream].stride;
+              if (!posCommon->NeedsReadback() &&
+                  bindingOffset <= posCommon->Desc()->Size) {
+                posMappedAllocation = posCommon->GetMappedSlice();
+                if (posMappedAllocation != nullptr) {
+                  const auto* mappedBase =
+                      reinterpret_cast<const uint8_t*>(
+                          posMappedAllocation->mapPtr());
+                  if (mappedBase != nullptr) {
+                    posCanonicalBytes = mappedBase + bindingOffset;
+                    posCanonicalLength =
+                        VkDeviceSize(posCommon->Desc()->Size) - bindingOffset;
+                  }
+                }
+              }
             }
           }
         }
-        if (posStride < sizeof(float) * 3u) {
+        const bool nativePositionLayoutInvalid =
+            !gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
+            (!nativePositionFormatSupported ||
+             nativePositionElementSize == 0u ||
+             declInfo.posOffset >= posStride ||
+             nativePositionElementSize > posStride - declInfo.posOffset);
+        if (posStride < sizeof(float) * 3u ||
+            nativePositionLayoutInvalid) {
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
           m_war3Scene.shadowStats.drawTimeVBCacheRejectInvalidStride++;
           break;
         }
         if (posSlice.buffer() == nullptr) {
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoSlice++;
           break;
         }
+        // Resolve the exact IB before choosing a vertex copy range.  Warcraft
+        // III does not consistently keep MinVertexIndex/NumVertices in sync
+        // with the indices emitted by animated model geosets, so those D3D9
+        // parameters are hints only and can never define the capture domain.
+        DxvkBufferSlice drawTimeIndexSlice;
+        VkIndexType drawTimeIndexType = VK_INDEX_TYPE_UINT16;
+        D3D9CommonBuffer* drawTimeIndexCommon = nullptr;
+        VkDeviceSize drawTimeIndexStride = 0u;
+        VkDeviceSize drawTimeIndexRangeOffset = 0u;
+        VkDeviceSize drawTimeIndexRangeBytes = 0u;
+        Rc<DxvkResourceAllocation> drawTimeIndexMappedAllocation = nullptr;
+        const uint8_t* drawTimeIndexBytes = nullptr;
+        uint64_t actualIndexContentHash = 0u;
+        uint32_t actualIndexMin = 0u;
+        uint32_t actualIndexMax = 0u;
+        bool actualIndexDomainKnown = false;
+        bool fullVertexDomainFallback = false;
+        bool indexHintMismatch = false;
+        if (indexed) {
+          auto* ib = m_state.indices.ptr();
+          if (DynamicSysmemIBO) {
+            // UploadPerDrawData may leave the main draw with an empty index
+            // binding when the requested range is invalid.  In that case an
+            // exact shadow draw must not silently fall back to the original
+            // D3D9 IB, because it would no longer match the main draw.
+            if (!m_war3PerDrawUpload.ibValid ||
+                m_war3PerDrawUpload.ibSlice.buffer() == nullptr ||
+                m_war3PerDrawUpload.ibStorage == nullptr ||
+                m_war3PerDrawUpload.ibUploadBytes == nullptr) {
+              War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+              m_war3Scene.shadowStats.drawTimeVBCacheRejectIncompleteIndex++;
+              break;
+            }
+            drawTimeIndexSlice = m_war3PerDrawUpload.ibSlice;
+            drawTimeIndexType = m_war3PerDrawUpload.ibType;
+          } else if (ib != nullptr) {
+            drawTimeIndexCommon = ib->GetCommonBuffer();
+            if (drawTimeIndexCommon != nullptr) {
+              drawTimeIndexSlice =
+                  drawTimeIndexCommon->GetBufferSlice<
+                      D3D9_COMMON_BUFFER_TYPE_REAL>();
+              D3DINDEXBUFFER_DESC ibDesc = {};
+              ib->GetDesc(&ibDesc);
+              drawTimeIndexType = ibDesc.Format == D3DFMT_INDEX32
+                  ? VK_INDEX_TYPE_UINT32
+                  : VK_INDEX_TYPE_UINT16;
+            }
+          }
+          drawTimeIndexStride =
+              drawTimeIndexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
+          const uint64_t rangeOffset64 =
+              uint64_t(StartVal) * uint64_t(drawTimeIndexStride);
+          const uint64_t rangeBytes64 =
+              uint64_t(CountVal) * uint64_t(drawTimeIndexStride);
+          if (drawTimeIndexSlice.buffer() == nullptr || CountVal == 0u ||
+              rangeOffset64 >
+                  uint64_t(std::numeric_limits<VkDeviceSize>::max()) ||
+              rangeBytes64 == 0u ||
+              rangeBytes64 >
+                  uint64_t(std::numeric_limits<VkDeviceSize>::max())) {
+            War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectIncompleteIndex++;
+            break;
+          }
+          drawTimeIndexRangeOffset = VkDeviceSize(rangeOffset64);
+          drawTimeIndexRangeBytes = VkDeviceSize(rangeBytes64);
+          if (drawTimeIndexRangeOffset > drawTimeIndexSlice.length() ||
+              drawTimeIndexRangeBytes >
+                  drawTimeIndexSlice.length() - drawTimeIndexRangeOffset) {
+            War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectIncompleteIndex++;
+            break;
+          }
+
+          // Resolve a CPU view only when the exact logical allocation is
+          // genuinely HOST_CACHED.  Warcraft commonly places WRITEONLY direct
+          // IBs and the UP ring in write-combined HOST_VISIBLE memory; copying
+          // those bytes into another HOST_VISIBLE chunk and then walking every
+          // index costs tens of milliseconds in dense scenes.  An uncached IB
+          // therefore remains CPU-opaque and takes the conservative complete
+          // vertex-domain path below.  Its exact indices are still frozen by
+          // the ordered GPU copy in IndexBacking, so no D3D Min/Num hint is
+          // trusted and no source generation is lost.
+          const uint8_t* currentIndexBytes = nullptr;
+          bool currentIndexBytesHostCached = false;
+          if (DynamicSysmemIBO) {
+            if (StartVal != 0u ||
+                drawTimeIndexRangeBytes >
+                    VkDeviceSize(m_war3PerDrawUpload.ibUploadLength)) {
+              War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+              m_war3Scene.shadowStats.drawTimeVBCacheRejectIncompleteIndex++;
+              break;
+            }
+            const auto memoryProperties =
+                m_war3PerDrawUpload.ibStorage->getMemoryProperties();
+            if ((memoryProperties & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u) {
+              currentIndexBytes = reinterpret_cast<const uint8_t*>(
+                  m_war3PerDrawUpload.ibUploadBytes);
+              currentIndexBytesHostCached = currentIndexBytes != nullptr;
+            }
+          } else if (drawTimeIndexCommon != nullptr) {
+            // BUFFER/MANAGED mappings are authored in MAPPING storage.  Queue
+            // their normal staging upload before both the main draw and our
+            // REAL->exact copy, otherwise a cached CPU scan would describe the
+            // new MAPPING generation while replay froze the previous REAL one.
+            // PrepareDraw would perform the same flush later; moving it here
+            // preserves work rather than duplicating it.
+            if (drawTimeIndexCommon->NeedsUpload() &&
+                FAILED(FlushBuffer(drawTimeIndexCommon))) {
+              War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+              m_war3Scene.shadowStats.drawTimeVBCacheRejectIncompleteIndex++;
+              break;
+            }
+            if (drawTimeIndexCommon->NeedsReadback()) {
+              // GPU-authored REAL is current for the main draw, but has no
+              // authoritative CPU domain.  Preserve it through the ordered
+              // GPU copy and use the conservative complete VB domain.
+              currentIndexBytes = nullptr;
+            } else {
+              drawTimeIndexMappedAllocation =
+                  drawTimeIndexCommon->GetMappedSlice();
+              const bool mappedHostCached =
+                  drawTimeIndexMappedAllocation != nullptr &&
+                  (drawTimeIndexMappedAllocation->getMemoryProperties() &
+                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
+              const auto* mappedBase = mappedHostCached
+                  ? reinterpret_cast<const uint8_t*>(
+                        drawTimeIndexMappedAllocation->mapPtr())
+                  : nullptr;
+              const uint64_t mappedSize =
+                  drawTimeIndexCommon->Desc() != nullptr
+                      ? uint64_t(drawTimeIndexCommon->Desc()->Size)
+                      : 0u;
+              if (mappedBase != nullptr && rangeOffset64 <= mappedSize &&
+                  rangeBytes64 <= mappedSize - rangeOffset64) {
+                currentIndexBytes = mappedBase + size_t(rangeOffset64);
+                currentIndexBytesHostCached = true;
+              }
+            }
+          }
+
+          // Cached bytes can be scanned in place.  Replay never aliases this
+          // CPU view: IndexBacking emits a same-command-stream GPU copy from
+          // the exact virtual source after its upload/invalidate and before
+          // the main draw.  Later invalidations are ordered after that copy.
+          if (currentIndexBytesHostCached)
+            drawTimeIndexBytes = currentIndexBytes;
+
+          if (drawTimeIndexBytes != nullptr) {
+            actualIndexMin = std::numeric_limits<uint32_t>::max();
+            actualIndexMax = 0u;
+            actualIndexContentHash = 0xcbf29ce484222325ull;
+            for (uint32_t indexOrdinal = 0u;
+                 indexOrdinal < CountVal; ++indexOrdinal) {
+              uint32_t indexValue = 0u;
+              if (drawTimeIndexType == VK_INDEX_TYPE_UINT32) {
+                std::memcpy(&indexValue,
+                            drawTimeIndexBytes + size_t(indexOrdinal) * 4u,
+                            sizeof(indexValue));
+              } else {
+                uint16_t indexValue16 = 0u;
+                std::memcpy(&indexValue16,
+                            drawTimeIndexBytes + size_t(indexOrdinal) * 2u,
+                            sizeof(indexValue16));
+                indexValue = uint32_t(indexValue16);
+              }
+              actualIndexMin = std::min(actualIndexMin, indexValue);
+              actualIndexMax = std::max(actualIndexMax, indexValue);
+              actualIndexContentHash ^= uint64_t(indexValue);
+              actualIndexContentHash *= 0x100000001b3ull;
+            }
+            actualIndexDomainKnown = actualIndexMin <= actualIndexMax;
+            if (actualIndexDomainKnown && NumVertices != 0u) {
+              const uint64_t hintedEnd =
+                  uint64_t(MinVertexIndex) + uint64_t(NumVertices);
+              indexHintMismatch = actualIndexMin < MinVertexIndex ||
+                  uint64_t(actualIndexMax) >= hintedEnd;
+            }
+          }
+        }
         // 计算这个 draw 实际使用的 vertex range
         // K = vRangeStart：我们从原 VB 索引 K 起拷 vRangeCount 个 vertex。
-        // consume 端用 vertexOffset = BaseVertexIndex - K：
-        //   - wrap path（K=0）：vertexOffset = BaseVertexIndex
-        //   - standard path（K=BaseVI+MinVI）：vertexOffset = -MinVertexIndex
+        // consume 端用原始 index 值访问已裁剪的 VB：
+        //   - 已知实际索引域：vertexOffset = -actualIndexMin
+        //   - 完整 VB fallback：vertexOffset = BaseVertexIndex
         int32_t vRangeStart = 0;
         uint32_t vRangeCount = 0;
         int32_t consumeVertexOffset = 0;
@@ -39041,26 +39562,48 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               ? gpuSkinSemanticInput.desc.vertexCount
               : gpuSkinResolved->lease.desc.vertexCount;
           consumeVertexOffset = 0;
+          if (actualIndexDomainKnown && actualIndexMax >= vRangeCount) {
+            War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectInvalidRange++;
+            break;
+          }
         } else if (indexed) {
-          if (NumVertices > 0u) {
-            vRangeStart = BaseVertexIndex + int32_t(MinVertexIndex);
-            vRangeCount = NumVertices;
-            consumeVertexOffset = -int32_t(MinVertexIndex);
+          const uint64_t totalVerts =
+              posStride > 0u ? posSlice.length() / posStride : 0u;
+          if (actualIndexDomainKnown) {
+            const int64_t actualVertexStart =
+                int64_t(BaseVertexIndex) + int64_t(actualIndexMin);
+            const int64_t actualVertexEnd =
+                int64_t(BaseVertexIndex) + int64_t(actualIndexMax);
+            const uint64_t actualVertexCount =
+                uint64_t(actualIndexMax) - uint64_t(actualIndexMin) + 1u;
+            if (actualIndexMax > uint32_t(INT32_MAX) ||
+                actualVertexStart < 0 || actualVertexEnd < actualVertexStart ||
+                uint64_t(actualVertexEnd) >= totalVerts ||
+                actualVertexStart > INT32_MAX ||
+                actualVertexCount == 0u || actualVertexCount > 65536u) {
+              War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+              m_war3Scene.shadowStats.drawTimeVBCacheRejectInvalidRange++;
+              break;
+            }
+            vRangeStart = int32_t(actualVertexStart);
+            vRangeCount = uint32_t(actualVertexCount);
+            consumeVertexOffset = -int32_t(actualIndexMin);
           } else {
-            // DXVK 内部 wrap 调用没传 MinVertexIndex/NumVertices。
-            // 从原 VB 索引 0 起拷 totalVerts 个；vertexOffset = BaseVertexIndex。
-            // 若 totalVerts 超过 65536，放弃 capture（很罕见，War3 模型一般 <几千）。
+            // Device-local IB bytes cannot be scanned on the CPU.  Preserve
+            // original D3D9 addressing by copying the complete bounded VB;
+            // never fall back to the unverified Min/Num hint.
             m_war3Scene.shadowStats
                 .drawTimeVBCacheIndexedUnknownRangeFallbackCount++;
             vRangeStart = 0;
-            const uint64_t totalVerts =
-                (posStride > 0u) ? (posSlice.length() / posStride) : 0u;
             if (totalVerts == 0u || totalVerts > 65536u) {
+              War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
               m_war3Scene.shadowStats.drawTimeVBCacheRejectInvalidRange++;
               break;
             }
             vRangeCount = uint32_t(totalVerts);
             consumeVertexOffset = BaseVertexIndex;
+            fullVertexDomainFallback = true;
           }
         } else {
           vRangeStart = int32_t(StartVal);
@@ -39068,6 +39611,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           consumeVertexOffset = 0;
         }
         if (vRangeStart < 0 || vRangeCount == 0u || vRangeCount > 65536u) {
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
           m_war3Scene.shadowStats.drawTimeVBCacheRejectInvalidRange++;
           break;
         }
@@ -39100,11 +39644,25 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               (earlyVbState != D3DVBF_DISABLE || earlyVbIndexed) &&
               !(earlyVbState == D3DVBF_0WEIGHTS && !earlyVbIndexed);
           const uint32_t markerIndexCount = indexed ? CountVal : 0u;
+          // A CPU-opaque IB may force vRangeCount to the complete backing VB,
+          // but a small index count still strictly bounds the number of unique
+          // referenced vertices. Preserve the anonymous marker fail-closed gate
+          // without consulting the untrusted D3D Min/Num hint.
+          const bool unknownDomainSmallIndexedMarker =
+              indexed && !actualIndexDomainKnown && markerIndexCount != 0u &&
+              markerIndexCount <= dxvk::war3::internal::
+                  kPathBlockerAnonymousRigidMarkerMaxIndices &&
+              markerIndexCount <= dxvk::war3::internal::
+                  kPathBlockerAnonymousRigidMarkerMaxVertices;
+          const bool anonymousMarkerGeometryFits =
+              unknownDomainSmallIndexedMarker ||
+              War3AnonymousRigidMarkerGeometryFits(vRangeCount,
+                                                   markerIndexCount);
           if (anonymousTerrainMarker && unitPollutedOrUnknown &&
               noUnitIdentity && noDynamicPose &&
               !earlyVertexBlendEnabled && !earlyVbIndexed &&
-              War3AnonymousRigidMarkerGeometryFits(vRangeCount,
-                                                   markerIndexCount)) {
+              anonymousMarkerGeometryFits) {
+            War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
             m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
             m_war3Scene.shadowStats
                 .semanticSceneRejectedPathBlockerEarlyBypassCount++;
@@ -39119,6 +39677,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         if (posSlice.length() <
             VkDeviceSize(vRangeStart + vRangeCount) *
                 VkDeviceSize(posStride)) {
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
           m_war3Scene.shadowStats.drawTimeVBCacheRejectInsufficientLength++;
           break;
         }
@@ -39173,8 +39732,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           if (War3LegacyDrawIsPathBlockerGeometryMarkerCandidate(markerProbe,
                                                                  semantic)) {
             bool boundsReadable = false;
-            if (War3ComputeMappedLocalBoundsFromSlice(
-                    posSlice, posStride, capturePositionOffset,
+            if (War3ComputeMappedLocalBoundsFromBytes(
+                    posCanonicalBytes, posCanonicalLength, posStride,
+                    capturePositionOffset,
                     capturePositionFormat, uint32_t(vRangeStart), vRangeCount,
                     drawTimeMarkerBounds)) {
               boundsReadable = true;
@@ -39197,6 +39757,40 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
         if (gpuSkinBackingEligible && !gpuSkinSemanticBacking)
           noteGpuSkinBackingReject();
+
+        // Anonymous marker exemptions require two independently resolved
+        // identities to agree.  Stage/TLS-derived Unit classification alone
+        // is not proof: static LT/YT and blocker draws have historically
+        // inherited that stale classification.  The current render-object
+        // registry must name a real Unit and the exact geometry ledger must
+        // point at the very same CUnit.
+        const auto* exactUnitObject = semantic.object;
+        const bool exactUnitIdentityProven =
+            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+            exactUnitObject != nullptr &&
+            exactUnitObject->kind ==
+                dxvk::war3::render::ObjectKind::Unit &&
+            exactUnitObject->unitPtr != nullptr &&
+            vbCacheContract.objectKind ==
+                dxvk::war3::render::ObjectKind::Unit &&
+            vbCacheContract.unitPtr == exactUnitObject->unitPtr &&
+            // The contract scene node is the native CurrentDraw argument,
+            // whereas Unit/objectKind/unitPtr can all originate from the same
+            // TLS seed.  Require the live dispatch, native contract, semantic
+            // context and registry object to agree on one non-null scene.
+            drawDispatchContext.valid &&
+            drawDispatchContext.renderablePart == vbCachePart &&
+            drawDispatchContext.sceneNode != nullptr &&
+            vbCacheContract.sceneNode == drawDispatchContext.sceneNode &&
+            semantic.sceneNode == drawDispatchContext.sceneNode &&
+            exactUnitObject->sceneNode == drawDispatchContext.sceneNode &&
+            (vbCacheContract.worldObjectEntry == nullptr ||
+             exactUnitObject->worldObjectEntry == nullptr ||
+             vbCacheContract.worldObjectEntry ==
+                 exactUnitObject->worldObjectEntry) &&
+            !vbCacheContract.pathBlocker && !semantic.pathBlocker &&
+            !drawTimePathBlockerGeometryMarker &&
+            !IsLosBlockerFourCc(pathBlockerRawcode);
 
         drawTimeCaptureTiming.enter(
             War3ShadowDrawTimeCapturePhase::FingerprintAndDedup);
@@ -39230,6 +39824,23 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             indexed ? (uint64_t(StartVal) | (uint64_t(CountVal) << 32))
                     : (uint64_t(StartVal) | (uint64_t(CountVal) << 32)
                        | (1ull << 63)));
+        if (indexed) {
+          captureFingerprint = fold(
+              captureFingerprint,
+              reinterpret_cast<uintptr_t>(drawTimeIndexSlice.buffer().ptr()));
+          captureFingerprint = fold(
+              captureFingerprint, uint64_t(drawTimeIndexSlice.offset()) ^
+                  (uint64_t(drawTimeIndexRangeOffset) << 1u));
+          captureFingerprint = fold(
+              captureFingerprint,
+              uint64_t(actualIndexMin) | (uint64_t(actualIndexMax) << 32u));
+          captureFingerprint = fold(
+              captureFingerprint, actualIndexContentHash);
+          captureFingerprint = fold(
+              captureFingerprint,
+              uint64_t(actualIndexDomainKnown ? 1u : 0u) |
+                  (uint64_t(fullVertexDomainFallback ? 1u : 0u) << 1u));
+        }
         // Phase 7.70：fast path — 同帧、同源数据指纹命中时只刷新易变状态。
         //
         // 易变状态指 capture 时 D3D state 中可能在同一 renderablePart 不同
@@ -39316,6 +39927,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   semantic.pathBlocker ||
                   cached.pathBlockerGeometryMarker ||
                   IsLosBlockerFourCc(cached.rawcode);
+              cached.unitIdentityProven =
+                  exactUnitIdentityProven && !cached.pathBlocker;
+              cached.actualIndexMin = actualIndexMin;
+              cached.actualIndexMax = actualIndexMax;
+              cached.actualIndexDomainKnown = actualIndexDomainKnown;
+              cached.fullVertexDomainFallback = fullVertexDomainFallback;
+              cached.indexHintMismatch = indexHintMismatch;
               // 跨帧复用时必须把 frameSerial 刷到本帧，否则 consume/producer
               // 会因 entryFresh 失败而漏提交。
               cached.frameSerial = m_war3ShadowPersistentFrameSerial;
@@ -39394,13 +40012,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     dxvk::war3::render::ObjectKind::Unknown
                 ? vbCacheContract.objectKind
                 : semantic.objectKind;
+        entry.unitIdentityProven =
+            exactUnitIdentityProven && !entry.pathBlocker;
         entry.vertexCount = vRangeCount;
         entry.frameSerial = m_war3ShadowPersistentFrameSerial;
         entry.positionStride = posStride;
-        entry.positionOffset = uint32_t(declInfo.posOffset);
-        entry.positionFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        entry.positionOffset = capturePositionOffset;
+        entry.positionFormat = capturePositionFormat;
         entry.topology = captureTopology;
         entry.consumeVertexOffset = consumeVertexOffset;
+        entry.actualIndexMin = actualIndexMin;
+        entry.actualIndexMax = actualIndexMax;
+        entry.actualIndexDomainKnown = actualIndexDomainKnown;
+        entry.fullVertexDomainFallback = fullVertexDomainFallback;
+        entry.indexHintMismatch = indexHintMismatch;
         // This record is being replaced in-place. Publish it only after every
         // mandatory backing resource for this exact draw has been captured.
         // Keep allocated storage/capacity for retry, but invalidate the
@@ -39515,6 +40140,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             // its descriptor so this frame cannot publish stale/out-of-range
             // backing while allocation is deferred.
             entry.positionInfo = {};
+            War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
             break;
           }
         }
@@ -39543,6 +40169,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             (entry.positionBuffer == nullptr ||
              entry.positionCapacity < posBytes)) {
           entry.positionInfo = {};
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoBuffer++;
           break;
         }
@@ -39613,11 +40240,15 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
           if (uvElem != nullptr && uvElem->Stream < caps::MaxStreams) {
             const VkFormat uvFmt = DecodeDecltype(D3DDECLTYPE(uvElem->Type));
-            if (uvFmt != VK_FORMAT_UNDEFINED) {
+            const uint32_t uvElementSize =
+                GetDecltypeSize(D3DDECLTYPE(uvElem->Type));
+            if (uvFmt != VK_FORMAT_UNDEFINED && uvElementSize != 0u) {
               const uint32_t uvStream = uvElem->Stream;
               // CPU position backing 可以共享已复制 stream；GPU format 0
               // 必须进入后续分支，复制原始 UV source。
-              if (uvStream == posStream && !gpuSkinSemanticBacking) {
+              if (uvStream == posStream && !gpuSkinSemanticBacking &&
+                  uvElem->Offset < posStride &&
+                  uvElementSize <= posStride - uvElem->Offset) {
                 entry.uvSharesPositionBuffer = true;
                 entry.uvStride = posStride;
                 entry.uvOffset = uvElem->Offset;
@@ -39630,8 +40261,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 // UV 位于另一条 stream，或 format 0 与原生 stream 0 共用。
                 DxvkBufferSlice uvSrcSlice;
                 uint32_t uvStride = 0u;
-                if (DynamicSysmemVBOs &&
-                    m_war3PerDrawUpload.vbValid[uvStream]) {
+                if (DynamicSysmemVBOs) {
+                  // As with position, the main draw consumes the per-draw UP
+                  // generation.  Never recover a missing independent UV
+                  // stream from the original VB; that would alternate native
+                  // cutout UVs with stale/opaque geometry across frames.
+                  if (!m_war3PerDrawUpload.vbValid[uvStream] ||
+                      m_war3PerDrawUpload.vbSlices[uvStream].buffer() ==
+                          nullptr ||
+                      m_war3PerDrawUpload.storage == nullptr ||
+                      m_war3PerDrawUpload.vbUploadBytes[uvStream] == nullptr ||
+                      m_war3PerDrawUpload.vbUploadLength[uvStream] == 0u ||
+                      VkDeviceSize(
+                          m_war3PerDrawUpload.vbUploadLength[uvStream]) <
+                          m_war3PerDrawUpload.vbSlices[uvStream].length()) {
+                    War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+                    entry.captureComplete = false;
+                    break;
+                  }
                   uvSrcSlice = m_war3PerDrawUpload.vbSlices[uvStream];
                   uvStride = m_war3PerDrawUpload.vbStrides[uvStream];
                 } else {
@@ -39640,15 +40287,22 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   if (uvVb) {
                     auto* uvCommon = uvVb->GetCommonBuffer();
                     if (uvCommon) {
-                      uvSrcSlice =
-                          uvCommon
-                              ->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
-                                  m_state.vertexBuffers[uvStream].offset);
+                      if (uvCommon->NeedsUpload() &&
+                          FAILED(FlushBuffer(uvCommon))) {
+                        War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+                        entry.captureComplete = false;
+                        break;
+                      }
+                      uvSrcSlice = uvCommon
+                          ->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
+                              m_state.vertexBuffers[uvStream].offset);
                       uvStride = m_state.vertexBuffers[uvStream].stride;
                     }
                   }
                 }
-                if (uvSrcSlice.buffer() != nullptr && uvStride > 0u) {
+                if (uvSrcSlice.buffer() != nullptr && uvStride > 0u &&
+                    uvElem->Offset < uvStride &&
+                    uvElementSize <= uvStride - uvElem->Offset) {
                   const VkDeviceSize uvSrcOffset =
                       uvSrcSlice.offset() +
                       VkDeviceSize(vRangeStart) * VkDeviceSize(uvStride);
@@ -39722,51 +40376,42 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
         }
 
+        if (entry.alphaTestEnabled && !entry.HasCompleteAlphaPayload()) {
+          // Native cutout state without an exact UV/texture payload may never
+          // degrade to an opaque rectangle or escape through a generic lane.
+          entry.captureComplete = false;
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoSlice++;
+          break;
+        }
+
         drawTimeCaptureTiming.enter(
             War3ShadowDrawTimeCapturePhase::IndexBacking);
-        // 同样 GPU copy index range 到我们自有 buffer。
-        // 不 rebase——consume 端用 vertexOffset = -vRangeStart 抵消。
+        // Always freeze indices with an ordered GPU copy. Cached CPU bytes may
+        // supply an exact min/max domain, but never become replay backing; this
+        // keeps the domain scan and frozen IB on the same upload/invalidate
+        // command sequence without reading write-combined memory or pinning a
+        // frame allocator chunk. Indices are never rebased.
         bool idxOk = false;
-        if (indexed) {
-          auto* ib = m_state.indices.ptr();
-          DxvkBufferSlice ibSlice;
-          VkIndexType ibType = VK_INDEX_TYPE_UINT16;
-          if (DynamicSysmemIBO && m_war3PerDrawUpload.ibValid) {
-            ibSlice = m_war3PerDrawUpload.ibSlice;
-            ibType = m_war3PerDrawUpload.ibType;
-          } else if (ib) {
-            auto* ibCommon = ib->GetCommonBuffer();
-            if (ibCommon) {
-              ibSlice = ibCommon->GetBufferSlice<
-                  D3D9_COMMON_BUFFER_TYPE_REAL>();
-              D3DINDEXBUFFER_DESC ibDesc = {};
-              ib->GetDesc(&ibDesc);
-              ibType = (ibDesc.Format == D3DFMT_INDEX32)
-                           ? VK_INDEX_TYPE_UINT32
-                           : VK_INDEX_TYPE_UINT16;
-            }
-          }
-          if (ibSlice.buffer() != nullptr) {
-            const VkDeviceSize idxStride =
-                (ibType == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
-            const VkDeviceSize idxSrcOffset =
-                ibSlice.offset() + VkDeviceSize(StartVal) * idxStride;
-            const VkDeviceSize idxBytes =
-                VkDeviceSize(CountVal) * idxStride;
-            if (ibSlice.length() >=
-                VkDeviceSize(StartVal + CountVal) * idxStride) {
-              if (entry.indexBuffer == nullptr ||
-                  entry.indexCapacity < idxBytes) {
-                // Phase 7.123：IB alloc 也扣预算。预算耗尽时跳过 IB alloc，
-                // 整条 entry 留作"无 IB 状态"。下游消费者看到 indexBuffer ==
-                // nullptr 会跳过这次 caster 提交，第二帧补齐。
-                if (dxvk::war3::internal::
-                        kShadowDrawTimeVBCacheAllocBudgetEnabled &&
-                    m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
-                        dxvk::war3::internal::
-                            kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
-                  m_war3DrawTimeVBCacheBudgetDeferredCount++;
-                } else {
+        if (indexed && drawTimeIndexSlice.buffer() != nullptr) {
+          const VkDeviceSize idxSrcOffset =
+              drawTimeIndexSlice.offset() + drawTimeIndexRangeOffset;
+          const VkDeviceSize idxBytes = drawTimeIndexRangeBytes;
+          if (drawTimeIndexRangeOffset <= drawTimeIndexSlice.length() &&
+              idxBytes <=
+                  drawTimeIndexSlice.length() - drawTimeIndexRangeOffset) {
+            if (entry.indexBuffer == nullptr ||
+                entry.indexCapacity < idxBytes) {
+              // Phase 7.123：IB alloc 也扣预算。预算耗尽时跳过 IB alloc，
+              // 整条 entry 留作"无 IB 状态"。下游消费者看到 indexBuffer ==
+              // nullptr 会跳过这次 caster 提交，第二帧补齐。
+              if (dxvk::war3::internal::
+                      kShadowDrawTimeVBCacheAllocBudgetEnabled &&
+                  m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
+                      dxvk::war3::internal::
+                          kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
+                m_war3DrawTimeVBCacheBudgetDeferredCount++;
+              } else {
                 DxvkBufferCreateInfo idxInfoCi = {};
                 idxInfoCi.size = War3AlignPersistentBytes(idxBytes);
                 idxInfoCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -39785,31 +40430,29 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   // Phase 7.123：扣 IB alloc 预算。
                   m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
                 }
-                } // end Phase 7.123 budget else
-              }
-              if (entry.indexBuffer != nullptr &&
-                  entry.indexCapacity >= idxBytes) {
-                auto idxSrcBuf = ibSlice.buffer();
-                EmitCs([cDst = entry.indexBuffer, cSrc = idxSrcBuf,
-                        cSrcOff = idxSrcOffset,
-                        cBytes = idxBytes](DxvkContext *ctx) {
-                  ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
-                });
-                m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyCount++;
-                m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyBytes +=
-                    uint64_t(idxBytes);
-                entry.indexInfo =
-                    entry.indexBuffer->getSliceInfo(0, idxBytes);
-                entry.indexed = true;
-                entry.indexCount = CountVal;
-                entry.indexType = ibType;
-                entry.firstIndex = 0u;
-                idxOk = true;
-              } else {
-                // Keep stale storage for a later resize attempt, but never
-                // expose it or issue an out-of-bounds copy this frame.
-                entry.indexInfo = {};
-              }
+              } // end Phase 7.123 budget else
+            }
+            if (entry.indexBuffer != nullptr &&
+                entry.indexCapacity >= idxBytes) {
+              auto idxSrcBuf = drawTimeIndexSlice.buffer();
+              EmitCs([cDst = entry.indexBuffer, cSrc = idxSrcBuf,
+                      cSrcOff = idxSrcOffset,
+                      cBytes = idxBytes](DxvkContext *ctx) {
+                ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+              });
+              m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyCount++;
+              m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyBytes +=
+                  uint64_t(idxBytes);
+              entry.indexInfo = entry.indexBuffer->getSliceInfo(0, idxBytes);
+              entry.indexed = true;
+              entry.indexCount = CountVal;
+              entry.indexType = drawTimeIndexType;
+              entry.firstIndex = 0u;
+              idxOk = true;
+            } else {
+              // Keep stale storage for a later resize attempt, but never expose
+              // it or issue an out-of-bounds copy this frame.
+              entry.indexInfo = {};
             }
           }
         }
@@ -39824,6 +40467,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.indexInfo = {};
           entry.indexCount = 0u;
           entry.captureComplete = false;
+          War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
           m_war3Scene.shadowStats.drawTimeVBCacheRejectIncompleteIndex++;
           break;
         }
@@ -39951,14 +40595,19 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 ++m_war3GpuSkinP4ShadowFinalCommitRejects;
             }
             noteGpuSkinBackingReject();
-            if (gpuSkinSemanticBacking) {
-              entry.positionBuffer = nullptr;
-              entry.positionInfo = {};
-              entry.positionCapacity = 0u;
-            }
+            // Settlement failure is a terminal exact-owner decision.  In
+            // particular, direct-only mode points positionBuffer at the
+            // unskinned static input; leaving captureComplete true would let
+            // the producer publish that input as a rigid caster after the GPU
+            // skin consumer rejected it.
+            War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+            entry.captureComplete = false;
+            entry.positionBuffer = nullptr;
+            entry.positionInfo = {};
+            entry.positionCapacity = 0u;
             entry.gpuSkinLeaseBacked = false;
             entry.gpuSkinInput = {};
-            if (gpuSkinSemanticBacking && entry.uvSharesPositionBuffer) {
+            if (entry.uvSharesPositionBuffer) {
               // format 2/4 的 UV 与 position 指向同一 lease；终门失败时必须
               // 同步断开 alias，避免 cache 在 manager retirement 之后继续持有。
               entry.uvBuffer = nullptr;
@@ -39969,6 +40618,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               entry.uvSharesPositionBuffer = false;
               entry.uvCapacity = 0u;
             }
+            entry.ownedGpuBytes =
+                uint64_t(entry.indexCapacity) +
+                (entry.uvSharesPositionBuffer
+                     ? 0u
+                     : uint64_t(entry.uvCapacity));
             if (gpuSkinIrreversibleBypass) {
               failGpuSkinShadowConsumer();
             } else {

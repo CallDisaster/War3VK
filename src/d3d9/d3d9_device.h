@@ -1861,6 +1861,12 @@ private:
     std::array<DxvkBufferSlice, caps::MaxStreams> vbSlices = {};
     std::array<uint32_t, caps::MaxStreams> vbStrides = {};
     std::array<bool, caps::MaxStreams> vbValid = {};
+    // Exact CPU address of the bytes written into each per-draw UP slice.
+    // DxvkBufferSlice names the virtual buffer and only resolves its backing
+    // on the command-stream thread; these pointers are pinned by storage and
+    // therefore name the same DISCARD generation that the main draw consumes.
+    std::array<const void*, caps::MaxStreams> vbUploadBytes = {};
+    std::array<uint32_t, caps::MaxStreams> vbUploadLength = {};
     std::array<const void*, caps::MaxStreams> vbSourceBase = {};
     std::array<uint32_t, caps::MaxStreams> vbSourceOffset = {};
     std::array<uint32_t, caps::MaxStreams> vbSourceLength = {};
@@ -1876,6 +1882,14 @@ private:
     VkIndexType ibType = VK_INDEX_TYPE_UINT32;
     bool ibValid = false;
     Rc<DxvkResourceAllocation> ibStorage;
+    // Exact CPU address of the index bytes copied into the per-draw upload
+    // allocation.  DxvkBufferSlice::mapPtr() follows the virtual buffer's
+    // current storage and can therefore observe a different DISCARD
+    // generation until the queued invalidate command executes.  This pointer
+    // is pinned by ibStorage and identifies the same allocation that the main
+    // draw binds.
+    const void* ibUploadBytes = nullptr;
+    uint32_t ibUploadLength = 0u;
     uintptr_t ibSourceResource = 0u;
     uint64_t ibSourceIdentityGeneration = 0u;
     uint64_t ibSourceContentGeneration = 0u;
@@ -2362,6 +2376,16 @@ private:
     uint32_t indexCount = 0u;
     uint32_t firstIndex = 0u;
     bool indexed = false;
+    // War3's DrawIndexedPrimitive MinVertexIndex/NumVertices pair is only a
+    // hint in several model paths.  Exact Stage11 capture therefore records
+    // the domain actually referenced by the current IB whenever the bytes
+    // are CPU-readable.  When they are not, the only safe alternative is a
+    // bounded copy of the complete bound vertex domain.
+    uint32_t actualIndexMin = 0u;
+    uint32_t actualIndexMax = 0u;
+    bool actualIndexDomainKnown = false;
+    bool fullVertexDomainFallback = false;
+    bool indexHintMismatch = false;
     // True only after every mandatory backing resource for the original draw
     // has been captured. In particular, an indexed source must never be
     // reinterpreted as a non-indexed draw when its IB copy is deferred or
@@ -2450,6 +2474,9 @@ private:
     uint32_t jHandle = 0u;
     bool pathBlocker = false;
     bool pathBlockerGeometryMarker = false;
+    // ObjectKind can be inherited from stale TLS.  Only a current contract
+    // plus live unit-object evidence may set this bit.
+    bool unitIdentityProven = false;
     // GPU-skin output pages are dynamic, manager-retired storage. They are
     // valid only for this capture frame and must never enter static reuse.
     bool gpuSkinLeaseBacked = false;
@@ -2485,6 +2512,12 @@ private:
   std::unordered_map<War3DrawTimeVBCacheKey, War3DrawTimeVBEntry,
                      War3DrawTimeVBCacheKeyHash>
       m_war3DrawTimeVBCache;
+  // A positive current-frame rejection is an owner decision even when no VB
+  // entry was published.  It prevents generic reconstruction and historical
+  // packet leases from resurrecting a blocker after an early capture gate.
+  std::unordered_set<War3DrawTimeVBCacheKey, War3DrawTimeVBCacheKeyHash>
+      m_war3DrawTimeExactRejectedKeys;
+  uint64_t m_war3DrawTimeExactRejectedFrameSerial = 0u;
   uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;
   // S1 地形 legacy capture 分帧复用：period>1 时 off 帧注入上一批 stash，
   // 避免每帧数千 tile 全量 freeze（实测 ~6ms/帧）。
@@ -2645,6 +2678,10 @@ private:
       const dxvk::war3::render::CurrentDrawAuthoritativeSample*
           directCurrentDrawSample,
       bool fromStalePoseRestore);
+  void War3MarkDrawTimeExactRejectedCurrentFrame(
+      const War3DrawTimeVBCacheKey& key);
+  bool War3DrawTimeExactRejectedCurrentFrame(
+      const War3DrawTimeVBCacheKey& key) const;
   uint32_t War3TryPopulateDrawTimeSemanticProducer();
   uint32_t War3GetOrCreateSemanticShadowPalette(
       const dxvk::war3::shadow::ShadowDrawPacket& packet,

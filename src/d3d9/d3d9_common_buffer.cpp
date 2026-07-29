@@ -181,9 +181,16 @@ namespace dxvk {
       }
     }
     else if (m_desc.Type == D3DRTYPE_INDEXBUFFER) {
-      info.usage  |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-      info.stages |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
-      info.access |= VK_ACCESS_INDEX_READ_BIT;
+      // Stage11 exact shadow capture may need a same-command-stream snapshot
+      // when an index buffer has no CPU-readable current allocation.  Buffer
+      // usage is immutable, so every real IB must advertise transfer-read at
+      // creation time even though the common path only binds it for indexing.
+      info.usage  |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+                  |  VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+      info.stages |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT
+                  |  VK_PIPELINE_STAGE_TRANSFER_BIT;
+      info.access |= VK_ACCESS_INDEX_READ_BIT
+                  |  VK_ACCESS_TRANSFER_READ_BIT;
     }
 
     if (m_mapMode == D3D9_COMMON_BUFFER_MAP_MODE_DIRECT) {

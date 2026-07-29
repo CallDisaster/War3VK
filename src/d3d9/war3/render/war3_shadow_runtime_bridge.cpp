@@ -1529,6 +1529,16 @@ void WriteFinalShadowCasterRecordEvent(
      << ",\"diffuseSamplerIndex\":" << draw.diffuseSamplerIndex
      << ",\"alphaPayloadComplete\":"
      << (draw.alphaPayloadComplete ? 1 : 0)
+     << ",\"unitIdentityProven\":"
+     << (draw.shadowUnitIdentityProven ? 1 : 0)
+     << ",\"actualIndexDomainKnown\":"
+     << (draw.shadowActualIndexDomainKnown ? 1 : 0)
+     << ",\"actualIndexMin\":" << draw.shadowActualIndexMin
+     << ",\"actualIndexMax\":" << draw.shadowActualIndexMax
+     << ",\"fullVertexDomainFallback\":"
+     << (draw.shadowFullVertexDomainFallback ? 1 : 0)
+     << ",\"indexHintMismatch\":"
+     << (draw.shadowIndexHintMismatch ? 1 : 0)
      << ",\"alphaMetadataFrameSerial\":"
      << draw.alphaMetadataFrameSerial
      << ",\"metadataBlockerReason\":"
@@ -1547,6 +1557,8 @@ void WriteFinalShadowCasterRecordEvent(
   WriteHexField(os, "backingHash", backingHash);
   WriteHexField(os, "contentHash", contentHash);
   WriteHexField(os, "metadataKeyHash", draw.shadowMetadataKeyHash);
+  WriteHexField(os, "exactGeometryKeyHash",
+                draw.shadowExactGeometryKeyHash);
   WritePtrField(os, "renderablePart", draw.shadowRenderablePart);
   WriteHexField(os, "positionSampleHash", positionSampleHash);
   WriteHexField(os, "indexSampleHash", indexSampleHash);

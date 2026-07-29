@@ -1019,8 +1019,8 @@ inline bool War3ReplayDrawIsAnonymousStage11Marker(
   const bool exactCurrentDrawContractBacked =
       static_cast<war3::render::ObjectKind>(draw.objectKind) ==
           war3::render::ObjectKind::Unit &&
+      draw.shadowUnitIdentityProven &&
       draw.shadowRenderablePart != nullptr &&
-      draw.shadowMetadataKeyHash != 0u &&
       draw.shadowPartLifecycleState ==
           War3ShadowPartLifecycleState::RequiredCurrent;
   if (exactCurrentDrawContractBacked)
@@ -1052,8 +1052,8 @@ inline bool War3ReplayDrawIsAnonymousSmallMarker(
   const bool exactCurrentDrawContractBacked =
       static_cast<war3::render::ObjectKind>(draw.objectKind) ==
           war3::render::ObjectKind::Unit &&
+      draw.shadowUnitIdentityProven &&
       draw.shadowRenderablePart != nullptr &&
-      draw.shadowMetadataKeyHash != 0u &&
       draw.shadowPartLifecycleState ==
           War3ShadowPartLifecycleState::RequiredCurrent;
   if (exactCurrentDrawContractBacked)

@@ -1,5 +1,94 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-07-29（Stage12 当帧 source-generation 闭合 + 索引读回性能收口）
+
+本轮在 `1aaa594` Git 安全检查点之后继续处理用户物理屏仍可见的低频原点三角和
+路径阻断器若隐若现。没有回滚最新版功能，也没有触碰独立的 `StormBreaker` WIP；
+修复边界只收紧 Stage11 exact 当帧几何的 source generation、拒绝所有权和
+blocker/alpha metadata 消费。
+
+**新增根因与正确性修复**：
+
+- 旧 exact capture 对动态/UP VB、UV 和 IB 仍有代际洞：部分路径会读取未固定
+  allocation 的虚拟 `mapPtr`，并把 D3D9 的 `MinVertexIndex/NumVertices` 提示当成
+  实际索引域。buffer 在 draw 后换页或提示不准确时，可能组合出同身份但不同代的
+  position/index/alpha；exact 拒绝后 generic/packet lane 还可能补回另一种表示。
+- `War3PerDrawUploadInfo` 现在逐 stream 记录 exact UP 指针、长度和 allocation；
+  动态 position/UV/IB 必须证明当前 slice、storage 与 upload range 同代，否则
+  fail-closed。REAL/UP buffer 补齐 `TRANSFER_SRC` 合同；普通 BUFFER 的 pending
+  upload 先执行既有 staging→REAL flush，再在同一命令流按序 REAL→exact freeze。
+- indexed draw 不再用 D3D 提示裁剪真实顶点域。只有当前 allocation 明确带
+  `HOST_CACHED` 才扫描实际索引；常见非缓存 IB 保持 CPU opaque，由 ordered GPU
+  copy 固化 exact IB，并以完整、有界 VB domain + 原 BaseVertexIndex 渲染。
+  anonymous 小型 path/LOS marker 在不能证明实际域时继续保守拒绝，不能借完整域
+  伪装成普通 caster。
+- 新增当帧 exact-rejected ledger。exact owner 一旦因 source、alpha 或 blocker
+  合同失败，同一完整 cache key 不能再由 DirectGrouped、packet 或 lease 回填。
+  blocker bounds 和 indexed alpha metadata 只读 exact UP 或当前 pinned generation；
+  无法证明就拒绝，不再回退到陈旧映射。
+
+危险跨帧路径继续默认关闭：`DXVK_WAR3_DRAWTIME_VB_CACHE=0`、
+`DXVK_WAR3_SEMANTIC_DRAW_TIME_FAST_APPEND=0`、
+`DXVK_WAR3_SEMANTIC_DRAW_TIME_PREBUILD_BYPASS=0`、
+`DXVK_WAR3_DRAWTIME_SOURCE_FINGERPRINT_REUSE=0`。
+
+**性能回归与修复**：
+
+- 第一版正确性候选把 IB 复制到 `HOST_VISIBLE|HOST_COHERENT`、但非
+  `HOST_CACHED` 的 write-combined snapshot，随后逐个读取约 86,000 个 index/frame
+  计算真实域。高压图 `DrawTimeCapture` 从旧约 `0.204 ms/frame` 退化到
+  `22.136 ms/frame`，不是 GPU 或 caster 数增加。
+- 已删除该 host snapshot/readback。最终无完整 trace 的高压性能门 artifact
+  `AutoTest/artifacts/stage12_generation_cached_index_pressure_perf_24_20260729.json`，
+  report `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_29_17_36_31.html`：
+  `DrawTimeCapture=0.237 ms/frame`、`246.381 calls/frame`，FPS `68.389`、GPU
+  `3.458 ms`，`framesIncomplete=0 / budgetExceeded=0 / deviceLost=0`。相对错误
+  候选约快 93 倍，且工作量没有下降。
+
+**最终当帧取证门**：
+
+- 普通光影图 artifact
+  `AutoTest/artifacts/stage12_cached_index_final_normal_72_20260729.json`，trace
+  `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_07_29_17_42_26.jsonl`，
+  report `...war3_perf_report_auto_2026_07_29_17_43_17.html`。72/72 capture 映射；
+  捕获窗口 6,337 条 Stage11 record 全部 `batchTag=exact / stride=32 /
+  vertexBlend=0`，旧 `stride=12 + vertexBlend` 为 0。representation/alpha
+  transition、mixed representation、alpha payload gap、blocker leak、unexplained
+  disappearance、validation reject 均为 0；稳态最大时域暗块 244 px，目检为凤凰、
+  传送门和单位动画。完整 trace 下 FPS `54.703`，完整性/预算/device lost 全 0。
+- 高压单位图 artifact
+  `AutoTest/artifacts/stage12_cached_index_final_pressure_72_20260729.json`，trace
+  `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_07_29_17_49_19.jsonl`，
+  report `...war3_perf_report_auto_2026_07_29_17_50_10.html`。72/72 capture 映射；
+  稳态 exact claimed/submitted/lifecycle 与 Stage11 同步为 180--184，12,883 条
+  Stage11 record 全部是 exact `stride=32 / vertexBlend=0`。上述八项门、grace、
+  lease restore、core incomplete、epoch skip、missing required 全为 0；稳态最大
+  暗块 564 px，目检为密集单位、凤凰和技能动画。完整 trace 下 FPS `40.898`，
+  `framesIncomplete=0 / budgetExceeded=0 / deviceLost=0`。trace 唯一解析错误是停止后
+  frame 2259 的最后一条半写 record，远晚于最后 capture frame 735，不影响 72/72
+  join 或任何捕获帧结论。
+- 追加桥/斜坡图
+  `AutoTest/artifacts/stage12_cached_index_final_visual_72_20260729.json` 同样 72/72
+  映射且 alpha gap/blocker leak 为 0；该专图脚本主动移动相机，所以全 trace 的
+  view-dependent disappearance 不作为稳定对象门。稳态最大暗块 539 px，目检无
+  世界原点巨型三角。
+- 25 个 static 合同套件共 187 tests PASS；Win32 build 成功，
+  `ninja -C build32 -n` no-work；targeted `git diff --check` 仅既有 CRLF 警告。
+
+**最终部署与仍需物理验收**：
+
+- `build32` / `E:\Work\War3\d3d9.dll` exact：32,501,336 bytes，SHA-256
+  `7C264158C287E92C14BD555BEC83C04F94CF2FF187DF341CA1C645E3DCFE989F`。
+- 本轮开始前回退：
+  `E:\Work\War3\d3d9.dll.bak_20260729_CBEC_pre_stage12_index_blocker`；
+  性能修复前回退：
+  `E:\Work\War3\d3d9.dll.bak_20260729_5ED5_pre_cached_index_perf`。
+- 两次直接 `-loadfile` 启动正式《冰冠之陨》地图时，游戏/DLL/Vulkan 均存活但地图
+  未建立 AutoTest named-pipe control plane，90 秒和 240 秒均为 0 capture 后安全
+  终止。因此不能宣称克尔苏加德定点长门自动通过。用户仍需在当前 DLL 上对原位置
+  和路径阻断器区域连续物理观察 1--2 分钟；若仍复现，应使用本轮新增的低磁盘滚动
+  trace/触发保留能力捕获异常前后，而不是重新启用跨帧 cache 或扩大 grace。
+
 ## 🚨 2026-07-29（物理屏残留确认 + Git 安全检查点）
 
 用户在最终部署 `CBEC4C4A...` 上确认：本轮树木、蒙皮部件和建筑连续性修复使整体
