@@ -138,6 +138,39 @@ struct War3DrawTimeVBCacheKeyHash {
   }
 };
 
+// A verified anonymous LOSBlocker rejection must also outrank a short-lived
+// CurrentDraw/packet representation captured before the exact Stage11 draw.
+// That older representation can carry a different instance or payload
+// generation, but it still names the same native model part, mesh payload,
+// and layer. Keep this deliberately weaker key isolated to the narrow marker
+// rejection path; it must never authorize geometry reuse.
+struct War3DrawTimeAnonymousMarkerSliceKey {
+  void* renderablePart = nullptr;
+  void* meshPayloadPtr = nullptr;
+  uint32_t layerIndex = 0u;
+
+  bool operator==(
+      const War3DrawTimeAnonymousMarkerSliceKey& other) const noexcept {
+    return renderablePart == other.renderablePart &&
+           meshPayloadPtr == other.meshPayloadPtr &&
+           layerIndex == other.layerIndex;
+  }
+};
+
+struct War3DrawTimeAnonymousMarkerSliceKeyHash {
+  size_t operator()(
+      const War3DrawTimeAnonymousMarkerSliceKey& key) const noexcept {
+    size_t hash = std::hash<uintptr_t>{}(
+        reinterpret_cast<uintptr_t>(key.renderablePart));
+    hash ^= std::hash<uintptr_t>{}(
+                reinterpret_cast<uintptr_t>(key.meshPayloadPtr)) +
+            size_t(0x9e3779b9u) + (hash << 6u) + (hash >> 2u);
+    hash ^= std::hash<uint32_t>{}(key.layerIndex) +
+            size_t(0x9e3779b9u) + (hash << 6u) + (hash >> 2u);
+    return hash;
+  }
+};
+
 class D3D9InterfaceEx;
 class D3D9SwapChainEx;
 class D3D9CommonTexture;
@@ -2518,6 +2551,13 @@ private:
   std::unordered_set<War3DrawTimeVBCacheKey, War3DrawTimeVBCacheKeyHash>
       m_war3DrawTimeExactRejectedKeys;
   uint64_t m_war3DrawTimeExactRejectedFrameSerial = 0u;
+  // Short-lived terminal witnesses for the verified anonymous 4v/6i marker
+  // only. The value is the last exact-proof frame. This weaker slice identity
+  // exists solely to stop a prior CurrentDraw/Grace representation from
+  // resurrecting the rejected part; it never authorizes geometry reuse.
+  std::unordered_map<War3DrawTimeAnonymousMarkerSliceKey, uint64_t,
+                     War3DrawTimeAnonymousMarkerSliceKeyHash>
+      m_war3DrawTimeAnonymousMarkerRejectedSlices;
   uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;
   // S1 地形 legacy capture 分帧复用：period>1 时 off 帧注入上一批 stash，
   // 避免每帧数千 tile 全量 freeze（实测 ~6ms/帧）。
@@ -2682,6 +2722,11 @@ private:
       const War3DrawTimeVBCacheKey& key);
   bool War3DrawTimeExactRejectedCurrentFrame(
       const War3DrawTimeVBCacheKey& key) const;
+  void War3RememberDrawTimeAnonymousMarkerRejection(
+      const War3DrawTimeVBCacheKey& key);
+  bool War3DrawTimeAnonymousMarkerRejectionActive(
+      void* renderablePart, void* meshPayloadPtr,
+      uint32_t layerIndex) const;
   uint32_t War3TryPopulateDrawTimeSemanticProducer();
   uint32_t War3GetOrCreateSemanticShadowPalette(
       const dxvk::war3::shadow::ShadowDrawPacket& packet,

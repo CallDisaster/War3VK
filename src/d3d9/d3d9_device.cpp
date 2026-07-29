@@ -164,6 +164,12 @@ struct D3D9DeviceEx::War3SemanticDirectPartPacketLeaseState {
 
 namespace {
 
+// Old final-caster traces contain 11,550 post-proof anonymous-marker Grace
+// records, and every one falls within eight frames of the preceding exact
+// rejection; none survives at age nine or later. Retain only this negative
+// evidence window. This is not caster grace and never republishes geometry.
+constexpr uint64_t kWar3AnonymousMarkerRejectionHoldFrames = 8u;
+
 void* War3CurrentDrawInstanceIdentity(
     const war3::render::CurrentDrawContractRecord& contract) {
   if (contract.sceneNode != nullptr)
@@ -5326,7 +5332,7 @@ inline bool War3CasterIsAnonymousSmallPathBlockerMarker(
     return false;
 
   const uint32_t vertexCount =
-      draw.numVertices != 0u ? draw.numVertices : draw.vertexCount;
+      War3ShadowReferencedVertexUpperBound(draw);
   const uint32_t indexCount = draw.indexCount;
   if (vertexCount < 3u ||
       vertexCount >
@@ -19935,28 +19941,33 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   // caller must not append a generic representation for the same logical
   // slice after the current-frame producer has claimed it.
   if (War3DrawTimeCurrentFrameGeometryRuntime() &&
-      directCurrentDrawSample != nullptr &&
-      directCurrentDrawSample->contract.known) {
+      directCurrentDrawSample != nullptr) {
     const auto& contract = directCurrentDrawSample->contract;
     const int16_t effectiveProducerStage =
         contract.producerStage >= 0 ? contract.producerStage : contract.stage;
     if (effectiveProducerStage == 11 &&
-        packet.renderable.renderablePart != nullptr &&
-        War3CurrentDrawContractNamesExactSlice(
-            packet.renderable.renderablePart,
-            packet.renderable.layerIndex, contract)) {
+        packet.renderable.renderablePart != nullptr) {
+      if (War3DrawTimeAnonymousMarkerRejectionActive(
+              packet.renderable.renderablePart, contract.meshPayloadPtr,
+              packet.renderable.layerIndex)) {
+        return false;
+      }
       const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
           packet.renderable.renderablePart,
           packet.renderable.layerIndex, &contract);
-      if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
-        return false;
-      const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
-      if (vbIt != m_war3DrawTimeVBCache.end() &&
-          vbIt->second.MatchesKey(cacheKey) &&
-          vbIt->second.frameSerial == m_war3ShadowPersistentFrameSerial &&
-          vbIt->second.exactOwnerFrameSerial ==
-              m_war3ShadowPersistentFrameSerial) {
-        return false;
+      if (War3CurrentDrawContractNamesExactSlice(
+              packet.renderable.renderablePart,
+              packet.renderable.layerIndex, contract)) {
+        if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
+          return false;
+        const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
+        if (vbIt != m_war3DrawTimeVBCache.end() &&
+            vbIt->second.MatchesKey(cacheKey) &&
+            vbIt->second.frameSerial == m_war3ShadowPersistentFrameSerial &&
+            vbIt->second.exactOwnerFrameSerial ==
+                m_war3ShadowPersistentFrameSerial) {
+          return false;
+        }
       }
     }
   }
@@ -22621,6 +22632,30 @@ bool D3D9DeviceEx::War3DrawTimeExactRejectedCurrentFrame(
              m_war3DrawTimeExactRejectedKeys.end();
 }
 
+void D3D9DeviceEx::War3RememberDrawTimeAnonymousMarkerRejection(
+    const War3DrawTimeVBCacheKey& key) {
+  if (key.renderablePart == nullptr || key.meshPayloadPtr == nullptr)
+    return;
+  m_war3DrawTimeAnonymousMarkerRejectedSlices[
+      {key.renderablePart, key.meshPayloadPtr, key.layerIndex}] =
+      m_war3ShadowPersistentFrameSerial;
+}
+
+bool D3D9DeviceEx::War3DrawTimeAnonymousMarkerRejectionActive(
+    void* renderablePart, void* meshPayloadPtr,
+    uint32_t layerIndex) const {
+  if (renderablePart == nullptr || meshPayloadPtr == nullptr)
+    return false;
+  const auto it = m_war3DrawTimeAnonymousMarkerRejectedSlices.find(
+      {renderablePart, meshPayloadPtr, layerIndex});
+  if (it == m_war3DrawTimeAnonymousMarkerRejectedSlices.end() ||
+      it->second > m_war3ShadowPersistentFrameSerial) {
+    return false;
+  }
+  return m_war3ShadowPersistentFrameSerial - it->second <=
+      kWar3AnonymousMarkerRejectionHoldFrames;
+}
+
 uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
   auto& visibleRegistry =
       dxvk::war3::render::VisibleRenderableRegistry::instance();
@@ -23025,6 +23060,7 @@ bool D3D9DeviceEx::War3DrainShadowCasterTombstones() {
     m_war3DrawTimeExactRejectedKeys.clear();
     m_war3DrawTimeExactRejectedFrameSerial =
         m_war3ShadowPersistentFrameSerial;
+    m_war3DrawTimeAnonymousMarkerRejectedSlices.clear();
     m_war3Stage13RetainedCasters.clear();
     m_war3S1TerrainCasterStash.clear();
     dxvk::war3::shadow::War3ShadowDrawMetadataStore().clear();
@@ -23127,6 +23163,25 @@ bool D3D9DeviceEx::War3DrainShadowCasterTombstones() {
         retiredAnything = true;
       } else {
         ++it;
+      }
+    }
+    if (tombstone.reason ==
+            ShadowCasterTombstoneReason::StageDisabled &&
+        tombstone.identity.producerStage == 11) {
+      if (!m_war3DrawTimeAnonymousMarkerRejectedSlices.empty()) {
+        m_war3DrawTimeAnonymousMarkerRejectedSlices.clear();
+        retiredAnything = true;
+      }
+    } else if (tombstone.identity.renderablePart != nullptr) {
+      for (auto it = m_war3DrawTimeAnonymousMarkerRejectedSlices.begin();
+           it != m_war3DrawTimeAnonymousMarkerRejectedSlices.end();) {
+        if (it->first.renderablePart ==
+            tombstone.identity.renderablePart) {
+          it = m_war3DrawTimeAnonymousMarkerRejectedSlices.erase(it);
+          retiredAnything = true;
+        } else {
+          ++it;
+        }
       }
     }
     if (dxvk_war3_alpha_test_internal::RetirePayloadsForTombstone(
@@ -23505,14 +23560,20 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
             record.producerStage >= 0 ? record.producerStage : record.stage;
         if (War3DrawTimeCurrentFrameGeometryRuntime() &&
             effectiveProducerStage == 11 &&
-            record.renderablePart != nullptr &&
-            War3CurrentDrawContractNamesExactSlice(
-                record.renderablePart, record.layerIndex, record)) {
+            record.renderablePart != nullptr) {
           const War3DrawTimeVBCacheKey cacheKey =
               War3MakeDrawTimeVBCacheKey(
                   record.renderablePart, record.layerIndex, &record);
-          if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
+          if (War3DrawTimeAnonymousMarkerRejectionActive(
+                  record.renderablePart, record.meshPayloadPtr,
+                  record.layerIndex)) {
             return true;
+          }
+          if (War3CurrentDrawContractNamesExactSlice(
+                  record.renderablePart, record.layerIndex, record) &&
+              War3DrawTimeExactRejectedCurrentFrame(cacheKey)) {
+            return true;
+          }
         }
         return currentFrameDrawTimeProducerEntry(record) != nullptr;
       };
@@ -24831,29 +24892,37 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               leasedPart, leasedRenderable.sceneNode,
               leasedRenderable.worldObjectEntry, leasedRenderable.unitPtr,
               leasedRenderable.jHandle, leaseCurrentRenderFrameIndex,
-              currentContract) &&
-          War3CurrentDrawContractNamesExactSlice(
-              leasedPart, leasedLayer, currentContract)) {
+              currentContract)) {
         const War3DrawTimeVBCacheKey currentKey =
             War3MakeDrawTimeVBCacheKey(
                 leasedPart, leasedLayer, &currentContract);
-        if (War3DrawTimeExactRejectedCurrentFrame(currentKey)) {
+        if (War3DrawTimeAnonymousMarkerRejectionActive(
+                leasedPart, currentContract.meshPayloadPtr, leasedLayer)) {
           currentPartKeys.insert(key);
           m_war3Scene.shadowStats
               .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
           continue;
         }
-        const auto currentVbIt = m_war3DrawTimeVBCache.find(currentKey);
-        if (currentVbIt != m_war3DrawTimeVBCache.end() &&
-            currentVbIt->second.MatchesKey(currentKey) &&
-            currentVbIt->second.frameSerial ==
-                m_war3ShadowPersistentFrameSerial &&
-            currentVbIt->second.exactOwnerFrameSerial ==
-                m_war3ShadowPersistentFrameSerial) {
-          currentPartKeys.insert(key);
-          m_war3Scene.shadowStats
-              .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
-          continue;
+        if (War3CurrentDrawContractNamesExactSlice(
+                leasedPart, leasedLayer, currentContract)) {
+          if (War3DrawTimeExactRejectedCurrentFrame(currentKey)) {
+            currentPartKeys.insert(key);
+            m_war3Scene.shadowStats
+                .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
+            continue;
+          }
+          const auto currentVbIt = m_war3DrawTimeVBCache.find(currentKey);
+          if (currentVbIt != m_war3DrawTimeVBCache.end() &&
+              currentVbIt->second.MatchesKey(currentKey) &&
+              currentVbIt->second.frameSerial ==
+                  m_war3ShadowPersistentFrameSerial &&
+              currentVbIt->second.exactOwnerFrameSerial ==
+                  m_war3ShadowPersistentFrameSerial) {
+            currentPartKeys.insert(key);
+            m_war3Scene.shadowStats
+                .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
+            continue;
+          }
         }
       }
       if (directPartPacketLeaseFrame <= leaseIt->second.lastSubmittedFrame)
@@ -39791,6 +39860,73 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             !vbCacheContract.pathBlocker && !semantic.pathBlocker &&
             !drawTimePathBlockerGeometryMarker &&
             !IsLosBlockerFourCc(pathBlockerRawcode);
+
+        // Stage12 exact-index safety can require copying an entire CPU-opaque
+        // vertex page (commonly 16384 vertices).  That backing-domain size must
+        // not hide LOSBlocker.mdl's logical 4-vertex/6-index fingerprint.  For
+        // an unknown indexed domain, CountVal is still a strict upper bound on
+        // unique referenced vertices. Apply the existing narrow anonymous
+        // marker policy only when authoritative Unit identity cannot be
+        // proven. The exact decision owns this frame, while its narrow
+        // part/mesh/layer negative witness spans the measured eight-frame
+        // Grace horizon.
+        if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+            !exactUnitIdentityProven) {
+          War3ShadowCasterDraw exactMarkerProbe = {};
+          exactMarkerProbe.indexed = indexed;
+          exactMarkerProbe.topology = captureTopology;
+          exactMarkerProbe.indexCount = indexed ? CountVal : 0u;
+          exactMarkerProbe.vertexCount = indexed ? 0u : vRangeCount;
+          exactMarkerProbe.numVertices = vRangeCount;
+          exactMarkerProbe.shadowActualIndexMin = actualIndexMin;
+          exactMarkerProbe.shadowActualIndexMax = actualIndexMax;
+          exactMarkerProbe.shadowActualIndexDomainKnown =
+              actualIndexDomainKnown;
+          exactMarkerProbe.shadowFullVertexDomainFallback =
+              fullVertexDomainFallback;
+          exactMarkerProbe.vertexBlendEnabled = false;
+          exactMarkerProbe.vertexBlendIndexed = false;
+          exactMarkerProbe.alphaTestEnabled =
+              m_state.renderStates[D3DRS_ALPHATESTENABLE] != FALSE &&
+              m_state.renderStates[D3DRS_ALPHAFUNC] != D3DCMP_ALWAYS;
+          exactMarkerProbe.alphaBlendEnabled =
+              m_state.renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
+          exactMarkerProbe.category = cat;
+          exactMarkerProbe.batchTag = earlyTag;
+          exactMarkerProbe.stage = static_cast<int16_t>(stage);
+          const uint32_t exactMarkerJHandle =
+              vbCacheContract.jHandle != 0u ? vbCacheContract.jHandle
+                                            : semanticJHandle;
+          exactMarkerProbe.batchHandle = exactMarkerJHandle;
+          const auto exactMarkerObjectKind =
+              vbCacheContract.objectKind !=
+                      dxvk::war3::render::ObjectKind::Unknown
+                  ? vbCacheContract.objectKind
+                  : semantic.objectKind;
+          exactMarkerProbe.objectKind =
+              static_cast<uint8_t>(exactMarkerObjectKind);
+          exactMarkerProbe.rawcode =
+              pathBlockerRawcode != 0u
+                  ? pathBlockerRawcode
+                  : vbCacheContract.rawcode != 0u ? vbCacheContract.rawcode
+                                                  : semantic.rawcode;
+          exactMarkerProbe.jHandle = exactMarkerJHandle;
+          exactMarkerProbe.shadowRenderablePart = vbCachePart;
+          exactMarkerProbe.shadowUnitIdentityProven = false;
+          exactMarkerProbe.shadowPartLifecycleState =
+              War3ShadowPartLifecycleState::RequiredCurrent;
+          if (War3CasterIsAnonymousSmallPathBlockerMarker(exactMarkerProbe)) {
+            War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+            War3RememberDrawTimeAnonymousMarkerRejection(vbCacheKey);
+            m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
+            m_war3Scene.shadowStats
+                .semanticSceneRejectedPathBlockerEarlyBypassCount++;
+            NoteAnonymousSmallPathBlockerMarkerRejectLog(
+                exactMarkerProbe,
+                "DrawTimeExact/FullDomainAnonymousSmallMarker");
+            break;
+          }
+        }
 
         drawTimeCaptureTiming.enter(
             War3ShadowDrawTimeCapturePhase::FingerprintAndDedup);

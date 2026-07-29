@@ -371,6 +371,80 @@ def blocker_leaked_to_final_casters(record: dict[str, Any]) -> bool:
     )
 
 
+def full_domain_masked_anonymous_small_marker(record: dict[str, Any]) -> bool:
+    """Detect the exact-index representation that masked LOSBlocker.mdl.
+
+    A CPU-opaque IB can force the renderer to copy a full 16K-vertex backing
+    page even though a six-index draw references at most six unique vertices.
+    The explicit blocker flags are absent in the regression, so the old
+    blockerLeak metric was a stable false negative.
+    """
+    index_count = int(record.get("indexCount", 0))
+    world_lane = (
+        int(record.get("stage", -1)) == 11
+        or int(record.get("category", 0)) == 3
+        or int(record.get("batchTag", -1)) == 1
+    )
+    return (
+        world_lane
+        and int(record.get("rawcode", 0)) == 0
+        and int(record.get("jHandle", 0)) == 0
+        and int(record.get("batchHandle", 0)) == 0
+        and int(record.get("objectKind", 0)) in (0, 1, 3)
+        and not int(record.get("unitIdentityProven", 0))
+        and bool(int(record.get("indexed", 0)))
+        and int(record.get("topology", -1)) == 3
+        and 3 <= index_count <= 8
+        and not int(record.get("actualIndexDomainKnown", 0))
+        and bool(int(record.get("fullVertexDomainFallback", 0)))
+        and not int(record.get("vertexBlendEnabled", 0))
+        and not int(record.get("vertexBlendIndexed", 0))
+        and not int(record.get("alphaTestEnabled", 0))
+        and not int(record.get("alphaBlendEnabled", 0))
+    )
+
+
+def grace_resurrected_anonymous_small_marker(record: dict[str, Any]) -> bool:
+    """Detect the generic 4v/6i Grace form of the same LOS blocker.
+
+    The exact full-domain representation can be rejected correctly while an
+    older generic CurrentDraw record for the same part is restored during an
+    exact-producer hole.  That regression has a distinct and stable contract:
+    an anonymous Stage11 world draw, GraceOneFrame lifecycle, compact 12-byte
+    positions, and the legacy indexed vertex-blend interpretation.  Requiring
+    every field avoids confusing legitimate Stage13 4v/6i alpha geometry with
+    the blocker resurrection.
+    """
+    vertex_count = int(
+        record.get("numVertices", 0) or record.get("vertexCount", 0)
+    )
+    index_count = int(record.get("indexCount", 0))
+    world_lane = (
+        int(record.get("stage", -1)) == 11
+        or int(record.get("category", 0)) == 3
+        or int(record.get("batchTag", -1)) == 1
+    )
+    return (
+        world_lane
+        and int(record.get("rawcode", 0)) == 0
+        and int(record.get("jHandle", 0)) == 0
+        and int(record.get("batchHandle", 0)) == 0
+        and int(record.get("objectKind", 0)) in (0, 1, 3)
+        and not int(record.get("unitIdentityProven", 0))
+        and bool(int(record.get("indexed", 0)))
+        and int(record.get("topology", -1)) == 3
+        and 3 <= index_count <= 8
+        and 3 <= vertex_count <= 8
+        and int(record.get("partLifecycleState", -1)) == 2
+        and int(record.get("positionStride", 0)) == 12
+        and bool(int(record.get("vertexBlendEnabled", 0)))
+        and bool(int(record.get("vertexBlendIndexed", 0)))
+        and not int(record.get("alphaTestEnabled", 0))
+        and not int(record.get("alphaBlendEnabled", 0))
+        and not int(record.get("fullVertexDomainFallback", 0))
+    )
+
+
 def has_strong_object_identity(record: dict[str, Any]) -> bool:
     """Return whether backing continuity is meaningful for this draw.
 
@@ -466,6 +540,12 @@ def record_contract_score(record: dict[str, Any]) -> tuple[float, list[str]]:
     if blocker_leaked_to_final_casters(record):
         score += 1000.0
         reasons.append("blockerLeakedToFinalCaster")
+    if full_domain_masked_anonymous_small_marker(record):
+        score += 1000.0
+        reasons.append("fullDomainMaskedAnonymousSmallMarker")
+    if grace_resurrected_anonymous_small_marker(record):
+        score += 1000.0
+        reasons.append("graceResurrectedAnonymousSmallMarker")
     return score, reasons
 
 
@@ -620,6 +700,8 @@ def main() -> int:
         backing_generation_changes = 0
         alpha_payload_gaps = 0
         blocker_leaks = 0
+        full_domain_masked_marker_leaks = 0
+        grace_resurrected_marker_leaks = 0
         previous_by_part = {
             key: record
             for record in previous_records
@@ -673,6 +755,10 @@ def main() -> int:
                 alpha_payload_gaps += 1
             if blocker_leaked_to_final_casters(record):
                 blocker_leaks += 1
+            if full_domain_masked_anonymous_small_marker(record):
+                full_domain_masked_marker_leaks += 1
+            if grace_resurrected_anonymous_small_marker(record):
+                grace_resurrected_marker_leaks += 1
             record_rank.append((score, reasons, record))
 
         current_count = int(frame.get("finalDrawCount", len(current_records)))
@@ -697,6 +783,8 @@ def main() -> int:
         hard_score += len(mixed_alpha_keys) * 1000.0
         hard_score += alpha_payload_gaps * 750.0
         hard_score += blocker_leaks * 1000.0
+        hard_score += full_domain_masked_marker_leaks * 1000.0
+        hard_score += grace_resurrected_marker_leaks * 1000.0
         hard_score += int(frame.get("validationRejectCandidateCount", 0)) * 1000.0
 
         capture = captures.get(serial)
@@ -763,6 +851,12 @@ def main() -> int:
                 )[:128],
                 "alphaPayloadGapCount": alpha_payload_gaps,
                 "blockerLeakCount": blocker_leaks,
+                "fullDomainMaskedMarkerLeakCount": (
+                    full_domain_masked_marker_leaks
+                ),
+                "graceResurrectedMarkerLeakCount": (
+                    grace_resurrected_marker_leaks
+                ),
                 "explainedPartDisappearanceCount": 0,
                 "explainedPartDisappearanceKeys": [],
                 "explainedPartDisappearanceReasons": {},
@@ -915,6 +1009,12 @@ def main() -> int:
             int(row["alphaPayloadGapCount"]) for row in rows
         ),
         "blockerLeakCount": sum(int(row["blockerLeakCount"]) for row in rows),
+        "fullDomainMaskedMarkerLeakCount": sum(
+            int(row["fullDomainMaskedMarkerLeakCount"]) for row in rows
+        ),
+        "graceResurrectedMarkerLeakCount": sum(
+            int(row["graceResurrectedMarkerLeakCount"]) for row in rows
+        ),
         "captureJoinCount": sum(1 for serial in serials if serial in captures),
         "captureTraceMissCount": len(unmapped_captures)
         + sum(1 for serial in captures if serial not in frames),

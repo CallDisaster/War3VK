@@ -228,6 +228,20 @@ namespace dxvk {
         float boundsRadius = 0.0f; // 0 表示未提供 bounds（不做剔除）
     };
 
+    // fullVertexDomainFallback describes how much backing storage had to be
+    // copied, not how many vertices the indexed draw can reference.  When the
+    // immutable IB is CPU-opaque, indexCount is still a strict upper bound on
+    // the number of unique referenced vertices.  Keep this distinction in one
+    // shared helper so producer, final sweep, and replay cannot drift apart.
+    inline uint32_t War3ShadowReferencedVertexUpperBound(
+        const War3ShadowCasterDraw& draw) {
+      if (draw.indexed && draw.shadowFullVertexDomainFallback &&
+          !draw.shadowActualIndexDomainKnown && draw.indexCount != 0u) {
+        return draw.indexCount;
+      }
+      return draw.numVertices != 0u ? draw.numVertices : draw.vertexCount;
+    }
+
     enum class War3ShadowReplayMode : uint8_t {
         Unsupported = 0,
         FixedWorld,

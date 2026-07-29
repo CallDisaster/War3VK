@@ -100,6 +100,21 @@ class ShadowFinalCasterTraceStaticTests(unittest.TestCase):
         self.assertIn("MissingRequiredPart", self.analyzer)
         self.assertIn("RetiredAfterAuthoritativeAbsence", self.analyzer)
         self.assertIn("TombstoneRetired", self.analyzer)
+        self.assertIn(
+            "full_domain_masked_anonymous_small_marker", self.analyzer
+        )
+        self.assertIn("fullDomainMaskedMarkerLeakCount", self.analyzer)
+        self.assertIn(
+            "grace_resurrected_anonymous_small_marker", self.analyzer
+        )
+        self.assertIn("graceResurrectedMarkerLeakCount", self.analyzer)
+        for token in (
+            'int(record.get("partLifecycleState", -1)) == 2',
+            'int(record.get("positionStride", 0)) == 12',
+            'bool(int(record.get("vertexBlendEnabled", 0)))',
+            'bool(int(record.get("vertexBlendIndexed", 0)))',
+        ):
+            self.assertIn(token, self.analyzer)
 
     def test_populate_snapshot_is_traced_before_downstream_filters(self) -> None:
         snapshot = self.device.index(

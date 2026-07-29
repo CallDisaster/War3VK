@@ -780,6 +780,116 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         ):
             self.assertIn(token, marker)
 
+    def test_verified_marker_rejection_owns_prior_grace_representation(
+        self,
+    ) -> None:
+        key = source_block(
+            self.header,
+            "struct War3DrawTimeAnonymousMarkerSliceKey {",
+            "class D3D9InterfaceEx;",
+        )
+        for token in (
+            "void* renderablePart",
+            "void* meshPayloadPtr",
+            "uint32_t layerIndex",
+            "War3DrawTimeAnonymousMarkerSliceKeyHash",
+        ):
+            self.assertIn(token, key)
+        for forbidden in (
+            "instanceIdentity",
+            "jHandle",
+            "payloadWord108",
+            "payloadWord11C",
+        ):
+            self.assertNotIn(forbidden, key)
+        self.assertIn(
+            "std::unordered_map<War3DrawTimeAnonymousMarkerSliceKey, uint64_t,",
+            self.header,
+        )
+        self.assertNotIn(
+            "m_war3DrawTimeAnonymousMarkerRejectedFrameSerial",
+            self.header,
+        )
+
+        marker = source_block(
+            self.capture,
+            "// Stage12 exact-index safety can require copying an entire",
+            "War3ShadowDrawTimeCapturePhase::FingerprintAndDedup",
+        )
+        self.assertIn(
+            "War3RememberDrawTimeAnonymousMarkerRejection(vbCacheKey)",
+            marker,
+        )
+        self.assertEqual(
+            self.device.count(
+                "War3RememberDrawTimeAnonymousMarkerRejection("
+            ),
+            2,
+        )
+        for token in (
+            "constexpr uint64_t kWar3AnonymousMarkerRejectionHoldFrames = 8u",
+            "m_war3DrawTimeAnonymousMarkerRejectedSlices[",
+            "m_war3ShadowPersistentFrameSerial - it->second <=",
+            "kWar3AnonymousMarkerRejectionHoldFrames",
+        ):
+            self.assertIn(token, self.device)
+
+        owner = source_block(
+            self.grouped,
+            "const auto currentFrameDrawTimeProducerOwnsRecord =",
+            "struct DirectObjectCompletenessBucket",
+        )
+        for token in (
+            "War3DrawTimeAnonymousMarkerRejectionActive(",
+            "record.renderablePart, record.meshPayloadPtr",
+            "record.layerIndex",
+        ):
+            self.assertIn(token, owner)
+        append = source_block(
+            self.device,
+            "// Defensive final ownership gate.",
+            "War3FallbackAppendRawTiming fallbackAppendTiming;",
+        )
+        for token in (
+            "War3DrawTimeAnonymousMarkerRejectionActive(",
+            "packet.renderable.renderablePart, contract.meshPayloadPtr",
+            "packet.renderable.layerIndex",
+        ):
+            self.assertIn(token, append)
+        self.assertNotIn(
+            "directCurrentDrawSample->contract.known",
+            append,
+        )
+        lease = source_block(
+            self.grouped,
+            "// An exact current-frame Stage11 decision outranks every historical",
+            "if (directPartPacketLeaseFrame <= leaseIt->second.lastSubmittedFrame)",
+        )
+        for token in (
+            "War3DrawTimeAnonymousMarkerRejectionActive(",
+            "leasedPart, currentContract.meshPayloadPtr, leasedLayer",
+        ):
+            self.assertIn(token, lease)
+        key_factory = source_block(
+            self.device,
+            "War3DrawTimeVBCacheKey War3MakeDrawTimeVBCacheKey(",
+            "bool War3CurrentDrawContractNamesExactSlice(",
+        )
+        self.assertIn("contract != nullptr && contract->known", key_factory)
+        tombstones = source_block(
+            self.device,
+            "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()",
+            "uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(",
+        )
+        for token in (
+            "tombstone.identity.producerStage == 11",
+            "m_war3DrawTimeAnonymousMarkerRejectedSlices.clear()",
+            "it->first.renderablePart ==",
+            "tombstone.identity.renderablePart",
+            "m_war3DrawTimeAnonymousMarkerRejectedSlices.erase(it)",
+        ):
+            self.assertIn(token, tombstones)
+
     def test_invalid_observed_index_domain_fails_before_capture_complete(
         self,
     ) -> None:
@@ -1079,6 +1189,50 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
                 "if (exactCurrentDrawContractBacked)",
             )
             self.assertNotIn("draw.shadowMetadataKeyHash", exact_backed)
+
+    def test_full_domain_small_marker_uses_referenced_vertex_upper_bound(
+        self,
+    ) -> None:
+        helper = source_block(
+            self.scene,
+            "inline uint32_t War3ShadowReferencedVertexUpperBound(",
+            "enum class War3ShadowReplayMode",
+        )
+        for token in (
+            "draw.indexed",
+            "draw.shadowFullVertexDomainFallback",
+            "!draw.shadowActualIndexDomainKnown",
+            "draw.indexCount",
+        ):
+            self.assertIn(token, helper)
+
+        device_gate = source_block(
+            self.device,
+            "inline bool War3CasterIsAnonymousSmallPathBlockerMarker(",
+            "inline void NoteAnonymousSmallPathBlockerMarkerRejectLog(",
+        )
+        replay_gate = source_block(
+            self.shadow,
+            "inline bool War3ReplayDrawIsAnonymousSmallMarker(",
+            "inline void War3ReplayNoteAnonymousStage11Reject(",
+        )
+        for gate in (device_gate, replay_gate):
+            self.assertIn("War3ShadowReferencedVertexUpperBound(draw)", gate)
+
+        capture_reject = source_block(
+            self.capture,
+            "Stage12 exact-index safety can require copying an entire",
+            "War3ShadowDrawTimeCapturePhase::FingerprintAndDedup",
+        )
+        for token in (
+            "fullVertexDomainFallback",
+            "actualIndexDomainKnown",
+            "exactUnitIdentityProven",
+            "War3CasterIsAnonymousSmallPathBlockerMarker(exactMarkerProbe)",
+            "War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey)",
+            "DrawTimeExact/FullDomainAnonymousSmallMarker",
+        ):
+            self.assertIn(token, capture_reject)
 
 
 if __name__ == "__main__":

@@ -1065,7 +1065,7 @@ inline bool War3ReplayDrawIsAnonymousSmallMarker(
     return false;
 
   const uint32_t vertexCount =
-      draw.numVertices != 0u ? draw.numVertices : draw.vertexCount;
+      War3ShadowReferencedVertexUpperBound(draw);
   if (vertexCount < 3u ||
       vertexCount >
           dxvk::war3::internal::kPathBlockerBelowGroundFlatMarkerMaxVertices) {
