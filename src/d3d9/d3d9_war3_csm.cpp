@@ -274,6 +274,12 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
   if (dot3(lightDir, up) > 0.0f)
     lightDir = Vector4(-lightDir.x, -lightDir.y, -lightDir.z, 0.0f);
 
+  out.lightDirection = lightDir;
+  // selectStableWorldUp may temporarily choose an orthogonal helper when the
+  // light is nearly collinear with the canonical axis. Height fog and other
+  // consumers need the stable world axis, not that matrix-basis helper.
+  out.worldUp = m_cachedWorldUp;
+
   // Precompute a stable light basis (world space)
   // 策略：
   // - 优先沿用上一帧 right 向量并投影到当前光方向的正交平面，保证跨帧连续；
@@ -330,6 +336,7 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
     const float splitFar = splits[c + 1];
 
     // Compute frustum corners in world space for this split
+    std::array<Vector4, 8> viewCorners = {};
     std::array<Vector4, 8> worldCorners = {};
     for (uint32_t i = 0; i < 4; i++) {
       // Far corner in view space
@@ -358,6 +365,8 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
           Vector4(v.x * sNear, v.y * sNear, zSign * splitNear, 1.0f);
       Vector4 viewFar = Vector4(v.x * sFar, v.y * sFar, zSign * splitFar, 1.0f);
 
+      viewCorners[i + 0] = viewNear;
+      viewCorners[i + 4] = viewFar;
       worldCorners[i + 0] = invView * viewNear;
       worldCorners[i + 4] = invView * viewFar;
     }
@@ -377,7 +386,40 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
     centerAvg.z *= (1.0f / 8.0f);
     centerAvg.w = 1.0f;
 
-    Vector4 center = centerAvg;
+    // StableSphere must not derive its radius from world-space corners. The
+    // inverse-view transform adds camera translation before the subtraction
+    // below, which loses low bits at large War3 world coordinates and makes a
+    // theoretically constant radius breathe while the camera moves or rotates.
+    // View-space corners depend only on the projection and cascade split, so
+    // their sphere radius is invariant under camera motion.
+    Vector4 centerView = Vector4(0.0f);
+    for (const auto &p : viewCorners) {
+      centerView.x += p.x;
+      centerView.y += p.y;
+      centerView.z += p.z;
+    }
+    centerView.x *= (1.0f / 8.0f);
+    centerView.y *= (1.0f / 8.0f);
+    centerView.z *= (1.0f / 8.0f);
+    centerView.w = 1.0f;
+
+    float radius3d = 0.0f;
+    for (const auto &p : viewCorners) {
+      const Vector4 d = Vector4(p.x - centerView.x, p.y - centerView.y,
+                                p.z - centerView.z, 0.0f);
+      radius3d =
+          (std::max)(radius3d, std::sqrt((std::max)(dot3(d, d), 0.0f)));
+    }
+    radius3d = (std::max)(radius3d, 1.0f);
+
+    // StableSphere should keep its center on the same precision path as its
+    // radius. Averaging eight world-space corners first quantizes the camera
+    // translation eight times; transforming the view-space center once is
+    // mathematically equivalent but avoids that frame-dependent low-bit noise.
+    Vector4 center = config.fitMode == War3CsmFitMode::StableSphere
+                         ? invView * centerView
+                         : centerAvg;
+    center.w = 1.0f;
     float tightHalfExtent = 0.0f;
     if (config.fitMode == War3CsmFitMode::TightAabb) {
       float minX = (std::numeric_limits<float>::max)();
@@ -405,17 +447,6 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
                        r.y * cx + u.y * cy + f.y * cz,
                        r.z * cx + u.z * cy + f.z * cz, 1.0f);
     }
-
-    // EYE 距离用 3D 半径（围绕当前 center）保证不会把 frustum 放到相机后方
-    // 说明：这里的 radius3d 仅用于计算 lightDistance (Z)，
-    // 而真正的投影半径 radius 将在下方根据 fitMode 决定。
-    float radius3d = 0.0f;
-    for (const auto &p : worldCorners) {
-      const Vector4 d = Vector4(p.x - centerAvg.x, p.y - centerAvg.y,
-                                p.z - centerAvg.z, 0.0f);
-      radius3d = (std::max)(radius3d, std::sqrt((std::max)(dot3(d, d), 0.0f)));
-    }
-    radius3d = (std::max)(radius3d, 1.0f);
 
     // XY 投影半径（对称正方形）
     // TightAabb 在低仰角时 tightHalfExtent 会因视锥 far 角极远而爆炸。
@@ -468,55 +499,72 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
     }
     radius = radiusPadded;
 
-    Vector4 snappedCenter = center;
+    // Keep the snapped coordinates in light space all the way into the view
+    // matrix. Reconstructing a world-space point and projecting it back with
+    // float dot products loses the exact texel quantization at large world
+    // coordinates.
+    const auto projectCenter = [](const Vector4 &p, const Vector4 &axis) {
+      return double(p.x) * double(axis.x) + double(p.y) * double(axis.y) +
+             double(p.z) * double(axis.z);
+    };
+    double lightCenterX = projectCenter(center, r);
+    double lightCenterY = projectCenter(center, u);
+    const double lightCenterZ = projectCenter(center, f);
     if (doSnap) {
-      const float cx = dot3(center, r);
-      const float cy = dot3(center, u);
-      const float cz = dot3(center, f);
-
       // Round-to-nearest texel to minimize drift (handle negative coordinates
       // correctly)
-      const double invTexel = 1.0 / double(texelSize);
-      const float sx =
-          float(std::round(double(cx) * invTexel) * double(texelSize));
-      const float sy =
-          float(std::round(double(cy) * invTexel) * double(texelSize));
-
-      snappedCenter = Vector4(r.x * sx + u.x * sy + f.x * cz,
-                              r.y * sx + u.y * sy + f.y * cz,
-                              r.z * sx + u.z * sy + f.z * cz, 1.0f);
+      const double texelSizeD = double(texelSize);
+      const double invTexel = 1.0 / texelSizeD;
+      lightCenterX = std::round(lightCenterX * invTexel) * texelSizeD;
+      lightCenterY = std::round(lightCenterY * invTexel) * texelSizeD;
     }
 
     // RenderEdge approach: place light camera at (center - lightDir *
     // depth_extent) Using -minExtents.z as the distance (matches RenderEdge's
     // calculation)
     //
-    // 修正：原先固定加大 Z
-    // 范围（+3000）会严重损失深度精度，导致墙面“波纹/流动”。 这里改为：用
-    // frustum 在光空间的真实 min/max 计算范围，并加小的 margin。
+    // 原先固定加大 Z 范围（+3000）会严重损失深度精度；逐帧紧拟合角点又会
+    // 让深度尺度随相机旋转呼吸。下面改用稳定球加小 margin，在精度与稳定性间
+    // 保持固定、保守的范围。
     const float depthMargin = (std::max)(config.depthRangeMargin, 0.0f);
-    const float lightDistance = radius3d + depthMargin;
+    // Keep the light-space Z scale stable as well. A tight min/max fit of the
+    // rotated frustum corners changes whenever the camera rotates, even though
+    // the stable sphere itself has not changed. That alters normalized shadow
+    // depth and receiver bias from frame to frame, showing up as fine edge
+    // shimmer. A symmetric sphere bound is conservative and invariant.
+    const float depthRadius = (std::max)(radius3d, radius);
+    const float baseLightDistance = depthRadius + depthMargin;
+    // Directional shadow casters can sit toward the sun, outside the receiver
+    // frustum's symmetric Z sphere, while still projecting into it. C0/C1 are
+    // intentionally unchanged; volume-enabled far cascades receive a fixed
+    // one-sided allowance. Keeping it fixed avoids reintroducing per-frame
+    // Z-scale breathing from caster-dependent fitting.
+    // 体积光需要所有 cascade 都能包含上游 caster 的深度。
+    // C0/C1 使用一半的扩展量，避免过度损失深度精度；
+    // C2/C3 使用完整的 farCasterDepthExtension。
+    const float farCasterDepthExtension = c >= 2u
+        ? (std::max)(config.farCasterDepthExtension, 0.0f)
+        : (std::max)(config.farCasterDepthExtension * 0.5f, 0.0f);
+    const float lightDistance =
+        baseLightDistance + farCasterDepthExtension;
 
-    const Vector4 eye =
-        Vector4(snappedCenter.x - lightDir.x * lightDistance,
-                snappedCenter.y - lightDir.y * lightDistance,
-                snappedCenter.z - lightDir.z * lightDistance, 1.0f);
+    // Use the exact same stabilized basis that was used for texel snapping.
+    // Write its light-space translation directly as well: this preserves the
+    // snapped X/Y coordinates instead of round-tripping them through a large
+    // world-space eye position.
+    Matrix4 lightView;
+    lightView[0] = Vector4(r.x, u.x, f.x, 0.0f);
+    lightView[1] = Vector4(r.y, u.y, f.y, 0.0f);
+    lightView[2] = Vector4(r.z, u.z, f.z, 0.0f);
+    lightView[3] = Vector4(float(-lightCenterX), float(-lightCenterY),
+                           float(double(lightDistance) - lightCenterZ), 1.0f);
 
-    const Matrix4 lightView = makeLookAtLH(eye, snappedCenter, up);
-
-    float minZ = (std::numeric_limits<float>::max)();
-    float maxZ = (std::numeric_limits<float>::lowest)();
-    for (const auto &p : worldCorners) {
-      Vector4 lp = lightView * p;
-      minZ = (std::min)(minZ, lp.z);
-      maxZ = (std::max)(maxZ, lp.z);
-    }
-
-    // 额外扩展一小段，避免极端角度裁剪
-    minZ = (std::max)(0.0f, minZ - depthMargin);
-    maxZ = maxZ + depthMargin;
-    if (!(maxZ > minZ))
-      maxZ = minZ + 1.0f;
+    const float minZ = 0.0f;
+    // Moving the eye toward the sun by E shifts both receiver bounds by E.
+    // Adding E (rather than 2E) to the old symmetric far plane preserves the
+    // far receiver boundary and opens only the upstream caster side.
+    const float maxZ = (std::max)(
+        2.0f * baseLightDistance + farCasterDepthExtension, 1.0f);
 
     // Symmetric XY bounds around the snapped center
     const float halfExtent = radius;
@@ -531,8 +579,139 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
     out.cascades[c].lightViewProj = lightViewProj;
     out.cascades[c].splitNear = splitNear;
     out.cascades[c].splitFar = splitFar;
+    out.cascades[c].snappedCenterLightSpace =
+        Vector4(float(lightCenterX), float(lightCenterY),
+                float(lightCenterZ), 1.0f);
+    out.cascades[c].texelSize = texelSize;
   }
 
+  return out;
+}
+
+War3VolumeSunOrtho ComputeVolumeSunOrtho(
+    const Vector4& lightDirWorld,
+    const Vector4& worldUpIn,
+    const Vector4& centerWorld,
+    float orthoRadius,
+    float depthMargin,
+    float depthExtension,
+    uint32_t resolution,
+    bool stableSnap) {
+  War3VolumeSunOrtho out = {};
+  if (!std::isfinite(orthoRadius) || orthoRadius <= 1.0f ||
+      resolution == 0u || !std::isfinite(centerWorld.x) ||
+      !std::isfinite(centerWorld.y) || !std::isfinite(centerWorld.z))
+    return out;
+
+  auto n3 = [](Vector4 v) {
+    const float len2 = v.x * v.x + v.y * v.y + v.z * v.z;
+    if (len2 <= (std::numeric_limits<float>::min)())
+      return Vector4(0.0f, 0.0f, -1.0f, 0.0f);
+    const float inv = 1.0f / std::sqrt(len2);
+    return Vector4(v.x * inv, v.y * inv, v.z * inv, 0.0f);
+  };
+  auto d3 = [](const Vector4& a, const Vector4& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+  };
+  auto x3 = [](const Vector4& a, const Vector4& b) {
+    return Vector4(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
+                   a.x * b.y - a.y * b.x, 0.0f);
+  };
+
+  Vector4 lightDir = n3(lightDirWorld);
+  Vector4 worldUp = n3(worldUpIn);
+  if (d3(worldUp, worldUp) <= 1e-8f)
+    worldUp = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
+  // 与 CSM 一致：光方向朝向地面（与 up 夹角为钝角）
+  if (d3(lightDir, worldUp) > 0.0f)
+    lightDir = Vector4(-lightDir.x, -lightDir.y, -lightDir.z, 0.0f);
+
+  const Vector4 f = lightDir;
+  Vector4 helper = Vector4(1.0f, 0.0f, 0.0f, 0.0f);
+  {
+    const float ax = std::abs(f.x);
+    const float ay = std::abs(f.y);
+    const float az = std::abs(f.z);
+    if (ax <= ay && ax <= az)
+      helper = Vector4(1.0f, 0.0f, 0.0f, 0.0f);
+    else if (ay <= az)
+      helper = Vector4(0.0f, 1.0f, 0.0f, 0.0f);
+    else
+      helper = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
+  }
+  Vector4 r = n3(x3(helper, f));
+  if (d3(r, r) <= 1e-8f)
+    r = n3(x3(worldUp, f));
+  Vector4 u = n3(x3(f, r));
+  if (d3(u, u) <= 1e-8f) {
+    r = n3(x3(worldUp, f));
+    u = n3(x3(f, r));
+  }
+
+  // 固定半径：只量化，不随 pitch/FOV 膨胀。
+  float radius = (std::max)(orthoRadius, 64.0f);
+  constexpr float kRadiusStep = 64.0f;
+  radius = std::ceil(radius / kRadiusStep) * kRadiusStep;
+
+  const float resF = float((std::max)(resolution, 1u));
+  float radiusPadded = radius;
+  float texelSize = (2.0f * radiusPadded) / resF;
+  if (stableSnap && texelSize > 1e-6f) {
+    radiusPadded = radiusPadded + texelSize;
+    texelSize = (2.0f * radiusPadded) / resF;
+  }
+
+  auto project = [&](const Vector4& p, const Vector4& axis) {
+    return double(p.x) * double(axis.x) + double(p.y) * double(axis.y) +
+           double(p.z) * double(axis.z);
+  };
+  Vector4 center = centerWorld;
+  center.w = 1.0f;
+  double lightCenterX = project(center, r);
+  double lightCenterY = project(center, u);
+  const double lightCenterZ = project(center, f);
+  if (stableSnap && texelSize > 1e-6f) {
+    const double texelSizeD = double(texelSize);
+    const double invTexel = 1.0 / texelSizeD;
+    lightCenterX = std::round(lightCenterX * invTexel) * texelSizeD;
+    lightCenterY = std::round(lightCenterY * invTexel) * texelSizeD;
+  }
+
+  const float margin = (std::max)(depthMargin, 0.0f);
+  const float extension = (std::max)(depthExtension, 0.0f);
+  const float baseLightDistance = radiusPadded + margin;
+  const float lightDistance = baseLightDistance + extension;
+  const float minZ = 0.0f;
+  const float maxZ =
+      (std::max)(2.0f * baseLightDistance + extension, 1.0f);
+
+  Matrix4 lightView;
+  lightView[0] = Vector4(r.x, u.x, f.x, 0.0f);
+  lightView[1] = Vector4(r.y, u.y, f.y, 0.0f);
+  lightView[2] = Vector4(r.z, u.z, f.z, 0.0f);
+  lightView[3] = Vector4(float(-lightCenterX), float(-lightCenterY),
+                         float(double(lightDistance) - lightCenterZ), 1.0f);
+
+  const float halfExtent = radiusPadded;
+  // 复用 CSM 的 ortho 约定（row-vector）
+  const float invW = 1.0f / (2.0f * halfExtent);
+  const float invH = 1.0f / (2.0f * halfExtent);
+  const float invD = 1.0f / (maxZ - minZ);
+  Matrix4 lightProj;
+  lightProj[0] = Vector4(2.0f * invW, 0.0f, 0.0f, 0.0f);
+  lightProj[1] = Vector4(0.0f, 2.0f * invH, 0.0f, 0.0f);
+  lightProj[2] = Vector4(0.0f, 0.0f, invD, 0.0f);
+  lightProj[3] = Vector4(0.0f, 0.0f, -minZ * invD, 1.0f);
+
+  out.lightViewProj = lightProj * lightView;
+  out.lightDirection = lightDir;
+  out.worldUp = worldUp;
+  out.center = center;
+  out.radius = radiusPadded;
+  out.texelSize = texelSize;
+  out.minZ = minZ;
+  out.maxZ = maxZ;
+  out.valid = true;
   return out;
 }
 

@@ -5,6 +5,9 @@
 
 #include "d3d9_device_child.h"
 #include "d3d9_format.h"
+#include "war3/tools/war3_resource_residency_census.h"
+
+#include <atomic>
 
 namespace dxvk {
 
@@ -74,6 +77,17 @@ namespace dxvk {
     static constexpr VkDeviceSize BufferSliceAlignment = 64;
   public:
 
+    struct War3ActiveLock {
+      uintptr_t ownerIdentity = 0;
+      uint32_t offset = 0;
+      uint32_t size = 0;
+      uint32_t flags = 0;
+
+      explicit operator bool() const {
+        return ownerIdentity != 0;
+      }
+    };
+
     D3D9CommonBuffer(
             D3D9DeviceEx*      pDevice,
       const D3D9_BUFFER_DESC*  pDesc);
@@ -84,9 +98,10 @@ namespace dxvk {
             UINT   OffsetToLock,
             UINT   SizeToLock,
             void** ppbData,
-            DWORD  Flags);
+            DWORD  Flags,
+       uintptr_t   OwnerIdentity);
 
-    HRESULT Unlock();
+    HRESULT Unlock(uintptr_t OwnerIdentity);
 
     /**
     * \brief Determine the mapping mode of the buffer, (ie. direct mapping or backed)
@@ -135,6 +150,15 @@ namespace dxvk {
 
     inline Rc<DxvkResourceAllocation> DiscardMapSlice() {
       m_allocation = GetMapBuffer()->allocateStorage();
+      // 这是应用线程的分配意图。在 BUFFER 映射模式下，它只表示 staging 分配，
+      // 不是实际绘制后备；该信息严格仅供诊断，绝不参与 poison 匹配或清除。
+      const uint64_t generation =
+          m_war3MapAllocationGeneration.fetch_add(
+              1u, std::memory_order_relaxed) + 1u;
+      if (generation == 0u) {
+        m_war3MapAllocationGeneration.store(
+            1u, std::memory_order_relaxed);
+      }
       return m_allocation;
     }
 
@@ -146,6 +170,55 @@ namespace dxvk {
     inline void SetMapFlags(DWORD Flags)  { m_mapFlags = Flags; }
 
     inline const D3D9_BUFFER_DESC* Desc() const { return &m_desc; }
+    inline uint64_t War3IdentityGeneration() const {
+      return m_war3IdentityGeneration;
+    }
+    inline uint64_t War3MapAllocationGeneration() const {
+      return m_war3MapAllocationGeneration.load(std::memory_order_relaxed);
+    }
+    inline uint64_t War3ContentGeneration() const {
+      return m_war3ContentGeneration;
+    }
+    inline void War3MarkContentMutation() {
+      if (++m_war3ContentGeneration == 0u)
+        m_war3ContentGeneration = 1u;
+    }
+    inline void War3MarkGpuSkinNativeTracked() noexcept {
+      m_war3GpuSkinNativeTracked.store(true, std::memory_order_release);
+    }
+    inline bool War3GpuSkinNativeTracked() const noexcept {
+      return m_war3GpuSkinNativeTracked.load(std::memory_order_acquire);
+    }
+    inline bool War3GetActiveLock(War3ActiveLock& lock) const {
+      if (m_lockCount != 1u || !m_war3ActiveLock)
+        return false;
+      lock = m_war3ActiveLock;
+      return true;
+    }
+    inline void War3RecordActiveLock(uintptr_t ownerIdentity,
+                                     uint32_t offset,
+                                     uint32_t size,
+                                     uint32_t flags) {
+      m_war3ActiveLock = m_lockCount == 0u
+          ? War3ActiveLock{ownerIdentity, offset, size, flags}
+          : War3ActiveLock{};
+    }
+    inline void War3ClearActiveLock() {
+      m_war3ActiveLock = {};
+    }
+    inline void War3NoteResourceCensusLock(
+        const war3::resource_census::ResourceLockEvent& event) const {
+      war3::resource_census::NoteLock(m_war3ResourceCensus, event);
+    }
+    inline bool War3ResourceCensusEnabled() const {
+      return m_war3ResourceCensus != nullptr;
+    }
+    inline void War3NoteResourceCensusUnlock() const {
+      war3::resource_census::NoteUnlock(m_war3ResourceCensus);
+    }
+    inline void War3NoteResourceCensusUpload() const {
+      war3::resource_census::NoteDeviceUpload(m_war3ResourceCensus, 0u);
+    }
 
     static HRESULT ValidateBufferProperties(const D3D9_BUFFER_DESC* pDesc, const bool IsExtended);
 
@@ -243,6 +316,12 @@ namespace dxvk {
     uint32_t                    m_lockCount = 0;
 
     uint64_t                    m_seq = 0ull;
+    uint64_t                    m_war3IdentityGeneration = 0ull;
+    uint64_t                    m_war3ContentGeneration = 1ull;
+    std::atomic<uint64_t>       m_war3MapAllocationGeneration{1ull};
+    std::atomic<bool>           m_war3GpuSkinNativeTracked{false};
+    War3ActiveLock              m_war3ActiveLock;
+    war3::resource_census::ResourceHandle m_war3ResourceCensus;
 
   };
 

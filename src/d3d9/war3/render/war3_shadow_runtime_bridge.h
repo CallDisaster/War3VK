@@ -6,8 +6,11 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <type_traits>
 
 namespace dxvk::war3::render {
+
+struct CurrentDrawContractRecord;
 
 enum class SemanticDataPerfTag : uint32_t {
   Unknown = 0,
@@ -49,7 +52,15 @@ enum class SemanticDataPerfTag : uint32_t {
   AttachmentOverrideSharedPreset = 36,
   AttachmentOverrideLocalPoint = 37,
   AttachmentOverridePrimaryPreset = 38,
-  Count = 39,
+  // control-plane 摘要查询触发的异步 contract 刷新请求。曾与 ConsumerBuild
+  // 共用标签，导致 populate 热点归因被查询频率污染；现独立计量。
+  SummaryRefreshRequest = 39,
+  // Safe current-frame-only shadow metadata capture. The hot draw path uses
+  // sampled raw QPC and publishes one aggregate sample per rendered frame, so
+  // this tag's avgUsPerCall is the metadata self time per active frame rather
+  // than a per-draw instrumenting scope.
+  ShadowMetadataCapture = 40,
+  Count = 41,
 };
 
 struct ShadowRuntimeCadenceSample {
@@ -98,6 +109,18 @@ struct ShadowRuntimeCadenceSample {
   uint64_t shadowMatrixBufferOffset = 0;
   uint64_t shadowMatrixBufferSize = 0;
   uint64_t shadowMatrixBufferGpuAddress = 0;
+  uint64_t receiverCameraHash = 0;
+  uint64_t receiverSunDirectionHash = 0;
+  uint64_t receiverCsmHash = 0;
+  uint64_t receiverCameraDeltaNano = 0;
+  uint64_t receiverSunDeltaNano = 0;
+  uint64_t receiverCsmDeltaNano = 0;
+  uint64_t receiverSnappedCenterDeltaTexelsNano = 0;
+  uint64_t receiverTexelSizeDeltaNano = 0;
+  uint64_t replayBackingHash = 0;
+  uint64_t stage13ReplayContentHash = 0;
+  uint64_t stage13ReplayBackingHash = 0;
+  uint64_t stage13ReplayDrawCount = 0;
   uint64_t shadowMapRenderSerial = 0;
   uint64_t shadowMapImagePtr = 0;
   uint64_t shadowMapSampleViewPtr = 0;
@@ -114,6 +137,9 @@ struct ShadowRuntimeCadenceSample {
   uint64_t shadowHistoryValidAfter = 0;
   uint64_t shadowHistoryReadIndex = 0;
   uint64_t shadowHistoryWriteIndex = 0;
+  uint64_t shadowHistoryAdvancedThisFrame = 0;
+  uint64_t shadowHistoryAdvanceSkippedIncomplete = 0;
+  uint64_t shadowHistoryInvalidationMask = 0;
   uint64_t shadowReceiverSampleSource = 0;
 };
 
@@ -125,12 +151,14 @@ struct ShadowPoseFullTraceStatus {
   bool includePoseRecords = true;
   bool includeShadowObjectRecords = true;
   bool includeCurrentDrawRecords = true;
+  bool includeFinalCasterRecords = true;
   bool includeMatrixBytes = false;
   bool stoppedByLimit = false;
   uint32_t maxSeconds = 15u;
   uint32_t maxPoseRecords = 0u;
   uint32_t maxShadowObjectRecords = 0u;
   uint32_t maxCurrentDrawRecords = 0u;
+  uint32_t maxFinalCasterRecords = 0u;
   uint64_t traceEpoch = 0u;
   uint64_t frameEventsWritten = 0u;
   uint64_t recordEventsWritten = 0u;
@@ -270,6 +298,7 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t visibleRenderableSample1ScenePoseMatrixCount = 0;
   uint64_t visibleRenderableSample1GeosetModelResourcePtr = 0;
   uint64_t visibleRenderableSample1GeosetModelKey = 0;
+  bool sceneCollectorGroupLocalAggregationEnabled = false;
   uint64_t worldObjectListEntryCount = 0;
   uint64_t worldObjectListNullEntryCount = 0;
   uint64_t worldObjectListOwnerHintZeroCount = 0;
@@ -281,6 +310,11 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t lastWorldObjectListEntryWorldObjectEntryPtr = 0;
   uint64_t lastWorldObjectListEntryOwnerHintValue = 0;
   uint64_t lastWorldObjectListEntrySceneNodePtr = 0;
+  bool renderIdentityFullDiagnostics = false;
+  bool worldObjectListEntryWriteProbeHookInstalled = false;
+  bool worldObjectEntryRenderContextHookInstalled = false;
+  bool worldObjectEntryRenderPrePostProbeEnabled = false;
+  bool renderQueueIdentityPrimingHookInstalled = false;
   uint64_t worldObjectEntryRenderCallCount = 0;
   uint64_t worldObjectEntryRenderSceneNodeReadyBeforeCount = 0;
   uint64_t worldObjectEntryRenderSceneNodeReadyAfterCount = 0;
@@ -480,9 +514,27 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticManifestCopyTotalScanned = 0;
   uint64_t semanticManifestCopyTotalChronoNs = 0;
   uint64_t semanticManifestCopyMaxChronoNs = 0;
+  uint64_t semanticManifestResolveSourceCompleteSkipCount = 0;
+  uint64_t semanticManifestResolveLegacyCacheHitCount = 0;
+  uint64_t semanticManifestResolveRawScanCount = 0;
+  uint64_t semanticManifestResolveRawScanEntryVisitCount = 0;
+  uint64_t semanticManifestResolveRawScanMissCount = 0;
+  uint64_t semanticManifestResolveVerifierAttemptCount = 0;
+  uint64_t semanticManifestResolveVerifierMismatchCount = 0;
+  uint64_t semanticManifestResolveMaxRuntimeGeosetCount = 0;
+  uint64_t semanticManifestModelResourceAttemptCount = 0;
+  uint64_t semanticManifestModelResourceCacheHitCount = 0;
+  uint64_t semanticManifestModelResourceDeepResolveCount = 0;
+  uint64_t semanticManifestModelResourceNullResultCount = 0;
+  uint64_t semanticManifestModelResourceVerifierAttemptCount = 0;
+  uint64_t semanticManifestModelResourceVerifierMismatchCount = 0;
   uint64_t semanticConsumerBuildCalls = 0;
   uint64_t semanticConsumerBuildUs = 0;
   uint64_t semanticConsumerBuildSkippedFresh = 0;
+  uint64_t semanticSummaryRefreshRequestCalls = 0;
+  uint64_t semanticSummaryRefreshRequestUs = 0;
+  uint64_t shadowMetadataCaptureFrameCalls = 0;
+  uint64_t shadowMetadataCaptureUs = 0;
   uint64_t semanticLastHotFunctionTag = 0;
   uint64_t semanticLastHotFunctionUs = 0;
   uint64_t semanticModelBuildChildPreScanCalls = 0;
@@ -739,6 +791,13 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount = 0;
   uint64_t semanticSceneShadowManifestObjectCoreEpochMissingPartCount = 0;
   uint64_t semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount = 0;
+  uint64_t semanticSceneShadowManifestCorePartPrunedOnLeaseExpiryCount = 0;
+  uint64_t semanticSceneShadowManifestCoreObjectEmptiedOnLeaseExpiryCount = 0;
+  uint64_t semanticSceneShadowManifestLeaseExpiredBackingOnlyCount = 0;
+  uint64_t semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount = 0;
+  uint64_t semanticSceneShadowManifestMissingRequiredPartCount = 0;
+  uint64_t semanticSceneShadowManifestGraceUsedCount = 0;
+  uint64_t semanticSceneShadowManifestTombstoneRetiredCount = 0;
   // Phase 7.28：skinned palette content stability probe（跨层导出）。
   uint64_t semanticSceneSubmittedSkinnedPaletteSourceNoneCount = 0;
   uint64_t semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount = 0;
@@ -862,6 +921,47 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneLastAppendedGeometryId = 0;
   uint64_t semanticSceneLastAppendedRenderablePart = 0;
   uint64_t semanticSceneLastAppendedMeshData = 0;
+  // Stage1 terrain/bridge world-transform diagnostics. Bridges and ramps are
+  // emitted by the native renderer in the Stage1 terrain family rather than
+  // the Stage10 decoration family, so these gauges must travel with the
+  // published frame instead of being inferred from the later replay count.
+  uint64_t terrainS1CaptureAttemptCount = 0;
+  uint64_t terrainS1CaptureAcceptedCount = 0;
+  uint64_t terrainS1WorldIdentityLikeCount = 0;
+  uint64_t terrainS1WorldNonIdentityCount = 0;
+  uint64_t terrainS1WorldNonFiniteCount = 0;
+  uint64_t terrainS1ForceIdentityWorldCount = 0;
+  uint64_t terrainS1WorldMatrixHash = 0;
+  uint64_t terrainS1WorldTranslationMilliMax = 0;
+  std::array<uint64_t, kWar3ShadowStageHistogramBinCount>
+      shadowCasterStageHistogram = {};
+  std::array<uint64_t, kWar3ShadowCategoryHistogramBinCount>
+      shadowCasterCategoryHistogram = {};
+  uint64_t stage13CaptureAttemptCount = 0;
+  uint64_t stage13CaptureRejectedNoDemandCount = 0;
+  uint64_t stage13CaptureRejectedAfterBeforeUiCount = 0;
+  uint64_t stage13CaptureConsideredCount = 0;
+  uint64_t beforeUiStage13BoundaryCandidateCount = 0;
+  uint64_t beforeUiStage13BoundaryCommitCount = 0;
+  uint64_t stage13RetentionBaseEligibleCount = 0;
+  uint64_t stage13SourcePositionInvalidCount = 0;
+  uint64_t stage13SourceIndexInvalidCount = 0;
+  uint64_t stage13SourceIdentityValidCount = 0;
+  uint64_t stage13SourceIdentityHitCount = 0;
+  uint64_t stage13SourceIdentityMissCount = 0;
+  uint64_t stage13StrongScanCount = 0;
+  uint64_t stage13SnapshotBuildCount = 0;
+  uint64_t stage13SnapshotContentRekeyCount = 0;
+  uint64_t stage13FreezeCopyBytes = 0;
+  uint64_t stage13CpuSnapshotCopyBytes = 0;
+  uint64_t stage13RetentionSnapshotBytes = 0;
+  uint64_t stage13RetainedEntryCountMax = 0;
+  uint64_t stage13RetainedContentMatchCount = 0;
+  uint64_t stage13RetainedIdentityMatchCount = 0;
+  uint64_t stage13RetainedWorldMatchCount = 0;
+  uint64_t stage13RetainedMaterialMatchCount = 0;
+  uint64_t stage13RetainedLayoutMatchCount = 0;
+  uint64_t stage13RetainedAllSemanticMatchCount = 0;
   // --- submitted/replay/executed reconciliation ---
   uint64_t semanticSceneShadowCastersCount = 0;
   uint64_t semanticSceneReplayDrawsCount = 0;
@@ -1082,6 +1182,24 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t shadowAlphaTestPayloadStashSkipNoUploadCount = 0;
   uint64_t shadowAlphaTestPayloadCacheEvictedCount = 0;
   uint64_t shadowAlphaTestPayloadCacheSizeGauge = 0;
+  uint64_t shadowMetadataClassifiedCount = 0;
+  uint64_t shadowMetadataCapturedCount = 0;
+  uint64_t shadowMetadataAppliedCount = 0;
+  uint64_t shadowMetadataRejectedFrameCount = 0;
+  uint64_t shadowMetadataRejectedGenerationCount = 0;
+  uint64_t shadowMetadataAmbiguousCount = 0;
+  uint64_t shadowMetadataRejectedNoMaterialCount = 0;
+  uint64_t shadowMetadataRejectedOpaqueCount = 0;
+  uint64_t shadowMetadataRejectedNoUvCount = 0;
+  uint64_t shadowMetadataRejectedNoDiffuseCount = 0;
+  uint64_t shadowMetadataRejectedUploadCount = 0;
+  uint64_t shadowMetadataRejectedDuplicateCount = 0;
+  uint64_t shadowMetadataBlockerKnownRawcodeCount = 0;
+  uint64_t shadowMetadataBlockerWidgetIdentityCount = 0;
+  uint64_t shadowMetadataBlockerSmallFlatCount = 0;
+  uint64_t shadowMetadataBlockerBelowGroundCount = 0;
+  uint64_t shadowMetadataBlockerUnreadableCount = 0;
+  uint64_t shadowMetadataBlockerFinalLeakCount = 0;
   uint64_t semanticFallbackPruned = 0;
   uint64_t semanticFallbackPrunedByHandle = 0;
   uint64_t semanticFallbackPrunedByWorldObjectEntry = 0;
@@ -1766,7 +1884,400 @@ struct ShadowRuntimeBridgeSummary {
 struct ShadowRuntimeBridgeTrackingDecision {
   bool wantsObjectIdentity = false;
   bool wantsFallbackBridge = false;
+  // 低扰动健康路径证据：aggregateReadPasses 表示 O(1) 聚合读取，
+  // Verifier* 只在显式 brute-force 校验开启时表示真实全表扫描。
+  // 这些字段都是次数/记录数，不是计时。
+  uint64_t trackingHealthFastPathCalls = 0u;
+  uint64_t trackingHealthFullSummaryCompatibilityCalls = 0u;
+  uint64_t trackingHealthModelInstanceAggregateReadPasses = 0u;
+  uint64_t trackingHealthPoseAggregateReadPasses = 0u;
+  uint64_t trackingHealthModelInstanceVerifierScanPasses = 0u;
+  uint64_t trackingHealthPoseVerifierScanPasses = 0u;
+  uint64_t trackingHealthModelInstanceVerifierRecordsScanned = 0u;
+  uint64_t trackingHealthPoseVerifierRecordsScanned = 0u;
+  uint64_t trackingHealthModelInstanceVerifierMismatchCount = 0u;
+  uint64_t trackingHealthPoseVerifierMismatchCount = 0u;
+  uint32_t trackingHealthModelInstanceVerifierMismatchMask = 0u;
+  uint32_t trackingHealthPoseVerifierMismatchMask = 0u;
 };
+
+// Phase 1 low-disturbance telemetry for the periodic WorldObjects identity
+// refresh.  All structures are fixed-size POD snapshots: the hot path never
+// formats text, allocates, or performs per-object timing.
+enum class WorldObjectsPhase1TrackingReason : uint32_t {
+  None = 0,
+  ColdBootstrap = 1,
+  Warmup = 2,
+  PeriodicMaintenance = 3,
+  RepairBurst = 4,
+  RuntimeChainRepair = 5,
+  Count = 6,
+};
+
+enum class WorldObjectsPhase1CollectorOutcome : uint32_t {
+  Unclassified = 0,
+  ValidNonEmpty = 1,
+  ValidEmptyAfterFilter = 2,
+  NullWorld = 3,
+  InvalidGroup = 4,
+  UnreadableWorld = 5,
+  NullList = 6,
+  UnreadableList = 7,
+  NullData = 8,
+  CountZero = 9,
+  CountCap = 10,
+  UnreadableData = 11,
+  FilteredNoTargets = 12,
+  Count = 13,
+};
+
+// Game.dll's authoritative maintenance fan-out is group 0..2.  Legacy group
+// 3 remains functionally untouched but is intentionally outside this Phase1
+// attribution contract.
+constexpr uint32_t kWorldObjectsPhase1GroupCount = 3u;
+constexpr uint32_t kWorldObjectsPhase1EventSlotCount = 16u;
+constexpr uint32_t kWorldObjectsPhase1TrackingReasonCount =
+    static_cast<uint32_t>(WorldObjectsPhase1TrackingReason::Count);
+constexpr uint32_t kWorldObjectsPhase1CollectorOutcomeCount =
+    static_cast<uint32_t>(WorldObjectsPhase1CollectorOutcome::Count);
+constexpr uint32_t kWorldObjectsPhase1GetTagStageMaxProbes = 16u;
+
+struct WorldObjectsPhase1RawTiming {
+  uint64_t calls = 0u;
+  uint64_t ticks = 0u;
+  uint64_t maxTicks = 0u;
+};
+
+enum class WorldObjectsPhase1PairedTimingStage : uint32_t {
+  PresentPreTracking = 0,
+  WorldHookInclusive,
+  WorldCollector,
+  WorldOriginal,
+  WorldTrackNewBatches,
+  FlushRoot,
+  FlushNotify,
+  FlushTransactionBegin,
+  FlushOriginalBody,
+  FlushReimplOpaque,
+  FlushReimplTransparent,
+  FlushTransactionEnd,
+  DispatchRoot,
+  DispatchResolveSemantic,
+  DispatchNativeBegin,
+  DispatchExecBegin,
+  DispatchOriginal,
+  DispatchPublishVisible,
+  DispatchExecEnd,
+  DispatchNativeEnd,
+  ReimplExecBegin,
+  ReimplExecEnd,
+  Count,
+};
+
+constexpr uint32_t kWorldObjectsPhase1PairedTimingStageCount =
+    static_cast<uint32_t>(WorldObjectsPhase1PairedTimingStage::Count);
+
+enum class WorldObjectsPhase1FlushTerminal : uint32_t {
+  Unclassified = 0,
+  MissingGlobalsOriginal,
+  MissingDispatchOriginal,
+  DecisionFallbackOriginal,
+  OpaqueFailureOriginal,
+  TransparentFailureOriginal,
+  TakeoverSuccess,
+  Count,
+};
+
+constexpr uint32_t kWorldObjectsPhase1FlushTerminalCount =
+    static_cast<uint32_t>(WorldObjectsPhase1FlushTerminal::Count);
+
+enum class WorldObjectsPhase1DispatchCaptureKind : uint32_t {
+  None = 0,
+  PurePeriodic,
+  PostPeriodicControl,
+};
+
+// Dispatch-side attribution is armed for a pure periodic-maintenance frame
+// and, when the next decision is an exact reason=None frame, its adjacent
+// post-periodic control. Producers accumulate into render-thread TLS and
+// publish this POD block once, when the next Present tracking boundary closes
+// the preceding frame. The no-new-decision path must settle the same TLS state
+// explicitly. No dispatch performs locking, formatting, allocation, or timing
+// while the capture is inactive.
+struct WorldObjectsPhase1PeriodicDispatch {
+  uint64_t commonCalls = 0u;
+  uint64_t specialCalls = 0u;
+  // Entry TLS tag == WorldObjects is group0; every other entry tag is kept in
+  // one explicit residual bucket rather than reclassified after tracker lookup.
+  uint64_t group0Calls = 0u;
+  uint64_t otherStageCalls = 0u;
+  // Inclusive Hook_FlushSortedItems envelopes.  One root timer covers the
+  // contiguous dispatch traversal, avoiding an added QPC pair per dispatch.
+  uint64_t dispatchRootCalls = 0u;
+  uint64_t dispatchRootTicks = 0u;
+  // "eligible" deliberately means eligible if the identity-only gate were
+  // removed; blockedByIdentity is therefore an exact subset.
+  uint64_t worldFastEligibleIgnoringIdentity = 0u;
+  uint64_t worldFastBlockedByIdentity = 0u;
+  uint64_t getTagStageCalls = 0u;
+  uint64_t getTagStageHits = 0u;
+  uint64_t getTagStageMisses = 0u;
+  uint64_t getTagStageConflicts = 0u;
+  uint64_t getTagStageProbes = 0u;
+  uint64_t getTagStageTicks = 0u;
+  uint64_t captureFrameSerial = 0u;
+  uint64_t ownerThreadId = 0u;
+  uint64_t qpcReadCount = 0u;
+  uint64_t flushTopologyCalls = 0u;
+  uint64_t opaqueCountTotal = 0u;
+  uint64_t transparentCountTotal = 0u;
+  uint64_t flushTopologyHash = 0u;
+  std::array<uint64_t, kWorldObjectsPhase1FlushTerminalCount>
+      flushTerminalCounts{};
+  std::array<WorldObjectsPhase1RawTiming,
+             kWorldObjectsPhase1PairedTimingStageCount>
+      stageTimings{};
+  bool captureRequested = false;
+  bool finalized = false;
+  bool dispatchPathClosureClean = false;
+  bool dispatchRootClosureClean = false;
+  bool worldFastClosureClean = false;
+  bool getTagStageClosureClean = false;
+  bool rawTimingClosureClean = false;
+  bool qpcReadClosureClean = false;
+  bool pairedTimingClosureClean = false;
+  bool flushTopologyClosureClean = false;
+  bool closureClean = false;
+};
+
+struct WorldObjectsPhase1CollectorObservation {
+  WorldObjectsPhase1CollectorOutcome outcome =
+      WorldObjectsPhase1CollectorOutcome::Unclassified;
+  uint32_t listEntries = 0u;
+  uint32_t acceptedEntries = 0u;
+  uint32_t sceneNodeEntries = 0u;
+  uint32_t handleEntries = 0u;
+  uint64_t inclusiveTicks = 0u;
+  uint64_t setupTicks = 0u;
+  uint64_t iterateTicks = 0u;
+  uint64_t registerTicks = 0u;
+  uint64_t tailTicks = 0u;
+};
+
+struct WorldObjectsPhase1EventGroup {
+  uint64_t hookInclusiveTicks = 0u;
+  uint64_t collectorInclusiveTicks = 0u;
+  uint64_t collectorSetupTicks = 0u;
+  uint64_t collectorIterateTicks = 0u;
+  uint64_t collectorRegisterTicks = 0u;
+  uint64_t collectorTailTicks = 0u;
+  uint64_t modelFeedTicks = 0u;
+  uint64_t shadowFeedTicks = 0u;
+  uint64_t listEntries = 0u;
+  uint64_t acceptedEntries = 0u;
+  uint64_t sceneNodeEntries = 0u;
+  uint64_t handleEntries = 0u;
+  uint32_t hookCalls = 0u;
+  uint32_t collectorCalls = 0u;
+  uint32_t modelFeedCalls = 0u;
+  uint32_t shadowFeedCalls = 0u;
+  std::array<uint32_t, kWorldObjectsPhase1CollectorOutcomeCount>
+      outcomeCounts{};
+  bool observed = false;
+  bool outcomeClosureClean = false;
+  bool collectorPartitionClean = false;
+  bool hookCollectorCallClosureClean = false;
+  bool hookContainsCollector = false;
+  bool registerContainsFeeds = false;
+  bool entryCountBoundsClean = false;
+  bool unobservedZeroClean = false;
+};
+
+struct WorldObjectsPhase1Event {
+  uint64_t sequence = 0u;
+  // frameSerial is the registry serial observed by the decision; an active
+  // decision is applied before BeginFrame, so collectionFrameSerial is the
+  // following serial consumed by CollectWorldObjects.
+  uint64_t frameSerial = 0u;
+  uint64_t collectionFrameSerial = 0u;
+  uint64_t poseSerial = 0u;
+  uint64_t trackingInclusiveTicks = 0u;
+  uint64_t trackingQueryTicks = 0u;
+  uint64_t trackingDecisionTicks = 0u;
+  uint64_t refreshPeriod = 0u;
+  uint64_t warmupFrames = 0u;
+  WorldObjectsPhase1TrackingReason reason =
+      WorldObjectsPhase1TrackingReason::None;
+  uint32_t reasonMask = 0u;
+  uint32_t collectorGroupMask = 0u;
+  uint32_t hookGroupMask = 0u;
+  uint32_t observedGroupMask = 0u;
+  uint32_t duplicateCollectorGroupMask = 0u;
+  uint32_t duplicateHookGroupMask = 0u;
+  bool wantsObjectIdentity = false;
+  bool wantsFallbackBridge = false;
+  bool trackingPartitionClean = false;
+  bool completeObservedGroups = false;
+  bool unobservedGroupsZeroClean = false;
+  bool groupClosureClean = false;
+  WorldObjectsPhase1PeriodicDispatch periodicDispatch{};
+  WorldObjectsPhase1PeriodicDispatch postPeriodicControl{};
+  bool pairLifecycleClosureClean = false;
+  bool periodicEventSubsetClosureClean = false;
+  bool pairQpcBalancedExcludingGetTag = false;
+  bool pairQpcBalancedIncludingGetTag = false;
+  bool pairTopologyComparable = false;
+  bool pairComparable = false;
+  std::array<WorldObjectsPhase1EventGroup,
+             kWorldObjectsPhase1GroupCount>
+      groups{};
+};
+
+struct WorldObjectsPhase1GroupSummary {
+  WorldObjectsPhase1RawTiming hookInclusive;
+  WorldObjectsPhase1RawTiming collectorInclusive;
+  WorldObjectsPhase1RawTiming collectorSetup;
+  WorldObjectsPhase1RawTiming collectorIterate;
+  WorldObjectsPhase1RawTiming collectorRegister;
+  WorldObjectsPhase1RawTiming collectorTail;
+  WorldObjectsPhase1RawTiming modelFeed;
+  WorldObjectsPhase1RawTiming shadowFeed;
+  uint64_t listEntries = 0u;
+  uint64_t acceptedEntries = 0u;
+  uint64_t sceneNodeEntries = 0u;
+  uint64_t handleEntries = 0u;
+  uint64_t collectorPartitionMismatchCount = 0u;
+  uint64_t hookContainmentViolationCount = 0u;
+  uint64_t registerFeedContainmentViolationCount = 0u;
+  uint64_t acceptedCountViolationCount = 0u;
+  uint64_t sceneNodeCountViolationCount = 0u;
+  uint64_t handleCountViolationCount = 0u;
+  std::array<uint64_t, kWorldObjectsPhase1CollectorOutcomeCount>
+      outcomeCounts{};
+  bool observed = false;
+  bool outcomeClosureClean = false;
+  bool collectorPartitionClean = false;
+  bool hookCollectorCallClosureClean = false;
+  bool containmentClean = false;
+  bool entryCountBoundsClean = false;
+  bool unobservedZeroClean = false;
+};
+
+struct WorldObjectsPhase1TelemetrySummary {
+  uint64_t qpcFrequency = 0u;
+  uint64_t snapshotGenerationBefore = 0u;
+  uint64_t snapshotGenerationAfter = 0u;
+  uint64_t snapshotWritesStartedBefore = 0u;
+  uint64_t snapshotWritesStartedAfter = 0u;
+  uint64_t snapshotWritesCompletedBefore = 0u;
+  uint64_t snapshotWritesCompletedAfter = 0u;
+  uint32_t snapshotWritersBefore = 0u;
+  uint32_t snapshotWritersAfter = 0u;
+  uint64_t trackingAttempts = 0u;
+  uint64_t trackingHealthFastPathCalls = 0u;
+  uint64_t trackingHealthFullSummaryCompatibilityCalls = 0u;
+  uint64_t trackingHealthModelInstanceAggregateReadPasses = 0u;
+  uint64_t trackingHealthPoseAggregateReadPasses = 0u;
+  uint64_t trackingHealthModelInstanceVerifierScanPasses = 0u;
+  uint64_t trackingHealthPoseVerifierScanPasses = 0u;
+  uint64_t trackingHealthModelInstanceVerifierRecordsScanned = 0u;
+  uint64_t trackingHealthPoseVerifierRecordsScanned = 0u;
+  uint64_t trackingHealthModelInstanceVerifierMismatchCount = 0u;
+  uint64_t trackingHealthPoseVerifierMismatchCount = 0u;
+  uint32_t trackingHealthModelInstanceVerifierMismatchMask = 0u;
+  uint32_t trackingHealthPoseVerifierMismatchMask = 0u;
+  uint64_t identityRequests = 0u;
+  uint64_t fallbackRequests = 0u;
+  uint64_t eventCountLifetime = 0u;
+  uint64_t latestEventSequence = 0u;
+  uint64_t collectorWithoutEventCount = 0u;
+  uint64_t collectorReentryCount = 0u;
+  uint64_t collectorWithoutHookCount = 0u;
+  uint64_t hookWithoutCollectorCount = 0u;
+  uint64_t registryFeedOutsideCollectorCount = 0u;
+  uint64_t unexpectedGroupCount = 0u;
+  uint64_t pairedCaptureDuplicatePublishCount = 0u;
+  uint64_t pairedCaptureLostPublishCount = 0u;
+  uint64_t pairedCaptureSlotMismatchCount = 0u;
+  uint32_t lifetimeCollectorGroupMask = 0u;
+  uint32_t lifetimeHookGroupMask = 0u;
+  uint32_t lifetimeObservedGroupMask = 0u;
+  uint32_t retainedEventExpectedCount = 0u;
+  uint32_t retainedEventCount = 0u;
+  uint32_t missingRetainedEventCount = 0u;
+  WorldObjectsPhase1RawTiming trackingInclusive;
+  WorldObjectsPhase1RawTiming trackingQuery;
+  WorldObjectsPhase1RawTiming trackingDecision;
+  std::array<uint64_t, kWorldObjectsPhase1TrackingReasonCount>
+      reasonCounts{};
+  std::array<WorldObjectsPhase1GroupSummary,
+             kWorldObjectsPhase1GroupCount>
+      groups{};
+  std::array<WorldObjectsPhase1Event,
+             kWorldObjectsPhase1EventSlotCount>
+      events{};
+  bool snapshotStable = false;
+  bool trackingHealthPathClosureClean = false;
+  bool trackingReasonClosureClean = false;
+  bool eventCountClosureClean = false;
+  bool lifecycleClosureClean = false;
+  bool lifetimeObservedGroupsClosureClean = false;
+  bool lifetimeUnobservedGroupsZeroClean = false;
+  bool retainedEventsClosureClean = false;
+  bool overallClosureClean = false;
+};
+
+static_assert(std::is_trivially_copyable<
+                  WorldObjectsPhase1CollectorObservation>::value,
+              "WorldObjects Phase1 observation must remain POD telemetry");
+static_assert(std::is_trivially_copyable<
+                  WorldObjectsPhase1Event>::value,
+              "WorldObjects Phase1 event ring must remain POD telemetry");
+static_assert(std::is_trivially_copyable<
+                  WorldObjectsPhase1TelemetrySummary>::value,
+              "WorldObjects Phase1 snapshot must remain POD telemetry");
+
+bool IsWorldObjectsPhase1CaptureActive(int groupIdx) noexcept;
+bool IsWorldObjectsPhase1CollectorCaptureActive() noexcept;
+extern thread_local uint64_t
+    g_worldObjectsPhase1PurePeriodicDispatchSequence;
+extern thread_local WorldObjectsPhase1DispatchCaptureKind
+    g_worldObjectsPhase1DispatchCaptureKind;
+inline bool IsWorldObjectsPhase1PurePeriodicDispatchCaptureActive() noexcept {
+  return g_worldObjectsPhase1PurePeriodicDispatchSequence != 0u;
+}
+inline uint64_t CurrentWorldObjectsPhase1PurePeriodicDispatchSequence()
+    noexcept {
+  return g_worldObjectsPhase1PurePeriodicDispatchSequence;
+}
+bool BeginWorldObjectsPhase1Collector(int groupIdx) noexcept;
+void CompleteWorldObjectsPhase1Collector(
+    const WorldObjectsPhase1CollectorObservation& observation) noexcept;
+void RecordWorldObjectsPhase1HookInclusive(int groupIdx,
+                                           uint64_t ticks) noexcept;
+void RecordWorldObjectsPhase1RegistryFeed(uint64_t modelTicks,
+                                          uint64_t shadowTicks) noexcept;
+void RecordWorldObjectsPhase1PeriodicDispatch(
+    uint64_t eventSequence, bool special, bool group0Stage,
+    bool worldFastEligibleIgnoringIdentity,
+    bool worldFastBlockedByIdentity) noexcept;
+void RecordWorldObjectsPhase1PeriodicDispatchRoot(
+    uint64_t eventSequence, uint64_t ticks) noexcept;
+void RecordWorldObjectsPhase1PeriodicGetTagStage(
+    uint64_t eventSequence, bool hit, bool conflict,
+    uint32_t probes, uint64_t ticks) noexcept;
+void RecordWorldObjectsPhase1PairedTiming(
+    uint64_t eventSequence, WorldObjectsPhase1PairedTimingStage stage,
+    uint64_t ticks) noexcept;
+void RecordWorldObjectsPhase1PairedQpcReads(
+    uint64_t eventSequence, uint64_t reads) noexcept;
+void RecordWorldObjectsPhase1PairedFlushTopology(
+    uint64_t eventSequence, uint32_t opaqueCount,
+    uint32_t transparentCount) noexcept;
+void RecordWorldObjectsPhase1PairedFlushTerminal(
+    uint64_t eventSequence,
+    WorldObjectsPhase1FlushTerminal terminal) noexcept;
+WorldObjectsPhase1TelemetrySummary QueryWorldObjectsPhase1Telemetry();
 
 void NoteShadowRuntimeRenderObject(const RenderObjectInfo& info);
 void NoteShadowRuntimeRenderObjectsBatch(
@@ -1787,9 +2298,41 @@ void NoteShadowRuntimePose(void* runtimeModelPtr, void* sceneNode, void* unitPtr
                            const Matrix4* worldTransform = nullptr,
                            uint32_t matrixCount = 0,
                            uint64_t matrixHash = 0);
+
+// VS-S1 阴影重放的跨线程累计快照。写端来自唯一 ShadowReceiver，
+// 读端用于 GPU-skin clean-pair；八个字段必须在同一 shared_mutex 下复制。
+struct GpuSkinVsShadowRuntimeCounters {
+  uint64_t directAttempts = 0u;
+  uint64_t directInputRejects = 0u;
+  uint64_t directStateRejects = 0u;
+  uint64_t directDrawsSubmitted = 0u;
+  uint64_t directBindingsCleared = 0u;
+  uint64_t replayDirectional = 0u;
+  uint64_t replayPoint = 0u;
+  uint64_t replayUnknown = 0u;
+};
+
 void NoteShadowSceneStats(const War3ShadowCaptureStats& stats);
+GpuSkinVsShadowRuntimeCounters QueryGpuSkinVsShadowRuntimeCounters();
 void NoteShadowFrameCadenceSample(uint64_t frameIndex,
                                   const War3ShadowCaptureStats& stats);
+// Records the exact, post-policy caster set consumed by both directional and
+// point-shadow rendering. This is deliberately called at the sole replay
+// choke point rather than at producer sites, so an anomalous captured frame
+// can be joined to the actual geometry/backing/world tuple that reached the
+// shadow map. Output is part of the opt-in shadow pose full-trace JSONL.
+void NoteFinalShadowCasterFrame(
+    const War3FrameScene& scene,
+    const std::vector<const War3ShadowCasterDraw*>& draws,
+    uint64_t frameSerial);
+// Records the exact CurrentDraw snapshot consumed by semantic populate before
+// policy, freshness and lease filtering. Unlike the late registry snapshot in
+// the cadence reporter, this survives direct-only slot rotation and therefore
+// lets a missing final caster be attributed to upstream native submission or
+// to a WarVK downstream rejection.
+void NoteCurrentDrawSnapshotFrame(
+    const std::vector<CurrentDrawContractRecord>& records,
+    uint64_t frameSerial);
 void StartShadowPoseFullTrace(uint32_t maxSeconds = 15u,
                               bool includeMatrixBytes = false,
                               uint32_t maxPoseRecords = 0u,
@@ -1816,9 +2359,56 @@ void NoteShadowRuntimeSpriteFramePose(void* runtimeModelPtr, void* spritePtr,
 ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
     bool refreshSemanticFrameIfStale = false);
 ShadowRuntimeBridgeTrackingDecision ComputeShadowRuntimeBridgeTracking();
+void FinalizeWorldObjectsPhase1PreviousFrameWithoutNewDecision() noexcept;
 void ResetShadowRuntimeBridgeState();
 
+struct SemanticAugmentTlsCacheStats {
+  bool enabled = false;
+  bool telemetryEnabled = false;
+  uint32_t capacityPerRegistry = 0u;
+  uint64_t modelLookups = 0u;
+  uint64_t modelHits = 0u;
+  uint64_t modelNegativeHits = 0u;
+  uint64_t modelMisses = 0u;
+  uint64_t modelGenerationMismatches = 0u;
+  uint64_t modelCollisions = 0u;
+  uint64_t shadowLookups = 0u;
+  uint64_t shadowHits = 0u;
+  uint64_t shadowNegativeHits = 0u;
+  uint64_t shadowMisses = 0u;
+  uint64_t shadowGenerationMismatches = 0u;
+  uint64_t shadowCollisions = 0u;
+  uint64_t modelRegistryGeneration = 0u;
+  uint64_t shadowRegistryGeneration = 0u;
+};
+
+// Read-only cumulative telemetry for the fixed-capacity semantic augment TLS
+// caches.  The perf monitor can consume this later without coupling either
+// registry to the report implementation.
+SemanticAugmentTlsCacheStats QuerySemanticAugmentTlsCacheStats() noexcept;
+
+enum class ShadowSemanticAugmentTracePhase : uint8_t {
+  ModelInstance = 0u,
+  ShadowObject,
+  Pose,
+  RenderObject,
+  Finalize,
+};
+
+struct ShadowSemanticAugmentTrace {
+  using EnterFn = void (*)(void*, ShadowSemanticAugmentTracePhase);
+
+  void* context = nullptr;
+  EnterFn enterFn = nullptr;
+
+  inline void enter(ShadowSemanticAugmentTracePhase phase) const {
+    if (enterFn != nullptr)
+      enterFn(context, phase);
+  }
+};
+
 bool AugmentShadowSemanticContext(dxvk::War3ShadowSemanticContext& semantic,
-                                  const RenderObjectInfo* currentObj);
+                                  const RenderObjectInfo* currentObj,
+                                  const ShadowSemanticAugmentTrace* trace = nullptr);
 
 } // namespace dxvk::war3::render

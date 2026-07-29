@@ -100,13 +100,15 @@ public:
     ShadowPrimitiveTopology topology = ShadowPrimitiveTopology::TriangleList;
     Com<IDirect3DVertexBuffer9> positionBuffer;
     Com<IDirect3DIndexBuffer9> indexBuffer;
-    Com<IDirect3DVertexBuffer9> blendBuffer;
+    // blendBuffer removed: it was created in ensureGeometry but never bound by
+    // either DrawPreparedRigidRecord or DrawPreparedSkinnedRecord.
   };
 
   struct PaletteResource {
     uint64_t cacheKey = 0;
     uint64_t matrixHash = 0;
     uint32_t matrixCount = 0;
+    uint64_t lastUsedFrameSerial = 0;
     std::vector<Matrix4> matrices;
   };
 
@@ -139,6 +141,9 @@ public:
 
 private:
   void ensureIdentityPaletteResource();
+  // Drop palette cache entries untouched for a bounded number of frames so the
+  // per-frame-volatile palette key cannot grow the cache without bound.
+  void evictStalePalettes();
 
   IDirect3DDevice9* m_device = nullptr;
   uint64_t m_frameSerial = 0;

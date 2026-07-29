@@ -154,6 +154,9 @@ int32_t War3TeamColorManager::GetIndexFromTexture(
   if (!texture)
     return -1;
 
+  // 与所有姐妹方法一致：读取共享的 m_originalTextures 前先取 m_mutex，避免加载线程
+  // 写入/清空与查询线程之间的数据竞争。m_mutex 已改为 mutable 以支持此 const 访问器。
+  std::lock_guard<std::mutex> lock(m_mutex);
   for (uint32_t i = 0; i < kMaxTeamColors; i++) {
     if (m_originalTextures[i] == texture) {
       return static_cast<int32_t>(i);

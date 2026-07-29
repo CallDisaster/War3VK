@@ -3,7 +3,9 @@
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_memory.h"
 #include "war3_render_objects.h"
+#include "war3_shadow_runtime_bridge.h"
 #include "war3_render_state.h"
+#include "../../../util/util_time.h"
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -12,7 +14,9 @@ namespace dxvk::war3::render {
 
 namespace {
 constexpr size_t kElementStride = 20;
-constexpr size_t kMaxProbes = 16; // 线性探测最大步长
+constexpr size_t kElementLayerIndexOffset = 0x08;
+constexpr size_t kMaxProbes =
+    kWorldObjectsPhase1GetTagStageMaxProbes; // 线性探测最大步长
 constexpr uint8_t kInfoStateUnknown = 0;
 constexpr uint8_t kInfoStateHit = 1;
 constexpr uint8_t kInfoStateMiss = 2;
@@ -84,22 +88,26 @@ void RenderQueueTracker::TrackNewBatches(uint32_t before, int groupIdx) {
   void *batchArray = *m_batchArrayPtr;
 
   War3BatchTag tag = War3BatchTag::Unknown;
+  int stage = -1;
   switch (groupIdx) {
   case 0:
     tag = War3BatchTag::WorldObjects;
+    stage = 11;
     break;
   case 1:
     tag = War3BatchTag::SelectionOverlay;
+    stage = 12;
     break;
   case 2:
     tag = War3BatchTag::Decorations;
+    stage = 13;
     break;
   default:
     break;
   }
 
   if (batchArray && after > before && tag != War3BatchTag::Unknown) {
-    MarkTags(batchArray, before, after, tag);
+    MarkTagStage(batchArray, before, after, tag, stage);
   }
 }
 
@@ -121,70 +129,76 @@ void RenderQueueTracker::Reset() {
       uint64_t iHit = m_infoHit.exchange(0);
       uint64_t iMiss = m_infoMiss.exchange(0);
       uint64_t iFill = m_infoFill.exchange(0);
+      const RenderQueueSemanticConflictStats semanticStats =
+          GetSemanticConflictStats();
       war3dbg::Print("DXVK War3Hook: LockFree Tracker stats hit=%llu miss=%llu "
-                     "infoHit=%llu infoMiss=%llu infoFill=%llu\n",
+                     "infoHit=%llu infoMiss=%llu infoFill=%llu "
+                     "semanticConflict=%llu tagConflict=%llu "
+                     "stageConflict=%llu layerConflict=%llu\n",
                      (unsigned long long)fHit, (unsigned long long)fMiss,
                      (unsigned long long)iHit, (unsigned long long)iMiss,
-                     (unsigned long long)iFill);
+                     (unsigned long long)iFill,
+                     (unsigned long long)semanticStats.conflictingEntries,
+                     (unsigned long long)semanticStats.tagConflicts,
+                     (unsigned long long)semanticStats.stageConflicts,
+                     (unsigned long long)semanticStats.layerConflicts);
     }
   }
 }
 
-void RenderQueueTracker::MarkTags(void *batchArray, uint32_t before,
-                                  uint32_t after, War3BatchTag tag) {
+void RenderQueueTracker::MarkTagStage(void *batchArray, uint32_t before,
+                                      uint32_t after, War3BatchTag tag,
+                                      int stage) {
   if (!batchArray || after <= before)
     return;
 
   auto *base = reinterpret_cast<std::uint8_t *>(batchArray);
   uint32_t currentEpoch = m_epoch.load(std::memory_order_relaxed);
 
-  for (uint32_t i = before; i < after; ++i) {
-    void *element = *reinterpret_cast<void **>(base + i * kElementStride);
-    if (!element)
-      continue;
+  auto addSemanticConflicts = [&](AtomicEntry &entry,
+                                  uint32_t conflictMask) {
+    if (conflictMask == kRenderQueueSemanticConflictNone)
+      return;
 
-    size_t h = HashElementKey(element) & m_mask;
-    for (size_t p = 0; p < kMaxProbes; ++p) {
-      auto &entry = m_entries[(h + p) & m_mask];
-      void *expectedKey = nullptr;
-
-      // 如果槽位为空，尝试抢占
-      if (entry.key.compare_exchange_strong(expectedKey, element,
-                                            std::memory_order_relaxed) ||
-          expectedKey == element) {
-        // 抢占成功或已存在：更新状态
-        entry.state.store(PackState(tag, -1, currentEpoch),
-                          std::memory_order_relaxed);
+    uint32_t observed =
+        entry.semanticConflictStateEpoch.load(std::memory_order_relaxed);
+    uint32_t oldMask = 0;
+    uint32_t conflictEpoch = 0;
+    uint32_t newMask = 0;
+    for (;;) {
+      UnpackSemanticConflictState(observed, oldMask, conflictEpoch);
+      if (conflictEpoch != currentEpoch)
+        oldMask = kRenderQueueSemanticConflictNone;
+      newMask = oldMask | conflictMask;
+      const uint32_t desired =
+          PackSemanticConflictState(newMask, currentEpoch);
+      if (entry.semanticConflictStateEpoch.compare_exchange_weak(
+              observed, desired, std::memory_order_release,
+              std::memory_order_relaxed)) {
         break;
       }
-      // 如果被本帧其他对象抢占，继续探测
-      uint32_t entryState = entry.state.load(std::memory_order_relaxed);
-      uint32_t entryEpoch = (entryState >> 16) & 0xFFFFu;
-      if (entryEpoch != currentEpoch) {
-        // 槽位虽有 key 但属于旧帧，尝试收割
-        if (entry.key.compare_exchange_strong(expectedKey, element,
-                                              std::memory_order_relaxed)) {
-          entry.state.store(PackState(tag, -1, currentEpoch),
-                            std::memory_order_relaxed);
-          break;
-        }
-      }
     }
-  }
-}
 
-void RenderQueueTracker::MarkStages(void *batchArray, uint32_t before,
-                                    uint32_t after, int stage) {
-  if (!batchArray || after <= before)
-    return;
-
-  auto *base = reinterpret_cast<std::uint8_t *>(batchArray);
-  uint32_t currentEpoch = m_epoch.load(std::memory_order_relaxed);
+    const uint32_t addedMask = newMask & ~oldMask;
+    if (addedMask == kRenderQueueSemanticConflictNone)
+      return;
+    if (oldMask == kRenderQueueSemanticConflictNone)
+      m_semanticConflictingEntries.fetch_add(1, std::memory_order_relaxed);
+    if ((addedMask & kRenderQueueSemanticConflictTag) != 0u)
+      m_semanticTagConflicts.fetch_add(1, std::memory_order_relaxed);
+    if ((addedMask & kRenderQueueSemanticConflictStage) != 0u)
+      m_semanticStageConflicts.fetch_add(1, std::memory_order_relaxed);
+    if ((addedMask & kRenderQueueSemanticConflictLayer) != 0u)
+      m_semanticLayerConflicts.fetch_add(1, std::memory_order_relaxed);
+  };
 
   for (uint32_t i = before; i < after; ++i) {
-    void *element = *reinterpret_cast<void **>(base + i * kElementStride);
+    auto *record = base + i * kElementStride;
+    void *element = *reinterpret_cast<void **>(record);
     if (!element)
       continue;
+    const uint32_t layerIndex = *reinterpret_cast<const uint32_t *>(
+        record + kElementLayerIndexOffset);
 
     size_t h = HashElementKey(element) & m_mask;
     for (size_t p = 0; p < kMaxProbes; ++p) {
@@ -192,28 +206,123 @@ void RenderQueueTracker::MarkStages(void *batchArray, uint32_t before,
       void *currentKey = entry.key.load(std::memory_order_relaxed);
 
       if (currentKey == element) {
-        // 如果已存在，更新 stage，保持 tag 和 epoch
-        uint32_t oldState = entry.state.load(std::memory_order_relaxed);
-        War3BatchTag tag;
-        int oldStage;
-        uint32_t oldEpoch;
-        UnpackState(oldState, tag, oldStage, oldEpoch);
+        uint32_t oldEpoch = 0u;
+        War3BatchTag oldTag = War3BatchTag::Unknown;
+        int oldStage = -1;
+        const uint32_t oldState =
+            entry.state.load(std::memory_order_acquire);
+        UnpackState(oldState, oldTag, oldStage, oldEpoch);
 
-        // 仅当是本帧数据时才更新，否则可能会错误覆盖
-        if (oldEpoch == currentEpoch) {
+        if (oldEpoch != currentEpoch) {
+          entry.layerIndex.store(layerIndex, std::memory_order_relaxed);
+          entry.semanticConflictStateEpoch.store(
+              PackSemanticConflictState(kRenderQueueSemanticConflictNone,
+                                        currentEpoch),
+              std::memory_order_relaxed);
           entry.state.store(PackState(tag, stage, currentEpoch),
-                            std::memory_order_relaxed);
+                            std::memory_order_release);
+          break;
+        }
+
+        // Nested producers may revisit one renderablePart before Reset. Keep
+        // the first known tuple canonical and make any disagreement sticky.
+        War3BatchTag mergedTag = oldTag;
+        int mergedStage = oldStage;
+        uint32_t mergedLayer =
+            entry.layerIndex.load(std::memory_order_relaxed);
+        uint32_t conflictMask = kRenderQueueSemanticConflictNone;
+
+        if (tag != War3BatchTag::Unknown) {
+          if (oldTag == War3BatchTag::Unknown)
+            mergedTag = tag;
+          else if (oldTag != tag)
+            conflictMask |= kRenderQueueSemanticConflictTag;
+        }
+        if (stage >= 0) {
+          if (oldStage < 0)
+            mergedStage = stage;
+          else if (oldStage != stage)
+            conflictMask |= kRenderQueueSemanticConflictStage;
+        }
+        if (layerIndex != kRenderQueueUnknownLayerIndex) {
+          if (mergedLayer == kRenderQueueUnknownLayerIndex)
+            mergedLayer = layerIndex;
+          else if (mergedLayer != layerIndex)
+            conflictMask |= kRenderQueueSemanticConflictLayer;
+        }
+
+        entry.layerIndex.store(mergedLayer, std::memory_order_relaxed);
+        addSemanticConflicts(entry, conflictMask);
+        if (mergedTag != oldTag || mergedStage != oldStage) {
+          entry.state.store(PackState(mergedTag, mergedStage, currentEpoch),
+                            std::memory_order_release);
+        }
+        break;
+      }
+
+      bool reclaimable = currentKey == nullptr;
+      if (!reclaimable) {
+        const uint32_t entryState =
+            entry.state.load(std::memory_order_relaxed);
+        reclaimable = ((entryState >> 16) & 0xFFFFu) != currentEpoch;
+      }
+      if (reclaimable) {
+        void *expectedKey = currentKey;
+        if (entry.key.compare_exchange_strong(expectedKey, element,
+                                              std::memory_order_relaxed)) {
+          entry.layerIndex.store(layerIndex, std::memory_order_relaxed);
+          entry.semanticConflictStateEpoch.store(
+              PackSemanticConflictState(kRenderQueueSemanticConflictNone,
+                                        currentEpoch),
+              std::memory_order_relaxed);
+          entry.state.store(PackState(tag, stage, currentEpoch),
+                            std::memory_order_release);
           break;
         }
       }
-      if (currentKey == nullptr)
-        break;
     }
   }
 }
 
+void RenderQueueTracker::MarkTags(void *batchArray, uint32_t before,
+                                  uint32_t after, War3BatchTag tag) {
+  MarkTagStage(batchArray, before, after, tag, -1);
+}
+
+void RenderQueueTracker::MarkStages(void *batchArray, uint32_t before,
+                                    uint32_t after, int stage) {
+  MarkTagStage(batchArray, before, after, War3BatchTag::Unknown, stage);
+}
+
 bool RenderQueueTracker::GetTagStage(void *element, War3BatchTag &outTag,
                                      int &outStage) const {
+  const uint64_t periodicEventSequence =
+      CurrentWorldObjectsPhase1PurePeriodicDispatchSequence();
+  const bool periodicCapture = periodicEventSequence != 0u;
+  const int64_t begin = periodicCapture
+      ? dxvk::high_resolution_clock::get_counter()
+      : 0;
+  RenderQueueSemanticState state = {};
+  uint32_t probes = 0u;
+  const bool hit = periodicCapture
+      ? GetSemanticStateWithProbeCount(element, state, probes)
+      : GetSemanticState(element, state);
+  if (periodicCapture) {
+    const int64_t end = dxvk::high_resolution_clock::get_counter();
+    RecordWorldObjectsPhase1PeriodicGetTagStage(
+        periodicEventSequence, hit, hit && state.HasConflict(), probes,
+        end >= begin ? uint64_t(end - begin) : 0u);
+  }
+  if (!hit)
+    return false;
+  outTag = state.tag;
+  outStage = state.stage;
+  return true;
+}
+
+bool RenderQueueTracker::GetSemanticState(
+    void *element, RenderQueueSemanticState &outState) const {
+  outState = {};
   if (!element)
     return false;
 
@@ -224,14 +333,40 @@ bool RenderQueueTracker::GetTagStage(void *element, War3BatchTag &outTag,
     const auto &entry = m_entries[(h + p) & m_mask];
     void *k = entry.key.load(std::memory_order_relaxed);
     if (k == element) {
-      uint32_t s = entry.state.load(std::memory_order_relaxed);
-      War3BatchTag t;
-      int st;
-      uint32_t ep;
-      UnpackState(s, t, st, ep);
-      if (ep == currentEpoch) {
-        outTag = t;
-        outStage = st;
+      for (uint32_t attempt = 0; attempt < 2u; ++attempt) {
+        const uint32_t stateBefore =
+            entry.state.load(std::memory_order_acquire);
+        War3BatchTag tag = War3BatchTag::Unknown;
+        int stage = -1;
+        uint32_t epoch = 0;
+        UnpackState(stateBefore, tag, stage, epoch);
+        if (epoch != currentEpoch)
+          break;
+
+        const uint32_t layerIndex =
+            entry.layerIndex.load(std::memory_order_relaxed);
+        const uint32_t conflictState =
+            entry.semanticConflictStateEpoch.load(std::memory_order_acquire);
+        const uint32_t stateAfter =
+            entry.state.load(std::memory_order_acquire);
+        if (stateBefore != stateAfter)
+          continue;
+
+        uint32_t conflictMask = kRenderQueueSemanticConflictNone;
+        uint32_t conflictEpoch = 0;
+        UnpackSemanticConflictState(conflictState, conflictMask,
+                                    conflictEpoch);
+        if (conflictEpoch != currentEpoch ||
+            m_epoch.load(std::memory_order_relaxed) != currentEpoch ||
+            entry.key.load(std::memory_order_relaxed) != element) {
+          break;
+        }
+
+        outState.tag = tag;
+        outState.stage = stage;
+        outState.layerIndex = layerIndex;
+        outState.conflictMask = conflictMask;
+        outState.epoch = epoch;
         if (dxvk::war3::internal::kNativeRenderQueueTrackerStatsEnabled) {
           m_fastHit.fetch_add(1, std::memory_order_relaxed);
         }
@@ -246,6 +381,90 @@ bool RenderQueueTracker::GetTagStage(void *element, War3BatchTag &outTag,
     m_fastMiss.fetch_add(1, std::memory_order_relaxed);
   }
   return false;
+}
+
+bool RenderQueueTracker::GetSemanticStateWithProbeCount(
+    void *element, RenderQueueSemanticState &outState,
+    uint32_t &outProbeCount) const {
+  // This is intentionally a capture-only mirror of GetSemanticState.  The
+  // production lookup above stays branch-free: it must not pay an optional
+  // probe-counter test on every GPU-skin semantic lookup merely to diagnose
+  // one pure periodic frame out of 300.
+  outState = {};
+  outProbeCount = 0u;
+  if (!element)
+    return false;
+
+  size_t h = HashElementKey(element) & m_mask;
+  uint32_t currentEpoch = m_epoch.load(std::memory_order_relaxed);
+
+  for (size_t p = 0; p < kMaxProbes; ++p) {
+    outProbeCount += 1u;
+    const auto &entry = m_entries[(h + p) & m_mask];
+    void *k = entry.key.load(std::memory_order_relaxed);
+    if (k == element) {
+      for (uint32_t attempt = 0; attempt < 2u; ++attempt) {
+        const uint32_t stateBefore =
+            entry.state.load(std::memory_order_acquire);
+        War3BatchTag tag = War3BatchTag::Unknown;
+        int stage = -1;
+        uint32_t epoch = 0;
+        UnpackState(stateBefore, tag, stage, epoch);
+        if (epoch != currentEpoch)
+          break;
+
+        const uint32_t layerIndex =
+            entry.layerIndex.load(std::memory_order_relaxed);
+        const uint32_t conflictState =
+            entry.semanticConflictStateEpoch.load(std::memory_order_acquire);
+        const uint32_t stateAfter =
+            entry.state.load(std::memory_order_acquire);
+        if (stateBefore != stateAfter)
+          continue;
+
+        uint32_t conflictMask = kRenderQueueSemanticConflictNone;
+        uint32_t conflictEpoch = 0;
+        UnpackSemanticConflictState(conflictState, conflictMask,
+                                    conflictEpoch);
+        if (conflictEpoch != currentEpoch ||
+            m_epoch.load(std::memory_order_relaxed) != currentEpoch ||
+            entry.key.load(std::memory_order_relaxed) != element) {
+          break;
+        }
+
+        outState.tag = tag;
+        outState.stage = stage;
+        outState.layerIndex = layerIndex;
+        outState.conflictMask = conflictMask;
+        outState.epoch = epoch;
+        if (dxvk::war3::internal::kNativeRenderQueueTrackerStatsEnabled) {
+          m_fastHit.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+      }
+    }
+    if (k == nullptr)
+      break;
+  }
+
+  if (dxvk::war3::internal::kNativeRenderQueueTrackerStatsEnabled) {
+    m_fastMiss.fetch_add(1, std::memory_order_relaxed);
+  }
+  return false;
+}
+
+RenderQueueSemanticConflictStats
+RenderQueueTracker::GetSemanticConflictStats() const {
+  RenderQueueSemanticConflictStats stats = {};
+  stats.conflictingEntries =
+      m_semanticConflictingEntries.load(std::memory_order_relaxed);
+  stats.tagConflicts =
+      m_semanticTagConflicts.load(std::memory_order_relaxed);
+  stats.stageConflicts =
+      m_semanticStageConflicts.load(std::memory_order_relaxed);
+  stats.layerConflicts =
+      m_semanticLayerConflicts.load(std::memory_order_relaxed);
+  return stats;
 }
 
 bool RenderQueueTracker::GetTag(void *element, War3BatchTag &outTag) const {

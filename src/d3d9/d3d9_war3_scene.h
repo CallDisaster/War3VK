@@ -1,6 +1,7 @@
 #pragma once
 
 #include "war3/render/war3_render_state.h"
+#include "war3/gpu_skin/war3_gpu_skin_types.h"
 
 #include "../dxvk/dxvk_buffer.h"
 #include "../dxvk/dxvk_image.h"   // 用于 Rc<DxvkImageView> (Alpha测试阴影)
@@ -14,6 +15,14 @@
 
 namespace dxvk {
 
+    // Diagnostic histogram contract for the native render stages attached to
+    // accepted shadow casters. Bins 0..31 map to the engine stage verbatim;
+    // the last bin collects negative and out-of-range stages.
+    constexpr size_t kWar3ShadowStageHistogramStageCount = 32u;
+    constexpr size_t kWar3ShadowStageHistogramBinCount =
+        kWar3ShadowStageHistogramStageCount + 1u;
+    constexpr size_t kWar3ShadowCategoryHistogramBinCount = 7u;
+
     struct War3WorldCameraState {
         bool valid = false;
         Matrix4 view;
@@ -23,16 +32,63 @@ namespace dxvk {
         // 用于深度重建与 UI 区域裁剪的主世界 viewport/scissor
         D3DVIEWPORT9 viewport = { };
         RECT scissor = { };
+        // 0..2 resource slot retained for same-frame state diagnostics only.
         uint32_t frameIndex = 0;
+        // Monotonic frame in which these matrices were actually captured.
+        uint64_t frameSerial = 0;
     };
+
+    // A single immediately preceding perspective capture may bridge a
+    // transient orthographic/overlay frame. Anything older must not be paired
+    // with current depth or re-published to post effects.
+    constexpr uint64_t kWar3WorldCameraFallbackMaxAgeFrames = 1u;
+
+    inline bool War3WorldCameraIsFreshForFrame(
+        const War3WorldCameraState& camera, uint64_t currentFrameSerial) {
+      return camera.valid && currentFrameSerial != 0u &&
+          camera.frameSerial != 0u &&
+          camera.frameSerial <= currentFrameSerial &&
+          currentFrameSerial - camera.frameSerial <=
+              kWar3WorldCameraFallbackMaxAgeFrames;
+    }
 
     struct War3ShadowMatrixPalette {
         uint64_t hash = 0;
         std::array<Matrix4, 256> worldMatrices = { };
     };
 
+    // VS-S1 阴影重放只持有 generation-pinned 输入的值语义和强引用。
+    // compute 输出 VB 仍留在 War3ShadowCasterDraw 中，任何校验失败都可原路兜底。
+    struct War3GpuSkinDrawInput {
+        war3::gpu_skin::GpuSkinInputLeaseDesc desc = {};
+        DxvkBufferSlice staticSource;
+        DxvkBufferSlice palette;
+        uint64_t storageLeaseId = 0u;
+        uint64_t storagePageGeneration = 0u;
+        uint32_t storagePageId = 0u;
+        // true 仅用于 VS-B1：CPU kernel 已跳过，shader/caster 不得回到
+        // 原生动态位置 VB。
+        bool irreversible = false;
+        bool valid = false;
+
+        explicit operator bool() const noexcept {
+            return valid && staticSource.defined() && palette.defined() &&
+                   storageLeaseId != 0u && storagePageGeneration != 0u &&
+                   storagePageId != 0u;
+        }
+    };
+
+    enum class War3ShadowPartLifecycleState : uint8_t {
+        RequiredCurrent = 0u,
+        OptionalHistorical = 1u,
+        GraceOneFrame = 2u,
+        Tombstoned = 3u,
+    };
+
     struct War3ShadowCasterDraw {
         bool indexed = true;
+
+        War3GpuSkinDrawInput gpuSkinInput = {};
 
         // Vertex input (position only)
         // 注意：DXVK 的 D3D9 buffer 可能在同一帧内被 invalidate（更换 VkBuffer backing）。
@@ -93,6 +149,33 @@ namespace dxvk {
         uint32_t uvStride = 0;              // UV步长
         uint32_t uvOffset = 0;              // UV偏移
         VkFormat uvFormat = VK_FORMAT_UNDEFINED;  // UV格式
+        // Vertex-input binding that owns location 3. Binding 0 aliases the
+        // position stream, binding 1 aliases the blend stream, and binding 2
+        // is an independently captured UV stream.
+        uint32_t uvBinding = 0;
+
+        bool HasUsableUvBinding() const {
+            if (uvFormat == VK_FORMAT_UNDEFINED || uvStride == 0u ||
+                uvOffset >= uvStride ||
+                uvBinding > 2u)
+                return false;
+            if (uvBinding == 0u) {
+                return positionInfo.buffer != VK_NULL_HANDLE &&
+                       positionInfo.size != 0u &&
+                       uvStride == positionStride;
+            }
+            if (uvStorage == nullptr || uvInfo.buffer == VK_NULL_HANDLE ||
+                uvInfo.size == 0u)
+                return false;
+            if (uvBinding == 1u && blendBinding == 1u) {
+                return blendStorage != nullptr &&
+                       blendInfo.buffer == uvInfo.buffer &&
+                       blendInfo.offset == uvInfo.offset &&
+                       blendInfo.size == uvInfo.size &&
+                       blendStride == uvStride;
+            }
+            return true;
+        }
 
         // 漫反射纹理 (Stage 0 纹理，用于读取Alpha通道)
         Rc<DxvkImageView> diffuseTexture;   // 纹理视图 (Ref Count)
@@ -103,13 +186,27 @@ namespace dxvk {
         // 分类信息（用于调试/过滤）
         War3RenderState::StageCategory category = War3RenderState::StageCategory::Unknown;
         War3BatchTag batchTag = War3BatchTag::Unknown;
+        int16_t stage = -1;
         uint32_t batchHandle = 0; // jHandle（来自 ExecBatch TLS），用于描边筛选
         uint8_t objectKind = 0;   // dxvk::war3::render::ObjectKind
+        bool pathBlocker = false; // 已在 producer 端识别为路径/视野阻断器
+        bool pathBlockerGeometryMarker = false; // LOSBlocker.mdl-like tiny hidden marker geometry
         // 2026-05-31：caster 自带身份，供 finalize 阶段权威 path blocker 清扫。
         // 各 append 站点已解析的 rawcode/jHandle 直接写入，draw-time consumer
         // 无需依赖 widget cache 反查。
         uint32_t rawcode = 0;
         uint32_t jHandle = 0;
+
+        // Metadata-only producer evidence. These fields are diagnostic and
+        // cannot be used to manufacture/replay geometry.
+        void* shadowRenderablePart = nullptr;
+        uint32_t shadowLayerIndex = 0u;
+        uint64_t shadowMetadataKeyHash = 0u;
+        uint64_t alphaMetadataFrameSerial = 0u;
+        uint8_t shadowMetadataBlockerReason = 0u;
+        War3ShadowPartLifecycleState shadowPartLifecycleState =
+            War3ShadowPartLifecycleState::RequiredCurrent;
+        bool alphaPayloadComplete = false;
 
         // ===== 级联阴影剔除（粗略包围球）=====
         // 说明：用于 CPU 端对每个 CSM 级联做保守剔除，减少“每级联全量重放”的 drawcall 膨胀。
@@ -148,6 +245,7 @@ namespace dxvk {
             static_cast<war3::render::ObjectKind>(0);
         War3BatchTag tag = War3BatchTag::Unknown;
         int stage = -1;
+        bool pathBlocker = false;
 
         bool HasStableIdentity() const {
             return renderablePart != nullptr || sceneNode != nullptr ||
@@ -209,6 +307,7 @@ namespace dxvk {
         bool indexed = true;
         bool vertexBlendEnabled = false;
         bool vertexBlendIndexed = false;
+        bool pathBlockerGeometryMarker = false;
         uint8_t vertexBlendCount = 0;
         VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         uint32_t indexCount = 0;
@@ -267,6 +366,68 @@ namespace dxvk {
         uint32_t capturedIndexed = 0;
         uint32_t capturedNonIndexed = 0;
         uint32_t capturedTerrain = 0;
+        // Populated only when DXVK_WAR3_SHADOW_STAGE_HISTOGRAM=1. This is an
+        // exact per-frame census over the finalized shadowCasters vector, not
+        // a sampled hot-hook counter. It lets a final-frame screenshot be
+        // correlated with the producer stage that disappeared.
+        std::array<uint32_t, kWar3ShadowStageHistogramBinCount>
+            shadowCasterStageHistogram = {};
+        std::array<uint32_t, kWar3ShadowCategoryHistogramBinCount>
+            shadowCasterCategoryHistogram = {};
+        // Diagnostic-only Stage13 continuity chain. Stage13 is native
+        // WorldObjects group 2 (decorations/effects), which is the actual
+        // producer family used by the bridge/ramp test map. These counters
+        // distinguish "the draw never reached capture" from a demand gate,
+        // an already-committed BeforeUi boundary, or a later caster filter.
+        uint32_t stage13CaptureAttemptCount = 0;
+        uint32_t stage13CaptureRejectedNoDemandCount = 0;
+        uint32_t stage13CaptureRejectedAfterBeforeUiCount = 0;
+        uint32_t stage13CaptureConsideredCount = 0;
+        uint32_t beforeUiStage13BoundaryCandidateCount = 0;
+        uint32_t beforeUiStage13BoundaryCommitCount = 0;
+        // Stage13 retained-caster identity diagnostics. These are exact
+        // per-frame counters, intentionally kept outside sampled perf scopes:
+        // they explain whether the O(1) source-generation key is unavailable,
+        // cold/churning, or actually avoiding the referenced-byte scan.
+        uint32_t stage13RetentionBaseEligibleCount = 0;
+        uint32_t stage13SourcePositionInvalidCount = 0;
+        uint32_t stage13SourceIndexInvalidCount = 0;
+        uint32_t stage13SourceIdentityValidCount = 0;
+        uint32_t stage13SourceIdentityHitCount = 0;
+        uint32_t stage13SourceIdentityMissCount = 0;
+        uint32_t stage13StrongScanCount = 0;
+        uint32_t stage13SnapshotBuildCount = 0;
+        uint32_t stage13SnapshotContentRekeyCount = 0;
+        // Byte traffic for the production current-frame lane and the
+        // diagnostic-only retained lane. These stay separate so an A/B report
+        // cannot confuse GPU freeze copies with host snapshot materialization.
+        uint64_t stage13FreezeCopyBytes = 0;
+        uint64_t stage13CpuSnapshotCopyBytes = 0;
+        uint64_t stage13RetentionSnapshotBytes = 0;
+        uint32_t stage13RetainedEntryCountMax = 0;
+        uint32_t stage13RetainedContentMatchCount = 0;
+        uint32_t stage13RetainedIdentityMatchCount = 0;
+        uint32_t stage13RetainedWorldMatchCount = 0;
+        uint32_t stage13RetainedMaterialMatchCount = 0;
+        uint32_t stage13RetainedLayoutMatchCount = 0;
+        uint32_t stage13RetainedAllSemanticMatchCount = 0;
+        // Stage-specific terrain gauges. Stage 10 remains the native terrain
+        // doodad lane and Stage1 is ordinary terrain. Bridge/ramp objects in
+        // the dedicated test map were subsequently proven to use Stage13;
+        // their independent continuity counters live above.
+        uint32_t terrainDoodadCaptureAttemptCount = 0;
+        uint32_t terrainDoodadCaptureAcceptedCount = 0;
+        uint32_t terrainDoodadDynamicSourceCount = 0;
+        uint32_t terrainDoodadWorldIdentityLikeCount = 0;
+        uint32_t terrainDoodadWorldNonIdentityCount = 0;
+        uint32_t terrainS1CaptureAttemptCount = 0;
+        uint32_t terrainS1CaptureAcceptedCount = 0;
+        uint32_t terrainS1WorldIdentityLikeCount = 0;
+        uint32_t terrainS1WorldNonIdentityCount = 0;
+        uint32_t terrainS1WorldNonFiniteCount = 0;
+        uint32_t terrainS1ForceIdentityWorldCount = 0;
+        uint64_t terrainS1WorldMatrixHash = 0;
+        uint64_t terrainS1WorldTranslationMilliMax = 0;
         uint32_t capturedWorldObject = 0;
         uint32_t capturedUnitObject = 0;
         uint32_t capturedUnitVertexBlend = 0;
@@ -382,6 +543,16 @@ namespace dxvk {
         uint32_t drawTimeVBCacheConsumeMissCount = 0;
         // Phase 7.55 v4：诊断 capture path 早退原因
         uint32_t drawTimeVBCacheRejectNoRenderablePart = 0;
+        // A renderable part may contain several independent layers. Capturing
+        // without the authoritative dispatch/GPU-skin layer would recreate
+        // the old cross-layer VB/IB overwrite bug, so such draws fail closed.
+        uint32_t drawTimeVBCacheRejectNoLayerContext = 0;
+        uint32_t drawTimeVBCacheRejectContractLookup = 0;
+        uint32_t drawTimeVBCacheRejectContractFreshness = 0;
+        uint32_t drawTimeVBCacheRejectContractStage = 0;
+        uint32_t drawTimeVBCacheRejectContractRenderFrame = 0;
+        uint32_t drawTimeVBCacheRejectContractInstance = 0;
+        uint32_t drawTimeVBCacheRejectContractSlice = 0;
         uint32_t drawTimeVBCacheRejectNoDecl = 0;
         uint32_t drawTimeVBCacheRejectNoPosition = 0;
         uint32_t drawTimeVBCacheRejectInvalidStride = 0;
@@ -389,6 +560,10 @@ namespace dxvk {
         uint32_t drawTimeVBCacheRejectInvalidRange = 0;
         uint32_t drawTimeVBCacheRejectInsufficientLength = 0;
         uint32_t drawTimeVBCacheRejectNoBuffer = 0;
+        // Original draw was indexed, but its mandatory IB backing was not
+        // captured. The entry stays incomplete and must not be submitted as a
+        // non-indexed fallback.
+        uint32_t drawTimeVBCacheRejectIncompleteIndex = 0;
         uint32_t drawTimeVBCacheTotalEntered = 0;
         // Phase 7.69：draw-time GPU copy 成本账本。semantic 路线为了 Pose 正确
         // 每帧冻结 War3 当帧 VB/IB slice；这里记录 copy 命令数、字节数和 buffer
@@ -412,6 +587,20 @@ namespace dxvk {
         uint32_t drawTimeVBCacheAlphaTestStateCaptureCount = 0;
         uint32_t drawTimeVBCacheAlphaBlendStateCaptureCount = 0;
         uint32_t drawTimeVBCacheDiffuseTextureCaptureCount = 0;
+        uint32_t gpuSkinShadowBackingHitCount = 0;
+        uint32_t gpuSkinShadowBackingRejectCount = 0;
+        uint32_t gpuSkinShadowBackingFallbackCount = 0;
+        uint64_t gpuSkinShadowSkippedCpuCopyBytes = 0;
+        // VS-S1 阴影重放累计账本。顺序与 AutoTest 的
+        // shadowDirect / shadowReplay schema 完全一致。
+        uint64_t gpuSkinVsShadowDirectAttempts = 0u;
+        uint64_t gpuSkinVsShadowDirectInputRejects = 0u;
+        uint64_t gpuSkinVsShadowDirectStateRejects = 0u;
+        uint64_t gpuSkinVsShadowDirectDrawsSubmitted = 0u;
+        uint64_t gpuSkinVsShadowDirectBindingsCleared = 0u;
+        uint64_t gpuSkinVsShadowReplayDirectional = 0u;
+        uint64_t gpuSkinVsShadowReplayPoint = 0u;
+        uint64_t gpuSkinVsShadowReplayUnknown = 0u;
         // Phase 7.70：同帧重复捕获去重账本。
         // SameFrameDedupHit 是命中“数据指纹未变”的次数（跳过 GPU copy）。
         // SameFrameDedupMiss 是数据真的变了，必须重做 GPU copy 的次数。
@@ -421,9 +610,17 @@ namespace dxvk {
         uint32_t drawTimeVBCacheSameFrameStateRefresh = 0;
         uint32_t drawTimeSemanticProducerVisibleCandidateCount = 0;
         uint32_t drawTimeSemanticProducerFreshEntryCount = 0;
+        uint32_t drawTimeSemanticProducerClaimedCount = 0;
         uint32_t drawTimeSemanticProducerSubmittedCount = 0;
         uint32_t drawTimeSemanticProducerMissNoFreshEntryCount = 0;
         uint32_t drawTimeSemanticProducerFallbackCurrentDrawCount = 0;
+        // Stage11 current-frame geometry is authoritative whenever its
+        // producer has already submitted (or explicitly rejected) the exact
+        // logical slice.  Count generic records suppressed by that ownership
+        // decision so runtime gates can prove that the two representations no
+        // longer alternate for the same part.
+        uint32_t drawTimeSemanticProducerOwnedDirectGroupedSkipCount = 0;
+        uint32_t drawTimeSemanticProducerLifecycleMergedCount = 0;
         uint32_t semanticSceneRejectedPathBlockerCount = 0;
         // Phase 7.73：路径阻断器拒绝来源分桶。每个 reject 站点用独立 counter，
         // 让 full trace 能直接指认 path blocker 走的是哪条出口。
@@ -449,6 +646,15 @@ namespace dxvk {
         uint32_t semanticSceneRejectedPathBlockerLegacyCaptureCount = 0;
         uint32_t semanticSceneDirectDrawTimePrebuildBypassAttemptCount = 0;
         uint32_t semanticSceneDirectDrawTimePrebuildBypassHitCount = 0;
+        // fast-append bounds 数据源一致性探针。Pose 来自本次 draw 捕获时已经
+        // 完成的 semantic augment；SceneRead 是原有 sceneNode + VirtualQuery 路径。
+        uint32_t semanticSceneFastAppendBoundsPoseAvailableCount = 0;
+        uint32_t semanticSceneFastAppendBoundsSceneReadSuccessCount = 0;
+        uint32_t semanticSceneFastAppendBoundsPoseDeltaLe1Count = 0;
+        uint32_t semanticSceneFastAppendBoundsPoseDeltaLe4Count = 0;
+        uint32_t semanticSceneFastAppendBoundsPoseDeltaLe16Count = 0;
+        uint32_t semanticSceneFastAppendBoundsPoseDeltaGt16Count = 0;
+        uint32_t semanticSceneFastAppendBoundsPoseDeltaMaxMilli = 0;
         uint32_t semanticSceneSubmittedPaletteMotionSampleCount = 0;
         uint32_t semanticSceneSubmittedPaletteMotionNewRuntimeCount = 0;
         uint32_t semanticSceneSubmittedPaletteMotionChangedCount = 0;
@@ -585,6 +791,13 @@ namespace dxvk {
         uint32_t semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount = 0; // 本帧 live+lease 仍无法覆盖 committed core 的 object 数
         uint32_t semanticSceneShadowManifestObjectCoreEpochMissingPartCount = 0; // 本帧因 core 缺件被跳过的 part 总数
         uint32_t semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount = 0; // restored/leased packet 尝试自续 committed core 被拒绝的次数
+        uint32_t semanticSceneShadowManifestCorePartPrunedOnLeaseExpiryCount = 0; // lease 确认失效时同步从 committed/observation core 精确移除的 part 数
+        uint32_t semanticSceneShadowManifestCoreObjectEmptiedOnLeaseExpiryCount = 0; // lease 失效收缩后不再含任何 core/observation part 的 object 数
+        uint32_t semanticSceneShadowManifestLeaseExpiredBackingOnlyCount = 0; // lease expiry 仅释放 packet/backing，不改 authoritative core
+        uint32_t semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount = 0; // 连续两帧 authoritative live manifest 缺席后退休
+        uint32_t semanticSceneShadowManifestMissingRequiredPartCount = 0; // 当前 group 缺少 committed required part；仅跳过该 part
+        uint32_t semanticSceneShadowManifestGraceUsedCount = 0; // 使用一帧 self-contained grace 的 part 数
+        uint32_t semanticSceneShadowManifestTombstoneRetiredCount = 0; // 权威 tombstone 立即退休的记录数
         // Phase 7.28：skinned palette content stability probe。
         // 当 `semanticSceneSubmittedSkinned` > 0 时，这些计数反映本帧提交的
         // skinned packet 的 palette 稳定性与来源分布。
@@ -716,6 +929,9 @@ namespace dxvk {
         uint32_t semanticSceneShadowManifestCModelPoseHitCount = 0;
         uint32_t semanticSceneShadowManifestCModelPoseMissCount = 0;
         uint32_t semanticSceneShadowManifestCModelPoseNoRuntimeCount = 0;
+        uint64_t
+            semanticSceneShadowManifestPoseFreshGenerationVerifierMismatchCount =
+                0;
         uint64_t semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr = 0;
         uint32_t semanticSceneShadowManifestCModelPoseLastMatrixCount = 0;
         uint64_t semanticSceneShadowManifestCModelPoseLastMatrixHash = 0;
@@ -773,6 +989,8 @@ namespace dxvk {
         uint32_t semanticSceneShadowMapDynamicPreparedCount = 0;      // Unit/Effect/skinned prepared draw 数
         uint32_t semanticSceneShadowMapStaticPreparedCount = 0;       // Building/Destructible/Terrain prepared draw 数
         uint32_t semanticSceneShadowMapOtherPreparedCount = 0;        // 其他分类 prepared draw 数
+        uint32_t semanticSceneShadowMapTerrainDoodadPreparedCount = 0;
+        uint32_t semanticSceneShadowMapTerrainS1PreparedCount = 0;
         uint32_t semanticSceneShadowMapCascade0DrawnCount = 0;
         uint32_t semanticSceneShadowMapCascade1DrawnCount = 0;
         uint32_t semanticSceneShadowMapCascade2DrawnCount = 0;
@@ -781,6 +999,14 @@ namespace dxvk {
         uint32_t semanticSceneShadowMapCascade1CulledCount = 0;
         uint32_t semanticSceneShadowMapCascade2CulledCount = 0;
         uint32_t semanticSceneShadowMapCascade3CulledCount = 0;
+        uint32_t semanticSceneShadowMapTerrainDoodadCascade0DrawnCount = 0;
+        uint32_t semanticSceneShadowMapTerrainDoodadCascade1DrawnCount = 0;
+        uint32_t semanticSceneShadowMapTerrainDoodadCascade2DrawnCount = 0;
+        uint32_t semanticSceneShadowMapTerrainDoodadCascade3DrawnCount = 0;
+        uint32_t semanticSceneShadowMapTerrainS1Cascade0DrawnCount = 0;
+        uint32_t semanticSceneShadowMapTerrainS1Cascade1DrawnCount = 0;
+        uint32_t semanticSceneShadowMapTerrainS1Cascade2DrawnCount = 0;
+        uint32_t semanticSceneShadowMapTerrainS1Cascade3DrawnCount = 0;
         uint32_t semanticSceneShadowMapSkinnedCasterCount = 0;        // replay 中的 skinned caster 数
         uint32_t semanticSceneShadowMapSkinnedPreparedCount = 0;      // 实际 prepared 的 skinned 数
         uint32_t semanticSceneShadowMapSkinnedInvalidBufferCount = 0; // skinned replay 因 buffer 无效被拒绝
@@ -833,6 +1059,23 @@ namespace dxvk {
         uint64_t semanticSceneShadowMatrixBufferOffset = 0;      // active SSBO slice offset
         uint64_t semanticSceneShadowMatrixBufferSize = 0;        // active SSBO slice size
         uint64_t semanticSceneShadowMatrixBufferGpuAddress = 0;  // active SSBO GPU address when available
+        // Diagnostic-only continuity fingerprints. These remain zero unless
+        // DXVK_WAR3_CSM_CONTINUITY_TRACE=1. They intentionally separate
+        // camera/sun/CSM movement from Stage13 draw content and rotating GPU
+        // backing so a bridge/ramp pop can be correlated to the exact domain
+        // that changed on the captured frame.
+        uint64_t semanticSceneReceiverCameraHash = 0;
+        uint64_t semanticSceneReceiverSunDirectionHash = 0;
+        uint64_t semanticSceneReceiverCsmHash = 0;
+        uint64_t semanticSceneReceiverCameraDeltaNano = 0;
+        uint64_t semanticSceneReceiverSunDeltaNano = 0;
+        uint64_t semanticSceneReceiverCsmDeltaNano = 0;
+        uint64_t semanticSceneReceiverSnappedCenterDeltaTexelsNano = 0;
+        uint64_t semanticSceneReceiverTexelSizeDeltaNano = 0;
+        uint64_t semanticSceneReplayBackingHash = 0;
+        uint64_t semanticSceneStage13ReplayContentHash = 0;
+        uint64_t semanticSceneStage13ReplayBackingHash = 0;
+        uint32_t semanticSceneStage13ReplayDrawCount = 0;
         uint64_t semanticSceneShadowMapRenderSerial = 0;         // advances only after renderShadowMap succeeds
         uint64_t semanticSceneShadowMapImagePtr = 0;             // DxvkImage object pointer id
         uint64_t semanticSceneShadowMapSampleViewPtr = 0;        // DxvkImageView object pointer id
@@ -844,11 +1087,14 @@ namespace dxvk {
         uint64_t semanticSceneShadowHistoryWriteViewPtr = 0;     // history storage view written by this frame
         uint32_t semanticSceneShadowVisibilityExecutedThisFrame = 0; // ShadowTAA visibility prepass actually ran
         uint32_t semanticSceneReceiverDrawExecutedThisFrame = 0;     // fullscreen receiver actually drew
-        uint32_t semanticSceneShadowTaaMode = 0;                 // 0 off, 1 current-only, 2 current+history
+        uint32_t semanticSceneShadowTaaMode = 0;                 // 0 DirectInline, 1 PrepassCurrentOnly, 2 TemporalCurrentOnly, 3 TemporalHistory
         uint32_t semanticSceneShadowHistoryValidBefore = 0;      // history validity before receiver draw
         uint32_t semanticSceneShadowHistoryValidAfter = 0;       // history validity after receiver draw
         uint32_t semanticSceneShadowHistoryReadIndex = 0;        // ping-pong read index used by this frame
         uint32_t semanticSceneShadowHistoryWriteIndex = 0;       // ping-pong write index used by this frame
+        uint32_t semanticSceneShadowHistoryAdvancedThisFrame = 0; // receiver really wrote and committed history
+        uint32_t semanticSceneShadowHistoryAdvanceSkippedIncomplete = 0; // TAA requested but receiver/resource write was incomplete
+        uint32_t semanticSceneShadowHistoryInvalidationMask = 0;
         uint32_t semanticSceneShadowReceiverSampleSource = 0;    // 0 none, 1 direct shadow map, 2 current visibility, 3 history TAA
         uint32_t semanticSceneLastInputDrawCount = 0;
         uint32_t semanticSceneLastInputSkinnedCount = 0;

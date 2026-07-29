@@ -5,6 +5,7 @@
 namespace dxvk::war3::render {
 
 struct SceneCollectorIdentityProbeSummary {
+  bool groupLocalAggregationEnabled = false;
   uint64_t worldObjectListEntryCount = 0;
   uint64_t worldObjectListNullEntryCount = 0;
   uint64_t worldObjectListOwnerHintZeroCount = 0;

@@ -1,5 +1,7 @@
 #include "war3_shadow_native_runtime.h"
 
+#include "../core/war3_internal_test_config.h"
+
 namespace dxvk::war3::shadow {
 
 NativeD3D9BackendRuntime& NativeD3D9BackendRuntime::instance() {
@@ -57,8 +59,8 @@ void NativeD3D9BackendRuntime::setDevice(IDirect3DDevice9* device) {
   m_lastCanonicalPublishCountConsumed = 0u;
   m_canonicalPublishCount = 0u;
   m_canonicalFramePublishCount = 0u;
-  m_canonicalPublishRejectNotReadyCount = 0u;
-  m_canonicalPublishRejectNoPositionsCount = 0u;
+  m_canonicalPublishRejectNotReadyCount.store(0u, std::memory_order_relaxed);
+  m_canonicalPublishRejectNoPositionsCount.store(0u, std::memory_order_relaxed);
 }
 
 void NativeD3D9BackendRuntime::reset() {
@@ -73,8 +75,8 @@ void NativeD3D9BackendRuntime::reset() {
   m_lastCanonicalPublishCountConsumed = 0u;
   m_canonicalPublishCount = 0u;
   m_canonicalFramePublishCount = 0u;
-  m_canonicalPublishRejectNotReadyCount = 0u;
-  m_canonicalPublishRejectNoPositionsCount = 0u;
+  m_canonicalPublishRejectNotReadyCount.store(0u, std::memory_order_relaxed);
+  m_canonicalPublishRejectNoPositionsCount.store(0u, std::memory_order_relaxed);
 }
 
 void NativeD3D9BackendRuntime::beginCanonicalFrame(uint64_t frameSerial) {
@@ -87,7 +89,7 @@ void NativeD3D9BackendRuntime::beginCanonicalFrame(uint64_t frameSerial) {
 void NativeD3D9BackendRuntime::publishCanonicalDraw(
     const render::CanonicalShadowDrawItem& item) {
   if (!item.readyForShadowConsumer()) {
-    ++m_canonicalPublishRejectNotReadyCount;
+    m_canonicalPublishRejectNotReadyCount.fetch_add(1u, std::memory_order_relaxed);
     return;
   }
 
@@ -95,7 +97,7 @@ void NativeD3D9BackendRuntime::publishCanonicalDraw(
   const auto& positions = mesh.effectivePositionVec();
   if (mesh.vertexCount == 0u ||
       positions.size() < size_t(mesh.vertexCount) * 3u) {
-    ++m_canonicalPublishRejectNoPositionsCount;
+    m_canonicalPublishRejectNoPositionsCount.fetch_add(1u, std::memory_order_relaxed);
     return;
   }
 
@@ -129,7 +131,7 @@ void NativeD3D9BackendRuntime::publishCanonicalDrawPrepared(
     const uint16_t* indexData,
     uint32_t indexCount) {
   if (!item.readyForShadowConsumer()) {
-    ++m_canonicalPublishRejectNotReadyCount;
+    m_canonicalPublishRejectNotReadyCount.fetch_add(1u, std::memory_order_relaxed);
     return;
   }
 
@@ -137,7 +139,7 @@ void NativeD3D9BackendRuntime::publishCanonicalDrawPrepared(
   const uint32_t availableVertexCount =
       uint32_t(positions.size() / 3u);
   if (availableVertexCount == 0u) {
-    ++m_canonicalPublishRejectNoPositionsCount;
+    m_canonicalPublishRejectNoPositionsCount.fetch_add(1u, std::memory_order_relaxed);
     return;
   }
 
@@ -199,6 +201,8 @@ bool NativeD3D9BackendRuntime::buildCanonicalFrame(
     packet.renderable.modelKey = identity.modelKey;
     packet.renderable.jHandle = identity.jHandle;
     packet.renderable.rawcode = identity.rawcode;
+    packet.renderable.pathBlocker =
+        dxvk::war3::internal::IsPathBlockerFourCc(identity.rawcode);
     packet.renderable.layerIndex = material.layerIndex;
     packet.renderable.objectKind = identity.objectKind;
     packet.renderable.frameSerial = identity.frameSerial;
@@ -369,9 +373,9 @@ NativeD3D9BackendSummary NativeD3D9BackendRuntime::snapshot() const {
   }
   summary.canonicalPublishCount = m_canonicalFramePublishCount;
   summary.canonicalPublishRejectNotReadyCount =
-      m_canonicalPublishRejectNotReadyCount;
+      m_canonicalPublishRejectNotReadyCount.load(std::memory_order_relaxed);
   summary.canonicalPublishRejectNoPositionsCount =
-      m_canonicalPublishRejectNoPositionsCount;
+      m_canonicalPublishRejectNoPositionsCount.load(std::memory_order_relaxed);
   if (summary.hasDevice) {
     FillNativeBackendExecutionSummary(summary, m_backend);
   }

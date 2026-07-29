@@ -1,5 +1,11 @@
 # 第 10 章 ★ — 粒子 / Ribbon / Effect 渲染
 
+> 2026-07-15 authoritative correction：本章对 `0x6F184EE0` 的类名/receiver 解释已失效。
+> 真实 ABI 是 `CSprite_PrepareAndQueueAttachedRenderObject(CSprite*)`；它只在
+> `sprite+0x20` 非空时做 slot5 与 `RenderQueue_AddBatch`。这不能证明粒子/CEffect 的完整
+> producer taxonomy。类族和证据边界以
+> [30 号卷](../../research/war3_render_issues/30_cworld_class_family_full_reverse/README.md) 为准。
+>
 > 本章覆盖 War3 的特效渲染系统：粒子发射器、Ribbon 带状特效、
 > 以及 28 个 CEffect 派生类。这些特效在主渲染期通过 RenderQueue 提交。
 
@@ -18,8 +24,8 @@
 
 | RVA | 名字 | 角色 |
 |---|---|---|
-| `0x6F368E30` | `CWorld_WorldObjects_RenderGroup` | 世界对象渲染组（含特效） |
-| `0x6F184EE0` | `WorldObjectEntry_Render` | 世界对象渲染入口 |
+| `0x6F368E30` | `CWorldFrameWar3_RenderWorldGroup` | WorldFrame group producer；group gameplay taxonomy Unknown |
+| `0x6F184EE0` | `CSprite_PrepareAndQueueAttachedRenderObject` | `CSprite*` attached-object 入队 helper |
 | `0x6F139190` | `RenderQueue_AddBatch` | 添加批次（特效也走这里） |
 
 ## 1. 粒子系统

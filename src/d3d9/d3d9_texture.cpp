@@ -91,6 +91,8 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9Texture2D::AddDirtyRect(CONST RECT* pDirtyRect) {
+    if (unlikely(m_texture.War3ResourceCensusEnabled()))
+      m_texture.War3NoteResourceCensusExternalDirty();
     if (pDirtyRect) {
       D3DBOX box = { UINT(pDirtyRect->left), UINT(pDirtyRect->top), UINT(pDirtyRect->right), UINT(pDirtyRect->bottom), 0, 1 };
       m_texture.AddDirtyBox(&box, 0);
@@ -190,6 +192,8 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D9Texture3D::AddDirtyBox(CONST D3DBOX* pDirtyBox) {
+    if (unlikely(m_texture.War3ResourceCensusEnabled()))
+      m_texture.War3NoteResourceCensusExternalDirty();
     m_texture.AddDirtyBox(pDirtyBox, 0);
 
     // Some games keep using the pointer returned in LockBox() after calling Unlock()
@@ -285,6 +289,8 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9TextureCube::AddDirtyRect(D3DCUBEMAP_FACES Face, CONST RECT* pDirtyRect) {
+    if (unlikely(m_texture.War3ResourceCensusEnabled()))
+      m_texture.War3NoteResourceCensusExternalDirty();
     if (pDirtyRect) {
       D3DBOX box = { UINT(pDirtyRect->left), UINT(pDirtyRect->top), UINT(pDirtyRect->right), UINT(pDirtyRect->bottom), 0, 1 };
       m_texture.AddDirtyBox(&box, Face);

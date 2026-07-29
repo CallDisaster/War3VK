@@ -2,6 +2,13 @@
 
 更新日期：2026-04-04
 
+> 2026-07-15 范围说明：本页是渲染主链拓扑汇总，不是完整类字段/vtable inventory。
+> `CWorldFrameWar3`、独立 `CWorldObjects` 类族、`CWorldObjectsClippable` 与 `CDoodads` 的
+> authoritative 区分、逐槽 ABI 和冲突台账见
+> [30_cworld_class_family_full_reverse](../30_cworld_class_family_full_reverse/README.md)。
+> `0x6F184EE0` 已确认接收 `CSprite*`，不是 WorldObjectEntry/AUWOModel；slot5 也不是通用
+> PreRender。下文旧称一律按历史 alias 阅读。
+
 ## 1. 目标
 这份文档不是单点类逆向，而是站在“暴雪原生渲染引擎”视角，把当前已确认的所有主干拼成一张完整地图：
 
@@ -30,7 +37,7 @@ flowchart TD
   D --> F["WorldObjects_RenderGroup"]
   D --> G["Selection / Overlay / PostProcess / Indicator Tail"]
 
-  F --> H["WorldObjectEntry_Render"]
+  F --> H["CSprite_PrepareAndQueueAttachedRenderObject"]
   H --> I["RenderQueue_AddBatch"]
   I --> J["RenderBatch_Submit"]
   J --> K["Opaque Batch Array / Transparent Lists"]
@@ -94,14 +101,15 @@ flowchart TD
 主链：
 
 1. `CWorld_WorldObjects_RenderGroup @ 0x6F368E30`
-2. `WorldObjectEntry_Render @ 0x6F184EE0`
+2. `CSprite_PrepareAndQueueAttachedRenderObject @ 0x6F184EE0`
 3. `RenderQueue_AddBatch @ 0x6F139190`
 4. `RenderBatch_Submit @ 0x6F1375C0`
 
 已确认逻辑：
 
-1. `WorldObjectEntry_Render` 先调用对象虚表 `vtable[5]` 做 prerender
-2. 若 `entry+0x20` 的 `sceneNode` 非空，则进入 `RenderQueue_AddBatch`
+1. group record `+0` 先给出强引用 `CSprite*`；helper 在 `sprite+0x20` 非空时调用 sprite vslot5
+2. vslot5 对 base/Mini 是 no-op，对 Uber 只 flush pending attached state；随后以
+   `[sprite+0x20]` 进入 `RenderQueue_AddBatch`，真正 visibility/prepare dispatch 是 slot3
 3. `RenderQueue_AddBatch` 并不是简单薄封装，它还会：
    - 处理四条透明列表
    - 递归可见子节点

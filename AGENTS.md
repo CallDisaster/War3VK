@@ -1,9 +1,3143 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-07-29（物理屏残留确认 + Git 安全检查点）
+
+用户在最终部署 `CBEC4C4A...` 上确认：本轮树木、蒙皮部件和建筑连续性修复使整体
+正确性大幅提升，但物理屏仍有两项自动门没有覆盖到的残留，**本检查点不能标记为
+阴影问题全部解决**：
+
+- 长时间观察后仍会低频出现一次大型三角/多边形阴影撕裂；用户从现场画面定位到
+  克尔苏加德旁边的对象区域。该异常的时间尺度超过当前 72 帧自动截图门，现有
+  final-caster 自动风险门全 0、短窗 `maxDarkComponent` 仅 454 px 的结果并不能
+  证伪它。
+- 路径阻断器阴影仍会若隐若现，说明当前 exact/current-frame blocker 门已经显著
+  降低泄漏，但至少还有一条身份或生命周期路径没有闭合。
+
+本轮先以当前源码、着色器、构建合同、AutoTest 分析器和交接文档建立 Git 可回退
+基线；不在提交前继续叠加修复变量。相对旧 `15b65d9` 基线，当前版本累计保留了
+GPU/CPU 蒙皮接管、体积光和混合光追、Stage1/10/11/13 producer/lifecycle、当帧
+geometry ledger、final-caster 逐帧取证、TAA v2、blocker/alpha/palette fail-closed
+以及性能报告分账等工作。运行日志、截图缓存、`output/`/`research_bundles/` 备份树、
+一次性 patch 脚本和独立 StormBreaker 子模块 WIP 不进入该提交。
+
+下一阶段必须基于此检查点做长时间、定点、trace-aligned 取证：捕获撕裂发生前后
+完整 final-caster identity/backing/content/validation，并单独追踪 blocker 的 exact
+slice、instance、metadata 与 tombstone。禁止为掩盖低频缺口重新开启跨帧 cache、
+fast-append/prebuild 或延长 grace。
+
+## 🚨 2026-07-29（Stage11 单一当帧 owner，树木/蒙皮/阻断器回归收口，未 commit）
+
+用户在保留最新版功能的前提下报告三类回归：LT/YT 树木阴影在方块与 cutout 间
+闪烁、蒙皮部件周期掉帧而 rigid 部件正常、路径阻断器阴影重新出现。没有整体回滚
+工作区；先为已部署 `898D...` 建立回退点，再在当前改动上定向收紧 producer、
+identity、alpha、palette 与 lifecycle。
+
+**根因与修复边界**：
+
+- Stage11 exact current-frame producer 与 DirectGrouped/packet lease 会为同一 logical
+  slice 发布不同表示；exact caster 已提交后又没有进入 manifest/core lifecycle，
+  导致 generic `stride=12 + vertexBlend` 与 exact `stride=32` 在帧间竞争。新增
+  `exactOwnerFrameSerial` / `exactSubmittedFrameSerial`：exact 在 blocker/alpha
+  fail-closed 前取得唯一所有权，只有实际 caster 发布后才产生 live evidence；
+  DirectGrouped 对 exact-owned slice 避让，exact-submitted 记录直接从完整 cache key
+  合成并合入 manifest、selection、core 与 part identity，但永不进入 packet lease。
+- LT/YT static-world rawcode 被旧 TLS 污染成 Unit 后会走 generic skinned backfill，
+  产生 opaque 方块。现在把 LT/YT 归为 Destructible，generic preselect/record/build
+  三处全部 fail-closed；exact native geometry 保留同帧完整 UV/texture/alpha payload。
+- blocker fallback 曾允许非 exact visible winner、错误 payload 查询与未复核的旧
+  metadata 命中。现在 rawcode/material/metadata 均要求 exact slice、instance、
+  current render frame、Stage11、fresh、非 grace；anonymous exact-backed 豁免只限
+  显式 Unit，不能让 path/LOS marker 混入最终 caster。
+- lease palette refresh 现在要求当前 palette tag 非零，live min/max 非零且相等，
+  并严格等于当前 tag；否则 fail-closed。旧 stale-pose restore 默认关闭，lease
+  expiry 仍只清 backing，不再靠跨帧旧姿态掩盖缺口。
+- 最后一处 17 帧周期孔洞来自类型门遗漏：`hcas/halt/hatw/hctw/hgtw` 五类 Building
+  已有完整当帧 draw-time capture，却未被 exact producer 接纳，只能经历 8 帧
+  `GraceOneFrame` 后空一帧。Building 现进入 exact current-frame owner。旧 trace
+  全程 903 次 unexplained disappearance 全由这五个 handle 构成；没有扩大 grace。
+
+危险跨帧路径继续默认关闭：`DXVK_WAR3_DRAWTIME_VB_CACHE=0`、
+`DXVK_WAR3_SEMANTIC_DRAW_TIME_FAST_APPEND=0`、
+`DXVK_WAR3_SEMANTIC_DRAW_TIME_PREBUILD_BYPASS=0`。
+
+**最终验证**：
+
+- 普通光影图 artifact
+  `AutoTest/artifacts/stage11_building_exact_visual_72_20260729.json`，trace
+  `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_07_29_12_11_10.jsonl`，
+  report `...war3_perf_report_auto_2026_07_29_12_11_53.html`。3,394 个稳态 trace
+  帧中 13 个实际 Building part 每帧均存在，全部稳定为已蒙皮的
+  `stride=32 / vertexBlend=0`；旧 `stride=12 + vertexBlend=1` generic lane 归零。
+  72/72 exact capture 映射；captured steady 的 geometry/alpha transition、mixed
+  representation、alpha gap、blocker leak、unexplained disappearance 全为 0；
+  grace/lease restore/core skip/epoch skip/missing required 全为 0。最大时域暗块
+  454 px，最坏相邻帧目检为凤凰、单位和传送门动画。
+- 高压单位图 artifact
+  `AutoTest/artifacts/stage11_building_exact_pressure_72_20260729.json`，trace
+  `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_07_29_12_18_59.jsonl`，
+  report `...war3_perf_report_auto_2026_07_29_12_19_42.html`。72/72 映射，稳态
+  exact claimed/submitted/lifecycle 同步为 180--188，Stage11 同步为 180--188，
+  DirectGrouped=0；同一六项视觉/连续性门全 0，最大暗块 415 px，
+  `framesIncomplete=0 / budgetExceeded=0 / deviceLost=0`。
+- 81 项相关静态合同 PASS；Win32 build 成功，`ninja -C build32 -n` no-work；
+  targeted `git diff --check` 仅既有 CRLF 警告。
+
+**最终部署**：
+
+- `build32` / `E:\Work\War3\d3d9.dll` exact：32,482,211 bytes，SHA-256
+  `CBEC4C4AED2A675D8E9B515C1C09DD246B493762389B46096C4327AC0695037E`。
+- 本轮原始回退：
+  `E:\Work\War3\d3d9.dll.bak_20260729_898D_pre_stage11_single_owner_lifecycle`；
+  Building 修复前回退：
+  `E:\Work\War3\d3d9.dll.bak_20260729_C8C7_pre_building_exact_owner`。
+
+**仍需用户物理屏验收**：在原地图连续观察树木、普通单位/建筑和路径阻断器区域
+1--2 分钟。若仍有异常，应继续用最终 Caster trace 按 exact part/handle 定位，不能
+重新启用跨帧 cache/fast-append，也不能延长 grace 来隐藏 producer hole。
+
+## 🚨 2026-07-28（密集 Stage11 Caster 高速阴影闪烁修复，未 commit）
+
+用户确认缺失部件恢复后仍会高速闪烁，且视野内 Caster 越多越严重。旧高压报告的
+坏帧会把 Stage11 draw-time capture 从约 243 次降到 26～38 次，同时产生
+207～219 次 `drawTimeVBCacheRejectNoLayerContext`；semantic submit/replay 也随之
+从约 180/252 降到 70～77/142～149。`framesIncomplete`、core/epoch skip 均为 0，
+故不是 ShadowMap hold、lease 或 GPU 问题。
+
+**根因与修复**：
+
+- 新增互斥拒绝原因后确认 148,944 次拒绝中 147,608 次（99.10%）是
+  `QueryCurrentDrawContract` 查找失败。旧历史合同表虽有 4096 项，但
+  `kContractCacheWays=1`，按 renderable-part 指针直接映射；密集、规律分配的单位
+  part 会互相覆盖，所以 Caster 越多，碰撞和整帧部件缺口越严重。
+- 没有扩大旧历史表，因为它仍服务 palette/snapshot 消费者，历史上扩大可见集合
+  曾暴露不安全记录。新增独立的 `War3 CurrentDraw Geometry Ledger`：8192 项、
+  2048 set、4-way，仅接受 current-frame Stage11、fresh、非 grace、完整
+  mesh-payload 记录；按 jHandle/unit/worldObject/sceneNode 多身份发布，并在查询时
+  复核 exact renderable part、frame、Stage 和至少一个权威身份。
+- 新账本只修复当帧几何合同查找，不进入 palette/snapshot 或跨帧 replay；reset 和
+  tombstone 会同步清理。捕获端仍要求 dispatch 或 exact GPU-skin layer，禁止
+  layer=0 猜测。危险跨帧 cache/fast-append/prebuild 继续生产 fail-closed。
+
+**验证**：
+
+- 诊断基线 `353ADAC...`（报告 `...22_38_04.html`）：查找拒绝
+  p50/p95/max=`101/220/222`，capture p05/p50/p95=`26/143/245`，replay
+  `146/204/254`，呈明显锯齿。
+- 长门候选 artifact
+  `AutoTest/artifacts/geometry_ledger_final_pressure_160_20260728.json`，160 张 exact
+  capture 100% 映射到 final-caster trace。稳态拒绝 p50/p95/max=`2/2/2`，capture
+  `243/243/247`、semantic submit `180/180/184`、replay `252/252/256`；
+  `framesIncomplete=0 / ObjectCoreIncompleteSkip=0 / EpochSkippedIncomplete=0 /
+  EpochMissingPart=0`。final analysis 的 alpha gap、blocker leak、trace miss 均为 0；
+  最大稳态瞬态暗块 729 px，未见世界原点巨型三角。
+- 最终严格层身份短门 artifact
+  `AutoTest/artifacts/geometry_ledger_hardened_final_24_20260728.json`，报告
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_28_23_16_21.html`：
+  查找拒绝 p50/p95/max=`0/0/0`，capture=`244`、submit=`181`、replay=`253`
+  中位数，`framesIncomplete=0 / deviceLost=0`。42 项相关静态合同 PASS，
+  `ninja -n` no-work。
+
+**最终部署**：
+
+- `build32` / `E:\Work\War3\d3d9.dll` exact：32,469,589 bytes，SHA-256
+  `20F83427366D006BB9396958D3824773A1C27C27F21A433BA95A97A6F13000A5`。
+- 回退：`E:\Work\War3\d3d9.dll.bak_20260728_F045_pre_layer_hardening`
+  （SHA `F0455A66BA3C462084C9460F79CBECE6EC3DFDCCFA2272A8CF9DE116B25F622E`）。
+- 仍需用户在原密集单位场景物理屏确认高速闪烁消失；若仍有异常，应使用最终
+  Caster trace 定位剩余的 0～2 个严格身份拒绝，不能重新启用危险跨帧缓存。
+
+## 🚨 2026-07-28（视觉回退恢复：拆分安全当帧几何与危险跨帧缓存，未 commit）
+
+用户确认 `02D9EC...` 之后的 metadata/lifecycle 候选出现严重回退：Stage11 阴影
+部位大量缺失、alpha-test 消失、局部闪烁、路径阻断器方块回归且性能下降。本轮没有
+执行 `git reset` 或整体回滚；保留全部既有未提交工作，只在隔离 Desktop、
+`BELOW_NORMAL` 的 War3 中做定向恢复与取证。
+
+**根因与修复边界**：
+
+- `DXVK_WAR3_DRAWTIME_VB_CACHE=0` 本来用于阻断已证明会产生世界 `(0,0)` 巨型
+  三角的跨帧 draw-time snapshot/fast-append，但该总闸还错误地关闭了 Stage11
+  合法 Caster 所需的当帧 GPU 几何生产。旧“止血版”高压图平均只提交约
+  `66.44` 个 semantic draw/frame，而完整路径约 `128.83`；约一半合法部件并非
+  被优化，而是直接缺失。
+- 新增默认开启的 `DXVK_WAR3_DRAWTIME_CURRENT_FRAME_GEOMETRY=1`。它只允许
+  Stage11 在原 draw 当下复制 exact-current-frame GPU slice，并由 direct producer
+  在同一 `frameSerial` 消费；不允许跨帧 lookup/replay，不启用 generic geometry
+  override、GPU-skin legacy cache、prebuild bypass 或 fast-append。
+- 危险三项继续生产 fail-closed：`DRAWTIME_VB_CACHE=0`、
+  `SEMANTIC_DRAW_TIME_FAST_APPEND=0`、
+  `SEMANTIC_DRAW_TIME_PREBUILD_BYPASS=0`。旧 cache 现在只作为显式诊断闸，所有
+  不安全 consumer 仍同时依赖它，不能为了性能重新打开。
+- 当帧 direct producer 补齐 final-caster 的 renderable part/layer、metadata key、
+  alpha source frame、`RequiredCurrent` 生命周期与 alpha payload 完整性字段，避免
+  恢复后的原生 cutout 被取证器误报为 metadata 缺口。新开关同时进入 perf 环境
+  快照。
+
+**验证结果**：
+
+- 5 个相关静态合同套件共 60 tests PASS；Win32 构建成功，`ninja -n` no-work；
+  targeted `git diff --check` 仅既有 CRLF 警告。
+- 高压图最终 120 张 exact backbuffer：120/120 与最终 Caster trace 对齐，
+  `alphaPayloadGap=0 / blockerLeak=0 / unexplainedPartDisappearance=0`，最大时域暗块
+  490 px；报告 `framesIncomplete=0 / budgetExceeded=0`。平均 semantic submit
+  `128.48/frame`、replay `200.47/frame`，已恢复到旧完整诊断路径的
+  `128.83 / 200.83` 同量级；旧止血版仅 `66.44 / 138.42`。
+- 普通光影图 90/90 对齐，alpha 缺口、blocker 泄漏、未解释 part 消失均为 0；
+  透明树木保持 cutout，未见路径阻断器方块。
+- 桥/斜坡图 90/90 对齐，映射帧同样三项为 0，Stage1/Stage13 阴影均持续存在。
+  时域分析的 39,836/9,838 px 大暗变化经相邻三帧目检，均是专图脚本把相机从桥区
+  移到黑色战争迷雾，不是错误阴影或巨型几何。
+- 证据：
+  `AutoTest/artifacts/current_frame_geometry_final_pressure_120_20260728.json`、
+  `..._final_analysis.json`；
+  `current_frame_geometry_visual_contract_90_20260728.json`；
+  `current_frame_geometry_bridge_90_20260728.json`。对应报告分别为
+  `war3_perf_report_auto_2026_07_28_20_30_59.html`、
+  `...20_17_21.html`、`...20_35_29.html`。
+
+**构建与部署**：
+
+- `build32` / `E:\Work\War3\d3d9.dll` exact：31,077,430 bytes，SHA-256
+  `206926F113F7C4B5F1A589343D03A62B5A09001C422FAD1330864BCC2A1E399A`。
+- 本轮开始前回退：
+  `E:\Work\War3\d3d9.dll.bak_20260728_8F50_pre_current_frame_geometry`
+  （SHA `8F50E57C4DF8DA9C9420D5C6185B1F506D1219612F618FEC1441053A8D724455`）。
+- 中间 trace 合同前回退：
+  `E:\Work\War3\d3d9.dll.bak_20260728_1462_pre_current_frame_trace_contract`。
+
+**仍需用户物理屏验收**：当前自动门已经恢复完整工作量并闭合 alpha/blocker/part
+连续性，且未重新引入世界原点巨型三角；但物理扫描输出上的低频闪烁仍需在用户原
+高压场景连续观察 1--2 分钟。性能上不能再拿缺失约一半 semantic caster 的旧止血
+版作“快基线”；下一阶段应在此完整正确性基线上优化 cascade draw、当帧 capture
+与 shadow-map 单 draw 成本，禁止重新开启跨帧 draw-time cache/fast-append。
+
+## 🚨 2026-07-27（整对象阴影闪烁修复 + 最终 Caster 逐帧取证闭合，未 commit）
+
+用户确认上一候选仍有大量阴影闪烁，并要求每轮保存最终阴影数据、把异常截图精确
+关联到产生它的 Caster。全程只在隔离 Desktop 运行 War3，进程最终为
+`BELOW_NORMAL`，未控制用户前台。
+
+**闪烁根因与修复**：
+
+- 旧报告精确出现 531 次
+  `ObjectCoreIncompleteSkip / EpochSkippedIncomplete / EpochMissingPart`。
+  direct packet lease 到期时只删除 lease，却把 part key 留在 committed core；
+  core gate 又早于 post-submit phantom shrink，故一个已不可能恢复的 part 会让整个
+  object 被拒绝，形成周期性整对象阴影闪烁。
+- `d3d9_device.cpp` 新增 `pruneExpiredLeasePartFromCoreSet`：两个已确认 lease
+  失效入口在 erase 前同步从 committed/observation sorted set 删除 exact part；
+  不刷新 core epoch、lease 或 live frame。两集合都为空才删除 object core。
+- 新增并导出
+  `CorePartPrunedOnLeaseExpiry / CoreObjectEmptiedOnLeaseExpiry`，同时把
+  complete/incomplete/epoch missing/skip 等核心字段写入每帧 JSONL。
+- 长门旧 531 次整对象跳过降为 6（-98.87%）；最终短门为 0。目标 `hfoo`
+  cohort 的同步全缺失帧为 0，15 个目标 handle 中仅 1 个出现过一次单帧全缺失。
+
+**逐帧取证闭合**：
+
+- `run_bridge_ramp_visual_probe.py` 可在首张截图前等待本轮
+  `shadowFinalCasterFrame` witness；每轮保留 exact BMP、完整 final-caster JSONL、
+  时域暗块分析、最终 draw identity/backing/content/validation 摘要和 perf HTML。
+- 修复了观测层的两个时钟域误连：截图 `shadowFrameSerial` 是 trace serial，
+  Caster `frameSerial` 是 world frame。分析器现在严格使用
+  `capture shadowFrameSerial -> cadence.serial -> cadence.frameIndex ->
+  final-caster frameSerial`；长门 240/240、最终短门 120/120 均 100% 映射，无
+  parse error。
+- capture 0 没有前一张 exact screenshot，现标为 warmup，不再冒充“最坏瞬态”。
+  identity-world 的普通小型 skinned draw 也不再被误报为原点巨型几何；只有大几何
+  + 原点锚定才进入该规则。
+
+**最终运行结果**：
+
+- 最终短门 artifact：
+  `AutoTest/artifacts/high_pressure_core_prune_final_trace_smoke_20260727.json`；
+  trace：
+  `E:\Work\War3\WarVK\Log\shadow_pose_full_trace_2026_07_27_20_16_46.jsonl`；
+  report：
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_27_20_17_20.html`；
+  mapped analysis：
+  `AutoTest/artifacts/high_pressure_core_prune_final_trace_smoke_20260727_final_analysis.json`。
+- 1,091 report frames：
+  `framesIncomplete=0 / budgetExceeded=0 / deviceLost=0 /
+  ObjectCoreIncompleteSkip=0 / EpochSkippedIncomplete=0 /
+  EpochMissingPart=0`；pruned part=297、emptied object=126。
+- 119 张稳态 exact 帧最大暗块 677 px。最坏帧 world serial 313 只移除一个
+  Stage11 `rawcode=uban` 的 84-index / 49-vertex 小 part；无 validation flag、
+  backing change 或非法 buffer range。同步移除五个 `hfoo` 105-index 小 geoset
+  的两张对齐帧暗块仅 257/253 px，864-index 主体均持续存在。这与历史
+  12,194–16,907 px 世界原点巨型阴影不是同一量级/机制。
+- 危险源已生产 fail-closed：
+  `DXVK_WAR3_DRAWTIME_VB_CACHE=0`、
+  `DXVK_WAR3_SEMANTIC_DRAW_TIME_FAST_APPEND=0`、
+  `DXVK_WAR3_SEMANTIC_DRAW_TIME_PREBUILD_BYPASS=0`；只允许显式诊断回归，
+  不得为性能重新开启。
+
+**构建与部署**：
+
+- 30 项相关静态合同 PASS，`ninja -n` no-work；targeted `git diff --check`
+  仅换行警告。
+- `build32` / `E:\Work\War3\d3d9.dll` exact：31,019,266 bytes，SHA-256
+  `02D9EC173B4902BA85DAA9EEBA80873553FB386CB8DAFD66394A99109E1DD49D`。
+- 回退：
+  `E:\Work\War3\d3d9.dll.bak_20260727_0DC9_pre_core_trace_fields`
+  （SHA `0DC9B5A21772887E3461856E707FA2DBADC90790DCBA54D328287727B6E2D908`）。
+
+**仍需用户物理屏验收**：自动取证已消除整对象同步闪烁且未复现巨型三角，但低频
+扫描输出异常必须由用户在原场景物理屏确认。若仍出现，必须用同一 trace-aligned
+runner 保存该帧并按最终 Caster identity 继续二分；不得重新启用 draw-time cache，
+也不得用跨帧强留存小 geoset 掩盖合法动画可见性变化。
+
+## 🚨 2026-07-27（世界原点瞬态巨型阴影 + 点光摩尔纹收口，未 commit）
+
+用户在 Claude 高性能构建上确认：单位/可破坏物阴影开启时，约数秒一帧会从世界
+`(0,0)` 附近出现巨型三角/矩形阴影；点光阴影同时存在整片摩尔纹。本轮未控制前台，
+全部 War3 运行在隔离 Desktop 且最终降为 `BELOW_NORMAL`。
+
+**原点阴影的可重复证据与根因域**：
+
+- 在 `060E9280...` payload-exact 候选上抓取 160 张 exact backbuffer；第 103 帧
+  出现覆盖半屏的错误阴影，第 104 帧恢复。时域分析最大瞬态暗块 12,194 px。
+  artifact：`bridge_ramp_visual_probe_unit_instance_exact_origin_triangle_20260727_113213.json`。
+- 同 DLL 仅设置 `DXVK_WAR3_DRAWTIME_VB_CACHE=0` 后，160 帧最大暗块降至 307 px
+  （-97.48%），全部为正常动画，故排除 CSM、receiver、TAA、S1/S13，根因锁定在
+  draw-time VB snapshot 的消费/发布链。
+- 子路径二分：关闭 direct producer 仍复现（最大 16,907 px）；同时关闭
+  fast-append/prebuild、只保留 generic consumer 后最大 630 px；复开 direct
+  producer、保持 fast-append 关闭后最大 718 px，均无巨型几何。仅关闭 prebuild
+  而保留 fast-append 仍复现（12,392 px）。因此危险域是 fast-append 本身，不是
+  direct producer、generic cache override 或单独的 prebuild producer。
+- fast-append 确有一处具体合同遗漏：没有复制 `entry.gpuSkinInput`，可能把 input-only
+  GPU-skin 静态源当最终 xyz；现已补齐。但重新开启完整 fast-append 仍复现，证明
+  该捷径还绕过 generic canonical geometry/material/pose 验证，不能生产启用。
+
+**最终正确性策略**：
+
+- `War3DrawTimeVBCacheKey` 现在包含 object instance、mesh payload、JASS handle、
+  part/layer 与两个 payload word；capture 要求 CurrentDraw 与 semantic 至少一个
+  权威身份字段一致，所有 consumer 复核完整 key，visible producer 也复核实例。
+- 新增同 DLL 总诊断开关 `DXVK_WAR3_DRAWTIME_VB_CACHE`；后续取证已证明 master
+  cache 仍不安全，当前最终默认已改为 0，详见上一节。
+- `DXVK_WAR3_SEMANTIC_DRAW_TIME_FAST_APPEND=0` 与
+  `DXVK_WAR3_SEMANTIC_DRAW_TIME_PREBUILD_BYPASS=0` 现在默认 fail-closed，仅保留
+  显式回归诊断；三项开关和 draw-time 总开关均进入 perf env 快照。
+- 最终默认 160 帧：最大瞬态暗块 632 px，目检全部是凤凰/传送门动画；旧错误域
+  12,194–16,907 px 不再出现。`framesIncomplete=0 / budgetExceeded=0 /
+  deviceLost=0`。artifact：
+  `bridge_ramp_visual_probe_unit_fast_append_fail_closed_default_20260727_122420.json`，
+  报告：`war3_perf_report_auto_2026_07_27_12_25_24.html`。
+
+**点光摩尔纹修复**：
+
+- point shadow 默认 texel bias scale `0.08 -> 0.35`；receiver 由 `max(base, texel)`
+  改成 base + texel footprint + 有界 slope scale，volumetric 点阴影同步使用 additive
+  footprint，UI 上限扩到 1.0。
+- 最终点光门 `light_feature_matrix_20260727_122752.json`：PointShadow 1657 次、
+  0.999 calls/frame、GPU 0.14 ms，截图
+  `AutoTest/artifacts/screenshots/war3_20260727_122831.png` 未见整片摩尔纹。
+  matrix 的 false 只因旧 gate 仍要求已移除的 `DXVK PointShadow: Rendered!` DBWIN
+  文本并把受控 stop 计为 runtime failure；活跃 PointShadow section、无 crash/device
+  lost 与 exact 截图证明实际执行成功，后续应修测试器 gate。
+
+**构建与部署**：
+
+- 58 项相关静态合同 PASS，`git diff --check` 仅换行警告，最终 `ninja -n` no-work。
+- `build32` / `E:\Work\War3\d3d9.dll` exact：30,983,978 bytes，SHA-256
+  `4C04190ABB2EE4C3D829528018779F96E8BF4C4716B907E8562F81A834F75CBF`。
+- 回退：`E:\Work\War3\d3d9.dll.bak_20260727_409C_pre_fast_fail_closed`。
+- 仍未 commit。提交前建议用户物理屏确认原地图至少 1–2 分钟无原点三角，并确认
+  实际点光场景的摩尔纹观感；后续性能优化应针对安全 generic Submit，不能重新开启
+  fast-append，除非它完整复用 canonical validator 并重新通过时域门。
+
+## 🚨 2026-07-27（(0,0) 渲染缺失块调查收口 + ConsumerBuild 性能修复，未 commit）
+
+**背景与断档说明**：用户在 20:47 报告（`war3_perf_report_2026_07_26_20_47_45.html`，
+12:35 构建 SHA `5F458C07`）：性能低 + 渲染缺失块必定出现在 0,0，系 S13 桥/斜坡
+修复期间引入。上一会话在 21:22-21:27 已实现并部署 "drawtime layer exact"
+候选修复（SHA `CF1E82ED`），跑了两轮探针（`origin_block_drawtime_layer_exact_
+cf1e_20260726.json` 等，180+72 帧截图）后进程中断，未记录、未分析、未告知用户。
+本轮补完了该验证：CF1E 的 180 帧时域亮度差分无任何黑块/原点异常（唯一增亮
+是战斗火焰特效）。
+
+**根因调查结论（16-agent workflow + 对抗验证）**：
+
+- `semanticSceneDirectRecordCapAppendFailCount`（每帧 10）**名不副实**：与
+  record cap 无关，统计的是通过预算后 append 被拒的 record（固定一批匿名
+  path/LOS blocker 走廉价早退链被正确拒绝）。append 失败=阴影侧整体缺席，
+  不产生 draw，**不是** 0,0 缺失块根因，也不是性能问题。
+- 剔除类机制（S13 远级联剔除等）被证伪：剔除产生的缺失跟随相机/物体，不会
+  钉在原点。0,0 锚定指向"变换/几何被默认值替换"类缺陷：局部空间/预变换
+  顶点 × identity world 塌缩到世界原点。已核实的活路径中最吻合的是
+  draw-time VB cache 陈旧/异源快照重放（代码自注释"eight-frame-old dynamic
+  VB … giant triangle at the world origin"，21330-21344），即 CF1E 修复域。
+- S1 early cache key（仅 worldMatrix+几何规模）存在真实碰撞洞：identity
+  world + 相同顶点数的不同 tile 必然同 key，命中即错误重放异源冻结几何。
+  但用户 20:47 报告与本轮探针中 `persistentS1Early*` 全零（该图地形不入
+  early cache），**不是用户所见缺失块的直接来源**，本轮按纵深防御修复。
+- ConsumerBuild 4.25ms/帧（用户交互运行）= 完整 populate 每帧 ~2.3 次全量
+  执行：EndFrame flush 去重门键在 direct-only 模式下永不 latch（依赖
+  direct 路径从不推进的 validation runtime serial），每帧多付一次快照/
+  manifest/分组固定开销；另 control-plane 查询站点与 populate 共用
+  ConsumerBuild 标签污染归因。
+
+**本轮默认修复（全部 fail-closed 方向）**：
+
+- S1 early-cache 源身份校验：entry 冻结时记录 VB/IB 指针+offset+stride+
+  BaseVertexIndex/MinVertexIndex/StartVal 指纹（不进 key，仅命中时比对），
+  不匹配即淘汰重建并计入新计数器 `s1EarlySourceMismatchEvictCount`（已接入
+  workloadSeries 列与 shadowBudgetSummary 聚合）。动态 ring 源校验必失败→
+  走本就应走的慢路径。
+- EndFrame flush 门：新增 `m_war3SceneRotatedFrameSerial`（BeforeUi 与
+  Execute 两个 rotate 点写入）；`War3ExecuteSemanticShadowSceneForValidation`
+  在 direct-only 且非 native-validation 时，本帧场景已 rotate 即早退。
+  以 rotate 事实为键而非 populate 成功，BeforeUi 漏检帧（菜单/过场）照旧
+  走完整兜底，不丢整帧阴影。
+- 遥测拆分：bridge 查询站点上报改为新 tag `SummaryRefreshRequest`（enum 39，
+  Count=40），ConsumerBuild 现纯对应 populate。
+
+**静态与后台运行门**：
+
+- `ninja -C build32` 通过（no-work 复核）；19 个 static 合同套件全 PASS；
+  `test_bridge_ramp_shadow_safety_static` 按新签名更新并**新增**
+  `test_s1_early_hit_validates_source_fingerprint` 合同（指纹先于查找计算、
+  两个 store 站点记录、命中比对、mismatch 计数导出）。
+- 桥/斜坡探针（默认视角，72 截图）：报告
+  `war3_perf_report_auto_2026_07_27_01_34_18.html`，7200 帧，208.8 FPS /
+  CPU 4.789ms（CF1E 同图基线 21:35 为 188.3 FPS / 5.31ms）；
+  `deviceLost=0`，全部 shadow 完整性关键字 0。亮度差分：无暗块；增亮全部为
+  全局昼夜循环（478/600 格同升）。
+- 原点钉死探针（`--camera-target-x 0 --camera-target-y 0 --camera-angle-deg
+  304`，72 截图）：7200 帧，194.5 FPS / 5.14ms，`deviceLost=0`。差分中
+  帧 53 为全局夜晚帧；帧 4/9/20/26/54 的 1-2 格暗点经裁剪目检为传送门
+  草地贴片的蓝色辉光脉冲动画，几何完整。**原点视角无缺失块**。
+- ConsumerBuild 探针值 0.077ms/帧（1.25 次/帧，含启动期兜底帧）；
+  `SummaryRefreshRequest` 列已出现在 semanticPerfHotspots。
+- artifact：`AutoTest/artifacts/bridge_ramp_s1fp_flushgate_20260727.json`、
+  `AutoTest/artifacts/origin_pinned_s1fp_20260727.json`。
+
+**部署**：
+
+- `E:\Work\War3\d3d9.dll` = 30,977,396 bytes，SHA-256
+  `1807E5E748CE94AC9F25B620ECC059D6BD0414E559A356E32963F78587AB8964`，
+  与 `build32` exact。
+- 回退备份：`E:\Work\War3\d3d9.dll.bak_20260727_CF1E_pre_s1_fingerprint_flush_gate`
+  （即上一会话的 drawtime layer exact 构建）。
+
+**仍需用户物理屏验收**：1) 用户自己的地图在原报告视角/换视角后 0,0 处是否
+仍有缺失块（CF1E 与本构建的隔离探针均未复现，但用户 20:47 所见发生在
+CF1E 部署之前，尚无用户侧确认）；2) 交互运行的 FPS（flush 门的收益主要在
+交互场景的 ~2.3 次/帧 populate，隔离自动测试本就 ~1 次/帧，无法代表）；
+3) 若缺失块仍在：优先用 `DXVK_WAR3_SHADOW_DEBUG_CASTER_STAGE=13` 探针 +
+关闭 `DXVK_WAR3_KEEP_STAGE13_WORLDOBJECT_LEGACY_CAPTURE` 做单变量 A/B，
+并查报告新列 `s1EarlySourceMismatchEvictCount` 是否非零。
+
+## 🚨 2026-07-25（阴影 owner/lifecycle/S10/S12/S13/TAA v2 计划实现，未 commit）
+
+本轮按用户锁定计划完成了阴影 producer 所有权、生命周期、Stage 指标、非 TAA
+稳定化与 TAA v2 的代码落地；保留工作区全部既有改动，未 reset/commit。
+
+**默认正确性策略**：
+
+- 新增统一 `ShadowProducerPolicy` 和 33-bin Stage 生命周期计数。S12 /
+  `RangeIndicatorTarget` 是纯视觉 overlay，不能成为 caster 或覆盖 S11；
+  S10 由 current-frame immediate legacy lane 独占，重复 generic producer 被拒绝；
+  S13 保持 current-frame owner，retention/late descriptor/unique semantic/sparse
+  reuse 均不重新启用。
+- CurrentDraw / Manifest 补齐 producer stage/group/source、freshness、
+  visible serial、policy revision、grace age 与 alpha payload 完整性。StageDisabled
+  tombstone 立即清理并使 ShadowMap/history/reuse 失效；未验证的 widget
+  hidden/removed/replaced caller 仍只观察，不猜测 ABI/事件语义。
+- Stage10 只接纳 opaque 或权威完整 cutout；不再把任意 alpha blend 强转为
+  0.5 alpha-test，不完整 UV/texture/material payload fail-closed。
+- `DXVK_WAR3_SHADOW_TAA_MODE=0/1/2` 对应 DirectInline /
+  PrepassCurrentOnly / Temporal，旧开关只作兼容映射。默认 DirectInline；
+  Temporal v2 history 使用 RG16F visibility+linear depth，并要求
+  Visibility/Motion/Receiver/HistoryWrite 四段完整后才推进。当前十字预模糊已移除。
+- 非 TAA 路径统一了 cascade 的稳定世界坐标 PCF seed，稳定墙面采样不再提前
+  return；adaptive reuse 现在校验 caster/content/pose/CSM/map/policy generation，
+  tombstone、太阳或内容变化均失效。
+- 原版 doodad type=0 静态贴花已有 enable-only 精确运行门，但在 S10 前台视觉
+  通过前保持默认关闭；type=4、ListA、RegisterImage、fog/LOS/path/UberSplat 不动。
+
+**静态与后台运行门**：
+
+- 8 个相关静态合同共 57 tests PASS；`ninja -C build32` no-work；
+  targeted `git diff --check` 无错误。
+- S10 普通光影图：
+  `war3_perf_report_auto_2026_07_25_23_28_04.html`，3,010 帧。
+  immediate owner 的 24,088 次全部 `canonicalPublished/replayPrepared/C0..C3`
+  闭合；重复 producer 的 24,088 次全部计入 `rejectedStage10Owner`。
+  `framesIncomplete=0 / deviceLost=0`，隔离桌面、`BELOW_NORMAL`、cleanup 成功。
+- S13 桥/斜坡图：
+  `war3_perf_report_auto_2026_07_25_23_22_27.html`，6,672 帧。
+  Stage13 published=78,711、replay=77,535、retention bytes=0；
+  DirectInline 6,673 帧中 Visibility/Motion/HistoryWrite/HistoryAdvance 全为 0，
+  `framesIncomplete=0 / deviceLost=0`。
+- exact build/deploy DLL：30,968,506 bytes，SHA-256
+  `B734EF2ADA7ED920890C29CEF8B099D0D0391432E0517A74A0447B42ED79D217`。
+  回退点：
+  `E:\Work\War3\d3d9.dll.bak_20260725_9C83_pre_shadow_owner_taa_v2` 与
+  `d3d9.dll.bak_20260725_80B9_pre_s10_owner_closure`。
+
+**仍需用户物理屏验收**：S12 绿色选择树/单位/透明模型、hide/show/remove、
+S10 原版贴花关闭后的 fog/LOS/path 对照、跨 cascade 抖动固定 ROI，以及
+PrepassCurrentOnly/Temporal 的清晰度扫描。Temporal 未满足视觉门前不得设为默认。
+
+## 🚨 2026-07-25（17:34 Stage13 retained 回归紧急关闭，未 commit）
+
+用户在最终 `E5ACD001...` 上报告桥/斜坡出现巨量几何撕裂、靠近时严重掉帧，
+并提供
+`E:\Work\War3\WarVK\Log\war3_perf_report_2026_07_25_17_34_37.html`。
+该报告与两路独立代码审计证明上一节刚转正的 sparse retained 优化不安全，本节
+结论优先于上一节的“默认转正”结论。
+
+**确定的回归机制**：
+
+- sparse late descriptor 默认只读取 8 个均匀 raw index 及对应 position/UV
+  leaf，且不读完整 IB；它不是完整几何身份。不同桥/斜坡子网格可以在抽样点相同、
+  未抽样内容不同的情况下错误命中同一 retained entry。
+- 错误命中后代码会用当前 `draw` 覆盖 retained draw state，却保留旧
+  `positionBytes/contentHash`；随后跨帧 replay 形成“新 world/material/bounds +
+  旧顶点快照”，与用户看到的错误大三角/撕裂一致。
+- miss 会在 sparse mapped reads 之后继续执行完整 referenced-set scan。用户报告
+  `ShadowCapture/PostGate` 快/慢帧为 `1.992 / 34.289 ms`，调用量只增加
+  30.5%；p95 `40.174 ms`、max `93.370 ms`。同 DLL 17:15 明细中慢帧
+  `Stage13StrongIdentity=31.478 ms`，其中 `SampleLeaves + UniqueLeafRead`
+  占主要部分。GPU 仅约 3.6 ms，故不是 GPU 或 WaitGate。
+
+**紧急默认修复**：
+
+- `DXVK_WAR3_STAGE13_STATIC_RETENTION=0`：完全关闭 Stage13 跨帧 CPU
+  snapshot retention/replay，从生产路径移除错误复用与完整强扫描。
+- 保留 `DXVK_WAR3_KEEP_STAGE13_WORLDOBJECT_LEGACY_CAPTURE=1`，Stage13
+  当前帧的直接捕获/提交仍然工作，不恢复旧 semantic early-return。
+- `DXVK_WAR3_STAGE13_LATE_DESCRIPTOR_CACHE=0`；若显式诊断开启，默认恢复
+  `LATE_SAMPLE_COUNT=32` 与 `LATE_FULL_INDEX_FINGERPRINT=1`，但即使如此仍
+  不视为严格正确。unique-semantic 继续默认关闭。
+- 16 项桥/连续性静态合同 PASS，构建 no-work。
+
+**隔离专图验证**：
+
+- exact DLL：30,693,990 bytes，SHA-256
+  `9C837CDBC88A5793D77537E03A6ACECDAEF98998535941E3AB177754F2161545`，
+  已部署且与 `build32` exact。
+- artifact：
+  `AutoTest/artifacts/bridge_ramp_stage13_retention_off_9c83_20260725.json`；
+  报告：
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_25_17_59_23.html`。
+- 7200 报告帧、72 张 exact backbuffer，War3 为 `BELOW_NORMAL` 且运行于隔离
+  Desktop。`framesIncomplete=0 / budgetExceeded=0 / deviceLost=0`。
+- 用户回归报告 → 新版，同量级调用：
+  `PostGate 8.170→0.110 ms/frame`（**-98.65%，约 74×**），
+  p95 `40.174→0.205 ms`（**-99.49%**）；
+  `ShadowCapture 8.384→0.357 ms/frame`（**-95.74%**），
+  p95 `40.453→1.498 ms`（**-96.30%**）。
+- 72 张精确帧中 `stage13Attempt == stage13Considered`，Stage13 replay
+  0～32 draws；retention eligible/entry/strong scan/snapshot build 全部为 0，
+  history incomplete skip=0。抽查桥近景未见错误巨型三角。
+- 追加高压图短门
+  `AutoTest/artifacts/stage13_retention_off_pressure_9c83_20260725.json`，
+  报告 `...18_05_10.html`：1653 帧，`PostGate=0.421 ms/frame`、
+  p95 `0.671 ms`，`framesIncomplete=0 / budgetExceeded=0 /
+  deviceLost=0`；外部负载下绝对帧时不作为收益口径。
+- 回退备份：
+  `E:\Work\War3\d3d9.dll.bak_20260725_E5AC_pre_stage13_retention_emergency_off`。
+
+**仍需用户物理屏验收**：隔离 backbuffer 可以验证错误几何，但不能证明扫描输出
+时间域的物理撕裂完全消失。下一步必须用用户同一桥图肉眼确认。若只剩“原生完全不
+提交时的阴影缺口”，不得重新开启 sparse retained；正式解法应在 VB/IB 写入或
+Unlock 时生成完整 content generation/hash，使用包含 slice/range/layout 的 O(1)
+精确键，并把 draw state、content identity、CPU snapshot 作为不可分割记录发布。
+
+## 🚨 2026-07-25（Stage13 强身份扫描减半，默认转正，未 commit）
+
+本阶段继续只在隔离 Desktop 运行 War3，游戏/构建均为 `BELOW_NORMAL`，没有控制
+用户前台；外部高负载下只采信同轮局部比例，不使用绝对 FPS 宣称收益。
+
+**定位与可观测性**：
+
+- 在默认关闭的 `DXVK_WAR3_SHADOW_CAPTURE_BREAKDOWN=1` 下，把
+  `Stage13StrongIdentity` 拆为 `SourceMapAndSetup / IndexParse /
+  UniqueLeafRead / HashReplay / VerifyAndLookup`，再把
+  `SourceMapAndSetup` 拆为 `DescriptorSetup / IndexFingerprint /
+  SampleLeaves / RetainedLookup / Finalize`。
+- 首轮显示旧完整 referenced-set 扫描由 `UniqueLeafRead` 主导；原 32 点 late
+  descriptor 又各花约一半时间在完整 IB FNV 与 mapped position/UV 抽样，容器查找
+  仅约 0.01 ms/frame，不是热点。
+- “只按唯一 world+material+layout 命中”的零读取实验被强验证器抓到真实反例：
+  `retained=15658477967941462053`、`current=18028680984744935418`、
+  `count=810`。该路径保持
+  `DXVK_WAR3_STAGE13_UNIQUE_SEMANTIC_CACHE=0`，只留作反例复现。
+
+**默认优化**：
+
+- `DXVK_WAR3_STAGE13_LATE_DESCRIPTOR_CACHE=1`：Stage13 rigid retained caster
+  默认使用 late sparse content descriptor。
+- 默认 8 个均匀分布的 raw-index + position/UV leaf：
+  `DXVK_WAR3_STAGE13_LATE_SAMPLE_COUNT=8`；`=32` 恢复保守抽样。
+- 默认不再读取完整 mapped IB：
+  `DXVK_WAR3_STAGE13_LATE_FULL_INDEX_FINGERPRINT=0`；`=1` 精确恢复旧完整
+  IB 指纹。整项 `...LATE_DESCRIPTOR_CACHE=0` 可回退旧完整 referenced-set 扫描。
+- `DXVK_WAR3_STAGE13_SOURCE_GENERATION_VERIFY=1` 会在每个 fast hit 后重新执行
+  旧完整扫描并逐 content hash 比较，不一致立即 abort。
+
+**验证与比例**：
+
+- 桥图强验证
+  `AutoTest/artifacts/bridge_stage13_sparse8_no_full_ib_verify_ddd8_20260725.json`：
+  50/50 exact captures，489 attempts / 343 verified hits（70.1%）/
+  146 misses，零 mismatch，`framesIncomplete=0 / deviceLost=0`。
+- 同 DLL OFF→ON→ON→OFF 中，开启轮 scan avoidance 为 70.14% / 68.92%。
+  因前台负载使绝对帧时漂移 17–58 ms，收益按开启轮内部实际 scan 单价计算：
+  `Stage13StrongIdentity` 相对全扫描 counterfactual 分别约 **-49% / -53%**。
+- 生与死验证报告
+  `war3_perf_report_auto_2026_07_25_17_08_33.html`：474 frames；
+  SunkenCity 验证报告 `...17_10_28.html`：388 frames，约 45 Stage13
+  attempts/frame。两轮均 screenshot 成功且
+  `framesIncomplete=0 / deviceLost=0 / captureIncomplete=0`，无 verifier abort。
+- 最终默认桥图长门
+  `AutoTest/artifacts/stage13_sparse8_final_default_e5ac_20260725.json`，
+  报告 `...17_15_51.html`：990 frames，7.467 Stage13 attempts/frame，
+  2.020 full scans/frame（**72.95% avoidance**）；同轮内部 counterfactual
+  约 **-49.1%**。`framesIncomplete=0 / budgetExceeded=0 / deviceLost=0 /
+  captureIncomplete=0`，screenshot 成功。
+- 静态合同 16/16 PASS；`ninja -C build32 src/d3d9/d3d9.dll -n` no-work。
+
+**最终 exact 部署**：
+
+- `E:\Work\War3\d3d9.dll`：30,693,990 bytes，SHA-256
+  `E5ACD0015ED9FDD1071000AF23CCE543B26525FBAA5A1C0BDC02560A1FF24F4C`，
+  与 `build32` exact。
+- 回退备份：
+  `E:\Work\War3\d3d9.dll.bak_20260725_DDD8_pre_stage13_sparse8_default`；
+  上一版 source-split：
+  `d3d9.dll.bak_20260725_68BD_pre_stage13_sample_tuning`。
+
+**下一顺序**：Stage13 剩余最大成本为 8 个 mapped leaf reads
+（最终门约 2.564 ms/frame）和 miss 时 `UniqueLeafRead`（2.439 ms/frame）。
+不要再尝试无内容校验的 semantic-only 命中。若继续压缩，先用强验证器测试
+4 点/CPU-side source mirror，或建立写入期 content generation/hash；不得重新依赖
+轮换的 D3D resource/backing identity。
+
+## 🚨 2026-07-25（桥/斜坡 Stage13 连续阴影 + 生与死加载闪退修复，未 commit）
+
+用户报告两项独立故障：
+
+1. 所有桥/斜坡装饰物的阴影同步消失/出现，低视角闪烁更快、上帝视角更慢；
+2. 高压图 `(4)生与死v1.28读档bug修复.w3x` 加载一段时间后直接闪退。
+
+本轮全程在隔离桌面运行 War3，并把游戏进程调整为 `BELOW_NORMAL`，未控制用户
+前台。未使用 IDA；高压图故障通过 minidump、32 位 GDB rejection breakpoint 和
+汇编栈闭合。
+
+**桥/斜坡阴影根因与修复**：
+
+- 桥/斜坡走原生 Stage13 world-object 提交。旧路径先受相机相关 semantic
+  snapshot/visibility 门控，却没有进入 Stage13 caster 分类；因此一整组对象会随
+  视角高度和俯仰同步从阴影集合中掉出。低视角导致门控边界穿越更频繁，所以闪烁
+  周期更短；这不是材质、TAA 或单个模型资源随机损坏。
+- 新增默认开启的
+  `DXVK_WAR3_KEEP_STAGE13_WORLDOBJECT_LEGACY_CAPTURE=1`：Stage13 绕过该
+  view-dependent semantic early-return，在原 draw 当下由 legacy capture 持续接管；
+  同时补入 object/VS caster 分类。
+- DirectGrouped 的 grouped preselection 与 fallback build 两处都显式跳过
+  Stage13，保证 Stage13 只有一个 shadow owner，不会双重发布。
+- 静态合同
+  `AutoTest/test_bridge_ramp_shadow_safety_static.py` 现为 11/11 PASS。
+- 专图长循环 artifact：
+  `AutoTest/artifacts/bridge_probe_stage13_scoped_legacy_continuity_20260725.json`。
+  72.475 秒 / 6517 game frames / 96 张 exact backbuffer；79 个实际提交 Stage13
+  的采样帧中 `attempt=1229 / considered=1229 / final caster=1229`，
+  `AttemptButConsideredZero=0 / AttemptButFinalZero=0`。其余 17 帧相机完全位于
+  黑色战争迷雾且游戏没有提交对象，不是我方丢失。报告：
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_25_04_16_50.html`。
+
+**高压图闪退的精确证据**：
+
+- 旧候选在同图 4/4 于约 37 秒加载阶段崩溃。完整转储之一：
+  `E:\Work\War3\WarVK\Crash\war3_crash_2026_07_25_04_28_04_892_pid89664_tid49736.dmp`。
+  AV 为 `Game.dll+0xFB135` 向 null-derived `0x00200000` 写入；调用链经过
+  `Game+FB135 → FA5B0/FA586 → FA1BA → FA122 → Game+42C13`。
+- 一次性 GDB rejection artifact：
+  `AutoTest/artifacts/life_death_storm_reject_capture_20260725_045545.json`。
+  被拒绝的 live pointer 为 `0x3d990a08`，头 `0x3d9909f8`，magic
+  `0x53425431 (SBT1)`、size `0x00200000`、cookie/header 均有效；
+  exact recently-freed slot 为 0，`TlsfPool_IsFromPool(header)=1`。
+- 指针只满足 8 字节对齐。初始 managed allocation 使用 16-byte memalign，但普通
+  `TlsfPool_Realloc` 的 moving path 只保证 TLSF 基础对齐。旧代码随后把该块作为
+  live block 发布；下一轮 `QueryManagedBlock` 按公开 16-byte ABI 拒绝自己的活块，
+  ReAlloc 返回 null，而 Game 无条件保存并写入该返回值，形成确定性崩溃。该证据
+  排除了此前怀疑的 tombstone/hash collision。
+
+**Storm 修复**：
+
+- `AllocManagedBlock` 对后端返回地址追加 16-byte fail-closed 检查。
+- managed TLSF→TLSF ReAlloc 先调用 `TlsfPool_ReallocInPlace`；成功时天然保留
+  原对齐。无法原地调整时走 `AllocManagedBlock(16-byte aligned) + copy + release
+  old`，不再调用会丢失对齐的普通 `TlsfPool_Realloc`。
+- 离线 Storm 合同 18/18 PASS，其中新增
+  `test_managed_realloc_preserves_public_16_byte_alignment`。
+
+**最终高压图验证与部署**：
+
+- 修复后的同一 exact DLL 连续通过两轮完整隔离运行：
+  - `AutoTest/artifacts/resource_residency_census_isolated_life_and_death_20260725_050134`
+    （109.751 秒，779 observed frames）；
+  - `AutoTest/artifacts/resource_residency_census_isolated_life_and_death_20260725_050609`
+    （115.662 秒，779 observed frames）。
+- 两轮均 `PASS=true / framesIncomplete=0 / finalNewWar3=0`，module、launch、
+  cleanup 与 allocator chunk 合同全部闭合，且没有产生新 crash dump。对应报告：
+  `war3_perf_report_auto_2026_07_25_05_03_22.html` 与
+  `war3_perf_report_auto_2026_07_25_05_08_04.html`。
+- 最终 `build32/src/d3d9/d3d9.dll` 与 `E:\Work\War3\d3d9.dll` exact：
+  30,575,596 bytes，SHA-256
+  `F4020142D8632D160747EB515E3CC5B97A901C667195C1755E71B8D56C252582`；
+  `ninja -C build32 src/d3d9/d3d9.dll -n` 为 no-work。
+- 回退：
+  `E:\Work\War3\d3d9.dll.bak_20260725_1B81_pre_storm_realloc_alignment`
+  （SHA `1B81C2D98B3D7A0708E5937FFFB9FA55E01B7B106AB4CEB6928EF9B01D13020A`）。
+
+**仍需用户物理屏验收**：程序侧 Stage13 阴影集合在长循环中已无提交缺口，但最终
+是否还存在显示时间域闪烁必须由用户在同一专图肉眼确认。若最终 F402 上仍闪烁，
+下一步记录的是 Stage13 world matrix 与最终 shadow pixels 连续性，不能重新放开
+易失 S1 缓存，也不能用延长 history hold 掩盖问题。
+
+## 🚨 2026-07-24（17:13 世界原点阴影撕裂修复：禁用易失 S1 fallback early-cache，未 commit）
+
+用户在 replay 发布闭合候选 `C3F6ABA2...` 上报告：桥/斜坡阴影仍偶发消失，
+并且世界 `(0,0)` 高频出现放射状阴影撕裂，正常阴影也会被错误三角扰动。输入报告为
+`E:\Work\War3\WarVK\Log\war3_perf_report_2026_07_24_16_50_56.html`。
+
+**确定根因**：
+
+- 用户报告中 S1 early-cache 共有 8 项，全部是 fallback-backed；95,061 次
+  accepted hit 全部发布为 fallback，persistent-backed/instance 均为 0。
+- fallback freeze 默认来自 `ShadowArena_Alloc`。该 Arena 只有 3 个按帧轮换的
+  page，page 再次轮到时会把 offset 复位为 0；缓存中的 `Rc<DxvkBuffer>` 只能延长
+  Vulkan buffer 对象寿命，不能保护旧 slice 的字节不被后续帧覆盖。
+- `War3BuildS1TerrainEarlyKey` 又刻意省略了动态 ring 的
+  `StartVal/BaseVertexIndex/MinVertexIndex`，也没有完整 source-content 身份。
+  因此 replay 发布闭合修复让原先“命中后消失”的 latent 条目真正参与绘制后，
+  它们会把已经被其他 tile 覆盖的顶点/索引解释成旧 draw，直接形成从世界原点拉出
+  的错误三角和周期抖动。
+
+**默认修复**：
+
+- 新增 `DXVK_WAR3_S1_EARLY_FALLBACK_BACKING=0`（默认）。S1 early-cache 现在
+  只接受 registry-owned persistent geometry；frame-arena/freeze fallback 每帧
+  正常重新捕获并通过 canonical `shadowFallbacks` 绘制，不再跨帧复用易失 slice。
+- store 入口、slow fallback 写入点和 early-hit 读取点三层 fail-closed；即使进程
+  曾用危险诊断配置写入 id=0 条目，恢复默认后首次 lookup 也会立即清除，绝不发布。
+- `=1` 仅保留为精确复现旧行为的危险诊断回滚。该变量已加入 perf report 的环境
+  快照目录；在完整 source descriptor/content identity 和稳定 backing 实现前不得
+  转正。
+
+**同专图验证**：
+
+- 静态安全合同 10/10 PASS；最终构建 `ninja -n` no-work。
+- 短门报告
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_24_17_09_32.html`：
+  3,680 采样帧，S1 entry/fallback-backed/accepted/published 全为 0，
+  `framesIncomplete=0 / deviceLost=0 / capacityReject=0 / closureMismatch=0`。
+- 长门报告
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_24_17_13_20.html`：
+  7,200 采样帧、65.612 秒，工作量序列覆盖 24 次
+  fallback draw 低→高→低可见区间循环；所有逐帧 S1 early-cache gauge/hit
+  始终为 0，receiver 活跃但 replay=0 为 0，partial/incomplete/device-lost/
+  capacity-reject/closure-mismatch 全为 0。
+- 用户报告的 last-complete reuse 比例为 156/3457（4.51%）；长门同一
+  `workloadSeries` 窗口为 7/7200（0.097%，相对下降约 97.85%）。这只作阴影提交
+  稳定性比例，不把外部负载下绝对 FPS 当收益。
+- 长门内在四个不同相机阶段通过 control-plane 捕获最终帧，均未看到世界原点放射状
+  错误三角；最后一个阶段主要是地图自身的黑色战争迷雾，不是缺失渲染。截图为
+  `AutoTest/artifacts/screenshots/bridge_ramp_839c_long_01.png` 至 `_04.png`。
+
+**最终部署**：
+
+- `build32/src/d3d9/d3d9.dll` 与 `E:\Work\War3\d3d9.dll` exact：
+  30,518,709 bytes，SHA-256
+  `839CD9556BF8502508C274245A355829B289A8E3745F45F2803B4C1AA929FFF1`。
+- artifacts：
+  `AutoTest/artifacts/bridge_ramp_s1_fallback_fail_closed_839c_20260724.json`
+  与
+  `bridge_ramp_s1_fallback_fail_closed_long_839c_20260724.json`。
+- 回退：
+  `E:\Work\War3\d3d9.dll.bak_20260724_C3F6_pre_s1_fallback_fail_closed`
+  （SHA `C3F6ABA2...`）。
+
+**仍需用户物理屏验收**：后台逐帧合同、长循环和多阶段 backbuffer 均已通过，但物理
+屏幕上的时间域闪烁仍应由用户用同一专图确认。若桥/斜坡阴影仍消失，下一步只追踪
+逐帧 live S1 fallback membership、world matrix 和 receiver draw outcome；不得重新
+开启易失 fallback early-cache，也不得用延长 last-complete hold 掩盖缺口。
+
+## 🚨 2026-07-24（16:39 桥/斜坡阴影周期闪烁修复：S1 replay 发布闭合，未 commit）
+
+用户确认 ManifestCopy 巨卡已消失，但桥/斜坡阴影仍约每两秒周期闪烁。本轮不使用
+IDA，继续只在隔离桌面、`BELOW_NORMAL` War3 下运行专图
+`E:\Work\War3\Maps\ShadowTest\光影测试(桥斜坡).w3x`。
+
+**确定根因与修复**：
+
+- S1 early-cache 命中路径在 `d3d9_device.cpp` 中只向
+  `shadowCasters` 追加缓存 draw 后直接 return；但
+  `BuildShadowReplayDraws` 的 canonical 输入只有 `shadowInstances` 和
+  `shadowFallbacks`，裸 `shadowCasters` 不会进入当前阴影图。
+- 因此缓存命中和资源 lifetime 都正常，caster 却从当前 replay 集合消失；旧的
+  120 帧 last-complete hold 暂时掩盖缺口，hold 到期后暴露，形成约两秒闪烁。
+- early hit 现在按原 backing 合同恢复发布：persistent-backed 条目发布
+  `War3ShadowInstanceRef`，fallback-backed 条目发布
+  `War3ShadowFallbackDraw("s1-early-cache")`；随后仍保留兼容
+  `shadowCasters`。当前桥图 8 个 entry 全为 fallback-backed。
+- 新增 accepted hit / replay published / instance / fallback 逐帧计数和
+  closure mismatch；报告聚合与 `workloadSeries` 均可直接检查
+  `accepted == published == instance + fallback`。
+
+**同专图前后证据**：
+
+- 旧报告 `war3_perf_report_auto_2026_07_24_14_38_39.html`：4,234 条 series
+  中有 **1,058 帧（25.0%）** 在 receiver 活跃且 S1 已捕获时
+  `replayCasterCount=0`；`semanticSceneReceiverHoldEmptyReplayCount=604`。
+- 新默认门
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_24_16_38_54.html`：
+  2,849 帧、31.786 秒；64,358 accepted hits / 64,358 published /
+  64,358 fallback / 0 instance，**逐帧 mismatch=0**；
+  receiver 活跃但 replay=0 的帧 **1,058→0（-100%）**，
+  hold-empty **604→0（-100%）**。可见 S1 数量在 20～28 间变化并发生
+  510 次集合切换，证明循环相机反复进出视野已覆盖。
+- 同轮 `framesIncomplete=0 / deviceLost=0 / capacityReject=0`，GPU
+  2.342 ms；绝对 FPS 受用户前台负载影响不作为收益口径。
+- 一次因未显式跳过不适用于桥图的旧 hot-shadow 前置门而延长的隔离运行，仍得到
+  `16:35:41` 报告：9,307 observed frames，210,040 accepted /
+  210,040 published，mismatch=0、hold-empty=0、device-lost=0。其 gate artifact
+  因 hot-shadow timeout 标记 false，不作为正式门，仅作长时稳定性旁证。
+
+**验证与部署**：
+
+- 静态安全合同现为 9/9 PASS；Hook catalog 10/10、manifest 4/4、
+  Hook Breakdown mock 4 cases PASS；`ninja -n` no-work。
+- 正式 artifact：
+  `AutoTest/artifacts/bridge_ramp_s1_replay_closure_default_c3f6_20260724.json`；
+  最终帧：
+  `AutoTest/artifacts/screenshots/war3_20260724_163912.png`。
+- exact DLL：30,518,322 bytes，SHA-256
+  `C3F6ABA247DE24E74C8F97E60185F0281D16D5B8E2492844D100C0CFD0B01020`；
+  `build32` 与 `E:\Work\War3\d3d9.dll` exact。
+- 回退：
+  `E:\Work\War3\d3d9.dll.bak_20260724_DC8A_pre_s1_replay_publish`
+  （SHA `DC8A878C...`）。
+
+**仍需用户物理屏验收**：隔离桌面最终帧显示桥/斜坡阴影完整，但单张捕获不能证明
+时间域绝无闪烁。代码与逐帧 replay 缺口已完全闭合；请用户用同一循环图肉眼确认。
+若仍有闪烁，下一步只查实际 shadow-set 内容/矩阵连续性或显示 present，不要再改
+S1 resource cache，也不要延长 last-complete hold 掩盖问题。
+
+## 🚨 2026-07-24（14:09 桥/斜坡 ManifestCopy 巨卡修复，未 commit）
+
+用户报告
+`E:\Work\War3\WarVK\Log\war3_perf_report_2026_07_24_14_09_49.html`
+中 `ManifestCopy` 为 6.855 ms/frame，但只有 0.167 calls/frame；每次真实进入
+p50 35.835 ms / p95 87.376 ms / max 115.587 ms。直接 chrono 为
+11,858.765 ms / 294 次，即 40.336 ms/次；总共只扫描 4,964 条、单次最多
+33 条，证明不是 vector copy 或大记录数量。
+
+**根因与修复**：
+
+- `ConvertVisible` 的旧 `ManifestCopy` 名称覆盖了复制、模型资源解析、geoset
+  解析和 append。桥/斜坡的 runtime model 有效，但 `OwnedModelDataHandle`
+  无法解析成直接 model resource；旧代码因此对每条 visible record 重复调用
+  `resolveDirectModelResourcePtr`，最坏扫描 30 个一级偏移 × 30 个二级偏移。
+  `SafeReadPtrFast` 当前每次仍执行 `VirtualQuery`，于是一次失败解析可触发约
+  900 次内核查询。
+- `ResolveModelResourceForContract` 现有 4,096 项 thread-local 直接映射缓存，
+  精确键为 `(runtimeModelPtr, OwnedModelDataHandle, resourceCache.revision)`；
+  正/负结果均缓存。每次调用仍重读 owned handle，handle 或资源 revision
+  变化立即走旧深解析。`DXVK_WAR3_MANIFEST_MODEL_RESOURCE_CACHE=0` 可精确
+  回滚。
+- 默认关闭的强验证器
+  `DXVK_WAR3_MANIFEST_MODEL_RESOURCE_CACHE_VERIFY=1` 会在每次 cache hit
+  重新执行旧 30×30 resolver 并逐指针比较；
+  `..._VERIFY_ASSERT=1` 在 mismatch 时 abort。另加入 attempt/hit/deep/null/
+  verify 计数并贯通 control-plane 和 perf report。
+- 同时加入 source-backing/raw-geoset 诊断。桥图实测 source-complete hit=0，
+  raw geoset 每次最多 4 项且无 miss，证明它们不是本次主因；source-backing
+  fast path 因此保持默认关闭，不把无收益实验转正。
+
+**同 DLL 验证与比例结果**：
+
+- exact verifier 报告
+  `war3_perf_report_auto_2026_07_24_14_37_33.html`：
+  4,346 attempts / 4,268 cache hits / 78 deep resolves /
+  **4,268 verifier attempts / 0 mismatch**；验证器主动重跑旧逻辑时
+  43.062 ms/真实进入。
+- 默认生产报告
+  `war3_perf_report_auto_2026_07_24_14_38_39.html`：
+  4,234 帧，`framesIncomplete=0 / deviceLost=0`；
+  10,097 attempts / 10,021 hits / 76 deep resolves，命中率 99.25%。
+  直接 chrono 228.781 ms / 555 次 = **0.412 ms/真实进入**，
+  相对用户旧报告下降 **98.98%（约 97.85×）**，相对同 DLL 强验证下降
+  **99.04%（约 104.46×）**。报告 scope 从 6.855 降到
+  0.037 ms/frame；p50 0.036 ms / p95 0.097 ms。单次 max 54.887 ms
+  是极少冷解析或外部抢占，不代表重复进出视野的常态路径。
+- 静态合同 `AutoTest/test_manifest_source_backing_fastpath_static.py`
+  4/4 PASS；隔离桌面截图成功，War3 为 `BELOW_NORMAL`，未控制用户前台。
+
+**当前 exact 部署**：
+
+- `E:\Work\War3\d3d9.dll`：30,514,137 bytes，SHA-256
+  `DC8A878C80E3A7695D2284B0580F7A103C73082E86BD3AC0F85C719ADD17C83C`。
+- 强验证 artifact：
+  `AutoTest/artifacts/bridge_ramp_manifest_model_cache_verify_dc8a_20260724.json`；
+  默认 artifact：
+  `AutoTest/artifacts/bridge_ramp_manifest_model_cache_default_dc8a_20260724.json`。
+- 回退：
+  `E:\Work\War3\d3d9.dll.bak_20260724_CD00_pre_manifest_source_backing`
+  和
+  `E:\Work\War3\d3d9.dll.bak_20260724_D025_pre_manifest_model_cache`。
+
+**下一顺序**：让用户用前台桥/斜坡循环图确认重复进出视野不再巨卡；若仍能感知
+首次冷卡，给 deep resolver 单独做低频 timing，并用批量安全读取 + 旧算法逐结果
+verifier 收窄首次 30×30 探测。不要取消 handle/revision 失效条件来换性能。
+
+## 🚨 2026-07-24（黑块/撕裂专项）：索引 fail-closed + TAA history 完整性（未 commit）
+
+用户补充报告：画面周期性瞬时出现纯黑缺块，形态有时像撕裂、有时像局部渲染
+消失。本轮继续只使用隔离桌面和 `BELOW_NORMAL` 进程，未控制用户前台。
+
+**已修复的两个确定性错误**：
+
+- DrawTime 阴影缓存原始 draw 为 indexed、但 IB 捕获因预算/容量/资源失败时，旧
+  代码会把 entry 改成 non-indexed；消费者随后把 position range 顺序解释成三角形，
+  可产生覆盖大面积屏幕的错误三角/黑楔。`War3DrawTimeVBEntry` 现有显式
+  `captureComplete/HasCompleteBacking()` 合同，5 个消费者统一拒绝不完整 backing；
+  indexed IB 失败保留 indexed 身份并中止发布，不再错误降级。
+- Shadow TAA 旧代码只看 `shadowTaaActive` 就推进 ping-pong 并把 history 标有效，
+  即使 `drawReceiver` 因瞬时资源条件早退、HistoryWrite 根本没有写入。现在只有
+  receiver fullscreen draw 确实录制且 write image 存在才 barrier/推进；失败帧保留
+  最后一张完整 history，并让下一帧 current-only 后再恢复混合。
+- 新增 `drawTimeVBCacheRejectIncompleteIndex`，以及 cadence 的
+  `shadowHistoryAdvancedThisFrame /
+  shadowHistoryAdvanceSkippedIncomplete`；同时补齐 control-plane 序列化和
+  pre-receiver 占位统计合并，避免新 outcome 被下一次旧场景发布清零。
+
+**后台验证**：
+
+- indexed fail-closed 候选 `FF8492C0...`：桥/斜坡循环图 4298 帧，
+  `framesIncomplete=0 / deviceLost=0`，报告
+  `war3_perf_report_auto_2026_07_24_11_50_42.html`。
+- 两项渲染修复候选 `DCD840B6...`：同图 7200 帧，
+  `framesIncomplete=0 / deviceLost=0`；10 次 control-plane 连续截图均成功，
+  未看到错误巨型三角或局部未渲染块。报告
+  `war3_perf_report_auto_2026_07_24_12_12_36.html`，artifact
+  `AutoTest/artifacts/bridge_ramp_black_block_full_guard_dcd8_20260724.json`。
+- 最终仅追加诊断合并的 exact `CD005F64...` 又通过 202 帧与 2028 帧短门，
+  均 `framesIncomplete=0 / deviceLost=0 / cleanup=true`；报告
+  `12:20:09 / 12:22:28`。静态合同 7/7 PASS，ninja no-work。
+
+**最终部署**：
+
+- `E:\Work\War3\d3d9.dll` = 30,373,374 bytes，SHA-256
+  `CD005F64DC0338E79DCF4FB9E800DCC0A5751EFA02E5A3DBA432EF2F17AE5768`；
+  与 `build32` exact。
+- 回退备份：`d3d9.dll.bak_20260724_FF84_pre_taa_history_gate`、
+  `d3d9.dll.bak_20260724_DCD8_pre_taa_diag_merge`、
+  `d3d9.dll.bak_20260724_C2CA_pre_taa_diag_preserve`。
+
+**仍需用户物理屏验收的独立问题**：FPS 解锁当前会强制
+`D3DPRESENT_INTERVAL_IMMEDIATE`，日志确认 Vulkan present mode 为
+`VK_PRESENT_MODE_IMMEDIATE_KHR`。隔离桌面的 backbuffer 截图无法捕获扫描输出撕裂；
+而测试图的相机周期性经过大片黑色战争迷雾，物理 tear 会特别像横向黑块。若新 DLL
+后只剩水平接缝，下一步应单变量 A/B `dxvk.tearFree = True`（优先 MAILBOX，缺失时
+回退 FIFO），不要再归因于阴影资源损坏；该模式可能改变显示延迟/帧率口径，尚未设为
+默认。
+
+## 🚨 2026-07-24（桥/斜坡专项收口）：S1 不稳定源隔离 + 越界拷贝保险（未 commit）
+
+用户新建循环视野地图
+`E:\Work\War3\Maps\ShadowTest\光影测试(桥斜坡).w3x`，用于反复让桥/斜坡进入和
+退出视野。用户报告的问题为：首次入镜严重卡顿、再次入镜重复卡顿、阴影周期闪烁，
+晃动数次后游戏未响应。本轮全程只在隔离桌面运行 War3，进程
+`BELOW_NORMAL`，未控制用户前台；无需 IDA。绝对 FPS 受用户前台高负载影响，结论
+只使用同地图的资源局部比例、逐帧工作量与设备稳定性。
+
+**根因与反证链**：
+
+- 用户报告 `war3_perf_report_2026_07_24_10_23_07.html` 已显示 512 MiB
+  persistent pool 顶满、6523 次 capacity reject、约 5.35 GiB 请求和约
+  1.60 GiB 淘汰；GPU 仅约 1.64 ms，不是 GPU 光栅瓶颈。
+- 旧 exact `EEDFB123...` 的两次专图后台基线
+  `10:34:53 / 10:36:34` 分别只有 1603 / 1231 帧，却产生 14510 / 14116 次
+  persistent create、8.23 / 7.67 GiB 请求、2.36 / 2.13 GiB 淘汰；池峰值均为
+  512 MiB，capacity reject 为 9291 / 9601，并出现
+  `VK_ERROR_DEVICE_LOST`。
+- 仅打开旧 indexed 前缀 trim 虽减少约 56% 请求，仍 device-lost；同 DLL 只关闭
+  `DXVK_WAR3_S1_TERRAIN_PERSISTENT_GEOMETRY` 后立即变为
+  `deviceLost=0 / reject=0`，证明故障严格属于 S1 persistent 晋升域，而不是阴影
+  pass 本身。
+- S1 旧准入允许 UP/ring 动态上传仅靠 source-key/world-matrix 进入跨帧缓存，
+  每个 tile 又创建独立 device-local VkBuffer。相机循环导致分配、容量拒绝、240 帧
+  淘汰再创建的锯齿。DrawTime 旧 fingerprint 还遗漏 IB identity/backing/slice、
+  UV source/layout、topology 与 vertexOffset，可能复用陈旧 backing，对应闪烁风险。
+- DrawTime position/UV/index 扩容失败或单帧 alloc budget 耗尽时，旧代码可能保留
+  较小旧 buffer，却按更大的新字节数继续 `copyBuffer`；这是可直接导致
+  Vulkan 越界提交和 device lost 的正确性漏洞。
+
+**已落地的默认修复**：
+
+- `DXVK_WAR3_S1_PERSISTENT_UNSTABLE_SOURCE=0`（默认）：S1 persistent 只允许
+  非 DynamicSysmem、非 `D3DUSAGE_DYNAMIC` 且 IB 同样稳定的 backing。UP/ring 或
+  动态 IB 仍正常画阴影，但走已验证的逐帧 fallback，不再跨帧晋升。
+  `=1` 仅用于危险的旧行为诊断回滚。
+- `DXVK_WAR3_S1_PERSISTENT_BORROW_STATIC=1`（默认）：真正静态的 S1 VB/IB
+  直接持有原 `DxvkBufferSlice` 的 `Rc`，不再为每个桥/斜坡 tile 额外分配和复制。
+  retained upload 不计入 persistent owned-byte cap；`=0` 恢复旧 allocate+copy。
+- `DXVK_WAR3_DRAWTIME_SOURCE_FINGERPRINT_REUSE=0`（默认）：完整 source
+  descriptor verifier 落地前，同帧/跨帧都不允许依赖现有不完整 fingerprint
+  跳过拷贝；`=1` 仅恢复旧诊断路径。
+- DrawTime position、独立 UV、IB 三条 copy 路径现在都在提交前验证
+  `capacity >= requested bytes`；预算延期/创建失败会清空当帧 descriptor/readiness，
+  绝不再向旧的小 buffer 提交大 copy。
+- 新增
+  `AutoTest/test_bridge_ramp_shadow_safety_static.py`；与 iterator 合同合计 7 tests
+  PASS。最终 `ninja -C build32 src/d3d9/d3d9.dll -n` 为 no-work。
+
+**最终专图验证**：
+
+- 最终 exact DLL：30,368,952 bytes，SHA-256
+  `BCA7F82E6643E3C823B8BF36129EA1133AD6CB25C2F54FD13B4019B862F00118`；
+  build32 与 `E:\Work\War3\d3d9.dll` exact。
+- 默认短门：
+  `war3_perf_report_auto_2026_07_24_11_07_21.html`，504 帧，
+  `deviceLost=0 / framesIncomplete=0 / capacity reject=0`，persistent pool
+  峰值 473,856 bytes。
+- 默认长门：
+  `war3_perf_report_auto_2026_07_24_11_08_54.html`，2777 帧 / 44.821 秒，
+  工作量序列明确覆盖 **20 次** replay 从 0→非 0（反复重新入镜）；
+  `deviceLost=0 / framesIncomplete=0 / capacity reject=0`。create=550，
+  requested=1,802,496 bytes，pool peak=500,736 bytes，
+  evicted delta=1,363,968 bytes。
+- 对两轮旧基线按帧归一化：persistent create **-97.8%～-98.3%**，
+  requested bytes **-99.987%～-99.990%**，evicted bytes
+  **-99.967%～-99.972%**，pool peak **-99.907%**。同时
+  `ShadowCapture 0.264/0.320 → 0.252 ms/frame`（约 -4.5% / -21.3%），说明
+  安全 fallback 没把 capture CPU 变成新瓶颈。
+- artifacts：
+  `AutoTest/artifacts/bridge_ramp_safety_s1off_590f_20260724.json`、
+  `bridge_ramp_safety_default_short_bca7_20260724.json`、
+  `bridge_ramp_safety_default_long_bca7_20260724.json`。
+- 回退备份：
+  `E:\Work\War3\d3d9.dll.bak_20260724_EEDF_pre_bridge_ramp_safety` 和
+  `E:\Work\War3\d3d9.dll.bak_20260724_590F_pre_s1_stable_gate`。
+
+**仍需用户前台确认**：隔离 Desktop 的内部最终帧捕获接口超时，且按合同拒绝回退
+截图用户可见桌面，所以本轮不能诚实宣称已做画面对照。资源锯齿、设备丢失和重复入镜
+稳定性已实测消除；用户需用同一地图肉眼确认桥/斜坡阴影不再周期闪烁。若仍有纯视觉
+闪烁，下一步只做完整 IB/UV/topology/source descriptor verifier 与 shadow-set
+连续性追踪，不能重新放开不稳定 S1 persistent。
+
+## 🚨 2026-07-24（上午阶段收口）：NativeHint/DrawTime/CurrentDraw 继续下钻 + 两项默认优化（未 commit）
+
+本阶段继续遵守无人值守合同：所有 War3 均在隔离桌面、游戏与构建进程均为
+`BELOW_NORMAL`，未控制用户前台；性能结论只使用同 DLL ABBA 的局部耗时/调用与
+同帧控制比例，不把外部高负载下的绝对 FPS 当收益。动画、可见性、阴影像素和
+persistent 容量语义均未修改。
+
+**可观测性 1 — CurrentDraw 固定 ID 调用树**：
+
+- `war3_hook_perf.h`、`war3_current_draw_contract.{h,cpp}` 新增默认关闭的
+  `DXVK_WAR3_PERF_CURRENT_DRAW_BREAKDOWN=1`，复用 CurrentDraw 根的 1/32
+  预选 HT 样本，输出 ContextGate / RecordSeed / VisibleBackfill /
+  FrameIdentity / BindFieldRefresh / PublishContract，以及 Publish 下
+  LocalGateCache / TrustedPaletteQueryPack / SnapshotCommit / GlobalMaps。
+  旧 `Semantic/CurrentDraw/*` 字符串 scope 在 Level2 关闭，避免双记账。
+- fixed path capacity 96→192，并新增
+  `Profiler_HotHookPathOverflow/NearCapacity` 零耗时告警。明细门
+  `war3_perf_report_auto_2026_07_24_07_49_55.html` 中两项告警均未出现，
+  旧 scope 为 0；Common Publish 约 0.172 ms/frame，Special 约 0.087，
+  其中 Local/Snapshot/Trusted 是主要已知子项。
+- 该树本身有明显 observer tax；`PublishContract self` 混入 path bucket 查找/
+  push/pop，不能直接当业务热点。开关默认关闭，只用于递归调查。
+
+**默认优化 1 — producer-off NativeHint 全局 fast return**：
+
+- 当前 `kWar3ShadowProjectorNativeHintEnabled=false`；全仓唯一两个 producer
+  `recordFromObject/recordSimple` 都被同一 `if constexpr` 编译剔除，registry
+  全进程恒为空。`War3TryResolveNativeShadowHint` 现在在 profiler 和最多 13 次
+  mutex/map probe 前直接返回 false；空 registry 的每帧 `beginFrame` 也跳过。
+  miss 时 `outHint` 仍保持不变。未来 producer flag=true 时整个 fast path 被编译
+  删除。`DXVK_WAR3_NATIVE_HINT_PRODUCERLESS_SKIP=0` 精确恢复旧查询。
+- 静态测试会扫描整个活跃 `src/d3d9` 的所有 producer 调用点，防止未来新增未受
+  同一门控的 writer。两路独立审查均 PASS。
+- 同 DLL `01F76EF8` A1/B1/B2/A2（报告 08:05:44 / 08:08:59 /
+  08:12:38 / 08:15:44）：DrawTimeCapture 工作量 246.36～247.18 calls/frame，
+  差异 <0.4%；NativeHint A 平均 0.049→B 0.0025 ms/frame，局部约
+  **-94.9%**。四轮均 device-lost=0、incomplete=0。
+
+**可观测性 2 — DrawTimeCapture 11 段固定 QPC 树**：
+
+- 新增默认关闭的 `DXVK_WAR3_SHADOW_DRAWTIME_BREAKDOWN=1`：
+  IdentityResolve / GpuSkinInput / PositionSource / MarkerGatesAndBounds /
+  FingerprintAndDedup / CacheRecordSetup / PositionBacking / UvBacking /
+  IndexBacking / FinalizeAccounting / GpuSkinSettlement。
+- 复用既有 ShadowCapture xorshift admission/sample weight；默认关闭时不读
+  QPC。抽样叶节点互斥并按 always-on exact `DrawTimeCapture` 父 ticks 归一化，
+  无样本时保留父 self，不伪造数据。
+- 明细门
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_24_08_28_18.html`：
+  11/11 叶节点齐全，父 0.243 ms/frame、self=0；三位显示精度下叶和
+  0.245（2 us 舍入差）。当前排序：
+  FingerprintAndDedup≈0.073、IndexBacking≈0.057、
+  CacheRecordSetup≈0.052、PositionBacking≈0.037 ms/frame，其余明显较小。
+  artifact：
+  `AutoTest/artifacts/unattended_gate_drawtime_breakdown_1d2e_20260724.json`。
+
+**默认优化 2 — DrawTime cache iterator 复用**：
+
+- FingerprintAndDedup 已经 `find(vbCacheKey)`；当 entry 存在但不能 early-dedup
+  时，旧 CacheRecordSetup 仍用 `operator[]` 对同一 key 重复 hash/find。现在复用
+  尚未失效的 iterator；miss/gpu-skin 路径仍执行原 `operator[]` 默认构造。
+  `DXVK_WAR3_DRAWTIME_CACHE_ITERATOR_REUSE=0` 精确回滚；
+  `..._VERIFY=1` 再走旧 lookup 并比较节点地址，不同立即 abort。
+- 独立审查证明 find→deref 间无 insert/erase/rehash/reentrancy，PASS。verifier
+  强门 `08:47:31` 3339 frames 无 abort、device-lost=0、incomplete=0。
+- 同 DLL `EEDFB123` A1/B1/B2/A2（报告 08:49:11 / 08:50:51 /
+  08:52:30 / 08:54:31），CacheRecordSetup 调用量 180.46～182.13/frame：
+  原始单位调用约 **-6.79%**；同期未修改的 FingerprintAndDedup 因外部负载
+  +6.63%。用该同帧控制归一化后，CacheRecordSetup 相对成本约 **-12.72%**，
+  两段合计占比 45.16%→41.82%。父 DrawTime 受噪声 +2.27%，不宣称整帧收益。
+
+**CurrentDraw 严格等价微优化（收益低于当前测量噪声）**：
+
+- 默认不再执行三个全工程无 reader 的 provenance `uint64_t` atomic RMW；
+  trusted hit 的重复累计由 canonical
+  `g_paletteCaptureTrustedSourceHitCount` 在 summary 导出时派生。字段/JSON key
+  保持不变；`DXVK_WAR3_CURRENT_DRAW_REDUNDANT_ATOMICS=1` 恢复旧四个写入。
+  32-bit MinGW 下每次 RMW 是 `lock cmpxchg8b`，静态等价性与独立审查 PASS。
+- 同 DLL ABBA 中 TrustedQueryPack 单位调用约 -13.8%，但 SnapshotCommit
+  +8.7%、Publish parent +4.6%，方向混合且被 Level2 observer/外部负载淹没；
+  因此只记录“确定少执行指令”，**不宣称可测整帧收益**。
+
+**新发现但本阶段未盲修的正确性风险**：
+
+- DrawTime `captureFingerprint` 实际未包含 IB identity/backing/slice/index type、
+  UV source/layout、topology、`consumeVertexOffset`，且可在 IB 未成功捕获时提交
+  fingerprint；同 part 改 IB/UV 或一次预算冷失败可能错误复用旧/不完整 entry。
+- IB/独立 UV 已有旧 buffer 但 capacity 不足、当帧 alloc budget 又耗尽时，现代码
+  仍可能因 buffer 非空而提交更大 copy，存在目的容量不足风险。
+- 下一阶段应先加默认关闭的完整 source descriptor verifier，分别统计 same-frame/
+  cross-frame false hit 与 incomplete commit；在数据前不要扩大 dedup，也不要把
+  该风险修复误算成性能回归。跨帧 copy-skip 在取得 content-generation 证明前
+  不能视为严格安全。
+
+**最终统一构建/部署**：
+
+- exact DLL：30,363,639 bytes，SHA-256
+  `EEDFB123BAEF12F52837F234BC55EC5360A288F0598124A96771CA20E17F019A`；
+  `build32` 与 `E:\Work\War3\d3d9.dll` 完全一致，ninja no-work 通过。
+- 静态合同：Hook/DrawTime 10 tests、CurrentDraw atomics 5 tests、
+  iterator reuse 2 tests，全通过。
+- 最终默认 Level1 高压门：
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_24_08_56_57.html`，
+  2824 frames / 16.308 ms / GPU 2.264 ms；绝对值仅作样本说明，不作收益口径。
+  `framesIncomplete=0`、device-lost=0、cleanup=true、War3=BELOW_NORMAL。
+  artifact：
+  `AutoTest/artifacts/unattended_gate_final_default_eedf_20260724.json`。
+- 回退备份：
+  `E:\Work\War3\d3d9.dll.bak_20260724_1D2E_pre_iterator_reuse`
+  （SHA `1D2EC8DC...`）、
+  `d3d9.dll.bak_20260724_01F7_pre_drawtime_atomic`（SHA `01F76EF8...`）和
+  `d3d9.dll.bak_20260724_2104_pre_native_hint`（SHA `21043C5A...`）。
+
+**下一顺序**：先实现 fingerprint/IB/UV 完整 descriptor observer + incomplete
+capacity verifier；随后按 DrawTime 新树继续处理 IndexBacking 与真正的
+FingerprintAndDedup self。CurrentDraw 后续优先考虑 packed 3x4 直接读取以及 TLS
+state 合并，但两者都必须先做 byte-for-byte/snapshot verifier。不要仅因原生
+`UiRenderable/Sprite` 或 `FrameAnchorVisibilityQuery` 耗时高而跳过动画/可见性逻辑。
+
+## 🚨 2026-07-24（清晨收口）：PublishVisible SafeCopy + Populate permutation view 转正（未 commit）
+
+本轮继续遵守夜间无人值守约束：所有 War3 均在隔离桌面、所有游戏/构建进程均为
+`BELOW_NORMAL`，没有切换用户前台；收益只按同 DLL 反序 A/B 的局部比例判断，不用受
+外部负载污染的绝对 FPS。动画、可见性判定、阴影像素和 persistent 容量语义均未改变。
+
+**转正 1 — PublishVisible 指针读取**：
+
+- `war3_hook_render.{h,cpp}`：`renderablePart` 的 mesh/scene 小字段读取默认从
+  `SafeReadPtrFast` 改为一次 current-process `SafeCopy`；preset scene 时只复制
+  4-byte mesh，scene 为空时一次复制 `0x0C..0x17`。复制先落临时量，只有完整成功才
+  提交；失败完整回退旧路径。`DXVK_WAR3_PUBLISH_VISIBLE_SAFE_COPY=0` 可精确回滚。
+- 同 DLL `4BDE9958` 反序 A1/B1/B2/A2：`PublishVisible_SafeRead` 每调用
+  `1.4252→1.2530 us`，平均 **-12.09%**，两对分别 -11.42% / -12.71%，
+  约 224 calls/frame；外部负载下绝对帧时反向漂移，因此只采信局部比值。
+- 独立 verifier（候选/旧实现均写局部临时量，mismatch 重读区分稳定/并发变化，
+  release assert 使用 `abort`）在报告
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_24_06_47_14.html`
+  以 period=1 比较 **670,784** 次：copy failure=0，initial/stable mismatch=0，
+  unstable=0，两个 mask OR=0，两个 mismatch 数组 1..7 全 0，
+  stableMatch=attempts。artifact：
+  `AutoTest/artifacts/unattended_gate_safecopy_verify_C6AD_20260724.json`。
+
+**转正 2 — Populate Submit permutation view**：
+
+- `d3d9_device.cpp`：保留 stable-sort 得到的 index permutation，group/core-gate/cap/
+  append 通过 view 访问原 `EligibleRecord`，不再把含多组 vector/matrix/palette 的完整
+  record 搬进第二个 vector。独立审查发现 initial vector 扩容可能留下 self-alias；
+  VIEW 现先做一次全量 `War3RebindEligibleRecordPackets`，不依赖 provisional-filter
+  配置，随后 storage 不再增删。`DXVK_WAR3_POPULATE_SUBMIT_PERMUTATION_VIEW=0`
+  可精确回滚。
+- VERIFY-only 独立构造旧版 materialization shadow，逐项+最终 rebind；完整比较
+  packet/renderable/resource/pose/material、矩阵/动态流/runtime palette/sample hashes、
+  owned-vector 内容与 alias 状态，不执行第二次 append，口径明确限定为
+  **mapping + append-input equivalence**。
+- 强门报告
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_24_06_55_43.html`：
+  2943/2943 passed frames，516,746 eligible inputs、516,633 attempted inputs，
+  mapping/input mismatch=0，hash 全相等，`framesIncomplete=0`。artifact：
+  `AutoTest/artifacts/unattended_gate_populate_permutation_verify_7A3C_20260724.json`。
+- 同 DLL `7A3CC4AF` 反序 A1/B1/B2/A2（报告时间 06:57:56 / 06:59:45 /
+  07:01:27 / 07:03:06），记录工作量仅 -0.082%：
+  `MaterializeAndRebind→PermutationViewRebind` **-94.78%**
+  （-94.69% / -94.86%，局部省 0.01977 ms/frame）；
+  `SubmitGroupSort` **-58.17%**（-61.07% / -54.73%）；
+  整个 `Submit` **-4.56%**（-7.49% / -1.65%）。artifacts：
+  `AutoTest/artifacts/unattended_abba_popview_7A3C_{A1,B1,B2,A2}_20260724.json`。
+
+**被数据否决、保持默认关闭**：
+
+- 1024-entry semantic augment TLS cache 虽把 collision 降到 2%～5%，但 generation
+  mismatch 约 35%，同 DLL Model/Shadow lookup 分别 **+23.6% / +20.2%**，不转正。
+- visible semantic merge index verifier 零 mismatch，但 `RegistryRegister` 平均
+  **+5.21%** 且两对方向不稳，不转正。审查另发现 latent 多索引不变量缺口：
+  merge 若把 `renderablePart` 从 null 补成非 null，可能未同步
+  `renderablePartRecordCount/byRenderablePartLayer`；当前默认活跃 producer 未证明会
+  形成该输入组合，未在性能轮盲改，后续应先加专用计数/verifier。
+
+**最终统一构建/部署**：
+
+- exact DLL：30,290,241 bytes，SHA-256
+  `1FB73F45813682D90A9D43B7E1332A8757654EBA0ACB274A0D4EADDCA5BEA152`；
+  `build32` 与 `E:\Work\War3\d3d9.dll` 完全一致，ninja no-work、Hook catalog
+  6 tests、前端 JS parse + 4 mock cases 全通过。
+- 默认 Level1 高压门：
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_24_07_08_49.html`，
+  3239 frames / 14.218 ms / GPU 2.114 ms，`framesIncomplete=0`、device-lost=0；
+  46 个默认 Hook installed，32 个 detail/unsafe catalog 项按门控未安装。
+  artifact：`AutoTest/artifacts/unattended_gate_final_defaults_1FB7_20260724.json`。
+- 回退备份：
+  `E:\Work\War3\d3d9.dll.bak_20260724_7A3C_pre_final_defaults`
+  （SHA `7A3CC4AF...`）和
+  `E:\Work\War3\d3d9.dll.bak_20260724_4BDE_pre_safecopy_verify`
+  （SHA `4BDE9958...`）。
+
+**下一顺序**：继续拆 `CurrentDraw UpdateWorldMatrix/WarVKHookLogic`（约
+0.17～0.26 ms/frame）与 `ShadowCapture/Gates/RuntimeBridge`；任何 frame-invariant
+缓存先做完整输入 verifier。Populate 的下一个真实大头是 BuildEligible/Append，
+不再重复优化已降到约 0.016 ms/frame 的 GroupSort。
+
+## 🚨 2026-07-24（夜间无人值守）：资源热路径 + CSM descriptor 复用 + Lifecycle 可观测性（未 commit）
+
+用户明确授权夜间无人值守继续优化。本轮全程只使用隔离桌面、`BELOW_NORMAL`
+War3/构建进程和同工作量局部比例；未使用 IDA、未切换或占用用户前台，未改变动画、
+可见性、阴影像素或 persistent 容量语义。所有改动仍与此前工作一起留在未提交工作区。
+
+**默认路径优化与独立验证**：
+
+- `war3_visible_renderables.{h,cpp}`：manifest pose freshness 从每轮构造
+  `unordered_set` 改为对象内 `poseFreshGeneration`；generation 0 保留、每次 refresh
+  都递增、回绕全清，空/全无效输入仍走旧结果。默认关闭的新旧双算法验证器在 3252
+  次 aggregate/scan、1,923,496 条 model record 上
+  `modelMismatch=0 / poseMismatch=0 / manifestMismatch=0`。
+- 同工作量旧 `CF8FB705` → 新 `FB664193`：`ManifestPublish 0.084→0.068`
+  ms/frame（-19.0%），`BuildEligible 0.481→0.412`（-14.3%），
+  `RecordLoop 0.312→0.261`（-16.3%），`Populate 1.217→1.077`
+  （-11.5%）。考虑外部调度噪声后，以相邻父节点归一化的局部下降约
+  **5.5%～13.9%**，不以 FPS 宣称收益。
+- registry tracking decision 已改为同轮 aggregate 的 O(1) 决策；默认局部
+  `0.063～0.077→0.008 ms/frame`（约 **-87%～-90%**），brute verifier
+  全部零 mismatch。
+- `d3d9_war3_shadow.cpp` 新增保守的 CSM 跨 draw descriptor 复用：
+  仅 descriptor-buffer 后端、仅 non-direct、每 cascade 单项 last-bound；
+  签名完整覆盖 layout、三个 buffer 的
+  `VkBuffer/offset/size/gpuAddress` 与冻结 alpha
+  `imageView/imageLayout`。direct/full-clear 强制失效，资源 lifetime tracking
+  保持原位；命中只省 descriptor write，push constants 仍逐 draw 更新。
+  `DXVK_WAR3_CSM_DESCRIPTOR_REUSE=0` 可精确回滚；默认关闭 verifier/assert
+  实机零 mismatch。
+
+**CSM 同 DLL 反序 A/B（`964E1F63`，相同高压图/约 1100 shadow draws）**：
+
+- OFF-A / OFF-B：`CascadeRecord` 每 descriptor request
+  `0.714 / 0.725 us`；
+- ON-A / ON-B：`0.441 / 0.426 us`，均值下降约 **39.8%**；
+- 整个 `DirectionalShadowMapPhaseSample` 按真实 CSM 执行帧归一化
+  `0.675 / 0.681 → 0.470 / 0.440 ms`，均值下降约 **32.9%**；
+- ON 两轮约 **82.7%** 请求变为 push-only，约 17.3% 保留 full bind；
+  未命中主要为 alpha 纹理切换。整帧绝对值受用户前台负载影响，未用于结论。
+
+**Hook 可观测性补齐**：
+
+- Hook Catalog pilot 已接入 schema v9 与独立前端：32 个 RenderPerf
+  默认关闭入口有固定 ID、激活门、ABI/地址、计时合同和状态；
+  当前 `31 DisabledByEnvironment + 1 SkippedUnsafeABI(0x368E90 隐式 EDI)`。
+  禁用入口不会作为 0ms 热点污染 Hook Breakdown；`hookInventory` 仍是未迁移域
+  的安装权威。
+- 11 个 Lifecycle 深层 Hook（TlsPump/SelectWorker/RunCallbacks/QueueFlush/
+  FinalizeTick/Reschedule/PrepareDispatch/FinalizeDispatch/TickUpdate/
+  FinalizeWorker/ComputeWakeDelta）使用 period 4/8 的固定 ID 树。
+  首轮 Level2 暴露“安装成功但多数调用在 EventPump boundary 外、无 section”
+  的覆盖漏洞；已增加 `War3HotHookRootedCallTiming`：
+  有外层 boundary 时保持动态父树，无外层时只为该调用建立 Level2 根边界。
+  RAII 顺序为 timing → publish → perfScope；默认 Level0/1 完全不创建该边界。
+- 最终 Level2 报告：57/57 inventory installed；本场景实际命中的 8 个
+  `Hook_Engine*` 全部出现 Hook total / `NativeOriginalInclusive` /
+  `ObserverOverhead` 或 `WarVKHookLogic`，闭合误差 ≤0.001ms（显示舍入）；
+  其余 3 个入口本轮未调用。Level1 最终门仅 46 个默认 Hook、Engine 深层
+  section 为 0，证明默认门正确。
+- 报告前端用独立 headless Chromium 验收：Hook Breakdown
+  46 contexts / 57 installed records、Catalog 32/32、Call Tree 新 Engine 根、
+  Timeline 16 列 Stage Trends 均正常；唯一 console error 为 `favicon.ico` 404。
+- frameSeries/stageSeries 已证实 9～11ms/120FPS 间歇切换是主线程、worker 和
+  uncovered frame wall 同时变化的广域调度/抢占现象，不是 WaitGate 或 GPU
+  单点；报告继续把 uncovered wall 明确标为 **NOT CPU hotspot**。
+
+**最终 exact 候选**：
+
+- build/deploy：`30,181,221 bytes`
+- SHA-256：
+  `CE4F42B882E18E14C02D59E6734282F56BEA818A8ACC1E73BE2090E4A62D8887`
+- ninja no-work；源码构建 DLL 与 `E:\Work\War3\d3d9.dll` hash/size exact。
+- 最终默认报告：
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_24_04_59_04.html`
+  （3145 frames，`framesIncomplete=0`）。
+- 最终 Level2 报告：
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_24_04_52_18.html`
+  （2955 frames，57/57 installed，`framesIncomplete=0`）。
+- CSM verifier：
+  `AutoTest/artifacts/unattended_gate_csm_descriptor_verify_964E_20260724.json`；
+  A/B：`unattended_gate_csm_reuse_{off_a,on_a,off_b,on_b}_964E_20260724.json`。
+- manifest 双验证：
+  `AutoTest/artifacts/unattended_gate_manifest_tracking_verify_FB66_20260724.json`
+  与 `unattended_gate_manifest_generation_default_FB66_20260724.json`。
+- 安全备份：
+  `E:\Work\War3\d3d9.dll.bak_20260724_FB664193_pre_csm_cross_draw_reuse`
+  和 `E:\Work\War3\d3d9.dll.bak_20260724_964E_pre_lifecycle_rooted`。
+
+**下一顺序**：继续以最终 Level2 的局部 self/inclusive 占比为准拆
+`WorldFramePrepare/NativeOriginal`、`UiRenderableRender`、
+`ShadowCapture/Gates` 与 Dispatch bridge；Catalog 仍是 partial pilot，应按域渐进迁移，
+不能把 32 当作全项目 Hook 总数。任何动画/可见性缓存或 alpha draw 重排必须另做
+语义证明与画面对照，不能从本轮 timing 直接推导。
+
+## 🚨 2026-07-23（16:20）：Persistent miss 优化转正 + Sprite/PostVisibility 第三级拆分（未 commit）
+
+本轮继续使用默认关闭的 Level-2 观察 Hook 下钻，并只把经过独立审查的严格等价
+优化放入默认路径。统一构建、no-work、两轮默认高压图和一轮全明细高压图全部通过；
+未使用 IDA、未占用用户前台。
+
+**已落地的默认路径优化**：
+
+- `d3d9_device.{h,cpp}`：persistent geometry 年龄 GC 在同一
+  `m_war3ShadowPersistentFrameSerial` 内最多全表扫描一次；Present 已在 serial
+  递增后扫过，随后每个 miss 不再重复 `O(liveGeometry)` 扫描。强制预算分支仍可
+  每次执行，max-age/淘汰/统计不变。
+- 新增 `War3CreateShadowPersistentGeometryAfterMiss`；两个已经完成外层
+  `War3TryFind...` 且仍处同一 device/render 串行域的调用点不再执行必然失败的
+  第二次哈希查询。
+- `war3_shadow_runtime_bridge.cpp`：ModelInstance 可写回的 7 个字段已经完整时，
+  跳过无副作用的 shared-lock + map read + POD copy；ShadowObject/Pose 顺序不变。
+- `war3_current_draw_contract.cpp`：active-slot snapshot 以 TLS occupancy bitmap
+  popcount 作为 reserve 上界，不再固定 reserve 4096；已排序 preferred keys 直接
+  binary-search，任意未排序调用仍精确回退旧 unordered_set。
+- 性能报告新增 6 个 persistent reject 原因：
+  `NoIdentity/UnsupportedMode/DynamicSource/AlphaBlend/MissingStorage/CreateOrBudget`。
+
+**新增默认关闭诊断**：
+
+- Sprite `0x12F0A0` 下新增 8 个 period-8 Observer 节点：
+  WithOverrides / Simple / ChildStagePresetTree / OverrideGraph /
+  AssignSpan / CopyOutput / DefaultAssign / Flush。仍只在
+  `PERF_LEVEL>=2 + DXVK_WAR3_PERF_SPRITE_NATIVE_BREAKDOWN_HOOKS=1`
+  且所有 pose/matrix producer 关闭时安装。
+- WorldPrepare `0x378420` 下新增 `FrameAnchorUpdate@0x377FD0` 与
+  `FrameAnchorVisibilityQuery@0x358CF0`，沿用默认关闭的
+  `DXVK_WAR3_PERF_WORLD_PREPARE_CORE_HOOKS=1`。
+- 全部 10 个新入口完成独立 ABI/地址/共址/默认门审查；明细报告 hook inventory
+  96/96 installed，默认报告仅 46 个，不安装这些 Observer。
+
+**实测结果**：
+
+- 旧明细 `15:39:04` → 新明细 `16:17:10`：
+  `PersistentLookup 0.288→0.042 ms/frame`，
+  `MissCreate 0.269→0.021 ms/frame`，局部确定净省约 **0.246 ms/frame**；
+  `PostGate 0.433→0.122 ms/frame`。调用次数仍约 29/frame，证明收益来自单次
+  miss 成本下降而非工作量减少。
+- 默认高压图两轮：
+  `16:15:17` = 61.091 FPS / 16.369 ms，
+  `16:20:37` = 61.732 FPS / 16.199 ms，GPU 均 2.012 ms；
+  对比上一 DLL 默认 `15:37:41` = 58.814 FPS / 17.003 ms。
+  FPS 含场景噪声，发布口径以局部 0.246 ms 为准。三轮
+  `framesIncomplete=0`，无 crash/device-lost/budget reject。
+- Sprite 新树：约 2.4 ms 的 `SetWorldMatrixAndEvaluateRootPose` 主要落在
+  `WithOverrides → EvaluateOverrideGraph`；Simple/ChildTree/assign/copy 很小。
+- WorldPrepare 新树：`PostVisibilityGlobalAdvanceA` 约 1.66 ms，其中
+  `FrameAnchorVisibilityQuery` 约 1.46 ms，外层扫描不是主体。
+- 新报告累计 `persistentRejectCreateOrBudget=34,687`（约 24.6/frame），其他
+  5 类 reject 为 0。现有名字仍混合 capacity 与 buffer-create；未取得 persistent
+  pool gauge 前不能盲修容量算法。已知旧 bug 是 force trim 不会为 incoming bytes
+  预留空间，但只有池接近默认 512 MiB 时才相关。
+
+**当前 exact DLL**：
+
+- build/deploy：`29,820,879 bytes`
+- SHA-256：
+  `37FFC3862316C1E358308B7142645DDEB2D2BD12A20F267EDB65A5FC0C2AD7EC`
+- 默认报告：
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_23_16_20_37.html`
+- 明细报告：
+  `E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_23_16_17_10.html`
+
+**下一顺序**：先给 CreateOrBudget 拆出 capacity/buffer-create 与 persistent pool
+gauge；随后继续拆 `EvaluateOverrideGraph@0x77C260` 和
+`FrameAnchorVisibilityQuery@0x358CF0`。在证据前不要缓存/跳过原生动画或可见性
+查询，也不要直接启用已知 capacity trim 改动。
+
+## 🚨 2026-07-23（下午）：WorldPrepare/PreRender 继续拆分 + ShadowCapture 低风险优化（未 commit）
+
+本轮在 Hook/Native/WarVK 动态树上继续做默认关闭的二级诊断，并只落地有同 DLL
+阶段计数支撑的低风险优化：
+
+- 新增 `DXVK_WAR3_PERF_SPRITE_FRAME_HOOKS=1`（同时要求 `PERF_LEVEL>=2`）：
+  四个 `CSpriteUber` frame-update 入口按 8 次抽样，分别输出 Hook total /
+  `NativeOriginalInclusive` / `WarVKHookLogic`；perf-only 模式不恢复已关闭的 pose、
+  registry 或 dt probe。
+- 新增 `DXVK_WAR3_PERF_WORLD_PREPARE_RESIDUAL_HOOKS=1`（同时要求
+  `PERF_LEVEL>=2`）：覆盖 0x368E00 / 0x3AC130 / 0x369370，纯观察器残差明确命名为
+  `ObserverOverhead`。0x368E90 依赖调用方隐式 EDI，普通 C++ MinHook detour ABI
+  不安全，刻意跳过。
+- `DispatchCommon/Special` 的完整动态分账由每调用采样改为 1/8 加权抽样；节点与
+  Native/WarVK 拆分保留，减少每帧数百次成对 QPC。
+- widget negative cache 默认 TTL 从 1 帧改为 8 帧（环境变量仍可设 1 精确回滚）；
+  positive identity cache 每 draw 先查，因此新发布身份立即胜出。高压同 DLL 分段：
+  `WorldMagicRead` 101.287→13.189 calls/frame、0.282→0.052ms，
+  `PathBlockerFallback` 0.320→0.088ms，`ShadowCapture` 1.696→1.541ms。
+- ShadowCapture 内多次 `executionRoute()` 机械合并为一次局部读取。曾尝试删除
+  DrawTimeCapture 二次 blocker 解析，但审计发现该块还向 4 个下游传播 rawcode，
+  已完整撤回，不能写成已优化。
+
+Level2 高压报告
+`E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_23_14_56_51.html`
+证明：`UiRenderableRender/NativeOriginalInclusive` 2.398ms 中，
+`SpriteFrameUpdate` 2.330ms（native 2.320 / Hook logic 0.010）、
+`SpriteMiniFrameUpdate` 0.130ms（native 0.120 / Hook logic 0.010），即旧 2.5ms
+黑盒几乎全部是 game.dll Sprite PreRender 本体，不是我方 pose producer。WorldPrepare
+三个残余入口仅约 0.03ms / 0 / 0，不是大头；Prepare native self 仍约 2.220ms 待拆。
+
+最终统一构建与部署 exact：29,783,860 bytes，SHA-256
+`F3061ED9F9FA1EF69EF4698B6106CA50CA8190E24F6D8F6D8AD5367481D0D6E0`。
+默认高压门报告
+`E:\Work\War3\WarVK\Log\war3_perf_report_auto_2026_07_23_14_55_46.html`：
+1455 帧、57.553fps、17.375ms、GPU 2.021ms、`framesIncomplete=0`。
+Level2 全诊断门：1462 帧、57.984fps、17.246ms、GPU 2.043ms、
+71 个 Hook inventory 全部安装成功、`framesIncomplete=0`。两轮均无 crash/device lost；
+全部改动仍未 commit。
+
+## 🚨 2026-07-23：Hook/Native/WarVK 动态分账 v2 完成（最终高压门通过，未 commit）
+
+用户要求解决热点榜多条 `Orig` 无法辨认、原函数区间混入 WarVK 回调却被误判为
+“纯原生耗时”的问题。本轮完成全域 Hook 安装盘点、低污染动态调用树、安装清单与
+前端 Hook Breakdown。**结论：旧 `Orig` 是 trampoline 墙钟 inclusive，不是纯
+game.dll CPU；原函数执行期间会重新进入 Dispatch/D3D9/Shadow/Registry 等 Hook。**
+
+**统一计时合同**：
+- Hook 根 = 整个 detour；`NativeOriginal`/`NativeOriginalInclusive` = 原函数指针墙钟；
+  `WarVKHookLogic` = detour 直接自定义逻辑；Native self = 扣除已识别嵌套子树后的残余。
+- `PERF_LEVEL=0` 关闭 Hook 计时；`1` 为默认低频 frame scope；`2` 才启用完整热 Hook
+  动态树。高频路径用固定 ID + TLS + QPC 加权抽样，禁止字符串 scope。
+- 旧 `MakeRenderHookDrawScope` 已退休；它与新树同路径重复写账，曾把 Common calls/
+  HookTotal 放大约 3 倍。最终报告闭合误差最大仅 0.001ms（显示精度舍入）。
+- `frameSeriesDebug` 已删除；section TLS cache 改 512 项小范围哈希探测，避免旧 64 项
+  线性 FIFO 在 200-300 个 section 下每帧抖出/锁争用。
+
+**覆盖范围**：Render/Dispatch/UI/JASS/Lifecycle/Wait/CurrentDraw/Model/Shadow/Widget/
+Storm、D3D9 四个 Draw、ShadowCapture 回调及条件 GPU-skin upload/copy kernel；中央
+`InstallMinHook` 和直接安装路径导出 `hookInventory`。最终默认报告有 48/48 installed，
+泛化 `Orig` 节点为 0。已知原生 StageUpdate/FlushTransparent 地址来自现有 address
+book，只加纯计时 detour；后续这条线**不需要 IDA**。
+
+**最终候选 DLL**：`E:\Work\War3\d3d9.dll` = SHA-256
+`48F13426F97067458FE1974BF5258ADA7ED95F4B9E0C62CCEB0F0DC4C9B01A54`
+（29,725,013 bytes，源码=构建=部署 exact，ninja no-work 通过）。最终高压 hot-shadow
+gate：`war3_perf_report_auto_2026_07_23_12_04_03.html`，4855 perf frames，51.606fps，
+19.377ms，GPU 2.400ms，`framesIncomplete=0`，无 crash/残留进程；artifact：
+`AutoTest/artifacts/perf_trace_gate_final_clean_20260723.json`。
+
+**最终 detail 报告**（低图、`PERF_LEVEL=2`）：
+`war3_perf_report_auto_2026_07_23_12_00_15.html`；artifact：
+`AutoTest/artifacts/perf_trace_detail_final_clean_20260723.json`。关键分账（ms/frame）：
+- `WorldRenderScene` total 4.292 / direct Hook 0.004 / native self 0.026 /
+  attributed native subtree 4.262；旧“原生 4ms”判定被实证推翻。
+- 主路径 `FlushAndReset` total 2.824 / direct 0.041 / native self 0.038 /
+  nested 2.745；主 `FlushSortedItems` 2.027 / direct 0.008 / native self 0.072 /
+  nested 1.947。
+- `WorldFramePrepare` 2.140 / direct 0.006 / native self 1.040 / nested 1.094
+  （主要 `UiRenderableRender` native self 约 1.073）。
+- WarVK/前端已知热点：D3D9 DrawIndexed frontend 1.684、ShadowCapture callback 0.963、
+  Dispatch Common direct 0.416、CurrentDraw 0.166、Dispatch Special 0.150、Submit 0.088、
+  AddBatch 0.043ms/frame。Unattributed active wall 仍 4.949ms（coverage 60.3%），是下一轮
+  应拆的非 Hook/尚未接线边界，不得重新叫 WaitGate。
+
+**观察器税**：退休旧 per-draw scope 后，最终 detail 单轮 `2-1=+0.214ms/frame`；此前
+AB/BA 漂移较大，必须继续用反序均值，不得从单轮自动化 FPS 承诺物理收益。默认 level1
+与 level0 的最终 AB/BA 样本约 +0.179/+0.541ms，均值约 +0.360ms。真实前台 FPS 基线
+比较应设 level0；性能归因报告默认 level1，深挖才显式 level2。
+
+主要实现文件：`war3_hook_perf.h`、`war3_hook_install_util.{h,cpp}`、各 Hook 域文件、
+`d3d9_device.cpp`、`war3_perf_monitor.{h,cpp}`、`war3_perf_report_template.h`、
+`AutoTest/run_perf_rebuild_validation.py`。全部工作区改动仍未 commit。
+
+## 🚨 2026-07-22（深夜第二轮）：22:23 报告验收 + frameSeries lane 算法重写 + Gates 命名修正
+
+**22:23 报告验收（D20CA3DB，3600 帧）**：
+- 覆盖率 98.5%，UnattributedCPU 0.233ms；动态父路径修复生效——
+  `Hook_WorldRenderScene` 8.55 incl / self 仅 0.005，子树干净展开：
+  `WorldDispatch/Orig` self 4.45（native per-draw dispatch）、
+  `FlushAndReset/Orig/FlushSortedItems/Orig` 3.00、`WorldFramePrepare/Orig` 2.40、
+  `Populate` 0.87（正确嵌套在 FlushAndReset 下）。
+- **ShadowCapture 细分生效**：总 3.04ms = **Gates 1.69ms**（闸口/path-blocker/
+  semantic bypass 段，最大子项）+ legacy 余量 ~1.32 + S1Early 0.024 + Finalize 0.002；
+  `BuildSemantic` 合计 ~0.64ms（嵌在 WorldDispatch/Orig 与 FlushSortedItems/Orig 下）、
+  `MaterialSig` 0.006、`NativeHint` 0.058。
+- jank：817/3600 帧 >16.67ms，p95 18.2ms，max 65.5ms。
+
+**发现并修复 frameSeries lane 数据矛盾**：旧"parentPath 空=根"过滤的 lane 值与
+threadSections 聚合数学上矛盾（Main 31.8 vs 15.5、Other 出现 22→107 锯齿尖峰），
+逐行排查未定位单点根因（lane 循环与聚合循环读同一数据源，疑似 archived frame
+per-entry 数据的边界脆弱性）。按"宁可简单正确"原则**重写 lane 算法**
+（war3_perf_monitor.cpp frameSeries 段）：
+- Main = 系统线程 CPU（GetThreadTimes 精确值，~14.1ms）；
+- 非主线程 = 按"线程局部顶层 section"（parentPath 不在同线程 path 集合）求和后
+  按顶层 path 前缀归类 CS/Other，天然避免 inclusive 双计；
+- Worker = max(0, 系统 workerCPU − CS)。
+
+**Gates 命名修正**：addCpuSample 父名+全路径导致 `ShadowCapture/ShadowCapture/Gates`，
+改为叶子名（`Gates`/`S1Early`/`Finalize`，父 `ShadowCapture`）。
+
+**构建/部署**：ninja 通过。当前部署 `E:\Work\War3\d3d9.dll` = SHA-256
+`69B7B363036408B08A19E52C48D266FB36BFD1E96E69E882EE442484D54A81FA`
+（29,376,023 bytes，源=构建=部署 exact）。**待用户再生成报告验收**：
+Swimlanes/Timeline 应显示 Main≈14ms、CS≈1ms、Worker≈3-5ms 的合理量级。
+
+**性能本体结论（供后续优化参考）**：15.8ms 帧时中，native 侧
+（WorldDispatch/Orig 4.45 + FlushSortedItems/Orig 3.00 + WorldFramePrepare/Orig 2.40）
+≈ 9.9ms 是大头；我方 tracked 主要为 ShadowCapture 3.04（Gates 1.69 已是最肥子项，
+候选：path-blocker EntryGate 慢路径与 semantic bypass publish 的合并/缓存）、
+Populate 0.87、Shadow/Main（CS）0.63。
+
+## 🚨 2026-07-22（深夜）：真实报告验收 + 三项覆盖补丁（build+部署完成）
+
+
+**首轮重建验收（用户实机报告 `war3_perf_report_2026_07_22_20_25_08.html`，高压图 1025 帧）**：
+- **UnattributedCPU 10.4ms → 0.271ms，cpuCoveragePct = 98.2%**，coverageWarning=false；
+  meta（SHA/profile/模块掩码/帧对齐）与 schema v7 全部生效。
+- 真实热点结构首次可见（66.4 FPS / 15.05ms / GPU 1.34ms）：
+  - `Hook_WorldRenderScene/Orig` 7.81ms incl：其中 `Hook_WorldDispatch/Orig` **self 3.96ms**
+    （native per-draw dispatch，PERF_LEVEL=2 可再拆 bridge/orig）、
+    `Hook_FlushAndReset`（嵌套上下文）~3.46ms、`Hook_WorldFramePrepare/Orig` 2.37ms
+    （native culling）；
+  - `ShadowCapture` **2.95ms self / 55 calls**（我方最大已知 CPU 项）；
+  - `Populate` 0.94ms（已正常）、`Shadow/Main` 0.60ms（CS 线程）、PostFX 0.18ms；
+  - jank：162/1025 帧 >16.67ms，p95 18.3ms，max 33.9ms。
+- 发现两个监控自身 bug：frameSeries 泳道把 inclusive 父子相加（Main lane 假 80ms）；
+  绝对路径叶节点挂扁平父导致嵌套上下文 self 失真（FlushAndReset 嵌套段 3.46ms 异常）。
+
+**本轮三项覆盖补丁（未 commit）**：
+1. **动态父路径**（war3_perf_monitor.{h,cpp}）：`CpuOnlyScope` 新增 `dynamicParentPath`
+   （push 时 TLS 栈顶），popScope 有效父=动态优先、静态前缀兜底。修复绝对路径/TLS 混用
+   的嵌套 self 失真；栈空的绝对路径（WaitGate 等）行为不变。
+2. **frameSeries 只统计根 section**（parentPath 非空跳过），消除泳道 inclusive 双重计数。
+3. **ShadowCapture 细分**（d3d9_device.cpp）：`War3CaptureCpuSample` 加 `stop()`；
+   新增 `ShadowCapture/Gates`（入口→legacy 采样点，含 path-blocker/semantic 闸口）、
+   `ShadowCapture/S1Early`（S1 early-cache 块）、`ShadowCapture/Finalize`
+   （finalizeShadowDrawCommon）三个 TLS 桶；原 `Shadow/DrawTime/BuildSemantic`、
+   `MaterialSig`、`NativeHint` 三个埋点从旧 constexpr 切到 `War3PerfHookLevel()>=1`。
+
+**构建/部署**：ninja 通过（19/19，仅既有 warning）。当前部署 `E:\Work\War3\d3d9.dll` =
+SHA-256 `D20CA3DB1F7B89B587185FB5FF45120DB664FD2BC248E4CDD405411BCF6BFEA4`
+（29,366,241 bytes，源=构建=部署 exact，no-work 通过）。
+
+**待用户重新生成报告验收**：泳道数值应回到帧时量级（不再 80ms）；
+`Hook_WorldRenderScene/Orig/Hook_FlushAndReset` 嵌套段应有正确的 `Orig` 子节点；
+`ShadowCapture` 下出现 Gates/S1Early/Finalize 子项。若要继续拆
+`Hook_WorldDispatch/Orig` 的 3.96ms（native per-draw dispatch），设
+`DXVK_WAR3_PERF_LEVEL=2` 再生成一份报告（per-draw 采样 N=8 加权）。
+自动化 crash-gate 仍未跑（环境全屏占用 + 沙盒目录缺失），脚本
+`AutoTest/run_perf_rebuild_validation.py` 已备。
+
+## 🚨 2026-07-22（晚）：性能计时体系重建 + 报告前端全面重设计（build+部署完成，实机验证待用户手动）
+
+
+**背景**：R01–R11 二分测试证明旧报告不可信——关键渲染 Hook 计时被
+`kNativeOptimizationPerfTrackingEnabled=false`（war3_internal_test_config.h:382）整体编译剔除；
+R11 真实 WaitGate 仅 0.154ms 但 UntrackedActive 高达 10.4ms（残余桶误标）；绝对路径与 TLS
+动态栈混用导致调用树断裂；R08/R09 还暴露 shadow-off 时 SemanticScene/Populate 22-24ms
+孤儿慢路径。本轮按「Present→Present 根 + 调用树 + 线程泳道」重建，计划文件：
+`~/.kimi-code/sessions/.../plans/jean-grey-argent-domino.md`。**未 commit**。
+
+**P0 监控可信度**：`DXVK_WAR3_PERF_MONITOR=0` 全局主开关（构造函数解析，所有 scope
+入口空操作）；报告新增 `meta`（DLL SHA-256 自哈希/文件大小/构建时间/runtimeProfile/
+enabled/disabledModules/关键 env/perfFrameEpoch↔businessFrameSerial 对齐/PresentEx 每帧
+`noteBusinessFrameSerial` 登记）；`Other/UntrackedActive` 改名 `Other/UnattributedCPU`
+（JSON 保留旧字段 `avgUntrackedActiveCpuMs` 兼容旧解析器，新增 `avgUnattributedCpuMs`
+与 `coverageWarning`（>2ms/帧 为 true））。
+
+**P1/P2 调用树**：新增 `kNativePerfFrameHookTimingEnabled=true`（帧级低频 scope 常开：
+WorldFramePrepare/RenderScene/WorldDispatch/RenderGroup/FlushSortedItems/FlushAndReset）+
+`DXVK_WAR3_PERF_LEVEL`（0=off,1=frame 默认,2=detail）+ per-draw 采样 token
+（Hook_FlushSortedItems 每 N 个 flush 采样，`DXVK_WAR3_PERF_DRAW_SAMPLE_PERIOD` 默认 8，
+Horvitz-Thompson 加权，新 `cpuScope(name, weight)` 重载）。补齐三段结构：
+FlushSortedItems Orig 段（CallOriginalFlushSortedItems 内）、RenderScene/WorldFramePrepare
+After 段、Dispatch_Common/Special 全部桥接段。所有 `MakeRenderHookCpuScope` 调用点按
+帧级（MakeRenderHookFrameScope，31 处）/per-draw（MakeRenderHookDrawScope，16 处）分级。
+
+**P3 schema v7**：JSON 新增 `schemaVersion:7`、`frameSeries`（每帧
+[epoch,totalCpu,gpu,main,cs,worker,other] 四泳道，worker 线程按类别归并不按 tid）、
+`sectionPercentiles`（path→{p50,p95}）、`threadLanes`。
+
+**P4-1 门控修复（唯一行为改动）**：d3d9_device.cpp:14985 的
+`War3TryPopulateSemanticShadowScene` 增加
+`IsAnyWar3RuntimeModuleEnabled({ShadowCapture,ShadowMap,ShadowReceiver})` 前置条件——
+shadow-off 时不再执行 22-24ms 孤儿 Populate。**crash-gate 未跑**（见下）。
+
+**P5 前端全面重写**：新 `war3/tools/war3_perf_report_template.h`（880 行，
+`kWar3PerfReportHtmlHead/Tail` 两段 raw string，`const data = ` 注入点）；旧模板
+（war3_perf_monitor.cpp:7528-8780）整段删除换三行拼接；导出改**原子写**
+（.tmp + MoveFileExA REPLACE_EXISTING|WRITE_THROUGH）。新 UI 四标签页（默认 Hotspots）：
+Hotspots（avgSelfCpuMs 降序 + 热度条 + p95 + 线程徽章 + 点击跳树）、Call Tree（虚拟
+Frame 根 + 虚拟滚动 + 搜索自动展开高亮祖先链 + 线程切换）、Timeline（frameSeries canvas
+堆叠条 + GPU 折线 + >P95 红标 + 框选）、Swimlanes（Main/CS/Worker/Other 四泳道）；
+顶栏 meta 徽章 + coverageWarning 黄条 + 全局搜索（子串 AND/`>1.5`ms/`thread:cs`）；
+GitHub-dark 美学（#0d1117/#161b22/#d29922/#39c5cf）；Legacy 折叠区。子代理已做
+node --check + DOM stub 冒烟 + mock 预览 `AutoTest/artifacts/frontend_preview_test.html`。
+
+**构建/部署**：两次 ninja 均通过（仅既有 OPCode -Wreorder 与 GCC -Wmaybe-uninitialized
+误报）。当前部署 `E:\Work\War3\d3d9.dll` = SHA-256
+`982347A897658046B3A1CCD5EB99E14A511CD5D85F09AE1CC7299286A9CE645C`（29,362,272 bytes，
+源=构建=部署 exact，no-work 通过）。旧 DLL 备份
+`E:\Work\War3\d3d9.dll.bak_20260722_pre_perf_rebuild`。
+
+**验证状态（重要）**：自动化 crash-gate 与 P6 跑组**未完成**——
+`E:\Work\War3_AutoTestSandbox` 沙盒目录已不存在（DEFAULT_WAR3_DIR 指向它导致 launch
+失败），且用户反馈当前有程序全屏导致 War3 无法启动，改为**用户手动测试**。已备好
+`AutoTest/run_perf_rebuild_validation.py`（已修正为直接用 `E:\Work\War3`：
+`gate`（高压 hot-shadow crash-gate）/`monitor`（P6-1 on/off）/`r08`（P6-3 修复后 R08
+shadow+postfx off，预期 Populate 消失）/`resource`（P6-2 semantic off vs on）。
+用户手动测试入口：正常启动游戏进图后，报告在 `E:\Work\War3\WarVK\Log\` 带时间戳生成
+（ImGui 停止录制或 `DXVK_WAR3_PERF_RECORD_ON_START=1` +
+`DXVK_WAR3_PERF_AUTO_EXPORT_SEC`）。验收点：报告顶栏有 SHA/配置徽章；Hotspots 默认页
+Self 降序；Call Tree 出现 `Frame → Hook_WorldFramePrepare/Hook_WorldRenderScene → …` 树；
+UnattributedCPU 应较旧报告 10.4ms 显著下降。
+
+**回退路径**：`DXVK_WAR3_PERF_MONITOR=0` 全停监控；`DXVK_WAR3_PERF_LEVEL=0` 只停 hook
+计时；`kNativePerfFrameHookTimingEnabled=false` 编译期回退；P4-1 回退=删除
+semanticShadowModuleEnabled 条件；旧 DLL 用上述 .bak 恢复。
+
+**下一步**：1) 用户手动实机验收新报告 + crash-gate（脚本已备）；2) P6-2/3 数据到手后
+决定资源层 1.9ms 未归属与 ShadowCapture 2.87ms 细分（第二轮 P3 余项+P4-2/3）；
+3) 提交策略待用户确认（本轮与此前 7 项安全修复、T1 整改均未 commit）。
+
+## 🚨 2026-07-22（凌晨）：D3D9/交换链/reimpl 生命周期 7 项安全 Bug 修复（全部 crash-gate 验证，未 commit）
+
+本轮**未触碰用户活跃的阴影/点光/体积光可视区**，只在崩溃可验证、非视觉的生命周期/内存
+安全面做了 6 轮代码审查，落地 **7 个真实 Bug 修复**，逐个独立构建 + 高压图 crash-gate 验证：
+
+1. `war3/shadow/war3_shadow_native_runtime.{h,cpp}`：两个 reject 计数器跨线程数据竞争 →
+   改 `std::atomic<uint64_t>` + relaxed（**wired 实时可达**）。DLL FD6857A8，3530 帧 PASS。
+2. `d3d9_interface.cpp` CreateDevice：InitialReset 失败分支泄漏整个 `D3D9DeviceEx`（含
+   `Rc<DxvkDevice>`/adapter）→ 失败前 `delete device`。DLL 7E10B135。
+3. `d3d9_interface.cpp` ValidatePresentationParametersEx：空指针判空在解引用之后成死代码
+   （ResetEx(NULL) 崩）→ 判空上移到函数首句。DLL 7E10B135，3169 帧 PASS。
+4. `d3d9_swapchain.cpp` GetFrontBufferData：对空 `m_backBuffers` 调 `.back()`（UB，失败
+   Reset 后截图可达）→ 加 `empty()` 守卫，与 Present(:389)/GetBackBuffer(:805) 一致。
+5. `d3d9_swapchain.cpp` CheckColorSpaceSupport：未守卫 `m_wctx` 空指针（姐妹 SetColorSpace/
+   SetHDRMetaData 都守卫）→ 加判空。DLL 40AC8281，3196 帧 PASS。
+6. `d3d9_shader.h` D3D9VertexShader::SetPartner：Release-before-AddRef 自赋值 UAF 隐患
+   （fork 专有 m_partner，wired 但坏分支未触发）→ 改 AddRef-before-Release 次序。DLL 11F36BB7，3247 帧 PASS。
+7. `war3/reimpl/war3_team_color_manager.{h,cpp}` GetIndexFromTexture：缺失姐妹锁的读侧数据
+   竞争（该类当前**未接线**，潜伏）→ mutex 改 `mutable` + `lock_guard`，与 5 个姐妹方法一致。
+
+**当前部署**：`E:\Work\War3\d3d9.dll` = SHA-256
+`B9AFF330A65B8EEC27D0CEEEA79450534BBBF207B543F8E4146136D490051C5F`（29,305,110 bytes），
+源=构建=部署 exact。最终高压图 crash-gate（`光影测试(高压).w3x`，隔离桌面，hot-shadow 门）：
+3179 帧无崩溃、`framesIncomplete=0`、全 rejects=0、44.65fps 无回归、无残留进程
+（报告 `WarVK/Log/war3_perf_report_auto_2026_07_22_02_05_05.html`）。**7 项修复与用户体积光
+重构均未 commit**，等用户定提交策略。验证强度分级：#1–#5 修复可达路径（#1 是 wired 计数器上
+真实活跃竞争）；#6 wired 但坏分支未触发，gate 证 happy-path 无回归；#7 整类未接线，正确性靠
+与 5 个姐妹方法逐字一致的加锁由检视确立，gate 只证对已接线 DLL 零回归。
+
+**第 6 轮审查结论**：hook 安装/生命周期、jass native plan 缓存、dispatch contract、
+instance buffer、shader patcher、StateBlock/buffer Lock/Query/shader/volume·cube·3D texture
+等 wired fork 面**全部干净或已修（忠实上游 DXVK 守卫）**；另一潜伏项 `War3InstanceBuffer::Get`
+首设备指针陈旧（单设备 Reset 场景安全，仅设备销毁+重建才活）暂不修。
+
+**性能：未取得可测 FPS 提升（A/B 硬性证伪安全面已竭尽）**。禁用整个阴影子系统帧率反而
+44→24fps、`War3SemanticScene/Populate` 1.6→28.6ms → 阴影缓存是承重结构，无"减阴影提 FPS"空间。
+整帧 22ms 中我方 tracked CPU 仅 ~6.3ms（ShadowCapture 3.38ms 已 O(1) 早命中、period 强制 1），
+其余 ~16ms 是引擎 `WaitGate`（非我方代码）。六轮全帧数据稳定在 44.36–45.67fps 噪声带内。
+
+**Report2（21:43，jank1138）卡顿根因已定位，但都在用户活跃区/需画面验证，睡眠期不盲改，
+待用户授权后按严格 crash-gate + 画面对照落地**：
+1. 点阴影 CPU worker 每帧 `std::async(std::launch::async)` spawn 新 OS 线程
+   （`d3d9_war3_shadow.cpp:3576`，`.get()`@3471 阻塞主线程）→ 转持久线程池（T1-1 遗留，最优先，
+   不改阴影像素语义，最可能直接压掉 worker 尖刺）；
+2. `War3SemanticScene/Populate` 28ms 未缓存慢路径（平时 single-flight 门控 1.6ms，误触即尖刺）；
+3. 自适应阴影分辨率无迟滞（`d3d9_war3_shadow.cpp:982` ResolveAdaptiveShadowResolution，
+   与体积光固定分辨率预留耦合，阈值附近振荡引发资源抖动）。
+
+---
+
+## 🧭 KimiCode 接手引导（2026-07-21 晚，图形优化整改中线状态）
+
+**当前焦点**：图形系统（点光源/点阴影/世界光阴影 CSM/体积雾体积光）优化质量整改。
+权威任务清单见下方「🔧 整改任务清单」；7 路审查的**全量取证原文**在
+`docs/research/graphics_optimization_audit_2026_07_21.md`（91 KB，含全部 文件:行号
+证据与改进建议，清单未收录的低优先级发现也在其中）。
+
+**进度快照**：
+- 第一梯队 T1-1～T1-6 已全部落地并标记 ✅（验证：ninja 增量编译 + no-work）。
+- 第二梯队 T2-1～T2-4、第三梯队 T3-1～T3-4 均未开始。
+- 当前 DLL：29,295,805 bytes，SHA-256
+  `B862A514DF460ED7B506CDF8F44D78B3BDB0ACB10CA7455EF0F1C4E24F87097F`（build-only）。
+
+**Git 状态警告**：全部整改改动（以及此前 VS-B1/StormBreaker 等大量工作）目前
+**均未 commit**，只存在于工作区。接手后第一件事建议与用户确认是否提交。
+
+**构建环境（Git Bash 下必须照做，否则编译器静默退出 1 且无 stderr）**：
+```bash
+export PATH="/e/Dev/MinGW/bin:$PATH"
+"D:/Environment/Python3.13.11/Scripts/ninja.EXE" -C build32 src/d3d9/d3d9.dll -j2
+```
+（cc1plus 依赖 `E:\Dev\MinGW\bin` 的 DLL；ninja 在 Python3.13 Scripts 下。）
+
+**严格下一步顺序**（纪律同 AGENTS.md 一贯要求）：
+1. 与用户确认 git 提交策略 → 2. 部署 exact DLL → 3. 隔离 light crash-gate 验证
+   T1 全量改动无运行回归 → 4. 才允许开始 T2；T3 各项必须先过 crash-gate 再做
+   ABBA，禁止仅凭静态分析或编译通过声称性能收益。S1 period 必须为 1；
+   用户未明确让出前台前禁止 foreground `dual_perf`。
+
+---
+
+## 🚨 2026-07-21（下午）：第一梯队 T1-1～T1-6 全部落地（build-only）
+
+本轮完成图形系统优化整改第一梯队全部 6 项（明细见下方清单 ✅ 标注）：
+
+- T1-1 点阴影 worker 改 `War3PointShadowCpuPlanInput` 小 POD + move（持久 worker 子项遗留）；
+- T1-2 两个 registry 全部纯读 find 已核实为 `std::shared_lock`；
+- T1-3 ShadowPoseStore/ShadowModelResourceStore 快照存储按值调用点全部改指针版
+  （`war3_shadow_renderer_core.cpp` 8 处 + `d3d9_device.cpp` 静态补充段，含另一线程
+  遗留的 `resourceRecord.` 点访问编译错误修复）；mutex 保护的 registry 按值 find
+  维持锁内拷贝安全模式不变；
+- T1-4 逐记录计时/ScopedMaxUs/ResolvePhaseTimer/Stream1Layout 全部默认关闭并门控，
+  两个 debug env 静态缓存；
+- T1-5 12 KB publish 栈数组与 trusted vector 改 thread_local 复用，
+  `BuildShadowReplayDraws` 返回 const&；
+- T1-6 体积太阳路径保存/恢复 `reconciliation` 与 `m_shadowMapRenderSerial`，
+  发布统计不再被体积 pass 覆盖。
+
+构建环境注意：本机 ninja 位于 `D:\Environment\Python3.13.11\Scripts\ninja.EXE`，
+且 MinGW 15.2.0 的 cc1plus 依赖 `E:\Dev\MinGW\bin` 下的 DLL——Git Bash 中必须
+`export PATH="/e/Dev/MinGW/bin:$PATH"` 再调 ninja，否则编译器静默退出 1（无 stderr）。
+构建：`ninja -C build32 src/d3d9/d3d9.dll -j2` exit 0，随后 no-work 通过。
+DLL 29,295,805 bytes，SHA-256
+`B862A514DF460ED7B506CDF8F44D78B3BDB0ACB10CA7455EF0F1C4E24F87097F`。
+
+**未部署、未跑 crash-gate、未做 ABBA**：本梯队全部静态语义等价改动，但按纪律仍须
+先过隔离 crash-gate 再谈性能数字；禁止仅凭编译通过声称收益。下一梯队（T2-1 UBO ring
+slice / T2-2 copy region / T2-3 点阴影状态去重 / T2-4 native 后端死资源）未动。
+
+## 🔧 2026-07-21：图形系统优化质量整改任务清单（多代理审查驱动，权威记录）
+
+> 来源：7 个并行审查代理对体积雾/CSM/阴影核心/语义捕获/点光源/后端外围的逐文件
+> 取证（全部附文件:行号）。**本清单是已知问题的权威记录**：解决后在此标记 ✅ 并注明
+> 验证方式；后续 Agent 不需要重新审查已标记项，只需关注未标记项与新引入代码。
+> 纪律：触及剔除/租约/缓存淘汰语义的改动必须先过隔离 crash-gate 再做 ABBA，
+> 禁止仅凭静态分析承诺性能数字。
+
+### 第一梯队（低风险纯 CPU/诊断收益）
+
+- [x] **T1-1 点阴影 worker 每帧双份场景深拷贝**：`d3d9_war3_shadow.cpp:3544-3549`
+  每帧两次深拷贝整个 `War3PipelineInput`（caster 大结构 vector + 每条约 16 KB 的
+  palettes 哈希），worker 实际只读 settings、3 个 stats 字段与 palettes。改小 POD
+  捕获 + `std::async` 换持久 worker。
+  ✅ 2026-07-21：已改 `War3PointShadowCpuPlanInput` 小 POD（settings 值拷贝 + 3 个
+  stats 字段 + palette hash 列表）并 move 进 lambda。持久 worker 子项留待后续。
+  验证：ninja 增量编译 + no-work 通过（未实机）。
+- [x] **T1-2 registry 只读 find 误用独占锁**：`war3_model_registry.cpp` 28+ 个、
+  `war3_shadow_object_registry.cpp` 6 个只读 find 用 `std::unique_lock`，与
+  Phase 7.83 注释声称的 shared_lock 不符，read-read 线程互斥。全部改
+  `std::shared_lock`。
+  ✅ 2026-07-21：两文件全部纯读 find/snapshot/count 已核实为 `std::shared_lock`，
+  仅 writer（storeRecord/note*/bind*/clear）保留 unique_lock。
+- [x] **T1-3 find 按值返回整记录**：`war3_shadow_runtime_contract.cpp:3031-3162`
+  等热路径经 out 引用拷贝含 7+ vector / 最多 256 个 Matrix4（约 16 KB）的记录，
+  指针版重载已存在但少用。调用点机械替换为指针版。
+  ✅ 2026-07-21：ShadowPoseStore/ShadowModelResourceStore 快照存储的按值调用点
+  已全部改指针版：`war3_shadow_renderer_core.cpp` 8 处（pose 候选、attachment
+  补充循环 128×2、descendant 扫描、mesh pose 计数等）与 `d3d9_device.cpp`
+  静态补充段（含编译修复：另一线程遗留的 `resourceRecord.` 点访问与按值 pose
+  find 一并改为指针版）。mutex 保护的 `model::PoseRegistry`/instance/shadow
+  registry 按值 find 属锁内安全模式，不在本项范围。验证：编译 + no-work。
+- [x] **T1-4 常开逐记录诊断与环境变量热路径**：
+  `war3_shadow_renderer_core.cpp`（9492 行无 `#ifdef`）每条 manifest 记录 12+ 次
+  `steady_clock::now()`；`NotePublishedStream1Layout`
+  （`war3_current_draw_contract.cpp:436-475`）无 env 门控；
+  `d3d9_war3_shadow.cpp:5661/5674` 每帧两次 `getenv`+string 分配。加
+  constexpr/env 门控并静态化。
+  ✅ 2026-07-21：`ScopedMaxUs`/`ResolvePhaseTimer`/逐记录 recordStart 均经
+  `RendererCoreTimingProbeEnabled()` 门控（默认关，功能性 chunk 时间盒不受影响）；
+  `NotePublishedStream1Layout` 默认关，`DXVK_WAR3_STREAM1_LAYOUT_PROBE=1` 开启；
+  两个 debug env 已静态缓存。验证：编译 + no-work。
+- [x] **T1-5 12 KB 栈清零 + 按值返回**：
+  `war3_current_draw_contract.cpp:1463` 每次 ready publish 零初始化 12 KB 栈数组
+  （该路径每帧 10K-30K 次，数十 MB/帧无效写带宽），改 thread_local 复用；
+  `BuildShadowReplayDraws` cache 命中仍按值拷贝 N 个指针，返回 const&。
+  ✅ 2026-07-21：`trustedPaletteBytes` 已改 thread_local 无零初始化（下游只读
+  requiredBytes 前缀）；`trustedPalette` 临时 vector 同步改 thread_local 复用；
+  `BuildShadowReplayDraws` 已返回 `const&`，5 个调用点全部引用接收。
+  验证：编译 + no-work。
+- [x] **T1-6 体积 pass 覆盖主 CSM 统计（诊断正确性）**：
+  `d3d9_war3_shadow.cpp:2295-2313` renderShadowMap 入口重置 reconciliation 计数，
+  体积太阳开启时发布的"每帧"统计实际被体积 pass（1-2 层）覆盖，render serial
+  每帧双增——依赖这些计数的 crash-gate/报表会读错。按 Main/Volume 分桶。
+  ✅ 2026-07-21：`renderVolumeSunShadow` 在成员交换时同模式保存/恢复
+  `reconciliation` 与 `m_shadowMapRenderSerial`（正常路径与 catch 路径均恢复），
+  发布后看到的永远是主 CSM pass 的计数与连续 serial。验证：编译 + no-work。
+
+### 第二梯队（GPU 常规收敛）
+
+- [ ] **T2-1 4 块单缓冲 UBO 跨帧 WAR barrier**：体积 CSM/点光 UBO
+  （`d3d9_war3_volumetric_light.cpp:1209-1245`）+ 光照/点阴影 UBO
+  （`d3d9_war3_shadow.cpp:4862-4894`）每帧走 UNIFORM_READ→TRANSFER_WRITE→UNIFORM_READ
+  barrier 对。buffer 均几百字节，改 2~3 槽 ring slice。
+- [ ] **T2-2 copyColor/copyDepth 无 region 参数**：全屏拷贝与全屏 pass 改相机视口
+  矩形（小视口场景最多浪费 4× 带宽）；相邻 barrier 合并。
+- [ ] **T2-3 点阴影路径状态去重**：空 face 改 `vkCmdClearDepthStencilImage`；
+  补 pipeline/VB/IB dirty-check（定向 CSM 路径已有排序+dirty-check）；
+  `EvaluateShadowGpuSkinDirectInput` 从 (级联/面×draw) 内层上提到 prepare（同一
+  draw 每帧最多重复评估 4 次 CSM / 24 次点阴影）。
+- [ ] **T2-4 skinned 几何静态 VB/IB 建而不用**：
+  `war3_shadow_backend_native_d3d9.cpp:816-845` ensureGeometry 无条件创建上传，
+  但 skinned 只走 DrawPrimitiveUP；`blendBuffer` 全工程无绑定点。跳过创建+删死代码；
+  native 后端 D3DSBT_ALL 状态块改手工保存约 12 项。
+
+### 第三梯队（需实图/ABBA 门验证，禁止仅凭静态分析晋级）
+
+- [ ] **T3-1 点光 ROI 死代码**：`d3d9_war3_volumetric_light.cpp:1651` ROI 分支要求
+  `resolutionDivisor==2`，但除数被 TDR 合同硬钳到 [4,8]，约 40 行区域映射代码
+  永不执行，纯点光帧仍付全屏 1/4 ray-march。修复（需复核奇数尺寸光栅合同）或删除。
+- [ ] **T3-2 C0/C1 级联对非地形 caster 永不剔除**：
+  `d3d9_war3_shadow.cpp:2596-2597`（RTS 俯视保近处阴影的刻意设计，已有
+  `DXVK_WAR3_CSM_DISABLE_FAR_CASCADE_CULL` A/B 开关）。保守球剔除分级，用既有
+  开关对照，重点看高镜头树影。
+- [ ] **T3-3 体积太阳路径不受自适应复用门保护**：
+  `d3d9_war3_shadow.cpp:6494-6510` `wantVolumeSun` 不含 `reuseLastShadowMap`，
+  主 CSM 命中复用的帧体积阴影仍全量重画。纳入复用门 + prepare 结果与主 CSM 共享。
+- [ ] **T3-4 palette 缓存无界增长**：`war3_shadow_backend_native_d3d9.cpp:54-66`
+  key 混入逐帧姿态哈希，动画单位每帧新增一条，整场游戏单调泄漏。按帧分代；
+  硬件 PCF 评估；`war3_volumetric_light.frag:583-603` 动态索引 spill 用 SPIR-V
+  反射定案。
+
+### 整改进度记录
+
+| 日期 | 项目 | 状态 | 验证 |
+|------|------|------|------|
+| 2026-07-21 | T1-1 点阴影 worker 小 POD | ✅ 完成（持久 worker 子项遗留） | ninja 编译 + no-work |
+| 2026-07-21 | T1-2 registry find shared_lock | ✅ 完成（核实已在工作区） | 逐函数核实 |
+| 2026-07-21 | T1-3 快照存储 find 指针版 | ✅ 完成（renderer_core 8 处 + d3d9_device 补充段） | ninja 编译 + no-work |
+| 2026-07-21 | T1-4 诊断门控 + env 静态化 | ✅ 完成 | ninja 编译 + no-work |
+| 2026-07-21 | T1-5 thread_local 复用 + const& | ✅ 完成 | ninja 编译 + no-work |
+| 2026-07-21 | T1-6 体积 pass 统计隔离 | ✅ 完成 | ninja 编译 + no-work |
+
+构建产物：DLL 29,295,805 bytes，SHA-256
+`B862A514DF460ED7B506CDF8F44D78B3BDB0ACB10CA7455EF0F1C4E24F87097F`。
+全部改动未 commit、未部署、未跑 crash-gate / ABBA。
+
+### 清单外补充发现（低优先级，全文见审查文档）
+
+以下发现已收录于 `docs/research/graphics_optimization_audit_2026_07_21.md`，
+未列入 T1-T3 梯队，供后续按需认领：
+
+- `AugmentShadowSemanticContext`（`war3_shadow_runtime_bridge.cpp:7845-8004`）每 draw
+  链式最多约 18 次注册表查询 + 含 string 的整记录拷贝；建议批量查询或身份完整快判。
+- 注册表多镜像写放大（`war3_shadow_object_registry.cpp:177-222` storeRecord 写 6~9 张
+  map 全量拷贝）；建议单存储 + 二级索引。
+- 分块发布每块深拷贝累计部分帧（`war3_shadow_renderer_core.cpp:9288-9296`，O(N²/16)）；
+  建议追加游标。
+- palette 槽位缓存 4096 项线性扫描（`war3_shadow_renderer_core.cpp:696-731`）；
+  逐字节 FNV 哈希 12 KB palette（`:733-742`）。
+- `war3_shader_api.cpp:1515` 用相机 (0,0,0) 取点光快照击穿帧缓存；
+  `GetPointLights`（`:1109-1118`）解锁后返回内部 vector 指针（悬窗，正确性问题）。
+- CPU 蒙皮逐 draw 重算 + DrawPrimitiveUP 驱动拷贝（`war3_shadow_backend_native_d3d9.cpp`），
+  多级联零复用；`D3DSBT_ALL` 状态块每批一次（实际只触约 12 项）。
+- 体积光 shader 微项：`pow(denom,1.5)` 可改写 `denom*sqrt(denom)`；未采样的 `s_color`
+  binding；copy 资源多余 TRANSFER_SRC usage；receiver PCF 内 per-pixel `textureSize`。
+- 自适应阴影分辨率无迟滞（`d3d9_war3_shadow.cpp:979-1000`），阈值附近振荡引发资源抖动。
+- 每 4096 次 miss 的 6 键复查 + printf 毛刺（`war3_upper_layer_shadow.cpp:273-308`）。
+
+---
+
 ## 📅 项目当前状态 (Current Status)
 
-**最后更新**: 2026-06-05
-**当前阶段**: 渲染层逆向论文 v1 完成 + Phase 7.171 static VB idle LRU 修正
+**最后更新**: 2026-07-20
+**当前阶段**: 旧 compute/bypass 正确性基线保持通过；显式 VS-B1 的普通图、
+高压图与 lifecycle 正确性已经闭合，但 2026-07-20 多轮隔离 ABBA 仍有约
+`+2.79～+3.28 ms/frame` CPU 侧负增量，尚未产生可发布的正收益。
+默认关闭的 VS-A 数据脚手架、资源普查、allocator closure 与 GPU static 快照去重已完成。真实
+consumer-fenced C++ input lease 与 fixed-function ubershader prelude 已接线，并通过显式 VS-A。
+显式 VS-B0 input-only 又在普通图、lifecycle 与高压图通过。独立显式 VS-B1
+`vertex_shader_bypass` 现已实现真实 kernel bypass：白名单 draw 不再创建 compute output/job，
+Main/Shadow 直接从 static atlas + palette input lease 蒙皮；普通隔离 crash-gate 已 PASS，22,055 次
+CPU kernel 与约 415.75 MB 动态输出写入被跳过。默认 Compute、旧 compute/bypass、VS-A/B0 与
+StormBreaker stable 均未改默认行为。VS-B1 继续保持显式实验路线，不能改成产品默认。
+**分支**: `codex/war3-stable-producer-baseline`
+
+## 🚨 2026-07-21：VS-B1 负候选桥接收窄（最新）
+
+本轮继续保持默认 Compute、旧 compute/bypass、VS-A/B0 与 StormBreaker stable 不变，只修改显式
+`vertex_shader_bypass` 实验路线：
+
+- B1 的 palette 上传已按 flush 批次合并为一次连续 host upload；每个 candidate 仍保留独立
+  storage lease、consumer receipt 与 Main/Shadow 结算，未放宽寿命或 ABI 证明。
+- 新增 exact single-DIP + Main/Shadow settlement 后的 native poison 提前退休；完整诊断模式仍
+  保留旧 O1 生命周期。隔离 crash-gate 已证明 poison create/hit/clear、index exact、ledger 与
+  reset/restore 均闭合。
+- 已知非候选 Common dispatch 现在借用外层 flush detour pin：省略完整 NativeDispatchScope、
+  Apply semantic frame、DIP observer、upload/kernel detour 原子 pin，并仅在非空候选视图、精确
+  NativeCpuOnly、无 poison/无生命周期事件时生效；空视图、候选正路径、Special、嵌套、reset
+  或任一身份漂移仍回完整路径。
+- 最新 DLL SHA-256：
+  `7448311EE7E9BC2E4278E6CF1749E92913B688213FAC93D260BFD98DC3113319`，源码/部署 exact；
+  `ninja` no-work 与 Python 语法检查通过。
+- 正确性 artifact：
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_vertex_shader_bypass_vs_b1_borrow_flush_pin_scope_v1_20260721_065752`，PASS；
+  B1 bypass `9,503`，poison create/hit `9,503`，clear `5,500`，ledger leak/unreserved/
+  duplicate/planMismatch 均为 0，native kernel normal clean。
+- 最新隔离 ABBA：
+  `AutoTest/artifacts/gpu_skin_perf_isolated_ab_20260721_070000`；disabled/B1 平均
+  `10.656/12.787 ms/frame`，仍为 `+2.1315 ms/frame` CPU 负增量，GPU `+0.006 ms`，尚未达到
+  正收益，不能把 VS-B1 写成产品默认或性能完成。
+
+下一步应优先围绕 B1 candidate 本身的 per-draw lease/receipt 与少量正候选 dispatch 合并，不能
+继续扩大负候选旁路的安全边界；任何新改动先过隔离 crash-gate，再做 ABBA，S1 period 仍必须为 1。
+
+---
+
+## 🚨 2026-07-20：VS-B1 性能复核与 Lock/Unlock NoOverlap 轻量端点
+
+本轮首先完成 reset 冷窗口分类修复后的第三次 lifecycle，随后完成高压格式图；两轮均证明
+B1、两次 reset、窗口 resize/maximize/restore、第二进程 relaunch、Special fallback 与资源清理正确。
+性能方面没有得到正收益，不能把正确性通过写成性能完成：
+
+- lifecycle PASS：
+  `AutoTest/artifacts/gpu_skin_p4_lifecycle_isolated_diag_light_sidecar_none_route_vertex_shader_bypass_vs_b1_lifecycle_reset_class_final_v3_20260720_031808`；
+- 高压格式 PASS：
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_vertex_shader_bypass_vs_b1_high_pressure_format_special_v1_20260720_033313`；
+- 原始 B1 ABBA：
+  `AutoTest/artifacts/gpu_skin_perf_isolated_ab_20260720_034212`，约
+  `+3.434 ms/frame`；逐项试过并撤回 DIP manager 融合、input view 缓存、全 buffer view、延迟
+  shader/view 清理和 poison ledger 捷径，这些改动都没有稳定收益；
+- T1 现改为先读取连续 8 字节 `skinMode/format`，只有候选才复制 `0x6C4` 字节完整 GX 状态。
+  crash-gate
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_vertex_shader_bypass_t1_narrow_skin_format_20260720_073508`
+  PASS；ABBA `AutoTest/artifacts/gpu_skin_perf_isolated_ab_20260720_073757` 的 disabled/B1 均值为
+  `11.6955/14.4870 ms`，仍负 `+2.7915 ms/frame`；
+- production O1 新增实际 D3D9 Lock/Unlock 的 NoOverlap 轻量端点。sidecar、1/127 evidence、重叠、
+  storage/资源身份漂移全部回完整证据路径；轻量端点仍要求原 kernel 正常返回与真实 Unlock，且只能
+  提交 NoOverlap，不能清 poison。普通 crash-gate
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_vertex_shader_bypass_fast_lock_no_overlap_20260720_090708`
+  PASS；lifecycle artifact
+  `AutoTest/artifacts/gpu_skin_p4_lifecycle_isolated_diag_light_sidecar_none_route_vertex_shader_bypass_fast_lock_no_overlap_lifecycle_20260720_092724`
+  的 `p4_result.json` verdict 为 PASS，authority lock/kernel/unlock 与 reset/relaunch 全闭合；
+- NoOverlap ABBA `AutoTest/artifacts/gpu_skin_perf_isolated_ab_20260720_090929` 的 disabled/B1 均值为
+  `10.588/13.801 ms`，仍负 `+3.213 ms/frame`。因此该端点只能写成“正确性无回归、未测得性能收益”。
+
+最终 DLL 29,294,131 bytes，SHA-256
+`7297880730736000EA375465FA184573BB941D8A7EC510C249AD862D8B8FA5B0`，source/deployed exact，
+随后 no-work PASS；War3/World Editor/YDWE 残留为 0。lifecycle 命令的宿主等待在 artifact 已完整写出后
+超时，遗留的本轮 AutoTest/IDA MCP Python 子进程已按创建时间精确清理，没有终止用户原有服务。
+
+结论：当前负增量不在 compute shader 或 GPU 时间，也不在单次 view/restore；光影图每帧只有约 6 个
+B1 候选、平均约 584 vertices，却仍让全局 outer-upload/kernel/dispatch hook 覆盖数百个 CPU-only
+上传。下一步必须把 poison rewrite retirement 从 outer-upload observer 中拆出，改成 actual
+Lock→kernel-normal→Unlock 的独立窄事务，并让详细 upload/dispatch 管理只在 manager 已发布的候选
+窗口内激活；随后再合并 palette/input publication。未完成这层前禁止声称“GPU 蒙皮已转正”，也不要
+继续用 shader view 或原子计数微调承诺找回 3 ms。
+
+---
+
+## 🚨 2026-07-20：VS-B1 首个真实 kernel-bypass 运行门通过
+
+新增独立显式 `DXVK_WAR3_GPU_SKIN_EXECUTION_ROUTE=vertex_shader_bypass`（route 3）。默认/非法值仍
+回到 Compute；VS-A、VS-B0 与旧 compute/P4 路线不共享 B1 authority。B1 只接受 opaque、format2、
+单 UV、Common stage11/skinMode1、triangle list、instance1、fixed-function FVF `0x112`、单 stream、
+无 vertex blend/custom VS/SWVP/material override 的 exact candidate。
+
+- P4 kernel 前同时验证 native Lock/ring/index、static/palette input lease、storage page generation、
+  Main fixed-function 状态与 Shadow semantic producer。Outline 尚未实现 input-backed draw，因此请求
+  outline 的候选在 kernel 前保留 CPU 路径；
+- B1 不生成 compute output/job。Main 的 WVS2 ubershader 直接读取 static/palette；Shadow position/UV
+  直接绑定 static atlas 的 SoA position/texcoord0 段。CPU kernel 已跳过后，两个 shader 的私有门若
+  异常失败只裁掉 primitive，绝不回读带毒 native VB；
+- ABI-9 与 preflight bit layout 未改变。历史 `GpuOutputReady/ExactGpuJob` 位在 B1 通过同值别名表示
+  route-specific consumer capability / exact work contract，旧 compute 语义保持不变；
+- static atlas 新增 vertex-input usage/stage/access，仅用于 B1 Shadow direct binding；真实 input receipt、
+  `Rc<DxvkFence>`、page generation、reset 与 retirement 仍是唯一寿命权限。
+
+首轮运行 artifact
+`AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_vertex_shader_bypass_vs_b1_first_runtime_20260720_014654`
+没有 crash，画面正常，且已有 7 次真实 kernel skip；但 draw-side 错把 ResolveDip 已合法收窄的 Main
+consumer mask 要求为完整 `Main|Shadow`，7 次均被安全 suppress，故正式 FAIL。修复为“非零且只能是
+Main/Shadow 子集”，完整 capability 仍由 manager 的 kernel 前 preflight 验证。
+
+正式普通图 artifact：
+`AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_vertex_shader_bypass_vs_b1_consumer_mask_fix_20260720_015650`，
+PASS；DLL 29,285,294 bytes，SHA-256
+`170515583671EDE25855F5CC370A5442654CAD021B8D13D280C0526C78125380`，source/deployed exact：
+
+- input prepared/submitted `23,359/23,359`，palette bytes `66,325,296/66,325,296`；省略
+  `23,359` 个 compute output/job 与 `440,855,616 B` output 写入；
+- Main WVS2 draw/clear `22,055/22,055`，input/state reject 均 0；Shadow capture/commit
+  `22,055/22,055`，direct/replay `356/356`，所有 Shadow input/state/position/index/UV/commit reject 为 0；
+- kernel original/bypassed `2,195,685/22,055`，bypassed bytes `415,749,920`；P4 auth/commit、poison
+  create/hit、index exact 均为 `22,055`，bypass mismatch 0；
+- ledger classified/resolved/consumed `70,077/44,110/44,110`，fallback/suppressed/leak/unreserved/
+  duplicate/planMismatch 均 0；late poison 0，forced clean snapshot 3，截图正常，无 crash，最终进程为 0。
+
+lifecycle 两轮均证明 B1、窗口动作、两次 reset 与第二进程 relaunch 本身正确，但 runner 仍严格 FAIL：
+
+- v1 artifact：
+  `AutoTest/artifacts/gpu_skin_p4_lifecycle_isolated_diag_light_sidecar_none_route_vertex_shader_bypass_vs_b1_lifecycle_v1_20260720_020407`；
+  唯一失败项 `dipFastProbeContractClean`，reset 冷窗口累计 early/late `noTransactionCover=2/1`；
+- 第一笔只读诊断重分类后 v2 artifact：
+  `AutoTest/artifacts/gpu_skin_p4_lifecycle_isolated_diag_light_sidecar_none_route_vertex_shader_bypass_vs_b1_lifecycle_cold_class_fix_20260720_023801`；
+  只剩 early `noTransactionCover=1`。首进程 B1 Main/Shadow `21,521/21,521`，reset request/completion/ack
+  `2/2/2`；第二进程 B1 Main/Shadow `8,307/8,307`，两个 ledger 与 cleanup 均闭合。不能把该轮写成 PASS；
+- 代码已进一步把“observer cookie/depth 完整，但 requested/applied reset generation 暂时不等”的 sampled
+  reject 精确归入 `ResetOrRetirement`，真实 fast-path 行为不变。最终 build/no-work PASS，源码 DLL
+  SHA-256 `1975BB891C5CA597178CBDF2E5C9D2AAAB884CA1A02A7293B7C3C14E0803E151`；此时用户启动了
+  `worldeditydwe.exe` PID 5552，因此没有部署或第三次 lifecycle。部署 DLL 仍为
+  `21A7BA47FB7F2C82B74C8E3D0564EAF2E700669D2FD19BA9BAE9FE6C0FA8E964`，没有半部署。
+
+最新离线产物
+`AutoTest/artifacts/gpu_skin_vs_input_lease_offline_20260720_vs_b1_runtime_v1/result.json` 为 schema 6，
+7 个生命周期场景与 31 项静态接线检查全部通过，unsafe reuse/pending 为 0。下一严格顺序：等待
+World Editor 退出 -> 部署 exact `1975...E151` -> 复跑 B1 lifecycle -> 高压格式/Special fallback ->
+透明实图 -> isolated A/B。B1 outline 尚未实现，不能运行 `--outline-all` 后把预期 preflight fallback
+误写成失败；foreground `dual_perf` 仍必须等待用户明确让出前台，S1 period 保持 1。
+
+---
+
+## 🚨 2026-07-19：VS-B0 input-only 普通图/lifecycle/高压图通过
+
+新增显式 `DXVK_WAR3_GPU_SKIN_EXECUTION_ROUTE=vertex_shader_input_only`，只接受 opaque、format2、
+单 UV、fixed-function 白名单。它为 Main/Shadow 发布真实 consumer-fenced static+palette input lease，
+但不分配 post-skin output、不记录 compute dispatch；P4 preflight 明确拒绝，CPU kernel 仍精确执行，
+Outline/transparent/非目标格式/Special/custom VS 等继续旧路径。默认 Compute 与旧 P4 无行为变化。
+
+高压图首轮暴露 2 个已预留 Shadow consumer 没有进入最终 capture：旧 Bypass settlement 把合法
+CPU fallback 拒为 planMismatch，帧尾再 suppress，形成 leak=2。修复只允许“显式 VS-B0、
+`bypassCommitted=false`、CpuFallback”这一组合；真正 kernel skip 仍只能 suppress+fuse。复测中 3 个
+Shadow CPU fallback 精确结算，resolved=consumed+fallback，suppressed/leak/planMismatch 全为 0。
+
+最终 DLL 29,276,269 bytes，SHA-256
+`F9629893627140E98D5CA874B0C6F65F40E1535FA8B302957D014B648897A6DF`，source/deployed exact：
+
+- 离线 input-lease/静态接线：
+  `AutoTest/artifacts/gpu_skin_vs_input_lease_offline_20260719_223014/result.json`，schema 4，7 个确定性
+  生命周期场景与 24 项 VS-A/VS-B0 runtime integration audit 全通过，unsafe reuse/pending 为 0；
+
+- 普通图 crash-gate：
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_vertex_shader_input_only_vs_b0_input_only_v2_20260719_213844`，
+  PASS；input/Main/Shadow `21,631/21,631/21,631`，省略 `21,631` 个 compute output/job 与
+  `408,213,536 B` output 写入；CPU kernel `2,084,826` 次全部 original，P4/poison/index 全冷；
+- lifecycle：
+  `AutoTest/artifacts/gpu_skin_p4_lifecycle_isolated_diag_light_sidecar_none_route_vertex_shader_input_only_vs_b0_input_only_lifecycle_v1_20260719_214555`，
+  PASS；resize/maximize/restore、reset/generation `2/2/2`、第二进程 relaunch 与清理闭合；
+- 高压图：
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_vertex_shader_input_only_vs_b0_high_pressure_format_v2_20260719_220731`，
+  PASS；input/Main/Shadow `21,933/21,933/21,930`，Shadow CPU fallback `3`，省略
+  `384,015,904 B` output 写入，Special/layout fallback `118,212/580,591`；ledger
+  `65,799/43,866/43,863/3`，所有 leak/mismatch/fault 为 0。
+
+自动图 transparent candidate 仍为 0，不能声明透明材质运行覆盖；源码静态门已证明
+`bypassOpaqueEligible` 是 input-only admission 的必需条件。当前数字不是 FPS 或永久显存收益。
+下一严格顺序：独立 VS-B1 route/preflight 设计 -> kernel skip 前证明 Main/Shadow/Outline consumer
+完备 -> isolated crash-gate/lifecycle -> 透明/特殊格式实图 -> isolated A/B。用户明确让出前台前禁止
+foreground `dual_perf`，S1 period 必须保持 1；“生与死”资源普查仍是独立任务。
+
+---
+
+## 🚨 2026-07-19：真实 input lease + VS-A ubershader 隔离通过
+
+接手时工作区已有 VS-A shader/draw 草案，但租约不可激活：receipt 未创建、page generation 未写入，
+native dispatch/upload epoch 也未同步到 receipt，导致 `GpuSkinInputLease::operator bool()` 恒为 false。
+本轮完成最窄正确性接线：
+
+- palette 从 producer upload page 复制到 device-local storage slice；input lease 强持有 static/palette
+  slice、storage lease id、page id/generation 与共享 receipt；
+- `Pending` receipt 与 desc、range、buffer identity、map/device/frame/native epoch、token、consumer
+  mask 逐字段闭合。正常帧尾只在 Main/Shadow draw 之后的真实 `Rc<DxvkFence>`/value 被 output arena
+  接受后进入 `ConsumerCommitted`；仅 producer 路径进入 `ProducerOnly`，未提交/拒绝路径进入
+  `Cancelled`。终态 receipt、stale generation 或错误 fence 都不能重新发布 draw；
+- VS-A 仅接受显式 `DXVK_WAR3_GPU_SKIN_EXECUTION_ROUTE=vertex_shader`、Common/stage11/skinMode1、
+  triangle list、instance1、fixed-function FVF `0x112`、单 UV、format2。custom VS、PositionT、SWVP、
+  override 或任意漂移继续走 compute output；CPU kernel、compute job、output VB 与 P4 permission 未删；
+- 私有 fixed-function VS 在 stock 变换/光照/雾/texgen 前按 precise 3x4 顺序读取 static/palette；每个
+  draw 同一 CS 闭包内 bind -> draw -> push clear -> resource unbind -> stock shader restore。copy 后
+  transfer-write -> vertex-shader-read barrier 已闭合；Shadow direct input 同样保存 page generation；
+- runner clean-pair 原先错误要求每个短窗口都必须新增 Shadow replay；生命周期已有 direct 时，短窗
+  direct delta 可以合法为 0。现改为零进展必须整组 delta 精确为 0，并加入合成回归。
+
+构建：`ninja -C build32 src/d3d9/d3d9.dll -j2` 与 no-work 均通过。DLL 29,261,468 bytes，SHA-256
+`49ECC06749FA13C413943D93D7AC34067B6C139C907BBAC5CEA9595E8FF3379E`，source/deployed exact。
+
+- Compute 控制 artifact：
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_compute_vs_a_compute_control_v1_20260719_133219`，
+  PASS，旧 P4/Compute 与 StormBreaker stable 默认无运行回归；
+- VS-A 正式 artifact：
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_vertex_shader_vs_a_consumer_fenced_v2_20260719_143012`，
+  PASS。input prepared/submitted `12,540/12,540`，palette bytes `35,560,752/35,560,752`，compute jobs
+  `12,540/12,540`；Main VS draw/clear `11,863/11,863`，Shadow capture/direct/replay
+  `11,863/148/148`；input/state reject、consumer mismatch、clear mismatch、unknown replay 全为 0；
+  output+input-storage retired `25,080`、pending `0`、upload page allocate/reclaim `1/1`。两张隔离截图
+  人工复核正常，无 crash，最终 War3/runner/build 残留 0。
+- VS-A outline 专项 artifact：
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_route_vertex_shader_vs_a_outline_regression_v1_20260719_150932`，
+  PASS。input prepared `5,918`，Main draw/clear `5,535/5,535`，Shadow direct/replay
+  `7,376/7,376`；geometry outline submitted/same-slice `5,026/5,026`，slice mismatch、restore
+  overlap 与 pending 全为 0；input storage 与 output retirement `11,836`，pending `0`。
+- VS-A lifecycle artifact：
+  `AutoTest/artifacts/gpu_skin_p4_lifecycle_isolated_diag_light_sidecar_none_route_vertex_shader_vs_a_lifecycle_v1_20260719_151401`，
+  PASS。隔离桌面完成 1280x720 resize、maximize、restore、两次 reset generation 与第二进程
+  relaunch；reset request/completion/ack `2/2/2`，generation `2/2/2`，wrong-thread、retirement fault、
+  fail-closed、retirement overflow/invalid/pending/fault 全为 0。两个进程均由 retained native handle
+  精确终止并完成桌面/视频模式恢复。
+- 最新离线静态/状态机产物：
+  `AutoTest/artifacts/gpu_skin_vs_input_lease_offline_20260719_153556/result.json`，7 个确定性场景、
+  17 项 runtime integration audit 全通过，`unsafePageReuses=0`；该产物只补静态与状态机证据，
+  运行权限仍来自上述隔离 artifact。
+
+当前只可声明 VS-A 正确性与真实 consumer-fence 生命周期通过，不能声明性能收益或全模型接管。
+outline 与 resize/reset/relaunch 已闭合；下一顺序：格式/透明/special fallback -> VS-B main-only
+cohort（不分配 compute output、不建 compute job）-> 隔离 A/B。foreground `dual_perf` 仍需用户明确
+让出前台，S1 period 必须保持 1；“生与死”资源普查仍待独立执行。
+
+---
+
+## 🚨 2026-07-19：额度收尾与下一轮起点
+
+- StormBreaker 稳定产品策略离线合同 17/17、资源驻留 chunk 合同 10/10、三个 Python 入口
+  `py_compile` 全部通过；最终 x86 DLL 仍为 29,250,964 bytes，SHA-256
+  `45E26440CBF33BFBC125CA4128693343C6879E954D1082817BC5C666F9363CF6`，随后 no-work 通过；
+- `AutoTest/run_resource_residency_census_isolated.py` 已升级到 v2，默认且正式地图固定为
+  `(4)生与死v1.28读档bug修复.w3x`，同时保留显式 `--map-path`。离线测试会拒绝默认地图、参数或
+  合同版本被意外改回；
+- 本轮收尾时 AutoTest 状态查询发生基础设施长时间无响应，因此没有 deploy、没有启动 War3，也没有
+  生成新的 crash-gate 或“生与死”普查产物。构建 DLL 与已部署 DLL 分别为
+  `45E26440...9363CF6` / `B6B88C4E...C5BDB`，没有半部署；War3、World Editor、YDWE、ydhost 与
+  构建进程残留均为 0；
+- 当前可引用的驻留数字仍只来自 2026-07-17 的旧轻图：duplicate host backing
+  `44,577,192 B`、managed texture `44,576,936 B`、lazy-readback candidate `23,094,324 B`。
+  它们不能回答“生与死”缺失的数百 MiB；下一轮必须先恢复 AutoTest，再用新 runner 跑一次重图，
+  且 `evictionAuthority` 在实现 Seal-and-Evict 前仍必须为 false；
+- 下一轮严格顺序：部署 exact DLL -> 隔离 light crash-gate -> “生与死”隔离驻留普查 ->
+  consumer-fenced C++ input lease -> fixed-function ubershader VS-A。用户未明确让出前台前仍禁止
+  foreground `dual_perf`，S1 period 必须保持 1。
+
+---
+
+## 🚨 2026-07-18：StormBreaker 稳定默认策略整合（build-only）
+
+用户已确认 StormBreaker 的产品默认必须是“大块优化 + 原生小块 search 修复”；全量接管为负收益，
+只允许独立内存诊断。本轮将 stable `master` v1.3.0 的产品边界写入 DXVK，未复制或回滚
+`subprojects/StormBreaker` 的脏实验工作区：
+
+- 未设置 `DXVK_WAR3_STORM_TAKEOVER_MODE` 即启用 stable；显式值只接受 `stable/large`，
+  `full/hybrid` 直接拒绝；TLSF 精确阈值固定下限 `0xFE7C`；
+- ordinal 401/403/404/405 与原生小块 `search` 修复同批安装；只接受 334,312-byte、SHA-256
+  `F8F519CFAA6275A5172A014F0ABED2212284390A33F1194677155A7D408E63EB` 的 Storm.dll，并闭合
+  PE/RVA/prolog；
+- 页目录只做负过滤。精确 TLSF 块起点、私有头读取和 `LIVE->BUSY` claim 在 allocator 锁内完成；
+  exact validator 的 next/previous 上界使用完整 `block_start_offset`，首块损坏的 prev-free 位也会
+  fail closed；所有 Alloc/ReAlloc 在首次进入 TLSF 前做 size/alignment 溢出预检；
+- managed Free 后端拒绝时恢复旧头/tombstone；原生大块 Free/确实释放旧块的 ReAlloc 会原子修正
+  `g_TotalAllocatedMemory @ +0x5738C` 的差额；TLSF vendored 进程级小块 cache 已禁用；release
+  启动只初始化 mapping table，不再运行位操作/映射全扫描自测；
+- Hook 回滚无法证明移除时永久保留 trampoline、关闭 redirect 并禁止二次安装。已知
+  `StormBreaker*.asi` 在本进程已加载时 DXVK 会退出；会话事件发布后再次核验目标 prolog。固定名
+  event 是旧 standalone 协议的会话级广播，重命名 ASI 的极端并发仍没有跨实现原子握手；
+- 4096 槽 recent-freed 表与 v1.3.0 相同，只是异常 stale/double-free 的有界防线，不是永久证明；
+  正常成对生命周期由 exact block + atomic claim 闭合。
+
+离线合同 `AutoTest/test_stormbreaker_stable_policy_offline.py` 为 17/17。唯一 Test Conductor 完成
+`ninja -C build32 src/d3d9/d3d9.dll -j2` 与随后 no-work；DLL 29,250,964 bytes，SHA-256
+`45E26440CBF33BFBC125CA4128693343C6879E954D1082817BC5C666F9363CF6`，构建工具残留 0。
+本轮未 deploy、未启动 War3，不能声明运行门通过。下一步先做隔离 crash gate；重图资源普查只能用
+`(4)生与死v1.28读档bug修复.w3x`，SunkenCity/光影图不能替代那几百 MiB 的驻留证据。
+
+---
+
+## 🚨 2026-07-17：GPU 蒙皮路线转向 + 资源驻留第一层收口
+
+完整 isolated ABBA
+`AutoTest/artifacts/gpu_skin_perf_isolated_ab_20260717_065042` 证明 disabled→bypass 的
+frame/process/main/measured-GPU delta 为 `+2.3475/+2.9630/+2.8435/-0.0010 ms`。损失位于同步
+CPU render lane，不是 compute shader 或 GPU 饱和；outside direct receipt 每帧约 143 次也没有
+测出收益。禁止继续用零散 wrapper 微调承诺恢复约 2 ms。
+
+新路线为 DXVK fixed-function VS ubershader 前置 War3 skin prelude：
+
+- 已新增 `GpuSkinExecutionRoute`、32-byte `GpuSkinVsDrawParams` 与 88-byte
+  `GpuSkinInputLeaseDesc`，但当前 manager/device/native/P4 均不消费 route；默认与非法值都保持
+  Compute，draw/P4 authority 为 0；
+- static atlas 已允许未来 vertex-shader stage 读取；当前没有 shader 绑定或行为变化；
+- 离线 input-lease 产物
+  `AutoTest/artifacts/gpu_skin_vs_input_lease_offline_20260717_081253/result.json` 覆盖 pending receipt、
+  reset 后旧 ticket、page generation 重开与 stale/copy ticket ABA 拒绝，7 个场景通过，
+  `unsafePageReuses=0`；它明确不是 runtime implementation；
+- 未来 C++ lease 必须绑定真实 `Rc<DxvkFence>` identity、device generation、static/palette range、
+  consumer bits 与 exact receipt。VS-A 先保留 CPU kernel+compute 做 parity/restore；VS-B 才允许
+  main-only cohort 跳 compute/output 和原生 CPU kernel。
+
+资源普查：
+
+- 首轮 `resource_residency_census_isolated_20260717_025503` 看到 duplicate host backing
+  `44,735,294 B`，其中 managed texture `44,576,936 B`；
+- GPU static resource 与 queued miss 现共享
+  `shared_ptr<const ShadowGeosetResourceRecord>` 不可变快照，消除 `158,102 B` 持久 mirror 与
+  `55,867 B` 观测峰值 queued copy；观察时间戳独立，内容变化才 copy-on-publish；
+- 第二轮 `resource_residency_census_isolated_20260717_084857` 中总 duplicate 为
+  `44,577,192 B`，GPU static mirror/queued/peak queued host bytes 全为 0；managed texture 仍为
+  `44,576,936 B`，lazy-readback candidate `23,094,324 B` 仍只有观察意义，
+  `evictionAuthority=false`；model cache alias duplicate 仍为 `338,468 B`；
+- D3D allocator reserve/used/mapped 为
+  `67,108,864/44,586,688/62,844,288 B`。已修复 `<4 KiB` 尾段丢失、零分配空 chunk 与
+  `MapViewOfFile` 失败时伪指针/refcount/mapped 账本；离线 allocator 7/7、快照共享 6/6。
+
+最终中文注释版本：
+
+- build artifact：
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_zh_comments_final_v1_20260717_091811_build`；
+- DLL SHA256：`CF8922D617EA4698A5945D924E5A527795AE32A3ACFA9326ECB098509468FEC2`，
+  source/deployed exact；
+- P4 artifact：
+  `AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_zh_comments_final_v1_20260717_091811`，
+  bypass `11,789 calls / 222,122,784 B`；P3/P4Shadow `11,789/11,789`，poison create/hit
+  `11,789/11,789`，index exact `11,789/11,789`；mismatch、hostMismatch、restoreFail、所有 Shadow
+  reject、poison overflow/resetStale/outstanding、index leak、ledger leak/unreserved/duplicate/
+  planMismatch、nativeKernelNormal、retirement/reset fault/pending/active 与 crash 均为 0；
+- 最终 game/runner/build 残留 `0/0/0`。该轮未跑 census、性能或 foreground。
+
+下一步严格顺序：真实 consumer-fenced input lease -> fixed-function ubershader VS-A parity/restore ->
+VS-B main-only skip compute/CPU kernel -> outline -> CSM/point shadow -> resize/reset/relaunch -> 格式/
+透明/special fallback -> `(4)生与死v1.28读档bug修复.w3x` isolated pressure。用户明确让出前台前仍禁止 foreground
+`dual_perf`，S1 period 必须为 1。
+
+本项目后续新增或改写的文档、代码注释和测试说明统一使用简体中文；代码标识符、外部 API、ABI、
+环境变量与报表 schema 保持原始拼写。不要为了本地化批量改写未触及的 DXVK 上游注释。
+
+---
+
+## 🚨 2026-07-16：体积积分地表端 + 切片/峰值收口（已 deploy，待实图）
+
+调查结论：上帝视角柱缩回模型的**代码级主因**是相机中心积分截断球
+`[0, min(L,D)]` 丢掉近地表尾段；火凤凰多层剪影来自 16 段 + 段内 `max()`；
+高镜头 CSM 不完整来自 128/256 Draw 硬截 + C2/C3 cull。**禁止再靠拉 intensity。**
+
+**本轮实现**：
+
+1. **`war3_volumetric_light.frag` 积分区间**  
+   - 非天空且 `L>D`：`[L-D, L]`（地表端，预算长度仍为 D）  
+   - 天空：仍 `[0, min(L,D)]`  
+   - 点光 ray-sphere 同步裁到同一 `[intervalStart, intervalEnd]`
+2. **段内 probe**：`max` → **平均**，减轻整段二值膨胀造成的多层剪影
+3. **peak/底图衰减降档**：可读性指数下限 0.28；底图硬顶约 18%～28%（旧可到 ~68%）；
+   默认 intensity/density/weight → **0.95 / 1.10 / 1.85**；`maxRayDistance=1.0`
+   （与 UI 最大距离一致，`D=sunDistance`）
+4. **CSM 上限**：SubmitDrawCap **256→512**；DirectRecordCap **128→256**  
+   无上限 A/B：`DXVK_WAR3_SEMANTIC_SUBMIT_DRAW_CAP=4096` 等  
+   C2/C3 cull A/B：`DXVK_WAR3_CSM_DISABLE_FAR_CASCADE_CULL=1`
+
+**build**：`ninja -C build32 src/d3d9/d3d9.dll -j2` exit 0。  
+DLL 28,951,535 bytes，SHA256  
+`DB388B9E60F4BE2FBD4B480F198337C7D97619895C9AAAF4CD3B80C94AEADDF6`。  
+已部署 `E:\Work\War3\d3d9.dll`，source/target hash exact。**未启动 War3 / 未跑 AutoTest**，
+不能先验宣称俯视画质通过。
+
+**验收**（固定太阳/场景）：  
+- 上帝俯视柱贴地、压低再抬回不应再「缩回模型」；  
+- 火凤凰柱叠层应明显弱于旧 max 路径；  
+- 低镜头靠近不应再突然大黑坨；  
+- 可选 cap=4096 / far-cull off 对照高镜头树影完整性。
+
+---
+
+## 🚨 2026-07-16：Volume Sun + 俯视柱可读性收口（历史；已被地表端区间路线收窄）
+
+用户反馈：仍要拉满才见柱；压低再抬回上帝视角柱仍缩回模型。曾补双级 Volume Sun +
+激进 peak（默认 1.05/1.20/2.35，底图衰减最高 ~68%）。实机/分析显示**根因更在
+相机端积分截断**，peak 过猛会引入黑坨/噪声。见上节地表端区间修复。
+
+历史 DLL SHA256 `182F57E88BD321EEC44EDCD36B352BD769F14A878DF4BD4705A399ECE0A2EAE7`。
+
+---
+
+## 🚨 2026-07-16：体积光 CSM 空间连续性 + 独立可读性闭合（待实图门）
+
+用户确认远处树影会随相机靠近进入高清稳定状态，同时体积阴影柱会随镜头压低从模型向地面
+“长出来”。主线程与三路只读复核确认这不是单纯相机矩阵错误，而是三个叠加问题：标准 CSM
+远级联 world-units-per-texel 更粗；volume 未消费已经上传的 `cascadeBlendRange`；C2/C3 的
+receiver sphere 没有向太阳侧保留上游 caster depth。旧 additive-only 合成又把阴影只表达成
+“少一点正散射”，因此低雾能量时对比存在硬上限。
+
+- `war3_volumetric_light.frag` 抽出单级联 exact sample，并在 split 前按 surface receiver 的
+  smoothstep 区间同时采 c0/c1。先混合 `coverage*(1-visibility)` 与 coverage，再重建
+  visibility，避免错误交叉项造/抹柱；primary projection 无效仍与 surface receiver 一样
+  fail-soft，不能在 boolean 边界突然硬切到 coarse coverage。每段仍最多 8 个纵向 probe，
+  普通/全 seam raw CSM fetch 上限分别为 8/16。
+- `War3CsmConfig` 新增内部 `farCasterDepthExtension`。仅当 global post-FX 与 volume 都 enabled
+  时，C2/C3 固定使用 384u one-sided toward-sun allowance：`baseD=radius+margin`、
+  `eye=baseD+E`、`maxZ=2*baseD+E`。远 receiver world boundary 保持不变，Z range 只增加 E；
+  C0/C1 与 volume-off CSM 不变，避免历史对称 `+3000` 的深度精度/抖动回归。
+- whole-ray true occlusion 继续负责少散射；`weight>1` 额外把同一真实遮挡以
+  `min(Oresolved*0.45*mediumGate*sourceGate*readabilityMix,0.18)` 写入既有 alpha
+  base-transmittance。`weight<=1` 仍严格是 no-contrast/physical，coverage-only、CSM missing、
+  strength0、极低介质或极弱太阳都不能造黑柱。最大额外底图衰减 18%。
+- composite 的 alpha edge 有 2.5% relative dead zone，加上既有外层阈值后实际 3% 内保持
+  双线性；`O=1/64` 最大档 cross weight 约 0.13，`O=1/16` 命中 1/64 floor。已知 P2 是相邻
+  ray 的物理 T 若也跨过 3%，可能保留低分辨率块边，必须由实图判断。
+- Python 纯算术产物：
+  `AutoTest/artifacts/volumetric_camera_continuity_offline_20260716/result.json`。安全档
+  `3,461,120` segments，普通/seam-only CSM 上界 `27,688,960/55,377,920`；gates=1 时
+  `O=1/64` 最大档为 12.5% 少散射 + 5.625% 底图衰减，`O=1/16` 为 25% + 11.25%，
+  weight1 额外衰减 exact 0，完整遮挡硬封顶 18%。
+- 两条 GLSL 已生成 SPIR-V；最终 `ninja -C build32 src/d3d9/d3d9.dll -j2` 为 4/4 增量
+  compile/link、exit 0，随后 `ninja` no-work。DLL 29,921,590 bytes，SHA256
+  `9A795542BFD01FB55B85EC5380EB37A45A6558B38B3F8587F8A4641A51340201`。确认 War3、
+  World Editor、YDWE/ydhost 进程均为 0 后部署到 `E:\Work\War3\d3d9.dll`，source/target
+  hash exact；未启动 War3、未跑 AutoTest，不能先验声明俯视画质通过。
+
+下一门只需用户在同一光影图做 RTS 俯视/低镜头静态截图：固定太阳、CSM 与模型，先用
+`weight=2.5`（3.0 已在 shader clamp 成相同结果）、samples16、divisor4；验收柱从遮挡物沿
+同一光向连续延伸、跨 cascade 不长缩、普通俯视截图可无猜测辨认，同时检查平滑雾是否出现
+4x block。此门不要求 foreground dual_perf，也不能修改 S1 period=1。
+
+---
+
+## 🚨 2026-07-16：体积光俯视可见性第二阶段（build-only）
+
+针对用户与深度研究报告指出的“低镜头可见、RTS 俯视明显变淡”，主线程复核确认问题不是单一
+相机矩阵：同帧 CSM publication 与 current world-camera matrix 已有 exact gate，剩余主要是
+phase 视角偏置、固定 longitudinal probe phase，以及 quarter-resolution composite 只用几何
+depth、无法识别平坦地形上的体积散射边界。
+
+- 太阳 HG/iso mix `0.55 -> 0.35`，归一化 phase floor 为 `0.80`（当前最坏 backscatter
+  自然值 `0.833`，不触发增能 clamp）；离线 forward/back response span `2.104 -> 1.622`，
+  不提高全局雾能量。
+- 每段 CSM probe 硬上限仍为 8；目标 spacing 按 view ray 与 sun direction 的横穿分量及
+  `abs(dot(viewRay,worldUp))` 俯视因子从 `24 -> 10` 自适应收紧；segment/matrix/TDR 上限均未放宽。
+- composite 在 raw-depth 相容的四邻域中选 spatial-nearest reference，并增加相对 scattering
+  bilateral 权重；小于 8% 的梯度仍双线性，强 lit/shadow 边界跨侧权重下限 1/64。它只防止已
+  采中的细柱在 4x4 放大时被冲淡，不能伪造所有 low-res ray 都漏掉的阴影。
+- 第一版 DLL `5EECB...93B` 已被用户实际部署；11:38 的 2048x1105 RTS 截图在 intensity=4、
+  samples=16、density=2、weight=3 时只能明确辨认地表阴影和全局雾，不能无猜测指出体积
+  阴影柱，因此正式判定画质门失败。验收门固定为：普通俯视截图中必须能指出遮挡物、连续
+  柱体及一致延伸方向，不能把地表 CSM shadow、AO 或泛光误认成体积柱。
+- 失败后 whole-ray contrast 从 `pow(physicalRatio,w)` 改为 true-occlusion readability toe。
+  `O=1/64` 的最大档对比从 3.86% 提高为低镜头 5.91%、俯视 12.5%；`weight=0/1` 仍严格为
+  no-CSM-contrast/physical，`O=0` 仍为 0，不能凭空造柱。
+- `git diff --check` 通过；离线边界模型通过。唯一主线程构建
+  `ninja -C build32 src/d3d9/d3d9.dll -j2` 已生成两条 SPIR-V header 并完成 x86 link，DLL
+  SHA256 `CFCEBDA6106311942B9EA71DF9A84B55EA89C8D4B079394AE6E2DE153A1B67E1`，构建残留 0。
+  已在确认 War3/World Editor 进程为 0 后部署到 `E:\Work\War3\d3d9.dll`，源/目标 SHA256
+  exact match；未启动 War3、未运行 AutoTest，因此当前只能声明静态/build/deploy 闭合；下一运行门
+  必须对同一光影图锁定太阳/CSM，比较 RTS 俯视与低镜头的柱体连续性、block edge、cascade seam
+  与 point+volume 稳定性，不能把画质改进先验写成通过。
+
+---
+
+## 🚨 2026-07-16：outside-poison O1 production authority 与诊断原子收敛
+
+本轮把 2026-07-15 的 O0/O1a successful-Lock 侧证晋级为 production O1，但权限边界保持
+很窄：它只用真实 successful Lock→原 kernel normal-return→successful Unlock 事务替代产品路径
+每次 1252-byte GX `SafeCopy` 的 poison 子证明；原生 CPU skin kernel 仍精确执行一次，O1 不会
+自行授权 GPU skin、跳 kernel 或绕过 consumer/poison 安全合同。
+
+- 每个 poison-bearing outside upload 创建 outer-owned provisional token。actual Lock 必须精确闭合
+  FVF/stride、desc/range、mapped pointer、device/CommonBuffer/COM、resource/storage generation 与
+  poison ledger mutation generation；kernel 与 Unlock 任一漂移都只 retain/fail closed。
+- `none` 产品路径只保留严格 `1/127` legacy evidence；任意 O0/O1a sidecar 开启时仍全量 legacy
+  scan 且 production authority 固定为 0。evidence 永不授权，`legacyBackedAuthority=0`。
+- parser 同时要求窗口 `poisonScanDelta == evidenceDelta` 与累计 endpoint
+  `poisonScanTotal == evidenceAttemptsTotal`；sidecar 模式累计要求
+  `poisonScanTotal == authorityAttemptsTotal`。旧 `acceptedWithPoison==poisonNoOverlap` 只适用于
+  全量 sidecar；产品 O1 的精确分区为
+  `authorityAttempts == acceptedWithPoison + evidenceOverlap + evidenceReadFail`。
+- production-light 正式门
+  `gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_none_o1_tls_batch_prod_none_v1_20260716_073859`
+  中累计 O1 `attempt/authority/retained = 491,686/487,815/3,871`，legacy scan 仅 `3,871`
+  （约 `0.787%` attempts，较全量扫描减少约 `99.21%`）；正式 clean pair 为
+  `2,476/2,457/19`，Lock/kernel/Unlock exact，所有 reject/mismatch/poison leak 为 0。
+- sidecar retained 控制
+  `gpu_skin_p4_crash_gate_isolated_diag_light_sidecar_both_o1_tls_batch_both_retained_v1_20260716_074428`
+  中 armed/retained `2,489/2,489`、authority `0`；O0/O1a 九格、direct-discard receipt、累计 scan
+  与旧 P4 门全部闭合。
+
+O1 正常事务原先每次产生约 12 次 process-wide diagnostic `fetch_add`。现将 15 个正常路径字段
+接入既有 render-thread-owned `NativeTelemetryDelta`；`active`、retained、overflow/cancel/reset、
+三类 reject 与全部 evidence/matrix 仍即时 atomic。prod-none clean pair 的 29,674 次逻辑计数
+更新，保守估算至少少 27,190 次 relaxed atomic RMW（约 1,182 次/frame proxy）。运行精确门为：
+
+- `batchedAddsDelta == expectedBatchedAddsDelta = 21,167,306`；该值含 bytes 等数值加和，只能证明
+  exact-add，不能当作操作次数或毫秒收益；
+- 两端 telemetry pending/fault `0/0`，15 个 authority delta 与 O1 生命周期逐字段相等；
+- sidecar retained 控制 exact-add `12,596,985 == 12,596,985`；
+- full 最终控制
+  `gpu_skin_p4_crash_gate_isolated_diag_full_sidecar_none_o1_tls_batch_full_none_final_v2_20260716_075835`
+  中 batching disabled、flush/batched-add `0/0`、expected `0`、`exactAdds=true`，O1 全零/fullExact。
+
+最新 build-only：
+
+`AutoTest/artifacts/gpu_skin_o1_authority_tls_batch_build_only_j2_v1_20260716_073601`
+
+唯一 Test Conductor 使用 `ninja -C build32 src/d3d9/d3d9.dll -j2`，`2/2`、warning/error `0/0`；
+DLL SHA256 `074C4DDA1C1B50A1FB8C79608D7E929DE0A09C0437ED33B95063A967977C9736`。
+上述三轮运行均无 crash，截图正常，ledger/poison/index/nativeKernelNormal 与 steady-state
+reset/retirement fault/pending diagnostics clean，测试/War3/build 自有残留为 0；三轮
+`lifecycle.enabled=false`，尚未执行 resize/maximize/restore、map/device reset 或第二进程 relaunch。
+
+当前不能据此声明 FPS 已提高。RMW 数量硬下降来自代码路径与 exact authority/TLS ledger；
+period-256 只提供有尖峰噪声的时间/热点估计。最新可见最大 parent 约为 Game.dll 原生
+`ApplyDrawStateAndSamplerPair` `1.03 ms/frame`，GPU-skin wrapper residual 约 `0.069 ms/frame`。
+outer/DIP/dispatch 可见量级约 `0.17..0.23 ms/frame` 且相互可能嵌套，不能横加。新增
+kernel-route enum 预计只能省 1–2 个 TLS miss，却增加 set/clear/read，现阶段否决；先用同 DLL
+isolated ABBA 归因当前 disabled↔bypass 总增量（不能隔离 TLS batching 独立收益），再决定是否补
+同一 semantic sample 域的 child closure。outline→resize/maximize/restore + map/device reset +
+second-process lifecycle→格式/透明/special fallback 仍是发布前硬门；用户明确让出前台前禁止
+foreground `dual_perf`，S1 period 必须保持 1。
+
+额度收尾时的最新状态：同 DLL isolated ABBA 首次尝试
+`AutoTest/artifacts/gpu_skin_perf_isolated_ab_20260716_081116` 只完成 A1/B1，未完成 B2/A2，
+因此没有 order-balanced 正式 delta。A1 disabled 的 frame/main/GPU 为
+`9.785/7.862/1.430 ms`，B1 bypass 为 `13.992/12.097/1.500 ms`；未平衡参考差
+`+4.207/+4.235/+0.070 ms`。两窗 raw AutoTest、模块与 DLL SHA、隔离桌面/视频恢复、双重清理均
+正常，B1 仅因 ABBA parser 仍使用旧 `acceptedWithPoison==poisonNoOverlap` 公式而主动停止。
+
+parser 的 manager-visible 分区已改为 O1-aware，但静态审计指出启动 env 的 `sidecar=none` 不能替代
+DLL 运行时策略证据。因此当前源码又新增 perf-report `outsidePoisonSidecar` immutable config/native
+counter exact 字段，ABBA 必须验证 explicit none、invalid=false、closure clean、config/counter exact；
+差值字段明确名为 `derivedUnscannedAcceptedWithPoison`，且
+`independentAuthorityVerified=false`。Python `py_compile` 与 4 组纯合成测试通过，旧报告因缺新字段
+被预期拒绝。**该最后一笔 perf-report/C++ 变更尚未静态终审、build、deploy 或运行**；部署 DLL 仍是
+SHA `074C4DDA...`，ABBA runner 的 expected SHA 也仍指向它，下一线程必须先终审/build，更新 exact
+SHA，再跑 production-light P4 回归，最后从头跑完整 A1/B1/B2/A2。
+
+旧两窗的 draw-chain 只作预定位：sampled leaf 平均 `18.005 -> 23.195 us/call`，按约 473 leaf/frame
+折算约 `+2.46 ms/frame`；其中 HostOther 约 `+1.24`、GpuSkinDip `+0.60`、BeforeUi `+0.38 ms/frame`。
+这些仍是未平衡样本，不能当正式结论，但已表明主要增量在 CPU host/render lane，不在 measured GPU。
+`semanticOriginal` 只包 Game.dll `ApplyDrawStateAndSamplerPair` trampoline，DIP 在其返回后的 caller tail
+flush，不能伪造 `semanticOriginal = outer + DIP + remaining`。若完整 ABBA 仍证实明显增量，同域只可做
+`semanticOriginal = outerChild + remainingApplyState`；要包含 DIP，parent 必须提升到 Common/Special
+`dispatchOriginal`。不要重复给已有 draw-chain leaf 加 QPC。
+
+---
+
+## 🚨 2026-07-15 接棒：GPU skin 同步管理固定成本继续收窄
+
+最新 production-light 证据不是“剩余 GPU 算力不足”，而是 CPU render lane 的固定管理成本：
+
+- 同场景 isolated ABBA 仅作归因：off/bypass mean frame `10.9855/13.5825 ms`，
+  main `8.8365/12.0065 ms`，即 bypass 增量约 `+2.597 ms frame / +3.170 ms main`，
+  measured GPU 基本不变；该数不是正式 FPS。
+- light lifetime 为 raw/kernel `1,121,900`，original `1,111,353`，bypass `10,547`
+  （仅 `0.9401%` calls），但 bytes 为 original `248,651,648`、bypass `198,956,224`
+  （bypass 占 `44.4488%` bytes）。当前接管偏向大模型，不能称全模型 GPU 蒙皮。
+- production partition 为 scope `977,195`、skin/format `54,089`、small CPU `66,960`、
+  candidates `23,656`；Common 可证明 CPU-only 的 path/stage/skin/small 合计约
+  `157,855` 次，即 `51.62 uploads/frame`。旧 1/256 sampler 闭合出的 GPU-skin 增量
+  为 `2.600 ms/frame`，与 ABBA `2.597 ms` 对齐。
+
+本轮实现 **Common dispatch exact-negative CPU-only seal**：
+
+- manager 只在本 flush 完整 assembly 完成、且有 batch 时 host submission 已 accepted 后，
+  发布不可变 current-flush candidate view；空但完整 assembly 的 flush 也可发布。下一 flush、
+  callback exception、epoch retirement/reset 会清 view。
+- Common dispatch begin 在 manager mutex 内对 exact `(flushEpoch, renderablePart, layer)` 做
+  CandidateKey→token 保守扫描；任何候选都拒绝 seal。bridge 只在 callback 正常返回并进入
+  `BeginIssued` 后 commit。整 dispatch 的 `dispatchEpoch % 127 == 0` 证据 cohort 永不 seal；
+  full diagnostics 与 Special 旧证据语义不变，callback ABI 仍为 9。
+- sealed upload 仍完整执行 Game.dll outer upload 与原生 CPU skin kernel，并用独立
+  normal-return sidecar 证明真实返回；只省 ABI-9 manager upload/DIP/fanout 管理链。
+  D3D 的 `ProvenCpuOnly` 只跳 GPU lease/parity/consumer resolution，仍执行 ShadowCapture、
+  material override、PrepareDraw、正常 CPU stream main/outline draw 与状态恢复。
+- poison、pending authorization、reset/retirement、nested dispatch/semantic、generic upload/DIP、
+  ticket 或 marker 冲突全部 fail closed；proposal reject/abort 与 seal invalidation 是允许的安全
+  撤销，active marker conflict 和 timing cancel 必须为 0。
+- 新 `nativeDispatchSeal`、`nativeProdDispatchSeal`、raw/inside/f7/s7/0-1-N fanout、
+  telemetry exact-add 与 clean-pair parser 均闭合。两轮合成故障注入覆盖 evidence-Special、
+  transient fallback、closure mismatch、漏分类和 marker conflict；最终静态复核 P0/P1=0。
+
+离线小任务模型：
+
+- `AutoTest/artifacts/gpu_skin_small_job_batching_offline_20260715_080551/result.json`：当前
+  449 阈值为 `11,782 jobs / 1,630 dispatches`，actual/launched vertices
+  `6,940,763/11,176,384`，利用率 `62.10%`；tail waste 仅 `3.64%`，主要浪费是
+  cross-job `34.26%`。
+- 32-lane local size 理论只省 `0.57..5.54%`，却增加至少 `24.2%` workgroups；不做。
+  历史 `<64` micro-pack 最多只覆盖 `1.13%` vertices；延后。若运行 crossover 证实正收益，
+  下一安全扩展区间是把 production threshold 从 `449` 降到 `193`，不能先盲目全接小模型。
+
+最新 build-only：
+
+`AutoTest/artifacts/gpu_skin_p4_build_only_isolated_diag_light_steady_fastpath_incremental_build_j2_v2_20260715_091416`
+
+唯一 Test Conductor 使用 `ninja -C build32 src/d3d9/d3d9.dll -j2`，`14/14` 最终 x86 link、
+exit 0、error 0；DLL SHA256
+`45AB5F7A5CE121F7AA53EF8CB37F9346F30167E9BDE8794CB6BD878D43190F51`。
+`launchPerformed=false`、`deployPerformed=false`、`autoTestPerformed=false`，未部署、未运行
+War3；编译器/linker/runner 精确自有残留 0。**因此当前只能声明代码/静态/build 闭合，不能
+声明 FPS 已提高。**
+
+按旧窗口估计，Common seal 独立收益约 `0.32..0.48 ms/frame`，不会单独吃掉全部
+`2.60 ms/frame` 增量。随后静态审查否决了“用当前 SafeCopy 结果给自己建 fixed cache”的
+方案：pre-read 只有 GX/count，缺 output format、六选一 VB/ring 与 native device；post-read key
+又只能证明刚完成的 SafeCopy，不能证明下一次可删读。不能把同源缓存当独立晋级证据。
+
+现已实现真正独立的 **outside-poison D3D9 successful-Lock O0 sidecar**：
+
+- 旧 1252-byte GX `SafeCopy` 仍是唯一 admission authority；O0 只记录，不授权、不清 poison、
+  不改变 CPU kernel、marker、reset 或 quiescence。
+- 每次 production-light poison scan 建立 outer-owned cookie；固定 TLS LIFO 深度 8，fast/generic
+  settle、异常 cancel、reset abort 与 overflow 分区闭合。poison ledger 每次真实 create/remove/
+  trim/split/reset commit 都推进独立、跳零的 mutation generation。
+- 成功 vertex `LockBuffer` 在 active-lock record 与 lock-count 之后采集 device/CommonBuffer/COM、
+  resource generation、real/mapping/map-allocation identity 与 generation、FVF/desc、offset/size、
+  requested/effective flags 和 mapped pointer。顶点环按 ASM 精确使用 `0x1800/0x2800`；既有
+  index `0x1000/0x2000` 语义未改。
+- 两个 native kernel normal-return 通知的第一项语义动作都是 freeze，早于 generic CPU rewrite
+  清毒。reset/retirement、flush/mutation 漂移、多 Lock、重入、非正常返回等只归 unprovable。
+- 旧 `{N,O,R}` × Lock `{N,O,R}` 九格、12 类 unprovable 与三层 closure 已接入 parser；硬门
+  单列 `old N -> Lock O` 为 `legacyMissedOverlap`，要求为 0。O0 允许保守 off-diagonal 与
+  unprovable，但 authority 固定为 0。
+
+离线模型最终产物：
+`AutoTest/artifacts/gpu_skin_outside_lock_shadow_offline_20260715_095245_834601/result.json`。
+27 个确定性边界和 50,000 次有界 fuzz 通过；eligible `N->O=0`，strict exact identity
+`15,862` 例 off-diagonal=0。该结论仅是 Python 合同闭合，不是运行授权或 FPS 证据。
+
+O0 最新 build-only：
+
+`AutoTest/artifacts/gpu_skin_o0_sidecar_build_only_j2_v1_20260715_101034`
+
+唯一 Test Conductor 使用 `ninja -C build32 src/d3d9/d3d9.dll -j2`，`23/23` 最终 link、exit 0、
+error 0；DLL SHA256
+`83F124FBCAC9E5498456A33299B2DF252038363CA66504EAF6AB001DE7EB2C13`。
+`launchPerformed=false`、`deployPerformed=false`、`autoTestPerformed=false`、
+`foregroundActionPerformed=false`；67 个精确自有构建进程全部自然退出，残留 0。C++ 与 parser
+独立复核均 P0/P1=0，parser `py_compile` 与 17/17 纯合成测试通过。
+
+因此当前仍只能声明静态/build-only 闭合。游戏可用后先跑 isolated production-light/full O0
+crash gate，确认 scan/attempt/lifetime/settlement 全闭合、active=0、`legacyMissedOverlap=0`，
+再设计具有独立 pre-Lock 状态的 O1 tracker；不能直接删除 SafeCopy。随后仍按 outline→lifecycle/
+格式推进。用户明确让出前台前禁止 foreground `dual_perf`，S1 period 必须保持 1。
+
+### War3 1.27a `CWorld` 类族全量逆向（2026-07-15）
+
+新 authoritative 分卷位于
+`docs/research/war3_render_issues/30_cworld_class_family_full_reverse/`。当前 raw RTTI/真实 x86
+ASM 已确认：`CWorldFrameWar3` 是 `0x668` 的 UI/world frame；独立 `CWorldObjects` 为
+`CShowable` 派生的 `0xF4` base；`CDoodads/CBlightPuffs` 大小分别 `0x150/0xF8`；
+`CWorldObjectsClippable` 是独立 `CClippable` 分支，大小 `0x1C`，不是 CDoodads 基类。
+
+- WorldFrame 主/次 vtable 为 `0x6F98DCD0` 57 槽与 `0x6F98DDB8` 9 槽，次基偏移 `+0xB4`；
+  三个 world-group owner 位于 `+0x16C/+0x170/+0x174`，每个真实分配 `0x1C`。
+- `CWorldObjects/CDoodads/CBlightPuffs` 三表各 103 槽；全槽地址、机械 ABI 与 raw behavior
+  已入卷。slots28..52、53..77、78..102 分别核验 39/45/39 个唯一 target 并完成增量写回；
+  slot57、64..66 与若干公开返回码/flag/参数名仍保留 Unknown。
+  `0x188` 是 AUWOModel entry stride，不是
+  CDoodads 类大小。
+- `CWorldFrameWar3_RenderScene/DispatchStage/RenderWorldGroup` 已作为 canonical 名增量写回 IDA；
+  stage 11 先有 TerrainShadow selector12 producer，再有 group0 producer，flush 在 stage 返回后。
+  不能用 `stageId==11` 或旧 group taxonomy 代替 producer-time exact sidecar。
+- stage16 已闭合为四个 `CAgentPtr<CUnit>` bucket 加 pathing/debug overlay；stage18 的
+  `+0x250` 是 borrowed active `CBuildFrame*`，其 pass 消费 `CPlacementBox/CConstructUI`；
+  stage21 严格依次执行 static-root TextTag、可选 `TerrainImage` 和 `CGameState+0x2C8` embedded
+  TextTag。旧 `CWorld_TerrainShadow_Dispatch(this)` 已纠正为 `ECX=selector` 的 global fastcall，
+  因 selector13 明确不是 TerrainShadow。
+- WorldFrame primary slots15..24 已由真实 dispatcher/ASM 闭合为 event-record forwarders；
+  slots25/26 是 `AUKeyboardFocus` effective-active/inactive 生命周期，slots31..33 为继承属性传播；
+  primary slots34..56 和 `CLayoutFrame@+0xB4` 的 9 槽 ABI/核心语义也已逐槽入卷。
+- primary slots0..14 亦已闭合：slot2 是 `CObserver` 三参 `__thiscall` registration，slot10 是
+  `CMouseEvent` hit-test，slot14 仅路由 sprite/ghost-sprite/terrain click；WorldFrame 57+9
+  全槽已具备真实 cleanup 与最保守行为表。
+- `CLayoutFrame@+0xB4` 的精确 `0x68` 次对象布局已由 ctor/setter/commit ASM 闭合：主对象
+  `+0xF8..+0x104` 为 cached rect、`+0x108` 为 authoritative valid、`+0x10C/+0x110`
+  为 unscaled width/height、`+0x114` 为 scale、`+0x118` 为 publication latch；失效只清
+  valid，不清旧 rect bytes。
+- world-group 的 `0x18` record `+0` 已闭合为 strong `CSprite*`，非 AUWOModel/独立
+  WorldObjectEntry；五张 29 槽 CSprite/Mini/Uber/pooled-leaf vtable 已入卷。add 先增
+  activeCount 后填 record，clear 可 release-to-zero 并同步回池，因此 record/count 无 lock-free
+  publication 或稳定 identity 合同。
+- WorldFrame `+0x3B0..+0x65F` 已拆成 Rally/Int32 small vectors、Waypoint ring、六组 raw
+  pointer vector 与六组 `CAgentPtr<T>` vector；raw vectors 只拥有 backing，`CAgentPtr` vectors
+  同时 retain 元素。`+0x588` 是 RallyIndicator source，TargetPointConfirm 在 `+0x58C`。
+- `CWorldFrameWar3_RefreshGameContextBindings @ 0x6F3618F0` 已闭合 `+0x178/+0x184/+0x188/`
+  `+0x198/+0x1F4/+0x230/+0x32C` 的来源和 indicator ordinal 尾链。`+0x254..+0x2F7` 是 exact
+  `0xA4` embedded `CCinematicFilter`；COL `0x6FA874AC`、TD `0x6FB8E0FC`、vtable
+  `0x6F98ED34` 仅一槽，slot0 `0x6F38A130` 为 scalar deleting dtor。
+- `CWorldObjects+0x94` 已闭合为 borrowed `CTerrain*`；`CDoodads+0xF4/+0xF8` 为 borrowed
+  `CDoodadDB*/CDestructableDB*`，`+0x118` 为内嵌 ModelColorHash table；`+0x10C` 已由 raw
+  debug descriptor 闭合为 `Destructibles use height map` cached toggle。`AUWOModel+0x88/+0x8C`
+  已分别闭合为 static-shadow/selection-circle image handle；`+0x90/+0x94` 也已闭合为 emitter/
+  feature-domain-Unknown terrain handle。四者均以 `-1` 为无效索引并有注销边界；但
+  `0x6F74DA00` selection 注册 body 的所有静态引用扫描均为 0，producer reachability 仍 Unknown。
+- `CClippable` ctor/dtor 只写 vptr，结合派生首字段把 ABI size 闭合为 `0x4`；两张 10 槽表
+  已全量写回。Clippable Clone 只证明 independent outer array 与已证 nested-owner copy，raw
+  references 仍可能共享。`CBlightPuffs+0xF4` 已闭合为 `puffDurationMs`，与 entry
+  elapsed/duration `+0x148/+0x14C` 和 birth/stand/death 状态机形成完整毫秒合同。
+- 第二十二批已把 WorldFrame `+0x334..+0x38C` 从旧 Unknown block 收窄：`+0x334` exact
+  `CFog*`，`+0x338/+0x33C/+0x354` 为 pooled Uber sprite strong refs，`+0x340` exact base
+  `CLight*`（不是 `COmniLight`）；`+0x360` 为 `CPathingMapIndicator` strong-ref vector，
+  `+0x370` 为 stride-`0x18` `TargetIndicatorVector`，`+0x37C` 为 `(cursor+1)&7` ring cursor，
+  `+0x380/+0x384/+0x388/+0x38C` 为已证 accumulator/latch 链。`+0x344` 仍必须保留
+  `Unknown[4]`。同时闭合 `CEnvEffect -> CFog/CLight -> COmniLight` RTTI、大小和四张 5 槽表；
+  WorldFrame 使用 default `CLight(0xDC)`，独立 `COmniLight(0x104)` factory 只有另一处直接 xref。
+- 二十二批 IDA 名称/type/comment 均已 read-before-write、读回并保存
+  `E:\Work\War3\Game.dll.i64`。此前 CPU-MT Phase B 优先 evidence package 也已闭合并写回：
+  `0x6F13A5C5/0x6F138F55` 的 palette/static-input freeze、`0x6F0EEB76..0x6F0EEBB6`
+  的 output identity/SEH/latest join、以及 EvtSched `_beginthreadex` worker 来源；最新大小
+  当前数据库大小 `251,984,624` bytes。本逆向任务未 build/deploy、
+  未启动 War3、未运行 AutoTest。
+
+CPU-MT Phase B 的结论不是“已接线”：source/palette 与 successful Lock 后的 destination 必须
+用 exact candidate token 分段关联；staging copy/owner join 必须在 kernel detour 内、
+`0x6F0EEB8A` 前完成。现有 Lock/Unlock sidecar 明文 diagnostics-only，ABI 9 缺 CPU batch
+submit/acquire/commit/abort，`onUpload` 又晚于当前 kernel，原样不能承担该 producer。完整证据见
+`docs/research/war3_render_issues/28_gpu_skinning_takeover_feasibility/cpu_mt_phase_b_native_evidence.md`。
+
+仍未完成：WorldFrame `TargetIndicator` 等 record 的公开业务字段、`+0x344` 与其余
+borrowed/retained pointee 动态类、vector cohort taxonomy，
+WorldObjects 已审槽仍 Unknown 的公开业务名，CSprite 其余虚槽，stage16 bucket taxonomy/
+pathing global root、stage18/21 少数 owner 空洞、UI/particle/effect/terrain/shadow 其余类族，
+以及除已证 EvtSched/render-lane 路径外的原生 OS thread/worker/join 证据。继续时必须
+读取真实 ASM/xref/raw RTTI，不得把 17/19/24 旧文档的“完整”标题或 IDA 自动库名当结论。
+
+---
+
+## 🚨 2026-07-14 最新接棒：GPU skin 优化 + 灯光/混合光追
+
+### GPU skin 当前真实状态
+
+- P1A Observe v6：raw uploads `1449543`、outside `1078139`、inside
+  `371404`、eligible `123790`，reject path/stage/skin
+  `98217/31146/118251`；begin=end，truePairErr/epoch/pending=0。
+- P1B Dual：`gpu_skin_dual_isolated_v3_20260711_174405`，
+  `1824/1824` parity。
+- P2 Shadow：`gpu_skin_shadow_isolated_v3_20260711_201657`，
+  `34990` exact，跳过约 `485,260,384` CPU shadow-copy bytes。
+- P3 Main：`gpu_skin_main_isolated_v1_20260712_010442`，
+  `26035` GPU main submissions，restore clean；outlineSubmitted=0，描边专项仍待。
+- P4 native bypass：白名单、callback ABI 9、精确
+  NativeVertexOutputProof、CPU normal-return proof、resource retirement、
+  reset generation、index ticket、poison、RAII settlement 已实现；full/light crash hard
+  gate 均已通过。**不能据此宣称全模型已完全接管**，最新 DLL 仍缺 outline/lifecycle/
+  格式覆盖和最终前台性能门。
+
+2026-07-14 算法优化把 eligible upload 的跨进程读取从约 52 次压到 4 次并保留
+exact fallback；新增可复用 upload-page pool、per-frame retirement poll 和 lifetime
+计数修复。随后继续收窄 compute 热路径：
+
+- shader 每个 64-lane workgroup 只协作读取一次实际使用的 9 个 `GpuSkinJob` word，
+  64-byte ABI、`precise` 公式、FVF 输出和二维 dispatch 均未改变；
+- host 在任何 output lease 前按 `floor(log2(ceil(vertexCount/64)))` 做 9 桶稳定
+  counting partition，同桶保留原 native 顺序；零顶点或超过 16384 顶点硬拒绝；
+- 新增 actual vertices、64 对齐 invocation、实际 launched invocation、tail waste、
+  cross-job waste 与 bucket histogram，供后续运行 A/B 判断多 dispatch/palette dedup
+  的代价，当前不宣称理论 load 削减已经转化为 FPS。
+
+2026-07-14 用户手测 `DXVK_WAR3_GPU_SKIN_MODE=bypass` 后约 12 FPS，最新报告
+`war3_perf_report_2026_07_14_08_29_06.html` 为 avg `11.545 FPS`、frame
+`86.620 ms`、process CPU `89.286 ms`，但 measured GPU 仅 `2.188 ms`。静态调用链和
+IDA ASM 均未发现 GPU fence/retirement wait；War3 该实例未创建 multithreaded D3D9
+device，DXVK device lock 也是 no-op。问题位于同步 render lane 上的接管管理成本，而非
+compute shader 算力。
+
+- 最新日志只绕过 `4094/117691` 个 native kernel（raw upload 的 `3.48%`），仍不能称为
+  全模型接管；CPU normal-return proof 却执行 `42292` 次，且 `79.64%` upload 在 scope 外。
+- `AutoTest/analyze_gpu_skin_offline_cost.py` 离线重放证明旧 bridge 的跨进程读/VirtualQuery
+  放大会随上传量增长；production bypass 已改为 fail-closed T0/T1/T2 分层，只对 live poison
+  overlap 做 CPU rewrite proof。scope-less outside reject 跳过 manager callback，但只允许
+  `dispatchEpoch==0`，epoch/配对异常仍必须进入 manager 暴露。
+- RenderQueue admission 已用 learned `(renderablePart, layer)` 反向索引先拒绝未知项，命中后只
+  读取相邻 8-byte live binding；新增 raw QPC 的 bridge/outer kernel/manager 分段计时。
+- exact bucket histogram 为 `344,0,2908,1252,0,0,0,0,0`。Python 约束模型证明 449 顶点
+  阈值只保留 `27.80%` GPU jobs，同时保留 `30.59%..62.97%` 顶点；因此 Bypass production
+  采用 bucket3+ 混合路由，小模型继续走 Game.dll SSE，而 Observe/Dual/Shadow/Main 证据模式
+  不改变。该优化已静态/build-only 通过，但尚无新的 War3 FPS 结论。
+
+用户随后复测 `war3_perf_report_2026_07_14_11_40_58.html`：avg `48.330 FPS`、
+frame `20.691 ms`、main thread `17.283 ms`、GPU `2.102 ms`。10–12 FPS 的数量级退化
+已显著收回，但相对未启用 GPU skin 的约 90–100 FPS 仍没有净收益。窗口 delta 把
+manager flush/prepareArray 定位到约 `7.346/7.185 ms/frame`；无正样本扫描仅约
+`23.9 ns/element`，剩余墙集中在阈值后的约 50 个候选的 model/resource/palette 正路径。
+
+- RenderQueue 新增 4096-bit 双 hash negative-only Bloom；positive 仍必须走 exact map 与
+  live proof，运行闭合式为
+  `bloomRejects+bloomMaybes == reverseHits+reverseMisses`。
+- Bypass learned layout 可持有严格 epoch/content/layout/static-slice/index-hash 匹配的
+  `bypassStaticHint`，只省 model-cache/resource probe，不能授权 CPU skip。preflight 仍做
+  current stamp/palette 与 position/normal/group/UV/index 全量 exact proof，completion 再验
+  stamp/palette；ABA、结构 mismatch、fuse、reset/epoch 均清 hint。
+- key-only native fuse 在 preflight 恢复 exact geoset/layer 后会升级成 layout fuse，下一
+  flush 在 palette copy/compute 前拒绝。global palette base 每 flush 只读一次；仅 Bypass
+  取消不参与授权且历史 hit=0 的 palette hash/dedup，Dual/Shadow/Main 不变。
+- 最新纯 Python 重放为
+  `AutoTest/artifacts/gpu_skin_offline_cost_20260714_122644/result.json`；静态双审
+  P0/P1=0，最新 DLL 已通过 build-only 但尚待运行 delta，不能据此宣称 FPS 已恢复。
+
+用户随后确认该版 FPS 仍基本不变，因此 2026-07-14 又补齐了 GPU skin 全链路的
+低扰动 raw-QPC 取证，而不是继续凭静态猜测热点：
+
+- 既有 `nativeTiming` 保留 begin/evaluate/complete/normal-return/DIP/outer/CPU kernel；
+  manager 新增 `managerQueueTime`、`managerBatchTime`、`managerProofTime`、
+  `managerConsumerTime`，覆盖 flush query/control/static、RenderQueue scan、透明碰撞、
+  exact-positive binding/model/static/palette/candidate、output lease、compute finalize/upload、
+  host finalize、P4 preflight 三段、两次 palette proof、static proof、normal-return proof、
+  completion、resolve/plan/commit/fail/close/draw-result/fuse/terminate。
+- Bloom miss 和逐 element 负路径没有新增 QPC；scan 只每 array 计一次，四个 candidate
+  子阶段只在 reverse exact hit 且通过格式/449 阈值/重复门后计时。production scope-less
+  upload 仍跳 manager callback；唯一较宽的 completion timer 只覆盖真实 manager upload。
+- `run_gpu_skin_p4_isolated.py` 会对两个有进度的 forced clean snapshot 做 calls/ticks 差，
+  直接给出窗口 `totalMs/averageUs`、第二快照 lifetime max 和 inclusive 耗时排名；max 不做
+  非法相减。flush→prepare→scan→positive、assemble→finalize→upload、native outer、
+  preflight/normal-return/completion、palette/static proof 都有嵌套闭合，且新
+  `hotPathTimingContractClean` 硬门同时要求字段完整、频率一致、单调、闭合与 Bloom exact。
+- 注意 nested timer 不能横向重复相加：例如 positive 已包含 binding/static/palette/build，
+  plan 又位于 preflight host callback 内。下一轮应优先读取 forced artifact 中
+  `cleanPairHotPathDelta.rankedByInclusiveTotalMs` 与各 closure residual，再决定优化函数。
+
+最新 build-only：
+
+`AutoTest/artifacts/gpu_skin_timing_volume_build_only_20260714_132000`
+
+相关增量 5/5：volumetric shader 生成、GPU skin manager、device、Volumetric C++ 与最终
+x86 link 均通过，exit 0、error=0；parser AST 与最小字段/闭合合同自测也通过。9 行 warning
+均为共享头既有 `OPCode -Wreorder`。DLL SHA256：
+`13927E439386E1837343632914DA4D919DB56145FCD7B95991CBC55C4EB3742B`；
+`launchPerformed=false`、`deployPerformed=false`、`autoTestPerformed=false`，未运行性能测试，
+本轮编译器/链接器/Python/Node 派生残留 0。
+
+2026-07-14 13:51 报告的 GPU-skin 巨量 CPU 墙现已具体闭合，而不是继续归入笼统的
+“render lane 管理成本”：
+
+- 报告 `war3_perf_report_2026_07_14_13_51_15.html` 为 frame `19.219 ms`、main
+  `15.650 ms`、GPU `2.208 ms`。7 个超过 100 ms 的尖峰位于帧
+  `72/372/672/972/1272/1572/1872`，严格相隔 300 帧；旧 periodic GPU-skin
+  formatter/logger 均摊 `0.644 ms/frame`，并制造全部大尖峰。production 默认现为
+  `DXVK_WAR3_GPU_SKIN_DIAGNOSTICS=light`、period `0`；full 只由专项 AutoTest 显式开启。
+- clean-pair 同帧 delta：v1b native outer + manager flush 为
+  `8.577 + 1.454 = 10.032 ms/frame`；449 顶点 T1 early gate 后 v2 为 `4.727`；manager
+  palette 从 VirtualQuery/readability 放大改为 bounded fault-safe copy 后 v3 为 `3.348`；
+  native T2 palette readability 同样改为独立 TLS scratch SafeCopy 后 v5 为 `1.550`。
+  v1b→v5 共收回约 `8.482 ms/frame`。
+- lifetime sampler 给出 manager palette copy `228.591 -> 2.223 us/candidate`
+  (`-99.03%`)；native T2 palette proof `281.328 -> 2.193 us/candidate`
+  (`-99.22%`)，完整 exact T2 `292.588 -> 12.769 us/candidate` (`-95.64%`)。
+  未发现 GPU fence wait、同步 Map、retirement wait 或 compute dispatch 多毫秒阻塞。
+- 以同场景 delta 回代旧报告，production-light 的审慎预测为 `10.09..10.56 ms/frame`
+  (`94.7..99.1 FPS`)；这是归因预测，不是隔离桌面 FPS 结论，最终仍只认用户让出前台后的
+  foreground 报告。
+
+最新部署 DLL SHA256 为
+`26FE1807A0D4346B45141E59D9F44CB5FDF0325D6DA9CEE15E3FF62C0859036F`。full hard gate：
+`AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_full_v6_full_clean_endpoint_gap_fix_20260714_160456`；
+policy `1/1/0`、raw `6055`、begin/eval/complete/outer 全等、fast partition 与 timing/resource
+closure 全闭合。production-light hard gate：
+`AutoTest/artifacts/gpu_skin_p4_crash_gate_isolated_diag_light_diagnostics_light_full_v6_light_20260714_154649`；
+policy `0/0/0`、44 个 full timing stage 的 calls/ticks 全为 0、raw `3788`、kernel bypass
+`13099` 次 / `247,459,104` bytes，公共安全门全部通过。
+
+forced diagnostics 现在允许两个严格 clean endpoint 中间出现已结算 transient poison，但不
+放宽 endpoint：两端仍须 exact PID/requestId、完整 block、同 epoch/reset generation、各自
+quiescent；最终重新校验 chronology、intermediate 全 non-clean、counter 单调、progress、
+resource retirement 等量、timing/fast partition closure。上述 full artifact 实际以 attempts
+`[2,4]`、gap `[3]`（poisonRanges `3`）通过，两个 endpoint 的 poisonRanges 均为 0。
+
+### 点光、点阴影、体积光
+
+- 全局点光 snapshot 现在先过滤非有限、零 range、零 intensity 与黑色光，再在
+  shadow-first 分组内按 `maxRGB * intensity * range² / (1 + cameraDist²)` 排序；
+  黑色高强度灯不再占用 cube/direct/contact 的有限槽位。receiver UBO 保持
+  48-byte/light、784-byte 总 ABI，但由 CPU 每帧/灯预先写入 view-space position，
+  shader 不再对每像素/灯重复 world→view；2560x1440、16 灯时理论上最多移除约
+  5900 万次 position transform/帧，实际 GPU 收益仍待运行测量。
+- 点光 receiver 的模型法线不再使用 divergent early-return 后的 `dFdx/dFdy`。
+  现在显式读取 L/R/U/D 最多 4 个 integer depth texel，拒绝 clear/跨 surface 邻居；
+  `viewFacing` 只用于合法法线翻面，低 confidence 时点光增量归零，不再把薄片/轮廓
+  混成最大 N·V 的锯齿亮边。同一 gated normal 用于 Lambert、cube bias 与 contact ray。
+- cube 点阴影只有六面 `0x3F` 全部有效才可采样，避免未初始化 face/seam
+  形成错位楔形；16-tap PCF 改为零质心同心盘；range fade 使用自身
+  `currentDist/shadowRange` 域。默认 1024、可选 2048、D32 总预算 96 MiB。
+  质量默认已把 `pointShadowMaxCastersPerFace` 从静默 192 cap 改为 0
+  (unlimited)；显式 cap 时逐 face 记录 `candidate/kept/dropped` 并低频报告。
+- 2026-07-14 继续静态复核确认 cube face VP 乘法次序曾确定错误：仓库
+  `Matrix4::operator*` 的 raw product 反序，C++ 必须写 `proj * view` 才能让 row-vector
+  caster shader 收到 raw `view * proj`。旧 `view * proj` 在光源平移后会把 face 正前方
+  caster 投到视锥外，足以解释“阴影位置不对”。clip-X cube convention 与六面表不改。
+  默认六面/period1 不再 O(draw+palette) 做无效内容 hash；24 个 face vector 保留
+  capacity，unlimited 直接按 replay 顺序追加；range/direct reject 用 squared distance，
+  16 个 PCF tap 去掉单 mip cube 上数学冗余的 normalize。只有 temporal reuse 或
+  1..5 face 轮转会计算 O(draw+palette) 历史签名；该签名现已包含 skinned output
+  动态门、position/index/blend/UV slice 与 layout、draw range、alpha/texture/sampler，
+  资源或材质变化不能再误复用旧 cube。
+- **独立 UV binding 静态闭合**：`War3ShadowCasterDraw`、persistent geometry 与
+  pipeline key 显式传播 `uvBinding=0/1/2`（position/blend/separate），CSM、terrain
+  mask、point cube 与两条 outline consumer 均按 binding 绑定并 track。raw legacy 在
+  persistent probe 前解析真实 UV owner；动态 separate UV 强制逐帧冻结 fallback，
+  静态 separate UV 进入 source hash；semantic alpha key 在首个 cache probe 前纳入
+  UV/纹理合同。S1 early cache 的读与两个写点均只允许 opaque，不能被 alpha draw
+  污染。静态 gate P0/P1=0，仍须运行验证 binding1/2 树叶/栅栏与 outline。
+- 体积光修正低分辨率非线性 depth 插值、sun/point/requireCsm 门、CSM coverage
+  feather、Beer-Lambert/HG 能量、LDR soft-headroom composite；点光体积能量
+  已与 receiver 的 `(1-x²)²/(1+6x²)` 对齐，移除常见距离约 5–7 倍的隐性
+  衰减。点光 ray-sphere 区间现在每像素只计算一次，再按 march segment 的真实
+  overlap 做 Beer-Lambert 子段积分；细小/掠射光球不再因 jitter midpoint 未命中而
+  完全消失，无 overlap 的灯也不再逐步执行 length/HG/atten。深度使用
+  projection-derived far clear、signed viewport delta 与
+  D16/D24/D32 quantum，支持正常/反向 viewport。默认仍关闭；TDR 安全启用档改为
+  samples=16、divisor=4、point lights=2，执行层和 shader 均有硬 clamp。
+- 体积太阳阴影把旧单纵向点的 8-tap PCF 重排为每段最多 8 个 longitudinal raw
+  `texelFetch`；每 probe 内完整组合 coverage fallback 与真实 blocker 后段内取 max，
+  不再跨 probe 双重计费。CSM camera/ray clip 预计算把最坏矩阵变换收为固定 8 次/像素。
+  点光能量仍取 overlap midpoint，但 cube visibility 用 2 个分层 probe；CPU/shader 双端
+  硬限 2 灯，因此最多 4 cube fetch/segment。`weight` 只控制阴影柱对比，不再全局加雾。
+  4M segment 门给出组合 shadow fetch 约 4800 万/帧绝对上界；纯算术产物为
+  `AutoTest/artifacts/volumetric_offline_cost_20260714_122642/result.json`。
+- 用户确认上述路径已经能看见阴影柱，但上帝视角仍弱、需要过高强度。根因不是 probe
+  预算，而是旧 `weight` 在单个二值 segment 内立即饱和，无法增强俯视 ray 只横穿
+  1/16 段的短柱；旧 HG 映射也让低镜头 forward scatter 天然显著更亮。
+- 太阳现在每段同时累计只含 coverage fallback 的 reference 与含真实 CSM blocker 的
+  physical integral，整条 ray 末端使用
+  `Aout=Aref*pow(clamp(Aphysical/Aref,0,1), clamp(weight,0,2.5))`。
+  `weight=0/1/>1` 分别表示去掉真实阴影对比/物理结果/增强短柱；CSM 缺失时两者相等，
+  任何 weight 都不能造伪柱。该改动不增加 texture fetch、segment 或矩阵预算。
+- HG 映射收窄为 `g=clamp((skyThreshold-.55)*.50,0,.22)`，HG/iso mix 从 0.70 降到
+  0.55，削弱低镜头 forward 峰并抬高俯视 side/back 响应，不提高全局雾能量。
+  `volumetric_max_quality` 改为相干的俯视可见 preset：weight=2.25、height=0.50、
+  fadeFar=0.55；`height=2/fadeFar=1` 不是“更强”，而会把介质压向地表并延迟短 ray 显现。
+- 体积光不再盲取全局 shadow-first canonical 前缀：仅在体积消费者内用固定数组
+  先拒绝超出真实 march 最大光程、完全在相机后方或可证明离屏的光球，再从剩余
+  最多 16 盏灯按
+  `clamped maxRGB * intensity * range² / (1 + cameraDist²)` 选择最多 2 盏；
+  global snapshot、shadow prefix 与 generation 完全不变，预算覆盖全部灯时保持原序。
+  这修复“远处阴影灯占满前四位，近处亮非阴影灯表面可见但没有体积”的确定性漏选。
+  `Run()` 在任何资源申请/copy 前只获取一次不可变 snapshot；point-only 且有效候选
+  为 0 时不再执行两次 full-resolution copy 或两次 fullscreen pass。`density<=0/NaN`
+  也与 shader 同合同早退。march 内 sample view-Z 改为 camera intercept + ray slope 的
+  affine FMA；执行层额外用 4,000,000 ray-segment 硬预算收缩 samples，必要时自动把
+  divisor 提高到 8；最低 4 samples 仍超预算时直接跳过 optional pass。
+- optional CSM 缺失时 `unshadowedScattering` 现在始终控制太阳 fallback，不再被
+  `shadowStrength=0` 绕过并凭空生成 100% sun volume。旧 point-only sphere ROI 只对
+  divisor=2 有精确合同；TDR 安全档最小 divisor=4 后当前走保守 full-effect extent，
+  由 ray-segment 硬预算兜底。后续若恢复 ROI，必须先推广 odd-size 映射合同；full
+  color/depth copy 仍未收窄。
+- 默认关闭的软件 point contact ray 已包含 A0 线性步进与 A1 半分辨率 Hi-Z。
+  A1 使用 `RG32F` min/max 全 mip 链、`RG16F` visibility/confidence、默认
+  24 个节点硬预算，并按点光 range/direct-energy relevance 在 8..configured
+  visits 间自适应；范围外和低贡献像素在法线邻域/遍历前退出。深度断层、
+  raw-depth 量化不确定、离屏、预算耗尽均 confidence=0。默认仍只处理
+  canonical shadow prefix 的 1 盏灯。contact pass 已改为逐灯保守屏幕 ROI；每帧先把
+  active array 全层 transfer-clear 为 `(visibility=1, confidence=0)`，ROI 外、完全离屏
+  或 empty layer 不会继承旧帧暗影。48-byte push ABI 不变，最终
+  `min(cube, contact)`，只补暗不破坏 cube fallback。mip0 精确测试也从固定 1/3、2/3
+  两点改为 full-resolution 子像素 DDA：一个 2x2 cell 实际穿过的最多 3 个像素区间
+  各 load 一次 depth，但 blocker 判定使用该像素内完整 ray-depth 区间，不再只测
+  ownership midpoint。量化采用三态：expanded possible window 可证明分离才 definite
+  miss；可能重叠但 shrunken reliable window 不重叠则 unknown；可靠相交才从真实交集
+  选 representative。全局仍硬限 8 次 depth load；corner tie、沿像素边、不可表示
+  短区间、求根失败或 cell ownership 不一致均返回 unknown，不能再把第三像素或
+  midpoint 两侧的薄 blocker 错判为 confident visible。
+- A1 outer hierarchy 同时删除 `current+1e-4` exit 门与两处 world-distance post-step；
+  旧逻辑可整段跳过极短 projected cell。现在精确停在 rational boundary、按投影方向
+  定义 half-open ownership，并验证只进入相邻 old-mip cell；root/axis/corner/progress
+  歧义均 unknown，只有完整测试到 traceLength 才 confident visible。全部 light ROI
+  预先计算；若都可证明离屏/behind，则在 allocation/clear/Hi-Z seed 前零 GPU work 返回，
+  caller 已先清本帧发布 view，不会消费缓存旧 A1。
+- A1 receiver 从 half-res 回 full-res 已由 nearest 改为 depth-guided 2x2 bilinear
+  resolve；未知、mixed、深度不一致的 tap 贡献零遮挡且不重归一化，canonical
+  anchor 不可信时整像素 fully lit。边缘采用 clamp-to-edge，不能由邻格把 blocker
+  借进 ROI clear/unknown 像素。代价从每像素/灯 2 次读取增到最多 8 次，仍需运行期
+  GPU p95 证明。
+- A1 已从单灯固定预算扩为最多 2 盏 canonical shadow light：一灯仍保持原
+  `mix(8, configured, sqrt(relevance))` 行为；两灯各保留 8 次基础访问，其余预算按
+  receiver 处真实 `maxRGB*intensity*shadowStrength` 与 range attenuation 分配，任一
+  重叠像素总访问硬界为 `configured+8`（默认 24 时最多 32，不再是 48）。visibility
+  array 容量只增不减，active layer 仍逐帧精确 clear/dispatch/publish；UBO 从 256
+  增至 320 bytes，48-byte push ABI 不变。
+- 点阴影补齐 point-only/CSM-reuse 场景的首消费者屏障：transfer/compute write 在
+  cube replay 前显式可见于 vertex/index input。receiver 的 cube texel footprint
+  改为 `2*max(abs(dir))/resolution`，在 face center 精确、在 seam/corner 为保守
+  Jacobian 上界，PCF 半径与 world-space texel bias 不再按中心尺度过度膨胀。环境
+  float parser 拒绝 NaN/Inf，consumer 端再以 0.65/1.15/0.08/0.78 默认值 finite
+  fallback，非法 filter 参数不能污染 cube lookup。
+- Pipeline 新增单调 `frameSerial`，并把 0..2 的 `frameIndex` 明确限制为资源 ring；
+  light snapshot、ReplayDraw cache、camera freshness、CSM/point-cube/Hybrid RT 发布均不再
+  用三帧环索引判断“同帧”。CSM 只有本帧实际 render 成功或显式 reuse 才 settlement；
+  point cube 记录真实 published serial，Volume 与 receiver 使用 expected serial exact
+  gate，异常或非异常资源失败都不能把旧纹理重标为当前帧。该事务静态复核 P0/P1=0。
+- 体积光太阳与点光统一为 `color * sourceIntensity`；黑色、NaN 或零辐射太阳在
+  image allocation/copy 前退出，不能制造无源消光。HDR sun color 不再被隐藏
+  peak-normalize，仍统一经过 `softClipRgb(..., 0.92)` 与 composite headroom。
+  “全部滑杆拉满”不是最大可见 preset：fade、minSunIntensity 与 extinction 是门限/
+  抑制参数，验收应使用相干的 `volumetric_max_quality` 组合。
+- RTX 4060 Ti 的 64 位 ICD 支持硬件 RT，但当前 NVIDIA 610.74 **32 位 ICD**
+  不枚举 AS/ray-query/RT-pipeline；War3 x86 进程内不能直接启用。详见：
+  `docs/research/war3_render_issues/29_hybrid_ray_tracing/README.md`。
+- P0 补丁后的最新 build-only 为
+  `gpu_skin_light_build_only_20260714_123117`；两个修改 shader、Volumetric、manager、
+  device 与最终 x86 link 均成功。DLL SHA256
+  `0620F24CDB7BDCB3D44ADBDDA8431C59571257CC50A475485E05C259D1D71E83`；未部署、
+  未启动 War3、未运行 AutoTest。
+- A1 生命周期静态门已闭合：资源在首条 Vulkan 命令前 track，异常录制保持
+  fail-soft；设备析构按 `Flush -> CS sync -> GPU idle -> pass destroy`，避免 raw
+  compute pipeline 仍在执行时提前销毁。冷启动默认关闭不分配 A1 资源；启用后
+  再关闭会安全保留缓存到 owner 析构。
+- 灯光专项详见：
+  `docs/research/war3_render_issues/27_dynamic_lights_and_volumetric_release/README.md`。
+
+### 当前验证约束与下一步
+
+- 2026-07-14 用户已授权 GPU-skin 性能线由**唯一 Test Conductor**多轮运行隔离
+  AutoTest；仍禁止并发测试、切换用户前台或把 isolated frame advance 当正式 FPS。
+- 后续先在隔离桌面的 `光影测试.w3x` 做点阴影六 seam、范围边缘、体积光
+  sun-only/point-only/CSM-missing/max 档，补 alpha caster binding1/2 在 CSM/point/
+  outline 的树叶与栅栏，以及 contact ray A0/A1、深度断层、reversed depth、
+  resize/reset/第二进程；SunkenCity 自动化困难时不强行进图。
+- `AutoTest/run_light_feature_matrix.py` 已扩为 8 组：保留 512 低成本性能对照，
+  新增 1024 产品默认正确性和 2048 Ultra 质量门；三个 point-shadow case 均要求
+  exact-launch-PID 执行证据。
+- isolated desktop 不判 FPS；最终 foreground `dual_perf` 只能在用户明确让出
+  前台后执行。
+- S1 capture period 必须保持 1；不得借灯光/光追工作修改 S1、点光或 CSM 之外的
+  算法语义。
+
+---
+
+## 🚨 2026-07-11 GPU 蒙皮主线交接（先读专项文档）
+
+完整寄存器级证据、CPU skin 公式、FVF 布局、DXVK 接管点、同帧边界和 P0~P5 实施顺序已写入：
+
+`docs/research/war3_render_issues/28_gpu_skinning_takeover_feasibility/README.md`
+
+P1~P4 多 Agent 分工、模型/思考强度、文件所有权、槽位轮转与唯一 AutoTest 锁已写入：
+
+`docs/plan/gpu_skinning_multi_agent_execution_2026_07_10.md`
+
+执行硬约束：主线程外最多并行 3 个 Agent；只有 `Test Conductor` 可以 build/deploy/启动 War3/运行 AutoTest；凡涉及 Game.dll 渲染语义、hook ABI 或 native bypass，必须由 `gpt-5.6-sol + ultra` Agent 阅读 ASM，IDA 伪代码仅作辅助证据。
+
+当前结论：普通 `CGeosetData` GPU 蒙皮接管 **高置信可行**。War3 使用 CPU 生成的 group palette，每顶点仅以 `uint8_t groupSlot` 选择一条 3x4 混合矩阵；推荐在 `Hook_FlushSortedItems` 入口批量 compute 生成原 FVF post-skin VB，并于 `D3D9DeviceEx::DrawIndexedPrimitive` 的 `PrepareDraw` 后做一次性 stream 0 override。`DxvkContext::dispatch()` 会 spill render pass，**禁止逐 draw dispatch compute**。
+
+**已证明（仅 Observe）**：v5 配对子门为 `begin=end`、`truePairErr/epoch/pending=0`，且 `outside upload==0-fanout`。ASM sidecar + unified tag/stage upsert 的 v6 最终日志为 raw uploads `1449543`、outside `1078139`、inside `371404`、eligible `123790`，reject path/stage/skin `98217/31146/118251`，计数严格闭合；`Stage/world missing=outside+stageReject` 是分类结果，不是白名单故障。
+
+**待验证 / 禁止晋级**：P1B Dual v1 在 `finalizeComputeGroup` 因 `GpuSkinJob alignas(16)` 与 32 位 `vector` 仅 8-byte 对齐触发 `movaps` 崩溃（`gpu_skin_dual_isolated_v1_20260711_161836`）。已移除 CPU staging over-alignment，并补 static hash/layout/readback usage+budget hardening；Dual v2 正在隔离桌面验证，尚未获得 parity 或画面通过结论。P2/P3/P4 只有代码骨架，未 runtime 晋级，所有 takeover/skip 默认关闭。所有现有 GPU-skin 测试均为隔离桌面，性能暂缓；最终 `dual_perf` 只能以前台 FG 判定。
+
+硬约束：不要先改 War3 全部 vertex shader；不要绕过逐 draw fallback；不要把 GPU skin 与动画树/GPU palette 全接管混为一期；S1 period 仍必须保持 1。
+
+---
+
+## 🚨 2026-07-09 接棒交接（其他 AGENT 必读）
+
+> 本节是 **2026-07-09 自动化性能推进 + 点光/体积光** 的完整交接。  
+> 更早的 Phase 7.x 阴影/路径阻断器/静态阴影历史在本文后半，不要与本节混读为“本轮刚做完”。
+
+### 0. 用户目标与硬约束
+
+| 项 | 内容 |
+|---|---|
+| 性能护栏 | 前台 `dual_perf`：**高压 ≥85 FPS**、**低压 ≥120 FPS** |
+| 高压图 | `E:\Work\War3\Maps\ShadowTest\光影测试-高压.w3x`（桥/斜坡/大量 caster） |
+| 低压图 | `E:\Work\War3\Maps\ShadowTest\光影测试.w3x` |
+| 验收脚本 | `py AutoTest\dual_perf_baseline.py`（**必须前台 FG**，禁止 isolated desktop 判 FPS） |
+| S1 period | **必须保持 1**。`period>1` 用户已实机确认地形阴影**高频闪烁**，禁止再试 |
+| Worker_Prepare | 目标方向 ON（点光/点阴影 worker 路径）；MT_CmdRecord 目标 OFF |
+| 视觉红线 | 不得回退静态阴影解决版、path blocker 身份门、S1 地形遮挡语义、动态单位 pose 流畅 |
+
+**WSL 注意**：在 WSL 内跑 AutoTest 时应用 Windows 的 `py`（或 `cmd.exe /c py ...`），不要用 Linux python 直接起 War3。
+
+### 1. 本轮做了什么（按时间线）
+
+#### 1.1 Phase A→E 性能主线（核心）
+
+收官数字见 `AutoTest/artifacts/phaseAE_closeout_20260709.json`：
+
+| 里程碑 | 高压 FPS | 低压 FPS | 做了什么 | 结论 |
+|---|---|---|---|---|
+| **A0 基线** | 37.7 | 53.6 | 进入本轮前 dual_perf 起点 | 起点极差 |
+| **A S1 early cache** | **64.8** | **109.7** | S1 地形 legacy capture 入口 O(1) early cache；persistent geometry ON；**period=1** | **本轮唯一大收益**（+27 / +56）；ShadowCapture 从热点塌到 ~0.02ms 量级 |
+| **B Populate/diag 门控** | 64.9 | 109.3 | 关闭/门控 Populate 上过重诊断与无效热路径 | 与 A **持平**，不抬 FPS |
+| **C static VB fingerprint** | （随 B dual 同批） | | 静态 VB cache 指纹/分类安全收紧 | 正确性向，**无 FPS 抬升** |
+| **D WaitGate 归因** | 60.2→~67.9* | 107→~113* | 装 Engine WaitGate/PrepareWait/SleepGate 做 Idle 归因；曾误装宽 Wait API Hook 压帧 | 证明旧 “Untracked ~13ms” 大量是 **Idle 误分**；coverage→100%，UntrackedActive→0 |
+| **E 2048+adaptive+轻 WaitGate** | **67.9** | **113.1** | CSM 默认 2048；`kShadowAdaptiveMapUpdateEnabled` period=2；Wait 只保留轻量 Engine WaitGate | GPU 约 3.36→**2.11**；相对 A 仅 **+3.1 / +3.4**；护栏仍 FAIL |
+
+\* Phase D 中途宽 WaitHook 把高压压到 ~60；收口后改为 `kNativeMainLoopWaitGateHookEnabled=true` 的**轻量**路径。
+
+**Phase E 单次 dual_perf 原文**（`phaseE_res2048_waitgate_light_dual_perf_20260709.log`）：
+- 高压：`avgFps=67.884`，`avgFrameTimeMs=14.731`，`avgGpuTimeMs=2.114`，`avgMainThreadCpuMs=11.268`
+- 低压：`avgFps=113.126`，`avgFrameTimeMs=8.84`，`avgGpuTimeMs=1.654`，`avgMainThreadCpuMs=5.697`
+- 护栏：高压 FAIL / 低压 FAIL
+
+#### 1.2 Phase A 技术细节（接棒必懂）
+
+- **问题**：高压场景 S1 terrain 作为 CSM occluder 走 legacy ShadowCapture，每帧对大量 tile 做 decl/VB/copy，主线程爆炸。
+- **做法**（`d3d9_device.cpp` + `d3d9_device.h`）：
+  - `kShadowS1TerrainPersistentGeometryEnabled=true`：S1 tile 可进 persistent geometry。
+  - **Early cache**：capture 入口用稳定 key 查 early cache，命中则跳过整条 re-copy/decl 热路径；仍 **period=1**（每帧 live 可见集合，不是隔帧跳过采集）。
+  - `War3S1TerrainCapturePeriodRuntime()`：**period 强制语义为 1**；代码注释写明 period>1 会闪。
+- **失败/放弃过的方向**：
+  - period=2/3 隔帧 stash：FPS 好看但**地形阴影闪** → 禁止。
+  - 仅靠 bounds cache / source-key 而不做 early hit：收益远小于 early cache。
+
+#### 1.3 Phase B/C 细节
+
+- B：Populate / semantic diag 门控（减少无用 scope 与日志路径），**不改变提交语义**。
+- C：static VB cache fingerprint / unitless rigid 静态持久化相关安全收紧（延续 Phase 7.15x 三问题线），**不抬 FPS**。
+- 相关配置仍在 `war3_internal_test_config.h`：
+  - `kShadowDrawTimeVBCacheStaticPersistEnabled=true`
+  - `kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled=true`
+  - `kShadowDrawTimeVBCacheAllocBudgetPerFrame=32`（**不要**再降到 4：Phase 7.155 降 budget 会导致阴影不完整，已 REVERT）
+
+#### 1.4 Phase D 细节（归因，不是性能银弹）
+
+- 目标：解释 perf 报告里巨大的 `Other/Untracked*`。
+- 结果：
+  - 装 Wait 归因后：`cpuCoveragePct≈100`，`avgUntrackedActiveCpuMs≈0`，`avgIdleWaitCpuMs≈帧时`。
+  - **结论**：大量时间是引擎等待/门控，不是 “Shadow 还有 13ms 可砍”。
+- 踩坑：Hook Sleep/Wait 宽 API → 高压 **-5 FPS 级**；已收回到 Engine 侧轻量 WaitGate 安装路径（`war3_hook_lifecycle.cpp` + config 开关）。
+- 配置：`kNativeMainLoopWaitGateHookEnabled=true`（`war3_internal_test_config.h` ~281 行）。
+
+#### 1.5 Phase E 细节
+
+- CSM 默认分辨率：`d3d9_war3_csm.h` 中 `shadowResolution = 2048`（历史常见 4096）。
+- Adaptive ShadowMap：
+  - `kShadowAdaptiveMapUpdateEnabled=true`
+  - `kShadowAdaptiveMapUpdatePeriod=2`（及 high/huge caster 分层 period）
+  - **实测**：有 skinned 动态 caster 时 reuse 几乎不触发（设计正确，避免 pose 冻）；稳态收益有限。
+- Adaptive resolution 开关仍在 config（`kShadowAdaptiveResolutionEnabled` 等），与 map-update adaptive 不同层。
+
+#### 1.6 模块二分 / 天花板证据（决定性）
+
+| 实验 | 结果 | 含义 |
+|---|---|---|
+| `dxvk_only` / 极简关增强 | 高压仍 ~**63** FPS，MT ~**11ms** | **85 墙不在“再砍一点 Shadow 诊断”**；存在引擎/DXVK 基线上限 |
+| tracked Shadow+Populate | 合计约 **~1.3ms** | 已观测 shadow 热路径不是 11ms 主因 |
+| `Worker_Prepare` 矩阵 | 点光默认关时 Worker 路径 **无重叠收益**；点阴影开时有 `PointShadow` section | A2 要真收益必须在 **CSM prepare/sort** 上做，不是空开点光 worker |
+| isolated desktop dual | FPS 噪声大（曾假降 5–10） | 判护栏**只用前台 FG** |
+
+相关产物：
+- `AutoTest/artifacts/a2_worker_module_matrix_isolated_20260709_171037.json`
+- `AutoTest/artifacts/perf_module_bisect_20260709_172834.json`（注意：部分 case 如 `no_semantic` 数字异常偏低，解读时核对是否 dual 互斥/进程污染）
+- `AutoTest/artifacts/fg_untracked_probe_20260709_*.json`
+- `AutoTest/run_module_bisect_perf.py` / `run_one_case.py` / `run_fg_untracked_probe.py` / `run_a2_worker_module_matrix.py`（本轮新增，部分未收口文档化）
+
+#### 1.7 点光 / 点阴影 / 体积光（并行线，默认关）
+
+文档：`docs/research/war3_render_issues/27_dynamic_lights_and_volumetric_release/README.md`
+
+**已完成**：
+1. 自动化：`AutoTest/run_light_feature_matrix.py`（先 dual_perf 护栏，再 5 组 env 矩阵）。
+2. 零成本关闭复核：点阴影/体积光 off 时入口 return，不分配 cube、不 copy depth/color。
+3. 点阴影 face budget：默认每帧最多 3 面轮转；env `DXVK_WAR3_POINT_SHADOW_MAX_FACES=0..6`。
+4. 体积光：低分辨率 effect（默认 divisor=4）+ full-res composite；`requireCsmSnapshot` 同源 CSM；参数与冲白保护收紧。
+5. JASS/command bridge 与 env 控制入口已齐（见 27 号文档）。
+6. `build32_safe.cmd` / `ninja -C build32` 本轮可过（以你本机最后一次编译为准）。
+
+**未完成 / 未用户前台验收**：
+- 用户前台完整 `run_light_feature_matrix.py` 矩阵（isolated 结果不可信作最终画质/FPS 结论）。
+- 正式 **A1：N−1 双缓冲 CSM 快照**（体积光/receiver 与 ShadowMap 生产解耦）。
+- 正式 **A2：CSM prepare/sort 丢 Worker_Prepare**（与点光 worker 不是同一条路径）。
+- **B1：点光重要性排序**。
+- 体积光阴影质量/采样与用户主观 “阴影不对” 的专项（用户曾 defer vol-light shadow 修复）。
+
+### 2. 默认配置清单（接棒时视为当前生产倾向）
+
+| 配置 / 位置 | 值 | 说明 |
+|---|---|---|
+| `kShadowS1TerrainPersistentGeometryEnabled` | true | S1 persistent |
+| S1 capture period | **1** | 禁止 >1 |
+| S1 early cache | ON（代码路径） | Phase A 大收益 |
+| `kShadowSemanticCoreSceneKeepS1TerrainLegacyCapture` | true（历史） | S1 仍走 legacy capture 语义 |
+| `d3d9_war3_csm.h` `shadowResolution` | **2048** | Phase E |
+| `kShadowAdaptiveMapUpdateEnabled` | true | period=2 等 |
+| `kNativeMainLoopWaitGateHookEnabled` | true | 轻量 Idle 归因 |
+| MT_CmdRecord | OFF | 目标保持 |
+| Worker_Prepare | ON（点光相关） | 点光关时几乎无收益 |
+| 点光 / 点阴影 / 体积光 | 默认 **关** | 高级选项 |
+| VB alloc budget | **32**/帧 | 勿回 4 |
+| path blocker 匿名几何宽启发式 | **已 REVERT** | 误杀单位子网格 |
+
+### 3. 关键文件地图（改动落点）
+
+| 文件 | 本轮角色 |
+|---|---|
+| `src/d3d9/d3d9_device.cpp` / `.h` | S1 early cache、period 门、Populate/VB cache、capture 热路径 |
+| `src/d3d9/war3/core/war3_internal_test_config.h` | WaitGate、S1、adaptive map、VB cache 开关 |
+| `src/d3d9/d3d9_war3_csm.h` | 默认 2048 |
+| `src/d3d9/d3d9_war3_shadow.cpp` | ShadowMap adaptive、点阴影、receiver/volume 协作 |
+| `src/d3d9/war3/hooks/war3_hook_lifecycle.cpp` | WaitGate 安装路径 |
+| `subprojects/war3fx/shaders/war3_volumetric_*.frag` 等 | 体积光 effect/composite |
+| `AutoTest/dual_perf_baseline.py` | 护栏双图（FG） |
+| `AutoTest/run_light_feature_matrix.py` | 灯光矩阵 |
+| `AutoTest/artifacts/phaseAE_closeout_20260709.json` | **A→E 收官数字唯一摘要** |
+| `docs/research/war3_render_issues/25_s1_terrain_csm_occluder/` | S1 语义/历史 |
+| `docs/research/war3_render_issues/26_*` / `27_*` | 体积光/动态光 |
+
+### 4. 明确「没做完 / 禁止重做」清单
+
+#### 4.1 未完成（建议下一 AGENT 优先级）
+
+1. **护栏仍 FAIL**：高压 67.9≪85，低压 113≪120。  
+2. **主线程 ~11ms 未归因到可砍模块**：tracked shadow 已薄；需 **引擎层**（MainLoop 非 Wait、Jass、RenderQueue flush、Present/DXVK 录制）深挖，或接受 “dxvk_only≈63” 为当前硬件/场景上限并改目标。  
+3. **Plan A1** N−1 CSM 双缓冲快照（体积光/后处理与 map 生产解耦）。  
+4. **Plan A2** 把 **CSM** prepare/sort（非仅 PointShadow）丢 worker 线程；需 dual_perf FG 证明。  
+5. 点光 **B1 重要性排序**、face budget 与画质 A/B。  
+6. 用户前台 **light_feature_matrix** 正式验收 + 体积光阴影主观问题（若仍开）。  
+7. 工作区 **大量未 commit**：接棒后先 `git status` / 决定是否只提交 war3 相关、勿误提交 submodules 噪声。  
+8. 历史 **静态阴影/path blocker** 视觉线：2026-07-08 已有 “静态阴影解决版” 里程碑（UnitUI buildingShadow 等），与本轮性能线独立；若用户仍报残留，另开视觉专项，不要用 ListA/WriteMaskRegion 粗拦。
+
+#### 4.2 已证伪 / 禁止
+
+| 动作 | 原因 |
+|---|---|
+| S1 `period>1` | 地形阴影闪 |
+| 宽 Sleep/Wait API Hook 当默认 | 高压掉帧 |
+| VB alloc budget→4 | 阴影不完整（7.155 REVERT） |
+| 匿名 rigid vtx 启发式拦 path blocker | 误杀真实单位（7.155 REVERT） |
+| ListA_Render* 当阴影闸 | 毁悬崖地形（7.143） |
+| 用 isolated desktop FPS 过护栏 | 噪声假 FAIL/PASS |
+| 指望 adaptive ShadowMap 在 skinned 战场大幅省 | 动态 pose 下几乎不 reuse |
+
+### 5. 接棒后建议操作顺序
+
+1. 读本节 + `phaseAE_closeout_20260709.json` + `docs/research/.../25` 与 `27`。  
+2. 本机 `ninja -C build32` 或 `build32_safe.cmd`，部署 `src/d3d9/d3d9.dll` → `E:\Work\War3\d3d9.dll`。  
+3. **前台** 跑一遍 `py AutoTest\dual_perf_baseline.py` 复现 ~68 / ~113 是否仍成立（防环境漂移）。  
+4. 二选一主攻：  
+   - **性能**：A2 CSM worker 或 MainLoop/Jass 非 Wait 热点（先 perf HTML section，再改）。  
+   - **功能**：A1 快照 + 灯光矩阵前台验收。  
+5. 每轮改动必须 dual_perf FG；视觉相关必须看图/日志，禁止只看 FPS。
+
+### 6. 一句话阶段结论
+
+> **S1 early cache（period=1）是本轮唯一质变；其余多为归因与小幅 GPU 收口。护栏未过：瓶颈已不在 tracked ShadowCapture，而在 ~11ms 主线程中的引擎/未 scope 路径与约 63 FPS 的 dxvk 基线天花板。点光/体积光入口已产品化但默认关闭，A1/A2 与前台矩阵仍待下一 AGENT。**
+
+---
 
 ### 📊 逆向论文交付状态（2026-05-19）
 

@@ -1,6 +1,7 @@
 #include "war3_hook_ui.h"
 #include "war3_hook_address_book.h"
 #include "war3_hook_install_util.h"
+#include "war3_hook_perf.h"
 
 #include "../../d3d9_war3_debug.h"
 #include "../../jass/war3_game.h"
@@ -91,17 +92,22 @@ DWORD __fastcall Hook_GetD3d9Parameters(void *thisPtr, void *edx,
 
 int __fastcall Hook_UiDispatch(void *self, void *edx, int a2, std::int64_t a3,
                                int a4) {
+  War3HotHookCallTiming hookTiming(War3HotHookId::UiDispatch, 8u);
+  const auto callNativeOriginal = [&]() {
+    if (!g_trampolineUiDispatch && !g_originalUiDispatch)
+      return 0;
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    if (g_trampolineUiDispatch)
+      return g_trampolineUiDispatch(self, edx, a2, a3, a4);
+    return g_originalUiDispatch(self, edx, a2, a3, a4);
+  };
   // 步骤1：在 UI 分发入口尝试执行 FPS 覆盖逻辑（带内部重试/幂等保护）。
   War3TryOverrideMaxFps();
 
   // 步骤2：当未启用 batch 追踪时走快速路径，避免进入额外桥接逻辑。
   if constexpr (dxvk::war3::internal::kNativeHookFastPathEnabled) {
     if (!War3RenderState::IsBatchTagTrackingEnabled()) {
-      if (g_trampolineUiDispatch)
-        return g_trampolineUiDispatch(self, edx, a2, a3, a4);
-      if (g_originalUiDispatch)
-        return g_originalUiDispatch(self, edx, a2, a3, a4);
-      return 0;
+      return callNativeOriginal();
     }
   }
 
@@ -121,11 +127,13 @@ int __fastcall Hook_UiDispatch(void *self, void *edx, int a2, std::int64_t a3,
   // 步骤4：执行原函数并保留返回值。
   int result = 0;
   if (g_trampolineUiDispatch) {
-    auto origScope = MakeUiHotpathCpuScope("Hook_UiDispatch/Orig");
-    result = g_trampolineUiDispatch(self, edx, a2, a3, a4);
+    auto origScope =
+        MakeUiHotpathCpuScope("Hook_UiDispatch/NativeOriginal");
+    result = callNativeOriginal();
   } else if (g_originalUiDispatch) {
-    auto origScope = MakeUiHotpathCpuScope("Hook_UiDispatch/Orig");
-    result = g_originalUiDispatch(self, edx, a2, a3, a4);
+    auto origScope =
+        MakeUiHotpathCpuScope("Hook_UiDispatch/NativeOriginal");
+    result = callNativeOriginal();
   }
 
   // 步骤5：退出 UI 分发状态机，恢复进入前层级。
@@ -135,14 +143,19 @@ int __fastcall Hook_UiDispatch(void *self, void *edx, int a2, std::int64_t a3,
 
 int __fastcall Hook_UiRenderableRender(void *node, void *renderCtx, int a3,
                                        int a4) {
+  War3HotHookCallTiming hookTiming(War3HotHookId::UiRenderableRender, 8u);
+  const auto callNativeOriginal = [&]() {
+    if (!g_trampolineUiRenderableRender && !g_originalUiRenderableRender)
+      return 0;
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    if (g_trampolineUiRenderableRender)
+      return g_trampolineUiRenderableRender(node, renderCtx, a3, a4);
+    return g_originalUiRenderableRender(node, renderCtx, a3, a4);
+  };
   // 快速路径：无需跟踪时直接转发，减少 UI 热路径分支成本。
   if constexpr (dxvk::war3::internal::kNativeHookFastPathEnabled) {
     if (!War3RenderState::IsBatchTagTrackingEnabled()) {
-      if (g_trampolineUiRenderableRender)
-        return g_trampolineUiRenderableRender(node, renderCtx, a3, a4);
-      if (g_originalUiRenderableRender)
-        return g_originalUiRenderableRender(node, renderCtx, a3, a4);
-      return 0;
+      return callNativeOriginal();
     }
 
     // UI 稳态快退：
@@ -150,11 +163,7 @@ int __fastcall Hook_UiRenderableRender(void *node, void *renderCtx, int a3,
     // 无需重复执行层切换与 dispatch 补写逻辑，直接透传原函数。
     if (War3RenderState::CurrentLayer() == War3RenderLayer::UI &&
         War3RenderState::HasUiDispatchThisFrame()) {
-      if (g_trampolineUiRenderableRender)
-        return g_trampolineUiRenderableRender(node, renderCtx, a3, a4);
-      if (g_originalUiRenderableRender)
-        return g_originalUiRenderableRender(node, renderCtx, a3, a4);
-      return 0;
+      return callNativeOriginal();
     }
   }
 
@@ -214,12 +223,12 @@ int __fastcall Hook_UiRenderableRender(void *node, void *renderCtx, int a3,
   int result = 0;
   if (g_trampolineUiRenderableRender) {
     auto origScope =
-        MakeUiHotpathCpuScope("Hook_UiRenderableRender/Orig");
-    result = g_trampolineUiRenderableRender(node, renderCtx, a3, a4);
+        MakeUiHotpathCpuScope("Hook_UiRenderableRender/NativeOriginal");
+    result = callNativeOriginal();
   } else if (g_originalUiRenderableRender) {
     auto origScope =
-        MakeUiHotpathCpuScope("Hook_UiRenderableRender/Orig");
-    result = g_originalUiRenderableRender(node, renderCtx, a3, a4);
+        MakeUiHotpathCpuScope("Hook_UiRenderableRender/NativeOriginal");
+    result = callNativeOriginal();
   }
 
   if (needLayerSwitch)

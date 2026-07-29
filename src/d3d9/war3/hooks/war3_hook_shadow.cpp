@@ -1,6 +1,7 @@
 // Phase 7.100 marker bump 102042
 #include "war3_hook_shadow.h"
 #include "war3_hook_install_util.h"
+#include "war3_hook_perf.h"
 #include "war3_hook_widget_identity.h"
 #include "war3_shadow_filter_policy.h"
 
@@ -14,6 +15,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <unordered_set>
@@ -54,6 +56,7 @@ using ShadowRegisterImageEntryFn = int(__fastcall *)(void *, void *, int,
                                                      void *, void *, int, int);
 using ShadowPathStaticStampToggleFn = void(__fastcall *)(void *, void *, int,
                                                          int);
+using CUnitUiRecordSetUnitShadowFn = int(__fastcall *)(void *, int);
 using CUnitUiRecordSetStructureShadowFn = int(__fastcall *)(void *, int);
 
 TerrainRenderShadowLayerFn g_originalTerrainShadowLayer = nullptr;
@@ -73,6 +76,8 @@ ShadowRegisterImageEntryFn g_originalShadowRegisterImageEntry = nullptr;
 ShadowRegisterImageEntryFn g_trampolineShadowRegisterImageEntry = nullptr;
 ShadowPathStaticStampToggleFn g_originalShadowPathStaticStampToggle = nullptr;
 ShadowPathStaticStampToggleFn g_trampolineShadowPathStaticStampToggle = nullptr;
+CUnitUiRecordSetUnitShadowFn g_originalCUnitUiRecordSetUnitShadow = nullptr;
+CUnitUiRecordSetUnitShadowFn g_trampolineCUnitUiRecordSetUnitShadow = nullptr;
 CUnitUiRecordSetStructureShadowFn
     g_originalCUnitUiRecordSetStructureShadow = nullptr;
 CUnitUiRecordSetStructureShadowFn
@@ -111,6 +116,8 @@ std::atomic<uint64_t> g_registerImageObjectBridgeCount{0};
 std::atomic<uint64_t> g_registerImageFromPointCount{0};
 std::atomic<uint64_t> g_registerImageFromTwoPointsCount{0};
 std::atomic<uint64_t> g_registerImageUnknownSourceCount{0};
+std::atomic<uint64_t> g_cunitUiRecordSetUnitShadowEnterCount{0};
+std::atomic<uint64_t> g_cunitUiRecordSetUnitShadowBlockedCount{0};
 std::atomic<uint64_t> g_cunitUiRecordSetStructureShadowEnterCount{0};
 std::atomic<uint64_t> g_cunitUiRecordSetStructureShadowBlockedCount{0};
 
@@ -214,6 +221,14 @@ int CallShadowRegisterImageEntryOriginal(void* thisPtr, int keyPtr,
                                               typeArg);
   }
   return -1;
+}
+
+int CallCUnitUiRecordSetUnitShadowOriginal(void *thisPtr, int shadowNamePtr) {
+  if (g_trampolineCUnitUiRecordSetUnitShadow)
+    return g_trampolineCUnitUiRecordSetUnitShadow(thisPtr, shadowNamePtr);
+  if (g_originalCUnitUiRecordSetUnitShadow)
+    return g_originalCUnitUiRecordSetUnitShadow(thisPtr, shadowNamePtr);
+  return 0;
 }
 
 int CallCUnitUiRecordSetStructureShadowOriginal(void *thisPtr,
@@ -405,8 +420,101 @@ bool ShouldBlockCUnitUiBuildingShadowWrite(uint32_t mode) {
   return false;
 }
 
+bool ShouldBlockCUnitUiUnitShadowWrite(uint32_t mode) {
+  if constexpr (
+      dxvk::war3::internal::kNativeShadowBlockCUnitUiUnitShadowByDefault) {
+    return true;
+  }
+  if (mode >= 2u)
+    return dxvk::war3::internal::kNativeShadowBlockCUnitUiUnitShadowWhenMode2;
+  if (mode == 1u)
+    return dxvk::war3::internal::kNativeShadowBlockCUnitUiUnitShadowWhenMode1;
+  return false;
+}
+
+int __fastcall Hook_CUnitUIManager_RecordSetUnitShadow(void *thisPtr,
+                                                       int shadowNamePtr) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::ShadowUnitUiRecord, 8u);
+  const auto callNativeOriginal = [&](int effectiveShadowNamePtr) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return CallCUnitUiRecordSetUnitShadowOriginal(
+        thisPtr, effectiveShadowNamePtr);
+  };
+  const uint64_t calls =
+      g_cunitUiRecordSetUnitShadowEnterCount.fetch_add(
+          1, std::memory_order_relaxed) +
+      1;
+  const uint32_t mode = War3RenderState::GetNativeShadowMode();
+  const bool blocked =
+      shadowNamePtr != 0 && ShouldBlockCUnitUiUnitShadowWrite(mode);
+
+  if constexpr (dxvk::war3::internal::
+                    kNativeShadowCUnitUiUnitShadowStatsLogging) {
+    if (!blocked && calls <= 16u) {
+      char name[96] = {};
+      if (shadowNamePtr == 0) {
+        snprintf(name, sizeof(name), "(null)");
+      } else if (!ReadCStringPreview(shadowNamePtr, name, sizeof(name))) {
+        snprintf(name, sizeof(name), "(unreadable)");
+      }
+      war3dbg::Print(
+          "DXVK War3Hook: CUnitUI unitShadow PASS calls=%llu mode=%u "
+          "this=%p shadow=0x%08X name=%s\n",
+          static_cast<unsigned long long>(calls), static_cast<unsigned>(mode),
+          thisPtr, static_cast<unsigned>(static_cast<uint32_t>(shadowNamePtr)),
+          name);
+    }
+  }
+
+  if (blocked) {
+    const uint64_t blockedCount =
+        g_cunitUiRecordSetUnitShadowBlockedCount.fetch_add(
+            1, std::memory_order_relaxed) +
+        1;
+
+    if constexpr (dxvk::war3::internal::
+                      kNativeShadowCUnitUiUnitShadowStatsLogging ||
+                  dxvk::war3::internal::
+                      kNativeShadowCUnitUiUnitShadowVerboseLogging) {
+      const bool sample =
+          blockedCount <= 16u ||
+          (dxvk::war3::internal::
+                   kNativeShadowCUnitUiUnitShadowStatsInterval != 0u &&
+           (calls % dxvk::war3::internal::
+                        kNativeShadowCUnitUiUnitShadowStatsInterval) == 0u);
+      if (sample || dxvk::war3::internal::
+                        kNativeShadowCUnitUiUnitShadowVerboseLogging) {
+        char name[96] = {};
+        if (!ReadCStringPreview(shadowNamePtr, name, sizeof(name)))
+          snprintf(name, sizeof(name), "(unreadable)");
+        war3dbg::Print(
+            "DXVK War3Hook: CUnitUI unitShadow BLOCK calls=%llu "
+            "blocked=%llu mode=%u this=%p shadow=0x%08X name=%s\n",
+            static_cast<unsigned long long>(calls),
+            static_cast<unsigned long long>(blockedCount),
+            static_cast<unsigned>(mode), thisPtr,
+            static_cast<unsigned>(static_cast<uint32_t>(shadowNamePtr)), name);
+      }
+    }
+
+    // Preserve Blizzard's cleanup path for record +0x4C, but suppress the
+    // replacement string so the legacy unit blob shadow is never produced.
+    return callNativeOriginal(0);
+  }
+
+  return callNativeOriginal(shadowNamePtr);
+}
+
 int __fastcall Hook_CUnitUIManager_RecordSetStructureShadow(void *thisPtr,
                                                             int shadowNamePtr) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::ShadowStructureUiRecord, 8u);
+  const auto callNativeOriginal = [&](int effectiveShadowNamePtr) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return CallCUnitUiRecordSetStructureShadowOriginal(
+        thisPtr, effectiveShadowNamePtr);
+  };
   const uint64_t calls =
       g_cunitUiRecordSetStructureShadowEnterCount.fetch_add(
           1, std::memory_order_relaxed) +
@@ -466,10 +574,10 @@ int __fastcall Hook_CUnitUIManager_RecordSetStructureShadow(void *thisPtr,
 
     // Preserve Blizzard's cleanup path: the original function frees the old
     // record +0x50 string first, then only writes a new copy when EDX != 0.
-    return CallCUnitUiRecordSetStructureShadowOriginal(thisPtr, 0);
+    return callNativeOriginal(0);
   }
 
-  return CallCUnitUiRecordSetStructureShadowOriginal(thisPtr, shadowNamePtr);
+  return callNativeOriginal(shadowNamePtr);
 }
 
 // 地形阴影层入口：
@@ -477,6 +585,8 @@ int __fastcall Hook_CUnitUIManager_RecordSetStructureShadow(void *thisPtr,
 // - mode>=2：完全禁用原生阴影层
 void __fastcall Hook_Terrain_RenderShadowLayer(void *thisPtr, void *edx, int a2,
                                                int a3, int a4) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::ShadowTerrainLayer, 4u);
   const uint32_t mode = War3RenderState::GetNativeShadowMode();
   static uint32_t s_shadowLayerLog = 0;
   if (s_shadowLayerLog < 10) {
@@ -499,8 +609,10 @@ void __fastcall Hook_Terrain_RenderShadowLayer(void *thisPtr, void *edx, int a2,
   }
 
   if (g_trampolineTerrainShadowLayer) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
     g_trampolineTerrainShadowLayer(thisPtr, edx, a2, a3, a4);
   } else if (g_originalTerrainShadowLayer) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
     g_originalTerrainShadowLayer(thisPtr, edx, a2, a3, a4);
   }
 }
@@ -611,15 +723,22 @@ int __fastcall Hook_Terrain_RenderListA(void *thisPtr, void *edx, void *entry) {
 // - stage14 直调链路会直接走 argType=4，不经过 Terrain_RenderShadowLayer(a3)。
 void __fastcall Hook_Terrain_RenderListB(void *thisPtr, void *edx, int argType,
                                          int passMode) {
+  War3HotHookCallTiming hookTiming(War3HotHookId::ShadowTerrainListB, 4u);
   // 2026-07-08 复核：建筑静态阴影已前移到 UnitUI buildingShadow producer
-  // gate；ListB 现在作为旧版单位动态黑色 blob 圆影默认移除。
+  // gate；unitShadow producer gate 清旧版单位动态黑色 blob 圆影。ListB type=4
+  // 还承载 S19 建筑地面贴花/UberSplat，默认不能全杀。
   const uint32_t mode = War3RenderState::GetNativeShadowMode();
   bool blocked = false;
   const char *reason = "PassThrough";
+  const bool preserveType4ByDefault =
+      argType == 4 &&
+      dxvk::war3::internal::kNativeShadowListBPreserveType4ByDefault;
 
-  if constexpr (dxvk::war3::internal::kNativeShadowListBBlockAllByDefault) {
+  if (preserveType4ByDefault) {
+    reason = "PreserveType4UberSplat";
+  } else if constexpr (dxvk::war3::internal::kNativeShadowListBBlockAllByDefault) {
     blocked = true;
-    reason = "Default_BlockAllListB";
+    reason = "Default_BlockListB";
   } else if (mode >= 2u &&
              dxvk::war3::internal::kNativeShadowListBBlockAllWhenMode2) {
     blocked = true;
@@ -696,10 +815,12 @@ void __fastcall Hook_Terrain_RenderListB(void *thisPtr, void *edx, int argType,
   }
 
   if (g_trampolineTerrainRenderListB) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
     g_trampolineTerrainRenderListB(thisPtr, edx, argType, passMode);
     return;
   }
   if (g_originalTerrainRenderListB) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
     g_originalTerrainRenderListB(thisPtr, edx, argType, passMode);
   }
 }
@@ -864,6 +985,13 @@ void __fastcall Hook_ShadowPath_StaticStamp_Toggle(void* thisPtr,
 int __fastcall Hook_ShadowProjector_Add_FromObject(void *a1, void *a2,
                                                    void *arg0, int arg1,
                                                    int arg2) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::ShadowProjectorFromObject, 4u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return CallShadowProjectorAddFromObjectOriginal(
+        a1, a2, arg0, arg1, arg2);
+  };
   // 入口职责：
   // 1) 识别调用来源（Runtime/JassBridge）；
   // 2) 采样 key；
@@ -898,7 +1026,7 @@ int __fastcall Hook_ShadowProjector_Add_FromObject(void *a1, void *a2,
       dxvk::war3::internal::kNativeShadowBlockAllProjectorEnabled ||
       needsSourcePath || needsKeyInspection || needsFourCCInspection;
   if (!needsProjectorInspection)
-    return CallShadowProjectorAddFromObjectOriginal(a1, a2, arg0, arg1, arg2);
+    return callNativeOriginal();
 
   const bool hasKey =
       needsKeyInspection &&
@@ -1069,12 +1197,18 @@ int __fastcall Hook_ShadowProjector_Add_FromObject(void *a1, void *a2,
     return -1;
   }
 
-  return CallShadowProjectorAddFromObjectOriginal(a1, a2, arg0, arg1, arg2);
+  return callNativeOriginal();
 }
 
 int __fastcall Hook_ShadowProjector_Add_Simple(void *a1, void *a2, int arg0,
                                                int arg1, int arg2, int arg3,
                                                int arg4, int arg5, int arg6) {
+  War3HotHookCallTiming hookTiming(War3HotHookId::ShadowProjectorSimple, 4u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return CallShadowProjectorAddSimpleOriginal(
+        a1, a2, arg0, arg1, arg2, arg3, arg4, arg5, arg6);
+  };
   // Add_Simple 覆盖 FromObject 之外的投影链路，作为静态阴影补充拦截点。
 
   // Phase 7.108：永久计数。
@@ -1089,8 +1223,7 @@ int __fastcall Hook_ShadowProjector_Add_Simple(void *a1, void *a2, int arg0,
       dxvk::war3::internal::kNativeShadowBlockProjectorSimpleEnabled ||
       needsSourcePath;
   if (!needsProjectorInspection) {
-    return CallShadowProjectorAddSimpleOriginal(a1, a2, arg0, arg1, arg2, arg3,
-                                                arg4, arg5, arg6);
+    return callNativeOriginal();
   }
 
   const uintptr_t retAddr = needsSourcePath ? GetCallReturnAddress() : 0u;
@@ -1160,8 +1293,7 @@ int __fastcall Hook_ShadowProjector_Add_Simple(void *a1, void *a2, int arg0,
     return -1;
   }
 
-  return CallShadowProjectorAddSimpleOriginal(a1, a2, arg0, arg1, arg2, arg3,
-                                              arg4, arg5, arg6);
+  return callNativeOriginal();
 }
 
 int __fastcall Hook_TerrainShadow_RegisterImageEntry(void *thisPtr, void *edx,
@@ -1333,8 +1465,9 @@ int __fastcall Hook_TerrainShadow_RegisterImageEntry(void *thisPtr, void *edx,
 // 阴影一直可见。
 //
 // 这是干净 __thiscall(this, doodadSlot, enable)，可安全 hook。
-// 策略：mode>=1 且 enable!=0 时直接跳过 enable 写入（return 0），让贴花阴影
-// 不被注册。enable==0（移除）必须放行，确保已注册的 stamp 能被清除。
+// 策略：仅当 canonical runtime A/B gate 开启且 enable!=0 时跳过 enable
+// 写入（return 0），让贴花阴影不被注册。enable==0（移除）始终放行，
+// 确保已注册的 stamp 能被清除。
 //
 // 注意：姊妹函数 ToggleEmitterStamp (0x74DE40) 是 __userpurge（edi=this 作为
 // 隐式参数），不能用标准 __fastcall trampoline 安全 hook（passthrough 会丢
@@ -1342,27 +1475,63 @@ int __fastcall Hook_TerrainShadow_RegisterImageEntry(void *thisPtr, void *edx,
 // 树木/建筑阴影本体，因此本轮不拦它，只拦 StaticStamp（type=0）这条阴影主路径。
 using TerrainShadowToggleStaticStampFn = int(__fastcall *)(void *, void *, int,
                                                            int);
+TerrainShadowToggleStaticStampFn g_originalDoodadStaticStamp = nullptr;
 TerrainShadowToggleStaticStampFn g_trampolineDoodadStaticStamp = nullptr;
 
 std::atomic<uint64_t> g_doodadStaticStampEnterCount{0};
 std::atomic<uint64_t> g_doodadStaticStampBlockedCount{0};
+std::atomic<uint64_t> g_doodadStaticStampPassthroughCleanupCount{0};
+std::atomic<uint64_t> g_doodadStaticStampGateActiveCount{0};
 std::atomic<uint64_t> g_doodadEmitterStampEnterCount{0};
 std::atomic<uint64_t> g_doodadEmitterStampBlockedCount{0};
+
+bool NativeDoodadStaticStampRuntimeGateActive() {
+  static const bool gateActive = [] {
+    const char *value =
+        std::getenv("DXVK_WAR3_BLOCK_NATIVE_DOODAD_STATIC_SHADOW");
+    // Historical diagnostic spelling remains a fallback only. The canonical
+    // policy/UI/report state is DXVK_WAR3_BLOCK_NATIVE_DOODAD_STATIC_SHADOW.
+    if (value == nullptr)
+      value = std::getenv("DXVK_WAR3_NATIVE_DOODAD_STATIC_STAMP");
+    if (value != nullptr)
+      return value[0] == '1' && value[1] == '\0';
+    return dxvk::war3::internal::
+        kNativeDoodadStaticStampRuntimeGateDefault;
+  }();
+  return gateActive;
+}
+
+int CallDoodadStaticStampOriginal(void *thisPtr, void *edx, int doodadSlot,
+                                  int enable) {
+  if (g_trampolineDoodadStaticStamp)
+    return g_trampolineDoodadStaticStamp(thisPtr, edx, doodadSlot, enable);
+  if (g_originalDoodadStaticStamp)
+    return g_originalDoodadStaticStamp(thisPtr, edx, doodadSlot, enable);
+  return 0;
+}
 
 int __fastcall Hook_Doodad_ToggleStaticStampFromObject(void *thisPtr, void *edx,
                                                        int doodadSlot,
                                                        int enable) {
   g_doodadStaticStampEnterCount.fetch_add(1, std::memory_order_relaxed);
-  const uint32_t mode = War3RenderState::GetNativeShadowMode();
-  bool blocked = false;
-  // 只屏蔽"启用"写入；"移除"必须放行以清除既有 stamp。
-  if (enable != 0) {
-    if ((mode == 1u &&
-         dxvk::war3::internal::kNativeShadowBlockDoodadStaticStampWhenMode1) ||
-        mode >= 2u) {
-      blocked = true;
-    }
+  const bool gateActive = NativeDoodadStaticStampRuntimeGateActive();
+  if (gateActive)
+    g_doodadStaticStampGateActiveCount.fetch_add(
+        1, std::memory_order_relaxed);
+
+  // Cleanup/remove is an invariant, not an A/B option: even with the runtime
+  // gate active it must reach the original function so an existing type=0
+  // stamp can be retired.
+  if (enable == 0) {
+    g_doodadStaticStampPassthroughCleanupCount.fetch_add(
+        1, std::memory_order_relaxed);
+    return CallDoodadStaticStampOriginal(thisPtr, edx, doodadSlot, enable);
   }
+
+  // The runtime gate is the sole blocking authority. NativeShadowMode is
+  // deliberately not consulted, so the default-installed hook is a clean
+  // pass-through unless the exact A/B flag is active.
+  const bool blocked = gateActive && enable != 0;
 
   if constexpr (dxvk::war3::internal::kNativeShadowDoodadStampStatsLogging) {
     static std::atomic<uint32_t> s_calls{0};
@@ -1373,12 +1542,12 @@ int __fastcall Hook_Doodad_ToggleStaticStampFromObject(void *thisPtr, void *edx,
       char buf[160];
       snprintf(buf, sizeof(buf),
                "DXVK War3Hook[Shadow]: DoodadStaticStamp calls=%u blocked=%llu "
-               "mode=%u enable=%d",
+               "gate=%u enable=%d",
                static_cast<unsigned>(calls),
                static_cast<unsigned long long>(
                    g_doodadStaticStampBlockedCount.load(
                        std::memory_order_relaxed)),
-               static_cast<unsigned>(mode), enable);
+               gateActive ? 1u : 0u, enable);
       ::dxvk::Logger::info(buf);
     }
   }
@@ -1389,9 +1558,7 @@ int __fastcall Hook_Doodad_ToggleStaticStampFromObject(void *thisPtr, void *edx,
     return 0;
   }
 
-  if (g_trampolineDoodadStaticStamp)
-    return g_trampolineDoodadStaticStamp(thisPtr, edx, doodadSlot, enable);
-  return 0;
+  return CallDoodadStaticStampOriginal(thisPtr, edx, doodadSlot, enable);
 }
 
 // =====================================================================
@@ -1970,6 +2137,13 @@ uint64_t QueryDoodadStaticStampEnterCount() {
 uint64_t QueryDoodadStaticStampBlockedCount() {
   return g_doodadStaticStampBlockedCount.load(std::memory_order_relaxed);
 }
+uint64_t QueryDoodadStaticStampPassthroughCleanupCount() {
+  return g_doodadStaticStampPassthroughCleanupCount.load(
+      std::memory_order_relaxed);
+}
+uint64_t QueryDoodadStaticStampGateActiveCount() {
+  return g_doodadStaticStampGateActiveCount.load(std::memory_order_relaxed);
+}
 uint64_t QueryDoodadEmitterStampEnterCount() {
   return g_doodadEmitterStampEnterCount.load(std::memory_order_relaxed);
 }
@@ -1994,6 +2168,9 @@ uint64_t QueryListARenderAllEntriesBlockedCount() {
 
 bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   // 先保存原函数指针与来源地址，再执行分项安装，保证失败时仍可回退。
+  g_originalDoodadStaticStamp =
+      reinterpret_cast<TerrainShadowToggleStaticStampFn>(
+          addrs.terrainShadowToggleStaticStampFromObjectAddr);
   g_originalTerrainShadowLayer =
       reinterpret_cast<TerrainRenderShadowLayerFn>(addrs.terrainShadowLayerAddr);
   g_originalTerrainRenderListA =
@@ -2014,6 +2191,9 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
   g_originalShadowPathStaticStampToggle =
       reinterpret_cast<ShadowPathStaticStampToggleFn>(
           addrs.shadowPathStaticStampToggleAddr);
+  g_originalCUnitUiRecordSetUnitShadow =
+      reinterpret_cast<CUnitUiRecordSetUnitShadowFn>(
+          addrs.cunitUiRecordSetUnitShadowAddr);
   g_originalCUnitUiRecordSetStructureShadow =
       reinterpret_cast<CUnitUiRecordSetStructureShadowFn>(
           addrs.cunitUiRecordSetStructureShadowAddr);
@@ -2092,6 +2272,33 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
 
   if constexpr (dxvk::war3::internal::kWar3ShadowTypeRecordHookEnabled &&
                 dxvk::war3::internal::
+                    kNativeShadowCUnitUiUnitShadowHookEnabled) {
+    if (addrs.cunitUiRecordSetUnitShadowAddr != nullptr) {
+      const bool ok = InstallMinHook(
+          addrs.cunitUiRecordSetUnitShadowAddr,
+          reinterpret_cast<LPVOID>(&Hook_CUnitUIManager_RecordSetUnitShadow),
+          reinterpret_cast<LPVOID *>(&g_trampolineCUnitUiRecordSetUnitShadow),
+          "Shadow", "CUnitUIManager_RecordSetUnitShadow", false, true);
+      anyInstalled |= ok;
+      char buf[160];
+      snprintf(buf, sizeof(buf),
+               "DXVK War3Hook[Shadow]: CUnitUI RecordSetUnitShadow "
+               "install addr=%p result=%s defaultBlock=%d",
+               addrs.cunitUiRecordSetUnitShadowAddr, ok ? "ok" : "fail",
+               dxvk::war3::internal::
+                   kNativeShadowBlockCUnitUiUnitShadowByDefault
+                   ? 1
+                   : 0);
+      ::dxvk::Logger::info(buf);
+    } else {
+      ::dxvk::Logger::info(
+          "DXVK War3Hook[Shadow]: CUnitUI RecordSetUnitShadow install "
+          "SKIPPED - nullptr");
+    }
+  }
+
+  if constexpr (dxvk::war3::internal::kWar3ShadowTypeRecordHookEnabled &&
+                dxvk::war3::internal::
                     kNativeShadowCUnitUiBuildingShadowHookEnabled) {
     if (addrs.cunitUiRecordSetStructureShadowAddr != nullptr) {
       const bool ok = InstallMinHook(
@@ -2156,10 +2363,11 @@ bool InstallShadowHooks(const ShadowHookAddresses &addrs) {
     }
   }
 
-  // 2026-05-30：CDoodads 贴花阴影拦截（魔兽自带可见静态阴影 + path blocker）。
+  // CDoodads type=0 静态贴花入口始终安装为安全 pass-through，允许同一 DLL
+  // 使用 DXVK_WAR3_BLOCK_NATIVE_DOODAD_STATIC_SHADOW=0/1 做运行时 A/B。
   // ToggleStaticStampFromObject 是树木/装饰物/可破坏物/path blocker 地面贴花
-  // 阴影的对象级注册入口（RegisterImage type=0）。在 mode>=1 时跳过 enable!=0
-  // 写入即可干净屏蔽魔兽自带可见静态阴影，不影响 fog/LOS/path。
+  // 阴影的对象级注册入口（RegisterImage type=0）。只有 gate=1 且 enable!=0
+  // 才跳过写入；enable==0 始终透传，保证旧 stamp 能正常清理。
   // EmitterStamp(0x74DE40) 是 __userpurge，不安全 hook，本轮不拦（它是发光体/
   // 特效，不是静态阴影本体）。
   if constexpr (dxvk::war3::internal::kNativeShadowDoodadStampHookEnabled) {

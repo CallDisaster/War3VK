@@ -820,6 +820,10 @@ void War3RenderState::SetOutlineForceEnabled(bool enabled) {
   g_outlineForceChecked.store(true, std::memory_order_relaxed);
 }
 
+bool War3RenderState::IsOutlineForceEnabledForTest() {
+  return IsOutlineForceEnabled();
+}
+
 void War3RenderState::SetNativeShadowMode(uint32_t mode) {
   if (mode > 2u)
     mode = 2u;

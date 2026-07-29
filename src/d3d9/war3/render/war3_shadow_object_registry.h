@@ -58,6 +58,47 @@ struct ShadowObjectRecord {
   uint32_t spriteFrameSampleCount = 0;
   uint64_t firstSeenFrame = 0;
   uint64_t lastSeenFrame = 0;
+  // Set only by SceneCollector's batch feed.  Other same-frame pose/model
+  // updates may refresh lastSeenFrame but cannot authorize deduplication.
+  uint64_t lastSceneCollectorBatchFrame = 0;
+};
+
+// Fixed-size projection used by the per-draw semantic augment path.  The full
+// registry record owns modelPath and several fields that this consumer never
+// reads; copying that record on every lookup can allocate/copy a path string.
+struct ShadowObjectAugmentView {
+  void *worldObjectEntry = nullptr;
+  void *sceneNode = nullptr;
+  void *runtimeModelPtr = nullptr;
+  void *modelResourcePtr = nullptr;
+  uint32_t jHandle = 0;
+  uint32_t rawcode = 0;
+  ObjectKind kind = ObjectKind::Unknown;
+  uint64_t modelKey = 0;
+  float scale = 1.0f;
+  float height = 0.0f;
+  bool hasWorldTransform = false;
+  Matrix4 worldTransform;
+  bool hasSpriteFrameTransform = false;
+  Matrix4 spriteFrameTransform;
+  uint32_t matrixCount = 0;
+  uint64_t matrixHash = 0;
+  uint64_t lastRootPoseFrame = 0;
+  uint64_t lastSpriteFramePoseFrame = 0;
+  uint64_t lastMatrixPaletteFrame = 0;
+};
+
+struct ShadowIdentitySameFrameDedupStats {
+  // attempts == hits + every miss* counter. batchMarked is independent.
+  uint64_t attempts = 0;
+  uint64_t hits = 0;
+  uint64_t missMissingAlias = 0;
+  uint64_t missCrossFrame = 0;
+  uint64_t missNoBatchProof = 0;
+  uint64_t missIncomplete = 0;
+  uint64_t missInputMismatch = 0;
+  uint64_t missAliasConflict = 0;
+  uint64_t batchMarked = 0;
 };
 
 class ShadowObjectRegistry {
@@ -99,21 +140,38 @@ public:
   bool findByHandle(uint32_t jHandle, ShadowObjectRecord &out) const;
   bool findBySpritePtr(void *spritePtr, ShadowObjectRecord &out) const;
   bool findByRuntimeModel(void *runtimeModelPtr, ShadowObjectRecord &out) const;
+  // Per-draw semantic augment lookup. Preserves the legacy key priority while
+  // holding one shared lock instead of reacquiring it for every miss.
+  bool findFirstForAugment(void* worldObjectEntry, void* sceneNode,
+                           void* primaryUnitPtr, void* secondaryUnitPtr,
+                           uint32_t jHandle, void* runtimeModelPtr,
+                           ShadowObjectRecord& out) const;
+  bool findFirstForAugmentView(void* worldObjectEntry, void* sceneNode,
+                               void* primaryUnitPtr, void* secondaryUnitPtr,
+                               uint32_t jHandle, void* runtimeModelPtr,
+                               ShadowObjectAugmentView& out,
+                               uint64_t* mutationGenerationOut = nullptr,
+                               uint64_t* frameNumberOut = nullptr) const;
   std::vector<ShadowObjectRecord> snapshot() const;
   size_t runtimeBoundCount() const;
   size_t completeIdentityCount() const;
   size_t poseReadyCount() const;
+  ShadowIdentitySameFrameDedupStats sameFrameIdentityDedupStats() const;
 
   uint64_t frameNumber() const;
+  uint64_t mutationGeneration() const;
 
 private:
   ShadowObjectRegistry() = default;
 
   void storeRecord(const ShadowObjectRecord &record);
+  bool trySkipExactSameFrameRenderObjectLocked(const RenderObjectInfo &info,
+                                                uint64_t currentFrame);
   void noteInstanceIdentityLocked(void *worldObjectEntry, void *sceneNode,
                                   void *unitPtr, void *spritePtr,
                                   uint32_t jHandle, uint32_t rawcode,
-                                  ObjectKind kind);
+                                  ObjectKind kind,
+                                  bool sceneCollectorBatch);
 
   // Phase 7.83：reader 路径（findBy*/snapshot/recordCount/frameNumber）远多于 writer。
   mutable std::shared_mutex m_mutex;
@@ -123,7 +181,14 @@ private:
   std::unordered_map<void *, ShadowObjectRecord> m_bySpritePtr;
   std::unordered_map<void *, ShadowObjectRecord> m_byRuntimeModel;
   std::unordered_map<uint32_t, ShadowObjectRecord> m_byHandle;
+  ShadowIdentitySameFrameDedupStats m_sameFrameIdentityDedupStats = {};
+  // Protected by m_mutex.  The exact alias proof runs only after this frame
+  // received a valid SceneCollector batch entry.
+  uint64_t m_lastSceneCollectorBatchFrame = 0;
   std::atomic<uint64_t> m_frameNumber{0};
+  // Even values are stable; odd values mean a writer holds m_mutex. TLS
+  // caches retain value projections only and validate hits with two loads.
+  std::atomic<uint64_t> m_mutationGeneration{0};
 };
 
 } // namespace render

@@ -6,7 +6,9 @@
 #include "../game/war3_unit.h"
 #include "../core/war3_memory.h"
 #include "../render/war3_render_objects.h"
+#include "../../util/util_env.h"
 
+#include <cassert>
 #include <unordered_set>
 
 namespace dxvk {
@@ -96,12 +98,112 @@ bool HasRuntimeSourceObject(const ModelInstanceRecord& record) {
          record.sourceSpriteObjectPtr != nullptr;
 }
 
+struct ModelInstanceTrackingClassification {
+  bool runtimeBound = false;
+  bool completeIdentity = false;
+};
+
+ModelInstanceTrackingClassification ClassifyModelInstanceTracking(
+    const ModelInstanceRecord& record) noexcept {
+  ModelInstanceTrackingClassification classification = {};
+  classification.runtimeBound =
+      record.runtimeModelPtr != nullptr && record.spritePtr != nullptr;
+  classification.completeIdentity =
+      classification.runtimeBound &&
+      (record.sceneNode != nullptr || record.unitPtr != nullptr ||
+       record.jHandle != 0u || record.rawcode != 0u);
+  return classification;
+}
+
+struct PoseTrackingClassification {
+  bool readyPose = false;
+  bool spriteFramePose = false;
+  bool matrixPalette = false;
+};
+
+PoseTrackingClassification ClassifyPoseTracking(
+    const PoseRecord& record) noexcept {
+  PoseTrackingClassification classification = {};
+  classification.spriteFramePose =
+      record.lastSpriteFramePoseFrame != 0u;
+  classification.matrixPalette =
+      record.lastMatrixPaletteFrame != 0u && record.matrixCount != 0u &&
+      !record.matrixPalette.empty();
+  classification.readyPose =
+      classification.spriteFramePose || record.lastRootPoseFrame != 0u ||
+      classification.matrixPalette;
+  return classification;
+}
+
+void ReplaceTrackingClassificationCount(uint64_t& count, bool oldValue,
+                                        bool newValue) noexcept {
+  if (oldValue == newValue)
+    return;
+  if (oldValue) {
+    assert(count != 0u);
+    if (count != 0u)
+      --count;
+    return;
+  }
+  ++count;
+}
+
+bool RegistryTrackingHealthVerifierEnabled() {
+  static const bool enabled =
+      env::getEnvVar("DXVK_WAR3_REGISTRY_HEALTH_VERIFY") == "1" ||
+      env::getEnvVar("DXVK_WAR3_REGISTRY_HEALTH_VERIFY_ASSERT") == "1";
+  return enabled;
+}
+
+bool RegistryTrackingHealthVerifierAssertEnabled() {
+  static const bool enabled =
+      env::getEnvVar("DXVK_WAR3_REGISTRY_HEALTH_VERIFY_ASSERT") == "1";
+  return enabled;
+}
+
+void MaybeAssertRegistryTrackingHealth(uint32_t mismatchMask) {
+  if (mismatchMask == 0u ||
+      !RegistryTrackingHealthVerifierAssertEnabled()) {
+    return;
+  }
+  assert(mismatchMask == 0u &&
+         "War3 registry tracking-health aggregate mismatch");
+}
+
 bool HasSameRuntimeOwnerIdentity(const ModelInstanceRecord& a,
                                  const ModelInstanceRecord& b) {
   return a.worldObjectEntry == b.worldObjectEntry &&
          a.sceneNode == b.sceneNode && a.unitPtr == b.unitPtr &&
          a.spritePtr == b.spritePtr && a.jHandle == b.jHandle &&
          a.rawcode == b.rawcode;
+}
+
+bool HasSameModelInstancePayloadExact(const ModelInstanceRecord& a,
+                                      const ModelInstanceRecord& b) {
+  return a.worldObjectEntry == b.worldObjectEntry &&
+         a.sceneNode == b.sceneNode && a.unitPtr == b.unitPtr &&
+         a.spritePtr == b.spritePtr &&
+         a.runtimeModelPtr == b.runtimeModelPtr &&
+         a.sourceObjectPtr == b.sourceObjectPtr &&
+         a.sourceSpriteObjectPtr == b.sourceSpriteObjectPtr &&
+         a.runtimeCreatorModelDataPtr == b.runtimeCreatorModelDataPtr &&
+         a.runtimeCreatorHandlePtr == b.runtimeCreatorHandlePtr &&
+         a.modelResourcePtr == b.modelResourcePtr &&
+         a.jHandle == b.jHandle && a.rawcode == b.rawcode &&
+         a.runtimeCreatorCallerRva == b.runtimeCreatorCallerRva &&
+         a.runtimeResolveCallerRva == b.runtimeResolveCallerRva &&
+         a.modelKey == b.modelKey &&
+         a.firstSeenFrame == b.firstSeenFrame;
+}
+
+bool HasExactRuntimeOwnerProof(const ModelInstanceRecord& owner,
+                               const ModelInstanceRecord& source) {
+  return owner.runtimeModelPtr == source.runtimeModelPtr &&
+         HasSameRuntimeOwnerIdentity(owner, source) &&
+         owner.modelKey == source.modelKey &&
+         owner.modelResourcePtr == source.modelResourcePtr &&
+         owner.lastSceneCollectorBatchFrame ==
+             source.lastSceneCollectorBatchFrame;
 }
 
 void CollectRuntimeModelTreeForOwner(void* rootRuntimeModelPtr,
@@ -226,6 +328,10 @@ void MergeModelInstanceRecord(ModelInstanceRecord &dst,
   }
   if (src.lastSeenFrame > dst.lastSeenFrame)
     dst.lastSeenFrame = src.lastSeenFrame;
+  if (src.lastSceneCollectorBatchFrame >
+      dst.lastSceneCollectorBatchFrame) {
+    dst.lastSceneCollectorBatchFrame = src.lastSceneCollectorBatchFrame;
+  }
 }
 
 void MergePoseRecord(PoseRecord &dst, const PoseRecord &src) {
@@ -329,6 +435,30 @@ void MergeAttachmentRigidRecord(AttachmentRigidRecord& dst,
   if (src.lastSeenFrame > dst.lastSeenFrame)
     dst.lastSeenFrame = src.lastSeenFrame;
 }
+
+class RegistryMutationGenerationGuard {
+public:
+  explicit RegistryMutationGenerationGuard(
+      std::atomic<uint64_t>& generation) noexcept
+  : m_generation(generation) {
+    // Odd means a writer is active. All registry writers already serialize on
+    // their unique_lock, so this is a single-writer seqlock.
+    m_generation.fetch_add(1u, std::memory_order_acq_rel);
+  }
+
+  ~RegistryMutationGenerationGuard() {
+    // Publish every map write before making the next even generation visible.
+    m_generation.fetch_add(1u, std::memory_order_release);
+  }
+
+  RegistryMutationGenerationGuard(
+      const RegistryMutationGenerationGuard&) = delete;
+  RegistryMutationGenerationGuard& operator=(
+      const RegistryMutationGenerationGuard&) = delete;
+
+private:
+  std::atomic<uint64_t>& m_generation;
+};
 } // namespace
 
 ModelRegistry &ModelRegistry::instance() {
@@ -444,7 +574,7 @@ bool ModelRegistry::findBySprite(void *spritePtr, ModelResourceRecord &out) cons
   if (!spritePtr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySprite.find(spritePtr);
   if (it == m_bySprite.end())
     return false;
@@ -457,7 +587,7 @@ bool ModelRegistry::findByRuntimeModel(void *runtimeModelPtr,
   if (!runtimeModelPtr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byRuntimeModel.find(runtimeModelPtr);
   if (it == m_byRuntimeModel.end())
     return false;
@@ -470,7 +600,7 @@ bool ModelRegistry::findByPath(const std::string &modelPath,
   if (modelPath.empty())
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byPath.find(modelPath);
   if (it == m_byPath.end())
     return false;
@@ -504,6 +634,7 @@ ModelInstanceRegistry &ModelInstanceRegistry::instance() {
 
 void ModelInstanceRegistry::beginFrame() {
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
@@ -512,6 +643,7 @@ void ModelInstanceRegistry::endFrame() {
   if constexpr (dxvk::war3::internal::
                     kWar3RuntimeConfigDisableSemanticRegistryEndFrameSweeps)
     return;
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   for (auto &it : m_byWorldObjectEntry)
     it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_bySceneNode)
@@ -530,6 +662,37 @@ void ModelInstanceRegistry::endFrame() {
     it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_byHandle)
     it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+}
+
+void ModelInstanceRegistry::storeRuntimeModelRecordLocked(
+    const ModelInstanceRecord& record) {
+  assert(record.runtimeModelPtr != nullptr);
+  if (record.runtimeModelPtr == nullptr)
+    return;
+
+  auto it = m_byRuntimeModel.find(record.runtimeModelPtr);
+  if (it == m_byRuntimeModel.end()) {
+    const auto inserted =
+        m_byRuntimeModel.emplace(record.runtimeModelPtr, record);
+    const auto current =
+        ClassifyModelInstanceTracking(inserted.first->second);
+    ReplaceTrackingClassificationCount(
+        m_trackingRuntimeBoundCount, false, current.runtimeBound);
+    ReplaceTrackingClassificationCount(
+        m_trackingCompleteIdentityCount, false,
+        current.completeIdentity);
+    return;
+  }
+
+  const auto previous = ClassifyModelInstanceTracking(it->second);
+  it->second = record;
+  const auto current = ClassifyModelInstanceTracking(it->second);
+  ReplaceTrackingClassificationCount(
+      m_trackingRuntimeBoundCount, previous.runtimeBound,
+      current.runtimeBound);
+  ReplaceTrackingClassificationCount(
+      m_trackingCompleteIdentityCount, previous.completeIdentity,
+      current.completeIdentity);
 }
 
 void ModelInstanceRegistry::storeRecord(const ModelInstanceRecord &record) {
@@ -576,6 +739,17 @@ void ModelInstanceRegistry::storeRecord(const ModelInstanceRecord &record) {
   }
   MergeModelInstanceRecord(merged, record);
 
+  if (!merged.worldObjectEntry && !merged.sceneNode && !merged.unitPtr &&
+      !merged.spritePtr && !merged.runtimeModelPtr &&
+      !merged.sourceObjectPtr && !merged.sourceSpriteObjectPtr &&
+      merged.jHandle == 0u) {
+    return;
+  }
+
+  // Publish invalidation before touching any lookup-visible map.  A cache hit
+  // that observed the previous generation is linearized before this mutation;
+  // every later lookup will take the locked miss path.
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   if (merged.worldObjectEntry)
     m_byWorldObjectEntry[merged.worldObjectEntry] = merged;
   if (merged.sceneNode)
@@ -585,7 +759,7 @@ void ModelInstanceRegistry::storeRecord(const ModelInstanceRecord &record) {
   if (merged.spritePtr)
     m_bySpritePtr[merged.spritePtr] = merged;
   if (merged.runtimeModelPtr)
-    m_byRuntimeModel[merged.runtimeModelPtr] = merged;
+    storeRuntimeModelRecordLocked(merged);
   if (merged.sourceObjectPtr)
     m_bySourceObject[merged.sourceObjectPtr] = merged;
   if (merged.sourceSpriteObjectPtr)
@@ -601,10 +775,12 @@ void ModelInstanceRegistry::propagateRuntimeOwnerIdentityLocked(
     return;
   }
 
+  const uint64_t currentFrame =
+      m_frameNumber.load(std::memory_order_relaxed);
   const auto itExisting = m_runtimeOwnerByRuntimeModel.find(rootRuntimeModelPtr);
   if (itExisting != m_runtimeOwnerByRuntimeModel.end() &&
-      itExisting->second.lastSeenFrame == m_frameNumber.load(std::memory_order_relaxed) &&
-      HasSameRuntimeOwnerIdentity(itExisting->second, ownerRecord)) {
+      itExisting->second.lastSeenFrame == currentFrame &&
+      HasExactRuntimeOwnerProof(itExisting->second, ownerRecord)) {
     return;
   }
 
@@ -613,6 +789,7 @@ void ModelInstanceRegistry::propagateRuntimeOwnerIdentityLocked(
   if (runtimeModels.empty())
     runtimeModels.push_back(rootRuntimeModelPtr);
 
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   for (void* runtimeModelPtr : runtimeModels) {
     if (!LooksLikeRuntimeModelPtr(runtimeModelPtr))
       continue;
@@ -627,8 +804,8 @@ void ModelInstanceRegistry::propagateRuntimeOwnerIdentityLocked(
     MergeModelInstanceRecord(merged, ownerRecord);
     merged.runtimeModelPtr = runtimeModelPtr;
     if (merged.firstSeenFrame == 0)
-      merged.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
-    merged.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+      merged.firstSeenFrame = currentFrame;
+    merged.lastSeenFrame = currentFrame;
     m_runtimeOwnerByRuntimeModel[runtimeModelPtr] = merged;
   }
 }
@@ -645,6 +822,7 @@ void ModelInstanceRegistry::propagateRuntimeSourceObjectLocked(
   if (runtimeModels.empty())
     runtimeModels.push_back(rootRuntimeModelPtr);
 
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   for (void* runtimeModelPtr : runtimeModels) {
     if (!LooksLikeRuntimeModelPtr(runtimeModelPtr))
       continue;
@@ -662,8 +840,129 @@ void ModelInstanceRegistry::propagateRuntimeSourceObjectLocked(
     if (merged.firstSeenFrame == 0)
       merged.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
     merged.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
-    m_byRuntimeModel[runtimeModelPtr] = merged;
+    storeRuntimeModelRecordLocked(merged);
   }
+}
+
+bool ModelInstanceRegistry::trySkipExactSameFrameRenderObjectLocked(
+    const render::RenderObjectInfo& info, uint64_t currentFrame) {
+  auto& stats = m_sameFrameIdentityDedupStats;
+  ++stats.attempts;
+  const auto fail = [](uint64_t& counter) {
+    ++counter;
+    return false;
+  };
+
+  // This helper is deliberately specific to the RenderQueue single-feed path.
+  // Both keys are supplied by mapSceneNode after SceneCollector ran for the
+  // group; incomplete/native-only paths retain the historical merge.
+  if (info.worldObjectEntry == nullptr || info.sceneNode == nullptr)
+    return fail(stats.missIncomplete);
+
+  const auto itScene = m_bySceneNode.find(info.sceneNode);
+  if (itScene == m_bySceneNode.end())
+    return fail(stats.missMissingAlias);
+
+  const ModelInstanceRecord& canonical = itScene->second;
+  if (canonical.lastSeenFrame != currentFrame)
+    return fail(stats.missCrossFrame);
+  if (canonical.lastSceneCollectorBatchFrame != currentFrame)
+    return fail(stats.missNoBatchProof);
+
+  // Only fields consumed by noteInstanceIdentityLocked participate.  Unknown
+  // (null/zero) input cannot erase an already complete canonical record.
+  if (canonical.worldObjectEntry != info.worldObjectEntry ||
+      canonical.sceneNode != info.sceneNode ||
+      // The historical path assigns unitPtr even when the single-feed input
+      // is null, which deliberately defeats the owner-tree same-frame
+      // shortcut and gives newly attached runtime children one more
+      // propagation pass.  Only an exact value may skip that behavior.
+      canonical.unitPtr != info.unitPtr ||
+      (info.jHandle != 0u && canonical.jHandle != info.jHandle) ||
+      (info.rawcode != 0u && canonical.rawcode != info.rawcode)) {
+    return fail(stats.missInputMismatch);
+  }
+
+  if (canonical.firstSeenFrame == 0u ||
+      canonical.worldObjectEntry == nullptr || canonical.sceneNode == nullptr ||
+      canonical.unitPtr == nullptr || canonical.spritePtr == nullptr ||
+      canonical.runtimeModelPtr == nullptr || canonical.modelKey == 0u ||
+      canonical.modelResourcePtr == nullptr) {
+    return fail(stats.missIncomplete);
+  }
+
+  enum : uint32_t {
+    kAliasClean = 0u,
+    kAliasMissing = 1u,
+    kAliasCrossFrame = 2u,
+    kAliasNoBatchProof = 3u,
+    kAliasConflict = 4u,
+  };
+  const auto validateAlias = [&](const auto& map,
+                                 const auto& key) -> uint32_t {
+    const auto it = map.find(key);
+    if (it == map.end())
+      return kAliasMissing;
+    const ModelInstanceRecord& alias = it->second;
+    if (alias.lastSeenFrame != currentFrame)
+      return kAliasCrossFrame;
+    if (alias.lastSceneCollectorBatchFrame != currentFrame)
+      return kAliasNoBatchProof;
+    if (!HasSameModelInstancePayloadExact(canonical, alias))
+      return kAliasConflict;
+    return kAliasClean;
+  };
+  const auto failAlias = [&](uint32_t result) {
+    if (result == kAliasMissing)
+      return fail(stats.missMissingAlias);
+    if (result == kAliasCrossFrame)
+      return fail(stats.missCrossFrame);
+    if (result == kAliasNoBatchProof)
+      return fail(stats.missNoBatchProof);
+    return fail(stats.missAliasConflict);
+  };
+
+  uint32_t aliasResult =
+      validateAlias(m_byWorldObjectEntry, canonical.worldObjectEntry);
+  if (aliasResult != kAliasClean)
+    return failAlias(aliasResult);
+  aliasResult = validateAlias(m_byUnitPtr, canonical.unitPtr);
+  if (aliasResult != kAliasClean)
+    return failAlias(aliasResult);
+  aliasResult = validateAlias(m_bySpritePtr, canonical.spritePtr);
+  if (aliasResult != kAliasClean)
+    return failAlias(aliasResult);
+  aliasResult = validateAlias(m_byRuntimeModel, canonical.runtimeModelPtr);
+  if (aliasResult != kAliasClean)
+    return failAlias(aliasResult);
+  if (canonical.sourceObjectPtr != nullptr) {
+    aliasResult = validateAlias(m_bySourceObject, canonical.sourceObjectPtr);
+    if (aliasResult != kAliasClean)
+      return failAlias(aliasResult);
+  }
+  if (canonical.sourceSpriteObjectPtr != nullptr) {
+    aliasResult =
+        validateAlias(m_bySourceSpriteObject, canonical.sourceSpriteObjectPtr);
+    if (aliasResult != kAliasClean)
+      return failAlias(aliasResult);
+  }
+  if (canonical.jHandle != 0u) {
+    aliasResult = validateAlias(m_byHandle, canonical.jHandle);
+    if (aliasResult != kAliasClean)
+      return failAlias(aliasResult);
+  }
+
+  const auto itOwner =
+      m_runtimeOwnerByRuntimeModel.find(canonical.runtimeModelPtr);
+  if (itOwner == m_runtimeOwnerByRuntimeModel.end() ||
+      itOwner->second.lastSeenFrame != currentFrame ||
+      itOwner->second.lastSceneCollectorBatchFrame != currentFrame ||
+      !HasExactRuntimeOwnerProof(itOwner->second, canonical)) {
+    return fail(stats.missRuntimeOwner);
+  }
+
+  ++stats.hits;
+  return true;
 }
 
 void ModelInstanceRegistry::noteRenderObject(const render::RenderObjectInfo &info) {
@@ -672,8 +971,14 @@ void ModelInstanceRegistry::noteRenderObject(const render::RenderObjectInfo &inf
     return;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  const uint64_t currentFrame =
+      m_frameNumber.load(std::memory_order_relaxed);
+  if (currentFrame != 0u && m_lastSceneCollectorBatchFrame == currentFrame &&
+      trySkipExactSameFrameRenderObjectLocked(info, currentFrame)) {
+    return;
+  }
   noteInstanceIdentityLocked(info.worldObjectEntry, info.sceneNode, info.unitPtr,
-                             nullptr, info.jHandle, info.rawcode);
+                             nullptr, info.jHandle, info.rawcode, false);
 }
 
 void ModelInstanceRegistry::noteRenderObjectsBatch(
@@ -691,7 +996,7 @@ void ModelInstanceRegistry::noteRenderObjectsBatch(
     }
     noteInstanceIdentityLocked(info->worldObjectEntry, info->sceneNode,
                                info->unitPtr, nullptr, info->jHandle,
-                               info->rawcode);
+                               info->rawcode, true);
   }
 }
 
@@ -703,7 +1008,7 @@ void ModelInstanceRegistry::noteInstanceIdentity(void *worldObjectEntry,
                                                  uint32_t rawcode) {
   std::unique_lock<std::shared_mutex> lock(m_mutex);
   noteInstanceIdentityLocked(worldObjectEntry, sceneNode, unitPtr, spritePtr,
-                             jHandle, rawcode);
+                             jHandle, rawcode, false);
 }
 
 void ModelInstanceRegistry::noteInstanceIdentityLocked(void *worldObjectEntry,
@@ -711,12 +1016,15 @@ void ModelInstanceRegistry::noteInstanceIdentityLocked(void *worldObjectEntry,
                                                        void *unitPtr,
                                                        void *spritePtr,
                                                        uint32_t jHandle,
-                                                       uint32_t rawcode) {
+                                                       uint32_t rawcode,
+                                                       bool sceneCollectorBatch) {
   if (!worldObjectEntry && !sceneNode && !unitPtr && !spritePtr &&
       jHandle == 0u && rawcode == 0u) {
     return;
   }
 
+  const uint64_t currentFrame =
+      m_frameNumber.load(std::memory_order_relaxed);
   ModelInstanceRecord record = {};
   if (sceneNode) {
     auto it = m_bySceneNode.find(sceneNode);
@@ -779,8 +1087,13 @@ void ModelInstanceRegistry::noteInstanceIdentityLocked(void *worldObjectEntry,
     }
   }
   if (record.firstSeenFrame == 0)
-    record.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
-  record.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+    record.firstSeenFrame = currentFrame;
+  record.lastSeenFrame = currentFrame;
+  if (sceneCollectorBatch) {
+    record.lastSceneCollectorBatchFrame = currentFrame;
+    m_lastSceneCollectorBatchFrame = currentFrame;
+    ++m_sameFrameIdentityDedupStats.batchMarked;
+  }
   storeRecord(record);
   if (record.runtimeModelPtr != nullptr && HasRuntimeOwnerIdentity(record))
     propagateRuntimeOwnerIdentityLocked(record.runtimeModelPtr, record);
@@ -791,7 +1104,10 @@ void ModelInstanceRegistry::bindSpriteToInstance(void *unitPtr, void *spritePtr)
     return;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
-  ModelInstanceRecord &record = m_byUnitPtr[unitPtr];
+  ModelInstanceRecord record = {};
+  const auto itUnit = m_byUnitPtr.find(unitPtr);
+  if (itUnit != m_byUnitPtr.end())
+    record = itUnit->second;
   record.unitPtr = unitPtr;
   record.spritePtr = spritePtr;
   record.runtimeModelPtr = TryReadRuntimeModelFromSprite(spritePtr);
@@ -1014,6 +1330,7 @@ void ModelInstanceRegistry::bindModelToInstance(void *sceneNode,
     return;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   ModelInstanceRecord &record = m_bySceneNode[sceneNode];
   record.sceneNode = sceneNode;
   record.modelKey = modelKey;
@@ -1023,7 +1340,7 @@ void ModelInstanceRegistry::bindModelToInstance(void *sceneNode,
   if (record.spritePtr)
     m_bySpritePtr[record.spritePtr] = record;
   if (record.runtimeModelPtr)
-    m_byRuntimeModel[record.runtimeModelPtr] = record;
+    storeRuntimeModelRecordLocked(record);
 }
 
 bool ModelInstanceRegistry::findByWorldObjectEntry(void *worldObjectEntry,
@@ -1031,7 +1348,7 @@ bool ModelInstanceRegistry::findByWorldObjectEntry(void *worldObjectEntry,
   if (!worldObjectEntry)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byWorldObjectEntry.find(worldObjectEntry);
   if (it == m_byWorldObjectEntry.end())
     return false;
@@ -1044,7 +1361,7 @@ bool ModelInstanceRegistry::findBySceneNode(void *sceneNode,
   if (!sceneNode)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySceneNode.find(sceneNode);
   if (it == m_bySceneNode.end())
     return false;
@@ -1057,7 +1374,7 @@ bool ModelInstanceRegistry::findByUnitPtr(void *unitPtr,
   if (!unitPtr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byUnitPtr.find(unitPtr);
   if (it == m_byUnitPtr.end())
     return false;
@@ -1070,7 +1387,7 @@ bool ModelInstanceRegistry::findBySpritePtr(void *spritePtr,
   if (!spritePtr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySpritePtr.find(spritePtr);
   if (it == m_bySpritePtr.end())
     return false;
@@ -1083,7 +1400,7 @@ bool ModelInstanceRegistry::findByRuntimeModel(void *runtimeModelPtr,
   if (!runtimeModelPtr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byRuntimeModel.find(runtimeModelPtr);
   if (it == m_byRuntimeModel.end())
     return false;
@@ -1097,7 +1414,7 @@ bool ModelInstanceRegistry::findBySourceObject(void* sourceObjectPtr,
   if (!sourceObjectPtr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySourceObject.find(sourceObjectPtr);
   if (it == m_bySourceObject.end())
     return false;
@@ -1111,7 +1428,7 @@ bool ModelInstanceRegistry::findBySourceSpriteObject(
   if (!sourceSpriteObjectPtr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySourceSpriteObject.find(sourceSpriteObjectPtr);
   if (it == m_bySourceSpriteObject.end())
     return false;
@@ -1125,7 +1442,7 @@ bool ModelInstanceRegistry::findOwnerByRuntimeModel(void *runtimeModelPtr,
   if (!runtimeModelPtr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_runtimeOwnerByRuntimeModel.find(runtimeModelPtr);
   if (it == m_runtimeOwnerByRuntimeModel.end())
     return false;
@@ -1134,15 +1451,94 @@ bool ModelInstanceRegistry::findOwnerByRuntimeModel(void *runtimeModelPtr,
 }
 
 bool ModelInstanceRegistry::findByHandle(uint32_t jHandle,
-                                         ModelInstanceRecord &out) const {
+                                          ModelInstanceRecord &out) const {
   if (jHandle == 0)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byHandle.find(jHandle);
   if (it == m_byHandle.end())
     return false;
   out = it->second;
+  return true;
+}
+
+bool ModelInstanceRegistry::findFirstForAugment(
+    void* worldObjectEntry, void* sceneNode, void* primaryUnitPtr,
+    void* secondaryUnitPtr, uint32_t jHandle,
+    ModelInstanceRecord& out) const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+  auto findPointer = [&](const auto& map, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto it = map.find(key);
+    if (it == map.end())
+      return false;
+    out = it->second;
+    return true;
+  };
+
+  if (findPointer(m_byWorldObjectEntry, worldObjectEntry) ||
+      findPointer(m_bySceneNode, sceneNode) ||
+      findPointer(m_byUnitPtr, primaryUnitPtr) ||
+      (secondaryUnitPtr != primaryUnitPtr &&
+       findPointer(m_byUnitPtr, secondaryUnitPtr))) {
+    return true;
+  }
+
+  if (jHandle == 0u)
+    return false;
+  const auto handleIt = m_byHandle.find(jHandle);
+  if (handleIt == m_byHandle.end())
+    return false;
+  out = handleIt->second;
+  return true;
+}
+
+bool ModelInstanceRegistry::findFirstForAugmentView(
+    void* worldObjectEntry, void* sceneNode, void* primaryUnitPtr,
+    void* secondaryUnitPtr, uint32_t jHandle,
+    ModelInstanceAugmentView& out,
+    uint64_t* mutationGenerationOut) const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  if (mutationGenerationOut != nullptr) {
+    *mutationGenerationOut =
+        m_mutationGeneration.load(std::memory_order_acquire);
+  }
+
+  const ModelInstanceRecord* record = nullptr;
+  const auto findPointer = [&](const auto& map, const auto& key) -> bool {
+    const auto it = map.find(key);
+    if (it == map.end())
+      return false;
+    record = &it->second;
+    return true;
+  };
+
+  if (worldObjectEntry != nullptr)
+    findPointer(m_byWorldObjectEntry, worldObjectEntry);
+  if (record == nullptr && sceneNode != nullptr)
+    findPointer(m_bySceneNode, sceneNode);
+  if (record == nullptr && primaryUnitPtr != nullptr)
+    findPointer(m_byUnitPtr, primaryUnitPtr);
+  if (record == nullptr && secondaryUnitPtr != nullptr &&
+      secondaryUnitPtr != primaryUnitPtr) {
+    findPointer(m_byUnitPtr, secondaryUnitPtr);
+  }
+  if (record == nullptr && jHandle != 0u)
+    findPointer(m_byHandle, jHandle);
+
+  if (record == nullptr)
+    return false;
+
+  out.worldObjectEntry = record->worldObjectEntry;
+  out.sceneNode = record->sceneNode;
+  out.runtimeModelPtr = record->runtimeModelPtr;
+  out.modelResourcePtr = record->modelResourcePtr;
+  out.jHandle = record->jHandle;
+  out.rawcode = record->rawcode;
+  out.modelKey = record->modelKey;
   return true;
 }
 
@@ -1162,13 +1558,7 @@ size_t ModelInstanceRegistry::recordCount() const {
 
 size_t ModelInstanceRegistry::runtimeBoundCount() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
-  size_t count = 0;
-  for (const auto &it : m_byRuntimeModel) {
-    const auto &record = it.second;
-    if (record.runtimeModelPtr != nullptr && record.spritePtr != nullptr)
-      ++count;
-  }
-  return count;
+  return size_t(m_trackingRuntimeBoundCount);
 }
 
 size_t ModelInstanceRegistry::runtimeCreationProvenanceCount() const {
@@ -1226,21 +1616,79 @@ size_t ModelInstanceRegistry::runtimeOwnerIdentityCount() const {
 
 size_t ModelInstanceRegistry::completeIdentityCount() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
-  size_t count = 0;
-  for (const auto &it : m_byRuntimeModel) {
-    const auto &record = it.second;
-    if (record.runtimeModelPtr == nullptr || record.spritePtr == nullptr)
-      continue;
-    if (record.sceneNode != nullptr || record.unitPtr != nullptr ||
-        record.jHandle != 0u || record.rawcode != 0u)
-      ++count;
+  return size_t(m_trackingCompleteIdentityCount);
+}
+
+ModelInstanceTrackingHealthSnapshot
+ModelInstanceRegistry::trackingHealthSnapshot() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  return trackingHealthSnapshotLocked(
+      RegistryTrackingHealthVerifierEnabled());
+}
+
+ModelInstanceTrackingHealthSnapshot
+ModelInstanceRegistry::debugVerifyTrackingHealthAggregate() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  return trackingHealthSnapshotLocked(true);
+}
+
+ModelInstanceTrackingHealthSnapshot
+ModelInstanceRegistry::trackingHealthSnapshotLocked(
+    bool runVerifier) const {
+  ModelInstanceTrackingHealthSnapshot snapshot = {};
+  snapshot.frameNumber = m_frameNumber.load(std::memory_order_relaxed);
+  snapshot.recordCount = uint64_t(m_byRuntimeModel.size());
+  snapshot.runtimeBoundCount = m_trackingRuntimeBoundCount;
+  snapshot.completeIdentityCount = m_trackingCompleteIdentityCount;
+  snapshot.aggregateReadPasses = 1u;
+
+  if (runVerifier) {
+    uint64_t scannedRuntimeBoundCount = 0u;
+    uint64_t scannedCompleteIdentityCount = 0u;
+    snapshot.verifierScanPasses = 1u;
+    for (const auto& it : m_byRuntimeModel) {
+      ++snapshot.verifierRecordsScanned;
+      const auto classification =
+          ClassifyModelInstanceTracking(it.second);
+      if (classification.runtimeBound)
+        ++scannedRuntimeBoundCount;
+      if (classification.completeIdentity)
+        ++scannedCompleteIdentityCount;
+    }
+
+    if (snapshot.recordCount != snapshot.verifierRecordsScanned) {
+      snapshot.verifierMismatchMask |=
+          ModelInstanceTrackingHealthMismatchRecordCount;
+    }
+    if (snapshot.runtimeBoundCount != scannedRuntimeBoundCount) {
+      snapshot.verifierMismatchMask |=
+          ModelInstanceTrackingHealthMismatchRuntimeBoundCount;
+    }
+    if (snapshot.completeIdentityCount !=
+        scannedCompleteIdentityCount) {
+      snapshot.verifierMismatchMask |=
+          ModelInstanceTrackingHealthMismatchCompleteIdentityCount;
+    }
+    snapshot.verifierMismatchCount =
+        snapshot.verifierMismatchMask != 0u ? 1u : 0u;
+    MaybeAssertRegistryTrackingHealth(snapshot.verifierMismatchMask);
   }
-  return count;
+  return snapshot;
+}
+
+ModelIdentitySameFrameDedupStats
+ModelInstanceRegistry::sameFrameIdentityDedupStats() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  return m_sameFrameIdentityDedupStats;
 }
 
 uint64_t ModelInstanceRegistry::frameNumber() const {
   // Phase 7.83锛歮_frameNumber 宸叉敼 atomic锛屼笉鍐嶉渶瑕侀攣銆?
   return m_frameNumber.load(std::memory_order_relaxed);
+}
+
+uint64_t ModelInstanceRegistry::mutationGeneration() const {
+  return m_mutationGeneration.load(std::memory_order_acquire);
 }
 
 PoseRegistry &PoseRegistry::instance() {
@@ -1255,6 +1703,39 @@ void PoseRegistry::beginFrame() {
 
 void PoseRegistry::endFrame() {
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+}
+
+void PoseRegistry::storeRuntimeModelRecordLocked(const PoseRecord& record) {
+  assert(record.runtimeModelPtr != nullptr);
+  if (record.runtimeModelPtr == nullptr)
+    return;
+
+  auto it = m_byRuntimeModel.find(record.runtimeModelPtr);
+  if (it == m_byRuntimeModel.end()) {
+    const auto inserted =
+        m_byRuntimeModel.emplace(record.runtimeModelPtr, record);
+    const auto current = ClassifyPoseTracking(inserted.first->second);
+    ReplaceTrackingClassificationCount(
+        m_trackingReadyPoseCount, false, current.readyPose);
+    ReplaceTrackingClassificationCount(
+        m_trackingSpriteFramePoseCount, false,
+        current.spriteFramePose);
+    ReplaceTrackingClassificationCount(
+        m_trackingMatrixPaletteCount, false, current.matrixPalette);
+    return;
+  }
+
+  const auto previous = ClassifyPoseTracking(it->second);
+  it->second = record;
+  const auto current = ClassifyPoseTracking(it->second);
+  ReplaceTrackingClassificationCount(
+      m_trackingReadyPoseCount, previous.readyPose, current.readyPose);
+  ReplaceTrackingClassificationCount(
+      m_trackingSpriteFramePoseCount, previous.spriteFramePose,
+      current.spriteFramePose);
+  ReplaceTrackingClassificationCount(
+      m_trackingMatrixPaletteCount, previous.matrixPalette,
+      current.matrixPalette);
 }
 
 void PoseRegistry::storeRecord(const PoseRecord &record) {
@@ -1277,7 +1758,7 @@ void PoseRegistry::storeRecord(const PoseRecord &record) {
   MergePoseRecord(merged, record);
 
   if (merged.runtimeModelPtr)
-    m_byRuntimeModel[merged.runtimeModelPtr] = merged;
+    storeRuntimeModelRecordLocked(merged);
   if (merged.sceneNode)
     m_bySceneNode[merged.sceneNode] = merged;
   if (merged.unitPtr)
@@ -1381,7 +1862,7 @@ bool PoseRegistry::findByRuntimeModel(void *runtimeModelPtr,
   if (!runtimeModelPtr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byRuntimeModel.find(runtimeModelPtr);
   if (it == m_byRuntimeModel.end())
     return false;
@@ -1393,7 +1874,7 @@ bool PoseRegistry::findBySceneNode(void *sceneNode, PoseRecord &out) const {
   if (!sceneNode)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySceneNode.find(sceneNode);
   if (it == m_bySceneNode.end())
     return false;
@@ -1405,11 +1886,67 @@ bool PoseRegistry::findByUnitPtr(void *unitPtr, PoseRecord &out) const {
   if (!unitPtr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byUnitPtr.find(unitPtr);
   if (it == m_byUnitPtr.end())
     return false;
   out = it->second;
+  return true;
+}
+
+// Project the fields the per-draw shadow augment path actually consumes,
+// skipping the matrixPalette vector so no heap allocation/copy happens.
+static inline void ProjectPoseAugment(const PoseRecord &rec,
+                                      PoseAugmentView &out) {
+  out.hasWorldTransform = rec.hasWorldTransform;
+  out.worldTransform = rec.worldTransform;
+  out.hasSpriteFrameTransform = rec.hasSpriteFrameTransform;
+  out.spriteFrameTransform = rec.spriteFrameTransform;
+  out.scale = rec.scale;
+  out.height = rec.height;
+  out.matrixCount = rec.matrixCount;
+  out.matrixHash = rec.matrixHash;
+  out.lastRootPoseFrame = rec.lastRootPoseFrame;
+  out.lastSpriteFramePoseFrame = rec.lastSpriteFramePoseFrame;
+  out.lastMatrixPaletteFrame = rec.lastMatrixPaletteFrame;
+}
+
+bool PoseRegistry::findByRuntimeModelAugment(void *runtimeModelPtr,
+                                             PoseAugmentView &out) const {
+  if (!runtimeModelPtr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  auto it = m_byRuntimeModel.find(runtimeModelPtr);
+  if (it == m_byRuntimeModel.end())
+    return false;
+  ProjectPoseAugment(it->second, out);
+  return true;
+}
+
+bool PoseRegistry::findBySceneNodeAugment(void *sceneNode,
+                                          PoseAugmentView &out) const {
+  if (!sceneNode)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  auto it = m_bySceneNode.find(sceneNode);
+  if (it == m_bySceneNode.end())
+    return false;
+  ProjectPoseAugment(it->second, out);
+  return true;
+}
+
+bool PoseRegistry::findByUnitPtrAugment(void *unitPtr,
+                                        PoseAugmentView &out) const {
+  if (!unitPtr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  auto it = m_byUnitPtr.find(unitPtr);
+  if (it == m_byUnitPtr.end())
+    return false;
+  ProjectPoseAugment(it->second, out);
   return true;
 }
 
@@ -1433,40 +1970,80 @@ size_t PoseRegistry::recordCount() const {
 
 size_t PoseRegistry::readyPoseCount() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
-  size_t count = 0;
-  for (const auto &it : m_byRuntimeModel) {
-    const auto &record = it.second;
-    if (record.lastSpriteFramePoseFrame != 0 ||
-        record.lastRootPoseFrame != 0 ||
-        (record.lastMatrixPaletteFrame != 0 && record.matrixCount != 0 &&
-         !record.matrixPalette.empty())) {
-      ++count;
-    }
-  }
-  return count;
+  return size_t(m_trackingReadyPoseCount);
 }
 
 size_t PoseRegistry::spriteFramePoseCount() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
-  size_t count = 0;
-  for (const auto& it : m_byRuntimeModel) {
-    if (it.second.lastSpriteFramePoseFrame != 0)
-      ++count;
-  }
-  return count;
+  return size_t(m_trackingSpriteFramePoseCount);
 }
 
 size_t PoseRegistry::matrixPaletteCount() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
-  size_t count = 0;
-  for (const auto& it : m_byRuntimeModel) {
-    if (it.second.lastMatrixPaletteFrame != 0 &&
-        it.second.matrixCount != 0 &&
-        !it.second.matrixPalette.empty()) {
-      ++count;
+  return size_t(m_trackingMatrixPaletteCount);
+}
+
+PoseTrackingHealthSnapshot PoseRegistry::trackingHealthSnapshot() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  return trackingHealthSnapshotLocked(
+      RegistryTrackingHealthVerifierEnabled());
+}
+
+PoseTrackingHealthSnapshot
+PoseRegistry::debugVerifyTrackingHealthAggregate() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  return trackingHealthSnapshotLocked(true);
+}
+
+PoseTrackingHealthSnapshot PoseRegistry::trackingHealthSnapshotLocked(
+    bool runVerifier) const {
+  PoseTrackingHealthSnapshot snapshot = {};
+  snapshot.frameNumber = m_frameNumber.load(std::memory_order_relaxed);
+  snapshot.recordCount = uint64_t(m_byRuntimeModel.size());
+  snapshot.readyPoseCount = m_trackingReadyPoseCount;
+  snapshot.spriteFramePoseCount = m_trackingSpriteFramePoseCount;
+  snapshot.matrixPaletteCount = m_trackingMatrixPaletteCount;
+  snapshot.aggregateReadPasses = 1u;
+
+  if (runVerifier) {
+    uint64_t scannedReadyPoseCount = 0u;
+    uint64_t scannedSpriteFramePoseCount = 0u;
+    uint64_t scannedMatrixPaletteCount = 0u;
+    snapshot.verifierScanPasses = 1u;
+    for (const auto& it : m_byRuntimeModel) {
+      ++snapshot.verifierRecordsScanned;
+      const auto classification = ClassifyPoseTracking(it.second);
+      if (classification.readyPose)
+        ++scannedReadyPoseCount;
+      if (classification.spriteFramePose)
+        ++scannedSpriteFramePoseCount;
+      if (classification.matrixPalette)
+        ++scannedMatrixPaletteCount;
     }
+
+    if (snapshot.recordCount != snapshot.verifierRecordsScanned) {
+      snapshot.verifierMismatchMask |=
+          PoseTrackingHealthMismatchRecordCount;
+    }
+    if (snapshot.readyPoseCount != scannedReadyPoseCount) {
+      snapshot.verifierMismatchMask |=
+          PoseTrackingHealthMismatchReadyPoseCount;
+    }
+    if (snapshot.spriteFramePoseCount !=
+        scannedSpriteFramePoseCount) {
+      snapshot.verifierMismatchMask |=
+          PoseTrackingHealthMismatchSpriteFramePoseCount;
+    }
+    if (snapshot.matrixPaletteCount !=
+        scannedMatrixPaletteCount) {
+      snapshot.verifierMismatchMask |=
+          PoseTrackingHealthMismatchMatrixPaletteCount;
+    }
+    snapshot.verifierMismatchCount =
+        snapshot.verifierMismatchMask != 0u ? 1u : 0u;
+    MaybeAssertRegistryTrackingHealth(snapshot.verifierMismatchMask);
   }
-  return count;
+  return snapshot;
 }
 
 uint64_t PoseRegistry::frameNumber() const {
@@ -1674,7 +2251,7 @@ bool AttachmentRigidRegistry::findByChildRuntimeModel(
   out = {};
   if (childRuntimeModelPtr == nullptr)
     return false;
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byChildRuntimeModel.find(childRuntimeModelPtr);
   if (it == m_byChildRuntimeModel.end())
     return false;
@@ -1687,7 +2264,7 @@ bool AttachmentRigidRegistry::findByOwnerRuntimeModel(
   out = {};
   if (ownerRuntimeModelPtr == nullptr)
     return false;
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byOwnerRuntimeModel.find(ownerRuntimeModelPtr);
   if (it == m_byOwnerRuntimeModel.end())
     return false;
@@ -1700,7 +2277,7 @@ bool AttachmentRigidRegistry::findByRootRuntimeModel(
   out = {};
   if (rootRuntimeModelPtr == nullptr)
     return false;
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byRootRuntimeModel.find(rootRuntimeModelPtr);
   if (it == m_byRootRuntimeModel.end())
     return false;
@@ -1713,7 +2290,7 @@ bool AttachmentRigidRegistry::findByAnyRuntimeModel(
   out = {};
   if (runtimeModelPtr == nullptr)
     return false;
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto itChild = m_byChildRuntimeModel.find(runtimeModelPtr);
   if (itChild != m_byChildRuntimeModel.end()) {
     out = itChild->second;
@@ -1737,7 +2314,7 @@ bool AttachmentRigidRegistry::findByWorldObjectEntry(
   out = {};
   if (worldObjectEntry == nullptr)
     return false;
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byWorldObjectEntry.find(worldObjectEntry);
   if (it == m_byWorldObjectEntry.end())
     return false;
@@ -1750,7 +2327,7 @@ bool AttachmentRigidRegistry::findBySceneNode(void* sceneNode,
   out = {};
   if (sceneNode == nullptr)
     return false;
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_bySceneNode.find(sceneNode);
   if (it == m_bySceneNode.end())
     return false;
@@ -1763,7 +2340,7 @@ bool AttachmentRigidRegistry::findByUnitPtr(void* unitPtr,
   out = {};
   if (unitPtr == nullptr)
     return false;
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto it = m_byUnitPtr.find(unitPtr);
   if (it == m_byUnitPtr.end())
     return false;
@@ -1776,7 +2353,7 @@ bool AttachmentRigidRegistry::findByHandle(uint32_t jHandle,
   out = {};
   if (jHandle == 0u)
     return false;
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byHandle.find(jHandle);
   if (it == m_byHandle.end())
     return false;

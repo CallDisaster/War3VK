@@ -741,9 +741,31 @@ void NativeD3D9Backend::ensureIdentityPaletteResource() {
   m_paletteResources.emplace(kIdentityPaletteHandle, std::move(identity));
 }
 
+void NativeD3D9Backend::evictStalePalettes() {
+  // The palette cache key folds in per-frame pose/matrix hashes, so animated
+  // casters mint a fresh entry every frame that is never reused. Cache hits
+  // refresh lastUsedFrameSerial, so anything genuinely reused survives; entries
+  // idle beyond the window are dropped to bound total memory over a long
+  // session. The identity palette (kIdentityPaletteHandle) is permanent.
+  constexpr uint64_t kPaletteMaxIdleFrames = 16u;
+  if (m_paletteResources.size() <= 1u || m_frameSerial < kPaletteMaxIdleFrames)
+    return;
+  const uint64_t cutoff = m_frameSerial - kPaletteMaxIdleFrames;
+  for (auto it = m_paletteResources.begin(); it != m_paletteResources.end();) {
+    if (it->first != kIdentityPaletteHandle &&
+        it->second.lastUsedFrameSerial <= cutoff) {
+      m_paletteHandleByKey.erase(it->second.cacheKey);
+      it = m_paletteResources.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 void NativeD3D9Backend::beginFrame(uint64_t frameSerial) {
   ensureIdentityPaletteResource();
   m_frameSerial = frameSerial;
+  evictStalePalettes();
   m_submittedDrawCount = 0u;
   m_submittedRigidDrawCount = 0u;
   m_submittedSkinnedDrawCount = 0u;
@@ -813,36 +835,31 @@ bool NativeD3D9Backend::ensureGeometry(const ShadowDrawPacket& packet,
   resource.blendStride = blendStride;
   resource.topology = packet.resource.topology;
 
-  if (!CreateStaticVertexBuffer(m_device, positions.data(),
-                                positions.size() * sizeof(float),
-                                resource.positionBuffer)) {
-    ++m_geometryRejectCount;
-    return false;
-  }
+  // Skinned packets are replayed via CPU skinning + DrawPrimitiveUP
+  // (DrawPreparedSkinnedRecord) and never bind the static position/index
+  // buffers; only the rigid path (DrawPreparedRigidRecord) consumes them.
+  // Skip the upload + DEFAULT-pool VRAM for skinned geometry. The handle and
+  // vertex/index/topology metadata below are still produced, so submitDraw's
+  // non-zero-handle contract and record fields are unchanged.
+  if (!resource.skinned) {
+    if (!CreateStaticVertexBuffer(m_device, positions.data(),
+                                  positions.size() * sizeof(float),
+                                  resource.positionBuffer)) {
+      ++m_geometryRejectCount;
+      return false;
+    }
 
-  if (indexed &&
-      !CreateStaticIndexBuffer(m_device, indices.data(),
-                               indices.size() * sizeof(uint16_t),
-                               resource.indexBuffer)) {
-    ++m_geometryRejectCount;
-    return false;
+    if (indexed &&
+        !CreateStaticIndexBuffer(m_device, indices.data(),
+                                 indices.size() * sizeof(uint16_t),
+                                 resource.indexBuffer)) {
+      ++m_geometryRejectCount;
+      return false;
+    }
   }
-
-  if (!blendVertices.empty() &&
-      !CreateStaticVertexBuffer(m_device, blendVertices.data(),
-                                blendVertices.size() * sizeof(blendVertices[0]),
-                                resource.blendBuffer)) {
-    ++m_geometryRejectCount;
-    return false;
-  }
-
-  if (!blendIndices.empty() &&
-      !CreateStaticVertexBuffer(m_device, blendIndices.data(),
-                                blendIndices.size() * sizeof(blendIndices[0]),
-                                resource.blendBuffer)) {
-    ++m_geometryRejectCount;
-    return false;
-  }
+  // The former blendBuffer uploads were removed: neither draw path binds a
+  // blend vertex buffer. ResolveBlendStream above is retained for its packet
+  // validation and reject semantics only.
 
   const uint64_t handleValue = m_nextHandleValue++;
   m_geometryHandleByKey.emplace(key, handleValue);
@@ -865,12 +882,16 @@ bool NativeD3D9Backend::ensurePalette(const ShadowDrawPacket& packet,
   if (const auto it = m_paletteHandleByKey.find(key);
       it != m_paletteHandleByKey.end()) {
     outHandle.value = it->second;
+    if (const auto rit = m_paletteResources.find(it->second);
+        rit != m_paletteResources.end())
+      rit->second.lastUsedFrameSerial = m_frameSerial;
     return true;
   }
 
   PaletteResource resource = {};
   resource.cacheKey = key;
   resource.matrixHash = packet.pose.matrixHash;
+  resource.lastUsedFrameSerial = m_frameSerial;
 
   if (packet.path == ShadowDrawPath::Skinned && !packet.runtimeGroupPalette.empty()) {
     resource.matrices = packet.runtimeGroupPalette;

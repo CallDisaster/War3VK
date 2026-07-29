@@ -1,5 +1,6 @@
 #include "d3d9_war3_hook.h"
 
+#include "d3d9_device.h"
 #include "d3d9_war3_branding.h"
 #include "d3d9_war3_debug.h"
 #include "jass/war3_game.h"
@@ -316,6 +317,9 @@ BuildShadowHookAddresses(const ModuleInfo &gameInfo, const char *source) {
               "ShadowPath_ObjectProjector_JassBridge");
   shadowHooks.shadowPathStaticStampToggleAddr =
       resolve(book.shadowPathStaticStampToggle, "ShadowPath_StaticStamp_Toggle");
+  shadowHooks.cunitUiRecordSetUnitShadowAddr =
+      resolve(book.cunitUiRecordSetUnitShadow,
+              "CUnitUIManager_RecordSetUnitShadow");
   shadowHooks.cunitUiRecordSetStructureShadowAddr =
       resolve(book.cunitUiRecordSetStructureShadow,
               "CUnitUIManager_RecordSetStructureShadow");
@@ -357,6 +361,8 @@ BuildShadowHookAddresses(const ModuleInfo &gameInfo, const char *source) {
 
 // 地图退出时重置运行时状态，避免跨局残留。
 void ResetWar3RuntimeState() {
+  if (auto* device = dxvk::war3::GetActiveDevice())
+    device->War3ResetGpuSkinMapEpoch();
   g_war3_runtime_activated.store(false, std::memory_order_release);
   std::this_thread::yield();
   dxvk::war3::platform::ResetRuntimeCore();
@@ -485,6 +491,17 @@ void ActivateWar3Runtime(uintptr_t gameBase, const char *source) {
 
 void TryInstallShadowHooksEarly(uintptr_t gameBase, const char *source) {
   (void)gameBase;
+  if (GetEnvBool("DXVK_WAR3_BOOTSTRAP_MINIMAL", false)) {
+    static std::atomic<bool> s_minimalLogged{false};
+    bool expected = false;
+    if (s_minimalLogged.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+      war3dbg::Print(
+          "DXVK War3Hook: 启动最小化二分，忽略 early hook 补装 source=%s\n",
+          source ? source : "unknown");
+    }
+    return;
+  }
   TryInstallStormBreakerEarly(source);
 
   // Phase 7.99/7.170：CWidget identity 与 Shadow producer hooks 必须早装。
@@ -783,9 +800,29 @@ void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
     return;
   }
 
-  // Shadow producer/StormBreaker 越早装越好：优先在首个 D3D9 bootstrap
-  // 尝试安装，若此时依赖尚未就绪，再由 MainRunner_ENTER 补一次兜底。
-  TryInstallShadowHooksEarly(gameInfo.base, "Bootstrap");
+  // 诊断态可完全跳过 Game.dll bootstrap hooks；此时不会建立控制管道，
+  // 只用 Present/窗口证据判断游戏自身是否继续启动。默认路径不变。
+  const bool bootstrapNoGameHooks =
+      GetEnvBool("DXVK_WAR3_BOOTSTRAP_NO_GAME_HOOKS", false);
+  if (bootstrapNoGameHooks) {
+    war3dbg::Print(
+        "DXVK War3Hook: 启动无 Game hook 二分，仅保留 D3D9 图形路径\n");
+    g_bootstrapInstalled.store(true, std::memory_order_release);
+    return;
+  }
+
+  // 最小化模式只保留能建立控制管道的 JASS/MainRunner 入口，用于排除
+  // Storm、Shadow producer 与 model provenance 的启动期侵入。
+  const bool bootstrapMinimal =
+      GetEnvBool("DXVK_WAR3_BOOTSTRAP_MINIMAL", false);
+  if (!bootstrapMinimal) {
+    // Shadow producer/StormBreaker 越早装越好：优先在首个 D3D9 bootstrap
+    // 尝试安装，若此时依赖尚未就绪，再由 MainRunner_ENTER 补一次兜底。
+    TryInstallShadowHooksEarly(gameInfo.base, "Bootstrap");
+  } else {
+    war3dbg::Print(
+        "DXVK War3Hook: 启动最小化二分，跳过 Storm/Shadow early hooks\n");
+  }
 
   // Bootstrap 只做“最早期可安全安装”的生命周期/JASS 入口。
   dxvk::war3::hooks::War3HookJass::Install(gameInfo.base);
@@ -796,7 +833,8 @@ void War3Hook::InstallHooks(IDirect3DDevice9 *device) {
     // 之前的更早创建窗”。bootstrap 这里只提前安装 provenance 必需 hooks，
     // 把 sprite/pose/local-point 这类高侵入 hook 留到 runtime 激活后再装，
     // 避免把整包 model hook 提前到过早生命周期。
-    war3::model::Init(gameInfo.base, true);
+    if (!bootstrapMinimal)
+      war3::model::Init(gameInfo.base, true);
   }
 
   g_bootstrapInstalled.store(true, std::memory_order_release);

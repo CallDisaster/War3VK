@@ -1,5 +1,12 @@
 # 无人值守渲染层论文 + 静态阴影深化 — 总规划（2026-05-15）
 
+> 2026-07-15 authoritative correction：本文件保留历史计划语境；`CWorld_*` 与
+> `WorldObjectEntry_Render` 不再是有效类归属。当前 canonical anchors 为
+> `CWorldFrameWar3_RenderScene/DispatchStage/RenderWorldGroup`、
+> `CSprite_PrepareAndQueueAttachedRenderObject(CSprite*)` 与
+> `WorldGroupRecordOwner_AddSpriteRef`。详见
+> [30 号类族卷](../../research/war3_render_issues/30_cworld_class_family_full_reverse/README.md)。
+
 ## 0. 用户的硬要求
 1. **本线程仅做逆向**，不允许动 War3 项目源码（性能优化的另一线程在跑，不能干扰）。
 2. 把魔兽争霸 3 从**逻辑层剔除（visibility/scene cull）→ 渲染层过渡**开始一路逆向，直到把
@@ -23,9 +30,11 @@
 
 ### 子线程 A：剔除层 → 渲染层过渡
 - 范围：`CWorld::FrameUpdate` → 视锥剔除 / quadtree 查询 → 可见对象列表 → `RenderQueue` 入口
-- 关键函数已知锚点：`worldFrameUpdateAndPreparePasses(0x368480)`、`CWorld_RenderScene(0x3681C0)`、
-  `CWorld_DispatchStage(0x363020)`、`CWorld_WorldObjects_RenderGroup(0x368E30)`、
-  `WorldObjectEntry_Render(0x184EE0)`、`worldObjectListEntryWrite(0x0CB110)`
+- 关键函数已知锚点：`worldFrameUpdateAndPreparePasses(0x368480)`、
+  `CWorldFrameWar3_RenderScene(0x3681C0)`、`CWorldFrameWar3_DispatchStage(0x363020)`、
+  `CWorldFrameWar3_RenderWorldGroup(0x368E30)`、
+  `CSprite_PrepareAndQueueAttachedRenderObject(0x184EE0)`、
+  `WorldGroupRecordOwner_AddSpriteRef(0x0CB110)`
 - 输出：剔除策略 + 可见集分发 + 进入 RenderQueue 的边界
 
 ### 子线程 B：RenderQueue 入队 / 排序 / 分发深挖

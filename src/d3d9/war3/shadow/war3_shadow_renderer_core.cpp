@@ -46,6 +46,17 @@ bool SemanticCoreSliceTraceEnabled() {
   return enabled;
 }
 
+// 2026-07-21 优化：逐记录 slowest*Us 计时诊断默认关闭。开启前每条 manifest
+// 记录要付 ~20 次 steady_clock::now()（9 个 ScopedMaxUs + 6 个
+// ResolvePhaseTimer + 循环体 recordStart），与被测的 resolveRecord 本身
+// 同量级；这些 slowest*Us 只用于 control-plane 诊断展示，不影响任何
+// 功能路径。`DXVK_WAR3_RENDERER_CORE_TIMING_PROBE=1` 显式恢复完整计时。
+bool RendererCoreTimingProbeEnabled() {
+  static const bool enabled =
+      dxvk::env::getEnvVar("DXVK_WAR3_RENDERER_CORE_TIMING_PROBE") == "1";
+  return enabled;
+}
+
 bool LooksLikeGeosetDataPtr(void* candidate);
 
 bool RenderableUsesDirectGeosetData(
@@ -111,6 +122,10 @@ ShadowRenderableRecord ConvertVisibleRecord(
   dst.queueKind = src.queueKind;
   dst.groupIdx = src.identity.groupIdx;
   dst.frameSerial = frameSerial;
+  dst.stage = src.stage;
+  dst.pathBlocker =
+      src.pathBlocker ||
+      dxvk::war3::internal::IsPathBlockerFourCc(dst.rawcode);
   return dst;
 }
 
@@ -2222,6 +2237,9 @@ bool TryAugmentRenderableSemanticRecovery(ShadowRenderableRecord& renderable) {
   semantic.rawcode = renderable.rawcode;
   semantic.modelKey = renderable.modelKey;
   semantic.objectKind = renderable.objectKind;
+  semantic.pathBlocker =
+      renderable.pathBlocker ||
+      dxvk::war3::internal::IsPathBlockerFourCc(renderable.rawcode);
 
   const bool bridgeReady =
       render::AugmentShadowSemanticContext(semantic, currentObj);
@@ -2415,6 +2433,9 @@ bool TryAugmentRenderableSemanticRecovery(ShadowRenderableRecord& renderable) {
     renderable.rawcode = worldInstance.rawcode;
     changed = true;
   }
+  renderable.pathBlocker =
+      renderable.pathBlocker || semantic.pathBlocker ||
+      dxvk::war3::internal::IsPathBlockerFourCc(renderable.rawcode);
   if (renderable.objectKind == render::ObjectKind::Unknown &&
       semantic.objectKind != render::ObjectKind::Unknown) {
     renderable.objectKind = semantic.objectKind;
@@ -2488,6 +2509,9 @@ bool TryAugmentRenderableSemanticRecovery(ShadowRenderableRecord& renderable) {
       renderable.rawcode = shadowRecord.rawcode;
       changed = true;
     }
+    renderable.pathBlocker =
+        renderable.pathBlocker ||
+        dxvk::war3::internal::IsPathBlockerFourCc(renderable.rawcode);
     if (renderable.objectKind == render::ObjectKind::Unknown &&
         shadowRecord.kind != render::ObjectKind::Unknown) {
       renderable.objectKind = shadowRecord.kind;
@@ -2612,13 +2636,19 @@ void AccumulateRuntimeGroupPaletteMissStats(
 
 struct ScopedMaxUs {
   uint64_t* targetUs = nullptr;
-  std::chrono::steady_clock::time_point startedAt =
-      std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point startedAt;
+  bool active = false;
 
-  explicit ScopedMaxUs(uint64_t* target) : targetUs(target) {}
+  explicit ScopedMaxUs(uint64_t* target) : targetUs(target) {
+    // 2026-07-21：探针默认关闭时连构造期的 clock 调用都省掉，
+    // 每条记录只留一次 bool 分支。
+    active = targetUs != nullptr && RendererCoreTimingProbeEnabled();
+    if (active)
+      startedAt = std::chrono::steady_clock::now();
+  }
 
   ~ScopedMaxUs() {
-    if (targetUs == nullptr)
+    if (!active)
       return;
     const uint64_t elapsedUs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2766,15 +2796,17 @@ bool TryResolveBestPoseForRenderable(const ShadowRenderableRecord& renderable,
               poses, instanceRecord.runtimeModelPtr, candidate)) {
         consider(candidate);
       }
-      candidate = {};
-      if (instanceRecord.unitPtr != nullptr &&
-          poses.findByUnitPtr(instanceRecord.unitPtr, candidate)) {
-        consider(candidate);
+      // 2026-07-21 优化：改用指针版 find，候选未命中时不再按值拷贝最多
+      // 256 个 Matrix4（约 16 KB）的 ShadowPoseRecord；命中也只在
+      // consider 判定为更优时拷贝一次。store 快照生命周期覆盖本调用。
+      if (instanceRecord.unitPtr != nullptr) {
+        if (const auto* pose = poses.findByUnitPtrPtr(instanceRecord.unitPtr))
+          consider(*pose);
       }
-      candidate = {};
-      if (instanceRecord.sceneNode != nullptr &&
-          poses.findBySceneNode(instanceRecord.sceneNode, candidate)) {
-        consider(candidate);
+      if (instanceRecord.sceneNode != nullptr) {
+        if (const auto* pose =
+                poses.findBySceneNodePtr(instanceRecord.sceneNode))
+          consider(*pose);
       }
     }
   }
@@ -2815,15 +2847,14 @@ bool TryResolveBestPoseForRenderable(const ShadowRenderableRecord& renderable,
               poses, shadowRecord.runtimeModelPtr, candidate)) {
         consider(candidate);
       }
-      candidate = {};
-      if (shadowRecord.unitPtr != nullptr &&
-          poses.findByUnitPtr(shadowRecord.unitPtr, candidate)) {
-        consider(candidate);
+      if (shadowRecord.unitPtr != nullptr) {
+        if (const auto* pose = poses.findByUnitPtrPtr(shadowRecord.unitPtr))
+          consider(*pose);
       }
-      candidate = {};
-      if (shadowRecord.sceneNode != nullptr &&
-          poses.findBySceneNode(shadowRecord.sceneNode, candidate)) {
-        consider(candidate);
+      if (shadowRecord.sceneNode != nullptr) {
+        if (const auto* pose =
+                poses.findBySceneNodePtr(shadowRecord.sceneNode))
+          consider(*pose);
       }
     }
   }
@@ -2845,9 +2876,9 @@ bool TryResolveBestPoseForRenderable(const ShadowRenderableRecord& renderable,
     if (spritePtr == nullptr && renderObject != nullptr &&
         renderObject->unitPtr != nullptr)
       spritePtr = TryResolveSpritePtrFromUnit(renderObject->unitPtr);
-    if (renderObject != nullptr && renderObject->unitPtr != nullptr &&
-        poses.findByUnitPtr(renderObject->unitPtr, candidate)) {
-      consider(candidate);
+    if (renderObject != nullptr && renderObject->unitPtr != nullptr) {
+      if (const auto* pose = poses.findByUnitPtrPtr(renderObject->unitPtr))
+        consider(*pose);
     }
     candidate = {};
     if (spritePtr != nullptr) {
@@ -2940,14 +2971,18 @@ bool TryResolveBestPoseForRenderable(const ShadowRenderableRecord& renderable,
           model::PoseRegistry::instance().findByUnitPtr(detailedObject->unitPtr,
                                                         livePoseUnit);
 
-      ShadowPoseRecord shadowPoseScene = {};
-      ShadowPoseRecord shadowPoseUnit = {};
-      const bool shadowPoseSceneHit =
-          renderable.sceneNode != nullptr &&
-          poses.findBySceneNode(renderable.sceneNode, shadowPoseScene);
-      const bool shadowPoseUnitHit =
-          detailedObject != nullptr && detailedObject->unitPtr != nullptr &&
-          poses.findByUnitPtr(detailedObject->unitPtr, shadowPoseUnit);
+      // 2026-07-21 优化：这两条 pose 只用于诊断打印的 matrixCount，
+      // 改用指针版 find，避免每次拷贝最多约 16 KB 的 ShadowPoseRecord。
+      const ShadowPoseRecord* shadowPoseScene =
+          renderable.sceneNode != nullptr
+              ? poses.findBySceneNodePtr(renderable.sceneNode)
+              : nullptr;
+      const ShadowPoseRecord* shadowPoseUnit =
+          detailedObject != nullptr && detailedObject->unitPtr != nullptr
+              ? poses.findByUnitPtrPtr(detailedObject->unitPtr)
+              : nullptr;
+      const bool shadowPoseSceneHit = shadowPoseScene != nullptr;
+      const bool shadowPoseUnitHit = shadowPoseUnit != nullptr;
 
       const bool hasIdentityContext =
           renderable.sceneNode != nullptr ||
@@ -2994,8 +3029,8 @@ bool TryResolveBestPoseForRenderable(const ShadowRenderableRecord& renderable,
             livePoseSceneHit ? livePoseScene.matrixCount : 0u,
             livePoseUnitHit ? livePoseUnit.matrixCount : 0u,
             shadowPoseSceneHit ? 1 : 0, shadowPoseUnitHit ? 1 : 0,
-            shadowPoseSceneHit ? shadowPoseScene.matrixCount : 0u,
-            shadowPoseUnitHit ? shadowPoseUnit.matrixCount : 0u,
+            shadowPoseSceneHit ? shadowPoseScene->matrixCount : 0u,
+            shadowPoseUnitHit ? shadowPoseUnit->matrixCount : 0u,
             meshPoseRuntimeModelPtr);
       }
     }
@@ -3850,11 +3885,14 @@ bool TryBuildAttachmentRigidPose(const ShadowRenderableRecord& renderable,
                  poses, outAttachment.rootRuntimeModelPtr, rootPose)) {
     rootPoseStoreHit = true;
   } else {
-    if (outAttachment.sceneNode != nullptr &&
-        poses.findBySceneNode(outAttachment.sceneNode, rootPose)) {
-      rootPoseStoreHit = true;
-    } else if (outAttachment.unitPtr != nullptr &&
-               poses.findByUnitPtr(outAttachment.unitPtr, rootPose)) {
+    // 2026-07-21 优化：指针版 find，未命中时避免按值拷贝整条 pose。
+    const ShadowPoseRecord* foundPose = nullptr;
+    if (outAttachment.sceneNode != nullptr)
+      foundPose = poses.findBySceneNodePtr(outAttachment.sceneNode);
+    if (foundPose == nullptr && outAttachment.unitPtr != nullptr)
+      foundPose = poses.findByUnitPtrPtr(outAttachment.unitPtr);
+    if (foundPose != nullptr) {
+      rootPose = *foundPose;
       rootPoseStoreHit = true;
     }
   }
@@ -6532,9 +6570,10 @@ bool TryBuildRuntimeGroupPalette(const ShadowModelResourceRecord& resource,
           meshPoseCandidate, dxvk::war3::CModelOffsets::FinalPoseMatrixCount,
           meshPoseCandidateFinalCount);
 
-      ShadowPoseRecord meshPoseRecord = {};
-      if (poses.findByRuntimeModel(meshPoseCandidate, meshPoseRecord))
-        meshPoseCandidateStoredCount = meshPoseRecord.matrixCount;
+      // 2026-07-21 优化：只需要 matrixCount，用指针版避免整条拷贝。
+      if (const auto* meshPoseRecord =
+              poses.findByRuntimeModelPtr(meshPoseCandidate))
+        meshPoseCandidateStoredCount = meshPoseRecord->matrixCount;
     }
     if (renderable.meshData != nullptr) {
       dxvk::war3::SafeReadPtrFast(renderable.meshData,
@@ -6586,11 +6625,14 @@ bool TryBuildRuntimeGroupPalette(const ShadowModelResourceRecord& resource,
             candidateRuntimeModel == renderable.runtimeModelPtr) {
           continue;
         }
-        ShadowPoseRecord candidatePose = {};
-        if (!poses.findByRuntimeModel(candidateRuntimeModel, candidatePose))
+        // 2026-07-21 优化：只需要 matrixCount，用指针版避免每个
+        // descendant 都按值拷贝最多约 16 KB 的 ShadowPoseRecord。
+        const ShadowPoseRecord* candidatePose =
+            poses.findByRuntimeModelPtr(candidateRuntimeModel);
+        if (candidatePose == nullptr)
           continue;
-        if (candidatePose.matrixCount > bestDescendantPoseCount) {
-          bestDescendantPoseCount = candidatePose.matrixCount;
+        if (candidatePose->matrixCount > bestDescendantPoseCount) {
+          bestDescendantPoseCount = candidatePose->matrixCount;
           bestDescendantRuntimeModel = candidateRuntimeModel;
         }
       }
@@ -6964,6 +7006,9 @@ size_t ShadowRendererCore::buildFrameChunk(
     ioFrame.draws.reserve(manifest.records.size());
 
   const auto startedAt = std::chrono::steady_clock::now();
+  // 2026-07-21：逐记录 recordStart 计时随探针默认关闭（功能性的
+  // maxDurationUs 时间盒不受影响，仍按 startedAt 计算）。
+  const bool recordTimingProbe = RendererCoreTimingProbeEnabled();
   uint32_t processed = 0u;
   size_t index = startIndex;
   while (index < manifest.records.size()) {
@@ -6972,27 +7017,31 @@ size_t ShadowRendererCore::buildFrameChunk(
 
     ShadowDrawPacket packet = {};
     ioStats.considered++;
-    const auto recordStart = std::chrono::steady_clock::now();
+    const auto recordStart = recordTimingProbe
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point();
     const auto& record = manifest.records[index];
     if (resolveRecord(record, resources, poses, attachments, packet, ioStats))
       ioFrame.draws.emplace_back(std::move(packet));
-    const uint64_t recordElapsedUs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - recordStart)
-            .count());
-    if (recordElapsedUs > ioStats.slowestRecordResolveUs) {
-      ioStats.slowestRecordResolveUs = recordElapsedUs;
-      ioStats.slowestRecordIndex = index;
-      ioStats.slowestRecordRuntimeModelPtr =
-          reinterpret_cast<uint64_t>(record.runtimeModelPtr);
-      ioStats.slowestRecordModelResourcePtr =
-          reinterpret_cast<uint64_t>(record.modelResourcePtr);
-      ioStats.slowestRecordRuntimeGeosetPtr =
-          reinterpret_cast<uint64_t>(record.runtimeGeosetPtr);
-      ioStats.slowestRecordRuntimeGeosetDataPtr =
-          reinterpret_cast<uint64_t>(record.runtimeGeosetDataPtr);
-      ioStats.slowestRecordGeosetIndex = record.geosetIndex;
-      ioStats.slowestRecordObjectKind = uint64_t(record.objectKind);
+    if (recordTimingProbe) {
+      const uint64_t recordElapsedUs = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - recordStart)
+              .count());
+      if (recordElapsedUs > ioStats.slowestRecordResolveUs) {
+        ioStats.slowestRecordResolveUs = recordElapsedUs;
+        ioStats.slowestRecordIndex = index;
+        ioStats.slowestRecordRuntimeModelPtr =
+            reinterpret_cast<uint64_t>(record.runtimeModelPtr);
+        ioStats.slowestRecordModelResourcePtr =
+            reinterpret_cast<uint64_t>(record.modelResourcePtr);
+        ioStats.slowestRecordRuntimeGeosetPtr =
+            reinterpret_cast<uint64_t>(record.runtimeGeosetPtr);
+        ioStats.slowestRecordRuntimeGeosetDataPtr =
+            reinterpret_cast<uint64_t>(record.runtimeGeosetDataPtr);
+        ioStats.slowestRecordGeosetIndex = record.geosetIndex;
+        ioStats.slowestRecordObjectKind = uint64_t(record.objectKind);
+      }
     }
 
     ++processed;
@@ -7081,6 +7130,8 @@ size_t ShadowRendererCore::buildFrameChunk(
                                            : resource.modelKey;
         supplemental.jHandle = attachment.jHandle;
         supplemental.rawcode = attachment.rawcode;
+        supplemental.pathBlocker =
+            dxvk::war3::internal::IsPathBlockerFourCc(supplemental.rawcode);
         supplemental.geosetIndex = resource.geosetIndex;
         supplemental.frameSerial = manifest.frameSerial;
         supplemental.objectKind =
@@ -7117,14 +7168,19 @@ size_t ShadowRendererCore::buildFrameChunk(
            ioStats.attachmentRigidSupplementalResolvedCount <
                maxSupplementalAttachmentResolvedPerFrame;
            ++geosetIndex) {
-        ShadowModelResourceRecord resource = {};
-        if (resources.findByRuntimeModel(attachment.childRuntimeModelPtr,
-                                         geosetIndex, resource) ||
-            (attachment.childModelResourcePtr != nullptr &&
-             resources.findByModelResource(attachment.childModelResourcePtr,
-                                           geosetIndex, resource))) {
-          tryAppendAttachmentResource(resource);
-        }
+        // 2026-07-21 优化：指针版 find，避免最多 128 轮 × 2 次按值拷贝
+        // 含 7+ vector 的 ShadowModelResourceRecord；命中时把 store 内
+        // 记录直接以 const& 传给 tryAppendAttachmentResource，全程零拷贝。
+        // store 快照生命周期覆盖本循环内的 packet 消费。
+        const ShadowModelResourceRecord* resource =
+            resources.findByRuntimeModel(attachment.childRuntimeModelPtr,
+                                         geosetIndex);
+        if (resource == nullptr &&
+            attachment.childModelResourcePtr != nullptr)
+          resource = resources.findByModelResource(
+              attachment.childModelResourcePtr, geosetIndex);
+        if (resource != nullptr)
+          tryAppendAttachmentResource(*resource);
       }
 
       for (const auto& resource : resources.records()) {
@@ -7223,9 +7279,15 @@ bool ShadowRendererCore::resolveRecord(const ShadowRenderableRecord& record,
   };
   struct ResolvePhaseTimer {
     uint64_t& targetUs;
-    std::chrono::steady_clock::time_point startedAt =
-        std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point startedAt;
+    bool active = RendererCoreTimingProbeEnabled();
+    explicit ResolvePhaseTimer(uint64_t& target) : targetUs(target) {
+      if (active)
+        startedAt = std::chrono::steady_clock::now();
+    }
     ~ResolvePhaseTimer() {
+      if (!active)
+        return;
       const uint64_t elapsedUs = static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now() - startedAt)

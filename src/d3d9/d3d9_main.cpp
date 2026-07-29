@@ -35,6 +35,31 @@ HRESULT CreateD3D9(bool Extended, IDirect3D9Ex **ppDirect3D9Ex,
 namespace {
 
 std::atomic<bool> g_warVkDirectLoadBootstrapStarted{false};
+std::atomic<uint32_t> g_d3d9CreateTraceOrdinal{0u};
+
+void TraceD3D9Create(const char *phase, uint32_t ordinal,
+                     const void *result = nullptr,
+                     HRESULT hr = S_OK) {
+  // 仅用于启动期死锁取证；固定栈缓冲，不在帧热路径执行。
+  if (ordinal == 0u || ordinal > 4u)
+    return;
+  // 兼容旧取证器：历史前缀只在 API 入口出现一次，返回标记仅使用新格式。
+  const char *prefix = phase && std::strcmp(phase, "entry") == 0
+      ? "DXVK: Direct3DCreate9 called; "
+      : "DXVK ";
+  char buffer[256] = {};
+  std::snprintf(
+      buffer, sizeof(buffer),
+      "%sW3START pid=%lu tid=%lu tick=%llu "
+      "comp=D3D9Create ord=%u "
+      "phase=%s object=%p hr=0x%08lx\n",
+      prefix,
+      static_cast<unsigned long>(::GetCurrentProcessId()),
+      static_cast<unsigned long>(::GetCurrentThreadId()),
+      static_cast<unsigned long long>(::GetTickCount64()), ordinal,
+      phase ? phase : "<null>", result, static_cast<unsigned long>(hr));
+  ::OutputDebugStringA(buffer);
+}
 
 void AppendWarVkBootstrapMarker(const char *phase, const char *source) {
   char tempPath[MAX_PATH] = {};
@@ -168,9 +193,12 @@ DLLEXPORT void __stdcall Initialize(void) {
 }
 
 DLLEXPORT IDirect3D9 *__stdcall Direct3DCreate9(UINT nSDKVersion) {
-  OutputDebugStringA("DXVK: Direct3DCreate9 called\n");
+  const uint32_t ordinal =
+      g_d3d9CreateTraceOrdinal.fetch_add(1u, std::memory_order_relaxed) + 1u;
+  TraceD3D9Create("entry", ordinal);
   IDirect3D9Ex *pDirect3D = nullptr;
-  dxvk::CreateD3D9(false, &pDirect3D, nullptr, 0);
+  const HRESULT hr = dxvk::CreateD3D9(false, &pDirect3D, nullptr, 0);
+  TraceD3D9Create("return", ordinal, pDirect3D, hr);
 
   return pDirect3D;
 }

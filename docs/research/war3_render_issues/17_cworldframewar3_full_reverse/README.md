@@ -4,6 +4,17 @@
 > 目标版本：Warcraft III 1.27a（`Game.dll` 基址 `0x6F000000`）  
 > 专题标记：`【CWorldFrameWar3专题】`（文档简写：`【CWFW3】`）
 
+> 2026-07-15 维护说明：类族 RTTI、对象大小、逐槽 ABI、字段证据与历史冲突已转入
+> [30_cworld_class_family_full_reverse](../30_cworld_class_family_full_reverse/README.md)。本页保留
+> WorldFrame 主链研究历史；其中 group 0/1/2 的 gameplay 分类、`+0x19C camera`、旧
+> `+0x1D4..+0x1E0` world-rect 自然名和 `+0x53C..+0x65F` tail taxonomy 均不得作为
+> Confirmed；30 号卷第19~21批已 supersede 本页旧字段表。IDA 中三个 canonical 名现为
+> `CWorldFrameWar3_RenderScene/DispatchStage/RenderWorldGroup`。另：`0x6F184EE0` 已由 record
+> load、RTTI 与五张 raw vtable 闭合为 `CSprite_PrepareAndQueueAttachedRenderObject(CSprite*)`；
+> 本页旧 `WorldObjectEntry`/slot5=PreRender 解释已被 30 号文档第18批 supersede。下文所有
+> `CWorld_*` 仅是历史搜索名；`0x6F76F060` 的 canonical owner 是
+> `RenderGlobalPass_DispatchBySelector(int selector)`，不是 TerrainShadow thiscall。
+
 ## 1. 结论先行
 
 `CWorldFrameWar3` 不是“单一渲染器类”，而是一个同时承担以下职责的世界视口中枢对象：
@@ -20,7 +31,9 @@
 2. 主虚表位于 `0x6F98DCD0`，共 `57` 个槽位；`CLayoutFrame` 子对象虚表位于 `0x6F98DDB8`，共 `9` 个槽位，子对象偏移 `+0xB4`。
 3. `CWorld_RenderScene(0x6F3681C0)` 就是 `CWorldFrameWar3` 的虚表槽位 `12`。
 4. `CWorld_DispatchStage(0x6F363020)` 不是全局“世界渲染器”，而是由 `CWorldFrameWar3` 持有状态并驱动的 stage 分发器。
-5. 已有 `war3_game_struct.h` 对 `0x19C camera`、`0x1D4~0x1E0 world rect`、`0x300` 一批字段方向并不失真；本轮已继续把 `0x1A4~0x1C8`、`0x53C~0x598`、`0x644~0x648`、`0x660~0x664` 等高置信字段落回共享头和 `native` 头。
+5. 当前 authoritative 字段裁决是：`+0x19C` 只证明 retained runtime object（动态类 Unknown），
+   `+0x1D4..+0x1E0` 只证明 `float[4]` storage，`+0x1F8/+0x214` 各是 `0x1C` embedded
+   footprint；完整表以 30 号卷为准。
 
 ## 2. 证据基线
 
@@ -80,9 +93,9 @@ flowchart TD
   B --> C["世界状态更新<br/>sub_6F368480"]
   C --> D["CWorld_RenderScene"]
   D --> E["CWorld_DispatchStage"]
-  E --> F["CWorld_TerrainShadow_Dispatch"]
+  E --> F["RenderGlobalPass_DispatchBySelector"]
   E --> G["CWorld_WorldObjects_RenderGroup"]
-  G --> H["WorldObjectEntry_Render"]
+  G --> H["CSprite_PrepareAndQueueAttachedRenderObject"]
   H --> I["RenderBatch_Submit"]
   I --> J["RenderQueue_AddBatch"]
   D --> K["RenderQueue_FlushAndReset"]
@@ -159,9 +172,12 @@ flowchart TD
 
 高价值字段证据：
 
-1. `this+0x19C`：被当成对象指针使用，读取 `+52` 成员参与后续世界对象/句柄更新，和现有 `CCameraWar3* camera` 注释相容。
+1. `this+0x19C`：retained/refcounted runtime object；读取其成员参与更新，但当前没有 RTTI
+   证据把动态类闭合为 `CCameraWar3`。
 2. `this+0x300`：默认 `-1`，被 `sub_6F76F540 / sub_6F76F190` 这类 terrain 相关函数消费，不是普通 UI flag。
-3. `this+0x354/0x358/0x35C`：与 stage0 条件联动，明显是某个世界特效/指示器对象及其激活状态。
+3. `this+0x348..0x35C`：`+0x348` 是保存模型路径的 embedded `RCString`；`+0x354`
+   是 strong pooled `CSpriteUber_` leaf，`+0x358` 是 stage-0 enable gate，`+0x35C`
+   是本帧 visibility/pre-render prepare 返回值。公开业务枚举名仍 Unknown。
 4. `this+0x398/0x39C`：构造时写入 `"ScaledAnimTime"` / `"DayHours"` 配置键。
 
 ### 5.2 Stage 分发器：`RenderWorld_DispatchStage`
@@ -173,7 +189,9 @@ flowchart TD
 
 `RenderWorld_DispatchStage` 先比较并切换这两个状态，再按 stage 号分流：
 
-1. `1/2/3/4/5/6/7/8/9/10/14/17/19/20/21` 主要走 `CWorld_TerrainShadow_Dispatch` 的不同子通道。
+1. `1/2/3/4/5/6/7/8/9/10/14/17/19/20/21` 主要走
+   `RenderGlobalPass_DispatchBySelector` 的不同 selector；其中至少 selector13 为 TextTag，
+   不能把 global selector 统一归成 TerrainShadow。
 2. `11/12/13` 走 `CWorld_WorldObjects_RenderGroup`。
 3. `16` 是复杂的 feature-bit 组合 stage，会进入 `sub_6F368A90` 和 `sub_6F369560`。
 4. `18` 处理额外 world/UI bridge 收尾。
@@ -281,35 +299,37 @@ flowchart TD
 |---|---|---|---|
 | `0x000` | `vfptr_primary` | 主虚表 `0x6F98DCD0` | 已证实 |
 | `0x0B4` | `vfptr_CLayoutFrame` | 次虚表 `0x6F98DDB8` | 已证实 |
-| `0x16C` | `worldObjectGroup0` | `CWorld_WorldObjects_RenderGroup(group0)` | 已证实 |
-| `0x170` | `worldObjectGroup1` | `CWorld_WorldObjects_RenderGroup(group1)` | 已证实 |
-| `0x174` | `worldObjectGroup2` | `CWorld_WorldObjects_RenderGroup(group2)` | 已证实 |
-| `0x19C` | `camera` | 现有 header + `sub_6F368480` 交叉使用 | 高置信 |
-| `0x1D4` | `worldMinY` | 现有 `war3_game_struct.h` | 高置信 |
-| `0x1D8` | `worldMinX` | 现有 `war3_game_struct.h` | 高置信 |
-| `0x1DC` | `worldMaxY` | 现有 `war3_game_struct.h` | 高置信 |
-| `0x1E0` | `worldMaxX` | 现有 `war3_game_struct.h` | 高置信 |
-| `0x1F8` | `rallyIndexCountA` | ctor 默认 `12`，`sub_6F368E90` 用于 `sub_6F36E8E0` | 推测 |
-| `0x214` | `rallyIndexCountB` | ctor 默认 `12` | 推测 |
-| `0x2F8` | `groundIndicatorModeA` | `sub_6F368D60` / `sub_6F3679A0` | 推测 |
-| `0x2FC` | `groundIndicatorActive` | `sub_6F3679A0/367A90` 设置 | 高置信 |
-| `0x300` | `indicatorImageHandle` | 现有 header + `sub_6F76F540/76F190` 消费 | 高置信 |
-| `0x30C` | `rangeTintRuntimeHandle` | `sub_6F3621E0` 在 group1 上使用 | 推测 |
-| `0x31C` | `activeQueue` | `CWorld_RenderScene` 直接读此字段 | 已证实 |
-| `0x320` | `worldPickDisabled` | `sub_6F367C70` 早退 | 高置信 |
-| `0x324` | `enableStage17` | `CWorld_RenderScene` 条件调度 stage17 | 高置信 |
-| `0x328` | `clickFilterMaskA` | `sub_6F367C70` 参与点击分类过滤 | 高置信 |
-| `0x330` | `clickFilterMaskB` | ctor 默认 1，点击路径使用 | 推测 |
-| `0x334` | `terrainFogObject` | ctor `sub_6F191320` + `sub_6F36C390` | 高置信 |
-| `0x338` | `dncTerrainModel` | `sub_6F366F10` 创建 / `StateCleanup` 使用 | 高置信 |
-| `0x33C` | `dncUnitModel` | `sub_6F366F10` 创建 / `StateCleanup` 使用 | 高置信 |
-| `0x340` | `extraEnvironmentObject` | ctor `sub_6F1913B0` | 推测 |
-| `0x354` | `stage0WorldObject` | `CWorld_RenderScene` 的 stage0 条件对象 | 高置信 |
-| `0x358` | `stage0Enabled` | stage0 条件开关 | 高置信 |
-| `0x35C` | `stage0RuntimeState` | `sub_6F184F00(this+0x354, ...)` 的结果 | 高置信 |
-| `0x370` | `rallyRuntimeArrayMeta` | dtor 调 `sub_6F35FF00` | 推测 |
-| `0x378` | `rallyIndicatorSortKeys` | ctor/dtor/`sub_6F367040` | 高置信 |
-| `0x388` | `scaledAnimTimeDirty` | ctor 默认 1 | 推测 |
+| `0x16C` | `worldObjectGroup0` | `CWorldFrameWar3_RenderWorldGroup(group0)` | 已证实 |
+| `0x170` | `worldObjectGroup1` | `CWorldFrameWar3_RenderWorldGroup(group1)` | 已证实 |
+| `0x174` | `worldObjectGroup2` | `CWorldFrameWar3_RenderWorldGroup(group2)` | 已证实 |
+| `0x178` | borrowed `CGameWar3*` | lazy global `0x6FBE4238` 的 exact writer | 已证实 |
+| `0x184/0x188` | game-ordinal object / `game+0x34` borrowed publication | `0x6F3618F0` raw ASM | 来源已证；具体类型 Unknown |
+| `0x198/0x1F4` | zero-extended game ordinal / `uint16(1<<ordinal)` | exact writer 与 indicator tail caller | 已证实 |
+| `0x19C` | retained runtime object | dtor release；动态类无 RTTI 证据 | ownership 已证；type Unknown |
+| `0x1D4..0x1E3` | `float[4]` storage | 逐分量 reader/writer | width/type 已证；自然名 Unknown |
+| `0x1F8..0x213` | embedded metadata/container A | `0x1C` footprint，mode 0 initializer | footprint 已证；type Unknown |
+| `0x214..0x22F` | embedded metadata/container B | `0x1C` footprint，mode 1 initializer | footprint 已证；type Unknown |
+| `0x248` | build-hover / hit-test gate | secondary hit-test publish/clear | 已证实 |
+| `0x250` | borrowed active `CBuildFrame*` | stage18 producer/consumer RTTI | 已证实 |
+| `0x254..0x2F7` | embedded `CCinematicFilter` | TD/COL/vtable、ctor/dtor、next-field boundary | 已证实，size `0xA4` |
+| `0x2F8` | strong runtime-object wrapper | replacement/dtor release | ownership 已证；type Unknown |
+| `0x2FC/0x300` | TerrainImage gate / signed CTerrain registry index | stage21 exact consumer | 已证实 |
+| `0x31C` | `activeQueue` | `CWorldFrameWar3_RenderScene` 直接读此字段 | 已证实 |
+| `0x320/0x324/0x328/0x330` | interaction/scene gates | exact branch readers | offsets 已证；业务名部分 Unknown |
+| `0x32C` | borrowed `CGameWar3+0x3C0` publication | `0x6F3618F0` exact store | 来源已证；`CGameUI*` 仅推断 |
+| `0x334` | owned strong `CFog*` | `CFog_Create @ 0x6F191320`，size `0xD4`、vptr `0x6F964ADC` | type/ownership/config source 已证 |
+| `0x338/0x33C` | owned strong terrain/unit DNC pooled Uber sprites | `CWorldFrameWar3_InitDncSpriteResources @ 0x6F366F10` | exact pooled leaf vptr `0x6F96485C` |
+| `0x340` | owned strong `CLight*` | default `CLight_Create @ 0x6F1913B0`，size `0xDC`、vptr `0x6F964B08` | exact base `CLight`；不是 `COmniLight` |
+| `0x344` | `Unknown[4]` | 已知 WorldFrame ASM 无静态读写，ctor 不初始化 | 禁止称 padding |
+| `0x348..0x350` | embedded `RCString` | stage-0 sprite model path | type/use/lifetime 已证 |
+| `0x354` | owned strong stage-0 pooled Uber sprite | setter `0x6F36D620` 固定 `useUber=1` | dynamic vptr `0x6F96485C` |
+| `0x358/0x35C` | stage-0 enable gate / last prepare result | RenderScene reader；slot11 producer | storage/branch role 已证；公开名 Unknown |
+| `0x360..0x36C` | `CPathingMapIndicator` strong-ref vector | `{capacity,count,data,growthQuantum}` | layout/reallocate/destroy 已证 |
+| `0x370..0x378` | `TargetIndicatorVector` | `{capacity,count,data}`，record stride `0x18`，ctor resize 8 | layout/ownership 已证 |
+| `0x37C` | TargetIndicator ring cursor | 两个 producer 均执行 `(cursor+1)&7` | formula/storage 已证 |
+| `0x380/0x384` | two float periodic accumulators | raw threshold `3.0f`；各有独立 producer/settlement | type/formula 已证；业务单位 Unknown |
+| `0x388` | periodic-maintenance-due latch | ctor/外部/threshold producer，maintenance consumer | mechanical role 已证；维护 taxonomy 部分 Unknown |
+| `0x38C` | one-shot refresh pending latch | 多个 producer；terrain extra pass/callback consumer | mechanical role已证；异常清理语义 Unknown |
 | `0x390` | `scaledAnimTimeAccum` | `sub_6F368480` 直接累加 | 已证实 |
 | `0x394` | `dayHoursOrInfinitySeed` | ctor 置 `INF`，后续被采样 | 高置信 |
 | `0x398` | `cfgScaledAnimTime` | ctor 写 `"ScaledAnimTime"` | 已证实 |
@@ -317,26 +337,14 @@ flowchart TD
 | `0x3A0` | `cfgColorFriend` | ctor 写 `"ColorFriend"` | 已证实 |
 | `0x3A4` | `cfgColorNeutral` | ctor 写 `"ColorNeutral"` | 已证实 |
 | `0x3A8` | `cfgColorEnemy` | ctor 写 `"ColorEnemy"` | 已证实 |
-| `0x53C` | `rallyDstCapacity` | ctor/`sub_6F367040` | 高置信 |
-| `0x540` | `rallyDstCount` | ctor/`sub_6F367040` | 高置信 |
-| `0x544` | `rallyDstArray` | ctor/`sub_6F367040` | 高置信 |
-| `0x588` | `targetPointConfirm` | `sub_6F367170` | 已证实 |
-| `0x594` | `waypointIndicatorCount` | ctor/dtor/`sub_6F3671C0` | 已证实 |
-| `0x598` | `waypointIndicatorArray` | ctor/dtor/`sub_6F3671C0` | 已证实 |
-| `0x5A4` | `pendingHookCountA` | `sub_6F368E90` 批处理回调数组 | 推测 |
-| `0x5A8` | `pendingHookArrayA` | `sub_6F368E90` | 推测 |
-| `0x5B4` | `pendingHookCountB` | `sub_6F368E90` | 推测 |
-| `0x5B8` | `pendingHookArrayB` | `sub_6F368E90` | 推测 |
-| `0x5C4` | `pendingHookCountC` | `sub_6F368E90` | 推测 |
-| `0x5C8` | `pendingHookArrayC` | `sub_6F368E90` | 推测 |
-| `0x5E4` | `debugToggleA` | `sub_6F368E90` 从热键读取 | 推测 |
-| `0x5F0` | `debugToggleB` | `sub_6F368E90` 从热键读取 | 推测 |
-| `0x63C` | `auxCounterA` | ctor/dtor 初始化与清理 | 推测 |
-| `0x640` | `auxCounterB` | ctor/dtor 初始化与清理 | 推测 |
-| `0x644` | `deferredSelectionCount` | `sub_6F368E00` | 已证实 |
-| `0x648` | `deferredSelectionArray` | `sub_6F368E00` | 已证实 |
-| `0x660` | `currentRenderMode` | `RenderWorld_DispatchStage` | 已证实 |
-| `0x664` | `currentRenderCategory` | `RenderWorld_DispatchStage` | 已证实 |
+| `0x3B0..0x53B` | `RallyIndicatorSmallVector16` | header + inline 16×`0x18` records | 已证实 |
+| `0x53C..0x587` | `Int32SmallVector16` | header + inline `int32_t[16]` | 已证实 |
+| `0x588/0x58C` | RallyIndicator source / TargetPointConfirm runtime refs | ctor/init/dtor/refresh | ownership/role 已证；动态类 Unknown |
+| `0x590..0x59C` | WaypointIndicator vector + ring cursor | capacity `0x100`，stride `0x1C`，cursor `&0xFF` | 已证实 |
+| `0x5A0..0x5FF` | 六个 raw-pointer vectors | Unit/Destructable/Item/CaptainAI/EffectImagePos/GhostImage descriptors | backing owned、elements borrowed |
+| `0x600..0x65F` | 六个 `CAgentPtr<T>` vectors | Unit/Item/Unit/Selectable/Widget/GhostImage descriptors | backing 与 refs owned |
+| `0x660` | `currentRenderMode` | `CWorldFrameWar3_DispatchStage` | 已证实 |
+| `0x664` | `currentRenderCategory` | `CWorldFrameWar3_DispatchStage` | 已证实 |
 
 ## 9. 关键函数深拆
 
@@ -366,7 +374,8 @@ flowchart TD
 这个函数是 `CWorldFrameWar3` 运行时资源回收中心，释放：
 
 1. 地面/世界对象句柄数组。
-2. `0x334/0x338/0x33C/0x340/0x354/0x358` 一带环境/特效对象。
+2. exact strong resources `0x334 CFog`、`0x338/0x33C` DNC pooled Uber sprites、
+   `0x340 CLight`、`0x354` stage-0 pooled Uber sprite；`0x358` 只是 gate，不是对象。
 3. Waypoint/Rally 相关数组和临时数据。
 
 它说明 `CWorldFrameWar3` 并不是只保存轻量状态，而是直接拥有一批重对象。
@@ -414,7 +423,7 @@ classDiagram
   class CLayoutFrame
   class CGameUI
   class CWorldFrameWar3
-  class CCameraWar3
+  class CCinematicFilter
   class CTerrainClickEvent
   class CSpriteClickEvent
   class CGhostSpriteClickEvent
@@ -427,7 +436,7 @@ classDiagram
   CWorldFrameWar3 --|> TRefCnt
   CWorldFrameWar3 ..> CLayoutFrame : secondary vftable @ +0xB4
   CGameUI --> CWorldFrameWar3 : owns @ +0x3BC
-  CWorldFrameWar3 --> CCameraWar3 : field @ +0x19C
+  CWorldFrameWar3 *-- CCinematicFilter : embedded @ +0x254, size 0xA4
   CWorldFrameWar3 ..> CTerrainClickEvent : build/dispatch
   CWorldFrameWar3 ..> CSpriteClickEvent : build/dispatch
   CWorldFrameWar3 ..> CGhostSpriteClickEvent : build/dispatch
@@ -437,8 +446,9 @@ classDiagram
 
 补充说明：
 
-1. `RenderQueue`、`WorldObjectEntry_Render`、`CWorld_TerrainShadow_Dispatch` 当前在本专题里属于“函数级/子系统级”对象，而不是基于 RTTI 明确落名的类，因此不放进“精确类图”。
-2. 如果后续在 IDA 中找到这些对象的 RTTI，再升级类图。
+1. `RenderQueue` 仍按函数级/子系统级处理；`0x6F184EE0` 的 receiver 已升级为精确 `CSprite*`，
+   但 `sprite+0x20` attached render object 的精确动态类仍 Unknown。
+2. 历史 `WorldObjectEntry_Render` 名仅保留作旧 telemetry/search alias，不再代表独立 RTTI 类。
 
 ## 11. 与仓库旧结论的对齐和纠偏
 
@@ -483,7 +493,7 @@ classDiagram
 11. `sub_6F3679A0` -> `CWorldFrameWar3_OnShowWorldFrame`
 12. `sub_6F367A90` -> `CWorldFrameWar3_OnHideWorldFrame`
 13. `sub_6F367040` -> `CWorldFrameWar3_InitRallyIndicators`
-14. `sub_6F367170` -> `CWorldFrameWar3_InitTargetPointConfirmSprite`
+14. `sub_6F367170` -> `CWorldFrameWar3_InitTargetPointConfirm`
 15. `sub_6F3671C0` -> `CWorldFrameWar3_InitWaypointIndicators`
 16. `sub_6F368D60` -> `CWorldFrameWar3_UpdateIndicatorAnchor`
 17. `sub_6F368E90` -> `CWorldFrameWar3_RunDeferredWorldCallbacks`
@@ -500,14 +510,14 @@ classDiagram
 
 1. `0x6F98DCD0` 主 vtable
 2. `0x6F98DDB8` `CLayoutFrame` 子 vtable
-3. `0x6F3681C0` `CWorld_RenderScene`
-4. `0x6F363020` `CWorld_DispatchStage`
-5. `0x6F368E30` `CWorld_WorldObjects_RenderGroup`
-6. `0x6F76F060` `CWorld_TerrainShadow_Dispatch`
+3. `0x6F3681C0` `CWorldFrameWar3_RenderScene`
+4. `0x6F363020` `CWorldFrameWar3_DispatchStage`
+5. `0x6F368E30` `CWorldFrameWar3_RenderWorldGroup`
+6. `0x6F76F060` `RenderGlobalPass_DispatchBySelector`
 
 本轮继续补写回的函数与中文作用：
 
-1. `0x6F184EE0` -> `WorldObjectEntry_PreRenderAndEnqueue`
+1. `0x6F184EE0` -> `CSprite_PrepareAndQueueAttachedRenderObject`（2026-07-15 canonical；旧名 superseded）
 2. `0x6F0CB480` -> `WorldObjectList_RenderEntries`
 3. `0x6F363350` -> `CWorldFrameWar3_ApplyCategoryMode`
 4. `0x6F191300` -> `RenderStateObserver_OnEnable`
@@ -541,7 +551,9 @@ classDiagram
 
 ## 13. 下一步
 
-1. 继续向 `0x178~0x214` 和 `0x334~0x35C` 一带追精确类型，把“推测字段”压到最少。
+1. `+0x334..+0x38C` 的对象类型、两个 vector header、ring cursor 与周期 latch 已闭合；继续追
+   `TargetIndicator` record 的公开业务字段、`+0x344` 与更早 borrowed/retained pointee，Unknown
+   必须继续显式保留。
 2. 单独拆 `stage16`，确认它到底对应哪些世界覆盖层。
 3. 为 `CTerrainClickEvent / CSpriteClickEvent / CSpriteTrackEvent` 再补一页专题，把世界窗口交互链闭环。
 4. 如果后续补到 `RenderQueue` / `WorldObjectEntry` RTTI，再升级类图和对象图。

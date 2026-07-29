@@ -1665,6 +1665,12 @@ worldPos.xyz += normalW * gOutlineParams.x;</code></pre>
             <tr><td><code>bool SetShadowRimPower(float power)</code></td><td>轮廓光指数（越大边缘越细）</td></tr>
             <tr><td><code>bool SetPointLightsEnabled(bool enabled)</code></td><td>启用/禁用点光源</td></tr>
             <tr><td><code>bool SetPointShadowEnabled(bool enabled)</code></td><td>启用/禁用点光源阴影</td></tr>
+            <tr><td><code>bool SetPointShadowBias(float bias)</code></td><td>设置点光源阴影深度偏移</td></tr>
+            <tr><td><code>bool SetVolumetricLightEnabled(bool enabled)</code></td><td>启用/禁用体积光 pass</td></tr>
+            <tr><td><code>bool SetVolumetricLightParams(float intensity, float density, float weight, float decay, uint32_t sampleCount)</code></td><td>设置体积光强度、密度、权重、衰减与采样数</td></tr>
+            <tr><td><code>bool SetVolumetricLightFade(float fadeNear, float fadeFar, float maxRayDistance)</code></td><td>设置体积光屏幕径向淡出与最大射线距离</td></tr>
+            <tr><td><code>bool SetVolumetricHeightFog(float baseHeight, float falloff, float strength)</code></td><td>设置体积光高度雾参数</td></tr>
+            <tr><td><code>bool SetVolumetricResolutionDivisor(uint32_t divisor)</code></td><td>设置体积光低分辨率 effect buffer 比例（1..4，默认 4）</td></tr>
             <tr><td><code>bool SetOutlineEnabled(bool enabled)</code></td><td>启用/禁用描边</td></tr>
             <tr><td><code>bool SetOutlineWidth(float widthPx)</code></td><td>描边宽度（像素）</td></tr>
             <tr><td><code>bool SetOutlineColor(float r, float g, float b, float a)</code></td><td>描边颜色 (rgba)</td></tr>
@@ -1698,7 +1704,11 @@ worldPos.xyz += normalW * gOutlineParams.x;</code></pre>
           <tbody>
             <tr><td><code>int32_t AddPointLight(float x, float y, float z, float range, float r, float g, float b, float intensity, float shadowIntensity)</code></td><td>创建点光源并返回 ID</td></tr>
             <tr><td><code>bool UpdatePointLight(int32_t id, float x, float y, float z, float range, float r, float g, float b, float intensity)</code></td><td>更新点光源参数</td></tr>
+            <tr><td><code>bool UpdatePointLightEx(int32_t id, float x, float y, float z, float range, float r, float g, float b, float intensity, float shadowIntensity)</code></td><td>更新点光源参数并同步更新阴影强度</td></tr>
+            <tr><td><code>bool SetPointLightShadowIntensity(int32_t id, float shadowIntensity)</code></td><td>单独设置指定点光源的阴影强度</td></tr>
             <tr><td><code>bool RemovePointLight(int32_t id)</code></td><td>移除点光源</td></tr>
+            <tr><td><code>void ClearPointLights()</code></td><td>清空全部点光源</td></tr>
+            <tr><td><code>uint32_t GetPointLightCount()</code></td><td>查询当前点光源数量</td></tr>
           </tbody>
         </table>
 
@@ -1808,6 +1818,34 @@ war3shader::UnregisterRenderEvent(id);</code></pre>
             <tr><td><code>DXVK_SetShadowRimPower</code></td><td><code>(R)B</code></td><td>轮廓光指数（越大边缘越细）</td></tr>
             <tr><td><code>DXVK_SetPointLightsEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用点光源</td></tr>
             <tr><td><code>DXVK_SetPointShadowEnabled</code></td><td><code>(B)B</code></td><td>启用/禁用点光源阴影</td></tr>
+          </tbody>
+        </table>
+
+        <h3>JASS Command Bridge（字符串命令）</h3>
+        <p>以下命令通过 JASS command bridge 调用，参数使用竖线分隔；它们不是上表的 MemHack Native 签名。</p>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>命令</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>add-point-light|x|y|z|range|r|g|b|intensity|shadowIntensity</code></td><td>创建点光源，返回 ID</td></tr>
+            <tr><td><code>update-point-light|id|x|y|z|range|r|g|b|intensity</code></td><td>更新点光源基础参数</td></tr>
+            <tr><td><code>update-point-light-ex|id|x|y|z|range|r|g|b|intensity|shadowIntensity</code></td><td>更新点光源并同步阴影强度</td></tr>
+            <tr><td><code>set-point-light-shadow|id|shadowIntensity</code></td><td>调整指定点光源阴影强度</td></tr>
+            <tr><td><code>remove-point-light|id</code></td><td>移除指定点光源</td></tr>
+            <tr><td><code>clear-point-lights</code></td><td>清空全部点光源</td></tr>
+            <tr><td><code>get-point-light-count</code></td><td>返回当前点光源数量</td></tr>
+            <tr><td><code>set-point-lights-enabled|true/false</code></td><td>启用/禁用点光源 receiver</td></tr>
+            <tr><td><code>set-point-shadow-enabled|true/false</code></td><td>启用/禁用点光源 cube shadow</td></tr>
+            <tr><td><code>set-point-shadow-bias|bias</code></td><td>设置点光源阴影偏移</td></tr>
+            <tr><td><code>set-volumetric-light-enabled|true/false</code></td><td>启用/禁用体积光 pass</td></tr>
+            <tr><td><code>set-volumetric-light-params|intensity|density|weight|decay|samples</code></td><td>设置体积光核心参数</td></tr>
+            <tr><td><code>set-volumetric-light-fade|fadeNear|fadeFar|maxRayDistance</code></td><td>设置体积光淡出距离</td></tr>
+            <tr><td><code>set-volumetric-height-fog|baseHeight|falloff|strength</code></td><td>设置体积光高度雾</td></tr>
+            <tr><td><code>set-volumetric-resolution-divisor|1..4</code></td><td>设置体积光 effect buffer 分辨率比例，默认 4</td></tr>
           </tbody>
         </table>
 

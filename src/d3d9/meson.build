@@ -14,6 +14,28 @@ d3d9_shaders = files([
 
 d3d9_shaders += war3fx_shaders
 
+# War3 GPU 蒙皮使用独立的 fixed-function VS 变体。stock shader 仍由通用
+# generator 原样生成，避免所有 D3D9 fixed-function draw 都承担私有 binding 契约。
+d3d9_war3_gpu_skin_ff_vs_args = [
+  '--quiet',
+  '--target-env', 'vulkan1.3',
+  '--vn', 'd3d9_war3_gpu_skin_fixed_function_vert',
+  '--depfile', '@DEPFILE@',
+  '-DD3D9_WAR3_GPU_SKIN=1',
+  '@INPUT@',
+  '-o', '@OUTPUT@',
+]
+if get_option('debug')
+  d3d9_war3_gpu_skin_ff_vs_args += ['-gVS']
+endif
+d3d9_war3_gpu_skin_ff_vs = custom_target(
+  'd3d9_war3_gpu_skin_fixed_function_vert',
+  input   : 'shaders/d3d9_fixed_function_vert.vert',
+  output  : 'd3d9_war3_gpu_skin_fixed_function_vert.h',
+  depfile : 'd3d9_war3_gpu_skin_fixed_function_vert.h.d',
+  command : [glsl_compiler] + d3d9_war3_gpu_skin_ff_vs_args,
+)
+
 d3d9_src = [
   'd3d9_main.cpp',
   'd3d9_interface.cpp',
@@ -59,6 +81,8 @@ d3d9_src = [
   'd3d9_war3_shadow.cpp',
   'd3d9_war3_shadow_resources.cpp',
   'd3d9_war3_shadow_outline.cpp',
+  'd3d9_war3_volumetric_light.cpp',
+  'war3/render/war3_hybrid_ray_tracing.cpp',
   'd3d9_war3_ssao.cpp',
   'war3_shader_api.cpp',
   'war3_shaderpack.cpp',
@@ -83,11 +107,14 @@ d3d9_src = [
   'war3/memory/tlsf.c',
   'war3/memory/war3_tlsf_pool.cpp',
   'war3/memory/war3_storm_hook.cpp',
+  'war3/memory/war3_storm_native_small_repair.cpp',
   'war3/memory/war3_shadow_arena.cpp',
   'war3/handle/war3_handle_resolver.cpp',
   'war3/render/war3_render_objects.cpp',
   'war3/render/war3_render_identity_bridge.cpp',
   'war3/render/war3_shadow_runtime_bridge.cpp',
+  'war3/render/war3_shadow_lifecycle.cpp',
+  'war3/render/war3_shadow_producer_policy.cpp',
   'war3/render/war3_current_draw_contract.cpp',
   'war3/render/war3_scene_collector.cpp',
   'war3/render/war3_renderer.cpp',
@@ -107,6 +134,7 @@ d3d9_src = [
   'war3/state/war3_render_state.cpp',
   'war3/debug/war3_debug.cpp',
   'war3/tools/war3_perf_monitor.cpp',
+  'war3/tools/war3_resource_residency_census.cpp',
   'war3/tools/war3_diagnostics_hub.cpp',
   'war3/tools/war3_control_plane.cpp',
   'war3/tools/war3_frame_capture.cpp',
@@ -116,6 +144,11 @@ d3d9_src = [
   'war3/model/war3_model_hook.cpp',
   'war3/model/war3_model_resource_cache.cpp',
   'war3/model/war3_model_registry.cpp',
+  'war3/gpu_skin/war3_gpu_skin_compute.cpp',
+  'war3/gpu_skin/war3_cpu_skin_mt.cpp',
+  'war3/gpu_skin/war3_gpu_skin_manager.cpp',
+  'war3/gpu_skin/war3_gpu_skin_native_bridge.cpp',
+  'war3/gpu_skin/war3_gpu_skin_resources.cpp',
   'war3/shadow/war3_shadow_runtime_contract.cpp',
   'war3/shadow/war3_shadow_renderer_core.cpp',
   'war3/shadow/war3_shadow_backend_dxvk.cpp',
@@ -173,7 +206,8 @@ endif
 lib_dwmapi = cpp.find_library('dwmapi')
 lib_dbghelp = cpp.find_library('dbghelp')
 
-d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src, glsl_generator.process(d3d9_shaders), d3d9_res,
+d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
+  glsl_generator.process(d3d9_shaders), d3d9_war3_gpu_skin_ff_vs, d3d9_res,
   dependencies        : [ dxso_dep, dxvk_dep, imgui_dep, lib_dwmapi, lib_dbghelp ],
   include_directories : [ dxvk_include_path, minhook_inc_path ],
   install             : true,

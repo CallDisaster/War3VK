@@ -51,15 +51,32 @@ void AdvanceSmallSemanticBuilds(
 } // namespace
 
 void InitializeRuntimeCore(uintptr_t gameBase) {
+  dxvk::war3dbg::Print(
+      "DXVK War3Bootstrap: 运行时核心初始化开始 gameBase=%p\n",
+      reinterpret_cast<void*>(gameBase));
   if (gameBase != 0) {
+    dxvk::war3dbg::Print("DXVK War3Bootstrap: war3::Initialize 开始\n");
     dxvk::war3::Initialize(gameBase);
+    dxvk::war3dbg::Print("DXVK War3Bootstrap: war3::Initialize 完成\n");
+    dxvk::war3dbg::Print("DXVK War3Bootstrap: ShaderManager reload 开始\n");
     dxvk::war3::ShaderManager::get().reload();
+    dxvk::war3dbg::Print("DXVK War3Bootstrap: ShaderManager reload 完成\n");
   } else {
+    dxvk::war3dbg::Print("DXVK War3Bootstrap: war3::Initialize(auto) 开始\n");
     dxvk::war3::Initialize();
+    dxvk::war3dbg::Print("DXVK War3Bootstrap: war3::Initialize(auto) 完成\n");
   }
 
-  dxvk::war3::NetEventHook::get().init();
+  dxvk::war3dbg::Print("DXVK War3Bootstrap: NetEventHook 初始化开始\n");
+  const bool netEventReady = dxvk::war3::NetEventHook::get().init();
+  dxvk::war3dbg::Print(
+      "DXVK War3Bootstrap: NetEventHook 初始化完成 ready=%d\n",
+      netEventReady ? 1 : 0);
+  dxvk::war3dbg::Print("DXVK War3Bootstrap: 控制平面初始化开始\n");
   dxvk::war3::tools::InitializeWar3ControlPlane();
+  dxvk::war3dbg::Print(
+      "DXVK War3Bootstrap: 控制平面初始化返回 running=%d\n",
+      dxvk::war3::tools::IsWar3ControlPlaneRunning() ? 1 : 0);
 
   if constexpr (dxvk::war3::internal::kWar3StormBreakerEnabled) {
     if (!dxvk::war3::memory::TlsfPool_IsInitialized()) {

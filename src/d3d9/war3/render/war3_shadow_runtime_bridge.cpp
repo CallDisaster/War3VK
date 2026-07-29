@@ -1,4 +1,5 @@
 #include "war3_shadow_runtime_bridge.h"
+#include "../tools/war3_perf_monitor.h"
 
 #include "../../d3d9_war3_hook.h"
 #include "../model/war3_model_hook.h"
@@ -24,6 +25,7 @@
 #include "../state/war3_render_state.h"
 #include "../../util/log/log.h"
 #include "../../util/util_env.h"
+#include "../../util/util_time.h"
 
 #include <algorithm>
 #include <array>
@@ -34,7 +36,9 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -56,6 +60,12 @@ namespace dxvk::war3_diag {
 
 namespace dxvk::war3::render {
 
+thread_local uint64_t
+    g_worldObjectsPhase1PurePeriodicDispatchSequence = 0u;
+thread_local WorldObjectsPhase1DispatchCaptureKind
+    g_worldObjectsPhase1DispatchCaptureKind =
+        WorldObjectsPhase1DispatchCaptureKind::None;
+
 namespace {
 
 enum class SemanticBuildSkippedReason : uint64_t {
@@ -67,6 +77,828 @@ enum class SemanticBuildSkippedReason : uint64_t {
   ConsumerDisabled = 5,
   SceneSubmissionDisabled = 6,
 };
+
+bool SemanticAugmentBatchLookupRuntime() {
+  static const bool s_enabled = [] {
+    const std::string value =
+        env::getEnvVar("DXVK_WAR3_SEMANTIC_AUGMENT_BATCH_LOOKUP");
+    return value.empty() || value != "0";
+  }();
+  return s_enabled;
+}
+
+bool SemanticAugmentCompactShadowViewRuntime() {
+  static const bool s_enabled = [] {
+    const std::string value =
+        env::getEnvVar("DXVK_WAR3_SEMANTIC_AUGMENT_COMPACT_SHADOW_VIEW");
+    return value.empty() || value != "0";
+  }();
+  return s_enabled;
+}
+
+bool SemanticAugmentTlsCacheRuntime() {
+  static const bool s_enabled = [] {
+    const std::string value =
+        env::getEnvVar("DXVK_WAR3_SEMANTIC_AUGMENT_TLS_CACHE");
+    // The first isolated A-B-B-A did not produce a measurable frame-time win
+    // and made ShadowCapture/Gates slightly slower. Keep the experiment
+    // available for follow-up cache-shape work, but do not charge production
+    // frames for an unproven optimization.
+    return !value.empty() && value != "0";
+  }();
+  return s_enabled;
+}
+
+bool SemanticAugmentTlsCacheStatsRuntime() {
+  static const bool s_enabled =
+      env::getEnvVar("DXVK_WAR3_SEMANTIC_AUGMENT_TLS_CACHE_STATS") == "1";
+  return s_enabled;
+}
+
+struct SemanticAugmentModelCacheKey {
+  void* worldObjectEntry = nullptr;
+  void* sceneNode = nullptr;
+  void* primaryUnitPtr = nullptr;
+  void* secondaryUnitPtr = nullptr;
+  uint32_t jHandle = 0u;
+
+  bool operator==(const SemanticAugmentModelCacheKey& other) const noexcept {
+    return worldObjectEntry == other.worldObjectEntry &&
+        sceneNode == other.sceneNode &&
+        primaryUnitPtr == other.primaryUnitPtr &&
+        secondaryUnitPtr == other.secondaryUnitPtr &&
+        jHandle == other.jHandle;
+  }
+};
+
+struct SemanticAugmentShadowCacheKey {
+  void* worldObjectEntry = nullptr;
+  void* sceneNode = nullptr;
+  void* primaryUnitPtr = nullptr;
+  void* secondaryUnitPtr = nullptr;
+  uint32_t jHandle = 0u;
+  void* runtimeModelPtr = nullptr;
+
+  bool operator==(const SemanticAugmentShadowCacheKey& other) const noexcept {
+    return worldObjectEntry == other.worldObjectEntry &&
+        sceneNode == other.sceneNode &&
+        primaryUnitPtr == other.primaryUnitPtr &&
+        secondaryUnitPtr == other.secondaryUnitPtr &&
+        jHandle == other.jHandle &&
+        runtimeModelPtr == other.runtimeModelPtr;
+  }
+};
+
+uint64_t MixSemanticAugmentCacheHash(uint64_t hash,
+                                     uintptr_t value) noexcept {
+  hash ^= uint64_t(value) + 0x9e3779b97f4a7c15ull +
+      (hash << 6u) + (hash >> 2u);
+  return hash;
+}
+
+size_t HashSemanticAugmentCacheKey(
+    const SemanticAugmentModelCacheKey& key) noexcept {
+  uint64_t hash = 0xcbf29ce484222325ull;
+  hash = MixSemanticAugmentCacheHash(
+      hash, reinterpret_cast<uintptr_t>(key.worldObjectEntry));
+  hash = MixSemanticAugmentCacheHash(
+      hash, reinterpret_cast<uintptr_t>(key.sceneNode));
+  hash = MixSemanticAugmentCacheHash(
+      hash, reinterpret_cast<uintptr_t>(key.primaryUnitPtr));
+  hash = MixSemanticAugmentCacheHash(
+      hash, reinterpret_cast<uintptr_t>(key.secondaryUnitPtr));
+  hash = MixSemanticAugmentCacheHash(hash, uintptr_t(key.jHandle));
+  return size_t(hash);
+}
+
+size_t HashSemanticAugmentCacheKey(
+    const SemanticAugmentShadowCacheKey& key) noexcept {
+  uint64_t hash = 0xcbf29ce484222325ull;
+  hash = MixSemanticAugmentCacheHash(
+      hash, reinterpret_cast<uintptr_t>(key.worldObjectEntry));
+  hash = MixSemanticAugmentCacheHash(
+      hash, reinterpret_cast<uintptr_t>(key.sceneNode));
+  hash = MixSemanticAugmentCacheHash(
+      hash, reinterpret_cast<uintptr_t>(key.primaryUnitPtr));
+  hash = MixSemanticAugmentCacheHash(
+      hash, reinterpret_cast<uintptr_t>(key.secondaryUnitPtr));
+  hash = MixSemanticAugmentCacheHash(hash, uintptr_t(key.jHandle));
+  hash = MixSemanticAugmentCacheHash(
+      hash, reinterpret_cast<uintptr_t>(key.runtimeModelPtr));
+  return size_t(hash);
+}
+
+// The high-pressure scene resolves roughly 330 distinct augment keys per
+// frame.  A 64-entry direct-mapped table therefore evicts otherwise reusable
+// positive and negative results before their next draw: the explicit cache
+// census measured about 43% key collisions.  Keep the existing exact-key and
+// registry-generation validation contract, but size the diagnostic cache to
+// hold one representative render frame without conflict-thrashing.
+constexpr size_t kSemanticAugmentTlsCacheCapacity = 1024u;
+static_assert(
+    (kSemanticAugmentTlsCacheCapacity &
+     (kSemanticAugmentTlsCacheCapacity - 1u)) == 0u);
+
+struct SemanticAugmentModelCacheEntry {
+  bool valid = false;
+  bool found = false;
+  uint64_t mutationGeneration = 0u;
+  SemanticAugmentModelCacheKey key = {};
+  model::ModelInstanceAugmentView value = {};
+};
+
+struct SemanticAugmentShadowCacheEntry {
+  bool valid = false;
+  bool found = false;
+  uint64_t mutationGeneration = 0u;
+  uint64_t registryFrame = 0u;
+  SemanticAugmentShadowCacheKey key = {};
+  ShadowObjectAugmentView value = {};
+};
+
+struct SemanticAugmentTlsCacheAtomicStats {
+  std::atomic<uint64_t> modelLookups{0u};
+  std::atomic<uint64_t> modelHits{0u};
+  std::atomic<uint64_t> modelNegativeHits{0u};
+  std::atomic<uint64_t> modelMisses{0u};
+  std::atomic<uint64_t> modelGenerationMismatches{0u};
+  std::atomic<uint64_t> modelCollisions{0u};
+  std::atomic<uint64_t> shadowLookups{0u};
+  std::atomic<uint64_t> shadowHits{0u};
+  std::atomic<uint64_t> shadowNegativeHits{0u};
+  std::atomic<uint64_t> shadowMisses{0u};
+  std::atomic<uint64_t> shadowGenerationMismatches{0u};
+  std::atomic<uint64_t> shadowCollisions{0u};
+};
+
+SemanticAugmentTlsCacheAtomicStats g_semanticAugmentTlsCacheStats;
+
+struct SemanticAugmentTlsCacheStorage {
+  std::array<SemanticAugmentModelCacheEntry,
+             kSemanticAugmentTlsCacheCapacity> model = {};
+  std::array<SemanticAugmentShadowCacheEntry,
+             kSemanticAugmentTlsCacheCapacity> shadow = {};
+};
+
+SemanticAugmentTlsCacheStorage* GetSemanticAugmentTlsCacheStorage() noexcept {
+  // The experiment is default-off.  A direct thread_local array would reserve
+  // hundreds of KiB on every DXVK/driver worker even when no augment lookup
+  // ever uses it. Allocate only on a thread that enters the enabled cache, but
+  // retain TLS ownership so short-lived threads release the storage on exit.
+  // A fragmented 32-bit address space may reject the ~0.33 MiB allocation;
+  // fail closed to the exact uncached registry lookup instead of throwing
+  // through a draw hook.
+  static thread_local std::unique_ptr<SemanticAugmentTlsCacheStorage> s_storage;
+  static thread_local bool s_allocationAttempted = false;
+  if (!s_storage && !s_allocationAttempted) {
+    s_allocationAttempted = true;
+    s_storage.reset(new (std::nothrow) SemanticAugmentTlsCacheStorage());
+  }
+  return s_storage.get();
+}
+
+bool FindModelInstanceAugmentCached(
+    model::ModelInstanceRegistry& registry,
+    const SemanticAugmentModelCacheKey& key,
+    model::ModelInstanceAugmentView& out) {
+  auto& stats = g_semanticAugmentTlsCacheStats;
+  const bool collectStats = SemanticAugmentTlsCacheStatsRuntime();
+  if (collectStats)
+    stats.modelLookups.fetch_add(1u, std::memory_order_relaxed);
+
+  auto* const cacheStorage = GetSemanticAugmentTlsCacheStorage();
+  if (cacheStorage == nullptr) {
+    if (collectStats)
+      stats.modelMisses.fetch_add(1u, std::memory_order_relaxed);
+    return registry.findFirstForAugmentView(
+        key.worldObjectEntry, key.sceneNode, key.primaryUnitPtr,
+        key.secondaryUnitPtr, key.jHandle, out, nullptr);
+  }
+
+  auto& entry = cacheStorage->model[
+      HashSemanticAugmentCacheKey(key) &
+      (kSemanticAugmentTlsCacheCapacity - 1u)];
+  const uint64_t generationBefore = registry.mutationGeneration();
+  if (entry.valid && entry.key == key) {
+    if ((generationBefore & 1u) == 0u &&
+        entry.mutationGeneration == generationBefore) {
+      const bool found = entry.found;
+      const uint64_t generationAfter = registry.mutationGeneration();
+      if (generationAfter == generationBefore) {
+        if (collectStats)
+          stats.modelHits.fetch_add(1u, std::memory_order_relaxed);
+        if (!found) {
+          if (collectStats) {
+            stats.modelNegativeHits.fetch_add(
+                1u, std::memory_order_relaxed);
+          }
+          return false;
+        }
+        // The cache entry is thread-local and cannot mutate underneath this
+        // copy.  Avoid the previous entry->temporary->out double copy.
+        out = entry.value;
+        return true;
+      }
+    }
+    if (collectStats) {
+      stats.modelGenerationMismatches.fetch_add(
+          1u, std::memory_order_relaxed);
+    }
+  } else if (entry.valid) {
+    if (collectStats)
+      stats.modelCollisions.fetch_add(1u, std::memory_order_relaxed);
+  }
+
+  if (collectStats)
+    stats.modelMisses.fetch_add(1u, std::memory_order_relaxed);
+  model::ModelInstanceAugmentView value = {};
+  uint64_t lookupGeneration = 0u;
+  const bool found = registry.findFirstForAugmentView(
+      key.worldObjectEntry, key.sceneNode, key.primaryUnitPtr,
+      key.secondaryUnitPtr, key.jHandle, value, &lookupGeneration);
+  entry.valid = true;
+  entry.found = found;
+  entry.mutationGeneration = lookupGeneration;
+  entry.key = key;
+  entry.value = found ? value : model::ModelInstanceAugmentView{};
+  if (found)
+    out = value;
+  return found;
+}
+
+bool FindShadowObjectAugmentCached(
+    ShadowObjectRegistry& registry,
+    const SemanticAugmentShadowCacheKey& key,
+    ShadowObjectAugmentView& out,
+    uint64_t& registryFrameOut) {
+  auto& stats = g_semanticAugmentTlsCacheStats;
+  const bool collectStats = SemanticAugmentTlsCacheStatsRuntime();
+  if (collectStats)
+    stats.shadowLookups.fetch_add(1u, std::memory_order_relaxed);
+
+  auto* const cacheStorage = GetSemanticAugmentTlsCacheStorage();
+  if (cacheStorage == nullptr) {
+    if (collectStats)
+      stats.shadowMisses.fetch_add(1u, std::memory_order_relaxed);
+    return registry.findFirstForAugmentView(
+        key.worldObjectEntry, key.sceneNode, key.primaryUnitPtr,
+        key.secondaryUnitPtr, key.jHandle, key.runtimeModelPtr, out, nullptr,
+        &registryFrameOut);
+  }
+
+  auto& entry = cacheStorage->shadow[
+      HashSemanticAugmentCacheKey(key) &
+      (kSemanticAugmentTlsCacheCapacity - 1u)];
+  const uint64_t generationBefore = registry.mutationGeneration();
+  if (entry.valid && entry.key == key) {
+    if ((generationBefore & 1u) == 0u &&
+        entry.mutationGeneration == generationBefore) {
+      const bool found = entry.found;
+      const uint64_t registryFrame = entry.registryFrame;
+      const uint64_t generationAfter = registry.mutationGeneration();
+      if (generationAfter == generationBefore) {
+        if (collectStats)
+          stats.shadowHits.fetch_add(1u, std::memory_order_relaxed);
+        registryFrameOut = registryFrame;
+        if (!found) {
+          if (collectStats) {
+            stats.shadowNegativeHits.fetch_add(
+                1u, std::memory_order_relaxed);
+          }
+          return false;
+        }
+        // The cache entry is thread-local and cannot mutate underneath this
+        // copy.  Avoid the previous entry->temporary->out double copy.
+        out = entry.value;
+        return true;
+      }
+    }
+    if (collectStats) {
+      stats.shadowGenerationMismatches.fetch_add(
+          1u, std::memory_order_relaxed);
+    }
+  } else if (entry.valid) {
+    if (collectStats)
+      stats.shadowCollisions.fetch_add(1u, std::memory_order_relaxed);
+  }
+
+  if (collectStats)
+    stats.shadowMisses.fetch_add(1u, std::memory_order_relaxed);
+  ShadowObjectAugmentView value = {};
+  uint64_t lookupGeneration = 0u;
+  uint64_t registryFrame = 0u;
+  const bool found = registry.findFirstForAugmentView(
+      key.worldObjectEntry, key.sceneNode, key.primaryUnitPtr,
+      key.secondaryUnitPtr, key.jHandle, key.runtimeModelPtr, value,
+      &lookupGeneration, &registryFrame);
+  entry.valid = true;
+  entry.found = found;
+  entry.mutationGeneration = lookupGeneration;
+  entry.registryFrame = registryFrame;
+  entry.key = key;
+  entry.value = found ? value : ShadowObjectAugmentView{};
+  registryFrameOut = registryFrame;
+  if (found)
+    out = value;
+  return found;
+}
+
+struct WorldObjectsPhase1AtomicTiming {
+  std::atomic<uint64_t> calls{0u};
+  std::atomic<uint64_t> ticks{0u};
+  std::atomic<uint64_t> maxTicks{0u};
+};
+
+struct WorldObjectsPhase1AtomicGroup {
+  WorldObjectsPhase1AtomicTiming hookInclusive;
+  WorldObjectsPhase1AtomicTiming collectorInclusive;
+  WorldObjectsPhase1AtomicTiming collectorSetup;
+  WorldObjectsPhase1AtomicTiming collectorIterate;
+  WorldObjectsPhase1AtomicTiming collectorRegister;
+  WorldObjectsPhase1AtomicTiming collectorTail;
+  WorldObjectsPhase1AtomicTiming modelFeed;
+  WorldObjectsPhase1AtomicTiming shadowFeed;
+  std::atomic<uint64_t> listEntries{0u};
+  std::atomic<uint64_t> acceptedEntries{0u};
+  std::atomic<uint64_t> sceneNodeEntries{0u};
+  std::atomic<uint64_t> handleEntries{0u};
+  std::atomic<uint64_t> collectorPartitionMismatchCount{0u};
+  std::atomic<uint64_t> hookContainmentViolationCount{0u};
+  std::atomic<uint64_t> registerFeedContainmentViolationCount{0u};
+  std::atomic<uint64_t> acceptedCountViolationCount{0u};
+  std::atomic<uint64_t> sceneNodeCountViolationCount{0u};
+  std::atomic<uint64_t> handleCountViolationCount{0u};
+  std::array<std::atomic<uint64_t>,
+             kWorldObjectsPhase1CollectorOutcomeCount>
+      outcomeCounts{};
+};
+
+struct WorldObjectsPhase1TlsContext {
+  uint64_t eventSequence = 0u;
+  uint64_t dispatchCaptureEventSequence = 0u;
+  uint32_t collectorGroup = kWorldObjectsPhase1GroupCount;
+  bool collectorActive = false;
+  WorldObjectsPhase1DispatchCaptureKind dispatchCaptureKind =
+      WorldObjectsPhase1DispatchCaptureKind::None;
+  WorldObjectsPhase1PeriodicDispatch periodicDispatch{};
+  uint64_t modelFeedTicks = 0u;
+  uint64_t shadowFeedTicks = 0u;
+  uint64_t modelFeedMaxTicks = 0u;
+  uint64_t shadowFeedMaxTicks = 0u;
+  uint32_t modelFeedCalls = 0u;
+  uint32_t shadowFeedCalls = 0u;
+  std::array<uint64_t, kWorldObjectsPhase1GroupCount>
+      pendingCollectorTicks{};
+  std::array<uint32_t, kWorldObjectsPhase1GroupCount>
+      pendingCollectorCalls{};
+};
+
+std::atomic<uint64_t> g_worldObjectsPhase1WritesStarted{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1WritesCompleted{0u};
+std::atomic<uint32_t> g_worldObjectsPhase1Writers{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1SnapshotGeneration{0u};
+std::atomic_flag g_worldObjectsPhase1WriterLock = ATOMIC_FLAG_INIT;
+std::atomic<uint64_t> g_worldObjectsPhase1ActiveEventSequence{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1EventSequence{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1TrackingAttempts{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1TrackingHealthFastPathCalls{0u};
+std::atomic<uint64_t>
+    g_worldObjectsPhase1TrackingHealthFullSummaryCompatibilityCalls{0u};
+std::atomic<uint64_t>
+    g_worldObjectsPhase1TrackingHealthModelInstanceAggregateReadPasses{0u};
+std::atomic<uint64_t>
+    g_worldObjectsPhase1TrackingHealthPoseAggregateReadPasses{0u};
+std::atomic<uint64_t>
+    g_worldObjectsPhase1TrackingHealthModelInstanceVerifierScanPasses{0u};
+std::atomic<uint64_t>
+    g_worldObjectsPhase1TrackingHealthPoseVerifierScanPasses{0u};
+std::atomic<uint64_t>
+    g_worldObjectsPhase1TrackingHealthModelInstanceVerifierRecordsScanned{0u};
+std::atomic<uint64_t>
+    g_worldObjectsPhase1TrackingHealthPoseVerifierRecordsScanned{0u};
+std::atomic<uint64_t>
+    g_worldObjectsPhase1TrackingHealthModelInstanceVerifierMismatchCount{0u};
+std::atomic<uint64_t>
+    g_worldObjectsPhase1TrackingHealthPoseVerifierMismatchCount{0u};
+std::atomic<uint32_t>
+    g_worldObjectsPhase1TrackingHealthModelInstanceVerifierMismatchMask{0u};
+std::atomic<uint32_t>
+    g_worldObjectsPhase1TrackingHealthPoseVerifierMismatchMask{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1IdentityRequests{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1FallbackRequests{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1CollectorWithoutEventCount{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1CollectorReentryCount{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1CollectorWithoutHookCount{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1HookWithoutCollectorCount{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1RegistryFeedOutsideCollectorCount{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1UnexpectedGroupCount{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1PairedCaptureDuplicatePublishCount{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1PairedCaptureLostPublishCount{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1PairedCaptureSlotMismatchCount{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1ActiveDispatchCaptureSequence{0u};
+std::atomic<uint64_t> g_worldObjectsPhase1ActiveDispatchCaptureOwner{0u};
+std::atomic<uint32_t> g_worldObjectsPhase1ActiveDispatchCaptureKind{0u};
+WorldObjectsPhase1AtomicTiming g_worldObjectsPhase1TrackingInclusive;
+WorldObjectsPhase1AtomicTiming g_worldObjectsPhase1TrackingQuery;
+WorldObjectsPhase1AtomicTiming g_worldObjectsPhase1TrackingDecision;
+std::array<std::atomic<uint64_t>,
+           kWorldObjectsPhase1TrackingReasonCount>
+    g_worldObjectsPhase1ReasonCounts{};
+std::array<WorldObjectsPhase1AtomicGroup,
+           kWorldObjectsPhase1GroupCount>
+    g_worldObjectsPhase1Groups{};
+std::mutex g_worldObjectsPhase1EventMutex;
+std::array<WorldObjectsPhase1Event,
+           kWorldObjectsPhase1EventSlotCount>
+    g_worldObjectsPhase1Events{};
+thread_local WorldObjectsPhase1TlsContext g_worldObjectsPhase1Tls{};
+
+class WorldObjectsPhase1WriteGuard {
+public:
+  WorldObjectsPhase1WriteGuard() noexcept {
+    while (g_worldObjectsPhase1WriterLock.test_and_set(
+        std::memory_order_acquire)) {
+    }
+    // Serializing writers keeps the odd/even generation a real seqlock even
+    // if a future producer moves off the render thread.
+    g_worldObjectsPhase1SnapshotGeneration.fetch_add(
+        1u, std::memory_order_acq_rel);
+    g_worldObjectsPhase1Writers.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_worldObjectsPhase1WritesStarted.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+
+  ~WorldObjectsPhase1WriteGuard() {
+    g_worldObjectsPhase1WritesCompleted.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_worldObjectsPhase1Writers.fetch_sub(
+        1u, std::memory_order_relaxed);
+    g_worldObjectsPhase1SnapshotGeneration.fetch_add(
+        1u, std::memory_order_release);
+    g_worldObjectsPhase1WriterLock.clear(std::memory_order_release);
+  }
+
+  WorldObjectsPhase1WriteGuard(const WorldObjectsPhase1WriteGuard&) = delete;
+  WorldObjectsPhase1WriteGuard& operator=(
+      const WorldObjectsPhase1WriteGuard&) = delete;
+};
+
+uint64_t WorldObjectsPhase1TickDelta(int64_t begin, int64_t end) noexcept {
+  return end >= begin ? uint64_t(end - begin) : 0u;
+}
+
+void RecordWorldObjectsPhase1AtomicTimingSamples(
+    WorldObjectsPhase1AtomicTiming& timing, uint64_t calls,
+    uint64_t ticks, uint64_t maxTicks) noexcept {
+  timing.calls.fetch_add(calls, std::memory_order_relaxed);
+  timing.ticks.fetch_add(ticks, std::memory_order_relaxed);
+  uint64_t current = timing.maxTicks.load(std::memory_order_relaxed);
+  while (current < maxTicks &&
+         !timing.maxTicks.compare_exchange_weak(
+             current, maxTicks, std::memory_order_relaxed,
+             std::memory_order_relaxed)) {
+  }
+}
+
+void RecordWorldObjectsPhase1AtomicTiming(
+    WorldObjectsPhase1AtomicTiming& timing, uint64_t ticks) noexcept {
+  RecordWorldObjectsPhase1AtomicTimingSamples(timing, 1u, ticks, ticks);
+}
+
+WorldObjectsPhase1RawTiming CopyWorldObjectsPhase1AtomicTiming(
+    const WorldObjectsPhase1AtomicTiming& timing) noexcept {
+  WorldObjectsPhase1RawTiming result = {};
+  result.calls = timing.calls.load(std::memory_order_relaxed);
+  result.ticks = timing.ticks.load(std::memory_order_relaxed);
+  result.maxTicks = timing.maxTicks.load(std::memory_order_relaxed);
+  return result;
+}
+
+bool IsWorldObjectsPhase1RawTimingZero(
+    const WorldObjectsPhase1RawTiming& timing) noexcept {
+  return timing.calls == 0u && timing.ticks == 0u &&
+      timing.maxTicks == 0u;
+}
+
+void RecordWorldObjectsPhase1Counter(
+    std::atomic<uint64_t>& counter, uint64_t value = 1u) noexcept {
+  WorldObjectsPhase1WriteGuard writeGuard;
+  counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+uint32_t WorldObjectsPhase1ReasonBit(
+    WorldObjectsPhase1TrackingReason reason) noexcept {
+  const uint32_t index = static_cast<uint32_t>(reason);
+  return index > 0u && index < kWorldObjectsPhase1TrackingReasonCount
+      ? (1u << index)
+      : 0u;
+}
+
+bool IsWorldObjectsPhase1PairedCaptureKind(
+    WorldObjectsPhase1DispatchCaptureKind kind) noexcept {
+  return kind == WorldObjectsPhase1DispatchCaptureKind::PurePeriodic ||
+      kind == WorldObjectsPhase1DispatchCaptureKind::PostPeriodicControl;
+}
+
+void ClearWorldObjectsPhase1PairedCaptureTls() noexcept {
+  g_worldObjectsPhase1PurePeriodicDispatchSequence = 0u;
+  g_worldObjectsPhase1DispatchCaptureKind =
+      WorldObjectsPhase1DispatchCaptureKind::None;
+}
+
+void ArmWorldObjectsPhase1PairedCapture(
+    uint64_t eventSequence, WorldObjectsPhase1DispatchCaptureKind kind,
+    uint64_t captureFrameSerial, uint64_t ownerThreadId) noexcept {
+  g_worldObjectsPhase1Tls.dispatchCaptureEventSequence = eventSequence;
+  g_worldObjectsPhase1Tls.dispatchCaptureKind = kind;
+  g_worldObjectsPhase1Tls.periodicDispatch = {};
+  g_worldObjectsPhase1Tls.periodicDispatch.captureRequested = true;
+  g_worldObjectsPhase1Tls.periodicDispatch.captureFrameSerial =
+      captureFrameSerial;
+  g_worldObjectsPhase1Tls.periodicDispatch.ownerThreadId = ownerThreadId;
+  g_worldObjectsPhase1Tls.periodicDispatch.flushTopologyHash =
+      14695981039346656037ull;
+  // This legacy TLS name is intentionally the low-cost render-hook admission
+  // token for both members of the pair. The capture kind selects the eventual
+  // event destination; no control frame becomes an identity/collector event.
+  g_worldObjectsPhase1PurePeriodicDispatchSequence = eventSequence;
+  g_worldObjectsPhase1DispatchCaptureKind = kind;
+  g_worldObjectsPhase1ActiveDispatchCaptureOwner.store(
+      ownerThreadId, std::memory_order_relaxed);
+  g_worldObjectsPhase1ActiveDispatchCaptureKind.store(
+      static_cast<uint32_t>(kind), std::memory_order_relaxed);
+  g_worldObjectsPhase1ActiveDispatchCaptureSequence.store(
+      eventSequence, std::memory_order_release);
+}
+
+void SettleWorldObjectsPhase1ActiveDispatchCaptureMarker(
+    uint64_t completedEventSequence,
+    WorldObjectsPhase1DispatchCaptureKind completedKind) noexcept {
+  const uint64_t activeSequence =
+      g_worldObjectsPhase1ActiveDispatchCaptureSequence.load(
+          std::memory_order_acquire);
+  if (activeSequence == 0u)
+    return;
+  const uint64_t activeOwner =
+      g_worldObjectsPhase1ActiveDispatchCaptureOwner.load(
+          std::memory_order_relaxed);
+  const uint32_t activeKind =
+      g_worldObjectsPhase1ActiveDispatchCaptureKind.load(
+          std::memory_order_relaxed);
+  if (activeSequence != completedEventSequence ||
+      activeOwner != uint64_t(::GetCurrentThreadId()) ||
+      activeKind != static_cast<uint32_t>(completedKind)) {
+    g_worldObjectsPhase1PairedCaptureLostPublishCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+  g_worldObjectsPhase1ActiveDispatchCaptureSequence.store(
+      0u, std::memory_order_release);
+  g_worldObjectsPhase1ActiveDispatchCaptureOwner.store(
+      0u, std::memory_order_relaxed);
+  g_worldObjectsPhase1ActiveDispatchCaptureKind.store(
+      0u, std::memory_order_relaxed);
+}
+
+bool PublishWorldObjectsPhase1PairedCapture(
+    uint64_t eventSequence, WorldObjectsPhase1DispatchCaptureKind kind,
+    WorldObjectsPhase1PeriodicDispatch capture) noexcept {
+  if (eventSequence == 0u || !IsWorldObjectsPhase1PairedCaptureKind(kind))
+    return true;
+  capture.captureRequested = true;
+  capture.finalized = true;
+  if (capture.ownerThreadId == 0u ||
+      capture.ownerThreadId != uint64_t(::GetCurrentThreadId())) {
+    g_worldObjectsPhase1PairedCaptureLostPublishCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(g_worldObjectsPhase1EventMutex);
+  auto& event = g_worldObjectsPhase1Events[
+      (eventSequence - 1u) % kWorldObjectsPhase1EventSlotCount];
+  if (event.sequence != eventSequence) {
+    g_worldObjectsPhase1PairedCaptureSlotMismatchCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_worldObjectsPhase1PairedCaptureLostPublishCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+  auto& destination =
+      kind == WorldObjectsPhase1DispatchCaptureKind::PurePeriodic
+      ? event.periodicDispatch : event.postPeriodicControl;
+  if (destination.finalized) {
+    g_worldObjectsPhase1PairedCaptureDuplicatePublishCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+  if (!destination.captureRequested ||
+      destination.captureFrameSerial != capture.captureFrameSerial ||
+      destination.ownerThreadId != capture.ownerThreadId) {
+    g_worldObjectsPhase1PairedCaptureLostPublishCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+  destination = capture;
+  return true;
+}
+
+bool PrepareWorldObjectsPhase1PostPeriodicControl(
+    uint64_t eventSequence, uint64_t periodicFrameSerial,
+    uint64_t controlFrameSerial, uint64_t ownerThreadId) noexcept {
+  if (eventSequence == 0u || periodicFrameSerial == 0u ||
+      controlFrameSerial != periodicFrameSerial + 1u)
+    return false;
+  std::lock_guard<std::mutex> lock(g_worldObjectsPhase1EventMutex);
+  auto& event = g_worldObjectsPhase1Events[
+      (eventSequence - 1u) % kWorldObjectsPhase1EventSlotCount];
+  if (event.sequence != eventSequence) {
+    g_worldObjectsPhase1PairedCaptureSlotMismatchCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+  if (event.postPeriodicControl.captureRequested ||
+      event.postPeriodicControl.finalized) {
+    g_worldObjectsPhase1PairedCaptureDuplicatePublishCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
+  event.postPeriodicControl.captureRequested = true;
+  event.postPeriodicControl.captureFrameSerial = controlFrameSerial;
+  event.postPeriodicControl.ownerThreadId = ownerThreadId;
+  event.postPeriodicControl.flushTopologyHash = 14695981039346656037ull;
+  return true;
+}
+
+void RecordWorldObjectsPhase1Tracking(
+    uint64_t frameSerial, uint64_t collectionFrameSerial,
+    uint64_t poseSerial,
+    WorldObjectsPhase1TrackingReason reason, uint32_t reasonMask,
+    uint64_t refreshPeriod, uint64_t warmupFrames,
+    const ShadowRuntimeBridgeTrackingDecision& decision,
+    uint64_t inclusiveTicks, uint64_t queryTicks,
+    uint64_t decisionTicks) noexcept {
+  const uint64_t completedDispatchEventSequence =
+      g_worldObjectsPhase1Tls.dispatchCaptureEventSequence;
+  const auto completedDispatchCaptureKind =
+      g_worldObjectsPhase1Tls.dispatchCaptureKind;
+  auto completedPeriodicDispatch =
+      g_worldObjectsPhase1Tls.periodicDispatch;
+  uint64_t abandonedCollectorCalls = 0u;
+  for (uint32_t group = 0u; group < kWorldObjectsPhase1GroupCount; ++group)
+    abandonedCollectorCalls +=
+        g_worldObjectsPhase1Tls.pendingCollectorCalls[group];
+
+  WorldObjectsPhase1WriteGuard writeGuard;
+  SettleWorldObjectsPhase1ActiveDispatchCaptureMarker(
+      completedDispatchEventSequence, completedDispatchCaptureKind);
+  g_worldObjectsPhase1Tls = {};
+  ClearWorldObjectsPhase1PairedCaptureTls();
+  const uint32_t reasonIndex = static_cast<uint32_t>(reason);
+  const uint32_t safeReasonIndex =
+      reasonIndex < kWorldObjectsPhase1TrackingReasonCount ? reasonIndex : 0u;
+
+  PublishWorldObjectsPhase1PairedCapture(
+      completedDispatchEventSequence, completedDispatchCaptureKind,
+      completedPeriodicDispatch);
+  if (abandonedCollectorCalls != 0u) {
+    g_worldObjectsPhase1CollectorWithoutHookCount.fetch_add(
+        abandonedCollectorCalls, std::memory_order_relaxed);
+  }
+  g_worldObjectsPhase1TrackingAttempts.fetch_add(
+      1u, std::memory_order_relaxed);
+  const auto addTrackingHealthCounter =
+      [](std::atomic<uint64_t>& counter, uint64_t value) {
+        if (value != 0u)
+          counter.fetch_add(value, std::memory_order_relaxed);
+      };
+  addTrackingHealthCounter(
+      g_worldObjectsPhase1TrackingHealthFastPathCalls,
+      decision.trackingHealthFastPathCalls);
+  addTrackingHealthCounter(
+      g_worldObjectsPhase1TrackingHealthFullSummaryCompatibilityCalls,
+      decision.trackingHealthFullSummaryCompatibilityCalls);
+  addTrackingHealthCounter(
+      g_worldObjectsPhase1TrackingHealthModelInstanceAggregateReadPasses,
+      decision.trackingHealthModelInstanceAggregateReadPasses);
+  addTrackingHealthCounter(
+      g_worldObjectsPhase1TrackingHealthPoseAggregateReadPasses,
+      decision.trackingHealthPoseAggregateReadPasses);
+  addTrackingHealthCounter(
+      g_worldObjectsPhase1TrackingHealthModelInstanceVerifierScanPasses,
+      decision.trackingHealthModelInstanceVerifierScanPasses);
+  addTrackingHealthCounter(
+      g_worldObjectsPhase1TrackingHealthPoseVerifierScanPasses,
+      decision.trackingHealthPoseVerifierScanPasses);
+  addTrackingHealthCounter(
+      g_worldObjectsPhase1TrackingHealthModelInstanceVerifierRecordsScanned,
+      decision.trackingHealthModelInstanceVerifierRecordsScanned);
+  addTrackingHealthCounter(
+      g_worldObjectsPhase1TrackingHealthPoseVerifierRecordsScanned,
+      decision.trackingHealthPoseVerifierRecordsScanned);
+  addTrackingHealthCounter(
+      g_worldObjectsPhase1TrackingHealthModelInstanceVerifierMismatchCount,
+      decision.trackingHealthModelInstanceVerifierMismatchCount);
+  addTrackingHealthCounter(
+      g_worldObjectsPhase1TrackingHealthPoseVerifierMismatchCount,
+      decision.trackingHealthPoseVerifierMismatchCount);
+  if (decision.trackingHealthModelInstanceVerifierMismatchMask != 0u) {
+    g_worldObjectsPhase1TrackingHealthModelInstanceVerifierMismatchMask
+        .fetch_or(
+            decision.trackingHealthModelInstanceVerifierMismatchMask,
+            std::memory_order_relaxed);
+  }
+  if (decision.trackingHealthPoseVerifierMismatchMask != 0u) {
+    g_worldObjectsPhase1TrackingHealthPoseVerifierMismatchMask.fetch_or(
+        decision.trackingHealthPoseVerifierMismatchMask,
+        std::memory_order_relaxed);
+  }
+  g_worldObjectsPhase1ReasonCounts[safeReasonIndex].fetch_add(
+      1u, std::memory_order_relaxed);
+  if (decision.wantsObjectIdentity) {
+    g_worldObjectsPhase1IdentityRequests.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+  if (decision.wantsFallbackBridge) {
+    g_worldObjectsPhase1FallbackRequests.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+  RecordWorldObjectsPhase1AtomicTiming(
+      g_worldObjectsPhase1TrackingInclusive, inclusiveTicks);
+  RecordWorldObjectsPhase1AtomicTiming(
+      g_worldObjectsPhase1TrackingQuery, queryTicks);
+  RecordWorldObjectsPhase1AtomicTiming(
+      g_worldObjectsPhase1TrackingDecision, decisionTicks);
+
+  const bool cleanPostPeriodicControl =
+      completedDispatchCaptureKind ==
+          WorldObjectsPhase1DispatchCaptureKind::PurePeriodic &&
+      reason == WorldObjectsPhase1TrackingReason::None && reasonMask == 0u &&
+      !decision.wantsObjectIdentity && !decision.wantsFallbackBridge &&
+      collectionFrameSerial ==
+          completedPeriodicDispatch.captureFrameSerial + 1u;
+  if (reason == WorldObjectsPhase1TrackingReason::None ||
+      !decision.wantsObjectIdentity) {
+    g_worldObjectsPhase1ActiveEventSequence.store(
+        0u, std::memory_order_release);
+    if (cleanPostPeriodicControl &&
+        PrepareWorldObjectsPhase1PostPeriodicControl(
+            completedDispatchEventSequence,
+            completedPeriodicDispatch.captureFrameSerial,
+            collectionFrameSerial, uint64_t(::GetCurrentThreadId()))) {
+      ArmWorldObjectsPhase1PairedCapture(
+          completedDispatchEventSequence,
+          WorldObjectsPhase1DispatchCaptureKind::PostPeriodicControl,
+          collectionFrameSerial, uint64_t(::GetCurrentThreadId()));
+    }
+    return;
+  }
+
+  const uint64_t eventSequence =
+      g_worldObjectsPhase1EventSequence.fetch_add(
+          1u, std::memory_order_relaxed) + 1u;
+  WorldObjectsPhase1Event event = {};
+  event.sequence = eventSequence;
+  event.frameSerial = frameSerial;
+  event.collectionFrameSerial = collectionFrameSerial;
+  event.poseSerial = poseSerial;
+  event.trackingInclusiveTicks = inclusiveTicks;
+  event.trackingQueryTicks = queryTicks;
+  event.trackingDecisionTicks = decisionTicks;
+  event.refreshPeriod = refreshPeriod;
+  event.warmupFrames = warmupFrames;
+  event.reason = reason;
+  event.reasonMask = reasonMask;
+  event.wantsObjectIdentity = decision.wantsObjectIdentity;
+  event.wantsFallbackBridge = decision.wantsFallbackBridge;
+  const uint32_t periodicReasonBit = WorldObjectsPhase1ReasonBit(
+      WorldObjectsPhase1TrackingReason::PeriodicMaintenance);
+  const bool purePeriodicDispatchCapture =
+      reason == WorldObjectsPhase1TrackingReason::PeriodicMaintenance &&
+      reasonMask == periodicReasonBit;
+  event.periodicDispatch.captureRequested =
+      purePeriodicDispatchCapture;
+  if (purePeriodicDispatchCapture) {
+    event.periodicDispatch.captureFrameSerial = collectionFrameSerial;
+    event.periodicDispatch.ownerThreadId = uint64_t(::GetCurrentThreadId());
+    event.periodicDispatch.flushTopologyHash = 14695981039346656037ull;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_worldObjectsPhase1EventMutex);
+    g_worldObjectsPhase1Events[
+        (eventSequence - 1u) % kWorldObjectsPhase1EventSlotCount] = event;
+  }
+  g_worldObjectsPhase1Tls.eventSequence = eventSequence;
+  g_worldObjectsPhase1Tls.collectorGroup =
+      kWorldObjectsPhase1GroupCount;
+  if (purePeriodicDispatchCapture) {
+    ArmWorldObjectsPhase1PairedCapture(
+        eventSequence, WorldObjectsPhase1DispatchCaptureKind::PurePeriodic,
+        collectionFrameSerial, uint64_t(::GetCurrentThreadId()));
+  }
+  g_worldObjectsPhase1ActiveEventSequence.store(
+      eventSequence, std::memory_order_release);
+}
 
 bool IsSemanticDataModuleEnabled() {
   return runtime::IsWar3RuntimeModuleEnabled(
@@ -161,11 +993,14 @@ struct ShadowPoseFullTraceConfigSnapshot {
   bool includePoseRecords = true;
   bool includeShadowObjectRecords = true;
   bool includeCurrentDrawRecords = true;
+  bool includeFinalCasterRecords = true;
   bool includeMatrixBytes = false;
   uint32_t maxSeconds = 15u;
   uint32_t maxPoseRecords = 0u;
   uint32_t maxShadowObjectRecords = 0u;
   uint32_t maxCurrentDrawRecords = 0u;
+  uint32_t maxFinalCasterRecords = 0u;
+  uint32_t finalCasterSampleBytes = 4096u;
   uint64_t epoch = 0u;
 };
 
@@ -179,14 +1014,19 @@ bool g_shadowPoseFullTraceStoppedByLimit = false;
 bool g_shadowPoseFullTraceIncludePoseRecords = true;
 bool g_shadowPoseFullTraceIncludeShadowObjectRecords = true;
 bool g_shadowPoseFullTraceIncludeCurrentDrawRecords = true;
+bool g_shadowPoseFullTraceIncludeFinalCasterRecords = true;
 bool g_shadowPoseFullTraceIncludeMatrixBytes = false;
 uint32_t g_shadowPoseFullTraceMaxSeconds = 15u;
 uint32_t g_shadowPoseFullTraceMaxPoseRecords = 0u;
 uint32_t g_shadowPoseFullTraceMaxShadowObjectRecords = 0u;
 uint32_t g_shadowPoseFullTraceMaxCurrentDrawRecords = 0u;
+uint32_t g_shadowPoseFullTraceMaxFinalCasterRecords = 0u;
+uint32_t g_shadowPoseFullTraceFinalCasterSampleBytes = 4096u;
 uint64_t g_shadowPoseFullTraceEpoch = 0u;
 uint64_t g_shadowPoseFullTraceFrameEventsWritten = 0u;
 uint64_t g_shadowPoseFullTraceRecordEventsWritten = 0u;
+uint64_t g_shadowPoseFullTraceLastFinalCasterFrameSerial = 0u;
+const War3FrameScene* g_shadowPoseFullTraceLastFinalCasterScene = nullptr;
 std::chrono::steady_clock::time_point g_shadowPoseFullTraceStart = {};
 std::string g_shadowPoseFullTracePath;
 constexpr size_t kSemanticPerfTagCount =
@@ -266,6 +1106,8 @@ void InitializeShadowPoseFullTraceEnvLocked() {
       env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_OBJECTS"), true);
   g_shadowPoseFullTraceIncludeCurrentDrawRecords = ParseTraceBool(
       env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_CONTRACTS"), true);
+  g_shadowPoseFullTraceIncludeFinalCasterRecords = ParseTraceBool(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_CASTERS"), true);
   g_shadowPoseFullTraceIncludeMatrixBytes = ParseTraceBool(
       env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MATRIX_BYTES"), false);
   g_shadowPoseFullTraceMaxSeconds = ParseTraceU32(
@@ -276,6 +1118,11 @@ void InitializeShadowPoseFullTraceEnvLocked() {
       env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MAX_OBJECTS"), 0u);
   g_shadowPoseFullTraceMaxCurrentDrawRecords = ParseTraceU32(
       env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MAX_CONTRACTS"), 0u);
+  g_shadowPoseFullTraceMaxFinalCasterRecords = ParseTraceU32(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_MAX_CASTERS"), 0u);
+  g_shadowPoseFullTraceFinalCasterSampleBytes = ParseTraceU32(
+      env::getEnvVar("DXVK_WAR3_SHADOW_POSE_FULL_TRACE_CASTER_SAMPLE_BYTES"),
+      4096u);
   ++g_shadowPoseFullTraceEpoch;
 }
 
@@ -291,6 +1138,8 @@ ShadowPoseFullTraceConfigSnapshot ShadowPoseFullTraceConfigLocked() {
       g_shadowPoseFullTraceIncludeShadowObjectRecords;
   config.includeCurrentDrawRecords =
       g_shadowPoseFullTraceIncludeCurrentDrawRecords;
+  config.includeFinalCasterRecords =
+      g_shadowPoseFullTraceIncludeFinalCasterRecords;
   config.includeMatrixBytes = g_shadowPoseFullTraceIncludeMatrixBytes;
   config.maxSeconds = g_shadowPoseFullTraceMaxSeconds;
   config.maxPoseRecords = g_shadowPoseFullTraceMaxPoseRecords;
@@ -298,6 +1147,10 @@ ShadowPoseFullTraceConfigSnapshot ShadowPoseFullTraceConfigLocked() {
       g_shadowPoseFullTraceMaxShadowObjectRecords;
   config.maxCurrentDrawRecords =
       g_shadowPoseFullTraceMaxCurrentDrawRecords;
+  config.maxFinalCasterRecords =
+      g_shadowPoseFullTraceMaxFinalCasterRecords;
+  config.finalCasterSampleBytes =
+      g_shadowPoseFullTraceFinalCasterSampleBytes;
   config.epoch = g_shadowPoseFullTraceEpoch;
   return config;
 }
@@ -384,6 +1237,368 @@ void WriteMatrixJson(std::ostream& os, const Matrix4& matrix) {
     os << ']';
   }
   os << ']';
+}
+
+uint64_t ShadowCasterTraceHashInit() {
+  return 14695981039346656037ull;
+}
+
+void ShadowCasterTraceHashBytes(uint64_t& hash, const void* data, size_t size) {
+  const auto* bytes = reinterpret_cast<const uint8_t*>(data);
+  for (size_t i = 0u; i < size; ++i) {
+    hash ^= uint64_t(bytes[i]);
+    hash *= 1099511628211ull;
+  }
+}
+
+template <typename T>
+void ShadowCasterTraceHashValue(uint64_t& hash, const T& value) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  ShadowCasterTraceHashBytes(hash, &value, sizeof(value));
+}
+
+template <typename Handle>
+uint64_t ShadowCasterTraceHandleBits(Handle handle) {
+  uint64_t bits = 0u;
+  static_assert(sizeof(handle) <= sizeof(bits));
+  std::memcpy(&bits, &handle, sizeof(handle));
+  return bits;
+}
+
+uint64_t ShadowCasterTraceBufferSampleHash(
+    const DxvkResourceBufferInfo& info, uint32_t maxBytes) {
+  if (info.mapPtr == nullptr || info.size == 0u || maxBytes == 0u)
+    return 0u;
+
+  const uint64_t boundedSize64 =
+      (std::min)(uint64_t(info.size), uint64_t(SIZE_MAX));
+  const size_t size = static_cast<size_t>(boundedSize64);
+  const size_t budget = (std::min)(size, size_t(maxBytes));
+  if (budget == 0u)
+    return 0u;
+
+  uint64_t hash = ShadowCasterTraceHashInit();
+  ShadowCasterTraceHashValue(hash, boundedSize64);
+  const auto* bytes = reinterpret_cast<const uint8_t*>(info.mapPtr);
+  if (budget == size) {
+    ShadowCasterTraceHashBytes(hash, bytes, size);
+  } else {
+    const size_t firstBytes = budget / 2u;
+    const size_t lastBytes = budget - firstBytes;
+    ShadowCasterTraceHashBytes(hash, bytes, firstBytes);
+    ShadowCasterTraceHashBytes(hash, bytes + size - lastBytes, lastBytes);
+  }
+  return hash;
+}
+
+uint64_t ShadowCasterTraceIdentityHash(const War3ShadowCasterDraw& draw) {
+  uint64_t hash = ShadowCasterTraceHashInit();
+  ShadowCasterTraceHashValue(hash, draw.stage);
+  const uint32_t category = static_cast<uint32_t>(draw.category);
+  const int32_t batchTag = static_cast<int32_t>(draw.batchTag);
+  ShadowCasterTraceHashValue(hash, category);
+  ShadowCasterTraceHashValue(hash, batchTag);
+  ShadowCasterTraceHashValue(hash, draw.objectKind);
+  ShadowCasterTraceHashValue(hash, draw.rawcode);
+  ShadowCasterTraceHashValue(hash, draw.jHandle);
+  ShadowCasterTraceHashValue(hash, draw.batchHandle);
+  ShadowCasterTraceHashValue(hash, draw.indexed);
+  ShadowCasterTraceHashValue(hash, draw.topology);
+  ShadowCasterTraceHashValue(hash, draw.indexCount);
+  ShadowCasterTraceHashValue(hash, draw.firstIndex);
+  ShadowCasterTraceHashValue(hash, draw.vertexOffset);
+  ShadowCasterTraceHashValue(hash, draw.vertexCount);
+  ShadowCasterTraceHashValue(hash, draw.firstVertex);
+  ShadowCasterTraceHashValue(hash, draw.minVertexIndex);
+  ShadowCasterTraceHashValue(hash, draw.numVertices);
+  return hash;
+}
+
+uint64_t ShadowCasterTraceBackingHash(const War3ShadowCasterDraw& draw) {
+  uint64_t hash = ShadowCasterTraceHashInit();
+  const uint64_t positionStorage =
+      uint64_t(reinterpret_cast<uintptr_t>(draw.positionStorage.ptr()));
+  const uint64_t indexStorage =
+      uint64_t(reinterpret_cast<uintptr_t>(draw.indexStorage.ptr()));
+  const uint64_t blendStorage =
+      uint64_t(reinterpret_cast<uintptr_t>(draw.blendStorage.ptr()));
+  const uint64_t uvStorage =
+      uint64_t(reinterpret_cast<uintptr_t>(draw.uvStorage.ptr()));
+  ShadowCasterTraceHashValue(hash, positionStorage);
+  ShadowCasterTraceHashValue(
+      hash, ShadowCasterTraceHandleBits(draw.positionInfo.buffer));
+  ShadowCasterTraceHashValue(hash, draw.positionInfo.offset);
+  ShadowCasterTraceHashValue(hash, draw.positionInfo.size);
+  ShadowCasterTraceHashValue(hash, indexStorage);
+  ShadowCasterTraceHashValue(
+      hash, ShadowCasterTraceHandleBits(draw.indexInfo.buffer));
+  ShadowCasterTraceHashValue(hash, draw.indexInfo.offset);
+  ShadowCasterTraceHashValue(hash, draw.indexInfo.size);
+  ShadowCasterTraceHashValue(hash, blendStorage);
+  ShadowCasterTraceHashValue(
+      hash, ShadowCasterTraceHandleBits(draw.blendInfo.buffer));
+  ShadowCasterTraceHashValue(hash, draw.blendInfo.offset);
+  ShadowCasterTraceHashValue(hash, draw.blendInfo.size);
+  ShadowCasterTraceHashValue(hash, uvStorage);
+  ShadowCasterTraceHashValue(
+      hash, ShadowCasterTraceHandleBits(draw.uvInfo.buffer));
+  ShadowCasterTraceHashValue(hash, draw.uvInfo.offset);
+  ShadowCasterTraceHashValue(hash, draw.uvInfo.size);
+  if (draw.positionStorage != nullptr) {
+    ShadowCasterTraceHashValue(
+        hash, draw.positionStorage->diagnosticStorageGeneration());
+  }
+  if (draw.indexStorage != nullptr) {
+    ShadowCasterTraceHashValue(
+        hash, draw.indexStorage->diagnosticStorageGeneration());
+  }
+  if (draw.blendStorage != nullptr) {
+    ShadowCasterTraceHashValue(
+        hash, draw.blendStorage->diagnosticStorageGeneration());
+  }
+  if (draw.uvStorage != nullptr) {
+    ShadowCasterTraceHashValue(
+        hash, draw.uvStorage->diagnosticStorageGeneration());
+  }
+  return hash;
+}
+
+uint64_t ShadowCasterTraceContentHash(
+    const War3ShadowCasterDraw& draw, uint32_t sampleBytes) {
+  uint64_t hash = ShadowCasterTraceIdentityHash(draw);
+  const uint64_t backingHash = ShadowCasterTraceBackingHash(draw);
+  ShadowCasterTraceHashValue(hash, backingHash);
+  ShadowCasterTraceHashBytes(hash, &draw.worldMatrix,
+                             sizeof(draw.worldMatrix));
+  ShadowCasterTraceHashBytes(hash, &draw.boundsCenter,
+                             sizeof(draw.boundsCenter));
+  ShadowCasterTraceHashValue(hash, draw.boundsRadius);
+  ShadowCasterTraceHashValue(hash, draw.positionStride);
+  ShadowCasterTraceHashValue(hash, draw.positionOffset);
+  ShadowCasterTraceHashValue(hash, draw.positionFormat);
+  ShadowCasterTraceHashValue(hash, draw.indexType);
+  ShadowCasterTraceHashValue(hash, draw.vertexBlendEnabled);
+  ShadowCasterTraceHashValue(hash, draw.vertexBlendIndexed);
+  ShadowCasterTraceHashValue(hash, draw.vertexBlendCount);
+  ShadowCasterTraceHashValue(hash, draw.paletteIndex);
+  ShadowCasterTraceHashValue(hash, draw.alphaTestEnabled);
+  ShadowCasterTraceHashValue(hash, draw.alphaBlendEnabled);
+  ShadowCasterTraceHashValue(hash, draw.alphaRef);
+  ShadowCasterTraceHashValue(hash, draw.uvStride);
+  ShadowCasterTraceHashValue(hash, draw.uvOffset);
+  ShadowCasterTraceHashValue(hash, draw.uvFormat);
+  ShadowCasterTraceHashValue(hash, draw.uvBinding);
+  const uint64_t positionSample =
+      ShadowCasterTraceBufferSampleHash(draw.positionInfo, sampleBytes);
+  const uint64_t indexSample =
+      ShadowCasterTraceBufferSampleHash(draw.indexInfo, sampleBytes);
+  ShadowCasterTraceHashValue(hash, positionSample);
+  ShadowCasterTraceHashValue(hash, indexSample);
+  return hash;
+}
+
+bool ShadowCasterTraceFiniteMatrix(const Matrix4& matrix) {
+  for (uint32_t row = 0u; row < 4u; ++row) {
+    for (uint32_t col = 0u; col < 4u; ++col) {
+      if (!std::isfinite(matrix[row][col]))
+        return false;
+    }
+  }
+  return true;
+}
+
+uint32_t ShadowCasterTraceValidationFlags(
+    const War3ShadowCasterDraw& draw) {
+  uint32_t flags = 0u;
+  if (!ShadowCasterTraceFiniteMatrix(draw.worldMatrix))
+    flags |= 1u << 0u;
+  if (draw.positionStorage == nullptr ||
+      draw.positionInfo.buffer == VK_NULL_HANDLE ||
+      draw.positionInfo.size == 0u ||
+      draw.positionStride == 0u ||
+      draw.positionOffset >= draw.positionStride) {
+    flags |= 1u << 1u;
+  }
+  if (draw.indexed &&
+      (draw.indexStorage == nullptr ||
+       draw.indexInfo.buffer == VK_NULL_HANDLE ||
+       draw.indexInfo.size == 0u ||
+       draw.indexCount == 0u)) {
+    flags |= 1u << 2u;
+  }
+  if (!std::isfinite(draw.boundsCenter.x) ||
+      !std::isfinite(draw.boundsCenter.y) ||
+      !std::isfinite(draw.boundsCenter.z) ||
+      !std::isfinite(draw.boundsRadius) ||
+      draw.boundsRadius < 0.0f) {
+    flags |= 1u << 3u;
+  }
+  if (draw.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST &&
+      draw.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+    flags |= 1u << 4u;
+  }
+  return flags;
+}
+
+void WriteFinalShadowCasterRecordEvent(
+    std::ostream& os,
+    uint64_t epoch,
+    uint64_t frameSerial,
+    uint32_t index,
+    const War3ShadowCasterDraw& draw,
+    uint32_t sampleBytes) {
+  const uint64_t identityHash = ShadowCasterTraceIdentityHash(draw);
+  const uint64_t backingHash = ShadowCasterTraceBackingHash(draw);
+  const uint64_t contentHash =
+      ShadowCasterTraceContentHash(draw, sampleBytes);
+  const uint64_t positionSampleHash =
+      ShadowCasterTraceBufferSampleHash(draw.positionInfo, sampleBytes);
+  const uint64_t indexSampleHash =
+      ShadowCasterTraceBufferSampleHash(draw.indexInfo, sampleBytes);
+  const uint64_t positionGeneration =
+      draw.positionStorage != nullptr
+          ? draw.positionStorage->diagnosticStorageGeneration()
+          : 0u;
+  const uint64_t indexGeneration =
+      draw.indexStorage != nullptr
+          ? draw.indexStorage->diagnosticStorageGeneration()
+          : 0u;
+  const uint64_t blendGeneration =
+      draw.blendStorage != nullptr
+          ? draw.blendStorage->diagnosticStorageGeneration()
+          : 0u;
+  const uint64_t uvGeneration =
+      draw.uvStorage != nullptr
+          ? draw.uvStorage->diagnosticStorageGeneration()
+          : 0u;
+
+  os << std::setprecision(9)
+     << "{\"type\":\"shadowFinalCasterRecord\""
+     << ",\"version\":1"
+     << ",\"epoch\":" << epoch
+     << ",\"frameSerial\":" << frameSerial
+     << ",\"index\":" << index
+     << ",\"stage\":" << draw.stage
+     << ",\"category\":" << static_cast<uint32_t>(draw.category)
+     << ",\"batchTag\":" << static_cast<int32_t>(draw.batchTag)
+     << ",\"objectKind\":" << static_cast<uint32_t>(draw.objectKind)
+     << ",\"rawcode\":" << draw.rawcode
+     << ",\"jHandle\":" << draw.jHandle
+     << ",\"batchHandle\":" << draw.batchHandle
+     << ",\"layerIndex\":" << draw.shadowLayerIndex
+     << ",\"pathBlocker\":" << (draw.pathBlocker ? 1 : 0)
+     << ",\"pathBlockerGeometryMarker\":"
+     << (draw.pathBlockerGeometryMarker ? 1 : 0)
+     << ",\"indexed\":" << (draw.indexed ? 1 : 0)
+     << ",\"topology\":" << static_cast<uint32_t>(draw.topology)
+     << ",\"indexCount\":" << draw.indexCount
+     << ",\"firstIndex\":" << draw.firstIndex
+     << ",\"vertexOffset\":" << draw.vertexOffset
+     << ",\"vertexCount\":" << draw.vertexCount
+     << ",\"firstVertex\":" << draw.firstVertex
+     << ",\"minVertexIndex\":" << draw.minVertexIndex
+     << ",\"numVertices\":" << draw.numVertices
+     << ",\"positionStride\":" << draw.positionStride
+     << ",\"positionOffset\":" << draw.positionOffset
+     << ",\"positionFormat\":"
+     << static_cast<uint32_t>(draw.positionFormat)
+     << ",\"positionBufferOffset\":" << draw.positionInfo.offset
+     << ",\"positionBufferSize\":" << draw.positionInfo.size
+     << ",\"positionStorageGeneration\":" << positionGeneration
+     << ",\"indexType\":" << static_cast<uint32_t>(draw.indexType)
+     << ",\"indexBufferOffset\":" << draw.indexInfo.offset
+     << ",\"indexBufferSize\":" << draw.indexInfo.size
+     << ",\"indexStorageGeneration\":" << indexGeneration
+     << ",\"blendStorageGeneration\":" << blendGeneration
+     << ",\"uvStorageGeneration\":" << uvGeneration
+     << ",\"vertexBlendEnabled\":"
+     << (draw.vertexBlendEnabled ? 1 : 0)
+     << ",\"vertexBlendIndexed\":"
+     << (draw.vertexBlendIndexed ? 1 : 0)
+     << ",\"vertexBlendCount\":"
+     << static_cast<uint32_t>(draw.vertexBlendCount)
+     << ",\"paletteIndex\":" << draw.paletteIndex
+     << ",\"alphaTestEnabled\":" << (draw.alphaTestEnabled ? 1 : 0)
+     << ",\"alphaBlendEnabled\":" << (draw.alphaBlendEnabled ? 1 : 0)
+     << ",\"additiveBlend\":" << (draw.additiveBlend ? 1 : 0)
+     << ",\"alphaRef\":" << draw.alphaRef
+     << ",\"uvStride\":" << draw.uvStride
+     << ",\"uvOffset\":" << draw.uvOffset
+     << ",\"uvFormat\":" << static_cast<uint32_t>(draw.uvFormat)
+     << ",\"uvBinding\":" << draw.uvBinding
+     << ",\"diffuseSamplerIndex\":" << draw.diffuseSamplerIndex
+     << ",\"alphaPayloadComplete\":"
+     << (draw.alphaPayloadComplete ? 1 : 0)
+     << ",\"alphaMetadataFrameSerial\":"
+     << draw.alphaMetadataFrameSerial
+     << ",\"metadataBlockerReason\":"
+     << static_cast<uint32_t>(draw.shadowMetadataBlockerReason)
+     << ",\"partLifecycleState\":"
+     << static_cast<uint32_t>(draw.shadowPartLifecycleState)
+     << ",\"boundsCenter\":[" << draw.boundsCenter.x << ','
+     << draw.boundsCenter.y << ',' << draw.boundsCenter.z << ','
+     << draw.boundsCenter.w << ']'
+     << ",\"boundsRadius\":" << draw.boundsRadius
+     << ",\"worldTranslation\":[" << draw.worldMatrix[3].x << ','
+     << draw.worldMatrix[3].y << ',' << draw.worldMatrix[3].z << ']'
+     << ",\"worldMatrix\":";
+  WriteMatrixJson(os, draw.worldMatrix);
+  WriteHexField(os, "identityHash", identityHash);
+  WriteHexField(os, "backingHash", backingHash);
+  WriteHexField(os, "contentHash", contentHash);
+  WriteHexField(os, "metadataKeyHash", draw.shadowMetadataKeyHash);
+  WritePtrField(os, "renderablePart", draw.shadowRenderablePart);
+  WriteHexField(os, "positionSampleHash", positionSampleHash);
+  WriteHexField(os, "indexSampleHash", indexSampleHash);
+  WritePtrField(os, "positionStoragePtr", draw.positionStorage.ptr());
+  WriteHexField(
+      os, "positionBuffer",
+      ShadowCasterTraceHandleBits(draw.positionInfo.buffer));
+  WritePtrField(os, "indexStoragePtr", draw.indexStorage.ptr());
+  WriteHexField(os, "indexBuffer",
+                ShadowCasterTraceHandleBits(draw.indexInfo.buffer));
+  WritePtrField(os, "blendStoragePtr", draw.blendStorage.ptr());
+  WriteHexField(os, "blendBuffer",
+                ShadowCasterTraceHandleBits(draw.blendInfo.buffer));
+  WritePtrField(os, "uvStoragePtr", draw.uvStorage.ptr());
+  WriteHexField(os, "uvBuffer",
+                ShadowCasterTraceHandleBits(draw.uvInfo.buffer));
+  WritePtrField(os, "diffuseTexturePtr", draw.diffuseTexture.ptr());
+  WritePtrField(os, "diffuseSamplerPtr", draw.diffuseSampler.ptr());
+  os << ",\"validationFlags\":"
+     << ShadowCasterTraceValidationFlags(draw)
+     << ",\"gpuSkin\":{"
+     << "\"valid\":" << (draw.gpuSkinInput.valid ? 1 : 0)
+     << ",\"irreversible\":"
+     << (draw.gpuSkinInput.irreversible ? 1 : 0)
+     << ",\"storageLeaseId\":" << draw.gpuSkinInput.storageLeaseId
+     << ",\"storagePageGeneration\":"
+     << draw.gpuSkinInput.storagePageGeneration
+     << ",\"storagePageId\":" << draw.gpuSkinInput.storagePageId
+     << ",\"mapEpoch\":" << draw.gpuSkinInput.desc.mapEpoch
+     << ",\"deviceEpoch\":" << draw.gpuSkinInput.desc.deviceEpoch
+     << ",\"frameTag\":" << draw.gpuSkinInput.desc.frameTag
+     << ",\"token\":" << draw.gpuSkinInput.desc.token
+     << ",\"dispatchEpoch\":" << draw.gpuSkinInput.desc.dispatchEpoch
+     << ",\"uploadEpoch\":" << draw.gpuSkinInput.desc.uploadEpoch
+     << ",\"staticByteOffset\":"
+     << draw.gpuSkinInput.desc.staticByteOffset
+     << ",\"staticByteLength\":"
+     << draw.gpuSkinInput.desc.staticByteLength
+     << ",\"paletteByteOffset\":"
+     << draw.gpuSkinInput.desc.paletteByteOffset
+     << ",\"paletteByteLength\":"
+     << draw.gpuSkinInput.desc.paletteByteLength
+     << ",\"vertexCount\":" << draw.gpuSkinInput.desc.vertexCount
+     << ",\"paletteMatrixCount\":"
+     << draw.gpuSkinInput.desc.paletteMatrixCount
+     << ",\"sourceUvLayerCount\":"
+     << draw.gpuSkinInput.desc.sourceUvLayerCount
+     << ",\"outputFormat\":" << draw.gpuSkinInput.desc.outputFormat
+     << ",\"layoutGeneration\":"
+     << draw.gpuSkinInput.desc.layoutGeneration
+     << ",\"consumerBits\":" << draw.gpuSkinInput.desc.consumerBits
+     << "}}\n";
 }
 
 template <typename T>
@@ -486,6 +1701,10 @@ void WriteCadenceJson(std::ostream& os,
      << sample.shadowHistoryValidAfter
      << ",\"shadowHistoryReadIndex\":" << sample.shadowHistoryReadIndex
      << ",\"shadowHistoryWriteIndex\":" << sample.shadowHistoryWriteIndex
+     << ",\"shadowHistoryAdvancedThisFrame\":"
+     << sample.shadowHistoryAdvancedThisFrame
+     << ",\"shadowHistoryAdvanceSkippedIncomplete\":"
+     << sample.shadowHistoryAdvanceSkippedIncomplete
      << ",\"shadowReceiverSampleSource\":"
      << sample.shadowReceiverSampleSource << '}';
 }
@@ -533,6 +1752,43 @@ void WriteTraceFrameEvent(
      << stats.semanticSceneDirectPartLeaseRestoredCount
      << ",\"semanticSceneDirectPartLeaseUpdatedCount\":"
      << stats.semanticSceneDirectPartLeaseUpdatedCount
+     << ",\"semanticSceneDirectPartLeaseExpiredCount\":"
+     << stats.semanticSceneDirectPartLeaseExpiredCount
+     << ",\"semanticSceneDirectPartLeaseRejectedDynamicMeshCount\":"
+     << stats.semanticSceneDirectPartLeaseRejectedDynamicMeshCount
+     << ",\"semanticSceneDirectPartLeaseRejectedNotSelfContainedCount\":"
+     << stats.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount
+     << ",\"semanticSceneDirectPartLeaseRejectedUnsafeBackingCount\":"
+     << stats.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount
+     << ",\"semanticSceneDirectPartLeaseRejectedSelfRenewCount\":"
+     << stats.semanticSceneDirectPartLeaseRejectedSelfRenewCount
+     << ",\"semanticSceneDirectPartLeaseBudgetLimitCount\":"
+     << stats.semanticSceneDirectPartLeaseBudgetLimitCount
+     << ",\"semanticSceneShadowManifestPartLeaseRestoredCount\":"
+     << stats.semanticSceneShadowManifestPartLeaseRestoredCount
+     << ",\"semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount\":"
+     << stats.semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount
+     << ",\"semanticSceneShadowManifestPartLeaseExpiredCount\":"
+     << stats.semanticSceneShadowManifestPartLeaseExpiredCount
+     << ",\"semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount\":"
+     << stats.semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount
+     << ",\"semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount\":"
+     << stats.semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount
+     << ",\"semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount\":"
+     << stats.semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount
+     << ",\"semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount\":"
+     << stats
+            .semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount
+     << ",\"semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount\":"
+     << stats.semanticSceneShadowManifestPartLeaseRejectedSelfRenewCount
+     << ",\"semanticSceneShadowManifestPartLeaseBudgetLimitCount\":"
+     << stats.semanticSceneShadowManifestPartLeaseBudgetLimitCount
+     << ",\"semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount\":"
+     << stats.semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount
+     << ",\"semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount\":"
+     << stats.semanticSceneShadowManifestPartLeasePoseFreshenedFromCModelCount
+     << ",\"semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount\":"
+     << stats.semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount
      << ",\"semanticSceneShadowManifestObjectCount\":"
      << stats.semanticSceneShadowManifestObjectCount
      << ",\"semanticSceneShadowManifestPartCount\":"
@@ -567,6 +1823,43 @@ void WriteTraceFrameEvent(
      << stats.semanticSceneShadowManifestPartLeasePaletteRefreshHitCount
      << ",\"semanticSceneShadowManifestPartLeasePaletteRefreshMissCount\":"
      << stats.semanticSceneShadowManifestPartLeasePaletteRefreshMissCount
+     << ",\"semanticSceneShadowManifestCorePartPrunedOnLeaseExpiryCount\":"
+     << stats
+            .semanticSceneShadowManifestCorePartPrunedOnLeaseExpiryCount
+     << ",\"semanticSceneShadowManifestCoreObjectEmptiedOnLeaseExpiryCount\":"
+     << stats
+            .semanticSceneShadowManifestCoreObjectEmptiedOnLeaseExpiryCount
+     << ",\"semanticSceneShadowManifestLeaseExpiredBackingOnlyCount\":"
+     << stats.semanticSceneShadowManifestLeaseExpiredBackingOnlyCount
+     << ",\"semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount\":"
+     << stats
+            .semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount
+     << ",\"semanticSceneShadowManifestMissingRequiredPartCount\":"
+     << stats.semanticSceneShadowManifestMissingRequiredPartCount
+     << ",\"semanticSceneShadowManifestGraceUsedCount\":"
+     << stats.semanticSceneShadowManifestGraceUsedCount
+     << ",\"semanticSceneShadowManifestTombstoneRetiredCount\":"
+     << stats.semanticSceneShadowManifestTombstoneRetiredCount
+     << ",\"semanticSceneShadowManifestObjectCoreCompleteCount\":"
+     << stats.semanticSceneShadowManifestObjectCoreCompleteCount
+     << ",\"semanticSceneShadowManifestObjectCoreIncompleteSkipCount\":"
+     << stats.semanticSceneShadowManifestObjectCoreIncompleteSkipCount
+     << ",\"semanticSceneShadowManifestPartOmittedIncompleteCoreCount\":"
+     << stats.semanticSceneShadowManifestPartOmittedIncompleteCoreCount
+     << ",\"semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount\":"
+     << stats
+            .semanticSceneShadowManifestObjectCoreEpochUpdatedFromLiveCount
+     << ",\"semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount\":"
+     << stats
+            .semanticSceneShadowManifestObjectCoreEpochRestoredCompleteCount
+     << ",\"semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount\":"
+     << stats
+            .semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount
+     << ",\"semanticSceneShadowManifestObjectCoreEpochMissingPartCount\":"
+     << stats.semanticSceneShadowManifestObjectCoreEpochMissingPartCount
+     << ",\"semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount\":"
+     << stats
+            .semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount
      << ",\"submitPaletteFrameLagSampleCount\":"
      << currentDraw.submitPaletteFrameLagSampleCount
      << ",\"submitPaletteFrameLag3To5Count\":"
@@ -723,12 +2016,18 @@ void WriteTraceFrameEvent(
      << stats.drawTimeSemanticProducerVisibleCandidateCount
      << ",\"drawTimeSemanticProducerFreshEntryCount\":"
      << stats.drawTimeSemanticProducerFreshEntryCount
+     << ",\"drawTimeSemanticProducerClaimedCount\":"
+     << stats.drawTimeSemanticProducerClaimedCount
      << ",\"drawTimeSemanticProducerSubmittedCount\":"
      << stats.drawTimeSemanticProducerSubmittedCount
      << ",\"drawTimeSemanticProducerMissNoFreshEntryCount\":"
      << stats.drawTimeSemanticProducerMissNoFreshEntryCount
      << ",\"drawTimeSemanticProducerFallbackCurrentDrawCount\":"
      << stats.drawTimeSemanticProducerFallbackCurrentDrawCount
+     << ",\"drawTimeSemanticProducerOwnedDirectGroupedSkipCount\":"
+     << stats.drawTimeSemanticProducerOwnedDirectGroupedSkipCount
+     << ",\"drawTimeSemanticProducerLifecycleMergedCount\":"
+     << stats.drawTimeSemanticProducerLifecycleMergedCount
      << ",\"semanticSceneRejectedPathBlockerCount\":"
      << stats.semanticSceneRejectedPathBlockerCount
      << ",\"semanticSceneRejectedPathBlockerEarlyBypassCount\":"
@@ -755,10 +2054,26 @@ void WriteTraceFrameEvent(
      << stats.semanticSceneDirectDrawTimePrebuildBypassAttemptCount
      << ",\"semanticSceneDirectDrawTimePrebuildBypassHitCount\":"
      << stats.semanticSceneDirectDrawTimePrebuildBypassHitCount
+     << ",\"semanticSceneFastAppendBoundsPoseAvailableCount\":"
+     << stats.semanticSceneFastAppendBoundsPoseAvailableCount
+     << ",\"semanticSceneFastAppendBoundsSceneReadSuccessCount\":"
+     << stats.semanticSceneFastAppendBoundsSceneReadSuccessCount
+     << ",\"semanticSceneFastAppendBoundsPoseDeltaLe1Count\":"
+     << stats.semanticSceneFastAppendBoundsPoseDeltaLe1Count
+     << ",\"semanticSceneFastAppendBoundsPoseDeltaLe4Count\":"
+     << stats.semanticSceneFastAppendBoundsPoseDeltaLe4Count
+     << ",\"semanticSceneFastAppendBoundsPoseDeltaLe16Count\":"
+     << stats.semanticSceneFastAppendBoundsPoseDeltaLe16Count
+     << ",\"semanticSceneFastAppendBoundsPoseDeltaGt16Count\":"
+     << stats.semanticSceneFastAppendBoundsPoseDeltaGt16Count
+     << ",\"semanticSceneFastAppendBoundsPoseDeltaMaxMilli\":"
+     << stats.semanticSceneFastAppendBoundsPoseDeltaMaxMilli
      << ",\"drawTimeVBCacheTotalEntered\":"
      << stats.drawTimeVBCacheTotalEntered
      << ",\"drawTimeVBCacheRejectNoRenderablePart\":"
      << stats.drawTimeVBCacheRejectNoRenderablePart
+     << ",\"drawTimeVBCacheRejectNoLayerContext\":"
+     << stats.drawTimeVBCacheRejectNoLayerContext
      << ",\"drawTimeVBCacheRejectNoDecl\":"
      << stats.drawTimeVBCacheRejectNoDecl
      << ",\"drawTimeVBCacheRejectNoPosition\":"
@@ -773,6 +2088,8 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCacheRejectInsufficientLength
      << ",\"drawTimeVBCacheRejectNoBuffer\":"
      << stats.drawTimeVBCacheRejectNoBuffer
+     << ",\"drawTimeVBCacheRejectIncompleteIndex\":"
+     << stats.drawTimeVBCacheRejectIncompleteIndex
      << ",\"drawTimeVBCachePositionCopyCount\":"
      << stats.drawTimeVBCachePositionCopyCount
      << ",\"drawTimeVBCachePositionCopyBytes\":"
@@ -1040,6 +2357,18 @@ void WriteCurrentDrawRecordEvent(std::ostream& os, uint64_t epoch,
   os << ",\"stream1Stride\":" << record.stream1Stride
      << ",\"capturedPaletteCount\":" << record.capturedPaletteCount
      << ",\"frameTag\":" << record.frameTag
+     << ",\"stage\":" << record.stage
+     << ",\"batchTag\":" << int32_t(record.batchTag)
+     << ",\"producerStage\":" << record.producerStage
+     << ",\"producerGroup\":" << int32_t(record.producerGroup)
+     << ",\"sourceKind\":" << uint32_t(record.sourceKind)
+     << ",\"producerFreshThisFrame\":"
+     << (record.producerFreshThisFrame ? 1 : 0)
+     << ",\"stagePolicyRevision\":" << record.stagePolicyRevision
+     << ",\"fromGrace\":" << (record.fromGrace ? 1 : 0)
+     << ",\"graceAge\":" << record.graceAge
+     << ",\"alphaPayloadComplete\":"
+     << (record.alphaPayloadComplete ? 1 : 0)
      << ",\"visibleFrameSerial\":" << record.visibleFrameSerial
      << ",\"renderFrameIndex\":" << record.renderFrameIndex
      << ",\"captureSerial\":" << record.captureSerial
@@ -1070,12 +2399,17 @@ bool EnsureShadowPoseFullTraceOpenLocked(
       << ",\"maxPoseRecords\":" << config.maxPoseRecords
       << ",\"maxShadowObjectRecords\":" << config.maxShadowObjectRecords
       << ",\"maxCurrentDrawRecords\":" << config.maxCurrentDrawRecords
+      << ",\"maxFinalCasterRecords\":" << config.maxFinalCasterRecords
+      << ",\"finalCasterSampleBytes\":"
+      << config.finalCasterSampleBytes
       << ",\"includePoseRecords\":"
       << (config.includePoseRecords ? 1 : 0)
       << ",\"includeShadowObjectRecords\":"
       << (config.includeShadowObjectRecords ? 1 : 0)
       << ",\"includeCurrentDrawRecords\":"
       << (config.includeCurrentDrawRecords ? 1 : 0)
+      << ",\"includeFinalCasterRecords\":"
+      << (config.includeFinalCasterRecords ? 1 : 0)
       << ",\"includeMatrixBytes\":"
       << (config.includeMatrixBytes ? 1 : 0)
       << ",\"statsLayout\":\"War3ShadowCaptureStats raw hex uses the current "
@@ -1379,6 +2713,1240 @@ void MergeRenderObject(dxvk::War3ShadowSemanticContext& semantic,
 
 } // namespace
 
+SemanticAugmentTlsCacheStats QuerySemanticAugmentTlsCacheStats() noexcept {
+  const auto& source = g_semanticAugmentTlsCacheStats;
+  SemanticAugmentTlsCacheStats result = {};
+  result.enabled = SemanticAugmentTlsCacheRuntime();
+  result.telemetryEnabled = SemanticAugmentTlsCacheStatsRuntime();
+  result.capacityPerRegistry =
+      static_cast<uint32_t>(kSemanticAugmentTlsCacheCapacity);
+  result.modelLookups =
+      source.modelLookups.load(std::memory_order_relaxed);
+  result.modelHits = source.modelHits.load(std::memory_order_relaxed);
+  result.modelNegativeHits =
+      source.modelNegativeHits.load(std::memory_order_relaxed);
+  result.modelMisses = source.modelMisses.load(std::memory_order_relaxed);
+  result.modelGenerationMismatches =
+      source.modelGenerationMismatches.load(std::memory_order_relaxed);
+  result.modelCollisions =
+      source.modelCollisions.load(std::memory_order_relaxed);
+  result.shadowLookups =
+      source.shadowLookups.load(std::memory_order_relaxed);
+  result.shadowHits = source.shadowHits.load(std::memory_order_relaxed);
+  result.shadowNegativeHits =
+      source.shadowNegativeHits.load(std::memory_order_relaxed);
+  result.shadowMisses =
+      source.shadowMisses.load(std::memory_order_relaxed);
+  result.shadowGenerationMismatches =
+      source.shadowGenerationMismatches.load(std::memory_order_relaxed);
+  result.shadowCollisions =
+      source.shadowCollisions.load(std::memory_order_relaxed);
+  result.modelRegistryGeneration =
+      model::ModelInstanceRegistry::instance().mutationGeneration();
+  result.shadowRegistryGeneration =
+      ShadowObjectRegistry::instance().mutationGeneration();
+  return result;
+}
+
+void FinalizeWorldObjectsPhase1PreviousFrameWithoutNewDecision() noexcept {
+  const uint64_t completedEventSequence =
+      g_worldObjectsPhase1Tls.eventSequence;
+  const uint64_t completedDispatchEventSequence =
+      g_worldObjectsPhase1Tls.dispatchCaptureEventSequence;
+  const auto completedDispatchCaptureKind =
+      g_worldObjectsPhase1Tls.dispatchCaptureKind;
+  auto completedPeriodicDispatch =
+      g_worldObjectsPhase1Tls.periodicDispatch;
+  uint64_t abandonedCollectorCalls = 0u;
+  for (uint32_t group = 0u; group < kWorldObjectsPhase1GroupCount; ++group) {
+    abandonedCollectorCalls +=
+        g_worldObjectsPhase1Tls.pendingCollectorCalls[group];
+  }
+  const uint64_t activeDispatchCaptureSequence =
+      g_worldObjectsPhase1ActiveDispatchCaptureSequence.load(
+          std::memory_order_acquire);
+  const bool hadLocalFrameState =
+      completedEventSequence != 0u ||
+      completedDispatchEventSequence != 0u ||
+      activeDispatchCaptureSequence != 0u ||
+      g_worldObjectsPhase1Tls.collectorActive ||
+      abandonedCollectorCalls != 0u ||
+      g_worldObjectsPhase1PurePeriodicDispatchSequence != 0u;
+
+  if (!hadLocalFrameState) {
+    if (g_worldObjectsPhase1ActiveEventSequence.load(
+            std::memory_order_acquire) != 0u) {
+      g_worldObjectsPhase1ActiveEventSequence.store(
+          0u, std::memory_order_release);
+    }
+    return;
+  }
+
+  // This is the exact Present boundary at which the normal decision path
+  // calls RecordWorldObjectsPhase1Tracking and takes the same previous-frame
+  // TLS state.  Clear before publishing so no later dispatch can append to a
+  // frame that has already been settled.
+  WorldObjectsPhase1WriteGuard writeGuard;
+  SettleWorldObjectsPhase1ActiveDispatchCaptureMarker(
+      completedDispatchEventSequence, completedDispatchCaptureKind);
+  g_worldObjectsPhase1Tls = {};
+  ClearWorldObjectsPhase1PairedCaptureTls();
+
+  PublishWorldObjectsPhase1PairedCapture(
+      completedDispatchEventSequence, completedDispatchCaptureKind,
+      completedPeriodicDispatch);
+  if (abandonedCollectorCalls != 0u) {
+    g_worldObjectsPhase1CollectorWithoutHookCount.fetch_add(
+        abandonedCollectorCalls, std::memory_order_relaxed);
+  }
+  g_worldObjectsPhase1ActiveEventSequence.store(
+      0u, std::memory_order_release);
+}
+
+bool IsWorldObjectsPhase1CaptureActive(int groupIdx) noexcept {
+  return groupIdx >= 0 &&
+      uint32_t(groupIdx) < kWorldObjectsPhase1GroupCount &&
+      g_worldObjectsPhase1Tls.eventSequence != 0u;
+}
+
+bool IsWorldObjectsPhase1CollectorCaptureActive() noexcept {
+  return g_worldObjectsPhase1Tls.eventSequence != 0u &&
+      g_worldObjectsPhase1Tls.collectorActive;
+}
+
+bool BeginWorldObjectsPhase1Collector(int groupIdx) noexcept {
+  if (groupIdx < 0 || uint32_t(groupIdx) >= kWorldObjectsPhase1GroupCount) {
+    if (g_worldObjectsPhase1Tls.eventSequence != 0u)
+      RecordWorldObjectsPhase1Counter(
+          g_worldObjectsPhase1UnexpectedGroupCount);
+    return false;
+  }
+
+  if (g_worldObjectsPhase1Tls.eventSequence == 0u) {
+    if (g_worldObjectsPhase1ActiveEventSequence.load(
+            std::memory_order_acquire) != 0u) {
+      RecordWorldObjectsPhase1Counter(
+          g_worldObjectsPhase1CollectorWithoutEventCount);
+    }
+    return false;
+  }
+
+  if (g_worldObjectsPhase1Tls.collectorActive) {
+    RecordWorldObjectsPhase1Counter(
+        g_worldObjectsPhase1CollectorReentryCount);
+    return false;
+  }
+
+  const uint32_t group = uint32_t(groupIdx);
+  if (g_worldObjectsPhase1Tls.pendingCollectorCalls[group] != 0u) {
+    RecordWorldObjectsPhase1Counter(
+        g_worldObjectsPhase1CollectorWithoutHookCount,
+        g_worldObjectsPhase1Tls.pendingCollectorCalls[group]);
+    g_worldObjectsPhase1Tls.pendingCollectorCalls[group] = 0u;
+    g_worldObjectsPhase1Tls.pendingCollectorTicks[group] = 0u;
+  }
+  g_worldObjectsPhase1Tls.collectorActive = true;
+  g_worldObjectsPhase1Tls.collectorGroup = group;
+  g_worldObjectsPhase1Tls.modelFeedTicks = 0u;
+  g_worldObjectsPhase1Tls.shadowFeedTicks = 0u;
+  g_worldObjectsPhase1Tls.modelFeedMaxTicks = 0u;
+  g_worldObjectsPhase1Tls.shadowFeedMaxTicks = 0u;
+  g_worldObjectsPhase1Tls.modelFeedCalls = 0u;
+  g_worldObjectsPhase1Tls.shadowFeedCalls = 0u;
+  return true;
+}
+
+void CompleteWorldObjectsPhase1Collector(
+    const WorldObjectsPhase1CollectorObservation& observation) noexcept {
+  if (!g_worldObjectsPhase1Tls.collectorActive ||
+      g_worldObjectsPhase1Tls.eventSequence == 0u ||
+      g_worldObjectsPhase1Tls.collectorGroup >=
+          kWorldObjectsPhase1GroupCount) {
+    RecordWorldObjectsPhase1Counter(
+        g_worldObjectsPhase1CollectorWithoutEventCount);
+    return;
+  }
+
+  const uint32_t group = g_worldObjectsPhase1Tls.collectorGroup;
+  const uint64_t eventSequence = g_worldObjectsPhase1Tls.eventSequence;
+  const uint64_t modelFeedTicks = g_worldObjectsPhase1Tls.modelFeedTicks;
+  const uint64_t shadowFeedTicks = g_worldObjectsPhase1Tls.shadowFeedTicks;
+  const uint64_t modelFeedMaxTicks =
+      g_worldObjectsPhase1Tls.modelFeedMaxTicks;
+  const uint64_t shadowFeedMaxTicks =
+      g_worldObjectsPhase1Tls.shadowFeedMaxTicks;
+  const uint32_t modelFeedCalls = g_worldObjectsPhase1Tls.modelFeedCalls;
+  const uint32_t shadowFeedCalls = g_worldObjectsPhase1Tls.shadowFeedCalls;
+  const uint32_t outcomeIndex =
+      static_cast<uint32_t>(observation.outcome);
+  const uint32_t safeOutcomeIndex =
+      outcomeIndex < kWorldObjectsPhase1CollectorOutcomeCount
+          ? outcomeIndex
+          : static_cast<uint32_t>(
+                WorldObjectsPhase1CollectorOutcome::Unclassified);
+  const uint64_t partitionTicks = observation.setupTicks +
+      observation.iterateTicks + observation.registerTicks +
+      observation.tailTicks;
+  const uint64_t feedTicks = modelFeedTicks + shadowFeedTicks;
+
+  const uint64_t pairedCaptureSequence =
+      CurrentWorldObjectsPhase1PurePeriodicDispatchSequence();
+  if (pairedCaptureSequence != 0u) {
+    RecordWorldObjectsPhase1PairedTiming(
+        pairedCaptureSequence,
+        WorldObjectsPhase1PairedTimingStage::WorldCollector,
+        observation.inclusiveTicks);
+  }
+
+  WorldObjectsPhase1WriteGuard writeGuard;
+  auto& aggregate = g_worldObjectsPhase1Groups[group];
+  RecordWorldObjectsPhase1AtomicTiming(
+      aggregate.collectorInclusive, observation.inclusiveTicks);
+  RecordWorldObjectsPhase1AtomicTiming(
+      aggregate.collectorSetup, observation.setupTicks);
+  RecordWorldObjectsPhase1AtomicTiming(
+      aggregate.collectorIterate, observation.iterateTicks);
+  RecordWorldObjectsPhase1AtomicTiming(
+      aggregate.collectorRegister, observation.registerTicks);
+  RecordWorldObjectsPhase1AtomicTiming(
+      aggregate.collectorTail, observation.tailTicks);
+  if (modelFeedCalls != 0u) {
+    RecordWorldObjectsPhase1AtomicTimingSamples(
+        aggregate.modelFeed, modelFeedCalls, modelFeedTicks,
+        modelFeedMaxTicks);
+  }
+  if (shadowFeedCalls != 0u) {
+    RecordWorldObjectsPhase1AtomicTimingSamples(
+        aggregate.shadowFeed, shadowFeedCalls, shadowFeedTicks,
+        shadowFeedMaxTicks);
+  }
+  aggregate.listEntries.fetch_add(
+      observation.listEntries, std::memory_order_relaxed);
+  aggregate.acceptedEntries.fetch_add(
+      observation.acceptedEntries, std::memory_order_relaxed);
+  aggregate.sceneNodeEntries.fetch_add(
+      observation.sceneNodeEntries, std::memory_order_relaxed);
+  aggregate.handleEntries.fetch_add(
+      observation.handleEntries, std::memory_order_relaxed);
+  aggregate.outcomeCounts[safeOutcomeIndex].fetch_add(
+      1u, std::memory_order_relaxed);
+  if (partitionTicks != observation.inclusiveTicks) {
+    aggregate.collectorPartitionMismatchCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+  if (feedTicks > observation.registerTicks) {
+    aggregate.registerFeedContainmentViolationCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+  if (observation.acceptedEntries > observation.listEntries) {
+    aggregate.acceptedCountViolationCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+  if (observation.sceneNodeEntries > observation.acceptedEntries) {
+    aggregate.sceneNodeCountViolationCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+  if (observation.handleEntries > observation.acceptedEntries) {
+    aggregate.handleCountViolationCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g_worldObjectsPhase1EventMutex);
+    auto& event = g_worldObjectsPhase1Events[
+        (eventSequence - 1u) % kWorldObjectsPhase1EventSlotCount];
+    if (event.sequence == eventSequence) {
+      auto& eventGroup = event.groups[group];
+      const uint32_t groupBit = 1u << group;
+      if (eventGroup.collectorCalls != 0u)
+        event.duplicateCollectorGroupMask |= groupBit;
+      event.collectorGroupMask |= groupBit;
+      eventGroup.collectorCalls += 1u;
+      eventGroup.collectorInclusiveTicks += observation.inclusiveTicks;
+      eventGroup.collectorSetupTicks += observation.setupTicks;
+      eventGroup.collectorIterateTicks += observation.iterateTicks;
+      eventGroup.collectorRegisterTicks += observation.registerTicks;
+      eventGroup.collectorTailTicks += observation.tailTicks;
+      eventGroup.modelFeedTicks += modelFeedTicks;
+      eventGroup.shadowFeedTicks += shadowFeedTicks;
+      eventGroup.modelFeedCalls += modelFeedCalls;
+      eventGroup.shadowFeedCalls += shadowFeedCalls;
+      eventGroup.listEntries += observation.listEntries;
+      eventGroup.acceptedEntries += observation.acceptedEntries;
+      eventGroup.sceneNodeEntries += observation.sceneNodeEntries;
+      eventGroup.handleEntries += observation.handleEntries;
+      eventGroup.outcomeCounts[safeOutcomeIndex] += 1u;
+    }
+  }
+
+  g_worldObjectsPhase1Tls.pendingCollectorTicks[group] =
+      observation.inclusiveTicks;
+  g_worldObjectsPhase1Tls.pendingCollectorCalls[group] = 1u;
+  g_worldObjectsPhase1Tls.collectorActive = false;
+  g_worldObjectsPhase1Tls.collectorGroup =
+      kWorldObjectsPhase1GroupCount;
+  g_worldObjectsPhase1Tls.modelFeedTicks = 0u;
+  g_worldObjectsPhase1Tls.shadowFeedTicks = 0u;
+  g_worldObjectsPhase1Tls.modelFeedMaxTicks = 0u;
+  g_worldObjectsPhase1Tls.shadowFeedMaxTicks = 0u;
+  g_worldObjectsPhase1Tls.modelFeedCalls = 0u;
+  g_worldObjectsPhase1Tls.shadowFeedCalls = 0u;
+}
+
+void RecordWorldObjectsPhase1HookInclusive(int groupIdx,
+                                           uint64_t ticks) noexcept {
+  if (groupIdx < 0 || uint32_t(groupIdx) >= kWorldObjectsPhase1GroupCount) {
+    if (g_worldObjectsPhase1Tls.eventSequence != 0u)
+      RecordWorldObjectsPhase1Counter(
+          g_worldObjectsPhase1UnexpectedGroupCount);
+    return;
+  }
+  if (g_worldObjectsPhase1Tls.eventSequence == 0u)
+    return;
+
+  const uint32_t group = uint32_t(groupIdx);
+  const uint64_t eventSequence = g_worldObjectsPhase1Tls.eventSequence;
+  const uint32_t pendingCalls =
+      g_worldObjectsPhase1Tls.pendingCollectorCalls[group];
+  const uint64_t pendingTicks =
+      g_worldObjectsPhase1Tls.pendingCollectorTicks[group];
+
+  WorldObjectsPhase1WriteGuard writeGuard;
+  auto& aggregate = g_worldObjectsPhase1Groups[group];
+  RecordWorldObjectsPhase1AtomicTiming(aggregate.hookInclusive, ticks);
+  if (pendingCalls == 0u) {
+    g_worldObjectsPhase1HookWithoutCollectorCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  } else if (ticks < pendingTicks) {
+    aggregate.hookContainmentViolationCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g_worldObjectsPhase1EventMutex);
+    auto& event = g_worldObjectsPhase1Events[
+        (eventSequence - 1u) % kWorldObjectsPhase1EventSlotCount];
+    if (event.sequence == eventSequence) {
+      auto& eventGroup = event.groups[group];
+      const uint32_t groupBit = 1u << group;
+      if (eventGroup.hookCalls != 0u)
+        event.duplicateHookGroupMask |= groupBit;
+      event.hookGroupMask |= groupBit;
+      eventGroup.hookCalls += 1u;
+      eventGroup.hookInclusiveTicks += ticks;
+    }
+  }
+
+  g_worldObjectsPhase1Tls.pendingCollectorCalls[group] = 0u;
+  g_worldObjectsPhase1Tls.pendingCollectorTicks[group] = 0u;
+}
+
+void RecordWorldObjectsPhase1RegistryFeed(uint64_t modelTicks,
+                                          uint64_t shadowTicks) noexcept {
+  if (!g_worldObjectsPhase1Tls.collectorActive ||
+      g_worldObjectsPhase1Tls.eventSequence == 0u) {
+    RecordWorldObjectsPhase1Counter(
+        g_worldObjectsPhase1RegistryFeedOutsideCollectorCount);
+    return;
+  }
+  g_worldObjectsPhase1Tls.modelFeedTicks += modelTicks;
+  g_worldObjectsPhase1Tls.shadowFeedTicks += shadowTicks;
+  g_worldObjectsPhase1Tls.modelFeedMaxTicks = std::max(
+      g_worldObjectsPhase1Tls.modelFeedMaxTicks, modelTicks);
+  g_worldObjectsPhase1Tls.shadowFeedMaxTicks = std::max(
+      g_worldObjectsPhase1Tls.shadowFeedMaxTicks, shadowTicks);
+  g_worldObjectsPhase1Tls.modelFeedCalls += 1u;
+  g_worldObjectsPhase1Tls.shadowFeedCalls += 1u;
+}
+
+void RecordWorldObjectsPhase1PeriodicDispatch(
+    uint64_t eventSequence, bool special, bool group0Stage,
+    bool worldFastEligibleIgnoringIdentity,
+    bool worldFastBlockedByIdentity) noexcept {
+  if (eventSequence == 0u ||
+      CurrentWorldObjectsPhase1PurePeriodicDispatchSequence() !=
+          eventSequence ||
+      g_worldObjectsPhase1Tls.dispatchCaptureEventSequence != eventSequence ||
+      !IsWorldObjectsPhase1PairedCaptureKind(
+          g_worldObjectsPhase1Tls.dispatchCaptureKind))
+    return;
+
+  auto& dispatch = g_worldObjectsPhase1Tls.periodicDispatch;
+  dispatch.commonCalls += special ? 0u : 1u;
+  dispatch.specialCalls += special ? 1u : 0u;
+  dispatch.group0Calls += group0Stage ? 1u : 0u;
+  dispatch.otherStageCalls += group0Stage ? 0u : 1u;
+  dispatch.worldFastEligibleIgnoringIdentity +=
+      worldFastEligibleIgnoringIdentity ? 1u : 0u;
+  dispatch.worldFastBlockedByIdentity +=
+      worldFastBlockedByIdentity ? 1u : 0u;
+}
+
+void RecordWorldObjectsPhase1PeriodicDispatchRoot(
+    uint64_t eventSequence, uint64_t ticks) noexcept {
+  if (eventSequence == 0u ||
+      CurrentWorldObjectsPhase1PurePeriodicDispatchSequence() !=
+          eventSequence ||
+      g_worldObjectsPhase1Tls.dispatchCaptureEventSequence != eventSequence ||
+      !IsWorldObjectsPhase1PairedCaptureKind(
+          g_worldObjectsPhase1Tls.dispatchCaptureKind))
+    return;
+
+  auto& dispatch = g_worldObjectsPhase1Tls.periodicDispatch;
+  dispatch.dispatchRootCalls += 1u;
+  dispatch.dispatchRootTicks += ticks;
+}
+
+void RecordWorldObjectsPhase1PeriodicGetTagStage(
+    uint64_t eventSequence, bool hit, bool conflict,
+    uint32_t probes, uint64_t ticks) noexcept {
+  if (eventSequence == 0u ||
+      CurrentWorldObjectsPhase1PurePeriodicDispatchSequence() !=
+          eventSequence ||
+      g_worldObjectsPhase1Tls.dispatchCaptureEventSequence != eventSequence ||
+      !IsWorldObjectsPhase1PairedCaptureKind(
+          g_worldObjectsPhase1Tls.dispatchCaptureKind))
+    return;
+
+  auto& dispatch = g_worldObjectsPhase1Tls.periodicDispatch;
+  dispatch.getTagStageCalls += 1u;
+  dispatch.getTagStageHits += hit ? 1u : 0u;
+  dispatch.getTagStageMisses += hit ? 0u : 1u;
+  dispatch.getTagStageConflicts += hit && conflict ? 1u : 0u;
+  dispatch.getTagStageProbes += probes;
+  dispatch.getTagStageTicks += ticks;
+  // RenderQueueTracker brackets every recorded GetTagStage sample with one
+  // begin/end QPC pair. Account those reads here so the pair-level QPC
+  // contract remains exact without widening the tracker hot-path API.
+  dispatch.qpcReadCount += 2u;
+}
+
+void RecordWorldObjectsPhase1PairedTiming(
+    uint64_t eventSequence, WorldObjectsPhase1PairedTimingStage stage,
+    uint64_t ticks) noexcept {
+  const uint32_t stageIndex = static_cast<uint32_t>(stage);
+  if (eventSequence == 0u ||
+      CurrentWorldObjectsPhase1PurePeriodicDispatchSequence() !=
+          eventSequence ||
+      g_worldObjectsPhase1Tls.dispatchCaptureEventSequence != eventSequence ||
+      !IsWorldObjectsPhase1PairedCaptureKind(
+          g_worldObjectsPhase1Tls.dispatchCaptureKind) ||
+      stageIndex >= kWorldObjectsPhase1PairedTimingStageCount)
+    return;
+  auto& timing =
+      g_worldObjectsPhase1Tls.periodicDispatch.stageTimings[stageIndex];
+  timing.calls += 1u;
+  timing.ticks += ticks;
+  timing.maxTicks = std::max(timing.maxTicks, ticks);
+}
+
+void RecordWorldObjectsPhase1PairedQpcReads(
+    uint64_t eventSequence, uint64_t reads) noexcept {
+  if (eventSequence == 0u || reads == 0u ||
+      CurrentWorldObjectsPhase1PurePeriodicDispatchSequence() !=
+          eventSequence ||
+      g_worldObjectsPhase1Tls.dispatchCaptureEventSequence != eventSequence ||
+      !IsWorldObjectsPhase1PairedCaptureKind(
+          g_worldObjectsPhase1Tls.dispatchCaptureKind))
+    return;
+  g_worldObjectsPhase1Tls.periodicDispatch.qpcReadCount += reads;
+}
+
+void RecordWorldObjectsPhase1PairedFlushTopology(
+    uint64_t eventSequence, uint32_t opaqueCount,
+    uint32_t transparentCount) noexcept {
+  if (eventSequence == 0u ||
+      CurrentWorldObjectsPhase1PurePeriodicDispatchSequence() !=
+          eventSequence ||
+      g_worldObjectsPhase1Tls.dispatchCaptureEventSequence != eventSequence ||
+      !IsWorldObjectsPhase1PairedCaptureKind(
+          g_worldObjectsPhase1Tls.dispatchCaptureKind))
+    return;
+  auto& capture = g_worldObjectsPhase1Tls.periodicDispatch;
+  capture.flushTopologyCalls += 1u;
+  capture.opaqueCountTotal += opaqueCount;
+  capture.transparentCountTotal += transparentCount;
+  constexpr uint64_t kFnvPrime = 1099511628211ull;
+  capture.flushTopologyHash ^= uint64_t(opaqueCount);
+  capture.flushTopologyHash *= kFnvPrime;
+  capture.flushTopologyHash ^= uint64_t(transparentCount);
+  capture.flushTopologyHash *= kFnvPrime;
+}
+
+void RecordWorldObjectsPhase1PairedFlushTerminal(
+    uint64_t eventSequence,
+    WorldObjectsPhase1FlushTerminal terminal) noexcept {
+  const uint32_t terminalIndex = static_cast<uint32_t>(terminal);
+  if (eventSequence == 0u ||
+      CurrentWorldObjectsPhase1PurePeriodicDispatchSequence() !=
+          eventSequence ||
+      g_worldObjectsPhase1Tls.dispatchCaptureEventSequence != eventSequence ||
+      !IsWorldObjectsPhase1PairedCaptureKind(
+          g_worldObjectsPhase1Tls.dispatchCaptureKind) ||
+      terminalIndex >= kWorldObjectsPhase1FlushTerminalCount)
+    return;
+  g_worldObjectsPhase1Tls.periodicDispatch
+      .flushTerminalCounts[terminalIndex] += 1u;
+}
+
+WorldObjectsPhase1TelemetrySummary QueryWorldObjectsPhase1Telemetry() {
+  WorldObjectsPhase1TelemetrySummary summary = {};
+  summary.qpcFrequency = uint64_t(
+      dxvk::high_resolution_clock::get_frequency());
+  summary.snapshotGenerationBefore =
+      g_worldObjectsPhase1SnapshotGeneration.load(
+          std::memory_order_acquire);
+  summary.snapshotWritersBefore =
+      g_worldObjectsPhase1Writers.load(std::memory_order_acquire);
+  summary.snapshotWritesStartedBefore =
+      g_worldObjectsPhase1WritesStarted.load(std::memory_order_acquire);
+  summary.snapshotWritesCompletedBefore =
+      g_worldObjectsPhase1WritesCompleted.load(std::memory_order_acquire);
+  summary.trackingAttempts =
+      g_worldObjectsPhase1TrackingAttempts.load(std::memory_order_relaxed);
+  summary.trackingHealthFastPathCalls =
+      g_worldObjectsPhase1TrackingHealthFastPathCalls.load(
+          std::memory_order_relaxed);
+  summary.trackingHealthFullSummaryCompatibilityCalls =
+      g_worldObjectsPhase1TrackingHealthFullSummaryCompatibilityCalls.load(
+          std::memory_order_relaxed);
+  summary.trackingHealthModelInstanceAggregateReadPasses =
+      g_worldObjectsPhase1TrackingHealthModelInstanceAggregateReadPasses.load(
+          std::memory_order_relaxed);
+  summary.trackingHealthPoseAggregateReadPasses =
+      g_worldObjectsPhase1TrackingHealthPoseAggregateReadPasses.load(
+          std::memory_order_relaxed);
+  summary.trackingHealthModelInstanceVerifierScanPasses =
+      g_worldObjectsPhase1TrackingHealthModelInstanceVerifierScanPasses.load(
+          std::memory_order_relaxed);
+  summary.trackingHealthPoseVerifierScanPasses =
+      g_worldObjectsPhase1TrackingHealthPoseVerifierScanPasses.load(
+          std::memory_order_relaxed);
+  summary.trackingHealthModelInstanceVerifierRecordsScanned =
+      g_worldObjectsPhase1TrackingHealthModelInstanceVerifierRecordsScanned
+          .load(std::memory_order_relaxed);
+  summary.trackingHealthPoseVerifierRecordsScanned =
+      g_worldObjectsPhase1TrackingHealthPoseVerifierRecordsScanned.load(
+          std::memory_order_relaxed);
+  summary.trackingHealthModelInstanceVerifierMismatchCount =
+      g_worldObjectsPhase1TrackingHealthModelInstanceVerifierMismatchCount
+          .load(std::memory_order_relaxed);
+  summary.trackingHealthPoseVerifierMismatchCount =
+      g_worldObjectsPhase1TrackingHealthPoseVerifierMismatchCount.load(
+          std::memory_order_relaxed);
+  summary.trackingHealthModelInstanceVerifierMismatchMask =
+      g_worldObjectsPhase1TrackingHealthModelInstanceVerifierMismatchMask.load(
+          std::memory_order_relaxed);
+  summary.trackingHealthPoseVerifierMismatchMask =
+      g_worldObjectsPhase1TrackingHealthPoseVerifierMismatchMask.load(
+          std::memory_order_relaxed);
+  summary.identityRequests =
+      g_worldObjectsPhase1IdentityRequests.load(std::memory_order_relaxed);
+  summary.fallbackRequests =
+      g_worldObjectsPhase1FallbackRequests.load(std::memory_order_relaxed);
+  summary.eventCountLifetime =
+      g_worldObjectsPhase1EventSequence.load(std::memory_order_relaxed);
+  summary.latestEventSequence = summary.eventCountLifetime;
+  summary.collectorWithoutEventCount =
+      g_worldObjectsPhase1CollectorWithoutEventCount.load(
+          std::memory_order_relaxed);
+  summary.collectorReentryCount =
+      g_worldObjectsPhase1CollectorReentryCount.load(
+          std::memory_order_relaxed);
+  summary.collectorWithoutHookCount =
+      g_worldObjectsPhase1CollectorWithoutHookCount.load(
+          std::memory_order_relaxed);
+  summary.hookWithoutCollectorCount =
+      g_worldObjectsPhase1HookWithoutCollectorCount.load(
+          std::memory_order_relaxed);
+  summary.registryFeedOutsideCollectorCount =
+      g_worldObjectsPhase1RegistryFeedOutsideCollectorCount.load(
+          std::memory_order_relaxed);
+  summary.unexpectedGroupCount =
+      g_worldObjectsPhase1UnexpectedGroupCount.load(
+          std::memory_order_relaxed);
+  summary.pairedCaptureDuplicatePublishCount =
+      g_worldObjectsPhase1PairedCaptureDuplicatePublishCount.load(
+          std::memory_order_relaxed);
+  summary.pairedCaptureLostPublishCount =
+      g_worldObjectsPhase1PairedCaptureLostPublishCount.load(
+          std::memory_order_relaxed);
+  summary.pairedCaptureSlotMismatchCount =
+      g_worldObjectsPhase1PairedCaptureSlotMismatchCount.load(
+          std::memory_order_relaxed);
+  summary.trackingInclusive = CopyWorldObjectsPhase1AtomicTiming(
+      g_worldObjectsPhase1TrackingInclusive);
+  summary.trackingQuery = CopyWorldObjectsPhase1AtomicTiming(
+      g_worldObjectsPhase1TrackingQuery);
+  summary.trackingDecision = CopyWorldObjectsPhase1AtomicTiming(
+      g_worldObjectsPhase1TrackingDecision);
+
+  const bool trackingHealthPathPartitionClean =
+      summary.trackingHealthFastPathCalls <= summary.trackingAttempts &&
+      summary.trackingHealthFullSummaryCompatibilityCalls ==
+          summary.trackingAttempts - summary.trackingHealthFastPathCalls;
+  if constexpr (internal::kNativeRendererHookTakeoverEnabled) {
+    summary.trackingHealthPathClosureClean =
+        trackingHealthPathPartitionClean &&
+        summary.trackingHealthFullSummaryCompatibilityCalls ==
+            summary.trackingAttempts &&
+        summary.trackingHealthFastPathCalls == 0u &&
+        summary.trackingHealthModelInstanceAggregateReadPasses == 0u &&
+        summary.trackingHealthPoseAggregateReadPasses == 0u &&
+        summary.trackingHealthModelInstanceVerifierScanPasses == 0u &&
+        summary.trackingHealthPoseVerifierScanPasses == 0u &&
+        summary.trackingHealthModelInstanceVerifierRecordsScanned == 0u &&
+        summary.trackingHealthPoseVerifierRecordsScanned == 0u &&
+        summary.trackingHealthModelInstanceVerifierMismatchCount == 0u &&
+        summary.trackingHealthPoseVerifierMismatchCount == 0u &&
+        summary.trackingHealthModelInstanceVerifierMismatchMask == 0u &&
+        summary.trackingHealthPoseVerifierMismatchMask == 0u;
+  } else {
+    const bool verifierPassesClean =
+        summary.trackingHealthModelInstanceVerifierScanPasses ==
+            summary.trackingHealthPoseVerifierScanPasses &&
+        (summary.trackingHealthModelInstanceVerifierScanPasses == 0u ||
+         summary.trackingHealthModelInstanceVerifierScanPasses ==
+             summary.trackingAttempts);
+    const bool verifierRecordsClean =
+        summary.trackingHealthModelInstanceVerifierScanPasses != 0u ||
+        (summary.trackingHealthModelInstanceVerifierRecordsScanned == 0u &&
+         summary.trackingHealthPoseVerifierRecordsScanned == 0u);
+    const bool verifierMismatchesClean =
+        summary.trackingHealthModelInstanceVerifierMismatchCount == 0u &&
+        summary.trackingHealthPoseVerifierMismatchCount == 0u &&
+        summary.trackingHealthModelInstanceVerifierMismatchMask == 0u &&
+        summary.trackingHealthPoseVerifierMismatchMask == 0u;
+    summary.trackingHealthPathClosureClean =
+        trackingHealthPathPartitionClean &&
+        summary.trackingHealthFastPathCalls == summary.trackingAttempts &&
+        summary.trackingHealthFullSummaryCompatibilityCalls == 0u &&
+        summary.trackingHealthModelInstanceAggregateReadPasses ==
+            summary.trackingAttempts &&
+        summary.trackingHealthPoseAggregateReadPasses ==
+            summary.trackingAttempts &&
+        verifierPassesClean && verifierRecordsClean &&
+        verifierMismatchesClean;
+  }
+
+  uint64_t classifiedTrackingAttempts = 0u;
+  uint64_t classifiedTrackingEvents = 0u;
+  for (uint32_t reason = 0u;
+       reason < kWorldObjectsPhase1TrackingReasonCount; ++reason) {
+    summary.reasonCounts[reason] =
+        g_worldObjectsPhase1ReasonCounts[reason].load(
+            std::memory_order_relaxed);
+    classifiedTrackingAttempts += summary.reasonCounts[reason];
+    if (reason != static_cast<uint32_t>(
+                      WorldObjectsPhase1TrackingReason::None)) {
+      classifiedTrackingEvents += summary.reasonCounts[reason];
+    }
+  }
+  summary.trackingReasonClosureClean =
+      classifiedTrackingAttempts == summary.trackingAttempts &&
+      summary.trackingInclusive.calls == summary.trackingAttempts &&
+      summary.trackingQuery.calls == summary.trackingAttempts &&
+      summary.trackingDecision.calls == summary.trackingAttempts &&
+      summary.trackingInclusive.ticks ==
+          summary.trackingQuery.ticks + summary.trackingDecision.ticks;
+  summary.eventCountClosureClean =
+      classifiedTrackingEvents == summary.eventCountLifetime;
+
+  bool lifetimeObservedContentClean = true;
+  summary.lifetimeUnobservedGroupsZeroClean = true;
+  for (uint32_t group = 0u; group < kWorldObjectsPhase1GroupCount; ++group) {
+    const auto& source = g_worldObjectsPhase1Groups[group];
+    auto& destination = summary.groups[group];
+    destination.hookInclusive = CopyWorldObjectsPhase1AtomicTiming(
+        source.hookInclusive);
+    destination.collectorInclusive = CopyWorldObjectsPhase1AtomicTiming(
+        source.collectorInclusive);
+    destination.collectorSetup = CopyWorldObjectsPhase1AtomicTiming(
+        source.collectorSetup);
+    destination.collectorIterate = CopyWorldObjectsPhase1AtomicTiming(
+        source.collectorIterate);
+    destination.collectorRegister = CopyWorldObjectsPhase1AtomicTiming(
+        source.collectorRegister);
+    destination.collectorTail = CopyWorldObjectsPhase1AtomicTiming(
+        source.collectorTail);
+    destination.modelFeed = CopyWorldObjectsPhase1AtomicTiming(
+        source.modelFeed);
+    destination.shadowFeed = CopyWorldObjectsPhase1AtomicTiming(
+        source.shadowFeed);
+    destination.listEntries =
+        source.listEntries.load(std::memory_order_relaxed);
+    destination.acceptedEntries =
+        source.acceptedEntries.load(std::memory_order_relaxed);
+    destination.sceneNodeEntries =
+        source.sceneNodeEntries.load(std::memory_order_relaxed);
+    destination.handleEntries =
+        source.handleEntries.load(std::memory_order_relaxed);
+    destination.collectorPartitionMismatchCount =
+        source.collectorPartitionMismatchCount.load(
+            std::memory_order_relaxed);
+    destination.hookContainmentViolationCount =
+        source.hookContainmentViolationCount.load(
+            std::memory_order_relaxed);
+    destination.registerFeedContainmentViolationCount =
+        source.registerFeedContainmentViolationCount.load(
+            std::memory_order_relaxed);
+    destination.acceptedCountViolationCount =
+        source.acceptedCountViolationCount.load(
+            std::memory_order_relaxed);
+    destination.sceneNodeCountViolationCount =
+        source.sceneNodeCountViolationCount.load(
+            std::memory_order_relaxed);
+    destination.handleCountViolationCount =
+        source.handleCountViolationCount.load(
+            std::memory_order_relaxed);
+    uint64_t classifiedCollectorCalls = 0u;
+    for (uint32_t outcome = 0u;
+         outcome < kWorldObjectsPhase1CollectorOutcomeCount; ++outcome) {
+      destination.outcomeCounts[outcome] =
+          source.outcomeCounts[outcome].load(std::memory_order_relaxed);
+      classifiedCollectorCalls += destination.outcomeCounts[outcome];
+    }
+    destination.outcomeClosureClean =
+        classifiedCollectorCalls == destination.collectorInclusive.calls;
+    destination.collectorPartitionClean =
+        destination.collectorPartitionMismatchCount == 0u &&
+        destination.collectorSetup.calls ==
+            destination.collectorInclusive.calls &&
+        destination.collectorIterate.calls ==
+            destination.collectorInclusive.calls &&
+        destination.collectorRegister.calls ==
+            destination.collectorInclusive.calls &&
+        destination.collectorTail.calls ==
+            destination.collectorInclusive.calls &&
+        destination.collectorInclusive.ticks ==
+            destination.collectorSetup.ticks +
+            destination.collectorIterate.ticks +
+            destination.collectorRegister.ticks +
+            destination.collectorTail.ticks;
+    destination.hookCollectorCallClosureClean =
+        destination.hookInclusive.calls ==
+            destination.collectorInclusive.calls;
+    destination.containmentClean =
+        destination.hookContainmentViolationCount == 0u &&
+        destination.registerFeedContainmentViolationCount == 0u &&
+        destination.hookInclusive.ticks >=
+            destination.collectorInclusive.ticks &&
+        destination.collectorRegister.ticks >=
+            destination.modelFeed.ticks + destination.shadowFeed.ticks &&
+        destination.modelFeed.calls == destination.shadowFeed.calls;
+    destination.entryCountBoundsClean =
+        destination.acceptedCountViolationCount == 0u &&
+        destination.sceneNodeCountViolationCount == 0u &&
+        destination.handleCountViolationCount == 0u &&
+        destination.acceptedEntries <= destination.listEntries &&
+        destination.sceneNodeEntries <= destination.acceptedEntries &&
+        destination.handleEntries <= destination.acceptedEntries;
+    const uint32_t groupBit = 1u << group;
+    if (destination.collectorInclusive.calls != 0u)
+      summary.lifetimeCollectorGroupMask |= groupBit;
+    if (destination.hookInclusive.calls != 0u)
+      summary.lifetimeHookGroupMask |= groupBit;
+    destination.observed =
+        destination.collectorInclusive.calls != 0u ||
+        destination.hookInclusive.calls != 0u;
+    const bool zeroResidual =
+        IsWorldObjectsPhase1RawTimingZero(destination.hookInclusive) &&
+        IsWorldObjectsPhase1RawTimingZero(destination.collectorInclusive) &&
+        IsWorldObjectsPhase1RawTimingZero(destination.collectorSetup) &&
+        IsWorldObjectsPhase1RawTimingZero(destination.collectorIterate) &&
+        IsWorldObjectsPhase1RawTimingZero(destination.collectorRegister) &&
+        IsWorldObjectsPhase1RawTimingZero(destination.collectorTail) &&
+        IsWorldObjectsPhase1RawTimingZero(destination.modelFeed) &&
+        IsWorldObjectsPhase1RawTimingZero(destination.shadowFeed) &&
+        destination.listEntries == 0u &&
+        destination.acceptedEntries == 0u &&
+        destination.sceneNodeEntries == 0u &&
+        destination.handleEntries == 0u &&
+        destination.collectorPartitionMismatchCount == 0u &&
+        destination.hookContainmentViolationCount == 0u &&
+        destination.registerFeedContainmentViolationCount == 0u &&
+        destination.acceptedCountViolationCount == 0u &&
+        destination.sceneNodeCountViolationCount == 0u &&
+        destination.handleCountViolationCount == 0u &&
+        classifiedCollectorCalls == 0u;
+    destination.unobservedZeroClean =
+        destination.observed || zeroResidual;
+    if (destination.observed) {
+      lifetimeObservedContentClean = lifetimeObservedContentClean &&
+          destination.outcomeClosureClean &&
+          destination.collectorPartitionClean &&
+          destination.hookCollectorCallClosureClean &&
+          destination.containmentClean &&
+          destination.entryCountBoundsClean;
+    } else {
+      summary.lifetimeUnobservedGroupsZeroClean =
+          summary.lifetimeUnobservedGroupsZeroClean && zeroResidual;
+    }
+  }
+  summary.lifetimeObservedGroupMask =
+      summary.lifetimeCollectorGroupMask |
+      summary.lifetimeHookGroupMask;
+  summary.lifetimeObservedGroupsClosureClean =
+      summary.lifetimeCollectorGroupMask ==
+          summary.lifetimeHookGroupMask &&
+      lifetimeObservedContentClean &&
+      summary.lifetimeUnobservedGroupsZeroClean;
+
+  summary.retainedEventsClosureClean = true;
+  {
+    std::lock_guard<std::mutex> lock(g_worldObjectsPhase1EventMutex);
+    const uint64_t retained = std::min<uint64_t>(
+        summary.latestEventSequence, kWorldObjectsPhase1EventSlotCount);
+    summary.retainedEventExpectedCount = uint32_t(retained);
+    const uint64_t firstSequence = retained != 0u
+        ? summary.latestEventSequence - retained + 1u
+        : 0u;
+    for (uint64_t sequence = firstSequence;
+         sequence != 0u && sequence <= summary.latestEventSequence;
+         ++sequence) {
+      const auto& stored = g_worldObjectsPhase1Events[
+          (sequence - 1u) % kWorldObjectsPhase1EventSlotCount];
+      if (stored.sequence != sequence) {
+        summary.missingRetainedEventCount += 1u;
+        summary.retainedEventsClosureClean = false;
+        continue;
+      }
+      auto event = stored;
+      event.trackingPartitionClean =
+          event.trackingInclusiveTicks ==
+              event.trackingQueryTicks + event.trackingDecisionTicks;
+      const auto finalizeDispatchCapture =
+          [](WorldObjectsPhase1PeriodicDispatch& dispatch) {
+        const uint64_t dispatchCalls =
+            dispatch.commonCalls + dispatch.specialCalls;
+        dispatch.dispatchPathClosureClean =
+            dispatchCalls ==
+                dispatch.group0Calls + dispatch.otherStageCalls;
+        dispatch.dispatchRootClosureClean =
+            (dispatchCalls == 0u || dispatch.dispatchRootCalls != 0u) &&
+            (dispatch.dispatchRootCalls != 0u ||
+             dispatch.dispatchRootTicks == 0u);
+        dispatch.worldFastClosureClean =
+            dispatch.worldFastBlockedByIdentity <=
+                dispatch.worldFastEligibleIgnoringIdentity &&
+            dispatch.worldFastEligibleIgnoringIdentity <= dispatchCalls;
+        dispatch.getTagStageClosureClean =
+            dispatch.getTagStageCalls ==
+                dispatch.getTagStageHits + dispatch.getTagStageMisses &&
+            dispatch.getTagStageConflicts <= dispatch.getTagStageHits &&
+            dispatch.getTagStageProbes >= dispatch.getTagStageHits &&
+            dispatch.getTagStageProbes <=
+                dispatch.getTagStageCalls *
+                    kWorldObjectsPhase1GetTagStageMaxProbes;
+
+        const auto timing = [&](WorldObjectsPhase1PairedTimingStage stage)
+            -> const WorldObjectsPhase1RawTiming& {
+          return dispatch.stageTimings[static_cast<uint32_t>(stage)];
+        };
+        const auto& flushRoot =
+            timing(WorldObjectsPhase1PairedTimingStage::FlushRoot);
+        const auto& dispatchRoot =
+            timing(WorldObjectsPhase1PairedTimingStage::DispatchRoot);
+        const auto& worldRoot =
+            timing(WorldObjectsPhase1PairedTimingStage::WorldHookInclusive);
+        const uint64_t worldKnownTicks =
+            timing(WorldObjectsPhase1PairedTimingStage::WorldCollector).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::WorldOriginal).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       WorldTrackNewBatches).ticks;
+        const uint64_t flushKnownTicks =
+            timing(WorldObjectsPhase1PairedTimingStage::FlushNotify).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushTransactionBegin).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushOriginalBody).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushReimplOpaque).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushReimplTransparent).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushTransactionEnd).ticks;
+        const uint64_t dispatchKnownTicks =
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchResolveSemantic).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchNativeBegin).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchExecBegin).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchOriginal).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchPublishVisible).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchExecEnd).ticks +
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchNativeEnd).ticks;
+        uint64_t terminalCalls = 0u;
+        for (uint64_t calls : dispatch.flushTerminalCounts)
+          terminalCalls += calls;
+        uint64_t pairedTimedCalls = 0u;
+        bool rawTimingClosureClean = true;
+        for (uint32_t stage = 0u;
+             stage < kWorldObjectsPhase1PairedTimingStageCount; ++stage) {
+          const auto& raw = dispatch.stageTimings[stage];
+          const bool maxProductFits = raw.maxTicks == 0u ||
+              raw.calls <= UINT64_MAX / raw.maxTicks;
+          rawTimingClosureClean = rawTimingClosureClean &&
+              raw.maxTicks <= raw.ticks &&
+              (raw.calls == 0u
+                   ? raw.ticks == 0u && raw.maxTicks == 0u
+                   : maxProductFits &&
+                       raw.ticks <= raw.calls * raw.maxTicks);
+          if (stage != static_cast<uint32_t>(
+                           WorldObjectsPhase1PairedTimingStage::
+                               WorldCollector)) {
+            pairedTimedCalls += raw.calls;
+          }
+        }
+        dispatch.rawTimingClosureClean = rawTimingClosureClean;
+        dispatch.qpcReadClosureClean =
+            pairedTimedCalls <= UINT64_MAX / 2u &&
+            dispatch.getTagStageCalls <=
+                UINT64_MAX / 2u - pairedTimedCalls &&
+            dispatch.qpcReadCount ==
+                2u * (pairedTimedCalls + dispatch.getTagStageCalls);
+        dispatch.flushTopologyClosureClean =
+            flushRoot.calls == dispatch.dispatchRootCalls &&
+            flushRoot.ticks == dispatch.dispatchRootTicks &&
+            dispatch.flushTopologyCalls == flushRoot.calls &&
+            terminalCalls == flushRoot.calls &&
+            dispatch.flushTerminalCounts[static_cast<uint32_t>(
+                WorldObjectsPhase1FlushTerminal::Unclassified)] == 0u;
+        dispatch.pairedTimingClosureClean =
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       PresentPreTracking).calls == 1u &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushNotify).calls == flushRoot.calls &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushTransactionBegin).calls == flushRoot.calls &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushOriginalBody).calls <= flushRoot.calls &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushReimplOpaque).calls <= flushRoot.calls &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushReimplTransparent).calls <= flushRoot.calls &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushOriginalBody).calls +
+                    timing(WorldObjectsPhase1PairedTimingStage::
+                               FlushReimplOpaque).calls >=
+                flushRoot.calls &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       FlushTransactionEnd).calls <=
+                timing(WorldObjectsPhase1PairedTimingStage::
+                           FlushTransactionBegin).calls &&
+            dispatchRoot.calls == dispatchCalls &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchResolveSemantic).calls == dispatchCalls &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchNativeBegin).calls == dispatchCalls &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchOriginal).calls == dispatchCalls &&
+            timing(WorldObjectsPhase1PairedTimingStage::
+                       DispatchNativeEnd).calls == dispatchCalls &&
+            dispatch.rawTimingClosureClean &&
+            dispatch.qpcReadClosureClean &&
+            worldRoot.ticks >= worldKnownTicks &&
+            flushRoot.ticks >= flushKnownTicks &&
+            dispatchRoot.ticks >= dispatchKnownTicks &&
+            (flushRoot.calls == 0u || dispatch.qpcReadCount != 0u);
+
+        bool extendedZero = dispatch.captureFrameSerial == 0u &&
+            dispatch.ownerThreadId == 0u && dispatch.qpcReadCount == 0u &&
+            dispatch.flushTopologyCalls == 0u &&
+            dispatch.opaqueCountTotal == 0u &&
+            dispatch.transparentCountTotal == 0u &&
+            dispatch.flushTopologyHash == 0u;
+        for (uint64_t calls : dispatch.flushTerminalCounts)
+          extendedZero = extendedZero && calls == 0u;
+        for (const auto& stage : dispatch.stageTimings) {
+          extendedZero = extendedZero && stage.calls == 0u &&
+              stage.ticks == 0u && stage.maxTicks == 0u;
+        }
+        const bool periodicDispatchZero =
+            dispatch.commonCalls == 0u && dispatch.specialCalls == 0u &&
+            dispatch.group0Calls == 0u &&
+            dispatch.otherStageCalls == 0u &&
+            dispatch.dispatchRootCalls == 0u &&
+            dispatch.dispatchRootTicks == 0u &&
+            dispatch.worldFastEligibleIgnoringIdentity == 0u &&
+            dispatch.worldFastBlockedByIdentity == 0u &&
+            dispatch.getTagStageCalls == 0u &&
+            dispatch.getTagStageHits == 0u &&
+            dispatch.getTagStageMisses == 0u &&
+            dispatch.getTagStageConflicts == 0u &&
+            dispatch.getTagStageProbes == 0u &&
+            dispatch.getTagStageTicks == 0u && extendedZero;
+        dispatch.closureClean = dispatch.captureRequested
+            ? dispatch.finalized && dispatch.dispatchPathClosureClean &&
+                dispatch.dispatchRootClosureClean &&
+                dispatch.worldFastClosureClean &&
+                dispatch.getTagStageClosureClean &&
+                dispatch.pairedTimingClosureClean &&
+                dispatch.flushTopologyClosureClean
+            : !dispatch.finalized && periodicDispatchZero;
+      };
+      finalizeDispatchCapture(event.periodicDispatch);
+      finalizeDispatchCapture(event.postPeriodicControl);
+      event.pairLifecycleClosureClean =
+          event.periodicDispatch.captureRequested &&
+          event.periodicDispatch.finalized &&
+          event.postPeriodicControl.captureRequested &&
+          event.postPeriodicControl.finalized &&
+          event.frameSerial != UINT64_MAX &&
+          event.collectionFrameSerial == event.frameSerial + 1u &&
+          event.periodicDispatch.captureFrameSerial ==
+              event.collectionFrameSerial &&
+          event.periodicDispatch.captureFrameSerial != UINT64_MAX &&
+          event.postPeriodicControl.captureFrameSerial ==
+              event.periodicDispatch.captureFrameSerial + 1u &&
+          event.periodicDispatch.ownerThreadId != 0u &&
+          event.periodicDispatch.ownerThreadId ==
+              event.postPeriodicControl.ownerThreadId;
+      const bool periodicGetTagQpcBounded =
+          event.periodicDispatch.getTagStageCalls <= UINT64_MAX / 2u &&
+          event.periodicDispatch.qpcReadCount >=
+              2u * event.periodicDispatch.getTagStageCalls;
+      const bool controlGetTagQpcBounded =
+          event.postPeriodicControl.getTagStageCalls <= UINT64_MAX / 2u &&
+          event.postPeriodicControl.qpcReadCount >=
+              2u * event.postPeriodicControl.getTagStageCalls;
+      event.pairQpcBalancedExcludingGetTag =
+          periodicGetTagQpcBounded && controlGetTagQpcBounded &&
+          event.periodicDispatch.qpcReadCount -
+                  2u * event.periodicDispatch.getTagStageCalls ==
+              event.postPeriodicControl.qpcReadCount -
+                  2u * event.postPeriodicControl.getTagStageCalls;
+      event.pairQpcBalancedIncludingGetTag =
+          event.periodicDispatch.qpcReadCount ==
+              event.postPeriodicControl.qpcReadCount;
+      event.pairTopologyComparable = event.pairLifecycleClosureClean &&
+          event.periodicDispatch.closureClean &&
+          event.postPeriodicControl.closureClean &&
+          event.periodicDispatch.flushTopologyCalls > 0u &&
+          event.postPeriodicControl.flushTopologyCalls > 0u &&
+          event.periodicDispatch.stageTimings[static_cast<uint32_t>(
+              WorldObjectsPhase1PairedTimingStage::WorldHookInclusive)]
+                  .calls > 0u &&
+          event.postPeriodicControl.stageTimings[static_cast<uint32_t>(
+              WorldObjectsPhase1PairedTimingStage::WorldHookInclusive)]
+                  .calls > 0u &&
+          event.periodicDispatch.stageTimings[static_cast<uint32_t>(
+              WorldObjectsPhase1PairedTimingStage::WorldHookInclusive)]
+                  .calls ==
+              event.postPeriodicControl.stageTimings[static_cast<uint32_t>(
+                  WorldObjectsPhase1PairedTimingStage::WorldHookInclusive)]
+                      .calls &&
+          event.periodicDispatch.stageTimings[static_cast<uint32_t>(
+              WorldObjectsPhase1PairedTimingStage::DispatchRoot)]
+                  .calls > 0u &&
+          event.postPeriodicControl.stageTimings[static_cast<uint32_t>(
+              WorldObjectsPhase1PairedTimingStage::DispatchRoot)]
+                  .calls > 0u &&
+          event.periodicDispatch.dispatchRootCalls ==
+              event.postPeriodicControl.dispatchRootCalls &&
+          event.periodicDispatch.commonCalls ==
+              event.postPeriodicControl.commonCalls &&
+          event.periodicDispatch.specialCalls ==
+              event.postPeriodicControl.specialCalls &&
+          event.periodicDispatch.group0Calls ==
+              event.postPeriodicControl.group0Calls &&
+          event.periodicDispatch.otherStageCalls ==
+              event.postPeriodicControl.otherStageCalls &&
+          event.periodicDispatch.worldFastEligibleIgnoringIdentity ==
+              event.postPeriodicControl.worldFastEligibleIgnoringIdentity &&
+          event.postPeriodicControl.worldFastBlockedByIdentity == 0u &&
+          event.periodicDispatch.flushTopologyCalls ==
+              event.postPeriodicControl.flushTopologyCalls &&
+          event.periodicDispatch.opaqueCountTotal ==
+              event.postPeriodicControl.opaqueCountTotal &&
+          event.periodicDispatch.transparentCountTotal ==
+              event.postPeriodicControl.transparentCountTotal &&
+          event.periodicDispatch.flushTopologyHash ==
+              event.postPeriodicControl.flushTopologyHash &&
+          event.periodicDispatch.flushTerminalCounts ==
+              event.postPeriodicControl.flushTerminalCounts &&
+          event.pairQpcBalancedExcludingGetTag;
+      constexpr uint32_t kValidObservedGroupMask =
+          (1u << kWorldObjectsPhase1GroupCount) - 1u;
+      const uint32_t rawObservedGroupMask =
+          event.collectorGroupMask | event.hookGroupMask;
+      event.observedGroupMask =
+          rawObservedGroupMask & kValidObservedGroupMask;
+      event.groupClosureClean = true;
+      event.unobservedGroupsZeroClean = true;
+      uint64_t periodicHookCalls = 0u;
+      uint64_t periodicHookTicks = 0u;
+      uint64_t periodicCollectorCalls = 0u;
+      uint64_t periodicCollectorTicks = 0u;
+      for (uint32_t group = 0u;
+           group < kWorldObjectsPhase1GroupCount; ++group) {
+        auto& eventGroup = event.groups[group];
+        periodicHookCalls += eventGroup.hookCalls;
+        periodicHookTicks += eventGroup.hookInclusiveTicks;
+        periodicCollectorCalls += eventGroup.collectorCalls;
+        periodicCollectorTicks += eventGroup.collectorInclusiveTicks;
+        const uint32_t groupBit = 1u << group;
+        eventGroup.observed =
+            (event.observedGroupMask & groupBit) != 0u;
+        uint64_t outcomeCalls = 0u;
+        for (uint32_t outcome = 0u;
+             outcome < kWorldObjectsPhase1CollectorOutcomeCount; ++outcome) {
+          outcomeCalls += eventGroup.outcomeCounts[outcome];
+        }
+        eventGroup.outcomeClosureClean =
+            outcomeCalls == eventGroup.collectorCalls;
+        eventGroup.collectorPartitionClean =
+            eventGroup.collectorInclusiveTicks ==
+                eventGroup.collectorSetupTicks +
+                eventGroup.collectorIterateTicks +
+                eventGroup.collectorRegisterTicks +
+                eventGroup.collectorTailTicks;
+        eventGroup.hookCollectorCallClosureClean =
+            eventGroup.hookCalls == eventGroup.collectorCalls;
+        eventGroup.hookContainsCollector =
+            eventGroup.hookInclusiveTicks >=
+                eventGroup.collectorInclusiveTicks;
+        eventGroup.registerContainsFeeds =
+            eventGroup.collectorRegisterTicks >=
+                eventGroup.modelFeedTicks + eventGroup.shadowFeedTicks &&
+            eventGroup.modelFeedCalls == eventGroup.shadowFeedCalls;
+        eventGroup.entryCountBoundsClean =
+            eventGroup.acceptedEntries <= eventGroup.listEntries &&
+            eventGroup.sceneNodeEntries <= eventGroup.acceptedEntries &&
+            eventGroup.handleEntries <= eventGroup.acceptedEntries;
+        const bool zeroResidual =
+            eventGroup.hookInclusiveTicks == 0u &&
+            eventGroup.collectorInclusiveTicks == 0u &&
+            eventGroup.collectorSetupTicks == 0u &&
+            eventGroup.collectorIterateTicks == 0u &&
+            eventGroup.collectorRegisterTicks == 0u &&
+            eventGroup.collectorTailTicks == 0u &&
+            eventGroup.modelFeedTicks == 0u &&
+            eventGroup.shadowFeedTicks == 0u &&
+            eventGroup.listEntries == 0u &&
+            eventGroup.acceptedEntries == 0u &&
+            eventGroup.sceneNodeEntries == 0u &&
+            eventGroup.handleEntries == 0u &&
+            eventGroup.hookCalls == 0u &&
+            eventGroup.collectorCalls == 0u &&
+            eventGroup.modelFeedCalls == 0u &&
+            eventGroup.shadowFeedCalls == 0u &&
+            outcomeCalls == 0u;
+        eventGroup.unobservedZeroClean =
+            eventGroup.observed || zeroResidual;
+        if (eventGroup.observed) {
+          event.groupClosureClean = event.groupClosureClean &&
+              eventGroup.hookCalls != 0u &&
+              eventGroup.collectorCalls != 0u &&
+              eventGroup.outcomeClosureClean &&
+              eventGroup.collectorPartitionClean &&
+              eventGroup.hookCollectorCallClosureClean &&
+              eventGroup.hookContainsCollector &&
+              eventGroup.registerContainsFeeds &&
+              eventGroup.entryCountBoundsClean;
+        } else {
+          event.unobservedGroupsZeroClean =
+              event.unobservedGroupsZeroClean && zeroResidual;
+          event.groupClosureClean =
+              event.groupClosureClean && zeroResidual;
+        }
+      }
+      event.completeObservedGroups =
+          rawObservedGroupMask == event.observedGroupMask &&
+          event.collectorGroupMask == event.hookGroupMask &&
+          event.duplicateCollectorGroupMask == 0u &&
+          event.duplicateHookGroupMask == 0u &&
+          event.groupClosureClean &&
+          event.unobservedGroupsZeroClean;
+      const auto& periodicWorldHook =
+          event.periodicDispatch.stageTimings[static_cast<uint32_t>(
+              WorldObjectsPhase1PairedTimingStage::WorldHookInclusive)];
+      const auto& periodicWorldCollector =
+          event.periodicDispatch.stageTimings[static_cast<uint32_t>(
+              WorldObjectsPhase1PairedTimingStage::WorldCollector)];
+      event.periodicEventSubsetClosureClean =
+          periodicWorldCollector.calls == periodicCollectorCalls &&
+          periodicWorldCollector.ticks == periodicCollectorTicks &&
+          periodicWorldHook.calls >= periodicHookCalls &&
+          periodicWorldHook.ticks >= periodicHookTicks;
+      event.pairTopologyComparable = event.pairTopologyComparable &&
+          event.completeObservedGroups &&
+          event.periodicEventSubsetClosureClean;
+      event.pairComparable = event.pairTopologyComparable;
+      summary.retainedEventsClosureClean =
+          summary.retainedEventsClosureClean &&
+          event.trackingPartitionClean && event.completeObservedGroups &&
+          event.groupClosureClean;
+      summary.events[summary.retainedEventCount++] = event;
+    }
+    summary.retainedEventsClosureClean =
+        summary.retainedEventsClosureClean &&
+        summary.missingRetainedEventCount == 0u &&
+        summary.retainedEventCount == summary.retainedEventExpectedCount;
+  }
+
+  summary.snapshotWritesStartedAfter =
+      g_worldObjectsPhase1WritesStarted.load(std::memory_order_acquire);
+  summary.snapshotWritesCompletedAfter =
+      g_worldObjectsPhase1WritesCompleted.load(std::memory_order_acquire);
+  summary.snapshotWritersAfter =
+      g_worldObjectsPhase1Writers.load(std::memory_order_acquire);
+  summary.snapshotGenerationAfter =
+      g_worldObjectsPhase1SnapshotGeneration.load(
+          std::memory_order_acquire);
+  summary.snapshotStable =
+      summary.snapshotGenerationBefore == summary.snapshotGenerationAfter &&
+      (summary.snapshotGenerationAfter & 1u) == 0u &&
+      summary.snapshotWritersBefore == 0u &&
+      summary.snapshotWritersAfter == 0u &&
+      summary.snapshotWritesStartedBefore ==
+          summary.snapshotWritesCompletedBefore &&
+      summary.snapshotWritesStartedAfter ==
+          summary.snapshotWritesCompletedAfter &&
+      summary.snapshotWritesStartedBefore ==
+          summary.snapshotWritesStartedAfter &&
+      summary.snapshotWritesCompletedBefore ==
+          summary.snapshotWritesCompletedAfter;
+  summary.lifecycleClosureClean =
+      summary.collectorWithoutEventCount == 0u &&
+      summary.collectorReentryCount == 0u &&
+      summary.collectorWithoutHookCount == 0u &&
+      summary.hookWithoutCollectorCount == 0u &&
+      summary.registryFeedOutsideCollectorCount == 0u &&
+      summary.unexpectedGroupCount == 0u &&
+      summary.pairedCaptureDuplicatePublishCount == 0u &&
+      summary.pairedCaptureLostPublishCount == 0u &&
+      summary.pairedCaptureSlotMismatchCount == 0u;
+  summary.overallClosureClean =
+      summary.snapshotStable &&
+      summary.trackingHealthPathClosureClean &&
+      summary.trackingReasonClosureClean &&
+      summary.eventCountClosureClean &&
+      summary.lifecycleClosureClean &&
+      summary.lifetimeObservedGroupsClosureClean &&
+      summary.lifetimeUnobservedGroupsZeroClean &&
+      summary.retainedEventsClosureClean;
+  for (const auto& group : summary.groups) {
+    if (group.observed) {
+      summary.overallClosureClean = summary.overallClosureClean &&
+          group.outcomeClosureClean &&
+          group.collectorPartitionClean &&
+          group.hookCollectorCallClosureClean &&
+          group.containmentClean &&
+          group.entryCountBoundsClean;
+    } else {
+      summary.overallClosureClean = summary.overallClosureClean &&
+          group.unobservedZeroClean;
+    }
+  }
+  return summary;
+}
+
 void NoteShadowRuntimeRenderObject(const RenderObjectInfo& info) {
   if (!dxvk::war3::internal::kShadowRuntimeBridgeEnabled)
     return;
@@ -1390,8 +3958,23 @@ void NoteShadowRuntimeRenderObjectsBatch(
     const std::vector<const RenderObjectInfo*>& infos) {
   if (!dxvk::war3::internal::kShadowRuntimeBridgeEnabled || infos.empty())
     return;
+
+  const bool phase1Capture =
+      IsWorldObjectsPhase1CollectorCaptureActive();
+  const int64_t modelBegin = phase1Capture
+      ? dxvk::high_resolution_clock::get_counter()
+      : 0;
   model::ModelInstanceRegistry::instance().noteRenderObjectsBatch(infos);
+  const int64_t shadowBegin = phase1Capture
+      ? dxvk::high_resolution_clock::get_counter()
+      : 0;
   ShadowObjectRegistry::instance().noteRenderObjectsBatch(infos);
+  if (phase1Capture) {
+    const int64_t end = dxvk::high_resolution_clock::get_counter();
+    RecordWorldObjectsPhase1RegistryFeed(
+        WorldObjectsPhase1TickDelta(modelBegin, shadowBegin),
+        WorldObjectsPhase1TickDelta(shadowBegin, end));
+  }
 }
 
 void NoteShadowRuntimeIdentity(void* worldObjectEntry, void* sceneNode,
@@ -1440,6 +4023,7 @@ void NoteShadowRuntimePose(void* runtimeModelPtr, void* sceneNode, void* unitPtr
 void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
   std::unique_lock<std::shared_mutex> lock(g_shadowSceneStatsMutex);
   War3ShadowCaptureStats merged = stats;
+  const auto& previous = g_shadowSceneStats;
   const auto hasReceiverDetails = [](const War3ShadowCaptureStats& value) {
     return value.semanticSceneShadowMapDrawnCasters != 0u ||
            value.semanticSceneShadowMapPreparedDrawCount != 0u ||
@@ -1494,7 +4078,6 @@ void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
   };
   if (merged.semanticSceneReplayDrawsCount != 0u ||
       merged.semanticSceneShadowCastersCount != 0u) {
-    const auto& previous = g_shadowSceneStats;
     const bool incomingHasReceiverDetails = hasReceiverDetails(merged);
     const bool previousHasReceiverDetails = hasReceiverDetails(previous);
     // The semantic scene is published once before the receiver pass runs and
@@ -1626,6 +4209,30 @@ void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
           previous.semanticSceneShadowMatrixBufferSize;
       merged.semanticSceneShadowMatrixBufferGpuAddress =
           previous.semanticSceneShadowMatrixBufferGpuAddress;
+      merged.semanticSceneReceiverCameraHash =
+          previous.semanticSceneReceiverCameraHash;
+      merged.semanticSceneReceiverSunDirectionHash =
+          previous.semanticSceneReceiverSunDirectionHash;
+      merged.semanticSceneReceiverCsmHash =
+          previous.semanticSceneReceiverCsmHash;
+      merged.semanticSceneReceiverCameraDeltaNano =
+          previous.semanticSceneReceiverCameraDeltaNano;
+      merged.semanticSceneReceiverSunDeltaNano =
+          previous.semanticSceneReceiverSunDeltaNano;
+      merged.semanticSceneReceiverCsmDeltaNano =
+          previous.semanticSceneReceiverCsmDeltaNano;
+      merged.semanticSceneReceiverSnappedCenterDeltaTexelsNano =
+          previous.semanticSceneReceiverSnappedCenterDeltaTexelsNano;
+      merged.semanticSceneReceiverTexelSizeDeltaNano =
+          previous.semanticSceneReceiverTexelSizeDeltaNano;
+      merged.semanticSceneReplayBackingHash =
+          previous.semanticSceneReplayBackingHash;
+      merged.semanticSceneStage13ReplayContentHash =
+          previous.semanticSceneStage13ReplayContentHash;
+      merged.semanticSceneStage13ReplayBackingHash =
+          previous.semanticSceneStage13ReplayBackingHash;
+      merged.semanticSceneStage13ReplayDrawCount =
+          previous.semanticSceneStage13ReplayDrawCount;
       merged.semanticSceneShadowMapRenderSerial =
           previous.semanticSceneShadowMapRenderSerial;
       merged.semanticSceneShadowMapImagePtr =
@@ -1658,6 +4265,12 @@ void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
           previous.semanticSceneShadowHistoryReadIndex;
       merged.semanticSceneShadowHistoryWriteIndex =
           previous.semanticSceneShadowHistoryWriteIndex;
+      merged.semanticSceneShadowHistoryAdvancedThisFrame =
+          previous.semanticSceneShadowHistoryAdvancedThisFrame;
+      merged.semanticSceneShadowHistoryAdvanceSkippedIncomplete =
+          previous.semanticSceneShadowHistoryAdvanceSkippedIncomplete;
+      merged.semanticSceneShadowHistoryInvalidationMask =
+          previous.semanticSceneShadowHistoryInvalidationMask;
       merged.semanticSceneShadowReceiverSampleSource =
           previous.semanticSceneShadowReceiverSampleSource;
       merged.semanticSceneReceiverViewportX =
@@ -1670,8 +4283,239 @@ void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
           previous.semanticSceneReceiverViewportHeight;
     }
   }
+
+  // The command-list tail republishes its immutable pre-receiver scene copy
+  // after Run() has already published the real receiver reconciliation. That
+  // copy can carry older non-zero receiver fields, so hasReceiverDetails()
+  // alone cannot identify it, while these newly added per-frame outcomes are
+  // still both zero. Under the corrected contract a Temporal frame always has
+  // exactly one terminal outcome: advance after all four passes complete, or
+  // skip because the write was incomplete. PrepassCurrentOnly intentionally
+  // has no history outcome and must not inherit a preceding Temporal result.
+  const bool missingTaaHistoryOutcome =
+      merged.semanticSceneShadowTaaActive != 0u &&
+      merged.semanticSceneShadowTaaMode >= 2u &&
+      merged.semanticSceneShadowHistoryAdvancedThisFrame == 0u &&
+      merged.semanticSceneShadowHistoryAdvanceSkippedIncomplete == 0u;
+  if (missingTaaHistoryOutcome) {
+    merged.semanticSceneShadowHistoryAdvancedThisFrame =
+        previous.semanticSceneShadowHistoryAdvancedThisFrame;
+    merged.semanticSceneShadowHistoryAdvanceSkippedIncomplete =
+        previous.semanticSceneShadowHistoryAdvanceSkippedIncomplete;
+    merged.semanticSceneShadowHistoryInvalidationMask |=
+        previous.semanticSceneShadowHistoryInvalidationMask;
+  }
+
+  // 主线程会在 receiver 命令真正执行前发布一次场景占位统计；该占位对象中的
+  // VS-S1 字段为 0，绝不能把 CS 线程已经发布的单调累计值清回 0。
+  merged.gpuSkinVsShadowDirectAttempts = std::max(
+      merged.gpuSkinVsShadowDirectAttempts,
+      previous.gpuSkinVsShadowDirectAttempts);
+  merged.gpuSkinVsShadowDirectInputRejects = std::max(
+      merged.gpuSkinVsShadowDirectInputRejects,
+      previous.gpuSkinVsShadowDirectInputRejects);
+  merged.gpuSkinVsShadowDirectStateRejects = std::max(
+      merged.gpuSkinVsShadowDirectStateRejects,
+      previous.gpuSkinVsShadowDirectStateRejects);
+  merged.gpuSkinVsShadowDirectDrawsSubmitted = std::max(
+      merged.gpuSkinVsShadowDirectDrawsSubmitted,
+      previous.gpuSkinVsShadowDirectDrawsSubmitted);
+  merged.gpuSkinVsShadowDirectBindingsCleared = std::max(
+      merged.gpuSkinVsShadowDirectBindingsCleared,
+      previous.gpuSkinVsShadowDirectBindingsCleared);
+  merged.gpuSkinVsShadowReplayDirectional = std::max(
+      merged.gpuSkinVsShadowReplayDirectional,
+      previous.gpuSkinVsShadowReplayDirectional);
+  merged.gpuSkinVsShadowReplayPoint = std::max(
+      merged.gpuSkinVsShadowReplayPoint,
+      previous.gpuSkinVsShadowReplayPoint);
+  merged.gpuSkinVsShadowReplayUnknown = std::max(
+      merged.gpuSkinVsShadowReplayUnknown,
+      previous.gpuSkinVsShadowReplayUnknown);
   g_shadowSceneStats = merged;
   ++g_shadowSceneStatsPublishCount;
+}
+
+GpuSkinVsShadowRuntimeCounters QueryGpuSkinVsShadowRuntimeCounters() {
+  std::shared_lock<std::shared_mutex> lock(g_shadowSceneStatsMutex);
+  GpuSkinVsShadowRuntimeCounters result;
+  result.directAttempts = g_shadowSceneStats.gpuSkinVsShadowDirectAttempts;
+  result.directInputRejects =
+      g_shadowSceneStats.gpuSkinVsShadowDirectInputRejects;
+  result.directStateRejects =
+      g_shadowSceneStats.gpuSkinVsShadowDirectStateRejects;
+  result.directDrawsSubmitted =
+      g_shadowSceneStats.gpuSkinVsShadowDirectDrawsSubmitted;
+  result.directBindingsCleared =
+      g_shadowSceneStats.gpuSkinVsShadowDirectBindingsCleared;
+  result.replayDirectional =
+      g_shadowSceneStats.gpuSkinVsShadowReplayDirectional;
+  result.replayPoint = g_shadowSceneStats.gpuSkinVsShadowReplayPoint;
+  result.replayUnknown = g_shadowSceneStats.gpuSkinVsShadowReplayUnknown;
+  return result;
+}
+
+void NoteFinalShadowCasterFrame(
+    const War3FrameScene& scene,
+    const std::vector<const War3ShadowCasterDraw*>& draws,
+    uint64_t frameSerial) {
+  if (frameSerial == 0u)
+    return;
+
+  std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
+  auto config = ShadowPoseFullTraceConfigLocked();
+  if (!config.enabled || !config.includeFinalCasterRecords)
+    return;
+  if (ShadowPoseFullTraceDeadlineReachedLocked()) {
+    g_shadowPoseFullTraceStoppedByLimit = true;
+    CloseShadowPoseFullTraceLocked();
+    Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
+                 "duration limit");
+    return;
+  }
+  if (g_shadowPoseFullTraceLastFinalCasterFrameSerial == frameSerial &&
+      g_shadowPoseFullTraceLastFinalCasterScene == &scene) {
+    return;
+  }
+  if (!EnsureShadowPoseFullTraceOpenLocked(config))
+    return;
+
+  std::array<uint32_t, kWar3ShadowStageHistogramBinCount> stageCounts = {};
+  std::array<uint32_t, kWar3ShadowCategoryHistogramBinCount>
+      categoryCounts = {};
+  uint64_t identityXor = 0u;
+  uint64_t identitySum = 0u;
+  uint64_t backingXor = 0u;
+  uint64_t contentXor = 0u;
+  uint32_t nullDrawCount = 0u;
+  uint32_t validationRejectCandidateCount = 0u;
+
+  for (const War3ShadowCasterDraw* draw : draws) {
+    if (draw == nullptr) {
+      ++nullDrawCount;
+      continue;
+    }
+    const size_t stageBin =
+        draw->stage >= 0 &&
+                draw->stage <
+                    static_cast<int16_t>(kWar3ShadowStageHistogramStageCount)
+            ? static_cast<size_t>(draw->stage)
+            : kWar3ShadowStageHistogramBinCount - 1u;
+    ++stageCounts[stageBin];
+    const size_t categoryBin =
+        (std::min)(size_t(static_cast<uint32_t>(draw->category)),
+                   kWar3ShadowCategoryHistogramBinCount - 1u);
+    ++categoryCounts[categoryBin];
+
+    const uint64_t identityHash = ShadowCasterTraceIdentityHash(*draw);
+    identityXor ^= identityHash;
+    identitySum += identityHash;
+    backingXor ^= ShadowCasterTraceBackingHash(*draw);
+    contentXor ^=
+        ShadowCasterTraceContentHash(*draw, config.finalCasterSampleBytes);
+    if (ShadowCasterTraceValidationFlags(*draw) != 0u)
+      ++validationRejectCandidateCount;
+  }
+
+  const uint32_t recordLimit =
+      config.maxFinalCasterRecords == 0u
+          ? static_cast<uint32_t>(
+                (std::min)(draws.size(), size_t(0xFFFFFFFFu)))
+          : static_cast<uint32_t>(
+                (std::min)(draws.size(),
+                           size_t(config.maxFinalCasterRecords)));
+  g_shadowPoseFullTraceStream
+      << "{\"type\":\"shadowFinalCasterFrame\""
+      << ",\"version\":1"
+      << ",\"epoch\":" << config.epoch
+      << ",\"frameSerial\":" << frameSerial
+      << ",\"worldCameraValid\":" << (scene.worldCamera.valid ? 1 : 0)
+      << ",\"worldCameraFrameSerial\":" << scene.worldCamera.frameSerial
+      << ",\"shadowCastersSize\":" << scene.shadowCasters.size()
+      << ",\"shadowInstancesSize\":" << scene.shadowInstances.size()
+      << ",\"shadowFallbacksSize\":" << scene.shadowFallbacks.size()
+      << ",\"finalDrawCount\":" << draws.size()
+      << ",\"recordCount\":" << recordLimit
+      << ",\"truncated\":"
+      << (recordLimit < draws.size() ? 1 : 0)
+      << ",\"nullDrawCount\":" << nullDrawCount
+      << ",\"validationRejectCandidateCount\":"
+      << validationRejectCandidateCount;
+  WritePtrField(g_shadowPoseFullTraceStream, "scenePtr", &scene);
+  WriteHexField(g_shadowPoseFullTraceStream, "identityXor", identityXor);
+  WriteHexField(g_shadowPoseFullTraceStream, "identitySum", identitySum);
+  WriteHexField(g_shadowPoseFullTraceStream, "backingXor", backingXor);
+  WriteHexField(g_shadowPoseFullTraceStream, "contentXor", contentXor);
+  g_shadowPoseFullTraceStream << ",\"stageCounts\":[";
+  for (size_t i = 0u; i < stageCounts.size(); ++i) {
+    if (i != 0u)
+      g_shadowPoseFullTraceStream << ',';
+    g_shadowPoseFullTraceStream << stageCounts[i];
+  }
+  g_shadowPoseFullTraceStream << "],\"categoryCounts\":[";
+  for (size_t i = 0u; i < categoryCounts.size(); ++i) {
+    if (i != 0u)
+      g_shadowPoseFullTraceStream << ',';
+    g_shadowPoseFullTraceStream << categoryCounts[i];
+  }
+  g_shadowPoseFullTraceStream << "]}\n";
+  ++g_shadowPoseFullTraceFrameEventsWritten;
+
+  for (uint32_t i = 0u; i < recordLimit; ++i) {
+    if (draws[i] == nullptr)
+      continue;
+    WriteFinalShadowCasterRecordEvent(
+        g_shadowPoseFullTraceStream, config.epoch, frameSerial, i,
+        *draws[i], config.finalCasterSampleBytes);
+    ++g_shadowPoseFullTraceRecordEventsWritten;
+  }
+  g_shadowPoseFullTraceStream.flush();
+  g_shadowPoseFullTraceLastFinalCasterFrameSerial = frameSerial;
+  g_shadowPoseFullTraceLastFinalCasterScene = &scene;
+}
+
+void NoteCurrentDrawSnapshotFrame(
+    const std::vector<CurrentDrawContractRecord>& records,
+    uint64_t frameSerial) {
+  if (frameSerial == 0u)
+    return;
+
+  std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
+  auto config = ShadowPoseFullTraceConfigLocked();
+  if (!config.enabled || !config.includeCurrentDrawRecords)
+    return;
+  if (ShadowPoseFullTraceDeadlineReachedLocked()) {
+    g_shadowPoseFullTraceStoppedByLimit = true;
+    CloseShadowPoseFullTraceLocked();
+    Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
+                 "duration limit");
+    return;
+  }
+  if (!EnsureShadowPoseFullTraceOpenLocked(config))
+    return;
+
+  const uint32_t recordLimit =
+      config.maxCurrentDrawRecords == 0u
+          ? uint32_t(std::min<size_t>(
+                records.size(), size_t(std::numeric_limits<uint32_t>::max())))
+          : uint32_t(std::min<size_t>(records.size(),
+                                     config.maxCurrentDrawRecords));
+  g_shadowPoseFullTraceStream
+      << "{\"type\":\"shadowCurrentDrawSnapshotFrame\""
+      << ",\"version\":1"
+      << ",\"epoch\":" << config.epoch
+      << ",\"frameSerial\":" << frameSerial
+      << ",\"recordCount\":" << records.size()
+      << ",\"writtenRecordCount\":" << recordLimit
+      << ",\"truncated\":" << (recordLimit < records.size() ? 1 : 0)
+      << "}\n";
+  ++g_shadowPoseFullTraceFrameEventsWritten;
+  for (uint32_t i = 0u; i < recordLimit; ++i) {
+    WriteCurrentDrawRecordEvent(g_shadowPoseFullTraceStream, config.epoch,
+                                frameSerial, i, records[i]);
+    ++g_shadowPoseFullTraceRecordEventsWritten;
+  }
+  g_shadowPoseFullTraceStream.flush();
 }
 
 void NoteShadowFrameCadenceSample(uint64_t frameIndex,
@@ -1747,6 +4591,30 @@ void NoteShadowFrameCadenceSample(uint64_t frameIndex,
       stats.semanticSceneShadowMatrixBufferSize;
   sample.shadowMatrixBufferGpuAddress =
       stats.semanticSceneShadowMatrixBufferGpuAddress;
+  sample.receiverCameraHash =
+      stats.semanticSceneReceiverCameraHash;
+  sample.receiverSunDirectionHash =
+      stats.semanticSceneReceiverSunDirectionHash;
+  sample.receiverCsmHash =
+      stats.semanticSceneReceiverCsmHash;
+  sample.receiverCameraDeltaNano =
+      stats.semanticSceneReceiverCameraDeltaNano;
+  sample.receiverSunDeltaNano =
+      stats.semanticSceneReceiverSunDeltaNano;
+  sample.receiverCsmDeltaNano =
+      stats.semanticSceneReceiverCsmDeltaNano;
+  sample.receiverSnappedCenterDeltaTexelsNano =
+      stats.semanticSceneReceiverSnappedCenterDeltaTexelsNano;
+  sample.receiverTexelSizeDeltaNano =
+      stats.semanticSceneReceiverTexelSizeDeltaNano;
+  sample.replayBackingHash =
+      stats.semanticSceneReplayBackingHash;
+  sample.stage13ReplayContentHash =
+      stats.semanticSceneStage13ReplayContentHash;
+  sample.stage13ReplayBackingHash =
+      stats.semanticSceneStage13ReplayBackingHash;
+  sample.stage13ReplayDrawCount =
+      stats.semanticSceneStage13ReplayDrawCount;
   sample.shadowMapRenderSerial = stats.semanticSceneShadowMapRenderSerial;
   sample.shadowMapImagePtr = stats.semanticSceneShadowMapImagePtr;
   sample.shadowMapSampleViewPtr =
@@ -1774,6 +4642,12 @@ void NoteShadowFrameCadenceSample(uint64_t frameIndex,
   sample.shadowHistoryReadIndex = stats.semanticSceneShadowHistoryReadIndex;
   sample.shadowHistoryWriteIndex =
       stats.semanticSceneShadowHistoryWriteIndex;
+  sample.shadowHistoryAdvancedThisFrame =
+      stats.semanticSceneShadowHistoryAdvancedThisFrame;
+  sample.shadowHistoryAdvanceSkippedIncomplete =
+      stats.semanticSceneShadowHistoryAdvanceSkippedIncomplete;
+  sample.shadowHistoryInvalidationMask =
+      stats.semanticSceneShadowHistoryInvalidationMask;
   sample.shadowReceiverSampleSource =
       stats.semanticSceneShadowReceiverSampleSource;
 
@@ -1843,13 +4717,17 @@ void StartShadowPoseFullTrace(uint32_t maxSeconds, bool includeMatrixBytes,
   g_shadowPoseFullTraceIncludePoseRecords = true;
   g_shadowPoseFullTraceIncludeShadowObjectRecords = true;
   g_shadowPoseFullTraceIncludeCurrentDrawRecords = true;
+  g_shadowPoseFullTraceIncludeFinalCasterRecords = true;
   g_shadowPoseFullTraceIncludeMatrixBytes = includeMatrixBytes;
   g_shadowPoseFullTraceMaxSeconds = maxSeconds == 0u ? 15u : maxSeconds;
   g_shadowPoseFullTraceMaxPoseRecords = maxPoseRecords;
   g_shadowPoseFullTraceMaxShadowObjectRecords = maxShadowObjectRecords;
   g_shadowPoseFullTraceMaxCurrentDrawRecords = maxCurrentDrawRecords;
+  g_shadowPoseFullTraceMaxFinalCasterRecords = 0u;
   g_shadowPoseFullTraceFrameEventsWritten = 0u;
   g_shadowPoseFullTraceRecordEventsWritten = 0u;
+  g_shadowPoseFullTraceLastFinalCasterFrameSerial = 0u;
+  g_shadowPoseFullTraceLastFinalCasterScene = nullptr;
   g_shadowPoseFullTraceStart = {};
   g_shadowPoseFullTracePath.clear();
   ++g_shadowPoseFullTraceEpoch;
@@ -1860,6 +4738,8 @@ void StopShadowPoseFullTrace() {
   g_shadowPoseFullTraceManualEnabled = false;
   g_shadowPoseFullTraceEnvEnabled = false;
   g_shadowPoseFullTraceStoppedByLimit = false;
+  g_shadowPoseFullTraceLastFinalCasterFrameSerial = 0u;
+  g_shadowPoseFullTraceLastFinalCasterScene = nullptr;
   CloseShadowPoseFullTraceLocked();
 }
 
@@ -1874,12 +4754,14 @@ ShadowPoseFullTraceStatus QueryShadowPoseFullTraceStatus() {
   status.includePoseRecords = config.includePoseRecords;
   status.includeShadowObjectRecords = config.includeShadowObjectRecords;
   status.includeCurrentDrawRecords = config.includeCurrentDrawRecords;
+  status.includeFinalCasterRecords = config.includeFinalCasterRecords;
   status.includeMatrixBytes = config.includeMatrixBytes;
   status.stoppedByLimit = g_shadowPoseFullTraceStoppedByLimit;
   status.maxSeconds = config.maxSeconds;
   status.maxPoseRecords = config.maxPoseRecords;
   status.maxShadowObjectRecords = config.maxShadowObjectRecords;
   status.maxCurrentDrawRecords = config.maxCurrentDrawRecords;
+  status.maxFinalCasterRecords = config.maxFinalCasterRecords;
   status.traceEpoch = config.epoch;
   status.frameEventsWritten = g_shadowPoseFullTraceFrameEventsWritten;
   status.recordEventsWritten = g_shadowPoseFullTraceRecordEventsWritten;
@@ -2119,7 +5001,7 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
               std::chrono::steady_clock::now() - semanticRefreshStart)
               .count();
       NoteSemanticDataPerf(
-          SemanticDataPerfTag::ConsumerBuild,
+          SemanticDataPerfTag::SummaryRefreshRequest,
           semanticRefreshElapsed > 0
               ? static_cast<uint64_t>(semanticRefreshElapsed)
               : 0u);
@@ -2335,6 +5217,8 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
       writeVisibleSample(visibleRecords[1], false);
   }
   const auto sceneCollectorSummary = QuerySceneCollectorIdentityProbeSummary();
+  summary.sceneCollectorGroupLocalAggregationEnabled =
+      sceneCollectorSummary.groupLocalAggregationEnabled;
   summary.worldObjectListEntryCount =
       sceneCollectorSummary.worldObjectListEntryCount;
   summary.worldObjectListNullEntryCount =
@@ -2359,6 +5243,16 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
       sceneCollectorSummary.lastWorldObjectListEntrySceneNodePtr;
   const auto renderIdentitySummary =
       hooks::QueryRenderIdentityLifecycleProbeSummary();
+  summary.renderIdentityFullDiagnostics =
+      renderIdentitySummary.fullDiagnostics;
+  summary.worldObjectListEntryWriteProbeHookInstalled =
+      renderIdentitySummary.worldObjectListEntryWriteProbeHookInstalled;
+  summary.worldObjectEntryRenderContextHookInstalled =
+      renderIdentitySummary.worldObjectEntryRenderContextHookInstalled;
+  summary.worldObjectEntryRenderPrePostProbeEnabled =
+      renderIdentitySummary.worldObjectEntryRenderPrePostProbeEnabled;
+  summary.renderQueueIdentityPrimingHookInstalled =
+      renderIdentitySummary.renderQueueIdentityPrimingHookInstalled;
   summary.worldObjectEntryRenderCallCount =
       renderIdentitySummary.worldObjectEntryRenderCallCount;
   summary.worldObjectEntryRenderSceneNodeReadyBeforeCount =
@@ -3456,6 +6350,27 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         .semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount =
         g_shadowSceneStats
             .semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount;
+    summary
+        .semanticSceneShadowManifestCorePartPrunedOnLeaseExpiryCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestCorePartPrunedOnLeaseExpiryCount;
+    summary
+        .semanticSceneShadowManifestCoreObjectEmptiedOnLeaseExpiryCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestCoreObjectEmptiedOnLeaseExpiryCount;
+    summary.semanticSceneShadowManifestLeaseExpiredBackingOnlyCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestLeaseExpiredBackingOnlyCount;
+    summary
+        .semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount =
+        g_shadowSceneStats
+            .semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount;
+    summary.semanticSceneShadowManifestMissingRequiredPartCount =
+        g_shadowSceneStats.semanticSceneShadowManifestMissingRequiredPartCount;
+    summary.semanticSceneShadowManifestGraceUsedCount =
+        g_shadowSceneStats.semanticSceneShadowManifestGraceUsedCount;
+    summary.semanticSceneShadowManifestTombstoneRetiredCount =
+        g_shadowSceneStats.semanticSceneShadowManifestTombstoneRetiredCount;
     // Phase 7.28：skinned palette content stability probe。
     summary.semanticSceneSubmittedSkinnedPaletteSourceNoneCount =
         g_shadowSceneStats.semanticSceneSubmittedSkinnedPaletteSourceNoneCount;
@@ -3749,6 +6664,80 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneLastAppendedRenderablePart;
     summary.semanticSceneLastAppendedMeshData =
         g_shadowSceneStats.semanticSceneLastAppendedMeshData;
+    summary.terrainS1CaptureAttemptCount =
+        g_shadowSceneStats.terrainS1CaptureAttemptCount;
+    summary.terrainS1CaptureAcceptedCount =
+        g_shadowSceneStats.terrainS1CaptureAcceptedCount;
+    summary.terrainS1WorldIdentityLikeCount =
+        g_shadowSceneStats.terrainS1WorldIdentityLikeCount;
+    summary.terrainS1WorldNonIdentityCount =
+        g_shadowSceneStats.terrainS1WorldNonIdentityCount;
+    summary.terrainS1WorldNonFiniteCount =
+        g_shadowSceneStats.terrainS1WorldNonFiniteCount;
+    summary.terrainS1ForceIdentityWorldCount =
+        g_shadowSceneStats.terrainS1ForceIdentityWorldCount;
+    summary.terrainS1WorldMatrixHash =
+        g_shadowSceneStats.terrainS1WorldMatrixHash;
+    summary.terrainS1WorldTranslationMilliMax =
+        g_shadowSceneStats.terrainS1WorldTranslationMilliMax;
+    for (size_t i = 0u; i < summary.shadowCasterStageHistogram.size(); ++i) {
+      summary.shadowCasterStageHistogram[i] =
+          g_shadowSceneStats.shadowCasterStageHistogram[i];
+    }
+    for (size_t i = 0u; i < summary.shadowCasterCategoryHistogram.size(); ++i) {
+      summary.shadowCasterCategoryHistogram[i] =
+          g_shadowSceneStats.shadowCasterCategoryHistogram[i];
+    }
+    summary.stage13CaptureAttemptCount =
+        g_shadowSceneStats.stage13CaptureAttemptCount;
+    summary.stage13CaptureRejectedNoDemandCount =
+        g_shadowSceneStats.stage13CaptureRejectedNoDemandCount;
+    summary.stage13CaptureRejectedAfterBeforeUiCount =
+        g_shadowSceneStats.stage13CaptureRejectedAfterBeforeUiCount;
+    summary.stage13CaptureConsideredCount =
+        g_shadowSceneStats.stage13CaptureConsideredCount;
+    summary.beforeUiStage13BoundaryCandidateCount =
+        g_shadowSceneStats.beforeUiStage13BoundaryCandidateCount;
+    summary.beforeUiStage13BoundaryCommitCount =
+        g_shadowSceneStats.beforeUiStage13BoundaryCommitCount;
+    summary.stage13RetentionBaseEligibleCount =
+        g_shadowSceneStats.stage13RetentionBaseEligibleCount;
+    summary.stage13SourcePositionInvalidCount =
+        g_shadowSceneStats.stage13SourcePositionInvalidCount;
+    summary.stage13SourceIndexInvalidCount =
+        g_shadowSceneStats.stage13SourceIndexInvalidCount;
+    summary.stage13SourceIdentityValidCount =
+        g_shadowSceneStats.stage13SourceIdentityValidCount;
+    summary.stage13SourceIdentityHitCount =
+        g_shadowSceneStats.stage13SourceIdentityHitCount;
+    summary.stage13SourceIdentityMissCount =
+        g_shadowSceneStats.stage13SourceIdentityMissCount;
+    summary.stage13StrongScanCount =
+        g_shadowSceneStats.stage13StrongScanCount;
+    summary.stage13SnapshotBuildCount =
+        g_shadowSceneStats.stage13SnapshotBuildCount;
+    summary.stage13SnapshotContentRekeyCount =
+        g_shadowSceneStats.stage13SnapshotContentRekeyCount;
+    summary.stage13FreezeCopyBytes =
+        g_shadowSceneStats.stage13FreezeCopyBytes;
+    summary.stage13CpuSnapshotCopyBytes =
+        g_shadowSceneStats.stage13CpuSnapshotCopyBytes;
+    summary.stage13RetentionSnapshotBytes =
+        g_shadowSceneStats.stage13RetentionSnapshotBytes;
+    summary.stage13RetainedEntryCountMax =
+        g_shadowSceneStats.stage13RetainedEntryCountMax;
+    summary.stage13RetainedContentMatchCount =
+        g_shadowSceneStats.stage13RetainedContentMatchCount;
+    summary.stage13RetainedIdentityMatchCount =
+        g_shadowSceneStats.stage13RetainedIdentityMatchCount;
+    summary.stage13RetainedWorldMatchCount =
+        g_shadowSceneStats.stage13RetainedWorldMatchCount;
+    summary.stage13RetainedMaterialMatchCount =
+        g_shadowSceneStats.stage13RetainedMaterialMatchCount;
+    summary.stage13RetainedLayoutMatchCount =
+        g_shadowSceneStats.stage13RetainedLayoutMatchCount;
+    summary.stage13RetainedAllSemanticMatchCount =
+        g_shadowSceneStats.stage13RetainedAllSemanticMatchCount;
     // submitted/replay/executed reconciliation
     summary.semanticSceneShadowCastersCount =
         g_shadowSceneStats.semanticSceneShadowCastersCount;
@@ -4114,6 +7103,42 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
           alphaTestSnapshot.cacheEvictedCount;
       summary.shadowAlphaTestPayloadCacheSizeGauge =
           alphaTestSnapshot.cacheSizeGauge;
+      summary.shadowMetadataClassifiedCount =
+          alphaTestSnapshot.metadataClassifiedCount;
+      summary.shadowMetadataCapturedCount =
+          alphaTestSnapshot.metadataCapturedCount;
+      summary.shadowMetadataAppliedCount =
+          alphaTestSnapshot.metadataAppliedCount;
+      summary.shadowMetadataRejectedFrameCount =
+          alphaTestSnapshot.metadataRejectedFrameCount;
+      summary.shadowMetadataRejectedGenerationCount =
+          alphaTestSnapshot.metadataRejectedGenerationCount;
+      summary.shadowMetadataAmbiguousCount =
+          alphaTestSnapshot.metadataAmbiguousCount;
+      summary.shadowMetadataRejectedNoMaterialCount =
+          alphaTestSnapshot.metadataRejectedNoMaterialCount;
+      summary.shadowMetadataRejectedOpaqueCount =
+          alphaTestSnapshot.metadataRejectedOpaqueCount;
+      summary.shadowMetadataRejectedNoUvCount =
+          alphaTestSnapshot.metadataRejectedNoUvCount;
+      summary.shadowMetadataRejectedNoDiffuseCount =
+          alphaTestSnapshot.metadataRejectedNoDiffuseCount;
+      summary.shadowMetadataRejectedUploadCount =
+          alphaTestSnapshot.metadataRejectedUploadCount;
+      summary.shadowMetadataRejectedDuplicateCount =
+          alphaTestSnapshot.metadataRejectedDuplicateCount;
+      summary.shadowMetadataBlockerKnownRawcodeCount =
+          alphaTestSnapshot.blockerKnownRawcodeCount;
+      summary.shadowMetadataBlockerWidgetIdentityCount =
+          alphaTestSnapshot.blockerWidgetIdentityCount;
+      summary.shadowMetadataBlockerSmallFlatCount =
+          alphaTestSnapshot.blockerSmallFlatCount;
+      summary.shadowMetadataBlockerBelowGroundCount =
+          alphaTestSnapshot.blockerBelowGroundCount;
+      summary.shadowMetadataBlockerUnreadableCount =
+          alphaTestSnapshot.blockerUnreadableCount;
+      summary.shadowMetadataBlockerFinalLeakCount =
+          alphaTestSnapshot.blockerFinalLeakCount;
     }
     summary.semanticFallbackPruned = g_shadowSceneStats.semanticFallbackPruned;
     summary.semanticFallbackPrunedByHandle =
@@ -4320,6 +7345,34 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         contractCache.manifestCopyTotalChronoNs();
     summary.semanticManifestCopyMaxChronoNs =
         contractCache.manifestCopyMaxChronoNs();
+    summary.semanticManifestResolveSourceCompleteSkipCount =
+        contractCache.manifestResolveSourceCompleteSkipCount();
+    summary.semanticManifestResolveLegacyCacheHitCount =
+        contractCache.manifestResolveLegacyCacheHitCount();
+    summary.semanticManifestResolveRawScanCount =
+        contractCache.manifestResolveRawScanCount();
+    summary.semanticManifestResolveRawScanEntryVisitCount =
+        contractCache.manifestResolveRawScanEntryVisitCount();
+    summary.semanticManifestResolveRawScanMissCount =
+        contractCache.manifestResolveRawScanMissCount();
+    summary.semanticManifestResolveVerifierAttemptCount =
+        contractCache.manifestResolveVerifierAttemptCount();
+    summary.semanticManifestResolveVerifierMismatchCount =
+        contractCache.manifestResolveVerifierMismatchCount();
+    summary.semanticManifestResolveMaxRuntimeGeosetCount =
+        contractCache.manifestResolveMaxRuntimeGeosetCount();
+    summary.semanticManifestModelResourceAttemptCount =
+        contractCache.manifestModelResourceAttemptCount();
+    summary.semanticManifestModelResourceCacheHitCount =
+        contractCache.manifestModelResourceCacheHitCount();
+    summary.semanticManifestModelResourceDeepResolveCount =
+        contractCache.manifestModelResourceDeepResolveCount();
+    summary.semanticManifestModelResourceNullResultCount =
+        contractCache.manifestModelResourceNullResultCount();
+    summary.semanticManifestModelResourceVerifierAttemptCount =
+        contractCache.manifestModelResourceVerifierAttemptCount();
+    summary.semanticManifestModelResourceVerifierMismatchCount =
+        contractCache.manifestModelResourceVerifierMismatchCount();
   }
   summary.semanticVisibleDirectUnitCandidateAccepted =
       publishedBundle.stats.visibleDirectUnitCandidateAccepted;
@@ -4788,6 +7841,14 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
       semanticPerfUs(SemanticDataPerfTag::ConsumerBuild);
   summary.semanticConsumerBuildSkippedFresh =
       g_semanticConsumerBuildSkippedFresh.load(std::memory_order_relaxed);
+  summary.semanticSummaryRefreshRequestCalls =
+      semanticPerfCalls(SemanticDataPerfTag::SummaryRefreshRequest);
+  summary.semanticSummaryRefreshRequestUs =
+      semanticPerfUs(SemanticDataPerfTag::SummaryRefreshRequest);
+  summary.shadowMetadataCaptureFrameCalls =
+      semanticPerfCalls(SemanticDataPerfTag::ShadowMetadataCapture);
+  summary.shadowMetadataCaptureUs =
+      semanticPerfUs(SemanticDataPerfTag::ShadowMetadataCapture);
   summary.semanticLastHotFunctionTag =
       g_semanticLastHotFunctionTag.load(std::memory_order_relaxed);
   summary.semanticLastHotFunctionUs =
@@ -5824,48 +8885,246 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
   return summary;
 }
 
+namespace {
+
+struct ShadowRuntimeBridgeTrackingHealth {
+  uint64_t poseFrame = 0u;
+  uint64_t fastPathCalls = 0u;
+  uint64_t fullSummaryCompatibilityCalls = 0u;
+  uint64_t modelInstanceAggregateReadPasses = 0u;
+  uint64_t poseAggregateReadPasses = 0u;
+  uint64_t modelInstanceVerifierScanPasses = 0u;
+  uint64_t poseVerifierScanPasses = 0u;
+  uint64_t modelInstanceVerifierRecordsScanned = 0u;
+  uint64_t poseVerifierRecordsScanned = 0u;
+  uint64_t modelInstanceVerifierMismatchCount = 0u;
+  uint64_t poseVerifierMismatchCount = 0u;
+  uint32_t modelInstanceVerifierMismatchMask = 0u;
+  uint32_t poseVerifierMismatchMask = 0u;
+  bool runtimePoseHooksActive = false;
+  bool runtimeChainWarm = false;
+  bool runtimeChainNeedsRepair = false;
+};
+
+ShadowRuntimeBridgeTrackingHealth QueryShadowRuntimeBridgeTrackingHealth() {
+  ShadowRuntimeBridgeTrackingHealth health = {};
+  if constexpr (internal::kNativeRendererHookTakeoverEnabled) {
+    // QueryShadowRuntimeBridgeSummary also owns the historical native takeover
+    // installation side effect.  Preserve that exact behavior if takeover is
+    // ever compiled on; the current production configuration compiles this
+    // large compatibility path out of per-frame tracking.
+    const auto summary = QueryShadowRuntimeBridgeSummary();
+    health.poseFrame = summary.poseFrame;
+    health.fullSummaryCompatibilityCalls = 1u;
+    health.runtimePoseHooksActive = summary.runtimePoseHooksActive;
+    health.runtimeChainWarm = summary.runtimeChainWarm;
+    health.runtimeChainNeedsRepair = summary.runtimeChainNeedsRepair;
+  } else {
+    const auto contractStats =
+        shadow::ShadowRuntimeContractCache::instance().snapshotStats();
+    health.runtimePoseHooksActive = model::IsPoseHookEnabled();
+    const uint64_t modelRegistryCount =
+        uint64_t(model::ModelRegistry::instance().recordCount());
+    const auto instanceHealth =
+        model::ModelInstanceRegistry::instance().trackingHealthSnapshot();
+    const auto poseHealth =
+        model::PoseRegistry::instance().trackingHealthSnapshot();
+
+    health.fastPathCalls = 1u;
+    health.modelInstanceAggregateReadPasses =
+        instanceHealth.aggregateReadPasses;
+    health.poseAggregateReadPasses = poseHealth.aggregateReadPasses;
+    health.modelInstanceVerifierScanPasses =
+        instanceHealth.verifierScanPasses;
+    health.poseVerifierScanPasses = poseHealth.verifierScanPasses;
+    health.modelInstanceVerifierRecordsScanned =
+        instanceHealth.verifierRecordsScanned;
+    health.poseVerifierRecordsScanned =
+        poseHealth.verifierRecordsScanned;
+    health.modelInstanceVerifierMismatchCount =
+        instanceHealth.verifierMismatchCount;
+    health.poseVerifierMismatchCount =
+        poseHealth.verifierMismatchCount;
+    health.modelInstanceVerifierMismatchMask =
+        instanceHealth.verifierMismatchMask;
+    health.poseVerifierMismatchMask = poseHealth.verifierMismatchMask;
+    health.poseFrame = health.runtimePoseHooksActive
+        ? poseHealth.frameNumber
+        : instanceHealth.frameNumber;
+
+    const uint64_t matrixPaletteCount = (std::max)(
+        poseHealth.matrixPaletteCount, contractStats.matrixPaletteCount);
+
+    // Keep these predicates equivalent to the corresponding
+    // fields in QueryShadowRuntimeBridgeSummary.  Only their data acquisition
+    // is consolidated; warm/repair policy remains unchanged.
+    health.runtimeChainWarm =
+        modelRegistryCount >= 16u &&
+        instanceHealth.runtimeBoundCount >= 16u &&
+        instanceHealth.completeIdentityCount + 4u >=
+            instanceHealth.runtimeBoundCount &&
+        (!health.runtimePoseHooksActive ||
+         (poseHealth.readyPoseCount >= 16u &&
+          (poseHealth.spriteFramePoseCount + matrixPaletteCount) >= 8u));
+
+    const uint64_t identityGap =
+        instanceHealth.runtimeBoundCount >
+                instanceHealth.completeIdentityCount
+            ? (instanceHealth.runtimeBoundCount -
+               instanceHealth.completeIdentityCount)
+            : 0u;
+    const uint64_t runtimeBindGap =
+        modelRegistryCount > instanceHealth.runtimeBoundCount
+            ? (modelRegistryCount - instanceHealth.runtimeBoundCount)
+            : 0u;
+    const uint64_t poseGap =
+        instanceHealth.runtimeBoundCount > poseHealth.readyPoseCount
+            ? (instanceHealth.runtimeBoundCount - poseHealth.readyPoseCount)
+            : 0u;
+
+    const bool identityNeedsRepair =
+        instanceHealth.runtimeBoundCount >= 24u && identityGap > 12u &&
+        identityGap * 4u > instanceHealth.runtimeBoundCount;
+    const bool runtimeBindNeedsRepair =
+        modelRegistryCount >= 32u && runtimeBindGap > 8u &&
+        runtimeBindGap * 2u > modelRegistryCount;
+    const bool poseNeedsRepair =
+        health.runtimePoseHooksActive &&
+        instanceHealth.runtimeBoundCount >= 24u &&
+        ((poseGap > 12u &&
+          poseGap * 4u > instanceHealth.runtimeBoundCount) ||
+         (poseHealth.spriteFramePoseCount + matrixPaletteCount) == 0u);
+
+    health.runtimeChainNeedsRepair =
+        identityNeedsRepair || runtimeBindNeedsRepair || poseNeedsRepair;
+  }
+  return health;
+}
+
+} // namespace
+
 ShadowRuntimeBridgeTrackingDecision ComputeShadowRuntimeBridgeTracking() {
   ShadowRuntimeBridgeTrackingDecision decision = {};
-  if (!dxvk::war3::internal::kShadowRuntimeBridgeEnabled)
+  if (!dxvk::war3::internal::kShadowRuntimeBridgeEnabled) {
+    FinalizeWorldObjectsPhase1PreviousFrameWithoutNewDecision();
     return decision;
-  const auto summary = QueryShadowRuntimeBridgeSummary();
+  }
+
+  const int64_t trackingBegin =
+      dxvk::high_resolution_clock::get_counter();
+  const auto health = QueryShadowRuntimeBridgeTrackingHealth();
+  const int64_t queryEnd =
+      dxvk::high_resolution_clock::get_counter();
+  decision.trackingHealthFastPathCalls = health.fastPathCalls;
+  decision.trackingHealthFullSummaryCompatibilityCalls =
+      health.fullSummaryCompatibilityCalls;
+  decision.trackingHealthModelInstanceAggregateReadPasses =
+      health.modelInstanceAggregateReadPasses;
+  decision.trackingHealthPoseAggregateReadPasses =
+      health.poseAggregateReadPasses;
+  decision.trackingHealthModelInstanceVerifierScanPasses =
+      health.modelInstanceVerifierScanPasses;
+  decision.trackingHealthPoseVerifierScanPasses =
+      health.poseVerifierScanPasses;
+  decision.trackingHealthModelInstanceVerifierRecordsScanned =
+      health.modelInstanceVerifierRecordsScanned;
+  decision.trackingHealthPoseVerifierRecordsScanned =
+      health.poseVerifierRecordsScanned;
+  decision.trackingHealthModelInstanceVerifierMismatchCount =
+      health.modelInstanceVerifierMismatchCount;
+  decision.trackingHealthPoseVerifierMismatchCount =
+      health.poseVerifierMismatchCount;
+  decision.trackingHealthModelInstanceVerifierMismatchMask =
+      health.modelInstanceVerifierMismatchMask;
+  decision.trackingHealthPoseVerifierMismatchMask =
+      health.poseVerifierMismatchMask;
   const bool semanticSceneOwnsUnits =
       dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled() &&
       dxvk::war3::internal::
           IsSemanticSceneBypassLegacyUnitCaptureRuntimeEnabled() &&
       dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly;
-  const uint64_t refreshPeriod = summary.runtimePoseHooksActive ? 240u : 300u;
-  uint64_t warmupFrames = summary.runtimePoseHooksActive ? 60u : 24u;
+  const uint64_t refreshPeriod = health.runtimePoseHooksActive ? 240u : 300u;
+  uint64_t warmupFrames = health.runtimePoseHooksActive ? 60u : 24u;
   if (semanticSceneOwnsUnits) {
     // 语义 scene 已经能直接消费 runtimeModel + pose palette 时，
     // 不再需要在低 FPS 阶段坚持几十帧的“全量 identity warmup”。
     // 否则 poseFrame 会长时间卡在 warmup 区间，导致每帧重复 CollectWorldObjects，
     // 形成 FPS 越低、warmup 越走不完的恶性循环。
-    warmupFrames = summary.runtimeChainWarm ? 4u : 8u;
+    warmupFrames = health.runtimeChainWarm ? 4u : 8u;
   }
   const bool repairBurstActive =
-      summary.poseFrame != 0u &&
-      summary.poseFrame <=
+      health.poseFrame != 0u &&
+      health.poseFrame <=
           g_shadowBridgeRepairUntilFrame.load(std::memory_order_relaxed);
+  const bool warmupActive = health.poseFrame < warmupFrames;
+  const bool periodicMaintenanceActive =
+      health.poseFrame >= warmupFrames &&
+      (health.poseFrame % refreshPeriod) == 0u;
   const bool shouldRefreshIdentity =
-      summary.poseFrame < warmupFrames ||
-      ((summary.poseFrame % refreshPeriod) == 0u &&
-       summary.poseFrame >= warmupFrames) ||
+      warmupActive || periodicMaintenanceActive ||
       repairBurstActive ||
-      summary.runtimeChainNeedsRepair;
+      health.runtimeChainNeedsRepair;
 
   decision.wantsObjectIdentity =
-      shouldRefreshIdentity || !summary.runtimeChainWarm;
+      shouldRefreshIdentity || !health.runtimeChainWarm;
   decision.wantsFallbackBridge =
-      !summary.runtimeChainWarm || summary.poseFrame < warmupFrames ||
+      !health.runtimeChainWarm || health.poseFrame < warmupFrames ||
       repairBurstActive ||
-      summary.runtimeChainNeedsRepair;
+      health.runtimeChainNeedsRepair;
 
-  if (semanticSceneOwnsUnits && summary.runtimeChainWarm &&
-      !repairBurstActive && !summary.runtimeChainNeedsRepair) {
+  if (semanticSceneOwnsUnits && health.runtimeChainWarm &&
+      !repairBurstActive && !health.runtimeChainNeedsRepair) {
     // units-first semantic scene 已接管后，legacy fallback 只保留修复/诊断角色。
     decision.wantsFallbackBridge = false;
   }
+
+  uint32_t reasonMask = 0u;
+  if (!health.runtimeChainWarm) {
+    reasonMask |= WorldObjectsPhase1ReasonBit(
+        WorldObjectsPhase1TrackingReason::ColdBootstrap);
+  }
+  if (warmupActive) {
+    reasonMask |= WorldObjectsPhase1ReasonBit(
+        WorldObjectsPhase1TrackingReason::Warmup);
+  }
+  if (periodicMaintenanceActive) {
+    reasonMask |= WorldObjectsPhase1ReasonBit(
+        WorldObjectsPhase1TrackingReason::PeriodicMaintenance);
+  }
+  if (repairBurstActive) {
+    reasonMask |= WorldObjectsPhase1ReasonBit(
+        WorldObjectsPhase1TrackingReason::RepairBurst);
+  }
+  if (health.runtimeChainNeedsRepair) {
+    reasonMask |= WorldObjectsPhase1ReasonBit(
+        WorldObjectsPhase1TrackingReason::RuntimeChainRepair);
+  }
+
+  WorldObjectsPhase1TrackingReason reason =
+      WorldObjectsPhase1TrackingReason::None;
+  if (health.runtimeChainNeedsRepair) {
+    reason = WorldObjectsPhase1TrackingReason::RuntimeChainRepair;
+  } else if (repairBurstActive) {
+    reason = WorldObjectsPhase1TrackingReason::RepairBurst;
+  } else if (warmupActive) {
+    reason = WorldObjectsPhase1TrackingReason::Warmup;
+  } else if (!health.runtimeChainWarm) {
+    reason = WorldObjectsPhase1TrackingReason::ColdBootstrap;
+  } else if (periodicMaintenanceActive) {
+    reason = WorldObjectsPhase1TrackingReason::PeriodicMaintenance;
+  }
+
+  const uint64_t frameSerial =
+      RenderObjectRegistry::instance().getFrameNumber();
+  const uint64_t collectionFrameSerial = frameSerial + 1u;
+  const int64_t trackingEnd =
+      dxvk::high_resolution_clock::get_counter();
+  RecordWorldObjectsPhase1Tracking(
+      frameSerial, collectionFrameSerial, health.poseFrame, reason,
+      reasonMask, refreshPeriod, warmupFrames, decision,
+      WorldObjectsPhase1TickDelta(trackingBegin, trackingEnd),
+      WorldObjectsPhase1TickDelta(trackingBegin, queryEnd),
+      WorldObjectsPhase1TickDelta(queryEnd, trackingEnd));
   return decision;
 }
 
@@ -5949,8 +9208,13 @@ void ResetShadowRuntimeBridgeState() {
   shadow::NativeD3D9BackendRuntime::instance().reset();
 }
 
-bool AugmentShadowSemanticContext(dxvk::War3ShadowSemanticContext& semantic,
-                                  const RenderObjectInfo* currentObj) {
+bool AugmentShadowSemanticContext(
+    dxvk::War3ShadowSemanticContext& semantic,
+    const RenderObjectInfo* currentObj,
+    const ShadowSemanticAugmentTrace* trace) {
+  // 该函数可在每个 caster/draw 路径调用；默认 detail scope 为零开销空对象。
+  auto augmentDetailScope = dxvk::war3::War3PerfMonitor::instance()
+      .cpuDetailScope("Semantic/AugmentShadowContext");
   if (!dxvk::war3::internal::kShadowRuntimeBridgeEnabled)
     return false;
   const void* currentUnitPtr = currentObj != nullptr ? currentObj->unitPtr : nullptr;
@@ -5972,80 +9236,121 @@ bool AugmentShadowSemanticContext(dxvk::War3ShadowSemanticContext& semantic,
       needsStableIdentityAugment &&
       (semantic.sceneNode != nullptr || semantic.worldObjectEntry != nullptr ||
        semantic.jHandle != 0u || currentUnitPtr != nullptr);
-  const bool allowRuntimeRegistryLookup =
+  // ModelInstance lookup only supplies these seven fields.  Runtime-pose
+  // augmentation may still require ShadowObject/Pose below, but consulting
+  // ModelInstance when every field is already populated is a read-only no-op.
+  // Keep this test field-exact so incomplete first-seen objects retain the
+  // historical recovery order and result.
+  const bool needsModelInstanceRecovery =
+      semantic.sceneNode == nullptr ||
+      semantic.worldObjectEntry == nullptr ||
+      semantic.runtimeModelPtr == nullptr ||
+      semantic.modelResourcePtr == nullptr || semantic.modelKey == 0u ||
+      semantic.jHandle == 0u || semantic.rawcode == 0u;
+  const bool needsAnyRuntimeRegistryLookup =
       needsRuntimePoseAugment || needsStableIdentityAugment ||
       needsRuntimeRecovery;
+  void* const semanticUnitPtr =
+      needsAnyRuntimeRegistryLookup && semantic.object != nullptr
+          ? semantic.object->unitPtr
+          : nullptr;
+  const bool hasRuntimeRegistryLookupKey =
+      semantic.worldObjectEntry != nullptr || semantic.sceneNode != nullptr ||
+      semanticUnitPtr != nullptr || currentUnitPtr != nullptr ||
+      semantic.jHandle != 0u || semantic.runtimeModelPtr != nullptr;
+  // A keyless lookup can only miss.  Keep it when the explicitly enabled TLS
+  // cache is active, because that diagnostic mode observes negative-cache
+  // insertions and hit/miss counters.
+  const bool allowRuntimeRegistryLookup =
+      needsAnyRuntimeRegistryLookup &&
+      (hasRuntimeRegistryLookupKey || SemanticAugmentTlsCacheRuntime());
 
+  if (trace != nullptr)
+    trace->enter(ShadowSemanticAugmentTracePhase::ModelInstance);
   if (allowRuntimeRegistryLookup) {
-    model::ModelInstanceRecord instanceRecord = {};
-    bool instanceRecordHit = false;
-    auto& instanceRegistry = model::ModelInstanceRegistry::instance();
-    if (!instanceRecordHit && semantic.worldObjectEntry != nullptr)
-      instanceRecordHit = instanceRegistry.findByWorldObjectEntry(
-          semantic.worldObjectEntry, instanceRecord);
-    if (!instanceRecordHit && semantic.sceneNode != nullptr)
-      instanceRecordHit =
-          instanceRegistry.findBySceneNode(semantic.sceneNode, instanceRecord);
-    if (!instanceRecordHit && semantic.object != nullptr &&
-        semantic.object->unitPtr != nullptr) {
-      instanceRecordHit =
-          instanceRegistry.findByUnitPtr(semantic.object->unitPtr, instanceRecord);
-    }
-    if (!instanceRecordHit && currentUnitPtr != nullptr)
-      instanceRecordHit = instanceRegistry.findByUnitPtr(
-          const_cast<void*>(currentUnitPtr), instanceRecord);
-    if (!instanceRecordHit && semantic.jHandle != 0u)
-      instanceRecordHit =
-          instanceRegistry.findByHandle(semantic.jHandle, instanceRecord);
+    auto registryDetailScope = dxvk::war3::War3PerfMonitor::instance()
+        .cpuDetailScope("Semantic/AugmentShadowContext/RegistryRecovery");
+    if (needsModelInstanceRecovery) {
+      auto instanceRegistryDetailScope =
+          dxvk::war3::War3PerfMonitor::instance().cpuDetailScope(
+              "Semantic/AugmentShadowContext/RegistryRecovery/ModelInstance");
+      auto& instanceRegistry = model::ModelInstanceRegistry::instance();
+      const auto applyInstanceRecord = [&](const auto& instanceRecord) {
+        if (semantic.sceneNode == nullptr)
+          semantic.sceneNode = instanceRecord.sceneNode;
+        if (semantic.worldObjectEntry == nullptr)
+          semantic.worldObjectEntry = instanceRecord.worldObjectEntry;
+        if (semantic.runtimeModelPtr == nullptr)
+          semantic.runtimeModelPtr = instanceRecord.runtimeModelPtr;
+        if (semantic.modelResourcePtr == nullptr)
+          semantic.modelResourcePtr = instanceRecord.modelResourcePtr;
+        if (semantic.modelKey == 0u)
+          semantic.modelKey = instanceRecord.modelKey;
+        if (semantic.jHandle == 0u)
+          semantic.jHandle = instanceRecord.jHandle;
+        if (semantic.rawcode == 0u)
+          semantic.rawcode = instanceRecord.rawcode;
+      };
 
-    if (instanceRecordHit) {
-      if (semantic.sceneNode == nullptr)
-        semantic.sceneNode = instanceRecord.sceneNode;
-      if (semantic.worldObjectEntry == nullptr)
-        semantic.worldObjectEntry = instanceRecord.worldObjectEntry;
-      if (semantic.runtimeModelPtr == nullptr)
-        semantic.runtimeModelPtr = instanceRecord.runtimeModelPtr;
-      if (semantic.modelResourcePtr == nullptr)
-        semantic.modelResourcePtr = instanceRecord.modelResourcePtr;
-      if (semantic.modelKey == 0u)
-        semantic.modelKey = instanceRecord.modelKey;
-      if (semantic.jHandle == 0u)
-        semantic.jHandle = instanceRecord.jHandle;
-      if (semantic.rawcode == 0u)
-        semantic.rawcode = instanceRecord.rawcode;
+      if (SemanticAugmentBatchLookupRuntime()) {
+        model::ModelInstanceAugmentView instanceView = {};
+        bool instanceRecordHit = false;
+        if (SemanticAugmentTlsCacheRuntime()) {
+          const SemanticAugmentModelCacheKey cacheKey = {
+              semantic.worldObjectEntry,
+              semantic.sceneNode,
+              semanticUnitPtr,
+              const_cast<void*>(currentUnitPtr),
+              semantic.jHandle,
+          };
+          instanceRecordHit = FindModelInstanceAugmentCached(
+              instanceRegistry, cacheKey, instanceView);
+        } else {
+          instanceRecordHit = instanceRegistry.findFirstForAugmentView(
+              semantic.worldObjectEntry, semantic.sceneNode, semanticUnitPtr,
+              const_cast<void*>(currentUnitPtr), semantic.jHandle,
+              instanceView);
+        }
+        if (instanceRecordHit) {
+          applyInstanceRecord(instanceView);
+        }
+      } else {
+        model::ModelInstanceRecord instanceRecord = {};
+        bool instanceRecordHit = false;
+        if (!instanceRecordHit && semantic.worldObjectEntry != nullptr)
+          instanceRecordHit = instanceRegistry.findByWorldObjectEntry(
+              semantic.worldObjectEntry, instanceRecord);
+        if (!instanceRecordHit && semantic.sceneNode != nullptr)
+          instanceRecordHit = instanceRegistry.findBySceneNode(
+              semantic.sceneNode, instanceRecord);
+        if (!instanceRecordHit && semanticUnitPtr != nullptr)
+          instanceRecordHit = instanceRegistry.findByUnitPtr(
+              semanticUnitPtr, instanceRecord);
+        if (!instanceRecordHit && currentUnitPtr != nullptr)
+          instanceRecordHit = instanceRegistry.findByUnitPtr(
+              const_cast<void*>(currentUnitPtr), instanceRecord);
+        if (!instanceRecordHit && semantic.jHandle != 0u)
+          instanceRecordHit = instanceRegistry.findByHandle(
+              semantic.jHandle, instanceRecord);
+
+        if (instanceRecordHit)
+          applyInstanceRecord(instanceRecord);
+      }
     }
 
+    if (trace != nullptr)
+      trace->enter(ShadowSemanticAugmentTracePhase::ShadowObject);
     const bool needsShadowRegistryRecovery =
         needsRuntimePoseAugment || semantic.sceneNode == nullptr ||
         semantic.worldObjectEntry == nullptr || semantic.jHandle == 0u ||
         semantic.rawcode == 0u || semantic.objectKind == ObjectKind::Unknown;
     if (needsShadowRegistryRecovery) {
-      ShadowObjectRecord shadowRecord = {};
-      bool shadowRecordHit = false;
+      auto shadowRegistryDetailScope =
+          dxvk::war3::War3PerfMonitor::instance().cpuDetailScope(
+              "Semantic/AugmentShadowContext/RegistryRecovery/ShadowObject");
       auto& shadowRegistry = ShadowObjectRegistry::instance();
-      const uint64_t shadowRegistryFrame = shadowRegistry.frameNumber();
-      if (!shadowRecordHit && semantic.worldObjectEntry != nullptr)
-        shadowRecordHit = shadowRegistry.findByWorldObjectEntry(
-            semantic.worldObjectEntry, shadowRecord);
-      if (!shadowRecordHit && semantic.sceneNode != nullptr)
-        shadowRecordHit =
-            shadowRegistry.findBySceneNode(semantic.sceneNode, shadowRecord);
-      if (!shadowRecordHit && semantic.object != nullptr &&
-          semantic.object->unitPtr != nullptr) {
-        shadowRecordHit =
-            shadowRegistry.findByUnitPtr(semantic.object->unitPtr, shadowRecord);
-      }
-      if (!shadowRecordHit && currentObj != nullptr && currentObj->unitPtr != nullptr)
-        shadowRecordHit =
-            shadowRegistry.findByUnitPtr(currentObj->unitPtr, shadowRecord);
-      if (!shadowRecordHit && semantic.jHandle != 0u)
-        shadowRecordHit =
-            shadowRegistry.findByHandle(semantic.jHandle, shadowRecord);
-      if (!shadowRecordHit && semantic.runtimeModelPtr != nullptr)
-        shadowRecordHit =
-            shadowRegistry.findByRuntimeModel(semantic.runtimeModelPtr, shadowRecord);
-
-      if (shadowRecordHit) {
+      uint64_t shadowRegistryFrame = shadowRegistry.frameNumber();
+      const auto applyShadowRecord = [&](const auto& shadowRecord) {
         if (semantic.sceneNode == nullptr)
           semantic.sceneNode = shadowRecord.sceneNode;
         if (semantic.worldObjectEntry == nullptr)
@@ -6081,26 +9386,89 @@ bool AugmentShadowSemanticContext(dxvk::War3ShadowSemanticContext& semantic,
                                  shadowRecord.matrixHash,
                                  shadowRecord.lastMatrixPaletteFrame,
                                  bestMatrixFrame);
+      };
+
+      if (SemanticAugmentBatchLookupRuntime() &&
+          SemanticAugmentCompactShadowViewRuntime()) {
+        ShadowObjectAugmentView shadowView = {};
+        bool shadowRecordHit = false;
+        if (SemanticAugmentTlsCacheRuntime()) {
+          const SemanticAugmentShadowCacheKey cacheKey = {
+              semantic.worldObjectEntry,
+              semantic.sceneNode,
+              semanticUnitPtr,
+              const_cast<void*>(currentUnitPtr),
+              semantic.jHandle,
+              semantic.runtimeModelPtr,
+          };
+          shadowRecordHit = FindShadowObjectAugmentCached(
+              shadowRegistry, cacheKey, shadowView, shadowRegistryFrame);
+        } else {
+          shadowRecordHit = shadowRegistry.findFirstForAugmentView(
+              semantic.worldObjectEntry, semantic.sceneNode, semanticUnitPtr,
+              const_cast<void*>(currentUnitPtr), semantic.jHandle,
+              semantic.runtimeModelPtr, shadowView);
+        }
+        if (shadowRecordHit) {
+          applyShadowRecord(shadowView);
+        }
+      } else {
+        ShadowObjectRecord shadowRecord = {};
+        bool shadowRecordHit = false;
+        if (SemanticAugmentBatchLookupRuntime()) {
+          shadowRecordHit = shadowRegistry.findFirstForAugment(
+              semantic.worldObjectEntry, semantic.sceneNode, semanticUnitPtr,
+              const_cast<void*>(currentUnitPtr), semantic.jHandle,
+              semantic.runtimeModelPtr, shadowRecord);
+        } else {
+          if (!shadowRecordHit && semantic.worldObjectEntry != nullptr)
+            shadowRecordHit = shadowRegistry.findByWorldObjectEntry(
+                semantic.worldObjectEntry, shadowRecord);
+          if (!shadowRecordHit && semantic.sceneNode != nullptr)
+            shadowRecordHit = shadowRegistry.findBySceneNode(
+                semantic.sceneNode, shadowRecord);
+          if (!shadowRecordHit && semanticUnitPtr != nullptr)
+            shadowRecordHit = shadowRegistry.findByUnitPtr(
+                semanticUnitPtr, shadowRecord);
+          if (!shadowRecordHit && currentUnitPtr != nullptr)
+            shadowRecordHit = shadowRegistry.findByUnitPtr(
+                const_cast<void*>(currentUnitPtr), shadowRecord);
+          if (!shadowRecordHit && semantic.jHandle != 0u)
+            shadowRecordHit = shadowRegistry.findByHandle(
+                semantic.jHandle, shadowRecord);
+          if (!shadowRecordHit && semantic.runtimeModelPtr != nullptr)
+            shadowRecordHit = shadowRegistry.findByRuntimeModel(
+                semantic.runtimeModelPtr, shadowRecord);
+        }
+
+        if (shadowRecordHit)
+          applyShadowRecord(shadowRecord);
       }
     }
 
+    if (trace != nullptr)
+      trace->enter(ShadowSemanticAugmentTracePhase::Pose);
     if (needsRuntimePoseAugment) {
-      model::PoseRecord poseRecord = {};
+      auto poseRegistryDetailScope =
+          dxvk::war3::War3PerfMonitor::instance().cpuDetailScope(
+              "Semantic/AugmentShadowContext/RegistryRecovery/Pose");
+      model::PoseAugmentView poseRecord = {};
       bool poseRecordHit = false;
       auto& poseRegistry = model::PoseRegistry::instance();
       const uint64_t poseRegistryFrame = poseRegistry.frameNumber();
       if (semantic.runtimeModelPtr != nullptr)
-        poseRecordHit =
-            poseRegistry.findByRuntimeModel(semantic.runtimeModelPtr, poseRecord);
+        poseRecordHit = poseRegistry.findByRuntimeModelAugment(
+            semantic.runtimeModelPtr, poseRecord);
       if (!poseRecordHit && semantic.sceneNode != nullptr)
-        poseRecordHit = poseRegistry.findBySceneNode(semantic.sceneNode, poseRecord);
+        poseRecordHit = poseRegistry.findBySceneNodeAugment(semantic.sceneNode,
+                                                            poseRecord);
       if (!poseRecordHit && semantic.object != nullptr &&
           semantic.object->unitPtr != nullptr) {
-        poseRecordHit =
-            poseRegistry.findByUnitPtr(semantic.object->unitPtr, poseRecord);
+        poseRecordHit = poseRegistry.findByUnitPtrAugment(
+            semantic.object->unitPtr, poseRecord);
       }
       if (!poseRecordHit && currentUnitPtr != nullptr)
-        poseRecordHit = poseRegistry.findByUnitPtr(
+        poseRecordHit = poseRegistry.findByUnitPtrAugment(
             const_cast<void*>(currentUnitPtr), poseRecord);
 
       if (poseRecordHit) {
@@ -6126,7 +9494,12 @@ bool AugmentShadowSemanticContext(dxvk::War3ShadowSemanticContext& semantic,
     }
   }
 
+  if (trace != nullptr)
+    trace->enter(ShadowSemanticAugmentTracePhase::RenderObject);
   if (semantic.object == nullptr) {
+    auto renderObjectDetailScope =
+        dxvk::war3::War3PerfMonitor::instance().cpuDetailScope(
+            "Semantic/AugmentShadowContext/RenderObjectRecovery");
     auto& registry = RenderObjectRegistry::instance();
     const RenderObjectInfo* object = nullptr;
     if (semantic.sceneNode != nullptr)
@@ -6137,6 +9510,12 @@ bool AugmentShadowSemanticContext(dxvk::War3ShadowSemanticContext& semantic,
       object = registry.findByHandle(semantic.jHandle);
     MergeRenderObject(semantic, object);
   }
+
+  if (trace != nullptr)
+    trace->enter(ShadowSemanticAugmentTracePhase::Finalize);
+  semantic.pathBlocker =
+      semantic.pathBlocker ||
+      dxvk::war3::internal::IsPathBlockerFourCc(semantic.rawcode);
 
   const bool hasMeaningfulContext =
       semantic.sceneNode != nullptr || semantic.worldObjectEntry != nullptr ||

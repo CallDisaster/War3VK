@@ -2,7 +2,10 @@
 
 #include "../../util/util_matrix.h"
 #include "war3_render_objects.h"
+#include "war3_render_state.h"
+#include "war3_shadow_producer_policy.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -50,9 +53,23 @@ struct CurrentDrawContractRecord {
   uint32_t stream1Stride = 0u;
   uint32_t capturedPaletteCount = 0u;
   uint32_t frameTag = 0u;
+  int16_t stage = -1;
+  bool pathBlocker = false;
   uint64_t visibleFrameSerial = 0u;
   uint32_t renderFrameIndex = 0u;
   uint64_t captureSerial = 0u;
+  // Shadow producer ownership is stage/tag based. Preserve the tag observed at
+  // publish time so delayed snapshot consumers cannot reclassify an S12 range
+  // indicator redraw as a physical world-object caster.
+  War3BatchTag batchTag = War3BatchTag::Unknown;
+  int16_t producerStage = -1;
+  War3BatchTag producerGroup = War3BatchTag::Unknown;
+  ShadowProducerKind sourceKind = ShadowProducerKind::CurrentDrawContract;
+  bool producerFreshThisFrame = false;
+  uint64_t stagePolicyRevision = 0u;
+  bool fromGrace = false;
+  uint32_t graceAge = 0u;
+  bool alphaPayloadComplete = false;
 };
 
 struct CurrentDrawDispatchContext {
@@ -96,6 +113,40 @@ struct CurrentDrawAuthoritativeSample {
 
   bool groupSlotsReady() const {
     return !groupSlots.empty();
+  }
+};
+
+// Optional low-overhead phase observer for the authoritative decode hot path.
+// The caller owns timing policy and sampling; production calls pass nullptr.
+enum class CurrentDrawResolveTracePhase : uint8_t {
+  PaletteDecode = 0u,
+  PaletteHash,
+  GroupGate,
+  GroupRangeCheck,
+  GroupDecodeLoop,
+  GroupFinalize,
+  StableHash,
+};
+
+struct CurrentDrawResolveTrace {
+  void* context = nullptr;
+  void (*enter)(void* context, CurrentDrawResolveTracePhase phase) = nullptr;
+
+  inline void note(CurrentDrawResolveTracePhase phase) const {
+    if (enter != nullptr)
+      enter(context, phase);
+  }
+};
+
+// Optional caller-owned readable-range validator. Populate uses this to keep
+// VirtualQuery results only for the lifetime of one scene build; callers that
+// do not provide it retain the original IsReadableRange behavior.
+struct CurrentDrawRangeValidator {
+  void* context = nullptr;
+  bool (*validate)(void* context, const void* address, size_t size) = nullptr;
+
+  inline bool readable(const void* address, size_t size) const {
+    return validate != nullptr && validate(context, address, size);
   }
 };
 
@@ -264,9 +315,24 @@ struct CurrentDrawContractSnapshotOptions {
   std::vector<uint64_t> preferredSelectionKeys;
 };
 
+struct CurrentDrawRetireResult {
+  uint64_t localContractCount = 0u;
+  uint64_t localPaletteCount = 0u;
+  uint64_t localPreparedSliceCount = 0u;
+  uint64_t globalContractCount = 0u;
+  uint64_t globalPaletteCount = 0u;
+};
+
 void ResetCurrentDrawContractCache();
 
-void PublishCurrentDrawContract(const CurrentDrawContractRecord& record);
+CurrentDrawRetireResult RetireCurrentDrawContracts(
+    const struct ShadowCasterTombstone& tombstone);
+
+// breakdownSampleWeight is an internal profiler token selected by the
+// RenderQueue_UpdateItemWorldMatrix Hook. Zero keeps the production path free
+// of nested timing; non-zero is used only by the opt-in fixed-ID detail tree.
+void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
+                                uint32_t breakdownSampleWeight = 0u);
 
 CurrentDrawDispatchContext PushCurrentDrawDispatchContext(
     void* sceneNode,
@@ -304,6 +370,18 @@ bool InstallCurrentDrawContractHook(uintptr_t gameBase, bool logEnabled);
 bool QueryCurrentDrawContract(void* renderablePart,
                               CurrentDrawContractRecord& out);
 
+// Collision-resistant, current-frame-only lookup for Stage11 geometry
+// capture. This ledger is independent from the historical one-way palette
+// cache and never feeds palette/snapshot consumers.
+bool QueryCurrentDrawGeometryContract(
+    void* renderablePart,
+    void* sceneNode,
+    void* worldObjectEntry,
+    void* unitPtr,
+    uint32_t jHandle,
+    uint32_t expectedRenderFrameIndex,
+    CurrentDrawContractRecord& out);
+
 bool QueryCurrentDrawContractCapturedPalette(
     void* renderablePart,
     std::vector<Matrix4>& outPalette,
@@ -313,7 +391,10 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  uint32_t vertexCount,
                                  uint32_t paletteCount,
                                  std::vector<uint8_t>& outGroupSlots,
-                                 uint64_t& outGroupHash);
+                                 uint64_t& outGroupHash,
+                                 const CurrentDrawResolveTrace* trace = nullptr,
+                                 const CurrentDrawRangeValidator* rangeValidator =
+                                     nullptr);
 
 /**
  * @brief Legacy diagnostic normalization for the raw +0x58 bind value.
@@ -355,7 +436,9 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
     const CurrentDrawContractRecord& record,
     uint32_t vertexCount,
     uint64_t expectedVisibleFrameSerial,
-    CurrentDrawAuthoritativeSample& out);
+    CurrentDrawAuthoritativeSample& out,
+    const CurrentDrawResolveTrace* trace = nullptr,
+    const CurrentDrawRangeValidator* rangeValidator = nullptr);
 
 /**
  * @brief Phase 7.35：记录一次 submit 观察到的 palette 时间滞后。

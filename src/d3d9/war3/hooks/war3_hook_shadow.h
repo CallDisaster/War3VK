@@ -86,6 +86,8 @@ struct ShadowHookAddresses {
   LPVOID shadowPathObjectProjectorJassBridgeAddr = nullptr;
   /** @brief ShadowPath_StaticStamp_Toggle（静态 stamp 直写链路）。 */
   LPVOID shadowPathStaticStampToggleAddr = nullptr;
+  /** @brief CUnitUIManager_RecordSetUnitShadow：unitShadow 写入 +0x4C。 */
+  LPVOID cunitUiRecordSetUnitShadowAddr = nullptr;            // 0x3358C0
   /** @brief CUnitUIManager_RecordSetStructureShadow：buildingShadow 写入 +0x50。 */
   LPVOID cunitUiRecordSetStructureShadowAddr = nullptr;       // 0x335A00
 
@@ -160,6 +162,8 @@ uint64_t QueryDispatchToShapeFromOtherCallerCount();
 // 2026-05-30：CDoodads 贴花阴影拦截诊断（control plane 透传用）。
 uint64_t QueryDoodadStaticStampEnterCount();
 uint64_t QueryDoodadStaticStampBlockedCount();
+uint64_t QueryDoodadStaticStampPassthroughCleanupCount();
+uint64_t QueryDoodadStaticStampGateActiveCount();
 uint64_t QueryDoodadEmitterStampEnterCount();
 uint64_t QueryDoodadEmitterStampBlockedCount();
 

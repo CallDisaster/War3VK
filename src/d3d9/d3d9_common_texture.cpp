@@ -95,6 +95,57 @@ namespace dxvk {
       m_data = m_device->GetAllocator()->Alloc(m_totalSize);
     else if (m_mapMode != D3D9_COMMON_TEXTURE_MAP_MODE_NONE && m_desc.Pool != D3DPOOL_DEFAULT)
       CreateBuffer(false);
+
+    const auto bufferAllocationBytes = [](const Rc<DxvkBuffer>& buffer) {
+      const Rc<DxvkResourceAllocation> storage =
+          buffer != nullptr ? buffer->storage() : nullptr;
+      return storage != nullptr
+          ? uint64_t(storage->getMemoryInfo().size)
+          : 0u;
+    };
+    const uint64_t gpuBytes = m_image != nullptr
+        ? uint64_t(m_image->getMemoryInfo().size) : 0u;
+    const uint64_t cpuBytes = m_buffer != nullptr
+        ? bufferAllocationBytes(m_buffer)
+        : (m_data ? uint64_t(m_totalSize) : 0u);
+    war3::resource_census::ResourceRegistration census = {};
+    switch (m_type) {
+      case D3DRTYPE_SURFACE:
+        census.resourceClass =
+            war3::resource_census::ResourceClass::Surface;
+        break;
+      case D3DRTYPE_CUBETEXTURE:
+        census.resourceClass =
+            war3::resource_census::ResourceClass::CubeTexture;
+        break;
+      case D3DRTYPE_VOLUMETEXTURE:
+        census.resourceClass =
+            war3::resource_census::ResourceClass::VolumeTexture;
+        break;
+      default:
+        census.resourceClass =
+            war3::resource_census::ResourceClass::Texture2D;
+        break;
+    }
+    census.pool = static_cast<uint32_t>(m_desc.Pool);
+    census.usage = m_desc.Usage;
+    census.mapMode = static_cast<uint32_t>(m_mapMode);
+    census.subresourceCount = CountSubresources();
+    census.logicalBytes = m_totalSize;
+    census.deviceAllocationBytes = gpuBytes;
+    census.hostBackingLogicalBytes = cpuBytes;
+    census.hostMappedLogicalBytes = m_buffer != nullptr ? cpuBytes : 0u;
+    census.duplicateHostBackingLogicalBytes =
+        m_image != nullptr ? cpuBytes : 0u;
+    census.dynamic = (m_desc.Usage & D3DUSAGE_DYNAMIC) != 0u;
+    census.writeOnly = (m_desc.Usage & D3DUSAGE_WRITEONLY) != 0u;
+    census.hasDeviceCopy = m_image != nullptr;
+    census.deviceReadbackCapable = m_image != nullptr &&
+        m_mapping.ConversionFormatInfo.FormatType ==
+            D3D9ConversionFormat_None;
+    census.hostBinding = War3HostBackingBinding();
+    m_war3ResourceCensus = war3::resource_census::Register(census);
+    War3RefreshResourceCensusBacking();
   }
 
 
@@ -276,6 +327,7 @@ namespace dxvk {
       return m_buffer->mapPtr(m_memoryOffset[Subresource]);
 
     m_data.Map();
+    War3RefreshResourceCensusBacking();
     uint8_t* ptr = reinterpret_cast<uint8_t*>(m_data.Ptr());
     if (ptr == nullptr)
       return nullptr;
@@ -320,6 +372,71 @@ namespace dxvk {
       }
     }
     m_data = {};
+
+    War3RefreshResourceCensusBacking();
+  }
+
+
+  void D3D9CommonTexture::DestroyBuffer() {
+    m_buffer = nullptr;
+    MarkAllNeedReadback();
+    War3RefreshResourceCensusBacking();
+  }
+
+
+  void D3D9CommonTexture::UnmapData() {
+    m_data.Unmap();
+    War3RefreshResourceCensusBacking();
+  }
+
+
+  void D3D9CommonTexture::War3RefreshResourceCensusBacking() {
+    if (m_war3ResourceCensus == nullptr)
+      return;
+
+    const auto bufferAllocationBytes = [](const Rc<DxvkBuffer>& buffer) {
+      const Rc<DxvkResourceAllocation> storage =
+          buffer != nullptr ? buffer->storage() : nullptr;
+      return storage != nullptr
+          ? uint64_t(storage->getMemoryInfo().size)
+          : 0u;
+    };
+    const uint64_t hostBytes = m_buffer != nullptr
+        ? bufferAllocationBytes(m_buffer)
+        : (m_data ? uint64_t(m_totalSize) : 0u);
+    const auto hostBinding = War3HostBackingBinding();
+    const uint64_t mappedBytes = m_buffer != nullptr
+        ? hostBytes
+        : (hostBinding.mapped ? uint64_t(m_totalSize) : 0u);
+    war3::resource_census::UpdateHostBacking(
+        m_war3ResourceCensus, hostBytes, mappedBytes,
+        m_image != nullptr ? hostBytes : 0u, hostBinding);
+  }
+
+
+  war3::resource_census::HostBackingBinding
+  D3D9CommonTexture::War3HostBackingBinding() const noexcept {
+    war3::resource_census::HostBackingBinding result;
+    if (m_buffer != nullptr) {
+      result.bindingClass =
+          war3::resource_census::HostBackingBindingClass::
+              ExternalHostAllocation;
+      return result;
+    }
+    if (!m_data)
+      return result;
+
+    const D3D9MemoryDiagnosticBinding binding =
+        m_data.GetDiagnosticBinding();
+    result.bindingClass = binding.chunkId != 0u
+        ? war3::resource_census::HostBackingBindingClass::ExactD3D9Memory
+        : war3::resource_census::HostBackingBindingClass::
+              UnresolvedD3D9Memory;
+    result.chunkId = binding.chunkId;
+    result.offset = binding.offset;
+    result.alignedSliceBytes = binding.alignedSliceBytes;
+    result.mapped = binding.mapped;
+    return result;
   }
 
 

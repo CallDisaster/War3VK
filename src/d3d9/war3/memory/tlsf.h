@@ -78,10 +78,18 @@ void tlsf_remove_pool(tlsf_t tlsf, pool_t pool);
 void* tlsf_malloc(tlsf_t tlsf, size_t bytes);
 void* tlsf_memalign(tlsf_t tlsf, size_t align, size_t bytes);
 void* tlsf_realloc(tlsf_t tlsf, void* ptr, size_t size);
+/* 只允许原地调整；失败时原块保持有效且内容不变。 */
+void* tlsf_realloc_in_place(tlsf_t tlsf, void* ptr, size_t size);
 void tlsf_free(tlsf_t tlsf, void* ptr);
+
+/* Storm 产品池必须关闭旧的进程级小块缓存，保证释放与池枚举一致。 */
+void tlsf_toggle_optimized_memory_locality(int enable);
 
 /* Returns internal block size, not original request size */
 size_t tlsf_block_size(void* ptr);
+/* 校验 ptr 是指定 VM 范围中一个仍在使用的精确块起点。 */
+int tlsf_block_is_valid_in_range(void* ptr, void* range_base,
+                                 size_t range_size);
 
 /* Overheads/limits of internal structures. */
 size_t tlsf_size(void);
@@ -90,10 +98,14 @@ size_t tlsf_block_size_min(void);
 size_t tlsf_block_size_max(void);
 size_t tlsf_pool_overhead(void);
 size_t tlsf_alloc_overhead(void);
+/* 计算一个新池至少需要多大，才能落入可满足请求的 TLSF size class。 */
+size_t tlsf_allocation_pool_size(size_t bytes, size_t align);
 
 /* Debugging. */
 typedef void (*tlsf_walker)(void* ptr, size_t size, int used, void* user);
 void tlsf_walk_pool(pool_t pool, tlsf_walker walker, void* user);
+/* O(1) 判断：池中只剩一个完全合并的自由块和结尾哨兵。 */
+int tlsf_pool_is_empty(pool_t pool);
 /* Returns nonzero if any internal consistency check fails. */
 int tlsf_check(tlsf_t tlsf);
 int tlsf_check_pool(pool_t pool);

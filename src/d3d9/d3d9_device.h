@@ -36,7 +36,9 @@
 #include "d3d9_bridge.h"
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <queue>
 #include <unordered_set>
 
 
@@ -59,6 +61,20 @@ namespace render {
 enum class ObjectKind : uint8_t;
 struct CurrentDrawAuthoritativeSample;
 }
+namespace gpu_skin {
+class War3GpuSkinCompute;
+class War3GpuSkinManager;
+struct FlushRequest;
+struct GpuSkinHostSubmitResult;
+struct GpuSkinNativeBypassHostRequest;
+struct GpuSkinPendingBatch;
+struct GpuSkinResolvedDraw;
+struct NativeCpuRewriteOutputProof;
+struct NativeDipObservation;
+struct NativeFlushObservation;
+struct NativeUploadObservation;
+struct NativeVertexOutputProof;
+}
 }
 } // namespace dxvk
 #include "d3d9_war3_aa.h"
@@ -74,6 +90,53 @@ namespace dxvk {
 
 class War3RenderPipeline;
 class War3PostProcess;
+
+// Draw-time vertex snapshots belong to one object instance and one logical
+// draw slice. Model parts can be shared by many units, and one part/layer can
+// still publish several geoset/palette payloads in a frame. Omitting either
+// identity lets a later unit overwrite the VB/IB/world tuple consumed by an
+// earlier unit and emit a one-frame triangle towards the world origin.
+struct War3DrawTimeVBCacheKey {
+  void* instanceIdentity = nullptr;
+  void* meshPayloadPtr = nullptr;
+  void* renderablePart = nullptr;
+  uint32_t jHandle = 0u;
+  uint32_t layerIndex = 0u;
+  uint32_t payloadWord108 = 0u;
+  uint32_t payloadWord11C = 0u;
+
+  bool operator==(const War3DrawTimeVBCacheKey& other) const noexcept {
+    return instanceIdentity == other.instanceIdentity &&
+           meshPayloadPtr == other.meshPayloadPtr &&
+           renderablePart == other.renderablePart &&
+           jHandle == other.jHandle &&
+           layerIndex == other.layerIndex &&
+           payloadWord108 == other.payloadWord108 &&
+           payloadWord11C == other.payloadWord11C;
+  }
+};
+
+struct War3DrawTimeVBCacheKeyHash {
+  size_t operator()(const War3DrawTimeVBCacheKey& key) const noexcept {
+    size_t hash = std::hash<uintptr_t>{}(
+        reinterpret_cast<uintptr_t>(key.instanceIdentity));
+    hash ^= std::hash<uintptr_t>{}(
+                reinterpret_cast<uintptr_t>(key.meshPayloadPtr)) +
+            size_t(0x9e3779b9u) + (hash << 6u) + (hash >> 2u);
+    hash ^= std::hash<uintptr_t>{}(
+                reinterpret_cast<uintptr_t>(key.renderablePart)) +
+            size_t(0x9e3779b9u) + (hash << 6u) + (hash >> 2u);
+    hash ^= std::hash<uint32_t>{}(key.jHandle) +
+            size_t(0x9e3779b9u) + (hash << 6u) + (hash >> 2u);
+    hash ^= std::hash<uint32_t>{}(key.layerIndex) +
+            size_t(0x9e3779b9u) + (hash << 6u) + (hash >> 2u);
+    hash ^= std::hash<uint32_t>{}(key.payloadWord108) +
+            size_t(0x9e3779b9u) + (hash << 6u) + (hash >> 2u);
+    hash ^= std::hash<uint32_t>{}(key.payloadWord11C) +
+            size_t(0x9e3779b9u) + (hash << 6u) + (hash >> 2u);
+    return hash;
+  }
+};
 
 class D3D9InterfaceEx;
 class D3D9SwapChainEx;
@@ -815,14 +878,16 @@ public:
   void EmitGenerateMips(D3D9CommonTexture *pResource);
 
   HRESULT LockBuffer(D3D9CommonBuffer *pResource, UINT OffsetToLock,
-                     UINT SizeToLock, void **ppbData, DWORD Flags);
+                     UINT SizeToLock, void **ppbData, DWORD Flags,
+                     uintptr_t OwnerIdentity);
 
   /**
    * \brief Uploads the given buffer from its local system memory copy.
    */
   HRESULT FlushBuffer(D3D9CommonBuffer *pResource);
 
-  HRESULT UnlockBuffer(D3D9CommonBuffer *pResource);
+  HRESULT UnlockBuffer(D3D9CommonBuffer *pResource,
+                       uintptr_t OwnerIdentity);
 
   /**
    * @brief Uploads data from D3DPOOL_SYSMEM + D3DUSAGE_DYNAMIC buffers and
@@ -1267,7 +1332,9 @@ private:
                                              UINT NumVertices,
                                              UINT StartIndex, UINT IndexCount,
                                              bool DynamicSysmemVBOs,
-                                             bool DynamicSysmemIBO);
+                                             bool DynamicSysmemIBO,
+                                             const war3::gpu_skin::GpuSkinResolvedDraw*
+                                                 gpuSkinResolved);
 
   // War3：捕获可投影阴影的 non-indexed draw（主要用于 Terrain 等）
   void War3TryCaptureShadowCasterDrawNonIndexed(D3DPRIMITIVETYPE PrimitiveType,
@@ -1313,7 +1380,50 @@ public:
   // War3：获取渲染管线设置（供 ImGui/调试使用）
   War3RenderPipeline *GetWar3Pipeline() const { return m_war3Pipeline; }
 
+  // GPU skin hooks are process-lifetime, while the device and map epochs are
+  // explicit. Disabled mode never allocates a manager or GPU resources.
+  void War3AttachGpuSkinNativeBridge(uintptr_t gameBase);
+  void War3ResetGpuSkinMapEpoch();
+  bool War3ResetGpuSkinBridgeForTest(bool deviceEpoch);
+  bool War3LogGpuSkinDiagnosticsForTest(
+      bool requireQuiescent = false, bool* outQuiescent = nullptr);
+
 private:
+  static bool War3GpuSkinQueryFlushRequest(
+      void* userData,
+      const war3::gpu_skin::NativeFlushObservation& observation,
+      war3::gpu_skin::FlushRequest* request);
+  static war3::gpu_skin::GpuSkinHostSubmitResult
+  War3GpuSkinSubmitFlushBatch(
+      void* userData,
+      const war3::gpu_skin::GpuSkinPendingBatch& batch);
+  static bool War3GpuSkinPreflightNativeBypass(
+      void* userData,
+      const war3::gpu_skin::GpuSkinNativeBypassHostRequest& request,
+      war3::gpu_skin::NativeVertexOutputProof* outputProof);
+  static bool War3GpuSkinResolveNativeCpuRewriteOutputProof(
+      void* userData,
+      const war3::gpu_skin::NativeUploadObservation& observation,
+      war3::gpu_skin::NativeCpuRewriteOutputProof* outputProof);
+  enum class War3GpuSkinDipDisposition : uint8_t {
+    Unresolved = 0u,
+    ProvenCpuOnly = 1u,
+  };
+  war3::gpu_skin::GpuSkinResolvedDraw War3NotifyGpuSkinDip(
+      D3DPRIMITIVETYPE primitiveType, INT baseVertexIndex,
+      UINT minVertexIndex, UINT numVertices, UINT startIndex,
+      UINT primitiveCount, uint32_t flags, bool outlineRequested = false,
+      War3GpuSkinDipDisposition* disposition = nullptr);
+  void War3ScheduleGpuSkinParity(
+      const war3::gpu_skin::GpuSkinResolvedDraw& resolved,
+      INT baseVertexIndex);
+  void War3PollGpuSkinParity();
+  void War3LogGpuSkinDiagnostics(bool force);
+  void War3RetireGpuSkinFrameBatches();
+  void War3ResetGpuSkinDeviceEpoch();
+  void War3RetryGpuSkinDeviceRebind();
+  bool War3GpuSkinDeviceReady() const;
+
   /**
    * \brief Allocates buffer memory for DrawPrimitiveUp draws
    */
@@ -1596,7 +1706,108 @@ private:
   D3D9Initializer *m_initializer = nullptr;
   D3D9FormatHelper *m_converter = nullptr;
   War3RenderPipeline *m_war3Pipeline = nullptr;
+  std::unique_ptr<war3::gpu_skin::War3GpuSkinManager>
+      m_war3GpuSkinManager;
+  std::unique_ptr<war3::gpu_skin::War3GpuSkinCompute>
+      m_war3GpuSkinCompute;
+  Rc<DxvkFence> m_war3GpuSkinFence;
+  uint64_t m_war3GpuSkinFenceValue = 0u;
+  uint64_t m_war3GpuSkinMapEpoch = 1u;
+  uint64_t m_war3GpuSkinDeviceEpoch = 1u;
+  enum class War3GpuSkinDeviceBindingState : uint8_t {
+    Ready,
+    RebindPending,
+  };
+  War3GpuSkinDeviceBindingState m_war3GpuSkinDeviceBindingState =
+      War3GpuSkinDeviceBindingState::Ready;
+  uint64_t m_war3GpuSkinPendingDeviceEpoch = 0u;
+  uint64_t m_war3GpuSkinDeviceRebindAttempts = 0u;
+  uint64_t m_war3GpuSkinDeviceRebindFailures = 0u;
+  std::vector<uint64_t> m_war3GpuSkinFrameBatchIds;
+  struct War3GpuSkinD3D9IndexTicketState {
+    D3D9CommonBuffer* commonResource = nullptr;
+    uintptr_t comIndexBuffer = 0u;
+    uint64_t resourceGeneration = 0u;
+    uint64_t ticketGeneration = 0u;
+    uint32_t offset = 0u;
+    uint32_t size = 0u;
+    uint32_t flags = 0u;
+    uint32_t indexFormat = 0u;
+    bool contentsValidated = false;
+    bool unlockNotified = false;
+    bool setIndicesNotified = false;
+
+    explicit operator bool() const {
+      return commonResource != nullptr && comIndexBuffer != 0u &&
+             resourceGeneration != 0u && ticketGeneration != 0u;
+    }
+  };
+  War3GpuSkinD3D9IndexTicketState m_war3GpuSkinD3D9IndexTicket;
+  struct War3GpuSkinParityReadback {
+    Rc<DxvkBuffer> buffer;
+    Rc<DxvkFence> fence;
+    uint64_t fenceValue = 0u;
+    uint64_t token = 0u;
+    uint32_t byteCount = 0u;
+    uint32_t gpuOffset = 0u;
+    uint32_t allocationBytes = 0u;
+    uint32_t stride = 0u;
+    uint32_t outputFormat = 0u;
+  };
+  std::vector<War3GpuSkinParityReadback> m_war3GpuSkinParityReadbacks;
+  uint64_t m_war3GpuSkinParityReadbackBytes = 0u;
+  uint64_t m_war3GpuSkinParitySkippedBudget = 0u;
+  uint64_t m_war3GpuSkinParitySkippedSource = 0u;
+  uint64_t m_war3GpuSkinParitySamples = 0u;
+  uint64_t m_war3GpuSkinParityMatches = 0u;
+  uint64_t m_war3GpuSkinParityMismatches = 0u;
+  std::array<uint64_t, 6> m_war3GpuSkinParitySamplesByFormat = {};
+  std::array<uint64_t, 6> m_war3GpuSkinParityMatchesByFormat = {};
+  std::array<uint64_t, 6> m_war3GpuSkinParityMismatchesByFormat = {};
+  uint64_t m_war3GpuSkinP3Hits = 0u;
+  uint64_t m_war3GpuSkinP3Rejects = 0u;
+  uint64_t m_war3GpuSkinP3MainDrawsSubmitted = 0u;
+  uint64_t m_war3GpuSkinP3OutlineDrawsSubmitted = 0u;
+  uint64_t m_war3GpuSkinP3OutlineSameSliceSubmitted = 0u;
+  uint64_t m_war3GpuSkinP3OutlineSliceMismatches = 0u;
+  uint64_t m_war3GpuSkinVsMainRouteAttempts = 0u;
+  uint64_t m_war3GpuSkinVsMainInputRejects = 0u;
+  uint64_t m_war3GpuSkinVsMainStateRejects = 0u;
+  uint64_t m_war3GpuSkinVsMainDrawsSubmitted = 0u;
+  uint64_t m_war3GpuSkinVsMainBindingsCleared = 0u;
+  uint64_t m_war3GpuSkinVsShadowCaptureAttempts = 0u;
+  uint64_t m_war3GpuSkinVsShadowCaptureInputRejects = 0u;
+  uint64_t m_war3GpuSkinVsShadowCaptureStateRejects = 0u;
+  uint64_t m_war3GpuSkinVsShadowCaptureCommitted = 0u;
+  uint64_t m_war3GpuSkinP3Restores = 0u;
+  uint64_t m_war3GpuSkinP3RestoreRebinds = 0u;
+  uint64_t m_war3GpuSkinP3RestoreOverlaps = 0u;
+  bool m_war3GpuSkinP3RestorePending = false;
+  uint64_t m_war3GpuSkinP2ResolvedInputs = 0u;
+  uint64_t m_war3GpuSkinP2ResolvedStage11Inputs = 0u;
+  uint64_t m_war3GpuSkinP2SemanticGateInputs = 0u;
+  uint64_t m_war3GpuSkinP2SemanticContextInputs = 0u;
+  uint64_t m_war3GpuSkinP2IdentityMatchInputs = 0u;
+  uint64_t m_war3GpuSkinP2BackingHits = 0u;
+  uint64_t m_war3GpuSkinP2BackingRejects = 0u;
+  uint64_t m_war3GpuSkinP2BackingFallbacks = 0u;
+  uint64_t m_war3GpuSkinP2SkippedCpuCopyBytes = 0u;
+  // P4 Shadow 承诺必须晚于可复用 IB/UV scratch 的只读 warm gate。
+  // 终门计数用于证明授权后不再发生不可逆 consumer suppression。
+  uint64_t m_war3GpuSkinP4ShadowPreflightIndexRejects = 0u;
+  uint64_t m_war3GpuSkinP4ShadowPreflightUvRejects = 0u;
+  uint64_t m_war3GpuSkinP4ShadowFinalPositionRejects = 0u;
+  uint64_t m_war3GpuSkinP4ShadowFinalIndexRejects = 0u;
+  uint64_t m_war3GpuSkinP4ShadowFinalUvRejects = 0u;
+  uint64_t m_war3GpuSkinP4ShadowFinalCommitRejects = 0u;
+  uint64_t m_war3GpuSkinP4ShadowCommits = 0u;
+  uint64_t m_war3GpuSkinDiagnosticFrames = 0u;
   War3FrameScene m_war3Scene;
+  // 本帧场景已被 rotate（move 进 pipeline input）的帧序号。direct-only 模式
+  // 下 EndFrame flush 用它判定 BeforeUi 是否已消费本帧场景：命中则跳过重复
+  // 的全量 populate 固定开销；未命中（菜单/过场等 BeforeUi 漏检帧）仍走完整
+  // 兜底路径。以 rotate 事实为键，而非 populate 成功——见 2026-07-26 分析。
+  uint64_t m_war3SceneRotatedFrameSerial = 0u;
   struct War3ShadowDeclInfo {
     bool hasPosition = false;
     D3DDECLTYPE posType = D3DDECLTYPE_UNUSED;
@@ -1650,10 +1861,27 @@ private:
     std::array<DxvkBufferSlice, caps::MaxStreams> vbSlices = {};
     std::array<uint32_t, caps::MaxStreams> vbStrides = {};
     std::array<bool, caps::MaxStreams> vbValid = {};
+    std::array<const void*, caps::MaxStreams> vbSourceBase = {};
+    std::array<uint32_t, caps::MaxStreams> vbSourceOffset = {};
+    std::array<uint32_t, caps::MaxStreams> vbSourceLength = {};
+    std::array<uint32_t, caps::MaxStreams> vbSourceElementCount = {};
+    std::array<uint32_t, caps::MaxStreams> vbSourceElementStride = {};
+    std::array<uint32_t, caps::MaxStreams> vbSourceElementSize = {};
+    std::array<uint64_t, caps::MaxStreams> vbSourceSequence = {};
+    std::array<uintptr_t, caps::MaxStreams> vbSourceResource = {};
+    std::array<uint64_t, caps::MaxStreams> vbSourceIdentityGeneration = {};
+    std::array<uint64_t, caps::MaxStreams> vbSourceContentGeneration = {};
+    std::array<bool, caps::MaxStreams> vbSourceValid = {};
     DxvkBufferSlice ibSlice;
     VkIndexType ibType = VK_INDEX_TYPE_UINT32;
     bool ibValid = false;
     Rc<DxvkResourceAllocation> ibStorage;
+    uintptr_t ibSourceResource = 0u;
+    uint64_t ibSourceIdentityGeneration = 0u;
+    uint64_t ibSourceContentGeneration = 0u;
+    uint32_t ibSourceOffset = 0u;
+    uint32_t ibSourceLength = 0u;
+    bool ibSourceValid = false;
   };
   War3PerDrawUploadInfo m_war3PerDrawUpload;
   // 上一帧/最近一次“可解析透视投影”的世界相机快照（用于兜底，避免偶发捕获失败导致整帧无阴影）。
@@ -1881,12 +2109,86 @@ private:
     VkDeviceSize bytes = 0;
     VkBufferUsageFlags usage = 0;
     const char* debugName = nullptr;
+    // Static S1 geometry already lives in a stable GPU buffer. Retaining that
+    // source slice avoids allocating and copying another device-local buffer
+    // for every bridge/ramp tile while preserving the same strong lifetime.
+    bool retainSource = false;
+  };
+  enum class War3ShadowPersistentCreateFailure : uint8_t {
+    None = 0,
+    Capacity,
+    PositionBufferCreate,
+    IndexBufferCreate,
+    BlendBufferCreate,
+    UvBufferCreate,
+    RegistryInsert,
+    Other,
+  };
+  struct War3ShadowPersistentDiagnosticsFrame {
+    // These reject counters refine the legacy
+    // persistentRejectCreateOrBudget bucket and therefore count only the
+    // ShadowCapture caller that publishes that legacy bucket.
+    uint64_t rejectCapacity = 0;
+    uint64_t rejectPositionBufferCreate = 0;
+    uint64_t rejectIndexBufferCreate = 0;
+    uint64_t rejectBlendBufferCreate = 0;
+    uint64_t rejectUvBufferCreate = 0;
+    uint64_t rejectRegistryInsert = 0;
+    uint64_t rejectOther = 0;
+
+    // Creation/GC telemetry covers every caller of the shared persistent
+    // geometry helper during the completed Present-to-Present interval.
+    uint64_t createAttempts = 0;
+    uint64_t bytesNeededTotal = 0;
+    uint64_t bytesNeededMax = 0;
+    uint64_t bytesNeededLast = 0;
+    uint64_t forceGcRequests = 0;
+    uint64_t forceGcNoBytesFreed = 0;
+    uint64_t forceGcStillInsufficient = 0;
+    uint64_t forceGcBytesFreed = 0;
+    uint64_t capacityRejectAllCallers = 0;
+    uint64_t capacityFastReject = 0;
+    uint64_t expiryTokensPopped = 0;
+    uint64_t expiryTokensRequeued = 0;
+    uint64_t expiryStaleTokens = 0;
+    uint64_t expiryAgeEvictions = 0;
+
+    // Present-sampled S1 early-cache gauges. logicalReferencedBytes is a
+    // conservative sum of the buffer ranges referenced by every entry. It is
+    // intentionally not a unique-allocation or resident-memory measurement.
+    uint64_t s1EarlyEntryCount = 0;
+    uint64_t s1EarlyPersistentBackedCount = 0;
+    uint64_t s1EarlyPersistentReverseIndexCount = 0;
+    uint64_t s1EarlyFallbackBackedCount = 0;
+    uint64_t s1EarlyLogicalReferencedBytes = 0;
+
+    // Per-interval publication closure for accepted S1 early-cache hits.
+    // BuildShadowReplayDraws consumes only shadowInstances/shadowFallbacks, so
+    // every accepted hit must publish exactly one canonical replay record in
+    // addition to retaining the compatibility shadowCasters entry.
+    uint64_t s1EarlyAcceptedHitCount = 0;
+    uint64_t s1EarlyReplayPublishedCount = 0;
+    uint64_t s1EarlyReplayInstanceCount = 0;
+    uint64_t s1EarlyReplayFallbackCount = 0;
+    // 命中但源指纹不匹配（key 碰撞或 VB 指针复用）而被淘汰的次数。
+    // 非零即证明 early key 碰撞在真实运行中发生过。
+    uint64_t s1EarlySourceMismatchEvictCount = 0;
   };
   struct War3ShadowPersistentGeometryEntry {
     War3ShadowGeometryRegistryKey key = {};
     War3ShadowPersistentGeometry geometry = {};
     uint64_t totalBytes = 0;
     uint64_t lastSeenFrame = 0;
+  };
+  struct War3ShadowPersistentExpiryEntry {
+    uint64_t lastSeenFrame = 0;
+    uint32_t geometryId = 0;
+  };
+  struct War3ShadowPersistentExpiryCompare {
+    bool operator()(const War3ShadowPersistentExpiryEntry& a,
+                    const War3ShadowPersistentExpiryEntry& b) const {
+      return a.lastSeenFrame > b.lastSeenFrame;
+    }
   };
   struct War3SemanticDirectCasterContractKey {
     uint64_t identityKey = 0;
@@ -1937,6 +2239,26 @@ private:
                          War3ShadowGeometryRegistryKeyHash>;
   using War3ShadowPersistentGeometryMap =
       std::unordered_map<uint32_t, War3ShadowPersistentGeometryEntry>;
+  // Stage13 contains static bridge/ramp world objects whose native visibility
+  // batch may disappear before their projected shadow has left the camera.
+  // Retain a bounded CPU copy of the exact referenced vertex sequence. Stale
+  // entries are uploaded into the current frame's shared mapped freeze arena;
+  // no frame-ring Rc is ever retained across frames and no per-object Vulkan
+  // buffer is created.
+  struct War3Stage13RetainedCasterEntry {
+    War3ShadowCasterDraw draw = {};
+    std::vector<unsigned char> positionBytes;
+    uint64_t contentHash = 0u;
+    uint64_t sourceIdentityHash = 0u;
+    uint64_t worldMatrixHash = 0u;
+    uint64_t materialHash = 0u;
+    uint64_t layoutHash = 0u;
+    uint64_t lastSeenFrame = 0u;
+  };
+  using War3Stage13RetainedCasterMap =
+      std::unordered_map<War3ShadowGeometryRegistryKey,
+                         War3Stage13RetainedCasterEntry,
+                         War3ShadowGeometryRegistryKeyHash>;
   // Arena VB 帧内去重缓存：key=(DxvkBuffer*,offset,size)，value=已复制到 Arena 的 allocation。
   // 同一帧内相同 DxvkBufferSlice 只 EmitCs copyBuffer 一次，后续 DIP 直接复用 arena offset。
   // 等价于 state_counter < 12 语义（同一流绑定内多 DIP 共享同一 VB slice）。
@@ -1960,8 +2282,21 @@ private:
   std::array<War3ArenaVbCache, 3> m_war3ArenaVbCaches;
   War3ShadowGeometryRegistry m_war3ShadowGeometryRegistry;
   War3ShadowPersistentGeometryMap m_war3ShadowPersistentGeometries;
+  War3Stage13RetainedCasterMap m_war3Stage13RetainedCasters;
+  // Every live geometry has one authoritative scheduled age token. Hits update
+  // the map entry only; when an old token reaches the heap head, GC either
+  // retires the still-idle geometry or requeues its newer lastSeenFrame.
+  // Emergency budget repair may leave a short-lived stale token for an entry
+  // it erased; the normal head walk discards that token without double
+  // accounting. This preserves the max-age contract without scanning the
+  // entire ~512 MiB registry every Present.
+  std::priority_queue<War3ShadowPersistentExpiryEntry,
+                      std::vector<War3ShadowPersistentExpiryEntry>,
+                      War3ShadowPersistentExpiryCompare>
+      m_war3ShadowPersistentExpiryQueue;
   uint32_t m_war3NextShadowGeometryId = 1;
   uint64_t m_war3ShadowPersistentFrameSerial = 0;
+  uint64_t m_war3ShadowPersistentLastGcFrameSerial = ~uint64_t(0);
   uint64_t m_war3SemanticSceneLastCaptureFrameSerial = 0;
   uint64_t m_war3SemanticSceneLastCapturePublishRevision = 0;
   uint64_t m_war3SemanticSceneLastCapturedVisibleFrameSerial = 0;
@@ -1986,9 +2321,21 @@ private:
   // 不影响我们的 buffer。
   struct War3DrawTimeVBEntry {
     void* renderablePart = nullptr;
+    uint32_t layerIndex = 0u;
+    // Canonical CurrentDraw logical-slice identity. These values are copied
+    // from the same authoritative record used to construct the map key and
+    // are rechecked by every consumer before a cached draw is published.
+    uint32_t payloadWord108 = 0u;
+    uint32_t payloadWord11C = 0u;
+    void* instanceIdentity = nullptr;
+    void* meshPayloadPtr = nullptr;
+    uint32_t contractJHandle = 0u;
     // Phase 7.92：capture 时保存 sceneNode，让 producer/fast-append 路径能
     // 从 entry 直接读到世界位置用于 CSM cascade cull。
     void* sceneNode = nullptr;
+    void* unitPtr = nullptr;
+    void* worldObjectEntry = nullptr;
+    int16_t producerStage = -1;
     // 我们自有 GPU buffer（device-local），存 capture 帧的 vertex range bytes。
     // 包含完整 stride 的 vertex 数据；shader 用 positionStride/positionOffset
     // 读取 xyz。
@@ -2015,6 +2362,53 @@ private:
     uint32_t indexCount = 0u;
     uint32_t firstIndex = 0u;
     bool indexed = false;
+    // True only after every mandatory backing resource for the original draw
+    // has been captured. In particular, an indexed source must never be
+    // reinterpreted as a non-indexed draw when its IB copy is deferred or
+    // fails; doing so can emit unrelated triangles that cover large screen
+    // regions.
+    bool captureComplete = false;
+
+    bool MatchesKey(const War3DrawTimeVBCacheKey& key) const {
+      return instanceIdentity == key.instanceIdentity &&
+             meshPayloadPtr == key.meshPayloadPtr &&
+             renderablePart == key.renderablePart &&
+             contractJHandle == key.jHandle &&
+             layerIndex == key.layerIndex &&
+             payloadWord108 == key.payloadWord108 &&
+             payloadWord11C == key.payloadWord11C;
+    }
+
+    bool HasCompleteBacking() const {
+      return captureComplete &&
+             vertexCount != 0u &&
+             positionBuffer != nullptr &&
+             positionInfo.buffer != VK_NULL_HANDLE &&
+             positionInfo.size != 0u &&
+             (!indexed ||
+              (indexBuffer != nullptr &&
+               indexInfo.buffer != VK_NULL_HANDLE &&
+               indexInfo.size != 0u &&
+               indexCount != 0u));
+    }
+
+    bool HasCompleteAlphaPayload() const {
+      if (!alphaTestEnabled || diffuseTexture == nullptr ||
+          uvFormat == VK_FORMAT_UNDEFINED || uvStride == 0u ||
+          uvOffset >= uvStride) {
+        return false;
+      }
+
+      if (uvSharesPositionBuffer) {
+        return positionBuffer != nullptr &&
+               positionInfo.buffer != VK_NULL_HANDLE &&
+               positionInfo.size != 0u;
+      }
+
+      return uvBuffer != nullptr &&
+             uvInfo.buffer != VK_NULL_HANDLE &&
+             uvInfo.size != 0u;
+    }
     // capture 时的 D3DTS_WORLD 矩阵。
     // 动态单位（已 CPU skin）：通常是 identity，顶点已是世界空间。
     // 静态建筑（未 skin）：是该模型的 world 变换矩阵，顶点是模型本地空间。
@@ -2043,8 +2437,25 @@ private:
     VkDeviceSize indexCapacity = 0u;
     uint64_t frameSerial = 0u;
     uint64_t submittedFrameSerial = 0u;
+    // Written only by the exact current-frame Stage11 producer after the
+    // entry has passed its geometry/visibility ownership gates. Generic and
+    // lease paths must never write this marker.
+    uint64_t exactOwnerFrameSerial = 0u;
+    // Unlike exactOwnerFrameSerial, this is written only after the exact
+    // current-frame caster was actually published.  Lifecycle/core code uses
+    // it as positive live evidence; blocker/alpha fail-closed decisions must
+    // never refresh object liveness.
+    uint64_t exactSubmittedFrameSerial = 0u;
     uint32_t rawcode = 0u;
     uint32_t jHandle = 0u;
+    bool pathBlocker = false;
+    bool pathBlockerGeometryMarker = false;
+    // GPU-skin output pages are dynamic, manager-retired storage. They are
+    // valid only for this capture frame and must never enter static reuse.
+    bool gpuSkinLeaseBacked = false;
+    // VS-S1 与 compute output 共用同一帧 consumer fence；这里只保留
+    // generation-pinned 静态输入和 palette storage 的值语义/强引用。
+    War3GpuSkinDrawInput gpuSkinInput = {};
     war3::render::ObjectKind objectKind =
         static_cast<war3::render::ObjectKind>(0);
     // 2026-05-30 问题2（桥/斜坡卡顿）：静态几何标记。
@@ -2071,8 +2482,44 @@ private:
     //   - 一个简单 mix-hash，不持久化跨帧
     uint64_t lastCaptureFingerprint = 0u;
   };
-  std::unordered_map<void*, War3DrawTimeVBEntry> m_war3DrawTimeVBCache;
+  std::unordered_map<War3DrawTimeVBCacheKey, War3DrawTimeVBEntry,
+                     War3DrawTimeVBCacheKeyHash>
+      m_war3DrawTimeVBCache;
   uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;
+  // S1 地形 legacy capture 分帧复用：period>1 时 off 帧注入上一批 stash，
+  // 避免每帧数千 tile 全量 freeze（实测 ~6ms/帧）。
+  std::vector<War3ShadowCasterDraw> m_war3S1TerrainCasterStash;
+  uint64_t m_war3S1TerrainStashBuiltFrameSerial = 0u;
+  uint64_t m_war3S1TerrainStashCaptureFrameSerial = 0u;
+  // Phase A：S1 early cache（入口 O(1) 命中，跳过整条 ShadowCapture 热路径）。
+  // key = worldMatrix + draw layout；value 持有已 freeze 的 GPU buffer。
+  // period 保持 1：每帧只提交当前可见 tile；命中只省 re-copy/decl 解析。
+  struct War3S1TerrainEarlyEntry {
+    War3ShadowCasterDraw draw;
+    uint64_t lastSeenFrame = 0u;
+    // Non-zero entries alias a geometry owned by the persistent registry.
+    // Early hits must validate and refresh that backing entry before use.
+    uint32_t persistentGeometryId = 0u;
+    uint64_t logicalReferencedBytes = 0u;
+    // 冻结时的顶点/索引源身份（VB/IB 指针+offset+stride+draw 参数）。
+    // early key 只含 worldMatrix+几何规模：identity world + 相同顶点数的
+    // 不同 tile 会 key 碰撞，错误重放另一块地形的冻结几何。命中时必须
+    // 比对源指纹，不匹配即淘汰重建，绝不重放。
+    uint64_t sourceFingerprint = 0u;
+  };
+  using War3S1TerrainEarlyCache =
+      std::unordered_map<uint64_t, War3S1TerrainEarlyEntry>;
+  War3S1TerrainEarlyCache m_war3S1TerrainEarlyCache;
+  // One persistent geometry can back multiple S1 tiles because the persistent
+  // key may omit worldMatrix while the early key includes it. Keep a one-to-many
+  // reverse index so retiring a persistent geometry also releases every strong
+  // Rc reference retained by its early aliases.
+  std::unordered_multimap<uint32_t, uint64_t>
+      m_war3S1TerrainEarlyKeysByPersistentGeometryId;
+  uint64_t m_war3S1TerrainEarlyCacheLastGcFrame = 0u;
+  uint64_t m_war3S1TerrainEarlyPersistentBackedCount = 0u;
+  uint64_t m_war3S1TerrainEarlyFallbackBackedCount = 0u;
+  uint64_t m_war3S1TerrainEarlyLogicalReferencedBytes = 0u;
   // Phase 7.123：per-frame GPU buffer alloc 预算，限制单帧 capture 端创建多少
   // 新的 device-local buffer。当一批新 caster 同时进入视野（如桥/斜坡/装饰物
   // 集中区域）时，原本会一次性触发数十次 createBuffer + EmitCs(copyBuffer)，
@@ -2105,12 +2552,15 @@ private:
   struct War3SemanticDirectPartPacketLeaseState;
   std::unique_ptr<War3SemanticDirectPartPacketLeaseState>
       m_war3SemanticDirectPartPacketLeaseState;
+  uint64_t m_war3ShadowTombstoneSerialSeen = 0u;
   War3SemanticDirectCasterContractMap m_war3SemanticDirectCasterContracts;
   bool m_war3SemanticSceneLastReusableUnitsOnly = true;
   bool m_war3SemanticSceneLastReusableNativeValidation = false;
   bool m_war3SemanticSceneLastSuccessfulSubmitComplete = false;
   uint64_t m_war3ShadowPersistentBytesUsed = 0;
   uint64_t m_war3ShadowPersistentBytesEvicted = 0;
+  War3ShadowPersistentDiagnosticsFrame
+      m_war3ShadowPersistentDiagnosticsFrame = {};
   uint64_t m_war3ShadowFallbackBudgetCapBytes = 0;
   uint64_t m_war3ShadowFallbackBudgetUsedBytes = 0;
   bool m_war3ShadowFallbackBudgetExceeded = false;
@@ -2119,6 +2569,7 @@ private:
                                        VkDeviceSize &outOffset,
                                        bool hostVisible = false,
                                        void** outMapPtr = nullptr);
+  bool War3DrainShadowCasterTombstones();
   War3ShadowSemanticContext War3BuildShadowSemanticContext(
       const dxvk::war3::render::RenderObjectInfo* currentObj) const;
   War3ShadowReplayMode War3ClassifyShadowReplayMode(
@@ -2147,13 +2598,39 @@ private:
       uint32_t& outGeometryId,
       const War3ShadowPersistentGeometry*& outGeometry,
       bool& outCreatedNew);
-  void War3GcShadowPersistentGeometry(bool forceTrimToBudget = false);
+  bool War3CreateShadowPersistentGeometryAfterMiss(
+      const War3ShadowGeometryRegistryKey& key,
+      const War3ShadowPersistentGeometry& candidate,
+      const std::array<War3ShadowPersistentUpload, 4>& uploads,
+      uint32_t& outGeometryId,
+      const War3ShadowPersistentGeometry*& outGeometry,
+      bool& outCreatedNew,
+      War3ShadowPersistentCreateFailure* outFailure = nullptr);
+  void War3GcShadowPersistentGeometry();
+  void War3StoreS1TerrainEarlyCacheEntry(
+      uint64_t key, const War3ShadowCasterDraw& draw,
+      uint32_t persistentGeometryId, uint64_t sourceFingerprint);
+  uint64_t War3ComputeS1TerrainSourceFingerprint(
+      bool indexed, INT baseVertexIndex, UINT minVertexIndex,
+      UINT startVal) const;
+  void War3EraseS1TerrainEarlyCacheEntry(uint64_t key);
+  void War3EraseS1TerrainEarlyAliasesForPersistentGeometry(
+      uint32_t persistentGeometryId);
+  void War3GcS1TerrainEarlyCache();
   void War3TryCaptureShadowCaster(D3DPRIMITIVETYPE PrimitiveType,
                                   INT BaseVertexIndex, UINT MinVertexIndex,
                                   UINT NumVertices, UINT StartVal,
                                   UINT CountVal, bool indexed,
                                   bool DynamicSysmemVBOs,
-                                  bool DynamicSysmemIBO);
+                                  bool DynamicSysmemIBO,
+                                  const war3::gpu_skin::GpuSkinResolvedDraw*
+                                      gpuSkinResolved);
+  bool War3CaptureShadowDrawMetadata(
+      D3DPRIMITIVETYPE primitiveType, INT baseVertexIndex,
+      UINT minVertexIndex, UINT numVertices, UINT startVal, UINT countVal,
+      bool indexed, bool dynamicSysmemVbos,
+      const War3ShadowSemanticContext& semantic, int stage,
+      War3RenderState::StageCategory category, War3BatchTag batchTag);
   bool War3TryAppendSemanticShadowPacket(
       const dxvk::war3::shadow::ShadowDrawPacket& packet);
   bool War3TryAppendSemanticShadowPacket(
@@ -2210,6 +2687,9 @@ private:
 
 public:
   DWORD GetPureGameAmbient() const { return m_pureGameAmbient; }
+  War3ShadowReceiverPass* GetWar3ShadowReceiverPass() const {
+    return m_shadowReceiverPass;
+  }
   uint32_t War3PopulateSemanticShadowSceneForValidation(
       bool unitsOnly,
       bool executeNativeBackendValidation = false) {

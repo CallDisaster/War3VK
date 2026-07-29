@@ -42,6 +42,8 @@ struct ShadowRenderableRecord {
   render::ObjectKind objectKind = render::ObjectKind::Unknown;
   render::VisibleRenderableQueueKind queueKind =
       render::VisibleRenderableQueueKind::MainQueue;
+  int16_t stage = -1;
+  bool pathBlocker = false;
   int8_t groupIdx = -1;
   uint64_t frameSerial = 0;
 
@@ -101,6 +103,21 @@ struct ShadowModelResourceRecord {
   }
 };
 
+struct ShadowModelResourceMemorySnapshot {
+  uint64_t records = 0;
+  uint64_t recordVectorCapacityBytes = 0;
+  uint64_t payloadCapacityBytes = 0;
+  uint64_t positionsCapacityBytes = 0;
+  uint64_t normalsCapacityBytes = 0;
+  uint64_t groupSlotsCapacityBytes = 0;
+  uint64_t primitiveCapacityBytes = 0;
+  uint64_t matrixGroupsCapacityBytes = 0;
+  uint64_t matrixIndicesCapacityBytes = 0;
+  uint64_t indicesCapacityBytes = 0;
+  uint64_t uvCapacityBytes = 0;
+  uint64_t hashContainerOverheadIncluded = 0;
+};
+
 class ShadowModelResourceStore {
 public:
   void clear();
@@ -128,6 +145,7 @@ public:
   const std::vector<ShadowModelResourceRecord>& records() const {
     return m_records;
   }
+  ShadowModelResourceMemorySnapshot memorySnapshot() const;
 
 private:
   struct ModelGeosetKey {
@@ -382,6 +400,24 @@ private:
   // Phase 7.97：用 std::chrono 直接测 ManifestCopy 墙钟时间，绕开 perf monitor。
   mutable std::atomic<uint64_t> m_manifestCopyTotalChronoNs{0};
   mutable std::atomic<uint64_t> m_manifestCopyMaxChronoNs{0};
+  mutable std::atomic<uint64_t>
+      m_manifestResolveSourceCompleteSkipCount{0};
+  mutable std::atomic<uint64_t> m_manifestResolveLegacyCacheHitCount{0};
+  mutable std::atomic<uint64_t> m_manifestResolveRawScanCount{0};
+  mutable std::atomic<uint64_t> m_manifestResolveRawScanEntryVisitCount{0};
+  mutable std::atomic<uint64_t> m_manifestResolveRawScanMissCount{0};
+  mutable std::atomic<uint64_t> m_manifestResolveVerifierAttemptCount{0};
+  mutable std::atomic<uint64_t> m_manifestResolveVerifierMismatchCount{0};
+  mutable std::atomic<uint64_t>
+      m_manifestResolveMaxRuntimeGeosetCount{0};
+  mutable std::atomic<uint64_t> m_manifestModelResourceAttemptCount{0};
+  mutable std::atomic<uint64_t> m_manifestModelResourceCacheHitCount{0};
+  mutable std::atomic<uint64_t> m_manifestModelResourceDeepResolveCount{0};
+  mutable std::atomic<uint64_t> m_manifestModelResourceNullResultCount{0};
+  mutable std::atomic<uint64_t>
+      m_manifestModelResourceVerifierAttemptCount{0};
+  mutable std::atomic<uint64_t>
+      m_manifestModelResourceVerifierMismatchCount{0};
 public:
   // Phase 7.97 reader：bridge 透传时拉取最近一次 ManifestCopy 的实际遍历
   // 与 publish 跳过统计。
@@ -414,6 +450,60 @@ public:
   }
   uint64_t manifestCopyMaxChronoNs() const {
     return m_manifestCopyMaxChronoNs.load(std::memory_order_relaxed);
+  }
+  uint64_t manifestResolveSourceCompleteSkipCount() const {
+    return m_manifestResolveSourceCompleteSkipCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestResolveLegacyCacheHitCount() const {
+    return m_manifestResolveLegacyCacheHitCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestResolveRawScanCount() const {
+    return m_manifestResolveRawScanCount.load(std::memory_order_relaxed);
+  }
+  uint64_t manifestResolveRawScanEntryVisitCount() const {
+    return m_manifestResolveRawScanEntryVisitCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestResolveRawScanMissCount() const {
+    return m_manifestResolveRawScanMissCount.load(std::memory_order_relaxed);
+  }
+  uint64_t manifestResolveVerifierAttemptCount() const {
+    return m_manifestResolveVerifierAttemptCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestResolveVerifierMismatchCount() const {
+    return m_manifestResolveVerifierMismatchCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestResolveMaxRuntimeGeosetCount() const {
+    return m_manifestResolveMaxRuntimeGeosetCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestModelResourceAttemptCount() const {
+    return m_manifestModelResourceAttemptCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestModelResourceCacheHitCount() const {
+    return m_manifestModelResourceCacheHitCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestModelResourceDeepResolveCount() const {
+    return m_manifestModelResourceDeepResolveCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestModelResourceNullResultCount() const {
+    return m_manifestModelResourceNullResultCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestModelResourceVerifierAttemptCount() const {
+    return m_manifestModelResourceVerifierAttemptCount.load(
+        std::memory_order_relaxed);
+  }
+  uint64_t manifestModelResourceVerifierMismatchCount() const {
+    return m_manifestModelResourceVerifierMismatchCount.load(
+        std::memory_order_relaxed);
   }
 };
 

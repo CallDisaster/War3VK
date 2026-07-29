@@ -610,7 +610,14 @@ namespace dxvk {
       small_vector<const DxvkDescriptor*, 8u> descriptors;
       descriptors.reserve(descriptorCount);
 
-      small_vector<DxvkDescriptor, 8u> buffers;
+      struct BufferDescriptorEntry {
+        VkDescriptorType type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
+        VkDeviceAddress address = 0u;
+        VkDeviceSize range = 0u;
+        DxvkDescriptor descriptor = { };
+      };
+
+      small_vector<BufferDescriptorEntry, 8u> buffers;
       buffers.reserve(descriptorCount);
 
       for (uint32_t i = 0u; i < descriptorCount; i++) {
@@ -619,11 +626,33 @@ namespace dxvk {
         switch (info.descriptorType) {
           case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
           case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
-            auto& descriptor = buffers.emplace_back();
+            const VkDeviceAddress address =
+              info.buffer.size ? info.buffer.gpuAddress : 0u;
+
+            const DxvkDescriptor* cachedDescriptor = nullptr;
+
+            for (const auto& entry : buffers) {
+              if (entry.type == info.descriptorType
+               && entry.address == address
+               && entry.range == info.buffer.size) {
+                cachedDescriptor = &entry.descriptor;
+                break;
+              }
+            }
+
+            if (cachedDescriptor) {
+              descriptors.push_back(cachedDescriptor);
+              break;
+            }
+
+            auto& entry = buffers.emplace_back();
+            entry.type = info.descriptorType;
+            entry.address = address;
+            entry.range = info.buffer.size;
 
             VkDescriptorAddressInfoEXT bufferInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT };
-            bufferInfo.address = info.buffer.gpuAddress;
-            bufferInfo.range = info.buffer.size;
+            bufferInfo.address = entry.address;
+            bufferInfo.range = entry.range;
 
             VkDescriptorGetInfoEXT descriptorInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT };
             descriptorInfo.type = info.descriptorType;
@@ -636,9 +665,9 @@ namespace dxvk {
 
             vk->vkGetDescriptorEXT(vk->device(), &descriptorInfo,
               m_device->getDescriptorProperties().getDescriptorTypeInfo(info.descriptorType).size,
-              descriptor.descriptor.data());
+              entry.descriptor.descriptor.data());
 
-            descriptors.push_back(&descriptor);
+            descriptors.push_back(&entry.descriptor);
           } break;
 
           case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:

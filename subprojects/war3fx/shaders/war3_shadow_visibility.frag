@@ -12,6 +12,7 @@
 layout(set = 0, binding = 0) uniform sampler s_samplers[];
 layout(set = 1, binding = 1) uniform texture2DArray s_depth;
 layout(set = 1, binding = 2) uniform texture2DArray s_shadow;
+layout(set = 1, binding = 11) uniform texture2DArray s_casterMask;
 
 layout(set = 1, binding = 3, scalar, row_major)
 uniform ShadowData {
@@ -27,7 +28,7 @@ uniform ShadowData {
   vec4 u_params5;   // x=normalBiasScale, y=rimIntensity, z=rimPower, w=receiverMode
   vec4 u_params6;   // x=pcfKernel, y=pcfRotateMode, z=pcssSearchKernel, w=pcfCascadeRadiusScale
   vec4 u_viewport;  // x=vpX, y=vpY, z=vpW, w=vpH
-  vec4 u_viewportZ; // x=minZ, y=maxZ, z/w unused
+  vec4 u_viewportZ; // x=minZ, y=maxZ, z=S1 terrain mask enabled, w=mask epsilon
   mat4 u_prevViewProj;
   vec4 u_taaParams; // x=taaEnabled, y=blendFactor, z=neighborClamp, w=hasHistory/hasPrev
 } ubo;
@@ -49,6 +50,27 @@ float shadowMapDepth(uint cascadeIndex, vec2 uv) {
 float shadowCompare(uint cascadeIndex, vec2 uv, float refDepth) {
   float d = shadowMapDepth(cascadeIndex, uv);
   return (refDepth <= d) ? 1.0 : 0.0;
+}
+
+float casterMaskValue(uint cascadeIndex, vec2 uv) {
+  if (ubo.u_viewportZ.z <= 0.5)
+    return 0.0;
+  return texture(
+    sampler2DArray(s_casterMask, s_samplers[nonuniformEXT(p_shadowSampler)]),
+    vec3(uv, float(cascadeIndex))).r;
+}
+
+bool isTerrainMaskedOccluder(uint cascadeIndex, vec2 uv, float refDepth) {
+  if (ubo.u_viewportZ.z <= 0.5)
+    return false;
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+    return false;
+
+  float blockerDepth = shadowMapDepth(cascadeIndex, uv);
+  float eps = max(ubo.u_viewportZ.w, 0.0);
+  if (refDepth <= blockerDepth + eps)
+    return false;
+  return casterMaskValue(cascadeIndex, uv) > 0.5;
 }
 
 const vec2 kPoisson16[16] = vec2[](
@@ -277,6 +299,7 @@ float sampleShadowStableWall(uint cascadeIndex, vec2 uv, float refDepth, float r
 }
 
 float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra, vec2 rot, bool stableWallPath) {
+  const bool diagnoseCsm = int(ubo.u_params2.z + 0.5) == 9;
   int cascadeCount = clamp(int(ubo.u_params.w), 1, 4);
 
   float splits[4];
@@ -302,26 +325,73 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra, v
   // Sample primary cascade only (skip cascade blending for TAA - temporal filter smooths it)
   vec4 l0 = p * ubo.u_lightViewProj[c0];
   if (l0.w <= 0.0)
-    return 1.0;
+    return diagnoseCsm ? 0.05 : 1.0;
   vec3 n0 = l0.xyz / l0.w;
   if (n0.z < 0.0 || n0.z > 1.0)
-    return 1.0;
+    return diagnoseCsm ? 0.15 : 1.0;
 
   vec2 uv0 = n0.xy * 0.5 + 0.5;
   uv0.y = 1.0 - uv0.y;
+  if (diagnoseCsm &&
+      (uv0.x < 0.0 || uv0.x > 1.0 || uv0.y < 0.0 || uv0.y > 1.0))
+    return 0.25;
   float bias0 = baseBias * computeCascadeBiasScale(c0, cascadeCount, cascadeBiasScale);
   // 与 receiver.frag 一致：越界直接全亮会造成接触阴影突然断裂。
   float ref0 = clamp(n0.z - bias0, 0.0, 1.0);
+  if (isTerrainMaskedOccluder(uint(c0), uv0, ref0))
+    return diagnoseCsm ? 0.35 : 1.0;
+
+  if (diagnoseCsm) {
+    float blockerDepth = shadowMapDepth(uint(c0), uv0);
+    if (blockerDepth >= 0.99999)
+      return 0.45;
+    return ref0 <= blockerDepth ? 0.55 : 0.65;
+  }
 
   float radius0 = max(ubo.u_params.y, 0.0);
   radius0 = computeCascadePcfRadius(radius0, c0, cascadeCount, pcfCascadeRadiusScale);
 
-  if (stableWallPath)
-    return sampleShadowStableWall(uint(c0), uv0, ref0, radius0);
+  // The visibility source must preserve the receiver's cascade contract.
+  // Stable walls previously returned here and hard-switched at splitFar.
+  float vis0 = stableWallPath
+      ? sampleShadowStableWall(uint(c0), uv0, ref0, radius0)
+      : sampleShadowPcf(uint(c0), uv0, ref0, radius0, rot);
 
-  // TAA pre-pass: keep current visibility cheap and deterministic. Alpha-test
-  // foliage stability is handled by texture-anchored caster dither plus history.
-  return sampleShadowFast4(uint(c0), uv0, ref0);
+  // Match receiver-side cascade blending. Without this, the TAA source texture
+  // has hard split transitions that history cannot fully hide during camera
+  // motion.
+  float blendRange = max(ubo.u_params2.y, 0.0);
+  if (blendRange > 0.0 && c0 < cascadeCount - 1) {
+    float far0 = splits[c0];
+    float t = clamp((viewDepth - (far0 - blendRange)) / blendRange, 0.0, 1.0);
+    float w = t * t * (3.0 - 2.0 * t);
+    if (w > 1e-6) {
+      int c1 = c0 + 1;
+      vec4 l1 = p * ubo.u_lightViewProj[c1];
+      if (l1.w > 0.0) {
+        vec3 n1 = l1.xyz / l1.w;
+        if (n1.z >= 0.0 && n1.z <= 1.0) {
+          vec2 uv1 = n1.xy * 0.5 + 0.5;
+          uv1.y = 1.0 - uv1.y;
+          float bias1 = baseBias * computeCascadeBiasScale(c1, cascadeCount, cascadeBiasScale);
+          float ref1 = clamp(n1.z - bias1, 0.0, 1.0);
+          float radius1 = max(ubo.u_params.y, 0.0);
+          radius1 = computeCascadePcfRadius(radius1, c1, cascadeCount, pcfCascadeRadiusScale);
+          float vis1 = 1.0;
+          if (!isTerrainMaskedOccluder(uint(c1), uv1, ref1)) {
+            // Stable-wall filtering is used on both cascades before blending;
+            // never mix its snapped grid with the generic PCF family.
+            vis1 = stableWallPath
+                ? sampleShadowStableWall(uint(c1), uv1, ref1, radius1)
+                : sampleShadowPcf(uint(c1), uv1, ref1, radius1, rot);
+          }
+          return mix(vis0, vis1, w);
+        }
+      }
+    }
+  }
+
+  return vis0;
 }
 
 void main() {
@@ -423,21 +493,9 @@ void main() {
   }
 
   vec2 pcfRot = vec2(1.0, 0.0);
-  float rotateMode = ubo.u_params6.y;
-  if (rotateMode > 0.5 && !stableWallPath) {
-    float seed = 0.0;
-    bool useScreenRotate =
-        rotateMode < 1.5 ||
-        viewDepth > ubo.u_splitFar.y ||
-        stableWallPath;
-    if (useScreenRotate) {
-      seed = fract(dot(vec2(pix), vec2(0.06711056, 0.00583715)));
-    } else {
-      seed = fract(dot(worldPos.xy, vec2(0.03125, 0.015625)));
-    }
-    float angle = seed * 6.28318531;
-    pcfRot = vec2(cos(angle), sin(angle));
-  }
+  // This pass feeds Shadow TAA. Any per-pixel rotated Poisson pattern becomes
+  // part of the temporal input and shows up as edge crawl, so keep the current
+  // visibility source deterministic. Non-TAA receiver sampling may still rotate.
 
   o_vis = computeShadowVisibility(worldPos, viewDepth, biasExtra, pcfRot, stableWallPath);
 }

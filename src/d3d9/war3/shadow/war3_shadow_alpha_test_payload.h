@@ -14,11 +14,13 @@
 //     opaque 方形卡片投射到 shadow map。
 //
 // 本 payload 负责补齐“materialClassification -> actual replay binding”的断层：
-//   - 在 draw-time（legacy 捕获同一位置）把必要资源按对象身份 stash 到
-//     进程级 cache；
-//   - 在 semantic `War3TryAppendSemanticShadowPacket` 消费时按同样的身份查表，
-//     把 UV snapshot + diffuse view/sampler/descriptor/samplerIndex + 真
-//     alphaRef 灌进 `War3ShadowPersistentGeometry` / `War3ShadowCasterDraw`。
+//   - 在 Stage11 semantic early-return 之前按完整 draw identity 捕获必要元数据；
+//   - 只把 UV snapshot + diffuse view/sampler/descriptor/samplerIndex + 真
+//     alphaRef 放入 exact-frame 三槽 metadata store；
+//   - semantic `War3TryAppendSemanticShadowPacket` 仅在同 frame / identity /
+//     material / texture generation 全部一致时应用它。
+//
+// 该通道不保存 position/index，不产生 draw，也没有跨帧 replay 能力。
 //
 // 仅在 AlphaTest lane 内使用。**不**掺入 pose/palette freshness 任何逻辑。
 
@@ -27,8 +29,11 @@
 #include "../../../dxvk/dxvk_image.h"
 #include "../../../dxvk/dxvk_sampler.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <vector>
 
 namespace dxvk {
 namespace war3 {
@@ -74,8 +79,19 @@ struct War3ShadowAlphaTestPayload {
   /// Bindless sampler slot。
   uint32_t diffuseSamplerIndex = 0;
 
-  /// 本 payload 写入时的 shadow persistent frame serial；用于 TTL 淘汰。
+  /// 本 payload 写入时的 shadow persistent frame serial；必须 exact-match。
   uint64_t frameSerial = 0;
+
+  /// Metadata upload page generation. The safe metadata store accepts a UV
+  /// slice only while this generation matches the current frame slot.
+  uint64_t uvPageGeneration = 0;
+
+  // Authoritative producer identity used only for tombstone retirement and
+  // material-key verification. These fields do not participate in rendering.
+  void* renderablePart = nullptr;
+  void* sceneNode = nullptr;
+  void* worldObjectEntry = nullptr;
+  int16_t producerStage = -1;
 
   /// @brief payload 是否包含完整 alpha-test 必需资源。
   bool valid() const {
@@ -85,6 +101,106 @@ struct War3ShadowAlphaTestPayload {
            diffuseTexture != nullptr;
   }
 };
+
+/// A complete draw identity for the metadata-only shadow channel.
+///
+/// This deliberately does not contain position/index storage and cannot be
+/// converted into a caster. Texture identity and generation are part of the
+/// key so a recycled D3D9 texture/view cannot inherit an older alpha payload.
+struct War3ShadowDrawMetadataKey {
+  void* instanceIdentity = nullptr;
+  void* sceneNode = nullptr;
+  void* renderablePart = nullptr;
+  void* meshPayloadPtr = nullptr;
+  void* worldObjectEntry = nullptr;
+  void* unitPtr = nullptr;
+  uint32_t jHandle = 0u;
+  uint32_t layerIndex = 0u;
+  int16_t producerStage = -1;
+  uint32_t payloadWord108 = 0u;
+  uint32_t payloadWord11C = 0u;
+  uint64_t materialSignatureHash = 0u;
+  void* textureIdentity = nullptr;
+  uint64_t textureGeneration = 0u;
+
+  bool operator==(const War3ShadowDrawMetadataKey& other) const noexcept;
+  uint64_t stableHash() const noexcept;
+};
+
+/// Consumer-side key. Texture identity is intentionally not guessed by the
+/// semantic consumer; lookup first matches this full logical slice, then
+/// validates the stored texture identity/generation against its live Rc view.
+struct War3ShadowDrawMetadataQuery {
+  void* instanceIdentity = nullptr;
+  void* sceneNode = nullptr;
+  void* renderablePart = nullptr;
+  void* meshPayloadPtr = nullptr;
+  void* worldObjectEntry = nullptr;
+  void* unitPtr = nullptr;
+  uint32_t jHandle = 0u;
+  uint32_t layerIndex = 0u;
+  int16_t producerStage = -1;
+  uint32_t payloadWord108 = 0u;
+  uint32_t payloadWord11C = 0u;
+  uint64_t materialSignatureHash = 0u;
+};
+
+enum class War3ShadowMetadataBlockerReason : uint8_t {
+  None = 0u,
+  KnownRawcode = 1u,
+  WidgetIdentity = 2u,
+  SmallFlat = 3u,
+  BelowGround = 4u,
+  Unreadable = 5u,
+};
+
+struct War3ShadowDrawMetadata {
+  War3ShadowDrawMetadataKey key = {};
+  War3ShadowAlphaTestPayload alpha = {};
+  War3ShadowMetadataBlockerReason blockerReason =
+      War3ShadowMetadataBlockerReason::None;
+  uint64_t frameSerial = 0u;
+  uint64_t uvPageGeneration = 0u;
+  bool alphaPayloadComplete = false;
+
+  bool hasBlocker() const {
+    return blockerReason != War3ShadowMetadataBlockerReason::None &&
+           blockerReason != War3ShadowMetadataBlockerReason::Unreadable;
+  }
+};
+
+/// Three-slot, exact-frame metadata store. It owns only compact identity,
+/// material/alpha state and an optional independently uploaded UV slice. It
+/// never owns position/index data and exposes no draw/replay API.
+class War3ShadowDrawMetadataFrameStore {
+public:
+  void publish(War3ShadowDrawMetadata metadata);
+  bool lookupAlpha(const War3ShadowDrawMetadataQuery& query,
+                   uint64_t frameSerial,
+                   War3ShadowDrawMetadata& out,
+                   bool noteRejectedLookup = true) const;
+  bool lookupBlocker(const War3ShadowDrawMetadataQuery& query,
+                     uint64_t frameSerial,
+                     War3ShadowMetadataBlockerReason& outReason,
+                     uint64_t* outKeyHash = nullptr) const;
+  uint64_t retire(void* renderablePart, void* sceneNode,
+                  void* worldObjectEntry, int16_t producerStage);
+  void clear();
+  uint64_t size() const;
+
+private:
+  struct FrameSlot {
+    uint64_t frameSerial = 0u;
+    uint64_t pageGeneration = 0u;
+    std::vector<War3ShadowDrawMetadata> records;
+  };
+
+  mutable std::mutex m_mutex;
+  std::array<FrameSlot, 3u> m_slots = {};
+};
+
+War3ShadowDrawMetadataFrameStore& War3ShadowDrawMetadataStore();
+uint64_t War3ShadowTextureGeneration(const Rc<DxvkImageView>& view);
 
 /// @brief AlphaTest payload plumbing 诊断计数器集合。
 ///
@@ -122,6 +238,26 @@ struct War3ShadowAlphaTestPayloadCounters {
   std::atomic<uint64_t> cacheEvictedCount{0u};
   /// 当前 cache 规模（最近一次读取后同步写入）。
   std::atomic<uint64_t> cacheSizeGauge{0u};
+
+  // ---- metadata-only channel ----
+  std::atomic<uint64_t> metadataClassifiedCount{0u};
+  std::atomic<uint64_t> metadataCapturedCount{0u};
+  std::atomic<uint64_t> metadataAppliedCount{0u};
+  std::atomic<uint64_t> metadataRejectedFrameCount{0u};
+  std::atomic<uint64_t> metadataRejectedGenerationCount{0u};
+  std::atomic<uint64_t> metadataAmbiguousCount{0u};
+  std::atomic<uint64_t> metadataRejectedNoMaterialCount{0u};
+  std::atomic<uint64_t> metadataRejectedOpaqueCount{0u};
+  std::atomic<uint64_t> metadataRejectedNoUvCount{0u};
+  std::atomic<uint64_t> metadataRejectedNoDiffuseCount{0u};
+  std::atomic<uint64_t> metadataRejectedUploadCount{0u};
+  std::atomic<uint64_t> metadataRejectedDuplicateCount{0u};
+  std::atomic<uint64_t> blockerKnownRawcodeCount{0u};
+  std::atomic<uint64_t> blockerWidgetIdentityCount{0u};
+  std::atomic<uint64_t> blockerSmallFlatCount{0u};
+  std::atomic<uint64_t> blockerBelowGroundCount{0u};
+  std::atomic<uint64_t> blockerUnreadableCount{0u};
+  std::atomic<uint64_t> blockerFinalLeakCount{0u};
 };
 
 /// @brief 对外快照结构：用于 bridge summary / JSON 暴露。
@@ -141,6 +277,24 @@ struct War3ShadowAlphaTestPayloadCountersSnapshot {
   uint64_t stashSkipNoUploadCountBudget = 0;
   uint64_t cacheEvictedCount = 0;
   uint64_t cacheSizeGauge = 0;
+  uint64_t metadataClassifiedCount = 0;
+  uint64_t metadataCapturedCount = 0;
+  uint64_t metadataAppliedCount = 0;
+  uint64_t metadataRejectedFrameCount = 0;
+  uint64_t metadataRejectedGenerationCount = 0;
+  uint64_t metadataAmbiguousCount = 0;
+  uint64_t metadataRejectedNoMaterialCount = 0;
+  uint64_t metadataRejectedOpaqueCount = 0;
+  uint64_t metadataRejectedNoUvCount = 0;
+  uint64_t metadataRejectedNoDiffuseCount = 0;
+  uint64_t metadataRejectedUploadCount = 0;
+  uint64_t metadataRejectedDuplicateCount = 0;
+  uint64_t blockerKnownRawcodeCount = 0;
+  uint64_t blockerWidgetIdentityCount = 0;
+  uint64_t blockerSmallFlatCount = 0;
+  uint64_t blockerBelowGroundCount = 0;
+  uint64_t blockerUnreadableCount = 0;
+  uint64_t blockerFinalLeakCount = 0;
 };
 
 extern War3ShadowAlphaTestPayloadCounters g_war3ShadowAlphaTestPayloadCounters;

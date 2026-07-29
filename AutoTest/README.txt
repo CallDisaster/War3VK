@@ -18,8 +18,8 @@ War3 AutoTest MCP（自动化测试服务）
 
 默认路径
 --------
-- War3 目录: E:\Work\War3
-- 测试地图: E:\Work\War3\Maps\光影测试.w3x
+- War3 目录: E:\Work\War3_AutoTestSandbox
+- 测试地图: E:\Work\War3_AutoTestSandbox\Maps\光影测试.w3x
 
 已实现 MCP 工具
 ---------------
@@ -27,6 +27,15 @@ War3 AutoTest MCP（自动化测试服务）
 - prepare_test_map
 - deploy_d3d9_to_war3
 - ensure_war3_video_baseline
+- preflight_instance_pool
+- provision_ydhost_assets（默认 dry-run；哈希锁定且目标漂移即拒绝）
+- generate_ydhost_map_metadata（默认临时执行；不启动 War3/WE/ydhost）
+- launch_war3_instance
+- launch_war3_batch
+- run_multi_instance_suite（仅 LAN/ydhost；真实启动显式 opt-in，协议证据不足仍 fail-closed）
+- list_war3_sessions
+- stop_war3_batch
+- cleanup_orphan_sessions
 - launch_war3_test
 - is_war3_running
 - read_runtime_status
@@ -58,6 +67,19 @@ War3 AutoTest MCP（自动化测试服务）
    - 启动参数使用: -loadfile
    - 地图复制到: Maps\Test\WorldEditTestMap.w3x
    - 传相对路径给 -loadfile（减少长路径不识别风险）
+
+1.5) 历史 YDWE/JAPI 地图
+   - `launch_war3_test` / `run_quick_autotest` 显式传
+     `launcher_mode="ydwe"`、`ydwe_root=<YDWE根>`、
+     `use_isolated_desktop=true`。
+   - 仅允许既有 `E:\Work\War3_AutoTestSandbox`；只读校验 HKCU InstallPath，
+     不修改注册表、不复制新沙盒。
+   - 启动链为 `YDWE.exe -war3 -loadfile <短路径> -closew2l`，追踪其 child
+     war3 PID；DBWIN/ready/stop 均绑定游戏 PID。
+   - 候选图部署后必须与短路径目标 SHA-256 一致；LuaEngine.dll 与
+     yd_jass_api.dll 必须在 child 中以精确路径和 SHA 加载。
+   - 检测到用户 YDWE/WorldEditor 进程时返回
+     `USER_YDWE_PROCESS_CONFLICT`，绝不结束用户进程，也不降级成无 JAPI 直启。
 
 2) 自动性能录制
    - 若 DXVK 新版已包含该开关，可通过环境变量:
@@ -245,7 +267,7 @@ War3 AutoTest MCP（自动化测试服务）
        因此 City 专项稳定性/压力套件虽已落地，但真正签收前仍需先解决该地图的加载条件。
    - 夜间执行策略（新增）：
      - `City.w3x` 仍作为优先专项图；
-     - 若 standalone 自动链路未能进图，套件会自动回退到 `E:\Work\War3\Maps\光影测试.w3x`，
+     - 若 standalone 自动链路未能进图，套件会自动回退到 `E:\Work\War3_AutoTestSandbox\Maps\光影测试.w3x`，
        不再因为单张地图启动兼容性阻塞整晚稳定性/压力回归；
      - 夜间 runner 不以中途人工汇总作为停点，而是持续执行
        `稳定性 -> 压力 -> 低压回归`，统一把结果落到 `AutoTest/artifacts/`。

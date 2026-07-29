@@ -10,6 +10,7 @@
 #include "war3/core/war3_internal_test_config.h"
 #include "war3/core/war3_runtime_profile.h"
 #include "war3/core/war3_semantic_shadow_gate.h"
+#include "d3d9_war3_light.h"
 #include "d3d9_war3_shadow.h"
 #include "d3d9_war3_debug.h"
 #include "war3/tools/war3_perf_monitor.h"
@@ -42,7 +43,7 @@ namespace dxvk {
                 return false;
             char* end = nullptr;
             const float f = std::strtof(v.c_str(), &end);
-            if (end == v.c_str())
+            if (end == v.c_str() || !std::isfinite(f))
                 return false;
             outValue = f;
             return true;
@@ -224,14 +225,16 @@ namespace dxvk {
     // RegisterPass(std::make_unique<War3ShadowReceiverPass>(m_device));
 
         // 调试/调参：可用环境变量快速覆盖部分阴影参数，便于定位抽搐与采样伪影。
-        // - DXVK_WAR3_SHADOW_DEBUG=0..3: 0=None 1=Cascades 2=ShadowFactor 3=Depth
+          // - DXVK_WAR3_SHADOW_DEBUG=0..9:
+        //   0=None 1=Cascades 2=ShadowFactor 3=Depth 4=Motion 5=History
+        //   6=PointShadow 7=CurrentVisibility(pre-TAA)
         // - DXVK_WAR3_SHADOW_STRENGTH=0..1
         // - DXVK_WAR3_SHADOW_BIAS>=0
         // - DXVK_WAR3_SHADOW_PCF>=0
         {
             int dbg = -1;
             if (ParseEnvInt("DXVK_WAR3_SHADOW_DEBUG", dbg)) {
-                dbg = std::clamp(dbg, 0, 3);
+                  dbg = std::clamp(dbg, 0, 9);
                 m_settings.shadows.debugMode = static_cast<War3ShadowDebugMode>(dbg);
                 WAR3_RENDER_LOG("DXVK War3Shadow: DXVK_WAR3_SHADOW_DEBUG=%d\n", dbg);
             }
@@ -248,6 +251,57 @@ namespace dxvk {
                 m_settings.shadows.receiverBias = std::max(bias, 0.0f);
                 WAR3_RENDER_LOG("DXVK War3Shadow: DXVK_WAR3_SHADOW_BIAS=%.6f\n",
                                static_cast<double>(m_settings.shadows.receiverBias));
+            }
+
+            int receiverMode = -1;
+            if (ParseEnvInt("DXVK_WAR3_SHADOW_RECEIVER_MODE", receiverMode)) {
+                receiverMode = std::clamp(receiverMode, 0, 2);
+                m_settings.shadows.receiverMode =
+                    static_cast<War3ShadowReceiverMode>(receiverMode);
+                WAR3_RENDER_LOG(
+                    "DXVK War3Shadow: DXVK_WAR3_SHADOW_RECEIVER_MODE=%d\n",
+                    receiverMode);
+            }
+
+            float normalBiasScale = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_SHADOW_NORMAL_BIAS_SCALE",
+                              normalBiasScale)) {
+                m_settings.shadows.normalBiasScale =
+                    std::max(normalBiasScale, 0.0f);
+                WAR3_RENDER_LOG(
+                    "DXVK War3Shadow: DXVK_WAR3_SHADOW_NORMAL_BIAS_SCALE=%.6f\n",
+                    static_cast<double>(
+                        m_settings.shadows.normalBiasScale));
+            }
+
+            float cascadeBlendRange = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_SHADOW_CASCADE_BLEND_RANGE",
+                              cascadeBlendRange)) {
+                m_settings.shadows.cascadeBlendRange =
+                    std::max(cascadeBlendRange, 0.0f);
+                WAR3_RENDER_LOG(
+                    "DXVK War3Shadow: DXVK_WAR3_SHADOW_CASCADE_BLEND_RANGE=%.3f\n",
+                    static_cast<double>(
+                        m_settings.shadows.cascadeBlendRange));
+            }
+
+            int stableSnap = -1;
+            if (ParseEnvInt("DXVK_WAR3_SHADOW_STABLE_SNAP", stableSnap)) {
+                m_settings.shadows.csm.stableSnap =
+                    stableSnap != 0 ? 1.0f : 0.0f;
+                WAR3_RENDER_LOG(
+                    "DXVK War3Shadow: DXVK_WAR3_SHADOW_STABLE_SNAP=%d\n",
+                    stableSnap != 0 ? 1 : 0);
+            }
+
+            float splitLambda = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_SHADOW_SPLIT_LAMBDA", splitLambda)) {
+                m_settings.shadows.csm.splitLambda =
+                    std::clamp(splitLambda, 0.0f, 1.0f);
+                WAR3_RENDER_LOG(
+                    "DXVK War3Shadow: DXVK_WAR3_SHADOW_SPLIT_LAMBDA=%.3f\n",
+                    static_cast<double>(
+                        m_settings.shadows.csm.splitLambda));
             }
 
             float pcf = 0.0f;
@@ -286,8 +340,25 @@ namespace dxvk {
             int shadowTaa = -1;
             if (ParseEnvInt("DXVK_WAR3_SHADOW_TAA", shadowTaa)) {
                 m_settings.shadows.shadowTaaEnabled = shadowTaa != 0;
+                m_settings.shadows.shadowTaaMode =
+                    shadowTaa != 0
+                        ? War3ShadowTaaMode::Temporal
+                        : War3ShadowTaaMode::DirectInline;
                 WAR3_RENDER_LOG("DXVK War3Shadow: DXVK_WAR3_SHADOW_TAA=%d\n",
                                m_settings.shadows.shadowTaaEnabled ? 1 : 0);
+            }
+
+            float shadowTaaWeight = 0.0f;
+            if (ParseEnvFloat(
+                    "DXVK_WAR3_SHADOW_TAA_NEW_FRAME_WEIGHT",
+                    shadowTaaWeight)) {
+                m_settings.shadows.shadowTaaBlendFactor =
+                    std::clamp(shadowTaaWeight, 0.12f, 0.30f);
+                WAR3_RENDER_LOG(
+                    "DXVK War3Shadow: "
+                    "DXVK_WAR3_SHADOW_TAA_NEW_FRAME_WEIGHT=%.3f\n",
+                    static_cast<double>(
+                        m_settings.shadows.shadowTaaBlendFactor));
             }
 
             int alphaHash = -1;
@@ -333,6 +404,351 @@ namespace dxvk {
                 m_settings.postFx.aa.fxaaQualitySubpix = std::clamp(fxaaSubpix, 0.0f, 1.0f);
                 WAR3_RENDER_LOG("DXVK War3AA: DXVK_WAR3_FXAA_SUBPIX=%.3f\n",
                                static_cast<double>(m_settings.postFx.aa.fxaaQualitySubpix));
+            }
+        }
+
+        // 点光源运行时入口：默认关闭；可由 JASS 命令或环境变量打开。
+        {
+            int enabled = -1;
+            if (ParseEnvInt("DXVK_WAR3_POINT_LIGHTS", enabled)) {
+                m_settings.shadows.pointLightsEnabled = enabled != 0;
+                WAR3_RENDER_LOG("DXVK War3PointLight: DXVK_WAR3_POINT_LIGHTS=%d\n",
+                               m_settings.shadows.pointLightsEnabled ? 1 : 0);
+            }
+
+            int shadowEnabled = -1;
+            if (ParseEnvInt("DXVK_WAR3_POINT_SHADOW", shadowEnabled)) {
+                m_settings.shadows.pointShadowEnabled = shadowEnabled != 0;
+                WAR3_RENDER_LOG("DXVK War3PointLight: DXVK_WAR3_POINT_SHADOW=%d\n",
+                               m_settings.shadows.pointShadowEnabled ? 1 : 0);
+            }
+
+            int pointShadowMaxLights = 0;
+            if (ParseEnvInt("DXVK_WAR3_POINT_SHADOW_MAX_LIGHTS",
+                            pointShadowMaxLights)) {
+                pointShadowMaxLights = std::clamp(pointShadowMaxLights, 1, 4);
+                m_settings.shadows.pointShadowMaxLights =
+                    static_cast<uint32_t>(pointShadowMaxLights);
+                WAR3_RENDER_LOG(
+                    "DXVK War3PointLight: pointShadowMaxLights=%d\n",
+                    pointShadowMaxLights);
+            }
+
+            int pointShadowResolution = 0;
+            if (ParseEnvInt("DXVK_WAR3_POINT_SHADOW_RESOLUTION",
+                            pointShadowResolution)) {
+                pointShadowResolution =
+                    std::clamp(pointShadowResolution, 128, 2048);
+                m_settings.shadows.pointShadowResolution =
+                    static_cast<uint32_t>(pointShadowResolution);
+                WAR3_RENDER_LOG(
+                    "DXVK War3PointLight: pointShadowResolution=%d\n",
+                    pointShadowResolution);
+            }
+
+            int pointShadowDebugLight = 0;
+            if (ParseEnvInt("DXVK_WAR3_POINT_SHADOW_DEBUG_LIGHT",
+                            pointShadowDebugLight)) {
+                pointShadowDebugLight = std::clamp(pointShadowDebugLight, 0, 3);
+                m_settings.shadows.pointShadowDebugLightIndex =
+                    static_cast<uint32_t>(pointShadowDebugLight);
+                WAR3_RENDER_LOG(
+                    "DXVK War3PointLight: pointShadowDebugLight=%d\n",
+                    pointShadowDebugLight);
+            }
+
+            float pointShadowBias = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_POINT_SHADOW_BIAS", pointShadowBias)) {
+                m_settings.shadows.pointShadowBias = std::max(0.0f, pointShadowBias);
+                WAR3_RENDER_LOG("DXVK War3PointLight: pointShadowBias=%.4f\n",
+                               static_cast<double>(m_settings.shadows.pointShadowBias));
+            }
+
+            float pointShadowPcfNear = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_POINT_SHADOW_PCF_NEAR",
+                              pointShadowPcfNear)) {
+                m_settings.shadows.pointShadowPcfRadiusNear =
+                    std::clamp(pointShadowPcfNear, 0.0f, 4.0f);
+            }
+
+            float pointShadowPcfFar = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_POINT_SHADOW_PCF_FAR",
+                              pointShadowPcfFar)) {
+                m_settings.shadows.pointShadowPcfRadiusFar =
+                    std::clamp(pointShadowPcfFar,
+                               m_settings.shadows.pointShadowPcfRadiusNear,
+                               6.0f);
+            }
+
+            float pointShadowTexelBias = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_POINT_SHADOW_TEXEL_BIAS",
+                              pointShadowTexelBias)) {
+                m_settings.shadows.pointShadowTexelBiasScale =
+                    std::clamp(pointShadowTexelBias, 0.0f, 1.0f);
+            }
+
+            float pointShadowRangeFade = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_POINT_SHADOW_RANGE_FADE",
+                              pointShadowRangeFade)) {
+                m_settings.shadows.pointShadowRangeFadeStart =
+                    std::clamp(pointShadowRangeFade, 0.50f, 0.98f);
+            }
+
+            int pointRayShadowEnabled = -1;
+            if (ParseEnvInt("DXVK_WAR3_POINT_RAY_SHADOW",
+                            pointRayShadowEnabled)) {
+                m_settings.shadows.pointRayShadowEnabled =
+                    pointRayShadowEnabled != 0;
+                WAR3_RENDER_LOG(
+                    "DXVK War3PointLight: pointRayShadowEnabled=%d\n",
+                    m_settings.shadows.pointRayShadowEnabled ? 1 : 0);
+            }
+
+            int pointRayShadowHiZEnabled = -1;
+            if (ParseEnvInt("DXVK_WAR3_POINT_RAY_SHADOW_HIZ",
+                            pointRayShadowHiZEnabled)) {
+                m_settings.shadows.pointRayShadowHiZEnabled =
+                    pointRayShadowHiZEnabled != 0;
+                WAR3_RENDER_LOG(
+                    "DXVK War3PointLight: pointRayShadowHiZEnabled=%d\n",
+                    m_settings.shadows.pointRayShadowHiZEnabled ? 1 : 0);
+            }
+
+            int pointRayShadowMaxLights = 0;
+            if (ParseEnvInt("DXVK_WAR3_POINT_RAY_SHADOW_MAX_LIGHTS",
+                            pointRayShadowMaxLights)) {
+                m_settings.shadows.pointRayShadowMaxLights =
+                    static_cast<uint32_t>(
+                        std::clamp(pointRayShadowMaxLights, 1, 2));
+            }
+
+            int pointRayShadowSteps = 0;
+            if (ParseEnvInt("DXVK_WAR3_POINT_RAY_SHADOW_STEPS",
+                            pointRayShadowSteps)) {
+                m_settings.shadows.pointRayShadowSteps =
+                    static_cast<uint32_t>(
+                        std::clamp(pointRayShadowSteps, 4, 32));
+            }
+
+            int pointRayShadowHiZVisits = 0;
+            if (ParseEnvInt("DXVK_WAR3_POINT_RAY_SHADOW_HIZ_VISITS",
+                            pointRayShadowHiZVisits)) {
+                m_settings.shadows.pointRayShadowHiZMaxVisits =
+                    static_cast<uint32_t>(
+                        std::clamp(pointRayShadowHiZVisits, 8, 64));
+            }
+
+            float pointRayShadowMaxDistance = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_POINT_RAY_SHADOW_MAX_DISTANCE",
+                              pointRayShadowMaxDistance)) {
+                m_settings.shadows.pointRayShadowMaxDistance =
+                    std::clamp(pointRayShadowMaxDistance, 32.0f, 2400.0f);
+            }
+
+            float pointRayShadowThickness = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_POINT_RAY_SHADOW_THICKNESS",
+                              pointRayShadowThickness)) {
+                m_settings.shadows.pointRayShadowThickness =
+                    std::clamp(pointRayShadowThickness, 1.0f, 160.0f);
+            }
+
+            float pointRayShadowStartOffset = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_POINT_RAY_SHADOW_START_OFFSET",
+                              pointRayShadowStartOffset)) {
+                m_settings.shadows.pointRayShadowStartOffset =
+                    std::clamp(pointRayShadowStartOffset, 1.0f, 96.0f);
+            }
+
+            float pointRayShadowStrength = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_POINT_RAY_SHADOW_STRENGTH",
+                              pointRayShadowStrength)) {
+                m_settings.shadows.pointRayShadowStrength =
+                    std::clamp(pointRayShadowStrength, 0.0f, 1.0f);
+            }
+
+            int pointShadowMaxFaces = 0;
+            if (ParseEnvInt("DXVK_WAR3_POINT_SHADOW_MAX_FACES",
+                            pointShadowMaxFaces)) {
+                // 0 = 全更；1..6 = 每帧 face budget。
+                pointShadowMaxFaces = std::clamp(pointShadowMaxFaces, 0, 6);
+                m_settings.shadows.pointShadowMaxFacesPerFrame =
+                    static_cast<uint32_t>(pointShadowMaxFaces);
+                WAR3_RENDER_LOG(
+                    "DXVK War3PointLight: pointShadowMaxFacesPerFrame=%d\n",
+                    pointShadowMaxFaces);
+            }
+
+            int clearTestLights = 0;
+            if (ParseEnvInt("DXVK_WAR3_TEST_POINT_LIGHT_CLEAR",
+                            clearTestLights) &&
+                clearTestLights != 0) {
+                War3LightManager::Instance().ClearLights();
+            }
+
+            int testLight = 0;
+            if (ParseEnvInt("DXVK_WAR3_TEST_POINT_LIGHT", testLight) &&
+                testLight != 0) {
+                float x = 0.0f;
+                float y = 0.0f;
+                float z = 420.0f;
+                float range = 1800.0f;
+                float r = 1.0f;
+                float g = 0.86f;
+                float b = 0.58f;
+                float intensity = 2.4f;
+                float shadowIntensity = 0.65f;
+                ParseEnvFloat("DXVK_WAR3_TEST_POINT_LIGHT_X", x);
+                ParseEnvFloat("DXVK_WAR3_TEST_POINT_LIGHT_Y", y);
+                ParseEnvFloat("DXVK_WAR3_TEST_POINT_LIGHT_Z", z);
+                ParseEnvFloat("DXVK_WAR3_TEST_POINT_LIGHT_RANGE", range);
+                ParseEnvFloat("DXVK_WAR3_TEST_POINT_LIGHT_R", r);
+                ParseEnvFloat("DXVK_WAR3_TEST_POINT_LIGHT_G", g);
+                ParseEnvFloat("DXVK_WAR3_TEST_POINT_LIGHT_B", b);
+                ParseEnvFloat("DXVK_WAR3_TEST_POINT_LIGHT_INTENSITY", intensity);
+                ParseEnvFloat("DXVK_WAR3_TEST_POINT_LIGHT_SHADOW",
+                              shadowIntensity);
+                if (!War3LightManager::Instance().HasActiveLights()) {
+                    const int32_t id = War3LightManager::Instance().AddPointLight(
+                        x, y, z, range, r, g, b, intensity, shadowIntensity);
+                    WAR3_RENDER_LOG(
+                        "DXVK War3PointLight: test light id=%d pos=(%.1f,%.1f,%.1f) range=%.1f color=(%.2f,%.2f,%.2f) intensity=%.2f shadow=%.2f\n",
+                        id, static_cast<double>(x), static_cast<double>(y),
+                        static_cast<double>(z), static_cast<double>(range),
+                        static_cast<double>(r), static_cast<double>(g),
+                        static_cast<double>(b), static_cast<double>(intensity),
+                        static_cast<double>(shadowIntensity));
+                }
+                m_settings.shadows.pointLightsEnabled = true;
+                if (shadowIntensity > 0.0f)
+                    m_settings.shadows.pointShadowEnabled = true;
+            }
+        }
+
+        // 体积光实验入口：默认关闭，只在显式环境变量打开时参与 BeforeUi。
+        {
+            int enabled = -1;
+            if (ParseEnvInt("DXVK_WAR3_VOLUMETRIC_LIGHT", enabled)) {
+                m_settings.postFx.volumetricLight.enabled = enabled != 0;
+                WAR3_RENDER_LOG("DXVK War3Volumetric: DXVK_WAR3_VOLUMETRIC_LIGHT=%d\n",
+                               m_settings.postFx.volumetricLight.enabled ? 1 : 0);
+            }
+
+            float intensity = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_INTENSITY", intensity)) {
+                m_settings.postFx.volumetricLight.intensity =
+                    std::max(0.0f, intensity);
+                WAR3_RENDER_LOG("DXVK War3Volumetric: intensity=%.3f\n",
+                               static_cast<double>(
+                                   m_settings.postFx.volumetricLight.intensity));
+            }
+
+            float decay = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_DECAY", decay)) {
+                m_settings.postFx.volumetricLight.decay =
+                    std::clamp(decay, 0.70f, 0.999f);
+                WAR3_RENDER_LOG("DXVK War3Volumetric: decay=%.3f\n",
+                               static_cast<double>(
+                                   m_settings.postFx.volumetricLight.decay));
+            }
+
+            float density = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_DENSITY", density)) {
+                m_settings.postFx.volumetricLight.density =
+                    std::max(0.0f, density);
+                WAR3_RENDER_LOG("DXVK War3Volumetric: density=%.3f\n",
+                               static_cast<double>(
+                                   m_settings.postFx.volumetricLight.density));
+            }
+
+            float weight = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_WEIGHT", weight)) {
+                m_settings.postFx.volumetricLight.weight =
+                    std::max(0.0f, weight);
+                WAR3_RENDER_LOG("DXVK War3Volumetric: weight=%.3f\n",
+                               static_cast<double>(
+                                   m_settings.postFx.volumetricLight.weight));
+            }
+
+            float skyThreshold = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_SKY_THRESHOLD",
+                              skyThreshold)) {
+                m_settings.postFx.volumetricLight.skyThreshold =
+                    std::clamp(skyThreshold, 0.55f, 0.99f);
+                WAR3_RENDER_LOG("DXVK War3Volumetric: skyThreshold=%.3f\n",
+                               static_cast<double>(m_settings.postFx
+                                                       .volumetricLight
+                                                       .skyThreshold));
+            }
+
+            int sampleCount = 0;
+            if (ParseEnvInt("DXVK_WAR3_VOLUMETRIC_SAMPLES", sampleCount)) {
+                m_settings.postFx.volumetricLight.sampleCount =
+                    std::clamp(sampleCount, 4, 16);
+                WAR3_RENDER_LOG("DXVK War3Volumetric: samples=%d\n",
+                               m_settings.postFx.volumetricLight.sampleCount);
+            }
+
+            int pointMaxLights = 0;
+            if (ParseEnvInt("DXVK_WAR3_VOLUMETRIC_POINT_MAX_LIGHTS",
+                            pointMaxLights)) {
+                m_settings.postFx.volumetricLight.maxPointLights =
+                    static_cast<uint32_t>(std::clamp(pointMaxLights, 0, 2));
+                WAR3_RENDER_LOG(
+                    "DXVK War3Volumetric: pointMaxLights=%u\n",
+                    static_cast<unsigned>(
+                        m_settings.postFx.volumetricLight.maxPointLights));
+            }
+
+            int resDivisor = 0;
+            if (ParseEnvInt("DXVK_WAR3_VOLUMETRIC_RES_DIVISOR", resDivisor)) {
+                m_settings.postFx.volumetricLight.resolutionDivisor =
+                    static_cast<uint32_t>(std::clamp(resDivisor, 4, 8));
+                WAR3_RENDER_LOG("DXVK War3Volumetric: resDivisor=%u\n",
+                               static_cast<unsigned>(m_settings.postFx
+                                                         .volumetricLight
+                                                         .resolutionDivisor));
+            }
+
+            float fadeNear = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_FADE_NEAR", fadeNear)) {
+                m_settings.postFx.volumetricLight.fadeNear =
+                    std::clamp(fadeNear, 0.0f, 0.95f);
+            }
+
+            float fadeFar = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_FADE_FAR", fadeFar)) {
+                const float nearValue =
+                    m_settings.postFx.volumetricLight.fadeNear;
+                m_settings.postFx.volumetricLight.fadeFar =
+                    std::clamp(fadeFar, nearValue + 0.01f, 1.0f);
+            }
+
+            float maxRayDistance = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_MAX_RAY",
+                              maxRayDistance)) {
+                m_settings.postFx.volumetricLight.maxRayDistance =
+                    std::max(0.05f, maxRayDistance);
+            }
+
+            float heightFogStrength = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_HEIGHT_FOG",
+                              heightFogStrength)) {
+                m_settings.postFx.volumetricLight.heightFogStrength =
+                    std::max(0.0f, heightFogStrength);
+            }
+
+            float extinctionStrength = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_EXTINCTION",
+                              extinctionStrength)) {
+                m_settings.postFx.volumetricLight.extinctionStrength =
+                    std::clamp(extinctionStrength, 0.0f, 1.0f);
+            }
+
+            float unshadowedScattering = 0.0f;
+            if (ParseEnvFloat("DXVK_WAR3_VOLUMETRIC_UNSHADOWED",
+                              unshadowedScattering)) {
+                m_settings.postFx.volumetricLight.unshadowedScattering =
+                    std::clamp(unshadowedScattering, 0.0f, 1.0f);
             }
         }
     }
@@ -394,6 +810,13 @@ namespace dxvk {
             const bool wantsShadows =
                 moduleShadowMap && moduleShadowReceiver &&
                 m_settings.shadows.enabled && !disableWar3Shadow;
+            const bool wantsPointLights =
+                moduleShadowReceiver && m_settings.shadows.pointLightsEnabled &&
+                War3LightManager::Instance().HasActiveLights();
+            const bool wantsPointShadow =
+                wantsPointLights && moduleShadowMap &&
+                m_settings.shadows.pointShadowEnabled &&
+                m_settings.shadows.pointShadowMaxLights > 0;
 
             if (disableWar3Shadow && m_settings.shadows.enabled) {
                 static uint32_t s_shadowDisableLog = 0;
@@ -415,7 +838,8 @@ namespace dxvk {
                 }
                 wantsOutline = false;
             }
-            const bool wantsShadowReceiver = wantsShadows || wantsOutline;
+            const bool wantsShadowReceiver =
+                wantsShadows || wantsOutline || wantsPointLights;
             const bool wantsSemanticShadowScene =
                 moduleSemanticData &&
                 dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled();
@@ -444,7 +868,8 @@ namespace dxvk {
             // it rides on frames where the normal receiver already runs. A
             // separate force flag exists only for narrow diagnostics.
             m_wantsShadowCapture =
-                (effectiveModuleShadowCapture && wantsShadowReceiver) ||
+                (effectiveModuleShadowCapture &&
+                 (wantsShadows || wantsOutline || wantsPointShadow)) ||
                 semanticShadowForcesBeforeUi;
             m_wantsBeforeUiInsertion =
                 shaderPackEnabled || wantsShadowReceiver || wantsPostFx ||
@@ -846,7 +1271,7 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
         }
 
         // 低频运行时健康日志（默认每 1200 帧）。
-        dxvk::war3::tools::LogRuntimeHealthPeriodic(input.frameIndex);
+        dxvk::war3::tools::LogRuntimeHealthPeriodic(input.frameSerial);
     }
 
     void War3RenderPipeline::RegisterPass(const char* name, std::unique_ptr<War3RenderPass> pass, bool enabled) {

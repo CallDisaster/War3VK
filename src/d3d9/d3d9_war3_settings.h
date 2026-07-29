@@ -21,6 +21,10 @@ enum class War3ShadowDebugMode : uint8_t {
   Depth = 3,
   MotionVector = 4,
   ShadowHistory = 5,
+  PointShadow = 6,
+  ShadowCurrent = 7,
+  ShadowCurrentOverlay = 8,
+  ShadowCsmDiagnosis = 9,
 };
 
 enum class War3ShadowReceiverMode : uint8_t {
@@ -57,6 +61,17 @@ enum class War3ShadowAltitudeMode : uint8_t {
   TimeLinear = 1,
 };
 
+// Shadow receiver source policy. Keep this separate from the shader's
+// four-state execution contract (Temporal expands to current-only/history):
+// - DirectInline: receiver evaluates the current shadow map directly.
+// - PrepassCurrentOnly: visibility prepass is sampled, history is not reused.
+// - Temporal: visibility + motion + history resolve are allowed.
+enum class War3ShadowTaaMode : uint8_t {
+  DirectInline = 0,
+  PrepassCurrentOnly = 1,
+  Temporal = 2,
+};
+
 struct War3ShadowSettings {
   bool enabled = true;
   War3CsmConfig csm = {};
@@ -64,7 +79,7 @@ struct War3ShadowSettings {
   // Phase 7.31 Iteration D：从 0.95 降到 0.70，让 Poisson16 的采样落在
   // 更小的 texel 半径内，shadow edge 更锐。配合 CSM maxDistance 4000 + 
   // 自适应 min resolution 3072 给用户"清晰 caster"观感。
-  float pcfRadius = 0.70f;
+  float pcfRadius = 0.85f;
   float receiverBias = 0.004f;
   float cascadeBlendRange = 120.0f;
   War3ShadowPcfKernel pcfKernel = War3ShadowPcfKernel::Poisson16;
@@ -93,15 +108,73 @@ struct War3ShadowSettings {
   float alphaShadowMipLodBias = 0.0f;
   float alphaShadowFarAlphaRefBias = 0.05f;
 
-  bool shadowTaaEnabled = true;
-  float shadowTaaBlendFactor = 0.05f;
+  // The bool remains as a compatibility surface for the existing UI and
+  // DXVK_WAR3_SHADOW_TAA switch. A true legacy value promotes the default
+  // DirectInline mode to Temporal unless DXVK_WAR3_SHADOW_TAA_MODE explicitly
+  // selects a mode.
+  War3ShadowTaaMode shadowTaaMode = War3ShadowTaaMode::DirectInline;
+  bool shadowTaaEnabled = false;
+  // TAA v2 clarity-first default. Candidate sweeps use 0.12/0.20/0.30;
+  // Temporal is still disabled by default, so this only takes effect when the
+  // user explicitly selects it.
+  float shadowTaaBlendFactor = 0.20f;
   bool shadowTaaNeighborClamp = true;
 
+  // 点光源 / 点光阴影：默认关闭，关闭时 ShadowReceiver 只做 atomic 计数检查，
+  // 不构建灯光快照、不渲染 cube shadow，避免拖累 CSM 主路径。
   bool pointLightsEnabled = false;
   uint32_t pointShadowMaxLights = 1;
-  uint32_t pointShadowResolution = 512;
+  // 512 在默认 2000 world-unit 范围下仍约为 7.8 units/texel。资源现在按
+  // configured light capacity 分配，因此默认单灯 1024 仍只占约 24 MiB D32；
+  // 高级单灯可选 2048（约 96 MiB），多灯应按显存预算降档。
+  uint32_t pointShadowResolution = 1024;
+  uint32_t pointShadowDebugLightIndex = 0;
   float pointShadowBias = 0.05f;
+  // Manual cube PCF controls. The cube is sampled with a dedicated nearest
+  // sampler; these values are therefore the only intended filter footprint.
+  float pointShadowPcfRadiusNear = 0.65f;
+  float pointShadowPcfRadiusFar = 1.15f;
+  // World-space receiver bias contribution = cube texel footprint * this
+  // scale. Point cubes store radial distance, so a fixed world-space bias is
+  // not enough: the quantization footprint grows with receiver distance.
+  float pointShadowTexelBiasScale = 0.35f;
+  // Fade optional shadowing before the finite-radius direct light reaches zero.
+  float pointShadowRangeFadeStart = 0.78f;
   bool pointShadowEnabled = false;
+  // Optional software ray-marched contact shadow. This traces the current
+  // receiver depth toward each point light in view space, so it can recover
+  // short-range contact detail that a finite-resolution cube map misses. It is
+  // deliberately opt-in: the disabled path adds no depth taps, while enabled
+  // cost scales with lit pixels * lights * steps.
+  bool pointRayShadowEnabled = false;
+  // A1 hierarchical path. The overall feature remains opt-in, but once the
+  // user enables software rays this is the preferred implementation: it builds
+  // one half-resolution min/max depth pyramid and traces with a strict node
+  // visit budget. Disable only for A/B against the A0 linear fallback.
+  bool pointRayShadowHiZEnabled = true;
+  // Bound the full-screen ray cost independently from the direct-light count.
+  // A0 traces only the canonical most-important prefix; 1 is the safe default.
+  uint32_t pointRayShadowMaxLights = 1;
+  uint32_t pointRayShadowSteps = 12;
+  uint32_t pointRayShadowHiZMaxVisits = 24;
+  float pointRayShadowMaxDistance = 480.0f;
+  float pointRayShadowThickness = 24.0f;
+  float pointRayShadowStartOffset = 10.0f;
+  float pointRayShadowStrength = 0.85f;
+  // 默认逐帧更新：当前内容签名不包含逐骨骼 pose，隔帧复用会让动态单位
+  // 阴影落后。高级用户仍可显式开启复用以换取性能。
+  bool pointShadowTemporalReuse = false;
+  uint32_t pointShadowUpdatePeriod = 1;
+  // 光源范围外 caster 剔除的 padding（>1 留安全边）。
+  float pointShadowCasterCullPadding = 1.20f;
+  // 每个 cube face 最多绘制的 caster 数；0 = 不限制。质量默认不能静默
+  // 丢弃密集地图中的远端/大型 caster；需要性能档时再显式设置上限。
+  uint32_t pointShadowMaxCastersPerFace = 0;
+  // 按 cube face 方向做半球剔除，减少 6 面重复提交。
+  bool pointShadowFaceCulling = true;
+  // 显式开启点阴影后默认保持六面同帧一致；1..5 可作为性能档轮转更新，
+  // 但动态 caster 会出现各面 pose 年龄不一致。0 或 >=6 = 每帧全更。
+  uint32_t pointShadowMaxFacesPerFrame = 6;
 
   War3ShadowReceiverMode receiverMode = War3ShadowReceiverMode::NormalBias;
   float normalBiasScale = 0.005f;
@@ -158,11 +231,86 @@ struct War3BloomSettings {
   bool acesToneMap = false;
 };
 
+struct War3VolumetricLightSettings {
+  // CSM 对齐的体积光。默认关闭；开启后以受光雾/缺光雾的真实差值为主。
+  // 关闭时 Run() 在入口即返回，不申请资源、不拷贝 depth/color。
+  // intensity：整体加亮能量；weight：仅放大真实 CSM/cube 遮挡形成的
+  // 受光雾/缺光雾对比，不再把整个世界统一加雾；
+  // density：世界空间散射密度；sampleCount 受执行层预算硬限制，避免
+  // 低机位/高分辨率时的全屏 ray-march 触发 GPU TDR。
+  bool enabled = false;
+  // soft-clip + composite headroom 防冲白。weight<=1 只通过少加散射形成
+  // 物理阴影；weight>1 启用温和柱可读性（地表端积分后不再依赖激进 peak）。
+  // 默认可读档：先保证区间正确，再谈强度；勿再靠拉满 intensity 补柱。
+  float intensity = 0.95f;
+  float decay = 0.95f;
+  float density = 1.10f;
+  float weight = 1.85f;
+  float skyThreshold = 0.72f;
+  float fadeNear = 0.0f;
+  float fadeFar = 0.45f;
+  // 与 sunDistance 相乘为世界积分预算；1.0 时 UI「最大距离」与实际预算一致。
+  float maxRayDistance = 1.00f;
+  // 4x + 16 steps keeps the default workload below the pass hard budget at
+  // common 1440p extents. Visibility must be tuned through energy/density,
+  // never by restoring an unbounded fragment loop.
+  int sampleCount = 16;
+  // TDR 合同硬下限 divisor=4；俯视靠地表端区间 + 温和可读性，不靠降 divisor。
+  uint32_t resolutionDivisor = 4;
+  // 地表端 [L-D,L] 下 D=sunDistance*maxRayDistance；1400 覆盖常见 RTS 射线尾。
+  float sunDistance = 1400.0f;
+  float froxelNear = 20.0f;
+  float heightFogBase = 0.0f;
+  float heightFogFalloff = 0.0012f;
+  float heightFogStrength = 0.35f;
+  // Stylized shaft composite: retain only a controlled part of physical
+  // extinction so added scattering is not cancelled by LDR base darkening.
+  float extinctionStrength = 0.18f;
+  // When a ray falls outside CSM coverage (or CSM is explicitly optional),
+  // permit a low-energy unshadowed medium term rather than an all-or-nothing cut.
+  float unshadowedScattering = 0.22f;
+  // 夜间/太阳过弱时跳过体积光，避免无可见收益仍付 full-screen 成本。
+  float minSunIntensity = 0.08f;
+  // 要求有效 CSM 快照；没有完整 shadow map 时直接跳过（不回退假散射）。
+  bool requireCsmSnapshot = true;
+  // 体积光中是否叠加点光源散射；关闭可省一次灯光快照构建。
+  bool includePointLights = true;
+  // Full-screen raymarch cost is samples * point lights. The volume consumer
+  // selects a relevance-ranked local top-K without changing the canonical
+  // shadow-first snapshot order; 0 disables point-volume while retaining sun.
+  uint32_t maxPointLights = 2;
+  // 按强度自适应 sampleCount：只在极弱时略降，避免默认把 24 砍到碎点区。
+  bool adaptiveSampleCount = true;
+
+  // 长期线：体积太阳柱遮挡与相机相对 CSM 解耦。
+  // 开启时 ShadowReceiver 额外渲染一张太阳对齐、固定世界半径的 ortho 深度图，
+  // 体积 pass 优先采样它；无效时才 fail-soft 回退相机 CSM。
+  // 体积 enabled=false 时不分配、不绘制（零成本合同）。
+  bool volumeSunShadowEnabled = true;
+  // snapshot 无效时是否回退到相机 CSM（过渡期默认 true）。
+  bool volumeSunShadowFallbackToCsm = true;
+  // 远级 volume cascade 水平半径（War3 世界单位）。
+  float volumeSunOrthoRadius = 3400.0f;
+  // 近级半径 = far * volumeSunNearRadiusScale（固定比例，仍不随 pitch 变）。
+  float volumeSunNearRadiusScale = 0.42f;
+  // 向太阳侧 caster 深度余量；大于历史 C2/C3 的 384 以覆盖高空单位柱体。
+  float volumeSunDepthExtension = 640.0f;
+  float volumeSunDepthMargin = 96.0f;
+  // 双层 depth 分辨率；1536 在近级约 4.2 units/texel。
+  uint32_t volumeSunResolution = 1536;
+  // 体积专用 soft compare 半径（shader 内 3x3 footprint）。
+  float volumeSunSoftRadius = 1.85f;
+  float volumeSunReceiverBias = 0.0075f;
+  // 双级 cascade（近锐/远盖）；false 时退回单层远级。
+  bool volumeSunDualCascade = true;
+};
+
 struct War3PostFxSettings {
   bool enabled = true;
   War3AASettings aa = {};
   War3SsaoSettings ssao = {};
   War3BloomSettings bloom = {};
+  War3VolumetricLightSettings volumetricLight = {};
   float exposure = 1.0f; // 用户要求默认 1.0
   bool useSrgb = false;
 };

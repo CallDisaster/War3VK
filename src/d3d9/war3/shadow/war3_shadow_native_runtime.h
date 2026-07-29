@@ -4,6 +4,7 @@
 #include "war3_shadow_renderer_core.h"
 #include "../render/war3_canonical_draw.h"
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 
@@ -91,8 +92,13 @@ private:
   CanonicalPreparedFrame m_canonicalFrame = {};
   uint64_t m_canonicalPublishCount = 0;
   uint64_t m_canonicalFramePublishCount = 0;
-  uint64_t m_canonicalPublishRejectNotReadyCount = 0;
-  uint64_t m_canonicalPublishRejectNoPositionsCount = 0;
+  // 2026-07-21 修复数据竞争：这两个 reject 计数在 publishCanonicalDraw /
+  // publishCanonicalDrawPrepared 的早退路径上于**获取 m_mutex 之前**自增
+  // （reject 快退路径刻意不进锁，避免热路径锁竞争），而 reset()/setDevice()
+  // 在锁内清零、snapshot() 在锁内读取——非原子成员由此构成无锁读改写竞争。
+  // 改为 atomic 既消除竞争，又不给 reject 快退路径引入锁（relaxed 即可，纯统计）。
+  std::atomic<uint64_t> m_canonicalPublishRejectNotReadyCount{0};
+  std::atomic<uint64_t> m_canonicalPublishRejectNoPositionsCount{0};
 };
 
 } // namespace dxvk::war3::shadow

@@ -5,6 +5,9 @@
 
 #include "d3d9_war3_debug.h"
 #include "../../d3d9_war3_scene.h"
+#include "../gpu_skin/war3_gpu_skin_native_bridge.h"
+#include "../render/war3_shadow_runtime_bridge.h"
+#include "war3_resource_residency_census.h"
 
 #include "../../dxvk/dxvk_cmdlist.h"
 #include "../../dxvk/dxvk_device.h"
@@ -29,9 +32,178 @@ namespace dxvk::war3 {
  */
 struct SectionTiming {
     uint32_t id = 0;
+    uint32_t threadId = 0;
     double cpuMs = 0.0;
     double gpuMs = 0.0;
+    double maxCpuMs = 0.0;
+    double maxGpuMs = 0.0;
     uint32_t callCount = 0;
+    // Number of completed timestamp pairs contributing to gpuMs. This keeps
+    // per-path export correlation from treating an absent query as 0 ms.
+    uint32_t gpuCount = 0;
+};
+
+/**
+ * @brief Fixed-cost, once-per-receiver-run Shadow TAA contract telemetry.
+ *
+ * No strings or containers are allowed here. The receiver publishes this from
+ * a scope-exit path so early returns remain visible in the report.
+ */
+struct ShadowTaaFrameTelemetry {
+    uint32_t runtimeModuleEnabled = 0;
+    uint32_t requestedMode = 0;
+    uint32_t effectiveMode = 0;
+    uint32_t shaderMode = 0;
+    uint32_t blockedSemanticDynamic = 0;
+    uint32_t blockedSunMotion = 0;
+    uint32_t blockedCsmFallback = 0;
+    uint32_t visibilityExecuted = 0;
+    uint32_t motionVectorExecuted = 0;
+    uint32_t receiverExecuted = 0;
+    uint32_t historyWriteExecuted = 0;
+    uint32_t historyAdvanced = 0;
+    uint32_t historyAdvanceSkippedIncomplete = 0;
+    uint32_t historyValidBefore = 0;
+    uint32_t historyValidAfter = 0;
+    uint32_t historyInvalidationMask = 0;
+};
+
+/**
+ * @brief Per-frame workload gauges used only by offline report correlation.
+ *
+ * This is populated once at the Present boundary. It deliberately contains no
+ * strings or containers so retaining 3600 frames does not affect Hook hot
+ * paths or materially grow the history ring.
+ */
+struct FrameWorkloadSnapshot {
+    uint64_t businessFrameSerial = 0;
+    bool hasShadowBudget = false;
+    uint64_t capturedDrawCount = 0;
+    // Sampled metadata-only draw hook cost for this Present interval. This is
+    // kept in the per-frame series so p50/p95+MAD can reject foreground
+    // pre-emption instead of relying on a polluted aggregate wall average.
+    uint64_t shadowMetadataCaptureCalls = 0;
+    uint64_t shadowMetadataCaptureUs = 0;
+    uint64_t terrainDoodadCaptureAttemptCount = 0;
+    uint64_t terrainDoodadCaptureAcceptedCount = 0;
+    uint64_t terrainDoodadDynamicSourceCount = 0;
+    uint64_t terrainDoodadWorldIdentityLikeCount = 0;
+    uint64_t terrainDoodadWorldNonIdentityCount = 0;
+    uint64_t terrainS1CaptureAttemptCount = 0;
+    uint64_t terrainS1CaptureAcceptedCount = 0;
+    uint64_t terrainS1WorldIdentityLikeCount = 0;
+    uint64_t terrainS1WorldNonIdentityCount = 0;
+    uint64_t terrainS1WorldNonFiniteCount = 0;
+    uint64_t terrainS1ForceIdentityWorldCount = 0;
+    uint64_t terrainS1WorldMatrixHash = 0;
+    uint64_t terrainS1WorldTranslationMilliMax = 0;
+    uint64_t stage13CaptureAttemptCount = 0;
+    uint64_t stage13CaptureRejectedNoDemandCount = 0;
+    uint64_t stage13CaptureRejectedAfterBeforeUiCount = 0;
+    uint64_t stage13CaptureConsideredCount = 0;
+    uint64_t stage13FreezeCopyBytes = 0;
+    uint64_t stage13CpuSnapshotCopyBytes = 0;
+    uint64_t stage13RetentionSnapshotBytes = 0;
+    uint64_t stage13ReplayDrawCount = 0;
+    uint64_t receiverCameraDeltaNano = 0;
+    uint64_t receiverSunDeltaNano = 0;
+    uint64_t receiverCsmDeltaNano = 0;
+    uint64_t receiverSnappedCenterDeltaTexelsNano = 0;
+    uint64_t receiverTexelSizeDeltaNano = 0;
+    uint64_t shadowMapRenderSerial = 0;
+    uint64_t uniqueGeometryCount = 0;
+    uint64_t staticPersistentCount = 0;
+    uint64_t dynamicPoseCount = 0;
+    uint64_t dynamicSkinnedOutputCount = 0;
+    uint64_t fallbackDrawCount = 0;
+    uint64_t drawTimeVBCacheCaptureCount = 0;
+    uint64_t drawTimeVBCacheConsumeHitCount = 0;
+    uint64_t drawTimeVBCacheConsumeMissCount = 0;
+    uint64_t drawTimeVBCacheRejectNoLayerContext = 0;
+    uint64_t drawTimeVBCacheRejectContractLookup = 0;
+    uint64_t drawTimeVBCacheRejectContractFreshness = 0;
+    uint64_t drawTimeVBCacheRejectContractStage = 0;
+    uint64_t drawTimeVBCacheRejectContractRenderFrame = 0;
+    uint64_t drawTimeVBCacheRejectContractInstance = 0;
+    uint64_t drawTimeVBCacheRejectContractSlice = 0;
+    uint64_t drawTimeVBCacheSameFrameDedupMiss = 0;
+    uint64_t semanticSceneSubmitted = 0;
+    uint64_t semanticSceneSubmittedSkinned = 0;
+    uint64_t skippedCasterCap = 0;
+    uint64_t skippedDistanceCull = 0;
+    bool hasShadowReceiver = false;
+    uint64_t replayCasterCount = 0;
+    uint64_t replayGeometryWork = 0;
+    bool hasShadowTaaTelemetry = false;
+    uint32_t shadowTaaRuntimeModuleEnabled = 0;
+    uint32_t shadowTaaRequestedMode = 0;
+    uint32_t shadowTaaEffectiveMode = 0;
+    uint32_t shadowTaaShaderMode = 0;
+    uint32_t shadowTaaBlockedSemanticDynamic = 0;
+    uint32_t shadowTaaBlockedSunMotion = 0;
+    uint32_t shadowTaaBlockedCsmFallback = 0;
+    uint32_t shadowTaaVisibilityExecuted = 0;
+    uint32_t shadowTaaMotionVectorExecuted = 0;
+    uint32_t shadowTaaReceiverExecuted = 0;
+    uint32_t shadowTaaHistoryWriteExecuted = 0;
+    uint32_t shadowTaaHistoryAdvanced = 0;
+    uint32_t shadowTaaHistoryAdvanceSkippedIncomplete = 0;
+    uint32_t shadowTaaHistoryValidBefore = 0;
+    uint32_t shadowTaaHistoryValidAfter = 0;
+    uint32_t shadowTaaHistoryInvalidationMask = 0;
+    uint64_t terrainDoodadPreparedCount = 0;
+    uint64_t terrainS1PreparedCount = 0;
+    uint64_t terrainDoodadCascade0DrawnCount = 0;
+    uint64_t terrainDoodadCascade1DrawnCount = 0;
+    uint64_t terrainDoodadCascade2DrawnCount = 0;
+    uint64_t terrainDoodadCascade3DrawnCount = 0;
+    uint64_t terrainS1Cascade0DrawnCount = 0;
+    uint64_t terrainS1Cascade1DrawnCount = 0;
+    uint64_t terrainS1Cascade2DrawnCount = 0;
+    uint64_t terrainS1Cascade3DrawnCount = 0;
+    uint32_t requestedShadowResolution = 0;
+    uint32_t effectiveShadowResolution = 0;
+    bool reusedLastCompleteShadowMap = false;
+    bool renderedCurrentPartialShadowMap = false;
+    bool hasPersistentGeometry = false;
+    uint64_t rejectCapacity = 0;
+    uint64_t rejectPositionBufferCreate = 0;
+    uint64_t rejectIndexBufferCreate = 0;
+    uint64_t rejectBlendBufferCreate = 0;
+    uint64_t rejectUvBufferCreate = 0;
+    uint64_t rejectRegistryInsert = 0;
+    uint64_t rejectOther = 0;
+    uint64_t createAttempts = 0;
+    uint64_t bytesNeededTotal = 0;
+    uint64_t bytesNeededMax = 0;
+    uint64_t bytesNeededLast = 0;
+    uint64_t forceGcRequests = 0;
+    uint64_t forceGcNoBytesFreed = 0;
+    uint64_t forceGcStillInsufficient = 0;
+    uint64_t forceGcBytesFreed = 0;
+    uint64_t capacityRejectAllCallers = 0;
+    uint64_t capacityFastReject = 0;
+    uint64_t expiryTokensPopped = 0;
+    uint64_t expiryTokensRequeued = 0;
+    uint64_t expiryStaleTokens = 0;
+    uint64_t expiryAgeEvictions = 0;
+    uint64_t expiryQueueSize = 0;
+    uint64_t bytesCap = 0;
+    uint64_t bytesUsed = 0;
+    uint64_t bytesEvicted = 0;
+    uint64_t bytesEvictedDelta = 0;
+    uint64_t liveGeometryCount = 0;
+    uint64_t s1EarlyEntryCount = 0;
+    uint64_t s1EarlyPersistentBackedCount = 0;
+    uint64_t s1EarlyPersistentReverseIndexCount = 0;
+    uint64_t s1EarlyFallbackBackedCount = 0;
+    uint64_t s1EarlyLogicalReferencedBytes = 0;
+    uint64_t s1EarlyAcceptedHitCount = 0;
+    uint64_t s1EarlyReplayPublishedCount = 0;
+    uint64_t s1EarlyReplayInstanceCount = 0;
+    uint64_t s1EarlyReplayFallbackCount = 0;
+    uint64_t s1EarlySourceMismatchEvictCount = 0;
+    bool s1EarlyReplayClosureMismatch = false;
 };
 
 /**
@@ -39,15 +211,24 @@ struct SectionTiming {
  */
 struct FrameSnapshot {
     uint64_t frameIndex = 0;
+    // Monotonic capture epoch. Unlike frameIndex, this is never reset and is
+    // therefore safe for delayed worker/GPU samples across report resets.
+    uint64_t frameEpoch = 0;
     double totalCpuMs = 0.0;
     double totalGpuMs = 0.0;
     double processCpuMs = 0.0;
     double mainThreadCpuMs = 0.0;
     double workerThreadsCpuMs = 0.0;
+    // GPU timestamp queries are asynchronous. A numeric zero is meaningful
+    // only after at least one query completed for this Present frame; without
+    // this bit, a missing sample was indistinguishable from measured 0 ms.
+    bool hasGpuTiming = false;
     bool hasProcessCpu = false;
     bool hasMainThreadCpu = false;
+    bool mainThreadCpuClampedToProcess = false;
     std::chrono::steady_clock::time_point timestamp;
     std::vector<SectionTiming> sections;
+    FrameWorkloadSnapshot workload;
 };
 
 /**
@@ -62,6 +243,55 @@ struct FrameSnapshot {
 class War3PerfMonitor final {
 public:
     ~War3PerfMonitor();
+
+    /**
+     * @brief One completed Present-to-Present interval of persistent geometry
+     * diagnostics.
+     *
+     * Reject counters refine the legacy persistentRejectCreateOrBudget
+     * ShadowCapture bucket. Creation counters include both shared-helper calls
+     * and the equivalent ShadowCapture capacity preflight. Pool and S1 early
+     * values are end-of-interval gauges, not additive byte traffic.
+     */
+    struct PersistentGeometryFrameStats {
+        uint64_t rejectCapacity = 0;
+        uint64_t rejectPositionBufferCreate = 0;
+        uint64_t rejectIndexBufferCreate = 0;
+        uint64_t rejectBlendBufferCreate = 0;
+        uint64_t rejectUvBufferCreate = 0;
+        uint64_t rejectRegistryInsert = 0;
+        uint64_t rejectOther = 0;
+        uint64_t createAttempts = 0;
+        uint64_t bytesNeededTotal = 0;
+        uint64_t bytesNeededMax = 0;
+        uint64_t bytesNeededLast = 0;
+        uint64_t forceGcRequests = 0;
+        uint64_t forceGcNoBytesFreed = 0;
+        uint64_t forceGcStillInsufficient = 0;
+        uint64_t forceGcBytesFreed = 0;
+        uint64_t capacityRejectAllCallers = 0;
+        uint64_t capacityFastReject = 0;
+        uint64_t expiryTokensPopped = 0;
+        uint64_t expiryTokensRequeued = 0;
+        uint64_t expiryStaleTokens = 0;
+        uint64_t expiryAgeEvictions = 0;
+        uint64_t expiryQueueSize = 0;
+        uint64_t bytesCap = 0;
+        uint64_t bytesUsed = 0;
+        uint64_t bytesEvicted = 0;
+        uint64_t liveGeometryCount = 0;
+        uint64_t s1EarlyEntryCount = 0;
+        uint64_t s1EarlyPersistentBackedCount = 0;
+        uint64_t s1EarlyPersistentReverseIndexCount = 0;
+        uint64_t s1EarlyFallbackBackedCount = 0;
+        uint64_t s1EarlyLogicalReferencedBytes = 0;
+        uint64_t s1EarlyAcceptedHitCount = 0;
+        uint64_t s1EarlyReplayPublishedCount = 0;
+        uint64_t s1EarlyReplayInstanceCount = 0;
+        uint64_t s1EarlyReplayFallbackCount = 0;
+        uint64_t s1EarlySourceMismatchEvictCount = 0;
+        bool s1EarlyReplayClosureMismatch = false;
+    };
 
     /**
      * @brief RAII 风格的分段计时器
@@ -82,6 +312,7 @@ public:
     private:
         War3PerfMonitor* m_monitor = nullptr;
         uint32_t m_id = 0;
+        uint64_t m_frameEpoch = 0;
         std::chrono::steady_clock::time_point m_cpuStart;
         Rc<DxvkGpuQuery> m_gpuStart;
         Rc<DxvkCommandList> m_ctx;
@@ -108,7 +339,9 @@ public:
     class ScopedCpuScope final {
     public:
         ScopedCpuScope() = default;
-        ScopedCpuScope(War3PerfMonitor* monitor, const char* name);
+        ScopedCpuScope(War3PerfMonitor* monitor, const char* name,
+                       uint32_t sampleWeight = 1,
+                       bool detailSample = false);
         ~ScopedCpuScope();
 
         ScopedCpuScope(const ScopedCpuScope&) = delete;
@@ -118,11 +351,16 @@ public:
 
     private:
         War3PerfMonitor* m_monitor = nullptr;
+        uint32_t m_sampleWeight = 1;
+        bool m_detailSample = false;
     };
 
     static War3PerfMonitor& instance();
 
     void setDevice(DxvkDevice* device);
+    // 仅为资源普查提供 allocator 数值快照；monitor 不拥有该指针。
+    void setResourceCensusAllocator(D3D9MemoryAllocator* allocator);
+    void clearResourceCensusAllocator(D3D9MemoryAllocator* allocator);
     void shutdown();
 
     // 帧管理
@@ -133,6 +371,11 @@ public:
     // 分段计时
     ScopedSection scope(const char* name, const Rc<DxvkCommandList>& ctx);
     ScopedCpuScope cpuScope(const char* name);
+    // 带采样权重的变体：popScope 时按 sampleWeight 加权（Horvitz-Thompson）。
+    ScopedCpuScope cpuScope(const char* name, uint32_t sampleWeight);
+    // 详细 trace 专用：默认是空 scope。仅 DXVK_WAR3_PERF_TRACE=detail 时
+    // 按 DXVK_WAR3_PERF_TRACE_SAMPLE_PERIOD 采样，适合 per-draw 热路径。
+    ScopedCpuScope cpuDetailScope(const char* name);
     /**
      * @brief 手工写入 CPU 采样（用于跨函数聚合结果上报）
      * @param name 节点名
@@ -144,10 +387,44 @@ public:
                       double cpuMs,
                       const char* parentPath = nullptr,
                       uint32_t calls = 1);
+
+    /**
+     * @brief 将已在调用端聚合的 CPU 采样挂到当前 TLS scope 下
+     *
+     * 用于微秒级热循环：循环内只累加裸计时，循环结束后一次写入，避免
+     * 每条记录 push/pop scope 的字符串、哈希和队列成本污染被测代码。
+     */
+    void addCpuSampleToCurrentScope(const char* name,
+                                    double cpuMs,
+                                    uint32_t calls = 1);
+
+    /**
+     * @brief 将聚合样本挂到“当前 scope 下的一个合成父节点”
+     *
+     * 调用端应先用 addCpuSampleToCurrentScope(parentName, ...) 写入父样本，
+     * 再用本接口写子阶段。这样低频裸计时仍能形成真实 parentPath 调用树，
+     * 无需为了建立层级而在热循环中 push/pop scope。
+     */
+    void addCpuSampleToCurrentScopeChild(const char* parentName,
+                                         const char* childName,
+                                         double cpuMs,
+                                         uint32_t calls = 1);
+
+    /**
+     * @brief 将聚合样本挂到当前 scope 下的任意相对父路径
+     *
+     * 只允许在低频 flush/frame 回填点调用；热循环不得构造 relativeParentPath。
+     * 该接口用于把固定 ID 的高频 Hook 聚合桶恢复成真实嵌套调用树。
+     */
+    void addCpuSampleToCurrentScopeRelative(const char* relativeParentPath,
+                                            const char* name,
+                                            double cpuMs,
+                                            uint32_t calls = 1);
     
     // 分层 Scope（用于无 CommandList 的纯 CPU 计时）
-    void pushScope(const char* name);
-    void popScope();
+    void pushScope(const char* name, uint32_t sampleWeight = 1,
+                   bool detailSample = false);
+    void popScope(uint32_t sampleWeight = 1);
 
     // 开关
     void setEnabled(bool enabled) { m_enabled.store(enabled, std::memory_order_relaxed); }
@@ -158,11 +435,18 @@ public:
     bool waitForPendingExports(uint32_t timeoutMs = 15000);
     uint32_t getPendingExportCount() const;
     void noteShadowBudgetFrame(const War3ShadowCaptureStats& stats);
+    void noteShadowMetadataFrame(uint64_t captureUs, uint64_t captureCalls);
+    void notePersistentGeometryFrame(
+        const PersistentGeometryFrameStats& stats);
+    // 登记业务帧主序号（m_war3ShadowPersistentFrameSerial），用于报告里
+    // 与 perf frameEpoch 建立对齐点。仅原子写，热路径无锁。
+    void noteBusinessFrameSerial(uint64_t serial);
     void noteShadowMapFallback(bool reusedLastComplete, bool renderedCurrentPartial);
     void noteShadowReceiverFrame(uint32_t replayCasterCount,
                                  uint64_t replayGeometryWork,
                                  uint32_t requestedShadowResolution,
                                  uint32_t effectiveShadowResolution);
+    void noteShadowTaaFrame(const ShadowTaaFrameTelemetry& telemetry);
 
     // 报告导出
     void exportHtmlReport(const std::string& outputPath);
@@ -185,10 +469,14 @@ private:
         double cpuSumMs = 0.0;
         uint64_t gpuCount = 0;
         double gpuSumMs = 0.0;
+        double cpuMaxMs = 0.0;
+        double gpuMaxMs = 0.0;
     };
 
     struct PendingSample {
         uint32_t id = 0;
+        uint32_t threadId = 0;
+        uint64_t frameEpoch = 0;
         double cpuMs = 0.0;
         Rc<DxvkGpuQuery> gpuBegin;
         Rc<DxvkGpuQuery> gpuEnd;
@@ -197,6 +485,12 @@ private:
     struct CpuOnlyScope {
         std::string name;
         std::string path;
+        std::string parentPath;
+        // 动态父路径：push 时 TLS 栈顶（可能为空）。绝对路径 name 在嵌套
+        // 上下文中，报表的 self/覆盖归因应以真实调用栈父节点为准。
+        std::string dynamicParentPath;
+        uint32_t sampleWeight = 1;
+        uint64_t frameEpoch = 0;
         std::chrono::steady_clock::time_point start;
     };
 
@@ -210,22 +504,45 @@ private:
 
     struct CpuDelta {
         uint32_t id = 0;
+        uint32_t threadId = 0;
+        uint64_t frameEpoch = 0;
         double cpuMs = 0.0;
+        double maxCpuMs = 0.0;
         uint32_t calls = 0;
     };
 
+    struct ProfilerCounters {
+        uint64_t coarseScopeAttempts = 0;
+        uint64_t detailScopeAttempts = 0;
+        uint64_t detailScopeSampled = 0;
+        uint64_t lateCpuDeltasRecovered = 0;
+        uint64_t lateGpuSamplesRecovered = 0;
+        uint64_t gpuSamplesDropped = 0;
+        uint64_t lateCpuDeltasDropped = 0;
+    };
+
     struct SectionIdCacheEntry {
-        const char* name = nullptr;
-        const char* parentPath = nullptr;
+        // 必须拥有字符串。Scope 的 name/parentPath 常来自栈上 std::string；
+        // 保存裸指针不仅永远命不中下一次同名 Scope，还会留下悬空地址。
+        std::string name;
+        std::string parentPath;
         size_t nameHash = 0;
         size_t parentHash = 0;
         uint32_t id = 0;
+        bool occupied = false;
     };
 
     struct ThreadCpuState {
-        std::array<SectionIdCacheEntry, 64> sectionIdCache = {};
+        // 一个 detail Hook 报告通常有 200-300 个动态 section。旧 64 项
+        // FIFO + 全表线性扫描会每帧抖出并反复进入全局 mutex。512 项
+        // power-of-two 表配合小范围哈希探测可让稳定路径留在 TLS。
+        std::array<SectionIdCacheEntry, 512> sectionIdCache = {};
         uint32_t nextCacheSlot = 0;
         std::vector<CpuDelta> pendingDeltas;
+        uint64_t coarseScopeAttempts = 0;
+        uint64_t detailScopeAttempts = 0;
+        uint64_t detailScopeSampled = 0;
+        uint64_t lateCpuDeltasDropped = 0;
     };
 
     struct ShadowBudgetAggregate {
@@ -251,6 +568,39 @@ private:
         uint64_t shadowReceiverAdaptiveResolutionFrames = 0;
         uint64_t shadowReceiverRequestedResolutionLast = 0;
         uint64_t shadowReceiverEffectiveResolutionLast = 0;
+        uint64_t shadowTaaFramesObserved = 0;
+        uint64_t shadowTaaRuntimeModuleDisabledFrames = 0;
+        uint64_t shadowTaaRequestedDirectFrames = 0;
+        uint64_t shadowTaaRequestedPrepassFrames = 0;
+        uint64_t shadowTaaRequestedTemporalFrames = 0;
+        uint64_t shadowTaaEffectiveDirectFrames = 0;
+        uint64_t shadowTaaEffectivePrepassFrames = 0;
+        uint64_t shadowTaaEffectiveTemporalFrames = 0;
+        uint64_t shadowTaaBlockedSemanticDynamicFrames = 0;
+        uint64_t shadowTaaBlockedSunMotionFrames = 0;
+        uint64_t shadowTaaBlockedCsmFallbackFrames = 0;
+        uint64_t shadowTaaVisibilityExecutedFrames = 0;
+        uint64_t shadowTaaMotionVectorExecutedFrames = 0;
+        uint64_t shadowTaaReceiverExecutedFrames = 0;
+        uint64_t shadowTaaHistoryWriteExecutedFrames = 0;
+        uint64_t shadowTaaHistoryAdvancedFrames = 0;
+        uint64_t shadowTaaHistoryAdvanceSkippedIncompleteFrames = 0;
+        uint64_t shadowTaaHistoryValidBeforeFrames = 0;
+        uint64_t shadowTaaHistoryValidAfterFrames = 0;
+        uint64_t shadowTaaHistoryInvalidatedFrames = 0;
+        std::array<uint64_t, 11> shadowTaaHistoryInvalidationReasonFrames = {};
+        uint32_t shadowTaaHistoryInvalidationMaskLast = 0;
+        uint32_t shadowTaaRequestedModeLast = 0;
+        uint32_t shadowTaaEffectiveModeLast = 0;
+        uint32_t shadowTaaShaderModeLast = 0;
+        uint64_t stage13CaptureAttemptCount = 0;
+        uint64_t stage13CaptureRejectedNoDemandCount = 0;
+        uint64_t stage13CaptureRejectedAfterBeforeUiCount = 0;
+        uint64_t stage13CaptureConsideredCount = 0;
+        uint64_t stage13FreezeCopyBytes = 0;
+        uint64_t stage13CpuSnapshotCopyBytes = 0;
+        uint64_t stage13RetentionSnapshotBytes = 0;
+        uint64_t stage13ReplayDrawCount = 0;
         uint64_t totalBudgetBytes = 0;
         uint64_t totalUsedBytes = 0;
         uint64_t maxBudgetBytes = 0;
@@ -296,6 +646,11 @@ private:
         uint64_t fallbackDrawCountWorldObject = 0;
         uint64_t fallbackDrawCountUnitObject = 0;
         uint64_t objectFallbackDrawCount = 0;
+        uint64_t drawTimeVBCacheCaptureCount = 0;
+        uint64_t drawTimeVBCacheConsumeHitCount = 0;
+        uint64_t drawTimeVBCacheConsumeMissCount = 0;
+        uint64_t drawTimeVBCacheRejectNoLayerContext = 0;
+        uint64_t drawTimeVBCacheSameFrameDedupMiss = 0;
         uint64_t semanticBridgeHit = 0;
         uint64_t semanticBridgeMiss = 0;
         uint64_t semanticBridgeBypassed = 0;
@@ -327,6 +682,13 @@ private:
         uint64_t semanticSceneMaterialBlendMode1Count = 0;
         uint64_t semanticSceneMaterialBlendMode2PlusCount = 0;
         uint64_t semanticSceneDirectCurrentDrawLayerIndexNonZeroCount = 0;
+        uint64_t semanticSceneFastAppendBoundsPoseAvailableCount = 0;
+        uint64_t semanticSceneFastAppendBoundsSceneReadSuccessCount = 0;
+        uint64_t semanticSceneFastAppendBoundsPoseDeltaLe1Count = 0;
+        uint64_t semanticSceneFastAppendBoundsPoseDeltaLe4Count = 0;
+        uint64_t semanticSceneFastAppendBoundsPoseDeltaLe16Count = 0;
+        uint64_t semanticSceneFastAppendBoundsPoseDeltaGt16Count = 0;
+        uint32_t semanticSceneFastAppendBoundsPoseDeltaMaxMilli = 0;
         uint64_t semanticSceneLivePaletteRefreshAttemptCount = 0;
         uint64_t semanticSceneLivePaletteRefreshHitCount = 0;
         uint64_t semanticSceneLivePaletteRefreshMissCount = 0;
@@ -464,6 +826,13 @@ private:
         uint64_t semanticSceneShadowManifestObjectCoreEpochSkippedIncompleteCount = 0;
         uint64_t semanticSceneShadowManifestObjectCoreEpochMissingPartCount = 0;
         uint64_t semanticSceneShadowManifestObjectCoreEpochSelfRenewRejectCount = 0;
+        uint64_t semanticSceneShadowManifestCorePartPrunedOnLeaseExpiryCount = 0;
+        uint64_t semanticSceneShadowManifestCoreObjectEmptiedOnLeaseExpiryCount = 0;
+        uint64_t semanticSceneShadowManifestLeaseExpiredBackingOnlyCount = 0;
+        uint64_t semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount = 0;
+        uint64_t semanticSceneShadowManifestMissingRequiredPartCount = 0;
+        uint64_t semanticSceneShadowManifestGraceUsedCount = 0;
+        uint64_t semanticSceneShadowManifestTombstoneRetiredCount = 0;
         // Phase 7.28：skinned palette content stability probe。
         uint64_t semanticSceneSubmittedSkinnedPaletteSourceNoneCount = 0;
         uint64_t semanticSceneSubmittedSkinnedPaletteSourceDrawTimeCapturedCount = 0;
@@ -533,6 +902,9 @@ private:
         uint64_t semanticSceneShadowManifestCModelPoseHitCount = 0;
         uint64_t semanticSceneShadowManifestCModelPoseMissCount = 0;
         uint64_t semanticSceneShadowManifestCModelPoseNoRuntimeCount = 0;
+        uint64_t
+            semanticSceneShadowManifestPoseFreshGenerationVerifierMismatchCount =
+                0;
         uint64_t semanticSceneShadowManifestCModelPoseLastRuntimeModelPtr = 0;
         uint64_t semanticSceneShadowManifestCModelPoseLastMatrixCount = 0;
         uint64_t semanticSceneShadowManifestCModelPoseLastMatrixHash = 0;
@@ -617,6 +989,60 @@ private:
         uint64_t semanticSceneRejectedGeometry = 0;
         uint64_t semanticSceneRejectedGeometryFrameLocal = 0;
         uint64_t semanticSceneRejectedGeometryPersistent = 0;
+        uint64_t persistentRejectNoIdentity = 0;
+        uint64_t persistentRejectUnsupportedMode = 0;
+        uint64_t persistentRejectDynamicSource = 0;
+        uint64_t persistentRejectAlphaBlend = 0;
+        uint64_t persistentRejectMissingStorage = 0;
+        uint64_t persistentRejectCreateOrBudget = 0;
+        // Detailed refinement of persistentRejectCreateOrBudget. These are
+        // additive event counters over the report recording window.
+        uint64_t persistentRejectCapacity = 0;
+        uint64_t persistentRejectPositionBufferCreate = 0;
+        uint64_t persistentRejectIndexBufferCreate = 0;
+        uint64_t persistentRejectBlendBufferCreate = 0;
+        uint64_t persistentRejectUvBufferCreate = 0;
+        uint64_t persistentRejectRegistryInsert = 0;
+        uint64_t persistentRejectOther = 0;
+        // Persistent pool observation. *Last/*Max are gauges. NeededTotal is
+        // additive requested byte traffic; UsedGaugeSum exists only to derive
+        // an average of end-of-Present gauge samples.
+        uint64_t persistentDiagnosticsFramesObserved = 0;
+        uint64_t persistentCreateAttempts = 0;
+        uint64_t persistentPoolBytesCapLast = 0;
+        uint64_t persistentPoolBytesUsedLast = 0;
+        uint64_t persistentPoolBytesUsedMax = 0;
+        uint64_t persistentPoolBytesUsedGaugeSum = 0;
+        uint64_t persistentPoolBytesNeededLast = 0;
+        uint64_t persistentPoolBytesNeededMax = 0;
+        uint64_t persistentPoolBytesNeededTotal = 0;
+        uint64_t persistentPoolBytesEvictedLast = 0;
+        uint64_t persistentPoolBytesEvictedDelta = 0;
+        uint64_t persistentPoolLiveGeometryCountLast = 0;
+        uint64_t persistentPoolLiveGeometryCountMax = 0;
+        uint64_t persistentForceGcRequests = 0;
+        uint64_t persistentForceGcNoBytesFreed = 0;
+        uint64_t persistentForceGcStillInsufficient = 0;
+        uint64_t persistentForceGcBytesFreed = 0;
+        uint64_t persistentCapacityRejectAllCallers = 0;
+        uint64_t persistentCapacityFastReject = 0;
+        uint64_t persistentS1EarlyEntryCountLast = 0;
+        uint64_t persistentS1EarlyEntryCountMax = 0;
+        uint64_t persistentS1EarlyPersistentBackedCountLast = 0;
+        uint64_t persistentS1EarlyPersistentBackedCountMax = 0;
+        uint64_t persistentS1EarlyPersistentReverseIndexCountLast = 0;
+        uint64_t persistentS1EarlyPersistentReverseIndexCountMax = 0;
+        uint64_t persistentS1EarlyPersistentReverseIndexMismatchFrames = 0;
+        uint64_t persistentS1EarlyFallbackBackedCountLast = 0;
+        uint64_t persistentS1EarlyFallbackBackedCountMax = 0;
+        uint64_t persistentS1EarlyLogicalReferencedBytesLast = 0;
+        uint64_t persistentS1EarlyLogicalReferencedBytesMax = 0;
+        uint64_t persistentS1EarlyAcceptedHitCount = 0;
+        uint64_t persistentS1EarlyReplayPublishedCount = 0;
+        uint64_t persistentS1EarlyReplayInstanceCount = 0;
+        uint64_t persistentS1EarlyReplayFallbackCount = 0;
+        uint64_t persistentS1EarlySourceMismatchEvictCount = 0;
+        uint64_t persistentS1EarlyReplayClosureMismatchFrames = 0;
         uint64_t semanticFallbackPruned = 0;
         uint64_t semanticFallbackPrunedByHandle = 0;
         uint64_t semanticFallbackPrunedByWorldObjectEntry = 0;
@@ -636,9 +1062,52 @@ private:
     };
 
     struct ExportSnapshot {
+        struct IdentitySameFrameDedupStats {
+            uint64_t attempts = 0;
+            uint64_t hits = 0;
+            uint64_t missMissingAlias = 0;
+            uint64_t missCrossFrame = 0;
+            uint64_t missNoBatchProof = 0;
+            uint64_t missIncomplete = 0;
+            uint64_t missInputMismatch = 0;
+            uint64_t missAliasConflict = 0;
+            uint64_t missRuntimeOwner = 0;
+            uint64_t batchMarked = 0;
+        };
+
         std::deque<FrameSnapshot> frameHistory;
         std::vector<SectionStats> sections;
         ShadowBudgetAggregate shadowBudgetAggregate;
+        uint32_t processId = 0;
+        DWORD mainThreadId = 0;
+        uint64_t processStartFileTime100ns = 0;
+        bool gpuSkinHooksEnabled = false;
+        gpu_skin::GpuSkinRuntimeConfig gpuSkinRuntimeConfig;
+        gpu_skin::NativeBridgeFingerprint gpuSkinNativeFingerprint;
+        gpu_skin::NativeBridgeCounters gpuSkinNativeCounters;
+        resource_census::ResourceResidencySnapshot resourceResidency;
+        render::WorldObjectsPhase1TelemetrySummary
+            worldObjectsMaintenanceTiming;
+        IdentitySameFrameDedupStats modelIdentitySameFrameDedup;
+        IdentitySameFrameDedupStats shadowIdentitySameFrameDedup;
+        ProfilerCounters profilerCounters;
+        bool detailTraceEnabled = false;
+        uint32_t detailTraceSamplePeriod = 0;
+        // 报告元数据：构建/配置身份与帧序号对齐（schema v9）。
+        struct ReportMeta {
+            std::string schemaVersion = "9";
+            std::string dllSha256Hex;
+            uint64_t dllFileSize = 0;
+            std::string buildTimestamp;
+            std::string runtimeProfile;
+            std::string enabledModulesCsv;
+            std::string disabledModulesCsv;
+            std::string perfEnvJson;
+            uint64_t perfFrameEpoch = 0;
+            uint64_t businessFrameSerial = 0;
+            bool monitorDisabledByEnv = false;
+        };
+        ReportMeta meta;
     };
 
     struct ExportJob {
@@ -660,8 +1129,12 @@ private:
     void flushThreadCpuDeltas(ThreadCpuState& state);
     void flushCurrentThreadCpuDeltas();
     static ThreadCpuState& threadCpuState();
+    bool shouldSampleDetailScope(ThreadCpuState& state) const;
+    static bool detailTraceEnabled();
+    static uint32_t detailTraceSamplePeriod();
     Rc<DxvkGpuQuery> writeTimestamp(const Rc<DxvkCommandList>& ctx);
     void submitSample(uint32_t id,
+                      uint64_t frameEpoch,
                       double cpuMs,
                       Rc<DxvkGpuQuery> gpuBegin,
                       Rc<DxvkGpuQuery> gpuEnd);
@@ -672,7 +1145,7 @@ private:
     bool readThreadCpu100ns(HANDLE threadHandle, uint64_t& out100ns) const;
     HANDLE ensureMainThreadHandleLocked(DWORD tid);
     void closeMainThreadHandleLocked();
-    CpuProbeSnapshot captureCpuProbeLocked();
+    CpuProbeSnapshot captureCpuProbeLocked(bool frameEnd);
     ExportSnapshot captureExportSnapshotLocked() const;
     std::string resolveExportPath(const std::string& outputPath) const;
     double resolveReportWindowSec() const;
@@ -684,6 +1157,8 @@ private:
                                              double windowSec) const;
 
     DxvkDevice* m_device = nullptr;
+    // 非 owning；只允许在 m_mutex 下登记、清理或读取。
+    D3D9MemoryAllocator* m_resourceCensusAllocator = nullptr;
     double m_timestampPeriodNs = 0.0;
     std::atomic<bool> m_enabled { true };
     std::atomic<bool> m_recording { false };
@@ -693,6 +1168,10 @@ private:
     std::unordered_map<std::string, uint32_t> m_sectionIds;
     std::vector<SectionStats> m_sections;
     std::vector<PendingSample> m_pending;
+    // 键=(threadId<<32)|sectionId；只在 TLS 批量 flush 时触及，不能放入
+    // 默认 per-draw 快路径。
+    std::unordered_map<uint64_t, SectionStats> m_threadSections;
+    ProfilerCounters m_profilerCounters = {};
 
     // 帧历史
     std::deque<FrameSnapshot> m_frameHistory;
@@ -701,9 +1180,12 @@ private:
 
     // 当前帧数据
     uint64_t m_frameIndex = 0;
+    uint64_t m_frameEpochSerial = 0;
     std::chrono::steady_clock::time_point m_frameStart;
     CpuProbeSnapshot m_frameCpuProbeStart;
+    FrameWorkloadSnapshot m_currentFrameWorkload = {};
     bool m_inFrame = false;
+    std::atomic<uint64_t> m_activeFrameEpoch { 0 };
     HANDLE m_mainThreadHandle = nullptr;
     DWORD m_mainThreadHandleTid = 0;
 
@@ -723,6 +1205,7 @@ private:
     bool m_exportAbortRequested = false;
     size_t m_exportInFlight = 0;
     std::atomic<uint32_t> m_pendingExportJobs { 0 };
+    std::atomic<uint64_t> m_lastBusinessFrameSerial { 0 };
     ShadowBudgetAggregate m_shadowBudgetAggregate = {};
 
     friend class ScopedSection;

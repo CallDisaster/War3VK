@@ -45,7 +45,20 @@ bool TlsfPool_IsInitialized();
 void *TlsfPool_Alloc(size_t size);
 void *TlsfPool_AllocAligned(size_t size, size_t alignment);
 void *TlsfPool_Realloc(void *ptr, size_t newSize);
-void TlsfPool_Free(void *ptr);
+/** @brief 只允许原地调整；失败时原块仍有效。 */
+void *TlsfPool_ReallocInPlace(void *ptr, size_t newSize);
+bool TlsfPool_Free(void *ptr);
+
+using TlsfPoolExactBlockInspector = bool (*)(void *block, void *context);
+
+/**
+ * @brief 在 allocator 锁内验证精确块起点，并调用只读/原子 inspector。
+ *
+ * inspector 运行期间不得再次调用 TlsfPool；该锁域保证扩展池不会同时退役。
+ */
+bool TlsfPool_InspectExactBlock(void *ptr,
+                                TlsfPoolExactBlockInspector inspector,
+                                void *context);
 
 /** @return ptr 是否来自本池（通过地址范围判断）。 */
 bool TlsfPool_IsFromPool(void *ptr);
@@ -101,12 +114,7 @@ void TlsfPool_PrintStats();
 // 线程安全控制
 // ============================================================================
 
-/**
- * @brief 禁用内部锁（仅在确认单线程访问时使用，显著减少开销）。
- *
- * War3 的 Storm 分配在游戏主线程执行，Shadow Arena 也在主线程。
- * 若确认无多线程竞争，调用此函数可省去 Spinlock 开销。
- */
+/** @brief 兼容旧调用；生产实现会拒绝禁用 allocator 生命周期锁。 */
 void TlsfPool_DisableLock();
 void TlsfPool_EnableLock();
 bool TlsfPool_IsLockEnabled();

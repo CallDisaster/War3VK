@@ -1,5 +1,6 @@
 #include "war3_visible_renderables.h"
 
+#include "war3_shadow_lifecycle.h"
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_scene.h"
 #include "../core/war3_game_structs.h"
@@ -10,14 +11,18 @@
 #include "../model/war3_model_resource_cache.h"
 #include "../model/war3_model_registry.h"
 #include "war3_current_draw_contract.h"
+#include "war3_render_state.h"
 #include "war3_render_objects.h"
 #include "war3_render_queue_tracker.h"
 #include "war3_shadow_object_registry.h"
 #include "war3_shadow_runtime_bridge.h"
 #include "../../util/util_bit.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cstdlib>
+#include <memory>
 #include <unordered_set>
 
 namespace dxvk::war3::render {
@@ -34,6 +39,160 @@ uint64_t VisibleRenderablePartLayerKey(void* renderablePart,
       hash, uint64_t(reinterpret_cast<uintptr_t>(renderablePart)));
   hash = bit::fnv1a_iter(hash, layerIndex);
   return hash;
+}
+
+constexpr uint32_t kInvalidSemanticMergeRecordIndex = 0xFFFFFFFFu;
+
+struct VisibleSemanticMergeIndexConfig {
+  // The verifier maintains and probes the index, but does not select the
+  // production path unless the independent enabled flag is set.
+  bool enabled = false;
+  bool verify = false;
+  bool assertOnMismatch = false;
+};
+
+const VisibleSemanticMergeIndexConfig&
+GetVisibleSemanticMergeIndexConfig() {
+  static const VisibleSemanticMergeIndexConfig s_config = []() {
+    const auto readEnabled = [](const char* name) {
+      const char* raw = std::getenv(name);
+      return raw != nullptr && raw[0] == '1';
+    };
+    VisibleSemanticMergeIndexConfig config = {};
+    config.enabled =
+        readEnabled("DXVK_WAR3_VISIBLE_SEMANTIC_MERGE_INDEX");
+    config.assertOnMismatch =
+        readEnabled("DXVK_WAR3_VISIBLE_SEMANTIC_MERGE_INDEX_VERIFY_ASSERT");
+    config.verify =
+        readEnabled("DXVK_WAR3_VISIBLE_SEMANTIC_MERGE_INDEX_VERIFY") ||
+        config.assertOnMismatch;
+    return config;
+  }();
+  return s_config;
+}
+
+bool War3VisibleSemanticMergeIndexEnabled() {
+  return GetVisibleSemanticMergeIndexConfig().enabled;
+}
+
+bool War3VisibleSemanticMergeIndexVerifierAssertEnabled() {
+  return GetVisibleSemanticMergeIndexConfig().assertOnMismatch;
+}
+
+bool War3VisibleSemanticMergeIndexVerifierEnabled() {
+  return GetVisibleSemanticMergeIndexConfig().verify;
+}
+
+bool War3VisibleSemanticMergeIndexMaintained() {
+  const auto& config = GetVisibleSemanticMergeIndexConfig();
+  return config.enabled || config.verify;
+}
+
+template <typename Fn>
+void ForEachDistinctSemanticMergePointer(const VisibleRenderableRecord& record,
+                                         Fn&& fn) {
+  if (record.renderablePart != nullptr)
+    fn(record.renderablePart);
+  if (record.payload != nullptr && record.payload != record.renderablePart)
+    fn(record.payload);
+}
+
+void IndexSemanticMergeRecord(VisibleRenderableRegistry::Snapshot& snap,
+                              uint32_t index) {
+  if (!War3VisibleSemanticMergeIndexMaintained() ||
+      index >= snap.records.size()) {
+    return;
+  }
+
+  ForEachDistinctSemanticMergePointer(
+      snap.records[index],
+      [&](void* pointer) { snap.semanticMergeByPointer.emplace(pointer, index); });
+}
+
+void RefreshSemanticMergeRecordIndex(
+    VisibleRenderableRegistry::Snapshot& snap, uint32_t index,
+    void* oldRenderablePart, void* oldPayload) {
+  if (!War3VisibleSemanticMergeIndexMaintained() ||
+      index >= snap.records.size()) {
+    return;
+  }
+
+  const VisibleRenderableRecord& record = snap.records[index];
+  if (record.renderablePart == oldRenderablePart &&
+      record.payload == oldPayload) {
+    return;
+  }
+
+  const auto oldHadPointer = [&](void* pointer) {
+    return pointer != nullptr &&
+           (pointer == oldRenderablePart || pointer == oldPayload);
+  };
+  const auto newHasPointer = [&](void* pointer) {
+    return pointer != nullptr &&
+           (pointer == record.renderablePart || pointer == record.payload);
+  };
+  const auto erasePointerIndex = [&](void* pointer) {
+    if (pointer == nullptr || newHasPointer(pointer))
+      return;
+    const auto range = snap.semanticMergeByPointer.equal_range(pointer);
+    for (auto it = range.first; it != range.second;) {
+      if (it->second == index)
+        it = snap.semanticMergeByPointer.erase(it);
+      else
+        ++it;
+    }
+  };
+
+  erasePointerIndex(oldRenderablePart);
+  if (oldPayload != oldRenderablePart)
+    erasePointerIndex(oldPayload);
+
+  ForEachDistinctSemanticMergePointer(record, [&](void* pointer) {
+    if (!oldHadPointer(pointer))
+      snap.semanticMergeByPointer.emplace(pointer, index);
+  });
+}
+
+void RebuildSemanticMergePointerIndex(
+    VisibleRenderableRegistry::Snapshot& snap) {
+  snap.semanticMergeByPointer.clear();
+  if (!War3VisibleSemanticMergeIndexMaintained())
+    return;
+
+  snap.semanticMergeByPointer.reserve(snap.records.size() * 2u);
+  for (uint32_t index = 0u; index < snap.records.size(); ++index) {
+    ForEachDistinctSemanticMergePointer(
+        snap.records[index],
+        [&](void* pointer) {
+          snap.semanticMergeByPointer.emplace(pointer, index);
+        });
+  }
+}
+
+bool VerifySemanticMergePointerIndex(
+    const VisibleRenderableRegistry::Snapshot& snap) {
+  using Entry = std::pair<uintptr_t, uint32_t>;
+  static thread_local std::vector<Entry> s_expected;
+  static thread_local std::vector<Entry> s_actual;
+  s_expected.clear();
+  s_actual.clear();
+  s_expected.reserve(snap.records.size() * 2u);
+  s_actual.reserve(snap.semanticMergeByPointer.size());
+
+  for (uint32_t index = 0u; index < snap.records.size(); ++index) {
+    ForEachDistinctSemanticMergePointer(
+        snap.records[index], [&](void* pointer) {
+          s_expected.emplace_back(
+              reinterpret_cast<uintptr_t>(pointer), index);
+        });
+  }
+  for (const auto& [pointer, index] : snap.semanticMergeByPointer) {
+    s_actual.emplace_back(reinterpret_cast<uintptr_t>(pointer), index);
+  }
+
+  std::sort(s_expected.begin(), s_expected.end());
+  std::sort(s_actual.begin(), s_actual.end());
+  return s_expected == s_actual;
 }
 
 uint64_t HashTaggedPtr(uint32_t tag, const void* value) {
@@ -141,6 +300,25 @@ bool War3SemanticShadowManifestCModelPoseProbeAllowed() {
     if (readU32("DXVK_WAR3_SEMANTIC_SHADOW_MANIFEST_CMODEL_POSE_DIAG", 0u) != 0u)
       return true;
     return false;
+  }();
+  return s_enabled;
+}
+
+bool War3SemanticShadowManifestPoseGenerationVerifierAssertEnabled() {
+  static const bool s_enabled = []() {
+    const char* raw = std::getenv(
+        "DXVK_WAR3_SEMANTIC_MANIFEST_POSE_GENERATION_VERIFY_ASSERT");
+    return raw != nullptr && raw[0] == '1';
+  }();
+  return s_enabled;
+}
+
+bool War3SemanticShadowManifestPoseGenerationVerifierEnabled() {
+  static const bool s_enabled = []() {
+    const char* raw = std::getenv(
+        "DXVK_WAR3_SEMANTIC_MANIFEST_POSE_GENERATION_VERIFY");
+    return (raw != nullptr && raw[0] == '1') ||
+           War3SemanticShadowManifestPoseGenerationVerifierAssertEnabled();
   }();
   return s_enabled;
 }
@@ -1307,6 +1485,9 @@ void MergeIdentityFromPrior(const VisibleRenderableRecord &prior,
     record.modelResourcePtr = prior.modelResourcePtr;
   if (record.modelKey == 0u)
     record.modelKey = prior.modelKey;
+  record.pathBlocker =
+      record.pathBlocker || prior.pathBlocker ||
+      dxvk::war3::internal::IsPathBlockerFourCc(record.identity.rawcode);
   // Do not copy per-renderable geoset/slice data from a sibling or prior record.
   // Multiple units and multiple submeshes can share sceneNode/modelResource keys,
   // and copying the previous geoset here produced the "one caster fragment on
@@ -1484,8 +1665,13 @@ void VisibleRenderableRegistry::appendRecord(Snapshot &snap,
     record.payload = record.renderablePart;
   }
 
+  record.pathBlocker =
+      record.pathBlocker ||
+      dxvk::war3::internal::IsPathBlockerFourCc(record.identity.rawcode);
+
   const uint32_t index = static_cast<uint32_t>(snap.records.size());
   snap.records.emplace_back(record);
+  IndexSemanticMergeRecord(snap, index);
 
   if constexpr (!dxvk::war3::internal::
                     kWar3RuntimeConfigDeferSemanticVisibleIndexBuild ||
@@ -1619,6 +1805,8 @@ void RebuildVisibleSnapshotIndexes(VisibleRenderableRegistry::Snapshot &snap) {
     else
       ++snap.mainQueueCount;
   }
+
+  RebuildSemanticMergePointerIndex(snap);
 }
 
 void HydrateVisibleSnapshotBasicFields(VisibleRenderableRegistry::Snapshot &snap) {
@@ -1638,7 +1826,10 @@ void HydrateVisibleSnapshotBasicFields(VisibleRenderableRegistry::Snapshot &snap
   s_partCache.reserve(snap.records.size());
   auto &partCache = s_partCache;
 
-  for (VisibleRenderableRecord &record : snap.records) {
+  for (uint32_t index = 0u; index < snap.records.size(); ++index) {
+    VisibleRenderableRecord& record = snap.records[index];
+    void* const oldRenderablePart = record.renderablePart;
+    void* const oldPayload = record.payload;
     if (record.payload == nullptr)
       record.payload = record.renderablePart;
 
@@ -1669,6 +1860,8 @@ void HydrateVisibleSnapshotBasicFields(VisibleRenderableRegistry::Snapshot &snap
       record.identity.sceneNode = record.sceneNode;
       changed = true;
     }
+
+    RefreshSemanticMergeRecordIndex(snap, index, oldRenderablePart, oldPayload);
   }
 
   if constexpr (dxvk::war3::internal::
@@ -1782,12 +1975,15 @@ void HydrateVisibleSnapshotStaticSemanticFields(
   size_t hydrated = 0u;
   bool changed = false;
 
-  for (VisibleRenderableRecord& record : snap.records) {
+  for (uint32_t index = 0u; index < snap.records.size(); ++index) {
+    VisibleRenderableRecord& record = snap.records[index];
     if (!ShouldHydrateStaticSemanticRecord(record))
       continue;
     if (hydrated >= kMaxStaticHydrateRecords)
       break;
     ++hydrated;
+    void* const oldRenderablePart = record.renderablePart;
+    void* const oldPayload = record.payload;
 
     if (record.payload == nullptr)
       record.payload = record.renderablePart;
@@ -1810,6 +2006,7 @@ void HydrateVisibleSnapshotStaticSemanticFields(
     const bool hadGeoset = record.HasResolvedGeoset();
     ResolveGeosetMetadata(record);
     changed |= !hadGeoset && record.HasResolvedGeoset();
+    RefreshSemanticMergeRecordIndex(snap, index, oldRenderablePart, oldPayload);
   }
 
   if ((changed || dxvk::war3::internal::
@@ -1854,9 +2051,29 @@ void VisibleRenderableRegistry::beginFrame() {
   snap.semanticCandidateCallCount = 0u;
   snap.semanticCandidateMergedCount = 0u;
   snap.semanticCandidateAppendedCount = 0u;
+  snap.semanticMergeFallbackCallCount = 0u;
+  snap.semanticMergeIndexLookupCount = 0u;
+  snap.semanticMergeIndexHitCount = 0u;
+  snap.semanticMergeIndexCandidateVisitCount = 0u;
+  snap.semanticMergeLegacyScanCallCount = 0u;
+  snap.semanticMergeLegacyScanRecordVisitCount = 0u;
+  snap.semanticMergeVerifierCallCount = 0u;
+  snap.semanticMergeVerifierLegacyScanRecordVisitCount = 0u;
+  snap.semanticMergeVerifierMismatchCount = 0u;
+  snap.semanticMergeVerifierSelectionMismatchCount = 0u;
+  snap.semanticMergeVerifierAuxIndexCheckCount = 0u;
+  snap.semanticMergeVerifierAuxIndexMismatchCount = 0u;
   snap.transparentEntryCallCount = 0u;
   if (reserveRecord)
     snap.records.reserve(reserveRecord);
+
+  const size_t reserveSemanticMergePointers =
+      snap.lastSemanticMergePointerCount;
+  snap.semanticMergeByPointer.clear();
+  if (War3VisibleSemanticMergeIndexMaintained() &&
+      reserveSemanticMergePointers != 0u) {
+    snap.semanticMergeByPointer.reserve(reserveSemanticMergePointers);
+  }
 
   constexpr bool kMaintainIndexes =
       !dxvk::war3::internal::kWar3RuntimeConfigDeferSemanticVisibleIndexBuild ||
@@ -1975,11 +2192,26 @@ void VisibleRenderableRegistry::endFrame() {
     HydrateVisibleSnapshotStaticSemanticFields(snap);
   }
 
+  if (War3VisibleSemanticMergeIndexVerifierEnabled()) {
+    ++snap.semanticMergeVerifierAuxIndexCheckCount;
+    const bool auxIndexMismatch =
+        !VerifySemanticMergePointerIndex(snap);
+    if (auxIndexMismatch) {
+      ++snap.semanticMergeVerifierAuxIndexMismatchCount;
+      ++snap.semanticMergeVerifierMismatchCount;
+      if (War3VisibleSemanticMergeIndexVerifierAssertEnabled()) {
+        assert(!auxIndexMismatch &&
+               "War3 visible semantic merge auxiliary index mismatch");
+      }
+    }
+  }
+
   snap.lastRecordCount = snap.records.size();
   snap.lastPayloadCount = snap.byPayload.size();
   snap.lastRenderablePartCount = snap.byRenderablePart.size();
   snap.lastRenderablePartLayerCount = snap.byRenderablePartLayer.size();
   snap.lastRenderablePartRecordCount = snap.renderablePartRecordCount.size();
+  snap.lastSemanticMergePointerCount = snap.semanticMergeByPointer.size();
   snap.lastWorldObjectCount = snap.byWorldObjectEntry.size();
   snap.lastHandleCount = snap.byHandle.size();
   snap.lastSceneNodeCount = snap.bySceneNode.size();
@@ -1990,15 +2222,26 @@ void VisibleRenderableRegistry::endFrame() {
   snap.lastModelMetadataCount = snap.modelMetadataBySceneNode.size();
   m_publishedIndex.store(m_writeIndex, std::memory_order_release);
 
-  static std::atomic<uint32_t> s_logCount{0};
-  const uint32_t logCount = s_logCount.fetch_add(1, std::memory_order_relaxed);
-  if ((snap.mainQueueCount != 0 || snap.transparentCount != 0) &&
-      (logCount < 12u || (logCount % 120u) == 0u)) {
-    dxvk::war3dbg::Print(
+  // This is diagnostic output, not part of the registry publication
+  // contract.  Print() flushes a console synchronously and can stall the
+  // render thread for tens of milliseconds on an isolated desktop.  Keep the
+  // old cadence when render logging is explicitly requested, but make the
+  // production path completely silent.
+  if (dxvk::war3dbg::RenderLogEnabled()) {
+    static std::atomic<uint32_t> s_logCount{0};
+    const uint32_t logCount =
+        s_logCount.fetch_add(1, std::memory_order_relaxed);
+    if ((snap.mainQueueCount != 0 || snap.transparentCount != 0) &&
+        (logCount < 12u || (logCount % 120u) == 0u)) {
+      dxvk::war3dbg::Print(
         "DXVK VisibleManifest: frame=%llu total=%zu main=%zu transparent=%zu "
         "payload=%zu part=%zu entry=%zu handle=%zu scene=%zu mesh=%zu "
         "runtime=%zu rtGeo=%zu rtGeoData=%zu ranges=%llu rangeRecords=%llu "
         "semanticCalls=%llu semanticMerged=%llu semanticAppended=%llu "
+        "semanticFallback=%llu mergeIndexLookups=%llu mergeIndexHits=%llu "
+        "mergeIndexVisits=%llu mergeScans=%llu mergeScanRecords=%llu "
+        "mergeVerify=%llu mergeAuxChecks=%llu mergeMismatch=%llu "
+        "mergeIndexEntries=%zu "
         "transparentCalls=%llu\n",
         static_cast<unsigned long long>(
             m_frameNumber.load(std::memory_order_relaxed)),
@@ -2013,7 +2256,22 @@ void VisibleRenderableRegistry::endFrame() {
         static_cast<unsigned long long>(snap.semanticCandidateCallCount),
         static_cast<unsigned long long>(snap.semanticCandidateMergedCount),
         static_cast<unsigned long long>(snap.semanticCandidateAppendedCount),
+        static_cast<unsigned long long>(snap.semanticMergeFallbackCallCount),
+        static_cast<unsigned long long>(snap.semanticMergeIndexLookupCount),
+        static_cast<unsigned long long>(snap.semanticMergeIndexHitCount),
+        static_cast<unsigned long long>(
+            snap.semanticMergeIndexCandidateVisitCount),
+        static_cast<unsigned long long>(snap.semanticMergeLegacyScanCallCount),
+        static_cast<unsigned long long>(
+            snap.semanticMergeLegacyScanRecordVisitCount),
+        static_cast<unsigned long long>(snap.semanticMergeVerifierCallCount),
+        static_cast<unsigned long long>(
+            snap.semanticMergeVerifierAuxIndexCheckCount),
+        static_cast<unsigned long long>(
+            snap.semanticMergeVerifierMismatchCount),
+        snap.semanticMergeByPointer.size(),
         static_cast<unsigned long long>(snap.transparentEntryCallCount));
+    }
   }
 }
 
@@ -2077,6 +2335,7 @@ void VisibleRenderableRegistry::registerMainQueueRange(
 
     VisibleRenderableRecord record = {};
     record.queueKind = VisibleRenderableQueueKind::MainQueue;
+    record.stage = static_cast<int16_t>(War3RenderState::GetStage());
     record.payload = *reinterpret_cast<void **>(
         element + RenderBatchElementOffsets::BatchEntry);
     record.renderablePart = *reinterpret_cast<void **>(
@@ -2185,10 +2444,7 @@ bool VisibleRenderableRegistry::registerSemanticCandidate(
         }
         return true;
       };
-  auto mergeCandidateIntoExisting = [&](uint32_t index) {
-    if (index >= snap.records.size())
-      return false;
-    VisibleRenderableRecord& existing = snap.records[index];
+  auto mergeCandidateFields = [&](VisibleRenderableRecord& existing) {
     if (!canMergeVisibleSubpart(existing, candidate))
       return false;
     if (existing.payload == nullptr && candidate.payload != nullptr) {
@@ -2258,6 +2514,23 @@ bool VisibleRenderableRegistry::registerSemanticCandidate(
       existing.identity.kind = candidate.identity.kind;
     if (existing.identity.groupIdx < 0)
       existing.identity.groupIdx = candidate.identity.groupIdx;
+    existing.pathBlocker =
+        existing.pathBlocker || candidate.pathBlocker ||
+        dxvk::war3::internal::IsPathBlockerFourCc(existing.identity.rawcode);
+    return true;
+  };
+
+  auto mergeCandidateIntoExisting = [&](uint32_t index) {
+    if (index >= snap.records.size())
+      return false;
+    VisibleRenderableRecord& existing = snap.records[index];
+    void* const oldRenderablePart = existing.renderablePart;
+    void* const oldPayload = existing.payload;
+    if (!mergeCandidateFields(existing))
+      return false;
+
+    RefreshSemanticMergeRecordIndex(
+        snap, index, oldRenderablePart, oldPayload);
 
     if constexpr (!dxvk::war3::internal::
                       kWar3RuntimeConfigDeferSemanticVisibleIndexBuild ||
@@ -2310,42 +2583,156 @@ bool VisibleRenderableRegistry::registerSemanticCandidate(
         return true;
       }
     }
-    for (uint32_t index = 0u; index < snap.records.size(); ++index) {
-      const auto& existing = snap.records[index];
-      if (candidate.renderablePart != nullptr &&
-          existing.renderablePart == candidate.renderablePart) {
-        if (mergeCandidateIntoExisting(index)) {
-          snap.semanticCandidateMergedCount++;
-          return true;
+
+    ++snap.semanticMergeFallbackCallCount;
+    const bool partPayloadFallback =
+        candidate.renderablePart != nullptr || candidate.payload != nullptr;
+    const bool useSemanticMergeIndex =
+        partPayloadFallback && War3VisibleSemanticMergeIndexEnabled();
+    const bool verifySemanticMergeIndex =
+        partPayloadFallback &&
+        War3VisibleSemanticMergeIndexVerifierEnabled();
+
+    auto selectLegacyFallback = [&](uint64_t& recordVisitCount) {
+      for (uint32_t index = 0u; index < snap.records.size(); ++index) {
+        const auto& existing = snap.records[index];
+        if (candidate.renderablePart != nullptr &&
+            existing.renderablePart == candidate.renderablePart) {
+          if (canMergeVisibleSubpart(existing, candidate)) {
+            recordVisitCount = uint64_t(index) + 1u;
+            return index;
+          }
+          continue;
         }
-        continue;
+        if (candidate.payload != nullptr &&
+            existing.payload == candidate.payload) {
+          if (canMergeVisibleSubpart(existing, candidate)) {
+            recordVisitCount = uint64_t(index) + 1u;
+            return index;
+          }
+          continue;
+        }
+        if (candidate.renderablePart == nullptr &&
+            candidate.payload == nullptr &&
+            candidate.runtimeGeosetPtr != nullptr &&
+            existing.runtimeGeosetPtr == candidate.runtimeGeosetPtr) {
+          if (canMergeVisibleSubpart(existing, candidate)) {
+            recordVisitCount = uint64_t(index) + 1u;
+            return index;
+          }
+          continue;
+        }
+        if (candidate.renderablePart == nullptr &&
+            candidate.payload == nullptr &&
+            candidate.runtimeGeosetDataPtr != nullptr &&
+            existing.runtimeGeosetDataPtr ==
+                candidate.runtimeGeosetDataPtr) {
+          if (canMergeVisibleSubpart(existing, candidate)) {
+            recordVisitCount = uint64_t(index) + 1u;
+            return index;
+          }
+          continue;
+        }
       }
-      if (candidate.payload != nullptr && existing.payload == candidate.payload) {
-        if (mergeCandidateIntoExisting(index)) {
-          snap.semanticCandidateMergedCount++;
-          return true;
+      recordVisitCount = snap.records.size();
+      return kInvalidSemanticMergeRecordIndex;
+    };
+
+    auto selectIndexedPartPayloadFallback = [&]() {
+      ++snap.semanticMergeIndexLookupCount;
+      uint32_t bestIndex = kInvalidSemanticMergeRecordIndex;
+
+      auto visitPointer = [&](void* pointer) {
+        if (pointer == nullptr)
+          return;
+        const auto range = snap.semanticMergeByPointer.equal_range(pointer);
+        for (auto it = range.first; it != range.second; ++it) {
+          ++snap.semanticMergeIndexCandidateVisitCount;
+          const uint32_t index = it->second;
+          if (index >= snap.records.size() || index >= bestIndex)
+            continue;
+
+          // semanticMergeByPointer is deliberately an untagged union of
+          // renderablePart/payload keys. Re-check the original field-specific
+          // predicates before canMergeVisibleSubpart: a cross-field pointer
+          // coincidence is not a legacy fallback match.
+          const auto& existing = snap.records[index];
+          const bool exactPartMatch =
+              candidate.renderablePart != nullptr &&
+              existing.renderablePart == candidate.renderablePart;
+          const bool exactPayloadMatch =
+              candidate.payload != nullptr &&
+              existing.payload == candidate.payload;
+          if (!exactPartMatch && !exactPayloadMatch)
+            continue;
+          if (!canMergeVisibleSubpart(existing, candidate))
+            continue;
+          bestIndex = index;
         }
-        continue;
+      };
+
+      visitPointer(candidate.renderablePart);
+      if (candidate.payload != candidate.renderablePart)
+        visitPointer(candidate.payload);
+      if (bestIndex != kInvalidSemanticMergeRecordIndex)
+        ++snap.semanticMergeIndexHitCount;
+      return bestIndex;
+    };
+
+    uint32_t legacySelection = kInvalidSemanticMergeRecordIndex;
+    uint32_t indexedSelection = kInvalidSemanticMergeRecordIndex;
+    uint64_t legacyRecordVisits = 0u;
+    if (!useSemanticMergeIndex || verifySemanticMergeIndex) {
+      legacySelection = selectLegacyFallback(legacyRecordVisits);
+      if (!useSemanticMergeIndex) {
+        ++snap.semanticMergeLegacyScanCallCount;
+        snap.semanticMergeLegacyScanRecordVisitCount += legacyRecordVisits;
       }
-      if (candidate.renderablePart == nullptr && candidate.payload == nullptr &&
-          candidate.runtimeGeosetPtr != nullptr &&
-          existing.runtimeGeosetPtr == candidate.runtimeGeosetPtr) {
-        if (mergeCandidateIntoExisting(index)) {
-          snap.semanticCandidateMergedCount++;
-          return true;
-        }
-        continue;
-      }
-      if (candidate.renderablePart == nullptr && candidate.payload == nullptr &&
-          candidate.runtimeGeosetDataPtr != nullptr &&
-          existing.runtimeGeosetDataPtr == candidate.runtimeGeosetDataPtr) {
-        if (mergeCandidateIntoExisting(index)) {
-          snap.semanticCandidateMergedCount++;
-          return true;
-        }
-        continue;
+      if (verifySemanticMergeIndex) {
+        ++snap.semanticMergeVerifierCallCount;
+        snap.semanticMergeVerifierLegacyScanRecordVisitCount +=
+            legacyRecordVisits;
       }
     }
+    if (useSemanticMergeIndex || verifySemanticMergeIndex)
+      indexedSelection = selectIndexedPartPayloadFallback();
+
+    const uint32_t productionSelection =
+        useSemanticMergeIndex ? indexedSelection : legacySelection;
+
+    // Both selectors feed the same merge/append code below. Matching selected
+    // indices therefore also preserves the resulting record, ordering, counts
+    // and any deterministic content hash without cloning the snapshot.
+    if (verifySemanticMergeIndex &&
+        legacySelection != indexedSelection) {
+      ++snap.semanticMergeVerifierSelectionMismatchCount;
+      ++snap.semanticMergeVerifierMismatchCount;
+      if (War3VisibleSemanticMergeIndexVerifierAssertEnabled()) {
+        assert(legacySelection == indexedSelection &&
+               "War3 visible semantic merge index selection mismatch");
+      }
+    }
+
+    if (productionSelection != kInvalidSemanticMergeRecordIndex) {
+      const bool merged =
+          mergeCandidateIntoExisting(productionSelection);
+      if (merged) {
+        ++snap.semanticCandidateMergedCount;
+      } else {
+        // Both selectors only return bounds-checked, compatible records.
+        // Preserve fail-safe append behavior if an invariant is ever violated.
+        VisibleRenderableRecord record = candidate;
+        record.queueKind = VisibleRenderableQueueKind::MainQueue;
+        appendRecord(snap, record);
+        ++snap.semanticCandidateAppendedCount;
+      }
+    } else {
+      VisibleRenderableRecord record = candidate;
+      record.queueKind = VisibleRenderableQueueKind::MainQueue;
+      appendRecord(snap, record);
+      ++snap.semanticCandidateAppendedCount;
+    }
+    return true;
   } else {
     if (candidate.renderablePart != nullptr &&
         snap.byRenderablePart.find(candidate.renderablePart) !=
@@ -2438,6 +2825,7 @@ void VisibleRenderableRegistry::registerTransparentEntry(
 
   VisibleRenderableRecord record = {};
   record.queueKind = VisibleRenderableQueueKind::Transparent;
+  record.stage = static_cast<int16_t>(War3RenderState::GetStage());
   record.payload = payload;
   record.queueSlot = queueSlot;
   record.transparentType = transparentType;
@@ -2701,15 +3089,45 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
       frameNumber != 0u ? frameNumber : m_frameNumber.load(std::memory_order_relaxed);
   ShadowManifestSummary summary = {};
   summary.frameNumber = frame;
+  summary.poseFreshGenerationVerifierMismatchCount =
+      m_shadowManifestSummary.poseFreshGenerationVerifierMismatchCount;
 
   std::unordered_map<uint64_t, uint64_t> firstSliceByPartAnchor;
   std::unordered_set<uint64_t> multiSlicePartAnchors;
-  std::unordered_set<uint64_t> poseFreshObjects;
+  bool hasPoseFreshObject = false;
   const Snapshot& visibleSnapshot = snapshotForThread();
   (void)visibleSnapshot;  // 保留 snapshotForThread() 调用以维持内部快照确认
   firstSliceByPartAnchor.reserve(records.size());
   multiSlicePartAnchors.reserve(records.size() / 2u + 1u);
-  poseFreshObjects.reserve(records.size());
+
+  // Generation 0 is reserved for "never marked".  A refresh receives a new
+  // generation even when frameNumber is unchanged, so repeated same-frame
+  // populates preserve the old per-call set semantics exactly.  On uint32 wrap
+  // clear all persistent marks before restarting at 1; this prevents entries
+  // stamped during the previous generation epoch from becoming false hits.
+  uint32_t refreshGeneration = m_shadowManifestRefreshGeneration + 1u;
+  if (refreshGeneration == 0u) {
+    for (auto& [_, entry] : m_shadowManifestObjects)
+      entry.poseFreshGeneration = 0u;
+    refreshGeneration = 1u;
+  }
+  m_shadowManifestRefreshGeneration = refreshGeneration;
+
+  // Explicitly enabled verifier only: reconstruct the retired temporary set
+  // as ground truth.  The default path neither constructs nor allocates it.
+  std::unique_ptr<std::unordered_set<uint64_t>> poseFreshVerifierObjects;
+  if (War3SemanticShadowManifestPoseGenerationVerifierEnabled()) {
+    poseFreshVerifierObjects =
+        std::make_unique<std::unordered_set<uint64_t>>();
+    poseFreshVerifierObjects->reserve(records.size());
+    for (const auto& record : records) {
+      if (record.fromGrace)
+        continue;
+      const uint64_t objectKey = ShadowManifestObjectKey(record);
+      if (objectKey != 0u)
+        poseFreshVerifierObjects->insert(objectKey);
+    }
+  }
 
   // Phase 7.26：runtimeModelPtr 只在 pose restore/pose 诊断开启时才会被后续
   // 读取。refresh 阶段的 ResolveRuntimeModelForCurrentDrawRecord 是
@@ -2726,10 +3144,14 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
   };
 
   for (const auto& record : records) {
+    // Grace can fill a one-frame producer hole, but it must never become a
+    // fresh Manifest observation or extend structure/pose/slice lifetime.
+    if (record.fromGrace)
+      continue;
     const uint64_t objectKey = ShadowManifestObjectKey(record);
     if (objectKey == 0u)
       continue;
-    poseFreshObjects.insert(objectKey);
+    hasPoseFreshObject = true;
 
     auto objectIt = m_shadowManifestObjects.find(objectKey);
     if (objectIt == m_shadowManifestObjects.end()) {
@@ -2738,6 +3160,7 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
       entry.firstSeenFrame = frame;
       entry.lastSeenFrame = frame;
       entry.observedFrameCount = 1u;
+      entry.poseFreshGeneration = refreshGeneration;
       objectIt = m_shadowManifestObjects.emplace(objectKey, entry).first;
       ++summary.newObjectCount;
     } else {
@@ -2745,6 +3168,7 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
       if (entry.lastSeenFrame != frame)
         ++entry.observedFrameCount;
       entry.lastSeenFrame = frame;
+      entry.poseFreshGeneration = refreshGeneration;
     }
 
     const uint64_t partKey = ShadowManifestPartKey(record, objectKey);
@@ -2768,9 +3192,19 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
       entry.payloadWord108 = record.payloadWord108;
       entry.lastPayloadWord11C = record.payloadWord11C;
       entry.observedFrameCount = 1u;
+      entry.producerStage =
+          record.producerStage >= 0 ? record.producerStage : record.stage;
+      entry.producerGroup = record.producerGroup;
+      entry.sourceKind = record.sourceKind;
+      entry.producerFreshThisFrame = record.producerFreshThisFrame;
+      entry.visibleFrameSerial = record.visibleFrameSerial;
+      entry.stagePolicyRevision = record.stagePolicyRevision;
+      entry.fromGrace = record.fromGrace;
+      entry.graceAge = record.graceAge;
+      entry.alphaPayloadComplete = record.alphaPayloadComplete;
       partIt = m_shadowManifestParts.emplace(partKey, entry).first;
-      // Phase 7.31 Iteration G 回退：sibling propagation 已默认关闭，
-      // 反向索引维护无收益但有插入/擦除开销，撤回索引维护。
+      // Phase 7.31 Iteration G：不维护 objectKey→partKey 反向索引；
+      // object entry 的 refresh generation 在统一 part sweep 中传播。
     } else {
       auto& entry = partIt->second;
       if (entry.lastSeenFrame != frame)
@@ -2792,6 +3226,16 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
       entry.layerIndex = record.layerIndex;
       entry.payloadWord108 = record.payloadWord108;
       entry.lastPayloadWord11C = record.payloadWord11C;
+      entry.producerStage =
+          record.producerStage >= 0 ? record.producerStage : record.stage;
+      entry.producerGroup = record.producerGroup;
+      entry.sourceKind = record.sourceKind;
+      entry.producerFreshThisFrame = record.producerFreshThisFrame;
+      entry.visibleFrameSerial = record.visibleFrameSerial;
+      entry.stagePolicyRevision = record.stagePolicyRevision;
+      entry.fromGrace = record.fromGrace;
+      entry.graceAge = record.graceAge;
+      entry.alphaPayloadComplete = record.alphaPayloadComplete;
     }
 
     const uint64_t partAnchorKey =
@@ -2802,16 +3246,6 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
           firstSliceByPartAnchor.emplace(partAnchorKey, sliceKey);
       if (!inserted.second && inserted.first->second != sliceKey)
         multiSlicePartAnchors.insert(partAnchorKey);
-    }
-  }
-
-  if (!poseFreshObjects.empty()) {
-    // Phase 7.31 Iteration G：用"只对 sibling 少的 object 做 propagation"降本。
-    // 由于撤回了 objectKey→partKey 反向索引，这里回退到全表扫描。
-    // 但只在 poseFreshObjects 非空时才扫描，且检查 entry.objectKey 是否在 set 里。
-    for (auto& [_, entry] : m_shadowManifestParts) {
-      if (poseFreshObjects.find(entry.objectKey) != poseFreshObjects.end())
-        entry.lastPoseFrame = (std::max)(entry.lastPoseFrame, frame);
     }
   }
 
@@ -2830,15 +3264,45 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     }
   }
 
+  const auto isPoseFreshObject = [&](uint64_t objectKey) {
+    const auto objectIt = m_shadowManifestObjects.find(objectKey);
+    return objectIt != m_shadowManifestObjects.end() &&
+           objectIt->second.poseFreshGeneration == refreshGeneration;
+  };
+
+  if (poseFreshVerifierObjects != nullptr) {
+    uint64_t refreshMismatchCount = 0u;
+    for (const auto& [_, entry] : m_shadowManifestParts) {
+      const bool expectedFresh =
+          poseFreshVerifierObjects->find(entry.objectKey) !=
+          poseFreshVerifierObjects->end();
+      if (isPoseFreshObject(entry.objectKey) != expectedFresh)
+        ++refreshMismatchCount;
+    }
+    summary.poseFreshGenerationVerifierMismatchCount += refreshMismatchCount;
+    if (refreshMismatchCount != 0u &&
+        War3SemanticShadowManifestPoseGenerationVerifierAssertEnabled()) {
+      assert(refreshMismatchCount == 0u &&
+             "War3 shadow manifest pose generation mismatch");
+    }
+  }
+
   for (auto it = m_shadowManifestParts.begin();
        it != m_shadowManifestParts.end();) {
-    const uint64_t lastSeen = it->second.lastSeenFrame;
+    auto& entry = it->second;
+
+    // Phase 7.31 Iteration G：pose-bearing record 是 object 级 freshness 信号。
+    // 在过期及 pose-age 判断前传播给 sibling，并合入已有 part sweep，
+    // 避免每帧第二次全表扫描。
+    if (hasPoseFreshObject && isPoseFreshObject(entry.objectKey))
+      entry.lastPoseFrame = (std::max)(entry.lastPoseFrame, frame);
+
+    const uint64_t lastSeen = entry.lastSeenFrame;
     if (frame > lastSeen &&
         frame - lastSeen > kShadowManifestStructureTtlFrames) {
       it = m_shadowManifestParts.erase(it);
       ++summary.expiredPartCount;
     } else {
-      auto& entry = it->second;
       ++summary.partCount;
       if (entry.lastSeenFrame == frame) {
         ++summary.freshPartCount;
@@ -2962,6 +3426,15 @@ VisibleRenderableRegistry::queryShadowManifestPartLeaseInfo(
   info.lastGoodPacketFrame = entry.lastGoodPacketFrame;
   info.runtimeModelPtr = entry.runtimeModelPtr;
   info.observedFrameCount = entry.observedFrameCount;
+  info.producerStage = entry.producerStage;
+  info.producerGroup = entry.producerGroup;
+  info.sourceKind = entry.sourceKind;
+  info.producerFreshThisFrame = entry.producerFreshThisFrame;
+  info.visibleFrameSerial = entry.visibleFrameSerial;
+  info.stagePolicyRevision = entry.stagePolicyRevision;
+  info.fromGrace = entry.fromGrace;
+  info.graceAge = entry.graceAge;
+  info.alphaPayloadComplete = entry.alphaPayloadComplete;
   info.poseAgeFrames =
       frame > entry.lastPoseFrame ? frame - entry.lastPoseFrame : 0u;
   info.sliceAgeFrames =
@@ -2992,6 +3465,111 @@ VisibleRenderableRegistry::queryShadowManifestPartLeaseInfo(
   info.leaseable =
       info.structureLive && info.poseFresh && info.sliceFresh && info.packetFresh;
   return info;
+}
+
+VisibleRenderableRegistry::ShadowManifestRetireResult
+VisibleRenderableRegistry::retireShadowManifest(
+    const ShadowCasterTombstone& tombstone) {
+  ShadowManifestRetireResult result = {};
+  std::array<uint64_t, 4u> objectKeys = {};
+  size_t objectKeyCount = 0u;
+  const auto appendObjectKey =
+      [&](const CurrentDrawContractRecord& record) {
+        const uint64_t key = computeShadowManifestObjectKey(record);
+        if (key == 0u)
+          return;
+        for (size_t i = 0u; i < objectKeyCount; ++i) {
+          if (objectKeys[i] == key)
+            return;
+        }
+        objectKeys[objectKeyCount++] = key;
+      };
+
+  CurrentDrawContractRecord identityRecord = {};
+  if (tombstone.identity.jHandle != 0u) {
+    identityRecord.jHandle = tombstone.identity.jHandle;
+    appendObjectKey(identityRecord);
+    identityRecord = {};
+  }
+  if (tombstone.identity.unitPtr != nullptr) {
+    identityRecord.unitPtr = tombstone.identity.unitPtr;
+    appendObjectKey(identityRecord);
+    identityRecord = {};
+  }
+  if (tombstone.identity.worldObjectEntry != nullptr) {
+    identityRecord.worldObjectEntry =
+        tombstone.identity.worldObjectEntry;
+    appendObjectKey(identityRecord);
+    identityRecord = {};
+  }
+  if (tombstone.identity.sceneNode != nullptr) {
+    identityRecord.sceneNode = tombstone.identity.sceneNode;
+    appendObjectKey(identityRecord);
+  }
+
+  const auto matchesObjectKey = [&](uint64_t key) {
+    return std::find(
+               objectKeys.begin(),
+               objectKeys.begin() + objectKeyCount,
+               key) != objectKeys.begin() + objectKeyCount;
+  };
+
+  for (auto it = m_shadowManifestObjects.begin();
+       it != m_shadowManifestObjects.end();) {
+    if (matchesObjectKey(it->first)) {
+      it = m_shadowManifestObjects.erase(it);
+      result.objectCount++;
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = m_shadowManifestParts.begin();
+       it != m_shadowManifestParts.end();) {
+    const ShadowManifestPartEntry& part = it->second;
+    const bool stageMatch =
+        tombstone.reason == ShadowCasterTombstoneReason::StageDisabled &&
+        tombstone.identity.producerStage >= 0 &&
+        part.producerStage == tombstone.identity.producerStage;
+    const bool directPointerMatch =
+        (tombstone.identity.renderablePart != nullptr &&
+         part.renderablePart == tombstone.identity.renderablePart) ||
+        (tombstone.identity.sceneNode != nullptr &&
+         part.sceneNode == tombstone.identity.sceneNode);
+    if (stageMatch || matchesObjectKey(part.objectKey) ||
+        directPointerMatch) {
+      it = m_shadowManifestParts.erase(it);
+      result.partCount++;
+    } else {
+      ++it;
+    }
+  }
+  if (result.partCount != 0u) {
+    std::unordered_set<uint64_t> liveObjectKeys;
+    liveObjectKeys.reserve(m_shadowManifestParts.size());
+    for (const auto& [_, part] : m_shadowManifestParts)
+      liveObjectKeys.insert(part.objectKey);
+    for (auto it = m_shadowManifestObjects.begin();
+         it != m_shadowManifestObjects.end();) {
+      if (liveObjectKeys.find(it->first) == liveObjectKeys.end()) {
+        it = m_shadowManifestObjects.erase(it);
+        result.objectCount++;
+      } else {
+        ++it;
+      }
+    }
+  }
+  return result;
+}
+
+VisibleRenderableRegistry::ShadowManifestRetireResult
+VisibleRenderableRegistry::clearShadowManifest() {
+  ShadowManifestRetireResult result = {};
+  result.objectCount = m_shadowManifestObjects.size();
+  result.partCount = m_shadowManifestParts.size();
+  m_shadowManifestObjects.clear();
+  m_shadowManifestParts.clear();
+  m_shadowManifestSummary = {};
+  return result;
 }
 
 VisibleRenderableRegistry::ShadowManifestSummary
@@ -3042,6 +3620,30 @@ VisibleRenderableRegistry::queryDebugSummary() const {
   summary.semanticCandidateCallCount = snap.semanticCandidateCallCount;
   summary.semanticCandidateMergedCount = snap.semanticCandidateMergedCount;
   summary.semanticCandidateAppendedCount = snap.semanticCandidateAppendedCount;
+  summary.semanticMergeFallbackCallCount =
+      snap.semanticMergeFallbackCallCount;
+  summary.semanticMergeIndexLookupCount =
+      snap.semanticMergeIndexLookupCount;
+  summary.semanticMergeIndexHitCount = snap.semanticMergeIndexHitCount;
+  summary.semanticMergeIndexCandidateVisitCount =
+      snap.semanticMergeIndexCandidateVisitCount;
+  summary.semanticMergeLegacyScanCallCount =
+      snap.semanticMergeLegacyScanCallCount;
+  summary.semanticMergeLegacyScanRecordVisitCount =
+      snap.semanticMergeLegacyScanRecordVisitCount;
+  summary.semanticMergeVerifierCallCount =
+      snap.semanticMergeVerifierCallCount;
+  summary.semanticMergeVerifierLegacyScanRecordVisitCount =
+      snap.semanticMergeVerifierLegacyScanRecordVisitCount;
+  summary.semanticMergeVerifierMismatchCount =
+      snap.semanticMergeVerifierMismatchCount;
+  summary.semanticMergeVerifierSelectionMismatchCount =
+      snap.semanticMergeVerifierSelectionMismatchCount;
+  summary.semanticMergeVerifierAuxIndexCheckCount =
+      snap.semanticMergeVerifierAuxIndexCheckCount;
+  summary.semanticMergeVerifierAuxIndexMismatchCount =
+      snap.semanticMergeVerifierAuxIndexMismatchCount;
+  summary.semanticMergeIndexEntryCount = snap.semanticMergeByPointer.size();
   summary.transparentEntryCallCount = snap.transparentEntryCallCount;
   return summary;
 }

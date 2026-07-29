@@ -1,5 +1,15 @@
 # 第 1 章 — 剔除层 → 渲染层过渡
 
+> 2026-07-15 authoritative correction：`0x6F184EE0` 不是未知 `WorldObjectEntry_Render`。
+> 两个 direct caller 均从 stride-`0x18` `WorldGroupRecord+0` 取 strong `CSprite*`；canonical
+> 名为 `CSprite_PrepareAndQueueAttachedRenderObject(CSprite*)`。`sprite+0x20` 才是 AddBatch
+> 输入；slot5 对 base/Mini 是 no-op，对 Uber 只 flush pending attached state，真正
+> visibility/prepare dispatch 是 slot3。本文后续旧 entry/slot5=PreRender 叙述只保留历史，
+> 以 [30 号 authoritative 卷](../../research/war3_render_issues/30_cworld_class_family_full_reverse/README.md)
+> 为准；group gameplay taxonomy 也仍是 Unknown。第19~21批还已 supersede 本章后部旧
+> WorldFrame 字段建议表：authoritative offsets 是 `activeQueue +0x31C`、mode/category
+> `+0x660/+0x664`；`+0x238`、越界 `+0x668/+0x66C` 和 tail taxonomy 不得继续使用。
+
 > 本章是论文从 *逻辑层* (CWorld / 可见性管理) 到 *渲染层* (RenderQueue) 的过渡，
 > 也是用户原 OVERNIGHT_PLAN 中"任务 A"的章节。
 >
@@ -14,11 +24,11 @@
 | RVA | 名字 | 角色 |
 |---|---|---|
 | `0x6F368480` | `worldFrameUpdateAndPreparePasses` | 帧前置：相机更新 + frustum 构建 + 可见性查询 |
-| `0x6F3681C0` | `CWorld_RenderScene` | 主渲染链：调度 22 个 stage |
-| `0x6F363020` | `RenderWorld_DispatchStage` | stageId 分发器（0..21） |
-| `0x6F368E30` | `WorldObjects_RenderGroup` | group 0/1/2 的对象组渲染入口 |
-| `0x6F184EE0` | `WorldObjectEntry_Render` | 单对象渲染入口（vt[5] + AddBatch） |
-| `0x6F0CB110` | `WorldObjectList_AddEntry_ObjectSelfOwnerHint` | 给 list 追加一个 entry（24B） |
+| `0x6F3681C0` | `CWorldFrameWar3_RenderScene` | 主渲染链：调度 22 个 stage |
+| `0x6F363020` | `CWorldFrameWar3_DispatchStage` | stageId 分发器（0..21） |
+| `0x6F368E30` | `CWorldFrameWar3_RenderWorldGroup` | group 0/1/2 的对象组渲染入口 |
+| `0x6F184EE0` | `CSprite_PrepareAndQueueAttachedRenderObject` | `CSprite*` attached-object 入队（vslot5 + AddBatch） |
+| `0x6F0CB110` | `WorldGroupRecordOwner_AddSpriteRef` | 给 owner 追加一个 `0x18` record，acquire `CSprite*` |
 | `0x6F0CB480` | `WorldObjectList_RenderAll` | list 内全部 entry 调 WorldObjectEntry_Render |
 | `0x6F184F00` | `CWorld_VisibilityOrPreRenderHook` | 调用 vt[3] 的可见性/PreRender 入口 |
 | `0x6F0CAA90` | `WorldObjectList_QueryVisibleCandidates` | 可见性查询入口（含 force gate） |

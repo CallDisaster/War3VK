@@ -2,8 +2,9 @@
 // Storm.dll 内存分配拦截接口（从 StormBreaker 整合）
 //
 // 策略：
-//   - 大块（>= 64 KB）→ TlsfPool_Alloc，使用私有头部做零锁识别
-//   - 小块（< 64 KB）→ 放行原生 Storm，不干预
+//   - 大块（>= 0xFE7C）→ TlsfPool_Alloc，页目录负过滤后在锁内校验精确块/私有头
+//   - 小块（<= 0xFE7B）→ 原生 Storm arena，并默认启用 search 分箱修复
+//   - 全尺寸接管不编入生产 DLL，只保留在 StormBreaker 实验分支做内存诊断
 //
 // 说明：
 //   - Storm.dll 原生头并不是 10 字节。基于 Storm ASM，SMemFree/GetSize/ReAlloc
@@ -34,11 +35,11 @@ namespace dxvk::war3::memory {
  * 调用前提：TlsfPool_Init() 必须已成功执行。
  * 会自动定位 Storm.dll 并通过 MinHook 拦截 SMemAlloc/Free/Realloc/GetSize。
  *
- * @return 至少安装一个 Hook 成功返回 true。
+ * @return 四个导出与启用的原生小块修复全部同批安装成功才返回 true。
  */
 bool StormHook_Install();
 
-/** @brief 卸载所有 Storm Hook（DLL 卸载时调用）。 */
+/** @brief 兼容旧接口；产品 Hook 永久驻留到进程退出，不执行运行中卸载。 */
 void StormHook_Uninstall();
 
 /** @return Hook 是否已安装。 */
@@ -60,10 +61,10 @@ bool StormHook_IsRedirectEnabled();
 // ============================================================================
 
 /**
- * @brief 设置大块拦截阈值（默认 64 KB）。
+ * @brief 设置大块拦截阈值（默认 0xFE7C）。
  *
  * 超过此阈值的分配会被重定向到 TLSF 池。
- * 不建议低于 64 KB，否则会干扰 Storm 小块池的内部逻辑。
+ * 低于 0xFE7C 的值会被钳制；生产路径不会借阈值实现全尺寸接管。
  */
 void StormHook_SetLargeBlockThreshold(size_t bytes);
 size_t StormHook_GetLargeBlockThreshold();
@@ -72,7 +73,7 @@ size_t StormHook_GetLargeBlockThreshold();
 // 状态查询
 // ============================================================================
 
-/** @return ptr 是否是被我们管理的大块（地址范围 + 私有头校验，零锁）。 */
+/** @return ptr 是否是托管大块（页目录负过滤 + 锁内精确块/私有头校验）。 */
 bool StormHook_IsOurBlock(void *userPtr);
 
 /** @return 当前托管块数量。 */
@@ -84,9 +85,9 @@ size_t StormHook_GetManagedSize();
 /**
  * @brief 读取 Storm.dll 的 g_TotalAllocatedMemory 全局变量。
  *
- * 该变量只增不减——Storm 原生分配每次 +bytes，释放时不减。
- * StormBreaker 的核心价值：大块转 TLSF 后，此计数不再增长，
- * 接近 2GB 时不再崩溃。周期报告中可观测此值是否稳定。
+ * 原生实现对大块只记压缩头大小，释放时不会扣除实际 VirtualAlloc 差额。
+ * 稳定策略既让新大块直接进入 TLSF，也会在原生大块确实释放时补扣该差额；
+ * 周期报告可观测此值是否保持在安全范围。
  *
  * @return 当前 Storm 累计分配字节数（0 = Storm.dll 未加载或读取失败）。
  */

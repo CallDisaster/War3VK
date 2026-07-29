@@ -34,7 +34,11 @@ namespace dxvk {
         Rc<DxvkImageView> colorView;
         Rc<DxvkImageView> depthView; // 预留
         War3FrameScene scene;        // 本帧捕获的世界数据（阴影/光照/后处理共享）
-        uint32_t frameIndex = 0;     // Synchronization: Ring Buffer Index for this frame
+        uint32_t frameIndex = 0;     // Synchronization: 0..2 ring-buffer slot only
+        // Monotonic D3D9 presentation-frame identity. Never use frameIndex for
+        // publication/cache freshness: its 0/1/2 aliases repeat every three
+        // frames and slot zero is a valid resource slot, not an invalid frame.
+        uint64_t frameSerial = 0;
         const War3RenderSettings* settings = nullptr;
     };
 

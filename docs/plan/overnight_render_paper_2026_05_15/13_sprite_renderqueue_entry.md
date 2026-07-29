@@ -1,5 +1,13 @@
 # 第 13 章 — CSpriteUber 4 变体 + WorldObjectEntry_Render + RenderQueue_AddBatch
 
+> 2026-07-15 authoritative correction：本章第2节关于 `0x6F184EE0` 的伪代码、参数和
+> “slot5=PreRender”解释已由真实 x86/RTTI 推翻。该函数的 ECX 直接是 `CSprite*`，canonical
+> 名为 `CSprite_PrepareAndQueueAttachedRenderObject`；它先检查 `sprite+0x20`，调用 vslot5，
+> 再把 `[sprite+0x20]` 交给 AddBatch。base/Mini vslot5 是 no-op，Uber 仅 flush 两组 pending
+> attached state；真正 visibility/prepare dispatch 是 vslot3。完整 record/owner/refcount/pool
+> 边界见 [30 号 authoritative 卷](../../research/war3_render_issues/30_cworld_class_family_full_reverse/README.md)。
+> 以下旧伪代码仅作研究历史，不得用于 ABI、类归属或线程安全结论。
+
 > 本章补全三个核心函数的完整算法：
 > 1. CSpriteUber_PreRender 4 个变体的精确差异
 > 2. WorldObjectEntry_Render 完整流程

@@ -1,5 +1,11 @@
 # 第 7 章 ★★★ — Light Pass / Shadow Pass 着色器与 RT 绑定（GPU 侧）
 
+> 2026-07-15 authoritative correction：`0x6F76F060` 不是 TerrainShadow owner 的 thiscall；
+> 其 ECX 是 0..16 selector，canonical ABI 为
+> `RenderGlobalPass_DispatchBySelector(int selector)`。selector13 明确尾调 TextTag pass，故本章
+> 后续把全部 case 统称 TerrainShadow 的段落只保留历史。逐 case 证据见
+> [30 号卷](../../research/war3_render_issues/30_cworld_class_family_full_reverse/callgraphs.md)。
+>
 > 本章覆盖 War3 的阴影渲染管线：从 War3 原生 TerrainShadow 系统到项目的
 > D3D9 CSM shadow caster pipeline 的完整接管。
 > 它回答：War3 原生怎么画阴影、我们怎么接管、shadow map / receiver / TAA 怎么工作。
@@ -17,7 +23,7 @@
 
 | RVA | 名字 | 角色 |
 |---|---|---|
-| `0x6F76F060` | `CWorld_TerrainShadow_Dispatch` | 原生阴影子调度（stage 0..16） |
+| `0x6F76F060` | `RenderGlobalPass_DispatchBySelector` | global selector 0..16；并非所有 case 都属于 TerrainShadow |
 | `0x6F76EF80` | `TerrainShadow_FlushPass` | 原生阴影 flush |
 | `0x6F737500` | `TerrainShadow_RenderListA` | 渲染 ListA（混合层：雾/边界/烘焙阴影/贴花） |
 | `0x6F737400` | `TerrainShadow_RenderListB` | 渲染 ListB |

@@ -457,8 +457,16 @@ WAR3_SHADER_API int32_t AddPointLight(
     float r, float g, float b,
     float intensity,
     float shadowIntensity) {
-    return dxvk::War3LightManager::Instance().AddPointLight(
+    const int32_t id = dxvk::War3LightManager::Instance().AddPointLight(
         x, y, z, range, r, g, b, intensity, shadowIntensity);
+    if (id != 0) {
+        if (auto* settings = GetMutableSettings()) {
+            settings->shadows.pointLightsEnabled = true;
+            if (shadowIntensity > 0.0f)
+                settings->shadows.pointShadowEnabled = true;
+        }
+    }
+    return id;
 }
 
 WAR3_SHADER_API bool UpdatePointLight(
@@ -471,8 +479,47 @@ WAR3_SHADER_API bool UpdatePointLight(
         id, x, y, z, range, r, g, b, intensity);
 }
 
+WAR3_SHADER_API bool UpdatePointLightEx(
+    int32_t id,
+    float x, float y, float z,
+    float range,
+    float r, float g, float b,
+    float intensity,
+    float shadowIntensity) {
+    const bool ok = dxvk::War3LightManager::Instance().UpdatePointLightEx(
+        id, x, y, z, range, r, g, b, intensity, shadowIntensity);
+    if (ok && shadowIntensity > 0.0f) {
+        if (auto* settings = GetMutableSettings()) {
+            settings->shadows.pointLightsEnabled = true;
+            settings->shadows.pointShadowEnabled = true;
+        }
+    }
+    return ok;
+}
+
+WAR3_SHADER_API bool SetPointLightShadowIntensity(int32_t id,
+                                                  float shadowIntensity) {
+    const bool ok = dxvk::War3LightManager::Instance().SetPointLightShadowIntensity(
+        id, shadowIntensity);
+    if (ok && shadowIntensity > 0.0f) {
+        if (auto* settings = GetMutableSettings()) {
+            settings->shadows.pointLightsEnabled = true;
+            settings->shadows.pointShadowEnabled = true;
+        }
+    }
+    return ok;
+}
+
 WAR3_SHADER_API bool RemovePointLight(int32_t id) {
     return dxvk::War3LightManager::Instance().RemovePointLight(id);
+}
+
+WAR3_SHADER_API void ClearPointLights() {
+    dxvk::War3LightManager::Instance().ClearLights();
+}
+
+WAR3_SHADER_API uint32_t GetPointLightCount() {
+    return dxvk::War3LightManager::Instance().GetLightCount();
 }
 
 WAR3_SHADER_API bool SetLightingEnabled(bool enabled) {
@@ -683,8 +730,8 @@ WAR3_SHADER_API bool SetShadowDebugMode(uint32_t mode) {
     auto* settings = GetMutableSettings();
     if (!settings)
         return false;
-    if (mode > 3u)
-        mode = 3u;
+    if (mode > 6u)
+        mode = 6u;
     settings->shadows.debugMode = static_cast<dxvk::War3ShadowDebugMode>(mode);
     return true;
 }
@@ -775,6 +822,74 @@ WAR3_SHADER_API bool SetPointShadowEnabled(bool enabled) {
     if (!settings)
         return false;
     settings->shadows.pointShadowEnabled = enabled;
+    return true;
+}
+
+WAR3_SHADER_API bool SetPointShadowBias(float bias) {
+    auto* settings = GetMutableSettings();
+    if (!settings)
+        return false;
+    settings->shadows.pointShadowBias = std::max(0.0f, bias);
+    return true;
+}
+
+WAR3_SHADER_API bool SetVolumetricLightEnabled(bool enabled) {
+    auto* settings = GetMutableSettings();
+    if (!settings)
+        return false;
+    settings->postFx.volumetricLight.enabled = enabled;
+    if (enabled)
+        settings->postFx.enabled = true;
+    return true;
+}
+
+WAR3_SHADER_API bool SetVolumetricLightParams(
+    float intensity, float density, float weight, float decay,
+    uint32_t sampleCount) {
+    auto* settings = GetMutableSettings();
+    if (!settings)
+        return false;
+    auto& volumetric = settings->postFx.volumetricLight;
+    volumetric.intensity = std::max(0.0f, intensity);
+    volumetric.density = std::max(0.0f, density);
+    volumetric.weight = std::max(0.0f, weight);
+    volumetric.decay = std::clamp(decay, 0.70f, 0.999f);
+    volumetric.sampleCount = static_cast<int>(std::clamp<uint32_t>(
+        sampleCount, 4u, 16u));
+    return true;
+}
+
+WAR3_SHADER_API bool SetVolumetricLightFade(float fadeNear, float fadeFar,
+                                            float maxRayDistance) {
+    auto* settings = GetMutableSettings();
+    if (!settings)
+        return false;
+    auto& volumetric = settings->postFx.volumetricLight;
+    volumetric.fadeNear = std::clamp(fadeNear, 0.0f, 0.95f);
+    volumetric.fadeFar =
+        std::clamp(fadeFar, volumetric.fadeNear + 0.01f, 1.0f);
+    volumetric.maxRayDistance = std::max(0.05f, maxRayDistance);
+    return true;
+}
+
+WAR3_SHADER_API bool SetVolumetricHeightFog(float baseHeight, float falloff,
+                                            float strength) {
+    auto* settings = GetMutableSettings();
+    if (!settings)
+        return false;
+    auto& volumetric = settings->postFx.volumetricLight;
+    volumetric.heightFogBase = baseHeight;
+    volumetric.heightFogFalloff = std::max(0.0f, falloff);
+    volumetric.heightFogStrength = std::max(0.0f, strength);
+    return true;
+}
+
+WAR3_SHADER_API bool SetVolumetricResolutionDivisor(uint32_t divisor) {
+    auto* settings = GetMutableSettings();
+    if (!settings)
+        return false;
+    settings->postFx.volumetricLight.resolutionDivisor =
+        std::clamp<uint32_t>(divisor, 4u, 8u);
     return true;
 }
 
@@ -1392,29 +1507,31 @@ void UpdateRenderContext(const dxvk::War3PipelineInput& input) {
         }
     }
     
-    // 更新光源
-    auto activeLights = dxvk::War3LightManager::Instance().GetActiveLights();
-    // [Fix] Use frame-synchronized index passed from capture thread
-    // Normalize absolute frame index to ring buffer range [0, 2]
-    uint32_t ringIndex = input.frameIndex % kRingBufferSize; 
-    
-    // Fallback if not populated (though it should be)
-    // if (ringIndex >= 3) ringIndex = g_ringBufferIndex;
-
+    // 更新光源：使用帧快照，避免每帧 vector 拷贝 + 堆分配。
+    uint32_t ringIndex = input.frameIndex % kRingBufferSize;
     auto& currentPointLights = g_pointLightBuffers[ringIndex];
     currentPointLights.clear();
-    for (const auto& light : activeLights) {
+    if (dxvk::War3LightManager::Instance().HasActiveLights()) {
+      dxvk::Vector4 cameraPos(0.0f, 0.0f, 0.0f, 1.0f);
+      const auto snap = dxvk::War3LightManager::Instance().GetFrameSnapshot(
+          input.frameSerial, cameraPos);
+      currentPointLights.reserve(snap.count);
+      for (uint32_t i = 0; i < snap.count; ++i) {
+        const auto& light = snap.lights[i];
         LightData ld = {};
         ld.type = LightType::POINT;
         ld.position = { light.position.x, light.position.y, light.position.z };
         ld.color = { light.color.x, light.color.y, light.color.z, light.color.w };
         ld.range = light.position.w;
         ld.intensity = light.color.w;
-        ld.flags = LIGHT_FLAG_ACTIVE;  // 不投射阴影
+        ld.flags = LIGHT_FLAG_ACTIVE;
         currentPointLights.push_back(ld);
+      }
     }
-    g_currentContext.pointLightCount = static_cast<uint32_t>(currentPointLights.size());
-    g_currentContext.pointLights = currentPointLights.empty() ? nullptr : currentPointLights.data();
+    g_currentContext.pointLightCount =
+        static_cast<uint32_t>(currentPointLights.size());
+    g_currentContext.pointLights =
+        currentPointLights.empty() ? nullptr : currentPointLights.data();
 
     
     

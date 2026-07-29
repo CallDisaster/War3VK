@@ -5,6 +5,11 @@
 namespace dxvk::war3::hooks {
 
 struct RenderIdentityLifecycleProbeSummary {
+  bool fullDiagnostics = false;
+  bool worldObjectListEntryWriteProbeHookInstalled = false;
+  bool worldObjectEntryRenderContextHookInstalled = false;
+  bool worldObjectEntryRenderPrePostProbeEnabled = false;
+  bool renderQueueIdentityPrimingHookInstalled = false;
   uint64_t worldObjectEntryRenderCallCount = 0;
   uint64_t worldObjectEntryRenderSceneNodeReadyBeforeCount = 0;
   uint64_t worldObjectEntryRenderSceneNodeReadyAfterCount = 0;

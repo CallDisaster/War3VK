@@ -1,0 +1,64 @@
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rg32f)
+readonly uniform image2D s_srcMip;
+layout(set = 0, binding = 1, rg32f)
+writeonly uniform image2D s_dstMip;
+
+layout(push_constant, scalar)
+uniform PushData {
+  uint p_srcMip;
+  uint p_dstMip;
+  uint p_mipCount;
+  uint p_layerCount;
+  uvec4 p_extent;
+  uvec4 p_dispatch; // source width/height, destination width/height
+} pc;
+
+void main() {
+  ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 srcExtent = ivec2(pc.p_dispatch.xy);
+  ivec2 dstExtent = ivec2(pc.p_dispatch.zw);
+  if (any(greaterThanEqual(dst, dstExtent)))
+    return;
+
+  ivec2 first = dst * 2;
+  // Vulkan mip extents floor-divide odd dimensions. The last destination
+  // texel therefore owns the otherwise orphaned final source row/column.
+  // Keeping the regular 2^m partition and only extending the final cell also
+  // matches the contact traversal's hierarchical cell boundaries.
+  ivec2 end = min(first + ivec2(2), srcExtent);
+  if (dst.x == dstExtent.x - 1)
+    end.x = srcExtent.x;
+  if (dst.y == dstExtent.y - 1)
+    end.y = srcExtent.y;
+  bool hasValid = false;
+  bool allValid = true;
+  float minDepth = 3.402823466e38;
+  float maxDepth = 0.0;
+
+  for (int childY = first.y; childY < end.y; ++childY) {
+    for (int childX = first.x; childX < end.x; ++childX) {
+      ivec2 child = ivec2(childX, childY);
+
+      vec2 encoded = imageLoad(s_srcMip, child).rg;
+      bool childHasValid = encoded.x > 0.0;
+      bool childAllValid = childHasValid && encoded.y > 0.0;
+      allValid = allValid && childAllValid;
+      if (childHasValid) {
+        hasValid = true;
+        minDepth = min(minDepth, encoded.x);
+        maxDepth = max(maxDepth, abs(encoded.y));
+      }
+    }
+  }
+
+  vec2 encoded = vec2(0.0);
+  if (hasValid)
+    encoded = vec2(minDepth, allValid ? maxDepth : -maxDepth);
+  imageStore(s_dstMip, dst, vec4(encoded, 0.0, 0.0));
+}

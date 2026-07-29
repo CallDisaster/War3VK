@@ -8,10 +8,12 @@
 #include <vector>
 
 #include "war3_render_identity_bridge.h"
+#include "war3_shadow_producer_policy.h"
 
 namespace dxvk::war3::render {
 
 struct CurrentDrawContractRecord;
+struct ShadowCasterTombstone;
 
 inline constexpr uint32_t kInvalidVisibleMeshIndex = 0xFFFFFFFFu;
 
@@ -42,6 +44,8 @@ struct VisibleRenderableRecord {
   uint32_t geosetIndex = kInvalidVisibleMeshIndex;
   float transparentDistanceSq = 0.0f;
   VisibleRenderableQueueKind queueKind = VisibleRenderableQueueKind::MainQueue;
+  int16_t stage = -1;
+  bool pathBlocker = false;
 
   RenderObjectIdentitySnapshot identity = {};
 
@@ -78,6 +82,19 @@ public:
     uint64_t semanticCandidateCallCount = 0;
     uint64_t semanticCandidateMergedCount = 0;
     uint64_t semanticCandidateAppendedCount = 0;
+    uint64_t semanticMergeFallbackCallCount = 0;
+    uint64_t semanticMergeIndexLookupCount = 0;
+    uint64_t semanticMergeIndexHitCount = 0;
+    uint64_t semanticMergeIndexCandidateVisitCount = 0;
+    uint64_t semanticMergeLegacyScanCallCount = 0;
+    uint64_t semanticMergeLegacyScanRecordVisitCount = 0;
+    uint64_t semanticMergeVerifierCallCount = 0;
+    uint64_t semanticMergeVerifierLegacyScanRecordVisitCount = 0;
+    uint64_t semanticMergeVerifierMismatchCount = 0;
+    uint64_t semanticMergeVerifierSelectionMismatchCount = 0;
+    uint64_t semanticMergeVerifierAuxIndexCheckCount = 0;
+    uint64_t semanticMergeVerifierAuxIndexMismatchCount = 0;
+    uint64_t semanticMergeIndexEntryCount = 0;
     uint64_t transparentEntryCallCount = 0;
   };
 
@@ -105,6 +122,7 @@ public:
     uint64_t visibleLookupPartLayerHitCount = 0;
     uint64_t visibleLookupSingleFallbackCount = 0;
     uint64_t visibleLookupMissCount = 0;
+    uint64_t poseFreshGenerationVerifierMismatchCount = 0;
   };
 
   struct ShadowManifestPartLeaseInfo {
@@ -121,13 +139,27 @@ public:
     uint64_t cModelPoseMatrixHash = 0;
     uint32_t cModelPoseMatrixCount = 0;
     uint32_t observedFrameCount = 0;
+    int16_t producerStage = -1;
+    War3BatchTag producerGroup = War3BatchTag::Unknown;
+    ShadowProducerKind sourceKind = ShadowProducerKind::CurrentDrawContract;
+    uint64_t visibleFrameSerial = 0u;
+    uint64_t stagePolicyRevision = 0u;
+    uint32_t graceAge = 0u;
     bool found = false;
+    bool producerFreshThisFrame = false;
+    bool fromGrace = false;
+    bool alphaPayloadComplete = false;
     bool structureLive = false;
     bool poseFresh = false;
     bool sliceFresh = false;
     bool packetFresh = false;
     bool cModelPoseFresh = false;
     bool leaseable = false;
+  };
+
+  struct ShadowManifestRetireResult {
+    uint64_t objectCount = 0u;
+    uint64_t partCount = 0u;
   };
 
   static VisibleRenderableRegistry &instance();
@@ -163,6 +195,9 @@ public:
                                         uint64_t frameNumber);
   ShadowManifestPartLeaseInfo queryShadowManifestPartLeaseInfo(
       uint64_t partKey, uint64_t frameNumber) const;
+  ShadowManifestRetireResult retireShadowManifest(
+      const ShadowCasterTombstone& tombstone);
+  ShadowManifestRetireResult clearShadowManifest();
   ShadowManifestSummary queryShadowManifestSummary() const;
 
   static uint64_t computeShadowManifestObjectKey(
@@ -186,6 +221,11 @@ public:
     std::unordered_map<void *, uint32_t> byRenderablePart;
     std::unordered_map<uint64_t, uint32_t> byRenderablePartLayer;
     std::unordered_map<void *, uint32_t> renderablePartRecordCount;
+    // Deferred-index registerSemanticCandidate fallback accelerator. Each
+    // record is indexed once for every distinct non-null pointer among
+    // renderablePart/payload. Values remain record indices, never vector
+    // pointers or iterators, so records reallocation cannot invalidate them.
+    std::unordered_multimap<void *, uint32_t> semanticMergeByPointer;
     std::unordered_map<void *, uint32_t> byWorldObjectEntry;
     std::unordered_map<uint32_t, uint32_t> byHandle;
     std::unordered_map<void *, uint32_t> bySceneNode;
@@ -202,12 +242,25 @@ public:
     uint64_t semanticCandidateCallCount = 0;
     uint64_t semanticCandidateMergedCount = 0;
     uint64_t semanticCandidateAppendedCount = 0;
+    uint64_t semanticMergeFallbackCallCount = 0;
+    uint64_t semanticMergeIndexLookupCount = 0;
+    uint64_t semanticMergeIndexHitCount = 0;
+    uint64_t semanticMergeIndexCandidateVisitCount = 0;
+    uint64_t semanticMergeLegacyScanCallCount = 0;
+    uint64_t semanticMergeLegacyScanRecordVisitCount = 0;
+    uint64_t semanticMergeVerifierCallCount = 0;
+    uint64_t semanticMergeVerifierLegacyScanRecordVisitCount = 0;
+    uint64_t semanticMergeVerifierMismatchCount = 0;
+    uint64_t semanticMergeVerifierSelectionMismatchCount = 0;
+    uint64_t semanticMergeVerifierAuxIndexCheckCount = 0;
+    uint64_t semanticMergeVerifierAuxIndexMismatchCount = 0;
     uint64_t transparentEntryCallCount = 0;
     size_t lastRecordCount = 0;
     size_t lastPayloadCount = 0;
     size_t lastRenderablePartCount = 0;
     size_t lastRenderablePartLayerCount = 0;
     size_t lastRenderablePartRecordCount = 0;
+    size_t lastSemanticMergePointerCount = 0;
     size_t lastWorldObjectCount = 0;
     size_t lastHandleCount = 0;
     size_t lastSceneNodeCount = 0;
@@ -232,6 +285,7 @@ private:
     uint64_t firstSeenFrame = 0;
     uint64_t lastSeenFrame = 0;
     uint32_t observedFrameCount = 0;
+    uint32_t poseFreshGeneration = 0;
   };
 
   struct ShadowManifestPartEntry {
@@ -250,6 +304,15 @@ private:
     uint32_t lastPayloadWord11C = 0;
     uint32_t renderablePartChurnCount = 0;
     uint32_t observedFrameCount = 0;
+    int16_t producerStage = -1;
+    War3BatchTag producerGroup = War3BatchTag::Unknown;
+    ShadowProducerKind sourceKind = ShadowProducerKind::CurrentDrawContract;
+    uint64_t visibleFrameSerial = 0u;
+    uint64_t stagePolicyRevision = 0u;
+    uint32_t graceAge = 0u;
+    bool producerFreshThisFrame = false;
+    bool fromGrace = false;
+    bool alphaPayloadComplete = false;
   };
 
   void appendRecord(Snapshot &snap, VisibleRenderableRecord &record);
@@ -260,6 +323,7 @@ private:
   std::array<Snapshot, kSnapshotCount> m_snapshots = {};
   std::atomic<uint32_t> m_publishedIndex{0};
   uint32_t m_writeIndex = 0;
+  uint32_t m_shadowManifestRefreshGeneration = 0;
   std::thread::id m_renderThreadId = {};
   std::atomic<uint64_t> m_frameNumber{0};
   // Phase 7.96：record cap 触发后置 true，后续 register 调用在入口直接 return。
@@ -267,8 +331,8 @@ private:
   std::unordered_map<uint64_t, ShadowManifestObjectEntry>
       m_shadowManifestObjects;
   std::unordered_map<uint64_t, ShadowManifestPartEntry> m_shadowManifestParts;
-  // Phase 7.31 Iteration G 回退：不再维护反向索引（sibling propagation 已默认关闭）。
-  // 字段保留结构占位但不再使用（移除以减少 per-instance 开销）。
+  // Phase 7.31 Iteration G：不维护 objectKey→partKey 反向索引；refresh
+  // generation 标在 object entry 上，part sweep 直接查询现有 object map。
   ShadowManifestSummary m_shadowManifestSummary = {};
   mutable std::atomic<uint64_t> m_shadowManifestVisibleLookupPartLayerHitCount{
       0};

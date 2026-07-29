@@ -10,6 +10,7 @@
 #include "war3_hook_widget_identity.h"
 
 #include "war3_hook_install_util.h"
+#include "war3_hook_perf.h"
 #include "../../d3d9_war3_debug.h"
 #include "../core/war3_game_structs.h"
 #include "../core/war3_internal_test_config.h"
@@ -29,6 +30,10 @@
 #include <unordered_map>
 
 #include "../../../util/log/log.h"
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace dxvk::war3::hooks {
 
@@ -65,6 +70,7 @@ using WidgetRegisterFootprintFn = int(__fastcall*)(
 
 WidgetRegisterFootprintFn g_originalWidgetRegister = nullptr;
 WidgetRegisterFootprintFn g_trampolineWidgetRegister = nullptr;
+std::atomic<uintptr_t> g_widgetIdentityGameBase{0u};
 
 // One identity record per widget. Lifetime tracks the widget itself; on
 // destruction the entry simply stops being looked up. War3 does not reuse
@@ -122,6 +128,11 @@ struct GlobalStats {
   std::atomic<uint64_t> installFailedAddrNull{0};
   std::atomic<uint64_t> installFailedEnvDisabled{0};
   std::atomic<uint64_t> installFailedMinHook{0};
+  std::atomic<uint32_t> lastCallerRva{0u};
+  std::atomic<uint32_t> lastArgumentMask{0u};
+  std::atomic<uint64_t> callerChangeCount{0u};
+  std::atomic<uint64_t> callerOutsideGameModuleCount{0u};
+  std::atomic<uint64_t> lifecycleObserverCount{0u};
 };
 
 GlobalStats& stats() {
@@ -140,6 +151,54 @@ bool WidgetIdentityHookEnabled() {
     return env[0] != '0';
   }();
   return s_enabled;
+}
+
+uint32_t GetWidgetRegisterCallerRva(uintptr_t callerAddress) {
+  const uintptr_t gameBase =
+      g_widgetIdentityGameBase.load(std::memory_order_relaxed);
+  if (gameBase == 0u || callerAddress < gameBase) {
+    stats().callerOutsideGameModuleCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return 0u;
+  }
+  const uintptr_t rva = callerAddress - gameBase;
+  if (rva > 0x02000000u) {
+    stats().callerOutsideGameModuleCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return 0u;
+  }
+  return static_cast<uint32_t>(rva);
+}
+
+void ObserveWidgetLifecycleCaller(
+    uint32_t callerRva,
+    int a1,
+    void* widgetPtr,
+    int* posXYZ,
+    float* posY,
+    int a5,
+    int a6,
+    int a7,
+    int a8) {
+  // Preserve only a compact, non-semantic argument shape. Do not infer
+  // Hidden/Removed from these bits: several verified callers reuse this
+  // function for create, move and footprint refresh operations.
+  uint32_t mask = 0u;
+  mask |= a1 != 0 ? 1u << 0 : 0u;
+  mask |= widgetPtr != nullptr ? 1u << 1 : 0u;
+  mask |= posXYZ != nullptr ? 1u << 2 : 0u;
+  mask |= posY != nullptr ? 1u << 3 : 0u;
+  mask |= a5 != 0 ? 1u << 4 : 0u;
+  mask |= a6 != 0 ? 1u << 5 : 0u;
+  mask |= a7 != 0 ? 1u << 6 : 0u;
+  mask |= a8 != 0 ? 1u << 7 : 0u;
+  stats().lastArgumentMask.store(mask, std::memory_order_relaxed);
+  const uint32_t previous =
+      stats().lastCallerRva.exchange(callerRva, std::memory_order_relaxed);
+  if (previous != 0u && callerRva != 0u && previous != callerRva) {
+    stats().callerChangeCount.fetch_add(1u, std::memory_order_relaxed);
+  }
+  stats().lifecycleObserverCount.fetch_add(1u, std::memory_order_relaxed);
 }
 
 // Best-effort kind classification using agent type or unit flags.
@@ -288,11 +347,25 @@ int __fastcall HookedWidgetRegisterFootprintAndShadowMask(
     int a6,
     int a7,
     int a8) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::WidgetRegisterFootprint, 8u);
+  uintptr_t callerAddress = 0u;
+#if defined(_MSC_VER)
+  callerAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
+#elif defined(__GNUC__)
+  callerAddress =
+      reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+#endif
+  const uint32_t callerRva =
+      GetWidgetRegisterCallerRva(callerAddress);
+  ObserveWidgetLifecycleCaller(
+      callerRva, a1, widgetPtr, posXYZ, posY, a5, a6, a7, a8);
   // Always proxy to the original game function, even on internal failure.
   if (WidgetIdentityHookEnabled())
     ProcessWidgetRegister(widgetPtr);
 
   if (g_trampolineWidgetRegister) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
     return g_trampolineWidgetRegister(a1, widgetPtr, posXYZ, posY, a5, a6, a7,
                                        a8);
   }
@@ -324,6 +397,9 @@ bool InstallWidgetIdentityHook(void* widgetRegisterAddr) {
 
   g_originalWidgetRegister =
       reinterpret_cast<WidgetRegisterFootprintFn>(widgetRegisterAddr);
+  const HMODULE gameModule = ::GetModuleHandleA("Game.dll");
+  g_widgetIdentityGameBase.store(
+      reinterpret_cast<uintptr_t>(gameModule), std::memory_order_release);
 
   const bool ok = InstallMinHook(
       widgetRegisterAddr,
@@ -502,6 +578,16 @@ WidgetIdentityHookStats GetWidgetIdentityHookStats() {
       stats().installFailedEnvDisabled.load(std::memory_order_relaxed);
   out.installFailedMinHook =
       stats().installFailedMinHook.load(std::memory_order_relaxed);
+  out.lastCallerRva =
+      stats().lastCallerRva.load(std::memory_order_relaxed);
+  out.lastArgumentMask =
+      stats().lastArgumentMask.load(std::memory_order_relaxed);
+  out.callerChangeCount =
+      stats().callerChangeCount.load(std::memory_order_relaxed);
+  out.callerOutsideGameModuleCount =
+      stats().callerOutsideGameModuleCount.load(std::memory_order_relaxed);
+  out.lifecycleObserverCount =
+      stats().lifecycleObserverCount.load(std::memory_order_relaxed);
   return out;
 }
 

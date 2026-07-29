@@ -1,7 +1,10 @@
 """Phase 7.113: 双图性能基线（高压+低压）"""
 import sys
 sys.path.insert(0, '.')
-from war3_autotest_mcp import run_quick_autotest
+from war3_autotest_mcp import DEFAULT_SANDBOX_ROOT, run_quick_autotest
+
+HIGH_MAP = DEFAULT_SANDBOX_ROOT / "Maps" / "ShadowTest" / "光影测试(高压).w3x"
+LOW_MAP = DEFAULT_SANDBOX_ROOT / "Maps" / "ShadowTest" / "光影测试.w3x"
 
 def get_perf(r):
     rep = r.get('report', {}) or {}
@@ -16,7 +19,7 @@ def get_perf(r):
 
 print("\n========== HIGH PRESSURE (光影测试-高压) 30s ==========")
 r1 = run_quick_autotest(
-    map_path=r"E:\Work\War3\Maps\ShadowTest\光影测试(高压).w3x",
+    map_path=str(HIGH_MAP),
     sample_duration_sec=30,
     use_isolated_desktop=False,  # Phase 7.137：前台模式更稳定，isolated desktop 会让 GPU present 被 compositor 阻塞导致高压 FPS 假降 5-10
     deploy_d3d9_before_launch=False,
@@ -28,7 +31,7 @@ for k,v in p1.items():
 
 print("\n========== LOW PRESSURE (光影测试) 30s ==========")
 r2 = run_quick_autotest(
-    map_path=r"E:\Work\War3\Maps\ShadowTest\光影测试.w3x",
+    map_path=str(LOW_MAP),
     sample_duration_sec=30,
     use_isolated_desktop=False,  # Phase 7.137：同上
     deploy_d3d9_before_launch=False,

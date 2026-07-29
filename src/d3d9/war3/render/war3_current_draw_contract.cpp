@@ -5,9 +5,12 @@
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_memory.h"
 #include "../hooks/war3_hook_install_util.h"
+#include "../hooks/war3_hook_perf.h"
 #include "../tools/war3_perf_monitor.h"
 #include "war3_render_state.h"
 #include "war3_render_objects.h"
+#include "war3_shadow_lifecycle.h"
+#include "war3_shadow_producer_policy.h"
 #include "../state/war3_render_state.h"
 #include "war3_visible_renderables.h"
 #include "../../util/util_bit.h"
@@ -18,7 +21,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <windows.h>
@@ -29,9 +34,30 @@ namespace {
 
 static constexpr uint32_t kMaxPaletteMatrices = 256u;
 static constexpr size_t kContractCacheSize = 4096u;
+// Keep the historical one-record-per-bucket residency contract and pointer
+// bucket mapping. Increasing residency or changing the mapping exposed records
+// that the downstream GPU path is not prepared to consume and reproduced
+// device loss in the high-pressure gate. Missing palettes are recovered later
+// through the canonical live-rebuild path, never by widening these caches.
+static constexpr size_t kContractCacheWays = 1u;
+static constexpr size_t kContractCacheSetCount =
+    kContractCacheSize / kContractCacheWays;
+static constexpr size_t kContractCacheOccupancyWordCount =
+    (kContractCacheSize + 63u) / 64u;
 static constexpr size_t kPaletteSnapshotCacheSize = 512u;
+static constexpr size_t kPaletteSnapshotCacheWays = 1u;
+static constexpr size_t kPaletteSnapshotCacheSetCount =
+    kPaletteSnapshotCacheSize / kPaletteSnapshotCacheWays;
 static constexpr size_t kPreparedSliceCacheSize = 1024u;
 static constexpr size_t kPreparedSliceInterestCacheSize = 2048u;
+// The legacy CurrentDraw cache intentionally remains one-way because widening
+// it changes palette/snapshot residency. Geometry capture needs only the exact
+// current Stage11 identity, so keep a separate four-way TLS ledger whose
+// records can never reach those historical consumers.
+static constexpr size_t kGeometryContractLedgerSize = 8192u;
+static constexpr size_t kGeometryContractLedgerWays = 4u;
+static constexpr size_t kGeometryContractLedgerSetCount =
+    kGeometryContractLedgerSize / kGeometryContractLedgerWays;
 using RenderQueueUpdateItemWorldMatrixFn =
     int(__fastcall *)(int sceneNodePtr, int renderablePartPtr,
                       int meshPayloadPtr);
@@ -85,8 +111,20 @@ struct CurrentDrawPreparedSliceInterest {
   uint32_t layerIndex = 0u;
 };
 
+struct CurrentDrawGeometryLedgerEntry {
+  void* renderablePart = nullptr;
+  uint64_t identityAlias = 0u;
+  CurrentDrawContractRecord record = {};
+};
+
 thread_local std::array<CurrentDrawContractRecord, kContractCacheSize>
     g_currentDrawContractCache = {};
+// Direct-mapped cache slots are sparse in normal scenes. Snapshot used to walk
+// all 4096 large records every frame; retain an exact TLS occupancy bitmap so
+// the snapshot can visit only published slots while preserving ascending slot
+// order (and therefore the historical dedupe/tie order).
+thread_local std::array<uint64_t, kContractCacheOccupancyWordCount>
+    g_currentDrawContractCacheOccupancy = {};
 thread_local std::array<PaletteSnapshotEntry, kPaletteSnapshotCacheSize>
     g_paletteSnapshotCache = {};
 thread_local std::array<CurrentDrawPreparedSliceRecord,
@@ -95,6 +133,9 @@ thread_local std::array<CurrentDrawPreparedSliceRecord,
 thread_local std::array<CurrentDrawPreparedSliceInterest,
                         kPreparedSliceInterestCacheSize>
     g_preparedSliceInterestCache = {};
+thread_local std::array<CurrentDrawGeometryLedgerEntry,
+                        kGeometryContractLedgerSize>
+    g_currentDrawGeometryLedger = {};
 thread_local CurrentDrawContractRecord g_globalFallbackRecord = {};
 thread_local CurrentDrawDispatchContext g_currentDrawDispatchContext = {};
 std::mutex g_publishedCurrentDrawMutex;
@@ -109,6 +150,260 @@ std::unordered_map<uint64_t, PaletteSnapshotEntry>
     g_publishedPaletteSnapshotByAttribution;
 std::unordered_map<uint64_t, CurrentDrawContractRecord>
     g_publishedCurrentDrawReadyByAttribution;
+
+static_assert(kContractCacheSize % kContractCacheWays == 0u);
+static_assert(kPaletteSnapshotCacheSize % kPaletteSnapshotCacheWays == 0u);
+static_assert((kContractCacheSetCount & (kContractCacheSetCount - 1u)) == 0u);
+static_assert((kPaletteSnapshotCacheSetCount &
+               (kPaletteSnapshotCacheSetCount - 1u)) == 0u);
+static_assert(kGeometryContractLedgerSize % kGeometryContractLedgerWays == 0u);
+static_assert((kGeometryContractLedgerSetCount &
+               (kGeometryContractLedgerSetCount - 1u)) == 0u);
+
+uint64_t CurrentDrawGeometryIdentityAlias(uint32_t kind, uint64_t value) {
+  if (value == 0u)
+    return 0u;
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, 0x72130000u | kind);
+  hash = bit::fnv1a_iter(hash, value);
+  return hash;
+}
+
+size_t CurrentDrawGeometryLedgerSetBase(void* renderablePart,
+                                        uint64_t identityAlias) {
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(
+      hash, uint64_t(reinterpret_cast<uintptr_t>(renderablePart)));
+  hash = bit::fnv1a_iter(hash, identityAlias);
+  return size_t(hash & (kGeometryContractLedgerSetCount - 1u)) *
+      kGeometryContractLedgerWays;
+}
+
+bool CurrentDrawGeometryRecordMatchesIdentity(
+    const CurrentDrawContractRecord& record,
+    void* sceneNode,
+    void* worldObjectEntry,
+    void* unitPtr,
+    uint32_t jHandle) {
+  bool matched = false;
+  if (sceneNode != nullptr && record.sceneNode != nullptr) {
+    if (sceneNode != record.sceneNode)
+      return false;
+    matched = true;
+  }
+  if (worldObjectEntry != nullptr && record.worldObjectEntry != nullptr) {
+    if (worldObjectEntry != record.worldObjectEntry)
+      return false;
+    matched = true;
+  }
+  if (unitPtr != nullptr && record.unitPtr != nullptr) {
+    if (unitPtr != record.unitPtr)
+      return false;
+    matched = true;
+  }
+  if (jHandle != 0u && record.jHandle != 0u) {
+    if (jHandle != record.jHandle)
+      return false;
+    matched = true;
+  }
+  return matched;
+}
+
+void StoreCurrentDrawGeometryLedgerAlias(
+    const CurrentDrawContractRecord& record,
+    uint64_t identityAlias) {
+  if (identityAlias == 0u)
+    return;
+  const size_t base = CurrentDrawGeometryLedgerSetBase(
+      record.renderablePart, identityAlias);
+  size_t selected = base;
+  size_t empty = kGeometryContractLedgerSize;
+  uint64_t oldestSerial = std::numeric_limits<uint64_t>::max();
+  for (size_t way = 0u; way < kGeometryContractLedgerWays; ++way) {
+    const size_t slot = base + way;
+    const auto& entry = g_currentDrawGeometryLedger[slot];
+    if (entry.renderablePart == record.renderablePart &&
+        entry.identityAlias == identityAlias) {
+      selected = slot;
+      empty = kGeometryContractLedgerSize;
+      break;
+    }
+    if (entry.renderablePart == nullptr && empty == kGeometryContractLedgerSize)
+      empty = slot;
+    if (entry.record.captureSerial < oldestSerial) {
+      oldestSerial = entry.record.captureSerial;
+      selected = slot;
+    }
+  }
+  if (empty != kGeometryContractLedgerSize)
+    selected = empty;
+  auto& destination = g_currentDrawGeometryLedger[selected];
+  destination.renderablePart = record.renderablePart;
+  destination.identityAlias = identityAlias;
+  destination.record = record;
+  destination.record.known = true;
+}
+
+void StoreCurrentDrawGeometryLedgerRecord(
+    const CurrentDrawContractRecord& record) {
+  if (record.renderablePart == nullptr || record.meshPayloadPtr == nullptr ||
+      record.producerStage != 11 || !record.producerFreshThisFrame ||
+      record.fromGrace) {
+    return;
+  }
+  StoreCurrentDrawGeometryLedgerAlias(
+      record, CurrentDrawGeometryIdentityAlias(1u, record.jHandle));
+  StoreCurrentDrawGeometryLedgerAlias(
+      record, CurrentDrawGeometryIdentityAlias(
+                  2u, uint64_t(reinterpret_cast<uintptr_t>(record.unitPtr))));
+  StoreCurrentDrawGeometryLedgerAlias(
+      record, CurrentDrawGeometryIdentityAlias(
+                  3u, uint64_t(reinterpret_cast<uintptr_t>(
+                          record.worldObjectEntry))));
+  StoreCurrentDrawGeometryLedgerAlias(
+      record, CurrentDrawGeometryIdentityAlias(
+                  4u, uint64_t(reinterpret_cast<uintptr_t>(record.sceneNode))));
+}
+
+size_t CurrentDrawCacheSetIndex(void* renderablePart, size_t setCount) {
+  // Preserve the historical bucket mapping exactly. Experiments with wider
+  // sets and alternative hashes exposed records that the downstream GPU path
+  // is not yet prepared to consume.
+  return (uintptr_t(renderablePart) >> 4u) % setCount;
+}
+
+size_t CurrentDrawContractSetBase(void* renderablePart) {
+  return CurrentDrawCacheSetIndex(renderablePart, kContractCacheSetCount) *
+      kContractCacheWays;
+}
+
+CurrentDrawContractRecord* FindLocalCurrentDrawContract(
+    void* renderablePart) {
+  if (renderablePart == nullptr)
+    return nullptr;
+  const size_t base = CurrentDrawContractSetBase(renderablePart);
+  CurrentDrawContractRecord* best = nullptr;
+  for (size_t way = 0u; way < kContractCacheWays; ++way) {
+    auto& entry = g_currentDrawContractCache[base + way];
+    if (entry.renderablePart != renderablePart)
+      continue;
+    if (best == nullptr || entry.captureSerial > best->captureSerial)
+      best = &entry;
+  }
+  return best;
+}
+
+size_t SelectLocalCurrentDrawContractSlot(void* renderablePart) {
+  const size_t base = CurrentDrawContractSetBase(renderablePart);
+  size_t oldestSlot = base;
+  size_t emptySlot = kContractCacheSize;
+  uint64_t oldestSerial = std::numeric_limits<uint64_t>::max();
+  for (size_t way = 0u; way < kContractCacheWays; ++way) {
+    const size_t slot = base + way;
+    const auto& entry = g_currentDrawContractCache[slot];
+    if (entry.renderablePart == renderablePart)
+      return slot;
+    if (entry.renderablePart == nullptr && emptySlot == kContractCacheSize)
+      emptySlot = slot;
+    if (entry.captureSerial < oldestSerial) {
+      oldestSerial = entry.captureSerial;
+      oldestSlot = slot;
+    }
+  }
+  return emptySlot != kContractCacheSize ? emptySlot : oldestSlot;
+}
+
+size_t PaletteSnapshotSetBase(void* renderablePart) {
+  return CurrentDrawCacheSetIndex(renderablePart,
+                                  kPaletteSnapshotCacheSetCount) *
+      kPaletteSnapshotCacheWays;
+}
+
+PaletteSnapshotEntry* FindLocalPaletteSnapshot(void* renderablePart) {
+  if (renderablePart == nullptr)
+    return nullptr;
+  const size_t base = PaletteSnapshotSetBase(renderablePart);
+  PaletteSnapshotEntry* best = nullptr;
+  for (size_t way = 0u; way < kPaletteSnapshotCacheWays; ++way) {
+    auto& entry = g_paletteSnapshotCache[base + way];
+    if (entry.renderablePart != renderablePart)
+      continue;
+    if (best == nullptr || entry.captureSerial > best->captureSerial)
+      best = &entry;
+  }
+  return best;
+}
+
+size_t SelectLocalPaletteSnapshotSlot(void* renderablePart) {
+  const size_t base = PaletteSnapshotSetBase(renderablePart);
+  size_t oldestSlot = base;
+  size_t emptySlot = kPaletteSnapshotCacheSize;
+  uint64_t oldestSerial = std::numeric_limits<uint64_t>::max();
+  for (size_t way = 0u; way < kPaletteSnapshotCacheWays; ++way) {
+    const size_t slot = base + way;
+    const auto& entry = g_paletteSnapshotCache[slot];
+    if (entry.renderablePart == renderablePart)
+      return slot;
+    if (entry.renderablePart == nullptr &&
+        emptySlot == kPaletteSnapshotCacheSize) {
+      emptySlot = slot;
+    }
+    if (entry.captureSerial < oldestSerial) {
+      oldestSerial = entry.captureSerial;
+      oldestSlot = slot;
+    }
+  }
+  return emptySlot != kPaletteSnapshotCacheSize ? emptySlot : oldestSlot;
+}
+
+ShadowCasterIdentity MakeShadowCasterIdentity(
+    const CurrentDrawContractRecord& record) {
+  ShadowCasterIdentity identity = {};
+  identity.unitPtr = record.unitPtr;
+  identity.worldObjectEntry = record.worldObjectEntry;
+  identity.sceneNode = record.sceneNode;
+  identity.renderablePart = record.renderablePart;
+  identity.jHandle = record.jHandle;
+  identity.rawcode = record.rawcode;
+  identity.producerStage =
+      record.producerStage >= 0 ? record.producerStage : record.stage;
+  return identity;
+}
+
+bool CurrentDrawRecordMatchesTombstone(
+    const CurrentDrawContractRecord& record,
+    const ShadowCasterTombstone& tombstone) {
+  const int16_t recordStage =
+      record.producerStage >= 0 ? record.producerStage : record.stage;
+  if (tombstone.reason == ShadowCasterTombstoneReason::StageDisabled &&
+      tombstone.identity.producerStage >= 0) {
+    return recordStage == tombstone.identity.producerStage;
+  }
+  return ShadowCasterIdentityMatches(
+      MakeShadowCasterIdentity(record), tombstone.identity);
+}
+
+CurrentDrawContractRecord SnapshotRecordWithGrace(
+    const CurrentDrawContractRecord& record) {
+  CurrentDrawContractRecord snapshot = record;
+  const uint64_t currentVisibleFrameSerial =
+      VisibleRenderableRegistry::instance().getFrameNumber();
+  snapshot.fromGrace =
+      snapshot.visibleFrameSerial != 0u &&
+      currentVisibleFrameSerial > snapshot.visibleFrameSerial;
+  snapshot.producerFreshThisFrame =
+      record.producerFreshThisFrame && !snapshot.fromGrace;
+  if (snapshot.fromGrace) {
+    const uint64_t age =
+        currentVisibleFrameSerial - snapshot.visibleFrameSerial;
+    snapshot.graceAge = age > uint64_t(std::numeric_limits<uint32_t>::max())
+        ? std::numeric_limits<uint32_t>::max()
+        : static_cast<uint32_t>(age);
+  } else {
+    snapshot.graceAge = 0u;
+  }
+  return snapshot;
+}
 
 std::atomic<uint64_t> g_publishAttemptCount{0u};
 std::atomic<uint64_t> g_publishReadyCount{0u};
@@ -327,6 +622,214 @@ bool GlobalCurrentDrawPublishEnabled() {
   return enabled;
 }
 
+bool CurrentDrawActiveSlotSnapshotEnabled() {
+  static const bool enabled =
+      ReadEnvU32("DXVK_WAR3_CURRENT_DRAW_ACTIVE_SLOT_SNAPSHOT", 1u) != 0u;
+  return enabled;
+}
+
+bool CurrentDrawBatchedBoundedSnapshotEnabled() {
+  // Bounded snapshots historically maintained global order on every insert,
+  // making an uncapped frame O(N^2) even when the record cap was never hit.
+  // Keep the original path available for isolated A/B and visual gates.
+  static const bool enabled =
+      ReadEnvU32("DXVK_WAR3_CURRENT_DRAW_BATCHED_BOUNDED_SNAPSHOT", 1u) != 0u;
+  return enabled;
+}
+
+bool CurrentDrawSnapshotBreakdownEnabled() {
+  // Coarse frame-level tracing only. Keep this separate from the per-draw
+  // publish probes so production snapshots pay no timer or scope cost.
+  static const bool enabled =
+      ReadEnvU32("DXVK_WAR3_CURRENT_DRAW_SNAPSHOT_BREAKDOWN", 0u) != 0u;
+  return enabled;
+}
+
+bool CurrentDrawHookBreakdownEnabled() {
+  // This is deliberately separate from the frame-level snapshot breakdown.
+  // It adds fixed-ID QPC regions to the sampled CurrentDraw HotHook tree and
+  // therefore stays opt-in at PERF_LEVEL=2.
+  static const bool enabled =
+      ReadEnvU32("DXVK_WAR3_PERF_CURRENT_DRAW_BREAKDOWN", 0u) != 0u;
+  return enabled && dxvk::war3::internal::War3PerfHookLevel() >= 2;
+}
+
+bool CurrentDrawRedundantAtomicsLegacyRuntime() {
+  // The old publish path performed one unread provenance bucket RMW for every
+  // ready snapshot and a second lifetime counter RMW for every trusted hit.
+  // On the 32-bit build each uint64_t fetch_add lowers to lock cmpxchg8b. Keep
+  // the exact legacy writes for same-DLL A/B; the default path derives the
+  // compatibility trusted total from its canonical counter instead.
+  static const bool enabled =
+      ReadEnvU32("DXVK_WAR3_CURRENT_DRAW_REDUNDANT_ATOMICS", 0u) != 0u;
+  return enabled;
+}
+
+dxvk::war3::War3PerfMonitor::ScopedCpuScope
+CurrentDrawLegacyDetailScope(const char* name) {
+  // The fixed-ID tree and the old string detail scopes measure the same work.
+  // Never publish both: doing so would inflate coverage and make Hotspot self
+  // time mathematically wrong.
+  // The coarse CurrentDraw fixed root is already active for every Level-2
+  // boundary, even when its optional child breakdown is disabled.
+  if (dxvk::war3::internal::War3PerfHookLevel() >= 2)
+    return {};
+  return dxvk::war3::War3PerfMonitor::instance().cpuDetailScope(name);
+}
+
+class CurrentDrawFixedPhaseScope final {
+public:
+  CurrentDrawFixedPhaseScope(
+      dxvk::war3::hooks::War3HotHookId id,
+      uint32_t sampleWeight) noexcept {
+    if (sampleWeight != 0u) {
+      m_timing.emplace(
+          id, dxvk::war3::hooks::War3HotHookPreselectedSample{
+                  sampleWeight});
+    }
+  }
+
+  CurrentDrawFixedPhaseScope(
+      const CurrentDrawFixedPhaseScope&) = delete;
+  CurrentDrawFixedPhaseScope& operator=(
+      const CurrentDrawFixedPhaseScope&) = delete;
+
+private:
+  std::optional<dxvk::war3::hooks::War3HotHookCallTiming> m_timing;
+};
+
+uint32_t CurrentDrawSnapshotTraceSamplePeriod() {
+  static const uint32_t period = std::clamp<uint32_t>(
+      ReadEnvU32("DXVK_WAR3_CURRENT_DRAW_SNAPSHOT_TRACE_PERIOD", 16u),
+      1u, 4096u);
+  return period;
+}
+
+bool SampleCurrentDrawSnapshotRecord(uint32_t period) {
+  if (period <= 1u)
+    return true;
+  static thread_local uint64_t state = 0x94d049bb133111ebull;
+  state ^= state << 13u;
+  state ^= state >> 7u;
+  state ^= state << 17u;
+  return (state % period) == 0u;
+}
+
+uint64_t CurrentDrawSnapshotQpcOverheadTicks() {
+  static const uint64_t ticks = []() {
+    uint64_t minimum = std::numeric_limits<uint64_t>::max();
+    for (uint32_t i = 0u; i < 64u; ++i) {
+      const int64_t begin = dxvk::high_resolution_clock::get_counter();
+      const int64_t end = dxvk::high_resolution_clock::get_counter();
+      if (end > begin)
+        minimum = std::min(minimum, uint64_t(end - begin));
+    }
+    return minimum == std::numeric_limits<uint64_t>::max() ? 0u : minimum;
+  }();
+  return ticks;
+}
+
+enum class CurrentDrawSnapshotRecordPhase : uint8_t {
+  VisibilityGate = 0u,
+  ReadyGate,
+  PriorityGate,
+  DedupeKey,
+  DedupeLookup,
+  DuplicateCompare,
+  DuplicateReplace,
+  IndexPublish,
+  RecordAppend,
+  BoundedDuplicateScan,
+  BoundedOrderScan,
+  BoundedInsert,
+  Count,
+};
+
+constexpr size_t kCurrentDrawSnapshotRecordPhaseCount =
+    static_cast<size_t>(CurrentDrawSnapshotRecordPhase::Count);
+
+struct CurrentDrawSnapshotPartKey {
+  uintptr_t renderablePart = 0u;
+  uint32_t layerIndex = 0u;
+  uint32_t payloadWord108 = 0u;
+  uint32_t payloadWord11C = 0u;
+
+  bool operator==(const CurrentDrawSnapshotPartKey& other) const {
+    return renderablePart == other.renderablePart &&
+        layerIndex == other.layerIndex &&
+        payloadWord108 == other.payloadWord108 &&
+        payloadWord11C == other.payloadWord11C;
+  }
+};
+
+struct CurrentDrawSnapshotPartKeyHash {
+  size_t operator()(const CurrentDrawSnapshotPartKey& key) const {
+    uint64_t hash = bit::fnv1a_init();
+    hash = bit::fnv1a_iter(hash, uint64_t(key.renderablePart));
+    hash = bit::fnv1a_iter(hash, key.layerIndex);
+    hash = bit::fnv1a_iter(hash, key.payloadWord108);
+    hash = bit::fnv1a_iter(hash, key.payloadWord11C);
+    return size_t(hash);
+  }
+};
+
+class CurrentDrawSnapshotRecordRawTiming final {
+public:
+  CurrentDrawSnapshotRecordRawTiming(
+      bool active, uint32_t sampleWeight, uint64_t qpcOverheadTicks,
+      std::array<uint64_t, kCurrentDrawSnapshotRecordPhaseCount>& ticks,
+      std::array<uint32_t, kCurrentDrawSnapshotRecordPhaseCount>& calls)
+      : m_active(active),
+        m_sampleWeight(std::max(1u, sampleWeight)),
+        m_qpcOverheadTicks(qpcOverheadTicks),
+        m_ticks(ticks),
+        m_calls(calls) {
+  }
+
+  ~CurrentDrawSnapshotRecordRawTiming() {
+    if (m_active)
+      closeCurrent(dxvk::high_resolution_clock::get_counter());
+  }
+
+  CurrentDrawSnapshotRecordRawTiming(
+      const CurrentDrawSnapshotRecordRawTiming&) = delete;
+  CurrentDrawSnapshotRecordRawTiming& operator=(
+      const CurrentDrawSnapshotRecordRawTiming&) = delete;
+
+  void enter(CurrentDrawSnapshotRecordPhase phase) {
+    if (!m_active)
+      return;
+    const int64_t now = dxvk::high_resolution_clock::get_counter();
+    closeCurrent(now);
+    m_phase = phase;
+    m_begin = now;
+    m_calls[static_cast<size_t>(phase)] += m_sampleWeight;
+  }
+
+private:
+  void closeCurrent(int64_t now) {
+    if (m_begin == 0 || m_phase == CurrentDrawSnapshotRecordPhase::Count)
+      return;
+    if (now > m_begin) {
+      const uint64_t elapsed = uint64_t(now - m_begin);
+      const uint64_t corrected = elapsed > m_qpcOverheadTicks
+          ? elapsed - m_qpcOverheadTicks
+          : 0u;
+      m_ticks[static_cast<size_t>(m_phase)] +=
+          corrected * m_sampleWeight;
+    }
+  }
+
+  bool m_active = false;
+  uint32_t m_sampleWeight = 1u;
+  uint64_t m_qpcOverheadTicks = 0u;
+  std::array<uint64_t, kCurrentDrawSnapshotRecordPhaseCount>& m_ticks;
+  std::array<uint32_t, kCurrentDrawSnapshotRecordPhaseCount>& m_calls;
+  CurrentDrawSnapshotRecordPhase m_phase =
+      CurrentDrawSnapshotRecordPhase::Count;
+  int64_t m_begin = 0;
+};
+
 bool PublishCurrentDrawContractAfterOriginalRuntime() {
   // RenderQueue_UpdateItemWorldMatrix (0x6F13A510) is the authoritative
   // palette-slot consumer/update point. Capture after the original by default
@@ -370,7 +873,7 @@ bool IsMainWorldObjectStageForCurrentDrawPublish() {
     return false;
 
   const int stage = dxvk::War3RenderState::GetStage();
-  return stage == 11 || stage == 12 || stage == 13;
+  return stage == 11 || stage == 13;
 }
 
 bool IsWorldCurrentDrawPublishContext() {
@@ -399,6 +902,20 @@ bool IsWorldCurrentDrawPublishContext() {
   }
 
   const auto& semantic = dxvk::War3RenderState::GetTlsShadowSemanticState();
+  const ShadowProducerPolicyContext producerContext = {
+      semantic.stage >= 0
+          ? semantic.stage
+          : dxvk::War3RenderState::GetStage(),
+      dxvk::War3RenderState::GetCurrentBatchTag(),
+      dxvk::War3RenderState::GetTlsBatchTag(),
+      semantic.tag,
+      false,
+  };
+  if (!ShadowProducerPolicyAllows(
+          ShadowProducerKind::CurrentDrawContract, producerContext)) {
+    return false;
+  }
+
   if (semantic.tag == dxvk::War3BatchTag::WorldObjects)
     return true;
 
@@ -433,7 +950,19 @@ bool Phase749PublishProbeEnabled() {
   return enabled;
 }
 
+// 2026-07-21 优化：与 Phase 7.49 probe 同款的逐 publish 诊断（CAS + 多次
+// fetch_add），但这组 counter 全工程无消费者（连 control-plane JSON 都未
+// 导出），属于 Phase 7.77 收口时的遗漏。默认关闭，`DXVK_WAR3_STREAM1_LAYOUT_PROBE=1`
+// 显式开启。
+bool Stream1LayoutProbeEnabled() {
+  static const bool enabled =
+      ReadEnvU32("DXVK_WAR3_STREAM1_LAYOUT_PROBE", 0u) != 0u;
+  return enabled;
+}
+
 void NotePublishedStream1Layout(const CurrentDrawContractRecord& record) {
+  if (!Stream1LayoutProbeEnabled())
+    return;
   if (record.stream1Ptr == nullptr) {
     g_stream1PublishNoStreamCount.fetch_add(1u, std::memory_order_relaxed);
     return;
@@ -485,10 +1014,9 @@ bool RecordHasReadyShape(const CurrentDrawContractRecord& record) {
 bool RecordHasLocalPaletteSnapshot(const CurrentDrawContractRecord& record) {
   if (!RecordHasReadyShape(record))
     return false;
-  const size_t snapshotSlot =
-      (uintptr_t(record.renderablePart) >> 4u) % kPaletteSnapshotCacheSize;
-  const auto& snapshot = g_paletteSnapshotCache[snapshotSlot];
-  if (snapshot.renderablePart != record.renderablePart)
+  const PaletteSnapshotEntry* snapshot =
+      FindLocalPaletteSnapshot(record.renderablePart);
+  if (snapshot == nullptr)
     return false;
   // Phase 7.32: 放宽 captureSerial 匹配条件。
   // 原先要求 snapshot.captureSerial == record.captureSerial，但在高频渲染中
@@ -497,20 +1025,20 @@ bool RecordHasLocalPaletteSnapshot(const CurrentDrawContractRecord& record) {
   // 这种相位差导致所有 record 被 readyOnly 过滤掉，populate 返回空帧。
   // 修复：允许 snapshot serial 比 record serial 旧最多 2 个版本。
   const bool captureSerialMatch =
-      snapshot.captureSerial == record.captureSerial ||
-      (record.captureSerial != 0u && snapshot.captureSerial != 0u &&
-       record.captureSerial > snapshot.captureSerial &&
-       record.captureSerial - snapshot.captureSerial <= 2u);
+      snapshot->captureSerial == record.captureSerial ||
+      (record.captureSerial != 0u && snapshot->captureSerial != 0u &&
+       record.captureSerial > snapshot->captureSerial &&
+       record.captureSerial - snapshot->captureSerial <= 2u);
   if (!captureSerialMatch)
     return false;
   // Phase 7.31 P0: 放宽 matrixCount 匹配（capturedPaletteCount 来自整模型，
   // snapshot.matrixCount 来自单 geoset groupCount，两者天然不同）。
-  if (snapshot.matrixCount == 0u)
+  if (snapshot->matrixCount == 0u)
     return false;
-  if (!(record.frameTag == 0u || snapshot.frameTag == 0u ||
-        snapshot.frameTag == record.frameTag ||
-        (record.frameTag > snapshot.frameTag &&
-         record.frameTag - snapshot.frameTag <= 1u)))
+  if (!(record.frameTag == 0u || snapshot->frameTag == 0u ||
+        snapshot->frameTag == record.frameTag ||
+        (record.frameTag > snapshot->frameTag &&
+         record.frameTag - snapshot->frameTag <= 1u)))
     return false;
   return true;
 }
@@ -545,14 +1073,21 @@ ContractLookupStatus LookupCurrentDrawContractRecord(
   if (renderablePart == nullptr)
     return ContractLookupStatus::MissingRecord;
 
-  const size_t slot =
-      (uintptr_t(renderablePart) >> 4u) % kContractCacheSize;
-  const CurrentDrawContractRecord& entry = g_currentDrawContractCache[slot];
-  if (entry.renderablePart != renderablePart) {
+  const CurrentDrawContractRecord* localEntry =
+      FindLocalCurrentDrawContract(renderablePart);
+  if (localEntry == nullptr) {
+    const size_t base = CurrentDrawContractSetBase(renderablePart);
+    bool occupiedCollision = false;
+    for (size_t way = 0u; way < kContractCacheWays; ++way) {
+      if (g_currentDrawContractCache[base + way].renderablePart != nullptr) {
+        occupiedCollision = true;
+        break;
+      }
+    }
     std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
     const auto globalIt = g_publishedCurrentDrawByPart.find(renderablePart);
     if (globalIt == g_publishedCurrentDrawByPart.end()) {
-      if (entry.renderablePart != nullptr)
+      if (occupiedCollision)
         return ContractLookupStatus::CacheCollision;
       return ContractLookupStatus::MissingRecord;
     }
@@ -560,6 +1095,7 @@ ContractLookupStatus LookupCurrentDrawContractRecord(
     out = &g_globalFallbackRecord;
     return ContractLookupStatus::Hit;
   }
+  const CurrentDrawContractRecord& entry = *localEntry;
 
   uint32_t currentFrameTag = 0u;
   const bool hasCurrentFrameTag = TryReadCurrentPaletteFrameTag(currentFrameTag);
@@ -795,15 +1331,14 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
     }
   };
 
-  const size_t snapshotSlot =
-      (uintptr_t(record.renderablePart) >> 4u) % kPaletteSnapshotCacheSize;
-  const auto& snapshot = g_paletteSnapshotCache[snapshotSlot];
-  if (snapshot.renderablePart == record.renderablePart &&
-      snapshot.captureSerial == record.captureSerial &&
-      snapshot.matrixCount == record.capturedPaletteCount &&
-      (record.frameTag == 0u || snapshot.frameTag == 0u ||
-       snapshot.frameTag == record.frameTag)) {
-    decodePaletteBytes(snapshot.bytes.data());
+  const PaletteSnapshotEntry* snapshot =
+      FindLocalPaletteSnapshot(record.renderablePart);
+  if (snapshot != nullptr &&
+      snapshot->captureSerial == record.captureSerial &&
+      snapshot->matrixCount == record.capturedPaletteCount &&
+      (record.frameTag == 0u || snapshot->frameTag == 0u ||
+       snapshot->frameTag == record.frameTag)) {
+    decodePaletteBytes(snapshot->bytes.data());
     outGroupCount = record.capturedPaletteCount;
     g_capturedPaletteQueryHitCount.fetch_add(1u, std::memory_order_relaxed);
     g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
@@ -874,149 +1409,263 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
 int __fastcall Hook_RenderQueueUpdateItemWorldMatrix(int sceneNodePtr,
                                                      int renderablePartPtr,
                                                      int meshPayloadPtr) {
+  // 高频调用：调用数与墙钟都按 1/32 固定周期作 HT 加权估算；样本只写
+  // TLS 固定桶，由最近的 NativeOriginal/frame 边界一次性回填。
+  dxvk::war3::hooks::War3HotHookCallTiming hookTiming(
+      dxvk::war3::hooks::War3HotHookId::CurrentDrawUpdateWorldMatrix, 32u);
+  const uint32_t breakdownSampleWeight =
+      CurrentDrawHookBreakdownEnabled() && hookTiming.hasSampledTiming()
+      ? hookTiming.preselectedSample().weight
+      : 0u;
+  // 每帧 1-3 万次：默认空对象；仅 detail+采样才产生时间戳/TLS 记录。
+  auto hookDetailScope =
+      CurrentDrawLegacyDetailScope("Semantic/CurrentDraw/Hook");
   if (!g_trampolineRenderQueueUpdateItemWorldMatrix)
     return 0;
 
+  const auto callNativeOriginal = [&]() {
+    dxvk::war3::hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    return g_trampolineRenderQueueUpdateItemWorldMatrix(
+        sceneNodePtr, renderablePartPtr, meshPayloadPtr);
+  };
+
+  bool runtimeActivated = false;
+  bool disablePublish = false;
+  bool allowWorldPublish = false;
+  {
+    CurrentDrawFixedPhaseScope phase(
+        dxvk::war3::hooks::War3HotHookId::CurrentDrawContextGate,
+        breakdownSampleWeight);
+    runtimeActivated =
+        dxvk::g_war3_runtime_activated.load(std::memory_order_relaxed);
+    if (runtimeActivated) {
+      // Phase 7.94：诊断用 — 完全禁用 publish contract hook 的数据层工作。
+      // 用于隔离"是 publish hook 导致卡顿还是其他 hook"。
+      static const bool s_disablePublish =
+          ReadEnvU32("DXVK_WAR3_DISABLE_PUBLISH_CONTRACT", 0u) != 0u;
+      disablePublish = s_disablePublish;
+      if (!disablePublish)
+        allowWorldPublish = IsWorldCurrentDrawPublishContext();
+    }
+  }
+
   // Phase 7.89：退出地图后 producer 降级为纯透传。
-  if (!dxvk::g_war3_runtime_activated.load(std::memory_order_relaxed)) {
-    return g_trampolineRenderQueueUpdateItemWorldMatrix(
-        sceneNodePtr, renderablePartPtr, meshPayloadPtr);
+  if (!runtimeActivated) {
+    return callNativeOriginal();
   }
 
-  // Phase 7.94：诊断用 — 完全禁用 publish contract hook 的数据层工作。
-  // 用于隔离"是 publish hook 导致卡顿还是其他 hook"。
-  static const bool s_disablePublish =
-      ReadEnvU32("DXVK_WAR3_DISABLE_PUBLISH_CONTRACT", 0u) != 0u;
-  if (s_disablePublish) {
-    return g_trampolineRenderQueueUpdateItemWorldMatrix(
-        sceneNodePtr, renderablePartPtr, meshPayloadPtr);
+  if (disablePublish) {
+    return callNativeOriginal();
   }
 
-  const bool allowWorldPublish = IsWorldCurrentDrawPublishContext();
+  if (!allowWorldPublish) {
+    // Keep the historical serial stream exact even though this draw never
+    // publishes. RecordHasLocalPaletteSnapshot uses captureSerial distance as
+    // part of its freshness contract, so skipping this increment would widen
+    // the accepted window for later world records.
+    g_captureSerialCounter.fetch_add(1u, std::memory_order_relaxed);
+
+    // Preserve the existing counter/original ordering for both runtime modes:
+    // after-original increments the skip counter after the trampoline, while
+    // before-original increments it before the trampoline.
+    if (PublishCurrentDrawContractAfterOriginalRuntime()) {
+      int result = 0;
+      {
+        auto trampolineDetailScope = CurrentDrawLegacyDetailScope(
+            "Semantic/CurrentDraw/OriginalTrampoline");
+        result = callNativeOriginal();
+      }
+      g_publishSkippedNonWorldContext.fetch_add(
+          1u, std::memory_order_relaxed);
+      return result;
+    }
+
+    g_publishSkippedNonWorldContext.fetch_add(1u, std::memory_order_relaxed);
+    auto trampolineDetailScope = CurrentDrawLegacyDetailScope(
+        "Semantic/CurrentDraw/OriginalTrampoline");
+    return callNativeOriginal();
+  }
 
   CurrentDrawContractRecord entry = {};
-  entry.sceneNode = reinterpret_cast<void*>(uintptr_t(uint32_t(sceneNodePtr)));
-  entry.renderablePart =
-      reinterpret_cast<void*>(uintptr_t(uint32_t(renderablePartPtr)));
-  entry.meshPayloadPtr =
-      reinterpret_cast<void*>(uintptr_t(uint32_t(meshPayloadPtr)));
-  const auto& tlsSemantic = dxvk::War3RenderState::GetTlsShadowSemanticState();
-  entry.worldObjectEntry = tlsSemantic.worldObjectEntry;
-  entry.jHandle = tlsSemantic.jHandle;
-  entry.rawcode = tlsSemantic.rawcode;
-  entry.objectKind = tlsSemantic.objectKind;
-  if (tlsSemantic.object != nullptr)
-    entry.unitPtr = tlsSemantic.object->unitPtr;
-  const auto dispatchContext = g_currentDrawDispatchContext;
-  if (dispatchContext.valid &&
-      (dispatchContext.renderablePart == nullptr ||
-       dispatchContext.renderablePart == entry.renderablePart)) {
-    entry.layerIndex = dispatchContext.layerIndex;
-  }
-  const bool needsVisibleIdentityBackfill =
-      entry.worldObjectEntry == nullptr || entry.unitPtr == nullptr ||
-      entry.jHandle == 0u || entry.rawcode == 0u ||
-      entry.objectKind == ObjectKind::Unknown ||
-      entry.sceneNode == nullptr || entry.meshPayloadPtr == nullptr;
-  if (needsVisibleIdentityBackfill && entry.renderablePart != nullptr) {
-    VisibleRenderableRecord visible = {};
-    if (VisibleRenderableRegistry::instance().queryByRenderablePartAndLayer(
-            entry.renderablePart, entry.layerIndex, visible)) {
-      if (entry.worldObjectEntry == nullptr)
-        entry.worldObjectEntry = visible.identity.worldObjectEntry;
-      if (entry.unitPtr == nullptr)
-        entry.unitPtr = visible.identity.unitPtr;
-      if (entry.jHandle == 0u)
-        entry.jHandle = visible.identity.jHandle != 0u
-                            ? visible.identity.jHandle
-                            : visible.identity.handleId;
-      if (entry.rawcode == 0u)
-        entry.rawcode = visible.identity.rawcode;
-      if (entry.objectKind == ObjectKind::Unknown &&
-          visible.identity.kind != ObjectKind::Unknown)
-        entry.objectKind = visible.identity.kind;
-      if (entry.sceneNode == nullptr)
-        entry.sceneNode = visible.sceneNode;
-      if (entry.meshPayloadPtr == nullptr)
-        entry.meshPayloadPtr = visible.meshData;
+  {
+    CurrentDrawFixedPhaseScope phase(
+        dxvk::war3::hooks::War3HotHookId::CurrentDrawRecordSeed,
+        breakdownSampleWeight);
+    entry.sceneNode =
+        reinterpret_cast<void*>(uintptr_t(uint32_t(sceneNodePtr)));
+    entry.renderablePart =
+        reinterpret_cast<void*>(uintptr_t(uint32_t(renderablePartPtr)));
+    entry.meshPayloadPtr =
+        reinterpret_cast<void*>(uintptr_t(uint32_t(meshPayloadPtr)));
+    const auto& tlsSemantic =
+        dxvk::War3RenderState::GetTlsShadowSemanticState();
+    entry.worldObjectEntry = tlsSemantic.worldObjectEntry;
+    entry.jHandle = tlsSemantic.jHandle;
+    entry.rawcode = tlsSemantic.rawcode;
+    entry.objectKind = tlsSemantic.objectKind;
+    entry.stage =
+        static_cast<int16_t>(tlsSemantic.stage >= 0
+                                 ? tlsSemantic.stage
+                                 : dxvk::War3RenderState::GetStage());
+    entry.batchTag =
+        tlsSemantic.tag != dxvk::War3BatchTag::Unknown
+            ? tlsSemantic.tag
+            : dxvk::War3RenderState::GetCurrentBatchTag();
+    entry.producerStage = entry.stage;
+    entry.producerGroup = entry.batchTag;
+    entry.sourceKind = ShadowProducerKind::CurrentDrawContract;
+    entry.producerFreshThisFrame = true;
+    entry.stagePolicyRevision = CurrentShadowStagePolicyRevision();
+    entry.fromGrace = false;
+    entry.graceAge = 0u;
+    entry.alphaPayloadComplete = false;
+    entry.pathBlocker = tlsSemantic.pathBlocker;
+    if (tlsSemantic.object != nullptr)
+      entry.unitPtr = tlsSemantic.object->unitPtr;
+    const auto dispatchContext = g_currentDrawDispatchContext;
+    if (dispatchContext.valid &&
+        (dispatchContext.renderablePart == nullptr ||
+         dispatchContext.renderablePart == entry.renderablePart)) {
+      entry.layerIndex = dispatchContext.layerIndex;
     }
   }
-  entry.visibleFrameSerial = VisibleRenderableRegistry::instance().getFrameNumber();
-  entry.renderFrameIndex = dxvk::war3::state::RenderState::instance().getFrameIndex();
-  entry.frameTag = CachedCurrentPaletteFrameTag(entry.renderFrameIndex);
-  entry.captureSerial =
-      g_captureSerialCounter.fetch_add(1u, std::memory_order_relaxed) + 1u;
+
+  {
+    CurrentDrawFixedPhaseScope phase(
+        dxvk::war3::hooks::War3HotHookId::CurrentDrawVisibleBackfill,
+        breakdownSampleWeight);
+    const bool needsVisibleIdentityBackfill =
+        entry.worldObjectEntry == nullptr || entry.unitPtr == nullptr ||
+        entry.jHandle == 0u || entry.rawcode == 0u ||
+        entry.objectKind == ObjectKind::Unknown ||
+        entry.sceneNode == nullptr || entry.meshPayloadPtr == nullptr;
+    if (needsVisibleIdentityBackfill && entry.renderablePart != nullptr) {
+      auto backfillDetailScope = CurrentDrawLegacyDetailScope(
+          "Semantic/CurrentDraw/VisibleIdentityBackfill");
+      VisibleRenderableRecord visible = {};
+      if (VisibleRenderableRegistry::instance().queryByRenderablePartAndLayer(
+              entry.renderablePart, entry.layerIndex, visible)) {
+        if (entry.worldObjectEntry == nullptr)
+          entry.worldObjectEntry = visible.identity.worldObjectEntry;
+        if (entry.unitPtr == nullptr)
+          entry.unitPtr = visible.identity.unitPtr;
+        if (entry.jHandle == 0u)
+          entry.jHandle = visible.identity.jHandle != 0u
+                              ? visible.identity.jHandle
+                              : visible.identity.handleId;
+        if (entry.rawcode == 0u)
+          entry.rawcode = visible.identity.rawcode;
+        entry.pathBlocker = entry.pathBlocker || visible.pathBlocker;
+        if (entry.objectKind == ObjectKind::Unknown &&
+            visible.identity.kind != ObjectKind::Unknown)
+          entry.objectKind = visible.identity.kind;
+        if (entry.sceneNode == nullptr)
+          entry.sceneNode = visible.sceneNode;
+        if (entry.meshPayloadPtr == nullptr)
+          entry.meshPayloadPtr = visible.meshData;
+      }
+    }
+  }
+
+  {
+    CurrentDrawFixedPhaseScope phase(
+        dxvk::war3::hooks::War3HotHookId::CurrentDrawFrameIdentity,
+        breakdownSampleWeight);
+    entry.pathBlocker =
+        entry.pathBlocker ||
+        dxvk::war3::internal::IsPathBlockerFourCc(entry.rawcode);
+    entry.visibleFrameSerial =
+        VisibleRenderableRegistry::instance().getFrameNumber();
+    entry.renderFrameIndex =
+        dxvk::war3::state::RenderState::instance().getFrameIndex();
+    entry.frameTag = CachedCurrentPaletteFrameTag(entry.renderFrameIndex);
+    entry.captureSerial =
+        g_captureSerialCounter.fetch_add(1u, std::memory_order_relaxed) + 1u;
+  }
 
   auto refreshDrawBindFieldsAndPublish = [&]() {
-    if (!allowWorldPublish) {
-      g_publishSkippedNonWorldContext.fetch_add(1u,
-                                                std::memory_order_relaxed);
-      return;
-    }
+    {
+      CurrentDrawFixedPhaseScope phase(
+          dxvk::war3::hooks::War3HotHookId::CurrentDrawBindFieldRefresh,
+          breakdownSampleWeight);
+      auto bindDetailScope = CurrentDrawLegacyDetailScope(
+          "Semantic/CurrentDraw/BindFieldRefresh");
 
-    entry.paletteSlotIndex = 0xFFFFFFFFu;
-    entry.paletteAddress = nullptr;
-    entry.capturedPaletteCount = 0u;
+      entry.paletteSlotIndex = 0xFFFFFFFFu;
+      entry.paletteAddress = nullptr;
+      entry.capturedPaletteCount = 0u;
 
-    if (entry.renderablePart != nullptr) {
-      entry.paletteSlotIndex =
-          *reinterpret_cast<uint32_t*>(uintptr_t(uint32_t(renderablePartPtr)) +
-                                       0x08u);
-    }
+      if (entry.renderablePart != nullptr) {
+        entry.paletteSlotIndex =
+            *reinterpret_cast<uint32_t*>(uintptr_t(uint32_t(renderablePartPtr)) +
+                                         0x08u);
+      }
 
-    if (entry.meshPayloadPtr != nullptr) {
-      const uintptr_t payload = uintptr_t(uint32_t(meshPayloadPtr));
-      entry.payloadWordF0 = *reinterpret_cast<uint32_t*>(payload + 0xF0u);
-      entry.payloadWord104 = *reinterpret_cast<uint32_t*>(payload + 0x104u);
-      entry.payloadWord108 = *reinterpret_cast<uint32_t*>(payload + 0x108u);
-      entry.payloadWord11C = *reinterpret_cast<uint32_t*>(payload + 0x11Cu);
-      entry.payloadWord48 = *reinterpret_cast<uint32_t*>(payload + 0x48u);
-      entry.stream1Ptr = *reinterpret_cast<void**>(payload + 0x4Cu);
-      entry.stream1Stride = *reinterpret_cast<uint32_t*>(payload + 0x58u);
-      NotePublishedStream1Layout(entry);
-    }
+      if (entry.meshPayloadPtr != nullptr) {
+        const uintptr_t payload = uintptr_t(uint32_t(meshPayloadPtr));
+        entry.payloadWordF0 = *reinterpret_cast<uint32_t*>(payload + 0xF0u);
+        entry.payloadWord104 = *reinterpret_cast<uint32_t*>(payload + 0x104u);
+        entry.payloadWord108 = *reinterpret_cast<uint32_t*>(payload + 0x108u);
+        entry.payloadWord11C = *reinterpret_cast<uint32_t*>(payload + 0x11Cu);
+        entry.payloadWord48 = *reinterpret_cast<uint32_t*>(payload + 0x48u);
+        entry.stream1Ptr = *reinterpret_cast<void**>(payload + 0x4Cu);
+        entry.stream1Stride = *reinterpret_cast<uint32_t*>(payload + 0x58u);
+        NotePublishedStream1Layout(entry);
+      }
 
-    if (entry.renderablePart != nullptr && entry.meshPayloadPtr != nullptr &&
-        entry.paletteSlotIndex != 0xFFFFFFFFu &&
-        entry.paletteSlotIndex < 0x3A98u && entry.payloadWordF0 != 0u &&
-        entry.payloadWordF0 <= kMaxPaletteMatrices &&
-        entry.paletteSlotIndex + entry.payloadWordF0 <= 0x3A98u) {
-      const uintptr_t globalPaletteBuffer =
-          g_currentDrawContractGameBase != 0u
-              ? uintptr_t(*reinterpret_cast<uint32_t*>(
-                    g_currentDrawContractGameBase + 0xBC6BD0u))
-              : 0u;
-      if (globalPaletteBuffer != 0u) {
-        entry.paletteAddress = reinterpret_cast<void*>(
-            globalPaletteBuffer + size_t(entry.paletteSlotIndex) * 48u);
-        entry.capturedPaletteCount = entry.payloadWordF0;
+      if (entry.renderablePart != nullptr && entry.meshPayloadPtr != nullptr &&
+          entry.paletteSlotIndex != 0xFFFFFFFFu &&
+          entry.paletteSlotIndex < 0x3A98u && entry.payloadWordF0 != 0u &&
+          entry.payloadWordF0 <= kMaxPaletteMatrices &&
+          entry.paletteSlotIndex + entry.payloadWordF0 <= 0x3A98u) {
+        const uintptr_t globalPaletteBuffer =
+            g_currentDrawContractGameBase != 0u
+                ? uintptr_t(*reinterpret_cast<uint32_t*>(
+                      g_currentDrawContractGameBase + 0xBC6BD0u))
+                : 0u;
+        if (globalPaletteBuffer != 0u) {
+          entry.paletteAddress = reinterpret_cast<void*>(
+              globalPaletteBuffer + size_t(entry.paletteSlotIndex) * 48u);
+          entry.capturedPaletteCount = entry.payloadWordF0;
+        }
       }
     }
 
-    PublishCurrentDrawContract(entry);
+    CurrentDrawFixedPhaseScope phase(
+        dxvk::war3::hooks::War3HotHookId::CurrentDrawPublishContract,
+        breakdownSampleWeight);
+    PublishCurrentDrawContract(entry, breakdownSampleWeight);
   };
 
   if (PublishCurrentDrawContractAfterOriginalRuntime()) {
-    const int result = g_trampolineRenderQueueUpdateItemWorldMatrix(
-        sceneNodePtr, renderablePartPtr, meshPayloadPtr);
+    int result = 0;
+    {
+      auto trampolineDetailScope = CurrentDrawLegacyDetailScope(
+          "Semantic/CurrentDraw/OriginalTrampoline");
+      result = callNativeOriginal();
+    }
     refreshDrawBindFieldsAndPublish();
     return result;
   }
 
   refreshDrawBindFieldsAndPublish();
-  return g_trampolineRenderQueueUpdateItemWorldMatrix(
-      sceneNodePtr, renderablePartPtr, meshPayloadPtr);
+  auto trampolineDetailScope = CurrentDrawLegacyDetailScope(
+      "Semantic/CurrentDraw/OriginalTrampoline");
+  return callNativeOriginal();
 }
 
 void ResetCurrentDrawContractCache() {
   for (auto& entry : g_currentDrawContractCache)
     entry = {};
+  g_currentDrawContractCacheOccupancy.fill(0u);
   for (auto& snapshot : g_paletteSnapshotCache)
     snapshot = {};
   for (auto& prepared : g_preparedSliceCache)
     prepared = {};
   for (auto& interest : g_preparedSliceInterestCache)
     interest = {};
+  for (auto& entry : g_currentDrawGeometryLedger)
+    entry = {};
   g_globalFallbackRecord = {};
   g_currentDrawDispatchContext = {};
   g_captureSerialCounter.store(0u, std::memory_order_relaxed);
@@ -1090,6 +1739,132 @@ void ResetCurrentDrawContractCache() {
     g_publishedPaletteSnapshotByAttribution.clear();
     g_publishedCurrentDrawReadyByAttribution.clear();
   }
+}
+
+CurrentDrawRetireResult RetireCurrentDrawContracts(
+    const ShadowCasterTombstone& tombstone) {
+  CurrentDrawRetireResult result = {};
+  std::unordered_set<void*> retiredParts;
+  const auto notePart = [&](void* part) {
+    if (part != nullptr)
+      retiredParts.insert(part);
+  };
+
+  for (size_t slot = 0u; slot < g_currentDrawContractCache.size(); ++slot) {
+    auto& record = g_currentDrawContractCache[slot];
+    if (!CurrentDrawRecordMatchesTombstone(record, tombstone))
+      continue;
+    notePart(record.renderablePart);
+    record = {};
+    g_currentDrawContractCacheOccupancy[slot >> 6u] &=
+        ~(uint64_t(1u) << (slot & 63u));
+    result.localContractCount++;
+  }
+
+  for (auto& entry : g_currentDrawGeometryLedger) {
+    if (!CurrentDrawRecordMatchesTombstone(entry.record, tombstone))
+      continue;
+    notePart(entry.renderablePart);
+    entry = {};
+    result.localContractCount++;
+  }
+
+  for (auto& snapshot : g_paletteSnapshotCache) {
+    const bool directPartMatch =
+        tombstone.identity.renderablePart != nullptr &&
+        snapshot.renderablePart == tombstone.identity.renderablePart;
+    if (directPartMatch ||
+        retiredParts.find(snapshot.renderablePart) != retiredParts.end()) {
+      snapshot = {};
+      result.localPaletteCount++;
+    }
+  }
+
+  for (auto& prepared : g_preparedSliceCache) {
+    const bool directPartMatch =
+        tombstone.identity.renderablePart != nullptr &&
+        prepared.renderablePart == tombstone.identity.renderablePart;
+    if (directPartMatch ||
+        retiredParts.find(prepared.renderablePart) != retiredParts.end()) {
+      prepared = {};
+      result.localPreparedSliceCount++;
+    }
+  }
+  for (auto& interest : g_preparedSliceInterestCache) {
+    const bool directPartMatch =
+        tombstone.identity.renderablePart != nullptr &&
+        interest.renderablePart == tombstone.identity.renderablePart;
+    if (directPartMatch ||
+        retiredParts.find(interest.renderablePart) != retiredParts.end()) {
+      interest = {};
+    }
+  }
+
+  if (CurrentDrawRecordMatchesTombstone(
+          g_globalFallbackRecord, tombstone)) {
+    notePart(g_globalFallbackRecord.renderablePart);
+    g_globalFallbackRecord = {};
+    result.localContractCount++;
+  }
+  if (g_currentDrawDispatchContext.valid) {
+    const bool partMatch =
+        tombstone.identity.renderablePart != nullptr &&
+        g_currentDrawDispatchContext.renderablePart ==
+            tombstone.identity.renderablePart;
+    const bool sceneMatch =
+        tombstone.identity.sceneNode != nullptr &&
+        g_currentDrawDispatchContext.sceneNode ==
+            tombstone.identity.sceneNode;
+    if (partMatch || sceneMatch)
+      g_currentDrawDispatchContext = {};
+  }
+
+  std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
+  for (auto it = g_publishedCurrentDrawByPart.begin();
+       it != g_publishedCurrentDrawByPart.end();) {
+    if (CurrentDrawRecordMatchesTombstone(it->second, tombstone)) {
+      notePart(it->first);
+      it = g_publishedCurrentDrawByPart.erase(it);
+      result.globalContractCount++;
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = g_publishedCurrentDrawReadyByPart.begin();
+       it != g_publishedCurrentDrawReadyByPart.end();) {
+    if (CurrentDrawRecordMatchesTombstone(it->second, tombstone)) {
+      notePart(it->first);
+      it = g_publishedCurrentDrawReadyByPart.erase(it);
+      result.globalContractCount++;
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = g_publishedCurrentDrawReadyByAttribution.begin();
+       it != g_publishedCurrentDrawReadyByAttribution.end();) {
+    if (CurrentDrawRecordMatchesTombstone(it->second, tombstone)) {
+      g_publishedPaletteSnapshotByAttribution.erase(it->first);
+      it = g_publishedCurrentDrawReadyByAttribution.erase(it);
+      result.globalContractCount++;
+      result.globalPaletteCount++;
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = g_publishedPaletteSnapshotByPart.begin();
+       it != g_publishedPaletteSnapshotByPart.end();) {
+    const bool directPartMatch =
+        tombstone.identity.renderablePart != nullptr &&
+        it->first == tombstone.identity.renderablePart;
+    if (directPartMatch ||
+        retiredParts.find(it->first) != retiredParts.end()) {
+      it = g_publishedPaletteSnapshotByPart.erase(it);
+      result.globalPaletteCount++;
+    } else {
+      ++it;
+    }
+  }
+  return result;
 }
 
 CurrentDrawDispatchContext PushCurrentDrawDispatchContext(
@@ -1219,25 +1994,49 @@ bool QueryCurrentDrawPreparedSlice(void* renderablePart,
   return true;
 }
 
-void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
+void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
+                                uint32_t breakdownSampleWeight) {
+  const ShadowProducerPolicyContext producerContext = {
+      record.stage,
+      record.batchTag,
+      War3BatchTag::Unknown,
+      War3BatchTag::Unknown,
+      false,
+  };
+  if (!ShadowProducerPolicyAllows(
+          ShadowProducerKind::CurrentDrawContract, producerContext)) {
+    return;
+  }
+
   // Phase 7.74：把 Publish 的 CPU 时间显式归类。constexpr 门控；release 默认
   // 编译期 strip。该函数每帧约 10K-30K 次（每个 RenderQueue_UpdateItemWorldMatrix
   // 都会触发一次），是 OutsideMainLoop/Tracked 的潜在大头。
   auto publishScope = [&]() -> dxvk::war3::War3PerfMonitor::ScopedCpuScope {
     if constexpr (dxvk::war3::internal::kNativeOptimizationPerfTrackingEnabled) {
-      return dxvk::war3::War3PerfMonitor::instance().cpuScope(
-          "Shadow/Publish/CurrentDraw");
+      if (!CurrentDrawHookBreakdownEnabled()) {
+        return dxvk::war3::War3PerfMonitor::instance().cpuScope(
+            "Shadow/Publish/CurrentDraw");
+      }
     }
     return {};
   }();
-  g_publishAttemptCount.fetch_add(1u, std::memory_order_relaxed);
-  if (record.renderablePart == nullptr) {
-    g_publishMissNoRenderablePart.fetch_add(1u, std::memory_order_relaxed);
-    g_lastMissReason.store(
-        uint32_t(CurrentDrawMissReason::PublishNoRenderablePart),
-        std::memory_order_relaxed);
-    return;
-  }
+  auto detailScope =
+      CurrentDrawLegacyDetailScope("Semantic/CurrentDraw/Publish");
+  bool publishGlobal = false;
+  size_t requiredBytes = 0u;
+  {
+    CurrentDrawFixedPhaseScope localGateCachePhase(
+        dxvk::war3::hooks::War3HotHookId::
+            CurrentDrawPublishLocalGateCache,
+        breakdownSampleWeight);
+    g_publishAttemptCount.fetch_add(1u, std::memory_order_relaxed);
+    if (record.renderablePart == nullptr) {
+      g_publishMissNoRenderablePart.fetch_add(1u, std::memory_order_relaxed);
+      g_lastMissReason.store(
+          uint32_t(CurrentDrawMissReason::PublishNoRenderablePart),
+          std::memory_order_relaxed);
+      return;
+    }
 
   // Phase 7.49：per-publish provenance probe（极低成本，纯 relaxed atomics）。
   // 核心思路：Publish 进入这一点之后 record 已经是本次要发布的材料；
@@ -1249,7 +2048,7 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
   // CAS-loop 累计 1-3ms）。Phase 7.55 v4 + Phase 7.57 producer 已闭环
   // stutter 根因，probe 不再属于主路径所需。需要重启诊断时设
   // `DXVK_WAR3_PUBLISH_PROBE=1`。
-  if (Phase749PublishProbeEnabled()) {
+    if (Phase749PublishProbeEnabled()) {
     g_publishCallCumulative.fetch_add(1u, std::memory_order_relaxed);
     const uint32_t recordTag = record.frameTag;
     // 更新 record.frameTag same-run 与 min/max。注意 relaxed 即可，这是
@@ -1325,9 +2124,9 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
         }
       }
     }
-  }
+    }
 
-  if (LastSampleDiagnosticsEnabled()) {
+    if (LastSampleDiagnosticsEnabled()) {
     g_lastRenderablePart.store(reinterpret_cast<uintptr_t>(record.renderablePart),
                                std::memory_order_relaxed);
     g_lastSceneNode.store(reinterpret_cast<uintptr_t>(record.sceneNode),
@@ -1350,32 +2149,37 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
                                    std::memory_order_relaxed);
     g_lastRenderFrameIndex.store(record.renderFrameIndex,
                                  std::memory_order_relaxed);
-  }
+    }
 
-  if (record.meshPayloadPtr == nullptr) {
+    if (record.meshPayloadPtr == nullptr) {
     g_publishMissNoMeshPayload.fetch_add(1u, std::memory_order_relaxed);
     g_lastMissReason.store(uint32_t(CurrentDrawMissReason::PublishNoMeshPayload),
                            std::memory_order_relaxed);
-  }
+    }
 
-  const size_t slot =
-      (uintptr_t(record.renderablePart) >> 4u) % kContractCacheSize;
-  CurrentDrawContractRecord& localCacheRecord = g_currentDrawContractCache[slot];
-  const bool preserveLocalReadyRecord =
-      KeepReadySnapshotOnInvalidCurrentDrawEnabled() &&
-      !RecordHasReadyShape(record) &&
-      localCacheRecord.renderablePart == record.renderablePart &&
-      RecordHasLocalPaletteSnapshot(localCacheRecord);
-  if (!preserveLocalReadyRecord)
-    localCacheRecord = record;
+    const size_t slot =
+        SelectLocalCurrentDrawContractSlot(record.renderablePart);
+    g_currentDrawContractCacheOccupancy[slot >> 6u] |=
+        uint64_t(1u) << (slot & 63u);
+    CurrentDrawContractRecord& localCacheRecord =
+        g_currentDrawContractCache[slot];
+    const bool preserveLocalReadyRecord =
+        KeepReadySnapshotOnInvalidCurrentDrawEnabled() &&
+        !RecordHasReadyShape(record) &&
+        localCacheRecord.renderablePart == record.renderablePart &&
+        RecordHasLocalPaletteSnapshot(localCacheRecord);
+    if (!preserveLocalReadyRecord)
+      localCacheRecord = record;
+    StoreCurrentDrawGeometryLedgerRecord(record);
 
-  const bool publishGlobal = GlobalCurrentDrawPublishEnabled();
-  if (publishGlobal) {
-    std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
-    g_publishedCurrentDrawByPart[record.renderablePart] = record;
-  }
+    publishGlobal = GlobalCurrentDrawPublishEnabled();
+    if (publishGlobal) {
+      std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
+      g_publishedCurrentDrawByPart[record.renderablePart] = record;
+    }
 
-  if (record.paletteSlotIndex == 0xFFFFFFFFu || record.paletteSlotIndex >= 0x3A98u) {
+    if (record.paletteSlotIndex == 0xFFFFFFFFu ||
+        record.paletteSlotIndex >= 0x3A98u) {
     // Phase 7.52 根因说明：FROZEN 段里 War3 的 8-帧 cadence 让 record.paletteSlotIndex
     // 临时 = 0xFFFFFFFFu。这里仍然早退 publish，但不是 submit 端吃旧 palette 的根因：
     //   1. `preserveLocalReadyRecord` 让 localCacheRecord 保留上次 ready 的 record
@@ -1391,40 +2195,42 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
     g_lastMissReason.store(
         uint32_t(CurrentDrawMissReason::PublishInvalidPaletteSlot),
         std::memory_order_relaxed);
-    return;
-  }
+      return;
+    }
 
-  if (record.capturedPaletteCount == 0u ||
-      record.capturedPaletteCount > kMaxPaletteMatrices) {
+    if (record.capturedPaletteCount == 0u ||
+        record.capturedPaletteCount > kMaxPaletteMatrices) {
     if (publishGlobal && !KeepReadySnapshotOnInvalidCurrentDrawEnabled())
       ClearPublishedCurrentDrawReadyRecord(record.renderablePart);
     g_publishMissInvalidPaletteCount.fetch_add(1u, std::memory_order_relaxed);
     g_lastMissReason.store(
         uint32_t(CurrentDrawMissReason::PublishInvalidPaletteCount),
         std::memory_order_relaxed);
-    return;
-  }
+      return;
+    }
 
-  if (record.paletteAddress == nullptr) {
+    if (record.paletteAddress == nullptr) {
     if (publishGlobal && !KeepReadySnapshotOnInvalidCurrentDrawEnabled())
       ClearPublishedCurrentDrawReadyRecord(record.renderablePart);
     g_publishMissNoGlobalPalette.fetch_add(1u, std::memory_order_relaxed);
     g_lastMissReason.store(
         uint32_t(CurrentDrawMissReason::PublishNoGlobalPalette),
         std::memory_order_relaxed);
-    return;
-  }
+      return;
+    }
 
-  const size_t requiredBytes = size_t(record.capturedPaletteCount) * 48u;
-  if (SafePaletteRangeCheckEnabled() &&
-      !dxvk::war3::IsReadableRangeFast(record.paletteAddress, requiredBytes)) {
+    requiredBytes = size_t(record.capturedPaletteCount) * 48u;
+    if (SafePaletteRangeCheckEnabled() &&
+        !dxvk::war3::IsReadableRangeFast(record.paletteAddress,
+                                         requiredBytes)) {
     if (publishGlobal && !KeepReadySnapshotOnInvalidCurrentDrawEnabled())
       ClearPublishedCurrentDrawReadyRecord(record.renderablePart);
     g_publishMissNoGlobalPalette.fetch_add(1u, std::memory_order_relaxed);
     g_lastMissReason.store(
         uint32_t(CurrentDrawMissReason::PublishNoGlobalPalette),
         std::memory_order_relaxed);
-    return;
+      return;
+    }
   }
 
   // Phase 7.30 Action B（第二刀）：优先用 Hook_RuntimeMatrixWrite 当场捕获的
@@ -1447,11 +2253,23 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
   //      `DXVK_WAR3_PALETTE_ARBITRATION_STRICT=0` 兼容模式：回退到原 raw arena
   //      行为，供临时回滚调试。
   //   3. raw arena 永远标记 `PaletteProvenance::RawGlobalArena`，仅做诊断。
-  std::array<uint8_t, kMaxPaletteMatrices * 48u> trustedPaletteBytes = {};
+  // 2026-07-21 优化：12 KB 栈数组改为 thread_local 复用且不做零初始化。
+  // 下游消费只 memcpy `requiredBytes`（= capturedPaletteCount * 48）前缀，
+  // 数组尾部从不读取；该 publish 路径每帧可达 10K-30K 次，原 `= {}` 每次
+  // 产生 12 KB 无效写带宽（数十 MB/帧）。
+  thread_local std::array<uint8_t, kMaxPaletteMatrices * 48u> trustedPaletteBytes;
   const uint8_t* paletteSource = nullptr;
   PaletteProvenance provenance = PaletteProvenance::Unknown;
   {
-    std::vector<Matrix4> trustedPalette;
+    CurrentDrawFixedPhaseScope trustedPalettePhase(
+        dxvk::war3::hooks::War3HotHookId::
+            CurrentDrawPublishTrustedPaletteQueryPack,
+        breakdownSampleWeight);
+    // 2026-07-21 优化：trusted 查询的临时 vector 改 thread_local 复用容量，
+    // 避免每次 ready publish 都产生一次堆分配。本函数在同一线程内不可重入，
+    // 复用安全。
+    thread_local std::vector<Matrix4> trustedPalette;
+    trustedPalette.clear();
     if (PaletteAttributionSnapshotEnabled() &&
         dxvk::war3::model::QueryBlendedPaletteBySlotIndexExact(
             record.paletteSlotIndex, record.capturedPaletteCount,
@@ -1472,80 +2290,97 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
       provenance = PaletteProvenance::TrustedBlendedWriter;
       g_paletteCaptureTrustedSourceHitCount.fetch_add(
           1u, std::memory_order_relaxed);
-      g_publishTrustedHitCumulative.fetch_add(1u, std::memory_order_relaxed);
+      if (CurrentDrawRedundantAtomicsLegacyRuntime()) {
+        g_publishTrustedHitCumulative.fetch_add(
+            1u, std::memory_order_relaxed);
+      }
     } else if (PaletteAttributionSnapshotEnabled()) {
       g_paletteCaptureTrustedSourceMissCount.fetch_add(
           1u, std::memory_order_relaxed);
     }
-  }
+    // Phase 7.34：严格仲裁模式默认开启。
+    // 环境变量 DXVK_WAR3_PALETTE_ARBITRATION_STRICT=0 可回滚到旧的 raw-arena
+    // fallback 行为（仅调试用）。
+    //
+    // Phase 7.34 软化（2026-05-11 21:35）：首轮 A2 把 trusted miss 整条丢弃，
+    // 用户观察到"视角移动/压力大时阴影一帧消失→视觉闪烁"。根因：
+    //   - `visibleFrameSerial` grace 8 帧，连续多帧 trusted miss 后旧 record
+    //     超窗口被剔除，下游 populate 看不到对象，阴影消失。
+    //   - 严格拒绝 publish 没解决 palette 正确性，反而让对象缺失更严重。
+    // 正确策略（接手计划原话）：RawGlobalArena "只保留诊断，不作为 Ready palette"
+    //   - 不是在 publish 端丢弃，而是在发布时**打上 RawGlobalArena 标签**，
+    //     让下游 submit 根据 provenance 决定是否接受。
+    //   - 本轮先恢复 publish（不丢），只做标记+counter。下一轮补下游 provenance
+    //     感知过滤（让 submit 对 RawGlobalArena 退化优雅处理）。
+    // 回滚：`DXVK_WAR3_PALETTE_ARBITRATION_STRICT=2` 恢复到 A2 首轮的"直接丢弃"
+    // 行为供诊断对比，`=0` 恢复完全老 raw arena 兼容。
+    static const uint32_t s_paletteArbitrationStrictMode =
+        ReadEnvU32("DXVK_WAR3_PALETTE_ARBITRATION_STRICT", 1u);
 
-  // Phase 7.34：严格仲裁模式默认开启。
-  // 环境变量 DXVK_WAR3_PALETTE_ARBITRATION_STRICT=0 可回滚到旧的 raw-arena
-  // fallback 行为（仅调试用）。
-  //
-  // Phase 7.34 软化（2026-05-11 21:35）：首轮 A2 把 trusted miss 整条丢弃，
-  // 用户观察到"视角移动/压力大时阴影一帧消失→视觉闪烁"。根因：
-  //   - `visibleFrameSerial` grace 8 帧，连续多帧 trusted miss 后旧 record
-  //     超窗口被剔除，下游 populate 看不到对象，阴影消失。
-  //   - 严格拒绝 publish 没解决 palette 正确性，反而让对象缺失更严重。
-  // 正确策略（接手计划原话）：RawGlobalArena "只保留诊断，不作为 Ready palette"
-  //   - 不是在 publish 端丢弃，而是在发布时**打上 RawGlobalArena 标签**，
-  //     让下游 submit 根据 provenance 决定是否接受。
-  //   - 本轮先恢复 publish（不丢），只做标记+counter。下一轮补下游 provenance
-  //     感知过滤（让 submit 对 RawGlobalArena 退化优雅处理）。
-  // 回滚：`DXVK_WAR3_PALETTE_ARBITRATION_STRICT=2` 恢复到 A2 首轮的"直接丢弃"
-  // 行为供诊断对比，`=0` 恢复完全老 raw arena 兼容。
-  static const uint32_t s_paletteArbitrationStrictMode =
-      ReadEnvU32("DXVK_WAR3_PALETTE_ARBITRATION_STRICT", 1u);
-
-  if (paletteSource == nullptr) {
-    if (s_paletteArbitrationStrictMode >= 2u) {
-      // 严格模式 2：trusted miss 直接丢弃，保留旧 record 给 grace 窗口。
-      // 此路径仅作诊断对比使用。
-      g_paletteRejectedNoTrustedSourceCount.fetch_add(
-          1u, std::memory_order_relaxed);
-      g_publishRejectedNoTrustedCumulative.fetch_add(
-          1u, std::memory_order_relaxed);
-      g_lastMissReason.store(
-          uint32_t(CurrentDrawMissReason::PaletteNoSnapshot),
-          std::memory_order_relaxed);
-      return;
+    if (paletteSource == nullptr) {
+      if (s_paletteArbitrationStrictMode >= 2u) {
+        // 严格模式 2：trusted miss 直接丢弃，保留旧 record 给 grace 窗口。
+        // 此路径仅作诊断对比使用。
+        g_paletteRejectedNoTrustedSourceCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_publishRejectedNoTrustedCumulative.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_lastMissReason.store(
+            uint32_t(CurrentDrawMissReason::PaletteNoSnapshot),
+            std::memory_order_relaxed);
+        return;
+      }
+      // 默认路径（Strict mode 1 或 0）：使用 raw arena 作为 snapshot 源，
+      // 但 provenance 明确标记为 RawGlobalArena 以便下游识别。
+      // 注意：这里的数据可能带 arena 残留（跨对象污染），下游 submit 端
+      // 需要根据 provenance 决定是否信任。
+      paletteSource = reinterpret_cast<const uint8_t*>(record.paletteAddress);
+      provenance = PaletteProvenance::RawGlobalArena;
+      g_publishRawFallbackCumulative.fetch_add(1u, std::memory_order_relaxed);
+      if (s_paletteArbitrationStrictMode >= 1u) {
+        // Strict mode 1（默认）：标记但仍发布。记录 counter 以观察
+        // RawGlobalArena 在总 publish 中的占比。
+        g_paletteRejectedNoTrustedSourceCount.fetch_add(
+            1u, std::memory_order_relaxed);
+      }
     }
-    // 默认路径（Strict mode 1 或 0）：使用 raw arena 作为 snapshot 源，
-    // 但 provenance 明确标记为 RawGlobalArena 以便下游识别。
-    // 注意：这里的数据可能带 arena 残留（跨对象污染），下游 submit 端
-    // 需要根据 provenance 决定是否信任。
-    paletteSource = reinterpret_cast<const uint8_t*>(record.paletteAddress);
-    provenance = PaletteProvenance::RawGlobalArena;
-    g_publishRawFallbackCumulative.fetch_add(1u, std::memory_order_relaxed);
-    if (s_paletteArbitrationStrictMode >= 1u) {
-      // Strict mode 1（默认）：标记但仍发布。记录 counter 以观察
-      // RawGlobalArena 在总 publish 中的占比。
-      g_paletteRejectedNoTrustedSourceCount.fetch_add(
-          1u, std::memory_order_relaxed);
+  }
+
+  {
+    CurrentDrawFixedPhaseScope snapshotCommitPhase(
+        dxvk::war3::hooks::War3HotHookId::
+            CurrentDrawPublishSnapshotCommit,
+        breakdownSampleWeight);
+    if (CurrentDrawRedundantAtomicsLegacyRuntime()) {
+      // Legacy-only diagnostic buckets: these counters have never had a
+      // reader or report export, but retaining them behind the rollback gate
+      // gives an exact same-DLL comparison with the historical hot path.
+      static std::atomic<uint64_t>
+          g_paletteProvenanceTrustedBlendedWriterCount{0u};
+      static std::atomic<uint64_t>
+          g_paletteProvenanceRawGlobalArenaCount{0u};
+      static std::atomic<uint64_t> g_paletteProvenanceUnknownCount{0u};
+      switch (provenance) {
+        case PaletteProvenance::TrustedBlendedWriter:
+          g_paletteProvenanceTrustedBlendedWriterCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          break;
+        case PaletteProvenance::RawGlobalArena:
+          g_paletteProvenanceRawGlobalArenaCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          break;
+        default:
+          g_paletteProvenanceUnknownCount.fetch_add(
+              1u, std::memory_order_relaxed);
+          break;
+      }
     }
-  }
-  // Phase 1：记录 provenance 分桶计数。
-  static std::atomic<uint64_t> g_paletteProvenanceTrustedBlendedWriterCount{0u};
-  static std::atomic<uint64_t> g_paletteProvenanceRawGlobalArenaCount{0u};
-  static std::atomic<uint64_t> g_paletteProvenanceUnknownCount{0u};
-  switch (provenance) {
-    case PaletteProvenance::TrustedBlendedWriter:
-      g_paletteProvenanceTrustedBlendedWriterCount.fetch_add(1u, std::memory_order_relaxed);
-      break;
-    case PaletteProvenance::RawGlobalArena:
-      g_paletteProvenanceRawGlobalArenaCount.fetch_add(1u, std::memory_order_relaxed);
-      break;
-    default:
-      g_paletteProvenanceUnknownCount.fetch_add(1u, std::memory_order_relaxed);
-      break;
-  }
 
-  const size_t snapshotSlot =
-      (uintptr_t(record.renderablePart) >> 4u) % kPaletteSnapshotCacheSize;
-  auto& snapshot = g_paletteSnapshotCache[snapshotSlot];
+    const size_t snapshotSlot =
+        SelectLocalPaletteSnapshotSlot(record.renderablePart);
+    auto& snapshot = g_paletteSnapshotCache[snapshotSlot];
 
-  // Phase 7.34 第三轮曾尝试不让 RawGlobalArena 降级覆盖已有 trusted snapshot。
+    // Phase 7.34 第三轮曾尝试不让 RawGlobalArena 降级覆盖已有 trusted snapshot。
   // 根因：用户观察到"视角边缘对象（门）在压力下闪烁"。
   // 机制：某帧视锥边缘对象的 trusted cache miss → 若允许 raw arena 覆写
   // snapshot，当前帧的 snapshot 变成 arena 残留数据 → 下游 populate 拿到
@@ -1556,27 +2391,34 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
   // 显示 fresh，实际 shadow pose 却可连续多帧冻结。默认关闭该保护，让
   // RawGlobalArena 覆写当前帧 bytes；若需要回滚对比，可显式设置
   // DXVK_WAR3_PRESERVE_TRUSTED_PALETTE_ON_RAW_MISS=1。
-  const bool snapshotWasTrusted =
-      snapshot.renderablePart == record.renderablePart &&
-      snapshot.paletteProvenance == PaletteProvenance::TrustedBlendedWriter;
-  const bool preserveTrustedSnapshot =
-      PreserveTrustedPaletteOnRawMissEnabled() && snapshotWasTrusted &&
-      provenance == PaletteProvenance::RawGlobalArena;
+    const bool snapshotWasTrusted =
+        snapshot.renderablePart == record.renderablePart &&
+        snapshot.paletteProvenance == PaletteProvenance::TrustedBlendedWriter;
+    const bool preserveTrustedSnapshot =
+        PreserveTrustedPaletteOnRawMissEnabled() && snapshotWasTrusted &&
+        provenance == PaletteProvenance::RawGlobalArena;
 
-  snapshot.renderablePart = record.renderablePart;
-  snapshot.frameTag = record.frameTag;
-  snapshot.captureSerial = record.captureSerial;
-  snapshot.matrixCount = record.capturedPaletteCount;
-  if (!preserveTrustedSnapshot) {
-    snapshot.paletteProvenance = provenance;
-    std::memcpy(snapshot.bytes.data(), paletteSource, requiredBytes);
-  } else {
-    g_paletteSnapshotTrustedPreservedCount.fetch_add(
-        1u, std::memory_order_relaxed);
+    snapshot.renderablePart = record.renderablePart;
+    snapshot.frameTag = record.frameTag;
+    snapshot.captureSerial = record.captureSerial;
+    snapshot.matrixCount = record.capturedPaletteCount;
+    if (!preserveTrustedSnapshot) {
+      snapshot.paletteProvenance = provenance;
+      std::memcpy(snapshot.bytes.data(), paletteSource, requiredBytes);
+    } else {
+      g_paletteSnapshotTrustedPreservedCount.fetch_add(
+          1u, std::memory_order_relaxed);
+    }
   }
-  if (publishGlobal) {
-    std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
-    auto& globalSnapshot = g_publishedPaletteSnapshotByPart[record.renderablePart];
+
+  {
+    CurrentDrawFixedPhaseScope globalMapsPhase(
+        dxvk::war3::hooks::War3HotHookId::CurrentDrawPublishGlobalMaps,
+        breakdownSampleWeight);
+    if (publishGlobal) {
+      std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
+      auto& globalSnapshot =
+          g_publishedPaletteSnapshotByPart[record.renderablePart];
     // 对 global snapshot 做同样的"不降级" 保护。
     const bool globalWasTrusted =
         globalSnapshot.renderablePart == record.renderablePart &&
@@ -1593,14 +2435,15 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
       globalSnapshot.paletteProvenance = provenance;
       std::memcpy(globalSnapshot.bytes.data(), paletteSource, requiredBytes);
     }
-    g_publishedCurrentDrawReadyByPart[record.renderablePart] = record;
+      g_publishedCurrentDrawReadyByPart[record.renderablePart] = record;
     // Phase 7.30 Action B：按 attribution key 并行存一份 snapshot 与 record，
     // 作为 renderablePart 换地址时的跨帧真源。这一份的 key 是纯数值，不会
     // 因为 renderablePart 指针被回收/重分配而失效。
-    if (PaletteAttributionSnapshotEnabled()) {
-      const uint64_t attrKey = ComputePaletteAttributionKey(record);
-      if (attrKey != 0u) {
-        auto& attrSnapshot = g_publishedPaletteSnapshotByAttribution[attrKey];
+      if (PaletteAttributionSnapshotEnabled()) {
+        const uint64_t attrKey = ComputePaletteAttributionKey(record);
+        if (attrKey != 0u) {
+          auto& attrSnapshot =
+              g_publishedPaletteSnapshotByAttribution[attrKey];
         const bool attrWasTrusted =
             attrSnapshot.renderablePart != nullptr &&
             attrSnapshot.paletteProvenance ==
@@ -1616,7 +2459,8 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record) {
           attrSnapshot.paletteProvenance = provenance;
           std::memcpy(attrSnapshot.bytes.data(), paletteSource, requiredBytes);
         }
-        g_publishedCurrentDrawReadyByAttribution[attrKey] = record;
+          g_publishedCurrentDrawReadyByAttribution[attrKey] = record;
+        }
       }
     }
   }
@@ -1812,7 +2656,10 @@ QueryCurrentDrawContractDiagnosticsSummary() {
   summary.publishCallCumulative =
       g_publishCallCumulative.load(std::memory_order_relaxed);
   summary.publishTrustedHitCumulative =
-      g_publishTrustedHitCumulative.load(std::memory_order_relaxed);
+      CurrentDrawRedundantAtomicsLegacyRuntime()
+          ? g_publishTrustedHitCumulative.load(std::memory_order_relaxed)
+          : g_paletteCaptureTrustedSourceHitCount.load(
+                std::memory_order_relaxed);
   summary.publishRawFallbackCumulative =
       g_publishRawFallbackCumulative.load(std::memory_order_relaxed);
   summary.publishRejectedNoTrustedCumulative =
@@ -1948,6 +2795,55 @@ bool QueryCurrentDrawContract(void* renderablePart,
   return true;
 }
 
+bool QueryCurrentDrawGeometryContract(
+    void* renderablePart,
+    void* sceneNode,
+    void* worldObjectEntry,
+    void* unitPtr,
+    uint32_t jHandle,
+    uint32_t expectedRenderFrameIndex,
+    CurrentDrawContractRecord& out) {
+  out = {};
+  if (renderablePart == nullptr)
+    return false;
+
+  const CurrentDrawContractRecord* best = nullptr;
+  const auto tryAlias = [&](uint64_t identityAlias) {
+    if (identityAlias == 0u)
+      return;
+    const size_t base = CurrentDrawGeometryLedgerSetBase(
+        renderablePart, identityAlias);
+    for (size_t way = 0u; way < kGeometryContractLedgerWays; ++way) {
+      const auto& entry = g_currentDrawGeometryLedger[base + way];
+      const auto& record = entry.record;
+      if (entry.renderablePart != renderablePart ||
+          entry.identityAlias != identityAlias || !record.known ||
+          record.renderFrameIndex != expectedRenderFrameIndex ||
+          record.producerStage != 11 || !record.producerFreshThisFrame ||
+          record.fromGrace || record.meshPayloadPtr == nullptr ||
+          !CurrentDrawGeometryRecordMatchesIdentity(
+              record, sceneNode, worldObjectEntry, unitPtr, jHandle)) {
+        continue;
+      }
+      if (best == nullptr || record.captureSerial > best->captureSerial)
+        best = &record;
+    }
+  };
+
+  tryAlias(CurrentDrawGeometryIdentityAlias(1u, jHandle));
+  tryAlias(CurrentDrawGeometryIdentityAlias(
+      2u, uint64_t(reinterpret_cast<uintptr_t>(unitPtr))));
+  tryAlias(CurrentDrawGeometryIdentityAlias(
+      3u, uint64_t(reinterpret_cast<uintptr_t>(worldObjectEntry))));
+  tryAlias(CurrentDrawGeometryIdentityAlias(
+      4u, uint64_t(reinterpret_cast<uintptr_t>(sceneNode))));
+  if (best == nullptr)
+    return false;
+  out = *best;
+  out.known = true;
+  return true;
+}
+
 bool QueryCurrentDrawContractCapturedPalette(
     void* renderablePart,
     std::vector<Matrix4>& outPalette,
@@ -1975,7 +2871,9 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  uint32_t vertexCount,
                                  uint32_t paletteCount,
                                  std::vector<uint8_t>& outGroupSlots,
-                                 uint64_t& outGroupHash) {
+                                 uint64_t& outGroupHash,
+                                 const CurrentDrawResolveTrace* trace,
+                                 const CurrentDrawRangeValidator* rangeValidator) {
   outGroupSlots.clear();
   outGroupHash = 0u;
   g_groupSlotDecodeAttemptCount.fetch_add(1u, std::memory_order_relaxed);
@@ -2005,7 +2903,13 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
       reinterpret_cast<const uint8_t*>(record.stream1Ptr);
   const size_t requiredBytes =
       size_t(vertexCount - 1u) * size_t(kCurrentDrawGroupSlotStep) + 1u;
-  if (!dxvk::war3::IsReadableRange(streamBase, requiredBytes)) {
+  if (trace != nullptr)
+    trace->note(CurrentDrawResolveTracePhase::GroupRangeCheck);
+  const bool streamReadable = rangeValidator != nullptr &&
+          rangeValidator->validate != nullptr
+      ? rangeValidator->readable(streamBase, requiredBytes)
+      : dxvk::war3::IsReadableRange(streamBase, requiredBytes);
+  if (!streamReadable) {
     g_groupSlotDecodeMissUnreadableStream.fetch_add(
         1u, std::memory_order_relaxed);
     g_lastMissReason.store(
@@ -2014,6 +2918,8 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
     return false;
   }
 
+  if (trace != nullptr)
+    trace->note(CurrentDrawResolveTracePhase::GroupDecodeLoop);
   outGroupSlots.resize(vertexCount);
   uint64_t hash = bit::fnv1a_init();
   for (uint32_t i = 0u; i < vertexCount; ++i) {
@@ -2033,6 +2939,8 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
     hash = bit::fnv1a_iter(hash, groupSlot);
   }
 
+  if (trace != nullptr)
+    trace->note(CurrentDrawResolveTracePhase::GroupFinalize);
   hash = bit::fnv1a_iter(hash,
                          reinterpret_cast<uintptr_t>(record.stream1Ptr));
   hash = bit::fnv1a_iter(hash, kCurrentDrawGroupSlotStep);
@@ -2075,15 +2983,82 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
 
 std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
     const CurrentDrawContractSnapshotOptions& options) {
+  const bool traceSnapshot = CurrentDrawSnapshotBreakdownEnabled();
+  const uint32_t snapshotTracePeriod = traceSnapshot
+      ? CurrentDrawSnapshotTraceSamplePeriod()
+      : 1u;
+  const uint64_t snapshotQpcOverheadTicks = traceSnapshot
+      ? CurrentDrawSnapshotQpcOverheadTicks()
+      : 0u;
+  const bool activeSlotSnapshot = CurrentDrawActiveSlotSnapshotEnabled();
+  const bool globalPublishEnabled = GlobalCurrentDrawPublishEnabled();
+  const bool batchedBoundedSnapshotRequested = options.maxRecords != 0u &&
+      CurrentDrawBatchedBoundedSnapshotEnabled();
+  size_t localSnapshotUpperBound = kContractCacheSize;
+  if (activeSlotSnapshot) {
+    localSnapshotUpperBound = 0u;
+    for (uint64_t occupied : g_currentDrawContractCacheOccupancy)
+      localSnapshotUpperBound += size_t(__builtin_popcountll(occupied));
+  }
+  // Preserve the historical online-top-K behavior whenever the cap may be
+  // reached or a mutex-backed global source may append more records. The
+  // batched route is enabled only when the exact local upper bound proves that
+  // no pop_back decision can occur, making collect+stable_sort equivalent.
+  const bool batchedBoundedSnapshot = batchedBoundedSnapshotRequested &&
+      !globalPublishEnabled &&
+      localSnapshotUpperBound <= size_t(options.maxRecords);
+  std::array<uint64_t, kCurrentDrawSnapshotRecordPhaseCount>
+      snapshotRecordPhaseTicks = {};
+  std::array<uint32_t, kCurrentDrawSnapshotRecordPhaseCount>
+      snapshotRecordPhaseCalls = {};
+  bool traceActiveSlotRecords = false;
+  std::optional<dxvk::war3::War3PerfMonitor::ScopedCpuScope> snapshotPhaseScope;
+  const auto enterSnapshotPhase = [&](const char* name) {
+    if (!traceSnapshot)
+      return;
+    snapshotPhaseScope.reset();
+    snapshotPhaseScope.emplace(
+        dxvk::war3::War3PerfMonitor::instance().cpuScope(name));
+  };
+
+  enterSnapshotPhase("SnapshotOutputReserve");
   std::vector<CurrentDrawContractRecord> out;
   const size_t reserveCount =
       options.maxRecords != 0u
-          ? std::min<size_t>(kContractCacheSize, size_t(options.maxRecords))
-          : kContractCacheSize;
+          ? std::min<size_t>(localSnapshotUpperBound,
+                             size_t(options.maxRecords))
+          : localSnapshotUpperBound;
   out.reserve(reserveCount);
-  const std::unordered_set<uint64_t> preferredKeySet(
-      options.preferredSelectionKeys.begin(),
-      options.preferredSelectionKeys.end());
+
+  enterSnapshotPhase("SnapshotPreferredSet");
+  // DirectGrouped already supplies a sorted/unique lease vector. Keep the
+  // public API's arbitrary-order semantics, but use binary search for that hot
+  // path instead of rebuilding a node-based hash set every semantic frame.
+  // Unsorted callers retain the historical set-membership behavior.
+  const bool preferredKeysSorted =
+      std::is_sorted(options.preferredSelectionKeys.begin(),
+                     options.preferredSelectionKeys.end());
+  static thread_local std::unordered_set<uint64_t> s_preferredKeySet;
+  s_preferredKeySet.clear();
+  if (!preferredKeysSorted && !options.preferredSelectionKeys.empty()) {
+    const size_t retainedCapacity = size_t(
+        double(s_preferredKeySet.bucket_count()) *
+        double(s_preferredKeySet.max_load_factor()));
+    if (retainedCapacity < options.preferredSelectionKeys.size())
+      s_preferredKeySet.reserve(options.preferredSelectionKeys.size());
+    s_preferredKeySet.insert(options.preferredSelectionKeys.begin(),
+                             options.preferredSelectionKeys.end());
+  }
+  const auto& preferredKeySet = s_preferredKeySet;
+  const auto containsPreferredKey = [&](uint64_t key) {
+    return preferredKeysSorted
+        ? std::binary_search(options.preferredSelectionKeys.begin(),
+                             options.preferredSelectionKeys.end(), key)
+        : preferredKeySet.find(key) != preferredKeySet.end();
+  };
+  const bool hasPreferredKeys = !options.preferredSelectionKeys.empty();
+
+  enterSnapshotPhase("SnapshotScratchSetup");
   // Phase 7.81：thread_local 复用 preferredVisibleKeyCache。
   static thread_local std::unordered_map<uint64_t, uint64_t>
       s_preferredVisibleKeyCache;
@@ -2129,16 +3104,19 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
     preferredVisibleKeyCache.emplace(cacheKey, key);
     return key;
   };
-  const auto isPreferred = [&](const CurrentDrawContractRecord& record) {
-    if (preferredKeySet.empty())
+  const auto isPreferredWithIdentity =
+      [&](const CurrentDrawContractRecord& record, uint64_t identityKey) {
+    if (!hasPreferredKeys)
       return false;
-    const uint64_t key = SnapshotStableIdentityKey(record);
-    if (key != 0u && preferredKeySet.find(key) != preferredKeySet.end()) {
+    if (identityKey != 0u && containsPreferredKey(identityKey)) {
       return true;
     }
     const uint64_t visibleKey = preferredVisibleKey(record);
-    return visibleKey != 0u &&
-           preferredKeySet.find(visibleKey) != preferredKeySet.end();
+    return visibleKey != 0u && containsPreferredKey(visibleKey);
+  };
+  const auto isPreferred = [&](const CurrentDrawContractRecord& record) {
+    return isPreferredWithIdentity(record,
+                                   SnapshotStableIdentityKey(record));
   };
   const auto betterRecord = [&](const CurrentDrawContractRecord& a,
                                 const CurrentDrawContractRecord& b) {
@@ -2165,29 +3143,78 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
   if (options.maxRecords == 0u)
     unlimitedDedupeIndex.reserve(kContractCacheSize);
 
+  static thread_local std::unordered_map<
+      CurrentDrawSnapshotPartKey, size_t, CurrentDrawSnapshotPartKeyHash>
+      s_batchedBoundedDedupeIndex;
+  s_batchedBoundedDedupeIndex.clear();
+  auto& batchedBoundedDedupeIndex = s_batchedBoundedDedupeIndex;
+  if (batchedBoundedSnapshot)
+    batchedBoundedDedupeIndex.reserve(kContractCacheSize);
+
+  enterSnapshotPhase("SnapshotRecordPolicySetup");
   auto considerRecord = [&](const CurrentDrawContractRecord& record) {
+    const bool traceRecord = traceActiveSlotRecords &&
+        SampleCurrentDrawSnapshotRecord(snapshotTracePeriod);
+    CurrentDrawSnapshotRecordRawTiming recordTiming(
+        traceRecord, snapshotTracePeriod, snapshotQpcOverheadTicks,
+        snapshotRecordPhaseTicks, snapshotRecordPhaseCalls);
+    recordTiming.enter(CurrentDrawSnapshotRecordPhase::VisibilityGate);
     if (!SnapshotRecordVisibleEnough(record, options.minVisibleFrameSerial))
       return;
+    recordTiming.enter(CurrentDrawSnapshotRecordPhase::ReadyGate);
     if (options.readyOnly && !RecordHasLocalPaletteSnapshot(record))
       return;
+    recordTiming.enter(CurrentDrawSnapshotRecordPhase::PriorityGate);
     if (options.maxRecords != 0u &&
         SnapshotPriorityOf(record, options.unitsOnly) == 0u)
       return;
+    if (batchedBoundedSnapshot) {
+      recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeKey);
+      const CurrentDrawSnapshotPartKey dedupeKey = {
+          uintptr_t(record.renderablePart), record.layerIndex,
+          record.payloadWord108, record.payloadWord11C};
+      recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeLookup);
+      const auto duplicate = batchedBoundedDedupeIndex.find(dedupeKey);
+      if (duplicate != batchedBoundedDedupeIndex.end() &&
+          duplicate->second < out.size()) {
+        CurrentDrawContractRecord& existing = out[duplicate->second];
+        recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateCompare);
+        if (betterRecord(record, existing)) {
+          recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateReplace);
+          existing = SnapshotRecordWithGrace(record);
+        }
+        return;
+      }
+      recordTiming.enter(CurrentDrawSnapshotRecordPhase::IndexPublish);
+      batchedBoundedDedupeIndex.emplace(dedupeKey, out.size());
+      recordTiming.enter(CurrentDrawSnapshotRecordPhase::RecordAppend);
+      out.push_back(SnapshotRecordWithGrace(record));
+      return;
+    }
     if (options.maxRecords == 0u) {
+      recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeKey);
       const uint64_t dedupeKey = unlimitedDedupeKey(record);
+      recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeLookup);
       const auto duplicate = unlimitedDedupeIndex.find(dedupeKey);
       if (duplicate != unlimitedDedupeIndex.end() &&
           duplicate->second < out.size()) {
         CurrentDrawContractRecord& existing = out[duplicate->second];
-        if (betterRecord(record, existing))
-          existing = record;
+        recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateCompare);
+        const bool replaceExisting = betterRecord(record, existing);
+        if (replaceExisting) {
+          recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateReplace);
+          existing = SnapshotRecordWithGrace(record);
+        }
         return;
       }
+      recordTiming.enter(CurrentDrawSnapshotRecordPhase::IndexPublish);
       unlimitedDedupeIndex.emplace(dedupeKey, out.size());
-      out.push_back(record);
+      recordTiming.enter(CurrentDrawSnapshotRecordPhase::RecordAppend);
+      out.push_back(SnapshotRecordWithGrace(record));
       return;
     }
 
+    recordTiming.enter(CurrentDrawSnapshotRecordPhase::BoundedDuplicateScan);
     auto duplicate = std::find_if(
         out.begin(), out.end(), [&](const CurrentDrawContractRecord& existing) {
           // 使用 part-slice key 去重：同 renderablePart 的不同 layer/slice 
@@ -2198,24 +3225,69 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
                  existing.payloadWord11C == record.payloadWord11C;
         });
     if (duplicate != out.end()) {
+      recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateCompare);
       if (!betterRecord(record, *duplicate))
         return;
+      recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateReplace);
       out.erase(duplicate);
     }
 
+    recordTiming.enter(CurrentDrawSnapshotRecordPhase::BoundedOrderScan);
     auto insertAt = std::find_if(
         out.begin(), out.end(), [&](const CurrentDrawContractRecord& existing) {
           return betterRecord(record, existing);
         });
-    out.insert(insertAt, record);
+    recordTiming.enter(CurrentDrawSnapshotRecordPhase::BoundedInsert);
+    out.insert(insertAt, SnapshotRecordWithGrace(record));
     if (out.size() > size_t(options.maxRecords))
       out.pop_back();
   };
 
-  for (const auto& record : g_currentDrawContractCache)
-    considerRecord(record);
+  enterSnapshotPhase("SnapshotActiveSlotScan");
+  traceActiveSlotRecords = traceSnapshot;
+  if (activeSlotSnapshot) {
+    for (size_t wordIndex = 0u;
+         wordIndex < g_currentDrawContractCacheOccupancy.size(); ++wordIndex) {
+      uint64_t occupied = g_currentDrawContractCacheOccupancy[wordIndex];
+      while (occupied != 0u) {
+        const uint32_t bitIndex = uint32_t(__builtin_ctzll(occupied));
+        const size_t slot = (wordIndex << 6u) + bitIndex;
+        if (slot < g_currentDrawContractCache.size())
+          considerRecord(g_currentDrawContractCache[slot]);
+        occupied &= occupied - 1u;
+      }
+    }
+  } else {
+    for (const auto& record : g_currentDrawContractCache)
+      considerRecord(record);
+  }
+  traceActiveSlotRecords = false;
 
-  if (GlobalCurrentDrawPublishEnabled()) {
+  if (traceSnapshot) {
+    static constexpr std::array<const char*,
+                                kCurrentDrawSnapshotRecordPhaseCount>
+        kSnapshotRecordPhaseNames = {
+            "RecordVisibilityGate", "RecordReadyGate",
+            "RecordPriorityGate",   "RecordDedupeKey",
+            "RecordDedupeLookup",   "RecordDuplicateCompare",
+            "RecordDuplicateReplace", "RecordIndexPublish",
+            "RecordAppend",         "RecordBoundedDuplicateScan",
+            "RecordBoundedOrderScan", "RecordBoundedInsert"};
+    const double ticksToMs = 1000.0 /
+        double(dxvk::high_resolution_clock::get_frequency());
+    auto& perf = dxvk::war3::War3PerfMonitor::instance();
+    for (size_t i = 0u; i < kCurrentDrawSnapshotRecordPhaseCount; ++i) {
+      if (snapshotRecordPhaseCalls[i] == 0u)
+        continue;
+      perf.addCpuSampleToCurrentScope(
+          kSnapshotRecordPhaseNames[i],
+          double(snapshotRecordPhaseTicks[i]) * ticksToMs,
+          snapshotRecordPhaseCalls[i]);
+    }
+  }
+
+  enterSnapshotPhase("SnapshotGlobalPublishScan");
+  if (globalPublishEnabled) {
     std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
     if (options.pruneOlderThanMinVisibleFrame)
       PrunePublishedCurrentDrawContractsLocked(options.minVisibleFrameSerial);
@@ -2226,6 +3298,75 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
     for (const auto& [_, record] : source)
       considerRecord(record);
   }
+
+  if (batchedBoundedSnapshot) {
+    enterSnapshotPhase("SnapshotBatchedOrder");
+    if (out.size() > 1u) {
+    // The old stable_sort comparator recomputed preferred membership,
+    // priority and three stable hashes O(N log N) times. Decorate every
+    // immutable snapshot record once, sort the compact keys, then copy records
+    // in key order. sourceIndex is the final ascending tie-break, which is
+    // exactly stable_sort's input-order rule for otherwise equivalent keys.
+    struct SnapshotSortKey {
+      bool preferred = false;
+      uint32_t priority = 0u;
+      uint64_t identity = 0u;
+      uint64_t part = 0u;
+      uint64_t visibleFrameSerial = 0u;
+      uint32_t renderFrameIndex = 0u;
+      uint64_t captureSerial = 0u;
+      size_t sourceIndex = 0u;
+    };
+    static thread_local std::vector<SnapshotSortKey> s_sortKeys;
+    static thread_local std::vector<CurrentDrawContractRecord>
+        s_sortedSnapshotScratch;
+    s_sortKeys.clear();
+    s_sortKeys.reserve(out.size());
+    for (size_t i = 0u; i < out.size(); ++i) {
+      const auto& record = out[i];
+      const uint64_t identity = SnapshotStableIdentityKey(record);
+      s_sortKeys.push_back({
+          isPreferredWithIdentity(record, identity),
+          SnapshotPriorityOf(record, options.unitsOnly),
+          identity,
+          SnapshotStablePartKey(record),
+          record.visibleFrameSerial,
+          record.renderFrameIndex,
+          record.captureSerial,
+          i,
+      });
+    }
+    std::sort(
+        s_sortKeys.begin(), s_sortKeys.end(),
+        [](const SnapshotSortKey& a, const SnapshotSortKey& b) {
+          if (a.preferred != b.preferred)
+            return a.preferred;
+          if (a.priority != b.priority)
+            return a.priority > b.priority;
+          if (a.identity != b.identity)
+            return a.identity < b.identity;
+          if (a.part != b.part)
+            return a.part < b.part;
+          if (a.visibleFrameSerial != b.visibleFrameSerial)
+            return a.visibleFrameSerial > b.visibleFrameSerial;
+          if (a.renderFrameIndex != b.renderFrameIndex)
+            return a.renderFrameIndex > b.renderFrameIndex;
+          if (a.captureSerial != b.captureSerial)
+            return a.captureSerial > b.captureSerial;
+          return a.sourceIndex < b.sourceIndex;
+        });
+
+    s_sortedSnapshotScratch.clear();
+    s_sortedSnapshotScratch.reserve(out.size());
+    for (const SnapshotSortKey& key : s_sortKeys)
+      s_sortedSnapshotScratch.push_back(out[key.sourceIndex]);
+    out.swap(s_sortedSnapshotScratch);
+    }
+    if (out.size() > size_t(options.maxRecords))
+      out.resize(size_t(options.maxRecords));
+  }
+
+  enterSnapshotPhase("SnapshotFinalize");
   return out;
 }
 
@@ -2258,11 +3399,10 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
         bit::fnv1a_hash(reinterpret_cast<const uint8_t*>(out.palette.data()),
                         out.palette.size() * sizeof(Matrix4));
     // Phase 1：从 thread-local snapshot 读取 provenance。
-    const size_t snapshotSlot =
-        (uintptr_t(renderablePart) >> 4u) % kPaletteSnapshotCacheSize;
-    const auto& snapshot = g_paletteSnapshotCache[snapshotSlot];
-    if (snapshot.renderablePart == renderablePart)
-      out.paletteProvenance = snapshot.paletteProvenance;
+    const PaletteSnapshotEntry* snapshot =
+        FindLocalPaletteSnapshot(renderablePart);
+    if (snapshot != nullptr)
+      out.paletteProvenance = snapshot->paletteProvenance;
   }
 
   if (!out.paletteReady()) {
@@ -2286,7 +3426,9 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
     const CurrentDrawContractRecord& record,
     uint32_t vertexCount,
     uint64_t expectedVisibleFrameSerial,
-    CurrentDrawAuthoritativeSample& out) {
+    CurrentDrawAuthoritativeSample& out,
+    const CurrentDrawResolveTrace* trace,
+    const CurrentDrawRangeValidator* rangeValidator) {
   out = {};
   out.contract = record;
   out.contract.known =
@@ -2307,11 +3449,15 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
     return out.status;
   }
 
+  if (trace != nullptr)
+    trace->note(CurrentDrawResolveTracePhase::PaletteDecode);
   DecodeCapturedPaletteForRecord(out.contract, out.palette, out.paletteCount,
                                  true);
   if (out.paletteCount != 0u && out.palette.size() >= out.paletteCount) {
     if (out.palette.size() > out.paletteCount)
       out.palette.resize(out.paletteCount);
+    if (trace != nullptr)
+      trace->note(CurrentDrawResolveTracePhase::PaletteHash);
     out.paletteHash =
         bit::fnv1a_hash(reinterpret_cast<const uint8_t*>(out.palette.data()),
                         out.palette.size() * sizeof(Matrix4));
@@ -2322,12 +3468,17 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
     return out.status;
   }
 
+  if (trace != nullptr)
+    trace->note(CurrentDrawResolveTracePhase::GroupGate);
   if (!DecodeCurrentDrawGroupSlots(out.contract, vertexCount, out.paletteCount,
-                                   out.groupSlots, out.groupHash)) {
+                                   out.groupSlots, out.groupHash, trace,
+                                   rangeValidator)) {
     out.status = CurrentDrawResolveStatus::MissingGroupSlots;
     return out.status;
   }
 
+  if (trace != nullptr)
+    trace->note(CurrentDrawResolveTracePhase::StableHash);
   out.stableGroupHash =
       ComputeStableGroupContentHash(out.contract, out.groupSlots);
   out.status = CurrentDrawResolveStatus::Ready;

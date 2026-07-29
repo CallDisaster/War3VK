@@ -1,4 +1,5 @@
 #include "war3_jass_command_bridge.h"
+#include "war3_hook_lifecycle.h"
 
 #include "../../d3d9_war3_debug.h"
 #ifndef WAR3_SHADER_API_INTERNAL
@@ -13,6 +14,7 @@
 #include "../../jass/war3_jass_types.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -37,6 +39,11 @@ constexpr uint32_t kMaxNativeStringBytes = 2048;
 using NativeVoidStringFn = void(__cdecl *)(uint32_t);
 using NativeIntStringFn = int(__cdecl *)(uint32_t);
 using NativeStringStringFn = uint32_t(__cdecl *)(uint32_t);
+using NativeVoidBooleanFn = void(__cdecl *)(uint32_t);
+using NativeConvertCameraFieldFn = uint32_t(__cdecl *)(int32_t);
+using NativeSetCameraFieldFn =
+    void(__cdecl *)(uint32_t, float *, float *);
+using NativeSetCameraPositionFn = void(__cdecl *)(float *, float *);
 using NativePlayerFn = uint32_t(__cdecl *)(int);
 using NativeGetLocalPlayerFn = uint32_t(__cdecl *)();
 using NativeDisplayTextToPlayerFn =
@@ -218,11 +225,50 @@ int HandleShaderApiCommand(BridgeState &state, const std::string &command,
                                                intensity));
   }
 
+  if (args[0] == "update-point-light-ex") {
+    int32_t id;
+    float x, y, z, range, r, g, b, intensity, shadowIntensity;
+    if (args.size() != 11 || !parseIntAt(1, id) || !parseFloatAt(2, x) ||
+        !parseFloatAt(3, y) || !parseFloatAt(4, z) ||
+        !parseFloatAt(5, range) || !parseFloatAt(6, r) ||
+        !parseFloatAt(7, g) || !parseFloatAt(8, b) ||
+        !parseFloatAt(9, intensity) || !parseFloatAt(10, shadowIntensity))
+      return failArgs();
+    return okBool(war3shader::UpdatePointLightEx(
+        id, x, y, z, range, r, g, b, intensity, shadowIntensity));
+  }
+
+  if (args[0] == "set-point-light-shadow") {
+    int32_t id;
+    float shadowIntensity;
+    if (args.size() != 3 || !parseIntAt(1, id) ||
+        !parseFloatAt(2, shadowIntensity))
+      return failArgs();
+    return okBool(
+        war3shader::SetPointLightShadowIntensity(id, shadowIntensity));
+  }
+
   if (args[0] == "remove-point-light") {
     int32_t id;
     if (args.size() != 2 || !parseIntAt(1, id))
       return failArgs();
     return okBool(war3shader::RemovePointLight(id));
+  }
+
+  if (args[0] == "clear-point-lights") {
+    if (args.size() != 1)
+      return failArgs();
+    war3shader::ClearPointLights();
+    SetCommandOk(state, "ok:" + args[0], stringResult);
+    return 1;
+  }
+
+  if (args[0] == "get-point-light-count") {
+    if (args.size() != 1)
+      return failArgs();
+    const uint32_t count = war3shader::GetPointLightCount();
+    SetCommandOk(state, std::to_string(count), stringResult);
+    return static_cast<int>(count);
   }
 
   if (args[0] == "outline-add-handle") {
@@ -351,6 +397,57 @@ int HandleShaderApiCommand(BridgeState &state, const std::string &command,
     if (args.size() != 2 || !parseBoolAt(1, enabled))
       return failArgs();
     return okBool(war3shader::SetPointShadowEnabled(enabled));
+  }
+
+  if (args[0] == "set-point-shadow-bias") {
+    float value;
+    if (args.size() != 2 || !parseFloatAt(1, value))
+      return failArgs();
+    return okBool(war3shader::SetPointShadowBias(value));
+  }
+
+  if (args[0] == "set-volumetric-light-enabled" ||
+      args[0] == "set-volumetric-enabled") {
+    bool enabled;
+    if (args.size() != 2 || !parseBoolAt(1, enabled))
+      return failArgs();
+    return okBool(war3shader::SetVolumetricLightEnabled(enabled));
+  }
+
+  if (args[0] == "set-volumetric-light-params") {
+    float intensity, density, weight, decay;
+    uint32_t samples;
+    if (args.size() != 6 || !parseFloatAt(1, intensity) ||
+        !parseFloatAt(2, density) || !parseFloatAt(3, weight) ||
+        !parseFloatAt(4, decay) || !parseUIntAt(5, samples))
+      return failArgs();
+    return okBool(war3shader::SetVolumetricLightParams(
+        intensity, density, weight, decay, samples));
+  }
+
+  if (args[0] == "set-volumetric-light-fade") {
+    float fadeNear, fadeFar, maxRayDistance;
+    if (args.size() != 4 || !parseFloatAt(1, fadeNear) ||
+        !parseFloatAt(2, fadeFar) || !parseFloatAt(3, maxRayDistance))
+      return failArgs();
+    return okBool(war3shader::SetVolumetricLightFade(
+        fadeNear, fadeFar, maxRayDistance));
+  }
+
+  if (args[0] == "set-volumetric-height-fog") {
+    float baseHeight, falloff, strength;
+    if (args.size() != 4 || !parseFloatAt(1, baseHeight) ||
+        !parseFloatAt(2, falloff) || !parseFloatAt(3, strength))
+      return failArgs();
+    return okBool(
+        war3shader::SetVolumetricHeightFog(baseHeight, falloff, strength));
+  }
+
+  if (args[0] == "set-volumetric-resolution-divisor") {
+    uint32_t divisor;
+    if (args.size() != 2 || !parseUIntAt(1, divisor))
+      return failArgs();
+    return okBool(war3shader::SetVolumetricResolutionDivisor(divisor));
   }
 
   if (args[0] == "set-outline-enabled") {
@@ -704,6 +801,26 @@ void *ReadCurrentNativeFunc(void *entry) {
   if (!dxvk::war3::SafeReadPtr(entry, kNativeEntryFuncPtrOffset, funcPtr))
     return nullptr;
   return funcPtr;
+}
+
+bool CopyNativeSignature(const char *signature, std::string &out) {
+  out.clear();
+  if (!signature)
+    return false;
+
+  constexpr size_t kMaxSignatureBytes = 96u;
+  for (size_t i = 0u; i < kMaxSignatureBytes; ++i) {
+    if (!dxvk::war3::IsReadableRange(signature + i, 1u)) {
+      out.clear();
+      return false;
+    }
+    const char value = signature[i];
+    if (value == '\0')
+      return !out.empty();
+    out.push_back(value);
+  }
+  out.clear();
+  return false;
 }
 
 bool SignatureLooksLikeOneStringArg(const char *sigPtr) {
@@ -1170,6 +1287,265 @@ JassCommandBridgeSelfTestResult RunJassCommandBridgeSelfTest(bool displayText) {
   if (!result.intQueryOk || !result.stringQueryOk) {
     result.error = "carrier selftest did not return expected values";
   }
+  return result;
+}
+
+JassPauseGameTestResult SetJassGamePausedForTest(bool paused) {
+  JassPauseGameTestResult result = {};
+  result.paused = paused;
+
+  TryInstallJassCommandBridge("pause-game-test");
+  void *entry = LookupNativeEntry("PauseGame");
+  if (!entry) {
+    result.error = "PauseGame native entry was not found";
+    return result;
+  }
+  result.resolved = true;
+
+  void *funcPtr = nullptr;
+  const char *signature = nullptr;
+  if (!ReadNativeMeta(entry, funcPtr, signature, result.paramCount,
+                      result.returnType)) {
+    result.error = "PauseGame native metadata is unreadable";
+    return result;
+  }
+
+  if (signature && dxvk::war3::IsReadableRange(signature, 4u)) {
+    char copy[16] = {};
+    size_t length = 0u;
+    while (length + 1u < sizeof(copy) &&
+           dxvk::war3::IsReadableRange(signature + length, 1u) &&
+           signature[length] != '\0') {
+      copy[length] = signature[length];
+      ++length;
+    }
+    result.signature.assign(copy, length);
+  }
+
+  // Native metadata uses the JASS signature "(B)V" for
+  // PauseGame(boolean). Fail closed instead of calling a table entry with an
+  // ABI that does not match the one-argument cdecl contract.
+  result.signatureValidated =
+      result.paramCount == 1u && result.signature.size() >= 4u &&
+      result.signature[0] == '(' && result.signature[1] == 'B' &&
+      result.signature[2] == ')' && result.signature[3] == 'V';
+  if (!result.signatureValidated) {
+    result.error = "PauseGame native signature mismatch";
+    return result;
+  }
+
+  const auto pauseFn = reinterpret_cast<NativeVoidBooleanFn>(funcPtr);
+  if (!pauseFn) {
+    result.error = "PauseGame native function pointer is null";
+    return result;
+  }
+
+  const bool previousBypass =
+      SetInternalTestGamePauseBypassForCurrentThread(true);
+  pauseFn(paused ? 1u : 0u);
+  SetInternalTestGamePauseBypassForCurrentThread(previousBypass);
+  result.invoked = true;
+  return result;
+}
+
+JassCameraFieldTestResult SetJassCameraAngleOfAttackForTest(
+    float angleDegrees) {
+  JassCameraFieldTestResult result = {};
+  result.angleDegrees = angleDegrees;
+
+  if (!std::isfinite(angleDegrees)) {
+    result.error = "camera angle is not finite";
+    return result;
+  }
+
+  TryInstallJassCommandBridge("camera-angle-test");
+  void *convertEntry = LookupNativeEntry("ConvertCameraField");
+  void *setEntry = LookupNativeEntry("SetCameraField");
+  result.convertResolved = convertEntry != nullptr;
+  result.setResolved = setEntry != nullptr;
+  if (!result.convertResolved || !result.setResolved) {
+    result.error =
+        "ConvertCameraField or SetCameraField native entry was not found";
+    return result;
+  }
+
+  void *convertPtr = nullptr;
+  void *setPtr = nullptr;
+  const char *convertSignature = nullptr;
+  const char *setSignature = nullptr;
+  if (!ReadNativeMeta(convertEntry, convertPtr, convertSignature,
+                      result.convertParamCount, result.convertReturnType) ||
+      !ReadNativeMeta(setEntry, setPtr, setSignature, result.setParamCount,
+                      result.setReturnType)) {
+    result.error = "camera native metadata is unreadable";
+    return result;
+  }
+
+  CopyNativeSignature(convertSignature, result.convertSignature);
+  CopyNativeSignature(setSignature, result.setSignature);
+  const bool convertSignatureValid =
+      result.convertParamCount == 1u &&
+      result.convertSignature.rfind("(I)", 0u) == 0u &&
+      result.convertSignature.find("camerafield") != std::string::npos;
+  const bool setSignatureValid =
+      result.setParamCount == 3u &&
+      result.setSignature.rfind("(Hcamerafield;RR)", 0u) == 0u &&
+      result.setSignature.size() >= 2u &&
+      result.setSignature.back() == 'V';
+  result.signaturesValidated =
+      convertSignatureValid && setSignatureValid;
+  if (!result.signaturesValidated) {
+    result.error = "camera native signature mismatch";
+    return result;
+  }
+
+  const auto convertFn =
+      reinterpret_cast<NativeConvertCameraFieldFn>(convertPtr);
+  const auto setFn = reinterpret_cast<NativeSetCameraFieldFn>(setPtr);
+  if (!convertFn || !setFn) {
+    result.error = "camera native function pointer is null";
+    return result;
+  }
+
+  // common.j: CAMERA_FIELD_ANGLE_OF_ATTACK = ConvertCameraField(2).
+  result.cameraFieldHandle = convertFn(2);
+  if (result.cameraFieldHandle == 0u) {
+    result.error = "ConvertCameraField(2) returned a null handle";
+    return result;
+  }
+
+  float angle = angleDegrees;
+  float duration = 0.0f;
+  setFn(result.cameraFieldHandle, &angle, &duration);
+  result.invoked = true;
+  return result;
+}
+
+JassFixedCameraTestResult SetJassFixedCameraForTest(
+    float targetX, float targetY, float targetDistance, float angleDegrees,
+    float rotationDegrees, float fieldOfViewDegrees, float farZ,
+    float rollDegrees, float zOffset) {
+  JassFixedCameraTestResult result = {};
+  result.targetX = targetX;
+  result.targetY = targetY;
+  result.targetDistance = targetDistance;
+  result.angleDegrees = angleDegrees;
+  result.rotationDegrees = rotationDegrees;
+  result.fieldOfViewDegrees = fieldOfViewDegrees;
+  result.farZ = farZ;
+  result.rollDegrees = rollDegrees;
+  result.zOffset = zOffset;
+
+  const float values[] = {
+      targetX, targetY, targetDistance, angleDegrees, rotationDegrees,
+      fieldOfViewDegrees, farZ, rollDegrees, zOffset,
+  };
+  for (const float value : values) {
+    if (!std::isfinite(value)) {
+      result.error = "fixed camera input is not finite";
+      return result;
+    }
+  }
+  if (targetDistance <= 0.0f || fieldOfViewDegrees <= 0.0f ||
+      farZ <= 0.0f) {
+    result.error = "fixed camera distance/FOV/FarZ must be positive";
+    return result;
+  }
+
+  TryInstallJassCommandBridge("fixed-camera-test");
+  void *convertEntry = LookupNativeEntry("ConvertCameraField");
+  void *setEntry = LookupNativeEntry("SetCameraField");
+  void *positionEntry = LookupNativeEntry("SetCameraPosition");
+  result.convertResolved = convertEntry != nullptr;
+  result.setResolved = setEntry != nullptr;
+  result.positionResolved = positionEntry != nullptr;
+  if (!result.convertResolved || !result.setResolved ||
+      !result.positionResolved) {
+    result.error = "fixed camera native entry was not found";
+    return result;
+  }
+
+  void *convertPtr = nullptr;
+  void *setPtr = nullptr;
+  void *positionPtr = nullptr;
+  const char *convertSignature = nullptr;
+  const char *setSignature = nullptr;
+  const char *positionSignature = nullptr;
+  if (!ReadNativeMeta(convertEntry, convertPtr, convertSignature,
+                      result.convertParamCount, result.convertReturnType) ||
+      !ReadNativeMeta(setEntry, setPtr, setSignature, result.setParamCount,
+                      result.setReturnType) ||
+      !ReadNativeMeta(positionEntry, positionPtr, positionSignature,
+                      result.positionParamCount, result.positionReturnType)) {
+    result.error = "fixed camera native metadata is unreadable";
+    return result;
+  }
+
+  CopyNativeSignature(convertSignature, result.convertSignature);
+  CopyNativeSignature(setSignature, result.setSignature);
+  CopyNativeSignature(positionSignature, result.positionSignature);
+  const bool convertSignatureValid =
+      result.convertParamCount == 1u &&
+      result.convertSignature.rfind("(I)", 0u) == 0u &&
+      result.convertSignature.find("camerafield") != std::string::npos;
+  const bool setSignatureValid =
+      result.setParamCount == 3u &&
+      result.setSignature.rfind("(Hcamerafield;RR)", 0u) == 0u &&
+      result.setSignature.size() >= 2u &&
+      result.setSignature.back() == 'V';
+  const bool positionSignatureValid =
+      result.positionParamCount == 2u &&
+      result.positionSignature == "(RR)V";
+  result.signaturesValidated =
+      convertSignatureValid && setSignatureValid && positionSignatureValid;
+  if (!result.signaturesValidated) {
+    result.error = "fixed camera native signature mismatch";
+    return result;
+  }
+
+  const auto convertFn =
+      reinterpret_cast<NativeConvertCameraFieldFn>(convertPtr);
+  const auto setFn = reinterpret_cast<NativeSetCameraFieldFn>(setPtr);
+  const auto positionFn =
+      reinterpret_cast<NativeSetCameraPositionFn>(positionPtr);
+  if (!convertFn || !setFn || !positionFn) {
+    result.error = "fixed camera native function pointer is null";
+    return result;
+  }
+
+  // common.j camera fields 0..6:
+  // target distance, far Z, angle of attack, FOV, roll, rotation, Z offset.
+  for (int32_t index = 0; index < 7; ++index) {
+    result.cameraFieldHandles[index] = convertFn(index);
+    // Camera-field handles are enum values, not pointers. Field zero is the
+    // valid CAMERA_FIELD_TARGET_DISTANCE value; only a zero result for a
+    // non-zero enum input proves that conversion failed.
+    if (index != 0 && result.cameraFieldHandles[index] == 0u) {
+      result.error = "ConvertCameraField returned a null handle";
+      return result;
+    }
+  }
+
+  float x = targetX;
+  float y = targetY;
+  positionFn(&x, &y);
+  result.positionInvoked = true;
+
+  float duration = 0.0f;
+  float fieldValues[] = {
+      targetDistance,
+      farZ,
+      angleDegrees,
+      fieldOfViewDegrees,
+      rollDegrees,
+      rotationDegrees,
+      zOffset,
+  };
+  for (uint32_t index = 0u; index < 7u; ++index) {
+    setFn(result.cameraFieldHandles[index], &fieldValues[index], &duration);
+    ++result.fieldInvocations;
+  }
+  result.invoked = result.positionInvoked && result.fieldInvocations == 7u;
   return result;
 }
 

@@ -21,6 +21,10 @@ layout(push_constant) uniform push_block {
   uint p_flags;            // bit2=alphaTest启用
   float p_alphaRef;        // Alpha阈值
   uint p_samplerIndex;     // [NEW] Bindless Sampler Index
+  float p_terrainDepthBias;// 与顶点着色器布局保持一致
+  uint p_pad0;              // 点阴影路径: cube face 分辨率
+  uint p_pad1;
+  vec4 p_pointLightPosRange;
 };
 
 float hash12(vec2 p) {
@@ -65,6 +69,8 @@ void main() {
       }
     }
   }
-  
-  // 深度写入由硬件自动完成，无需额外输出
+
+  // Directional CSM uses fixed-function depth. Do not write gl_FragDepth:
+  // doing so disables early depth and, on the 32-bit driver path, the shared
+  // point/cascade shader eventually caused VK_ERROR_DEVICE_LOST.
 }

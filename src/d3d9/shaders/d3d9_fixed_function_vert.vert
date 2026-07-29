@@ -3,6 +3,10 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_spirv_intrinsics : require
 
+#ifndef D3D9_WAR3_GPU_SKIN
+#define D3D9_WAR3_GPU_SKIN 0
+#endif
+
 layout(location = 0) in vec4 in_Position0;
 layout(location = 1) in vec4 in_Normal0;
 layout(location = 2) in vec4 in_Position1;
@@ -141,6 +145,16 @@ layout(set = 0, binding = 4, scalar, row_major) uniform ShaderData {
 
 layout(push_constant, scalar, row_major) uniform RenderStates {
     D3D9RenderStateInfo rs;
+#if D3D9_WAR3_GPU_SKIN
+    layout(offset = 64) uint gpuSkinActivationMagic;
+    uint gpuSkinInputVertexOffset;
+    uint gpuSkinPaletteOffset;
+    uint gpuSkinVertexCount;
+    uint gpuSkinPaletteMatrixCount;
+    uint gpuSkinSourceUvLayerCount;
+    uint gpuSkinOutputFormat;
+    uint gpuSkinLayoutGeneration;
+#endif
 };
 
 // Bindings have to match with computeResourceSlotId in dxso_util.h
@@ -163,6 +177,18 @@ layout(set = 0, binding = 5, std140, row_major) readonly buffer VertexBlendData 
 layout(set = 0, binding = 3, std140) uniform ClipPlanes {
     vec4 clipPlanes[MaxClipPlaneCount];
 };
+
+#if D3D9_WAR3_GPU_SKIN
+// 这两个 binding 只存在于 War3 私有变体。Main draw 会在同一命令闭包内
+// 完成绑定、绘制、清零和解绑，stock fixed-function draw 不会看到该契约。
+layout(set = 0, binding = 64, std430) readonly restrict buffer War3GpuSkinStaticSource {
+    uint gpuSkinSourceWords[];
+};
+
+layout(set = 0, binding = 65, std430) readonly restrict buffer War3GpuSkinPalette {
+    uint gpuSkinPaletteWords[];
+};
+#endif
 
 
 // Functions to extract information from the packed VS key
@@ -354,11 +380,126 @@ vec4 pickMaterialSource(uint source, vec4 material) {
         return material;
 }
 
+#if D3D9_WAR3_GPU_SKIN
+const uint War3GpuSkinActiveMagic = 0x31535657u;
+const uint War3GpuSkinBypassActiveMagic = 0x32535657u;
+const uint War3GpuSkinLayoutGeneration = 1u;
+const uint War3GpuSkinOutputFormatPositionNormalUv1 = 2u;
+
+uint loadWar3GpuSkinSourceWord(uint byteOffset) {
+    return gpuSkinSourceWords[byteOffset >> 2u];
+}
+
+uint loadWar3GpuSkinSourceByte(uint byteOffset) {
+    uint packed = gpuSkinSourceWords[byteOffset >> 2u];
+    return (packed >> ((byteOffset & 3u) * 8u)) & 0xffu;
+}
+
+float loadWar3GpuSkinPaletteFloat(uint byteOffset) {
+    return uintBitsToFloat(gpuSkinPaletteWords[byteOffset >> 2u]);
+}
+
+bool tryLoadWar3GpuSkinVertex(
+        inout vec4 vtx,
+        inout vec3 normal,
+        inout vec4 texcoord0) {
+    if ((gpuSkinActivationMagic != War3GpuSkinActiveMagic &&
+         gpuSkinActivationMagic != War3GpuSkinBypassActiveMagic) ||
+        gpuSkinInputVertexOffset != 0u || gpuSkinPaletteOffset != 0u ||
+        gpuSkinVertexCount == 0u || gpuSkinPaletteMatrixCount == 0u ||
+        gpuSkinSourceUvLayerCount != 1u ||
+        gpuSkinOutputFormat != War3GpuSkinOutputFormatPositionNormalUv1 ||
+        gpuSkinLayoutGeneration != War3GpuSkinLayoutGeneration ||
+        vertexHasPositionT() ||
+        blendMode() != D3D9FF_VertexBlendMode_Disabled ||
+        gl_VertexIndex < 0 || uint(gl_VertexIndex) >= gpuSkinVertexCount) {
+        return false;
+    }
+
+    uint vertex = uint(gl_VertexIndex);
+    uint positionBase = gpuSkinInputVertexOffset;
+    uint normalBase = positionBase + gpuSkinVertexCount * 12u;
+    uint groupSlotBase = normalBase + gpuSkinVertexCount * 12u;
+    uint texcoord0Base = (groupSlotBase + gpuSkinVertexCount + 3u) & ~3u;
+    uint positionAddress = positionBase + vertex * 12u;
+    uint normalAddress = normalBase + vertex * 12u;
+    uint texcoord0Address = texcoord0Base + vertex * 8u;
+
+    precise float px = uintBitsToFloat(loadWar3GpuSkinSourceWord(positionAddress + 0u));
+    precise float py = uintBitsToFloat(loadWar3GpuSkinSourceWord(positionAddress + 4u));
+    precise float pz = uintBitsToFloat(loadWar3GpuSkinSourceWord(positionAddress + 8u));
+    precise float nx = uintBitsToFloat(loadWar3GpuSkinSourceWord(normalAddress + 0u));
+    precise float ny = uintBitsToFloat(loadWar3GpuSkinSourceWord(normalAddress + 4u));
+    precise float nz = uintBitsToFloat(loadWar3GpuSkinSourceWord(normalAddress + 8u));
+    float uvx = uintBitsToFloat(loadWar3GpuSkinSourceWord(texcoord0Address + 0u));
+    float uvy = uintBitsToFloat(loadWar3GpuSkinSourceWord(texcoord0Address + 4u));
+
+    uint groupSlot = loadWar3GpuSkinSourceByte(groupSlotBase + vertex);
+    if (groupSlot >= gpuSkinPaletteMatrixCount)
+        return false;
+
+    uint matrixAddress = gpuSkinPaletteOffset + groupSlot * 48u;
+    precise float m0 = loadWar3GpuSkinPaletteFloat(matrixAddress + 0u);
+    precise float m1 = loadWar3GpuSkinPaletteFloat(matrixAddress + 4u);
+    precise float m2 = loadWar3GpuSkinPaletteFloat(matrixAddress + 8u);
+    precise float m3 = loadWar3GpuSkinPaletteFloat(matrixAddress + 12u);
+    precise float m4 = loadWar3GpuSkinPaletteFloat(matrixAddress + 16u);
+    precise float m5 = loadWar3GpuSkinPaletteFloat(matrixAddress + 20u);
+    precise float m6 = loadWar3GpuSkinPaletteFloat(matrixAddress + 24u);
+    precise float m7 = loadWar3GpuSkinPaletteFloat(matrixAddress + 28u);
+    precise float m8 = loadWar3GpuSkinPaletteFloat(matrixAddress + 32u);
+    precise float m9 = loadWar3GpuSkinPaletteFloat(matrixAddress + 36u);
+    precise float m10 = loadWar3GpuSkinPaletteFloat(matrixAddress + 40u);
+    precise float m11 = loadWar3GpuSkinPaletteFloat(matrixAddress + 44u);
+
+    // 与 compute/native parity 合同保持相同的 3x4 标量求值顺序。
+    precise float positionX01 = m0 * px + m3 * py;
+    precise float positionX2 = positionX01 + m6 * pz;
+    precise float positionX = positionX2 + m9;
+    precise float positionY01 = m1 * px + m4 * py;
+    precise float positionY2 = positionY01 + m7 * pz;
+    precise float positionY = positionY2 + m10;
+    precise float positionZ01 = m2 * px + m5 * py;
+    precise float positionZ2 = positionZ01 + m8 * pz;
+    precise float positionZ = positionZ2 + m11;
+
+    precise float normalX01 = m0 * nx + m3 * ny;
+    precise float normalX = normalX01 + m6 * nz;
+    precise float normalY01 = m1 * nx + m4 * ny;
+    precise float normalY = normalY01 + m7 * nz;
+    precise float normalZ01 = m2 * nx + m5 * ny;
+    precise float normalZ = normalZ01 + m8 * nz;
+
+    vtx = vec4(positionX, positionY, positionZ, 1.0);
+    normal = vec3(normalX, normalY, normalZ);
+    // format 0x112 的 UV0 也必须来自同一份 generation-pinned 静态输入。
+    // 否则未来移除 compute 输出 VB 后会把原生动态环中的旧 UV 当成当前模型数据。
+    texcoord0 = vec4(uvx, uvy, 0.0, 1.0);
+    return true;
+}
+#endif
+
 
 void main() {
     vec4 vtx = in_Position0;
     gl_Position = in_Position0;
     vec3 normal = in_Normal0.xyz;
+
+#if D3D9_WAR3_GPU_SKIN
+    // false 时完整保留 stock 输入；host 仍绑定已验证的 compute 输出 VB，
+    // 因而任何私有门失败都只会回到现有正确路径。
+    vec4 war3GpuSkinTexcoord0 = in_Texcoord0;
+    bool war3GpuSkinActive =
+        tryLoadWar3GpuSkinVertex(vtx, normal, war3GpuSkinTexcoord0);
+    // WVS2 只由已经通过 P4 input-capability preflight 的 VS-B1 发布。
+    // 此时 CPU kernel 已跳过，私有门异常不能回读带毒原生 VB。
+    if (gpuSkinActivationMagic == War3GpuSkinBypassActiveMagic &&
+        !war3GpuSkinActive) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        out_Normal = vec4(0.0, 0.0, 1.0, 1.0);
+        return;
+    }
+#endif
 
     if (blendMode() == D3D9FF_VertexBlendMode_Tween) {
         vec4 vtx1 = in_Position1;
@@ -437,7 +578,11 @@ void main() {
     out_Normal = outNrm;
 
     vec4 texCoords[TextureStageCount];
+#if D3D9_WAR3_GPU_SKIN
+    texCoords[0] = war3GpuSkinActive ? war3GpuSkinTexcoord0 : in_Texcoord0;
+#else
     texCoords[0] = in_Texcoord0;
+#endif
     texCoords[1] = in_Texcoord1;
     texCoords[2] = in_Texcoord2;
     texCoords[3] = in_Texcoord3;

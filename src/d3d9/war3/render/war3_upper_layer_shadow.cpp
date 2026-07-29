@@ -320,6 +320,9 @@ bool UpperLayerShadowRegistry::resolve(
     out.visible.identity.jHandle = semantic.jHandle;
   if (out.visible.identity.rawcode == 0u)
     out.visible.identity.rawcode = semantic.rawcode;
+  out.visible.pathBlocker =
+      out.visible.pathBlocker || semantic.pathBlocker ||
+      dxvk::war3::internal::IsPathBlockerFourCc(out.visible.identity.rawcode);
   if (out.visible.modelKey == 0u)
     out.visible.modelKey = semantic.modelKey;
   if (!out.visible.HasResolvedGeoset()) {

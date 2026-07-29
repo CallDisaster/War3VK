@@ -66,8 +66,8 @@ struct CGxuLight;
 
 enum class RenderStage : int32_t {
   Stage0_PreRenderContext = 0,                // sub_6F186300(this+0x354)
-  Stage1_TerrainShadow0 = 1,                  // TerrainShadow_Dispatch(0)
-  Stage2_TerrainShadow1 = 2,                  // TerrainShadow_Dispatch(1)
+  Stage1_TerrainShadow0 = 1,                  // TerrainShadow_Dispatch(0), main terrain geometry
+  Stage2_TerrainShadow1 = 2,                  // TerrainShadow_Dispatch(1), fog/shadow/decal layer
   Stage3_TerrainShadow2 = 3,                  // TerrainShadow_Dispatch(2)
   Stage4_TerrainShadow3 = 4,                  // TerrainShadow_Dispatch(3)
   Stage5_TerrainShadow5 = 5,                  // TerrainShadow_Dispatch(5)
@@ -92,7 +92,7 @@ enum class RenderStage : int32_t {
   // 但后续继续还原时应优先使用上面的“阶段号+真实作用”命名。
   SkyBox = Stage0_PreRenderContext,
   Terrain = Stage1_TerrainShadow0,
-  Buildings_Legacy = Stage2_TerrainShadow1,
+  FogShadowDecal_Legacy = Stage2_TerrainShadow1,
   Decorations_Legacy = Stage3_TerrainShadow2,
   OtherObjects_Legacy = Stage4_TerrainShadow3,
   TransparentDecor_Legacy = Stage5_TerrainShadow5,

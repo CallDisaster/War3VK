@@ -15,6 +15,7 @@
 #include "../game/war3_agent.h"
 #include "../game/war3_unit.h"
 #include "../hooks/war3_hook_install_util.h"
+#include "../hooks/war3_hook_perf.h"
 #include "../render/war3_render_identity_bridge.h"
 #include "../render/war3_render_objects.h"
 #include "../render/war3_render_state.h"
@@ -76,9 +77,21 @@ using RuntimeInitFromModelDataFn = char*(__thiscall *)(char* thisPtr,
                                                        void* modelDataPtr);
 using BuildChildRuntimeModelLinksFn =
     void*(__thiscall *)(void* thisPtr, void* modelDataPtr);
+using RuntimeBuildPoseStackRootFn =
+    int(__fastcall *)(int runtimeModel, const __m128i* poseStackRoot);
 using RuntimePoseUpdateFn =
     int(__fastcall *)(int runtimeModel, const __m128i *poseMatrix, float scale,
                       int a4, int a5);
+using RuntimeBuildStagePresetsFn =
+    int(__fastcall *)(int runtimeModel, int poseStackBasePtr, int a3, int a4);
+using RuntimeEvaluateOverrideGraphFn =
+    int(__fastcall *)(int controllerPtr, int evaluationContextPtr);
+using RuntimeOverrideGraphPresetWalkerFn =
+    int(__fastcall *)(int controllerPtr, int graphBodyPtr,
+                      void* evaluationContextPtr);
+using RuntimeEvaluateChildStagePresetTreeFn =
+    int(__fastcall *)(int runtimeModel, int poseStackNodePtr,
+                      int inheritScaleFlag, int a4, int a5);
 using RuntimeMatrixWriteFn =
     void(__fastcall *)(int nodePtr, int sourceMatrixPtr, int destMatrixPtr);
 using RuntimeGroupPaletteWrapperFn = int(__fastcall *)(int runtimeModel,
@@ -176,7 +189,14 @@ constexpr uintptr_t kSpriteMiniFrameUpdateRva = 0x1820C0;
 constexpr uintptr_t kSpriteMiniFrameLiteUpdateRva = 0x1825E0;
 constexpr uintptr_t kSpriteFrameUpdateRva = 0x182300;
 constexpr uintptr_t kSpriteFrameLiteUpdateRva = 0x1826C0;
+constexpr uintptr_t kRuntimeBuildPoseStackRootRva = 0x12F3B0;
 constexpr uintptr_t kRuntimePoseUpdateRva = 0x12F0A0;
+constexpr uintptr_t kRuntimeBuildStagePresetsWithOverridesRva = 0x12E900;
+constexpr uintptr_t kRuntimeBuildStagePresetsSimpleRva = 0x12EB70;
+constexpr uintptr_t kRuntimeEvaluateOverrideGraphRva = 0x77C260;
+constexpr uintptr_t kRuntimeOverrideGraphPerTrackPresetWalkerRva = 0x77CAB0;
+constexpr uintptr_t kRuntimeOverrideGraphPerStagePresetWalkerRva = 0x77CC30;
+constexpr uintptr_t kRuntimeEvaluateChildStagePresetTreeRva = 0x12F2F0;
 constexpr uintptr_t kRuntimeMatrixWriteRva = 0x12E600;
 constexpr uintptr_t kRuntimeGroupPaletteWrapperRva = 0x12FED0;
 constexpr uintptr_t kRuntimeSimpleGroupPaletteRva = 0x12FF90;
@@ -227,7 +247,19 @@ SpriteFrameUpdateFn g_trampolineSpriteMiniFrameUpdate = nullptr;
 SpriteFrameLiteUpdateFn g_trampolineSpriteMiniFrameLiteUpdate = nullptr;
 SpriteFrameUpdateFn g_trampolineSpriteFrameUpdate = nullptr;
 SpriteFrameLiteUpdateFn g_trampolineSpriteFrameLiteUpdate = nullptr;
+RuntimeBuildPoseStackRootFn g_trampolineRuntimeBuildPoseStackRoot = nullptr;
 RuntimePoseUpdateFn g_trampolineRuntimePoseUpdate = nullptr;
+RuntimeBuildStagePresetsFn
+    g_trampolineRuntimeBuildStagePresetsWithOverrides = nullptr;
+RuntimeBuildStagePresetsFn g_trampolineRuntimeBuildStagePresetsSimple = nullptr;
+RuntimeEvaluateOverrideGraphFn g_trampolineRuntimeEvaluateOverrideGraph =
+    nullptr;
+RuntimeOverrideGraphPresetWalkerFn
+    g_trampolineRuntimeOverrideGraphPerTrackPresetWalker = nullptr;
+RuntimeOverrideGraphPresetWalkerFn
+    g_trampolineRuntimeOverrideGraphPerStagePresetWalker = nullptr;
+RuntimeEvaluateChildStagePresetTreeFn
+    g_trampolineRuntimeEvaluateChildStagePresetTree = nullptr;
 RuntimeMatrixWriteFn g_trampolineRuntimeMatrixWrite = nullptr;
 RuntimeGroupPaletteWrapperFn g_trampolineRuntimeGroupPaletteWrapper = nullptr;
 RuntimeSimpleGroupPaletteFn g_trampolineRuntimeSimpleGroupPalette = nullptr;
@@ -2371,6 +2403,56 @@ static inline bool SpriteUberDtProbeEnabled() {
                         dxvk::war3::internal::
                             kWar3RuntimeConfigInstallSpriteUberDtProbeHooks);
   return enabled;
+}
+
+// SpriteFrameUpdate 四入口是 WorldFramePrepare 原生阶段中的高频边界。
+// 默认不因性能监控而安装；只有 detail 级且显式 opt-in 时，才允许在 pose/dt
+// producer 都关闭的配置下安装纯 trampoline 诊断 Hook。
+static inline bool SpriteFramePerfHooksEnabled() {
+  static const bool enabled =
+      dxvk::war3::internal::War3PerfHookLevel() >= 2 &&
+      (GetEnvBoolCached("DXVK_WAR3_PERF_SPRITE_FRAME_HOOKS", false) ||
+       GetEnvBoolCached("DXVK_WAR3_PERF_SPRITE_NATIVE_BREAKDOWN_HOOKS",
+                        false));
+  return enabled;
+}
+
+static inline bool SpriteFramePerfOnlyMode() {
+  return SpriteFramePerfHooksEnabled() && !g_config.poseEnabled &&
+         !dxvk::war3::internal::
+             kWar3RuntimeConfigInstallSpriteFrameHooksWithoutPose &&
+         !SpriteUberDtProbeEnabled();
+}
+
+// Optional second-level split below the four CSprite frame-update entry points.
+// This mode deliberately reuses only three IDA-grounded helpers whose fastcall
+// ABI is already present in the production model hook layer. It is observer-only:
+// if any semantic pose producer is active, this gate stays closed so these
+// sections can be named ObserverOverhead without hiding WarVK business work.
+static inline bool SpriteNativeBreakdownPerfOnlyMode() {
+  static const bool requested =
+      dxvk::war3::internal::War3PerfHookLevel() >= 2 &&
+      GetEnvBoolCached("DXVK_WAR3_PERF_SPRITE_NATIVE_BREAKDOWN_HOOKS", false);
+  return requested && SpriteFramePerfOnlyMode() &&
+         !dxvk::war3::internal::
+             kWar3RuntimeConfigSemanticRuntimePoseUpdateEffective &&
+         !dxvk::war3::internal::
+             kWar3RuntimeConfigSemanticRuntimeMatrixWriteEffective &&
+         !dxvk::war3::internal::
+             kWar3RuntimeConfigSemanticMatrixPublisherPoseEffective;
+}
+
+// Optional third-level split below EvaluateOverrideGraph. Keep this behind its
+// own opt-in gate so the two additional detours never enter the default or
+// second-level diagnostic configuration.
+static inline bool OverrideGraphBreakdownPerfOnlyMode() {
+  static const bool requested =
+      dxvk::war3::internal::War3PerfHookLevel() >= 2 &&
+      GetEnvBoolCached("DXVK_WAR3_PERF_SPRITE_NATIVE_BREAKDOWN_HOOKS",
+                       false) &&
+      GetEnvBoolCached("DXVK_WAR3_PERF_OVERRIDE_GRAPH_BREAKDOWN_HOOKS",
+                       false);
+  return requested && SpriteNativeBreakdownPerfOnlyMode();
 }
 
 void RecordRenderablePartPaletteBinding(
@@ -7316,6 +7398,8 @@ int __fastcall Hook_CreateSpriteAndBindSourceObject(void* thisPtr, void* edx,
                                                     void* sourceObjectPtr,
                                                     char a3, int a4, int a5,
                                                     int16_t a6) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpriteHostBind);
   if (!g_trampolineCreateSpriteAndBindSourceObject)
     return 0;
 
@@ -7323,8 +7407,12 @@ int __fastcall Hook_CreateSpriteAndBindSourceObject(void* thisPtr, void* edx,
   g_lastSpriteHostSourceObjectPtr.store(
       uint64_t(reinterpret_cast<uintptr_t>(sourceObjectPtr)),
       std::memory_order_relaxed);
-  const int result = g_trampolineCreateSpriteAndBindSourceObject(
-      thisPtr, sourceObjectPtr, a3, a4, a5, a6);
+  int result = 0;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    result = g_trampolineCreateSpriteAndBindSourceObject(
+        thisPtr, sourceObjectPtr, a3, a4, a5, a6);
+  }
   // Phase 7.105：RecordSpriteHostOwnerBinding 在 12-人对战图实测每次调用累计
   // ~600ms 同步阻塞 Game.dll 主线程（4-人地图约 120ms），导致用户报告的
   // "对战地图开局卡顿 10 秒以上"。
@@ -7362,6 +7450,8 @@ int __fastcall Hook_AttachedEffectInit(void* thisPtr, void* edx,
                                        void* ownerWidgetPtr, int a3, int a4,
                                        int16_t a5, int a6, int a7,
                                        unsigned int a8) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelAttachedEffectInit);
   if (!g_trampolineAttachedEffectInit)
     return 0;
 
@@ -7369,8 +7459,12 @@ int __fastcall Hook_AttachedEffectInit(void* thisPtr, void* edx,
   g_attachedEffectInitScopeState.depth = previousScope.depth + 1u;
   g_attachedEffectInitScopeState.effectPtr = thisPtr;
   g_attachedEffectInitScopeState.ownerWidgetPtr = ownerWidgetPtr;
-  const int result = g_trampolineAttachedEffectInit(thisPtr, ownerWidgetPtr, a3,
-                                                    a4, a5, a6, a7, a8);
+  int result = 0;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    result = g_trampolineAttachedEffectInit(
+        thisPtr, ownerWidgetPtr, a3, a4, a5, a6, a7, a8);
+  }
   g_attachedEffectInitScopeState = previousScope;
   if constexpr (!dxvk::war3::internal::
                     kWar3RuntimeConfigSemanticAttachmentProducerEffective) {
@@ -7388,12 +7482,18 @@ int __fastcall Hook_AttachedEffectInit(void* thisPtr, void* edx,
 unsigned int __fastcall Hook_AttachedEffectDirectAttach(
     void* thisPtr, void* edx, void* ownerWidgetPtr, int16_t attachPointIndex,
     int attachPointArrayPtr, unsigned int attachPointCount) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelAttachedEffectDirectAttach);
   if (!g_trampolineAttachedEffectDirectAttach)
     return 0u;
 
-  const unsigned int result = g_trampolineAttachedEffectDirectAttach(
-      thisPtr, ownerWidgetPtr, attachPointIndex, attachPointArrayPtr,
-      attachPointCount);
+  unsigned int result = 0u;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    result = g_trampolineAttachedEffectDirectAttach(
+        thisPtr, ownerWidgetPtr, attachPointIndex, attachPointArrayPtr,
+        attachPointCount);
+  }
   if constexpr (!dxvk::war3::internal::
                     kWar3RuntimeConfigSemanticAttachmentProducerEffective) {
     return result;
@@ -7410,6 +7510,8 @@ unsigned int __fastcall Hook_AttachedEffectDirectAttach(
 void __fastcall Hook_AttachModelToPoint(void* parentSpritePtr,
                                         int attachPointIndex,
                                         void* childSpritePtr) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelAttachToPoint);
   if (g_trampolineAttachModelToPoint == nullptr)
     return;
 
@@ -7426,8 +7528,11 @@ void __fastcall Hook_AttachModelToPoint(void* parentSpritePtr,
     g_attachModelToPointScopeState.parentRuntimeModelPtr = nullptr;
   }
   g_attachModelToPointScopeState.childSpritePtr = childSpritePtr;
-  g_trampolineAttachModelToPoint(parentSpritePtr, attachPointIndex,
-                                 childSpritePtr);
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    g_trampolineAttachModelToPoint(parentSpritePtr, attachPointIndex,
+                                   childSpritePtr);
+  }
   g_attachModelToPointScopeState = previousScope;
   if constexpr (!dxvk::war3::internal::
                     kWar3RuntimeConfigSemanticAttachmentProducerEffective) {
@@ -7443,10 +7548,16 @@ void __fastcall Hook_AttachModelToPoint(void* parentSpritePtr,
 }
 
 void *__fastcall Hook_CreateSpriteRuntime(void *thisPtr, void *edx) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelCreateSpriteRuntime);
   if (!g_trampolineCreateSpriteRuntime)
     return nullptr;
 
-  void *spritePtr = g_trampolineCreateSpriteRuntime(thisPtr);
+  void *spritePtr = nullptr;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    spritePtr = g_trampolineCreateSpriteRuntime(thisPtr);
+  }
   {
     SemanticHookPerfScope perf(
         render::SemanticDataPerfTag::ModelHook,
@@ -7458,11 +7569,17 @@ void *__fastcall Hook_CreateSpriteRuntime(void *thisPtr, void *edx) {
 
 void *__fastcall Hook_CreateGeosetFromRawArrays(int a1, int a2, int a3, int a4,
                                                 int a5, int a6, int a7, int a8) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelCreateGeoset);
   if (!g_trampolineCreateGeosetFromRawArrays)
     return nullptr;
 
-  void *geosetPtr =
-      g_trampolineCreateGeosetFromRawArrays(a1, a2, a3, a4, a5, a6, a7, a8);
+  void *geosetPtr = nullptr;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    geosetPtr = g_trampolineCreateGeosetFromRawArrays(
+        a1, a2, a3, a4, a5, a6, a7, a8);
+  }
   if constexpr (dxvk::war3::internal::
                     kWar3RuntimeConfigDisableSemanticGeosetResourceCapture) {
     return geosetPtr;
@@ -7519,11 +7636,17 @@ void* __stdcall Hook_ResolveRuntimeModelFromHandle(void* handlePtr) {
 }
 
 void* __fastcall Hook_PromoteRuntimeModel(void* thisPtr, void* edx) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelPromoteRuntime);
   if (!g_trampolinePromoteRuntimeModel)
     return nullptr;
 
   const uintptr_t callerPc = GetCallReturnAddress();
-  void* runtimeModelPtr = g_trampolinePromoteRuntimeModel(thisPtr);
+  void* runtimeModelPtr = nullptr;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    runtimeModelPtr = g_trampolinePromoteRuntimeModel(thisPtr);
+  }
   {
     SemanticHookPerfScope perf(render::SemanticDataPerfTag::ModelHook,
                                render::SemanticDataPerfTag::ModelPromoteRuntime);
@@ -7550,6 +7673,8 @@ char* __fastcall Hook_RuntimeInitFromModelData(char* thisPtr, void* edx,
 
 void* __fastcall Hook_BuildChildRuntimeModelLinks(void* thisPtr, void* edx,
                                                   void* modelDataPtr) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelBuildChildLinks);
   if (!g_trampolineBuildChildRuntimeModelLinks)
     return nullptr;
 
@@ -7566,7 +7691,11 @@ void* __fastcall Hook_BuildChildRuntimeModelLinks(void* thisPtr, void* edx,
     RecordBuildTimeModelDataChildLinkScan(thisPtr, modelDataPtr, 1u,
                                           &preModelDataLinks);
   }
-  void* result = g_trampolineBuildChildRuntimeModelLinks(thisPtr, modelDataPtr);
+  void* result = nullptr;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    result = g_trampolineBuildChildRuntimeModelLinks(thisPtr, modelDataPtr);
+  }
   if (g_config.logEnabled) {
     SemanticHookPerfScope perf(
         render::SemanticDataPerfTag::ModelHook,
@@ -7578,11 +7707,35 @@ void* __fastcall Hook_BuildChildRuntimeModelLinks(void* thisPtr, void* edx,
   return result;
 }
 
+int __fastcall Hook_RuntimeBuildPoseStackRoot(
+    int runtimeModel, const __m128i* poseStackRoot) {
+  if (!g_trampolineRuntimeBuildPoseStackRoot)
+    return 0;
+
+  // This address is installed only for the explicit observer-only breakdown.
+  // The fixed-ID 1/8 sample nests below the active SpriteFrame hook and thus
+  // attributes the native helper to the exact Full/Mini caller variant.
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpriteBuildPoseStackRoot, 8u);
+  hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+  return g_trampolineRuntimeBuildPoseStackRoot(runtimeModel, poseStackRoot);
+}
+
 int __fastcall Hook_RuntimePoseUpdate(int runtimeModel,
                                       const __m128i *poseMatrix, float scale,
                                       int a4, int a5) {
   if (!g_trampolineRuntimePoseUpdate)
     return 0;
+
+  if (SpriteNativeBreakdownPerfOnlyMode()) {
+    hooks::War3HotHookCallTiming hookTiming(
+        hooks::War3HotHookId::
+            ModelSpriteSetWorldMatrixAndEvaluateRootPose,
+        8u);
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    return g_trampolineRuntimePoseUpdate(runtimeModel, poseMatrix, scale, a4,
+                                         a5);
+  }
 
   const int result =
       g_trampolineRuntimePoseUpdate(runtimeModel, poseMatrix, scale, a4, a5);
@@ -7610,6 +7763,82 @@ int __fastcall Hook_RuntimePoseUpdate(int runtimeModel,
     }
   }
   return result;
+}
+
+int __fastcall Hook_RuntimeBuildStagePresetsWithOverrides(
+    int runtimeModel, int poseStackBasePtr, int a3, int a4) {
+  if (!g_trampolineRuntimeBuildStagePresetsWithOverrides)
+    return 0;
+
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpriteBuildStagePresetsWithOverrides, 8u);
+  hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+  return g_trampolineRuntimeBuildStagePresetsWithOverrides(
+      runtimeModel, poseStackBasePtr, a3, a4);
+}
+
+int __fastcall Hook_RuntimeBuildStagePresetsSimple(
+    int runtimeModel, int poseStackBasePtr, int a3, int a4) {
+  if (!g_trampolineRuntimeBuildStagePresetsSimple)
+    return 0;
+
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpriteBuildStagePresetsSimple, 8u);
+  hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+  return g_trampolineRuntimeBuildStagePresetsSimple(runtimeModel,
+                                                     poseStackBasePtr, a3, a4);
+}
+
+int __fastcall Hook_RuntimeEvaluateOverrideGraph(int controllerPtr,
+                                                 int evaluationContextPtr) {
+  if (!g_trampolineRuntimeEvaluateOverrideGraph)
+    return 0;
+
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpriteEvaluateOverrideGraph, 8u);
+  hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+  return g_trampolineRuntimeEvaluateOverrideGraph(controllerPtr,
+                                                   evaluationContextPtr);
+}
+
+// Both direct EvaluateOverrideGraph walkers use ECX=controller,
+// EDX=graph body and one stack argument=evaluation context (`retn 4`).
+// They are mutually exclusive per parent invocation and observer-only.
+int __fastcall Hook_RuntimeOverrideGraphPerTrackPresetWalker(
+    int controllerPtr, int graphBodyPtr, void* evaluationContextPtr) {
+  if (!g_trampolineRuntimeOverrideGraphPerTrackPresetWalker)
+    return 0;
+
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpritePerTrackPresetWalker, 8u);
+  hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+  return g_trampolineRuntimeOverrideGraphPerTrackPresetWalker(
+      controllerPtr, graphBodyPtr, evaluationContextPtr);
+}
+
+int __fastcall Hook_RuntimeOverrideGraphPerStagePresetWalker(
+    int controllerPtr, int graphBodyPtr, void* evaluationContextPtr) {
+  if (!g_trampolineRuntimeOverrideGraphPerStagePresetWalker)
+    return 0;
+
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpritePerStagePresetWalker, 8u);
+  hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+  return g_trampolineRuntimeOverrideGraphPerStagePresetWalker(
+      controllerPtr, graphBodyPtr, evaluationContextPtr);
+}
+
+int __fastcall Hook_RuntimeEvaluateChildStagePresetTree(
+    int runtimeModel, int poseStackNodePtr, int inheritScaleFlag, int a4,
+    int a5) {
+  if (!g_trampolineRuntimeEvaluateChildStagePresetTree)
+    return 0;
+
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpriteEvaluateChildStagePresetTree, 8u);
+  hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+  return g_trampolineRuntimeEvaluateChildStagePresetTree(
+      runtimeModel, poseStackNodePtr, inheritScaleFlag, a4, a5);
 }
 
 // Phase 7.31 P0（恢复 + 修正）：batch capture 开关。
@@ -7770,6 +7999,14 @@ int __fastcall Hook_RuntimeGroupPaletteWrapper(int runtimeModel,
   if (!g_trampolineRuntimeGroupPaletteWrapper)
     return 0;
 
+  if (SpriteNativeBreakdownPerfOnlyMode()) {
+    hooks::War3HotHookCallTiming hookTiming(
+        hooks::War3HotHookId::ModelSpriteAssignVisiblePartStagePresetSpan, 8u);
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    return g_trampolineRuntimeGroupPaletteWrapper(runtimeModel,
+                                                   poseStackBasePtr);
+  }
+
   const int result =
       g_trampolineRuntimeGroupPaletteWrapper(runtimeModel, poseStackBasePtr);
   g_runtimeGroupPaletteWrapperCallCount.fetch_add(1u,
@@ -7795,6 +8032,16 @@ void __fastcall Hook_RuntimeSimpleGroupPalette(int runtimeModel, void* edx) {
   if (!g_trampolineRuntimeSimpleGroupPalette)
     return;
 
+  if (SpriteNativeBreakdownPerfOnlyMode()) {
+    hooks::War3HotHookCallTiming hookTiming(
+        hooks::War3HotHookId::
+            ModelSpriteAssignDefaultVisiblePartStagePresets,
+        8u);
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    g_trampolineRuntimeSimpleGroupPalette(runtimeModel);
+    return;
+  }
+
   g_trampolineRuntimeSimpleGroupPalette(runtimeModel);
   g_runtimeSimpleGroupPaletteCallCount.fetch_add(1u,
                                                  std::memory_order_relaxed);
@@ -7815,6 +8062,13 @@ void __fastcall Hook_RuntimeSimpleGroupPalette(int runtimeModel, void* edx) {
 int __fastcall Hook_RuntimePropagatePoseTree(int runtimeModel, int a2) {
   if (!g_trampolineRuntimePropagatePoseTree)
     return 0;
+
+  if (SpriteNativeBreakdownPerfOnlyMode()) {
+    hooks::War3HotHookCallTiming hookTiming(
+        hooks::War3HotHookId::ModelSpriteEvalPoseStackAndChildren, 8u);
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    return g_trampolineRuntimePropagatePoseTree(runtimeModel, a2);
+  }
 
   const int result = g_trampolineRuntimePropagatePoseTree(runtimeModel, a2);
   {
@@ -7840,16 +8094,27 @@ void __fastcall Hook_RuntimeRecurseChildTree(int runtimeModel, int a2) {
 }
 
 int __fastcall Hook_SpriteFrameUpdate(int thisPtr, void* edx, float dt, int a3,
-                                      unsigned int a4, int a5) {
+                                       unsigned int a4, int a5) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpriteFrameUpdate, 8u);
   if (!g_trampolineSpriteFrameUpdate)
     return 0;
 
+  const bool perfOnly = SpriteFramePerfOnlyMode();
   // Phase 7.47 dt gate probe：trampoline 前记录 dt（包括早退路径）。
-  NoteSpriteUberPreRenderDtBucket(dt);
+  if (!perfOnly)
+    NoteSpriteUberPreRenderDtBucket(dt);
 
-  const uintptr_t callerPc = GetCallReturnAddress();
-  const int result =
-      g_trampolineSpriteFrameUpdate(thisPtr, dt, a3, a4, a5);
+  const uintptr_t callerPc = perfOnly ? 0u : GetCallReturnAddress();
+  int result = 0;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    result = g_trampolineSpriteFrameUpdate(thisPtr, dt, a3, a4, a5);
+  }
+  // 纯性能模式只能测 detour/trampoline 边界，不能把已关闭的 pose producer
+  // 重新带回 RecordSpriteFramePoseFromSprite。
+  if (perfOnly)
+    return result;
   // probe-only 模式下跳过 identity/pose 重路径，只保留 dt 统计。
   if (!g_config.poseEnabled && SpriteUberDtProbeEnabled()) {
     return result;
@@ -7867,16 +8132,25 @@ int __fastcall Hook_SpriteFrameUpdate(int thisPtr, void* edx, float dt, int a3,
 }
 
 int __fastcall Hook_SpriteMiniFrameUpdate(int thisPtr, void* edx, float dt,
-                                          int a3, unsigned int a4, int a5) {
+                                           int a3, unsigned int a4, int a5) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpriteMiniFrameUpdate, 8u);
   if (!g_trampolineSpriteMiniFrameUpdate)
     return 0;
 
+  const bool perfOnly = SpriteFramePerfOnlyMode();
   // Phase 7.47 dt gate probe
-  NoteSpriteUberPreRenderDtBucket(dt);
+  if (!perfOnly)
+    NoteSpriteUberPreRenderDtBucket(dt);
 
-  const uintptr_t callerPc = GetCallReturnAddress();
-  const int result =
-      g_trampolineSpriteMiniFrameUpdate(thisPtr, dt, a3, a4, a5);
+  const uintptr_t callerPc = perfOnly ? 0u : GetCallReturnAddress();
+  int result = 0;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    result = g_trampolineSpriteMiniFrameUpdate(thisPtr, dt, a3, a4, a5);
+  }
+  if (perfOnly)
+    return result;
   if (!g_config.poseEnabled && SpriteUberDtProbeEnabled()) {
     return result;
   }
@@ -7893,14 +8167,24 @@ int __fastcall Hook_SpriteMiniFrameUpdate(int thisPtr, void* edx, float dt,
 }
 
 int __fastcall Hook_SpriteFrameLiteUpdate(int thisPtr, void* edx, float dt) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpriteFrameLiteUpdate, 8u);
   if (!g_trampolineSpriteFrameLiteUpdate)
     return 0;
 
+  const bool perfOnly = SpriteFramePerfOnlyMode();
   // Phase 7.47 dt gate probe
-  NoteSpriteUberPreRenderDtBucket(dt);
+  if (!perfOnly)
+    NoteSpriteUberPreRenderDtBucket(dt);
 
-  const uintptr_t callerPc = GetCallReturnAddress();
-  const int result = g_trampolineSpriteFrameLiteUpdate(thisPtr, dt);
+  const uintptr_t callerPc = perfOnly ? 0u : GetCallReturnAddress();
+  int result = 0;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    result = g_trampolineSpriteFrameLiteUpdate(thisPtr, dt);
+  }
+  if (perfOnly)
+    return result;
   if (!g_config.poseEnabled && SpriteUberDtProbeEnabled()) {
     return result;
   }
@@ -7910,15 +8194,25 @@ int __fastcall Hook_SpriteFrameLiteUpdate(int thisPtr, void* edx, float dt) {
 }
 
 int __fastcall Hook_SpriteMiniFrameLiteUpdate(int thisPtr, void* edx,
-                                              float dt) {
+                                               float dt) {
+  hooks::War3HotHookCallTiming hookTiming(
+      hooks::War3HotHookId::ModelSpriteMiniFrameLiteUpdate, 8u);
   if (!g_trampolineSpriteMiniFrameLiteUpdate)
     return 0;
 
+  const bool perfOnly = SpriteFramePerfOnlyMode();
   // Phase 7.47 dt gate probe
-  NoteSpriteUberPreRenderDtBucket(dt);
+  if (!perfOnly)
+    NoteSpriteUberPreRenderDtBucket(dt);
 
-  const uintptr_t callerPc = GetCallReturnAddress();
-  const int result = g_trampolineSpriteMiniFrameLiteUpdate(thisPtr, dt);
+  const uintptr_t callerPc = perfOnly ? 0u : GetCallReturnAddress();
+  int result = 0;
+  {
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    result = g_trampolineSpriteMiniFrameLiteUpdate(thisPtr, dt);
+  }
+  if (perfOnly)
+    return result;
   if (!g_config.poseEnabled && SpriteUberDtProbeEnabled()) {
     return result;
   }
@@ -7930,6 +8224,13 @@ int __fastcall Hook_SpriteMiniFrameLiteUpdate(int thisPtr, void* edx,
 int __fastcall Hook_RuntimeMatrixRangeCopy(int runtimeModel, int a2, int a3) {
   if (!g_trampolineRuntimeMatrixRangeCopy)
     return 0;
+
+  if (SpriteNativeBreakdownPerfOnlyMode()) {
+    hooks::War3HotHookCallTiming hookTiming(
+        hooks::War3HotHookId::ModelSpriteCopyResolvedStagePresetsToOutput, 8u);
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    return g_trampolineRuntimeMatrixRangeCopy(runtimeModel, a2, a3);
+  }
 
   const int result = g_trampolineRuntimeMatrixRangeCopy(runtimeModel, a2, a3);
   {
@@ -7982,6 +8283,15 @@ int __fastcall Hook_RuntimeMatrixRangeCopy(int runtimeModel, int a2, int a3) {
 int __fastcall Hook_RuntimeMatrixFlush(int runtimeModel, void* edx) {
   if (!g_trampolineRuntimeMatrixFlush)
     return 0;
+
+  if (SpriteNativeBreakdownPerfOnlyMode()) {
+    hooks::War3HotHookCallTiming hookTiming(
+        hooks::War3HotHookId::
+            ModelSpriteFlushCurrentPoseStackToMatrices,
+        8u);
+    hooks::War3HotHookNativeScope nativeTiming(hookTiming);
+    return g_trampolineRuntimeMatrixFlush(runtimeModel);
+  }
 
   const int result = g_trampolineRuntimeMatrixFlush(runtimeModel);
   {
@@ -8316,6 +8626,24 @@ bool InstallSpriteMiniFrameLiteUpdateHook(uintptr_t gameBase) {
       "Model", "SpriteMiniFrameLiteUpdate", true, g_config.logEnabled);
 }
 
+bool InstallRuntimeBuildPoseStackRootPerfHook(uintptr_t gameBase) {
+  const uintptr_t target = gameBase + kRuntimeBuildPoseStackRootRva;
+  if (!IsExecutableRange(reinterpret_cast<const void*>(target), 16)) {
+    war3dbg::Print(
+        "DXVK_Model: sprite native BuildPoseStackRoot perf target "
+        "不可执行，跳过 Hook (addr=%p)\n",
+        reinterpret_cast<void*>(target));
+    return false;
+  }
+
+  return hooks::InstallMinHook(
+      reinterpret_cast<LPVOID>(target),
+      reinterpret_cast<LPVOID>(&Hook_RuntimeBuildPoseStackRoot),
+      reinterpret_cast<LPVOID*>(&g_trampolineRuntimeBuildPoseStackRoot),
+      "ModelPerf", "SpriteNativeBuildPoseStackRoot", true,
+      g_config.logEnabled);
+}
+
 bool InstallRuntimePoseHook(uintptr_t gameBase) {
   const uintptr_t target = gameBase + kRuntimePoseUpdateRva;
   if (!IsExecutableRange(reinterpret_cast<const void *>(target), 16)) {
@@ -8330,6 +8658,126 @@ bool InstallRuntimePoseHook(uintptr_t gameBase) {
       reinterpret_cast<LPVOID>(&Hook_RuntimePoseUpdate),
       reinterpret_cast<LPVOID *>(&g_trampolineRuntimePoseUpdate), "Model",
       "RuntimePoseUpdate", true, g_config.logEnabled);
+}
+
+bool InstallRuntimeBuildStagePresetsWithOverridesPerfHook(uintptr_t gameBase) {
+  const uintptr_t target =
+      gameBase + kRuntimeBuildStagePresetsWithOverridesRva;
+  if (!IsExecutableRange(reinterpret_cast<const void*>(target), 16)) {
+    war3dbg::Print(
+        "DXVK_Model: sprite native stage-preset overrides perf target "
+        "不可执行，跳过 Hook (addr=%p)\n",
+        reinterpret_cast<void*>(target));
+    return false;
+  }
+
+  return hooks::InstallMinHook(
+      reinterpret_cast<LPVOID>(target),
+      reinterpret_cast<LPVOID>(&Hook_RuntimeBuildStagePresetsWithOverrides),
+      reinterpret_cast<LPVOID*>(
+          &g_trampolineRuntimeBuildStagePresetsWithOverrides),
+      "ModelPerf", "SpriteNativeBuildStagePresetsWithOverrides", true,
+      g_config.logEnabled);
+}
+
+bool InstallRuntimeBuildStagePresetsSimplePerfHook(uintptr_t gameBase) {
+  const uintptr_t target = gameBase + kRuntimeBuildStagePresetsSimpleRva;
+  if (!IsExecutableRange(reinterpret_cast<const void*>(target), 16)) {
+    war3dbg::Print(
+        "DXVK_Model: sprite native simple stage-preset perf target "
+        "不可执行，跳过 Hook (addr=%p)\n",
+        reinterpret_cast<void*>(target));
+    return false;
+  }
+
+  return hooks::InstallMinHook(
+      reinterpret_cast<LPVOID>(target),
+      reinterpret_cast<LPVOID>(&Hook_RuntimeBuildStagePresetsSimple),
+      reinterpret_cast<LPVOID*>(&g_trampolineRuntimeBuildStagePresetsSimple),
+      "ModelPerf", "SpriteNativeBuildStagePresetsSimple", true,
+      g_config.logEnabled);
+}
+
+bool InstallRuntimeEvaluateOverrideGraphPerfHook(uintptr_t gameBase) {
+  const uintptr_t target = gameBase + kRuntimeEvaluateOverrideGraphRva;
+  if (!IsExecutableRange(reinterpret_cast<const void*>(target), 16)) {
+    war3dbg::Print(
+        "DXVK_Model: sprite native override-graph perf target "
+        "不可执行，跳过 Hook (addr=%p)\n",
+        reinterpret_cast<void*>(target));
+    return false;
+  }
+
+  return hooks::InstallMinHook(
+      reinterpret_cast<LPVOID>(target),
+      reinterpret_cast<LPVOID>(&Hook_RuntimeEvaluateOverrideGraph),
+      reinterpret_cast<LPVOID*>(&g_trampolineRuntimeEvaluateOverrideGraph),
+      "ModelPerf", "SpriteNativeEvaluateOverrideGraph", true,
+      g_config.logEnabled);
+}
+
+bool InstallRuntimeOverrideGraphPerTrackPresetWalkerPerfHook(
+    uintptr_t gameBase) {
+  const uintptr_t target =
+      gameBase + kRuntimeOverrideGraphPerTrackPresetWalkerRva;
+  if (!IsExecutableRange(reinterpret_cast<const void*>(target), 16)) {
+    war3dbg::Print(
+        "DXVK_Model: override-graph per-track walker perf target "
+        "不可执行，跳过 Hook (addr=%p)\n",
+        reinterpret_cast<void*>(target));
+    return false;
+  }
+
+  return hooks::InstallMinHook(
+      reinterpret_cast<LPVOID>(target),
+      reinterpret_cast<LPVOID>(
+          &Hook_RuntimeOverrideGraphPerTrackPresetWalker),
+      reinterpret_cast<LPVOID*>(
+          &g_trampolineRuntimeOverrideGraphPerTrackPresetWalker),
+      "ModelPerf", "SpriteNativeOverrideGraphPerTrackPresetWalker", true,
+      g_config.logEnabled);
+}
+
+bool InstallRuntimeOverrideGraphPerStagePresetWalkerPerfHook(
+    uintptr_t gameBase) {
+  const uintptr_t target =
+      gameBase + kRuntimeOverrideGraphPerStagePresetWalkerRva;
+  if (!IsExecutableRange(reinterpret_cast<const void*>(target), 16)) {
+    war3dbg::Print(
+        "DXVK_Model: override-graph per-stage walker perf target "
+        "不可执行，跳过 Hook (addr=%p)\n",
+        reinterpret_cast<void*>(target));
+    return false;
+  }
+
+  return hooks::InstallMinHook(
+      reinterpret_cast<LPVOID>(target),
+      reinterpret_cast<LPVOID>(
+          &Hook_RuntimeOverrideGraphPerStagePresetWalker),
+      reinterpret_cast<LPVOID*>(
+          &g_trampolineRuntimeOverrideGraphPerStagePresetWalker),
+      "ModelPerf", "SpriteNativeOverrideGraphPerStagePresetWalker", true,
+      g_config.logEnabled);
+}
+
+bool InstallRuntimeEvaluateChildStagePresetTreePerfHook(uintptr_t gameBase) {
+  const uintptr_t target =
+      gameBase + kRuntimeEvaluateChildStagePresetTreeRva;
+  if (!IsExecutableRange(reinterpret_cast<const void*>(target), 16)) {
+    war3dbg::Print(
+        "DXVK_Model: sprite native child stage-preset tree perf target "
+        "不可执行，跳过 Hook (addr=%p)\n",
+        reinterpret_cast<void*>(target));
+    return false;
+  }
+
+  return hooks::InstallMinHook(
+      reinterpret_cast<LPVOID>(target),
+      reinterpret_cast<LPVOID>(&Hook_RuntimeEvaluateChildStagePresetTree),
+      reinterpret_cast<LPVOID*>(
+          &g_trampolineRuntimeEvaluateChildStagePresetTree),
+      "ModelPerf", "SpriteNativeEvaluateChildStagePresetTree", true,
+      g_config.logEnabled);
 }
 
 bool InstallRuntimeMatrixWriteHook(uintptr_t gameBase) {
@@ -8851,6 +9299,7 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
   const bool semanticDataEnabled =
       dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
           dxvk::war3::runtime::War3RuntimeModule::SemanticData);
+  const bool spriteFramePerfHooksEnabled = SpriteFramePerfHooksEnabled();
   g_config.enabled =
       semanticDataEnabled &&
       dxvk::war3::internal::
@@ -8883,17 +9332,25 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
       g_config.enabled &&
       dxvk::war3::internal::
           kWar3RuntimeConfigSemanticRuntimeMatrixWriteEffective;
+  const bool spriteNativeBreakdownPerfOnly =
+      SpriteNativeBreakdownPerfOnlyMode();
+  const bool overrideGraphBreakdownPerfOnly =
+      OverrideGraphBreakdownPerfOnlyMode();
 
   war3dbg::Print(
       "DXVK_Model: init enabled=%d pose=%d runtimePoseUpdate=%d "
-      "matrixWrite=%d matrixPublisherPose=%d attach=%d log=%d semanticData=%d\n",
-                 g_config.enabled ? 1 : 0, g_config.poseEnabled ? 1 : 0,
-                 runtimePoseUpdateEnabled ? 1 : 0,
-                 runtimeMatrixWriteEnabled ? 1 : 0,
-                 matrixPublisherPoseEnabled ? 1 : 0,
-                 g_config.attachmentEnabled ? 1 : 0,
-                 g_config.logEnabled ? 1 : 0,
-                 semanticDataEnabled ? 1 : 0);
+      "matrixWrite=%d matrixPublisherPose=%d attach=%d log=%d semanticData=%d "
+      "spriteFramePerf=%d spriteNativePerf=%d overrideGraphPerf=%d\n",
+                  g_config.enabled ? 1 : 0, g_config.poseEnabled ? 1 : 0,
+                  runtimePoseUpdateEnabled ? 1 : 0,
+                  runtimeMatrixWriteEnabled ? 1 : 0,
+                  matrixPublisherPoseEnabled ? 1 : 0,
+                  g_config.attachmentEnabled ? 1 : 0,
+                  g_config.logEnabled ? 1 : 0,
+                  semanticDataEnabled ? 1 : 0,
+                  spriteFramePerfHooksEnabled ? 1 : 0,
+                  spriteNativeBreakdownPerfOnly ? 1 : 0,
+                  overrideGraphBreakdownPerfOnly ? 1 : 0);
 
   if (!g_config.enabled || !gameBase)
     return;
@@ -9624,7 +10081,7 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
         g_config.poseEnabled ||
         dxvk::war3::internal::
             kWar3RuntimeConfigInstallSpriteFrameHooksWithoutPose ||
-        SpriteUberDtProbeEnabled();
+        SpriteUberDtProbeEnabled() || spriteFramePerfHooksEnabled;
     if (installSpriteFrameHooks) {
       fullInstalled = InstallSpriteMiniFrameUpdateHook(gameBase) || fullInstalled;
       fullInstalled =
@@ -9633,11 +10090,38 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
       fullInstalled =
           InstallSpriteFrameLiteUpdateHook(gameBase) || fullInstalled;
     }
-    if (g_config.poseEnabled || runtimePoseUpdateEnabled)
+    if (spriteNativeBreakdownPerfOnly)
+      fullInstalled =
+          InstallRuntimeBuildPoseStackRootPerfHook(gameBase) || fullInstalled;
+    if (g_config.poseEnabled || runtimePoseUpdateEnabled ||
+        spriteNativeBreakdownPerfOnly)
       fullInstalled = InstallRuntimePoseHook(gameBase) || fullInstalled;
+    if (spriteNativeBreakdownPerfOnly) {
+      fullInstalled =
+          InstallRuntimeBuildStagePresetsWithOverridesPerfHook(gameBase) ||
+          fullInstalled;
+      fullInstalled =
+          InstallRuntimeBuildStagePresetsSimplePerfHook(gameBase) ||
+          fullInstalled;
+      fullInstalled =
+          InstallRuntimeEvaluateOverrideGraphPerfHook(gameBase) ||
+          fullInstalled;
+      fullInstalled =
+          InstallRuntimeEvaluateChildStagePresetTreePerfHook(gameBase) ||
+          fullInstalled;
+    }
+    if (overrideGraphBreakdownPerfOnly) {
+      fullInstalled =
+          InstallRuntimeOverrideGraphPerTrackPresetWalkerPerfHook(gameBase) ||
+          fullInstalled;
+      fullInstalled =
+          InstallRuntimeOverrideGraphPerStagePresetWalkerPerfHook(gameBase) ||
+          fullInstalled;
+    }
     if (g_config.poseEnabled || runtimeMatrixWriteEnabled)
       fullInstalled = InstallRuntimeMatrixWriteHook(gameBase) || fullInstalled;
-    if (g_config.poseEnabled || runtimeMatrixWriteEnabled) {
+    if (g_config.poseEnabled || runtimeMatrixWriteEnabled ||
+        spriteNativeBreakdownPerfOnly) {
       fullInstalled =
           InstallRuntimeGroupPaletteWrapperHook(gameBase) || fullInstalled;
       fullInstalled =
@@ -9648,16 +10132,18 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
           render::InstallCurrentDrawContractHook(gameBase,
                                                  g_config.logEnabled) ||
           fullInstalled;
-    if (g_config.poseEnabled)
+    if (g_config.poseEnabled || spriteNativeBreakdownPerfOnly)
       fullInstalled =
           InstallRuntimePropagatePoseTreeHook(gameBase) || fullInstalled;
     if (g_config.poseEnabled)
       fullInstalled =
           InstallRuntimeRecurseChildTreeHook(gameBase) || fullInstalled;
-    if (g_config.poseEnabled || matrixPublisherPoseEnabled)
+    if (g_config.poseEnabled || matrixPublisherPoseEnabled ||
+        spriteNativeBreakdownPerfOnly)
       fullInstalled =
           InstallRuntimeMatrixRangeCopyHook(gameBase) || fullInstalled;
-    if (g_config.poseEnabled || matrixPublisherPoseEnabled)
+    if (g_config.poseEnabled || matrixPublisherPoseEnabled ||
+        spriteNativeBreakdownPerfOnly)
       fullInstalled = InstallRuntimeMatrixFlushHook(gameBase) || fullInstalled;
     if (g_config.poseEnabled && g_config.attachmentEnabled)
       fullInstalled =

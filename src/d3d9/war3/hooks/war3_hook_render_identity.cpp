@@ -2,9 +2,11 @@
 
 #include "war3_hook_address_book.h"
 #include "war3_hook_install_util.h"
+#include "war3_hook_perf.h"
 #include "../../d3d9_war3_debug.h"
 #include "../core/war3_memory.h"
 #include "../core/war3_internal_test_config.h"
+#include "../gpu_skin/war3_gpu_skin_native_bridge.h"
 #include "../render/war3_render_identity_bridge.h"
 #include "../render/war3_render_queue_tracker.h"
 #include "../render/war3_renderer.h"
@@ -75,6 +77,10 @@ std::atomic<uint64_t> g_lastWorldObjectListEntryWriteWorldObjectEntryPtr{0u};
 std::atomic<uint64_t> g_lastWorldObjectListEntryWriteOwnerHintValue{0u};
 std::atomic<uint64_t> g_lastWorldObjectEntryRenderSceneNodeBeforePtr{0u};
 std::atomic<uint64_t> g_lastWorldObjectEntryRenderSceneNodeAfterPtr{0u};
+std::atomic<bool> g_renderIdentityFullDiagnostics{false};
+std::atomic<bool> g_worldObjectListEntryWriteProbeHookInstalled{false};
+std::atomic<bool> g_worldObjectEntryRenderContextHookInstalled{false};
+std::atomic<bool> g_renderQueueIdentityPrimingHookInstalled{false};
 std::array<std::atomic<uint64_t>, kRecentWorldObjectOwnerHintSlots>
     g_recentWorldObjectEntryPtrs = {};
 std::array<std::atomic<uint64_t>, kRecentWorldObjectOwnerHintSlots>
@@ -215,13 +221,49 @@ static int __fastcall Hook_WorldObjectListEntry_Write(void *listPtr,
   return ownerHint;
 }
 
-static int __fastcall Hook_WorldObjectEntry_Render(void *entry, int reserved) {
+static int CallOriginalWorldObjectEntryRender(void *entry, int reserved) {
+  if (g_trampolineWorldObjectEntryRender)
+    return g_trampolineWorldObjectEntryRender(entry, reserved);
+  if (g_originalWorldObjectEntryRender)
+    return g_originalWorldObjectEntryRender(entry, reserved);
+  return 0;
+}
+
+// Production keeps this hook because ScopedWorldObjectContext is consumed by
+// RenderQueue identity priming and the visible/transparent registries.  The
+// pre/post scene reads and the 256-slot owner-hint probe are diagnostics only.
+static int __fastcall Hook_WorldObjectEntry_Render_Production(
+    void *entry, int reserved) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::WorldObjectEntryRender, 4u);
+  const auto callNativeOriginal = [&]() {
+    if (!g_trampolineWorldObjectEntryRender &&
+        !g_originalWorldObjectEntryRender)
+      return 0;
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return CallOriginalWorldObjectEntryRender(entry, reserved);
+  };
   if (!dxvk::war3::internal::kNativeRenderIdentityBridgeEnabled || !entry) {
-    if (g_trampolineWorldObjectEntryRender)
-      return g_trampolineWorldObjectEntryRender(entry, reserved);
-    if (g_originalWorldObjectEntryRender)
-      return g_originalWorldObjectEntryRender(entry, reserved);
-    return 0;
+    return callNativeOriginal();
+  }
+
+  ScopedWorldObjectContext scope(entry, nullptr);
+  return callNativeOriginal();
+}
+
+static int __fastcall Hook_WorldObjectEntry_Render_Diagnostics(
+    void *entry, int reserved) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::WorldObjectEntryRender, 4u);
+  const auto callNativeOriginal = [&]() {
+    if (!g_trampolineWorldObjectEntryRender &&
+        !g_originalWorldObjectEntryRender)
+      return 0;
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return CallOriginalWorldObjectEntryRender(entry, reserved);
+  };
+  if (!dxvk::war3::internal::kNativeRenderIdentityBridgeEnabled || !entry) {
+    return callNativeOriginal();
   }
 
   void *sceneNodeBefore = nullptr;
@@ -254,11 +296,7 @@ static int __fastcall Hook_WorldObjectEntry_Render(void *entry, int reserved) {
 
   ScopedWorldObjectContext scope(entry, nullptr);
 
-  int result = 0;
-  if (g_trampolineWorldObjectEntryRender)
-    result = g_trampolineWorldObjectEntryRender(entry, reserved);
-  else if (g_originalWorldObjectEntryRender)
-    result = g_originalWorldObjectEntryRender(entry, reserved);
+  const int result = callNativeOriginal();
 
   void *sceneNodeAfter = nullptr;
   dxvk::war3::SafeReadPtrFast(entry, 0x20, sceneNodeAfter);
@@ -281,6 +319,8 @@ static int __fastcall Hook_WorldObjectEntry_Render(void *entry, int reserved) {
 }
 
 static void __fastcall Hook_RenderQueue_AddBatch(void *sceneNode, int reserved) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::RenderQueueAddBatch, 4u);
   dxvk::war3::render::RenderObjectIdentitySnapshot identity = {};
   void *batchArrayBefore = nullptr;
   uint32_t before = 0;
@@ -302,8 +342,10 @@ static void __fastcall Hook_RenderQueue_AddBatch(void *sceneNode, int reserved) 
   }
 
   if (g_trampolineRenderQueueAddBatch) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
     g_trampolineRenderQueueAddBatch(sceneNode, reserved);
   } else if (g_originalRenderQueueAddBatch) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
     g_originalRenderQueueAddBatch(sceneNode, reserved);
   }
 
@@ -323,6 +365,8 @@ static void __fastcall Hook_RenderQueue_AddBatch(void *sceneNode, int reserved) 
 }
 
 static void __fastcall Hook_RenderBatch_Submit(void *sceneNode, int reserved) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::RenderBatchSubmit, 4u);
   dxvk::war3::render::RenderObjectIdentitySnapshot identity = {};
   void *batchArrayBefore = nullptr;
   uint32_t before = 0;
@@ -340,8 +384,10 @@ static void __fastcall Hook_RenderBatch_Submit(void *sceneNode, int reserved) {
   }
 
   if (g_trampolineRenderBatchSubmit) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
     g_trampolineRenderBatchSubmit(sceneNode, reserved);
   } else if (g_originalRenderBatchSubmit) {
+    War3HotHookNativeScope nativeTiming(hookTiming);
     g_originalRenderBatchSubmit(sceneNode, reserved);
   }
 
@@ -404,6 +450,17 @@ void War3HookRenderIdentity::Install(uintptr_t gameBase) {
       dxvk::war3::internal::kNativeRenderIdentityBridgeEnabled;
   const bool wantsVisibleManifest =
       dxvk::war3::internal::kNativeVisibleRenderableRegistryEnabled;
+  const bool fullDiagnostics =
+      dxvk::war3::gpu_skin::NativeBridgeFullDiagnosticsEnabled();
+
+  g_renderIdentityFullDiagnostics.store(fullDiagnostics,
+                                        std::memory_order_relaxed);
+  g_worldObjectListEntryWriteProbeHookInstalled.store(
+      false, std::memory_order_relaxed);
+  g_worldObjectEntryRenderContextHookInstalled.store(
+      false, std::memory_order_relaxed);
+  g_renderQueueIdentityPrimingHookInstalled.store(
+      false, std::memory_order_relaxed);
 
   if (!wantsIdentityBridge && !wantsVisibleManifest)
     return;
@@ -439,45 +496,77 @@ void War3HookRenderIdentity::Install(uintptr_t gameBase) {
       reinterpret_cast<void **>(transparentArrayBaseAddr);
 
   if (wantsIdentityBridge) {
-    InstallMinHook(
-        worldObjectListEntryWriteAddr,
-        reinterpret_cast<LPVOID>(&Hook_WorldObjectListEntry_Write),
-        reinterpret_cast<LPVOID *>(&g_trampolineWorldObjectListEntryWrite),
-        "Render", "WorldObjectListEntry_Write", false, true);
+    // The writer feeds only the diagnostic owner-hint ring.  Production-light
+    // leaves Game.dll's function completely unhooked.
+    if (fullDiagnostics) {
+      const bool installed = InstallMinHook(
+          worldObjectListEntryWriteAddr,
+          reinterpret_cast<LPVOID>(&Hook_WorldObjectListEntry_Write),
+          reinterpret_cast<LPVOID *>(&g_trampolineWorldObjectListEntryWrite),
+          "Render", "WorldObjectListEntry_Write", false, true);
+      g_worldObjectListEntryWriteProbeHookInstalled.store(
+          installed, std::memory_order_relaxed);
+    } else {
+      g_trampolineWorldObjectListEntryWrite = nullptr;
+    }
 
-    InstallMinHook(
-        worldObjectEntryRenderAddr,
-        reinterpret_cast<LPVOID>(&Hook_WorldObjectEntry_Render),
+    LPVOID entryRenderDetour =
+        fullDiagnostics
+            ? reinterpret_cast<LPVOID>(
+                  &Hook_WorldObjectEntry_Render_Diagnostics)
+            : reinterpret_cast<LPVOID>(
+                  &Hook_WorldObjectEntry_Render_Production);
+    const bool entryRenderInstalled = InstallMinHook(
+        worldObjectEntryRenderAddr, entryRenderDetour,
         reinterpret_cast<LPVOID *>(&g_trampolineWorldObjectEntryRender), "Render",
         "WorldObjectEntry_Render", false, true);
+    g_worldObjectEntryRenderContextHookInstalled.store(
+        entryRenderInstalled, std::memory_order_relaxed);
 
-    InstallMinHook(renderQueueAddBatchAddr,
-                   reinterpret_cast<LPVOID>(&Hook_RenderQueue_AddBatch),
-                   reinterpret_cast<LPVOID *>(&g_trampolineRenderQueueAddBatch),
-                   "Render", "RenderQueue_AddBatch", false, true);
+    const bool primingInstalled = InstallMinHook(
+        renderQueueAddBatchAddr,
+        reinterpret_cast<LPVOID>(&Hook_RenderQueue_AddBatch),
+        reinterpret_cast<LPVOID *>(&g_trampolineRenderQueueAddBatch),
+        "Render", "RenderQueue_AddBatch", false, true);
+    g_renderQueueIdentityPrimingHookInstalled.store(
+        primingInstalled, std::memory_order_relaxed);
   }
 
-    if (wantsVisibleManifest) {
-      InstallMinHook(renderBatchSubmitAddr,
-                     reinterpret_cast<LPVOID>(&Hook_RenderBatch_Submit),
-                     reinterpret_cast<LPVOID *>(&g_trampolineRenderBatchSubmit),
-                     "Render", "RenderBatch_Submit", false, true);
+  if (wantsVisibleManifest) {
+    InstallMinHook(renderBatchSubmitAddr,
+                   reinterpret_cast<LPVOID>(&Hook_RenderBatch_Submit),
+                   reinterpret_cast<LPVOID *>(&g_trampolineRenderBatchSubmit),
+                   "Render", "RenderBatch_Submit", false, true);
 
-      if constexpr (dxvk::war3::internal::
-                        kNativeVisibleRenderableTransparentHookEnabled) {
-        InstallMinHook(
-            aucTransparentAddEntryAddr,
-            reinterpret_cast<LPVOID>(&Hook_AUCTransparent_AddEntry),
-            reinterpret_cast<LPVOID *>(&g_trampolineAucTransparentAddEntry),
-            "Render", "AUCTransparent_AddEntry", false, true);
-      } else {
-        g_trampolineAucTransparentAddEntry = nullptr;
-      }
+    if constexpr (dxvk::war3::internal::
+                      kNativeVisibleRenderableTransparentHookEnabled) {
+      InstallMinHook(
+          aucTransparentAddEntryAddr,
+          reinterpret_cast<LPVOID>(&Hook_AUCTransparent_AddEntry),
+          reinterpret_cast<LPVOID *>(&g_trampolineAucTransparentAddEntry),
+          "Render", "AUCTransparent_AddEntry", false, true);
+    } else {
+      g_trampolineAucTransparentAddEntry = nullptr;
     }
   }
+}
 
 RenderIdentityLifecycleProbeSummary QueryRenderIdentityLifecycleProbeSummary() {
   RenderIdentityLifecycleProbeSummary summary = {};
+  summary.fullDiagnostics =
+      g_renderIdentityFullDiagnostics.load(std::memory_order_relaxed);
+  summary.worldObjectListEntryWriteProbeHookInstalled =
+      g_worldObjectListEntryWriteProbeHookInstalled.load(
+          std::memory_order_relaxed);
+  summary.worldObjectEntryRenderContextHookInstalled =
+      g_worldObjectEntryRenderContextHookInstalled.load(
+          std::memory_order_relaxed);
+  summary.worldObjectEntryRenderPrePostProbeEnabled =
+      summary.fullDiagnostics &&
+      summary.worldObjectEntryRenderContextHookInstalled;
+  summary.renderQueueIdentityPrimingHookInstalled =
+      g_renderQueueIdentityPrimingHookInstalled.load(
+          std::memory_order_relaxed);
   summary.worldObjectEntryRenderCallCount =
       g_worldObjectEntryRenderCallCount.load(std::memory_order_relaxed);
   summary.worldObjectEntryRenderSceneNodeReadyBeforeCount =

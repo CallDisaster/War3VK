@@ -88,9 +88,51 @@ struct War3HookAddressBook {
   uintptr_t worldObjectsRenderGroup = 0;
   uintptr_t dispatchCommon = 0;
   uintptr_t dispatchSpecial = 0;
+  uintptr_t applyDrawStateAndSamplerPair = 0;
   uintptr_t applyDrawStateAndDraw = 0;
+  uintptr_t gxDeviceD3dDynamicVertexUpload = 0;
   uintptr_t flushSortedItems = 0;
   uintptr_t terrainRenderAllTiles = 0;
+
+  // WorldFrameUpdateAndPreparePasses 内部第一层固定 callee。
+  // 仅供 PERF_LEVEL=2 + DXVK_WAR3_PERF_WORLD_PREPARE_DEEP_HOOKS=1
+  // 的显式诊断安装；默认运行时不会安装这些 detour。
+  uintptr_t worldPrepareCameraBuildFrustum = 0;
+  uintptr_t worldPrepareTerrainShadowFlush = 0;
+  uintptr_t worldPrepareTerrainExtraPass = 0;
+  uintptr_t worldPrepareShadowProjectorFlush = 0;
+  uintptr_t worldPrepareTargetIndicatorRingAdvance = 0;
+  uintptr_t worldPrepareCinematicFilterTimeAdvance = 0;
+  uintptr_t worldPrepareRuntimeFlagClockAdvance3B8760 = 0;
+
+  // WorldFrameUpdateAndPreparePasses 的剩余固定 callee。与上组分离是为了
+  // 允许独立打开低污染残余分账；0x368E90 依赖调用方 EDI 隐式实参，
+  // 不满足普通 MinHook C++ detour ABI，故刻意不进入地址簿。
+  uintptr_t worldPrepareFlushDeferredSelectionObjects = 0;
+  uintptr_t worldPrepareGlobalRenderCallbackPass = 0;
+  uintptr_t worldPrepareRenderWaypointIndicators = 0;
+
+  // WorldFrameUpdateAndPreparePasses 内尚未归属的核心阶段。调用约定已由
+  // 1.27a 机器码的 call-site、callee prologue 与 RET N 三方确认；只在
+  // PERF_LEVEL=2 + DXVK_WAR3_PERF_WORLD_PREPARE_CORE_HOOKS=1 时安装。
+  uintptr_t worldPrepareFrameUpdateGate = 0;
+  uintptr_t worldPrepareGameUiFrameSync = 0;
+  uintptr_t worldPrepareUpdateIndicatorAnchor = 0;
+  uintptr_t worldPrepareCameraAdvance = 0;
+  uintptr_t worldPrepareCameraPrepareConstants = 0;
+  uintptr_t worldPrepareViewProjPrepare = 0;
+  uintptr_t worldPrepareSceneQueryFlushSync = 0;
+  uintptr_t worldPrepareFixedPointRemap = 0;
+  uintptr_t worldPreparePostVisibilityGlobalAdvanceA = 0;
+  // 0x378420 数组扫描命中后的唯一重型子阶段。0x6374A0 仅从 entry+0x50
+  // 取出 this 并尾跳到该入口；直接量内层可把外层 self 收敛为扫描/句柄校验。
+  uintptr_t worldPreparePostVisibilityFrameAnchorUpdate = 0;
+  // FrameAnchorUpdate 内唯一的 579-byte 投影/可见性查询；fastcall ABI 为
+  // ECX=world object、EDX=2-float output、栈上第三个 output 指针。
+  uintptr_t worldPreparePostVisibilityFrameAnchorVisibilityQuery = 0;
+  uintptr_t worldPreparePostVisibilityGlobalAdvanceB = 0;
+  uintptr_t worldPrepareVisibilityTailAdvanceA = 0;
+  uintptr_t worldPrepareVisibilityTailAdvanceB = 0;
 
   // -------------------------------------------------------------------------
   // Shadow 域
@@ -105,7 +147,8 @@ struct War3HookAddressBook {
   uintptr_t shadowToggleStaticStampFromObject = 0;
   uintptr_t shadowToggleEmitterStamp = 0;
   uintptr_t shadowPathStaticStampToggle = 0;
-  // UnitUI.slk buildingShadow 字段写入 CUnitUIManager type record +0x50。
+  // UnitUI.slk unitShadow/buildingShadow 字段写入 CUnitUIManager type record。
+  uintptr_t cunitUiRecordSetUnitShadow = 0;       // 0x3358C0 (+0x4C)
   uintptr_t cunitUiRecordSetStructureShadow = 0;  // 0x335A00
   uintptr_t shadowProjectorSimpleBridge = 0;
   uintptr_t shadowPathObjectProjectorRuntime = 0;

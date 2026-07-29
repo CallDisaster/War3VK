@@ -81,6 +81,13 @@ struct WidgetIdentityHookStats {
   uint64_t installFailedAddrNull = 0;
   uint64_t installFailedEnvDisabled = 0;
   uint64_t installFailedMinHook = 0;
+  // Lifecycle caller observer only. These values intentionally do not drive
+  // hide/remove semantics until the individual Game.dll callers are verified.
+  uint32_t lastCallerRva = 0;
+  uint32_t lastArgumentMask = 0;
+  uint64_t callerChangeCount = 0;
+  uint64_t callerOutsideGameModuleCount = 0;
+  uint64_t lifecycleObserverCount = 0;
 };
 
 WidgetIdentityHookStats GetWidgetIdentityHookStats();

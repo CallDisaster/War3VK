@@ -1,17 +1,41 @@
 # War3 渲染问题统一研究目录
 
-## 当前阶段（2026-07-08）
+## 当前阶段（2026-07-09）
 - **建筑静态阴影已收敛到稳定生产方案**：hook
   `CUnitUIManager_RecordSetStructureShadow(0x6F335A00 / RVA 0x335A00)`，
   在 UnitUI/type record 写入 `buildingShadow(+0x50)` 时直接传空值，阻止
   `ShadowAltarofKings / ShadowTreeofLife / ShadowCannonTower` 等原生建筑阴影文件名进入类型记录。
+- **UberSplat/HMED 误杀已修正**：IDA 复核确认 UnitUI type record
+  `+0x48 = UberSplat key`、`+0x4C = unitShadow`、`+0x50 = buildingShadow`。
+  国王祭坛 `HMED` 属于 `+0x48` 建筑地面贴花，必须保留；旧版单位黑色 blob/圆影改由
+  `CUnitUIManager_RecordSetUnitShadow(0x6F3358C0 / RVA 0x3358C0)` producer gate 清理。
 - **实机验证已通过**：DebugView 捕获
   `DXVK War3Hook: CUnitUI buildingShadow BLOCK calls=768 blocked=768 mode=0 ... name=ShadowTreeofLife`，
   用户确认建筑阴影完全不可见。
 - **历史实验默认退役**：`WriteMaskRegion / StaticStampPath / RegisterImage / DoodadStamp`
   不再作为生产默认链路，只保留证伪资料与专项诊断入口；`ListA` 末端过滤保持关闭。
-- **ListB 保留默认移除**：`TerrainShadow_RenderListB` 现在被定义为旧版单位脚下黑色 blob/圆影治理入口，
-  默认全阻断，不再作为建筑静态阴影主方案。
+- **ListB 不再粗杀 type=4**：`TerrainShadow_RenderListB` 保留末端兜底，但 `type=4`
+  会承载 S19 建筑地面贴花/UberSplat，因此默认放行 type=4；单位 blob 不再靠 ListB type4
+  末端粗拦截解决。
+- **Stage 语义修正**：`CWorld_DispatchStage(0x6F363020)` 中 S1 调
+  `TerrainShadowDispatch(0)`，S2 调 `TerrainShadowDispatch(1)`，后者内部是
+  `TerrainShadow_RenderLayer(ListA=1,ListB=0,type=0)`，属于战争迷雾/阴影/贴花混合层，
+  不是地形几何本体；S19 才会直调 `RenderListB(type=4)`。
+- **S1 地形已纳入 CSM 遮挡体**：CSM 继续只把 S1 当作地形几何来源，S2/S19
+  不进入地形 caster。实现上主 ShadowMap 保持 depth-only，另用 S1-terrain-only R8
+  caster mask 标记“最近遮挡体是地形”的像素；receiver 对这些像素放亮，从而同时避免
+  飞行单位阴影穿透到低层地面、以及地形/悬崖把自己投成大片暗斑。2026-07-08 后续
+  专图复核显示：静态 slice / UP source-key bounds 可保留，动态 slice/content-key
+  持久缓存命中率只有约 1-2%，默认关闭，后续若继续压性能应回到原生 terrain tile
+  身份而不是扩大动态 VB 采样。
+- **动态点光源与体积光已推进到正式入口**：点光源接入
+  `War3LightManager + war3_shader_api + JASS command bridge`，receiver 端从无界纯加法
+  改为按 base material 乘色补光，避免脚本灯把整屏冲白；点光源 cube shadow 的
+  `PointShadowBlock` UBO 已与 shader 对齐，但成本较高，默认作为高级可选项。体积光从
+  `War3ShadowReceiverPass` 读取已经稳定化的 shadow map、CSM、sun direction 与 worldUp，
+  并改为低分辨率 effect buffer + full-res composite；默认 `resolutionDivisor=4`。
+  2026-07-09 AutoTest 中“点光源 + 体积光 divisor=4”短窗 `avgFps=51.058`，接近
+  无点光/无体积光基线 `avgFps=51.247`，因此生产策略是“入口正式、默认安全关闭、按地图/JASS 启用”。
 
 ## 当前阶段（2026-04-05）
 - **代码稳定回退点**：`ea204b1`，作为当前进入下一阶段前的安全基线。
@@ -37,7 +61,8 @@
 - `01_batch_merge/README.md`：渲染对象批次合并（Queue Takeover + Instancing）研究与推进记录。
 - `02_los_blocker_shadow/README.md`：路径阻断器（LOSBlocker）误入阴影采集问题研究与修复记录。
 - `03_building_static_shadow/README.md`：建筑静态阴影在“关闭阴影”后仍渲染的问题研究与修复记录；2026-07-08 已收敛到
-  `CUnitUIManager_RecordSetStructureShadow -> buildingShadow(+0x50)` 生产端阻断。
+  `buildingShadow(+0x50)` 与 `unitShadow(+0x4C)` 两个 producer gate，保留
+  `UberSplat(+0x48)` 建筑地面纹理。
 - `04_architecture_refactor/README.md`：Hook 框架/桥接层/运行时生命周期的重构方案与里程碑。
 - `05_jass_vm_and_partial_batch_submit/README.md`：JASS VM 主循环画像与渲染层“局部合并提交”专项。
 - `06_message_1_4_archive/README.md`：留言1~4夜间专项的统一归档（目标/实现/证据/验证清单）。
@@ -69,6 +94,14 @@
   的拦截都不能消除建筑阴影（包括 AGENTS 第 57 条 `Mode1_BlockAllRegisterImage` 极限实验）。
   CDoodads `a6` mask 注入仍能关树木阴影；建筑阴影必须 hook `WriteMaskRegion` 按 type code bit
   做精细屏蔽（不能整体 return，否则同时关 fog/视野）。
+- `25_s1_terrain_csm_occluder/README.md`：S1 地形进入 CSM 的 IDA 证据、二阶段
+  terrain caster mask 实现、LOSBlocker/阴影穿透回归结果。
+- `26_volumetric_light_probe/README.md`：CSM 同步体积光/上帝光历史探针，记录
+  2026-07-08 full-res 实验入口、初测成本，以及 2026-07-09 被低分辨率 effect/composite
+  正式方案接管的过程。
+- `27_dynamic_lights_and_volumetric_release/README.md`：动态点光源与体积光正式入口，
+  记录点光源 API/JASS 命令、点阴影 UBO 修正、体积光 `resolutionDivisor=4` 默认策略、
+  AutoTest 多轮结果与推荐启用方式。
 - `../../plan/overnight_render_paper_2026_05_15/06_fogmask_static_shadow.md`：
   **24 文档 v3 之后的完整 FogMask 论文（2026-05-15 夜间无人值守新增）**。
   揭示真正的根因：
@@ -146,8 +179,8 @@
 - 已基于 ASM 确认 `TerrainShadow_RenderLayer` 的参数语义：`a2` 控制 ListA，`a3` 控制 ListB。
 - 已基于 ASM 追加确认：`CWorld_TerrainShadow_Dispatch(stage14)` 会直调 `TerrainShadow_RenderListB(type=4)`，不经过 `RenderLayer(a3)`。
 - 已补齐 `ShadowProjector_Add_FromObject / ShadowProjector_Add_Simple` Hook 入口，接入可配置拦截策略。
-- 已新增 `TerrainShadow_RenderListB` Hook：历史上用于 mode=1/type=4 诊断；2026-07-08 起改为默认全阻断，
-  专门移除旧版单位脚下黑色 blob/圆影。
+- 已新增 `TerrainShadow_RenderListB` Hook：历史上用于 mode=1/type=4 诊断；2026-07-08 起改为默认拦截
+  ListB 非 type4 旧阴影尾巴，且默认放行 type4，避免误杀 S19 建筑地面贴花/UberSplat。
 - 方向2（LOSBlocker）已完成结项：`rawcode` + `Sprite->Model` 双通道过滤稳定生效，阻断器阴影已清除。
 - 已修复合批 fallback 状态位回归：`SingletonBypass`/尾部 fallback 恢复原始 `layerChanged/stateChanged` 计算，不再强制 `1/1`。
 - 已新增 `native` 研究目录，开始按 ASM 固化渲染主链（`CWorld_RenderScene -> DispatchStage -> RenderGroup -> Submit/Dispatch -> Flush`）与阴影分支链路。
@@ -202,7 +235,7 @@
 |---|---|---|---|
 | 方向1 合批 | 合批框架已工作，但仍有较高单发与回退成本 | 在 `BatchMergeStats` 基础上新增回退原因分桶（`NoShader/StateMismatch/AppendBreak/...`）并按场景量化 | `FQ_Dispatch_Opaque` 占比下降；`dispatchCommon` 调用数下降 |
 | 方向2 LOSBlocker | 已收敛：原版阻断器 FourCC 已稳定从 ShadowCapture 拒绝 | 进入维护：仅保留自定义地图变体抽样与黑名单补充；透明材质描边问题转入独立专项 | 阻断器不再进入阴影，且无“全体描边”回归 |
-| 方向3 静态阴影 | 2026-07-08 已收敛到 UnitUI `buildingShadow(+0x50)` 写入端 | 默认安装 `CUnitUIManager_RecordSetStructureShadow` producer gate；旧 `WriteMaskRegion/StaticStamp/RegisterImage/DoodadStamp` 实验退役；ListB 默认全阻断用于单位 blob 圆影 | 建筑静态阴影消失，且不再误伤雾/边界/贴花 |
+| 方向3 静态阴影 | 2026-07-08 已收敛到 UnitUI 字段级 producer gate | 默认安装 `CUnitUIManager_RecordSetStructureShadow(+0x50)` 与 `CUnitUIManager_RecordSetUnitShadow(+0x4C)`；旧 `WriteMaskRegion/StaticStamp/RegisterImage/DoodadStamp` 实验退役；ListB 默认保留 type4，避免误杀 UberSplat/HMED | 建筑静态阴影消失，单位黑 blob 移除，且不再误伤雾/边界/贴花/建筑地面纹理 |
 | 方向4 架构重构 | P1/P2 已落地：主入口瘦身 + 分域接线 + AddressBook | 持续推进统一 Hook 注册器、诊断分级与桥接契约化 | `d3d9_war3_hook.cpp` 持续保持“薄中枢”，分域可独立回归 |
 | 方向5 JASS+局部合并提交 | 已完成 JASS 主循环入口定位与 Hook（`0x7F1A20/0x7F2D92`） | 先以“同 renderablePart 局部上下文复用”压低 Dispatch CPU，再决定是否扩大到全队列接管合批 | `Hook_Dispatch_*` CPU 下降，`DispatchLocalMerge reusePct` 稳定上升且画面无回归 |
 
@@ -219,7 +252,7 @@
 |---|---|---|
 | 01 合批/批次提交 | 进行中（阶段性） | 已形成“保守接管 + 局部合并 + 透明排序快路径”可用组合，收益稳定；全量接管仍需按场景继续 A/B。 |
 | 02 LOSBlocker 阴影 | 已结项 | 已稳定屏蔽阻断器阴影，且保持描边链路可用。 |
-| 03 建筑静态阴影 | 已结项（生产默认） | 稳定治理点为 `CUnitUIManager_RecordSetStructureShadow(0x335A00)`，阻断 UnitUI type record `buildingShadow(+0x50)`；ListB 默认移除旧单位 blob 圆影。 |
+| 03 建筑静态阴影 | 已结项（生产默认） | 稳定治理点为 `CUnitUIManager_RecordSetStructureShadow(0x335A00)` 阻断 `buildingShadow(+0x50)`，并由 `CUnitUIManager_RecordSetUnitShadow(0x3358C0)` 清理 `unitShadow(+0x4C)`；保留 `UberSplat(+0x48)`，ListB 默认不再杀 type4。 |
 | 04 架构重构 | 已完成 v1 | 入口瘦身、分域 Hook、AddressBook 与模块化文档已完成。 |
 | 05 JASS VM + 局部提交 | 已完成阶段目标 | 已建立 JASS 追踪与预算策略、局部合并提交实验链路，并纳入自动化回归。 |
 | 07/08 MainLoop 与 WaitGate | 进行中（方法论稳定） | 已完成深层拆解与口径澄清，默认采用“性能模式/分析模式”双配置。 |

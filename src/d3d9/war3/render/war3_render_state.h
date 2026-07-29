@@ -54,12 +54,13 @@ struct War3TlsShadowSemanticState {
       static_cast<war3::render::ObjectKind>(0);
   War3BatchTag tag = War3BatchTag::Unknown;
   int stage = -1;
+  bool pathBlocker = false;
 
   bool HasAnyContext() const {
     return renderablePart != nullptr || sceneNode != nullptr ||
            worldObjectEntry != nullptr || object != nullptr || jHandle != 0u ||
            rawcode != 0u || static_cast<uint32_t>(objectKind) != 0u ||
-           tag != War3BatchTag::Unknown || stage >= 0;
+           tag != War3BatchTag::Unknown || stage >= 0 || pathBlocker;
   }
 };
 
@@ -214,6 +215,7 @@ public:
   static void SetOutlineDebugAllObjectsEnabled(bool enabled);
   // 调试：强制启用描边设置（与脚本设置解耦）
   static void SetOutlineForceEnabled(bool enabled);
+  static bool IsOutlineForceEnabledForTest();
 
   // 原生阴影模式：0=默认(完整) 1=仅保留雾/边界 2=完全禁用
   static void SetNativeShadowMode(uint32_t mode);

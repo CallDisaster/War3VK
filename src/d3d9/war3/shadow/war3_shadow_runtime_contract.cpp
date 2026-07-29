@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -57,6 +58,76 @@ struct PointerBoolCacheEntry {
   void* ptr = nullptr;
   bool value = false;
 };
+
+struct ManifestResolveDiagnostics {
+  uint64_t sourceCompleteSkipCount = 0u;
+  uint64_t legacyCacheHitCount = 0u;
+  uint64_t rawScanCount = 0u;
+  uint64_t rawScanEntryVisitCount = 0u;
+  uint64_t rawScanMissCount = 0u;
+  uint64_t verifierAttemptCount = 0u;
+  uint64_t verifierMismatchCount = 0u;
+  uint64_t modelResourceAttemptCount = 0u;
+  uint64_t modelResourceCacheHitCount = 0u;
+  uint64_t modelResourceDeepResolveCount = 0u;
+  uint64_t modelResourceNullResultCount = 0u;
+  uint64_t modelResourceVerifierAttemptCount = 0u;
+  uint64_t modelResourceVerifierMismatchCount = 0u;
+  uint32_t maxRuntimeGeosetCount = 0u;
+};
+
+struct ManifestSourceBackingConfig {
+  bool enabled = true;
+  bool verify = false;
+  bool assertOnMismatch = false;
+};
+
+const ManifestSourceBackingConfig& GetManifestSourceBackingConfig() {
+  static const ManifestSourceBackingConfig s_config = []() {
+    const auto exactFlag = [](const char* name) {
+      const char* raw = std::getenv(name);
+      return raw != nullptr && raw[0] == '1';
+    };
+    ManifestSourceBackingConfig config = {};
+    const char* enabled =
+        std::getenv("DXVK_WAR3_MANIFEST_SOURCE_BACKING_FAST_PATH");
+    config.enabled = enabled != nullptr && enabled[0] == '1';
+    config.assertOnMismatch = exactFlag(
+        "DXVK_WAR3_MANIFEST_SOURCE_BACKING_VERIFY_ASSERT");
+    config.verify =
+        exactFlag("DXVK_WAR3_MANIFEST_SOURCE_BACKING_VERIFY") ||
+        config.assertOnMismatch;
+    return config;
+  }();
+  return s_config;
+}
+
+struct ManifestModelResourceCacheConfig {
+  bool enabled = true;
+  bool verify = false;
+  bool assertOnMismatch = false;
+};
+
+const ManifestModelResourceCacheConfig&
+GetManifestModelResourceCacheConfig() {
+  static const ManifestModelResourceCacheConfig s_config = []() {
+    const auto exactFlag = [](const char* name) {
+      const char* raw = std::getenv(name);
+      return raw != nullptr && raw[0] == '1';
+    };
+    ManifestModelResourceCacheConfig config = {};
+    const char* enabled =
+        std::getenv("DXVK_WAR3_MANIFEST_MODEL_RESOURCE_CACHE");
+    config.enabled = enabled == nullptr || enabled[0] != '0';
+    config.assertOnMismatch = exactFlag(
+        "DXVK_WAR3_MANIFEST_MODEL_RESOURCE_CACHE_VERIFY_ASSERT");
+    config.verify =
+        exactFlag("DXVK_WAR3_MANIFEST_MODEL_RESOURCE_CACHE_VERIFY") ||
+        config.assertOnMismatch;
+    return config;
+  }();
+  return s_config;
+}
 
 template <size_t N, typename Fn>
 bool CachedPointerBool(std::array<PointerBoolCacheEntry, N>& cache, void* ptr,
@@ -175,7 +246,73 @@ bool LooksLikeGeosetDataPtrForContract(void* candidate) {
   });
 }
 
-void ResolveCurrentRuntimeGeosetFromData(ShadowRenderableRecord& record) {
+void* ResolveModelResourceForContract(
+    void* runtimeModelPtr, model::ShadowModelResourceCache& resourceCache,
+    ManifestResolveDiagnostics& diagnostics) {
+  if (runtimeModelPtr == nullptr)
+    return nullptr;
+
+  ++diagnostics.modelResourceAttemptCount;
+  void* ownedModelDataHandle = nullptr;
+  if (!dxvk::war3::SafeReadPtrFast(
+          runtimeModelPtr, dxvk::war3::CModelOffsets::OwnedModelDataHandle,
+          ownedModelDataHandle) ||
+      ownedModelDataHandle == nullptr) {
+    ++diagnostics.modelResourceNullResultCount;
+    return nullptr;
+  }
+
+  struct CacheEntry {
+    void* runtimeModelPtr = nullptr;
+    void* ownedModelDataHandle = nullptr;
+    void* modelResourcePtr = nullptr;
+    uint64_t resourceRevision = 0u;
+    bool valid = false;
+  };
+  thread_local std::array<CacheEntry, 4096u> s_cache = {};
+  const uintptr_t hash =
+      (reinterpret_cast<uintptr_t>(runtimeModelPtr) >> 4u) ^
+      (reinterpret_cast<uintptr_t>(ownedModelDataHandle) >> 7u);
+  CacheEntry& entry = s_cache[hash & (s_cache.size() - 1u)];
+  const uint64_t resourceRevision = resourceCache.revision();
+  const auto& config = GetManifestModelResourceCacheConfig();
+  if (config.enabled && entry.valid &&
+      entry.runtimeModelPtr == runtimeModelPtr &&
+      entry.ownedModelDataHandle == ownedModelDataHandle &&
+      entry.resourceRevision == resourceRevision) {
+    ++diagnostics.modelResourceCacheHitCount;
+    if (config.verify) {
+      ++diagnostics.modelResourceVerifierAttemptCount;
+      void* legacy =
+          resourceCache.resolveDirectModelResourcePtr(ownedModelDataHandle);
+      if (legacy != entry.modelResourcePtr) {
+        ++diagnostics.modelResourceVerifierMismatchCount;
+        if (config.assertOnMismatch)
+          std::abort();
+      }
+    }
+    if (entry.modelResourcePtr == nullptr)
+      ++diagnostics.modelResourceNullResultCount;
+    return entry.modelResourcePtr;
+  }
+
+  ++diagnostics.modelResourceDeepResolveCount;
+  void* resolved =
+      resourceCache.resolveDirectModelResourcePtr(ownedModelDataHandle);
+  if (config.enabled) {
+    entry.runtimeModelPtr = runtimeModelPtr;
+    entry.ownedModelDataHandle = ownedModelDataHandle;
+    entry.modelResourcePtr = resolved;
+    entry.resourceRevision = resourceRevision;
+    entry.valid = true;
+  }
+  if (resolved == nullptr)
+    ++diagnostics.modelResourceNullResultCount;
+  return resolved;
+}
+
+void ResolveCurrentRuntimeGeosetFromDataLegacy(
+    ShadowRenderableRecord& record, ManifestResolveDiagnostics& diagnostics) {
   if (record.runtimeGeosetDataPtr == nullptr)
     return;
   if (record.runtimeModelPtr == nullptr)
@@ -198,6 +335,7 @@ void ResolveCurrentRuntimeGeosetFromData(ShadowRenderableRecord& record) {
   ResolveCacheEntry& entry = s_cache[slot];
   if (entry.valid && entry.runtimeModel == record.runtimeModelPtr &&
       entry.runtimeGeosetData == record.runtimeGeosetDataPtr) {
+    ++diagnostics.legacyCacheHitCount;
     record.runtimeGeosetPtr = entry.geosetPtr;
     record.meshIndex = entry.index;
     record.geosetIndex = entry.index;
@@ -219,8 +357,12 @@ void ResolveCurrentRuntimeGeosetFromData(ShadowRenderableRecord& record) {
     return;
   }
 
+  ++diagnostics.rawScanCount;
+  diagnostics.maxRuntimeGeosetCount =
+      std::max(diagnostics.maxRuntimeGeosetCount, runtimeGeosetCount);
   auto** entries = reinterpret_cast<void**>(runtimeGeosets);
   for (uint32_t i = 0u; i < runtimeGeosetCount; ++i) {
+    ++diagnostics.rawScanEntryVisitCount;
     void* geosetPtr = entries[i];
     if (geosetPtr == nullptr)
       continue;
@@ -244,6 +386,56 @@ void ResolveCurrentRuntimeGeosetFromData(ShadowRenderableRecord& record) {
     entry.valid = true;
     return;
   }
+  ++diagnostics.rawScanMissCount;
+}
+
+void ResolveCurrentRuntimeGeosetFromData(
+    ShadowRenderableRecord& record, ManifestResolveDiagnostics& diagnostics) {
+  if (record.runtimeGeosetDataPtr == nullptr ||
+      record.runtimeModelPtr == nullptr) {
+    return;
+  }
+
+  const bool sourceBackingComplete =
+      record.runtimeGeosetPtr != nullptr &&
+      record.meshIndex != kInvalidShadowContractGeosetIndex &&
+      record.geosetIndex != kInvalidShadowContractGeosetIndex &&
+      record.meshIndex == record.geosetIndex;
+  const auto& config = GetManifestSourceBackingConfig();
+  if (!config.enabled || !sourceBackingComplete) {
+    ResolveCurrentRuntimeGeosetFromDataLegacy(record, diagnostics);
+    return;
+  }
+
+  ++diagnostics.sourceCompleteSkipCount;
+  if (!config.verify)
+    return;
+
+  ++diagnostics.verifierAttemptCount;
+  ShadowRenderableRecord legacy = record;
+  ManifestResolveDiagnostics verifierDiagnostics = {};
+  ResolveCurrentRuntimeGeosetFromDataLegacy(legacy, verifierDiagnostics);
+  diagnostics.legacyCacheHitCount +=
+      verifierDiagnostics.legacyCacheHitCount;
+  diagnostics.rawScanCount += verifierDiagnostics.rawScanCount;
+  diagnostics.rawScanEntryVisitCount +=
+      verifierDiagnostics.rawScanEntryVisitCount;
+  diagnostics.rawScanMissCount += verifierDiagnostics.rawScanMissCount;
+  diagnostics.maxRuntimeGeosetCount =
+      std::max(diagnostics.maxRuntimeGeosetCount,
+               verifierDiagnostics.maxRuntimeGeosetCount);
+
+  const bool matches =
+      legacy.runtimeGeosetPtr == record.runtimeGeosetPtr &&
+      legacy.runtimeGeosetDataPtr == record.runtimeGeosetDataPtr &&
+      legacy.meshIndex == record.meshIndex &&
+      legacy.geosetIndex == record.geosetIndex;
+  if (matches)
+    return;
+
+  ++diagnostics.verifierMismatchCount;
+  if (config.assertOnMismatch)
+    std::abort();
 }
 
 bool IsContractUnitCandidate(const ShadowRenderableRecord& record) {
@@ -410,7 +602,8 @@ void DemandFillVisibleUnitGeosetBindings(ShadowFrameManifest& manifest) {
 
 ShadowRenderableRecord ConvertVisible(
     const render::VisibleRenderableRecord& src,
-    uint64_t frameSerial) {
+    uint64_t frameSerial,
+    ManifestResolveDiagnostics& resolveDiagnostics) {
   ShadowRenderableRecord dst = {};
   dst.worldObjectEntry = src.identity.worldObjectEntry;
   dst.sceneNode =
@@ -440,6 +633,10 @@ ShadowRenderableRecord ConvertVisible(
   dst.queueKind = src.queueKind;
   dst.groupIdx = src.identity.groupIdx;
   dst.frameSerial = frameSerial;
+  dst.stage = src.stage;
+  dst.pathBlocker =
+      src.pathBlocker ||
+      dxvk::war3::internal::IsPathBlockerFourCc(dst.rawcode);
 
   if (dst.runtimeModelPtr == nullptr &&
       LooksLikeRuntimeModelPtrForContract(dst.sceneNode)) {
@@ -448,21 +645,15 @@ ShadowRenderableRecord ConvertVisible(
 
   auto& resourceCache = model::ShadowModelResourceCache::instance();
   if (dst.modelResourcePtr == nullptr && dst.runtimeModelPtr != nullptr) {
-    void* ownedModelDataHandle = nullptr;
-    if (dxvk::war3::SafeReadPtrFast(
-            dst.runtimeModelPtr,
-            dxvk::war3::CModelOffsets::OwnedModelDataHandle,
-            ownedModelDataHandle)) {
-      dst.modelResourcePtr =
-          resourceCache.resolveDirectModelResourcePtr(ownedModelDataHandle);
-    }
+    dst.modelResourcePtr = ResolveModelResourceForContract(
+        dst.runtimeModelPtr, resourceCache, resolveDiagnostics);
   }
 
   if (dst.runtimeGeosetDataPtr == nullptr &&
       LooksLikeGeosetDataPtrForContract(dst.meshData)) {
     dst.runtimeGeosetDataPtr = dst.meshData;
   }
-  ResolveCurrentRuntimeGeosetFromData(dst);
+  ResolveCurrentRuntimeGeosetFromData(dst, resolveDiagnostics);
   return dst;
 }
 
@@ -512,6 +703,9 @@ void MergeRenderableIdentityFromPrior(const ShadowRenderableRecord& prior,
     record.jHandle = prior.jHandle;
   if (record.rawcode == 0u)
     record.rawcode = prior.rawcode;
+  record.pathBlocker =
+      record.pathBlocker || prior.pathBlocker ||
+      dxvk::war3::internal::IsPathBlockerFourCc(record.rawcode);
   if (record.objectKind == render::ObjectKind::Unknown &&
       prior.objectKind != render::ObjectKind::Unknown) {
     record.objectKind = prior.objectKind;
@@ -1639,6 +1833,8 @@ void AppendRootUnitSupplementRecords(
       record.modelKey = seed.modelKey != 0u ? seed.modelKey : resource->modelKey;
       record.jHandle = seed.jHandle;
       record.rawcode = seed.rawcode;
+      record.pathBlocker =
+          dxvk::war3::internal::IsPathBlockerFourCc(record.rawcode);
       record.meshIndex = resolvedGeosetIndex;
       record.geosetIndex = resolvedGeosetIndex;
       record.objectKind =
@@ -2910,6 +3106,40 @@ size_t ShadowModelResourceStore::ModelGeosetKeyHash::operator()(
   return h1 ^ (h2 + 0x9e3779b9u + (h1 << 6) + (h1 >> 2));
 }
 
+ShadowModelResourceMemorySnapshot
+ShadowModelResourceStore::memorySnapshot() const {
+  ShadowModelResourceMemorySnapshot result;
+  result.records = m_records.size();
+  result.recordVectorCapacityBytes =
+      m_records.capacity() * sizeof(ShadowModelResourceRecord);
+  for (const auto& record : m_records) {
+    result.positionsCapacityBytes +=
+        record.positions.capacity() * sizeof(float);
+    result.normalsCapacityBytes +=
+        record.normals.capacity() * sizeof(float);
+    result.groupSlotsCapacityBytes +=
+        record.vertexGroupIndices.capacity() * sizeof(uint8_t);
+    result.primitiveCapacityBytes +=
+        record.primitiveRecords.capacity() * sizeof(ShadowPrimitiveRecord);
+    result.matrixGroupsCapacityBytes +=
+        record.matrixGroupSizes.capacity() * sizeof(uint32_t);
+    result.matrixIndicesCapacityBytes +=
+        record.matrixIndices.capacity() * sizeof(uint32_t);
+    result.indicesCapacityBytes +=
+        record.indices.capacity() * sizeof(uint16_t);
+    result.uvCapacityBytes +=
+        record.uvLayers.capacity() * sizeof(std::vector<float>);
+    for (const auto& layer : record.uvLayers)
+      result.uvCapacityBytes += layer.capacity() * sizeof(float);
+  }
+  result.payloadCapacityBytes = result.positionsCapacityBytes +
+      result.normalsCapacityBytes + result.groupSlotsCapacityBytes +
+      result.primitiveCapacityBytes + result.matrixGroupsCapacityBytes +
+      result.matrixIndicesCapacityBytes + result.indicesCapacityBytes +
+      result.uvCapacityBytes;
+  return result;
+}
+
 void ShadowModelResourceStore::clear() {
   m_records.clear();
   m_byRuntimeGeoset.clear();
@@ -3405,9 +3635,17 @@ void ShadowRuntimeContractCache::captureLiveState() {
   auto& attachmentRegistry = model::AttachmentRigidRegistry::instance();
   constexpr bool kCaptureAttachmentRigidContracts =
       !dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly;
-  if (resourceCache.readyGeosetCount() == 0u &&
+  // The bootstrap predicate is a conjunction, but readyGeosetCount() is an
+  // O(all geosets + aliases) scan while the other two terms are O(1) map-size
+  // reads.  In the steady state runtime-model records already exist, so test
+  // that decisive term first and never pay the full scan.  Registry mutation
+  // and capture both run on the render-thread frame boundary; changing the
+  // order therefore preserves the exact bootstrap predicate and frame order.
+  const bool needsResourceBootstrap =
       resourceCache.runtimeModelRecordCount() == 0u &&
-      modelRegistry.recordCount() != 0u) {
+      modelRegistry.recordCount() != 0u &&
+      resourceCache.readyGeosetCount() == 0u;
+  if (needsResourceBootstrap) {
     auto bootstrapScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/ResourceBootstrap");
     for (const auto& record : modelRegistry.snapshot()) {
@@ -3527,6 +3765,7 @@ void ShadowRuntimeContractCache::captureLiveState() {
     const bool useHashSet = visibleRecords.size() > kHashSetThreshold;
     std::unordered_set<uint64_t> seenSetLarge;
     std::vector<uint64_t> seenVecSmall;
+    ManifestResolveDiagnostics resolveDiagnostics = {};
     if constexpr (dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly) {
       if (useHashSet) {
         seenSetLarge.reserve(visibleRecords.size());
@@ -3584,7 +3823,8 @@ void ShadowRuntimeContractCache::captureLiveState() {
           seenVecSmall.push_back(directUnitKey);
         }
       }
-      manifest.records.push_back(ConvertVisible(record, manifest.frameSerial));
+      manifest.records.push_back(
+          ConvertVisible(record, manifest.frameSerial, resolveDiagnostics));
       ++stats.manifestCopyAppended;
     }
     // Phase 7.97：在 ManifestCopy 出口写 atomic counter。即使本次 capture
@@ -3602,6 +3842,48 @@ void ShadowRuntimeContractCache::captureLiveState() {
     // 累积 total/max，避免最近一次极小覆盖。
     m_manifestCopyTotalScanned.fetch_add(stats.manifestCopyVisibleScanned,
                                          std::memory_order_relaxed);
+    m_manifestResolveSourceCompleteSkipCount.fetch_add(
+        resolveDiagnostics.sourceCompleteSkipCount, std::memory_order_relaxed);
+    m_manifestResolveLegacyCacheHitCount.fetch_add(
+        resolveDiagnostics.legacyCacheHitCount, std::memory_order_relaxed);
+    m_manifestResolveRawScanCount.fetch_add(
+        resolveDiagnostics.rawScanCount, std::memory_order_relaxed);
+    m_manifestResolveRawScanEntryVisitCount.fetch_add(
+        resolveDiagnostics.rawScanEntryVisitCount,
+        std::memory_order_relaxed);
+    m_manifestResolveRawScanMissCount.fetch_add(
+        resolveDiagnostics.rawScanMissCount, std::memory_order_relaxed);
+    m_manifestResolveVerifierAttemptCount.fetch_add(
+        resolveDiagnostics.verifierAttemptCount, std::memory_order_relaxed);
+    m_manifestResolveVerifierMismatchCount.fetch_add(
+        resolveDiagnostics.verifierMismatchCount, std::memory_order_relaxed);
+    m_manifestModelResourceAttemptCount.fetch_add(
+        resolveDiagnostics.modelResourceAttemptCount,
+        std::memory_order_relaxed);
+    m_manifestModelResourceCacheHitCount.fetch_add(
+        resolveDiagnostics.modelResourceCacheHitCount,
+        std::memory_order_relaxed);
+    m_manifestModelResourceDeepResolveCount.fetch_add(
+        resolveDiagnostics.modelResourceDeepResolveCount,
+        std::memory_order_relaxed);
+    m_manifestModelResourceNullResultCount.fetch_add(
+        resolveDiagnostics.modelResourceNullResultCount,
+        std::memory_order_relaxed);
+    m_manifestModelResourceVerifierAttemptCount.fetch_add(
+        resolveDiagnostics.modelResourceVerifierAttemptCount,
+        std::memory_order_relaxed);
+    m_manifestModelResourceVerifierMismatchCount.fetch_add(
+        resolveDiagnostics.modelResourceVerifierMismatchCount,
+        std::memory_order_relaxed);
+    {
+      uint64_t cur = m_manifestResolveMaxRuntimeGeosetCount.load(
+          std::memory_order_relaxed);
+      while (resolveDiagnostics.maxRuntimeGeosetCount > cur &&
+             !m_manifestResolveMaxRuntimeGeosetCount.compare_exchange_weak(
+                 cur, resolveDiagnostics.maxRuntimeGeosetCount,
+                 std::memory_order_relaxed))
+        ;
+    }
     {
       uint64_t cur = m_manifestCopyMaxScanned.load(std::memory_order_relaxed);
       while (stats.manifestCopyVisibleScanned > cur &&

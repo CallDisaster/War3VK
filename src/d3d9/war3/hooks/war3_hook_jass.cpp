@@ -1,6 +1,7 @@
 #include "war3_hook_jass.h"
 #include "war3_hook_address_book.h"
 #include "war3_hook_install_util.h"
+#include "war3_hook_perf.h"
 #include "war3_jass_command_bridge.h"
 #include "war3_jass_native_plan_cache.h"
 #include "../../d3d9_war3_debug.h"
@@ -354,6 +355,20 @@ static int __cdecl Hook_InitJassNatives() {
 int __fastcall Hook_ExecuteJassFunction(void *thisPtr, void *edx, int a2,
                                         uint32_t *a3, int *a4, int a5, int a6,
                                         uint32_t *a7) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::ExecuteJassFunction, 8u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    if (g_trampolineExecuteJassFunction) {
+      return g_trampolineExecuteJassFunction(
+          thisPtr, edx, a2, a3, a4, a5, a6, a7);
+    }
+    if (g_originalExecuteJassFunction) {
+      return g_originalExecuteJassFunction(
+          thisPtr, edx, a2, a3, a4, a5, a6, a7);
+    }
+    return 1;
+  };
   // 当前策略：保持完全透传，仅保留可观测性与预算策略切入点。
   static bool s_firstCallLogged = false;
   if (!s_firstCallLogged) {
@@ -390,22 +405,13 @@ int __fastcall Hook_ExecuteJassFunction(void *thisPtr, void *edx, int a2,
 
   const auto begin = PerfClock::now();
   int result = 1;
-  if (g_trampolineExecuteJassFunction) {
+  if (g_trampolineExecuteJassFunction || g_originalExecuteJassFunction) {
     war3::War3PerfMonitor::ScopedCpuScope origScope;
     if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
       origScope = war3::War3PerfMonitor::instance().cpuScope(
-          "JassVM/ExecuteJassFunction/Orig");
+          "JassVM/ExecuteJassFunction/NativeOriginal");
     }
-    result = g_trampolineExecuteJassFunction(thisPtr, edx, a2, a3, a4, a5, a6,
-                                             a7);
-  } else if (g_originalExecuteJassFunction) {
-    war3::War3PerfMonitor::ScopedCpuScope origScope;
-    if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
-      origScope = war3::War3PerfMonitor::instance().cpuScope(
-          "JassVM/ExecuteJassFunction/Orig");
-    }
-    result = g_originalExecuteJassFunction(thisPtr, edx, a2, a3, a4, a5, a6,
-                                           a7);
+    result = callNativeOriginal();
   }
   const auto end = PerfClock::now();
   RecordJassExecuteStats(
@@ -442,7 +448,7 @@ int __fastcall Hook_ExecuteJassFunctionInternal(void *thisPtr, void *edx, int a2
     war3::War3PerfMonitor::ScopedCpuScope origScope;
     if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
       origScope = war3::War3PerfMonitor::instance().cpuScope(
-          "JassVM/ExecuteFunctionInternal/Orig");
+          "JassVM/ExecuteFunctionInternal/NativeOriginal");
     }
     return g_trampolineExecuteJassFunctionInternal(thisPtr, edx, a2, a3, a4,
                                                    opBudget, a6, a7);
@@ -451,7 +457,7 @@ int __fastcall Hook_ExecuteJassFunctionInternal(void *thisPtr, void *edx, int a2
     war3::War3PerfMonitor::ScopedCpuScope origScope;
     if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
       origScope = war3::War3PerfMonitor::instance().cpuScope(
-          "JassVM/ExecuteFunctionInternal/Orig");
+          "JassVM/ExecuteFunctionInternal/NativeOriginal");
     }
     return g_originalExecuteJassFunctionInternal(thisPtr, edx, a2, a3, a4,
                                                  opBudget, a6, a7);
@@ -479,14 +485,16 @@ int __fastcall Hook_JassInterpreterMainLoop(void *thisPtr, void *edx, int a2,
     war3::War3PerfMonitor::ScopedCpuScope origScope;
     if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
       origScope =
-          war3::War3PerfMonitor::instance().cpuScope("JassVM/MainLoop/Orig");
+          war3::War3PerfMonitor::instance().cpuScope(
+              "JassVM/MainLoop/NativeOriginal");
     }
     ret = g_trampolineJassInterpreterMainLoop(thisPtr, edx, a2, a3, a4, a5);
   } else if (g_originalJassInterpreterMainLoop) {
     war3::War3PerfMonitor::ScopedCpuScope origScope;
     if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
       origScope =
-          war3::War3PerfMonitor::instance().cpuScope("JassVM/MainLoop/Orig");
+          war3::War3PerfMonitor::instance().cpuScope(
+              "JassVM/MainLoop/NativeOriginal");
     }
     ret = g_originalJassInterpreterMainLoop(thisPtr, edx, a2, a3, a4, a5);
   }

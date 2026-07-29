@@ -5,6 +5,7 @@
 #include "../core/war3_game_structs.h"
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_memory.h"
+#include "war3_current_draw_contract.h"
 #include "war3_render_objects.h"
 #include "war3_render_identity_bridge.h"
 #include "war3_render_queue_tracker.h"
@@ -279,7 +280,15 @@ ExecBatchContext ExecBatchProcessor::Begin(void *element, War3BatchTag tag,
     // semantic-only cutover still needs the lightweight render context.  Do
     // not resolve handles here; just carry scene/world-object keys forward so
     // model hooks and semantic manifest repair have something to join on.
-    SafeReadPtrFast(element, 0x14, elementSceneNode);
+    const CurrentDrawDispatchContext dispatchContext =
+        GetCurrentDrawDispatchContext();
+    if (dispatchContext.valid &&
+        dispatchContext.renderablePart == element &&
+        dispatchContext.sceneNode != nullptr) {
+      elementSceneNode = dispatchContext.sceneNode;
+    } else {
+      SafeReadPtrFast(element, 0x14, elementSceneNode);
+    }
   }
 
   if (isWorldGroup && shadowSemanticOnly) {
@@ -508,6 +517,8 @@ ExecBatchContext ExecBatchProcessor::Begin(void *element, War3BatchTag tag,
     semanticState.tag = tag;
     semanticState.stage =
         elementStage >= 0 ? elementStage : War3RenderState::GetStage();
+    semanticState.pathBlocker =
+        dxvk::war3::internal::IsPathBlockerFourCc(semanticState.rawcode);
     War3RenderState::SetTlsShadowSemanticState(semanticState);
 
     if constexpr (dxvk::war3::internal::kNativeHookHotpathVerboseLogging) {

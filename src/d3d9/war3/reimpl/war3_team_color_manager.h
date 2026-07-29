@@ -82,7 +82,10 @@ private:
   D3DFORMAT m_textureFormat = D3DFMT_UNKNOWN;
 
   bool m_isReady = false;
-  std::mutex m_mutex;
+  // mutable：GetIndexFromTexture 是 const 访问器，但仍需与写入 m_originalTextures
+  // 的姐妹方法(Initialize/RegisterTeamColor/BuildTextureArray/OnLostDevice)共享
+  // 同一把锁；否则 const 读取无法加锁，形成加载线程写入 vs 渲染线程查询的数据竞争。
+  mutable std::mutex m_mutex;
 };
 
 } // namespace reimpl

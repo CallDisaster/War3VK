@@ -29,11 +29,12 @@ namespace dxvk {
         OffsetToLock,
         SizeToLock,
         ppbData,
-        Flags);
+        Flags,
+        reinterpret_cast<uintptr_t>(this));
     }
 
     HRESULT STDMETHODCALLTYPE Unlock() final {
-      return m_buffer.Unlock();
+      return m_buffer.Unlock(reinterpret_cast<uintptr_t>(this));
     }
 
     void STDMETHODCALLTYPE PreLoad() final {

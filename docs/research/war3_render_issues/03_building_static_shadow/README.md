@@ -1,6 +1,6 @@
 # 研究方向三：建筑静态阴影无法屏蔽
 
-## 2026-07-08 最终稳定结论：UnitUI buildingShadow 写入端治理
+## 2026-07-08 最终稳定结论：UnitUI 字段级 producer gate
 本轮 x32dbg + IDA + 实机日志确认，建筑底部那类原生静态阴影的最高价值治理点不是
 `CUnit+0x50`、`ListA/ListB`、`RegisterImage`、`StaticStampPath` 或
 `WriteMaskRegion`，而是 **UnitUI 类型记录的 `buildingShadow` 字段写入点**：
@@ -12,6 +12,17 @@
 - 调用来源：`CUnitUIManager_LoadSlkRows(0x6F66BA00)`，callsite `0x6F66BF5F`
 - SLK 字段描述：`buildingShadow` descriptor offset `1304`，`unitShadow` descriptor offset `1292`
 - 类型记录偏移：`+0x4C = unitShadow`，`+0x50 = buildingShadow`，`+0x48 = UberSplat key`
+
+同一轮 IDA 追加复核还确认了两个相邻字段，必须作为生产策略的一部分一起理解：
+
+- `CUnitUIManager_RecordSetUberSplatKey(0x6F335A70)`：写 type record `+0x48`，来源为 UnitUI.slk
+  `UberSplat` 字段；国王祭坛的典型 key 为 `HMED`，这是建筑地面纹理/贴花，不能因“去阴影”被清掉。
+- `CUnitUIManager_RecordSetUnitShadow(0x6F3358C0)`：写 type record `+0x4C`，来源为 UnitUI.slk
+  `unitShadow` 字段；这是旧版单位脚下黑色 blob/圆影的生产点，可以单独 producer 端清除。
+- `CUnitUIManager_RecordSetStructureShadow(0x6F335A00)`：写 type record `+0x50`，来源为 UnitUI.slk
+  `buildingShadow` 字段；这是建筑原生静态阴影文件名生产点。
+
+因此三者的安全边界是：**只清 `+0x4C unitShadow` 与 `+0x50 buildingShadow`，保留 `+0x48 UberSplat`**。
 
 关键纠偏：
 
@@ -33,10 +44,34 @@
 当前默认策略：
 
 - 建筑静态阴影：以 `CUnitUIManager_RecordSetStructureShadow` producer gate 为唯一生产主路径；
-- `TerrainShadow_RenderListB`：保留并默认全阻断，用来移除老版单位脚下黑色 blob/圆影；
+- 旧版单位黑色 blob/圆影：以 `CUnitUIManager_RecordSetUnitShadow` producer gate 清理 `+0x4C`；
+- 建筑地面纹理/UberSplat：保留 `CUnitUIManager_RecordSetUberSplatKey` 的 `+0x48` 写入；
+- `TerrainShadow_RenderListB`：仍保留为末端兜底，但默认不再粗暴杀 `type=4`，因为 `type=4`
+  会承载 S19 建筑地面贴花/UberSplat，例如国王祭坛 `HMED`；
 - `WriteMaskRegion / StaticStampPath / RegisterImage / DoodadStamp` 等历史静态阴影实验默认退役，
   仅保留为证伪资料和必要时的专项诊断入口；
 - `ListA` 末端过滤继续关闭，避免误伤战争迷雾、边界、悬崖/地形 tile。
+
+Stage 语义也在本轮 IDA 复核中修正：
+
+- `CWorld_DispatchStage(0x6F363020)` 的 `case 1` 调用 `CWorld_TerrainShadow_Dispatch(0)`，即 S1。
+- `case 2` 调用 `CWorld_TerrainShadow_Dispatch(1)`，内部仅执行
+  `TerrainShadow_RenderLayer(ListA=1, ListB=0, type=0)`，即 S2 是战争迷雾/阴影/贴花混合层，
+  不是地形几何本体。
+- `case 19` 调用 `CWorld_TerrainShadow_Dispatch(14)`，再直调
+  `TerrainShadow_RenderListB(type=4)`。这条链路解释了为什么早期“ListB type4 全拦”
+  会把建筑地面纹理一起干掉。
+
+2026-07-08 代码收口补充：
+
+- `Hook_Terrain_RenderListB` 现在优先判断 `type=4 && kNativeShadowListBPreserveType4ByDefault`，
+  即使 `NativeShadowMode>=2` 的全拦诊断开关打开，也会先保护 UberSplat/HMED。
+- IDA 已写回关键注释：
+  - `0x6F335AD5`：UnitUI record `+0x48 = UberSplat key`；
+  - `0x6F335925`：UnitUI record `+0x4C = unitShadow`；
+  - `0x6F335A65`：UnitUI record `+0x50 = buildingShadow`；
+  - `0x6F3630B9 / 0x6F3630CA / 0x6F363152`：S1/S2/S19 分发语义；
+  - `0x6F7378F5`：`TerrainShadowDispatch(14)` 渲染 `ListB(type=4)`。
 
 后续若要支持“JASS 后中途加载插件”，必须注意：已经在 UnitUI/type record 中写入的
 `buildingShadow` 不会被这条 producer gate 反向清除；因此稳定方案必须在 Game.dll 早期

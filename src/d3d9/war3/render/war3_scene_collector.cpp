@@ -4,13 +4,16 @@
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_memory.h"
 #include "../game/war3_agent.h"
+#include "../gpu_skin/war3_gpu_skin_native_bridge.h"
 #include "../handle/war3_handle_resolver.h"
 #include "war3_native_renderer_probe.h"
 #include "war3_render_exec_batch.h"
 #include "war3_render_objects.h"
 #include "war3_render_state.h"
+#include "war3_shadow_runtime_bridge.h"
 #include "../tools/war3_perf_monitor.h"
 #include "../../util/util_env.h"
+#include "../../util/util_time.h"
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -36,6 +39,142 @@ std::atomic<uint64_t> g_worldObjectListAcceptedIdentityCount{0u};
 std::atomic<uint64_t> g_lastWorldObjectListEntryWorldObjectEntryPtr{0u};
 std::atomic<uint64_t> g_lastWorldObjectListEntryOwnerHintValue{0u};
 std::atomic<uint64_t> g_lastWorldObjectListEntrySceneNodePtr{0u};
+
+struct SceneCollectorIdentityProbeDelta {
+  uint64_t entryCount = 0u;
+  uint64_t nullEntryCount = 0u;
+  uint64_t ownerHintZeroCount = 0u;
+  uint64_t ownerHintNonzeroCount = 0u;
+  uint64_t ownerHintHandleCount = 0u;
+  uint64_t ownerHintUnitPtrCount = 0u;
+  uint64_t ownerHintZeroContextAcceptedCount = 0u;
+  uint64_t acceptedIdentityCount = 0u;
+  uint64_t lastWorldObjectEntryPtr = 0u;
+  uint64_t lastOwnerHintValue = 0u;
+  uint64_t lastSceneNodePtr = 0u;
+  bool sawWorldObjectEntry = false;
+  bool sawSceneNode = false;
+};
+
+void PublishSceneCollectorIdentityProbeDelta(
+    const SceneCollectorIdentityProbeDelta &delta) {
+  const auto add = [](std::atomic<uint64_t> &counter, uint64_t value) {
+    if (value != 0u)
+      counter.fetch_add(value, std::memory_order_relaxed);
+  };
+  add(g_worldObjectListEntryCount, delta.entryCount);
+  add(g_worldObjectListNullEntryCount, delta.nullEntryCount);
+  add(g_worldObjectListOwnerHintZeroCount, delta.ownerHintZeroCount);
+  add(g_worldObjectListOwnerHintNonzeroCount, delta.ownerHintNonzeroCount);
+  add(g_worldObjectListOwnerHintHandleCount, delta.ownerHintHandleCount);
+  add(g_worldObjectListOwnerHintUnitPtrCount, delta.ownerHintUnitPtrCount);
+  add(g_worldObjectListOwnerHintZeroContextAcceptedCount,
+      delta.ownerHintZeroContextAcceptedCount);
+  add(g_worldObjectListAcceptedIdentityCount, delta.acceptedIdentityCount);
+  if (delta.sawWorldObjectEntry) {
+    g_lastWorldObjectListEntryWorldObjectEntryPtr.store(
+        delta.lastWorldObjectEntryPtr, std::memory_order_relaxed);
+    g_lastWorldObjectListEntryOwnerHintValue.store(
+        delta.lastOwnerHintValue, std::memory_order_relaxed);
+  }
+  if (delta.sawSceneNode) {
+    g_lastWorldObjectListEntrySceneNodePtr.store(
+        delta.lastSceneNodePtr, std::memory_order_relaxed);
+  }
+}
+
+class WorldObjectsPhase1CollectorScope {
+public:
+  explicit WorldObjectsPhase1CollectorScope(int groupIdx) noexcept
+      : m_active(groupIdx >= 0 &&
+                 uint32_t(groupIdx) < kWorldObjectsPhase1GroupCount &&
+                 IsWorldObjectsPhase1CaptureActive(groupIdx) &&
+                 BeginWorldObjectsPhase1Collector(groupIdx)) {
+    if (m_active) {
+      m_begin = dxvk::high_resolution_clock::get_counter();
+      m_phaseBegin = m_begin;
+    }
+  }
+
+  ~WorldObjectsPhase1CollectorScope() {
+    if (!m_active)
+      return;
+    const int64_t end = dxvk::high_resolution_clock::get_counter();
+    closeCurrentPhase(end);
+    m_observation.inclusiveTicks = tickDelta(m_begin, end);
+    CompleteWorldObjectsPhase1Collector(m_observation);
+  }
+
+  WorldObjectsPhase1CollectorScope(
+      const WorldObjectsPhase1CollectorScope&) = delete;
+  WorldObjectsPhase1CollectorScope& operator=(
+      const WorldObjectsPhase1CollectorScope&) = delete;
+
+  void setOutcome(WorldObjectsPhase1CollectorOutcome outcome) noexcept {
+    if (m_active)
+      m_observation.outcome = outcome;
+  }
+
+  void setCounts(uint32_t listEntries, uint32_t acceptedEntries,
+                 uint32_t sceneNodeEntries,
+                 uint32_t handleEntries) noexcept {
+    if (!m_active)
+      return;
+    m_observation.listEntries = listEntries;
+    m_observation.acceptedEntries = acceptedEntries;
+    m_observation.sceneNodeEntries = sceneNodeEntries;
+    m_observation.handleEntries = handleEntries;
+  }
+
+  void beginIterate() noexcept { transitionTo(Phase::Iterate); }
+  void beginRegister() noexcept { transitionTo(Phase::Register); }
+  void beginTail() noexcept { transitionTo(Phase::Tail); }
+
+private:
+  enum class Phase : uint32_t {
+    Setup = 0,
+    Iterate = 1,
+    Register = 2,
+    Tail = 3,
+  };
+
+  static uint64_t tickDelta(int64_t begin, int64_t end) noexcept {
+    return end >= begin ? uint64_t(end - begin) : 0u;
+  }
+
+  void closeCurrentPhase(int64_t end) noexcept {
+    const uint64_t ticks = tickDelta(m_phaseBegin, end);
+    switch (m_phase) {
+      case Phase::Setup:
+        m_observation.setupTicks += ticks;
+        break;
+      case Phase::Iterate:
+        m_observation.iterateTicks += ticks;
+        break;
+      case Phase::Register:
+        m_observation.registerTicks += ticks;
+        break;
+      case Phase::Tail:
+        m_observation.tailTicks += ticks;
+        break;
+    }
+  }
+
+  void transitionTo(Phase next) noexcept {
+    if (!m_active || m_phase == next)
+      return;
+    const int64_t now = dxvk::high_resolution_clock::get_counter();
+    closeCurrentPhase(now);
+    m_phase = next;
+    m_phaseBegin = now;
+  }
+
+  bool m_active = false;
+  Phase m_phase = Phase::Setup;
+  int64_t m_begin = 0;
+  int64_t m_phaseBegin = 0;
+  WorldObjectsPhase1CollectorObservation m_observation = {};
+};
 
 } // namespace
 
@@ -76,13 +215,21 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
   constexpr uint32_t kMaxWorldGroupEntries = 200000u;
   auto collectScope = MakeSceneCollectorCpuScope(
       "SceneCollector/CollectWorldObjects");
+  WorldObjectsPhase1CollectorScope phase1Scope(groupIdx);
   // [DEBUG] 追踪函数调用
   // [DISABLED] ENTER LOG
 
   // 扩展扫描范围，支持更多组 (0-7)
-  if (!gameWorldPtr || groupIdx < kMinWorldGroupIdx ||
-      groupIdx > kMaxWorldGroupIdx)
+  if (!gameWorldPtr) {
+    phase1Scope.setOutcome(
+        WorldObjectsPhase1CollectorOutcome::NullWorld);
     return;
+  }
+  if (groupIdx < kMinWorldGroupIdx || groupIdx > kMaxWorldGroupIdx) {
+    phase1Scope.setOutcome(
+        WorldObjectsPhase1CollectorOutcome::InvalidGroup);
+    return;
+  }
 
   // 根据 Codex 逆向分析：列表元素结构为 24 字节
   // +0x00: WorldObjectEntry* (渲染入口)
@@ -92,12 +239,26 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
   uint32_t listOffset = 91 + groupIdx;
   void **thisArray = (void **)gameWorldPtr;
 
-  if (!IsReadableRange(thisArray, (listOffset + 1) * sizeof(void *)))
+  if (!IsReadableRange(thisArray, (listOffset + 1) * sizeof(void *))) {
+    phase1Scope.setOutcome(
+        WorldObjectsPhase1CollectorOutcome::UnreadableWorld);
     return;
+  }
 
   void *list = thisArray[listOffset];
 
-  if (list && IsReadableRange(list, 0x18)) {
+  if (!list) {
+    phase1Scope.setOutcome(
+        WorldObjectsPhase1CollectorOutcome::NullList);
+    return;
+  }
+  if (!IsReadableRange(list, 0x18)) {
+    phase1Scope.setOutcome(
+        WorldObjectsPhase1CollectorOutcome::UnreadableList);
+    return;
+  }
+
+  {
     auto prepareScope = MakeSceneCollectorCpuScope("SceneCollector/Prepare");
     // 列表结构（类似 std::vector）：
     // +0x0C (listData[3]): 数据指针
@@ -105,9 +266,20 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
     uint32_t *listData = (uint32_t *)list;
     void *dataPtr = (void *)listData[3]; // +0x0C
     uint32_t count = listData[5];        // +0x14
-    if (!dataPtr || count == 0)
+    phase1Scope.setCounts(count, 0u, 0u, 0u);
+    if (!dataPtr) {
+      phase1Scope.setOutcome(
+          WorldObjectsPhase1CollectorOutcome::NullData);
       return;
+    }
+    if (count == 0u) {
+      phase1Scope.setOutcome(
+          WorldObjectsPhase1CollectorOutcome::CountZero);
+      return;
+    }
     if (count > kMaxWorldGroupEntries) {
+      phase1Scope.setOutcome(
+          WorldObjectsPhase1CollectorOutcome::CountCap);
       static uint32_t s_invalidCountLog = 0;
       if (s_invalidCountLog < 10u || (s_invalidCountLog % 1000u) == 0u) {
         WAR3_RENDER_LOG(
@@ -119,6 +291,8 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
       return;
     }
     if (!IsReadableRangeFast(dataPtr, size_t(count) * 24u)) {
+      phase1Scope.setOutcome(
+          WorldObjectsPhase1CollectorOutcome::UnreadableData);
       static uint32_t s_invalidRangeLog = 0;
       if (s_invalidRangeLog < 10u || (s_invalidRangeLog % 1000u) == 0u) {
         WAR3_RENDER_LOG(
@@ -149,6 +323,49 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
     thread_local std::vector<RenderObjectBatchItem> s_batchItems;
     s_batchItems.clear();
     s_batchItems.reserve(count);
+    // Full diagnostics retains the historical per-entry publication cadence.
+    // Production-light aggregates the same pure statistics once per group;
+    // registry admission and every identity field remain per-entry and exact.
+    const bool aggregateIdentityProbe =
+        !dxvk::war3::gpu_skin::NativeBridgeFullDiagnosticsEnabled();
+    SceneCollectorIdentityProbeDelta identityProbeDelta = {};
+    const auto recordProbeCount = [aggregateIdentityProbe](
+                                      std::atomic<uint64_t> &counter,
+                                      uint64_t &local) {
+      if (aggregateIdentityProbe)
+        ++local;
+      else
+        counter.fetch_add(1u, std::memory_order_relaxed);
+    };
+    const auto recordWorldObjectEntry = [aggregateIdentityProbe,
+                                         &identityProbeDelta](
+                                            void *worldObjectEntry,
+                                            uint32_t ownerHintRaw) {
+      const uint64_t entryValue =
+          uint64_t(reinterpret_cast<uintptr_t>(worldObjectEntry));
+      if (aggregateIdentityProbe) {
+        identityProbeDelta.lastWorldObjectEntryPtr = entryValue;
+        identityProbeDelta.lastOwnerHintValue = uint64_t(ownerHintRaw);
+        identityProbeDelta.sawWorldObjectEntry = true;
+      } else {
+        g_lastWorldObjectListEntryWorldObjectEntryPtr.store(
+            entryValue, std::memory_order_relaxed);
+        g_lastWorldObjectListEntryOwnerHintValue.store(
+            uint64_t(ownerHintRaw), std::memory_order_relaxed);
+      }
+    };
+    const auto recordSceneNode = [aggregateIdentityProbe,
+                                  &identityProbeDelta](void *sceneNode) {
+      const uint64_t sceneValue =
+          uint64_t(reinterpret_cast<uintptr_t>(sceneNode));
+      if (aggregateIdentityProbe) {
+        identityProbeDelta.lastSceneNodePtr = sceneValue;
+        identityProbeDelta.sawSceneNode = true;
+      } else {
+        g_lastWorldObjectListEntrySceneNodePtr.store(
+            sceneValue, std::memory_order_relaxed);
+      }
+    };
 
     // [性能] 默认仅追踪“被关注的句柄”（outline/bloom），避免把全场景对象都塞进 Registry。
     // 如需完整枚举/调试，请设置：DXVK_WAR3_FORCE_OBJECT_TRACKING=1
@@ -193,6 +410,8 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
     // - 无需遍历 WorldObject 列表；
     // - 避免执行后续 unitPtr/sceneNode 解析热路径。
     if (filtered && s_trackedHandles.empty() && !probeEnabled) {
+      phase1Scope.setOutcome(
+          WorldObjectsPhase1CollectorOutcome::FilteredNoTargets);
       NativeRendererProbe::instance().OnWorldObjectsGroup(
           groupIdx, count, 0, 0, 0, 0, true);
       return;
@@ -318,21 +537,19 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
       }
     }
 
+    phase1Scope.beginIterate();
     {
       auto iterateScope =
           MakeSceneCollectorCpuScope("SceneCollector/IterateList");
       for (uint32_t i = 0; i < count; i++) {
         // 读取列表元素 (24字节/6个DWORD)
         // idx * 6 + offset_idx
-        g_worldObjectListEntryCount.fetch_add(1u, std::memory_order_relaxed);
+        recordProbeCount(g_worldObjectListEntryCount,
+                         identityProbeDelta.entryCount);
         void *worldObjectEntry =
             (void *)elements[i * 6 + (ListElementOffsets::WorldObjectEntry / 4)];
         uint32_t rawVal = elements[i * 6 + (ListElementOffsets::UnitPtr / 4)];
-        g_lastWorldObjectListEntryWorldObjectEntryPtr.store(
-            uint64_t(reinterpret_cast<uintptr_t>(worldObjectEntry)),
-            std::memory_order_relaxed);
-        g_lastWorldObjectListEntryOwnerHintValue.store(
-            uint64_t(rawVal), std::memory_order_relaxed);
+        recordWorldObjectEntry(worldObjectEntry, rawVal);
 
         const bool hasOwnerHint = rawVal != 0u;
         void *unitPtr = hasOwnerHint ? reinterpret_cast<void *>(rawVal)
@@ -345,23 +562,23 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
         const bool isHandleVal = hasOwnerHint && rawVal < 0x01000000u;
 
         if (!worldObjectEntry) {
-          g_worldObjectListNullEntryCount.fetch_add(1u,
-                                                    std::memory_order_relaxed);
+          recordProbeCount(g_worldObjectListNullEntryCount,
+                           identityProbeDelta.nullEntryCount);
           continue;
         }
 
         if (!hasOwnerHint) {
-          g_worldObjectListOwnerHintZeroCount.fetch_add(
-              1u, std::memory_order_relaxed);
+          recordProbeCount(g_worldObjectListOwnerHintZeroCount,
+                           identityProbeDelta.ownerHintZeroCount);
         } else {
-          g_worldObjectListOwnerHintNonzeroCount.fetch_add(
-              1u, std::memory_order_relaxed);
+          recordProbeCount(g_worldObjectListOwnerHintNonzeroCount,
+                           identityProbeDelta.ownerHintNonzeroCount);
           if (isHandleVal) {
-            g_worldObjectListOwnerHintHandleCount.fetch_add(
-                1u, std::memory_order_relaxed);
+            recordProbeCount(g_worldObjectListOwnerHintHandleCount,
+                             identityProbeDelta.ownerHintHandleCount);
           } else {
-            g_worldObjectListOwnerHintUnitPtrCount.fetch_add(
-                1u, std::memory_order_relaxed);
+            recordProbeCount(g_worldObjectListOwnerHintUnitPtrCount,
+                             identityProbeDelta.ownerHintUnitPtrCount);
           }
 
           if (!isHandleVal) {
@@ -426,9 +643,7 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
         } else {
           item.sceneNode = nullptr;
         }
-        g_lastWorldObjectListEntrySceneNodePtr.store(
-            uint64_t(reinterpret_cast<uintptr_t>(item.sceneNode)),
-            std::memory_order_relaxed);
+        recordSceneNode(item.sceneNode);
 
         // Probe counters（仅用于统计，不影响逻辑）
         if (item.sceneNode)
@@ -447,11 +662,12 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
 
         s_batchItems.push_back(item);
         if (!hasOwnerHint) {
-          g_worldObjectListOwnerHintZeroContextAcceptedCount.fetch_add(
-              1u, std::memory_order_relaxed);
+          recordProbeCount(
+              g_worldObjectListOwnerHintZeroContextAcceptedCount,
+              identityProbeDelta.ownerHintZeroContextAcceptedCount);
         }
-        g_worldObjectListAcceptedIdentityCount.fetch_add(
-            1u, std::memory_order_relaxed);
+        recordProbeCount(g_worldObjectListAcceptedIdentityCount,
+                         identityProbeDelta.acceptedIdentityCount);
 
         // [DEBUG PROBE] Register scene node for reverse lookup
         if (sceneNode) {
@@ -469,6 +685,14 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
         }
       }
     }
+
+    phase1Scope.setCounts(
+        count, static_cast<uint32_t>(s_batchItems.size()),
+        keptSceneNodeCount, keptHandleCount);
+    phase1Scope.beginRegister();
+
+    if (aggregateIdentityProbe)
+      PublishSceneCollectorIdentityProbeDelta(identityProbeDelta);
 
     // 默认使用“快速模式”写入 Registry：避免每帧对所有对象调用 HandleResolver。
     // 如需完整解析（agentType/agentPtr 等），可设置：DXVK_WAR3_OBJECT_TRACKING_FULL_RESOLVE=1
@@ -495,6 +719,7 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
           MakeSceneCollectorCpuScope("SceneCollector/RegisterBatch");
       registry.registerWorldObjectsBatch(s_batchItems, registerMode);
     }
+    phase1Scope.beginTail();
 
     // Native Renderer Probe：统计对象收集与过滤效果
     NativeRendererProbe::instance().OnWorldObjectsGroup(
@@ -564,11 +789,17 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
 
     // [DEBUG] 追踪 registry 填充状态
     // [DISABLED] Registry fill log
+    phase1Scope.setOutcome(
+        s_batchItems.empty()
+            ? WorldObjectsPhase1CollectorOutcome::ValidEmptyAfterFilter
+            : WorldObjectsPhase1CollectorOutcome::ValidNonEmpty);
   }
 }
 
 SceneCollectorIdentityProbeSummary QuerySceneCollectorIdentityProbeSummary() {
   SceneCollectorIdentityProbeSummary summary = {};
+  summary.groupLocalAggregationEnabled =
+      !dxvk::war3::gpu_skin::NativeBridgeFullDiagnosticsEnabled();
   summary.worldObjectListEntryCount =
       g_worldObjectListEntryCount.load(std::memory_order_relaxed);
   summary.worldObjectListNullEntryCount =

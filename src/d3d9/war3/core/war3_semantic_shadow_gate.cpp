@@ -24,6 +24,15 @@ bool EnvFlagOrDefault(const char* name, bool defaultValue) {
   return ParseEnabled(value);
 }
 
+bool RuntimeGateValueCacheEnabled() {
+  // 环境覆盖在进程启动时确定，AutoTest 的每轮 A/B 也会启动独立进程。
+  // 热 draw 路径不应为同一个变量每帧构造上千个 std::string。保留关闭
+  // 开关用于同一 DLL 的严格对照与紧急回退。
+  static const bool enabled = EnvFlagOrDefault(
+      "DXVK_WAR3_SEMANTIC_GATE_VALUE_CACHE", true);
+  return enabled;
+}
+
 } // namespace
 
 bool IsSemanticShadowPreviewEnabled() {
@@ -38,9 +47,16 @@ bool IsSemanticCoreValidationRuntimeEnabled() {
 }
 
 bool IsSemanticSceneSubmissionRuntimeEnabled() {
-  return kShadowSemanticCoreSceneSubmissionEnabled &&
-         IsSemanticShadowPreviewEnabled() &&
-         EnvFlagOrDefault("DXVK_WAR3_SEMANTIC_SHADOW_SCENE_SUBMISSION", true);
+  const auto resolve = []() {
+    return kShadowSemanticCoreSceneSubmissionEnabled &&
+           IsSemanticShadowPreviewEnabled() &&
+           EnvFlagOrDefault("DXVK_WAR3_SEMANTIC_SHADOW_SCENE_SUBMISSION",
+                            true);
+  };
+  if (!RuntimeGateValueCacheEnabled())
+    return resolve();
+  static const bool enabled = resolve();
+  return enabled;
 }
 
 bool IsSemanticSceneBootstrapCatchupRuntimeEnabled() {
@@ -75,15 +91,21 @@ bool IsSemanticSceneBypassLegacyUnitCaptureRuntimeEnabled() {
 }
 
 bool IsSemanticSceneDisableLegacyShadowCaptureRuntimeEnabled() {
-  if (!IsSemanticShadowPreviewEnabled())
-    return false;
+  const auto resolve = []() {
+    if (!IsSemanticShadowPreviewEnabled())
+      return false;
 
-  const std::string overrideValue = dxvk::env::getEnvVar(
-      "DXVK_WAR3_SEMANTIC_SHADOW_DISABLE_LEGACY_CAPTURE");
-  if (!overrideValue.empty())
-    return ParseEnabled(overrideValue);
+    const std::string overrideValue = dxvk::env::getEnvVar(
+        "DXVK_WAR3_SEMANTIC_SHADOW_DISABLE_LEGACY_CAPTURE");
+    if (!overrideValue.empty())
+      return ParseEnabled(overrideValue);
 
-  return kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled;
+    return kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled;
+  };
+  if (!RuntimeGateValueCacheEnabled())
+    return resolve();
+  static const bool enabled = resolve();
+  return enabled;
 }
 
 bool IsSemanticShadowPreReadyValidationRuntimeEnabled() {

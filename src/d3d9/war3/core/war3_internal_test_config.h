@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace dxvk::war3::internal {
 
@@ -271,10 +272,14 @@ inline constexpr bool kNativeDirectGetFloatGameStateRuntimeEnabled = true;
 // ========================================================================
 // MainLoop / WinAPI 等待链路追踪
 // ========================================================================
-// 是否安装主线程 Wait/Sleep 系列 WinAPI Hook（用于拆分 Untracked）。
-// 该组 Hook 覆盖面广，会引入可观额外开销，性能优先默认关闭。
+// 是否安装主线程 Wait/Sleep 系列 WinAPI Hook（Sleep/WaitMessage 等，面很广）。
+// Phase D 实测：API 级 Hook 有可测开销（高压约 -5 FPS），默认关。
+// Engine WaitGate/SleepGate 见下方 kNativeMainLoopWaitGateHookEnabled。
 inline constexpr bool kNativeMainThreadWaitHookEnabled =
     kNativeMainLoopCoverageAnalysisMode || false;
+// Phase D：只装 Engine WaitGate/PrepareWait/SleepGate（不装 Sleep API），
+// 把 Idle 从 Untracked Active Gap 拆出来，开销远小于 WaitHook 全套。
+inline constexpr bool kNativeMainLoopWaitGateHookEnabled = true;
 // 是否启用深层内核等待 Hook（WaitForMultiple/NtWait*）。
 // 注意：该组 API 覆盖面很广，调试阶段建议按需开启，出现兼容/稳定性问题可快速关闭。
 inline constexpr bool kNativeMainThreadWaitDeepHookEnabled =
@@ -378,6 +383,41 @@ inline constexpr bool kWar3ForceImmediatePresentEnabled = true;
 inline constexpr bool kNativeOptimizationPerfTrackingEnabled =
     kNativeMainLoopCoverageAnalysisMode || false;
 
+// ========================================================================
+// Hook 计时分级（2026-07-22 性能计时体系重建）
+// ========================================================================
+// 帧级低频 Hook 计时（Prepare/RenderScene/WorldDispatch/RenderGroup/Flush，
+// 每帧 < 50 次 QPC 对，成本可忽略）。默认开启，配合 DXVK_WAR3_PERF_LEVEL。
+inline constexpr bool kNativePerfFrameHookTimingEnabled = true;
+// per-draw 高频 Hook 计时（Dispatch_Common/Special 等），仅在采样 flush 内生效。
+inline constexpr bool kNativePerfDrawHookTimingEnabled = true;
+// detail 级杂项 Hook 计时（PERF_LEVEL=2 时全开）。
+inline constexpr bool kNativePerfDetailHookTimingEnabled = true;
+
+// PERF_LEVEL：0=off，1=frame（默认，仅帧级低频 scope），2=detail（含 per-draw 采样）。
+inline int War3PerfHookLevel() {
+  static const int level = [] {
+    const char *value = std::getenv("DXVK_WAR3_PERF_LEVEL");
+    if (value == nullptr || *value == '\0')
+      return 1;
+    const int parsed = std::atoi(value);
+    return parsed < 0 ? 0 : (parsed > 2 ? 2 : parsed);
+  }();
+  return level;
+}
+
+// per-draw 采样周期（flush 粒度，默认 8；PERF_LEVEL=2 时生效）。
+inline uint32_t War3PerfDrawSamplePeriod() {
+  static const uint32_t period = [] {
+    const char *value = std::getenv("DXVK_WAR3_PERF_DRAW_SAMPLE_PERIOD");
+    const int parsed =
+        (value == nullptr || *value == '\0') ? 8 : std::atoi(value);
+    return static_cast<uint32_t>(parsed < 1 ? 1 : (parsed > 1024 ? 1024
+                                                            : parsed));
+  }();
+  return period;
+}
+
 // 超级快速路径：跳过 FlushSortedItems 中的冗余安全检查
 // 原版游戏不做这些检查，启用后性能更接近原版
 inline constexpr bool kNativeFlushUnsafePathEnabled = false;
@@ -462,6 +502,19 @@ inline constexpr bool kWar3RuntimeConfigEnableSemanticMatrixPublisherHooks =
     false;
 inline constexpr bool kShadowSemanticCoreSceneDisableLegacyShadowCaptureEnabled =
     true;
+// Semantic scene 接管对象阴影后，legacy draw-time ShadowCapture 默认早退。
+// S1 是主体地形几何，仍需要作为 CSM 深度遮挡体，否则飞行单位/高地物体的
+// 阴影会穿透到更低层地表。这里只放行 S1，不放行 S2/S19 的雾、贴花、
+// UberSplat 等 TerrainShadow 子层。
+inline constexpr bool kShadowSemanticCoreSceneKeepS1TerrainLegacyCapture =
+    true;
+
+// Phase A（2026-07-09）：S1 地形 tile 走 persistent geometry 池。
+// period>1 会闪烁（整包 stash 与当帧可见 tile 集合不一致），必须保持 period=1。
+// 本开关让每帧仍采集“当前可见 S1 tile 集合”，但对相同 upload/layout fingerprint
+// 的 tile 命中 persistent 池，跳过每帧 freeze copyBuffer（ShadowCapture 主热点）。
+// 关闭回退：DXVK_WAR3_S1_TERRAIN_PERSISTENT_GEOMETRY=0 或本常量 false。
+inline constexpr bool kShadowS1TerrainPersistentGeometryEnabled = true;
 
 // Pose producer 关闭时是否仍安装 SpriteFrameUpdate 系列 Hook 来补 runtime
 // resource。当前性能二分证明该热路径可能在无 pose 情况下造成未计入的
@@ -720,9 +773,13 @@ inline constexpr bool kShadowSemanticCoreValidationEnabled = true;
 inline constexpr bool kShadowSemanticCoreSceneSubmissionEnabled = true;
 inline constexpr bool kShadowSemanticCoreSceneUnitsOnly = false;
 // Phase 7.93：启用 shadow caster 数量上限。SunkenCity 某些视角有 700+ caster
-// 导致 1FPS。设 256 上限：足够覆盖正常高压场景（~200），截断极端场景。
+// 导致 1FPS。2026-07：默认 512，减轻高镜头 CSM 半截提交（旧 256 按 Draw 截断，
+// 可在对象 Geoset 中间切断）。无上限验证：
+// DXVK_WAR3_SEMANTIC_SUBMIT_DRAW_CAP=4096
+// DXVK_WAR3_SEMANTIC_DIRECT_RECORD_CAP=4096
+// DXVK_WAR3_SEMANTIC_DIRECT_SCAN_CAP=16384
 inline constexpr bool kShadowSemanticCoreSceneSubmitDrawCapEnabled = true;
-inline constexpr uint32_t kShadowSemanticCoreSceneSubmitDrawCap = 256u;
+inline constexpr uint32_t kShadowSemanticCoreSceneSubmitDrawCap = 512u;
 inline constexpr bool kShadowSemanticCoreSceneBootstrapCatchupEnabled = false;
 inline constexpr uint32_t kShadowSemanticCoreSceneBootstrapCatchupMaxAttempts = 0u;
 inline constexpr bool kShadowSemanticCoreSceneTailBoundaryFallbackEnabled = false;
@@ -795,7 +852,7 @@ inline constexpr bool kNativeRenderWorldGroupEnabled = true;
 inline constexpr bool kNativeRendererHookTakeoverEnabled = false;
 
 // Native Renderer Hook 详细日志输出（用于调试Hook安装过程）
-inline constexpr bool kNativeRendererHookVerboseLogging = true;
+inline constexpr bool kNativeRendererHookVerboseLogging = false;
 
 // 是否在Hook安装失败时继续运行（仅记录错误）
 inline constexpr bool kNativeRendererHookContinueOnError = false;
@@ -882,31 +939,35 @@ inline bool kShadowRenderDecorations = true; // 默认开启
 // ========================================================================
 // ShadowMap 自适应更新（渲染层 CPU/GPU 优化）
 // ========================================================================
-// 在“高 caster + 相机/场景稳定”时，允许隔帧复用上一帧 ShadowMap。
-// 注意：该策略偏向性能，若观察到阴影跟随延迟可关闭。
-inline constexpr bool kShadowAdaptiveMapUpdateEnabled = false;
-// 触发自适应的最小 caster 数。
-inline constexpr uint32_t kShadowAdaptiveMapUpdateMinCasters = 16;
+// Phase E（2026-07-09）：默认开启隔帧复用。与 S1 capture period 无关（S1 必须
+// period=1）；此处只在“完整 map 已有 + 相机/pose 稳定 + 无 capture 不稳定”时
+// 跳过 renderShadowMap 整段（Shadow/Main ~0.65ms + ShadowMap ~0.47ms 量级）。
+// 动态 skinned 存在且 pose signature 变化时仍每帧重建（见 receiver 侧条件）。
+// 回退：kShadowAdaptiveMapUpdateEnabled=false 或 env 诊断。
+inline constexpr bool kShadowAdaptiveMapUpdateEnabled = true;
+// 触发自适应的最小 caster 数（高压图 replay ~196，必须低于该阈值）。
+inline constexpr uint32_t kShadowAdaptiveMapUpdateMinCasters = 64;
 // 自适应跳帧周期：1=每帧更新，2=隔帧更新，3=每三帧更新一次。
-inline constexpr uint32_t kShadowAdaptiveMapUpdatePeriod = 1;
+// 注意：period 必须 >1 才会 reuse；1 等于关闭。
+inline constexpr uint32_t kShadowAdaptiveMapUpdatePeriod = 2;
 // 当 caster 数极高时，提高复用周期，避免超大图里“一帧重建太久”。
-inline constexpr uint32_t kShadowAdaptiveMapUpdateHighCasterThreshold = 768;
-inline constexpr uint32_t kShadowAdaptiveMapUpdateHighCasterPeriod = 4;
-inline constexpr uint32_t kShadowAdaptiveMapUpdateHugeCasterThreshold = 1536;
-inline constexpr uint32_t kShadowAdaptiveMapUpdateHugeCasterPeriod = 6;
+// 阈值对齐高压图常见 150–400 replay draws，避免永远碰不到 768。
+inline constexpr uint32_t kShadowAdaptiveMapUpdateHighCasterThreshold = 160;
+inline constexpr uint32_t kShadowAdaptiveMapUpdateHighCasterPeriod = 3;
+inline constexpr uint32_t kShadowAdaptiveMapUpdateHugeCasterThreshold = 320;
+inline constexpr uint32_t kShadowAdaptiveMapUpdateHugeCasterPeriod = 4;
 // 判定“相机稳定”的矩阵差阈值（view/proj 元素绝对差最大值）。
 inline constexpr float kShadowAdaptiveMapUpdateCameraMaxDelta = 0.0005f;
 // 判定“场景稳定”的 caster 数变化阈值。
 inline constexpr uint32_t kShadowAdaptiveMapUpdateCasterDelta = 2;
 // ShadowMap 分辨率自适应：
-// Phase 7.68：视觉验证显示树叶/细枝阴影主要受有效 CSM 分辨率影响；旧策略会在
-// replay geometry work 较高时把用户请求的 4096 静默降到 2048，导致 alpha
-// cutout 细节被 texel 稀释。性能报告同时显示近期瓶颈不在 ShadowMap 分辨率本身，
-// 因此默认保留请求分辨率，后续若需要再通过明确的质量档位重新引入。
-inline constexpr bool kShadowAdaptiveResolutionEnabled = false;
-inline constexpr uint64_t kShadowAdaptiveResolutionHighWork = 3000;
-inline constexpr uint32_t kShadowAdaptiveResolutionHigh = 2048;
-inline constexpr uint64_t kShadowAdaptiveResolutionHugeWork = 12000;
+// Phase E（2026-07-09）：仅在几何 work 极高时从 4096 降到 2048，避免高压图
+// 每帧 4 cascade × 4096 填满带宽。近景/低 work 仍用请求分辨率。
+// Phase 7.68 曾默认关；本轮只在 Huge 阈值触发，High 阈值与请求同为 2048 无额外降级。
+inline constexpr bool kShadowAdaptiveResolutionEnabled = true;
+inline constexpr uint64_t kShadowAdaptiveResolutionHighWork = 50000;
+inline constexpr uint32_t kShadowAdaptiveResolutionHigh = 4096;
+inline constexpr uint64_t kShadowAdaptiveResolutionHugeWork = 200000;
 inline constexpr uint32_t kShadowAdaptiveResolutionHuge = 2048;
 inline constexpr uint32_t kShadowAdaptiveResolutionMin = 2048;
 // 自适应更新是否感知太阳运动（太阳移动时强制每帧更新 ShadowMap）。
@@ -956,6 +1017,32 @@ inline constexpr float kShadowCascadeCullBuildingExtraGuardNdc = 0.10f;
 // 超大 draw（索引/顶点阈值）按保守剔除处理时的放大参数。
 inline constexpr float kShadowCascadeCullLargeDrawRadiusScale = 1.20f;
 inline constexpr float kShadowCascadeCullLargeDrawExtraGuardNdc = 0.06f;
+// S1 terrain 作为 CSM 遮挡体后必须有 tile bounds，否则每个地形 tile 会被
+// 保守画进全部级联。静态 VB 直接按 slice 做 TLS 缓存；War3 的 S1 地形
+// 常走 per-draw UP 上传，此时用原始上传源作为稳定 key，value 仍由当次
+// draw 的真实 UP slice 扫描得出，只作用于 stage 1 terrain。
+inline constexpr bool kShadowCascadeCullTerrainWithBounds = true;
+inline constexpr float kShadowCascadeCullTerrainRadiusScale = 1.25f;
+inline constexpr float kShadowCascadeCullTerrainExtraGuardNdc = 0.20f;
+inline constexpr bool kShadowS1TerrainBoundsCacheUploadSourceKeyEnabled = true;
+// 当前专用地图验证显示 dynamic slice/content-key 路径命中率只有约 1-2%：
+// War3 会持续重建/搬移动面地形 VB。默认关闭，避免为低命中率额外采样。
+inline constexpr bool kShadowS1TerrainBoundsCacheDynamicSliceKeyEnabled = false;
+// S1 terrain bounds cache 低频诊断。按需开启，用于确认 bounds 裁剪是否
+// 命中静态 VB / UP source-key cache，或仍在动态上传路径反复扫描 VB。
+inline constexpr bool kShadowS1TerrainBoundsCacheStatsLogging = false;
+inline constexpr uint32_t kShadowS1TerrainBoundsCacheStatsInterval = 4096u;
+// 仅作用于 stage 1 terrain caster 的 shadow-map 深度偏移（NDC 深度）。
+// 目标：S1 仍可挡住高地单位阴影向低层穿透，但减少地形自身/悬崖边缘
+// 因同面采样产生的大面积暗斑。不要改全局 caster/receiver bias。
+// S1 terrain participates in CSM as a normal caster/occluder by default.
+// The caster-kind mask experiment suppresses terrain-as-caster pixels in the
+// receiver, but that also removes visible cliff/terrain shadows. Keep it off
+// for production until the layered-terrain leak fix is redesigned.
+inline constexpr bool kShadowS1TerrainCasterMaskEnabled = false;
+inline constexpr float kShadowS1TerrainCasterMaskDepthEpsilon = 0.0005f;
+inline constexpr bool kShadowS1TerrainCasterDepthBiasEnabled = false;
+inline constexpr float kShadowS1TerrainCasterDepthBiasNdc = 0.0f;
 // 判定“太阳在移动”的最小角度阈值（单位：度）。
 inline constexpr float kShadowSunMotionThresholdDeg = 0.05f;
 // 太阳移动时是否强制关闭 stable snap（避免 texel snapping 台阶导致的抖动）。
@@ -982,6 +1069,17 @@ inline constexpr bool kShadowTimeAdaptiveSpeedEnabled = true;
 // 阴影运行统计日志（含矩阵信息）默认关闭，避免输出通道导致主线程周期性抖动。
 inline constexpr bool kShadowRunStatsLogging = false;
 inline constexpr uint32_t kShadowRunStatsLogIntervalFrames = 300;
+// 下面几类日志属于临时取证/教学输出，默认关闭；需要复查 LOSBlocker、
+// S1 terrain 或 VB cache 突发时再显式打开对应环境变量/配置。
+inline constexpr bool kShadowCaptureStageProbeLogging = false;
+inline constexpr bool kShadowReplayDrawSurveyLogging = false;
+inline constexpr bool kShadowCasterCompositionLogging = false;
+inline constexpr bool kShadowVbAllocSpikeLogging = false;
+inline constexpr bool kVolumetricLightDebugFlipUvX = false;
+inline constexpr bool kVolumetricLightDebugFlipUvY = false;
+inline constexpr bool kVolumetricLightDebugFlipSunRaySign = false;
+inline constexpr bool kVolumetricLightDebugDisableNearFade = false;
+inline constexpr bool kVolumetricLightDebugFlipDepthDelta = false;
 
 // ========================================================================
 // 路径阻断器诊断 (Path Blocker Debug)
@@ -1001,14 +1099,40 @@ inline bool kPathBlockerDrawTimeSweepEnabled = true;
 // 导致同一 caster 在“保留 / 置空”之间逐帧抖动，因此保持显式 opt-in。
 inline bool kPathBlockerDrawTimeSweepHandleFallbackEnabled = false;
 
-// Phase 7.156：匿名 rigid marker 兜底。
-// 最新实机日志显示仍有 rawcode=0 / handle=0 / no-widget 的小型 rigid caster
-// 进入 ShadowMap；它们多出现在 Terrain/Decorations 阶段，且常被污染为
-// ObjectKind::Unit。Phase 7.155 的宽泛 vtx<=200 规则误杀了真实单位子网格，
-// 因此这里仅作为“完全匿名 + rigid + 无稳定单位资源/动态姿态”的最后防线。
-inline constexpr bool kPathBlockerAnonymousRigidMarkerGateEnabled = true;
+// Phase 7.156：匿名 rigid marker 兜底（默认关闭）。
+// 早期宽泛 vtx<=200 规则能捞到一部分 rawcode=0 的 blocker，但也有误杀真实
+// 单位子网格的风险。稳定默认只使用身份命中和下面的 LOSBlocker.mdl 几何指纹；
+// 这个宽兜底保留为诊断开关。
+inline constexpr bool kPathBlockerAnonymousRigidMarkerGateEnabled = false;
+// Stage 11 匿名 rigid 兜底同样默认关闭，避免把 CUnit 阶段里丢失身份的真实
+// 子模型当成 path blocker。LOSBlocker.mdl 走 below-ground flat marker 规则。
+inline constexpr bool kPathBlockerStage11AnonymousRigidMarkerGateEnabled = false;
 inline constexpr uint32_t kPathBlockerAnonymousRigidMarkerMaxVertices = 200u;
 inline constexpr uint32_t kPathBlockerAnonymousRigidMarkerMaxIndices = 900u;
+// Invisible alpha-blend rigid culling is a broad diagnostic escape hatch.
+// LOSBlocker.mdl itself is an opaque below-ground quad, so the stable default
+// keeps this off and uses the narrower geometry fingerprint below.
+inline constexpr bool kPathBlockerRejectInvisibleAlphaBlendRigidCasterEnabled =
+    false;
+// 专用兜底：实机专用地图确认 LOSBlocker 会以 rawcode=0 / handle=0 /
+// vtx=4 / idx=6 的匿名 rigid 小平面进入 CSM，此时顶点已进入世界空间，
+// 不能再依赖 local Z ~= -9.72。这个 gate 只认极小三角面，不打开上面的
+// vtx<=200 宽兜底。
+inline constexpr bool kPathBlockerAnonymousSmallFlatMarkerGateEnabled = true;
+// LOSBlocker.mdl is an opaque 4-vertex quad placed below model origin
+// (local Z ~= -9.72). Warcraft hides it in the normal pass through terrain
+// depth, but CSM must explicitly reject it as a marker caster.
+inline constexpr bool kPathBlockerBelowGroundFlatMarkerGateEnabled = true;
+// Keep unreadable-VB tiny geometry as an explicit diagnostic fallback. The
+// production-safe path requires readable local bounds proving the marker sits
+// below the model origin, or a stable rawcode/jHandle/widget identity hit.
+inline constexpr bool kPathBlockerBelowGroundFlatMarkerUnreadableFallbackEnabled =
+    false;
+inline constexpr uint32_t kPathBlockerBelowGroundFlatMarkerMaxVertices = 8u;
+inline constexpr uint32_t kPathBlockerBelowGroundFlatMarkerMaxIndices = 12u;
+inline constexpr float kPathBlockerBelowGroundFlatMarkerMaxLocalZ = -1.0f;
+inline constexpr float kPathBlockerBelowGroundFlatMarkerMaxZSpan = 1.0f;
+inline constexpr float kPathBlockerBelowGroundFlatMarkerMaxXYExtent = 64.0f;
 
 // ========================================================================
 // Phase 7.123：draw-time VB cache 单帧 GPU buffer alloc 预算
@@ -1174,9 +1298,22 @@ inline constexpr bool kNativeShadowCUnitUiBuildingShadowHookEnabled = true;
 inline constexpr bool kNativeShadowBlockCUnitUiBuildingShadowByDefault = true;
 inline constexpr bool kNativeShadowBlockCUnitUiBuildingShadowWhenMode1 = true;
 inline constexpr bool kNativeShadowBlockCUnitUiBuildingShadowWhenMode2 = true;
-inline constexpr bool kNativeShadowCUnitUiBuildingShadowStatsLogging = true;
+// 生产默认关闭：加载期 hook 已有 BLOCK 行为，统计日志只在定位时打开。
+inline constexpr bool kNativeShadowCUnitUiBuildingShadowStatsLogging = false;
 inline constexpr uint32_t kNativeShadowCUnitUiBuildingShadowStatsInterval = 128;
 inline constexpr bool kNativeShadowCUnitUiBuildingShadowVerboseLogging = false;
+
+// UnitUI.slk unitShadow producer 端治理（旧版单位脚下黑色 blob/圆影）。
+// IDA 复核：CUnitUIManager_RecordSetUnitShadow(0x3358C0) 写 type record +0x4C；
+// UberSplat/HMED 走 +0x48，buildingShadow 走 +0x50。默认只清 unitShadow /
+// buildingShadow 两个阴影字段，保留 +0x48 建筑地面纹理。
+inline constexpr bool kNativeShadowCUnitUiUnitShadowHookEnabled = true;
+inline constexpr bool kNativeShadowBlockCUnitUiUnitShadowByDefault = true;
+inline constexpr bool kNativeShadowBlockCUnitUiUnitShadowWhenMode1 = true;
+inline constexpr bool kNativeShadowBlockCUnitUiUnitShadowWhenMode2 = true;
+inline constexpr bool kNativeShadowCUnitUiUnitShadowStatsLogging = false;
+inline constexpr uint32_t kNativeShadowCUnitUiUnitShadowStatsInterval = 128;
+inline constexpr bool kNativeShadowCUnitUiUnitShadowVerboseLogging = false;
 
 // ========================================================================
 // CDoodads 贴花阴影治理（2026-05-30 接手：魔兽自带静态阴影禁用 + path blocker）
@@ -1190,11 +1327,13 @@ inline constexpr bool kNativeShadowCUnitUiBuildingShadowVerboseLogging = false;
 // (ShadowPath_StaticStamp_Toggle 0x74E420)，**没有拦这两条 RegisterImage 贴花
 // 路径**，所以魔兽自带的树木/装饰物地面贴花阴影一直可见。
 //
-// 该实验曾用于 create / EnableFeatures / TOD-refresh caller 覆盖验证。
-// 2026-07-08 后默认关闭，避免与 UnitUI buildingShadow 生产主路径混杂。
-inline constexpr bool kNativeShadowDoodadStampHookEnabled = false;
-// mode=1（仅雾/边界）时屏蔽 doodad 静态贴花阴影注册。
-inline constexpr bool kNativeShadowBlockDoodadStaticStampWhenMode1 = true;
+// Hook 保持安装，以便同一 DLL 通过运行时环境变量做精确 A/B。默认行为仍是
+// 完整透传，不改变任何原生贴花：只有
+// DXVK_WAR3_BLOCK_NATIVE_DOODAD_STATIC_SHADOW=1 才允许 type=0 enable 写入被阻断。
+inline constexpr bool kNativeShadowDoodadStampHookEnabled = true;
+inline constexpr bool kNativeDoodadStaticStampRuntimeGateDefault = false;
+// 旧 mode=1 策略保留为历史配置，但显式关闭；运行时 gate 是唯一授权源。
+inline constexpr bool kNativeShadowBlockDoodadStaticStampWhenMode1 = false;
 // mode=1 时屏蔽 doodad emitter 贴花阴影注册。
 inline constexpr bool kNativeShadowBlockDoodadEmitterStampWhenMode1 = true;
 // doodad 贴花阴影拦截统计日志（低频，默认开启用于验证 hook 命中）。
@@ -1261,11 +1400,9 @@ inline constexpr bool kNativeShadowProjectorFourCCFilterEnabled = true;
 // 影子投影器调试日志（打印少量关键数据）
 inline constexpr bool kNativeShadowProjectorVerboseLogging = false;
 
-// 影子投影器低频统计日志（calls/blocked/path 分布）
-// Phase 7.130：默认打开，让用户起床后能直接在 dxvk.log 里看到 ShadowProjector
-// 是否真的 fire（验证 path blocker 视觉残留是否走这条 native projector 路径）。
-// 频率：calls % 4000，每 4000 次写 1 行，开销可忽略。
-inline constexpr bool kNativeShadowProjectorStatsLogging = true;
+// 影子投影器低频统计日志（calls/blocked/path 分布）。
+// 生产默认关闭；需要定位 native projector 时再开。
+inline constexpr bool kNativeShadowProjectorStatsLogging = false;
 
 // 需要拦截的 UberSplat 关键字（用于建筑阴影）
 // 说明：这些 key 通常来自单位数据表的 UberSplat 字段（例如 OLAR）。
@@ -1307,10 +1444,44 @@ inline constexpr uint32_t kPathBlockerFourCCs[] = {
     0x59546663u, // 'YTfc' - 路径阻断器(全部)(大)
     0x59546C62u, // 'YTlb' - 视野阻断器
     0x59546C63u, // 'YTlc' - 视野阻断器(大)
-    0x68666F6Fu,
 };
 inline constexpr uint32_t kPathBlockerFourCCsCount =
     sizeof(kPathBlockerFourCCs) / sizeof(kPathBlockerFourCCs[0]);
+
+inline constexpr uint32_t NormalizePathBlockerFourCc(uint32_t rawcode) {
+  if (rawcode == 0u)
+    return 0u;
+
+  const uint32_t swapped =
+      ((rawcode & 0xFFu) << 24) | ((rawcode & 0xFF00u) << 8) |
+      ((rawcode >> 8) & 0xFF00u) | ((rawcode >> 24) & 0xFFu);
+
+  const uint32_t rawC0 = (rawcode >> 24) & 0xFFu;
+  const uint32_t rawC1 = (rawcode >> 16) & 0xFFu;
+  const bool rawLooksLikeEditorOrder =
+      rawC0 == static_cast<uint32_t>('Y') &&
+      (rawC1 == static_cast<uint32_t>('T') ||
+       rawC1 == static_cast<uint32_t>('t'));
+
+  uint32_t normalized = rawLooksLikeEditorOrder ? rawcode : swapped;
+  const uint32_t c1 = (normalized >> 16) & 0xFFu;
+  if (c1 >= static_cast<uint32_t>('a') &&
+      c1 <= static_cast<uint32_t>('z')) {
+    normalized = (normalized & 0xFF00FFFFu) | ((c1 - 0x20u) << 16);
+  }
+  return normalized;
+}
+
+inline constexpr bool IsPathBlockerFourCc(uint32_t rawcode) {
+  if (rawcode == 0u)
+    return false;
+  const uint32_t normalized = NormalizePathBlockerFourCc(rawcode);
+  for (uint32_t i = 0u; i < kPathBlockerFourCCsCount; ++i) {
+    if (normalized == kPathBlockerFourCCs[i])
+      return true;
+  }
+  return false;
+}
 
 // 兼容旧名字（Phase 7.108 之前 Hook_ShadowProjector 使用的别名）。
 // 新代码统一用 kPathBlockerFourCCs；旧引用通过 alias 指向同一份数据。
@@ -1393,12 +1564,13 @@ inline constexpr bool kNativeShadowRegisterBlockShadowTextureKeyWhenMode1 = true
 
 // mode=1 时是否拦截 WithParams + UberSplat。
 // 说明：
-// - 历史实测中静态阴影残留会以 WithParams + Human/Orc/Undead/*UberSplat
-//   形式继续注册；mode1 目标是禁用 War3 原生静态阴影，因此默认阻断。
-// - 如后续实机确认某些地图依赖非阴影 UberSplat 贴花，可单独收窄 key 规则，
-//   不回退 RegisterImage 上游主控。
+// - 旧实验曾把 UberSplat 当作建筑静态阴影残留处理。
+// - 2026-07-08 IDA 复核确认 UnitUI type record +0x48 为合法建筑地面贴花
+//   key（例如国王祭坛 HMED），不能再默认阻断。
+// - 真正的建筑静态阴影走 +0x50 buildingShadow；旧单位黑色 blob 走 +0x4C
+//   unitShadow，均已前移到 CUnitUI producer gate。
 inline constexpr bool kNativeShadowRegisterBlockWithParamsUberSplatWhenMode1 =
-    true;
+    false;
 
 // 是否启用 RegisterImage owner 类型过滤（Building/Destructible 精确拦截）。
 inline constexpr bool kNativeShadowRegisterOwnerKindFilterEnabled = true;
@@ -1435,27 +1607,33 @@ inline constexpr bool kNativeShadowListAStatsLogging = false;
 // 稳定解决；ListB 保留为默认移除，用来干掉老版单位脚下黑色 blob 圆影。
 inline constexpr bool kNativeShadowListBHookEnabled = true;
 
-// 生产默认：不依赖 NativeShadowMode，直接拦截全部 ListB。
+// 生产默认：不依赖 NativeShadowMode，直接拦截 ListB 非 type4 条目。
 inline constexpr bool kNativeShadowListBBlockAllByDefault = true;
+
+// ListB type=4 也承载 S19 建筑地面贴花 / UberSplat（例如国王祭坛 HMED）。
+// 不能再被“单位黑圆影”策略粗暴全拦；单位 blob 现在由 +0x4C producer gate 清理。
+inline constexpr bool kNativeShadowListBPreserveType4ByDefault = true;
 
 // mode=1 时是否拦截 type=4（stage14 直调链路）
 inline constexpr bool kNativeShadowListBBlockType4WhenMode1 = false;
 
 // mode=1 时拦截 type=4 是否仅限 stage14 调用点（return RVA=0x007378FA）。
-// 历史实验开关；当前默认全阻断 ListB 时不会走到这条细分规则。
+// 历史实验开关；当前默认保留 type4，因此不会走到这条细分规则。
 inline constexpr bool kNativeShadowListBType4Stage14OnlyWhenMode1 = false;
 
 // mode=1 时是否拦截 type=3（静态阴影残留常见路径）
 inline constexpr bool kNativeShadowListBBlockType3WhenMode1 = false;
 
-// mode=1 时是否拦截全部 ListB（极限诊断开关）
-inline constexpr bool kNativeShadowListBBlockAllWhenMode1 = true;
+// mode=1 时是否拦截全部 ListB（极限诊断开关）。
+// 默认关闭，避免在切到 mode1 调试时误杀 type4 UberSplat/HMED。
+inline constexpr bool kNativeShadowListBBlockAllWhenMode1 = false;
 
-// mode>=2 时是否拦截全部 ListB
+// mode>=2 时是否拦截全部 ListB。Hook 仍会优先遵守
+// kNativeShadowListBPreserveType4ByDefault，避免误杀 UberSplat/HMED。
 inline constexpr bool kNativeShadowListBBlockAllWhenMode2 = true;
 
-// ListB 低频统计日志
-inline constexpr bool kNativeShadowListBStatsLogging = true;
+// ListB 低频统计日志（生产默认关闭）
+inline constexpr bool kNativeShadowListBStatsLogging = false;
 
 // ListB 详细日志
 inline constexpr bool kNativeShadowListBVerboseLogging = false;

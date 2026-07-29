@@ -22,18 +22,44 @@ uniform push_block {
   mat4 p_mvp;              // 统一: lightVP（非混合物体的 worldMatrix 从 SSBO 读取）
   uint p_paletteOffset;    // 混合: paletteIndex * 256；非混合: objectBase + drawIndex
   uint p_blendCount;       // 0..3
-  uint p_flags;            // bit0=useBlend, bit1=indexed, bit2=alphaTest
+  uint p_flags;            // 低位0..5沿用归档阴影语义；高位保留但不消费
   float p_alphaRef;        // Alpha阈值 (0.0-1.0)
+  uint p_samplerIndex;     // 与片段着色器布局保持一致
+  float p_terrainDepthBias;// S1 terrain caster-only NDC depth bias
+  uint p_pad0;
+  uint p_pad1;
+  vec4 p_pointLightPosRange; // xyz=点光源位置, w=范围
 };
 
+void applyTerrainDepthBias(inout vec4 clipPos) {
+  if ((p_flags & 0x10u) != 0u && p_terrainDepthBias > 0.0 && clipPos.w > 0.0) {
+    clipPos.z = min(clipPos.z + p_terrainDepthBias * clipPos.w, clipPos.w);
+  }
+}
+
 void main() {
-  // 传递UV到片段着色器
-  v_uv = in_uv;
+  vec4 position = in_pos;
+  vec2 uv = in_uv;
+  v_uv = uv;
+
+  // Diagnostic fail-safe: the complete world/light transform is already in
+  // the push constants, so this path performs no matrix-SSBO access. It is
+  // used to distinguish captured geometry faults from matrix ring lifetime
+  // faults without changing the vertex/index buffers under test.
+  if ((p_flags & 0x40u) != 0u) {
+    vec4 clipPos = position * p_mvp;
+    applyTerrainDepthBias(clipPos);
+    gl_Position = clipPos;
+    return;
+  }
 
   // 非混合模式：GPU 端 MVP 计算（worldMatrix 从 SSBO 读取）
   if ((p_flags & 0x1u) == 0u) {
     mat4 wm = u_worldMatrices[p_paletteOffset + uint(gl_InstanceIndex)];
-    gl_Position = (in_pos * wm) * p_mvp;
+    vec4 worldPos = position * wm;
+    vec4 clipPos = worldPos * p_mvp;
+    applyTerrainDepthBias(clipPos);
+    gl_Position = clipPos;
     return;
   }
 
@@ -58,8 +84,10 @@ void main() {
     }
 
     mat4 wm = u_worldMatrices[p_paletteOffset + idx];
-    sum += (in_pos * wm) * w;
+    sum += (position * wm) * w;
   }
 
-  gl_Position = sum * p_mvp;
+  vec4 clipPos = sum * p_mvp;
+  applyTerrainDepthBias(clipPos);
+  gl_Position = clipPos;
 }

@@ -74,9 +74,35 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x368E30, // worldObjectsRenderGroup
       0x13A5E0, // dispatchCommon
       0x13A780, // dispatchSpecial
-      0x138F70, // applyDrawStateAndDraw (ApplyDrawStateAndSamplerPair -> Gx draw)
+      0x138EE0, // applyDrawStateAndSamplerPair (__fastcall, ret 4)
+      0x138F70, // applyDrawStateAndDraw (prepared-slice probe inner wrapper)
+      0x0EEA50, // gxDeviceD3dDynamicVertexUpload (__thiscall, ret 34h)
       0x1380A0, // flushSortedItems
       0x737110, // terrainRenderAllTiles
+      0x0D2370, // worldPrepareCameraBuildFrustum (__fastcall, ECX/EDX + 1 stack arg)
+      0x76EF80, // worldPrepareTerrainShadowFlush (__fastcall, ECX/EDX)
+      0x770670, // worldPrepareTerrainExtraPass (__fastcall, ECX/EDX + float)
+      0x76D920, // worldPrepareShadowProjectorFlush (__cdecl)
+      0x3702A0, // worldPrepareTargetIndicatorRingAdvance (__thiscall + float)
+      0x3B6600, // worldPrepareCinematicFilterTimeAdvance (__thiscall + float)
+      0x3B8760, // worldPrepareRuntimeFlagClockAdvance3B8760 (__thiscall + float)
+      0x368E00, // worldPrepareFlushDeferredSelectionObjects (__thiscall)
+      0x3AC130, // worldPrepareGlobalRenderCallbackPass (__thiscall, ECX token)
+      0x369370, // worldPrepareRenderWaypointIndicators (__thiscall + float + ptr)
+      0x0A2300, // worldPrepareFrameUpdateGate (__thiscall + 3 args)
+      0x37C520, // worldPrepareGameUiFrameSync (__thiscall)
+      0x368D60, // worldPrepareUpdateIndicatorAnchor (__thiscall)
+      0x346980, // worldPrepareCameraAdvance (__thiscall + float + ptr)
+      0x0E3A00, // worldPrepareCameraPrepareConstants (__thiscall)
+      0x0E3910, // worldPrepareViewProjPrepare (__thiscall)
+      0x139860, // worldPrepareSceneQueryFlushSync (__cdecl)
+      0x0528B0, // worldPrepareFixedPointRemap (__fastcall + 1 stack arg)
+      0x378420, // worldPreparePostVisibilityGlobalAdvanceA (__cdecl)
+      0x377FD0, // worldPreparePostVisibilityFrameAnchorUpdate (__thiscall)
+      0x358CF0, // worldPreparePostVisibilityFrameAnchorVisibilityQuery (__fastcall)
+      0x3AC290, // worldPreparePostVisibilityGlobalAdvanceB (__cdecl)
+      0x0A2AA0, // worldPrepareVisibilityTailAdvanceA (__thiscall + 3 args)
+      0x0A2AE0, // worldPrepareVisibilityTailAdvanceB (__thiscall + 3 args)
 
       // Shadow 域
       0x737620, // terrainShadowLayer
@@ -89,6 +115,7 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x74DB30, // shadowToggleStaticStampFromObject
       0x74DE40, // shadowToggleEmitterStamp (函数入口，74DF50 为内部 call 点)
       0x74E420, // shadowPathStaticStampToggle
+      0x3358C0, // cunitUiRecordSetUnitShadow（UnitUI.slk unitShadow -> record +0x4C）
       0x335A00, // cunitUiRecordSetStructureShadow（UnitUI.slk buildingShadow -> record +0x50）
       0x764AC0, // shadowProjectorSimpleBridge
       0x38D7A0, // shadowPathObjectProjectorRuntime

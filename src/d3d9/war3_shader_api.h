@@ -555,7 +555,17 @@ WAR3_SHADER_API bool UpdatePointLight(
     float range,
     float r, float g, float b,
     float intensity);
+WAR3_SHADER_API bool UpdatePointLightEx(
+    int32_t id,
+    float x, float y, float z,
+    float range,
+    float r, float g, float b,
+    float intensity,
+    float shadowIntensity);
+WAR3_SHADER_API bool SetPointLightShadowIntensity(int32_t id, float shadowIntensity);
 WAR3_SHADER_API bool RemovePointLight(int32_t id);
+WAR3_SHADER_API void ClearPointLights();
+WAR3_SHADER_API uint32_t GetPointLightCount();
 
 /**
  * @brief 渲染设置 API（高阶控制）
@@ -595,6 +605,16 @@ WAR3_SHADER_API bool SetShadowRimIntensity(float intensity);
 WAR3_SHADER_API bool SetShadowRimPower(float power);
 WAR3_SHADER_API bool SetPointLightsEnabled(bool enabled);
 WAR3_SHADER_API bool SetPointShadowEnabled(bool enabled);
+WAR3_SHADER_API bool SetPointShadowBias(float bias);
+WAR3_SHADER_API bool SetVolumetricLightEnabled(bool enabled);
+WAR3_SHADER_API bool SetVolumetricLightParams(
+    float intensity, float density, float weight, float decay,
+    uint32_t sampleCount);
+WAR3_SHADER_API bool SetVolumetricLightFade(
+    float fadeNear, float fadeFar, float maxRayDistance);
+WAR3_SHADER_API bool SetVolumetricHeightFog(
+    float baseHeight, float falloff, float strength);
+WAR3_SHADER_API bool SetVolumetricResolutionDivisor(uint32_t divisor);
 WAR3_SHADER_API bool SetOutlineEnabled(bool enabled);
 WAR3_SHADER_API bool SetOutlineWidth(float widthPx);
 WAR3_SHADER_API bool SetOutlineColor(float r, float g, float b, float a);
