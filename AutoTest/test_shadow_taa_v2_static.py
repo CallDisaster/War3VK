@@ -50,6 +50,51 @@ class ShadowTaaV2StaticTests(unittest.TestCase):
         self.assertIn("reactive", SHADER)
         self.assertIn("max(blend, 0.30)", SHADER)
 
+    def test_variance_clipping_is_center_anchored_and_reactive(self):
+        for token in (
+            "vec2 visibilityMoments",
+            "meanVisibility",
+            "float variance = max(",
+            "float sigma = sqrt(variance)",
+            "float gamma = mix(0.85, 1.10, edgeFactor)",
+            "min(currVis, meanVisibility - gamma * sigma)",
+            "max(currVis, meanVisibility + gamma * sigma)",
+            "float rawHistVis = histSample.r",
+            "float historyDisagreement = abs(rawHistVis - currVis)",
+            "historyRectification",
+        ):
+            self.assertIn(token, SHADER)
+        self.assertNotIn("float minN =", SHADER)
+        self.assertNotIn("float maxN =", SHADER)
+
+    def test_ordinary_shadow_evolution_is_not_a_global_history_cut(self):
+        start = SHADOW_CPP.index(
+            "if (shadowTaaTemporalActive && m_shadowHistoryValid)"
+        )
+        end = SHADOW_CPP.index(
+            "const bool shadowHistoryValidBefore", start
+        )
+        contract = SHADOW_CPP[start:end]
+        self.assertNotIn("currentCsmHash", contract)
+        self.assertNotIn("m_shadowTaaHistoryReplayContentHash", contract)
+        self.assertIn("ShadowTaaDisableOnSunMotionEnabled()", contract)
+        self.assertIn(
+            "ShadowTaaDisableForSemanticDynamicEnabled()", contract
+        )
+
+    def test_camera_cut_uses_pose_not_raw_world_scale_matrix_delta(self):
+        self.assertIn("bool ShadowTaaIsCameraCut(", SHADOW_CPP)
+        self.assertIn("const Vector4 currentEye = currentInvView[3]", SHADOW_CPP)
+        self.assertIn("shadowFarDistance * 0.10f", SHADOW_CPP)
+        self.assertIn("forwardCosine < 0.64278764f", SHADOW_CPP)
+        self.assertNotIn("if (viewProjDelta > 0.25f)", SHADOW_CPP)
+        self.assertIn("m_shadowTaaHistoryView", SHADOW_H)
+        self.assertIn(
+            "? m_shadowTaaHistoryViewProj\n"
+            "        : (m_hasPrevFrameData ? m_prevViewProj : currentViewProj)",
+            SHADOW_CPP,
+        )
+
     def test_shader_and_cpu_use_four_execution_states(self):
         self.assertIn("0 DirectInline", SHADER)
         self.assertIn("1 PrepassCurrentOnly", SHADER)

@@ -1,5 +1,49 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-07-30（点阴影径向深度恢复 + TAA 方差裁剪候选，已 commit）
+
+用户要求先保全接近发布的阴影正确性基线，再恢复失效的点光阴影并推进优化版 TAA。
+本轮先建立本地 `codex/war3-stable-producer-baseline` 检查点，未推送 GitHub；实现前
+核对 Reeves PCF、Brabec omnidirectional shadow mapping、Playdead TAA、Eurographics
+2020 TAA survey 与 temporal shadow mapping 的公式和验证边界。
+
+**点阴影根因与修复**：
+
+- cube face caster 旧路径仍绑定方向光 fragment shader，只写 face projection depth；
+  surface/volumetric receiver 却比较 `distance(light, fragment) / range`，写入域与读取域
+  不一致，导致点阴影不可见或错误。已有的专用 point caster shader 虽已编译却从未绑定。
+- `ShadowCasterPipelineKey` 新增 `pointShadowRadialDepth` 并进入 equality/hash；point pass
+  独占选择专用 fragment shader，把 face depth 还原为径向距离后写入 `gl_FragDepth`。
+  方向光 caster 保持不写 `gl_FragDepth`，避免重新触发旧 Win32 device-loss 风险；
+  mask 与 point key 组合 fail-closed。
+
+**TAA v2 优化**：
+
+- 维持 3x3 当前帧采样预算，将 min/max box clamp 换成亮度一、二阶矩的方差裁剪
+  `mu ± gamma sigma`，并由局部边缘调节 gamma；裁剪区间包含中心当前值，避免细小
+  shadow contact 被邻域均值吞掉。reactive feedback 同时响应 raw history/current 差异
+  和 rectification 幅度；保留双线性 history，未增加 Catmull-Rom 带宽。
+- 普通太阳、CSM 内容和动态 caster pose 变化不再整屏清空 history，显式调试策略仍可
+  强制旧行为。camera cut 改为相机世界位置与 forward 夹角判定；history motion UBO 使用
+  真正生成 history 的 exact view-projection，保留生命周期、投影、viewport、资源代际与
+  CSM fallback 等硬失效门。
+
+**最终验证与部署**：
+
+- 23 项 point/TAA 静态合同 PASS；Win32 build 成功并 `ninja -C build32 -n` no-work。
+- 点光矩阵 `AutoTest/artifacts/light_feature_matrix_20260730_093104.json` 为 PASS：
+  PointShadow 1,235 calls、0.986 calls/frame、GPU 0.151 ms，`deviceLost=0`。
+- TAA scripted camera-cut 96/96 帧：5,456 次 Visibility/Motion/Receiver/HistoryWrite/
+  HistoryAdvance 全闭合，camera-cut invalidation 从旧 3,489/7,021 降到 20/5,456。
+  固定太阳普通图 96/96 帧只有 2 次初始化/资源失效、0 camera cut，最大时域暗块
+  231 px；DirectInline 对照为 267 px，未见巨型三角或阴影撕裂。
+- `build32` 与 `E:\Work\War3\d3d9.dll` exact：32,517,043 bytes，SHA-256
+  `E0A1557D9F0FBD9C30D583C86E0FC02BEED520EBEB312771E5D30AA54ACA42F1`；部署前回退
+  `E:\Work\War3\d3d9.dll.bak_20260730_0999_pre_point_shadow_taa`。
+
+**发布边界**：默认仍为 DirectInline（TAA mode 0）。Temporal mode 2 已形成可验收候选，
+但在用户物理屏确认点光阴影、移动单位细影和相机运动无拖影前不得改成发布默认值。
+
 ## 🚨 2026-07-29（Stage12 当帧 source-generation 闭合 + 索引读回性能收口）
 
 本轮在 `1aaa594` Git 安全检查点之后继续处理用户物理屏仍可见的低频原点三角和

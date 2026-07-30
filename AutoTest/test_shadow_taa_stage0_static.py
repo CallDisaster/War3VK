@@ -18,6 +18,9 @@ PERF_H = (
 PERF_CPP = (
     ROOT / "src/d3d9/war3/tools/war3_perf_monitor.cpp"
 ).read_text(encoding="utf-8")
+INTERNAL_CONFIG = (
+    ROOT / "src/d3d9/war3/core/war3_internal_test_config.h"
+).read_text(encoding="utf-8")
 
 
 class ShadowTaaStage0StaticTests(unittest.TestCase):
@@ -93,6 +96,10 @@ class ShadowTaaStage0StaticTests(unittest.TestCase):
         )
         self.assertIn("shadowTaaBlockedForSunMotion", SHADOW_CPP)
         self.assertIn("shadowTaaBlockedForSemanticDynamic", SHADOW_CPP)
+        self.assertIn(
+            "kShadowDisableTaaForSemanticDynamicCasters = false",
+            INTERNAL_CONFIG,
+        )
 
     def test_fixed_frame_telemetry_and_report_snapshot_are_wired(self):
         self.assertIn("struct ShadowTaaFrameTelemetry", PERF_H)

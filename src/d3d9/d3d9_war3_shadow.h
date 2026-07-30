@@ -327,6 +327,7 @@ namespace dxvk {
             uint32_t uvBinding = 0;                    // 0=position, 1=blend, 2=separate
             bool alphaTestEnabled = false;             // 是否启用Alpha测试
             bool casterMaskEnabled = false;            // CSM caster-kind R8 output
+            bool pointShadowRadialDepth = false;       // point cube writes distance/range
             uint8_t outlineMode = 0;                   // 0=OccludedFill, 1=Silhouette
 
             bool eq(const ShadowCasterPipelineKey& other) const {
@@ -346,6 +347,7 @@ namespace dxvk {
                     && uvBinding == other.uvBinding
                     && alphaTestEnabled == other.alphaTestEnabled
                     && casterMaskEnabled == other.casterMaskEnabled
+                    && pointShadowRadialDepth == other.pointShadowRadialDepth
                     && outlineMode == other.outlineMode;
             }
             size_t hash() const {
@@ -366,6 +368,7 @@ namespace dxvk {
                 h.add(uvBinding);
                 h.add(uint32_t(alphaTestEnabled));
                 h.add(uint32_t(casterMaskEnabled));
+                h.add(uint32_t(pointShadowRadialDepth));
                 h.add(uint32_t(outlineMode));
                 return h;
             }
@@ -494,6 +497,7 @@ namespace dxvk {
         // contract that produced it. These fields are committed atomically at
         // the end of a complete Visibility+Motion+Receiver+HistoryWrite frame.
         bool m_shadowTaaHistoryContractValid = false;
+        Matrix4 m_shadowTaaHistoryView = {};
         Matrix4 m_shadowTaaHistoryViewProj = {};
         Matrix4 m_shadowTaaHistoryProjection = {};
         Vector4 m_shadowTaaHistorySunDirection =

@@ -1281,7 +1281,8 @@ void main() {
           vec2 histSample = texture(
             sampler2D(s_shadowHistory, s_samplers[nonuniformEXT(p_colorSampler)]),
             historyTexUv).rg;
-          histVis = histSample.r;
+          float rawHistVis = histSample.r;
+          histVis = rawHistVis;
           histDepth = histSample.g;
 
           // Reject disocclusion and geometry changes. The derivative-aware
@@ -1292,14 +1293,19 @@ void main() {
           float depthTolerance =
               max(0.0015, depthDerivative * 2.5 + mvLen * 0.01);
           validHistory =
-              validFloat(histDepth) &&
+              validFloat(rawHistVis) && validFloat(histDepth) &&
               abs(histDepth - currLinearDepth) <= depthTolerance;
 
-          // 邻域夹紧：阴影边缘比颜色更怕过窄 clamp，使用 3x3 给历史
-          // 一点活动空间，降低 CSM/PCF 亚像素爬动的可见度。
+          // Variance clipping (mu +/- gamma*sigma) follows the temporal-AA
+          // neighbourhood rectification model. It reuses the same 3x3 current
+          // visibility fetch budget as the old min/max clamp, but rejects an
+          // isolated stale history extreme without accepting the full local
+          // range. Anchor the interval to currVis so a one-pixel leaf/cutout
+          // shadow cannot be erased merely because its eight neighbours differ.
+          float historyRectification = 0.0;
           if (clampEnabled) {
-            float minN = currVis;
-            float maxN = currVis;
+            vec2 visibilityMoments = vec2(0.0);
+            float neighborhoodSamples = 0.0;
 
             for (int oy = -1; oy <= 1; oy++) {
               for (int ox = -1; ox <= 1; ox++) {
@@ -1311,21 +1317,41 @@ void main() {
                     sampler2D(s_shadowCurrent, s_samplers[nonuniformEXT(p_colorSampler)]),
                     np,
                     0).r;
-                  minN = min(minN, n);
-                  maxN = max(maxN, n);
+                  n = validFloat(n) ? clamp(n, 0.0, 1.0) : currVis;
+                  visibilityMoments += vec2(n, n * n);
+                  neighborhoodSamples += 1.0;
                 }
               }
             }
-            float clampPad = mix(0.008, 0.025, edgeFactor);
-            histVis = clamp(histVis, minN - clampPad, maxN + clampPad);
+            float invSamples = 1.0 / max(neighborhoodSamples, 1.0);
+            float meanVisibility = visibilityMoments.x * invSamples;
+            float variance = max(
+                visibilityMoments.y * invSamples -
+                meanVisibility * meanVisibility,
+                0.0);
+            float sigma = sqrt(variance);
+            // The survey-supported gamma range is roughly 0.75..1.25. Keep
+            // flat receivers strict and give half-shadow PCF edges more room.
+            float gamma = mix(0.85, 1.10, edgeFactor);
+            float clampPad = mix(0.006, 0.020, edgeFactor);
+            float varianceLower =
+                min(currVis, meanVisibility - gamma * sigma) - clampPad;
+            float varianceUpper =
+                max(currVis, meanVisibility + gamma * sigma) + clampPad;
+            histVis = clamp(rawHistVis,
+                            max(varianceLower, 0.0),
+                            min(varianceUpper, 1.0));
+            historyRectification = abs(rawHistVis - histVis);
           }
 
           if (validHistory) {
             // A large visibility disagreement is a reactive event (moving,
             // hidden or newly visible caster). Bias sharply toward current so
             // a disappearing shadow cannot leave a long temporal trail.
-            float reactive =
-                smoothstep(0.08, 0.35, abs(histVis - currVis));
+            float historyDisagreement = abs(rawHistVis - currVis);
+            float reactive = max(
+                smoothstep(0.08, 0.35, historyDisagreement),
+                smoothstep(0.01, 0.20, historyRectification));
             adaptiveBlend =
                 mix(adaptiveBlend, 1.0, reactive * 0.90);
             vis = mix(histVis, currVis, adaptiveBlend);

@@ -31,6 +31,7 @@
 #include <war3_outline_mask.h>
 #include <war3_shadow_caster_frag.h>
 #include <war3_shadow_caster_mask.h>
+#include <war3_shadow_caster_point_frag.h>
 #include <war3_shadow_caster_vert.h>
 #include <war3_shadow_receiver.h>
 #include <war3_shadow_visibility.h>
@@ -1440,6 +1441,58 @@ float MaxCsmAbsDelta(const War3CsmData& a, const War3CsmData& b) {
   return delta;
 }
 
+bool ShadowTaaIsCameraCut(const Matrix4& currentView,
+                          const Matrix4& historyView,
+                          float shadowFarDistance) {
+  const Matrix4 currentInvView = inverse(currentView);
+  const Matrix4 historyInvView = inverse(historyView);
+  if (!IsFiniteMatrix(currentInvView) || !IsFiniteMatrix(historyInvView))
+    return true;
+
+  const Vector4 currentEye = currentInvView[3];
+  const Vector4 historyEye = historyInvView[3];
+  const float dx = currentEye.x - historyEye.x;
+  const float dy = currentEye.y - historyEye.y;
+  const float dz = currentEye.z - historyEye.z;
+  const float positionDeltaSq = dx * dx + dy * dy + dz * dz;
+
+  // Raw view-projection elements contain world-scale translation, so a normal
+  // one-tick War3 camera pan easily exceeds an arbitrary matrix epsilon. Use
+  // camera pose instead: only a jump spanning a meaningful fraction of the
+  // active shadow range is a cut. Ordinary motion remains reprojectable.
+  const float positionCutDistance =
+      std::clamp(shadowFarDistance * 0.10f, 384.0f, 2048.0f);
+  if (!std::isfinite(positionDeltaSq) ||
+      positionDeltaSq > positionCutDistance * positionCutDistance) {
+    return true;
+  }
+
+  const Vector4 currentForward = currentInvView[2];
+  const Vector4 historyForward = historyInvView[2];
+  const float currentForwardLenSq =
+      currentForward.x * currentForward.x +
+      currentForward.y * currentForward.y +
+      currentForward.z * currentForward.z;
+  const float historyForwardLenSq =
+      historyForward.x * historyForward.x +
+      historyForward.y * historyForward.y +
+      historyForward.z * historyForward.z;
+  if (!std::isfinite(currentForwardLenSq) ||
+      !std::isfinite(historyForwardLenSq) ||
+      currentForwardLenSq <= 1.0e-8f || historyForwardLenSq <= 1.0e-8f) {
+    return true;
+  }
+
+  const float forwardCosine =
+      (currentForward.x * historyForward.x +
+       currentForward.y * historyForward.y +
+       currentForward.z * historyForward.z) /
+      std::sqrt(currentForwardLenSq * historyForwardLenSq);
+  // A >50 degree one-frame rotation is a camera cut. Smaller rotations are
+  // handled by reverse reprojection and per-pixel depth validation.
+  return !std::isfinite(forwardCosine) || forwardCosine < 0.64278764f;
+}
+
 float MaxCsmSnappedCenterDeltaTexels(
     const War3CsmData& a, const War3CsmData& b) {
   if (a.cascadeCount != b.cascadeCount)
@@ -2045,6 +2098,11 @@ War3ShadowReceiverPass::getShadowCasterPipeline(
 War3ShadowReceiverPass::ShadowCasterPipeline
 War3ShadowReceiverPass::createShadowCasterPipeline(
     const ShadowCasterPipelineKey &key) const {
+  // Caster masks are directional-CSM color outputs, whereas point shadows
+  // write radial distance into cube depth. A pipeline can never be both.
+  if (key.casterMaskEnabled && key.pointShadowRadialDepth)
+    return {};
+
   if (key.alphaTestEnabled &&
       (key.uvBinding > 2u ||
        (key.uvBinding == 0u && key.uvStride != key.positionStride) ||
@@ -2151,11 +2209,14 @@ War3ShadowReceiverPass::createShadowCasterPipeline(
 
   util::DxvkBuiltInGraphicsState state = {};
   state.vs = util::DxvkBuiltInShaderStage(war3_shadow_caster_vert, nullptr);
-  state.fs = key.casterMaskEnabled
-                 ? util::DxvkBuiltInShaderStage(war3_shadow_caster_mask,
-                                                nullptr)
-                 : util::DxvkBuiltInShaderStage(war3_shadow_caster_frag,
-                                                nullptr);
+  if (key.casterMaskEnabled) {
+    state.fs = util::DxvkBuiltInShaderStage(war3_shadow_caster_mask, nullptr);
+  } else if (key.pointShadowRadialDepth) {
+    state.fs =
+        util::DxvkBuiltInShaderStage(war3_shadow_caster_point_frag, nullptr);
+  } else {
+    state.fs = util::DxvkBuiltInShaderStage(war3_shadow_caster_frag, nullptr);
+  }
   if (key.casterMaskEnabled)
     state.colorFormat = VK_FORMAT_R8_UNORM;
   state.depthFormat = VK_FORMAT_D32_SFLOAT;
@@ -5308,6 +5369,9 @@ void War3ShadowReceiverPass::renderPointShadow(
         key.positionStride = draw.positionStride;
         key.positionOffset = draw.positionOffset;
         key.topology = draw.topology;
+        // The cube receiver compares distance/range, so point faces must bind
+        // the dedicated fragment shader that writes the same radial domain.
+        key.pointShadowRadialDepth = true;
 
         if (draw.vertexBlendEnabled && draw.vertexBlendCount > 0) {
           key.blendWeightFormat = draw.blendWeightFormat;
@@ -7942,14 +8006,20 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         historyContractInvalidation |= kShadowTaaInvalidateTaaResource;
       } else {
         const auto& historyVp = effectiveWorldCamera.viewport;
-        const float viewProjDelta =
-            MaxMatrixAbsDelta(effectiveWorldCamera.viewProj,
-                              m_shadowTaaHistoryViewProj);
         const float projectionDelta =
             MaxMatrixAbsDelta(effectiveWorldCamera.proj,
                               m_shadowTaaHistoryProjection);
-        if (viewProjDelta > 0.25f)
+        const float cameraCutFarDistance =
+            m_csmData.cascadeCount != 0u
+                ? std::max(
+                      m_csmData.cascades[m_csmData.cascadeCount - 1u].splitFar,
+                      1.0f)
+                : 5000.0f;
+        if (ShadowTaaIsCameraCut(effectiveWorldCamera.view,
+                                 m_shadowTaaHistoryView,
+                                 cameraCutFarDistance)) {
           historyContractInvalidation |= kShadowTaaInvalidateCameraCut;
+        }
         if (projectionDelta > 1.0e-5f)
           historyContractInvalidation |= kShadowTaaInvalidateProjection;
         if (historyVp.X != m_shadowTaaHistoryViewportX ||
@@ -7962,23 +8032,19 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
                 1.0e-6f) {
           historyContractInvalidation |= kShadowTaaInvalidateViewport;
         }
-        if (ShadowTaaSunDirectionDelta(
+        // Normal sun/CSM/caster evolution is a shading change on the same
+        // receiver surface. Let depth rejection, variance rectification and
+        // reactive current weighting resolve it per pixel instead of globally
+        // discarding useful history every animated frame. The two explicit
+        // environment policies below retain conservative diagnostic fallbacks.
+        if (ShadowTaaDisableOnSunMotionEnabled() &&
+            ShadowTaaSunDirectionDelta(
                 receiverSunDirSource,
                 m_shadowTaaHistorySunDirection) > 1.0e-5f) {
           historyContractInvalidation |= kShadowTaaInvalidateSun;
         }
-        const uint64_t currentCsmHash =
-            War3ContinuityHashCsm(m_csmData);
-        if (currentCsmHash != m_shadowTaaHistoryCsmHash)
-          historyContractInvalidation |= kShadowTaaInvalidateCsm;
-        if (replayHashes.contentHash !=
-                m_shadowTaaHistoryReplayContentHash ||
-            replayHashes.backingHash !=
-                m_shadowTaaHistoryReplayBackingHash) {
-          historyContractInvalidation |=
-              kShadowTaaInvalidateCasterContent;
-        }
-        if (semanticDynamicCastersActive &&
+        if (ShadowTaaDisableForSemanticDynamicEnabled() &&
+            semanticDynamicCastersActive &&
             (currentDynamicPoseSignature == 0u ||
              currentDynamicPoseSignature !=
                  m_shadowTaaHistoryDynamicPoseSignature)) {
@@ -8183,10 +8249,9 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         receiverClearRaw, receiverClearKnown ? 1.0f : 0.0f,
         war3::render::War3RawDepthQuantum(m_cachedDepthFormat), 0.0f);
 
-    // Shadow TAA / Motion Vector：上一帧 ViewProj（无上一帧时用当前帧填充，保证
-    // mv=0）
+    // Shadow TAA / Motion Vector：TemporalHistory 必须重投影到实际生成当前
+    // history image 的相机。若本帧只做调试 motion vector，则回退到普通上一帧。
     const Matrix4 currentViewProj = effectiveWorldCamera.viewProj;
-    ubo.prevViewProj = m_hasPrevFrameData ? m_prevViewProj : currentViewProj;
 
     // Shadow TAA v2 execution contract:
     //   0 DirectInline
@@ -8196,6 +8261,9 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     const bool shadowHistoryReadable =
         shadowTaaTemporalActive && m_shadowHistoryValid &&
         m_shadowTaaWasActiveLastFrame && m_hasPrevFrameData;
+    ubo.prevViewProj = shadowHistoryReadable
+        ? m_shadowTaaHistoryViewProj
+        : (m_hasPrevFrameData ? m_prevViewProj : currentViewProj);
     float taaMode = 0.0f;
     if (shadowTaaEffectiveMode == War3ShadowTaaMode::PrepassCurrentOnly) {
       taaMode = 1.0f;
@@ -8473,6 +8541,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       m_shadowHistoryIndex = historyWriteIndex;
       m_shadowHistoryValid = true;
       m_shadowTaaHistoryContractValid = true;
+      m_shadowTaaHistoryView = effectiveWorldCamera.view;
       m_shadowTaaHistoryViewProj = effectiveWorldCamera.viewProj;
       m_shadowTaaHistoryProjection = effectiveWorldCamera.proj;
       m_shadowTaaHistorySunDirection = receiverSunDirSource;

@@ -974,10 +974,10 @@ inline constexpr uint32_t kShadowAdaptiveResolutionMin = 2048;
 inline constexpr bool kShadowSunMotionAwareAdaptiveUpdate = true;
 // 太阳移动时是否自动关闭 Shadow TAA（避免历史混入导致拖影/波动）。
 inline constexpr bool kShadowSunMotionAwareTaaDisable = false;
-// Semantic dynamic unit shadows are driven by current-draw contracts. Until the
-// receiver has per-caster motion vectors, temporal shadow history can blend an
-// old/static shadow state with the current skinned pose and look like flicker.
-inline constexpr bool kShadowDisableTaaForSemanticDynamicCasters = true;
+// Dynamic caster motion changes shadow visibility, not receiver geometry.
+// Depth rejection, variance clipping and reactive current weighting handle it
+// per pixel; an opt-in environment override remains for diagnostic A/B runs.
+inline constexpr bool kShadowDisableTaaForSemanticDynamicCasters = false;
 // If the receiver reaches a frame with a non-world/invalid CSM candidate after
 // a complete shadow map has already been rendered, keep the last-good map
 // instead of clearing/redrawing it with a likely UI/portrait draw list.
