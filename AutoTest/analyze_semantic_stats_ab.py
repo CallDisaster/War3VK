@@ -35,6 +35,15 @@ def _find_section(report: dict[str, Any], suffix: str) -> dict[str, Any]:
     return {}
 
 
+def _find_section_percentiles(
+    report: dict[str, Any], suffix: str
+) -> dict[str, Any]:
+    for path, entry in report.get("sectionPercentiles", {}).items():
+        if str(path).endswith(suffix):
+            return entry
+    return {}
+
+
 def load_run(path: pathlib.Path) -> dict[str, Any]:
     artifact = json.loads(path.read_text(encoding="utf-8"))
     result = artifact.get("result", artifact)
@@ -56,7 +65,9 @@ def load_run(path: pathlib.Path) -> dict[str, Any]:
         )
     }
     paths = {
+        "Populate": "/Populate",
         "DirectGrouped": "/Populate/DirectGrouped",
+        "SnapshotPreselect": "/Populate/DirectGrouped/SnapshotPreselect",
         "BuildEligible": "/Populate/DirectGrouped/BuildEligible",
         "Submit": "/Populate/DirectGrouped/Submit",
         "ShadowCapture": "ShadowCapture",
@@ -81,6 +92,17 @@ def load_run(path: pathlib.Path) -> dict[str, Any]:
         "workloadPerFrame": workload,
         "sections": {
             name: float(_find_section(report, suffix).get("avgCpuMs", 0.0))
+            for name, suffix in paths.items()
+        },
+        "sectionPercentiles": {
+            name: {
+                percentile: float(
+                    _find_section_percentiles(report, suffix).get(
+                        percentile, 0.0
+                    )
+                )
+                for percentile in ("p50", "p95")
+            }
             for name, suffix in paths.items()
         },
         "integrity": {
@@ -119,6 +141,22 @@ def compare(optimized: dict[str, Any], exact: dict[str, Any]) -> dict[str, Any]:
         "directGroupedPct": delta_pct(
             optimized["sections"]["DirectGrouped"],
             exact["sections"]["DirectGrouped"],
+        ),
+        "directGroupedP95Pct": delta_pct(
+            optimized["sectionPercentiles"]["DirectGrouped"]["p95"],
+            exact["sectionPercentiles"]["DirectGrouped"]["p95"],
+        ),
+        "populatePct": delta_pct(
+            optimized["sections"]["Populate"],
+            exact["sections"]["Populate"],
+        ),
+        "populateP95Pct": delta_pct(
+            optimized["sectionPercentiles"]["Populate"]["p95"],
+            exact["sectionPercentiles"]["Populate"]["p95"],
+        ),
+        "snapshotPreselectPct": delta_pct(
+            optimized["sections"]["SnapshotPreselect"],
+            exact["sections"]["SnapshotPreselect"],
         ),
         "submitPct": delta_pct(
             optimized["sections"]["Submit"], exact["sections"]["Submit"]

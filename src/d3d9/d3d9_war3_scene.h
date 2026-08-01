@@ -677,6 +677,11 @@ namespace dxvk {
         uint32_t semanticSceneCompactWorkTableSealedCount = 0;
         uint32_t semanticSceneCompactWorkTableConsumedCount = 0;
         uint32_t semanticSceneCompactWorkTableFallbackCount = 0;
+        uint32_t semanticSceneCompactWorkTableRejectStageCount = 0;
+        uint32_t semanticSceneCompactWorkTableRejectFreshnessCount = 0;
+        uint32_t semanticSceneCompactWorkTableRejectPolicyCount = 0;
+        uint32_t semanticSceneCompactWorkTableRejectFrameCount = 0;
+        uint32_t semanticSceneCompactWorkTableRejectIdentityCount = 0;
         uint32_t semanticSceneCompactWorkTableMismatchCount = 0;
         uint32_t semanticSceneRejectedPathBlockerProducerCount = 0;
         uint32_t semanticSceneRejectedPathBlockerStaticSupplementCount = 0;

@@ -6232,6 +6232,16 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneCompactWorkTableConsumedCount;
     summary.semanticSceneCompactWorkTableFallbackCount =
         g_shadowSceneStats.semanticSceneCompactWorkTableFallbackCount;
+    summary.semanticSceneCompactWorkTableRejectStageCount =
+        g_shadowSceneStats.semanticSceneCompactWorkTableRejectStageCount;
+    summary.semanticSceneCompactWorkTableRejectFreshnessCount =
+        g_shadowSceneStats.semanticSceneCompactWorkTableRejectFreshnessCount;
+    summary.semanticSceneCompactWorkTableRejectPolicyCount =
+        g_shadowSceneStats.semanticSceneCompactWorkTableRejectPolicyCount;
+    summary.semanticSceneCompactWorkTableRejectFrameCount =
+        g_shadowSceneStats.semanticSceneCompactWorkTableRejectFrameCount;
+    summary.semanticSceneCompactWorkTableRejectIdentityCount =
+        g_shadowSceneStats.semanticSceneCompactWorkTableRejectIdentityCount;
     summary.semanticSceneCompactWorkTableMismatchCount =
         g_shadowSceneStats.semanticSceneCompactWorkTableMismatchCount;
     summary.semanticSceneDirectLastSubmittedRecordCount =

@@ -739,6 +739,11 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneCompactWorkTableSealedCount = 0;
   uint64_t semanticSceneCompactWorkTableConsumedCount = 0;
   uint64_t semanticSceneCompactWorkTableFallbackCount = 0;
+  uint64_t semanticSceneCompactWorkTableRejectStageCount = 0;
+  uint64_t semanticSceneCompactWorkTableRejectFreshnessCount = 0;
+  uint64_t semanticSceneCompactWorkTableRejectPolicyCount = 0;
+  uint64_t semanticSceneCompactWorkTableRejectFrameCount = 0;
+  uint64_t semanticSceneCompactWorkTableRejectIdentityCount = 0;
   uint64_t semanticSceneCompactWorkTableMismatchCount = 0;
   uint64_t semanticSceneDirectLastSubmittedRecordCount = 0;
   uint64_t semanticSceneDirectLastUniqueObjectCount = 0;

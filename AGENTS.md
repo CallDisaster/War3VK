@@ -1,5 +1,48 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（Compact WorkTable 严格封存与性能准入，默认仍关闭）
+
+本轮先完成三套仅本地安全检查点，再在 `b021c26` 的 generation-tagged
+Compact WorkTable 上修复封存判据并完成 Observe/Consume 准入；没有 push，危险
+跨帧 cache、fast append、prebuild bypass 和 source fingerprint reuse 继续默认关闭。
+
+**封存修复与控制面**：
+
+- `record.known` 表示旧 palette/group resolver 是否完成，并非 source freshness。
+  封存现在只接受同帧 Stage11 producer、fresh/non-grace、当前 policy revision、
+  exact frame/render/evidence generation 以及完整 part/payload/capture identity；其余
+  全部回 canonical 路径。
+- 新增 Stage/Freshness/Policy/Frame/Identity 拒绝分账。高压图约 50.6% 条目满足
+  strict seal，其余均因 freshness/frame 不满足而安全回退；没有放宽 grace。
+- evidence builder 先完成廉价 seal，再按 canonical 早退顺序计算 owner、static、
+  policy、blocker 和 selection。stale、exact-owned 等记录不再白做 registry hash/
+  sticky lookup。Observe 的 `SnapshotPreselect` ABBA 均值为 0.1265 ms，对照 Off
+  0.1270 ms，低于 0.15 ms 基础设施门。
+- Consume 仍是实验模式。160 帧正确性闭合，但两轮无 trace 性能为
+  `DirectGrouped=1.73/1.74 ms`、`Populate=1.96/1.97 ms`，且 p95 超过 2.25 ms，
+  workload 没减少，因此未通过准入。发布默认保持 Off，不以“换一条控制路径”冒充
+  优化收益。
+
+**证据与构建**：
+
+- Observe 低磁盘门：
+  `AutoTest/artifacts/compact_worktable_observe_sealfix_cap160_20260802.json`，
+  trace 458.18 MiB，160/160 join；191,282 records，alpha gap、blocker leak、mixed
+  representation、unexplained disappearance、parse error 全 0，稳态最大暗块 300 px。
+- Consume 门：
+  `AutoTest/artifacts/compact_worktable_consume_trace160_20260802.json`，trace
+  443.84 MiB，160/160 join；185,296 records，同一组正确性门全 0，稳态最大暗块
+  311 px，`framesIncomplete=0 / budgetExceeded=0 / deviceLost=0`。
+- 212 项 `test_*_static.py` PASS；Win32 build 成功，`ninja -C build32 -n` no-work；
+  targeted `git diff --check` 仅既有 CRLF 警告。
+- `build32` / `E:\Work\War3\d3d9.dll` exact：32,603,558 bytes，SHA-256
+  `98B781DB175F0871A597D4CEAFB07333FEECA68BA2B6727490354C67649CA9E8`；回退副本
+  `E:\Work\War3\d3d9.dll.bak_20260802_904E_pre_compact_earlyout`，SHA-256
+  `904E91966270F5CAC49538C78B1A693D13B8E1D02608B73993F76E898B21A883`。
+
+下一阶段从默认 Off 的正确性基线推进联合消费者剔除 Observe；不能把未过性能门的
+Consume 改成默认，也不能为提高命中率放宽 freshness/frame/identity。
+
 ## 🚨 2026-08-02（固定 4096 CSM、TAA v2 状态闭合、Arena fence 与 GPU 取证）
 
 用户授权在无人监管的隔离桌面启动游戏，并要求落实 4096 CSM、TAA v2 真实开关、

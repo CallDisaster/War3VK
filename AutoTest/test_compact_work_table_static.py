@@ -14,6 +14,8 @@ SCENE = (ROOT / "src/d3d9/d3d9_war3_scene.h").read_text(
 CONTROL = (ROOT / "src/d3d9/war3/tools/war3_control_plane.cpp").read_text(
     encoding="utf-8", errors="replace"
 )
+
+
 class CompactWorkTableContracts(unittest.TestCase):
     def test_release_default_is_off_and_modes_are_bounded(self):
         block = DEVICE[
@@ -28,14 +30,25 @@ class CompactWorkTableContracts(unittest.TestCase):
 
     def test_only_exact_current_generation_items_are_sealed(self):
         start = DEVICE.index("// A compact item is consumable only")
-        end = DEVICE.index("auto& stats", start)
+        end = DEVICE.index(
+            "stats.semanticSceneCompactWorkTableCandidateCount++", start
+        )
         block = DEVICE[start:end]
+        self.assertIn("record.stage == 11", block)
+        self.assertIn("record.producerStage == 11", block)
         self.assertIn("record.producerFreshThisFrame", block)
         self.assertIn("!record.fromGrace", block)
         self.assertIn("record.stagePolicyRevision", block)
         self.assertIn("CurrentShadowStagePolicyRevision()", block)
+        self.assertIn("record.frameTag == currentFrameTag", block)
+        self.assertIn("record.visibleFrameSerial", block)
+        self.assertIn("record.renderFrameIndex == currentFrameTag", block)
+        self.assertIn("record.renderablePart != nullptr", block)
+        self.assertIn("record.meshPayloadPtr != nullptr", block)
+        self.assertIn("record.captureSerial != 0u", block)
         self.assertIn("m_war3ShadowPersistentFrameSerial", block)
         self.assertIn("War3CompactWorkSealed", block)
+        self.assertNotIn("record.known &&", block)
 
     def test_persistent_storage_is_generation_tagged_pod_soa(self):
         block = SCENE[
@@ -83,6 +96,28 @@ class CompactWorkTableContracts(unittest.TestCase):
         self.assertIn("work.priorityScore != priorityScore", block)
         self.assertIn("semanticSceneCompactWorkTableMismatchCount++", block)
 
+    def test_unsealed_and_early_rejected_items_skip_expensive_identity_work(self):
+        start = DEVICE.index("const auto buildCompactWorkEvidence")
+        end = DEVICE.index("bool recordsForBuildAlphaPrefiltered", start)
+        block = DEVICE[start:end]
+        seal_exit = block.index("if (!sealed)\n          return evidence;")
+        owner_gate = block.index("currentFrameDrawTimeProducerOwnsRecord", seal_exit)
+        static_gate = block.index("War3SemanticRawcodeLooksStaticWorldCaster", owner_gate)
+        producer_gate = block.index("ShadowProducerPolicyAllows", static_gate)
+        blocker_gate = block.index("War3ShadowIsLosBlocker", producer_gate)
+        selection_hash = block.index("War3SemanticDirectRecordSelectionKey", blocker_gate)
+        priority_score = block.index(
+            "War3SemanticDirectRecordPriorityScore", selection_hash
+        )
+        sticky_probe = block.index("wasPreviouslySubmitted", priority_score)
+        self.assertLess(seal_exit, owner_gate)
+        self.assertLess(owner_gate, static_gate)
+        self.assertLess(static_gate, producer_gate)
+        self.assertLess(producer_gate, blocker_gate)
+        self.assertLess(blocker_gate, selection_hash)
+        self.assertLess(selection_hash, priority_score)
+        self.assertLess(priority_score, sticky_probe)
+
     def test_diagnostics_are_public_and_mismatch_is_counted(self):
         for field in (
             "semanticSceneCompactWorkTableMode",
@@ -90,6 +125,11 @@ class CompactWorkTableContracts(unittest.TestCase):
             "semanticSceneCompactWorkTableSealedCount",
             "semanticSceneCompactWorkTableConsumedCount",
             "semanticSceneCompactWorkTableFallbackCount",
+            "semanticSceneCompactWorkTableRejectStageCount",
+            "semanticSceneCompactWorkTableRejectFreshnessCount",
+            "semanticSceneCompactWorkTableRejectPolicyCount",
+            "semanticSceneCompactWorkTableRejectFrameCount",
+            "semanticSceneCompactWorkTableRejectIdentityCount",
             "semanticSceneCompactWorkTableMismatchCount",
         ):
             self.assertIn(field, SCENE)

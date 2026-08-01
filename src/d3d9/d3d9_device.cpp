@@ -23709,10 +23709,64 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         War3CompactWorkItem evidence = {};
         evidence.flags = uint8_t(War3CompactWorkValid);
         evidence.frameGeneration = m_war3ShadowPersistentFrameSerial;
-        if (currentFrameDrawTimeProducerOwnsRecord(record))
+        // A compact item is consumable only when every identity and policy bit
+        // belongs to this exact producer generation. Grace and historical
+        // records remain on the canonical path.
+        const uint32_t currentFrameTag =
+            uint32_t(m_war3ShadowPersistentFrameSerial);
+        const bool stageReady =
+            record.stage == 11 && record.producerStage == 11;
+        const bool freshnessReady =
+            record.producerFreshThisFrame && !record.fromGrace;
+        const bool policyReady =
+            record.stagePolicyRevision ==
+            dxvk::war3::render::CurrentShadowStagePolicyRevision();
+        const bool frameReady =
+            record.frameTag == currentFrameTag &&
+            record.visibleFrameSerial == m_war3ShadowPersistentFrameSerial &&
+            record.renderFrameIndex == currentFrameTag &&
+            evidence.frameGeneration == m_war3ShadowPersistentFrameSerial;
+        // `known` means that the legacy palette/group resolver completed. It
+        // is intentionally not a freshness bit: Stage11 publishes exact frame
+        // identity before that optional resolver and DirectGrouped already
+        // handles its own packet/palette fallback.
+        const bool identityReady = record.renderablePart != nullptr &&
+            record.meshPayloadPtr != nullptr && record.captureSerial != 0u;
+        auto& stats = m_war3Scene.shadowStats;
+        if (!stageReady)
+          stats.semanticSceneCompactWorkTableRejectStageCount++;
+        if (!freshnessReady)
+          stats.semanticSceneCompactWorkTableRejectFreshnessCount++;
+        if (!policyReady)
+          stats.semanticSceneCompactWorkTableRejectPolicyCount++;
+        if (!frameReady)
+          stats.semanticSceneCompactWorkTableRejectFrameCount++;
+        if (!identityReady)
+          stats.semanticSceneCompactWorkTableRejectIdentityCount++;
+        const bool sealed = stageReady && freshnessReady && policyReady &&
+            frameReady && identityReady;
+        if (sealed)
+          evidence.flags |= uint8_t(War3CompactWorkSealed);
+        stats.semanticSceneCompactWorkTableCandidateCount++;
+        if (sealed)
+          stats.semanticSceneCompactWorkTableSealedCount++;
+        else
+          stats.semanticSceneCompactWorkTableFallbackCount++;
+
+        // Match the canonical preselect early-out order. In particular, do
+        // not hash selection identity or probe sticky history for an item
+        // which is stale, exact-owned, static-world, policy-rejected, or a
+        // blocker. Those values can never be consumed on that branch.
+        if (!sealed)
+          return evidence;
+        if (currentFrameDrawTimeProducerOwnsRecord(record)) {
           evidence.flags |= uint8_t(War3CompactWorkExactOwner);
-        if (War3SemanticRawcodeLooksStaticWorldCaster(record.rawcode))
+          return evidence;
+        }
+        if (War3SemanticRawcodeLooksStaticWorldCaster(record.rawcode)) {
           evidence.flags |= uint8_t(War3CompactWorkStaticWorld);
+          return evidence;
+        }
         const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
             record.stage,
             record.batchTag,
@@ -23720,33 +23774,21 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
             War3BatchTag::Unknown,
             false,
         };
-        if (dxvk::war3::render::ShadowProducerPolicyAllows(
+        if (!dxvk::war3::render::ShadowProducerPolicyAllows(
                 dxvk::war3::render::ShadowProducerKind::SemanticDirectGrouped,
                 producerContext))
-          evidence.flags |= uint8_t(War3CompactWorkProducerAllowed);
+          return evidence;
+        evidence.flags |= uint8_t(War3CompactWorkProducerAllowed);
         if (dxvk::war3::internal::kPathBlockerHideEnabled &&
-            War3ShadowIsLosBlocker(record))
+            War3ShadowIsLosBlocker(record)) {
           evidence.flags |= uint8_t(War3CompactWorkPathBlocker);
+          return evidence;
+        }
         evidence.selectionKey = War3SemanticDirectRecordSelectionKey(record);
         evidence.priorityScore =
             War3SemanticDirectRecordPriorityScore(record);
         if (wasPreviouslySubmitted(evidence.selectionKey))
           evidence.flags |= uint8_t(War3CompactWorkPreviouslySelected);
-        // A compact item is consumable only when every identity and policy bit
-        // belongs to this exact producer generation. Grace and historical
-        // records remain on the canonical path.
-        if (record.known && record.producerFreshThisFrame &&
-            !record.fromGrace &&
-            record.stagePolicyRevision ==
-                dxvk::war3::render::CurrentShadowStagePolicyRevision() &&
-            evidence.frameGeneration == m_war3ShadowPersistentFrameSerial)
-          evidence.flags |= uint8_t(War3CompactWorkSealed);
-        auto& stats = m_war3Scene.shadowStats;
-        stats.semanticSceneCompactWorkTableCandidateCount++;
-        if (War3CompactWorkHasFlag(evidence, War3CompactWorkSealed))
-          stats.semanticSceneCompactWorkTableSealedCount++;
-        else
-          stats.semanticSceneCompactWorkTableFallbackCount++;
         return evidence;
       };
   bool recordsForBuildAlphaPrefiltered = false;
