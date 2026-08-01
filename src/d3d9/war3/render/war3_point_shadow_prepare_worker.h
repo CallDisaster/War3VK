@@ -206,7 +206,11 @@ public:
   War3PointShadowPersistentPrepareWorker& operator=(
       War3PointShadowPersistentPrepareWorker&&) = delete;
 
-  War3PointShadowPrepareSubmitStatus submit(Request request) noexcept {
+  // Rejected submissions retain complete ownership in the caller. Only the
+  // Accepted path moves the request into the worker slot, allowing Busy,
+  // Stale, Stopping and Unavailable callers to synchronously process the same
+  // exact frozen request instead of rebuilding or losing its owned buffers.
+  War3PointShadowPrepareSubmitStatus submit(Request& request) noexcept {
     if (!request.generation.valid())
       return War3PointShadowPrepareSubmitStatus::InvalidGeneration;
 
@@ -236,6 +240,9 @@ public:
     state->workAvailable.notify_one();
     return War3PointShadowPrepareSubmitStatus::Accepted;
   }
+
+  War3PointShadowPrepareSubmitStatus submit(Request&& request) noexcept =
+      delete;
 
   Result tryCollectExact(
       const War3PointShadowPrepareGenerationTuple& expected) noexcept {

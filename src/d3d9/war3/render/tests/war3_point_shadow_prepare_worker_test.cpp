@@ -70,6 +70,7 @@ using TestWorker = War3PointShadowPersistentPrepareWorker<
 struct RecycleRequestPayload {
   std::vector<uint32_t> storage;
   uint32_t marker = 0u;
+  TestMode mode = TestMode::Normal;
 };
 
 struct RecycleResultPayload {
@@ -82,6 +83,12 @@ struct RecycleResultPayload {
 struct RecycleProcessor {
   RecycleResultPayload operator()(
       War3PointShadowPrepareRequest<RecycleRequestPayload>&& request) const {
+    if (request.payload.mode == TestMode::Block) {
+      std::unique_lock<std::mutex> lock(g_blockMutex);
+      g_blockEntered = true;
+      g_blockCv.notify_all();
+      g_blockCv.wait(lock, [] { return g_blockRelease; });
+    }
     const uintptr_t observedAllocation =
         reinterpret_cast<uintptr_t>(request.payload.storage.data());
     const size_t observedCapacity = request.payload.storage.capacity();
@@ -143,7 +150,7 @@ void TestOneThreadServesSequentialExactJobs() {
   for (uint64_t job = 1u; job <= 8u; ++job) {
     TestWorker::Request request{Generation(job, 1u, job, 11u),
                                 {job, TestMode::Normal}};
-    const auto submit = worker.submit(std::move(request));
+    const auto submit = worker.submit(request);
     CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
     if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
       return;
@@ -186,7 +193,7 @@ void TestOwnedVectorCapacityReturnsForNextJob() {
   CHECK(reinterpret_cast<uintptr_t>(firstRequest.payload.storage.data()) ==
         originalAllocation);
   CHECK(firstRequest.payload.storage.capacity() == originalCapacity);
-  auto submit = worker.submit(std::move(firstRequest));
+  auto submit = worker.submit(firstRequest);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
   if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
     return;
@@ -211,7 +218,7 @@ void TestOwnedVectorCapacityReturnsForNextJob() {
   CHECK(reinterpret_cast<uintptr_t>(secondRequest.payload.storage.data()) ==
         originalAllocation);
   CHECK(secondRequest.payload.storage.capacity() == originalCapacity);
-  submit = worker.submit(std::move(secondRequest));
+  submit = worker.submit(secondRequest);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
   if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
     return;
@@ -234,37 +241,129 @@ void TestSingleFlightBackpressureAndMonotonicJobs() {
   ResetBlock();
   TestWorker worker;
   const auto firstGeneration = Generation(1u, 2u, 10u, 3u);
-  auto submit = worker.submit(
-      {firstGeneration, {3u, TestMode::Block}});
+  TestWorker::Request firstRequest{
+      firstGeneration, {3u, TestMode::Block}};
+  auto submit = worker.submit(firstRequest);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
   if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
     return;
   CHECK(WaitForBlockEntry());
 
-  submit = worker.submit(
-      {Generation(2u, 2u, 11u, 3u), {4u, TestMode::Normal}});
+  TestWorker::Request busyRequest{
+      Generation(2u, 2u, 11u, 3u), {4u, TestMode::Normal}};
+  submit = worker.submit(busyRequest);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Busy);
+  CHECK(busyRequest.payload.value == 4u);
   ReleaseBlock();
   auto result = worker.waitAndCollectExact(firstGeneration);
   CHECK(result.state == War3PointShadowPrepareResultState::Ready);
 
-  submit = worker.submit(
-      {Generation(1u, 2u, 12u, 3u), {5u, TestMode::Normal}});
+  TestWorker::Request staleRequest{
+      Generation(1u, 2u, 12u, 3u), {5u, TestMode::Normal}};
+  submit = worker.submit(staleRequest);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::StaleGeneration);
-  submit = worker.submit(
-      {Generation(1u, 3u, 1u, 1u), {5u, TestMode::Normal}});
+  CHECK(staleRequest.payload.value == 5u);
+  TestWorker::Request nextEpochRequest{
+      Generation(1u, 3u, 1u, 1u), {5u, TestMode::Normal}};
+  submit = worker.submit(nextEpochRequest);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
   result = worker.waitAndCollectExact(Generation(1u, 3u, 1u, 1u));
   CHECK(result.state == War3PointShadowPrepareResultState::Ready);
   CHECK(worker.diagnostics().busyRejections == 1u);
 }
 
+void TestRejectedSubmissionsRetainExactOwnedStorageForSyncFallback() {
+  ResetBlock();
+  RecycleWorker worker;
+  std::vector<uint32_t> blockingStorage = {1u};
+  RecycleWorker::Request blockingRequest{
+      Generation(10u, 9u, 100u, 5u),
+      {std::move(blockingStorage), 1u, TestMode::Block}};
+  const auto blockingGeneration = blockingRequest.generation;
+  const uintptr_t acceptedAllocation =
+      reinterpret_cast<uintptr_t>(blockingRequest.payload.storage.data());
+  CHECK(worker.submit(blockingRequest) ==
+        War3PointShadowPrepareSubmitStatus::Accepted);
+  CHECK(blockingRequest.payload.storage.empty());
+  CHECK(reinterpret_cast<uintptr_t>(blockingRequest.payload.storage.data()) !=
+        acceptedAllocation);
+  CHECK(WaitForBlockEntry());
+
+  auto makeOwnedRequest = [](const War3PointShadowPrepareGenerationTuple& gen,
+                             uint32_t marker) {
+    std::vector<uint32_t> storage;
+    storage.reserve(64u);
+    storage.push_back(marker);
+    return RecycleWorker::Request{
+        gen, {std::move(storage), marker, TestMode::Normal}};
+  };
+  auto verifySyncOwnership = [](RecycleWorker::Request& request,
+                                uintptr_t allocation,
+                                size_t capacity,
+                                uint32_t marker) {
+    CHECK(reinterpret_cast<uintptr_t>(request.payload.storage.data()) ==
+          allocation);
+    CHECK(request.payload.storage.capacity() == capacity);
+    CHECK(request.payload.storage.size() == 1u);
+    CHECK(request.payload.storage.front() == marker);
+    const auto synchronous = RecycleProcessor{}(std::move(request));
+    CHECK(synchronous.observedAllocation == allocation);
+    CHECK(synchronous.observedCapacity == capacity);
+    CHECK(synchronous.storage.data() ==
+          reinterpret_cast<const uint32_t*>(allocation));
+    CHECK(synchronous.storage.front() == marker);
+  };
+
+  auto invalidRequest =
+      makeOwnedRequest(Generation(0u, 9u, 99u, 5u), 0xddddu);
+  const uintptr_t invalidAllocation =
+      reinterpret_cast<uintptr_t>(invalidRequest.payload.storage.data());
+  const size_t invalidCapacity = invalidRequest.payload.storage.capacity();
+  CHECK(worker.submit(invalidRequest) ==
+        War3PointShadowPrepareSubmitStatus::InvalidGeneration);
+  verifySyncOwnership(invalidRequest, invalidAllocation, invalidCapacity,
+                      0xddddu);
+
+  auto busyRequest =
+      makeOwnedRequest(Generation(11u, 9u, 101u, 5u), 0xaaaau);
+  const uintptr_t busyAllocation =
+      reinterpret_cast<uintptr_t>(busyRequest.payload.storage.data());
+  const size_t busyCapacity = busyRequest.payload.storage.capacity();
+  CHECK(worker.submit(busyRequest) ==
+        War3PointShadowPrepareSubmitStatus::Busy);
+  verifySyncOwnership(busyRequest, busyAllocation, busyCapacity, 0xaaaau);
+
+  ReleaseBlock();
+  const auto completed = worker.waitAndCollectExact(blockingGeneration);
+  CHECK(completed.state == War3PointShadowPrepareResultState::Ready);
+
+  auto staleRequest =
+      makeOwnedRequest(Generation(9u, 9u, 102u, 5u), 0xbbbbu);
+  const uintptr_t staleAllocation =
+      reinterpret_cast<uintptr_t>(staleRequest.payload.storage.data());
+  const size_t staleCapacity = staleRequest.payload.storage.capacity();
+  CHECK(worker.submit(staleRequest) ==
+        War3PointShadowPrepareSubmitStatus::StaleGeneration);
+  verifySyncOwnership(staleRequest, staleAllocation, staleCapacity, 0xbbbbu);
+
+  worker.shutdown();
+  auto stoppedRequest =
+      makeOwnedRequest(Generation(12u, 9u, 103u, 5u), 0xccccu);
+  const uintptr_t stoppedAllocation =
+      reinterpret_cast<uintptr_t>(stoppedRequest.payload.storage.data());
+  const size_t stoppedCapacity = stoppedRequest.payload.storage.capacity();
+  CHECK(worker.submit(stoppedRequest) ==
+        War3PointShadowPrepareSubmitStatus::Stopping);
+  verifySyncOwnership(stoppedRequest, stoppedAllocation, stoppedCapacity,
+                      0xccccu);
+}
+
 void TestStaleCollectionDropsPayload() {
   TestWorker worker;
   const auto produced = Generation(1u, 4u, 20u, 8u);
   const auto expected = Generation(1u, 4u, 20u, 9u);
-  const auto submit = worker.submit(
-      {produced, {6u, TestMode::Normal}});
+  TestWorker::Request request{produced, {6u, TestMode::Normal}};
+  const auto submit = worker.submit(request);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
   if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
     return;
@@ -280,8 +379,9 @@ void TestStaleCollectionDropsPayload() {
 void TestExceptionFailsClosedAndWorkerSurvives() {
   TestWorker worker;
   const auto failedGeneration = Generation(1u, 5u, 30u, 12u);
-  auto submit = worker.submit(
-      {failedGeneration, {7u, TestMode::Throw}});
+  TestWorker::Request failedRequest{
+      failedGeneration, {7u, TestMode::Throw}};
+  auto submit = worker.submit(failedRequest);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
   if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
     return;
@@ -292,8 +392,9 @@ void TestExceptionFailsClosedAndWorkerSurvives() {
   CHECK(static_cast<bool>(result.failure));
 
   const auto recoveryGeneration = Generation(2u, 5u, 31u, 12u);
-  submit = worker.submit(
-      {recoveryGeneration, {9u, TestMode::Normal}});
+  TestWorker::Request recoveryRequest{
+      recoveryGeneration, {9u, TestMode::Normal}};
+  submit = worker.submit(recoveryRequest);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
   if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
     return;
@@ -311,8 +412,8 @@ void TestShutdownJoinsAndCancelsRunningResult() {
   ResetBlock();
   TestWorker worker;
   const auto generation = Generation(1u, 6u, 40u, 15u);
-  const auto submit = worker.submit(
-      {generation, {10u, TestMode::Block}});
+  TestWorker::Request request{generation, {10u, TestMode::Block}};
+  const auto submit = worker.submit(request);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
   if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
     return;
@@ -344,16 +445,17 @@ void TestShutdownJoinsAndCancelsRunningResult() {
   CHECK(diagnostics.threadJoins == 1u);
   CHECK(diagnostics.cancelledJobs == 1u);
   CHECK(!diagnostics.available);
-  CHECK(worker.submit({Generation(2u, 6u, 41u, 15u),
-                       {1u, TestMode::Normal}}) ==
+  TestWorker::Request stoppedRequest{
+      Generation(2u, 6u, 41u, 15u), {1u, TestMode::Normal}};
+  CHECK(worker.submit(stoppedRequest) ==
         War3PointShadowPrepareSubmitStatus::Stopping);
 }
 
 void TestShutdownRevokesUncollectedReadyResult() {
   TestWorker worker;
   const auto generation = Generation(1u, 7u, 50u, 17u);
-  const auto submit = worker.submit(
-      {generation, {12u, TestMode::Normal}});
+  TestWorker::Request request{generation, {12u, TestMode::Normal}};
+  const auto submit = worker.submit(request);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
   if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
     return;
@@ -377,8 +479,8 @@ void TestConcurrentShutdownJoinsExactlyOnce() {
   ResetBlock();
   TestWorker worker;
   const auto generation = Generation(1u, 8u, 60u, 19u);
-  const auto submit = worker.submit(
-      {generation, {13u, TestMode::Block}});
+  TestWorker::Request request{generation, {13u, TestMode::Block}};
+  const auto submit = worker.submit(request);
   CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
   if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
     return;
@@ -421,6 +523,7 @@ int main() {
   TestOneThreadServesSequentialExactJobs();
   TestOwnedVectorCapacityReturnsForNextJob();
   TestSingleFlightBackpressureAndMonotonicJobs();
+  TestRejectedSubmissionsRetainExactOwnedStorageForSyncFallback();
   TestStaleCollectionDropsPayload();
   TestExceptionFailsClosedAndWorkerSurvives();
   TestShutdownJoinsAndCancelsRunningResult();

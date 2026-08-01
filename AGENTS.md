@@ -1,5 +1,47 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（点阴影纯 CPU Planner + 拒绝提交所有权闭合，运行时仍未接入）
+
+在既有 persistent worker mailbox 基础上拆出独立的 owned-value 点阴影 CPU planner；
+生产 `d3d9_war3_shadow.cpp/.h` 没有 include、实例化或调用它，旧 `std::async` 路径和
+已部署 DLL 行为均未改变。本阶段只能称为运行时替换前的可验证算法地基，不能宣称已经
+获得点阴影 CPU 性能收益。
+
+- request 冻结最多四盏灯、caster scalar/source identity、完整 world matrix、palette hash、
+  dynamic pose 统计、发布 history，以及 `replay/policy/lifecycle` 三项 seal；不含 renderer、
+  scene/draw 指针、`Rc<>`、Vulkan/DXVK 资源或发布权限。`frozenComplete` 只是未来唯一
+  renderer owner 必须铸造和复核的准入声明，当前 `OwnerBuilderIntegrated=false`。
+- value planner 覆盖 96 MiB cube 容量裁剪、旧内容签名 token 顺序、temporal period 节拍、
+  每灯独立 face age/valid 预算、range/90-degree face 保守球剔除、nearest-surface known
+  caster cap 及六面 translated-eye view-projection。三组 legacy signature oracle 固定为
+  `B5D6942CFC00FFAE`、`FF6737AA6748ED15`、`D3199C952EA5844C`。
+- 旧路径对“正半径 + NaN/Inf center”会误 range-cull，且可能把 NaN 排序键送入
+  `nth_element`。新 planner 明确把任一非有限 center/radius 视为 unknown/pinned；这是
+  fail-closed hardening delta，不冒充畸形输入的 bit-equivalence。非有限灯光与无效 seal
+  同样整体拒绝。
+- capped cohort 使用无临时 buffer 的 `partition(pinned) + known-only nth_element +
+  replay-index sort`，没有退化成 known 全量排序。caster、palette、range/ranked scratch 与
+  24 个 face vector 全部在 request→result→下一 request 间 move/clear 回收；200 个连续
+  accepted job 验证 allocation 地址与 capacity 稳定，4096 caster→16 known 的门通过。
+- worker `submit` 从按值吞 request 改为 `submit(Request&)`，并删除 rvalue overload；只有
+  Accepted 才 move 到 mailbox。Invalid/Busy/Stale/Stopping/Unavailable 均发生在唯一 move
+  之前，动态测试证明前四类拒绝后同一 frozen vector 可直接由同步 processor 消费，避免
+  busy fallback 丢失 exact 当帧数据。Accepted job 若 processor 抛异常或被取消仍不返还
+  storage，`FailedJobStorageRecoveryIntegrated=false`，未来 owner 必须重新冻结 canonical
+  replay，不能采样旧 plan。
+- planner/worker 静态合同 9/9、10/10 PASS；两个 Win32 Meson runnable 2/2 PASS；全量
+  299 项 `test_*_static.py` PASS；Win32 production target 与 `ninja -C build32 -n` 均为
+  no-work。未部署 build32 DLL 为 32,698,815 bytes，SHA-256
+  `1DBF61D109C5DFBB28E18B86B47841A3D77CCB463176891C4C8863C9A5149B53`；部署目录继续
+  保持已通过物理门的 32,649,789-byte `9BF5E3D9...`。
+
+**运行时接入前仍需完成**：唯一 owner builder、完整 tuple/replay size 验收、
+Busy/Failed/Stale/Unavailable 的同算法同步 exact fallback、逐面录制成功后的 age/valid
+事务提交、异常 rollback、cube allocation/OOM backoff、published light IDs/frame/generation
+与 receiver 采样闭合，以及 ABBA 性能/160 帧取证门。下一条独立主线优先实施 Persistent
+Package P1 的 per-model immutable generation 与 Store 强 validator；Store 当前的 `Ready`
+只证明 copy 已登记，绝不能当 producer fence 已完成。
+
 ## 🚨 2026-08-02（Persistent Package 不可伪造 proof catalog，运行时仍硬关闭）
 
 在 `f20e878` 的固定容量 observer 基础上新增 CPU/value-only immutable proof catalog，

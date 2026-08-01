@@ -334,6 +334,25 @@ test(
   timeout : 30,
 )
 
+# Pure owned-value planner for the future persistent point-shadow worker. It is
+# intentionally compiled only into this isolated runnable: d3d9_src and the
+# live std::async shadow pass have no reference to either planner source file.
+war3_point_shadow_cpu_plan_test = executable(
+  'war3_point_shadow_cpu_plan_test',
+  [
+    'war3/render/war3_point_shadow_cpu_plan.cpp',
+    'war3/render/tests/war3_point_shadow_cpu_plan_test.cpp',
+  ],
+  dependencies        : [ dependency('threads') ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_point_shadow_cpu_plan_foundation',
+  war3_point_shadow_cpu_plan_test,
+  timeout : 30,
+)
+
 if platform != 'windows'
   pkg.generate(d3d9_dll,
     filebase: dxvk_pkg_prefix + 'd3d9',

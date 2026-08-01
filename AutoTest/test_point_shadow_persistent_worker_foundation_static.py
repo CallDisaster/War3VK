@@ -47,10 +47,46 @@ class PointShadowPersistentWorkerFoundationContracts(unittest.TestCase):
             "state->requestSlot.has_value() || state->workerRunning ||",
             "state->resultSlot.has_value()",
             "War3PointShadowPrepareSubmitStatus::Busy",
+            "War3PointShadowPrepareSubmitStatus::InvalidGeneration",
             "maximumInFlight",
         ):
             self.assertIn(token, self.header)
         self.assertNotIn("std::deque", self.header)
+
+    def test_rejected_submit_retains_caller_owned_request(self) -> None:
+        for token in (
+            "submit(Request& request) noexcept",
+            "submit(Request&& request) noexcept =",
+            "state->requestSlot.emplace(std::move(request))",
+            "TestRejectedSubmissionsRetainExactOwnedStorageForSyncFallback",
+            "War3PointShadowPrepareSubmitStatus::Busy",
+            "War3PointShadowPrepareSubmitStatus::StaleGeneration",
+            "War3PointShadowPrepareSubmitStatus::Stopping",
+            "verifySyncOwnership",
+            "synchronous.observedAllocation == allocation",
+            "blockingRequest.payload.storage.empty()",
+            "invalidRequest.payload.storage.data()",
+        ):
+            self.assertIn(token, self.header + self.unit)
+        submit_start = self.header.index("submit(Request& request) noexcept")
+        submit_end = self.header.index("submit(Request&& request)", submit_start)
+        accepted_move = self.header.index(
+            "state->requestSlot.emplace(std::move(request))", submit_start
+        )
+        self.assertLess(accepted_move, submit_end)
+        for rejection in (
+            "InvalidGeneration",
+            "Unavailable",
+            "Stopping",
+            "StaleGeneration",
+            "Busy",
+        ):
+            self.assertLess(
+                self.header.index(
+                    f"War3PointShadowPrepareSubmitStatus::{rejection}", submit_start
+                ),
+                accepted_move,
+            )
 
     def test_worker_has_no_renderer_or_gpu_ownership_surface(self) -> None:
         for forbidden in (
@@ -109,6 +145,7 @@ class PointShadowPersistentWorkerFoundationContracts(unittest.TestCase):
             "TestOneThreadServesSequentialExactJobs",
             "TestOwnedVectorCapacityReturnsForNextJob",
             "TestSingleFlightBackpressureAndMonotonicJobs",
+            "TestRejectedSubmissionsRetainExactOwnedStorageForSyncFallback",
             "TestStaleCollectionDropsPayload",
             "TestExceptionFailsClosedAndWorkerSurvives",
             "TestShutdownJoinsAndCancelsRunningResult",
