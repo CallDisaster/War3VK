@@ -16,6 +16,15 @@ manager 大锁、compute、output、receipt 或 lease。
   热路径或 renderer 行为。
 - 新 owner/static 合同 7 项、既有 package 合同 11 项与 runnable ownership test 1/1
   PASS；Win32 `d3d9.dll` build 成功，`ninja -C build32 -n` no-work。
+- 运行时归因用同一 `vertex_shader_bypass + sidecar=none` P4 脚本对候选
+  `E1D87436...` 与提交前备份 `37E0BE91...` 各运行 45 秒。两者都稳定存活、CSM=4
+  级联、Arena busy/overflow=0，也都表现为 input package 正常 prepared/submitted、但
+  main/shadow consumer 与 kernel bypass 为 0；Windows 没有新增 `nvlddmkm 153`、
+  `Display 4101` 或 GPU incident。因此该 P4 FAIL 是 P0 之前已经存在的 consumer-route
+  状态，不能归因于 store 抽离，也不能把本轮测试描述成 GPU skin takeover 已通过。
+- 候选与部署 DLL exact：32,627,806 bytes，SHA-256
+  `E1D874364D9FBFEA07298C26B9196A0D0492853BBC3DB11088DFEFF6EE87C80E`；A/B 后已经恢复
+  候选部署。回退仍为 `E:\Work\War3\d3d9.dll.bak_20260802_pre_package_store_37E0BE91`。
 
 **必须保留的 P1 阻断门**：旧实现的 epoch clear 会同时清 atlas 与未完成 producer
 retirement。当前 manager 通过 `hasInFlightResources()` 保留整个旧 resources owner，故
