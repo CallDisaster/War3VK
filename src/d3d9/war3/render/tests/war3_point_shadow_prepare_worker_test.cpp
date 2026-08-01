@@ -7,6 +7,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -46,7 +47,7 @@ bool g_blockRelease = false;
 
 struct TestProcessor {
   TestResultPayload operator()(
-      const War3PointShadowPrepareRequest<TestRequestPayload>& request) const {
+      War3PointShadowPrepareRequest<TestRequestPayload>&& request) const {
     if (request.payload.mode == TestMode::Throw)
       throw std::runtime_error("injected point-shadow prepare failure");
     if (request.payload.mode == TestMode::Block) {
@@ -65,6 +66,40 @@ struct TestProcessor {
 
 using TestWorker = War3PointShadowPersistentPrepareWorker<
     TestRequestPayload, TestResultPayload, TestProcessor>;
+
+struct RecycleRequestPayload {
+  std::vector<uint32_t> storage;
+  uint32_t marker = 0u;
+};
+
+struct RecycleResultPayload {
+  std::vector<uint32_t> storage;
+  uintptr_t observedAllocation = 0u;
+  size_t observedCapacity = 0u;
+  uint32_t marker = 0u;
+};
+
+struct RecycleProcessor {
+  RecycleResultPayload operator()(
+      War3PointShadowPrepareRequest<RecycleRequestPayload>&& request) const {
+    const uintptr_t observedAllocation =
+        reinterpret_cast<uintptr_t>(request.payload.storage.data());
+    const size_t observedCapacity = request.payload.storage.capacity();
+    const uint32_t marker = request.payload.marker;
+    std::vector<uint32_t> storage = std::move(request.payload.storage);
+    storage.clear();
+    storage.push_back(marker);
+    return {std::move(storage), observedAllocation, observedCapacity, marker};
+  }
+};
+
+using RecycleWorker = War3PointShadowPersistentPrepareWorker<
+    RecycleRequestPayload, RecycleResultPayload, RecycleProcessor>;
+
+static_assert(std::is_invocable_r_v<
+              TestResultPayload, TestProcessor, TestWorker::Request&&>);
+static_assert(!std::is_invocable_v<
+              TestProcessor, const TestWorker::Request&>);
 
 War3PointShadowPrepareGenerationTuple Generation(
     uint64_t job, uint64_t renderer = 1u, uint64_t frame = 1u,
@@ -130,6 +165,69 @@ void TestOneThreadServesSequentialExactJobs() {
   CHECK(diagnostics.readyJobs == 8u);
   CHECK(diagnostics.exactCollections == 8u);
   CHECK(diagnostics.maximumInFlight == 1u);
+}
+
+void TestOwnedVectorCapacityReturnsForNextJob() {
+  RecycleWorker worker;
+  std::vector<uint32_t> storage;
+  storage.reserve(256u);
+  for (uint32_t value = 0u; value < 32u; ++value)
+    storage.push_back(value);
+
+  const uintptr_t originalAllocation =
+      reinterpret_cast<uintptr_t>(storage.data());
+  const size_t originalCapacity = storage.capacity();
+  CHECK(originalAllocation != 0u);
+  CHECK(originalCapacity >= 256u);
+
+  const auto firstGeneration = Generation(1u, 20u, 100u, 30u);
+  RecycleWorker::Request firstRequest{
+      firstGeneration, {std::move(storage), 0x1234u}};
+  CHECK(reinterpret_cast<uintptr_t>(firstRequest.payload.storage.data()) ==
+        originalAllocation);
+  CHECK(firstRequest.payload.storage.capacity() == originalCapacity);
+  auto submit = worker.submit(std::move(firstRequest));
+  CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
+  if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
+    return;
+
+  auto firstResult = worker.waitAndCollectExact(firstGeneration);
+  CHECK(firstResult.state == War3PointShadowPrepareResultState::Ready);
+  CHECK(firstResult.payload.has_value());
+  if (!firstResult.payload.has_value())
+    return;
+  CHECK(firstResult.payload->observedAllocation == originalAllocation);
+  CHECK(firstResult.payload->observedCapacity == originalCapacity);
+  CHECK(reinterpret_cast<uintptr_t>(firstResult.payload->storage.data()) ==
+        originalAllocation);
+  CHECK(firstResult.payload->storage.capacity() == originalCapacity);
+  CHECK(firstResult.payload->storage.size() == 1u);
+  CHECK(firstResult.payload->storage.front() == 0x1234u);
+
+  const auto secondGeneration = Generation(2u, 20u, 101u, 30u);
+  RecycleWorker::Request secondRequest{
+      secondGeneration,
+      {std::move(firstResult.payload->storage), 0x5678u}};
+  CHECK(reinterpret_cast<uintptr_t>(secondRequest.payload.storage.data()) ==
+        originalAllocation);
+  CHECK(secondRequest.payload.storage.capacity() == originalCapacity);
+  submit = worker.submit(std::move(secondRequest));
+  CHECK(submit == War3PointShadowPrepareSubmitStatus::Accepted);
+  if (submit != War3PointShadowPrepareSubmitStatus::Accepted)
+    return;
+
+  auto secondResult = worker.waitAndCollectExact(secondGeneration);
+  CHECK(secondResult.state == War3PointShadowPrepareResultState::Ready);
+  CHECK(secondResult.payload.has_value());
+  if (!secondResult.payload.has_value())
+    return;
+  CHECK(secondResult.payload->observedAllocation == originalAllocation);
+  CHECK(secondResult.payload->observedCapacity == originalCapacity);
+  CHECK(reinterpret_cast<uintptr_t>(secondResult.payload->storage.data()) ==
+        originalAllocation);
+  CHECK(secondResult.payload->storage.capacity() == originalCapacity);
+  CHECK(secondResult.payload->storage.size() == 1u);
+  CHECK(secondResult.payload->storage.front() == 0x5678u);
 }
 
 void TestSingleFlightBackpressureAndMonotonicJobs() {
@@ -321,6 +419,7 @@ void TestConcurrentShutdownJoinsExactlyOnce() {
 int main() {
   TestGenerationTupleIsExact();
   TestOneThreadServesSequentialExactJobs();
+  TestOwnedVectorCapacityReturnsForNextJob();
   TestSingleFlightBackpressureAndMonotonicJobs();
   TestStaleCollectionDropsPayload();
   TestExceptionFailsClosedAndWorkerSurvives();

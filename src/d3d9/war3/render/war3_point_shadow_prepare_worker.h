@@ -131,6 +131,8 @@ struct War3PointShadowPrepareWorkerDiagnostics {
  * deliberate ownership boundary: the persistent thread stores no captured
  * renderer object. A future runtime integration must freeze all CPU inputs into
  * RequestPayload and return all proposed state changes through ResultPayload.
+ * Processor consumes Request&& so large owned CPU buffers can move into the
+ * result and be recycled by the owner for a later request without copying.
  *
  * There is exactly one request slot and one result slot. A new request is
  * rejected until the prior result has been collected, so neither a pending nor
@@ -161,8 +163,8 @@ class War3PointShadowPersistentPrepareWorker final {
                 "processor must be constructed inside the worker");
   static_assert(
       std::is_invocable_r_v<ResultPayload, Processor,
-                            const RequestEnvelope&>,
-      "processor must map an owned request to an owned result");
+                            RequestEnvelope&&>,
+      "processor must consume an owned request and return an owned result");
 
 public:
   using Request = RequestEnvelope;
@@ -426,7 +428,7 @@ private:
         Result result;
         result.generation = request->generation;
         try {
-          result.payload.emplace(Processor{}(*request));
+          result.payload.emplace(Processor{}(std::move(*request)));
           result.state = War3PointShadowPrepareResultState::Ready;
         } catch (...) {
           result.payload.reset();

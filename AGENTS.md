@@ -9,13 +9,17 @@
 - worker 只有一个 request slot、一个 result slot 和一个持久线程；request/result 都是
   自有 CPU value，processor 必须无状态，线程不捕获 renderer、DXVK/Vulkan resource
   或可变发布状态。
+- processor 现在严格消费 `Request&&`；大块 `std::vector` 可从 request 零拷贝移入
+  result，再由 owner 移回下一份 request。隔离测试连续两个 job 验证 allocation 地址与
+  capacity 保持相同，证明双缓冲/回收能力无需 renderer 或 `Rc<>` 所有权。
 - 结果必须完整匹配 `jobSerial / rendererEpoch / frameSerial / lightGeneration`；invalid、
   stale、busy、exception、cancel 和 startup failure 全部 fail-closed，禁止消费旧 plan。
 - shutdown 会取消未发布结果、等待正在执行的 CPU job 并 join；完整 stop/join 边界由
   owner-side mutex 串行化，两条 teardown 路径并发调用也只 join 一次，绝不 detach。
-- C++ runnable test 覆盖同线程复用、单在途背压、代际单调、stale 丢 payload、异常后
-  恢复、运行中取消、ready 结果撤销和并发 shutdown；200/200 压力重复通过。
-- 静态合同 8 项与 Meson runnable test 1/1 PASS；Win32 测试目标编译链接通过。
+- C++ runnable test 覆盖同线程复用、owned vector capacity 跨 job 回收、单在途背压、
+  代际单调、stale 丢 payload、异常后恢复、运行中取消、ready 结果撤销和并发 shutdown；
+  200/200 压力重复通过。
+- 静态合同 9 项与 Meson runnable test 1/1 PASS；Win32 测试目标编译链接通过。
 
 **接入边界**：只有先把当前点阴影 prepare 从捕获 renderer `this` 的大 lambda 拆成
 纯 POD request→result，owner 在 exact tuple 匹配后单次发布，才允许替换 `std::async`。

@@ -69,6 +69,25 @@ class PointShadowPersistentWorkerFoundationContracts(unittest.TestCase):
         worker_end = self.header.index("std::shared_ptr<SharedState> m_state", worker_start)
         self.assertNotIn("this", self.header[worker_start:worker_end])
 
+    def test_processor_consumes_owned_rvalue_and_can_return_storage(self) -> None:
+        self.assertIn(
+            "std::is_invocable_r_v<ResultPayload, Processor,",
+            self.header,
+        )
+        self.assertIn("RequestEnvelope&&>", self.header)
+        self.assertIn(
+            "Processor{}(std::move(*request))",
+            self.header,
+        )
+        for token in (
+            "TestOwnedVectorCapacityReturnsForNextJob",
+            "std::vector<uint32_t> storage",
+            "observedAllocation == originalAllocation",
+            "observedCapacity == originalCapacity",
+            "storage.capacity() == originalCapacity",
+        ):
+            self.assertIn(token, self.unit)
+
     def test_exception_stale_and_shutdown_outcomes_are_fail_closed(self) -> None:
         for token in (
             "result.payload.reset()",
@@ -88,6 +107,7 @@ class PointShadowPersistentWorkerFoundationContracts(unittest.TestCase):
     def test_runnable_test_exercises_thread_reuse_backpressure_and_recovery(self) -> None:
         for token in (
             "TestOneThreadServesSequentialExactJobs",
+            "TestOwnedVectorCapacityReturnsForNextJob",
             "TestSingleFlightBackpressureAndMonotonicJobs",
             "TestStaleCollectionDropsPayload",
             "TestExceptionFailsClosedAndWorkerSurvives",
