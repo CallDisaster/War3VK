@@ -149,6 +149,7 @@ d3d9_src = [
   'war3/gpu_skin/war3_cpu_skin_mt.cpp',
   'war3/gpu_skin/war3_gpu_skin_manager.cpp',
   'war3/gpu_skin/war3_gpu_skin_native_bridge.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_observer.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_owner.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_store.cpp',
   'war3/gpu_skin/war3_gpu_skin_resources.cpp',
@@ -273,6 +274,23 @@ war3_persistent_gpu_package_generation_owner_test = executable(
 test(
   'war3_persistent_gpu_package_generation_owner',
   war3_persistent_gpu_package_generation_owner_test,
+  timeout : 30,
+)
+
+# Value-only P1 package observer. Production compiles the policy/table, but no
+# renderer, store or D3D9 object instantiates it and Consume remains denied.
+war3_persistent_gpu_package_observer_test = executable(
+  'war3_persistent_gpu_package_observer_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_observer.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_observer_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_observer',
+  war3_persistent_gpu_package_observer_test,
   timeout : 30,
 )
 

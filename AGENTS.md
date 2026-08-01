@@ -1,5 +1,31 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（Persistent Package Observer 值表基础，生产路径仍未接入）
+
+新增固定容量、无热路径分配的 `War3PersistentGpuPackageObserver`，用于在未来接入
+shared package consumer 前先证明 Stage11 当帧 exact identity、source、material、alpha、
+bounds、consumer 与 package generation 的闭合关系。当前生产 DLL 只编译该模块，没有
+任何 D3D9/Store/Resources/Shadow 对象实例化它，也没有部署本轮构建。
+
+- 模式固定为 `Off / Observe / Consume`；`Consume` 生产硬拒绝，Observe 永远透传 canonical
+  workload/consumer mask，不绑定 atlas、不写 consumer last-use、不改变 caster、copy 或 draw。
+- 4096 项 POD 表按 exact frame/policy/Stage11/map/device/package/source generation 封存；未知
+  identity、source/content pending、动态/蒙皮、material/alpha/bounds 缺证据均按 proof ceiling
+  保守降级，非有限 bounds、未知 consumer、容量或预算越界 fail-closed。
+- consumer 统计分为四层：requested、package-eligible、canonical actual 和
+  `wouldUse = eligible & actual`。`FullyEquivalent` 本身绝不伪造 actual；只有 seal 前已经真实
+  入队的 Main 可作为 pre-submitted witness，CSM/point/geometry-outline 必须在对应真实 draw
+  之后以 exact table index/identity/frame/policy/generation 单 bit 幂等记录。
+- 只读 Stage11 审计确认唯一安全 seal 点位于 exact producer 同时发布
+  `shadowInstances/shadowCasters` 并写入 submitted frame witness 之后；owner claim、capture
+  complete、prepare/cull 均太早。首轮运行时 Observe 仍必须令 `packageContentReady=false`，
+  因为 Store 尚私有于默认关闭的 GPU manager，且 shared owner/package proof sidecar/consumer
+  last-use 尚未接通；不得为观察而创建 128 MiB atlas 或把任何条目晋升为 FullyEquivalent。
+- 全部 274 项 `test_*_static.py` PASS；三个 package owner/observer Meson runnable 3/3 PASS；
+  Win32 build 成功且 `ninja -C build32 -n` no-work。未部署 build32 DLL 为 32,660,682 bytes，
+  SHA-256 `CEA5D4FA80ED95243618174E3C9307DF6615D933A4D89F13D22A7C97DC34EB4C`；已部署 DLL 继续保持
+  上一轮通过视觉/稳定门的 `9BF5E3D9...`。
+
 ## 🚨 2026-08-02（Persistent Package immutable proof 扩充，仍无 Renderer Consumer）
 
 P0 package 现在在模型首次打包时一次性生成逐 stream 与逐 primitive 的不可变证明；
