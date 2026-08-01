@@ -17,8 +17,17 @@ P0 package 现在在模型首次打包时一次性生成逐 stream 与逐 primit
   越界 index 或 proof mismatch 都 fail-closed 到原安全路径。
 - 相关 TAA/point/stage/alpha/blocker/final-caster/package/WorkTable/union/P4 静态门共 212 项
   PASS；两个 package owner runnable 2/2 PASS；Win32 build 成功且 `ninja -C build32 -n`
-  no-work。组合 build32 DLL 为 32,649,789 bytes，SHA-256
-  `9BF5E3D9591602990A85F482639D9D1FD6EC4A5E98EE6DC3D239DFE09BF68DD9`，未部署、未启动游戏。
+  no-work。组合 build32/部署 DLL exact 为 32,649,789 bytes，SHA-256
+  `9BF5E3D9591602990A85F482639D9D1FD6EC4A5E98EE6DC3D239DFE09BF68DD9`；回退为
+  `E:\Work\War3\d3d9.dll.bak_20260802_pre_package_immutable_proof_801A2726`。
+- 隔离高压稳定门 2,421 report frames：53.341 FPS、main-thread 13.276 ms、GPU
+  4.822 ms，`framesIncomplete=0 / budgetExceeded=0 / deviceLost=0`，无 Arena 违规、GPU
+  incident 或新增 NVIDIA 153/4101；进程与 isolated desktop exact cleanup。
+- DirectInline 高压视觉门 160/160 exact screenshot 成功，在线 3,000 px 巨型暗块触发为
+  0；低磁盘保留窗口最大暗块 255 px，目检为正常单位/凤凰动画。512 MiB 滚动策略仅保留
+  最后三段（132 world frames、14 capture joins），其中 alpha gap、blocker leak、mixed
+  representation、unexplained disappearance、validation reject 全为 0；不能把该结果冒充
+  160/160 full-trace 留存。
 
 ## 🚨 2026-08-02（Persistent Package consumer last-use owner，纯值合同、未接运行时）
 
