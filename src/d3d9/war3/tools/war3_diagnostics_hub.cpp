@@ -1,7 +1,11 @@
 #include "war3_diagnostics_hub.h"
 
+#include "../../d3d9_device.h"
 #include "../../d3d9_war3_debug.h"
+#include "../../d3d9_war3_shadow.h"
 
+#include "../war3.h"
+#include "../memory/war3_shadow_arena.h"
 #include "../platform/war3_module_api.h"
 #include "../core/war3_game_structs.h"
 #include "../core/war3_events.h"
@@ -15,9 +19,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <deque>
+#include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <sstream>
 #include <string>
 
 namespace dxvk::war3::tools {
@@ -26,6 +35,20 @@ namespace {
 using json = nlohmann::json;
 
 std::atomic<bool> s_inGameRenderReady{false};
+std::atomic<uint64_t> s_shadowEvidenceRetentionRevision{0u};
+std::atomic<bool> s_shadowEvidenceCollectorAttached{false};
+std::mutex s_gpuFlightMutex;
+std::deque<GpuFlightFrame> s_gpuFlightFrames;
+uint64_t s_gpuLastCompletedSerial = 0u;
+std::chrono::steady_clock::time_point s_gpuLastProgressAt =
+    std::chrono::steady_clock::now();
+bool s_gpuIncidentLatched = false;
+
+uint64_t EpochMilliseconds() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<
+      std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count());
+}
 
 bool LooksLikeRuntimeModelForDiagnostics(void* candidate) {
   if (candidate == nullptr)
@@ -260,6 +283,173 @@ std::string GetWarVkTempRuntimePath() {
   return tempDir + "runtime_status.json";
 }
 
+std::filesystem::path GetWarVkLogDirectory() {
+  char exePath[MAX_PATH] = {0};
+  if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) <= 0)
+    return {};
+  std::filesystem::path directory =
+      std::filesystem::path(exePath).parent_path() / "WarVK" / "Log";
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  return error ? std::filesystem::path{} : directory;
+}
+
+void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
+  const std::filesystem::path directory = GetWarVkLogDirectory();
+  if (directory.empty())
+    return;
+
+  json payload = {
+      {"timestampMs", incident.timestampMs},
+      {"reason", incident.reason},
+      {"queueResult", incident.queueResult},
+      {"stalledMilliseconds", incident.stalledMilliseconds},
+      {"lastRenderStage",
+       incident.recentFrames.empty()
+           ? std::string{}
+           : incident.recentFrames.back().lastRenderStage},
+      {"deviceFault", {
+          {"supported", false},
+          {"reason", "VK_EXT_device_fault is not exposed by this DXVK build"},
+      }},
+      {"frames", json::array()},
+  };
+  for (const auto& frame : incident.recentFrames) {
+    payload["frames"].push_back({
+        {"timestampMs", frame.timestampMs},
+        {"frameSerial", frame.frameSerial},
+        {"lastRenderStage", frame.lastRenderStage},
+        {"csmRequestedResolution", frame.csmRequestedResolution},
+        {"csmEffectiveResolution", frame.csmEffectiveResolution},
+        {"csmFallbackReason", frame.csmFallbackReason},
+        {"csmFallbackLatched", frame.csmFallbackLatched},
+        {"csmGeneration", frame.csmGeneration},
+        {"csmMemoryBudgetBytes", frame.csmMemoryBudgetBytes},
+        {"csmMemoryAvailableBytes", frame.csmMemoryAvailableBytes},
+        {"taaRequestedMode", frame.taaRequestedMode},
+        {"taaEffectiveMode", frame.taaEffectiveMode},
+        {"taaShaderMode", frame.taaShaderMode},
+        {"taaHistoryValid", frame.taaHistoryValid},
+        {"taaHistoryGeneration", frame.taaHistoryGeneration},
+        {"arenaUsedBytes", frame.arenaUsedBytes},
+        {"arenaResidentBytes", frame.arenaResidentBytes},
+        {"arenaGeneration", frame.arenaGeneration},
+        {"arenaBusyReuseRejectCount", frame.arenaBusyReuseRejectCount},
+        {"arenaOverflowCount", frame.arenaOverflowCount},
+        {"arenaFrameIncomplete", frame.arenaFrameIncomplete},
+        {"queueSubmittedSerial", frame.queueSubmittedSerial},
+        {"queueCompletedSerial", frame.queueCompletedSerial},
+        {"queueResult", frame.queueResult},
+    });
+  }
+
+  const std::string filename =
+      "gpu_incident_" + std::to_string(incident.timestampMs) + ".json";
+  const std::filesystem::path target = directory / filename;
+  const std::filesystem::path temporary = target.string() + ".tmp";
+  {
+    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+    if (!stream)
+      return;
+    stream << payload.dump(2);
+    stream.flush();
+    if (!stream)
+      return;
+  }
+  MoveFileExA(temporary.string().c_str(), target.string().c_str(),
+              MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+
+  std::vector<std::filesystem::directory_entry> incidents;
+  std::error_code error;
+  for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+    if (error)
+      break;
+    const std::string name = entry.path().filename().string();
+    if (entry.is_regular_file() && name.rfind("gpu_incident_", 0u) == 0u &&
+        entry.path().extension() == ".json") {
+      incidents.push_back(entry);
+    }
+  }
+  std::sort(incidents.begin(), incidents.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return lhs.last_write_time() < rhs.last_write_time();
+            });
+  while (incidents.size() > 4u) {
+    std::filesystem::remove(incidents.front().path(), error);
+    incidents.erase(incidents.begin());
+  }
+}
+
+void RecordGpuFlightFrame(uint64_t frameSerial) {
+  GpuFlightFrame frame = {};
+  frame.timestampMs = EpochMilliseconds();
+  frame.frameSerial = frameSerial;
+  frame.lastRenderStage = "War3Pipeline.BeforeUi.PostPass";
+  const auto taa = dxvk::QueryShadowTaaDiagnostics();
+  const auto csm = dxvk::QueryCsmResolutionDiagnostics();
+  const auto arena = dxvk::war3::memory::ShadowArena_QueryDiagnostics();
+  frame.csmRequestedResolution = csm.requestedResolution;
+  frame.csmEffectiveResolution = csm.effectiveResolution;
+  frame.csmFallbackReason = csm.fallbackReason;
+  frame.csmFallbackLatched = csm.fallbackLatched;
+  frame.csmGeneration = csm.resourceGeneration;
+  frame.csmMemoryBudgetBytes = csm.memoryBudgetBytes;
+  frame.csmMemoryAvailableBytes = csm.memoryAvailableBytes;
+  frame.taaRequestedMode = taa.requestedMode;
+  frame.taaEffectiveMode = taa.effectiveMode;
+  frame.taaShaderMode = taa.shaderMode;
+  frame.taaHistoryValid = taa.historyValid;
+  frame.taaHistoryGeneration = taa.historyGeneration;
+  frame.arenaUsedBytes = arena.usedBytes;
+  frame.arenaResidentBytes = arena.residentBytes;
+  frame.arenaGeneration = arena.generation;
+  frame.arenaBusyReuseRejectCount = arena.busyReuseRejectCount;
+  frame.arenaOverflowCount = arena.overflowCount;
+  frame.arenaFrameIncomplete = arena.frameIncomplete;
+  frame.queueSubmittedSerial = arena.submittedSerial;
+  frame.queueCompletedSerial = arena.completedSerial;
+  if (auto* device = dxvk::war3::GetActiveDevice()) {
+    frame.queueResult =
+        static_cast<int64_t>(device->GetDXVKDevice()->getDeviceStatus());
+  }
+
+  GpuIncidentSnapshot incident = {};
+  bool writeIncident = false;
+  {
+    std::lock_guard<std::mutex> lock(s_gpuFlightMutex);
+    s_gpuFlightFrames.push_back(frame);
+    while (s_gpuFlightFrames.size() > 240u)
+      s_gpuFlightFrames.pop_front();
+
+    const auto now = std::chrono::steady_clock::now();
+    if (frame.queueCompletedSerial != s_gpuLastCompletedSerial) {
+      s_gpuLastCompletedSerial = frame.queueCompletedSerial;
+      s_gpuLastProgressAt = now;
+      if (frame.queueResult == VK_SUCCESS)
+        s_gpuIncidentLatched = false;
+    }
+    const uint64_t stalledMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - s_gpuLastProgressAt).count());
+    const bool queueFailed = frame.queueResult != VK_SUCCESS;
+    const bool queueStalled =
+        frame.queueSubmittedSerial > frame.queueCompletedSerial &&
+        stalledMs >= 10000u;
+    if ((queueFailed || queueStalled) && !s_gpuIncidentLatched) {
+      s_gpuIncidentLatched = true;
+      incident.timestampMs = frame.timestampMs;
+      incident.reason = queueFailed ? "queue-error" : "gpu-no-progress-10s";
+      incident.queueResult = frame.queueResult;
+      incident.stalledMilliseconds = stalledMs;
+      incident.recentFrames.assign(s_gpuFlightFrames.begin(),
+                                   s_gpuFlightFrames.end());
+      writeIncident = true;
+    }
+  }
+  if (writeIncident)
+    WriteGpuIncidentSnapshot(incident);
+}
+
 War3RuntimeStatusFrameSnapshot BuildFrameSnapshot() {
   War3RuntimeStatusFrameSnapshot summary = {};
   const auto manifest =
@@ -331,6 +521,48 @@ War3RuntimeStatusFrameSnapshot BuildFrameSnapshot() {
 War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
   War3RuntimeStatusShadowSnapshot summary = {};
   const auto bridgeSummary = dxvk::war3::render::QueryShadowRuntimeBridgeSummary();
+  const auto taaDiagnostics = dxvk::QueryShadowTaaDiagnostics();
+  const auto csmDiagnostics = dxvk::QueryCsmResolutionDiagnostics();
+  const auto arenaDiagnostics =
+      dxvk::war3::memory::ShadowArena_QueryDiagnostics();
+  summary.shadowTaaRequestedMode = taaDiagnostics.requestedMode;
+  summary.shadowTaaEffectiveMode = taaDiagnostics.effectiveMode;
+  summary.shadowTaaShaderMode = taaDiagnostics.shaderMode;
+  summary.shadowTaaHistoryValid = taaDiagnostics.historyValid;
+  summary.shadowTaaHistoryReadable = taaDiagnostics.historyReadable;
+  summary.shadowTaaHistoryGeneration = taaDiagnostics.historyGeneration;
+  summary.shadowTaaLastInvalidationReason =
+      taaDiagnostics.lastInvalidationReason;
+  summary.shadowTaaFixedWallBypassCount =
+      taaDiagnostics.fixedWallBypassCount;
+  summary.csmRequestedResolution = csmDiagnostics.requestedResolution;
+  summary.csmEffectiveResolution = csmDiagnostics.effectiveResolution;
+  summary.csmFallbackReason = csmDiagnostics.fallbackReason;
+  summary.csmFallbackLatched = csmDiagnostics.fallbackLatched;
+  summary.csmResourceGeneration = csmDiagnostics.resourceGeneration;
+  summary.csmResourceRebuildCount = csmDiagnostics.resourceRebuildCount;
+  summary.csmMemoryBudgetBytes = csmDiagnostics.memoryBudgetBytes;
+  summary.csmMemoryAvailableBytes = csmDiagnostics.memoryAvailableBytes;
+  summary.shadowArenaUsedBytes = arenaDiagnostics.usedBytes;
+  summary.shadowArenaResidentBytes = arenaDiagnostics.residentBytes;
+  summary.shadowArenaResidentLimitBytes =
+      arenaDiagnostics.residentLimitBytes;
+  summary.shadowArenaGeneration = arenaDiagnostics.generation;
+  summary.shadowArenaBusyReuseRejectCount =
+      arenaDiagnostics.busyReuseRejectCount;
+  summary.shadowArenaOverflowCount = arenaDiagnostics.overflowCount;
+  summary.shadowArenaFrameIncomplete = arenaDiagnostics.frameIncomplete;
+  summary.queueSubmittedSerial = arenaDiagnostics.submittedSerial;
+  summary.queueCompletedSerial = arenaDiagnostics.completedSerial;
+  if (auto* device = dxvk::war3::GetActiveDevice()) {
+    summary.queueLastResult =
+        static_cast<int64_t>(device->GetDXVKDevice()->getDeviceStatus());
+  }
+  summary.shadowEvidenceRetentionRevision =
+      s_shadowEvidenceRetentionRevision.load(std::memory_order_acquire);
+  summary.shadowEvidenceCollectorAttached =
+      s_shadowEvidenceCollectorAttached.load(std::memory_order_acquire) ? 1u
+                                                                       : 0u;
   summary.matrixPaletteCount = bridgeSummary.matrixPaletteCount;
   summary.shadowReadyGeosetCount = bridgeSummary.shadowReadyGeosetCount;
   summary.shadowModelResourceCount = bridgeSummary.shadowModelResourceCount;
@@ -2109,6 +2341,43 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.semanticSceneShadowMapSkinnedDrawnCount},
         {"semanticSceneShadowTaaActive",
          snapshot.shadow.semanticSceneShadowTaaActive},
+        {"shadowTaaRequestedMode", snapshot.shadow.shadowTaaRequestedMode},
+        {"shadowTaaEffectiveMode", snapshot.shadow.shadowTaaEffectiveMode},
+        {"shadowTaaShaderMode", snapshot.shadow.shadowTaaShaderMode},
+        {"shadowTaaHistoryValid", snapshot.shadow.shadowTaaHistoryValid},
+        {"shadowTaaHistoryReadable", snapshot.shadow.shadowTaaHistoryReadable},
+        {"shadowTaaHistoryGeneration",
+         snapshot.shadow.shadowTaaHistoryGeneration},
+        {"shadowTaaLastInvalidationReason",
+         snapshot.shadow.shadowTaaLastInvalidationReason},
+        {"shadowTaaFixedWallBypassCount",
+         snapshot.shadow.shadowTaaFixedWallBypassCount},
+        {"csmRequestedResolution", snapshot.shadow.csmRequestedResolution},
+        {"csmEffectiveResolution", snapshot.shadow.csmEffectiveResolution},
+        {"csmFallbackReason", snapshot.shadow.csmFallbackReason},
+        {"csmFallbackLatched", snapshot.shadow.csmFallbackLatched},
+        {"csmResourceGeneration", snapshot.shadow.csmResourceGeneration},
+        {"csmResourceRebuildCount", snapshot.shadow.csmResourceRebuildCount},
+        {"csmMemoryBudgetBytes", snapshot.shadow.csmMemoryBudgetBytes},
+        {"csmMemoryAvailableBytes", snapshot.shadow.csmMemoryAvailableBytes},
+        {"shadowArenaUsedBytes", snapshot.shadow.shadowArenaUsedBytes},
+        {"shadowArenaResidentBytes", snapshot.shadow.shadowArenaResidentBytes},
+        {"shadowArenaResidentLimitBytes",
+         snapshot.shadow.shadowArenaResidentLimitBytes},
+        {"shadowArenaGeneration", snapshot.shadow.shadowArenaGeneration},
+        {"shadowArenaBusyReuseRejectCount",
+         snapshot.shadow.shadowArenaBusyReuseRejectCount},
+        {"shadowArenaOverflowCount",
+         snapshot.shadow.shadowArenaOverflowCount},
+        {"shadowArenaFrameIncomplete",
+         snapshot.shadow.shadowArenaFrameIncomplete},
+        {"queueSubmittedSerial", snapshot.shadow.queueSubmittedSerial},
+        {"queueCompletedSerial", snapshot.shadow.queueCompletedSerial},
+        {"queueLastResult", snapshot.shadow.queueLastResult},
+        {"shadowEvidenceRetentionRevision",
+         snapshot.shadow.shadowEvidenceRetentionRevision},
+        {"shadowEvidenceCollectorAttached",
+         snapshot.shadow.shadowEvidenceCollectorAttached},
         {"semanticSceneReceiverReuseShadowMap",
          snapshot.shadow.semanticSceneReceiverReuseShadowMap},
         {"semanticSceneReceiverInputValid",
@@ -2324,6 +2593,7 @@ void LogRuntimeSummaryOnce(const char* source) {
 }
 
 void LogRuntimeHealthPeriodic(uint64_t frameIndex, uint32_t interval) {
+  RecordGpuFlightFrame(frameIndex);
   // 部分路径下 frameIndex 可能长期为 0，此时按取模会每次都命中，造成刷屏。
   // 这里做去重与零值防抖，保证日志频率稳定。
   static std::atomic<uint64_t> s_lastLoggedFrame{~uint64_t(0)};
@@ -2364,6 +2634,25 @@ void LogRuntimeHealthPeriodic(uint64_t frameIndex, uint32_t interval) {
       dxvk::war3::runtime::GetWar3RuntimeProfileName());
 
   ExportRuntimeStatusSnapshot("periodic", frameIndex);
+}
+
+uint64_t RequestShadowEvidenceRetention() {
+  return s_shadowEvidenceRetentionRevision.fetch_add(
+             1u, std::memory_order_acq_rel) +
+         1u;
+}
+
+uint64_t QueryShadowEvidenceRetentionRevision() {
+  return s_shadowEvidenceRetentionRevision.load(std::memory_order_acquire);
+}
+
+void SetShadowEvidenceCollectorAttached(bool attached) {
+  s_shadowEvidenceCollectorAttached.store(attached,
+                                          std::memory_order_release);
+}
+
+bool IsShadowEvidenceCollectorAttached() {
+  return s_shadowEvidenceCollectorAttached.load(std::memory_order_acquire);
 }
 
 } // namespace dxvk::war3::tools

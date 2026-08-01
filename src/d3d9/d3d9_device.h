@@ -1743,6 +1743,7 @@ private:
       m_war3GpuSkinManager;
   std::unique_ptr<war3::gpu_skin::War3GpuSkinCompute>
       m_war3GpuSkinCompute;
+  Rc<sync::Fence> m_war3ShadowArenaFence;
   Rc<DxvkFence> m_war3GpuSkinFence;
   uint64_t m_war3GpuSkinFenceValue = 0u;
   uint64_t m_war3GpuSkinMapEpoch = 1u;

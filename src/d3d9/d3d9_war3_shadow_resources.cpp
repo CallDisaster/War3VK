@@ -4,6 +4,7 @@
 #include "war3/render/war3_render_objects.h"
 
 #include "../util/util_bit.h"
+#include "../dxvk/dxvk_adapter.h"
 
 #include <algorithm>
 #include <cstring>
@@ -582,29 +583,265 @@ void War3ShadowReceiverPass::ensureOutlineMaskResources(VkExtent3D extent) {
   m_outlineMaskAllView = m_outlineMaskAll->createView(viewInfo);
 }
 
-void War3ShadowReceiverPass::ensureShadowResources(uint32_t cascadeCount,
+bool War3ShadowReceiverPass::ensureShadowResources(uint32_t cascadeCount,
                                                    uint32_t resolution) {
+  constexpr uint64_t kCsmFallbackReserveBytes = 512ull * 1024ull * 1024ull;
   cascadeCount = std::min<uint32_t>(std::max<uint32_t>(cascadeCount, 1u), 4u);
   resolution = std::max<uint32_t>(resolution, 256u);
+  m_csmRequestedResolution = resolution;
+
+  const auto publishDiagnostics = [&]() {
+    CsmResolutionDiagnostics diagnostics = {};
+    diagnostics.requestedResolution = m_csmRequestedResolution;
+    diagnostics.effectiveResolution = m_csmEffectiveResolution;
+    diagnostics.fallbackReason =
+        static_cast<uint32_t>(m_csmResolutionFallbackReason);
+    diagnostics.fallbackLatched =
+        m_csmResolutionFallbackLatched ? 1u : 0u;
+    diagnostics.memoryBudgetSupported =
+        m_csmMemoryBudgetSupported ? 1u : 0u;
+    diagnostics.memoryBudgetBytes = m_csmMemoryBudgetBytes;
+    diagnostics.memoryAvailableBytes = m_csmMemoryAvailableBytes;
+    diagnostics.resourceGeneration = m_shadowMapResourceGeneration;
+    diagnostics.resourceRebuildCount = m_csmResourceRebuildCount;
+    PublishCsmResolutionDiagnostics(diagnostics);
+  };
 
   if (m_shadowMap && m_shadowCasterMask &&
       m_shadowMapSampleView && m_shadowCasterMaskSampleView &&
-      m_shadowMapResolution == resolution && m_shadowMapLayers == cascadeCount)
-    return;
+      m_shadowMapResolution == resolution &&
+      m_shadowMapLayers == cascadeCount) {
+    m_csmEffectiveResolution = m_shadowMapResolution;
+    publishDiagnostics();
+    return true;
+  }
 
-  m_shadowMapResolution = resolution;
+  uint32_t candidateResolution =
+      m_csmResolutionFallbackLatched && resolution > 2048u
+          ? 2048u
+          : resolution;
+
+  // VK_EXT_memory_budget is the only preflight authority. Without it we try
+  // 4096 and only latch a fallback after an actual allocation failure.
+  m_csmMemoryBudgetSupported = m_device->features().extMemoryBudget != 0u;
+  m_csmMemoryBudgetBytes = 0u;
+  m_csmMemoryAvailableBytes = 0u;
+  if (!m_csmResolutionFallbackLatched && candidateResolution > 2048u &&
+      m_csmMemoryBudgetSupported) {
+    const DxvkAdapterMemoryInfo memoryInfo =
+        m_device->adapter()->getMemoryHeapInfo();
+    for (uint32_t i = 0u; i < memoryInfo.heapCount; ++i) {
+      const auto& heap = memoryInfo.heaps[i];
+      if ((heap.heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0u)
+        continue;
+      const uint64_t available =
+          heap.memoryBudget > heap.memoryAllocated
+              ? heap.memoryBudget - heap.memoryAllocated
+              : 0u;
+      if (available >= m_csmMemoryAvailableBytes) {
+        m_csmMemoryBudgetBytes = heap.memoryBudget;
+        m_csmMemoryAvailableBytes = available;
+      }
+    }
+    const uint64_t candidateBytes =
+        uint64_t(candidateResolution) * uint64_t(candidateResolution) *
+        uint64_t(cascadeCount) * 5ull; // D32 + R8
+    if (m_csmMemoryAvailableBytes <
+        candidateBytes + kCsmFallbackReserveBytes) {
+      m_csmResolutionFallbackLatched = true;
+      m_csmResolutionFallbackReason =
+          CsmResolutionFallbackReason::MemoryBudget;
+      candidateResolution = 2048u;
+    }
+  }
+
+  // A session-latched 2048 fallback still receives the original 4096 request
+  // every frame. Compare against the resolved candidate as well as the user
+  // request so the fallback stays observable without recreating identical
+  // 2048 resources on every pass.
+  if (m_shadowMap && m_shadowCasterMask &&
+      m_shadowMapSampleView && m_shadowCasterMaskSampleView &&
+      m_shadowMapResolution == candidateResolution &&
+      m_shadowMapLayers == cascadeCount) {
+    m_csmEffectiveResolution = m_shadowMapResolution;
+    publishDiagnostics();
+    return true;
+  }
+
+  struct ShadowResourceCandidate {
+    Rc<DxvkImage> shadowMap;
+    Rc<DxvkImageView> shadowMapSampleView;
+    decltype(m_shadowMapLayerViews) shadowMapLayerViews = {};
+    Rc<DxvkImage> shadowCasterMask;
+    Rc<DxvkImageView> shadowCasterMaskSampleView;
+    decltype(m_shadowCasterMaskLayerViews) shadowCasterMaskLayerViews = {};
+  };
+
+  const auto createCandidate = [&](uint32_t requestedCandidateResolution,
+                                   ShadowResourceCandidate& candidate) {
+    DxvkImageCreateInfo info = {};
+    info.type = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_D32_SFLOAT;
+    info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    info.extent = VkExtent3D{requestedCandidateResolution,
+                             requestedCandidateResolution, 1u};
+    info.numLayers = cascadeCount;
+    info.mipLevels = 1;
+    info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    info.access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                  VK_ACCESS_SHADER_READ_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+    DxvkImageCreateInfo maskInfo = {};
+    maskInfo.type = VK_IMAGE_TYPE_2D;
+    maskInfo.format = VK_FORMAT_R8_UNORM;
+    maskInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    maskInfo.extent = info.extent;
+    maskInfo.numLayers = cascadeCount;
+    maskInfo.mipLevels = 1;
+    maskInfo.usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    maskInfo.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    maskInfo.access =
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    maskInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    maskInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    maskInfo.debugName = "War3ShadowCasterMask";
+
+    try {
+      Rc<DxvkImage> candidateShadowMap = m_device->createImage(
+          info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      Rc<DxvkImage> candidateShadowCasterMask = m_device->createImage(
+          maskInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      if (!candidateShadowMap || !candidateShadowMap->storage() ||
+          !candidateShadowCasterMask ||
+          !candidateShadowCasterMask->storage()) {
+        return false;
+      }
+      candidate.shadowMap = std::move(candidateShadowMap);
+      candidate.shadowCasterMask = std::move(candidateShadowCasterMask);
+
+      const VkComponentMapping mapping = {
+          VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+          VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+      DxvkImageViewKey viewInfo;
+      viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      viewInfo.format = info.format;
+      viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+      viewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+      viewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+      viewInfo.mipIndex = 0;
+      viewInfo.mipCount = 1;
+      viewInfo.layerIndex = 0;
+      viewInfo.layerCount = cascadeCount;
+      viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+      candidate.shadowMapSampleView = candidate.shadowMap->createView(viewInfo);
+
+      DxvkImageViewKey maskViewInfo;
+      maskViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      maskViewInfo.format = maskInfo.format;
+      maskViewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+      maskViewInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      maskViewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+      maskViewInfo.mipIndex = 0;
+      maskViewInfo.mipCount = 1;
+      maskViewInfo.layerIndex = 0;
+      maskViewInfo.layerCount = cascadeCount;
+      maskViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+      candidate.shadowCasterMaskSampleView =
+          candidate.shadowCasterMask->createView(maskViewInfo);
+
+      for (uint32_t i = 0u; i < cascadeCount; ++i) {
+        DxvkImageViewKey layerViewInfo;
+        layerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        layerViewInfo.format = info.format;
+        layerViewInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        layerViewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        layerViewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+        layerViewInfo.mipIndex = 0;
+        layerViewInfo.mipCount = 1;
+        layerViewInfo.layerIndex = i;
+        layerViewInfo.layerCount = 1;
+        layerViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+        candidate.shadowMapLayerViews[i] =
+            candidate.shadowMap->createView(layerViewInfo);
+
+        DxvkImageViewKey maskLayerViewInfo;
+        maskLayerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        maskLayerViewInfo.format = maskInfo.format;
+        maskLayerViewInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        maskLayerViewInfo.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        maskLayerViewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        maskLayerViewInfo.mipIndex = 0;
+        maskLayerViewInfo.mipCount = 1;
+        maskLayerViewInfo.layerIndex = i;
+        maskLayerViewInfo.layerCount = 1;
+        maskLayerViewInfo.packedSwizzle =
+            DxvkImageViewKey::packSwizzle(mapping);
+        candidate.shadowCasterMaskLayerViews[i] =
+            candidate.shadowCasterMask->createView(maskLayerViewInfo);
+      }
+    } catch (const DxvkError& error) {
+      const std::string message = error.message();
+      if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST ||
+          message.find("VK_ERROR_DEVICE_LOST") != std::string::npos ||
+          message.find(": -4") != std::string::npos) {
+        throw;
+      }
+      return false;
+    }
+
+    if (!candidate.shadowMapSampleView ||
+        !candidate.shadowCasterMaskSampleView)
+      return false;
+    for (uint32_t i = 0u; i < cascadeCount; ++i) {
+      if (!candidate.shadowMapLayerViews[i] ||
+          !candidate.shadowCasterMaskLayerViews[i])
+        return false;
+    }
+    return true;
+  };
+
+  ShadowResourceCandidate candidate = {};
+  if (!createCandidate(candidateResolution, candidate)) {
+    if (candidateResolution > 2048u) {
+      m_csmResolutionFallbackLatched = true;
+      m_csmResolutionFallbackReason =
+          CsmResolutionFallbackReason::AllocationFailure;
+      candidateResolution = 2048u;
+      candidate = {};
+    }
+    if (!createCandidate(candidateResolution, candidate)) {
+      m_csmEffectiveResolution = m_shadowMapResolution;
+      publishDiagnostics();
+      return false;
+    }
+  }
+
+  // Transactional commit: old resources remain alive until every candidate
+  // image and view exists. Only the successful swap changes generations.
+  std::swap(m_shadowMap, candidate.shadowMap);
+  std::swap(m_shadowMapSampleView, candidate.shadowMapSampleView);
+  std::swap(m_shadowMapLayerViews, candidate.shadowMapLayerViews);
+  std::swap(m_shadowCasterMask, candidate.shadowCasterMask);
+  std::swap(m_shadowCasterMaskSampleView,
+            candidate.shadowCasterMaskSampleView);
+  std::swap(m_shadowCasterMaskLayerViews,
+            candidate.shadowCasterMaskLayerViews);
+
+  m_shadowMapResolution = candidateResolution;
   m_shadowMapLayers = cascadeCount;
+  m_csmEffectiveResolution = candidateResolution;
 
-  // Replay 路径已弃用：不再创建 D3D9 depth texture/surface
+  // Replay path is retired; no D3D9 depth texture/surface is recreated.
   m_shadowTexture = nullptr;
   m_shadowSurface = nullptr;
-
-  m_shadowMap = nullptr;
-  m_shadowMapSampleView = nullptr;
-  m_shadowMapLayerViews = {};
-  m_shadowCasterMask = nullptr;
-  m_shadowCasterMaskSampleView = nullptr;
-  m_shadowCasterMaskLayerViews = {};
   m_hasCompleteShadowMap = false;
   m_lastShadowMapCasterCount = 0;
   m_transientEmptyReplayHoldFramesRemaining = 0;
@@ -615,111 +852,9 @@ void War3ShadowReceiverPass::ensureShadowResources(uint32_t cascadeCount,
   m_shadowTaaHistoryContractValid = false;
   if (++m_shadowMapResourceGeneration == 0u)
     ++m_shadowMapResourceGeneration;
-
-  DxvkImageCreateInfo info = {};
-  info.type = VK_IMAGE_TYPE_2D;
-  info.format = VK_FORMAT_D32_SFLOAT;
-  info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
-  info.extent = VkExtent3D{resolution, resolution, 1u};
-  info.numLayers = cascadeCount;
-  info.mipLevels = 1;
-  info.usage =
-      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  info.stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  info.access =
-      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-  info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-
-  m_shadowMap =
-      m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-  DxvkImageCreateInfo maskInfo = {};
-  maskInfo.type = VK_IMAGE_TYPE_2D;
-  maskInfo.format = VK_FORMAT_R8_UNORM;
-  maskInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
-  maskInfo.extent = VkExtent3D{resolution, resolution, 1u};
-  maskInfo.numLayers = cascadeCount;
-  maskInfo.mipLevels = 1;
-  maskInfo.usage =
-      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  maskInfo.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  maskInfo.access =
-      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-  maskInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-  maskInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  maskInfo.debugName = "War3ShadowCasterMask";
-
-  m_shadowCasterMask =
-      m_device->createImage(maskInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-  VkComponentMapping mapping = {
-      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-
-  {
-    DxvkImageViewKey viewInfo;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    viewInfo.format = info.format;
-    viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-    viewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    viewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
-    viewInfo.mipIndex = 0;
-    viewInfo.mipCount = 1;
-    viewInfo.layerIndex = 0;
-    viewInfo.layerCount = cascadeCount;
-    viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-    m_shadowMapSampleView = m_shadowMap->createView(viewInfo);
-  }
-
-  if (m_shadowCasterMask) {
-    DxvkImageViewKey maskViewInfo;
-    maskViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    maskViewInfo.format = maskInfo.format;
-    maskViewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-    maskViewInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    maskViewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
-    maskViewInfo.mipIndex = 0;
-    maskViewInfo.mipCount = 1;
-    maskViewInfo.layerIndex = 0;
-    maskViewInfo.layerCount = cascadeCount;
-    maskViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-    m_shadowCasterMaskSampleView = m_shadowCasterMask->createView(maskViewInfo);
-  }
-
-  for (uint32_t i = 0; i < cascadeCount; i++) {
-    DxvkImageViewKey layerViewInfo;
-    layerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    layerViewInfo.format = info.format;
-    layerViewInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    layerViewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    layerViewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
-    layerViewInfo.mipIndex = 0;
-    layerViewInfo.mipCount = 1;
-    layerViewInfo.layerIndex = i;
-    layerViewInfo.layerCount = 1;
-    layerViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-    m_shadowMapLayerViews[i] = m_shadowMap->createView(layerViewInfo);
-
-    if (m_shadowCasterMask) {
-      DxvkImageViewKey maskLayerViewInfo;
-      maskLayerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-      maskLayerViewInfo.format = maskInfo.format;
-      maskLayerViewInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-      maskLayerViewInfo.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-      maskLayerViewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
-      maskLayerViewInfo.mipIndex = 0;
-      maskLayerViewInfo.mipCount = 1;
-      maskLayerViewInfo.layerIndex = i;
-      maskLayerViewInfo.layerCount = 1;
-      maskLayerViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-      m_shadowCasterMaskLayerViews[i] =
-          m_shadowCasterMask->createView(maskLayerViewInfo);
-    }
-  }
+  ++m_csmResourceRebuildCount;
+  publishDiagnostics();
+  return true;
 }
 
 DxvkResourceBufferInfo War3ShadowReceiverPass::ensureShadowMatrixBuffer(

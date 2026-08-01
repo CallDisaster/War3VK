@@ -3,6 +3,7 @@
 #include "war3_imgui.h"
 #include "../../d3d9_device.h"
 #include "../../d3d9_war3_light.h"
+#include "../../d3d9_war3_shadow.h"
 #include "../../war3_shader_api.h"
 #include "../../war3_shaderpack.h"
 #include "imgui_impl_dx9.h"
@@ -14,6 +15,7 @@
 #include "../render/war3_render_state.h"
 #include "../shader/war3_shader_manager.h"
 #include "../tools/war3_perf_monitor.h"
+#include "../tools/war3_diagnostics_hub.h"
 
 #include <algorithm>
 
@@ -615,7 +617,42 @@ void War3Imgui::drawDebugWindow() {
             settings.shadows.shadowTaaEnabled =
                 settings.shadows.shadowTaaMode ==
                 War3ShadowTaaMode::Temporal;
+            ++settings.shadows.shadowTaaSettingsRevision;
           }
+          const auto taaDiagnostics = dxvk::QueryShadowTaaDiagnostics();
+          ImGui::Text(
+              "TAA requested/effective/shader: %u / %u / %u",
+              taaDiagnostics.requestedMode, taaDiagnostics.effectiveMode,
+              taaDiagnostics.shaderMode);
+          ImGui::Text(
+              "history valid/readable: %u / %u  gen=%llu  invalidate=0x%X",
+              taaDiagnostics.historyValid, taaDiagnostics.historyReadable,
+              static_cast<unsigned long long>(
+                  taaDiagnostics.historyGeneration),
+              taaDiagnostics.lastInvalidationReason);
+          ImGui::Text("固定墙旁路帧: %llu  settings rev=%llu",
+                      static_cast<unsigned long long>(
+                          taaDiagnostics.fixedWallBypassCount),
+                      static_cast<unsigned long long>(
+                          taaDiagnostics.settingsRevision));
+          const auto csmDiagnostics = dxvk::QueryCsmResolutionDiagnostics();
+          ImGui::Text("CSM requested/effective: %u / %u  generation=%llu",
+                      csmDiagnostics.requestedResolution,
+                      csmDiagnostics.effectiveResolution,
+                      static_cast<unsigned long long>(
+                          csmDiagnostics.resourceGeneration));
+          ImGui::Text("CSM fallback: %s  reason=%u  rebuilds=%llu",
+                      csmDiagnostics.fallbackLatched ? "latched" : "none",
+                      csmDiagnostics.fallbackReason,
+                      static_cast<unsigned long long>(
+                          csmDiagnostics.resourceRebuildCount));
+          if (ImGui::Button("保留最近阴影证据"))
+            dxvk::war3::tools::RequestShadowEvidenceRetention();
+          ImGui::SameLine();
+          ImGui::Text("采集器: %s",
+                      dxvk::war3::tools::IsShadowEvidenceCollectorAttached()
+                          ? "已连接"
+                          : "未连接");
           ImGui::BeginDisabled(
               settings.shadows.shadowTaaMode !=
               War3ShadowTaaMode::Temporal);

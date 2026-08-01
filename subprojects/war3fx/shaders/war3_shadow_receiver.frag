@@ -330,7 +330,7 @@ float computeWallStabilityFactor(vec3 normV, vec3 viewPos, vec3 lightDirV) {
 float sampleShadowStableWall(uint cascadeIndex, vec2 uv, float refDepth, float radiusTexel) {
   float invRes = max(ubo.u_params.z, 1e-6);
   vec2 snappedUv = (floor(uv / invRes) + 0.5) * invRes;
-  float stableRadius = max(radiusTexel, 1.75);
+  float stableRadius = max(radiusTexel, 1.50);
   return sampleShadowGrid(cascadeIndex, snappedUv, refDepth, stableRadius, 2);
 }
 

@@ -12,6 +12,9 @@ SHADOW_H = (ROOT / "src/d3d9/d3d9_war3_shadow.h").read_text(
 SHADOW_CPP = (ROOT / "src/d3d9/d3d9_war3_shadow.cpp").read_text(
     encoding="utf-8"
 )
+PIPELINE = (ROOT / "src/d3d9/d3d9_war3_pipeline.cpp").read_text(
+    encoding="utf-8"
+)
 PERF_H = (
     ROOT / "src/d3d9/war3/tools/war3_perf_monitor.h"
 ).read_text(encoding="utf-8")
@@ -35,16 +38,17 @@ class ShadowTaaStage0StaticTests(unittest.TestCase):
         self.assertIn("bool shadowTaaEnabled = false", SETTINGS)
 
     def test_new_mode_switch_precedes_legacy_switch(self):
-        mode_pos = SHADOW_CPP.index("DXVK_WAR3_SHADOW_TAA_MODE")
-        legacy_pos = SHADOW_CPP.index(
-            'env::getEnvVar("DXVK_WAR3_SHADOW_TAA")'
-        )
+        mode_pos = PIPELINE.index("DXVK_WAR3_SHADOW_TAA_MODE")
+        legacy_pos = PIPELINE.index("DXVK_WAR3_SHADOW_TAA\"")
         self.assertLess(mode_pos, legacy_pos)
         self.assertIn(
-            "? War3ShadowTaaMode::Temporal\n"
-            "        : War3ShadowTaaMode::DirectInline",
-            SHADOW_CPP,
+            "ParseInitialShadowTaaMode(initialShadowTaaMode)", PIPELINE
         )
+        resolve_start = SHADOW_CPP.index("ResolveShadowTaaRequestedMode")
+        resolve_end = SHADOW_CPP.index(
+            "ShadowTaaDisableForSemanticDynamicEnabled", resolve_start
+        )
+        self.assertNotIn("getEnvVar", SHADOW_CPP[resolve_start:resolve_end])
 
     def test_runtime_module_gates_all_auxiliary_work(self):
         self.assertIn(

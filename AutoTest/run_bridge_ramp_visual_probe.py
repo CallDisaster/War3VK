@@ -27,6 +27,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--war3-dir", default=r"E:\Work\War3")
     parser.add_argument(
+        "--attach-only",
+        action="store_true",
+        help="Attach to an existing War3 process without launch/stop/focus control.",
+    )
+    parser.add_argument("--attach-pid", type=int, default=0)
+    parser.add_argument(
         "--map",
         default=r"E:\Work\War3\Maps\ShadowTest\光影测试(桥斜坡).w3x",
     )
@@ -188,8 +194,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--trace-ring-retain-segments",
         type=int,
-        default=2,
+        default=3,
         help="Recent non-trigger trace segments retained on disk.",
+    )
+    parser.add_argument(
+        "--trace-ring-max-disk-mb",
+        type=int,
+        default=512,
+        help="Hard on-disk cap for this rolling evidence session.",
     )
     parser.add_argument(
         "--trace-ring-max-pose-records", type=int, default=64
@@ -415,6 +427,14 @@ def _safe_unlink_probe_artifact(path: Path, allowed_dir: Path) -> str:
 
 def main() -> int:
     args = _parse_args()
+    owns_process = False if args.attach_only else True
+    if args.attach_only:
+        if args.attach_pid <= 0:
+            raise SystemExit("--attach-pid is required with --attach-only")
+        if args.trace_ring_segment_sec <= 0.0:
+            args.trace_ring_segment_sec = 2.0
+        if args.capture_retain_count == 0:
+            args.capture_retain_count = 16
     if args.capture_retain_count < 0:
         raise SystemExit("--capture-retain-count must be non-negative")
     if args.temporal_dark_trigger_pixels < 0:
@@ -444,6 +464,8 @@ def main() -> int:
         raise SystemExit("--trace-ring-segment-sec must be 0 or at least 2")
     if args.trace_ring_retain_segments < 1:
         raise SystemExit("--trace-ring-retain-segments must be positive")
+    if args.trace_ring_max_disk_mb < 1:
+        raise SystemExit("--trace-ring-max-disk-mb must be positive")
     for name in (
         "trace_ring_max_pose_records",
         "trace_ring_max_shadow_object_records",
@@ -573,12 +595,39 @@ def main() -> int:
             result_box["exception"] = repr(exc)
             result_box["traceback"] = traceback.format_exc()
 
-    worker = threading.Thread(target=run_gate, name="bridge-ramp-probe")
-    worker.start()
-    priority: Dict[str, Any] = {
-        "ok": False,
-        "error": "process did not publish a retained witness",
-    }
+    if owns_process:
+        worker: Any = threading.Thread(
+            target=run_gate, name="bridge-ramp-probe"
+        )
+        worker.start()
+        priority: Dict[str, Any] = {
+            "ok": False,
+            "error": "process did not publish a retained witness",
+        }
+    else:
+        class AttachedProcessWorker:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+            def is_alive(self) -> bool:
+                return war3._pid_alive(self.pid)
+
+            def join(self) -> None:
+                return None
+
+        war3.STATE.war3_pid = int(args.attach_pid)
+        war3.STATE.war3_dir = war3_dir
+        worker = AttachedProcessWorker(int(args.attach_pid))
+        result_box["result"] = {
+            "ok": worker.is_alive(),
+            "attachOnly": True,
+            "pid": int(args.attach_pid),
+        }
+        priority = {
+            "ok": True,
+            "skipped": True,
+            "reason": "attach-only never changes process priority",
+        }
     frames: List[Dict[str, Any]] = []
     frame_rows_by_path: Dict[str, Dict[str, Any]] = {}
     rolling_capture_paths: List[Path] = []
@@ -620,22 +669,21 @@ def main() -> int:
         "enabled": bool(trace_ring_enabled),
         "segmentSec": float(args.trace_ring_segment_sec),
         "retainSegments": int(args.trace_ring_retain_segments),
+        "maxDiskMiB": int(args.trace_ring_max_disk_mb),
         "segments": [],
         "control": [],
         "errors": [],
+        "diskCapEvictions": [],
+        "manualRetentionEvents": [],
     }
     trace_segment_started_at = 0.0
     trace_segment_pin_on_close = False
+    manual_retention_revision_seen = 0
 
     def prune_trace_ring() -> None:
         segments = trace_ring["segments"]
-        retained_unpinned = [
-            row
-            for row in segments
-            if not row.get("pinned") and row.get("retained", True)
-        ]
-        while len(retained_unpinned) > args.trace_ring_retain_segments:
-            row = retained_unpinned.pop(0)
+
+        def delete_segment(row: Dict[str, Any], reason: str) -> bool:
             path_text = str(row.get("path", "") or "")
             path = Path(path_text) if path_text else Path()
             safe_name = path.name.startswith("shadow_pose_full_trace_") and (
@@ -652,8 +700,60 @@ def main() -> int:
                 outcome = "refused: trace name or run freshness check failed"
             row["retained"] = outcome != "deleted"
             row["deleteOutcome"] = outcome
+            row["deleteReason"] = reason
+            if outcome == "deleted":
+                trace_ring["diskCapEvictions"].append(
+                    {"path": path_text, "reason": reason}
+                )
+                return True
             if outcome.startswith("failed") or outcome.startswith("refused"):
                 trace_ring["errors"].append(outcome)
+            return False
+
+        retained_unpinned = [
+            row
+            for row in segments
+            if not row.get("pinned") and row.get("retained", True)
+        ]
+        while len(retained_unpinned) > args.trace_ring_retain_segments:
+            row = retained_unpinned.pop(0)
+            delete_segment(row, "retain-count")
+
+        max_bytes = int(args.trace_ring_max_disk_mb) * 1024 * 1024
+        capture_bytes = 0
+        for path in rolling_capture_paths:
+            try:
+                if path.exists():
+                    capture_bytes += path.stat().st_size
+            except OSError:
+                pass
+        max_trace_bytes = max(0, max_bytes - capture_bytes)
+        trace_ring["captureRetainedBytes"] = capture_bytes
+        while True:
+            retained_rows = [
+                row for row in segments if row.get("retained", True)
+            ]
+            total_bytes = 0
+            for row in retained_rows:
+                try:
+                    total_bytes += Path(str(row.get("path", ""))).stat().st_size
+                except OSError:
+                    pass
+            trace_ring["retainedBytes"] = total_bytes
+            trace_ring["evidenceRetainedBytes"] = (
+                capture_bytes + total_bytes
+            )
+            if total_bytes <= max_trace_bytes or not retained_rows:
+                break
+            # Prefer non-pinned history, then evict the oldest pinned segment.
+            # This keeps the disk cap hard even if a pathological trace segment
+            # grows far beyond its expected two-second budget.
+            victim = next(
+                (row for row in retained_rows if not row.get("pinned")),
+                retained_rows[0],
+            )
+            if not delete_segment(victim, "hard-disk-cap"):
+                break
 
     def start_trace_segment(pid: int, *, pin_on_close: bool = False) -> bool:
         nonlocal trace_segment_started_at, trace_segment_pin_on_close
@@ -795,9 +895,7 @@ def main() -> int:
         return row
 
     def prune_capture_ring() -> None:
-        if args.capture_retain_count <= 0:
-            return
-        while True:
+        while args.capture_retain_count > 0:
             unpinned = [
                 path
                 for path in rolling_capture_paths
@@ -818,19 +916,65 @@ def main() -> int:
             if outcome == "deleted":
                 rolling_capture_paths.remove(path)
             if outcome != "deleted":
-                return
+                break
+
+        # The 512 MiB option is a session-wide evidence cap, not a trace-only
+        # cap. Keep screenshots below it first, then let prune_trace_ring use
+        # only the remaining bytes. The hard cap outranks pinning if every
+        # remaining artifact is pinned.
+        if trace_ring_enabled or args.attach_only:
+            max_bytes = int(args.trace_ring_max_disk_mb) * 1024 * 1024
+            while True:
+                existing = [
+                    path for path in rolling_capture_paths if path.exists()
+                ]
+                total_bytes = 0
+                for path in existing:
+                    try:
+                        total_bytes += path.stat().st_size
+                    except OSError:
+                        pass
+                if total_bytes <= max_bytes or not existing:
+                    break
+                victim = next(
+                    (
+                        path
+                        for path in existing
+                        if str(path.resolve()) not in pinned_capture_paths
+                    ),
+                    existing[0],
+                )
+                outcome = _safe_unlink_probe_artifact(victim, frame_dir)
+                capture_ring_deletions.append(
+                    {
+                        "path": str(victim),
+                        "outcome": outcome,
+                        "reason": "hard-evidence-disk-cap",
+                    }
+                )
+                row = frame_rows_by_path.get(str(victim.resolve()))
+                if row is not None:
+                    row["retained"] = outcome != "deleted"
+                    row["deleteOutcome"] = outcome
+                if outcome == "deleted":
+                    rolling_capture_paths.remove(victim)
+                else:
+                    break
+        if trace_ring_enabled:
+            prune_trace_ring()
 
     try:
         deadline = time.time() + max(60, args.ready_timeout_sec)
-        while worker.is_alive() and time.time() < deadline:
-            attempt = gate._lower_owned_process_priority()
-            if attempt.get("ok"):
-                priority = attempt
-                break
-            if not attempt.get("retry", False):
-                priority = attempt
-                break
-            time.sleep(0.05)
+        if owns_process:
+            while worker.is_alive() and time.time() < deadline:
+                attempt = gate._lower_owned_process_priority()
+                if attempt.get("ok"):
+                    priority = attempt
+                    break
+                if not attempt.get("retry", False):
+                    priority = attempt
+                    break
+                time.sleep(0.05)
 
         ready = False
         pid = int(war3.STATE.war3_pid or 0)
@@ -863,6 +1007,22 @@ def main() -> int:
             time.sleep(0.10)
 
         if ready:
+            collector_response = war3._control_plane_request(
+                pid=pid,
+                command="set_shadow_evidence_collector",
+                payload={"attached": True},
+                timeout_sec=2.0,
+            )
+            trace_ring["control"].append(
+                {
+                    "action": "collector-attached",
+                    "ok": bool(collector_response.get("ok")),
+                    "error": str(collector_response.get("error", "") or ""),
+                }
+            )
+            manual_retention_revision_seen = int(
+                shadow.get("shadowEvidenceRetentionRevision", 0) or 0
+            )
             # Wait for a bridge-heavy Stage13 frame. This avoids freezing the
             # test while the camera is over empty terrain and makes the
             # current/history/final factor captures directly comparable.
@@ -909,7 +1069,7 @@ def main() -> int:
                     ):
                         break
                     time.sleep(0.05)
-            if args.lock_sun_time is not None:
+            if args.lock_sun_time is not None and not args.attach_only:
                 sun_lock = war3._invoke_internal_test_request(
                     pid=pid,
                     war3_dir=war3_dir,
@@ -923,7 +1083,7 @@ def main() -> int:
                 # Let the new light direction settle through CSM, current
                 # visibility and history before the first exact capture.
                 time.sleep(0.25)
-            if args.freeze_scripted_camera:
+            if args.freeze_scripted_camera and not args.attach_only:
                 camera_freeze = war3._invoke_internal_test_request(
                     pid=pid,
                     war3_dir=war3_dir,
@@ -936,7 +1096,7 @@ def main() -> int:
                 # Drain the last in-flight simulation frame before correlating
                 # Stage13 and shadow history on a fixed scene.
                 time.sleep(0.25)
-            if args.camera_angle_deg is not None:
+            if args.camera_angle_deg is not None and not args.attach_only:
                 camera_command, camera_payload = camera_request(0)
                 camera_angle = war3._invoke_internal_test_request(
                     pid=pid,
@@ -972,6 +1132,63 @@ def main() -> int:
             for index in range(capture_count):
                 if not worker.is_alive():
                     break
+                retention_status = war3._control_plane_request(
+                    pid=pid,
+                    command="get_runtime_status",
+                    payload={},
+                    timeout_sec=2.0,
+                )
+                retention_shadow = dict(
+                    (retention_status.get("result", {}) or {}).get(
+                        "shadow", {}
+                    )
+                    or {}
+                )
+                retention_revision = int(
+                    retention_shadow.get(
+                        "shadowEvidenceRetentionRevision", 0
+                    )
+                    or 0
+                )
+                if retention_revision > manual_retention_revision_seen:
+                    manual_retention_revision_seen = retention_revision
+                    retained_segments = [
+                        row
+                        for row in trace_ring["segments"]
+                        if row.get("retained", True)
+                    ]
+                    if retained_segments:
+                        retained_segments[-1]["pinned"] = True
+                    if trace_ring_enabled:
+                        stop_trace_segment(
+                            pid,
+                            reason="manual-imgui-retention",
+                            pin=True,
+                        )
+                        start_trace_segment(pid, pin_on_close=True)
+                    trace_pin_until_index = max(
+                        trace_pin_until_index,
+                        index + max(
+                            1,
+                            int(
+                                math.ceil(
+                                    args.trace_ring_segment_sec
+                                    / max(args.capture_interval_sec, 0.01)
+                                )
+                            ),
+                        ),
+                    )
+                    if previous_capture_path is not None:
+                        pinned_capture_paths.add(
+                            str(previous_capture_path.resolve())
+                        )
+                    trace_ring["manualRetentionEvents"].append(
+                        {
+                            "revision": retention_revision,
+                            "captureIndex": index,
+                            "atMs": int(time.time() * 1000),
+                        }
+                    )
                 if (
                     trace_ring_enabled
                     and trace_segment_started_at > 0.0
@@ -991,7 +1208,7 @@ def main() -> int:
                         pid,
                         pin_on_close=index <= trace_pin_until_index,
                     )
-                if args.camera_angle_deg is not None:
+                if args.camera_angle_deg is not None and not args.attach_only:
                     camera_command, camera_payload = camera_request(index)
                     refreshed = war3._invoke_internal_test_request(
                         pid=pid,
@@ -1138,6 +1355,9 @@ def main() -> int:
 
                     previous_capture_path = actual_capture_path
                     previous_capture_index = index
+                    if index <= trace_pin_until_index:
+                        pinned_capture_paths.add(resolved_text)
+                        frame_row["evidencePinned"] = True
                     prune_capture_ring()
 
                 if (
@@ -1174,9 +1394,24 @@ def main() -> int:
                     payload={"paused": False},
                     timeout_sec=6.0,
                 )
-            cleanup = gate._cleanup_owned_process()
+            war3._control_plane_request(
+                pid=int(war3.STATE.war3_pid or 0),
+                command="set_shadow_evidence_collector",
+                payload={"attached": False},
+                timeout_sec=2.0,
+            )
+            if owns_process:
+                cleanup = gate._cleanup_owned_process()
+            else:
+                cleanup = {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "attach-only never stops the game",
+                }
 
     payload = {
+        "attachOnly": bool(args.attach_only),
+        "attachPid": int(args.attach_pid),
         "ok": bool(
             priority.get("ok")
             and frames

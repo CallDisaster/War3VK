@@ -1,5 +1,102 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（固定 4096 CSM、TAA v2 状态闭合、Arena fence 与 GPU 取证）
+
+用户授权在无人监管的隔离桌面启动游戏，并要求落实 4096 CSM、TAA v2 真实开关、
+大型地图 GPU 未响应防护以及低频阴影块取证。本轮继续保留 2026-07-29 Stage12
+exact-current-frame producer 基线；没有重新开启 draw-time VB cache、fast append、
+prebuild bypass 或 source fingerprint reuse，也没有延长 grace。
+
+**TAA v2 设置与执行闭合**：
+
+- `DXVK_WAR3_SHADOW_TAA_MODE` 只在 `War3RenderPipeline` 构造时读取；旧
+  `DXVK_WAR3_SHADOW_TAA` 仅作一次兼容回退。运行中 ImGui 拥有最终控制权，切换会
+  增加 `shadowTaaSettingsRevision`，不再被逐帧环境解析覆盖。
+- 模式或 revision 变化只产生一次 `ModeSwitch` history cut。Temporal 首个完整帧以
+  shader mode 2 写入当前结果，后续在 history 可读时进入 mode 3；只有
+  Visibility/Motion/Receiver/HistoryWrite 四阶段全部完成才推进 ping-pong 与 generation。
+- `runtime_status.json` 和 ImGui 现在同时显示 requested/effective/shader、history
+  valid/readable/generation、最后失效原因与设置 revision。兼容字段
+  `semanticSceneShadowTaaActive` 改为实际 shader 执行证据。
+- 保留既有 3x3 亮度方差裁剪、reactive feedback 与双线性 history，没有提高历史权重
+  或增加 Catmull-Rom 带宽。固定镜头慢移 A/B 中 Temporal 的稳定背景最大暗变化均值
+  比 Direct 低约 2.4%，剔除轨迹端点后低约 4.9%；作用真实但刻意保持清晰度优先。
+
+**CSM 4096 与清晰边缘**：
+
+- requested 默认固定为 4096，禁用按 geometry work 在 4096/2048 间逐帧切换。
+  普通 PCF 半径 `0.85 -> 0.70`，稳定墙面最小半径 `1.75 -> 1.50` texel；点阴影
+  过滤参数不变。
+- 支持 `VK_EXT_memory_budget` 时，仅在可用 device-local 预算不足候选 D32+R8 实际
+  字节数再加 512 MiB reserve 时锁存回退 2048；无扩展时先尝试 4096，只有真实分配
+  失败才回退。device lost 会继续抛出，不能伪装为回退。
+- 资源使用完整 candidate image/view 创建后 `std::swap` 的两阶段提交。失败保留旧资源；
+  只有成功交换才增加 generation/rebuild 并失效一次 TAA history。
+- 审计额外修正了低显存专属边界：锁存 2048 后 requested 仍保持 4096，resolved
+  candidate 与现有 2048 等价时立即复用，禁止逐帧重建相同 fallback 资源。
+
+**Shadow Arena 与 GPU incident recorder**：
+
+- Arena 页固定 64 MiB，每代际最多 384 MiB，总驻留上限 1.125 GiB；三个预热页合计
+  192 MiB。Present 最后消费者之后把专用 `sync::Fence` 信号排入 GPU command list；
+  只有 retire serial 已完成的代际才能清零，GPU 落后时在总上限内增加 spill 代际。
+- busy reuse、单代际 overflow 或总驻留超限均 fail-closed 并标记 frame incomplete；
+  `War3AllocFreezeBuffer` 不再落入无预算的 LegacyFreeze。
+- flight recorder 保留最近 240 帧的 CSM requested/effective/fallback/generation/显存预算、
+  TAA mode/history、Arena used/resident/busy/overflow、queue submit/complete/result 与最后
+  render stage。queue error 或有在途提交且 10 秒无进展时原子写 incident JSON，只保留
+  最近四份。本 DXVK 构建未暴露 `VK_EXT_device_fault`，incident 会显式记录 unsupported。
+
+**低磁盘 final-caster 取证**：
+
+- `run_bridge_ramp_visual_probe.py --attach-only [--attach-pid]` 只连接用户已有 War3；
+  不启动、不结束、不调前台、不改优先级，也不暂停游戏、太阳或相机。
+- 滚动 trace 默认 2 秒段、保留最近三段、会话硬上限 512 MiB。大暗块自动触发或
+  ImGui“保留最近阴影证据”按钮会固定前段/当前段/后一段与相邻截图；界面显示采集器
+  是否连接。未触发证据持续按 retain-count 淘汰。
+
+**无人监管运行结果**：
+
+- 桥/斜坡 Temporal+4096：120/120 exact capture；报告
+  `war3_perf_report_auto_2026_08_01_23_57_26.html`，7,200 帧 / 69.826 秒，
+  111.584 FPS、GPU 3.038 ms。CSM 4096/4096、generation/rebuild=1/1；Arena 驻留
+  192 MiB；`framesIncomplete=0 / budgetExceeded=0 / deviceLost=0`。首次两次在线
+  大暗块触发均为加载后脚本相机大幅转场，前中后 trace 已保留 183 MiB。
+- 高压图 Temporal+4096+完整 trace：160/160 capture；报告
+  `war3_perf_report_auto_2026_08_02_00_00_42.html`，3,766 帧 / 81.821 秒，
+  48.394 FPS、GPU 4.357 ms，稳态约 1,116 shadow draws，最大 Shadow 用量
+  55.783 MiB；暗块触发、Arena busy/overflow/incomplete、旧帧复用、局部渲染、
+  device lost 全为 0。
+- 同高压图 Direct+4096 对照：120/120 capture；报告
+  `war3_perf_report_auto_2026_08_02_00_02_53.html`，3,602 帧 / 71.830 秒，
+  52.393 FPS、GPU 4.780 ms；requested/effective/shader=0/0/0，history 始终无效；
+  同一组完整性与驱动门全部为 0。
+- 最终审计 DLL 高压冒烟：24/24 capture；报告
+  `war3_perf_report_auto_2026_08_02_00_17_22.html`，2,514 帧 / 36.814 秒，
+  70.161 FPS、GPU 4.321 ms，最大 Shadow 用量 55.777 MiB；4096 单代稳定且所有
+  incomplete/budget/device-lost 门为 0。全部运行中未产生 GPU incident，也没有新的
+  `nvlddmkm` / Display 153/4101 事件。
+- attach-only 实测连接由隔离 runner 持有的 PID 16216：8/8 capture、1 个 trace 段，
+  截图 41.5 MiB + trace 65.7 MiB = 107.1 MiB；priority 与 cleanup 都明确 skipped。
+  attach 返回后原 PID 仍存活且响应，随后只由持有者自然结束；无残留 War3 进程。
+
+**静态、构建与部署**：
+
+- 相关定向套件 157 tests PASS；完整 `test_*static.py` 发现集 204 tests PASS；
+  Win32 build 成功，`ninja -C build32 -n` no-work，`git diff --check` 仅既有 CRLF 警告。
+- 最终 `build32` / `E:\Work\War3\d3d9.dll` exact：32,594,571 bytes，SHA-256
+  `437F82CF188AE819F087F003B1A25FB3F5FD0745F251D4FBBBAB7EC6729EB858`。
+- 初始回退：`E:\Work\War3\d3d9.dll.bak_20260801_235322__pre_4096_taa_arena`
+  （旧稳定 SHA `E0A1557D...`）；审计前候选回退：
+  `E:\Work\War3\d3d9.dll.bak_20260802_001630_pre_csm_latch_audit`
+  （SHA `6503547F...`）。提交只进入本地 `codex/war3-stable-producer-baseline`，不推送。
+
+**发布边界**：默认仍为 DirectInline。自动门已证明 TAA 开关、4096 CSM 和 Arena GPU
+生命周期真实生效，并且本轮运行未复现驱动故障或低频阴影块；但没有用户物理屏长时间
+观察前，不能宣称阴影块彻底消失，也不能把 Temporal 改为发布默认值。若原克尔苏加德或
+路径阻断器位置再现，使用 attach-only 滚动证据定点修复，禁止重新开启跨帧 cache 或
+扩大过滤器掩盖问题。
+
 ## 🚨 2026-07-30（点阴影径向深度恢复 + TAA 方差裁剪候选，已 commit）
 
 用户要求先保全接近发布的阴影正确性基线，再恢复失效的点光阴影并推进优化版 TAA。

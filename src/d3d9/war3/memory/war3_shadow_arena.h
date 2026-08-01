@@ -27,11 +27,25 @@ struct ShadowArenaAllocation {
   }
 };
 
+struct ShadowArenaDiagnostics {
+  uint64_t usedBytes = 0u;
+  uint64_t residentBytes = 0u;
+  uint64_t perGenerationCapacityBytes = 0u;
+  uint64_t residentLimitBytes = 0u;
+  uint64_t generation = 0u;
+  uint64_t submittedSerial = 0u;
+  uint64_t completedSerial = 0u;
+  uint64_t busyReuseRejectCount = 0u;
+  uint64_t overflowCount = 0u;
+  uint32_t activeGenerationCount = 0u;
+  uint32_t frameIncomplete = 0u;
+};
+
 /**
  * @brief 初始化 Shadow Arena 分配器。
  *
- * 创建 DEVICE_LOCAL GPU buffer（默认 8MB × 3帧，capture 模式 96MB × 2帧）。
- * 无 CPU 映射；写入通过 EmitCs(ctx->copyBuffer) 完成。
+ * 创建三个 64 MiB DEVICE_LOCAL 预热页；每个 GPU 代际最多 384 MiB，
+ * 总驻留上限 1.125 GiB。无 CPU 映射；写入通过 EmitCs(ctx->copyBuffer) 完成。
  * 在 D3D9 设备创建后调用，不依赖 TLSF 池。
  *
  * @return 成功返回 true。
@@ -42,16 +56,19 @@ bool ShadowArena_IsInitialized();
 /**
  * @brief 切换到当前渲染帧对应的 Arena 分区。
  *
- * 采用与 D3D9DeviceEx::m_war3FrameIndex 一致的三帧轮转，避免 GPU 仍在读取
- * 上一帧数据时被 CPU 覆写。
+ * 优先轮转三个预热代际，但只有 retire fence 已完成的代际才允许清零复用；
+ * GPU 落后时会在总驻留上限内增加 spill 代际。
  */
-void ShadowArena_BeginFrame(uint32_t frameIndex);
+bool ShadowArena_BeginFrame(uint64_t frameSerial, uint64_t completedSerial);
+
+/** Mark the active generation as owned by all shadow work for frameSerial. */
+void ShadowArena_EndFrame(uint64_t frameSerial);
 
 /**
  * @brief 在 Arena 中分配当前帧所需内存（极速无锁分配）。
  *
- * 只涉及简单的指针偏移加法，开销 < 5ns。
- * 此块内存在下一次调用 ShadowArena_Reset 之前均有效。
+ * 只涉及当前代际的页游标推进。此块内存在该代际的 completion fence
+ * 完成之前均不会被覆写。
  *
  * @param size      需要的内存大小。
  * @param alignment 对齐要求（必须为 2 的幂次，默认 16）。
@@ -63,8 +80,8 @@ ShadowArenaAllocation ShadowArena_Alloc(uint32_t size,
 /**
  * @brief 重置分配器游标。
  *
- * 应当在 GPU Fence 信号确认上帧数据已被消耗后调用（或简单地将 Arena
- * 分为多帧区域轮转）， 内部实现上会将当前 offset 置零，不需要实际执行 free。
+ * 仅供已经由 ShadowArena_BeginFrame 证明可复用的当前代际使用；内部只将
+ * 当前页游标置零，不执行 free。
  */
 void ShadowArena_Reset();
 
@@ -74,5 +91,7 @@ void ShadowArena_Reset();
  */
 uint32_t ShadowArena_UsedBytes();
 uint32_t ShadowArena_CapacityBytes();
+uint64_t ShadowArena_ResidentBytes();
+ShadowArenaDiagnostics ShadowArena_QueryDiagnostics();
 
 } // namespace dxvk::war3::memory

@@ -4420,6 +4420,17 @@ json HandleCommand(const json& request) {
     return response;
   }
 
+  if (command == "set_shadow_evidence_collector") {
+    const bool attached = payload.value("attached", false);
+    SetShadowEvidenceCollectorAttached(attached);
+    response["ok"] = true;
+    response["result"] = {
+        {"attached", IsShadowEvidenceCollectorAttached()},
+        {"retentionRevision", QueryShadowEvidenceRetentionRevision()},
+    };
+    return response;
+  }
+
   if (command == "start_shadow_pose_full_trace") {
     const uint32_t maxSeconds =
         (std::max)(uint32_t(1), payload.value("maxSeconds", 15u));

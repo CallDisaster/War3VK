@@ -16,11 +16,9 @@ namespace dxvk {
 
     struct War3CsmConfig {
         uint32_t cascadeCount = 4;
-        // Phase E（2026-07-09）：默认 2048。4096 在高压图下 ShadowMap/Receiver
-        // 带宽与 prepare 成本更高，且 dual_perf 显示 GPU 不是唯一瓶颈但 2048
-        // 仍是画质/性能平衡点（Phase 7.68 曾为树叶锐度推到 4096）。
-        // 需要更高锐度可在 ImGui/设置里调回 4096。
-        uint32_t shadowResolution = 2048;
+        // Release clarity baseline. Runtime work must not bounce this between
+        // 4096 and 2048; allocation/budget fallback is session-latched.
+        uint32_t shadowResolution = 4096;
         float splitLambda = 0.5f;
         // Phase 7.31 Iteration D：从 8000 降到 4000。War3 的 RTS 相机俯角下
         // 远景很少超过 3000 个单位，8000 会让每个 cascade 覆盖太大范围、

@@ -964,7 +964,7 @@ inline constexpr uint32_t kShadowAdaptiveMapUpdateCasterDelta = 2;
 // Phase E（2026-07-09）：仅在几何 work 极高时从 4096 降到 2048，避免高压图
 // 每帧 4 cascade × 4096 填满带宽。近景/低 work 仍用请求分辨率。
 // Phase 7.68 曾默认关；本轮只在 Huge 阈值触发，High 阈值与请求同为 2048 无额外降级。
-inline constexpr bool kShadowAdaptiveResolutionEnabled = true;
+inline constexpr bool kShadowAdaptiveResolutionEnabled = false;
 inline constexpr uint64_t kShadowAdaptiveResolutionHighWork = 50000;
 inline constexpr uint32_t kShadowAdaptiveResolutionHigh = 4096;
 inline constexpr uint64_t kShadowAdaptiveResolutionHugeWork = 200000;

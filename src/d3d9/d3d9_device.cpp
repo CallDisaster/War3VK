@@ -9492,6 +9492,7 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   const uint32_t traceOrdinal =
       g_d3d9DeviceTraceOrdinal.fetch_add(1u, std::memory_order_relaxed) + 1u;
   TraceD3D9Device(traceOrdinal, "ctor-body-begin", this);
+  m_war3ShadowArenaFence = new sync::Fence();
 
   // If we can SWVP, then we use an extended constant set
   // as SWVP has many more slots available than HWVP.
@@ -18979,17 +18980,37 @@ Rc<DxvkBuffer> D3D9DeviceEx::War3AllocFreezeBuffer(VkDeviceSize size,
   size = (size + align - 1) & ~(align - 1);
   if (outMapPtr)
     *outMapPtr = nullptr;
+  outOffset = 0u;
 
   if (!hostVisible && dxvk::war3::render::IsShadowArenaCaptureEnabled()) {
-    if (!dxvk::war3::memory::ShadowArena_IsInitialized())
-      dxvk::war3::memory::ShadowArena_Init();
+    if (!dxvk::war3::memory::ShadowArena_IsInitialized() &&
+        dxvk::war3::memory::ShadowArena_Init()) {
+      const uint64_t completedSerial =
+          m_war3ShadowArenaFence != nullptr
+              ? m_war3ShadowArenaFence->value()
+              : 0u;
+      dxvk::war3::memory::ShadowArena_BeginFrame(
+          m_war3ShadowPersistentFrameSerial + 1u, completedSerial);
+    }
 
-    const auto arenaAlloc = dxvk::war3::memory::ShadowArena_Alloc(
-        static_cast<uint32_t>(size), static_cast<uint32_t>(align));
+    const auto arenaAlloc =
+        size <= std::numeric_limits<uint32_t>::max()
+            ? dxvk::war3::memory::ShadowArena_Alloc(
+                  static_cast<uint32_t>(size), static_cast<uint32_t>(align))
+            : dxvk::war3::memory::ShadowArenaAllocation{};
     if (arenaAlloc) {
       outOffset = arenaAlloc.offset;
       return arenaAlloc.storage;
     }
+    // Arena capture is the only owner for device-local current-frame freeze
+    // data. Busy reuse, per-generation overflow or the global residency cap
+    // must fail closed; falling through to LegacyFreeze would bypass all three
+    // limits and reintroduce the in-flight overwrite path.
+    m_war3Scene.shadowStats.budgetExceeded = 1u;
+    m_war3Scene.shadowStats.fallbackArenaBytes =
+        dxvk::war3::memory::ShadowArena_UsedBytes();
+    m_war3ShadowFallbackBudgetExceeded = true;
+    return nullptr;
   }
 
   if (hostVisible) {
@@ -31772,7 +31793,29 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     if (dxvk::war3::render::IsShadowArenaCaptureEnabled()) {
       if (!dxvk::war3::memory::ShadowArena_IsInitialized())
         dxvk::war3::memory::ShadowArena_Init();
-      dxvk::war3::memory::ShadowArena_BeginFrame(m_war3FrameIndex);
+      // Present is the last command-producing boundary for the current world
+      // frame. Retire its Arena generation, enqueue a dedicated completion
+      // signal, then acquire a proven-free generation for the next frame.
+      const uint64_t retiringFrameSerial =
+          m_war3ShadowPersistentFrameSerial + 1u;
+      const uint64_t nextFrameSerial = retiringFrameSerial + 1u;
+      dxvk::war3::memory::ShadowArena_EndFrame(retiringFrameSerial);
+      if (m_war3ShadowArenaFence != nullptr) {
+        const Rc<sync::Fence> cShadowArenaFence = m_war3ShadowArenaFence;
+        EmitCs([cShadowArenaFence,
+                cRetiringFrameSerial = retiringFrameSerial](DxvkContext* ctx) {
+          ctx->signal(cShadowArenaFence, cRetiringFrameSerial);
+        });
+      }
+      const uint64_t completedSerial =
+          m_war3ShadowArenaFence != nullptr
+              ? m_war3ShadowArenaFence->value()
+              : 0u;
+      if (!dxvk::war3::memory::ShadowArena_BeginFrame(
+              nextFrameSerial, completedSerial)) {
+        m_war3Scene.shadowStats.budgetExceeded = 1u;
+        m_war3ShadowFallbackBudgetExceeded = true;
+      }
     }
   }
   {

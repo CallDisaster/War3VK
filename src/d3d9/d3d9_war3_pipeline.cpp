@@ -57,6 +57,37 @@ namespace dxvk {
                    v == "on" || v == "ON" || v == "yes" || v == "YES";
         }
 
+        bool ParseInitialShadowTaaMode(War3ShadowTaaMode& outMode) {
+            const std::string value =
+                env::getEnvVar("DXVK_WAR3_SHADOW_TAA_MODE");
+            if (value.empty())
+                return false;
+
+            if (value == "direct" || value == "direct_inline" ||
+                value == "DirectInline") {
+                outMode = War3ShadowTaaMode::DirectInline;
+                return true;
+            }
+            if (value == "prepass" || value == "current" ||
+                value == "prepass_current_only" ||
+                value == "PrepassCurrentOnly") {
+                outMode = War3ShadowTaaMode::PrepassCurrentOnly;
+                return true;
+            }
+            if (value == "temporal" || value == "Temporal") {
+                outMode = War3ShadowTaaMode::Temporal;
+                return true;
+            }
+
+            char* end = nullptr;
+            const long parsed = std::strtol(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0')
+                return false;
+            outMode = static_cast<War3ShadowTaaMode>(
+                std::clamp<long>(parsed, 0, 2));
+            return true;
+        }
+
         bool IsRuntimePipelinePassEnabled(const std::string& name) {
             using dxvk::war3::runtime::IsWar3RuntimeModuleEnabled;
             using dxvk::war3::runtime::War3RuntimeModule;
@@ -337,15 +368,29 @@ namespace dxvk {
                                pcfKernel);
             }
 
-            int shadowTaa = -1;
-            if (ParseEnvInt("DXVK_WAR3_SHADOW_TAA", shadowTaa)) {
-                m_settings.shadows.shadowTaaEnabled = shadowTaa != 0;
-                m_settings.shadows.shadowTaaMode =
-                    shadowTaa != 0
-                        ? War3ShadowTaaMode::Temporal
-                        : War3ShadowTaaMode::DirectInline;
-                WAR3_RENDER_LOG("DXVK War3Shadow: DXVK_WAR3_SHADOW_TAA=%d\n",
-                               m_settings.shadows.shadowTaaEnabled ? 1 : 0);
+            War3ShadowTaaMode initialShadowTaaMode =
+                m_settings.shadows.shadowTaaMode;
+            if (ParseInitialShadowTaaMode(initialShadowTaaMode)) {
+                m_settings.shadows.shadowTaaMode = initialShadowTaaMode;
+                m_settings.shadows.shadowTaaEnabled =
+                    initialShadowTaaMode == War3ShadowTaaMode::Temporal;
+                WAR3_RENDER_LOG(
+                    "DXVK War3Shadow: DXVK_WAR3_SHADOW_TAA_MODE=%d\n",
+                    static_cast<int>(initialShadowTaaMode));
+            } else {
+                // Compatibility fallback only. Parse it once during pipeline
+                // construction so an in-game ImGui selection remains final.
+                int shadowTaa = -1;
+                if (ParseEnvInt("DXVK_WAR3_SHADOW_TAA", shadowTaa)) {
+                    m_settings.shadows.shadowTaaEnabled = shadowTaa != 0;
+                    m_settings.shadows.shadowTaaMode =
+                        shadowTaa != 0
+                            ? War3ShadowTaaMode::Temporal
+                            : War3ShadowTaaMode::DirectInline;
+                    WAR3_RENDER_LOG(
+                        "DXVK War3Shadow: DXVK_WAR3_SHADOW_TAA=%d\n",
+                        m_settings.shadows.shadowTaaEnabled ? 1 : 0);
+                }
             }
 
             float shadowTaaWeight = 0.0f;

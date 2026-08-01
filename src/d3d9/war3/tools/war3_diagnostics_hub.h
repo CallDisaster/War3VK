@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace dxvk::war3::tools {
 
@@ -23,6 +24,41 @@ struct War3RuntimeStatusProfileSnapshot {
   std::string name;
   std::string disabledModules;
   std::string enabledModules;
+};
+
+struct GpuFlightFrame {
+  uint64_t timestampMs = 0u;
+  uint64_t frameSerial = 0u;
+  std::string lastRenderStage;
+  uint32_t csmRequestedResolution = 0u;
+  uint32_t csmEffectiveResolution = 0u;
+  uint32_t csmFallbackReason = 0u;
+  uint32_t csmFallbackLatched = 0u;
+  uint64_t csmGeneration = 0u;
+  uint64_t csmMemoryBudgetBytes = 0u;
+  uint64_t csmMemoryAvailableBytes = 0u;
+  uint32_t taaRequestedMode = 0u;
+  uint32_t taaEffectiveMode = 0u;
+  uint32_t taaShaderMode = 0u;
+  uint32_t taaHistoryValid = 0u;
+  uint64_t taaHistoryGeneration = 0u;
+  uint64_t arenaUsedBytes = 0u;
+  uint64_t arenaResidentBytes = 0u;
+  uint64_t arenaGeneration = 0u;
+  uint64_t arenaBusyReuseRejectCount = 0u;
+  uint64_t arenaOverflowCount = 0u;
+  uint32_t arenaFrameIncomplete = 0u;
+  uint64_t queueSubmittedSerial = 0u;
+  uint64_t queueCompletedSerial = 0u;
+  int64_t queueResult = 0;
+};
+
+struct GpuIncidentSnapshot {
+  uint64_t timestampMs = 0u;
+  std::string reason;
+  int64_t queueResult = 0;
+  uint64_t stalledMilliseconds = 0u;
+  std::vector<GpuFlightFrame> recentFrames;
 };
 
 struct War3RuntimeStatusRuntimeSnapshot {
@@ -453,6 +489,34 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t semanticSceneShadowMapSkinnedInvalidPipelineCount = 0;
   uint64_t semanticSceneShadowMapSkinnedDrawnCount = 0;
   uint64_t semanticSceneShadowTaaActive = 0;
+  uint64_t shadowTaaRequestedMode = 0;
+  uint64_t shadowTaaEffectiveMode = 0;
+  uint64_t shadowTaaShaderMode = 0;
+  uint64_t shadowTaaHistoryValid = 0;
+  uint64_t shadowTaaHistoryReadable = 0;
+  uint64_t shadowTaaHistoryGeneration = 0;
+  uint64_t shadowTaaLastInvalidationReason = 0;
+  uint64_t shadowTaaFixedWallBypassCount = 0;
+  uint64_t csmRequestedResolution = 0;
+  uint64_t csmEffectiveResolution = 0;
+  uint64_t csmFallbackReason = 0;
+  uint64_t csmFallbackLatched = 0;
+  uint64_t csmResourceGeneration = 0;
+  uint64_t csmResourceRebuildCount = 0;
+  uint64_t csmMemoryBudgetBytes = 0;
+  uint64_t csmMemoryAvailableBytes = 0;
+  uint64_t shadowArenaUsedBytes = 0;
+  uint64_t shadowArenaResidentBytes = 0;
+  uint64_t shadowArenaResidentLimitBytes = 0;
+  uint64_t shadowArenaGeneration = 0;
+  uint64_t shadowArenaBusyReuseRejectCount = 0;
+  uint64_t shadowArenaOverflowCount = 0;
+  uint64_t shadowArenaFrameIncomplete = 0;
+  uint64_t queueSubmittedSerial = 0;
+  uint64_t queueCompletedSerial = 0;
+  int64_t queueLastResult = 0;
+  uint64_t shadowEvidenceRetentionRevision = 0;
+  uint64_t shadowEvidenceCollectorAttached = 0;
   uint64_t semanticSceneReceiverReuseShadowMap = 0;
   uint64_t semanticSceneReceiverInputValid = 0;
   uint64_t semanticSceneReceiverInputRejectReason = 0;
@@ -559,5 +623,10 @@ bool IsInGameRenderReady();
  * @brief 重置运行态就绪补充信号。
  */
 void ResetRuntimeReadySignals();
+
+uint64_t RequestShadowEvidenceRetention();
+uint64_t QueryShadowEvidenceRetentionRevision();
+void SetShadowEvidenceCollectorAttached(bool attached);
+bool IsShadowEvidenceCollectorAttached();
 
 } // namespace dxvk::war3::tools

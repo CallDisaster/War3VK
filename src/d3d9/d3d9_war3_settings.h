@@ -76,10 +76,9 @@ struct War3ShadowSettings {
   bool enabled = true;
   War3CsmConfig csm = {};
   float strength = 0.75f;
-  // Phase 7.31 Iteration D：从 0.95 降到 0.70，让 Poisson16 的采样落在
-  // 更小的 texel 半径内，shadow edge 更锐。配合 CSM maxDistance 4000 + 
-  // 自适应 min resolution 3072 给用户"清晰 caster"观感。
-  float pcfRadius = 0.85f;
+  // Release hardening：0.70 让 Poisson16 的采样落在更小的 texel 半径内；
+  // 配合固定 4096 CSM 保持清晰边缘，不用扩大滤波掩盖几何撕裂。
+  float pcfRadius = 0.70f;
   float receiverBias = 0.004f;
   float cascadeBlendRange = 120.0f;
   War3ShadowPcfKernel pcfKernel = War3ShadowPcfKernel::Poisson16;
@@ -114,6 +113,9 @@ struct War3ShadowSettings {
   // selects a mode.
   War3ShadowTaaMode shadowTaaMode = War3ShadowTaaMode::DirectInline;
   bool shadowTaaEnabled = false;
+  // UI-owned revision. Environment variables initialize the setting once in
+  // War3RenderPipeline; the render pass must never re-parse them per frame.
+  uint64_t shadowTaaSettingsRevision = 0u;
   // TAA v2 clarity-first default. Candidate sweeps use 0.12/0.20/0.30;
   // Temporal is still disabled by default, so this only takes effect when the
   // user explicitly selects it.

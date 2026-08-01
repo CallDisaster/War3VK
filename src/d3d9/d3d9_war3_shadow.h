@@ -122,6 +122,44 @@ namespace dxvk {
         const War3FrameScene* sceneForReplayFallback = nullptr;
     };
 
+    struct ShadowTaaDiagnostics {
+      uint32_t requestedMode = 0u;
+      uint32_t effectiveMode = 0u;
+      uint32_t shaderMode = 0u;
+      uint32_t historyValid = 0u;
+      uint32_t historyReadable = 0u;
+      uint64_t historyGeneration = 0u;
+      uint32_t lastInvalidationReason = 0u;
+      // Temporal receiver frames for which the fixed-wall current-only path
+      // was eligible. Pixel atomics are intentionally avoided.
+      uint64_t fixedWallBypassCount = 0u;
+      uint64_t settingsRevision = 0u;
+    };
+
+    enum class CsmResolutionFallbackReason : uint32_t {
+      None = 0u,
+      MemoryBudget = 1u,
+      AllocationFailure = 2u,
+    };
+
+    struct CsmResolutionDiagnostics {
+      uint32_t requestedResolution = 4096u;
+      uint32_t effectiveResolution = 0u;
+      uint32_t fallbackReason = 0u;
+      uint32_t fallbackLatched = 0u;
+      uint32_t memoryBudgetSupported = 0u;
+      uint64_t memoryBudgetBytes = 0u;
+      uint64_t memoryAvailableBytes = 0u;
+      uint64_t resourceGeneration = 0u;
+      uint64_t resourceRebuildCount = 0u;
+    };
+
+    ShadowTaaDiagnostics QueryShadowTaaDiagnostics();
+    CsmResolutionDiagnostics QueryCsmResolutionDiagnostics();
+    void PublishShadowTaaDiagnostics(const ShadowTaaDiagnostics& diagnostics);
+    void PublishCsmResolutionDiagnostics(
+        const CsmResolutionDiagnostics& diagnostics);
+
     class War3ShadowReceiverPass final : public War3RenderPass {
     public:
         explicit War3ShadowReceiverPass(D3D9DeviceEx* device);
@@ -523,6 +561,23 @@ namespace dxvk {
         Vector4 m_shadowTaaPreviousSunDirection =
             Vector4(0.0f, 0.0f, 1.0f, 0.0f);
         bool m_shadowTaaHasPreviousSunDirection = false;
+        bool m_shadowTaaModeInitialized = false;
+        War3ShadowTaaMode m_shadowTaaRequestedModeSeen =
+            War3ShadowTaaMode::DirectInline;
+        uint64_t m_shadowTaaSettingsRevisionSeen = 0u;
+        uint64_t m_shadowTaaHistoryGeneration = 0u;
+        uint32_t m_shadowTaaLastInvalidationReason = 0u;
+        uint64_t m_shadowTaaFixedWallBypassCount = 0u;
+
+        bool m_csmResolutionFallbackLatched = false;
+        CsmResolutionFallbackReason m_csmResolutionFallbackReason =
+            CsmResolutionFallbackReason::None;
+        uint32_t m_csmRequestedResolution = 4096u;
+        uint32_t m_csmEffectiveResolution = 0u;
+        uint64_t m_csmResourceRebuildCount = 0u;
+        bool m_csmMemoryBudgetSupported = false;
+        uint64_t m_csmMemoryBudgetBytes = 0u;
+        uint64_t m_csmMemoryAvailableBytes = 0u;
 
         // Receiver shader 常量（CSM 矩阵、split 等）
         Rc<DxvkBuffer> m_shadowUniformBuffer;
@@ -831,7 +886,7 @@ namespace dxvk {
         void ensureDepthCopyResources(VkExtent3D extent, VkFormat format);
         void ensureMotionVectorResources(VkExtent3D extent);
         void ensureShadowTaaResources(VkExtent3D extent);
-        void ensureShadowResources(uint32_t cascadeCount, uint32_t resolution);
+        bool ensureShadowResources(uint32_t cascadeCount, uint32_t resolution);
         // 上传“骨骼调色板 + 非混合 worldMatrix”到 SSBO（按帧去重）
         DxvkResourceBufferInfo ensureShadowMatrixBuffer(
             const Rc<DxvkCommandList>& ctx,

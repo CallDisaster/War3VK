@@ -45,6 +45,7 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <mutex>
 #include <type_traits>
 #include <utility>
 
@@ -59,6 +60,10 @@
 namespace dxvk {
 
 namespace {
+std::mutex g_shadowDiagnosticsMutex;
+ShadowTaaDiagnostics g_shadowTaaDiagnostics = {};
+CsmResolutionDiagnostics g_csmResolutionDiagnostics = {};
+
 template <typename Fn>
 class War3ScopeExit final {
 public:
@@ -107,6 +112,7 @@ enum War3ShadowTaaHistoryInvalidationBits : uint32_t {
   kShadowTaaInvalidateShadowMapResource = 1u << 8,
   kShadowTaaInvalidateTaaResource = 1u << 9,
   kShadowTaaInvalidateCsmFallback = 1u << 10,
+  kShadowTaaInvalidateModeSwitch = 1u << 11,
 };
 
 // ===== 阴影投射器推送常量 =====
@@ -404,49 +410,12 @@ int EnvIntOverride(const char* name, int minValue, int maxValue) {
   return std::clamp<int>(static_cast<int>(parsed), minValue, maxValue);
 }
 
-War3ShadowTaaMode ParseShadowTaaMode(
-    const std::string& value, War3ShadowTaaMode fallback) {
-  if (value.empty())
-    return fallback;
-  if (value == "direct" || value == "direct_inline" ||
-      value == "DirectInline")
-    return War3ShadowTaaMode::DirectInline;
-  if (value == "prepass" || value == "current" ||
-      value == "prepass_current_only" || value == "PrepassCurrentOnly")
-    return War3ShadowTaaMode::PrepassCurrentOnly;
-  if (value == "temporal" || value == "Temporal")
-    return War3ShadowTaaMode::Temporal;
-
-  char* end = nullptr;
-  const long parsed = std::strtol(value.c_str(), &end, 10);
-  if (end == value.c_str())
-    return fallback;
-  return static_cast<War3ShadowTaaMode>(
-      std::clamp<long>(parsed, 0, 2));
-}
-
 War3ShadowTaaMode ResolveShadowTaaRequestedMode(
     const War3ShadowSettings* settings) {
   const War3ShadowTaaMode configured =
       settings != nullptr
           ? settings->shadowTaaMode
           : War3ShadowTaaMode::DirectInline;
-
-  // New three-state switch is authoritative when present.
-  const std::string modeOverride =
-      env::getEnvVar("DXVK_WAR3_SHADOW_TAA_MODE");
-  if (!modeOverride.empty())
-    return ParseShadowTaaMode(modeOverride, configured);
-
-  // Preserve the old binary switch, including callers that still mutate the
-  // compatibility bool through the existing settings/UI surface.
-  const std::string legacyOverride =
-      env::getEnvVar("DXVK_WAR3_SHADOW_TAA");
-  if (!legacyOverride.empty()) {
-    return EnvFlagDefault("DXVK_WAR3_SHADOW_TAA", false)
-        ? War3ShadowTaaMode::Temporal
-        : War3ShadowTaaMode::DirectInline;
-  }
   if (configured != War3ShadowTaaMode::DirectInline)
     return configured;
   return settings != nullptr && settings->shadowTaaEnabled
@@ -1393,29 +1362,6 @@ uint64_t EstimateShadowReplayGeometryWork(
   return work;
 }
 
-uint32_t ResolveAdaptiveShadowResolution(uint32_t requestedResolution,
-                                         uint64_t geometryWork) {
-  if constexpr (!war3::internal::kShadowAdaptiveResolutionEnabled)
-    return requestedResolution;
-
-  if (requestedResolution <= war3::internal::kShadowAdaptiveResolutionMin)
-    return requestedResolution;
-
-  uint32_t targetResolution = requestedResolution;
-  if (geometryWork >= war3::internal::kShadowAdaptiveResolutionHugeWork) {
-    targetResolution = std::min<uint32_t>(
-        targetResolution, war3::internal::kShadowAdaptiveResolutionHuge);
-  } else if (geometryWork >=
-             war3::internal::kShadowAdaptiveResolutionHighWork) {
-    targetResolution = std::min<uint32_t>(
-        targetResolution, war3::internal::kShadowAdaptiveResolutionHigh);
-  }
-
-  targetResolution = std::max<uint32_t>(
-      targetResolution, war3::internal::kShadowAdaptiveResolutionMin);
-  return targetResolution;
-}
-
 float MaxMatrixAbsDelta(const Matrix4& a, const Matrix4& b) {
   float delta = 0.0f;
   for (uint32_t i = 0; i < 4; i++) {
@@ -1774,6 +1720,28 @@ Matrix4 MakeLookAtLH(const Vector4 &eye, const Vector4 &target,
   return m;
 }
 } // namespace
+
+ShadowTaaDiagnostics QueryShadowTaaDiagnostics() {
+  std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
+  return g_shadowTaaDiagnostics;
+}
+
+CsmResolutionDiagnostics QueryCsmResolutionDiagnostics() {
+  std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
+  return g_csmResolutionDiagnostics;
+}
+
+void PublishShadowTaaDiagnostics(
+    const ShadowTaaDiagnostics& diagnostics) {
+  std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
+  g_shadowTaaDiagnostics = diagnostics;
+}
+
+void PublishCsmResolutionDiagnostics(
+    const CsmResolutionDiagnostics& diagnostics) {
+  std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
+  g_csmResolutionDiagnostics = diagnostics;
+}
 
 War3ShadowReceiverPass::War3ShadowReceiverPass(D3D9DeviceEx *device)
     : m_parent(device), m_device(device->GetDXVKDevice()),
@@ -6063,6 +6031,26 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   const War3ShadowTaaMode shadowTaaRequestedMode =
       ResolveShadowTaaRequestedMode(
           input.settings != nullptr ? &input.settings->shadows : nullptr);
+  const uint64_t shadowTaaSettingsRevision =
+      input.settings != nullptr
+          ? input.settings->shadows.shadowTaaSettingsRevision
+          : 0u;
+  if (!m_shadowTaaModeInitialized) {
+    m_shadowTaaModeInitialized = true;
+    m_shadowTaaRequestedModeSeen = shadowTaaRequestedMode;
+    m_shadowTaaSettingsRevisionSeen = shadowTaaSettingsRevision;
+  } else if (m_shadowTaaRequestedModeSeen != shadowTaaRequestedMode ||
+             m_shadowTaaSettingsRevisionSeen != shadowTaaSettingsRevision) {
+    // A user mode transition owns exactly one history cut. The next Temporal
+    // frame writes current-only and the following valid frame may read it.
+    reconciliation.shadowHistoryInvalidationMask |=
+        kShadowTaaInvalidateModeSwitch;
+    m_shadowHistoryValid = false;
+    m_shadowTaaWasActiveLastFrame = false;
+    m_shadowTaaHistoryContractValid = false;
+    m_shadowTaaRequestedModeSeen = shadowTaaRequestedMode;
+    m_shadowTaaSettingsRevisionSeen = shadowTaaSettingsRevision;
+  }
   reconciliation.shadowTaaRuntimeModuleEnabled =
       shadowTaaRuntimeModuleEnabled ? 1u : 0u;
   reconciliation.shadowTaaRequestedMode =
@@ -6109,6 +6097,25 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         telemetry.historyInvalidationMask =
             reconciliation.shadowHistoryInvalidationMask;
         war3::War3PerfMonitor::instance().noteShadowTaaFrame(telemetry);
+
+        if (reconciliation.shadowHistoryInvalidationMask != 0u) {
+          m_shadowTaaLastInvalidationReason =
+              reconciliation.shadowHistoryInvalidationMask;
+        }
+        ShadowTaaDiagnostics diagnostics = {};
+        diagnostics.requestedMode = reconciliation.shadowTaaRequestedMode;
+        diagnostics.effectiveMode = reconciliation.shadowTaaEffectiveMode;
+        diagnostics.shaderMode = reconciliation.shadowTaaMode;
+        diagnostics.historyValid = reconciliation.shadowHistoryValidAfter;
+        diagnostics.historyReadable =
+            reconciliation.shadowTaaMode >= 3u ? 1u : 0u;
+        diagnostics.historyGeneration = m_shadowTaaHistoryGeneration;
+        diagnostics.lastInvalidationReason =
+            m_shadowTaaLastInvalidationReason;
+        diagnostics.fixedWallBypassCount =
+            m_shadowTaaFixedWallBypassCount;
+        diagnostics.settingsRevision = m_shadowTaaSettingsRevisionSeen;
+        PublishShadowTaaDiagnostics(diagnostics);
       });
   const auto strengthToMilli = [](float value) -> uint32_t {
     return uint32_t(std::clamp(value, 0.0f, 1.0f) * 1000.0f + 0.5f);
@@ -7173,32 +7180,24 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   const uint64_t replayGeometryWork =
       EstimateShadowReplayGeometryWork(replayDraws);
   const uint32_t requestedShadowResolution = m_csmConfig.shadowResolution;
-  const uint32_t adaptiveShadowResolution =
-      ResolveAdaptiveShadowResolution(requestedShadowResolution,
-                                      replayGeometryWork);
-  if (adaptiveShadowResolution != requestedShadowResolution) {
-    static uint32_t s_adaptiveResolutionLogs = 0;
-    if (s_adaptiveResolutionLogs++ < 12u ||
-        (s_adaptiveResolutionLogs % 240u) == 0u) {
-      WAR3_RENDER_LOG(
-          "DXVK War3Shadow: adaptive shadow resolution %u -> %u "
-          "(casters=%u geometryWork=%llu)\n",
-          static_cast<unsigned>(requestedShadowResolution),
-          static_cast<unsigned>(adaptiveShadowResolution),
-          static_cast<unsigned>(replayCasterCount),
-          static_cast<unsigned long long>(replayGeometryWork));
-    }
-    m_csmConfig.shadowResolution = adaptiveShadowResolution;
-  }
+  // Resolve and allocate before computing cascade matrices so texel snapping
+  // always uses the same resolution as the image rendered this frame.
+  ensureShadowResources(m_csmConfig.cascadeCount,
+                        requestedShadowResolution);
+  War3CsmConfig effectiveCsmConfig = m_csmConfig;
+  if (m_csmEffectiveResolution != 0u)
+    effectiveCsmConfig.shadowResolution = m_csmEffectiveResolution;
   war3::War3PerfMonitor::instance().noteShadowReceiverFrame(
       static_cast<uint32_t>(std::min<size_t>(
           replayCasterCount, std::numeric_limits<uint32_t>::max())),
-      replayGeometryWork, requestedShadowResolution, m_csmConfig.shadowResolution);
+      replayGeometryWork, requestedShadowResolution,
+      effectiveCsmConfig.shadowResolution);
 
   // 计算本帧级联数据（需要外部捕获世界相机矩阵后才会有效）
   War3WorldCameraState effectiveWorldCamera = input.scene.worldCamera;
   War3CsmData newCsm = m_csm.Compute(
-      effectiveWorldCamera, mutableSettings.sun.direction, m_csmConfig);
+      effectiveWorldCamera, mutableSettings.sun.direction,
+      effectiveCsmConfig);
   if (War3CsmContinuityTraceEnabled()) {
     reconciliation.receiverCameraHash =
         War3ContinuityHashCamera(effectiveWorldCamera);
@@ -8383,6 +8382,10 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
                 float(pointRayMaxLights),
                 pointRayHiZActive ? float(m_pointRayHiZLightCount) : 0.0f);
     reconciliation.shadowTaaMode = uint32_t(taaMode + 0.5f);
+    // Compatibility telemetry is execution evidence, not a requested-setting
+    // echo. A non-zero value proves the receiver shader entered a TAA mode.
+    reconciliation.shadowTaaActive =
+        reconciliation.shadowTaaMode != 0u ? 1u : 0u;
     reconciliation.shadowReceiverSampleSource =
         receiverHasUsableDirectionalShadow
             ? (shadowTaaActive
@@ -8484,6 +8487,11 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       const uint32_t receiverDrawBefore =
           reconciliation.receiverDrawExecutedThisFrame;
       drawReceiver(ctx, input.colorView);
+      if (receiverDrawBefore == 0u &&
+          reconciliation.receiverDrawExecutedThisFrame != 0u &&
+          reconciliation.shadowTaaMode >= 2u) {
+        ++m_shadowTaaFixedWallBypassCount;
+      }
       if (pointRayActive && !pointRayHiZActive &&
           receiverDrawBefore == 0u &&
           reconciliation.receiverDrawExecutedThisFrame != 0u) {
@@ -8569,6 +8577,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
           m_shadowMapResourceGeneration;
       m_shadowTaaHistoryResourceGeneration =
           m_shadowTaaResourceGeneration;
+      ++m_shadowTaaHistoryGeneration;
       reconciliation.shadowHistoryAdvancedThisFrame = 1u;
     } else if (shadowTaaTemporalActive) {
       reconciliation.shadowHistoryAdvanceSkippedIncomplete = 1u;
