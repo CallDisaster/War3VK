@@ -1,5 +1,28 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（Persistent GPU Package Store P0 抽离，Shared Owner 仍禁止）
+
+本轮从 `89dc8ec` 继续，把 immutable vertex/index package 的 static map、atlas、miss、
+一次性 upload、producer-fence retirement 与 validator 从 `War3GpuSkinResources` 抽入
+独立 `War3PersistentGpuPackageStore`。现有 resources 的公开方法签名保持并逐项委托；
+没有在 D3D9Device 创建 owner，没有接 Main/CSM/point/outline consumer，也没有启用旧
+manager 大锁、compute、output、receipt 或 lease。
+
+- 对抗审查把迁移前后 `makeKey/find/probe/prepare/create/take/retire/atlas` 去注释、空白和
+  类名后比较；除 `0 -> 0u` 外 token-equivalent。map/device epoch、package generation、
+  fallback、diagnostics、residency 和 manager Disabled gate 均未发生运行语义漂移。
+- store 只由旧 manager 懒创建的 `War3GpuSkinResources` 私有持有；默认 GPU skin Disabled
+  仍不会创建 manager/resources/store，因此本阶段不分配 128 MiB atlas，也没有新增默认
+  热路径或 renderer 行为。
+- 新 owner/static 合同 7 项、既有 package 合同 11 项与 runnable ownership test 1/1
+  PASS；Win32 `d3d9.dll` build 成功，`ninja -C build32 -n` no-work。
+
+**必须保留的 P1 阻断门**：旧实现的 epoch clear 会同时清 atlas 与未完成 producer
+retirement。当前 manager 通过 `hasInFlightResources()` 保留整个旧 resources owner，故
+现有运行路径安全；但独立 shared owner 尚不具备跨 epoch upload/use-fence retirement。
+`kD3D9SharedOwnerEnabled=false` 与 `kCrossEpochRetirementSafe=false` 共同锁死接入，任何
+D3D9 shared owner/Consume 工作都必须先修复这一继承限制并加入 fence 生命周期测试。
+
 ## 🚨 2026-08-02（点阴影 Persistent Prepare Worker 隔离基础层，尚未接入运行时）
 
 本轮为替换点阴影逐帧 `std::async` 建立了独立、可运行验证的持久 worker 基础层；

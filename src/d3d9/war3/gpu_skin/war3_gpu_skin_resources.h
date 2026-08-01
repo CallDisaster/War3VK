@@ -230,6 +230,8 @@ struct GpuSkinInputCopy {
   uint32_t token = 0u;
 };
 
+class War3PersistentGpuPackageStore;
+
 class War3GpuSkinResources {
 public:
   explicit War3GpuSkinResources(Rc<DxvkDevice> device,
@@ -311,14 +313,6 @@ private:
     OutputLease lease;
   };
 
-  struct RetiredStaticUpload {
-    GpuSkinStaticResourceKey key;
-    DxvkBufferSlice source;
-    Rc<DxvkFence> fence;
-    uint64_t retireValue = 0;
-    resource_census::ResourceHandle residencyCensus;
-  };
-
   struct ActiveOutput {
     uint32_t pageId = 0;
     uint64_t pageGeneration = 0;
@@ -327,21 +321,11 @@ private:
     bool retirementQueued = false;
   };
 
-  struct QueuedStaticMiss {
-    GpuSkinStaticResourceKey key;
-    model::ShadowGeosetResourceSnapshot record;
-  };
-
-  GpuSkinStaticResourceKey makeKey(
-      const model::ShadowGeosetResourceRecord& record,
-      uint32_t layoutGeneration) const;
-  std::shared_ptr<GpuSkinStaticResource> createStaticResource(
-      const QueuedStaticMiss& miss);
   bool ensureUploadPage(VkDeviceSize requiredBytes);
   void updateStorageBufferOffsetAlignment();
   void recordFallback(GpuSkinFallbackReason reason);
   void publishResidencySnapshot() const;
-  void clearEpochResources();
+  void clearDynamicEpochResources();
 
   Rc<DxvkDevice> m_device;
   GpuSkinResourceBudgets m_budgets;
@@ -351,25 +335,16 @@ private:
   uint64_t m_lastRetirementPollDeviceEpoch = 0;
   uint64_t m_lastRetirementPollFrameTag = 0;
   uint64_t m_nextOutputLeaseId = 1;
-  uint64_t m_nextStaticPackageGeneration = 1;
   uint32_t m_nextOutputPageId = 1;
-  VkDeviceSize m_staticBytes = 0;
-  VkDeviceSize m_staticCursor = 0;
   VkDeviceSize m_uploadBytes = 0;
   VkDeviceSize m_outputBytes = 0;
-  uint64_t m_queuedStaticMissHostBytes = 0;
-  uint64_t m_peakQueuedStaticMissRecords = 0;
-  uint64_t m_peakQueuedStaticMissHostBytes = 0;
   VkDeviceSize m_storageBufferOffsetAlignment = 16u;
   GpuSkinDiagnostics m_diagnostics;
-  std::unordered_map<GpuSkinStaticResourceKey,
-      std::shared_ptr<GpuSkinStaticResource>, GpuSkinStaticResourceKeyHash>
-      m_staticResources;
-  std::deque<QueuedStaticMiss> m_staticMisses;
+  // P0 ownership seam: immutable model/index packages live in an independent
+  // store. Resources preserves its public API surface and delegates the old path; no
+  // D3D9 device owner or renderer consumer is introduced by this refactor.
+  std::unique_ptr<War3PersistentGpuPackageStore> m_persistentPackages;
   std::deque<GpuSkinJobFallback> m_jobFallbacks;
-  std::vector<GpuSkinStaticUpload> m_readyStaticUploads;
-  Rc<DxvkBuffer> m_staticAtlas;
-  resource_census::ResourceHandle m_staticAtlasCensus;
   std::unique_ptr<UploadPage> m_activeUpload;
   std::deque<std::unique_ptr<UploadPage>> m_pendingUploads;
   std::deque<std::unique_ptr<UploadPage>> m_retiredUploads;
@@ -378,7 +353,6 @@ private:
   std::deque<std::unique_ptr<UploadPage>> m_idleUploads;
   std::vector<std::unique_ptr<OutputPage>> m_outputPages;
   std::unordered_map<uint64_t, ActiveOutput> m_activeOutputs;
-  std::deque<RetiredStaticUpload> m_retiredStaticUploads;
   std::deque<RetiredOutput> m_retiredOutputs;
 };
 

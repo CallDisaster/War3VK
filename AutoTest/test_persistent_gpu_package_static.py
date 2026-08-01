@@ -16,6 +16,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 RES_H = ROOT / "src/d3d9/war3/gpu_skin/war3_gpu_skin_resources.h"
 RES_CPP = ROOT / "src/d3d9/war3/gpu_skin/war3_gpu_skin_resources.cpp"
+STORE_H = ROOT / "src/d3d9/war3/gpu_skin/war3_persistent_gpu_package_store.h"
+STORE_CPP = ROOT / "src/d3d9/war3/gpu_skin/war3_persistent_gpu_package_store.cpp"
 DEVICE_CPP = ROOT / "src/d3d9/d3d9_device.cpp"
 
 
@@ -117,7 +119,9 @@ class SourceContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.header = RES_H.read_text(encoding="utf-8")
-        cls.source = RES_CPP.read_text(encoding="utf-8")
+        cls.resources_source = RES_CPP.read_text(encoding="utf-8")
+        cls.store_header = STORE_H.read_text(encoding="utf-8")
+        cls.source = STORE_CPP.read_text(encoding="utf-8")
         cls.device = DEVICE_CPP.read_text(encoding="utf-8")
 
     def test_proof_carries_epoch_generation_content_and_index_identity(self) -> None:
@@ -188,16 +192,37 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("resource->sourceLayout = layout;", create_body)
 
     def test_package_generation_is_not_reused_on_epoch_clear(self) -> None:
-        self.assertIn("m_nextStaticPackageGeneration = 1", self.header)
+        self.assertIn(
+            "m_nextStaticPackageGeneration = 1u", self.store_header
+        )
         self.assertIn(
             "m_nextStaticPackageGeneration == "
             "std::numeric_limits<uint64_t>::max()",
             self.source,
         )
         clear_body = self.source.split(
-            "void War3GpuSkinResources::clearEpochResources() {", 1
+            "void War3PersistentGpuPackageStore::clearEpochResources() {", 1
         )[1].split("}  // namespace dxvk::war3::gpu_skin", 1)[0]
         self.assertNotIn("m_nextStaticPackageGeneration", clear_body)
+
+    def test_resources_preserves_public_api_and_delegates_static_path(self) -> None:
+        self.assertIn("class War3PersistentGpuPackageStore;", self.header)
+        self.assertIn(
+            "std::unique_ptr<War3PersistentGpuPackageStore> "
+            "m_persistentPackages;",
+            self.header,
+        )
+        for method in (
+            "findOrQueueStatic",
+            "probeStatic",
+            "prepareQueuedStaticResources",
+            "takeStaticUploads",
+            "retireStaticUpload",
+            "staticAtlasSlice",
+        ):
+            self.assertIn(
+                f"m_persistentPackages->{method}", self.resources_source
+            )
 
     def test_no_renderer_consumer_is_enabled_by_this_foundation(self) -> None:
         self.assertNotIn("ValidateGpuSkinStaticPackage", self.device)
