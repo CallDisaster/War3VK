@@ -1,5 +1,7 @@
 #pragma once
 
+#include "war3_persistent_gpu_package_proof_catalog.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -14,11 +16,13 @@ namespace dxvk::war3::gpu_skin {
 // canonical workload and consumer mask through unchanged.
 class War3PersistentGpuPackageObserver final {
 public:
+  using PackageProofCatalog = War3PersistentGpuPackageProofCatalog;
   static constexpr bool kRuntimeInstantiated = false;
   static constexpr bool kObserveOnly = true;
   static constexpr bool kObserveBindsAtlas = false;
   static constexpr bool kObserveWritesConsumerLastUse = false;
   static constexpr bool kConsumeAdmissionGranted = false;
+  static constexpr bool kRecordingThreadOwnershipIntegrated = false;
   static constexpr uint32_t kRequiredStage = 11u;
   static constexpr size_t kCapacity = 4096u;
 
@@ -41,10 +45,6 @@ public:
   static constexpr uint32_t kKnownConsumerMask =
       ConsumerMain | ConsumerCsm0 | ConsumerCsm1 | ConsumerCsm2 |
       ConsumerCsm3 | ConsumerPointShadow | ConsumerGeometryOutline;
-  // Only Main may already have executed before the future Stage11 seal point.
-  // Shadow and outline consumers must use the post-draw note API.
-  static constexpr uint32_t kPreSubmittedConsumerMask = ConsumerMain;
-
   enum class ProofState : uint8_t {
     IdentityOnly = 0u,
     ContentPending,
@@ -85,8 +85,10 @@ public:
     uint32_t stage = 0u;
     uint64_t mapEpoch = 0u;
     uint64_t deviceEpoch = 0u;
-    uint64_t packageGeneration = 0u;
-    uint64_t sourceGeneration = 0u;
+    uint64_t catalogInstanceGeneration = 0u;
+    // Revision of the immutable package-proof snapshot acquired once for this
+    // frame. Individual package/source generations belong to each sealed row.
+    uint64_t catalogSnapshotRevision = 0u;
     uint64_t canonicalWorkload = 0u;
     size_t observationBudget = kCapacity;
   };
@@ -97,27 +99,33 @@ public:
     uint32_t stage = 0u;
     uint64_t mapEpoch = 0u;
     uint64_t deviceEpoch = 0u;
+    uint64_t catalogInstanceGeneration = 0u;
+    uint64_t catalogSnapshotRevision = 0u;
     uint64_t packageGeneration = 0u;
-    uint64_t sourceGeneration = 0u;
+    uint64_t immutableModelGeneration = 0u;
+    uint64_t currentDrawSourceGeneration = 0u;
+    PackageProofCatalog::Key packageKey = {};
+    PackageProofCatalog::PackageContentDecision packageContentDecision;
 
     uint64_t identityToken = 0u;
     uint64_t sourceToken = 0u;
     uint64_t materialToken = 0u;
     uint64_t alphaToken = 0u;
+    uint64_t worldToken = 0u;
     uint64_t boundsToken = 0u;
     uint32_t requestedConsumerMask = 0u;
-    uint32_t preSubmittedConsumerMask = 0u;
     Bounds bounds = {};
 
     bool identityKnown = false;
     bool identityExact = false;
     bool sourceKnown = false;
     bool sourceExact = false;
-    bool packageContentReady = false;
     bool materialKnown = false;
     bool materialExact = false;
     bool alphaKnown = false;
     bool alphaExact = false;
+    bool worldKnown = false;
+    bool worldExact = false;
     bool boundsKnown = false;
     bool boundsExact = false;
     bool staticRigidProven = false;
@@ -131,12 +139,22 @@ public:
     uint32_t stage = 0u;
     uint64_t mapEpoch = 0u;
     uint64_t deviceEpoch = 0u;
+    uint64_t catalogInstanceGeneration = 0u;
+    uint64_t catalogSnapshotRevision = 0u;
+    uint64_t packagePublicationRevision = 0u;
+    uint64_t packageCanonicalDigest = 0u;
+    PackageProofCatalog::PackageContentDecision::Reason
+        packageDecisionReason = PackageProofCatalog::
+            PackageContentDecision::Reason::MissingSnapshot;
     uint64_t packageGeneration = 0u;
-    uint64_t sourceGeneration = 0u;
+    uint64_t immutableModelGeneration = 0u;
+    uint64_t currentDrawSourceGeneration = 0u;
+    PackageProofCatalog::Key packageKey = {};
     uint64_t identityToken = 0u;
     uint64_t sourceToken = 0u;
     uint64_t materialToken = 0u;
     uint64_t alphaToken = 0u;
+    uint64_t worldToken = 0u;
     uint64_t boundsToken = 0u;
     uint32_t requestedConsumerMask = 0u;
     uint32_t eligibleConsumerMask = 0u;
@@ -144,6 +162,7 @@ public:
     uint32_t actualConsumerMask = 0u;
     ProofState proofState = ProofState::Rejected;
     Disposition disposition = Disposition::Recorded;
+    bool packageDecisionBound = false;
   };
 
   struct ActualConsumerNote {
@@ -153,9 +172,18 @@ public:
     uint32_t stage = 0u;
     uint64_t mapEpoch = 0u;
     uint64_t deviceEpoch = 0u;
+    uint64_t catalogInstanceGeneration = 0u;
+    uint64_t catalogSnapshotRevision = 0u;
     uint64_t packageGeneration = 0u;
-    uint64_t sourceGeneration = 0u;
+    uint64_t immutableModelGeneration = 0u;
+    uint64_t currentDrawSourceGeneration = 0u;
+    PackageProofCatalog::Key packageKey = {};
     uint64_t identityToken = 0u;
+    uint64_t sourceToken = 0u;
+    uint64_t materialToken = 0u;
+    uint64_t alphaToken = 0u;
+    uint64_t worldToken = 0u;
+    uint64_t boundsToken = 0u;
     uint32_t consumerBit = 0u;
   };
 
@@ -189,7 +217,6 @@ public:
     uint32_t actualConsumerMask = 0u;
     size_t tableIndex = kCapacity;
     bool recorded = false;
-    bool preSubmittedAccepted = false;
     bool drawMutationAllowed = false;
     bool atlasBindingAllowed = false;
     bool writesConsumerLastUse = false;
@@ -206,6 +233,7 @@ public:
     uint64_t contentPending = 0u;
     uint64_t packageInputReady = 0u;
     uint64_t fullyEquivalent = 0u;
+    uint64_t packageDecisionBindingMismatch = 0u;
     uint64_t rejected = 0u;
     uint64_t deferredBudget = 0u;
     uint64_t deferredCapacity = 0u;
@@ -216,7 +244,6 @@ public:
     uint64_t actualConsumerEntries = 0u;
     uint64_t actualConsumerBits = 0u;
     uint32_t actualConsumerMaskOr = 0u;
-    uint64_t invalidPreSubmittedMasks = 0u;
     uint64_t actualNoteCalls = 0u;
     uint64_t actualNotesRecorded = 0u;
     uint64_t actualNotesDuplicate = 0u;
@@ -246,6 +273,7 @@ private:
   static bool isFiniteBounds(const Bounds& bounds) noexcept;
   static bool exactFrameKey(
       const FrameContext& context, const SealInput& input) noexcept;
+  static bool exactPackageDecision(const SealInput& input) noexcept;
   static bool isKnownSingleConsumerBit(uint32_t consumerBit) noexcept;
   static ProofState classify(const SealInput& input) noexcept;
 
@@ -282,5 +310,7 @@ static_assert(!War3PersistentGpuPackageObserver::kObserveBindsAtlas);
 static_assert(
     !War3PersistentGpuPackageObserver::kObserveWritesConsumerLastUse);
 static_assert(!War3PersistentGpuPackageObserver::kConsumeAdmissionGranted);
+static_assert(
+    !War3PersistentGpuPackageObserver::kRecordingThreadOwnershipIntegrated);
 
 }  // namespace dxvk::war3::gpu_skin

@@ -1,5 +1,43 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（Persistent Package 不可伪造 proof catalog，运行时仍硬关闭）
+
+在 `f20e878` 的固定容量 observer 基础上新增 CPU/value-only immutable proof catalog，
+并修正了 observer 把“全局 catalog snapshot revision”与“单条目最后 publication
+revision”混用的问题。生产 DLL 只编译这些类型，没有 D3D9/Store/Manager/Renderer 对象
+实例化 catalog/observer，没有绑定 atlas、修改 draw/caster 或部署本轮 DLL。
+
+- catalog 使用 immutable sorted `shared_ptr<const Snapshot>` 与单 writer COW 发布；有效空
+  snapshot 从 revision 1 开始，并带进程单调的 catalog instance generation，防止 catalog
+  重建后相同数值 revision 接受旧 decision。条目的 publication revision 只用于诊断，当前帧
+  exact key 比较 acquired instance/snapshot revision，因此同一快照中不同发布时间的 package
+  均可验证。
+- 发布状态为 `Prepared -> UploadSubmitted -> UploadCompleted / Invalidated`。
+  `UploadCompleted` 不能由旧 Store `Ready` 推导，必须带 fence identity、成功 query 与
+  `completedValue >= submittedValue` 的值证据；query 失败、未达值或 identity 不同均拒绝。
+- Ready decision 的构造器私有，只能由 catalog validator 产生；它同时绑定 frame serial、
+  policy revision、Stage11、完整 package key、immutable model generation、当帧 source
+  generation，以及 identity/source/material/alpha/world/bounds 六类 exact sealed/current
+  token。digest 只作早退，之后仍逐字段比较完整 package/primitive/stream/domain proof。
+- observer 删除可伪造的 `packageContentReady` 布尔值和 Main pre-submitted mask；只有上述
+  decision 与当前 row 完整匹配才能达到 `FullyEquivalent`。Main、CSM、point 与 outline
+  全部必须通过 post-seal actual note，且 note 逐项复核完整 key、三类 generation 和六类
+  token；错配 decision 只会降为 ContentPending，revision/digest 诊断清零。
+- package generation、immutable model generation 与 current-draw source generation 已拆成
+  三个语义域，禁止把模型代际机械等同于动态 VB allocation 代际。
+- 当前 catalog 只接受完整单 primitive package，并复核 whole/primitive index hash、连续
+  全域、primitive aggregate、static stream byte layout 与 index offset。multi-primitive 原子
+  发布和 Store 铸造的 publication authority 尚未实现，分别由
+  `kMultiPrimitivePublicationGranted=false` 与
+  `kStorePublicationAuthorityIntegrated=false` 硬阻断；observer 的单 recording-owner 线程
+  也由 `kRecordingThreadOwnershipIntegrated=false` 阻断。在这些合同完成前不得运行时发布
+  条目或记录 actual consumer。
+- 35 个全量 `test_*_static.py` 文件 PASS；四个 package owner/observer/catalog Win32
+  runnable 4/4 PASS；Win32 production build 成功且 `ninja -C build32 -n` no-work。
+  未部署 DLL 为 32,698,815 bytes，SHA-256
+  `1DBF61D109C5DFBB28E18B86B47841A3D77CCB463176891C4C8863C9A5149B53`；部署目录继续保持
+  已通过物理正确性门的 `9BF5E3D9...`。
+
 ## 🚨 2026-08-02（Persistent Package Observer 值表基础，生产路径仍未接入）
 
 新增固定容量、无热路径分配的 `War3PersistentGpuPackageObserver`，用于在未来接入

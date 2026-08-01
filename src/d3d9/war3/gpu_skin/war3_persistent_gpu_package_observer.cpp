@@ -13,8 +13,9 @@ bool War3PersistentGpuPackageObserver::isValidFrameContext(
     const FrameContext& context) noexcept {
   return context.frameSerial != 0u && context.policyRevision != 0u &&
       context.stage == kRequiredStage && context.mapEpoch != 0u &&
-      context.deviceEpoch != 0u && context.packageGeneration != 0u &&
-      context.sourceGeneration != 0u;
+      context.deviceEpoch != 0u &&
+      context.catalogInstanceGeneration != 0u &&
+      context.catalogSnapshotRevision != 0u;
 }
 
 bool War3PersistentGpuPackageObserver::isFiniteBounds(
@@ -32,8 +33,29 @@ bool War3PersistentGpuPackageObserver::exactFrameKey(
       input.policyRevision == context.policyRevision &&
       input.stage == context.stage && input.mapEpoch == context.mapEpoch &&
       input.deviceEpoch == context.deviceEpoch &&
-      input.packageGeneration == context.packageGeneration &&
-      input.sourceGeneration == context.sourceGeneration;
+      input.catalogInstanceGeneration ==
+          context.catalogInstanceGeneration &&
+      input.catalogSnapshotRevision == context.catalogSnapshotRevision;
+}
+
+bool War3PersistentGpuPackageObserver::exactPackageDecision(
+    const SealInput& input) noexcept {
+  return input.packageGeneration != 0u &&
+      input.immutableModelGeneration != 0u &&
+      input.currentDrawSourceGeneration != 0u &&
+      input.packageKey.mapEpoch == input.mapEpoch &&
+      input.packageKey.deviceEpoch == input.deviceEpoch &&
+      input.packageKey.packageGeneration == input.packageGeneration &&
+      input.packageKey.immutableModelGeneration ==
+          input.immutableModelGeneration &&
+      input.packageContentDecision.matches(
+          input.packageKey, input.catalogInstanceGeneration,
+          input.catalogSnapshotRevision,
+          input.frameSerial, input.policyRevision, input.stage,
+          input.identityToken, input.sourceToken,
+          input.currentDrawSourceGeneration,
+          input.materialToken, input.alphaToken,
+          input.worldToken, input.boundsToken);
 }
 
 bool War3PersistentGpuPackageObserver::isKnownSingleConsumerBit(
@@ -51,17 +73,19 @@ War3PersistentGpuPackageObserver::classify(
     return ProofState::IdentityOnly;
 
   if (!input.sourceKnown || !input.sourceExact ||
-      input.sourceToken == 0u || !input.packageContentReady)
+      input.sourceToken == 0u || !exactPackageDecision(input))
     return ProofState::ContentPending;
 
   const bool exactMaterial = input.materialKnown && input.materialExact &&
       input.materialToken != 0u;
   const bool exactAlpha = input.alphaKnown && input.alphaExact &&
       input.alphaToken != 0u;
+  const bool exactWorld = input.worldKnown && input.worldExact &&
+      input.worldToken != 0u;
   const bool exactBounds = input.boundsKnown && input.boundsExact &&
       input.boundsToken != 0u;
   if (input.dynamic || input.skinned || !input.staticRigidProven ||
-      !exactMaterial || !exactAlpha || !exactBounds)
+      !exactMaterial || !exactAlpha || !exactWorld || !exactBounds)
     return ProofState::PackageInputReady;
 
   return ProofState::FullyEquivalent;
@@ -167,17 +191,31 @@ War3PersistentGpuPackageObserver::append(
   SealDecision decision = makePassthroughDecision(
       input, state, disposition);
   Entry& target = m_entries[m_size];
+  const bool packageDecisionBound = exactPackageDecision(input);
   target.frameSerial = input.frameSerial;
   target.policyRevision = input.policyRevision;
   target.stage = input.stage;
   target.mapEpoch = input.mapEpoch;
   target.deviceEpoch = input.deviceEpoch;
+  target.catalogInstanceGeneration = input.catalogInstanceGeneration;
+  target.catalogSnapshotRevision = input.catalogSnapshotRevision;
+  target.packagePublicationRevision = packageDecisionBound
+      ? input.packageContentDecision.publicationRevision()
+      : 0u;
+  target.packageCanonicalDigest = packageDecisionBound
+      ? input.packageContentDecision.canonicalDigest()
+      : 0u;
+  target.packageDecisionReason = input.packageContentDecision.reason();
   target.packageGeneration = input.packageGeneration;
-  target.sourceGeneration = input.sourceGeneration;
+  target.immutableModelGeneration = input.immutableModelGeneration;
+  target.currentDrawSourceGeneration =
+      input.currentDrawSourceGeneration;
+  target.packageKey = input.packageKey;
   target.identityToken = input.identityToken;
   target.sourceToken = input.sourceToken;
   target.materialToken = input.materialToken;
   target.alphaToken = input.alphaToken;
+  target.worldToken = input.worldToken;
   target.boundsToken = input.boundsToken;
   target.requestedConsumerMask = input.requestedConsumerMask;
   target.eligibleConsumerMask = state == ProofState::FullyEquivalent
@@ -187,23 +225,10 @@ War3PersistentGpuPackageObserver::append(
   target.actualConsumerMask = 0u;
   target.proofState = state;
   target.disposition = disposition;
+  target.packageDecisionBound = packageDecisionBound;
+  if (input.packageContentDecision.ready() && !packageDecisionBound)
+    m_diagnostics.packageDecisionBindingMismatch += 1u;
 
-  const uint32_t preSubmitted = input.preSubmittedConsumerMask;
-  const bool exactSeal = exactFrameKey(m_context, input) &&
-      input.stage == kRequiredStage && input.identityKnown &&
-      input.identityExact && input.identityToken != 0u;
-  const bool validRequested = input.requestedConsumerMask != 0u &&
-      (input.requestedConsumerMask & ~kKnownConsumerMask) == 0u;
-  const bool validPreSubmitted =
-      validRequested &&
-      (preSubmitted & ~input.requestedConsumerMask) == 0u &&
-      (preSubmitted & ~kPreSubmittedConsumerMask) == 0u;
-  decision.preSubmittedAccepted = exactSeal && validPreSubmitted;
-  if (decision.preSubmittedAccepted) {
-    target.actualConsumerMask = preSubmitted;
-  } else if (preSubmitted != 0u) {
-    m_diagnostics.invalidPreSubmittedMasks += 1u;
-  }
   target.wouldUseConsumerMask =
       target.eligibleConsumerMask & target.actualConsumerMask;
 
@@ -308,23 +333,37 @@ War3PersistentGpuPackageObserver::noteActualConsumer(
 
   if (note.frameSerial != m_context.frameSerial ||
       note.policyRevision != m_context.policyRevision ||
-      note.stage != m_context.stage || note.stage != kRequiredStage)
+      note.stage != m_context.stage || note.stage != kRequiredStage ||
+      note.catalogInstanceGeneration !=
+          m_context.catalogInstanceGeneration ||
+      note.catalogSnapshotRevision !=
+          m_context.catalogSnapshotRevision)
     return reject(ActualNoteResult::ContextMismatch);
   if (note.mapEpoch != m_context.mapEpoch ||
-      note.deviceEpoch != m_context.deviceEpoch ||
-      note.packageGeneration != m_context.packageGeneration ||
-      note.sourceGeneration != m_context.sourceGeneration)
+      note.deviceEpoch != m_context.deviceEpoch)
     return reject(ActualNoteResult::GenerationMismatch);
 
   Entry& target = m_entries[note.tableIndex];
+  if (note.packageGeneration != target.packageGeneration ||
+      note.immutableModelGeneration != target.immutableModelGeneration ||
+      note.currentDrawSourceGeneration !=
+          target.currentDrawSourceGeneration)
+    return reject(ActualNoteResult::GenerationMismatch);
   if (note.frameSerial != target.frameSerial ||
       note.policyRevision != target.policyRevision ||
       note.stage != target.stage || note.mapEpoch != target.mapEpoch ||
       note.deviceEpoch != target.deviceEpoch ||
-      note.packageGeneration != target.packageGeneration ||
-      note.sourceGeneration != target.sourceGeneration ||
+      note.catalogInstanceGeneration !=
+          target.catalogInstanceGeneration ||
+      note.catalogSnapshotRevision != target.catalogSnapshotRevision ||
+      !PackageProofCatalog::sameKey(note.packageKey, target.packageKey) ||
       note.identityToken == 0u ||
-      note.identityToken != target.identityToken)
+      note.identityToken != target.identityToken ||
+      note.sourceToken != target.sourceToken ||
+      note.materialToken != target.materialToken ||
+      note.alphaToken != target.alphaToken ||
+      note.worldToken != target.worldToken ||
+      note.boundsToken != target.boundsToken)
     return reject(ActualNoteResult::EntryMismatch);
   if ((target.requestedConsumerMask & note.consumerBit) == 0u)
     return reject(ActualNoteResult::ConsumerNotRequested);

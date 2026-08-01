@@ -46,6 +46,7 @@ class PersistentPackageObserverContracts(unittest.TestCase):
             "kObserveBindsAtlas = false",
             "kObserveWritesConsumerLastUse = false",
             "kConsumeAdmissionGranted = false",
+            "kRecordingThreadOwnershipIntegrated = false",
         ):
             with self.subTest(token=token):
                 self.assertIn(token, self.header)
@@ -91,7 +92,7 @@ class PersistentPackageObserverContracts(unittest.TestCase):
 
     def test_exact_seal_requires_every_current_domain(self) -> None:
         exact = self.source.split("exactFrameKey(", 1)[1].split(
-            "War3PersistentGpuPackageObserver::ProofState", 1
+            "bool War3PersistentGpuPackageObserver::exactPackageDecision", 1
         )[0]
         for token in (
             "input.frameSerial == context.frameSerial",
@@ -99,8 +100,9 @@ class PersistentPackageObserverContracts(unittest.TestCase):
             "input.stage == context.stage",
             "input.mapEpoch == context.mapEpoch",
             "input.deviceEpoch == context.deviceEpoch",
-            "input.packageGeneration == context.packageGeneration",
-            "input.sourceGeneration == context.sourceGeneration",
+            "input.catalogInstanceGeneration ==",
+            "context.catalogInstanceGeneration",
+            "input.catalogSnapshotRevision == context.catalogSnapshotRevision",
         ):
             with self.subTest(token=token):
                 self.assertIn(token, exact)
@@ -109,10 +111,66 @@ class PersistentPackageObserverContracts(unittest.TestCase):
             "sourceExact",
             "materialExact",
             "alphaExact",
+            "worldExact",
             "boundsExact",
         ):
             with self.subTest(flag=flag):
                 self.assertIn(flag, self.source)
+
+    def test_package_and_source_generations_are_per_entry(self) -> None:
+        frame = self.header.split("struct FrameContext", 1)[1].split(
+            "struct SealInput", 1
+        )[0]
+        seal = self.header.split("struct SealInput", 1)[1].split(
+            "struct Entry", 1
+        )[0]
+        self.assertNotIn("packageGeneration", frame)
+        self.assertNotIn("currentDrawSourceGeneration", frame)
+        self.assertNotIn("immutableModelGeneration", frame)
+        self.assertIn("catalogSnapshotRevision", frame)
+        self.assertIn("catalogInstanceGeneration", frame)
+        self.assertIn("packageGeneration", seal)
+        self.assertIn("currentDrawSourceGeneration", seal)
+        self.assertIn("immutableModelGeneration", seal)
+        exact = self.source.split("exactFrameKey(", 1)[1].split(
+            "bool War3PersistentGpuPackageObserver::exactPackageDecision", 1
+        )[0]
+        self.assertNotIn("packageGeneration", exact)
+        self.assertNotIn("currentDrawSourceGeneration", exact)
+        self.assertNotIn("immutableModelGeneration", exact)
+
+    def test_ready_is_catalog_decision_bound_to_full_row(self) -> None:
+        seal = self.header.split("struct SealInput", 1)[1].split(
+            "struct Entry", 1
+        )[0]
+        self.assertIn("PackageProofCatalog::Key packageKey", seal)
+        self.assertIn(
+            "PackageProofCatalog::PackageContentDecision packageContentDecision",
+            seal,
+        )
+        self.assertNotIn("packageContentReady", self.header + self.source)
+        exact_package = self.source.split("exactPackageDecision(\n", 1)[1].split(
+            "isKnownSingleConsumerBit", 1
+        )[0]
+        for token in (
+            "input.packageKey.mapEpoch == input.mapEpoch",
+            "input.packageKey.deviceEpoch == input.deviceEpoch",
+            "input.packageKey.packageGeneration == input.packageGeneration",
+            "input.packageKey.immutableModelGeneration ==",
+            "input.immutableModelGeneration",
+            "input.currentDrawSourceGeneration",
+            "input.packageContentDecision.matches(",
+            "input.catalogInstanceGeneration",
+            "input.catalogSnapshotRevision",
+            "input.identityToken",
+            "input.sourceToken",
+            "input.materialToken",
+            "input.alphaToken",
+            "input.worldToken",
+            "input.boundsToken",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, exact_package)
 
     def test_dynamic_unknown_and_skinned_cannot_be_fully_equivalent(self) -> None:
         classify = self.source.split("classify(\n", 1)[1].split(
@@ -122,8 +180,9 @@ class PersistentPackageObserverContracts(unittest.TestCase):
         for gate in (
             "!input.identityKnown",
             "!input.sourceKnown",
+            "!exactPackageDecision(input)",
             "input.dynamic || input.skinned || !input.staticRigidProven",
-            "!exactMaterial || !exactAlpha || !exactBounds",
+            "!exactMaterial || !exactAlpha || !exactWorld || !exactBounds",
         ):
             with self.subTest(gate=gate):
                 self.assertIn(gate, classify)
@@ -149,7 +208,9 @@ class PersistentPackageObserverContracts(unittest.TestCase):
                 self.assertIn(token, self.header)
 
     def test_eligibility_and_actual_consumers_are_separate(self) -> None:
-        entry = self.header.split("struct Entry", 1)[1].split("};", 1)[0]
+        entry = self.header.split("struct Entry", 1)[1].split(
+            "struct ActualConsumerNote", 1
+        )[0]
         self.assertIn("eligibleConsumerMask", entry)
         self.assertIn("wouldUseConsumerMask", entry)
         self.assertIn("actualConsumerMask", entry)
@@ -174,25 +235,12 @@ class PersistentPackageObserverContracts(unittest.TestCase):
             "target.actualConsumerMask = target.wouldUseConsumerMask", append
         )
 
-    def test_pre_submitted_is_main_only_subset_and_does_not_classify(self) -> None:
-        self.assertIn(
-            "kPreSubmittedConsumerMask = ConsumerMain", self.header
-        )
-        append = self.source.split("append(\n", 1)[1].split(
-            "War3PersistentGpuPackageObserver::SealDecision\n"
-            "War3PersistentGpuPackageObserver::seal",
-            1,
-        )[0]
-        self.assertIn(
-            "preSubmitted & ~input.requestedConsumerMask", append
-        )
-        self.assertIn(
-            "preSubmitted & ~kPreSubmittedConsumerMask", append
-        )
-        classify = self.source.split("classify(\n", 1)[1].split(
-            "War3PersistentGpuPackageObserver::BeginDecision", 1
-        )[0]
-        self.assertNotIn("preSubmittedConsumerMask", classify)
+    def test_main_has_no_forgeable_pre_submitted_shortcut(self) -> None:
+        implementation = self.header + self.source
+        self.assertNotIn("preSubmittedConsumerMask", implementation)
+        self.assertNotIn("preSubmittedAccepted", implementation)
+        self.assertNotIn("kPreSubmittedConsumerMask", implementation)
+        self.assertIn("TestMainAlsoRequiresExplicitBoundDrawEvidence", self.test)
 
     def test_actual_note_requires_exact_current_entry_and_known_bit(self) -> None:
         note = self.source.split("noteActualConsumer(\n", 1)[1]
@@ -204,8 +252,20 @@ class PersistentPackageObserverContracts(unittest.TestCase):
             "note.policyRevision != m_context.policyRevision",
             "note.mapEpoch != m_context.mapEpoch",
             "note.deviceEpoch != m_context.deviceEpoch",
-            "note.packageGeneration != m_context.packageGeneration",
-            "note.sourceGeneration != m_context.sourceGeneration",
+            "note.catalogInstanceGeneration !=",
+            "m_context.catalogInstanceGeneration",
+            "note.catalogSnapshotRevision !=",
+            "m_context.catalogSnapshotRevision",
+            "note.packageGeneration != target.packageGeneration",
+            "note.immutableModelGeneration != target.immutableModelGeneration",
+            "note.currentDrawSourceGeneration !=",
+            "target.currentDrawSourceGeneration",
+            "PackageProofCatalog::sameKey(note.packageKey, target.packageKey)",
+            "note.sourceToken != target.sourceToken",
+            "note.materialToken != target.materialToken",
+            "note.alphaToken != target.alphaToken",
+            "note.worldToken != target.worldToken",
+            "note.boundsToken != target.boundsToken",
             "note.identityToken != target.identityToken",
             "target.requestedConsumerMask & note.consumerBit",
             "target.actualConsumerMask |= note.consumerBit",
@@ -218,7 +278,7 @@ class PersistentPackageObserverContracts(unittest.TestCase):
             note.index("target.actualConsumerMask |= note.consumerBit"),
         )
         self.assertLess(
-            note.index("note.packageGeneration != m_context.packageGeneration"),
+            note.index("note.packageGeneration != target.packageGeneration"),
             note.index("target.actualConsumerMask |= note.consumerBit"),
         )
 
@@ -239,10 +299,12 @@ class PersistentPackageObserverContracts(unittest.TestCase):
             "'war3_persistent_gpu_package_observer_test'",
             self.meson,
         )
-        self.assertIn(
+        for source in (
+            "'war3/gpu_skin/war3_persistent_gpu_package_proof_catalog.cpp'",
             "'war3/gpu_skin/tests/war3_persistent_gpu_package_observer_test.cpp'",
-            self.meson,
-        )
+        ):
+            with self.subTest(source=source):
+                self.assertIn(source, self.meson)
 
 
 if __name__ == "__main__":
