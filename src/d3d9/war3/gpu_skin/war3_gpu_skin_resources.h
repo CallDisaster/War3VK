@@ -31,18 +31,74 @@ struct GpuSkinStaticUpload {
   resource_census::ResourceHandle residencyCensus;
 };
 
+// Value-only identity for one immutable vertex/index package in the static
+// atlas.  A future Main/Shadow/Outline consumer may retain this proof together
+// with the resource shared_ptr, but must still compare every field before
+// borrowing either slice.  In particular, a matching geoset pointer alone is
+// not sufficient after a map/device epoch or packing-layout change.
+struct GpuSkinStaticPackageProof {
+  uint64_t mapEpoch = 0u;
+  uint64_t deviceEpoch = 0u;
+  uint64_t packageGeneration = 0u;
+  uintptr_t geosetData = 0u;
+  uint64_t contentHash = 0u;
+  uint64_t indexContentHash = 0u;
+  uint32_t layoutGeneration = 0u;
+  uint32_t vertexCount = 0u;
+  uint32_t indexCount = 0u;
+  VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+  uint32_t staticByteOffset = 0u;
+  uint32_t staticByteLength = 0u;
+  uint32_t indexByteOffset = 0u;
+  uint32_t indexByteLength = 0u;
+};
+
+inline bool SameGpuSkinStaticPackageProof(
+    const GpuSkinStaticPackageProof& lhs,
+    const GpuSkinStaticPackageProof& rhs) noexcept {
+  return lhs.mapEpoch == rhs.mapEpoch &&
+      lhs.deviceEpoch == rhs.deviceEpoch &&
+      lhs.packageGeneration == rhs.packageGeneration &&
+      lhs.geosetData == rhs.geosetData &&
+      lhs.contentHash == rhs.contentHash &&
+      lhs.indexContentHash == rhs.indexContentHash &&
+      lhs.layoutGeneration == rhs.layoutGeneration &&
+      lhs.vertexCount == rhs.vertexCount &&
+      lhs.indexCount == rhs.indexCount &&
+      lhs.indexType == rhs.indexType &&
+      lhs.staticByteOffset == rhs.staticByteOffset &&
+      lhs.staticByteLength == rhs.staticByteLength &&
+      lhs.indexByteOffset == rhs.indexByteOffset &&
+      lhs.indexByteLength == rhs.indexByteLength;
+}
+
 struct GpuSkinStaticResource {
   GpuSkinStaticResourceKey key;
   model::ShadowGeosetResourceSnapshot record;
+  GpuSkinStaticPackageProof packageProof;
   uint64_t indexContentHash = 0;
   uint32_t maxVertexGroupSlot = 0;
   GpuSkinStaticSourceLayout sourceLayout;
+  // packageSlice is the one contiguous immutable upload transaction.
+  // staticSource preserves the existing compute/VS ABI; indexSource is a
+  // UINT16 subrange in the same device-local atlas allocation.
+  DxvkBufferSlice packageSlice;
   DxvkBufferSlice staticSource;
+  DxvkBufferSlice indexSource;
+  VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+  uint32_t indexCount = 0u;
   GpuSkinStaticUpload pendingUpload;
   GpuSkinStaticResourceState state = GpuSkinStaticResourceState::PendingUpload;
   VkDeviceSize allocatedBytes = 0;
   resource_census::ResourceHandle residencyCensus;
 };
+
+bool ValidateGpuSkinStaticPackage(
+    const GpuSkinStaticResource& resource,
+    const GpuSkinStaticPackageProof& expected) noexcept;
+
+static_assert(std::is_standard_layout_v<GpuSkinStaticPackageProof>);
+static_assert(std::is_trivially_copyable_v<GpuSkinStaticPackageProof>);
 
 struct GpuSkinStaticLookup {
   std::shared_ptr<const GpuSkinStaticResource> resource;
@@ -295,6 +351,7 @@ private:
   uint64_t m_lastRetirementPollDeviceEpoch = 0;
   uint64_t m_lastRetirementPollFrameTag = 0;
   uint64_t m_nextOutputLeaseId = 1;
+  uint64_t m_nextStaticPackageGeneration = 1;
   uint32_t m_nextOutputPageId = 1;
   VkDeviceSize m_staticBytes = 0;
   VkDeviceSize m_staticCursor = 0;

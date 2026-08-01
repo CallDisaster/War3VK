@@ -153,6 +153,7 @@ DxvkBufferCreateInfo StaticBufferInfo(VkDeviceSize size, const char* name) {
   info.size = size;
   info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+               VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
@@ -160,6 +161,7 @@ DxvkBufferCreateInfo StaticBufferInfo(VkDeviceSize size, const char* name) {
                 VK_PIPELINE_STAGE_TRANSFER_BIT;
   info.access = VK_ACCESS_SHADER_READ_BIT |
                 VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                VK_ACCESS_INDEX_READ_BIT |
                 VK_ACCESS_TRANSFER_WRITE_BIT;
   info.debugName = name;
   return info;
@@ -244,6 +246,101 @@ bool GetValidatedStaticLayout(
 }
 
 }  // namespace
+
+bool ValidateGpuSkinStaticPackage(
+    const GpuSkinStaticResource& resource,
+    const GpuSkinStaticPackageProof& expected) noexcept {
+  if (resource.state != GpuSkinStaticResourceState::Ready ||
+      !SameGpuSkinStaticPackageProof(resource.packageProof, expected) ||
+      expected.mapEpoch == 0u || expected.deviceEpoch == 0u ||
+      expected.packageGeneration == 0u || expected.geosetData == 0u ||
+      expected.contentHash == 0u || expected.indexContentHash == 0u ||
+      expected.layoutGeneration == 0u || expected.vertexCount == 0u ||
+      expected.indexCount == 0u ||
+      expected.indexType != VK_INDEX_TYPE_UINT16 ||
+      expected.staticByteLength == 0u || expected.indexByteLength == 0u ||
+      resource.record == nullptr || resource.indexContentHash == 0u ||
+      resource.indexContentHash != expected.indexContentHash ||
+      resource.indexType != expected.indexType ||
+      resource.indexCount != expected.indexCount ||
+      resource.key.mapEpoch != expected.mapEpoch ||
+      resource.key.deviceEpoch != expected.deviceEpoch ||
+      resource.key.geosetData != expected.geosetData ||
+      resource.key.contentHash != expected.contentHash ||
+      resource.key.layoutGeneration != expected.layoutGeneration) {
+    return false;
+  }
+
+  const model::ShadowGeosetResourceRecord& record = *resource.record;
+  GpuSkinStaticSourceLayout validatedLayout = {};
+  if (!GetValidatedStaticLayout(record, &validatedLayout) ||
+      record.geosetDataPtr != reinterpret_cast<void*>(expected.geosetData) ||
+      record.contentHash != expected.contentHash ||
+      record.vertexCount != expected.vertexCount ||
+      record.indexCount != expected.indexCount ||
+      record.indices.size() != expected.indexCount ||
+      resource.sourceLayout.positionOffset != validatedLayout.positionOffset ||
+      resource.sourceLayout.normalOffset != validatedLayout.normalOffset ||
+      resource.sourceLayout.groupSlotOffset != validatedLayout.groupSlotOffset ||
+      resource.sourceLayout.texcoord0Offset != validatedLayout.texcoord0Offset ||
+      resource.sourceLayout.texcoord1Offset != validatedLayout.texcoord1Offset ||
+      resource.sourceLayout.byteSize != validatedLayout.byteSize ||
+      expected.staticByteLength != validatedLayout.byteSize ||
+      uint64_t(expected.indexByteLength) !=
+          uint64_t(expected.indexCount) * sizeof(uint16_t)) {
+    return false;
+  }
+
+  if (!resource.packageSlice.defined() ||
+      !resource.staticSource.defined() || !resource.indexSource.defined() ||
+      resource.packageSlice.buffer() == nullptr ||
+      resource.staticSource.buffer() != resource.packageSlice.buffer() ||
+      resource.indexSource.buffer() != resource.packageSlice.buffer() ||
+      resource.packageSlice.length() != resource.allocatedBytes ||
+      resource.staticSource.offset() != expected.staticByteOffset ||
+      resource.staticSource.length() != expected.staticByteLength ||
+      resource.indexSource.offset() != expected.indexByteOffset ||
+      resource.indexSource.length() != expected.indexByteLength ||
+      resource.packageSlice.offset() != resource.staticSource.offset()) {
+    return false;
+  }
+
+  const uint64_t packageOffset = resource.packageSlice.offset();
+  const uint64_t packageLength = resource.packageSlice.length();
+  const uint64_t staticOffset = resource.staticSource.offset();
+  const uint64_t staticLength = resource.staticSource.length();
+  const uint64_t indexOffset = resource.indexSource.offset();
+  const uint64_t indexLength = resource.indexSource.length();
+  if (staticOffset < packageOffset || indexOffset < packageOffset ||
+      staticLength > packageLength || indexLength > packageLength ||
+      staticOffset - packageOffset > packageLength - staticLength ||
+      indexOffset - packageOffset > packageLength - indexLength ||
+      indexOffset < staticOffset + staticLength ||
+      indexOffset - packageOffset + indexLength != packageLength ||
+      indexOffset % alignof(uint16_t) != 0u) {
+    return false;
+  }
+
+  const DxvkBufferCreateInfo& info = resource.packageSlice.buffer()->info();
+  constexpr VkBufferUsageFlags kRequiredUsage =
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+      VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  constexpr VkPipelineStageFlags kRequiredStages =
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+      VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+      VK_PIPELINE_STAGE_TRANSFER_BIT;
+  constexpr VkAccessFlags kRequiredAccess =
+      VK_ACCESS_SHADER_READ_BIT |
+      VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+      VK_ACCESS_INDEX_READ_BIT |
+      VK_ACCESS_TRANSFER_WRITE_BIT;
+  return (info.usage & kRequiredUsage) == kRequiredUsage &&
+      (info.stages & kRequiredStages) == kRequiredStages &&
+      (info.access & kRequiredAccess) == kRequiredAccess;
+}
 
 
 GpuSkinMode GpuSkinRuntimeConfig::parseMode(const char* value) {
@@ -420,7 +517,8 @@ GpuSkinStaticLookup War3GpuSkinResources::findOrQueueStatic(
   const GpuSkinStaticResourceKey key = makeKey(snapshot, layoutGeneration);
   const auto ready = m_staticResources.find(key);
   if (ready != m_staticResources.end()) {
-    if (ready->second->state == GpuSkinStaticResourceState::Ready) {
+    if (ready->second != nullptr &&
+        ready->second->state == GpuSkinStaticResourceState::Ready) {
       const GpuSkinStaticSourceLayout& cachedLayout =
           ready->second->sourceLayout;
       const bool exactLayout =
@@ -435,7 +533,11 @@ GpuSkinStaticLookup War3GpuSkinResources::findOrQueueStatic(
           ready->second->record->contentHash == snapshot.contentHash &&
           ready->second->record->vertexCount == snapshot.vertexCount &&
           ready->second->record->normalCount == snapshot.normalCount &&
-          ready->second->record->uvLayerCount == snapshot.uvLayerCount;
+          ready->second->record->uvLayerCount == snapshot.uvLayerCount &&
+          ready->second->record->indexCount == snapshot.indexCount &&
+          ready->second->record->indices.size() == snapshot.indices.size() &&
+          ValidateGpuSkinStaticPackage(
+              *ready->second, ready->second->packageProof);
       if (!exactLayout) {
         recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
         return { nullptr, GpuSkinFallbackReason::StaticResourceInvalid };
@@ -443,7 +545,8 @@ GpuSkinStaticLookup War3GpuSkinResources::findOrQueueStatic(
       ++m_diagnostics.staticCacheHits;
       return { ready->second, GpuSkinFallbackReason::None };
     }
-    if (ready->second->state == GpuSkinStaticResourceState::Invalid) {
+    if (ready->second != nullptr &&
+        ready->second->state == GpuSkinStaticResourceState::Invalid) {
       recordFallback(GpuSkinFallbackReason::StaticBudgetExhausted);
       return { nullptr, GpuSkinFallbackReason::StaticBudgetExhausted };
     }
@@ -534,10 +637,7 @@ GpuSkinStaticLookup War3GpuSkinResources::probeStatic(
       record->geosetDataPtr != stamp.geosetDataPtr ||
       record->contentHash != stamp.contentHash ||
       record->vertexCount != stamp.vertexCount ||
-      resource->indexContentHash == 0u ||
-      !resource->staticSource.defined() ||
-      resource->staticSource.buffer() == nullptr ||
-      resource->staticSource.length() != resource->sourceLayout.byteSize) {
+      !ValidateGpuSkinStaticPackage(*resource, resource->packageProof)) {
     recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
     return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
   }
@@ -580,17 +680,43 @@ std::shared_ptr<GpuSkinStaticResource> War3GpuSkinResources::createStaticResourc
     return nullptr;
   const model::ShadowGeosetResourceRecord& record = *miss.record;
   GpuSkinStaticSourceLayout layout;
-  if (m_device == nullptr || !GetValidatedStaticLayout(record, &layout))
+  if (m_device == nullptr || m_mapEpoch == 0u || m_deviceEpoch == 0u ||
+      miss.key.mapEpoch != m_mapEpoch ||
+      miss.key.deviceEpoch != m_deviceEpoch ||
+      miss.key.geosetData !=
+          reinterpret_cast<uintptr_t>(record.geosetDataPtr) ||
+      miss.key.contentHash == 0u ||
+      miss.key.contentHash != record.contentHash ||
+      miss.key.layoutGeneration == 0u ||
+      !GetValidatedStaticLayout(record, &layout))
     return nullptr;
 
-  const VkDeviceSize deviceBytes = layout.byteSize;
+  if (record.indexCount == 0u ||
+      record.indices.size() != size_t(record.indexCount))
+    return nullptr;
+
+  const VkDeviceSize staticBytes = layout.byteSize;
+  const VkDeviceSize indexBytes =
+      VkDeviceSize(record.indices.size()) * sizeof(uint16_t);
+  VkDeviceSize indexRelativeOffset = 0u;
+  if (!TryAlignUp(staticBytes, alignof(uint16_t), indexRelativeOffset) ||
+      indexBytes == 0u ||
+      indexRelativeOffset > std::numeric_limits<VkDeviceSize>::max() -
+          indexBytes)
+    return nullptr;
+  const VkDeviceSize packageBytes = indexRelativeOffset + indexBytes;
+
   VkDeviceSize atlasOffset = 0u;
   if (!TryAlignUp(m_staticCursor, m_storageBufferOffsetAlignment,
                   atlasOffset))
     return nullptr;
-  if (deviceBytes == 0u || atlasOffset > m_budgets.staticBytes ||
-      deviceBytes > m_budgets.staticBytes - atlasOffset ||
-      atlasOffset > std::numeric_limits<uint32_t>::max())
+  if (staticBytes == 0u || packageBytes == 0u ||
+      atlasOffset > m_budgets.staticBytes ||
+      packageBytes > m_budgets.staticBytes - atlasOffset ||
+      atlasOffset > std::numeric_limits<uint32_t>::max() ||
+      packageBytes > std::numeric_limits<uint32_t>::max() ||
+      atlasOffset + indexRelativeOffset >
+          std::numeric_limits<uint32_t>::max())
     return nullptr;
 
   if (m_staticAtlas == nullptr) {
@@ -622,24 +748,28 @@ std::shared_ptr<GpuSkinStaticResource> War3GpuSkinResources::createStaticResourc
   resource->record = miss.record;
   resource->indexContentHash = HashStaticBytes(
       record.indices.data(), record.indices.size() * sizeof(uint16_t));
+  if (resource->indexContentHash == 0u)
+    return nullptr;
   resource->maxVertexGroupSlot = *std::max_element(
       record.vertexGroupIndices.begin(), record.vertexGroupIndices.end());
   resource->sourceLayout = layout;
-  resource->allocatedBytes = deviceBytes;
+  resource->indexType = VK_INDEX_TYPE_UINT16;
+  resource->indexCount = record.indexCount;
+  resource->allocatedBytes = packageBytes;
   resource->residencyCensus =
-      RegisterStaticMirror(deviceBytes, true);
+      RegisterStaticMirror(packageBytes, true);
 
   Rc<DxvkBuffer> staging = m_device->createBuffer(
-      UploadBufferInfo(deviceBytes, "War3GpuSkinStaticSourceUpload"),
+      UploadBufferInfo(packageBytes, "War3GpuSkinStaticPackageUpload"),
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
   if (staging == nullptr || staging->mapPtr(0u) == nullptr)
     return nullptr;
   resource_census::ResourceHandle stagingCensus = RegisterGpuBuffer(
       resource_census::ResourceClass::GpuSkinStaticUploadStaging,
-      staging, deviceBytes, true, true);
+      staging, packageBytes, true, true);
 
   auto* blob = reinterpret_cast<uint8_t*>(staging->mapPtr(0u));
-  std::memset(blob, 0, size_t(deviceBytes));
+  std::memset(blob, 0, size_t(packageBytes));
   std::memcpy(blob + layout.positionOffset, record.positions.data(),
       size_t(record.vertexCount) * 12u);
   std::memcpy(blob + layout.normalOffset, record.normals.data(),
@@ -656,20 +786,49 @@ std::shared_ptr<GpuSkinStaticResource> War3GpuSkinResources::createStaticResourc
         record.uvLayers[1].uvPairs.data(),
         size_t(record.vertexCount) * 8u);
   }
+  std::memcpy(blob + indexRelativeOffset, record.indices.data(),
+      size_t(indexBytes));
 
+  resource->packageSlice = DxvkBufferSlice(
+      m_staticAtlas, atlasOffset, packageBytes);
   resource->staticSource = DxvkBufferSlice(
-      m_staticAtlas, atlasOffset, deviceBytes);
+      m_staticAtlas, atlasOffset, staticBytes);
+  resource->indexSource = DxvkBufferSlice(
+      m_staticAtlas, atlasOffset + indexRelativeOffset, indexBytes);
+
+  // Never recycle an identity generation. Exhaustion is practically
+  // unreachable, but fail closed instead of allowing an ancient retained
+  // proof to alias a new package after integer wrap.
+  if (m_nextStaticPackageGeneration == 0u ||
+      m_nextStaticPackageGeneration == std::numeric_limits<uint64_t>::max())
+    return nullptr;
+  const uint64_t packageGeneration = m_nextStaticPackageGeneration++;
+  resource->packageProof = {
+      m_mapEpoch,
+      m_deviceEpoch,
+      packageGeneration,
+      reinterpret_cast<uintptr_t>(record.geosetDataPtr),
+      record.contentHash,
+      resource->indexContentHash,
+      miss.key.layoutGeneration,
+      record.vertexCount,
+      record.indexCount,
+      VK_INDEX_TYPE_UINT16,
+      uint32_t(atlasOffset),
+      uint32_t(staticBytes),
+      uint32_t(atlasOffset + indexRelativeOffset),
+      uint32_t(indexBytes) };
   resource->pendingUpload = {
       resource->key,
-      DxvkBufferSlice(std::move(staging), 0u, deviceBytes),
-      resource->staticSource,
-      deviceBytes,
+      DxvkBufferSlice(std::move(staging), 0u, packageBytes),
+      resource->packageSlice,
+      packageBytes,
       std::move(stagingCensus) };
 
-  m_staticCursor = atlasOffset + deviceBytes;
+  m_staticCursor = atlasOffset + packageBytes;
   m_staticBytes = m_staticCursor;
   ++m_diagnostics.staticUploadsPrepared;
-  m_diagnostics.staticUploadBytes += deviceBytes;
+  m_diagnostics.staticUploadBytes += packageBytes;
   return resource;
 }
 
@@ -692,12 +851,18 @@ bool War3GpuSkinResources::retireStaticUpload(
 
   const auto found = m_staticResources.find(upload.key);
   if (found != m_staticResources.end() &&
+      found->second != nullptr &&
       found->second->state == GpuSkinStaticResourceState::Ready) {
-    return true;
+    const bool valid = ValidateGpuSkinStaticPackage(
+        *found->second, found->second->packageProof);
+    if (!valid)
+      recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
+    return valid;
   }
 
   bool exactPendingUpload = false;
   if (found != m_staticResources.end() &&
+      found->second != nullptr &&
       found->second->state == GpuSkinStaticResourceState::PendingUpload) {
     const GpuSkinStaticUpload& pending = found->second->pendingUpload;
     exactPendingUpload = pending.source.defined() &&
@@ -707,16 +872,26 @@ bool War3GpuSkinResources::retireStaticUpload(
         pending.source.length() == upload.source.length() &&
         pending.destination.buffer() == upload.destination.buffer() &&
         pending.destination.offset() == upload.destination.offset() &&
-        pending.destination.length() == upload.destination.length();
+        pending.destination.length() == upload.destination.length() &&
+        pending.destination.buffer() == found->second->packageSlice.buffer() &&
+        pending.destination.offset() == found->second->packageSlice.offset() &&
+        pending.destination.length() == found->second->packageSlice.length();
     if (exactPendingUpload) {
-      found->second->pendingUpload = {};
       found->second->state = GpuSkinStaticResourceState::Ready;
-      resource_census::UpdateHostBacking(
-          found->second->residencyCensus, 0u, 0u, 0u);
-      // 这里只标记精确 atlas 上传事务已被接受，并纳入下方 producer fence 管理。
-      // 该信息仅供诊断，绝不授权释放仍属于 P4 精确内容证明的 CPU mirror。
-      resource_census::NoteDeviceUpload(
-          found->second->residencyCensus, 0u);
+      const bool validPackage = ValidateGpuSkinStaticPackage(
+          *found->second, found->second->packageProof);
+      found->second->pendingUpload = {};
+      if (validPackage) {
+        resource_census::UpdateHostBacking(
+            found->second->residencyCensus, 0u, 0u, 0u);
+        // 这里只标记精确 atlas 上传事务已被接受，并纳入下方 producer fence 管理。
+        // 该信息仅供诊断，绝不授权释放仍属于 P4 精确内容证明的 CPU mirror。
+        resource_census::NoteDeviceUpload(
+            found->second->residencyCensus, 0u);
+      } else {
+        found->second->state = GpuSkinStaticResourceState::Invalid;
+        exactPendingUpload = false;
+      }
     }
   }
 
