@@ -266,6 +266,7 @@ War3PersistentGpuPackageStore::War3PersistentGpuPackageStore(
 
 War3PersistentGpuPackageStore::~War3PersistentGpuPackageStore() {
   reset();
+  deferOutstandingProducerRetirements();
 }
 
 bool War3PersistentGpuPackageStore::beginFrame(
@@ -710,9 +711,12 @@ bool War3PersistentGpuPackageStore::retireStaticUpload(
 
   // The staging slice remains authoritative until the producer fence passes,
   // even if an epoch invalidates the package lookup table in the meantime.
-  m_retiredStaticUploads.push_back({
-      upload.key, upload.source, std::move(fence), value,
-      upload.residencyCensus});
+  // Retain the exact destination slice and atlas census for the same interval:
+  // a copy command references both resources, not only its host-visible side.
+  m_retiredStaticUploads.push_back(std::make_unique<RetiredStaticUpload>(
+      RetiredStaticUpload{
+          upload.key, upload.source, upload.destination, std::move(fence),
+          value, upload.residencyCensus, m_staticAtlasCensus}));
   ++m_diagnostics.staticUploadRetirementsQueued;
   if (!exactPendingUpload)
     recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
@@ -759,8 +763,11 @@ void War3PersistentGpuPackageStore::fillResidencySnapshot(
   for (const auto& upload : m_readyStaticUploads)
     snapshot.readyStaticUploadBytes += uint64_t(upload.byteCount);
   snapshot.retiredStaticUploadCount = m_retiredStaticUploads.size();
-  for (const auto& upload : m_retiredStaticUploads)
-    snapshot.retiredStaticUploadBytes += uint64_t(upload.source.length());
+  for (const auto& upload : m_retiredStaticUploads) {
+    if (upload != nullptr)
+      snapshot.retiredStaticUploadBytes +=
+          uint64_t(upload->source.length());
+  }
 }
 
 void War3PersistentGpuPackageStore::recordFallback(
@@ -777,10 +784,45 @@ void War3PersistentGpuPackageStore::clearEpochResources() {
   m_readyStaticUploads.clear();
   m_staticAtlas = nullptr;
   m_staticAtlasCensus.reset();
-  m_retiredStaticUploads.clear();
+  // Submitted copies are generation-owned retirement records, not active
+  // lookup state. Keep their source and destination slices alive across map,
+  // device and reset boundaries until pollRetired observes the exact producer
+  // fence. Consumer-side atlas retirement remains a separate P1 admission gate.
   m_staticBytes = 0u;
   m_staticCursor = 0u;
   m_queuedStaticMissHostBytes = 0u;
+}
+
+void War3PersistentGpuPackageStore::deferOutstandingProducerRetirements()
+    noexcept {
+  // The legacy manager normally destroys this store only after its whole
+  // War3GpuSkinResources owner is quiescent. Keep destruction independently
+  // producer-safe as well: if a submitted copy is unexpectedly still in
+  // flight, transfer its two buffer slices to the timeline-fence callback.
+  // The callback deliberately owns no fence reference, avoiding a cycle.
+  while (!m_retiredStaticUploads.empty()) {
+    std::unique_ptr<RetiredStaticUpload> retirement =
+        std::move(m_retiredStaticUploads.front());
+    m_retiredStaticUploads.pop_front();
+    if (retirement == nullptr || retirement->fence == nullptr ||
+        retirement->retireValue == 0u) {
+      // A malformed retirement has no completion proof. Leak rather than
+      // guess that the producer is idle and release GPU-visible storage.
+      (void)retirement.release();
+      continue;
+    }
+
+    Rc<DxvkFence> fence = std::move(retirement->fence);
+    const uint64_t retireValue = retirement->retireValue;
+    RetiredStaticUpload* const payload = retirement.release();
+    try {
+      fence->enqueueWait(retireValue, [payload] { delete payload; });
+    } catch (...) {
+      // Allocation failure while registering the callback must not turn into
+      // an early GPU resource release. Intentionally leak this exceptional
+      // payload; process teardown will reclaim it fail-closed.
+    }
+  }
 }
 
 }  // namespace dxvk::war3::gpu_skin

@@ -1,5 +1,31 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（Persistent Package producer-fence 跨 epoch 保活，Shared Consumer 仍禁止）
+
+本轮修复 P0 Store 继承的 producer upload 生命周期缺口，范围只覆盖一次性
+staging→atlas copy；没有创建 D3D9 shared owner，也没有让 Main/CSM/point/outline
+消费 package。
+
+- `RetiredStaticUpload` 现在同时持有 exact source、destination atlas slice 与两侧 census；
+  map/device/reset 清理 lookup/active atlas 时不再删除未完成 retirement。只有 exact
+  producer fence 达值才回收。
+- 析构若意外仍有在途 copy，会把 payload 转交 `DxvkFence::enqueueWait`；若回调注册失败
+  或 device teardown 无法证明完成，则有意保留到进程退出，禁止猜测 GPU 已空闲并提前释放。
+- `kProducerRetirementSurvivesEpochClear=true`，但
+  `kD3D9SharedOwnerEnabled=false / kCrossEpochRetirementSafe=false` 继续锁死。Store 尚无
+  Main/CSM/point/outline 最后一次 use-fence，不能据此开启 shared consumer 或 B1 bypass。
+- 19 项 package/owner 合同、181 项相关 TAA/point/stage/alpha/blocker/final-caster 静态门、
+  Meson runnable 1/1 PASS；Win32 build 成功，`ninja -C build32 -n` no-work。
+- 高压图 `full_default` 性能-only 门（该 runner 的 hot-shadow witness 与当前图不兼容，故
+  显式 `--no-hot-shadow`）运行 2,517 帧：54.288 FPS、frame 18.420 ms、main-thread
+  CPU 13.500 ms、worker CPU 5.140 ms、GPU 4.905 ms；BuildEligible 1.886 ms、Populate
+  2.569 ms。`framesIncomplete=0 / budgetExceeded=0 / Arena busy/overflow=0`，无新增
+  NVIDIA 153/4101 或 GPU incident。该门证明运行稳定和性能基线，不替代 160 张
+  trace-aligned 阴影正确性验收。
+- build32/部署 DLL exact：32,633,770 bytes，SHA-256
+  `801A272648874A97933F7E07C58C273A920F17A15CA6E974D683F27F586F59B2`；回退为
+  `E:\Work\War3\d3d9.dll.bak_20260802_pre_package_producer_retirement_E1D87436`。
+
 ## 🚨 2026-08-02（Persistent GPU Package Store P0 抽离，Shared Owner 仍禁止）
 
 本轮从 `89dc8ec` 继续，把 immutable vertex/index package 的 static map、atlas、miss、

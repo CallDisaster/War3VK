@@ -17,10 +17,15 @@ class War3PersistentGpuPackageStore final {
 public:
   static constexpr bool kD3D9SharedOwnerEnabled = false;
   static constexpr bool kRequiresNativeBridge = false;
-  // The inherited P0 reset path still clears the atlas and producer-retirement
-  // records together. The legacy manager is safe because it retains the old
-  // War3GpuSkinResources owner while work is in flight, but a future shared
-  // D3D9 owner must first add explicit upload/use-fence generation retirement.
+  // A submitted package upload owns both sides of the copy until its producer
+  // fence completes. Epoch invalidation may drop lookup state, but it must not
+  // discard this retirement queue or release the destination atlas early.
+  static constexpr bool kProducerRetirementSurvivesEpochClear = true;
+  // P0 reset still clears active atlas lookup state, while submitted copy
+  // retirements now survive the epoch. The legacy manager remains the only
+  // owner and retains War3GpuSkinResources through consumer completion; a
+  // future shared D3D9 owner must additionally publish an exact last-use fence
+  // for Main/CSM/point/outline before this gate can be enabled.
   static constexpr bool kCrossEpochRetirementSafe = false;
 
   War3PersistentGpuPackageStore(
@@ -61,8 +66,8 @@ public:
   void pollRetired(const FenceValueQuery& getFenceValue) {
     for (auto it = m_retiredStaticUploads.begin();
          it != m_retiredStaticUploads.end();) {
-      if (it->fence != nullptr &&
-          getFenceValue(it->fence) >= it->retireValue) {
+      if (*it != nullptr && (*it)->fence != nullptr &&
+          getFenceValue((*it)->fence) >= (*it)->retireValue) {
         ++m_diagnostics.staticUploadRetirementsReclaimed;
         it = m_retiredStaticUploads.erase(it);
       } else {
@@ -82,9 +87,11 @@ private:
   struct RetiredStaticUpload {
     GpuSkinStaticResourceKey key;
     DxvkBufferSlice source;
+    DxvkBufferSlice destination;
     Rc<DxvkFence> fence;
     uint64_t retireValue = 0;
     resource_census::ResourceHandle residencyCensus;
+    resource_census::ResourceHandle destinationResidencyCensus;
   };
 
   GpuSkinStaticResourceKey makeKey(
@@ -94,6 +101,7 @@ private:
       const QueuedStaticMiss& miss);
   void recordFallback(GpuSkinFallbackReason reason);
   void clearEpochResources();
+  void deferOutstandingProducerRetirements() noexcept;
 
   Rc<DxvkDevice> m_device;
   GpuSkinResourceBudgets m_budgets;
@@ -114,11 +122,13 @@ private:
   std::vector<GpuSkinStaticUpload> m_readyStaticUploads;
   Rc<DxvkBuffer> m_staticAtlas;
   resource_census::ResourceHandle m_staticAtlasCensus;
-  std::deque<RetiredStaticUpload> m_retiredStaticUploads;
+  std::deque<std::unique_ptr<RetiredStaticUpload>> m_retiredStaticUploads;
 };
 
 static_assert(!War3PersistentGpuPackageStore::kD3D9SharedOwnerEnabled);
 static_assert(!War3PersistentGpuPackageStore::kRequiresNativeBridge);
+static_assert(
+    War3PersistentGpuPackageStore::kProducerRetirementSurvivesEpochClear);
 static_assert(!War3PersistentGpuPackageStore::kCrossEpochRetirementSafe);
 
 }  // namespace dxvk::war3::gpu_skin

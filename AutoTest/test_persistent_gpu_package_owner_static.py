@@ -74,18 +74,50 @@ class PersistentPackageOwnerContracts(unittest.TestCase):
                 self.assertNotIn(forbidden, store_implementation)
         self.assertIn("kD3D9SharedOwnerEnabled = false", self.store_h)
         self.assertIn("kRequiresNativeBridge = false", self.store_h)
+        self.assertIn(
+            "kProducerRetirementSurvivesEpochClear = true", self.store_h
+        )
         self.assertIn("kCrossEpochRetirementSafe = false", self.store_h)
 
-    def test_shared_owner_is_blocked_until_cross_epoch_fences_exist(self) -> None:
+    def test_producer_retirement_survives_epoch_clear(self) -> None:
+        retired = self.store_h.split("struct RetiredStaticUpload", 1)[1].split(
+            "};", 1
+        )[0]
+        self.assertIn("DxvkBufferSlice source;", retired)
+        self.assertIn("DxvkBufferSlice destination;", retired)
+        self.assertIn("destinationResidencyCensus", retired)
+
+        retire = self.store_cpp.split("retireStaticUpload(", 1)[1].split(
+            "staticAtlasSlice()", 1
+        )[0]
+        self.assertIn("upload.source, upload.destination", retire)
+        self.assertIn("m_staticAtlasCensus", retire)
+
+        clear = self.store_cpp.split(
+            "void War3PersistentGpuPackageStore::clearEpochResources()", 1
+        )[1]
+        self.assertNotIn("m_retiredStaticUploads.clear()", clear)
+
+        destructor = self.store_cpp.split(
+            "War3PersistentGpuPackageStore::~War3PersistentGpuPackageStore()",
+            1,
+        )[1].split("bool War3PersistentGpuPackageStore::beginFrame", 1)[0]
+        self.assertIn("deferOutstandingProducerRetirements()", destructor)
+
+        deferred = self.store_cpp.split(
+            "deferOutstandingProducerRetirements()", 2
+        )[2]
+        self.assertIn("fence->enqueueWait(retireValue", deferred)
+        self.assertIn("delete payload", deferred)
+        self.assertIn("Intentionally leak", deferred)
+
+    def test_shared_owner_remains_blocked_without_consumer_use_fence(self) -> None:
         self.assertIn(
             "static_assert(!War3PersistentGpuPackageStore::"
             "kCrossEpochRetirementSafe)",
             self.store_h,
         )
-        clear = self.store_cpp.split(
-            "void War3PersistentGpuPackageStore::clearEpochResources()", 1
-        )[1]
-        self.assertIn("m_retiredStaticUploads.clear()", clear)
+        self.assertNotIn("retireStaticAtlasUse", self.store_h)
 
     def test_d3d9_does_not_construct_or_name_the_store(self) -> None:
         self.assertNotIn("War3PersistentGpuPackageStore", self.device_cpp)

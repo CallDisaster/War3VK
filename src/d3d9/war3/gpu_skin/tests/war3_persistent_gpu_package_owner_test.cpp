@@ -21,7 +21,10 @@ int main() {
     return 2;
   if (gpu_skin::War3PersistentGpuPackageStore::kRequiresNativeBridge)
     return 3;
-  if (gpu_skin::War3PersistentGpuPackageStore::kCrossEpochRetirementSafe)
+  if (!gpu_skin::War3PersistentGpuPackageStore::
+          kProducerRetirementSurvivesEpochClear)
     return 4;
+  if (gpu_skin::War3PersistentGpuPackageStore::kCrossEpochRetirementSafe)
+    return 5;
   return 0;
 }
