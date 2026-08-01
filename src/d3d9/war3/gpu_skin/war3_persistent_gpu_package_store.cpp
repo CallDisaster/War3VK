@@ -1,6 +1,7 @@
 #include "war3_persistent_gpu_package_store.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 
@@ -29,12 +30,117 @@ bool TryAlignUp(VkDeviceSize value, VkDeviceSize alignment,
   return true;
 }
 
-uint64_t HashStaticBytes(const void* data, size_t size) {
-  uint64_t hash = 0xcbf29ce484222325ull;
+void HashStaticBytesInto(uint64_t& hash, const void* data, size_t size) {
   const auto* bytes = reinterpret_cast<const uint8_t*>(data);
   for (size_t i = 0u; i < size; ++i)
     hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+}
+
+uint64_t HashStaticBytes(const void* data, size_t size) {
+  uint64_t hash = 0xcbf29ce484222325ull;
+  HashStaticBytesInto(hash, data, size);
   return hash;
+}
+
+template <typename T>
+void HashStaticValueInto(uint64_t& hash, const T& value) {
+  HashStaticBytesInto(hash, &value, sizeof(value));
+}
+
+bool BuildPrimitiveProofs(
+    const model::ShadowGeosetResourceRecord& record,
+    std::vector<GpuSkinStaticPrimitiveProof>& proofs,
+    uint64_t& proofHash) {
+  proofs.clear();
+  proofHash = 0u;
+  if (record.primitiveCount == 0u ||
+      record.primitiveRecords.size() != record.primitiveCount ||
+      record.indices.size() != record.indexCount ||
+      record.vertexCount == 0u)
+    return false;
+
+  proofs.reserve(record.primitiveCount);
+  uint64_t firstIndex = 0u;
+  uint64_t aggregateHash = 0xcbf29ce484222325ull;
+  for (uint32_t ordinal = 0u; ordinal < record.primitiveCount; ++ordinal) {
+    const auto& primitive = record.primitiveRecords[ordinal];
+    const uint64_t indexCount = primitive.indexCount;
+    if (indexCount == 0u || firstIndex > record.indexCount ||
+        indexCount > uint64_t(record.indexCount) - firstIndex)
+      return false;
+
+    const auto begin = record.indices.begin() + size_t(firstIndex);
+    const auto end = begin + size_t(indexCount);
+    const auto minmax = std::minmax_element(begin, end);
+    if (minmax.first == end || *minmax.second >= record.vertexCount)
+      return false;
+
+    GpuSkinStaticPrimitiveProof proof = {};
+    proof.indexContentHash = HashStaticBytes(
+        &record.indices[size_t(firstIndex)],
+        size_t(indexCount) * sizeof(uint16_t));
+    proof.ordinal = ordinal;
+    proof.primitiveTypeOrMaterialSlot =
+        primitive.primitiveTypeOrMaterialSlot;
+    proof.firstIndex = uint32_t(firstIndex);
+    proof.indexCount = uint32_t(indexCount);
+    proof.minVertex = *minmax.first;
+    proof.maxVertex = *minmax.second;
+    if (proof.indexContentHash == 0u)
+      return false;
+
+    HashStaticValueInto(aggregateHash, proof.indexContentHash);
+    HashStaticValueInto(aggregateHash, proof.ordinal);
+    HashStaticValueInto(
+        aggregateHash, proof.primitiveTypeOrMaterialSlot);
+    HashStaticValueInto(aggregateHash, proof.firstIndex);
+    HashStaticValueInto(aggregateHash, proof.indexCount);
+    HashStaticValueInto(aggregateHash, proof.minVertex);
+    HashStaticValueInto(aggregateHash, proof.maxVertex);
+    proofs.push_back(proof);
+    firstIndex += indexCount;
+  }
+
+  if (firstIndex != record.indexCount || aggregateHash == 0u) {
+    proofs.clear();
+    return false;
+  }
+  proofHash = aggregateHash;
+  return true;
+}
+
+bool BuildLocalBounds(
+    const model::ShadowGeosetResourceRecord& record,
+    GpuSkinStaticPackageProof& proof) {
+  if (record.vertexCount == 0u ||
+      record.positions.size() != size_t(record.vertexCount) * 3u)
+    return false;
+
+  float bounds[6] = {
+      record.positions[0], record.positions[1], record.positions[2],
+      record.positions[0], record.positions[1], record.positions[2]};
+  for (uint32_t vertex = 0u; vertex < record.vertexCount; ++vertex) {
+    const float x = record.positions[size_t(vertex) * 3u + 0u];
+    const float y = record.positions[size_t(vertex) * 3u + 1u];
+    const float z = record.positions[size_t(vertex) * 3u + 2u];
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+      return false;
+    bounds[0] = std::min(bounds[0], x);
+    bounds[1] = std::min(bounds[1], y);
+    bounds[2] = std::min(bounds[2], z);
+    bounds[3] = std::max(bounds[3], x);
+    bounds[4] = std::max(bounds[4], y);
+    bounds[5] = std::max(bounds[5], z);
+  }
+
+  proof.localBoundsHash = HashStaticBytes(bounds, sizeof(bounds));
+  proof.localMinX = bounds[0];
+  proof.localMinY = bounds[1];
+  proof.localMinZ = bounds[2];
+  proof.localMaxX = bounds[3];
+  proof.localMaxY = bounds[4];
+  proof.localMaxZ = bounds[5];
+  return proof.localBoundsHash != 0u;
 }
 
 resource_census::ResourceHandle RegisterStaticMirror(
@@ -155,6 +261,61 @@ bool GetValidatedStaticLayout(
   return true;
 }
 
+bool ValidatePrimitiveProofs(
+    const model::ShadowGeosetResourceRecord& record,
+    const std::vector<GpuSkinStaticPrimitiveProof>& proofs,
+    const GpuSkinStaticPackageProof& packageProof) {
+  if (packageProof.primitiveProofCount == 0u ||
+      packageProof.primitiveProofHash == 0u ||
+      proofs.size() != packageProof.primitiveProofCount ||
+      proofs.size() != record.primitiveRecords.size() ||
+      proofs.size() != record.primitiveCount)
+    return false;
+
+  uint64_t aggregateHash = 0xcbf29ce484222325ull;
+  uint64_t expectedFirstIndex = 0u;
+  for (size_t i = 0u; i < proofs.size(); ++i) {
+    const auto& proof = proofs[i];
+    const auto& primitive = record.primitiveRecords[i];
+    if (proof.indexContentHash == 0u || proof.ordinal != i ||
+        proof.primitiveTypeOrMaterialSlot !=
+            primitive.primitiveTypeOrMaterialSlot ||
+        proof.firstIndex != expectedFirstIndex ||
+        proof.indexCount == 0u ||
+        proof.indexCount != primitive.indexCount ||
+        proof.minVertex > proof.maxVertex ||
+        proof.maxVertex >= record.vertexCount ||
+        expectedFirstIndex > record.indexCount ||
+        proof.indexCount > uint64_t(record.indexCount) - expectedFirstIndex)
+      return false;
+
+    HashStaticValueInto(aggregateHash, proof.indexContentHash);
+    HashStaticValueInto(aggregateHash, proof.ordinal);
+    HashStaticValueInto(
+        aggregateHash, proof.primitiveTypeOrMaterialSlot);
+    HashStaticValueInto(aggregateHash, proof.firstIndex);
+    HashStaticValueInto(aggregateHash, proof.indexCount);
+    HashStaticValueInto(aggregateHash, proof.minVertex);
+    HashStaticValueInto(aggregateHash, proof.maxVertex);
+    expectedFirstIndex += proof.indexCount;
+  }
+  return expectedFirstIndex == record.indexCount &&
+      aggregateHash == packageProof.primitiveProofHash;
+}
+
+bool HasFiniteLocalBounds(const GpuSkinStaticPackageProof& proof) {
+  return proof.localBoundsHash != 0u &&
+      std::isfinite(proof.localMinX) &&
+      std::isfinite(proof.localMinY) &&
+      std::isfinite(proof.localMinZ) &&
+      std::isfinite(proof.localMaxX) &&
+      std::isfinite(proof.localMaxY) &&
+      std::isfinite(proof.localMaxZ) &&
+      proof.localMinX <= proof.localMaxX &&
+      proof.localMinY <= proof.localMaxY &&
+      proof.localMinZ <= proof.localMaxZ;
+}
+
 }  // namespace
 
 bool ValidateGpuSkinStaticPackage(
@@ -164,9 +325,24 @@ bool ValidateGpuSkinStaticPackage(
       !SameGpuSkinStaticPackageProof(resource.packageProof, expected) ||
       expected.mapEpoch == 0u || expected.deviceEpoch == 0u ||
       expected.packageGeneration == 0u || expected.geosetData == 0u ||
-      expected.contentHash == 0u || expected.indexContentHash == 0u ||
+      expected.contentHash == 0u || expected.positionContentHash == 0u ||
+      expected.normalContentHash == 0u ||
+      expected.vertexGroupContentHash == 0u ||
+      expected.indexContentHash == 0u ||
+      expected.primitiveProofHash == 0u ||
       expected.layoutGeneration == 0u || expected.vertexCount == 0u ||
-      expected.indexCount == 0u ||
+      expected.indexCount == 0u || expected.uvLayerCount > 2u ||
+      expected.primitiveProofCount == 0u ||
+      (expected.uvLayerCount == 0u &&
+          (expected.uv0ContentHash != 0u ||
+           expected.uv1ContentHash != 0u)) ||
+      (expected.uvLayerCount == 1u &&
+          (expected.uv0ContentHash == 0u ||
+           expected.uv1ContentHash != 0u)) ||
+      (expected.uvLayerCount == 2u &&
+          (expected.uv0ContentHash == 0u ||
+           expected.uv1ContentHash == 0u)) ||
+      !HasFiniteLocalBounds(expected) ||
       expected.indexType != VK_INDEX_TYPE_UINT16 ||
       expected.staticByteLength == 0u || expected.indexByteLength == 0u ||
       resource.record == nullptr || resource.indexContentHash == 0u ||
@@ -188,7 +364,10 @@ bool ValidateGpuSkinStaticPackage(
       record.contentHash != expected.contentHash ||
       record.vertexCount != expected.vertexCount ||
       record.indexCount != expected.indexCount ||
+      record.uvLayerCount != expected.uvLayerCount ||
       record.indices.size() != expected.indexCount ||
+      !ValidatePrimitiveProofs(
+          record, resource.primitiveProofs, expected) ||
       resource.sourceLayout.positionOffset != validatedLayout.positionOffset ||
       resource.sourceLayout.normalOffset != validatedLayout.normalOffset ||
       resource.sourceLayout.groupSlotOffset != validatedLayout.groupSlotOffset ||
@@ -569,6 +748,10 @@ War3PersistentGpuPackageStore::createStaticResource(
       record.indices.data(), record.indices.size() * sizeof(uint16_t));
   if (resource->indexContentHash == 0u)
     return nullptr;
+  uint64_t primitiveProofHash = 0u;
+  if (!BuildPrimitiveProofs(
+          record, resource->primitiveProofs, primitiveProofHash))
+    return nullptr;
   resource->maxVertexGroupSlot = *std::max_element(
       record.vertexGroupIndices.begin(), record.vertexGroupIndices.end());
   resource->sourceLayout = layout;
@@ -620,21 +803,50 @@ War3PersistentGpuPackageStore::createStaticResource(
       m_nextStaticPackageGeneration == std::numeric_limits<uint64_t>::max())
     return nullptr;
   const uint64_t packageGeneration = m_nextStaticPackageGeneration++;
-  resource->packageProof = {
-      m_mapEpoch,
-      m_deviceEpoch,
-      packageGeneration,
-      reinterpret_cast<uintptr_t>(record.geosetDataPtr),
-      record.contentHash,
-      resource->indexContentHash,
-      miss.key.layoutGeneration,
-      record.vertexCount,
-      record.indexCount,
-      VK_INDEX_TYPE_UINT16,
-      uint32_t(atlasOffset),
-      uint32_t(staticBytes),
-      uint32_t(atlasOffset + indexRelativeOffset),
-      uint32_t(indexBytes)};
+  GpuSkinStaticPackageProof packageProof = {};
+  packageProof.mapEpoch = m_mapEpoch;
+  packageProof.deviceEpoch = m_deviceEpoch;
+  packageProof.packageGeneration = packageGeneration;
+  packageProof.geosetData =
+      reinterpret_cast<uintptr_t>(record.geosetDataPtr);
+  packageProof.contentHash = record.contentHash;
+  packageProof.positionContentHash = HashStaticBytes(
+      record.positions.data(), record.positions.size() * sizeof(float));
+  packageProof.normalContentHash = HashStaticBytes(
+      record.normals.data(), record.normals.size() * sizeof(float));
+  packageProof.vertexGroupContentHash = HashStaticBytes(
+      record.vertexGroupIndices.data(), record.vertexGroupIndices.size());
+  if (record.uvLayerCount >= 1u) {
+    packageProof.uv0ContentHash = HashStaticBytes(
+        record.uvLayers[0].uvPairs.data(),
+        record.uvLayers[0].uvPairs.size() * sizeof(float));
+  }
+  if (record.uvLayerCount >= 2u) {
+    packageProof.uv1ContentHash = HashStaticBytes(
+        record.uvLayers[1].uvPairs.data(),
+        record.uvLayers[1].uvPairs.size() * sizeof(float));
+  }
+  packageProof.indexContentHash = resource->indexContentHash;
+  packageProof.primitiveProofHash = primitiveProofHash;
+  packageProof.layoutGeneration = miss.key.layoutGeneration;
+  packageProof.vertexCount = record.vertexCount;
+  packageProof.indexCount = record.indexCount;
+  packageProof.uvLayerCount = record.uvLayerCount;
+  packageProof.primitiveProofCount =
+      uint32_t(resource->primitiveProofs.size());
+  packageProof.indexType = VK_INDEX_TYPE_UINT16;
+  packageProof.staticByteOffset = uint32_t(atlasOffset);
+  packageProof.staticByteLength = uint32_t(staticBytes);
+  packageProof.indexByteOffset =
+      uint32_t(atlasOffset + indexRelativeOffset);
+  packageProof.indexByteLength = uint32_t(indexBytes);
+  if (packageProof.positionContentHash == 0u ||
+      packageProof.normalContentHash == 0u ||
+      packageProof.vertexGroupContentHash == 0u ||
+      packageProof.primitiveProofCount == 0u ||
+      !BuildLocalBounds(record, packageProof))
+    return nullptr;
+  resource->packageProof = packageProof;
   resource->pendingUpload = {
       resource->key,
       DxvkBufferSlice(std::move(staging), 0u, packageBytes),

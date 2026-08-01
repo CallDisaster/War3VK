@@ -34,11 +34,26 @@ class PackageProof:
     package_generation: int
     geoset_data: int
     content_hash: int
+    position_content_hash: int
+    normal_content_hash: int
+    vertex_group_content_hash: int
+    uv0_content_hash: int
+    uv1_content_hash: int
     index_content_hash: int
+    primitive_proof_hash: int
+    local_bounds_hash: int
     layout_generation: int
     vertex_count: int
     index_count: int
+    uv_layer_count: int
+    primitive_proof_count: int
     index_type: int
+    local_min_x: float
+    local_min_y: float
+    local_min_z: float
+    local_max_x: float
+    local_max_y: float
+    local_max_z: float
     static_byte_offset: int
     static_byte_length: int
     index_byte_offset: int
@@ -67,11 +82,26 @@ def pack_package(
         package_generation=13,
         geoset_data=0x12340000,
         content_hash=0xABCDEF01,
+        position_content_hash=0x1101,
+        normal_content_hash=0x1102,
+        vertex_group_content_hash=0x1103,
+        uv0_content_hash=0x1104,
+        uv1_content_hash=0,
         index_content_hash=0x10203040,
+        primitive_proof_hash=0x1201,
+        local_bounds_hash=0x1301,
         layout_generation=1,
         vertex_count=static_bytes,
         index_count=index_count,
+        uv_layer_count=1,
+        primitive_proof_count=1,
         index_type=0,
+        local_min_x=-1.0,
+        local_min_y=-2.0,
+        local_min_z=-3.0,
+        local_max_x=1.0,
+        local_max_y=2.0,
+        local_max_z=3.0,
         static_byte_offset=atlas_offset,
         static_byte_length=static_bytes,
         index_byte_offset=atlas_offset + index_relative_offset,
@@ -135,11 +165,26 @@ class SourceContractTests(unittest.TestCase):
             "packageGeneration",
             "geosetData",
             "contentHash",
+            "positionContentHash",
+            "normalContentHash",
+            "vertexGroupContentHash",
+            "uv0ContentHash",
+            "uv1ContentHash",
             "indexContentHash",
+            "primitiveProofHash",
+            "localBoundsHash",
             "layoutGeneration",
             "vertexCount",
             "indexCount",
+            "uvLayerCount",
+            "primitiveProofCount",
             "indexType",
+            "localMinX",
+            "localMinY",
+            "localMinZ",
+            "localMaxX",
+            "localMaxY",
+            "localMaxZ",
             "staticByteOffset",
             "staticByteLength",
             "indexByteOffset",
@@ -156,6 +201,34 @@ class SourceContractTests(unittest.TestCase):
             )
             self.assertIn(f"lhs.{cpp_name} == rhs.{cpp_name}", equality_body)
         self.assertIn("ValidateGpuSkinStaticPackage", self.header)
+
+    def test_immutable_stream_bounds_and_primitive_proofs_are_built_once(self) -> None:
+        self.assertIn("struct GpuSkinStaticPrimitiveProof", self.header)
+        resource_body = self.header.split(
+            "struct GpuSkinStaticResource", 1
+        )[1].split("};", 1)[0]
+        self.assertIn(
+            "std::vector<GpuSkinStaticPrimitiveProof> primitiveProofs",
+            resource_body,
+        )
+        create_body = self.source.split("createStaticResource(", 1)[1].split(
+            "takeStaticUploads()", 1
+        )[0]
+        for token in (
+            "BuildPrimitiveProofs(",
+            "BuildLocalBounds(",
+            "positionContentHash = HashStaticBytes(",
+            "normalContentHash = HashStaticBytes(",
+            "vertexGroupContentHash = HashStaticBytes(",
+            "uv0ContentHash = HashStaticBytes(",
+            "primitiveProofHash = primitiveProofHash",
+        ):
+            self.assertIn(token, create_body)
+        validator = self.source.split(
+            "bool ValidateGpuSkinStaticPackage", 1
+        )[1].split("War3PersistentGpuPackageStore::", 1)[0]
+        self.assertIn("ValidatePrimitiveProofs(", validator)
+        self.assertIn("HasFiniteLocalBounds(expected)", validator)
 
     def test_static_atlas_declares_all_future_read_domains(self) -> None:
         static_info = self.source.split("StaticBufferInfo", 1)[1].split(

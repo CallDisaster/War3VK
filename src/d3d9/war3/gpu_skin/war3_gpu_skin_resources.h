@@ -31,6 +31,32 @@ struct GpuSkinStaticUpload {
   resource_census::ResourceHandle residencyCensus;
 };
 
+// Immutable proof for one primitive's exact UINT16 index interval.  The
+// material-looking source word is deliberately treated as opaque identity;
+// current draw-side material and alpha state still need an independent proof.
+struct GpuSkinStaticPrimitiveProof {
+  uint64_t indexContentHash = 0u;
+  uint32_t ordinal = 0u;
+  uint32_t primitiveTypeOrMaterialSlot = 0u;
+  uint32_t firstIndex = 0u;
+  uint32_t indexCount = 0u;
+  uint32_t minVertex = 0u;
+  uint32_t maxVertex = 0u;
+};
+
+inline bool SameGpuSkinStaticPrimitiveProof(
+    const GpuSkinStaticPrimitiveProof& lhs,
+    const GpuSkinStaticPrimitiveProof& rhs) noexcept {
+  return lhs.indexContentHash == rhs.indexContentHash &&
+      lhs.ordinal == rhs.ordinal &&
+      lhs.primitiveTypeOrMaterialSlot ==
+          rhs.primitiveTypeOrMaterialSlot &&
+      lhs.firstIndex == rhs.firstIndex &&
+      lhs.indexCount == rhs.indexCount &&
+      lhs.minVertex == rhs.minVertex &&
+      lhs.maxVertex == rhs.maxVertex;
+}
+
 // Value-only identity for one immutable vertex/index package in the static
 // atlas.  A future Main/Shadow/Outline consumer may retain this proof together
 // with the resource shared_ptr, but must still compare every field before
@@ -42,11 +68,26 @@ struct GpuSkinStaticPackageProof {
   uint64_t packageGeneration = 0u;
   uintptr_t geosetData = 0u;
   uint64_t contentHash = 0u;
+  uint64_t positionContentHash = 0u;
+  uint64_t normalContentHash = 0u;
+  uint64_t vertexGroupContentHash = 0u;
+  uint64_t uv0ContentHash = 0u;
+  uint64_t uv1ContentHash = 0u;
   uint64_t indexContentHash = 0u;
+  uint64_t primitiveProofHash = 0u;
+  uint64_t localBoundsHash = 0u;
   uint32_t layoutGeneration = 0u;
   uint32_t vertexCount = 0u;
   uint32_t indexCount = 0u;
+  uint32_t uvLayerCount = 0u;
+  uint32_t primitiveProofCount = 0u;
   VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+  float localMinX = 0.0f;
+  float localMinY = 0.0f;
+  float localMinZ = 0.0f;
+  float localMaxX = 0.0f;
+  float localMaxY = 0.0f;
+  float localMaxZ = 0.0f;
   uint32_t staticByteOffset = 0u;
   uint32_t staticByteLength = 0u;
   uint32_t indexByteOffset = 0u;
@@ -61,11 +102,26 @@ inline bool SameGpuSkinStaticPackageProof(
       lhs.packageGeneration == rhs.packageGeneration &&
       lhs.geosetData == rhs.geosetData &&
       lhs.contentHash == rhs.contentHash &&
+      lhs.positionContentHash == rhs.positionContentHash &&
+      lhs.normalContentHash == rhs.normalContentHash &&
+      lhs.vertexGroupContentHash == rhs.vertexGroupContentHash &&
+      lhs.uv0ContentHash == rhs.uv0ContentHash &&
+      lhs.uv1ContentHash == rhs.uv1ContentHash &&
       lhs.indexContentHash == rhs.indexContentHash &&
+      lhs.primitiveProofHash == rhs.primitiveProofHash &&
+      lhs.localBoundsHash == rhs.localBoundsHash &&
       lhs.layoutGeneration == rhs.layoutGeneration &&
       lhs.vertexCount == rhs.vertexCount &&
       lhs.indexCount == rhs.indexCount &&
+      lhs.uvLayerCount == rhs.uvLayerCount &&
+      lhs.primitiveProofCount == rhs.primitiveProofCount &&
       lhs.indexType == rhs.indexType &&
+      lhs.localMinX == rhs.localMinX &&
+      lhs.localMinY == rhs.localMinY &&
+      lhs.localMinZ == rhs.localMinZ &&
+      lhs.localMaxX == rhs.localMaxX &&
+      lhs.localMaxY == rhs.localMaxY &&
+      lhs.localMaxZ == rhs.localMaxZ &&
       lhs.staticByteOffset == rhs.staticByteOffset &&
       lhs.staticByteLength == rhs.staticByteLength &&
       lhs.indexByteOffset == rhs.indexByteOffset &&
@@ -76,6 +132,7 @@ struct GpuSkinStaticResource {
   GpuSkinStaticResourceKey key;
   model::ShadowGeosetResourceSnapshot record;
   GpuSkinStaticPackageProof packageProof;
+  std::vector<GpuSkinStaticPrimitiveProof> primitiveProofs;
   uint64_t indexContentHash = 0;
   uint32_t maxVertexGroupSlot = 0;
   GpuSkinStaticSourceLayout sourceLayout;
@@ -99,6 +156,8 @@ bool ValidateGpuSkinStaticPackage(
 
 static_assert(std::is_standard_layout_v<GpuSkinStaticPackageProof>);
 static_assert(std::is_trivially_copyable_v<GpuSkinStaticPackageProof>);
+static_assert(std::is_standard_layout_v<GpuSkinStaticPrimitiveProof>);
+static_assert(std::is_trivially_copyable_v<GpuSkinStaticPrimitiveProof>);
 
 struct GpuSkinStaticLookup {
   std::shared_ptr<const GpuSkinStaticResource> resource;

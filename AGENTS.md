@@ -1,5 +1,25 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（Persistent Package immutable proof 扩充，仍无 Renderer Consumer）
+
+P0 package 现在在模型首次打包时一次性生成逐 stream 与逐 primitive 的不可变证明；
+没有把 package VB/IB 接到 Main、CSM、point 或 outline，也没有改变 Shared Consumer 门。
+
+- proof 新增 position、normal、vertex-group、UV0/UV1 与 whole-index hash，有限 local
+  bounds/hash，以及每 primitive 的 ordinal、opaque type/material word、连续 firstIndex、
+  indexCount、index hash、min/max referenced vertex。primitive ranges 必须完整覆盖 whole IB，
+  所有索引必须落在 vertex domain 内。
+- `primitiveTypeOrMaterialSlot` 只作为 opaque immutable identity；它不能证明当帧 material、
+  alpha texture/sampler 或 skinned pose。未来 Observe 仍需 Stage11 current-draw sidecar 才能
+  把 rigid/static 晋升为 `FullyEquivalent`；动态/蒙皮 package 只能是 input-ready。
+- hash/bounds/range 只在 package 创建时计算一次；热路径 validation 只比较 POD proof 与
+  少量 primitive metadata，不重新扫描 write-combined IB。任何非有限 bounds、range 缺口、
+  越界 index 或 proof mismatch 都 fail-closed 到原安全路径。
+- 相关 TAA/point/stage/alpha/blocker/final-caster/package/WorkTable/union/P4 静态门共 212 项
+  PASS；两个 package owner runnable 2/2 PASS；Win32 build 成功且 `ninja -C build32 -n`
+  no-work。组合 build32 DLL 为 32,649,789 bytes，SHA-256
+  `9BF5E3D9591602990A85F482639D9D1FD6EC4A5E98EE6DC3D239DFE09BF68DD9`，未部署、未启动游戏。
+
 ## 🚨 2026-08-02（Persistent Package consumer last-use owner，纯值合同、未接运行时）
 
 新增独立 `War3PersistentGpuPackageOwner` 作为未来 shared atlas 的生命周期准入边界；
