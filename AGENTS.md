@@ -1,5 +1,26 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（点阴影 Persistent Prepare Worker 隔离基础层，尚未接入运行时）
+
+本轮为替换点阴影逐帧 `std::async` 建立了独立、可运行验证的持久 worker 基础层；
+生产 `d3d9_war3_shadow.cpp/.h` 未 include、未实例化该类，现有运行路径和 DLL 行为
+保持不变，不能把本提交冒充为已经获得点阴影 CPU 收益。
+
+- worker 只有一个 request slot、一个 result slot 和一个持久线程；request/result 都是
+  自有 CPU value，processor 必须无状态，线程不捕获 renderer、DXVK/Vulkan resource
+  或可变发布状态。
+- 结果必须完整匹配 `jobSerial / rendererEpoch / frameSerial / lightGeneration`；invalid、
+  stale、busy、exception、cancel 和 startup failure 全部 fail-closed，禁止消费旧 plan。
+- shutdown 会取消未发布结果、等待正在执行的 CPU job 并 join；完整 stop/join 边界由
+  owner-side mutex 串行化，两条 teardown 路径并发调用也只 join 一次，绝不 detach。
+- C++ runnable test 覆盖同线程复用、单在途背压、代际单调、stale 丢 payload、异常后
+  恢复、运行中取消、ready 结果撤销和并发 shutdown；200/200 压力重复通过。
+- 静态合同 8 项与 Meson runnable test 1/1 PASS；Win32 测试目标编译链接通过。
+
+**接入边界**：只有先把当前点阴影 prepare 从捕获 renderer `this` 的大 lambda 拆成
+纯 POD request→result，owner 在 exact tuple 匹配后单次发布，才允许替换 `std::async`。
+worker 不得访问 shared package store、Shadow Arena 或任何跨帧 lease。
+
 ## 🚨 2026-08-02（Persistent GPU Package 基础层 + 联合剔除 Observe，Consume 未准入）
 
 本轮从 `41c7fee` 的默认 Off 正确性基线继续，先建立两份独立本地提交：

@@ -240,6 +240,24 @@ test(
   timeout : 30,
 )
 
+# Isolated foundation test for the future point-shadow persistent worker. The
+# production shadow pass intentionally does not include or instantiate this
+# mailbox yet, so building this target cannot alter live rendering behavior.
+war3_point_shadow_prepare_worker_test = executable(
+  'war3_point_shadow_prepare_worker_test',
+  [
+    'war3/render/tests/war3_point_shadow_prepare_worker_test.cpp',
+  ],
+  dependencies        : [ dependency('threads') ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_point_shadow_prepare_worker_foundation',
+  war3_point_shadow_prepare_worker_test,
+  timeout : 30,
+)
+
 if platform != 'windows'
   pkg.generate(d3d9_dll,
     filebase: dxvk_pkg_prefix + 'd3d9',
