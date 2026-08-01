@@ -1,5 +1,61 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（Persistent GPU Package 基础层 + 联合剔除 Observe，Consume 未准入）
+
+本轮从 `41c7fee` 的默认 Off 正确性基线继续，先建立两份独立本地提交：
+`759dd23` 为 immutable vertex/index GPU package，`f4de5ab` 为联合消费者剔除
+Observe；均只在 `codex/war3-stable-producer-baseline`，没有 upstream、没有 push。
+
+**Persistent GPU Package 基础层**：
+
+- 现有 128 MiB device-local static atlas 现在把原 vertex blob 与 UINT16 IB 打包进
+  同一连续 package、同一 staging→device upload；补齐 INDEX_BUFFER usage/stage/access。
+- package proof 严格包含 map/device/package/layout/content/index hash、vertex/index
+  count/type/offset/length；任何字段不等、epoch clear 或 generation 耗尽均 fail-closed。
+  generation 不跨 map/device 清零，也绝不整数回绕复用。
+- 旧 `staticSource` ABI 保持，新增 `indexSource` 尚未接入 renderer consumer；因此本轮
+  不恢复旧 GPU manager 大锁/lease，也不改变 Main/CSM/point/outline 路由。
+- 默认 full_default 实测 `gpuSkinPools=0`，证明共享 package owner 仍需从旧“只有 GPU
+  skin mode 才创建 manager”的生命周期中拆出；不能把本基础层冒充为已消除 Arena copy。
+
+**联合消费者剔除 Observe**：
+
+- 新增纯 POD policy、runnable C++ test 和 `Off/Observe/Consume` 三态；Main、CSM0-3、
+  point shadow、outline mask 与 source/bounds/camera/consumer/resource generation proof
+  均显式表示。未知、陈旧、非有限、动态/蒙皮以及 C0/C1 全部 fail-visible。
+- 运行时只在最终 CSM 边界观察 Stage11 exact-current、RequiredCurrent、Building/
+  Destructible rigid 的 C2/C3 结果，并与原 canonical culler 对账。即使环境请求 Consume，
+  `consumeAdmissionGranted` 仍固定 false，代码不读取 `effectiveVisibleMask` 跳过 draw。
+- 高压图长门 16,257 observed frames、1,216,286 candidates、2,432,572 finite proofs；
+  false-negative/false-positive 均 0。但 canonical cull、C2/C3 would-cull、both-far
+  would-cull 同样全部为 0，机会率 0%，远低于 25% 门，故严禁进入 Consume。
+- Off/Observe/Observe/Off ABBA 主线程 CPU 分别 11.580/10.615/11.748/10.976 ms；
+  Observe 均值相对 Off 为 -0.097 ms（运行噪声），满足基础设施 <=0.15 ms 门。
+
+**正确性、构建与证据**：
+
+- 160/160 capture 与 final-caster trace join，1,133 trace frames / 313,933 records；
+  representation/alpha transition、mixed representation、alpha payload gap、blocker leak、
+  marker leak、unexplained disappearance、validation/parse/capture miss 全为 0。去除前六张
+  光照 settle warmup 后最大时域暗块 251 px。
+- 长门 `framesIncomplete=0 / budgetExceeded=0 / reuseLastComplete=0 /
+  renderCurrentPartial=0`，Arena 最大 55.794 MiB；无 GPU incident、无新 nvlddmkm 153
+  或 Display 4101。24 张跨 245 秒采样中的一次大变化来自相隔 10 秒的单位移动，目检
+  不是阴影撕裂。
+- 228 项 `test_*_static.py` PASS；runnable union test PASS；Win32 build 和后续
+  `ninja -C build32 -n` no-work。DLL 32,621,604 bytes，SHA-256
+  `37E0BE91D51DD95EC5359109E188D70082E6D57FAAC7CC1B18E67B810198527C`；部署前回退
+  `E:\Work\War3\d3d9.dll.bak_20260802_pre_union_cull_observe_98B781DB`。
+- 超限 788,685,925-byte raw trace 在分析后压缩为
+  `AutoTest/artifacts/union_package_trace160_pressure_20260802_trace.zip`，46,657,609 bytes，
+  SHA-256 `9B12DF080EFBE27B8778594720DA1FD99F27342D7152AADA724EAFA4689E5D1D`；
+  原日志移入 Windows 回收站，可恢复。
+
+**发布边界**：联合剔除默认 Off，Consume 不合格；Persistent Package 尚无默认消费者。
+下一步先解决 shared package owner 与真实 IB/VB 命中率 Observe，或选择命中 CSM/point/
+outline 并集的更早 bounds 时钟域。禁止仅为获得数字而启用 camera-only cull、放宽 exact
+generation，或把动态单位纳入首轮剔除。
+
 ## 🚨 2026-08-02（Compact WorkTable 严格封存与性能准入，默认仍关闭）
 
 本轮先完成三套仅本地安全检查点，再在 `b021c26` 的 generation-tagged
