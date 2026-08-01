@@ -6222,6 +6222,18 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneDirectLastRawRecordCount;
     summary.semanticSceneDirectLastEligibleRecordCount =
         g_shadowSceneStats.semanticSceneDirectLastEligibleRecordCount;
+    summary.semanticSceneCompactWorkTableMode =
+        g_shadowSceneStats.semanticSceneCompactWorkTableMode;
+    summary.semanticSceneCompactWorkTableCandidateCount =
+        g_shadowSceneStats.semanticSceneCompactWorkTableCandidateCount;
+    summary.semanticSceneCompactWorkTableSealedCount =
+        g_shadowSceneStats.semanticSceneCompactWorkTableSealedCount;
+    summary.semanticSceneCompactWorkTableConsumedCount =
+        g_shadowSceneStats.semanticSceneCompactWorkTableConsumedCount;
+    summary.semanticSceneCompactWorkTableFallbackCount =
+        g_shadowSceneStats.semanticSceneCompactWorkTableFallbackCount;
+    summary.semanticSceneCompactWorkTableMismatchCount =
+        g_shadowSceneStats.semanticSceneCompactWorkTableMismatchCount;
     summary.semanticSceneDirectLastSubmittedRecordCount =
         g_shadowSceneStats.semanticSceneDirectLastSubmittedRecordCount;
     summary.semanticSceneDirectLastUniqueObjectCount =

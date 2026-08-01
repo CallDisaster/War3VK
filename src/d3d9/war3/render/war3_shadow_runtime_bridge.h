@@ -734,6 +734,12 @@ struct ShadowRuntimeBridgeSummary {
   // === Phase 7.1: caster selection stability diagnostics ===
   uint64_t semanticSceneDirectLastRawRecordCount = 0;
   uint64_t semanticSceneDirectLastEligibleRecordCount = 0;
+  uint64_t semanticSceneCompactWorkTableMode = 0;
+  uint64_t semanticSceneCompactWorkTableCandidateCount = 0;
+  uint64_t semanticSceneCompactWorkTableSealedCount = 0;
+  uint64_t semanticSceneCompactWorkTableConsumedCount = 0;
+  uint64_t semanticSceneCompactWorkTableFallbackCount = 0;
+  uint64_t semanticSceneCompactWorkTableMismatchCount = 0;
   uint64_t semanticSceneDirectLastSubmittedRecordCount = 0;
   uint64_t semanticSceneDirectLastUniqueObjectCount = 0;
   uint64_t semanticSceneDirectLastSubmittedObjectCount = 0;

@@ -1482,6 +1482,19 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.semanticSceneDirectLastEligibleRecordCount = std::max(
       agg.semanticSceneDirectLastEligibleRecordCount,
       uint64_t(stats.semanticSceneDirectLastEligibleRecordCount));
+  agg.semanticSceneCompactWorkTableMode = std::max(
+      agg.semanticSceneCompactWorkTableMode,
+      uint64_t(stats.semanticSceneCompactWorkTableMode));
+  agg.semanticSceneCompactWorkTableCandidateCount +=
+      stats.semanticSceneCompactWorkTableCandidateCount;
+  agg.semanticSceneCompactWorkTableSealedCount +=
+      stats.semanticSceneCompactWorkTableSealedCount;
+  agg.semanticSceneCompactWorkTableConsumedCount +=
+      stats.semanticSceneCompactWorkTableConsumedCount;
+  agg.semanticSceneCompactWorkTableFallbackCount +=
+      stats.semanticSceneCompactWorkTableFallbackCount;
+  agg.semanticSceneCompactWorkTableMismatchCount +=
+      stats.semanticSceneCompactWorkTableMismatchCount;
   agg.semanticSceneDirectLastSubmittedRecordCount = std::max(
       agg.semanticSceneDirectLastSubmittedRecordCount,
       uint64_t(stats.semanticSceneDirectLastSubmittedRecordCount));
@@ -5968,6 +5981,18 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneDirectLastRawRecordCount << ",\n";
   json << "    \"semanticSceneDirectLastEligibleRecordCount\": "
        << shadowAgg.semanticSceneDirectLastEligibleRecordCount << ",\n";
+  json << "    \"semanticSceneCompactWorkTableMode\": "
+       << shadowAgg.semanticSceneCompactWorkTableMode << ",\n";
+  json << "    \"semanticSceneCompactWorkTableCandidateCount\": "
+       << shadowAgg.semanticSceneCompactWorkTableCandidateCount << ",\n";
+  json << "    \"semanticSceneCompactWorkTableSealedCount\": "
+       << shadowAgg.semanticSceneCompactWorkTableSealedCount << ",\n";
+  json << "    \"semanticSceneCompactWorkTableConsumedCount\": "
+       << shadowAgg.semanticSceneCompactWorkTableConsumedCount << ",\n";
+  json << "    \"semanticSceneCompactWorkTableFallbackCount\": "
+       << shadowAgg.semanticSceneCompactWorkTableFallbackCount << ",\n";
+  json << "    \"semanticSceneCompactWorkTableMismatchCount\": "
+       << shadowAgg.semanticSceneCompactWorkTableMismatchCount << ",\n";
   json << "    \"semanticSceneDirectLastSubmittedRecordCount\": "
        << shadowAgg.semanticSceneDirectLastSubmittedRecordCount << ",\n";
   json << "    \"semanticSceneDirectLastUniqueObjectCount\": "
@@ -7143,6 +7168,18 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneDirectLastRawRecordCount << ",\n";
   json << "    \"semanticSceneDirectLastEligibleRecordCount\": "
        << shadowAgg.semanticSceneDirectLastEligibleRecordCount << ",\n";
+  json << "    \"semanticSceneCompactWorkTableMode\": "
+       << shadowAgg.semanticSceneCompactWorkTableMode << ",\n";
+  json << "    \"semanticSceneCompactWorkTableCandidateCount\": "
+       << shadowAgg.semanticSceneCompactWorkTableCandidateCount << ",\n";
+  json << "    \"semanticSceneCompactWorkTableSealedCount\": "
+       << shadowAgg.semanticSceneCompactWorkTableSealedCount << ",\n";
+  json << "    \"semanticSceneCompactWorkTableConsumedCount\": "
+       << shadowAgg.semanticSceneCompactWorkTableConsumedCount << ",\n";
+  json << "    \"semanticSceneCompactWorkTableFallbackCount\": "
+       << shadowAgg.semanticSceneCompactWorkTableFallbackCount << ",\n";
+  json << "    \"semanticSceneCompactWorkTableMismatchCount\": "
+       << shadowAgg.semanticSceneCompactWorkTableMismatchCount << ",\n";
   json << "    \"semanticSceneDirectLastSubmittedRecordCount\": "
        << shadowAgg.semanticSceneDirectLastSubmittedRecordCount << ",\n";
   json << "    \"semanticSceneDirectLastUniqueObjectCount\": "

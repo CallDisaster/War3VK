@@ -911,6 +911,18 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       bridgeSummary.semanticSceneDirectLastRawRecordCount;
   summary.semanticSceneDirectLastEligibleRecordCount =
       bridgeSummary.semanticSceneDirectLastEligibleRecordCount;
+  summary.semanticSceneCompactWorkTableMode =
+      bridgeSummary.semanticSceneCompactWorkTableMode;
+  summary.semanticSceneCompactWorkTableCandidateCount =
+      bridgeSummary.semanticSceneCompactWorkTableCandidateCount;
+  summary.semanticSceneCompactWorkTableSealedCount =
+      bridgeSummary.semanticSceneCompactWorkTableSealedCount;
+  summary.semanticSceneCompactWorkTableConsumedCount =
+      bridgeSummary.semanticSceneCompactWorkTableConsumedCount;
+  summary.semanticSceneCompactWorkTableFallbackCount =
+      bridgeSummary.semanticSceneCompactWorkTableFallbackCount;
+  summary.semanticSceneCompactWorkTableMismatchCount =
+      bridgeSummary.semanticSceneCompactWorkTableMismatchCount;
   summary.semanticSceneDirectLastSubmittedRecordCount =
       bridgeSummary.semanticSceneDirectLastSubmittedRecordCount;
   summary.semanticSceneDirectLastUniqueObjectCount =
@@ -1937,6 +1949,18 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.semanticSceneDirectLastRawRecordCount},
         {"semanticSceneDirectLastEligibleRecordCount",
          snapshot.shadow.semanticSceneDirectLastEligibleRecordCount},
+        {"semanticSceneCompactWorkTableMode",
+         snapshot.shadow.semanticSceneCompactWorkTableMode},
+        {"semanticSceneCompactWorkTableCandidateCount",
+         snapshot.shadow.semanticSceneCompactWorkTableCandidateCount},
+        {"semanticSceneCompactWorkTableSealedCount",
+         snapshot.shadow.semanticSceneCompactWorkTableSealedCount},
+        {"semanticSceneCompactWorkTableConsumedCount",
+         snapshot.shadow.semanticSceneCompactWorkTableConsumedCount},
+        {"semanticSceneCompactWorkTableFallbackCount",
+         snapshot.shadow.semanticSceneCompactWorkTableFallbackCount},
+        {"semanticSceneCompactWorkTableMismatchCount",
+         snapshot.shadow.semanticSceneCompactWorkTableMismatchCount},
         {"semanticSceneDirectLastSubmittedRecordCount",
          snapshot.shadow.semanticSceneDirectLastSubmittedRecordCount},
         {"semanticSceneDirectLastUniqueObjectCount",

@@ -2179,6 +2179,22 @@ bool War3SemanticObjectGroupedSelectionRuntime() {
   return s_enabled;
 }
 
+enum class War3CompactWorkTableMode : uint8_t {
+  Off = 0u,
+  Observe = 1u,
+  Consume = 2u,
+};
+
+War3CompactWorkTableMode War3SemanticCompactWorkTableModeRuntime() {
+  // The table is a correctness-neutral control-plane optimization. Keep the
+  // release default disabled until Observe has proved parity and its measured
+  // overhead stays below the 0.15 ms/frame admission gate.
+  static const auto s_mode = static_cast<War3CompactWorkTableMode>(
+      std::min<uint32_t>(
+          2u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", 0u)));
+  return s_mode;
+}
+
 bool War3PopulateSubmitPermutationViewRuntime() {
   // 周期 1 的 mapping+input verifier 以及同 DLL 反序 A/B 均已通过。
   // 默认保留 stable-sort permutation，并按 view 访问原 vector；仍保留一次
@@ -23675,11 +23691,70 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     completenessBucketForRecord(record).observedParts++;
 
   std::vector<dxvk::war3::render::CurrentDrawContractRecord> recordsForBuild;
+  const War3CompactWorkTableMode compactWorkTableMode =
+      War3SemanticCompactWorkTableModeRuntime();
+  const bool observeCompactWorkTable =
+      compactWorkTableMode == War3CompactWorkTableMode::Observe;
+  const bool consumeCompactWorkTable =
+      compactWorkTableMode == War3CompactWorkTableMode::Consume;
+  m_war3Scene.shadowStats.semanticSceneCompactWorkTableMode =
+      uint32_t(compactWorkTableMode);
+  m_war3CompactWorkTable.reset(
+      m_war3ShadowPersistentFrameSerial,
+      compactWorkTableMode == War3CompactWorkTableMode::Off
+          ? 0u
+          : size_t(directStickyRecordBudget));
+  const auto buildCompactWorkEvidence =
+      [&](const dxvk::war3::render::CurrentDrawContractRecord& record) {
+        War3CompactWorkItem evidence = {};
+        evidence.flags = uint8_t(War3CompactWorkValid);
+        evidence.frameGeneration = m_war3ShadowPersistentFrameSerial;
+        if (currentFrameDrawTimeProducerOwnsRecord(record))
+          evidence.flags |= uint8_t(War3CompactWorkExactOwner);
+        if (War3SemanticRawcodeLooksStaticWorldCaster(record.rawcode))
+          evidence.flags |= uint8_t(War3CompactWorkStaticWorld);
+        const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
+            record.stage,
+            record.batchTag,
+            War3BatchTag::Unknown,
+            War3BatchTag::Unknown,
+            false,
+        };
+        if (dxvk::war3::render::ShadowProducerPolicyAllows(
+                dxvk::war3::render::ShadowProducerKind::SemanticDirectGrouped,
+                producerContext))
+          evidence.flags |= uint8_t(War3CompactWorkProducerAllowed);
+        if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+            War3ShadowIsLosBlocker(record))
+          evidence.flags |= uint8_t(War3CompactWorkPathBlocker);
+        evidence.selectionKey = War3SemanticDirectRecordSelectionKey(record);
+        evidence.priorityScore =
+            War3SemanticDirectRecordPriorityScore(record);
+        if (wasPreviouslySubmitted(evidence.selectionKey))
+          evidence.flags |= uint8_t(War3CompactWorkPreviouslySelected);
+        // A compact item is consumable only when every identity and policy bit
+        // belongs to this exact producer generation. Grace and historical
+        // records remain on the canonical path.
+        if (record.known && record.producerFreshThisFrame &&
+            !record.fromGrace &&
+            record.stagePolicyRevision ==
+                dxvk::war3::render::CurrentShadowStagePolicyRevision() &&
+            evidence.frameGeneration == m_war3ShadowPersistentFrameSerial)
+          evidence.flags |= uint8_t(War3CompactWorkSealed);
+        auto& stats = m_war3Scene.shadowStats;
+        stats.semanticSceneCompactWorkTableCandidateCount++;
+        if (War3CompactWorkHasFlag(evidence, War3CompactWorkSealed))
+          stats.semanticSceneCompactWorkTableSealedCount++;
+        else
+          stats.semanticSceneCompactWorkTableFallbackCount++;
+        return evidence;
+      };
   bool recordsForBuildAlphaPrefiltered = false;
   if (useObjectGrouped && directRecordCap != 0u) {
     enterDirectDetailPhase("PreselectScan");
     struct PreselectedRecord {
       dxvk::war3::render::CurrentDrawContractRecord record = {};
+      War3CompactWorkItem work = {};
       uint64_t selectionKey = 0u;
       uint32_t priorityScore = 0u;
       bool previouslySelected = false;
@@ -23697,28 +23772,77 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     auto preselectScope = War3SemanticSubmitScope(
         "War3SemanticScene/Direct/Preselect");
     for (const auto& record : directRecords) {
-      if (currentFrameDrawTimeProducerOwnsRecord(record)) {
+      War3CompactWorkItem work = {};
+      if (compactWorkTableMode != War3CompactWorkTableMode::Off)
+        work = buildCompactWorkEvidence(record);
+      const bool workSealed =
+          War3CompactWorkHasFlag(work, War3CompactWorkSealed);
+      const bool useSealedWork = consumeCompactWorkTable && workSealed;
+      const bool canonicalExactOwner = !useSealedWork || observeCompactWorkTable
+          ? currentFrameDrawTimeProducerOwnsRecord(record)
+          : false;
+      const bool compactExactOwner =
+          War3CompactWorkHasFlag(work, War3CompactWorkExactOwner);
+      if (observeCompactWorkTable && workSealed &&
+          compactExactOwner != canonicalExactOwner)
+        m_war3Scene.shadowStats.semanticSceneCompactWorkTableMismatchCount++;
+      const bool exactOwner =
+          useSealedWork ? compactExactOwner : canonicalExactOwner;
+      if (exactOwner) {
         m_war3Scene.shadowStats
             .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
         continue;
       }
-      if (War3SemanticRawcodeLooksStaticWorldCaster(record.rawcode))
+      const bool canonicalStaticWorld = !useSealedWork || observeCompactWorkTable
+          ? War3SemanticRawcodeLooksStaticWorldCaster(record.rawcode)
+          : false;
+      const bool compactStaticWorld =
+          War3CompactWorkHasFlag(work, War3CompactWorkStaticWorld);
+      if (observeCompactWorkTable && workSealed &&
+          compactStaticWorld != canonicalStaticWorld)
+        m_war3Scene.shadowStats.semanticSceneCompactWorkTableMismatchCount++;
+      const bool staticWorld =
+          useSealedWork ? compactStaticWorld : canonicalStaticWorld;
+      if (staticWorld)
         continue;
-      const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
-          record.stage,
-          record.batchTag,
-          War3BatchTag::Unknown,
-          War3BatchTag::Unknown,
-          false,
-      };
-      if (!dxvk::war3::render::ShadowProducerPolicyAllows(
-              dxvk::war3::render::ShadowProducerKind::SemanticDirectGrouped,
-              producerContext)) {
+      bool canonicalProducerAllowed = false;
+      if (!useSealedWork || observeCompactWorkTable) {
+        const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
+            record.stage,
+            record.batchTag,
+            War3BatchTag::Unknown,
+            War3BatchTag::Unknown,
+            false,
+        };
+        canonicalProducerAllowed =
+            dxvk::war3::render::ShadowProducerPolicyAllows(
+                dxvk::war3::render::ShadowProducerKind::SemanticDirectGrouped,
+                producerContext);
+      }
+      const bool compactProducerAllowed =
+          War3CompactWorkHasFlag(work, War3CompactWorkProducerAllowed);
+      if (observeCompactWorkTable && workSealed &&
+          compactProducerAllowed != canonicalProducerAllowed)
+        m_war3Scene.shadowStats.semanticSceneCompactWorkTableMismatchCount++;
+      const bool producerAllowed = useSealedWork
+          ? compactProducerAllowed
+          : canonicalProducerAllowed;
+      if (!producerAllowed) {
         continue;
       }
       auto& bucket = completenessBucketForRecord(record);
-      if (dxvk::war3::internal::kPathBlockerHideEnabled &&
-          War3ShadowIsLosBlocker(record)) {
+      const bool canonicalPathBlocker = !useSealedWork || observeCompactWorkTable
+          ? (dxvk::war3::internal::kPathBlockerHideEnabled &&
+             War3ShadowIsLosBlocker(record))
+          : false;
+      const bool compactPathBlocker =
+          War3CompactWorkHasFlag(work, War3CompactWorkPathBlocker);
+      if (observeCompactWorkTable && workSealed &&
+          compactPathBlocker != canonicalPathBlocker)
+        m_war3Scene.shadowStats.semanticSceneCompactWorkTableMismatchCount++;
+      const bool pathBlocker =
+          useSealedWork ? compactPathBlocker : canonicalPathBlocker;
+      if (pathBlocker) {
         m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
         m_war3Scene.shadowStats
             .semanticSceneRejectedPathBlockerDirectGroupedCount++;
@@ -23735,12 +23859,30 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       }
       bucket.shadowEligibleParts++;
 
-      const uint64_t selectionKey = War3SemanticDirectRecordSelectionKey(record);
+      const uint64_t selectionKey = useSealedWork
+          ? work.selectionKey
+          : War3SemanticDirectRecordSelectionKey(record);
+      const uint32_t priorityScore = useSealedWork
+          ? work.priorityScore
+          : War3SemanticDirectRecordPriorityScore(record);
+      const bool previouslySelected = useSealedWork
+          ? War3CompactWorkHasFlag(
+                work, War3CompactWorkPreviouslySelected)
+          : wasPreviouslySubmitted(selectionKey);
+      if (observeCompactWorkTable && workSealed &&
+          (work.selectionKey != selectionKey ||
+           work.priorityScore != priorityScore ||
+           War3CompactWorkHasFlag(
+               work, War3CompactWorkPreviouslySelected) !=
+               previouslySelected)) {
+        m_war3Scene.shadowStats.semanticSceneCompactWorkTableMismatchCount++;
+      }
       preselectedRecords.push_back(
           {record,
+           work,
            selectionKey,
-           War3SemanticDirectRecordPriorityScore(record),
-           wasPreviouslySubmitted(selectionKey)});
+           priorityScore,
+           previouslySelected});
     }
 
     enterDirectDetailPhase("PreselectRecordSort");
@@ -23809,8 +23951,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         return false;
       }
       const size_t beforeSize = recordsForBuild.size();
-      for (uint32_t i = group.startIdx; i < group.startIdx + group.count; ++i)
+      for (uint32_t i = group.startIdx; i < group.startIdx + group.count; ++i) {
         recordsForBuild.push_back(preselectedRecords[i].record);
+        if (compactWorkTableMode != War3CompactWorkTableMode::Off)
+          m_war3CompactWorkTable.append(preselectedRecords[i].work);
+      }
       if (stickySelectionFill && group.previouslySelected &&
           recordsForBuild.size() > size_t(directRecordCap)) {
         const size_t extraBefore =
@@ -24286,31 +24431,46 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       War3CurrentDrawVisibleIndexSliceCacheRuntime());
 
   enterBuildEligiblePhase("RecordLoop");
-  for (const auto& record : recordsForBuild) {
+  for (size_t recordIndex = 0u; recordIndex < recordsForBuild.size();
+       ++recordIndex) {
+    const auto& record = recordsForBuild[recordIndex];
+    War3CompactWorkItem compactWork = {};
+    const bool hasCompactWork =
+        m_war3CompactWorkTable.load(recordIndex, compactWork);
+    const bool useSealedWork = consumeCompactWorkTable &&
+        hasCompactWork &&
+        War3CompactWorkHasFlag(compactWork, War3CompactWorkValid) &&
+        War3CompactWorkHasFlag(compactWork, War3CompactWorkSealed) &&
+        compactWork.frameGeneration == m_war3ShadowPersistentFrameSerial;
+    if (useSealedWork)
+      m_war3Scene.shadowStats.semanticSceneCompactWorkTableConsumedCount++;
     // The exact current-frame Stage11 producer runs before this grouped
     // fallback.  A matching exactOwnerFrameSerial means it either published
     // the native draw representation or deliberately rejected that exact
     // slice under the blocker/alpha fail-closed policy.  In both cases the
     // generic skinned reconstruction must not publish a second, non-equivalent
     // representation for the same part in this frame.
-    if (currentFrameDrawTimeProducerOwnsRecord(record)) {
+    if (!useSealedWork && currentFrameDrawTimeProducerOwnsRecord(record)) {
       m_war3Scene.shadowStats
           .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
       continue;
     }
-    if (War3SemanticRawcodeLooksStaticWorldCaster(record.rawcode))
+    if (!useSealedWork &&
+        War3SemanticRawcodeLooksStaticWorldCaster(record.rawcode))
       continue;
-    const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
-        record.stage,
-        record.batchTag,
-        War3BatchTag::Unknown,
-        War3BatchTag::Unknown,
-        false,
-    };
-    if (!dxvk::war3::render::ShadowProducerPolicyAllows(
-            dxvk::war3::render::ShadowProducerKind::SemanticDirectGrouped,
-            producerContext)) {
-      continue;
+    if (!useSealedWork) {
+      const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
+          record.stage,
+          record.batchTag,
+          War3BatchTag::Unknown,
+          War3BatchTag::Unknown,
+          false,
+      };
+      if (!dxvk::war3::render::ShadowProducerPolicyAllows(
+              dxvk::war3::render::ShadowProducerKind::SemanticDirectGrouped,
+              producerContext)) {
+        continue;
+      }
     }
     const bool traceBuildRecord =
         traceBuildEligible &&
@@ -24321,7 +24481,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         buildEligibleRecordPhaseTicks, buildEligibleRecordPhaseCalls);
     buildRecordTiming.enter(War3BuildEligibleRecordPhase::GateFilter);
     auto& bucket = completenessBucketForRecord(record);
-    if (dxvk::war3::internal::kPathBlockerHideEnabled &&
+    if (!useSealedWork && dxvk::war3::internal::kPathBlockerHideEnabled &&
         War3ShadowIsLosBlocker(record)) {
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
       m_war3Scene.shadowStats
@@ -24451,8 +24611,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
     buildRecordTiming.enter(War3BuildEligibleRecordPhase::Identity);
     eligible.sceneNode = eligible.packet.renderable.sceneNode;
-    eligible.recordSelectionKey =
-        War3SemanticDirectRecordSelectionKey(record);
+    eligible.recordSelectionKey = useSealedWork
+        ? compactWork.selectionKey
+        : War3SemanticDirectRecordSelectionKey(record);
     War3SemanticDirectSelectionKeySource selectionKeySource =
         War3SemanticDirectSelectionKeySource::None;
     eligible.selectionKey =

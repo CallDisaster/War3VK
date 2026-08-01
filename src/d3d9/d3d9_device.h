@@ -1837,6 +1837,9 @@ private:
   uint64_t m_war3GpuSkinP4ShadowCommits = 0u;
   uint64_t m_war3GpuSkinDiagnosticFrames = 0u;
   War3FrameScene m_war3Scene;
+  // Reused render-thread-only SoA storage for the generation-sealed compact
+  // control plane. It never owns geometry, alpha payloads, or palette bytes.
+  War3CompactWorkTable m_war3CompactWorkTable;
   // 本帧场景已被 rotate（move 进 pipeline input）的帧序号。direct-only 模式
   // 下 EndFrame flush 用它判定 BeforeUi 是否已消费本帧场景：命中则跳过重复
   // 的全量 populate 固定开销；未命中（菜单/过场等 BeforeUi 漏检帧）仍走完整

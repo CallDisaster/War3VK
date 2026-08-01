@@ -12,6 +12,7 @@
 #include <array>
 #include <vector>
 #include <cstdint>
+#include <type_traits>
 
 namespace dxvk {
 
@@ -668,6 +669,15 @@ namespace dxvk {
         uint32_t semanticSceneRejectedPathBlockerAppendVbBlendCount = 0;
         uint32_t semanticSceneRejectedPathBlockerFastAppendCount = 0;
         uint32_t semanticSceneRejectedPathBlockerDirectGroupedCount = 0;
+        // Generation-tagged DirectGrouped control-plane work table. Mode:
+        // 0=Off, 1=Observe, 2=Consume. Only exact current-generation sealed
+        // items may bypass repeated ownership/policy/key work.
+        uint32_t semanticSceneCompactWorkTableMode = 0;
+        uint32_t semanticSceneCompactWorkTableCandidateCount = 0;
+        uint32_t semanticSceneCompactWorkTableSealedCount = 0;
+        uint32_t semanticSceneCompactWorkTableConsumedCount = 0;
+        uint32_t semanticSceneCompactWorkTableFallbackCount = 0;
+        uint32_t semanticSceneCompactWorkTableMismatchCount = 0;
         uint32_t semanticSceneRejectedPathBlockerProducerCount = 0;
         uint32_t semanticSceneRejectedPathBlockerStaticSupplementCount = 0;
         uint32_t semanticSceneRejectedPathBlockerLegacyCaptureCount = 0;
@@ -1184,6 +1194,80 @@ namespace dxvk {
         uint64_t fallbackBudgetUsedBytes = 0;
         uint64_t fallbackArenaBytes = 0;
         uint64_t dynamicPoseSignature = 0;
+    };
+
+    enum War3CompactWorkFlags : uint8_t {
+        War3CompactWorkValid = 1u << 0,
+        War3CompactWorkSealed = 1u << 1,
+        War3CompactWorkExactOwner = 1u << 2,
+        War3CompactWorkStaticWorld = 1u << 3,
+        War3CompactWorkProducerAllowed = 1u << 4,
+        War3CompactWorkPathBlocker = 1u << 5,
+        War3CompactWorkPreviouslySelected = 1u << 6,
+    };
+
+    // Immutable POD row used while the canonical path and the compact path are
+    // compared. Persistent storage below is SoA so consumers read only the
+    // columns needed by their gate instead of chasing the full draw contract.
+    struct War3CompactWorkItem {
+        uint64_t frameGeneration = 0u;
+        uint64_t selectionKey = 0u;
+        uint32_t priorityScore = 0u;
+        uint8_t flags = 0u;
+    };
+
+    static_assert(std::is_standard_layout_v<War3CompactWorkItem>);
+    static_assert(std::is_trivially_copyable_v<War3CompactWorkItem>);
+
+    inline bool War3CompactWorkHasFlag(
+        const War3CompactWorkItem& item, War3CompactWorkFlags flag) {
+      return (item.flags & uint8_t(flag)) != 0u;
+    }
+
+    struct War3CompactWorkTable {
+        uint64_t generation = 0u;
+        std::vector<uint64_t> frameGenerations;
+        std::vector<uint64_t> selectionKeys;
+        std::vector<uint32_t> priorityScores;
+        std::vector<uint8_t> flags;
+
+        void reset(uint64_t nextGeneration, size_t reserveCount) {
+          generation = nextGeneration;
+          frameGenerations.clear();
+          selectionKeys.clear();
+          priorityScores.clear();
+          flags.clear();
+          if (frameGenerations.capacity() < reserveCount)
+            frameGenerations.reserve(reserveCount);
+          if (selectionKeys.capacity() < reserveCount)
+            selectionKeys.reserve(reserveCount);
+          if (priorityScores.capacity() < reserveCount)
+            priorityScores.reserve(reserveCount);
+          if (flags.capacity() < reserveCount)
+            flags.reserve(reserveCount);
+        }
+
+        void append(const War3CompactWorkItem& item) {
+          frameGenerations.push_back(item.frameGeneration);
+          selectionKeys.push_back(item.selectionKey);
+          priorityScores.push_back(item.priorityScore);
+          flags.push_back(item.flags);
+        }
+
+        void appendInvalid(size_t count) {
+          for (size_t i = 0u; i < count; ++i)
+            append({generation, 0u, 0u, 0u});
+        }
+
+        bool load(size_t index, War3CompactWorkItem& item) const {
+          if (index >= frameGenerations.size() ||
+              index >= selectionKeys.size() ||
+              index >= priorityScores.size() || index >= flags.size())
+            return false;
+          item = {frameGenerations[index], selectionKeys[index],
+                  priorityScores[index], flags[index]};
+          return true;
+        }
     };
 
     struct War3FrameScene {

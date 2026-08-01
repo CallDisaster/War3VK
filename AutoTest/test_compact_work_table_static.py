@@ -1,0 +1,109 @@
+"""Static contracts for the generation-sealed DirectGrouped work table."""
+
+from pathlib import Path
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(
+    encoding="utf-8", errors="replace"
+)
+SCENE = (ROOT / "src/d3d9/d3d9_war3_scene.h").read_text(
+    encoding="utf-8", errors="replace"
+)
+CONTROL = (ROOT / "src/d3d9/war3/tools/war3_control_plane.cpp").read_text(
+    encoding="utf-8", errors="replace"
+)
+class CompactWorkTableContracts(unittest.TestCase):
+    def test_release_default_is_off_and_modes_are_bounded(self):
+        block = DEVICE[
+            DEVICE.index("enum class War3CompactWorkTableMode") :
+            DEVICE.index("bool War3PopulateSubmitPermutationViewRuntime")
+        ]
+        self.assertIn("Off = 0u", block)
+        self.assertIn("Observe = 1u", block)
+        self.assertIn("Consume = 2u", block)
+        self.assertIn('"DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", 0u', block)
+        self.assertIn("std::min<uint32_t>(", block)
+
+    def test_only_exact_current_generation_items_are_sealed(self):
+        start = DEVICE.index("// A compact item is consumable only")
+        end = DEVICE.index("auto& stats", start)
+        block = DEVICE[start:end]
+        self.assertIn("record.producerFreshThisFrame", block)
+        self.assertIn("!record.fromGrace", block)
+        self.assertIn("record.stagePolicyRevision", block)
+        self.assertIn("CurrentShadowStagePolicyRevision()", block)
+        self.assertIn("m_war3ShadowPersistentFrameSerial", block)
+        self.assertIn("War3CompactWorkSealed", block)
+
+    def test_persistent_storage_is_generation_tagged_pod_soa(self):
+        block = SCENE[
+            SCENE.index("struct War3CompactWorkItem") :
+            SCENE.index("struct War3FrameScene")
+        ]
+        self.assertIn("std::is_standard_layout_v<War3CompactWorkItem>", block)
+        self.assertIn("std::is_trivially_copyable_v<War3CompactWorkItem>", block)
+        self.assertIn("uint64_t generation", block)
+        self.assertIn("std::vector<uint64_t> frameGenerations", block)
+        self.assertIn("std::vector<uint64_t> selectionKeys", block)
+        self.assertIn("std::vector<uint32_t> priorityScores", block)
+        self.assertIn("std::vector<uint8_t> flags", block)
+
+    def test_consume_requires_seal_and_generation_match(self):
+        loop = DEVICE.index(
+            "for (size_t recordIndex = 0u; recordIndex < recordsForBuild.size();"
+        )
+        block = DEVICE[loop : DEVICE.index("// --- Step 3: submit ---", loop)]
+        self.assertIn("consumeCompactWorkTable", block)
+        self.assertIn("m_war3CompactWorkTable.load", block)
+        self.assertIn("War3CompactWorkValid", block)
+        self.assertIn("War3CompactWorkSealed", block)
+        self.assertIn(
+            "compactWork.frameGeneration == m_war3ShadowPersistentFrameSerial",
+            block,
+        )
+        self.assertIn("currentFrameDrawTimeProducerOwnsRecord(record)", block)
+        self.assertIn("War3ShadowIsLosBlocker(record)", block)
+        self.assertIn("ShadowProducerPolicyAllows(", block)
+
+    def test_observe_compares_every_cached_early_gate(self):
+        block = DEVICE[
+            DEVICE.index("for (const auto& record : directRecords)") :
+            DEVICE.index('enterDirectDetailPhase("PreselectRecordSort")')
+        ]
+        for cached, canonical in (
+            ("compactExactOwner", "canonicalExactOwner"),
+            ("compactStaticWorld", "canonicalStaticWorld"),
+            ("compactProducerAllowed", "canonicalProducerAllowed"),
+            ("compactPathBlocker", "canonicalPathBlocker"),
+        ):
+            self.assertIn(f"{cached} != {canonical}", block)
+        self.assertIn("work.selectionKey != selectionKey", block)
+        self.assertIn("work.priorityScore != priorityScore", block)
+        self.assertIn("semanticSceneCompactWorkTableMismatchCount++", block)
+
+    def test_diagnostics_are_public_and_mismatch_is_counted(self):
+        for field in (
+            "semanticSceneCompactWorkTableMode",
+            "semanticSceneCompactWorkTableCandidateCount",
+            "semanticSceneCompactWorkTableSealedCount",
+            "semanticSceneCompactWorkTableConsumedCount",
+            "semanticSceneCompactWorkTableFallbackCount",
+            "semanticSceneCompactWorkTableMismatchCount",
+        ):
+            self.assertIn(field, SCENE)
+            self.assertIn(field, CONTROL)
+
+    def test_known_unsafe_cross_frame_shortcuts_remain_fail_closed(self):
+        for setting in (
+            "DXVK_WAR3_DRAWTIME_VB_CACHE",
+            "DXVK_WAR3_SEMANTIC_DRAW_TIME_FAST_APPEND",
+            "DXVK_WAR3_SEMANTIC_DRAW_TIME_PREBUILD_BYPASS",
+            "DXVK_WAR3_DRAWTIME_SOURCE_FINGERPRINT_REUSE",
+        ):
+            self.assertIn(f'War3GetEnvU32("{setting}", 0u)', DEVICE)
+
+
+if __name__ == "__main__":
+    unittest.main()
