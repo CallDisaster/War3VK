@@ -1,5 +1,23 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（Persistent Package consumer last-use owner，纯值合同、未接运行时）
+
+新增独立 `War3PersistentGpuPackageOwner` 作为未来 shared atlas 的生命周期准入边界；
+当前仅编译纯值账本与 runnable test，D3D9/Store/Main/CSM/point/outline 均不实例化它。
+
+- 每个 generation 使用 exact `mapEpoch/deviceEpoch/packageGeneration`，分别记录 upload
+  fence identity/value 与 consumer last-use fence identity/value、consumer mask、submit
+  serial。retirement 必须先拥有两组非零 proof；只有两次 completion query 成功、fence
+  identity 精确一致且两个 completed value 均达值才允许 erase。
+- 零值、未知 consumer bit、失败 query、epoch/generation/fence mismatch、倒退的 submit
+  serial 或 fence value 全部保守保留。Owner 禁止复制，避免无意复制生命周期权限。
+- Observe API 是 const classifier，只验证 would-be last-use，不写账本、不绑定 atlas。
+  `kRuntimeObserveEnabled=false / kObserveBindsAtlas=false /
+  kObserveWritesConsumerLastUse=false / kSharedConsumerEnabled=false`；Store 原有
+  `kD3D9SharedOwnerEnabled=false / kCrossEpochRetirementSafe=false` 未改变。
+- generation static 7/7、既有 owner/package static 20/20、两个 Meson runnable 2/2
+  PASS；Win32 d3d9 build 通过，`ninja -C build32 -n` no-work。此阶段没有部署或启动游戏。
+
 ## 🚨 2026-08-02（P4 B1 归因为安全索引证明缺口，禁止复开旧 VB cache）
 
 对旧部署 `37E0BE91...` 与当前 P0 Package 候选做 exact route=3 A/B 后，两者均能

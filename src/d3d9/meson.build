@@ -149,6 +149,7 @@ d3d9_src = [
   'war3/gpu_skin/war3_cpu_skin_mt.cpp',
   'war3/gpu_skin/war3_gpu_skin_manager.cpp',
   'war3/gpu_skin/war3_gpu_skin_native_bridge.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_owner.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_store.cpp',
   'war3/gpu_skin/war3_gpu_skin_resources.cpp',
   'war3/shadow/war3_shadow_runtime_contract.cpp',
@@ -254,6 +255,24 @@ war3_persistent_gpu_package_owner_test = executable(
 test(
   'war3_persistent_gpu_package_owner',
   war3_persistent_gpu_package_owner_test,
+  timeout : 30,
+)
+
+# Value-only P1 lifecycle proof. It records upload and consumer last-use fence
+# identities/values for isolated tests, but is not instantiated by the store,
+# D3D9 device or any renderer consumer.
+war3_persistent_gpu_package_generation_owner_test = executable(
+  'war3_persistent_gpu_package_generation_owner_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_owner.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_generation_owner_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_generation_owner',
+  war3_persistent_gpu_package_generation_owner_test,
   timeout : 30,
 )
 
