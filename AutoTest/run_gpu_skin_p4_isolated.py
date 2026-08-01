@@ -48,6 +48,8 @@ DEPLOYED_OUTLINE_SHADER = WAR3_DIR / "shaders" / "war3_outline.hlsl"
 WAIT_CHAIN_COLLECTOR = HERE / "collect_process_wait_chains.py"
 WAIT_CHAIN_HELPER_TIMEOUT_SEC = 5.0
 WAIT_CHAIN_HELPER_MAX_THREADS = 64
+LEGACY_DRAWTIME_INDEX_CACHE_ENV = "DXVK_WAR3_DRAWTIME_VB_CACHE"
+SAFE_INDEX_PROOF_BLOCKER_CODE = "BLOCKED_SAFE_INDEX_PROOF"
 
 P4_ENV = {
     "DXVK_WAR3_GPU_SKIN_MODE": "bypass",
@@ -59,6 +61,11 @@ P4_ENV = {
     # S1 is a semantic control, not a performance knob. Every isolated P4
     # launch records and enforces the project-wide period-1 contract.
     "DXVK_WAR3_S1_TERRAIN_CAPTURE_PERIOD": "1",
+    # B1 evidence must never be manufactured by restoring the cross-frame
+    # DrawTime snapshot cache that previously produced origin triangles.  A
+    # future B1 implementation has to publish a current-frame exact index
+    # proof; until then the runner reports a safe capability blocker.
+    LEGACY_DRAWTIME_INDEX_CACHE_ENV: "0",
 }
 GPU_SKIN_POISON_SIDECAR_ENV = "DXVK_WAR3_GPU_SKIN_POISON_SIDECAR"
 GPU_SKIN_POISON_SIDECAR_POLICIES = {
@@ -270,6 +277,49 @@ VS_INPUT_ONLY_P4_EXERCISE_GATE_NAMES = frozenset((
     "nativePoisonO1AuthorityContractClean",
     "ledgerTerminalClean",
 ))
+
+# These gates must remain clean before a B1 zero-authority run can be called a
+# safe index-proof blocker.  They deliberately exclude only progress/exercise
+# gates downstream of B1 authorization.  A real corruption, ownership,
+# lifecycle, process, or device symptom therefore remains a runtime failure.
+SAFE_INDEX_PROOF_REQUIRED_CLEAN_GATES = (
+    "diagnosticsPresent",
+    "managerDispatchAccountingClosed",
+    "computeAccountingClosed",
+    "kernelAccountingClosed",
+    "formatHistogramClosed",
+    "skinHistogramClosed",
+    "formatBucketsKnown",
+    "nativeInsideUploadRangeValid",
+    "strictUploadClassificationClosed",
+    "nativeUploadExactlyOnce",
+    "nativeFanoutAccountingClosed",
+    "poisonOverflowZero",
+    "poisonResetStaleZero",
+    "poisonOutstandingZero",
+    "nativeDirectDiscardAccountingClosed",
+    "nativeCrossBackingPoisonMergeZero",
+    "indexTicketClean",
+    "postSkipClean",
+    "p3RestoreClean",
+    "bypassMismatchZero",
+    "bypassHostAuthorizationMismatchZero",
+    "p4ShadowFinalClean",
+    "ledgerClean",
+    "lifetimeClean",
+    "exactTakeoverConflictClean",
+    "nativeKernelNormalClean",
+    "nativeRetirementClean",
+    "nativeResetFaultClean",
+    "crashScanClean",
+    "processAlive",
+    "processAuthorityExact",
+    "crashEvidenceAuthorityExact",
+    "vsRouteConfigExact",
+    "vsRouteEnvironmentExact",
+    "vsRouteInputContract",
+    "vsRouteInputConsumerContract",
+)
 
 NATIVE_POISON_SHADOW_STATES = (
     "noOverlap", "overlap", "readFailure",
@@ -11526,6 +11576,158 @@ def _evaluate_vs_route_gates(
     }
 
 
+def _classify_b1_safe_index_proof_blocker(
+    diag: Dict[str, Any],
+    gates: Dict[str, Any],
+    launch: Optional[Dict[str, Any]],
+    *,
+    phase: str,
+    execution_route: str,
+    error: Optional[str],
+    runtime_failure_authoritative: bool = False,
+    runtime_death_observed: bool = False,
+) -> Dict[str, Any]:
+    """Separate a fail-closed B1 capability gap from a runtime failure.
+
+    The classifier is intentionally narrower than the B1 route gate.  It only
+    recognizes the exact zero-authority shape produced when immutable input
+    packages exist but no current-frame exact index proof reaches preflight.
+    The legacy DrawTime cache must be explicitly disabled in the child
+    environment, and every ownership/lifecycle/process safety gate must still
+    be clean.  It never converts the run into a PASS.
+    """
+
+    def exact_tuple(value: Any, length: int) -> tuple[Any, ...]:
+        if isinstance(value, (tuple, list)) and len(value) == length:
+            return tuple(value)
+        return (None,) * length
+
+    def non_negative_int(value: Any) -> bool:
+        return bool(
+            isinstance(value, int) and not isinstance(value, bool)
+            and value >= 0
+        )
+
+    record = dict(diag.get("VSRoute", {}) or {})
+    p3 = dict(diag.get("P3", {}) or {})
+    p4_shadow = dict(diag.get("P4Shadow", {}) or {})
+    ticket = dict(diag.get("indexTicket", {}) or {})
+    kernel = dict(diag.get("kernel", {}) or {})
+    prepared = exact_tuple(record.get("inputPrepared"), 2)
+    submitted = exact_tuple(record.get("inputSubmitted"), 2)
+    input_only = exact_tuple(record.get("inputOnly"), 6)
+    main = exact_tuple(record.get("main"), 4)
+    shadow_capture = exact_tuple(record.get("shadowCapture"), 4)
+    shadow_direct = exact_tuple(record.get("shadowDirect"), 5)
+    shadow_replay = exact_tuple(record.get("shadowReplay"), 3)
+
+    launch_record = dict(launch or {})
+    effective_raw = launch_record.get("effectiveWar3Environment")
+    effective_environment = (
+        dict(effective_raw) if isinstance(effective_raw, dict) else {}
+    )
+    legacy_cache_disabled = bool(
+        isinstance(effective_raw, dict)
+        and effective_environment.get(LEGACY_DRAWTIME_INDEX_CACHE_ENV) == "0"
+    )
+
+    bypass_attempts = p3.get("bypassAttempts")
+    preflight_index_reject = p4_shadow.get("preflightIndexReject")
+    input_package_exact = bool(
+        all(non_negative_int(value) for value in prepared + submitted + input_only)
+        and prepared[0] > 0
+        and prepared[1] > 0
+        and prepared == submitted
+        and input_only[0] == prepared[0]
+        and input_only[1] == prepared[1]
+        and input_only[2] == prepared[0]
+        and input_only[3] > 0
+        and input_only[4] == 0
+        and input_only[5] == 0
+    )
+    zero_authority_exact = bool(
+        non_negative_int(bypass_attempts)
+        and bypass_attempts > 0
+        and p3.get("bypassFallbacks") == bypass_attempts
+        and p3.get("bypassAuthorizations") == 0
+        and p3.get("bypassCommits") == 0
+        and non_negative_int(preflight_index_reject)
+        and 0 < preflight_index_reject <= bypass_attempts
+        and p4_shadow.get("preflightUvReject") == 0
+        and p4_shadow.get("leasesConsumed") == 0
+        and p4_shadow.get("bypassCommits") == 0
+        and all(
+            p4_shadow.get(name) == 0
+            for name in (
+                "finalPositionReject", "finalIndexReject", "finalUvReject",
+                "finalCommitReject",
+            )
+        )
+        and all(
+            ticket.get(name) == 0
+            for name in (
+                "mask", "attempts", "exact", "suppressed", "leaks",
+            )
+        )
+        and non_negative_int(kernel.get("hookCalls"))
+        and kernel.get("hookCalls") > 0
+        and kernel.get("originalCalls") == kernel.get("hookCalls")
+        and kernel.get("bypassedCalls") == 0
+        and kernel.get("bypassedBytes") == 0
+        and all(value == 0 for value in main)
+        and all(value == 0 for value in shadow_capture)
+        and all(value == 0 for value in shadow_direct)
+        and all(value == 0 for value in shadow_replay)
+    )
+    safe_index_proof_unavailable = bool(
+        record.get("route") == 3
+        and record.get("explicit") == 1
+        and record.get("invalid") == 0
+        and input_package_exact
+        and zero_authority_exact
+    )
+    failed_safety_gates = tuple(
+        name for name in SAFE_INDEX_PROOF_REQUIRED_CLEAN_GATES
+        if gates.get(name) is not True
+    )
+    safety_contract_clean = not failed_safety_gates
+    blocked = bool(
+        phase in ("crash-gate", "lifecycle")
+        and execution_route == "vertex_shader_bypass"
+        and error is None
+        and not runtime_failure_authoritative
+        and not runtime_death_observed
+        and legacy_cache_disabled
+        and safe_index_proof_unavailable
+        and safety_contract_clean
+    )
+    return {
+        "blocked": blocked,
+        "code": SAFE_INDEX_PROOF_BLOCKER_CODE if blocked else None,
+        "SafeIndexProofUnavailable": safe_index_proof_unavailable,
+        "LegacyIndexCacheDisabled": legacy_cache_disabled,
+        "safetyContractClean": safety_contract_clean,
+        "failedSafetyGates": list(failed_safety_gates),
+        "runtimeFailureAuthorityPresent": bool(runtime_failure_authoritative),
+        "runtimeDeathObserved": bool(runtime_death_observed),
+        "inputPackageExact": input_package_exact,
+        "zeroAuthorityExact": zero_authority_exact,
+        "preflightIndexReject": preflight_index_reject,
+        "bypassAttempts": bypass_attempts,
+        "legacyCacheEnvironment": {
+            "name": LEGACY_DRAWTIME_INDEX_CACHE_ENV,
+            "effectiveValue": effective_environment.get(
+                LEGACY_DRAWTIME_INDEX_CACHE_ENV
+            ),
+            "explicitlyReported": isinstance(effective_raw, dict),
+        },
+        "resolutionContract": (
+            "Publish a generation-pinned current-frame exact index proof; "
+            "never enable the legacy cross-frame DrawTime cache."
+        ),
+    }
+
+
 def _gpu_skin_resource_delta_closed(
     previous_jobs: Any, current_jobs: Any,
     previous_input_storage: Any, current_input_storage: Any,
@@ -20266,6 +20468,32 @@ def _run_runtime_phase(args: argparse.Namespace, out_dir: Path) -> int:
         name for name in VS_ROUTE_HARD_GATE_NAMES
         if not gates.get(name, False)
     )
+    evidence_classifications = [
+        dict(runtime_failure_evidence.get("classification", {}) or {}),
+        dict(second_runtime_failure_evidence.get("classification", {}) or {}),
+        dict(ready_failure_evidence.get("classification", {}) or {}),
+        dict(second_ready_failure_evidence.get("classification", {}) or {}),
+    ]
+    runtime_failure_authoritative = any(
+        item.get("gpuSkinRuntimeFailure") is True
+        or item.get("runtimeProcessFailure") is True
+        for item in evidence_classifications
+    )
+    safe_index_proof_blocker = _classify_b1_safe_index_proof_blocker(
+        diag,
+        gates,
+        launch,
+        phase=args.phase,
+        execution_route=args.execution_route,
+        error=error,
+        runtime_failure_authoritative=runtime_failure_authoritative,
+        runtime_death_observed=bool(
+            first_runtime_death_observed or second_runtime_death_observed
+        ),
+    )
+    safe_index_proof_blocked = bool(
+        safe_index_proof_blocker.get("blocked") is True
+    )
     passed = (
         error is None
         and _hard_gate_pass(
@@ -20274,12 +20502,6 @@ def _run_runtime_phase(args: argparse.Namespace, out_dir: Path) -> int:
         )
         and all(gates.get(name, False) for name in VS_ROUTE_HARD_GATE_NAMES)
     )
-    evidence_classifications = [
-        dict(runtime_failure_evidence.get("classification", {}) or {}),
-        dict(second_runtime_failure_evidence.get("classification", {}) or {}),
-        dict(ready_failure_evidence.get("classification", {}) or {}),
-        dict(second_ready_failure_evidence.get("classification", {}) or {}),
-    ]
     failure_classification: Dict[str, Any] = {}
     if first_runtime_death_observed or second_runtime_death_observed:
         # Only a signaled retained launch handle whose PID/creation/path match
@@ -20322,6 +20544,29 @@ def _run_runtime_phase(args: argparse.Namespace, out_dir: Path) -> int:
             (item for item in evidence_classifications if item),
             {},
         )
+    if safe_index_proof_blocked and not failure_classification:
+        failure_classification = {
+            "primary": "blockedSafeIndexProof",
+            "code": SAFE_INDEX_PROOF_BLOCKER_CODE,
+            "blockedSafeIndexProof": True,
+            "SafeIndexProofUnavailable": True,
+            "LegacyIndexCacheDisabled": True,
+            "readyInfrastructureFailure": False,
+            "infrastructureFailure": False,
+            "gpuSkinRuntimeFailure": False,
+            "testActuationFailure": False,
+            "runtimeProcessFailure": False,
+            "processAliveAtEvidenceCapture": alive_before_stop,
+            "processLivenessAuthority": first_process_authority,
+            "secondProcessLivenessAuthority": second_process_authority,
+            "readyMode": ready.get("mode"),
+            "readyError": ready.get("error"),
+            "evidenceNote": (
+                "B1 stayed fail-closed because no safe current-frame exact "
+                "index proof reached preflight while the legacy cross-frame "
+                "cache remained explicitly disabled."
+            ),
+        }
     if not failure_classification:
         first_restore_actuation_failure = bool(
             first_outline_restore
@@ -20374,6 +20619,7 @@ def _run_runtime_phase(args: argparse.Namespace, out_dir: Path) -> int:
             and not infrastructure_failure
             and not outline_control_failure
             and not runtime_process_failure
+            and not safe_index_proof_blocked
             and (error is not None or failed_hard_gates)
         )
         outline_control_failure_reason = ""
@@ -20421,7 +20667,24 @@ def _run_runtime_phase(args: argparse.Namespace, out_dir: Path) -> int:
     result = {
         "test": f"P4 {args.phase} isolated",
         "artifact": out_dir.name,
-        "verdict": "PASS" if passed else "FAIL",
+        "verdict": (
+            "PASS" if passed
+            else SAFE_INDEX_PROOF_BLOCKER_CODE
+            if safe_index_proof_blocked
+            else "FAIL"
+        ),
+        "blocked": safe_index_proof_blocked,
+        "blockerCode": (
+            SAFE_INDEX_PROOF_BLOCKER_CODE
+            if safe_index_proof_blocked else None
+        ),
+        "SafeIndexProofUnavailable": bool(
+            safe_index_proof_blocker.get("SafeIndexProofUnavailable") is True
+        ),
+        "LegacyIndexCacheDisabled": bool(
+            safe_index_proof_blocker.get("LegacyIndexCacheDisabled") is True
+        ),
+        "safeIndexProofBlocker": safe_index_proof_blocker,
         "failedHardGates": failed_hard_gates,
         "error": error,
         "failureClassification": failure_classification,
@@ -20543,11 +20806,12 @@ def _run_runtime_phase(args: argparse.Namespace, out_dir: Path) -> int:
         f"outlineSubmitted={diag['P3'].get('outlineSubmitted')} "
         f"outlineSameSlice={diag['P3'].get('outlineSameSlice')} "
         f"outlineSliceMismatch={diag['P3'].get('outlineSliceMismatch')}\n"
+        f"safeIndexProofBlocker={json.dumps(safe_index_proof_blocker)}\n"
         "全局 tracker 冲突只作报告；只有运行时发出的 exact-takeover 冲突才判失败。\n",
     )
     _write_sha256s(out_dir)
     print(f"P4 {args.phase} {result['verdict']}: {out_dir}", flush=True)
-    return 0 if passed else 1
+    return 0 if passed else 2 if safe_index_proof_blocked else 1
 
 
 def main() -> int:

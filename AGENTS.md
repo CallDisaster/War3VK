@@ -1,5 +1,25 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（P4 B1 归因为安全索引证明缺口，禁止复开旧 VB cache）
+
+对旧部署 `37E0BE91...` 与当前 P0 Package 候选做 exact route=3 A/B 后，两者均能
+prepare/submit immutable input package，但 `main/shadow/kernelBypassed` 全为 0；不是 P0
+引入的 GPU 蒙皮算法回归。B1 preflight 仍依赖已在 2026-07-27 因世界原点巨型三角而
+生产关闭的跨帧 DrawTime VB/IB cache，缺少 exact index 时会在不可逆 kernel bypass 前
+fail-closed。不得为恢复旧 P4 PASS 重新开启该 cache。
+
+- `run_gpu_skin_p4_isolated.py` 现在对所有路线显式固定
+  `DXVK_WAR3_DRAWTIME_VB_CACHE=0`。只有 input package 完整、preflight index reject、
+  index ticket/authority/consumer 全为 0，且 36 项 ownership/lifecycle/process/device 安全
+  门全部 clean 时，才分类为 `BLOCKED_SAFE_INDEX_PROOF`；它不是 PASS，也不是 runtime
+  failure，进程退出码为 2。
+- final index reject、ticket 泄漏、生命周期/进程异常和权威 runtime failure 仍按真实失败
+  处理，不能被 capability blocker 降级。
+- 9 项新分类/源码合同、`py_compile` 与既有 VS-route 39 项 synthetic checks PASS；真实
+  37E0 A/B artifact 离线回放精确落入安全阻塞分类。
+- 解除阻塞的唯一准入路线是 generation-pinned、current-frame immutable index lease；
+  miss/pending 必须调用原生 kernel exactly once。在该路线实现前，B1 Consume 保持关闭。
+
 ## 🚨 2026-08-02（Persistent Package producer-fence 跨 epoch 保活，Shared Consumer 仍禁止）
 
 本轮修复 P0 Store 继承的 producer upload 生命周期缺口，范围只覆盖一次性
