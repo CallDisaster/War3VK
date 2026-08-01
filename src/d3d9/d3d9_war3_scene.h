@@ -1041,6 +1041,21 @@ namespace dxvk {
         uint32_t semanticSceneShadowMapCascade1CulledCount = 0;
         uint32_t semanticSceneShadowMapCascade2CulledCount = 0;
         uint32_t semanticSceneShadowMapCascade3CulledCount = 0;
+        // Joint-consumer culling admission remains observation-only. These
+        // counters describe C2/C3 static-rigid opportunities and parity with
+        // the canonical late CSM decision; they never authorize a draw skip.
+        uint32_t semanticSceneUnionCullMode = 0;
+        uint32_t semanticSceneUnionCullObserveFrameCount = 0;
+        uint32_t semanticSceneUnionCullCandidateCount = 0;
+        uint32_t semanticSceneUnionCullProofAcceptedCount = 0;
+        uint32_t semanticSceneUnionCullFailVisibleCount = 0;
+        uint32_t semanticSceneUnionCullDynamicConservativeCount = 0;
+        uint32_t semanticSceneUnionCullUnknownOrStaleCount = 0;
+        uint32_t semanticSceneUnionCullC2WouldCullCount = 0;
+        uint32_t semanticSceneUnionCullC3WouldCullCount = 0;
+        uint32_t semanticSceneUnionCullBothFarWouldCullCount = 0;
+        uint32_t semanticSceneUnionCullFalseNegativeCount = 0;
+        uint32_t semanticSceneUnionCullFalsePositiveCount = 0;
         uint32_t semanticSceneShadowMapTerrainDoodadCascade0DrawnCount = 0;
         uint32_t semanticSceneShadowMapTerrainDoodadCascade1DrawnCount = 0;
         uint32_t semanticSceneShadowMapTerrainDoodadCascade2DrawnCount = 0;

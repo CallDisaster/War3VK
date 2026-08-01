@@ -1884,6 +1884,31 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       agg.semanticSceneShadowMapDrawnCasters,
       uint64_t(stats.semanticSceneShadowMapDrawnCasters));
   agg.semanticSceneShadowMapCascadeCulledCount += stats.semanticSceneShadowMapCascadeCulledCount;
+  agg.semanticSceneUnionCullMode = std::max(
+      agg.semanticSceneUnionCullMode,
+      uint64_t(stats.semanticSceneUnionCullMode));
+  agg.semanticSceneUnionCullObserveFrameCount +=
+      stats.semanticSceneUnionCullObserveFrameCount;
+  agg.semanticSceneUnionCullCandidateCount +=
+      stats.semanticSceneUnionCullCandidateCount;
+  agg.semanticSceneUnionCullProofAcceptedCount +=
+      stats.semanticSceneUnionCullProofAcceptedCount;
+  agg.semanticSceneUnionCullFailVisibleCount +=
+      stats.semanticSceneUnionCullFailVisibleCount;
+  agg.semanticSceneUnionCullDynamicConservativeCount +=
+      stats.semanticSceneUnionCullDynamicConservativeCount;
+  agg.semanticSceneUnionCullUnknownOrStaleCount +=
+      stats.semanticSceneUnionCullUnknownOrStaleCount;
+  agg.semanticSceneUnionCullC2WouldCullCount +=
+      stats.semanticSceneUnionCullC2WouldCullCount;
+  agg.semanticSceneUnionCullC3WouldCullCount +=
+      stats.semanticSceneUnionCullC3WouldCullCount;
+  agg.semanticSceneUnionCullBothFarWouldCullCount +=
+      stats.semanticSceneUnionCullBothFarWouldCullCount;
+  agg.semanticSceneUnionCullFalseNegativeCount +=
+      stats.semanticSceneUnionCullFalseNegativeCount;
+  agg.semanticSceneUnionCullFalsePositiveCount +=
+      stats.semanticSceneUnionCullFalsePositiveCount;
   agg.semanticSceneShadowMapSkinnedCasterCount = std::max(
       agg.semanticSceneShadowMapSkinnedCasterCount,
       uint64_t(stats.semanticSceneShadowMapSkinnedCasterCount));
@@ -6498,6 +6523,30 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneShadowMapDrawnCasters << ",\n";
   json << "    \"semanticSceneShadowMapCascadeCulledCount\": "
        << shadowAgg.semanticSceneShadowMapCascadeCulledCount << ",\n";
+  json << "    \"semanticSceneUnionCullMode\": "
+       << shadowAgg.semanticSceneUnionCullMode << ",\n";
+  json << "    \"semanticSceneUnionCullObserveFrameCount\": "
+       << shadowAgg.semanticSceneUnionCullObserveFrameCount << ",\n";
+  json << "    \"semanticSceneUnionCullCandidateCount\": "
+       << shadowAgg.semanticSceneUnionCullCandidateCount << ",\n";
+  json << "    \"semanticSceneUnionCullProofAcceptedCount\": "
+       << shadowAgg.semanticSceneUnionCullProofAcceptedCount << ",\n";
+  json << "    \"semanticSceneUnionCullFailVisibleCount\": "
+       << shadowAgg.semanticSceneUnionCullFailVisibleCount << ",\n";
+  json << "    \"semanticSceneUnionCullDynamicConservativeCount\": "
+       << shadowAgg.semanticSceneUnionCullDynamicConservativeCount << ",\n";
+  json << "    \"semanticSceneUnionCullUnknownOrStaleCount\": "
+       << shadowAgg.semanticSceneUnionCullUnknownOrStaleCount << ",\n";
+  json << "    \"semanticSceneUnionCullC2WouldCullCount\": "
+       << shadowAgg.semanticSceneUnionCullC2WouldCullCount << ",\n";
+  json << "    \"semanticSceneUnionCullC3WouldCullCount\": "
+       << shadowAgg.semanticSceneUnionCullC3WouldCullCount << ",\n";
+  json << "    \"semanticSceneUnionCullBothFarWouldCullCount\": "
+       << shadowAgg.semanticSceneUnionCullBothFarWouldCullCount << ",\n";
+  json << "    \"semanticSceneUnionCullFalseNegativeCount\": "
+       << shadowAgg.semanticSceneUnionCullFalseNegativeCount << ",\n";
+  json << "    \"semanticSceneUnionCullFalsePositiveCount\": "
+       << shadowAgg.semanticSceneUnionCullFalsePositiveCount << ",\n";
   json << "    \"semanticSceneShadowMapSkinnedCasterCount\": "
        << shadowAgg.semanticSceneShadowMapSkinnedCasterCount << ",\n";
   json << "    \"semanticSceneShadowMapSkinnedPreparedCount\": "
@@ -7695,6 +7744,30 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneShadowMapDrawnCasters << ",\n";
   json << "    \"semanticSceneShadowMapCascadeCulledCount\": "
        << shadowAgg.semanticSceneShadowMapCascadeCulledCount << ",\n";
+  json << "    \"semanticSceneUnionCullMode\": "
+       << shadowAgg.semanticSceneUnionCullMode << ",\n";
+  json << "    \"semanticSceneUnionCullObserveFrameCount\": "
+       << shadowAgg.semanticSceneUnionCullObserveFrameCount << ",\n";
+  json << "    \"semanticSceneUnionCullCandidateCount\": "
+       << shadowAgg.semanticSceneUnionCullCandidateCount << ",\n";
+  json << "    \"semanticSceneUnionCullProofAcceptedCount\": "
+       << shadowAgg.semanticSceneUnionCullProofAcceptedCount << ",\n";
+  json << "    \"semanticSceneUnionCullFailVisibleCount\": "
+       << shadowAgg.semanticSceneUnionCullFailVisibleCount << ",\n";
+  json << "    \"semanticSceneUnionCullDynamicConservativeCount\": "
+       << shadowAgg.semanticSceneUnionCullDynamicConservativeCount << ",\n";
+  json << "    \"semanticSceneUnionCullUnknownOrStaleCount\": "
+       << shadowAgg.semanticSceneUnionCullUnknownOrStaleCount << ",\n";
+  json << "    \"semanticSceneUnionCullC2WouldCullCount\": "
+       << shadowAgg.semanticSceneUnionCullC2WouldCullCount << ",\n";
+  json << "    \"semanticSceneUnionCullC3WouldCullCount\": "
+       << shadowAgg.semanticSceneUnionCullC3WouldCullCount << ",\n";
+  json << "    \"semanticSceneUnionCullBothFarWouldCullCount\": "
+       << shadowAgg.semanticSceneUnionCullBothFarWouldCullCount << ",\n";
+  json << "    \"semanticSceneUnionCullFalseNegativeCount\": "
+       << shadowAgg.semanticSceneUnionCullFalseNegativeCount << ",\n";
+  json << "    \"semanticSceneUnionCullFalsePositiveCount\": "
+       << shadowAgg.semanticSceneUnionCullFalsePositiveCount << ",\n";
   json << "    \"semanticSceneShadowMapSkinnedCasterCount\": "
        << shadowAgg.semanticSceneShadowMapSkinnedCasterCount << ",\n";
   json << "    \"semanticSceneShadowMapSkinnedPreparedCount\": "

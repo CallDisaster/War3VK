@@ -10,6 +10,7 @@
 #include "war3/render/war3_shadow_lifecycle.h"
 #include "war3/render/war3_shadow_producer_policy.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
+#include "war3/render/war3_union_consumer_visibility.h"
 #include "war3/shader/war3_shader_manager.h"
 #include "war3/tools/war3_diagnostics_hub.h"
 #include "war3/tools/war3_perf_monitor.h"
@@ -408,6 +409,13 @@ int EnvIntOverride(const char* name, int minValue, int maxValue) {
   if (end == value.c_str())
     return minValue - 1;
   return std::clamp<int>(static_cast<int>(parsed), minValue, maxValue);
+}
+
+war3::render::War3UnionVisibilityMode War3UnionCullModeRuntime() {
+  static const auto mode = static_cast<war3::render::War3UnionVisibilityMode>(
+      std::min<uint32_t>(
+          EnvU32Default("DXVK_WAR3_UNION_CONSUMER_CULL_MODE", 0u), 2u));
+  return mode;
 }
 
 War3ShadowTaaMode ResolveShadowTaaRequestedMode(
@@ -2970,6 +2978,18 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   reconciliation.shadowMapCascade1CulledCount = 0u;
   reconciliation.shadowMapCascade2CulledCount = 0u;
   reconciliation.shadowMapCascade3CulledCount = 0u;
+  reconciliation.unionCullMode = 0u;
+  reconciliation.unionCullObserveFrameCount = 0u;
+  reconciliation.unionCullCandidateCount = 0u;
+  reconciliation.unionCullProofAcceptedCount = 0u;
+  reconciliation.unionCullFailVisibleCount = 0u;
+  reconciliation.unionCullDynamicConservativeCount = 0u;
+  reconciliation.unionCullUnknownOrStaleCount = 0u;
+  reconciliation.unionCullC2WouldCullCount = 0u;
+  reconciliation.unionCullC3WouldCullCount = 0u;
+  reconciliation.unionCullBothFarWouldCullCount = 0u;
+  reconciliation.unionCullFalseNegativeCount = 0u;
+  reconciliation.unionCullFalsePositiveCount = 0u;
   reconciliation.shadowMapTerrainDoodadCascade0DrawnCount = 0u;
   reconciliation.shadowMapTerrainDoodadCascade1DrawnCount = 0u;
   reconciliation.shadowMapTerrainDoodadCascade2DrawnCount = 0u;
@@ -3274,6 +3294,9 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     cullParams[c].row2Len = len3(m[0].z, m[1].z, m[2].z);
   }
 
+  static const bool s_disableFarCascadeCull =
+      EnvFlagDefault("DXVK_WAR3_CSM_DISABLE_FAR_CASCADE_CULL", false);
+
   auto intersectsCascade = [&](const War3ShadowCasterDraw &draw,
                                uint32_t cascadeIdx) -> bool {
     using war3::render::ObjectKind;
@@ -3293,8 +3316,6 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     // 不做 cull 保证近处阴影完整；cascade 2/3 覆盖远处，做 cull 省 draw。
     // A/B：DXVK_WAR3_CSM_DISABLE_FAR_CASCADE_CULL=1 时所有非地形也不剔除，
     // 用于验证高镜头树影/单位是否因 C2/C3 包围球漏杀。
-    static const bool s_disableFarCascadeCull =
-        EnvFlagDefault("DXVK_WAR3_CSM_DISABLE_FAR_CASCADE_CULL", false);
     if ((cascadeIdx < 2u || s_disableFarCascadeCull) && !terrainDraw)
       return true;
     const auto objectKind = static_cast<ObjectKind>(draw.objectKind);
@@ -3383,7 +3404,137 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
                 if (ka.indexBuffer != kb.indexBuffer)
                   return ka.indexBuffer < kb.indexBuffer;
                 return a < b;
-              });
+               });
+  }
+
+  // Observation-only admission stage for the future joint-consumer mask.
+  // It deliberately runs at the final CSM boundary so its prediction can be
+  // compared against the canonical culler without changing capture, upload,
+  // sorting or any submitted draw. Even mode=Consume remains unadmitted here.
+  const auto unionCullMode = War3UnionCullModeRuntime();
+  if (unionCullMode != war3::render::War3UnionVisibilityMode::Off) {
+    reconciliation.unionCullMode = static_cast<uint32_t>(unionCullMode);
+    reconciliation.unionCullObserveFrameCount = 1u;
+
+    const bool cameraCurrent = War3WorldCameraIsFreshForFrame(
+        input.scene.worldCamera, input.frameSerial);
+    const bool consumerStateCurrent = !s_disableFarCascadeCull;
+    const uint32_t firstFarCascade = 2u;
+
+    for (const uint32_t drawIndex : sortedDrawIndices) {
+      const auto& draw = *replayDraws[drawIndex];
+      const auto objectKind =
+          static_cast<war3::render::ObjectKind>(draw.objectKind);
+      const bool dynamicOrSkinned =
+          draw.vertexBlendEnabled || draw.vertexBlendIndexed ||
+          objectKind == war3::render::ObjectKind::Unit ||
+          objectKind == war3::render::ObjectKind::Effect;
+      if (dynamicOrSkinned) {
+        ++reconciliation.unionCullDynamicConservativeCount;
+        continue;
+      }
+
+      const bool staticRigid =
+          objectKind == war3::render::ObjectKind::Building ||
+          objectKind == war3::render::ObjectKind::Destructible;
+      const bool exactCurrentSource =
+          draw.stage == 11 &&
+          draw.shadowPartLifecycleState ==
+              War3ShadowPartLifecycleState::RequiredCurrent &&
+          draw.shadowRenderablePart != nullptr &&
+          draw.shadowExactGeometryKeyHash != 0u;
+      if (!staticRigid || !exactCurrentSource || !cameraCurrent ||
+          !consumerStateCurrent || !(draw.boundsRadius > 0.0f) ||
+          m_shadowMapResourceGeneration == 0u) {
+        ++reconciliation.unionCullUnknownOrStaleCount;
+        continue;
+      }
+
+      ++reconciliation.unionCullCandidateCount;
+      bool farWouldCull[2] = {false, false};
+      for (uint32_t c = firstFarCascade; c < cascadeCount && c < 4u; ++c) {
+        war3::render::War3UnionCsmSphereQuery query = {};
+        query.mode = unionCullMode;
+        query.requestedMask = war3::render::War3UnionConsumerCsm2 |
+                              war3::render::War3UnionConsumerCsm3;
+        query.cascadeIndex = c;
+        query.bounds = {draw.boundsCenter.x, draw.boundsCenter.y,
+                        draw.boundsCenter.z, draw.boundsRadius};
+
+        const Matrix4& matrix = m_csmData.cascades[c].lightViewProj;
+        for (uint32_t column = 0u; column < 4u; ++column) {
+          query.lightViewProjection.columns[column][0] = matrix[column].x;
+          query.lightViewProjection.columns[column][1] = matrix[column].y;
+          query.lightViewProjection.columns[column][2] = matrix[column].z;
+          query.lightViewProjection.columns[column][3] = matrix[column].w;
+        }
+
+        query.generations.currentFrameGeneration = input.frameSerial;
+        query.generations.candidateFrameGeneration = input.frameSerial;
+        query.generations.boundsFrameGeneration = input.frameSerial;
+        query.generations.cameraFrameGeneration = input.frameSerial;
+        query.generations.consumerStateFrameGeneration = input.frameSerial;
+        query.generations.resourceGeneration = m_shadowMapResourceGeneration;
+        query.generations.expectedResourceGeneration =
+            m_shadowMapResourceGeneration;
+        query.identityKnown = true;
+        query.exactCurrentFrameSource = true;
+        query.boundsKnown = true;
+        query.cameraKnown = cameraCurrent;
+        query.consumerStateKnown = consumerStateCurrent;
+        query.matrixKnown = true;
+        query.staticRigidProven = true;
+        query.dynamic = false;
+        query.skinned = false;
+        query.radiusScale = 1.0f;
+        query.guardBandNdc = war3::internal::kShadowCascadeCullGuardBandNdc;
+        query.depthGuardBandNdc = query.guardBandNdc;
+        if (objectKind == war3::render::ObjectKind::Building) {
+          query.radiusScale =
+              war3::internal::kShadowCascadeCullBuildingRadiusScale;
+          query.guardBandNdc = std::max(
+              query.guardBandNdc,
+              war3::internal::kShadowCascadeCullBuildingExtraGuardNdc);
+          query.depthGuardBandNdc = query.guardBandNdc;
+        } else if (draw.indexCount >= 8192u ||
+                   draw.vertexCount >= 8192u ||
+                   draw.numVertices >= 8192u) {
+          query.radiusScale =
+              war3::internal::kShadowCascadeCullLargeDrawRadiusScale;
+          query.guardBandNdc = std::max(
+              query.guardBandNdc,
+              war3::internal::kShadowCascadeCullLargeDrawExtraGuardNdc);
+          query.depthGuardBandNdc = query.guardBandNdc;
+        }
+        query.consumeAdmissionGranted = false;
+
+        const auto decision =
+            war3::render::War3EvaluateConservativeCsmSphere(query);
+        if ((decision.proofBits &
+             war3::render::War3UnionProofFiniteProjection) != 0u)
+          ++reconciliation.unionCullProofAcceptedCount;
+        if (decision.failVisible)
+          ++reconciliation.unionCullFailVisibleCount;
+
+        const auto consumerBit = war3::render::War3UnionCsmConsumerBit(c);
+        const bool predictedVisible =
+            (decision.predictedVisibleMask & consumerBit) != 0u;
+        const bool canonicalVisible = intersectsCascade(draw, c);
+        if (!predictedVisible && canonicalVisible)
+          ++reconciliation.unionCullFalseNegativeCount;
+        if (predictedVisible && !canonicalVisible)
+          ++reconciliation.unionCullFalsePositiveCount;
+        farWouldCull[c - firstFarCascade] = !predictedVisible;
+        if (!predictedVisible) {
+          if (c == 2u)
+            ++reconciliation.unionCullC2WouldCullCount;
+          else if (c == 3u)
+            ++reconciliation.unionCullC3WouldCullCount;
+        }
+      }
+      if (farWouldCull[0] && farWouldCull[1])
+        ++reconciliation.unionCullBothFarWouldCullCount;
+    }
   }
 
   m_shadowTerrainMaskDrawIndicesScratch.clear();
@@ -6219,6 +6370,29 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         reconciliation.shadowMapDrawnCasters;
     stats.semanticSceneShadowMapCascadeCulledCount =
         reconciliation.cascadeCulledCount;
+    stats.semanticSceneUnionCullMode = reconciliation.unionCullMode;
+    stats.semanticSceneUnionCullObserveFrameCount =
+        reconciliation.unionCullObserveFrameCount;
+    stats.semanticSceneUnionCullCandidateCount =
+        reconciliation.unionCullCandidateCount;
+    stats.semanticSceneUnionCullProofAcceptedCount =
+        reconciliation.unionCullProofAcceptedCount;
+    stats.semanticSceneUnionCullFailVisibleCount =
+        reconciliation.unionCullFailVisibleCount;
+    stats.semanticSceneUnionCullDynamicConservativeCount =
+        reconciliation.unionCullDynamicConservativeCount;
+    stats.semanticSceneUnionCullUnknownOrStaleCount =
+        reconciliation.unionCullUnknownOrStaleCount;
+    stats.semanticSceneUnionCullC2WouldCullCount =
+        reconciliation.unionCullC2WouldCullCount;
+    stats.semanticSceneUnionCullC3WouldCullCount =
+        reconciliation.unionCullC3WouldCullCount;
+    stats.semanticSceneUnionCullBothFarWouldCullCount =
+        reconciliation.unionCullBothFarWouldCullCount;
+    stats.semanticSceneUnionCullFalseNegativeCount =
+        reconciliation.unionCullFalseNegativeCount;
+    stats.semanticSceneUnionCullFalsePositiveCount =
+        reconciliation.unionCullFalsePositiveCount;
     stats.semanticSceneShadowMapPreparedDrawCount =
         reconciliation.shadowMapPreparedDrawCount;
     stats.semanticSceneShadowMapAlphaTestPreparedCount =

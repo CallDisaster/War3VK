@@ -115,6 +115,7 @@ d3d9_src = [
   'war3/render/war3_shadow_runtime_bridge.cpp',
   'war3/render/war3_shadow_lifecycle.cpp',
   'war3/render/war3_shadow_producer_policy.cpp',
+  'war3/render/war3_union_consumer_visibility.cpp',
   'war3/render/war3_current_draw_contract.cpp',
   'war3/render/war3_scene_collector.cpp',
   'war3/render/war3_renderer.cpp',
@@ -220,6 +221,23 @@ d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
 d3d9_dep = declare_dependency(
   link_with           : [ d3d9_dll ],
   include_directories : [ dxvk_include_path ],
+)
+
+# Pure, runnable policy test. It does not link d3d9.dll and therefore cannot
+# mutate or accidentally exercise the live War3 render paths.
+war3_union_consumer_visibility_test = executable(
+  'war3_union_consumer_visibility_test',
+  [
+    'war3/render/war3_union_consumer_visibility.cpp',
+    'war3/render/tests/war3_union_consumer_visibility_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_union_consumer_visibility',
+  war3_union_consumer_visibility_test,
+  timeout : 30,
 )
 
 if platform != 'windows'
