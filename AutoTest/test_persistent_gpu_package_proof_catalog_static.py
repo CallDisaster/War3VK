@@ -27,6 +27,11 @@ CATALOG_FILENAMES = {
     "war3_persistent_gpu_package_proof_catalog.cpp",
     "war3_persistent_gpu_package_observer.h",
     "war3_persistent_gpu_package_observer.cpp",
+    # The isolated recording-authority value contract deliberately consumes
+    # the catalog's private Ready decision, but is not part of d3d9_src and
+    # cannot grant a production/runtime admission by itself.
+    "war3_persistent_gpu_package_recording_authority.h",
+    "war3_persistent_gpu_package_recording_authority.cpp",
 }
 LIVE_SOURCES = tuple(
     path

@@ -1,5 +1,36 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（Persistent Package P2 录制权限值合同，隔离提交、未接入）
+
+本阶段只定义 persistent package 从 P1 `UploadCompleted` 证明进入未来 Stage11/EmitCs
+录制前的单所有者事务合同。实现与 runnable 均未加入 Meson，生产代码没有 include、
+实例化或调用它；因此它不是 runtime Consume、不是实际命令录制，也没有改变已部署 DLL。
+
+**权限与事务边界**：
+
+- `CurrentStageSource` 持有真实 `ProofCatalog::SharedSnapshot` 和只能由 catalog 私有路径
+  铸造的 `PackageContentDecision`。create/record/seal/emit 四个边界均重新验证 exact
+  snapshot、UploadCompleted publication revision/canonical digest、当前 Stage11 source
+  generation、package/model/layout/material/alpha/world/bounds 全 tuple；默认构造、原始 POD
+  伪造和跨 snapshot Ready decision 均 fail-closed。
+- 单 recording owner 以 instance/transaction/seal generation、owner submission serial、
+  command-list/EmitCs generation 和 canonical batch digest 约束；最多 4096 条记录，4097
+  条拒绝。分配异常保持 Idle 可恢复，错序、缺项、seal 后写入、重复 seal 和 stale ticket
+  都不能发布部分命令。
+- authority 在 create 时复制并拥有 immutable record plan；callback 只能读取
+  `const RecordInput*` view。callback false 或抛异常只终结一次为 `CallbackFailed/Aborted`，
+  reentrant/并发 emit 最多执行一次，callback 已开始后 abort 返回 `EmitInProgress`。
+
+**验证与硬边界**：
+
+- P1/P2 静态合同 19/19 PASS；严格 i686 C++17 `-Wall -Wextra -Werror` runnable 构建通过，
+  50/50 独立进程压力轮次通过，包含 4096/4097、真实 allocation fault、外部 seal 后篡改、
+  throwing callback、stale flood 与 200-round at-most-once race。
+- 仍没有真实 D3D9/Stage11 adapter、EmitCs command-list mutation proof、producer/use fence、
+  多 primitive 或 Main/CSM/点阴影/outline 共享消费；runtime gate 不存在，不能通过开关启用。
+  下一阶段必须由真实 render owner 构造 context/source，接入 GPU fence 与失败时 exact Arena
+  fallback 后再讨论 Observe；本阶段没有部署、没有启动游戏。
+
 ## 🚨 2026-08-02（Persistent Package P1 不可变源码发布权限闭合，未部署）
 
 本阶段只建立静态/刚性模型进入 persistent GPU package 之前的不可变源码与发布权限
