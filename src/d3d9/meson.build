@@ -97,6 +97,7 @@ d3d9_src = [
   'jass/war3_hook.cpp',
   # War3 新模块
   'war3/war3.cpp',
+  'war3/bridge/war3_visual_bridge_v1.cpp',
   'war3/core/war3_memory.cpp',
   'war3/core/war3_crash_handler.cpp',
   'war3/core/war3_runtime_profile.cpp',

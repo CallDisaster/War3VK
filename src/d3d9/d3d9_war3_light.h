@@ -76,8 +76,9 @@ public:
     light.id = id;
     light.active = true;
     m_lights.push_back(light);
-    m_activeCount.store(static_cast<uint32_t>(m_lights.size()),
-                        std::memory_order_release);
+    m_liveCount.store(static_cast<uint32_t>(m_lights.size()),
+                      std::memory_order_release);
+    RecountActiveLocked();
     ++m_generation;
     InvalidateSnapshotLocked();
     return id;
@@ -120,7 +121,7 @@ public:
   bool SetPointLightShadowIntensity(int32_t id, float shadowIntensity) {
     std::lock_guard<std::mutex> lock(m_mutex);
     for (auto& light : m_lights) {
-      if (light.id != id || !light.active)
+      if (light.id != id)
         continue;
       light.params.x = ClampShadowIntensity(shadowIntensity);
       ++m_generation;
@@ -130,14 +131,82 @@ public:
     return false;
   }
 
+  bool SetPointLightActive(int32_t id, bool active) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& light : m_lights) {
+      if (light.id != id)
+        continue;
+      if (light.active == active)
+        return true;
+      light.active = active;
+      RecountActiveLocked();
+      ++m_generation;
+      InvalidateSnapshotLocked();
+      return true;
+    }
+    return false;
+  }
+
+  bool SetPointLightPosition(int32_t id, float x, float y, float z) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& light : m_lights) {
+      if (light.id != id)
+        continue;
+      light.position.x = x;
+      light.position.y = y;
+      light.position.z = z;
+      ++m_generation;
+      InvalidateSnapshotLocked();
+      return true;
+    }
+    return false;
+  }
+
+  bool SetPointLightColorIntensity(int32_t id, float r, float g, float b,
+                                   float intensity) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& light : m_lights) {
+      if (light.id != id)
+        continue;
+      light.color = Vector4(ClampNonNegative(r), ClampNonNegative(g),
+                            ClampNonNegative(b), ClampNonNegative(intensity));
+      ++m_generation;
+      InvalidateSnapshotLocked();
+      return true;
+    }
+    return false;
+  }
+
+  bool SetPointLightRadius(int32_t id, float range) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& light : m_lights) {
+      if (light.id != id)
+        continue;
+      light.position.w = std::max(1.0f, range);
+      ++m_generation;
+      InvalidateSnapshotLocked();
+      return true;
+    }
+    return false;
+  }
+
+  bool IsPointLightAlive(int32_t id) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return std::any_of(m_lights.begin(), m_lights.end(),
+                       [id](const War3PointLight& light) {
+                         return light.id == id;
+                       });
+  }
+
   bool RemovePointLight(int32_t id) {
     std::lock_guard<std::mutex> lock(m_mutex);
     for (auto it = m_lights.begin(); it != m_lights.end(); ++it) {
       if (it->id != id)
         continue;
       m_lights.erase(it);
-      m_activeCount.store(static_cast<uint32_t>(m_lights.size()),
-                          std::memory_order_release);
+      m_liveCount.store(static_cast<uint32_t>(m_lights.size()),
+                        std::memory_order_release);
+      RecountActiveLocked();
       ++m_generation;
       InvalidateSnapshotLocked();
       return true;
@@ -149,6 +218,7 @@ public:
     std::lock_guard<std::mutex> lock(m_mutex);
     m_lights.clear();
     m_hasTestLight = false;
+    m_liveCount.store(0u, std::memory_order_release);
     m_activeCount.store(0u, std::memory_order_release);
     ++m_generation;
     InvalidateSnapshotLocked();
@@ -170,8 +240,9 @@ public:
     light.id = ++m_nextId;
     light.active = true;
     m_lights.push_back(light);
-    m_activeCount.store(static_cast<uint32_t>(m_lights.size()),
-                        std::memory_order_release);
+    m_liveCount.store(static_cast<uint32_t>(m_lights.size()),
+                      std::memory_order_release);
+    RecountActiveLocked();
     ++m_generation;
     InvalidateSnapshotLocked();
   }
@@ -193,7 +264,7 @@ public:
   }
 
   uint32_t GetLightCount() const {
-    return m_activeCount.load(std::memory_order_acquire);
+    return m_liveCount.load(std::memory_order_acquire);
   }
 
   uint64_t GetGeneration() const {
@@ -273,6 +344,13 @@ private:
 
   void InvalidateSnapshotLocked() {
     m_snapshotValid = false;
+  }
+
+  void RecountActiveLocked() {
+    const uint32_t count = static_cast<uint32_t>(std::count_if(
+        m_lights.begin(), m_lights.end(),
+        [](const War3PointLight& light) { return light.active; }));
+    m_activeCount.store(count, std::memory_order_release);
   }
 
   void BuildSnapshotLocked(uint64_t frameSerial,
@@ -361,6 +439,7 @@ private:
 
   mutable std::mutex m_mutex;
   std::vector<War3PointLight> m_lights;
+  std::atomic<uint32_t> m_liveCount{0};
   std::atomic<uint32_t> m_activeCount{0};
   std::atomic<uint64_t> m_generation{1};
   int32_t m_nextId = 0;

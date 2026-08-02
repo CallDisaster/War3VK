@@ -34,6 +34,12 @@ constexpr size_t kNativeEntrySigPtrOffset = 0x24;
 constexpr size_t kNativeEntryRetTypeOffset = 0x38;
 
 constexpr const char *kWarVkPrefix = "warvk:";
+// Canonical public WarVK v1 traffic is owned by the clean-room carrier
+// runtime in war3map.dll.  This older DXVK bridge remains available only for
+// the internal AutoTest command vocabulary (warvk:ping, warvk:cmd:...).  It
+// must never consume a versioned public request, irrespective of hook install
+// order; forwarding reaches the Detours-patched stock implementation.
+constexpr const char *kWarVkV1Prefix = "warvk:v1;";
 constexpr uint32_t kMaxNativeStringBytes = 2048;
 
 using NativeVoidStringFn = void(__cdecl *)(uint32_t);
@@ -966,6 +972,11 @@ bool TryHandleCarrier(CarrierPatch &patch, uint32_t nativeArg, int *intResult,
                       uint32_t *stringResult) {
   std::string command;
   if (!DecodeNativeStringArg(nativeArg, command) || !StartsWith(command, kWarVkPrefix)) {
+    patch.passedThrough.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  if (StartsWith(command, kWarVkV1Prefix)) {
     patch.passedThrough.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
