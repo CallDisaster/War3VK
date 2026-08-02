@@ -4030,6 +4030,38 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   // records where that nearest blocker is terrain; the receiver then ignores
   // terrain-as-caster pixels so the terrain does not visibly project onto itself.
   if (terrainCasterMaskEnabled) {
+    // The mask pass opens the same depth attachment with LOAD and performs a
+    // read-only depth test. Dynamic-rendering instances do not create an
+    // implicit attachment dependency, so make the main CSM writes available
+    // before any early/late depth reads in the second instance.
+    VkImageMemoryBarrier2 mainDepthToTerrainMask = {
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    mainDepthToTerrainMask.srcStageMask =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    mainDepthToTerrainMask.srcAccessMask =
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    mainDepthToTerrainMask.dstStageMask =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    mainDepthToTerrainMask.dstAccessMask =
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    mainDepthToTerrainMask.oldLayout =
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    mainDepthToTerrainMask.newLayout =
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    mainDepthToTerrainMask.image = m_shadowMap->handle();
+    mainDepthToTerrainMask.subresourceRange = {
+        VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u, cascadeCount};
+
+    VkDependencyInfo mainDepthToTerrainMaskDependency = {
+        VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    mainDepthToTerrainMaskDependency.imageMemoryBarrierCount = 1u;
+    mainDepthToTerrainMaskDependency.pImageMemoryBarriers =
+        &mainDepthToTerrainMask;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer,
+                            &mainDepthToTerrainMaskDependency);
+
     uint32_t terrainMaskDraws = 0u;
     for (uint32_t c = 0; c < cascadeCount; c++) {
       if (!m_shadowMapLayerViews[c] || !m_shadowCasterMaskLayerViews[c])
@@ -4331,8 +4363,10 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   // 3) Transition shadow map back to read-only for sampling in receiver shader
   {
     VkImageMemoryBarrier2 toRead = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toRead.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    toRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toRead.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
     toRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -6919,8 +6953,10 @@ void War3ShadowReceiverPass::renderPointShadow(
 
   {
     VkImageMemoryBarrier2 toRead = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toRead.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    toRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toRead.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
     toRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -6964,6 +7000,7 @@ void War3ShadowReceiverPass::renderPointShadow(
       restoreRead.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
       restoreRead.srcAccessMask =
+          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
       restoreRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
       restoreRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;

@@ -479,6 +479,67 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra, v
   return vis0;
 }
 
+// A nearest-filtered cubemap lookup does not return the depth located on the
+// continuous input ray. It returns the depth stored at one quantized face
+// texel. Reconstruct that texel's centre ray so receiver-plane depth and the
+// fetched caster depth use the exact same radial direction.
+vec3 pointCubeNearestTexelRay(vec3 direction, float cubeResolution) {
+  vec3 axis = abs(direction);
+  float major = 0.0;
+  vec2 faceSt = vec2(0.0);
+  int face = 0;
+
+  // Match the Vulkan cube face table. Z > Y > X is deterministic for exact
+  // ties; the reconstructed centre ray lies strictly inside the selected face
+  // so the subsequent texture lookup cannot choose a different tie outcome.
+  if (axis.z >= axis.y && axis.z >= axis.x) {
+    major = max(axis.z, 1.0e-12);
+    if (direction.z >= 0.0) {
+      face = 4;
+      faceSt = vec2(direction.x, -direction.y) / major;
+    } else {
+      face = 5;
+      faceSt = vec2(-direction.x, -direction.y) / major;
+    }
+  } else if (axis.y >= axis.x) {
+    major = max(axis.y, 1.0e-12);
+    if (direction.y >= 0.0) {
+      face = 2;
+      faceSt = vec2(direction.x, direction.z) / major;
+    } else {
+      face = 3;
+      faceSt = vec2(direction.x, -direction.z) / major;
+    }
+  } else {
+    major = max(axis.x, 1.0e-12);
+    if (direction.x >= 0.0) {
+      face = 0;
+      faceSt = vec2(-direction.z, -direction.y) / major;
+    } else {
+      face = 1;
+      faceSt = vec2(direction.z, -direction.y) / major;
+    }
+  }
+
+  cubeResolution = max(cubeResolution, 1.0);
+  vec2 uv = clamp(faceSt * 0.5 + vec2(0.5), vec2(0.0), vec2(1.0));
+  vec2 texel = clamp(floor(uv * cubeResolution), vec2(0.0),
+                     vec2(cubeResolution - 1.0));
+  vec2 texelSt = ((texel + vec2(0.5)) / cubeResolution) * 2.0 - 1.0;
+
+  if (face == 0)
+    return vec3(1.0, -texelSt.y, -texelSt.x);
+  if (face == 1)
+    return vec3(-1.0, -texelSt.y, texelSt.x);
+  if (face == 2)
+    return vec3(texelSt.x, 1.0, texelSt.y);
+  if (face == 3)
+    return vec3(texelSt.x, -1.0, -texelSt.y);
+  if (face == 4)
+    return vec3(texelSt.x, -texelSt.y, 1.0);
+  return vec3(-texelSt.x, -texelSt.y, -1.0);
+}
+
 float samplePointShadowPcf(uint lightIndex, vec3 dir, float currentDist,
                            float shadowRange, float biasBase,
                            vec3 receiverNormalWorld,
@@ -560,18 +621,20 @@ float samplePointShadowPcf(uint lightIndex, vec3 dir, float currentDist,
     // direction, but costs 16 reciprocal-square-roots per shaded light.
     vec3 sampleDir =
       dirN + (tangent * taps[i].x + bitangent * taps[i].y) * pcfRadius;
+    vec3 texelRay = pointCubeNearestTexelRay(
+        sampleDir, cubeResolution);
     float receiverDepth = currentDepth;
     if (receiverPlaneValid) {
-      float sampleLenSq = dot(sampleDir, sampleDir);
-      float planeDenominator = dot(receiverNormal, sampleDir);
-      if (validFloat(sampleLenSq) && sampleLenSq > 1.0e-8 &&
+      float texelRayLenSq = dot(texelRay, texelRay);
+      float planeDenominator = dot(receiverNormal, texelRay);
+      if (validFloat(texelRayLenSq) && texelRayLenSq > 1.0e-8 &&
           validFloat(planeDenominator) && planeDenominator < -0.08) {
-        // sampleDir is homogeneous for cube lookup, but the radial depth is
-        // not. Normalize the ray for the plane intersection so every PCF tap
-        // compares against the depth of the same physical receiver plane.
-        float sampleDirLength = sqrt(sampleLenSq);
+        // The nearest lookup and receiver reference must name the same cube
+        // texel-centre ray. Using the continuous tap here creates a signed,
+        // quantized depth residual that becomes coherent grazing-angle bands.
+        float texelRayLength = sqrt(texelRayLenSq);
         float receiverPlaneDistance =
-            planeNumerator * sampleDirLength / planeDenominator;
+            planeNumerator * texelRayLength / planeDenominator;
         if (validFloat(receiverPlaneDistance) &&
             receiverPlaneDistance >= 0.0) {
           receiverDepth = clamp(
@@ -582,7 +645,7 @@ float samplePointShadowPcf(uint lightIndex, vec3 dir, float currentDist,
     float storedDepth = texture(
       samplerCubeArray(s_pointShadow,
         s_samplers[nonuniformEXT(pointShadow.u_samplerIndex)]),
-      vec4(sampleDir, float(lightIndex))).r;
+      vec4(texelRay, float(lightIndex))).r;
 
     visible += (receiverDepth > storedDepth + biasDepth) ? 0.0 : 1.0;
   }
@@ -1101,10 +1164,19 @@ void main() {
       float currentDist = length(lightToFrag);
       float shadowRange = max(ps.lightPos.w, 1.0);
       if (currentDist < shadowRange * 0.999) {
-        pointVis = samplePointShadowPcf(
-            debugLight, lightToFrag, currentDist, shadowRange, ps.bias,
-            -normalize(lightToFrag), 0.0);
-        activeMask = 1.0;
+        vec4 debugViewH = vec4(worldPos, 1.0) * ubo.u_view;
+        if (validVec4(debugViewH)) {
+          float pointNormalConfidence = 0.0;
+          vec3 pointNormV = computePointLightViewNormal(
+              debugViewH.xyz, pointNormalConfidence);
+          float normalTrust = smoothstep(
+              0.0, 0.35, clamp(pointNormalConfidence, 0.0, 1.0));
+          vec3 pointNormW = pointNormV * transpose(mat3(ubo.u_view));
+          pointVis = samplePointShadowPcf(
+              debugLight, lightToFrag, currentDist, shadowRange, ps.bias,
+              pointNormW, normalTrust);
+          activeMask = 1.0;
+        }
       }
     }
     o_color = (activeMask > 0.5)

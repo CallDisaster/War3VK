@@ -725,22 +725,23 @@ namespace dxvk {
         War3WorldCameraState m_lastGoodReceiverCamera = {};
         bool m_hasLastGoodReceiverCamera = false;
 
-        // Vertex blending palette buffer (WorldMatrices[paletteIndex*256 + i])
-        // Uses a ring buffer to avoid CPU/GPU data races across frames-in-flight.
-        // Several passes can consume the shared shadow-matrix SSBO in the same
-        // frame (shadow map, outline mask, unit outline), and high caster load
-        // can leave several frames in flight. Three slices can overwrite a
-        // slice still referenced by queued GPU work, which presents as regular
-        // skinned-shadow flicker. Keep this ring deliberately wider than the
-        // nominal swapchain frame count and per-frame pass count.
-        static constexpr uint32_t kPaletteRingCount = 12;
+        // Vertex blending palettes and per-draw world matrices. Every upload
+        // owns a complete buffer backing until DXVK resource tracking proves
+        // that all GPU reads have completed. A fixed modulo ring is not an
+        // ownership protocol: a delayed GPU can still be reading the slice
+        // selected by the CPU after wraparound.
+        struct ShadowMatrixUploadSlot {
+            Rc<DxvkBuffer> buffer;
+            void* mapPtr = nullptr;
+            VkDeviceSize capacity = 0u;
+        };
+        static constexpr uint32_t kShadowMatrixUploadPoolLimit = 32u;
+        std::vector<ShadowMatrixUploadSlot> m_shadowMatrixUploadSlots;
         Rc<DxvkBuffer> m_vertexBlendPaletteBuffer;
         Rc<DxvkBuffer> m_dummyPaletteBuffer; // 点光源阴影未使用骨骼时的占位SSBO
         void* m_vertexBlendPaletteMapPtr = nullptr;
         VkDeviceSize m_vertexBlendPaletteCapacity = 0;
-        VkDeviceSize m_paletteStride = 0;        // Per-ring-segment stride (only grows, never shrinks)
-        uint64_t m_paletteFrameId = 0;           // Frame counter for ring rotation
-        uint32_t m_paletteBaseMatrixIndex = 0;   // Base matrix index for current frame (set after upload)
+        uint32_t m_paletteBaseMatrixIndex = 0;   // Renamed buffers always start at matrix zero
 
         // 当前帧矩阵缓冲区 slice（包含：骨骼调色板 + 每个 draw 的 worldMatrix）
         // 说明：用于统一 shadow caster / outline mask / unit outline 的矩阵来源，避免 ring offset 不一致导致读取错位。
@@ -748,7 +749,7 @@ namespace dxvk {
         uint64_t m_shadowMatrixUploadedFrame = 0; // RenderObjectRegistry::getFrameNumber()
         uint32_t m_shadowMatrixObjectBase = 0;    // = paletteCount * 256
         uint64_t m_shadowMatrixSceneKey = 0;       // palette/world-matrix content key for same-frame semantic updates
-        uint64_t m_shadowMatrixUploadSerial = 0;   // advances only on real uploads; selects the ring slice
+        uint64_t m_shadowMatrixUploadSerial = 0;   // advances only on real, completion-safe uploads
         uint64_t m_shadowMapRenderSerial = 0;      // advances only after a real shadow map render
 
         Rc<DxvkImage> m_shadowMap;

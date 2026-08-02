@@ -1,5 +1,60 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（研究报告二次修复：点阴影 texel-center、深度同步与矩阵所有权）
+
+用户提供的两份静态研究报告指出三个可独立造成条带、低频裂口或单帧错误的源码
+合同。本轮在上一份 `5343...` 发布候选上逐项落地，不通过扩大 PCF、提高 bias、
+延长 grace 或恢复跨帧几何缓存掩盖问题。
+
+**点阴影比较域修复**：
+
+- 点阴影 cube 使用 nearest sampler，但旧 receiver-plane PCF 以连续 `sampleDir`
+  求接收面径向深度，再与量化 texel 中保存的 caster 深度比较；两者不在同一条射线
+  上，斜视角会形成有符号、随 texel 跳变的深度残差，表现为稳定条带/摩尔纹。
+- receiver shader 新增 Vulkan cube 六面选择、texel floor 与 texel-center 射线重建。
+  每个现有 16-tap 同时用同一 `texelRay` 求接收面深度和采样 cube；采样数、D32
+  径向深度格式及点阴影过滤半径均未增加。
+- point-shadow debug mode 6 不再传入固定 `confidence=0`，而是复用生产路径的
+  view-normal 重建、置信度和平面比较，因此调试输出现在能真实覆盖该修复。
+
+**Vulkan 深度同步修复**：
+
+- CSM 与 point-cube 的 attachment→sample 最终 barrier 均覆盖
+  `EARLY_FRAGMENT_TESTS | LATE_FRAGMENT_TESTS` 和 depth attachment
+  `READ | WRITE`；异常恢复路径采用相同合同。
+- CSM 主 caster 与 terrain-mask 两个 dynamic-rendering instance 之间新增显式
+  depth write→read dependency。mask 的 LOAD/read-only depth test 不再依赖不存在的
+  隐式 render-pass dependency。
+- 通用 ShaderPack 的 depth read-only 往返 barrier 同步扩展到 Early/Late 与
+  depth read/write，避免同类遗漏从旁路重新进入。
+
+**矩阵上传所有权修复**：
+
+- 删除固定 `12` 段、仅按 upload serial 取模的 shadow matrix SSBO ring。旧 ring
+  没有 GPU 完成证明，GPU 延迟超过窗口时 CPU 可以覆盖仍被 caster/outline 读取的
+  palette/world matrix。
+- 改为最多 32 个 backing 的有界 allocation-renaming pool；只有
+  `DxvkBuffer::isInUse(DxvkAccess::Read)==false` 的槽位才允许覆写，每个选择后的
+  buffer 由 command-list resource tracker 持有到 GPU 完成。池全部在途时当帧
+  fail-closed，不覆盖旧矩阵，也不回退固定环。
+
+**静态、构建与部署**：
+
+- 新增 nearest cube texel、深度 barrier 与矩阵 backing ownership 合同；全部
+  `test_*static.py` 共 384 tests PASS，其中 shadow 专项 176 tests、报告新增/更新
+  专项 18 tests、相关 persistent/ownership 专项 45 tests。
+- `glslang` 编译通过；`spirv-val --uniform-buffer-standard-layout` 通过。Win32
+  全量 build 成功，随后 `ninja -C build32 -n` 为 no-work；targeted
+  `git diff --check` 仅既有 CRLF 提示。
+- `build32` 与部署 `E:\Work\War3\d3d9.dll` exact：33,200,899 bytes，SHA-256
+  `9EC8101F9660B53F98614CEF215451412DC30C991577488B72E3A418CE89D11E`；部署前回退
+  `E:\Work\War3\d3d9.dll.bak_20260802_222313_5343_pre_point_texel_depth_sync`。
+
+**验收边界**：本轮未启动游戏。静态合同已修复报告中确定存在的问题，但点阴影
+摩尔纹与低频单帧裂口仍须用户在物理画面做固定点光/移动相机与 1--2 分钟长门；
+通过之前不得宣称视觉问题完全解决。工作树中既有的根层扁平副本删除、
+`StormBreaker` WIP、日志及研究输出均未触碰、未纳入本轮范围。
+
 ## 🚨 2026-08-02（低频阴影裂口硬化 + 点阴影 receiver-plane PCF）
 
 用户继续报告两项物理屏残留：方向/单位阴影偶发单帧撕裂或缺口，以及点光 cube

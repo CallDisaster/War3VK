@@ -895,30 +895,74 @@ DxvkResourceBufferInfo War3ShadowReceiverPass::ensureShadowMatrixBuffer(
   const VkDeviceSize requiredStride =
       (requiredBytes + (align - 1u)) & ~(align - 1u);
 
-  if (!m_vertexBlendPaletteBuffer || m_paletteStride < requiredStride) {
-    m_paletteStride = requiredStride;
-    m_vertexBlendPaletteCapacity = m_paletteStride * kPaletteRingCount;
+  // Allocation renaming pool: plain Rc ownership keeps slots resident, while
+  // DxvkAccess::Read is released only after the command list has completed on
+  // the GPU. Never write a host-visible slot while that access is still live.
+  size_t selectedSlot = m_shadowMatrixUploadSlots.size();
+  size_t replaceableSlot = m_shadowMatrixUploadSlots.size();
+  VkDeviceSize selectedCapacity = ~VkDeviceSize(0u);
+  for (size_t i = 0u; i < m_shadowMatrixUploadSlots.size(); ++i) {
+    const auto& slot = m_shadowMatrixUploadSlots[i];
+    if (!slot.buffer || slot.buffer->isInUse(DxvkAccess::Read))
+      continue;
+
+    if (slot.capacity >= requiredStride) {
+      if (slot.capacity < selectedCapacity) {
+        selectedSlot = i;
+        selectedCapacity = slot.capacity;
+      }
+    } else if (replaceableSlot == m_shadowMatrixUploadSlots.size()) {
+      replaceableSlot = i;
+    }
+  }
+
+  if (selectedSlot == m_shadowMatrixUploadSlots.size()) {
+    if (replaceableSlot == m_shadowMatrixUploadSlots.size() &&
+        m_shadowMatrixUploadSlots.size() >=
+            kShadowMatrixUploadPoolLimit) {
+      // GPU completion has not released any suitable backing. Missing one
+      // shadow frame is preferable to overwriting matrices still in flight.
+      return {};
+    }
 
     DxvkBufferCreateInfo bufInfo = {};
-    bufInfo.size = m_vertexBlendPaletteCapacity;
+    bufInfo.size = requiredStride;
     bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     bufInfo.stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
     bufInfo.access = VK_ACCESS_SHADER_READ_BIT;
     bufInfo.debugName = "War3ShadowMatricesSSBO";
 
-    m_vertexBlendPaletteBuffer = m_device->createBuffer(
+    ShadowMatrixUploadSlot newSlot = {};
+    newSlot.buffer = m_device->createBuffer(
         bufInfo, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    m_vertexBlendPaletteMapPtr = m_vertexBlendPaletteBuffer->mapPtr(0u);
+    if (!newSlot.buffer)
+      return {};
+    newSlot.mapPtr = newSlot.buffer->mapPtr(0u);
+    newSlot.capacity = requiredStride;
+    if (newSlot.mapPtr == nullptr)
+      return {};
+
+    if (replaceableSlot != m_shadowMatrixUploadSlots.size()) {
+      m_shadowMatrixUploadSlots[replaceableSlot] = std::move(newSlot);
+      selectedSlot = replaceableSlot;
+    } else {
+      m_shadowMatrixUploadSlots.push_back(std::move(newSlot));
+      selectedSlot = m_shadowMatrixUploadSlots.size() - 1u;
+    }
   }
 
-  if (!m_vertexBlendPaletteBuffer || m_vertexBlendPaletteMapPtr == nullptr)
+  auto& uploadSlot = m_shadowMatrixUploadSlots[selectedSlot];
+  m_vertexBlendPaletteBuffer = uploadSlot.buffer;
+  m_vertexBlendPaletteMapPtr = uploadSlot.mapPtr;
+  m_vertexBlendPaletteCapacity = uploadSlot.capacity;
+  if (!m_vertexBlendPaletteBuffer || m_vertexBlendPaletteMapPtr == nullptr ||
+      m_vertexBlendPaletteCapacity < requiredBytes)
     return {};
 
-  const uint32_t ringIndex =
-      uint32_t((m_shadowMatrixUploadSerial++) % kPaletteRingCount);
-  const VkDeviceSize baseOffset = VkDeviceSize(ringIndex) * m_paletteStride;
-  m_paletteBaseMatrixIndex = uint32_t(baseOffset / sizeof(Matrix4));
+  ++m_shadowMatrixUploadSerial;
+  const VkDeviceSize baseOffset = 0u;
+  m_paletteBaseMatrixIndex = 0u;
 
   Matrix4 *dst = reinterpret_cast<Matrix4 *>(
       reinterpret_cast<uint8_t *>(m_vertexBlendPaletteMapPtr) + baseOffset);
