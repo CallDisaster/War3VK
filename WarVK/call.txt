@@ -1,122 +1,69 @@
-[WarVK_Load]
-title = "启动 WarVK 加载"
-description = "启动 WarVK 加载并返回当前是否已经就绪"
-comment = "第一次调用通常返回 false，因为加载请求和轮询是异步的"
-category = TC_WARVK_LOADER
-returns = boolean
-
-[WarVK_IsLoaded]
-title = "WarVK 是否已加载"
-description = "检查 WarVK bridge 是否已经就绪"
-comment = "返回 true 后即可调用渲染、闪电与调试 API"
-category = TC_WARVK_LOADER
-returns = boolean
-
-[WarVK_RequestDllLoadByLua]
-title = "请求 Lua 加载 WarVK"
-description = "通过 YDWE exec-lua 请求加载 WarVK.dll"
-comment = "需要地图/环境已有 exec-lua 支持"
-category = TC_WARVK_LOADER
-returns = boolean
-
-[WarVK_RequestDllLoadByMemory]
-title = "请求内存桥加载 WarVK"
-description = "尝试通过非 Lua 内存桥加载 WarVK.dll"
-comment = "当前只是 clean-room 占位，返回 false；没有复制 MemHack 实现"
-category = TC_WARVK_LOADER
-returns = boolean
-
-[WarVK_RequestDllLoadByAi]
-title = "请求 AI 桥加载 WarVK"
-description = "通过 StartCampaignAI 启动 warvk.ai"
-comment = "当前 warvk.ai 会优先从地图导出 warvk.blp 到临时 DLL 后加载，失败再尝试 LoadLibraryA(\"WarVK.dll\")"
-category = TC_WARVK_LOADER
-returns = boolean
-
-[WarVK_GetLoaderMode]
-title = "获取 WarVK 加载模式"
-description = "获取 WarVK 当前加载模式"
-comment = "0=外部加载，1=YDWE exec-lua，2=内存桥，3=AI桥"
-category = TC_WARVK_LOADER
-returns = WARVK_LOADER_MODE
-
-[WarVK_GetLoaderModeString]
-title = "获取加载模式文本"
-description = "获取 WarVK 当前加载模式文本"
-comment = "便于在地图内显示调试信息"
-category = TC_WARVK_LOADER
+[WarVKGetVersion]
+title = "获取 WarVK 版本"
+description = "返回 WarVK API 版本文本。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetVersion"
 returns = string
-
-[WarVK_GetLastLoadRouteString]
-title = "获取最后加载路线"
-description = "获取 WarVK 最后一次请求加载的路线"
-comment = "例如 exec-lua:warvk_loader"
-category = TC_WARVK_LOADER
-returns = string
-
-[WarVK_GetLocalLoadErrorString]
-title = "获取本地加载错误"
-description = "获取 WarVK JASS 层记录的加载错误"
-comment = "bridge 未就绪时优先看这个"
-category = TC_WARVK_LOADER
-returns = string
-
-[WarVK_GetLastErrorString]
-title = "获取 WarVK 最后错误"
-description = "获取 WarVK 最后错误"
-comment = "bridge ready 后读取 DLL 侧错误；未 ready 时返回 JASS 本地加载错误"
-category = TC_WARVK_LOADER
-returns = string
-
-[WarVK_GetVersionString]
-title = "获取 WarVK 版本文本"
-description = "获取 WarVK DLL 版本文本"
-comment = "未加载时返回空字符串"
-category = TC_WARVK_DEBUG
-returns = string
-
-[WarVK_GetStatsString]
-title = "获取 WarVK 状态文本"
-description = "获取 WarVK DLL 状态文本"
-comment = "未加载时返回空字符串"
-category = TC_WARVK_DEBUG
-returns = string
-
-[DXVK_GetGameTimeSeconds]
-title = "获取游戏时间秒"
-description = "获取游戏时间（秒）"
-comment = "返回秒级时间戳"
-category = TC_WARVK_TIME
-returns = real
-
-[DXVK_GetTimeOfDay]
-title = "获取昼夜时间"
-description = "获取昼夜时间（0~24）"
-comment = "0 表示午夜，12 表示中午"
-category = TC_WARVK_TIME
-returns = real
-
-[DXVK_GetGameVersion]
-title = "获取游戏版本"
-description = "获取游戏版本号"
-comment = "1.27a 返回 0x27a"
-category = TC_WARVK_DEBUG
-returns = integer
-
-[DXVK_BloomGetBoost]
-title = "获取 Bloom 强度"
-description = "获取对象 Bloom 提示强度 ${handle}"
-comment = "返回 0 表示未标记"
-category = TC_WARVK_BLOOM
-returns = real
 [[.args]]
-type = integer
+type = nothing
 
-[AddPointLight]
+[WarVKGetProtocolVersion]
+title = "获取协议版本"
+description = "返回协议版本整数。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetProtocolVersion"
+returns = integer
+[[.args]]
+type = nothing
+
+[WarVKGetLastErrorCode]
+title = "获取最后错误码"
+description = "返回最后错误码。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetLastErrorCode"
+returns = integer
+[[.args]]
+type = nothing
+
+[WarVKGetLastError]
+title = "获取最后错误文本"
+description = "返回稳定英文错误文本。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetLastError"
+returns = string
+[[.args]]
+type = nothing
+
+[WarVKGetFeatureFlags]
+title = "获取功能标志"
+description = "返回运行时后端声明的功能位。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetFeatureFlags"
+returns = integer
+[[.args]]
+type = nothing
+
+[WarVKIsRuntimeReady]
+title = "查询运行时就绪"
+description = "查询 WarVK 运行时是否就绪。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKIsRuntimeReady"
+returns = boolean
+[[.args]]
+type = nothing
+
+[WarVKCreatePointLight]
 title = "创建点光源"
-description = "创建点光源 ${x}, ${y}, ${z}, ${range}, ${r}, ${g}, ${b}, ${intensity}, ${shadowIntensity}"
-comment = "x,y,z=世界坐标；range=范围；r,g,b=颜色；intensity=强度；shadowIntensity=阴影强度(0=无)"
-category = TC_WARVK_POINTLIGHT
+description = "以位置 ${x}、${y}、${z}、半径 ${radius}、颜色 ${red}、${green}、${blue}、强度 ${intensity} 创建点光并返回 WarVK id。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKCreatePointLight"
 returns = integer
 [[.args]]
 type = real
@@ -134,81 +81,133 @@ type = real
 type = real
 [[.args]]
 type = real
-[[.args]]
-type = real
 
-[UpdatePointLight]
-title = "更新点光源"
-description = "更新点光源 ${id}, ${x}, ${y}, ${z}, ${range}, ${r}, ${g}, ${b}, ${intensity}"
-comment = "id=点光源ID；x,y,z=世界坐标；range=范围；r,g,b=颜色；intensity=强度"
-category = TC_WARVK_POINTLIGHT
-returns = boolean
-[[.args]]
-type = integer
-[[.args]]
-type = real
-[[.args]]
-type = real
-[[.args]]
-type = real
-[[.args]]
-type = real
-[[.args]]
-type = real
-[[.args]]
-type = real
-[[.args]]
-type = real
-[[.args]]
-type = real
-
-[RemovePointLight]
-title = "移除点光源"
-description = "删除点光源 ${id}"
-comment = "id=点光源ID"
-category = TC_WARVK_POINTLIGHT
+[WarVKIsPointLightAlive]
+title = "查询点光存活"
+description = "查询 WarVK 点光 id ${lightId} 是否存活。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKIsPointLightAlive"
 returns = boolean
 [[.args]]
 type = integer
 
-[DXVK_GetPluginVersion]
-title = "获取插件版本"
-description = "获取插件版本"
-comment = "返回插件版本"
-category = TC_WARVK_DEBUG
+[WarVKCreateLightning]
+title = "创建闪电"
+description = "以起点 ${startX}、${startY}、${startZ}、终点 ${endX}、${endY}、${endZ}、颜色 ${red}、${green}、${blue}、${alpha}、宽度 ${width} 创建闪电并返回 WarVK id。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKCreateLightning"
 returns = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
 
-[DXVK_GetPluginVersionString]
-title = "获取插件版本字符串"
-description = "获取插件版本字符串"
-comment = "返回插件版本字符串"
-category = TC_WARVK_DEBUG
-returns = string
+[WarVKIsLightningAlive]
+title = "查询闪电存活"
+description = "查询 WarVK 闪电 id ${lightningId} 是否存活。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKIsLightningAlive"
+returns = boolean
+[[.args]]
+type = integer
 
-[TestIntReturn]
-title = "测试整数返回"
-description = "测试整数返回"
-comment = "返回 0"
-category = TC_WARVK_DEBUG
+[WarVKGetManagedObjectCount]
+title = "查询托管对象数量"
+description = "只读返回 WarVK 托管对象数量。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetManagedObjectCount"
 returns = integer
+[[.args]]
+type = nothing
 
-[TestFloatReturn]
-title = "测试浮点数返回"
-description = "测试浮点数返回"
-comment = "返回 0.0"
-category = TC_WARVK_DEBUG
+[WarVKIsManagedObjectAlive]
+title = "查询托管对象存活"
+description = "只读查询 WarVK 对象 id ${objectId} 是否存活。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKIsManagedObjectAlive"
+returns = boolean
+[[.args]]
+type = integer
+
+[WarVKGetManagedObjectType]
+title = "查询托管对象类型"
+description = "只读返回 WarVK 对象 id ${objectId} 的类型。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetManagedObjectType"
+returns = integer
+[[.args]]
+type = integer
+
+[WarVKGetVisualTimeSeconds]
+title = "查询视觉时间"
+description = "只读返回渲染时间秒数。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetVisualTimeSeconds"
 returns = real
+[[.args]]
+type = nothing
 
-[TestStringReturn]
-title = "测试字符串返回"
-description = "测试字符串返回"
-comment = "返回 Hello"
-category = TC_WARVK_DEBUG
-returns = string
+[WarVKGetFrameIndex]
+title = "查询帧序号"
+description = "只读返回渲染帧序号。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetFrameIndex"
+returns = integer
+[[.args]]
+type = nothing
 
-[TestBooleanReturn]
-title = "测试布尔值返回"
-description = "测试布尔值返回"
-comment = "返回 true"
-category = TC_WARVK_DEBUG
-returns = boolean
+[WarVKGetFramesPerSecond]
+title = "查询帧率"
+description = "只读返回渲染帧率。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetFramesPerSecond"
+returns = real
+[[.args]]
+type = nothing
+
+[WarVKGetFrameTimeMilliseconds]
+title = "查询帧耗时"
+description = "返回帧耗时毫秒。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetFrameTimeMilliseconds"
+returns = real
+[[.args]]
+type = nothing
+
+[WarVKGetDrawCallCount]
+title = "查询绘制调用数"
+description = "只读返回最近一帧绘制调用数。"
+comment = ""
+category = "TC_WarVK"
+script = "WarVKGetDrawCallCount"
+returns = integer
+[[.args]]
+type = nothing

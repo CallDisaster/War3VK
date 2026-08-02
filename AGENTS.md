@@ -34,12 +34,15 @@
 
 **地图侧交付**：
 
-- WarVK/v1/jass/warvk_v1_complete.j：公共常量与 55 个 WarVK... wrapper 的单文件库；
-- WarVK/v1/jass/warvk_v1_smoke_test.j：可选的 begin/finish 两阶段点光验收；点光会
-  保留到截图完成后再由地图显式销毁，确保真实跨越渲染帧；
-- WarVK/v1/editor：TriggerData、TriggerStrings 与 MapUI action/call/define；
-- WarVK/v1/manifest/warvk_v1.json 保持 clean-room 原文件 exact SHA-256
-  920872221B3836A5EFF69D3EC721915B21E0C4B5399C0F09F05B028CF46D27BF。
+- `WarVK` 根目录现在是唯一发布面：YDWE 直接读取根目录 `action.txt`、`call.txt`、
+  `define.txt`；`jass/warvk_init.j` 引入 loader bridge、公共常量与完整 55-command
+  `jass/warvk_api.j`。
+- `jass/warvk_smoke_test.j` 提供 begin/finish 两阶段点光验收；点光会保留到截图完成
+  后再由地图显式销毁，确保真实跨越渲染帧。
+- 删除平行的 `WarVK/v1`、旧 `jass/API`、空 event、重复 TriggerData/TriggerStrings、
+  manifest/test/integration 副本及两份重复 README。发布树只保留 12 个必要文件。
+- JASS 函数和 YDWE description/comment 已删除逐函数重复的“仅限本地视觉/禁止多人
+  同步分支”警告；UI 文本只描述函数实际作用。
 
 **静态与构建门**：
 
@@ -47,11 +50,14 @@
   JAPI/point-shadow/persistent-package runnable 全 PASS。
 - 全部 366 项 DXVK static 合同 PASS，覆盖 JAPI、TAA、4096 CSM、Arena fence、
   point shadow、alpha、blocker、Stage11 exact 和 final-caster。
-- clean-room 原实现 6 个 Release C++ executable 与 9 个 codegen tests PASS；
-  8 个复制生成资产逐字 hash 一致。
-- YDWE runtime-24 pjass 对 common.j + blizzard.j + complete JASS + smoke test
-  共 13,076 行解析成功。Win32 d3d9.dll build 成功：33,179,964 bytes，SHA-256
-  9F9BFB865EE9FAD3A45B269411BCB9D9E7E2A10D11F2D21690DD7736542CEA56。
+- YDWE runtime-24 pjass 对 common.j + blizzard.j + 根目录 public API + smoke test
+  共 12,960 行解析成功。
+- 真实 YDWE `triggerdata.lua → new-reader/old-writer → wtg_checker` 数据库门通过：
+  action=1645、call=1664、condition=40、event=100，现图 823 个引用全部接受；参数
+  数量与顺序门均通过，`unknownui` 恢复为 false。
+- Win32 d3d9.dll build 成功：33,179,964 bytes，SHA-256
+  9F9BFB865EE9FAD3A45B269411BCB9D9E7E2A10D11F2D21690DD7736542CEA56；
+  `WarVK/bin/WarVK.dll` 与地图载荷 `WarVK/bin/warvk.blp` 已重新打包并逐字一致。
 
 **边界**：本轮没有编辑或启动地图。只有用户在旁路候选地图实际确认 version、
 feature flags、create 正数 id、count 增减和可见点阴影之后，才能把“地图已经成功

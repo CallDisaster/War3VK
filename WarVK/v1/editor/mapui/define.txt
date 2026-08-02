@@ -1,3 +1,0 @@
-[TriggerCategories]
-
-TC_WarVK=[WarVK 本地视觉·禁玩法分支],ReplaceableTextures\\CommandButtons\\BTNReplay-Play.blp

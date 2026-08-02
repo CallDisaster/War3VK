@@ -1,14 +1,15 @@
-import hashlib
-import json
 import re
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST_PATH = ROOT / "WarVK/v1/manifest/warvk_v1.json"
-JASS_PATH = ROOT / "WarVK/v1/jass/warvk_v1.j"
-SMOKE_JASS_PATH = ROOT / "WarVK/v1/jass/warvk_v1_smoke_test.j"
+WARVK_ROOT = ROOT / "WarVK"
+JASS_PATH = WARVK_ROOT / "jass/warvk_api.j"
+SMOKE_JASS_PATH = WARVK_ROOT / "jass/warvk_smoke_test.j"
+INIT_JASS_PATH = WARVK_ROOT / "jass/warvk_init.j"
+ACTION_PATH = WARVK_ROOT / "action.txt"
+CALL_PATH = WARVK_ROOT / "call.txt"
 RUNTIME_PATH = ROOT / "src/d3d9/war3/japi/war3_japi_v1.cpp"
 BRIDGE_PATH = ROOT / "src/d3d9/war3/hooks/war3_jass_command_bridge.cpp"
 LIGHTNING_HEADER = ROOT / "src/d3d9/war3/render/war3_lightning_runtime.h"
@@ -18,69 +19,85 @@ LIGHTNING_SOURCE = ROOT / "src/d3d9/war3/render/war3_lightning_runtime.cpp"
 class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.manifest_bytes = MANIFEST_PATH.read_bytes()
-        cls.manifest = json.loads(cls.manifest_bytes)
         cls.jass = JASS_PATH.read_text(encoding="utf-8")
         cls.smoke_jass = SMOKE_JASS_PATH.read_text(encoding="utf-8")
+        cls.init_jass = INIT_JASS_PATH.read_text(encoding="utf-8")
+        cls.action = ACTION_PATH.read_text(encoding="utf-8")
+        cls.call = CALL_PATH.read_text(encoding="utf-8")
         cls.runtime = RUNTIME_PATH.read_text(encoding="utf-8")
         cls.bridge = BRIDGE_PATH.read_text(encoding="utf-8")
 
-    def test_manifest_is_the_exact_clean_room_source(self):
-        self.assertEqual(
-            hashlib.sha256(self.manifest_bytes).hexdigest().upper(),
-            "920872221B3836A5EFF69D3EC721915B21E0C4B5399C0F09F05B028CF46D27BF",
-        )
-        self.assertEqual(len(self.manifest["commands"]), 55)
-        self.assertFalse(
-            self.manifest["provenance"]["restrictedImplementationConsulted"]
-        )
+    def test_public_package_uses_the_existing_warvk_layout(self):
+        self.assertFalse((WARVK_ROOT / "v1").exists())
+        for path in (
+            ACTION_PATH,
+            CALL_PATH,
+            WARVK_ROOT / "define.txt",
+            JASS_PATH,
+            SMOKE_JASS_PATH,
+        ):
+            self.assertTrue(path.is_file(), path)
+        self.assertIn('#include "warvk_api.j"', self.init_jass)
+        self.assertNotIn('API/warvk_render.j', self.init_jass)
+        self.assertNotIn('API/warvk_lightning.j', self.init_jass)
 
-    def test_cpp_command_table_matches_manifest(self):
+    def test_cpp_command_table_matches_public_jass(self):
         rows = re.findall(
             r'\{CommandId::\w+,\s*"([^"]+)",\s*Carrier::(\w+),\s*'
             r'"([bird]*)",\s*[^,]+,\s*(true|false)\}',
             self.runtime,
         )
         self.assertEqual(len(rows), 55)
-        by_name = {
-            name: (carrier, signature, required == "true")
-            for name, carrier, signature, required in rows
+        cpp_commands = {
+            name: (carrier, signature)
+            for name, carrier, signature, _required in rows
         }
-        carrier_names = {
-            "preloader": "Preloader",
-            "hotkey": "Hotkey",
-            "localized_string": "LocalizedString",
-        }
-        type_codes = {"bool": "b", "i32": "i", "id": "d", "real": "r"}
-        for command in self.manifest["commands"]:
-            self.assertIn(command["name"], by_name)
-            carrier, signature, required = by_name[command["name"]]
-            self.assertEqual(carrier, carrier_names[command["carrier"]])
-            self.assertEqual(
-                signature,
-                "".join(type_codes[arg["type"]] for arg in command["args"]),
-            )
-            self.assertEqual(required, command["backendRequired"])
+        self.assertEqual(len(cpp_commands), 55)
 
-    def test_all_public_jass_wrappers_match_manifest_carriers(self):
         self.assertNotIn("JapiFunc", self.jass)
         self.assertNotRegex(self.jass, r"(?m)^\s*native\s+WarVK")
-        for command in self.manifest["commands"]:
-            block_match = re.search(
-                rf"function\s+{re.escape(command['jassName'])}\s+takes\b"
-                rf".*?\bendfunction",
-                self.jass,
-                re.DOTALL,
-            )
-            self.assertIsNotNone(block_match, command["jassName"])
-            block = block_match.group(0)
-            self.assertIn(f"warvk:v1;{command['name']}", block)
-            expected_native = {
-                "preloader": "Preloader(payload)",
-                "hotkey": "GetLocalizedHotkey(payload)",
-                "localized_string": "GetLocalizedString(payload)",
-            }[command["carrier"]]
-            self.assertIn(expected_native, block)
+        jass_commands = {}
+        public_functions = set()
+        for match in re.finditer(
+            r"function\s+(WarVK\w+)\s+takes\b.*?\bendfunction",
+            self.jass,
+            re.DOTALL,
+        ):
+            function_name = match.group(1)
+            block = match.group(0)
+            command_match = re.search(r'"warvk:v1;([^"]+)"', block)
+            if not command_match:
+                continue
+            command_name = command_match.group(1)
+            self.assertNotIn(command_name, jass_commands)
+            if "Preloader(payload)" in block:
+                carrier = "Preloader"
+            elif "GetLocalizedHotkey(payload)" in block:
+                carrier = "Hotkey"
+            elif "GetLocalizedString(payload)" in block:
+                carrier = "LocalizedString"
+            else:
+                self.fail(f"{function_name} has no recognized carrier")
+            signature = "".join(re.findall(r'";([bird]):"', block))
+            jass_commands[command_name] = (carrier, signature)
+            public_functions.add(function_name)
+
+        self.assertEqual(jass_commands, cpp_commands)
+        ui_scripts = set(
+            re.findall(r'(?m)^script = "(WarVK\w+)"$', self.action + self.call)
+        )
+        self.assertEqual(ui_scripts, public_functions)
+
+    def test_public_jass_and_ui_have_concise_descriptions(self):
+        combined = self.jass + self.smoke_jass + self.action + self.call
+        for banned in (
+            "本地",
+            "仅限本地视觉",
+            "禁止用于多人同步玩法分支",
+            "多人同步玩法",
+            "local_visual_only",
+        ):
+            self.assertNotIn(banned, combined)
 
     def test_dxvk_is_the_single_versioned_carrier_owner(self):
         self.assertIn('#include "../japi/war3_japi_v1.h"', self.bridge)

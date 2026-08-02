@@ -1,9 +1,3 @@
-// Optional local visual smoke test. Import after warvk_v1.j or
-// warvk_v1_complete.j. These functions change only WarVK-owned local
-// rendering state.
-//
-// Keep the returned id alive for at least one rendered frame. After taking a
-// screenshot, pass that id to WarVKFinishPointLightSmokeTest.
 function WarVKBeginPointLightSmokeTest takes real x, real y, real z returns integer
     local integer before = WarVKGetManagedObjectCount()
     local integer lightId = WarVKCreatePointLight(x, y, z, 900.00, 0.25, 0.70, 1.00, 4.00)

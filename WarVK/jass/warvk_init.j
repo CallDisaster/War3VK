@@ -5,8 +5,7 @@
 // so the map can pass native-table validation before WarVK is loaded.
 
 #include "warvk_bridge.j"
-#include "API/warvk_render.j"
-#include "API/warvk_lightning.j"
+#include "warvk_api.j"
 
 library WarVKInitLib initializer WarVK_AutoInit
     globals
