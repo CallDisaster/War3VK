@@ -151,6 +151,7 @@ d3d9_src = [
   'war3/gpu_skin/war3_gpu_skin_manager.cpp',
   'war3/gpu_skin/war3_gpu_skin_native_bridge.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_observer.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_owner.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_proof_catalog.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_immutable.cpp',
@@ -296,6 +297,26 @@ war3_persistent_gpu_package_observer_test = executable(
 test(
   'war3_persistent_gpu_package_observer',
   war3_persistent_gpu_package_observer_test,
+  timeout : 30,
+)
+
+# Runtime-integrated but evidence-only Stage11 adapter. The isolated runnable
+# proves source generations, exact accepted-witness gates, hard zero package /
+# consumer authority and timing aggregation without constructing DXVK/GPU
+# resources.
+war3_persistent_gpu_package_stage11_observe_adapter_test = executable(
+  'war3_persistent_gpu_package_stage11_observe_adapter_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_stage11_observe_adapter_test.cpp',
+  ],
+  dependencies        : [ dependency('threads') ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_stage11_observe_adapter',
+  war3_persistent_gpu_package_stage11_observe_adapter_test,
   timeout : 30,
 )
 

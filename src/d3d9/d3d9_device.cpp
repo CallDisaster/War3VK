@@ -37,6 +37,7 @@
 #include "war3/model/war3_model_registry.h"
 #include "war3/gpu_skin/war3_gpu_skin_compute.h"
 #include "war3/gpu_skin/war3_gpu_skin_manager.h"
+#include "war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.h"
 #include "war3/native/war3_native_shadow_hint.h"
 #include "war3/platform/war3_runtime_bootstrap.h"
 #include "war3/shadow/war3_shadow_renderer_core.h"
@@ -2192,6 +2193,18 @@ War3CompactWorkTableMode War3SemanticCompactWorkTableModeRuntime() {
   static const auto s_mode = static_cast<War3CompactWorkTableMode>(
       std::min<uint32_t>(
           2u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", 0u)));
+  return s_mode;
+}
+
+dxvk::war3::gpu_skin::War3PersistentGpuPackageStage11ObserveAdapter::Mode
+War3PersistentPackageStage11EvidenceModeRuntime() {
+  using Mode = dxvk::war3::gpu_skin::
+      War3PersistentGpuPackageStage11ObserveAdapter::Mode;
+  // This bridge is evidence-only. Keep release behavior entirely absent until
+  // an explicit Observe request; Consume remains a hard capability failure.
+  static const auto s_mode = static_cast<Mode>((std::min)(
+      2u, War3GetEnvU32(
+              "DXVK_WAR3_PERSISTENT_GPU_PACKAGE_STAGE11_EVIDENCE_MODE", 0u)));
   return s_mode;
 }
 
@@ -22693,6 +22706,132 @@ bool D3D9DeviceEx::War3DrawTimeAnonymousMarkerRejectionActive(
       kWar3AnonymousMarkerRejectionHoldFrames;
 }
 
+void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(
+    const War3DrawTimeVBCacheKey& key,
+    const War3DrawTimeVBEntry& entry, int16_t exactProducerStage,
+    bool blockerClassified,
+    dxvk::war3::gpu_skin::
+        War3PersistentGpuPackageStage11ObserveAdapter::Mode
+            requestedMode) noexcept {
+  using Adapter = dxvk::war3::gpu_skin::
+      War3PersistentGpuPackageStage11ObserveAdapter;
+  if (requestedMode == Adapter::Mode::Off)
+    return;
+  if (requestedMode == Adapter::Mode::Consume) {
+    static std::atomic<bool> s_consumeDeniedLogged{false};
+    if (!s_consumeDeniedLogged.exchange(true, std::memory_order_relaxed)) {
+      WAR3_RENDER_LOG(
+          "DXVK War3PackageStage11Observe: Consume denied; evidence-only "
+          "adapter remains inactive\n");
+    }
+    return;
+  }
+
+  const int64_t beginTicks = dxvk::high_resolution_clock::get_counter();
+  dxvk::war3::model::ShadowGeosetResourceStamp geosetStamp = {};
+  bool hasExplicitGeosetDataSidecar = false;
+  bool explicitGeosetDataSidecarLookupFailed = false;
+  try {
+    hasExplicitGeosetDataSidecar =
+        dxvk::war3::model::ShadowModelResourceCache::instance()
+            .findGeosetStampByData(key.meshPayloadPtr, geosetStamp);
+  } catch (...) {
+    // Observation must never unwind through the already-published canonical
+    // caster. Preserve the caster and classify this evidence lookup only.
+    explicitGeosetDataSidecarLookupFailed = true;
+    geosetStamp = {};
+  }
+
+  Adapter::ExactSubmittedWitness witness = {};
+  witness.frameSerial = m_war3ShadowPersistentFrameSerial;
+  witness.exactSubmittedFrameSerial = entry.exactSubmittedFrameSerial;
+  witness.policyRevision =
+      dxvk::war3::render::CurrentShadowStagePolicyRevision();
+  witness.mapEpoch = m_war3GpuSkinMapEpoch;
+  witness.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+  witness.exactGeometryKeyHash =
+      uint64_t(War3DrawTimeVBCacheKeyHash{}(key));
+  if (witness.exactGeometryKeyHash == 0u)
+    witness.exactGeometryKeyHash = 1u;
+  witness.instanceIdentity =
+      reinterpret_cast<uintptr_t>(key.instanceIdentity);
+  witness.meshPayloadIdentity =
+      reinterpret_cast<uintptr_t>(key.meshPayloadPtr);
+  witness.renderablePartIdentity =
+      reinterpret_cast<uintptr_t>(key.renderablePart);
+  witness.jHandle = key.jHandle;
+  witness.layerIndex = key.layerIndex;
+  witness.payloadWord108 = key.payloadWord108;
+  witness.payloadWord11C = key.payloadWord11C;
+  witness.stage = exactProducerStage >= 0
+      ? uint32_t(exactProducerStage) : 0u;
+  witness.vertexCount = entry.vertexCount;
+  witness.indexCount = entry.indexCount;
+  witness.indexed = entry.indexed;
+  witness.alphaTestEnabled = entry.alphaTestEnabled;
+  witness.alphaPayloadComplete = entry.HasCompleteAlphaPayload();
+  // Reaching this hook proves the active blocker gates completed. Preserve a
+  // separate classification bit so Observe can expose an accepted blocker if
+  // a diagnostic build intentionally disables rejection.
+  witness.blockerGatePassed = true;
+  witness.blockerClassified = blockerClassified;
+  witness.producerAccepted = true;
+  witness.geosetSidecar.found = hasExplicitGeosetDataSidecar;
+  witness.geosetSidecar.lookupFailed =
+      explicitGeosetDataSidecarLookupFailed;
+  witness.geosetSidecar.geosetDataIdentity =
+      reinterpret_cast<uintptr_t>(geosetStamp.geosetDataPtr);
+  witness.geosetSidecar.contentHash = geosetStamp.contentHash;
+  witness.geosetSidecar.immutableModelGeneration =
+      geosetStamp.immutableModelGeneration;
+  witness.geosetSidecar.vertexCount = geosetStamp.vertexCount;
+
+  const Adapter::Evidence evidence =
+      m_war3PersistentPackageStage11ObserveAdapter.observe(
+          requestedMode, witness);
+  const int64_t endTicks = dxvk::high_resolution_clock::get_counter();
+  m_war3PersistentPackageStage11ObserveAdapter.noteElapsedTicks(
+      witness.frameSerial,
+      endTicks >= beginTicks ? uint64_t(endTicks - beginTicks) : 0u);
+
+  const auto& diagnostics =
+      m_war3PersistentPackageStage11ObserveAdapter.diagnostics();
+  if (diagnostics.observeCalls <= 16u ||
+      (diagnostics.observeCalls % 4096u) == 0u) {
+    const double ticksToUs = 1000000.0 /
+        double(dxvk::high_resolution_clock::get_frequency());
+    WAR3_RENDER_LOG(
+        "DXVK War3PackageStage11Observe: calls=%llu contentIdentityOnly=%llu "
+        "lookupFailed=%llu missingSidecar=%llu invalidSidecar=%llu "
+        "invalidWitness=%llu "
+        "acceptedBlocker=%llu "
+        "lastSource=%llu disposition=%u packageGeneration=0 ready=0 "
+        "fullyEquivalent=0 eligible=0 wouldUse=0 actual=0 "
+        "provesCurrentGameMemory=0 "
+        "avgCoreCallUs=%.3f maxCoreCallUs=%.3f maxCoreFrameUs=%.3f\n",
+        static_cast<unsigned long long>(diagnostics.observeCalls),
+        static_cast<unsigned long long>(
+            diagnostics.recordedContentIdentityOnly),
+        static_cast<unsigned long long>(
+            diagnostics.explicitGeosetDataSidecarLookupFailed),
+        static_cast<unsigned long long>(
+            diagnostics.missingExplicitGeosetDataSidecar),
+        static_cast<unsigned long long>(
+            diagnostics.invalidExplicitGeosetDataSidecar),
+        static_cast<unsigned long long>(diagnostics.invalidWitness),
+        static_cast<unsigned long long>(
+            diagnostics.acceptedBlockerClassified),
+        static_cast<unsigned long long>(diagnostics.lastSourceGeneration),
+        static_cast<unsigned>(evidence.disposition),
+        diagnostics.observeCalls != 0u
+            ? double(diagnostics.elapsedTicksTotal) * ticksToUs /
+                  double(diagnostics.observeCalls)
+            : 0.0,
+        double(diagnostics.elapsedTicksMaxCall) * ticksToUs,
+        double(diagnostics.elapsedTicksMaxFrame) * ticksToUs);
+  }
+}
+
 uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
   auto& visibleRegistry =
       dxvk::war3::render::VisibleRenderableRegistry::instance();
@@ -22703,6 +22842,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
   if (!War3DrawTimeCurrentFrameGeometryRuntime() &&
       !War3DrawTimeVBCacheRuntime())
     return 0u;
+  const auto packageStage11EvidenceMode =
+      War3PersistentPackageStage11EvidenceModeRuntime();
   for (auto& [cacheKey, entry] : m_war3DrawTimeVBCache) {
     void* const renderablePart = cacheKey.renderablePart;
     if (renderablePart == nullptr)
@@ -23056,6 +23197,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
       m_war3Scene.shadowStats.semanticSceneSubmittedAlphaBlend++;
     m_war3Scene.shadowStats.drawTimeSemanticProducerSubmittedCount++;
     entry.exactSubmittedFrameSerial = m_war3ShadowPersistentFrameSerial;
+    if (packageStage11EvidenceMode != dxvk::war3::gpu_skin::
+            War3PersistentGpuPackageStage11ObserveAdapter::Mode::Off) {
+      War3ObservePersistentPackageStage11Evidence(
+          cacheKey, entry, exactProducerStage,
+          metadataRejectedBlocker || drawTimeEntryIsPathBlocker,
+          packageStage11EvidenceMode);
+    }
     entry.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
     ++submitted;
   }
