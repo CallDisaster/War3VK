@@ -215,20 +215,23 @@ class SourceContractTests(unittest.TestCase):
             "takeStaticUploads()", 1
         )[0]
         for token in (
-            "BuildPrimitiveProofs(",
-            "BuildLocalBounds(",
-            "positionContentHash = HashStaticBytes(",
-            "normalContentHash = HashStaticBytes(",
-            "vertexGroupContentHash = HashStaticBytes(",
-            "uv0ContentHash = HashStaticBytes(",
-            "primitiveProofHash = primitiveProofHash",
+            "BuildPersistentGpuPackageImmutableProof(",
+            "SamePersistentGpuPackageImmutableProof(",
+            "ValidatePersistentGpuPackagePackedBytes(",
+            "packageProof.positionContentHash =",
+            "packageProof.normalContentHash =",
+            "packageProof.vertexGroupContentHash =",
+            "packageProof.uv0ContentHash =",
+            "packageProof.primitiveProofHash =",
+            "frozen->m_immutableProof = recomputedProof",
         ):
             self.assertIn(token, create_body)
         validator = self.source.split(
             "bool ValidateGpuSkinStaticPackage", 1
         )[1].split("War3PersistentGpuPackageStore::", 1)[0]
-        self.assertIn("ValidatePrimitiveProofs(", validator)
-        self.assertIn("HasFiniteLocalBounds(expected)", validator)
+        self.assertIn("ValidateFrozenMirrorsAndGpuRanges", validator)
+        self.assertIn("BuildPersistentGpuPackageImmutableProof(", validator)
+        self.assertIn("SamePersistentGpuPackageImmutableProof(", validator)
 
     def test_static_atlas_declares_all_future_read_domains(self) -> None:
         static_info = self.source.split("StaticBufferInfo", 1)[1].split(

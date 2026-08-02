@@ -296,7 +296,8 @@ void MergeModelRecord(ShadowModelResourceRecord &dst,
     dst.geosetPtrs = src.geosetPtrs;
   if (!src.geosetDataPtrs.empty())
     dst.geosetDataPtrs = src.geosetDataPtrs;
-  if (src.readyGeosetCount != 0)
+  if (src.geosetCount != 0u || !src.geosetPtrs.empty() ||
+      !src.geosetDataPtrs.empty() || src.readyGeosetCount != 0u)
     dst.readyGeosetCount = src.readyGeosetCount;
   if (dst.firstSeenFrame == 0 ||
       (src.firstSeenFrame != 0 && src.firstSeenFrame < dst.firstSeenFrame)) {
@@ -313,7 +314,8 @@ bool HasSameGeosetConsumerContent(const ShadowGeosetResourceRecord& a,
       return false;
     for (size_t i = 0; i < a.uvLayers.size(); ++i) {
       if (a.uvLayers[i].uvCount != b.uvLayers[i].uvCount ||
-          a.uvLayers[i].uvPairs != b.uvLayers[i].uvPairs) {
+          !SameShadowGeosetFloatPayloadBytes(
+              a.uvLayers[i].uvPairs, b.uvLayers[i].uvPairs)) {
         return false;
       }
     }
@@ -343,9 +345,9 @@ bool HasSameGeosetConsumerContent(const ShadowGeosetResourceRecord& a,
          a.mergedGeosetSlotOrBindingIndex ==
              b.mergedGeosetSlotOrBindingIndex &&
          a.vertexCount == b.vertexCount &&
-         a.positions == b.positions &&
+         SameShadowGeosetFloatPayloadBytes(a.positions, b.positions) &&
          a.normalCount == b.normalCount &&
-         a.normals == b.normals &&
+         SameShadowGeosetFloatPayloadBytes(a.normals, b.normals) &&
          a.vertexGroupCount == b.vertexGroupCount &&
          a.vertexGroupIndices == b.vertexGroupIndices &&
          a.uvLayerCount == b.uvLayerCount &&
@@ -476,43 +478,48 @@ bool CaptureGeosetRecord(void *geosetPtr, ShadowGeosetResourceRecord &record) {
   void *matrixGroupSizesPtr = nullptr;
   void *matrixIndicesPtr = nullptr;
 
-  TryReadU32Fast(geosetDataPtr, dxvk::war3::CGeosetDataOffsets::VertexCount,
-                 vertexCount);
+  const bool vertexCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::VertexCount,
+      vertexCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::VertexPositions, positionsPtr);
-  TryReadU32Fast(geosetDataPtr, dxvk::war3::CGeosetDataOffsets::NormalCount,
-                 normalCount);
+  const bool normalCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::NormalCount,
+      normalCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::NormalVectors, normalsPtr);
-  TryReadU32Fast(geosetDataPtr,
-                 dxvk::war3::CGeosetDataOffsets::VertexGroupCount,
-                 vertexGroupCount);
+  const bool vertexGroupCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::VertexGroupCount,
+      vertexGroupCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::VertexGroupIndices,
                  vertexGroupsPtr);
-  TryReadU32Fast(geosetDataPtr, dxvk::war3::CGeosetDataOffsets::UvLayerCount,
-                 uvLayerCount);
+  const bool uvLayerCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::UvLayerCount,
+      uvLayerCount);
   TryReadPtrFast(geosetDataPtr, dxvk::war3::CGeosetDataOffsets::UvLayers,
                  uvLayersPtr);
-  TryReadU32Fast(geosetDataPtr,
-                 dxvk::war3::CGeosetDataOffsets::PrimitiveRecordCount,
-                 primitiveCount);
+  const bool primitiveCountRead = TryReadU32Fast(
+      geosetDataPtr,
+      dxvk::war3::CGeosetDataOffsets::PrimitiveRecordCount,
+      primitiveCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::PrimitiveRecords,
                  primitiveRecordsPtr);
-  TryReadU32Fast(geosetDataPtr, dxvk::war3::CGeosetDataOffsets::IndexCount,
-                 indexCount);
+  const bool indexCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::IndexCount,
+      indexCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::IndexBufferU16, indicesPtr);
-  TryReadU32Fast(geosetDataPtr,
-                 dxvk::war3::CGeosetDataOffsets::MatrixGroupCount,
-                 matrixGroupCount);
+  const bool matrixGroupCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::MatrixGroupCount,
+      matrixGroupCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::MatrixGroupSizes,
                  matrixGroupSizesPtr);
-  TryReadU32Fast(geosetDataPtr,
-                 dxvk::war3::CGeosetDataOffsets::MatrixIndexCount,
-                 matrixIndexCount);
+  const bool matrixIndexCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::MatrixIndexCount,
+      matrixIndexCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::MatrixIndices,
                  matrixIndicesPtr);
@@ -526,23 +533,40 @@ bool CaptureGeosetRecord(void *geosetPtr, ShadowGeosetResourceRecord &record) {
   record.matrixGroupCount = std::min(matrixGroupCount, kMaxMatrixGroupCount);
   record.matrixIndexCount = std::min(matrixIndexCount, kMaxMatrixIndexCount);
 
-  CopyFlatFloatArray(static_cast<const float *>(positionsPtr), record.vertexCount,
-                     3u, record.positions);
-  CopyFlatFloatArray(static_cast<const float *>(normalsPtr), record.normalCount,
-                     3u, record.normals);
-  CopyPodArray(static_cast<const uint8_t *>(vertexGroupsPtr),
-               record.vertexGroupCount, record.vertexGroupIndices);
-  CopyPodArray(static_cast<const uint16_t *>(indicesPtr), record.indexCount,
-               record.indices);
-  CopyPodArray(static_cast<const uint32_t *>(matrixGroupSizesPtr),
-               record.matrixGroupCount, record.matrixGroupSizes);
-  CopyPodArray(static_cast<const uint32_t *>(matrixIndicesPtr),
-               record.matrixIndexCount, record.matrixIndices);
+  const bool rawCountsReadable = vertexCountRead && normalCountRead &&
+      vertexGroupCountRead && uvLayerCountRead && primitiveCountRead &&
+      indexCountRead && matrixGroupCountRead && matrixIndexCountRead;
+  const bool rawCountsWithinLimits = rawCountsReadable && vertexCount != 0u &&
+      vertexCount <= kMaxVertexCount && normalCount <= kMaxVertexCount &&
+      vertexGroupCount <= kMaxVertexCount && uvLayerCount <= kMaxUvLayers &&
+      primitiveCount <= kMaxIndexCount && indexCount <= kMaxIndexCount &&
+      matrixGroupCount <= kMaxMatrixGroupCount &&
+      matrixIndexCount <= kMaxMatrixIndexCount;
+  const bool positionsCopied = CopyFlatFloatArray(
+      static_cast<const float *>(positionsPtr), record.vertexCount,
+      3u, record.positions);
+  const bool normalsCopied = record.normalCount == 0u || CopyFlatFloatArray(
+      static_cast<const float *>(normalsPtr), record.normalCount,
+      3u, record.normals);
+  const bool groupsCopied = record.vertexGroupCount == 0u || CopyPodArray(
+      static_cast<const uint8_t *>(vertexGroupsPtr),
+      record.vertexGroupCount, record.vertexGroupIndices);
+  const bool indicesCopied = record.indexCount == 0u || CopyPodArray(
+      static_cast<const uint16_t *>(indicesPtr), record.indexCount,
+      record.indices);
+  const bool matrixGroupsCopied = record.matrixGroupCount == 0u || CopyPodArray(
+      static_cast<const uint32_t *>(matrixGroupSizesPtr),
+      record.matrixGroupCount, record.matrixGroupSizes);
+  const bool matrixIndicesCopied = record.matrixIndexCount == 0u || CopyPodArray(
+      static_cast<const uint32_t *>(matrixIndicesPtr),
+      record.matrixIndexCount, record.matrixIndices);
 
   std::vector<dxvk::war3::GeosetPrimitiveRecord> primitivesRaw;
-  if (CopyPodArray(static_cast<const dxvk::war3::GeosetPrimitiveRecord *>(
+  const bool primitivesCopied = record.primitiveCount == 0u || CopyPodArray(
+      static_cast<const dxvk::war3::GeosetPrimitiveRecord *>(
                        primitiveRecordsPtr),
-                   record.primitiveCount, primitivesRaw)) {
+                   record.primitiveCount, primitivesRaw);
+  if (primitivesCopied) {
     record.primitiveRecords.reserve(primitivesRaw.size());
     for (const auto &primitive : primitivesRaw) {
       record.primitiveRecords.push_back(ShadowGeosetPrimitiveRecord{
@@ -550,6 +574,7 @@ bool CaptureGeosetRecord(void *geosetPtr, ShadowGeosetResourceRecord &record) {
     }
   }
 
+  bool uvLayersCopied = record.uvLayerCount == 0u;
   if (uvLayersPtr != nullptr && record.uvLayerCount != 0 &&
       dxvk::war3::IsReadableRange(
           uvLayersPtr, size_t(record.uvLayerCount) *
@@ -557,16 +582,26 @@ bool CaptureGeosetRecord(void *geosetPtr, ShadowGeosetResourceRecord &record) {
     auto *layers = static_cast<const dxvk::war3::GeosetUvLayerVec2ArrayRecord *>(
         uvLayersPtr);
     record.uvLayers.reserve(record.uvLayerCount);
+    uvLayersCopied = true;
     for (uint32_t i = 0; i < record.uvLayerCount; ++i) {
       ShadowGeosetUvLayerRecord uvRecord = {};
       uvRecord.uvCount = std::min(layers[i].count, record.vertexCount);
       const float *uvData =
           layers[i].data != nullptr ? layers[i].data : layers[i].inline_storage;
-      CopyFlatFloatArray(uvData, uvRecord.uvCount, 2u, uvRecord.uvPairs);
+      const bool exactUvCount = layers[i].count == record.vertexCount;
+      const bool copied = exactUvCount && CopyFlatFloatArray(
+          uvData, uvRecord.uvCount, 2u, uvRecord.uvPairs);
+      uvLayersCopied = uvLayersCopied && copied;
       record.uvLayers.emplace_back(std::move(uvRecord));
     }
   }
 
+  record.immutableCaptureStatus =
+      rawCountsWithinLimits && positionsCopied && normalsCopied &&
+          groupsCopied && indicesCopied && matrixGroupsCopied &&
+          matrixIndicesCopied && primitivesCopied && uvLayersCopied
+      ? ShadowGeosetImmutableCaptureStatus::Complete
+      : ShadowGeosetImmutableCaptureStatus::AttemptedFailed;
   record.contentHash = ComputeGeosetContentHash(record);
   return true;
 }
@@ -603,8 +638,12 @@ bool CaptureGeosetRecordFromKnownPtrs(void* geosetPtr, void* geosetDataPtr,
     return false;
 
   if (geosetPtr != nullptr && CaptureGeosetRecord(geosetPtr, record)) {
-    if (geosetDataPtr != nullptr)
-      record.geosetDataPtr = geosetDataPtr;
+    // Never overwrite the data identity actually captured through geosetPtr
+    // with a caller hint.  A mismatch means the hint is stale and allowing it
+    // would merge payload bytes across two source identities.
+    if (geosetDataPtr != nullptr &&
+        record.geosetDataPtr != geosetDataPtr)
+      return false;
     return true;
   }
 
@@ -636,43 +675,48 @@ bool CaptureGeosetRecordFromKnownPtrs(void* geosetPtr, void* geosetDataPtr,
   void* matrixGroupSizesPtr = nullptr;
   void* matrixIndicesPtr = nullptr;
 
-  TryReadU32Fast(geosetDataPtr, dxvk::war3::CGeosetDataOffsets::VertexCount,
-                 vertexCount);
+  const bool vertexCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::VertexCount,
+      vertexCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::VertexPositions, positionsPtr);
-  TryReadU32Fast(geosetDataPtr, dxvk::war3::CGeosetDataOffsets::NormalCount,
-                 normalCount);
+  const bool normalCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::NormalCount,
+      normalCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::NormalVectors, normalsPtr);
-  TryReadU32Fast(geosetDataPtr,
-                 dxvk::war3::CGeosetDataOffsets::VertexGroupCount,
-                 vertexGroupCount);
+  const bool vertexGroupCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::VertexGroupCount,
+      vertexGroupCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::VertexGroupIndices,
                  vertexGroupsPtr);
-  TryReadU32Fast(geosetDataPtr, dxvk::war3::CGeosetDataOffsets::UvLayerCount,
-                 uvLayerCount);
+  const bool uvLayerCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::UvLayerCount,
+      uvLayerCount);
   TryReadPtrFast(geosetDataPtr, dxvk::war3::CGeosetDataOffsets::UvLayers,
                  uvLayersPtr);
-  TryReadU32Fast(geosetDataPtr,
-                 dxvk::war3::CGeosetDataOffsets::PrimitiveRecordCount,
-                 primitiveCount);
+  const bool primitiveCountRead = TryReadU32Fast(
+      geosetDataPtr,
+      dxvk::war3::CGeosetDataOffsets::PrimitiveRecordCount,
+      primitiveCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::PrimitiveRecords,
                  primitiveRecordsPtr);
-  TryReadU32Fast(geosetDataPtr, dxvk::war3::CGeosetDataOffsets::IndexCount,
-                 indexCount);
+  const bool indexCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::IndexCount,
+      indexCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::IndexBufferU16, indicesPtr);
-  TryReadU32Fast(geosetDataPtr,
-                 dxvk::war3::CGeosetDataOffsets::MatrixGroupCount,
-                 matrixGroupCount);
+  const bool matrixGroupCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::MatrixGroupCount,
+      matrixGroupCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::MatrixGroupSizes,
                  matrixGroupSizesPtr);
-  TryReadU32Fast(geosetDataPtr,
-                 dxvk::war3::CGeosetDataOffsets::MatrixIndexCount,
-                 matrixIndexCount);
+  const bool matrixIndexCountRead = TryReadU32Fast(
+      geosetDataPtr, dxvk::war3::CGeosetDataOffsets::MatrixIndexCount,
+      matrixIndexCount);
   TryReadPtrFast(geosetDataPtr,
                  dxvk::war3::CGeosetDataOffsets::MatrixIndices,
                  matrixIndicesPtr);
@@ -686,23 +730,40 @@ bool CaptureGeosetRecordFromKnownPtrs(void* geosetPtr, void* geosetDataPtr,
   record.matrixGroupCount = std::min(matrixGroupCount, kMaxMatrixGroupCount);
   record.matrixIndexCount = std::min(matrixIndexCount, kMaxMatrixIndexCount);
 
-  CopyFlatFloatArray(static_cast<const float*>(positionsPtr), record.vertexCount,
-                     3u, record.positions);
-  CopyFlatFloatArray(static_cast<const float*>(normalsPtr), record.normalCount,
-                     3u, record.normals);
-  CopyPodArray(static_cast<const uint8_t*>(vertexGroupsPtr),
-               record.vertexGroupCount, record.vertexGroupIndices);
-  CopyPodArray(static_cast<const uint16_t*>(indicesPtr), record.indexCount,
-               record.indices);
-  CopyPodArray(static_cast<const uint32_t*>(matrixGroupSizesPtr),
-               record.matrixGroupCount, record.matrixGroupSizes);
-  CopyPodArray(static_cast<const uint32_t*>(matrixIndicesPtr),
-               record.matrixIndexCount, record.matrixIndices);
+  const bool rawCountsReadable = vertexCountRead && normalCountRead &&
+      vertexGroupCountRead && uvLayerCountRead && primitiveCountRead &&
+      indexCountRead && matrixGroupCountRead && matrixIndexCountRead;
+  const bool rawCountsWithinLimits = rawCountsReadable && vertexCount != 0u &&
+      vertexCount <= kMaxVertexCount && normalCount <= kMaxVertexCount &&
+      vertexGroupCount <= kMaxVertexCount && uvLayerCount <= kMaxUvLayers &&
+      primitiveCount <= kMaxIndexCount && indexCount <= kMaxIndexCount &&
+      matrixGroupCount <= kMaxMatrixGroupCount &&
+      matrixIndexCount <= kMaxMatrixIndexCount;
+  const bool positionsCopied = CopyFlatFloatArray(
+      static_cast<const float*>(positionsPtr), record.vertexCount,
+      3u, record.positions);
+  const bool normalsCopied = record.normalCount == 0u || CopyFlatFloatArray(
+      static_cast<const float*>(normalsPtr), record.normalCount,
+      3u, record.normals);
+  const bool groupsCopied = record.vertexGroupCount == 0u || CopyPodArray(
+      static_cast<const uint8_t*>(vertexGroupsPtr),
+      record.vertexGroupCount, record.vertexGroupIndices);
+  const bool indicesCopied = record.indexCount == 0u || CopyPodArray(
+      static_cast<const uint16_t*>(indicesPtr), record.indexCount,
+      record.indices);
+  const bool matrixGroupsCopied = record.matrixGroupCount == 0u || CopyPodArray(
+      static_cast<const uint32_t*>(matrixGroupSizesPtr),
+      record.matrixGroupCount, record.matrixGroupSizes);
+  const bool matrixIndicesCopied = record.matrixIndexCount == 0u || CopyPodArray(
+      static_cast<const uint32_t*>(matrixIndicesPtr),
+      record.matrixIndexCount, record.matrixIndices);
 
   std::vector<dxvk::war3::GeosetPrimitiveRecord> primitivesRaw;
-  if (CopyPodArray(static_cast<const dxvk::war3::GeosetPrimitiveRecord*>(
+  const bool primitivesCopied = record.primitiveCount == 0u || CopyPodArray(
+      static_cast<const dxvk::war3::GeosetPrimitiveRecord*>(
                        primitiveRecordsPtr),
-                   record.primitiveCount, primitivesRaw)) {
+                   record.primitiveCount, primitivesRaw);
+  if (primitivesCopied) {
     record.primitiveRecords.reserve(primitivesRaw.size());
     for (const auto& primitive : primitivesRaw) {
       record.primitiveRecords.push_back(ShadowGeosetPrimitiveRecord{
@@ -710,6 +771,7 @@ bool CaptureGeosetRecordFromKnownPtrs(void* geosetPtr, void* geosetDataPtr,
     }
   }
 
+  bool uvLayersCopied = record.uvLayerCount == 0u;
   if (uvLayersPtr != nullptr && record.uvLayerCount != 0 &&
       dxvk::war3::IsReadableRange(
           uvLayersPtr, size_t(record.uvLayerCount) *
@@ -717,16 +779,26 @@ bool CaptureGeosetRecordFromKnownPtrs(void* geosetPtr, void* geosetDataPtr,
     auto* layers = static_cast<const dxvk::war3::GeosetUvLayerVec2ArrayRecord*>(
         uvLayersPtr);
     record.uvLayers.reserve(record.uvLayerCount);
+    uvLayersCopied = true;
     for (uint32_t i = 0; i < record.uvLayerCount; ++i) {
       ShadowGeosetUvLayerRecord uvRecord = {};
       uvRecord.uvCount = std::min(layers[i].count, record.vertexCount);
       const float* uvData =
           layers[i].data != nullptr ? layers[i].data : layers[i].inline_storage;
-      CopyFlatFloatArray(uvData, uvRecord.uvCount, 2u, uvRecord.uvPairs);
+      const bool exactUvCount = layers[i].count == record.vertexCount;
+      const bool copied = exactUvCount && CopyFlatFloatArray(
+          uvData, uvRecord.uvCount, 2u, uvRecord.uvPairs);
+      uvLayersCopied = uvLayersCopied && copied;
       record.uvLayers.emplace_back(std::move(uvRecord));
     }
   }
 
+  record.immutableCaptureStatus =
+      rawCountsWithinLimits && positionsCopied && normalsCopied &&
+          groupsCopied && indicesCopied && matrixGroupsCopied &&
+          matrixIndicesCopied && primitivesCopied && uvLayersCopied
+      ? ShadowGeosetImmutableCaptureStatus::Complete
+      : ShadowGeosetImmutableCaptureStatus::AttemptedFailed;
   record.contentHash = ComputeGeosetContentHash(record);
   return true;
 }
@@ -759,9 +831,26 @@ uint32_t CountReadyGeosets(const ShadowModelResourceRecord& record,
     const void* geosetPtr = record.geosetPtrs[i];
     if (geosetPtr != nullptr) {
       const auto itGeoset = byGeoset.find(const_cast<void*>(geosetPtr));
-      if (itGeoset != byGeoset.end() && itGeoset->second.readyForShadowConsumer()) {
-        ++readyCount;
-        continue;
+      if (itGeoset != byGeoset.end()) {
+        const auto& alias = itGeoset->second;
+        if (!alias.readyForShadowConsumer())
+          continue;
+        if (alias.geosetDataPtr != nullptr) {
+          const auto canonical = byGeosetData.find(alias.geosetDataPtr);
+          if (canonical != byGeosetData.end()) {
+            if (canonical->second != nullptr &&
+                canonical->second->readyForShadowConsumer()) {
+              ++readyCount;
+            }
+            // Canonical presence is authoritative even when it is a failure
+            // tombstone; never fall through to a stale model data pointer.
+            continue;
+          }
+        }
+        if (alias.geosetDataPtr == nullptr) {
+          ++readyCount;
+          continue;
+        }
       }
     }
 
@@ -838,6 +927,59 @@ void ShadowModelResourceCache::beginFrame() {
   m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
+void MergeGeosetMetadata(ShadowGeosetResourceRecord& dst,
+                         const ShadowGeosetResourceRecord& src) {
+  if (src.geosetPtr)
+    dst.geosetPtr = src.geosetPtr;
+  if (src.geosetDataPtr)
+    dst.geosetDataPtr = src.geosetDataPtr;
+  if (src.modelResourcePtr)
+    dst.modelResourcePtr = src.modelResourcePtr;
+  if (src.modelKey != 0u)
+    dst.modelKey = src.modelKey;
+  if (src.prefersRuntimeContract)
+    dst.prefersRuntimeContract = true;
+  if (src.geosetIndex != kInvalidShadowGeosetIndex)
+    dst.geosetIndex = src.geosetIndex;
+  if (src.materialOrLayoutSlot != 0u)
+    dst.materialOrLayoutSlot = src.materialOrLayoutSlot;
+  if (src.layoutOrMaterialSlot != 0u)
+    dst.layoutOrMaterialSlot = src.layoutOrMaterialSlot;
+  if (src.mergedGeosetSlotOrBindingIndex != 0u)
+    dst.mergedGeosetSlotOrBindingIndex =
+        src.mergedGeosetSlotOrBindingIndex;
+  if (dst.firstSeenFrame == 0u ||
+      (src.firstSeenFrame != 0u &&
+       src.firstSeenFrame < dst.firstSeenFrame))
+    dst.firstSeenFrame = src.firstSeenFrame;
+  dst.lastSeenFrame = (std::max)(dst.lastSeenFrame, src.lastSeenFrame);
+  dst.lastRuntimeRefreshFrame = (std::max)(
+      dst.lastRuntimeRefreshFrame, src.lastRuntimeRefreshFrame);
+}
+
+void ReplaceGeosetImmutablePayload(ShadowGeosetResourceRecord& dst,
+                                   const ShadowGeosetResourceRecord& src) {
+  dst.vertexCount = src.vertexCount;
+  dst.positions = src.positions;
+  dst.normalCount = src.normalCount;
+  dst.normals = src.normals;
+  dst.vertexGroupCount = src.vertexGroupCount;
+  dst.vertexGroupIndices = src.vertexGroupIndices;
+  dst.uvLayerCount = src.uvLayerCount;
+  dst.uvLayers = src.uvLayers;
+  dst.primitiveCount = src.primitiveCount;
+  dst.primitiveRecords = src.primitiveRecords;
+  dst.indexCount = src.indexCount;
+  dst.indices = src.indices;
+  dst.matrixGroupCount = src.matrixGroupCount;
+  dst.matrixGroupSizes = src.matrixGroupSizes;
+  dst.matrixIndexCount = src.matrixIndexCount;
+  dst.matrixIndices = src.matrixIndices;
+  dst.contentHash = src.contentHash;
+  dst.immutableModelGeneration = 0u;
+  dst.immutableCaptureStatus = src.immutableCaptureStatus;
+}
+
 void ShadowModelResourceCache::endFrame() {
   std::unique_lock<std::shared_mutex> lock(m_mutex);
 }
@@ -885,63 +1027,170 @@ ShadowModelResourceCache::materializeGeosetDataRecordLocked(
   return result;
 }
 
-void ShadowModelResourceCache::storeGeosetRecord(
+ShadowGeosetResourceRecord
+ShadowModelResourceCache::materializeGeosetAliasRecordLocked(
+    const ShadowGeosetResourceRecord& alias) const {
+  // Header/failed transition records are explicit unresolved tombstones. An
+  // independently Ready canonical target must not wash them back to Ready.
+  if (!alias.readyForShadowConsumer() || alias.geosetDataPtr == nullptr)
+    return alias;
+
+  const auto canonical = m_byGeosetData.find(alias.geosetDataPtr);
+  if (canonical != m_byGeosetData.end() && canonical->second != nullptr) {
+    ShadowGeosetResourceRecord result = materializeGeosetDataRecordLocked(
+        alias.geosetDataPtr, canonical->second);
+    // Canonical owns every immutable byte and its generation. The by-geoset
+    // value contributes only alias/owner observation metadata.
+    MergeGeosetMetadata(result, alias);
+    return result;
+  }
+
+  // A generated alias without its canonical publication violates the cache
+  // ownership invariant. Never leak its old payload/generation as ready.
+  ShadowGeosetResourceRecord unresolved = {};
+  MergeGeosetMetadata(unresolved, alias);
+  unresolved.immutableCaptureStatus =
+      ShadowGeosetImmutableCaptureStatus::NotAttempted;
+  unresolved.immutableModelGeneration = 0u;
+  unresolved.contentHash = ComputeGeosetContentHash(unresolved);
+  return unresolved;
+}
+
+ShadowGeosetResourceSnapshot ShadowModelResourceCache::storeGeosetRecord(
     const ShadowGeosetResourceRecord &record) {
-  ShadowGeosetResourceRecord merged = {};
-  bool hadExisting = false;
-  ShadowGeosetResourceRecord existing = {};
-  uint64_t consistentContentHash = 0;
-  bool contentHashesAgree = true;
-  const auto noteContentHash = [&](uint64_t hash) {
-    if (hash == 0)
-      return;
-    if (consistentContentHash == 0)
-      consistentContentHash = hash;
-    else if (consistentContentHash != hash)
-      contentHashesAgree = false;
-  };
+  const ShadowGeosetResourceRecord* existingByGeoset = nullptr;
+  ShadowGeosetResourceSnapshot existingByData;
   if (record.geosetPtr != nullptr) {
-    auto it = m_byGeoset.find(record.geosetPtr);
-    if (it != m_byGeoset.end()) {
-      noteContentHash(it->second.contentHash);
-      MergeGeosetRecord(merged, it->second);
-      if (!hadExisting) {
-        existing = it->second;
-        hadExisting = true;
-      }
-    }
+    const auto found = m_byGeoset.find(record.geosetPtr);
+    if (found != m_byGeoset.end())
+      existingByGeoset = &found->second;
   }
   if (record.geosetDataPtr != nullptr) {
-    auto it = m_byGeosetData.find(record.geosetDataPtr);
-    if (it != m_byGeosetData.end() && it->second != nullptr) {
-      const ShadowGeosetResourceRecord existingData =
-          materializeGeosetDataRecordLocked(record.geosetDataPtr,
-                                            it->second);
-      noteContentHash(existingData.contentHash);
-      MergeGeosetRecord(merged, existingData);
-      if (!hadExisting) {
-        existing = existingData;
-        hadExisting = true;
-      }
+    const auto found = m_byGeosetData.find(record.geosetDataPtr);
+    if (found != m_byGeosetData.end())
+      existingByData = found->second;
+  }
+
+  const bool sourceIdentityTransition =
+      existingByGeoset != nullptr &&
+      existingByGeoset->geosetDataPtr != nullptr &&
+      record.geosetDataPtr != nullptr &&
+      existingByGeoset->geosetDataPtr != record.geosetDataPtr;
+  const bool pendingAliasResolution = !sourceIdentityTransition &&
+      existingByGeoset != nullptr && existingByData != nullptr &&
+      existingByGeoset->geosetDataPtr == record.geosetDataPtr &&
+      existingByGeoset->immutableModelGeneration == 0u &&
+      existingByGeoset->immutableCaptureStatus !=
+          ShadowGeosetImmutableCaptureStatus::Complete &&
+      existingByData->immutableModelGeneration != 0u &&
+      existingByData->readyForShadowConsumer();
+  const bool forceFreshGeneration = sourceIdentityTransition ||
+      pendingAliasResolution ||
+      (existingByGeoset != nullptr &&
+       existingByGeoset->geosetDataPtr == record.geosetDataPtr &&
+       existingByGeoset->immutableModelGeneration == 0u &&
+       existingByGeoset->immutableCaptureStatus !=
+           ShadowGeosetImmutableCaptureStatus::Complete);
+
+  // A header-only or failed observation of alias P moving to canonical data B
+  // must neither inherit A's vectors nor tombstone B's independently complete
+  // snapshot. Publish only an unresolved per-geoset record until P itself has
+  // a complete capture.
+  if ((sourceIdentityTransition || pendingAliasResolution) &&
+      record.immutableCaptureStatus !=
+          ShadowGeosetImmutableCaptureStatus::Complete) {
+    ShadowGeosetResourceRecord unresolved = {};
+    MergeGeosetMetadata(unresolved, *existingByGeoset);
+    MergeGeosetMetadata(unresolved, record);
+    unresolved.immutableCaptureStatus = record.immutableCaptureStatus;
+    unresolved.immutableModelGeneration = 0u;
+    unresolved.contentHash = ComputeGeosetContentHash(unresolved);
+    const bool changed = existingByGeoset->immutableModelGeneration != 0u ||
+        existingByGeoset->immutableCaptureStatus !=
+            unresolved.immutableCaptureStatus ||
+        !HasSameGeosetConsumerContent(*existingByGeoset, unresolved);
+    m_byGeoset[unresolved.geosetPtr] = unresolved;
+    if (changed)
+      m_revision.fetch_add(1u, std::memory_order_relaxed);
+    return std::make_shared<ShadowGeosetResourceRecord>(unresolved);
+  }
+
+  ShadowGeosetResourceRecord merged = {};
+  if (existingByGeoset != nullptr)
+    MergeGeosetMetadata(merged, *existingByGeoset);
+  if (existingByData != nullptr)
+    MergeGeosetMetadata(merged, *existingByData);
+  MergeGeosetMetadata(merged, record);
+
+  if (record.immutableCaptureStatus ==
+      ShadowGeosetImmutableCaptureStatus::Complete) {
+    // A successful capture is a full replacement, never a partial vector
+    // merge. This allows legitimate stream removal and prevents old payload
+    // inheritance across aliases.
+    ReplaceGeosetImmutablePayload(merged, record);
+  } else if (record.immutableCaptureStatus ==
+      ShadowGeosetImmutableCaptureStatus::AttemptedFailed) {
+    // Publish a non-ready tombstone for the current data identity. Clear all
+    // old payload so ready-pointer early-outs cannot make the failure sticky.
+    merged.immutableCaptureStatus =
+        ShadowGeosetImmutableCaptureStatus::AttemptedFailed;
+    merged.immutableModelGeneration = 0u;
+    merged.contentHash = ComputeGeosetContentHash(merged);
+  } else {
+    // Header-only metadata may reuse immutable bytes only from the same
+    // canonical data identity.
+    if (existingByData != nullptr)
+      ReplaceGeosetImmutablePayload(merged, *existingByData);
+    else if (existingByGeoset != nullptr && !sourceIdentityTransition)
+      ReplaceGeosetImmutablePayload(merged, *existingByGeoset);
+  }
+
+  if (merged.contentHash == 0u)
+    merged.contentHash = ComputeGeosetContentHash(merged);
+  uint64_t generation = 0u;
+  const bool completeConsumerPayload =
+      merged.hasCompleteImmutableConsumerPayload();
+  if (completeConsumerPayload) {
+    // A geoset alias moving A -> B -> A is a new source-lifetime
+    // publication even when canonical A still has identical bytes. Never
+    // resurrect A's earlier generation across that identity transition.
+    if (!forceFreshGeneration && existingByData != nullptr &&
+        existingByData->immutableModelGeneration != 0u &&
+        existingByData->immutableCaptureStatus ==
+            ShadowGeosetImmutableCaptureStatus::Complete &&
+        SameShadowGeosetImmutableConsumerPayload(
+            *existingByData, merged)) {
+      generation = existingByData->immutableModelGeneration;
+    } else if (!forceFreshGeneration && existingByData == nullptr &&
+        existingByGeoset != nullptr &&
+        existingByGeoset->geosetDataPtr == merged.geosetDataPtr &&
+        existingByGeoset->immutableModelGeneration != 0u &&
+        existingByGeoset->immutableCaptureStatus ==
+            ShadowGeosetImmutableCaptureStatus::Complete &&
+        SameShadowGeosetImmutableConsumerPayload(
+            *existingByGeoset, merged)) {
+      generation = existingByGeoset->immutableModelGeneration;
+    } else {
+      generation = m_immutableModelGenerations.issue();
     }
   }
-  noteContentHash(record.contentHash);
-  MergeGeosetRecord(merged, record);
-  // 常见的重复绑定路径会携带同一个已计算哈希，因此保持 O(1)。只有局部/完整记录
-  // 或别名发生冲突、可能把不同快照的 vector 合并时，才重新计算最终字节的哈希。
-  // 当前只有纯头部捕获会给出零哈希，但仍在这里防御性固化不变量：未来若某个生产者
-  // 附带了未计算哈希的消费者字节，绝不能让它继承旧快照的过期哈希。
-  merged.contentHash = record.contentHash != 0 &&
-          contentHashesAgree && consistentContentHash != 0
-      ? consistentContentHash
-      : ComputeGeosetContentHash(merged);
+  merged.immutableModelGeneration = generation;
 
-  bool changed = !hadExisting || !HasSameGeosetConsumerContent(merged, existing);
+  const ShadowGeosetResourceRecord* comparison = existingByData != nullptr
+      ? existingByData.get() : existingByGeoset;
+  const bool changed = comparison == nullptr ||
+      comparison->immutableModelGeneration != merged.immutableModelGeneration ||
+      comparison->immutableCaptureStatus != merged.immutableCaptureStatus ||
+      !HasSameGeosetConsumerContent(*comparison, merged);
   if (merged.geosetPtr != nullptr)
     m_byGeoset[merged.geosetPtr] = merged;
   if (merged.geosetDataPtr != nullptr) {
     const auto current = m_byGeosetData.find(merged.geosetDataPtr);
     if (current == m_byGeosetData.end() || current->second == nullptr ||
+        current->second->immutableModelGeneration !=
+            merged.immutableModelGeneration ||
+        current->second->immutableCaptureStatus !=
+            merged.immutableCaptureStatus ||
         !HasSameGeosetConsumerContent(*current->second, merged)) {
       m_byGeosetData[merged.geosetDataPtr] =
           std::make_shared<ShadowGeosetResourceRecord>(merged);
@@ -950,6 +1199,12 @@ void ShadowModelResourceCache::storeGeosetRecord(
   }
   if (changed)
     m_revision.fetch_add(1u, std::memory_order_relaxed);
+  if (merged.geosetDataPtr != nullptr) {
+    const auto published = m_byGeosetData.find(merged.geosetDataPtr);
+    if (published != m_byGeosetData.end())
+      return published->second;
+  }
+  return std::make_shared<ShadowGeosetResourceRecord>(merged);
 }
 
 void ShadowModelResourceCache::storeModelRecord(
@@ -1008,15 +1263,23 @@ void ShadowModelResourceCache::recordGeosetCreate(void *geosetPtr) {
     return;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  bool aliasIdentityTransition = false;
   if (record.geosetPtr != nullptr) {
     const auto it = m_byGeoset.find(record.geosetPtr);
-    if (it != m_byGeoset.end() && it->second.readyForShadowConsumer()) {
+    const ShadowGeosetResourceRecord current = it != m_byGeoset.end()
+        ? materializeGeosetAliasRecordLocked(it->second)
+        : ShadowGeosetResourceRecord{};
+    aliasIdentityTransition = it != m_byGeoset.end() &&
+        current.geosetDataPtr != nullptr && record.geosetDataPtr != nullptr &&
+        current.geosetDataPtr != record.geosetDataPtr;
+    if (!aliasIdentityTransition && it != m_byGeoset.end() &&
+        current.readyForShadowConsumer()) {
       it->second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
-      noteGeosetDataMetadataLocked(it->second.geosetDataPtr, it->second);
+      noteGeosetDataMetadataLocked(current.geosetDataPtr, current);
       return;
     }
   }
-  if (record.geosetDataPtr != nullptr) {
+  if (!aliasIdentityTransition && record.geosetDataPtr != nullptr) {
     const auto it = m_byGeosetData.find(record.geosetDataPtr);
     if (it != m_byGeosetData.end() && it->second != nullptr &&
         it->second->readyForShadowConsumer()) {
@@ -1058,6 +1321,9 @@ void ShadowModelResourceCache::noteModelResourceBinding(void *modelResourcePtr,
   {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     auto it = m_byModelResource.find(modelResourcePtr);
+    if (it != m_byModelResource.end())
+      it->second.readyGeosetCount = CountReadyGeosets(
+          it->second, m_byGeoset, m_byGeosetData);
     if (it != m_byModelResource.end() &&
         it->second.readyForShadowConsumer() &&
         (modelKey == 0 || it->second.modelKey == 0 ||
@@ -1107,16 +1373,20 @@ void ShadowModelResourceCache::noteModelResourceBinding(void *modelResourcePtr,
   for (uint32_t i = 0; i < modelRecord.geosetCount; ++i) {
     ShadowGeosetResourceRecord geosetRecord = {};
     auto itGeoset = m_byGeoset.find(geosetPtrs[i]);
-    if (itGeoset != m_byGeoset.end() &&
-        itGeoset->second.readyForShadowConsumer()) {
-      geosetRecord = itGeoset->second;
-    } else if (CaptureGeosetRecord(geosetPtrs[i], geosetRecord)) {
-      if (geosetRecord.firstSeenFrame == 0)
-        geosetRecord.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
-    } else if (itGeoset != m_byGeoset.end()) {
-      geosetRecord = itGeoset->second;
-    } else {
-      continue;
+    if (itGeoset != m_byGeoset.end())
+      geosetRecord = materializeGeosetAliasRecordLocked(itGeoset->second);
+    if (!geosetRecord.readyForShadowConsumer()) {
+      ShadowGeosetResourceRecord captured = {};
+      if (CaptureGeosetRecord(geosetPtrs[i], captured)) {
+        MergeGeosetMetadata(captured, geosetRecord);
+        geosetRecord = std::move(captured);
+        if (geosetRecord.firstSeenFrame == 0) {
+          geosetRecord.firstSeenFrame =
+              m_frameNumber.load(std::memory_order_relaxed);
+        }
+      } else if (itGeoset == m_byGeoset.end()) {
+        continue;
+      }
     }
 
     geosetRecord.modelResourcePtr = modelResourcePtr;
@@ -1124,10 +1394,12 @@ void ShadowModelResourceCache::noteModelResourceBinding(void *modelResourcePtr,
       geosetRecord.modelKey = modelKey;
     geosetRecord.geosetIndex = i;
     geosetRecord.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
-    storeGeosetRecord(geosetRecord);
+    const ShadowGeosetResourceSnapshot published =
+        storeGeosetRecord(geosetRecord);
 
-    modelRecord.geosetDataPtrs[i] = geosetRecord.geosetDataPtr;
-    if (geosetRecord.readyForShadowConsumer())
+    modelRecord.geosetDataPtrs[i] = published != nullptr
+        ? published->geosetDataPtr : nullptr;
+    if (published != nullptr && published->readyForShadowConsumer())
       ++modelRecord.readyGeosetCount;
   }
 
@@ -1153,6 +1425,9 @@ void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
   {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     auto it = m_byRuntimeModel.find(runtimeModelPtr);
+    if (it != m_byRuntimeModel.end())
+      it->second.readyGeosetCount = CountReadyGeosets(
+          it->second, m_byGeoset, m_byGeosetData);
     if (it != m_byRuntimeModel.end() &&
         it->second.readyForShadowConsumer() &&
         (modelResourcePtr == nullptr ||
@@ -1170,6 +1445,9 @@ void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
 
     if (modelResourcePtr != nullptr) {
       auto modelIt = m_byModelResource.find(modelResourcePtr);
+      if (modelIt != m_byModelResource.end())
+        modelIt->second.readyGeosetCount = CountReadyGeosets(
+            modelIt->second, m_byGeoset, m_byGeosetData);
       if (modelIt != m_byModelResource.end() &&
           modelIt->second.readyForShadowConsumer()) {
         ShadowModelResourceRecord runtimeAlias = modelIt->second;
@@ -1226,11 +1504,19 @@ void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
     ShadowGeosetResourceRecord geosetRecord = {};
     auto itGeoset = m_byGeoset.find(geosetPtrs[i]);
     if (itGeoset != m_byGeoset.end()) {
-      geosetRecord = itGeoset->second;
-    } else {
-      geosetRecord.geosetPtr = geosetPtrs[i];
-      TryReadGeosetDataPtr(geosetPtrs[i], geosetRecord.geosetDataPtr);
-      geosetRecord.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+      geosetRecord = materializeGeosetAliasRecordLocked(itGeoset->second);
+    }
+    if (!geosetRecord.readyForShadowConsumer()) {
+      ShadowGeosetResourceRecord captured = {};
+      if (CaptureGeosetRecord(geosetPtrs[i], captured)) {
+        MergeGeosetMetadata(captured, geosetRecord);
+        geosetRecord = std::move(captured);
+      } else if (itGeoset == m_byGeoset.end()) {
+        geosetRecord.geosetPtr = geosetPtrs[i];
+        TryReadGeosetDataPtr(geosetPtrs[i], geosetRecord.geosetDataPtr);
+        geosetRecord.firstSeenFrame =
+            m_frameNumber.load(std::memory_order_relaxed);
+      }
     }
 
     geosetRecord.geosetPtr = geosetPtrs[i];
@@ -1242,10 +1528,12 @@ void ShadowModelResourceCache::noteRuntimeModelBinding(void* runtimeModelPtr,
     if (modelKey != 0)
       geosetRecord.modelKey = modelKey;
     geosetRecord.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
-    storeGeosetRecord(geosetRecord);
+    const ShadowGeosetResourceSnapshot published =
+        storeGeosetRecord(geosetRecord);
 
-    runtimeRecord.geosetDataPtrs[i] = geosetRecord.geosetDataPtr;
-    if (geosetRecord.readyForShadowConsumer())
+    runtimeRecord.geosetDataPtrs[i] = published != nullptr
+        ? published->geosetDataPtr : nullptr;
+    if (published != nullptr && published->readyForShadowConsumer())
       ++runtimeRecord.readyGeosetCount;
   }
 
@@ -1286,10 +1574,13 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
     if (runtimeGeosetPtr != nullptr) {
       const auto itGeoset = m_byGeoset.find(runtimeGeosetPtr);
       if (itGeoset != m_byGeoset.end()) {
-        geosetRecord = itGeoset->second;
+        geosetRecord = materializeGeosetAliasRecordLocked(itGeoset->second);
         alreadyRefreshedThisFrame =
             geosetRecord.prefersRuntimeContract &&
-            geosetRecord.lastRuntimeRefreshFrame == m_frameNumber.load(std::memory_order_relaxed);
+            geosetRecord.lastRuntimeRefreshFrame ==
+                m_frameNumber.load(std::memory_order_relaxed) &&
+            (runtimeGeosetDataPtr == nullptr ||
+             geosetRecord.geosetDataPtr == runtimeGeosetDataPtr);
       }
     }
     if (geosetRecord.geosetPtr == nullptr && runtimeGeosetDataPtr != nullptr) {
@@ -1310,12 +1601,16 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
     if (CaptureGeosetRecordFromKnownPtrs(runtimeGeosetPtr, runtimeGeosetDataPtr,
                                          liveRuntimeRecord)) {
       if (geosetRecord.geosetPtr != nullptr || geosetRecord.geosetDataPtr != nullptr) {
-        ShadowGeosetResourceRecord mergedRecord = geosetRecord;
-        MergeGeosetRecord(mergedRecord, liveRuntimeRecord);
+        ShadowGeosetResourceRecord mergedRecord = {};
+        MergeGeosetMetadata(mergedRecord, geosetRecord);
+        MergeGeosetMetadata(mergedRecord, liveRuntimeRecord);
+        ReplaceGeosetImmutablePayload(mergedRecord, liveRuntimeRecord);
         geosetRecord = std::move(mergedRecord);
       } else {
         geosetRecord = std::move(liveRuntimeRecord);
       }
+    } else {
+      return;
     }
   }
 
@@ -1356,7 +1651,10 @@ void ShadowModelResourceCache::noteRuntimeGeosetBinding(
     geosetRecord.modelResourcePtr = modelResourcePtr;
   if (modelKey != 0)
     geosetRecord.modelKey = modelKey;
-  storeGeosetRecord(geosetRecord);
+  const ShadowGeosetResourceSnapshot published =
+      storeGeosetRecord(geosetRecord);
+  if (published != nullptr)
+    geosetRecord = *published;
 
   if (runtimeModelPtr != nullptr && geosetIndex != kInvalidShadowGeosetIndex) {
     ShadowModelResourceRecord runtimeRecord = {};
@@ -1416,11 +1714,11 @@ bool ShadowModelResourceCache::findGeosetByPtr(
   if (geosetPtr == nullptr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byGeoset.find(geosetPtr);
   if (it == m_byGeoset.end())
     return false;
-  out = it->second;
+  out = materializeGeosetAliasRecordLocked(it->second);
   return true;
 }
 
@@ -1495,7 +1793,17 @@ bool ShadowModelResourceCache::findGeosetStampByData(
     return false;
   out.geosetDataPtr = it->second->geosetDataPtr;
   out.contentHash = it->second->contentHash;
+  out.immutableModelGeneration =
+      it->second->immutableModelGeneration;
   out.vertexCount = it->second->vertexCount;
+  out.immutableCaptureStatus =
+      it->second->immutableCaptureStatus;
+  if (out.contentHash == 0u || out.immutableModelGeneration == 0u ||
+      out.vertexCount == 0u || out.immutableCaptureStatus !=
+          ShadowGeosetImmutableCaptureStatus::Complete) {
+    out = {};
+    return false;
+  }
   return true;
 }
 
@@ -1506,15 +1814,26 @@ bool ShadowModelResourceCache::hydrateGeosetByKnownPtrs(
     return false;
 
   {
-    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    bool aliasIdentityTransition = false;
+    bool aliasRequiresCapture = false;
     if (geosetPtr != nullptr) {
       const auto it = m_byGeoset.find(geosetPtr);
-      if (it != m_byGeoset.end() && it->second.readyForShadowConsumer()) {
-        out = it->second;
-        return true;
+      if (it != m_byGeoset.end()) {
+        ShadowGeosetResourceRecord current =
+            materializeGeosetAliasRecordLocked(it->second);
+        aliasIdentityTransition = current.geosetDataPtr != nullptr &&
+            geosetDataPtr != nullptr &&
+            current.geosetDataPtr != geosetDataPtr;
+        aliasRequiresCapture = !current.readyForShadowConsumer();
+        if (!aliasIdentityTransition && current.readyForShadowConsumer()) {
+          out = std::move(current);
+          return true;
+        }
       }
     }
-    if (geosetDataPtr != nullptr) {
+    if (!aliasIdentityTransition && !aliasRequiresCapture &&
+        geosetDataPtr != nullptr) {
       const auto it = m_byGeosetData.find(geosetDataPtr);
       if (it != m_byGeosetData.end() && it->second != nullptr &&
           it->second->readyForShadowConsumer()) {
@@ -1527,16 +1846,22 @@ bool ShadowModelResourceCache::hydrateGeosetByKnownPtrs(
   ShadowGeosetResourceRecord hydrated = {};
   if (!CaptureGeosetRecordFromKnownPtrs(geosetPtr, geosetDataPtr, hydrated))
     return false;
-  if (!hydrated.readyForShadowConsumer())
+  if (!hydrated.hasCompleteImmutableConsumerPayload())
     return false;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
   if (hydrated.firstSeenFrame == 0)
     hydrated.firstSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   hydrated.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
-  storeGeosetRecord(hydrated);
-  out = hydrated;
-  return true;
+  const ShadowGeosetResourceSnapshot published = storeGeosetRecord(hydrated);
+  if (published == nullptr)
+    return false;
+  out = published->geosetDataPtr != nullptr
+      ? materializeGeosetDataRecordLocked(
+            published->geosetDataPtr, published)
+      : *published;
+  return out.immutableModelGeneration != 0u &&
+      out.readyForShadowConsumer();
 }
 
 bool ShadowModelResourceCache::findModelGeoset(
@@ -1546,7 +1871,7 @@ bool ShadowModelResourceCache::findModelGeoset(
   if (modelResourcePtr == nullptr || geosetIndex == kInvalidShadowGeosetIndex)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   const auto itModel = m_byModelResource.find(modelResourcePtr);
   if (itModel == m_byModelResource.end())
     return false;
@@ -1559,7 +1884,7 @@ bool ShadowModelResourceCache::findModelGeoset(
   if (geosetPtr != nullptr) {
     const auto itGeoset = m_byGeoset.find(const_cast<void *>(geosetPtr));
     if (itGeoset != m_byGeoset.end()) {
-      out = itGeoset->second;
+      out = materializeGeosetAliasRecordLocked(itGeoset->second);
       return true;
     }
   }
@@ -1588,7 +1913,7 @@ bool ShadowModelResourceCache::findRuntimeModelGeoset(
   if (runtimeModelPtr == nullptr || geosetIndex == kInvalidShadowGeosetIndex)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   const auto itRuntime = m_byRuntimeModel.find(runtimeModelPtr);
   if (itRuntime == m_byRuntimeModel.end())
     return false;
@@ -1601,7 +1926,7 @@ bool ShadowModelResourceCache::findRuntimeModelGeoset(
   if (geosetPtr != nullptr) {
     const auto itGeoset = m_byGeoset.find(const_cast<void*>(geosetPtr));
     if (itGeoset != m_byGeoset.end()) {
-      out = itGeoset->second;
+      out = materializeGeosetAliasRecordLocked(itGeoset->second);
       return true;
     }
   }
@@ -1633,7 +1958,7 @@ bool ShadowModelResourceCache::findRuntimeModelOwner(
 
   modelResourcePtr = TryResolveDirectModelResourcePtr(modelResourcePtr);
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto tryIndexedOwner = [&](const std::unordered_map<void*, void*>& index,
                              void* key) -> bool {
     if (key == nullptr)
@@ -1695,7 +2020,7 @@ bool ShadowModelResourceCache::findRuntimeModelOwnerIndexed(
   if (runtimeGeosetPtr == nullptr && runtimeGeosetDataPtr == nullptr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   auto tryIndexedOwner = [&](const std::unordered_map<void*, void*>& index,
                              void* key) -> bool {
     if (key == nullptr)
@@ -1723,11 +2048,13 @@ bool ShadowModelResourceCache::findModelResource(
   if (modelResourcePtr == nullptr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byModelResource.find(modelResourcePtr);
   if (it == m_byModelResource.end())
     return false;
   out = it->second;
+  out.readyGeosetCount = CountReadyGeosets(
+      out, m_byGeoset, m_byGeosetData);
   return true;
 }
 
@@ -1737,11 +2064,13 @@ bool ShadowModelResourceCache::findRuntimeModelResource(
   if (runtimeModelPtr == nullptr)
     return false;
 
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byRuntimeModel.find(runtimeModelPtr);
   if (it == m_byRuntimeModel.end())
     return false;
   out = it->second;
+  out.readyGeosetCount = CountReadyGeosets(
+      out, m_byGeoset, m_byGeosetData);
   return true;
 }
 
@@ -1761,7 +2090,7 @@ ShadowModelResourceCache::snapshotGeosets() const {
   std::vector<ShadowGeosetResourceRecord> out;
   out.reserve(m_byGeoset.size() + m_byGeosetData.size());
   for (const auto &it : m_byGeoset)
-    out.push_back(it.second);
+    out.push_back(materializeGeosetAliasRecordLocked(it.second));
   for (const auto& it : m_byGeosetData) {
     if (it.second == nullptr)
       continue;
@@ -1813,7 +2142,8 @@ size_t ShadowModelResourceCache::readyGeosetCount() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = 0;
   for (const auto &it : m_byGeoset) {
-    if (it.second.readyForShadowConsumer())
+    if (materializeGeosetAliasRecordLocked(
+            it.second).readyForShadowConsumer())
       ++count;
   }
   for (const auto& it : m_byGeosetData) {

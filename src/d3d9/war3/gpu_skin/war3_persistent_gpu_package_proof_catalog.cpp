@@ -156,6 +156,7 @@ uint64_t War3PersistentGpuPackageProofCatalog::canonicalDigest(
   HashU64(hash, proof.packageGeneration);
   HashU64(hash, uint64_t(proof.geosetData));
   HashU64(hash, proof.contentHash);
+  HashU64(hash, proof.immutableModelGeneration);
   HashU64(hash, proof.positionContentHash);
   HashU64(hash, proof.normalContentHash);
   HashU64(hash, proof.vertexGroupContentHash);
@@ -225,6 +226,7 @@ bool War3PersistentGpuPackageProofCatalog::validPreparedPackage(
       proof.packageGeneration != key.packageGeneration ||
       proof.geosetData != key.geosetData ||
       proof.contentHash != key.contentHash ||
+      proof.immutableModelGeneration != key.immutableModelGeneration ||
       proof.layoutGeneration != key.layoutGeneration ||
       primitive.ordinal != key.primitiveOrdinal ||
       proof.positionContentHash == 0u || proof.normalContentHash == 0u ||

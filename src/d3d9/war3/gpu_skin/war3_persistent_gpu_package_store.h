@@ -15,6 +15,8 @@ namespace dxvk::war3::gpu_skin {
 // the existing manager-disabled construction boundary unchanged.
 class War3PersistentGpuPackageStore final {
 public:
+  static constexpr uint32_t kStaticPackingLayoutGeneration =
+      kPersistentGpuPackageStaticLayoutGeneration;
   static constexpr bool kD3D9SharedOwnerEnabled = false;
   static constexpr bool kRequiresNativeBridge = false;
   // A submitted package upload owns both sides of the copy until its producer
@@ -27,6 +29,22 @@ public:
   // future shared D3D9 owner must additionally publish an exact last-use fence
   // for Main/CSM/point/outline before this gate can be enabled.
   static constexpr bool kCrossEpochRetirementSafe = false;
+  // Cache generation alone cannot prove current Game.dll memory because the
+  // legacy cache is not map-scoped and has ready-pointer early outs.
+  static constexpr bool kCurrentStageSourceAuthorityIntegrated = false;
+  static constexpr bool kStaticHintCurrentGenerationAuthorityIntegrated =
+      true;
+  // This is a capability declaration, not a runtime thread guard. The public
+  // GpuSkinStaticUpload still exposes key/slices, and the interval from Store
+  // creation through manager EmitCs recording has no sealed transaction token
+  // or final exact revalidation. P2 must close both before publication.
+  static constexpr bool kRecordingThreadOwnershipIntegrated = false;
+  // P1 freezes immutable content only. Legacy Ready still means the upload was
+  // accepted for submission; it is not producer-fence completion authority.
+  static constexpr bool kProducerCompletionAuthorityIntegrated = false;
+  // GPU slice/usage checks run in production validation, but the isolated
+  // CPU runnable intentionally constructs no DxvkDevice/DxvkBuffer.
+  static constexpr bool kFrozenGpuSliceRunnableIntegrated = false;
 
   War3PersistentGpuPackageStore(
       Rc<DxvkDevice> device,
@@ -82,6 +100,8 @@ private:
   struct QueuedStaticMiss {
     GpuSkinStaticResourceKey key;
     model::ShadowGeosetResourceSnapshot record;
+    PersistentGpuPackageImmutableProof immutableProof;
+    std::vector<PersistentGpuPackagePrimitiveProof> primitiveProofs;
   };
 
   struct RetiredStaticUpload {
@@ -99,6 +119,8 @@ private:
       uint32_t layoutGeneration) const;
   std::shared_ptr<GpuSkinStaticResource> createStaticResource(
       const QueuedStaticMiss& miss);
+  bool ownsFrozenPayload(
+      const GpuSkinStaticResource& resource) const noexcept;
   void recordFallback(GpuSkinFallbackReason reason);
   void clearEpochResources();
   void deferOutstandingProducerRetirements() noexcept;
@@ -109,6 +131,7 @@ private:
   GpuSkinDiagnostics& m_diagnostics;
   uint64_t m_mapEpoch = 0u;
   uint64_t m_deviceEpoch = 0u;
+  uint64_t m_instanceAuthority = 0u;
   uint64_t m_nextStaticPackageGeneration = 1u;
   VkDeviceSize m_staticBytes = 0u;
   VkDeviceSize m_staticCursor = 0u;
@@ -130,5 +153,15 @@ static_assert(!War3PersistentGpuPackageStore::kRequiresNativeBridge);
 static_assert(
     War3PersistentGpuPackageStore::kProducerRetirementSurvivesEpochClear);
 static_assert(!War3PersistentGpuPackageStore::kCrossEpochRetirementSafe);
+static_assert(!War3PersistentGpuPackageStore::
+    kCurrentStageSourceAuthorityIntegrated);
+static_assert(War3PersistentGpuPackageStore::
+    kStaticHintCurrentGenerationAuthorityIntegrated);
+static_assert(!War3PersistentGpuPackageStore::
+    kRecordingThreadOwnershipIntegrated);
+static_assert(!War3PersistentGpuPackageStore::
+    kProducerCompletionAuthorityIntegrated);
+static_assert(!War3PersistentGpuPackageStore::
+    kFrozenGpuSliceRunnableIntegrated);
 
 }  // namespace dxvk::war3::gpu_skin

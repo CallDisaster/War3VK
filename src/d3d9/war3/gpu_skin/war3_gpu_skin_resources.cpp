@@ -240,7 +240,9 @@ size_t GpuSkinStaticResourceKeyHash::operator()(
   mix(key.deviceEpoch);
   mix(uint64_t(key.geosetData));
   mix(key.contentHash);
+  mix(key.immutableModelGeneration);
   mix(key.layoutGeneration);
+  mix(key.reserved);
   return size_t(hash ^ (hash >> 32u));
 }
 

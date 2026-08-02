@@ -152,6 +152,7 @@ d3d9_src = [
   'war3/gpu_skin/war3_persistent_gpu_package_observer.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_owner.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_proof_catalog.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_immutable.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_store.cpp',
   'war3/gpu_skin/war3_gpu_skin_resources.cpp',
   'war3/shadow/war3_shadow_runtime_contract.cpp',
@@ -313,6 +314,23 @@ war3_persistent_gpu_package_proof_catalog_test = executable(
 test(
   'war3_persistent_gpu_package_proof_catalog',
   war3_persistent_gpu_package_proof_catalog_test,
+  timeout : 30,
+)
+
+# CPU-only immutable model/package authority test. It never constructs a
+# device, Store, renderer, atlas or GPU slice.
+war3_persistent_gpu_package_immutable_test = executable(
+  'war3_persistent_gpu_package_immutable_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_immutable.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_immutable_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_immutable',
+  war3_persistent_gpu_package_immutable_test,
   timeout : 30,
 )
 

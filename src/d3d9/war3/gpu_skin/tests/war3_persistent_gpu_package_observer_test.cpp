@@ -67,6 +67,8 @@ Catalog::PreparedPackage PreparedPackage(bool second) {
   proof.packageGeneration = prepared.key.packageGeneration;
   proof.geosetData = prepared.key.geosetData;
   proof.contentHash = prepared.key.contentHash;
+  proof.immutableModelGeneration =
+      prepared.key.immutableModelGeneration;
   proof.positionContentHash = second ? 59u : 61u;
   proof.normalContentHash = second ? 67u : 71u;
   proof.vertexGroupContentHash = second ? 73u : 79u;

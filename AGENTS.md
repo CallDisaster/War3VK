@@ -1,5 +1,47 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（Persistent Package P1 不可变源码发布权限闭合，未部署）
+
+本阶段只建立静态/刚性模型进入 persistent GPU package 之前的不可变源码与发布权限
+地基；没有接入 Main/CSM/点阴影/outline 共享消费，也没有改变已部署 DLL。运行时 gate、
+current Stage source authority、recording transaction、producer completion 与跨消费者
+use-fence 继续为硬关闭，不能把本阶段描述成已有性能收益。
+
+**不可变源码与代际合同**：
+
+- `ShadowModelResourceCache` 为每次完整源码生命周期铸造 process-monotonic、不可回绕的
+  immutable generation；position/normal/UV/primitive、bounds 与 matrix topology 必须
+  同代且完整。所有 count/copy/UV 读取失败均 fail-closed，不允许 partial merge。
+- 浮点 payload 采用 bit-exact 身份，`+0/-0` 不等，同 payload NaN 保持可重复。完整
+  `A -> B -> A`、以及 unresolved/failed -> Complete 均重新 capture 并取得新 generation，
+  即使最终 canonical bytes 与历史版本相同也不能复用旧发布权限。
+- by-geoset alias 只有自身 Complete 后才能 materialize 当前 by-data canonical；未完成或
+  失败 alias 保持 fail-closed，不能被 canonical Ready 状态“洗回”可消费。模型 readiness
+  与 ready count 均依据当前 alias + canonical publication 重新计算。
+
+**Store 与消费者提示合同**：
+
+- Store 只接受当前 cache 的 exact shared_ptr identity、固定 layout schema、私有 frozen
+  descriptor 与 store-instance monotonic token；提交前重新校验 streams、primitive 聚合、
+  bounds、matrix topology、实际 packed staging ranges/padding/hash。
+- immutable generation 进入 proof catalog digest/equality。Manager 的 bypass hint 会重新
+  核对当前 cache stamp 与 Store probe；duplicate/mismatch 退役保持 GPU slice 存活到 fence，
+  但返回 false，不能取得消费权限。
+- 当前仍不具备 multi-primitive publication、真实 GPU slice runnable、producer fence
+  completion、D3D9 shared owner/cross-epoch retirement，也没有证明 lock 外 Game.dll capture
+  的 single-writer/current-stage freshness。排队 miss 变 stale 只会浪费 atlas 预算，不会在
+  新 generation 下被误消费；后续必须以这些边界为 P2 门，不能提前打开 runtime gate。
+
+**最终静态验证**：
+
+- 六套 package source/static 合同 66/66 PASS；五个 Win32 package runnable 5/5 PASS。
+- Win32 `d3d9.dll` production build PASS，`ninja -C build32 -n` no-work；targeted
+  `git diff --check` 无 whitespace error（仅既有 LF -> CRLF 提示）。
+- `build32/src/d3d9/d3d9.dll`：32,734,530 bytes，SHA-256
+  `506A20B210C8E4F9E1A723DA29C7503C30F970DE1B5C47C32B004AC6B681A5E1`。
+- 已部署 `E:\\Work\\War3\\d3d9.dll` 仍保持物理验收基线 `9BF5E3D9...`；本阶段没有部署、
+  没有启动游戏。CPU-MT 三个未跟踪 value-contract 文件不属于本提交。
+
 ## 🚨 2026-08-02（点阴影纯 CPU Planner + 拒绝提交所有权闭合，运行时仍未接入）
 
 在既有 persistent worker mailbox 基础上拆出独立的 owned-value 点阴影 CPU planner；

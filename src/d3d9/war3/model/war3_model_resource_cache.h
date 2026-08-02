@@ -1,7 +1,11 @@
 #pragma once
 
+#include "war3_immutable_model_generation.h"
+
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -20,6 +24,12 @@ struct ShadowGeosetPrimitiveRecord {
 struct ShadowGeosetUvLayerRecord {
   uint32_t uvCount = 0;
   std::vector<float> uvPairs;
+};
+
+enum class ShadowGeosetImmutableCaptureStatus : uint8_t {
+  NotAttempted = 0u,
+  Complete = 1u,
+  AttemptedFailed = 2u,
 };
 
 struct ShadowGeosetResourceRecord {
@@ -58,12 +68,26 @@ struct ShadowGeosetResourceRecord {
   std::vector<uint32_t> matrixIndices;
 
   uint64_t contentHash = 0;
+  // Minted only by ShadowModelResourceCache under its unique writer lock.
+  // Callers may carry this value, but incoming values are never trusted or
+  // merged when the cache publishes a replacement immutable snapshot.
+  uint64_t immutableModelGeneration = 0;
+  ShadowGeosetImmutableCaptureStatus immutableCaptureStatus =
+      ShadowGeosetImmutableCaptureStatus::NotAttempted;
   uint64_t firstSeenFrame = 0;
   uint64_t lastSeenFrame = 0;
   uint64_t lastRuntimeRefreshFrame = 0;
 
+  bool hasCompleteImmutableConsumerPayload() const {
+    return immutableCaptureStatus ==
+            ShadowGeosetImmutableCaptureStatus::Complete &&
+        !positions.empty() &&
+        (!indices.empty() || !primitiveRecords.empty());
+  }
+
   bool readyForShadowConsumer() const {
-    return !positions.empty() && (!indices.empty() || !primitiveRecords.empty());
+    return immutableModelGeneration != 0u &&
+        hasCompleteImmutableConsumerPayload();
   }
 
   bool hasSkinningData() const {
@@ -71,6 +95,57 @@ struct ShadowGeosetResourceRecord {
            (!matrixGroupSizes.empty() || !matrixIndices.empty());
   }
 };
+
+inline bool SameShadowGeosetFloatPayloadBytes(
+    const std::vector<float>& lhs, const std::vector<float>& rhs) noexcept {
+  return lhs.size() == rhs.size() &&
+      (lhs.empty() || std::memcmp(lhs.data(), rhs.data(),
+          lhs.size() * sizeof(float)) == 0);
+}
+
+// Exact immutable payload equality used by the cache generation authority.
+// Pointer aliases, owner/model metadata and observation timestamps are
+// deliberately excluded: completing those fields does not change bytes a GPU
+// package would derive from this snapshot.  Every model stream that can affect
+// geometry, primitive topology or palette addressing remains included.
+inline bool SameShadowGeosetImmutableConsumerPayload(
+    const ShadowGeosetResourceRecord& lhs,
+    const ShadowGeosetResourceRecord& rhs) {
+  if (lhs.vertexCount != rhs.vertexCount ||
+      !SameShadowGeosetFloatPayloadBytes(lhs.positions, rhs.positions) ||
+      lhs.normalCount != rhs.normalCount ||
+      !SameShadowGeosetFloatPayloadBytes(lhs.normals, rhs.normals) ||
+      lhs.vertexGroupCount != rhs.vertexGroupCount ||
+      lhs.vertexGroupIndices != rhs.vertexGroupIndices ||
+      lhs.uvLayerCount != rhs.uvLayerCount ||
+      lhs.uvLayers.size() != rhs.uvLayers.size() ||
+      lhs.primitiveCount != rhs.primitiveCount ||
+      lhs.primitiveRecords.size() != rhs.primitiveRecords.size() ||
+      lhs.indexCount != rhs.indexCount ||
+      lhs.indices != rhs.indices ||
+      lhs.matrixGroupCount != rhs.matrixGroupCount ||
+      lhs.matrixGroupSizes != rhs.matrixGroupSizes ||
+      lhs.matrixIndexCount != rhs.matrixIndexCount ||
+      lhs.matrixIndices != rhs.matrixIndices) {
+    return false;
+  }
+
+  for (size_t i = 0u; i < lhs.uvLayers.size(); ++i) {
+    if (lhs.uvLayers[i].uvCount != rhs.uvLayers[i].uvCount ||
+        !SameShadowGeosetFloatPayloadBytes(
+            lhs.uvLayers[i].uvPairs, rhs.uvLayers[i].uvPairs))
+      return false;
+  }
+  for (size_t i = 0u; i < lhs.primitiveRecords.size(); ++i) {
+    if (lhs.primitiveRecords[i].primitiveTypeOrMaterialSlot !=
+            rhs.primitiveRecords[i].primitiveTypeOrMaterialSlot ||
+        lhs.primitiveRecords[i].indexCount !=
+            rhs.primitiveRecords[i].indexCount) {
+      return false;
+    }
+  }
+  return true;
+}
 
 // 消费者载荷以替换方式发布，发布后不再原地修改。长生命周期 GPU 消费者持有该
 // 快照即可越过缓存锁的生命周期，无需复制模型的每个 vector。
@@ -82,7 +157,10 @@ using ShadowGeosetResourceSnapshot =
 struct ShadowGeosetResourceStamp {
   void* geosetDataPtr = nullptr;
   uint64_t contentHash = 0;
+  uint64_t immutableModelGeneration = 0;
   uint32_t vertexCount = 0;
+  ShadowGeosetImmutableCaptureStatus immutableCaptureStatus =
+      ShadowGeosetImmutableCaptureStatus::NotAttempted;
 };
 
 struct ShadowModelResourceRecord {
@@ -120,6 +198,12 @@ struct ShadowModelResourceMemorySnapshot {
 
 class ShadowModelResourceCache {
 public:
+  // Cache snapshots are immutable once published, but legacy hot paths may
+  // reuse a ready pointer without re-reading Game.dll and the cache is not map
+  // epoch scoped. This proves cache-content identity only; a future renderer
+  // consumer still requires an exact current Stage11 source token.
+  static constexpr bool kImmutableGenerationProvesCurrentGameMemory = false;
+
   static ShadowModelResourceCache &instance();
 
   void beginFrame();
@@ -182,7 +266,8 @@ private:
     uint64_t lastRuntimeRefreshFrame = 0;
   };
 
-  void storeGeosetRecord(const ShadowGeosetResourceRecord &record);
+  ShadowGeosetResourceSnapshot storeGeosetRecord(
+      const ShadowGeosetResourceRecord &record);
   void storeModelRecord(const ShadowModelResourceRecord &record);
   void storeRuntimeModelRecord(const ShadowModelResourceRecord &record);
   void noteGeosetDataMetadataLocked(
@@ -190,6 +275,8 @@ private:
   ShadowGeosetResourceRecord materializeGeosetDataRecordLocked(
       void* geosetDataPtr,
       const ShadowGeosetResourceSnapshot& snapshot) const;
+  ShadowGeosetResourceRecord materializeGeosetAliasRecordLocked(
+      const ShadowGeosetResourceRecord& alias) const;
 
   // Phase 7.83：reader 路径（findGeoset*/findModel*/findRuntime*/snapshot*/*Count）
   // 远多于 writer。改 shared_mutex 让 reader 走 shared_lock，writer 走 unique_lock。
@@ -208,6 +295,12 @@ private:
   std::unordered_map<void *, void *> m_runtimeOwnerByGeosetData;
   std::atomic<uint64_t> m_frameNumber{0};
   std::atomic<uint64_t> m_revision{0};
+  // Process-lifetime source-generation authority.  This member is neither
+  // reset by map/device changes nor reachable outside the cache writer path.
+  ImmutableModelGenerationIssuer m_immutableModelGenerations;
 };
 
 } // namespace dxvk::war3::model
+
+static_assert(!dxvk::war3::model::ShadowModelResourceCache::
+    kImmutableGenerationProvesCurrentGameMemory);

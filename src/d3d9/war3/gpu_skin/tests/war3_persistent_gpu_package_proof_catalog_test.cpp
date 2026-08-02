@@ -68,6 +68,8 @@ Catalog::PreparedPackage ValidPrepared(uint32_t packageVariant = 0u) {
   proof.packageGeneration = prepared.key.packageGeneration;
   proof.geosetData = prepared.key.geosetData;
   proof.contentHash = prepared.key.contentHash;
+  proof.immutableModelGeneration =
+      prepared.key.immutableModelGeneration;
   proof.positionContentHash = 19u + packageVariant;
   proof.normalContentHash = 23u + packageVariant;
   proof.vertexGroupContentHash = 29u + packageVariant;

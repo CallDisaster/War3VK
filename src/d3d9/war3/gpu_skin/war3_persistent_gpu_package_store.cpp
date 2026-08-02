@@ -1,6 +1,7 @@
 #include "war3_persistent_gpu_package_store.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -10,6 +11,21 @@ namespace dxvk::war3::gpu_skin {
 namespace {
 
 constexpr VkDeviceSize kMinimumStorageBufferOffsetAlignment = 16u;
+
+std::atomic<uint64_t> g_nextStoreInstanceAuthority{1u};
+
+uint64_t AllocateStoreInstanceAuthority() noexcept {
+  uint64_t current = g_nextStoreInstanceAuthority.load(
+      std::memory_order_relaxed);
+  while (current != 0u &&
+         current != std::numeric_limits<uint64_t>::max()) {
+    if (g_nextStoreInstanceAuthority.compare_exchange_weak(
+            current, current + 1u, std::memory_order_relaxed,
+            std::memory_order_relaxed))
+      return current;
+  }
+  return 0u;
+}
 
 bool TryAlignUp(VkDeviceSize value, VkDeviceSize alignment,
                 VkDeviceSize& result) {
@@ -28,119 +44,6 @@ bool TryAlignUp(VkDeviceSize value, VkDeviceSize alignment,
 
   result = value + padding;
   return true;
-}
-
-void HashStaticBytesInto(uint64_t& hash, const void* data, size_t size) {
-  const auto* bytes = reinterpret_cast<const uint8_t*>(data);
-  for (size_t i = 0u; i < size; ++i)
-    hash = (hash ^ bytes[i]) * 0x100000001b3ull;
-}
-
-uint64_t HashStaticBytes(const void* data, size_t size) {
-  uint64_t hash = 0xcbf29ce484222325ull;
-  HashStaticBytesInto(hash, data, size);
-  return hash;
-}
-
-template <typename T>
-void HashStaticValueInto(uint64_t& hash, const T& value) {
-  HashStaticBytesInto(hash, &value, sizeof(value));
-}
-
-bool BuildPrimitiveProofs(
-    const model::ShadowGeosetResourceRecord& record,
-    std::vector<GpuSkinStaticPrimitiveProof>& proofs,
-    uint64_t& proofHash) {
-  proofs.clear();
-  proofHash = 0u;
-  if (record.primitiveCount == 0u ||
-      record.primitiveRecords.size() != record.primitiveCount ||
-      record.indices.size() != record.indexCount ||
-      record.vertexCount == 0u)
-    return false;
-
-  proofs.reserve(record.primitiveCount);
-  uint64_t firstIndex = 0u;
-  uint64_t aggregateHash = 0xcbf29ce484222325ull;
-  for (uint32_t ordinal = 0u; ordinal < record.primitiveCount; ++ordinal) {
-    const auto& primitive = record.primitiveRecords[ordinal];
-    const uint64_t indexCount = primitive.indexCount;
-    if (indexCount == 0u || firstIndex > record.indexCount ||
-        indexCount > uint64_t(record.indexCount) - firstIndex)
-      return false;
-
-    const auto begin = record.indices.begin() + size_t(firstIndex);
-    const auto end = begin + size_t(indexCount);
-    const auto minmax = std::minmax_element(begin, end);
-    if (minmax.first == end || *minmax.second >= record.vertexCount)
-      return false;
-
-    GpuSkinStaticPrimitiveProof proof = {};
-    proof.indexContentHash = HashStaticBytes(
-        &record.indices[size_t(firstIndex)],
-        size_t(indexCount) * sizeof(uint16_t));
-    proof.ordinal = ordinal;
-    proof.primitiveTypeOrMaterialSlot =
-        primitive.primitiveTypeOrMaterialSlot;
-    proof.firstIndex = uint32_t(firstIndex);
-    proof.indexCount = uint32_t(indexCount);
-    proof.minVertex = *minmax.first;
-    proof.maxVertex = *minmax.second;
-    if (proof.indexContentHash == 0u)
-      return false;
-
-    HashStaticValueInto(aggregateHash, proof.indexContentHash);
-    HashStaticValueInto(aggregateHash, proof.ordinal);
-    HashStaticValueInto(
-        aggregateHash, proof.primitiveTypeOrMaterialSlot);
-    HashStaticValueInto(aggregateHash, proof.firstIndex);
-    HashStaticValueInto(aggregateHash, proof.indexCount);
-    HashStaticValueInto(aggregateHash, proof.minVertex);
-    HashStaticValueInto(aggregateHash, proof.maxVertex);
-    proofs.push_back(proof);
-    firstIndex += indexCount;
-  }
-
-  if (firstIndex != record.indexCount || aggregateHash == 0u) {
-    proofs.clear();
-    return false;
-  }
-  proofHash = aggregateHash;
-  return true;
-}
-
-bool BuildLocalBounds(
-    const model::ShadowGeosetResourceRecord& record,
-    GpuSkinStaticPackageProof& proof) {
-  if (record.vertexCount == 0u ||
-      record.positions.size() != size_t(record.vertexCount) * 3u)
-    return false;
-
-  float bounds[6] = {
-      record.positions[0], record.positions[1], record.positions[2],
-      record.positions[0], record.positions[1], record.positions[2]};
-  for (uint32_t vertex = 0u; vertex < record.vertexCount; ++vertex) {
-    const float x = record.positions[size_t(vertex) * 3u + 0u];
-    const float y = record.positions[size_t(vertex) * 3u + 1u];
-    const float z = record.positions[size_t(vertex) * 3u + 2u];
-    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
-      return false;
-    bounds[0] = std::min(bounds[0], x);
-    bounds[1] = std::min(bounds[1], y);
-    bounds[2] = std::min(bounds[2], z);
-    bounds[3] = std::max(bounds[3], x);
-    bounds[4] = std::max(bounds[4], y);
-    bounds[5] = std::max(bounds[5], z);
-  }
-
-  proof.localBoundsHash = HashStaticBytes(bounds, sizeof(bounds));
-  proof.localMinX = bounds[0];
-  proof.localMinY = bounds[1];
-  proof.localMinZ = bounds[2];
-  proof.localMaxX = bounds[3];
-  proof.localMaxY = bounds[4];
-  proof.localMaxZ = bounds[5];
-  return proof.localBoundsHash != 0u;
 }
 
 resource_census::ResourceHandle RegisterStaticMirror(
@@ -218,169 +121,141 @@ DxvkBufferCreateInfo StaticUploadBufferInfo(
   return info;
 }
 
-bool GetValidatedStaticLayout(
-    const model::ShadowGeosetResourceRecord& record,
-    GpuSkinStaticSourceLayout* outLayout = nullptr) {
-  const uint64_t vertexCount = record.vertexCount;
-  if (record.geosetDataPtr == nullptr || vertexCount == 0u)
-    return false;
-  if (record.normalCount != vertexCount ||
-      record.vertexGroupCount != vertexCount ||
-      record.uvLayerCount > 2u ||
-      record.uvLayers.size() != record.uvLayerCount)
-    return false;
-  if (uint64_t(record.positions.size()) != vertexCount * 3u ||
-      uint64_t(record.normals.size()) != vertexCount * 3u ||
-      uint64_t(record.vertexGroupIndices.size()) != vertexCount)
-    return false;
+bool SameStaticLayout(
+    const GpuSkinStaticSourceLayout& lhs,
+    const GpuSkinStaticSourceLayout& rhs) noexcept {
+  return lhs.positionOffset == rhs.positionOffset &&
+      lhs.normalOffset == rhs.normalOffset &&
+      lhs.groupSlotOffset == rhs.groupSlotOffset &&
+      lhs.texcoord0Offset == rhs.texcoord0Offset &&
+      lhs.texcoord1Offset == rhs.texcoord1Offset &&
+      lhs.byteSize == rhs.byteSize;
+}
 
-  for (const auto& uv : record.uvLayers) {
-    if (uv.uvCount != vertexCount ||
-        uint64_t(uv.uvPairs.size()) != vertexCount * 2u)
+bool SameBufferSlice(
+    const DxvkBufferSlice& lhs, const DxvkBufferSlice& rhs) noexcept {
+  return lhs.defined() == rhs.defined() &&
+      (!lhs.defined() ||
+       (lhs.buffer() == rhs.buffer() && lhs.offset() == rhs.offset() &&
+        lhs.length() == rhs.length()));
+}
+
+bool SamePrimitiveVector(
+    const std::vector<GpuSkinStaticPrimitiveProof>& lhs,
+    const std::vector<GpuSkinStaticPrimitiveProof>& rhs) noexcept {
+  if (lhs.size() != rhs.size())
+    return false;
+  for (size_t i = 0u; i < lhs.size(); ++i) {
+    if (!SameGpuSkinStaticPrimitiveProof(lhs[i], rhs[i]))
       return false;
   }
-
-  const uint64_t groupEnd = vertexCount * 25u;
-  const uint64_t texcoord0Offset = (groupEnd + 3u) & ~uint64_t(3u);
-  const uint64_t byteSize = texcoord0Offset +
-      vertexCount * 8u * record.uvLayerCount;
-  if (byteSize > std::numeric_limits<uint32_t>::max())
-    return false;
-
-  const GpuSkinStaticSourceLayout layout = GetGpuSkinStaticSourceLayout(
-      record.vertexCount, record.uvLayerCount);
-  if (layout.byteSize != byteSize || layout.positionOffset != 0u ||
-      layout.normalOffset != vertexCount * 12u ||
-      layout.groupSlotOffset != vertexCount * 24u ||
-      layout.texcoord0Offset != texcoord0Offset ||
-      layout.texcoord1Offset != texcoord0Offset + vertexCount * 8u)
-    return false;
-
-  if (outLayout != nullptr)
-    *outLayout = layout;
   return true;
 }
 
-bool ValidatePrimitiveProofs(
-    const model::ShadowGeosetResourceRecord& record,
-    const std::vector<GpuSkinStaticPrimitiveProof>& proofs,
-    const GpuSkinStaticPackageProof& packageProof) {
-  if (packageProof.primitiveProofCount == 0u ||
-      packageProof.primitiveProofHash == 0u ||
-      proofs.size() != packageProof.primitiveProofCount ||
-      proofs.size() != record.primitiveRecords.size() ||
-      proofs.size() != record.primitiveCount)
+bool SameDerivedPrimitiveVector(
+    const std::vector<PersistentGpuPackagePrimitiveProof>& derived,
+    const std::vector<GpuSkinStaticPrimitiveProof>& frozen) noexcept {
+  if (derived.size() != frozen.size())
     return false;
-
-  uint64_t aggregateHash = 0xcbf29ce484222325ull;
-  uint64_t expectedFirstIndex = 0u;
-  for (size_t i = 0u; i < proofs.size(); ++i) {
-    const auto& proof = proofs[i];
-    const auto& primitive = record.primitiveRecords[i];
-    if (proof.indexContentHash == 0u || proof.ordinal != i ||
-        proof.primitiveTypeOrMaterialSlot !=
-            primitive.primitiveTypeOrMaterialSlot ||
-        proof.firstIndex != expectedFirstIndex ||
-        proof.indexCount == 0u ||
-        proof.indexCount != primitive.indexCount ||
-        proof.minVertex > proof.maxVertex ||
-        proof.maxVertex >= record.vertexCount ||
-        expectedFirstIndex > record.indexCount ||
-        proof.indexCount > uint64_t(record.indexCount) - expectedFirstIndex)
+  for (size_t i = 0u; i < derived.size(); ++i) {
+    const auto& lhs = derived[i];
+    const auto& rhs = frozen[i];
+    if (lhs.indexContentHash != rhs.indexContentHash ||
+        lhs.ordinal != rhs.ordinal ||
+        lhs.primitiveTypeOrMaterialSlot !=
+            rhs.primitiveTypeOrMaterialSlot ||
+        lhs.firstIndex != rhs.firstIndex ||
+        lhs.indexCount != rhs.indexCount ||
+        lhs.minVertex != rhs.minVertex ||
+        lhs.maxVertex != rhs.maxVertex) {
       return false;
-
-    HashStaticValueInto(aggregateHash, proof.indexContentHash);
-    HashStaticValueInto(aggregateHash, proof.ordinal);
-    HashStaticValueInto(
-        aggregateHash, proof.primitiveTypeOrMaterialSlot);
-    HashStaticValueInto(aggregateHash, proof.firstIndex);
-    HashStaticValueInto(aggregateHash, proof.indexCount);
-    HashStaticValueInto(aggregateHash, proof.minVertex);
-    HashStaticValueInto(aggregateHash, proof.maxVertex);
-    expectedFirstIndex += proof.indexCount;
+    }
   }
-  return expectedFirstIndex == record.indexCount &&
-      aggregateHash == packageProof.primitiveProofHash;
+  return true;
 }
 
-bool HasFiniteLocalBounds(const GpuSkinStaticPackageProof& proof) {
-  return proof.localBoundsHash != 0u &&
-      std::isfinite(proof.localMinX) &&
-      std::isfinite(proof.localMinY) &&
-      std::isfinite(proof.localMinZ) &&
-      std::isfinite(proof.localMaxX) &&
-      std::isfinite(proof.localMaxY) &&
-      std::isfinite(proof.localMaxZ) &&
-      proof.localMinX <= proof.localMaxX &&
-      proof.localMinY <= proof.localMaxY &&
-      proof.localMinZ <= proof.localMaxZ;
-}
+bool ValidateFrozenMirrorsAndGpuRanges(
+    const GpuSkinStaticResource& resource) noexcept {
+  const auto& frozen = resource.frozenPayload;
+  if (frozen == nullptr || frozen->storeInstanceAuthority() == 0u ||
+      frozen->snapshotIdentity() == nullptr || frozen->record() == nullptr ||
+      frozen->snapshotIdentity() != frozen->record().get() ||
+      resource.record == nullptr || resource.record.get() !=
+          frozen->snapshotIdentity() ||
+      !(resource.key == frozen->key()) ||
+      !SameGpuSkinStaticPackageProof(
+          resource.packageProof, frozen->packageProof()) ||
+      !SamePrimitiveVector(
+          resource.primitiveProofs, frozen->primitiveProofs()) ||
+      resource.indexContentHash != frozen->indexContentHash() ||
+      resource.maxVertexGroupSlot != frozen->maxVertexGroupSlot() ||
+      !SameStaticLayout(resource.sourceLayout, frozen->sourceLayout()) ||
+      !SameBufferSlice(resource.packageSlice, frozen->packageSlice()) ||
+      !SameBufferSlice(resource.staticSource, frozen->staticSource()) ||
+      !SameBufferSlice(resource.indexSource, frozen->indexSource()) ||
+      resource.indexType != frozen->indexType() ||
+      resource.indexCount != frozen->indexCount() ||
+      resource.allocatedBytes != frozen->allocatedBytes()) {
+    return false;
+  }
 
-}  // namespace
-
-bool ValidateGpuSkinStaticPackage(
-    const GpuSkinStaticResource& resource,
-    const GpuSkinStaticPackageProof& expected) noexcept {
-  if (resource.state != GpuSkinStaticResourceState::Ready ||
-      !SameGpuSkinStaticPackageProof(resource.packageProof, expected) ||
-      expected.mapEpoch == 0u || expected.deviceEpoch == 0u ||
-      expected.packageGeneration == 0u || expected.geosetData == 0u ||
-      expected.contentHash == 0u || expected.positionContentHash == 0u ||
-      expected.normalContentHash == 0u ||
-      expected.vertexGroupContentHash == 0u ||
-      expected.indexContentHash == 0u ||
-      expected.primitiveProofHash == 0u ||
-      expected.layoutGeneration == 0u || expected.vertexCount == 0u ||
-      expected.indexCount == 0u || expected.uvLayerCount > 2u ||
-      expected.primitiveProofCount == 0u ||
-      (expected.uvLayerCount == 0u &&
-          (expected.uv0ContentHash != 0u ||
-           expected.uv1ContentHash != 0u)) ||
-      (expected.uvLayerCount == 1u &&
-          (expected.uv0ContentHash == 0u ||
-           expected.uv1ContentHash != 0u)) ||
-      (expected.uvLayerCount == 2u &&
-          (expected.uv0ContentHash == 0u ||
-           expected.uv1ContentHash == 0u)) ||
-      !HasFiniteLocalBounds(expected) ||
-      expected.indexType != VK_INDEX_TYPE_UINT16 ||
-      expected.staticByteLength == 0u || expected.indexByteLength == 0u ||
-      resource.record == nullptr || resource.indexContentHash == 0u ||
-      resource.indexContentHash != expected.indexContentHash ||
-      resource.indexType != expected.indexType ||
-      resource.indexCount != expected.indexCount ||
+  const auto& expected = frozen->packageProof();
+  const auto& immutable = frozen->immutableProof();
+  const auto& record = *frozen->record();
+  if (resource.key.reserved != 0u || expected.mapEpoch == 0u ||
+      expected.deviceEpoch == 0u || expected.packageGeneration == 0u ||
+      expected.geosetData == 0u || expected.contentHash == 0u ||
+      expected.immutableModelGeneration == 0u ||
+      expected.layoutGeneration !=
+          kPersistentGpuPackageStaticLayoutGeneration ||
       resource.key.mapEpoch != expected.mapEpoch ||
       resource.key.deviceEpoch != expected.deviceEpoch ||
       resource.key.geosetData != expected.geosetData ||
       resource.key.contentHash != expected.contentHash ||
-      resource.key.layoutGeneration != expected.layoutGeneration) {
-    return false;
-  }
-
-  const model::ShadowGeosetResourceRecord& record = *resource.record;
-  GpuSkinStaticSourceLayout validatedLayout = {};
-  if (!GetValidatedStaticLayout(record, &validatedLayout) ||
+      resource.key.immutableModelGeneration !=
+          expected.immutableModelGeneration ||
+      resource.key.layoutGeneration != expected.layoutGeneration ||
       record.geosetDataPtr != reinterpret_cast<void*>(expected.geosetData) ||
       record.contentHash != expected.contentHash ||
-      record.vertexCount != expected.vertexCount ||
-      record.indexCount != expected.indexCount ||
-      record.uvLayerCount != expected.uvLayerCount ||
-      record.indices.size() != expected.indexCount ||
-      !ValidatePrimitiveProofs(
-          record, resource.primitiveProofs, expected) ||
-      resource.sourceLayout.positionOffset != validatedLayout.positionOffset ||
-      resource.sourceLayout.normalOffset != validatedLayout.normalOffset ||
-      resource.sourceLayout.groupSlotOffset != validatedLayout.groupSlotOffset ||
-      resource.sourceLayout.texcoord0Offset != validatedLayout.texcoord0Offset ||
-      resource.sourceLayout.texcoord1Offset != validatedLayout.texcoord1Offset ||
-      resource.sourceLayout.byteSize != validatedLayout.byteSize ||
-      expected.staticByteLength != validatedLayout.byteSize ||
+      record.immutableModelGeneration !=
+          expected.immutableModelGeneration ||
+      immutable.immutableModelGeneration !=
+          expected.immutableModelGeneration ||
+      immutable.contentHash != expected.contentHash ||
+      immutable.positionContentHash != expected.positionContentHash ||
+      immutable.normalContentHash != expected.normalContentHash ||
+      immutable.vertexGroupContentHash !=
+          expected.vertexGroupContentHash ||
+      immutable.uv0ContentHash != expected.uv0ContentHash ||
+      immutable.uv1ContentHash != expected.uv1ContentHash ||
+      immutable.indexContentHash != expected.indexContentHash ||
+      immutable.primitiveProofHash != expected.primitiveProofHash ||
+      immutable.localBoundsHash != expected.localBoundsHash ||
+      immutable.layoutGeneration != expected.layoutGeneration ||
+      immutable.vertexCount != expected.vertexCount ||
+      immutable.indexCount != expected.indexCount ||
+      immutable.uvLayerCount != expected.uvLayerCount ||
+      immutable.primitiveProofCount != expected.primitiveProofCount ||
+      immutable.localMinX != expected.localMinX ||
+      immutable.localMinY != expected.localMinY ||
+      immutable.localMinZ != expected.localMinZ ||
+      immutable.localMaxX != expected.localMaxX ||
+      immutable.localMaxY != expected.localMaxY ||
+      immutable.localMaxZ != expected.localMaxZ ||
+      expected.indexType != VK_INDEX_TYPE_UINT16 ||
+      expected.staticByteLength != immutable.staticByteSize ||
       uint64_t(expected.indexByteLength) !=
           uint64_t(expected.indexCount) * sizeof(uint16_t)) {
     return false;
   }
 
-  if (!resource.packageSlice.defined() ||
+  const GpuSkinStaticSourceLayout immutableLayout = {
+      immutable.positionOffset, immutable.normalOffset,
+      immutable.groupSlotOffset, immutable.texcoord0Offset,
+      immutable.texcoord1Offset, immutable.staticByteSize};
+  if (!SameStaticLayout(resource.sourceLayout, immutableLayout) ||
+      resource.maxVertexGroupSlot != immutable.maxVertexGroupSlot ||
+      !resource.packageSlice.defined() ||
       !resource.staticSource.defined() || !resource.indexSource.defined() ||
       resource.packageSlice.buffer() == nullptr ||
       resource.staticSource.buffer() != resource.packageSlice.buffer() ||
@@ -400,17 +275,19 @@ bool ValidateGpuSkinStaticPackage(
   const uint64_t staticLength = resource.staticSource.length();
   const uint64_t indexOffset = resource.indexSource.offset();
   const uint64_t indexLength = resource.indexSource.length();
-  if (staticOffset < packageOffset || indexOffset < packageOffset ||
+  const DxvkBufferCreateInfo& info = resource.packageSlice.buffer()->info();
+  if (packageOffset > info.size || packageLength > info.size - packageOffset ||
+      staticOffset < packageOffset || indexOffset < packageOffset ||
       staticLength > packageLength || indexLength > packageLength ||
       staticOffset - packageOffset > packageLength - staticLength ||
       indexOffset - packageOffset > packageLength - indexLength ||
+      staticOffset > std::numeric_limits<uint64_t>::max() - staticLength ||
       indexOffset < staticOffset + staticLength ||
       indexOffset - packageOffset + indexLength != packageLength ||
       indexOffset % alignof(uint16_t) != 0u) {
     return false;
   }
 
-  const DxvkBufferCreateInfo& info = resource.packageSlice.buffer()->info();
   constexpr VkBufferUsageFlags kRequiredUsage =
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
@@ -431,6 +308,36 @@ bool ValidateGpuSkinStaticPackage(
       (info.access & kRequiredAccess) == kRequiredAccess;
 }
 
+}  // namespace
+
+bool ValidateGpuSkinStaticPackage(
+    const GpuSkinStaticResource& resource) noexcept {
+  return resource.state == GpuSkinStaticResourceState::Ready &&
+      ValidateFrozenMirrorsAndGpuRanges(resource);
+}
+
+bool ValidateGpuSkinStaticFrozenPayload(
+    const GpuSkinStaticResource& resource) noexcept {
+  if (resource.state == GpuSkinStaticResourceState::Invalid ||
+      !ValidateFrozenMirrorsAndGpuRanges(resource) ||
+      resource.frozenPayload == nullptr ||
+      resource.frozenPayload->record() == nullptr) {
+    return false;
+  }
+
+  PersistentGpuPackageImmutableProof recomputed = {};
+  std::vector<PersistentGpuPackagePrimitiveProof> primitives;
+  if (!BuildPersistentGpuPackageImmutableProof(
+          *resource.frozenPayload->record(), recomputed, primitives) ||
+      !SamePersistentGpuPackageImmutableProof(
+          recomputed, resource.frozenPayload->immutableProof()) ||
+      !SameDerivedPrimitiveVector(
+          primitives, resource.frozenPayload->primitiveProofs())) {
+    return false;
+  }
+  return true;
+}
+
 War3PersistentGpuPackageStore::War3PersistentGpuPackageStore(
     Rc<DxvkDevice> device,
     const GpuSkinResourceBudgets& budgets,
@@ -440,7 +347,8 @@ War3PersistentGpuPackageStore::War3PersistentGpuPackageStore(
   m_budgets(budgets),
   m_storageBufferOffsetAlignment(std::max(
       storageBufferOffsetAlignment, kMinimumStorageBufferOffsetAlignment)),
-  m_diagnostics(diagnostics) {
+  m_diagnostics(diagnostics),
+  m_instanceAuthority(AllocateStoreInstanceAuthority()) {
 }
 
 War3PersistentGpuPackageStore::~War3PersistentGpuPackageStore() {
@@ -491,18 +399,34 @@ GpuSkinStaticResourceKey War3PersistentGpuPackageStore::makeKey(
   key.deviceEpoch = m_deviceEpoch;
   key.geosetData = reinterpret_cast<uintptr_t>(record.geosetDataPtr);
   key.contentHash = record.contentHash;
-  key.layoutGeneration = layoutGeneration;
+  key.immutableModelGeneration = record.immutableModelGeneration;
+  key.layoutGeneration = kStaticPackingLayoutGeneration;
+  if (layoutGeneration != kStaticPackingLayoutGeneration)
+    return {};
   return key;
 }
 
 GpuSkinStaticLookup War3PersistentGpuPackageStore::findOrQueueStatic(
     model::ShadowGeosetResourceSnapshot record,
     uint32_t layoutGeneration) {
-  if (record == nullptr) {
+  if (record == nullptr || m_instanceAuthority == 0u ||
+      layoutGeneration != kStaticPackingLayoutGeneration) {
     recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
     return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
   }
   const model::ShadowGeosetResourceRecord& snapshot = *record;
+  const model::ShadowGeosetResourceSnapshot cacheSnapshot =
+      model::ShadowModelResourceCache::instance().findGeosetSnapshotByData(
+          snapshot.geosetDataPtr);
+  if (cacheSnapshot == nullptr || cacheSnapshot.get() != record.get() ||
+      snapshot.geosetDataPtr == nullptr || snapshot.contentHash == 0u ||
+      snapshot.immutableModelGeneration == 0u ||
+      snapshot.immutableCaptureStatus !=
+          model::ShadowGeosetImmutableCaptureStatus::Complete ||
+      snapshot.vertexCount == 0u) {
+    recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
+    return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
+  }
   if (m_device == nullptr) {
     recordFallback(GpuSkinFallbackReason::DeviceLost);
     return {nullptr, GpuSkinFallbackReason::DeviceLost};
@@ -511,36 +435,18 @@ GpuSkinStaticLookup War3PersistentGpuPackageStore::findOrQueueStatic(
     recordFallback(GpuSkinFallbackReason::InvalidEpoch);
     return {nullptr, GpuSkinFallbackReason::InvalidEpoch};
   }
-  GpuSkinStaticSourceLayout requestedLayout;
-  if (!GetValidatedStaticLayout(snapshot, &requestedLayout)) {
-    recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
-    return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
-  }
-
   const GpuSkinStaticResourceKey key = makeKey(snapshot, layoutGeneration);
   const auto ready = m_staticResources.find(key);
   if (ready != m_staticResources.end()) {
     if (ready->second != nullptr &&
         ready->second->state == GpuSkinStaticResourceState::Ready) {
-      const GpuSkinStaticSourceLayout& cachedLayout =
-          ready->second->sourceLayout;
-      const bool exactLayout =
-          cachedLayout.positionOffset == requestedLayout.positionOffset &&
-          cachedLayout.normalOffset == requestedLayout.normalOffset &&
-          cachedLayout.groupSlotOffset == requestedLayout.groupSlotOffset &&
-          cachedLayout.texcoord0Offset == requestedLayout.texcoord0Offset &&
-          cachedLayout.texcoord1Offset == requestedLayout.texcoord1Offset &&
-          cachedLayout.byteSize == requestedLayout.byteSize &&
-          ready->second->staticSource.length() == requestedLayout.byteSize &&
+      const bool exactLayout = ownsFrozenPayload(*ready->second) &&
           ready->second->record != nullptr &&
           ready->second->record->contentHash == snapshot.contentHash &&
+          ready->second->record->immutableModelGeneration ==
+              snapshot.immutableModelGeneration &&
           ready->second->record->vertexCount == snapshot.vertexCount &&
-          ready->second->record->normalCount == snapshot.normalCount &&
-          ready->second->record->uvLayerCount == snapshot.uvLayerCount &&
-          ready->second->record->indexCount == snapshot.indexCount &&
-          ready->second->record->indices.size() == snapshot.indices.size() &&
-          ValidateGpuSkinStaticPackage(
-              *ready->second, ready->second->packageProof);
+          ValidateGpuSkinStaticPackage(*ready->second);
       if (!exactLayout) {
         recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
         return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
@@ -569,8 +475,17 @@ GpuSkinStaticLookup War3PersistentGpuPackageStore::findOrQueueStatic(
     return {nullptr, GpuSkinFallbackReason::MissQueueFull};
   }
 
+  PersistentGpuPackageImmutableProof immutableProof = {};
+  std::vector<PersistentGpuPackagePrimitiveProof> primitiveProofs;
+  if (!BuildPersistentGpuPackageImmutableProof(
+          snapshot, immutableProof, primitiveProofs)) {
+    recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
+    return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
+  }
+
   ++m_diagnostics.staticCacheMisses;
-  m_staticMisses.push_back({key, std::move(record)});
+  m_staticMisses.push_back(QueuedStaticMiss{
+      key, std::move(record), immutableProof, std::move(primitiveProofs)});
   m_peakQueuedStaticMissRecords = std::max<uint64_t>(
       m_peakQueuedStaticMissRecords, m_staticMisses.size());
   m_peakQueuedStaticMissHostBytes = std::max(
@@ -590,8 +505,27 @@ GpuSkinStaticLookup War3PersistentGpuPackageStore::probeStatic(
     recordFallback(GpuSkinFallbackReason::InvalidEpoch);
     return {nullptr, GpuSkinFallbackReason::InvalidEpoch};
   }
-  if (stamp.geosetDataPtr == nullptr || stamp.contentHash == 0u ||
+  if (layoutGeneration != kStaticPackingLayoutGeneration ||
+      m_instanceAuthority == 0u || stamp.geosetDataPtr == nullptr ||
+      stamp.contentHash == 0u || stamp.immutableModelGeneration == 0u ||
+      stamp.immutableCaptureStatus !=
+          model::ShadowGeosetImmutableCaptureStatus::Complete ||
       stamp.vertexCount == 0u) {
+    recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
+    return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
+  }
+
+  const model::ShadowGeosetResourceSnapshot currentSnapshot =
+      model::ShadowModelResourceCache::instance().findGeosetSnapshotByData(
+          stamp.geosetDataPtr);
+  if (currentSnapshot == nullptr ||
+      currentSnapshot->geosetDataPtr != stamp.geosetDataPtr ||
+      currentSnapshot->contentHash != stamp.contentHash ||
+      currentSnapshot->immutableModelGeneration !=
+          stamp.immutableModelGeneration ||
+      currentSnapshot->immutableCaptureStatus !=
+          model::ShadowGeosetImmutableCaptureStatus::Complete ||
+      currentSnapshot->vertexCount != stamp.vertexCount) {
     recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
     return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
   }
@@ -601,7 +535,8 @@ GpuSkinStaticLookup War3PersistentGpuPackageStore::probeStatic(
   key.deviceEpoch = m_deviceEpoch;
   key.geosetData = reinterpret_cast<uintptr_t>(stamp.geosetDataPtr);
   key.contentHash = stamp.contentHash;
-  key.layoutGeneration = layoutGeneration;
+  key.immutableModelGeneration = stamp.immutableModelGeneration;
+  key.layoutGeneration = kStaticPackingLayoutGeneration;
   const auto found = m_staticResources.find(key);
   if (found == m_staticResources.end()) {
     const auto queued = std::find_if(
@@ -635,8 +570,11 @@ GpuSkinStaticLookup War3PersistentGpuPackageStore::probeStatic(
   if (!(resource->key == key) || record == nullptr ||
       record->geosetDataPtr != stamp.geosetDataPtr ||
       record->contentHash != stamp.contentHash ||
+      record->immutableModelGeneration !=
+          stamp.immutableModelGeneration ||
       record->vertexCount != stamp.vertexCount ||
-      !ValidateGpuSkinStaticPackage(*resource, resource->packageProof)) {
+      !ownsFrozenPayload(*resource) ||
+      !ValidateGpuSkinStaticPackage(*resource)) {
     recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
     return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
   }
@@ -679,16 +617,37 @@ War3PersistentGpuPackageStore::createStaticResource(
   if (miss.record == nullptr)
     return nullptr;
   const model::ShadowGeosetResourceRecord& record = *miss.record;
-  GpuSkinStaticSourceLayout layout;
+  PersistentGpuPackageImmutableProof recomputedProof = {};
+  std::vector<PersistentGpuPackagePrimitiveProof> recomputedPrimitives;
+  if (!BuildPersistentGpuPackageImmutableProof(
+          record, recomputedProof, recomputedPrimitives) ||
+      !SamePersistentGpuPackageImmutableProof(
+          recomputedProof, miss.immutableProof) ||
+      recomputedPrimitives.size() != miss.primitiveProofs.size())
+    return nullptr;
+  for (size_t i = 0u; i < recomputedPrimitives.size(); ++i) {
+    if (!SamePersistentGpuPackagePrimitiveProof(
+            recomputedPrimitives[i], miss.primitiveProofs[i]))
+      return nullptr;
+  }
+
+  const GpuSkinStaticSourceLayout layout = {
+      recomputedProof.positionOffset, recomputedProof.normalOffset,
+      recomputedProof.groupSlotOffset, recomputedProof.texcoord0Offset,
+      recomputedProof.texcoord1Offset, recomputedProof.staticByteSize};
   if (m_device == nullptr || m_mapEpoch == 0u || m_deviceEpoch == 0u ||
+      m_instanceAuthority == 0u ||
       miss.key.mapEpoch != m_mapEpoch ||
       miss.key.deviceEpoch != m_deviceEpoch ||
       miss.key.geosetData !=
           reinterpret_cast<uintptr_t>(record.geosetDataPtr) ||
       miss.key.contentHash == 0u ||
       miss.key.contentHash != record.contentHash ||
-      miss.key.layoutGeneration == 0u ||
-      !GetValidatedStaticLayout(record, &layout))
+      miss.key.immutableModelGeneration == 0u ||
+      miss.key.immutableModelGeneration !=
+          record.immutableModelGeneration ||
+      miss.key.layoutGeneration != kStaticPackingLayoutGeneration ||
+      recomputedProof.layoutGeneration != kStaticPackingLayoutGeneration)
     return nullptr;
 
   if (record.indexCount == 0u ||
@@ -744,16 +703,15 @@ War3PersistentGpuPackageStore::createStaticResource(
   auto resource = std::make_shared<GpuSkinStaticResource>();
   resource->key = miss.key;
   resource->record = miss.record;
-  resource->indexContentHash = HashStaticBytes(
-      record.indices.data(), record.indices.size() * sizeof(uint16_t));
-  if (resource->indexContentHash == 0u)
-    return nullptr;
-  uint64_t primitiveProofHash = 0u;
-  if (!BuildPrimitiveProofs(
-          record, resource->primitiveProofs, primitiveProofHash))
-    return nullptr;
-  resource->maxVertexGroupSlot = *std::max_element(
-      record.vertexGroupIndices.begin(), record.vertexGroupIndices.end());
+  resource->indexContentHash = recomputedProof.indexContentHash;
+  resource->primitiveProofs.reserve(recomputedPrimitives.size());
+  for (const auto& primitive : recomputedPrimitives) {
+    resource->primitiveProofs.push_back(GpuSkinStaticPrimitiveProof{
+        primitive.indexContentHash, primitive.ordinal,
+        primitive.primitiveTypeOrMaterialSlot, primitive.firstIndex,
+        primitive.indexCount, primitive.minVertex, primitive.maxVertex});
+  }
+  resource->maxVertexGroupSlot = recomputedProof.maxVertexGroupSlot;
   resource->sourceLayout = layout;
   resource->indexType = VK_INDEX_TYPE_UINT16;
   resource->indexCount = record.indexCount;
@@ -791,6 +749,10 @@ War3PersistentGpuPackageStore::createStaticResource(
   }
   std::memcpy(blob + indexRelativeOffset, record.indices.data(),
       size_t(indexBytes));
+  if (!ValidatePersistentGpuPackagePackedBytes(
+          blob, uint64_t(packageBytes), uint64_t(indexRelativeOffset),
+          recomputedProof, recomputedPrimitives))
+    return nullptr;
 
   resource->packageSlice = DxvkBufferSlice(
       m_staticAtlas, atlasOffset, packageBytes);
@@ -810,43 +772,59 @@ War3PersistentGpuPackageStore::createStaticResource(
   packageProof.geosetData =
       reinterpret_cast<uintptr_t>(record.geosetDataPtr);
   packageProof.contentHash = record.contentHash;
-  packageProof.positionContentHash = HashStaticBytes(
-      record.positions.data(), record.positions.size() * sizeof(float));
-  packageProof.normalContentHash = HashStaticBytes(
-      record.normals.data(), record.normals.size() * sizeof(float));
-  packageProof.vertexGroupContentHash = HashStaticBytes(
-      record.vertexGroupIndices.data(), record.vertexGroupIndices.size());
-  if (record.uvLayerCount >= 1u) {
-    packageProof.uv0ContentHash = HashStaticBytes(
-        record.uvLayers[0].uvPairs.data(),
-        record.uvLayers[0].uvPairs.size() * sizeof(float));
-  }
-  if (record.uvLayerCount >= 2u) {
-    packageProof.uv1ContentHash = HashStaticBytes(
-        record.uvLayers[1].uvPairs.data(),
-        record.uvLayers[1].uvPairs.size() * sizeof(float));
-  }
-  packageProof.indexContentHash = resource->indexContentHash;
-  packageProof.primitiveProofHash = primitiveProofHash;
-  packageProof.layoutGeneration = miss.key.layoutGeneration;
-  packageProof.vertexCount = record.vertexCount;
-  packageProof.indexCount = record.indexCount;
-  packageProof.uvLayerCount = record.uvLayerCount;
-  packageProof.primitiveProofCount =
-      uint32_t(resource->primitiveProofs.size());
+  packageProof.immutableModelGeneration =
+      record.immutableModelGeneration;
+  packageProof.positionContentHash = recomputedProof.positionContentHash;
+  packageProof.normalContentHash = recomputedProof.normalContentHash;
+  packageProof.vertexGroupContentHash =
+      recomputedProof.vertexGroupContentHash;
+  packageProof.uv0ContentHash = recomputedProof.uv0ContentHash;
+  packageProof.uv1ContentHash = recomputedProof.uv1ContentHash;
+  packageProof.indexContentHash = recomputedProof.indexContentHash;
+  packageProof.primitiveProofHash = recomputedProof.primitiveProofHash;
+  packageProof.localBoundsHash = recomputedProof.localBoundsHash;
+  packageProof.layoutGeneration = kStaticPackingLayoutGeneration;
+  packageProof.vertexCount = recomputedProof.vertexCount;
+  packageProof.indexCount = recomputedProof.indexCount;
+  packageProof.uvLayerCount = recomputedProof.uvLayerCount;
+  packageProof.primitiveProofCount = recomputedProof.primitiveProofCount;
   packageProof.indexType = VK_INDEX_TYPE_UINT16;
+  packageProof.localMinX = recomputedProof.localMinX;
+  packageProof.localMinY = recomputedProof.localMinY;
+  packageProof.localMinZ = recomputedProof.localMinZ;
+  packageProof.localMaxX = recomputedProof.localMaxX;
+  packageProof.localMaxY = recomputedProof.localMaxY;
+  packageProof.localMaxZ = recomputedProof.localMaxZ;
   packageProof.staticByteOffset = uint32_t(atlasOffset);
   packageProof.staticByteLength = uint32_t(staticBytes);
   packageProof.indexByteOffset =
       uint32_t(atlasOffset + indexRelativeOffset);
   packageProof.indexByteLength = uint32_t(indexBytes);
-  if (packageProof.positionContentHash == 0u ||
-      packageProof.normalContentHash == 0u ||
-      packageProof.vertexGroupContentHash == 0u ||
-      packageProof.primitiveProofCount == 0u ||
-      !BuildLocalBounds(record, packageProof))
-    return nullptr;
   resource->packageProof = packageProof;
+
+  std::shared_ptr<GpuSkinStaticFrozenPackage> frozen(
+      new GpuSkinStaticFrozenPackage());
+  frozen->m_storeInstanceAuthority = m_instanceAuthority;
+  frozen->m_snapshotIdentity = miss.record.get();
+  frozen->m_key = resource->key;
+  frozen->m_record = miss.record;
+  frozen->m_packageProof = resource->packageProof;
+  frozen->m_primitiveProofs = resource->primitiveProofs;
+  frozen->m_immutableProof = recomputedProof;
+  frozen->m_sourceLayout = resource->sourceLayout;
+  frozen->m_packageSlice = resource->packageSlice;
+  frozen->m_staticSource = resource->staticSource;
+  frozen->m_indexSource = resource->indexSource;
+  frozen->m_indexContentHash = resource->indexContentHash;
+  frozen->m_maxVertexGroupSlot = resource->maxVertexGroupSlot;
+  frozen->m_indexType = resource->indexType;
+  frozen->m_indexCount = resource->indexCount;
+  frozen->m_allocatedBytes = resource->allocatedBytes;
+  resource->frozenPayload = std::move(frozen);
+  if (!ownsFrozenPayload(*resource) ||
+      !ValidateGpuSkinStaticFrozenPayload(*resource))
+    return nullptr;
+
   resource->pendingUpload = {
       resource->key,
       DxvkBufferSlice(std::move(staging), 0u, packageBytes),
@@ -861,6 +839,13 @@ War3PersistentGpuPackageStore::createStaticResource(
   return resource;
 }
 
+bool War3PersistentGpuPackageStore::ownsFrozenPayload(
+    const GpuSkinStaticResource& resource) const noexcept {
+  return m_instanceAuthority != 0u && resource.frozenPayload != nullptr &&
+      resource.frozenPayload->storeInstanceAuthority() ==
+          m_instanceAuthority;
+}
+
 std::vector<GpuSkinStaticUpload>
 War3PersistentGpuPackageStore::takeStaticUploads() {
   std::vector<GpuSkinStaticUpload> uploads;
@@ -872,6 +857,7 @@ bool War3PersistentGpuPackageStore::retireStaticUpload(
     const GpuSkinStaticUpload& upload,
     Rc<DxvkFence> fence, uint64_t value) {
   if (!upload.source.defined() || !upload.destination.defined() ||
+      upload.key.reserved != 0u ||
       upload.byteCount == 0u || upload.source.length() != upload.byteCount ||
       upload.destination.length() != upload.byteCount ||
       fence == nullptr || value == 0u) {
@@ -882,11 +868,11 @@ bool War3PersistentGpuPackageStore::retireStaticUpload(
   const auto found = m_staticResources.find(upload.key);
   if (found != m_staticResources.end() && found->second != nullptr &&
       found->second->state == GpuSkinStaticResourceState::Ready) {
-    const bool valid = ValidateGpuSkinStaticPackage(
-        *found->second, found->second->packageProof);
-    if (!valid)
-      recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
-    return valid;
+    // A Ready lookup cannot authorize an arbitrary second upload that merely
+    // repeats its public key. Submission identity/completion authority is a
+    // later P2 protocol. Keep the supplied slices alive to their stated fence
+    // below, but never report this duplicate transaction as accepted.
+    recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
   }
 
   bool exactPendingUpload = false;
@@ -906,8 +892,8 @@ bool War3PersistentGpuPackageStore::retireStaticUpload(
         pending.destination.length() == found->second->packageSlice.length();
     if (exactPendingUpload) {
       found->second->state = GpuSkinStaticResourceState::Ready;
-      const bool validPackage = ValidateGpuSkinStaticPackage(
-          *found->second, found->second->packageProof);
+      const bool validPackage = ownsFrozenPayload(*found->second) &&
+          ValidateGpuSkinStaticPackage(*found->second);
       found->second->pendingUpload = {};
       if (validPackage) {
         resource_census::UpdateHostBacking(
@@ -932,7 +918,7 @@ bool War3PersistentGpuPackageStore::retireStaticUpload(
   ++m_diagnostics.staticUploadRetirementsQueued;
   if (!exactPendingUpload)
     recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
-  return true;
+  return exactPendingUpload;
 }
 
 DxvkBufferSlice War3PersistentGpuPackageStore::staticAtlasSlice() const {

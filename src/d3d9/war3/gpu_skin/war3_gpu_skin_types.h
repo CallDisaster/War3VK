@@ -197,13 +197,16 @@ struct GpuSkinStaticResourceKey {
   uint64_t deviceEpoch = 0;
   uintptr_t geosetData = 0;
   uint64_t contentHash = 0;
+  uint64_t immutableModelGeneration = 0;
   uint32_t layoutGeneration = 0;
   uint32_t reserved = 0;
 
   bool operator==(const GpuSkinStaticResourceKey& other) const {
     return mapEpoch == other.mapEpoch && deviceEpoch == other.deviceEpoch &&
            geosetData == other.geosetData && contentHash == other.contentHash &&
-           layoutGeneration == other.layoutGeneration;
+           immutableModelGeneration == other.immutableModelGeneration &&
+           layoutGeneration == other.layoutGeneration &&
+           reserved == other.reserved;
   }
 };
 

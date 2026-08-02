@@ -1,4 +1,5 @@
 #include "war3_gpu_skin_manager.h"
+#include "war3_persistent_gpu_package_store.h"
 
 #include "../core/war3_memory.h"
 #include "../model/war3_model_resource_cache.h"
@@ -69,7 +70,8 @@ constexpr uint32_t kMaxStaticPreparesPerFlush = 32u;
 constexpr size_t kMaxRetiredResourceEpochs = 8u;
 constexpr size_t kMaxRetiringClaims = 8u;
 constexpr size_t kMaxAutoRetiredBatchTombstones = 32u;
-constexpr uint32_t kStaticPackingLayoutGeneration = 1u;
+constexpr uint32_t kStaticPackingLayoutGeneration =
+    War3PersistentGpuPackageStore::kStaticPackingLayoutGeneration;
 constexpr uint32_t kDispatchSpecialMask = 3u;
 constexpr uint32_t kDispatchSpecialValue = 3u;
 constexpr uint32_t kGxPrimitiveTriangleList = 3u;
@@ -596,6 +598,7 @@ struct PreparedCandidate {
   uint32_t expectedIndexCount = 0;
   uint64_t expectedIndexContentHash = 0;
   uint64_t resourceContentHash = 0;
+  uint64_t resourceImmutableModelGeneration = 0;
   bool bypassOpaqueEligible = false;
   std::vector<uint8_t> paletteBytes;
 };
@@ -3126,6 +3129,7 @@ private:
     uint32_t expectedIndexCount = 0;
     uint64_t expectedIndexContentHash = 0;
     uint64_t resourceContentHash = 0;
+    uint64_t resourceImmutableModelGeneration = 0;
     uint64_t bypassFuseKey = 0;
     uint64_t leaseId = 0;
     GpuSkinConsumerPlan consumerPlan;
@@ -3192,12 +3196,18 @@ private:
         resource->key.geosetData != prepared.key.geosetData ||
         resource->key.contentHash == 0u ||
         resource->key.contentHash != prepared.resourceContentHash ||
+        resource->key.immutableModelGeneration == 0u ||
+        resource->key.immutableModelGeneration !=
+            prepared.resourceImmutableModelGeneration ||
         resource->key.layoutGeneration != kStaticPackingLayoutGeneration ||
         resource->record == nullptr ||
         resource->record->geosetDataPtr !=
             reinterpret_cast<void*>(prepared.key.geosetData) ||
         resource->record->contentHash != prepared.resourceContentHash ||
+        resource->record->immutableModelGeneration !=
+            prepared.resourceImmutableModelGeneration ||
         resource->record->vertexCount != prepared.expectedVertexCount ||
+        !ValidateGpuSkinStaticPackage(*resource) ||
         resource->indexContentHash == 0u ||
         resource->indexContentHash != prepared.expectedIndexContentHash) {
       return false;
@@ -4402,6 +4412,7 @@ private:
     hash = HashMix(hash, prepared.key.layerIndex);
     hash = HashMix(hash, prepared.key.outputFormat);
     hash = HashMix(hash, prepared.resourceContentHash);
+    hash = HashMix(hash, prepared.resourceImmutableModelGeneration);
     hash = HashMix(hash, prepared.expectedVertexCount);
     hash = HashMix(hash, prepared.expectedOutputStride);
     hash = HashMix(hash, prepared.expectedIndexCount);
@@ -5012,27 +5023,41 @@ private:
     bool usedBypassStaticHint = false;
     if (m_mode == GpuSkinMode::Bypass) {
       const auto& hint = learnedLayout.bypassStaticHint;
-      const bool exactHint = hint != nullptr &&
+      model::ShadowGeosetResourceStamp currentHintStamp = {};
+      const bool hasCurrentHintStamp =
+          modelCache.findGeosetStampByData(
+              geosetDataPtr, currentHintStamp);
+      const bool exactHint = hasCurrentHintStamp && hint != nullptr &&
           hint->state == GpuSkinStaticResourceState::Ready &&
           hint->key.mapEpoch == m_currentMapEpoch &&
           hint->key.deviceEpoch == m_boundDeviceEpoch &&
           hint->key.geosetData == geosetData &&
           hint->key.contentHash != 0u &&
+          hint->key.immutableModelGeneration != 0u &&
           hint->key.layoutGeneration == kStaticPackingLayoutGeneration &&
           hint->record != nullptr &&
           hint->record->geosetDataPtr == geosetDataPtr &&
           hint->record->contentHash == hint->key.contentHash &&
+          hint->record->immutableModelGeneration ==
+              hint->key.immutableModelGeneration &&
           hint->record->vertexCount == learnedLayout.vertexCount &&
+          currentHintStamp.geosetDataPtr == geosetDataPtr &&
+          currentHintStamp.contentHash == hint->key.contentHash &&
+          currentHintStamp.immutableModelGeneration ==
+              hint->key.immutableModelGeneration &&
+          currentHintStamp.vertexCount == hint->record->vertexCount &&
           hint->sourceLayout.byteSize != 0u &&
           hint->staticSource.defined() &&
           hint->staticSource.buffer() != nullptr &&
           hint->staticSource.length() == hint->sourceLayout.byteSize &&
           hint->indexContentHash != 0u;
-      if (exactHint) {
-        staticResource = hint;
-        recordStamp.geosetDataPtr = hint->record->geosetDataPtr;
-        recordStamp.contentHash = hint->record->contentHash;
-        recordStamp.vertexCount = hint->record->vertexCount;
+      const GpuSkinStaticLookup hintProbe = exactHint
+          ? m_resources->probeStatic(
+                currentHintStamp, kStaticPackingLayoutGeneration)
+          : GpuSkinStaticLookup{};
+      if (exactHint && hintProbe.resource == hint) {
+        staticResource = hintProbe.resource;
+        recordStamp = currentHintStamp;
         usedBypassStaticHint = true;
         ++m_diagnostics.bypassStaticHintHits;
       } else {
@@ -5047,7 +5072,9 @@ private:
         return;
       }
       if (recordStamp.geosetDataPtr != geosetDataPtr ||
-          recordStamp.contentHash == 0u || recordStamp.vertexCount == 0u ||
+          recordStamp.contentHash == 0u ||
+          recordStamp.immutableModelGeneration == 0u ||
+          recordStamp.vertexCount == 0u ||
           recordStamp.vertexCount != learnedLayout.vertexCount) {
         recordFallback(GpuSkinManagerFallbackReason::LayoutChanged);
         return;
@@ -5071,6 +5098,8 @@ private:
       }
       if (coldRecord->geosetDataPtr != recordStamp.geosetDataPtr ||
           coldRecord->contentHash != recordStamp.contentHash ||
+          coldRecord->immutableModelGeneration !=
+              recordStamp.immutableModelGeneration ||
           coldRecord->vertexCount != recordStamp.vertexCount) {
         recordFallback(GpuSkinManagerFallbackReason::LayoutChanged);
         return;
@@ -5104,12 +5133,17 @@ private:
         staticResource->key.deviceEpoch != m_boundDeviceEpoch ||
         staticResource->key.geosetData != geosetData ||
         staticResource->key.contentHash != recordStamp.contentHash ||
+        staticResource->key.immutableModelGeneration !=
+            recordStamp.immutableModelGeneration ||
         staticResource->key.layoutGeneration !=
             kStaticPackingLayoutGeneration ||
         staticResource->record == nullptr ||
         staticResource->record->geosetDataPtr != geosetDataPtr ||
         staticResource->record->contentHash != recordStamp.contentHash ||
+        staticResource->record->immutableModelGeneration !=
+            recordStamp.immutableModelGeneration ||
         staticResource->record->vertexCount != recordStamp.vertexCount ||
+        !ValidateGpuSkinStaticPackage(*staticResource) ||
         staticResource->indexContentHash == 0u) {
       recordFallback(GpuSkinManagerFallbackReason::LayoutChanged);
       return;
@@ -5233,6 +5267,8 @@ private:
     prepared.expectedIndexCount = record.primitiveRecords[0].indexCount;
     prepared.expectedIndexContentHash = staticResource->indexContentHash;
     prepared.resourceContentHash = record.contentHash;
+    prepared.resourceImmutableModelGeneration =
+        record.immutableModelGeneration;
     prepared.bypassOpaqueEligible = bypassOpaqueEligible;
     prepared.paletteBytes = std::move(paletteBytes);
 
@@ -5995,6 +6031,8 @@ private:
         prepared.expectedIndexContentHash =
             candidate.expectedIndexContentHash;
         prepared.resourceContentHash = candidate.resourceContentHash;
+        prepared.resourceImmutableModelGeneration =
+            candidate.resourceImmutableModelGeneration;
         prepared.bypassOpaqueEligible = candidate.bypassOpaqueEligible;
         // candidate 快照已经复制进映射的 GPU upload，发布后不会再次读取。
         // 此处把所有权转交给长生命周期 parity/bypass 记录，避免再次深拷贝。
@@ -6307,13 +6345,20 @@ private:
         currentStamp.geosetDataPtr !=
             reinterpret_cast<void*>(prepared.key.geosetData) ||
         currentStamp.contentHash != prepared.resourceContentHash ||
+        currentStamp.immutableModelGeneration !=
+            prepared.resourceImmutableModelGeneration ||
         currentStamp.vertexCount != prepared.expectedVertexCount ||
         resource->key.geosetData != upload.geosetData ||
         resource->key.contentHash != currentStamp.contentHash ||
+        resource->key.immutableModelGeneration !=
+            currentStamp.immutableModelGeneration ||
         resource->record == nullptr ||
         resource->record->geosetDataPtr != currentStamp.geosetDataPtr ||
         resource->record->contentHash != currentStamp.contentHash ||
+        resource->record->immutableModelGeneration !=
+            currentStamp.immutableModelGeneration ||
         resource->record->vertexCount != currentStamp.vertexCount ||
+        !ValidateGpuSkinStaticPackage(*resource) ||
         resource->record->matrixGroupCount != prepared.paletteGroupCount ||
         resource->maxVertexGroupSlot >= prepared.paletteGroupCount ||
         prepared.paletteGroupCount == 0u ||
@@ -6377,6 +6422,9 @@ private:
         resource->record == nullptr ||
         resource->key.geosetData != upload.geosetData ||
         resource->key.contentHash != prepared.resourceContentHash ||
+        resource->key.immutableModelGeneration !=
+            prepared.resourceImmutableModelGeneration ||
+        !ValidateGpuSkinStaticPackage(*resource) ||
         resource->indexContentHash != prepared.expectedIndexContentHash) {
       return rejectLayout();
     }
@@ -6384,6 +6432,8 @@ private:
     if (record.geosetDataPtr !=
             reinterpret_cast<void*>(upload.geosetData) ||
         record.contentHash != prepared.resourceContentHash ||
+        record.immutableModelGeneration !=
+            prepared.resourceImmutableModelGeneration ||
         record.vertexCount != prepared.expectedVertexCount ||
         record.vertexCount == 0u ||
         record.vertexCount > kMaxNativeVertices ||

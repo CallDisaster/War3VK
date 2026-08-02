@@ -11,9 +11,12 @@
 #include "../model/war3_model_resource_cache.h"
 #include "war3_gpu_skin_types.h"
 #include "war3_gpu_skin_compute.h"
+#include "war3_persistent_gpu_package_immutable.h"
 #include "../tools/war3_resource_residency_census.h"
 
 namespace dxvk::war3::gpu_skin {
+
+class War3PersistentGpuPackageStore;
 
 struct GpuSkinResourceBudgets {
   VkDeviceSize staticBytes = 128ull << 20;
@@ -68,6 +71,7 @@ struct GpuSkinStaticPackageProof {
   uint64_t packageGeneration = 0u;
   uintptr_t geosetData = 0u;
   uint64_t contentHash = 0u;
+  uint64_t immutableModelGeneration = 0u;
   uint64_t positionContentHash = 0u;
   uint64_t normalContentHash = 0u;
   uint64_t vertexGroupContentHash = 0u;
@@ -102,6 +106,7 @@ inline bool SameGpuSkinStaticPackageProof(
       lhs.packageGeneration == rhs.packageGeneration &&
       lhs.geosetData == rhs.geosetData &&
       lhs.contentHash == rhs.contentHash &&
+      lhs.immutableModelGeneration == rhs.immutableModelGeneration &&
       lhs.positionContentHash == rhs.positionContentHash &&
       lhs.normalContentHash == rhs.normalContentHash &&
       lhs.vertexGroupContentHash == rhs.vertexGroupContentHash &&
@@ -128,6 +133,72 @@ inline bool SameGpuSkinStaticPackageProof(
       lhs.indexByteLength == rhs.indexByteLength;
 }
 
+// Store-created immutable descriptor. Its constructor and fields are private,
+// so a public GpuSkinStaticPackageProof value cannot authorize itself.  The
+// descriptor pins the exact cache snapshot identity, Store instance, epochs,
+// atlas slices and independently derived CPU proof used at creation.
+class GpuSkinStaticFrozenPackage final {
+public:
+  const GpuSkinStaticResourceKey& key() const noexcept { return m_key; }
+  const model::ShadowGeosetResourceSnapshot& record() const noexcept {
+    return m_record;
+  }
+  const GpuSkinStaticPackageProof& packageProof() const noexcept {
+    return m_packageProof;
+  }
+  const std::vector<GpuSkinStaticPrimitiveProof>& primitiveProofs()
+      const noexcept {
+    return m_primitiveProofs;
+  }
+  const PersistentGpuPackageImmutableProof& immutableProof() const noexcept {
+    return m_immutableProof;
+  }
+  uint64_t storeInstanceAuthority() const noexcept {
+    return m_storeInstanceAuthority;
+  }
+  const void* snapshotIdentity() const noexcept { return m_snapshotIdentity; }
+  const GpuSkinStaticSourceLayout& sourceLayout() const noexcept {
+    return m_sourceLayout;
+  }
+  const DxvkBufferSlice& packageSlice() const noexcept {
+    return m_packageSlice;
+  }
+  const DxvkBufferSlice& staticSource() const noexcept {
+    return m_staticSource;
+  }
+  const DxvkBufferSlice& indexSource() const noexcept {
+    return m_indexSource;
+  }
+  uint64_t indexContentHash() const noexcept { return m_indexContentHash; }
+  uint32_t maxVertexGroupSlot() const noexcept {
+    return m_maxVertexGroupSlot;
+  }
+  VkIndexType indexType() const noexcept { return m_indexType; }
+  uint32_t indexCount() const noexcept { return m_indexCount; }
+  VkDeviceSize allocatedBytes() const noexcept { return m_allocatedBytes; }
+
+private:
+  friend class War3PersistentGpuPackageStore;
+  GpuSkinStaticFrozenPackage() = default;
+
+  uint64_t m_storeInstanceAuthority = 0u;
+  const void* m_snapshotIdentity = nullptr;
+  GpuSkinStaticResourceKey m_key;
+  model::ShadowGeosetResourceSnapshot m_record;
+  GpuSkinStaticPackageProof m_packageProof;
+  std::vector<GpuSkinStaticPrimitiveProof> m_primitiveProofs;
+  PersistentGpuPackageImmutableProof m_immutableProof;
+  GpuSkinStaticSourceLayout m_sourceLayout;
+  DxvkBufferSlice m_packageSlice;
+  DxvkBufferSlice m_staticSource;
+  DxvkBufferSlice m_indexSource;
+  uint64_t m_indexContentHash = 0u;
+  uint32_t m_maxVertexGroupSlot = 0u;
+  VkIndexType m_indexType = VK_INDEX_TYPE_UINT16;
+  uint32_t m_indexCount = 0u;
+  VkDeviceSize m_allocatedBytes = 0u;
+};
+
 struct GpuSkinStaticResource {
   GpuSkinStaticResourceKey key;
   model::ShadowGeosetResourceSnapshot record;
@@ -148,12 +219,17 @@ struct GpuSkinStaticResource {
   GpuSkinStaticResourceState state = GpuSkinStaticResourceState::PendingUpload;
   VkDeviceSize allocatedBytes = 0;
   resource_census::ResourceHandle residencyCensus;
+  // Only War3PersistentGpuPackageStore can construct this descriptor. Public
+  // proof PODs and mutable resource mirrors cannot validate themselves.
+  std::shared_ptr<const class GpuSkinStaticFrozenPackage> frozenPayload;
 };
 
 bool ValidateGpuSkinStaticPackage(
-    const GpuSkinStaticResource& resource,
-    const GpuSkinStaticPackageProof& expected) noexcept;
+    const GpuSkinStaticResource& resource) noexcept;
+bool ValidateGpuSkinStaticFrozenPayload(
+    const GpuSkinStaticResource& resource) noexcept;
 
+static_assert(!std::is_default_constructible_v<GpuSkinStaticFrozenPackage>);
 static_assert(std::is_standard_layout_v<GpuSkinStaticPackageProof>);
 static_assert(std::is_trivially_copyable_v<GpuSkinStaticPackageProof>);
 static_assert(std::is_standard_layout_v<GpuSkinStaticPrimitiveProof>);
