@@ -138,6 +138,64 @@ namespace dxvk {
       uint64_t settingsRevision = 0u;
     };
 
+    enum class PointShadowPersistentBeginRejectReason : uint32_t {
+      None = 0u,
+      ModeOff = 1u,
+      WorkerPrepareDisabled = 2u,
+      NoPointShadowWork = 3u,
+      MissingSettings = 4u,
+      PointShadowDisabled = 5u,
+      NoPointLights = 6u,
+      NoReplayDraws = 7u,
+      InvalidLightSnapshot = 8u,
+      InvalidFrameSerial = 9u,
+      InvalidRendererEpoch = 10u,
+      WorkerCreateFailed = 11u,
+      WorkerUnavailable = 12u,
+      PreviousJobNotReady = 13u,
+      JobSerialExhausted = 14u,
+      ReplayDrawCountOverflow = 15u,
+      NullCaster = 16u,
+      SubmitInvalidGeneration = 17u,
+      SubmitStaleGeneration = 18u,
+      SubmitBusy = 19u,
+      SubmitStopping = 20u,
+      SubmitUnavailable = 21u,
+      AllocationFailure = 22u,
+      UnexpectedException = 23u,
+      NoShadowCastingLights = 24u,
+    };
+
+    /**
+     * @brief POD-only live state for the opt-in point-shadow prepare worker.
+     *
+     * All counters are cumulative for one receiver instance. The render path
+     * stores only numeric state; JSON/UI code may translate enum values after
+     * leaving the hot path.
+     */
+    struct PointShadowPersistentDiagnostics {
+      uint32_t configuredMode = 0u;
+      uint32_t effectiveMode = 0u;
+      uint32_t lastBeginRejectReason = static_cast<uint32_t>(
+          PointShadowPersistentBeginRejectReason::ModeOff);
+      uint32_t workerCreated = 0u;
+      uint32_t workerAvailable = 0u;
+      uint64_t lastFrameSerial = 0u;
+      uint64_t beginAttempts = 0u;
+      uint64_t beginEligible = 0u;
+      uint64_t workerCreateCount = 0u;
+      uint64_t workerThreadStarts = 0u;
+      uint64_t accepted = 0u;
+      uint64_t ready = 0u;
+      uint64_t deadlineFallback = 0u;
+      uint64_t rejectedFallback = 0u;
+      uint64_t observeMatch = 0u;
+      uint64_t mismatch = 0u;
+      uint64_t consumed = 0u;
+      uint64_t failed = 0u;
+      uint64_t busy = 0u;
+    };
+
     enum class CsmResolutionFallbackReason : uint32_t {
       None = 0u,
       MemoryBudget = 1u,
@@ -158,9 +216,13 @@ namespace dxvk {
 
     ShadowTaaDiagnostics QueryShadowTaaDiagnostics();
     CsmResolutionDiagnostics QueryCsmResolutionDiagnostics();
+    PointShadowPersistentDiagnostics
+    QueryPointShadowPersistentDiagnostics();
     void PublishShadowTaaDiagnostics(const ShadowTaaDiagnostics& diagnostics);
     void PublishCsmResolutionDiagnostics(
         const CsmResolutionDiagnostics& diagnostics);
+    void PublishPointShadowPersistentDiagnostics(
+        const PointShadowPersistentDiagnostics& diagnostics);
 
     class War3ShadowReceiverPass final : public War3RenderPass {
     public:
@@ -837,12 +899,18 @@ namespace dxvk {
         bool m_pointShadowPersistentPending = false;
         uint64_t m_pointShadowPersistentRendererEpoch = 0u;
         uint64_t m_pointShadowPersistentJobSerial = 0u;
+        uint64_t m_pointShadowPersistentBeginAttempts = 0u;
+        uint64_t m_pointShadowPersistentBeginEligible = 0u;
+        uint64_t m_pointShadowPersistentWorkerCreateCount = 0u;
         uint64_t m_pointShadowPersistentAccepted = 0u;
         uint64_t m_pointShadowPersistentDeadlineFallback = 0u;
         uint64_t m_pointShadowPersistentRejectedFallback = 0u;
         uint64_t m_pointShadowPersistentObserveMatch = 0u;
         uint64_t m_pointShadowPersistentObserveMismatch = 0u;
         uint64_t m_pointShadowPersistentConsumed = 0u;
+        PointShadowPersistentBeginRejectReason
+            m_pointShadowPersistentLastBeginRejectReason =
+                PointShadowPersistentBeginRejectReason::ModeOff;
         
         // [NEW] Point Shadow UBO for receiver shader
         struct PointShadowLightUniform {

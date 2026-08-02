@@ -69,6 +69,33 @@ struct ShadowTaaFrameTelemetry {
 };
 
 /**
+ * @brief Numeric snapshot of the opt-in point-shadow persistent prepare path.
+ *
+ * Values are cumulative receiver-instance counters. The perf report stores the
+ * latest snapshot and never translates reject reasons on the render hot path.
+ */
+struct PointShadowPersistentFrameTelemetry {
+    uint32_t configuredMode = 0;
+    uint32_t effectiveMode = 0;
+    uint32_t lastBeginRejectReason = 0;
+    uint32_t workerCreated = 0;
+    uint32_t workerAvailable = 0;
+    uint64_t beginAttempts = 0;
+    uint64_t beginEligible = 0;
+    uint64_t workerCreateCount = 0;
+    uint64_t workerThreadStarts = 0;
+    uint64_t accepted = 0;
+    uint64_t ready = 0;
+    uint64_t deadlineFallback = 0;
+    uint64_t rejectedFallback = 0;
+    uint64_t observeMatch = 0;
+    uint64_t mismatch = 0;
+    uint64_t consumed = 0;
+    uint64_t failed = 0;
+    uint64_t busy = 0;
+};
+
+/**
  * @brief Per-frame workload gauges used only by offline report correlation.
  *
  * This is populated once at the Present boundary. It deliberately contains no
@@ -447,6 +474,8 @@ public:
                                  uint32_t requestedShadowResolution,
                                  uint32_t effectiveShadowResolution);
     void noteShadowTaaFrame(const ShadowTaaFrameTelemetry& telemetry);
+    void notePointShadowPersistentFrame(
+        const PointShadowPersistentFrameTelemetry& telemetry);
 
     // 报告导出
     void exportHtmlReport(const std::string& outputPath);
@@ -593,6 +622,9 @@ private:
         uint32_t shadowTaaRequestedModeLast = 0;
         uint32_t shadowTaaEffectiveModeLast = 0;
         uint32_t shadowTaaShaderModeLast = 0;
+        uint64_t pointShadowPersistentFramesObserved = 0;
+        PointShadowPersistentFrameTelemetry
+            pointShadowPersistentLast = {};
         uint64_t stage13CaptureAttemptCount = 0;
         uint64_t stage13CaptureRejectedNoDemandCount = 0;
         uint64_t stage13CaptureRejectedAfterBeforeUiCount = 0;

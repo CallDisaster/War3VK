@@ -2336,6 +2336,19 @@ void War3PerfMonitor::noteShadowTaaFrame(
   agg.shadowTaaShaderModeLast = telemetry.shaderMode;
 }
 
+void War3PerfMonitor::notePointShadowPersistentFrame(
+    const PointShadowPersistentFrameTelemetry& telemetry) {
+  if (!m_enabled.load(std::memory_order_relaxed) ||
+      !m_recording.load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  std::lock_guard lock(m_mutex);
+  auto& agg = m_shadowBudgetAggregate;
+  ++agg.pointShadowPersistentFramesObserved;
+  agg.pointShadowPersistentLast = telemetry;
+}
+
 War3PerfMonitor::~War3PerfMonitor() { shutdown(); }
 
 std::vector<War3PerfMonitor::CpuOnlyScope> &War3PerfMonitor::scopeStack() {
@@ -6559,6 +6572,44 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneShadowMapSkinnedDrawnCount << ",\n";
   json << "    \"semanticSceneShadowTaaActive\": "
        << shadowAgg.semanticSceneShadowTaaActive << ",\n";
+  json << "    \"pointShadowPersistentFramesObserved\": "
+       << shadowAgg.pointShadowPersistentFramesObserved << ",\n";
+  json << "    \"pointShadowPersistentConfiguredModeLast\": "
+       << shadowAgg.pointShadowPersistentLast.configuredMode << ",\n";
+  json << "    \"pointShadowPersistentEffectiveModeLast\": "
+       << shadowAgg.pointShadowPersistentLast.effectiveMode << ",\n";
+  json << "    \"pointShadowPersistentLastBeginRejectReason\": "
+       << shadowAgg.pointShadowPersistentLast.lastBeginRejectReason << ",\n";
+  json << "    \"pointShadowPersistentWorkerCreatedLast\": "
+       << shadowAgg.pointShadowPersistentLast.workerCreated << ",\n";
+  json << "    \"pointShadowPersistentWorkerAvailableLast\": "
+       << shadowAgg.pointShadowPersistentLast.workerAvailable << ",\n";
+  json << "    \"pointShadowPersistentBeginAttemptsLast\": "
+       << shadowAgg.pointShadowPersistentLast.beginAttempts << ",\n";
+  json << "    \"pointShadowPersistentBeginEligibleLast\": "
+       << shadowAgg.pointShadowPersistentLast.beginEligible << ",\n";
+  json << "    \"pointShadowPersistentWorkerCreateCountLast\": "
+       << shadowAgg.pointShadowPersistentLast.workerCreateCount << ",\n";
+  json << "    \"pointShadowPersistentWorkerThreadStartsLast\": "
+       << shadowAgg.pointShadowPersistentLast.workerThreadStarts << ",\n";
+  json << "    \"pointShadowPersistentAcceptedLast\": "
+       << shadowAgg.pointShadowPersistentLast.accepted << ",\n";
+  json << "    \"pointShadowPersistentReadyLast\": "
+       << shadowAgg.pointShadowPersistentLast.ready << ",\n";
+  json << "    \"pointShadowPersistentDeadlineFallbackLast\": "
+       << shadowAgg.pointShadowPersistentLast.deadlineFallback << ",\n";
+  json << "    \"pointShadowPersistentRejectedFallbackLast\": "
+       << shadowAgg.pointShadowPersistentLast.rejectedFallback << ",\n";
+  json << "    \"pointShadowPersistentObserveMatchLast\": "
+       << shadowAgg.pointShadowPersistentLast.observeMatch << ",\n";
+  json << "    \"pointShadowPersistentMismatchLast\": "
+       << shadowAgg.pointShadowPersistentLast.mismatch << ",\n";
+  json << "    \"pointShadowPersistentConsumedLast\": "
+       << shadowAgg.pointShadowPersistentLast.consumed << ",\n";
+  json << "    \"pointShadowPersistentFailedLast\": "
+       << shadowAgg.pointShadowPersistentLast.failed << ",\n";
+  json << "    \"pointShadowPersistentBusyLast\": "
+       << shadowAgg.pointShadowPersistentLast.busy << ",\n";
   json << "    \"shadowTaaFramesObserved\": "
        << shadowAgg.shadowTaaFramesObserved << ",\n";
   json << "    \"shadowTaaRuntimeModuleDisabledFrames\": "

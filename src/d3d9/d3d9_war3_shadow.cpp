@@ -65,6 +65,7 @@ namespace {
 std::mutex g_shadowDiagnosticsMutex;
 ShadowTaaDiagnostics g_shadowTaaDiagnostics = {};
 CsmResolutionDiagnostics g_csmResolutionDiagnostics = {};
+PointShadowPersistentDiagnostics g_pointShadowPersistentDiagnostics = {};
 std::atomic<uint64_t> g_pointShadowPersistentRendererEpoch{1u};
 
 uint64_t MintPointShadowPersistentRendererEpoch() noexcept {
@@ -1756,6 +1757,12 @@ CsmResolutionDiagnostics QueryCsmResolutionDiagnostics() {
   return g_csmResolutionDiagnostics;
 }
 
+PointShadowPersistentDiagnostics
+QueryPointShadowPersistentDiagnostics() {
+  std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
+  return g_pointShadowPersistentDiagnostics;
+}
+
 void PublishShadowTaaDiagnostics(
     const ShadowTaaDiagnostics& diagnostics) {
   std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
@@ -1766,6 +1773,12 @@ void PublishCsmResolutionDiagnostics(
     const CsmResolutionDiagnostics& diagnostics) {
   std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
   g_csmResolutionDiagnostics = diagnostics;
+}
+
+void PublishPointShadowPersistentDiagnostics(
+    const PointShadowPersistentDiagnostics& diagnostics) {
+  std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
+  g_pointShadowPersistentDiagnostics = diagnostics;
 }
 
 War3ShadowReceiverPass::War3ShadowReceiverPass(D3D9DeviceEx *device)
@@ -4963,21 +4976,77 @@ void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
     const std::vector<const War3ShadowCasterDraw *> *replayDraws) {
   using namespace war3::render;
 
-  if (!replayDraws || replayDraws->empty() || !input.settings ||
-      lightSnapshot.generation == 0u || lightSnapshot.frameSerial == 0u ||
-      input.frameSerial == 0u ||
-      m_pointShadowPersistentRendererEpoch == 0u)
+  ++m_pointShadowPersistentBeginAttempts;
+  const auto rejectAdmission =
+      [this](PointShadowPersistentBeginRejectReason reason) noexcept {
+        m_pointShadowPersistentLastBeginRejectReason = reason;
+      };
+  if (PointShadowPersistentMode() == War3PointShadowPersistentMode::Off) {
+    rejectAdmission(PointShadowPersistentBeginRejectReason::ModeOff);
     return;
+  }
+  if (!War3WorkerPrepareEnabled()) {
+    rejectAdmission(
+        PointShadowPersistentBeginRejectReason::WorkerPrepareDisabled);
+    return;
+  }
+  if (!input.settings) {
+    rejectAdmission(PointShadowPersistentBeginRejectReason::MissingSettings);
+    return;
+  }
+  if (!input.settings->shadows.pointLightsEnabled ||
+      !input.settings->shadows.pointShadowEnabled ||
+      input.settings->shadows.pointShadowMaxLights == 0u) {
+    rejectAdmission(PointShadowPersistentBeginRejectReason::PointShadowDisabled);
+    return;
+  }
+  if (!lightSnapshot.hasAny) {
+    rejectAdmission(PointShadowPersistentBeginRejectReason::NoPointLights);
+    return;
+  }
+  if (lightSnapshot.shadowCount == 0u) {
+    rejectAdmission(
+        PointShadowPersistentBeginRejectReason::NoShadowCastingLights);
+    return;
+  }
+  if (!replayDraws || replayDraws->empty()) {
+    rejectAdmission(PointShadowPersistentBeginRejectReason::NoReplayDraws);
+    return;
+  }
+  if (lightSnapshot.generation == 0u ||
+      lightSnapshot.frameSerial == 0u) {
+    rejectAdmission(
+        PointShadowPersistentBeginRejectReason::InvalidLightSnapshot);
+    return;
+  }
+  if (input.frameSerial == 0u ||
+      lightSnapshot.frameSerial != input.frameSerial) {
+    rejectAdmission(PointShadowPersistentBeginRejectReason::InvalidFrameSerial);
+    return;
+  }
+  if (m_pointShadowPersistentRendererEpoch == 0u) {
+    rejectAdmission(
+        PointShadowPersistentBeginRejectReason::InvalidRendererEpoch);
+    return;
+  }
+
+  ++m_pointShadowPersistentBeginEligible;
+  m_pointShadowPersistentLastBeginRejectReason =
+      PointShadowPersistentBeginRejectReason::None;
 
   if (!m_pointShadowPersistentWorker) {
     try {
       m_pointShadowPersistentWorker =
           std::make_unique<PointShadowPersistentPrepareWorker>();
     } catch (...) {
+      rejectAdmission(
+          PointShadowPersistentBeginRejectReason::WorkerCreateFailed);
       ++m_pointShadowPersistentRejectedFallback;
       return;
     }
+    ++m_pointShadowPersistentWorkerCreateCount;
     if (!m_pointShadowPersistentWorker->available()) {
+      rejectAdmission(PointShadowPersistentBeginRejectReason::WorkerUnavailable);
       ++m_pointShadowPersistentRejectedFallback;
       return;
     }
@@ -4995,6 +5064,8 @@ void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
     auto previous = m_pointShadowPersistentWorker->tryCollectExact(
         m_pointShadowPersistentPendingGeneration);
     if (previous.state == War3PointShadowPrepareResultState::NotReady) {
+      rejectAdmission(
+          PointShadowPersistentBeginRejectReason::PreviousJobNotReady);
       ++m_pointShadowPersistentRejectedFallback;
       return;
     }
@@ -5008,11 +5079,15 @@ void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
 
   if (m_pointShadowPersistentJobSerial ==
       std::numeric_limits<uint64_t>::max()) {
+    rejectAdmission(
+        PointShadowPersistentBeginRejectReason::JobSerialExhausted);
     ++m_pointShadowPersistentRejectedFallback;
     return;
   }
   if (replayDraws->size() >
       size_t(std::numeric_limits<uint32_t>::max())) {
+    rejectAdmission(
+        PointShadowPersistentBeginRejectReason::ReplayDrawCountOverflow);
     ++m_pointShadowPersistentRejectedFallback;
     return;
   }
@@ -5076,6 +5151,7 @@ void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
       if (!draw) {
         request.generation = {};
         payload.seal = {};
+        rejectAdmission(PointShadowPersistentBeginRejectReason::NullCaster);
         ++m_pointShadowPersistentRejectedFallback;
         return;
       }
@@ -5118,6 +5194,8 @@ void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
       m_pointShadowPersistentExpectedDynamicSkinnedOutputCount =
           expectedDynamicSkinnedOutputCount;
       m_pointShadowPersistentPending = true;
+      m_pointShadowPersistentLastBeginRejectReason =
+          PointShadowPersistentBeginRejectReason::None;
       ++m_pointShadowPersistentAccepted;
       return;
     }
@@ -5126,6 +5204,28 @@ void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
     // here and remains reusable after the canonical same-frame fallback.
     request.generation = {};
     payload.seal = {};
+    switch (submitted) {
+      case War3PointShadowPrepareSubmitStatus::InvalidGeneration:
+        rejectAdmission(
+            PointShadowPersistentBeginRejectReason::SubmitInvalidGeneration);
+        break;
+      case War3PointShadowPrepareSubmitStatus::StaleGeneration:
+        rejectAdmission(
+            PointShadowPersistentBeginRejectReason::SubmitStaleGeneration);
+        break;
+      case War3PointShadowPrepareSubmitStatus::Busy:
+        rejectAdmission(PointShadowPersistentBeginRejectReason::SubmitBusy);
+        break;
+      case War3PointShadowPrepareSubmitStatus::Stopping:
+        rejectAdmission(PointShadowPersistentBeginRejectReason::SubmitStopping);
+        break;
+      case War3PointShadowPrepareSubmitStatus::Unavailable:
+        rejectAdmission(
+            PointShadowPersistentBeginRejectReason::SubmitUnavailable);
+        break;
+      case War3PointShadowPrepareSubmitStatus::Accepted:
+        break;
+    }
     ++m_pointShadowPersistentRejectedFallback;
   } catch (const std::bad_alloc &) {
     // Every allocation in the owner freeze transaction is above this boundary.
@@ -5134,6 +5234,7 @@ void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
     request.generation = {};
     request.payload.seal = {};
     m_pointShadowPersistentPending = false;
+    rejectAdmission(PointShadowPersistentBeginRejectReason::AllocationFailure);
     ++m_pointShadowPersistentRejectedFallback;
   } catch (...) {
     // length_error and any future throwing copy/freeze helper follow the same
@@ -5141,6 +5242,8 @@ void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
     request.generation = {};
     request.payload.seal = {};
     m_pointShadowPersistentPending = false;
+    rejectAdmission(
+        PointShadowPersistentBeginRejectReason::UnexpectedException);
     ++m_pointShadowPersistentRejectedFallback;
   }
 }
@@ -7212,6 +7315,89 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   shadowMainPhaseTiming.enter(
       static_cast<size_t>(War3ShadowMainRawPhase::EntryAndValidation));
   ++m_pointShadowRunSerial;
+  const War3PointShadowPersistentMode pointShadowPersistentConfiguredMode =
+      PointShadowPersistentMode();
+  if (pointShadowPersistentConfiguredMode ==
+      War3PointShadowPersistentMode::Off) {
+    m_pointShadowPersistentLastBeginRejectReason =
+        PointShadowPersistentBeginRejectReason::ModeOff;
+  } else if (!War3WorkerPrepareEnabled()) {
+    m_pointShadowPersistentLastBeginRejectReason =
+        PointShadowPersistentBeginRejectReason::WorkerPrepareDisabled;
+  } else {
+    m_pointShadowPersistentLastBeginRejectReason =
+        PointShadowPersistentBeginRejectReason::NoPointShadowWork;
+  }
+  [[maybe_unused]] auto pointShadowPersistentDiagnosticsPublish =
+      MakeWar3ScopeExit([&]() noexcept {
+        // Release-default Off never creates a worker and must add no status or
+        // perf mutex traffic to the frame hot path. The global zero/default
+        // snapshot already reports configured/effective Off.
+        if (pointShadowPersistentConfiguredMode ==
+                War3PointShadowPersistentMode::Off &&
+            !m_pointShadowPersistentWorker) {
+          return;
+        }
+        const auto workerDiagnostics =
+            m_pointShadowPersistentWorker
+                ? m_pointShadowPersistentWorker->diagnostics()
+                : war3::render::War3PointShadowPrepareWorkerDiagnostics{};
+        PointShadowPersistentDiagnostics diagnostics = {};
+        diagnostics.configuredMode =
+            static_cast<uint32_t>(pointShadowPersistentConfiguredMode);
+        diagnostics.effectiveMode =
+            pointShadowPersistentConfiguredMode !=
+                    War3PointShadowPersistentMode::Off &&
+                m_pointShadowPersistentWorker && workerDiagnostics.available
+            ? static_cast<uint32_t>(pointShadowPersistentConfiguredMode)
+            : static_cast<uint32_t>(War3PointShadowPersistentMode::Off);
+        diagnostics.lastBeginRejectReason = static_cast<uint32_t>(
+            m_pointShadowPersistentLastBeginRejectReason);
+        diagnostics.workerCreated =
+            m_pointShadowPersistentWorker ? 1u : 0u;
+        diagnostics.workerAvailable = workerDiagnostics.available ? 1u : 0u;
+        diagnostics.lastFrameSerial = input.frameSerial;
+        diagnostics.beginAttempts = m_pointShadowPersistentBeginAttempts;
+        diagnostics.beginEligible = m_pointShadowPersistentBeginEligible;
+        diagnostics.workerCreateCount =
+            m_pointShadowPersistentWorkerCreateCount;
+        diagnostics.workerThreadStarts = workerDiagnostics.threadStarts;
+        diagnostics.accepted = m_pointShadowPersistentAccepted;
+        diagnostics.ready = workerDiagnostics.readyJobs;
+        diagnostics.deadlineFallback =
+            m_pointShadowPersistentDeadlineFallback;
+        diagnostics.rejectedFallback =
+            m_pointShadowPersistentRejectedFallback;
+        diagnostics.observeMatch = m_pointShadowPersistentObserveMatch;
+        diagnostics.mismatch = m_pointShadowPersistentObserveMismatch;
+        diagnostics.consumed = m_pointShadowPersistentConsumed;
+        diagnostics.failed = workerDiagnostics.failedJobs;
+        diagnostics.busy = workerDiagnostics.busyRejections;
+        PublishPointShadowPersistentDiagnostics(diagnostics);
+
+        war3::PointShadowPersistentFrameTelemetry telemetry = {};
+        telemetry.configuredMode = diagnostics.configuredMode;
+        telemetry.effectiveMode = diagnostics.effectiveMode;
+        telemetry.lastBeginRejectReason =
+            diagnostics.lastBeginRejectReason;
+        telemetry.workerCreated = diagnostics.workerCreated;
+        telemetry.workerAvailable = diagnostics.workerAvailable;
+        telemetry.beginAttempts = diagnostics.beginAttempts;
+        telemetry.beginEligible = diagnostics.beginEligible;
+        telemetry.workerCreateCount = diagnostics.workerCreateCount;
+        telemetry.workerThreadStarts = diagnostics.workerThreadStarts;
+        telemetry.accepted = diagnostics.accepted;
+        telemetry.ready = diagnostics.ready;
+        telemetry.deadlineFallback = diagnostics.deadlineFallback;
+        telemetry.rejectedFallback = diagnostics.rejectedFallback;
+        telemetry.observeMatch = diagnostics.observeMatch;
+        telemetry.mismatch = diagnostics.mismatch;
+        telemetry.consumed = diagnostics.consumed;
+        telemetry.failed = diagnostics.failed;
+        telemetry.busy = diagnostics.busy;
+        war3::War3PerfMonitor::instance()
+            .notePointShadowPersistentFrame(telemetry);
+      });
   // External consumers execute later in the same frame graph. Revoke the old
   // settlement before any fallible work so a caught Shadow exception cannot
   // make Volume pair a prior CSM with current camera/depth.
@@ -8888,6 +9074,24 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     m_csmData = newCsm;
   }
 
+  const bool allowPointShadowPrepare =
+      (!semanticReceiverStabilityActive ||
+       !SemanticReceiverDisablePointLightsEnabled()) &&
+      m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&
+      mutableSettings.shadows.pointShadowMaxLights > 0u && m_hasPointLights;
+  const bool allowPointShadowPersistentPrepare =
+      allowPointShadowPrepare && pointLightSnapshot.shadowCount > 0u;
+  // Persistent admission is a point-shadow concern, not a directional CSM
+  // concern. Start it before the CSM-only branch so point-only frames get the
+  // same exact same-frame proposal while CSM frames retain useful overlap.
+  // The release-default Off route deliberately stays at its historical spot
+  // inside receiverNeedsShadowMap below, preserving std::async behaviour.
+  if (allowPointShadowPersistentPrepare &&
+      pointShadowPersistentConfiguredMode !=
+          War3PointShadowPersistentMode::Off) {
+    beginPointShadowCpuPrepare(input, pointLightSnapshot, &replayDraws);
+  }
+
   if (receiverNeedsShadowMap) {
     // When the frame chooses to reuse the last complete map, keep the old
     // image dimensions alive. Recreating here clears m_hasCompleteShadowMap and
@@ -8914,16 +9118,14 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       }
       reuseLastShadowMap = false;
     }
-    // A2：在 CSM 录制/复用窗口内后台准备点阴影 face/caster（同帧 seal 的 replayDraws）。
-    // 点光关闭 / WorkerPrepare=0 时 begin 立即空返回，零成本。
-    const bool allowPointShadowPrepare =
-        (!semanticReceiverStabilityActive ||
-         !SemanticReceiverDisablePointLightsEnabled()) &&
-        m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&
-        mutableSettings.shadows.pointShadowMaxLights > 0 && m_hasPointLights;
-    if (allowPointShadowPrepare)
+    // A2 legacy route: keep release-default Off and its std::async launch
+    // exactly inside the original CSM recording/reuse window.
+    if (allowPointShadowPrepare &&
+        pointShadowPersistentConfiguredMode ==
+            War3PointShadowPersistentMode::Off) {
       beginPointShadowCpuPrepare(input, pointLightSnapshot,
                                  &replayDraws);
+    }
 
     if (reuseLastShadowMap) {
       war3::War3PerfMonitor::instance().noteShadowMapFallback(true, false);

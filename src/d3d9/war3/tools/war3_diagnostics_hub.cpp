@@ -522,6 +522,8 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
   War3RuntimeStatusShadowSnapshot summary = {};
   const auto bridgeSummary = dxvk::war3::render::QueryShadowRuntimeBridgeSummary();
   const auto taaDiagnostics = dxvk::QueryShadowTaaDiagnostics();
+  const auto pointPersistentDiagnostics =
+      dxvk::QueryPointShadowPersistentDiagnostics();
   const auto csmDiagnostics = dxvk::QueryCsmResolutionDiagnostics();
   const auto arenaDiagnostics =
       dxvk::war3::memory::ShadowArena_QueryDiagnostics();
@@ -535,6 +537,41 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       taaDiagnostics.lastInvalidationReason;
   summary.shadowTaaFixedWallBypassCount =
       taaDiagnostics.fixedWallBypassCount;
+  summary.pointShadowPersistentConfiguredMode =
+      pointPersistentDiagnostics.configuredMode;
+  summary.pointShadowPersistentEffectiveMode =
+      pointPersistentDiagnostics.effectiveMode;
+  summary.pointShadowPersistentLastBeginRejectReason =
+      pointPersistentDiagnostics.lastBeginRejectReason;
+  summary.pointShadowPersistentWorkerCreated =
+      pointPersistentDiagnostics.workerCreated;
+  summary.pointShadowPersistentWorkerAvailable =
+      pointPersistentDiagnostics.workerAvailable;
+  summary.pointShadowPersistentLastFrameSerial =
+      pointPersistentDiagnostics.lastFrameSerial;
+  summary.pointShadowPersistentBeginAttempts =
+      pointPersistentDiagnostics.beginAttempts;
+  summary.pointShadowPersistentBeginEligible =
+      pointPersistentDiagnostics.beginEligible;
+  summary.pointShadowPersistentWorkerCreateCount =
+      pointPersistentDiagnostics.workerCreateCount;
+  summary.pointShadowPersistentWorkerThreadStarts =
+      pointPersistentDiagnostics.workerThreadStarts;
+  summary.pointShadowPersistentAccepted =
+      pointPersistentDiagnostics.accepted;
+  summary.pointShadowPersistentReady = pointPersistentDiagnostics.ready;
+  summary.pointShadowPersistentDeadlineFallback =
+      pointPersistentDiagnostics.deadlineFallback;
+  summary.pointShadowPersistentRejectedFallback =
+      pointPersistentDiagnostics.rejectedFallback;
+  summary.pointShadowPersistentObserveMatch =
+      pointPersistentDiagnostics.observeMatch;
+  summary.pointShadowPersistentMismatch =
+      pointPersistentDiagnostics.mismatch;
+  summary.pointShadowPersistentConsumed =
+      pointPersistentDiagnostics.consumed;
+  summary.pointShadowPersistentFailed = pointPersistentDiagnostics.failed;
+  summary.pointShadowPersistentBusy = pointPersistentDiagnostics.busy;
   summary.csmRequestedResolution = csmDiagnostics.requestedResolution;
   summary.csmEffectiveResolution = csmDiagnostics.effectiveResolution;
   summary.csmFallbackReason = csmDiagnostics.fallbackReason;
@@ -2396,6 +2433,44 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.shadowTaaLastInvalidationReason},
         {"shadowTaaFixedWallBypassCount",
          snapshot.shadow.shadowTaaFixedWallBypassCount},
+        {"pointShadowPersistentConfiguredMode",
+         snapshot.shadow.pointShadowPersistentConfiguredMode},
+        {"pointShadowPersistentEffectiveMode",
+         snapshot.shadow.pointShadowPersistentEffectiveMode},
+        {"pointShadowPersistentLastBeginRejectReason",
+         snapshot.shadow.pointShadowPersistentLastBeginRejectReason},
+        {"pointShadowPersistentWorkerCreated",
+         snapshot.shadow.pointShadowPersistentWorkerCreated},
+        {"pointShadowPersistentWorkerAvailable",
+         snapshot.shadow.pointShadowPersistentWorkerAvailable},
+        {"pointShadowPersistentLastFrameSerial",
+         snapshot.shadow.pointShadowPersistentLastFrameSerial},
+        {"pointShadowPersistentBeginAttempts",
+         snapshot.shadow.pointShadowPersistentBeginAttempts},
+        {"pointShadowPersistentBeginEligible",
+         snapshot.shadow.pointShadowPersistentBeginEligible},
+        {"pointShadowPersistentWorkerCreateCount",
+         snapshot.shadow.pointShadowPersistentWorkerCreateCount},
+        {"pointShadowPersistentWorkerThreadStarts",
+         snapshot.shadow.pointShadowPersistentWorkerThreadStarts},
+        {"pointShadowPersistentAccepted",
+         snapshot.shadow.pointShadowPersistentAccepted},
+        {"pointShadowPersistentReady",
+         snapshot.shadow.pointShadowPersistentReady},
+        {"pointShadowPersistentDeadlineFallback",
+         snapshot.shadow.pointShadowPersistentDeadlineFallback},
+        {"pointShadowPersistentRejectedFallback",
+         snapshot.shadow.pointShadowPersistentRejectedFallback},
+        {"pointShadowPersistentObserveMatch",
+         snapshot.shadow.pointShadowPersistentObserveMatch},
+        {"pointShadowPersistentMismatch",
+         snapshot.shadow.pointShadowPersistentMismatch},
+        {"pointShadowPersistentConsumed",
+         snapshot.shadow.pointShadowPersistentConsumed},
+        {"pointShadowPersistentFailed",
+         snapshot.shadow.pointShadowPersistentFailed},
+        {"pointShadowPersistentBusy",
+         snapshot.shadow.pointShadowPersistentBusy},
         {"csmRequestedResolution", snapshot.shadow.csmRequestedResolution},
         {"csmEffectiveResolution", snapshot.shadow.csmEffectiveResolution},
         {"csmFallbackReason", snapshot.shadow.csmFallbackReason},
