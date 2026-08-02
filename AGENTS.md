@@ -6,10 +6,11 @@
 `数据段和文本段参数数目不一致（4，3）`。根因是 action 元数据误写了
 `returns = nothing`；YDWE old-writer 会把它序列化为 action 数据段的第一列，
 而 TriggerStrings 只为真实参数生成占位符。现已从全部 action 定义移除返回字段和
-`nothing` 哨兵，call 定义仍保留合法的返回类型/零参数哨兵。
+  `nothing` 哨兵；零参数 call 只保留返回类型，不能伪造一个参数列。
 
 - `WarVK/action.txt` 共37个 action，数据段与 `${...}` 文本占位符逐项一致；
-  `WarVK/call.txt` 共18个 call，返回类型和参数段符合 YDWE classic writer。
+  `WarVK/call.txt` 共18个 call，返回类型和参数段符合 YDWE classic writer，
+  其中零参数 call 的数据段不再出现 `nothing`。
 - 55个公开函数都补充了简短的 `comment` 提示，说明调用用途、参数含义和主要范围；
   不再写入重复的同步/视觉限制警告。
 - `SourceMap/YDWE1.32.13 - MemoryHack/ui/WarVK` 已同步根目录 UI/JASS；删除旧的

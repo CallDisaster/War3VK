@@ -5,8 +5,6 @@ comment = "无参数；返回当前 API 版本字符串。"
 category = "TC_WarVK"
 script = "WarVKGetVersion"
 returns = string
-[[.args]]
-type = nothing
 
 [WarVKGetProtocolVersion]
 title = "获取协议版本"
@@ -15,8 +13,6 @@ comment = "无参数；当前协议版本为1。"
 category = "TC_WarVK"
 script = "WarVKGetProtocolVersion"
 returns = integer
-[[.args]]
-type = nothing
 
 [WarVKGetLastErrorCode]
 title = "获取最后错误码"
@@ -25,8 +21,6 @@ comment = "无参数；返回0表示成功，其余值见 WARVK_ERROR_* 常量�
 category = "TC_WarVK"
 script = "WarVKGetLastErrorCode"
 returns = integer
-[[.args]]
-type = nothing
 
 [WarVKGetLastError]
 title = "获取最后错误文本"
@@ -35,8 +29,6 @@ comment = "无参数；返回最近一次请求的错误文本。"
 category = "TC_WarVK"
 script = "WarVKGetLastError"
 returns = string
-[[.args]]
-type = nothing
 
 [WarVKGetFeatureFlags]
 title = "获取功能标志"
@@ -45,8 +37,6 @@ comment = "无参数；返回 WARVK_FEATURE_* 位掩码，可用整数按位检�
 category = "TC_WarVK"
 script = "WarVKGetFeatureFlags"
 returns = integer
-[[.args]]
-type = nothing
 
 [WarVKIsRuntimeReady]
 title = "查询运行时就绪"
@@ -55,8 +45,6 @@ comment = "无参数；返回true表示桥接和渲染后端已就绪。"
 category = "TC_WarVK"
 script = "WarVKIsRuntimeReady"
 returns = boolean
-[[.args]]
-type = nothing
 
 [WarVKCreatePointLight]
 title = "创建点光源"
@@ -139,8 +127,6 @@ comment = "无参数；返回当前点光和闪电对象数量。"
 category = "TC_WarVK"
 script = "WarVKGetManagedObjectCount"
 returns = integer
-[[.args]]
-type = nothing
 
 [WarVKIsManagedObjectAlive]
 title = "查询托管对象存活"
@@ -169,8 +155,6 @@ comment = "无参数；返回渲染器累计视觉时间，单位秒。"
 category = "TC_WarVK"
 script = "WarVKGetVisualTimeSeconds"
 returns = real
-[[.args]]
-type = nothing
 
 [WarVKGetFrameIndex]
 title = "查询帧序号"
@@ -179,8 +163,6 @@ comment = "无参数；返回当前渲染帧序号。"
 category = "TC_WarVK"
 script = "WarVKGetFrameIndex"
 returns = integer
-[[.args]]
-type = nothing
 
 [WarVKGetFramesPerSecond]
 title = "查询帧率"
@@ -189,8 +171,6 @@ comment = "无参数；返回最近测得的帧率，单位FPS。"
 category = "TC_WarVK"
 script = "WarVKGetFramesPerSecond"
 returns = real
-[[.args]]
-type = nothing
 
 [WarVKGetFrameTimeMilliseconds]
 title = "查询帧耗时"
@@ -199,8 +179,6 @@ comment = "无参数；返回最近帧耗时，单位毫秒。"
 category = "TC_WarVK"
 script = "WarVKGetFrameTimeMilliseconds"
 returns = real
-[[.args]]
-type = nothing
 
 [WarVKGetDrawCallCount]
 title = "查询绘制调用数"
@@ -209,5 +187,3 @@ comment = "无参数；返回最近完成帧的绘制调用数量。"
 category = "TC_WarVK"
 script = "WarVKGetDrawCallCount"
 returns = integer
-[[.args]]
-type = nothing

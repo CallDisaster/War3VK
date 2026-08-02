@@ -110,6 +110,8 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
                 self.assertRegex(block, r'(?m)^comment = "[^"].*"$', name)
                 if kind == "action":
                     self.assertNotRegex(block, r"(?m)^returns\s*=", name)
+                else:
+                    self.assertNotRegex(block, r"(?m)^type\s*=\s*nothing$", name)
                 args = [
                     value
                     for value in re.findall(r"(?m)^type\s*=\s*(\S+)", block)
