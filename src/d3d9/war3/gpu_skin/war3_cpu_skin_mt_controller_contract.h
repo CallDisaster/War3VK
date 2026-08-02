@@ -10,8 +10,9 @@
 
 namespace dxvk::war3::gpu_skin {
 
-// Phase 1 is deliberately value-only. None of these constants authorize a
-// native hook, a mapped-VB write, parity acceptance, or production routing.
+// Phase 2A remains an isolated value contract. These gates deliberately do
+// not authorize a native hook, a mapped-VB write, parity acceptance, or a
+// production route.
 inline constexpr bool kCpuSkinMtControllerRuntimeIntegrated = false;
 inline constexpr bool kCpuSkinMtControllerNativeParityProven = false;
 inline constexpr bool kCpuSkinMtControllerConsumeEnabled = false;
@@ -25,9 +26,11 @@ inline constexpr uint32_t kCpuSkinMtFormat2MinVertices = 193u;
 inline constexpr uint32_t kCpuSkinMtFormat2MaxVertices = 448u;
 inline constexpr uint32_t kCpuSkinMtFormat2MaxPaletteGroups = 64u;
 inline constexpr uint32_t kCpuSkinMtPaletteMatrixBytes = 48u;
+inline constexpr uint32_t kCpuSkinMtMxcsrStatusMask = 0x003fu;
 inline constexpr uint32_t kCpuSkinMtMxcsrControlMask = 0xffc0u;
 inline constexpr uint32_t kCpuSkinMtMxcsrExceptionMask = 0x1f80u;
-inline constexpr uint32_t kCpuSkinMtOutputProofVersion = 1u;
+inline constexpr uint32_t kCpuSkinMtProducerResultProofVersion = 2u;
+inline constexpr uint32_t kCpuSkinMtRenderCommitEnvelopeVersion = 1u;
 
 enum class CpuSkinMtControllerPath : uint8_t {
   Unknown = 0,
@@ -41,11 +44,10 @@ enum class CpuSkinMtControllerState : uint8_t {
   Submitted,
   BoundToOuter,
   AwaitingKernel,
-  ProducerReady,
   CommitClaimed,
-  CopyInProgress,
+  CopyBodyInProgress,
   CopyAwaitingUnlock,
-  NativeSelected,
+  NativeBodyInProgress,
   NativeAwaitingUnlock,
   CopiedNormal,
   OriginalNormal,
@@ -70,6 +72,10 @@ enum class CpuSkinMtControllerTerminal : uint8_t {
 enum class CpuSkinMtControllerResult : uint8_t {
   Applied = 0,
   AlreadyApplied,
+  Published,
+  AlreadyPublished,
+  Consumed,
+  Deferred,
   StaleGeneration,
   InvalidTransition,
   KeyMismatch,
@@ -78,7 +84,9 @@ enum class CpuSkinMtControllerResult : uint8_t {
   DoubleTerminal,
   LateProducerReady,
   MxcsrMismatch,
+  MxcsrStatusDeltaMismatch,
   MissingCopyCallback,
+  InvalidNativeLease,
 };
 
 enum class CpuSkinMtControllerKernelRoute : uint8_t {
@@ -90,23 +98,13 @@ enum class CpuSkinMtControllerKernelRoute : uint8_t {
 
 enum class CpuSkinMtControllerKernelReason : uint8_t {
   None = 0,
-  ReadyOwnedOutput,
+  ReadyProducerResult,
   ProducerNotReady,
   StateLockContended,
   MxcsrMismatch,
+  EnvelopeMismatch,
   AlreadyDecided,
   WindowClosed,
-};
-
-struct CpuSkinMtControllerKernelDecision {
-  CpuSkinMtControllerResult result =
-      CpuSkinMtControllerResult::InvalidTransition;
-  CpuSkinMtControllerKernelRoute route =
-      CpuSkinMtControllerKernelRoute::None;
-  CpuSkinMtControllerKernelReason reason =
-      CpuSkinMtControllerKernelReason::None;
-  bool stateLockAcquired = false;
-  bool selectedNow = false;
 };
 
 struct CpuSkinMtControllerOwnerSessionProof {
@@ -260,15 +258,6 @@ struct CpuSkinMtControllerFrozenKey {
   CpuSkinMtControllerPaletteProof palette;
 };
 
-struct CpuSkinMtControllerExactKey {
-  CpuSkinMtControllerOwnerSessionProof owner;
-  CpuSkinMtControllerFlushBindingProof flush;
-  CpuSkinMtControllerImmutableSourceProof source;
-  CpuSkinMtControllerPaletteProof palette;
-  CpuSkinMtControllerOuterBindingProof outer;
-  CpuSkinMtControllerDestinationProof destination;
-};
-
 bool operator==(const CpuSkinMtControllerOwnerSessionProof& lhs,
                 const CpuSkinMtControllerOwnerSessionProof& rhs) noexcept;
 bool operator==(const CpuSkinMtControllerFlushBindingProof& lhs,
@@ -285,11 +274,9 @@ bool operator==(const CpuSkinMtControllerUnlockProof& lhs,
                 const CpuSkinMtControllerUnlockProof& rhs) noexcept;
 bool operator==(const CpuSkinMtControllerFrozenKey& lhs,
                 const CpuSkinMtControllerFrozenKey& rhs) noexcept;
-bool operator==(const CpuSkinMtControllerExactKey& lhs,
-                const CpuSkinMtControllerExactKey& rhs) noexcept;
 
-inline bool operator!=(const CpuSkinMtControllerExactKey& lhs,
-                       const CpuSkinMtControllerExactKey& rhs) noexcept {
+inline bool operator!=(const CpuSkinMtControllerFrozenKey& lhs,
+                       const CpuSkinMtControllerFrozenKey& rhs) noexcept {
   return !(lhs == rhs);
 }
 
@@ -305,8 +292,6 @@ bool CpuSkinMtControllerDestinationValid(
 bool CpuSkinMtControllerUnlockMatchesDestination(
     const CpuSkinMtControllerDestinationProof& destination,
     const CpuSkinMtControllerUnlockProof& unlock) noexcept;
-bool CpuSkinMtControllerExactKeyComplete(
-    const CpuSkinMtControllerExactKey& key) noexcept;
 
 enum CpuSkinMtFormat2EligibilityFailure : uint64_t {
   CpuSkinMtFormat2EligibilityNone = 0,
@@ -380,16 +365,31 @@ struct CpuSkinMtFormat2EligibilityResult {
   bool eligible = false;
 };
 
+struct CpuSkinMtControllerMxcsrStatusDelta {
+  uint32_t normalizedControl = 0;
+  uint32_t statusBefore = 0;
+  uint32_t statusAfter = 0;
+  uint32_t raisedStatus = 0;
+  uint32_t clearedStatus = 0;
+  bool valid = false;
+};
+
+bool operator==(const CpuSkinMtControllerMxcsrStatusDelta& lhs,
+                const CpuSkinMtControllerMxcsrStatusDelta& rhs) noexcept;
 uint32_t CpuSkinMtNormalizeMxcsrControl(uint32_t mxcsr) noexcept;
 bool CpuSkinMtHasSafeMxcsrControl(uint32_t mxcsr) noexcept;
+CpuSkinMtControllerMxcsrStatusDelta CpuSkinMtCaptureMxcsrStatusDelta(
+    uint32_t before,
+    uint32_t after) noexcept;
 CpuSkinMtFormat2EligibilityResult CpuSkinMtValidateFormat2Eligibility(
     const CpuSkinMtFormat2EligibilityInput& input) noexcept;
-bool CpuSkinMtEligibilityMatchesExactKey(
-    const CpuSkinMtControllerExactKey& key,
+bool CpuSkinMtEligibilityMatchesFrozenKey(
+    const CpuSkinMtControllerFrozenKey& key,
     const CpuSkinMtFormat2EligibilityInput& input) noexcept;
 
-struct CpuSkinMtControllerOutputProof {
-  CpuSkinMtControllerExactKey exactKey;
+struct CpuSkinMtControllerProducerResultProof {
+  CpuSkinMtControllerFrozenKey frozenKey;
+  CpuSkinMtControllerMxcsrStatusDelta mxcsrStatusDelta;
   uint64_t resultSerial = 0;
   uint64_t producerGeneration = 0;
   uint64_t outputContentHash = 0;
@@ -399,61 +399,191 @@ struct CpuSkinMtControllerOutputProof {
   uint32_t proofVersion = 0;
 };
 
-bool operator==(const CpuSkinMtControllerOutputProof& lhs,
-                const CpuSkinMtControllerOutputProof& rhs) noexcept;
+bool operator==(const CpuSkinMtControllerProducerResultProof& lhs,
+                const CpuSkinMtControllerProducerResultProof& rhs) noexcept;
 
-class CpuSkinMtControllerOwnedOutput final {
+class CpuSkinMtControllerOwnedProducerResult final {
 public:
-  static std::shared_ptr<const CpuSkinMtControllerOwnedOutput> Create(
-      const CpuSkinMtControllerExactKey& exactKey,
+  static std::shared_ptr<const CpuSkinMtControllerOwnedProducerResult> Create(
+      const CpuSkinMtControllerFrozenKey& frozenKey,
       const CpuSkinMtFormat2EligibilityInput& eligibility,
       uint64_t resultSerial,
-      std::vector<uint8_t> bytes);
+      std::vector<uint8_t> bytes,
+      uint32_t producerMxcsrBefore,
+      uint32_t producerMxcsrAfter);
 
-  CpuSkinMtControllerOwnedOutput(
-      const CpuSkinMtControllerOwnedOutput&) = delete;
-  CpuSkinMtControllerOwnedOutput& operator=(
-      const CpuSkinMtControllerOwnedOutput&) = delete;
+  CpuSkinMtControllerOwnedProducerResult(
+      const CpuSkinMtControllerOwnedProducerResult&) = delete;
+  CpuSkinMtControllerOwnedProducerResult& operator=(
+      const CpuSkinMtControllerOwnedProducerResult&) = delete;
 
-  const CpuSkinMtControllerOutputProof& proof() const noexcept;
+  const CpuSkinMtControllerProducerResultProof& proof() const noexcept;
   const uint8_t* data() const noexcept;
   uint32_t size() const noexcept;
   bool proofComplete() const noexcept;
 
 private:
-  CpuSkinMtControllerOwnedOutput(
-      const CpuSkinMtControllerExactKey& exactKey,
-      uint32_t normalizedMxcsr,
+  CpuSkinMtControllerOwnedProducerResult(
+      const CpuSkinMtControllerFrozenKey& frozenKey,
+      const CpuSkinMtControllerMxcsrStatusDelta& statusDelta,
       uint64_t resultSerial,
       std::vector<uint8_t> bytes) noexcept;
 
-  CpuSkinMtControllerOutputProof m_proof = {};
+  CpuSkinMtControllerProducerResultProof m_proof = {};
   std::vector<uint8_t> m_bytes;
 };
 
-struct CpuSkinMtControllerOutputView {
-  const uint8_t* bytes = nullptr;
-  uint32_t byteSize = 0;
-  const CpuSkinMtControllerOutputProof* proof = nullptr;
+struct CpuSkinMtControllerRenderCommitEnvelopeProof {
+  CpuSkinMtControllerFrozenKey frozenKey;
+  CpuSkinMtControllerOuterBindingProof outer;
+  CpuSkinMtControllerDestinationProof destination;
+  CpuSkinMtControllerProducerResultProof producerResult;
+  uint64_t commitSerial = 0;
+  uint32_t normalizedOwnerMxcsr = 0;
+  uint32_t proofVersion = 0;
 };
 
-using CpuSkinMtControllerCopyCallback = bool (*)(
+bool operator==(const CpuSkinMtControllerRenderCommitEnvelopeProof& lhs,
+                const CpuSkinMtControllerRenderCommitEnvelopeProof& rhs)
+    noexcept;
+bool CpuSkinMtControllerRenderCommitEnvelopeComplete(
+    const CpuSkinMtControllerRenderCommitEnvelopeProof& proof) noexcept;
+
+class CpuSkinMtControllerRenderCommitEnvelope final {
+public:
+  CpuSkinMtControllerRenderCommitEnvelope() noexcept = default;
+  bool valid() const noexcept;
+  const CpuSkinMtControllerRenderCommitEnvelopeProof& proof() const noexcept;
+
+private:
+  static CpuSkinMtControllerRenderCommitEnvelope MintAfterLock(
+      const CpuSkinMtControllerFrozenKey& frozenKey,
+      const CpuSkinMtControllerOuterBindingProof& outer,
+      const CpuSkinMtControllerDestinationProof& destination,
+      std::shared_ptr<const CpuSkinMtControllerOwnedProducerResult> result,
+      uint64_t commitSerial,
+      uint32_t ownerMxcsr) noexcept;
+
+  CpuSkinMtControllerRenderCommitEnvelopeProof m_proof = {};
+  std::shared_ptr<const CpuSkinMtControllerOwnedProducerResult> m_result;
+
+  friend class CpuSkinMtControllerJob;
+};
+
+class CpuSkinMtControllerNativeBodyLease final {
+public:
+  CpuSkinMtControllerNativeBodyLease() noexcept = default;
+  bool valid() const noexcept;
+  uint64_t activeGeneration() const noexcept;
+  uint64_t lockSerial() const noexcept;
+
+private:
+  CpuSkinMtControllerNativeBodyLease(
+      uint64_t controllerInstanceGeneration,
+      uint64_t producerGeneration,
+      uint64_t activeGeneration,
+      uint64_t frameTag,
+      uint64_t batchId,
+      uint64_t lockSerial) noexcept;
+
+  uint64_t m_controllerInstanceGeneration = 0;
+  uint64_t m_producerGeneration = 0;
+  uint64_t m_activeGeneration = 0;
+  uint64_t m_frameTag = 0;
+  uint64_t m_batchId = 0;
+  uint64_t m_lockSerial = 0;
+
+  friend bool operator==(const CpuSkinMtControllerNativeBodyLease& lhs,
+                         const CpuSkinMtControllerNativeBodyLease& rhs)
+      noexcept;
+  friend class CpuSkinMtControllerJob;
+};
+
+bool operator==(const CpuSkinMtControllerNativeBodyLease& lhs,
+                const CpuSkinMtControllerNativeBodyLease& rhs) noexcept;
+
+struct CpuSkinMtControllerKernelDecision {
+  CpuSkinMtControllerResult result =
+      CpuSkinMtControllerResult::InvalidTransition;
+  CpuSkinMtControllerKernelRoute route =
+      CpuSkinMtControllerKernelRoute::None;
+  CpuSkinMtControllerKernelReason reason =
+      CpuSkinMtControllerKernelReason::None;
+  CpuSkinMtControllerNativeBodyLease nativeBodyLease;
+  bool stateLockAcquired = false;
+  bool selectedNow = false;
+};
+
+struct CpuSkinMtControllerBodyCompletion {
+  bool succeeded = false;
+  uint32_t mxcsrBefore = 0;
+  uint32_t mxcsrAfter = 0;
+};
+
+bool operator==(const CpuSkinMtControllerBodyCompletion& lhs,
+                const CpuSkinMtControllerBodyCompletion& rhs) noexcept;
+
+struct CpuSkinMtControllerProducerResultView {
+  const uint8_t* bytes = nullptr;
+  uint32_t byteSize = 0;
+  const CpuSkinMtControllerProducerResultProof* producerProof = nullptr;
+  const CpuSkinMtControllerRenderCommitEnvelopeProof* commitEnvelope =
+      nullptr;
+};
+
+using CpuSkinMtControllerCopyCallback = CpuSkinMtControllerBodyCompletion (*)(
     void* context,
-    const CpuSkinMtControllerOutputView& output,
+    const CpuSkinMtControllerProducerResultView& result,
     const CpuSkinMtControllerDestinationProof& destination) noexcept;
+
+struct CpuSkinMtControllerOuterSettlementSnapshot {
+  CpuSkinMtControllerKernelRoute route =
+      CpuSkinMtControllerKernelRoute::None;
+  CpuSkinMtControllerTerminal deferredTerminal =
+      CpuSkinMtControllerTerminal::None;
+  CpuSkinMtControllerBodyCompletion bodyCompletion;
+  CpuSkinMtControllerMxcsrStatusDelta bodyMxcsrStatusDelta;
+  bool settlementOpened = false;
+  bool bodyCompleted = false;
+  bool unlockObserved = false;
+  bool producerResultPublished = false;
+  bool producerResultClaimed = false;
+  bool producerResultConsumed = false;
+  bool nativeBodyLeaseInProgress = false;
+  bool cancellationDeferred = false;
+  bool settled = false;
+};
 
 struct CpuSkinMtControllerTerminalLedgerSnapshot {
   uint64_t jobsCreated = 0;
   uint64_t liveJobs = 0;
-  uint64_t producerReadyPublications = 0;
+  uint64_t producerResultPublications = 0;
+  uint64_t liveProducerResults = 0;
+  uint64_t producerResultClaims = 0;
+  uint64_t liveProducerClaims = 0;
+  uint64_t producerResultConsumptions = 0;
+  uint64_t producerResultAbandoned = 0;
+  uint64_t producerClaimAbandoned = 0;
   uint64_t copySelections = 0;
   uint64_t nativeSelections = 0;
   uint64_t liveCopyJobs = 0;
   uint64_t liveNativeJobs = 0;
+  uint64_t nativeBodyLeases = 0;
+  uint64_t liveNativeBodyLeases = 0;
+  uint64_t nativeBodiesCompleted = 0;
+  uint64_t nativeBodyLeasesAbandoned = 0;
+  uint64_t outerSettlementsOpened = 0;
+  uint64_t liveOuterSettlements = 0;
+  uint64_t outerSettlementsCompleted = 0;
   uint64_t guardedCopies = 0;
   uint64_t guardedCopyBodyFaults = 0;
+  uint64_t mxcsrStatusDeltasRecorded = 0;
+  uint64_t mxcsrStatusDeltaMismatches = 0;
   uint64_t successfulUnlocks = 0;
   uint64_t failedUnlocks = 0;
+  uint64_t deferredResetCancellations = 0;
+  uint64_t deferredOuterCancellations = 0;
+  uint64_t deferredTemplateCancellations = 0;
   uint64_t copiedNormal = 0;
   uint64_t originalNormal = 0;
   uint64_t originalFault = 0;
@@ -472,6 +602,7 @@ struct CpuSkinMtControllerTerminalLedgerSnapshot {
   uint64_t copyAfterUnlockRejects = 0;
   uint64_t doubleTerminalRejects = 0;
   uint64_t mxcsrMismatchRejects = 0;
+  uint64_t invalidNativeLeaseRejects = 0;
 
   uint64_t terminalJobs() const noexcept;
   bool closureHolds() const noexcept;
@@ -489,35 +620,56 @@ public:
 
 private:
   struct AtomicCounters {
-    std::atomic<uint64_t> jobsCreated{0};
-    std::atomic<uint64_t> liveJobs{0};
-    std::atomic<uint64_t> producerReadyPublications{0};
-    std::atomic<uint64_t> copySelections{0};
-    std::atomic<uint64_t> nativeSelections{0};
-    std::atomic<uint64_t> liveCopyJobs{0};
-    std::atomic<uint64_t> liveNativeJobs{0};
-    std::atomic<uint64_t> guardedCopies{0};
-    std::atomic<uint64_t> guardedCopyBodyFaults{0};
-    std::atomic<uint64_t> successfulUnlocks{0};
-    std::atomic<uint64_t> failedUnlocks{0};
-    std::atomic<uint64_t> copiedNormal{0};
-    std::atomic<uint64_t> originalNormal{0};
-    std::atomic<uint64_t> originalFault{0};
-    std::atomic<uint64_t> copyFault{0};
-    std::atomic<uint64_t> templateMismatch{0};
-    std::atomic<uint64_t> resetCancelled{0};
-    std::atomic<uint64_t> outerCancelled{0};
-    std::atomic<uint64_t> copyCancelled{0};
-    std::atomic<uint64_t> nativeCancelled{0};
-    std::atomic<uint64_t> unselectedCancelled{0};
-    std::atomic<uint64_t> staleGenerationRejects{0};
-    std::atomic<uint64_t> invalidTransitionRejects{0};
-    std::atomic<uint64_t> keyMismatchRejects{0};
-    std::atomic<uint64_t> producerNotReadyRejects{0};
-    std::atomic<uint64_t> lateProducerReadyRejects{0};
-    std::atomic<uint64_t> copyAfterUnlockRejects{0};
-    std::atomic<uint64_t> doubleTerminalRejects{0};
-    std::atomic<uint64_t> mxcsrMismatchRejects{0};
+#define CPU_SKIN_MT_ATOMIC_COUNTER(name) std::atomic<uint64_t> name{0}
+    CPU_SKIN_MT_ATOMIC_COUNTER(jobsCreated);
+    CPU_SKIN_MT_ATOMIC_COUNTER(liveJobs);
+    CPU_SKIN_MT_ATOMIC_COUNTER(producerResultPublications);
+    CPU_SKIN_MT_ATOMIC_COUNTER(liveProducerResults);
+    CPU_SKIN_MT_ATOMIC_COUNTER(producerResultClaims);
+    CPU_SKIN_MT_ATOMIC_COUNTER(liveProducerClaims);
+    CPU_SKIN_MT_ATOMIC_COUNTER(producerResultConsumptions);
+    CPU_SKIN_MT_ATOMIC_COUNTER(producerResultAbandoned);
+    CPU_SKIN_MT_ATOMIC_COUNTER(producerClaimAbandoned);
+    CPU_SKIN_MT_ATOMIC_COUNTER(copySelections);
+    CPU_SKIN_MT_ATOMIC_COUNTER(nativeSelections);
+    CPU_SKIN_MT_ATOMIC_COUNTER(liveCopyJobs);
+    CPU_SKIN_MT_ATOMIC_COUNTER(liveNativeJobs);
+    CPU_SKIN_MT_ATOMIC_COUNTER(nativeBodyLeases);
+    CPU_SKIN_MT_ATOMIC_COUNTER(liveNativeBodyLeases);
+    CPU_SKIN_MT_ATOMIC_COUNTER(nativeBodiesCompleted);
+    CPU_SKIN_MT_ATOMIC_COUNTER(nativeBodyLeasesAbandoned);
+    CPU_SKIN_MT_ATOMIC_COUNTER(outerSettlementsOpened);
+    CPU_SKIN_MT_ATOMIC_COUNTER(liveOuterSettlements);
+    CPU_SKIN_MT_ATOMIC_COUNTER(outerSettlementsCompleted);
+    CPU_SKIN_MT_ATOMIC_COUNTER(guardedCopies);
+    CPU_SKIN_MT_ATOMIC_COUNTER(guardedCopyBodyFaults);
+    CPU_SKIN_MT_ATOMIC_COUNTER(mxcsrStatusDeltasRecorded);
+    CPU_SKIN_MT_ATOMIC_COUNTER(mxcsrStatusDeltaMismatches);
+    CPU_SKIN_MT_ATOMIC_COUNTER(successfulUnlocks);
+    CPU_SKIN_MT_ATOMIC_COUNTER(failedUnlocks);
+    CPU_SKIN_MT_ATOMIC_COUNTER(deferredResetCancellations);
+    CPU_SKIN_MT_ATOMIC_COUNTER(deferredOuterCancellations);
+    CPU_SKIN_MT_ATOMIC_COUNTER(deferredTemplateCancellations);
+    CPU_SKIN_MT_ATOMIC_COUNTER(copiedNormal);
+    CPU_SKIN_MT_ATOMIC_COUNTER(originalNormal);
+    CPU_SKIN_MT_ATOMIC_COUNTER(originalFault);
+    CPU_SKIN_MT_ATOMIC_COUNTER(copyFault);
+    CPU_SKIN_MT_ATOMIC_COUNTER(templateMismatch);
+    CPU_SKIN_MT_ATOMIC_COUNTER(resetCancelled);
+    CPU_SKIN_MT_ATOMIC_COUNTER(outerCancelled);
+    CPU_SKIN_MT_ATOMIC_COUNTER(copyCancelled);
+    CPU_SKIN_MT_ATOMIC_COUNTER(nativeCancelled);
+    CPU_SKIN_MT_ATOMIC_COUNTER(unselectedCancelled);
+    CPU_SKIN_MT_ATOMIC_COUNTER(staleGenerationRejects);
+    CPU_SKIN_MT_ATOMIC_COUNTER(invalidTransitionRejects);
+    CPU_SKIN_MT_ATOMIC_COUNTER(keyMismatchRejects);
+    CPU_SKIN_MT_ATOMIC_COUNTER(producerNotReadyRejects);
+    CPU_SKIN_MT_ATOMIC_COUNTER(lateProducerReadyRejects);
+    CPU_SKIN_MT_ATOMIC_COUNTER(copyAfterUnlockRejects);
+    CPU_SKIN_MT_ATOMIC_COUNTER(doubleTerminalRejects);
+    CPU_SKIN_MT_ATOMIC_COUNTER(mxcsrMismatchRejects);
+    CPU_SKIN_MT_ATOMIC_COUNTER(invalidNativeLeaseRejects);
+#undef CPU_SKIN_MT_ATOMIC_COUNTER
   };
 
   AtomicCounters m_counters;
@@ -538,26 +690,27 @@ public:
       const CpuSkinMtControllerJob&) = delete;
 
   CpuSkinMtControllerResult submit(uint64_t generation) noexcept;
+  CpuSkinMtControllerResult publishProducerResult(
+      uint64_t generation,
+      std::shared_ptr<const CpuSkinMtControllerOwnedProducerResult> result)
+      noexcept;
   CpuSkinMtControllerResult bindOuter(
       uint64_t generation,
       const CpuSkinMtControllerOuterBindingProof& outer) noexcept;
   CpuSkinMtControllerResult awaitKernel(
       uint64_t generation,
       const CpuSkinMtControllerDestinationProof& destination) noexcept;
-  CpuSkinMtControllerResult publishProducerReady(
-      uint64_t generation,
-      std::shared_ptr<const CpuSkinMtControllerOwnedOutput> output) noexcept;
   CpuSkinMtControllerKernelDecision trySelectKernelRoute(
       uint64_t generation,
       uint32_t currentMxcsr) noexcept;
-  CpuSkinMtControllerResult copyOutputUnderLease(
+  CpuSkinMtControllerResult copyProducerResultUnderLease(
       uint64_t generation,
       CpuSkinMtControllerCopyCallback callback,
       void* context) noexcept;
-  CpuSkinMtControllerResult completeOriginalNormal(
-      uint64_t generation) noexcept;
-  CpuSkinMtControllerResult completeOriginalFault(
-      uint64_t generation) noexcept;
+  CpuSkinMtControllerResult completeNativeBody(
+      uint64_t generation,
+      const CpuSkinMtControllerNativeBodyLease& lease,
+      const CpuSkinMtControllerBodyCompletion& completion) noexcept;
   CpuSkinMtControllerResult noteUnlock(
       uint64_t generation,
       const CpuSkinMtControllerUnlockProof& unlock) noexcept;
@@ -571,14 +724,20 @@ public:
   CpuSkinMtControllerState state() const noexcept;
   CpuSkinMtControllerTerminal terminal() const noexcept;
   uint64_t activeGeneration() const noexcept;
-  bool producerReady() const noexcept;
+  bool producerResultPublished() const noexcept;
+  bool producerResultConsumed() const noexcept;
   bool unlockObserved() const noexcept;
-  CpuSkinMtControllerExactKey exactKey() const noexcept;
-  CpuSkinMtControllerOutputProof outputProof() const noexcept;
+  CpuSkinMtControllerProducerResultProof producerResultProof() const noexcept;
+  CpuSkinMtControllerRenderCommitEnvelopeProof renderCommitEnvelopeProof()
+      const noexcept;
+  CpuSkinMtControllerOuterSettlementSnapshot outerSettlement() const noexcept;
 
 private:
   bool isTerminalLocked() const noexcept;
   void materializeAtomicRouteLocked() noexcept;
+  CpuSkinMtControllerNativeBodyLease makeNativeBodyLease() const noexcept;
+  bool nativeBodyLeaseMatchesLocked(
+      const CpuSkinMtControllerNativeBodyLease& lease) const noexcept;
   CpuSkinMtControllerKernelDecision selectNativeWithoutWaiting(
       CpuSkinMtControllerKernelReason reason,
       bool stateLockAcquired) noexcept;
@@ -586,75 +745,77 @@ private:
   CpuSkinMtControllerResult rejectInvalidLocked() noexcept;
   CpuSkinMtControllerResult rejectKeyLocked() noexcept;
   CpuSkinMtControllerResult rejectDoubleTerminalLocked() noexcept;
+  void settleProducerConsumedLocked() noexcept;
+  void settleProducerAbandonedLocked() noexcept;
+  bool shouldDeferCancellationLocked() const noexcept;
+  CpuSkinMtControllerResult queueDeferredCancellationLocked(
+      CpuSkinMtControllerTerminal terminal,
+      uint64_t nextGeneration) noexcept;
   CpuSkinMtControllerResult finishLocked(
       CpuSkinMtControllerState state,
       CpuSkinMtControllerTerminal terminal) noexcept;
   CpuSkinMtControllerResult finalizeRouteAfterUnlockLocked() noexcept;
 
-  // copyOutputUnderLease holds this mutex across the actual callback. This is
-  // the Phase-1 linearization point: matching Unlock/reset/cancel cannot pass
-  // it and therefore can never authorize a byte write that occurs later.
+  // The copy callback runs while m_mutex is held. A native route is protected
+  // differently: the route CAS itself issues the exact NativeBodyLease, so a
+  // concurrent reset/cancel can only queue a deferred terminal until both the
+  // body and exact Unlock have settled.
   mutable std::mutex m_mutex;
-  CpuSkinMtControllerExactKey m_key = {};
+  CpuSkinMtControllerFrozenKey m_frozen = {};
+  CpuSkinMtControllerOuterBindingProof m_outer = {};
+  CpuSkinMtControllerDestinationProof m_destination = {};
   CpuSkinMtControllerUnlockProof m_unlock = {};
+  CpuSkinMtControllerBodyCompletion m_bodyCompletion = {};
+  CpuSkinMtControllerMxcsrStatusDelta m_bodyMxcsrStatusDelta = {};
+  CpuSkinMtControllerRenderCommitEnvelope m_commitEnvelope;
   CpuSkinMtControllerState m_state = CpuSkinMtControllerState::Invalid;
   CpuSkinMtControllerTerminal m_terminal =
       CpuSkinMtControllerTerminal::None;
+  CpuSkinMtControllerTerminal m_deferredTerminal =
+      CpuSkinMtControllerTerminal::None;
+  uint64_t m_pendingResetGeneration = 0;
   uint64_t m_activeGeneration = 0;
   bool m_unlockObserved = false;
   bool m_bodyCompleted = false;
   bool m_bodySucceeded = false;
+  bool m_producerPublicationSettled = false;
+  bool m_producerClaimed = false;
+  bool m_producerConsumed = false;
+  bool m_outerSettlementOpen = false;
+  bool m_nativeBodyLeaseLive = false;
   CpuSkinMtControllerKernelRoute m_route =
       CpuSkinMtControllerKernelRoute::None;
   std::atomic<CpuSkinMtControllerKernelRoute> m_routeAuthority{
       CpuSkinMtControllerKernelRoute::None};
   std::atomic<uint64_t> m_activeGenerationAtomic{0};
   std::atomic<bool> m_kernelWindowOpen{false};
-  std::shared_ptr<const CpuSkinMtControllerOwnedOutput> m_output;
+  std::shared_ptr<const CpuSkinMtControllerOwnedProducerResult>
+      m_producerResult;
   CpuSkinMtControllerTerminalLedger* m_ledger = nullptr;
 
   friend class CpuSkinMtControllerJobTestPeer;
 };
 
-static_assert(std::is_standard_layout_v<
-              CpuSkinMtControllerOwnerSessionProof>);
-static_assert(std::is_trivially_copyable_v<
-              CpuSkinMtControllerOwnerSessionProof>);
-static_assert(std::is_standard_layout_v<
-              CpuSkinMtControllerFlushBindingProof>);
-static_assert(std::is_trivially_copyable_v<
-              CpuSkinMtControllerFlushBindingProof>);
-static_assert(std::is_standard_layout_v<
-              CpuSkinMtControllerImmutableSourceProof>);
-static_assert(std::is_trivially_copyable_v<
-              CpuSkinMtControllerImmutableSourceProof>);
-static_assert(std::is_standard_layout_v<
-              CpuSkinMtControllerPaletteProof>);
-static_assert(std::is_trivially_copyable_v<
-              CpuSkinMtControllerPaletteProof>);
-static_assert(std::is_standard_layout_v<
-              CpuSkinMtControllerOuterBindingProof>);
-static_assert(std::is_trivially_copyable_v<
-              CpuSkinMtControllerOuterBindingProof>);
-static_assert(std::is_standard_layout_v<
-              CpuSkinMtControllerDestinationProof>);
-static_assert(std::is_trivially_copyable_v<
-              CpuSkinMtControllerDestinationProof>);
-static_assert(std::is_standard_layout_v<
-              CpuSkinMtControllerUnlockProof>);
-static_assert(std::is_trivially_copyable_v<
-              CpuSkinMtControllerUnlockProof>);
-static_assert(std::is_standard_layout_v<CpuSkinMtControllerFrozenKey>);
-static_assert(std::is_trivially_copyable_v<CpuSkinMtControllerFrozenKey>);
-static_assert(std::is_standard_layout_v<CpuSkinMtControllerExactKey>);
-static_assert(std::is_trivially_copyable_v<CpuSkinMtControllerExactKey>);
-static_assert(std::is_standard_layout_v<CpuSkinMtFormat2EligibilityInput>);
-static_assert(std::is_trivially_copyable_v<CpuSkinMtFormat2EligibilityInput>);
-static_assert(std::is_standard_layout_v<CpuSkinMtControllerOutputProof>);
-static_assert(std::is_trivially_copyable_v<CpuSkinMtControllerOutputProof>);
-static_assert(std::is_standard_layout_v<CpuSkinMtControllerKernelDecision>);
-static_assert(std::is_trivially_copyable_v<
-              CpuSkinMtControllerKernelDecision>);
+#define CPU_SKIN_MT_ASSERT_POD(type)           \
+  static_assert(std::is_standard_layout_v<type>); \
+  static_assert(std::is_trivially_copyable_v<type>)
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerOwnerSessionProof);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerFlushBindingProof);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerImmutableSourceProof);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerPaletteProof);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerOuterBindingProof);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerDestinationProof);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerUnlockProof);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerFrozenKey);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtFormat2EligibilityInput);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerMxcsrStatusDelta);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerProducerResultProof);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerRenderCommitEnvelopeProof);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerNativeBodyLease);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerKernelDecision);
+CPU_SKIN_MT_ASSERT_POD(CpuSkinMtControllerBodyCompletion);
+#undef CPU_SKIN_MT_ASSERT_POD
+
 static_assert(std::atomic<CpuSkinMtControllerKernelRoute>::is_always_lock_free,
               "kernel route CAS must be lock-free");
 static_assert(std::atomic<uint64_t>::is_always_lock_free,

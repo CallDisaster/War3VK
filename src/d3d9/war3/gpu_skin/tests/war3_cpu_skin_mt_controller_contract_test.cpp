@@ -41,6 +41,8 @@ using namespace dxvk::war3::gpu_skin;
 
 constexpr uint64_t kGeneration = 7u;
 constexpr uint32_t kSafeMxcsr = kCpuSkinMtMxcsrExceptionMask;
+constexpr uint32_t kProducerMxcsrBefore = kSafeMxcsr | 0x01u;
+constexpr uint32_t kProducerMxcsrAfter = kSafeMxcsr | 0x05u;
 
 struct ProofFixture {
   std::vector<float> positions;
@@ -72,7 +74,6 @@ struct ProofFixture {
     frozen.owner.deviceEpoch = 17u;
     frozen.owner.bridgeResetGeneration = 19u;
     frozen.owner.renderThreadId = 23u;
-
     frozen.flush.frameTag = 29u;
     frozen.flush.flushEpoch = 31u;
     frozen.flush.batchId = 37u;
@@ -201,12 +202,6 @@ struct ProofFixture {
     unlock.result = 0;
   }
 
-  CpuSkinMtControllerExactKey exactKey() const {
-    return CpuSkinMtControllerExactKey{
-        frozen.owner, frozen.flush, frozen.source, frozen.palette,
-        outer, destination};
-  }
-
   CpuSkinMtFormat2EligibilityInput eligibility() const {
     CpuSkinMtFormat2EligibilityInput input;
     input.path = frozen.flush.path;
@@ -236,19 +231,28 @@ struct ProofFixture {
     input.paletteFloatCount = palette.size();
     input.immutableSourceSealedToken = frozen.source.sealedContentToken;
     input.paletteSealedToken = frozen.palette.sealedContentToken;
-    input.frozenMxcsr = kSafeMxcsr;
-    input.currentMxcsr = kSafeMxcsr;
+    input.frozenMxcsr = kProducerMxcsrBefore;
+    input.currentMxcsr = kProducerMxcsrBefore;
     return input;
   }
 
-  std::shared_ptr<const CpuSkinMtControllerOwnedOutput> output(
+  std::shared_ptr<const CpuSkinMtControllerOwnedProducerResult> result(
       uint64_t serial = 1u,
-      uint8_t fill = 0x5au) const {
-    return CpuSkinMtControllerOwnedOutput::Create(
-        exactKey(), eligibility(), serial,
-        std::vector<uint8_t>(destination.size, fill));
+      uint8_t fill = 0x5au,
+      uint32_t mxcsrBefore = kProducerMxcsrBefore,
+      uint32_t mxcsrAfter = kProducerMxcsrAfter) const {
+    return CpuSkinMtControllerOwnedProducerResult::Create(
+        frozen, eligibility(), serial,
+        std::vector<uint8_t>(destination.size, fill),
+        mxcsrBefore, mxcsrAfter);
   }
 };
+
+CpuSkinMtControllerBodyCompletion GoodBodyCompletion(
+    bool succeeded = true) {
+  return CpuSkinMtControllerBodyCompletion{
+      succeeded, kProducerMxcsrBefore, kProducerMxcsrAfter};
+}
 
 bool PrepareAwaiting(CpuSkinMtControllerJob& job,
                      const ProofFixture& fixture) {
@@ -257,85 +261,77 @@ bool PrepareAwaiting(CpuSkinMtControllerJob& job,
         CpuSkinMtControllerResult::Applied);
   CHECK(job.awaitKernel(kGeneration, fixture.destination) ==
         CpuSkinMtControllerResult::Applied);
-  CHECK(CpuSkinMtControllerExactKeyComplete(job.exactKey()));
   return true;
 }
 
-bool SelectCopyRoute(CpuSkinMtControllerJob& job,
-                     uint32_t currentMxcsr = kSafeMxcsr) {
-  const CpuSkinMtControllerKernelDecision decision =
-      job.trySelectKernelRoute(kGeneration, currentMxcsr);
+bool PublishResult(CpuSkinMtControllerJob& job,
+                   const std::shared_ptr<
+                       const CpuSkinMtControllerOwnedProducerResult>& result) {
+  CHECK(result);
+  CHECK(job.publishProducerResult(kGeneration, result) ==
+        CpuSkinMtControllerResult::Published);
+  return true;
+}
+
+bool SelectCopyRoute(CpuSkinMtControllerJob& job) {
+  const auto decision = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
   CHECK(decision.result == CpuSkinMtControllerResult::Applied);
   CHECK(decision.route == CpuSkinMtControllerKernelRoute::Copy);
   CHECK(decision.reason ==
-        CpuSkinMtControllerKernelReason::ReadyOwnedOutput);
+        CpuSkinMtControllerKernelReason::ReadyProducerResult);
   CHECK(decision.stateLockAcquired);
   CHECK(decision.selectedNow);
+  CHECK(!decision.nativeBodyLease.valid());
   return true;
-}
-
-bool SelectNativeRoute(
-    CpuSkinMtControllerJob& job,
-    CpuSkinMtControllerKernelReason expectedReason =
-        CpuSkinMtControllerKernelReason::ProducerNotReady) {
-  const CpuSkinMtControllerKernelDecision decision =
-      job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
-  CHECK(decision.result == CpuSkinMtControllerResult::Applied);
-  CHECK(decision.route == CpuSkinMtControllerKernelRoute::Native);
-  CHECK(decision.reason == expectedReason);
-  CHECK(decision.selectedNow);
-  return true;
-}
-
-bool HasFailure(const CpuSkinMtFormat2EligibilityResult& result,
-                CpuSkinMtFormat2EligibilityFailure failure) {
-  return (result.failureMask & static_cast<uint64_t>(failure)) != 0u;
 }
 
 struct CopyContext {
-  uint32_t calls = 0;
-  bool bodyResult = true;
-  uint8_t expectedFill = 0x5au;
+  bool called = false;
+  bool proofValid = false;
+  CpuSkinMtControllerBodyCompletion completion = GoodBodyCompletion();
 };
 
-bool CopyToMappedDestination(
+CpuSkinMtControllerBodyCompletion CopyToMappedDestination(
     void* opaque,
-    const CpuSkinMtControllerOutputView& output,
+    const CpuSkinMtControllerProducerResultView& result,
     const CpuSkinMtControllerDestinationProof& destination) noexcept {
   auto* context = static_cast<CopyContext*>(opaque);
-  context->calls++;
-  if (output.bytes == nullptr || output.proof == nullptr ||
-      output.byteSize != destination.size ||
-      output.proof->ownedBytesIdentity !=
-          reinterpret_cast<uintptr_t>(output.bytes) ||
-      output.proof->outputByteSize != output.byteSize ||
-      output.bytes[0] != context->expectedFill)
-    return false;
-  std::memcpy(reinterpret_cast<void*>(destination.mappedPointer),
-              output.bytes, output.byteSize);
-  return context->bodyResult;
+  context->called = true;
+  context->proofValid = result.bytes != nullptr && result.byteSize != 0u &&
+      result.producerProof != nullptr && result.commitEnvelope != nullptr &&
+      result.byteSize == destination.size &&
+      result.commitEnvelope->destination == destination &&
+      result.commitEnvelope->producerResult == *result.producerProof;
+  if (context->proofValid) {
+    std::memcpy(reinterpret_cast<void*>(destination.mappedPointer),
+                result.bytes, result.byteSize);
+  }
+  CpuSkinMtControllerBodyCompletion completion = context->completion;
+  completion.succeeded = completion.succeeded && context->proofValid;
+  return completion;
 }
 
 struct BlockingCopyContext {
   std::atomic<bool> entered{false};
   std::atomic<bool> release{false};
-  std::atomic<uint32_t>* sequence = nullptr;
-  uint32_t writeOrder = 0;
 };
 
-bool BlockingCopy(
+CpuSkinMtControllerBodyCompletion BlockingCopy(
     void* opaque,
-    const CpuSkinMtControllerOutputView& output,
+    const CpuSkinMtControllerProducerResultView& result,
     const CpuSkinMtControllerDestinationProof& destination) noexcept {
   auto* context = static_cast<BlockingCopyContext*>(opaque);
   context->entered.store(true, std::memory_order_release);
   while (!context->release.load(std::memory_order_acquire))
     std::this_thread::yield();
-  std::memcpy(reinterpret_cast<void*>(destination.mappedPointer),
-              output.bytes, output.byteSize);
-  context->writeOrder =
-      context->sequence->fetch_add(1u, std::memory_order_acq_rel) + 1u;
-  return true;
+  const bool valid = result.bytes != nullptr &&
+      result.byteSize == destination.size;
+  if (valid) {
+    std::memcpy(reinterpret_cast<void*>(destination.mappedPointer),
+                result.bytes, result.byteSize);
+  }
+  CpuSkinMtControllerBodyCompletion completion = GoodBodyCompletion(valid);
+  return completion;
 }
 
 bool TestRuntimeGatesRemainClosed() {
@@ -346,176 +342,337 @@ bool TestRuntimeGatesRemainClosed() {
   return true;
 }
 
-bool TestExactKeyAndOutputAuthority() {
+bool TestDestinationFreeProducerResultProof() {
   ProofFixture f;
-  const auto exact = f.exactKey();
-  CHECK(CpuSkinMtControllerFrozenKeyValid(f.frozen));
-  CHECK(CpuSkinMtControllerOuterMatchesFrozen(f.frozen, f.outer));
-  CHECK(CpuSkinMtControllerDestinationValid(
-      f.frozen, f.outer, f.destination));
-  CHECK(CpuSkinMtControllerUnlockMatchesDestination(
-      f.destination, f.unlock));
-  CHECK(CpuSkinMtControllerExactKeyComplete(exact));
-  CHECK(CpuSkinMtEligibilityMatchesExactKey(exact, f.eligibility()));
+  const auto result = f.result(17u, 0x6bu);
+  CHECK(result);
+  CHECK(result->proofComplete());
+  CHECK(result->proof().frozenKey == f.frozen);
+  CHECK(result->proof().outputByteSize == f.destination.size);
+  CHECK(result->proof().producerGeneration ==
+        f.frozen.owner.producerGeneration);
+  CHECK(result->proof().mxcsrStatusDelta ==
+        CpuSkinMtCaptureMxcsrStatusDelta(
+            kProducerMxcsrBefore, kProducerMxcsrAfter));
+  CHECK(result->proof().mxcsrStatusDelta.raisedStatus == 0x04u);
 
-  const auto output = f.output(17u, 0x6bu);
-  CHECK(output);
-  CHECK(output->proofComplete());
-  CHECK(output->proof().exactKey == exact);
-  CHECK(output->proof().resultSerial == 17u);
-  CHECK(output->proof().producerGeneration ==
-        exact.owner.producerGeneration);
-  CHECK(output->proof().ownedBytesIdentity ==
-        reinterpret_cast<uintptr_t>(output->data()));
-  CHECK(output->proof().outputByteSize == exact.destination.size);
-  CHECK(output->proof().normalizedMxcsr == kSafeMxcsr);
-  CHECK(output->proof().proofVersion == kCpuSkinMtOutputProofVersion);
-
-  auto badEligibility = f.eligibility();
-  badEligibility.positions++;
-  CHECK(!CpuSkinMtEligibilityMatchesExactKey(exact, badEligibility));
-  CHECK(!CpuSkinMtControllerOwnedOutput::Create(
-      exact, badEligibility, 19u,
-      std::vector<uint8_t>(f.destination.size, 0u)));
-  badEligibility = f.eligibility();
-  badEligibility.currentMxcsr ^= 0x2000u;
-  CHECK(!CpuSkinMtEligibilityMatchesExactKey(exact, badEligibility));
-  badEligibility = f.eligibility();
-  badEligibility.paletteSealedToken++;
-  CHECK(!CpuSkinMtEligibilityMatchesExactKey(exact, badEligibility));
-  CHECK(!CpuSkinMtControllerOwnedOutput::Create(
-      exact, f.eligibility(), 0u,
-      std::vector<uint8_t>(f.destination.size, 0u)));
-  CHECK(!CpuSkinMtControllerOwnedOutput::Create(
-      exact, f.eligibility(), 21u,
-      std::vector<uint8_t>(f.destination.size - 1u, 0u)));
+  auto wrongFrozen = f.frozen;
+  wrongFrozen.source.sealedContentToken++;
+  CHECK(!CpuSkinMtControllerOwnedProducerResult::Create(
+      wrongFrozen, f.eligibility(), 18u,
+      std::vector<uint8_t>(f.destination.size, 0u),
+      kProducerMxcsrBefore, kProducerMxcsrAfter));
+  CHECK(!f.result(19u, 0u, kProducerMxcsrBefore,
+                  kProducerMxcsrAfter ^ 0x2000u));
   return true;
 }
 
-bool TestOwnedOutputLifetimeAndUnlockCommit() {
+bool TestPublicationIsNotConsumption() {
   ProofFixture f;
   CpuSkinMtControllerTerminalLedger ledger;
   CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-  CHECK(PrepareAwaiting(job, f));
+  CHECK(job.submit(kGeneration) == CpuSkinMtControllerResult::Applied);
+  const auto result = f.result();
+  CHECK(job.publishProducerResult(kGeneration, result) ==
+        CpuSkinMtControllerResult::Published);
+  CHECK(job.producerResultPublished());
+  CHECK(!job.producerResultConsumed());
+  auto snapshot = ledger.snapshot();
+  CHECK(snapshot.producerResultPublications == 1u);
+  CHECK(snapshot.producerResultConsumptions == 0u);
+  CHECK(snapshot.liveProducerResults == 1u);
 
-  auto output = f.output();
-  CHECK(output);
-  std::weak_ptr<const CpuSkinMtControllerOwnedOutput> weak = output;
-  CHECK(job.publishProducerReady(kGeneration, output) ==
+  CHECK(job.bindOuter(kGeneration, f.outer) ==
         CpuSkinMtControllerResult::Applied);
-  output.reset();
-  CHECK(!weak.expired());
-  CHECK(job.producerReady());
-  CHECK(job.outputProof().exactKey == f.exactKey());
+  CHECK(job.awaitKernel(kGeneration, f.destination) ==
+        CpuSkinMtControllerResult::Applied);
   CHECK(SelectCopyRoute(job));
-
-  CopyContext copy;
-  CHECK(job.copyOutputUnderLease(kGeneration, CopyToMappedDestination,
-                                 &copy) ==
+  CHECK(!job.producerResultConsumed());
+  CHECK(CpuSkinMtControllerRenderCommitEnvelopeComplete(
+      job.renderCommitEnvelopeProof()));
+  CHECK(job.cancelOuter(kGeneration) ==
         CpuSkinMtControllerResult::Applied);
-  CHECK(copy.calls == 1u);
-  CHECK(job.state() == CpuSkinMtControllerState::CopyAwaitingUnlock);
-  CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
-  CHECK(!weak.expired());
-  CHECK(f.mapped[f.destination.offset] == copy.expectedFill);
-
-  CHECK(job.noteUnlock(kGeneration, f.unlock) ==
-        CpuSkinMtControllerResult::Applied);
-  CHECK(job.terminal() == CpuSkinMtControllerTerminal::CopiedNormal);
-  CHECK(weak.expired());
-  const auto snapshot = ledger.snapshot();
-  CHECK(snapshot.jobsCreated == 1u);
-  CHECK(snapshot.producerReadyPublications == 1u);
-  CHECK(snapshot.copySelections == 1u);
-  CHECK(snapshot.guardedCopies == 1u);
-  CHECK(snapshot.successfulUnlocks == 1u);
-  CHECK(snapshot.copiedNormal == 1u);
+  snapshot = ledger.snapshot();
+  CHECK(snapshot.producerResultConsumptions == 0u);
+  CHECK(snapshot.producerResultAbandoned == 1u);
+  CHECK(snapshot.producerClaimAbandoned == 1u);
   CHECK(snapshot.closureHolds());
   return true;
 }
 
-bool TestOutputMismatchAndCommitMxcsr() {
-  {
+bool TestCopyCommitEnvelopeAndOuterSettlement() {
+  ProofFixture f;
+  CpuSkinMtControllerTerminalLedger ledger;
+  CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+  CHECK(job.submit(kGeneration) == CpuSkinMtControllerResult::Applied);
+  const auto result = f.result(23u, 0x7cu);
+  CHECK(PublishResult(job, result));
+  CHECK(job.bindOuter(kGeneration, f.outer) ==
+        CpuSkinMtControllerResult::Applied);
+  CHECK(job.awaitKernel(kGeneration, f.destination) ==
+        CpuSkinMtControllerResult::Applied);
+  CHECK(SelectCopyRoute(job));
+  const auto envelope = job.renderCommitEnvelopeProof();
+  CHECK(CpuSkinMtControllerRenderCommitEnvelopeComplete(envelope));
+  CHECK(envelope.destination == f.destination);
+  CHECK(envelope.producerResult == result->proof());
+  CHECK(envelope.commitSerial == f.destination.lockSerial);
+  auto forgedEnvelope = envelope;
+  forgedEnvelope.destination.lockSerial++;
+  CHECK(!CpuSkinMtControllerRenderCommitEnvelopeComplete(forgedEnvelope));
+  forgedEnvelope = envelope;
+  forgedEnvelope.producerResult.mxcsrStatusDelta.raisedStatus ^= 0x02u;
+  CHECK(!CpuSkinMtControllerRenderCommitEnvelopeComplete(forgedEnvelope));
+
+  CopyContext context;
+  CHECK(job.copyProducerResultUnderLease(
+      kGeneration, CopyToMappedDestination, &context) ==
+      CpuSkinMtControllerResult::Consumed);
+  CHECK(context.called && context.proofValid);
+  CHECK(job.producerResultConsumed());
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
+  auto settlement = job.outerSettlement();
+  CHECK(settlement.settlementOpened);
+  CHECK(settlement.bodyCompleted);
+  CHECK(!settlement.unlockObserved);
+  CHECK(settlement.producerResultConsumed);
+  CHECK(settlement.bodyMxcsrStatusDelta ==
+        result->proof().mxcsrStatusDelta);
+  CHECK(f.mapped[f.destination.offset] == 0x7cu);
+
+  CHECK(job.noteUnlock(kGeneration, f.unlock) ==
+        CpuSkinMtControllerResult::Applied);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::CopiedNormal);
+  const auto snapshot = ledger.snapshot();
+  CHECK(snapshot.producerResultPublications == 1u);
+  CHECK(snapshot.producerResultConsumptions == 1u);
+  CHECK(snapshot.outerSettlementsOpened == 1u);
+  CHECK(snapshot.outerSettlementsCompleted == 1u);
+  CHECK(snapshot.mxcsrStatusDeltasRecorded == 1u);
+  CHECK(snapshot.closureHolds());
+  return true;
+}
+
+bool TestCopyMxcsrStatusDeltaMismatchFailsClosed() {
+  ProofFixture f;
+  CpuSkinMtControllerTerminalLedger ledger;
+  CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+  CHECK(PrepareAwaiting(job, f));
+  CHECK(PublishResult(job, f.result()));
+  CHECK(SelectCopyRoute(job));
+  CopyContext context;
+  context.completion.mxcsrAfter = kSafeMxcsr | 0x09u;
+  CHECK(job.copyProducerResultUnderLease(
+      kGeneration, CopyToMappedDestination, &context) ==
+      CpuSkinMtControllerResult::MxcsrStatusDeltaMismatch);
+  CHECK(job.producerResultConsumed());
+  CHECK(job.noteUnlock(kGeneration, f.unlock) ==
+        CpuSkinMtControllerResult::Applied);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::CopyFault);
+  const auto snapshot = ledger.snapshot();
+  CHECK(snapshot.producerResultConsumptions == 1u);
+  CHECK(snapshot.mxcsrStatusDeltaMismatches == 1u);
+  CHECK(snapshot.guardedCopyBodyFaults == 1u);
+  CHECK(snapshot.closureHolds());
+  return true;
+}
+
+bool TestNativeLeaseDefersResetThroughOuterSettlement() {
+  ProofFixture f;
+  CpuSkinMtControllerTerminalLedger ledger;
+  CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+  CHECK(PrepareAwaiting(job, f));
+  const auto decision = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
+  CHECK(decision.result == CpuSkinMtControllerResult::Applied);
+  CHECK(decision.route == CpuSkinMtControllerKernelRoute::Native);
+  CHECK(decision.nativeBodyLease.valid());
+  CHECK(decision.nativeBodyLease.activeGeneration() == kGeneration);
+  CHECK(decision.nativeBodyLease.lockSerial() == f.destination.lockSerial);
+  CHECK(job.cancelForReset(kGeneration, kGeneration + 1u) ==
+        CpuSkinMtControllerResult::Deferred);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
+  CHECK(job.activeGeneration() == kGeneration);
+  CHECK(job.outerSettlement().nativeBodyLeaseInProgress);
+
+  CHECK(job.noteUnlock(kGeneration, f.unlock) ==
+        CpuSkinMtControllerResult::Applied);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
+  CHECK(job.completeNativeBody(
+      kGeneration, decision.nativeBodyLease, GoodBodyCompletion()) ==
+      CpuSkinMtControllerResult::Applied);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::ResetCancelled);
+  CHECK(job.activeGeneration() == kGeneration + 1u);
+  const auto snapshot = ledger.snapshot();
+  CHECK(snapshot.deferredResetCancellations == 1u);
+  CHECK(snapshot.nativeBodyLeases == 1u);
+  CHECK(snapshot.nativeBodiesCompleted == 1u);
+  CHECK(snapshot.outerSettlementsCompleted == 1u);
+  CHECK(snapshot.closureHolds());
+  return true;
+}
+
+bool TestNativeLeaseRejectsForgeryAndDuplicateOwner() {
+  ProofFixture f;
+  CpuSkinMtControllerTerminalLedger ledger;
+  CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+  CHECK(PrepareAwaiting(job, f));
+  const auto first = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
+  CHECK(first.route == CpuSkinMtControllerKernelRoute::Native);
+  CHECK(first.selectedNow && first.nativeBodyLease.valid());
+  CHECK(job.completeNativeBody(
+      kGeneration, CpuSkinMtControllerNativeBodyLease{},
+      GoodBodyCompletion()) ==
+      CpuSkinMtControllerResult::InvalidNativeLease);
+  CHECK(!job.outerSettlement().bodyCompleted);
+  CHECK(job.completeNativeBody(
+      kGeneration, first.nativeBodyLease, GoodBodyCompletion()) ==
+      CpuSkinMtControllerResult::Applied);
+  CHECK(job.completeNativeBody(
+      kGeneration, first.nativeBodyLease, GoodBodyCompletion()) ==
+      CpuSkinMtControllerResult::AlreadyApplied);
+  CHECK(job.noteUnlock(kGeneration, f.unlock) ==
+        CpuSkinMtControllerResult::Applied);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::OriginalNormal);
+  const auto snapshot = ledger.snapshot();
+  CHECK(snapshot.invalidNativeLeaseRejects == 1u);
+  CHECK(snapshot.nativeBodiesCompleted == 1u);
+  CHECK(snapshot.closureHolds());
+  return true;
+}
+
+bool TestNativeCompletionThenOuterCancelDefers() {
+  ProofFixture f;
+  CpuSkinMtControllerTerminalLedger ledger;
+  CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+  CHECK(PrepareAwaiting(job, f));
+  const auto decision = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
+  CHECK(decision.nativeBodyLease.valid());
+  CHECK(job.completeNativeBody(
+      kGeneration, decision.nativeBodyLease, GoodBodyCompletion()) ==
+      CpuSkinMtControllerResult::Applied);
+  CHECK(job.cancelOuter(kGeneration) ==
+        CpuSkinMtControllerResult::Deferred);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
+  CHECK(job.noteUnlock(kGeneration, f.unlock) ==
+        CpuSkinMtControllerResult::Applied);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::OuterCancelled);
+  CHECK(ledger.snapshot().deferredOuterCancellations == 1u);
+  CHECK(ledger.snapshot().closureHolds());
+  return true;
+}
+
+bool TestNativeBodyUnlockRace() {
+  for (uint32_t iteration = 0; iteration < 200u; iteration++) {
     ProofFixture f;
     CpuSkinMtControllerTerminalLedger ledger;
     CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
     CHECK(PrepareAwaiting(job, f));
-    CHECK(SelectNativeRoute(job));
-    CHECK(job.completeOriginalNormal(kGeneration) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.noteUnlock(kGeneration, f.unlock) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(ledger.snapshot().producerNotReadyRejects == 1u);
-    CHECK(ledger.snapshot().closureHolds());
-  }
-
-  {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    auto changedExact = f.exactKey();
-    changedExact.destination.lockSerial++;
-    const auto wrong = CpuSkinMtControllerOwnedOutput::Create(
-        changedExact, f.eligibility(), 31u,
-        std::vector<uint8_t>(f.destination.size, 0x11u));
-    CHECK(wrong);
-    CHECK(job.publishProducerReady(kGeneration, wrong) ==
-          CpuSkinMtControllerResult::KeyMismatch);
-
-    const auto output = f.output(33u);
-    const auto duplicateValue = f.output(34u);
-    CHECK(job.publishProducerReady(kGeneration, output) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.publishProducerReady(kGeneration, output) ==
-          CpuSkinMtControllerResult::AlreadyApplied);
-    CHECK(job.publishProducerReady(kGeneration, duplicateValue) ==
-          CpuSkinMtControllerResult::KeyMismatch);
-    const CpuSkinMtControllerKernelDecision mismatch =
-        job.trySelectKernelRoute(kGeneration, kSafeMxcsr ^ 0x2000u);
-    CHECK(mismatch.result == CpuSkinMtControllerResult::Applied);
-    CHECK(mismatch.route == CpuSkinMtControllerKernelRoute::Native);
-    CHECK(mismatch.reason ==
-          CpuSkinMtControllerKernelReason::MxcsrMismatch);
-    CHECK(job.completeOriginalNormal(kGeneration) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.noteUnlock(kGeneration, f.unlock) ==
-          CpuSkinMtControllerResult::Applied);
-    const auto snapshot = ledger.snapshot();
-    CHECK(snapshot.keyMismatchRejects == 2u);
-    CHECK(snapshot.mxcsrMismatchRejects == 1u);
-    CHECK(snapshot.originalNormal == 1u);
-    CHECK(snapshot.closureHolds());
-  }
-
-  {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(job.publishProducerReady(kGeneration, f.output()) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(SelectCopyRoute(job, kSafeMxcsr | 0x21u));
-    CHECK(job.cancelOuter(kGeneration) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(ledger.snapshot().copyCancelled == 1u);
+    const auto decision = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
+    CHECK(decision.nativeBodyLease.valid());
+    std::atomic<bool> start{false};
+    CpuSkinMtControllerResult body =
+        CpuSkinMtControllerResult::InvalidTransition;
+    CpuSkinMtControllerResult unlock =
+        CpuSkinMtControllerResult::InvalidTransition;
+    std::thread bodyThread([&] {
+      while (!start.load(std::memory_order_acquire)) { }
+      body = job.completeNativeBody(
+          kGeneration, decision.nativeBodyLease, GoodBodyCompletion());
+    });
+    std::thread unlockThread([&] {
+      while (!start.load(std::memory_order_acquire)) { }
+      unlock = job.noteUnlock(kGeneration, f.unlock);
+    });
+    start.store(true, std::memory_order_release);
+    bodyThread.join();
+    unlockThread.join();
+    CHECK(body == CpuSkinMtControllerResult::Applied);
+    CHECK(unlock == CpuSkinMtControllerResult::Applied);
+    CHECK(job.terminal() == CpuSkinMtControllerTerminal::OriginalNormal);
     CHECK(ledger.snapshot().closureHolds());
   }
   return true;
 }
 
-bool TestKernelWindowContentionFallsBackImmediately() {
+bool TestNativeResetBodyRaceDefers() {
+  for (uint32_t iteration = 0; iteration < 200u; iteration++) {
+    ProofFixture f;
+    CpuSkinMtControllerTerminalLedger ledger;
+    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+    CHECK(PrepareAwaiting(job, f));
+    const auto decision = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
+    CHECK(decision.nativeBodyLease.valid());
+    std::atomic<bool> start{false};
+    CpuSkinMtControllerResult body =
+        CpuSkinMtControllerResult::InvalidTransition;
+    CpuSkinMtControllerResult cancel =
+        CpuSkinMtControllerResult::InvalidTransition;
+    std::thread bodyThread([&] {
+      while (!start.load(std::memory_order_acquire)) { }
+      body = job.completeNativeBody(
+          kGeneration, decision.nativeBodyLease, GoodBodyCompletion());
+    });
+    std::thread cancelThread([&] {
+      while (!start.load(std::memory_order_acquire)) { }
+      cancel = job.cancelForReset(kGeneration, kGeneration + 1u);
+    });
+    start.store(true, std::memory_order_release);
+    bodyThread.join();
+    cancelThread.join();
+    CHECK(body == CpuSkinMtControllerResult::Applied);
+    CHECK(cancel == CpuSkinMtControllerResult::Deferred);
+    CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
+    CHECK(job.noteUnlock(kGeneration, f.unlock) ==
+          CpuSkinMtControllerResult::Applied);
+    CHECK(job.terminal() == CpuSkinMtControllerTerminal::ResetCancelled);
+    CHECK(job.activeGeneration() == kGeneration + 1u);
+    CHECK(ledger.snapshot().closureHolds());
+  }
+  return true;
+}
+
+bool TestCopyBodyResetRaceDefers() {
+  for (uint32_t iteration = 0; iteration < 100u; iteration++) {
+    ProofFixture f;
+    CpuSkinMtControllerTerminalLedger ledger;
+    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+    CHECK(PrepareAwaiting(job, f));
+    CHECK(PublishResult(job, f.result()));
+    CHECK(SelectCopyRoute(job));
+    BlockingCopyContext context;
+    CpuSkinMtControllerResult copy =
+        CpuSkinMtControllerResult::InvalidTransition;
+    CpuSkinMtControllerResult cancel =
+        CpuSkinMtControllerResult::InvalidTransition;
+    std::thread copyThread([&] {
+      copy = job.copyProducerResultUnderLease(
+          kGeneration, BlockingCopy, &context);
+    });
+    while (!context.entered.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    std::thread cancelThread([&] {
+      cancel = job.cancelForReset(kGeneration, kGeneration + 1u);
+    });
+    context.release.store(true, std::memory_order_release);
+    copyThread.join();
+    cancelThread.join();
+    CHECK(copy == CpuSkinMtControllerResult::Consumed);
+    CHECK(cancel == CpuSkinMtControllerResult::Deferred);
+    CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
+    CHECK(job.noteUnlock(kGeneration, f.unlock) ==
+          CpuSkinMtControllerResult::Applied);
+    CHECK(job.terminal() == CpuSkinMtControllerTerminal::ResetCancelled);
+    CHECK(ledger.snapshot().closureHolds());
+  }
+  return true;
+}
+
+bool TestStateLockContentionIssuesNativeLease() {
   ProofFixture f;
   CpuSkinMtControllerTerminalLedger ledger;
   CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
   CHECK(PrepareAwaiting(job, f));
-  auto output = f.output();
-  std::weak_ptr<const CpuSkinMtControllerOwnedOutput> weak = output;
-  CHECK(job.publishProducerReady(kGeneration, output) ==
-        CpuSkinMtControllerResult::Applied);
-  output.reset();
-  CHECK(!weak.expired());
-
+  CHECK(PublishResult(job, f.result()));
   std::atomic<bool> entered{false};
   std::atomic<bool> release{false};
   std::thread holder([&] {
@@ -524,475 +681,232 @@ bool TestKernelWindowContentionFallsBackImmediately() {
   });
   while (!entered.load(std::memory_order_acquire))
     std::this_thread::yield();
-
-  // This call is intentionally made by the thread that must later release the
-  // holder. Any blocking mutex acquisition would deadlock this test.
-  const CpuSkinMtControllerKernelDecision decision =
-      job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
-  CHECK(decision.result == CpuSkinMtControllerResult::Applied);
+  const auto decision = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
   CHECK(decision.route == CpuSkinMtControllerKernelRoute::Native);
   CHECK(decision.reason ==
         CpuSkinMtControllerKernelReason::StateLockContended);
   CHECK(!decision.stateLockAcquired);
-  CHECK(decision.selectedNow);
-  CHECK(!release.load(std::memory_order_acquire));
-
+  CHECK(decision.selectedNow && decision.nativeBodyLease.valid());
   release.store(true, std::memory_order_release);
   holder.join();
-  CHECK(job.publishProducerReady(kGeneration, f.output(2u)) ==
-        CpuSkinMtControllerResult::LateProducerReady);
-  CHECK(job.completeOriginalNormal(kGeneration) ==
-        CpuSkinMtControllerResult::Applied);
-  CHECK(weak.expired());
+  CHECK(job.cancelOuter(kGeneration) == CpuSkinMtControllerResult::Deferred);
+  CHECK(job.completeNativeBody(
+      kGeneration, decision.nativeBodyLease, GoodBodyCompletion()) ==
+      CpuSkinMtControllerResult::Applied);
   CHECK(job.noteUnlock(kGeneration, f.unlock) ==
         CpuSkinMtControllerResult::Applied);
-  CHECK(job.terminal() == CpuSkinMtControllerTerminal::OriginalNormal);
-  const auto snapshot = ledger.snapshot();
-  CHECK(snapshot.copySelections == 0u);
-  CHECK(snapshot.nativeSelections == 1u);
-  CHECK(snapshot.lateProducerReadyRejects == 1u);
-  CHECK(snapshot.closureHolds());
-  return true;
-}
-
-bool TestCopyFaultsAreUnlockFinalized() {
-  {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(job.publishProducerReady(kGeneration, f.output()) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(SelectCopyRoute(job));
-    CopyContext copy;
-    CHECK(job.copyOutputUnderLease(kGeneration, CopyToMappedDestination,
-                                   &copy) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
-    auto failedUnlock = f.unlock;
-    failedUnlock.result = -1;
-    CHECK(job.noteUnlock(kGeneration, failedUnlock) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::CopyFault);
-    CHECK(ledger.snapshot().failedUnlocks == 1u);
-    CHECK(ledger.snapshot().copyFault == 1u);
-    CHECK(ledger.snapshot().closureHolds());
-  }
-
-  {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(job.publishProducerReady(kGeneration, f.output()) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(SelectCopyRoute(job));
-    CopyContext copy;
-    copy.bodyResult = false;
-    CHECK(job.copyOutputUnderLease(kGeneration, CopyToMappedDestination,
-                                   &copy) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
-    CHECK(job.noteUnlock(kGeneration, f.unlock) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::CopyFault);
-    CHECK(ledger.snapshot().guardedCopyBodyFaults == 1u);
-    CHECK(ledger.snapshot().copyFault == 1u);
-    CHECK(ledger.snapshot().closureHolds());
-  }
-
-  return true;
-}
-
-bool TestNativeCompletionRequiresUnlock() {
-  {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(SelectNativeRoute(job));
-    const auto late = f.output(2u);
-    CHECK(job.publishProducerReady(kGeneration, late) ==
-          CpuSkinMtControllerResult::LateProducerReady);
-    CHECK(!job.producerReady());
-    CHECK(job.completeOriginalNormal(kGeneration) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
-    CHECK(job.noteUnlock(kGeneration, f.unlock) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::OriginalNormal);
-    CHECK(ledger.snapshot().lateProducerReadyRejects == 1u);
-    CHECK(ledger.snapshot().closureHolds());
-  }
-
-  {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(SelectNativeRoute(job));
-    CHECK(job.noteUnlock(kGeneration, f.unlock) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::OriginalFault);
-    CHECK(job.completeOriginalNormal(kGeneration) ==
-          CpuSkinMtControllerResult::DoubleTerminal);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::OriginalFault);
-    CHECK(ledger.snapshot().closureHolds());
-  }
-  return true;
-}
-
-bool TestNativeFailureClassification() {
-  {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(SelectNativeRoute(job));
-    CHECK(job.completeOriginalNormal(kGeneration) ==
-          CpuSkinMtControllerResult::Applied);
-    auto failedUnlock = f.unlock;
-    failedUnlock.result = -7;
-    CHECK(job.noteUnlock(kGeneration, failedUnlock) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::OriginalFault);
-    CHECK(ledger.snapshot().originalFault == 1u);
-    CHECK(ledger.snapshot().closureHolds());
-  }
-
-  {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(SelectNativeRoute(job));
-    CHECK(job.completeOriginalFault(kGeneration) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
-    CHECK(job.noteUnlock(kGeneration, f.unlock) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::OriginalFault);
-    CHECK(ledger.snapshot().closureHolds());
-  }
-  return true;
-}
-
-bool TestNativeBodyVersusUnlockRace() {
-  for (uint32_t iteration = 0; iteration < 300u; iteration++) {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(SelectNativeRoute(job));
-
-    std::atomic<bool> start{false};
-    CpuSkinMtControllerResult bodyResult =
-        CpuSkinMtControllerResult::InvalidTransition;
-    CpuSkinMtControllerResult unlockResult =
-        CpuSkinMtControllerResult::InvalidTransition;
-    std::thread body([&] {
-      while (!start.load(std::memory_order_acquire)) { }
-      bodyResult = job.completeOriginalNormal(kGeneration);
-    });
-    std::thread unlock([&] {
-      while (!start.load(std::memory_order_acquire)) { }
-      unlockResult = job.noteUnlock(kGeneration, f.unlock);
-    });
-    start.store(true, std::memory_order_release);
-    body.join();
-    unlock.join();
-
-    CHECK(unlockResult == CpuSkinMtControllerResult::Applied);
-    const CpuSkinMtControllerTerminal terminal = job.terminal();
-    CHECK(terminal == CpuSkinMtControllerTerminal::OriginalNormal ||
-          terminal == CpuSkinMtControllerTerminal::OriginalFault);
-    if (terminal == CpuSkinMtControllerTerminal::OriginalNormal) {
-      CHECK(bodyResult == CpuSkinMtControllerResult::Applied);
-    } else {
-      CHECK(bodyResult == CpuSkinMtControllerResult::DoubleTerminal);
-    }
-    CHECK(ledger.snapshot().closureHolds());
-  }
-  return true;
-}
-
-bool TestUnlockBeforeCopyRejectsAllWrites() {
-  ProofFixture f;
-  CpuSkinMtControllerTerminalLedger ledger;
-  CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-  CHECK(PrepareAwaiting(job, f));
-  CHECK(job.publishProducerReady(kGeneration, f.output()) ==
-        CpuSkinMtControllerResult::Applied);
-  CHECK(SelectCopyRoute(job));
-  CHECK(job.noteUnlock(kGeneration, f.unlock) ==
-        CpuSkinMtControllerResult::Applied);
-  CHECK(job.terminal() == CpuSkinMtControllerTerminal::CopyFault);
-  CopyContext copy;
-  CHECK(job.copyOutputUnderLease(kGeneration, CopyToMappedDestination,
-                                 &copy) ==
-        CpuSkinMtControllerResult::CopyAfterUnlock);
-  CHECK(copy.calls == 0u);
-  CHECK(f.mapped[f.destination.offset] == 0xccu);
-  CHECK(job.terminal() == CpuSkinMtControllerTerminal::CopyFault);
-  CHECK(ledger.snapshot().copyAfterUnlockRejects == 1u);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::OuterCancelled);
+  CHECK(ledger.snapshot().producerResultAbandoned == 1u);
   CHECK(ledger.snapshot().closureHolds());
   return true;
 }
 
-bool TestCancelBeforeCopyRejectsAllWrites() {
-  for (uint32_t route = 0; route < 2u; route++) {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(job.publishProducerReady(kGeneration, f.output()) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(SelectCopyRoute(job));
-    if (route == 0u) {
-      CHECK(job.cancelForReset(kGeneration, kGeneration + 1u) ==
-            CpuSkinMtControllerResult::Applied);
-    } else {
-      CHECK(job.cancelOuter(kGeneration) ==
-            CpuSkinMtControllerResult::Applied);
-    }
-    CopyContext copy;
-    const CpuSkinMtControllerResult copyResult =
-        job.copyOutputUnderLease(kGeneration, CopyToMappedDestination, &copy);
-    CHECK(copyResult == (route == 0u
-        ? CpuSkinMtControllerResult::StaleGeneration
-        : CpuSkinMtControllerResult::DoubleTerminal));
-    CHECK(copy.calls == 0u);
-    CHECK(f.mapped[f.destination.offset] == 0xccu);
-    CHECK(ledger.snapshot().closureHolds());
-  }
-  return true;
-}
-
-bool TestGuardedCopyLinearizesBeforeUnlock() {
-  for (uint32_t iteration = 0; iteration < 100u; iteration++) {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(job.publishProducerReady(kGeneration, f.output()) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(SelectCopyRoute(job));
-
-    std::atomic<uint32_t> sequence{0u};
-    BlockingCopyContext copy;
-    copy.sequence = &sequence;
-    CpuSkinMtControllerResult copyResult =
-        CpuSkinMtControllerResult::InvalidTransition;
-    CpuSkinMtControllerResult unlockResult =
-        CpuSkinMtControllerResult::InvalidTransition;
-    std::atomic<bool> unlockAttempted{false};
-    uint32_t unlockOrder = 0u;
-
-    std::thread copyThread([&] {
-      copyResult = job.copyOutputUnderLease(
-          kGeneration, BlockingCopy, &copy);
-    });
-    while (!copy.entered.load(std::memory_order_acquire))
-      std::this_thread::yield();
-
-    std::thread unlockThread([&] {
-      unlockAttempted.store(true, std::memory_order_release);
-      unlockResult = job.noteUnlock(kGeneration, f.unlock);
-      unlockOrder = sequence.fetch_add(1u, std::memory_order_acq_rel) + 1u;
-    });
-    while (!unlockAttempted.load(std::memory_order_acquire))
-      std::this_thread::yield();
-    copy.release.store(true, std::memory_order_release);
-    copyThread.join();
-    unlockThread.join();
-
-    CHECK(copyResult == CpuSkinMtControllerResult::Applied);
-    CHECK(unlockResult == CpuSkinMtControllerResult::Applied);
-    CHECK(copy.writeOrder != 0u);
-    CHECK(copy.writeOrder < unlockOrder);
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::CopiedNormal);
-    CHECK(ledger.snapshot().closureHolds());
-  }
-  return true;
-}
-
-bool TestGuardedCopyLinearizesBeforeResetOrCancel() {
-  for (uint32_t iteration = 0; iteration < 100u; iteration++) {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    CHECK(job.publishProducerReady(kGeneration, f.output()) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(SelectCopyRoute(job));
-
-    std::atomic<uint32_t> sequence{0u};
-    BlockingCopyContext copy;
-    copy.sequence = &sequence;
-    CpuSkinMtControllerResult copyResult =
-        CpuSkinMtControllerResult::InvalidTransition;
-    CpuSkinMtControllerResult cancelResult =
-        CpuSkinMtControllerResult::InvalidTransition;
-    std::atomic<bool> cancelAttempted{false};
-    uint32_t cancelOrder = 0u;
-
-    std::thread copyThread([&] {
-      copyResult = job.copyOutputUnderLease(
-          kGeneration, BlockingCopy, &copy);
-    });
-    while (!copy.entered.load(std::memory_order_acquire))
-      std::this_thread::yield();
-
-    std::thread cancelThread([&] {
-      cancelAttempted.store(true, std::memory_order_release);
-      if ((iteration & 1u) == 0u) {
-        cancelResult = job.cancelForReset(
-            kGeneration, kGeneration + 1u);
-      } else {
-        cancelResult = job.cancelOuter(kGeneration);
-      }
-      cancelOrder = sequence.fetch_add(1u, std::memory_order_acq_rel) + 1u;
-    });
-    while (!cancelAttempted.load(std::memory_order_acquire))
-      std::this_thread::yield();
-    copy.release.store(true, std::memory_order_release);
-    copyThread.join();
-    cancelThread.join();
-
-    CHECK(copyResult == CpuSkinMtControllerResult::Applied);
-    CHECK(cancelResult == CpuSkinMtControllerResult::Applied);
-    CHECK(copy.writeOrder < cancelOrder);
-    const CpuSkinMtControllerTerminal expected = (iteration & 1u) == 0u
-        ? CpuSkinMtControllerTerminal::ResetCancelled
-        : CpuSkinMtControllerTerminal::OuterCancelled;
-    CHECK(job.terminal() == expected);
-    const CpuSkinMtControllerResult postCancelUnlock =
-        job.noteUnlock(job.activeGeneration(), f.unlock);
-    CHECK(postCancelUnlock == ((iteration & 1u) == 0u
-        ? CpuSkinMtControllerResult::StaleGeneration
-        : CpuSkinMtControllerResult::Applied));
-    CHECK(job.terminal() == expected);
-    CHECK(ledger.snapshot().closureHolds());
-  }
-  return true;
-}
-
-bool TestClaimVersusNativeRace() {
+bool TestProducerPublicationVersusNativeRace() {
   for (uint32_t iteration = 0; iteration < 200u; iteration++) {
     ProofFixture f;
     CpuSkinMtControllerTerminalLedger ledger;
     CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
     CHECK(PrepareAwaiting(job, f));
-    CHECK(job.publishProducerReady(kGeneration, f.output()) ==
-          CpuSkinMtControllerResult::Applied);
-
+    const auto result = f.result();
     std::atomic<bool> start{false};
-    CpuSkinMtControllerKernelDecision first;
-    CpuSkinMtControllerKernelDecision second;
-    std::thread firstOwner([&] {
-      while (!start.load(std::memory_order_acquire)) { }
-      first = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
-    });
-    std::thread secondOwner([&] {
-      while (!start.load(std::memory_order_acquire)) { }
-      second = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
-    });
-    start.store(true, std::memory_order_release);
-    firstOwner.join();
-    secondOwner.join();
-    CHECK(first.route == second.route);
-    CHECK(first.route == CpuSkinMtControllerKernelRoute::Copy ||
-          first.route == CpuSkinMtControllerKernelRoute::Native);
-    CHECK(first.selectedNow != second.selectedNow);
-    CHECK((first.result == CpuSkinMtControllerResult::Applied) !=
-          (second.result == CpuSkinMtControllerResult::Applied));
-
-    if (first.route == CpuSkinMtControllerKernelRoute::Copy) {
-      CopyContext context;
-      CHECK(job.copyOutputUnderLease(kGeneration, CopyToMappedDestination,
-                                     &context) ==
-            CpuSkinMtControllerResult::Applied);
-    } else {
-      CHECK(job.completeOriginalNormal(kGeneration) ==
-            CpuSkinMtControllerResult::Applied);
-    }
-    CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
-    CHECK(job.noteUnlock(kGeneration, f.unlock) ==
-          CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == (first.route ==
-                                      CpuSkinMtControllerKernelRoute::Copy
-        ? CpuSkinMtControllerTerminal::CopiedNormal
-        : CpuSkinMtControllerTerminal::OriginalNormal));
-    CHECK(ledger.snapshot().closureHolds());
-  }
-  return true;
-}
-
-bool TestProducerVersusNativeRaceAndLateOutput() {
-  for (uint32_t iteration = 0; iteration < 200u; iteration++) {
-    ProofFixture f;
-    CpuSkinMtControllerTerminalLedger ledger;
-    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(job, f));
-    const auto output = f.output();
-
-    std::atomic<bool> start{false};
-    CpuSkinMtControllerResult readyResult =
+    CpuSkinMtControllerResult publication =
         CpuSkinMtControllerResult::InvalidTransition;
     CpuSkinMtControllerKernelDecision decision;
-    std::thread ready([&] {
+    std::thread producer([&] {
       while (!start.load(std::memory_order_acquire)) { }
-      readyResult = job.publishProducerReady(kGeneration, output);
+      publication = job.publishProducerResult(kGeneration, result);
     });
     std::thread owner([&] {
       while (!start.load(std::memory_order_acquire)) { }
       decision = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
     });
     start.store(true, std::memory_order_release);
-    ready.join();
+    producer.join();
     owner.join();
-
     CHECK(decision.result == CpuSkinMtControllerResult::Applied);
     CHECK(decision.selectedNow);
-    CHECK(decision.route == CpuSkinMtControllerKernelRoute::Copy ||
-          decision.route == CpuSkinMtControllerKernelRoute::Native);
-    CHECK(readyResult == CpuSkinMtControllerResult::Applied ||
-          readyResult == CpuSkinMtControllerResult::LateProducerReady);
     if (decision.route == CpuSkinMtControllerKernelRoute::Copy) {
-      CHECK(readyResult == CpuSkinMtControllerResult::Applied);
+      CHECK(publication == CpuSkinMtControllerResult::Published);
       CopyContext context;
-      CHECK(job.copyOutputUnderLease(kGeneration, CopyToMappedDestination,
-                                     &context) ==
-            CpuSkinMtControllerResult::Applied);
+      CHECK(job.copyProducerResultUnderLease(
+          kGeneration, CopyToMappedDestination, &context) ==
+          CpuSkinMtControllerResult::Consumed);
     } else {
-      CHECK(!job.producerReady());
-      CHECK(job.publishProducerReady(kGeneration, output) ==
-            CpuSkinMtControllerResult::LateProducerReady);
-      CHECK(job.completeOriginalNormal(kGeneration) ==
-            CpuSkinMtControllerResult::Applied);
+      CHECK(decision.route == CpuSkinMtControllerKernelRoute::Native);
+      CHECK(decision.nativeBodyLease.valid());
+      CHECK(publication == CpuSkinMtControllerResult::Published ||
+            publication == CpuSkinMtControllerResult::LateProducerReady);
+      CHECK(job.completeNativeBody(
+          kGeneration, decision.nativeBodyLease, GoodBodyCompletion()) ==
+          CpuSkinMtControllerResult::Applied);
     }
     CHECK(job.noteUnlock(kGeneration, f.unlock) ==
           CpuSkinMtControllerResult::Applied);
-    CHECK(job.terminal() == (decision.route ==
-                                      CpuSkinMtControllerKernelRoute::Copy
-        ? CpuSkinMtControllerTerminal::CopiedNormal
-        : CpuSkinMtControllerTerminal::OriginalNormal));
+    CHECK(job.terminal() ==
+          (decision.route == CpuSkinMtControllerKernelRoute::Copy
+              ? CpuSkinMtControllerTerminal::CopiedNormal
+              : CpuSkinMtControllerTerminal::OriginalNormal));
     CHECK(ledger.snapshot().closureHolds());
   }
   return true;
 }
 
-bool TestKeyMismatchResetAndDestructorClosure() {
+bool TestSingleRouteClaimRace() {
+  for (uint32_t iteration = 0; iteration < 200u; iteration++) {
+    ProofFixture f;
+    CpuSkinMtControllerTerminalLedger ledger;
+    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+    CHECK(PrepareAwaiting(job, f));
+    CHECK(PublishResult(job, f.result()));
+    std::atomic<bool> start{false};
+    CpuSkinMtControllerKernelDecision first;
+    CpuSkinMtControllerKernelDecision second;
+    std::thread a([&] {
+      while (!start.load(std::memory_order_acquire)) { }
+      first = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
+    });
+    std::thread b([&] {
+      while (!start.load(std::memory_order_acquire)) { }
+      second = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
+    });
+    start.store(true, std::memory_order_release);
+    a.join();
+    b.join();
+    CHECK(first.selectedNow != second.selectedNow);
+    const auto& selected = first.selectedNow ? first : second;
+    if (selected.route == CpuSkinMtControllerKernelRoute::Copy) {
+      CopyContext context;
+      CHECK(job.copyProducerResultUnderLease(
+          kGeneration, CopyToMappedDestination, &context) ==
+          CpuSkinMtControllerResult::Consumed);
+    } else {
+      CHECK(selected.route == CpuSkinMtControllerKernelRoute::Native);
+      CHECK(selected.nativeBodyLease.valid());
+      CHECK(job.completeNativeBody(
+          kGeneration, selected.nativeBodyLease, GoodBodyCompletion()) ==
+          CpuSkinMtControllerResult::Applied);
+    }
+    CHECK(job.noteUnlock(kGeneration, f.unlock) ==
+          CpuSkinMtControllerResult::Applied);
+    CHECK(ledger.snapshot().closureHolds());
+  }
+  return true;
+}
+
+bool TestUnlockBeforeCopyRejectsWriteAndSettlesClaim() {
+  ProofFixture f;
+  CpuSkinMtControllerTerminalLedger ledger;
+  CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+  CHECK(PrepareAwaiting(job, f));
+  CHECK(PublishResult(job, f.result()));
+  CHECK(SelectCopyRoute(job));
+  CHECK(job.noteUnlock(kGeneration, f.unlock) ==
+        CpuSkinMtControllerResult::Applied);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::CopyFault);
+  CopyContext context;
+  CHECK(job.copyProducerResultUnderLease(
+      kGeneration, CopyToMappedDestination, &context) ==
+      CpuSkinMtControllerResult::CopyAfterUnlock);
+  CHECK(!context.called);
+  CHECK(!job.producerResultConsumed());
+  const auto snapshot = ledger.snapshot();
+  CHECK(snapshot.producerResultAbandoned == 1u);
+  CHECK(snapshot.producerClaimAbandoned == 1u);
+  CHECK(snapshot.closureHolds());
+  return true;
+}
+
+bool TestTemplateCancelWaitsForCopyUnlock() {
+  ProofFixture f;
+  CpuSkinMtControllerTerminalLedger ledger;
+  CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+  CHECK(PrepareAwaiting(job, f));
+  CHECK(PublishResult(job, f.result()));
+  CHECK(SelectCopyRoute(job));
+  CopyContext context;
+  CHECK(job.copyProducerResultUnderLease(
+      kGeneration, CopyToMappedDestination, &context) ==
+      CpuSkinMtControllerResult::Consumed);
+  CHECK(job.cancelTemplateMismatch(kGeneration) ==
+        CpuSkinMtControllerResult::Deferred);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::None);
+  CHECK(job.noteUnlock(kGeneration, f.unlock) ==
+        CpuSkinMtControllerResult::Applied);
+  CHECK(job.terminal() == CpuSkinMtControllerTerminal::TemplateMismatch);
+  CHECK(ledger.snapshot().deferredTemplateCancellations == 1u);
+  CHECK(ledger.snapshot().closureHolds());
+  return true;
+}
+
+bool TestDestructorClosesOutstandingNativeLease() {
+  ProofFixture f;
+  CpuSkinMtControllerTerminalLedger ledger;
+  {
+    CpuSkinMtControllerJob job(f.frozen, kGeneration, ledger);
+    CHECK(PrepareAwaiting(job, f));
+    const auto decision = job.trySelectKernelRoute(kGeneration, kSafeMxcsr);
+    CHECK(decision.nativeBodyLease.valid());
+  }
+  const auto snapshot = ledger.snapshot();
+  CHECK(snapshot.nativeBodyLeasesAbandoned == 1u);
+  CHECK(snapshot.outerCancelled == 1u);
+  CHECK(snapshot.liveJobs == 0u);
+  CHECK(snapshot.closureHolds());
+  return true;
+}
+
+bool TestMxcsrStatusDeltaContract() {
+  const auto delta = CpuSkinMtCaptureMxcsrStatusDelta(
+      kSafeMxcsr | 0x03u, kSafeMxcsr | 0x0au);
+  CHECK(delta.valid);
+  CHECK(delta.normalizedControl == kSafeMxcsr);
+  CHECK(delta.statusBefore == 0x03u);
+  CHECK(delta.statusAfter == 0x0au);
+  CHECK(delta.raisedStatus == 0x08u);
+  CHECK(delta.clearedStatus == 0x01u);
+  CHECK(!CpuSkinMtCaptureMxcsrStatusDelta(
+      kSafeMxcsr, kSafeMxcsr ^ 0x2000u).valid);
+  CHECK(!CpuSkinMtCaptureMxcsrStatusDelta(
+      kSafeMxcsr, kSafeMxcsr | 0x10000u).valid);
+  return true;
+}
+
+bool TestEligibilityBoundaries() {
+  ProofFixture minimum;
+  CHECK(CpuSkinMtValidateFormat2Eligibility(
+      minimum.eligibility()).eligible);
+  CHECK(CpuSkinMtEligibilityMatchesFrozenKey(
+      minimum.frozen, minimum.eligibility()));
+  ProofFixture maximum(kCpuSkinMtFormat2MaxVertices);
+  CHECK(CpuSkinMtValidateFormat2Eligibility(
+      maximum.eligibility()).eligible);
+
+  ProofFixture below(kCpuSkinMtFormat2MinVertices - 1u);
+  CHECK(!CpuSkinMtValidateFormat2Eligibility(
+      below.eligibility()).eligible);
+  auto input = minimum.eligibility();
+  input.path = CpuSkinMtControllerPath::Special;
+  CHECK(!CpuSkinMtValidateFormat2Eligibility(input).eligible);
+  input = minimum.eligibility();
+  input.paletteSealedToken = 0u;
+  CHECK(!CpuSkinMtValidateFormat2Eligibility(input).eligible);
+  minimum.positions[0] = std::numeric_limits<float>::quiet_NaN();
+  CHECK(!CpuSkinMtValidateFormat2Eligibility(
+      minimum.eligibility()).eligible);
+  return true;
+}
+
+bool TestKeyMismatchAndImmediateResetClosure() {
   ProofFixture f;
   CpuSkinMtControllerTerminalLedger ledger;
   {
     CpuSkinMtControllerJob mismatch(f.frozen, kGeneration, ledger);
-    CHECK(PrepareAwaiting(mismatch, f));
-    auto wrongUnlock = f.unlock;
-    wrongUnlock.mapAllocationGeneration++;
-    CHECK(mismatch.noteUnlock(kGeneration, wrongUnlock) ==
+    CHECK(mismatch.submit(kGeneration) ==
+          CpuSkinMtControllerResult::Applied);
+    auto wrongOuter = f.outer;
+    wrongOuter.sourceGeneration++;
+    CHECK(mismatch.bindOuter(kGeneration, wrongOuter) ==
           CpuSkinMtControllerResult::KeyMismatch);
-    CHECK(!mismatch.unlockObserved());
     CHECK(mismatch.cancelTemplateMismatch(kGeneration) ==
           CpuSkinMtControllerResult::Applied);
 
@@ -1003,98 +917,13 @@ bool TestKeyMismatchResetAndDestructorClosure() {
     CHECK(reset.activeGeneration() == kGeneration + 1u);
     CHECK(reset.submit(kGeneration) ==
           CpuSkinMtControllerResult::StaleGeneration);
-
-    CpuSkinMtControllerJob abandoned(f.frozen, kGeneration, ledger);
-    CHECK(abandoned.submit(kGeneration) ==
-          CpuSkinMtControllerResult::Applied);
   }
   const auto snapshot = ledger.snapshot();
   CHECK(snapshot.templateMismatch == 1u);
   CHECK(snapshot.resetCancelled == 1u);
-  CHECK(snapshot.outerCancelled == 1u);
   CHECK(snapshot.keyMismatchRejects == 1u);
   CHECK(snapshot.staleGenerationRejects == 1u);
-  CHECK(snapshot.liveJobs == 0u);
   CHECK(snapshot.closureHolds());
-  return true;
-}
-
-bool TestEligibilityBoundariesAndShape() {
-  ProofFixture minimum;
-  CHECK(CpuSkinMtValidateFormat2Eligibility(
-      minimum.eligibility()).eligible);
-  ProofFixture maximum(kCpuSkinMtFormat2MaxVertices);
-  CHECK(CpuSkinMtValidateFormat2Eligibility(
-      maximum.eligibility()).eligible);
-
-  ProofFixture below(kCpuSkinMtFormat2MinVertices - 1u);
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(
-                       below.eligibility()),
-                   CpuSkinMtFormat2EligibilityVertexRange));
-  ProofFixture above(kCpuSkinMtFormat2MaxVertices + 1u);
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(
-                       above.eligibility()),
-                   CpuSkinMtFormat2EligibilityVertexRange));
-
-  auto input = minimum.eligibility();
-  input.path = CpuSkinMtControllerPath::Special;
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(input),
-                   CpuSkinMtFormat2EligibilityNotCommon));
-  input = minimum.eligibility();
-  input.opaque = false;
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(input),
-                   CpuSkinMtFormat2EligibilityNotOpaque));
-  input = minimum.eligibility();
-  input.specialDispatch = true;
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(input),
-                   CpuSkinMtFormat2EligibilitySpecialDispatch));
-  input = minimum.eligibility();
-  input.outputStride++;
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(input),
-                   CpuSkinMtFormat2EligibilityOutputStride));
-  input = minimum.eligibility();
-  input.positionFloatCount--;
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(input),
-                   CpuSkinMtFormat2EligibilityPositionCount));
-  input = minimum.eligibility();
-  input.paletteSealedToken = 0u;
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(input),
-                   CpuSkinMtFormat2EligibilityPaletteUnsealed));
-  return true;
-}
-
-bool TestEligibilityFiniteGroupAndMxcsr() {
-  ProofFixture f;
-  f.groups[0] = static_cast<uint8_t>(f.frozen.palette.groupCount);
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(f.eligibility()),
-                   CpuSkinMtFormat2EligibilityGroupSlotRange));
-  f.groups[0] = 0u;
-  f.positions[0] = std::numeric_limits<float>::quiet_NaN();
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(f.eligibility()),
-                   CpuSkinMtFormat2EligibilityNonFinitePosition));
-  f.positions[0] = 1.0f;
-  f.normals[0] = std::numeric_limits<float>::infinity();
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(f.eligibility()),
-                   CpuSkinMtFormat2EligibilityNonFiniteNormal));
-  f.normals[0] = 0.5f;
-  f.palette[0] = -std::numeric_limits<float>::infinity();
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(f.eligibility()),
-                   CpuSkinMtFormat2EligibilityNonFinitePalette));
-  f.palette[0] = 1.0f;
-
-  auto input = f.eligibility();
-  input.frozenMxcsr = 0u;
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(input),
-                   CpuSkinMtFormat2EligibilityUnsafeMxcsr));
-  input = f.eligibility();
-  input.currentMxcsr ^= 0x2000u;
-  CHECK(HasFailure(CpuSkinMtValidateFormat2Eligibility(input),
-                   CpuSkinMtFormat2EligibilityMxcsrMismatch));
-  input = f.eligibility();
-  input.frozenMxcsr |= 0x01u;
-  input.currentMxcsr |= 0x21u;
-  CHECK(CpuSkinMtValidateFormat2Eligibility(input).eligible);
-  CHECK(CpuSkinMtEligibilityMatchesExactKey(f.exactKey(), input));
   return true;
 }
 
@@ -1108,24 +937,29 @@ int main() {
 
   const TestCase tests[] = {
       {"runtime gates", TestRuntimeGatesRemainClosed},
-      {"exact/output authority", TestExactKeyAndOutputAuthority},
-      {"owned output lifetime", TestOwnedOutputLifetimeAndUnlockCommit},
-      {"output/MXCSR mismatch", TestOutputMismatchAndCommitMxcsr},
-      {"kernel lock contention",
-       TestKernelWindowContentionFallsBackImmediately},
-      {"copy fault finalization", TestCopyFaultsAreUnlockFinalized},
-      {"native unlock pending", TestNativeCompletionRequiresUnlock},
-      {"native fault classification", TestNativeFailureClassification},
-      {"native body/unlock race", TestNativeBodyVersusUnlockRace},
-      {"unlock rejects copy", TestUnlockBeforeCopyRejectsAllWrites},
-      {"cancel rejects copy", TestCancelBeforeCopyRejectsAllWrites},
-      {"copy/unlock race", TestGuardedCopyLinearizesBeforeUnlock},
-      {"copy/cancel race", TestGuardedCopyLinearizesBeforeResetOrCancel},
-      {"claim/native race", TestClaimVersusNativeRace},
-      {"producer/native race", TestProducerVersusNativeRaceAndLateOutput},
-      {"key/reset/destructor", TestKeyMismatchResetAndDestructorClosure},
-      {"eligibility shape", TestEligibilityBoundariesAndShape},
-      {"eligibility finite/MXCSR", TestEligibilityFiniteGroupAndMxcsr},
+      {"destination-free producer", TestDestinationFreeProducerResultProof},
+      {"publication is not consumption", TestPublicationIsNotConsumption},
+      {"commit envelope/settlement",
+       TestCopyCommitEnvelopeAndOuterSettlement},
+      {"copy MXCSR status mismatch",
+       TestCopyMxcsrStatusDeltaMismatchFailsClosed},
+      {"native lease reset deferral",
+       TestNativeLeaseDefersResetThroughOuterSettlement},
+      {"native lease forgery", TestNativeLeaseRejectsForgeryAndDuplicateOwner},
+      {"native outer cancel deferral",
+       TestNativeCompletionThenOuterCancelDefers},
+      {"native body/unlock race", TestNativeBodyUnlockRace},
+      {"native reset/body race", TestNativeResetBodyRaceDefers},
+      {"copy body/reset race", TestCopyBodyResetRaceDefers},
+      {"lock contention lease", TestStateLockContentionIssuesNativeLease},
+      {"producer/native race", TestProducerPublicationVersusNativeRace},
+      {"single route race", TestSingleRouteClaimRace},
+      {"unlock rejects copy", TestUnlockBeforeCopyRejectsWriteAndSettlesClaim},
+      {"template cancel settlement", TestTemplateCancelWaitsForCopyUnlock},
+      {"destructor lease closure", TestDestructorClosesOutstandingNativeLease},
+      {"MXCSR status delta", TestMxcsrStatusDeltaContract},
+      {"eligibility boundaries", TestEligibilityBoundaries},
+      {"key/reset closure", TestKeyMismatchAndImmediateResetClosure},
   };
 
   for (const auto& test : tests) {
@@ -1136,6 +970,6 @@ int main() {
     std::cout << "PASS: " << test.name << '\n';
   }
 
-  std::cout << "PASS: CPU-MT controller Phase 1 value contract\n";
+  std::cout << "PASS: CPU-MT controller Phase 2A value contract\n";
   return 0;
 }
