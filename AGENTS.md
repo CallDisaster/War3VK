@@ -1,5 +1,54 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02 上午（夜间阶段收口：三个隔离切片已提交，未部署）
+
+用户要求在当前阶段结束后收紧预算，不再继续 Atlas、生产 CPU-MT、阴影批处理或新的
+长时间游戏门。本检查点只收口已经展开的 point-only persistent diagnostics、Stage11
+Package Observe 和 CPU-MT Phase 2A；三者均建立独立本地提交与标签，未 push GitHub。
+
+**独立提交与安全边界**：
+
+- `078b5d6` / `codex/overnight-point-shadow-point-only-diagnostics-20260802`：
+  persistent 准入移出 CSM-only 条件，使显式 Observe/Consume 可覆盖纯点光帧；默认 Off
+  仍使用原 CSM 内 `std::async` 谓词和调度。新增数值型 runtime/perf diagnostics；只有
+  至少一个 `shadowCount>0` 的点光才创建 worker，内外两层均 fail-closed。
+- `e04ebe9` / `codex/overnight-cpu-skin-mt-phase2a-20260802`：destination-free
+  `ProducerResultProof`、Lock 后 render-owner `RenderCommitEnvelope`、Published/Consumed
+  分账、`NativeBodyLease`、reset/cancel 延迟结算及 MXCSR control/status-delta 合同。
+  模块仍未进入 Meson/生产路径，RuntimeIntegrated/NativeParityProven/ConsumeEnabled/
+  ProductionDefault 四门全部为 false；不能宣称 CPU-MT 已落地或已有性能收益。
+- `2a71067` / `codex/overnight-package-stage11-content-observe-20260802`：默认 Off 的
+  Stage11 Observe adapter 只在 final caster 与 exactSubmitted witness 发布后做一次
+  geoset sidecar 地址关联。独立审查确认模型缓存不按 map epoch 分域，因此证据已明确
+  降级为 `RecordedContentIdentityOnly`，硬置 `provesCurrentGameMemory=false`；Package、
+  Consume、Arena、GPU binding、command recording、draw mutation 与 consumer authority
+  全部为零。该统计不能作为 persistent package 准入证明。
+
+**验证与构建**：
+
+- 全部 42 个 `test_*static.py` 模块共 354 tests PASS；Package Stage11 adapter、point
+  mailbox、point planner 三个 Meson runnable 3/3 PASS。CPU-MT Phase 2A 另有严格 i686
+  20/20 runnable 与 50/50 独立进程竞态压力 PASS，共 45,000 个序列。
+- Win32 全构建成功，`ninja -C build32 -n` no-work；目标 diff-check 无 whitespace error。
+  新 `build32/src/d3d9/d3d9.dll` 为 32,859,760 bytes，SHA-256
+  `6B59C78B7EA36B3ECB9B1B3EF0C2B52F87A8BC30040560BC150915BC28E6B0CD`。
+- 此组合 DLL **没有部署、没有启动游戏**。`E:\Work\War3\d3d9.dll` 仍是上一轮已运行的
+  `D99643796218CE2E60345AE739558CE583694CF74F72A3D0C6C2519BB8C1C015`；其回退仍为
+  `d3d9.dll.bak_20260802_9BF5_pre_point_persistent_observe`。
+
+**上一部署候选的最终高压门**：
+
+- 显式 point persistent Consume + DirectInline 在高压单位图完成 160/160 exact capture、
+  5,049 report frames / 91.826 秒；暗块 trigger、frame incomplete、budget exceeded、
+  device lost、incident JSON 与新增 NVIDIA driver event 全为 0。PointShadow 5,030 calls
+  中只有 1 次启动同步 Prepare，之后由持久 worker proposal 接管；保留的最后 32 帧
+  最大时域暗块 181 px。该结果证明候选正确性门通过，但隔离桌面报告的 FPS/CPU 数字
+  不能当作正式 ABBA 收益，发布默认继续保持 Off。
+
+**下一轮边界**：先由用户审核本交接清单。若继续，应优先做短小的 point-only 运行诊断
+与 Package Observe 10k 帧开销测量；在当前地图资源证明、真实 Lock/Unlock 生命周期、
+native byte/MXCSR parity 和 ABBA 收益闭合前，不接入 Package Consume 或生产 CPU-MT。
+
 ## 🚨 2026-08-02（点阴影持久 Prepare Worker 运行验证候选，默认 Off）
 
 本阶段把已验证的 owned-value point-shadow planner/worker 接入 production shadow pass，
