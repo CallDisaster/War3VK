@@ -1,5 +1,41 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（点阴影持久 Prepare Worker 运行时候选，默认 Off、未部署）
+
+本阶段把已验证的 owned-value point-shadow planner/worker 接入 production shadow pass，
+但发布默认仍为 `Off`：默认不分配 worker、不创建线程，并完整保留旧 `std::async` 路径。
+显式环境 `DXVK_WAR3_POINT_SHADOW_PERSISTENT_PREPARE_MODE=Observe/Consume` 才延迟创建
+持久 worker；尚无游戏运行证据，不能改默认值或宣称性能收益。
+
+**同帧正确性与失败回退**：
+
+- render owner 冻结最多四灯、settings/history、light matrix/face history、replay/policy/
+  lifecycle seals、完整 caster scalar/world/palette，以及 dynamic pose signature/count/
+  skinned-output count；request 只含自有 CPU 值，不跨线程携带 renderer、`Rc<>` 或 Vulkan
+  生命周期。vector reserve/push/copy/submit 任一异常或拒绝都会撤销 pending，并在当帧执行
+  canonical 同步构建；拒绝前不移动 caller storage，回退数据不会丢失。
+- collection 是 non-blocking exact：busy、not-ready、failed、stale、generation/frame/light、
+  settings/history、blend tuple、dynamic pose 或 caster/replay seal 任一不一致均拒绝 proposal，
+  当帧同步重建，绝不消费陈旧 plan。Consume 只有 exact proposal 才采用；Observe 始终先跑
+  canonical 同步计划，再只比较 disposition/lights/face lists/history，记录 match/mismatch。
+- `ReusePublished` 不是 render payload：独立 validator 只允许沿用当前已发布 faces，并只推进
+  一次 temporal age；不会用 proposal 覆写实时 lights、matrices、face valid/age/history 或
+  face caster lists。Render proposal 则在采用前再次执行完整 exact equality。
+- worker/storage 的 shutdown/join 发生在 renderer/GPU 资源销毁之前；Accepted storage 在
+  result 后回收复用，deadline/rejected fallback 不阻塞 render owner。
+
+**验证与交付边界**：
+
+- 针对性静态合同 29/29 PASS；Win32 mailbox/planner runnable 2/2 PASS；全量
+  `test_*_static.py` 335/335 PASS。production build 与 `ninja -C build32 -n` 均 no-work；
+  targeted `git diff --check` 仅既有 LF -> CRLF 提示。
+- 未部署 `build32/src/d3d9/d3d9.dll`：32,842,865 bytes，SHA-256
+  `D99643796218CE2E60345AE739558CE583694CF74F72A3D0C6C2519BB8C1C015`。部署目录仍为
+  32,649,789-byte `9BF5E3D9...` 物理验收基线；本阶段未启动游戏。
+- 后续只能先部署带回退副本的 Observe 候选，跑点光图/高压图并证明 mismatch=0、
+  deviceLost/Arena violation/final-caster 缺口均为 0，再单独测试 Consume；未达这些门时
+  必须保持 Off，不能删除旧同步/`std::async` 回退。
+
 ## 🚨 2026-08-02（CPU-MT 蒙皮 Phase 1 值合同，隔离提交、默认关闭）
 
 本阶段只保存 format-2 中型候选的 CPU-MT 所有权、输出证明、非阻塞路由与终态记账

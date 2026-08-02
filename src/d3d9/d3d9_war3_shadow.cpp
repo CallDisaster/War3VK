@@ -47,6 +47,7 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <type_traits>
 #include <utility>
 
@@ -64,6 +65,22 @@ namespace {
 std::mutex g_shadowDiagnosticsMutex;
 ShadowTaaDiagnostics g_shadowTaaDiagnostics = {};
 CsmResolutionDiagnostics g_csmResolutionDiagnostics = {};
+std::atomic<uint64_t> g_pointShadowPersistentRendererEpoch{1u};
+
+uint64_t MintPointShadowPersistentRendererEpoch() noexcept {
+  uint64_t epoch =
+      g_pointShadowPersistentRendererEpoch.load(std::memory_order_relaxed);
+  for (;;) {
+    // Saturate permanently at exhaustion. Zero is an invalid owner token and
+    // no prior epoch may ever be recycled after integer wrap.
+    if (epoch == 0u || epoch == std::numeric_limits<uint64_t>::max())
+      return 0u;
+    if (g_pointShadowPersistentRendererEpoch.compare_exchange_weak(
+            epoch, epoch + 1u, std::memory_order_relaxed,
+            std::memory_order_relaxed))
+      return epoch;
+  }
+}
 
 template <typename Fn>
 class War3ScopeExit final {
@@ -1755,6 +1772,8 @@ War3ShadowReceiverPass::War3ShadowReceiverPass(D3D9DeviceEx *device)
     : m_parent(device), m_device(device->GetDXVKDevice()),
       m_layout(createPipelineLayout()),
       m_shadowCasterLayout(createShadowCasterPipelineLayout()) {
+  m_pointShadowPersistentRendererEpoch =
+      MintPointShadowPersistentRendererEpoch();
   // Cannot init MRT layout here until we know we need it?
   // Better to defer init.
 
@@ -1833,6 +1852,8 @@ War3ShadowReceiverPass::War3ShadowReceiverPass(D3D9DeviceEx *device)
 }
 
 War3ShadowReceiverPass::~War3ShadowReceiverPass() {
+  if (m_pointShadowPersistentWorker)
+    m_pointShadowPersistentWorker->shutdown();
   // Point-shadow CPU preparation captures this pass and writes its plan/state.
   // Drain it before tearing down perf state, pipelines, or member resources;
   // relying on std::future's member destructor is too late because that runs
@@ -4384,6 +4405,412 @@ bool War3WorkerPrepareEnabled() {
   return enabled;
 }
 
+enum class War3PointShadowPersistentMode : uint32_t {
+  Off = 0u,
+  Observe = 1u,
+  Consume = 2u,
+};
+
+War3PointShadowPersistentMode PointShadowPersistentMode() {
+  static const War3PointShadowPersistentMode mode = [] {
+    const char *env =
+        std::getenv("DXVK_WAR3_POINT_SHADOW_PERSISTENT_PREPARE_MODE");
+    if (!env || env[0] == '\0' || env[0] == '0')
+      return War3PointShadowPersistentMode::Off;
+    if (std::strcmp(env, "2") == 0 || std::strcmp(env, "consume") == 0 ||
+        std::strcmp(env, "Consume") == 0)
+      return War3PointShadowPersistentMode::Consume;
+    if (std::strcmp(env, "1") == 0 || std::strcmp(env, "observe") == 0 ||
+        std::strcmp(env, "Observe") == 0)
+      return War3PointShadowPersistentMode::Observe;
+    return War3PointShadowPersistentMode::Off;
+  }();
+  return mode;
+}
+
+struct PointShadowSealBuilder {
+  uint64_t value = 0xcbf29ce484222325ull;
+
+  void mixU64(uint64_t token) noexcept {
+    value ^= token + 0x9e3779b97f4a7c15ull + (value << 6u) +
+        (value >> 2u);
+  }
+
+  void mixF32(float token) noexcept {
+    uint32_t bits = 0u;
+    static_assert(sizeof(bits) == sizeof(token));
+    std::memcpy(&bits, &token, sizeof(bits));
+    mixU64(bits);
+  }
+
+  uint64_t finish() const noexcept {
+    return value != 0u ? value : 1u;
+  }
+};
+
+template <typename Handle>
+uint64_t PointShadowHandleIdentity(Handle handle) noexcept {
+  uint64_t result = 0u;
+  static_assert(sizeof(handle) <= sizeof(result));
+  std::memcpy(&result, &handle, sizeof(handle));
+  return result;
+}
+
+bool PointShadowF32Exact(float lhs, float rhs) noexcept {
+  uint32_t lhsBits = 0u;
+  uint32_t rhsBits = 0u;
+  std::memcpy(&lhsBits, &lhs, sizeof(lhsBits));
+  std::memcpy(&rhsBits, &rhs, sizeof(rhsBits));
+  return lhsBits == rhsBits;
+}
+
+war3::render::War3PointShadowCpuMatrix4 FreezePointShadowMatrix(
+    const Matrix4 &matrix) noexcept {
+  war3::render::War3PointShadowCpuMatrix4 result = {};
+  for (uint32_t lane = 0u; lane < 4u; ++lane) {
+    result.vectors[lane][0] = matrix[lane].x;
+    result.vectors[lane][1] = matrix[lane].y;
+    result.vectors[lane][2] = matrix[lane].z;
+    result.vectors[lane][3] = matrix[lane].w;
+  }
+  return result;
+}
+
+Matrix4 ThawPointShadowMatrix(
+    const war3::render::War3PointShadowCpuMatrix4 &matrix) noexcept {
+  Matrix4 result;
+  for (uint32_t lane = 0u; lane < 4u; ++lane) {
+    result[lane] = Vector4(matrix.vectors[lane][0], matrix.vectors[lane][1],
+                           matrix.vectors[lane][2], matrix.vectors[lane][3]);
+  }
+  return result;
+}
+
+war3::render::War3PointShadowCpuCaster FreezePointShadowCaster(
+    const War3ShadowCasterDraw &draw) noexcept {
+  using Caster = war3::render::War3PointShadowCpuCaster;
+  Caster result = {};
+  result.boundsCenter = {draw.boundsCenter.x, draw.boundsCenter.y,
+                         draw.boundsCenter.z, draw.boundsCenter.w};
+  result.boundsRadius = draw.boundsRadius;
+  result.worldMatrix = FreezePointShadowMatrix(draw.worldMatrix);
+  result.vertexCount = draw.vertexCount;
+  result.indexCount = draw.indexCount;
+  result.positionFormat = static_cast<uint32_t>(draw.positionFormat);
+  result.positionStride = draw.positionStride;
+  result.positionOffset = draw.positionOffset;
+  result.indexType = static_cast<uint32_t>(draw.indexType);
+  result.vertexBlendCount = draw.vertexBlendCount;
+  result.paletteIndex = draw.paletteIndex;
+  result.blendWeightFormat = static_cast<uint32_t>(draw.blendWeightFormat);
+  result.blendWeightOffset = draw.blendWeightOffset;
+  result.blendIndexFormat = static_cast<uint32_t>(draw.blendIndexFormat);
+  result.blendIndexOffset = draw.blendIndexOffset;
+  result.blendBinding = draw.blendBinding;
+  result.blendStride = draw.blendStride;
+  result.topology = static_cast<uint32_t>(draw.topology);
+  result.firstIndex = draw.firstIndex;
+  result.vertexOffset = draw.vertexOffset;
+  result.firstVertex = draw.firstVertex;
+  result.minVertexIndex = draw.minVertexIndex;
+  result.numVertices = draw.numVertices;
+  result.positionStorageIdentity =
+      reinterpret_cast<uintptr_t>(draw.positionStorage.ptr());
+  result.positionBufferIdentity =
+      PointShadowHandleIdentity(draw.positionInfo.buffer);
+  result.positionBufferOffset = draw.positionInfo.offset;
+  result.positionBufferSize = draw.positionInfo.size;
+  result.indexStorageIdentity =
+      reinterpret_cast<uintptr_t>(draw.indexStorage.ptr());
+  result.indexBufferIdentity = PointShadowHandleIdentity(draw.indexInfo.buffer);
+  result.indexBufferOffset = draw.indexInfo.offset;
+  result.indexBufferSize = draw.indexInfo.size;
+  result.blendStorageIdentity =
+      reinterpret_cast<uintptr_t>(draw.blendStorage.ptr());
+  result.blendBufferIdentity = PointShadowHandleIdentity(draw.blendInfo.buffer);
+  result.blendBufferOffset = draw.blendInfo.offset;
+  result.blendBufferSize = draw.blendInfo.size;
+  result.alphaRef = draw.alphaRef;
+  result.uvFormat = static_cast<uint32_t>(draw.uvFormat);
+  result.uvStride = draw.uvStride;
+  result.uvOffset = draw.uvOffset;
+  result.uvBinding = draw.uvBinding;
+  result.uvStorageIdentity =
+      reinterpret_cast<uintptr_t>(draw.uvStorage.ptr());
+  result.uvBufferIdentity = PointShadowHandleIdentity(draw.uvInfo.buffer);
+  result.uvBufferOffset = draw.uvInfo.offset;
+  result.uvBufferSize = draw.uvInfo.size;
+  result.diffuseTextureIdentity =
+      reinterpret_cast<uintptr_t>(draw.diffuseTexture.ptr());
+  result.diffuseSamplerIdentity =
+      reinterpret_cast<uintptr_t>(draw.diffuseSampler.ptr());
+  result.diffuseSamplerIndex = draw.diffuseSamplerIndex;
+  result.indexed = draw.indexed;
+  result.vertexBlendEnabled = draw.vertexBlendEnabled;
+  result.vertexBlendIndexed = draw.vertexBlendIndexed;
+  result.alphaTestEnabled = draw.alphaTestEnabled;
+  result.alphaBlendEnabled = draw.alphaBlendEnabled;
+  // This declaration is minted only after every field above has been copied
+  // from the sealed current-frame replay row by the renderer owner.
+  result.frozenComplete = true;
+  return result;
+}
+
+bool PointShadowMatrixExact(
+    const war3::render::War3PointShadowCpuMatrix4 &lhs,
+    const war3::render::War3PointShadowCpuMatrix4 &rhs) noexcept {
+  for (uint32_t lane = 0u; lane < 4u; ++lane) {
+    for (uint32_t component = 0u; component < 4u; ++component) {
+      if (!PointShadowF32Exact(lhs.vectors[lane][component],
+                               rhs.vectors[lane][component]))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool PointShadowMatrixFinite(
+    const war3::render::War3PointShadowCpuMatrix4 &matrix) noexcept {
+  for (uint32_t lane = 0u; lane < 4u; ++lane) {
+    for (uint32_t component = 0u; component < 4u; ++component) {
+      if (!std::isfinite(matrix.vectors[lane][component]))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool PointShadowCasterExact(
+    const war3::render::War3PointShadowCpuCaster &lhs,
+    const war3::render::War3PointShadowCpuCaster &rhs) noexcept {
+  const bool scalarExact =
+      PointShadowF32Exact(lhs.boundsCenter.x, rhs.boundsCenter.x) &&
+      PointShadowF32Exact(lhs.boundsCenter.y, rhs.boundsCenter.y) &&
+      PointShadowF32Exact(lhs.boundsCenter.z, rhs.boundsCenter.z) &&
+      PointShadowF32Exact(lhs.boundsCenter.w, rhs.boundsCenter.w) &&
+      PointShadowF32Exact(lhs.boundsRadius, rhs.boundsRadius) &&
+      PointShadowF32Exact(lhs.alphaRef, rhs.alphaRef);
+  if (!scalarExact || !PointShadowMatrixExact(lhs.worldMatrix, rhs.worldMatrix))
+    return false;
+  return lhs.vertexCount == rhs.vertexCount &&
+      lhs.indexCount == rhs.indexCount &&
+      lhs.positionFormat == rhs.positionFormat &&
+      lhs.positionStride == rhs.positionStride &&
+      lhs.positionOffset == rhs.positionOffset &&
+      lhs.indexType == rhs.indexType &&
+      lhs.vertexBlendCount == rhs.vertexBlendCount &&
+      lhs.paletteIndex == rhs.paletteIndex &&
+      lhs.blendWeightFormat == rhs.blendWeightFormat &&
+      lhs.blendWeightOffset == rhs.blendWeightOffset &&
+      lhs.blendIndexFormat == rhs.blendIndexFormat &&
+      lhs.blendIndexOffset == rhs.blendIndexOffset &&
+      lhs.blendBinding == rhs.blendBinding &&
+      lhs.blendStride == rhs.blendStride &&
+      lhs.topology == rhs.topology && lhs.firstIndex == rhs.firstIndex &&
+      lhs.vertexOffset == rhs.vertexOffset &&
+      lhs.firstVertex == rhs.firstVertex &&
+      lhs.minVertexIndex == rhs.minVertexIndex &&
+      lhs.numVertices == rhs.numVertices &&
+      lhs.positionStorageIdentity == rhs.positionStorageIdentity &&
+      lhs.positionBufferIdentity == rhs.positionBufferIdentity &&
+      lhs.positionBufferOffset == rhs.positionBufferOffset &&
+      lhs.positionBufferSize == rhs.positionBufferSize &&
+      lhs.indexStorageIdentity == rhs.indexStorageIdentity &&
+      lhs.indexBufferIdentity == rhs.indexBufferIdentity &&
+      lhs.indexBufferOffset == rhs.indexBufferOffset &&
+      lhs.indexBufferSize == rhs.indexBufferSize &&
+      lhs.blendStorageIdentity == rhs.blendStorageIdentity &&
+      lhs.blendBufferIdentity == rhs.blendBufferIdentity &&
+      lhs.blendBufferOffset == rhs.blendBufferOffset &&
+      lhs.blendBufferSize == rhs.blendBufferSize &&
+      lhs.uvFormat == rhs.uvFormat && lhs.uvStride == rhs.uvStride &&
+      lhs.uvOffset == rhs.uvOffset && lhs.uvBinding == rhs.uvBinding &&
+      lhs.uvStorageIdentity == rhs.uvStorageIdentity &&
+      lhs.uvBufferIdentity == rhs.uvBufferIdentity &&
+      lhs.uvBufferOffset == rhs.uvBufferOffset &&
+      lhs.uvBufferSize == rhs.uvBufferSize &&
+      lhs.diffuseTextureIdentity == rhs.diffuseTextureIdentity &&
+      lhs.diffuseSamplerIdentity == rhs.diffuseSamplerIdentity &&
+      lhs.diffuseSamplerIndex == rhs.diffuseSamplerIndex &&
+      lhs.indexed == rhs.indexed &&
+      lhs.vertexBlendEnabled == rhs.vertexBlendEnabled &&
+      lhs.vertexBlendIndexed == rhs.vertexBlendIndexed &&
+      lhs.alphaTestEnabled == rhs.alphaTestEnabled &&
+      lhs.alphaBlendEnabled == rhs.alphaBlendEnabled &&
+      lhs.frozenComplete == rhs.frozenComplete;
+}
+
+void MixPointShadowCasterSeal(
+    PointShadowSealBuilder &seal,
+    const war3::render::War3PointShadowCpuCaster &caster) noexcept {
+  // Do not hash object padding. Mix the exact fields through a second,
+  // padding-free byte representation produced by the same explicit equality
+  // contract. The full equality is still repeated before Consume; this digest
+  // is only the early replay-generation seal.
+  seal.mixF32(caster.boundsCenter.x);
+  seal.mixF32(caster.boundsCenter.y);
+  seal.mixF32(caster.boundsCenter.z);
+  seal.mixF32(caster.boundsCenter.w);
+  seal.mixF32(caster.boundsRadius);
+  seal.mixU64(caster.vertexCount);
+  seal.mixU64(caster.indexCount);
+  seal.mixU64(caster.positionFormat);
+  seal.mixU64(caster.positionStride);
+  seal.mixU64(caster.positionOffset);
+  seal.mixU64(caster.indexType);
+  seal.mixU64(caster.vertexBlendCount);
+  seal.mixU64(caster.paletteIndex);
+  seal.mixU64(caster.blendWeightFormat);
+  seal.mixU64(caster.blendWeightOffset);
+  seal.mixU64(caster.blendIndexFormat);
+  seal.mixU64(caster.blendIndexOffset);
+  seal.mixU64(caster.blendBinding);
+  seal.mixU64(caster.blendStride);
+  seal.mixU64(caster.topology);
+  seal.mixU64(caster.firstIndex);
+  seal.mixU64(static_cast<uint32_t>(caster.vertexOffset));
+  seal.mixU64(caster.firstVertex);
+  seal.mixU64(caster.minVertexIndex);
+  seal.mixU64(caster.numVertices);
+  seal.mixU64(caster.positionStorageIdentity);
+  seal.mixU64(caster.positionBufferIdentity);
+  seal.mixU64(caster.positionBufferOffset);
+  seal.mixU64(caster.positionBufferSize);
+  seal.mixU64(caster.indexStorageIdentity);
+  seal.mixU64(caster.indexBufferIdentity);
+  seal.mixU64(caster.indexBufferOffset);
+  seal.mixU64(caster.indexBufferSize);
+  seal.mixU64(caster.blendStorageIdentity);
+  seal.mixU64(caster.blendBufferIdentity);
+  seal.mixU64(caster.blendBufferOffset);
+  seal.mixU64(caster.blendBufferSize);
+  seal.mixF32(caster.alphaRef);
+  seal.mixU64(caster.uvFormat);
+  seal.mixU64(caster.uvStride);
+  seal.mixU64(caster.uvOffset);
+  seal.mixU64(caster.uvBinding);
+  seal.mixU64(caster.uvStorageIdentity);
+  seal.mixU64(caster.uvBufferIdentity);
+  seal.mixU64(caster.uvBufferOffset);
+  seal.mixU64(caster.uvBufferSize);
+  seal.mixU64(caster.diffuseTextureIdentity);
+  seal.mixU64(caster.diffuseSamplerIdentity);
+  seal.mixU64(caster.diffuseSamplerIndex);
+  seal.mixU64(caster.indexed ? 1u : 0u);
+  seal.mixU64(caster.vertexBlendEnabled ? 1u : 0u);
+  seal.mixU64(caster.vertexBlendIndexed ? 1u : 0u);
+  seal.mixU64(caster.alphaTestEnabled ? 1u : 0u);
+  seal.mixU64(caster.alphaBlendEnabled ? 1u : 0u);
+  seal.mixU64(caster.frozenComplete ? 1u : 0u);
+  for (uint32_t lane = 0u; lane < 4u; ++lane) {
+    for (uint32_t component = 0u; component < 4u; ++component)
+      seal.mixF32(caster.worldMatrix.vectors[lane][component]);
+  }
+}
+
+war3::render::War3PointShadowCpuPlanSettings FreezePointShadowSettings(
+    const War3RenderSettings &settings) noexcept {
+  war3::render::War3PointShadowCpuPlanSettings result = {};
+  result.pointLightsEnabled = settings.shadows.pointLightsEnabled;
+  result.pointShadowEnabled = settings.shadows.pointShadowEnabled;
+  result.pointShadowFaceCulling = settings.shadows.pointShadowFaceCulling;
+  result.pointShadowTemporalReuse = settings.shadows.pointShadowTemporalReuse;
+  result.alphaShadowHashed = settings.shadows.alphaShadowHashed;
+  result.pointShadowResolution = settings.shadows.pointShadowResolution;
+  result.pointShadowMaxLights = settings.shadows.pointShadowMaxLights;
+  result.pointShadowMaxFacesPerFrame =
+      settings.shadows.pointShadowMaxFacesPerFrame;
+  result.pointShadowMaxCastersPerFace =
+      settings.shadows.pointShadowMaxCastersPerFace;
+  result.pointShadowUpdatePeriod = settings.shadows.pointShadowUpdatePeriod;
+  result.pointShadowCasterCullPadding =
+      settings.shadows.pointShadowCasterCullPadding;
+  return result;
+}
+
+bool PointShadowSettingsExact(
+    const war3::render::War3PointShadowCpuPlanSettings &lhs,
+    const war3::render::War3PointShadowCpuPlanSettings &rhs) noexcept {
+  return lhs.pointLightsEnabled == rhs.pointLightsEnabled &&
+      lhs.pointShadowEnabled == rhs.pointShadowEnabled &&
+      lhs.pointShadowFaceCulling == rhs.pointShadowFaceCulling &&
+      lhs.pointShadowTemporalReuse == rhs.pointShadowTemporalReuse &&
+      lhs.alphaShadowHashed == rhs.alphaShadowHashed &&
+      lhs.pointShadowResolution == rhs.pointShadowResolution &&
+      lhs.pointShadowMaxLights == rhs.pointShadowMaxLights &&
+      lhs.pointShadowMaxFacesPerFrame == rhs.pointShadowMaxFacesPerFrame &&
+      lhs.pointShadowMaxCastersPerFace == rhs.pointShadowMaxCastersPerFace &&
+      lhs.pointShadowUpdatePeriod == rhs.pointShadowUpdatePeriod &&
+      PointShadowF32Exact(lhs.pointShadowCasterCullPadding,
+                          rhs.pointShadowCasterCullPadding);
+}
+
+uint64_t PointShadowPolicySeal(
+    const war3::render::War3PointShadowCpuPlanSettings &settings) noexcept {
+  PointShadowSealBuilder seal;
+  seal.mixU64(settings.pointLightsEnabled ? 1u : 0u);
+  seal.mixU64(settings.pointShadowEnabled ? 1u : 0u);
+  seal.mixU64(settings.pointShadowFaceCulling ? 1u : 0u);
+  seal.mixU64(settings.pointShadowTemporalReuse ? 1u : 0u);
+  seal.mixU64(settings.alphaShadowHashed ? 1u : 0u);
+  seal.mixU64(settings.pointShadowResolution);
+  seal.mixU64(settings.pointShadowMaxLights);
+  seal.mixU64(settings.pointShadowMaxFacesPerFrame);
+  seal.mixU64(settings.pointShadowMaxCastersPerFace);
+  seal.mixU64(settings.pointShadowUpdatePeriod);
+  seal.mixF32(settings.pointShadowCasterCullPadding);
+  return seal.finish();
+}
+
+bool PointShadowHistoryExact(
+    const war3::render::War3PointShadowCpuHistory &lhs,
+    const war3::render::War3PointShadowCpuHistory &rhs) noexcept {
+  return lhs.cubeAllocated == rhs.cubeAllocated &&
+      lhs.readyLightCount == rhs.readyLightCount &&
+      lhs.publishedContentSignature == rhs.publishedContentSignature &&
+      lhs.temporalAge == rhs.temporalAge &&
+      lhs.faceValidMask == rhs.faceValidMask && lhs.faceAge == rhs.faceAge;
+}
+
+uint64_t PointShadowLifecycleSeal(
+    uint64_t rendererEpoch,
+    const war3::render::War3PointShadowCpuHistory &history) noexcept {
+  PointShadowSealBuilder seal;
+  seal.mixU64(rendererEpoch);
+  seal.mixU64(history.cubeAllocated ? 1u : 0u);
+  seal.mixU64(history.readyLightCount);
+  seal.mixU64(history.publishedContentSignature);
+  seal.mixU64(history.temporalAge);
+  for (uint32_t light = 0u;
+       light < war3::render::kWar3PointShadowCpuPlanMaxLights; ++light) {
+    seal.mixU64(history.faceValidMask[light]);
+    for (uint32_t face = 0u; face < 6u; ++face)
+      seal.mixU64(history.faceAge[light][face]);
+  }
+  return seal.finish();
+}
+
+war3::render::War3PointShadowCpuLight FreezePointShadowLight(
+    const War3PointLight &light) noexcept {
+  war3::render::War3PointShadowCpuLight result = {};
+  result.position = {light.position.x, light.position.y, light.position.z,
+                     light.position.w};
+  result.shadowIntensity = light.params.x;
+  result.id = light.id;
+  return result;
+}
+
+bool PointShadowLightExact(
+    const war3::render::War3PointShadowCpuLight &lhs,
+    const war3::render::War3PointShadowCpuLight &rhs) noexcept {
+  return lhs.id == rhs.id &&
+      PointShadowF32Exact(lhs.position.x, rhs.position.x) &&
+      PointShadowF32Exact(lhs.position.y, rhs.position.y) &&
+      PointShadowF32Exact(lhs.position.z, rhs.position.z) &&
+      PointShadowF32Exact(lhs.position.w, rhs.position.w) &&
+      PointShadowF32Exact(lhs.shadowIntensity, rhs.shadowIntensity);
+}
+
 static const struct {
   Vector4 dir;
   Vector4 up;
@@ -4525,6 +4952,620 @@ void War3ShadowReceiverPass::waitPointShadowCpuPrepare() {
   m_pointShadowPrepareRunning.store(false, std::memory_order_release);
 }
 
+void War3ShadowReceiverPass::recyclePointShadowPersistentStorage(
+    war3::render::War3PointShadowCpuPlanOwnedStorage &&storage) {
+  m_pointShadowPersistentRequestScratch.payload.storage = std::move(storage);
+}
+
+void War3ShadowReceiverPass::beginPointShadowPersistentPrepare(
+    const War3PipelineInput &input,
+    const War3PointLightFrameSnapshot &lightSnapshot,
+    const std::vector<const War3ShadowCasterDraw *> *replayDraws) {
+  using namespace war3::render;
+
+  if (!replayDraws || replayDraws->empty() || !input.settings ||
+      lightSnapshot.generation == 0u || lightSnapshot.frameSerial == 0u ||
+      input.frameSerial == 0u ||
+      m_pointShadowPersistentRendererEpoch == 0u)
+    return;
+
+  if (!m_pointShadowPersistentWorker) {
+    try {
+      m_pointShadowPersistentWorker =
+          std::make_unique<PointShadowPersistentPrepareWorker>();
+    } catch (...) {
+      ++m_pointShadowPersistentRejectedFallback;
+      return;
+    }
+    if (!m_pointShadowPersistentWorker->available()) {
+      ++m_pointShadowPersistentRejectedFallback;
+      return;
+    }
+    WAR3_RENDER_LOG(
+        "DXVK PointShadow: persistent prepare worker created mode=%u "
+        "(release default remains Off)\n",
+        static_cast<uint32_t>(PointShadowPersistentMode()));
+  }
+
+  // A prior frame may have taken longer than its same-frame deadline. Never
+  // wait for it and never overwrite its mailbox slot. Reclaim an exact ready
+  // payload, discard terminal failures, or leave the worker busy and use the
+  // canonical synchronous path for this frame.
+  if (m_pointShadowPersistentPending) {
+    auto previous = m_pointShadowPersistentWorker->tryCollectExact(
+        m_pointShadowPersistentPendingGeneration);
+    if (previous.state == War3PointShadowPrepareResultState::NotReady) {
+      ++m_pointShadowPersistentRejectedFallback;
+      return;
+    }
+    m_pointShadowPersistentPending = false;
+    if (previous.state == War3PointShadowPrepareResultState::Ready &&
+        previous.payload.has_value()) {
+      recyclePointShadowPersistentStorage(
+          std::move(previous.payload->storage));
+    }
+  }
+
+  if (m_pointShadowPersistentJobSerial ==
+      std::numeric_limits<uint64_t>::max()) {
+    ++m_pointShadowPersistentRejectedFallback;
+    return;
+  }
+  if (replayDraws->size() >
+      size_t(std::numeric_limits<uint32_t>::max())) {
+    ++m_pointShadowPersistentRejectedFallback;
+    return;
+  }
+
+  PointShadowPersistentRequest &request =
+      m_pointShadowPersistentRequestScratch;
+  try {
+    request.generation = {
+        ++m_pointShadowPersistentJobSerial,
+        m_pointShadowPersistentRendererEpoch,
+        input.frameSerial,
+        lightSnapshot.generation,
+    };
+    auto &payload = request.payload;
+    payload.settings = FreezePointShadowSettings(*input.settings);
+    payload.hasAnyLight = lightSnapshot.hasAny;
+    payload.shadowLightCount = lightSnapshot.shadowCount;
+    payload.dynamicPoseSignature =
+        input.scene.shadowStats.dynamicPoseSignature;
+    payload.dynamicPoseCount = input.scene.shadowStats.dynamicPoseCount;
+    payload.dynamicSkinnedOutputCount =
+        input.scene.shadowStats.dynamicSkinnedOutputCount;
+    payload.history = {};
+    payload.history.cubeAllocated =
+        m_pointShadowCube && m_pointShadowCubeView;
+    payload.history.readyLightCount = m_pointShadowReadyCount;
+    payload.history.publishedContentSignature =
+        m_pointShadowContentSignature;
+    payload.history.temporalAge = m_pointShadowTemporalAge;
+    payload.history.faceValidMask = m_pointShadowFaceValidMask;
+    payload.history.faceAge = m_pointShadowFaceAge;
+
+    payload.lights.fill({});
+    const uint32_t frozenLightCount = std::min<uint32_t>(
+        lightSnapshot.shadowCount, kMaxPointShadowLights);
+    for (uint32_t light = 0u; light < frozenLightCount; ++light) {
+      payload.lights[light] =
+          FreezePointShadowLight(lightSnapshot.lights[light]);
+    }
+
+    auto &storage = payload.storage;
+    storage.paletteHashes.clear();
+    storage.paletteHashes.reserve(input.scene.shadowPalettes.size());
+    for (const auto &palette : input.scene.shadowPalettes)
+      storage.paletteHashes.push_back(palette.hash);
+    storage.casters.clear();
+    storage.casters.reserve(replayDraws->size());
+    storage.rangeCandidateIndices.clear();
+    storage.rankedCandidates.clear();
+    for (auto &face : storage.faceCasters)
+      face.clear();
+
+    PointShadowSealBuilder replaySeal;
+    replaySeal.mixU64(input.frameSerial);
+    replaySeal.mixU64(lightSnapshot.generation);
+    replaySeal.mixU64(payload.dynamicPoseSignature);
+    replaySeal.mixU64(payload.dynamicPoseCount);
+    replaySeal.mixU64(payload.dynamicSkinnedOutputCount);
+    replaySeal.mixU64(replayDraws->size());
+    for (const War3ShadowCasterDraw *draw : *replayDraws) {
+      if (!draw) {
+        request.generation = {};
+        payload.seal = {};
+        ++m_pointShadowPersistentRejectedFallback;
+        return;
+      }
+      storage.casters.push_back(FreezePointShadowCaster(*draw));
+      MixPointShadowCasterSeal(replaySeal, storage.casters.back());
+    }
+    replaySeal.mixU64(storage.paletteHashes.size());
+    for (uint64_t paletteHash : storage.paletteHashes)
+      replaySeal.mixU64(paletteHash);
+
+    payload.seal.replayGeneration = replaySeal.finish();
+    payload.seal.policyRevision = PointShadowPolicySeal(payload.settings);
+    payload.seal.lifecycleGeneration = PointShadowLifecycleSeal(
+        m_pointShadowPersistentRendererEpoch, payload.history);
+
+    const auto expectedGeneration = request.generation;
+    const auto expectedSeal = payload.seal;
+    const auto expectedSettings = payload.settings;
+    const auto expectedHistory = payload.history;
+    const auto expectedLights = payload.lights;
+    const uint64_t expectedDynamicPoseSignature =
+        payload.dynamicPoseSignature;
+    const uint32_t expectedDynamicPoseCount = payload.dynamicPoseCount;
+    const uint32_t expectedDynamicSkinnedOutputCount =
+        payload.dynamicSkinnedOutputCount;
+
+    const War3PointShadowPrepareSubmitStatus submitted =
+        m_pointShadowPersistentWorker->submit(request);
+    if (submitted == War3PointShadowPrepareSubmitStatus::Accepted) {
+      m_pointShadowPersistentPendingGeneration = expectedGeneration;
+      m_pointShadowPersistentPendingSeal = expectedSeal;
+      m_pointShadowPersistentExpectedSettings = expectedSettings;
+      m_pointShadowPersistentExpectedHistory = expectedHistory;
+      m_pointShadowPersistentExpectedLights = expectedLights;
+      m_pointShadowPersistentExpectedLightCount = frozenLightCount;
+      m_pointShadowPersistentExpectedDynamicPoseSignature =
+          expectedDynamicPoseSignature;
+      m_pointShadowPersistentExpectedDynamicPoseCount =
+          expectedDynamicPoseCount;
+      m_pointShadowPersistentExpectedDynamicSkinnedOutputCount =
+          expectedDynamicSkinnedOutputCount;
+      m_pointShadowPersistentPending = true;
+      ++m_pointShadowPersistentAccepted;
+      return;
+    }
+
+    // submit(Request&) moves only on Accepted. The exact storage is still ours
+    // here and remains reusable after the canonical same-frame fallback.
+    request.generation = {};
+    payload.seal = {};
+    ++m_pointShadowPersistentRejectedFallback;
+  } catch (const std::bad_alloc &) {
+    // Every allocation in the owner freeze transaction is above this boundary.
+    // The request has not crossed submit, so no worker generation is pending and
+    // renderPointShadow will build the canonical plan in this same frame.
+    request.generation = {};
+    request.payload.seal = {};
+    m_pointShadowPersistentPending = false;
+    ++m_pointShadowPersistentRejectedFallback;
+  } catch (...) {
+    // length_error and any future throwing copy/freeze helper follow the same
+    // fail-closed path. Partially filled vectors remain renderer-owned scratch.
+    request.generation = {};
+    request.payload.seal = {};
+    m_pointShadowPersistentPending = false;
+    ++m_pointShadowPersistentRejectedFallback;
+  }
+}
+
+std::optional<War3ShadowReceiverPass::PointShadowPersistentResultPayload>
+War3ShadowReceiverPass::tryCollectPointShadowPersistentProposal(
+    const War3PipelineInput &input,
+    const War3PointLightFrameSnapshot &lightSnapshot,
+    const std::vector<const War3ShadowCasterDraw *> *replayDraws) {
+  using namespace war3::render;
+  if (!m_pointShadowPersistentPending || !m_pointShadowPersistentWorker ||
+      !replayDraws || !input.settings)
+    return std::nullopt;
+  if (m_pointShadowPersistentPendingGeneration.frameSerial !=
+          input.frameSerial ||
+      m_pointShadowPersistentPendingGeneration.lightGeneration !=
+          lightSnapshot.generation ||
+      lightSnapshot.frameSerial != input.frameSerial) {
+    return std::nullopt;
+  }
+
+  auto completed = m_pointShadowPersistentWorker->tryCollectExact(
+      m_pointShadowPersistentPendingGeneration);
+  if (completed.state == War3PointShadowPrepareResultState::NotReady) {
+    ++m_pointShadowPersistentDeadlineFallback;
+    return std::nullopt;
+  }
+  m_pointShadowPersistentPending = false;
+  if (completed.state != War3PointShadowPrepareResultState::Ready ||
+      !completed.payload.has_value()) {
+    ++m_pointShadowPersistentRejectedFallback;
+    return std::nullopt;
+  }
+
+  PointShadowPersistentResultPayload proposal =
+      std::move(*completed.payload);
+  const auto rejectAndRecycle = [&]()
+      -> std::optional<PointShadowPersistentResultPayload> {
+    recyclePointShadowPersistentStorage(std::move(proposal.storage));
+    ++m_pointShadowPersistentRejectedFallback;
+    return std::nullopt;
+  };
+
+  if (proposal.seal != m_pointShadowPersistentPendingSeal ||
+      !proposal.seal.valid() || proposal.ownerMustInvalidatePublication)
+    return rejectAndRecycle();
+  if (proposal.disposition != War3PointShadowCpuPlanDisposition::Render &&
+      proposal.disposition !=
+          War3PointShadowCpuPlanDisposition::ReusePublished)
+    return rejectAndRecycle();
+  if (proposal.shouldRender == proposal.reusePublished ||
+      proposal.shadowLightCount > kMaxPointShadowLights ||
+      proposal.storage.casters.size() != replayDraws->size())
+    return rejectAndRecycle();
+
+  const War3PointShadowCpuPlanSettings currentSettings =
+      FreezePointShadowSettings(*input.settings);
+  if (!PointShadowSettingsExact(currentSettings,
+                                 m_pointShadowPersistentExpectedSettings) ||
+      PointShadowPolicySeal(currentSettings) !=
+          m_pointShadowPersistentPendingSeal.policyRevision)
+    return rejectAndRecycle();
+  if (input.scene.shadowStats.dynamicPoseSignature !=
+          m_pointShadowPersistentExpectedDynamicPoseSignature ||
+      input.scene.shadowStats.dynamicPoseCount !=
+          m_pointShadowPersistentExpectedDynamicPoseCount ||
+      input.scene.shadowStats.dynamicSkinnedOutputCount !=
+          m_pointShadowPersistentExpectedDynamicSkinnedOutputCount)
+    return rejectAndRecycle();
+  const uint32_t expectedResolution = std::clamp<uint32_t>(
+      currentSettings.pointShadowResolution, 128u, 2048u);
+  const uint32_t expectedRequestedLights = std::clamp<uint32_t>(
+      currentSettings.pointShadowMaxLights, 1u,
+      kMaxPointShadowLights);
+  const uint32_t expectedCapacity = War3ResolvePointShadowCpuPlanCapacity(
+      expectedResolution, expectedRequestedLights);
+  const uint32_t expectedShadowLights = std::min<uint32_t>(
+      {kMaxPointShadowLights, expectedCapacity,
+       lightSnapshot.shadowCount});
+  if (proposal.resolution != expectedResolution ||
+      proposal.resourceCapacityLights != expectedCapacity ||
+      proposal.shadowLightCount != expectedShadowLights ||
+      proposal.maxCastersPerFace !=
+          currentSettings.pointShadowMaxCastersPerFace)
+    return rejectAndRecycle();
+
+  War3PointShadowCpuHistory currentHistory = {};
+  currentHistory.cubeAllocated = m_pointShadowCube && m_pointShadowCubeView;
+  currentHistory.readyLightCount = m_pointShadowReadyCount;
+  currentHistory.publishedContentSignature = m_pointShadowContentSignature;
+  currentHistory.temporalAge = m_pointShadowTemporalAge;
+  currentHistory.faceValidMask = m_pointShadowFaceValidMask;
+  currentHistory.faceAge = m_pointShadowFaceAge;
+  if (!PointShadowHistoryExact(currentHistory,
+                               m_pointShadowPersistentExpectedHistory) ||
+      PointShadowLifecycleSeal(m_pointShadowPersistentRendererEpoch,
+                               currentHistory) !=
+          m_pointShadowPersistentPendingSeal.lifecycleGeneration)
+    return rejectAndRecycle();
+
+  if (m_pointShadowPersistentExpectedLightCount !=
+      std::min<uint32_t>(lightSnapshot.shadowCount,
+                         kMaxPointShadowLights))
+    return rejectAndRecycle();
+  for (uint32_t light = 0u;
+       light < m_pointShadowPersistentExpectedLightCount; ++light) {
+    if (!PointShadowLightExact(
+            FreezePointShadowLight(lightSnapshot.lights[light]),
+            m_pointShadowPersistentExpectedLights[light]))
+      return rejectAndRecycle();
+  }
+
+  PointShadowSealBuilder replaySeal;
+  replaySeal.mixU64(input.frameSerial);
+  replaySeal.mixU64(lightSnapshot.generation);
+  replaySeal.mixU64(input.scene.shadowStats.dynamicPoseSignature);
+  replaySeal.mixU64(input.scene.shadowStats.dynamicPoseCount);
+  replaySeal.mixU64(input.scene.shadowStats.dynamicSkinnedOutputCount);
+  replaySeal.mixU64(replayDraws->size());
+  bool frozenCasterUsesVertexBlend = false;
+  for (size_t caster = 0u; caster < replayDraws->size(); ++caster) {
+    const War3ShadowCasterDraw *draw = (*replayDraws)[caster];
+    if (!draw)
+      return rejectAndRecycle();
+    const War3PointShadowCpuCaster frozen = FreezePointShadowCaster(*draw);
+    if (!PointShadowCasterExact(frozen, proposal.storage.casters[caster]))
+      return rejectAndRecycle();
+    frozenCasterUsesVertexBlend =
+        frozenCasterUsesVertexBlend || frozen.vertexBlendEnabled;
+    MixPointShadowCasterSeal(replaySeal, frozen);
+  }
+  replaySeal.mixU64(input.scene.shadowPalettes.size());
+  if (proposal.storage.paletteHashes.size() !=
+      input.scene.shadowPalettes.size())
+    return rejectAndRecycle();
+  for (size_t palette = 0u; palette <
+       input.scene.shadowPalettes.size(); ++palette) {
+    const uint64_t currentHash = input.scene.shadowPalettes[palette].hash;
+    if (proposal.storage.paletteHashes[palette] != currentHash)
+      return rejectAndRecycle();
+    replaySeal.mixU64(currentHash);
+  }
+  if (replaySeal.finish() !=
+      m_pointShadowPersistentPendingSeal.replayGeneration)
+    return rejectAndRecycle();
+
+  if (proposal.disposition ==
+      War3PointShadowCpuPlanDisposition::ReusePublished) {
+    if (!War3PointShadowCpuReuseProposalExact(
+            proposal, currentSettings, currentHistory,
+            m_pointShadowPersistentExpectedDynamicPoseCount,
+            m_pointShadowPersistentExpectedDynamicSkinnedOutputCount,
+            frozenCasterUsesVertexBlend))
+      return rejectAndRecycle();
+
+    // A reuse proposal deliberately contains no regenerated light matrices or
+    // face lists. Prove that the live publication still names the exact frozen
+    // lights before allowing adoption to advance only the temporal age.
+    if (m_pointShadowPublishedLightGeneration != lightSnapshot.generation ||
+        m_pointShadowPublishedFrameSerial == 0u ||
+        m_pointShadowPublishedFrameSerial >= input.frameSerial ||
+        m_pointShadowPublishedLightCount != proposal.shadowLightCount)
+      return rejectAndRecycle();
+    for (uint32_t light = 0u; light < proposal.shadowLightCount; ++light) {
+      const auto &expected = m_pointShadowPersistentExpectedLights[light];
+      const auto &live = m_pointShadowData[light];
+      if (m_pointShadowPublishedLightIds[light] != expected.id ||
+          !PointShadowF32Exact(live.lightPos.x, expected.position.x) ||
+          !PointShadowF32Exact(live.lightPos.y, expected.position.y) ||
+          !PointShadowF32Exact(live.lightPos.z, expected.position.z) ||
+          !PointShadowF32Exact(live.lightPos.w,
+                               std::max(expected.position.w, 1.0f)) ||
+          !PointShadowF32Exact(
+              live.shadowIntensity,
+              std::clamp(expected.shadowIntensity, 0.0f, 1.0f)))
+        return rejectAndRecycle();
+    }
+    for (uint32_t light = 0u; light < kMaxPointShadowLights; ++light) {
+      if (proposal.updateMask[light] != 0u)
+        return rejectAndRecycle();
+    }
+    for (size_t face = 0u; face < proposal.storage.faceCasters.size(); ++face) {
+      if (proposal.faceCandidateCount[face] != 0u ||
+          proposal.faceKeptCount[face] != 0u ||
+          proposal.faceDroppedCount[face] != 0u ||
+          !proposal.storage.faceCasters[face].empty())
+        return rejectAndRecycle();
+    }
+    return std::optional<PointShadowPersistentResultPayload>(
+        std::in_place, std::move(proposal));
+  }
+
+  if (proposal.disposition != War3PointShadowCpuPlanDisposition::Render ||
+      !proposal.shouldRender || proposal.reusePublished ||
+      proposal.maxFacesPerFrame == 0u ||
+      proposal.maxFacesPerFrame > 6u ||
+      proposal.nextTemporalAge != 0u ||
+      proposal.forceFullFaceUpdate !=
+          proposal.ownerMustClearFaceValidityBeforeRecord)
+    return rejectAndRecycle();
+
+  for (size_t face = 0u; face < proposal.storage.faceCasters.size(); ++face) {
+    const uint32_t light = static_cast<uint32_t>(face / 6u);
+    if ((proposal.updateMask[light] & 0xc0u) != 0u ||
+        proposal.faceKeptCount[face] !=
+            proposal.storage.faceCasters[face].size() ||
+        proposal.faceCandidateCount[face] <
+            proposal.faceKeptCount[face] ||
+        proposal.faceDroppedCount[face] !=
+            proposal.faceCandidateCount[face] -
+                proposal.faceKeptCount[face])
+      return rejectAndRecycle();
+    if ((proposal.updateMask[face / 6u] &
+         uint8_t(1u << (face % 6u))) == 0u &&
+        !proposal.storage.faceCasters[face].empty())
+      return rejectAndRecycle();
+    for (uint32_t caster : proposal.storage.faceCasters[face]) {
+      if (caster >= proposal.storage.casters.size())
+        return rejectAndRecycle();
+    }
+  }
+  for (uint32_t light = 0u; light < proposal.shadowLightCount; ++light) {
+    const auto &plan = proposal.lights[light];
+    if (!std::isfinite(plan.lightPositionRange.x) ||
+        !std::isfinite(plan.lightPositionRange.y) ||
+        !std::isfinite(plan.lightPositionRange.z) ||
+        !std::isfinite(plan.lightPositionRange.w) ||
+        !std::isfinite(plan.shadowIntensity))
+      return rejectAndRecycle();
+    for (uint32_t face = 0u; face < 6u; ++face) {
+      if (!PointShadowMatrixFinite(plan.faceViewProjection[face]))
+        return rejectAndRecycle();
+    }
+  }
+  return std::optional<PointShadowPersistentResultPayload>(
+      std::in_place, std::move(proposal));
+}
+
+bool War3ShadowReceiverPass::adoptPointShadowPersistentProposal(
+    PointShadowPersistentResultPayload &proposal,
+    const War3PointLightFrameSnapshot &lightSnapshot) {
+  using namespace war3::render;
+  if (proposal.ownerMustInvalidatePublication)
+    return false;
+  if (proposal.disposition ==
+      War3PointShadowCpuPlanDisposition::ReusePublished) {
+    return adoptPointShadowPersistentReuseProposal(proposal, lightSnapshot);
+  }
+  if (proposal.disposition == War3PointShadowCpuPlanDisposition::Render)
+    return adoptPointShadowPersistentRenderProposal(proposal, lightSnapshot);
+  return false;
+}
+
+bool War3ShadowReceiverPass::adoptPointShadowPersistentReuseProposal(
+    PointShadowPersistentResultPayload &proposal,
+    const War3PointLightFrameSnapshot &lightSnapshot) {
+  using namespace war3::render;
+  if (proposal.disposition !=
+          War3PointShadowCpuPlanDisposition::ReusePublished ||
+      proposal.shouldRender || !proposal.reusePublished ||
+      proposal.forceFullFaceUpdate ||
+      proposal.ownerMustClearFaceValidityBeforeRecord ||
+      proposal.ownerMustInvalidatePublication ||
+      proposal.contentSignature == 0u || proposal.nextTemporalAge == 0u)
+    return false;
+
+  // ReusePublished is not a render payload: its light matrices and face lists
+  // are intentionally default-initialized. Preserve the live publication and
+  // advance only the exact semantic tuple proven by collection above.
+  m_pointShadowCpuPlan.ready = true;
+  m_pointShadowCpuPlan.failed = false;
+  m_pointShadowCpuPlan.shouldRender = false;
+  m_pointShadowCpuPlan.reusePublished = true;
+  m_pointShadowCpuPlan.forceFullFaceUpdate = false;
+  m_pointShadowCpuPlan.shadowLightCount = proposal.shadowLightCount;
+  m_pointShadowCpuPlan.resourceCapacityLights =
+      proposal.resourceCapacityLights;
+  m_pointShadowCpuPlan.resolution = proposal.resolution;
+  m_pointShadowCpuPlan.maxCastersPerFace = proposal.maxCastersPerFace;
+  m_pointShadowCpuPlan.lightGeneration = lightSnapshot.generation;
+  m_pointShadowCpuPlan.lightFrameSerial = lightSnapshot.frameSerial;
+  m_pointShadowCpuPlan.contentSignature = proposal.contentSignature;
+  m_pointShadowTemporalAge = proposal.nextTemporalAge;
+
+  recyclePointShadowPersistentStorage(std::move(proposal.storage));
+  ++m_pointShadowPersistentConsumed;
+  return true;
+}
+
+bool War3ShadowReceiverPass::adoptPointShadowPersistentRenderProposal(
+    PointShadowPersistentResultPayload &proposal,
+    const War3PointLightFrameSnapshot &lightSnapshot) {
+  using namespace war3::render;
+  if (proposal.disposition != War3PointShadowCpuPlanDisposition::Render ||
+      !proposal.shouldRender || proposal.reusePublished ||
+      proposal.ownerMustInvalidatePublication)
+    return false;
+
+  m_pointShadowCpuPlan.ready = true;
+  m_pointShadowCpuPlan.failed = false;
+  m_pointShadowCpuPlan.shouldRender = proposal.shouldRender;
+  m_pointShadowCpuPlan.reusePublished = proposal.reusePublished;
+  m_pointShadowCpuPlan.forceFullFaceUpdate =
+      proposal.forceFullFaceUpdate;
+  m_pointShadowCpuPlan.shadowLightCount = proposal.shadowLightCount;
+  m_pointShadowCpuPlan.resourceCapacityLights =
+      proposal.resourceCapacityLights;
+  m_pointShadowCpuPlan.maxFacesPerFrame = proposal.maxFacesPerFrame;
+  m_pointShadowCpuPlan.resolution = proposal.resolution;
+  m_pointShadowCpuPlan.maxCastersPerFace = proposal.maxCastersPerFace;
+  m_pointShadowCpuPlan.lightGeneration = lightSnapshot.generation;
+  m_pointShadowCpuPlan.lightFrameSerial = lightSnapshot.frameSerial;
+  m_pointShadowCpuPlan.contentSignature = proposal.contentSignature;
+  m_pointShadowCpuPlan.updateMask = proposal.updateMask;
+  m_pointShadowCpuPlan.faceCandidateCount = proposal.faceCandidateCount;
+  m_pointShadowCpuPlan.faceKeptCount = proposal.faceKeptCount;
+  m_pointShadowCpuPlan.faceDroppedCount = proposal.faceDroppedCount;
+  m_pointShadowTemporalAge = proposal.nextTemporalAge;
+
+  for (uint32_t light = 0u; light < proposal.shadowLightCount; ++light) {
+    const auto &source = proposal.lights[light];
+    m_pointShadowData[light].lightPos =
+        Vector4(source.lightPositionRange.x, source.lightPositionRange.y,
+                source.lightPositionRange.z, source.lightPositionRange.w);
+    m_pointShadowData[light].shadowIntensity = source.shadowIntensity;
+    for (uint32_t face = 0u; face < 6u; ++face) {
+      m_pointShadowData[light].faceViewProj[face] =
+          ThawPointShadowMatrix(source.faceViewProjection[face]);
+    }
+    if (proposal.ownerMustClearFaceValidityBeforeRecord)
+      m_pointShadowFaceValidMask[light] = 0u;
+  }
+
+  auto storage = std::move(proposal.storage);
+  for (size_t face = 0u; face < storage.faceCasters.size(); ++face) {
+    m_pointShadowCpuPlan.faceCasters[face].swap(storage.faceCasters[face]);
+  }
+  recyclePointShadowPersistentStorage(std::move(storage));
+  ++m_pointShadowPersistentConsumed;
+  return true;
+}
+
+bool War3ShadowReceiverPass::pointShadowPersistentProposalMatchesCanonical(
+    const PointShadowPersistentResultPayload &proposal) const {
+  using namespace war3::render;
+  if (proposal.disposition ==
+      War3PointShadowCpuPlanDisposition::ReusePublished) {
+    if (!m_pointShadowCpuPlan.ready || m_pointShadowCpuPlan.failed ||
+        m_pointShadowCpuPlan.shouldRender ||
+        !m_pointShadowCpuPlan.reusePublished ||
+        m_pointShadowCpuPlan.forceFullFaceUpdate ||
+        m_pointShadowCpuPlan.contentSignature != proposal.contentSignature ||
+        m_pointShadowTemporalAge != proposal.nextTemporalAge ||
+        m_pointShadowPublishedLightCount != proposal.shadowLightCount ||
+        !pointShadowPublishedStateMatchesCurrentPlan())
+      return false;
+    for (uint32_t light = 0u; light < proposal.shadowLightCount; ++light) {
+      const auto &expected = m_pointShadowPersistentExpectedLights[light];
+      const auto &actual = m_pointShadowData[light];
+      if (m_pointShadowPublishedLightIds[light] != expected.id ||
+          !PointShadowF32Exact(actual.lightPos.x, expected.position.x) ||
+          !PointShadowF32Exact(actual.lightPos.y, expected.position.y) ||
+          !PointShadowF32Exact(actual.lightPos.z, expected.position.z) ||
+          !PointShadowF32Exact(actual.lightPos.w,
+                               std::max(expected.position.w, 1.0f)) ||
+          !PointShadowF32Exact(
+              actual.shadowIntensity,
+              std::clamp(expected.shadowIntensity, 0.0f, 1.0f)))
+        return false;
+    }
+    return true;
+  }
+
+  if (proposal.disposition != War3PointShadowCpuPlanDisposition::Render)
+    return false;
+  if (!m_pointShadowCpuPlan.ready || m_pointShadowCpuPlan.failed ||
+      m_pointShadowCpuPlan.shouldRender != proposal.shouldRender ||
+      m_pointShadowCpuPlan.reusePublished != proposal.reusePublished ||
+      m_pointShadowCpuPlan.forceFullFaceUpdate !=
+          proposal.forceFullFaceUpdate ||
+      m_pointShadowCpuPlan.shadowLightCount != proposal.shadowLightCount ||
+      m_pointShadowCpuPlan.resourceCapacityLights !=
+          proposal.resourceCapacityLights ||
+      m_pointShadowCpuPlan.maxFacesPerFrame != proposal.maxFacesPerFrame ||
+      m_pointShadowCpuPlan.resolution != proposal.resolution ||
+      m_pointShadowCpuPlan.maxCastersPerFace !=
+          proposal.maxCastersPerFace ||
+      m_pointShadowCpuPlan.contentSignature != proposal.contentSignature ||
+      m_pointShadowCpuPlan.updateMask != proposal.updateMask ||
+      m_pointShadowCpuPlan.faceCandidateCount !=
+          proposal.faceCandidateCount ||
+      m_pointShadowCpuPlan.faceKeptCount != proposal.faceKeptCount ||
+      m_pointShadowCpuPlan.faceDroppedCount != proposal.faceDroppedCount ||
+      m_pointShadowTemporalAge != proposal.nextTemporalAge)
+    return false;
+
+  for (uint32_t light = 0u; light < proposal.shadowLightCount; ++light) {
+    const auto &expected = proposal.lights[light];
+    const auto &actual = m_pointShadowData[light];
+    if (!PointShadowF32Exact(actual.lightPos.x,
+                             expected.lightPositionRange.x) ||
+        !PointShadowF32Exact(actual.lightPos.y,
+                             expected.lightPositionRange.y) ||
+        !PointShadowF32Exact(actual.lightPos.z,
+                             expected.lightPositionRange.z) ||
+        !PointShadowF32Exact(actual.lightPos.w,
+                             expected.lightPositionRange.w) ||
+        !PointShadowF32Exact(actual.shadowIntensity,
+                             expected.shadowIntensity))
+      return false;
+    for (uint32_t face = 0u; face < 6u; ++face) {
+      if (!PointShadowMatrixExact(
+              FreezePointShadowMatrix(actual.faceViewProj[face]),
+              expected.faceViewProjection[face]))
+        return false;
+    }
+  }
+  for (size_t face = 0u; face < proposal.storage.faceCasters.size(); ++face) {
+    if (m_pointShadowCpuPlan.faceCasters[face] !=
+        proposal.storage.faceCasters[face])
+      return false;
+  }
+  return true;
+}
+
 void War3ShadowReceiverPass::beginPointShadowCpuPrepare(
     const War3PipelineInput &input,
     const War3PointLightFrameSnapshot &lightSnapshot,
@@ -4537,6 +5578,11 @@ void War3ShadowReceiverPass::beginPointShadowCpuPrepare(
   // needs synchronous preparation.
   m_pointShadowCpuPlan.lightGeneration = lightSnapshot.generation;
   m_pointShadowCpuPlan.lightFrameSerial = lightSnapshot.frameSerial;
+  if (War3WorkerPrepareEnabled() &&
+      PointShadowPersistentMode() != War3PointShadowPersistentMode::Off) {
+    beginPointShadowPersistentPrepare(input, lightSnapshot, replayDraws);
+    return;
+  }
   if (!War3WorkerPrepareEnabled() || !replayDraws || replayDraws->empty())
     return;
   if (!input.settings || !input.settings->shadows.pointLightsEnabled ||
@@ -5114,6 +6160,25 @@ void War3ShadowReceiverPass::renderPointShadow(
   auto perfScope = war3::War3PerfMonitor::instance().scope("PointShadow", ctx);
 
   waitPointShadowCpuPrepare();
+  const War3PointShadowPersistentMode persistentMode =
+      PointShadowPersistentMode();
+  std::optional<PointShadowPersistentResultPayload> persistentProposal;
+  if (persistentMode != War3PointShadowPersistentMode::Off) {
+    persistentProposal = tryCollectPointShadowPersistentProposal(
+        input, lightSnapshot, replayDrawsOverride);
+    if (persistentMode == War3PointShadowPersistentMode::Consume &&
+        persistentProposal.has_value()) {
+      if (adoptPointShadowPersistentProposal(*persistentProposal,
+                                              lightSnapshot)) {
+        persistentProposal.reset();
+      } else {
+        recyclePointShadowPersistentStorage(
+            std::move(persistentProposal->storage));
+        persistentProposal.reset();
+        ++m_pointShadowPersistentRejectedFallback;
+      }
+    }
+  }
   const bool planNamesCurrentSnapshot =
       m_pointShadowCpuPlan.ready &&
       m_pointShadowCpuPlan.lightGeneration == lightSnapshot.generation &&
@@ -5139,6 +6204,40 @@ void War3ShadowReceiverPass::renderPointShadow(
       syncInput.paletteHashes.push_back(palette.hash);
     syncInput.sceneForReplayFallback = &input.scene;
     preparePointShadowCpuPlan(syncInput, lightSnapshot, replayDrawsOverride);
+  }
+  if (persistentMode == War3PointShadowPersistentMode::Observe &&
+      persistentProposal.has_value()) {
+    if (pointShadowPersistentProposalMatchesCanonical(*persistentProposal))
+      ++m_pointShadowPersistentObserveMatch;
+    else
+      ++m_pointShadowPersistentObserveMismatch;
+    const uint64_t observed = m_pointShadowPersistentObserveMatch +
+        m_pointShadowPersistentObserveMismatch;
+    if (observed <= 16u || (observed % 240u) == 0u) {
+      const auto workerDiagnostics =
+          m_pointShadowPersistentWorker
+              ? m_pointShadowPersistentWorker->diagnostics()
+              : war3::render::War3PointShadowPrepareWorkerDiagnostics{};
+      WAR3_RENDER_LOG(
+          "DXVK PointShadow: persistent Observe exact=%llu mismatch=%llu "
+          "accepted=%llu deadlineFallback=%llu rejectedFallback=%llu "
+          "workerReady=%llu workerFailed=%llu busy=%llu\n",
+          static_cast<unsigned long long>(
+              m_pointShadowPersistentObserveMatch),
+          static_cast<unsigned long long>(
+              m_pointShadowPersistentObserveMismatch),
+          static_cast<unsigned long long>(m_pointShadowPersistentAccepted),
+          static_cast<unsigned long long>(
+              m_pointShadowPersistentDeadlineFallback),
+          static_cast<unsigned long long>(
+              m_pointShadowPersistentRejectedFallback),
+          static_cast<unsigned long long>(workerDiagnostics.readyJobs),
+          static_cast<unsigned long long>(workerDiagnostics.failedJobs),
+          static_cast<unsigned long long>(workerDiagnostics.busyRejections));
+    }
+    recyclePointShadowPersistentStorage(
+        std::move(persistentProposal->storage));
+    persistentProposal.reset();
   }
   if (!m_pointShadowCpuPlan.ready) {
     invalidatePointShadowPublishedState();

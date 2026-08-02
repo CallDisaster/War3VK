@@ -4,17 +4,23 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
 namespace dxvk::war3::render {
 
-// This module is an isolated value-algorithm foundation. The live shadow pass
-// neither includes nor instantiates it, and the result is only a suggestion:
-// a future renderer owner must revalidate the complete generation tuple before
-// publishing resources or recording any draw.
-inline constexpr bool kWar3PointShadowCpuPlanRuntimeIntegrated = false;
-inline constexpr bool kWar3PointShadowCpuPlanOwnerBuilderIntegrated = false;
+// The live shadow pass may now freeze an owned request and run this planner on
+// its persistent CPU worker. Runtime admission remains explicitly opt-in: Off
+// preserves the prior async implementation, Observe always renders the
+// canonical synchronous plan, and Consume still falls back synchronously when
+// an exact result is not ready at the render-thread deadline.
+inline constexpr bool kWar3PointShadowCpuPlanRuntimeIntegrated = true;
+inline constexpr bool kWar3PointShadowCpuPlanOwnerBuilderIntegrated = true;
+inline constexpr bool kWar3PointShadowCpuPlanRuntimeDefaultEnabled = false;
+inline constexpr bool kWar3PointShadowCpuPlanConsumeDefaultEnabled = false;
+inline constexpr bool kWar3PointShadowCpuPlanRenderThreadMayWait = false;
+inline constexpr bool kWar3PointShadowCpuPlanSameFrameFallbackIntegrated = true;
 // Rejected submissions retain caller ownership. Processor exceptions and
 // cancellation can still destroy an accepted request after ownership crossed
 // the worker boundary, so that separate recovery contract remains a blocker.
@@ -286,6 +292,50 @@ struct War3PointShadowCpuPlanResultPayload {
       lights = {};
   War3PointShadowCpuPlanOwnedStorage storage = {};
 };
+
+/**
+ * \brief Validate only the semantic fields used by a temporal-reuse adoption
+ *
+ * ReusePublished intentionally carries no regenerated light matrices or face
+ * lists. Those values belong to the already published cube and must never be
+ * copied from the default-initialized proposal. The renderer separately proves
+ * the exact light/caster/palette inputs and the owner-held dynamic-pose tuple;
+ * this helper closes the history/age/disposition portion without consulting
+ * render-only fields such as maxFacesPerFrame.
+ */
+inline bool War3PointShadowCpuReuseProposalExact(
+    const War3PointShadowCpuPlanResultPayload& proposal,
+    const War3PointShadowCpuPlanSettings& settings,
+    const War3PointShadowCpuHistory& history,
+    uint32_t dynamicPoseCount,
+    uint32_t dynamicSkinnedOutputCount,
+    bool frozenCasterUsesVertexBlend) noexcept {
+  if (proposal.disposition !=
+          War3PointShadowCpuPlanDisposition::ReusePublished ||
+      proposal.shouldRender || !proposal.reusePublished ||
+      proposal.forceFullFaceUpdate ||
+      proposal.ownerMustClearFaceValidityBeforeRecord ||
+      proposal.ownerMustInvalidatePublication || !proposal.seal.valid() ||
+      proposal.shadowLightCount == 0u ||
+      proposal.shadowLightCount > kWar3PointShadowCpuPlanMaxLights)
+    return false;
+
+  if (!settings.pointShadowTemporalReuse ||
+      settings.pointShadowUpdatePeriod <= 1u ||
+      dynamicPoseCount != 0u || dynamicSkinnedOutputCount != 0u ||
+      frozenCasterUsesVertexBlend)
+    return false;
+
+  if (!history.cubeAllocated || history.readyLightCount == 0u ||
+      history.publishedContentSignature == 0u ||
+      proposal.contentSignature != history.publishedContentSignature)
+    return false;
+
+  const uint64_t nextAge = uint64_t(history.temporalAge) + 1ull;
+  return nextAge < uint64_t(settings.pointShadowUpdatePeriod) &&
+      nextAge <= uint64_t(std::numeric_limits<uint32_t>::max()) &&
+      proposal.nextTemporalAge == static_cast<uint32_t>(nextAge);
+}
 
 using War3PointShadowCpuPlanRequest =
     War3PointShadowPrepareRequest<War3PointShadowCpuPlanRequestPayload>;

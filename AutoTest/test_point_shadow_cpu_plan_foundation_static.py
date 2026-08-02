@@ -23,10 +23,14 @@ class PointShadowCpuPlanFoundationContracts(unittest.TestCase):
         cls.shadow_header = SHADOW_HEADER.read_text(encoding="utf-8")
         cls.shadow_source = SHADOW_SOURCE.read_text(encoding="utf-8")
 
-    def test_runtime_integration_is_explicitly_denied(self) -> None:
+    def test_runtime_integration_is_opt_in_and_nonblocking(self) -> None:
         for token in (
-            "kWar3PointShadowCpuPlanRuntimeIntegrated = false",
-            "kWar3PointShadowCpuPlanOwnerBuilderIntegrated = false",
+            "kWar3PointShadowCpuPlanRuntimeIntegrated = true",
+            "kWar3PointShadowCpuPlanOwnerBuilderIntegrated = true",
+            "kWar3PointShadowCpuPlanRuntimeDefaultEnabled = false",
+            "kWar3PointShadowCpuPlanConsumeDefaultEnabled = false",
+            "kWar3PointShadowCpuPlanRenderThreadMayWait = false",
+            "kWar3PointShadowCpuPlanSameFrameFallbackIntegrated = true",
             "kWar3PointShadowCpuPlanRejectedSubmitStorageRecoveryIntegrated = true",
             "kWar3PointShadowCpuPlanFailedJobStorageRecoveryIntegrated = false",
             "kWar3PointShadowCpuPlanMayPublishRendererState = false",
@@ -37,8 +41,9 @@ class PointShadowCpuPlanFoundationContracts(unittest.TestCase):
         ):
             self.assertIn(token, self.header)
         include = '#include "war3/render/war3_point_shadow_cpu_plan.h"'
-        self.assertNotIn(include, self.shadow_header)
-        self.assertNotIn(include, self.shadow_source)
+        self.assertIn(include, self.shadow_header)
+        self.assertIn("PointShadowPersistentMode", self.shadow_source)
+        self.assertIn("tryCollectPointShadowPersistentProposal", self.shadow_source)
         self.assertIn("std::async(", self.shadow_source)
 
     def test_request_and_result_expose_no_renderer_or_gpu_owner(self) -> None:
@@ -145,14 +150,14 @@ class PointShadowCpuPlanFoundationContracts(unittest.TestCase):
         ):
             self.assertIn(token, self.header + self.source + self.unit)
 
-    def test_meson_builds_only_the_isolated_runnable(self) -> None:
+    def test_meson_builds_production_and_isolated_runnable(self) -> None:
         self.assertEqual(
-            self.meson.count("war3/render/war3_point_shadow_cpu_plan.cpp"), 1
+            self.meson.count("war3/render/war3_point_shadow_cpu_plan.cpp"), 2
         )
         self.assertIn("war3_point_shadow_cpu_plan_test", self.meson)
         self.assertIn("war3_point_shadow_cpu_plan_foundation", self.meson)
         production_prefix = self.meson.split("war3_point_shadow_cpu_plan_test =", 1)[0]
-        self.assertNotIn("war3_point_shadow_cpu_plan.cpp", production_prefix)
+        self.assertIn("war3_point_shadow_cpu_plan.cpp", production_prefix)
 
 
 if __name__ == "__main__":

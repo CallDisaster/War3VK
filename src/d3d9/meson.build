@@ -115,6 +115,7 @@ d3d9_src = [
   'war3/render/war3_shadow_runtime_bridge.cpp',
   'war3/render/war3_shadow_lifecycle.cpp',
   'war3/render/war3_shadow_producer_policy.cpp',
+  'war3/render/war3_point_shadow_cpu_plan.cpp',
   'war3/render/war3_union_consumer_visibility.cpp',
   'war3/render/war3_current_draw_contract.cpp',
   'war3/render/war3_scene_collector.cpp',
@@ -334,9 +335,9 @@ test(
   timeout : 30,
 )
 
-# Isolated foundation test for the future point-shadow persistent worker. The
-# production shadow pass intentionally does not include or instantiate this
-# mailbox yet, so building this target cannot alter live rendering behavior.
+# Runnable ownership/lifetime test for the point-shadow persistent mailbox.
+# The production pass lazily instantiates the same mailbox only when its
+# explicit Observe/Consume mode is requested; release default remains Off.
 war3_point_shadow_prepare_worker_test = executable(
   'war3_point_shadow_prepare_worker_test',
   [
@@ -352,9 +353,8 @@ test(
   timeout : 30,
 )
 
-# Pure owned-value planner for the future persistent point-shadow worker. It is
-# intentionally compiled only into this isolated runnable: d3d9_src and the
-# live std::async shadow pass have no reference to either planner source file.
+# Pure owned-value planner used by the opt-in persistent point-shadow path and
+# independently linked into this runnable for algorithm/ownership oracles.
 war3_point_shadow_cpu_plan_test = executable(
   'war3_point_shadow_cpu_plan_test',
   [

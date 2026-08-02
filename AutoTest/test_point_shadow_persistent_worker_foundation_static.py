@@ -172,10 +172,13 @@ class PointShadowPersistentWorkerFoundationContracts(unittest.TestCase):
         )
         self.assertIn("war3_point_shadow_prepare_worker_foundation", self.meson)
 
-    def test_existing_async_runtime_path_is_deliberately_untouched(self) -> None:
-        include = '#include "war3/render/war3_point_shadow_prepare_worker.h"'
-        self.assertNotIn(include, self.shadow_header)
-        self.assertNotIn(include, self.shadow_source)
+    def test_runtime_owner_is_opt_in_and_old_async_is_off_baseline(self) -> None:
+        include = '#include "war3/render/war3_point_shadow_cpu_plan.h"'
+        self.assertIn(include, self.shadow_header)
+        self.assertIn("m_pointShadowPersistentWorker", self.shadow_header)
+        self.assertIn("DXVK_WAR3_POINT_SHADOW_PERSISTENT_PREPARE_MODE", self.shadow_source)
+        self.assertIn("War3PointShadowPersistentMode::Off", self.shadow_source)
+        self.assertIn("tryCollectExact(", self.shadow_source)
         self.assertIn("std::future<void> m_pointShadowPrepareFuture", self.shadow_header)
         self.assertIn("std::async(", self.shadow_source)
 

@@ -2,6 +2,7 @@
 
 #include "d3d9_war3_pipeline.h"
 #include "d3d9_war3_csm.h"
+#include "war3/render/war3_point_shadow_cpu_plan.h"
 
 #include "../dxvk/dxvk_hash.h"
 
@@ -15,6 +16,7 @@
 #include <atomic>
 #include <future>
 #include <memory>
+#include <optional>
 #include <vector>
 #include "d3d9_util.h"
 
@@ -800,6 +802,47 @@ namespace dxvk {
         PointShadowCpuPlan m_pointShadowCpuPlan = {};
         std::future<void> m_pointShadowPrepareFuture;
         std::atomic<bool> m_pointShadowPrepareRunning{false};
+
+        using PointShadowPersistentPrepareWorker =
+            war3::render::War3PointShadowPersistentPrepareWorker<
+                war3::render::War3PointShadowCpuPlanRequestPayload,
+                war3::render::War3PointShadowCpuPlanResultPayload,
+                war3::render::War3PointShadowCpuPlanner>;
+        using PointShadowPersistentRequest =
+            war3::render::War3PointShadowCpuPlanRequest;
+        using PointShadowPersistentResultPayload =
+            war3::render::War3PointShadowCpuPlanResultPayload;
+
+        // The persistent path is lazily allocated only for explicit
+        // Observe/Consume. The release default remains Off and therefore does
+        // not create a thread or change the existing std::async path.
+        std::unique_ptr<PointShadowPersistentPrepareWorker>
+            m_pointShadowPersistentWorker;
+        PointShadowPersistentRequest m_pointShadowPersistentRequestScratch = {};
+        war3::render::War3PointShadowPrepareGenerationTuple
+            m_pointShadowPersistentPendingGeneration = {};
+        war3::render::War3PointShadowCpuPlanSealTuple
+            m_pointShadowPersistentPendingSeal = {};
+        war3::render::War3PointShadowCpuPlanSettings
+            m_pointShadowPersistentExpectedSettings = {};
+        war3::render::War3PointShadowCpuHistory
+            m_pointShadowPersistentExpectedHistory = {};
+        std::array<war3::render::War3PointShadowCpuLight,
+                   kMaxPointShadowLights>
+            m_pointShadowPersistentExpectedLights = {};
+        uint32_t m_pointShadowPersistentExpectedLightCount = 0u;
+        uint64_t m_pointShadowPersistentExpectedDynamicPoseSignature = 0u;
+        uint32_t m_pointShadowPersistentExpectedDynamicPoseCount = 0u;
+        uint32_t m_pointShadowPersistentExpectedDynamicSkinnedOutputCount = 0u;
+        bool m_pointShadowPersistentPending = false;
+        uint64_t m_pointShadowPersistentRendererEpoch = 0u;
+        uint64_t m_pointShadowPersistentJobSerial = 0u;
+        uint64_t m_pointShadowPersistentAccepted = 0u;
+        uint64_t m_pointShadowPersistentDeadlineFallback = 0u;
+        uint64_t m_pointShadowPersistentRejectedFallback = 0u;
+        uint64_t m_pointShadowPersistentObserveMatch = 0u;
+        uint64_t m_pointShadowPersistentObserveMismatch = 0u;
+        uint64_t m_pointShadowPersistentConsumed = 0u;
         
         // [NEW] Point Shadow UBO for receiver shader
         struct PointShadowLightUniform {
@@ -943,6 +986,33 @@ namespace dxvk {
             const std::vector<const War3ShadowCasterDraw*>* replayDraws);
         /** @brief 等待点阴影 CPU prepare 完成（无在途任务时立即返回）。 */
         void waitPointShadowCpuPrepare();
+        /** @brief Build and submit one renderer-owned value request. Never
+         *         waits; rejection leaves the exact request in caller storage. */
+        void beginPointShadowPersistentPrepare(
+            const War3PipelineInput& input,
+            const War3PointLightFrameSnapshot& lightSnapshot,
+            const std::vector<const War3ShadowCasterDraw*>* replayDraws);
+        /** @brief Non-blocking exact collection. Non-ready/failed/stale returns
+         *         no proposal and the caller performs the canonical same-frame
+         *         synchronous build. */
+        std::optional<PointShadowPersistentResultPayload>
+        tryCollectPointShadowPersistentProposal(
+            const War3PipelineInput& input,
+            const War3PointLightFrameSnapshot& lightSnapshot,
+            const std::vector<const War3ShadowCasterDraw*>* replayDraws);
+        void recyclePointShadowPersistentStorage(
+            war3::render::War3PointShadowCpuPlanOwnedStorage&& storage);
+        bool adoptPointShadowPersistentProposal(
+            PointShadowPersistentResultPayload& proposal,
+            const War3PointLightFrameSnapshot& lightSnapshot);
+        bool adoptPointShadowPersistentReuseProposal(
+            PointShadowPersistentResultPayload& proposal,
+            const War3PointLightFrameSnapshot& lightSnapshot);
+        bool adoptPointShadowPersistentRenderProposal(
+            PointShadowPersistentResultPayload& proposal,
+            const War3PointLightFrameSnapshot& lightSnapshot);
+        bool pointShadowPersistentProposalMatchesCanonical(
+            const PointShadowPersistentResultPayload& proposal) const;
         /** @brief Reset per-frame point-shadow plan state without discarding
          *         the 24 face-vector capacities retained from prior frames. */
         void resetPointShadowCpuPlanPreservingCapacity();

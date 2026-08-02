@@ -87,7 +87,12 @@ bool MatrixIsZero(const War3PointShadowCpuMatrix4& matrix) {
 }
 
 void TestRuntimeBoundaryAndCapacity() {
-  static_assert(!kWar3PointShadowCpuPlanRuntimeIntegrated);
+  static_assert(kWar3PointShadowCpuPlanRuntimeIntegrated);
+  static_assert(kWar3PointShadowCpuPlanOwnerBuilderIntegrated);
+  static_assert(!kWar3PointShadowCpuPlanRuntimeDefaultEnabled);
+  static_assert(!kWar3PointShadowCpuPlanConsumeDefaultEnabled);
+  static_assert(!kWar3PointShadowCpuPlanRenderThreadMayWait);
+  static_assert(kWar3PointShadowCpuPlanSameFrameFallbackIntegrated);
   static_assert(
       kWar3PointShadowCpuPlanRejectedSubmitStorageRecoveryIntegrated);
   static_assert(!kWar3PointShadowCpuPlanFailedJobStorageRecoveryIntegrated);
@@ -300,8 +305,44 @@ void TestTemporalCadenceAndDynamicForcesFullUpdate() {
   CHECK(result.disposition ==
         War3PointShadowCpuPlanDisposition::ReusePublished);
   CHECK(result.nextTemporalAge == 1u);
+  CHECK(result.contentSignature == initial.contentSignature);
   CHECK(MatrixIsZero(result.lights[0].faceViewProjection[0]));
   CHECK(result.storage.faceCasters[0].empty());
+  CHECK(War3PointShadowCpuReuseProposalExact(
+      result, request.payload.settings, request.payload.history,
+      request.payload.dynamicPoseCount,
+      request.payload.dynamicSkinnedOutputCount, false));
+
+  // Render-only fields are deliberately absent from a reuse proposal. The
+  // owner must not reject or copy these defaults into live light/face state.
+  auto zeroRenderFields = result;
+  zeroRenderFields.maxFacesPerFrame = 0u;
+  zeroRenderFields.lights = {};
+  for (auto& face : zeroRenderFields.storage.faceCasters)
+    face.clear();
+  CHECK(War3PointShadowCpuReuseProposalExact(
+      zeroRenderFields, request.payload.settings, request.payload.history,
+      0u, 0u, false));
+
+  auto brokenReuse = result;
+  brokenReuse.contentSignature ^= 1u;
+  CHECK(!War3PointShadowCpuReuseProposalExact(
+      brokenReuse, request.payload.settings, request.payload.history,
+      0u, 0u, false));
+  brokenReuse = result;
+  ++brokenReuse.nextTemporalAge;
+  CHECK(!War3PointShadowCpuReuseProposalExact(
+      brokenReuse, request.payload.settings, request.payload.history,
+      0u, 0u, false));
+  CHECK(!War3PointShadowCpuReuseProposalExact(
+      result, request.payload.settings, request.payload.history,
+      1u, 0u, false));
+  CHECK(!War3PointShadowCpuReuseProposalExact(
+      result, request.payload.settings, request.payload.history,
+      0u, 1u, false));
+  CHECK(!War3PointShadowCpuReuseProposalExact(
+      result, request.payload.settings, request.payload.history,
+      0u, 0u, true));
 
   request.payload.history.temporalAge = 1u;
   result = Build(request);
