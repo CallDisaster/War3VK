@@ -99,6 +99,29 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
         ):
             self.assertNotIn(banned, combined)
 
+    def test_ydwe_metadata_has_matching_arguments_and_hints(self):
+        for kind, source in (("action", self.action), ("call", self.call)):
+            blocks = re.split(r"\n\s*\n(?=\[)", source)
+            for block in blocks:
+                header = re.match(r"\[([^\]]+)\]", block.strip())
+                if not header:
+                    continue
+                name = header.group(1)
+                self.assertRegex(block, r'(?m)^comment = "[^"].*"$', name)
+                if kind == "action":
+                    self.assertNotRegex(block, r"(?m)^returns\s*=", name)
+                args = [
+                    value
+                    for value in re.findall(r"(?m)^type\s*=\s*(\S+)", block)
+                    if value != "nothing"
+                ]
+                placeholders = re.findall(r"\$\{[^}]+\}", block)
+                self.assertEqual(
+                    len(args),
+                    len(placeholders),
+                    f"{kind}:{name} metadata arity",
+                )
+
     def test_dxvk_is_the_single_versioned_carrier_owner(self):
         self.assertIn('#include "../japi/war3_japi_v1.h"', self.bridge)
         self.assertIn("IsVersionedPublicCommand(command)", self.bridge)

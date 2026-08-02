@@ -16,9 +16,11 @@ WarVK 的运行时内置于 DXVK `d3d9.dll`。地图通过 Warcraft III 自带�
 
 ## YDWE 接入
 
-将根目录的 `action.txt`、`call.txt`、`define.txt` 合并到目标
-`ui/MapUI`，并让地图预处理入口包含 `jass/warvk_init.j`。如果使用地图内
-加载路线，同时导入 `warvk.ai` 和由构建脚本生成的 `warvk.blp`。
+把整个根目录作为一个独立的 `ui/WarVK` 层接入 YDWE；至少保留根目录的
+`action.txt`、`call.txt`、`define.txt` 和 `jass`。不要把 action 定义复制到
+`MapUI` 后再改写返回类型。编辑器中的函数提示已经包含参数含义和有效范围。
+地图预处理入口包含 `jass/warvk_init.j`。如果使用地图内加载路线，同时导入
+`warvk.ai` 和由构建脚本生成的 `warvk.blp`。
 
 DXVK 已作为代理 DLL 启动时，初始化函数会直接检测到 bridge；无需再次加载 DLL。
 

@@ -1,5 +1,25 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（YDWE action 参数段修复与 WarVK 层同步）
+
+用户在 YDWE 打开 WarVK 层时发现 `WarVKSetPointLightShadowConfig` 报
+`数据段和文本段参数数目不一致（4，3）`。根因是 action 元数据误写了
+`returns = nothing`；YDWE old-writer 会把它序列化为 action 数据段的第一列，
+而 TriggerStrings 只为真实参数生成占位符。现已从全部 action 定义移除返回字段和
+`nothing` 哨兵，call 定义仍保留合法的返回类型/零参数哨兵。
+
+- `WarVK/action.txt` 共37个 action，数据段与 `${...}` 文本占位符逐项一致；
+  `WarVK/call.txt` 共18个 call，返回类型和参数段符合 YDWE classic writer。
+- 55个公开函数都补充了简短的 `comment` 提示，说明调用用途、参数含义和主要范围；
+  不再写入重复的同步/视觉限制警告。
+- `SourceMap/YDWE1.32.13 - MemoryHack/ui/WarVK` 已同步根目录 UI/JASS；删除旧的
+  `event.txt`、重复 README 和旧 `jass/API` 副本，保留 loader 与地图载荷文件。
+- 实际 YDWE `triggerdata.lua -> old-writer -> wtg_checker` 门通过，当前默认层统计
+  为 action=1606、call=1639、condition=40、event=99；其中
+  `WarVKSetPointLightShadowConfig=1,integer,integer,real` 已与三个文本参数闭合。
+- 新增静态合同禁止 action 再出现 `returns =`，并逐条检查 data/text 参数数量；
+  WarVK JAPI 静态套件 10/10 PASS。DXVK C++ 未改动，本轮不启动游戏。
+
 ## 🚨 2026-08-02（WarVK JAPI v1 正式迁入 DXVK，已编译，待地图物理验收）
 
 用户确认 JAPI 不应依赖 War3MapReforge 的 war3map.dll 运行时，要求把 clean-room

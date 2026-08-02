@@ -1,30 +1,25 @@
 [WarVKClearError]
 title = "清除最后错误"
 description = "清除当前线程的最后错误。"
-comment = ""
+comment = "无参数；清除最近一次错误状态。"
 category = "TC_WarVK"
 script = "WarVKClearError"
-returns = nothing
-[[.args]]
-type = nothing
 
 [WarVKSetSunEnabled]
 title = "启用太阳光"
 description = "设置太阳光开关 ${enabled}。"
-comment = ""
+comment = "enabled=true 开启，false 关闭。"
 category = "TC_WarVK"
 script = "WarVKSetSunEnabled"
-returns = nothing
 [[.args]]
 type = boolean
 
 [WarVKSetSunDirection]
 title = "设置太阳方向"
 description = "设置太阳方向 ${x}、${y}、${z}。"
-comment = ""
+comment = "x/y/z 为方向向量分量；须为有限数且长度不能为0，建议使用归一化向量。"
 category = "TC_WarVK"
 script = "WarVKSetSunDirection"
-returns = nothing
 [[.args]]
 type = real
 [[.args]]
@@ -35,10 +30,9 @@ type = real
 [WarVKSetSunColorIntensity]
 title = "设置太阳颜色与强度"
 description = "设置太阳颜色 ${red}、${green}、${blue} 与强度 ${intensity}。"
-comment = ""
+comment = "red/green/blue 为非负颜色分量；intensity 为非负强度，通常使用0..16。"
 category = "TC_WarVK"
 script = "WarVKSetSunColorIntensity"
-returns = nothing
 [[.args]]
 type = real
 [[.args]]
@@ -51,20 +45,18 @@ type = real
 [WarVKSetCsmEnabled]
 title = "启用 CSM"
 description = "设置级联阴影开关 ${enabled}。"
-comment = ""
+comment = "enabled=true 开启级联阴影，false 关闭。"
 category = "TC_WarVK"
 script = "WarVKSetCsmEnabled"
-returns = nothing
 [[.args]]
 type = boolean
 
 [WarVKSetCsmLayout]
 title = "设置 CSM 布局"
 description = "设置级联数 ${cascadeCount} 与最大距离 ${maxDistance}。"
-comment = ""
+comment = "cascadeCount 范围1..4；maxDistance 范围256..50000，单位为世界坐标。"
 category = "TC_WarVK"
 script = "WarVKSetCsmLayout"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -73,10 +65,9 @@ type = real
 [WarVKSetCsmTuning]
 title = "调整 CSM"
 description = "设置深度偏移 ${depthBias} 与混合宽度 ${blendWidth}。"
-comment = ""
+comment = "depthBias 范围0..1；blendWidth 范围0..10000，单位为世界坐标。"
 category = "TC_WarVK"
 script = "WarVKSetCsmTuning"
-returns = nothing
 [[.args]]
 type = real
 [[.args]]
@@ -85,20 +76,18 @@ type = real
 [WarVKDestroyPointLight]
 title = "销毁点光源"
 description = "销毁 WarVK 点光 id ${lightId}。"
-comment = ""
+comment = "lightId 使用创建函数返回的正整数；无效或已销毁 id 会被拒绝。"
 category = "TC_WarVK"
 script = "WarVKDestroyPointLight"
-returns = nothing
 [[.args]]
 type = integer
 
 [WarVKSetPointLightEnabled]
 title = "启用点光源"
 description = "设置点光 ${lightId} 开关 ${enabled}。"
-comment = ""
+comment = "lightId 为点光 id；enabled=true 开启，false 关闭。"
 category = "TC_WarVK"
 script = "WarVKSetPointLightEnabled"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -107,10 +96,9 @@ type = boolean
 [WarVKSetPointLightPosition]
 title = "设置点光位置"
 description = "设置点光 ${lightId} 位置 ${x}、${y}、${z}。"
-comment = ""
+comment = "lightId 为点光 id；x/y/z 为有限世界坐标。"
 category = "TC_WarVK"
 script = "WarVKSetPointLightPosition"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -123,10 +111,9 @@ type = real
 [WarVKSetPointLightColorIntensity]
 title = "设置点光颜色与强度"
 description = "设置点光 ${lightId} 颜色 ${red}、${green}、${blue} 与强度 ${intensity}。"
-comment = ""
+comment = "lightId 为点光 id；red/green/blue 为非负颜色分量，intensity 为非负强度。"
 category = "TC_WarVK"
 script = "WarVKSetPointLightColorIntensity"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -141,10 +128,9 @@ type = real
 [WarVKSetPointLightRadius]
 title = "设置点光半径"
 description = "设置点光 ${lightId} 半径 ${radius}。"
-comment = ""
+comment = "lightId 为点光 id；radius 必须大于0，单位为世界坐标。"
 category = "TC_WarVK"
 script = "WarVKSetPointLightRadius"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -153,10 +139,9 @@ type = real
 [WarVKSetPointLightShadowEnabled]
 title = "启用点光阴影"
 description = "设置点光 ${lightId} 阴影开关 ${enabled}。"
-comment = ""
+comment = "lightId 为点光 id；enabled=true 开启点光阴影，false 关闭。"
 category = "TC_WarVK"
 script = "WarVKSetPointLightShadowEnabled"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -165,10 +150,9 @@ type = boolean
 [WarVKSetPointLightShadowConfig]
 title = "设置点光阴影参数"
 description = "设置点光 ${lightId} 阴影分辨率 ${resolution} 与偏移 ${bias}。"
-comment = ""
+comment = "lightId 为点光 id；resolution 只能为128..2048的2次幂；bias 范围0..10。"
 category = "TC_WarVK"
 script = "WarVKSetPointLightShadowConfig"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -179,30 +163,27 @@ type = real
 [WarVKSetVolumetricEnabled]
 title = "启用体积光"
 description = "设置体积光开关 ${enabled}。"
-comment = ""
+comment = "enabled=true 开启体积光，false 关闭。"
 category = "TC_WarVK"
 script = "WarVKSetVolumetricEnabled"
-returns = nothing
 [[.args]]
 type = boolean
 
 [WarVKSetVolumetricDensity]
 title = "设置体积光密度"
 description = "设置体积光密度 ${density}。"
-comment = ""
+comment = "density 建议范围0..1；使用有限非负数。"
 category = "TC_WarVK"
 script = "WarVKSetVolumetricDensity"
-returns = nothing
 [[.args]]
 type = real
 
 [WarVKSetVolumetricScattering]
 title = "设置体积光散射"
 description = "设置散射 ${scattering} 与各向异性 ${anisotropy}。"
-comment = ""
+comment = "scattering 建议范围0..1；anisotropy 范围-1..1。"
 category = "TC_WarVK"
 script = "WarVKSetVolumetricScattering"
-returns = nothing
 [[.args]]
 type = real
 [[.args]]
@@ -211,10 +192,9 @@ type = real
 [WarVKSetVolumetricQuality]
 title = "设置体积光质量"
 description = "设置步数 ${stepCount} 与最大距离 ${maxDistance}。"
-comment = ""
+comment = "stepCount 建议1..256；maxDistance 必须为正数，单位为世界坐标。"
 category = "TC_WarVK"
 script = "WarVKSetVolumetricQuality"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -223,20 +203,18 @@ type = real
 [WarVKSetOutlineEnabled]
 title = "启用轮廓"
 description = "设置轮廓开关 ${enabled}。"
-comment = ""
+comment = "enabled=true 开启轮廓，false 关闭。"
 category = "TC_WarVK"
 script = "WarVKSetOutlineEnabled"
-returns = nothing
 [[.args]]
 type = boolean
 
 [WarVKSetOutlineColor]
 title = "设置轮廓颜色"
 description = "设置轮廓颜色 ${red}、${green}、${blue}、${alpha}。"
-comment = ""
+comment = "red/green/blue/alpha 建议范围0..1；alpha=0透明，alpha=1不透明。"
 category = "TC_WarVK"
 script = "WarVKSetOutlineColor"
-returns = nothing
 [[.args]]
 type = real
 [[.args]]
@@ -249,10 +227,9 @@ type = real
 [WarVKSetOutlineParameters]
 title = "设置轮廓参数"
 description = "设置轮廓宽度 ${width} 与深度阈值 ${depthThreshold}。"
-comment = ""
+comment = "width 建议0..16像素；depthThreshold 建议0..1。"
 category = "TC_WarVK"
 script = "WarVKSetOutlineParameters"
-returns = nothing
 [[.args]]
 type = real
 [[.args]]
@@ -261,20 +238,18 @@ type = real
 [WarVKSetBloomEnabled]
 title = "启用泛光"
 description = "设置泛光开关 ${enabled}。"
-comment = ""
+comment = "enabled=true 开启泛光，false 关闭。"
 category = "TC_WarVK"
 script = "WarVKSetBloomEnabled"
-returns = nothing
 [[.args]]
 type = boolean
 
 [WarVKSetBloomParameters]
 title = "设置泛光参数"
 description = "设置阈值 ${threshold}、强度 ${intensity} 与软膝 ${softKnee}。"
-comment = ""
+comment = "threshold 和 intensity 使用非负数；softKnee 建议范围0..1。"
 category = "TC_WarVK"
 script = "WarVKSetBloomParameters"
-returns = nothing
 [[.args]]
 type = real
 [[.args]]
@@ -285,30 +260,27 @@ type = real
 [WarVKSetBloomRadius]
 title = "设置泛光半径"
 description = "设置泛光半径 ${radius}。"
-comment = ""
+comment = "radius 使用非负数，单位为像素或后处理采样半径。"
 category = "TC_WarVK"
 script = "WarVKSetBloomRadius"
-returns = nothing
 [[.args]]
 type = real
 
 [WarVKSetPostfxEnabled]
 title = "启用后处理"
 description = "设置后处理开关 ${enabled}。"
-comment = ""
+comment = "enabled=true 开启后处理，false 关闭。"
 category = "TC_WarVK"
 script = "WarVKSetPostfxEnabled"
-returns = nothing
 [[.args]]
 type = boolean
 
 [WarVKSetPostfxExposureGamma]
 title = "设置曝光与伽马"
 description = "设置曝光 ${exposure} 与伽马 ${gamma}。"
-comment = ""
+comment = "exposure 建议-16..16；gamma 必须为正数，常用范围0.1..4。"
 category = "TC_WarVK"
 script = "WarVKSetPostfxExposureGamma"
-returns = nothing
 [[.args]]
 type = real
 [[.args]]
@@ -317,10 +289,9 @@ type = real
 [WarVKSetPostfxColorGrade]
 title = "设置色彩分级"
 description = "设置饱和度 ${saturation} 与对比度 ${contrast}。"
-comment = ""
+comment = "saturation 和 contrast 建议范围0..4，1表示保持原值。"
 category = "TC_WarVK"
 script = "WarVKSetPostfxColorGrade"
-returns = nothing
 [[.args]]
 type = real
 [[.args]]
@@ -329,10 +300,9 @@ type = real
 [WarVKSetAaMode]
 title = "设置抗锯齿模式"
 description = "设置抗锯齿模式 ${mode} 与质量 ${quality}。"
-comment = ""
+comment = "mode 使用渲染器定义的整数模式；quality 为非负质量级别，未知值会被拒绝。"
 category = "TC_WarVK"
 script = "WarVKSetAaMode"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -341,60 +311,54 @@ type = integer
 [WarVKSetAaSharpness]
 title = "设置抗锯齿锐度"
 description = "设置抗锯齿锐度 ${sharpness}。"
-comment = ""
+comment = "sharpness 建议范围0..2；0为不增强，1为常用值。"
 category = "TC_WarVK"
 script = "WarVKSetAaSharpness"
-returns = nothing
 [[.args]]
 type = real
 
 [WarVKSetDayNightEnabled]
 title = "启用昼夜视觉"
 description = "设置昼夜视觉开关 ${enabled}。"
-comment = ""
+comment = "enabled=true 开启昼夜调节，false 关闭。"
 category = "TC_WarVK"
 script = "WarVKSetDayNightEnabled"
-returns = nothing
 [[.args]]
 type = boolean
 
 [WarVKSetDayNightTime]
 title = "设置渲染时间"
 description = "设置昼夜时间 ${hours}。"
-comment = ""
+comment = "hours 范围0..24；0为午夜，12为正午。"
 category = "TC_WarVK"
 script = "WarVKSetDayNightTime"
-returns = nothing
 [[.args]]
 type = real
 
 [WarVKSetDayNightSpeed]
 title = "设置昼夜速度"
 description = "设置昼夜速度 ${scale}。"
-comment = ""
+comment = "scale 使用非负时间倍率；0暂停昼夜推进，1为正常速度。"
 category = "TC_WarVK"
 script = "WarVKSetDayNightSpeed"
-returns = nothing
 [[.args]]
 type = real
 
 [WarVKDestroyLightning]
 title = "销毁闪电"
 description = "销毁 WarVK 闪电 id ${lightningId}。"
-comment = ""
+comment = "lightningId 使用创建函数返回的正整数；无效或已销毁 id 会被拒绝。"
 category = "TC_WarVK"
 script = "WarVKDestroyLightning"
-returns = nothing
 [[.args]]
 type = integer
 
 [WarVKSetLightningEnabled]
 title = "启用闪电"
 description = "设置闪电 ${lightningId} 开关 ${enabled}。"
-comment = ""
+comment = "lightningId 为闪电 id；enabled=true 显示，false 隐藏。"
 category = "TC_WarVK"
 script = "WarVKSetLightningEnabled"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -403,10 +367,9 @@ type = boolean
 [WarVKSetLightningEndpoints]
 title = "设置闪电端点"
 description = "设置闪电 ${lightningId} 起点 ${startX}、${startY}、${startZ} 与终点 ${endX}、${endY}、${endZ}。"
-comment = ""
+comment = "lightningId 为闪电 id；六个坐标为有限世界坐标。"
 category = "TC_WarVK"
 script = "WarVKSetLightningEndpoints"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -425,10 +388,9 @@ type = real
 [WarVKSetLightningColor]
 title = "设置闪电颜色"
 description = "设置闪电 ${lightningId} 颜色 ${red}、${green}、${blue}、${alpha}。"
-comment = ""
+comment = "lightningId 为闪电 id；red/green/blue/alpha 建议范围0..1。"
 category = "TC_WarVK"
 script = "WarVKSetLightningColor"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
@@ -443,10 +405,9 @@ type = real
 [WarVKSetLightningWidth]
 title = "设置闪电宽度"
 description = "设置闪电 ${lightningId} 宽度 ${width}。"
-comment = ""
+comment = "lightningId 为闪电 id；width 必须大于0，单位为世界坐标宽度。"
 category = "TC_WarVK"
 script = "WarVKSetLightningWidth"
-returns = nothing
 [[.args]]
 type = integer
 [[.args]]
