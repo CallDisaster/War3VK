@@ -8512,7 +8512,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
       pointPcfNear, pointPcfFar,
       std::clamp(finitePointShadowSetting(
                      mutableSettings.shadows.pointShadowTexelBiasScale,
-                     0.35f),
+                     0.50f),
                  0.0f, 1.0f),
       std::clamp(finitePointShadowSetting(
                      mutableSettings.shadows.pointShadowRangeFadeStart,

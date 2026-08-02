@@ -481,7 +481,8 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra, v
 
 float samplePointShadowPcf(uint lightIndex, vec3 dir, float currentDist,
                            float shadowRange, float biasBase,
-                           float receiverCosine) {
+                           vec3 receiverNormalWorld,
+                           float receiverNormalConfidence) {
   float dirLenSq = dot(dir, dir);
   if (!validFloat(dirLenSq) || dirLenSq <= 1.0e-12 ||
       !validFloat(currentDist) || !validFloat(shadowRange) ||
@@ -531,19 +532,26 @@ float samplePointShadowPcf(uint lightIndex, vec3 dir, float currentDist,
   float currentDepth = clamp(currentDist / max(shadowRange, 1e-4), 0.0, 1.0);
   float texelWorld = texelAngle * currentDist;
   float texelBiasScale = clamp(pointShadow.u_filterParams.z, 0.0, 1.0);
-  // A radial cube's depth footprint grows with distance. The old max(base,
-  // 0.08 * footprint) stayed below one quantized texel over most of a War3
-  // light and produced coherent self-shadow bands (the reported moire). Use
-  // an additive footprint term and a bounded receiver-plane slope term. This
-  // changes comparison bias only; the PCF footprint and edge sharpness stay
-  // unchanged.
-  float receiverCos = clamp(receiverCosine, 0.20, 1.0);
-  float receiverSlope = sqrt(max(1.0 - receiverCos * receiverCos, 0.0)) /
-                        receiverCos;
-  float slopeScale = 1.0 + 0.75 * min(receiverSlope, 4.0);
+  // Keep a small residual depth bias for quantization. The actual slope term
+  // is handled per tap below by intersecting that cube ray with the receiver
+  // plane; scaling one centre depth for the entire PCF disk is what creates
+  // coherent alternating self-shadow bands on terrain and unit surfaces.
   float biasWorld = max(biasBase, 0.0) +
-                    texelWorld * texelBiasScale * slopeScale;
+                    texelWorld * texelBiasScale;
   float biasDepth = clamp(biasWorld / max(shadowRange, 1.0), 0.0, 0.01);
+  float normalLenSq = dot(receiverNormalWorld, receiverNormalWorld);
+  bool receiverPlaneValid =
+      validFloat(normalLenSq) && normalLenSq > 1.0e-8 &&
+      receiverNormalConfidence > 0.20;
+  vec3 receiverNormal = receiverPlaneValid
+      ? receiverNormalWorld * inversesqrt(normalLenSq)
+      : -dirN;
+  if (dot(receiverNormal, dirN) > 0.0)
+    receiverNormal = -receiverNormal;
+  float planeNumerator = dot(receiverNormal, dir);
+  receiverPlaneValid = receiverPlaneValid &&
+      validFloat(planeNumerator) &&
+      planeNumerator < -0.12 * max(currentDist, 1.0e-4);
   float visible = 0.0;
 
   for (int i = 0; i < 16; ++i) {
@@ -552,12 +560,31 @@ float samplePointShadowPcf(uint lightIndex, vec3 dir, float currentDist,
     // direction, but costs 16 reciprocal-square-roots per shaded light.
     vec3 sampleDir =
       dirN + (tangent * taps[i].x + bitangent * taps[i].y) * pcfRadius;
+    float receiverDepth = currentDepth;
+    if (receiverPlaneValid) {
+      float sampleLenSq = dot(sampleDir, sampleDir);
+      float planeDenominator = dot(receiverNormal, sampleDir);
+      if (validFloat(sampleLenSq) && sampleLenSq > 1.0e-8 &&
+          validFloat(planeDenominator) && planeDenominator < -0.08) {
+        // sampleDir is homogeneous for cube lookup, but the radial depth is
+        // not. Normalize the ray for the plane intersection so every PCF tap
+        // compares against the depth of the same physical receiver plane.
+        float sampleDirLength = sqrt(sampleLenSq);
+        float receiverPlaneDistance =
+            planeNumerator * sampleDirLength / planeDenominator;
+        if (validFloat(receiverPlaneDistance) &&
+            receiverPlaneDistance >= 0.0) {
+          receiverDepth = clamp(
+              receiverPlaneDistance / max(shadowRange, 1.0e-4), 0.0, 1.0);
+        }
+      }
+    }
     float storedDepth = texture(
       samplerCubeArray(s_pointShadow,
         s_samplers[nonuniformEXT(pointShadow.u_samplerIndex)]),
       vec4(sampleDir, float(lightIndex))).r;
 
-    visible += (currentDepth > storedDepth + biasDepth) ? 0.0 : 1.0;
+    visible += (receiverDepth > storedDepth + biasDepth) ? 0.0 : 1.0;
   }
 
   return visible * (1.0 / 16.0);
@@ -1074,9 +1101,9 @@ void main() {
       float currentDist = length(lightToFrag);
       float shadowRange = max(ps.lightPos.w, 1.0);
       if (currentDist < shadowRange * 0.999) {
-        pointVis = samplePointShadowPcf(debugLight, lightToFrag,
-                                        currentDist, shadowRange, ps.bias,
-                                        1.0);
+        pointVis = samplePointShadowPcf(
+            debugLight, lightToFrag, currentDist, shadowRange, ps.bias,
+            -normalize(lightToFrag), 0.0);
         activeMask = 1.0;
       }
     }
@@ -1447,9 +1474,15 @@ void main() {
           // illuminate back faces and make a local light look like ambient fill.
           float normalTrust = smoothstep(
               0.0, 0.35, clamp(pointNormalConfidence, 0.0, 1.0));
-          float nFactor = max(dot(pointNormV, Ldir), 0.0) * normalTrust;
+          float pointReceiverCosine = max(dot(pointNormV, Ldir), 0.0);
+          float nFactor = pointReceiverCosine * normalTrust;
           if (nFactor <= 1.0e-4)
               continue;
+
+          // u_view is an orthonormal world->view transform under the row-vector
+          // convention used by this pass. Its transpose maps the reconstructed
+          // view normal back to the cube map's world-space direction domain.
+          vec3 pointNormW = pointNormV * transpose(mat3(ubo.u_view));
 
           float pointShadowFactor = 1.0;
           if (i < pointShadow.u_lightCount) {
@@ -1461,8 +1494,6 @@ void main() {
                   float shadowStrength = clamp(ps.shadowIntensity, 0.0, 1.0);
 
                   if (currentDist < shadowRange) {
-                      // 斜率相关 bias：掠射角加大，减少 cube face acne。
-                      float slopeBias = ps.bias * mix(3.5, 1.0, nFactor);
                       // Fade the shadow term before the finite-radius light
                       // window reaches zero. This keeps the optional shadow
                       // from visibly snapping to fully lit at the range edge.
@@ -1480,7 +1511,7 @@ void main() {
                       if (shadowRangeFade > 1.0e-4) {
                           float visPoint = samplePointShadowPcf(
                               i, lightToFrag, currentDist, shadowRange,
-                              slopeBias, nFactor);
+                              ps.bias, pointNormW, normalTrust);
                           pointShadowFactor = mix(
                               1.0, visPoint,
                               shadowStrength * shadowRangeFade);

@@ -139,7 +139,7 @@ struct War3ShadowSettings {
   // World-space receiver bias contribution = cube texel footprint * this
   // scale. Point cubes store radial distance, so a fixed world-space bias is
   // not enough: the quantization footprint grows with receiver distance.
-  float pointShadowTexelBiasScale = 0.35f;
+  float pointShadowTexelBiasScale = 0.50f;
   // Fade optional shadowing before the finite-radius direct light reaches zero.
   float pointShadowRangeFadeStart = 0.78f;
   bool pointShadowEnabled = false;

@@ -1,5 +1,49 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（低频阴影裂口硬化 + 点阴影 receiver-plane PCF）
+
+用户继续报告两项物理屏残留：方向/单位阴影偶发单帧撕裂或缺口，以及点光 cube
+阴影在地面和单位表面形成摩尔纹。本轮没有重新启用任何危险跨帧 VB/IB cache，先
+在当前发布候选上审计 caster shader 与点阴影写入/读取域。
+
+**修复内容**：
+
+- 阴影 caster 的 `0x40` GPU-skin direct 分支原来一律把绑定 0 的 position 直接乘
+  light VP。VS-B1 (`0x40|0x80`) 中该绑定其实是 static atlas 的 bind-pose 位置，
+  当前 palette 位于 storage binding 4；若某张地图具备 exact index package 并使
+  B1 获权，就会把未蒙皮姿态投入 CSM/point pass。现在 caster VS 对 B1 从同一代
+  static source + palette 执行与主 VS/compute 相同的标量 3x4 LBS，alpha-test UV
+  同样取自该 source；metadata、vertex domain 或 group slot 任一不闭合即裁掉，
+  绝不读取已被跳过的原生动态 VB。VS-A/B0 的已蒙皮 32-byte 输入保持原路径。
+- 点阴影 receiver 不再让整个 Poisson16 采样盘共用中心像素的径向深度，再额外叠加
+  大斜率 bias。每个 cube tap 现在与接收面相交，使用该 tap 对应的物理径向深度比较；
+  仅保留 `base + 0.50 texel footprint` 的量化 bias。PCF tap 数和半径均未扩大，
+  因此不是通过进一步模糊边缘掩盖摩尔纹。
+
+**验证与边界**：
+
+- 222 项 shadow/point/Stage11/安全索引相关静态合同 PASS；两个修改后的 GLSL 均
+  实际编译为 SPIR-V；Win32 build 成功且 `ninja -C build32 -n` no-work。
+- 1024 产品点阴影隔离门 2,433 帧 PASS：PointShadow 2,410 calls、GPU 0.232 ms，
+  `deviceLost=0`；最终截图未见旧式地面/单位整片条纹。
+- 点阴影开启的高压长门 240/240 exact captures、3,449 report frames：caster
+  251--262、四级联 draw 1,004--1,048，`framesIncomplete=0 / budgetExceeded=0 /
+  deviceLost=0`，无新的 NVIDIA/TDR 事件。在线 3,000 px 巨型暗块触发为 0；离线
+  最大 2,022 px，经保留邻帧目检为大型单位/凤凰动画，低于历史错误三角
+  12,194--16,907 px 的量级。
+- VS-B1 专门门产生 40,633 个候选，但当前高压图缺 generation-pinned exact index
+  package，按既有规则 `BLOCKED_SAFE_INDEX_PROOF`，不可逆 kernel skip 和 direct
+  shadow 都为 0。不得为使旧 P4 门变绿而开启
+  `DXVK_WAR3_DRAWTIME_VB_CACHE`。VS-B0 对照实际消费 27,168 次 Main 和 27,163 次
+  Shadow capture；其 direct state 因 Stage12 完整 VB-domain 合同保守回退，进程、
+  ledger、截图与 crash scan 均干净。
+
+**部署**：build32 / `E:\Work\War3\d3d9.dll` exact SHA-256
+`5343B1341616542F2560C1672696A60F81D2F0E355F80985FD3183B9598FAAC2`；回退为
+`E:\Work\War3\d3d9.dll.bak_20260802_183108_9F9B_pre_direct_skin_point_plane`。
+自动门尚不能替代用户原地图的低频物理屏观察；确认前不得宣称所有单帧裂口已经
+完全消失。
+
 ## 🚨 2026-08-02（YDWE action 参数段修复与 WarVK 层同步）
 
 用户在 YDWE 打开 WarVK 层时发现 `WarVKSetPointLightShadowConfig` 报

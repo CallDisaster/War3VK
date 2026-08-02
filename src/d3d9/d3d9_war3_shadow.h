@@ -801,7 +801,7 @@ namespace dxvk {
         std::array<PointShadowData, kMaxPointShadowLights> m_pointShadowData = {};
         float m_pointShadowBias = 1.0f;
         Vector4 m_pointShadowFilterParams =
-            Vector4(0.65f, 1.15f, 0.35f, 0.78f);
+            Vector4(0.65f, 1.15f, 0.50f, 0.78f);
         uint32_t m_pointShadowDebugLightIndex = 0;
         bool m_pointLightsEnabled = false;
         bool m_hasPointLights = false;
@@ -925,7 +925,7 @@ namespace dxvk {
             uint32_t debugLightIndex = 0;
             uint32_t samplerIndex = 0;
             uint32_t pad2 = 0;
-            Vector4 filterParams = Vector4(0.65f, 1.15f, 0.35f, 0.78f);
+            Vector4 filterParams = Vector4(0.65f, 1.15f, 0.50f, 0.78f);
             std::array<PointShadowLightUniform, 4> lights = {};
         };
         static_assert(sizeof(PointShadowLightUniform) == 32u,

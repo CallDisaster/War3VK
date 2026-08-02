@@ -16,13 +16,24 @@ layout(set = 1, binding = 0, std140, row_major) readonly buffer WorldMatrices {
   mat4 u_worldMatrices[];
 };
 
+// VS-B1 keeps only immutable model input plus the current palette. Bindings
+// 3/4 are always valid storage descriptors; non-direct draws bind the matrix
+// buffer as a harmless fallback and never enter the private route below.
+layout(set = 1, binding = 3, std430) readonly restrict buffer GpuSkinStaticSource {
+  uint u_gpuSkinSourceWords[];
+};
+
+layout(set = 1, binding = 4, std430) readonly restrict buffer GpuSkinPalette {
+  uint u_gpuSkinPaletteWords[];
+};
+
 // ===== 推送常量 =====
 layout(push_constant, scalar, row_major)
 uniform push_block {
   mat4 p_mvp;              // 统一: lightVP（非混合物体的 worldMatrix 从 SSBO 读取）
   uint p_paletteOffset;    // 混合: paletteIndex * 256；非混合: objectBase + drawIndex
-  uint p_blendCount;       // 0..3
-  uint p_flags;            // 低位0..5沿用归档阴影语义；高位保留但不消费
+  uint p_blendCount;       // legacy=0..3; VS-B1=palette matrix count
+  uint p_flags;            // low bits=shadow route, high bits=VS-B1 layout metadata
   float p_alphaRef;        // Alpha阈值 (0.0-1.0)
   uint p_samplerIndex;     // 与片段着色器布局保持一致
   float p_terrainDepthBias;// S1 terrain caster-only NDC depth bias
@@ -37,16 +48,108 @@ void applyTerrainDepthBias(inout vec4 clipPos) {
   }
 }
 
+uint loadGpuSkinSourceWord(uint byteOffset) {
+  return u_gpuSkinSourceWords[byteOffset >> 2u];
+}
+
+uint loadGpuSkinSourceByte(uint byteOffset) {
+  uint packed = u_gpuSkinSourceWords[byteOffset >> 2u];
+  return (packed >> ((byteOffset & 3u) * 8u)) & 0xffu;
+}
+
+float loadGpuSkinPaletteFloat(uint byteOffset) {
+  return uintBitsToFloat(u_gpuSkinPaletteWords[byteOffset >> 2u]);
+}
+
+bool tryLoadGpuSkinDirectVertex(out vec4 position, out vec2 uv) {
+  const uint gpuSkinDirectFlag = 0x40u;
+  const uint gpuSkinNoFallbackFlag = 0x80u;
+  const uint gpuSkinMetadataMask = 0x000fff00u;
+  const uint gpuSkinFormat2Layout1Uv1 = 0x00011200u;
+
+  if ((p_flags & (gpuSkinDirectFlag | gpuSkinNoFallbackFlag)) !=
+          (gpuSkinDirectFlag | gpuSkinNoFallbackFlag) ||
+      (p_flags & gpuSkinMetadataMask) != gpuSkinFormat2Layout1Uv1 ||
+      p_pad1 == 0u || p_blendCount == 0u || p_blendCount > 256u ||
+      gl_VertexIndex < 0 || uint(gl_VertexIndex) >= p_pad1) {
+    return false;
+  }
+
+  uint vertex = uint(gl_VertexIndex);
+  uint vertexCount = p_pad1;
+  uint positionBase = 0u;
+  uint normalBase = positionBase + vertexCount * 12u;
+  uint groupSlotBase = normalBase + vertexCount * 12u;
+  uint texcoord0Base = (groupSlotBase + vertexCount + 3u) & ~3u;
+  uint positionAddress = positionBase + vertex * 12u;
+  uint texcoord0Address = texcoord0Base + vertex * 8u;
+
+  precise float px = uintBitsToFloat(
+      loadGpuSkinSourceWord(positionAddress + 0u));
+  precise float py = uintBitsToFloat(
+      loadGpuSkinSourceWord(positionAddress + 4u));
+  precise float pz = uintBitsToFloat(
+      loadGpuSkinSourceWord(positionAddress + 8u));
+
+  uint groupSlot = loadGpuSkinSourceByte(groupSlotBase + vertex);
+  if (groupSlot >= p_blendCount)
+    return false;
+
+  uint matrixAddress = groupSlot * 48u;
+  precise float m0 = loadGpuSkinPaletteFloat(matrixAddress + 0u);
+  precise float m1 = loadGpuSkinPaletteFloat(matrixAddress + 4u);
+  precise float m2 = loadGpuSkinPaletteFloat(matrixAddress + 8u);
+  precise float m3 = loadGpuSkinPaletteFloat(matrixAddress + 12u);
+  precise float m4 = loadGpuSkinPaletteFloat(matrixAddress + 16u);
+  precise float m5 = loadGpuSkinPaletteFloat(matrixAddress + 20u);
+  precise float m6 = loadGpuSkinPaletteFloat(matrixAddress + 24u);
+  precise float m7 = loadGpuSkinPaletteFloat(matrixAddress + 28u);
+  precise float m8 = loadGpuSkinPaletteFloat(matrixAddress + 32u);
+  precise float m9 = loadGpuSkinPaletteFloat(matrixAddress + 36u);
+  precise float m10 = loadGpuSkinPaletteFloat(matrixAddress + 40u);
+  precise float m11 = loadGpuSkinPaletteFloat(matrixAddress + 44u);
+
+  // Match the compute/native 3x4 scalar sequence exactly. A matrix multiply
+  // may reassociate or contract these operations and reintroduce pose drift.
+  precise float positionX01 = m0 * px + m3 * py;
+  precise float positionX2 = positionX01 + m6 * pz;
+  precise float positionX = positionX2 + m9;
+  precise float positionY01 = m1 * px + m4 * py;
+  precise float positionY2 = positionY01 + m7 * pz;
+  precise float positionY = positionY2 + m10;
+  precise float positionZ01 = m2 * px + m5 * py;
+  precise float positionZ2 = positionZ01 + m8 * pz;
+  precise float positionZ = positionZ2 + m11;
+
+  position = vec4(positionX, positionY, positionZ, 1.0);
+  uv = vec2(0.0);
+  if ((p_flags & 0x4u) != 0u) {
+    uv = vec2(
+        uintBitsToFloat(loadGpuSkinSourceWord(texcoord0Address + 0u)),
+        uintBitsToFloat(loadGpuSkinSourceWord(texcoord0Address + 4u)));
+  }
+  return true;
+}
+
 void main() {
   vec4 position = in_pos;
   vec2 uv = in_uv;
   v_uv = uv;
 
-  // Diagnostic fail-safe: the complete world/light transform is already in
-  // the push constants, so this path performs no matrix-SSBO access. It is
-  // used to distinguish captured geometry faults from matrix ring lifetime
-  // faults without changing the vertex/index buffers under test.
+  // VS-B1 aliases binding 0 to bind-pose positions and intentionally skips
+  // the native/compute output VB. Reconstruct the current pose from the exact
+  // immutable source + palette before applying light VP. VS-A/B0 still bind a
+  // fully skinned 32-byte vertex and therefore keep the direct projection path.
   if ((p_flags & 0x40u) != 0u) {
+    if ((p_flags & 0x80u) != 0u &&
+        !tryLoadGpuSkinDirectVertex(position, uv)) {
+      // B1 has no safe dynamic-VB fallback. Host preflight makes this an
+      // all-draw invariant failure; place the primitive outside clip space.
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      v_uv = vec2(0.0);
+      return;
+    }
+    v_uv = uv;
     vec4 clipPos = position * p_mvp;
     applyTerrainDepthBias(clipPos);
     gl_Position = clipPos;

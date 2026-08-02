@@ -1162,7 +1162,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
         : 0.05f;
     lightUbo.pointShadowFilter = Vector4(
         invResolution, worldBias,
-        clampFinite(pointShadowSnapshot.filterParams.z, 0.0f, 1.0f, 0.35f),
+        clampFinite(pointShadowSnapshot.filterParams.z, 0.0f, 1.0f, 0.50f),
         clampFinite(pointShadowSnapshot.filterParams.w, 0.50f, 0.98f,
                     0.78f));
   }

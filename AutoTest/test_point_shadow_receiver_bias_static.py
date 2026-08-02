@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import pathlib
 import unittest
 
@@ -67,28 +68,52 @@ class PointShadowReceiverBiasTests(unittest.TestCase):
         self.assertIn("currentDistance / shadowRange", self.volume)
 
     def test_default_bias_covers_a_meaningful_texel_fraction(self) -> None:
-        self.assertIn("pointShadowTexelBiasScale = 0.35f", self.settings)
+        self.assertIn("pointShadowTexelBiasScale = 0.50f", self.settings)
         self.assertGreaterEqual(
-            self.shadow_h.count("Vector4(0.65f, 1.15f, 0.35f, 0.78f)"),
+            self.shadow_h.count("Vector4(0.65f, 1.15f, 0.50f, 0.78f)"),
             2,
         )
-        self.assertIn("0.35f),\n                 0.0f, 1.0f)", self.shadow)
-        self.assertIn("0.0f, 1.0f, 0.35f", self.volume_cpp)
+        self.assertIn("0.50f),\n                 0.0f, 1.0f)", self.shadow)
+        self.assertIn("0.0f, 1.0f, 0.50f", self.volume_cpp)
 
-    def test_surface_bias_is_additive_and_receiver_slope_aware(self) -> None:
+    def test_surface_bias_uses_per_tap_receiver_plane_depth(self) -> None:
         start = self.receiver.index("float samplePointShadowPcf(")
         end = self.receiver.index("return visible * (1.0 / 16.0);", start)
         block = self.receiver[start:end]
-        self.assertIn("float receiverCosine", block)
-        self.assertIn("float receiverSlope =", block)
-        self.assertIn("float slopeScale =", block)
+        self.assertIn("vec3 receiverNormalWorld", block)
+        self.assertIn("float receiverNormalConfidence", block)
+        self.assertIn("float planeNumerator = dot(receiverNormal, dir);", block)
+        self.assertIn("float planeDenominator = dot(receiverNormal, sampleDir);", block)
+        self.assertIn("receiverPlaneDistance =", block)
+        self.assertIn("planeNumerator * sampleDirLength / planeDenominator", block)
+        self.assertIn("receiverDepth > storedDepth + biasDepth", block)
         self.assertIn("max(biasBase, 0.0) +", block)
-        self.assertIn("texelWorld * texelBiasScale * slopeScale", block)
-        self.assertNotIn(
-            "max(max(biasBase, 0.0), texelWorld * texelBiasScale)",
-            block,
-        )
-        self.assertIn("slopeBias, nFactor", self.receiver)
+        self.assertIn("texelWorld * texelBiasScale", block)
+        self.assertNotIn("receiverSlope", block)
+        self.assertNotIn("slopeScale", block)
+        self.assertNotIn("float slopeBias", self.receiver)
+        self.assertIn("pointNormV * transpose(mat3(ubo.u_view))", self.receiver)
+        self.assertIn("ps.bias, pointNormW, normalTrust", self.receiver)
+
+    def test_receiver_plane_formula_is_exact_for_neighbour_rays(self) -> None:
+        # Plane n.p = n.receiver, with the light at the origin. The shader's
+        # numerator/denominator quotient must reproduce the radial intersection
+        # distance for every normalized PCF ray, not reuse the centre depth.
+        receiver = (3.0, 4.0, 8.0)
+        normal = (0.0, -0.8, -0.6)
+        numerator = sum(a * b for a, b in zip(normal, receiver))
+        self.assertLess(numerator, 0.0)
+        for ray in ((0.31, 0.38, 0.87), (0.28, 0.44, 0.85),
+                    (0.36, 0.35, 0.86)):
+            length = math.sqrt(sum(v * v for v in ray))
+            ray_n = tuple(v / length for v in ray)
+            denominator = sum(a * b for a, b in zip(normal, ray_n))
+            distance = numerator / denominator
+            point = tuple(distance * v for v in ray_n)
+            self.assertAlmostEqual(
+                sum(a * b for a, b in zip(normal, point)), numerator,
+                places=6,
+            )
 
     def test_volume_uses_same_additive_radial_depth_contract(self) -> None:
         start = self.volume.index("float samplePointVolumeShadow(")
