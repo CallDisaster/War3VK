@@ -193,6 +193,20 @@ class ShadowFinalCasterTraceStaticTests(unittest.TestCase):
             self.probe_runner,
         )
 
+    def test_owned_conductor_cannot_expire_during_capture_sequence(self) -> None:
+        self.assertIn("minimum_capture_sample_sec", self.probe_runner)
+        self.assertIn("effective_sample_sec", self.probe_runner)
+        self.assertIn(
+            "sample_duration_sec=effective_sample_sec",
+            self.probe_runner,
+        )
+        for field in (
+            "sampleSecRequested",
+            "sampleSecMinimumCapture",
+            "sampleSecEffective",
+        ):
+            self.assertIn(f'"{field}"', self.probe_runner)
+
     def test_currentdraw_join_does_not_overclaim_missing_identity(self) -> None:
         current_join = (
             ROOT / "AutoTest/analyze_shadow_currentdraw_final_join.py"

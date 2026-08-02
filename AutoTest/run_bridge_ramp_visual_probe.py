@@ -482,6 +482,25 @@ def main() -> int:
     if fixed_camera_requested and args.camera_angle_deg is None:
         raise SystemExit("--camera-angle-deg is required with a fixed camera")
 
+    requested_sample_sec = max(20, int(args.sample_sec))
+    # The owned performance conductor starts its lifetime before map readiness,
+    # while exact capture also performs one status query and (optionally) one
+    # reduced image analysis per frame.  Reserve a bounded launch/control-plane
+    # margin so the conductor cannot tear down the named pipe in the middle of
+    # a valid requested capture sequence.
+    minimum_capture_sample_sec = int(
+        math.ceil(
+            max(1, int(args.capture_count))
+            * (max(0.0, float(args.capture_interval_sec)) + 0.10)
+            + 30.0
+        )
+    )
+    effective_sample_sec = (
+        requested_sample_sec
+        if args.attach_only
+        else max(requested_sample_sec, minimum_capture_sample_sec)
+    )
+
     def camera_request(capture_index: int = 0) -> tuple[str, Dict[str, Any]]:
         if fixed_camera_requested:
             period = max(4, int(args.camera_pan_period_captures))
@@ -567,7 +586,7 @@ def main() -> int:
                 war3_dir=str(war3_dir),
                 map_path=args.map,
                 ready_timeout_sec=max(1, args.ready_timeout_sec),
-                sample_duration_sec=max(20, args.sample_sec),
+                sample_duration_sec=effective_sample_sec,
                 windowed=False,
                 use_isolated_desktop=True,
                 desktop_name=desktop,
@@ -1460,6 +1479,9 @@ def main() -> int:
         "cameraPanYAmplitude": args.camera_pan_y_amplitude,
         "cameraPanPeriodCaptures": args.camera_pan_period_captures,
         "captureRetainCount": args.capture_retain_count,
+        "sampleSecRequested": requested_sample_sec,
+        "sampleSecMinimumCapture": minimum_capture_sample_sec,
+        "sampleSecEffective": effective_sample_sec,
         "captureRingDeletions": capture_ring_deletions,
         "retainedCaptureCount": sum(
             1 for row in frames if row.get("retained")
