@@ -1262,6 +1262,13 @@ def main() -> int:
                         and len(temporal_trigger_events)
                         < args.max_trigger_events
                         and previous_capture_path is not None
+                        # Capture zero is the exact-frame warmup witness.  A
+                        # pressure map can publish the UI and shadow pass one
+                        # capture before the complete world colour target, so
+                        # the 0 -> 1 pair is not a temporal shadow sample.  The
+                        # offline final-caster analyzer applies the same
+                        # capture-zero exclusion contract.
+                        and previous_capture_index > 0
                         and previous_capture_path.is_file()
                     )
                     if trigger_allowed:

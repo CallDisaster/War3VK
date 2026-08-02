@@ -183,6 +183,16 @@ class ShadowFinalCasterTraceStaticTests(unittest.TestCase):
             self.probe_runner,
         )
 
+    def test_online_dark_trigger_excludes_capture_zero_warmup(self) -> None:
+        self.assertIn(
+            "and previous_capture_index > 0",
+            self.probe_runner,
+        )
+        self.assertIn(
+            "Capture zero is the exact-frame warmup witness",
+            self.probe_runner,
+        )
+
     def test_currentdraw_join_does_not_overclaim_missing_identity(self) -> None:
         current_join = (
             ROOT / "AutoTest/analyze_shadow_currentdraw_final_join.py"
