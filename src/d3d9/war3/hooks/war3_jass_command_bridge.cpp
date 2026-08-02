@@ -8,12 +8,14 @@
 #include "../../war3_shader_api.h"
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_memory.h"
+#include "../japi/war3_japi_v1.h"
 #include "../render/war3_lightning_runtime.h"
 
 #include "../../jass/war3_jass_convert.h"
 #include "../../jass/war3_jass_types.h"
 
 #include <atomic>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -34,13 +36,10 @@ constexpr size_t kNativeEntrySigPtrOffset = 0x24;
 constexpr size_t kNativeEntryRetTypeOffset = 0x38;
 
 constexpr const char *kWarVkPrefix = "warvk:";
-// Canonical public WarVK v1 traffic is owned by the clean-room carrier
-// runtime in war3map.dll.  This older DXVK bridge remains available only for
-// the internal AutoTest command vocabulary (warvk:ping, warvk:cmd:...).  It
-// must never consume a versioned public request, irrespective of hook install
-// order; forwarding reaches the Detours-patched stock implementation.
-constexpr const char *kWarVkV1Prefix = "warvk:v1;";
-constexpr uint32_t kMaxNativeStringBytes = 2048;
+// The public protocol limit is 512 bytes. Reading one additional byte lets the
+// dispatcher report PayloadTooLong without scanning an untrusted JASS string
+// arbitrarily far.
+constexpr uint32_t kMaxNativeStringBytes = 513;
 
 using NativeVoidStringFn = void(__cdecl *)(uint32_t);
 using NativeIntStringFn = int(__cdecl *)(uint32_t);
@@ -94,6 +93,21 @@ BridgeState s_state;
 bool StartsWith(const std::string &value, const char *prefix) {
   const size_t n = std::strlen(prefix);
   return value.size() >= n && std::memcmp(value.data(), prefix, n) == 0;
+}
+
+bool IsVersionedPublicCommand(const std::string &value) {
+  const size_t prefixLength = std::strlen(kWarVkPrefix);
+  if (value.size() <= prefixLength + 1u ||
+      value.compare(0u, prefixLength, kWarVkPrefix) != 0 ||
+      value[prefixLength] != 'v' ||
+      value[prefixLength + 1u] < '0' ||
+      value[prefixLength + 1u] > '9')
+    return false;
+  size_t offset = prefixLength + 2u;
+  while (offset < value.size() && value[offset] >= '0' &&
+         value[offset] <= '9')
+    ++offset;
+  return offset == value.size() || value[offset] == ';';
 }
 
 std::vector<std::string> SplitPipeArgs(const std::string &value) {
@@ -741,8 +755,10 @@ bool CopyCStringBounded(const char *src, std::string &out) {
     out.push_back(c);
   }
 
-  out.clear();
-  return false;
+  // A non-terminated 513-byte prefix is enough for public WarVK traffic to
+  // fail the strict 512-byte gate. Non-WarVK traffic will still be forwarded
+  // with its original native argument.
+  return !out.empty();
 }
 
 bool ReadCStringPtr(const void *base, size_t offset, std::string &out) {
@@ -833,6 +849,25 @@ bool SignatureLooksLikeOneStringArg(const char *sigPtr) {
   if (!sigPtr || !dxvk::war3::IsReadableRange(sigPtr, 4))
     return false;
   return sigPtr[0] == '(' && sigPtr[1] == 'S';
+}
+
+const char *ExpectedCarrierSignature(CarrierKind kind) {
+  switch (kind) {
+  case CarrierKind::Command:
+    return "(S)V";
+  case CarrierKind::IntQuery:
+    return "(S)I";
+  case CarrierKind::StringQuery:
+    return "(S)S";
+  }
+  return "";
+}
+
+bool SignatureMatchesCarrier(const char *sigPtr, CarrierKind kind) {
+  const char *expected = ExpectedCarrierSignature(kind);
+  if (!sigPtr || !expected || !dxvk::war3::IsReadableRange(sigPtr, 5u))
+    return false;
+  return std::memcmp(sigPtr, expected, 5u) == 0;
 }
 
 bool WriteNativeFuncPtr(void *entry, void *bridgeFn) {
@@ -976,9 +1011,36 @@ bool TryHandleCarrier(CarrierPatch &patch, uint32_t nativeArg, int *intResult,
     return false;
   }
 
-  if (StartsWith(command, kWarVkV1Prefix)) {
-    patch.passedThrough.fetch_add(1, std::memory_order_relaxed);
-    return false;
+  if (IsVersionedPublicCommand(command)) {
+    dxvk::war3::japi::Carrier carrier =
+        dxvk::war3::japi::Carrier::Preloader;
+    if (patch.kind == CarrierKind::IntQuery)
+      carrier = dxvk::war3::japi::Carrier::Hotkey;
+    else if (patch.kind == CarrierKind::StringQuery)
+      carrier = dxvk::war3::japi::Carrier::LocalizedString;
+
+    const dxvk::war3::japi::Reply reply =
+        dxvk::war3::japi::Dispatch(carrier, command);
+    patch.handled.fetch_add(1, std::memory_order_relaxed);
+
+    if (intResult) {
+      *intResult = reply.ok() &&
+                           reply.kind ==
+                               dxvk::war3::japi::ResultKind::Integer
+                       ? reply.integer
+                       : 0;
+    }
+    if (stringResult) {
+      *stringResult = 0u;
+      if (reply.ok() &&
+          reply.kind == dxvk::war3::japi::ResultKind::Text) {
+        const jString converted = jass::convert::to_jString(reply.text);
+        *stringResult = converted;
+        if (!converted)
+          dxvk::war3::japi::NoteTransportFailure();
+      }
+    }
+    return true;
   }
 
   const std::string payload = command.substr(std::strlen(kWarVkPrefix));
@@ -1095,15 +1157,24 @@ uint32_t __cdecl Bridge_GetLocalizedString(uint32_t nativeArg) {
     return CallOriginalString(s_string, nativeArg);
 
   uint32_t result = 0;
-  if (TryHandleCarrier(s_string, nativeArg, nullptr, &result)) {
-    if (result)
-      return result;
-    return CallOriginalString(s_string, nativeArg);
-  }
+  if (TryHandleCarrier(s_string, nativeArg, nullptr, &result))
+    return result;
   return CallOriginalString(s_string, nativeArg);
 }
 
-bool InstallCarrier(GetTlsJassDataFn lookupFn, CarrierPatch &patch) {
+struct PreparedCarrier {
+  CarrierPatch *patch = nullptr;
+  void *entry = nullptr;
+  void *currentFn = nullptr;
+  const char *signature = nullptr;
+  uintptr_t previousEntry = 0u;
+  uintptr_t previousOriginalFn = 0u;
+  uint32_t returnType = 0u;
+  bool alreadyInstalled = false;
+};
+
+bool PrepareCarrier(GetTlsJassDataFn lookupFn, CarrierPatch &patch,
+                    PreparedCarrier &prepared) {
   if (!lookupFn || !patch.name || !patch.bridgeFn)
     return false;
 
@@ -1117,30 +1188,30 @@ bool InstallCarrier(GetTlsJassDataFn lookupFn, CarrierPatch &patch) {
   uint32_t retType = 0;
   if (!ReadNativeMeta(entry, funcPtr, sigPtr, paramCount, retType))
     return false;
-  if (paramCount != 1 || !SignatureLooksLikeOneStringArg(sigPtr)) {
+  if (paramCount != 1 || !SignatureLooksLikeOneStringArg(sigPtr) ||
+      !SignatureMatchesCarrier(sigPtr, patch.kind)) {
     war3dbg::Print(
         "DXVK War3JassBridge: skip %s unexpected signature sig=%s argc=%u ret=%u\n",
         patch.name, sigPtr ? sigPtr : "<null>", paramCount, retType);
     return false;
   }
 
-  if (funcPtr == patch.bridgeFn) {
-    patch.entry.store(reinterpret_cast<uintptr_t>(entry),
-                      std::memory_order_relaxed);
-    return true;
-  }
-
-  patch.originalFn.store(reinterpret_cast<uintptr_t>(funcPtr),
-                         std::memory_order_relaxed);
-  if (!WriteNativeFuncPtr(entry, patch.bridgeFn))
+  prepared.patch = &patch;
+  prepared.entry = entry;
+  prepared.currentFn = funcPtr;
+  prepared.signature = sigPtr;
+  prepared.previousEntry =
+      patch.entry.load(std::memory_order_acquire);
+  prepared.previousOriginalFn =
+      patch.originalFn.load(std::memory_order_acquire);
+  prepared.returnType = retType;
+  prepared.alreadyInstalled = funcPtr == patch.bridgeFn;
+  if (prepared.alreadyInstalled && prepared.previousOriginalFn == 0u) {
+    war3dbg::Print(
+        "DXVK War3JassBridge: skip %s bridge is present but original is unknown\n",
+        patch.name);
     return false;
-
-  patch.entry.store(reinterpret_cast<uintptr_t>(entry),
-                    std::memory_order_relaxed);
-  patch.installCount.fetch_add(1, std::memory_order_relaxed);
-  war3dbg::Print(
-      "DXVK War3JassBridge: installed carrier %s entry=%p original=%p bridge=%p sig=%s ret=%u\n",
-      patch.name, entry, funcPtr, patch.bridgeFn, sigPtr, retType);
+  }
   return true;
 }
 
@@ -1157,7 +1228,9 @@ void ResetJassCommandBridgeInstallState() {
   s_allInstalled.store(false, std::memory_order_release);
   for (CarrierPatch *patch : AllCarriers) {
     patch->entry.store(0, std::memory_order_relaxed);
-    patch->originalFn.store(0, std::memory_order_relaxed);
+    // Preserve the proven stock target. Reset can run while an existing table
+    // is still patched; clearing it here would make exact forwarding
+    // impossible until the game happened to publish a fresh entry.
   }
 }
 
@@ -1181,9 +1254,61 @@ void TryInstallJassCommandBridge(const char *reason) {
   const uint64_t attempt =
       s_installAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
 
+  std::array<PreparedCarrier, 3u> prepared = {};
   bool allOk = true;
-  for (CarrierPatch *patch : AllCarriers) {
-    allOk = InstallCarrier(lookupFn, *patch) && allOk;
+  for (size_t index = 0u; index < prepared.size(); ++index) {
+    allOk = PrepareCarrier(
+                lookupFn, *AllCarriers[index], prepared[index]) &&
+            allOk;
+  }
+
+  std::array<bool, 3u> written = {};
+  if (allOk) {
+    for (size_t index = 0u; index < prepared.size(); ++index) {
+      PreparedCarrier &item = prepared[index];
+      item.patch->entry.store(
+          reinterpret_cast<uintptr_t>(item.entry),
+          std::memory_order_relaxed);
+      if (item.alreadyInstalled)
+        continue;
+
+      item.patch->originalFn.store(
+          reinterpret_cast<uintptr_t>(item.currentFn),
+          std::memory_order_release);
+      if (!WriteNativeFuncPtr(item.entry, item.patch->bridgeFn)) {
+        allOk = false;
+        break;
+      }
+      written[index] = true;
+    }
+  }
+
+  if (!allOk) {
+    // Restore both the game slots and the published bridge state. A carrier
+    // that was already installed before this transaction remains untouched.
+    for (size_t index = 0u; index < prepared.size(); ++index) {
+      PreparedCarrier &item = prepared[index];
+      if (!item.patch)
+        continue;
+      if (written[index])
+        static_cast<void>(WriteNativeFuncPtr(
+            item.entry, item.currentFn));
+      item.patch->entry.store(item.previousEntry,
+                              std::memory_order_release);
+      item.patch->originalFn.store(item.previousOriginalFn,
+                                   std::memory_order_release);
+    }
+  } else {
+    for (size_t index = 0u; index < prepared.size(); ++index) {
+      PreparedCarrier &item = prepared[index];
+      if (!item.alreadyInstalled) {
+        item.patch->installCount.fetch_add(1, std::memory_order_relaxed);
+        war3dbg::Print(
+            "DXVK War3JassBridge: installed carrier %s entry=%p original=%p bridge=%p sig=%s ret=%u\n",
+            item.patch->name, item.entry, item.currentFn,
+            item.patch->bridgeFn, item.signature, item.returnType);
+      }
+    }
   }
 
   if (allOk) {
@@ -1254,6 +1379,23 @@ JassCommandBridgeSelfTestResult RunJassCommandBridgeSelfTest(bool displayText) {
                            std::string::npos;
   }
 
+  // Exercise the exact public v1 path through all three patched stock
+  // carriers. This is the runtime witness used before editing a map.
+  preloaderFn(MakeSyntheticNativeStringArg("warvk:v1;system.clearError"));
+  result.publicProtocolVersion = hotkeyFn(
+      MakeSyntheticNativeStringArg("warvk:v1;system.protocolVersion"));
+  result.publicVersionStringHandle = stringFn(
+      MakeSyntheticNativeStringArg("warvk:v1;system.version"));
+  if (result.publicVersionStringHandle != 0u) {
+    const char *text =
+        jass::convert::to_CString(result.publicVersionStringHandle);
+    result.publicVersionText = text ? text : "";
+  }
+  result.publicV1Ok =
+      result.publicProtocolVersion == 1 &&
+      result.publicVersionText.find("WarVK JAPI 1.0.0-p0") !=
+          std::string::npos;
+
   if (displayText) {
     result.displayTextAttempted = true;
     void *playerEntry = LookupNativeEntry("Player");
@@ -1295,7 +1437,7 @@ JassCommandBridgeSelfTestResult RunJassCommandBridgeSelfTest(bool displayText) {
     result.displayTextOk = true;
   }
 
-  if (!result.intQueryOk || !result.stringQueryOk) {
+  if (!result.intQueryOk || !result.stringQueryOk || !result.publicV1Ok) {
     result.error = "carrier selftest did not return expected values";
   }
   return result;

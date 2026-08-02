@@ -98,6 +98,7 @@ d3d9_src = [
   # War3 新模块
   'war3/war3.cpp',
   'war3/bridge/war3_visual_bridge_v1.cpp',
+  'war3/japi/war3_japi_v1.cpp',
   'war3/core/war3_memory.cpp',
   'war3/core/war3_crash_handler.cpp',
   'war3/core/war3_runtime_profile.cpp',
@@ -229,6 +230,25 @@ d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
 d3d9_dep = declare_dependency(
   link_with           : [ d3d9_dll ],
   include_directories : [ dxvk_include_path ],
+)
+
+# Public WarVK v1 parser/dispatcher contract. This compiles the exact
+# production source with the rendering backend replaced by a fail-closed stub,
+# so strict wire parsing can run without loading d3d9.dll or Warcraft.
+war3_japi_v1_protocol_test = executable(
+  'war3_japi_v1_protocol_test',
+  [
+    'war3/japi/war3_japi_v1.cpp',
+    'war3/japi/tests/war3_japi_v1_protocol_test.cpp',
+  ],
+  cpp_args            : [ '-DWARVK_JAPI_PROTOCOL_TEST=1' ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_japi_v1_protocol',
+  war3_japi_v1_protocol_test,
+  timeout : 30,
 )
 
 # Pure, runnable policy test. It does not link d3d9.dll and therefore cannot

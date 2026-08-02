@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "status": "static-build-complete-map-physical-test-pending",
+  "runtimeOwner": "DXVK d3d9.dll",
+  "runtimeTopology": "single native-table carrier owner; no war3map.dll runtime",
+  "branch": "codex/warvk-japi-v1-integrated-20260802",
+  "sourceBaselineCommit": "03ac913f761be78e5d528aa8190264d326c16789",
+  "apiVersion": "WarVK JAPI 1.0.0-p0",
+  "protocolVersion": 1,
+  "commandCount": 55,
+  "sourceManifestSha256": "920872221B3836A5EFF69D3EC721915B21E0C4B5399C0F09F05B028CF46D27BF",
+  "implementedFeatureMaskHex": "0x00001E07",
+  "implementedFeatureMaskDecimal": 7687,
+  "implementedFeatures": [
+    "sun",
+    "csm",
+    "pointLight",
+    "lightning",
+    "managedObject",
+    "time",
+    "stats"
+  ],
+  "declaredButUnsupportedFeatures": [
+    "volumetric",
+    "outline",
+    "bloom",
+    "postfx",
+    "aa",
+    "dayNight"
+  ],
+  "artifacts": {
+    "build32D3d9": {
+      "path": "build32/src/d3d9/d3d9.dll",
+      "bytes": 33179964,
+      "sha256": "9F9BFB865EE9FAD3A45B269411BCB9D9E7E2A10D11F2D21690DD7736542CEA56"
+    },
+    "completeJass": {
+      "path": "WarVK/v1/jass/warvk_v1_complete.j",
+      "bytes": 20182,
+      "sha256": "396BC19EFB975C709B9AA22145EE239C8EBD2D6E09ADB7C32D619ADE598B6686"
+    },
+    "smokeTestJass": {
+      "path": "WarVK/v1/jass/warvk_v1_smoke_test.j",
+      "bytes": 1954,
+      "sha256": "9C6D136D285E92F4779AB54555F1152FEE165BAC3EBF1FE75CB905F92809C0B4"
+    }
+  },
+  "validation": {
+    "dxvkStaticTests": 366,
+    "dxvkMesonRunnables": 10,
+    "cleanRoomCppExecutables": 6,
+    "cleanRoomCodegenTests": 9,
+    "pjassParsedLines": 13076,
+    "win32Build": "pass",
+    "ninjaNoWork": "pass",
+    "diffCheck": "pass"
+  },
+  "mapModified": false,
+  "gameLaunched": false,
+  "githubPushAllowed": false
+}

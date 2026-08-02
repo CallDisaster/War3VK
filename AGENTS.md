@@ -1,5 +1,62 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（WarVK JAPI v1 正式迁入 DXVK，已编译，待地图物理验收）
+
+用户确认 JAPI 不应依赖 War3MapReforge 的 war3map.dll 运行时，要求把 clean-room
+协议、Native carrier、真实图形后端和完整 JASS 库迁回独立 DXVK。本轮工作位于本地
+分支 codex/warvk-japi-v1-integrated-20260802；不 push、不修改地图。
+
+**单一运行时与协议**：
+
+- src/d3d9/war3/japi/war3_japi_v1.cpp 现在是正式 warvk:v1 owner。DXVK 使用自有
+  Native 表跳板接管 stock Preloader、GetLocalizedHotkey 和 GetLocalizedString；
+  没有注册新 Native、没有 JapiFunc、没有 Detours，也不需要编译/加载 war3map.dll。
+  非 warvk: 调用 exact 转发，旧无版本 ping/cmd 仅为 AutoTest 兼容。
+- 公共协议固定 512 bytes / 16 参数 / printable ASCII；严格解析 b/i/d/r、
+  canonical int32、正数 managed id 和 locale-independent finite float。错误版本、
+  carrier、数量、类型和后端拒绝全部 fail-closed，并通过 thread-local
+  system.lastError 返回 manifest 稳定错误码/文本。
+- 三个 carrier 先完整校验名称、精确 ABI 签名和原函数，再事务式写表；中途失败会
+  回滚本轮已写 slot。Reset 不再丢失仍需用于 stock 转发的 original target。
+  internal jass.bridge_selftest 同时验证旧 AutoTest 与正式 v1 三载体路径。
+
+**真实后端与生命周期**：
+
+- 点光/点阴影、闪电共用正数 WarVK public id registry；不暴露 Warcraft handle、
+  指针或 Vulkan 对象。地图/JASS VM 重建只清理由 JAPI 创建的对象。
+- Lightning runtime 补齐 enabled/isAlive，并在 disabled 时保留对象但不提交绘制。
+- 当前诚实 feature mask 为 0x1E07：Sun、CSM、PointLight、Lightning、
+  ManagedObject、Time、Stats。完整 55-command wrapper 全部存在；体积光、outline、
+  bloom、postfx、AA、day/night 因渲染器尚无完整一一对应字段而不宣称支持，调用
+  稳定返回 UnsupportedFeature，不做静默 no-op。
+- pointLight.setShadowConfig 先验证 public id；当前 renderer 的 cube resolution /
+  bias 仍是全局策略，文档已明确，签名保留 id 供未来逐灯实现兼容升级。
+
+**地图侧交付**：
+
+- WarVK/v1/jass/warvk_v1_complete.j：公共常量与 55 个 WarVK... wrapper 的单文件库；
+- WarVK/v1/jass/warvk_v1_smoke_test.j：可选的 begin/finish 两阶段点光验收；点光会
+  保留到截图完成后再由地图显式销毁，确保真实跨越渲染帧；
+- WarVK/v1/editor：TriggerData、TriggerStrings 与 MapUI action/call/define；
+- WarVK/v1/manifest/warvk_v1.json 保持 clean-room 原文件 exact SHA-256
+  920872221B3836A5EFF69D3EC721915B21E0C4B5399C0F09F05B028CF46D27BF。
+
+**静态与构建门**：
+
+- DXVK production-source protocol executable PASS；10 项 Meson
+  JAPI/point-shadow/persistent-package runnable 全 PASS。
+- 全部 366 项 DXVK static 合同 PASS，覆盖 JAPI、TAA、4096 CSM、Arena fence、
+  point shadow、alpha、blocker、Stage11 exact 和 final-caster。
+- clean-room 原实现 6 个 Release C++ executable 与 9 个 codegen tests PASS；
+  8 个复制生成资产逐字 hash 一致。
+- YDWE runtime-24 pjass 对 common.j + blizzard.j + complete JASS + smoke test
+  共 13,076 行解析成功。Win32 d3d9.dll build 成功：33,179,964 bytes，SHA-256
+  9F9BFB865EE9FAD3A45B269411BCB9D9E7E2A10D11F2D21690DD7736542CEA56。
+
+**边界**：本轮没有编辑或启动地图。只有用户在旁路候选地图实际确认 version、
+feature flags、create 正数 id、count 增减和可见点阴影之后，才能把“地图已经成功
+调用 C++ 接口”标记为完成；当前只宣称源码、协议、JASS 与 Win32 构建闭合。
+
 ## 🚨 2026-08-02 上午（夜间阶段收口：三个隔离切片已提交，未部署）
 
 用户要求在当前阶段结束后收紧预算，不再继续 Atlas、生产 CPU-MT、阴影批处理或新的

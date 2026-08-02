@@ -1,0 +1,267 @@
+{
+  "schema": {
+    "name": "warvk-japi-manifest",
+    "version": 1
+  },
+  "apiVersion": "WarVK JAPI 1.0.0-p0",
+  "protocolVersion": 1,
+  "provenance": {
+    "method": "clean-room",
+    "allowedEvidence": [
+      "project-owned War3MapReforge code",
+      "independent static verification of Game.dll 1.27a",
+      "stock Warcraft III native ABI"
+    ],
+    "restrictedImplementationConsulted": false,
+    "runtimeEffectClaimed": false
+  },
+  "distribution": {
+    "status": "blocked",
+    "reason": "repository license is unresolved",
+    "deploymentAuthorized": false,
+    "mapArchiveIntegrationAuthorized": false
+  },
+  "protocol": {
+    "prefix": "warvk:",
+    "canonicalPrefix": "warvk:v1;",
+    "canonicalGrammar": "warvk:v1;<command>[;<typed-arg>...]",
+    "legacyGrammar": "warvk:<command>[;<typed-arg>...]",
+    "legacyParseOnly": true,
+    "separator": ";",
+    "typeSeparator": ":",
+    "encoding": "ASCII",
+    "maxBytes": 512,
+    "maxArgs": 16,
+    "integerPolicy": "strict signed int32 decimal; no whitespace, sign-only token, or overflow",
+    "realPolicy": "strict decimal, optional exponent, finite and representable; reject NaN, Inf, whitespace, and overflow",
+    "nonWarvkPolicy": "forward_original_unconditionally",
+    "profileMismatchPolicy": "fail_closed_no_address_scan",
+    "typedArgs": {
+      "b": { "type": "bool", "grammar": "b:0|b:1" },
+      "i": { "type": "i32", "grammar": "i:<strict-int32-decimal>" },
+      "d": { "type": "id", "grammar": "d:<positive-int32-decimal>" },
+      "r": { "type": "real", "grammar": "r:<finite-decimal>" }
+    },
+    "carriers": {
+      "preloader": { "stockNative": "Preloader", "abi": "(S)V", "role": "setter_or_command" },
+      "hotkey": { "stockNative": "GetLocalizedHotkey", "abi": "(S)I", "role": "bool_i32_or_id_return" },
+      "localized_string": { "stockNative": "GetLocalizedString", "abi": "(S)S", "role": "string_or_textual_real_return" }
+    }
+  },
+  "publicApiPolicy": {
+    "jassNamePattern": "^WarVK[A-Za-z0-9]+$",
+    "allowedInputTypes": ["bool", "i32", "id", "real"],
+    "allowedResultTypes": ["void", "bool", "i32", "id", "real", "string"],
+    "prohibitedPublicTypes": [
+      "raw_pointer",
+      "address",
+      "vulkan_handle",
+      "framebuffer",
+      "native_callback",
+      "native_event",
+      "c_ui_callback",
+      "raw_image_handle",
+      "war3_handle"
+    ],
+    "localVisualWarningZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。",
+    "managedIdPolicy": "Only positive WarVK-managed int32 ids are accepted; Warcraft handles and addresses are forbidden."
+  },
+  "featureStatus": "declared_backend_required",
+  "categories": [
+    { "name": "system", "status": "internal_dispatch", "featureBit": -1 },
+    { "name": "sun", "status": "declared_backend_required", "featureBit": 0 },
+    { "name": "csm", "status": "declared_backend_required", "featureBit": 1 },
+    { "name": "pointLight", "status": "declared_backend_required", "featureBit": 2 },
+    { "name": "volumetric", "status": "declared_backend_required", "featureBit": 3 },
+    { "name": "outline", "status": "declared_backend_required", "featureBit": 4 },
+    { "name": "bloom", "status": "declared_backend_required", "featureBit": 5 },
+    { "name": "postfx", "status": "declared_backend_required", "featureBit": 6 },
+    { "name": "aa", "status": "declared_backend_required", "featureBit": 7 },
+    { "name": "dayNight", "status": "declared_backend_required", "featureBit": 8 },
+    { "name": "lightning", "status": "declared_backend_required", "featureBit": 9 },
+    { "name": "managedObject", "status": "declared_backend_required", "featureBit": 10 },
+    { "name": "time", "status": "declared_backend_required", "featureBit": 11 },
+    { "name": "stats", "status": "declared_backend_required", "featureBit": 12 }
+  ],
+  "errorCodes": [
+    { "value": 0, "name": "None", "stableText": "no error" },
+    { "value": 1, "name": "PayloadTooLong", "stableText": "payload exceeds 512 bytes" },
+    { "value": 2, "name": "NonAscii", "stableText": "payload contains a non-ASCII byte" },
+    { "value": 3, "name": "ControlCharacter", "stableText": "payload contains a control character" },
+    { "value": 4, "name": "EmptyToken", "stableText": "payload contains an empty token" },
+    { "value": 5, "name": "TooManyArguments", "stableText": "payload exceeds 16 arguments" },
+    { "value": 6, "name": "UnsupportedVersion", "stableText": "protocol version is unsupported" },
+    { "value": 7, "name": "MissingCommand", "stableText": "command token is missing" },
+    { "value": 8, "name": "UnknownCommand", "stableText": "command is not declared" },
+    { "value": 9, "name": "CarrierMismatch", "stableText": "command used the wrong stock native carrier" },
+    { "value": 10, "name": "ArgumentCountMismatch", "stableText": "argument count does not match the command" },
+    { "value": 11, "name": "InvalidInteger", "stableText": "integer token is malformed" },
+    { "value": 12, "name": "IntegerOverflow", "stableText": "integer token is outside int32 range" },
+    { "value": 13, "name": "InvalidBoolean", "stableText": "boolean token must be b:0 or b:1" },
+    { "value": 14, "name": "InvalidId", "stableText": "id token must be a positive int32" },
+    { "value": 15, "name": "InvalidReal", "stableText": "real token is malformed or non-finite" },
+    { "value": 16, "name": "RealOutOfRange", "stableText": "real token is outside the representable range" },
+    { "value": 17, "name": "BackendUnavailable", "stableText": "visual backend is unavailable" },
+    { "value": 18, "name": "UnsupportedFeature", "stableText": "visual feature is not supported by the backend" },
+    { "value": 19, "name": "BackendRejected", "stableText": "visual backend rejected the command" },
+    { "value": 20, "name": "InternalError", "stableText": "internal protocol error" },
+    { "value": 21, "name": "BackendContractViolation", "stableText": "backend result violates the declared result type" },
+    { "value": 22, "name": "InvalidArgumentType", "stableText": "typed argument tag is unknown or does not match the declared type" }
+  ],
+  "gameDllProfile": {
+    "profileId": "war3-1.27.0.52240-x86-e04d1716",
+    "identity": {
+      "sha256": "E04D1716603C075EB0C8E1E21CF1093A664ADC5249EFAB396BFA08D7B09D0C3A",
+      "fileVersion": "1.27.0.52240",
+      "productVersion": "1.27.0.52240 (f7ba2a3)",
+      "fileLength": 13187048,
+      "machine": "0x014C",
+      "optionalHeaderMagic": "0x010B",
+      "timeDateStamp": "0x56BD0E1C",
+      "sizeOfImage": "0x00CD8000",
+      "sectionCount": 6,
+      "entryPointRva": "0x0077190A",
+      "preferredImageBase": "0x6F000000",
+      "checksum": "0x00C96841"
+    },
+    "verificationPolicy": "All identity, fixed-RVA, ABI, exact-byte, relocation-mask, and registration-layout checks must pass; otherwise fail closed. Never scan for replacement addresses.",
+    "registrationTargetRva": "0x007E3710",
+    "carriers": [
+      {
+        "name": "GetLocalizedString",
+        "implementationRva": "0x001E31D0",
+        "implementationSize": "0x6F",
+        "registrationRva": "0x001E9C21",
+        "nameRva": "0x00967238",
+        "signatureRva": "0x00967230",
+        "abi": "(S)S",
+        "prologueBytes": "55 8B EC 81 EC 04 08 00 00 A1 74 A7 B6 6F 33 C5 89 45 FC 8B 4D 08 56 E8",
+        "prologueMask": "FF FF FF FF FF FF FF FF FF FF 00 00 00 00 FF FF FF FF FF FF FF FF FF FF",
+        "relocations": [
+          { "offset": 10, "targetRva": "0x00B6A774" }
+        ]
+      },
+      {
+        "name": "GetLocalizedHotkey",
+        "implementationRva": "0x001E31A0",
+        "implementationSize": "0x29",
+        "registrationRva": "0x001E9C35",
+        "nameRva": "0x0096724C",
+        "signatureRva": "0x009671BC",
+        "abi": "(S)I",
+        "prologueBytes": "55 8B EC 8B 4D 08 E8 45 E5 E6 FF 85 C0 74 16 80 38 00 74 11",
+        "prologueMask": "FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF",
+        "relocations": []
+      },
+      {
+        "name": "Preloader",
+        "implementationRva": "0x001F2190",
+        "implementationSize": "0x118",
+        "registrationRva": "0x001EF56D",
+        "nameRva": "0x0096FBCC",
+        "signatureRva": "0x009678D8",
+        "abi": "(S)V",
+        "prologueBytes": "55 8B EC 83 EC 28 A1 74 A7 B6 6F 33 C5 89 45 FC 8B 4D 08 56 E8 47 F5 E5",
+        "prologueMask": "FF FF FF FF FF FF FF 00 00 00 00 FF FF FF FF FF FF FF FF FF FF FF FF FF",
+        "relocations": [
+          { "offset": 7, "targetRva": "0x00B6A774" }
+        ]
+      }
+    ],
+    "helpers": [
+      {
+        "name": "StringHandleToCString",
+        "rva": "0x000516F0",
+        "size": "0x0E",
+        "bytes": "8B 41 08 85 C0 74 04 8B 40 1C C3 33 C0 C3",
+        "mask": "FF FF FF FF FF FF FF FF FF FF FF FF FF FF",
+        "relocations": []
+      },
+      {
+        "name": "CStringToStringHandle",
+        "rva": "0x001DA520",
+        "size": "0x14",
+        "bytes": "85 C9 75 03 33 C0 C3 51 8B 0D 38 42 BE 6F E8 8D 52 FE FF C3",
+        "mask": "FF FF FF FF FF FF FF FF FF FF 00 00 00 00 FF FF FF FF FF FF",
+        "relocations": [
+          { "offset": 10, "targetRva": "0x00BE4238" }
+        ]
+      }
+    ],
+    "registrationEvidence": {
+      "addressing": "module_base_plus_rva",
+      "layout": "fixed opcode/layout with exact carrier name RVA, signature RVA, implementation RVA, and registration target RVA",
+      "scanAllowed": false
+    }
+  },
+  "commands": [
+    { "id": 0, "name": "system.version", "jassName": "WarVKGetVersion", "category": "system", "carrier": "localized_string", "args": [], "result": "string", "backendRequired": false, "localVisual": true, "querySyncWarning": true, "titleZh": "获取 WarVK 版本", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。返回 WarVK API 版本文本。" },
+    { "id": 1, "name": "system.protocolVersion", "jassName": "WarVKGetProtocolVersion", "category": "system", "carrier": "hotkey", "args": [], "result": "i32", "backendRequired": false, "localVisual": true, "querySyncWarning": true, "titleZh": "获取协议版本", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。返回协议版本整数。" },
+    { "id": 2, "name": "system.lastErrorCode", "jassName": "WarVKGetLastErrorCode", "category": "system", "carrier": "hotkey", "args": [], "result": "i32", "backendRequired": false, "localVisual": true, "querySyncWarning": true, "titleZh": "获取最后错误码", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。返回最后错误码。" },
+    { "id": 3, "name": "system.lastError", "jassName": "WarVKGetLastError", "category": "system", "carrier": "localized_string", "args": [], "result": "string", "backendRequired": false, "localVisual": true, "querySyncWarning": true, "titleZh": "获取最后错误文本", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。返回稳定英文错误文本。" },
+    { "id": 4, "name": "system.clearError", "jassName": "WarVKClearError", "category": "system", "carrier": "preloader", "args": [], "result": "void", "backendRequired": false, "localVisual": true, "querySyncWarning": true, "titleZh": "清除最后错误", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。清除当前线程的最后错误。" },
+    { "id": 5, "name": "system.featureFlags", "jassName": "WarVKGetFeatureFlags", "category": "system", "carrier": "hotkey", "args": [], "result": "i32", "backendRequired": false, "localVisual": true, "querySyncWarning": true, "titleZh": "获取功能标志", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。返回运行时后端声明的功能位。" },
+    { "id": 6, "name": "system.runtimeReady", "jassName": "WarVKIsRuntimeReady", "category": "system", "carrier": "hotkey", "args": [], "result": "bool", "backendRequired": false, "localVisual": true, "querySyncWarning": true, "titleZh": "查询运行时就绪", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。查询本地 WarVK 运行时是否就绪。" },
+
+    { "id": 7, "name": "sun.setEnabled", "jassName": "WarVKSetSunEnabled", "category": "sun", "carrier": "preloader", "args": [{ "name": "enabled", "type": "bool" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "启用太阳光", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置太阳光开关 ${enabled}。" },
+    { "id": 8, "name": "sun.setDirection", "jassName": "WarVKSetSunDirection", "category": "sun", "carrier": "preloader", "args": [{ "name": "x", "type": "real" }, { "name": "y", "type": "real" }, { "name": "z", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置太阳方向", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置太阳方向 ${x}、${y}、${z}。" },
+    { "id": 9, "name": "sun.setColorIntensity", "jassName": "WarVKSetSunColorIntensity", "category": "sun", "carrier": "preloader", "args": [{ "name": "red", "type": "real" }, { "name": "green", "type": "real" }, { "name": "blue", "type": "real" }, { "name": "intensity", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置太阳颜色与强度", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置太阳颜色 ${red}、${green}、${blue} 与强度 ${intensity}。" },
+
+    { "id": 10, "name": "csm.setEnabled", "jassName": "WarVKSetCsmEnabled", "category": "csm", "carrier": "preloader", "args": [{ "name": "enabled", "type": "bool" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "启用 CSM", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置级联阴影开关 ${enabled}。" },
+    { "id": 11, "name": "csm.setLayout", "jassName": "WarVKSetCsmLayout", "category": "csm", "carrier": "preloader", "args": [{ "name": "cascadeCount", "type": "i32" }, { "name": "maxDistance", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置 CSM 布局", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置级联数 ${cascadeCount} 与最大距离 ${maxDistance}。" },
+    { "id": 12, "name": "csm.setTuning", "jassName": "WarVKSetCsmTuning", "category": "csm", "carrier": "preloader", "args": [{ "name": "depthBias", "type": "real" }, { "name": "blendWidth", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "调整 CSM", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置深度偏移 ${depthBias} 与混合宽度 ${blendWidth}。" },
+
+    { "id": 13, "name": "pointLight.create", "jassName": "WarVKCreatePointLight", "category": "pointLight", "carrier": "hotkey", "args": [{ "name": "x", "type": "real" }, { "name": "y", "type": "real" }, { "name": "z", "type": "real" }, { "name": "radius", "type": "real" }, { "name": "red", "type": "real" }, { "name": "green", "type": "real" }, { "name": "blue", "type": "real" }, { "name": "intensity", "type": "real" }], "result": "id", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "创建点光源", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。以位置 ${x}、${y}、${z}、半径 ${radius}、颜色 ${red}、${green}、${blue}、强度 ${intensity} 创建本地点光并返回 WarVK id。" },
+    { "id": 14, "name": "pointLight.destroy", "jassName": "WarVKDestroyPointLight", "category": "pointLight", "carrier": "preloader", "args": [{ "name": "lightId", "type": "id" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "销毁点光源", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。销毁 WarVK 点光 id ${lightId}。" },
+    { "id": 15, "name": "pointLight.setEnabled", "jassName": "WarVKSetPointLightEnabled", "category": "pointLight", "carrier": "preloader", "args": [{ "name": "lightId", "type": "id" }, { "name": "enabled", "type": "bool" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "启用点光源", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 开关 ${enabled}。" },
+    { "id": 16, "name": "pointLight.setPosition", "jassName": "WarVKSetPointLightPosition", "category": "pointLight", "carrier": "preloader", "args": [{ "name": "lightId", "type": "id" }, { "name": "x", "type": "real" }, { "name": "y", "type": "real" }, { "name": "z", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置点光位置", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 位置 ${x}、${y}、${z}。" },
+    { "id": 17, "name": "pointLight.setColorIntensity", "jassName": "WarVKSetPointLightColorIntensity", "category": "pointLight", "carrier": "preloader", "args": [{ "name": "lightId", "type": "id" }, { "name": "red", "type": "real" }, { "name": "green", "type": "real" }, { "name": "blue", "type": "real" }, { "name": "intensity", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置点光颜色与强度", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 颜色 ${red}、${green}、${blue} 与强度 ${intensity}。" },
+    { "id": 18, "name": "pointLight.setRadius", "jassName": "WarVKSetPointLightRadius", "category": "pointLight", "carrier": "preloader", "args": [{ "name": "lightId", "type": "id" }, { "name": "radius", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置点光半径", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 半径 ${radius}。" },
+    { "id": 19, "name": "pointLight.setShadowEnabled", "jassName": "WarVKSetPointLightShadowEnabled", "category": "pointLight", "carrier": "preloader", "args": [{ "name": "lightId", "type": "id" }, { "name": "enabled", "type": "bool" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "启用点光阴影", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 阴影开关 ${enabled}。" },
+    { "id": 20, "name": "pointLight.setShadowConfig", "jassName": "WarVKSetPointLightShadowConfig", "category": "pointLight", "carrier": "preloader", "args": [{ "name": "lightId", "type": "id" }, { "name": "resolution", "type": "i32" }, { "name": "bias", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置点光阴影参数", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 阴影分辨率 ${resolution} 与偏移 ${bias}。" },
+    { "id": 21, "name": "pointLight.isAlive", "jassName": "WarVKIsPointLightAlive", "category": "pointLight", "carrier": "hotkey", "args": [{ "name": "lightId", "type": "id" }], "result": "bool", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "查询点光存活", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。查询 WarVK 点光 id ${lightId} 是否存活。" },
+
+    { "id": 22, "name": "volumetric.setEnabled", "jassName": "WarVKSetVolumetricEnabled", "category": "volumetric", "carrier": "preloader", "args": [{ "name": "enabled", "type": "bool" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "启用体积光", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置体积光开关 ${enabled}。" },
+    { "id": 23, "name": "volumetric.setDensity", "jassName": "WarVKSetVolumetricDensity", "category": "volumetric", "carrier": "preloader", "args": [{ "name": "density", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置体积光密度", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置体积光密度 ${density}。" },
+    { "id": 24, "name": "volumetric.setScattering", "jassName": "WarVKSetVolumetricScattering", "category": "volumetric", "carrier": "preloader", "args": [{ "name": "scattering", "type": "real" }, { "name": "anisotropy", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置体积光散射", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置散射 ${scattering} 与各向异性 ${anisotropy}。" },
+    { "id": 25, "name": "volumetric.setQuality", "jassName": "WarVKSetVolumetricQuality", "category": "volumetric", "carrier": "preloader", "args": [{ "name": "stepCount", "type": "i32" }, { "name": "maxDistance", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置体积光质量", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置步数 ${stepCount} 与最大距离 ${maxDistance}。" },
+
+    { "id": 26, "name": "outline.setEnabled", "jassName": "WarVKSetOutlineEnabled", "category": "outline", "carrier": "preloader", "args": [{ "name": "enabled", "type": "bool" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "启用轮廓", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置轮廓开关 ${enabled}。" },
+    { "id": 27, "name": "outline.setColor", "jassName": "WarVKSetOutlineColor", "category": "outline", "carrier": "preloader", "args": [{ "name": "red", "type": "real" }, { "name": "green", "type": "real" }, { "name": "blue", "type": "real" }, { "name": "alpha", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置轮廓颜色", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置轮廓颜色 ${red}、${green}、${blue}、${alpha}。" },
+    { "id": 28, "name": "outline.setParameters", "jassName": "WarVKSetOutlineParameters", "category": "outline", "carrier": "preloader", "args": [{ "name": "width", "type": "real" }, { "name": "depthThreshold", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置轮廓参数", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置轮廓宽度 ${width} 与深度阈值 ${depthThreshold}。" },
+
+    { "id": 29, "name": "bloom.setEnabled", "jassName": "WarVKSetBloomEnabled", "category": "bloom", "carrier": "preloader", "args": [{ "name": "enabled", "type": "bool" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "启用泛光", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置泛光开关 ${enabled}。" },
+    { "id": 30, "name": "bloom.setParameters", "jassName": "WarVKSetBloomParameters", "category": "bloom", "carrier": "preloader", "args": [{ "name": "threshold", "type": "real" }, { "name": "intensity", "type": "real" }, { "name": "softKnee", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置泛光参数", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置阈值 ${threshold}、强度 ${intensity} 与软膝 ${softKnee}。" },
+    { "id": 31, "name": "bloom.setRadius", "jassName": "WarVKSetBloomRadius", "category": "bloom", "carrier": "preloader", "args": [{ "name": "radius", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置泛光半径", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置泛光半径 ${radius}。" },
+
+    { "id": 32, "name": "postfx.setEnabled", "jassName": "WarVKSetPostfxEnabled", "category": "postfx", "carrier": "preloader", "args": [{ "name": "enabled", "type": "bool" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "启用后处理", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置后处理开关 ${enabled}。" },
+    { "id": 33, "name": "postfx.setExposureGamma", "jassName": "WarVKSetPostfxExposureGamma", "category": "postfx", "carrier": "preloader", "args": [{ "name": "exposure", "type": "real" }, { "name": "gamma", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置曝光与伽马", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置曝光 ${exposure} 与伽马 ${gamma}。" },
+    { "id": 34, "name": "postfx.setColorGrade", "jassName": "WarVKSetPostfxColorGrade", "category": "postfx", "carrier": "preloader", "args": [{ "name": "saturation", "type": "real" }, { "name": "contrast", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置色彩分级", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置饱和度 ${saturation} 与对比度 ${contrast}。" },
+
+    { "id": 35, "name": "aa.setMode", "jassName": "WarVKSetAaMode", "category": "aa", "carrier": "preloader", "args": [{ "name": "mode", "type": "i32" }, { "name": "quality", "type": "i32" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置抗锯齿模式", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置抗锯齿模式 ${mode} 与质量 ${quality}。" },
+    { "id": 36, "name": "aa.setSharpness", "jassName": "WarVKSetAaSharpness", "category": "aa", "carrier": "preloader", "args": [{ "name": "sharpness", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置抗锯齿锐度", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置抗锯齿锐度 ${sharpness}。" },
+
+    { "id": 37, "name": "dayNight.setEnabled", "jassName": "WarVKSetDayNightEnabled", "category": "dayNight", "carrier": "preloader", "args": [{ "name": "enabled", "type": "bool" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "启用昼夜视觉", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置昼夜视觉开关 ${enabled}。" },
+    { "id": 38, "name": "dayNight.setTime", "jassName": "WarVKSetDayNightTime", "category": "dayNight", "carrier": "preloader", "args": [{ "name": "hours", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置本地视觉时间", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置本地视觉小时 ${hours}。" },
+    { "id": 39, "name": "dayNight.setSpeed", "jassName": "WarVKSetDayNightSpeed", "category": "dayNight", "carrier": "preloader", "args": [{ "name": "scale", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置昼夜速度", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置本地昼夜速度 ${scale}。" },
+
+    { "id": 40, "name": "lightning.create", "jassName": "WarVKCreateLightning", "category": "lightning", "carrier": "hotkey", "args": [{ "name": "startX", "type": "real" }, { "name": "startY", "type": "real" }, { "name": "startZ", "type": "real" }, { "name": "endX", "type": "real" }, { "name": "endY", "type": "real" }, { "name": "endZ", "type": "real" }, { "name": "red", "type": "real" }, { "name": "green", "type": "real" }, { "name": "blue", "type": "real" }, { "name": "alpha", "type": "real" }, { "name": "width", "type": "real" }], "result": "id", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "创建闪电", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。以起点 ${startX}、${startY}、${startZ}、终点 ${endX}、${endY}、${endZ}、颜色 ${red}、${green}、${blue}、${alpha}、宽度 ${width} 创建本地闪电并返回 WarVK id。" },
+    { "id": 41, "name": "lightning.destroy", "jassName": "WarVKDestroyLightning", "category": "lightning", "carrier": "preloader", "args": [{ "name": "lightningId", "type": "id" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "销毁闪电", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。销毁 WarVK 闪电 id ${lightningId}。" },
+    { "id": 42, "name": "lightning.setEnabled", "jassName": "WarVKSetLightningEnabled", "category": "lightning", "carrier": "preloader", "args": [{ "name": "lightningId", "type": "id" }, { "name": "enabled", "type": "bool" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "启用闪电", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置闪电 ${lightningId} 开关 ${enabled}。" },
+    { "id": 43, "name": "lightning.setEndpoints", "jassName": "WarVKSetLightningEndpoints", "category": "lightning", "carrier": "preloader", "args": [{ "name": "lightningId", "type": "id" }, { "name": "startX", "type": "real" }, { "name": "startY", "type": "real" }, { "name": "startZ", "type": "real" }, { "name": "endX", "type": "real" }, { "name": "endY", "type": "real" }, { "name": "endZ", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置闪电端点", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置闪电 ${lightningId} 起点 ${startX}、${startY}、${startZ} 与终点 ${endX}、${endY}、${endZ}。" },
+    { "id": 44, "name": "lightning.setColor", "jassName": "WarVKSetLightningColor", "category": "lightning", "carrier": "preloader", "args": [{ "name": "lightningId", "type": "id" }, { "name": "red", "type": "real" }, { "name": "green", "type": "real" }, { "name": "blue", "type": "real" }, { "name": "alpha", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置闪电颜色", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置闪电 ${lightningId} 颜色 ${red}、${green}、${blue}、${alpha}。" },
+    { "id": 45, "name": "lightning.setWidth", "jassName": "WarVKSetLightningWidth", "category": "lightning", "carrier": "preloader", "args": [{ "name": "lightningId", "type": "id" }, { "name": "width", "type": "real" }], "result": "void", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "设置闪电宽度", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置闪电 ${lightningId} 宽度 ${width}。" },
+    { "id": 46, "name": "lightning.isAlive", "jassName": "WarVKIsLightningAlive", "category": "lightning", "carrier": "hotkey", "args": [{ "name": "lightningId", "type": "id" }], "result": "bool", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "查询闪电存活", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。查询 WarVK 闪电 id ${lightningId} 是否存活。" },
+
+    { "id": 47, "name": "managedObject.count", "jassName": "WarVKGetManagedObjectCount", "category": "managedObject", "carrier": "hotkey", "args": [], "result": "i32", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "查询托管对象数量", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。只读返回 WarVK 托管对象数量。" },
+    { "id": 48, "name": "managedObject.isAlive", "jassName": "WarVKIsManagedObjectAlive", "category": "managedObject", "carrier": "hotkey", "args": [{ "name": "objectId", "type": "id" }], "result": "bool", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "查询托管对象存活", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。只读查询 WarVK 对象 id ${objectId} 是否存活。" },
+    { "id": 49, "name": "managedObject.type", "jassName": "WarVKGetManagedObjectType", "category": "managedObject", "carrier": "hotkey", "args": [{ "name": "objectId", "type": "id" }], "result": "i32", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "查询托管对象类型", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。只读返回 WarVK 对象 id ${objectId} 的类型。" },
+
+    { "id": 50, "name": "time.visualSeconds", "jassName": "WarVKGetVisualTimeSeconds", "category": "time", "carrier": "localized_string", "args": [], "result": "real", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "查询视觉时间", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。只读返回本地视觉时间秒数。" },
+    { "id": 51, "name": "time.frameIndex", "jassName": "WarVKGetFrameIndex", "category": "time", "carrier": "hotkey", "args": [], "result": "i32", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "查询帧序号", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。只读返回本地渲染帧序号。" },
+
+    { "id": 52, "name": "stats.framesPerSecond", "jassName": "WarVKGetFramesPerSecond", "category": "stats", "carrier": "localized_string", "args": [], "result": "real", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "查询帧率", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。只读返回本地渲染帧率。" },
+    { "id": 53, "name": "stats.frameTimeMilliseconds", "jassName": "WarVKGetFrameTimeMilliseconds", "category": "stats", "carrier": "localized_string", "args": [], "result": "real", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "查询帧耗时", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。只读返回本地帧耗时毫秒。" },
+    { "id": 54, "name": "stats.drawCallCount", "jassName": "WarVKGetDrawCallCount", "category": "stats", "carrier": "hotkey", "args": [], "result": "i32", "backendRequired": true, "localVisual": true, "querySyncWarning": true, "titleZh": "查询绘制调用数", "descriptionZh": "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。只读返回最近一帧绘制调用数。" }
+  ]
+}

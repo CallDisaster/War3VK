@@ -1,0 +1,490 @@
+[WarVKClearError]
+title = "清除最后错误"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。清除当前线程的最后错误。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKClearError"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = nothing
+
+[WarVKSetSunEnabled]
+title = "启用太阳光"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置太阳光开关 ${enabled}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetSunEnabled"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = boolean
+
+[WarVKSetSunDirection]
+title = "设置太阳方向"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置太阳方向 ${x}、${y}、${z}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetSunDirection"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetSunColorIntensity]
+title = "设置太阳颜色与强度"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置太阳颜色 ${red}、${green}、${blue} 与强度 ${intensity}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetSunColorIntensity"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetCsmEnabled]
+title = "启用 CSM"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置级联阴影开关 ${enabled}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetCsmEnabled"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = boolean
+
+[WarVKSetCsmLayout]
+title = "设置 CSM 布局"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置级联数 ${cascadeCount} 与最大距离 ${maxDistance}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetCsmLayout"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+
+[WarVKSetCsmTuning]
+title = "调整 CSM"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置深度偏移 ${depthBias} 与混合宽度 ${blendWidth}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetCsmTuning"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKDestroyPointLight]
+title = "销毁点光源"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。销毁 WarVK 点光 id ${lightId}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKDestroyPointLight"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+
+[WarVKSetPointLightEnabled]
+title = "启用点光源"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 开关 ${enabled}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetPointLightEnabled"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = boolean
+
+[WarVKSetPointLightPosition]
+title = "设置点光位置"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 位置 ${x}、${y}、${z}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetPointLightPosition"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetPointLightColorIntensity]
+title = "设置点光颜色与强度"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 颜色 ${red}、${green}、${blue} 与强度 ${intensity}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetPointLightColorIntensity"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetPointLightRadius]
+title = "设置点光半径"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 半径 ${radius}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetPointLightRadius"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+
+[WarVKSetPointLightShadowEnabled]
+title = "启用点光阴影"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 阴影开关 ${enabled}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetPointLightShadowEnabled"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = boolean
+
+[WarVKSetPointLightShadowConfig]
+title = "设置点光阴影参数"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置点光 ${lightId} 阴影分辨率 ${resolution} 与偏移 ${bias}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetPointLightShadowConfig"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = integer
+[[.args]]
+type = real
+
+[WarVKSetVolumetricEnabled]
+title = "启用体积光"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置体积光开关 ${enabled}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetVolumetricEnabled"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = boolean
+
+[WarVKSetVolumetricDensity]
+title = "设置体积光密度"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置体积光密度 ${density}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetVolumetricDensity"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+
+[WarVKSetVolumetricScattering]
+title = "设置体积光散射"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置散射 ${scattering} 与各向异性 ${anisotropy}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetVolumetricScattering"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetVolumetricQuality]
+title = "设置体积光质量"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置步数 ${stepCount} 与最大距离 ${maxDistance}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetVolumetricQuality"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+
+[WarVKSetOutlineEnabled]
+title = "启用轮廓"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置轮廓开关 ${enabled}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetOutlineEnabled"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = boolean
+
+[WarVKSetOutlineColor]
+title = "设置轮廓颜色"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置轮廓颜色 ${red}、${green}、${blue}、${alpha}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetOutlineColor"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetOutlineParameters]
+title = "设置轮廓参数"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置轮廓宽度 ${width} 与深度阈值 ${depthThreshold}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetOutlineParameters"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetBloomEnabled]
+title = "启用泛光"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置泛光开关 ${enabled}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetBloomEnabled"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = boolean
+
+[WarVKSetBloomParameters]
+title = "设置泛光参数"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置阈值 ${threshold}、强度 ${intensity} 与软膝 ${softKnee}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetBloomParameters"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetBloomRadius]
+title = "设置泛光半径"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置泛光半径 ${radius}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetBloomRadius"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+
+[WarVKSetPostfxEnabled]
+title = "启用后处理"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置后处理开关 ${enabled}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetPostfxEnabled"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = boolean
+
+[WarVKSetPostfxExposureGamma]
+title = "设置曝光与伽马"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置曝光 ${exposure} 与伽马 ${gamma}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetPostfxExposureGamma"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetPostfxColorGrade]
+title = "设置色彩分级"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置饱和度 ${saturation} 与对比度 ${contrast}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetPostfxColorGrade"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetAaMode]
+title = "设置抗锯齿模式"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置抗锯齿模式 ${mode} 与质量 ${quality}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetAaMode"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = integer
+
+[WarVKSetAaSharpness]
+title = "设置抗锯齿锐度"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置抗锯齿锐度 ${sharpness}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetAaSharpness"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+
+[WarVKSetDayNightEnabled]
+title = "启用昼夜视觉"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置昼夜视觉开关 ${enabled}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetDayNightEnabled"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = boolean
+
+[WarVKSetDayNightTime]
+title = "设置本地视觉时间"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置本地视觉小时 ${hours}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetDayNightTime"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+
+[WarVKSetDayNightSpeed]
+title = "设置昼夜速度"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置本地昼夜速度 ${scale}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetDayNightSpeed"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = real
+
+[WarVKDestroyLightning]
+title = "销毁闪电"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。销毁 WarVK 闪电 id ${lightningId}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKDestroyLightning"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+
+[WarVKSetLightningEnabled]
+title = "启用闪电"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置闪电 ${lightningId} 开关 ${enabled}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetLightningEnabled"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = boolean
+
+[WarVKSetLightningEndpoints]
+title = "设置闪电端点"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置闪电 ${lightningId} 起点 ${startX}、${startY}、${startZ} 与终点 ${endX}、${endY}、${endZ}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetLightningEndpoints"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetLightningColor]
+title = "设置闪电颜色"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置闪电 ${lightningId} 颜色 ${red}、${green}、${blue}、${alpha}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetLightningColor"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetLightningWidth]
+title = "设置闪电宽度"
+description = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。设置闪电 ${lightningId} 宽度 ${width}。"
+comment = "仅限本地视觉；本调用及其查询结果禁止用于多人同步玩法分支。"
+category = "TC_WarVK"
+script = "WarVKSetLightningWidth"
+returns = nothing
+local_visual_only = "true"
+[[.args]]
+type = integer
+[[.args]]
+type = real

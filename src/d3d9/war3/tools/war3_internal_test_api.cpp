@@ -533,14 +533,18 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     response["preloaderOk"] = test.preloaderOk;
     response["intQueryOk"] = test.intQueryOk;
     response["stringQueryOk"] = test.stringQueryOk;
+    response["publicV1Ok"] = test.publicV1Ok;
     response["displayTextAttempted"] = test.displayTextAttempted;
     response["displayTextOk"] = test.displayTextOk;
     response["pingCode"] = test.pingCode;
+    response["publicProtocolVersion"] = test.publicProtocolVersion;
     response["versionStringHandle"] = test.versionStringHandle;
+    response["publicVersionStringHandle"] = test.publicVersionStringHandle;
     response["versionText"] = test.versionText;
+    response["publicVersionText"] = test.publicVersionText;
     response["playerHandle"] = test.playerHandle;
     result.ok = test.installed && test.preloaderOk && test.intQueryOk &&
-                test.stringQueryOk &&
+                test.stringQueryOk && test.publicV1Ok &&
                 (!test.displayTextAttempted || test.displayTextOk);
     if (!result.ok)
       result.error = test.error.empty() ? "jass bridge selftest failed"

@@ -60,6 +60,7 @@ public:
     uint32_t branchCount = 2u;
     uint32_t seed = 0u;
     double createdSec = 0.0;
+    bool enabled = true;
     bool additive = true;
     bool depthTest = true;
   };
@@ -73,6 +74,8 @@ public:
   bool move(int32_t id, const War3LightningPoint& start,
             const War3LightningPoint& end);
   bool destroy(int32_t id);
+  bool setEnabled(int32_t id, bool enabled);
+  bool isAlive(int32_t id) const;
   bool setColor(int32_t id,
                 float r0, float g0, float b0, float a0,
                 float r1, float g1, float b1, float a1);

@@ -12,12 +12,16 @@ struct JassCommandBridgeSelfTestResult {
   bool preloaderOk = false;
   bool intQueryOk = false;
   bool stringQueryOk = false;
+  bool publicV1Ok = false;
   bool displayTextAttempted = false;
   bool displayTextOk = false;
   int pingCode = 0;
+  int publicProtocolVersion = 0;
   uint32_t versionStringHandle = 0;
+  uint32_t publicVersionStringHandle = 0;
   uint32_t playerHandle = 0;
   std::string versionText;
+  std::string publicVersionText;
   std::string error;
 };
 

@@ -13,12 +13,20 @@ class WarVKVisualBridgeV1StaticTests(unittest.TestCase):
             encoding="utf-8")
         self.exports = (ROOT / "src/d3d9/d3d9.def").read_text(encoding="utf-8")
 
-    def test_canonical_v1_is_forwarded_before_old_payload_dispatch(self) -> None:
+    def test_canonical_v1_is_owned_before_legacy_payload_dispatch(self) -> None:
         decode = self.old_bridge.index("bool TryHandleCarrier")
-        pass_v1 = self.old_bridge.index("StartsWith(command, kWarVkV1Prefix)", decode)
-        old_dispatch = self.old_bridge.index("HandleWarVkPayload", pass_v1)
-        self.assertLess(pass_v1, old_dispatch)
-        self.assertIn('kWarVkV1Prefix = "warvk:v1;"', self.old_bridge)
+        public_v1 = self.old_bridge.index(
+            "IsVersionedPublicCommand(command)", decode
+        )
+        public_dispatch = self.old_bridge.index(
+            "dxvk::war3::japi::Dispatch(carrier, command)", public_v1
+        )
+        old_dispatch = self.old_bridge.index(
+            "HandleWarVkPayload", public_dispatch
+        )
+        self.assertLess(public_v1, public_dispatch)
+        self.assertLess(public_dispatch, old_dispatch)
+        self.assertNotIn("kWarVkV1Prefix", self.old_bridge)
 
     def test_bridge_is_versioned_narrow_c_abi(self) -> None:
         self.assertIn("kAbiVersion = 0x00010000u", self.visual_bridge)

@@ -531,6 +531,20 @@ bool War3LightningRuntime::destroy(int32_t id) {
   return true;
 }
 
+bool War3LightningRuntime::setEnabled(int32_t id, bool enabled) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  const auto it = m_records.find(id);
+  if (it == m_records.end())
+    return false;
+  it->second.enabled = enabled;
+  return true;
+}
+
+bool War3LightningRuntime::isAlive(int32_t id) const {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return m_records.find(id) != m_records.end();
+}
+
 bool War3LightningRuntime::setColor(int32_t id,
                                     float r0, float g0, float b0, float a0,
                                     float r1, float g1, float b1, float a1) {
@@ -606,7 +620,9 @@ bool War3LightningRuntime::setPulse(int32_t id,
 
 bool War3LightningRuntime::hasActive() const {
   std::lock_guard<std::mutex> lock(m_mutex);
-  return !m_records.empty();
+  return std::any_of(
+      m_records.begin(), m_records.end(),
+      [](const auto& entry) { return entry.second.enabled; });
 }
 
 bool War3LightningRuntime::executePreparedFrame() {
@@ -620,8 +636,10 @@ bool War3LightningRuntime::executePreparedFrame() {
       if (ResolveRecordLifeAlpha(it->second, nowSec) <= 0.0f &&
           it->second.lifetimeSec > 0.0f) {
         it = m_records.erase(it);
-      } else {
+      } else if (it->second.enabled) {
         records.push_back(it->second);
+        ++it;
+      } else {
         ++it;
       }
     }

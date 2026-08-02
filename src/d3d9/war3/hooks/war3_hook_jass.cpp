@@ -5,6 +5,7 @@
 #include "war3_jass_command_bridge.h"
 #include "war3_jass_native_plan_cache.h"
 #include "../../d3d9_war3_debug.h"
+#include "../japi/war3_japi_v1.h"
 
 #include "../core/war3_internal_test_config.h"
 #include "../tools/war3_perf_monitor.h"
@@ -345,6 +346,9 @@ static int __cdecl Hook_InitJassNatives() {
     result = g_trampolineInitJassNatives();
   }
 
+  // A rebuilt JASS VM starts a new map generation. Retire only objects owned
+  // by the public WarVK JAPI before publishing the new carrier table.
+  dxvk::war3::japi::Reset();
   ResetJassCommandBridgeInstallState();
   TryInstallJassCommandBridge("InitJassNatives");
 
