@@ -1,5 +1,41 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-02（CPU-MT 蒙皮 Phase 1 值合同，隔离提交、默认关闭）
+
+本阶段只保存 format-2 中型候选的 CPU-MT 所有权、输出证明、非阻塞路由与终态记账
+合同。实现和 runnable 没有进入 Meson/生产 owner；四个硬门
+`RuntimeIntegrated/NativeParityProven/ConsumeEnabled/ProductionDefault` 均为 false，
+不能宣称已有线程并行、原生替换或帧时收益。
+
+**已闭合的值语义**：
+
+- 候选冻结 owner/map/device/reset、Flush part/geoset/layer、immutable source/palette、
+  outer dispatch/upload 以及 Lock 后 destination 的 exact tuple；首轮资格仅限 Common、
+  opaque、format-2/FVF `0x112`、stride 32、193--448 vertices、最多 64 palette groups，
+  特殊 FVF、粒子、非有限输入、不安全/不一致 MXCSR 全部拒绝。
+- producer 只能发布 factory-created `shared_ptr<const OwnedOutput>`；proof 绑定 exact key、
+  byte size/storage identity/content hash、producer generation、result serial、MXCSR 和版本。
+  owner 的 kernel 窗口使用 atomic route authority + `try_lock`；锁竞争、未 Ready 或 MXCSR
+  不匹配立即选择 Native，不等待 worker，也不在竞争路径计算哈希或取得 shared_ptr。
+- Copy 路径在 state mutex 内执行唯一 byte-writer callback；Unlock/reset/cancel 不能越过写入
+  窗口。Copy/Native 的 body 结果与 exact Unlock 都出现后才终结；Unlock 失败、Unlock 先于
+  body、迟到 producer、重复终态和 stale generation 均 fail-closed。terminal ledger 验证
+  live + terminal = created，并分别闭合 Copy/Native selection。
+
+**验证与不能跨越的边界**：
+
+- 静态合同 7/7 PASS；严格 i686 `-O2 -Wall -Wextra -Werror -Wpedantic -Wshadow
+  -Wconversion` runnable 18/18 PASS，50/50 独立进程压力轮次通过，共覆盖 45,000 个
+  claim/publish/copy/unlock/reset/cancel/native 竞态序列。
+- `OwnedOutput::ExactKey` 当前包含 Lock 后才存在的 destination，因此还不是 Flush-early
+  worker 结果；下一阶段必须拆成 destination-free producer result + render-owner commit
+  envelope。Native CAS 到真实原生 body 之间尚无 body lease，并发 reset/cancel 仍可能先
+  终结，当前 decision 不能授权真实 native call。
+- `publishProducerReady` 返回 Applied 只表示 publication，被随后 Native 路由击败时不能算
+  consumption；frozen POD token 仍是 trusted-caller 证明，不是 producer 铸造的不可伪造
+  authority。还缺生产 owner/hook、worker freeze、SEH copy adapter、真实 Lock/Unlock 与资源
+  生命周期、原生 exactly-once、byte/MXCSR parity 和 ABBA 性能门；本阶段未部署、未启动游戏。
+
 ## 🚨 2026-08-02（Persistent Package P2 录制权限值合同，隔离提交、未接入）
 
 本阶段只定义 persistent package 从 P1 `UploadCompleted` 证明进入未来 Stage11/EmitCs
