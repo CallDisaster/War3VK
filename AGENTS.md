@@ -1,11 +1,11 @@
 # Agents.md - 项目进度与交接文档
 
-## 🚨 2026-08-02（点阴影持久 Prepare Worker 运行时候选，默认 Off、未部署）
+## 🚨 2026-08-02（点阴影持久 Prepare Worker 运行验证候选，默认 Off）
 
 本阶段把已验证的 owned-value point-shadow planner/worker 接入 production shadow pass，
 但发布默认仍为 `Off`：默认不分配 worker、不创建线程，并完整保留旧 `std::async` 路径。
 显式环境 `DXVK_WAR3_POINT_SHADOW_PERSISTENT_PREPARE_MODE=Observe/Consume` 才延迟创建
-持久 worker；尚无游戏运行证据，不能改默认值或宣称性能收益。
+持久 worker；受控游戏运行已证明候选路径可用，但尚不足以改默认值或宣称稳定性能收益。
 
 **同帧正确性与失败回退**：
 
@@ -24,17 +24,44 @@
 - worker/storage 的 shutdown/join 发生在 renderer/GPU 资源销毁之前；Accepted storage 在
   result 后回收复用，deadline/rejected fallback 不阻塞 render owner。
 
-**验证与交付边界**：
+**静态验证、部署与回退**：
 
 - 针对性静态合同 29/29 PASS；Win32 mailbox/planner runnable 2/2 PASS；全量
   `test_*_static.py` 335/335 PASS。production build 与 `ninja -C build32 -n` 均 no-work；
   targeted `git diff --check` 仅既有 LF -> CRLF 提示。
-- 未部署 `build32/src/d3d9/d3d9.dll`：32,842,865 bytes，SHA-256
-  `D99643796218CE2E60345AE739558CE583694CF74F72A3D0C6C2519BB8C1C015`。部署目录仍为
-  32,649,789-byte `9BF5E3D9...` 物理验收基线；本阶段未启动游戏。
-- 后续只能先部署带回退副本的 Observe 候选，跑点光图/高压图并证明 mismatch=0、
-  deviceLost/Arena violation/final-caster 缺口均为 0，再单独测试 Consume；未达这些门时
-  必须保持 Off，不能删除旧同步/`std::async` 回退。
+- 部署前保存 `E:\\Work\\War3\\d3d9.dll.bak_20260802_9BF5_pre_point_persistent_observe`，
+  SHA-256 `9BF5E3D9591602990A85F482639D9D1FD6EC4A5E98EE6DC3D239DFE09BF68DD9`。
+  当前 `build32` 与部署 DLL exact：32,842,865 bytes，SHA-256
+  `D99643796218CE2E60345AE739558CE583694CF74F72A3D0C6C2519BB8C1C015`。
+
+**受控运行证据**：
+
+- 点光图 Off/Observe/Consume 三轮均无 crash/device lost；短门 PointShadow 分别约
+  `0.785/0.180`、`0.756/0.176`、`0.674/0.196 ms` CPU/GPU。隔离桌面、记录开关和采样窗口
+  不同，所以这些数值只证明没有明显退化，不能作为正式 ABBA 收益结论。
+- 显式 Observe + render log 的连续诊断在 exact=1200 时为
+  `accepted=1200 / workerReady=1200 / mismatch=0 / deadlineFallback=0 /
+  rejectedFallback=0 / workerFailed=0 / busy=0`。显式 Consume 报告持续有 PointShadow，且
+  没有 canonical `PointShadow/PrepareCpu` section，证明实测帧采用了持久 proposal。
+- `point_persistent_consume_trace_160_20260802.json` 完成 160/160 exact shadow-frame capture，
+  在线巨型暗块触发为 0；report 1006 个 shadow frame 中
+  `framesIncomplete=0 / budgetExceeded=0 / ArenaOverflow=0 / deviceLost=0`，无 incident JSON，
+  运行窗口后 Windows 也没有新增 `nvlddmkm`/Display 153/4101 事件。低磁盘滚动采集器
+  `errors=0`，证据总量约 440 MiB，严格低于 512 MiB 上限。
+- 因滚动上限只保留最后 32 张截图与最后 3 个 trace 段，不能把本轮描述成完整 160 帧
+  final-caster 原始证据。保留部分覆盖 153 个 trace frame、24,786 条 final-caster record、
+  20 个 exact screenshot join；representation/alpha transition、mixed representation、alpha
+  payload gap、blocker/marker leak、unexplained disappearance、validation reject 与 parse error
+  全为 0。最后 32 帧时域分析最大暗块 96 px，contact sheet 目检只有正常动画/光照变化。
+
+**仍未跨越的发布边界**：
+
+- persistent begin 当前仍位于 CSM `receiverNeedsShadowMap` 条件内；纯点光且太阳/CSM 不需要
+  shadow map 的帧会安全回退 canonical，但不会获得持久 worker 优化。下一补丁必须把准入
+  提到 CSM-only 条件之外，并补 point-only 静态/运行门和结构化 diagnostics。
+- 还缺高压单位图、纯点光图、大地图长门和用户物理屏验收；默认必须保持 Off，旧同步/
+  `std::async` 回退不能删除。低磁盘 runner 还应保存逐段聚合摘要，才能在不突破 512 MiB
+  的前提下形成全 160 帧 final-caster 覆盖。
 
 ## 🚨 2026-08-02（CPU-MT 蒙皮 Phase 1 值合同，隔离提交、默认关闭）
 
