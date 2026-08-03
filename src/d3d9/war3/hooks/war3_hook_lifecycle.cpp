@@ -70,6 +70,18 @@ static bool ShouldBlockGamePauseForAutoTest() {
   return s_runtimeEnabled;
 }
 
+// 1.27a IDA 证据：Storm 的窗口过程在 WM_ACTIVATEAPP 失焦时将 active=0，
+// Storm_EventLoop_PeekMessage 随后唯一调用 Game.dll+0x1552E0 取得 idle
+// Sleep 毫秒数。这里只关闭该精确后台分支，不 Hook 全局 Sleep，也不改变
+// SetThreadPriority/SetPriorityClass 或地图的 PauseGame 语义。
+static bool ShouldDisableBackgroundIdleSleepForAutoTest() {
+  if constexpr (dxvk::war3::internal::kAutoTestDisableBackgroundIdleSleep)
+    return true;
+  static const bool s_runtimeEnabled =
+      EnvFlagEnabled("DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE");
+  return s_runtimeEnabled;
+}
+
 bool SetInternalTestGamePauseBypassForCurrentThread(bool enabled) {
   const bool previous = s_internalTestGamePauseBypass;
   s_internalTestGamePauseBypass = enabled;
@@ -100,6 +112,7 @@ using EngineFinalizeWorkerFn = int(__fastcall *)(int, int);
 using EngineComputeWakeDeltaFn = int(__fastcall *)(int, int);
 using EngineSleepGateFn = void(__thiscall *)(uint32_t *, DWORD);
 using EngineSleepGateInnerFn = void(__thiscall *)(uint32_t *, DWORD);
+using BackgroundIdleSleepMsFn = DWORD(__cdecl *)();
 using GamePauseFn =
     void(__fastcall *)(void *, void *, BOOL, uint32_t, uint32_t, uint32_t,
                        uint32_t);
@@ -190,6 +203,10 @@ static EngineSleepGateFn g_trampolineEngineSleepGate = nullptr;
 
 static EngineSleepGateInnerFn g_originalEngineSleepGateInner = nullptr;
 static EngineSleepGateInnerFn g_trampolineEngineSleepGateInner = nullptr;
+
+static BackgroundIdleSleepMsFn g_originalBackgroundIdleSleepMs = nullptr;
+static BackgroundIdleSleepMsFn g_trampolineBackgroundIdleSleepMs = nullptr;
+static std::atomic<bool> g_backgroundIdleSleepBypassLogged = false;
 
 static GamePauseFn g_originalGamePause = nullptr;
 static GamePauseFn g_trampolineGamePause = nullptr;
@@ -2683,6 +2700,26 @@ void __fastcall Hook_GamePause(void *gameUi, void *edx, BOOL isPause,
   }
 }
 
+DWORD __cdecl Hook_BackgroundIdleSleepMs() {
+  const auto targetFn = g_trampolineBackgroundIdleSleepMs
+                            ? g_trampolineBackgroundIdleSleepMs
+                            : g_originalBackgroundIdleSleepMs;
+  if (!targetFn)
+    return 0u;
+
+  const DWORD nativeSleepMs = targetFn();
+  if (nativeSleepMs == 0u || !ShouldDisableBackgroundIdleSleepForAutoTest())
+    return nativeSleepMs;
+
+  if (!g_backgroundIdleSleepBypassLogged.exchange(true,
+                                                  std::memory_order_relaxed)) {
+    Logger::info(
+        "DXVK War3Hook[Lifecycle]: bypassed WM_ACTIVATEAPP background idle "
+        "sleep for AutoTest");
+  }
+  return 0u;
+}
+
 int __cdecl Hook_FlushAndReset() {
   // 帧尾主入口：
   // 1) 可选跳过空队列 flush；
@@ -2789,6 +2826,7 @@ void War3HookLifecycle::Install(uintptr_t gameBase) {
   LPVOID engineSleepGateAddr = resolveCode(book.engineSleepGate);
   LPVOID engineSleepGateInnerAddr = resolveCode(book.engineSleepGateInner);
   LPVOID gamePauseAddr = resolveCode(book.gamePause);
+  LPVOID backgroundIdleSleepMsAddr = resolveCode(book.backgroundIdleSleepMs);
   LPVOID flushResetAddr = resolveCode(book.flushAndReset);
   // GetD3d9Parameters is hooked via direct memory patch elsewhere typically,
   // but MinHooking it is safer
@@ -2834,6 +2872,8 @@ void War3HookLifecycle::Install(uintptr_t gameBase) {
   g_originalEngineSleepGateInner =
       reinterpret_cast<EngineSleepGateInnerFn>(engineSleepGateInnerAddr);
   g_originalGamePause = reinterpret_cast<GamePauseFn>(gamePauseAddr);
+  g_originalBackgroundIdleSleepMs =
+      reinterpret_cast<BackgroundIdleSleepMsFn>(backgroundIdleSleepMsAddr);
   g_originalFlushAndReset = reinterpret_cast<FlushAndResetFn>(flushResetAddr);
   g_windowMessageTargetLookup =
       reinterpret_cast<WindowMessageTargetLookupFn>(windowMessageTargetLookupAddr);
@@ -2946,6 +2986,10 @@ void War3HookLifecycle::Install(uintptr_t gameBase) {
                        &g_trampolineEngineComputeWakeDelta),
                    "Lifecycle", "EngineComputeWakeDelta", false, false);
   }
+  InstallMinHook(backgroundIdleSleepMsAddr,
+                 reinterpret_cast<LPVOID>(&Hook_BackgroundIdleSleepMs),
+                 reinterpret_cast<LPVOID *>(&g_trampolineBackgroundIdleSleepMs),
+                 "Lifecycle", "BackgroundIdleSleepMs", false, false);
   InstallMinHook(gamePauseAddr, reinterpret_cast<LPVOID>(&Hook_GamePause),
                  reinterpret_cast<LPVOID *>(&g_trampolineGamePause),
                  "Lifecycle", "GamePause", false, false);

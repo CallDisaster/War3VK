@@ -62,6 +62,8 @@ DEFAULT_TEST_MAP_REL = Path(r"Maps\Test\WorldEditTestMap.w3x")
 DEFAULT_BENCHMARK_WIDTH = 2560
 DEFAULT_BENCHMARK_HEIGHT = 1440
 DEFAULT_BENCHMARK_REFRESH = 59
+AUTOTEST_BACKGROUND_THROTTLE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE"
+AUTOTEST_GAME_PAUSE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE"
 WAR3_VIDEO_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III\Video"
 WAR3_INSTALL_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III"
 YDWE_LAUNCHER_MODE_DIRECT = "direct"
@@ -1128,6 +1130,10 @@ LOG_KEYWORD_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
     ("runtimeReady", re.compile(r"(?:JASS|War3) runtime fully initialized", re.IGNORECASE)),
     ("stage19", re.compile(r"War3StageSig: stage=19", re.IGNORECASE)),
     ("pauseBlocked", re.compile(r"blocked GamePause request", re.IGNORECASE)),
+    (
+        "backgroundIdleSleepBypassed",
+        re.compile(r"bypassed WM_ACTIVATEAPP background idle sleep", re.IGNORECASE),
+    ),
     ("internalTestApi", re.compile(r"DXVK War3TestApi:", re.IGNORECASE)),
 ]
 
@@ -5281,6 +5287,11 @@ def _launch_war3_instance_impl(
             session.desktop_handle = 0
         _mark_session_failed(session, f"env_overrides_json 解析失败: {parse_error}")
         return {"ok": False, "error": f"env_overrides_json 解析失败: {parse_error}", "sessionId": session_key}
+    # AutoTest 默认禁用已由 IDA 证实的 WM_ACTIVATEAPP 后台 idle Sleep。
+    # env_overrides_json 传入 0/false/no 时保留原生节流，作为显式 A/B 对照。
+    extra_env.setdefault(AUTOTEST_BACKGROUND_THROTTLE_ENV, "1")
+    # 旧的 GamePause 防护改为 AutoTest 子进程专用，避免普通游戏被编译期开关影响。
+    extra_env.setdefault(AUTOTEST_GAME_PAUSE_ENV, "1")
     env.update(extra_env)
 
     _start_debug_monitor(None)
@@ -6273,6 +6284,10 @@ def launch_war3_test(
     parse_error = extra_env.pop("__parse_error__", "")
     if parse_error:
         return {"ok": False, "error": f"env_overrides_json 解析失败: {parse_error}"}
+    # 与隔离实例入口保持同一默认：每次 AutoTest 都使用准确的后台 cadence，
+    # 但调用者仍可通过 env_overrides_json 明确恢复原生后台节流。
+    extra_env.setdefault(AUTOTEST_BACKGROUND_THROTTLE_ENV, "1")
+    extra_env.setdefault(AUTOTEST_GAME_PAUSE_ENV, "1")
     # 高频 SpriteFrame/runtime-matrix pose hooks are no longer the default
     # semantic palette producer. The production path samples Blizzard's
     # already-evaluated CModel palette from the visible contract; tests that

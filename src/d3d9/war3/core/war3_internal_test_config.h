@@ -299,8 +299,12 @@ inline constexpr uint32_t kNativeMainLoopStatsIntervalPumpCalls = 2000;
 inline constexpr bool kNativeMainLoopDeepPhaseHookEnabled =
     kNativeMainLoopCoverageAnalysisMode || false;
 
-// 诊断期阻止 War3 在切出窗口时自动暂停，避免 shadow/pose cadence 日志被前台切换污染。
-inline constexpr bool kAutoTestDisableGamePause = true;
+// 默认不改写地图/原生 PauseGame；旧诊断行为只能通过显式环境变量开启。
+inline constexpr bool kAutoTestDisableGamePause = false;
+
+// 默认不改变正式游戏在失焦时的空闲节流。AutoTest 仅通过进程级、一次性
+// DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE=1 显式启用该行为。
+inline constexpr bool kAutoTestDisableBackgroundIdleSleep = false;
 
 // 调试：忽略 CullTable 可见性（仅用于定位“漏渲染”原因）
 inline constexpr bool kNativeRenderBypassCull = false;

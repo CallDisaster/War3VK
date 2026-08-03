@@ -65,6 +65,8 @@ struct War3HookAddressBook {
   uintptr_t engineSleepGate = 0;
   uintptr_t engineSleepGateInner = 0;
   uintptr_t gamePause = 0;
+  // Storm_EventLoop 在 WM_ACTIVATEAPP=后台时读取的空闲 Sleep 毫秒来源。
+  uintptr_t backgroundIdleSleepMs = 0;
   uintptr_t getD3d9Parameters = 0;
   uintptr_t windowMessageTargetLookup = 0;
   uintptr_t windowSizeLParamState = 0;

@@ -53,6 +53,7 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x1648A0, // engineSleepGate
       0x164B00, // engineSleepGateInner
       0x354240, // gamePause
+      0x1552E0, // backgroundIdleSleepMs（WM_ACTIVATEAPP=后台的 Storm 空闲节流）
       0x0EC6B0, // getD3d9Parameters
       0x151F90, // windowMessageTargetLookup
       0xBDAA1C, // windowSizeLParamState

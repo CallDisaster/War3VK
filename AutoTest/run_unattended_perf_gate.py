@@ -23,12 +23,31 @@ from typing import Any, Dict
 import war3_autotest_mcp as war3
 
 
-BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 PROCESS_SET_INFORMATION = 0x0200
 
+# 性能门默认保持与 war3_autotest_mcp 启动器一致的 High。后台/隔离桌面
+# 视觉正确性任务若确有需要，必须显式选择 below-normal；不能再静默把性能
+# 样本降到 BELOW_NORMAL。
+PROCESS_PRIORITY_CLASSES = {
+    "high": (0x00000080, "HIGH"),
+    "normal": (0x00000020, "NORMAL"),
+    "below-normal": (0x00004000, "BELOW_NORMAL"),
+}
 
-def _lower_owned_process_priority() -> Dict[str, Any]:
-    """Lower only the exact process identified by STATE's retained witness."""
+
+def _set_owned_process_priority(priority_name: str) -> Dict[str, Any]:
+    """Set one retained AutoTest process to an explicit, verified priority class."""
+    normalized = str(priority_name or "").strip().lower()
+    target = PROCESS_PRIORITY_CLASSES.get(normalized)
+    if target is None:
+        return {
+            "ok": False,
+            "retry": False,
+            "error": f"unsupported process priority: {priority_name!r}",
+            "supported": sorted(PROCESS_PRIORITY_CLASSES),
+        }
+    target_class, target_name = target
+
     pid = int(war3.STATE.war3_pid or 0)
     witness = war3.STATE.retained_native_process
     if pid <= 0 or witness is None:
@@ -76,22 +95,28 @@ def _lower_owned_process_priority() -> Dict[str, Any]:
         changed = bool(
             kernel32.SetPriorityClass(
                 wintypes.HANDLE(handle_value),
-                BELOW_NORMAL_PRIORITY_CLASS,
+                target_class,
             )
         )
         observed = int(
             kernel32.GetPriorityClass(wintypes.HANDLE(handle_value)) or 0
         )
         return {
-            "ok": changed and observed == BELOW_NORMAL_PRIORITY_CLASS,
+            "ok": changed and observed == target_class,
             "retry": False,
             "pid": pid,
-            "priority": "BELOW_NORMAL",
+            "priority": target_name,
+            "requested": normalized,
             "observedClass": observed,
             "win32Error": 0 if changed else int(ctypes.get_last_error()),
         }
     finally:
         kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+
+
+def _lower_owned_process_priority() -> Dict[str, Any]:
+    """兼容旧的视觉探针；性能门不得默认调用此包装。"""
+    return _set_owned_process_priority("below-normal")
 
 
 def _cleanup_owned_process() -> Dict[str, Any]:
@@ -129,6 +154,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--perf-level", type=int, default=1)
     parser.add_argument("--profile", default="full_default")
     parser.add_argument("--scenario", default="night_unattended_gate")
+    parser.add_argument(
+        "--process-priority",
+        choices=tuple(PROCESS_PRIORITY_CLASSES),
+        default="high",
+        help=(
+            "Priority class for the owned War3 process. Performance gates default "
+            "to high; below-normal is only for explicit background correctness runs."
+        ),
+    )
+    parser.add_argument(
+        "--background-idle-sleep",
+        choices=("disabled", "native"),
+        default="disabled",
+        help=(
+            "Whether the verified WM_ACTIVATEAPP background idle Sleep stays "
+            "disabled for AutoTest or uses native game behavior for an A/B run."
+        ),
+    )
     parser.add_argument("--desktop", default="")
     parser.add_argument("--no-hot-shadow", action="store_true")
     parser.add_argument("--extra-env-json", default="{}")
@@ -147,6 +190,11 @@ def main() -> int:
         raise SystemExit(f"invalid --extra-env-json: {exc}") from exc
 
     extra_env.setdefault("DXVK_WAR3_PERF_LEVEL", str(max(0, args.perf_level)))
+    # 由 Game.dll+0x1552E0 的精确 Hook 消除 WM_ACTIVATEAPP 的空闲 Sleep。
+    # CLI 明确优先于 extra-env-json，确保报告中的性能策略可复现。
+    extra_env["DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE"] = (
+        "1" if args.background_idle_sleep == "disabled" else "0"
+    )
     desktop = args.desktop or f"War3CodexNight_{int(time.time())}"
     output = (
         Path(args.output)
@@ -200,7 +248,7 @@ def main() -> int:
     try:
         priority_deadline = time.time() + max(60, args.ready_timeout_sec)
         while worker.is_alive() and time.time() < priority_deadline:
-            attempt = _lower_owned_process_priority()
+            attempt = _set_owned_process_priority(args.process_priority)
             if attempt.get("ok"):
                 priority_box = attempt
                 break
@@ -228,6 +276,13 @@ def main() -> int:
         "elapsedSec": round(time.time() - started_at, 3),
         "desktop": desktop,
         "priorityOverride": priority_box,
+        "backgroundThrottle": {
+            "environmentVariable": "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE",
+            "mode": args.background_idle_sleep,
+            "value": extra_env.get(
+                "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE", ""
+            ),
+        },
         "cleanup": cleanup,
         **result_box,
     }

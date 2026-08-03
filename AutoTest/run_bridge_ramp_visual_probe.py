@@ -223,6 +223,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-sec", type=int, default=50)
     parser.add_argument("--ready-timeout-sec", type=int, default=180)
     parser.add_argument(
+        "--process-priority",
+        choices=tuple(gate.PROCESS_PRIORITY_CLASSES),
+        default="below-normal",
+        help=(
+            "Priority for the owned visual-probe process. This diagnostic keeps "
+            "the historical below-normal default; use high for performance work."
+        ),
+    )
+    parser.add_argument(
+        "--background-idle-sleep",
+        choices=("disabled", "native"),
+        default="disabled",
+        help=(
+            "Disable the verified WM_ACTIVATEAPP idle Sleep by default; choose "
+            "native only for an explicit background-throttle comparison."
+        ),
+    )
+    parser.add_argument(
         "--wait-for-shadow-trace-sec",
         type=float,
         default=0.0,
@@ -570,6 +588,9 @@ def main() -> int:
         "DXVK_WAR3_CSM_CONTINUITY_TRACE": "1",
     }
     env.update({str(key): str(value) for key, value in extra_env.items()})
+    env["DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE"] = (
+        "1" if args.background_idle_sleep == "disabled" else "0"
+    )
     if trace_ring_enabled:
         # Manual bounded segments own tracing in this mode. Prevent a launch-
         # time unlimited trace from racing the ring controller and set the
@@ -986,7 +1007,7 @@ def main() -> int:
         deadline = time.time() + max(60, args.ready_timeout_sec)
         if owns_process:
             while worker.is_alive() and time.time() < deadline:
-                attempt = gate._lower_owned_process_priority()
+                attempt = gate._set_owned_process_priority(args.process_priority)
                 if attempt.get("ok"):
                     priority = attempt
                     break
