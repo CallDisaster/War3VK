@@ -64,6 +64,13 @@ struct War3CpuReadableSpanDiagnostics {
   uint64_t lastIdentityGeneration = 0u;
   uint64_t lastAllocationGeneration = 0u;
   uint64_t lastContentGeneration = 0u;
+  uint64_t exactIndexDomainScannedBytes = 0u;
+  uint64_t exactIndexDomainNonHostCachedScanCount = 0u;
+  uint64_t exactIndexDomainNonHostCachedScannedBytes = 0u;
+  uint64_t exactIndexDomainBulkReadCount = 0u;
+  uint64_t exactIndexDomainBulkReadBytes = 0u;
+  uint64_t exactIndexDomainDirectReadCount = 0u;
+  uint64_t exactIndexDomainOversizeFallbackCount = 0u;
 };
 
 // Exact index-domain proof used to compact a current-frame shadow freeze.
@@ -79,6 +86,19 @@ struct War3ExactIndexVertexDomain {
   bool valid = false;
 };
 
+// Input for a bounded exact-domain scan. Non-HOST_CACHED source ranges can be
+// copied once into thread-local cached storage before the scalar min/max walk.
+// No source bytes or derived result survive this call.
+struct War3ExactIndexDomainScanInput {
+  War3CpuReadableBufferSpan indices = {};
+  uint32_t indexElementBytes = 0u;
+  uint32_t indexCount = 0u;
+  int32_t baseVertex = 0;
+  uint32_t vertexCapacity = 0u;
+  bool sourceHostCached = false;
+  bool bulkReadEnabled = true;
+};
+
 War3CpuReadableBufferSpan BuildWar3CpuReadableBufferSpan(
     const War3CpuReadableBufferSpanInput& input) noexcept;
 War3CpuReadableSpanDiagnostics QueryWar3CpuReadableSpanDiagnostics() noexcept;
@@ -87,5 +107,8 @@ War3ExactIndexVertexDomain ComputeWar3ExactIndexVertexDomain(
     const War3CpuReadableBufferSpan& indices, uint32_t indexElementBytes,
     uint32_t indexCount, int32_t baseVertex,
     uint32_t vertexCapacity) noexcept;
+
+War3ExactIndexVertexDomain ComputeWar3ExactIndexVertexDomainPrepared(
+    const War3ExactIndexDomainScanInput& input) noexcept;
 
 }  // namespace dxvk::war3::memory

@@ -25,6 +25,77 @@ std::atomic<uint64_t> g_lastIdentityGeneration{0u};
 std::atomic<uint64_t> g_lastAllocationGeneration{0u};
 std::atomic<uint64_t> g_lastContentGeneration{0u};
 
+std::atomic<uint64_t> g_exactIndexDomainScannedBytes{0u};
+std::atomic<uint64_t> g_exactIndexDomainNonHostCachedScanCount{0u};
+std::atomic<uint64_t> g_exactIndexDomainNonHostCachedScannedBytes{0u};
+std::atomic<uint64_t> g_exactIndexDomainBulkReadCount{0u};
+std::atomic<uint64_t> g_exactIndexDomainBulkReadBytes{0u};
+std::atomic<uint64_t> g_exactIndexDomainDirectReadCount{0u};
+std::atomic<uint64_t> g_exactIndexDomainOversizeFallbackCount{0u};
+
+constexpr size_t kExactIndexDomainBulkReadCapacity = 64u * 1024u;
+alignas(64) thread_local std::array<uint8_t,
+                                    kExactIndexDomainBulkReadCapacity>
+    t_exactIndexDomainBulkRead = {};
+
+void RecordExactIndexDomainScan(
+    const War3ExactIndexDomainScanInput& input) noexcept {
+  const uint64_t requiredBytes =
+      uint64_t(input.indexElementBytes) * uint64_t(input.indexCount);
+  g_exactIndexDomainScannedBytes.fetch_add(requiredBytes,
+                                           std::memory_order_relaxed);
+  if (!input.sourceHostCached) {
+    g_exactIndexDomainNonHostCachedScanCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_exactIndexDomainNonHostCachedScannedBytes.fetch_add(
+        requiredBytes, std::memory_order_relaxed);
+  }
+}
+
+War3ExactIndexVertexDomain ComputeExactIndexDomainPreparedImpl(
+    const War3ExactIndexDomainScanInput& input) noexcept {
+  if (!input.indices ||
+      (input.indexElementBytes != 2u && input.indexElementBytes != 4u) ||
+      input.indexCount == 0u || input.vertexCapacity == 0u)
+    return {};
+  const uint64_t requiredBytes =
+      uint64_t(input.indexElementBytes) * uint64_t(input.indexCount);
+  if (requiredBytes > input.indices.length)
+    return {};
+
+  RecordExactIndexDomainScan(input);
+  if (input.bulkReadEnabled && !input.sourceHostCached &&
+      requiredBytes <= kExactIndexDomainBulkReadCapacity) {
+    // Warcraft's WRITEONLY IB mappings are commonly write-combined.  Scalar
+    // 16-bit loads from those pages are disproportionately expensive.  One
+    // bounded sequential copy turns the subsequent min/max walk into cached
+    // reads while preserving the exact validated source generation.
+    std::memcpy(t_exactIndexDomainBulkRead.data(), input.indices.data,
+                size_t(requiredBytes));
+    auto staged = input.indices;
+    staged.data = t_exactIndexDomainBulkRead.data();
+    staged.length = requiredBytes;
+    g_exactIndexDomainBulkReadCount.fetch_add(1u,
+                                              std::memory_order_relaxed);
+    g_exactIndexDomainBulkReadBytes.fetch_add(requiredBytes,
+                                              std::memory_order_relaxed);
+    return ComputeWar3ExactIndexVertexDomain(
+        staged, input.indexElementBytes, input.indexCount,
+        input.baseVertex, input.vertexCapacity);
+  }
+
+  if (input.bulkReadEnabled && !input.sourceHostCached &&
+      requiredBytes > kExactIndexDomainBulkReadCapacity) {
+    g_exactIndexDomainOversizeFallbackCount.fetch_add(
+        1u, std::memory_order_relaxed);
+  }
+  g_exactIndexDomainDirectReadCount.fetch_add(1u,
+                                              std::memory_order_relaxed);
+  return ComputeWar3ExactIndexVertexDomain(
+      input.indices, input.indexElementBytes, input.indexCount,
+      input.baseVertex, input.vertexCapacity);
+}
+
 War3CpuReadableBufferSpan Reject(
     const War3CpuReadableBufferSpanInput& input,
     War3CpuReadableSpanRejectReason reason) noexcept {
@@ -133,6 +204,23 @@ War3CpuReadableSpanDiagnostics QueryWar3CpuReadableSpanDiagnostics() noexcept {
       g_lastAllocationGeneration.load(std::memory_order_acquire);
   result.lastContentGeneration =
       g_lastContentGeneration.load(std::memory_order_acquire);
+  result.exactIndexDomainScannedBytes =
+      g_exactIndexDomainScannedBytes.load(std::memory_order_acquire);
+  result.exactIndexDomainNonHostCachedScanCount =
+      g_exactIndexDomainNonHostCachedScanCount.load(
+          std::memory_order_acquire);
+  result.exactIndexDomainNonHostCachedScannedBytes =
+      g_exactIndexDomainNonHostCachedScannedBytes.load(
+          std::memory_order_acquire);
+  result.exactIndexDomainBulkReadCount =
+      g_exactIndexDomainBulkReadCount.load(std::memory_order_acquire);
+  result.exactIndexDomainBulkReadBytes =
+      g_exactIndexDomainBulkReadBytes.load(std::memory_order_acquire);
+  result.exactIndexDomainDirectReadCount =
+      g_exactIndexDomainDirectReadCount.load(std::memory_order_acquire);
+  result.exactIndexDomainOversizeFallbackCount =
+      g_exactIndexDomainOversizeFallbackCount.load(
+          std::memory_order_acquire);
   return result;
 }
 
@@ -184,6 +272,11 @@ War3ExactIndexVertexDomain ComputeWar3ExactIndexVertexDomain(
   result.maxIndex = maxIndex;
   result.valid = result.vertexCount != 0u;
   return result;
+}
+
+War3ExactIndexVertexDomain ComputeWar3ExactIndexVertexDomainPrepared(
+    const War3ExactIndexDomainScanInput& input) noexcept {
+  return ComputeExactIndexDomainPreparedImpl(input);
 }
 
 }  // namespace dxvk::war3::memory

@@ -57,6 +57,13 @@ struct GpuFlightFrame {
   uint64_t arenaExactIndexTrimAcceptedCount = 0u;
   uint64_t arenaExactIndexTrimRejectedCount = 0u;
   uint64_t arenaExactIndexTrimBytesSaved = 0u;
+  uint64_t exactIndexDomainScannedBytes = 0u;
+  uint64_t exactIndexDomainNonHostCachedScanCount = 0u;
+  uint64_t exactIndexDomainNonHostCachedScannedBytes = 0u;
+  uint64_t exactIndexDomainBulkReadCount = 0u;
+  uint64_t exactIndexDomainBulkReadBytes = 0u;
+  uint64_t exactIndexDomainDirectReadCount = 0u;
+  uint64_t exactIndexDomainOversizeFallbackCount = 0u;
   uint32_t arenaFrameIncomplete = 0u;
   uint64_t queueSubmittedSerial = 0u;
   uint64_t queueCompletedSerial = 0u;
@@ -654,6 +661,13 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t shadowCpuSpanLastSourceIdentityGeneration = 0;
   uint64_t shadowCpuSpanLastAllocationGeneration = 0;
   uint64_t shadowCpuSpanLastContentGeneration = 0;
+  uint64_t shadowExactIndexDomainScannedBytes = 0;
+  uint64_t shadowExactIndexDomainNonHostCachedScanCount = 0;
+  uint64_t shadowExactIndexDomainNonHostCachedScannedBytes = 0;
+  uint64_t shadowExactIndexDomainBulkReadCount = 0;
+  uint64_t shadowExactIndexDomainBulkReadBytes = 0;
+  uint64_t shadowExactIndexDomainDirectReadCount = 0;
+  uint64_t shadowExactIndexDomainOversizeFallbackCount = 0;
   uint64_t queueSubmittedSerial = 0;
   uint64_t queueCompletedSerial = 0;
   int64_t queueLastResult = 0;

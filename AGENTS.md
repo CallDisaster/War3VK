@@ -1,5 +1,60 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-03（精确索引域 WC bulk-read：性能回归修复候选）
+
+用户阶段验收发现当前默认光影图从历史约 100 FPS 降至 76 FPS，高压/“生与死”场景
+还会在低视角压力下出现阴影消失与 `VK_ERROR_DEVICE_LOST`。本轮没有继续推进 Package
+Consume、联合剔除或混合蒙皮，而是先定位并修复 Arena 崩溃补丁引入的确定 CPU 热点。
+
+**根因与最终实现**：
+
+- exact-index trim 为避免 512 KiB terrain VB 整域冻结，会扫描当前 draw 的真实 IB 得到
+  最小顶点域。Warcraft 的 WRITEONLY IB 映射通常是 HOST_VISIBLE、非 HOST_CACHED 的
+  write-combined 内存；旧实现对每个 16/32-bit index 做一次标量读取，高压图因此把
+  `ShadowCapture/PostGate` 推高到约 5--7 ms。
+- 曾验证 generation-qualified 结果缓存，但同 DLL 运行仅 2,038 hit / 71,304 miss，命中率
+  约 2.8%，不足以抵消哈希与比较成本；该实验实现已完整删除，不留默认或跨帧 cache。
+- 最终路径只对已经通过 allocation range、owner identity 和三类 generation 验证的当前
+  exact IB range 工作：非 HOST_CACHED 且不超过 64 KiB 时，一次顺序 `memcpy` 到 64-byte
+  对齐的 thread-local cached scratch，再执行原始 min/max/越界验证。scratch 与结果均不
+  跨调用存活；超过 64 KiB 或关闭 ABBA 开关时回退原标量路径。
+- 发布默认开启；同 DLL 对照开关为
+  `DXVK_WAR3_EXACT_INDEX_DOMAIN_BULK_READ=0/1`。该路径不修改 caster、draw range、
+  Arena transaction、freeze catalog、CSM、shader 或 GPU 资源所有权。
+
+**后台全速 ABBA 与运行证据**：
+
+- 所有运行使用已验证的 Game.dll 后台 idle-sleep 精确 Hook：
+  `--background-idle-sleep disabled --process-priority high`；没有依靠全局 Sleep Hook 或
+  BELOW_NORMAL 样本。隔离桌面 FPS 只作同机 ABBA，不作为物理前台发布帧率承诺。
+- 高压图 35 秒同 DLL ABBA：bulk Off 为 51.57 FPS、main 15.19 ms、ShadowCapture
+  6.52 ms、PostGate 5.79 ms；bulk On 为 68.21 FPS、main 10.53 ms、ShadowCapture
+  1.75 ms、PostGate 1.03 ms。GPU 4.92→4.77 ms，说明收益来自 CPU WC 读取消除。
+- 清理实验 cache 后的最终普通图：3,482 帧，95.61 FPS、main 5.07 ms、ShadowCapture
+  0.964 ms、PostGate 0.607 ms、GPU 5.65 ms；Arena 平均/峰值 2.46/4.12 MiB。
+- 最终高压 90 秒门：5,771 帧，63.47 FPS、main 11.54 ms、ShadowCapture 2.01 ms、
+  PostGate 1.27 ms、GPU 4.81 ms；Arena 平均/峰值 3.48/5.57 MiB。累计 419,084 次
+  non-HOST_CACHED scan、105,369,462 bytes 全部由 bounded bulk 覆盖，direct/oversize
+  fallback 均为 0；trim accepted 419,084、rejected 0。
+- 最终门的 Arena overflow/busy/admission/partial、frame incomplete、budget exceeded、
+  queue error、device lost 与新增 NVIDIA/Display 事件全部为 0；queue submitted/completed
+  仅差正常在途一帧。最终截图为
+  `AutoTest/artifacts/screenshots/war3_20260803_174611.png`，253 caster / 1012 cascade draw，
+  目检未见阴影缺口、路径阻断器泄漏或巨型阴影块。
+
+**静态、构建与交付**：
+
+- 429 项 `test_*_static.py` 全部 PASS；12/12 Win32 Meson runnable PASS；Win32 build
+  PASS，`ninja -C build32 -n` no-work，targeted diff-check 仅既有换行提示。
+- build32 与部署 `E:\\Work\\War3\\d3d9.dll` exact：33,454,248 bytes，SHA-256
+  `6C07BCE0B1F4F8C4903DE9C004E64351ED43D98691C3EB65C06BF01A85A3B8D7`；明确回退为
+  `E:\\Work\\War3\\d3d9.dll.bak_20260803_9A7D_pre_exact_domain_cache_abba`，SHA-256
+  `9A7D96C8EB45E84F7EFB8D922F9FB5D8224350DBAD3DD1A8E9806175F2CE28F5`。
+
+**验收边界**：自动高压图证明了热点收益与 90 秒稳定性，但不能代替用户在“生与死”
+原位置压低视角的最终物理验收。Persistent Package 仍默认 Off/Observe-only；本轮没有
+启用任何跨帧 VB/IB cache、source fingerprint reuse、fast append 或 prebuild bypass。
+
 ## 🚨 2026-08-03（阶段验收候选：bounded CurrentDraw Package Observe 闭合）
 
 本轮在 `ef012ba` 的 current-draw equivalence 地基上收口一个可供用户阶段验收的

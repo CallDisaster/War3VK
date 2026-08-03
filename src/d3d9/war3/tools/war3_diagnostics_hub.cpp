@@ -355,6 +355,20 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
          frame.arenaExactIndexTrimRejectedCount},
         {"arenaExactIndexTrimBytesSaved",
          frame.arenaExactIndexTrimBytesSaved},
+        {"exactIndexDomainScannedBytes",
+         frame.exactIndexDomainScannedBytes},
+        {"exactIndexDomainNonHostCachedScanCount",
+         frame.exactIndexDomainNonHostCachedScanCount},
+        {"exactIndexDomainNonHostCachedScannedBytes",
+         frame.exactIndexDomainNonHostCachedScannedBytes},
+        {"exactIndexDomainBulkReadCount",
+         frame.exactIndexDomainBulkReadCount},
+        {"exactIndexDomainBulkReadBytes",
+         frame.exactIndexDomainBulkReadBytes},
+        {"exactIndexDomainDirectReadCount",
+         frame.exactIndexDomainDirectReadCount},
+        {"exactIndexDomainOversizeFallbackCount",
+         frame.exactIndexDomainOversizeFallbackCount},
         {"arenaFrameIncomplete", frame.arenaFrameIncomplete},
         {"queueSubmittedSerial", frame.queueSubmittedSerial},
         {"queueCompletedSerial", frame.queueCompletedSerial},
@@ -434,6 +448,22 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.arenaExactIndexTrimAcceptedCount = arena.exactIndexTrimAcceptedCount;
   frame.arenaExactIndexTrimRejectedCount = arena.exactIndexTrimRejectedCount;
   frame.arenaExactIndexTrimBytesSaved = arena.exactIndexTrimBytesSaved;
+  const auto cpuSpan =
+      dxvk::war3::memory::QueryWar3CpuReadableSpanDiagnostics();
+  frame.exactIndexDomainScannedBytes =
+      cpuSpan.exactIndexDomainScannedBytes;
+  frame.exactIndexDomainNonHostCachedScanCount =
+      cpuSpan.exactIndexDomainNonHostCachedScanCount;
+  frame.exactIndexDomainNonHostCachedScannedBytes =
+      cpuSpan.exactIndexDomainNonHostCachedScannedBytes;
+  frame.exactIndexDomainBulkReadCount =
+      cpuSpan.exactIndexDomainBulkReadCount;
+  frame.exactIndexDomainBulkReadBytes =
+      cpuSpan.exactIndexDomainBulkReadBytes;
+  frame.exactIndexDomainDirectReadCount =
+      cpuSpan.exactIndexDomainDirectReadCount;
+  frame.exactIndexDomainOversizeFallbackCount =
+      cpuSpan.exactIndexDomainOversizeFallbackCount;
   frame.arenaFrameIncomplete = arena.frameIncomplete;
   frame.queueSubmittedSerial = arena.submittedSerial;
   frame.queueCompletedSerial = arena.completedSerial;
@@ -841,6 +871,20 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       cpuSpanDiagnostics.lastAllocationGeneration;
   summary.shadowCpuSpanLastContentGeneration =
       cpuSpanDiagnostics.lastContentGeneration;
+  summary.shadowExactIndexDomainScannedBytes =
+      cpuSpanDiagnostics.exactIndexDomainScannedBytes;
+  summary.shadowExactIndexDomainNonHostCachedScanCount =
+      cpuSpanDiagnostics.exactIndexDomainNonHostCachedScanCount;
+  summary.shadowExactIndexDomainNonHostCachedScannedBytes =
+      cpuSpanDiagnostics.exactIndexDomainNonHostCachedScannedBytes;
+  summary.shadowExactIndexDomainBulkReadCount =
+      cpuSpanDiagnostics.exactIndexDomainBulkReadCount;
+  summary.shadowExactIndexDomainBulkReadBytes =
+      cpuSpanDiagnostics.exactIndexDomainBulkReadBytes;
+  summary.shadowExactIndexDomainDirectReadCount =
+      cpuSpanDiagnostics.exactIndexDomainDirectReadCount;
+  summary.shadowExactIndexDomainOversizeFallbackCount =
+      cpuSpanDiagnostics.exactIndexDomainOversizeFallbackCount;
   summary.queueSubmittedSerial = arenaDiagnostics.submittedSerial;
   summary.queueCompletedSerial = arenaDiagnostics.completedSerial;
   if (auto* device = dxvk::war3::GetActiveDevice()) {
@@ -2940,6 +2984,20 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.shadowCpuSpanLastAllocationGeneration},
         {"shadowCpuSpanLastContentGeneration",
          snapshot.shadow.shadowCpuSpanLastContentGeneration},
+        {"shadowExactIndexDomainScannedBytes",
+         snapshot.shadow.shadowExactIndexDomainScannedBytes},
+        {"shadowExactIndexDomainNonHostCachedScanCount",
+         snapshot.shadow.shadowExactIndexDomainNonHostCachedScanCount},
+        {"shadowExactIndexDomainNonHostCachedScannedBytes",
+         snapshot.shadow.shadowExactIndexDomainNonHostCachedScannedBytes},
+        {"shadowExactIndexDomainBulkReadCount",
+         snapshot.shadow.shadowExactIndexDomainBulkReadCount},
+        {"shadowExactIndexDomainBulkReadBytes",
+         snapshot.shadow.shadowExactIndexDomainBulkReadBytes},
+        {"shadowExactIndexDomainDirectReadCount",
+         snapshot.shadow.shadowExactIndexDomainDirectReadCount},
+        {"shadowExactIndexDomainOversizeFallbackCount",
+         snapshot.shadow.shadowExactIndexDomainOversizeFallbackCount},
         {"queueSubmittedSerial", snapshot.shadow.queueSubmittedSerial},
         {"queueCompletedSerial", snapshot.shadow.queueCompletedSerial},
         {"queueLastResult", snapshot.shadow.queueLastResult},

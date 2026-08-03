@@ -161,6 +161,33 @@ bool TestExactIndexVertexDomain() {
   return true;
 }
 
+bool TestExactIndexVertexDomainBulkRead() {
+  const uint16_t indices[] = {12u, 8u, 10u, 9u, 11u, 8u};
+  War3ExactIndexDomainScanInput input = {};
+  input.indices = BuildWar3CpuReadableBufferSpan(
+      ValidInput(indices, sizeof(indices), 0u, sizeof(indices)));
+  input.indexElementBytes = 2u;
+  input.indexCount = 6u;
+  input.baseVertex = -8;
+  input.vertexCapacity = 16u;
+  input.sourceHostCached = false;
+  input.bulkReadEnabled = true;
+
+  const auto before = QueryWar3CpuReadableSpanDiagnostics();
+  const auto domain = ComputeWar3ExactIndexVertexDomainPrepared(input);
+  const auto after = QueryWar3CpuReadableSpanDiagnostics();
+  CHECK(domain.valid);
+  CHECK(domain.firstVertex == 0u);
+  CHECK(domain.vertexCount == 5u);
+  CHECK(after.exactIndexDomainBulkReadCount ==
+        before.exactIndexDomainBulkReadCount + 1u);
+  CHECK(after.exactIndexDomainBulkReadBytes ==
+        before.exactIndexDomainBulkReadBytes + sizeof(indices));
+  CHECK(after.exactIndexDomainDirectReadCount ==
+        before.exactIndexDomainDirectReadCount);
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -168,7 +195,8 @@ int main() {
       !TestInvalidBindingOffsetAndLogicalLength() ||
       !TestGenerationAndCpuReadabilityGates() ||
       !TestCurrentUpBytesAndAddressOverflow() || !TestDiagnostics() ||
-      !TestExactIndexVertexDomain())
+      !TestExactIndexVertexDomain() ||
+      !TestExactIndexVertexDomainBulkRead())
     return 1;
   std::cout << "war3_cpu_readable_buffer_span_test: PASS\n";
   return 0;

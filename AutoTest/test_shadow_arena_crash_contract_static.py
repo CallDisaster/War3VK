@@ -96,6 +96,9 @@ class ShadowArenaCrashContractStaticTests(unittest.TestCase):
         for token in (
             "War3ExactIndexVertexDomain",
             "ComputeWar3ExactIndexVertexDomain",
+            "ComputeWar3ExactIndexVertexDomainPrepared",
+            "War3ExactIndexDomainScanInput",
+            "contentGeneration",
             "indexElementBytes != 2u && indexElementBytes != 4u",
             "vertex < 0 || vertex >= int64_t(vertexCapacity)",
         ):
@@ -104,13 +107,16 @@ class ShadowArenaCrashContractStaticTests(unittest.TestCase):
             "exactIndexedFreezeTrimCandidate",
             "(DynamicSysmemVBOs || posDynamic)",
             "exactIndexCommon->GetMappingBufferSequenceNumber()",
-            "ComputeWar3ExactIndexVertexDomain(",
+            "ComputeWar3ExactIndexVertexDomainPrepared({",
+            "DXVK_WAR3_EXACT_INDEX_DOMAIN_BULK_READ",
             "posFreezeByteOffset",
             "capturedVertexOffset = exactIndexedFreezeTrimmed",
             "ShadowArena_NoteExactIndexTrim(",
         ):
             self.assertIn(token, DEVICE_CPP)
         self.assertIn("TestExactIndexVertexDomain", SPAN_TEST)
+        self.assertIn("TestExactIndexVertexDomainBulkRead", SPAN_TEST)
+        self.assertIn("kExactIndexDomainBulkReadCapacity", SPAN_CPP)
 
     def test_arena_bundle_is_all_or_nothing(self) -> None:
         for token in (
@@ -199,6 +205,11 @@ class ShadowArenaCrashContractStaticTests(unittest.TestCase):
             "shadowArenaExactIndexTrimBytesSaved",
             "shadowCpuSpanRejectedCount",
             "shadowCpuSpanLastRejectReason",
+            "shadowExactIndexDomainScannedBytes",
+            "shadowExactIndexDomainNonHostCachedScannedBytes",
+            "shadowExactIndexDomainBulkReadCount",
+            "shadowExactIndexDomainBulkReadBytes",
+            "shadowExactIndexDomainDirectReadCount",
         ):
             self.assertIn(token, DIAG_H)
             self.assertIn(token, DIAG_CPP)

@@ -43766,6 +43766,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   //   DXVK_WAR3_SHADOW_TRIM_INDEXED=1
   static const bool s_trimIndexedShadowVb =
       env::getEnvVar("DXVK_WAR3_SHADOW_TRIM_INDEXED") == "1";
+  // Same-DLL ABBA switch for the bounded write-combined IB bulk read. This
+  // only changes how the current validated range is read; it does not retain
+  // source bytes or derived geometry across calls.
+  static const bool s_exactIndexDomainBulkReadEnabled =
+      env::getEnvVar("DXVK_WAR3_EXACT_INDEX_DOMAIN_BULK_READ") != "0";
 
   // Position Buffer
   DxvkBufferSlice posSlice;
@@ -44063,6 +44068,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     auto* exactIndexCommon = m_state.indices.ptr() != nullptr
         ? m_state.indices.ptr()->GetCommonBuffer() : nullptr;
     dxvk::war3::memory::War3CpuReadableBufferSpan exactIndexSpan = {};
+    bool exactIndexHostCached = false;
     const uint32_t indexElementBytes =
         indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
     if (DynamicSysmemIBO && StartVal == 0u &&
@@ -44083,9 +44089,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       auto exactIndexAllocation = exactIndexCommon->GetMappedSlice();
       if (exactIndexAllocation != nullptr) {
         const auto allocationInfo = exactIndexAllocation->getBufferInfo();
-        const bool hostVisible =
-            (exactIndexAllocation->getMemoryProperties() &
-             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        const auto memoryProperties =
+            exactIndexAllocation->getMemoryProperties();
+        const bool hostVisible = (memoryProperties &
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        exactIndexHostCached = (memoryProperties &
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
         exactIndexSpan =
             dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
                 exactIndexAllocation->mapPtr(), uint64_t(allocationInfo.size),
@@ -44106,9 +44115,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       auto exactIndexAllocation = exactIndexCommon->GetMappedSlice();
       if (uploadReady && exactIndexAllocation != nullptr) {
         const auto allocationInfo = exactIndexAllocation->getBufferInfo();
-        const bool hostVisible =
-            (exactIndexAllocation->getMemoryProperties() &
-             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        const auto memoryProperties =
+            exactIndexAllocation->getMemoryProperties();
+        const bool hostVisible = (memoryProperties &
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        exactIndexHostCached = (memoryProperties &
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
         const uint64_t indexOffset =
             uint64_t(StartVal) * uint64_t(indexElementBytes);
         const uint64_t indexBytes =
@@ -44129,9 +44141,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         positionCapacity64 <=
             uint64_t(std::numeric_limits<uint32_t>::max())) {
       const auto exactDomain =
-          dxvk::war3::memory::ComputeWar3ExactIndexVertexDomain(
-              exactIndexSpan, indexElementBytes, CountVal,
-              BaseVertexIndex, uint32_t(positionCapacity64));
+          dxvk::war3::memory::ComputeWar3ExactIndexVertexDomainPrepared({
+              exactIndexSpan, indexElementBytes, CountVal, BaseVertexIndex,
+              uint32_t(positionCapacity64), exactIndexHostCached,
+              s_exactIndexDomainBulkReadEnabled});
       if (exactDomain.valid) {
         const uint64_t first = exactDomain.firstVertex;
         const uint64_t count = exactDomain.vertexCount;
