@@ -7,18 +7,121 @@
 
 namespace dxvk::war3::gpu_skin {
 
+uint64_t ContinuePersistentGpuPackageContentHash(
+    uint64_t seed, const void* data, size_t size) noexcept {
+  if (data == nullptr && size != 0u)
+    return 0u;
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  for (size_t i = 0u; i < size; ++i)
+    seed = (seed ^ bytes[i]) * 0x100000001b3ull;
+  return seed;
+}
+
+uint64_t HashPersistentGpuPackageContent(
+    const void* data, size_t size) noexcept {
+  return ContinuePersistentGpuPackageContentHash(
+      kPersistentGpuPackageContentHashSeed, data, size);
+}
+
+uint64_t HashPersistentGpuPackageStridedFloat3(
+    const void* data, uint64_t byteCount, uint32_t vertexCount,
+    uint32_t stride, uint32_t positionOffset) noexcept {
+  constexpr uint64_t kPositionBytes = sizeof(float) * 3u;
+  if (data == nullptr || byteCount == 0u || vertexCount == 0u ||
+      stride < kPositionBytes || positionOffset > stride - kPositionBytes)
+    return 0u;
+  const uint64_t lastVertex = uint64_t(vertexCount - 1u);
+  if (lastVertex >
+          ((std::numeric_limits<uint64_t>::max)() - positionOffset) /
+              stride)
+    return 0u;
+  const uint64_t lastOffset = lastVertex * stride + positionOffset;
+  if (lastOffset > byteCount || kPositionBytes > byteCount - lastOffset ||
+      lastOffset > (std::numeric_limits<size_t>::max)())
+    return 0u;
+
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  uint64_t hash = kPersistentGpuPackageContentHashSeed;
+  for (uint32_t vertex = 0u; vertex < vertexCount; ++vertex) {
+    hash = ContinuePersistentGpuPackageContentHash(
+        hash, bytes + uint64_t(vertex) * stride + positionOffset,
+        size_t(kPositionBytes));
+  }
+  return hash;
+}
+
+PersistentGpuPackageCurrentDrawMatchDisposition
+EvaluatePersistentGpuPackageCurrentDrawEquivalence(
+    const PersistentGpuPackageCurrentDrawProof& draw,
+    const PersistentGpuPackageCurrentDrawPackageProof& package) noexcept {
+  using Disposition = PersistentGpuPackageCurrentDrawMatchDisposition;
+  if (!draw.requested)
+    return Disposition::NotRequested;
+  if (!draw.sealed || draw.frameSerial == 0u || draw.mapEpoch == 0u ||
+      draw.deviceEpoch == 0u || draw.exactGeometryKeyHash == 0u ||
+      draw.instanceIdentity == 0u || draw.meshPayloadIdentity == 0u ||
+      draw.renderablePartIdentity == 0u || draw.vertexCount == 0u ||
+      draw.indexCount == 0u)
+    return Disposition::InvalidCurrentDraw;
+  if (!draw.rigidStatic)
+    return Disposition::NotRigidStatic;
+  if (!draw.opaqueMaterial)
+    return Disposition::MaterialRejected;
+  if (draw.gpuSkinBacked || draw.vertexBlendEnabled)
+    return Disposition::SkinningRouteRejected;
+  if (!draw.indexed || !draw.triangleList || !draw.uint16Indices ||
+      !draw.exactIndexDomainKnown || draw.fullVertexDomainFallback ||
+      !draw.zeroBasedVertexRange || !draw.positionFloat3 ||
+      draw.sourceFirstIndex != 0u || draw.actualIndexMin != 0u ||
+      draw.actualIndexMax >= draw.vertexCount)
+    return Disposition::GeometryContractRejected;
+  if (!draw.positionHostCached || !draw.indexHostCached)
+    return Disposition::CpuSourceUnavailable;
+  if (draw.positionOwnerIdentity == 0u ||
+      draw.positionIdentityGeneration == 0u ||
+      draw.positionAllocationGeneration == 0u ||
+      draw.positionContentGeneration == 0u ||
+      draw.indexOwnerIdentity == 0u ||
+      draw.indexIdentityGeneration == 0u ||
+      draw.indexAllocationGeneration == 0u ||
+      draw.indexContentGeneration == 0u ||
+      draw.positionContentHash == 0u || draw.indexContentHash == 0u)
+    return Disposition::SourceGenerationMissing;
+  if (!package.ready)
+    return Disposition::PackageNotReady;
+  if (!package.frozenPayloadValid || package.packageGeneration == 0u)
+    return Disposition::PackageInvalid;
+  if (!package.snapshotIdentityExact ||
+      package.mapEpoch != draw.mapEpoch ||
+      package.deviceEpoch != draw.deviceEpoch ||
+      package.geosetDataIdentity != draw.meshPayloadIdentity)
+    return Disposition::SnapshotMismatch;
+  if (package.primitiveCount != 1u)
+    return Disposition::MultiPrimitiveRejected;
+  if (package.vertexCount != draw.vertexCount ||
+      package.indexCount != draw.indexCount)
+    return Disposition::PackageLayoutMismatch;
+  if (package.positionContentHash != draw.positionContentHash)
+    return Disposition::PositionContentMismatch;
+  if (package.indexContentHash != draw.indexContentHash)
+    return Disposition::IndexContentMismatch;
+  if (package.primitiveOrdinal != 0u ||
+      package.primitiveFirstIndex != draw.sourceFirstIndex ||
+      package.primitiveIndexCount != draw.indexCount ||
+      package.primitiveMinVertex != draw.actualIndexMin ||
+      package.primitiveMaxVertex != draw.actualIndexMax)
+    return Disposition::PrimitiveMismatch;
+  return Disposition::ExactMatch;
+}
+
 namespace {
 
 void HashBytesInto(uint64_t& hash, const void* data, size_t size) noexcept {
-  const auto* bytes = static_cast<const uint8_t*>(data);
-  for (size_t i = 0u; i < size; ++i)
-    hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+  hash = ContinuePersistentGpuPackageContentHash(hash, data, size);
 }
 
 uint64_t HashBytes(const void* data, size_t size) noexcept {
-  uint64_t hash = 0xcbf29ce484222325ull;
-  HashBytesInto(hash, data, size);
-  return hash;
+  return HashPersistentGpuPackageContent(data, size);
 }
 
 template <typename T>

@@ -41,6 +41,27 @@ struct War3PersistentGpuPackageD3D9RuntimeDiagnostics {
   uint64_t currentMapEpoch = 0u;
   uint64_t currentDeviceEpoch = 0u;
   uint64_t currentFrameSerial = 0u;
+  uint64_t currentDrawConfiguredMode = 0u;
+  uint64_t currentDrawEffectiveMode = 0u;
+  uint64_t currentDrawObservations = 0u;
+  uint64_t currentDrawExactMatches = 0u;
+  uint64_t currentDrawWouldUseCsm = 0u;
+  uint64_t currentDrawRejected = 0u;
+  uint64_t currentDrawNotRigidStatic = 0u;
+  uint64_t currentDrawMaterialRejected = 0u;
+  uint64_t currentDrawSkinningRejected = 0u;
+  uint64_t currentDrawGeometryRejected = 0u;
+  uint64_t currentDrawCpuSourceUnavailable = 0u;
+  uint64_t currentDrawSourceGenerationMissing = 0u;
+  uint64_t currentDrawPackageNotReady = 0u;
+  uint64_t currentDrawPackageInvalid = 0u;
+  uint64_t currentDrawSnapshotMismatch = 0u;
+  uint64_t currentDrawMultiPrimitiveRejected = 0u;
+  uint64_t currentDrawPackageLayoutMismatch = 0u;
+  uint64_t currentDrawPositionMismatch = 0u;
+  uint64_t currentDrawIndexMismatch = 0u;
+  uint64_t currentDrawPrimitiveMismatch = 0u;
+  uint64_t currentDrawLastDisposition = 0u;
   uint64_t gpuBindingAllowed = 0u;
   uint64_t drawMutationAllowed = 0u;
   uint64_t consumerAuthorityPublished = 0u;
@@ -48,6 +69,8 @@ struct War3PersistentGpuPackageD3D9RuntimeDiagnostics {
 };
 
 void ConfigurePersistentGpuPackageD3D9RuntimeDiagnostics(
+    uint32_t configuredMode) noexcept;
+void ConfigurePersistentGpuPackageCurrentDrawRuntimeDiagnostics(
     uint32_t configuredMode) noexcept;
 War3PersistentGpuPackageD3D9RuntimeDiagnostics
 QueryPersistentGpuPackageD3D9RuntimeDiagnostics() noexcept;
@@ -85,7 +108,12 @@ public:
     GpuSkinFallbackReason fallback = GpuSkinFallbackReason::None;
     uint64_t packageGeneration = 0u;
     uint32_t primitiveCount = 0u;
+    PersistentGpuPackageCurrentDrawMatchDisposition currentDrawDisposition =
+        PersistentGpuPackageCurrentDrawMatchDisposition::NotRequested;
+    uint32_t eligibleConsumerMask = 0u;
+    uint32_t wouldUseConsumerMask = 0u;
     bool ready = false;
+    bool fullyEquivalent = false;
     bool gpuBindingAllowed = false;
     bool drawMutationAllowed = false;
     bool consumerAuthorityPublished = false;
@@ -128,6 +156,25 @@ public:
     uint64_t uploadBytesCommitted = 0u;
     uint64_t lastSubmittedFenceValue = 0u;
     uint64_t lastCompletedFenceValue = 0u;
+    uint64_t currentDrawObservations = 0u;
+    uint64_t currentDrawExactMatches = 0u;
+    uint64_t currentDrawWouldUseCsm = 0u;
+    uint64_t currentDrawRejected = 0u;
+    uint64_t currentDrawNotRigidStatic = 0u;
+    uint64_t currentDrawMaterialRejected = 0u;
+    uint64_t currentDrawSkinningRejected = 0u;
+    uint64_t currentDrawGeometryRejected = 0u;
+    uint64_t currentDrawCpuSourceUnavailable = 0u;
+    uint64_t currentDrawSourceGenerationMissing = 0u;
+    uint64_t currentDrawPackageNotReady = 0u;
+    uint64_t currentDrawPackageInvalid = 0u;
+    uint64_t currentDrawSnapshotMismatch = 0u;
+    uint64_t currentDrawMultiPrimitiveRejected = 0u;
+    uint64_t currentDrawPackageLayoutMismatch = 0u;
+    uint64_t currentDrawPositionMismatch = 0u;
+    uint64_t currentDrawIndexMismatch = 0u;
+    uint64_t currentDrawPrimitiveMismatch = 0u;
+    uint64_t currentDrawLastDisposition = 0u;
     uint64_t currentMapEpoch = 0u;
     uint64_t currentDeviceEpoch = 0u;
     uint64_t currentFrameSerial = 0u;
@@ -146,7 +193,8 @@ public:
 
   ObserveResult observe(
       const Stage11Evidence& evidence,
-      model::ShadowGeosetResourceSnapshot snapshot) noexcept;
+      model::ShadowGeosetResourceSnapshot snapshot,
+      const PersistentGpuPackageCurrentDrawProof& currentDraw) noexcept;
   Submission takeSubmission() noexcept;
   bool commitSubmission(const Submission& submission) noexcept;
   void rejectSubmission(const Submission& submission) noexcept;
@@ -163,6 +211,8 @@ private:
       const Stage11Evidence& evidence,
       const model::ShadowGeosetResourceSnapshot& snapshot) const noexcept;
   bool validSubmission(const Submission& submission) const noexcept;
+  void noteCurrentDrawDisposition(
+      PersistentGpuPackageCurrentDrawMatchDisposition disposition) noexcept;
   void publishRuntimeDiagnostics(bool ownerAlive) const noexcept;
   static uint64_t allocateOwnerAuthority() noexcept;
 

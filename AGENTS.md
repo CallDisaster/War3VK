@@ -1,5 +1,41 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-03（Persistent Package 当帧内容等价 Observe，默认关闭）
+
+本阶段继续收紧 Persistent GPU Package 从“上传 Ready”到未来真实消费者之间的
+正确性门。新增独立环境
+`DXVK_WAR3_PERSISTENT_GPU_PACKAGE_CURRENT_DRAW_EQUIVALENCE_MODE`，发布默认 Off，
+Consume 继续硬拒绝；即使完全匹配也只报告 CSM `wouldUse`，不会绑定 atlas、修改
+canonical draw、发布 consumer authority 或 last-use fence。
+
+**当帧 exact 内容证明**：
+
+- exact capture entry 新增 generation-tagged POD proof，绑定 frame/map/device、完整
+  draw identity、position/index allocation owner、identity/allocation/content generation、
+  UINT16 实际索引域及 position/index byte hash。entry 替换和历史 source-fingerprint
+  rollback 都先清空 proof，不能把旧 backing 刷新成当帧权限。
+- 只观察 Building/Destructible 的 rigid、opaque、无 vertex blend、非 GPU-skin、
+  indexed triangle-list、UINT16、zero-based、exact-domain、FLOAT3 候选。position 与 IB
+  必须都来自真实 `HOST_CACHED` span；其他候选只记拒绝原因，不扫描写合并内存。
+- immutable cache 与 current draw 共用同一个 byte-wise FNV-1a 实现；新增 strided
+  FLOAT3 helper，只读取每顶点 xyz 12 bytes，避免 interleaved normal/UV 污染比较域。
+- Store Ready 后仍重新核对 current snapshot identity、map/device epoch、不可伪造
+  frozen payload、单 primitive、vertex/index count、position/index hash 及 primitive
+  first/count/min/max。只有全部闭合才计 `fullyEquivalent/wouldUse CSM`；随后还会对
+  frozen CPU proof 做最终重算验证。
+
+**诊断与验证**：
+
+- `runtime_status.json` 与 control-plane 新增 current-draw configured/effective、
+  observations、exact/would-use、总拒绝及 rigid/material/skinning/geometry/CPU span/
+  generation/package/snapshot/multi-primitive/layout/position/index/primitive 分类和最后
+  disposition；既有四个实际消费权限字段继续固定为 0。
+- 新增 CPU/value-only runnable，覆盖统一 hash、strided FLOAT3 边界、HOST_CACHED
+  拒绝、多 primitive 及 position/index/primitive mismatch。全量 53 个静态模块共
+  417 tests PASS，全部 12 个 Meson runnable PASS；Win32 DLL build PASS。该组合尚未
+  部署、尚未启动游戏，运行时机会率与 Observe 开销必须通过独立门后才能设计
+  recording/last-use authority。
+
 ## 🚨 2026-08-03（Persistent Package 结构化运行诊断，消费者权限仍关闭）
 
 在 `codex/package-d3d9-observe-owner-20260803` 的真实 D3D9 Observe uploader

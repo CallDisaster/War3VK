@@ -379,6 +379,24 @@ test(
   timeout : 30,
 )
 
+# Value-only current-draw/package equivalence gate. It hashes exact strided
+# FLOAT3 bytes and rejects every incomplete route before any future renderer
+# consumer can publish would-use authority.
+war3_persistent_gpu_package_current_draw_equivalence_test = executable(
+  'war3_persistent_gpu_package_current_draw_equivalence_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_immutable.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_current_draw_equivalence_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_current_draw_equivalence',
+  war3_persistent_gpu_package_current_draw_equivalence_test,
+  timeout : 30,
+)
+
 # Runnable ownership/lifetime test for the point-shadow persistent mailbox.
 # The production pass lazily instantiates the same mailbox only when its
 # explicit Observe/Consume mode is requested; release default remains Off.

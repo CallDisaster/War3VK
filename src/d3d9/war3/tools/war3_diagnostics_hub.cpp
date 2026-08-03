@@ -688,6 +688,48 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       persistentPackageDiagnostics.currentDeviceEpoch;
   summary.persistentPackageCurrentFrameSerial =
       persistentPackageDiagnostics.currentFrameSerial;
+  summary.persistentPackageCurrentDrawConfiguredMode =
+      persistentPackageDiagnostics.currentDrawConfiguredMode;
+  summary.persistentPackageCurrentDrawEffectiveMode =
+      persistentPackageDiagnostics.currentDrawEffectiveMode;
+  summary.persistentPackageCurrentDrawObservations =
+      persistentPackageDiagnostics.currentDrawObservations;
+  summary.persistentPackageCurrentDrawExactMatches =
+      persistentPackageDiagnostics.currentDrawExactMatches;
+  summary.persistentPackageCurrentDrawWouldUseCsm =
+      persistentPackageDiagnostics.currentDrawWouldUseCsm;
+  summary.persistentPackageCurrentDrawRejected =
+      persistentPackageDiagnostics.currentDrawRejected;
+  summary.persistentPackageCurrentDrawNotRigidStatic =
+      persistentPackageDiagnostics.currentDrawNotRigidStatic;
+  summary.persistentPackageCurrentDrawMaterialRejected =
+      persistentPackageDiagnostics.currentDrawMaterialRejected;
+  summary.persistentPackageCurrentDrawSkinningRejected =
+      persistentPackageDiagnostics.currentDrawSkinningRejected;
+  summary.persistentPackageCurrentDrawGeometryRejected =
+      persistentPackageDiagnostics.currentDrawGeometryRejected;
+  summary.persistentPackageCurrentDrawCpuSourceUnavailable =
+      persistentPackageDiagnostics.currentDrawCpuSourceUnavailable;
+  summary.persistentPackageCurrentDrawSourceGenerationMissing =
+      persistentPackageDiagnostics.currentDrawSourceGenerationMissing;
+  summary.persistentPackageCurrentDrawPackageNotReady =
+      persistentPackageDiagnostics.currentDrawPackageNotReady;
+  summary.persistentPackageCurrentDrawPackageInvalid =
+      persistentPackageDiagnostics.currentDrawPackageInvalid;
+  summary.persistentPackageCurrentDrawSnapshotMismatch =
+      persistentPackageDiagnostics.currentDrawSnapshotMismatch;
+  summary.persistentPackageCurrentDrawMultiPrimitiveRejected =
+      persistentPackageDiagnostics.currentDrawMultiPrimitiveRejected;
+  summary.persistentPackageCurrentDrawPackageLayoutMismatch =
+      persistentPackageDiagnostics.currentDrawPackageLayoutMismatch;
+  summary.persistentPackageCurrentDrawPositionMismatch =
+      persistentPackageDiagnostics.currentDrawPositionMismatch;
+  summary.persistentPackageCurrentDrawIndexMismatch =
+      persistentPackageDiagnostics.currentDrawIndexMismatch;
+  summary.persistentPackageCurrentDrawPrimitiveMismatch =
+      persistentPackageDiagnostics.currentDrawPrimitiveMismatch;
+  summary.persistentPackageCurrentDrawLastDisposition =
+      persistentPackageDiagnostics.currentDrawLastDisposition;
   summary.persistentPackageGpuBindingAllowed =
       persistentPackageDiagnostics.gpuBindingAllowed;
   summary.persistentPackageDrawMutationAllowed =
@@ -2693,6 +2735,48 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.persistentPackageCurrentDeviceEpoch},
         {"persistentPackageCurrentFrameSerial",
          snapshot.shadow.persistentPackageCurrentFrameSerial},
+        {"persistentPackageCurrentDrawConfiguredMode",
+         snapshot.shadow.persistentPackageCurrentDrawConfiguredMode},
+        {"persistentPackageCurrentDrawEffectiveMode",
+         snapshot.shadow.persistentPackageCurrentDrawEffectiveMode},
+        {"persistentPackageCurrentDrawObservations",
+         snapshot.shadow.persistentPackageCurrentDrawObservations},
+        {"persistentPackageCurrentDrawExactMatches",
+         snapshot.shadow.persistentPackageCurrentDrawExactMatches},
+        {"persistentPackageCurrentDrawWouldUseCsm",
+         snapshot.shadow.persistentPackageCurrentDrawWouldUseCsm},
+        {"persistentPackageCurrentDrawRejected",
+         snapshot.shadow.persistentPackageCurrentDrawRejected},
+        {"persistentPackageCurrentDrawNotRigidStatic",
+         snapshot.shadow.persistentPackageCurrentDrawNotRigidStatic},
+        {"persistentPackageCurrentDrawMaterialRejected",
+         snapshot.shadow.persistentPackageCurrentDrawMaterialRejected},
+        {"persistentPackageCurrentDrawSkinningRejected",
+         snapshot.shadow.persistentPackageCurrentDrawSkinningRejected},
+        {"persistentPackageCurrentDrawGeometryRejected",
+         snapshot.shadow.persistentPackageCurrentDrawGeometryRejected},
+        {"persistentPackageCurrentDrawCpuSourceUnavailable",
+         snapshot.shadow.persistentPackageCurrentDrawCpuSourceUnavailable},
+        {"persistentPackageCurrentDrawSourceGenerationMissing",
+         snapshot.shadow.persistentPackageCurrentDrawSourceGenerationMissing},
+        {"persistentPackageCurrentDrawPackageNotReady",
+         snapshot.shadow.persistentPackageCurrentDrawPackageNotReady},
+        {"persistentPackageCurrentDrawPackageInvalid",
+         snapshot.shadow.persistentPackageCurrentDrawPackageInvalid},
+        {"persistentPackageCurrentDrawSnapshotMismatch",
+         snapshot.shadow.persistentPackageCurrentDrawSnapshotMismatch},
+        {"persistentPackageCurrentDrawMultiPrimitiveRejected",
+         snapshot.shadow.persistentPackageCurrentDrawMultiPrimitiveRejected},
+        {"persistentPackageCurrentDrawPackageLayoutMismatch",
+         snapshot.shadow.persistentPackageCurrentDrawPackageLayoutMismatch},
+        {"persistentPackageCurrentDrawPositionMismatch",
+         snapshot.shadow.persistentPackageCurrentDrawPositionMismatch},
+        {"persistentPackageCurrentDrawIndexMismatch",
+         snapshot.shadow.persistentPackageCurrentDrawIndexMismatch},
+        {"persistentPackageCurrentDrawPrimitiveMismatch",
+         snapshot.shadow.persistentPackageCurrentDrawPrimitiveMismatch},
+        {"persistentPackageCurrentDrawLastDisposition",
+         snapshot.shadow.persistentPackageCurrentDrawLastDisposition},
         {"persistentPackageGpuBindingAllowed",
          snapshot.shadow.persistentPackageGpuBindingAllowed},
         {"persistentPackageDrawMutationAllowed",

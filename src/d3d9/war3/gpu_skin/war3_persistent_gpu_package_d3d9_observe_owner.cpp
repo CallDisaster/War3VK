@@ -66,6 +66,16 @@ void ConfigurePersistentGpuPackageD3D9RuntimeDiagnostics(
     g_d3d9RuntimeDiagnostics.effectiveMode = 0u;
 }
 
+void ConfigurePersistentGpuPackageCurrentDrawRuntimeDiagnostics(
+    uint32_t configuredMode) noexcept {
+  std::lock_guard<std::mutex> lock(g_d3d9RuntimeDiagnosticsMutex);
+  g_d3d9RuntimeDiagnostics.currentDrawConfiguredMode = configuredMode;
+  g_d3d9RuntimeDiagnostics.currentDrawEffectiveMode =
+      configuredMode == 1u &&
+          g_d3d9RuntimeDiagnostics.effectiveMode == 1u
+      ? 1u : 0u;
+}
+
 War3PersistentGpuPackageD3D9RuntimeDiagnostics
 QueryPersistentGpuPackageD3D9RuntimeDiagnostics() noexcept {
   std::lock_guard<std::mutex> lock(g_d3d9RuntimeDiagnosticsMutex);
@@ -119,6 +129,8 @@ publishRuntimeDiagnostics(bool ownerAlive) const noexcept {
   std::lock_guard<std::mutex> lock(g_d3d9RuntimeDiagnosticsMutex);
   const uint64_t configuredMode =
       g_d3d9RuntimeDiagnostics.configuredMode;
+  const uint64_t currentDrawConfiguredMode =
+      g_d3d9RuntimeDiagnostics.currentDrawConfiguredMode;
   War3PersistentGpuPackageD3D9RuntimeDiagnostics published = {};
   published.configuredMode = configuredMode;
   published.effectiveMode =
@@ -154,6 +166,48 @@ publishRuntimeDiagnostics(bool ownerAlive) const noexcept {
   published.currentMapEpoch = m_mapEpoch;
   published.currentDeviceEpoch = m_deviceEpoch;
   published.currentFrameSerial = m_frameSerial;
+  published.currentDrawConfiguredMode = currentDrawConfiguredMode;
+  published.currentDrawEffectiveMode =
+      ownerAlive && configuredMode == 1u &&
+          currentDrawConfiguredMode == 1u
+      ? 1u : 0u;
+  published.currentDrawObservations =
+      m_diagnostics.currentDrawObservations;
+  published.currentDrawExactMatches =
+      m_diagnostics.currentDrawExactMatches;
+  published.currentDrawWouldUseCsm =
+      m_diagnostics.currentDrawWouldUseCsm;
+  published.currentDrawRejected = m_diagnostics.currentDrawRejected;
+  published.currentDrawNotRigidStatic =
+      m_diagnostics.currentDrawNotRigidStatic;
+  published.currentDrawMaterialRejected =
+      m_diagnostics.currentDrawMaterialRejected;
+  published.currentDrawSkinningRejected =
+      m_diagnostics.currentDrawSkinningRejected;
+  published.currentDrawGeometryRejected =
+      m_diagnostics.currentDrawGeometryRejected;
+  published.currentDrawCpuSourceUnavailable =
+      m_diagnostics.currentDrawCpuSourceUnavailable;
+  published.currentDrawSourceGenerationMissing =
+      m_diagnostics.currentDrawSourceGenerationMissing;
+  published.currentDrawPackageNotReady =
+      m_diagnostics.currentDrawPackageNotReady;
+  published.currentDrawPackageInvalid =
+      m_diagnostics.currentDrawPackageInvalid;
+  published.currentDrawSnapshotMismatch =
+      m_diagnostics.currentDrawSnapshotMismatch;
+  published.currentDrawMultiPrimitiveRejected =
+      m_diagnostics.currentDrawMultiPrimitiveRejected;
+  published.currentDrawPackageLayoutMismatch =
+      m_diagnostics.currentDrawPackageLayoutMismatch;
+  published.currentDrawPositionMismatch =
+      m_diagnostics.currentDrawPositionMismatch;
+  published.currentDrawIndexMismatch =
+      m_diagnostics.currentDrawIndexMismatch;
+  published.currentDrawPrimitiveMismatch =
+      m_diagnostics.currentDrawPrimitiveMismatch;
+  published.currentDrawLastDisposition =
+      m_diagnostics.currentDrawLastDisposition;
   // Observe owns uploads only. These remain explicit zeroes until a later,
   // separately gated recording/last-use authority is implemented.
   published.gpuBindingAllowed = 0u;
@@ -233,7 +287,8 @@ bool War3PersistentGpuPackageD3D9ObserveOwner::beginFrame(
 War3PersistentGpuPackageD3D9ObserveOwner::ObserveResult
 War3PersistentGpuPackageD3D9ObserveOwner::observe(
     const Stage11Evidence& evidence,
-    model::ShadowGeosetResourceSnapshot snapshot) noexcept {
+    model::ShadowGeosetResourceSnapshot snapshot,
+    const PersistentGpuPackageCurrentDrawProof& currentDraw) noexcept {
   ++m_diagnostics.observeCalls;
   ObserveResult result = {};
   if (!validEvidenceAndSnapshot(evidence, snapshot)) {
@@ -273,12 +328,46 @@ War3PersistentGpuPackageD3D9ObserveOwner::observe(
         currentSnapshot,
         War3PersistentGpuPackageStore::kStaticPackingLayoutGeneration);
     result.fallback = lookup.fallback;
+    PersistentGpuPackageCurrentDrawPackageProof currentPackage = {};
     if (lookup) {
       result.disposition = Disposition::ReadyObserved;
       result.ready = true;
       result.packageGeneration =
           lookup.resource->packageProof.packageGeneration;
       ++m_diagnostics.readyObservations;
+
+      const auto& resource = *lookup.resource;
+      const auto& frozen = resource.frozenPayload;
+      currentPackage.ready = true;
+      currentPackage.frozenPayloadValid =
+          frozen != nullptr && ValidateGpuSkinStaticPackage(resource);
+      if (currentPackage.frozenPayloadValid) {
+        const auto& packageProof = frozen->packageProof();
+        const auto& immutableProof = frozen->immutableProof();
+        const auto& primitiveProofs = frozen->primitiveProofs();
+        currentPackage.mapEpoch = packageProof.mapEpoch;
+        currentPackage.deviceEpoch = packageProof.deviceEpoch;
+        currentPackage.packageGeneration = packageProof.packageGeneration;
+        currentPackage.geosetDataIdentity = packageProof.geosetData;
+        currentPackage.positionContentHash =
+            immutableProof.positionContentHash;
+        currentPackage.indexContentHash = immutableProof.indexContentHash;
+        currentPackage.vertexCount = immutableProof.vertexCount;
+        currentPackage.indexCount = immutableProof.indexCount;
+        currentPackage.primitiveCount =
+            uint32_t(primitiveProofs.size());
+        currentPackage.snapshotIdentityExact =
+            frozen->snapshotIdentity() == currentSnapshot.get() &&
+            frozen->record().get() == currentSnapshot.get();
+        if (primitiveProofs.size() == 1u) {
+          const auto& primitive = primitiveProofs.front();
+          currentPackage.primitiveOrdinal = primitive.ordinal;
+          currentPackage.primitiveFirstIndex = primitive.firstIndex;
+          currentPackage.primitiveIndexCount = primitive.indexCount;
+          currentPackage.primitiveMinVertex = primitive.minVertex;
+          currentPackage.primitiveMaxVertex = primitive.maxVertex;
+        }
+      }
     } else if (lookup.fallback ==
                    GpuSkinFallbackReason::StaticResourceMiss) {
       result.disposition = Disposition::MissQueued;
@@ -291,6 +380,28 @@ War3PersistentGpuPackageD3D9ObserveOwner::observe(
       result.disposition = Disposition::StoreRejected;
       ++m_diagnostics.storeRejects;
     }
+
+    result.currentDrawDisposition =
+        EvaluatePersistentGpuPackageCurrentDrawEquivalence(
+            currentDraw, currentPackage);
+    if (result.currentDrawDisposition ==
+        PersistentGpuPackageCurrentDrawMatchDisposition::ExactMatch) {
+      // Exact content equality is still not renderer authority. Recompute the
+      // Store-frozen CPU proof only for this narrow candidate before reporting
+      // would-use; no slice escapes and the canonical Arena draw remains live.
+      if (!lookup ||
+          !ValidateGpuSkinStaticFrozenPayload(*lookup.resource)) {
+        result.currentDrawDisposition =
+            PersistentGpuPackageCurrentDrawMatchDisposition::PackageInvalid;
+      } else {
+        result.fullyEquivalent = true;
+        result.eligibleConsumerMask =
+            War3PersistentGpuPackageStage11ObserveAdapter::
+                kRequestedConsumerMask;
+        result.wouldUseConsumerMask = result.eligibleConsumerMask;
+      }
+    }
+    noteCurrentDrawDisposition(result.currentDrawDisposition);
 
     if (m_preparedThisFrame < kMaxPreparesPerFrame) {
       const uint32_t remaining =
@@ -305,6 +416,69 @@ War3PersistentGpuPackageD3D9ObserveOwner::observe(
     ++m_diagnostics.storeRejects;
   }
   return result;
+}
+
+void War3PersistentGpuPackageD3D9ObserveOwner::noteCurrentDrawDisposition(
+    PersistentGpuPackageCurrentDrawMatchDisposition disposition) noexcept {
+  using Match = PersistentGpuPackageCurrentDrawMatchDisposition;
+  m_diagnostics.currentDrawLastDisposition = uint64_t(disposition);
+  if (disposition == Match::NotRequested)
+    return;
+  ++m_diagnostics.currentDrawObservations;
+  if (disposition == Match::ExactMatch) {
+    ++m_diagnostics.currentDrawExactMatches;
+    ++m_diagnostics.currentDrawWouldUseCsm;
+    return;
+  }
+  ++m_diagnostics.currentDrawRejected;
+  switch (disposition) {
+  case Match::NotRigidStatic:
+    ++m_diagnostics.currentDrawNotRigidStatic;
+    break;
+  case Match::MaterialRejected:
+    ++m_diagnostics.currentDrawMaterialRejected;
+    break;
+  case Match::SkinningRouteRejected:
+    ++m_diagnostics.currentDrawSkinningRejected;
+    break;
+  case Match::GeometryContractRejected:
+    ++m_diagnostics.currentDrawGeometryRejected;
+    break;
+  case Match::CpuSourceUnavailable:
+    ++m_diagnostics.currentDrawCpuSourceUnavailable;
+    break;
+  case Match::SourceGenerationMissing:
+    ++m_diagnostics.currentDrawSourceGenerationMissing;
+    break;
+  case Match::PackageNotReady:
+    ++m_diagnostics.currentDrawPackageNotReady;
+    break;
+  case Match::PackageInvalid:
+    ++m_diagnostics.currentDrawPackageInvalid;
+    break;
+  case Match::SnapshotMismatch:
+    ++m_diagnostics.currentDrawSnapshotMismatch;
+    break;
+  case Match::MultiPrimitiveRejected:
+    ++m_diagnostics.currentDrawMultiPrimitiveRejected;
+    break;
+  case Match::PackageLayoutMismatch:
+    ++m_diagnostics.currentDrawPackageLayoutMismatch;
+    break;
+  case Match::PositionContentMismatch:
+    ++m_diagnostics.currentDrawPositionMismatch;
+    break;
+  case Match::IndexContentMismatch:
+    ++m_diagnostics.currentDrawIndexMismatch;
+    break;
+  case Match::PrimitiveMismatch:
+    ++m_diagnostics.currentDrawPrimitiveMismatch;
+    break;
+  case Match::InvalidCurrentDraw:
+  case Match::NotRequested:
+  case Match::ExactMatch:
+    break;
+  }
 }
 
 War3PersistentGpuPackageD3D9ObserveOwner::Submission

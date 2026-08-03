@@ -2464,6 +2464,11 @@ private:
     // fails; doing so can emit unrelated triangles that cover large screen
     // regions.
     bool captureComplete = false;
+    // Optional Observe-only content proof. It is sealed from the same exact
+    // current-frame CPU spans and generations as this Arena capture, but owns
+    // no GPU slice and cannot authorize a renderer mutation.
+    war3::gpu_skin::PersistentGpuPackageCurrentDrawProof
+        persistentPackageCurrentDrawProof = {};
 
     bool MatchesKey(const War3DrawTimeVBCacheKey& key) const {
       return instanceIdentity == key.instanceIdentity &&
@@ -2775,6 +2780,7 @@ private:
           requestedMode) noexcept;
   void War3ObservePersistentPackageD3D9Owner(
       const War3DrawTimeVBCacheKey& key,
+      const War3DrawTimeVBEntry& entry,
       const war3::gpu_skin::
           War3PersistentGpuPackageStage11ObserveAdapter::Evidence&
               evidence) noexcept;
