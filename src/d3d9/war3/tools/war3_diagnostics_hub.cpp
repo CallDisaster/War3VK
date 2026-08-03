@@ -708,6 +708,48 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       persistentPackageDiagnostics.currentDrawSkinningRejected;
   summary.persistentPackageCurrentDrawGeometryRejected =
       persistentPackageDiagnostics.currentDrawGeometryRejected;
+  summary.persistentPackageCurrentDrawGeometryPositionNotHostCached =
+      persistentPackageDiagnostics.currentDrawGeometryPositionNotHostCached;
+  summary.persistentPackageCurrentDrawGeometryIndexProofUnavailable =
+      persistentPackageDiagnostics.currentDrawGeometryIndexProofUnavailable;
+  summary.persistentPackageCurrentDrawBoundedIndexScans =
+      persistentPackageDiagnostics.currentDrawBoundedIndexScans;
+  summary.persistentPackageCurrentDrawBoundedIndexScanBytes =
+      persistentPackageDiagnostics.currentDrawBoundedIndexScanBytes;
+  summary.persistentPackageCurrentDrawBoundedIndexScanTicks =
+      persistentPackageDiagnostics.currentDrawBoundedIndexScanTicks;
+  summary.persistentPackageCurrentDrawBoundedPositionCopies =
+      persistentPackageDiagnostics.currentDrawBoundedPositionCopies;
+  summary.persistentPackageCurrentDrawBoundedPositionCopyBytes =
+      persistentPackageDiagnostics.currentDrawBoundedPositionCopyBytes;
+  summary.persistentPackageCurrentDrawBoundedPositionCopyTicks =
+      persistentPackageDiagnostics.currentDrawBoundedPositionCopyTicks;
+  summary.persistentPackageCurrentDrawContentHashBytes =
+      persistentPackageDiagnostics.currentDrawContentHashBytes;
+  summary.persistentPackageCurrentDrawContentHashTicks =
+      persistentPackageDiagnostics.currentDrawContentHashTicks;
+  summary.persistentPackageCurrentDrawProofBudgetRejected =
+      persistentPackageDiagnostics.currentDrawProofBudgetRejected;
+  summary.persistentPackageCaptureBoundedIndexScans =
+      persistentPackageDiagnostics.capture.boundedIndexScans;
+  summary.persistentPackageCaptureBoundedIndexScanBytes =
+      persistentPackageDiagnostics.capture.boundedIndexScanBytes;
+  summary.persistentPackageCaptureBoundedIndexScanTicks =
+      persistentPackageDiagnostics.capture.boundedIndexScanTicks;
+  summary.persistentPackageCaptureBoundedPositionCopies =
+      persistentPackageDiagnostics.capture.boundedPositionCopies;
+  summary.persistentPackageCaptureBoundedPositionCopyBytes =
+      persistentPackageDiagnostics.capture.boundedPositionCopyBytes;
+  summary.persistentPackageCaptureBoundedPositionCopyTicks =
+      persistentPackageDiagnostics.capture.boundedPositionCopyTicks;
+  summary.persistentPackageCaptureContentHashBytes =
+      persistentPackageDiagnostics.capture.contentHashBytes;
+  summary.persistentPackageCaptureContentHashTicks =
+      persistentPackageDiagnostics.capture.contentHashTicks;
+  summary.persistentPackageCaptureProofBudgetRejected =
+      persistentPackageDiagnostics.capture.proofBudgetRejected;
+  summary.persistentPackageCaptureTimerFrequency =
+      persistentPackageDiagnostics.capture.timerFrequency;
   summary.persistentPackageCurrentDrawCpuSourceUnavailable =
       persistentPackageDiagnostics.currentDrawCpuSourceUnavailable;
   summary.persistentPackageCurrentDrawSourceGenerationMissing =
@@ -2755,6 +2797,52 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.persistentPackageCurrentDrawSkinningRejected},
         {"persistentPackageCurrentDrawGeometryRejected",
          snapshot.shadow.persistentPackageCurrentDrawGeometryRejected},
+        {"persistentPackageCurrentDrawGeometryPositionNotHostCached",
+         snapshot.shadow
+             .persistentPackageCurrentDrawGeometryPositionNotHostCached},
+        {"persistentPackageCurrentDrawGeometryIndexProofUnavailable",
+         snapshot.shadow
+             .persistentPackageCurrentDrawGeometryIndexProofUnavailable},
+        {"persistentPackageCurrentDrawBoundedIndexScans",
+         snapshot.shadow.persistentPackageCurrentDrawBoundedIndexScans},
+        {"persistentPackageCurrentDrawBoundedIndexScanBytes",
+         snapshot.shadow.persistentPackageCurrentDrawBoundedIndexScanBytes},
+        {"persistentPackageCurrentDrawBoundedIndexScanTicks",
+         snapshot.shadow.persistentPackageCurrentDrawBoundedIndexScanTicks},
+        {"persistentPackageCurrentDrawBoundedPositionCopies",
+         snapshot.shadow.persistentPackageCurrentDrawBoundedPositionCopies},
+        {"persistentPackageCurrentDrawBoundedPositionCopyBytes",
+         snapshot.shadow
+             .persistentPackageCurrentDrawBoundedPositionCopyBytes},
+        {"persistentPackageCurrentDrawBoundedPositionCopyTicks",
+         snapshot.shadow
+             .persistentPackageCurrentDrawBoundedPositionCopyTicks},
+        {"persistentPackageCurrentDrawContentHashBytes",
+         snapshot.shadow.persistentPackageCurrentDrawContentHashBytes},
+        {"persistentPackageCurrentDrawContentHashTicks",
+         snapshot.shadow.persistentPackageCurrentDrawContentHashTicks},
+        {"persistentPackageCurrentDrawProofBudgetRejected",
+         snapshot.shadow.persistentPackageCurrentDrawProofBudgetRejected},
+        {"persistentPackageCaptureBoundedIndexScans",
+         snapshot.shadow.persistentPackageCaptureBoundedIndexScans},
+        {"persistentPackageCaptureBoundedIndexScanBytes",
+         snapshot.shadow.persistentPackageCaptureBoundedIndexScanBytes},
+        {"persistentPackageCaptureBoundedIndexScanTicks",
+         snapshot.shadow.persistentPackageCaptureBoundedIndexScanTicks},
+        {"persistentPackageCaptureBoundedPositionCopies",
+         snapshot.shadow.persistentPackageCaptureBoundedPositionCopies},
+        {"persistentPackageCaptureBoundedPositionCopyBytes",
+         snapshot.shadow.persistentPackageCaptureBoundedPositionCopyBytes},
+        {"persistentPackageCaptureBoundedPositionCopyTicks",
+         snapshot.shadow.persistentPackageCaptureBoundedPositionCopyTicks},
+        {"persistentPackageCaptureContentHashBytes",
+         snapshot.shadow.persistentPackageCaptureContentHashBytes},
+        {"persistentPackageCaptureContentHashTicks",
+         snapshot.shadow.persistentPackageCaptureContentHashTicks},
+        {"persistentPackageCaptureProofBudgetRejected",
+         snapshot.shadow.persistentPackageCaptureProofBudgetRejected},
+        {"persistentPackageCaptureTimerFrequency",
+         snapshot.shadow.persistentPackageCaptureTimerFrequency},
         {"persistentPackageCurrentDrawCpuSourceUnavailable",
          snapshot.shadow.persistentPackageCurrentDrawCpuSourceUnavailable},
         {"persistentPackageCurrentDrawSourceGenerationMissing",

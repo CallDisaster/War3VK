@@ -76,6 +76,12 @@ void ConfigurePersistentGpuPackageCurrentDrawRuntimeDiagnostics(
       ? 1u : 0u;
 }
 
+void PublishPersistentGpuPackageCaptureRuntimeDiagnostics(
+    const War3PersistentGpuPackageCaptureDiagnostics& diagnostics) noexcept {
+  std::lock_guard<std::mutex> lock(g_d3d9RuntimeDiagnosticsMutex);
+  g_d3d9RuntimeDiagnostics.capture = diagnostics;
+}
+
 War3PersistentGpuPackageD3D9RuntimeDiagnostics
 QueryPersistentGpuPackageD3D9RuntimeDiagnostics() noexcept {
   std::lock_guard<std::mutex> lock(g_d3d9RuntimeDiagnosticsMutex);
@@ -131,6 +137,8 @@ publishRuntimeDiagnostics(bool ownerAlive) const noexcept {
       g_d3d9RuntimeDiagnostics.configuredMode;
   const uint64_t currentDrawConfiguredMode =
       g_d3d9RuntimeDiagnostics.currentDrawConfiguredMode;
+  const War3PersistentGpuPackageCaptureDiagnostics capture =
+      g_d3d9RuntimeDiagnostics.capture;
   War3PersistentGpuPackageD3D9RuntimeDiagnostics published = {};
   published.configuredMode = configuredMode;
   published.effectiveMode =
@@ -186,6 +194,29 @@ publishRuntimeDiagnostics(bool ownerAlive) const noexcept {
       m_diagnostics.currentDrawSkinningRejected;
   published.currentDrawGeometryRejected =
       m_diagnostics.currentDrawGeometryRejected;
+  published.currentDrawGeometryPositionNotHostCached =
+      m_diagnostics.currentDrawGeometryPositionNotHostCached;
+  published.currentDrawGeometryIndexProofUnavailable =
+      m_diagnostics.currentDrawGeometryIndexProofUnavailable;
+  published.currentDrawBoundedIndexScans =
+      m_diagnostics.currentDrawBoundedIndexScans;
+  published.currentDrawBoundedIndexScanBytes =
+      m_diagnostics.currentDrawBoundedIndexScanBytes;
+  published.currentDrawBoundedIndexScanTicks =
+      m_diagnostics.currentDrawBoundedIndexScanTicks;
+  published.currentDrawBoundedPositionCopies =
+      m_diagnostics.currentDrawBoundedPositionCopies;
+  published.currentDrawBoundedPositionCopyBytes =
+      m_diagnostics.currentDrawBoundedPositionCopyBytes;
+  published.currentDrawBoundedPositionCopyTicks =
+      m_diagnostics.currentDrawBoundedPositionCopyTicks;
+  published.currentDrawContentHashBytes =
+      m_diagnostics.currentDrawContentHashBytes;
+  published.currentDrawContentHashTicks =
+      m_diagnostics.currentDrawContentHashTicks;
+  published.currentDrawProofBudgetRejected =
+      m_diagnostics.currentDrawProofBudgetRejected;
+  published.capture = capture;
   published.currentDrawCpuSourceUnavailable =
       m_diagnostics.currentDrawCpuSourceUnavailable;
   published.currentDrawSourceGenerationMissing =
@@ -220,6 +251,21 @@ publishRuntimeDiagnostics(bool ownerAlive) const noexcept {
 bool War3PersistentGpuPackageD3D9ObserveOwner::validEvidenceAndSnapshot(
     const Stage11Evidence& evidence,
     const model::ShadowGeosetResourceSnapshot& snapshot) const noexcept {
+  return validEvidence(evidence) && snapshot != nullptr &&
+      reinterpret_cast<uintptr_t>(snapshot->geosetDataPtr) ==
+          evidence.meshPayloadIdentity &&
+      snapshot->mapEpoch == evidence.mapEpoch &&
+      snapshot->contentHash == evidence.immutableContentHash &&
+      snapshot->immutableModelGeneration ==
+          evidence.immutableModelGeneration &&
+      snapshot->vertexCount == evidence.geosetVertexCount &&
+      snapshot->immutableCaptureStatus ==
+          model::ShadowGeosetImmutableCaptureStatus::Complete &&
+      snapshot->readyForShadowConsumer();
+}
+
+bool War3PersistentGpuPackageD3D9ObserveOwner::validEvidence(
+    const Stage11Evidence& evidence) const noexcept {
   using Adapter = War3PersistentGpuPackageStage11ObserveAdapter;
   return evidence.requestedMode == Adapter::Mode::Observe &&
       evidence.effectiveMode == Adapter::Mode::Observe &&
@@ -237,17 +283,7 @@ bool War3PersistentGpuPackageD3D9ObserveOwner::validEvidenceAndSnapshot(
       !evidence.packagePublicationAllowed &&
       evidence.eligibleConsumerMask == 0u &&
       evidence.wouldUseConsumerMask == 0u &&
-      evidence.actualConsumerMask == 0u && snapshot != nullptr &&
-      reinterpret_cast<uintptr_t>(snapshot->geosetDataPtr) ==
-          evidence.meshPayloadIdentity &&
-      snapshot->mapEpoch == evidence.mapEpoch &&
-      snapshot->contentHash == evidence.immutableContentHash &&
-      snapshot->immutableModelGeneration ==
-          evidence.immutableModelGeneration &&
-      snapshot->vertexCount == evidence.geosetVertexCount &&
-      snapshot->immutableCaptureStatus ==
-          model::ShadowGeosetImmutableCaptureStatus::Complete &&
-      snapshot->readyForShadowConsumer();
+      evidence.actualConsumerMask == 0u;
 }
 
 bool War3PersistentGpuPackageD3D9ObserveOwner::beginFrame(
@@ -291,7 +327,7 @@ War3PersistentGpuPackageD3D9ObserveOwner::observe(
     const PersistentGpuPackageCurrentDrawProof& currentDraw) noexcept {
   ++m_diagnostics.observeCalls;
   ObserveResult result = {};
-  if (!validEvidenceAndSnapshot(evidence, snapshot)) {
+  if (!validEvidence(evidence)) {
     result.disposition = Disposition::InvalidEvidence;
     ++m_diagnostics.invalidEvidence;
     return result;
@@ -301,6 +337,23 @@ War3PersistentGpuPackageD3D9ObserveOwner::observe(
     result.disposition = Disposition::EpochRejected;
     result.fallback = GpuSkinFallbackReason::InvalidEpoch;
     ++m_diagnostics.epochRejects;
+    return result;
+  }
+
+  const auto currentDrawPreflight =
+      EvaluatePersistentGpuPackageCurrentDrawEquivalence(currentDraw, {});
+  if (currentDraw.requested &&
+      currentDrawPreflight !=
+          PersistentGpuPackageCurrentDrawMatchDisposition::PackageNotReady) {
+    result.disposition = Disposition::CurrentDrawRejected;
+    result.currentDrawDisposition = currentDrawPreflight;
+    noteCurrentDrawDisposition(currentDrawPreflight, currentDraw);
+    return result;
+  }
+  if (!validEvidenceAndSnapshot(evidence, snapshot)) {
+    result.disposition = Disposition::InvalidSnapshot;
+    result.fallback = GpuSkinFallbackReason::StaticResourceInvalid;
+    ++m_diagnostics.invalidSnapshots;
     return result;
   }
 
@@ -340,27 +393,64 @@ War3PersistentGpuPackageD3D9ObserveOwner::observe(
       const auto& frozen = resource.frozenPayload;
       currentPackage.ready = true;
       currentPackage.frozenPayloadValid =
-          frozen != nullptr && ValidateGpuSkinStaticPackage(resource);
+          frozen != nullptr &&
+          resource.state == GpuSkinStaticResourceState::Ready &&
+          resource.readyValidationAuthority != 0u &&
+          resource.readyValidationAuthority ==
+              frozen->storeInstanceAuthority();
       if (currentPackage.frozenPayloadValid) {
         const auto& packageProof = frozen->packageProof();
-        const auto& immutableProof = frozen->immutableProof();
         const auto& primitiveProofs = frozen->primitiveProofs();
         currentPackage.mapEpoch = packageProof.mapEpoch;
         currentPackage.deviceEpoch = packageProof.deviceEpoch;
         currentPackage.packageGeneration = packageProof.packageGeneration;
         currentPackage.geosetDataIdentity = packageProof.geosetData;
-        currentPackage.positionContentHash =
-            immutableProof.positionContentHash;
-        currentPackage.indexContentHash = immutableProof.indexContentHash;
-        currentPackage.vertexCount = immutableProof.vertexCount;
-        currentPackage.indexCount = immutableProof.indexCount;
         currentPackage.primitiveCount =
             uint32_t(primitiveProofs.size());
         currentPackage.snapshotIdentityExact =
             frozen->snapshotIdentity() == currentSnapshot.get() &&
             frozen->record().get() == currentSnapshot.get();
-        if (primitiveProofs.size() == 1u) {
-          const auto& primitive = primitiveProofs.front();
+        auto selected = primitiveProofs.end();
+        bool ambiguousSelection = false;
+        for (auto it = primitiveProofs.begin();
+             it != primitiveProofs.end(); ++it) {
+          const bool exactPrimitive =
+              it->indexCount == currentDraw.indexCount &&
+              it->minVertex == currentDraw.actualIndexMin &&
+              it->maxVertex == currentDraw.actualIndexMax &&
+              it->indexContentHash == currentDraw.indexContentHash;
+          if (!exactPrimitive)
+            continue;
+          if (selected != primitiveProofs.end()) {
+            ambiguousSelection = true;
+            break;
+          }
+          selected = it;
+        }
+        if (!ambiguousSelection && selected != primitiveProofs.end() &&
+            currentDraw.actualIndexMax >= currentDraw.actualIndexMin &&
+            frozen->record() != nullptr) {
+          const auto& primitive = *selected;
+          const auto& record = *frozen->record();
+          const uint64_t vertexCount =
+              uint64_t(primitive.maxVertex) - primitive.minVertex + 1u;
+          const uint64_t firstFloat = uint64_t(primitive.minVertex) * 3u;
+          const uint64_t floatCount = vertexCount * 3u;
+          if (vertexCount <= std::numeric_limits<uint32_t>::max() &&
+              firstFloat <= record.positions.size() &&
+              floatCount <= record.positions.size() - firstFloat &&
+              floatCount <=
+                  std::numeric_limits<size_t>::max() / sizeof(float)) {
+            currentPackage.positionContentHash =
+                HashPersistentGpuPackageContent(
+                    record.positions.data() + size_t(firstFloat),
+                    size_t(floatCount) * sizeof(float));
+            currentPackage.indexContentHash = primitive.indexContentHash;
+            currentPackage.vertexCount = uint32_t(vertexCount);
+            currentPackage.indexCount = primitive.indexCount;
+            currentPackage.primitiveSelected =
+                currentPackage.positionContentHash != 0u;
+          }
           currentPackage.primitiveOrdinal = primitive.ordinal;
           currentPackage.primitiveFirstIndex = primitive.firstIndex;
           currentPackage.primitiveIndexCount = primitive.indexCount;
@@ -386,11 +476,11 @@ War3PersistentGpuPackageD3D9ObserveOwner::observe(
             currentDraw, currentPackage);
     if (result.currentDrawDisposition ==
         PersistentGpuPackageCurrentDrawMatchDisposition::ExactMatch) {
-      // Exact content equality is still not renderer authority. Recompute the
-      // Store-frozen CPU proof only for this narrow candidate before reporting
-      // would-use; no slice escapes and the canonical Arena draw remains live.
-      if (!lookup ||
-          !ValidateGpuSkinStaticFrozenPayload(*lookup.resource)) {
+      // Exact content equality is still not renderer authority. The Store's
+      // readyValidationAuthority was minted only after producer-fence
+      // completion and full frozen-payload validation; re-check that immutable
+      // publication here without re-walking the model on every draw.
+      if (!lookup || !currentPackage.frozenPayloadValid) {
         result.currentDrawDisposition =
             PersistentGpuPackageCurrentDrawMatchDisposition::PackageInvalid;
       } else {
@@ -401,7 +491,7 @@ War3PersistentGpuPackageD3D9ObserveOwner::observe(
         result.wouldUseConsumerMask = result.eligibleConsumerMask;
       }
     }
-    noteCurrentDrawDisposition(result.currentDrawDisposition);
+    noteCurrentDrawDisposition(result.currentDrawDisposition, currentDraw);
 
     if (m_preparedThisFrame < kMaxPreparesPerFrame) {
       const uint32_t remaining =
@@ -419,12 +509,33 @@ War3PersistentGpuPackageD3D9ObserveOwner::observe(
 }
 
 void War3PersistentGpuPackageD3D9ObserveOwner::noteCurrentDrawDisposition(
-    PersistentGpuPackageCurrentDrawMatchDisposition disposition) noexcept {
+    PersistentGpuPackageCurrentDrawMatchDisposition disposition,
+    const PersistentGpuPackageCurrentDrawProof& currentDraw) noexcept {
   using Match = PersistentGpuPackageCurrentDrawMatchDisposition;
   m_diagnostics.currentDrawLastDisposition = uint64_t(disposition);
   if (disposition == Match::NotRequested)
     return;
   ++m_diagnostics.currentDrawObservations;
+  if (currentDraw.boundedUncachedIndexScan) {
+    ++m_diagnostics.currentDrawBoundedIndexScans;
+    m_diagnostics.currentDrawBoundedIndexScanBytes +=
+        currentDraw.boundedIndexScanBytes;
+    m_diagnostics.currentDrawBoundedIndexScanTicks +=
+        currentDraw.boundedIndexScanTicks;
+  }
+  if (currentDraw.boundedUncachedPositionCopy) {
+    ++m_diagnostics.currentDrawBoundedPositionCopies;
+    m_diagnostics.currentDrawBoundedPositionCopyBytes +=
+        currentDraw.boundedPositionCopyBytes;
+    m_diagnostics.currentDrawBoundedPositionCopyTicks +=
+        currentDraw.boundedPositionCopyTicks;
+  }
+  m_diagnostics.currentDrawContentHashBytes +=
+      currentDraw.contentHashBytes;
+  m_diagnostics.currentDrawContentHashTicks +=
+      currentDraw.contentHashTicks;
+  if (currentDraw.boundedIndexScanBudgetRejected)
+    ++m_diagnostics.currentDrawProofBudgetRejected;
   if (disposition == Match::ExactMatch) {
     ++m_diagnostics.currentDrawExactMatches;
     ++m_diagnostics.currentDrawWouldUseCsm;
@@ -443,6 +554,32 @@ void War3PersistentGpuPackageD3D9ObserveOwner::noteCurrentDrawDisposition(
     break;
   case Match::GeometryContractRejected:
     ++m_diagnostics.currentDrawGeometryRejected;
+    if (!currentDraw.indexed)
+      ++m_diagnostics.currentDrawGeometryNonIndexed;
+    if (!currentDraw.triangleList)
+      ++m_diagnostics.currentDrawGeometryNonTriangleList;
+    if (!currentDraw.uint16Indices)
+      ++m_diagnostics.currentDrawGeometryNonUint16;
+    if (!currentDraw.exactIndexDomainKnown)
+      ++m_diagnostics.currentDrawGeometryIndexDomainUnknown;
+    if (currentDraw.fullVertexDomainFallback)
+      ++m_diagnostics.currentDrawGeometryFullDomainFallback;
+    if (!currentDraw.exactContiguousVertexRange)
+      ++m_diagnostics.currentDrawGeometryNonContiguousRange;
+    if (!currentDraw.positionFloat3)
+      ++m_diagnostics.currentDrawGeometryPositionNotFloat3;
+    if (!currentDraw.positionHostCached)
+      ++m_diagnostics.currentDrawGeometryPositionNotHostCached;
+    if (!currentDraw.indexHostCached &&
+        !currentDraw.indexBoundedObserveReadable) {
+      ++m_diagnostics.currentDrawGeometryIndexProofUnavailable;
+    }
+    if (currentDraw.actualIndexMax < currentDraw.actualIndexMin ||
+        uint64_t(currentDraw.actualIndexMax) -
+                uint64_t(currentDraw.actualIndexMin) + 1u !=
+            currentDraw.vertexCount) {
+      ++m_diagnostics.currentDrawGeometryVertexCountMismatch;
+    }
     break;
   case Match::CpuSourceUnavailable:
     ++m_diagnostics.currentDrawCpuSourceUnavailable;
@@ -459,7 +596,8 @@ void War3PersistentGpuPackageD3D9ObserveOwner::noteCurrentDrawDisposition(
   case Match::SnapshotMismatch:
     ++m_diagnostics.currentDrawSnapshotMismatch;
     break;
-  case Match::MultiPrimitiveRejected:
+  // MultiPrimitiveRejected is the compatibility alias for this counter.
+  case Match::PrimitiveSelectionRejected:
     ++m_diagnostics.currentDrawMultiPrimitiveRejected;
     break;
   case Match::PackageLayoutMismatch:

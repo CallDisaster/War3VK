@@ -441,12 +441,12 @@ GpuSkinStaticLookup War3PersistentGpuPackageStore::findOrQueueStatic(
     if (ready->second != nullptr &&
         ready->second->state == GpuSkinStaticResourceState::Ready) {
       const bool exactLayout = ownsFrozenPayload(*ready->second) &&
+          ready->second->readyValidationAuthority == m_instanceAuthority &&
           ready->second->record != nullptr &&
           ready->second->record->contentHash == snapshot.contentHash &&
           ready->second->record->immutableModelGeneration ==
               snapshot.immutableModelGeneration &&
-          ready->second->record->vertexCount == snapshot.vertexCount &&
-          ValidateGpuSkinStaticPackage(*ready->second);
+          ready->second->record->vertexCount == snapshot.vertexCount;
       if (!exactLayout) {
         recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
         return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
@@ -574,7 +574,7 @@ GpuSkinStaticLookup War3PersistentGpuPackageStore::probeStatic(
           stamp.immutableModelGeneration ||
       record->vertexCount != stamp.vertexCount ||
       !ownsFrozenPayload(*resource) ||
-      !ValidateGpuSkinStaticPackage(*resource)) {
+      resource->readyValidationAuthority != m_instanceAuthority) {
     recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
     return {nullptr, GpuSkinFallbackReason::StaticResourceInvalid};
   }
@@ -963,6 +963,7 @@ bool War3PersistentGpuPackageStore::retireStaticUploads(
   for (PreparedRetirement& item : prepared)
     m_retiredStaticUploads.push_back(std::move(item.retirement));
   for (PreparedRetirement& item : prepared) {
+    item.resource->readyValidationAuthority = 0u;
     item.resource->state = GpuSkinStaticResourceState::UploadSubmitted;
     item.resource->pendingUpload = {};
   }
@@ -999,6 +1000,7 @@ void War3PersistentGpuPackageStore::completeRetiredStaticUpload(
   if (exactSubmittedPayload) {
     resource->state = GpuSkinStaticResourceState::Ready;
     if (ValidateGpuSkinStaticPackage(*resource)) {
+      resource->readyValidationAuthority = m_instanceAuthority;
       resource_census::UpdateHostBacking(
           resource->residencyCensus, 0u, 0u, 0u);
       resource_census::NoteDeviceUpload(resource->residencyCensus, 0u);
@@ -1008,8 +1010,10 @@ void War3PersistentGpuPackageStore::completeRetiredStaticUpload(
     }
   }
 
-  if (resource != nullptr)
+  if (resource != nullptr) {
+    resource->readyValidationAuthority = 0u;
     resource->state = GpuSkinStaticResourceState::Invalid;
+  }
   ++m_diagnostics.staticUploadCompletionsRejected;
   recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
   retirement.publicationResource.reset();

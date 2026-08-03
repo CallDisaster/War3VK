@@ -39,7 +39,11 @@ enum class PersistentGpuPackageCurrentDrawMatchDisposition : uint8_t {
   PackageNotReady,
   PackageInvalid,
   SnapshotMismatch,
-  MultiPrimitiveRejected,
+  PrimitiveSelectionRejected,
+  // Compatibility spelling for existing runtime diagnostics. Multiple
+  // primitives are valid now; rejection means no unique exact primitive was
+  // selected from the immutable package.
+  MultiPrimitiveRejected = PrimitiveSelectionRejected,
   PackageLayoutMismatch,
   PositionContentMismatch,
   IndexContentMismatch,
@@ -68,13 +72,21 @@ struct PersistentGpuPackageCurrentDrawProof {
   uint64_t indexContentGeneration = 0u;
   uint64_t positionContentHash = 0u;
   uint64_t indexContentHash = 0u;
+  uint64_t boundedIndexScanTicks = 0u;
+  uint64_t boundedPositionCopyTicks = 0u;
+  uint64_t contentHashTicks = 0u;
   uint32_t vertexCount = 0u;
   uint32_t indexCount = 0u;
+  uint32_t boundedIndexScanBytes = 0u;
+  uint32_t boundedPositionCopyBytes = 0u;
+  uint32_t contentHashBytes = 0u;
+  uint32_t sourceVertexFirst = 0u;
   uint32_t sourceFirstIndex = 0u;
   uint32_t actualIndexMin = 0u;
   uint32_t actualIndexMax = 0u;
   uint32_t positionStride = 0u;
   uint32_t positionOffset = 0u;
+  int32_t baseVertexIndex = 0;
   bool requested = false;
   bool sealed = false;
   bool rigidStatic = false;
@@ -86,10 +98,15 @@ struct PersistentGpuPackageCurrentDrawProof {
   bool uint16Indices = false;
   bool exactIndexDomainKnown = false;
   bool fullVertexDomainFallback = false;
-  bool zeroBasedVertexRange = false;
+  bool exactContiguousVertexRange = false;
   bool positionFloat3 = false;
   bool positionHostCached = false;
+  bool positionBoundedObserveReadable = false;
   bool indexHostCached = false;
+  bool indexBoundedObserveReadable = false;
+  bool boundedUncachedPositionCopy = false;
+  bool boundedUncachedIndexScan = false;
+  bool boundedIndexScanBudgetRejected = false;
 };
 
 // Store-owned frozen payload fields copied into a value view immediately
@@ -113,6 +130,7 @@ struct PersistentGpuPackageCurrentDrawPackageProof {
   bool ready = false;
   bool frozenPayloadValid = false;
   bool snapshotIdentityExact = false;
+  bool primitiveSelected = false;
 };
 
 PersistentGpuPackageCurrentDrawMatchDisposition

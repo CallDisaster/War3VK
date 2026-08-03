@@ -22808,13 +22808,22 @@ void D3D9DeviceEx::War3ObservePersistentPackageD3D9Owner(
       m_war3PersistentPackageD3D9ObserveOwner =
           std::make_unique<PackageOwner>(m_dxvkDevice);
     }
-    const auto packageSnapshot =
-        dxvk::war3::model::ShadowModelResourceCache::instance()
-            .findGeosetSnapshotByData(key.meshPayloadPtr);
+    using Match = dxvk::war3::gpu_skin::
+        PersistentGpuPackageCurrentDrawMatchDisposition;
+    const auto& currentDraw = entry.persistentPackageCurrentDrawProof;
+    const Match currentDrawPreflight =
+        dxvk::war3::gpu_skin::
+            EvaluatePersistentGpuPackageCurrentDrawEquivalence(
+                currentDraw, {});
+    const bool currentDrawRejectedBeforePackage =
+        currentDraw.requested && currentDrawPreflight != Match::PackageNotReady;
+    const auto packageSnapshot = currentDrawRejectedBeforePackage
+        ? dxvk::war3::model::ShadowGeosetResourceSnapshot{}
+        : dxvk::war3::model::ShadowModelResourceCache::instance()
+              .findGeosetSnapshotByData(key.meshPayloadPtr);
     packageResult =
         m_war3PersistentPackageD3D9ObserveOwner->observe(
-            evidence, packageSnapshot,
-            entry.persistentPackageCurrentDrawProof);
+            evidence, packageSnapshot, currentDraw);
     packageSubmission =
         m_war3PersistentPackageD3D9ObserveOwner->takeSubmission();
     if (packageSubmission) {
@@ -22860,7 +22869,7 @@ void D3D9DeviceEx::War3ObservePersistentPackageD3D9Owner(
       (packageDiagnostics.observeCalls % 4096u) != 0u) {
     return;
   }
-  char packageLine[1024] = {};
+  char packageLine[1536] = {};
   std::snprintf(
       packageLine, sizeof(packageLine),
       "DXVK War3PackageD3D9Owner: calls=%llu exact=%llu "
@@ -22869,6 +22878,11 @@ void D3D9DeviceEx::War3ObservePersistentPackageD3D9Owner(
       "fence=%llu/%llu completion=%llu/%llu disposition=%u "
       "packageGeneration=%llu primitiveCount=%u recorded=%u "
       "currentDrawDisposition=%u equivalent=%u wouldUse=0x%x "
+      "geom=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+      "source=%llu/%llu scan=%llu/%llu/%llu copy=%llu/%llu/%llu "
+      "hash=%llu/%llu budget=%llu "
+      "captureScan=%llu/%llu/%llu captureCopy=%llu/%llu/%llu "
+      "captureHash=%llu/%llu captureBudget=%llu "
       "binding=0 mutation=0 consumerAuthority=0",
       static_cast<unsigned long long>(packageDiagnostics.observeCalls),
       static_cast<unsigned long long>(
@@ -22907,7 +22921,65 @@ void D3D9DeviceEx::War3ObservePersistentPackageD3D9Owner(
       packageSubmissionRecorded ? 1u : 0u,
       static_cast<unsigned>(packageResult.currentDrawDisposition),
       packageResult.fullyEquivalent ? 1u : 0u,
-      packageResult.wouldUseConsumerMask);
+      packageResult.wouldUseConsumerMask,
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryRejected),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryNonIndexed),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryNonTriangleList),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryNonUint16),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryIndexDomainUnknown),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryFullDomainFallback),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryNonContiguousRange),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryPositionNotFloat3),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryVertexCountMismatch),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryPositionNotHostCached),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawGeometryIndexProofUnavailable),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawBoundedIndexScans),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawBoundedIndexScanBytes),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawBoundedIndexScanTicks),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawBoundedPositionCopies),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawBoundedPositionCopyBytes),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawBoundedPositionCopyTicks),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawContentHashBytes),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawContentHashTicks),
+      static_cast<unsigned long long>(
+          packageDiagnostics.currentDrawProofBudgetRejected),
+      static_cast<unsigned long long>(
+          m_war3PersistentPackageCaptureIndexScans),
+      static_cast<unsigned long long>(
+          m_war3PersistentPackageCaptureIndexScanBytes),
+      static_cast<unsigned long long>(
+          m_war3PersistentPackageCaptureIndexScanTicks),
+      static_cast<unsigned long long>(
+          m_war3PersistentPackageCapturePositionCopies),
+      static_cast<unsigned long long>(
+          m_war3PersistentPackageCapturePositionCopyBytes),
+      static_cast<unsigned long long>(
+          m_war3PersistentPackageCapturePositionCopyTicks),
+      static_cast<unsigned long long>(
+          m_war3PersistentPackageCaptureContentHashBytes),
+      static_cast<unsigned long long>(
+          m_war3PersistentPackageCaptureContentHashTicks),
+      static_cast<unsigned long long>(
+          m_war3PersistentPackageCaptureProofBudgetRejected));
   Logger::info(packageLine);
 }
 
@@ -23415,6 +23487,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
       m_war3Scene.shadowStats.semanticSceneSubmittedAlphaBlend++;
     m_war3Scene.shadowStats.drawTimeSemanticProducerSubmittedCount++;
     entry.exactSubmittedFrameSerial = m_war3ShadowPersistentFrameSerial;
+    entry.packageLastSubmittedCaptureOrdinal = entry.packageCaptureOrdinal;
     if (packageStage11EvidenceMode != dxvk::war3::gpu_skin::
             War3PersistentGpuPackageStage11ObserveAdapter::Mode::Off) {
       War3ObservePersistentPackageStage11Evidence(
@@ -40132,6 +40205,51 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         bool actualIndexDomainKnown = false;
         bool fullVertexDomainFallback = false;
         bool indexHintMismatch = false;
+        using PersistentPackageMode = dxvk::war3::gpu_skin::
+            War3PersistentGpuPackageStage11ObserveAdapter::Mode;
+        const PersistentPackageMode currentDrawPackageMode =
+            War3PersistentPackageCurrentDrawEquivalenceModeRuntime();
+        const bool persistentPackageObserveEnabled =
+            currentDrawPackageMode == PersistentPackageMode::Observe &&
+            War3PersistentPackageD3D9OwnerModeRuntime() ==
+                PersistentPackageMode::Observe &&
+            War3PersistentPackageStage11EvidenceModeRuntime() ==
+                PersistentPackageMode::Observe;
+        dxvk::war3::memory::War3CpuReadableBufferSpan
+            packageObserveIndexReadableSpan = {};
+        const uint8_t* packageObserveIndexBytes = nullptr;
+        uint64_t packageObserveIndexContentHash = 0u;
+        uint64_t packageObserveIndexScanTicks = 0u;
+        uint32_t packageObserveIndexScanBytes = 0u;
+        uint32_t packageObserveIndexMin = 0u;
+        uint32_t packageObserveIndexMax = 0u;
+        bool packageObserveIndexDomainKnown = false;
+        bool packageObserveUncachedIndexScan = false;
+        bool packageObserveProofBudgetRejected = false;
+        uint32_t packageCurrentCaptureOrdinal = 1u;
+        if (persistentPackageObserveEnabled &&
+            m_war3PersistentPackageIndexScanFrameSerial !=
+                m_war3ShadowPersistentFrameSerial) {
+          dxvk::war3::gpu_skin::
+              PublishPersistentGpuPackageCaptureRuntimeDiagnostics({
+                  m_war3PersistentPackageCaptureIndexScans,
+                  m_war3PersistentPackageCaptureIndexScanBytes,
+                  m_war3PersistentPackageCaptureIndexScanTicks,
+                  m_war3PersistentPackageCapturePositionCopies,
+                  m_war3PersistentPackageCapturePositionCopyBytes,
+                  m_war3PersistentPackageCapturePositionCopyTicks,
+                  m_war3PersistentPackageCaptureContentHashBytes,
+                  m_war3PersistentPackageCaptureContentHashTicks,
+                  m_war3PersistentPackageCaptureProofBudgetRejected,
+                  uint64_t((std::max)(
+                      int64_t{1},
+                      dxvk::high_resolution_clock::get_frequency()))});
+          m_war3PersistentPackageIndexScanFrameSerial =
+              m_war3ShadowPersistentFrameSerial;
+          m_war3PersistentPackageIndexProofBytesThisFrame = 0u;
+          m_war3PersistentPackageProofTicksThisFrame = 0u;
+          m_war3PersistentPackagePositionHashBytesThisFrame = 0u;
+        }
         if (indexed) {
           auto* ib = m_state.indices.ptr();
           if (DynamicSysmemIBO) {
@@ -40306,6 +40424,178 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   uint64_t(MinVertexIndex) + uint64_t(NumVertices);
               indexHintMismatch = actualIndexMin < MinVertexIndex ||
                   uint64_t(actualIndexMax) >= hintedEnd;
+            }
+          }
+
+          if (persistentPackageObserveEnabled &&
+              actualIndexDomainKnown && drawTimeIndexBytes != nullptr) {
+            packageObserveIndexReadableSpan = currentIndexReadableSpan;
+            packageObserveIndexBytes = drawTimeIndexBytes;
+            packageObserveIndexMin = actualIndexMin;
+            packageObserveIndexMax = actualIndexMax;
+            packageObserveIndexDomainKnown = true;
+          } else if (persistentPackageObserveEnabled &&
+                     drawTimeIndexType == VK_INDEX_TYPE_UINT16 &&
+                     drawTimeIndexCommon != nullptr &&
+                     drawTimeIndexMappedAllocation != nullptr &&
+                     !drawTimeIndexCommon->NeedsReadback()) {
+            // Observe-only proof for Warcraft's WRITEONLY index buffers.  The
+            // canonical shadow path above deliberately keeps these mappings
+            // CPU-opaque and freezes the complete VB.  This bounded scan is
+            // never fed back into vRangeStart, Arena allocation or command
+            // recording; it only tests whether an immutable package would
+            // describe this exact rigid/opaque draw.
+            constexpr uint64_t kMaxIndexBytesPerDraw = 8u * 1024u;
+            constexpr uint64_t kMaxIndexBytesPerFrame = 32u * 1024u;
+            const auto packageObjectKind =
+                vbCacheContract.objectKind !=
+                        dxvk::war3::render::ObjectKind::Unknown
+                    ? vbCacheContract.objectKind
+                    : semantic.objectKind;
+            const bool packageRigidObject =
+                (packageObjectKind ==
+                     dxvk::war3::render::ObjectKind::Building ||
+                 packageObjectKind ==
+                     dxvk::war3::render::ObjectKind::Destructible) &&
+                !War3SemanticContextHasDynamicPoseEvidence(semantic) &&
+                !gpuSkinSemanticBacking && !gpuSkinSemanticInputExact &&
+                !vbCacheContract.pathBlocker && !semantic.pathBlocker &&
+                !IsLosBlockerFourCc(pathBlockerRawcode);
+            const bool packageOpaqueMaterial =
+                (m_state.renderStates[D3DRS_ALPHATESTENABLE] == FALSE ||
+                 m_state.renderStates[D3DRS_ALPHAFUNC] == D3DCMP_ALWAYS) &&
+                m_state.renderStates[D3DRS_ALPHABLENDENABLE] == FALSE;
+            const bool packageVertexBlendEnabled =
+                m_state.renderStates[D3DRS_VERTEXBLEND] != D3DVBF_DISABLE ||
+                m_state.renderStates[D3DRS_INDEXEDVERTEXBLENDENABLE] != FALSE;
+            // Spend the bounded Observe budget only on the capture ordinal
+            // which this full key's exact Stage11 owner selected in the
+            // immediately preceding business frame. This is only an admission
+            // hint: current bytes and generations are still proven below.
+            const auto previousPackageEntry =
+                m_war3DrawTimeVBCache.find(vbCacheKey);
+            if (previousPackageEntry != m_war3DrawTimeVBCache.end() &&
+                previousPackageEntry->second.frameSerial ==
+                    m_war3ShadowPersistentFrameSerial) {
+              packageCurrentCaptureOrdinal =
+                  previousPackageEntry->second.packageCaptureOrdinal ==
+                          UINT32_MAX
+                      ? UINT32_MAX
+                      : previousPackageEntry->second.packageCaptureOrdinal +
+                            1u;
+            }
+            const bool previousFrameFinalCaster =
+                previousPackageEntry != m_war3DrawTimeVBCache.end() &&
+                previousPackageEntry->second.exactSubmittedFrameSerial != 0u &&
+                previousPackageEntry->second.exactSubmittedFrameSerial <
+                    m_war3ShadowPersistentFrameSerial &&
+                m_war3ShadowPersistentFrameSerial -
+                        previousPackageEntry->second.exactSubmittedFrameSerial ==
+                    1u;
+            const bool predictedFinalCapture =
+                previousFrameFinalCaster &&
+                previousPackageEntry->second
+                        .packageLastSubmittedCaptureOrdinal != 0u &&
+                packageCurrentCaptureOrdinal ==
+                    previousPackageEntry->second
+                        .packageLastSubmittedCaptureOrdinal;
+            const bool cheapCandidate = predictedFinalCapture &&
+                packageRigidObject &&
+                packageOpaqueMaterial && !packageVertexBlendEnabled &&
+                PrimitiveType == D3DPT_TRIANGLELIST &&
+                declInfo.posType == D3DDECLTYPE_FLOAT3 &&
+                static_cast<bool>(posReadableSpan) &&
+                drawTimeIndexRangeBytes != 0u &&
+                uint64_t(drawTimeIndexRangeBytes) <=
+                    kMaxIndexBytesPerDraw;
+            if (cheapCandidate) {
+              const auto allocationInfo =
+                  drawTimeIndexMappedAllocation->getBufferInfo();
+              const bool mappedHostVisible =
+                  (drawTimeIndexMappedAllocation->getMemoryProperties() &
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+              packageObserveIndexReadableSpan =
+                  dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                      drawTimeIndexMappedAllocation->mapPtr(),
+                      uint64_t(allocationInfo.size), rangeOffset64,
+                      rangeBytes64,
+                      reinterpret_cast<uintptr_t>(drawTimeIndexCommon),
+                      drawTimeIndexCommon->War3IdentityGeneration(),
+                      drawTimeIndexCommon->War3MapAllocationGeneration(),
+                      drawTimeIndexCommon->War3ContentGeneration(),
+                      mappedHostVisible});
+              const uint64_t timerFrequency = uint64_t((std::max)(
+                  int64_t{1}, dxvk::high_resolution_clock::get_frequency()));
+              const uint64_t proofTickBudget = (std::max)(
+                  uint64_t{1}, timerFrequency / 10000u); // 0.10 ms/frame
+              const bool byteBudgetAvailable =
+                  m_war3PersistentPackageIndexProofBytesThisFrame <=
+                      kMaxIndexBytesPerFrame &&
+                  uint64_t(drawTimeIndexRangeBytes) <=
+                      kMaxIndexBytesPerFrame -
+                          m_war3PersistentPackageIndexProofBytesThisFrame;
+              const bool timeBudgetAvailable =
+                  m_war3PersistentPackageProofTicksThisFrame <
+                      proofTickBudget;
+              if (byteBudgetAvailable && timeBudgetAvailable) {
+                if (packageObserveIndexReadableSpan) {
+                  alignas(64) static thread_local
+                      std::array<uint8_t, kMaxIndexBytesPerDraw>
+                          s_packageIndexScratch = {};
+                  const int64_t scanBegin =
+                      dxvk::high_resolution_clock::get_counter();
+                  std::memcpy(
+                      s_packageIndexScratch.data(),
+                      packageObserveIndexReadableSpan.data,
+                      size_t(drawTimeIndexRangeBytes));
+                  packageObserveIndexMin =
+                      std::numeric_limits<uint32_t>::max();
+                  packageObserveIndexMax = 0u;
+                  for (uint32_t indexOrdinal = 0u;
+                       indexOrdinal < CountVal; ++indexOrdinal) {
+                    uint16_t indexValue = 0u;
+                    std::memcpy(
+                        &indexValue,
+                        s_packageIndexScratch.data() +
+                            size_t(indexOrdinal) * sizeof(uint16_t),
+                        sizeof(indexValue));
+                    packageObserveIndexMin = (std::min)(
+                        packageObserveIndexMin, uint32_t(indexValue));
+                    packageObserveIndexMax = (std::max)(
+                        packageObserveIndexMax, uint32_t(indexValue));
+                  }
+                  packageObserveIndexContentHash =
+                      dxvk::war3::gpu_skin::
+                          HashPersistentGpuPackageContent(
+                              s_packageIndexScratch.data(),
+                              size_t(drawTimeIndexRangeBytes));
+                  const int64_t scanEnd =
+                      dxvk::high_resolution_clock::get_counter();
+                  packageObserveIndexScanTicks =
+                      scanEnd > scanBegin
+                          ? uint64_t(scanEnd - scanBegin) : 0u;
+                  packageObserveIndexScanBytes =
+                      uint32_t(drawTimeIndexRangeBytes);
+                  packageObserveIndexBytes =
+                      s_packageIndexScratch.data();
+                  packageObserveIndexDomainKnown =
+                      packageObserveIndexMin <= packageObserveIndexMax &&
+                      packageObserveIndexContentHash != 0u;
+                  packageObserveUncachedIndexScan = true;
+                  ++m_war3PersistentPackageCaptureIndexScans;
+                  m_war3PersistentPackageCaptureIndexScanBytes +=
+                      uint64_t(drawTimeIndexRangeBytes);
+                  m_war3PersistentPackageCaptureIndexScanTicks +=
+                      packageObserveIndexScanTicks;
+                  m_war3PersistentPackageIndexProofBytesThisFrame +=
+                      uint64_t(drawTimeIndexRangeBytes);
+                  m_war3PersistentPackageProofTicksThisFrame +=
+                      packageObserveIndexScanTicks;
+                }
+              } else {
+                packageObserveProofBudgetRejected = true;
+                ++m_war3PersistentPackageCaptureProofBudgetRejected;
+              }
             }
           }
         }
@@ -40849,6 +41139,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             exactUnitIdentityProven && !entry.pathBlocker;
         entry.vertexCount = vRangeCount;
         entry.frameSerial = m_war3ShadowPersistentFrameSerial;
+        entry.packageCaptureOrdinal = packageCurrentCaptureOrdinal;
         entry.positionStride = posStride;
         entry.positionOffset = capturePositionOffset;
         entry.positionFormat = capturePositionFormat;
@@ -41379,11 +41670,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             uint64_t(entry.positionCapacity) + uint64_t(entry.indexCapacity) +
             (entry.uvSharesPositionBuffer ? 0u : uint64_t(entry.uvCapacity));
 
-        using PackageMode = dxvk::war3::gpu_skin::
-            War3PersistentGpuPackageStage11ObserveAdapter::Mode;
-        const PackageMode currentDrawPackageMode =
-            War3PersistentPackageCurrentDrawEquivalenceModeRuntime();
-        if (currentDrawPackageMode == PackageMode::Consume) {
+        if (currentDrawPackageMode == PersistentPackageMode::Consume) {
           static std::atomic<bool> s_currentDrawConsumeDeniedLogged{false};
           if (!s_currentDrawConsumeDeniedLogged.exchange(
                   true, std::memory_order_relaxed)) {
@@ -41391,8 +41678,28 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 "DXVK War3PackageCurrentDraw: Consume denied; exact "
                 "equivalence observer cannot bind or mutate draws");
           }
-        } else if (currentDrawPackageMode == PackageMode::Observe) {
+        } else if (currentDrawPackageMode == PersistentPackageMode::Observe) {
           auto& proof = entry.persistentPackageCurrentDrawProof;
+          const int64_t packageVertexStart =
+              int64_t(BaseVertexIndex) + int64_t(packageObserveIndexMin);
+          const uint64_t packageVertexCount =
+              packageObserveIndexMax >= packageObserveIndexMin
+                  ? uint64_t(packageObserveIndexMax) -
+                        uint64_t(packageObserveIndexMin) + 1u
+                  : 0u;
+          const uint64_t packageVertexCapacity =
+              posStride != 0u
+                  ? uint64_t(posCanonicalLength) / uint64_t(posStride)
+                  : 0u;
+          const bool packageVertexRangeValid =
+              packageObserveIndexDomainKnown && packageVertexStart >= 0 &&
+              packageVertexStart <=
+                  int64_t(std::numeric_limits<uint32_t>::max()) &&
+              packageVertexCount != 0u &&
+              packageVertexCount <= uint64_t(UINT32_MAX) &&
+              uint64_t(packageVertexStart) < packageVertexCapacity &&
+              packageVertexCount <=
+                  packageVertexCapacity - uint64_t(packageVertexStart);
           proof.requested = true;
           proof.sealed = true;
           proof.frameSerial = m_war3ShadowPersistentFrameSerial;
@@ -41416,21 +41723,28 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           proof.positionContentGeneration =
               posReadableSpan.contentGeneration;
           proof.indexOwnerIdentity =
-              currentIndexReadableSpan.ownerIdentity;
+              packageObserveIndexReadableSpan.ownerIdentity;
           proof.indexIdentityGeneration =
-              currentIndexReadableSpan.identityGeneration;
+              packageObserveIndexReadableSpan.identityGeneration;
           proof.indexAllocationGeneration =
-              currentIndexReadableSpan.allocationGeneration;
+              packageObserveIndexReadableSpan.allocationGeneration;
           proof.indexContentGeneration =
-              currentIndexReadableSpan.contentGeneration;
-          proof.vertexCount = entry.vertexCount;
-          proof.indexCount = entry.indexCount;
+              packageObserveIndexReadableSpan.contentGeneration;
+          proof.vertexCount = packageVertexRangeValid
+              ? uint32_t(packageVertexCount) : entry.vertexCount;
+          proof.indexCount = CountVal;
+          proof.sourceVertexFirst = packageVertexRangeValid
+              ? uint32_t(packageVertexStart) : uint32_t(vRangeStart);
           proof.sourceFirstIndex = StartVal;
-          proof.actualIndexMin = actualIndexMin;
-          proof.actualIndexMax = actualIndexMax;
+          proof.actualIndexMin = packageObserveIndexDomainKnown
+              ? packageObserveIndexMin : actualIndexMin;
+          proof.actualIndexMax = packageObserveIndexDomainKnown
+              ? packageObserveIndexMax : actualIndexMax;
           proof.positionStride = posStride;
           proof.positionOffset = capturePositionOffset;
+          proof.baseVertexIndex = BaseVertexIndex;
           proof.rigidStatic = entry.isStaticGeometry &&
+              !entry.pathBlocker &&
               (entry.objectKind ==
                    dxvk::war3::render::ObjectKind::Building ||
                entry.objectKind ==
@@ -41446,45 +41760,154 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           proof.triangleList =
               entry.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
           proof.uint16Indices = entry.indexType == VK_INDEX_TYPE_UINT16;
-          proof.exactIndexDomainKnown = actualIndexDomainKnown;
-          proof.fullVertexDomainFallback = fullVertexDomainFallback;
-          proof.zeroBasedVertexRange =
-              BaseVertexIndex == 0 && StartVal == 0u && vRangeStart == 0 &&
-              entry.consumeVertexOffset == 0;
+          proof.exactIndexDomainKnown = packageObserveIndexDomainKnown;
+          proof.fullVertexDomainFallback =
+              !packageObserveIndexDomainKnown && fullVertexDomainFallback;
+          proof.exactContiguousVertexRange = packageVertexRangeValid;
           proof.positionFloat3 =
               declInfo.posType == D3DDECLTYPE_FLOAT3 &&
               capturePositionFormat == VK_FORMAT_R32G32B32_SFLOAT;
           proof.positionHostCached =
               static_cast<bool>(posReadableSpan) && posCanonicalHostCached;
+          proof.positionBoundedObserveReadable =
+              static_cast<bool>(posReadableSpan) &&
+              !posCanonicalHostCached && packageVertexRangeValid;
           proof.indexHostCached =
               static_cast<bool>(currentIndexReadableSpan) &&
               drawTimeIndexBytes != nullptr;
+          proof.indexBoundedObserveReadable =
+              static_cast<bool>(packageObserveIndexReadableSpan) &&
+              packageObserveUncachedIndexScan;
+          proof.boundedUncachedIndexScan =
+              packageObserveUncachedIndexScan;
+          proof.boundedIndexScanBudgetRejected =
+              packageObserveProofBudgetRejected;
+          proof.boundedIndexScanBytes = packageObserveIndexScanBytes;
+          proof.boundedIndexScanTicks = packageObserveIndexScanTicks;
 
-          // Do not walk bytes for dynamic, alpha, skinned, non-zero-based or
-          // uncached candidates. Rejection accounting still explains exactly
-          // why they cannot replace the canonical Arena draw.
+          // Do not walk position bytes for dynamic, alpha, skinned or
+          // non-contiguous candidates.  A write-combined index source is only
+          // accepted when the bounded Observe-only proof above completed.
           const bool hashCandidate = proof.rigidStatic &&
               proof.opaqueMaterial && !proof.gpuSkinBacked &&
               !proof.vertexBlendEnabled && proof.indexed &&
               proof.triangleList && proof.uint16Indices &&
               proof.exactIndexDomainKnown &&
               !proof.fullVertexDomainFallback &&
-              proof.zeroBasedVertexRange && proof.positionFloat3 &&
-              proof.positionHostCached && proof.indexHostCached;
+              proof.exactContiguousVertexRange && proof.positionFloat3 &&
+              (proof.positionHostCached ||
+               proof.positionBoundedObserveReadable) &&
+              (proof.indexHostCached ||
+               proof.indexBoundedObserveReadable);
           if (hashCandidate) {
-            proof.positionContentHash =
-                dxvk::war3::gpu_skin::
-                    HashPersistentGpuPackageStridedFloat3(
-                        posCanonicalBytes, uint64_t(posCanonicalLength),
-                        entry.vertexCount, posStride,
-                        capturePositionOffset);
-            if (drawTimeIndexRangeBytes <=
-                VkDeviceSize((std::numeric_limits<size_t>::max)())) {
-              proof.indexContentHash =
+            constexpr uint64_t kMaxIndexHashBytesPerDraw = 8u * 1024u;
+            constexpr uint64_t kMaxIndexHashBytesPerFrame = 32u * 1024u;
+            constexpr uint64_t kMaxPositionHashBytesPerDraw = 32u * 1024u;
+            constexpr uint64_t kMaxPositionHashBytesPerFrame = 96u * 1024u;
+            const uint64_t positionRangeOffset =
+                uint64_t(proof.sourceVertexFirst) * uint64_t(posStride);
+            const uint64_t positionRangeBytes =
+                uint64_t(proof.vertexCount) * uint64_t(posStride);
+            const bool uncachedIndexAlreadyBudgeted =
+                proof.boundedUncachedIndexScan;
+            const uint64_t additionalIndexBytes =
+                uncachedIndexAlreadyBudgeted
+                    ? 0u : uint64_t(drawTimeIndexRangeBytes);
+            const uint64_t timerFrequency = uint64_t((std::max)(
+                int64_t{1}, dxvk::high_resolution_clock::get_frequency()));
+            const uint64_t proofTickBudget = (std::max)(
+                uint64_t{1}, timerFrequency / 10000u); // 0.10 ms/frame
+            const bool proofBudgetAvailable =
+                uint64_t(drawTimeIndexRangeBytes) <=
+                    kMaxIndexHashBytesPerDraw &&
+                m_war3PersistentPackageIndexProofBytesThisFrame <=
+                    kMaxIndexHashBytesPerFrame &&
+                additionalIndexBytes <=
+                    kMaxIndexHashBytesPerFrame -
+                        m_war3PersistentPackageIndexProofBytesThisFrame &&
+                positionRangeBytes <= kMaxPositionHashBytesPerDraw &&
+                m_war3PersistentPackagePositionHashBytesThisFrame <=
+                    kMaxPositionHashBytesPerFrame &&
+                positionRangeBytes <=
+                    kMaxPositionHashBytesPerFrame -
+                        m_war3PersistentPackagePositionHashBytesThisFrame &&
+                (proof.boundedUncachedIndexScan ||
+                 m_war3PersistentPackageProofTicksThisFrame <
+                     proofTickBudget);
+            if (!proofBudgetAvailable) {
+              proof.boundedIndexScanBudgetRejected = true;
+              proof.positionBoundedObserveReadable = false;
+              ++m_war3PersistentPackageCaptureProofBudgetRejected;
+            } else if (positionRangeOffset <=
+                           uint64_t(posCanonicalLength) &&
+                positionRangeBytes <=
+                    uint64_t(posCanonicalLength) - positionRangeOffset &&
+                positionRangeOffset <=
+                    uint64_t((std::numeric_limits<size_t>::max)())) {
+              const int64_t hashBegin =
+                  dxvk::high_resolution_clock::get_counter();
+              const uint8_t* positionHashSource =
+                  posCanonicalBytes + size_t(positionRangeOffset);
+              if (!proof.positionHostCached) {
+                alignas(64) static thread_local
+                    std::array<uint8_t, kMaxPositionHashBytesPerDraw>
+                        s_packagePositionScratch = {};
+                const int64_t copyBegin =
+                    dxvk::high_resolution_clock::get_counter();
+                std::memcpy(
+                    s_packagePositionScratch.data(), positionHashSource,
+                    size_t(positionRangeBytes));
+                const int64_t copyEnd =
+                    dxvk::high_resolution_clock::get_counter();
+                proof.boundedUncachedPositionCopy = true;
+                proof.boundedPositionCopyBytes =
+                    uint32_t(positionRangeBytes);
+                proof.boundedPositionCopyTicks =
+                    copyEnd > copyBegin
+                        ? uint64_t(copyEnd - copyBegin) : 0u;
+                ++m_war3PersistentPackageCapturePositionCopies;
+                m_war3PersistentPackageCapturePositionCopyBytes +=
+                    positionRangeBytes;
+                m_war3PersistentPackageCapturePositionCopyTicks +=
+                    proof.boundedPositionCopyTicks;
+                positionHashSource = s_packagePositionScratch.data();
+              }
+              proof.positionContentHash =
                   dxvk::war3::gpu_skin::
-                      HashPersistentGpuPackageContent(
-                          drawTimeIndexBytes,
-                          size_t(drawTimeIndexRangeBytes));
+                      HashPersistentGpuPackageStridedFloat3(
+                          positionHashSource,
+                          positionRangeBytes, proof.vertexCount, posStride,
+                          capturePositionOffset);
+              proof.indexContentHash = packageObserveIndexContentHash;
+              if (proof.indexContentHash == 0u &&
+                  packageObserveIndexBytes != nullptr &&
+                  drawTimeIndexRangeBytes <= VkDeviceSize(
+                      (std::numeric_limits<size_t>::max)())) {
+                proof.indexContentHash =
+                    dxvk::war3::gpu_skin::
+                        HashPersistentGpuPackageContent(
+                            packageObserveIndexBytes,
+                            size_t(drawTimeIndexRangeBytes));
+              }
+              const int64_t hashEnd =
+                  dxvk::high_resolution_clock::get_counter();
+              proof.contentHashTicks =
+                  hashEnd > hashBegin
+                      ? uint64_t(hashEnd - hashBegin) : 0u;
+              const uint64_t contentHashBytes =
+                  positionRangeBytes + additionalIndexBytes;
+              proof.contentHashBytes = uint32_t((std::min)(
+                  contentHashBytes, uint64_t(UINT32_MAX)));
+              m_war3PersistentPackageCaptureContentHashBytes +=
+                  contentHashBytes;
+              m_war3PersistentPackageCaptureContentHashTicks +=
+                  proof.contentHashTicks;
+              m_war3PersistentPackageIndexProofBytesThisFrame +=
+                  additionalIndexBytes;
+              m_war3PersistentPackagePositionHashBytesThisFrame +=
+                  positionRangeBytes;
+              m_war3PersistentPackageProofTicksThisFrame +=
+                  proof.contentHashTicks;
             }
           }
         }

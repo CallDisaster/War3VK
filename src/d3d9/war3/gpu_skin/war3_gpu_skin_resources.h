@@ -217,6 +217,11 @@ struct GpuSkinStaticResource {
   uint32_t indexCount = 0u;
   GpuSkinStaticUpload pendingUpload;
   GpuSkinStaticResourceState state = GpuSkinStaticResourceState::PendingUpload;
+  // Minted by the Store only after the producer fence completed and both the
+  // frozen CPU payload and GPU range mirrors passed their full validators.
+  // Ready resources are immutable, so hot lookups can check this authority
+  // instead of re-walking every stream and primitive for every draw.
+  uint64_t readyValidationAuthority = 0u;
   VkDeviceSize allocatedBytes = 0;
   resource_census::ResourceHandle residencyCensus;
   // Only War3PersistentGpuPackageStore can construct this descriptor. Public

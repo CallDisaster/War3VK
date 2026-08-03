@@ -1,5 +1,57 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-03（阶段验收候选：bounded CurrentDraw Package Observe 闭合）
+
+本轮在 `ef012ba` 的 current-draw equivalence 地基上收口一个可供用户阶段验收的
+稳定候选；没有进入 Package Consume、联合剔除、混合蒙皮或阴影合批。发布默认仍为
+Off，正常启动时不创建 Package owner、不扫描 WC buffer、不绑定 Package slice，也不
+修改 Main/CSM/点阴影/outline draw。
+
+**当前物理 draw 证明**：
+
+- multi-primitive geoset 现在按当前 `sourceVertexFirst/baseVertexIndex`、exact index
+  count/min/max/content hash 唯一选择 primitive；producer fence 完成后由 Store 发布
+  `readyValidationAuthority`，热路径不再重复完整 immutable source walk。
+- Warcraft 的 WRITEONLY VB/IB 常位于 HOST_VISIBLE、非 HOST_CACHED 内存。canonical
+  Shadow/Arena 继续把它视为 CPU-opaque 并走完整 VB fail-safe；只有三个 Package gate
+  同时为 Observe 时，才允许独立 bounded proof：index 每 draw 8 KiB、每帧 32 KiB，
+  position 每 draw 32 KiB、每帧 96 KiB，准入计时预算 0.10 ms/frame。事务一旦准入会
+  完成 index scan、position copy 与 hash，再由实际耗时阻止后续事务，禁止半份 proof。
+- 早期按“任意 eligible draw”花预算会扫描到非最终 caster；同一 key 的后续 draw 又会
+  覆盖 proof。现在 entry 记录同帧 capture ordinal 与上一帧 exact Stage11 最终选择的
+  ordinal，下一帧只在预测的最终 ordinal 上花观察成本。该跨帧值只用于成本准入；
+  当前 allocation identity、identity/allocation/content generation、draw range 与 bytes
+  仍逐帧重新证明，不能授权跨帧几何复用。
+- LOS/path blocker 在早期 FourCC/semantic gate 与最终 `entry.pathBlocker` gate 均被拒绝；
+  不恢复 draw-time VB cache、source fingerprint reuse、fast append 或 prebuild bypass。
+  `binding=0 / mutation=0 / consumerAuthority=0` 仍是硬合同。
+
+**诊断与运行证据**：
+
+- `runtime_status.json` 现在同时报告最终 Stage11 的 bounded scan/copy/hash/budget 与
+  capture 全部成本，并附 QPC frequency。20 秒高压 Observe 门为 1,041 report frames：
+  4,262 exact 中 4,258 ready，仅首次 4 个 package 产生 4 次提交/4,128 bytes 上传；
+  producer fence 4/4，position/index/primitive mismatch、invalid、completion reject、
+  device lost、shadow incomplete 与 budget exceeded 全为 0，Arena 峰值 5.543 MiB。
+- 最终状态快照的 capture scan/hash ticks 为 515,466/742,045，frequency=10,000,000；
+  两者合计约 0.121 ms/采样帧（position copy 已包含在 hash ticks 中，不重复相加），
+  低于 0.15 ms Observe 门。该数字不作为 Consume 收益结论。
+- 默认 Off 另跑 495 帧：configured/effective/owner、observations、scan/hash 全为 0；
+  device lost、shadow incomplete、budget exceeded 与新增 NVIDIA/Display 事件均为 0。
+
+**静态、构建与交付**：
+
+- 全部 `test_*_static.py` 共 423 tests PASS；全部 12 个 Win32 Meson runnable PASS；
+  Win32 DLL build PASS，最终 `ninja -C build32 -n` 为 no-work，targeted diff-check 只有
+  既有 LF/CRLF 提示。
+- build32 与部署 `E:\Work\War3\d3d9.dll` exact：33,374,202 bytes，SHA-256
+  `9A7D96C8EB45E84F7EFB8D922F9FB5D8224350DBAD3DD1A8E9806175F2CE28F5`；上一明确
+  回退为 `E:\Work\War3\d3d9.dll.bak_20260803_FFC0_pre_bounded_package_index_proof`。
+
+**验收边界**：用户本轮测试的是默认 Off 稳定候选与既有视觉正确性；Package Observe
+只用于后续显式诊断。没有 recording transaction、consumer last-use fence 与真实 Consume
+权限之前，不得声称 Persistent Package 已接管绘制或带来发布性能收益。
+
 ## 🚨 2026-08-03（Persistent Package 当帧内容等价 Observe，默认关闭）
 
 本阶段继续收紧 Persistent GPU Package 从“上传 Ready”到未来真实消费者之间的

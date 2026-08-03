@@ -69,13 +69,22 @@ EvaluatePersistentGpuPackageCurrentDrawEquivalence(
     return Disposition::MaterialRejected;
   if (draw.gpuSkinBacked || draw.vertexBlendEnabled)
     return Disposition::SkinningRouteRejected;
+  const uint64_t exactVertexCount = draw.actualIndexMax >= draw.actualIndexMin
+      ? uint64_t(draw.actualIndexMax) - uint64_t(draw.actualIndexMin) + 1u
+      : 0u;
+  const int64_t expectedPhysicalVertexFirst =
+      int64_t(draw.baseVertexIndex) + int64_t(draw.actualIndexMin);
   if (!draw.indexed || !draw.triangleList || !draw.uint16Indices ||
       !draw.exactIndexDomainKnown || draw.fullVertexDomainFallback ||
-      !draw.zeroBasedVertexRange || !draw.positionFloat3 ||
-      draw.sourceFirstIndex != 0u || draw.actualIndexMin != 0u ||
-      draw.actualIndexMax >= draw.vertexCount)
+      !draw.exactContiguousVertexRange || !draw.positionFloat3 ||
+      exactVertexCount == 0u || exactVertexCount != draw.vertexCount ||
+      expectedPhysicalVertexFirst < 0 ||
+      expectedPhysicalVertexFirst >
+          int64_t(std::numeric_limits<uint32_t>::max()) ||
+      draw.sourceVertexFirst != uint32_t(expectedPhysicalVertexFirst))
     return Disposition::GeometryContractRejected;
-  if (!draw.positionHostCached || !draw.indexHostCached)
+  if ((!draw.positionHostCached && !draw.positionBoundedObserveReadable) ||
+      (!draw.indexHostCached && !draw.indexBoundedObserveReadable))
     return Disposition::CpuSourceUnavailable;
   if (draw.positionOwnerIdentity == 0u ||
       draw.positionIdentityGeneration == 0u ||
@@ -96,8 +105,8 @@ EvaluatePersistentGpuPackageCurrentDrawEquivalence(
       package.deviceEpoch != draw.deviceEpoch ||
       package.geosetDataIdentity != draw.meshPayloadIdentity)
     return Disposition::SnapshotMismatch;
-  if (package.primitiveCount != 1u)
-    return Disposition::MultiPrimitiveRejected;
+  if (!package.primitiveSelected || package.primitiveCount == 0u)
+    return Disposition::PrimitiveSelectionRejected;
   if (package.vertexCount != draw.vertexCount ||
       package.indexCount != draw.indexCount)
     return Disposition::PackageLayoutMismatch;
@@ -105,9 +114,7 @@ EvaluatePersistentGpuPackageCurrentDrawEquivalence(
     return Disposition::PositionContentMismatch;
   if (package.indexContentHash != draw.indexContentHash)
     return Disposition::IndexContentMismatch;
-  if (package.primitiveOrdinal != 0u ||
-      package.primitiveFirstIndex != draw.sourceFirstIndex ||
-      package.primitiveIndexCount != draw.indexCount ||
+  if (package.primitiveIndexCount != draw.indexCount ||
       package.primitiveMinVertex != draw.actualIndexMin ||
       package.primitiveMaxVertex != draw.actualIndexMax)
     return Disposition::PrimitiveMismatch;

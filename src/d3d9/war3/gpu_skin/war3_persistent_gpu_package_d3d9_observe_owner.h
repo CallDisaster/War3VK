@@ -9,6 +9,19 @@
 
 namespace dxvk::war3::gpu_skin {
 
+struct War3PersistentGpuPackageCaptureDiagnostics {
+  uint64_t boundedIndexScans = 0u;
+  uint64_t boundedIndexScanBytes = 0u;
+  uint64_t boundedIndexScanTicks = 0u;
+  uint64_t boundedPositionCopies = 0u;
+  uint64_t boundedPositionCopyBytes = 0u;
+  uint64_t boundedPositionCopyTicks = 0u;
+  uint64_t contentHashBytes = 0u;
+  uint64_t contentHashTicks = 0u;
+  uint64_t proofBudgetRejected = 0u;
+  uint64_t timerFrequency = 0u;
+};
+
 // Process-wide, read-only status exported to runtime_status.json.  The live
 // owner publishes this snapshot at frame boundaries and submission changes;
 // querying it never touches Store or renderer-owned Vulkan objects.
@@ -51,6 +64,18 @@ struct War3PersistentGpuPackageD3D9RuntimeDiagnostics {
   uint64_t currentDrawMaterialRejected = 0u;
   uint64_t currentDrawSkinningRejected = 0u;
   uint64_t currentDrawGeometryRejected = 0u;
+  uint64_t currentDrawGeometryPositionNotHostCached = 0u;
+  uint64_t currentDrawGeometryIndexProofUnavailable = 0u;
+  uint64_t currentDrawBoundedIndexScans = 0u;
+  uint64_t currentDrawBoundedIndexScanBytes = 0u;
+  uint64_t currentDrawBoundedIndexScanTicks = 0u;
+  uint64_t currentDrawBoundedPositionCopies = 0u;
+  uint64_t currentDrawBoundedPositionCopyBytes = 0u;
+  uint64_t currentDrawBoundedPositionCopyTicks = 0u;
+  uint64_t currentDrawContentHashBytes = 0u;
+  uint64_t currentDrawContentHashTicks = 0u;
+  uint64_t currentDrawProofBudgetRejected = 0u;
+  War3PersistentGpuPackageCaptureDiagnostics capture = {};
   uint64_t currentDrawCpuSourceUnavailable = 0u;
   uint64_t currentDrawSourceGenerationMissing = 0u;
   uint64_t currentDrawPackageNotReady = 0u;
@@ -72,6 +97,8 @@ void ConfigurePersistentGpuPackageD3D9RuntimeDiagnostics(
     uint32_t configuredMode) noexcept;
 void ConfigurePersistentGpuPackageCurrentDrawRuntimeDiagnostics(
     uint32_t configuredMode) noexcept;
+void PublishPersistentGpuPackageCaptureRuntimeDiagnostics(
+    const War3PersistentGpuPackageCaptureDiagnostics& diagnostics) noexcept;
 War3PersistentGpuPackageD3D9RuntimeDiagnostics
 QueryPersistentGpuPackageD3D9RuntimeDiagnostics() noexcept;
 
@@ -101,6 +128,7 @@ public:
     MissQueued,
     Pending,
     StoreRejected,
+    CurrentDrawRejected,
   };
 
   struct ObserveResult {
@@ -164,6 +192,25 @@ public:
     uint64_t currentDrawMaterialRejected = 0u;
     uint64_t currentDrawSkinningRejected = 0u;
     uint64_t currentDrawGeometryRejected = 0u;
+    uint64_t currentDrawGeometryNonIndexed = 0u;
+    uint64_t currentDrawGeometryNonTriangleList = 0u;
+    uint64_t currentDrawGeometryNonUint16 = 0u;
+    uint64_t currentDrawGeometryIndexDomainUnknown = 0u;
+    uint64_t currentDrawGeometryFullDomainFallback = 0u;
+    uint64_t currentDrawGeometryNonContiguousRange = 0u;
+    uint64_t currentDrawGeometryPositionNotFloat3 = 0u;
+    uint64_t currentDrawGeometryVertexCountMismatch = 0u;
+    uint64_t currentDrawGeometryPositionNotHostCached = 0u;
+    uint64_t currentDrawGeometryIndexProofUnavailable = 0u;
+    uint64_t currentDrawBoundedIndexScans = 0u;
+    uint64_t currentDrawBoundedIndexScanBytes = 0u;
+    uint64_t currentDrawBoundedIndexScanTicks = 0u;
+    uint64_t currentDrawBoundedPositionCopies = 0u;
+    uint64_t currentDrawBoundedPositionCopyBytes = 0u;
+    uint64_t currentDrawBoundedPositionCopyTicks = 0u;
+    uint64_t currentDrawContentHashBytes = 0u;
+    uint64_t currentDrawContentHashTicks = 0u;
+    uint64_t currentDrawProofBudgetRejected = 0u;
     uint64_t currentDrawCpuSourceUnavailable = 0u;
     uint64_t currentDrawSourceGenerationMissing = 0u;
     uint64_t currentDrawPackageNotReady = 0u;
@@ -210,9 +257,11 @@ private:
   bool validEvidenceAndSnapshot(
       const Stage11Evidence& evidence,
       const model::ShadowGeosetResourceSnapshot& snapshot) const noexcept;
+  bool validEvidence(const Stage11Evidence& evidence) const noexcept;
   bool validSubmission(const Submission& submission) const noexcept;
   void noteCurrentDrawDisposition(
-      PersistentGpuPackageCurrentDrawMatchDisposition disposition) noexcept;
+      PersistentGpuPackageCurrentDrawMatchDisposition disposition,
+      const PersistentGpuPackageCurrentDrawProof& currentDraw) noexcept;
   void publishRuntimeDiagnostics(bool ownerAlive) const noexcept;
   static uint64_t allocateOwnerAuthority() noexcept;
 

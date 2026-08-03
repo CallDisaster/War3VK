@@ -29,8 +29,12 @@ PersistentGpuPackageCurrentDrawProof MakeDraw() {
   draw.indexContentHash = 71u;
   draw.vertexCount = 4u;
   draw.indexCount = 6u;
-  draw.actualIndexMax = 3u;
+  draw.sourceVertexFirst = 102u;
+  draw.sourceFirstIndex = 9u;
+  draw.actualIndexMin = 2u;
+  draw.actualIndexMax = 5u;
   draw.positionStride = 32u;
+  draw.baseVertexIndex = 100;
   draw.requested = true;
   draw.sealed = true;
   draw.rigidStatic = true;
@@ -39,7 +43,7 @@ PersistentGpuPackageCurrentDrawProof MakeDraw() {
   draw.triangleList = true;
   draw.uint16Indices = true;
   draw.exactIndexDomainKnown = true;
-  draw.zeroBasedVertexRange = true;
+  draw.exactContiguousVertexRange = true;
   draw.positionFloat3 = true;
   draw.positionHostCached = true;
   draw.indexHostCached = true;
@@ -56,12 +60,16 @@ PersistentGpuPackageCurrentDrawPackageProof MakePackage() {
   package.indexContentHash = 71u;
   package.vertexCount = 4u;
   package.indexCount = 6u;
-  package.primitiveCount = 1u;
+  package.primitiveCount = 3u;
+  package.primitiveOrdinal = 1u;
+  package.primitiveFirstIndex = 4u;
   package.primitiveIndexCount = 6u;
-  package.primitiveMaxVertex = 3u;
+  package.primitiveMinVertex = 2u;
+  package.primitiveMaxVertex = 5u;
   package.ready = true;
   package.frozenPayloadValid = true;
   package.snapshotIdentityExact = true;
+  package.primitiveSelected = true;
   return package;
 }
 
@@ -88,6 +96,14 @@ int main() {
       interleaved.data(), sizeof(interleaved), uint32_t(interleaved.size()),
       sizeof(InterleavedVertex), 0u);
   assert(packedHash != 0u && packedHash == stridedHash);
+  const uint64_t packedSubrangeHash = HashPersistentGpuPackageContent(
+      packed.data() + 3u, 6u * sizeof(float));
+  const uint64_t stridedSubrangeHash =
+      HashPersistentGpuPackageStridedFloat3(
+          interleaved.data() + 1u, 2u * sizeof(InterleavedVertex), 2u,
+          sizeof(InterleavedVertex), 0u);
+  assert(packedSubrangeHash != 0u &&
+         packedSubrangeHash == stridedSubrangeHash);
   assert(HashPersistentGpuPackageStridedFloat3(
              interleaved.data(), sizeof(interleaved) - 9u,
              uint32_t(interleaved.size()), sizeof(InterleavedVertex), 0u) ==
@@ -102,9 +118,26 @@ int main() {
   assert(EvaluatePersistentGpuPackageCurrentDrawEquivalence(draw, package) ==
          Disposition::CpuSourceUnavailable);
   draw = MakeDraw();
-  package.primitiveCount = 2u;
+  draw.positionHostCached = false;
+  draw.positionBoundedObserveReadable = true;
+  draw.boundedUncachedPositionCopy = true;
+  draw.boundedPositionCopyBytes = 128u;
+  draw.boundedPositionCopyTicks = 2u;
+  draw.indexHostCached = false;
+  draw.indexBoundedObserveReadable = true;
+  draw.boundedUncachedIndexScan = true;
+  draw.boundedIndexScanBytes = 12u;
+  draw.boundedIndexScanTicks = 3u;
   assert(EvaluatePersistentGpuPackageCurrentDrawEquivalence(draw, package) ==
-         Disposition::MultiPrimitiveRejected);
+         Disposition::ExactMatch);
+  draw = MakeDraw();
+  package.primitiveSelected = false;
+  assert(EvaluatePersistentGpuPackageCurrentDrawEquivalence(draw, package) ==
+         Disposition::PrimitiveSelectionRejected);
+  package = MakePackage();
+  package.vertexCount = 3u;
+  assert(EvaluatePersistentGpuPackageCurrentDrawEquivalence(draw, package) ==
+         Disposition::PackageLayoutMismatch);
   package = MakePackage();
   package.positionContentHash ^= 1u;
   assert(EvaluatePersistentGpuPackageCurrentDrawEquivalence(draw, package) ==
@@ -113,6 +146,10 @@ int main() {
   package.primitiveMaxVertex = 2u;
   assert(EvaluatePersistentGpuPackageCurrentDrawEquivalence(draw, package) ==
          Disposition::PrimitiveMismatch);
+  draw = MakeDraw();
+  draw.exactContiguousVertexRange = false;
+  assert(EvaluatePersistentGpuPackageCurrentDrawEquivalence(
+             draw, MakePackage()) == Disposition::GeometryContractRejected);
   draw.requested = false;
   assert(EvaluatePersistentGpuPackageCurrentDrawEquivalence(draw, package) ==
          Disposition::NotRequested);

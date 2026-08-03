@@ -1750,6 +1750,19 @@ private:
   std::unique_ptr<
       war3::gpu_skin::War3PersistentGpuPackageD3D9ObserveOwner>
       m_war3PersistentPackageD3D9ObserveOwner;
+  uint64_t m_war3PersistentPackageIndexScanFrameSerial = 0u;
+  uint64_t m_war3PersistentPackageIndexProofBytesThisFrame = 0u;
+  uint64_t m_war3PersistentPackageProofTicksThisFrame = 0u;
+  uint64_t m_war3PersistentPackagePositionHashBytesThisFrame = 0u;
+  uint64_t m_war3PersistentPackageCaptureIndexScans = 0u;
+  uint64_t m_war3PersistentPackageCaptureIndexScanBytes = 0u;
+  uint64_t m_war3PersistentPackageCaptureIndexScanTicks = 0u;
+  uint64_t m_war3PersistentPackageCapturePositionCopies = 0u;
+  uint64_t m_war3PersistentPackageCapturePositionCopyBytes = 0u;
+  uint64_t m_war3PersistentPackageCapturePositionCopyTicks = 0u;
+  uint64_t m_war3PersistentPackageCaptureContentHashBytes = 0u;
+  uint64_t m_war3PersistentPackageCaptureContentHashTicks = 0u;
+  uint64_t m_war3PersistentPackageCaptureProofBudgetRejected = 0u;
   Rc<sync::Fence> m_war3ShadowArenaFence;
   Rc<DxvkFence> m_war3GpuSkinFence;
   uint64_t m_war3GpuSkinFenceValue = 0u;
@@ -2537,6 +2550,11 @@ private:
     VkDeviceSize positionCapacity = 0u;
     VkDeviceSize indexCapacity = 0u;
     uint64_t frameSerial = 0u;
+    // Observe-only cost prediction: ordinal of this full cache key's capture
+    // within frameSerial, and the ordinal which the previous exact Stage11
+    // submission selected. Neither field authorizes geometry reuse.
+    uint32_t packageCaptureOrdinal = 0u;
+    uint32_t packageLastSubmittedCaptureOrdinal = 0u;
     uint64_t submittedFrameSerial = 0u;
     // Written only by the exact current-frame Stage11 producer after the
     // entry has passed its geometry/visibility ownership gates. Generic and
