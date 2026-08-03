@@ -37,7 +37,7 @@ class PersistentPackageStage11ObserveAdapterContracts(unittest.TestCase):
             "kRecordsCommands = false",
             "kMutatesCanonicalDraw = false",
             "kPublishesPackage = false",
-            "kProvesCurrentGameMemory = false",
+            "kProvesCurrentGameMemory = true",
         ):
             with self.subTest(token=token):
                 self.assertIn(token, self.header)
@@ -147,7 +147,7 @@ class PersistentPackageStage11ObserveAdapterContracts(unittest.TestCase):
         )[1].split(
             "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()", 1
         )[0]
-        self.assertEqual(bridge.count("findGeosetStampByData("), 1)
+        self.assertEqual(bridge.count("findGeosetStampByDataForEpoch("), 1)
         for forbidden in (
             "findGeosetSnapshotByData",
             "findGeosetByData",
@@ -178,14 +178,18 @@ class PersistentPackageStage11ObserveAdapterContracts(unittest.TestCase):
             "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()", 1
         )[0]
         begin = bridge.index("high_resolution_clock::get_counter()")
-        lookup = bridge.index("findGeosetStampByData(")
+        lookup = bridge.index("findGeosetStampByDataForEpoch(")
         observe = bridge.index(".observe(")
         note = bridge.index(".noteElapsedTicks(")
         self.assertLess(begin, lookup)
         self.assertLess(lookup, observe)
         self.assertLess(observe, note)
         self.assertIn("avgCoreCallUs", bridge)
-        self.assertIn("provesCurrentGameMemory=0", bridge)
+        self.assertIn("provesCurrentGameMemory=%u", bridge)
+        self.assertIn("timedFrames=%llu", bridge)
+        self.assertIn("currentTimedFrame=%llu", bridge)
+        self.assertIn("Logger::info(observeLine)", bridge)
+        self.assertNotIn("WAR3_RENDER_LOG(", bridge)
         for token in (
             "elapsedTicksTotal",
             "elapsedTicksMaxCall",
@@ -194,13 +198,13 @@ class PersistentPackageStage11ObserveAdapterContracts(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, self.header)
 
-    def test_content_join_never_claims_current_game_memory(self) -> None:
+    def test_map_scoped_content_join_proves_current_source_only(self) -> None:
         implementation = self.header + self.source + self.runnable
-        self.assertIn("RecordedContentIdentityOnly", implementation)
-        self.assertIn("kProvesCurrentGameMemory = false", self.header)
-        self.assertIn("provesCurrentGameMemory = false", self.header)
-        self.assertNotIn("RecordedInputEvidence", implementation)
-        self.assertIn("!observed.provesCurrentGameMemory", self.runnable)
+        self.assertIn("RecordedCurrentMapSource", implementation)
+        self.assertIn("StaleMapEpochExplicitGeosetDataSidecar", implementation)
+        self.assertIn("kProvesCurrentGameMemory = true", self.header)
+        self.assertIn("evidence.provesCurrentGameMemory = true", self.source)
+        self.assertIn("observed.provesCurrentGameMemory", self.runnable)
         self.assertIn("std::atomic<bool> s_consumeDeniedLogged", self.device)
 
     def test_meson_compiles_production_and_isolated_runnable(self) -> None:

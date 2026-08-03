@@ -1,5 +1,55 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-03（Persistent Package Stage 2A：地图代际源码证明，Observe-only）
+
+在 Arena 崩溃修复检查点 `7d8712a` 上继续推进 Persistent GPU Package，但本阶段只
+闭合“当前 Stage11 caster 对应当前地图 immutable model source”的 CPU 证据。没有创建
+atlas、绑定 GPU buffer、录制 package 命令、改写 draw/caster 或开放 Consume；发布默认
+仍为 Off，显式 mode=2 仍 fail-closed。
+
+**地图代际与源码权限**：
+
+- `ShadowModelResourceCache` 的 geoset record/stamp 新增 `mapEpoch`。D3D9 device 创建及
+  每次 `War3ResetGpuSkinMapEpoch` 都令 cache 进入同一 map epoch，并在独占锁内清空全部
+  geoset/model/runtime/address alias；process-monotonic immutable generation issuer 不重置，
+  因此地址复用、A→B→A 或 device/map 重建都不能把旧 publication 重新变成当前权限。
+- 新增 epoch-qualified O(1) geoset-data lookup，并在持锁期间同时复核 cache epoch 与
+  snapshot epoch。Stage11 Observe 只接受 exact submitted frame/stage/geometry/alpha/blocker
+  witness 与同 epoch sidecar 的闭合 join；成功证据标记 `RecordedCurrentMapSource` 和
+  `provesCurrentGameMemory=true`，stale/missing/invalid 各自独立计数。
+- Observe 仍是 fixed-size POD/value-only adapter，所有 consumer mask 均为 0，且
+  `kConsumeAdmissionGranted/kBindsGpuResources/kRecordsCommands/
+  kMutatesCanonicalDraw/kPublishesPackage` 全为 false。低频运行日志仅在显式 Observe 时输出
+  前 16 次和每 4096 次统计，同时报告 completed timed frames 与 core call/frame 开销；
+  默认 Off 没有该开销。
+
+**运行门与正确性证据**：
+
+- 高压图 DirectInline Observe 完成 11,128 个 timed frames、2,056,192 次 Stage11 join；
+  2,055,738 次取得 current-map source（99.978%），仅 454 次启动/未建 sidecar，
+  lookupFailed/staleMap/invalidSidecar/invalidWitness/acceptedBlocker 全为 0。
+  core 平均 0.267 μs/call，折算约 0.049 ms/frame，低于 0.15 ms Observe 门；单次墙钟
+  max 受线程抢占出现约 2.05 ms 离群值，不影响累计平均。
+- 11,002 个阴影报告帧中 incomplete/budgetExceeded/reuseLastComplete/renderPartial、Arena
+  overflow/partial transaction、deviceLost 全为 0；Arena 平均 3.476 MiB、峰值 5.531 MiB，
+  queue submitted/completed 稳定只差一帧。测试窗口无新 `nvlddmkm`/Display 153/4101 事件。
+- 160/160 exact screenshot + 2 秒滚动 trace 门通过，在线 3,000 px 巨型暗块触发为 0；
+  最后 32 帧离线最大新暗连通块 200 个分析像素，目检为单位/特效正常动画。保留三段共
+  200 个 final-caster frame、50,899 条 record：mixed representation/alpha、alpha payload
+  gap、blocker/marker leak、unexplained disappearance、validation reject 全为 0。
+
+**构建、部署与边界**：
+
+- 本轮最终 Win32 DLL 为 33,237,969 bytes，SHA-256
+  `C8F5630EE3076EF1B273070E1AD319696334CC8C8F4854A784E39A6C9D23CC26`，build32 与
+  `E:\\Work\\War3\\d3d9.dll` exact；Stage1 回退
+  `d3d9.dll.bak_20260803_BF10_pre_package_map_epoch_observe`，诊断前候选回退
+  `d3d9.dll.bak_20260803_2F7C_pre_observe_diagnostics`。
+- 下一阶段仍须实现真实 D3D9 shared package owner、producer upload completion、
+  Main/CSM/point/outline last-use fence、map/device retirement 与 exact Arena fallback，之后
+  才能进行 Store Observe/Consume ABBA。不得把本阶段的 source evidence 描述成已存在的
+  persistent GPU package 或性能优化收益。
+
 ## 🚨 2026-08-03（Shadow Arena 崩溃根因修复与高压长门）
 
 用户在“生与死”高压区域压低视角时稳定触发 `0xC0000005`，同时每个 Arena 代际

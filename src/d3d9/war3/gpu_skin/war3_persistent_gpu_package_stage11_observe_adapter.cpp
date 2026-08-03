@@ -36,8 +36,8 @@ bool War3PersistentGpuPackageStage11ObserveAdapter::validExplicitSidecar(
   const ExplicitGeosetDataSidecar& sidecar = witness.geosetSidecar;
   return sidecar.found && sidecar.geosetDataIdentity != 0u &&
       sidecar.geosetDataIdentity == witness.meshPayloadIdentity &&
-      sidecar.contentHash != 0u && sidecar.immutableModelGeneration != 0u &&
-      sidecar.vertexCount != 0u;
+      sidecar.contentHash != 0u && sidecar.mapEpoch == witness.mapEpoch &&
+      sidecar.immutableModelGeneration != 0u && sidecar.vertexCount != 0u;
 }
 
 uint64_t War3PersistentGpuPackageStage11ObserveAdapter::
@@ -153,6 +153,12 @@ War3PersistentGpuPackageStage11ObserveAdapter::observe(
     m_diagnostics.missingExplicitGeosetDataSidecar += 1u;
     return finish(evidence);
   }
+  if (witness.geosetSidecar.mapEpoch != witness.mapEpoch) {
+    evidence.disposition =
+        Disposition::StaleMapEpochExplicitGeosetDataSidecar;
+    m_diagnostics.staleMapEpochExplicitGeosetDataSidecar += 1u;
+    return finish(evidence);
+  }
   if (!validExplicitSidecar(witness)) {
     evidence.disposition = Disposition::InvalidExplicitGeosetDataSidecar;
     m_diagnostics.invalidExplicitGeosetDataSidecar += 1u;
@@ -163,10 +169,9 @@ War3PersistentGpuPackageStage11ObserveAdapter::observe(
       witness.geosetSidecar.immutableModelGeneration;
   evidence.immutableContentHash = witness.geosetSidecar.contentHash;
   evidence.geosetVertexCount = witness.geosetSidecar.vertexCount;
-  // This is deliberately weaker than a current-source proof. The process
-  // cache may still contain a prior map's record at the same address.
-  evidence.disposition = Disposition::RecordedContentIdentityOnly;
-  m_diagnostics.recordedContentIdentityOnly += 1u;
+  evidence.provesCurrentGameMemory = true;
+  evidence.disposition = Disposition::RecordedCurrentMapSource;
+  m_diagnostics.recordedCurrentMapSource += 1u;
   return finish(evidence);
 }
 

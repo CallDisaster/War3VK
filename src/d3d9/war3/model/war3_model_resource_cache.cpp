@@ -922,6 +922,23 @@ ShadowModelResourceCache &ShadowModelResourceCache::instance() {
   return s_instance;
 }
 
+bool ShadowModelResourceCache::resetMapEpoch(uint64_t nextMapEpoch) {
+  if (nextMapEpoch == 0u)
+    return false;
+
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  m_byGeoset.clear();
+  m_byGeosetData.clear();
+  m_geosetDataObservation.clear();
+  m_byModelResource.clear();
+  m_byRuntimeModel.clear();
+  m_runtimeOwnerByGeoset.clear();
+  m_runtimeOwnerByGeosetData.clear();
+  m_mapEpoch.store(nextMapEpoch, std::memory_order_release);
+  m_revision.fetch_add(1u, std::memory_order_relaxed);
+  return true;
+}
+
 void ShadowModelResourceCache::beginFrame() {
   std::unique_lock<std::shared_mutex> lock(m_mutex);
   m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
@@ -948,6 +965,8 @@ void MergeGeosetMetadata(ShadowGeosetResourceRecord& dst,
   if (src.mergedGeosetSlotOrBindingIndex != 0u)
     dst.mergedGeosetSlotOrBindingIndex =
         src.mergedGeosetSlotOrBindingIndex;
+  if (src.mapEpoch != 0u)
+    dst.mapEpoch = src.mapEpoch;
   if (dst.firstSeenFrame == 0u ||
       (src.firstSeenFrame != 0u &&
        src.firstSeenFrame < dst.firstSeenFrame))
@@ -1057,7 +1076,9 @@ ShadowModelResourceCache::materializeGeosetAliasRecordLocked(
 }
 
 ShadowGeosetResourceSnapshot ShadowModelResourceCache::storeGeosetRecord(
-    const ShadowGeosetResourceRecord &record) {
+    const ShadowGeosetResourceRecord &incomingRecord) {
+  ShadowGeosetResourceRecord record = incomingRecord;
+  record.mapEpoch = m_mapEpoch.load(std::memory_order_acquire);
   const ShadowGeosetResourceRecord* existingByGeoset = nullptr;
   ShadowGeosetResourceSnapshot existingByData;
   if (record.geosetPtr != nullptr) {
@@ -1744,8 +1765,11 @@ ShadowModelResourceCache::findGeosetSnapshotByData(
 
   std::shared_lock<std::shared_mutex> lock(m_mutex);
   const auto it = m_byGeosetData.find(geosetDataPtr);
-  return it != m_byGeosetData.end() ? it->second
-                                    : ShadowGeosetResourceSnapshot{};
+  const uint64_t currentMapEpoch =
+      m_mapEpoch.load(std::memory_order_acquire);
+  return it != m_byGeosetData.end() && it->second != nullptr &&
+          it->second->mapEpoch == currentMapEpoch
+      ? it->second : ShadowGeosetResourceSnapshot{};
 }
 
 struct GeosetCapacityBreakdown {
@@ -1783,22 +1807,34 @@ GeosetCapacityBreakdown MeasureGeosetCapacity(
 
 bool ShadowModelResourceCache::findGeosetStampByData(
     void* geosetDataPtr, ShadowGeosetResourceStamp& out) const {
+  return findGeosetStampByDataForEpoch(
+      geosetDataPtr, m_mapEpoch.load(std::memory_order_acquire), out);
+}
+
+bool ShadowModelResourceCache::findGeosetStampByDataForEpoch(
+    void* geosetDataPtr, uint64_t expectedMapEpoch,
+    ShadowGeosetResourceStamp& out) const {
   out = {};
-  if (geosetDataPtr == nullptr)
+  if (geosetDataPtr == nullptr || expectedMapEpoch == 0u)
     return false;
 
   std::shared_lock<std::shared_mutex> lock(m_mutex);
+  if (m_mapEpoch.load(std::memory_order_acquire) != expectedMapEpoch)
+    return false;
   const auto it = m_byGeosetData.find(geosetDataPtr);
-  if (it == m_byGeosetData.end() || it->second == nullptr)
+  if (it == m_byGeosetData.end() || it->second == nullptr ||
+      it->second->mapEpoch != expectedMapEpoch)
     return false;
   out.geosetDataPtr = it->second->geosetDataPtr;
   out.contentHash = it->second->contentHash;
+  out.mapEpoch = it->second->mapEpoch;
   out.immutableModelGeneration =
       it->second->immutableModelGeneration;
   out.vertexCount = it->second->vertexCount;
   out.immutableCaptureStatus =
       it->second->immutableCaptureStatus;
-  if (out.contentHash == 0u || out.immutableModelGeneration == 0u ||
+  if (out.contentHash == 0u || out.mapEpoch != expectedMapEpoch ||
+      out.immutableModelGeneration == 0u ||
       out.vertexCount == 0u || out.immutableCaptureStatus !=
           ShadowGeosetImmutableCaptureStatus::Complete) {
     out = {};
@@ -2234,6 +2270,10 @@ uint64_t ShadowModelResourceCache::frameNumber() const {
 uint64_t ShadowModelResourceCache::revision() const {
   // Phase 7.83锛歛tomic 鐩存帴 load锛屾棤闇€閿併€?
   return m_revision.load(std::memory_order_relaxed);
+}
+
+uint64_t ShadowModelResourceCache::mapEpoch() const {
+  return m_mapEpoch.load(std::memory_order_acquire);
 }
 
 } // namespace dxvk::war3::model

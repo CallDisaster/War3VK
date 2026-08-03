@@ -9539,6 +9539,10 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   m_war3PostProcess = new War3PostProcess(this);
   TraceD3D9Device(traceOrdinal, "war3-pipeline-end", this);
   war3::SetActiveDevice(this);
+  // A newly-created D3D9 owner starts a fresh address domain even when a
+  // previous device disappeared before the normal map-unload hook ran.
+  war3::model::ShadowModelResourceCache::instance().resetMapEpoch(
+      m_war3GpuSkinMapEpoch);
   war3shader::internal::InitShaderPackRuntime(m_dxvkDevice);
   war3shader::internal::SetVulkanHandles(
       reinterpret_cast<void *>(m_dxvkDevice->instance()->handle()),
@@ -14064,6 +14068,8 @@ void D3D9DeviceEx::War3ResetGpuSkinMapEpoch() {
       war3::gpu_skin::NativePoisonLedgerResetReason::MapEpoch);
   if (++m_war3GpuSkinMapEpoch == 0u)
     m_war3GpuSkinMapEpoch = 1u;
+  war3::model::ShadowModelResourceCache::instance().resetMapEpoch(
+      m_war3GpuSkinMapEpoch);
   if (m_war3GpuSkinManager != nullptr)
     m_war3GpuSkinManager->Reset(bridgeReset.requestedGeneration);
 }
@@ -22715,9 +22721,9 @@ void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(
   if (requestedMode == Adapter::Mode::Consume) {
     static std::atomic<bool> s_consumeDeniedLogged{false};
     if (!s_consumeDeniedLogged.exchange(true, std::memory_order_relaxed)) {
-      WAR3_RENDER_LOG(
+      Logger::warn(
           "DXVK War3PackageStage11Observe: Consume denied; evidence-only "
-          "adapter remains inactive\n");
+          "adapter remains inactive");
     }
     return;
   }
@@ -22729,7 +22735,8 @@ void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(
   try {
     hasExplicitGeosetDataSidecar =
         dxvk::war3::model::ShadowModelResourceCache::instance()
-            .findGeosetStampByData(key.meshPayloadPtr, geosetStamp);
+            .findGeosetStampByDataForEpoch(
+                key.meshPayloadPtr, m_war3GpuSkinMapEpoch, geosetStamp);
   } catch (...) {
     // Observation must never unwind through the already-published canonical
     // caster. Preserve the caster and classify this evidence lookup only.
@@ -22777,6 +22784,7 @@ void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(
   witness.geosetSidecar.geosetDataIdentity =
       reinterpret_cast<uintptr_t>(geosetStamp.geosetDataPtr);
   witness.geosetSidecar.contentHash = geosetStamp.contentHash;
+  witness.geosetSidecar.mapEpoch = geosetStamp.mapEpoch;
   witness.geosetSidecar.immutableModelGeneration =
       geosetStamp.immutableModelGeneration;
   witness.geosetSidecar.vertexCount = geosetStamp.vertexCount;
@@ -22795,35 +22803,44 @@ void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(
       (diagnostics.observeCalls % 4096u) == 0u) {
     const double ticksToUs = 1000000.0 /
         double(dxvk::high_resolution_clock::get_frequency());
-    WAR3_RENDER_LOG(
-        "DXVK War3PackageStage11Observe: calls=%llu contentIdentityOnly=%llu "
-        "lookupFailed=%llu missingSidecar=%llu invalidSidecar=%llu "
+    char observeLine[1024] = {};
+    std::snprintf(
+        observeLine, sizeof(observeLine),
+        "DXVK War3PackageStage11Observe: calls=%llu currentMapSource=%llu "
+        "lookupFailed=%llu missingSidecar=%llu staleMap=%llu invalidSidecar=%llu "
         "invalidWitness=%llu "
         "acceptedBlocker=%llu "
+        "timedFrames=%llu currentTimedFrame=%llu "
         "lastSource=%llu disposition=%u packageGeneration=0 ready=0 "
         "fullyEquivalent=0 eligible=0 wouldUse=0 actual=0 "
-        "provesCurrentGameMemory=0 "
-        "avgCoreCallUs=%.3f maxCoreCallUs=%.3f maxCoreFrameUs=%.3f\n",
+        "provesCurrentGameMemory=%u "
+        "avgCoreCallUs=%.3f maxCoreCallUs=%.3f maxCoreFrameUs=%.3f",
         static_cast<unsigned long long>(diagnostics.observeCalls),
         static_cast<unsigned long long>(
-            diagnostics.recordedContentIdentityOnly),
+            diagnostics.recordedCurrentMapSource),
         static_cast<unsigned long long>(
             diagnostics.explicitGeosetDataSidecarLookupFailed),
         static_cast<unsigned long long>(
             diagnostics.missingExplicitGeosetDataSidecar),
         static_cast<unsigned long long>(
+            diagnostics.staleMapEpochExplicitGeosetDataSidecar),
+        static_cast<unsigned long long>(
             diagnostics.invalidExplicitGeosetDataSidecar),
         static_cast<unsigned long long>(diagnostics.invalidWitness),
         static_cast<unsigned long long>(
             diagnostics.acceptedBlockerClassified),
+        static_cast<unsigned long long>(diagnostics.completedTimedFrames),
+        static_cast<unsigned long long>(diagnostics.currentTimedFrameSerial),
         static_cast<unsigned long long>(diagnostics.lastSourceGeneration),
         static_cast<unsigned>(evidence.disposition),
+        evidence.provesCurrentGameMemory ? 1u : 0u,
         diagnostics.observeCalls != 0u
             ? double(diagnostics.elapsedTicksTotal) * ticksToUs /
                   double(diagnostics.observeCalls)
             : 0.0,
         double(diagnostics.elapsedTicksMaxCall) * ticksToUs,
         double(diagnostics.elapsedTicksMaxFrame) * ticksToUs);
+    Logger::info(observeLine);
   }
 }
 

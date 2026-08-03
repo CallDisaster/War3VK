@@ -36,6 +36,7 @@ Adapter::ExactSubmittedWitness ValidWitness(bool withSidecar = true) {
   witness.producerAccepted = true;
   witness.geosetSidecar.geosetDataIdentity = 17u;
   witness.geosetSidecar.contentHash = 37u;
+  witness.geosetSidecar.mapEpoch = witness.mapEpoch;
   witness.geosetSidecar.immutableModelGeneration = 41u;
   witness.geosetSidecar.vertexCount = 300u;
   witness.geosetSidecar.found = withSidecar;
@@ -64,7 +65,7 @@ int TestModesAndHardCeilings() {
       Adapter::Mode::Observe, ValidWitness());
   if (const int rc = Check(
           observed.disposition ==
-                  Adapter::Disposition::RecordedContentIdentityOnly &&
+                  Adapter::Disposition::RecordedCurrentMapSource &&
               observed.effectiveMode == Adapter::Mode::Observe &&
               observed.packageGeneration == 0u &&
               observed.requestedConsumerMask ==
@@ -77,7 +78,7 @@ int TestModesAndHardCeilings() {
               !observed.gpuBindingAllowed &&
               !observed.commandRecordingAllowed &&
               !observed.packagePublicationAllowed &&
-              !observed.provesCurrentGameMemory,
+              observed.provesCurrentGameMemory,
           3))
     return rc;
   return 0;
@@ -118,6 +119,18 @@ int TestExactWitnessAndExplicitSidecar() {
     return rc;
 
   witness = ValidWitness();
+  witness.geosetSidecar.mapEpoch += 1u;
+  evidence = adapter.observe(Adapter::Mode::Observe, witness);
+  if (const int rc = Check(
+          evidence.disposition == Adapter::Disposition::
+              StaleMapEpochExplicitGeosetDataSidecar &&
+              !evidence.provesCurrentGameMemory &&
+              adapter.diagnostics().
+                  staleMapEpochExplicitGeosetDataSidecar == 1u,
+          17))
+    return rc;
+
+  witness = ValidWitness();
   witness.geosetSidecar.geosetDataIdentity += 1u;
   evidence = adapter.observe(Adapter::Mode::Observe, witness);
   if (const int rc = Check(
@@ -132,7 +145,7 @@ int TestExactWitnessAndExplicitSidecar() {
   evidence = adapter.observe(Adapter::Mode::Observe, witness);
   if (const int rc = Check(
           evidence.disposition ==
-                  Adapter::Disposition::RecordedContentIdentityOnly &&
+                  Adapter::Disposition::RecordedCurrentMapSource &&
               evidence.blockerClassified &&
               adapter.diagnostics().acceptedBlockerClassified == 1u,
           13))
@@ -143,8 +156,8 @@ int TestExactWitnessAndExplicitSidecar() {
   evidence = adapter.observe(Adapter::Mode::Observe, witness);
   if (const int rc = Check(
           evidence.disposition ==
-              Adapter::Disposition::RecordedContentIdentityOnly &&
-              !evidence.provesCurrentGameMemory,
+              Adapter::Disposition::RecordedCurrentMapSource &&
+              evidence.provesCurrentGameMemory,
           14))
     return rc;
 
@@ -204,7 +217,7 @@ static_assert(!Adapter::kBindsGpuResources);
 static_assert(!Adapter::kRecordsCommands);
 static_assert(!Adapter::kMutatesCanonicalDraw);
 static_assert(!Adapter::kPublishesPackage);
-static_assert(!Adapter::kProvesCurrentGameMemory);
+static_assert(Adapter::kProvesCurrentGameMemory);
 static_assert(
     Adapter::kRequestedConsumerMask ==
     (Adapter::ConsumerCsm0 | Adapter::ConsumerCsm1 |

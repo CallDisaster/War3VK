@@ -68,6 +68,10 @@ struct ShadowGeosetResourceRecord {
   std::vector<uint32_t> matrixIndices;
 
   uint64_t contentHash = 0;
+  // Map-scoped source authority minted by ShadowModelResourceCache.  The
+  // process-monotonic immutable generation identifies bytes; this epoch
+  // additionally proves that the address was captured in the active map.
+  uint64_t mapEpoch = 0;
   // Minted only by ShadowModelResourceCache under its unique writer lock.
   // Callers may carry this value, but incoming values are never trusted or
   // merged when the cache publishes a replacement immutable snapshot.
@@ -157,6 +161,7 @@ using ShadowGeosetResourceSnapshot =
 struct ShadowGeosetResourceStamp {
   void* geosetDataPtr = nullptr;
   uint64_t contentHash = 0;
+  uint64_t mapEpoch = 0;
   uint64_t immutableModelGeneration = 0;
   uint32_t vertexCount = 0;
   ShadowGeosetImmutableCaptureStatus immutableCaptureStatus =
@@ -203,11 +208,16 @@ public:
   // epoch scoped. This proves cache-content identity only; a future renderer
   // consumer still requires an exact current Stage11 source token.
   static constexpr bool kImmutableGenerationProvesCurrentGameMemory = false;
+  static constexpr bool kMapEpochScopedSourceAuthorityIntegrated = true;
 
   static ShadowModelResourceCache &instance();
 
   void beginFrame();
   void endFrame();
+  // Drops every address alias for the old map while allowing shared immutable
+  // snapshots already owned by GPU retirement records to outlive the lookup
+  // table. The immutable generation issuer is deliberately not reset.
+  bool resetMapEpoch(uint64_t nextMapEpoch);
 
   void recordGeosetCreate(void *geosetPtr);
   void noteModelResourceBinding(void *modelResourcePtr, uint64_t modelKey = 0);
@@ -227,6 +237,9 @@ public:
       void* geosetDataPtr) const;
   bool findGeosetStampByData(void* geosetDataPtr,
                              ShadowGeosetResourceStamp& out) const;
+  bool findGeosetStampByDataForEpoch(
+      void* geosetDataPtr, uint64_t expectedMapEpoch,
+      ShadowGeosetResourceStamp& out) const;
   bool hydrateGeosetByKnownPtrs(void* geosetPtr, void* geosetDataPtr,
                                 ShadowGeosetResourceRecord& out);
   bool findModelGeoset(void *modelResourcePtr, uint32_t geosetIndex,
@@ -256,6 +269,7 @@ public:
   ShadowModelResourceMemorySnapshot memorySnapshot() const;
   uint64_t frameNumber() const;
   uint64_t revision() const;
+  uint64_t mapEpoch() const;
 
 private:
   ShadowModelResourceCache() = default;
@@ -295,6 +309,7 @@ private:
   std::unordered_map<void *, void *> m_runtimeOwnerByGeosetData;
   std::atomic<uint64_t> m_frameNumber{0};
   std::atomic<uint64_t> m_revision{0};
+  std::atomic<uint64_t> m_mapEpoch{1u};
   // Process-lifetime source-generation authority.  This member is neither
   // reset by map/device changes nor reachable outside the cache writer path.
   ImmutableModelGenerationIssuer m_immutableModelGenerations;
@@ -304,3 +319,5 @@ private:
 
 static_assert(!dxvk::war3::model::ShadowModelResourceCache::
     kImmutableGenerationProvesCurrentGameMemory);
+static_assert(dxvk::war3::model::ShadowModelResourceCache::
+    kMapEpochScopedSourceAuthorityIntegrated);

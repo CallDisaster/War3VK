@@ -19,10 +19,10 @@ public:
   static constexpr bool kRecordsCommands = false;
   static constexpr bool kMutatesCanonicalDraw = false;
   static constexpr bool kPublishesPackage = false;
-  // ShadowModelResourceCache is process-lived and not map-epoch scoped. An
-  // address/content join can measure coverage, but it can never prove that the
-  // sidecar still describes current Game.dll memory.
-  static constexpr bool kProvesCurrentGameMemory = false;
+  // The cache drops all address aliases on every map epoch. Combined with the
+  // exact accepted Stage11 draw identity, an epoch-matched sidecar proves the
+  // immutable model source belongs to the current Game.dll map domain.
+  static constexpr bool kProvesCurrentGameMemory = true;
   static constexpr uint32_t kRequiredStage = 11u;
 
   enum class Mode : uint8_t {
@@ -51,13 +51,15 @@ public:
     SourceGenerationExhausted,
     ExplicitGeosetDataSidecarLookupFailed,
     MissingExplicitGeosetDataSidecar,
+    StaleMapEpochExplicitGeosetDataSidecar,
     InvalidExplicitGeosetDataSidecar,
-    RecordedContentIdentityOnly,
+    RecordedCurrentMapSource,
   };
 
   struct ExplicitGeosetDataSidecar {
     uintptr_t geosetDataIdentity = 0u;
     uint64_t contentHash = 0u;
+    uint64_t mapEpoch = 0u;
     uint64_t immutableModelGeneration = 0u;
     uint32_t vertexCount = 0u;
     bool found = false;
@@ -130,8 +132,9 @@ public:
     uint64_t sourceGenerationExhausted = 0u;
     uint64_t explicitGeosetDataSidecarLookupFailed = 0u;
     uint64_t missingExplicitGeosetDataSidecar = 0u;
+    uint64_t staleMapEpochExplicitGeosetDataSidecar = 0u;
     uint64_t invalidExplicitGeosetDataSidecar = 0u;
-    uint64_t recordedContentIdentityOnly = 0u;
+    uint64_t recordedCurrentMapSource = 0u;
     uint64_t acceptedBlockerClassified = 0u;
     uint64_t lastSourceGeneration = 0u;
     uint64_t elapsedTicksTotal = 0u;
@@ -192,7 +195,7 @@ static_assert(
 static_assert(
     !War3PersistentGpuPackageStage11ObserveAdapter::kPublishesPackage);
 static_assert(
-    !War3PersistentGpuPackageStage11ObserveAdapter::
+    War3PersistentGpuPackageStage11ObserveAdapter::
         kProvesCurrentGameMemory);
 
 }  // namespace dxvk::war3::gpu_skin
