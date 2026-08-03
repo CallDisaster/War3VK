@@ -340,6 +340,13 @@ bool War3GpuSkinResources::retireStaticUpload(
       upload, std::move(fence), value);
 }
 
+bool War3GpuSkinResources::retireStaticUploads(
+    const std::vector<GpuSkinStaticUpload>& uploads,
+    Rc<DxvkFence> fence, uint64_t value) {
+  return m_persistentPackages->retireStaticUploads(
+      uploads, std::move(fence), value);
+}
+
 DxvkBufferSlice War3GpuSkinResources::staticAtlasSlice() const {
   return m_persistentPackages->staticAtlasSlice();
 }

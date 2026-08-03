@@ -392,6 +392,9 @@ public:
   std::vector<GpuSkinStaticUpload> takeStaticUploads();
   bool retireStaticUpload(const GpuSkinStaticUpload& upload,
       Rc<DxvkFence> fence, uint64_t value);
+  bool retireStaticUploads(
+      const std::vector<GpuSkinStaticUpload>& uploads,
+      Rc<DxvkFence> fence, uint64_t value);
   DxvkBufferSlice staticAtlasSlice() const;
 
   GpuSkinBatchUpload allocateBatchUpload(

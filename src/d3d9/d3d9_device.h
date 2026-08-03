@@ -45,6 +45,7 @@
 #include "d3d9_war3_shadow.h"
 #include "d3d9_war3_ssao.h"
 #include "war3/shadow/war3_shadow_backend_dxvk.h"
+#include "war3/gpu_skin/war3_persistent_gpu_package_d3d9_observe_owner.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.h"
 #include <type_traits>
 #include <unordered_map>
@@ -1746,6 +1747,9 @@ private:
       m_war3GpuSkinCompute;
   war3::gpu_skin::War3PersistentGpuPackageStage11ObserveAdapter
       m_war3PersistentPackageStage11ObserveAdapter;
+  std::unique_ptr<
+      war3::gpu_skin::War3PersistentGpuPackageD3D9ObserveOwner>
+      m_war3PersistentPackageD3D9ObserveOwner;
   Rc<sync::Fence> m_war3ShadowArenaFence;
   Rc<DxvkFence> m_war3GpuSkinFence;
   uint64_t m_war3GpuSkinFenceValue = 0u;
@@ -2769,6 +2773,11 @@ private:
       bool blockerClassified,
       war3::gpu_skin::War3PersistentGpuPackageStage11ObserveAdapter::Mode
           requestedMode) noexcept;
+  void War3ObservePersistentPackageD3D9Owner(
+      const War3DrawTimeVBCacheKey& key,
+      const war3::gpu_skin::
+          War3PersistentGpuPackageStage11ObserveAdapter::Evidence&
+              evidence) noexcept;
   uint32_t War3GetOrCreateSemanticShadowPalette(
       const dxvk::war3::shadow::ShadowDrawPacket& packet,
       dxvk::war3::render::ObjectKind resolvedObjectKind,

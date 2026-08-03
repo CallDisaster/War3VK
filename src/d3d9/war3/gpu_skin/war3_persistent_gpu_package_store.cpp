@@ -856,66 +856,118 @@ War3PersistentGpuPackageStore::takeStaticUploads() {
 bool War3PersistentGpuPackageStore::retireStaticUpload(
     const GpuSkinStaticUpload& upload,
     Rc<DxvkFence> fence, uint64_t value) {
-  if (!upload.source.defined() || !upload.destination.defined() ||
-      upload.key.reserved != 0u ||
-      upload.byteCount == 0u || upload.source.length() != upload.byteCount ||
-      upload.destination.length() != upload.byteCount ||
-      fence == nullptr || value == 0u) {
+  try {
+    std::vector<GpuSkinStaticUpload> uploads;
+    uploads.reserve(1u);
+    uploads.push_back(upload);
+    return retireStaticUploads(uploads, std::move(fence), value);
+  } catch (...) {
+    recordFallback(GpuSkinFallbackReason::OutputLeaseUnretired);
+    return false;
+  }
+}
+
+bool War3PersistentGpuPackageStore::retireStaticUploads(
+    const std::vector<GpuSkinStaticUpload>& uploads,
+    Rc<DxvkFence> fence, uint64_t value) {
+  if (uploads.empty() || fence == nullptr || value == 0u ||
+      uploads.size() > m_budgets.missQueueCapacity) {
     recordFallback(GpuSkinFallbackReason::OutputLeaseUnretired);
     return false;
   }
 
-  const auto found = m_staticResources.find(upload.key);
-  bool exactPendingUpload = false;
-  if (found != m_staticResources.end() && found->second != nullptr &&
-      found->second->state == GpuSkinStaticResourceState::PendingUpload) {
-    const GpuSkinStaticUpload& pending = found->second->pendingUpload;
-    exactPendingUpload = found->second->key == upload.key &&
-        pending.key == upload.key && pending.source.defined() &&
-        pending.destination.defined() && pending.byteCount == upload.byteCount &&
-        pending.byteCount == found->second->allocatedBytes &&
-        pending.residencyCensus == upload.residencyCensus &&
-        pending.source.buffer() == upload.source.buffer() &&
-        pending.source.offset() == upload.source.offset() &&
-        pending.source.length() == upload.source.length() &&
-        pending.destination.buffer() == upload.destination.buffer() &&
-        pending.destination.offset() == upload.destination.offset() &&
-        pending.destination.length() == upload.destination.length() &&
-        pending.destination.buffer() == found->second->packageSlice.buffer() &&
-        pending.destination.offset() == found->second->packageSlice.offset() &&
-        pending.destination.length() == found->second->packageSlice.length() &&
-        ownsFrozenPayload(*found->second) &&
-        ValidateGpuSkinStaticFrozenPayload(*found->second);
+  struct PreparedRetirement {
+    std::unique_ptr<RetiredStaticUpload> retirement;
+    std::shared_ptr<GpuSkinStaticResource> resource;
+  };
+  std::vector<PreparedRetirement> prepared;
+  try {
+    prepared.reserve(uploads.size());
+    for (size_t uploadIndex = 0u;
+         uploadIndex < uploads.size(); ++uploadIndex) {
+      const GpuSkinStaticUpload& upload = uploads[uploadIndex];
+      if (!upload.source.defined() || !upload.destination.defined() ||
+          upload.key.reserved != 0u || upload.byteCount == 0u ||
+          upload.source.length() != upload.byteCount ||
+          upload.destination.length() != upload.byteCount) {
+        recordFallback(GpuSkinFallbackReason::OutputLeaseUnretired);
+        return false;
+      }
+      for (size_t earlier = 0u; earlier < uploadIndex; ++earlier) {
+        if (uploads[earlier].key == upload.key) {
+          recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
+          return false;
+        }
+      }
+
+      const auto found = m_staticResources.find(upload.key);
+      bool exactPendingUpload = false;
+      if (found != m_staticResources.end() && found->second != nullptr &&
+          found->second->state == GpuSkinStaticResourceState::PendingUpload) {
+        const GpuSkinStaticUpload& pending = found->second->pendingUpload;
+        exactPendingUpload = found->second->key == upload.key &&
+            pending.key == upload.key && pending.source.defined() &&
+            pending.destination.defined() &&
+            pending.byteCount == upload.byteCount &&
+            pending.byteCount == found->second->allocatedBytes &&
+            pending.residencyCensus == upload.residencyCensus &&
+            pending.source.buffer() == upload.source.buffer() &&
+            pending.source.offset() == upload.source.offset() &&
+            pending.source.length() == upload.source.length() &&
+            pending.destination.buffer() == upload.destination.buffer() &&
+            pending.destination.offset() == upload.destination.offset() &&
+            pending.destination.length() == upload.destination.length() &&
+            pending.destination.buffer() ==
+                found->second->packageSlice.buffer() &&
+            pending.destination.offset() ==
+                found->second->packageSlice.offset() &&
+            pending.destination.length() ==
+                found->second->packageSlice.length() &&
+            ownsFrozenPayload(*found->second) &&
+            ValidateGpuSkinStaticFrozenPayload(*found->second);
+      }
+      if (!exactPendingUpload) {
+        recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
+        return false;
+      }
+
+      // Both sides of the copy remain owned until the exact producer fence.
+      auto retirement = std::make_unique<RetiredStaticUpload>();
+      retirement->key = upload.key;
+      retirement->source = upload.source;
+      retirement->destination = upload.destination;
+      retirement->fence = fence;
+      retirement->retireValue = value;
+      retirement->residencyCensus = upload.residencyCensus;
+      retirement->destinationResidencyCensus = m_staticAtlasCensus;
+      retirement->publicationResource = found->second;
+      retirement->publishesReady = true;
+      prepared.push_back(
+          {std::move(retirement), found->second});
+    }
+
+    if (prepared.size() >
+        m_retiredStaticUploads.max_size() - m_retiredStaticUploads.size()) {
+      recordFallback(GpuSkinFallbackReason::OutputLeaseUnretired);
+      return false;
+    }
+    m_retiredStaticUploads.reserve(
+        m_retiredStaticUploads.size() + prepared.size());
+  } catch (...) {
+    recordFallback(GpuSkinFallbackReason::OutputLeaseUnretired);
+    return false;
   }
 
-  // The staging slice remains authoritative until the producer fence passes,
-  // even if an epoch invalidates the package lookup table in the meantime.
-  // Retain the exact destination slice and atlas census for the same interval:
-  // a copy command references both resources, not only its host-visible side.
-  auto retirement = std::make_unique<RetiredStaticUpload>();
-  retirement->key = upload.key;
-  retirement->source = upload.source;
-  retirement->destination = upload.destination;
-  retirement->fence = std::move(fence);
-  retirement->retireValue = value;
-  retirement->residencyCensus = upload.residencyCensus;
-  retirement->destinationResidencyCensus = m_staticAtlasCensus;
-  if (exactPendingUpload) {
-    retirement->publicationResource = found->second;
-    retirement->publishesReady = true;
+  // All allocations and exact validation are complete. The following commit
+  // cannot allocate and therefore cannot publish only half of this batch.
+  for (PreparedRetirement& item : prepared)
+    m_retiredStaticUploads.push_back(std::move(item.retirement));
+  for (PreparedRetirement& item : prepared) {
+    item.resource->state = GpuSkinStaticResourceState::UploadSubmitted;
+    item.resource->pendingUpload = {};
   }
-  m_retiredStaticUploads.push_back(std::move(retirement));
-
-  // Submission is not completion. Only the unique retirement record above
-  // owns permission to publish Ready after its exact fence value is observed.
-  if (exactPendingUpload) {
-    found->second->state = GpuSkinStaticResourceState::UploadSubmitted;
-    found->second->pendingUpload = {};
-  }
-  ++m_diagnostics.staticUploadRetirementsQueued;
-  if (!exactPendingUpload)
-    recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
-  return exactPendingUpload;
+  m_diagnostics.staticUploadRetirementsQueued += uploads.size();
+  return true;
 }
 
 void War3PersistentGpuPackageStore::completeRetiredStaticUpload(
@@ -1045,8 +1097,8 @@ void War3PersistentGpuPackageStore::deferOutstandingProducerRetirements()
   // The callback deliberately owns no fence reference, avoiding a cycle.
   while (!m_retiredStaticUploads.empty()) {
     std::unique_ptr<RetiredStaticUpload> retirement =
-        std::move(m_retiredStaticUploads.front());
-    m_retiredStaticUploads.pop_front();
+        std::move(m_retiredStaticUploads.back());
+    m_retiredStaticUploads.pop_back();
     if (retirement == nullptr || retirement->fence == nullptr ||
         retirement->retireValue == 0u) {
       // A malformed retirement has no completion proof. Leak rather than

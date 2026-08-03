@@ -17,6 +17,9 @@ class War3PersistentGpuPackageStore final {
 public:
   static constexpr uint32_t kStaticPackingLayoutGeneration =
       kPersistentGpuPackageStaticLayoutGeneration;
+  // The D3D9 boundary may now instantiate the Store through the bounded
+  // Observe owner, but no renderer consumer can borrow its slices yet.
+  static constexpr bool kD3D9ObserveOwnerEnabled = true;
   static constexpr bool kD3D9SharedOwnerEnabled = false;
   static constexpr bool kRequiresNativeBridge = false;
   // A submitted package upload owns both sides of the copy until its producer
@@ -77,6 +80,9 @@ public:
   std::vector<GpuSkinStaticUpload> takeStaticUploads();
   bool retireStaticUpload(const GpuSkinStaticUpload& upload,
                           Rc<DxvkFence> fence, uint64_t value);
+  bool retireStaticUploads(
+      const std::vector<GpuSkinStaticUpload>& uploads,
+      Rc<DxvkFence> fence, uint64_t value);
   DxvkBufferSlice staticAtlasSlice() const;
 
   bool hasRetiredUploads() const;
@@ -152,10 +158,13 @@ private:
   std::vector<GpuSkinStaticUpload> m_readyStaticUploads;
   Rc<DxvkBuffer> m_staticAtlas;
   resource_census::ResourceHandle m_staticAtlasCensus;
-  std::deque<std::unique_ptr<RetiredStaticUpload>> m_retiredStaticUploads;
+  // Vector reserve gives batch retirement a no-throw commit boundary after
+  // every exact upload and retirement payload has been validated/prepared.
+  std::vector<std::unique_ptr<RetiredStaticUpload>> m_retiredStaticUploads;
 };
 
 static_assert(!War3PersistentGpuPackageStore::kD3D9SharedOwnerEnabled);
+static_assert(War3PersistentGpuPackageStore::kD3D9ObserveOwnerEnabled);
 static_assert(!War3PersistentGpuPackageStore::kRequiresNativeBridge);
 static_assert(
     War3PersistentGpuPackageStore::kProducerRetirementSurvivesEpochClear);

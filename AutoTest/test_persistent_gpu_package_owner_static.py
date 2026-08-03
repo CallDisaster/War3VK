@@ -52,6 +52,7 @@ class PersistentPackageOwnerContracts(unittest.TestCase):
             "prepareQueuedStaticResources",
             "takeStaticUploads",
             "retireStaticUpload",
+            "retireStaticUploads",
             "staticAtlasSlice",
         ):
             with self.subTest(method=method):
@@ -72,6 +73,7 @@ class PersistentPackageOwnerContracts(unittest.TestCase):
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, store_implementation)
+        self.assertIn("kD3D9ObserveOwnerEnabled = true", self.store_h)
         self.assertIn("kD3D9SharedOwnerEnabled = false", self.store_h)
         self.assertIn("kRequiresNativeBridge = false", self.store_h)
         self.assertIn(
@@ -123,8 +125,11 @@ class PersistentPackageOwnerContracts(unittest.TestCase):
         )
         self.assertNotIn("retireStaticAtlasUse", self.store_h)
 
-    def test_d3d9_does_not_construct_or_name_the_store(self) -> None:
+    def test_d3d9_uses_observe_owner_without_naming_the_store(self) -> None:
         self.assertNotIn("War3PersistentGpuPackageStore", self.device_cpp)
+        self.assertIn(
+            "War3PersistentGpuPackageD3D9ObserveOwner", self.device_cpp
+        )
 
     def test_disabled_gate_still_precedes_manager_construction(self) -> None:
         attach = self.device_cpp.split(

@@ -17,8 +17,10 @@ int main() {
   const gpu_skin::GpuSkinRuntimeConfig defaults = {};
   if (defaults.mode != gpu_skin::GpuSkinMode::Disabled)
     return 1;
-  if (gpu_skin::War3PersistentGpuPackageStore::kD3D9SharedOwnerEnabled)
+  if (!gpu_skin::War3PersistentGpuPackageStore::kD3D9ObserveOwnerEnabled)
     return 2;
+  if (gpu_skin::War3PersistentGpuPackageStore::kD3D9SharedOwnerEnabled)
+    return 6;
   if (gpu_skin::War3PersistentGpuPackageStore::kRequiresNativeBridge)
     return 3;
   if (!gpu_skin::War3PersistentGpuPackageStore::

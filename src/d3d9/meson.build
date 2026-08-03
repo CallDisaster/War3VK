@@ -155,6 +155,7 @@ d3d9_src = [
   'war3/gpu_skin/war3_gpu_skin_native_bridge.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_observer.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_d3d9_observe_owner.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_owner.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_proof_catalog.cpp',
   'war3/gpu_skin/war3_persistent_gpu_package_immutable.cpp',

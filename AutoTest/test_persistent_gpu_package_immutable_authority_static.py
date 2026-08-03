@@ -173,7 +173,8 @@ class ImmutablePublicationAuthorityContracts(unittest.TestCase):
         retire = self.store_cpp.split("retireStaticUpload(", 1)[1].split(
             "completeRetiredStaticUpload", 1
         )[0]
-        self.assertIn("return exactPendingUpload", retire)
+        self.assertIn("if (!exactPendingUpload)", retire)
+        self.assertIn("return true", retire)
         self.assertIn(
             "GpuSkinStaticResourceState::UploadSubmitted", retire
         )

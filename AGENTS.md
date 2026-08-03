@@ -1,5 +1,53 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-03（Persistent Package 独立 D3D9 Observe owner，真实上传闭合）
+
+在 producer-completion 发布合同通过后，本轮把 persistent package Store 第一次接到
+独立 D3D9 owner，但仍严格限定为 Observe。该 owner 不依赖 GPU-skin manager 或原生
+bridge；默认不创建，只有显式
+`DXVK_WAR3_PERSISTENT_GPU_PACKAGE_D3D9_OWNER_MODE=1` 才工作，值 2 会被明确拒绝。
+
+**实现与生命周期**：
+
+- Stage11 CPU adapter 仍只负责当前帧源码证据；独立 D3D9 边界仅在
+  `RecordedCurrentMapSource`、exact map/device/source generation、immutable snapshot
+  pointer/content hash/vertex count 全部复核后，才把模型加入 Store。每帧最多准备两份
+  package，未放宽任何 source freshness 或安全回退。
+- 新 owner 自有 device-local atlas 和专用 timeline fence。上传命令执行 copy、显式
+  transfer→vertex/index/shader-read barrier 后 signal；Store 只有观察到对应 fence 完成才
+  将 package 发布为 Ready。
+- Store 新增批量原子 `retireStaticUploads`：先验证整批 exact pending payload、重复 key、
+  source/destination slice 和全部 retirement 分配，再以 no-throw commit 一次性切换到
+  `UploadSubmitted`，消除了多 upload 时只退休半批的可能。既有 GPU-skin manager 也改用
+  同一批量合同。
+- 地图代际、设备代际与析构均显式使 owner 失效；D3D9 device 析构先等待 GPU idle，再
+  poll completion 并销毁 owner。当前仍不导出 atlas slice，不绑定 Main/CSM/点阴影/
+  outline，不修改 canonical draw，也不发布 consumer authority 或 last-use fence。
+
+**静态、构建与运行门**：
+
+- 新增 D3D9 Observe owner 与批量 retirement 合同；全量 `test_*static.py` 409/409 PASS，
+  11 个 Win32 Meson runnable 11/11 PASS。Win32 build 成功，随后
+  `ninja -C build32 -n` 为 no-work。
+- 第一轮高压图运行 193.392 秒后被旧 conductor 的 hot-shadow freshness 条件判为失败：
+  `semanticSceneConsumptionMode` 仍为 pending；但同帧真实 shadow counter 已为 caster 259、
+  四级联 draw 1036，owner 达到 58/58 submissions、98/0 completions、687,920 bytes，
+  无 owner reject、崩溃或驱动事件。因此该结果只归类为自动化假阴性，没有据此放宽门。
+- 去除该无关 hot marker 后的第二轮高压图完成 74.686 秒、2,766 个 shadow frame：最终
+  caster 252、四级联 draw 1008；owner 累计 528,384 次 exact observe，50/50 submissions、
+  89/0 completions、634,892 bytes，`binding=0 / mutation=0 / consumerAuthority=0`。
+  `framesIncomplete=0 / budgetExceeded=0 / deviceLost=0`，Arena 平均 3.481 MiB、峰值
+  5.522 MiB；无新 dump、NVIDIA/Display 事件，最终截图目检未见错误大块或阴影缺口。
+- build32 与部署 DLL exact：33,270,269 bytes，SHA-256
+  `5F6028F869755F549B876D5F3F7770CA8CB6B827E4627B3E19303546EB208C87`；部署前回退为
+  `E:\Work\War3\d3d9.dll.bak_20260803_EB0F_pre_package_d3d9_observe`，SHA-256
+  `EB0FF0F2FED0AD95B5D7B600567D683ED40592995E0447E4E4D3BA9484E4687C`。
+
+**仍未跨越的边界**：这是默认 Off 的真实上传/完成 Observe，不是 Consume，也没有证明
+性能收益。下一阶段必须先建立每个消费者的 exact recording/last-use authority、跨
+map/device retirement 与 Arena fallback 事务，再做 Observe ≥10,000 帧和同 DLL ABBA；
+在此之前 `kD3D9SharedOwnerEnabled` 必须继续为 false。
+
 ## 🚨 2026-08-03（Persistent Package producer fence 完成发布闭合）
 
 Stage 2A 的 map-scoped Stage11 source Observe 已通过后，本轮继续审计现有 static

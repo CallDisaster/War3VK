@@ -2209,6 +2209,19 @@ War3PersistentPackageStage11EvidenceModeRuntime() {
   return s_mode;
 }
 
+dxvk::war3::gpu_skin::War3PersistentGpuPackageStage11ObserveAdapter::Mode
+War3PersistentPackageD3D9OwnerModeRuntime() {
+  using Mode = dxvk::war3::gpu_skin::
+      War3PersistentGpuPackageStage11ObserveAdapter::Mode;
+  // Separate from CPU source evidence so the proven low-overhead Stage11
+  // observer can still run without allocating an atlas. Consume remains a
+  // hard failure in this stage.
+  static const auto s_mode = static_cast<Mode>((std::min)(
+      2u, War3GetEnvU32(
+              "DXVK_WAR3_PERSISTENT_GPU_PACKAGE_D3D9_OWNER_MODE", 0u)));
+  return s_mode;
+}
+
 bool War3PopulateSubmitPermutationViewRuntime() {
   // 周期 1 的 mapping+input verifier 以及同 DLL 反序 A/B 均已通过。
   // 默认保留 stable-sort permutation，并按 view 访问原 vector；仍保留一次
@@ -9769,6 +9782,11 @@ D3D9DeviceEx::~D3D9DeviceEx() {
   // Drain the device before destroying any pass owner.
   m_dxvkDevice->waitForIdle(); // Sync Device
 
+  if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
+    m_war3PersistentPackageD3D9ObserveOwner->pollProducerCompletions();
+    m_war3PersistentPackageD3D9ObserveOwner.reset();
+  }
+
   if (m_annotation)
     delete m_annotation;
 
@@ -14075,6 +14093,10 @@ void D3D9DeviceEx::War3ResetGpuSkinMapEpoch() {
     m_war3GpuSkinMapEpoch = 1u;
   war3::model::ShadowModelResourceCache::instance().resetMapEpoch(
       m_war3GpuSkinMapEpoch);
+  if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
+    m_war3PersistentPackageD3D9ObserveOwner->invalidateMapEpoch(
+        m_war3GpuSkinMapEpoch);
+  }
   if (m_war3GpuSkinManager != nullptr)
     m_war3GpuSkinManager->Reset(bridgeReset.requestedGeneration);
 }
@@ -14109,6 +14131,10 @@ void D3D9DeviceEx::War3RetryGpuSkinDeviceRebind() {
     m_war3GpuSkinPendingDeviceEpoch = 0u;
     m_war3GpuSkinDeviceBindingState =
         War3GpuSkinDeviceBindingState::Ready;
+    if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
+      m_war3PersistentPackageD3D9ObserveOwner->invalidateDeviceEpoch(
+          m_war3GpuSkinDeviceEpoch);
+    }
     m_war3GpuSkinDeviceRebindFailures = 0u;
     return;
   }
@@ -14127,6 +14153,10 @@ void D3D9DeviceEx::War3RetryGpuSkinDeviceRebind() {
     m_war3GpuSkinPendingDeviceEpoch = 0u;
     m_war3GpuSkinDeviceBindingState =
         War3GpuSkinDeviceBindingState::Ready;
+    if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
+      m_war3PersistentPackageD3D9ObserveOwner->invalidateDeviceEpoch(
+          m_war3GpuSkinDeviceEpoch);
+    }
     m_war3GpuSkinDeviceRebindFailures = 0u;
     war3dbg::Print(
         "DXVK War3GpuSkin: device rebind ready epoch=%llu attempts=%llu\n",
@@ -22712,6 +22742,143 @@ bool D3D9DeviceEx::War3DrawTimeAnonymousMarkerRejectionActive(
       kWar3AnonymousMarkerRejectionHoldFrames;
 }
 
+void D3D9DeviceEx::War3ObservePersistentPackageD3D9Owner(
+    const War3DrawTimeVBCacheKey& key,
+    const dxvk::war3::gpu_skin::
+        War3PersistentGpuPackageStage11ObserveAdapter::Evidence&
+            evidence) noexcept {
+  using Adapter = dxvk::war3::gpu_skin::
+      War3PersistentGpuPackageStage11ObserveAdapter;
+  using PackageOwner = dxvk::war3::gpu_skin::
+      War3PersistentGpuPackageD3D9ObserveOwner;
+
+  PackageOwner::ObserveResult packageResult = {};
+  PackageOwner::Submission packageSubmission = {};
+  bool packageSubmissionRecorded = false;
+  const auto packageOwnerMode =
+      War3PersistentPackageD3D9OwnerModeRuntime();
+  if (packageOwnerMode == Adapter::Mode::Consume) {
+    static std::atomic<bool> s_packageConsumeDeniedLogged{false};
+    if (!s_packageConsumeDeniedLogged.exchange(
+            true, std::memory_order_relaxed)) {
+      Logger::warn(
+          "DXVK War3PackageD3D9Owner: Consume denied; Observe uploader "
+          "does not publish renderer authority");
+    }
+    return;
+  }
+  if (packageOwnerMode != Adapter::Mode::Observe ||
+      evidence.disposition !=
+          Adapter::Disposition::RecordedCurrentMapSource ||
+      !evidence.provesCurrentGameMemory ||
+      !War3GpuSkinDeviceReady() || war3::GetActiveDevice() != this ||
+      m_deviceLostState != D3D9DeviceLostState::Ok) {
+    return;
+  }
+
+  try {
+    if (m_war3PersistentPackageD3D9ObserveOwner == nullptr) {
+      m_war3PersistentPackageD3D9ObserveOwner =
+          std::make_unique<PackageOwner>(m_dxvkDevice);
+    }
+    const auto packageSnapshot =
+        dxvk::war3::model::ShadowModelResourceCache::instance()
+            .findGeosetSnapshotByData(key.meshPayloadPtr);
+    packageResult =
+        m_war3PersistentPackageD3D9ObserveOwner->observe(
+            evidence, packageSnapshot);
+    packageSubmission =
+        m_war3PersistentPackageD3D9ObserveOwner->takeSubmission();
+    if (packageSubmission) {
+      const auto uploads = packageSubmission.uploads;
+      const Rc<DxvkFence> fence = packageSubmission.fence;
+      const uint64_t fenceValue = packageSubmission.fenceValue;
+      EmitCs([uploads, fence, fenceValue](DxvkContext* ctx) {
+        for (const auto& upload : *uploads) {
+          ctx->copyBuffer(
+              upload.destination.buffer(), upload.destination.offset(),
+              upload.source.buffer(), upload.source.offset(),
+              upload.byteCount);
+        }
+        ctx->emitGraphicsBarrier(
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                VK_ACCESS_INDEX_READ_BIT |
+                VK_ACCESS_SHADER_READ_BIT);
+        ctx->signalFence(fence, fenceValue);
+      });
+      packageSubmissionRecorded =
+          m_war3PersistentPackageD3D9ObserveOwner
+              ->commitSubmission(packageSubmission);
+    }
+  } catch (...) {
+    if (m_war3PersistentPackageD3D9ObserveOwner != nullptr &&
+        packageSubmission) {
+      m_war3PersistentPackageD3D9ObserveOwner->rejectSubmission(
+          packageSubmission);
+    }
+    packageSubmissionRecorded = false;
+  }
+
+  if (m_war3PersistentPackageD3D9ObserveOwner == nullptr)
+    return;
+  const auto packageDiagnostics =
+      m_war3PersistentPackageD3D9ObserveOwner->diagnostics();
+  if (!packageSubmission &&
+      (packageDiagnostics.observeCalls % 4096u) != 0u) {
+    return;
+  }
+  char packageLine[1024] = {};
+  std::snprintf(
+      packageLine, sizeof(packageLine),
+      "DXVK War3PackageD3D9Owner: calls=%llu exact=%llu "
+      "ready=%llu miss=%llu pending=%llu invalid=%llu epochReject=%llu "
+      "submission=%llu/%llu rejected=%llu uploads=%llu bytes=%llu "
+      "fence=%llu/%llu completion=%llu/%llu disposition=%u "
+      "packageGeneration=%llu primitiveCount=%u recorded=%u "
+      "binding=0 mutation=0 consumerAuthority=0",
+      static_cast<unsigned long long>(packageDiagnostics.observeCalls),
+      static_cast<unsigned long long>(
+          packageDiagnostics.exactSourcesAccepted),
+      static_cast<unsigned long long>(
+          packageDiagnostics.readyObservations),
+      static_cast<unsigned long long>(
+          packageDiagnostics.missObservations),
+      static_cast<unsigned long long>(
+          packageDiagnostics.pendingObservations),
+      static_cast<unsigned long long>(
+          packageDiagnostics.invalidEvidence +
+          packageDiagnostics.invalidSnapshots +
+          packageDiagnostics.storeRejects),
+      static_cast<unsigned long long>(packageDiagnostics.epochRejects),
+      static_cast<unsigned long long>(
+          packageDiagnostics.submissionsCommitted),
+      static_cast<unsigned long long>(
+          packageDiagnostics.submissionsBuilt),
+      static_cast<unsigned long long>(
+          packageDiagnostics.submissionsRejected),
+      static_cast<unsigned long long>(packageDiagnostics.uploadsCommitted),
+      static_cast<unsigned long long>(
+          packageDiagnostics.uploadBytesCommitted),
+      static_cast<unsigned long long>(
+          packageDiagnostics.lastSubmittedFenceValue),
+      static_cast<unsigned long long>(
+          packageDiagnostics.lastCompletedFenceValue),
+      static_cast<unsigned long long>(
+          packageDiagnostics.store.staticUploadsCompleted),
+      static_cast<unsigned long long>(
+          packageDiagnostics.store.staticUploadCompletionsRejected),
+      static_cast<unsigned>(packageResult.disposition),
+      static_cast<unsigned long long>(packageResult.packageGeneration),
+      packageResult.primitiveCount,
+      packageSubmissionRecorded ? 1u : 0u);
+  Logger::info(packageLine);
+}
+
 void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(
     const War3DrawTimeVBCacheKey& key,
     const War3DrawTimeVBEntry& entry, int16_t exactProducerStage,
@@ -22801,6 +22968,8 @@ void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(
   m_war3PersistentPackageStage11ObserveAdapter.noteElapsedTicks(
       witness.frameSerial,
       endTicks >= beginTicks ? uint64_t(endTicks - beginTicks) : 0u);
+
+  War3ObservePersistentPackageD3D9Owner(key, evidence);
 
   const auto& diagnostics =
       m_war3PersistentPackageStage11ObserveAdapter.diagnostics();

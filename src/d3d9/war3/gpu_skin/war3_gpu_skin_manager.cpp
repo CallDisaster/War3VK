@@ -4164,9 +4164,8 @@ private:
       return false;
     }
 
-    bool retired = true;
-    for (const GpuSkinStaticUpload& upload : batch.staticUploads)
-      retired &= resources->retireStaticUpload(upload, fence, value);
+    bool retired = batch.staticUploads.empty() ||
+        resources->retireStaticUploads(batch.staticUploads, fence, value);
     if (batch.requiresUploadRetirement)
       retired &= resources->retireUploads(fence, value);
     if (retireOutputsOnProducerFence) {
