@@ -3,12 +3,16 @@
 #include <algorithm>
 #include <atomic>
 #include <limits>
+#include <mutex>
 
 namespace dxvk::war3::gpu_skin {
 
 namespace {
 
 std::atomic<uint64_t> g_nextD3D9ObserveOwnerAuthority{1u};
+std::mutex g_d3d9RuntimeDiagnosticsMutex;
+War3PersistentGpuPackageD3D9RuntimeDiagnostics
+    g_d3d9RuntimeDiagnostics = {};
 
 bool HasSliceContract(
     const DxvkBufferSlice& slice, VkBufferUsageFlags usage,
@@ -54,6 +58,20 @@ bool ValidObserveUpload(
 
 }  // namespace
 
+void ConfigurePersistentGpuPackageD3D9RuntimeDiagnostics(
+    uint32_t configuredMode) noexcept {
+  std::lock_guard<std::mutex> lock(g_d3d9RuntimeDiagnosticsMutex);
+  g_d3d9RuntimeDiagnostics.configuredMode = configuredMode;
+  if (configuredMode != 1u)
+    g_d3d9RuntimeDiagnostics.effectiveMode = 0u;
+}
+
+War3PersistentGpuPackageD3D9RuntimeDiagnostics
+QueryPersistentGpuPackageD3D9RuntimeDiagnostics() noexcept {
+  std::lock_guard<std::mutex> lock(g_d3d9RuntimeDiagnosticsMutex);
+  return g_d3d9RuntimeDiagnostics;
+}
+
 uint64_t War3PersistentGpuPackageD3D9ObserveOwner::
 allocateOwnerAuthority() noexcept {
   uint64_t current = g_nextD3D9ObserveOwnerAuthority.load(
@@ -87,11 +105,62 @@ War3PersistentGpuPackageD3D9ObserveOwner(
     return;
   m_store = std::make_unique<War3PersistentGpuPackageStore>(
       m_device, m_budgets, alignment, m_storeDiagnostics);
+  publishRuntimeDiagnostics(true);
 }
 
 War3PersistentGpuPackageD3D9ObserveOwner::
 ~War3PersistentGpuPackageD3D9ObserveOwner() {
   pollProducerCompletions();
+  publishRuntimeDiagnostics(false);
+}
+
+void War3PersistentGpuPackageD3D9ObserveOwner::
+publishRuntimeDiagnostics(bool ownerAlive) const noexcept {
+  std::lock_guard<std::mutex> lock(g_d3d9RuntimeDiagnosticsMutex);
+  const uint64_t configuredMode =
+      g_d3d9RuntimeDiagnostics.configuredMode;
+  War3PersistentGpuPackageD3D9RuntimeDiagnostics published = {};
+  published.configuredMode = configuredMode;
+  published.effectiveMode =
+      ownerAlive && configuredMode == 1u ? 1u : 0u;
+  published.ownerAlive = ownerAlive ? 1u : 0u;
+  published.observeCalls = m_diagnostics.observeCalls;
+  published.exactSourcesAccepted = m_diagnostics.exactSourcesAccepted;
+  published.invalidEvidence = m_diagnostics.invalidEvidence;
+  published.invalidSnapshots = m_diagnostics.invalidSnapshots;
+  published.epochRejects = m_diagnostics.epochRejects;
+  published.readyObservations = m_diagnostics.readyObservations;
+  published.missObservations = m_diagnostics.missObservations;
+  published.pendingObservations = m_diagnostics.pendingObservations;
+  published.storeRejects = m_diagnostics.storeRejects;
+  published.multiPrimitiveObservations =
+      m_diagnostics.multiPrimitiveObservations;
+  published.submissionsBuilt = m_diagnostics.submissionsBuilt;
+  published.submissionsCommitted = m_diagnostics.submissionsCommitted;
+  published.submissionsRejected = m_diagnostics.submissionsRejected;
+  published.uploadsCommitted = m_diagnostics.uploadsCommitted;
+  published.uploadBytesCommitted = m_diagnostics.uploadBytesCommitted;
+  published.producerFenceSubmitted =
+      m_diagnostics.lastSubmittedFenceValue;
+  published.producerFenceCompleted =
+      m_diagnostics.lastCompletedFenceValue;
+  published.staticCacheHits = m_storeDiagnostics.staticCacheHits;
+  published.staticCacheMisses = m_storeDiagnostics.staticCacheMisses;
+  published.staticFallbacks = m_storeDiagnostics.fallbackCount;
+  published.staticUploadsCompleted =
+      m_storeDiagnostics.staticUploadsCompleted;
+  published.staticUploadCompletionsRejected =
+      m_storeDiagnostics.staticUploadCompletionsRejected;
+  published.currentMapEpoch = m_mapEpoch;
+  published.currentDeviceEpoch = m_deviceEpoch;
+  published.currentFrameSerial = m_frameSerial;
+  // Observe owns uploads only. These remain explicit zeroes until a later,
+  // separately gated recording/last-use authority is implemented.
+  published.gpuBindingAllowed = 0u;
+  published.drawMutationAllowed = 0u;
+  published.consumerAuthorityPublished = 0u;
+  published.consumerLastUseFencePublished = 0u;
+  g_d3d9RuntimeDiagnostics = published;
 }
 
 bool War3PersistentGpuPackageD3D9ObserveOwner::validEvidenceAndSnapshot(
@@ -151,6 +220,7 @@ bool War3PersistentGpuPackageD3D9ObserveOwner::beginFrame(
     }
     if (m_frameSerial != frameSerial) {
       pollProducerCompletions();
+      publishRuntimeDiagnostics(true);
       m_frameSerial = frameSerial;
       m_preparedThisFrame = 0u;
     }
@@ -340,6 +410,7 @@ bool War3PersistentGpuPackageD3D9ObserveOwner::commitSubmission(
     ++m_diagnostics.submissionsRejected;
   }
   m_openSubmission = {};
+  publishRuntimeDiagnostics(true);
   return committed;
 }
 
@@ -349,6 +420,7 @@ void War3PersistentGpuPackageD3D9ObserveOwner::rejectSubmission(
     return;
   ++m_diagnostics.submissionsRejected;
   m_openSubmission = {};
+  publishRuntimeDiagnostics(true);
 }
 
 void War3PersistentGpuPackageD3D9ObserveOwner::invalidateMapEpoch(
@@ -361,6 +433,7 @@ void War3PersistentGpuPackageD3D9ObserveOwner::invalidateMapEpoch(
     m_frameSerial = 0u;
     m_preparedThisFrame = 0u;
     m_openSubmission = {};
+    publishRuntimeDiagnostics(true);
   } catch (...) {
   }
 }
@@ -379,6 +452,7 @@ void War3PersistentGpuPackageD3D9ObserveOwner::invalidateDeviceEpoch(
     m_frameSerial = 0u;
     m_preparedThisFrame = 0u;
     m_openSubmission = {};
+    publishRuntimeDiagnostics(true);
   } catch (...) {
   }
 }

@@ -13,6 +13,9 @@ STORE_CPP = ROOT / "src/d3d9/war3/gpu_skin/war3_persistent_gpu_package_store.cpp
 DEVICE_H = ROOT / "src/d3d9/d3d9_device.h"
 DEVICE_CPP = ROOT / "src/d3d9/d3d9_device.cpp"
 MESON = ROOT / "src/d3d9/meson.build"
+DIAGNOSTICS_H = ROOT / "src/d3d9/war3/tools/war3_diagnostics_hub.h"
+DIAGNOSTICS_CPP = ROOT / "src/d3d9/war3/tools/war3_diagnostics_hub.cpp"
+CONTROL_CPP = ROOT / "src/d3d9/war3/tools/war3_control_plane.cpp"
 
 
 class PersistentPackageD3D9ObserveOwnerContracts(unittest.TestCase):
@@ -25,6 +28,9 @@ class PersistentPackageD3D9ObserveOwnerContracts(unittest.TestCase):
         cls.device_h = DEVICE_H.read_text(encoding="utf-8")
         cls.device_cpp = DEVICE_CPP.read_text(encoding="utf-8")
         cls.meson = MESON.read_text(encoding="utf-8")
+        cls.diagnostics_h = DIAGNOSTICS_H.read_text(encoding="utf-8")
+        cls.diagnostics_cpp = DIAGNOSTICS_CPP.read_text(encoding="utf-8")
+        cls.control_cpp = CONTROL_CPP.read_text(encoding="utf-8")
 
     def test_owner_is_runtime_built_but_consumer_inert(self) -> None:
         for token in (
@@ -136,6 +142,39 @@ class PersistentPackageD3D9ObserveOwnerContracts(unittest.TestCase):
             destructor.index("pollProducerCompletions"),
         )
         self.assertIn("m_war3PersistentPackageD3D9ObserveOwner", self.device_h)
+
+    def test_runtime_status_exports_upload_and_consumer_boundaries(self) -> None:
+        for token in (
+            "persistentPackageConfiguredMode",
+            "persistentPackageEffectiveMode",
+            "persistentPackageReady",
+            "persistentPackageMiss",
+            "persistentPackagePending",
+            "persistentPackageStaticFallbacks",
+            "persistentPackageProducerFenceSubmitted",
+            "persistentPackageProducerFenceCompleted",
+            "persistentPackageGpuBindingAllowed",
+            "persistentPackageDrawMutationAllowed",
+            "persistentPackageConsumerAuthorityPublished",
+            "persistentPackageConsumerLastUseFencePublished",
+        ):
+            self.assertIn(token, self.diagnostics_h)
+            self.assertIn(token, self.diagnostics_cpp)
+            self.assertIn(token, self.control_cpp)
+        self.assertIn(
+            "QueryPersistentGpuPackageD3D9RuntimeDiagnostics",
+            self.diagnostics_cpp,
+        )
+        publisher = self.owner_cpp.split(
+            "publishRuntimeDiagnostics(bool ownerAlive)", 1
+        )[1].split("validEvidenceAndSnapshot", 1)[0]
+        for token in (
+            "published.gpuBindingAllowed = 0u",
+            "published.drawMutationAllowed = 0u",
+            "published.consumerAuthorityPublished = 0u",
+            "published.consumerLastUseFencePublished = 0u",
+        ):
+            self.assertIn(token, publisher)
 
 
 if __name__ == "__main__":

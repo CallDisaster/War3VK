@@ -2216,9 +2216,15 @@ War3PersistentPackageD3D9OwnerModeRuntime() {
   // Separate from CPU source evidence so the proven low-overhead Stage11
   // observer can still run without allocating an atlas. Consume remains a
   // hard failure in this stage.
-  static const auto s_mode = static_cast<Mode>((std::min)(
-      2u, War3GetEnvU32(
-              "DXVK_WAR3_PERSISTENT_GPU_PACKAGE_D3D9_OWNER_MODE", 0u)));
+  static const auto s_mode = [] {
+    const auto configured = static_cast<Mode>((std::min)(
+        2u, War3GetEnvU32(
+                "DXVK_WAR3_PERSISTENT_GPU_PACKAGE_D3D9_OWNER_MODE", 0u)));
+    dxvk::war3::gpu_skin::
+        ConfigurePersistentGpuPackageD3D9RuntimeDiagnostics(
+            static_cast<uint32_t>(configured));
+    return configured;
+  }();
   return s_mode;
 }
 

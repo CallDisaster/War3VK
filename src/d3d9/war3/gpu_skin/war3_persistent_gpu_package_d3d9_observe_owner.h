@@ -9,6 +9,49 @@
 
 namespace dxvk::war3::gpu_skin {
 
+// Process-wide, read-only status exported to runtime_status.json.  The live
+// owner publishes this snapshot at frame boundaries and submission changes;
+// querying it never touches Store or renderer-owned Vulkan objects.
+struct War3PersistentGpuPackageD3D9RuntimeDiagnostics {
+  uint64_t configuredMode = 0u;
+  uint64_t effectiveMode = 0u;
+  uint64_t ownerAlive = 0u;
+  uint64_t observeCalls = 0u;
+  uint64_t exactSourcesAccepted = 0u;
+  uint64_t invalidEvidence = 0u;
+  uint64_t invalidSnapshots = 0u;
+  uint64_t epochRejects = 0u;
+  uint64_t readyObservations = 0u;
+  uint64_t missObservations = 0u;
+  uint64_t pendingObservations = 0u;
+  uint64_t storeRejects = 0u;
+  uint64_t multiPrimitiveObservations = 0u;
+  uint64_t submissionsBuilt = 0u;
+  uint64_t submissionsCommitted = 0u;
+  uint64_t submissionsRejected = 0u;
+  uint64_t uploadsCommitted = 0u;
+  uint64_t uploadBytesCommitted = 0u;
+  uint64_t producerFenceSubmitted = 0u;
+  uint64_t producerFenceCompleted = 0u;
+  uint64_t staticCacheHits = 0u;
+  uint64_t staticCacheMisses = 0u;
+  uint64_t staticFallbacks = 0u;
+  uint64_t staticUploadsCompleted = 0u;
+  uint64_t staticUploadCompletionsRejected = 0u;
+  uint64_t currentMapEpoch = 0u;
+  uint64_t currentDeviceEpoch = 0u;
+  uint64_t currentFrameSerial = 0u;
+  uint64_t gpuBindingAllowed = 0u;
+  uint64_t drawMutationAllowed = 0u;
+  uint64_t consumerAuthorityPublished = 0u;
+  uint64_t consumerLastUseFencePublished = 0u;
+};
+
+void ConfigurePersistentGpuPackageD3D9RuntimeDiagnostics(
+    uint32_t configuredMode) noexcept;
+War3PersistentGpuPackageD3D9RuntimeDiagnostics
+QueryPersistentGpuPackageD3D9RuntimeDiagnostics() noexcept;
+
 // D3D9-owned, native-bridge-independent package uploader.  This stage proves
 // real atlas creation, copy submission and producer-fence completion only.
 // It deliberately exposes no buffer slice or consumer authority to Main,
@@ -120,6 +163,7 @@ private:
       const Stage11Evidence& evidence,
       const model::ShadowGeosetResourceSnapshot& snapshot) const noexcept;
   bool validSubmission(const Submission& submission) const noexcept;
+  void publishRuntimeDiagnostics(bool ownerAlive) const noexcept;
   static uint64_t allocateOwnerAuthority() noexcept;
 
   Rc<DxvkDevice> m_device;

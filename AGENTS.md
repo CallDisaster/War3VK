@@ -1,5 +1,24 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-03（Persistent Package 结构化运行诊断，消费者权限仍关闭）
+
+在 `codex/package-d3d9-observe-owner-20260803` 的真实 D3D9 Observe uploader
+基础上补齐 `runtime_status.json` 与 control-plane 状态。新增进程级只读快照，按帧边界
+发布 owner requested/effective、ready/miss/pending/fallback、上传字节、producer fence
+提交/完成、map/device/frame epoch，以及四项消费者权限状态。状态查询不触碰 Store 或
+Vulkan 对象；render owner 只在帧切换、提交和失效边界更新快照。
+
+- 发布默认仍为 Off；Consume 仍被显式拒绝。
+- `gpuBindingAllowed`、`drawMutationAllowed`、`consumerAuthorityPublished`、
+  `consumerLastUseFencePublished` 继续固定为 0。此提交不绑定 atlas、不修改 caster，
+  也不把 producer fence 冒充 consumer last-use fence。
+- Persistent Package 静态合同 87/87、全量 `test_*_static.py` 410/410、相关 Meson
+  runnable 7/7 PASS；Win32 build 成功且 `ninja -C build32 -n` no-work。
+
+下一阶段只能先建立当前 D3D9 VB/IB 精确范围与 immutable package 的逐字等价 Observe
+证明；未闭合 position/index/material/alpha/UV、当前 Stage11 generation 与同帧 caster
+identity 前，不得进入 CSM Consume 或发布 last-use authority。
+
 ## 🚨 2026-08-03（Persistent Package 独立 D3D9 Observe owner，真实上传闭合）
 
 在 producer-completion 发布合同通过后，本轮把 persistent package Store 第一次接到

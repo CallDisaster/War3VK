@@ -13,6 +13,7 @@
 #include "../core/war3_memory.h"
 #include "../core/war3_net_event_hook.h"
 #include "../core/war3_runtime_profile.h"
+#include "../gpu_skin/war3_persistent_gpu_package_d3d9_observe_owner.h"
 #include "../render/war3_shadow_runtime_bridge.h"
 #include "../shadow/war3_shadow_runtime_contract.h"
 #include "../state/war3_render_state.h"
@@ -580,6 +581,9 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
   const auto taaDiagnostics = dxvk::QueryShadowTaaDiagnostics();
   const auto pointPersistentDiagnostics =
       dxvk::QueryPointShadowPersistentDiagnostics();
+  const auto persistentPackageDiagnostics =
+      dxvk::war3::gpu_skin::
+          QueryPersistentGpuPackageD3D9RuntimeDiagnostics();
   const auto csmDiagnostics = dxvk::QueryCsmResolutionDiagnostics();
   const auto arenaDiagnostics =
       dxvk::war3::memory::ShadowArena_QueryDiagnostics();
@@ -628,6 +632,70 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       pointPersistentDiagnostics.consumed;
   summary.pointShadowPersistentFailed = pointPersistentDiagnostics.failed;
   summary.pointShadowPersistentBusy = pointPersistentDiagnostics.busy;
+  summary.persistentPackageConfiguredMode =
+      persistentPackageDiagnostics.configuredMode;
+  summary.persistentPackageEffectiveMode =
+      persistentPackageDiagnostics.effectiveMode;
+  summary.persistentPackageOwnerAlive =
+      persistentPackageDiagnostics.ownerAlive;
+  summary.persistentPackageObserveCalls =
+      persistentPackageDiagnostics.observeCalls;
+  summary.persistentPackageExactSourcesAccepted =
+      persistentPackageDiagnostics.exactSourcesAccepted;
+  summary.persistentPackageInvalidEvidence =
+      persistentPackageDiagnostics.invalidEvidence;
+  summary.persistentPackageInvalidSnapshots =
+      persistentPackageDiagnostics.invalidSnapshots;
+  summary.persistentPackageEpochRejects =
+      persistentPackageDiagnostics.epochRejects;
+  summary.persistentPackageReady =
+      persistentPackageDiagnostics.readyObservations;
+  summary.persistentPackageMiss =
+      persistentPackageDiagnostics.missObservations;
+  summary.persistentPackagePending =
+      persistentPackageDiagnostics.pendingObservations;
+  summary.persistentPackageStoreRejects =
+      persistentPackageDiagnostics.storeRejects;
+  summary.persistentPackageMultiPrimitive =
+      persistentPackageDiagnostics.multiPrimitiveObservations;
+  summary.persistentPackageSubmissionsBuilt =
+      persistentPackageDiagnostics.submissionsBuilt;
+  summary.persistentPackageSubmissionsCommitted =
+      persistentPackageDiagnostics.submissionsCommitted;
+  summary.persistentPackageSubmissionsRejected =
+      persistentPackageDiagnostics.submissionsRejected;
+  summary.persistentPackageUploadsCommitted =
+      persistentPackageDiagnostics.uploadsCommitted;
+  summary.persistentPackageUploadBytesCommitted =
+      persistentPackageDiagnostics.uploadBytesCommitted;
+  summary.persistentPackageProducerFenceSubmitted =
+      persistentPackageDiagnostics.producerFenceSubmitted;
+  summary.persistentPackageProducerFenceCompleted =
+      persistentPackageDiagnostics.producerFenceCompleted;
+  summary.persistentPackageStaticCacheHits =
+      persistentPackageDiagnostics.staticCacheHits;
+  summary.persistentPackageStaticCacheMisses =
+      persistentPackageDiagnostics.staticCacheMisses;
+  summary.persistentPackageStaticFallbacks =
+      persistentPackageDiagnostics.staticFallbacks;
+  summary.persistentPackageStaticUploadsCompleted =
+      persistentPackageDiagnostics.staticUploadsCompleted;
+  summary.persistentPackageStaticUploadCompletionsRejected =
+      persistentPackageDiagnostics.staticUploadCompletionsRejected;
+  summary.persistentPackageCurrentMapEpoch =
+      persistentPackageDiagnostics.currentMapEpoch;
+  summary.persistentPackageCurrentDeviceEpoch =
+      persistentPackageDiagnostics.currentDeviceEpoch;
+  summary.persistentPackageCurrentFrameSerial =
+      persistentPackageDiagnostics.currentFrameSerial;
+  summary.persistentPackageGpuBindingAllowed =
+      persistentPackageDiagnostics.gpuBindingAllowed;
+  summary.persistentPackageDrawMutationAllowed =
+      persistentPackageDiagnostics.drawMutationAllowed;
+  summary.persistentPackageConsumerAuthorityPublished =
+      persistentPackageDiagnostics.consumerAuthorityPublished;
+  summary.persistentPackageConsumerLastUseFencePublished =
+      persistentPackageDiagnostics.consumerLastUseFencePublished;
   summary.csmRequestedResolution = csmDiagnostics.requestedResolution;
   summary.csmEffectiveResolution = csmDiagnostics.effectiveResolution;
   summary.csmFallbackReason = csmDiagnostics.fallbackReason;
@@ -2571,6 +2639,68 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.pointShadowPersistentFailed},
         {"pointShadowPersistentBusy",
          snapshot.shadow.pointShadowPersistentBusy},
+        {"persistentPackageConfiguredMode",
+         snapshot.shadow.persistentPackageConfiguredMode},
+        {"persistentPackageEffectiveMode",
+         snapshot.shadow.persistentPackageEffectiveMode},
+        {"persistentPackageOwnerAlive",
+         snapshot.shadow.persistentPackageOwnerAlive},
+        {"persistentPackageObserveCalls",
+         snapshot.shadow.persistentPackageObserveCalls},
+        {"persistentPackageExactSourcesAccepted",
+         snapshot.shadow.persistentPackageExactSourcesAccepted},
+        {"persistentPackageInvalidEvidence",
+         snapshot.shadow.persistentPackageInvalidEvidence},
+        {"persistentPackageInvalidSnapshots",
+         snapshot.shadow.persistentPackageInvalidSnapshots},
+        {"persistentPackageEpochRejects",
+         snapshot.shadow.persistentPackageEpochRejects},
+        {"persistentPackageReady", snapshot.shadow.persistentPackageReady},
+        {"persistentPackageMiss", snapshot.shadow.persistentPackageMiss},
+        {"persistentPackagePending",
+         snapshot.shadow.persistentPackagePending},
+        {"persistentPackageStoreRejects",
+         snapshot.shadow.persistentPackageStoreRejects},
+        {"persistentPackageMultiPrimitive",
+         snapshot.shadow.persistentPackageMultiPrimitive},
+        {"persistentPackageSubmissionsBuilt",
+         snapshot.shadow.persistentPackageSubmissionsBuilt},
+        {"persistentPackageSubmissionsCommitted",
+         snapshot.shadow.persistentPackageSubmissionsCommitted},
+        {"persistentPackageSubmissionsRejected",
+         snapshot.shadow.persistentPackageSubmissionsRejected},
+        {"persistentPackageUploadsCommitted",
+         snapshot.shadow.persistentPackageUploadsCommitted},
+        {"persistentPackageUploadBytesCommitted",
+         snapshot.shadow.persistentPackageUploadBytesCommitted},
+        {"persistentPackageProducerFenceSubmitted",
+         snapshot.shadow.persistentPackageProducerFenceSubmitted},
+        {"persistentPackageProducerFenceCompleted",
+         snapshot.shadow.persistentPackageProducerFenceCompleted},
+        {"persistentPackageStaticCacheHits",
+         snapshot.shadow.persistentPackageStaticCacheHits},
+        {"persistentPackageStaticCacheMisses",
+         snapshot.shadow.persistentPackageStaticCacheMisses},
+        {"persistentPackageStaticFallbacks",
+         snapshot.shadow.persistentPackageStaticFallbacks},
+        {"persistentPackageStaticUploadsCompleted",
+         snapshot.shadow.persistentPackageStaticUploadsCompleted},
+        {"persistentPackageStaticUploadCompletionsRejected",
+         snapshot.shadow.persistentPackageStaticUploadCompletionsRejected},
+        {"persistentPackageCurrentMapEpoch",
+         snapshot.shadow.persistentPackageCurrentMapEpoch},
+        {"persistentPackageCurrentDeviceEpoch",
+         snapshot.shadow.persistentPackageCurrentDeviceEpoch},
+        {"persistentPackageCurrentFrameSerial",
+         snapshot.shadow.persistentPackageCurrentFrameSerial},
+        {"persistentPackageGpuBindingAllowed",
+         snapshot.shadow.persistentPackageGpuBindingAllowed},
+        {"persistentPackageDrawMutationAllowed",
+         snapshot.shadow.persistentPackageDrawMutationAllowed},
+        {"persistentPackageConsumerAuthorityPublished",
+         snapshot.shadow.persistentPackageConsumerAuthorityPublished},
+        {"persistentPackageConsumerLastUseFencePublished",
+         snapshot.shadow.persistentPackageConsumerLastUseFencePublished},
         {"csmRequestedResolution", snapshot.shadow.csmRequestedResolution},
         {"csmEffectiveResolution", snapshot.shadow.csmEffectiveResolution},
         {"csmFallbackReason", snapshot.shadow.csmFallbackReason},
