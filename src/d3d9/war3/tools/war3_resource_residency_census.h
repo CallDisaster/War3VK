@@ -258,6 +258,7 @@ struct GpuSkinPoolResidencySnapshot {
   uint64_t staticResourceRecords = 0;
   uint64_t staticReadyRecords = 0;
   uint64_t staticPendingRecords = 0;
+  uint64_t staticSubmittedRecords = 0;
   uint64_t staticInvalidRecords = 0;
   uint64_t queuedStaticMissRecords = 0;
   uint64_t queuedStaticMissHostBytes = 0;

@@ -171,10 +171,13 @@ class ImmutablePublicationAuthorityContracts(unittest.TestCase):
         ):
             self.assertIn(token, self.store_h)
         retire = self.store_cpp.split("retireStaticUpload(", 1)[1].split(
-            "staticAtlasSlice", 1
+            "completeRetiredStaticUpload", 1
         )[0]
         self.assertIn("return exactPendingUpload", retire)
-        self.assertIn("Ready lookup cannot authorize", retire)
+        self.assertIn(
+            "GpuSkinStaticResourceState::UploadSubmitted", retire
+        )
+        self.assertNotIn("GpuSkinStaticResourceState::Ready", retire)
 
     def test_manager_hint_revalidates_current_cache_and_store_probe(self) -> None:
         hint = self.manager_cpp.split("bypassStaticHint", 1)[1].split(

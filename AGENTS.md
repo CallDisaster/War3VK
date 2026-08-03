@@ -1,5 +1,49 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-03（Persistent Package producer fence 完成发布闭合）
+
+Stage 2A 的 map-scoped Stage11 source Observe 已通过后，本轮继续审计现有 static
+package Store，确认旧实现存在一个确定的 GPU 生命周期漏洞：`retireStaticUpload`
+在 copy 命令刚提交时就把资源设成 `Ready`，而 `pollRetired` 只在 fence 完成后释放
+staging。因此 manager 可能在 producer copy 尚未完成时消费 device-local atlas。
+
+**修复内容**：
+
+- static package 状态改为 `PendingUpload -> UploadSubmitted -> Ready`；提交本身不再
+  授予消费权限。唯一 retirement 记录同时持有 exact source/destination、fence/value、
+  Store-created frozen payload 和目标 resource 的发布权限。
+- `pollRetired` 观察到精确 fence value 后，重新核对 map/device epoch、active map 中的
+  shared resource identity、package slice、已清空 pending upload、immutable frozen proof
+  与全部 GPU range；全部闭合才发布 `Ready`。地图/设备代际已经切换、记录被替换或任一
+  proof 漂移时将旧资源标记 `Invalid`，禁止迟到发布到新代际。
+- 所有既有 manager 消费点仍只接受 `Ready`；`UploadSubmitted` 与排队状态一样安全回退。
+  residency JSON 新增 `staticSubmittedRecords`，GPU-skin lifetime 诊断新增
+  `completion=completed/rejected`，便于运行时直接证明发布闭合。
+- 修复旧 Dual conductor 时发现它未跟随 P4 launch-fingerprint API 迁移；该导体的初次
+  “进程退出”是 report-only 假阴性，原始查询明确为 `running=true`。临时兼容修改已撤销，
+  正式运行证据改由当前维护中的 unattended conductor 生成，测试产物不纳入源码提交。
+
+**静态、构建与运行门**：
+
+- 新增 producer-completion 静态合同；全量 `test_*static.py` 403/403 PASS，现有 11 个
+  Win32 Meson runnable 11/11 PASS。Win32 build 成功且 `ninja -C build32 -n` no-work。
+- 最终 build32/部署 DLL exact：33,237,790 bytes，SHA-256
+  `EB0FF0F2FED0AD95B5D7B600567D683ED40592995E0447E4E4D3BA9484E4687C`；回退依次为
+  `d3d9.dll.bak_20260803_1D73_pre_package_completion_diag` 和
+  `d3d9.dll.bak_20260803_C8F5_pre_package_producer_completion`。
+- 高压图显式 GPU-skin Dual 门完成 60 秒及 30 秒两轮。最终诊断为 static hit/miss
+  `20534/37`、upload retirement `37/37`、producer completion `37/0`，无未完成 static
+  retirement；308 个 shadow report frame 中 incomplete/budget exceeded 均为 0，Arena
+  峰值 5.477 MiB，deviceLost/AV/crash dump/新增 NVIDIA 事件均为 0。最终截图目检未见
+  阴影撕裂、缺口或错误大块。Dual + full diagnostics 的 9--11 FPS 只用于正确性压力，
+  不作为性能 ABBA 数据。
+
+**仍未跨越的边界**：Store-local producer completion 已闭合，但 proof catalog、独立
+D3D9 shared owner、recording transaction 及 Main/CSM/point/outline consumer last-use
+fence 尚未接入；`kD3D9SharedOwnerEnabled`、`kProducerCompletionAuthorityIntegrated` 与
+共享 Consume 继续保持 false。下一阶段只允许先做 D3D9 owner Observe，不能据此绑定
+atlas 或替换 exact Arena fallback。
+
 ## 🚨 2026-08-03（Persistent Package Stage 2A：地图代际源码证明，Observe-only）
 
 在 Arena 崩溃修复检查点 `7d8712a` 上继续推进 Persistent GPU Package，但本阶段只

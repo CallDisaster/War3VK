@@ -866,21 +866,15 @@ bool War3PersistentGpuPackageStore::retireStaticUpload(
   }
 
   const auto found = m_staticResources.find(upload.key);
-  if (found != m_staticResources.end() && found->second != nullptr &&
-      found->second->state == GpuSkinStaticResourceState::Ready) {
-    // A Ready lookup cannot authorize an arbitrary second upload that merely
-    // repeats its public key. Submission identity/completion authority is a
-    // later P2 protocol. Keep the supplied slices alive to their stated fence
-    // below, but never report this duplicate transaction as accepted.
-    recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
-  }
-
   bool exactPendingUpload = false;
   if (found != m_staticResources.end() && found->second != nullptr &&
       found->second->state == GpuSkinStaticResourceState::PendingUpload) {
     const GpuSkinStaticUpload& pending = found->second->pendingUpload;
-    exactPendingUpload = pending.source.defined() &&
+    exactPendingUpload = found->second->key == upload.key &&
+        pending.key == upload.key && pending.source.defined() &&
         pending.destination.defined() && pending.byteCount == upload.byteCount &&
+        pending.byteCount == found->second->allocatedBytes &&
+        pending.residencyCensus == upload.residencyCensus &&
         pending.source.buffer() == upload.source.buffer() &&
         pending.source.offset() == upload.source.offset() &&
         pending.source.length() == upload.source.length() &&
@@ -889,36 +883,84 @@ bool War3PersistentGpuPackageStore::retireStaticUpload(
         pending.destination.length() == upload.destination.length() &&
         pending.destination.buffer() == found->second->packageSlice.buffer() &&
         pending.destination.offset() == found->second->packageSlice.offset() &&
-        pending.destination.length() == found->second->packageSlice.length();
-    if (exactPendingUpload) {
-      found->second->state = GpuSkinStaticResourceState::Ready;
-      const bool validPackage = ownsFrozenPayload(*found->second) &&
-          ValidateGpuSkinStaticPackage(*found->second);
-      found->second->pendingUpload = {};
-      if (validPackage) {
-        resource_census::UpdateHostBacking(
-            found->second->residencyCensus, 0u, 0u, 0u);
-        resource_census::NoteDeviceUpload(
-            found->second->residencyCensus, 0u);
-      } else {
-        found->second->state = GpuSkinStaticResourceState::Invalid;
-        exactPendingUpload = false;
-      }
-    }
+        pending.destination.length() == found->second->packageSlice.length() &&
+        ownsFrozenPayload(*found->second) &&
+        ValidateGpuSkinStaticFrozenPayload(*found->second);
   }
 
   // The staging slice remains authoritative until the producer fence passes,
   // even if an epoch invalidates the package lookup table in the meantime.
   // Retain the exact destination slice and atlas census for the same interval:
   // a copy command references both resources, not only its host-visible side.
-  m_retiredStaticUploads.push_back(std::make_unique<RetiredStaticUpload>(
-      RetiredStaticUpload{
-          upload.key, upload.source, upload.destination, std::move(fence),
-          value, upload.residencyCensus, m_staticAtlasCensus}));
+  auto retirement = std::make_unique<RetiredStaticUpload>();
+  retirement->key = upload.key;
+  retirement->source = upload.source;
+  retirement->destination = upload.destination;
+  retirement->fence = std::move(fence);
+  retirement->retireValue = value;
+  retirement->residencyCensus = upload.residencyCensus;
+  retirement->destinationResidencyCensus = m_staticAtlasCensus;
+  if (exactPendingUpload) {
+    retirement->publicationResource = found->second;
+    retirement->publishesReady = true;
+  }
+  m_retiredStaticUploads.push_back(std::move(retirement));
+
+  // Submission is not completion. Only the unique retirement record above
+  // owns permission to publish Ready after its exact fence value is observed.
+  if (exactPendingUpload) {
+    found->second->state = GpuSkinStaticResourceState::UploadSubmitted;
+    found->second->pendingUpload = {};
+  }
   ++m_diagnostics.staticUploadRetirementsQueued;
   if (!exactPendingUpload)
     recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
   return exactPendingUpload;
+}
+
+void War3PersistentGpuPackageStore::completeRetiredStaticUpload(
+    RetiredStaticUpload& retirement) noexcept {
+  if (!retirement.publishesReady)
+    return;
+
+  retirement.publishesReady = false;
+  const std::shared_ptr<GpuSkinStaticResource> resource =
+      retirement.publicationResource;
+  const auto active = m_staticResources.find(retirement.key);
+  const bool exactActiveGeneration = resource != nullptr &&
+      m_mapEpoch == retirement.key.mapEpoch &&
+      m_deviceEpoch == retirement.key.deviceEpoch &&
+      active != m_staticResources.end() && active->second == resource;
+  const bool exactSubmittedPayload = exactActiveGeneration &&
+      resource->state == GpuSkinStaticResourceState::UploadSubmitted &&
+      resource->key == retirement.key &&
+      retirement.source.defined() && retirement.destination.defined() &&
+      retirement.source.length() == resource->allocatedBytes &&
+      retirement.destination.buffer() == resource->packageSlice.buffer() &&
+      retirement.destination.offset() == resource->packageSlice.offset() &&
+      retirement.destination.length() == resource->packageSlice.length() &&
+      !resource->pendingUpload.source.defined() &&
+      !resource->pendingUpload.destination.defined() &&
+      ownsFrozenPayload(*resource) &&
+      ValidateGpuSkinStaticFrozenPayload(*resource);
+
+  if (exactSubmittedPayload) {
+    resource->state = GpuSkinStaticResourceState::Ready;
+    if (ValidateGpuSkinStaticPackage(*resource)) {
+      resource_census::UpdateHostBacking(
+          resource->residencyCensus, 0u, 0u, 0u);
+      resource_census::NoteDeviceUpload(resource->residencyCensus, 0u);
+      ++m_diagnostics.staticUploadsCompleted;
+      retirement.publicationResource.reset();
+      return;
+    }
+  }
+
+  if (resource != nullptr)
+    resource->state = GpuSkinStaticResourceState::Invalid;
+  ++m_diagnostics.staticUploadCompletionsRejected;
+  recordFallback(GpuSkinFallbackReason::StaticResourceInvalid);
+  retirement.publicationResource.reset();
 }
 
 DxvkBufferSlice War3PersistentGpuPackageStore::staticAtlasSlice() const {
@@ -947,6 +989,9 @@ void War3PersistentGpuPackageStore::fillResidencySnapshot(
         break;
       case GpuSkinStaticResourceState::PendingUpload:
         ++snapshot.staticPendingRecords;
+        break;
+      case GpuSkinStaticResourceState::UploadSubmitted:
+        ++snapshot.staticSubmittedRecords;
         break;
       case GpuSkinStaticResourceState::Invalid:
         ++snapshot.staticInvalidRecords;

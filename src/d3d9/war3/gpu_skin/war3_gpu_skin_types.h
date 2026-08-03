@@ -149,8 +149,9 @@ enum class GpuSkinFallbackReason : uint16_t {
 
 enum class GpuSkinStaticResourceState : uint8_t {
   PendingUpload = 0,
-  Ready = 1,
-  Invalid = 2,
+  UploadSubmitted = 1,
+  Ready = 2,
+  Invalid = 3,
 };
 
 enum class GpuSkinBatchState : uint8_t {
@@ -429,6 +430,8 @@ struct GpuSkinDiagnostics {
   uint64_t staticUploadBytes = 0;
   uint64_t staticUploadRetirementsQueued = 0;
   uint64_t staticUploadRetirementsReclaimed = 0;
+  uint64_t staticUploadsCompleted = 0;
+  uint64_t staticUploadCompletionsRejected = 0;
   uint64_t paletteUploadBytes = 0;
   uint64_t jobUploadBytes = 0;
   uint64_t outputLeaseBytes = 0;

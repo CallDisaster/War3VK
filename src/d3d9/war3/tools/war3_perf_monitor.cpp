@@ -4661,6 +4661,8 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << gpuSkinPools.staticReadyRecords
        << ",\"staticPendingRecords\":"
        << gpuSkinPools.staticPendingRecords
+       << ",\"staticSubmittedRecords\":"
+       << gpuSkinPools.staticSubmittedRecords
        << ",\"staticInvalidRecords\":"
        << gpuSkinPools.staticInvalidRecords
        << ",\"queuedStaticMissRecords\":"

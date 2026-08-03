@@ -90,8 +90,12 @@ class PersistentPackageOwnerContracts(unittest.TestCase):
         retire = self.store_cpp.split("retireStaticUpload(", 1)[1].split(
             "staticAtlasSlice()", 1
         )[0]
-        self.assertIn("upload.source, upload.destination", retire)
-        self.assertIn("m_staticAtlasCensus", retire)
+        self.assertIn("retirement->source = upload.source", retire)
+        self.assertIn("retirement->destination = upload.destination", retire)
+        self.assertIn(
+            "retirement->destinationResidencyCensus = m_staticAtlasCensus",
+            retire,
+        )
 
         clear = self.store_cpp.split(
             "void War3PersistentGpuPackageStore::clearEpochResources()", 1

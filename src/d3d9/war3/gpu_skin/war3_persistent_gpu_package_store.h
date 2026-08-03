@@ -39,8 +39,10 @@ public:
   // creation through manager EmitCs recording has no sealed transaction token
   // or final exact revalidation. P2 must close both before publication.
   static constexpr bool kRecordingThreadOwnershipIntegrated = false;
-  // P1 freezes immutable content only. Legacy Ready still means the upload was
-  // accepted for submission; it is not producer-fence completion authority.
+  // Store-local publication now transitions Pending -> UploadSubmitted ->
+  // Ready only after the exact producer fence is observed. The broader proof
+  // catalog/renderer authority is still not integrated, so this capability
+  // gate remains closed for shared consumers.
   static constexpr bool kProducerCompletionAuthorityIntegrated = false;
   // GPU slice/usage checks run in production validation, but the isolated
   // CPU runnable intentionally constructs no DxvkDevice/DxvkBuffer.
@@ -86,6 +88,7 @@ public:
          it != m_retiredStaticUploads.end();) {
       if (*it != nullptr && (*it)->fence != nullptr &&
           getFenceValue((*it)->fence) >= (*it)->retireValue) {
+        completeRetiredStaticUpload(*(*it));
         ++m_diagnostics.staticUploadRetirementsReclaimed;
         it = m_retiredStaticUploads.erase(it);
       } else {
@@ -112,6 +115,8 @@ private:
     uint64_t retireValue = 0;
     resource_census::ResourceHandle residencyCensus;
     resource_census::ResourceHandle destinationResidencyCensus;
+    std::shared_ptr<GpuSkinStaticResource> publicationResource;
+    bool publishesReady = false;
   };
 
   GpuSkinStaticResourceKey makeKey(
@@ -121,6 +126,8 @@ private:
       const QueuedStaticMiss& miss);
   bool ownsFrozenPayload(
       const GpuSkinStaticResource& resource) const noexcept;
+  void completeRetiredStaticUpload(
+      RetiredStaticUpload& retirement) noexcept;
   void recordFallback(GpuSkinFallbackReason reason);
   void clearEpochResources();
   void deferOutstandingProducerRetirements() noexcept;

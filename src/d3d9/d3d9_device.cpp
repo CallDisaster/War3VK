@@ -11761,6 +11761,7 @@ void D3D9DeviceEx::War3LogGpuSkinDiagnostics(bool force) {
       "reject=%llu retired=%llu/%llu claims=%llu/%llu high=%llu/%llu "
       "limitViolation=%llu acceptedRecover=%llu/%llu autoRetire=%llu "
       "resource static=%llu/%llu upload=%llu/%llu bytes=%llu "
+      "completion=%llu/%llu "
       "pages=%llu/%llu output=%llu/%llu pending=%llu fence=%llu/%llu "
       "fallback=%llu",
       manager.retirementBackpressured ? 1u : 0u,
@@ -11785,6 +11786,10 @@ void D3D9DeviceEx::War3LogGpuSkinDiagnostics(bool force) {
       static_cast<unsigned long long>(
           manager.resources.staticUploadRetirementsReclaimed),
       static_cast<unsigned long long>(manager.resources.staticUploadBytes),
+      static_cast<unsigned long long>(
+          manager.resources.staticUploadsCompleted),
+      static_cast<unsigned long long>(
+          manager.resources.staticUploadCompletionsRejected),
       static_cast<unsigned long long>(manager.resources.uploadPagesAllocated),
       static_cast<unsigned long long>(manager.resources.uploadPagesReclaimed),
       static_cast<unsigned long long>(manager.resources.outputPagesAllocated),
