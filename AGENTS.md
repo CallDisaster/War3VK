@@ -1,5 +1,68 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-03（Shadow Arena 崩溃根因修复与高压长门）
+
+用户在“生与死”高压区域压低视角时稳定触发 `0xC0000005`，同时每个 Arena 代际
+增长到 384 MiB 并产生 8--80 次溢出。本阶段先建立用户已物理确认视觉正确的本地
+基线 `28ed131` / `codex/point-shadow-physical-baseline-9ec8-20260802`，再在
+`codex/war3-arena-performance-20260802` 独立修复；全程未 push。
+
+**确定根因与读取合同**：
+
+- dump 将 AV 定位到 `War3ComputeMappedLocalBoundsFromBytes`。旧路径把约 3 MiB 的
+  D3D9 binding offset 加到真实仅 512 KiB 的映射 allocation 上，却使用逻辑
+  `Desc()->Size` 证明后续 CPU 读取有效，因而可越过映射末端。
+- 新增 `War3CpuReadableBufferSpan`：只有 current UP owned bytes，或同时具备真实
+  allocation size/base、HOST_VISIBLE 属性、owner identity 及 identity/allocation/
+  content generation 的映射才能被 CPU 读取。blocker metadata、draw-time exact、
+  Stage13 和 terrain bounds/content 全部改走该合同；不可读的匿名路径阻断器
+  fail-closed，不再用 SEH/`VirtualQuery` 掩盖越界。
+
+**Arena 与当帧冻结**：
+
+- position/blend/UV/IB 改为逐 caster 的 `ShadowArenaBundleTransaction`。所有块先
+  在同一代际预留，任一失败恢复 page/offset/committed/tail-waste 游标，成功后才
+  录制唯一 copy batch；准入预算固定为配置剩余与 Arena 真实剩余的较小值。
+- 维持 64 MiB 页、384 MiB/代际、1.125 GiB 总驻留上限；三个 warm page 合计
+  192 MiB，GPU completion 未证明前禁止清零代际。没有扩大预算，也没有恢复
+  draw-time VB cache、fast append、prebuild bypass 或 source fingerprint reuse。
+- 新增仅当帧、generation-tagged freeze catalog。同一 exact source/range 可在当帧
+  复用，但 key 必须包含 allocation/source identity、三类 generation、frame serial、
+  stream type、slice offset/length 和元素布局；UP/ring 缺证据时不去重。
+- 魔兽 terrain/dynamic position VB 常声明 512 KiB，而实际 draw 只引用很小的索引域。
+  新路径扫描当前代际已验证的 16/32-bit IB，连同 signed base vertex 证明真实顶点域，
+  再同步裁剪 position/blend/separate UV；无法证明时保留完整域。由此在不减少 caster
+  的前提下，把高压图 Arena 从约 38--40 MiB/帧降到平均约 3.5 MiB。
+
+**诊断、构建与无人监管运行门**：
+
+- `runtime_status.json`/flight recorder 新增 bundle reserved/committed/rolledBack、
+  admission/partial、按流和来源分账、unique/duplicate、exact-index trim，以及 CPU
+  span 拒绝原因和 allocation/read/generation tuple。
+- 全部 static 合同 393/393 PASS；Win32 Meson runnable 11/11 PASS；Win32 build
+  成功，`ninja -C build32 -n` no-work，targeted diff-check 无 whitespace error。
+- 高压单位图 Direct 与 TAA v2 各 160/160 exact capture；桥/斜坡冻结镜头 60/60；
+  1024 点阴影 3538 帧。所有门的 overflow、partial、frame incomplete、device lost、
+  NVIDIA 新事件、blocker/alpha/mixed representation/final-caster 缺口均为 0。
+- “生与死”Direct/TAA v2 各运行约 10 分钟：分别 12,556/12,539 个 shadow frame，
+  Arena 平均 4.58/4.57 MiB、峰值均 6.075 MiB，trim reject=0，未发生 AV、Arena
+  ownership 违规、GPU 无进展或驱动事件。通用 `hot-shadow` 门因该地图不发布上层
+  semantic unit manifest 会假阴性；长门改用现有 `--no-hot-shadow`，同时人工监测真实
+  caster/CSM/Arena/device 字段，渲染管线始终活跃。
+- 上述全部运行门使用 33,233,182-byte `97C158E700A886FC9DC8FBD8884BF57FE5720A2A0E7D84C643C1B41D0A8C551F`。
+  最终只补显式 `<algorithm>` 依赖后重新链接；static/Meson/build 门重新通过，当前
+  build32 与部署 `E:\\Work\\War3\\d3d9.dll` exact：33,233,182 bytes，SHA-256
+  `BF104E197BF5AEE6D0C7D42F3BA74E6C0B5085AFFE801CBDE6CEEA89F4EDAB21`。
+  直接回退为 `d3d9.dll.bak_20260803_97C1_pre_header_relink`，原始视觉基线仍为
+  `d3d9.dll.bak_20260803_0835_9EC8_pre_arena_transaction`。
+
+**性能结论与下一阶段边界**：大地图平均约 21.8 FPS，main CPU 约 40.7--41.4 ms，
+GPU 约 3.9--4.4 ms，确认下一瓶颈在 CPU 控制面而非 GPU。Stage 1 已达到稳定门；
+下一阶段从 Persistent Package 的 map/device epoch、真实 current-stage authority、producer
+completion 与所有 consumer last-use fence 开始。既有 Stage11 Observe 仅证明 recorded
+content identity，`provesCurrentGameMemory=false`，在这些硬门闭合及 Observe 10k/ABBA
+通过之前禁止启用 Package Consume。
+
 ## 🚨 2026-08-02（研究报告二次修复：点阴影 texel-center、深度同步与矩阵所有权）
 
 用户提供的两份静态研究报告指出三个可独立造成条带、低频裂口或单帧错误的源码

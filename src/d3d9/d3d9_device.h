@@ -1932,6 +1932,7 @@ private:
     uint32_t ibUploadLength = 0u;
     uintptr_t ibSourceResource = 0u;
     uint64_t ibSourceIdentityGeneration = 0u;
+    uint64_t ibSourceSequence = 0u;
     uint64_t ibSourceContentGeneration = 0u;
     uint32_t ibSourceOffset = 0u;
     uint32_t ibSourceLength = 0u;
@@ -2115,28 +2116,68 @@ private:
       currentOffset = 0;
     }
   };
-  struct War3ShadowFreezeCacheKey {
+  enum class War3FrameFreezeStreamType : uint8_t {
+    Position = 0u,
+    Blend,
+    Uv,
+    Index,
+  };
+  struct War3FrameFreezeKey {
     DxvkBuffer* sourceBuffer = nullptr;
     VkDeviceSize sourceOffset = 0;
+    VkDeviceSize sourceLength = 0;
     VkDeviceSize size = 0;
+    uint32_t sourceElementStride = 0u;
+    uint32_t sourceElementSize = 0u;
+    uintptr_t allocationIdentity = 0u;
+    uintptr_t sourceOwner = 0u;
+    uint64_t identityGeneration = 0u;
+    uint64_t allocationGeneration = 0u;
+    uint64_t contentGeneration = 0u;
+    uint64_t frameSerial = 0u;
+    War3FrameFreezeStreamType streamType =
+        War3FrameFreezeStreamType::Position;
 
-    bool operator==(const War3ShadowFreezeCacheKey& other) const {
+    bool operator==(const War3FrameFreezeKey& other) const {
       return sourceBuffer == other.sourceBuffer &&
-             sourceOffset == other.sourceOffset && size == other.size;
+             sourceOffset == other.sourceOffset &&
+             sourceLength == other.sourceLength && size == other.size &&
+             sourceElementStride == other.sourceElementStride &&
+             sourceElementSize == other.sourceElementSize &&
+             allocationIdentity == other.allocationIdentity &&
+             sourceOwner == other.sourceOwner &&
+             identityGeneration == other.identityGeneration &&
+             allocationGeneration == other.allocationGeneration &&
+             contentGeneration == other.contentGeneration &&
+             frameSerial == other.frameSerial &&
+             streamType == other.streamType;
     }
   };
-  struct War3ShadowFreezeCacheKeyHash {
-    size_t operator()(const War3ShadowFreezeCacheKey& key) const {
-      const size_t h1 = std::hash<DxvkBuffer*>()(key.sourceBuffer);
-      const size_t h2 = std::hash<VkDeviceSize>()(key.sourceOffset);
-      const size_t h3 = std::hash<VkDeviceSize>()(key.size);
-      return h1 ^ (h2 + 0x9e3779b9u + (h1 << 6) + (h1 >> 2)) ^
-             (h3 + 0x9e3779b9u + (h2 << 6) + (h2 >> 2));
+  struct War3FrameFreezeKeyHash {
+    size_t operator()(const War3FrameFreezeKey& key) const {
+      size_t hash = std::hash<DxvkBuffer*>()(key.sourceBuffer);
+      const auto mix = [&](size_t value) {
+        hash ^= value + size_t(0x9e3779b9u) + (hash << 6) + (hash >> 2);
+      };
+      mix(std::hash<VkDeviceSize>()(key.sourceOffset));
+      mix(std::hash<VkDeviceSize>()(key.sourceLength));
+      mix(std::hash<VkDeviceSize>()(key.size));
+      mix(std::hash<uint32_t>()(key.sourceElementStride));
+      mix(std::hash<uint32_t>()(key.sourceElementSize));
+      mix(std::hash<uintptr_t>()(key.allocationIdentity));
+      mix(std::hash<uintptr_t>()(key.sourceOwner));
+      mix(std::hash<uint64_t>()(key.identityGeneration));
+      mix(std::hash<uint64_t>()(key.allocationGeneration));
+      mix(std::hash<uint64_t>()(key.contentGeneration));
+      mix(std::hash<uint64_t>()(key.frameSerial));
+      mix(std::hash<uint8_t>()(uint8_t(key.streamType)));
+      return hash;
     }
   };
-  struct War3ShadowFreezeCacheEntry {
+  struct War3FrameFreezeEntry {
     Rc<DxvkBuffer> frozenBuffer;
     DxvkResourceBufferInfo frozenInfo = {};
+    uint64_t sourceBytes = 0u;
   };
   using War3ShadowGeometryRegistryKey = War3ShadowGeometryKey;
   struct War3ShadowGeometryRegistryKeyHash {
@@ -2280,9 +2321,9 @@ private:
       std::unordered_map<War3SemanticDirectCasterContractKey,
                          War3SemanticDirectCasterContractState,
                          War3SemanticDirectCasterContractKeyHash>;
-  using War3ShadowFreezeCache =
-      std::unordered_map<War3ShadowFreezeCacheKey, War3ShadowFreezeCacheEntry,
-                         War3ShadowFreezeCacheKeyHash>;
+  using War3FrameFreezeCatalog =
+      std::unordered_map<War3FrameFreezeKey, War3FrameFreezeEntry,
+                         War3FrameFreezeKeyHash>;
   using War3ShadowGeometryRegistry =
       std::unordered_map<War3ShadowGeometryRegistryKey,
                          War3ShadowGeometryRegistryEntry,
@@ -2313,27 +2354,14 @@ private:
       std::unordered_map<War3ShadowGeometryRegistryKey,
                          War3Stage13RetainedCasterEntry,
                          War3ShadowGeometryRegistryKeyHash>;
-  // Arena VB 帧内去重缓存：key=(DxvkBuffer*,offset,size)，value=已复制到 Arena 的 allocation。
-  // 同一帧内相同 DxvkBufferSlice 只 EmitCs copyBuffer 一次，后续 DIP 直接复用 arena offset。
-  // 等价于 state_counter < 12 语义（同一流绑定内多 DIP 共享同一 VB slice）。
-  struct War3ArenaVbCacheEntry {
-    Rc<DxvkBuffer>       storage;          // arena buffer (keeps backing alive)
-    DxvkResourceBufferInfo info = {};       // offset+size inside arena
-    uint64_t dispatchSerial = 0;           // War3 dispatch 序号（帧内唯一递增）
-    // 命中时必须校验 dispatchSerial == 当前 dispatch 的 serial：
-    // 不同 dispatch 可能因 ring buffer 回绕而产生相同 (buf*,offset,size)，
-    // 但实际包含不同顶点数据 → 不可复用。
-  };
-  using War3ArenaVbCache =
-      std::unordered_map<War3ShadowFreezeCacheKey,
-                         War3ArenaVbCacheEntry,
-                         War3ShadowFreezeCacheKeyHash>;
   std::array<War3ShadowBufferAllocator, 3> m_war3ShadowAllocators;
   std::array<War3ShadowMappedBufferAllocator, 3> m_war3ShadowMappedAllocators;
-  std::array<War3ShadowFreezeCache, 3> m_war3ShadowFreezeCaches;
   std::array<War3ShadowFrozenGeometryCache, 3>
       m_war3ShadowFrozenGeometryCaches;
-  std::array<War3ArenaVbCache, 3> m_war3ArenaVbCaches;
+  War3FrameFreezeCatalog m_war3FrameFreezeCatalog;
+  uint64_t m_war3FrameFreezeCatalogSerial = 0u;
+  uint64_t m_war3FrameFreezeUniqueSourceBytes = 0u;
+  uint64_t m_war3FrameFreezeDuplicateBytesSaved = 0u;
   War3ShadowGeometryRegistry m_war3ShadowGeometryRegistry;
   War3ShadowPersistentGeometryMap m_war3ShadowPersistentGeometries;
   War3Stage13RetainedCasterMap m_war3Stage13RetainedCasters;
@@ -2761,9 +2789,14 @@ private:
     // cycle)
     m_war3ShadowAllocators[(m_war3FrameIndex + 1) % 3].Reset();
     m_war3ShadowMappedAllocators[(m_war3FrameIndex + 1) % 3].Reset();
-    m_war3ShadowFreezeCaches[(m_war3FrameIndex + 1) % 3].clear();
     m_war3ShadowFrozenGeometryCaches[(m_war3FrameIndex + 1) % 3].clear();
-    m_war3ArenaVbCaches[(m_war3FrameIndex + 1) % 3].clear();
+    const uint64_t nextFrameSerial = m_war3ShadowPersistentFrameSerial + 1u;
+    if (m_war3FrameFreezeCatalogSerial != nextFrameSerial) {
+      m_war3FrameFreezeCatalog.clear();
+      m_war3FrameFreezeCatalogSerial = nextFrameSerial;
+      m_war3FrameFreezeUniqueSourceBytes = 0u;
+      m_war3FrameFreezeDuplicateBytesSaved = 0u;
+    }
   }
 
   // War3 Shadow

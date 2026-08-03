@@ -10,6 +10,7 @@
 
 #include "../../dxvk/dxvk_buffer.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -27,6 +28,49 @@ struct ShadowArenaAllocation {
   }
 };
 
+enum class ShadowArenaAllocationTag : uint8_t {
+  Unknown = 0u,
+  Position,
+  Blend,
+  Uv,
+  Index,
+};
+
+enum class ShadowArenaSourceClass : uint8_t {
+  Terrain = 0u,
+  Model,
+  Skinned,
+  Up,
+};
+
+struct ShadowArenaBundleRequest {
+  uint32_t size = 0u;
+  uint32_t alignment = 16u;
+  ShadowArenaAllocationTag tag = ShadowArenaAllocationTag::Unknown;
+};
+
+constexpr uint32_t kShadowArenaBundleMaxParts = 4u;
+
+// Reserved before copy commands are recorded. The render thread either commits
+// every position/blend/UV/index allocation or restores the exact cursor.
+struct ShadowArenaBundleTransaction {
+  std::array<ShadowArenaAllocation, kShadowArenaBundleMaxParts> allocations = {};
+  std::array<ShadowArenaAllocationTag, kShadowArenaBundleMaxParts> tags = {};
+  uint32_t allocationCount = 0u;
+  uint32_t generationIndex = 0u;
+  uint32_t startPage = 0u;
+  uint32_t startOffset = 0u;
+  uint32_t startCommittedBytes = 0u;
+  uint32_t startPageTailWasteBytes = 0u;
+  uint32_t endPage = 0u;
+  uint32_t endOffset = 0u;
+  uint32_t endCommittedBytes = 0u;
+  uint32_t endPageTailWasteBytes = 0u;
+  uint64_t generation = 0u;
+  uint64_t requestedBytes = 0u;
+  bool active = false;
+};
+
 struct ShadowArenaDiagnostics {
   uint64_t usedBytes = 0u;
   uint64_t residentBytes = 0u;
@@ -37,6 +81,25 @@ struct ShadowArenaDiagnostics {
   uint64_t completedSerial = 0u;
   uint64_t busyReuseRejectCount = 0u;
   uint64_t overflowCount = 0u;
+  uint64_t reservedBytes = 0u;
+  uint64_t committedBundleBytes = 0u;
+  uint64_t rolledBackBytes = 0u;
+  uint64_t admissionRejectedCount = 0u;
+  uint64_t partialTransactionCount = 0u;
+  uint64_t pageTailWasteBytes = 0u;
+  uint64_t positionBytes = 0u;
+  uint64_t blendBytes = 0u;
+  uint64_t uvBytes = 0u;
+  uint64_t indexBytes = 0u;
+  uint64_t terrainBytes = 0u;
+  uint64_t modelBytes = 0u;
+  uint64_t skinnedBytes = 0u;
+  uint64_t upBytes = 0u;
+  uint64_t uniqueSourceBytes = 0u;
+  uint64_t duplicateBytesSaved = 0u;
+  uint64_t exactIndexTrimAcceptedCount = 0u;
+  uint64_t exactIndexTrimRejectedCount = 0u;
+  uint64_t exactIndexTrimBytesSaved = 0u;
   uint32_t activeGenerationCount = 0u;
   uint32_t frameIncomplete = 0u;
 };
@@ -75,7 +138,17 @@ void ShadowArena_EndFrame(uint64_t frameSerial);
  * @return          分配结果（含 GPU offset/size/storage/info），空间不足时 operator bool() 返回 false。
  */
 ShadowArenaAllocation ShadowArena_Alloc(uint32_t size,
-                                        uint32_t alignment = 16);
+                                         uint32_t alignment = 16);
+bool ShadowArena_BeginBundle(
+    const ShadowArenaBundleRequest* requests, uint32_t requestCount,
+    ShadowArenaBundleTransaction& transaction);
+bool ShadowArena_CommitBundle(ShadowArenaBundleTransaction& transaction);
+bool ShadowArena_RollbackBundle(ShadowArenaBundleTransaction& transaction);
+void ShadowArena_NoteFreezeCatalogBytes(
+    ShadowArenaAllocationTag tag, ShadowArenaSourceClass sourceClass,
+    uint64_t uniqueBytes, uint64_t duplicateBytesSaved);
+void ShadowArena_NoteExactIndexTrim(
+    bool accepted, uint64_t bytesBefore, uint64_t bytesAfter);
 
 /**
  * @brief 重置分配器游标。
@@ -91,6 +164,7 @@ void ShadowArena_Reset();
  */
 uint32_t ShadowArena_UsedBytes();
 uint32_t ShadowArena_CapacityBytes();
+uint32_t ShadowArena_RemainingBytes();
 uint64_t ShadowArena_ResidentBytes();
 ShadowArenaDiagnostics ShadowArena_QueryDiagnostics();
 

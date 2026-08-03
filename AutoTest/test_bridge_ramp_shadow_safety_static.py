@@ -733,7 +733,19 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
             "GetDecltypeSize(declInfo.posType)",
             self.device,
         )
-        self.assertIn("posSlice.mapPtr(0u)", self.device)
+        self.assertNotIn("posSlice.mapPtr(0u)", self.device)
+        self.assertIn(
+            "BuildWar3CpuReadableBufferSpan({",
+            self.device,
+        )
+        self.assertIn(
+            "stage13PositionMappedAllocation->getBufferInfo()",
+            self.device,
+        )
+        self.assertIn(
+            "stage13PositionReadableSpan.data",
+            self.device,
+        )
         self.assertIn(
             "positionBytes + vertexByteOffset +",
             self.device,

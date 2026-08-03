@@ -1123,11 +1123,12 @@ inline constexpr bool kPathBlockerAnonymousSmallFlatMarkerGateEnabled = true;
 // (local Z ~= -9.72). Warcraft hides it in the normal pass through terrain
 // depth, but CSM must explicitly reject it as a marker caster.
 inline constexpr bool kPathBlockerBelowGroundFlatMarkerGateEnabled = true;
-// Keep unreadable-VB tiny geometry as an explicit diagnostic fallback. The
-// production-safe path requires readable local bounds proving the marker sits
-// below the model origin, or a stable rawcode/jHandle/widget identity hit.
+// A strict anonymous 4-vertex/6-index marker candidate without readable exact
+// source generations is rejected rather than probing a virtual/stale mapping.
+// The candidate gate already excludes units, buildings, effects, alpha and
+// skinned geometry, so this remains a marker-only fail-closed policy.
 inline constexpr bool kPathBlockerBelowGroundFlatMarkerUnreadableFallbackEnabled =
-    false;
+    true;
 inline constexpr uint32_t kPathBlockerBelowGroundFlatMarkerMaxVertices = 8u;
 inline constexpr uint32_t kPathBlockerBelowGroundFlatMarkerMaxIndices = 12u;
 inline constexpr float kPathBlockerBelowGroundFlatMarkerMaxLocalZ = -1.0f;

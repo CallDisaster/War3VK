@@ -111,6 +111,7 @@ d3d9_src = [
   'war3/memory/war3_storm_hook.cpp',
   'war3/memory/war3_storm_native_small_repair.cpp',
   'war3/memory/war3_shadow_arena.cpp',
+  'war3/memory/war3_cpu_readable_buffer_span.cpp',
   'war3/handle/war3_handle_resolver.cpp',
   'war3/render/war3_render_objects.cpp',
   'war3/render/war3_render_identity_bridge.cpp',
@@ -410,6 +411,24 @@ war3_point_shadow_cpu_plan_test = executable(
 test(
   'war3_point_shadow_cpu_plan_foundation',
   war3_point_shadow_cpu_plan_test,
+  timeout : 30,
+)
+
+# Runnable boundary proof for CPU shadow-source reads. The guard-page case
+# proves that invalid D3D9 binding offsets are rejected from the allocation
+# metadata without touching the adjacent inaccessible page.
+war3_cpu_readable_buffer_span_test = executable(
+  'war3_cpu_readable_buffer_span_test',
+  [
+    'war3/memory/war3_cpu_readable_buffer_span.cpp',
+    'war3/memory/tests/war3_cpu_readable_buffer_span_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_cpu_readable_buffer_span',
+  war3_cpu_readable_buffer_span_test,
   timeout : 30,
 )
 

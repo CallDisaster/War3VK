@@ -5,6 +5,7 @@
 #include "../../d3d9_war3_shadow.h"
 
 #include "../war3.h"
+#include "../memory/war3_cpu_readable_buffer_span.h"
 #include "../memory/war3_shadow_arena.h"
 #include "../platform/war3_module_api.h"
 #include "../core/war3_game_structs.h"
@@ -43,6 +44,10 @@ uint64_t s_gpuLastCompletedSerial = 0u;
 std::chrono::steady_clock::time_point s_gpuLastProgressAt =
     std::chrono::steady_clock::now();
 bool s_gpuIncidentLatched = false;
+bool s_shadowArenaIncidentLatched = false;
+uint64_t s_shadowArenaLastOverflowCount = 0u;
+uint64_t s_shadowArenaLastAdmissionRejectedCount = 0u;
+uint64_t s_shadowArenaLastPartialTransactionCount = 0u;
 
 uint64_t EpochMilliseconds() {
   return static_cast<uint64_t>(std::chrono::duration_cast<
@@ -336,6 +341,19 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"arenaGeneration", frame.arenaGeneration},
         {"arenaBusyReuseRejectCount", frame.arenaBusyReuseRejectCount},
         {"arenaOverflowCount", frame.arenaOverflowCount},
+        {"arenaReservedBytes", frame.arenaReservedBytes},
+        {"arenaCommittedBytes", frame.arenaCommittedBytes},
+        {"arenaRolledBackBytes", frame.arenaRolledBackBytes},
+        {"arenaAdmissionRejectedCount", frame.arenaAdmissionRejectedCount},
+        {"arenaPartialTransactionCount", frame.arenaPartialTransactionCount},
+        {"arenaUniqueSourceBytes", frame.arenaUniqueSourceBytes},
+        {"arenaDuplicateBytesSaved", frame.arenaDuplicateBytesSaved},
+        {"arenaExactIndexTrimAcceptedCount",
+         frame.arenaExactIndexTrimAcceptedCount},
+        {"arenaExactIndexTrimRejectedCount",
+         frame.arenaExactIndexTrimRejectedCount},
+        {"arenaExactIndexTrimBytesSaved",
+         frame.arenaExactIndexTrimBytesSaved},
         {"arenaFrameIncomplete", frame.arenaFrameIncomplete},
         {"queueSubmittedSerial", frame.queueSubmittedSerial},
         {"queueCompletedSerial", frame.queueCompletedSerial},
@@ -405,6 +423,16 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.arenaGeneration = arena.generation;
   frame.arenaBusyReuseRejectCount = arena.busyReuseRejectCount;
   frame.arenaOverflowCount = arena.overflowCount;
+  frame.arenaReservedBytes = arena.reservedBytes;
+  frame.arenaCommittedBytes = arena.committedBundleBytes;
+  frame.arenaRolledBackBytes = arena.rolledBackBytes;
+  frame.arenaAdmissionRejectedCount = arena.admissionRejectedCount;
+  frame.arenaPartialTransactionCount = arena.partialTransactionCount;
+  frame.arenaUniqueSourceBytes = arena.uniqueSourceBytes;
+  frame.arenaDuplicateBytesSaved = arena.duplicateBytesSaved;
+  frame.arenaExactIndexTrimAcceptedCount = arena.exactIndexTrimAcceptedCount;
+  frame.arenaExactIndexTrimRejectedCount = arena.exactIndexTrimRejectedCount;
+  frame.arenaExactIndexTrimBytesSaved = arena.exactIndexTrimBytesSaved;
   frame.arenaFrameIncomplete = arena.frameIncomplete;
   frame.queueSubmittedSerial = arena.submittedSerial;
   frame.queueCompletedSerial = arena.completedSerial;
@@ -435,10 +463,38 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
     const bool queueStalled =
         frame.queueSubmittedSerial > frame.queueCompletedSerial &&
         stalledMs >= 10000u;
-    if ((queueFailed || queueStalled) && !s_gpuIncidentLatched) {
-      s_gpuIncidentLatched = true;
+    const bool arenaOverflow =
+        frame.arenaOverflowCount > s_shadowArenaLastOverflowCount;
+    const bool arenaAdmissionRejected = frame.arenaAdmissionRejectedCount >
+        s_shadowArenaLastAdmissionRejectedCount;
+    const bool arenaPartial = frame.arenaPartialTransactionCount >
+        s_shadowArenaLastPartialTransactionCount;
+    s_shadowArenaLastOverflowCount = frame.arenaOverflowCount;
+    s_shadowArenaLastAdmissionRejectedCount =
+        frame.arenaAdmissionRejectedCount;
+    s_shadowArenaLastPartialTransactionCount =
+        frame.arenaPartialTransactionCount;
+    const bool queueIncident =
+        (queueFailed || queueStalled) && !s_gpuIncidentLatched;
+    const bool arenaIncident =
+        (arenaOverflow || arenaAdmissionRejected || arenaPartial) &&
+        !s_shadowArenaIncidentLatched;
+    if (queueIncident || arenaIncident) {
+      if (queueIncident)
+        s_gpuIncidentLatched = true;
+      if (arenaIncident)
+        s_shadowArenaIncidentLatched = true;
       incident.timestampMs = frame.timestampMs;
-      incident.reason = queueFailed ? "queue-error" : "gpu-no-progress-10s";
+      if (queueFailed)
+        incident.reason = "queue-error";
+      else if (queueStalled)
+        incident.reason = "gpu-no-progress-10s";
+      else if (arenaPartial)
+        incident.reason = "shadow-arena-partial-transaction";
+      else if (arenaOverflow)
+        incident.reason = "shadow-arena-overflow";
+      else
+        incident.reason = "shadow-arena-admission-rejected";
       incident.queueResult = frame.queueResult;
       incident.stalledMilliseconds = stalledMs;
       incident.recentFrames.assign(s_gpuFlightFrames.begin(),
@@ -588,7 +644,51 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
   summary.shadowArenaBusyReuseRejectCount =
       arenaDiagnostics.busyReuseRejectCount;
   summary.shadowArenaOverflowCount = arenaDiagnostics.overflowCount;
+  summary.shadowArenaReservedBytes = arenaDiagnostics.reservedBytes;
+  summary.shadowArenaCommittedBytes =
+      arenaDiagnostics.committedBundleBytes;
+  summary.shadowArenaRolledBackBytes = arenaDiagnostics.rolledBackBytes;
+  summary.shadowArenaAdmissionRejectedCount =
+      arenaDiagnostics.admissionRejectedCount;
+  summary.shadowArenaPartialTransactionCount =
+      arenaDiagnostics.partialTransactionCount;
+  summary.shadowArenaPageTailWasteBytes =
+      arenaDiagnostics.pageTailWasteBytes;
+  summary.shadowArenaPositionBytes = arenaDiagnostics.positionBytes;
+  summary.shadowArenaBlendBytes = arenaDiagnostics.blendBytes;
+  summary.shadowArenaUvBytes = arenaDiagnostics.uvBytes;
+  summary.shadowArenaIndexBytes = arenaDiagnostics.indexBytes;
+  summary.shadowArenaTerrainBytes = arenaDiagnostics.terrainBytes;
+  summary.shadowArenaModelBytes = arenaDiagnostics.modelBytes;
+  summary.shadowArenaSkinnedBytes = arenaDiagnostics.skinnedBytes;
+  summary.shadowArenaUpBytes = arenaDiagnostics.upBytes;
+  summary.shadowArenaUniqueSourceBytes = arenaDiagnostics.uniqueSourceBytes;
+  summary.shadowArenaDuplicateBytesSaved =
+      arenaDiagnostics.duplicateBytesSaved;
+  summary.shadowArenaExactIndexTrimAcceptedCount =
+      arenaDiagnostics.exactIndexTrimAcceptedCount;
+  summary.shadowArenaExactIndexTrimRejectedCount =
+      arenaDiagnostics.exactIndexTrimRejectedCount;
+  summary.shadowArenaExactIndexTrimBytesSaved =
+      arenaDiagnostics.exactIndexTrimBytesSaved;
   summary.shadowArenaFrameIncomplete = arenaDiagnostics.frameIncomplete;
+  const auto cpuSpanDiagnostics =
+      dxvk::war3::memory::QueryWar3CpuReadableSpanDiagnostics();
+  summary.shadowCpuSpanAcceptedCount = cpuSpanDiagnostics.acceptedCount;
+  summary.shadowCpuSpanRejectedCount = cpuSpanDiagnostics.rejectedCount;
+  summary.shadowCpuSpanLastRejectReason =
+      cpuSpanDiagnostics.lastRejectReason;
+  summary.shadowCpuSpanLastAllocationBytes =
+      cpuSpanDiagnostics.lastAllocationBytes;
+  summary.shadowCpuSpanLastBindingOffset =
+      cpuSpanDiagnostics.lastRequestedOffset;
+  summary.shadowCpuSpanLastReadBytes = cpuSpanDiagnostics.lastRequestedBytes;
+  summary.shadowCpuSpanLastSourceIdentityGeneration =
+      cpuSpanDiagnostics.lastIdentityGeneration;
+  summary.shadowCpuSpanLastAllocationGeneration =
+      cpuSpanDiagnostics.lastAllocationGeneration;
+  summary.shadowCpuSpanLastContentGeneration =
+      cpuSpanDiagnostics.lastContentGeneration;
   summary.queueSubmittedSerial = arenaDiagnostics.submittedSerial;
   summary.queueCompletedSerial = arenaDiagnostics.completedSerial;
   if (auto* device = dxvk::war3::GetActiveDevice()) {
@@ -2488,8 +2588,56 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.shadowArenaBusyReuseRejectCount},
         {"shadowArenaOverflowCount",
          snapshot.shadow.shadowArenaOverflowCount},
+        {"shadowArenaReservedBytes",
+         snapshot.shadow.shadowArenaReservedBytes},
+        {"shadowArenaCommittedBytes",
+         snapshot.shadow.shadowArenaCommittedBytes},
+        {"shadowArenaRolledBackBytes",
+         snapshot.shadow.shadowArenaRolledBackBytes},
+        {"shadowArenaAdmissionRejectedCount",
+         snapshot.shadow.shadowArenaAdmissionRejectedCount},
+        {"shadowArenaPartialTransactionCount",
+         snapshot.shadow.shadowArenaPartialTransactionCount},
+        {"shadowArenaPageTailWasteBytes",
+         snapshot.shadow.shadowArenaPageTailWasteBytes},
+        {"shadowArenaPositionBytes", snapshot.shadow.shadowArenaPositionBytes},
+        {"shadowArenaBlendBytes", snapshot.shadow.shadowArenaBlendBytes},
+        {"shadowArenaUvBytes", snapshot.shadow.shadowArenaUvBytes},
+        {"shadowArenaIndexBytes", snapshot.shadow.shadowArenaIndexBytes},
+        {"shadowArenaTerrainBytes", snapshot.shadow.shadowArenaTerrainBytes},
+        {"shadowArenaModelBytes", snapshot.shadow.shadowArenaModelBytes},
+        {"shadowArenaSkinnedBytes", snapshot.shadow.shadowArenaSkinnedBytes},
+        {"shadowArenaUpBytes", snapshot.shadow.shadowArenaUpBytes},
+        {"shadowArenaUniqueSourceBytes",
+         snapshot.shadow.shadowArenaUniqueSourceBytes},
+        {"shadowArenaDuplicateBytesSaved",
+         snapshot.shadow.shadowArenaDuplicateBytesSaved},
+        {"shadowArenaExactIndexTrimAcceptedCount",
+         snapshot.shadow.shadowArenaExactIndexTrimAcceptedCount},
+        {"shadowArenaExactIndexTrimRejectedCount",
+         snapshot.shadow.shadowArenaExactIndexTrimRejectedCount},
+        {"shadowArenaExactIndexTrimBytesSaved",
+         snapshot.shadow.shadowArenaExactIndexTrimBytesSaved},
         {"shadowArenaFrameIncomplete",
          snapshot.shadow.shadowArenaFrameIncomplete},
+        {"shadowCpuSpanAcceptedCount",
+         snapshot.shadow.shadowCpuSpanAcceptedCount},
+        {"shadowCpuSpanRejectedCount",
+         snapshot.shadow.shadowCpuSpanRejectedCount},
+        {"shadowCpuSpanLastRejectReason",
+         snapshot.shadow.shadowCpuSpanLastRejectReason},
+        {"shadowCpuSpanLastAllocationBytes",
+         snapshot.shadow.shadowCpuSpanLastAllocationBytes},
+        {"shadowCpuSpanLastBindingOffset",
+         snapshot.shadow.shadowCpuSpanLastBindingOffset},
+        {"shadowCpuSpanLastReadBytes",
+         snapshot.shadow.shadowCpuSpanLastReadBytes},
+        {"shadowCpuSpanLastSourceIdentityGeneration",
+         snapshot.shadow.shadowCpuSpanLastSourceIdentityGeneration},
+        {"shadowCpuSpanLastAllocationGeneration",
+         snapshot.shadow.shadowCpuSpanLastAllocationGeneration},
+        {"shadowCpuSpanLastContentGeneration",
+         snapshot.shadow.shadowCpuSpanLastContentGeneration},
         {"queueSubmittedSerial", snapshot.shadow.queueSubmittedSerial},
         {"queueCompletedSerial", snapshot.shadow.queueCompletedSerial},
         {"queueLastResult", snapshot.shadow.queueLastResult},

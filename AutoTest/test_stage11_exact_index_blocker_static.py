@@ -472,7 +472,8 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
             "m_war3PerDrawUpload.vbUploadBytes[positionStream] != nullptr",
             "m_war3PerDrawUpload.vbUploadLength[positionStream] != 0u",
             "uploadSlice.length()",
-            "positionBytes = reinterpret_cast<const uint8_t*>(",
+            "BuildWar3CpuReadableBufferSpan({",
+            "positionBytes = positionReadableSpan.data;",
             "positionByteLength =",
         ):
             self.assertIn(token, dynamic)
@@ -486,11 +487,15 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         for token in (
             "Rc<DxvkResourceAllocation> positionMappedAllocation",
             "positionMappedAllocation = common->GetMappedSlice();",
+            "positionMappedAllocation->getBufferInfo()",
             "positionMappedAllocation->mapPtr()",
-            "positionBytes = mappedBase + bindingOffset;",
+            "BuildWar3CpuReadableBufferSpan({",
+            "positionBytes = positionReadableSpan.data;",
             "positionByteLength =",
         ):
             self.assertIn(token, blocker if token.startswith("Rc<") else regular)
+        self.assertNotIn("mappedBase + bindingOffset", regular)
+        self.assertNotIn("common->Desc()->Size - bindingOffset", regular)
 
     def test_metadata_alpha_uv_is_generation_exact_and_fail_closed(
         self,

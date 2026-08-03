@@ -30,6 +30,7 @@
 #include "war3/handle/war3_handle_resolver.h"
 #include "war3/hooks/war3_hook_widget_identity.h"
 #include "war3/hooks/war3_hook_perf.h"
+#include "war3/memory/war3_cpu_readable_buffer_span.h"
 #include "war3/memory/war3_shadow_arena.h"
 #include "war3/memory/war3_storm_hook.h"
 #include "war3/model/war3_model_hook.h"
@@ -8596,17 +8597,9 @@ inline bool War3ComputeMappedLocalBoundsFromBytes(
   return true;
 }
 
-inline bool War3ComputeMappedLocalBoundsFromSlice(
-    const DxvkBufferSlice& positionSlice, uint32_t positionStride,
-    uint32_t positionOffset, VkFormat positionFormat, uint32_t firstVertex,
-    uint32_t vertexCount, War3LocalGeometryBounds& outBounds) {
-  return War3ComputeMappedLocalBoundsFromBytes(
-      positionSlice.mapPtr(0u), positionSlice.length(), positionStride,
-      positionOffset, positionFormat, firstVertex, vertexCount, outBounds);
-}
-
 inline uint64_t War3ComputeTerrainBoundsContentKey(
-    const DxvkBufferSlice& positionSlice, uint32_t positionStride,
+    const dxvk::war3::memory::War3CpuReadableBufferSpan& positionSpan,
+    uint32_t positionStride,
     uint32_t positionOffset, VkFormat positionFormat, uint32_t firstVertex,
     uint32_t vertexCount) {
   if (vertexCount == 0u || positionStride < 12u)
@@ -8621,13 +8614,10 @@ inline uint64_t War3ComputeTerrainBoundsContentKey(
       (uint64_t(firstVertex) + uint64_t(vertexCount - 1u)) *
           uint64_t(positionStride) +
       uint64_t(positionOffset) + 12ull;
-  if (lastByte > positionSlice.length())
+  if (!positionSpan || lastByte > positionSpan.length)
     return 0u;
 
-  const auto* base =
-      reinterpret_cast<const uint8_t*>(positionSlice.mapPtr(0u));
-  if (base == nullptr)
-    return 0u;
+  const auto* base = positionSpan.data;
 
   auto foldBytes = [](uint64_t h, const uint8_t* p, size_t n) {
     for (size_t i = 0u; i < n; ++i) {
@@ -8653,8 +8643,9 @@ inline uint64_t War3ComputeTerrainBoundsContentKey(
   return hash != 0u ? hash : 1u;
 }
 
-inline bool War3ComputeCachedMappedTerrainBoundsFromSlice(
-    const DxvkBufferSlice& positionSlice, uint32_t positionStride,
+inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
+    const dxvk::war3::memory::War3CpuReadableBufferSpan& positionSpan,
+    uint32_t positionStride,
     uint32_t positionOffset, VkFormat positionFormat, uint32_t firstVertex,
     uint32_t vertexCount, bool allowPersistentCache,
     War3LocalGeometryBounds& outBounds,
@@ -8738,9 +8729,9 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSlice(
         dxvk::war3::internal::kShadowS1TerrainBoundsCacheStatsLogging) {
       s_stats.uncachedPath++;
     }
-    const bool ok = War3ComputeMappedLocalBoundsFromSlice(
-        positionSlice, positionStride, positionOffset, positionFormat,
-        firstVertex, vertexCount, outBounds);
+    const bool ok = positionSpan && War3ComputeMappedLocalBoundsFromBytes(
+        positionSpan.data, positionSpan.length, positionStride,
+        positionOffset, positionFormat, firstVertex, vertexCount, outBounds);
     if constexpr (
         dxvk::war3::internal::kShadowS1TerrainBoundsCacheStatsLogging) {
       if (!ok)
@@ -8755,8 +8746,7 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSlice(
     s_stats.cachedPath++;
   }
 
-  void* buffer = positionSlice.buffer().ptr();
-  if (buffer == nullptr) {
+  if (!positionSpan) {
     if constexpr (
         dxvk::war3::internal::kShadowS1TerrainBoundsCacheStatsLogging) {
       s_stats.noBuffer++;
@@ -8774,15 +8764,19 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSlice(
       stableSourceBase != nullptr && stableSourceLength != 0u;
   const void* keyIdentity = useStableSourceKey
                                 ? stableSourceBase
-                                : positionSlice.buffer().ptr();
+                                : positionSpan.data;
   const uint64_t keyOffset = useStableSourceKey
                                  ? stableSourceOffset
-                                 : uint64_t(positionSlice.offset());
+                                 : 0u;
   const uint64_t keyLength = useStableSourceKey
                                  ? stableSourceLength
-                                 : uint64_t(positionSlice.length());
+                                 : positionSpan.length;
   const uint64_t keySequence =
-      useStableSourceKey ? stableSourceSequence : 0u;
+      useStableSourceKey
+          ? stableSourceSequence
+          : positionSpan.identityGeneration ^
+                (positionSpan.allocationGeneration << 1u) ^
+                (positionSpan.contentGeneration << 2u);
   const uint32_t keyElementCount =
       useStableSourceKey ? stableSourceElementCount : 0u;
   const uint32_t keyElementStride =
@@ -8840,9 +8834,10 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSlice(
   }
 
   War3LocalGeometryBounds computed = {};
-  if (!War3ComputeMappedLocalBoundsFromSlice(
-          positionSlice, positionStride, positionOffset, positionFormat,
-          firstVertex, vertexCount, computed)) {
+  if (!War3ComputeMappedLocalBoundsFromBytes(
+          positionSpan.data, positionSpan.length, positionStride,
+          positionOffset, positionFormat, firstVertex, vertexCount,
+          computed)) {
     if constexpr (
         dxvk::war3::internal::kShadowS1TerrainBoundsCacheStatsLogging) {
       s_stats.computeFail++;
@@ -34549,6 +34544,8 @@ void D3D9DeviceEx::UploadPerDrawData(UINT &FirstVertexIndex, UINT NumVertices,
             reinterpret_cast<uintptr_t>(ibo);
         m_war3PerDrawUpload.ibSourceIdentityGeneration =
             ibo->War3IdentityGeneration();
+        m_war3PerDrawUpload.ibSourceSequence =
+            ibo->GetMappingBufferSequenceNumber();
         m_war3PerDrawUpload.ibSourceContentGeneration =
             ibo->War3ContentGeneration();
         m_war3PerDrawUpload.ibSourceOffset = offset;
@@ -38418,6 +38415,7 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
       uint32_t positionStride = 0u;
       const uint8_t* positionBytes = nullptr;
       VkDeviceSize positionByteLength = 0u;
+      dxvk::war3::memory::War3CpuReadableBufferSpan positionReadableSpan = {};
       Rc<DxvkResourceAllocation> positionMappedAllocation = nullptr;
       if (dynamicSysmemVbos) {
         // Metadata runs before the exact producer.  It may classify a blocker
@@ -38431,13 +38429,27 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
             m_war3PerDrawUpload.storage != nullptr &&
             m_war3PerDrawUpload.vbUploadBytes[positionStream] != nullptr &&
             m_war3PerDrawUpload.vbUploadLength[positionStream] != 0u &&
+            m_war3PerDrawUpload.vbSourceValid[positionStream] &&
             VkDeviceSize(
                 m_war3PerDrawUpload.vbUploadLength[positionStream]) >=
                 uploadSlice.length()) {
-          positionBytes = reinterpret_cast<const uint8_t*>(
-              m_war3PerDrawUpload.vbUploadBytes[positionStream]);
-          positionByteLength =
-              m_war3PerDrawUpload.vbUploadLength[positionStream];
+          positionReadableSpan =
+              dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                  m_war3PerDrawUpload.vbUploadBytes[positionStream],
+                  m_war3PerDrawUpload.vbUploadLength[positionStream],
+                  0u,
+                  m_war3PerDrawUpload.vbUploadLength[positionStream],
+                  m_war3PerDrawUpload.vbSourceResource[positionStream],
+                  m_war3PerDrawUpload
+                      .vbSourceIdentityGeneration[positionStream],
+                  m_war3PerDrawUpload.vbSourceSequence[positionStream],
+                  m_war3PerDrawUpload
+                      .vbSourceContentGeneration[positionStream],
+                  true});
+          if (positionReadableSpan) {
+            positionBytes = positionReadableSpan.data;
+            positionByteLength = positionReadableSpan.length;
+          }
           positionStride =
               m_war3PerDrawUpload.vbStrides[positionStream];
         }
@@ -38447,17 +38459,30 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
           auto* common = vb->GetCommonBuffer();
           const VkDeviceSize bindingOffset =
               m_state.vertexBuffers[positionStream].offset;
-          if (common != nullptr && !common->NeedsReadback() &&
-              bindingOffset <= common->Desc()->Size) {
+          if (common != nullptr && !common->NeedsReadback()) {
             positionMappedAllocation = common->GetMappedSlice();
-            const auto* mappedBase = positionMappedAllocation != nullptr
-                ? reinterpret_cast<const uint8_t*>(
-                      positionMappedAllocation->mapPtr())
-                : nullptr;
-            if (mappedBase != nullptr) {
-              positionBytes = mappedBase + bindingOffset;
-              positionByteLength =
-                  VkDeviceSize(common->Desc()->Size) - bindingOffset;
+            if (positionMappedAllocation != nullptr) {
+              const auto allocationInfo =
+                  positionMappedAllocation->getBufferInfo();
+              const bool hostVisible =
+                  (positionMappedAllocation->getMemoryProperties() &
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+              const uint64_t requestedBytes =
+                  bindingOffset <= allocationInfo.size
+                  ? uint64_t(allocationInfo.size - bindingOffset)
+                  : 0u;
+              positionReadableSpan =
+                  dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                      positionMappedAllocation->mapPtr(),
+                      uint64_t(allocationInfo.size), uint64_t(bindingOffset),
+                      requestedBytes, reinterpret_cast<uintptr_t>(common),
+                      common->War3IdentityGeneration(),
+                      common->War3MapAllocationGeneration(),
+                      common->War3ContentGeneration(), hostVisible});
+              if (positionReadableSpan) {
+                positionBytes = positionReadableSpan.data;
+                positionByteLength = positionReadableSpan.length;
+              }
             }
             positionStride = m_state.vertexBuffers[positionStream].stride;
           }
@@ -39744,6 +39769,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         uint32_t posStride = 0u;
         D3D9CommonBuffer* posCommon = nullptr;
         Rc<DxvkResourceAllocation> posMappedAllocation = nullptr;
+        dxvk::war3::memory::War3CpuReadableBufferSpan posReadableSpan = {};
         const uint8_t* posCanonicalBytes = nullptr;
         VkDeviceSize posCanonicalLength = 0u;
         if (gpuSkinSemanticBacking) {
@@ -39762,6 +39788,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               m_war3PerDrawUpload.storage == nullptr ||
               m_war3PerDrawUpload.vbUploadBytes[posStream] == nullptr ||
               m_war3PerDrawUpload.vbUploadLength[posStream] == 0u ||
+              !m_war3PerDrawUpload.vbSourceValid[posStream] ||
               VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream]) <
                   m_war3PerDrawUpload.vbSlices[posStream].length()) {
             War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
@@ -39770,10 +39797,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
           posSlice = m_war3PerDrawUpload.vbSlices[posStream];
           posStride = m_war3PerDrawUpload.vbStrides[posStream];
-          posCanonicalBytes = reinterpret_cast<const uint8_t*>(
-              m_war3PerDrawUpload.vbUploadBytes[posStream]);
-          posCanonicalLength =
-              m_war3PerDrawUpload.vbUploadLength[posStream];
+          posReadableSpan =
+              dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                  m_war3PerDrawUpload.vbUploadBytes[posStream],
+                  m_war3PerDrawUpload.vbUploadLength[posStream], 0u,
+                  m_war3PerDrawUpload.vbUploadLength[posStream],
+                  m_war3PerDrawUpload.vbSourceResource[posStream],
+                  m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream],
+                  m_war3PerDrawUpload.vbSourceSequence[posStream],
+                  m_war3PerDrawUpload.vbSourceContentGeneration[posStream],
+                  true});
+          if (posReadableSpan) {
+            posCanonicalBytes = posReadableSpan.data;
+            posCanonicalLength = posReadableSpan.length;
+          }
         } else {
           auto *vb = m_state.vertexBuffers[posStream].vertexBuffer.ptr();
           if (vb) {
@@ -39797,17 +39834,30 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   ->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(
                       bindingOffset);
               posStride = m_state.vertexBuffers[posStream].stride;
-              if (!posCommon->NeedsReadback() &&
-                  bindingOffset <= posCommon->Desc()->Size) {
+              if (!posCommon->NeedsReadback()) {
                 posMappedAllocation = posCommon->GetMappedSlice();
                 if (posMappedAllocation != nullptr) {
-                  const auto* mappedBase =
-                      reinterpret_cast<const uint8_t*>(
-                          posMappedAllocation->mapPtr());
-                  if (mappedBase != nullptr) {
-                    posCanonicalBytes = mappedBase + bindingOffset;
-                    posCanonicalLength =
-                        VkDeviceSize(posCommon->Desc()->Size) - bindingOffset;
+                  const auto allocationInfo =
+                      posMappedAllocation->getBufferInfo();
+                  const bool hostVisible =
+                      (posMappedAllocation->getMemoryProperties() &
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+                  const uint64_t requestedBytes =
+                      bindingOffset <= allocationInfo.size
+                      ? uint64_t(allocationInfo.size - bindingOffset)
+                      : 0u;
+                  posReadableSpan =
+                      dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                          posMappedAllocation->mapPtr(),
+                          uint64_t(allocationInfo.size), uint64_t(bindingOffset),
+                          requestedBytes,
+                          reinterpret_cast<uintptr_t>(posCommon),
+                          posCommon->War3IdentityGeneration(),
+                          posCommon->War3MapAllocationGeneration(),
+                          posCommon->War3ContentGeneration(), hostVisible});
+                  if (posReadableSpan) {
+                    posCanonicalBytes = posReadableSpan.data;
+                    posCanonicalLength = posReadableSpan.length;
                   }
                 }
               }
@@ -39916,6 +39966,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           // trusted and no source generation is lost.
           const uint8_t* currentIndexBytes = nullptr;
           bool currentIndexBytesHostCached = false;
+          dxvk::war3::memory::War3CpuReadableBufferSpan
+              currentIndexReadableSpan = {};
           if (DynamicSysmemIBO) {
             if (StartVal != 0u ||
                 drawTimeIndexRangeBytes >
@@ -39927,9 +39979,19 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             const auto memoryProperties =
                 m_war3PerDrawUpload.ibStorage->getMemoryProperties();
             if ((memoryProperties & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u) {
-              currentIndexBytes = reinterpret_cast<const uint8_t*>(
-                  m_war3PerDrawUpload.ibUploadBytes);
-              currentIndexBytesHostCached = currentIndexBytes != nullptr;
+              currentIndexReadableSpan =
+                  dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                      m_war3PerDrawUpload.ibUploadBytes,
+                      m_war3PerDrawUpload.ibUploadLength, 0u,
+                      uint64_t(drawTimeIndexRangeBytes),
+                      m_war3PerDrawUpload.ibSourceResource,
+                      m_war3PerDrawUpload.ibSourceIdentityGeneration,
+                      m_war3PerDrawUpload.ibSourceSequence,
+                      m_war3PerDrawUpload.ibSourceContentGeneration, true});
+              if (currentIndexReadableSpan) {
+                currentIndexBytes = currentIndexReadableSpan.data;
+                currentIndexBytesHostCached = true;
+              }
             }
           } else if (drawTimeIndexCommon != nullptr) {
             // BUFFER/MANAGED mappings are authored in MAPPING storage.  Queue
@@ -39956,17 +40018,22 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   drawTimeIndexMappedAllocation != nullptr &&
                   (drawTimeIndexMappedAllocation->getMemoryProperties() &
                    VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
-              const auto* mappedBase = mappedHostCached
-                  ? reinterpret_cast<const uint8_t*>(
-                        drawTimeIndexMappedAllocation->mapPtr())
-                  : nullptr;
-              const uint64_t mappedSize =
-                  drawTimeIndexCommon->Desc() != nullptr
-                      ? uint64_t(drawTimeIndexCommon->Desc()->Size)
-                      : 0u;
-              if (mappedBase != nullptr && rangeOffset64 <= mappedSize &&
-                  rangeBytes64 <= mappedSize - rangeOffset64) {
-                currentIndexBytes = mappedBase + size_t(rangeOffset64);
+              if (drawTimeIndexMappedAllocation != nullptr) {
+                const auto allocationInfo =
+                    drawTimeIndexMappedAllocation->getBufferInfo();
+                currentIndexReadableSpan =
+                    dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                        drawTimeIndexMappedAllocation->mapPtr(),
+                        uint64_t(allocationInfo.size), rangeOffset64,
+                        rangeBytes64,
+                        reinterpret_cast<uintptr_t>(drawTimeIndexCommon),
+                        drawTimeIndexCommon->War3IdentityGeneration(),
+                        drawTimeIndexCommon->War3MapAllocationGeneration(),
+                        drawTimeIndexCommon->War3ContentGeneration(),
+                        mappedHostCached});
+              }
+              if (currentIndexReadableSpan) {
+                currentIndexBytes = currentIndexReadableSpan.data;
                 currentIndexBytesHostCached = true;
               }
             }
@@ -41822,6 +41889,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   VkDeviceSize uvBytesNeeded = 0;
   bool uvDynamic = false;
   bool uvRequiresStableUploadSource = false;
+  VkDeviceSize uvFreezeByteOffset = 0u;
   Rc<DxvkImageView> diffuseTexView;
   float alphaRefFloat = 0.0f;
   bool captureAlphaTest = false;
@@ -42358,20 +42426,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             draw.indexed
                 ? int64_t(draw.vertexOffset) + int64_t(draw.minVertexIndex)
                 : int64_t(draw.firstVertex);
-        if (draw.positionStorage != nullptr &&
-            draw.positionInfo.buffer != VK_NULL_HANDLE &&
-            draw.positionInfo.size != 0u && firstVertex >= 0) {
-          const DxvkBufferSlice positionSlice(draw.positionStorage,
-                                              draw.positionInfo.offset,
-                                              draw.positionInfo.size);
-          if (War3ComputeMappedLocalBoundsFromSlice(
-                  positionSlice, draw.positionStride, draw.positionOffset,
-                  draw.positionFormat, uint32_t(firstVertex),
-                  markerVertexCount, markerBounds)) {
-            boundsReadable = true;
-            boundsFit = War3BelowGroundFlatMarkerBoundsFit(markerBounds);
-          }
-        }
+        // Finalize can observe an Arena/device-local backing or a virtual
+        // buffer whose current storage no longer names the captured draw.
+        // Without the source generations carried by the earlier exact lane,
+        // it must not inspect that mapping. The narrow marker candidate is
+        // rejected by the unreadable-marker policy below instead.
+        (void)markerVertexCount;
+        (void)firstVertex;
         if (boundsFit ||
             (!boundsReadable &&
              dxvk::war3::internal::
@@ -43015,6 +43076,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
   }
 
+  VkDeviceSize posFreezeByteOffset = 0u;
   VkDeviceSize posBytesNeeded = posInfo.size;
   if (vertexRangeValid && posStride != 0) {
     const VkDeviceSize wanted = static_cast<VkDeviceSize>(vertexRangeEnd) *
@@ -43035,6 +43097,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   DxvkResourceBufferInfo blendInfo = {};
   bool blendDynamic = false;
   VkDeviceSize blendBytesNeeded = 0;
+  VkDeviceSize blendFreezeByteOffset = 0u;
   if (blendBinding == 1 && !gpuSkinLegacyBacking) {
     if (blendStream >= caps::MaxStreams)
       return;
@@ -43203,6 +43266,157 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                          : nullptr;
     ibDynamic = DynamicSysmemIBO ||
                 (ibCommon && (ibCommon->Desc()->Usage & D3DUSAGE_DYNAMIC));
+  }
+
+  // Validate the current IB mapping generation and scan the exact draw range
+  // to derive the real vertex domain. SYSTEMMEM uses the source tuple frozen
+  // by UploadPerDrawData; managed/default buffers queue pending upload first.
+  // This replaces the unreliable D3D9
+  // MinVertexIndex/NumVertices hint without reading a stale REAL allocation or
+  // the write-combined UP ring. Large terrain/model draws commonly advertise
+  // a 512 KiB VB while their exact IB references only a small subrange.
+  bool exactIndexedFreezeTrimmed = false;
+  uint64_t exactIndexedFreezeBytesBefore = 0u;
+  uint64_t exactIndexedFreezeBytesAfter = 0u;
+  uint32_t exactIndexedFreezeFirstVertex = 0u;
+  uint32_t exactIndexedFreezeVertexCount = 0u;
+  // Both per-draw SYSTEMMEM uploads and ordinary D3DUSAGE_DYNAMIC position
+  // buffers are frozen into the Arena below.  The latter are the dominant
+  // Warcraft terrain path, so restricting this proof to DynamicSysmemVBOs
+  // would leave every 512 KiB terrain slice untrimmed.  We still read only the
+  // separately validated IB mapping here; the position payload remains a GPU
+  // copy ordered on the render command stream.
+  const bool exactIndexedFreezeTrimCandidate =
+      indexed && !gpuSkinLegacyBacking &&
+      (DynamicSysmemVBOs || posDynamic) && posStride != 0u &&
+      posInfo.size >= posStride;
+  if (exactIndexedFreezeTrimCandidate) {
+    auto* exactIndexCommon = m_state.indices.ptr() != nullptr
+        ? m_state.indices.ptr()->GetCommonBuffer() : nullptr;
+    dxvk::war3::memory::War3CpuReadableBufferSpan exactIndexSpan = {};
+    const uint32_t indexElementBytes =
+        indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
+    if (DynamicSysmemIBO && StartVal == 0u &&
+        exactIndexCommon != nullptr &&
+        m_war3PerDrawUpload.ibSourceValid &&
+        m_war3PerDrawUpload.ibSourceResource != 0u &&
+        m_war3PerDrawUpload.ibSourceIdentityGeneration != 0u &&
+        m_war3PerDrawUpload.ibSourceSequence != 0u &&
+        m_war3PerDrawUpload.ibSourceContentGeneration != 0u &&
+        reinterpret_cast<uintptr_t>(exactIndexCommon) ==
+            m_war3PerDrawUpload.ibSourceResource &&
+        exactIndexCommon->War3IdentityGeneration() ==
+            m_war3PerDrawUpload.ibSourceIdentityGeneration &&
+        exactIndexCommon->GetMappingBufferSequenceNumber() ==
+            m_war3PerDrawUpload.ibSourceSequence &&
+        exactIndexCommon->War3ContentGeneration() ==
+            m_war3PerDrawUpload.ibSourceContentGeneration) {
+      auto exactIndexAllocation = exactIndexCommon->GetMappedSlice();
+      if (exactIndexAllocation != nullptr) {
+        const auto allocationInfo = exactIndexAllocation->getBufferInfo();
+        const bool hostVisible =
+            (exactIndexAllocation->getMemoryProperties() &
+             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        exactIndexSpan =
+            dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                exactIndexAllocation->mapPtr(), uint64_t(allocationInfo.size),
+                uint64_t(m_war3PerDrawUpload.ibSourceOffset),
+                uint64_t(m_war3PerDrawUpload.ibSourceLength),
+                m_war3PerDrawUpload.ibSourceResource,
+                m_war3PerDrawUpload.ibSourceIdentityGeneration,
+                m_war3PerDrawUpload.ibSourceSequence,
+                m_war3PerDrawUpload.ibSourceContentGeneration, hostVisible});
+      }
+    } else if (!DynamicSysmemIBO && exactIndexCommon != nullptr &&
+               !exactIndexCommon->NeedsReadback()) {
+      // Keep MAPPING and REAL ordered on the same command stream. If a managed
+      // buffer still has pending CPU writes, queue its normal upload before
+      // the Arena copy so the scanned generation and frozen IB are identical.
+      const bool uploadReady = !exactIndexCommon->NeedsUpload() ||
+          SUCCEEDED(FlushBuffer(exactIndexCommon));
+      auto exactIndexAllocation = exactIndexCommon->GetMappedSlice();
+      if (uploadReady && exactIndexAllocation != nullptr) {
+        const auto allocationInfo = exactIndexAllocation->getBufferInfo();
+        const bool hostVisible =
+            (exactIndexAllocation->getMemoryProperties() &
+             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        const uint64_t indexOffset =
+            uint64_t(StartVal) * uint64_t(indexElementBytes);
+        const uint64_t indexBytes =
+            uint64_t(CountVal) * uint64_t(indexElementBytes);
+        exactIndexSpan =
+            dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                exactIndexAllocation->mapPtr(), uint64_t(allocationInfo.size),
+                indexOffset, indexBytes,
+                reinterpret_cast<uintptr_t>(exactIndexCommon),
+                exactIndexCommon->War3IdentityGeneration(),
+                exactIndexCommon->War3MapAllocationGeneration(),
+                exactIndexCommon->War3ContentGeneration(), hostVisible});
+      }
+    }
+
+    const uint64_t positionCapacity64 = posInfo.size / posStride;
+    if (exactIndexSpan && positionCapacity64 != 0u &&
+        positionCapacity64 <=
+            uint64_t(std::numeric_limits<uint32_t>::max())) {
+      const auto exactDomain =
+          dxvk::war3::memory::ComputeWar3ExactIndexVertexDomain(
+              exactIndexSpan, indexElementBytes, CountVal,
+              BaseVertexIndex, uint32_t(positionCapacity64));
+      if (exactDomain.valid) {
+        const uint64_t first = exactDomain.firstVertex;
+        const uint64_t count = exactDomain.vertexCount;
+        const uint64_t end = first + count;
+        const int64_t adjustedVertexOffset =
+            int64_t(BaseVertexIndex) - int64_t(first);
+        bool allStreamsFit = end <= positionCapacity64 &&
+            adjustedVertexOffset >=
+                int64_t(std::numeric_limits<int32_t>::min()) &&
+            adjustedVertexOffset <=
+                int64_t(std::numeric_limits<int32_t>::max());
+        if (allStreamsFit && blendBinding == 1u) {
+          allStreamsFit = blendStride != 0u &&
+              end <= uint64_t(blendInfo.size / blendStride);
+        }
+        if (allStreamsFit && captureAlphaTest &&
+            resolvedUvBinding == 2u) {
+          allStreamsFit = uvStride != 0u &&
+              end <= uint64_t(uvInfo.size / uvStride);
+        }
+
+        if (allStreamsFit &&
+            (first != 0u || count != positionCapacity64)) {
+          exactIndexedFreezeBytesBefore = uint64_t(posBytesNeeded) +
+              uint64_t(blendBytesNeeded) +
+              (captureAlphaTest && resolvedUvBinding == 2u
+                   ? uint64_t(uvBytesNeeded) : 0u);
+          posFreezeByteOffset = VkDeviceSize(first * posStride);
+          posBytesNeeded = VkDeviceSize(count * posStride);
+          if (blendBinding == 1u) {
+            blendFreezeByteOffset = VkDeviceSize(first * blendStride);
+            blendBytesNeeded = VkDeviceSize(count * blendStride);
+          }
+          if (captureAlphaTest && resolvedUvBinding == 2u) {
+            uvFreezeByteOffset = VkDeviceSize(first * uvStride);
+            uvBytesNeeded = VkDeviceSize(count * uvStride);
+          }
+          vertexRangeValid = true;
+          vertexRangeEnd = int64_t(end);
+          exactIndexedFreezeFirstVertex = uint32_t(first);
+          exactIndexedFreezeVertexCount = uint32_t(count);
+          exactIndexedFreezeTrimmed = true;
+          exactIndexedFreezeBytesAfter = uint64_t(posBytesNeeded) +
+              uint64_t(blendBytesNeeded) +
+              (captureAlphaTest && resolvedUvBinding == 2u
+                   ? uint64_t(uvBytesNeeded) : 0u);
+        }
+      }
+    }
+  }
+  if (exactIndexedFreezeTrimCandidate) {
+    dxvk::war3::memory::ShadowArena_NoteExactIndexTrim(
+        exactIndexedFreezeTrimmed, exactIndexedFreezeBytesBefore,
+        exactIndexedFreezeBytesAfter);
   }
 
   const bool dynamicShadowSource =
@@ -43516,6 +43730,88 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       DynamicSysmemIBO && m_war3PerDrawUpload.ibSourceValid &&
       m_war3PerDrawUpload.ibSourceResource ==
           reinterpret_cast<uintptr_t>(stage13IndexSourceResource);
+  Rc<DxvkResourceAllocation> stage13PositionMappedAllocation = nullptr;
+  Rc<DxvkResourceAllocation> stage13IndexMappedAllocation = nullptr;
+  dxvk::war3::memory::War3CpuReadableBufferSpan
+      stage13PositionReadableSpan = {};
+  dxvk::war3::memory::War3CpuReadableBufferSpan
+      stage13IndexReadableSpan = {};
+  if (stage13BaseRetentionEligible && stage13PositionLayoutValid &&
+      posInfo.size != 0u) {
+    if (DynamicSysmemVBOs && stage13DynamicPositionSourceValid &&
+        m_war3PerDrawUpload.vbUploadBytes[posStream] != nullptr) {
+      stage13PositionReadableSpan =
+          dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+              m_war3PerDrawUpload.vbUploadBytes[posStream],
+              m_war3PerDrawUpload.vbUploadLength[posStream], 0u,
+              uint64_t(posInfo.size),
+              m_war3PerDrawUpload.vbSourceResource[posStream],
+              m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream],
+              m_war3PerDrawUpload.vbSourceSequence[posStream],
+              m_war3PerDrawUpload.vbSourceContentGeneration[posStream], true});
+    } else if (!DynamicSysmemVBOs &&
+               stage13PositionSourceResource != nullptr &&
+               !stage13PositionSourceResource->NeedsReadback()) {
+      stage13PositionMappedAllocation =
+          stage13PositionSourceResource->GetMappedSlice();
+      if (stage13PositionMappedAllocation != nullptr) {
+        const auto allocationInfo =
+            stage13PositionMappedAllocation->getBufferInfo();
+        const uint64_t sourceOffset = uint64_t(posSlice.offset());
+        const bool hostVisible =
+            (stage13PositionMappedAllocation->getMemoryProperties() &
+             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        stage13PositionReadableSpan =
+            dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                stage13PositionMappedAllocation->mapPtr(),
+                uint64_t(allocationInfo.size), sourceOffset,
+                uint64_t(posInfo.size),
+                reinterpret_cast<uintptr_t>(stage13PositionSourceResource),
+                stage13PositionSourceResource->War3IdentityGeneration(),
+                stage13PositionSourceResource->War3MapAllocationGeneration(),
+                stage13PositionSourceResource->War3ContentGeneration(),
+                hostVisible});
+      }
+    }
+  }
+  if (stage13BaseRetentionEligible && stage13IndexRangeBytes != 0u) {
+    if (DynamicSysmemIBO && stage13DynamicIndexSourceValid &&
+        m_war3PerDrawUpload.ibUploadBytes != nullptr) {
+      stage13IndexReadableSpan =
+          dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+              m_war3PerDrawUpload.ibUploadBytes,
+              m_war3PerDrawUpload.ibUploadLength,
+              uint64_t(stage13IndexRangeOffset),
+              uint64_t(stage13IndexRangeBytes),
+              m_war3PerDrawUpload.ibSourceResource,
+              m_war3PerDrawUpload.ibSourceIdentityGeneration,
+              m_war3PerDrawUpload.ibSourceSequence,
+              m_war3PerDrawUpload.ibSourceContentGeneration, true});
+    } else if (!DynamicSysmemIBO && stage13IndexSourceResource != nullptr &&
+               !stage13IndexSourceResource->NeedsReadback()) {
+      stage13IndexMappedAllocation =
+          stage13IndexSourceResource->GetMappedSlice();
+      if (stage13IndexMappedAllocation != nullptr) {
+        const auto allocationInfo =
+            stage13IndexMappedAllocation->getBufferInfo();
+        const uint64_t sourceOffset = uint64_t(idxSlice.offset()) +
+            uint64_t(stage13IndexRangeOffset);
+        const bool hostVisible =
+            (stage13IndexMappedAllocation->getMemoryProperties() &
+             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        stage13IndexReadableSpan =
+            dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                stage13IndexMappedAllocation->mapPtr(),
+                uint64_t(allocationInfo.size), sourceOffset,
+                uint64_t(stage13IndexRangeBytes),
+                reinterpret_cast<uintptr_t>(stage13IndexSourceResource),
+                stage13IndexSourceResource->War3IdentityGeneration(),
+                stage13IndexSourceResource->War3MapAllocationGeneration(),
+                stage13IndexSourceResource->War3ContentGeneration(),
+                hostVisible});
+      }
+    }
+  }
   const auto* stage13CanonicalPositionBytes =
       stage13BaseRetentionEligible && DynamicSysmemVBOs &&
               stage13DynamicPositionSourceValid &&
@@ -43524,8 +43820,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               stage13ExpandedPositionBytes <=
                   kStage13MaxRetainedSnapshotBytes &&
               posInfo.size != 0u &&
-              posInfo.size <= VkDeviceSize(std::numeric_limits<size_t>::max())
-          ? reinterpret_cast<const unsigned char*>(posSlice.mapPtr(0u))
+              posInfo.size <= VkDeviceSize(std::numeric_limits<size_t>::max()) &&
+              stage13PositionReadableSpan
+          ? stage13PositionReadableSpan.data
           : nullptr;
   const auto* stage13CanonicalIndexBytes =
       stage13BaseRetentionEligible &&
@@ -43535,9 +43832,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               stage13IndexRangeBytes <=
                   idxInfo.size - stage13IndexRangeOffset &&
               stage13IndexRangeBytes <=
-                  VkDeviceSize(std::numeric_limits<size_t>::max())
-          ? reinterpret_cast<const unsigned char*>(
-                idxSlice.mapPtr(stage13IndexRangeOffset))
+                  VkDeviceSize(std::numeric_limits<size_t>::max()) &&
+              stage13IndexReadableSpan
+          ? stage13IndexReadableSpan.data
           : nullptr;
   const auto* stage13DynamicIndexBytes =
       DynamicSysmemIBO && stage13DynamicIndexSourceValid
@@ -43842,13 +44139,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       posInfo.size != 0u &&
       posSlice.buffer() != nullptr && idxSlice.buffer() != nullptr;
   const auto* stage13LateDescriptorIndexBytes =
-      stage13LateDescriptorCandidate
-          ? reinterpret_cast<const unsigned char*>(
-                idxSlice.mapPtr(stage13IndexRangeOffset))
+      stage13LateDescriptorCandidate && stage13IndexReadableSpan
+          ? stage13IndexReadableSpan.data
           : nullptr;
   const auto* stage13LateDescriptorPositionBytes =
-      stage13LateDescriptorIndexBytes != nullptr
-          ? reinterpret_cast<const unsigned char*>(posSlice.mapPtr(0u))
+      stage13LateDescriptorIndexBytes != nullptr &&
+              stage13PositionReadableSpan
+          ? stage13PositionReadableSpan.data
           : nullptr;
   bool stage13LateDescriptorValid = false;
   uint64_t stage13LateDescriptorHash = 0u;
@@ -43987,8 +44284,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   VkDeviceSize(std::numeric_limits<size_t>::max())
           ? (stage13LateDescriptorIndexBytes != nullptr
                  ? stage13LateDescriptorIndexBytes
-                 : reinterpret_cast<const unsigned char*>(
-                       idxSlice.mapPtr(stage13IndexRangeOffset)))
+                 : stage13IndexReadableSpan
+                     ? stage13IndexReadableSpan.data : nullptr)
           : nullptr;
   const bool stage13MappedIndexEligible =
       stage13MappedIndexBytes != nullptr;
@@ -44005,8 +44302,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               posInfo.size != 0u
           ? (stage13LateDescriptorPositionBytes != nullptr
                  ? stage13LateDescriptorPositionBytes
-                 : reinterpret_cast<const unsigned char*>(
-                       posSlice.mapPtr(0u)))
+                 : stage13PositionReadableSpan
+                     ? stage13PositionReadableSpan.data : nullptr)
           : nullptr;
   stage13SourceTiming.pause();
   const bool stage13ReferencedPositionEligible =
@@ -44842,24 +45139,62 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         indexed ? int64_t(BaseVertexIndex) + int64_t(MinVertexIndex)
                 : int64_t(StartVal);
     const uint32_t terrainVertexCount = indexed ? NumVertices : CountVal;
+    Rc<DxvkResourceAllocation> terrainMappedAllocation = nullptr;
+    dxvk::war3::memory::War3CpuReadableBufferSpan
+        terrainPositionReadableSpan = {};
+    const bool terrainUpSourceExact =
+        DynamicSysmemVBOs && posStream < caps::MaxStreams &&
+        m_war3PerDrawUpload.vbSourceValid[posStream] &&
+        m_war3PerDrawUpload.vbSourceResource[posStream] ==
+            reinterpret_cast<uintptr_t>(vbCommon) &&
+        m_war3PerDrawUpload.vbUploadBytes[posStream] != nullptr &&
+        m_war3PerDrawUpload.vbUploadLength[posStream] != 0u;
+    if (terrainUpSourceExact) {
+      terrainPositionReadableSpan =
+          dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+              m_war3PerDrawUpload.vbUploadBytes[posStream],
+              m_war3PerDrawUpload.vbUploadLength[posStream], 0u,
+              m_war3PerDrawUpload.vbUploadLength[posStream],
+              m_war3PerDrawUpload.vbSourceResource[posStream],
+              m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream],
+              m_war3PerDrawUpload.vbSourceSequence[posStream],
+              m_war3PerDrawUpload.vbSourceContentGeneration[posStream], true});
+    } else if (!DynamicSysmemVBOs && vbCommon != nullptr &&
+               !vbCommon->NeedsReadback()) {
+      terrainMappedAllocation = vbCommon->GetMappedSlice();
+      if (terrainMappedAllocation != nullptr) {
+        const auto allocationInfo = terrainMappedAllocation->getBufferInfo();
+        const bool hostVisible =
+            (terrainMappedAllocation->getMemoryProperties() &
+             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        terrainPositionReadableSpan =
+            dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                terrainMappedAllocation->mapPtr(),
+                uint64_t(allocationInfo.size), uint64_t(posSlice.offset()),
+                uint64_t(posSlice.length()),
+                reinterpret_cast<uintptr_t>(vbCommon),
+                vbCommon->War3IdentityGeneration(),
+                vbCommon->War3MapAllocationGeneration(),
+                vbCommon->War3ContentGeneration(), hostVisible});
+      }
+    }
     const bool terrainUploadSourceKeyValid =
-        DynamicSysmemVBOs &&
+        terrainUpSourceExact && terrainPositionReadableSpan &&
         dxvk::war3::internal::
-            kShadowS1TerrainBoundsCacheUploadSourceKeyEnabled &&
-        posStream < caps::MaxStreams &&
-        m_war3PerDrawUpload.vbSourceValid[posStream];
+            kShadowS1TerrainBoundsCacheUploadSourceKeyEnabled;
     uint64_t terrainDynamicSliceContentKey = 0u;
     bool terrainDynamicSliceContentKeyValid = false;
     if constexpr (dxvk::war3::internal::
                       kShadowS1TerrainBoundsCacheDynamicSliceKeyEnabled) {
       const bool terrainDynamicSliceKeyValid =
           !DynamicSysmemVBOs && posDynamic && vbCommon != nullptr &&
-          posSlice.buffer() != nullptr;
+          terrainPositionReadableSpan;
       terrainDynamicSliceContentKey =
           (terrainDynamicSliceKeyValid && terrainFirstVertex >= 0 &&
            terrainVertexCount != 0u)
               ? War3ComputeTerrainBoundsContentKey(
-                    posSlice, posStride, uint32_t(declInfo.posOffset),
+                    terrainPositionReadableSpan, posStride,
+                    uint32_t(declInfo.posOffset),
                     posFormat, uint32_t(terrainFirstVertex),
                     terrainVertexCount)
               : 0u;
@@ -44908,8 +45243,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     if (terrainFirstVertex >= 0 && terrainVertexCount != 0u) {
       shadowCaptureBoundsTiming.enter(
           War3ShadowCaptureBoundsPhase::TerrainBoundsCompute);
-      if (War3ComputeCachedMappedTerrainBoundsFromSlice(
-              posSlice, posStride, uint32_t(declInfo.posOffset), posFormat,
+      if (War3ComputeCachedMappedTerrainBoundsFromSpan(
+              terrainPositionReadableSpan, posStride,
+              uint32_t(declInfo.posOffset), posFormat,
               uint32_t(terrainFirstVertex), terrainVertexCount,
               allowTerrainBoundsCache, terrainBounds, terrainStableKeyBase,
               terrainStableKeyOffset, terrainStableKeyLength,
@@ -45040,8 +45376,25 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   }
 
   dxvk::war3::render::ShadowCaptureBudgetPolicy budgetPolicy = {};
-  budgetPolicy.hardBudgetBytes = m_war3ShadowFallbackBudgetCapBytes;
-  budgetPolicy.usedBudgetBytes = m_war3ShadowFallbackBudgetUsedBytes;
+  const bool arenaCaptureEnabled =
+      dxvk::war3::render::IsShadowArenaCaptureEnabled();
+  const uint64_t arenaUsedBytes = arenaCaptureEnabled
+      ? dxvk::war3::memory::ShadowArena_UsedBytes() : 0u;
+  const uint64_t arenaRemainingBytes = arenaCaptureEnabled
+      ? dxvk::war3::memory::ShadowArena_RemainingBytes()
+      : std::numeric_limits<uint64_t>::max();
+  const uint64_t configuredRemainingBytes =
+      m_war3ShadowFallbackBudgetUsedBytes < m_war3ShadowFallbackBudgetCapBytes
+      ? m_war3ShadowFallbackBudgetCapBytes -
+          m_war3ShadowFallbackBudgetUsedBytes
+      : 0u;
+  const uint64_t admissionRemainingBytes = arenaCaptureEnabled
+      ? std::min(configuredRemainingBytes, arenaRemainingBytes)
+      : configuredRemainingBytes;
+  budgetPolicy.usedBudgetBytes = arenaCaptureEnabled
+      ? arenaUsedBytes : m_war3ShadowFallbackBudgetUsedBytes;
+  budgetPolicy.hardBudgetBytes =
+      budgetPolicy.usedBudgetBytes + admissionRemainingBytes;
   budgetPolicy.posBytes = fallbackPosBudgetBytes;
   budgetPolicy.blendBytes = fallbackBlendBudgetBytes;
   budgetPolicy.uvBytes = fallbackUvBudgetBytes;
@@ -45091,7 +45444,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       budgetPolicy.posBytes + budgetPolicy.blendBytes +
       (captureAlphaTest ? budgetPolicy.uvBytes : 0ull) +
       budgetPolicy.indexBytes;
-  m_war3ShadowFallbackBudgetUsedBytes += acceptedFallbackBytes;
+  if (!arenaCaptureEnabled)
+    m_war3ShadowFallbackBudgetUsedBytes += acceptedFallbackBytes;
+  else
+    m_war3ShadowFallbackBudgetUsedBytes = arenaUsedBytes;
   if (m_war3ShadowFallbackBudgetUsedBytes > m_war3ShadowFallbackBudgetCapBytes) {
     m_war3ShadowFallbackBudgetExceeded = true;
     m_war3Scene.shadowStats.budgetExceeded = 1u;
@@ -45107,8 +45463,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   shadowCapturePostTiming.enter(War3ShadowCapturePostPhase::FreezeBuffers);
   uint32_t capturedPositionOffset = uint32_t(declInfo.posOffset);
   VkFormat capturedPositionFormat = posFormat;
-  int32_t capturedVertexOffset = BaseVertexIndex;
-  uint32_t capturedNumVertices = NumVertices;
+  int32_t capturedVertexOffset = exactIndexedFreezeTrimmed
+      ? int32_t(int64_t(BaseVertexIndex) -
+                int64_t(exactIndexedFreezeFirstVertex))
+      : BaseVertexIndex;
+  uint32_t capturedNumVertices = exactIndexedFreezeTrimmed
+      ? exactIndexedFreezeVertexCount : NumVertices;
   if (gpuSkinLegacyBacking) {
     const auto& lease = gpuSkinResolved->lease;
     posAlloc = lease.slice.buffer();
@@ -45127,48 +45487,229 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
   }
 
-  auto tryFreezeStableUploadSnapshot =
-      [&](const DxvkBufferSlice& srcSlice, VkDeviceSize bytes,
-          bool requiresStableUploadSource, Rc<DxvkBuffer>& ioAlloc,
-          DxvkResourceBufferInfo& ioInfo) -> bool {
-    if (!requiresStableUploadSource)
+  struct FrameFreezePlan {
+    DxvkBufferSlice sourceSlice;
+    VkDeviceSize bytes = 0u;
+    const void* stableSourceBytes = nullptr;
+    VkDeviceSize stableSourceLength = 0u;
+    Rc<DxvkBuffer>* outputStorage = nullptr;
+    DxvkResourceBufferInfo* outputInfo = nullptr;
+    War3FrameFreezeKey cacheKey = {};
+    bool cacheable = false;
+    dxvk::war3::memory::ShadowArenaAllocationTag allocationTag =
+        dxvk::war3::memory::ShadowArenaAllocationTag::Unknown;
+    dxvk::war3::memory::ShadowArenaSourceClass sourceClass =
+        dxvk::war3::memory::ShadowArenaSourceClass::Model;
+  };
+
+  const uint64_t freezeFrameSerial = m_war3ShadowPersistentFrameSerial + 1u;
+  if (m_war3FrameFreezeCatalogSerial != freezeFrameSerial) {
+    m_war3FrameFreezeCatalog.clear();
+    m_war3FrameFreezeCatalogSerial = freezeFrameSerial;
+    m_war3FrameFreezeUniqueSourceBytes = 0u;
+    m_war3FrameFreezeDuplicateBytesSaved = 0u;
+  }
+
+  const auto commonForStream = [&](uint32_t stream) -> D3D9CommonBuffer* {
+    if (stream >= caps::MaxStreams)
+      return nullptr;
+    auto* source = m_state.vertexBuffers[stream].vertexBuffer.ptr();
+    return source != nullptr ? source->GetCommonBuffer() : nullptr;
+  };
+
+  const auto buildFreezeKey =
+      [&](War3FrameFreezeStreamType streamType,
+          const DxvkBufferSlice& sourceSlice, VkDeviceSize bytes,
+          bool stableUpload, uint32_t sourceStream,
+          D3D9CommonBuffer* common, War3FrameFreezeKey& key) -> bool {
+    key = {};
+    if (sourceSlice.buffer() == nullptr || bytes == 0u ||
+        bytes > sourceSlice.length() || freezeFrameSerial == 0u)
       return false;
 
-    auto srcBuffer = srcSlice.buffer();
-    if (srcBuffer == nullptr || bytes == 0)
-      return false;
-    if ((srcBuffer->memFlags() & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0)
-      return false;
-
-    void* srcPtr = srcBuffer->mapPtr(srcSlice.offset());
-    if (srcPtr == nullptr)
-      return false;
-
-    VkDeviceSize finalOffset = 0;
-    auto frozenAlloc = War3AllocFreezeBuffer(bytes, finalOffset);
-    if (frozenAlloc == nullptr)
-      return false;
-
-    VkDeviceSize freezeOffset = 0;
-    void* snapshotPtr = nullptr;
-    auto snapshotAlloc =
-        War3AllocFreezeBuffer(bytes, freezeOffset, true, &snapshotPtr);
-    if (snapshotAlloc == nullptr || snapshotPtr == nullptr)
-      return false;
-
-    std::memcpy(snapshotPtr, srcPtr, static_cast<size_t>(bytes));
-    if (isStage13WorldObjectDraw) {
-      m_war3Scene.shadowStats.stage13CpuSnapshotCopyBytes +=
-          uint64_t(bytes);
-      m_war3Scene.shadowStats.stage13FreezeCopyBytes += uint64_t(bytes);
+    key.sourceBuffer = sourceSlice.buffer().ptr();
+    key.size = bytes;
+    key.frameSerial = freezeFrameSerial;
+    key.streamType = streamType;
+    if (stableUpload) {
+      if (streamType == War3FrameFreezeStreamType::Index) {
+        if (common == nullptr || !m_war3PerDrawUpload.ibSourceValid ||
+            m_war3PerDrawUpload.ibSourceResource == 0u ||
+            m_war3PerDrawUpload.ibSourceIdentityGeneration == 0u ||
+            m_war3PerDrawUpload.ibSourceSequence == 0u ||
+            m_war3PerDrawUpload.ibSourceContentGeneration == 0u ||
+            reinterpret_cast<uintptr_t>(common) !=
+                m_war3PerDrawUpload.ibSourceResource ||
+            common->War3IdentityGeneration() !=
+                m_war3PerDrawUpload.ibSourceIdentityGeneration ||
+            common->GetMappingBufferSequenceNumber() !=
+                m_war3PerDrawUpload.ibSourceSequence ||
+            common->War3ContentGeneration() !=
+                m_war3PerDrawUpload.ibSourceContentGeneration)
+          return false;
+        const auto sourceMapping = common->GetMappedSlice();
+        if (sourceMapping == nullptr)
+          return false;
+        key.allocationIdentity =
+            reinterpret_cast<uintptr_t>(sourceMapping.ptr());
+        key.sourceOffset = m_war3PerDrawUpload.ibSourceOffset;
+        key.sourceLength = m_war3PerDrawUpload.ibSourceLength;
+        key.sourceElementStride = m_war3PerDrawUpload.ibType ==
+                VK_INDEX_TYPE_UINT16
+            ? sizeof(uint16_t)
+            : sizeof(uint32_t);
+        key.sourceElementSize = key.sourceElementStride;
+        key.sourceOwner = m_war3PerDrawUpload.ibSourceResource;
+        key.identityGeneration =
+            m_war3PerDrawUpload.ibSourceIdentityGeneration;
+        key.allocationGeneration = m_war3PerDrawUpload.ibSourceSequence;
+        key.contentGeneration =
+            m_war3PerDrawUpload.ibSourceContentGeneration;
+      } else {
+        if (common == nullptr || sourceStream >= caps::MaxStreams ||
+            !m_war3PerDrawUpload.vbSourceValid[sourceStream] ||
+            m_war3PerDrawUpload.vbSourceResource[sourceStream] == 0u ||
+            m_war3PerDrawUpload.vbSourceIdentityGeneration[sourceStream] == 0u ||
+            m_war3PerDrawUpload.vbSourceSequence[sourceStream] == 0u ||
+            m_war3PerDrawUpload.vbSourceContentGeneration[sourceStream] == 0u ||
+            reinterpret_cast<uintptr_t>(common) !=
+                m_war3PerDrawUpload.vbSourceResource[sourceStream] ||
+            common->War3IdentityGeneration() !=
+                m_war3PerDrawUpload.vbSourceIdentityGeneration[sourceStream] ||
+            common->GetMappingBufferSequenceNumber() !=
+                m_war3PerDrawUpload.vbSourceSequence[sourceStream] ||
+            common->War3ContentGeneration() !=
+                m_war3PerDrawUpload.vbSourceContentGeneration[sourceStream])
+          return false;
+        const auto sourceMapping = common->GetMappedSlice();
+        if (sourceMapping == nullptr)
+          return false;
+        key.allocationIdentity =
+            reinterpret_cast<uintptr_t>(sourceMapping.ptr());
+        key.sourceElementStride =
+            m_war3PerDrawUpload.vbSourceElementStride[sourceStream];
+        key.sourceElementSize =
+            m_war3PerDrawUpload.vbSourceElementSize[sourceStream];
+        const auto& uploadSlice =
+            m_war3PerDrawUpload.vbSlices[sourceStream];
+        if (uploadSlice.buffer() == nullptr ||
+            uploadSlice.buffer() != sourceSlice.buffer() ||
+            sourceSlice.offset() < uploadSlice.offset() ||
+            key.sourceElementStride == 0u || key.sourceElementSize == 0u)
+          return false;
+        const uint64_t localByteOffset =
+            uint64_t(sourceSlice.offset() - uploadSlice.offset());
+        if (localByteOffset % key.sourceElementSize != 0u ||
+            uint64_t(bytes) % key.sourceElementSize != 0u)
+          return false;
+        const uint64_t firstElement =
+            localByteOffset / key.sourceElementSize;
+        const uint64_t elementCount = uint64_t(bytes) / key.sourceElementSize;
+        if (elementCount == 0u)
+          return false;
+        const uint64_t canonicalOffset =
+            uint64_t(m_war3PerDrawUpload.vbSourceOffset[sourceStream]) +
+            firstElement * uint64_t(key.sourceElementStride);
+        const uint64_t canonicalLength =
+            (elementCount - 1u) * uint64_t(key.sourceElementStride) +
+            uint64_t(key.sourceElementSize);
+        if (canonicalOffset >
+                uint64_t(std::numeric_limits<VkDeviceSize>::max()) ||
+            canonicalLength >
+                uint64_t(std::numeric_limits<VkDeviceSize>::max()))
+          return false;
+        key.sourceOffset = VkDeviceSize(canonicalOffset);
+        key.sourceLength = VkDeviceSize(canonicalLength);
+        key.sourceOwner =
+            m_war3PerDrawUpload.vbSourceResource[sourceStream];
+        key.identityGeneration =
+            m_war3PerDrawUpload.vbSourceIdentityGeneration[sourceStream];
+        key.allocationGeneration =
+            m_war3PerDrawUpload.vbSourceSequence[sourceStream];
+        key.contentGeneration =
+            m_war3PerDrawUpload.vbSourceContentGeneration[sourceStream];
+      }
+    } else {
+      if (common == nullptr || common->War3IdentityGeneration() == 0u ||
+          common->War3MapAllocationGeneration() == 0u ||
+          common->War3ContentGeneration() == 0u)
+        return false;
+      const auto sourceStorage = sourceSlice.buffer()->storage();
+      if (sourceStorage == nullptr)
+        return false;
+      key.sourceOffset = sourceSlice.offset();
+      key.sourceLength = sourceSlice.length();
+      key.allocationIdentity =
+          reinterpret_cast<uintptr_t>(sourceStorage.ptr());
+      key.sourceOwner = reinterpret_cast<uintptr_t>(common);
+      key.identityGeneration = common->War3IdentityGeneration();
+      key.allocationGeneration = common->War3MapAllocationGeneration();
+      key.contentGeneration = common->War3ContentGeneration();
     }
-    EmitCs([cDst = frozenAlloc, cDstOff = finalOffset, cSrc = snapshotAlloc,
-            cSrcOff = freezeOffset, cBytes = bytes](DxvkContext* ctx) {
-      ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
-    });
-    ioAlloc = frozenAlloc;
-    ioInfo = frozenAlloc->getSliceInfo(finalOffset, bytes);
-    return true;
+    return key.allocationIdentity != 0u && key.sourceOwner != 0u;
+  };
+
+  std::array<FrameFreezePlan, 4> freezePlans = {};
+  uint32_t freezePlanCount = 0u;
+  bool freezePlanInvalid = false;
+  const auto appendFreezePlan =
+      [&](War3FrameFreezeStreamType streamType,
+          dxvk::war3::memory::ShadowArenaAllocationTag allocationTag,
+          const DxvkBufferSlice& sourceSlice, VkDeviceSize bytes,
+          bool stableUpload, uint32_t sourceStream,
+          D3D9CommonBuffer* common, const void* stableBytes,
+          VkDeviceSize stableLength, Rc<DxvkBuffer>& outputStorage,
+          DxvkResourceBufferInfo& outputInfo) {
+    if (freezePlanCount >= freezePlans.size() ||
+        sourceSlice.buffer() == nullptr || bytes == 0u ||
+        bytes > sourceSlice.length() ||
+        (stableUpload && (stableBytes == nullptr || bytes > stableLength))) {
+      freezePlanInvalid = true;
+      return;
+    }
+
+    War3FrameFreezeKey key = {};
+    const bool cacheable = buildFreezeKey(
+        streamType, sourceSlice, bytes, stableUpload, sourceStream, common, key);
+    if (cacheable) {
+      const auto cached = m_war3FrameFreezeCatalog.find(key);
+      if (cached != m_war3FrameFreezeCatalog.end() &&
+          cached->second.frozenBuffer != nullptr &&
+          cached->second.frozenInfo.buffer != VK_NULL_HANDLE &&
+          cached->second.frozenInfo.size >= bytes) {
+        outputStorage = cached->second.frozenBuffer;
+        outputInfo = cached->second.frozenInfo;
+        m_war3FrameFreezeDuplicateBytesSaved += uint64_t(bytes);
+        const auto sourceClass = stableUpload
+            ? dxvk::war3::memory::ShadowArenaSourceClass::Up
+            : (terrainTileCaster || terrainDoodadCaster || terrainS1Caster)
+                ? dxvk::war3::memory::ShadowArenaSourceClass::Terrain
+                : (vertexBlendEnabled || gpuSkinFormalShadowMode)
+                    ? dxvk::war3::memory::ShadowArenaSourceClass::Skinned
+                    : dxvk::war3::memory::ShadowArenaSourceClass::Model;
+        dxvk::war3::memory::ShadowArena_NoteFreezeCatalogBytes(
+            allocationTag, sourceClass, 0u, uint64_t(bytes));
+        return;
+      }
+    }
+
+    auto& plan = freezePlans[freezePlanCount++];
+    plan.sourceSlice = sourceSlice;
+    plan.bytes = bytes;
+    plan.stableSourceBytes = stableUpload ? stableBytes : nullptr;
+    plan.stableSourceLength = stableUpload ? stableLength : 0u;
+    plan.outputStorage = &outputStorage;
+    plan.outputInfo = &outputInfo;
+    plan.cacheKey = key;
+    plan.cacheable = cacheable;
+    plan.allocationTag = allocationTag;
+    plan.sourceClass = stableUpload
+        ? dxvk::war3::memory::ShadowArenaSourceClass::Up
+        : (terrainTileCaster || terrainDoodadCaster || terrainS1Caster)
+            ? dxvk::war3::memory::ShadowArenaSourceClass::Terrain
+            : (vertexBlendEnabled || gpuSkinFormalShadowMode)
+                ? dxvk::war3::memory::ShadowArenaSourceClass::Skinned
+                : dxvk::war3::memory::ShadowArenaSourceClass::Model;
   };
 
   if (shouldFreezePosBuffer) {
@@ -45176,57 +45717,246 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       m_war3Scene.shadowStats.gpuSkinShadowBackingFallbackCount++;
       ++m_war3GpuSkinP2BackingFallbacks;
     }
-    VkDeviceSize bytes = posBytesNeeded;
-    const bool posRequiresStableUploadSource =
+    const bool stable =
         DynamicSysmemVBOs && m_war3PerDrawUpload.vbValid[posStream];
-    if (!tryFreezeStableUploadSnapshot(posSlice, bytes,
-                                       posRequiresStableUploadSource, posAlloc,
-                                       posInfo)) {
-      VkDeviceSize freezeOffset = 0;
-      auto frozenAlloc = War3AllocFreezeBuffer(bytes, freezeOffset);
-      if (frozenAlloc) {
-        if (isStage13WorldObjectDraw)
-          m_war3Scene.shadowStats.stage13FreezeCopyBytes += uint64_t(bytes);
-        auto srcBuffer = posSlice.buffer();
-        EmitCs([cDst = frozenAlloc, cDstOff = freezeOffset, cSrc = srcBuffer,
-                cSrcOff = posSlice.offset(),
-                cBytes = bytes](DxvkContext *ctx) {
-          ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
-        });
-        posAlloc = frozenAlloc;
-        posInfo = frozenAlloc->getSliceInfo(freezeOffset, bytes);
-      } else {
-        WAR3_RENDER_LOG("DEBUG: Freeze POS Failed (Alloc Null)\n");
-      }
-    }
+    const bool positionRangeValid =
+        posFreezeByteOffset <= posSlice.length() &&
+        posBytesNeeded <= posSlice.length() - posFreezeByteOffset;
+    const auto positionFreezeSlice = positionRangeValid
+        ? posSlice.subSlice(posFreezeByteOffset, posBytesNeeded)
+        : DxvkBufferSlice();
+    const auto* positionStableBytes = stable &&
+            posFreezeByteOffset <=
+                VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream])
+        ? reinterpret_cast<const uint8_t*>(
+              m_war3PerDrawUpload.vbUploadBytes[posStream]) +
+              size_t(posFreezeByteOffset)
+        : nullptr;
+    const VkDeviceSize positionStableLength = stable &&
+            posFreezeByteOffset <=
+                VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream])
+        ? VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream]) -
+              posFreezeByteOffset
+        : 0u;
+    appendFreezePlan(
+        War3FrameFreezeStreamType::Position,
+        dxvk::war3::memory::ShadowArenaAllocationTag::Position,
+        positionFreezeSlice, posBytesNeeded, stable, posStream,
+        gpuSkinLegacyBacking ? nullptr : commonForStream(posStream),
+        positionStableBytes, positionStableLength,
+        posAlloc, posInfo);
   }
 
   if (shouldFreezeBlendBuffer) {
-    VkDeviceSize bytes = blendBytesNeeded;
-    const bool blendRequiresStableUploadSource =
+    const bool stable =
         DynamicSysmemVBOs && m_war3PerDrawUpload.vbValid[blendStream];
-    if (!tryFreezeStableUploadSnapshot(blendSlice, bytes,
-                                       blendRequiresStableUploadSource,
-                                       blendAlloc, blendInfo)) {
-      VkDeviceSize freezeOffset = 0;
-      auto frozenAlloc = War3AllocFreezeBuffer(bytes, freezeOffset);
-      if (frozenAlloc) {
-        if (isStage13WorldObjectDraw)
-          m_war3Scene.shadowStats.stage13FreezeCopyBytes += uint64_t(bytes);
-        auto srcBuffer = blendSlice.buffer();
-        EmitCs([cDst = frozenAlloc, cDstOff = freezeOffset, cSrc = srcBuffer,
-                cSrcOff = blendSlice.offset(),
-                cBytes = bytes](DxvkContext *ctx) {
-          ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
-        });
-        blendAlloc = frozenAlloc;
-        blendInfo = frozenAlloc->getSliceInfo(freezeOffset, bytes);
+    const bool blendRangeValid =
+        blendFreezeByteOffset <= blendSlice.length() &&
+        blendBytesNeeded <= blendSlice.length() - blendFreezeByteOffset;
+    const auto blendFreezeSlice = blendRangeValid
+        ? blendSlice.subSlice(blendFreezeByteOffset, blendBytesNeeded)
+        : DxvkBufferSlice();
+    const auto* blendStableBytes = stable &&
+            blendFreezeByteOffset <=
+                VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[blendStream])
+        ? reinterpret_cast<const uint8_t*>(
+              m_war3PerDrawUpload.vbUploadBytes[blendStream]) +
+              size_t(blendFreezeByteOffset)
+        : nullptr;
+    const VkDeviceSize blendStableLength = stable &&
+            blendFreezeByteOffset <=
+                VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[blendStream])
+        ? VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[blendStream]) -
+              blendFreezeByteOffset
+        : 0u;
+    appendFreezePlan(
+        War3FrameFreezeStreamType::Blend,
+        dxvk::war3::memory::ShadowArenaAllocationTag::Blend,
+        blendFreezeSlice, blendBytesNeeded, stable, blendStream,
+        commonForStream(blendStream),
+        blendStableBytes, blendStableLength,
+        blendAlloc, blendInfo);
+  }
+
+  const bool freezeSeparateUv = captureAlphaTest && resolvedUvBinding == 2u &&
+      uvAlloc != nullptr && s_freezeDynamicShadowBuffers &&
+      (uvDynamic || forceFreezeUnitLikeGeometry ||
+       forceFreezeFallbackWorldGeometry);
+  if (freezeSeparateUv) {
+    const bool uvRangeValid =
+        uvFreezeByteOffset <= uvSlice.length() &&
+        uvBytesNeeded <= uvSlice.length() - uvFreezeByteOffset;
+    const auto uvFreezeSlice = uvRangeValid
+        ? uvSlice.subSlice(uvFreezeByteOffset, uvBytesNeeded)
+        : DxvkBufferSlice();
+    const auto* uvStableBytes = uvRequiresStableUploadSource &&
+            uvFreezeByteOffset <=
+                VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[uvStream])
+        ? reinterpret_cast<const uint8_t*>(
+              m_war3PerDrawUpload.vbUploadBytes[uvStream]) +
+              size_t(uvFreezeByteOffset)
+        : nullptr;
+    const VkDeviceSize uvStableLength = uvRequiresStableUploadSource &&
+            uvFreezeByteOffset <=
+                VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[uvStream])
+        ? VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[uvStream]) -
+              uvFreezeByteOffset
+        : 0u;
+    appendFreezePlan(
+        War3FrameFreezeStreamType::Uv,
+        dxvk::war3::memory::ShadowArenaAllocationTag::Uv,
+        uvFreezeSlice, uvBytesNeeded, uvRequiresStableUploadSource, uvStream,
+        commonForStream(uvStream),
+        uvStableBytes, uvStableLength,
+        uvAlloc, uvInfo);
+  }
+
+  if (shouldFreezeIndexBuffer) {
+    const bool stable =
+        DynamicSysmemIBO && m_war3PerDrawUpload.ibValid;
+    auto* indexCommon = m_state.indices.ptr() != nullptr
+        ? m_state.indices.ptr()->GetCommonBuffer() : nullptr;
+    appendFreezePlan(
+        War3FrameFreezeStreamType::Index,
+        dxvk::war3::memory::ShadowArenaAllocationTag::Index,
+        idxSlice, idxBytesNeeded, stable, 0u, indexCommon,
+        stable ? m_war3PerDrawUpload.ibUploadBytes : nullptr,
+        stable ? m_war3PerDrawUpload.ibUploadLength : 0u,
+        idxAlloc, idxInfo);
+  }
+
+  if (freezePlanInvalid) {
+    m_war3Scene.shadowStats.budgetExceeded = 1u;
+    m_war3ShadowFallbackBudgetExceeded = true;
+    return;
+  }
+
+  std::array<Rc<DxvkBuffer>, 4> frozenStorage = {};
+  std::array<VkDeviceSize, 4> frozenOffset = {};
+  std::array<Rc<DxvkBuffer>, 4> snapshotStorage = {};
+  std::array<VkDeviceSize, 4> snapshotOffset = {};
+  dxvk::war3::memory::ShadowArenaBundleTransaction arenaTransaction = {};
+  bool arenaTransactionActive = false;
+  if (freezePlanCount != 0u && arenaCaptureEnabled) {
+    std::array<dxvk::war3::memory::ShadowArenaBundleRequest, 4> requests = {};
+    for (uint32_t i = 0u; i < freezePlanCount; ++i) {
+      const uint64_t alignedBytes =
+          (uint64_t(freezePlans[i].bytes) + 255u) & ~uint64_t(255u);
+      if (alignedBytes == 0u ||
+          alignedBytes > std::numeric_limits<uint32_t>::max()) {
+        freezePlanInvalid = true;
+        break;
+      }
+      requests[i].size = uint32_t(alignedBytes);
+      requests[i].alignment = 256u;
+      requests[i].tag = freezePlans[i].allocationTag;
+    }
+    if (!freezePlanInvalid &&
+        dxvk::war3::memory::ShadowArena_BeginBundle(
+            requests.data(), freezePlanCount, arenaTransaction)) {
+      arenaTransactionActive = true;
+      for (uint32_t i = 0u; i < freezePlanCount; ++i) {
+        frozenStorage[i] = arenaTransaction.allocations[i].storage;
+        frozenOffset[i] = arenaTransaction.allocations[i].offset;
+      }
+    } else {
+      freezePlanInvalid = true;
+    }
+  } else if (freezePlanCount != 0u) {
+    for (uint32_t i = 0u; i < freezePlanCount; ++i) {
+      frozenStorage[i] = War3AllocFreezeBuffer(
+          freezePlans[i].bytes, frozenOffset[i]);
+      if (frozenStorage[i] == nullptr) {
+        freezePlanInvalid = true;
+        break;
       }
     }
   }
 
-  // position/blend freeze 后再解析共享 UV alias。Binding 2 已在 persistent
-  // probe 前完成解析，这里只需要处理它自己的 freeze。
+  if (!freezePlanInvalid) {
+    for (uint32_t i = 0u; i < freezePlanCount; ++i) {
+      const auto& plan = freezePlans[i];
+      if (plan.stableSourceBytes == nullptr)
+        continue;
+      void* snapshotPtr = nullptr;
+      snapshotStorage[i] = War3AllocFreezeBuffer(
+          plan.bytes, snapshotOffset[i], true, &snapshotPtr);
+      if (snapshotStorage[i] == nullptr || snapshotPtr == nullptr ||
+          plan.bytes > plan.stableSourceLength ||
+          plan.bytes > VkDeviceSize(std::numeric_limits<size_t>::max())) {
+        freezePlanInvalid = true;
+        break;
+      }
+      std::memcpy(snapshotPtr, plan.stableSourceBytes,
+                  static_cast<size_t>(plan.bytes));
+      if (isStage13WorldObjectDraw) {
+        m_war3Scene.shadowStats.stage13CpuSnapshotCopyBytes +=
+            uint64_t(plan.bytes);
+      }
+    }
+  }
+
+  if (freezePlanInvalid) {
+    if (arenaTransactionActive)
+      dxvk::war3::memory::ShadowArena_RollbackBundle(arenaTransaction);
+    m_war3Scene.shadowStats.budgetExceeded = 1u;
+    m_war3ShadowFallbackBudgetExceeded = true;
+    return;
+  }
+
+  if (arenaTransactionActive &&
+      !dxvk::war3::memory::ShadowArena_CommitBundle(arenaTransaction)) {
+    m_war3Scene.shadowStats.budgetExceeded = 1u;
+    m_war3ShadowFallbackBudgetExceeded = true;
+    return;
+  }
+
+  struct FrameFreezeCopyCommand {
+    Rc<DxvkBuffer> destination;
+    VkDeviceSize destinationOffset = 0u;
+    Rc<DxvkBuffer> source;
+    VkDeviceSize sourceOffset = 0u;
+    VkDeviceSize bytes = 0u;
+  };
+  std::array<FrameFreezeCopyCommand, 4> freezeCopies = {};
+  for (uint32_t i = 0u; i < freezePlanCount; ++i) {
+    auto& plan = freezePlans[i];
+    auto& copy = freezeCopies[i];
+    copy.destination = frozenStorage[i];
+    copy.destinationOffset = frozenOffset[i];
+    copy.source = plan.stableSourceBytes != nullptr
+        ? snapshotStorage[i] : plan.sourceSlice.buffer();
+    copy.sourceOffset = plan.stableSourceBytes != nullptr
+        ? snapshotOffset[i] : plan.sourceSlice.offset();
+    copy.bytes = plan.bytes;
+    *plan.outputStorage = frozenStorage[i];
+    *plan.outputInfo =
+        frozenStorage[i]->getSliceInfo(frozenOffset[i], plan.bytes);
+    m_war3FrameFreezeUniqueSourceBytes += uint64_t(plan.bytes);
+    dxvk::war3::memory::ShadowArena_NoteFreezeCatalogBytes(
+        plan.allocationTag, plan.sourceClass, uint64_t(plan.bytes), 0u);
+    if (isStage13WorldObjectDraw)
+      m_war3Scene.shadowStats.stage13FreezeCopyBytes += uint64_t(plan.bytes);
+    if (plan.cacheable) {
+      m_war3FrameFreezeCatalog.insert_or_assign(
+          plan.cacheKey,
+          War3FrameFreezeEntry{
+              frozenStorage[i], *plan.outputInfo, uint64_t(plan.bytes)});
+    }
+  }
+  if (freezePlanCount != 0u) {
+    EmitCs([cCopies = std::move(freezeCopies),
+            cCopyCount = freezePlanCount](DxvkContext* ctx) {
+      for (uint32_t i = 0u; i < cCopyCount; ++i) {
+        const auto& copy = cCopies[i];
+        ctx->copyBuffer(copy.destination, copy.destinationOffset,
+                        copy.source, copy.sourceOffset, copy.bytes);
+      }
+    });
+  }
+
+  // Position/blend aliases are resolved only after their transaction has
+  // committed, so an alpha caster never observes a half-built bundle.
   if (captureAlphaTest) {
     if (resolvedUvBinding == 0u) {
       uvAlloc = posAlloc;
@@ -45235,57 +45965,29 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     } else if (resolvedUvBinding == 1u) {
       uvAlloc = blendAlloc;
       uvInfo = blendInfo;
-    } else if (resolvedUvBinding == 2u && uvAlloc != nullptr &&
-               s_freezeDynamicShadowBuffers &&
-               (uvDynamic || forceFreezeUnitLikeGeometry ||
-                forceFreezeFallbackWorldGeometry)) {
-      const VkDeviceSize bytes = uvBytesNeeded;
-      if (!tryFreezeStableUploadSnapshot(uvSlice, bytes,
-                                         uvRequiresStableUploadSource,
-                                         uvAlloc, uvInfo)) {
-        VkDeviceSize freezeOffset = 0;
-        auto frozenAlloc = War3AllocFreezeBuffer(bytes, freezeOffset);
-        if (frozenAlloc) {
-          if (isStage13WorldObjectDraw)
-            m_war3Scene.shadowStats.stage13FreezeCopyBytes += uint64_t(bytes);
-          auto srcBuffer = uvSlice.buffer();
-          EmitCs([cDst = frozenAlloc, cDstOff = freezeOffset,
-                  cSrc = srcBuffer, cSrcOff = uvSlice.offset(),
-                  cBytes = bytes](DxvkContext *ctx) {
-            ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
-          });
-          uvAlloc = frozenAlloc;
-          uvInfo = frozenAlloc->getSliceInfo(freezeOffset, bytes);
-        }
-      }
     }
   }
 
-  if (shouldFreezeIndexBuffer) {
-    VkDeviceSize bytes = idxBytesNeeded;
-    const bool idxRequiresStableUploadSource =
-        DynamicSysmemIBO && m_war3PerDrawUpload.ibValid;
-    if (!tryFreezeStableUploadSnapshot(idxSlice, bytes,
-                                       idxRequiresStableUploadSource, idxAlloc,
-                                       idxInfo)) {
-      VkDeviceSize freezeOffset = 0;
-      auto frozenAlloc = War3AllocFreezeBuffer(bytes, freezeOffset);
-      if (frozenAlloc) {
-        if (isStage13WorldObjectDraw)
-          m_war3Scene.shadowStats.stage13FreezeCopyBytes += uint64_t(bytes);
-        auto srcBuffer = idxSlice.buffer();
-        EmitCs([cDst = frozenAlloc, cDstOff = freezeOffset, cSrc = srcBuffer,
-                cSrcOff = idxSlice.offset(),
-                cBytes = bytes](DxvkContext *ctx) {
-          ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
-        });
-        idxAlloc = frozenAlloc;
-        idxInfo = frozenAlloc->getSliceInfo(freezeOffset, bytes);
-      } else {
-        WAR3_RENDER_LOG("DEBUG: Freeze IDX Failed (Alloc Null)\n");
-      }
-    }
+  if ((shouldFreezePosBuffer &&
+       (posAlloc == nullptr || posInfo.buffer == VK_NULL_HANDLE)) ||
+      (shouldFreezeBlendBuffer &&
+       (blendAlloc == nullptr || blendInfo.buffer == VK_NULL_HANDLE)) ||
+      (freezeSeparateUv &&
+       (uvAlloc == nullptr || uvInfo.buffer == VK_NULL_HANDLE)) ||
+      (shouldFreezeIndexBuffer &&
+       (idxAlloc == nullptr || idxInfo.buffer == VK_NULL_HANDLE))) {
+    m_war3Scene.shadowStats.budgetExceeded = 1u;
+    m_war3ShadowFallbackBudgetExceeded = true;
+    return;
   }
+
+  if (arenaCaptureEnabled)
+    m_war3ShadowFallbackBudgetUsedBytes =
+        dxvk::war3::memory::ShadowArena_UsedBytes();
+  m_war3Scene.shadowStats.fallbackBudgetUsedBytes =
+      m_war3ShadowFallbackBudgetUsedBytes;
+  m_war3Scene.shadowStats.fallbackArenaBytes =
+      dxvk::war3::memory::ShadowArena_UsedBytes();
 
   noteDynamicPoseUsage(dynamicShadowSource);
 
