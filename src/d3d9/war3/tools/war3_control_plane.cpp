@@ -4603,6 +4603,15 @@ json HandleCommand(const json& request) {
     return response;
   }
 
+  if (command == "retain_shadow_evidence") {
+    response["ok"] = true;
+    response["result"] = {
+        {"retentionRevision", RequestShadowEvidenceRetention()},
+        {"collectorAttached", IsShadowEvidenceCollectorAttached()},
+    };
+    return response;
+  }
+
   if (command == "start_shadow_pose_full_trace") {
     const uint32_t maxSeconds =
         (std::max)(uint32_t(1), payload.value("maxSeconds", 15u));

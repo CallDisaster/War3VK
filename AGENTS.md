@@ -1,5 +1,59 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-05（跨地图阴影 epoch、Arena quarantine 与 replay 原子发布静态候选）
+
+用户确认只有“光影测试图 → 退出 → 生与死”同进程链容易触发整批阴影全灭/逐个补回及
+`VK_ERROR_DEVICE_LOST`，冷启动直接进入后长期稳定。本轮据此修复跨地图 render session
+没有完整切断的问题；只完成静态/runnable/构建门，尚未做用户所需 A→B→A 物理地图门。
+
+**Present 安全点与 GPU 所有权**：
+
+- 地图退出回调先关闭运行时并只递增 reset request serial，再清理 JASS/地图侧 CPU 状态；
+  不再从非渲染线程直接 reset GPU Skin、Receiver、Arena 或 render-owned cache。
+- `PresentEx` 在最后一次 BeforeUi 后合并请求：当前 Arena generation 被原子 quarantine，
+  专用 completion fence 排在旧 session 全部命令之后；资源型 caster/freeze/persistent/S1
+  容器移入 retired-session 队列，只有 fence 完成才释放。Arena 没有可证明空闲的
+  generation 时 producer 保持关闭并 fail-closed，不按三帧索引强行回绕。
+- 新增进程单调、非零的统一 shadow map epoch，并同步重置 Manifest、模型 cache、Package
+  与 GPU Skin。draw-time capture、semantic append/populate、备用 validation 及 legacy
+  allocator reset 均有 pending-session 硬门，避免退出请求与场景发布之间的竞态。
+
+**Epoch 隔离、Receiver 与最终 replay 防线**：
+
+- map/device epoch 已写入 Manifest object/part/lease、current-draw/semantic key、frame-freeze、
+  最终 `War3ShadowCasterDraw` 和 `War3PipelineInput`；旧 epoch、零 epoch 或 A→B→A 地址复用
+  在 producer/receiver/replay 三处均拒绝。
+- `InvalidateMapEpoch` 排空旧 `std::async`，关闭并推进 persistent point worker epoch，清除
+  CSM last-good、TAA history、identity/coverage hold、点阴影与 volume-sun publication；保留
+  已分配 4096 CSM/TAA/point image，但其内容不再属于新地图。
+- 新增纯值 `ValidateWar3ShadowReplayDraw`，在 CSM、terrain mask 与 point cube 发生 clear/draw
+  前验证 epoch、有限矩阵、VB/IB/index type、checked range、actual index + signed base vertex、
+  non-indexed、blend/UV 及 GPU-skin source/palette generation/range。任一失败整份 candidate
+  fail-closed；只有完整预检/管线准备通过后才 clear 并发布。旧图最多保留同 epoch 8 帧；
+  新 epoch 没有完整图时显示无阴影，禁止跨图 last-good 与逐 caster 可见补回。
+- Unit 统计只接受 authoritative unit evidence 或 `shadowUnitIdentityProven`；蒙皮分类继续取
+  最终实际 route。
+
+**诊断、测试与交付边界**：
+
+- `runtime_status.json`/flight recorder 增加 requested/applied/current epoch、transition、
+  Arena quarantine/retire/completed、retired session、stale/replay reject、planned/replay/
+  validated/drawn、partial prevented、first-complete latency、point worker cancel/late reject。
+- 新增 attach-only `AutoTest/run_attach_cross_map_shadow_gate.py`：只连接现有 Warcraft PID，
+  不启动、不聚焦、不改优先级、不终止游戏；epoch 变化时固定滚动证据，并记录状态、截图与
+  153/4101 事件差异。地图切换仍须用户操作。
+- 全量 `test_*_static.py` 456/456 PASS；15/15 Win32 Meson runnable PASS；Win32 build PASS，
+  `ninja -C build32 -n` no-work，目标文件 `git diff --check` 只有既有 LF/CRLF 提示。
+- build32 候选为 33,721,526 bytes，SHA-256
+  `109A46B88B18E96BAB75F0A43F038A72F78A3CC53B6B020B398158812EF2A5C3`。由于
+  `worldeditydwe.exe` PID 21984 仍在运行，未覆盖作者目录；
+  `E:\Work\Warcraft III\d3d9.dll` 仍是上一候选
+  `AD7A54BC9707F724E1D8B8C527B0508162622DBFBDBF26655DD2343DB895A2D3`。
+
+**不得越界宣称**：静态门证明请求合并、epoch/范围合同和 fence 所有权结构闭合，但不能
+替代 DirectInline 三轮、TAA v2 一轮及 A→B→A 的真实地图验收；在该门通过前不得宣称 TDR
+已经物理修复，也不得据此继续叠加 Persistent Package Consume、联合剔除或混合蒙皮。
+
 ## 🚨 2026-08-04（Polyline 点曲线、原生 S20 顺序与闪电阴影隔离静态候选）
 
 在 MathProgram/Curve Phase 1 上继续完成地图作者提交采样点的连续闪电路径，并修正

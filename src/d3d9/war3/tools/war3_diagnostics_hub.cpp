@@ -341,6 +341,9 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"arenaUsedBytes", frame.arenaUsedBytes},
         {"arenaResidentBytes", frame.arenaResidentBytes},
         {"arenaGeneration", frame.arenaGeneration},
+        {"arenaQuarantineCount", frame.arenaQuarantineCount},
+        {"arenaQuarantinedRetireSerial",
+         frame.arenaQuarantinedRetireSerial},
         {"arenaBusyReuseRejectCount", frame.arenaBusyReuseRejectCount},
         {"arenaOverflowCount", frame.arenaOverflowCount},
         {"arenaReservedBytes", frame.arenaReservedBytes},
@@ -371,6 +374,12 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"exactIndexDomainOversizeFallbackCount",
          frame.exactIndexDomainOversizeFallbackCount},
         {"arenaFrameIncomplete", frame.arenaFrameIncomplete},
+        {"shadowMapEpoch", frame.shadowMapEpoch},
+        {"shadowMapResetRequestedSerial",
+         frame.shadowMapResetRequestedSerial},
+        {"shadowMapResetAppliedSerial",
+         frame.shadowMapResetAppliedSerial},
+        {"shadowMapTransitionState", frame.shadowMapTransitionState},
         {"queueSubmittedSerial", frame.queueSubmittedSerial},
         {"queueCompletedSerial", frame.queueCompletedSerial},
         {"queueResult", frame.queueResult},
@@ -437,6 +446,9 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.arenaUsedBytes = arena.usedBytes;
   frame.arenaResidentBytes = arena.residentBytes;
   frame.arenaGeneration = arena.generation;
+  frame.arenaQuarantineCount = arena.quarantineCount;
+  frame.arenaQuarantinedRetireSerial =
+      arena.lastQuarantinedRetireSerial;
   frame.arenaBusyReuseRejectCount = arena.busyReuseRejectCount;
   frame.arenaOverflowCount = arena.overflowCount;
   frame.arenaReservedBytes = arena.reservedBytes;
@@ -466,6 +478,13 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.exactIndexDomainOversizeFallbackCount =
       cpuSpan.exactIndexDomainOversizeFallbackCount;
   frame.arenaFrameIncomplete = arena.frameIncomplete;
+  if (auto* device = dxvk::war3::GetActiveDevice()) {
+    const auto lifecycle = device->QueryWar3ShadowLifecycleDiagnostics();
+    frame.shadowMapEpoch = lifecycle.currentMapEpoch;
+    frame.shadowMapResetRequestedSerial = lifecycle.requestedResetSerial;
+    frame.shadowMapResetAppliedSerial = lifecycle.appliedResetSerial;
+    frame.shadowMapTransitionState = lifecycle.transitionState;
+  }
   frame.queueSubmittedSerial = arena.submittedSerial;
   frame.queueCompletedSerial = arena.completedSerial;
   if (auto* device = dxvk::war3::GetActiveDevice()) {
@@ -824,6 +843,11 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
   summary.shadowArenaResidentLimitBytes =
       arenaDiagnostics.residentLimitBytes;
   summary.shadowArenaGeneration = arenaDiagnostics.generation;
+  summary.shadowArenaQuarantineCount = arenaDiagnostics.quarantineCount;
+  summary.shadowArenaLastQuarantinedGeneration =
+      arenaDiagnostics.lastQuarantinedGeneration;
+  summary.shadowArenaLastQuarantinedRetireSerial =
+      arenaDiagnostics.lastQuarantinedRetireSerial;
   summary.shadowArenaBusyReuseRejectCount =
       arenaDiagnostics.busyReuseRejectCount;
   summary.shadowArenaOverflowCount = arenaDiagnostics.overflowCount;
@@ -888,9 +912,48 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       cpuSpanDiagnostics.exactIndexDomainOversizeFallbackCount;
   summary.queueSubmittedSerial = arenaDiagnostics.submittedSerial;
   summary.queueCompletedSerial = arenaDiagnostics.completedSerial;
+  const auto replayDiagnostics = dxvk::QueryShadowReplayDiagnostics();
+  summary.shadowStaleEpochConsumerRejectCount =
+      replayDiagnostics.staleEpochConsumerRejectCount;
+  summary.shadowReplayValidationRejectCount =
+      replayDiagnostics.validationRejectCount;
+  summary.shadowReplayPartialPreventedCount =
+      replayDiagnostics.partialPreventedCount;
+  summary.shadowPointWorkerCancelCount =
+      replayDiagnostics.pointWorkerCancelCount;
+  summary.shadowPointLateResultRejectCount =
+      replayDiagnostics.pointLateResultRejectCount;
+  summary.shadowFirstCompleteLatencyFrames =
+      replayDiagnostics.firstCompleteLatencyFrames;
+  summary.shadowReplayLastOffenderMapEpoch =
+      replayDiagnostics.lastOffenderMapEpoch;
+  summary.shadowReplayLastRequiredEnd = replayDiagnostics.lastRequiredEnd;
+  summary.shadowReplayLastAvailableSize = replayDiagnostics.lastAvailableSize;
+  summary.shadowReplayCandidateFrameSerial =
+      replayDiagnostics.candidateFrameSerial;
+  summary.shadowReplayPlannedCasterCount =
+      replayDiagnostics.plannedCasterCount;
+  summary.shadowReplayCasterCount = replayDiagnostics.replayCasterCount;
+  summary.shadowReplayValidatedCasterCount =
+      replayDiagnostics.validatedCasterCount;
+  summary.shadowReplayDrawnCasterCount = replayDiagnostics.drawnCasterCount;
+  summary.shadowReplayLastRejectReason = replayDiagnostics.lastRejectReason;
   if (auto* device = dxvk::war3::GetActiveDevice()) {
     summary.queueLastResult =
         static_cast<int64_t>(device->GetDXVKDevice()->getDeviceStatus());
+    const auto lifecycle = device->QueryWar3ShadowLifecycleDiagnostics();
+    summary.shadowMapResetRequestedSerial = lifecycle.requestedResetSerial;
+    summary.shadowMapResetAppliedSerial = lifecycle.appliedResetSerial;
+    summary.shadowMapEpoch = lifecycle.currentMapEpoch;
+    summary.shadowMapResetAppliedFrameSerial = lifecycle.appliedFrameSerial;
+    summary.shadowMapQuarantinedRetireSerial =
+        lifecycle.quarantinedRetireSerial;
+    summary.shadowMapCompletedRetireSerial = lifecycle.completedRetireSerial;
+    summary.shadowRetiredSessionCount = lifecycle.retiredSessionCount;
+    summary.shadowPendingProducerRejectCount =
+        lifecycle.pendingProducerRejectCount;
+    summary.shadowMapTransitionState = lifecycle.transitionState;
+    summary.shadowMapProducerReady = lifecycle.producerReady;
   }
   summary.shadowEvidenceRetentionRevision =
       s_shadowEvidenceRetentionRevision.load(std::memory_order_acquire);
@@ -2955,6 +3018,12 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
         {"shadowArenaResidentLimitBytes",
          snapshot.shadow.shadowArenaResidentLimitBytes},
         {"shadowArenaGeneration", snapshot.shadow.shadowArenaGeneration},
+        {"shadowArenaQuarantineCount",
+         snapshot.shadow.shadowArenaQuarantineCount},
+        {"shadowArenaLastQuarantinedGeneration",
+         snapshot.shadow.shadowArenaLastQuarantinedGeneration},
+        {"shadowArenaLastQuarantinedRetireSerial",
+         snapshot.shadow.shadowArenaLastQuarantinedRetireSerial},
         {"shadowArenaBusyReuseRejectCount",
          snapshot.shadow.shadowArenaBusyReuseRejectCount},
         {"shadowArenaOverflowCount",
@@ -3026,6 +3095,55 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
         {"queueSubmittedSerial", snapshot.shadow.queueSubmittedSerial},
         {"queueCompletedSerial", snapshot.shadow.queueCompletedSerial},
         {"queueLastResult", snapshot.shadow.queueLastResult},
+        {"shadowMapResetRequestedSerial",
+         snapshot.shadow.shadowMapResetRequestedSerial},
+        {"shadowMapResetAppliedSerial",
+         snapshot.shadow.shadowMapResetAppliedSerial},
+        {"shadowMapEpoch", snapshot.shadow.shadowMapEpoch},
+        {"shadowMapResetAppliedFrameSerial",
+         snapshot.shadow.shadowMapResetAppliedFrameSerial},
+        {"shadowMapQuarantinedRetireSerial",
+         snapshot.shadow.shadowMapQuarantinedRetireSerial},
+        {"shadowMapCompletedRetireSerial",
+         snapshot.shadow.shadowMapCompletedRetireSerial},
+        {"shadowRetiredSessionCount",
+         snapshot.shadow.shadowRetiredSessionCount},
+        {"shadowPendingProducerRejectCount",
+         snapshot.shadow.shadowPendingProducerRejectCount},
+        {"shadowStaleEpochConsumerRejectCount",
+         snapshot.shadow.shadowStaleEpochConsumerRejectCount},
+        {"shadowMapTransitionState",
+         snapshot.shadow.shadowMapTransitionState},
+        {"shadowMapProducerReady",
+         snapshot.shadow.shadowMapProducerReady},
+        {"shadowReplayCandidateFrameSerial",
+         snapshot.shadow.shadowReplayCandidateFrameSerial},
+        {"shadowReplayPlannedCasterCount",
+         snapshot.shadow.shadowReplayPlannedCasterCount},
+        {"shadowReplayCasterCount",
+         snapshot.shadow.shadowReplayCasterCount},
+        {"shadowReplayValidatedCasterCount",
+         snapshot.shadow.shadowReplayValidatedCasterCount},
+        {"shadowReplayDrawnCasterCount",
+         snapshot.shadow.shadowReplayDrawnCasterCount},
+        {"shadowReplayValidationRejectCount",
+         snapshot.shadow.shadowReplayValidationRejectCount},
+        {"shadowReplayPartialPreventedCount",
+         snapshot.shadow.shadowReplayPartialPreventedCount},
+        {"shadowReplayLastRejectReason",
+         snapshot.shadow.shadowReplayLastRejectReason},
+        {"shadowReplayLastOffenderMapEpoch",
+         snapshot.shadow.shadowReplayLastOffenderMapEpoch},
+        {"shadowReplayLastRequiredEnd",
+         snapshot.shadow.shadowReplayLastRequiredEnd},
+        {"shadowReplayLastAvailableSize",
+         snapshot.shadow.shadowReplayLastAvailableSize},
+        {"shadowFirstCompleteLatencyFrames",
+         snapshot.shadow.shadowFirstCompleteLatencyFrames},
+        {"shadowPointWorkerCancelCount",
+         snapshot.shadow.shadowPointWorkerCancelCount},
+        {"shadowPointLateResultRejectCount",
+         snapshot.shadow.shadowPointLateResultRejectCount},
         {"shadowEvidenceRetentionRevision",
          snapshot.shadow.shadowEvidenceRetentionRevision},
         {"shadowEvidenceCollectorAttached",
