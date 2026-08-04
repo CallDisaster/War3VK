@@ -1121,14 +1121,24 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
             "if (historyOverflowed) {",
             "const auto appendIdentityKey =",
         )
-        self.assertIn("m_war3DrawTimeExactRejectedKeys.clear();", overflow)
+        self.assertIn("War3ResetShadowSessionState", overflow)
+        central_reset = source_block(
+            self.device,
+            "void D3D9DeviceEx::War3ResetShadowSessionState",
+            "bool D3D9DeviceEx::War3DrainShadowCasterTombstones",
+        )
+        self.assertIn(
+            "m_war3DrawTimeExactRejectedKeys.clear();", central_reset
+        )
         self.assertIn(
             "m_war3DrawTimeExactRejectedFrameSerial =",
-            overflow,
+            central_reset,
         )
         self.assertLess(
-            overflow.index("m_war3DrawTimeExactRejectedKeys.clear();"),
-            overflow.index("m_war3DrawTimeExactRejectedFrameSerial ="),
+            central_reset.index("m_war3DrawTimeExactRejectedKeys.clear();"),
+            central_reset.index(
+                "m_war3DrawTimeExactRejectedFrameSerial ="
+            ),
         )
 
     def test_anonymous_unit_exemption_requires_explicit_identity_proof(

@@ -99,6 +99,7 @@ public:
   };
 
   struct ShadowManifestSummary {
+    uint64_t mapEpoch = 0;
     uint64_t frameNumber = 0;
     uint64_t objectCount = 0;
     uint64_t partCount = 0;
@@ -126,6 +127,7 @@ public:
   };
 
   struct ShadowManifestPartLeaseInfo {
+    uint64_t mapEpoch = 0;
     uint64_t partKey = 0;
     uint64_t objectKey = 0;
     uint64_t lastSeenFrame = 0;
@@ -191,6 +193,7 @@ public:
   void refreshShadowManifestFromCurrentDraw(
       const std::vector<CurrentDrawContractRecord>& records,
       uint64_t frameNumber);
+  void resetShadowManifestMapEpoch(uint64_t mapEpoch);
   void noteShadowManifestPartGoodPacket(uint64_t partKey,
                                         uint64_t frameNumber);
   ShadowManifestPartLeaseInfo queryShadowManifestPartLeaseInfo(
@@ -281,6 +284,7 @@ private:
   static constexpr uint64_t kShadowManifestLastGoodPacketTtlFrames = 1u;
 
   struct ShadowManifestObjectEntry {
+    uint64_t mapEpoch = 0;
     uint64_t key = 0;
     uint64_t firstSeenFrame = 0;
     uint64_t lastSeenFrame = 0;
@@ -289,6 +293,7 @@ private:
   };
 
   struct ShadowManifestPartEntry {
+    uint64_t mapEpoch = 0;
     uint64_t key = 0;
     uint64_t objectKey = 0;
     uint64_t firstSeenFrame = 0;
@@ -324,6 +329,7 @@ private:
   std::atomic<uint32_t> m_publishedIndex{0};
   uint32_t m_writeIndex = 0;
   uint32_t m_shadowManifestRefreshGeneration = 0;
+  uint64_t m_shadowManifestMapEpoch = 0u;
   std::thread::id m_renderThreadId = {};
   std::atomic<uint64_t> m_frameNumber{0};
   // Phase 7.96：record cap 触发后置 true，后续 register 调用在入口直接 return。

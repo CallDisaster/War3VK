@@ -100,6 +100,9 @@ struct ShadowArenaDiagnostics {
   uint64_t exactIndexTrimAcceptedCount = 0u;
   uint64_t exactIndexTrimRejectedCount = 0u;
   uint64_t exactIndexTrimBytesSaved = 0u;
+  uint64_t quarantineCount = 0u;
+  uint64_t lastQuarantinedGeneration = 0u;
+  uint64_t lastQuarantinedRetireSerial = 0u;
   uint32_t activeGenerationCount = 0u;
   uint32_t frameIncomplete = 0u;
 };
@@ -126,6 +129,9 @@ bool ShadowArena_BeginFrame(uint64_t frameSerial, uint64_t completedSerial);
 
 /** Mark the active generation as owned by all shadow work for frameSerial. */
 void ShadowArena_EndFrame(uint64_t frameSerial);
+
+/** Seal the active map generation without rewinding its allocation cursor. */
+bool ShadowArena_QuarantineCurrentGeneration(uint64_t retireSerial);
 
 /**
  * @brief 在 Arena 中分配当前帧所需内存（极速无锁分配）。

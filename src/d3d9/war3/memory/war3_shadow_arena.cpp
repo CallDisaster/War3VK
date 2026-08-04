@@ -1,5 +1,6 @@
 // war3_shadow_arena.cpp
 #include "war3_shadow_arena.h"
+#include "war3_shadow_arena_lifecycle.h"
 
 #include "../../d3d9_device.h"
 #include "../../d3d9_war3_debug.h"
@@ -69,6 +70,9 @@ std::atomic<uint64_t> g_duplicateBytesSaved{0u};
 std::atomic<uint64_t> g_exactIndexTrimAcceptedCount{0u};
 std::atomic<uint64_t> g_exactIndexTrimRejectedCount{0u};
 std::atomic<uint64_t> g_exactIndexTrimBytesSaved{0u};
+std::atomic<uint64_t> g_quarantineCount{0u};
+std::atomic<uint64_t> g_lastQuarantinedGeneration{0u};
+std::atomic<uint64_t> g_lastQuarantinedRetireSerial{0u};
 std::atomic<uint64_t> g_currentUsedBytes{0u};
 std::atomic<uint32_t> g_activeGenerationCount{0u};
 std::atomic<uint32_t> g_frameIncomplete{0u};
@@ -319,6 +323,9 @@ bool ShadowArena_Init() {
   g_exactIndexTrimAcceptedCount.store(0u, std::memory_order_release);
   g_exactIndexTrimRejectedCount.store(0u, std::memory_order_release);
   g_exactIndexTrimBytesSaved.store(0u, std::memory_order_release);
+  g_quarantineCount.store(0u, std::memory_order_release);
+  g_lastQuarantinedGeneration.store(0u, std::memory_order_release);
+  g_lastQuarantinedRetireSerial.store(0u, std::memory_order_release);
   g_currentUsedBytes.store(0u, std::memory_order_release);
   g_activeGenerationCount.store(0u, std::memory_order_release);
   g_frameIncomplete.store(0u, std::memory_order_release);
@@ -358,11 +365,13 @@ bool ShadowArena_BeginFrame(uint64_t frameSerial, uint64_t completedSerial) {
   const uint32_t preferred =
       static_cast<uint32_t>(frameSerial % g_arenaFrameCount);
   if (preferred < g_frameStates.size() &&
-      g_frameStates[preferred].retireSerial <= completedSerial) {
+      ShadowArenaGenerationCanBeReused(
+          g_frameStates[preferred].retireSerial, completedSerial)) {
     generationIndex = preferred;
   } else {
     for (uint32_t i = 0u; i < g_frameStates.size(); ++i) {
-      if (g_frameStates[i].retireSerial <= completedSerial) {
+      if (ShadowArenaGenerationCanBeReused(
+              g_frameStates[i].retireSerial, completedSerial)) {
         generationIndex = i;
         break;
       }
@@ -422,6 +431,26 @@ void ShadowArena_EndFrame(uint64_t frameSerial) {
     return;
   frameState.retireSerial = frameSerial;
   g_lastSubmittedSerial.store(frameSerial, std::memory_order_release);
+}
+
+bool ShadowArena_QuarantineCurrentGeneration(uint64_t retireSerial) {
+  if (retireSerial == 0u)
+    return false;
+  const uint32_t generationIndex =
+      g_currentFrameIndex.exchange(kInvalidGenerationIndex,
+                                   std::memory_order_acq_rel);
+  if (generationIndex >= g_frameStates.size())
+    return false;
+
+  auto& frameState = g_frameStates[generationIndex];
+  frameState.retireSerial = retireSerial;
+  g_lastSubmittedSerial.store(retireSerial, std::memory_order_release);
+  g_lastQuarantinedGeneration.store(frameState.generation,
+                                    std::memory_order_release);
+  g_lastQuarantinedRetireSerial.store(retireSerial,
+                                      std::memory_order_release);
+  g_quarantineCount.fetch_add(1u, std::memory_order_relaxed);
+  return true;
 }
 
 ShadowArenaAllocation ShadowArena_Alloc(uint32_t size, uint32_t alignment) {
@@ -709,6 +738,12 @@ ShadowArenaDiagnostics ShadowArena_QueryDiagnostics() {
       g_exactIndexTrimRejectedCount.load(std::memory_order_acquire);
   diagnostics.exactIndexTrimBytesSaved =
       g_exactIndexTrimBytesSaved.load(std::memory_order_acquire);
+  diagnostics.quarantineCount =
+      g_quarantineCount.load(std::memory_order_acquire);
+  diagnostics.lastQuarantinedGeneration =
+      g_lastQuarantinedGeneration.load(std::memory_order_acquire);
+  diagnostics.lastQuarantinedRetireSerial =
+      g_lastQuarantinedRetireSerial.load(std::memory_order_acquire);
   diagnostics.activeGenerationCount =
       g_activeGenerationCount.load(std::memory_order_acquire);
   diagnostics.frameIncomplete =

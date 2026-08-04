@@ -361,10 +361,13 @@ BuildShadowHookAddresses(const ModuleInfo &gameInfo, const char *source) {
 
 // 地图退出时重置运行时状态，避免跨局残留。
 void ResetWar3RuntimeState() {
-  if (auto* device = dxvk::war3::GetActiveDevice())
-    device->War3ResetGpuSkinMapEpoch();
+  // The unload hook may run outside the D3D9 render thread. Close producer
+  // admission first, then publish a request that Present will coalesce and
+  // apply after the final BeforeUi boundary. GPU-owned caches and Arena
+  // generations must never be rewound from this callback.
   g_war3_runtime_activated.store(false, std::memory_order_release);
-  std::this_thread::yield();
+  if (auto* device = dxvk::war3::GetActiveDevice())
+    device->War3RequestShadowMapEpochReset();
   dxvk::war3::platform::ResetRuntimeCore();
 }
 

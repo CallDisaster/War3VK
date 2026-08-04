@@ -196,6 +196,26 @@ namespace dxvk {
       uint64_t busy = 0u;
     };
 
+    struct ShadowReplayDiagnostics {
+      uint64_t mapEpoch = 0u;
+      uint64_t deviceEpoch = 0u;
+      uint64_t candidateFrameSerial = 0u;
+      uint64_t firstCompleteLatencyFrames = 0u;
+      uint64_t staleEpochConsumerRejectCount = 0u;
+      uint64_t validationRejectCount = 0u;
+      uint64_t partialPreventedCount = 0u;
+      uint64_t pointWorkerCancelCount = 0u;
+      uint64_t pointLateResultRejectCount = 0u;
+      uint32_t plannedCasterCount = 0u;
+      uint32_t replayCasterCount = 0u;
+      uint32_t validatedCasterCount = 0u;
+      uint32_t drawnCasterCount = 0u;
+      uint32_t lastRejectReason = 0u;
+      uint64_t lastOffenderMapEpoch = 0u;
+      uint64_t lastRequiredEnd = 0u;
+      uint64_t lastAvailableSize = 0u;
+    };
+
     enum class CsmResolutionFallbackReason : uint32_t {
       None = 0u,
       MemoryBudget = 1u,
@@ -218,6 +238,7 @@ namespace dxvk {
     CsmResolutionDiagnostics QueryCsmResolutionDiagnostics();
     PointShadowPersistentDiagnostics
     QueryPointShadowPersistentDiagnostics();
+    ShadowReplayDiagnostics QueryShadowReplayDiagnostics();
     void PublishShadowTaaDiagnostics(const ShadowTaaDiagnostics& diagnostics);
     void PublishCsmResolutionDiagnostics(
         const CsmResolutionDiagnostics& diagnostics);
@@ -231,6 +252,10 @@ namespace dxvk {
 
         War3InsertionPoint Point() const override { return War3InsertionPoint::BeforeUi; }
         void Run(const Rc<DxvkCommandList>& ctx, const War3PipelineInput& input) override;
+        // Invalidates ownership/publication only. Allocated 4096 CSM, TAA and
+        // point-shadow images remain cached and may be reused by the new map
+        // after fresh content has been rendered.
+        void InvalidateMapEpoch(uint64_t mapEpoch, uint64_t deviceEpoch);
         
         Rc<DxvkSampler> getFallbackSampler(bool useMip, float mipLodBias);
         bool GetVolumetricShadowSnapshot(uint64_t expectedFrameSerial,
@@ -395,6 +420,13 @@ namespace dxvk {
           uint64_t gpuSkinVsShadowReplayDirectional = 0u;
           uint64_t gpuSkinVsShadowReplayPoint = 0u;
           uint64_t gpuSkinVsShadowReplayUnknown = 0u;
+          uint32_t replayValidationRejectedCount = 0u;
+          uint32_t replayValidationLastReason = 0u;
+          uint32_t replayPartialPreventedCount = 0u;
+          uint64_t replayValidationLastDrawMapEpoch = 0u;
+          uint64_t replayValidationLastExpectedMapEpoch = 0u;
+          uint64_t replayValidationLastRequiredEnd = 0u;
+          uint64_t replayValidationLastAvailableSize = 0u;
         } reconciliation;
 
     private:
@@ -606,6 +638,8 @@ namespace dxvk {
         VkExtent3D m_shadowHistoryExtent = {0, 0, 1};
         uint32_t m_shadowHistoryIndex = 0; // 当前作为“历史读取”的索引
         bool m_shadowHistoryValid = false; // 历史是否已写入过（避免首次启用时读到旧数据）
+        uint64_t m_shadowMapEpoch = 0u;
+        uint64_t m_shadowDeviceEpoch = 0u;
         bool m_shadowTaaWasActiveLastFrame = false; // 上一帧是否执行了 ShadowTAA（用于避免断档后混入陈旧历史）
         // A history image is readable only when it names the exact scene/map
         // contract that produced it. These fields are committed atomically at
@@ -700,6 +734,10 @@ namespace dxvk {
         War3CsmCalculator m_csm;
         War3CsmData m_csmData;
         bool m_hasCompleteShadowMap = false;
+        bool m_replayValidationFailedThisFrame = false;
+        uint32_t m_replayValidationHoldFramesRemaining = 0u;
+        uint64_t m_epochFirstCandidateFrameSerial = 0u;
+        uint64_t m_epochFirstCompleteLatencyFrames = 0u;
         // Current-frame transaction settlement for external CSM consumers.
         // Run clears this before any fallible work and republishes only at its
         // normal end after a complete/rendered or explicit reusable map exists.
@@ -909,6 +947,8 @@ namespace dxvk {
         uint64_t m_pointShadowPersistentObserveMatch = 0u;
         uint64_t m_pointShadowPersistentObserveMismatch = 0u;
         uint64_t m_pointShadowPersistentConsumed = 0u;
+        uint64_t m_pointShadowWorkerCancelCount = 0u;
+        uint64_t m_pointShadowLateResultRejectCount = 0u;
         PointShadowPersistentBeginRejectReason
             m_pointShadowPersistentLastBeginRejectReason =
                 PointShadowPersistentBeginRejectReason::ModeOff;
@@ -1032,6 +1072,10 @@ namespace dxvk {
             const Rc<DxvkCommandList>& ctx,
             const War3PipelineInput& input,
             const std::vector<const War3ShadowCasterDraw*>* replayDraws = nullptr);
+        bool validateShadowReplayDraws(
+            const War3PipelineInput& input,
+            const std::vector<const War3ShadowCasterDraw*>& replayDraws,
+            const char* consumer);
         /**
          * @brief 渲染体积专用太阳 ortho 深度（单层 texture2DArray）。
          * @note 复用本帧 replay draws 与矩阵 SSBO；不改表面 CSM 资源。

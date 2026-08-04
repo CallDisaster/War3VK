@@ -120,6 +120,7 @@ d3d9_src = [
   'war3/render/war3_shadow_runtime_bridge.cpp',
   'war3/render/war3_shadow_lifecycle.cpp',
   'war3/render/war3_shadow_producer_policy.cpp',
+  'war3/render/war3_shadow_replay_validation.cpp',
   'war3/render/war3_point_shadow_cpu_plan.cpp',
   'war3/render/war3_union_consumer_visibility.cpp',
   'war3/render/war3_current_draw_contract.cpp',
@@ -287,6 +288,35 @@ war3_union_consumer_visibility_test = executable(
 test(
   'war3_union_consumer_visibility',
   war3_union_consumer_visibility_test,
+  timeout : 30,
+)
+
+war3_shadow_replay_validation_test = executable(
+  'war3_shadow_replay_validation_test',
+  [
+    'war3/render/war3_shadow_replay_validation.cpp',
+    'war3/render/tests/war3_shadow_replay_validation_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_replay_validation',
+  war3_shadow_replay_validation_test,
+  timeout : 30,
+)
+
+war3_shadow_arena_lifecycle_test = executable(
+  'war3_shadow_arena_lifecycle_test',
+  [
+    'war3/memory/tests/war3_shadow_arena_lifecycle_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_arena_lifecycle',
+  war3_shadow_arena_lifecycle_test,
   timeout : 30,
 )
 

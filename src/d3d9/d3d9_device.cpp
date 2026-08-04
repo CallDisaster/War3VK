@@ -27,6 +27,7 @@
 #include "war3/render/war3_visible_renderables.h"
 #include "war3/render/war3_canonical_draw.h"
 #include "war3/render/war3_current_draw_contract.h"
+#include "war3/render/war3_lightning_runtime.h"
 #include "war3/handle/war3_handle_resolver.h"
 #include "war3/hooks/war3_hook_widget_identity.h"
 #include "war3/hooks/war3_hook_perf.h"
@@ -294,8 +295,10 @@ bool War3VisibleRenderableMatchesDrawTimeKey(
 War3DrawTimeVBCacheKey War3MakeDrawTimeVBCacheKey(
     void* renderablePart,
     uint32_t layerIndex,
-    const war3::render::CurrentDrawContractRecord* contract) {
+    const war3::render::CurrentDrawContractRecord* contract,
+    uint64_t mapEpoch) {
   War3DrawTimeVBCacheKey key = {};
+  key.mapEpoch = mapEpoch;
   key.renderablePart = renderablePart;
   key.layerIndex = layerIndex;
   if (contract != nullptr && contract->known &&
@@ -9514,6 +9517,19 @@ void War3DebugRunIndexOverflowTest(D3D9DeviceEx *device) {
 namespace {
 
 std::atomic<uint32_t> g_d3d9DeviceTraceOrdinal{0u};
+std::atomic<uint64_t> g_war3ShadowMapEpochIssuer{0u};
+
+uint64_t MintWar3ShadowMapEpoch() {
+  // A process-wide monotonically increasing epoch prevents A -> B -> A address
+  // reuse from re-authorizing a cache entry. Exhaustion is not reachable in a
+  // process lifetime; still skip zero so it always means "uninitialized".
+  uint64_t epoch =
+      g_war3ShadowMapEpochIssuer.fetch_add(1u, std::memory_order_relaxed) + 1u;
+  if (unlikely(epoch == 0u))
+    epoch = g_war3ShadowMapEpochIssuer.fetch_add(1u,
+                                                 std::memory_order_relaxed) + 1u;
+  return epoch;
+}
 
 void TraceD3D9Device(uint32_t ordinal, const char* phase, const void* device) {
   // 只记录前四个设备的启动阶段；固定栈缓冲，不触发控制台或文件输出。
@@ -9556,6 +9572,9 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
       g_d3d9DeviceTraceOrdinal.fetch_add(1u, std::memory_order_relaxed) + 1u;
   TraceD3D9Device(traceOrdinal, "ctor-body-begin", this);
   m_war3ShadowArenaFence = new sync::Fence();
+  m_war3GpuSkinMapEpoch = MintWar3ShadowMapEpoch();
+  m_war3ShadowDiagCurrentMapEpoch.store(
+      m_war3GpuSkinMapEpoch, std::memory_order_relaxed);
 
   // If we can SWVP, then we use an extended constant set
   // as SWVP has many more slots available than HWVP.
@@ -9580,6 +9599,8 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   war3::SetActiveDevice(this);
   // A newly-created D3D9 owner starts a fresh address domain even when a
   // previous device disappeared before the normal map-unload hook ran.
+  war3::render::VisibleRenderableRegistry::instance()
+      .resetShadowManifestMapEpoch(m_war3GpuSkinMapEpoch);
   war3::model::ShadowModelResourceCache::instance().resetMapEpoch(
       m_war3GpuSkinMapEpoch);
   war3shader::internal::InitShaderPackRuntime(m_dxvkDevice);
@@ -9592,6 +9613,8 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
     TraceD3D9Device(traceOrdinal, "shadow-pass-begin", this);
     auto shadowPass = std::make_unique<War3ShadowReceiverPass>(this);
     m_shadowReceiverPass = shadowPass.get();
+    m_shadowReceiverPass->InvalidateMapEpoch(
+        m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch);
     m_war3Pipeline->RegisterPass(
         "ShadowReceiver", std::move(shadowPass),
         war3::runtime::IsWar3RuntimeModuleEnabled(
@@ -10812,7 +10835,8 @@ bool D3D9DeviceEx::War3GpuSkinPreflightNativeBypass(
             renderablePart, request.key.layerIndex, requestContract);
     const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
         renderablePart, request.key.layerIndex,
-        exactLogicalSlice ? &requestContract : nullptr);
+        exactLogicalSlice ? &requestContract : nullptr,
+        device->m_war3GpuSkinMapEpoch);
     const auto cached = War3DrawTimeVBCacheRuntime() && exactLogicalSlice
         ? device->m_war3DrawTimeVBCache.find(cacheKey)
         : device->m_war3DrawTimeVBCache.end();
@@ -14115,8 +14139,11 @@ void D3D9DeviceEx::War3ResetGpuSkinMapEpoch() {
   m_war3GpuSkinD3D9IndexTicket = {};
   const auto bridgeReset = war3::gpu_skin::RequestNativeBridgeReset(
       war3::gpu_skin::NativePoisonLedgerResetReason::MapEpoch);
-  if (++m_war3GpuSkinMapEpoch == 0u)
-    m_war3GpuSkinMapEpoch = 1u;
+  m_war3GpuSkinMapEpoch = MintWar3ShadowMapEpoch();
+  m_war3ShadowDiagCurrentMapEpoch.store(
+      m_war3GpuSkinMapEpoch, std::memory_order_release);
+  war3::render::VisibleRenderableRegistry::instance()
+      .resetShadowManifestMapEpoch(m_war3GpuSkinMapEpoch);
   war3::model::ShadowModelResourceCache::instance().resetMapEpoch(
       m_war3GpuSkinMapEpoch);
   if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
@@ -14125,6 +14152,106 @@ void D3D9DeviceEx::War3ResetGpuSkinMapEpoch() {
   }
   if (m_war3GpuSkinManager != nullptr)
     m_war3GpuSkinManager->Reset(bridgeReset.requestedGeneration);
+}
+
+void D3D9DeviceEx::War3RequestShadowMapEpochReset() {
+  uint64_t requested = m_war3ShadowMapResetRequestedSerial.fetch_add(
+                           1u, std::memory_order_acq_rel) + 1u;
+  if (unlikely(requested == 0u)) {
+    requested = m_war3ShadowMapResetRequestedSerial.fetch_add(
+                    1u, std::memory_order_acq_rel) + 1u;
+  }
+  // This store is the producer gate visible to both the unload callback and
+  // render-thread capture paths. Present is the only code allowed to reopen it.
+  m_war3ShadowSessionReady.store(false, std::memory_order_release);
+  m_war3ShadowDiagTransitionState.store(1u, std::memory_order_release);
+}
+
+War3ShadowLifecycleDiagnostics
+D3D9DeviceEx::QueryWar3ShadowLifecycleDiagnostics() const {
+  War3ShadowLifecycleDiagnostics result = {};
+  result.requestedResetSerial = m_war3ShadowMapResetRequestedSerial.load(
+      std::memory_order_acquire);
+  result.appliedResetSerial = m_war3ShadowDiagAppliedResetSerial.load(
+      std::memory_order_acquire);
+  result.currentMapEpoch = m_war3ShadowDiagCurrentMapEpoch.load(
+      std::memory_order_acquire);
+  result.appliedFrameSerial = m_war3ShadowDiagAppliedFrameSerial.load(
+      std::memory_order_acquire);
+  result.quarantinedRetireSerial =
+      m_war3ShadowDiagQuarantinedRetireSerial.load(std::memory_order_acquire);
+  result.completedRetireSerial =
+      m_war3ShadowDiagCompletedRetireSerial.load(std::memory_order_acquire);
+  result.retiredSessionCount = m_war3ShadowDiagRetiredSessionCount.load(
+      std::memory_order_acquire);
+  result.pendingProducerRejectCount =
+      m_war3ShadowDiagPendingProducerRejectCount.load(
+          std::memory_order_acquire);
+  result.transitionState = m_war3ShadowDiagTransitionState.load(
+      std::memory_order_acquire);
+  result.producerReady = m_war3ShadowSessionReady.load(
+      std::memory_order_acquire) ? 1u : 0u;
+  return result;
+}
+
+bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(
+    uint64_t retireSerial) {
+  const uint64_t requested =
+      m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire);
+  if (requested == m_war3ShadowMapResetAppliedSerial)
+    return false;
+
+  m_war3ShadowSessionReady.store(false, std::memory_order_release);
+  m_war3ShadowDiagTransitionState.store(2u, std::memory_order_release);
+  if (dxvk::war3::memory::ShadowArena_IsInitialized())
+    dxvk::war3::memory::ShadowArena_QuarantineCurrentGeneration(retireSerial);
+
+  // This signal is ordered after every command emitted by the old session and
+  // is shared by Arena generations and retired-session Rc ownership.
+  if (m_war3ShadowArenaFence != nullptr) {
+    const Rc<sync::Fence> cShadowArenaFence = m_war3ShadowArenaFence;
+    EmitCs([cShadowArenaFence, cRetireSerial = retireSerial](DxvkContext* ctx) {
+      ctx->signal(cShadowArenaFence, cRetireSerial);
+    });
+  }
+  m_war3ShadowArenaQuarantinedRetireSerial = retireSerial;
+  m_war3ShadowDiagQuarantinedRetireSerial.store(
+      retireSerial, std::memory_order_release);
+
+  // Map-wide render registries are reset only for the lifecycle transition,
+  // not for a shadow tombstone overflow that merely rebuilds caster caches.
+  dxvk::war3::render::RenderQueueTracker::instance().Reset();
+  dxvk::war3::render::ExecBatchProcessor::ResetCaches();
+  War3RenderState::ResetRuntimeState();
+  dxvk::war3::model::Shutdown();
+  dxvk::war3::render::ResetShadowRuntimeBridgeState();
+  dxvk::war3::render::War3LightningRuntime::instance().reset();
+  dxvk::war3::shadow::ShadowValidationRuntime::instance().reset();
+  dxvk::war3::render::War3Renderer::instance().EndFrame();
+  dxvk::war3::render::War3Renderer::instance().BeginFrame();
+  War3ResetShadowSessionState(retireSerial);
+  War3ResetGpuSkinMapEpoch();
+  if (m_shadowReceiverPass != nullptr) {
+    War3ShadowReceiverPass* const receiver = m_shadowReceiverPass;
+    const uint64_t mapEpoch = m_war3GpuSkinMapEpoch;
+    const uint64_t deviceEpoch = m_war3GpuSkinDeviceEpoch;
+    // Receiver state belongs to the CS thread. Ordering this command after the
+    // old-session completion signal avoids racing an earlier Run() while still
+    // ensuring every new-session Run observes the invalidation first.
+    EmitCs([receiver, mapEpoch, deviceEpoch](DxvkContext*) {
+      receiver->InvalidateMapEpoch(mapEpoch, deviceEpoch);
+    });
+  }
+
+  // Coalesce every request observed before this Present into one epoch bump.
+  m_war3ShadowMapResetAppliedSerial = requested;
+  m_war3ShadowMapResetAppliedFrameSerial =
+      m_war3ShadowPersistentFrameSerial + 1u;
+  m_war3ShadowDiagAppliedResetSerial.store(
+      requested, std::memory_order_release);
+  m_war3ShadowDiagAppliedFrameSerial.store(
+      m_war3ShadowMapResetAppliedFrameSerial, std::memory_order_release);
+  return true;
 }
 
 bool D3D9DeviceEx::War3GpuSkinDeviceReady() const {
@@ -17499,6 +17626,17 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   if (!m_war3Pipeline)
     return;
 
+  // A map-unload request closes the producer before any render-owned state is
+  // changed. Present will apply the coalesced reset and acquire a completed
+  // Arena generation; until then no old/new mixed caster set may reach replay.
+  if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
+      m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
+          m_war3ShadowMapResetAppliedSerial) {
+    m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return;
+  }
+
   // [性能] 若本帧不需要插入 BeforeUi，则跳过所有分界检测与外部渲染插入。
   // 目的：在“光影/后处理/ShaderPack 全部关闭”时，避免每帧
   // beginExternalRendering 导致的巨大 CPU/GPU 开销，尽可能贴近原生渲染性能。
@@ -18335,6 +18473,16 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
       std::min(kMaxShadowPaletteReserve,
                std::max(m_shadowPaletteReserveHint,
                         m_war3Scene.shadowPalettes.capacity()));
+  // The unload hook can race the CPU preparation above. Recheck immediately
+  // before publishing/moving the scene so a pending map can never enqueue a
+  // receiver run carrying the old epoch.
+  if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
+      m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
+          m_war3ShadowMapResetAppliedSerial) {
+    m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return;
+  }
   input.scene = std::move(m_war3Scene);
   m_war3Scene = War3FrameScene{};
   m_war3SceneRotatedFrameSerial = m_war3ShadowPersistentFrameSerial + 1u;
@@ -18389,6 +18537,8 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   // frame's BeforeUi insertion. Therefore +1 names the frame being captured,
   // while frameIndex remains only the three-slot GPU resource ring index.
   input.frameSerial = pipelineFrameSerial;
+  input.mapEpoch = m_war3GpuSkinMapEpoch;
+  input.deviceEpoch = m_war3GpuSkinDeviceEpoch;
 
   EmitCs([this, cInput = std::move(input)](DxvkContext *ctx) mutable {
     Rc<DxvkCommandList> cmd;
@@ -20035,6 +20185,13 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     const dxvk::war3::render::CurrentDrawAuthoritativeSample*
         directCurrentDrawSample,
     bool fromStalePoseRestore) {
+  if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
+      m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
+          m_war3ShadowMapResetAppliedSerial) {
+    m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
   const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
       packet.renderable.stage,
       War3BatchTag::Unknown,
@@ -20066,7 +20223,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       }
       const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
           packet.renderable.renderablePart,
-          packet.renderable.layerIndex, &contract);
+          packet.renderable.layerIndex, &contract,
+          m_war3GpuSkinMapEpoch);
       if (War3CurrentDrawContractNamesExactSlice(
               packet.renderable.renderablePart,
               packet.renderable.layerIndex, contract)) {
@@ -21890,6 +22048,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   auto drawBuildScope = War3SemanticSubmitScope(
       "War3SemanticScene/SubmitFrame/DrawBuild");
   War3ShadowCasterDraw draw = {};
+  draw.mapEpoch = m_war3GpuSkinMapEpoch;
+  draw.deviceEpoch = m_war3GpuSkinDeviceEpoch;
   draw.shadowRenderablePart = packet.renderable.renderablePart;
   draw.shadowLayerIndex = packet.renderable.layerIndex;
   draw.shadowMetadataKeyHash = semanticMetadataKeyHash;
@@ -21941,7 +22101,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     if (exactLogicalSlice) {
       const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
           consumeKey, packet.renderable.layerIndex,
-          authoritativeDrawContract);
+          authoritativeDrawContract, m_war3GpuSkinMapEpoch);
       auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
       // Dynamic/pre-skinned snapshots are exact-frame resources. Replaying an
       // eight-frame-old dynamic VB with a current packet/world transform can
@@ -22403,6 +22563,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     const uint64_t contractIdentityKey =
         War3SemanticDirectSelectionKey(packet, *currentDrawSample);
     const War3SemanticDirectCasterContractKey casterKey = {
+        m_war3GpuSkinMapEpoch,
         contractIdentityKey,
         reinterpret_cast<uint64_t>(packet.renderable.sceneNode),
         reinterpret_cast<uint64_t>(packet.renderable.renderablePart),
@@ -22592,7 +22753,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           *authoritativeDrawContract)) {
     const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
         packet.renderable.renderablePart, packet.renderable.layerIndex,
-        authoritativeDrawContract);
+        authoritativeDrawContract, m_war3GpuSkinMapEpoch);
     auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
     if (vbIt != m_war3DrawTimeVBCache.end() &&
         vbIt->second.MatchesKey(cacheKey))
@@ -23296,6 +23457,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     }
 
     War3ShadowCasterDraw draw = {};
+    draw.mapEpoch = m_war3GpuSkinMapEpoch;
+    draw.deviceEpoch = m_war3GpuSkinDeviceEpoch;
     // The safe current-frame producer is a first-class final caster source.
     // Preserve its exact part/layer and alpha-source identity so continuity
     // analysis does not collapse every recovered geoset into a null part or
@@ -23502,6 +23665,118 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
   return submitted;
 }
 
+void D3D9DeviceEx::War3CollectRetiredShadowSessions(
+    uint64_t completedSerial) {
+  m_war3RetiredShadowSessions.erase(
+      std::remove_if(
+          m_war3RetiredShadowSessions.begin(),
+          m_war3RetiredShadowSessions.end(),
+          [completedSerial](const War3RetiredShadowSession& session) {
+            return session.retireSerial != 0u &&
+                   session.retireSerial <= completedSerial;
+          }),
+      m_war3RetiredShadowSessions.end());
+  m_war3ShadowDiagCompletedRetireSerial.store(
+      completedSerial, std::memory_order_release);
+  m_war3ShadowDiagRetiredSessionCount.store(
+      m_war3RetiredShadowSessions.size(), std::memory_order_release);
+}
+
+void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
+  using namespace dxvk::war3::render;
+
+  // Move every resource-owning container as one session. The dedicated fence
+  // releases it later; no Rc backing can disappear while old CS chunks still
+  // reference it.
+  War3RetiredShadowSession retired = {};
+  retired.mapEpoch = m_war3GpuSkinMapEpoch;
+  retired.retireSerial = retireSerial;
+  retired.shadowAllocators = std::move(m_war3ShadowAllocators);
+  retired.shadowMappedAllocators = std::move(m_war3ShadowMappedAllocators);
+  retired.frozenGeometryCaches =
+      std::move(m_war3ShadowFrozenGeometryCaches);
+  retired.frameFreezeCatalog = std::move(m_war3FrameFreezeCatalog);
+  retired.geometryRegistry = std::move(m_war3ShadowGeometryRegistry);
+  retired.persistentGeometries =
+      std::move(m_war3ShadowPersistentGeometries);
+  retired.stage13RetainedCasters =
+      std::move(m_war3Stage13RetainedCasters);
+  retired.persistentExpiryQueue =
+      std::move(m_war3ShadowPersistentExpiryQueue);
+  retired.drawTimeVbCache = std::move(m_war3DrawTimeVBCache);
+  retired.s1TerrainCasterStash = std::move(m_war3S1TerrainCasterStash);
+  retired.s1TerrainEarlyCache = std::move(m_war3S1TerrainEarlyCache);
+  m_war3RetiredShadowSessions.emplace_back(std::move(retired));
+  m_war3ShadowDiagRetiredSessionCount.store(
+      m_war3RetiredShadowSessions.size(), std::memory_order_release);
+
+  m_war3ShadowAllocators = {};
+  m_war3ShadowMappedAllocators = {};
+  m_war3ShadowFrozenGeometryCaches = {};
+  m_war3FrameFreezeCatalog = {};
+  m_war3ShadowGeometryRegistry = {};
+  m_war3ShadowPersistentGeometries = {};
+  m_war3Stage13RetainedCasters = {};
+  m_war3ShadowPersistentExpiryQueue = {};
+  m_war3DrawTimeVBCache = {};
+  m_war3S1TerrainCasterStash = {};
+  m_war3S1TerrainEarlyCache = {};
+
+  ResetCurrentDrawContractCache();
+  VisibleRenderableRegistry::instance().clearShadowManifest();
+  if (m_war3SemanticDirectPartPacketLeaseState != nullptr) {
+    m_war3SemanticDirectPartPacketLeaseState->entries.clear();
+    m_war3SemanticDirectPartPacketLeaseState->objectCoreSets.clear();
+  }
+  m_war3SemanticDirectSelectionLeaseLastSeen.clear();
+  m_war3SemanticDirectPrevSubmittedIdentityKeys.clear();
+  m_war3SemanticDirectPrevSubmittedObjectIdentityKeys.clear();
+  m_war3SemanticDirectPrevSubmittedPartIdentityKeys.clear();
+  m_war3SemanticDirectCasterContracts.clear();
+  m_war3DrawTimeExactRejectedKeys.clear();
+  m_war3DrawTimeExactRejectedFrameSerial =
+      m_war3ShadowPersistentFrameSerial;
+  m_war3DrawTimeAnonymousMarkerRejectedSlices.clear();
+  m_war3S1TerrainEarlyKeysByPersistentGeometryId.clear();
+  m_war3S1TerrainEarlyPersistentBackedCount = 0u;
+  m_war3S1TerrainEarlyFallbackBackedCount = 0u;
+  m_war3S1TerrainEarlyLogicalReferencedBytes = 0u;
+  m_war3S1TerrainStashBuiltFrameSerial = 0u;
+  m_war3S1TerrainStashCaptureFrameSerial = 0u;
+  m_war3FrameFreezeCatalogSerial = 0u;
+  m_war3FrameFreezeUniqueSourceBytes = 0u;
+  m_war3FrameFreezeDuplicateBytesSaved = 0u;
+  m_war3ShadowPersistentLastGcFrameSerial = ~uint64_t(0);
+  m_war3SemanticSceneLastCaptureFrameSerial = 0u;
+  m_war3SemanticSceneLastCapturePublishRevision = 0u;
+  m_war3SemanticSceneLastCapturedVisibleFrameSerial = 0u;
+  m_war3SemanticSceneLastCoverageRecoveryCaptureFrameSerial = 0u;
+  m_war3SemanticSceneLastPoseOnlyCaptureFrameSerial = 0u;
+  m_war3SemanticSceneLastSteadyBuildFrameSerial = 0u;
+  m_war3SemanticSceneLastZeroSubmitFrameSerial = 0u;
+  m_war3SemanticSceneLastZeroSubmitPublishRevision = 0u;
+  m_war3SemanticSceneLastSuccessfulSubmitFrameSerial = 0u;
+  m_war3SemanticSceneLastSuccessfulSubmitPublishRevision = 0u;
+  m_war3SemanticSceneLastReusableFrame.reset();
+  m_war3SemanticDrawTimePoseFrameSerial = 0u;
+  m_war3SemanticDrawTimePoseDirtyFrameSerial = 0u;
+  m_war3SemanticLastMatrixPublisherPoseRevision = 0u;
+  m_war3SemanticDrawTimePoseKeys.clear();
+  m_war3SemanticDirectPrevIdentityHash = 0u;
+  m_war3SemanticDirectPrevPaletteHash = 0u;
+  m_war3SemanticDirectPrevGroupHash = 0u;
+  m_war3SemanticDirectPrevStableGroupHash = 0u;
+  m_war3SemanticDirectPrevStream1Ptr = 0u;
+  m_war3SemanticDirectPrevGeometrySourceHash = 0u;
+  m_war3SceneRotatedFrameSerial = 0u;
+  m_war3Scene = War3FrameScene{};
+  m_war3ShadowPaletteHashIndex.clear();
+  m_war3SemanticPaletteCache.clear();
+  m_war3SemanticPaletteCacheHashIndex.clear();
+  dxvk::war3::shadow::War3ShadowDrawMetadataStore().clear();
+  dxvk_war3_alpha_test_internal::ClearPayloadsForLifecycleOverflow();
+}
+
 bool D3D9DeviceEx::War3DrainShadowCasterTombstones() {
   using namespace dxvk::war3::render;
 
@@ -23521,26 +23796,7 @@ bool D3D9DeviceEx::War3DrainShadowCasterTombstones() {
   if (historyOverflowed) {
     // Missing even one authoritative removal is unsafe: fail closed and let
     // live producers rebuild every cache from current visibility.
-    ResetCurrentDrawContractCache();
-    visibleRegistry.clearShadowManifest();
-    if (m_war3SemanticDirectPartPacketLeaseState != nullptr) {
-      m_war3SemanticDirectPartPacketLeaseState->entries.clear();
-      m_war3SemanticDirectPartPacketLeaseState->objectCoreSets.clear();
-    }
-    m_war3SemanticDirectSelectionLeaseLastSeen.clear();
-    m_war3SemanticDirectPrevSubmittedIdentityKeys.clear();
-    m_war3SemanticDirectPrevSubmittedObjectIdentityKeys.clear();
-    m_war3SemanticDirectPrevSubmittedPartIdentityKeys.clear();
-    m_war3SemanticDirectCasterContracts.clear();
-    m_war3DrawTimeVBCache.clear();
-    m_war3DrawTimeExactRejectedKeys.clear();
-    m_war3DrawTimeExactRejectedFrameSerial =
-        m_war3ShadowPersistentFrameSerial;
-    m_war3DrawTimeAnonymousMarkerRejectedSlices.clear();
-    m_war3Stage13RetainedCasters.clear();
-    m_war3S1TerrainCasterStash.clear();
-    dxvk::war3::shadow::War3ShadowDrawMetadataStore().clear();
-    dxvk_war3_alpha_test_internal::ClearPayloadsForLifecycleOverflow();
+    War3ResetShadowSessionState(m_war3ShadowPersistentFrameSerial + 1u);
     retiredAnything = true;
   }
 
@@ -24019,7 +24275,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           return nullptr;
         }
         const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
-            record.renderablePart, record.layerIndex, &record);
+            record.renderablePart, record.layerIndex, &record,
+            m_war3GpuSkinMapEpoch);
         const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
         if (vbIt == m_war3DrawTimeVBCache.end() ||
             !vbIt->second.MatchesKey(cacheKey) ||
@@ -24039,7 +24296,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
             record.renderablePart != nullptr) {
           const War3DrawTimeVBCacheKey cacheKey =
               War3MakeDrawTimeVBCacheKey(
-                  record.renderablePart, record.layerIndex, &record);
+                  record.renderablePart, record.layerIndex, &record,
+                  m_war3GpuSkinMapEpoch);
           if (War3DrawTimeAnonymousMarkerRejectionActive(
                   record.renderablePart, record.meshPayloadPtr,
                   record.layerIndex)) {
@@ -24772,7 +25030,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
             record.renderablePart, record.layerIndex, record))
       return false;
     const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
-        record.renderablePart, record.layerIndex, &record);
+        record.renderablePart, record.layerIndex, &record,
+        m_war3GpuSkinMapEpoch);
     auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
     if (vbIt == m_war3DrawTimeVBCache.end())
       return false;
@@ -25558,7 +25817,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               currentContract)) {
         const War3DrawTimeVBCacheKey currentKey =
             War3MakeDrawTimeVBCacheKey(
-                leasedPart, leasedLayer, &currentContract);
+                leasedPart, leasedLayer, &currentContract,
+                m_war3GpuSkinMapEpoch);
         if (War3DrawTimeAnonymousMarkerRejectionActive(
                 leasedPart, currentContract.meshPayloadPtr, leasedLayer)) {
           currentPartKeys.insert(key);
@@ -26249,7 +26509,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
     const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
         consumeKey, eligible.packet.renderable.layerIndex,
-        &eligible.sample.contract);
+        &eligible.sample.contract, m_war3GpuSkinMapEpoch);
     auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
     if (vbIt == m_war3DrawTimeVBCache.end())
       return finishFastAppend(FastAppendOutcome::VbCacheMiss, false);
@@ -26286,6 +26546,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (nestedTiming != nullptr)
       nestedTiming->enter(War3SubmitAppendNestedPhase::FastDrawBuild);
     War3ShadowCasterDraw draw = {};
+    draw.mapEpoch = m_war3GpuSkinMapEpoch;
+    draw.deviceEpoch = m_war3GpuSkinDeviceEpoch;
     draw.indexed = entry.indexed;
     draw.positionStorage = entry.positionBuffer;
     draw.positionInfo = entry.positionInfo;
@@ -28286,6 +28548,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     kPopulateReturnDrawTimeProducerSubmitted = 10u,
   };
 
+  if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
+      m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
+          m_war3ShadowMapResetAppliedSerial) {
+    m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return 0u;
+  }
+
   m_war3Scene.shadowStats.semanticScenePopulateAttemptCount++;
   // Authoritative removal and stage-policy events outrank every grace/lease
   // path. Drain before any reuse/early-return decision in this populate.
@@ -29599,6 +29869,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
 bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
     bool unitsOnly,
     bool executeNativeBackendValidation) {
+  if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
+      m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
+          m_war3ShadowMapResetAppliedSerial) {
+    m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return false;
+  }
   if (!War3SemanticConsumerEnabled() ||
       !dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled())
     return false;
@@ -29676,6 +29953,8 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
   input.settings = &m_war3Pipeline->GetSettings();
   input.frameIndex = m_war3FrameIndex;
   input.frameSerial = pipelineFrameSerial;
+  input.mapEpoch = m_war3GpuSkinMapEpoch;
+  input.deviceEpoch = m_war3GpuSkinDeviceEpoch;
 
   EmitCs([this, cInput = std::move(input)](DxvkContext *ctx) mutable {
     Rc<DxvkCommandList> cmd;
@@ -32296,6 +32575,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
   // immediately prepares a reserved, empty scene for the next frame. Preserve
   // that fact across OnFrameStart(), which clears HasInsertedBeforeUi().
   bool war3FrameSceneAlreadyRotated = false;
+  bool war3ArenaRetiredAtMapTransition = false;
   {
   // This root intentionally ends before m_implicitSwapchain->Present. It is
   // the WarVK/DXVK pre-swapchain frame transition, not swapchain wait/present.
@@ -32324,6 +32604,14 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     War3MaybeInsertBeforeUi(true);
     war3FrameSceneAlreadyRotated =
         m_war3Pipeline != nullptr && m_war3Pipeline->HasInsertedBeforeUi();
+  }
+  {
+    auto phaseScope =
+        War3PresentFrameTransitionScope("ShadowMapEpochTransition");
+    const uint64_t retiringFrameSerial =
+        m_war3ShadowPersistentFrameSerial + 1u;
+    war3ArenaRetiredAtMapTransition =
+        War3ApplyShadowMapEpochResetAtPresent(retiringFrameSerial);
   }
   {
     auto phaseScope =
@@ -32359,10 +32647,14 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
   {
     auto phaseScope =
         War3PresentFrameTransitionScope("TrackingDecision");
-    const bool wantsShadowCapture =
+    const bool shadowSessionReady =
+        m_war3ShadowSessionReady.load(std::memory_order_acquire) &&
+        m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) ==
+            m_war3ShadowMapResetAppliedSerial;
+    const bool wantsShadowCapture = shadowSessionReady &&
         m_war3Pipeline && m_war3Pipeline->WantsShadowCapture();
     const bool wantsSemanticSceneIdentity =
-        War3SemanticConsumerEnabled() &&
+        shadowSessionReady && War3SemanticConsumerEnabled() &&
         dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled();
     bool wantsShadowObjectIdentity =
         (wantsShadowCapture || wantsSemanticSceneIdentity) &&
@@ -32441,8 +32733,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       const uint64_t retiringFrameSerial =
           m_war3ShadowPersistentFrameSerial + 1u;
       const uint64_t nextFrameSerial = retiringFrameSerial + 1u;
-      dxvk::war3::memory::ShadowArena_EndFrame(retiringFrameSerial);
-      if (m_war3ShadowArenaFence != nullptr) {
+      if (!war3ArenaRetiredAtMapTransition)
+        dxvk::war3::memory::ShadowArena_EndFrame(retiringFrameSerial);
+      if (!war3ArenaRetiredAtMapTransition &&
+          m_war3ShadowArenaFence != nullptr) {
         const Rc<sync::Fence> cShadowArenaFence = m_war3ShadowArenaFence;
         EmitCs([cShadowArenaFence,
                 cRetiringFrameSerial = retiringFrameSerial](DxvkContext* ctx) {
@@ -32453,11 +32747,35 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
           m_war3ShadowArenaFence != nullptr
               ? m_war3ShadowArenaFence->value()
               : 0u;
-      if (!dxvk::war3::memory::ShadowArena_BeginFrame(
-              nextFrameSerial, completedSerial)) {
+      War3CollectRetiredShadowSessions(completedSerial);
+      const bool arenaReady = dxvk::war3::memory::ShadowArena_BeginFrame(
+          nextFrameSerial, completedSerial);
+      const bool resetFullyApplied =
+          m_war3ShadowMapResetRequestedSerial.load(
+              std::memory_order_acquire) ==
+          m_war3ShadowMapResetAppliedSerial;
+      m_war3ShadowSessionReady.store(
+          arenaReady && resetFullyApplied, std::memory_order_release);
+      m_war3ShadowDiagTransitionState.store(
+          arenaReady && resetFullyApplied ? 0u : 2u,
+          std::memory_order_release);
+      if (!arenaReady) {
         m_war3Scene.shadowStats.budgetExceeded = 1u;
         m_war3ShadowFallbackBudgetExceeded = true;
       }
+    } else {
+      War3CollectRetiredShadowSessions(
+          m_war3ShadowArenaFence != nullptr
+              ? m_war3ShadowArenaFence->value()
+              : std::numeric_limits<uint64_t>::max());
+      const bool resetFullyApplied =
+          m_war3ShadowMapResetRequestedSerial.load(
+              std::memory_order_acquire) ==
+          m_war3ShadowMapResetAppliedSerial;
+      m_war3ShadowSessionReady.store(resetFullyApplied,
+                                     std::memory_order_release);
+      m_war3ShadowDiagTransitionState.store(
+          resetFullyApplied ? 0u : 2u, std::memory_order_release);
     }
   }
   {
@@ -38665,7 +38983,8 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
               : War3ShadowMetadataBlockerReason::KnownRawcode);
       War3MarkDrawTimeExactRejectedCurrentFrame(
           War3MakeDrawTimeVBCacheKey(
-              renderablePart, dispatch.layerIndex, &contract));
+              renderablePart, dispatch.layerIndex, &contract,
+              m_war3GpuSkinMapEpoch));
       return true;
     }
   }
@@ -38839,7 +39158,8 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
           publishBlocker(War3ShadowMetadataBlockerReason::BelowGround);
           War3MarkDrawTimeExactRejectedCurrentFrame(
               War3MakeDrawTimeVBCacheKey(
-                  renderablePart, dispatch.layerIndex, &contract));
+                  renderablePart, dispatch.layerIndex, &contract,
+                  m_war3GpuSkinMapEpoch));
           NotePathBlockerGeometryMarkerRejectLog(
               markerProbe, "Metadata/BelowGroundFlat", &bounds);
           return true;
@@ -39158,6 +39478,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   if (gpuSkinResolvedExact)
     ++m_war3GpuSkinP2ResolvedInputs;
 
+  if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
+      m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
+          m_war3ShadowMapResetAppliedSerial) {
+    m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    return;
+  }
+
   if (war3::runtime::IsWar3RuntimeModuleDisabled(
           war3::runtime::War3RuntimeModule::ShadowCapture))
     return;
@@ -39259,7 +39587,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
         War3MarkDrawTimeExactRejectedCurrentFrame(
             War3MakeDrawTimeVBCacheKey(
-                renderablePart, dispatch.layerIndex, &contract));
+                renderablePart, dispatch.layerIndex, &contract,
+                m_war3GpuSkinMapEpoch));
       };
   if (isStage13WorldObjectDraw)
     m_war3Scene.shadowStats.stage13CaptureAttemptCount++;
@@ -39933,7 +40262,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
         const War3DrawTimeVBCacheKey vbCacheKey =
             War3MakeDrawTimeVBCacheKey(
-                vbCachePart, vbCacheLayerIndex, &vbCacheContract);
+                vbCachePart, vbCacheLayerIndex, &vbCacheContract,
+                m_war3GpuSkinMapEpoch);
         // Phase 7.96/7.98：在 GPU copy 之前拦截路径阻断器，避免无意义的 VB 拷贝。
         // 路径阻断器（path blocker）是 War3 引擎用来阻挡单位通行的不可见对象，
         // 不应该投射阴影。
@@ -41095,6 +41425,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // a new contract/alpha state with the previous draw's backing.
         entry.captureComplete = false;
         entry.persistentPackageCurrentDrawProof = {};
+        entry.mapEpoch = m_war3GpuSkinMapEpoch;
         entry.renderablePart = vbCachePart;
         entry.layerIndex = vbCacheLayerIndex;
         entry.payloadWord108 = vbCacheKey.payloadWord108;
@@ -42861,6 +43192,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   dxvk::war3::native::War3NativeShadowHint nativeHint = {};
   const bool hasNativeHint =
       War3TryResolveNativeShadowHint(semantic, currentObj, nativeHint);
+  const bool authoritativeLegacyUnitEvidence =
+      legacyHasDynamicUnitObjectEvidence ||
+      (hasNativeHint &&
+       nativeHint.objectKind == dxvk::war3::render::ObjectKind::Unit);
   const bool nativeHintUnitLike =
       hasNativeHint &&
       (nativeHint.objectKind == dxvk::war3::render::ObjectKind::Unit ||
@@ -43168,7 +43503,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.batchTag = (execTag != War3BatchTag::Unknown) ? execTag : tag;
     draw.stage = static_cast<int16_t>(stage);
     draw.batchHandle = batchHandle;
-    draw.objectKind = resolvedObjectKind;
+    draw.shadowUnitIdentityProven = authoritativeLegacyUnitEvidence;
+    draw.objectKind =
+        resolvedObjectKind == static_cast<uint8_t>(
+                                  dxvk::war3::render::ObjectKind::Unit) &&
+                !draw.shadowUnitIdentityProven
+            ? static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unknown)
+            : resolvedObjectKind;
     // 2026-05-31：把已解析的身份写入 caster，供最终统一 path blocker 清扫。
     draw.rawcode = semantic.rawcode != 0u
                        ? semantic.rawcode
@@ -43593,6 +43934,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
 
     War3ShadowCasterDraw draw = {};
+    draw.mapEpoch = m_war3GpuSkinMapEpoch;
+    draw.deviceEpoch = m_war3GpuSkinDeviceEpoch;
     draw.indexed = geometry->indexed;
     draw.positionStorage = geometry->positionStorage;
     draw.positionInfo = geometry->positionInfo;
@@ -45618,6 +45961,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       instance.mode = replayMode;
 
       War3ShadowCasterDraw compatDraw = {};
+      compatDraw.mapEpoch = m_war3GpuSkinMapEpoch;
+      compatDraw.deviceEpoch = m_war3GpuSkinDeviceEpoch;
       compatDraw.indexed = geometry->indexed;
       compatDraw.positionStorage = geometry->positionStorage;
       compatDraw.positionInfo = geometry->positionInfo;
@@ -46311,6 +46656,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
     key.sourceBuffer = sourceSlice.buffer().ptr();
     key.size = bytes;
+    key.mapEpoch = m_war3GpuSkinMapEpoch;
     key.frameSerial = freezeFrameSerial;
     key.streamType = streamType;
     if (stableUpload) {
@@ -46774,6 +47120,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   noteDynamicPoseUsage(dynamicShadowSource);
 
   War3ShadowCasterDraw draw = {};
+  draw.mapEpoch = m_war3GpuSkinMapEpoch;
+  draw.deviceEpoch = m_war3GpuSkinDeviceEpoch;
   draw.indexed = indexed;
   draw.positionStorage = std::move(posAlloc);
   draw.positionInfo = posInfo;

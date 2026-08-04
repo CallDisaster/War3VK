@@ -3085,9 +3085,14 @@ bool VisibleRenderableRegistry::queryByRuntimeModel(
 void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     const std::vector<CurrentDrawContractRecord>& records,
     uint64_t frameNumber) {
+  if (m_shadowManifestMapEpoch == 0u) {
+    clearShadowManifest();
+    return;
+  }
   const uint64_t frame =
       frameNumber != 0u ? frameNumber : m_frameNumber.load(std::memory_order_relaxed);
   ShadowManifestSummary summary = {};
+  summary.mapEpoch = m_shadowManifestMapEpoch;
   summary.frameNumber = frame;
   summary.poseFreshGenerationVerifierMismatchCount =
       m_shadowManifestSummary.poseFreshGenerationVerifierMismatchCount;
@@ -3156,6 +3161,7 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     auto objectIt = m_shadowManifestObjects.find(objectKey);
     if (objectIt == m_shadowManifestObjects.end()) {
       ShadowManifestObjectEntry entry = {};
+      entry.mapEpoch = m_shadowManifestMapEpoch;
       entry.key = objectKey;
       entry.firstSeenFrame = frame;
       entry.lastSeenFrame = frame;
@@ -3165,6 +3171,12 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
       ++summary.newObjectCount;
     } else {
       auto& entry = objectIt->second;
+      if (entry.mapEpoch != m_shadowManifestMapEpoch) {
+        entry = {};
+        entry.mapEpoch = m_shadowManifestMapEpoch;
+        entry.key = objectKey;
+        entry.firstSeenFrame = frame;
+      }
       if (entry.lastSeenFrame != frame)
         ++entry.observedFrameCount;
       entry.lastSeenFrame = frame;
@@ -3178,6 +3190,7 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     auto partIt = m_shadowManifestParts.find(partKey);
     if (partIt == m_shadowManifestParts.end()) {
       ShadowManifestPartEntry entry = {};
+      entry.mapEpoch = m_shadowManifestMapEpoch;
       entry.key = partKey;
       entry.objectKey = objectKey;
       entry.firstSeenFrame = frame;
@@ -3207,6 +3220,13 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
       // object entry 的 refresh generation 在统一 part sweep 中传播。
     } else {
       auto& entry = partIt->second;
+      if (entry.mapEpoch != m_shadowManifestMapEpoch) {
+        entry = {};
+        entry.mapEpoch = m_shadowManifestMapEpoch;
+        entry.key = partKey;
+        entry.objectKey = objectKey;
+        entry.firstSeenFrame = frame;
+      }
       if (entry.lastSeenFrame != frame)
         ++entry.observedFrameCount;
       if (entry.lastPayloadWord11C != record.payloadWord11C)
@@ -3374,6 +3394,8 @@ void VisibleRenderableRegistry::noteShadowManifestPartGoodPacket(
   const uint64_t frame =
       frameNumber != 0u ? frameNumber : m_frameNumber.load(std::memory_order_relaxed);
   auto& entry = it->second;
+  if (entry.mapEpoch == 0u || entry.mapEpoch != m_shadowManifestMapEpoch)
+    return;
   entry.lastGoodPacketFrame = frame;
   entry.lastPoseFrame = (std::max)(entry.lastPoseFrame, frame);
 
@@ -3418,6 +3440,10 @@ VisibleRenderableRegistry::queryShadowManifestPartLeaseInfo(
   const uint64_t frame =
       frameNumber != 0u ? frameNumber : m_frameNumber.load(std::memory_order_relaxed);
   const auto& entry = it->second;
+  if (entry.mapEpoch == 0u ||
+      entry.mapEpoch != m_shadowManifestMapEpoch)
+    return info;
+  info.mapEpoch = entry.mapEpoch;
   info.found = true;
   info.objectKey = entry.objectKey;
   info.lastSeenFrame = entry.lastSeenFrame;
@@ -3570,6 +3596,16 @@ VisibleRenderableRegistry::clearShadowManifest() {
   m_shadowManifestParts.clear();
   m_shadowManifestSummary = {};
   return result;
+}
+
+void VisibleRenderableRegistry::resetShadowManifestMapEpoch(
+    uint64_t mapEpoch) {
+  if (mapEpoch == 0u || mapEpoch == m_shadowManifestMapEpoch)
+    return;
+  clearShadowManifest();
+  m_shadowManifestMapEpoch = mapEpoch;
+  m_shadowManifestSummary.mapEpoch = mapEpoch;
+  m_shadowManifestRefreshGeneration = 0u;
 }
 
 VisibleRenderableRegistry::ShadowManifestSummary

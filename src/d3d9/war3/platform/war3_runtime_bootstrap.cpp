@@ -112,20 +112,12 @@ void InitializeRuntimeCore(uintptr_t gameBase) {
 }
 
 void ResetRuntimeCore() {
-  dxvk::war3::render::RenderQueueTracker::instance().Reset();
-  dxvk::war3::render::ExecBatchProcessor::ResetCaches();
-
-  dxvk::War3RenderState::ResetRuntimeState();
-
-  dxvk::war3::model::Shutdown();
-  dxvk::war3::render::ResetShadowRuntimeBridgeState();
-  dxvk::war3::render::War3LightningRuntime::instance().reset();
+  // This callback can run on the game/unload thread while the render thread is
+  // still recording the old map.  Keep it strictly to map/JASS-owned CPU
+  // state.  RenderQueue, model, Lightning, shadow bridge, Receiver, GPU Skin
+  // and Arena state are reset together by the Present safe-point transaction.
   dxvk::war3::math::CurveRuntime::instance().reset();
-  dxvk::war3::shadow::ShadowValidationRuntime::instance().reset();
   dxvk::war3::tools::ResetWar3ControlPlaneState();
-  dxvk::war3::render::War3Renderer::instance().EndFrame();
-  dxvk::war3::render::War3Renderer::instance().BeginFrame();
-  dxvk::war3::memory::ShadowArena_Reset();
   dxvk::war3::state::RenderState::instance().setWorldPointer(nullptr);
   dxvk::war3::state::RenderState::instance().setIsInGame(false);
   dxvk::war3::state::RenderState::instance().setIsLoading(false);

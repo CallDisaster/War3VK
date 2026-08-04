@@ -9,6 +9,7 @@
 #include "war3/render/war3_hybrid_ray_tracing.h"
 #include "war3/render/war3_shadow_lifecycle.h"
 #include "war3/render/war3_shadow_producer_policy.h"
+#include "war3/render/war3_shadow_replay_validation.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
 #include "war3/render/war3_union_consumer_visibility.h"
 #include "war3/shader/war3_shader_manager.h"
@@ -66,6 +67,26 @@ std::mutex g_shadowDiagnosticsMutex;
 ShadowTaaDiagnostics g_shadowTaaDiagnostics = {};
 CsmResolutionDiagnostics g_csmResolutionDiagnostics = {};
 PointShadowPersistentDiagnostics g_pointShadowPersistentDiagnostics = {};
+struct ShadowReplayDiagnosticsAtomic {
+  std::atomic<uint64_t> mapEpoch{0u};
+  std::atomic<uint64_t> deviceEpoch{0u};
+  std::atomic<uint64_t> candidateFrameSerial{0u};
+  std::atomic<uint64_t> firstCompleteLatencyFrames{0u};
+  std::atomic<uint64_t> staleEpochConsumerRejectCount{0u};
+  std::atomic<uint64_t> validationRejectCount{0u};
+  std::atomic<uint64_t> partialPreventedCount{0u};
+  std::atomic<uint64_t> pointWorkerCancelCount{0u};
+  std::atomic<uint64_t> pointLateResultRejectCount{0u};
+  std::atomic<uint32_t> plannedCasterCount{0u};
+  std::atomic<uint32_t> replayCasterCount{0u};
+  std::atomic<uint32_t> validatedCasterCount{0u};
+  std::atomic<uint32_t> drawnCasterCount{0u};
+  std::atomic<uint32_t> lastRejectReason{0u};
+  std::atomic<uint64_t> lastOffenderMapEpoch{0u};
+  std::atomic<uint64_t> lastRequiredEnd{0u};
+  std::atomic<uint64_t> lastAvailableSize{0u};
+};
+ShadowReplayDiagnosticsAtomic g_shadowReplayDiagnostics = {};
 std::atomic<uint64_t> g_pointShadowPersistentRendererEpoch{1u};
 
 uint64_t MintPointShadowPersistentRendererEpoch() noexcept {
@@ -293,6 +314,155 @@ ShadowGpuSkinDirectDecision EvaluateShadowGpuSkinDirectInput(
       draw.vertexBlendCount == 0u && draw.blendBinding == 0u &&
       drawRangeExact;
   return result;
+}
+
+uint32_t War3ShadowFormatByteSize(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_R8G8B8A8_USCALED:
+    case VK_FORMAT_R8G8B8A8_SSCALED:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16_SSCALED:
+    case VK_FORMAT_A2B10G10R10_USCALED_PACK32:
+    case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
+      return 4u;
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32_UINT:
+    case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM:
+    case VK_FORMAT_R16G16B16A16_UINT:
+    case VK_FORMAT_R16G16B16A16_SINT:
+    case VK_FORMAT_R16G16B16A16_SSCALED:
+      return 8u;
+    case VK_FORMAT_R32G32B32_SFLOAT:
+    case VK_FORMAT_R32G32B32_UINT:
+    case VK_FORMAT_R32G32B32_SINT:
+      return 12u;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_R32G32B32A32_SINT:
+      return 16u;
+    default:
+      return 0u;
+  }
+}
+
+uint32_t War3ShadowAttributeEnd(uint32_t offset, VkFormat format) {
+  const uint32_t bytes = War3ShadowFormatByteSize(format);
+  return bytes != 0u && offset <= std::numeric_limits<uint32_t>::max() - bytes
+      ? offset + bytes
+      : 0u;
+}
+
+bool War3ShadowMatrixFinite(const Matrix4& matrix) {
+  for (uint32_t column = 0u; column < 4u; ++column) {
+    if (!std::isfinite(matrix[column].x) ||
+        !std::isfinite(matrix[column].y) ||
+        !std::isfinite(matrix[column].z) ||
+        !std::isfinite(matrix[column].w))
+      return false;
+  }
+  return true;
+}
+
+war3::render::War3ShadowReplayValidationInput
+MakeWar3ShadowReplayValidationInput(
+    const War3ShadowCasterDraw& draw, const War3PipelineInput& input) {
+  using war3::render::War3ShadowReplayBufferAccess;
+  war3::render::War3ShadowReplayValidationInput validation = {};
+  validation.expectedMapEpoch = input.mapEpoch;
+  validation.expectedDeviceEpoch = input.deviceEpoch;
+  validation.drawMapEpoch = draw.mapEpoch;
+  validation.drawDeviceEpoch = draw.deviceEpoch;
+  validation.worldMatrixFinite = War3ShadowMatrixFinite(draw.worldMatrix);
+  validation.position = {
+      draw.positionStorage != nullptr &&
+          draw.positionInfo.buffer != VK_NULL_HANDLE,
+      uint64_t(draw.positionInfo.size), draw.positionStride,
+      draw.positionOffset, War3ShadowFormatByteSize(draw.positionFormat)};
+  validation.indexed = draw.indexed;
+  validation.indexBufferPresent =
+      draw.indexStorage != nullptr && draw.indexInfo.buffer != VK_NULL_HANDLE;
+  validation.indexBufferSize = uint64_t(draw.indexInfo.size);
+  validation.indexTypeBytes = draw.indexType == VK_INDEX_TYPE_UINT16
+      ? 2u
+      : draw.indexType == VK_INDEX_TYPE_UINT32 ? 4u : 0u;
+  validation.firstIndex = draw.firstIndex;
+  validation.indexCount = draw.indexCount;
+  validation.vertexOffset = draw.vertexOffset;
+  validation.minVertexIndex = draw.minVertexIndex;
+  validation.numVertices = draw.numVertices;
+  validation.firstVertex = draw.firstVertex;
+  validation.vertexCount = draw.vertexCount;
+  validation.actualIndexDomainKnown = draw.shadowActualIndexDomainKnown;
+  validation.actualIndexMin = draw.shadowActualIndexMin;
+  validation.actualIndexMax = draw.shadowActualIndexMax;
+
+  validation.blendRequired =
+      draw.vertexBlendEnabled && draw.vertexBlendCount != 0u;
+  if (validation.blendRequired) {
+    const uint32_t weightEnd = War3ShadowAttributeEnd(
+        draw.blendWeightOffset, draw.blendWeightFormat);
+    const uint32_t indexEnd = draw.vertexBlendIndexed
+        ? War3ShadowAttributeEnd(draw.blendIndexOffset,
+                                draw.blendIndexFormat)
+        : 0u;
+    const bool sharesPosition = draw.blendBinding == 0u;
+    validation.blend = {
+        sharesPosition
+            ? validation.position.present
+            : draw.blendStorage != nullptr &&
+                  draw.blendInfo.buffer != VK_NULL_HANDLE,
+        sharesPosition ? uint64_t(draw.positionInfo.size)
+                       : uint64_t(draw.blendInfo.size),
+        sharesPosition ? draw.positionStride : draw.blendStride,
+        0u, std::max(weightEnd, indexEnd)};
+  }
+
+  validation.uvRequired = draw.alphaTestEnabled;
+  if (validation.uvRequired) {
+    const bool sharesPosition = draw.uvBinding == 0u;
+    validation.uv = {
+        sharesPosition
+            ? validation.position.present
+            : draw.uvStorage != nullptr && draw.uvInfo.buffer != VK_NULL_HANDLE,
+        sharesPosition ? uint64_t(draw.positionInfo.size)
+                       : uint64_t(draw.uvInfo.size),
+        sharesPosition ? draw.positionStride : draw.uvStride,
+        draw.uvOffset, War3ShadowFormatByteSize(draw.uvFormat)};
+  }
+
+  validation.gpuSkinRequired = draw.gpuSkinInput.valid;
+  if (validation.gpuSkinRequired) {
+    const auto& skin = draw.gpuSkinInput;
+    validation.gpuSkinLeaseValid = static_cast<bool>(skin);
+    validation.gpuSkinMapEpoch = skin.desc.mapEpoch;
+    validation.gpuSkinDeviceEpoch = skin.desc.deviceEpoch;
+    validation.gpuSkinSourceSize = skin.staticSource.buffer() != nullptr
+        ? uint64_t(skin.staticSource.buffer()->info().size)
+        : 0u;
+    validation.gpuSkinSourceOffset = skin.desc.staticByteOffset;
+    validation.gpuSkinSourceLength = skin.desc.staticByteLength;
+    validation.gpuSkinPaletteSize = skin.palette.buffer() != nullptr
+        ? uint64_t(skin.palette.buffer()->info().size)
+        : 0u;
+    validation.gpuSkinPaletteOffset = skin.desc.paletteByteOffset;
+    validation.gpuSkinPaletteLength = skin.desc.paletteByteLength;
+  }
+  return validation;
 }
 
 void SetShadowGpuSkinStorageDescriptors(
@@ -1763,6 +1933,31 @@ QueryPointShadowPersistentDiagnostics() {
   return g_pointShadowPersistentDiagnostics;
 }
 
+ShadowReplayDiagnostics QueryShadowReplayDiagnostics() {
+  ShadowReplayDiagnostics result = {};
+#define WAR3_LOAD_REPLAY_DIAG(name) \
+  result.name = g_shadowReplayDiagnostics.name.load(std::memory_order_acquire)
+  WAR3_LOAD_REPLAY_DIAG(mapEpoch);
+  WAR3_LOAD_REPLAY_DIAG(deviceEpoch);
+  WAR3_LOAD_REPLAY_DIAG(candidateFrameSerial);
+  WAR3_LOAD_REPLAY_DIAG(firstCompleteLatencyFrames);
+  WAR3_LOAD_REPLAY_DIAG(staleEpochConsumerRejectCount);
+  WAR3_LOAD_REPLAY_DIAG(validationRejectCount);
+  WAR3_LOAD_REPLAY_DIAG(partialPreventedCount);
+  WAR3_LOAD_REPLAY_DIAG(pointWorkerCancelCount);
+  WAR3_LOAD_REPLAY_DIAG(pointLateResultRejectCount);
+  WAR3_LOAD_REPLAY_DIAG(plannedCasterCount);
+  WAR3_LOAD_REPLAY_DIAG(replayCasterCount);
+  WAR3_LOAD_REPLAY_DIAG(validatedCasterCount);
+  WAR3_LOAD_REPLAY_DIAG(drawnCasterCount);
+  WAR3_LOAD_REPLAY_DIAG(lastRejectReason);
+  WAR3_LOAD_REPLAY_DIAG(lastOffenderMapEpoch);
+  WAR3_LOAD_REPLAY_DIAG(lastRequiredEnd);
+  WAR3_LOAD_REPLAY_DIAG(lastAvailableSize);
+#undef WAR3_LOAD_REPLAY_DIAG
+  return result;
+}
+
 void PublishShadowTaaDiagnostics(
     const ShadowTaaDiagnostics& diagnostics) {
   std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
@@ -2636,6 +2831,102 @@ void War3ShadowReceiverPass::renderMotionVectors(
   reconciliation.shadowMotionVectorExecutedThisFrame = 1u;
 }
 
+void War3ShadowReceiverPass::InvalidateMapEpoch(uint64_t mapEpoch,
+                                                uint64_t deviceEpoch) {
+  if (mapEpoch == 0u || deviceEpoch == 0u ||
+      (mapEpoch == m_shadowMapEpoch && deviceEpoch == m_shadowDeviceEpoch))
+    return;
+
+  // The std::async path writes pass-owned plan state, so it must be drained
+  // at the render-thread transition. The persistent worker owns a sealed
+  // value mailbox; shutting it down cancels admission and joins any job before
+  // the old renderer epoch can be observed again.
+  if (m_pointShadowPrepareFuture.valid())
+    ++m_pointShadowWorkerCancelCount;
+  waitPointShadowCpuPrepare();
+  if (m_pointShadowPersistentWorker) {
+    if (m_pointShadowPersistentPending)
+      ++m_pointShadowWorkerCancelCount;
+    m_pointShadowPersistentWorker->shutdown();
+    m_pointShadowPersistentWorker.reset();
+  }
+  m_pointShadowPersistentPending = false;
+  m_pointShadowPersistentPendingGeneration = {};
+  m_pointShadowPersistentPendingSeal = {};
+  m_pointShadowPersistentExpectedSettings = {};
+  m_pointShadowPersistentExpectedHistory = {};
+  m_pointShadowPersistentExpectedLights = {};
+  m_pointShadowPersistentExpectedLightCount = 0u;
+  m_pointShadowPersistentExpectedDynamicPoseSignature = 0u;
+  m_pointShadowPersistentExpectedDynamicPoseCount = 0u;
+  m_pointShadowPersistentExpectedDynamicSkinnedOutputCount = 0u;
+  m_pointShadowPersistentRendererEpoch =
+      MintPointShadowPersistentRendererEpoch();
+  resetPointShadowCpuPlanPreservingCapacity();
+  invalidatePointShadowPublishedState();
+
+  m_shadowMapEpoch = mapEpoch;
+  m_shadowDeviceEpoch = deviceEpoch;
+  m_epochFirstCandidateFrameSerial = 0u;
+  m_epochFirstCompleteLatencyFrames = 0u;
+  g_shadowReplayDiagnostics.mapEpoch.store(mapEpoch,
+                                           std::memory_order_release);
+  g_shadowReplayDiagnostics.deviceEpoch.store(deviceEpoch,
+                                               std::memory_order_release);
+  g_shadowReplayDiagnostics.candidateFrameSerial.store(
+      0u, std::memory_order_release);
+  g_shadowReplayDiagnostics.firstCompleteLatencyFrames.store(
+      0u, std::memory_order_release);
+  g_shadowReplayDiagnostics.plannedCasterCount.store(
+      0u, std::memory_order_release);
+  g_shadowReplayDiagnostics.replayCasterCount.store(
+      0u, std::memory_order_release);
+  g_shadowReplayDiagnostics.validatedCasterCount.store(
+      0u, std::memory_order_release);
+  g_shadowReplayDiagnostics.drawnCasterCount.store(
+      0u, std::memory_order_release);
+  g_shadowReplayDiagnostics.pointWorkerCancelCount.store(
+      m_pointShadowWorkerCancelCount, std::memory_order_release);
+  g_shadowReplayDiagnostics.pointLateResultRejectCount.store(
+      m_pointShadowLateResultRejectCount, std::memory_order_release);
+  m_hasCompleteShadowMap = false;
+  m_replayValidationFailedThisFrame = false;
+  m_replayValidationHoldFramesRemaining = 0u;
+  m_shadowPublicationSettledFrameSerial = 0u;
+  m_shadowHistoryValid = false;
+  m_shadowTaaWasActiveLastFrame = false;
+  m_shadowTaaHistoryContractValid = false;
+  m_shadowTaaHistoryLifecycleSerial = 0u;
+  m_shadowTaaHistoryStagePolicyRevision = 0u;
+  m_shadowTaaHistoryMapResourceGeneration = 0u;
+  m_shadowTaaHistoryResourceGeneration = 0u;
+  m_lastShadowMapCasterCount = 0u;
+  m_lastDynamicPoseSignature = 0u;
+  m_lastShadowMapReplayContentHash = 0u;
+  m_lastShadowMapReplayBackingHash = 0u;
+  m_lastShadowMapStagePolicyRevision = 0u;
+  m_lastShadowMapCsmHash = 0u;
+  m_lastShadowMapResourceGeneration = 0u;
+  m_shadowAdaptiveFrameIndex = 0u;
+  m_transientEmptyReplayHoldFramesRemaining = 0u;
+  m_recentSemanticDynamicHoldFramesRemaining = 0u;
+  m_semanticIdentityChurnHoldFramesRemaining = 0u;
+  m_semanticCoverageDropHoldStreak = 0u;
+  m_lastShadowMapSemanticIdentityHash = 0u;
+  m_pendingShadowMapSemanticIdentityHash = 0u;
+  m_pendingShadowMapSemanticIdentityStableFrames = 0u;
+  m_hasLastShadowMapLighting = false;
+  m_hasLastGoodReceiverCamera = false;
+
+  m_pointRayHiZVisibilityView = nullptr;
+  m_pointRayHiZView = nullptr;
+  m_pointRayHiZLightCount = 0u;
+  m_pointRayHiZFrameSerial = 0u;
+  m_pointRayHiZResourceGeneration = 0u;
+  m_pointRayHiZLightGeneration = 0u;
+  invalidateVolumeSunShadowPublication();
+}
+
 void War3ShadowReceiverPass::renderShadowVisibility(
     const Rc<DxvkCommandList> &ctx, const War3PipelineInput &input) {
   if (!m_shadowCurrentView || !m_depthCopyView || !m_shadowMapSampleView ||
@@ -2965,6 +3256,63 @@ bool War3ShadowReceiverPass::renderVolumeSunShadow(
   return true;
 }
 
+bool War3ShadowReceiverPass::validateShadowReplayDraws(
+    const War3PipelineInput& input,
+    const std::vector<const War3ShadowCasterDraw*>& replayDraws,
+    const char* consumer) {
+  for (const War3ShadowCasterDraw* draw : replayDraws) {
+    war3::render::War3ShadowReplayValidationResult result = {};
+    if (draw == nullptr) {
+      result.reason =
+          war3::render::War3ShadowReplayRejectReason::MissingPositionBuffer;
+    } else {
+      result = war3::render::ValidateWar3ShadowReplayDraw(
+          MakeWar3ShadowReplayValidationInput(*draw, input));
+    }
+    if (result) continue;
+
+    ++reconciliation.replayValidationRejectedCount;
+    ++reconciliation.replayPartialPreventedCount;
+    reconciliation.replayValidationLastReason =
+        static_cast<uint32_t>(result.reason);
+    reconciliation.replayValidationLastDrawMapEpoch =
+        draw != nullptr ? draw->mapEpoch : 0u;
+    reconciliation.replayValidationLastExpectedMapEpoch = input.mapEpoch;
+    reconciliation.replayValidationLastRequiredEnd = result.requiredEnd;
+    reconciliation.replayValidationLastAvailableSize = result.availableSize;
+    g_shadowReplayDiagnostics.validationRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_shadowReplayDiagnostics.partialPreventedCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_shadowReplayDiagnostics.lastRejectReason.store(
+        static_cast<uint32_t>(result.reason), std::memory_order_release);
+    g_shadowReplayDiagnostics.lastOffenderMapEpoch.store(
+        draw != nullptr ? draw->mapEpoch : 0u, std::memory_order_release);
+    g_shadowReplayDiagnostics.lastRequiredEnd.store(
+        result.requiredEnd, std::memory_order_release);
+    g_shadowReplayDiagnostics.lastAvailableSize.store(
+        result.availableSize, std::memory_order_release);
+    m_replayValidationFailedThisFrame = true;
+
+    static uint32_t s_replayRejectLogs = 0u;
+    if (s_replayRejectLogs++ < 32u ||
+        (s_replayRejectLogs % 240u) == 0u) {
+      WAR3_RENDER_LOG(
+          "DXVK War3ShadowReplay: reject consumer=%s reason=%s "
+          "drawEpoch=%llu expectedEpoch=%llu required=%llu available=%llu\n",
+          consumer != nullptr ? consumer : "unknown",
+          war3::render::War3ShadowReplayRejectReasonName(result.reason),
+          static_cast<unsigned long long>(
+              draw != nullptr ? draw->mapEpoch : 0u),
+          static_cast<unsigned long long>(input.mapEpoch),
+          static_cast<unsigned long long>(result.requiredEnd),
+          static_cast<unsigned long long>(result.availableSize));
+    }
+    return false;
+  }
+  return true;
+}
+
 bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
                                              const War3PipelineInput &input,
                                              const std::vector<
@@ -3042,6 +3390,36 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     replayDrawsPtr = &BuildShadowReplayDraws(input.scene, input.frameSerial);
   }
   const auto& replayDraws = *replayDrawsPtr;
+  const uint32_t replayCasterCount = static_cast<uint32_t>(
+      std::min<size_t>(replayDraws.size(),
+                       std::numeric_limits<uint32_t>::max()));
+  if (!m_volumeSunRenderPathActive) {
+    g_shadowReplayDiagnostics.mapEpoch.store(input.mapEpoch,
+                                             std::memory_order_release);
+    g_shadowReplayDiagnostics.deviceEpoch.store(input.deviceEpoch,
+                                                 std::memory_order_release);
+    g_shadowReplayDiagnostics.candidateFrameSerial.store(
+        input.frameSerial, std::memory_order_release);
+    g_shadowReplayDiagnostics.plannedCasterCount.store(
+        replayCasterCount, std::memory_order_release);
+    g_shadowReplayDiagnostics.replayCasterCount.store(
+        replayCasterCount, std::memory_order_release);
+    g_shadowReplayDiagnostics.validatedCasterCount.store(
+        0u, std::memory_order_release);
+    g_shadowReplayDiagnostics.drawnCasterCount.store(
+        0u, std::memory_order_release);
+  }
+  m_replayValidationFailedThisFrame = false;
+  if (!validateShadowReplayDraws(input, replayDraws,
+                                 m_volumeSunRenderPathActive
+                                     ? "volume-sun"
+                                     : "csm-terrain-mask")) {
+    return false;
+  }
+  if (!m_volumeSunRenderPathActive) {
+    g_shadowReplayDiagnostics.validatedCasterCount.store(
+        replayCasterCount, std::memory_order_release);
+  }
 
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
@@ -3170,6 +3548,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   uint32_t skinnedInvalidBufferCount = 0;
   uint32_t skinnedInvalidPipelineCount = 0;
   uint32_t preparedDrawCount = 0;
+  uint32_t requiredPreparedDrawCount = 0;
   uint32_t alphaTestPreparedCount = 0;
   uint32_t alphaPromotedPreparedCount = 0;
   uint32_t dynamicPreparedCount = 0;
@@ -3240,10 +3619,11 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     // any texture/UV backing is incomplete rather than drawing an opaque card.
     const bool alphaPayloadComplete =
         draw.diffuseTexture && draw.HasUsableUvBinding();
-    if ((draw.alphaBlendEnabled && !draw.alphaTestEnabled) ||
-        (draw.alphaTestEnabled && !alphaPayloadComplete)) {
+    if (draw.alphaBlendEnabled && !draw.alphaTestEnabled)
       continue;
-    }
+    ++requiredPreparedDrawCount;
+    if (draw.alphaTestEnabled && !alphaPayloadComplete)
+      continue;
     const bool effectiveAlphaTestShadow =
         draw.alphaTestEnabled && alphaPayloadComplete;
     const bool alphaPromotedShadow = false;
@@ -3310,6 +3690,59 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     }
 
     prepared[i] = out;
+  }
+
+  if (preparedDrawCount != requiredPreparedDrawCount) {
+    // Pipeline/material preparation is part of the publication transaction.
+    // The old complete contents have not been cleared or drawn over, so put
+    // both images back into their sampling layouts and reject the candidate.
+    VkImageMemoryBarrier2 toRead = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toRead.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    toRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    toRead.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    toRead.image = m_shadowMap->handle();
+    toRead.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u,
+                               cascadeCount};
+    VkDependencyInfo depthDep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depthDep.imageMemoryBarrierCount = 1u;
+    depthDep.pImageMemoryBarriers = &toRead;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depthDep);
+    if (terrainCasterMaskEnabled) {
+      VkImageMemoryBarrier2 maskToRead = {
+          VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+      maskToRead.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      maskToRead.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+      maskToRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+      maskToRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+      maskToRead.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      maskToRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      maskToRead.image = m_shadowCasterMask->handle();
+      maskToRead.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u,
+                                     cascadeCount};
+      VkDependencyInfo maskDep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      maskDep.imageMemoryBarrierCount = 1u;
+      maskDep.pImageMemoryBarriers = &maskToRead;
+      ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &maskDep);
+    }
+    ++reconciliation.replayValidationRejectedCount;
+    ++reconciliation.replayPartialPreventedCount;
+    reconciliation.replayValidationLastReason = static_cast<uint32_t>(
+        war3::render::War3ShadowReplayRejectReason::IncompleteReplayPlan);
+    g_shadowReplayDiagnostics.validationRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_shadowReplayDiagnostics.partialPreventedCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_shadowReplayDiagnostics.lastRejectReason.store(
+        reconciliation.replayValidationLastReason,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.validatedCasterCount.store(
+        preparedDrawCount, std::memory_order_release);
+    m_replayValidationFailedThisFrame = true;
+    return false;
   }
 
   shadowMapPhaseTiming.enter(static_cast<size_t>(
@@ -4438,6 +4871,10 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   }
   reconciliation.shadowMapExecutedThisFrame = 1u;
   reconciliation.shadowMapRenderSerial = ++m_shadowMapRenderSerial;
+  if (!m_volumeSunRenderPathActive) {
+    g_shadowReplayDiagnostics.drawnCasterCount.store(
+        preparedDrawCount, std::memory_order_release);
+  }
   return true;
 }
 
@@ -5296,6 +5733,9 @@ War3ShadowReceiverPass::tryCollectPointShadowPersistentProposal(
       m_pointShadowPersistentPendingGeneration.lightGeneration !=
           lightSnapshot.generation ||
       lightSnapshot.frameSerial != input.frameSerial) {
+    ++m_pointShadowLateResultRejectCount;
+    g_shadowReplayDiagnostics.pointLateResultRejectCount.store(
+        m_pointShadowLateResultRejectCount, std::memory_order_release);
     return std::nullopt;
   }
 
@@ -6476,6 +6916,12 @@ void War3ShadowReceiverPass::renderPointShadow(
     return;
   }
 
+  if (!validateShadowReplayDraws(input, replayDraws, "point-shadow")) {
+    invalidatePointShadowPublishedState();
+    m_pointShadowCpuPlan.shouldRender = false;
+    return;
+  }
+
   const uint32_t shadowLightCount = m_pointShadowCpuPlan.shadowLightCount;
   const uint32_t pointShadowResolution = m_pointShadowCpuPlan.resolution;
   const uint32_t pointShadowCapacityLights =
@@ -6555,6 +7001,100 @@ void War3ShadowReceiverPass::renderPointShadow(
       shadowLightCount > m_pointShadowCapacityLights) {
     invalidatePointShadowPublishedState();
     m_pointShadowCpuPlan.shouldRender = false;
+    return;
+  }
+
+  // Validate every face/caster/pipeline cohort before the first cube layer is
+  // transitioned or cleared. A point-shadow candidate is one transaction:
+  // missing views, stale plan indices, alpha payload gaps or pipeline failure
+  // revoke publication instead of leaving a partially refreshed cube.
+  bool pointReplayPlanComplete = true;
+  for (uint32_t lightIndex = 0u;
+       pointReplayPlanComplete && lightIndex < shadowLightCount;
+       ++lightIndex) {
+    const uint8_t updateMask = m_pointShadowCpuPlan.updateMask[lightIndex];
+    for (uint32_t face = 0u; pointReplayPlanComplete && face < 6u; ++face) {
+      if ((updateMask & (1u << face)) == 0u)
+        continue;
+      const uint32_t faceLayer = lightIndex * 6u + face;
+      if (faceLayer >= m_pointShadowCapacityLights * 6u ||
+          !m_pointShadowFaceViews[faceLayer]) {
+        pointReplayPlanComplete = false;
+        break;
+      }
+      const auto& faceCasters =
+          m_pointShadowCpuPlan.faceCasters[lightIndex * 6u + face];
+      for (uint32_t drawIdx : faceCasters) {
+        if (drawIdx >= replayDraws.size() || replayDraws[drawIdx] == nullptr) {
+          pointReplayPlanComplete = false;
+          break;
+        }
+        const auto& draw = *replayDraws[drawIdx];
+        if (draw.alphaBlendEnabled && !draw.alphaTestEnabled)
+          continue;
+        const bool alphaPayloadComplete =
+            draw.diffuseTexture && draw.HasUsableUvBinding();
+        if (draw.alphaTestEnabled && !alphaPayloadComplete) {
+          pointReplayPlanComplete = false;
+          break;
+        }
+
+        ShadowCasterPipelineKey key = {};
+        key.positionFormat = draw.positionFormat;
+        key.positionStride = draw.positionStride;
+        key.positionOffset = draw.positionOffset;
+        key.topology = draw.topology;
+        key.pointShadowRadialDepth = true;
+        key.blendWeightFormat =
+            draw.vertexBlendEnabled && draw.vertexBlendCount > 0u
+                ? draw.blendWeightFormat
+                : VK_FORMAT_UNDEFINED;
+        key.blendWeightOffset =
+            key.blendWeightFormat != VK_FORMAT_UNDEFINED
+                ? draw.blendWeightOffset
+                : 0u;
+        key.blendIndexFormat =
+            draw.vertexBlendEnabled && draw.vertexBlendIndexed
+                ? draw.blendIndexFormat
+                : VK_FORMAT_UNDEFINED;
+        key.blendIndexOffset =
+            key.blendIndexFormat != VK_FORMAT_UNDEFINED
+                ? draw.blendIndexOffset
+                : 0u;
+        key.blendBinding = draw.blendBinding;
+        key.blendStride = draw.blendStride;
+        key.alphaTestEnabled = draw.alphaTestEnabled;
+        if (draw.alphaTestEnabled) {
+          key.uvFormat = draw.uvFormat;
+          key.uvOffset = draw.uvOffset;
+          key.uvStride = draw.uvStride;
+          key.uvBinding = draw.uvBinding;
+        }
+        const ShadowCasterPipeline pipeline = getShadowCasterPipeline(key);
+        const ShadowGpuSkinDirectDecision direct =
+            EvaluateShadowGpuSkinDirectInput(draw);
+        if (pipeline.pipeline == VK_NULL_HANDLE ||
+            (draw.gpuSkinInput.irreversible && direct.requested && !direct)) {
+          pointReplayPlanComplete = false;
+          break;
+        }
+      }
+    }
+  }
+  if (!pointReplayPlanComplete) {
+    invalidatePointShadowPublishedState();
+    m_pointShadowCpuPlan.shouldRender = false;
+    ++reconciliation.replayValidationRejectedCount;
+    ++reconciliation.replayPartialPreventedCount;
+    reconciliation.replayValidationLastReason = static_cast<uint32_t>(
+        war3::render::War3ShadowReplayRejectReason::IncompleteReplayPlan);
+    g_shadowReplayDiagnostics.validationRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_shadowReplayDiagnostics.partialPreventedCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_shadowReplayDiagnostics.lastRejectReason.store(
+        reconciliation.replayValidationLastReason,
+        std::memory_order_release);
     return;
   }
 
@@ -7453,6 +7993,33 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   // Phase 7.2: 每帧重置对账计数器
   reconciliation = {};
   reconciliation.shadowMapRenderSerial = m_shadowMapRenderSerial;
+  if (input.mapEpoch == 0u || input.deviceEpoch == 0u ||
+      input.mapEpoch != m_shadowMapEpoch ||
+      input.deviceEpoch != m_shadowDeviceEpoch) {
+    reconciliation.replayValidationRejectedCount = 1u;
+    reconciliation.replayPartialPreventedCount = 1u;
+    reconciliation.replayValidationLastReason = static_cast<uint32_t>(
+        input.mapEpoch != m_shadowMapEpoch
+            ? war3::render::War3ShadowReplayRejectReason::StaleMapEpoch
+            : war3::render::War3ShadowReplayRejectReason::StaleDeviceEpoch);
+    reconciliation.replayValidationLastExpectedMapEpoch = m_shadowMapEpoch;
+    reconciliation.replayValidationLastDrawMapEpoch = input.mapEpoch;
+    g_shadowReplayDiagnostics.staleEpochConsumerRejectCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_shadowReplayDiagnostics.partialPreventedCount.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_shadowReplayDiagnostics.lastRejectReason.store(
+        reconciliation.replayValidationLastReason,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastOffenderMapEpoch.store(
+        input.mapEpoch, std::memory_order_release);
+    return;
+  }
+  if (m_epochFirstCandidateFrameSerial == 0u) {
+    m_epochFirstCandidateFrameSerial = input.frameSerial;
+    g_shadowReplayDiagnostics.candidateFrameSerial.store(
+        input.frameSerial, std::memory_order_release);
+  }
   const uint64_t shadowMapResourceGenerationAtRunEntry =
       m_shadowMapResourceGeneration;
   const uint64_t shadowTaaResourceGenerationAtRunEntry =
@@ -9175,6 +9742,15 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         directionalMapResolvedForFrame = true;
         m_semanticCoverageDropHoldStreak = 0u;
         m_hasCompleteShadowMap = true;
+        if (m_epochFirstCompleteLatencyFrames == 0u &&
+            input.frameSerial >= m_epochFirstCandidateFrameSerial) {
+          m_epochFirstCompleteLatencyFrames =
+              input.frameSerial - m_epochFirstCandidateFrameSerial + 1u;
+          g_shadowReplayDiagnostics.firstCompleteLatencyFrames.store(
+              m_epochFirstCompleteLatencyFrames,
+              std::memory_order_release);
+        }
+        m_replayValidationHoldFramesRemaining = 8u;
         m_lastShadowMapCasterCount = static_cast<uint32_t>(replayCasterCount);
         m_lastDynamicPoseSignature =
             input.scene.shadowStats.dynamicPoseSignature;
@@ -9202,6 +9778,15 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
             replayCasterCount != 0u
                 ? dxvk::war3::internal::kShadowTransientEmptyReplayHoldFrames
                 : 0u;
+      } else if (m_replayValidationFailedThisFrame &&
+                 m_hasCompleteShadowMap &&
+                 m_replayValidationHoldFramesRemaining != 0u) {
+        // The candidate was rejected before clear/draw. Preserve only the
+        // complete map produced by this same receiver epoch, with a strict
+        // bounded hold; a new epoch starts with m_hasCompleteShadowMap=false.
+        --m_replayValidationHoldFramesRemaining;
+        reconciliation.receiverReuseShadowMap = 1u;
+        directionalMapResolvedForFrame = true;
       } else if (!m_hasCompleteShadowMap) {
         m_lastShadowMapCasterCount = 0u;
         m_lastDynamicPoseSignature = 0u;

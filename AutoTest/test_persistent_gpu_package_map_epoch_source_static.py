@@ -66,7 +66,11 @@ class PersistentPackageMapEpochSourceContracts(unittest.TestCase):
         )[1].split("bool D3D9DeviceEx::War3GpuSkinDeviceReady", 1)[0]
         self.assertIn("ShadowModelResourceCache::instance().resetMapEpoch", ctor)
         self.assertIn("ShadowModelResourceCache::instance().resetMapEpoch", reset)
-        self.assertLess(reset.index("++m_war3GpuSkinMapEpoch"), reset.index("resetMapEpoch"))
+        self.assertLess(
+            reset.index("m_war3GpuSkinMapEpoch = MintWar3ShadowMapEpoch()"),
+            reset.index("resetMapEpoch"),
+        )
+        self.assertIn("g_war3ShadowMapEpochIssuer", self.device)
 
     def test_stage11_requires_exact_map_epoch_but_consume_stays_closed(self) -> None:
         self.assertIn("sidecar.mapEpoch == witness.mapEpoch", self.adapter_cpp)

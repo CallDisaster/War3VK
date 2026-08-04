@@ -99,6 +99,7 @@ class War3PostProcess;
 // identity lets a later unit overwrite the VB/IB/world tuple consumed by an
 // earlier unit and emit a one-frame triangle towards the world origin.
 struct War3DrawTimeVBCacheKey {
+  uint64_t mapEpoch = 0u;
   void* instanceIdentity = nullptr;
   void* meshPayloadPtr = nullptr;
   void* renderablePart = nullptr;
@@ -108,7 +109,8 @@ struct War3DrawTimeVBCacheKey {
   uint32_t payloadWord11C = 0u;
 
   bool operator==(const War3DrawTimeVBCacheKey& other) const noexcept {
-    return instanceIdentity == other.instanceIdentity &&
+    return mapEpoch == other.mapEpoch &&
+           instanceIdentity == other.instanceIdentity &&
            meshPayloadPtr == other.meshPayloadPtr &&
            renderablePart == other.renderablePart &&
            jHandle == other.jHandle &&
@@ -120,7 +122,8 @@ struct War3DrawTimeVBCacheKey {
 
 struct War3DrawTimeVBCacheKeyHash {
   size_t operator()(const War3DrawTimeVBCacheKey& key) const noexcept {
-    size_t hash = std::hash<uintptr_t>{}(
+    size_t hash = std::hash<uint64_t>{}(key.mapEpoch);
+    hash ^= std::hash<uintptr_t>{}(
         reinterpret_cast<uintptr_t>(key.instanceIdentity));
     hash ^= std::hash<uintptr_t>{}(
                 reinterpret_cast<uintptr_t>(key.meshPayloadPtr)) +
@@ -350,6 +353,19 @@ struct D3D9VBSlotTracking {
 
   /** Whether instancing is enabled for each slot */
   uint16_t instanced = 0;
+};
+
+struct War3ShadowLifecycleDiagnostics {
+  uint64_t requestedResetSerial = 0u;
+  uint64_t appliedResetSerial = 0u;
+  uint64_t currentMapEpoch = 0u;
+  uint64_t appliedFrameSerial = 0u;
+  uint64_t quarantinedRetireSerial = 0u;
+  uint64_t completedRetireSerial = 0u;
+  uint64_t retiredSessionCount = 0u;
+  uint64_t pendingProducerRejectCount = 0u;
+  uint32_t transitionState = 0u; // 0=ready, 1=requested, 2=quarantined
+  uint32_t producerReady = 0u;
 };
 
 class D3D9DeviceEx final : public ComObjectClamp<IDirect3DDevice9Ex> {
@@ -1336,6 +1352,13 @@ private:
   // War3 渲染管线插入点检测（BeforeUi）
   void War3MaybeInsertBeforeUi(bool forceFrameEnd = false);
 
+  // Applies a coalesced map-session reset only from the Present render-thread
+  // boundary. Returns true when the current Arena generation was sealed and
+  // its dedicated completion signal was emitted by this call.
+  bool War3ApplyShadowMapEpochResetAtPresent(uint64_t retireSerial);
+  void War3ResetShadowSessionState(uint64_t retireSerial);
+  void War3CollectRetiredShadowSessions(uint64_t completedSerial);
+
   // War3：捕获世界相机与投影（用于 CSM/后处理）
   void War3RecordWorldCamera();
 
@@ -1418,6 +1441,8 @@ public:
   // GPU skin hooks are process-lifetime, while the device and map epochs are
   // explicit. Disabled mode never allocates a manager or GPU resources.
   void War3AttachGpuSkinNativeBridge(uintptr_t gameBase);
+  void War3RequestShadowMapEpochReset();
+  War3ShadowLifecycleDiagnostics QueryWar3ShadowLifecycleDiagnostics() const;
   void War3ResetGpuSkinMapEpoch();
   bool War3ResetGpuSkinBridgeForTest(bool deviceEpoch);
   bool War3LogGpuSkinDiagnosticsForTest(
@@ -1764,6 +1789,19 @@ private:
   uint64_t m_war3PersistentPackageCaptureContentHashTicks = 0u;
   uint64_t m_war3PersistentPackageCaptureProofBudgetRejected = 0u;
   Rc<sync::Fence> m_war3ShadowArenaFence;
+  std::atomic<uint64_t> m_war3ShadowMapResetRequestedSerial { 0u };
+  uint64_t m_war3ShadowMapResetAppliedSerial = 0u;
+  uint64_t m_war3ShadowMapResetAppliedFrameSerial = 0u;
+  uint64_t m_war3ShadowArenaQuarantinedRetireSerial = 0u;
+  std::atomic<bool> m_war3ShadowSessionReady { true };
+  std::atomic<uint64_t> m_war3ShadowDiagAppliedResetSerial { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagCurrentMapEpoch { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagAppliedFrameSerial { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagQuarantinedRetireSerial { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagCompletedRetireSerial { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagRetiredSessionCount { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagPendingProducerRejectCount { 0u };
+  std::atomic<uint32_t> m_war3ShadowDiagTransitionState { 0u };
   Rc<DxvkFence> m_war3GpuSkinFence;
   uint64_t m_war3GpuSkinFenceValue = 0u;
   uint64_t m_war3GpuSkinMapEpoch = 1u;
@@ -2151,6 +2189,7 @@ private:
     uint64_t identityGeneration = 0u;
     uint64_t allocationGeneration = 0u;
     uint64_t contentGeneration = 0u;
+    uint64_t mapEpoch = 0u;
     uint64_t frameSerial = 0u;
     War3FrameFreezeStreamType streamType =
         War3FrameFreezeStreamType::Position;
@@ -2166,6 +2205,7 @@ private:
              identityGeneration == other.identityGeneration &&
              allocationGeneration == other.allocationGeneration &&
              contentGeneration == other.contentGeneration &&
+             mapEpoch == other.mapEpoch &&
              frameSerial == other.frameSerial &&
              streamType == other.streamType;
     }
@@ -2186,6 +2226,7 @@ private:
       mix(std::hash<uint64_t>()(key.identityGeneration));
       mix(std::hash<uint64_t>()(key.allocationGeneration));
       mix(std::hash<uint64_t>()(key.contentGeneration));
+      mix(std::hash<uint64_t>()(key.mapEpoch));
       mix(std::hash<uint64_t>()(key.frameSerial));
       mix(std::hash<uint8_t>()(uint8_t(key.streamType)));
       return hash;
@@ -2303,23 +2344,27 @@ private:
     }
   };
   struct War3SemanticDirectCasterContractKey {
+    uint64_t mapEpoch = 0u;
     uint64_t identityKey = 0;
     uint64_t sceneNode = 0;
     uint64_t renderablePart = 0;
     uint64_t meshData = 0;
 
     bool operator==(const War3SemanticDirectCasterContractKey& other) const {
-      return identityKey == other.identityKey &&
+      return mapEpoch == other.mapEpoch &&
+             identityKey == other.identityKey &&
              meshData == other.meshData;
     }
 
     bool valid() const {
-      return identityKey != 0 && meshData != 0;
+      return mapEpoch != 0u && identityKey != 0 && meshData != 0;
     }
   };
   struct War3SemanticDirectCasterContractKeyHash {
     size_t operator()(const War3SemanticDirectCasterContractKey& key) const {
-      const size_t h1 = std::hash<uint64_t>()(key.identityKey);
+      const size_t h0 = std::hash<uint64_t>()(key.mapEpoch);
+      const size_t h1 = std::hash<uint64_t>()(key.identityKey) ^
+          (h0 + 0x9e3779b9u + (h0 << 6) + (h0 >> 2));
       const size_t h2 = std::hash<uint64_t>()(key.meshData);
       return h1 ^ (h2 + 0x9e3779b9u + (h1 << 6) + (h1 >> 2));
     }
@@ -2419,6 +2464,7 @@ private:
   // 拷贝到我们自己的 device-local buffer。以后再有 draw 覆盖原 buffer 也
   // 不影响我们的 buffer。
   struct War3DrawTimeVBEntry {
+    uint64_t mapEpoch = 0u;
     void* renderablePart = nullptr;
     uint32_t layerIndex = 0u;
     // Canonical CurrentDraw logical-slice identity. These values are copied
@@ -2484,7 +2530,8 @@ private:
         persistentPackageCurrentDrawProof = {};
 
     bool MatchesKey(const War3DrawTimeVBCacheKey& key) const {
-      return instanceIdentity == key.instanceIdentity &&
+      return mapEpoch == key.mapEpoch &&
+             instanceIdentity == key.instanceIdentity &&
              meshPayloadPtr == key.meshPayloadPtr &&
              renderablePart == key.renderablePart &&
              contractJHandle == key.jHandle &&
@@ -2644,6 +2691,32 @@ private:
   };
   using War3S1TerrainEarlyCache =
       std::unordered_map<uint64_t, War3S1TerrainEarlyEntry>;
+  // Resources removed from the live map session remain strongly referenced
+  // until the dedicated shadow-Arena completion fence proves that every
+  // command recorded before the reset boundary has finished. This is the
+  // ownership counterpart to Arena quarantine; clearing these containers at
+  // map-unload time would still allow a command list to name freed backing.
+  struct War3RetiredShadowSession {
+    uint64_t mapEpoch = 0u;
+    uint64_t retireSerial = 0u;
+    std::array<War3ShadowBufferAllocator, 3> shadowAllocators;
+    std::array<War3ShadowMappedBufferAllocator, 3> shadowMappedAllocators;
+    std::array<War3ShadowFrozenGeometryCache, 3> frozenGeometryCaches;
+    War3FrameFreezeCatalog frameFreezeCatalog;
+    War3ShadowGeometryRegistry geometryRegistry;
+    War3ShadowPersistentGeometryMap persistentGeometries;
+    War3Stage13RetainedCasterMap stage13RetainedCasters;
+    std::priority_queue<War3ShadowPersistentExpiryEntry,
+                        std::vector<War3ShadowPersistentExpiryEntry>,
+                        War3ShadowPersistentExpiryCompare>
+        persistentExpiryQueue;
+    std::unordered_map<War3DrawTimeVBCacheKey, War3DrawTimeVBEntry,
+                       War3DrawTimeVBCacheKeyHash>
+        drawTimeVbCache;
+    std::vector<War3ShadowCasterDraw> s1TerrainCasterStash;
+    War3S1TerrainEarlyCache s1TerrainEarlyCache;
+  };
+  std::vector<War3RetiredShadowSession> m_war3RetiredShadowSessions;
   War3S1TerrainEarlyCache m_war3S1TerrainEarlyCache;
   // One persistent geometry can back multiple S1 tiles because the persistent
   // key may omit worldMatrix while the early key includes it. Keep a one-to-many
@@ -2818,6 +2891,14 @@ private:
       bool unitsOnly,
       bool executeNativeBackendValidation = false);
   void War3ResetShadowAllocator() {
+    // Map unload may be requested before the Present safe point reaches this
+    // helper (including through the non-Ex Present wrapper). Never rewind a
+    // legacy/fallback generation while the old session is quarantined; the
+    // transition moves all backing into the fence-retired session instead.
+    if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
+        m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
+            m_war3ShadowMapResetAppliedSerial)
+      return;
     // Reset the allocator for the NEXT frame (to be used in next BeginFrame
     // cycle)
     m_war3ShadowAllocators[(m_war3FrameIndex + 1) % 3].Reset();

@@ -89,6 +89,11 @@ namespace dxvk {
     struct War3ShadowCasterDraw {
         bool indexed = true;
 
+        // Unified ownership tuple. Raw pointers, JASS handles and VkBuffer
+        // slices are meaningful only inside this exact map/device epoch.
+        uint64_t mapEpoch = 0u;
+        uint64_t deviceEpoch = 0u;
+
         War3GpuSkinDrawInput gpuSkinInput = {};
 
         // Vertex input (position only)

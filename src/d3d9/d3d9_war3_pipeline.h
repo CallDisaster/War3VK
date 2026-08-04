@@ -39,6 +39,8 @@ namespace dxvk {
         // publication/cache freshness: its 0/1/2 aliases repeat every three
         // frames and slot zero is a valid resource slot, not an invalid frame.
         uint64_t frameSerial = 0;
+        uint64_t mapEpoch = 0;
+        uint64_t deviceEpoch = 0;
         const War3RenderSettings* settings = nullptr;
     };
 
