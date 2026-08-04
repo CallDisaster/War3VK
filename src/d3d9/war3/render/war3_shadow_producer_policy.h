@@ -23,6 +23,7 @@ enum class ShadowProducerKind : uint8_t {
 
 enum class ShadowProducerPolicyDecision : uint8_t {
   Allow = 0,
+  RejectNativeLightningStage,
   RejectRangeIndicatorTarget,
   RejectStage10OwnedByImmediateLegacy,
   RejectStage13OwnedByImmediateLegacy,
@@ -57,6 +58,11 @@ bool IsStage13ImmediateLegacyShadowOwnerEnabled();
 // physical-stage/tag decision.
 bool IsShadowVisualOverlay(const ShadowProducerPolicyContext& context);
 
+// S20 is Warcraft III's native lightning/electric effect pass. It is a
+// main-colour effect only and must never publish geometry, pose or material
+// payloads to any custom shadow producer.
+bool IsShadowNativeLightning(const ShadowProducerPolicyContext& context);
+
 struct ShadowStageLifecycleSnapshot {
   bool enabled = false;
   std::array<uint64_t, kShadowStageLifecycleBinCount> attempt = {};
@@ -73,6 +79,7 @@ struct ShadowStageLifecycleSnapshot {
   std::array<uint64_t, kShadowStageLifecycleBinCount> retiredStageDisabled = {};
   std::array<uint64_t, kShadowStageLifecycleBinCount> retiredReplaced = {};
   std::array<uint64_t, kShadowStageLifecycleBinCount> rejectedOverlay = {};
+  std::array<uint64_t, kShadowStageLifecycleBinCount> rejectedLightning = {};
   std::array<uint64_t, kShadowStageLifecycleBinCount> rejectedStage10Owner = {};
   std::array<uint64_t, kShadowStageLifecycleBinCount> rejectedStage13Owner = {};
   std::array<uint64_t, kShadowStageLifecycleBinCount> rejectedAlphaPayload = {};

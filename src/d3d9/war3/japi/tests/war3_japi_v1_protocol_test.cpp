@@ -33,7 +33,7 @@ void TestSystemAndForwarding() {
   const auto version =
       Dispatch(Carrier::LocalizedString, "warvk:v1;system.version");
   Check(version.ok(), "system.version must succeed without a backend");
-  Check(version.text == "WarVK JAPI 1.0.0-p0",
+  Check(version.text == "WarVK JAPI 1.3.0-polyline-curves",
         "system.version must identify the integrated runtime");
 
   const auto protocol =
@@ -84,8 +84,28 @@ void TestMessageShapeAndLimits() {
              ErrorCode::ArgumentCountMismatch,
              "argument count mismatch must fail");
   CheckError(Carrier::Preloader, "warvk:v1;sun.setEnabled;s:1",
-             ErrorCode::InvalidArgumentType,
-             "unknown typed argument tag must fail");
+             ErrorCode::InvalidBoolean,
+             "string type must not satisfy a boolean argument");
+
+  const auto validTemplate = Dispatch(
+      Carrier::Hotkey, "warvk:v1;lightning.template.create;s:SmokeBlue");
+  Check(validTemplate.error == ErrorCode::BackendUnavailable,
+        "template create must accept the strict string wire form");
+
+  std::string localizedTemplate =
+      "warvk:v1;lightning.template.create;s:";
+  localizedTemplate.push_back(static_cast<char>(0xd6));
+  localizedTemplate.push_back(static_cast<char>(0xd0));
+  localizedTemplate.push_back(static_cast<char>(0xce));
+  localizedTemplate.push_back(static_cast<char>(0xc4));
+  const auto localizedTemplateReply =
+      Dispatch(Carrier::Hotkey, localizedTemplate);
+  Check(localizedTemplateReply.error == ErrorCode::BackendUnavailable,
+        "localized legacy template names must pass the narrow compatibility gate");
+  CheckError(Carrier::Hotkey,
+             "warvk:v1;lightning.template.create;s:Smoke;Blue",
+             ErrorCode::ArgumentCountMismatch,
+             "template strings must not escape the semicolon token boundary");
 
   std::string tooMany = "warvk:v1;missing";
   for (int i = 0; i < 17; ++i)
@@ -108,6 +128,64 @@ void TestMessageShapeAndLimits() {
              "non-ASCII byte must fail");
   CheckError(Carrier::Hotkey, "warvk:v1;system.protocolVersion\n",
              ErrorCode::ControlCharacter, "control byte must fail");
+}
+
+void TestMathCurveWireContract() {
+  const auto compile = Dispatch(
+      Carrier::Hotkey,
+      "warvk:v1;math.program.compile;s:vec2(cos(t*tau)*radius,"
+      "sin(t*tau)*radius)");
+  Check(compile.error == ErrorCode::BackendUnavailable,
+        "formula compile must pass strict wire parsing");
+
+  const auto setReal = Dispatch(
+      Carrier::Preloader,
+      "warvk:v1;curve.setReal;d:1;s:radius;r:120");
+  Check(setReal.error == ErrorCode::BackendUnavailable,
+        "named curve parameter must pass strict wire parsing");
+
+  const auto evaluate = Dispatch(
+      Carrier::LocalizedString,
+      "warvk:v1;curve.evaluateComponent;d:1;i:0;r:0.5;r:0;"
+      "r:0;r:0;r:0;r:100;r:0;r:0;i:7");
+  Check(evaluate.error == ErrorCode::BackendUnavailable,
+        "curve component query must match its declared signature");
+
+  const auto arcLength = Dispatch(
+      Carrier::LocalizedString,
+      "warvk:v1;curve.arcLength;d:1;r:0;r:0;r:0;r:0;"
+      "r:100;r:0;r:0;i:7;i:32");
+  Check(arcLength.error == ErrorCode::BackendUnavailable,
+        "curve arc-length query must match its declared signature");
+
+  const auto bindTemplate = Dispatch(
+      Carrier::Preloader,
+      "warvk:v1;lightning.template.setFormulaCurve;d:1;d:2");
+  Check(bindTemplate.error == ErrorCode::BackendUnavailable,
+        "template curve binding must pass strict wire parsing");
+
+  const auto createPoints = Dispatch(
+      Carrier::Hotkey, "warvk:v1;curve.points.create;i:640");
+  Check(createPoints.error == ErrorCode::BackendUnavailable,
+        "point-curve creation must pass strict wire parsing");
+
+  const auto appendPoints = Dispatch(
+      Carrier::Preloader,
+      "warvk:v1;curve.points.append4;d:1;i:4;"
+      "r:0;r:1;r:2;r:3;r:4;r:5;r:6;r:7;r:8;r:9;r:10;r:11");
+  Check(appendPoints.error == ErrorCode::BackendUnavailable,
+        "four-point chunk must fit the strict 16-token transport cap");
+
+  const auto createPolyline = Dispatch(
+      Carrier::Hotkey,
+      "warvk:v1;lightning.createPolylineFromTemplate;d:1;d:2;i:7");
+  Check(createPolyline.error == ErrorCode::BackendUnavailable,
+        "polyline lightning creation must pass strict wire parsing");
+
+  CheckError(Carrier::Hotkey,
+             "warvk:v1;math.program.compile;s:vec2(t,0);s:extra",
+             ErrorCode::ArgumentCountMismatch,
+             "formula strings must not escape the semicolon boundary");
 }
 
 void TestStableLastError() {
@@ -136,6 +214,7 @@ int main() {
   TestSystemAndForwarding();
   TestStrictScalars();
   TestMessageShapeAndLimits();
+  TestMathCurveWireContract();
   TestStableLastError();
   if (g_failures != 0) {
     std::cerr << g_failures << " WarVK JAPI protocol test(s) failed\n";

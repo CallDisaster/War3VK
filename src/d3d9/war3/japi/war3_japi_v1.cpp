@@ -7,6 +7,7 @@
 #define WAR3_SHADER_API_INTERNAL 1
 #endif
 #include "../../war3_shader_api.h"
+#include "../math/war3_curve_runtime.h"
 #include "../render/war3_lightning_runtime.h"
 #include "../state/war3_render_state.h"
 #include "../war3.h"
@@ -30,7 +31,7 @@ namespace {
 
 constexpr std::string_view kProtocolPrefix = "warvk:";
 constexpr std::string_view kCanonicalVersion = "v1";
-constexpr std::string_view kApiVersion = "WarVK JAPI 1.0.0-p0";
+constexpr std::string_view kApiVersion = "WarVK JAPI 1.3.0-polyline-curves";
 constexpr size_t kMaximumMessageBytes = 512u;
 constexpr size_t kMaximumArgumentCount = 16u;
 
@@ -41,15 +42,19 @@ constexpr uint32_t kFeatureLightning = 0x00000200u;
 constexpr uint32_t kFeatureManagedObject = 0x00000400u;
 constexpr uint32_t kFeatureTime = 0x00000800u;
 constexpr uint32_t kFeatureStats = 0x00001000u;
+constexpr uint32_t kFeatureMathCurve = 0x00002000u;
+constexpr uint32_t kFeaturePolylineCurve = 0x00004000u;
 constexpr uint32_t kImplementedFeatureMask =
     kFeatureSun | kFeatureCsm | kFeaturePointLight | kFeatureLightning |
-    kFeatureManagedObject | kFeatureTime | kFeatureStats;
+    kFeatureManagedObject | kFeatureTime | kFeatureStats |
+    kFeatureMathCurve | kFeaturePolylineCurve;
 
 enum class WireType : uint8_t {
   Bool,
   I32,
   Id,
   Real,
+  String,
 };
 
 enum class CommandId : uint16_t {
@@ -93,6 +98,21 @@ enum class CommandId : uint16_t {
   DayNightSetEnabled,
   DayNightSetTime,
   DayNightSetSpeed,
+  MathProgramCompile,
+  MathProgramDestroy,
+  MathProgramIsAlive,
+  MathProgramLastError,
+  CurveCreate,
+  CurveDestroy,
+  CurveSetReal,
+  CurveSetCoordinateMode,
+  CurveSetEndpointLocks,
+  CurveEvaluateComponent,
+  CurveDerivativeComponent,
+  CurveArcLength,
+  CurvePointCreate,
+  CurvePointAppend4,
+  CurvePointFinalize,
   LightningCreate,
   LightningDestroy,
   LightningSetEnabled,
@@ -100,6 +120,16 @@ enum class CommandId : uint16_t {
   LightningSetColor,
   LightningSetWidth,
   LightningIsAlive,
+  LightningTemplateCreate,
+  LightningTemplateSetBasic,
+  LightningTemplateSetAdvanced,
+  LightningTemplateSetOptional,
+  LightningTemplateFinalize,
+  LightningCreateFromTemplate,
+  LightningCreatePolylineFromTemplate,
+  LightningTemplateSetFormulaCurve,
+  LightningSetFormulaCurve,
+  LightningSetPolylineCurve,
   ManagedObjectCount,
   ManagedObjectIsAlive,
   ManagedObjectType,
@@ -119,7 +149,7 @@ struct CommandSpec {
   bool backendRequired;
 };
 
-constexpr std::array<CommandSpec, 55> kCommands = {{
+constexpr std::array<CommandSpec, 80> kCommands = {{
     {CommandId::SystemVersion, "system.version", Carrier::LocalizedString, "", 0u, false},
     {CommandId::SystemProtocolVersion, "system.protocolVersion", Carrier::Hotkey, "", 0u, false},
     {CommandId::SystemLastErrorCode, "system.lastErrorCode", Carrier::Hotkey, "", 0u, false},
@@ -160,13 +190,38 @@ constexpr std::array<CommandSpec, 55> kCommands = {{
     {CommandId::DayNightSetEnabled, "dayNight.setEnabled", Carrier::Preloader, "b", 0x00000100u, true},
     {CommandId::DayNightSetTime, "dayNight.setTime", Carrier::Preloader, "r", 0x00000100u, true},
     {CommandId::DayNightSetSpeed, "dayNight.setSpeed", Carrier::Preloader, "r", 0x00000100u, true},
-    {CommandId::LightningCreate, "lightning.create", Carrier::Hotkey, "rrrrrrrrrrr", kFeatureLightning, true},
-    {CommandId::LightningDestroy, "lightning.destroy", Carrier::Preloader, "d", kFeatureLightning, true},
-    {CommandId::LightningSetEnabled, "lightning.setEnabled", Carrier::Preloader, "db", kFeatureLightning, true},
-    {CommandId::LightningSetEndpoints, "lightning.setEndpoints", Carrier::Preloader, "drrrrrr", kFeatureLightning, true},
-    {CommandId::LightningSetColor, "lightning.setColor", Carrier::Preloader, "drrrr", kFeatureLightning, true},
-    {CommandId::LightningSetWidth, "lightning.setWidth", Carrier::Preloader, "dr", kFeatureLightning, true},
-    {CommandId::LightningIsAlive, "lightning.isAlive", Carrier::Hotkey, "d", kFeatureLightning, true},
+    {CommandId::MathProgramCompile, "math.program.compile", Carrier::Hotkey, "s", kFeatureMathCurve, false},
+    {CommandId::MathProgramDestroy, "math.program.destroy", Carrier::Preloader, "d", kFeatureMathCurve, false},
+    {CommandId::MathProgramIsAlive, "math.program.isAlive", Carrier::Hotkey, "d", kFeatureMathCurve, false},
+    {CommandId::MathProgramLastError, "math.program.lastError", Carrier::LocalizedString, "", kFeatureMathCurve, false},
+    {CommandId::CurveCreate, "curve.create", Carrier::Hotkey, "d", kFeatureMathCurve, false},
+    {CommandId::CurveDestroy, "curve.destroy", Carrier::Preloader, "d", kFeatureMathCurve, false},
+    {CommandId::CurveSetReal, "curve.setReal", Carrier::Preloader, "dsr", kFeatureMathCurve, false},
+    {CommandId::CurveSetCoordinateMode, "curve.setCoordinateMode", Carrier::Preloader, "di", kFeatureMathCurve, false},
+    {CommandId::CurveSetEndpointLocks, "curve.setEndpointLocks", Carrier::Preloader, "dbb", kFeatureMathCurve, false},
+    {CommandId::CurveEvaluateComponent, "curve.evaluateComponent", Carrier::LocalizedString, "dirrrrrrrri", kFeatureMathCurve, false},
+    {CommandId::CurveDerivativeComponent, "curve.derivativeComponent", Carrier::LocalizedString, "dirrrrrrrri", kFeatureMathCurve, false},
+    {CommandId::CurveArcLength, "curve.arcLength", Carrier::LocalizedString, "drrrrrrrii", kFeatureMathCurve, false},
+    {CommandId::CurvePointCreate, "curve.points.create", Carrier::Hotkey, "i", kFeatureMathCurve | kFeaturePolylineCurve, false},
+    {CommandId::CurvePointAppend4, "curve.points.append4", Carrier::Preloader, "dirrrrrrrrrrrr", kFeatureMathCurve | kFeaturePolylineCurve, false},
+    {CommandId::CurvePointFinalize, "curve.points.finalize", Carrier::Preloader, "d", kFeatureMathCurve | kFeaturePolylineCurve, false},
+    {CommandId::LightningCreate, "lightning.create", Carrier::Hotkey, "rrrrrrrrrrr", kFeatureLightning, false},
+    {CommandId::LightningDestroy, "lightning.destroy", Carrier::Preloader, "d", kFeatureLightning, false},
+    {CommandId::LightningSetEnabled, "lightning.setEnabled", Carrier::Preloader, "db", kFeatureLightning, false},
+    {CommandId::LightningSetEndpoints, "lightning.setEndpoints", Carrier::Preloader, "drrrrrr", kFeatureLightning, false},
+    {CommandId::LightningSetColor, "lightning.setColor", Carrier::Preloader, "drrrr", kFeatureLightning, false},
+    {CommandId::LightningSetWidth, "lightning.setWidth", Carrier::Preloader, "dr", kFeatureLightning, false},
+    {CommandId::LightningIsAlive, "lightning.isAlive", Carrier::Hotkey, "d", kFeatureLightning, false},
+    {CommandId::LightningTemplateCreate, "lightning.template.create", Carrier::Hotkey, "s", kFeatureLightning, false},
+    {CommandId::LightningTemplateSetBasic, "lightning.template.setBasic", Carrier::Preloader, "dsrrrrrrrrrrrri", kFeatureLightning, false},
+    {CommandId::LightningTemplateSetAdvanced, "lightning.template.setAdvanced", Carrier::Preloader, "driirrrriirr", kFeatureLightning, false},
+    {CommandId::LightningTemplateSetOptional, "lightning.template.setOptional", Carrier::Preloader, "drrrrrrrrrr", kFeatureLightning, false},
+    {CommandId::LightningTemplateFinalize, "lightning.template.finalize", Carrier::Preloader, "d", kFeatureLightning, false},
+    {CommandId::LightningCreateFromTemplate, "lightning.createFromTemplate", Carrier::Hotkey, "drrrrrri", kFeatureLightning, false},
+    {CommandId::LightningCreatePolylineFromTemplate, "lightning.createPolylineFromTemplate", Carrier::Hotkey, "ddi", kFeatureLightning | kFeaturePolylineCurve, false},
+    {CommandId::LightningTemplateSetFormulaCurve, "lightning.template.setFormulaCurve", Carrier::Preloader, "dd", kFeatureLightning | kFeatureMathCurve, false},
+    {CommandId::LightningSetFormulaCurve, "lightning.setFormulaCurve", Carrier::Preloader, "dd", kFeatureLightning | kFeatureMathCurve, false},
+    {CommandId::LightningSetPolylineCurve, "lightning.setPolylineCurve", Carrier::Preloader, "dd", kFeatureLightning | kFeaturePolylineCurve, false},
     {CommandId::ManagedObjectCount, "managedObject.count", Carrier::Hotkey, "", kFeatureManagedObject, true},
     {CommandId::ManagedObjectIsAlive, "managedObject.isAlive", Carrier::Hotkey, "d", kFeatureManagedObject, true},
     {CommandId::ManagedObjectType, "managedObject.type", Carrier::Hotkey, "d", kFeatureManagedObject, true},
@@ -182,6 +237,7 @@ struct Argument {
   bool boolean = false;
   int32_t integer = 0;
   float real = 0.0f;
+  std::string text;
 };
 
 struct ParsedRequest {
@@ -381,7 +437,7 @@ NumberStatus ParseReal(std::string_view text, float& output) {
 }
 
 ErrorCode ParseArgument(std::string_view token, Argument& output) {
-  if (token.size() < 3u || token[1] != ':')
+  if (token.size() < 2u || token[1] != ':')
     return ErrorCode::InvalidArgumentType;
   const std::string_view value = token.substr(2u);
   switch (token[0]) {
@@ -418,6 +474,10 @@ ErrorCode ParseArgument(std::string_view token, Argument& output) {
       return status == NumberStatus::Ok
           ? ErrorCode::None : ErrorCode::InvalidReal;
     }
+    case 's':
+      output.type = WireType::String;
+      output.text.assign(value.data(), value.size());
+      return ErrorCode::None;
     default:
       return ErrorCode::InvalidArgumentType;
   }
@@ -429,6 +489,7 @@ char WireTypeCode(WireType type) {
     case WireType::I32: return 'i';
     case WireType::Id: return 'd';
     case WireType::Real: return 'r';
+    case WireType::String: return 's';
   }
   return '\0';
 }
@@ -439,6 +500,7 @@ ErrorCode TypeMismatchError(char expected) {
     case 'i': return ErrorCode::InvalidInteger;
     case 'd': return ErrorCode::InvalidId;
     case 'r': return ErrorCode::InvalidReal;
+    case 's': return ErrorCode::InvalidArgumentType;
     default: return ErrorCode::InternalError;
   }
 }
@@ -447,9 +509,19 @@ ErrorCode ParseRequest(std::string_view payload, Carrier carrier,
                        ParsedRequest& output) {
   if (payload.size() > kMaximumMessageBytes)
     return ErrorCode::PayloadTooLong;
+
+  // The public wire format is deliberately ASCII-only.  One compatibility
+  // exception is needed for maps already saved through the YDWE GUI before
+  // the JASS wrapper started hashing template display names: those maps send
+  // a local-codepage name in lightning.template.create's sole s: field.
+  // Keep the exception narrow; all command names, paths, numbers, and every
+  // other request continue to reject non-ASCII bytes fail-closed.
+  bool hasNonAscii = false;
   for (const unsigned char character : payload) {
-    if (character > 0x7fu)
-      return ErrorCode::NonAscii;
+    if (character > 0x7fu) {
+      hasNonAscii = true;
+      continue;
+    }
     if (character < 0x20u || character == 0x7fu)
       return ErrorCode::ControlCharacter;
   }
@@ -479,6 +551,17 @@ ErrorCode ParseRequest(std::string_view payload, Carrier carrier,
     if (tokens[index].empty())
       return ErrorCode::EmptyToken;
   }
+
+  if (hasNonAscii) {
+    const bool isLegacyLocalizedTemplateName =
+        tokenCount == 3u && tokens[0] == kCanonicalVersion &&
+        tokens[1] == "lightning.template.create" &&
+        tokens[2].size() >= 3u && tokens[2][0] == 's' &&
+        tokens[2][1] == ':';
+    if (!isLegacyLocalizedTemplateName)
+      return ErrorCode::NonAscii;
+  }
+
   if (tokens[0] != kCanonicalVersion)
     return ErrorCode::UnsupportedVersion;
   if (tokenCount < 2u || tokens[1].empty() || !IsCommandName(tokens[1]))
@@ -487,6 +570,7 @@ ErrorCode ParseRequest(std::string_view payload, Carrier carrier,
   output.spec = FindCommand(tokens[1]);
   if (!output.spec)
     return ErrorCode::UnknownCommand;
+
   if (output.spec->carrier != carrier)
     return ErrorCode::CarrierMismatch;
 
@@ -524,6 +608,79 @@ bool IsValidPointShadowResolution(int32_t resolution) {
     return false;
   const uint32_t value = static_cast<uint32_t>(resolution);
   return (value & (value - 1u)) == 0u;
+}
+
+bool IsLightningTemplateName(std::string_view value) {
+  if (value.empty() || value.size() > 64u)
+    return false;
+
+  bool hasNonAscii = false;
+  for (const char character : value) {
+    if (static_cast<unsigned char>(character) > 0x7fu) {
+      hasNonAscii = true;
+      continue;
+    }
+    if (!IsAsciiLetter(character) && !IsAsciiDigit(character) &&
+        character != '_' && character != '-' && character != '.')
+      return false;
+  }
+  // Existing ASCII-only names retain the original first-letter rule.  A
+  // localized name is a display label only and has already passed the narrow
+  // parser exception above, so do not require its first codepage byte to be a
+  // Latin letter.
+  return hasNonAscii || IsAsciiLetter(value.front());
+}
+
+char ToAsciiLower(char value) {
+  return value >= 'A' && value <= 'Z'
+      ? char(value - 'A' + 'a') : value;
+}
+
+bool HasAllowedLightningTextureExtension(std::string_view value) {
+  const size_t dot = value.find_last_of('.');
+  if (dot == std::string_view::npos)
+    return false;
+  std::string extension;
+  extension.reserve(value.size() - dot);
+  for (size_t index = dot; index < value.size(); ++index)
+    extension.push_back(ToAsciiLower(value[index]));
+  return extension == ".blp" || extension == ".tga" ||
+         extension == ".png" || extension == ".jpg" ||
+         extension == ".jpeg" || extension == ".bmp";
+}
+
+bool IsLightningTexturePath(std::string_view value) {
+  if (value.empty() || value.size() > 192u || value.front() == '/' ||
+      value.front() == '\\' || !HasAllowedLightningTextureExtension(value))
+    return false;
+
+  size_t segmentStart = 0u;
+  for (size_t index = 0u; index <= value.size(); ++index) {
+    const bool atEnd = index == value.size();
+    if (!atEnd && value[index] != '/' && value[index] != '\\') {
+      const char character = value[index];
+      if (!IsAsciiLetter(character) && !IsAsciiDigit(character) &&
+          character != '_' && character != '-' && character != '.' &&
+          character != ' ')
+        return false;
+      continue;
+    }
+
+    const std::string_view segment = value.substr(segmentStart, index - segmentStart);
+    if (segment.empty() || segment == "." || segment == "..")
+      return false;
+    segmentStart = index + 1u;
+  }
+  return true;
+}
+
+std::string NormalizeLightningTexturePath(std::string_view value) {
+  std::string normalized(value);
+  for (char& character : normalized) {
+    if (character == '/')
+      character = '\\';
+  }
+  return normalized;
 }
 
 std::string FormatReal(float value) {
@@ -648,7 +805,13 @@ Reply BackendRejected() {
 Reply DispatchBackend(const ParsedRequest& request) {
   const auto& a = request.arguments;
   auto* const settings = dxvk::war3::GetMutableSettings();
-  if (!settings)
+  const bool mathCurveCpuCommand =
+      request.spec->id >= CommandId::MathProgramCompile &&
+      request.spec->id <= CommandId::CurvePointFinalize;
+  const bool lightningCpuCommand =
+      request.spec->id >= CommandId::LightningCreate &&
+      request.spec->id <= CommandId::LightningSetPolylineCurve;
+  if (!settings && !mathCurveCpuCommand && !lightningCpuCommand)
     return Failure(ErrorCode::BackendUnavailable);
 
   switch (request.spec->id) {
@@ -790,6 +953,99 @@ Reply DispatchBackend(const ParsedRequest& request) {
           ResolveObject(a[0].integer, ManagedType::PointLight, internalId)
               ? 1 : 0);
     }
+    case CommandId::MathProgramCompile: {
+      const int32_t programId =
+          math::CurveRuntime::instance().compileProgram(a[0].text);
+      return programId > 0 ? SuccessInteger(programId) : BackendRejected();
+    }
+    case CommandId::MathProgramDestroy:
+      return math::CurveRuntime::instance().destroyProgram(a[0].integer)
+          ? SuccessVoid() : BackendRejected();
+    case CommandId::MathProgramIsAlive:
+      return SuccessInteger(
+          math::CurveRuntime::instance().isProgramAlive(a[0].integer)
+              ? 1 : 0);
+    case CommandId::MathProgramLastError:
+      return SuccessText(math::CurveRuntime::instance().lastCompileError());
+    case CommandId::CurveCreate: {
+      const int32_t curveId =
+          math::CurveRuntime::instance().createCurve(a[0].integer);
+      return curveId > 0 ? SuccessInteger(curveId) : BackendRejected();
+    }
+    case CommandId::CurveDestroy:
+      return math::CurveRuntime::instance().destroyCurve(a[0].integer)
+          ? SuccessVoid() : BackendRejected();
+    case CommandId::CurveSetReal:
+      return math::CurveRuntime::instance().setCurveReal(
+          a[0].integer, a[1].text, a[2].real)
+          ? SuccessVoid() : BackendRejected();
+    case CommandId::CurveSetCoordinateMode:
+      return math::CurveRuntime::instance().setCurveCoordinateMode(
+          a[0].integer, a[1].integer)
+          ? SuccessVoid() : BackendRejected();
+    case CommandId::CurveSetEndpointLocks:
+      return math::CurveRuntime::instance().setCurveEndpointLocks(
+          a[0].integer, a[1].boolean, a[2].boolean)
+          ? SuccessVoid() : BackendRejected();
+    case CommandId::CurveEvaluateComponent:
+    case CommandId::CurveDerivativeComponent: {
+      if (a[2].real < 0.0f || a[2].real > 1.0f)
+        return BackendRejected();
+      math::CurveContext context;
+      context.t = a[2].real;
+      context.time = a[3].real;
+      context.start = {a[4].real, a[5].real, a[6].real};
+      context.end = {a[7].real, a[8].real, a[9].real};
+      context.seed = static_cast<uint32_t>(a[10].integer);
+      context.segments = 64u;
+      context.index = static_cast<uint32_t>(std::lround(context.t * 64.0f));
+      float value = 0.0f;
+      const bool evaluated = request.spec->id ==
+              CommandId::CurveEvaluateComponent
+          ? math::CurveRuntime::instance().evaluateComponent(
+                a[0].integer, context, a[1].integer, value)
+          : math::CurveRuntime::instance().evaluateDerivativeComponent(
+                a[0].integer, context, a[1].integer, value);
+      return evaluated ? SuccessText(FormatReal(value)) : BackendRejected();
+    }
+    case CommandId::CurveArcLength: {
+      if (a[9].integer < 2 || a[9].integer > 256)
+        return BackendRejected();
+      math::CurveContext context;
+      context.time = a[1].real;
+      context.start = {a[2].real, a[3].real, a[4].real};
+      context.end = {a[5].real, a[6].real, a[7].real};
+      context.seed = static_cast<uint32_t>(a[8].integer);
+      context.segments = static_cast<uint32_t>(a[9].integer);
+      float value = 0.0f;
+      return math::CurveRuntime::instance().evaluateArcLength(
+          a[0].integer, context, context.segments, value)
+          ? SuccessText(FormatReal(value)) : BackendRejected();
+    }
+    case CommandId::CurvePointCreate: {
+      if (a[0].integer < int32_t(math::kMinimumPointCurvePoints) ||
+          a[0].integer > int32_t(math::kMaximumPointCurvePoints))
+        return BackendRejected();
+      const int32_t curveId = math::CurveRuntime::instance().createPointCurve(
+          static_cast<uint32_t>(a[0].integer));
+      return curveId > 0 ? SuccessInteger(curveId) : BackendRejected();
+    }
+    case CommandId::CurvePointAppend4: {
+      if (a[1].integer < 1 || a[1].integer > 4)
+        return BackendRejected();
+      std::array<math::Vec3, 4u> points = {};
+      for (size_t index = 0u; index < points.size(); ++index) {
+        const size_t base = 2u + index * 3u;
+        points[index] = {a[base].real, a[base + 1u].real,
+                         a[base + 2u].real};
+      }
+      return math::CurveRuntime::instance().appendPointCurve(
+          a[0].integer, points.data(), static_cast<uint32_t>(a[1].integer))
+          ? SuccessVoid() : BackendRejected();
+    }
+    case CommandId::CurvePointFinalize:
+      return math::CurveRuntime::instance().finalizePointCurve(a[0].integer)
+          ? SuccessVoid() : BackendRejected();
     case CommandId::LightningCreate: {
       if (!IsValidColor(
               a[6].real, a[7].real, a[8].real, a[9].real, true) ||
@@ -875,6 +1131,133 @@ Reply DispatchBackend(const ParsedRequest& request) {
       return SuccessInteger(
           ResolveObject(a[0].integer, ManagedType::Lightning, internalId)
               ? 1 : 0);
+    }
+    case CommandId::LightningTemplateCreate: {
+      if (!IsLightningTemplateName(a[0].text))
+        return BackendRejected();
+      const int32_t templateId =
+          render::War3LightningRuntime::instance().createTemplate(a[0].text);
+      return templateId > 0 ? SuccessInteger(templateId) : BackendRejected();
+    }
+    case CommandId::LightningTemplateSetBasic: {
+      if (!IsLightningTexturePath(a[1].text) ||
+          !IsValidColor(a[2].real, a[3].real, a[4].real, a[5].real, true) ||
+          !IsValidColor(a[6].real, a[7].real, a[8].real, a[9].real, true))
+        return BackendRejected();
+      render::War3LightningTemplateBasicDesc desc = {};
+      desc.texturePath = NormalizeLightningTexturePath(a[1].text);
+      desc.startColor = {a[2].real, a[3].real, a[4].real, a[5].real};
+      desc.endColor = {a[6].real, a[7].real, a[8].real, a[9].real};
+      desc.startWidth = a[10].real;
+      desc.endWidth = a[11].real;
+      desc.uvTiling = a[12].real;
+      desc.uvScrollSpeed = a[13].real;
+      desc.renderMode = a[14].integer;
+      return render::War3LightningRuntime::instance().setTemplateBasic(
+          a[0].integer, desc) ? SuccessVoid() : BackendRejected();
+    }
+    case CommandId::LightningTemplateSetAdvanced: {
+      render::War3LightningTemplateAdvancedDesc desc = {};
+      desc.averageSegmentLength = a[1].real;
+      desc.minimumSegments = static_cast<uint32_t>(a[2].integer);
+      desc.maximumSegments = static_cast<uint32_t>(a[3].integer);
+      desc.curveAmplitude = a[4].real;
+      desc.noiseAmplitude = a[5].real;
+      desc.noiseFrequency = a[6].real;
+      desc.noiseScrollSpeed = a[7].real;
+      desc.noiseOctaves = static_cast<uint32_t>(a[8].integer);
+      desc.branchCount = static_cast<uint32_t>(a[9].integer);
+      desc.branchLengthScale = a[10].real;
+      desc.branchWidthScale = a[11].real;
+      return render::War3LightningRuntime::instance().setTemplateAdvanced(
+          a[0].integer, desc) ? SuccessVoid() : BackendRejected();
+    }
+    case CommandId::LightningTemplateSetOptional: {
+      render::War3LightningTemplateOptionalDesc desc = {};
+      desc.lifetimeSec = a[1].real;
+      desc.fadeInSec = a[2].real;
+      desc.fadeOutSec = a[3].real;
+      desc.pulseAmplitude = a[4].real;
+      desc.pulseFrequency = a[5].real;
+      desc.pulseTravelSpeed = a[6].real;
+      desc.flickerAmplitude = a[7].real;
+      desc.flickerFrequencyHz = a[8].real;
+      desc.glowWidthScale = a[9].real;
+      desc.glowOpacity = a[10].real;
+      return render::War3LightningRuntime::instance().setTemplateOptional(
+          a[0].integer, desc) ? SuccessVoid() : BackendRejected();
+    }
+    case CommandId::LightningTemplateFinalize:
+      return render::War3LightningRuntime::instance().finalizeTemplate(
+          a[0].integer) ? SuccessVoid() : BackendRejected();
+    case CommandId::LightningCreateFromTemplate: {
+      render::War3LightningCreateDesc desc = {};
+      desc.start = {a[1].real, a[2].real, a[3].real};
+      desc.end = {a[4].real, a[5].real, a[6].real};
+      const int32_t internalId =
+          render::War3LightningRuntime::instance().createFromTemplate(
+              a[0].integer, desc, static_cast<uint32_t>(a[7].integer));
+      if (internalId <= 0)
+        return BackendRejected();
+      const int32_t publicId =
+          RegisterObject(ManagedType::Lightning, internalId);
+      if (publicId <= 0) {
+        static_cast<void>(
+            render::War3LightningRuntime::instance().destroy(internalId));
+        return Failure(ErrorCode::InternalError);
+      }
+      return SuccessInteger(publicId);
+    }
+    case CommandId::LightningCreatePolylineFromTemplate: {
+      math::CurveSnapshot curve;
+      if (!math::CurveRuntime::instance().snapshotCurve(
+              a[1].integer, curve) || !curve.isPointCurve())
+        return BackendRejected();
+      const int32_t internalId = render::War3LightningRuntime::instance()
+          .createPolylineFromTemplate(
+              a[0].integer, curve.pointCurve,
+              static_cast<uint32_t>(a[2].integer));
+      if (internalId <= 0)
+        return BackendRejected();
+      const int32_t publicId =
+          RegisterObject(ManagedType::Lightning, internalId);
+      if (publicId <= 0) {
+        static_cast<void>(
+            render::War3LightningRuntime::instance().destroy(internalId));
+        return Failure(ErrorCode::InternalError);
+      }
+      return SuccessInteger(publicId);
+    }
+    case CommandId::LightningTemplateSetFormulaCurve: {
+      math::CurveSnapshot curve;
+      if (!math::CurveRuntime::instance().snapshotCurve(
+              a[1].integer, curve) ||
+          !render::War3LightningRuntime::instance().setTemplateFormulaCurve(
+              a[0].integer, curve))
+        return BackendRejected();
+      return SuccessVoid();
+    }
+    case CommandId::LightningSetFormulaCurve: {
+      int32_t internalId = 0;
+      math::CurveSnapshot curve;
+      if (!ResolveObject(a[0].integer, ManagedType::Lightning, internalId) ||
+          !math::CurveRuntime::instance().snapshotCurve(
+              a[1].integer, curve) ||
+          !render::War3LightningRuntime::instance().setFormulaCurve(
+              internalId, curve))
+        return BackendRejected();
+      return SuccessVoid();
+    }
+    case CommandId::LightningSetPolylineCurve: {
+      int32_t internalId = 0;
+      math::CurveSnapshot curve;
+      if (!ResolveObject(a[0].integer, ManagedType::Lightning, internalId) ||
+          !math::CurveRuntime::instance().snapshotCurve(
+              a[1].integer, curve) || !curve.isPointCurve() ||
+          !render::War3LightningRuntime::instance().setPolylineCurve(
+              internalId, curve.pointCurve))
+        return BackendRejected();
+      return SuccessVoid();
     }
     case CommandId::ManagedObjectCount:
       return SuccessInteger(ManagedObjectCount());
@@ -1026,6 +1409,12 @@ void Reset() noexcept {
       static_cast<void>(
           render::War3LightningRuntime::instance().destroy(object.internalId));
   }
+  // Templates are map-scoped CPU descriptors. They are not managed objects,
+  // so a JASS VM rebuild must explicitly drop them and their texture cache.
+  render::War3LightningRuntime::instance().reset();
+  // Programs and mutable curve handles are map-scoped as well. Lightning
+  // records already own immutable snapshots, so reset order is intentional.
+  math::CurveRuntime::instance().reset();
 #endif
   g_lastError = ErrorCode::None;
 }

@@ -14,6 +14,7 @@
 #include "../core/war3_net_event_hook.h"
 #include "../core/war3_runtime_profile.h"
 #include "../gpu_skin/war3_persistent_gpu_package_d3d9_observe_owner.h"
+#include "../render/war3_lightning_runtime.h"
 #include "../render/war3_shadow_runtime_bridge.h"
 #include "../shadow/war3_shadow_runtime_contract.h"
 #include "../state/war3_render_state.h"
@@ -1773,6 +1774,30 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
         {"isInGame", snapshot.render.isInGame},
         {"isLoading", snapshot.render.isLoading},
         {"worldPtr", snapshot.render.worldPtr}}},
+      {"lightning",
+       {{"activeCount", snapshot.lightning.activeCount},
+        {"polylineActiveCount", snapshot.lightning.polylineActiveCount},
+        {"templateCount", snapshot.lightning.templateCount},
+        {"finalizedTemplateCount", snapshot.lightning.finalizedTemplateCount},
+        {"textureCacheEntryCount", snapshot.lightning.textureCacheEntryCount},
+        {"createCount", snapshot.lightning.createCount},
+        {"polylineCreateCount", snapshot.lightning.polylineCreateCount},
+        {"templateCreateCount", snapshot.lightning.templateCreateCount},
+        {"templateFinalizeCount", snapshot.lightning.templateFinalizeCount},
+        {"destroyCount", snapshot.lightning.destroyCount},
+        {"commandFailureCount", snapshot.lightning.commandFailureCount},
+        {"drawAttemptCount", snapshot.lightning.drawAttemptCount},
+        {"drawSuccessCount", snapshot.lightning.drawSuccessCount},
+        {"drawSkippedNoDeviceCount", snapshot.lightning.drawSkippedNoDeviceCount},
+        {"drawSkippedNoActiveCount", snapshot.lightning.drawSkippedNoActiveCount},
+        {"textureLoadAttemptCount", snapshot.lightning.textureLoadAttemptCount},
+        {"textureLoadFallbackCount", snapshot.lightning.textureLoadFallbackCount},
+        {"lastDrawVertexCount", snapshot.lightning.lastDrawVertexCount},
+        {"lastDrawPrimitiveCount", snapshot.lightning.lastDrawPrimitiveCount},
+        {"lastPolylinePointCount", snapshot.lightning.lastPolylinePointCount},
+        {"hasDevice", snapshot.lightning.hasDevice},
+        {"textureLoaded", snapshot.lightning.textureLoaded},
+        {"textureFallback", snapshot.lightning.textureFallback}}},
       {"frame",
        {{"frameNumber", snapshot.frame.frameNumber},
         {"publishRevision", snapshot.frame.publishRevision},
@@ -3135,6 +3160,31 @@ War3RuntimeStatusSnapshot BuildRuntimeStatusSnapshot(const char* source,
       reinterpret_cast<uint64_t>(renderState.getWorldPointer());
   snapshot.frame = BuildFrameSnapshot();
   snapshot.shadow = BuildShadowSnapshot();
+  const auto lightning =
+      dxvk::war3::render::War3LightningRuntime::instance().snapshot();
+  snapshot.lightning.activeCount = lightning.activeCount;
+  snapshot.lightning.polylineActiveCount = lightning.polylineActiveCount;
+  snapshot.lightning.templateCount = lightning.templateCount;
+  snapshot.lightning.finalizedTemplateCount = lightning.finalizedTemplateCount;
+  snapshot.lightning.textureCacheEntryCount = lightning.textureCacheEntryCount;
+  snapshot.lightning.createCount = lightning.createCount;
+  snapshot.lightning.polylineCreateCount = lightning.polylineCreateCount;
+  snapshot.lightning.templateCreateCount = lightning.templateCreateCount;
+  snapshot.lightning.templateFinalizeCount = lightning.templateFinalizeCount;
+  snapshot.lightning.destroyCount = lightning.destroyCount;
+  snapshot.lightning.commandFailureCount = lightning.commandFailureCount;
+  snapshot.lightning.drawAttemptCount = lightning.drawAttemptCount;
+  snapshot.lightning.drawSuccessCount = lightning.drawSuccessCount;
+  snapshot.lightning.drawSkippedNoDeviceCount = lightning.drawSkippedNoDeviceCount;
+  snapshot.lightning.drawSkippedNoActiveCount = lightning.drawSkippedNoActiveCount;
+  snapshot.lightning.textureLoadAttemptCount = lightning.textureLoadAttemptCount;
+  snapshot.lightning.textureLoadFallbackCount = lightning.textureLoadFallbackCount;
+  snapshot.lightning.lastDrawVertexCount = lightning.lastDrawVertexCount;
+  snapshot.lightning.lastDrawPrimitiveCount = lightning.lastDrawPrimitiveCount;
+  snapshot.lightning.lastPolylinePointCount = lightning.lastPolylinePointCount;
+  snapshot.lightning.hasDevice = lightning.hasDevice;
+  snapshot.lightning.textureLoaded = lightning.textureLoaded;
+  snapshot.lightning.textureFallback = lightning.textureFallback;
   return snapshot;
 }
 

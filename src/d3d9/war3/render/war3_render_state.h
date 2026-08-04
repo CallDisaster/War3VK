@@ -24,7 +24,8 @@ enum class War3RenderLayer : uint8_t {
 // 根据用户实测结果建立的 Stage -> Tag 映射:
 // S0=天空盒, S1=地形, S2=阴影/迷雾, S5=地面效果(瘟疫), S6=天气(下雪),
 // S7=选择圈, S9=地面效果(血迹/脚印), S10=装饰物, S11=单位渲染,
-// S12=范围指示器目标(绿色), S14=水, S19=建筑地板贴画, S21=范围指示器
+// S12=范围指示器目标(绿色), S14=水, S19=建筑地板贴画, S20=闪电,
+// S21=范围指示器
 enum class War3BatchTag : int32_t {
   Unknown = -1,
   Terrain = 0,          // S1: 地形
@@ -39,6 +40,7 @@ enum class War3BatchTag : int32_t {
   Water = 9,                // S14: 水面渲染
   BuildingFloorDecal = 10,  // S19: 建筑地板贴画
   RangeIndicator = 11,      // S21: 对象范围指示器渲染
+  Lightning = 12,           // S20: 魔兽原生与 WarVK 闪电
 };
 
 // Shadow 语义桥接：只用于在 draw 热路径中保留稳定对象上下文，

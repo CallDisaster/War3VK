@@ -412,3 +412,241 @@ script = "WarVKSetLightningWidth"
 type = integer
 [[.args]]
 type = real
+
+[WarVKSetLightningTemplateBasic]
+title = "设置闪电模板基础参数"
+description = "设置模板 ${templateId} 贴图 ${texturePath}、起点颜色 ${startRed}/${startGreen}/${startBlue}/${startAlpha}、终点颜色 ${endRed}/${endGreen}/${endBlue}/${endAlpha}、宽度 ${startWidth}/${endWidth}、UV ${uvTiling}/${uvScrollSpeed} 与渲染模式 ${renderMode}。"
+comment = "templateId=CreateLightningTemplate 返回的未冻结 id。texturePath=相对地图/MPQ 路径（非空），支持 BLP1(JPEG/索引色)/TGA/PNG/JPG/JPEG/BMP，不支持 BLP2；例 ReplaceableTextures\\Weather\\Lightning.blp。BLP1 JPEG 不含 Alpha，闪电会自动从边缘背景生成软遮罩；要精确透明请用带 Alpha 的 PNG/TGA。start/end 颜色：RGB 建议 0..1（>=0 有限数），Alpha 必须 0..1（不要填 255）。startWidth/endWidth=世界坐标带宽，范围 1..4096。uvTiling=沿电弧贴图重复次数 0.01..128；uvScrollSpeed=贴图滚动速度 -128..128。renderMode：0 ALPHA无深度 / 1 ALPHA深度测试 / 2 加法无深度 / 3 加法深度测试（推荐 WARVK_LIGHTNING_RENDER_ADDITIVE_DEPTH=3）。须在 Finalize 前调用。"
+category = "TC_WarVK"
+script = "WarVKSetLightningTemplateBasic"
+[[.args]]
+type = integer
+[[.args]]
+type = string
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = integer
+
+[WarVKSetLightningTemplateAdvanced]
+title = "设置闪电模板进阶参数"
+description = "设置模板 ${templateId} 段长 ${averageSegmentLength}、最小/最大段 ${minimumSegments}/${maximumSegments}、弧度 ${curveAmplitude}、噪声 ${noiseAmplitude}/${noiseFrequency}/${noiseScrollSpeed}、octaves ${noiseOctaves}、分支 ${branchCount}/${branchLengthScale}/${branchWidthScale}。"
+comment = "templateId=未冻结模板 id。averageSegmentLength=目标段长(世界坐标) 4..8192，越短越密越耗。minimumSegments/maximumSegments=段数钳制，各自 2..64 且 max>=min。curveAmplitude=大尺度弯曲 -4096..4096。noiseAmplitude=分形噪声位移 0..4096；noiseFrequency=噪声频率 0..64；noiseScrollSpeed=噪声相位滚动 -64..64。noiseOctaves=噪声层数 1..4。branchCount=分叉数 0..8；branchLengthScale=分叉相对主电长度 0..8（常用1）；branchWidthScale=分叉相对主电宽度 0.05..4（常用0.45）。推荐：80,4,32,70,36,9,1,2,2,1,0.45。Finalize 前调用。"
+category = "TC_WarVK"
+script = "WarVKSetLightningTemplateAdvanced"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = integer
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = integer
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetLightningTemplateOptional]
+title = "设置闪电模板可选参数"
+description = "设置模板 ${templateId} 生命周期 ${lifetimeSec}、淡入/淡出 ${fadeInSec}/${fadeOutSec}、脉冲 ${pulseAmplitude}/${pulseFrequency}/${pulseTravelSpeed}、闪烁 ${flickerAmplitude}/${flickerFrequencyHz}、辉光 ${glowWidthScale}/${glowOpacity}。"
+comment = "templateId=未冻结模板 id。lifetimeSec=寿命秒 0..600，0=常驻直到 DestroyLightning；>0 时 fadeIn/fadeOut 各自不能超过 lifetime。fadeInSec/fadeOutSec=淡入淡出秒 0..600。pulseAmplitude=脉冲强度 0..1；pulseFrequency=脉冲频率(Hz) 0..120；pulseTravelSpeed=脉冲沿电弧传播 -120..120（0=原地脉冲）。flickerAmplitude=随机闪烁强度 0..1；flickerFrequencyHz=闪烁频率 0..120。glowWidthScale=外层辉光宽度倍率 1..8（1=不更宽）；glowOpacity=辉光不透明度 0..1（0=关闭辉光，共用主贴图）。推荐常驻：0,0.08,0.16,0.25,7,0,0.08,11,1.8,0.22。Finalize 前调用。"
+category = "TC_WarVK"
+script = "WarVKSetLightningTemplateOptional"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKFinalizeLightningTemplate]
+title = "冻结闪电模板"
+description = "冻结闪电模板 ${templateId}。"
+comment = "templateId=已配置的模板 id。建议顺序：Create → Basic → Advanced → Optional → FormulaCurve(可选) → Finalize → CreateFromTemplate。至少需完成基础（通常也需进阶）配置；冻结后 setBasic/Advanced/Optional/setFormulaCurve 均会被拒绝；之后创建的实例复制冻结快照，互不影响。"
+category = "TC_WarVK"
+script = "WarVKFinalizeLightningTemplate"
+[[.args]]
+type = integer
+
+[WarVKDestroyMathProgram]
+title = "销毁数学程序句柄"
+description = "销毁数学程序句柄 ${programId}。"
+comment = "只销毁可再次创建曲线的 programId；已经创建的曲线和已绑定的闪电持有不可变快照，不受影响。"
+category = "TC_WarVK"
+script = "WarVKDestroyMathProgram"
+[[.args]]
+type = integer
+
+[WarVKDestroyCurve]
+title = "销毁公式曲线句柄"
+description = "销毁公式曲线句柄 ${curveId}。"
+comment = "已经绑定到模板或闪电实例的曲线快照不受影响。"
+category = "TC_WarVK"
+script = "WarVKDestroyCurve"
+[[.args]]
+type = integer
+
+[WarVKSetCurveReal]
+title = "设置曲线公式参数"
+description = "设置曲线 ${curveId} 中名为 ${name} 的实数参数为 ${value}。"
+comment = "name 必须是公式里出现的 ASCII 参数标识符且区分大小写；内置上下文变量不能覆盖。绑定到闪电时会复制当前参数快照。"
+category = "TC_WarVK"
+script = "WarVKSetCurveReal"
+[[.args]]
+type = integer
+[[.args]]
+type = string
+[[.args]]
+type = real
+
+[WarVKSetCurveCoordinateMode]
+title = "设置曲线坐标模式"
+description = "设置曲线 ${curveId} 的坐标模式为 ${mode}。"
+comment = "使用 WARVK_CURVE_COORDINATE_OFFSET(公式返回vec2偏移)、LOCAL(返回局部vec3) 或 WORLD(返回世界vec3)。"
+category = "TC_WarVK"
+script = "WarVKSetCurveCoordinateMode"
+[[.args]]
+type = integer
+[[.args]]
+type = integer
+
+[WarVKSetCurveEndpointLocks]
+title = "设置曲线端点锁定"
+description = "设置曲线 ${curveId} 起点锁 ${lockStart} 与终点锁 ${lockEnd}。"
+comment = "锁定会对公式输出施加平滑端点遮罩，确保闪电接触起点/终点；OFFSET 模式推荐两者都开启。"
+category = "TC_WarVK"
+script = "WarVKSetCurveEndpointLocks"
+[[.args]]
+type = integer
+[[.args]]
+type = boolean
+[[.args]]
+type = boolean
+
+[WarVKSetLightningTemplateFormulaCurve]
+title = "设置闪电模板公式曲线"
+description = "把曲线 ${curveId} 的当前快照绑定到闪电模板 ${templateId}。"
+comment = "必须在冻结模板之前调用。绑定后修改/销毁曲线或程序不会改变模板；公式由 C++ 批量执行，不逐点回调 JASS。"
+category = "TC_WarVK"
+script = "WarVKSetLightningTemplateFormulaCurve"
+[[.args]]
+type = integer
+[[.args]]
+type = integer
+
+[WarVKSetLightningFormulaCurve]
+title = "设置闪电实例公式曲线"
+description = "把曲线 ${curveId} 的当前快照绑定到闪电实例 ${lightningId}。"
+comment = "对现有闪电立即生效；绑定后修改/销毁曲线或程序不会改变该闪电实例。"
+category = "TC_WarVK"
+script = "WarVKSetLightningFormulaCurve"
+[[.args]]
+type = integer
+[[.args]]
+type = integer
+
+[WarVKAppendPointCurve4]
+title = "追加点曲线（最多4点）"
+description = "向点曲线 ${curveId} 追加 ${pointCount} 个点：${x0}/${y0}/${z0}、${x1}/${y1}/${z1}、${x2}/${y2}/${z2}、${x3}/${y3}/${z3}。"
+comment = "pointCount 范围1..4；未使用坐标仍填有限值，推荐重复最后一个有效点。累计点数不能超过创建时声明的数量。"
+category = "TC_WarVK"
+script = "WarVKAppendPointCurve4"
+[[.args]]
+type = integer
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKFinalizePointCurve]
+title = "冻结点曲线"
+description = "冻结点曲线 ${curveId} 并建立累计弧长表。"
+comment = "只有实际追加数量恰好等于预期点数且总长度非零时成功；冻结后不可继续追加。"
+category = "TC_WarVK"
+script = "WarVKFinalizePointCurve"
+[[.args]]
+type = integer
+
+[WarVKSetPolylineLightningCurve]
+title = "替换连续闪电点曲线"
+description = "把闪电实例 ${lightningId} 的中心线原子替换为已冻结点曲线 ${curveId}。"
+comment = "用于低频重建动态轨迹；实例 id 保持不变，渲染线程只看到完整不可变快照。"
+category = "TC_WarVK"
+script = "WarVKSetPolylineLightningCurve"
+[[.args]]
+type = integer
+[[.args]]
+type = integer

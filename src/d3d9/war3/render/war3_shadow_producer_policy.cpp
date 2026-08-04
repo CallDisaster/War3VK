@@ -21,6 +21,7 @@ StageCounterArray g_replayPrepared = {};
 std::array<StageCounterArray, 4u> g_cascadeDrawn = {};
 std::array<StageCounterArray, 4u> g_retiredByReason = {};
 StageCounterArray g_rejectedOverlay = {};
+StageCounterArray g_rejectedLightning = {};
 StageCounterArray g_rejectedStage10Owner = {};
 StageCounterArray g_rejectedStage13Owner = {};
 StageCounterArray g_rejectedAlphaPayload = {};
@@ -78,6 +79,15 @@ bool IsShadowVisualOverlay(const ShadowProducerPolicyContext& context) {
       context.batchTag == War3BatchTag::RangeIndicatorTarget ||
       context.tlsBatchTag == War3BatchTag::RangeIndicatorTarget ||
       context.semanticTag == War3BatchTag::RangeIndicatorTarget;
+}
+
+bool IsShadowNativeLightning(const ShadowProducerPolicyContext& context) {
+  // Prefer the physical S20 gate and retain all tag channels as fail-closed
+  // defence when a caller has already left the transient stage scope.
+  return context.stage == 20 ||
+      context.batchTag == War3BatchTag::Lightning ||
+      context.tlsBatchTag == War3BatchTag::Lightning ||
+      context.semanticTag == War3BatchTag::Lightning;
 }
 
 void NoteShadowStageMetadataClassified(int stage) {
@@ -140,6 +150,7 @@ ShadowStageLifecycleSnapshot QueryShadowStageLifecycleSnapshot() {
       SnapshotStageCounters(g_retiredByReason[2u]);
   result.retiredReplaced = SnapshotStageCounters(g_retiredByReason[3u]);
   result.rejectedOverlay = SnapshotStageCounters(g_rejectedOverlay);
+  result.rejectedLightning = SnapshotStageCounters(g_rejectedLightning);
   result.rejectedStage10Owner =
       SnapshotStageCounters(g_rejectedStage10Owner);
   result.rejectedStage13Owner =
@@ -155,6 +166,12 @@ ShadowProducerPolicyDecision EvaluateShadowProducerPolicy(
   const bool traceLifecycle = IsShadowStageLifecycleTelemetryEnabled();
   if (traceLifecycle)
     IncrementStageCounter(g_attempt, context.stage);
+
+  if (IsShadowNativeLightning(context)) {
+    if (traceLifecycle)
+      IncrementStageCounter(g_rejectedLightning, context.stage);
+    return ShadowProducerPolicyDecision::RejectNativeLightningStage;
+  }
 
   if (IsShadowVisualOverlay(context)) {
     if (traceLifecycle)

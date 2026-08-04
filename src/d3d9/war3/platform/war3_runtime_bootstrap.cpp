@@ -9,6 +9,7 @@
 #include "../memory/war3_shadow_arena.h"
 #include "../memory/war3_storm_hook.h"
 #include "../memory/war3_tlsf_pool.h"
+#include "../math/war3_curve_runtime.h"
 #include "../model/war3_model_hook.h"
 #include "../render/war3_render_exec_batch.h"
 #include "../render/war3_render_queue_tracker.h"
@@ -119,6 +120,7 @@ void ResetRuntimeCore() {
   dxvk::war3::model::Shutdown();
   dxvk::war3::render::ResetShadowRuntimeBridgeState();
   dxvk::war3::render::War3LightningRuntime::instance().reset();
+  dxvk::war3::math::CurveRuntime::instance().reset();
   dxvk::war3::shadow::ShadowValidationRuntime::instance().reset();
   dxvk::war3::tools::ResetWar3ControlPlaneState();
   dxvk::war3::render::War3Renderer::instance().EndFrame();
@@ -138,22 +140,20 @@ void BindNativeShadowDevice(IDirect3DDevice9* device) {
 
 bool DriveNativeShadowBackend(bool captureLiveState,
                               uint32_t maxExtraBuildPasses) {
-  const bool lightningActive =
-      dxvk::war3::render::War3LightningRuntime::instance().hasActive();
   if (!dxvk::war3::internal::
           IsNativeRendererHostExecuteValidationRuntimeEnabled())
-    return lightningActive;
+    return false;
   if (!dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
           dxvk::war3::runtime::War3RuntimeModule::SemanticData))
-    return lightningActive;
+    return false;
   if (!dxvk::war3::internal::kWar3RuntimeConfigSemanticConsumerEffective)
-    return lightningActive;
+    return false;
 
   if constexpr (dxvk::war3::internal::
                     kNativeSemanticShadowWorldStageValidationEnabled) {
     if (!dxvk::war3::internal::
             IsNativeSemanticShadowWorldStageValidationRuntimeEnabled())
-      return lightningActive;
+      return false;
 
     auto& validationRuntime =
         dxvk::war3::shadow::ShadowValidationRuntime::instance();
@@ -167,21 +167,18 @@ bool DriveNativeShadowBackend(bool captureLiveState,
   }
 
   return dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
-             .buildLatestFrame() ||
-         lightningActive;
+      .buildLatestFrame();
 }
 
 bool ExecuteNativeShadowBackendPreparedFrame() {
-  const bool shadowOk =
-      dxvk::war3::internal::
-          IsNativeRendererHostExecuteValidationRuntimeEnabled()
-          ? dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
-                .executePreparedFrame()
-          : false;
-  const bool lightningOk =
-      dxvk::war3::render::War3LightningRuntime::instance()
-          .executePreparedFrame();
-  return shadowOk || lightningOk;
+  // Lightning owns a separate Stage 20 hook. Executing it from this shadow
+  // helper made semantic-shadow configurations draw the same bolt twice and
+  // could also bypass the normal world-dispatch a5==0 gate.
+  return dxvk::war3::internal::
+             IsNativeRendererHostExecuteValidationRuntimeEnabled()
+      ? dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
+            .executePreparedFrame()
+      : false;
 }
 
 } // namespace dxvk::war3::platform

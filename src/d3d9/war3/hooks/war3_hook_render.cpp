@@ -2483,7 +2483,11 @@ static void TryNativeSemanticWorldStageValidation(int stage, int a3, int a4,
 }
 
 static void TryWarVkLightningWorldStageDraw(int stage, int a5) {
-  if (stage != dxvk::war3::internal::kNativeSemanticShadowExecuteStage)
+  // Warcraft III submits native lightning in S20.  Execute after the native
+  // WorldDispatch S20 call so WarVK ribbons share the same world ordering,
+  // after S10 doodads and S11 world objects but before later overlays/UI.
+  constexpr int kWarVkLightningStage = 20;
+  if (stage != kWarVkLightningStage)
     return;
   if (a5 != 0)
     return;
@@ -2495,9 +2499,9 @@ static void TryWarVkLightningWorldStageDraw(int stage, int a5) {
     return;
 
   dxvk::war3::platform::TryBindNativeDeviceFromWar3Globals(
-      "WarVKLightningWorldStage", false);
+      "WarVKLightningStage20", false);
 
-  auto scope = MakeRenderHookFrameScope("Hook_WorldDispatch/WarVKLightning");
+  auto scope = MakeRenderHookFrameScope("Hook_WorldDispatch/WarVKLightningS20");
   lightning.executePreparedFrame();
 }
 

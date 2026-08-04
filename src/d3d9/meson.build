@@ -106,6 +106,8 @@ d3d9_src = [
   'war3/platform/war3_module_api.cpp',
   'war3/platform/war3_native_device_resolver.cpp',
   'war3/platform/war3_runtime_bootstrap.cpp',
+  'war3/math/war3_math_expression.cpp',
+  'war3/math/war3_curve_runtime.cpp',
   'war3/memory/tlsf.c',
   'war3/memory/war3_tlsf_pool.cpp',
   'war3/memory/war3_storm_hook.cpp',
@@ -250,6 +252,24 @@ war3_japi_v1_protocol_test = executable(
 test(
   'war3_japi_v1_protocol',
   war3_japi_v1_protocol_test,
+  timeout : 30,
+)
+
+# Pure Phase-1 math-expression and curve-runtime test. It compiles and
+# evaluates bounded bytecode without loading Warcraft or creating GPU state.
+war3_math_curve_runtime_test = executable(
+  'war3_math_curve_runtime_test',
+  [
+    'war3/math/war3_math_expression.cpp',
+    'war3/math/war3_curve_runtime.cpp',
+    'war3/math/tests/war3_math_curve_runtime_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_math_curve_runtime',
+  war3_math_curve_runtime_test,
   timeout : 30,
 )
 

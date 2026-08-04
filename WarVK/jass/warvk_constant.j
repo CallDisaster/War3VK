@@ -69,10 +69,32 @@ globals
     constant integer WARVK_FEATURE_MANAGED_OBJECT = 1024
     constant integer WARVK_FEATURE_TIME = 2048
     constant integer WARVK_FEATURE_STATS = 4096
+    constant integer WARVK_FEATURE_MATH_CURVE = 8192
+    constant integer WARVK_FEATURE_POLYLINE_CURVE = 16384
 
     constant integer WARVK_OBJECT_NONE = 0
     constant integer WARVK_OBJECT_POINT_LIGHT = 1
     constant integer WARVK_OBJECT_LIGHTNING = 2
+
+    // 闪电模板渲染模式。渲染器始终关闭深度写入；
+    // 模式 1/3 仅开启相对场景的深度测试。
+    // 0=Alpha 无深度  1=Alpha 深度测试  2=加法无深度  3=加法深度测试（推荐）
+    constant integer WARVK_LIGHTNING_RENDER_ALPHA_NO_DEPTH = 0
+    constant integer WARVK_LIGHTNING_RENDER_ALPHA_DEPTH = 1
+    constant integer WARVK_LIGHTNING_RENDER_ADDITIVE_NO_DEPTH = 2
+    constant integer WARVK_LIGHTNING_RENDER_ADDITIVE_DEPTH = 3
+
+    // 公式曲线坐标模式。
+    // OFFSET：公式返回 vec2(右偏移, 上偏移)，底层保留起终点直线。
+    // LOCAL：公式返回 vec3(前进, 右偏移, 上偏移)，自动对齐起终点。
+    // WORLD：公式直接返回世界坐标 vec3。
+    constant integer WARVK_CURVE_COORDINATE_OFFSET = 0
+    constant integer WARVK_CURVE_COORDINATE_LOCAL = 1
+    constant integer WARVK_CURVE_COORDINATE_WORLD = 2
+
+    constant integer WARVK_CURVE_COMPONENT_X = 0
+    constant integer WARVK_CURVE_COMPONENT_Y = 1
+    constant integer WARVK_CURVE_COMPONENT_Z = 2
 
     constant integer WARVK_ERROR_NONE = 0
     constant integer WARVK_ERROR_PAYLOAD_TOO_LONG = 1

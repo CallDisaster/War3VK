@@ -713,6 +713,39 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t semanticSceneReceiverViewportHeight = 0;
 };
 
+/**
+ * @brief 闪电运行时的只读诊断快照。
+ *
+ * 这些计数由渲染线程维护，仅在低频 runtime_status 导出时读取；它们不参与
+ * 闪电创建或绘制的控制流。这样地图作者可以区分“JASS 没有创建模板”和
+ * “模板已创建但尚未进入 world-stage 绘制”。
+ */
+struct War3RuntimeStatusLightningSnapshot {
+  uint32_t activeCount = 0;
+  uint32_t polylineActiveCount = 0;
+  uint32_t templateCount = 0;
+  uint32_t finalizedTemplateCount = 0;
+  uint32_t textureCacheEntryCount = 0;
+  uint64_t createCount = 0;
+  uint64_t polylineCreateCount = 0;
+  uint64_t templateCreateCount = 0;
+  uint64_t templateFinalizeCount = 0;
+  uint64_t destroyCount = 0;
+  uint64_t commandFailureCount = 0;
+  uint64_t drawAttemptCount = 0;
+  uint64_t drawSuccessCount = 0;
+  uint64_t drawSkippedNoDeviceCount = 0;
+  uint64_t drawSkippedNoActiveCount = 0;
+  uint64_t textureLoadAttemptCount = 0;
+  uint64_t textureLoadFallbackCount = 0;
+  uint64_t lastDrawVertexCount = 0;
+  uint64_t lastDrawPrimitiveCount = 0;
+  uint64_t lastPolylinePointCount = 0;
+  bool hasDevice = false;
+  bool textureLoaded = false;
+  bool textureFallback = false;
+};
+
 struct War3RuntimeStatusSnapshot {
   uint64_t timestampMs = 0;
   std::string source;
@@ -724,6 +757,7 @@ struct War3RuntimeStatusSnapshot {
   War3RuntimeStatusRenderSnapshot render = {};
   War3RuntimeStatusFrameSnapshot frame = {};
   War3RuntimeStatusShadowSnapshot shadow = {};
+  War3RuntimeStatusLightningSnapshot lightning = {};
 };
 
 /**

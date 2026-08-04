@@ -3754,6 +3754,8 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
   writeStageLifecycleArray(
       "rejectedOverlay", shadowStageLifecycle.rejectedOverlay, true);
   writeStageLifecycleArray(
+      "rejectedLightning", shadowStageLifecycle.rejectedLightning, true);
+  writeStageLifecycleArray(
       "rejectedStage10Owner",
       shadowStageLifecycle.rejectedStage10Owner,
       true);

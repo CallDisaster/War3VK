@@ -29,7 +29,7 @@ static War3BatchTag MapStageToTagProfileMeasured(int stage) {
   case 19:
     return War3BatchTag::BuildingFloorDecal;
   case 20:
-    return War3BatchTag::Decorations;
+    return War3BatchTag::Lightning;
   case 21:
     return War3BatchTag::RangeIndicator;
   default:
@@ -62,7 +62,7 @@ static War3BatchTag MapStageToTagProfileLegacy(int stage) {
   case 19:
     return War3BatchTag::BuildingFloorDecal;
   case 20:
-    return War3BatchTag::Decorations;
+    return War3BatchTag::Lightning;
   case 21:
     return War3BatchTag::RangeIndicator;
   default:

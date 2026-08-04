@@ -1393,7 +1393,7 @@ JassCommandBridgeSelfTestResult RunJassCommandBridgeSelfTest(bool displayText) {
   }
   result.publicV1Ok =
       result.publicProtocolVersion == 1 &&
-      result.publicVersionText.find("WarVK JAPI 1.0.0-p0") !=
+      result.publicVersionText.find("WarVK JAPI 1.3.0-polyline-curves") !=
           std::string::npos;
 
   if (displayText) {

@@ -1,5 +1,98 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-04（Polyline 点曲线、原生 S20 顺序与闪电阴影隔离静态候选）
+
+在 MathProgram/Curve Phase 1 上继续完成地图作者提交采样点的连续闪电路径，并修正
+闪电渲染阶段及阴影归属。本轮按用户明确要求仅做静态开发、Win32 runnable 与构建；
+没有启动 Warcraft III、没有物理画面验收，也没有覆盖作者目录 DLL。
+
+**点曲线与单实例 Ribbon**：
+
+- `CurveRuntime` 新增 2..1024 点的 bounded builder：`createPointCurve`、每批最多4点的
+  `appendPointCurve` 与 exact-count `finalizePointCurve`。Finalize 在发布前一次性验证
+  有限坐标/非零总长、烘焙累计弧长，并生成 `shared_ptr<const PointCurveData>`；渲染线程
+  不会看见半条上传记录，源 curve 销毁后实例继续持有不可变快照。
+- `War3LightningRuntime` 新增 `createPolylineFromTemplate/setPolylineCurve`。一个点曲线只
+  建立一个 `LightningRecord`；中心线以连续 triangle strip 生成，局部左右方向带符号
+  连续性，颜色/宽度/脉冲/UV 按真实归一化弧长插值。主 Ribbon 一次 draw，可选辉光再加
+  一次；不会为每段创建托管闪电对象。Polyline 已是完整作者中心线，因此不再叠加模板
+  分支。
+- JAPI 升为 `WarVK JAPI 1.3.0-polyline-curves`，命令 75→80，新增 point create/
+  append4/finalize、polyline create/set 五条命令；功能位新增
+  `WARVK_FEATURE_POLYLINE_CURVE=16384`，总实现位为 `0x7E07`。由于 v1 wire 上限为16参数，
+  点集在 JASS 侧每批上传4点，但冻结与渲染仍是一个快照/一个实例。
+- JASS、YDWE action/call、README、`MATH_CURVE_API.md` 已同步；新增640点经典 Lorenz
+  smoke，JASS 一次积分4步后直接上传，不保留640点数组，最终只创建一个连续闪电实例。
+
+**S20 顺序与阴影合同**：
+
+- WarVK 绘制从借用 S11 semantic-shadow execute 改为原生 `WorldDispatch S20` 返回后执行，
+  保留 `a5==0` 与 runtime/device 门；同时移除 lightning 对 BeforeUi pipeline 的无关强制。
+- measured/legacy stage map 均把 S20 从 `Decorations` 改为独立
+  `War3BatchTag::Lightning`，`GetStageCategory` 把 S20/Lightning 分类为 `Effect`，不再是
+  Terrain。
+- 中央 `EvaluateShadowProducerPolicy` 在其他判定前对 physical stage 20 或任一 Lightning
+  tag fail-closed，覆盖 current draw、semantic direct、draw-time geometry/pose 与 immediate
+  legacy 等全部阴影发布者；telemetry 新增 `rejectedLightning`。该拒绝只阻止自定义阴影
+  数据发布，不修改 Warcraft 主颜色 S20 draw。
+
+**静态验证与候选**：
+
+- 全量 `test_*_static.py` 447/447 PASS；全部13个 Win32 Meson runnable PASS；Win32 DLL
+  build PASS，`ninja -C build32 -n` no-work，targeted diff-check 仅既有 LF/CRLF 提示。
+- `build32/src/d3d9/d3d9.dll` 为 PE32/I386，33,620,966 bytes，SHA-256
+  `AD7A54BC9707F724E1D8B8C527B0508162622DBFBDBF26655DD2343DB895A2D3`。未部署。
+- 静态/构建只能证明协议、生命周期、阶段门和生产者策略合同；仍需以后由用户显式安排
+  物理地图验收，确认 S20 层级、Lorenz 连续接缝、原生闪电不投影以及高点数性能。在此
+  之前不得宣称视觉问题已完成物理验证。
+
+## 🚨 2026-08-04（WarVK MathProgram / Curve 公式闪电 Phase 1 候选）
+
+用户要求闪电可由地图作者提交数学公式走出任意参数曲线，并把这套能力提升为可复用的
+数学表达式运行时，而不是每点从 JASS 回调 C++。本轮完成第一阶段生产闭环；未进入矩阵/
+四元数、自动微分、RK4、向量场或节点图。
+
+**数学与曲线运行时**：
+
+- 新增 `war3_math_expression`：纯表达式编译为不可变固定栈字节码，原生支持
+  `float/vec2/vec3`、四则/三角/指数/插值/向量/旋转/Bezier/端点遮罩与确定性
+  `noise1`。硬上限为公式384字节、作者参数16、指令256、栈64、嵌套32；没有循环、
+  递归、赋值、动态内存、文件/网络或游戏副作用，非有限结果、除零和定义域错误拒绝。
+- 新增 `CurveRuntime`：每图最多256个 program/512个 mutable curve；支持 OFFSET
+  (`vec2`)、LOCAL/WORLD (`vec3`) 三种严格类型坐标模式、首尾锁、命名 real 参数、
+  低频坐标/有限差分导数/2--256段弧长查询。program/curve 销毁后，已绑定模板/实例继续
+  持有不可变 `shared_ptr<const Program>` 快照；地图退出与 JASS Reset 均清理注册表。
+- 新增纯 Win32 runnable，覆盖全部 Phase-1 函数组、坐标基、端点锁、确定性噪声、导数、
+  弧长、非法公式、运行时除零、类型门及句柄/快照生命周期。
+
+**闪电与作者 API**：
+
+- `LightningRecord` 可持有公式曲线快照；主电和分支中心线在 C++ 渲染路径内批量求值，
+  自动提供 `t/time/length/start/end/forward/right/up/seed/index/segments/branchIndex/
+  branchDepth`。`time` 为实例创建后的秒数；类型不匹配在绑定时拒绝；求值失败安全回退
+  既有中心线。模板冻结、贴图/颜色/宽度/生命周期/辉光和现有分支合同保持不变。
+- JAPI 升为 `WarVK JAPI 1.2.0-math-curves`，命令表61→75，新增 MathProgram 编译/销毁/
+  查询、Curve 创建/销毁/参数/坐标/端点锁/坐标/导数/弧长、模板与实例曲线绑定14条命令；
+  功能位新增 `WARVK_FEATURE_MATH_CURVE=8192`，总已实现位为 `0x3E07`。这些 CPU 命令可
+  在 render settings 就绪前使用，仍受512字节 ASCII wire、16参数与分号 token 边界限制。
+- `WarVK/jass`、YDWE `action.txt/call.txt`、README、`MATH_CURVE_API.md` 与旋转螺旋
+  smoke 已同步。绑定发生在模板 Finalize 前并复制当前参数快照；渲染不会逐点调用 JASS。
+
+**验证、候选与边界**：
+
+- 全量 `test_*_static.py` 442/442 PASS；全部13个 Win32 Meson runnable PASS；Win32
+  build PASS，`ninja -C build32 -n` no-work，targeted diff-check 只有既有 LF/CRLF 提示。
+- 候选 `build32/src/d3d9/d3d9.dll` 为 PE32/I386，33,592,915 bytes，SHA-256
+  `FFD2F60FEDB718BE83EBF2B83DE846AF7D578E0B8172A802237667C15A9B269E`。
+- `worldeditydwe` PID 29716 自 2026-08-03 21:46 起仍运行，故未热覆盖作者目录、未启动
+  游戏；`E:\Work\Warcraft III\d3d9.dll` 仍为上一候选 33,497,691 bytes，SHA-256
+  `CE2574781D8CDF23BD9E821F279DD8441140FB5E847593D9A69CE061E7AAEB49`。下一步须关闭
+  编辑器后备份并部署同一 SHA，再用公式螺旋 smoke 做固定/移动端点、分支、多个 seed、
+  长时间动画与性能验收。
+- 暂未实现 `mat2/mat3/mat4`、quat、比较/三元/`let`、自动微分/二阶曲率、自适应细分、
+  弧长反查、noise2/3/fbm/curl、RK4/向量场、节点图或 GPU 求值；不得把 Phase 1 描述为
+  完整微积分/线性代数语言。
+
 ## 🚨 2026-08-03（精确索引域 WC bulk-read：性能回归修复候选）
 
 用户阶段验收发现当前默认光影图从历史约 100 FPS 降至 76 FPS，高压/“生与死”场景

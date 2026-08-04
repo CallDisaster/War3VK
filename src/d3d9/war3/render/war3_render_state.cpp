@@ -202,6 +202,8 @@ War3RenderState::StageCategory War3RenderState::GetStageCategory() {
     return StageCategory::UI;
   if (batchTag == War3BatchTag::SelectionOverlay)
     return StageCategory::Effect;
+  if (batchTag == War3BatchTag::Lightning)
+    return StageCategory::Effect;
 
   if (g_terrainDepth.load(std::memory_order_relaxed) > 0)
     return StageCategory::Terrain;
@@ -228,7 +230,6 @@ War3RenderState::StageCategory War3RenderState::GetStageCategory() {
   case 14:
   case 17:
   case 19:
-  case 20:
     return StageCategory::Terrain;
   case 11:
   case 12:
@@ -237,6 +238,7 @@ War3RenderState::StageCategory War3RenderState::GetStageCategory() {
   case 15:
   case 16:
   case 18:
+  case 20:
     return StageCategory::Effect;
   case 21:
     return StageCategory::PostProcess;
