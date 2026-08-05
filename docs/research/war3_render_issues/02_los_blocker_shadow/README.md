@@ -38,6 +38,28 @@
    `kPathBlockerForceBridgeTrackingEnabled=true`。
 4. 实测回归通过：日志可稳定观测 `YTxx`，且阻断器不再出现在阴影结果中。
 
+## 2026-07-08 复核修正：FourCC 不是唯一入口
+
+用户提供 `LOSBlocker.mdl` 与专用图 `E:\Work\War3\Maps\ShadowTest\光影测试.w3x`
+后重新验证，确认阻断器在正常渲染中不可见，但仍可能作为 CSM caster 进入 Stage 11 世界对象路径。
+这一轮关键发现是：**不能只依赖 FourCC**。
+
+实机日志同时出现两类命中：
+
+- 有对象身份的阻断器：`YTfb/YTpb/YTab/...`，可走 rawcode/FourCC/模型路径过滤。
+- 丢失对象身份的阻断器：`rawcode=0 / jHandle=0 / stage=11 / vtx=4 / idx=6`，
+  是 `LOSBlocker.mdl` 那种小型不可见平面进入 CSM 后的匿名形态。
+
+当前生产默认因此收窄成三层：
+
+1. 稳定身份优先：FourCC、模型路径、对象桥接命中直接拒绝。
+2. 禁止 broad anonymous rigid gate 默认开启，避免误杀真实单位子网格。
+3. 只保留极窄匿名小平面指纹：`vtx<=8 / idx<=12 / stage=11 / rigid / no alpha / no handle`，
+   用来处理 `LOSBlocker.mdl` 这类 rawcode 断链后的 CSM 残留。
+
+这解释了此前“把 `hfoo` 放进黑名单可以杀步兵，但阻断器杀不掉”的现象：步兵有稳定 rawcode，
+而阻断器在漏网路径里已经退化成 rawcode=0 的匿名小平面。
+
 ## 验收口径（结项）
 1. 含 LOSBlocker 地图下，阻断器不进入阴影。
 2. 非阻断器单位/建筑阴影保持正常。

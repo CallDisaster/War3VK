@@ -3,10 +3,278 @@
 
 #include "war3/render/war3_render_objects.h"
 
+#include "../util/util_bit.h"
+#include "../dxvk/dxvk_adapter.h"
+
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 namespace dxvk {
+namespace {
+
+uint64_t War3HashMatrixForShadowUpload(uint64_t hash, const Matrix4& matrix) {
+  for (uint32_t row = 0; row < 4u; ++row) {
+    hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[row].x));
+    hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[row].y));
+    hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[row].z));
+    hash = bit::fnv1a_iter(hash, bit::cast<uint32_t>(matrix[row].w));
+  }
+  return hash;
+}
+
+uint64_t War3ComputeShadowMatrixUploadKey(
+    const War3PipelineInput& input,
+    const std::vector<const War3ShadowCasterDraw*>* replayDraws) {
+  const uint32_t paletteCount =
+      static_cast<uint32_t>(input.scene.shadowPalettes.size());
+  const uint32_t casterCount =
+      replayDraws != nullptr
+          ? static_cast<uint32_t>(replayDraws->size())
+          : static_cast<uint32_t>(input.scene.shadowCasters.size());
+
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, paletteCount);
+  hash = bit::fnv1a_iter(hash, casterCount);
+  hash = bit::fnv1a_iter(hash, input.scene.shadowStats.dynamicPoseSignature);
+
+  for (uint32_t i = 0; i < paletteCount; ++i)
+    hash = bit::fnv1a_iter(hash, input.scene.shadowPalettes[i].hash);
+
+  for (uint32_t i = 0; i < casterCount; ++i) {
+    const auto& draw =
+        replayDraws != nullptr ? *(*replayDraws)[i] : input.scene.shadowCasters[i];
+    hash = bit::fnv1a_iter(hash, uint32_t(draw.vertexBlendEnabled ? 1u : 0u));
+    hash = bit::fnv1a_iter(hash, uint32_t(draw.vertexBlendIndexed ? 1u : 0u));
+    hash = bit::fnv1a_iter(hash, uint32_t(draw.vertexBlendCount));
+    hash = bit::fnv1a_iter(hash, draw.paletteIndex);
+    hash = War3HashMatrixForShadowUpload(hash, draw.worldMatrix);
+  }
+
+  return hash;
+}
+
+}
+
+bool War3ShadowReceiverPass::GetVolumetricShadowSnapshot(
+    uint64_t expectedFrameSerial, Rc<DxvkImageView>& outShadowMapView,
+    War3CsmData& outCsmData,
+    uint32_t& outShadowResolution, Vector4& outSunDir,
+    Vector4& outWorldUp) const {
+  if (expectedFrameSerial == 0u ||
+      m_shadowPublicationSettledFrameSerial != expectedFrameSerial ||
+      !m_hasCompleteShadowMap || !m_shadowMapSampleView ||
+      m_csmData.cascadeCount == 0u) {
+    outShadowMapView = nullptr;
+    outCsmData = {};
+    outShadowResolution = 0u;
+    outSunDir = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
+    outWorldUp = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
+    return false;
+  }
+
+  outShadowMapView = m_shadowMapSampleView;
+  outCsmData = m_csmData;
+  // Report the actual allocated image size. Adaptive resolution may differ
+  // from the configured target; using the target shifts volumetric PCF taps.
+  outShadowResolution = std::max<uint32_t>(m_shadowMapResolution, 1u);
+  outSunDir = m_csmData.lightDirection;
+  outWorldUp = m_csmData.worldUp;
+  return true;
+}
+
+bool War3ShadowReceiverPass::GetVolumetricSunShadowSnapshot(
+    uint64_t expectedFrameSerial,
+    War3VolumetricSunShadowSnapshot& outSnapshot) const {
+  outSnapshot.depthView = nullptr;
+  outSnapshot.lightViewProj[0] = Matrix4();
+  outSnapshot.lightViewProj[1] = Matrix4();
+  outSnapshot.lightDirection = Vector4(0.0f, 0.0f, -1.0f, 0.0f);
+  outSnapshot.worldUp = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
+  outSnapshot.resolution = 0u;
+  outSnapshot.cascadeCount = 1u;
+  outSnapshot.frameSerial = 0u;
+  outSnapshot.softRadius = 1.35f;
+  outSnapshot.receiverBias = 0.006f;
+  outSnapshot.radiusNear = 0.0f;
+  outSnapshot.radiusFar = 0.0f;
+  if (expectedFrameSerial == 0u ||
+      !m_volumeSunShadowReady ||
+      m_volumeSunPublishedFrameSerial != expectedFrameSerial ||
+      !m_volumeSunShadowSampleView ||
+      m_volumeSunShadowResolution == 0u ||
+      !m_volumeSunOrthoFar.valid) {
+    return false;
+  }
+
+  outSnapshot.depthView = m_volumeSunShadowSampleView;
+  outSnapshot.lightViewProj[0] = m_volumeSunLightViewProj[0];
+  outSnapshot.lightViewProj[1] = m_volumeSunLightViewProj[1];
+  outSnapshot.lightDirection = m_volumeSunOrthoFar.lightDirection;
+  outSnapshot.worldUp = m_volumeSunOrthoFar.worldUp;
+  outSnapshot.resolution = m_volumeSunShadowResolution;
+  outSnapshot.cascadeCount =
+      (m_volumeSunOrthoNear.valid && m_volumeSunOrthoFar.valid) ? 2u : 1u;
+  outSnapshot.frameSerial = m_volumeSunPublishedFrameSerial;
+  outSnapshot.softRadius = m_volumeSunSoftRadius;
+  outSnapshot.receiverBias = m_volumeSunReceiverBias;
+  outSnapshot.radiusNear = m_volumeSunOrthoNear.valid
+                               ? m_volumeSunOrthoNear.radius
+                               : m_volumeSunOrthoFar.radius;
+  outSnapshot.radiusFar = m_volumeSunOrthoFar.radius;
+  return outSnapshot.valid();
+}
+
+void War3ShadowReceiverPass::invalidateVolumeSunShadowPublication() {
+  m_volumeSunShadowReady = false;
+  m_volumeSunPublishedFrameSerial = 0u;
+  m_volumeSunOrthoNear = {};
+  m_volumeSunOrthoFar = {};
+  m_volumeSunLightViewProj[0] = {};
+  m_volumeSunLightViewProj[1] = {};
+}
+
+void War3ShadowReceiverPass::ensureVolumeSunShadowResources(
+    uint32_t resolution) {
+  resolution = std::max<uint32_t>(std::min<uint32_t>(resolution, 2048u), 256u);
+  constexpr uint32_t kLayers = 2u;
+  if (m_volumeSunShadowMap && m_volumeSunShadowSampleView &&
+      m_volumeSunShadowLayerViews[0] && m_volumeSunShadowLayerViews[1] &&
+      m_volumeSunShadowResolution == resolution &&
+      m_volumeSunShadowLayers == kLayers)
+    return;
+
+  m_volumeSunShadowResolution = resolution;
+  m_volumeSunShadowLayers = kLayers;
+  m_volumeSunShadowMap = nullptr;
+  m_volumeSunShadowSampleView = nullptr;
+  m_volumeSunShadowLayerViews = {};
+  invalidateVolumeSunShadowPublication();
+
+  DxvkImageCreateInfo info = {};
+  info.type = VK_IMAGE_TYPE_2D;
+  info.format = VK_FORMAT_D32_SFLOAT;
+  info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+  info.extent = VkExtent3D{resolution, resolution, 1u};
+  info.numLayers = kLayers;
+  info.mipLevels = 1;
+  info.usage =
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  info.stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  info.access =
+      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+  info.debugName = "War3VolumeSunShadow";
+
+  m_volumeSunShadowMap =
+      m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  VkComponentMapping mapping = {
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+
+  {
+    DxvkImageViewKey viewInfo;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    viewInfo.format = info.format;
+    viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    viewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    viewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+    viewInfo.mipIndex = 0;
+    viewInfo.mipCount = 1;
+    viewInfo.layerIndex = 0;
+    viewInfo.layerCount = kLayers;
+    viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+    m_volumeSunShadowSampleView = m_volumeSunShadowMap->createView(viewInfo);
+  }
+  for (uint32_t i = 0; i < kLayers; ++i) {
+    DxvkImageViewKey layerViewInfo;
+    layerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    layerViewInfo.format = info.format;
+    layerViewInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    layerViewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    layerViewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+    layerViewInfo.mipIndex = 0;
+    layerViewInfo.mipCount = 1;
+    layerViewInfo.layerIndex = i;
+    layerViewInfo.layerCount = 1;
+    layerViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+    m_volumeSunShadowLayerViews[i] =
+        m_volumeSunShadowMap->createView(layerViewInfo);
+  }
+}
+
+bool War3ShadowReceiverPass::GetVolumetricPointShadowSnapshot(
+    uint64_t expectedLightGeneration, uint64_t expectedFrameSerial,
+    War3VolumetricPointShadowSnapshot& outSnapshot) const {
+  outSnapshot = {};
+  if (expectedLightGeneration == 0u || expectedFrameSerial == 0u ||
+      !m_pointShadowEnabled ||
+      !pointShadowPublishedStateMatchesCurrentPlan() ||
+      m_pointShadowCpuPlan.lightGeneration != expectedLightGeneration ||
+      m_pointShadowCpuPlan.lightFrameSerial != expectedFrameSerial ||
+      m_pointShadowPublishedLightGeneration != expectedLightGeneration ||
+      m_pointShadowPublishedLightCount == 0u ||
+      m_pointShadowResolution == 0u) {
+    return false;
+  }
+
+  const Rc<DxvkSampler> pointShadowSampler =
+      m_shadowSampler ? m_shadowSampler : m_shadowSamplerActive;
+  if (!pointShadowSampler || !m_pointShadowCubeView)
+    return false;
+
+  War3VolumetricPointShadowSnapshot snapshot = {};
+  snapshot.cubeView = m_pointShadowCubeView;
+  snapshot.sampler = pointShadowSampler;
+  snapshot.resolution = m_pointShadowResolution;
+  snapshot.lightGeneration = expectedLightGeneration;
+  snapshot.frameSerial = expectedFrameSerial;
+  snapshot.publishedFrameSerial = m_pointShadowPublishedFrameSerial;
+  snapshot.contentSignature = m_pointShadowContentSignature;
+  snapshot.filterParams = m_pointShadowFilterParams;
+
+  constexpr uint32_t kCompleteFaceMask = 0x3fu;
+  const uint32_t publishedCount = std::min<uint32_t>(
+      m_pointShadowPublishedLightCount,
+      War3VolumetricPointShadowSnapshot::kMaxLights);
+  for (uint32_t cubeLayer = 0u; cubeLayer < publishedCount; ++cubeLayer) {
+    const uint32_t faceMask = m_pointShadowFaceValidMask[cubeLayer];
+    if (!m_pointShadowReady[cubeLayer] ||
+        (faceMask & kCompleteFaceMask) != kCompleteFaceMask ||
+        m_pointShadowPublishedLightIds[cubeLayer] == 0) {
+      continue;
+    }
+
+    auto& light = snapshot.lights[snapshot.lightCount++];
+    light.lightId = m_pointShadowPublishedLightIds[cubeLayer];
+    light.cubeLayer = cubeLayer;
+    light.faceValidMask = faceMask;
+    light.lightPosRange = m_pointShadowData[cubeLayer].lightPos;
+    light.shadowIntensity =
+        std::clamp(m_pointShadowData[cubeLayer].shadowIntensity, 0.0f, 1.0f);
+    light.bias = std::max(m_pointShadowBias, 0.0f);
+  }
+
+  if (!snapshot.valid())
+    return false;
+  outSnapshot = std::move(snapshot);
+  return true;
+}
+
+uint32_t War3ShadowReceiverPass::GetShadowSamplerIndex() const {
+  if (m_shadowSamplerActive)
+    return m_shadowSamplerActive->getDescriptor().samplerIndex;
+  if (m_shadowSampler)
+    return m_shadowSampler->getDescriptor().samplerIndex;
+  if (m_samplerLinear)
+    return m_samplerLinear->getDescriptor().samplerIndex;
+  return 0u;
+}
+
 void War3ShadowReceiverPass::ensureCopyResources(VkExtent3D extent,
                                                  VkFormat format) {
   if (m_colorCopy && m_cachedExtent.width == extent.width &&
@@ -57,14 +325,12 @@ void War3ShadowReceiverPass::ensureCopyResources(VkExtent3D extent,
 
 void War3ShadowReceiverPass::ensureDepthCopyResources(VkExtent3D extent,
                                                       VkFormat format) {
-  if (m_depthCopy && m_cachedDepthExtent.width == extent.width &&
+  if (m_depthCopy && m_depthCopyView && m_depthCopyView2D &&
+      m_cachedDepthExtent.width == extent.width &&
       m_cachedDepthExtent.height == extent.height &&
       m_cachedDepthFormat == format) {
     return;
   }
-
-  m_cachedDepthExtent = extent;
-  m_cachedDepthFormat = format;
 
   DxvkImageCreateInfo info = {};
   info.type = VK_IMAGE_TYPE_2D;
@@ -76,14 +342,15 @@ void War3ShadowReceiverPass::ensureDepthCopyResources(VkExtent3D extent,
   info.mipLevels = 1;
   info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-  info.stages =
-      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+  info.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_TRANSFER_BIT;
   info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
                 VK_ACCESS_TRANSFER_WRITE_BIT;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-  m_depthCopy =
+  Rc<DxvkImage> newDepthCopy =
       m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
   DxvkImageViewKey viewInfo;
@@ -101,7 +368,17 @@ void War3ShadowReceiverPass::ensureDepthCopyResources(VkExtent3D extent,
       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
   viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
 
-  m_depthCopyView = m_depthCopy->createView(viewInfo);
+  Rc<DxvkImageView> newDepthCopyView = newDepthCopy->createView(viewInfo);
+  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  Rc<DxvkImageView> newDepthCopyView2D = newDepthCopy->createView(viewInfo);
+
+  // Publish transactionally: replace views while the old image is still
+  // alive, then replace the backing image and its cache key.
+  m_depthCopyView = std::move(newDepthCopyView);
+  m_depthCopyView2D = std::move(newDepthCopyView2D);
+  m_depthCopy = std::move(newDepthCopy);
+  m_cachedDepthExtent = extent;
+  m_cachedDepthFormat = format;
 }
 
 void War3ShadowReceiverPass::ensureMotionVectorResources(VkExtent3D extent) {
@@ -167,6 +444,9 @@ void War3ShadowReceiverPass::ensureShadowTaaResources(VkExtent3D extent) {
   m_shadowHistoryValid = false;
   m_hasPrevFrameData = false;
   m_shadowTaaWasActiveLastFrame = false;
+  m_shadowTaaHistoryContractValid = false;
+  if (++m_shadowTaaResourceGeneration == 0u)
+    ++m_shadowTaaResourceGeneration;
 
   // 当前帧阴影因子（未滤波）
   {
@@ -207,11 +487,14 @@ void War3ShadowReceiverPass::ensureShadowTaaResources(VkExtent3D extent) {
     m_shadowCurrentView = m_shadowCurrent->createView(viewInfo);
   }
 
-  // 历史（Ping-Pong）：采样使用 GENERAL，写入使用 STORAGE_IMAGE(GENERAL)
+  // History v2 (ping-pong): R stores visibility and G stores normalized
+  // linear receiver depth.  Keeping depth beside visibility lets the temporal
+  // resolve reject disocclusions instead of smearing stale shadow coverage
+  // across newly visible geometry.
   for (uint32_t i = 0; i < 2; i++) {
     DxvkImageCreateInfo info = {};
     info.type = VK_IMAGE_TYPE_2D;
-    info.format = VK_FORMAT_R8_UNORM;
+    info.format = VK_FORMAT_R16G16_SFLOAT;
     info.flags = 0;
     info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
     info.extent = extent;
@@ -300,82 +583,278 @@ void War3ShadowReceiverPass::ensureOutlineMaskResources(VkExtent3D extent) {
   m_outlineMaskAllView = m_outlineMaskAll->createView(viewInfo);
 }
 
-void War3ShadowReceiverPass::ensureShadowResources(uint32_t cascadeCount,
+bool War3ShadowReceiverPass::ensureShadowResources(uint32_t cascadeCount,
                                                    uint32_t resolution) {
+  constexpr uint64_t kCsmFallbackReserveBytes = 512ull * 1024ull * 1024ull;
   cascadeCount = std::min<uint32_t>(std::max<uint32_t>(cascadeCount, 1u), 4u);
   resolution = std::max<uint32_t>(resolution, 256u);
+  m_csmRequestedResolution = resolution;
 
-  if (m_shadowMap && m_shadowMapResolution == resolution &&
-      m_shadowMapLayers == cascadeCount)
-    return;
+  const auto publishDiagnostics = [&]() {
+    CsmResolutionDiagnostics diagnostics = {};
+    diagnostics.requestedResolution = m_csmRequestedResolution;
+    diagnostics.effectiveResolution = m_csmEffectiveResolution;
+    diagnostics.fallbackReason =
+        static_cast<uint32_t>(m_csmResolutionFallbackReason);
+    diagnostics.fallbackLatched =
+        m_csmResolutionFallbackLatched ? 1u : 0u;
+    diagnostics.memoryBudgetSupported =
+        m_csmMemoryBudgetSupported ? 1u : 0u;
+    diagnostics.memoryBudgetBytes = m_csmMemoryBudgetBytes;
+    diagnostics.memoryAvailableBytes = m_csmMemoryAvailableBytes;
+    diagnostics.resourceGeneration = m_shadowMapResourceGeneration;
+    diagnostics.resourceRebuildCount = m_csmResourceRebuildCount;
+    PublishCsmResolutionDiagnostics(diagnostics);
+  };
 
-  m_shadowMapResolution = resolution;
+  if (m_shadowMap && m_shadowCasterMask &&
+      m_shadowMapSampleView && m_shadowCasterMaskSampleView &&
+      m_shadowMapResolution == resolution &&
+      m_shadowMapLayers == cascadeCount) {
+    m_csmEffectiveResolution = m_shadowMapResolution;
+    publishDiagnostics();
+    return true;
+  }
+
+  uint32_t candidateResolution =
+      m_csmResolutionFallbackLatched && resolution > 2048u
+          ? 2048u
+          : resolution;
+
+  // VK_EXT_memory_budget is the only preflight authority. Without it we try
+  // 4096 and only latch a fallback after an actual allocation failure.
+  m_csmMemoryBudgetSupported = m_device->features().extMemoryBudget != 0u;
+  m_csmMemoryBudgetBytes = 0u;
+  m_csmMemoryAvailableBytes = 0u;
+  if (!m_csmResolutionFallbackLatched && candidateResolution > 2048u &&
+      m_csmMemoryBudgetSupported) {
+    const DxvkAdapterMemoryInfo memoryInfo =
+        m_device->adapter()->getMemoryHeapInfo();
+    for (uint32_t i = 0u; i < memoryInfo.heapCount; ++i) {
+      const auto& heap = memoryInfo.heaps[i];
+      if ((heap.heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0u)
+        continue;
+      const uint64_t available =
+          heap.memoryBudget > heap.memoryAllocated
+              ? heap.memoryBudget - heap.memoryAllocated
+              : 0u;
+      if (available >= m_csmMemoryAvailableBytes) {
+        m_csmMemoryBudgetBytes = heap.memoryBudget;
+        m_csmMemoryAvailableBytes = available;
+      }
+    }
+    const uint64_t candidateBytes =
+        uint64_t(candidateResolution) * uint64_t(candidateResolution) *
+        uint64_t(cascadeCount) * 5ull; // D32 + R8
+    if (m_csmMemoryAvailableBytes <
+        candidateBytes + kCsmFallbackReserveBytes) {
+      m_csmResolutionFallbackLatched = true;
+      m_csmResolutionFallbackReason =
+          CsmResolutionFallbackReason::MemoryBudget;
+      candidateResolution = 2048u;
+    }
+  }
+
+  // A session-latched 2048 fallback still receives the original 4096 request
+  // every frame. Compare against the resolved candidate as well as the user
+  // request so the fallback stays observable without recreating identical
+  // 2048 resources on every pass.
+  if (m_shadowMap && m_shadowCasterMask &&
+      m_shadowMapSampleView && m_shadowCasterMaskSampleView &&
+      m_shadowMapResolution == candidateResolution &&
+      m_shadowMapLayers == cascadeCount) {
+    m_csmEffectiveResolution = m_shadowMapResolution;
+    publishDiagnostics();
+    return true;
+  }
+
+  struct ShadowResourceCandidate {
+    Rc<DxvkImage> shadowMap;
+    Rc<DxvkImageView> shadowMapSampleView;
+    decltype(m_shadowMapLayerViews) shadowMapLayerViews = {};
+    Rc<DxvkImage> shadowCasterMask;
+    Rc<DxvkImageView> shadowCasterMaskSampleView;
+    decltype(m_shadowCasterMaskLayerViews) shadowCasterMaskLayerViews = {};
+  };
+
+  const auto createCandidate = [&](uint32_t requestedCandidateResolution,
+                                   ShadowResourceCandidate& candidate) {
+    DxvkImageCreateInfo info = {};
+    info.type = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_D32_SFLOAT;
+    info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    info.extent = VkExtent3D{requestedCandidateResolution,
+                             requestedCandidateResolution, 1u};
+    info.numLayers = cascadeCount;
+    info.mipLevels = 1;
+    info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    info.access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                  VK_ACCESS_SHADER_READ_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+    DxvkImageCreateInfo maskInfo = {};
+    maskInfo.type = VK_IMAGE_TYPE_2D;
+    maskInfo.format = VK_FORMAT_R8_UNORM;
+    maskInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    maskInfo.extent = info.extent;
+    maskInfo.numLayers = cascadeCount;
+    maskInfo.mipLevels = 1;
+    maskInfo.usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    maskInfo.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    maskInfo.access =
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    maskInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    maskInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    maskInfo.debugName = "War3ShadowCasterMask";
+
+    try {
+      Rc<DxvkImage> candidateShadowMap = m_device->createImage(
+          info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      Rc<DxvkImage> candidateShadowCasterMask = m_device->createImage(
+          maskInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      if (!candidateShadowMap || !candidateShadowMap->storage() ||
+          !candidateShadowCasterMask ||
+          !candidateShadowCasterMask->storage()) {
+        return false;
+      }
+      candidate.shadowMap = std::move(candidateShadowMap);
+      candidate.shadowCasterMask = std::move(candidateShadowCasterMask);
+
+      const VkComponentMapping mapping = {
+          VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+          VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+      DxvkImageViewKey viewInfo;
+      viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      viewInfo.format = info.format;
+      viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+      viewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+      viewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+      viewInfo.mipIndex = 0;
+      viewInfo.mipCount = 1;
+      viewInfo.layerIndex = 0;
+      viewInfo.layerCount = cascadeCount;
+      viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+      candidate.shadowMapSampleView = candidate.shadowMap->createView(viewInfo);
+
+      DxvkImageViewKey maskViewInfo;
+      maskViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      maskViewInfo.format = maskInfo.format;
+      maskViewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+      maskViewInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      maskViewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+      maskViewInfo.mipIndex = 0;
+      maskViewInfo.mipCount = 1;
+      maskViewInfo.layerIndex = 0;
+      maskViewInfo.layerCount = cascadeCount;
+      maskViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+      candidate.shadowCasterMaskSampleView =
+          candidate.shadowCasterMask->createView(maskViewInfo);
+
+      for (uint32_t i = 0u; i < cascadeCount; ++i) {
+        DxvkImageViewKey layerViewInfo;
+        layerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        layerViewInfo.format = info.format;
+        layerViewInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        layerViewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        layerViewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+        layerViewInfo.mipIndex = 0;
+        layerViewInfo.mipCount = 1;
+        layerViewInfo.layerIndex = i;
+        layerViewInfo.layerCount = 1;
+        layerViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+        candidate.shadowMapLayerViews[i] =
+            candidate.shadowMap->createView(layerViewInfo);
+
+        DxvkImageViewKey maskLayerViewInfo;
+        maskLayerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        maskLayerViewInfo.format = maskInfo.format;
+        maskLayerViewInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        maskLayerViewInfo.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        maskLayerViewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        maskLayerViewInfo.mipIndex = 0;
+        maskLayerViewInfo.mipCount = 1;
+        maskLayerViewInfo.layerIndex = i;
+        maskLayerViewInfo.layerCount = 1;
+        maskLayerViewInfo.packedSwizzle =
+            DxvkImageViewKey::packSwizzle(mapping);
+        candidate.shadowCasterMaskLayerViews[i] =
+            candidate.shadowCasterMask->createView(maskLayerViewInfo);
+      }
+    } catch (const DxvkError& error) {
+      const std::string message = error.message();
+      if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST ||
+          message.find("VK_ERROR_DEVICE_LOST") != std::string::npos ||
+          message.find(": -4") != std::string::npos) {
+        throw;
+      }
+      return false;
+    }
+
+    if (!candidate.shadowMapSampleView ||
+        !candidate.shadowCasterMaskSampleView)
+      return false;
+    for (uint32_t i = 0u; i < cascadeCount; ++i) {
+      if (!candidate.shadowMapLayerViews[i] ||
+          !candidate.shadowCasterMaskLayerViews[i])
+        return false;
+    }
+    return true;
+  };
+
+  ShadowResourceCandidate candidate = {};
+  if (!createCandidate(candidateResolution, candidate)) {
+    if (candidateResolution > 2048u) {
+      m_csmResolutionFallbackLatched = true;
+      m_csmResolutionFallbackReason =
+          CsmResolutionFallbackReason::AllocationFailure;
+      candidateResolution = 2048u;
+      candidate = {};
+    }
+    if (!createCandidate(candidateResolution, candidate)) {
+      m_csmEffectiveResolution = m_shadowMapResolution;
+      publishDiagnostics();
+      return false;
+    }
+  }
+
+  // Transactional commit: old resources remain alive until every candidate
+  // image and view exists. Only the successful swap changes generations.
+  std::swap(m_shadowMap, candidate.shadowMap);
+  std::swap(m_shadowMapSampleView, candidate.shadowMapSampleView);
+  std::swap(m_shadowMapLayerViews, candidate.shadowMapLayerViews);
+  std::swap(m_shadowCasterMask, candidate.shadowCasterMask);
+  std::swap(m_shadowCasterMaskSampleView,
+            candidate.shadowCasterMaskSampleView);
+  std::swap(m_shadowCasterMaskLayerViews,
+            candidate.shadowCasterMaskLayerViews);
+
+  m_shadowMapResolution = candidateResolution;
   m_shadowMapLayers = cascadeCount;
+  m_csmEffectiveResolution = candidateResolution;
 
-  // Replay 路径已弃用：不再创建 D3D9 depth texture/surface
+  // Replay path is retired; no D3D9 depth texture/surface is recreated.
   m_shadowTexture = nullptr;
   m_shadowSurface = nullptr;
-
-  m_shadowMap = nullptr;
-  m_shadowMapSampleView = nullptr;
-  m_shadowMapLayerViews = {};
   m_hasCompleteShadowMap = false;
   m_lastShadowMapCasterCount = 0;
+  m_transientEmptyReplayHoldFramesRemaining = 0;
+  m_recentSemanticDynamicHoldFramesRemaining = 0;
   m_shadowAdaptiveFrameIndex = 0;
-
-  DxvkImageCreateInfo info = {};
-  info.type = VK_IMAGE_TYPE_2D;
-  info.format = VK_FORMAT_D32_SFLOAT;
-  info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
-  info.extent = VkExtent3D{resolution, resolution, 1u};
-  info.numLayers = cascadeCount;
-  info.mipLevels = 1;
-  info.usage =
-      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  info.stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  info.access =
-      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-  info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-
-  m_shadowMap =
-      m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-  VkComponentMapping mapping = {
-      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-
-  {
-    DxvkImageViewKey viewInfo;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    viewInfo.format = info.format;
-    viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-    viewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    viewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
-    viewInfo.mipIndex = 0;
-    viewInfo.mipCount = 1;
-    viewInfo.layerIndex = 0;
-    viewInfo.layerCount = cascadeCount;
-    viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-    m_shadowMapSampleView = m_shadowMap->createView(viewInfo);
-  }
-
-  for (uint32_t i = 0; i < cascadeCount; i++) {
-    DxvkImageViewKey layerViewInfo;
-    layerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    layerViewInfo.format = info.format;
-    layerViewInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    layerViewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    layerViewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
-    layerViewInfo.mipIndex = 0;
-    layerViewInfo.mipCount = 1;
-    layerViewInfo.layerIndex = i;
-    layerViewInfo.layerCount = 1;
-    layerViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-    m_shadowMapLayerViews[i] = m_shadowMap->createView(layerViewInfo);
-  }
+  m_shadowHistoryValid = false;
+  m_shadowTaaWasActiveLastFrame = false;
+  m_shadowTaaHistoryContractValid = false;
+  if (++m_shadowMapResourceGeneration == 0u)
+    ++m_shadowMapResourceGeneration;
+  ++m_csmResourceRebuildCount;
+  publishDiagnostics();
+  return true;
 }
 
 DxvkResourceBufferInfo War3ShadowReceiverPass::ensureShadowMatrixBuffer(
@@ -396,10 +875,13 @@ DxvkResourceBufferInfo War3ShadowReceiverPass::ensureShadowMatrixBuffer(
   // 在矩阵 SSBO 末尾追加“每个 draw 的 worldMatrix”，用于非骨骼物体的 GPU 端 MVP
   // 计算。 约定：objectMatrixIndex = objectBase + drawIndex
   const uint32_t objectBase = paletteCount * 256u;
+  const uint64_t sceneKey =
+      War3ComputeShadowMatrixUploadKey(input, replayDraws);
 
   if (m_shadowMatrixUploadedFrame == frameNumber &&
       m_shadowMatrixBufferInfo.buffer != VK_NULL_HANDLE &&
-      m_shadowMatrixObjectBase == objectBase) {
+      m_shadowMatrixObjectBase == objectBase &&
+      m_shadowMatrixSceneKey == sceneKey) {
     // 同一帧多次使用时，仍然需要对当前命令列表做资源追踪
     ctx->track(m_vertexBlendPaletteBuffer, DxvkAccess::Read);
     return m_shadowMatrixBufferInfo;
@@ -413,29 +895,74 @@ DxvkResourceBufferInfo War3ShadowReceiverPass::ensureShadowMatrixBuffer(
   const VkDeviceSize requiredStride =
       (requiredBytes + (align - 1u)) & ~(align - 1u);
 
-  if (!m_vertexBlendPaletteBuffer || m_paletteStride < requiredStride) {
-    m_paletteStride = requiredStride;
-    m_vertexBlendPaletteCapacity = m_paletteStride * kPaletteRingCount;
+  // Allocation renaming pool: plain Rc ownership keeps slots resident, while
+  // DxvkAccess::Read is released only after the command list has completed on
+  // the GPU. Never write a host-visible slot while that access is still live.
+  size_t selectedSlot = m_shadowMatrixUploadSlots.size();
+  size_t replaceableSlot = m_shadowMatrixUploadSlots.size();
+  VkDeviceSize selectedCapacity = ~VkDeviceSize(0u);
+  for (size_t i = 0u; i < m_shadowMatrixUploadSlots.size(); ++i) {
+    const auto& slot = m_shadowMatrixUploadSlots[i];
+    if (!slot.buffer || slot.buffer->isInUse(DxvkAccess::Read))
+      continue;
+
+    if (slot.capacity >= requiredStride) {
+      if (slot.capacity < selectedCapacity) {
+        selectedSlot = i;
+        selectedCapacity = slot.capacity;
+      }
+    } else if (replaceableSlot == m_shadowMatrixUploadSlots.size()) {
+      replaceableSlot = i;
+    }
+  }
+
+  if (selectedSlot == m_shadowMatrixUploadSlots.size()) {
+    if (replaceableSlot == m_shadowMatrixUploadSlots.size() &&
+        m_shadowMatrixUploadSlots.size() >=
+            kShadowMatrixUploadPoolLimit) {
+      // GPU completion has not released any suitable backing. Missing one
+      // shadow frame is preferable to overwriting matrices still in flight.
+      return {};
+    }
 
     DxvkBufferCreateInfo bufInfo = {};
-    bufInfo.size = m_vertexBlendPaletteCapacity;
+    bufInfo.size = requiredStride;
     bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     bufInfo.stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
     bufInfo.access = VK_ACCESS_SHADER_READ_BIT;
     bufInfo.debugName = "War3ShadowMatricesSSBO";
 
-    m_vertexBlendPaletteBuffer = m_device->createBuffer(
+    ShadowMatrixUploadSlot newSlot = {};
+    newSlot.buffer = m_device->createBuffer(
         bufInfo, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    m_vertexBlendPaletteMapPtr = m_vertexBlendPaletteBuffer->mapPtr(0u);
+    if (!newSlot.buffer)
+      return {};
+    newSlot.mapPtr = newSlot.buffer->mapPtr(0u);
+    newSlot.capacity = requiredStride;
+    if (newSlot.mapPtr == nullptr)
+      return {};
+
+    if (replaceableSlot != m_shadowMatrixUploadSlots.size()) {
+      m_shadowMatrixUploadSlots[replaceableSlot] = std::move(newSlot);
+      selectedSlot = replaceableSlot;
+    } else {
+      m_shadowMatrixUploadSlots.push_back(std::move(newSlot));
+      selectedSlot = m_shadowMatrixUploadSlots.size() - 1u;
+    }
   }
 
-  if (!m_vertexBlendPaletteBuffer || m_vertexBlendPaletteMapPtr == nullptr)
+  auto& uploadSlot = m_shadowMatrixUploadSlots[selectedSlot];
+  m_vertexBlendPaletteBuffer = uploadSlot.buffer;
+  m_vertexBlendPaletteMapPtr = uploadSlot.mapPtr;
+  m_vertexBlendPaletteCapacity = uploadSlot.capacity;
+  if (!m_vertexBlendPaletteBuffer || m_vertexBlendPaletteMapPtr == nullptr ||
+      m_vertexBlendPaletteCapacity < requiredBytes)
     return {};
 
-  const uint32_t ringIndex = uint32_t(input.frameIndex % kPaletteRingCount);
-  const VkDeviceSize baseOffset = VkDeviceSize(ringIndex) * m_paletteStride;
-  m_paletteBaseMatrixIndex = uint32_t(baseOffset / sizeof(Matrix4));
+  ++m_shadowMatrixUploadSerial;
+  const VkDeviceSize baseOffset = 0u;
+  m_paletteBaseMatrixIndex = 0u;
 
   Matrix4 *dst = reinterpret_cast<Matrix4 *>(
       reinterpret_cast<uint8_t *>(m_vertexBlendPaletteMapPtr) + baseOffset);
@@ -478,24 +1005,74 @@ DxvkResourceBufferInfo War3ShadowReceiverPass::ensureShadowMatrixBuffer(
   m_shadowMatrixBufferInfo = slice;
   m_shadowMatrixUploadedFrame = frameNumber;
   m_shadowMatrixObjectBase = objectBase;
+  m_shadowMatrixSceneKey = sceneKey;
 
   return slice;
 }
 
-// [NEW] Point Light Cube Shadow Map 资源创建
-void War3ShadowReceiverPass::ensurePointShadowResources() {
-  if (m_pointShadowCube)
-    return; // 已创建，直接返回
+void War3ShadowReceiverPass::ensurePointShadowNeutralResources() {
+  if (m_pointShadowNeutralCube && m_pointShadowNeutralCubeView)
+    return;
 
-  constexpr uint32_t resolution = kPointShadowResolution;
+  DxvkImageCreateInfo info = {};
+  info.type = VK_IMAGE_TYPE_2D;
+  info.format = VK_FORMAT_D32_SFLOAT;
+  info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+  info.extent = VkExtent3D{1u, 1u, 1u};
+  info.numLayers = 6u;
+  info.mipLevels = 1u;
+  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  info.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  info.access = VK_ACCESS_SHADER_READ_BIT;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+  info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+  info.debugName = "War3PointShadowNeutralCube";
 
-  // 创建 Cube 深度纹理
+  m_pointShadowNeutralCube =
+      m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  m_pointShadowNeutralReady = false;
+
+  DxvkImageViewKey viewInfo;
+  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+  viewInfo.format = info.format;
+  viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  viewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+  viewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+  viewInfo.mipIndex = 0u;
+  viewInfo.mipCount = 1u;
+  viewInfo.layerIndex = 0u;
+  viewInfo.layerCount = 6u;
+  const VkComponentMapping mapping = {
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+  viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+  m_pointShadowNeutralCubeView =
+      m_pointShadowNeutralCube->createView(viewInfo);
+}
+
+// Point-light cube-shadow resources are sized to the configured shadow-light
+// capacity. The old fixed 4-light allocation made a single 1024 cube cost the
+// memory of four lights (96 MiB) and prevented a practical 2048 ultra mode.
+void War3ShadowReceiverPass::ensurePointShadowResources(
+    uint32_t resolution, uint32_t capacityLights) {
+  resolution = std::clamp<uint32_t>(resolution, 128u, 2048u);
+  capacityLights =
+      std::clamp<uint32_t>(capacityLights, 1u, kMaxPointShadowLights);
+  if (m_pointShadowCube && m_pointShadowCubeView &&
+      m_pointShadowResolution == resolution &&
+      m_pointShadowCapacityLights == capacityLights)
+    return;
+
+  const uint32_t layerCount = capacityLights * 6u;
+
+  // 创建 CubeArray 深度纹理
   DxvkImageCreateInfo info = {};
   info.type = VK_IMAGE_TYPE_2D;
   info.format = VK_FORMAT_D32_SFLOAT;
   info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
   info.extent = VkExtent3D{resolution, resolution, 1u};
-  info.numLayers = 6; // Cube 有 6 个 layer
+  info.numLayers = layerCount;
   info.mipLevels = 1;
   info.usage =
       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -506,33 +1083,33 @@ void War3ShadowReceiverPass::ensurePointShadowResources() {
       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-  info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT; // 重要：标记为 Cube 兼容
+  info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+  info.debugName = "War3PointShadowCubeArray";
 
-  m_pointShadowCube =
+  // Build the replacement transactionally. If allocation/view creation throws,
+  // the last-good cube remains owned by the pass instead of being cleared first.
+  Rc<DxvkImage> newCube =
       m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
   VkComponentMapping mapping = {
       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
 
-  // 创建 Cube 采样视图
-  {
-    DxvkImageViewKey viewInfo;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
-    viewInfo.format = info.format;
-    viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-    viewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    viewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
-    viewInfo.mipIndex = 0;
-    viewInfo.mipCount = 1;
-    viewInfo.layerIndex = 0;
-    viewInfo.layerCount = 6;
-    viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-    m_pointShadowCubeView = m_pointShadowCube->createView(viewInfo);
-  }
+  DxvkImageViewKey viewInfo;
+  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+  viewInfo.format = info.format;
+  viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  viewInfo.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+  viewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+  viewInfo.mipIndex = 0;
+  viewInfo.mipCount = 1;
+  viewInfo.layerIndex = 0;
+  viewInfo.layerCount = layerCount;
+  viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
+  Rc<DxvkImageView> newCubeView = newCube->createView(viewInfo);
 
-  // 创建 6 个面的渲染视图（用于 Depth Attachment）
-  for (uint32_t i = 0; i < 6; i++) {
+  std::array<Rc<DxvkImageView>, kMaxPointShadowLights * 6u> newFaceViews = {};
+  for (uint32_t i = 0; i < layerCount; i++) {
     DxvkImageViewKey faceViewInfo;
     faceViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     faceViewInfo.format = info.format;
@@ -541,15 +1118,30 @@ void War3ShadowReceiverPass::ensurePointShadowResources() {
     faceViewInfo.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
     faceViewInfo.mipIndex = 0;
     faceViewInfo.mipCount = 1;
-    faceViewInfo.layerIndex = i; // 每个面一个 layer
+    faceViewInfo.layerIndex = i; // 每个点光源占连续 6 个 cube face layer
     faceViewInfo.layerCount = 1;
     faceViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-    m_pointShadowFaceViews[i] = m_pointShadowCube->createView(faceViewInfo);
+    newFaceViews[i] = newCube->createView(faceViewInfo);
   }
 
+  m_pointShadowCube = newCube;
+  m_pointShadowCubeView = newCubeView;
+  m_pointShadowFaceViews = newFaceViews;
+  m_pointShadowResolution = resolution;
+  m_pointShadowCapacityLights = capacityLights;
+  m_pointShadowCubeLayoutInitialized = false;
+  // A recreated image contains no valid face data. Keeping the old validity
+  // mask would let a low face-budget update sample untouched faces from the
+  // new (empty) cube as if they were temporal history.
+  invalidatePointShadowPublishedState();
+
+  const uint64_t bytes = uint64_t(resolution) * uint64_t(resolution) * 4ull *
+                         uint64_t(layerCount);
   WAR3_RENDER_LOG(
-      "DXVK War3Shadow: Point Shadow Cube created (%ux%u x 6 faces)\n",
-      resolution, resolution);
+      "DXVK War3Shadow: Point Shadow CubeArray created (%ux%u x %u layers, "
+      "capacity=%u, %.1f MiB D32)\n",
+      resolution, resolution, layerCount, capacityLights,
+      static_cast<double>(bytes) / (1024.0 * 1024.0));
 }
 
 void War3ShadowReceiverPass::copyColor(const Rc<DxvkCommandList> &ctx,
@@ -647,7 +1239,8 @@ void War3ShadowReceiverPass::copyDepth(const Rc<DxvkCommandList> &ctx,
   barriers[0].image = srcDepthView->image()->handle();
   barriers[0].subresourceRange = srcDepthView->imageSubresources();
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
   barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
   barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -690,7 +1283,8 @@ void War3ShadowReceiverPass::copyDepth(const Rc<DxvkCommandList> &ctx,
 
   barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
   barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
   barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   barriers[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;

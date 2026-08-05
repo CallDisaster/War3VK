@@ -5,6 +5,7 @@
 #include "d3d9_caps.h"
 #include "d3d9_mem.h"
 #include "d3d9_interop.h"
+#include "war3/tools/war3_resource_residency_census.h"
 
 #include "../dxvk/dxvk_device.h"
 
@@ -242,17 +243,30 @@ namespace dxvk {
       return Face * m_desc.MipLevels + MipLevel;
     }
 
-    void UnmapData() {
-      m_data.Unmap();
-    }
+    void UnmapData();
 
     /**
      * \brief Destroys a buffer
      * Destroys mapping and staging buffers for a given subresource
      */
-    void DestroyBuffer() {
-      m_buffer = nullptr;
-      MarkAllNeedReadback();
+    void DestroyBuffer();
+
+    void War3NoteResourceCensusLock(
+        const war3::resource_census::ResourceLockEvent& event) const {
+      war3::resource_census::NoteLock(m_war3ResourceCensus, event);
+    }
+    bool War3ResourceCensusEnabled() const {
+      return m_war3ResourceCensus != nullptr;
+    }
+    void War3NoteResourceCensusUnlock() const {
+      war3::resource_census::NoteUnlock(m_war3ResourceCensus);
+    }
+    void War3NoteResourceCensusExternalDirty() const {
+      war3::resource_census::NoteExternalDirty(m_war3ResourceCensus);
+    }
+    void War3NoteResourceCensusUpload(UINT subresource) const {
+      war3::resource_census::NoteDeviceUpload(
+          m_war3ResourceCensus, subresource);
     }
 
     bool IsDynamic() const {
@@ -479,6 +493,7 @@ namespace dxvk {
      * \returns Whether an allocation happened
      */
     void CreateBuffer(bool Initialize);
+    void War3RefreshResourceCensusBacking();
 
     ID3D9VkInteropTexture* GetVkInterop() { return &m_d3d9Interop; }
 
@@ -529,6 +544,7 @@ namespace dxvk {
     std::array<D3DBOX, 6>         m_dirtyBoxes;
 
     D3D9VkInteropTexture          m_d3d9Interop;
+    war3::resource_census::ResourceHandle m_war3ResourceCensus;
 
     Rc<DxvkImage> CreatePrimaryImage(D3DRESOURCETYPE ResourceType, HANDLE* pSharedHandle) const;
 
@@ -546,6 +562,9 @@ namespace dxvk {
 
     VkImageLayout OptimizeLayout(
             VkImageUsageFlags         Usage) const;
+
+    war3::resource_census::HostBackingBinding
+    War3HostBackingBinding() const noexcept;
 
     void ExportImageInfo();
 

@@ -3864,7 +3864,7 @@ static stbi_uc stbi__blinn_8x8(stbi_uc x, stbi_uc y)
 
 static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp, int req_comp)
 {
-   int n, decode_n, is_rgb;
+   int n, decode_n, is_rgb, is_bgra_jfif;
    z->s->img_n = 0; // make stbi__cleanup_jpeg safe
 
    // validate req_comp
@@ -3877,6 +3877,15 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
    n = req_comp ? req_comp : z->s->img_n >= 3 ? 3 : 1;
 
    is_rgb = z->s->img_n == 3 && (z->rgb == 3 || (z->app14_color_transform == 0 && !z->jfif));
+
+   // Warcraft III BLP1 JPEG payloads are non-standard four-component JFIF
+   // streams. Their components are direct B, G, R, A channels rather than
+   // YCbCr, but there is no Adobe APP14 marker to describe them. Applying
+   // YCbCr conversion produces green/cyan/magenta inversion; copying them as
+   // R, G, B produces an orange/blue channel swap. Four-component JFIF is
+   // outside the JFIF specification, so this signature does not change normal
+   // JPEG/CMYK/YCCK handling.
+   is_bgra_jfif = z->s->img_n == 4 && z->jfif && z->app14_color_transform == -1;
 
    if (z->s->img_n == 3 && n < 3 && !is_rgb)
       decode_n = 1;
@@ -3954,7 +3963,16 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
                   z->YCbCr_to_RGB_kernel(out, y, coutput[1], coutput[2], z->s->img_x, n);
                }
             } else if (z->s->img_n == 4) {
-               if (z->app14_color_transform == 0) { // CMYK
+               if (is_bgra_jfif) {
+                  for (i=0; i < z->s->img_x; ++i) {
+                     out[0] = coutput[2][i];
+                     out[1] = coutput[1][i];
+                     out[2] = coutput[0][i];
+                     if (n == 4)
+                        out[3] = coutput[3][i];
+                     out += n;
+                  }
+               } else if (z->app14_color_transform == 0) { // CMYK
                   for (i=0; i < z->s->img_x; ++i) {
                      stbi_uc m = coutput[3][i];
                      out[0] = stbi__blinn_8x8(coutput[0][i], m);

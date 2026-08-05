@@ -16,25 +16,84 @@ namespace dxvk {
 
     struct War3CsmConfig {
         uint32_t cascadeCount = 4;
+        // Release clarity baseline. Runtime work must not bounce this between
+        // 4096 and 2048; allocation/budget fallback is session-latched.
         uint32_t shadowResolution = 4096;
         float splitLambda = 0.5f;
-        float maxDistance = 8000.0f;
+        // Phase 7.31 Iteration D：从 8000 降到 4000。War3 的 RTS 相机俯角下
+        // 远景很少超过 3000 个单位，8000 会让每个 cascade 覆盖太大范围、
+        // 远景 texel 稀释造成"阴影边缘糊"。4000 配 splitLambda=0.5 近三级
+        // 可以覆盖到 1500~1800，视觉上锐度显著提升。
+        float maxDistance = 4000.0f;
 
         float stableSnap = 1.0f;        // 1 = 开启 texel snapping，0 = 关闭
         float depthRangeMargin = 50.0f; // 额外扩展 Z 范围，减少裁剪
-        War3CsmFitMode fitMode = War3CsmFitMode::TightAabb;
+        // Optional one-sided, toward-sun caster allowance for far cascades.
+        // Unlike depthRangeMargin this does not also move the far receiver
+        // boundary, so volume-enabled C2/C3 can retain upstream occluders with
+        // the smallest possible normalized-depth precision cost.
+        float farCasterDepthExtension = 0.0f;
+        War3CsmFitMode fitMode = War3CsmFitMode::StableSphere;
     };
 
     struct War3CsmCascade {
         Matrix4 lightViewProj;
         float splitNear = 0.0f; // view-space z
         float splitFar = 0.0f;  // view-space z
+        // Diagnostic contract for non-TAA jitter analysis. This is the exact
+        // light-space center after optional texel snapping and the final texel
+        // size used by the orthographic projection.
+        Vector4 snappedCenterLightSpace =
+            Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+        float texelSize = 0.0f;
     };
 
     struct War3CsmData {
         uint32_t cascadeCount = 0;
         std::array<War3CsmCascade, 4> cascades = { };
+        // Canonical basis actually used by Compute after normalization and the
+        // toward-ground sign fix. Consumers must not independently reconstruct
+        // these from mutable settings or a separate world-up heuristic.
+        Vector4 lightDirection = Vector4(0.0f, 0.0f, -1.0f, 0.0f);
+        Vector4 worldUp = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
     };
+
+    /**
+     * @brief 体积光专用太阳 ortho 投影（非相机视锥 cascade）。
+     * @note 半径/中心不随 pitch 变形；用于体积柱遮挡，不进表面 receiver。
+     */
+    struct War3VolumeSunOrtho {
+        Matrix4 lightViewProj = {};
+        Vector4 lightDirection = Vector4(0.0f, 0.0f, -1.0f, 0.0f);
+        Vector4 worldUp = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
+        Vector4 center = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+        float radius = 0.0f;
+        float texelSize = 0.0f;
+        float minZ = 0.0f;
+        float maxZ = 1.0f;
+        bool valid = false;
+    };
+
+    /**
+     * @brief 计算稳定的体积太阳 ortho 矩阵。
+     * @param lightDirWorld 从太阳指向地面的方向（与 CSM 同源语义）
+     * @param worldUp 稳定世界上方向
+     * @param centerWorld 覆盖中心（通常为相机世界位置）
+     * @param orthoRadius 水平半边长（世界单位）
+     * @param depthMargin 对称深度 margin
+     * @param depthExtension 仅向太阳侧的 caster 余量
+     * @param resolution 阴影图分辨率
+     * @param stableSnap 是否做光空间 texel snap
+     */
+    War3VolumeSunOrtho ComputeVolumeSunOrtho(
+        const Vector4& lightDirWorld,
+        const Vector4& worldUp,
+        const Vector4& centerWorld,
+        float orthoRadius,
+        float depthMargin,
+        float depthExtension,
+        uint32_t resolution,
+        bool stableSnap);
 
     class War3CsmCalculator {
     public:

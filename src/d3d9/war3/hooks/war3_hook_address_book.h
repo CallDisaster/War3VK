@@ -65,6 +65,8 @@ struct War3HookAddressBook {
   uintptr_t engineSleepGate = 0;
   uintptr_t engineSleepGateInner = 0;
   uintptr_t gamePause = 0;
+  // Storm_EventLoop 在 WM_ACTIVATEAPP=后台时读取的空闲 Sleep 毫秒来源。
+  uintptr_t backgroundIdleSleepMs = 0;
   uintptr_t getD3d9Parameters = 0;
   uintptr_t windowMessageTargetLookup = 0;
   uintptr_t windowSizeLParamState = 0;
@@ -76,16 +78,63 @@ struct War3HookAddressBook {
   // Render 域
   // -------------------------------------------------------------------------
   uintptr_t renderDispatcher = 0;
+  uintptr_t worldFrameUpdateAndPreparePasses = 0;
+  uintptr_t worldRenderScene = 0;
   uintptr_t renderQueueAddBatch = 0;
   uintptr_t renderBatchSubmit = 0;
+  uintptr_t aucTransparentAddEntry = 0;
   uintptr_t sceneSubmitBatch = 0;
+  uintptr_t worldObjectListEntryWrite = 0;
   uintptr_t worldObjectEntryRender = 0;
   uintptr_t worldDispatch = 0;
   uintptr_t worldObjectsRenderGroup = 0;
   uintptr_t dispatchCommon = 0;
   uintptr_t dispatchSpecial = 0;
+  uintptr_t applyDrawStateAndSamplerPair = 0;
+  uintptr_t applyDrawStateAndDraw = 0;
+  uintptr_t gxDeviceD3dDynamicVertexUpload = 0;
   uintptr_t flushSortedItems = 0;
   uintptr_t terrainRenderAllTiles = 0;
+
+  // WorldFrameUpdateAndPreparePasses 内部第一层固定 callee。
+  // 仅供 PERF_LEVEL=2 + DXVK_WAR3_PERF_WORLD_PREPARE_DEEP_HOOKS=1
+  // 的显式诊断安装；默认运行时不会安装这些 detour。
+  uintptr_t worldPrepareCameraBuildFrustum = 0;
+  uintptr_t worldPrepareTerrainShadowFlush = 0;
+  uintptr_t worldPrepareTerrainExtraPass = 0;
+  uintptr_t worldPrepareShadowProjectorFlush = 0;
+  uintptr_t worldPrepareTargetIndicatorRingAdvance = 0;
+  uintptr_t worldPrepareCinematicFilterTimeAdvance = 0;
+  uintptr_t worldPrepareRuntimeFlagClockAdvance3B8760 = 0;
+
+  // WorldFrameUpdateAndPreparePasses 的剩余固定 callee。与上组分离是为了
+  // 允许独立打开低污染残余分账；0x368E90 依赖调用方 EDI 隐式实参，
+  // 不满足普通 MinHook C++ detour ABI，故刻意不进入地址簿。
+  uintptr_t worldPrepareFlushDeferredSelectionObjects = 0;
+  uintptr_t worldPrepareGlobalRenderCallbackPass = 0;
+  uintptr_t worldPrepareRenderWaypointIndicators = 0;
+
+  // WorldFrameUpdateAndPreparePasses 内尚未归属的核心阶段。调用约定已由
+  // 1.27a 机器码的 call-site、callee prologue 与 RET N 三方确认；只在
+  // PERF_LEVEL=2 + DXVK_WAR3_PERF_WORLD_PREPARE_CORE_HOOKS=1 时安装。
+  uintptr_t worldPrepareFrameUpdateGate = 0;
+  uintptr_t worldPrepareGameUiFrameSync = 0;
+  uintptr_t worldPrepareUpdateIndicatorAnchor = 0;
+  uintptr_t worldPrepareCameraAdvance = 0;
+  uintptr_t worldPrepareCameraPrepareConstants = 0;
+  uintptr_t worldPrepareViewProjPrepare = 0;
+  uintptr_t worldPrepareSceneQueryFlushSync = 0;
+  uintptr_t worldPrepareFixedPointRemap = 0;
+  uintptr_t worldPreparePostVisibilityGlobalAdvanceA = 0;
+  // 0x378420 数组扫描命中后的唯一重型子阶段。0x6374A0 仅从 entry+0x50
+  // 取出 this 并尾跳到该入口；直接量内层可把外层 self 收敛为扫描/句柄校验。
+  uintptr_t worldPreparePostVisibilityFrameAnchorUpdate = 0;
+  // FrameAnchorUpdate 内唯一的 579-byte 投影/可见性查询；fastcall ABI 为
+  // ECX=world object、EDX=2-float output、栈上第三个 output 指针。
+  uintptr_t worldPreparePostVisibilityFrameAnchorVisibilityQuery = 0;
+  uintptr_t worldPreparePostVisibilityGlobalAdvanceB = 0;
+  uintptr_t worldPrepareVisibilityTailAdvanceA = 0;
+  uintptr_t worldPrepareVisibilityTailAdvanceB = 0;
 
   // -------------------------------------------------------------------------
   // Shadow 域
@@ -100,6 +149,9 @@ struct War3HookAddressBook {
   uintptr_t shadowToggleStaticStampFromObject = 0;
   uintptr_t shadowToggleEmitterStamp = 0;
   uintptr_t shadowPathStaticStampToggle = 0;
+  // UnitUI.slk unitShadow/buildingShadow 字段写入 CUnitUIManager type record。
+  uintptr_t cunitUiRecordSetUnitShadow = 0;       // 0x3358C0 (+0x4C)
+  uintptr_t cunitUiRecordSetStructureShadow = 0;  // 0x335A00
   uintptr_t shadowProjectorSimpleBridge = 0;
   uintptr_t shadowPathObjectProjectorRuntime = 0;
   uintptr_t shadowPathObjectProjectorJassBridge = 0;
@@ -112,6 +164,34 @@ struct War3HookAddressBook {
   uintptr_t shadowRegisterRetMarkOcclusion = 0;   // 0x76D5A4
   uintptr_t shadowRegisterRetFromPoint = 0;       // 0x76D69A
   uintptr_t shadowRegisterRetFromTwoPoints = 0;   // 0x76D719
+
+  // CWidget lifecycle 中央 sync 入口（30+ caller 都会调）。
+  // 用于在 destructible/building/unit 创建/销毁/移动等任意 lifecycle 事件时
+  // 抓取 widget 身份链（rawcode + jHandle），喂给 RenderObjectRegistry 兜底。
+  uintptr_t widgetRegisterFootprintAndShadowMask = 0;  // 0x65A140
+
+  // 2026-05-30：CDoodads 贴花阴影治理（魔兽自带可见静态阴影 + path blocker）。
+  // 这两个 Toggle 函数是树木/装饰物/可破坏物/path blocker 的"地面贴花阴影"
+  // 唯一对象级注册入口，分别写 RegisterImage(type=0) 与 RegisterImage(type=4)。
+  // hook 入口在 mode>=1 时跳过 enable!=0 写入即可干净屏蔽，不影响 fog/LOS/path。
+  uintptr_t terrainShadowToggleStaticStampFromObject = 0;  // 0x74DB30
+  uintptr_t terrainShadowToggleEmitterStamp = 0;           // 0x74DE40
+
+  // Phase 7.143 证伪归档：这两个 ListA 函数不是静态阴影消费点。
+  // 实机验证表明 hook 后会干掉悬崖/地形 tile；IDA 复核显示
+  // RenderAllEntries -> sub_6F725F80 按 148-byte stride 取地形 tile 几何。
+  // 地址仅保留作历史诊断，生产默认禁止安装对应 hook。
+  uintptr_t terrainShadowListARenderPreparedGroups = 0;  // 0x7370A0
+  uintptr_t terrainShadowListARenderAllEntries = 0;      // 0x737110
+
+  // Phase 7.116 旧实验地址：后续实测 dispatchToShapeEnterCount=0，
+  // 默认不再作为静态阴影治理点。仅在显式诊断开关打开时用于灰度验证。
+  uintptr_t terrainShadowDispatchToShape = 0;  // 0x234420
+
+  // Phase 7.100/7.101 诊断地址：idx==3/maskIdx 方案已被实测推翻。
+  // 该路径属于 fog/LOS/path/footprint 共享 mask grid，默认仅安装诊断 hook，
+  // 不做 reject。静态阴影生产治理改走 RegisterImage/StaticStamp producer 端。
+  uintptr_t terrainShadowWriteMaskRegion = 0;  // 0x234710
 
   // -------------------------------------------------------------------------
   // RenderQueue 数据区
@@ -127,6 +207,11 @@ struct War3HookAddressBook {
   uintptr_t rqStateCleanupPending = 0;
   uintptr_t handleManager = 0;
   uintptr_t gameWar3 = 0;
+  uintptr_t gxDevice = 0;
+
+  // CGxDeviceD3d object layout offsets. `gxDevice + 0x584` is the
+  // IDirect3DDevice9* written by IDirect3D9::CreateDevice in 0x6F0EC400.
+  uintptr_t gxDeviceD3dNativeDeviceOffset = 0;
 
   // -------------------------------------------------------------------------
   // RenderQueue/设备辅助函数

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
@@ -305,6 +306,8 @@ namespace dxvk {
 
       m_storage = std::move(slice);
       m_bufferInfo = m_storage->getBufferInfo();
+      m_diagnosticStorageGeneration.fetch_add(
+          1u, std::memory_order_relaxed);
 
       if (unlikely(m_info.debugName))
         updateDebugName();
@@ -321,6 +324,16 @@ namespace dxvk {
       // Implicitly invalidate views
       m_version += 1u;
       return result;
+    }
+
+    /**
+     * \brief 诊断用后备存储代数
+     *
+     * 在唯一的 assignStorage 汇合点递增，既覆盖破坏性失效，也覆盖内容保持型迁移。
+     * 它只用于观察，不能被当作内容有效性证明。
+     */
+    uint64_t diagnosticStorageGeneration() const {
+      return m_diagnosticStorageGeneration.load(std::memory_order_relaxed);
     }
 
     /**
@@ -408,6 +421,7 @@ namespace dxvk {
 
     uint32_t                    m_xfbStride     = 0u;
     uint32_t                    m_version       = 0u;
+    std::atomic<uint64_t>       m_diagnosticStorageGeneration{0u};
 
     bool                        m_stableAddress = false;
 

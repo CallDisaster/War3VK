@@ -306,7 +306,7 @@
             <section class="panel active" data-section="overview">
                 <h2>项目概览</h2>
                 <p>War3MapReforge 基于 DXVK 的 D3D9→Vulkan 转译层，在不改动游戏资源的前提下，通过分域 Hook + 桥接链路插入阴影、描边、材质覆盖与后处理能力。</p>
-                <p><strong>当前架构（2026-02-22）</strong> 已从“单入口大文件”升级为“薄中枢 + 分域模块”：<code>d3d9_war3_hook.cpp</code> 仅负责生命周期编排，渲染/JASS/生命周期/UI/Shadow 逻辑分别驻留在 <code>src/d3d9/war3/hooks/</code>。</p>
+                <p><strong>当前架构（2026-04-16）</strong> 已从“单入口大文件”升级为“薄中枢 + 分域模块 + 语义注册表”：<code>d3d9_war3_hook.cpp</code> 负责生命周期编排，Render 域主链则已显式接入 <code>CWorld_RenderScene</code> 与 <code>RenderBatch_Submit</code>，开始从上层语义直接记录最终可见 renderable。</p>
 
                 <div class="grid">
                     <div class="card">
@@ -323,7 +323,7 @@
                     </div>
                     <div class="card">
                         <strong>Bridge + Shader</strong>
-                        <div><code>render/* + shader/*</code> 完成对象桥接、材质覆盖、统计与诊断。</div>
+                        <div><code>render/* + shader/*</code> 完成对象桥接、最终可见 renderable 注册、材质覆盖、统计与诊断。</div>
                     </div>
                 </div>
 
@@ -349,12 +349,16 @@
 
                     subgraph Runtime["运行时系统"]
                     H --> K[RenderQueueTracker / ExecBatch]
+                    H --> K2[VisibleRenderableRegistry]
+                    H --> K3[War3RenderState(RenderScene 边界)]
                     J --> L[ShadowCapture / Receiver]
                     H --> M[ShaderManager / Material]
                     end
 
                     subgraph Backend["DXVK / Vulkan"]
                     K --> N[D3D9Device -> Vulkan]
+                    K2 --> N
+                    K3 --> N
                     L --> N
                     M --> N
                     end
@@ -387,10 +391,11 @@
 
                     subgraph L2["L2 运行时桥接"]
                     C1["render/war3_render_queue_tracker.*"]
+                    C1A["render/war3_visible_renderables.*"]
                     C2["render/war3_render_exec_batch.*"]
                     C3["render/war3_scene_collector.*"]
                     C4["handle/war3_handle_resolver.*"]
-                    C5["state/war3_render_state.*"]
+                    C5["state/war3_render_state.* + render/war3_render_state.*"]
                     C6["render/war3_frame_graph.*"]
                     C7["tools/war3_diagnostics_hub.*"]
                     end
@@ -411,10 +416,12 @@
                     A1 --> A3
                     B5 --> B6
                     B3 --> C1
+                    B3 --> C1A
                     B3 --> C2
                     B5 --> C3
                     C6 --> C7
                     C1 --> D1
+                    C1A --> D1
                     C2 --> D1
                     D1 --> D1A
                     D1 --> D1B
@@ -434,7 +441,7 @@
                     </div>
                     <div class="card">
                         <strong>src/d3d9/war3/render/ + handle/</strong>
-                        <div>桥接链路与对象追踪核心，负责从渲染数据回查逻辑对象身份。</div>
+                        <div>桥接链路与对象追踪核心，负责从渲染数据回查逻辑对象身份，并登记最终可见 renderable。</div>
                     </div>
                     <div class="card">
                         <strong>src/d3d9/war3/shader/</strong>
@@ -458,7 +465,7 @@
             <!-- 渲染管线流程 -->
             <section class="panel" data-section="pipeline">
                 <h2>渲染管线流程</h2>
-                <p>当前每帧路径由 Render 域 Hook 驱动，生命周期/Shadow/UI 域分别在关键边界插入状态同步与策略拦截。</p>
+                <p>当前每帧路径由 Render 域 Hook 驱动，生命周期/Shadow/UI 域分别在关键边界插入状态同步与策略拦截。自 2026-04-16 起，世界边界已不再只依赖 BeforeUi 猜测，而是显式接入 <code>CWorld_RenderScene</code> 与 <code>RenderBatch_Submit</code>。</p>
 
                 <div class="mermaid">
                     sequenceDiagram
@@ -466,6 +473,7 @@
                     participant D3D9 as D3D9 Device
                     participant Hook as Hook Domains
                     participant Bridge as Render Bridge
+                    participant Reg as Semantic Registries
                     participant SM as ShaderManager
                     participant VK as Vulkan
 
@@ -485,9 +493,16 @@
                     end
 
                     rect rgb(220, 255, 240)
-                    Note over Game,VK: 世界阶段
-                    D3D9->>Hook: Dispatch_Common / Dispatch_Special
-                    Hook->>Bridge: ExecBatch Begin/End
+                    Note over Game,VK: 世界阶段（当前主链）
+                    Game->>Hook: Hook_WorldFrameUpdateAndPreparePasses
+                    Game->>Hook: Hook_WorldRenderScene
+                    Hook->>Bridge: WorldObjects_RenderGroup / WorldObjectEntry_Render
+                    Bridge->>Reg: RenderObjectRegistry(sceneNode -> identity)
+                    Bridge->>Hook: RenderQueue_AddBatch
+                    Hook->>Reg: RenderQueueTracker(renderablePart -> tag/stage)
+                    Hook->>Reg: VisibleRenderableRegistry(RenderBatch_Submit 主队列 diff)
+                    Reg->>SM: 提供 identity / visible renderable
+                    Hook->>Bridge: Dispatch_Common / Dispatch_Special
                     Bridge->>SM: 绑定材质与 Uniform
                     SM->>VK: Vulkan Draw
                     end
@@ -551,6 +566,7 @@
                     subgraph Shared["共享状态"]
                     J[g_numOfElementsPtr等全局]
                     K[RenderQueueTracker / ExecBatch]
+                    K2[VisibleRenderableRegistry]
                     L[War3RenderState]
                     end
 
@@ -571,6 +587,7 @@
                     G --> J
                     E --> J
                     G --> K
+                    G --> K2
                     I --> K
                     H --> L
                     G --> L
@@ -753,6 +770,24 @@
                     D1 --> E1 --> E2 --> E3
                     D2 --> E1
                     D3 --> E2
+                </div>
+
+                <div class="note">
+                    2026-04-21 当前事实：
+                    semantic shadow 已不再只有单一 DXVK 宿主消费链。
+                    当前链路已经拆成
+                    <code>ShadowRendererCore -&gt; DxvkValidationBackend</code>
+                    与
+                    <code>ShadowRendererCore -&gt; NativeD3D9BackendRuntime -&gt; NativeD3D9Backend</code>
+                      两条并行宿主路径；其中 native 路径当前已经拆成
+                      <code>DriveNativeShadowBackend()</code> 的 build/prepare
+                      与 <code>ExecuteNativeShadowBackendPreparedFrame()</code>
+                      的 execute 两步。当前宿主已经能拿到
+                      <code>IDirect3DDevice9*</code> 并消费 semantic submission frame，
+                      但真正的 native draw 仍等待晚注入宿主点亮 native renderer hook
+                      takeover；对应 timing 已经接到
+                      <code>CWorld_ToggleGroup1ShadowPass -&gt; Stage12/Stage11 -&gt; FlushAndReset</code>
+                      这段 shadow-pass window 上。
                 </div>
 
                 <h3>Uniform 寄存器分配</h3>

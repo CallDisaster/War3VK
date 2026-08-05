@@ -23,6 +23,22 @@ EXPORTS
 
   DXVK_RegisterAnnotation @28257 NONAME
   DXVK_UnRegisterAnnotation @28258 NONAME
+  Initialize @28259
+  WarVK_Initialize @28260
+  WarVKVisualV1_GetAbiVersion @28261
+  WarVKVisualV1_GetManifestSha256 @28262
+  WarVKVisualV1_GetFeatureFlags @28263
+  WarVKVisualV1_IsRuntimeReady @28264
+  WarVKVisualV1_PointLightCreate @28265
+  WarVKVisualV1_PointLightDestroy @28266
+  WarVKVisualV1_PointLightSetEnabled @28267
+  WarVKVisualV1_PointLightSetPosition @28268
+  WarVKVisualV1_PointLightSetColorIntensity @28269
+  WarVKVisualV1_PointLightSetRadius @28270
+  WarVKVisualV1_PointLightSetShadowEnabled @28271
+  WarVKVisualV1_PointLightSetShadowConfig @28272
+  WarVKVisualV1_PointLightIsAlive @28273
+  WarVKVisualV1_PointLightCount @28274
 
   Direct3D9ForceHybridEnumeration @16 NONAME PRIVATE
   

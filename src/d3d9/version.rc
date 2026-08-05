@@ -2,8 +2,8 @@
 
 // DLL version information.
 VS_VERSION_INFO    VERSIONINFO
-FILEVERSION        1,1,0,0
-PRODUCTVERSION     1,1,0,0
+FILEVERSION        1,2,0,0
+PRODUCTVERSION     1,2,0,0
 FILEFLAGSMASK      VS_FFI_FILEFLAGSMASK
 FILEFLAGS          0
 FILEOS VOS_NT_WINDOWS32
@@ -15,13 +15,13 @@ BEGIN
     BLOCK "080904b0"
     BEGIN
       VALUE "CompanyName",      "WarVK"
-      VALUE "FileDescription",  "WarVK Direct3D 9 Runtime"
-      VALUE "FileVersion",      "1.1.0"
+      VALUE "FileDescription",  "WarVK 1.2.0 Release Direct3D 9 Runtime"
+      VALUE "FileVersion",      "1.2.0"
       VALUE "InternalName",     "D3D9.dll"
       VALUE "LegalCopyright",   "zlib/libpng license"
       VALUE "OriginalFilename", "D3D9.dll"
       VALUE "ProductName",      "WarVK"
-      VALUE "ProductVersion",   "1.1.0"
+      VALUE "ProductVersion",   "1.2.0 Release"
     END
   END
   BLOCK "VarFileInfo"

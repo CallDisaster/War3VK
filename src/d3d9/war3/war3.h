@@ -48,4 +48,10 @@ War3RenderPipeline* GetActivePipeline();
 // 获取可写的渲染设置（可能为空）
 War3RenderSettings* GetMutableSettings();
 
+// DXVK validation host helper: consume the latest semantic shadow scene on the
+// active device without exposing D3D9DeviceEx to render-layer code.
+bool ExecuteSemanticShadowSceneForValidation(
+    bool unitsOnly,
+    bool executeNativeBackendValidation = true);
+
 } // namespace dxvk::war3

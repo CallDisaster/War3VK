@@ -142,7 +142,8 @@ namespace dxvk {
 
     D3D9FFShader(
             D3D9DeviceEx*         pDevice,
-            DxsoProgramType       ProgramType);
+            DxsoProgramType       ProgramType,
+            bool                  War3GpuSkinVariant = false);
 
     template <typename T>
     void Dump(D3D9DeviceEx* pDevice, const T& Key, const std::string& Name);
@@ -182,6 +183,10 @@ namespace dxvk {
       return m_fsUbershader;
     }
 
+    const D3D9FFShader& GetWar3GpuSkinVSUbershaderModule() const {
+      return m_war3GpuSkinVsUbershader;
+    }
+
     UINT GetVSCount() const {
       return m_vsModules.size();
     }
@@ -204,6 +209,7 @@ namespace dxvk {
 
     D3D9FFShader m_vsUbershader;
     D3D9FFShader m_fsUbershader;
+    D3D9FFShader m_war3GpuSkinVsUbershader;
 
   };
 

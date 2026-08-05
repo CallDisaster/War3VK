@@ -25,7 +25,8 @@ struct ShadowCasterPushConstants {
   uint32_t flags;
   float alphaRef;
   uint32_t samplerIndex;
-  uint32_t padding[3];
+  float terrainDepthBias;
+  uint32_t padding[2];
   float outlineColor[4];
 };
 
@@ -175,10 +176,14 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
       key.positionStride = draw.positionStride;
       key.positionOffset = draw.positionOffset;
       key.topology = draw.topology;
-      key.alphaTestEnabled = draw.alphaTestEnabled;
-      key.uvFormat = draw.uvFormat;
-      key.uvOffset = draw.uvOffset;
-      key.uvStride = draw.uvStride;
+      key.alphaTestEnabled = draw.alphaTestEnabled && draw.diffuseTexture &&
+                             draw.HasUsableUvBinding();
+      if (key.alphaTestEnabled) {
+        key.uvFormat = draw.uvFormat;
+        key.uvOffset = draw.uvOffset;
+        key.uvStride = draw.uvStride;
+        key.uvBinding = draw.uvBinding;
+      }
       key.outlineMode = 0;
 
       if (draw.vertexBlendEnabled && draw.vertexBlendCount > 0) {
@@ -231,7 +236,7 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
         pc.paletteOffset = objectBase + drawIdx;
       }
 
-      if (draw.alphaTestEnabled && draw.diffuseTexture) {
+      if (key.alphaTestEnabled) {
         pc.flags |= 0x4u;
         pc.alphaRef = draw.alphaRef;
         pc.samplerIndex = draw.diffuseSamplerIndex;
@@ -240,12 +245,13 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
       ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
                            VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-      // Resource Binding: [0]=SSBO, [1]=AlphaTex, [2]=SceneDepth
-      std::array<DxvkDescriptorWrite, 3> descriptors = {};
+      // 资源布局固定为 0..4；binding2 继续保持场景深度，3/4 在描边
+      // 尚未启用 direct 时绑定有效矩阵 storage 作为失效关闭兜底。
+      std::array<DxvkDescriptorWrite, 5> descriptors = {};
       descriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       descriptors[0].buffer = paletteBufferInfo;
 
-      if (draw.alphaTestEnabled && draw.diffuseTexture) {
+      if (key.alphaTestEnabled) {
         descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         descriptors[1].descriptor = &draw.textureDescriptor;
         ctx->track(draw.diffuseTexture->image(), DxvkAccess::Read);
@@ -257,6 +263,10 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
       // [NEW] Bind Scene Depth (m_depthCopyView)
       descriptors[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
       descriptors[2].descriptor = m_depthCopyView->getDescriptor();
+      descriptors[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      descriptors[3].buffer = paletteBufferInfo;
+      descriptors[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      descriptors[4].buffer = paletteBufferInfo;
 
       ctx->bindResources(DxvkCmdBuffer::ExecBuffer, m_outlineMaskLayout,
                          descriptors.size(), descriptors.data(), sizeof(pc),
@@ -269,6 +279,11 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
         ctx->track(draw.indexStorage);
       if (draw.blendStorage.ptr() != nullptr)
         ctx->track(draw.blendStorage);
+      if (key.alphaTestEnabled && draw.uvBinding != 0u &&
+          draw.uvStorage.ptr() != nullptr &&
+          draw.uvStorage.ptr() != draw.positionStorage.ptr() &&
+          draw.uvStorage.ptr() != draw.blendStorage.ptr())
+        ctx->track(draw.uvStorage);
 
       VkBuffer vbs[2];
       VkDeviceSize offsets[2];
@@ -287,9 +302,23 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
         offsets[1] = draw.blendInfo.offset;
         sizes[1] = draw.blendInfo.size;
         strides[1] = draw.blendStride;
+      } else if (key.alphaTestEnabled && draw.uvBinding == 1u) {
+        vbCount = 2;
+        vbs[1] = draw.uvInfo.buffer;
+        offsets[1] = draw.uvInfo.offset;
+        sizes[1] = draw.uvInfo.size;
+        strides[1] = draw.uvStride;
       }
 
       ctx->cmdBindVertexBuffers(0, vbCount, vbs, offsets, sizes, strides);
+      if (key.alphaTestEnabled && draw.uvBinding == 2u) {
+        const VkBuffer uvBuffer = draw.uvInfo.buffer;
+        const VkDeviceSize uvOffset = draw.uvInfo.offset;
+        const VkDeviceSize uvSize = draw.uvInfo.size;
+        const VkDeviceSize uvStride = draw.uvStride;
+        ctx->cmdBindVertexBuffers(2u, 1u, &uvBuffer, &uvOffset, &uvSize,
+                                  &uvStride);
+      }
 
       // [FIX] Restore batchHandle to TLS so D3D9Device::OnDraw can identify the
       // object for filtering
@@ -623,10 +652,14 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
     key.positionStride = draw.positionStride;
     key.positionOffset = draw.positionOffset;
     key.topology = draw.topology;
-    key.alphaTestEnabled = draw.alphaTestEnabled;
-    key.uvFormat = draw.uvFormat;
-    key.uvOffset = draw.uvOffset;
-    key.uvStride = draw.uvStride;
+    key.alphaTestEnabled = draw.alphaTestEnabled && draw.diffuseTexture &&
+                           draw.HasUsableUvBinding();
+    if (key.alphaTestEnabled) {
+      key.uvFormat = draw.uvFormat;
+      key.uvOffset = draw.uvOffset;
+      key.uvStride = draw.uvStride;
+      key.uvBinding = draw.uvBinding;
+    }
     key.outlineMode = static_cast<uint8_t>(outlineMode);
 
     if (draw.vertexBlendEnabled && draw.vertexBlendCount > 0) {
@@ -656,7 +689,7 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
       outlinePipeline = it->second;
     } else {
       // 创建描边管线（与 shadow caster 类似，但深度测试 = GREATER，有颜色输出）
-      VkVertexInputBindingDescription bindings[2] = {};
+      VkVertexInputBindingDescription bindings[3] = {};
       uint32_t bindingCount = 1;
 
       bindings[0].binding = 0;
@@ -664,13 +697,24 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
       bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
       if (key.blendBinding == 1) {
-        bindingCount = 2;
-        bindings[1].binding = 1;
-        bindings[1].stride = key.blendStride;
-        bindings[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        bindings[bindingCount].binding = 1;
+        bindings[bindingCount].stride = key.blendStride;
+        bindings[bindingCount].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        ++bindingCount;
       }
 
-      std::array<VkVertexInputAttributeDescription, 3> attributes = {};
+      if (key.alphaTestEnabled && key.uvBinding != 0u &&
+          key.uvBinding != key.blendBinding) {
+        bindings[bindingCount].binding = key.uvBinding;
+        bindings[bindingCount].stride = key.uvStride;
+        bindings[bindingCount].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        ++bindingCount;
+      }
+
+      // Alpha-tested skinned outline draws may need position + blend weight +
+      // blend index + UV. Keep the outline VI layout capacity in sync with the
+      // caster path to avoid corrupting the stack when all four are present.
+      std::array<VkVertexInputAttributeDescription, 4> attributes = {};
       uint32_t attributeCount = 0;
 
       // 位置 (location = 0)
@@ -701,7 +745,7 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
       // UV (location = 3)
       if (key.alphaTestEnabled && key.uvFormat != VK_FORMAT_UNDEFINED) {
         attributes[attributeCount].location = 3;
-        attributes[attributeCount].binding = 0;
+        attributes[attributeCount].binding = key.uvBinding;
         attributes[attributeCount].format = key.uvFormat;
         attributes[attributeCount].offset = key.uvOffset;
         attributeCount++;
@@ -813,7 +857,7 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
       pc.mvp = viewProj * draw.worldMatrix;
     }
 
-    if (draw.alphaTestEnabled && draw.diffuseTexture) {
+    if (key.alphaTestEnabled) {
       pc.flags |= 0x4u;
       pc.alphaRef = draw.alphaRef;
       pc.samplerIndex = draw.diffuseSamplerIndex;
@@ -824,11 +868,11 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
                          VK_PIPELINE_BIND_POINT_GRAPHICS, outlinePipeline);
 
     // 绑定资源
-    std::array<DxvkDescriptorWrite, 2> descriptors = {};
+    std::array<DxvkDescriptorWrite, 5> descriptors = {};
     descriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     descriptors[0].buffer = paletteBufferInfo;
     // Binding 1: Alpha Texture
-    if (draw.alphaTestEnabled && draw.diffuseTexture) {
+    if (key.alphaTestEnabled) {
       descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
       descriptors[1].descriptor =
           &draw.textureDescriptor; // Need to ensure this is set?
@@ -837,6 +881,12 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
       descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
       descriptors[1].descriptor = nullptr;
     }
+    descriptors[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    descriptors[2].descriptor = nullptr;
+    descriptors[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    descriptors[3].buffer = paletteBufferInfo;
+    descriptors[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    descriptors[4].buffer = paletteBufferInfo;
 
     ctx->bindResources(DxvkCmdBuffer::ExecBuffer, m_outlineLayout,
                        descriptors.size(), descriptors.data(), sizeof(pc), &pc);
@@ -849,6 +899,11 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
       ctx->track(draw.indexStorage);
     if (draw.blendStorage.ptr() != nullptr)
       ctx->track(draw.blendStorage);
+    if (key.alphaTestEnabled && draw.uvBinding != 0u &&
+        draw.uvStorage.ptr() != nullptr &&
+        draw.uvStorage.ptr() != draw.positionStorage.ptr() &&
+        draw.uvStorage.ptr() != draw.blendStorage.ptr())
+      ctx->track(draw.uvStorage);
 
     // 绑定顶点缓冲区
     VkBuffer vbs[2];
@@ -868,9 +923,23 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
       offsets[1] = draw.blendInfo.offset;
       sizes[1] = draw.blendInfo.size;
       strides[1] = draw.blendStride;
+    } else if (key.alphaTestEnabled && draw.uvBinding == 1u) {
+      vbCount = 2;
+      vbs[1] = draw.uvInfo.buffer;
+      offsets[1] = draw.uvInfo.offset;
+      sizes[1] = draw.uvInfo.size;
+      strides[1] = draw.uvStride;
     }
 
     ctx->cmdBindVertexBuffers(0, vbCount, vbs, offsets, sizes, strides);
+    if (key.alphaTestEnabled && draw.uvBinding == 2u) {
+      const VkBuffer uvBuffer = draw.uvInfo.buffer;
+      const VkDeviceSize uvOffset = draw.uvInfo.offset;
+      const VkDeviceSize uvSize = draw.uvInfo.size;
+      const VkDeviceSize uvStride = draw.uvStride;
+      ctx->cmdBindVertexBuffers(2u, 1u, &uvBuffer, &uvOffset, &uvSize,
+                                &uvStride);
+    }
 
     // 绘制
     // [FIX] Restore batchHandle to TLS

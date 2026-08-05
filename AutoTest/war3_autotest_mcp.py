@@ -14,7 +14,10 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wintypes
 import copy
+import functools
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -30,18 +33,44 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from mcp.server.fastmcp import FastMCP
 
+from autotest_sessions import (
+    AutoTestSession,
+    DEFAULT_SANDBOX_ROOT,
+    SessionRegistry,
+    build_instance_layout,
+    deploy_content_addressed_map,
+    materialize_instance_root,
+    normalize_identifier,
+    preflight_instance_pool as _preflight_session_pool,
+    require_path_within,
+    sha256_file,
+)
+from ydhost_adapter import (
+    generate_ydhost_map_metadata as _generate_ydhost_map_metadata,
+    preflight_ydhost_lan as _preflight_ydhost_lan,
+    provision_ydhost_assets as _provision_ydhost_assets,
+)
+from ydhost_lan_adapter import real_launch_capability as _ydhost_real_launch_capability
 
-DEFAULT_WAR3_DIR = Path(r"E:\Work\War3")
-DEFAULT_TEST_MAP = Path(r"E:\Work\War3\Maps\光影测试.w3x")
-DEFAULT_LOW_PRESSURE_TEST_MAP = Path(r"E:\Work\War3\Maps\ShadowTest\光影测试低压.w3x")
-DEFAULT_CITY_MAP = Path(r"E:\Work\War3\Maps\dz\rpg\City.w3x")
+
+DEFAULT_WAR3_DIR = DEFAULT_SANDBOX_ROOT
+DEFAULT_TEST_MAP = DEFAULT_SANDBOX_ROOT / "Maps" / "光影测试.w3x"
+DEFAULT_LOW_PRESSURE_TEST_MAP = DEFAULT_SANDBOX_ROOT / "Maps" / "ShadowTest" / "光影测试.w3x"
+DEFAULT_CITY_MAP = DEFAULT_SANDBOX_ROOT / "Maps" / "dz" / "rpg" / "City.w3x"
 DEFAULT_CITY_FALLBACK_MAP = DEFAULT_TEST_MAP
 DEFAULT_TEST_MAP_REL = Path(r"Maps\Test\WorldEditTestMap.w3x")
 DEFAULT_BENCHMARK_WIDTH = 2560
 DEFAULT_BENCHMARK_HEIGHT = 1440
 DEFAULT_BENCHMARK_REFRESH = 59
+AUTOTEST_BACKGROUND_THROTTLE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE"
+AUTOTEST_GAME_PAUSE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE"
 WAR3_VIDEO_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III\Video"
+WAR3_INSTALL_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III"
+YDWE_LAUNCHER_MODE_DIRECT = "direct"
+YDWE_LAUNCHER_MODE_YDWE = "ydwe"
 ARTIFACT_ROOT = Path(__file__).resolve().parent / "artifacts"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_BUILD_D3D9 = REPO_ROOT / "build32" / "src" / "d3d9" / "d3d9.dll"
 MAX_EVENT_BUFFER = 4000
 DESKTOP_READOBJECTS = 0x0001
 DESKTOP_CREATEWINDOW = 0x0002
@@ -50,6 +79,119 @@ DESKTOP_WRITEOBJECTS = 0x0080
 DESKTOP_SWITCHDESKTOP = 0x0100
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 CREATE_NEW_CONSOLE = 0x00000010
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+OPEN_EXISTING = 3
+PIPE_READMODE_MESSAGE = 0x00000002
+ERROR_MORE_DATA = 234
+ERROR_BROKEN_PIPE = 109
+ERROR_ALREADY_EXISTS = 183
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+PROCESS_TERMINATE = 0x0001
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+SYNCHRONIZE = 0x00100000
+DUPLICATE_SAME_ACCESS = 0x00000002
+WAIT_OBJECT_0 = 0x00000000
+WAIT_TIMEOUT = 0x00000102
+WAIT_FAILED = 0xFFFFFFFF
+STILL_ACTIVE = 259
+
+_KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_KERNEL32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+_KERNEL32.WaitNamedPipeW.restype = wintypes.BOOL
+_KERNEL32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
+]
+_KERNEL32.CreateFileW.restype = wintypes.HANDLE
+_KERNEL32.SetNamedPipeHandleState.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+    wintypes.LPVOID,
+]
+_KERNEL32.SetNamedPipeHandleState.restype = wintypes.BOOL
+_KERNEL32.ReadFile.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+]
+_KERNEL32.ReadFile.restype = wintypes.BOOL
+_KERNEL32.PeekNamedPipe.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+]
+_KERNEL32.PeekNamedPipe.restype = wintypes.BOOL
+_KERNEL32.WriteFile.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPCVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+]
+_KERNEL32.WriteFile.restype = wintypes.BOOL
+_KERNEL32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+_KERNEL32.FlushFileBuffers.restype = wintypes.BOOL
+_KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
+_KERNEL32.CloseHandle.restype = wintypes.BOOL
+_KERNEL32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+_KERNEL32.CreateMutexW.restype = wintypes.HANDLE
+_KERNEL32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+_KERNEL32.ReleaseMutex.restype = wintypes.BOOL
+_KERNEL32.OpenProcess.argtypes = [
+    wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+]
+_KERNEL32.OpenProcess.restype = wintypes.HANDLE
+_KERNEL32.DuplicateHandle.argtypes = [
+    wintypes.HANDLE,
+    wintypes.HANDLE,
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.HANDLE),
+    wintypes.DWORD,
+    wintypes.BOOL,
+    wintypes.DWORD,
+]
+_KERNEL32.DuplicateHandle.restype = wintypes.BOOL
+_KERNEL32.GetCurrentProcess.argtypes = []
+_KERNEL32.GetCurrentProcess.restype = wintypes.HANDLE
+_KERNEL32.GetProcessId.argtypes = [wintypes.HANDLE]
+_KERNEL32.GetProcessId.restype = wintypes.DWORD
+_KERNEL32.GetProcessTimes.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.FILETIME),
+    ctypes.POINTER(wintypes.FILETIME),
+    ctypes.POINTER(wintypes.FILETIME),
+    ctypes.POINTER(wintypes.FILETIME),
+]
+_KERNEL32.GetProcessTimes.restype = wintypes.BOOL
+_KERNEL32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD),
+]
+_KERNEL32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+_KERNEL32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_KERNEL32.WaitForSingleObject.restype = wintypes.DWORD
+_KERNEL32.GetExitCodeProcess.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+]
+_KERNEL32.GetExitCodeProcess.restype = wintypes.BOOL
+_KERNEL32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+_KERNEL32.TerminateProcess.restype = wintypes.BOOL
 
 
 class _StartupInfoW(ctypes.Structure):
@@ -82,6 +224,617 @@ class _ProcessInformation(ctypes.Structure):
         ("dwProcessId", wintypes.DWORD),
         ("dwThreadId", wintypes.DWORD),
     ]
+
+
+def _native_handle_value(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return int(value)
+    return int(getattr(value, "value", 0) or 0)
+
+
+def _canonical_process_path(value: Any) -> str:
+    text = str(value or "").strip().strip('"')
+    if not text:
+        return ""
+    return os.path.normcase(os.path.normpath(os.path.abspath(text)))
+
+
+def _native_process_binding_from_handle(handle: int) -> Dict[str, Any]:
+    handle_value = int(handle or 0)
+    result: Dict[str, Any] = {
+        "ok": False,
+        "pid": 0,
+        "creationEpochMs": 0,
+        "canonicalExePath": "",
+        "error": "",
+    }
+    if handle_value <= 0:
+        result["error"] = "invalid native process handle"
+        return result
+    native_handle = wintypes.HANDLE(handle_value)
+    pid = int(_KERNEL32.GetProcessId(native_handle) or 0)
+    if pid <= 0:
+        result["error"] = f"GetProcessId failed: {ctypes.get_last_error()}"
+        return result
+    creation = wintypes.FILETIME()
+    exit_time = wintypes.FILETIME()
+    kernel_time = wintypes.FILETIME()
+    user_time = wintypes.FILETIME()
+    if not _KERNEL32.GetProcessTimes(
+        native_handle,
+        ctypes.byref(creation),
+        ctypes.byref(exit_time),
+        ctypes.byref(kernel_time),
+        ctypes.byref(user_time),
+    ):
+        result["error"] = f"GetProcessTimes failed: {ctypes.get_last_error()}"
+        return result
+    path_buffer = ctypes.create_unicode_buffer(32768)
+    path_length = wintypes.DWORD(len(path_buffer))
+    if not _KERNEL32.QueryFullProcessImageNameW(
+        native_handle, 0, path_buffer, ctypes.byref(path_length),
+    ):
+        result["error"] = (
+            "QueryFullProcessImageNameW failed: "
+            f"{ctypes.get_last_error()}"
+        )
+        return result
+    creation_ticks = (
+        (int(creation.dwHighDateTime) << 32)
+        | int(creation.dwLowDateTime)
+    )
+    windows_to_unix_100ns = 116_444_736_000_000_000
+    creation_epoch_ms = max(
+        0, (creation_ticks - windows_to_unix_100ns) // 10_000,
+    )
+    canonical_path = _canonical_process_path(path_buffer.value)
+    result.update({
+        "ok": bool(pid > 0 and creation_epoch_ms > 0 and canonical_path),
+        "pid": pid,
+        "creationEpochMs": int(creation_epoch_ms),
+        "canonicalExePath": canonical_path,
+    })
+    if not result["ok"]:
+        result["error"] = "incomplete native process binding"
+    return result
+
+
+class RetainedNativeProcessWitness:
+    """Owns one process HANDLE and its immutable launch-time identity."""
+
+    def __init__(
+        self,
+        handle: int,
+        pid: int,
+        creation_epoch_ms: int,
+        canonical_exe_path: str,
+        source: str,
+    ) -> None:
+        self._handle = int(handle)
+        self.pid = int(pid)
+        self.creation_epoch_ms = int(creation_epoch_ms)
+        self.canonical_exe_path = _canonical_process_path(
+            canonical_exe_path
+        )
+        self.source = str(source or "native-process")
+        self._closed = False
+        self._lock = threading.Lock()
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            available = bool(not self._closed and self._handle > 0)
+            return {
+                "available": available,
+                "ownsNativeHandle": available,
+                "closed": self._closed,
+                "pid": self.pid,
+                "creationEpochMs": self.creation_epoch_ms,
+                "canonicalExePath": self.canonical_exe_path,
+                "source": self.source,
+            }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.snapshot()
+
+    def _binding_exact(
+        self, pid: int, creation_epoch_ms: int, canonical_exe_path: str,
+    ) -> bool:
+        return bool(
+            self.pid == int(pid)
+            and self.creation_epoch_ms == int(creation_epoch_ms)
+            and self.creation_epoch_ms > 0
+            and self.canonical_exe_path
+            == _canonical_process_path(canonical_exe_path)
+        )
+
+    def duplicate(self) -> "RetainedNativeProcessWitness":
+        with self._lock:
+            if self._closed or self._handle <= 0:
+                raise RuntimeError("native process witness is closed")
+            duplicate = wintypes.HANDLE()
+            current = _KERNEL32.GetCurrentProcess()
+            ok = bool(_KERNEL32.DuplicateHandle(
+                current,
+                wintypes.HANDLE(self._handle),
+                current,
+                ctypes.byref(duplicate),
+                0,
+                False,
+                DUPLICATE_SAME_ACCESS,
+            ))
+            if not ok:
+                raise OSError(
+                    ctypes.get_last_error(), "DuplicateHandle failed",
+                )
+            duplicate_value = _native_handle_value(duplicate)
+            if duplicate_value <= 0:
+                raise RuntimeError("DuplicateHandle returned an invalid handle")
+            return RetainedNativeProcessWitness(
+                duplicate_value,
+                self.pid,
+                self.creation_epoch_ms,
+                self.canonical_exe_path,
+                f"duplicate:{self.source}",
+            )
+
+    def poll(self) -> Optional[int]:
+        with self._lock:
+            if self._closed or self._handle <= 0:
+                raise RuntimeError("native process witness is closed")
+            wait_result = int(_KERNEL32.WaitForSingleObject(
+                wintypes.HANDLE(self._handle), 0,
+            ))
+            if wait_result == WAIT_TIMEOUT:
+                return None
+            if wait_result != WAIT_OBJECT_0:
+                raise OSError(
+                    ctypes.get_last_error(),
+                    f"WaitForSingleObject failed: {wait_result}",
+                )
+            exit_code = wintypes.DWORD(0)
+            if not _KERNEL32.GetExitCodeProcess(
+                wintypes.HANDLE(self._handle), ctypes.byref(exit_code),
+            ):
+                raise OSError(
+                    ctypes.get_last_error(), "GetExitCodeProcess failed",
+                )
+            return int(exit_code.value)
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        timeout_ms = (
+            0xFFFFFFFF
+            if timeout is None
+            else max(0, min(0xFFFFFFFE, int(timeout * 1000.0)))
+        )
+        with self._lock:
+            if self._closed or self._handle <= 0:
+                raise RuntimeError("native process witness is closed")
+            wait_result = int(_KERNEL32.WaitForSingleObject(
+                wintypes.HANDLE(self._handle), timeout_ms,
+            ))
+            if wait_result == WAIT_TIMEOUT:
+                raise subprocess.TimeoutExpired(
+                    "retained-native-process", timeout,
+                )
+            if wait_result != WAIT_OBJECT_0:
+                raise OSError(
+                    ctypes.get_last_error(),
+                    f"WaitForSingleObject failed: {wait_result}",
+                )
+            exit_code = wintypes.DWORD(0)
+            if not _KERNEL32.GetExitCodeProcess(
+                wintypes.HANDLE(self._handle), ctypes.byref(exit_code),
+            ):
+                raise OSError(
+                    ctypes.get_last_error(), "GetExitCodeProcess failed",
+                )
+            return int(exit_code.value)
+
+    def termination_exact(
+        self, pid: int, creation_epoch_ms: int, canonical_exe_path: str,
+    ) -> Dict[str, Any]:
+        snapshot = self.snapshot()
+        binding_exact = bool(
+            snapshot.get("available") is True
+            and self._binding_exact(
+                pid, creation_epoch_ms, canonical_exe_path,
+            )
+        )
+        exit_code: Optional[int] = None
+        poll_error = ""
+        if binding_exact:
+            try:
+                exit_code = self.poll()
+            except Exception as exc:
+                poll_error = f"{type(exc).__name__}: {exc}"
+        signaled = bool(
+            binding_exact and not poll_error and exit_code is not None
+        )
+        return {
+            "exact": signaled,
+            "bindingExact": binding_exact,
+            "handleSignaled": signaled,
+            "exitCode": exit_code,
+            "pollError": poll_error,
+            "witness": snapshot,
+            "reportOnly": not signaled,
+            "failureClassificationAuthority": 1 if signaled else 0,
+        }
+
+    def terminate_exact(
+        self,
+        pid: int,
+        creation_epoch_ms: int,
+        canonical_exe_path: str,
+        exit_code: int = 0xC0DE0001,
+        wait_timeout_sec: float = 10.0,
+    ) -> Dict[str, Any]:
+        snapshot = self.snapshot()
+        binding_exact = bool(
+            snapshot.get("available") is True
+            and self._binding_exact(
+                pid, creation_epoch_ms, canonical_exe_path,
+            )
+        )
+        if not binding_exact:
+            return {
+                "ok": False,
+                "exact": False,
+                "bindingExact": False,
+                "handleSignaled": False,
+                "terminatedByHandle": False,
+                "reportOnly": True,
+                "failureClassificationAuthority": 0,
+                "witness": snapshot,
+            }
+        before = self.termination_exact(
+            pid, creation_epoch_ms, canonical_exe_path,
+        )
+        if before.get("exact") is True:
+            return {
+                "ok": True,
+                "exact": True,
+                "bindingExact": True,
+                "handleSignaled": True,
+                "terminatedByHandle": False,
+                "alreadyTerminated": True,
+                "terminationProof": before,
+                "reportOnly": False,
+                "failureClassificationAuthority": 1,
+            }
+        terminate_error = 0
+        with self._lock:
+            if self._closed or self._handle <= 0:
+                return {
+                    "ok": False,
+                    "exact": False,
+                    "bindingExact": False,
+                    "handleSignaled": False,
+                    "terminatedByHandle": False,
+                    "error": "native process witness closed before terminate",
+                    "reportOnly": True,
+                    "failureClassificationAuthority": 0,
+                }
+            terminated = bool(_KERNEL32.TerminateProcess(
+                wintypes.HANDLE(self._handle),
+                int(exit_code) & 0xFFFFFFFF,
+            ))
+            if not terminated:
+                terminate_error = int(ctypes.get_last_error())
+        wait_error = ""
+        if terminated:
+            try:
+                self.wait(max(0.0, float(wait_timeout_sec)))
+            except Exception as exc:
+                wait_error = f"{type(exc).__name__}: {exc}"
+        after = self.termination_exact(
+            pid, creation_epoch_ms, canonical_exe_path,
+        )
+        natural_exit_race = bool(
+            not terminated and after.get("exact") is True
+        )
+        exact = bool(
+            not wait_error
+            and after.get("exact") is True
+            and after.get("bindingExact") is True
+            and after.get("handleSignaled") is True
+        )
+        return {
+            "ok": exact,
+            "exact": exact,
+            "bindingExact": binding_exact,
+            "handleSignaled": after.get("handleSignaled") is True,
+            "terminatedByHandle": terminated,
+            "naturalExitRace": natural_exit_race,
+            "alreadyTerminated": False,
+            "requestedExitCode": int(exit_code) & 0xFFFFFFFF,
+            "terminateWin32Error": terminate_error,
+            "waitError": wait_error,
+            "terminationProof": after,
+            "pidTerminationCommandIssued": False,
+            "reportOnly": not exact,
+            "failureClassificationAuthority": 1 if exact else 0,
+        }
+
+    def close(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._closed or self._handle <= 0:
+                self._closed = True
+                self._handle = 0
+                return {
+                    "ok": True,
+                    "closed": True,
+                    "skipped": True,
+                    "pid": self.pid,
+                }
+            handle = self._handle
+            # Invalidate before CloseHandle. A closed integer is never exposed
+            # or reused, even if Windows later recycles the numeric value.
+            self._handle = 0
+            self._closed = True
+            closed = bool(_KERNEL32.CloseHandle(wintypes.HANDLE(handle)))
+            return {
+                "ok": closed,
+                "closed": closed,
+                "skipped": False,
+                "pid": self.pid,
+                "win32Error": 0 if closed else ctypes.get_last_error(),
+            }
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _terminate_and_close_owned_create_process_handle(
+    handle: Any,
+    exit_code: int = 0xC0DE0002,
+    wait_timeout_ms: int = 10_000,
+) -> Dict[str, Any]:
+    """Clean an unpublishable CreateProcessW child via its owned hProcess."""
+    handle_value = _native_handle_value(handle)
+    if handle_value <= 0:
+        return {
+            "ok": False,
+            "ownedCreateProcessHandle": False,
+            "handleSignaled": False,
+            "closed": False,
+            "terminatedByHandle": False,
+            "pidTerminationCommandIssued": False,
+            "error": "invalid owned CreateProcessW process handle",
+        }
+
+    native_handle = wintypes.HANDLE(handle_value)
+    pre_wait = int(_KERNEL32.WaitForSingleObject(native_handle, 0))
+    already_signaled = pre_wait == WAIT_OBJECT_0
+    terminate_attempted = pre_wait == WAIT_TIMEOUT
+    terminated_by_handle = False
+    terminate_error = 0
+    if terminate_attempted:
+        terminated_by_handle = bool(_KERNEL32.TerminateProcess(
+            native_handle, int(exit_code) & 0xFFFFFFFF,
+        ))
+        if not terminated_by_handle:
+            terminate_error = int(ctypes.get_last_error())
+
+    # A successful TerminateProcess is asynchronous. If it failed, use a
+    # zero-time recheck only: a concurrently natural exit is authoritative,
+    # but this cleanup must never wait on or address a PID fallback.
+    post_wait = pre_wait
+    if terminate_attempted:
+        post_wait = int(_KERNEL32.WaitForSingleObject(
+            native_handle,
+            max(0, int(wait_timeout_ms)) if terminated_by_handle else 0,
+        ))
+    handle_signaled = post_wait == WAIT_OBJECT_0
+    natural_exit_race = bool(
+        terminate_attempted
+        and not terminated_by_handle
+        and handle_signaled
+    )
+    exit_value: Optional[int] = None
+    exit_query_error = 0
+    if handle_signaled:
+        native_exit = wintypes.DWORD(0)
+        if _KERNEL32.GetExitCodeProcess(
+            native_handle, ctypes.byref(native_exit),
+        ):
+            exit_value = int(native_exit.value)
+        else:
+            exit_query_error = int(ctypes.get_last_error())
+
+    # Invalidate the sole local integer by closing exactly once. No caller is
+    # given the raw value and no PID/name fallback is issued.
+    closed = bool(_KERNEL32.CloseHandle(native_handle))
+    close_error = 0 if closed else int(ctypes.get_last_error())
+    exact_cleanup = bool(handle_signaled and closed)
+    return {
+        "ok": exact_cleanup,
+        "ownedCreateProcessHandle": True,
+        "terminateAttempted": terminate_attempted,
+        "terminatedByHandle": terminated_by_handle,
+        "alreadySignaled": already_signaled,
+        "naturalExitRace": natural_exit_race,
+        "handleSignaled": handle_signaled,
+        "waitResult": post_wait,
+        "requestedExitCode": int(exit_code) & 0xFFFFFFFF,
+        "exitCode": exit_value,
+        "terminateWin32Error": terminate_error,
+        "exitQueryWin32Error": exit_query_error,
+        "closed": closed,
+        "closeWin32Error": close_error,
+        "pidTerminationCommandIssued": False,
+        "failureClassificationAuthority": 1 if exact_cleanup else 0,
+    }
+
+
+def _adopt_native_process_witness(
+    handle: Any,
+    expected_pid: int,
+    expected_exe_path: Any,
+    source: str,
+    terminate_owned_create_on_failure: bool = False,
+) -> Tuple[Optional[RetainedNativeProcessWitness], Dict[str, Any]]:
+    handle_value = _native_handle_value(handle)
+    binding = _native_process_binding_from_handle(handle_value)
+    expected_path = _canonical_process_path(expected_exe_path)
+    exact = bool(
+        binding.get("ok") is True
+        and binding.get("pid") == int(expected_pid)
+        and isinstance(binding.get("creationEpochMs"), int)
+        and not isinstance(binding.get("creationEpochMs"), bool)
+        and binding.get("creationEpochMs", 0) > 0
+        and binding.get("canonicalExePath") == expected_path
+    )
+    result = {
+        "ok": exact,
+        "source": source,
+        "expectedPid": int(expected_pid),
+        "expectedCanonicalExePath": expected_path,
+        "binding": binding,
+        "failureClassificationAuthority": 1 if exact else 0,
+    }
+    if not exact:
+        owned_create_cleanup: Dict[str, Any] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "not an owned CreateProcessW failure handle",
+            "pidTerminationCommandIssued": False,
+        }
+        if handle_value > 0:
+            if terminate_owned_create_on_failure:
+                owned_create_cleanup = (
+                    _terminate_and_close_owned_create_process_handle(
+                        handle_value,
+                    )
+                )
+            else:
+                closed = bool(_KERNEL32.CloseHandle(
+                    wintypes.HANDLE(handle_value)
+                ))
+                owned_create_cleanup = {
+                    "ok": closed,
+                    "closed": closed,
+                    "terminatedByHandle": False,
+                    "pidTerminationCommandIssued": False,
+                    "win32Error": (
+                        0 if closed else int(ctypes.get_last_error())
+                    ),
+                }
+        result["handleFailureCleanup"] = owned_create_cleanup
+        result["error"] = (
+            binding.get("error")
+            or "native process handle identity mismatch"
+        )
+        return None, result
+    witness = RetainedNativeProcessWitness(
+        handle_value,
+        int(binding["pid"]),
+        int(binding["creationEpochMs"]),
+        str(binding["canonicalExePath"]),
+        source,
+    )
+    result["witness"] = witness.snapshot()
+    return witness, result
+
+
+def _open_native_process_witness(
+    pid: int, expected_exe_path: Any, source: str,
+) -> Tuple[Optional[RetainedNativeProcessWitness], Dict[str, Any]]:
+    handle = _KERNEL32.OpenProcess(
+        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+        False,
+        int(pid),
+    )
+    if not handle:
+        return None, {
+            "ok": False,
+            "source": source,
+            "expectedPid": int(pid),
+            "expectedCanonicalExePath": _canonical_process_path(
+                expected_exe_path
+            ),
+            "error": f"OpenProcess failed: {ctypes.get_last_error()}",
+            "failureClassificationAuthority": 0,
+        }
+    return _adopt_native_process_witness(
+        handle, pid, expected_exe_path, source,
+    )
+
+
+class _ProcessEntry32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
+class _ModuleEntry32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("th32ModuleID", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("GlblcntUsage", wintypes.DWORD),
+        ("ProccntUsage", wintypes.DWORD),
+        ("modBaseAddr", ctypes.POINTER(ctypes.c_byte)),
+        ("modBaseSize", wintypes.DWORD),
+        ("hModule", wintypes.HMODULE),
+        ("szModule", wintypes.WCHAR * 256),
+        ("szExePath", wintypes.WCHAR * 260),
+    ]
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
 RUNTIME_MODULE_ORDER = [
     "hook.lifecycle",
     "hook.ui",
@@ -96,6 +849,7 @@ RUNTIME_MODULE_ORDER = [
     "postfx",
     "ssao",
     "aa",
+    "semantic.data",
 ]
 PROFILE_DEFAULT_DISABLED = {
     "dxvk_only": set(RUNTIME_MODULE_ORDER),
@@ -112,6 +866,7 @@ PROFILE_DEFAULT_DISABLED = {
         "postfx",
         "ssao",
         "aa",
+        "semantic.data",
     },
     "hooks_default": {
         "render.queue",
@@ -122,6 +877,7 @@ PROFILE_DEFAULT_DISABLED = {
         "postfx",
         "ssao",
         "aa",
+        "semantic.data",
     },
     "render_base": {
         "shadow.capture",
@@ -131,6 +887,7 @@ PROFILE_DEFAULT_DISABLED = {
         "postfx",
         "ssao",
         "aa",
+        "semantic.data",
     },
     "shadow_capture_only": {
         "shadow.map",
@@ -139,11 +896,13 @@ PROFILE_DEFAULT_DISABLED = {
         "postfx",
         "ssao",
         "aa",
+        "semantic.data",
     },
     "shadow_full": {
         "postfx",
         "ssao",
         "aa",
+        "semantic.data",
     },
     "full_default": set(),
     "full_analysis": set(),
@@ -173,6 +932,7 @@ PROFILE_MATRIX_CASES: List[Dict[str, Any]] = [
     {"name": "sub_no_hook_ui", "profile": "full_default", "disable": "hook.ui", "group": "subtractive", "label": "No Hook UI", "category": "non_render_hook", "budgetFps": 10.0},
     {"name": "sub_no_hook_jass", "profile": "full_default", "disable": "hook.jass", "group": "subtractive", "label": "No Hook JASS", "category": "non_render_hook", "budgetFps": 10.0},
     {"name": "sub_no_hook_render", "profile": "full_default", "disable": "hook.render", "group": "subtractive", "label": "No Hook Render", "category": "render_bridge", "budgetFps": 25.0},
+    {"name": "sub_no_semantic_data", "profile": "full_default", "disable": "semantic.data", "group": "subtractive", "label": "No Semantic Data", "category": "semantic_data", "budgetFps": 35.0},
     {"name": "sub_no_render_queue", "profile": "full_default", "disable": "render.queue", "group": "subtractive", "label": "No Render Queue", "category": "render_bridge", "budgetFps": 25.0},
     {"name": "sub_no_shadow_capture", "profile": "full_default", "disable": "shadow.capture", "group": "subtractive", "label": "No Shadow Capture", "category": "shadow_capture", "budgetFps": 45.0},
     {"name": "sub_no_shadow_map", "profile": "full_default", "disable": "shadow.map", "group": "subtractive", "label": "No Shadow Map", "category": "shadow_render", "budgetFps": 20.0},
@@ -183,6 +943,17 @@ PROFILE_MATRIX_CASES: List[Dict[str, Any]] = [
     {"name": "sub_no_aa", "profile": "full_default", "disable": "aa", "group": "subtractive", "label": "No AA", "category": "postfx_diag", "budgetFps": 10.0},
 ]
 
+SEMANTIC_SHADOW_VALIDATION_ENV: Dict[str, str] = {
+    "DXVK_WAR3_SEMANTIC_SHADOW_PREVIEW": "1",
+    "DXVK_WAR3_SEMANTIC_SHADOW_SCENE_SUBMISSION": "1",
+    "DXVK_WAR3_SEMANTIC_SHADOW_BOOTSTRAP_CATCHUP": "1",
+    "DXVK_WAR3_SEMANTIC_SHADOW_ENDFRAME_BUILD": "0",
+    "DXVK_WAR3_SEMANTIC_SHADOW_ENDFRAME_FLUSH": "1",
+    "DXVK_WAR3_SEMANTIC_SHADOW_TAIL_FALLBACK": "1",
+    "DXVK_WAR3_SEMANTIC_SHADOW_PRE_READY": "1",
+    "DXVK_WAR3_SEMANTIC_PUBLISH_REGISTRIES_BEFORE_SCENE": "1",
+}
+
 SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
     "low_pressure_static_reuse": {
         "title": "低压静态复用",
@@ -190,7 +961,7 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "mapPath": str(DEFAULT_LOW_PRESSURE_TEST_MAP),
         "profile": "full_default",
         "disableModules": "",
-        "windowed": False,
+        "windowed": True,
         "useIsolatedDesktop": True,
         "desktopName": "War3LowPressureStatic",
         "readyTimeoutSec": 120,
@@ -200,10 +971,11 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "autoPerfExportSec": 24,
         "deployD3d9BeforeLaunch": True,
         "opengl": False,
-        "enforceVideoBaseline": True,
+        "enforceVideoBaseline": False,
         "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
         "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
         "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
     },
     "dynamic_shadow_pressure": {
         "title": "动作单位压力",
@@ -211,7 +983,7 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "mapPath": str(DEFAULT_TEST_MAP),
         "profile": "full_default",
         "disableModules": "",
-        "windowed": False,
+        "windowed": True,
         "useIsolatedDesktop": True,
         "desktopName": "War3DynamicShadowPressure",
         "readyTimeoutSec": 120,
@@ -221,10 +993,11 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "autoPerfExportSec": 26,
         "deployD3d9BeforeLaunch": True,
         "opengl": False,
-        "enforceVideoBaseline": True,
+        "enforceVideoBaseline": False,
         "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
         "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
         "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
     },
     "model_runtime_probe": {
         "title": "模型运行时探针",
@@ -242,10 +1015,11 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "autoPerfExportSec": 24,
         "deployD3d9BeforeLaunch": True,
         "opengl": False,
-        "enforceVideoBaseline": True,
+        "enforceVideoBaseline": False,
         "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
         "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
         "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
     },
     "semantic_cost_probe": {
         "title": "语义追踪成本探针",
@@ -253,7 +1027,7 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "mapPath": str(DEFAULT_LOW_PRESSURE_TEST_MAP),
         "profile": "full_analysis",
         "disableModules": "",
-        "windowed": False,
+        "windowed": True,
         "useIsolatedDesktop": True,
         "desktopName": "War3SemanticCostProbe",
         "readyTimeoutSec": 150,
@@ -263,10 +1037,78 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "autoPerfExportSec": 22,
         "deployD3d9BeforeLaunch": True,
         "opengl": False,
-        "enforceVideoBaseline": True,
+        "enforceVideoBaseline": False,
         "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
         "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
         "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
+    },
+    "rigid_static_canonical_smoke": {
+        "title": "Rigid/Static Canonical Smoke",
+        "description": "用于 Phase 4 prepared 的 rigid/static canonical 场景预案，不强制 hot-shadow gate。",
+        "mapPath": str(DEFAULT_LOW_PRESSURE_TEST_MAP),
+        "profile": "full_default",
+        "disableModules": "",
+        "windowed": True,
+        "useIsolatedDesktop": True,
+        "desktopName": "War3RigidStaticCanonical",
+        "readyTimeoutSec": 120,
+        "sampleDurationSec": 18,
+        "autoPerfRecord": True,
+        "recordAfterGameStarted": True,
+        "autoPerfExportSec": 22,
+        "deployD3d9BeforeLaunch": True,
+        "opengl": False,
+        "enforceVideoBaseline": False,
+        "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
+        "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
+        "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "requireHotShadowFrame": False,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
+    },
+    "static_world_caster_acceptance": {
+        "title": "Static World Caster Acceptance",
+        "description": "用于 Phase 4 correctness：验证 Building / Destructible / rigid-static canonical 提交。",
+        "mapPath": str(DEFAULT_LOW_PRESSURE_TEST_MAP),
+        "profile": "full_default",
+        "disableModules": "",
+        "windowed": True,
+        "useIsolatedDesktop": True,
+        "desktopName": "War3StaticWorldCasterAcceptance",
+        "readyTimeoutSec": 120,
+        "sampleDurationSec": 20,
+        "autoPerfRecord": True,
+        "recordAfterGameStarted": True,
+        "autoPerfExportSec": 24,
+        "deployD3d9BeforeLaunch": True,
+        "opengl": False,
+        "enforceVideoBaseline": False,
+        "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
+        "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
+        "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
+    },
+    "phase4_world_caster_acceptance": {
+        "title": "Phase 4 World Caster Acceptance",
+        "description": "用于 Phase 4 correctness：在真实混合 ShadowTest 场景中验证 Building / Destructible canonical 提交。",
+        "mapPath": str(DEFAULT_TEST_MAP),
+        "profile": "full_default",
+        "disableModules": "",
+        "windowed": True,
+        "useIsolatedDesktop": True,
+        "desktopName": "War3Phase4WorldCasterAcceptance",
+        "readyTimeoutSec": 120,
+        "sampleDurationSec": 22,
+        "autoPerfRecord": True,
+        "recordAfterGameStarted": True,
+        "autoPerfExportSec": 26,
+        "deployD3d9BeforeLaunch": True,
+        "opengl": False,
+        "enforceVideoBaseline": False,
+        "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
+        "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
+        "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "envOverrides": SEMANTIC_SHADOW_VALIDATION_ENV,
     },
 }
 PROFILE_MATRIX_PRIMARY_CHAIN = [
@@ -285,9 +1127,13 @@ LOG_KEYWORD_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
     ("shadowAdaptiveSkip", re.compile(r"Adaptive skip ShadowMap", re.IGNORECASE)),
     ("csmComputeFailed", re.compile(r"CSM compute failed", re.IGNORECASE)),
     ("csmConservativeFallback", re.compile(r"conservative cascade fallback", re.IGNORECASE)),
-    ("runtimeReady", re.compile(r"JASS runtime fully initialized", re.IGNORECASE)),
+    ("runtimeReady", re.compile(r"(?:JASS|War3) runtime fully initialized", re.IGNORECASE)),
     ("stage19", re.compile(r"War3StageSig: stage=19", re.IGNORECASE)),
     ("pauseBlocked", re.compile(r"blocked GamePause request", re.IGNORECASE)),
+    (
+        "backgroundIdleSleepBypassed",
+        re.compile(r"bypassed WM_ACTIVATEAPP background idle sleep", re.IGNORECASE),
+    ),
     ("internalTestApi", re.compile(r"DXVK War3TestApi:", re.IGNORECASE)),
 ]
 
@@ -442,17 +1288,46 @@ def _zero_shadow_runtime_v2_summary() -> Dict[str, Any]:
         "dynamicPoseCount": 0,
         "dynamicSkinnedOutputCount": 0,
         "fallbackDrawCount": 0,
+        "fallbackDrawCountTerrain": 0,
+        "fallbackDrawCountWorldObject": 0,
+        "fallbackDrawCountUnitObject": 0,
+        "objectFallbackDrawCount": 0,
         "semanticBridgeHit": 0,
         "semanticBridgeMiss": 0,
         "semanticBridgeBypassed": 0,
+        "semanticSceneSubmitted": 0,
+        "semanticSceneSubmittedUnit": 0,
+        "semanticSceneSubmittedSkinned": 0,
+        "semanticSceneSubmittedFrameLocal": 0,
+        "semanticSceneSubmittedPersistent": 0,
+        "semanticSceneAcceptedExplicitResourceOwnerRigid": 0,
+        "worldObjectListOwnerHintZeroContextAcceptedCount": 0,
         "modelRegistryHit": 0,
         "modelRegistryMiss": 0,
         "modelLoadCount": 0,
         "modelReuseCount": 0,
+        "runtimeBoundCount": 0,
+        "completeIdentityCount": 0,
+        "shadowRuntimeBoundCount": 0,
+        "shadowIdentityCount": 0,
         "poseUpdateCount": 0,
         "poseCacheHit": 0,
         "poseCacheMiss": 0,
         "bonePaletteUpdates": 0,
+        "shadowGeosetResourceCount": 0,
+        "shadowReadyGeosetCount": 0,
+        "shadowModelResourceCount": 0,
+        "shadowPoseReadyCount": 0,
+        "upperLayerResolveAttempts": 0,
+        "upperLayerResolveVisibleMiss": 0,
+        "upperLayerResolveVisibleUnresolvedGeoset": 0,
+        "upperLayerResolveGeosetMiss": 0,
+        "upperLayerResolvePoseMiss": 0,
+        "upperLayerResolveRuntimeGroupPaletteMiss": 0,
+        "upperLayerResolveAuthoritativeRigid": 0,
+        "upperLayerResolveAuthoritativeSkinned": 0,
+        "upperLayerEmitted": 0,
+        "upperLayerDuplicateOrSuppressed": 0,
         "animationSequenceCount": 0,
         "avgModelResolveCpuMs": 0.0,
         "avgPoseUpdateCpuMs": 0.0,
@@ -500,6 +1375,7 @@ def _create_isolated_desktop(name: str) -> Dict[str, Any]:
         desktop_name = f"War3AutoTest_{_now_compact()}"
 
     result: Dict[str, Any] = {}
+    cancelled = threading.Event()
 
     def _worker() -> None:
         user32 = ctypes.windll.user32
@@ -525,6 +1401,11 @@ def _create_isolated_desktop(name: str) -> Dict[str, Any]:
             result["ok"] = False
             result["error"] = f"CreateDesktopW 失败: {int(kernel32.GetLastError())}"
             return
+        if cancelled.is_set():
+            user32.CloseDesktop(wintypes.HANDLE(handle))
+            result["ok"] = False
+            result["cancelledHandleClosed"] = True
+            return
         result["ok"] = True
         result["name"] = desktop_name
         result["handle"] = int(handle)
@@ -533,7 +1414,20 @@ def _create_isolated_desktop(name: str) -> Dict[str, Any]:
     thread.start()
     thread.join(timeout=5.0)
     if thread.is_alive():
-        return {"ok": False, "error": "CreateDesktopW 超时", "name": desktop_name}
+        cancelled.set()
+        thread.join(timeout=1.0)
+        late_handle = int(result.get("handle", 0) or 0)
+        late_closed = (
+            _close_desktop_handle(late_handle)
+            if late_handle else bool(result.get("cancelledHandleClosed"))
+        )
+        return {
+            "ok": False,
+            "error": "CreateDesktopW 超时",
+            "name": desktop_name,
+            "lateHandleClosed": late_closed,
+            "workerExited": not thread.is_alive(),
+        }
     if not result.get("ok"):
         return {"ok": False, "error": result.get("error", "CreateDesktopW 失败"), "name": desktop_name}
     return result
@@ -605,13 +1499,670 @@ def _launch_process_on_desktop(
     pid = int(proc_info.dwProcessId)
     if proc_info.hThread:
         kernel32.CloseHandle(proc_info.hThread)
-    if proc_info.hProcess:
-        kernel32.CloseHandle(proc_info.hProcess)
+    witness, witness_acquisition = _adopt_native_process_witness(
+        proc_info.hProcess,
+        pid,
+        app_name,
+        "isolated-CreateProcessW-original-hProcess",
+        terminate_owned_create_on_failure=True,
+    )
+    if witness is None:
+        # The process was created but its immutable PID/creation/path binding
+        # could not be proven. The raw owned hProcess was terminated, waited,
+        # and closed inside adoption; never fall back to a recyclable PID.
+        return {
+            "ok": False,
+            "error": (
+                "CreateProcessW succeeded but native process witness "
+                "acquisition failed"
+            ),
+            "pid": pid,
+            "desktop": desktop_name,
+            "nativeProcessWitnessAcquisition": witness_acquisition,
+        }
     return {
         "ok": True,
         "pid": pid,
         "desktop": desktop_name,
+        "nativeProcessWitness": witness.snapshot(),
+        "nativeProcessWitnessAcquisition": witness_acquisition,
+        # Internal-only ownership transfer to launch_war3_test. This object is
+        # removed before any MCP/JSON result is returned.
+        "_nativeProcessWitness": witness,
     }
+
+
+def _normalize_launcher_mode(value: str) -> str:
+    mode = str(value or YDWE_LAUNCHER_MODE_DIRECT).strip().lower()
+    aliases = {
+        "war3": YDWE_LAUNCHER_MODE_DIRECT,
+        "war3.exe": YDWE_LAUNCHER_MODE_DIRECT,
+        "ydwe.exe": YDWE_LAUNCHER_MODE_YDWE,
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in (YDWE_LAUNCHER_MODE_DIRECT, YDWE_LAUNCHER_MODE_YDWE):
+        raise ValueError(
+            f"launcher_mode 只允许 {YDWE_LAUNCHER_MODE_DIRECT}/{YDWE_LAUNCHER_MODE_YDWE}: {value}"
+        )
+    return mode
+
+
+def _same_resolved_path(left: Path, right: Path) -> bool:
+    left_text = os.path.normcase(os.path.normpath(str(Path(left).resolve(strict=False))))
+    right_text = os.path.normcase(os.path.normpath(str(Path(right).resolve(strict=False))))
+    return left_text == right_text
+
+
+def _ydwe_lock_name(ydwe_root: Path) -> str:
+    canonical = os.path.normcase(
+        os.path.normpath(str(Path(ydwe_root).resolve(strict=False)))
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return f"Local\\War3AutoTest_YDWE_{digest[:24]}"
+
+
+def _acquire_ydwe_root_lock(ydwe_root: Path) -> Dict[str, Any]:
+    """串行化固定 logs 目录的 YDWE 运行时，避免 LuaEngine 在 DllMain 中 fast-fail。"""
+    name = _ydwe_lock_name(ydwe_root)
+    ctypes.set_last_error(0)
+    handle = _KERNEL32.CreateMutexW(None, True, name)
+    if not handle:
+        error = int(ctypes.get_last_error())
+        return {
+            "ok": False,
+            "code": "YDWE_ROOT_LOCK_FAILED",
+            "error": f"创建 YDWE 根互斥锁失败: {error}",
+            "win32Error": error,
+            "name": name,
+        }
+    error = int(ctypes.get_last_error())
+    if error == ERROR_ALREADY_EXISTS:
+        _KERNEL32.CloseHandle(handle)
+        return {
+            "ok": False,
+            "code": "YDWE_ROOT_BUSY",
+            "error": "同一 YDWE 根已有 AutoTest 会话，拒绝并发复用固定日志目录",
+            "win32Error": error,
+            "name": name,
+            "ydweRoot": str(Path(ydwe_root).resolve(strict=False)),
+        }
+    return {
+        "ok": True,
+        "handle": int(handle),
+        "name": name,
+        "ydweRoot": str(Path(ydwe_root).resolve(strict=False)),
+    }
+
+
+def _release_ydwe_root_lock(lock: Dict[str, Any]) -> Dict[str, Any]:
+    handle = int(lock.get("handle", 0) or 0)
+    if handle == 0:
+        return {"ok": True, "skipped": True, "reason": "无 YDWE 根互斥锁"}
+    released = bool(_KERNEL32.ReleaseMutex(wintypes.HANDLE(handle)))
+    release_error = 0 if released else int(ctypes.get_last_error())
+    closed = bool(_KERNEL32.CloseHandle(wintypes.HANDLE(handle)))
+    return {
+        "ok": released and closed,
+        "released": released,
+        "closed": closed,
+        "win32Error": release_error,
+        "name": str(lock.get("name", "")),
+        "ydweRoot": str(lock.get("ydweRoot", "")),
+    }
+
+
+def _probe_ydwe_log_writable(ydwe_root: Path) -> Dict[str, Any]:
+    """以 LuaEngine 同一启动令牌验证固定 war3.log 可写且未被独占。"""
+    log_path = Path(ydwe_root).resolve(strict=False) / "logs" / "war3.log"
+    if not log_path.is_file():
+        return {
+            "ok": False,
+            "code": "YDWE_LOG_MISSING",
+            "error": f"YDWE 运行日志不存在: {log_path}",
+            "path": str(log_path),
+        }
+    FILE_APPEND_DATA = 0x00000004
+    FILE_SHARE_READ = 0x00000001
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    handle = _KERNEL32.CreateFileW(
+        str(log_path),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if not handle or int(handle) == int(INVALID_HANDLE_VALUE):
+        error = int(ctypes.get_last_error())
+        return {
+            "ok": False,
+            "code": "YDWE_LOG_NOT_WRITABLE",
+            "error": (
+                "YDWE 的 logs\\war3.log 不可写或已被占用；"
+                "LuaEngine 会在 DLL 初始化阶段以 0xC0000409 退出"
+            ),
+            "path": str(log_path),
+            "win32Error": error,
+        }
+    _KERNEL32.CloseHandle(handle)
+    return {"ok": True, "path": str(log_path), "verification": "append-open-exclusive-write"}
+
+
+def _read_hkcu_war3_install_path() -> Dict[str, Any]:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WAR3_INSTALL_REG_KEY) as key:
+            value, value_type = winreg.QueryValueEx(key, "InstallPath")
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": f"读取 HKCU\\{WAR3_INSTALL_REG_KEY}\\InstallPath 失败: {exc}",
+            "keyPath": WAR3_INSTALL_REG_KEY,
+        }
+    if value_type not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+        return {
+            "ok": False,
+            "error": f"InstallPath 类型不是字符串: {value_type}",
+            "keyPath": WAR3_INSTALL_REG_KEY,
+        }
+    raw = str(value or "").strip()
+    if value_type == winreg.REG_EXPAND_SZ:
+        raw = os.path.expandvars(raw)
+    if not raw:
+        return {
+            "ok": False,
+            "error": "HKCU Warcraft III InstallPath 为空",
+            "keyPath": WAR3_INSTALL_REG_KEY,
+        }
+    return {
+        "ok": True,
+        "path": raw,
+        "keyPath": WAR3_INSTALL_REG_KEY,
+        "valueType": int(value_type),
+    }
+
+
+def _preflight_ydwe_single_launch(war3_dir: Path, ydwe_root: Path) -> Dict[str, Any]:
+    """校验单实例 YDWE/JAPI 启动闭包；只读注册表，任何漂移都拒绝启动。"""
+    try:
+        sandbox = _require_multi_instance_sandbox(war3_dir)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "code": "YDWE_SANDBOX_ROOT_MISMATCH"}
+
+    ydwe = Path(ydwe_root).resolve(strict=False)
+    required_war3 = ["war3.exe", "Game.dll", "war3.mpq", "war3patch.mpq", "Storm.dll"]
+    missing_war3 = [str(sandbox / name) for name in required_war3 if not (sandbox / name).is_file()]
+    required_ydwe = [
+        ydwe / "YDWE.exe",
+        ydwe / "bin" / "LuaEngine.dll",
+        ydwe / "plugin" / "warcraft3" / "yd_jass_api.dll",
+    ]
+    missing_ydwe = [str(path) for path in required_ydwe if not path.is_file()]
+    if missing_war3 or missing_ydwe:
+        return {
+            "ok": False,
+            "error": "YDWE/JAPI 启动闭包文件缺失",
+            "code": "YDWE_RUNTIME_CLOSURE_MISSING",
+            "missingWar3": missing_war3,
+            "missingYdwe": missing_ydwe,
+        }
+
+    log_writable = _probe_ydwe_log_writable(ydwe)
+    if not log_writable.get("ok"):
+        return {
+            "ok": False,
+            "error": log_writable.get("error", "YDWE war3.log 不可写"),
+            "code": log_writable.get("code", "YDWE_LOG_NOT_WRITABLE"),
+            "logWritable": log_writable,
+        }
+
+    conflicts = _find_user_ydwe_process_conflicts(ydwe)
+    if conflicts:
+        return {
+            "ok": False,
+            "error": "检测到用户正在运行 YDWE/WorldEditor；共享启动器可能不产出 War3，拒绝干预用户进程",
+            "code": "USER_YDWE_PROCESS_CONFLICT",
+            "conflicts": conflicts,
+        }
+
+    registry = _read_hkcu_war3_install_path()
+    if not registry.get("ok"):
+        return {
+            "ok": False,
+            "error": registry.get("error", "读取 InstallPath 失败"),
+            "code": "YDWE_INSTALL_PATH_UNAVAILABLE",
+            "registry": registry,
+        }
+    registry_path = Path(str(registry["path"]))
+    if not _same_resolved_path(registry_path, sandbox):
+        return {
+            "ok": False,
+            "error": (
+                "YDWE 使用共享 HKCU InstallPath；当前值未精确指向专用沙盒，"
+                "AutoTest 不会修改注册表"
+            ),
+            "code": "YDWE_INSTALL_PATH_MISMATCH",
+            "expected": str(sandbox),
+            "actual": str(registry_path),
+            "registry": registry,
+        }
+    return {
+        "ok": True,
+        "war3Dir": str(sandbox),
+        "ydweRoot": str(ydwe),
+        "ydweExe": str(ydwe / "YDWE.exe"),
+        "luaEngine": str(ydwe / "bin" / "LuaEngine.dll"),
+        "ydJassApi": str(ydwe / "plugin" / "warcraft3" / "yd_jass_api.dll"),
+        "runtimeSha256": {
+            "LuaEngine.dll": sha256_file(ydwe / "bin" / "LuaEngine.dll"),
+            "yd_jass_api.dll": sha256_file(ydwe / "plugin" / "warcraft3" / "yd_jass_api.dll"),
+        },
+        "registry": registry,
+        "logWritable": log_writable,
+        "registryModified": False,
+    }
+
+
+def _snapshot_process_entries() -> List[Dict[str, Any]]:
+    """使用 Toolhelp32 获取 PID/PPID/镜像名，避免依赖 WMI/PowerShell。"""
+    TH32CS_SNAPPROCESS = 0x00000002
+    invalid_handle = ctypes.c_void_p(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snapshot or int(snapshot) == int(invalid_handle):
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        entry = _ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry32W)
+        ok = bool(kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
+        while ok:
+            rows.append(
+                {
+                    "pid": int(entry.th32ProcessID),
+                    "parentPid": int(entry.th32ParentProcessID),
+                    "exeName": str(entry.szExeFile),
+                }
+            )
+            entry.dwSize = ctypes.sizeof(_ProcessEntry32W)
+            ok = bool(kernel32.Process32NextW(snapshot, ctypes.byref(entry)))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return rows
+
+
+def _query_process_image_path(pid: int) -> str:
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        buf = ctypes.create_unicode_buffer(int(size.value))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return ""
+        return str(buf.value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _find_user_ydwe_process_conflicts(ydwe_root: Path) -> List[Dict[str, Any]]:
+    """只报告冲突，不结束用户的编辑器或 YDWE 配置进程。"""
+    conflict_names = {"worldeditydwe.exe", "ydweconfig.exe", "ydwe.exe"}
+    rows: List[Dict[str, Any]] = []
+    for row in _snapshot_process_entries():
+        name = str(row.get("exeName", "")).lower()
+        if name not in conflict_names:
+            continue
+        pid = int(row.get("pid", 0) or 0)
+        if pid <= 0:
+            continue
+        image_path = _query_process_image_path(pid)
+        same_root = False
+        if image_path:
+            try:
+                Path(image_path).resolve(strict=False).relative_to(Path(ydwe_root).resolve(strict=False))
+                same_root = True
+            except (ValueError, OSError):
+                same_root = False
+        # 所有 YDWE/编辑器实例都共享 HKCU Warcraft InstallPath 等全局状态。
+        # 即使来自另一目录，也不能与本轮 wrapper 并发；只报告，绝不结束用户进程。
+        rows.append(
+            {
+                "pid": pid,
+                "exeName": str(row.get("exeName", "")),
+                "imagePath": image_path,
+                "sameYdweRoot": same_root,
+            }
+        )
+    return rows
+
+
+def _snapshot_process_modules(pid: int) -> List[Dict[str, Any]]:
+    TH32CS_SNAPMODULE = 0x00000008
+    TH32CS_SNAPMODULE32 = 0x00000010
+    invalid_handle = ctypes.c_void_p(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ModuleEntry32W)]
+    kernel32.Module32FirstW.restype = wintypes.BOOL
+    kernel32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ModuleEntry32W)]
+    kernel32.Module32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel32.CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+        int(pid),
+    )
+    if not snapshot or int(snapshot) == int(invalid_handle):
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        entry = _ModuleEntry32W()
+        entry.dwSize = ctypes.sizeof(_ModuleEntry32W)
+        ok = bool(kernel32.Module32FirstW(snapshot, ctypes.byref(entry)))
+        while ok:
+            rows.append(
+                {
+                    "name": str(entry.szModule),
+                    "path": str(entry.szExePath),
+                    "size": int(entry.modBaseSize),
+                }
+            )
+            entry.dwSize = ctypes.sizeof(_ModuleEntry32W)
+            ok = bool(kernel32.Module32NextW(snapshot, ctypes.byref(entry)))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return rows
+
+
+def _wait_for_ydwe_runtime_modules(
+    pid: int,
+    expected_paths: Dict[str, Path],
+    expected_sha256: Dict[str, str],
+    timeout_sec: float = 20.0,
+) -> Dict[str, Any]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    # 在发现 child 后立即保留 query handle。进程退出后 PID 已无法重新打开，
+    # 没有这个句柄就会丢失 0xC0000005 等关键早期崩溃证据。
+    process_handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, int(pid))
+
+    def exit_code_evidence() -> Dict[str, Any]:
+        if not process_handle:
+            return {"exitCodeAvailable": False}
+        code = wintypes.DWORD(0)
+        if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(code)):
+            return {
+                "exitCodeAvailable": False,
+                "exitCodeError": int(ctypes.get_last_error()),
+            }
+        value = int(code.value)
+        return {
+            "exitCodeAvailable": True,
+            "exitCode": value,
+            "exitCodeHex": f"0x{value:08X}",
+            "processExited": value != 259,
+        }
+
+    def process_is_alive() -> bool:
+        evidence = exit_code_evidence()
+        if evidence.get("exitCodeAvailable"):
+            return not bool(evidence.get("processExited"))
+        return _pid_alive(int(pid))
+
+    deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    last_seen: List[Dict[str, Any]] = []
+    last_module_snapshot: List[Dict[str, Any]] = []
+    expected_by_name = {str(name).lower(): Path(path) for name, path in expected_paths.items()}
+    try:
+        while time.monotonic() < deadline and process_is_alive():
+            modules = _snapshot_process_modules(int(pid))
+            last_module_snapshot = [
+                {
+                    "name": str(row.get("name", "")),
+                    "path": str(row.get("path", "")),
+                    "size": int(row.get("size", 0) or 0),
+                }
+                for row in modules
+            ]
+            by_name = {str(row.get("name", "")).lower(): row for row in modules}
+            seen: List[Dict[str, Any]] = []
+            valid = True
+            for lower_name, expected_path in expected_by_name.items():
+                row = by_name.get(lower_name)
+                if row is None:
+                    valid = False
+                    continue
+                actual_path = Path(str(row.get("path", "")))
+                path_matches = _same_resolved_path(actual_path, expected_path)
+                actual_sha = sha256_file(actual_path) if actual_path.is_file() else ""
+                expected_sha = str(expected_sha256.get(expected_path.name, "") or "")
+                sha_matches = bool(actual_sha and expected_sha and actual_sha.lower() == expected_sha.lower())
+                seen.append(
+                    {
+                        "name": expected_path.name,
+                        "path": str(actual_path),
+                        "pathMatches": path_matches,
+                        "sha256": actual_sha,
+                        "expectedSha256": expected_sha,
+                        "shaMatches": sha_matches,
+                    }
+                )
+                valid = valid and path_matches and sha_matches
+            last_seen = seen
+            if valid and len(seen) == len(expected_by_name):
+                return {
+                    "ok": True,
+                    "pid": int(pid),
+                    "modules": seen,
+                    "moduleSnapshot": last_module_snapshot,
+                    "verification": "loaded-module-exact-path-and-sha256",
+                    **exit_code_evidence(),
+                }
+            time.sleep(0.1)
+        return {
+            "ok": False,
+            "error": "未观察到路径与 SHA-256 均匹配的 YDWE LuaEngine/JAPI 运行时模块",
+            "code": "YDWE_JAPI_MODULES_NOT_VERIFIED",
+            "pid": int(pid),
+            "modules": last_seen,
+            "moduleSnapshot": last_module_snapshot,
+            "processAlive": process_is_alive(),
+            **exit_code_evidence(),
+        }
+    finally:
+        if process_handle:
+            kernel32.CloseHandle(process_handle)
+
+
+def _is_descendant_process(
+    pid: int,
+    launcher_pid: int,
+    by_pid: Dict[int, Dict[str, Any]],
+) -> bool:
+    current = int(pid)
+    seen: set[int] = set()
+    for _ in range(32):
+        row = by_pid.get(current)
+        if row is None:
+            return False
+        parent = int(row.get("parentPid", 0) or 0)
+        if parent == int(launcher_pid):
+            return True
+        if parent <= 0 or parent == current or parent in seen:
+            return False
+        seen.add(parent)
+        current = parent
+    return False
+
+
+def _wait_for_ydwe_war3_child(
+    launcher_pid: int,
+    expected_war3_exe: Path,
+    preexisting_pids: set[int],
+    timeout_sec: float = 20.0,
+    poll_interval_sec: float = 0.1,
+) -> Dict[str, Any]:
+    """只接受 YDWE 子树中新建且镜像路径精确匹配沙盒 war3.exe 的进程。"""
+    deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    last_candidates: List[Dict[str, Any]] = []
+    known_descendants: set[int] = {int(launcher_pid)}
+    while time.monotonic() < deadline:
+        rows = _snapshot_process_entries()
+        by_pid = {int(row.get("pid", 0)): row for row in rows}
+        # YDWE 可能经短命 helper 创建 War3。跨轮保留已经证明属于 launcher
+        # 子树的 PID，避免 helper 在下一次快照前退出后丢失整条祖先链。
+        changed = True
+        while changed:
+            changed = False
+            for row in rows:
+                row_pid = int(row.get("pid", 0) or 0)
+                parent_pid = int(row.get("parentPid", 0) or 0)
+                if row_pid > 0 and parent_pid in known_descendants and row_pid not in known_descendants:
+                    known_descendants.add(row_pid)
+                    changed = True
+        candidates: List[Dict[str, Any]] = []
+        for row in rows:
+            pid = int(row.get("pid", 0) or 0)
+            if pid <= 0 or pid in preexisting_pids:
+                continue
+            if str(row.get("exeName", "")).lower() != "war3.exe":
+                continue
+            if pid not in known_descendants and not _is_descendant_process(pid, int(launcher_pid), by_pid):
+                continue
+            image_path = _query_process_image_path(pid)
+            candidate = dict(row)
+            candidate["imagePath"] = image_path
+            candidate["imageMatches"] = bool(
+                image_path and _same_resolved_path(Path(image_path), expected_war3_exe)
+            )
+            candidates.append(candidate)
+        last_candidates = candidates
+        exact = [row for row in candidates if row.get("imageMatches")]
+        # Toolhelp 快照已经证明该 PID 在本轮仍存在，完整镜像路径又精确匹配
+        # 沙盒 war3.exe。这里不能再依赖一次 OpenProcess 判活：隔离 Desktop
+        # 的早期 loader 窗口中它可能返回 AccessDenied，而 tasklist fallback
+        # 同样会被策略拒绝，导致把真实 child 误报为不存在。
+        if len(exact) == 1:
+            return {
+                "ok": True,
+                "pid": int(exact[0]["pid"]),
+                "launcherPid": int(launcher_pid),
+                "imagePath": str(exact[0]["imagePath"]),
+                "discovery": "toolhelp-descendant-and-exact-image",
+            }
+        if len(exact) > 1:
+            return {
+                "ok": False,
+                "error": "YDWE 子树出现多个精确匹配的 war3.exe，拒绝猜测目标 PID",
+                "code": "YDWE_MULTIPLE_WAR3_CHILDREN",
+                "launcherPid": int(launcher_pid),
+                "candidates": exact,
+            }
+        time.sleep(max(0.01, float(poll_interval_sec)))
+    return {
+        "ok": False,
+        "error": "超时未发现 YDWE 启动的沙盒 war3.exe 子进程",
+        "code": "YDWE_WAR3_CHILD_NOT_FOUND",
+        "launcherPid": int(launcher_pid),
+        "expectedImage": str(expected_war3_exe),
+        "candidates": last_candidates,
+    }
+
+
+def _create_kill_on_close_job(pid: int, session_id: str) -> Dict[str, Any]:
+    """把目标进程放进 KILL_ON_JOB_CLOSE Job Object，确保整棵进程树可回收。"""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job_name = f"Local\\War3AutoTest_{session_id}_{int(pid)}"
+    job = kernel32.CreateJobObjectW(None, job_name)
+    if not job:
+        return {"ok": False, "error": f"CreateJobObjectW 失败: {ctypes.get_last_error()}"}
+
+    info = _JobObjectExtendedLimitInformation()
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+        job,
+        JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        error = int(ctypes.get_last_error())
+        kernel32.CloseHandle(job)
+        return {"ok": False, "error": f"SetInformationJobObject 失败: {error}"}
+
+    process_access = 0x0001 | 0x0100 | 0x1000  # TERMINATE | SET_QUOTA | QUERY_LIMITED_INFORMATION
+    process = kernel32.OpenProcess(process_access, False, int(pid))
+    if not process:
+        error = int(ctypes.get_last_error())
+        kernel32.CloseHandle(job)
+        return {"ok": False, "error": f"OpenProcess(job assign) 失败: {error}"}
+    try:
+        if not kernel32.AssignProcessToJobObject(job, process):
+            error = int(ctypes.get_last_error())
+            kernel32.CloseHandle(job)
+            return {"ok": False, "error": f"AssignProcessToJobObject 失败: {error}"}
+    finally:
+        kernel32.CloseHandle(process)
+    return {
+        "ok": True,
+        "pid": int(pid),
+        "name": job_name,
+        "handle": int(job),
+        "killOnClose": True,
+    }
+
+
+def _close_job_handle(handle: int) -> bool:
+    if int(handle or 0) == 0:
+        return True
+    try:
+        return bool(_KERNEL32.CloseHandle(wintypes.HANDLE(int(handle))))
+    except Exception:
+        return False
 
 
 def _set_process_priority_high(pid: int) -> Dict[str, Any]:
@@ -776,6 +2327,8 @@ def _runtime_status_file(war3_dir: Path) -> Path:
     return war3_dir / "WarVK" / "Temp" / "runtime_status.json"
 
 
+# 这些 legacy JSON 路径仅保留给旧工件清理/离线诊断使用。
+# 主动控制链已统一收口到 named pipe control plane。
 def _frame_capture_request_file(war3_dir: Path) -> Path:
     return war3_dir / "WarVK" / "Temp" / "frame_capture_request.json"
 
@@ -792,6 +2345,174 @@ def _internal_test_result_file(war3_dir: Path) -> Path:
     return war3_dir / "WarVK" / "Temp" / "internal_test_result.json"
 
 
+def _control_plane_pipe_name(pid: int) -> str:
+    return rf"\\.\pipe\War3ControlPlane_{int(pid)}"
+
+
+def _control_plane_request(
+    pid: int,
+    command: str,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout_sec: float = 6.0,
+) -> Dict[str, Any]:
+    target_pid = int(pid or 0)
+    if target_pid <= 0:
+        return {"transportOk": False, "ok": False, "error": "无有效 pid"}
+
+    pipe_name = _control_plane_pipe_name(target_pid)
+    timeout_ms = max(200, int(float(timeout_sec) * 1000.0))
+    t0 = time.time()
+    request = {
+        "requestId": f"cp_{_now_compact()}_{target_pid}_{int(time.time() * 1000)}",
+        "command": str(command or "").strip(),
+        "payload": dict(payload or {}),
+        "issuedAtMs": int(time.time() * 1000),
+        "pid": target_pid,
+    }
+
+    if not bool(_KERNEL32.WaitNamedPipeW(pipe_name, timeout_ms)):
+        return {
+            "transportOk": False,
+            "ok": False,
+            "error": f"named pipe 不可用: {ctypes.get_last_error()}",
+            "pipeName": pipe_name,
+            "request": request,
+            "elapsedSec": round(time.time() - t0, 3),
+        }
+
+    handle = _KERNEL32.CreateFileW(
+        pipe_name,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        None,
+        OPEN_EXISTING,
+        0,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        return {
+            "transportOk": False,
+            "ok": False,
+            "error": f"CreateFileW(pipe) 失败: {ctypes.get_last_error()}",
+            "pipeName": pipe_name,
+            "request": request,
+            "elapsedSec": round(time.time() - t0, 3),
+        }
+
+    try:
+        mode = wintypes.DWORD(PIPE_READMODE_MESSAGE)
+        _KERNEL32.SetNamedPipeHandleState(handle, ctypes.byref(mode), None, None)
+
+        raw = json.dumps(request, ensure_ascii=False).encode("utf-8")
+        write_buf = ctypes.create_string_buffer(raw)
+        written = wintypes.DWORD()
+        if not bool(_KERNEL32.WriteFile(handle, write_buf, len(raw), ctypes.byref(written), None)):
+            return {
+                "transportOk": False,
+                "ok": False,
+                "error": f"WriteFile(pipe) 失败: {ctypes.get_last_error()}",
+                "pipeName": pipe_name,
+                "request": request,
+                "elapsedSec": round(time.time() - t0, 3),
+            }
+        _KERNEL32.FlushFileBuffers(handle)
+
+        response_deadline = time.time() + max(0.2, float(timeout_sec))
+        while True:
+            bytes_avail = wintypes.DWORD()
+            bytes_left = wintypes.DWORD()
+            ok = bool(
+                _KERNEL32.PeekNamedPipe(
+                    handle,
+                    None,
+                    0,
+                    None,
+                    ctypes.byref(bytes_avail),
+                    ctypes.byref(bytes_left),
+                )
+            )
+            if not ok:
+                return {
+                    "transportOk": False,
+                    "ok": False,
+                    "error": f"PeekNamedPipe(pipe) 失败: {ctypes.get_last_error()}",
+                    "pipeName": pipe_name,
+                    "request": request,
+                    "elapsedSec": round(time.time() - t0, 3),
+                }
+            if bytes_avail.value > 0 or bytes_left.value > 0:
+                break
+            if time.time() >= response_deadline:
+                return {
+                    "transportOk": False,
+                    "ok": False,
+                    "error": "等待 control-plane 响应超时",
+                    "pipeName": pipe_name,
+                    "request": request,
+                    "elapsedSec": round(time.time() - t0, 3),
+                }
+            time.sleep(0.01)
+
+        chunks: List[bytes] = []
+        while True:
+            read_buf = ctypes.create_string_buffer(65536)
+            read = wintypes.DWORD()
+            ok = bool(_KERNEL32.ReadFile(handle, read_buf, len(read_buf), ctypes.byref(read), None))
+            if ok:
+                if read.value > 0:
+                    chunks.append(read_buf.raw[: read.value])
+                break
+            err = ctypes.get_last_error()
+            if err == ERROR_MORE_DATA:
+                if read.value > 0:
+                    chunks.append(read_buf.raw[: read.value])
+                continue
+            if err == ERROR_BROKEN_PIPE:
+                break
+            return {
+                "transportOk": False,
+                "ok": False,
+                "error": f"ReadFile(pipe) 失败: {err}",
+                "pipeName": pipe_name,
+                "request": request,
+                "elapsedSec": round(time.time() - t0, 3),
+            }
+
+        if not chunks:
+            return {
+                "transportOk": False,
+                "ok": False,
+                "error": "pipe 响应为空",
+                "pipeName": pipe_name,
+                "request": request,
+                "elapsedSec": round(time.time() - t0, 3),
+            }
+
+        response = json.loads(b"".join(chunks).decode("utf-8", errors="ignore"))
+        result = response.get("result", {})
+        return {
+            "transportOk": True,
+            "ok": bool(response.get("ok")),
+            "error": str(response.get("error", "") or ""),
+            "pipeName": pipe_name,
+            "request": request,
+            "response": response,
+            "result": result if isinstance(result, dict) else {"value": result},
+            "elapsedSec": round(time.time() - t0, 3),
+        }
+    except Exception as e:
+        return {
+            "transportOk": False,
+            "ok": False,
+            "error": f"pipe 请求异常: {e}",
+            "pipeName": pipe_name,
+            "request": request,
+            "elapsedSec": round(time.time() - t0, 3),
+        }
+    finally:
+        _KERNEL32.CloseHandle(handle)
+
+
 def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
@@ -803,6 +2524,28 @@ def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
 
 def _read_runtime_status_file(war3_dir: Path) -> Optional[Dict[str, Any]]:
     return _read_json_file(_runtime_status_file(war3_dir))
+
+
+def _read_runtime_status_best_effort(target_pid: int = 0) -> Optional[Dict[str, Any]]:
+    pid = int(target_pid or STATE.war3_pid or 0)
+    if pid > 0 and _pid_alive(pid):
+        pipe_res = _control_plane_request(
+            pid=pid,
+            command="get_runtime_status",
+            payload={},
+            timeout_sec=1.5,
+        )
+        if pipe_res.get("transportOk") and pipe_res.get("ok"):
+            data = dict(pipe_res.get("result", {}) or {})
+            if data:
+                return data
+
+    registered = SESSION_REGISTRY.get(pid=pid) if pid > 0 else None
+    if registered is not None:
+        war3_dir = Path(registered.instance_root)
+    else:
+        war3_dir = STATE.war3_dir if isinstance(STATE.war3_dir, Path) else DEFAULT_WAR3_DIR
+    return _read_runtime_status_file(Path(war3_dir))
 
 
 def _read_bmp_luma_samples(path: Path, max_samples: int = 262144) -> Dict[str, Any]:
@@ -1107,74 +2850,34 @@ def _invoke_internal_test_request(
     payload: Optional[Dict[str, Any]] = None,
     timeout_sec: float = 6.0,
 ) -> Dict[str, Any]:
-    request_path = _internal_test_request_file(war3_dir)
-    result_path = _internal_test_result_file(war3_dir)
-    request_id = f"internal_{_now_compact()}_{pid}_{int(time.time() * 1000)}"
-
-    for stale in (request_path, result_path):
-        try:
-            if stale.exists():
-                stale.unlink()
-        except Exception:
-            pass
-
-    _ensure_dir(request_path.parent)
-    request = {
-        "requestId": request_id,
-        "command": str(command or "").strip(),
-        "payload": dict(payload or {}),
-        "issuedAtMs": int(time.time() * 1000),
-        "pid": int(pid),
-    }
-    try:
-        request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
+    pipe_res = _control_plane_request(
+        pid=pid,
+        command="invoke_test_command",
+        payload={
+            "command": str(command or "").strip(),
+            "payload": dict(payload or {}),
+            "timeoutMs": max(1000, int(float(timeout_sec) * 1000.0)),
+        },
+        timeout_sec=max(2.0, float(timeout_sec) + 1.0),
+    )
+    if pipe_res.get("transportOk"):
         return {
-            "ok": False,
-            "error": f"写入 internal_test_request.json 失败: {e}",
-            "requestId": request_id,
-            "requestPath": str(request_path),
-            "resultPath": str(result_path),
+            "ok": bool(pipe_res.get("ok")),
+            "requestId": str((pipe_res.get("response", {}) or {}).get("requestId", "")),
+            "command": str(command or "").strip(),
+            "mode": "control-plane",
+            "response": dict(pipe_res.get("response", {}) or {}),
+            "result": dict(pipe_res.get("result", {}) or {}),
+            "error": str(pipe_res.get("error", "") or ""),
+            "elapsedSec": round(float(pipe_res.get("elapsedSec", 0.0) or 0.0), 3),
+            "pipeName": str(pipe_res.get("pipeName", "") or ""),
         }
-
-    t0 = time.time()
-    timeout_sec = max(0.5, float(timeout_sec))
-    response: Optional[Dict[str, Any]] = None
-    while time.time() - t0 < timeout_sec:
-        current = _read_json_file(result_path)
-        if isinstance(current, dict) and current.get("requestId") == request_id:
-            response = current
-            break
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.05)
-
-    try:
-        if request_path.exists():
-            request_path.unlink()
-    except Exception:
-        pass
-
-    if not isinstance(response, dict):
-        return {
-            "ok": False,
-            "error": "等待 internal_test_result.json 超时",
-            "requestId": request_id,
-            "requestPath": str(request_path),
-            "resultPath": str(result_path),
-            "elapsedSec": round(time.time() - t0, 3),
-        }
-
     return {
-        "ok": bool(response.get("ok")),
-        "requestId": request_id,
+        "ok": False,
         "command": str(command or "").strip(),
-        "requestPath": str(request_path),
-        "resultPath": str(result_path),
-        "response": response,
-        "result": dict(response.get("result", {}) or {}),
-        "error": str(response.get("error", "") or ""),
-        "elapsedSec": round(time.time() - t0, 3),
+        "mode": "control-plane-unavailable",
+        "error": str(pipe_res.get("error", "control plane 不可用") or "control plane 不可用"),
+        "detail": pipe_res,
     }
 
 
@@ -1184,93 +2887,12 @@ def _capture_final_frame_via_internal_test_api(
     output_path: Path,
     timeout_sec: float = 8.0,
 ) -> Dict[str, Any]:
-    final_out = output_path.resolve()
-    raw_bmp = final_out if final_out.suffix.lower() == ".bmp" else final_out.with_suffix(".bmp")
-    for stale in (raw_bmp, final_out):
-        try:
-            if stale.exists():
-                stale.unlink()
-        except Exception:
-            pass
-
-    invoke = _invoke_internal_test_request(
+    return _request_internal_frame_capture(
         pid=pid,
+        output_path=output_path,
         war3_dir=war3_dir,
-        command="capture.final_frame",
-        payload={"outputPath": str(raw_bmp)},
-        timeout_sec=max(1.0, min(float(timeout_sec), 6.0)),
+        timeout_sec=timeout_sec,
     )
-    if not invoke.get("ok"):
-        return {
-            "ok": False,
-            "mode": "internal-test-api-capture",
-            "error": str(invoke.get("error", "capture.final_frame 调用失败")),
-            "invoke": invoke,
-        }
-
-    result_path = _frame_capture_result_file(war3_dir)
-    request_id = str(invoke.get("requestId", ""))
-    t0 = time.time()
-    capture_result: Optional[Dict[str, Any]] = None
-    while time.time() - t0 < max(1.0, float(timeout_sec)):
-        current = _read_json_file(result_path)
-        if isinstance(current, dict) and current.get("requestId") == request_id:
-            capture_result = current
-            break
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.1)
-
-    if not isinstance(capture_result, dict):
-        return {
-            "ok": False,
-            "mode": "internal-test-api-capture",
-            "error": "等待 frame_capture_result.json 超时",
-            "invoke": invoke,
-            "elapsedSec": round(time.time() - t0, 3),
-        }
-
-    raw_output = Path(str(capture_result.get("outputPath", raw_bmp)))
-    if (not bool(capture_result.get("ok"))) or (not raw_output.exists()):
-        return {
-            "ok": False,
-            "mode": "internal-test-api-capture",
-            "error": str(capture_result.get("error", "内部最终帧导出失败")),
-            "invoke": invoke,
-            "details": capture_result,
-        }
-
-    convert: Dict[str, Any] = {"returncode": 0, "stdout": "", "stderr": "", "skipped": True}
-    delivered_output = raw_output
-    if final_out.suffix.lower() == ".png":
-        convert = _powershell_convert_bitmap_to_png(raw_output, final_out)
-        if convert.get("returncode", 1) != 0 or (not final_out.exists()):
-            return {
-                "ok": False,
-                "mode": "internal-test-api-capture",
-                "error": f"内部最终帧 PNG 转换失败: {convert.get('stderr') or convert.get('stdout') or 'unknown'}",
-                "invoke": invoke,
-                "details": capture_result,
-                "convert": convert,
-                "rawOutput": str(raw_output),
-            }
-        delivered_output = final_out
-        try:
-            raw_output.unlink()
-        except Exception:
-            pass
-
-    return {
-        "ok": True,
-        "mode": "internal-test-api-capture",
-        "requestId": request_id,
-        "output": str(delivered_output),
-        "rawOutput": str(raw_output),
-        "invoke": invoke,
-        "details": capture_result,
-        "convert": convert,
-        "elapsedSec": round(time.time() - t0, 3),
-    }
 
 
 def _extract_json_object(text: str, marker: str = "const data =") -> Optional[Dict[str, Any]]:
@@ -1375,6 +2997,22 @@ def _read_perf_summary(
         "avgTrackedActiveCpuMs": data.get("avgTrackedActiveCpuMs", data.get("avgTrackedRootCpuMs", 0.0)),
         "avgUntrackedActiveCpuMs": data.get("avgUntrackedActiveCpuMs", data.get("avgUntrackedCpuMs", 0.0)),
         "avgIdleWaitCpuMs": data.get("avgIdleWaitCpuMs", 0.0),
+        # schema v8 authoritative attribution. The legacy *Cpu* keys above are
+        # retained for old matrix consumers, but actually contain scope-wall
+        # aggregates and must not be presented as sampled CPU.
+        "avgTrackedAdditiveRootWallMs": data.get(
+            "avgTrackedAdditiveRootWallMs",
+            data.get("avgTrackedRootCpuMs", 0.0),
+        ),
+        "avgUncoveredFrameWallMs": data.get(
+            "avgUncoveredFrameWallMs",
+            data.get("avgUntrackedCpuMs", 0.0),
+        ),
+        "frameWallScopeCoveragePct": data.get(
+            "frameWallScopeCoveragePct",
+            data.get("cpuCoveragePct", 0.0),
+        ),
+        "frameWallAttribution": data.get("frameWallAttribution", {}),
         "cpuCoveragePct": data.get("cpuCoveragePct", 0.0),
         "cpuCoverageWithIdlePct": data.get("cpuCoverageWithIdlePct", data.get("cpuCoveragePct", 0.0)),
         "jank16": data.get("jank16", 0),
@@ -1493,17 +3131,45 @@ def _read_perf_summary(
             "dynamicPoseCount": int(shadow_runtime_v2.get("dynamicPoseCount", 0) or 0),
             "dynamicSkinnedOutputCount": int(shadow_runtime_v2.get("dynamicSkinnedOutputCount", 0) or 0),
             "fallbackDrawCount": int(shadow_runtime_v2.get("fallbackDrawCount", 0) or 0),
+            "fallbackDrawCountTerrain": int(shadow_runtime_v2.get("fallbackDrawCountTerrain", 0) or 0),
+            "fallbackDrawCountWorldObject": int(shadow_runtime_v2.get("fallbackDrawCountWorldObject", 0) or 0),
+            "fallbackDrawCountUnitObject": int(shadow_runtime_v2.get("fallbackDrawCountUnitObject", 0) or 0),
+            "objectFallbackDrawCount": int(shadow_runtime_v2.get("objectFallbackDrawCount", 0) or 0),
             "semanticBridgeHit": int(shadow_runtime_v2.get("semanticBridgeHit", 0) or 0),
             "semanticBridgeMiss": int(shadow_runtime_v2.get("semanticBridgeMiss", 0) or 0),
             "semanticBridgeBypassed": int(shadow_runtime_v2.get("semanticBridgeBypassed", 0) or 0),
+            "semanticSceneSubmitted": int(shadow_runtime_v2.get("semanticSceneSubmitted", 0) or 0),
+            "semanticSceneSubmittedUnit": int(shadow_runtime_v2.get("semanticSceneSubmittedUnit", 0) or 0),
+            "semanticSceneSubmittedSkinned": int(shadow_runtime_v2.get("semanticSceneSubmittedSkinned", 0) or 0),
+            "semanticSceneSubmittedFrameLocal": int(shadow_runtime_v2.get("semanticSceneSubmittedFrameLocal", 0) or 0),
+            "semanticSceneSubmittedPersistent": int(shadow_runtime_v2.get("semanticSceneSubmittedPersistent", 0) or 0),
+            "semanticSceneAcceptedExplicitResourceOwnerRigid": int(shadow_runtime_v2.get("semanticSceneAcceptedExplicitResourceOwnerRigid", 0) or 0),
             "modelRegistryHit": int(shadow_runtime_v2.get("modelRegistryHit", 0) or 0),
             "modelRegistryMiss": int(shadow_runtime_v2.get("modelRegistryMiss", 0) or 0),
             "modelLoadCount": int(shadow_runtime_v2.get("modelLoadCount", 0) or 0),
             "modelReuseCount": int(shadow_runtime_v2.get("modelReuseCount", 0) or 0),
+            "runtimeBoundCount": int(shadow_runtime_v2.get("runtimeBoundCount", 0) or 0),
+            "completeIdentityCount": int(shadow_runtime_v2.get("completeIdentityCount", 0) or 0),
+            "shadowRuntimeBoundCount": int(shadow_runtime_v2.get("shadowRuntimeBoundCount", 0) or 0),
+            "shadowIdentityCount": int(shadow_runtime_v2.get("shadowIdentityCount", 0) or 0),
             "poseUpdateCount": int(shadow_runtime_v2.get("poseUpdateCount", 0) or 0),
             "poseCacheHit": int(shadow_runtime_v2.get("poseCacheHit", 0) or 0),
             "poseCacheMiss": int(shadow_runtime_v2.get("poseCacheMiss", 0) or 0),
             "bonePaletteUpdates": int(shadow_runtime_v2.get("bonePaletteUpdates", 0) or 0),
+            "shadowGeosetResourceCount": int(shadow_runtime_v2.get("shadowGeosetResourceCount", 0) or 0),
+            "shadowReadyGeosetCount": int(shadow_runtime_v2.get("shadowReadyGeosetCount", 0) or 0),
+            "shadowModelResourceCount": int(shadow_runtime_v2.get("shadowModelResourceCount", 0) or 0),
+            "shadowPoseReadyCount": int(shadow_runtime_v2.get("shadowPoseReadyCount", 0) or 0),
+            "upperLayerResolveAttempts": int(shadow_runtime_v2.get("upperLayerResolveAttempts", 0) or 0),
+            "upperLayerResolveVisibleMiss": int(shadow_runtime_v2.get("upperLayerResolveVisibleMiss", 0) or 0),
+            "upperLayerResolveVisibleUnresolvedGeoset": int(shadow_runtime_v2.get("upperLayerResolveVisibleUnresolvedGeoset", 0) or 0),
+            "upperLayerResolveGeosetMiss": int(shadow_runtime_v2.get("upperLayerResolveGeosetMiss", 0) or 0),
+            "upperLayerResolvePoseMiss": int(shadow_runtime_v2.get("upperLayerResolvePoseMiss", 0) or 0),
+            "upperLayerResolveRuntimeGroupPaletteMiss": int(shadow_runtime_v2.get("upperLayerResolveRuntimeGroupPaletteMiss", 0) or 0),
+            "upperLayerResolveAuthoritativeRigid": int(shadow_runtime_v2.get("upperLayerResolveAuthoritativeRigid", 0) or 0),
+            "upperLayerResolveAuthoritativeSkinned": int(shadow_runtime_v2.get("upperLayerResolveAuthoritativeSkinned", 0) or 0),
+            "upperLayerEmitted": int(shadow_runtime_v2.get("upperLayerEmitted", 0) or 0),
+            "upperLayerDuplicateOrSuppressed": int(shadow_runtime_v2.get("upperLayerDuplicateOrSuppressed", 0) or 0),
             "animationSequenceCount": int(shadow_runtime_v2.get("animationSequenceCount", 0) or 0),
             "avgModelResolveCpuMs": float(shadow_runtime_v2.get("avgModelResolveCpuMs", 0.0) or 0.0),
             "avgPoseUpdateCpuMs": float(shadow_runtime_v2.get("avgPoseUpdateCpuMs", 0.0) or 0.0),
@@ -1841,7 +3507,40 @@ class DbWinListener:
         return pid, msg
 
 
+def _state_owned_process_alive(pid: int) -> Optional[bool]:
+    """
+    Return the authoritative liveness of the single process owned by STATE.
+
+    Isolated-desktop launches retain their original process HANDLE so PID reuse
+    and cross-desktop OpenProcess/tasklist visibility cannot create a false
+    "process exited" result. For any unowned/mismatched PID, or while the
+    witness is being replaced, return None and preserve the legacy probe.
+    """
+    state = globals().get("STATE")
+    if state is None or int(getattr(state, "war3_pid", 0) or 0) != int(pid):
+        return None
+    witness = getattr(state, "retained_native_process", None)
+    if witness is None:
+        return None
+    try:
+        snapshot = witness.snapshot()
+        if (
+            not bool(snapshot.get("available", False))
+            or int(snapshot.get("pid", 0) or 0) != int(pid)
+        ):
+            return None
+        return witness.poll() is None
+    except Exception:
+        # Replacement/close may race a read-only query. Falling back is safer
+        # than treating an unavailable witness as proof of process death.
+        return None
+
+
 def _pid_alive(pid: int) -> bool:
+    owned_alive = _state_owned_process_alive(pid)
+    if owned_alive is not None:
+        return owned_alive
+
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     STILL_ACTIVE = 259
     kernel32 = ctypes.windll.kernel32
@@ -1920,6 +3619,42 @@ def _get_process_cpu_seconds(pid: int) -> float:
         return float(kernel_t.value + user_t.value) / 10_000_000.0
     finally:
         kernel32.CloseHandle(h)
+
+
+def _get_process_creation_epoch_ms(pid: int) -> int:
+    """读取真实进程创建时间，用于防止 PID 回收后误路由/误结束。"""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return 0
+    try:
+        creation = ctypes.c_ulonglong(0)
+        exit_time = ctypes.c_ulonglong(0)
+        kernel_time = ctypes.c_ulonglong(0)
+        user_time = ctypes.c_ulonglong(0)
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            return 0
+        windows_to_unix_100ns = 116_444_736_000_000_000
+        return max(0, int((creation.value - windows_to_unix_100ns) // 10_000))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _registered_session_alive(session: AutoTestSession) -> bool:
+    if int(session.pid or 0) <= 0 or not _pid_alive(int(session.pid)):
+        return False
+    expected = int(session.process_created_at_ms or 0)
+    actual = _get_process_creation_epoch_ms(int(session.pid))
+    if expected > 0 and actual > 0 and abs(expected - actual) > 2_000:
+        return False
+    return True
 
 
 class _Win32Rect(ctypes.Structure):
@@ -2106,6 +3841,336 @@ def _post_window_syscommand(pid: int, command: int) -> Dict[str, Any]:
     }
 
 
+def _post_war3_key_pulse(
+    pid: int,
+    key: str = "RIGHT",
+    hold_ms: int = 45,
+    repeat: int = 1,
+    foreground: bool = False,
+) -> Dict[str, Any]:
+    """Send a small keyboard pulse to the War3 window without requiring camera internals."""
+    hwnd = _wait_for_main_window_hwnd(pid, timeout_sec=8.0, require_visible=True)
+    if not hwnd:
+        return {"ok": False, "error": f"未找到可见主窗口: pid={pid}"}
+
+    key_name = str(key or "RIGHT").strip().upper()
+    vk_map = {
+        "SPACE": 0x20,
+        "ENTER": 0x0D,
+        "RETURN": 0x0D,
+        "ESC": 0x1B,
+        "ESCAPE": 0x1B,
+        "TAB": 0x09,
+        "LEFT": 0x25,
+        "UP": 0x26,
+        "RIGHT": 0x27,
+        "DOWN": 0x28,
+        "PAGEUP": 0x21,
+        "PGUP": 0x21,
+        "PAGEDOWN": 0x22,
+        "PGDN": 0x22,
+        "HOME": 0x24,
+        "END": 0x23,
+        "INSERT": 0x2D,
+        "INS": 0x2D,
+        "DELETE": 0x2E,
+        "DEL": 0x2E,
+        "F1": 0x70,
+        "F2": 0x71,
+        "F3": 0x72,
+        "F4": 0x73,
+        "F5": 0x74,
+        "F6": 0x75,
+        "F7": 0x76,
+        "F8": 0x77,
+        "F9": 0x78,
+        "F10": 0x79,
+        "F11": 0x7A,
+        "F12": 0x7B,
+    }
+    if len(key_name) == 1 and "A" <= key_name <= "Z":
+        vk_map[key_name] = ord(key_name)
+    if len(key_name) == 1 and "0" <= key_name <= "9":
+        vk_map[key_name] = ord(key_name)
+    vk = int(vk_map.get(key_name, 0))
+    if vk == 0:
+        return {
+            "ok": False,
+            "error": f"不支持的 key: {key}",
+            "supported": sorted(vk_map.keys()),
+        }
+
+    user32 = ctypes.windll.user32
+
+    # War3 1.27a 的“按下任意键以继续”由 DirectInput/键盘状态读取，
+    # WM_KEYDOWN/WM_KEYUP 只足以驱动部分窗口消息路径。目标位于隔离
+    # Win32 Desktop 时，在同一 Desktop 内启动一次性 keybd_event helper；
+    # 这不会切换作者当前桌面，也不需要把 War3 窗口带到前台桌面。
+    registered = SESSION_REGISTRY.get(pid=int(pid))
+    desktop_name = ""
+    if registered is not None:
+        desktop_name = str(registered.desktop_name or "")
+    elif STATE.war3_pid == pid:
+        desktop_name = str(STATE.desktop_name or "")
+    if desktop_name:
+        helper_script = Path(__file__).with_name("send_key_same_desktop.ps1")
+        powershell_exe = (
+            Path(os.environ.get("SystemRoot", r"C:\Windows")) /
+            "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        )
+        status_path = _ensure_dir(ARTIFACT_ROOT / "input") / (
+            f"key_{pid}_{time.time_ns()}.status.txt"
+        )
+        if helper_script.is_file() and powershell_exe.is_file():
+            helper_args = [
+                str(powershell_exe),
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(helper_script),
+                "-TargetPid",
+                str(int(pid)),
+                "-VirtualKey",
+                str(int(vk)),
+                "-HoldMs",
+                str(max(20, int(hold_ms))),
+                "-StatusPath",
+                str(status_path),
+            ]
+            helper = _launch_process_on_desktop(
+                helper_args,
+                Path(__file__).resolve().parent,
+                os.environ.copy(),
+                desktop_name,
+            )
+            deadline = time.time() + 6.0
+            while helper.get("ok") and time.time() < deadline:
+                if status_path.exists():
+                    break
+                helper_pid = int(helper.get("pid", 0) or 0)
+                if helper_pid > 0 and not _pid_alive(helper_pid):
+                    break
+                time.sleep(0.05)
+            status = ""
+            if status_path.exists():
+                try:
+                    status = status_path.read_text(
+                        encoding="utf-8-sig", errors="replace").strip()
+                except Exception as exc:
+                    status = f"ERROR:status read failed: {exc}"
+            helper_ok = bool(helper.get("ok")) and status.startswith("OK:")
+            if helper_ok:
+                return {
+                    "ok": True,
+                    "pid": int(pid),
+                    "hwnd": int(hwnd),
+                    "key": key_name,
+                    "vk": int(vk),
+                    "holdMs": int(hold_ms),
+                    "repeat": 1,
+                    "foreground": False,
+                    "mode": "same-desktop-keybd-event",
+                    "desktop": desktop_name,
+                    "helper": helper,
+                    "helperStatus": status,
+                    "helperStatusPath": str(status_path),
+                    "window": _query_window_info_by_hwnd(hwnd, pid=pid),
+                }
+
+    if foreground:
+        try:
+            user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    scan = int(user32.MapVirtualKeyW(vk, 0)) & 0xFF
+    lparam_down = 1 | (scan << 16)
+    lparam_up = 1 | (scan << 16) | (1 << 30) | (1 << 31)
+    posts: List[Dict[str, Any]] = []
+    ok_all = True
+    repeat_count = max(1, int(repeat))
+    hold_sec = max(0.0, float(hold_ms) / 1000.0)
+    for _ in range(repeat_count):
+        down_ok = bool(
+            user32.PostMessageW(
+                ctypes.c_void_p(hwnd),
+                WM_KEYDOWN,
+                ctypes.c_void_p(vk),
+                ctypes.c_void_p(lparam_down),
+            )
+        )
+        time.sleep(hold_sec)
+        up_ok = bool(
+            user32.PostMessageW(
+                ctypes.c_void_p(hwnd),
+                WM_KEYUP,
+                ctypes.c_void_p(vk),
+                ctypes.c_void_p(lparam_up),
+            )
+        )
+        posts.append({"down": down_ok, "up": up_ok})
+        ok_all = ok_all and down_ok and up_ok
+        time.sleep(0.02)
+
+    return {
+        "ok": bool(ok_all),
+        "pid": int(pid),
+        "hwnd": int(hwnd),
+        "key": key_name,
+        "vk": vk,
+        "scan": scan,
+        "holdMs": int(hold_ms),
+        "repeat": repeat_count,
+        "foreground": bool(foreground),
+        "posts": posts,
+        "window": _query_window_info_by_hwnd(hwnd, pid=pid),
+    }
+
+
+def _run_war3_input_plan(
+    pid: int,
+    actions: List[Dict[str, Any]],
+    timeout_sec: float = 20.0,
+) -> Dict[str, Any]:
+    """Run keyboard/client-click actions from a helper on War3's isolated desktop."""
+    target_pid = int(pid)
+    if target_pid <= 0 or not _pid_alive(target_pid):
+        return {"ok": False, "error": f"进程不存在: {target_pid}"}
+    if not isinstance(actions, list) or not actions:
+        return {"ok": False, "error": "actions 必须是非空 JSON array"}
+    if len(actions) > 512:
+        return {"ok": False, "error": "单次输入计划最多 512 个动作"}
+
+    registered = SESSION_REGISTRY.get(pid=target_pid)
+    desktop_name = str(registered.desktop_name or "") if registered is not None else ""
+    if not desktop_name and STATE.war3_pid == target_pid:
+        desktop_name = str(STATE.desktop_name or "")
+    if not desktop_name:
+        return {
+            "ok": False,
+            "error": "输入计划只允许用于已登记的隔离桌面 War3 会话",
+            "code": "ISOLATED_DESKTOP_REQUIRED",
+        }
+
+    hwnd = _wait_for_main_window_hwnd(target_pid, timeout_sec=8.0, require_visible=True)
+    if not hwnd:
+        return {"ok": False, "error": f"未找到可见主窗口: pid={target_pid}"}
+    window = _query_window_info_by_hwnd(hwnd, pid=target_pid)
+    client = dict(window.get("clientRect", {}) or {})
+    client_width = max(1, int(client.get("width", 0) or 0))
+    client_height = max(1, int(client.get("height", 0) or 0))
+
+    normalized: List[Dict[str, Any]] = []
+    for index, raw_action in enumerate(actions):
+        if not isinstance(raw_action, dict):
+            return {"ok": False, "error": f"action[{index}] 必须是 object"}
+        kind = str(raw_action.get("type", "")).strip().lower()
+        if kind == "sleep":
+            normalized.append({
+                "type": "sleep",
+                "ms": max(0, min(int(raw_action.get("ms", 0) or 0), 60_000)),
+            })
+        elif kind == "key":
+            vk = int(raw_action.get("vk", 0) or 0)
+            if vk <= 0 or vk > 0xFE:
+                return {"ok": False, "error": f"action[{index}] vk 非法: {vk}"}
+            normalized.append({
+                "type": "key",
+                "vk": vk,
+                "holdMs": max(20, min(int(raw_action.get("holdMs", 45) or 45), 2_000)),
+            })
+        elif kind == "click":
+            button = str(raw_action.get("button", "left")).strip().lower()
+            if button not in ("left", "right"):
+                return {"ok": False, "error": f"action[{index}] button 非法: {button}"}
+            normalized.append({
+                "type": "click",
+                "x": max(0, min(int(raw_action.get("x", 0) or 0), client_width - 1)),
+                "y": max(0, min(int(raw_action.get("y", 0) or 0), client_height - 1)),
+                "button": button,
+                "holdMs": max(20, min(int(raw_action.get("holdMs", 45) or 45), 2_000)),
+                "count": max(1, min(int(raw_action.get("count", 1) or 1), 4)),
+            })
+        else:
+            return {"ok": False, "error": f"action[{index}] type 不支持: {kind}"}
+
+    helper_script = Path(__file__).with_name("send_input_plan_same_desktop.ps1")
+    powershell_exe = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) /
+        "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    )
+    if not helper_script.is_file() or not powershell_exe.is_file():
+        return {
+            "ok": False,
+            "error": "同桌面输入 helper 或 PowerShell 不存在",
+            "helperScript": str(helper_script),
+            "powershell": str(powershell_exe),
+        }
+
+    input_root = _ensure_dir(ARTIFACT_ROOT / "input")
+    nonce = f"{target_pid}_{time.time_ns()}"
+    actions_path = input_root / f"plan_{nonce}.json"
+    status_path = input_root / f"plan_{nonce}.status.txt"
+    actions_path.write_text(
+        json.dumps(normalized, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    helper_args = [
+        str(powershell_exe),
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(helper_script),
+        "-TargetPid",
+        str(target_pid),
+        "-ActionsPath",
+        str(actions_path),
+        "-StatusPath",
+        str(status_path),
+    ]
+    helper = _launch_process_on_desktop(
+        helper_args,
+        Path(__file__).resolve().parent,
+        os.environ.copy(),
+        desktop_name,
+    )
+    deadline = time.time() + max(2.0, float(timeout_sec))
+    while helper.get("ok") and time.time() < deadline:
+        if status_path.exists():
+            break
+        helper_pid = int(helper.get("pid", 0) or 0)
+        if helper_pid > 0 and not _pid_alive(helper_pid):
+            break
+        time.sleep(0.05)
+
+    status = ""
+    if status_path.exists():
+        try:
+            status = status_path.read_text(encoding="utf-8-sig", errors="replace").strip()
+        except Exception as exc:
+            status = f"ERROR:status read failed: {exc}"
+    ok = bool(helper.get("ok")) and status.startswith("OK:") and ";ok=True;" in status
+    return {
+        "ok": ok,
+        "pid": target_pid,
+        "hwnd": int(hwnd),
+        "desktop": desktop_name,
+        "clientWidth": client_width,
+        "clientHeight": client_height,
+        "actionCount": len(normalized),
+        "actionsPath": str(actions_path),
+        "statusPath": str(status_path),
+        "helper": helper,
+        "helperStatus": status,
+        "window": window,
+    }
+
+
 def _wait_for_window_ready(
     pid: int,
     timeout_sec: int = 30,
@@ -2149,7 +4214,7 @@ def _wait_for_window_ready(
     }
 
 
-def _find_main_window_hwnd(pid: int) -> int:
+def _enumerate_pid_windows(pid: int) -> List[int]:
     user32 = ctypes.windll.user32
     hwnds: List[int] = []
 
@@ -2160,18 +4225,59 @@ def _find_main_window_hwnd(pid: int) -> int:
         user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(proc_id))
         if proc_id.value == pid and user32.IsWindowVisible(ctypes.c_void_p(hwnd)):
             hwnds.append(hwnd)
-            return False
         return True
 
     enum_cb = WNDENUMPROC(_cb)
-    desktop_handle = int(STATE.desktop_handle or 0) if STATE.war3_pid == pid else 0
+    registered = SESSION_REGISTRY.get(pid=int(pid))
+    if registered is not None:
+        desktop_handle = int(registered.desktop_handle or 0)
+    else:
+        desktop_handle = int(STATE.desktop_handle or 0) if STATE.war3_pid == pid else 0
     if desktop_handle:
         user32.EnumDesktopWindows.argtypes = [wintypes.HANDLE, WNDENUMPROC, wintypes.LPARAM]
         user32.EnumDesktopWindows.restype = wintypes.BOOL
         user32.EnumDesktopWindows(wintypes.HANDLE(desktop_handle), enum_cb, 0)
     else:
         user32.EnumWindows(enum_cb, 0)
-    return hwnds[0] if hwnds else 0
+    return hwnds
+
+
+def _rank_window_candidate(info: Dict[str, Any]) -> int:
+    wr = dict(info.get("windowRect", {}) or {})
+    cr = dict(info.get("clientRect", {}) or {})
+    window_area = int(wr.get("width", 0) or 0) * int(wr.get("height", 0) or 0)
+    client_area = int(cr.get("width", 0) or 0) * int(cr.get("height", 0) or 0)
+    show_cmd = int(info.get("showCmd", 0) or 0)
+    score = max(window_area, client_area * 2)
+    if show_cmd == 2:  # SW_SHOWMINIMIZED
+        score -= 1_000_000_000
+    if str(info.get("title", "") or "").strip():
+        score += 10_000
+    return int(score)
+
+
+def _main_window_candidates(pid: int) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for hwnd in _enumerate_pid_windows(pid):
+        info = _query_window_info_by_hwnd(hwnd, pid=pid)
+        wr = dict(info.get("windowRect", {}) or {})
+        cr = dict(info.get("clientRect", {}) or {})
+        window_area = int(wr.get("width", 0) or 0) * int(wr.get("height", 0) or 0)
+        client_area = int(cr.get("width", 0) or 0) * int(cr.get("height", 0) or 0)
+        info["windowArea"] = int(window_area)
+        info["clientArea"] = int(client_area)
+        info["score"] = _rank_window_candidate(info)
+        rows.append(info)
+    rows.sort(key=lambda row: int(row.get("score", 0) or 0), reverse=True)
+    return rows
+
+
+def _find_main_window_hwnd(pid: int) -> int:
+    candidates = _main_window_candidates(pid)
+    for row in candidates:
+        if int(row.get("windowArea", 0) or 0) > 0 and int(row.get("clientArea", 0) or 0) > 0:
+            return int(row.get("hwnd", 0) or 0)
+    return int(candidates[0].get("hwnd", 0) or 0) if candidates else 0
 
 
 def _post_close(pid: int) -> bool:
@@ -2183,7 +4289,28 @@ def _post_close(pid: int) -> bool:
     return True
 
 
+def _uses_isolated_desktop(pid: int) -> bool:
+    """Return whether *pid* belongs to an AutoTest-owned non-input Desktop.
+
+    SessionRegistry is authoritative for batch sessions.  The legacy single-session
+    path still stores the same capability in STATE, so keep that as a conservative
+    fallback.  A false negative here could capture the developer's visible desktop.
+    """
+    registered = SESSION_REGISTRY.get(pid=int(pid))
+    if registered and int(registered.desktop_handle or 0):
+        return True
+    state = globals().get("STATE")
+    return bool(
+        state
+        and int(getattr(state, "war3_pid", 0) or 0) == int(pid)
+        and int(getattr(state, "desktop_handle", 0) or 0)
+    )
+
+
 def _powershell_capture_window(pid: int, output_png: Path) -> Dict[str, Any]:
+    hwnd = _find_main_window_hwnd(pid)
+    selected_window = _query_window_info_by_hwnd(hwnd, pid=pid) if hwnd else {"ok": False, "error": "hwnd=0"}
+    candidates = _main_window_candidates(pid)[:8]
     script = r'''
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
@@ -2209,13 +4336,29 @@ public class Win32Rect {
 [Win32Rect]::SetProcessDPIAware() | Out-Null
 $procId = [int]$env:WAR3_AUTOTEST_PID
 $out = $env:WAR3_AUTOTEST_OUT
+$hWnd = [IntPtr]::Zero
+if ($env:WAR3_AUTOTEST_HWND) {
+  $hWnd = [IntPtr]([Int64]$env:WAR3_AUTOTEST_HWND)
+}
 $proc = Get-Process -Id $procId -ErrorAction Stop
-$hWnd = $proc.MainWindowHandle
+if ($hWnd -eq [IntPtr]::Zero) {
+  $hWnd = $proc.MainWindowHandle
+}
 if ($hWnd -eq 0) { throw "MainWindowHandle=0" }
 $rect = New-Object Win32Rect+RECT
-[Win32Rect]::GetWindowRect($hWnd, [ref]$rect) | Out-Null
+$rectOk = [Win32Rect]::GetWindowRect($hWnd, [ref]$rect)
 $w = $rect.Right - $rect.Left
 $h = $rect.Bottom - $rect.Top
+if (-not $rectOk -or $w -le 0 -or $h -le 0) {
+  # powershell.exe 在非当前 Win32 Desktop 上偶尔无法再次读取窗口矩形，
+  # 即使父进程刚通过 EnumDesktopWindows/GetWindowRect 得到了有效值。
+  # 使用父进程已核验的尺寸仍可按 HWND 调用 PrintWindow，避免在真正的
+  # 地图加载错误对话框出现时先把游戏杀掉却没有留下任何画面证据。
+  $w = [int]$env:WAR3_AUTOTEST_WINDOW_W
+  $h = [int]$env:WAR3_AUTOTEST_WINDOW_H
+  $rect.Left = [int]$env:WAR3_AUTOTEST_WINDOW_LEFT
+  $rect.Top = [int]$env:WAR3_AUTOTEST_WINDOW_TOP
+}
 if ($w -le 0 -or $h -le 0) { throw "WindowRect invalid: ${w}x${h}" }
 $bmp = New-Object System.Drawing.Bitmap $w, $h
 $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -2230,7 +4373,12 @@ finally {
   if ($dc -ne [IntPtr]::Zero) { $g.ReleaseHdc($dc) }
 }
 if (-not $okPrint) {
-  # 回退：若 PrintWindow 不支持则退化为屏幕抓图。
+  # CopyFromScreen 只能抓当前输入桌面；目标在隔离 Win32 Desktop 时，
+  # 回退会悄悄截到开发者桌面并被误判为游戏画面。
+  if ($env:WAR3_AUTOTEST_ISOLATED_DESKTOP -eq "1") {
+    throw "PrintWindow failed on isolated desktop"
+  }
+  # 非隔离桌面才允许退化为屏幕抓图。
   $captureMode = "CopyFromScreen"
   $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
 }
@@ -2242,6 +4390,15 @@ Write-Output ("OK:" + $captureMode)
     env = os.environ.copy()
     env["WAR3_AUTOTEST_PID"] = str(pid)
     env["WAR3_AUTOTEST_OUT"] = str(output_png)
+    if hwnd:
+        env["WAR3_AUTOTEST_HWND"] = str(int(hwnd))
+    selected_rect = dict(selected_window.get("windowRect", {}) or {})
+    env["WAR3_AUTOTEST_WINDOW_W"] = str(int(selected_rect.get("width", 0) or 0))
+    env["WAR3_AUTOTEST_WINDOW_H"] = str(int(selected_rect.get("height", 0) or 0))
+    env["WAR3_AUTOTEST_WINDOW_LEFT"] = str(int(selected_rect.get("left", 0) or 0))
+    env["WAR3_AUTOTEST_WINDOW_TOP"] = str(int(selected_rect.get("top", 0) or 0))
+    isolated_desktop = _uses_isolated_desktop(pid)
+    env["WAR3_AUTOTEST_ISOLATED_DESKTOP"] = "1" if isolated_desktop else "0"
     proc = subprocess.run(
         ["powershell", "-NoProfile", "-Command", script],
         env=env,
@@ -2254,6 +4411,9 @@ Write-Output ("OK:" + $captureMode)
         "returncode": proc.returncode,
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
+        "hwnd": int(hwnd or 0),
+        "selectedWindow": selected_window,
+        "windowCandidates": candidates,
     }
 
 
@@ -2296,132 +4456,73 @@ def _request_internal_frame_capture(
     war3_dir: Path,
     timeout_sec: float = 8.0,
 ) -> Dict[str, Any]:
-    temp_dir = _ensure_dir(war3_dir / "WarVK" / "Temp")
-    request_path = _frame_capture_request_file(war3_dir)
-    result_path = _frame_capture_result_file(war3_dir)
     final_out = output_path.resolve()
     raw_bmp = final_out if final_out.suffix.lower() == ".bmp" else final_out.with_suffix(".bmp")
-    request_id = f"{_now_compact()}_{pid}_{int(time.time() * 1000)}"
-
-    for stale in (request_path, result_path):
-        try:
-            if stale.exists():
-                stale.unlink()
-        except Exception:
-            pass
-
-    for stale in (raw_bmp, final_out):
-        try:
-            if stale.exists():
-                stale.unlink()
-        except Exception:
-            pass
-
-    _ensure_dir(final_out.parent)
-    _ensure_dir(raw_bmp.parent)
-    payload = {
-        "requestId": request_id,
-        "outputPath": str(raw_bmp),
-        "capture": "final-backbuffer",
-        "format": "bmp",
-        "issuedAt": _now_str(),
-        "pid": int(pid),
-    }
-
-    try:
-        request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        return {
-            "ok": False,
-            "mode": "internal-final-frame",
-            "error": f"写入内部截图请求失败: {e}",
-            "requestId": request_id,
-            "requestPath": str(request_path),
-            "resultPath": str(result_path),
-        }
-
-    t0 = time.time()
-    last_result: Optional[Dict[str, Any]] = None
-    timeout_sec = max(1.0, float(timeout_sec))
-    while time.time() - t0 < timeout_sec:
-        current = _read_json_file(result_path)
-        if isinstance(current, dict) and current.get("requestId") == request_id:
-            last_result = current
-            break
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.1)
-
-    try:
-        if request_path.exists():
-            request_path.unlink()
-    except Exception:
-        pass
-
-    if not isinstance(last_result, dict):
-        return {
-            "ok": False,
-            "mode": "internal-final-frame",
-            "error": "等待内部截图结果超时",
-            "requestId": request_id,
-            "requestPath": str(request_path),
-            "resultPath": str(result_path),
-            "elapsedSec": round(time.time() - t0, 3),
-        }
-
-    raw_output = Path(str(last_result.get("outputPath", raw_bmp)))
-    if (not bool(last_result.get("ok"))) or (not raw_output.exists()):
-        return {
-            "ok": False,
-            "mode": "internal-final-frame",
-            "error": str(last_result.get("error", "内部截图失败")),
-            "requestId": request_id,
-            "requestPath": str(request_path),
-            "resultPath": str(result_path),
-            "details": last_result,
-            "elapsedSec": round(time.time() - t0, 3),
-        }
-
-    convert: Dict[str, Any] = {
-        "returncode": 0,
-        "stdout": "",
-        "stderr": "",
-        "skipped": True,
-    }
-    delivered_output = raw_output
-    if final_out.suffix.lower() == ".png":
-        convert = _powershell_convert_bitmap_to_png(raw_output, final_out)
-        if convert.get("returncode", 1) != 0 or (not final_out.exists()):
+    pipe_res = _control_plane_request(
+        pid=pid,
+        command="capture_final_frame",
+        payload={
+            "outputPath": str(raw_bmp),
+            "timeoutMs": max(1000, int(float(timeout_sec) * 1000.0)),
+        },
+        timeout_sec=max(2.0, float(timeout_sec) + 1.0),
+    )
+    if pipe_res.get("transportOk"):
+        if not pipe_res.get("ok"):
             return {
                 "ok": False,
-                "mode": "internal-final-frame",
-                "error": f"内部截图 PNG 转换失败: {convert.get('stderr') or convert.get('stdout') or 'unknown'}",
-                "requestId": request_id,
-                "requestPath": str(request_path),
-                "resultPath": str(result_path),
-                "details": last_result,
-                "convert": convert,
-                "rawOutput": str(raw_output),
-                "elapsedSec": round(time.time() - t0, 3),
+                "mode": "control-plane-capture",
+                "error": str(pipe_res.get("error", "control plane capture 失败")),
+                "detail": pipe_res,
             }
-        delivered_output = final_out
-        try:
-            raw_output.unlink()
-        except Exception:
-            pass
 
+        raw_output = Path(str((pipe_res.get("result", {}) or {}).get("outputPath", raw_bmp)))
+        if not raw_output.exists():
+            return {
+                "ok": False,
+                "mode": "control-plane-capture",
+                "error": "control plane capture 未产出文件",
+                "detail": pipe_res,
+            }
+
+        convert: Dict[str, Any] = {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "skipped": True,
+        }
+        delivered_output = raw_output
+        if final_out.suffix.lower() == ".png":
+            convert = _powershell_convert_bitmap_to_png(raw_output, final_out)
+            if convert.get("returncode", 1) != 0 or (not final_out.exists()):
+                return {
+                    "ok": False,
+                    "mode": "control-plane-capture",
+                    "error": f"control plane PNG 转换失败: {convert.get('stderr') or convert.get('stdout') or 'unknown'}",
+                    "detail": pipe_res,
+                    "convert": convert,
+                    "rawOutput": str(raw_output),
+                }
+            delivered_output = final_out
+            try:
+                raw_output.unlink()
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "mode": "control-plane-capture",
+            "output": str(delivered_output),
+            "rawOutput": str(raw_output),
+            "details": pipe_res,
+            "convert": convert,
+            "elapsedSec": round(float(pipe_res.get("elapsedSec", 0.0) or 0.0), 3),
+        }
     return {
-        "ok": True,
-        "mode": "internal-final-frame",
-        "requestId": request_id,
-        "pid": int(pid),
-        "output": str(delivered_output),
-        "rawOutput": str(raw_output),
-        "requestPath": str(request_path),
-        "resultPath": str(result_path),
-        "details": last_result,
-        "convert": convert,
-        "elapsedSec": round(time.time() - t0, 3),
+        "ok": False,
+        "mode": "control-plane-capture-unavailable",
+        "error": str(pipe_res.get("error", "control plane capture 不可用") or "control plane capture 不可用"),
+        "detail": pipe_res,
     }
 
 
@@ -2459,7 +4560,15 @@ def _powershell_resize_window_client(pid: int, client_w: int, client_h: int, x: 
 @dataclass
 class RuntimeState:
     war3_proc: Optional[subprocess.Popen] = None
+    retained_native_process: Optional[RetainedNativeProcessWitness] = None
     war3_pid: Optional[int] = None
+    launcher_pid: Optional[int] = None
+    launcher_created_at_ms: int = 0
+    launcher_mode: str = YDWE_LAUNCHER_MODE_DIRECT
+    launcher_exe: str = ""
+    ydwe_lock_handle: int = 0
+    ydwe_lock_name: str = ""
+    ydwe_lock_root: str = ""
     war3_dir: Path = DEFAULT_WAR3_DIR
     test_map_path: Path = DEFAULT_TEST_MAP
     desktop_name: str = ""
@@ -2518,7 +4627,42 @@ class RuntimeState:
 
 
 STATE = RuntimeState()
+SESSION_REGISTRY = SessionRegistry()
 mcp = FastMCP("war3-autotest")
+
+
+def _replace_state_retained_native_process(
+    witness: Optional[RetainedNativeProcessWitness],
+) -> Dict[str, Any]:
+    previous = STATE.retained_native_process
+    previous_close = (
+        previous.close()
+        if previous is not None
+        else {
+            "ok": True,
+            "closed": True,
+            "skipped": True,
+            "reason": "no previous retained native process",
+        }
+    )
+    # Publish only after the previous owned handle has been invalidated and
+    # closed. A lifecycle relaunch can therefore never overwrite/leak the
+    # first session's native handle.
+    STATE.retained_native_process = witness
+    return previous_close
+
+
+def _require_multi_instance_sandbox(path: Path) -> Path:
+    """新多实例 API 只允许使用专用 AutoTest 沙盒。"""
+    candidate = Path(path).resolve(strict=False)
+    allowed = DEFAULT_SANDBOX_ROOT.resolve(strict=False)
+    if os.path.normcase(str(candidate)) != os.path.normcase(str(allowed)):
+        raise ValueError(f"多实例只允许使用专用沙盒 {allowed}，拒绝路径: {candidate}")
+    return candidate
+
+
+def _session_by_selector(session_id: str = "", pid: int = 0) -> Optional[AutoTestSession]:
+    return SESSION_REGISTRY.get(session_id=str(session_id or ""), pid=int(pid or 0))
 
 
 def _restore_video_config_if_needed(target_pid: int) -> Dict[str, Any]:
@@ -2555,23 +4699,222 @@ def _close_state_desktop_if_needed(target_pid: int) -> Dict[str, Any]:
     }
 
 
+def _stop_tracked_launcher_if_needed(target_pid: int) -> Dict[str, Any]:
+    if target_pid <= 0 or STATE.war3_pid != target_pid:
+        return {"ok": True, "skipped": True, "reason": "pid 不匹配当前 AutoTest 会话"}
+    launcher_pid = int(STATE.launcher_pid or 0)
+    if launcher_pid <= 0 or launcher_pid == int(target_pid):
+        return {"ok": True, "skipped": True, "reason": "没有独立 launcher 进程"}
+    if not _pid_alive(launcher_pid):
+        return {"ok": True, "stopped": True, "pid": launcher_pid, "reason": "launcher 已退出"}
+    expected_created = int(STATE.launcher_created_at_ms or 0)
+    if expected_created <= 0:
+        return {
+            "ok": False,
+            "skipped": True,
+            "pid": launcher_pid,
+            "reason": "缺少 launcher 创建时间身份，拒绝结束潜在复用 PID",
+        }
+    actual_created = _get_process_creation_epoch_ms(launcher_pid)
+    if actual_created <= 0 or abs(expected_created - actual_created) > 2_000:
+        return {
+            "ok": False,
+            "skipped": True,
+            "pid": launcher_pid,
+            "reason": "launcher PID 已被复用，拒绝结束",
+        }
+    _taskkill(launcher_pid, force=True)
+    time.sleep(0.2)
+    alive = _pid_alive(launcher_pid)
+    return {"ok": not alive, "stopped": not alive, "pid": launcher_pid}
+
+
 def _clear_war3_launch_state(target_pid: int) -> None:
     if target_pid > 0 and STATE.war3_pid == target_pid:
+        if int(STATE.ydwe_lock_handle or 0) != 0:
+            _release_ydwe_root_lock(
+                {
+                    "handle": int(STATE.ydwe_lock_handle),
+                    "name": str(STATE.ydwe_lock_name),
+                    "ydweRoot": str(STATE.ydwe_lock_root),
+                }
+            )
+        _replace_state_retained_native_process(None)
         STATE.war3_proc = None
         STATE.war3_pid = None
+        STATE.launcher_pid = None
+        STATE.launcher_created_at_ms = 0
+        STATE.launcher_mode = YDWE_LAUNCHER_MODE_DIRECT
+        STATE.launcher_exe = ""
+        STATE.ydwe_lock_handle = 0
+        STATE.ydwe_lock_name = ""
+        STATE.ydwe_lock_root = ""
         STATE.desktop_name = ""
         STATE.desktop_handle = 0
         STATE.desktop_mode = "default"
         STATE.launch_epoch_ms = 0
 
 
+def _finalize_state_after_exact_native_termination(
+    pid: int,
+    creation_epoch_ms: int,
+    canonical_exe_path: str,
+) -> Dict[str, Any]:
+    """Release session state after HANDLE-authorized death, without PID IO."""
+    native_process = STATE.retained_native_process
+    expected_path = _canonical_process_path(canonical_exe_path)
+    state_exact = bool(
+        native_process is not None
+        and STATE.war3_pid == int(pid)
+        and STATE.launcher_pid == int(pid)
+        and STATE.launcher_created_at_ms == int(creation_epoch_ms)
+        and STATE.launcher_mode == YDWE_LAUNCHER_MODE_DIRECT
+        and _canonical_process_path(STATE.launcher_exe) == expected_path
+    )
+    termination = (
+        native_process.termination_exact(
+            int(pid), int(creation_epoch_ms), expected_path,
+        )
+        if state_exact else {
+            "exact": False,
+            "bindingExact": False,
+            "handleSignaled": False,
+            "reportOnly": True,
+            "failureClassificationAuthority": 0,
+        }
+    )
+    if termination.get("exact") is not True:
+        return {
+            "ok": False,
+            "finalized": False,
+            "stateExact": state_exact,
+            "terminationProof": termination,
+            "error": (
+                "STATE native process identity/termination is not exact"
+            ),
+        }
+    # No process-name/PID liveness query and no taskkill occurs below. Video
+    # registry and isolated desktop ownership belong to this exact STATE.
+    restore = _restore_video_config_if_needed(int(pid))
+    desktop = _close_state_desktop_if_needed(int(pid))
+    _clear_war3_launch_state(int(pid))
+    return {
+        "ok": bool(restore.get("ok") and desktop.get("ok")),
+        "finalized": True,
+        "stateExact": True,
+        "terminationProof": termination,
+        "videoRestore": restore,
+        "desktop": desktop,
+        "pidTerminationCommandIssued": False,
+    }
+
+
+def _stop_retained_state_process_exact(target_pid: int) -> Dict[str, Any]:
+    """Stop the current direct-launch War3 through its retained HANDLE only.
+
+    ``handled`` means callers must not fall back to PID/name based termination:
+    either the exact instance was stopped, or an identity mismatch made any
+    mutation unsafe. Legacy sessions without a retained witness remain
+    eligible for the older foreground stop path. Background callers must
+    still fail closed when this helper reports ``handled=False``.
+    """
+    if target_pid <= 0 or STATE.war3_pid != int(target_pid):
+        return {"handled": False, "reason": "target is not current STATE pid"}
+    witness = STATE.retained_native_process
+    if witness is None:
+        return {"handled": False, "reason": "no retained native witness"}
+    try:
+        snapshot = dict(witness.snapshot() or {})
+    except Exception as exc:
+        return {
+            "handled": True,
+            "ok": False,
+            "stopped": False,
+            "pid": int(target_pid),
+            "error": f"native witness snapshot failed: {type(exc).__name__}: {exc}",
+            "pidTerminationCommandIssued": False,
+        }
+    binding_shape = bool(
+        snapshot.get("available") is True
+        and int(snapshot.get("pid", 0) or 0) == int(target_pid)
+        and int(snapshot.get("creationEpochMs", 0) or 0) > 0
+        and str(snapshot.get("canonicalExePath", "") or "")
+    )
+    if not binding_shape:
+        return {
+            "handled": True,
+            "ok": False,
+            "stopped": False,
+            "pid": int(target_pid),
+            "error": "retained native witness identity is incomplete/mismatched",
+            "nativeProcessWitness": snapshot,
+            "pidTerminationCommandIssued": False,
+        }
+    try:
+        termination = witness.terminate_exact(
+            int(target_pid),
+            int(snapshot["creationEpochMs"]),
+            str(snapshot["canonicalExePath"]),
+            wait_timeout_sec=10.0,
+        )
+    except Exception as exc:
+        return {
+            "handled": True,
+            "ok": False,
+            "stopped": False,
+            "pid": int(target_pid),
+            "error": (
+                "exact retained-HANDLE termination raised: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "nativeProcessWitness": snapshot,
+            "pidTerminationCommandIssued": False,
+        }
+    if termination.get("exact") is not True:
+        return {
+            "handled": True,
+            "ok": False,
+            "stopped": False,
+            "pid": int(target_pid),
+            "error": "exact retained-HANDLE termination did not close",
+            "nativeTermination": termination,
+            "pidTerminationCommandIssued": False,
+        }
+    finalized = _finalize_state_after_exact_native_termination(
+        int(target_pid),
+        int(snapshot["creationEpochMs"]),
+        str(snapshot["canonicalExePath"]),
+    )
+    # Process death is already proven by the retained HANDLE. A later video
+    # registry/desktop cleanup error must not trigger a second PID-based stop.
+    stopped = finalized.get("finalized") is True
+    return {
+        "handled": True,
+        "ok": bool(stopped and finalized.get("ok") is True),
+        "stopped": stopped,
+        "pid": int(target_pid),
+        "closeSent": False,
+        "forced": True,
+        "silentStop": True,
+        "avoidForegroundSwitch": True,
+        "exactNativeHandleStop": True,
+        "nativeTermination": termination,
+        "stateFinalize": finalized,
+        "videoRestore": finalized.get("videoRestore"),
+        "desktop": finalized.get("desktop"),
+        "pidTerminationCommandIssued": False,
+    }
+
+
 def _start_debug_monitor(pid_filter: Optional[int]) -> Dict[str, Any]:
     with STATE.debug_lock:
         if STATE.debug_thread and STATE.debug_thread.is_alive():
-            STATE.debug_pid_filter = pid_filter
-            return {"ok": True, "message": "debug monitor already running", "pidFilter": pid_filter}
+            # DBWIN 是系统级单例缓冲，多实例必须由一个监听器接收后按 PID 分流。
+            # 保留参数仅兼容旧调用方，不再把监听器收窄到单 PID。
+            STATE.debug_pid_filter = None
+            return {"ok": True, "message": "debug monitor already running", "pidFilter": None}
         STATE.debug_stop.clear()
-        STATE.debug_pid_filter = pid_filter
+        STATE.debug_pid_filter = None
 
     def _worker() -> None:
         listener = DbWinListener()
@@ -2589,17 +4932,18 @@ def _start_debug_monitor(pid_filter: Optional[int]) -> Dict[str, Any]:
                 continue
             if pid is None or not msg:
                 continue
-            pid_filter_now = STATE.debug_pid_filter
-            if pid_filter_now and pid != pid_filter_now:
-                continue
             if "DXVK" in msg or "War3" in msg or "JASS" in msg:
-                STATE.push_event(pid, msg)
+                SESSION_REGISTRY.route_event(pid, msg)
+                # 单实例旧 API 仍从 STATE 读取；只接收其当前 PID，避免串线。
+                legacy_pid = int(STATE.war3_pid or 0)
+                if legacy_pid == 0 or pid == legacy_pid:
+                    STATE.push_event(pid, msg)
         listener.close()
 
     t = threading.Thread(target=_worker, name="war3-dbwin-monitor", daemon=True)
     STATE.debug_thread = t
     t.start()
-    return {"ok": True, "message": "debug monitor started", "pidFilter": pid_filter}
+    return {"ok": True, "message": "debug monitor started", "pidFilter": None}
 
 
 def _stop_debug_monitor() -> None:
@@ -2643,6 +4987,13 @@ def _compute_perf_aggregate(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "avgGpuTimeMs": _avg("avgGpuTimeMs"),
             "avgTrackedActiveCpuMs": _avg("avgTrackedActiveCpuMs"),
             "avgUntrackedActiveCpuMs": _avg("avgUntrackedActiveCpuMs"),
+            "avgTrackedAdditiveRootWallMs": _avg(
+                "avgTrackedAdditiveRootWallMs"
+            ),
+            "avgUncoveredFrameWallMs": _avg("avgUncoveredFrameWallMs"),
+            "frameWallScopeCoveragePct": _avg(
+                "frameWallScopeCoveragePct"
+            ),
             "cpuCoveragePct": _avg("cpuCoveragePct"),
             "cpuCoverageWithIdlePct": _avg("cpuCoverageWithIdlePct"),
             "totalJank16": int(sum(int(r.get("jank16", 0)) for r in ok_rows)),
@@ -2655,14 +5006,40 @@ def _compute_perf_aggregate(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _prepare_test_map_copy(war3_dir: Path, map_path: Path, target_rel: Path) -> Path:
     target_abs = war3_dir / target_rel
     _ensure_dir(target_abs.parent)
+    # 若源图和目标图是同一文件，直接复用，避免无意义覆盖。
+    if map_path.resolve() == target_abs.resolve():
+        return target_abs
+
+    source_sha = sha256_file(map_path)
+    if target_abs.is_file() and sha256_file(target_abs) == source_sha:
+        return target_abs
+
+    temporary = target_abs.with_name(
+        f".{target_abs.name}.{os.getpid()}.{time.time_ns()}.partial"
+    )
     try:
-        # 若源图和目标图是同一文件，直接复用，避免无意义覆盖。
-        if map_path.resolve() != target_abs.resolve():
-            shutil.copy2(map_path, target_abs)
-    except PermissionError:
-        # 目标图被占用时兜底复用现有短路径地图，避免自动测试链路整体失败。
-        if not target_abs.exists():
-            raise
+        # 源图可能带只读属性（编辑器归档和备份常见）。测试短路径是
+        # AutoTest 自己管理的部署目标，不能把该属性传播过去，否则下一轮
+        # os.replace 会在 Windows 上永久失败并诱发旧图误测。
+        shutil.copyfile(map_path, temporary)
+        os.chmod(temporary, 0o666)
+        if sha256_file(temporary) != source_sha:
+            raise RuntimeError("测试地图临时副本 SHA-256 与源图不一致")
+        if target_abs.exists():
+            os.chmod(target_abs, 0o666)
+        os.replace(temporary, target_abs)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    target_sha = sha256_file(target_abs)
+    if target_sha != source_sha:
+        raise RuntimeError(
+            "测试地图部署后 SHA-256 不一致: "
+            f"source={source_sha}, target={target_sha}, path={target_abs}"
+        )
     return target_abs
 
 
@@ -2678,6 +5055,8 @@ def _prefer_inplace_relative_loadfile_arg(war3_dir: Path, map_path: Path) -> str
 
 
 def _deploy_d3d9(build_dll: Path, war3_dir: Path) -> Dict[str, Any]:
+    if not build_dll.is_absolute():
+        build_dll = (REPO_ROOT / build_dll).resolve()
     dst = war3_dir / "d3d9.dll"
     if not build_dll.exists():
         return {"ok": False, "error": f"构建产物不存在: {build_dll}"}
@@ -2691,6 +5070,28 @@ def _deploy_d3d9(build_dll: Path, war3_dir: Path) -> Dict[str, Any]:
             "size": dst.stat().st_size,
             "mtime": datetime.fromtimestamp(dst.stat().st_mtime).isoformat(),
         }
+        # A controlled run may leave the exact deployed image mapped briefly
+        # after the process witness has closed.  Re-copying identical bytes is
+        # unnecessary and can fail with ERROR_SHARING_VIOLATION, so prove
+        # equality before attempting a mutating deploy.
+        try:
+            source_sha = sha256_file(build_dll)
+            target_sha = sha256_file(dst)
+            if source_sha == target_sha:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "target already matches build SHA-256",
+                    "source": str(build_dll),
+                    "target": str(dst),
+                    "sha256": source_sha,
+                    "old": old_info,
+                    "new": old_info,
+                }
+        except (OSError, PermissionError):
+            # Fall through to the existing bounded copy retry.  This keeps the
+            # deploy contract unchanged when the target cannot even be read.
+            pass
     # 某些时刻（进程刚退出/杀软扫描）会短暂占用目标文件，做短重试避免整条链路失败。
     copy_error: Optional[str] = None
     for i in range(8):
@@ -2724,23 +5125,556 @@ def _deploy_d3d9(build_dll: Path, war3_dir: Path) -> Dict[str, Any]:
     }
 
 
+def _preflight_instance_pool_impl(
+    sandbox_root: Path,
+    artifact_root: Path,
+    map_path: Optional[Path],
+    instance_count: int,
+    run_id: str = "",
+    session_prefix: str = "client",
+) -> Dict[str, Any]:
+    try:
+        sandbox = _require_multi_instance_sandbox(sandbox_root)
+    except ValueError as exc:
+        return {"ok": False, "errors": [str(exc)], "warnings": []}
+    result = _preflight_session_pool(
+        sandbox_root=sandbox,
+        artifact_root=artifact_root,
+        map_path=map_path,
+        instance_count=instance_count,
+        run_id=run_id,
+        session_prefix=session_prefix,
+    )
+    result["sandboxPolicy"] = "exact-path-only"
+    result["allowedSandboxRoot"] = str(DEFAULT_SANDBOX_ROOT.resolve(strict=False))
+    result["legacyExplicitPathsStillSupported"] = True
+    return result
+
+
+def _mark_session_failed(session: AutoTestSession, reason: str) -> None:
+    session.stop_reason = str(reason)
+    try:
+        SESSION_REGISTRY.mark_stopped(session.session_id, reason, state="failed")
+    except KeyError:
+        pass
+    try:
+        _write_session_manifest(session)
+    except Exception:
+        pass
+
+
+def _launch_war3_instance_impl(
+    sandbox_root: Path,
+    map_path: Path,
+    artifact_root: Path,
+    run_id: str,
+    session_id: str,
+    windowed: bool,
+    use_isolated_desktop: bool,
+    desktop_name: str,
+    opengl: bool,
+    deploy_d3d9_before_launch: bool,
+    build_d3d9_path: str,
+    profile: str,
+    disable_modules: str,
+    env_overrides_json: str,
+    extra_args: str,
+    reuse_existing_root: bool,
+) -> Dict[str, Any]:
+    try:
+        sandbox = _require_multi_instance_sandbox(sandbox_root)
+        run = normalize_identifier(run_id, "run")
+        session_key = normalize_identifier(session_id, "session")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    source_map = Path(map_path).resolve(strict=False)
+    check = _preflight_instance_pool_impl(
+        sandbox_root=sandbox,
+        artifact_root=artifact_root,
+        map_path=source_map,
+        instance_count=1,
+        run_id=run,
+        session_prefix="preflight",
+    )
+    if not check.get("ok"):
+        return {"ok": False, "error": "多实例预检失败", "preflight": check}
+    if SESSION_REGISTRY.get(session_id=session_key) is not None:
+        return {"ok": False, "error": f"session_id 已存在: {session_key}"}
+
+    layout = build_instance_layout(sandbox, artifact_root, run, session_key)
+    session = AutoTestSession(
+        session_id=session_key,
+        run_id=run,
+        sandbox_root=sandbox,
+        instance_root=layout.instance_root,
+        artifact_dir=layout.artifact_dir,
+        desktop_name=str(desktop_name or layout.desktop_name),
+        desktop_mode="isolated" if use_isolated_desktop else "default",
+        map_source=source_map,
+    )
+    try:
+        SESSION_REGISTRY.reserve(session)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    materialized = materialize_instance_root(layout, reuse_existing=bool(reuse_existing_root))
+    if not materialized.get("ok"):
+        _mark_session_failed(session, str(materialized.get("error", "实例部署失败")))
+        return {"ok": False, "error": materialized.get("error"), "sessionId": session_key, "materialize": materialized}
+
+    try:
+        deployed_map = deploy_content_addressed_map(layout.instance_root, source_map)
+    except Exception as exc:
+        _mark_session_failed(session, f"地图部署失败: {exc}")
+        return {"ok": False, "error": f"地图部署失败: {exc}", "sessionId": session_key}
+    session.map_path = Path(deployed_map["target"])
+    session.map_sha256 = str(deployed_map["sha256"])
+
+    deploy: Dict[str, Any] = {"ok": True, "skipped": True}
+    if deploy_d3d9_before_launch:
+        deploy = _deploy_d3d9(Path(build_d3d9_path), layout.instance_root)
+        if not deploy.get("ok"):
+            _mark_session_failed(session, str(deploy.get("error", "d3d9.dll 部署失败")))
+            return {"ok": False, "error": deploy.get("error"), "sessionId": session_key, "deploy": deploy}
+    d3d9_path = layout.instance_root / "d3d9.dll"
+    if d3d9_path.is_file():
+        session.dll_sha256 = sha256_file(d3d9_path)
+
+    effective_windowed = bool(windowed or use_isolated_desktop)
+    forced_windowed = bool(use_isolated_desktop and not windowed)
+    desktop: Dict[str, Any] = {"ok": True, "skipped": True, "reason": "use_isolated_desktop=False"}
+    if use_isolated_desktop:
+        desktop = _create_isolated_desktop(session.desktop_name)
+        if not desktop.get("ok"):
+            _mark_session_failed(session, str(desktop.get("error", "隔离桌面创建失败")))
+            return {"ok": False, "error": desktop.get("error"), "sessionId": session_key, "desktop": desktop}
+        session.desktop_name = str(desktop.get("name", session.desktop_name))
+        session.desktop_handle = int(desktop.get("handle", 0) or 0)
+
+    war3_exe = layout.instance_root / "war3.exe"
+    args = [str(war3_exe)]
+    if effective_windowed:
+        args.append("-window")
+    if opengl:
+        args.append("-opengl")
+    args.extend(["-loadfile", str(deployed_map["loadfileArg"])])
+    if str(extra_args or "").strip():
+        args.extend(str(extra_args).strip().split())
+
+    temp_dir = layout.instance_root / "WarVK" / "Temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "DXVK_WAR3_AUTOTEST_RUN_ID": run,
+            "DXVK_WAR3_AUTOTEST_SESSION_ID": session_key,
+            "DXVK_WAR3_AUTOTEST_ARTIFACT_DIR": str(layout.artifact_dir),
+            "DXVK_LOG_PATH": str(layout.artifact_dir),
+            "TEMP": str(temp_dir),
+            "TMP": str(temp_dir),
+        }
+    )
+    if str(profile or "").strip():
+        env["DXVK_WAR3_PROFILE"] = str(profile).strip()
+    if str(disable_modules or "").strip():
+        env["DXVK_WAR3_DISABLE"] = str(disable_modules).strip()
+    extra_env = _parse_env_overrides_json(env_overrides_json)
+    parse_error = extra_env.pop("__parse_error__", "")
+    if parse_error:
+        if session.desktop_handle:
+            _close_desktop_handle(session.desktop_handle)
+            session.desktop_handle = 0
+        _mark_session_failed(session, f"env_overrides_json 解析失败: {parse_error}")
+        return {"ok": False, "error": f"env_overrides_json 解析失败: {parse_error}", "sessionId": session_key}
+    # AutoTest 默认禁用已由 IDA 证实的 WM_ACTIVATEAPP 后台 idle Sleep。
+    # env_overrides_json 传入 0/false/no 时保留原生节流，作为显式 A/B 对照。
+    extra_env.setdefault(AUTOTEST_BACKGROUND_THROTTLE_ENV, "1")
+    # 旧的 GamePause 防护改为 AutoTest 子进程专用，避免普通游戏被编译期开关影响。
+    extra_env.setdefault(AUTOTEST_GAME_PAUSE_ENV, "1")
+    env.update(extra_env)
+
+    _start_debug_monitor(None)
+    launch_result: Dict[str, Any]
+    proc: Optional[subprocess.Popen] = None
+    if use_isolated_desktop:
+        launch_result = _launch_process_on_desktop(args, layout.instance_root, env, session.desktop_name)
+        if launch_result.get("ok"):
+            pid = int(launch_result["pid"])
+        else:
+            pid = 0
+    else:
+        try:
+            proc = subprocess.Popen(
+                args,
+                cwd=str(layout.instance_root),
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            pid = int(proc.pid)
+            launch_result = {"ok": True, "pid": pid}
+        except Exception as exc:
+            pid = 0
+            launch_result = {"ok": False, "error": str(exc)}
+    if not launch_result.get("ok") or pid <= 0:
+        if session.desktop_handle:
+            _close_desktop_handle(session.desktop_handle)
+            session.desktop_handle = 0
+        _mark_session_failed(session, str(launch_result.get("error", "进程启动失败")))
+        return {"ok": False, "error": launch_result.get("error", "进程启动失败"), "sessionId": session_key}
+
+    SESSION_REGISTRY.attach_pid(session_key, pid, process=proc)
+    session.process_created_at_ms = _get_process_creation_epoch_ms(pid) or int(time.time() * 1000)
+    job = _create_kill_on_close_job(pid, session_key)
+    if not job.get("ok"):
+        _taskkill(pid, force=True)
+        if session.desktop_handle:
+            _close_desktop_handle(session.desktop_handle)
+            session.desktop_handle = 0
+        _mark_session_failed(session, str(job.get("error", "Job Object 创建失败")))
+        return {"ok": False, "error": job.get("error"), "sessionId": session_key, "pid": pid, "job": job}
+    session.job_handle = int(job["handle"])
+    priority = _set_process_priority_high(pid)
+    manifest = _write_session_manifest(session)
+    return {
+        "ok": True,
+        "runId": run,
+        "sessionId": session_key,
+        "pid": pid,
+        "args": args,
+        "instanceRoot": str(layout.instance_root),
+        "artifactDir": str(layout.artifact_dir),
+        "map": deployed_map,
+        "mapSha256": session.map_sha256,
+        "dllSha256": session.dll_sha256,
+        "windowed": effective_windowed,
+        "forcedWindowedBecauseIsolatedDesktop": forced_windowed,
+        "desktop": desktop,
+        "job": job,
+        "manifest": manifest,
+        "priority": priority,
+        "materialize": materialized,
+        "deploy": deploy,
+        "envOverrides": extra_env,
+        "time": _now_str(),
+    }
+
+
+@mcp.tool()
+def preflight_instance_pool(
+    sandbox_root: str = str(DEFAULT_SANDBOX_ROOT),
+    map_path: str = str(DEFAULT_TEST_MAP),
+    instance_count: int = 2,
+    run_id: str = "",
+    session_prefix: str = "client",
+    artifact_root: str = str(ARTIFACT_ROOT),
+) -> Dict[str, Any]:
+    """只读检查 1-6 个实例的沙盒、地图、空间和隔离路径，不创建任何文件。"""
+    return _preflight_instance_pool_impl(
+        sandbox_root=Path(sandbox_root),
+        artifact_root=Path(artifact_root),
+        map_path=Path(map_path) if map_path else None,
+        instance_count=instance_count,
+        run_id=run_id,
+        session_prefix=session_prefix,
+    )
+
+
+@mcp.tool()
+def launch_war3_instance(
+    sandbox_root: str = str(DEFAULT_SANDBOX_ROOT),
+    map_path: str = str(DEFAULT_TEST_MAP),
+    run_id: str = "",
+    session_id: str = "",
+    artifact_root: str = str(ARTIFACT_ROOT),
+    windowed: bool = True,
+    use_isolated_desktop: bool = True,
+    desktop_name: str = "",
+    opengl: bool = False,
+    deploy_d3d9_before_launch: bool = True,
+    build_d3d9_path: str = "build32/src/d3d9/d3d9.dll",
+    profile: str = "",
+    disable_modules: str = "",
+    env_overrides_json: str = "",
+    extra_args: str = "",
+    reuse_existing_root: bool = False,
+) -> Dict[str, Any]:
+    """在专用根目录、Desktop、Job Object 和工件目录中启动一个 War3 会话。"""
+    return _launch_war3_instance_impl(
+        sandbox_root=Path(sandbox_root),
+        map_path=Path(map_path),
+        artifact_root=Path(artifact_root),
+        run_id=run_id,
+        session_id=session_id,
+        windowed=windowed,
+        use_isolated_desktop=use_isolated_desktop,
+        desktop_name=desktop_name,
+        opengl=opengl,
+        deploy_d3d9_before_launch=deploy_d3d9_before_launch,
+        build_d3d9_path=build_d3d9_path,
+        profile=profile,
+        disable_modules=disable_modules,
+        env_overrides_json=env_overrides_json,
+        extra_args=extra_args,
+        reuse_existing_root=reuse_existing_root,
+    )
+
+
+@mcp.tool()
+def launch_war3_batch(
+    sandbox_root: str = str(DEFAULT_SANDBOX_ROOT),
+    map_path: str = str(DEFAULT_TEST_MAP),
+    instance_count: int = 2,
+    run_id: str = "",
+    session_prefix: str = "client",
+    artifact_root: str = str(ARTIFACT_ROOT),
+    windowed: bool = True,
+    use_isolated_desktop: bool = True,
+    deploy_d3d9_before_launch: bool = True,
+    build_d3d9_path: str = "build32/src/d3d9/d3d9.dll",
+    profile: str = "",
+    disable_modules: str = "",
+    env_overrides_json: str = "",
+    extra_args: str = "",
+) -> Dict[str, Any]:
+    """启动相互隔离的 -loadfile 会话；用于进程隔离测试，不计作局域网联机验收。"""
+    try:
+        run = normalize_identifier(run_id, "run")
+        prefix = normalize_identifier(session_prefix, "session_prefix")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    check = _preflight_instance_pool_impl(
+        Path(sandbox_root),
+        Path(artifact_root),
+        Path(map_path),
+        instance_count,
+        run,
+        prefix,
+    )
+    if not check.get("ok"):
+        return {"ok": False, "error": "多实例预检失败", "preflight": check}
+
+    launched: List[Dict[str, Any]] = []
+    for index in range(1, int(instance_count) + 1):
+        session_key = f"{prefix}-{index:02d}"
+        result = _launch_war3_instance_impl(
+            sandbox_root=Path(sandbox_root),
+            map_path=Path(map_path),
+            artifact_root=Path(artifact_root),
+            run_id=run,
+            session_id=session_key,
+            windowed=windowed,
+            use_isolated_desktop=use_isolated_desktop,
+            desktop_name="",
+            opengl=False,
+            deploy_d3d9_before_launch=deploy_d3d9_before_launch,
+            build_d3d9_path=build_d3d9_path,
+            profile=profile,
+            disable_modules=disable_modules,
+            env_overrides_json=env_overrides_json,
+            extra_args=extra_args,
+            reuse_existing_root=False,
+        )
+        launched.append(result)
+        if not result.get("ok"):
+            rollback = []
+            for previous in launched[:-1]:
+                rollback.append(_stop_registered_session(str(previous.get("sessionId", "")), 2, True, True))
+            return {
+                "ok": False,
+                "error": f"批量启动在 {session_key} 失败",
+                "networkMode": "independent-loadfile",
+                "countsAsLanAcceptance": False,
+                "runId": run,
+                "preflight": check,
+                "results": launched,
+                "rollback": rollback,
+            }
+    return {
+        "ok": True,
+        "runId": run,
+        "count": len(launched),
+        "networkMode": "independent-loadfile",
+        "countsAsLanAcceptance": False,
+        "preflight": check,
+        "sessions": launched,
+    }
+
+
+@mcp.tool()
+def provision_ydhost_assets(
+    source_root: str,
+    sandbox_root: str = str(DEFAULT_SANDBOX_ROOT),
+    target_root: str = "",
+    apply: bool = False,
+) -> Dict[str, Any]:
+    """哈希锁定地配置 ydhost 运行时；默认 dry-run，且绝不启动 ydhost/War3。"""
+    try:
+        sandbox = _require_multi_instance_sandbox(Path(sandbox_root))
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "dryRun": not apply,
+            "applied": False,
+            "error": str(exc),
+        }
+    target = Path(target_root) if target_root else None
+    return _provision_ydhost_assets(
+        source_root=Path(source_root),
+        sandbox_root=sandbox,
+        target_root=target,
+        apply=bool(apply),
+    )
+
+
+@mcp.tool()
+def generate_ydhost_map_metadata(
+    ydwe_root: str,
+    map_path: str,
+    sandbox_root: str = str(DEFAULT_SANDBOX_ROOT),
+    apply: bool = False,
+    timeout_seconds: int = 180,
+) -> Dict[str, Any]:
+    """用哈希锁定的独立 YDWE mapdump 生成元数据；默认只在临时目录执行。"""
+    try:
+        sandbox = _require_multi_instance_sandbox(Path(sandbox_root))
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "dryRun": not apply,
+            "applied": False,
+            "error": str(exc),
+        }
+    return _generate_ydhost_map_metadata(
+        ydwe_root=Path(ydwe_root),
+        sandbox_root=sandbox,
+        map_path=Path(map_path),
+        apply=bool(apply),
+        timeout=max(1, int(timeout_seconds)),
+    )
+
+
+@mcp.tool()
+def run_multi_instance_suite(
+    sandbox_root: str = str(DEFAULT_SANDBOX_ROOT),
+    map_path: str = str(DEFAULT_TEST_MAP),
+    instance_count: int = 2,
+    run_id: str = "",
+    session_prefix: str = "client",
+    artifact_root: str = str(ARTIFACT_ROOT),
+    enable_ydhost_launch: bool = False,
+) -> Dict[str, Any]:
+    """执行 LAN 门禁；真实启动必须显式 opt-in，且协议未闭环时仍拒绝执行。"""
+    check = _preflight_instance_pool_impl(
+        sandbox_root=Path(sandbox_root),
+        artifact_root=Path(artifact_root),
+        map_path=Path(map_path) if map_path else None,
+        instance_count=instance_count,
+        run_id=run_id,
+        session_prefix=session_prefix,
+    )
+    if not check.get("ok"):
+        return {
+            "ok": False,
+            "status": "blocked",
+            "code": "INSTANCE_PREFLIGHT_FAILED",
+            "error": "联机套件实例预检失败",
+            "preflight": check,
+            "countsAsLanAcceptance": False,
+        }
+
+    try:
+        sandbox = _require_multi_instance_sandbox(Path(sandbox_root))
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "code": "SANDBOX_POLICY_REJECTED",
+            "error": str(exc),
+            "preflight": check,
+            "countsAsLanAcceptance": False,
+        }
+
+    ydhost_check = _preflight_ydhost_lan(sandbox, Path(map_path))
+    if not ydhost_check.get("ok"):
+        return {
+            "ok": False,
+            "status": "blocked",
+            "code": ydhost_check.get("code", "YDHOST_PREFLIGHT_FAILED"),
+            "error": ydhost_check.get("error", "ydhost 联机前置检查失败"),
+            "runId": check.get("runId", run_id),
+            "instanceCount": int(instance_count),
+            "preflight": check,
+            "ydhostPreflight": ydhost_check,
+            "networkModeRequired": "ydhost-lan",
+            "independentLoadfileRejected": True,
+            "countsAsLanAcceptance": False,
+        }
+
+    if not bool(enable_ydhost_launch):
+        return {
+            "ok": False,
+            "status": "blocked",
+            "code": "YDHOST_LAUNCH_OPT_IN_REQUIRED",
+            "error": "ydhost 真实启动默认关闭；必须显式 enable_ydhost_launch=true",
+            "runId": check.get("runId", run_id),
+            "instanceCount": int(instance_count),
+            "preflight": check,
+            "ydhostPreflight": ydhost_check,
+            "stateMachineImplemented": True,
+            "realProcessLaunchExecuted": False,
+            "networkModeRequired": "ydhost-lan",
+            "independentLoadfileRejected": True,
+            "countsAsLanAcceptance": False,
+        }
+
+    capability = _ydhost_real_launch_capability()
+    return {
+        "ok": False,
+        "status": "blocked",
+        "code": capability.get("code", "YDHOST_REAL_LAUNCH_UNAVAILABLE"),
+        "error": capability.get("error", "ydhost 真实启动协议尚未闭环"),
+        "runId": check.get("runId", run_id),
+        "instanceCount": int(instance_count),
+        "preflight": check,
+        "ydhostPreflight": ydhost_check,
+        "launchCapability": capability,
+        "stateMachineImplemented": True,
+        "realProcessLaunchExecuted": False,
+        "networkModeRequired": "ydhost-lan",
+        "independentLoadfileRejected": True,
+        "countsAsLanAcceptance": False,
+    }
+
+
 @mcp.tool()
 def ydwe_launch_chain_analysis() -> Dict[str, Any]:
     """返回 YDWE 启动链关键结论（从源码抽取）。"""
+    capability = _ydhost_real_launch_capability()
     return {
         "ok": True,
         "summary": [
-            "YDWE 使用 `war3.exe -loadfile <map>` 直进地图。",
-            "为规避路径长度问题，会先把地图复制到 `Maps\\\\Test\\\\WorldEditTestMap.w3x`。",
-            "之后传相对路径给 `-loadfile`（相对 war3 根目录）。",
-            "可附带 `-window` 与 `-opengl`。",
-            "YDWE 还会可选注入 LuaEngine.dll 与 Storm.dll 替换补丁。"
+            "单机测试链使用 `YDWE.exe -war3 -loadfile <map>`，并把长路径地图复制到短路径。",
+            "ydhost 联机链不同：先启动 ydhost，再启动 N 个 `YDWE.exe -war3 -closew2l -auto`。",
+            "`-auto` 由注入后的 yd_loader.dll 解释，不是 Warcraft III 原生命令。",
+            "原版 YDWE 通过共享注册表 InstallPath 选择 War3 根，尚不能绑定 per-instance 根。",
+            "connect 只证明 JOIN 请求；逐客户端 ready 仍须 DBWIN/JAPI/game-start 证据。",
         ],
         "evidence": [
-            r"E:\Mycode\Source\Repos\YDWE\Development\Core\YDWEStartup\LaunchWarcraft3.cpp:136",
-            r"E:\Mycode\Source\Repos\YDWE\Development\Core\YDWEStartup\LaunchWarcraft3.cpp:147",
-            r"E:\Mycode\Source\Repos\YDWE\Development\Component\script\ydwe\ydwe_on_test.lua:71",
+            r"SourceMap\YDWE1.32.13 - MemoryHack\script\ydwe\ydwe_on_test.lua:105",
+            r"E:\Mycode\Source\Repos\YDWE\Development\Core\ydwar3\warcraft3\directory.cpp:8",
+            r"E:\Mycode\Source\Repos\YDWE\Development\Core\YDWEStartup\LaunchWarcraft3.cpp:165",
+            r"E:\Mycode\Source\Repos\YDWE\Development\Plugin\Warcraft3\yd_loader\auto_enter.cpp:13",
+            r"E:\Mycode\Source\Repos\YDWE\Development\Plugin\Warcraft3\yd_loader\game_status.cpp:102",
         ],
+        "lanProtocol": capability.get("protocol", {}),
+        "identityContract": capability.get("identityContract", {}),
+        "productionBlocker": {
+            "code": capability.get("protocolBlockerCode", capability.get("code", "")),
+            "detail": capability.get("error", ""),
+        },
+        "realProcessLaunchExecuted": False,
     }
 
 
@@ -2759,11 +5693,22 @@ def prepare_test_map(
     if not src.exists():
         return {"ok": False, "error": f"map_path 不存在: {src}"}
 
-    dst = _prepare_test_map_copy(w3, src, rel)
+    try:
+        dst = _prepare_test_map_copy(w3, src, rel)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"部署测试地图失败: {exc}",
+            "code": "TEST_MAP_DEPLOY_FAILED",
+            "source": str(src),
+            "target": str(w3 / rel),
+        }
     return {
         "ok": True,
         "source": str(src),
         "target": str(dst),
+        "sourceSha256": sha256_file(src),
+        "targetSha256": sha256_file(dst),
         "loadfileArg": str(rel).replace("/", "\\"),
     }
 
@@ -2787,10 +5732,377 @@ def ensure_war3_video_baseline(
     return _set_war3_video_registry(width=width, height=height, refresh_rate=refresh_rate)
 
 
+class _PreStateLaunchTransaction:
+    """Owns every launch side effect until RuntimeState is fully published."""
+
+    def __init__(
+        self, video_baseline: Dict[str, Any], restore_video: bool,
+    ) -> None:
+        self.video_baseline = dict(video_baseline or {})
+        self.restore_video = bool(restore_video)
+        self.desktop_handle = 0
+        self.ydwe_lock: Dict[str, Any] = {}
+        self.native_processes: List[
+            Tuple[str, RetainedNativeProcessWitness]
+        ] = []
+        self.popen_processes: List[Tuple[str, subprocess.Popen]] = []
+        self.unresolved_processes: List[Dict[str, Any]] = []
+        self.state_published = False
+        self.committed = False
+        self._rollback_result: Optional[Dict[str, Any]] = None
+
+    def own_desktop(self, handle: Any) -> None:
+        self.desktop_handle = int(handle or 0)
+
+    def own_ydwe_lock(self, lock: Dict[str, Any]) -> None:
+        self.ydwe_lock = dict(lock or {})
+
+    def own_native_process(
+        self, role: str, witness: Optional[RetainedNativeProcessWitness],
+    ) -> None:
+        if witness is None:
+            return
+        if any(existing is witness for _, existing in self.native_processes):
+            return
+        self.native_processes.append((str(role), witness))
+
+    def own_popen(self, role: str, proc: Optional[subprocess.Popen]) -> None:
+        if proc is None:
+            return
+        if any(existing is proc for _, existing in self.popen_processes):
+            return
+        self.popen_processes.append((str(role), proc))
+
+    def mark_unresolved_process(
+        self, role: str, pid: int, reason: str,
+    ) -> None:
+        self.unresolved_processes.append({
+            "role": str(role),
+            "pidReportOnly": int(pid),
+            "reason": str(reason),
+            "cleanupAuthority": 0,
+        })
+
+    def publish_state(self) -> None:
+        self.state_published = True
+
+    def commit(self) -> Dict[str, Any]:
+        released_auxiliary: List[Dict[str, Any]] = []
+        for role, witness in self.native_processes:
+            if witness is STATE.retained_native_process:
+                continue
+            close_result = witness.close()
+            released_auxiliary.append({
+                "role": role,
+                "close": close_result,
+                "ok": close_result.get("ok") is True,
+            })
+        self.committed = True
+        return {
+            "ok": all(
+                row.get("ok") is True
+                for row in released_auxiliary
+            ),
+            "committed": True,
+            "statePublished": self.state_published,
+            "releasedAuxiliaryNativeHandles": released_auxiliary,
+            "pidTerminationCommandIssued": False,
+        }
+
+    def rollback(self, reason: str) -> Dict[str, Any]:
+        if self._rollback_result is not None:
+            return dict(self._rollback_result)
+
+        native_results: List[Dict[str, Any]] = []
+        state_finalize: Dict[str, Any] = {}
+        state_finalized = False
+        for role, witness in reversed(self.native_processes):
+            snapshot = dict(witness.snapshot())
+            if snapshot.get("available") is not True:
+                native_results.append({
+                    "role": role,
+                    "ok": snapshot.get("closed") is True,
+                    "skipped": True,
+                    "reason": "native witness already closed",
+                    "witness": snapshot,
+                    "pidTerminationCommandIssued": False,
+                })
+                continue
+            termination = witness.terminate_exact(
+                int(snapshot.get("pid", 0) or 0),
+                int(snapshot.get("creationEpochMs", 0) or 0),
+                str(snapshot.get("canonicalExePath", "")),
+                wait_timeout_sec=10.0,
+            )
+            owns_current_state = bool(
+                STATE.retained_native_process is witness
+                and STATE.war3_pid == snapshot.get("pid")
+                and STATE.launcher_pid == snapshot.get("pid")
+                and STATE.launcher_created_at_ms ==
+                    snapshot.get("creationEpochMs")
+                and _canonical_process_path(STATE.launcher_exe) ==
+                    _canonical_process_path(
+                        snapshot.get("canonicalExePath")
+                    )
+            )
+            close_result: Dict[str, Any]
+            if termination.get("exact") is True and owns_current_state:
+                state_finalize = (
+                    _finalize_state_after_exact_native_termination(
+                        int(snapshot["pid"]),
+                        int(snapshot["creationEpochMs"]),
+                        str(snapshot["canonicalExePath"]),
+                    )
+                )
+                state_finalized = state_finalize.get("ok") is True
+                close_result = {
+                    "ok": state_finalized,
+                    "closedByStateFinalize": state_finalized,
+                }
+            else:
+                close_result = witness.close()
+            native_results.append({
+                "role": role,
+                "ok": bool(
+                    termination.get("exact") is True
+                    and close_result.get("ok") is True
+                ),
+                "termination": termination,
+                "close": close_result,
+                "stateOwned": owns_current_state,
+                "pidTerminationCommandIssued": False,
+            })
+
+        popen_results: List[Dict[str, Any]] = []
+        for role, proc in reversed(self.popen_processes):
+            before = proc.poll()
+            terminate_issued = False
+            wait_error = ""
+            if before is None:
+                try:
+                    # subprocess.Popen owns a process HANDLE on Windows;
+                    # terminate() addresses that object, never a PID lookup.
+                    proc.terminate()
+                    terminate_issued = True
+                    proc.wait(timeout=10)
+                except Exception as exc:
+                    wait_error = f"{type(exc).__name__}: {exc}"
+            after = proc.poll()
+            popen_results.append({
+                "role": role,
+                "ok": after is not None and not wait_error,
+                "beforeReturnCode": before,
+                "afterReturnCode": after,
+                "terminatedByPopenHandle": terminate_issued,
+                "waitError": wait_error,
+                "pidTerminationCommandIssued": False,
+            })
+
+        if state_finalized:
+            desktop_close = dict(
+                state_finalize.get("desktop", {}) or {}
+            )
+            video_restore = dict(
+                state_finalize.get("videoRestore", {}) or {}
+            )
+            lock_release = {
+                "ok": True,
+                "releasedByStateFinalize": True,
+            }
+        else:
+            lock_release = (
+                _release_ydwe_root_lock(self.ydwe_lock)
+                if int(self.ydwe_lock.get("handle", 0) or 0) != 0
+                else {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "no pre-STATE YDWE lock",
+                }
+            )
+            desktop_closed = _close_desktop_handle(self.desktop_handle)
+            desktop_close = {
+                "ok": desktop_closed,
+                "closed": desktop_closed,
+                "handleWasPresent": self.desktop_handle != 0,
+            }
+            video_restore = (
+                _restore_war3_video_registry(
+                    dict(self.video_baseline.get("old", {})),
+                    key_path=str(self.video_baseline.get(
+                        "keyPath", WAR3_VIDEO_REG_KEY,
+                    )),
+                )
+                if self.restore_video else {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "video baseline not written",
+                }
+            )
+
+        process_clean = bool(
+            not self.unresolved_processes
+            and all(
+                row.get("ok") is True for row in
+                native_results + popen_results
+            )
+        )
+        result = {
+            "ok": bool(
+                process_clean
+                and lock_release.get("ok") is True
+                and desktop_close.get("ok") is True
+                and video_restore.get("ok") is True
+            ),
+            "rolledBack": True,
+            "reason": str(reason),
+            "statePublished": self.state_published,
+            "stateFinalize": state_finalize,
+            "nativeProcesses": [
+                {k: (v.snapshot() if hasattr(v, "snapshot") else v) for k, v in row.items()}
+                if isinstance(row, dict) else row
+                for row in native_results
+            ],
+            "popenProcesses": popen_results,
+            "unresolvedProcesses": list(self.unresolved_processes),
+            "ydweLockRelease": lock_release,
+            "desktopClose": desktop_close,
+            "videoRestore": video_restore,
+            "pidTerminationCommandIssued": False,
+        }
+        self._rollback_result = dict(result)
+        return result
+
+
+_PRE_STATE_LAUNCH_TLS = threading.local()
+
+
+def _transactional_launch(function: Any) -> Any:
+    @functools.wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        if getattr(_PRE_STATE_LAUNCH_TLS, "transaction", None) is not None:
+            return {
+                "ok": False,
+                "error": "nested launch transaction rejected",
+                "code": "NESTED_LAUNCH_TRANSACTION",
+            }
+        _PRE_STATE_LAUNCH_TLS.transaction = None
+        try:
+            try:
+                raw_result = function(*args, **kwargs)
+            except Exception as exc:
+                transaction = getattr(
+                    _PRE_STATE_LAUNCH_TLS, "transaction", None,
+                )
+                rollback = (
+                    transaction.rollback(
+                        f"exception: {type(exc).__name__}: {exc}"
+                    )
+                    if transaction is not None else {
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "exception before launch side effects",
+                    }
+                )
+                return {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "code": "PRE_STATE_LAUNCH_EXCEPTION",
+                    "preStateRollback": rollback,
+                    "videoRestore": dict(
+                        rollback.get("videoRestore", {}) or {}
+                    ),
+                }
+
+            transaction = getattr(
+                _PRE_STATE_LAUNCH_TLS, "transaction", None,
+            )
+            try:
+                result = dict(raw_result or {})
+            except Exception as exc:
+                rollback = (
+                    transaction.rollback(
+                        "launch returned a non-mapping result"
+                    )
+                    if transaction is not None else {
+                        "ok": True,
+                        "skipped": True,
+                    }
+                )
+                return {
+                    "ok": False,
+                    "error": f"invalid launch result: {exc}",
+                    "code": "INVALID_LAUNCH_RESULT",
+                    "preStateRollback": rollback,
+                }
+            if result.get("ok") is True:
+                if transaction is None or not transaction.state_published:
+                    rollback = (
+                        transaction.rollback(
+                            "success returned before STATE publication"
+                        )
+                        if transaction is not None else {
+                            "ok": True,
+                            "skipped": True,
+                        }
+                    )
+                    return {
+                        "ok": False,
+                        "error": "launch success lacked published STATE",
+                        "code": "PRE_STATE_PUBLICATION_MISSING",
+                        "preStateRollback": rollback,
+                    }
+                commit = transaction.commit()
+                result["preStateTransaction"] = commit
+                if commit.get("ok") is not True:
+                    rollback = transaction.rollback(
+                        "auxiliary native HANDLE close failed at commit"
+                    )
+                    return {
+                        "ok": False,
+                        "error": (
+                            "launch transaction commit did not close "
+                            "auxiliary HANDLEs"
+                        ),
+                        "code": "LAUNCH_TRANSACTION_COMMIT_FAILED",
+                        "preStateTransaction": commit,
+                        "preStateRollback": rollback,
+                    }
+                return result
+
+            rollback = (
+                transaction.rollback(
+                    str(result.get("error", "launch returned failure"))
+                )
+                if transaction is not None else {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "failure before launch side effects",
+                }
+            )
+            result["preStateRollback"] = rollback
+            result["videoRestore"] = dict(
+                rollback.get("videoRestore", {}) or {}
+            )
+            if rollback.get("ok") is not True:
+                result["rollbackError"] = (
+                    "pre-STATE launch rollback did not close exactly"
+                )
+            return result
+        finally:
+            _PRE_STATE_LAUNCH_TLS.transaction = None
+
+    return wrapped
+
+
 @mcp.tool()
+@_transactional_launch
 def launch_war3_test(
     war3_dir: str = str(DEFAULT_WAR3_DIR),
     map_path: str = str(DEFAULT_TEST_MAP),
+    launcher_mode: str = YDWE_LAUNCHER_MODE_DIRECT,
+    ydwe_root: str = "",
+    ydwe_child_timeout_sec: int = 20,
+    ydwe_module_timeout_sec: int = 30,
     windowed: bool = False,
     use_isolated_desktop: bool = False,
     desktop_name: str = "",
@@ -2810,7 +6122,7 @@ def launch_war3_test(
     env_overrides_json: str = "",
     extra_args: str = "",
 ) -> Dict[str, Any]:
-    """启动 War3 并自动加载测试地图。"""
+    """启动 War3 并自动加载测试地图；可显式通过 YDWE 注入历史 JAPI。"""
     w3 = Path(war3_dir)
     war3_exe = w3 / "war3.exe"
     src_map = Path(map_path)
@@ -2818,6 +6130,37 @@ def launch_war3_test(
         return {"ok": False, "error": f"未找到 war3.exe: {war3_exe}"}
     if not src_map.exists():
         return {"ok": False, "error": f"未找到地图: {src_map}"}
+
+    try:
+        launch_mode = _normalize_launcher_mode(launcher_mode)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "code": "INVALID_LAUNCHER_MODE"}
+
+    ydwe_preflight: Dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "reason": "launcher_mode=direct",
+        "registryModified": False,
+    }
+    ydwe_dir = Path(ydwe_root) if str(ydwe_root or "").strip() else Path()
+    if launch_mode == YDWE_LAUNCHER_MODE_YDWE:
+        if not str(ydwe_root or "").strip():
+            return {
+                "ok": False,
+                "error": "launcher_mode=ydwe 时必须显式提供 ydwe_root",
+                "code": "YDWE_ROOT_REQUIRED",
+            }
+        ydwe_preflight = _preflight_ydwe_single_launch(w3, ydwe_dir)
+        if not ydwe_preflight.get("ok"):
+            return {
+                "ok": False,
+                "error": ydwe_preflight.get("error", "YDWE/JAPI 启动预检失败"),
+                "code": ydwe_preflight.get("code", "YDWE_PREFLIGHT_FAILED"),
+                "ydwePreflight": ydwe_preflight,
+            }
+        w3 = Path(str(ydwe_preflight["war3Dir"]))
+        war3_exe = w3 / "war3.exe"
+        ydwe_dir = Path(str(ydwe_preflight["ydweRoot"]))
 
     deploy = None
     if deploy_d3d9_before_launch:
@@ -2836,23 +6179,47 @@ def launch_war3_test(
             height=baseline_height,
             refresh_rate=baseline_refresh_rate,
         )
-        if not video_baseline.get("ok"):
-            return {
-                "ok": False,
-                "error": video_baseline.get("error", "写入视频基线失败"),
-                "deploy": deploy,
-                "videoBaseline": video_baseline,
-            }
+    pre_state_transaction = _PreStateLaunchTransaction(
+        video_baseline, enforce_video_baseline,
+    )
+    _PRE_STATE_LAUNCH_TLS.transaction = pre_state_transaction
+    if not video_baseline.get("ok"):
+        return {
+            "ok": False,
+            "error": video_baseline.get("error", "写入视频基线失败"),
+            "deploy": deploy,
+            "videoBaseline": video_baseline,
+        }
 
-    inplace_rel = _prefer_inplace_relative_loadfile_arg(w3, src_map)
-    if inplace_rel:
-        dst = src_map
-        loadfile_arg = inplace_rel
-        map_launch_mode = "inplace-relative"
-    else:
-        dst = _prepare_test_map_copy(w3, src_map, DEFAULT_TEST_MAP_REL)
-        loadfile_arg = str(DEFAULT_TEST_MAP_REL).replace("/", "\\")
-        map_launch_mode = "copied-short-path"
+    inplace_rel = (
+        ""
+        if launch_mode == YDWE_LAUNCHER_MODE_YDWE
+        else _prefer_inplace_relative_loadfile_arg(w3, src_map)
+    )
+    try:
+        if inplace_rel:
+            dst = src_map
+            loadfile_arg = inplace_rel
+            map_launch_mode = "inplace-relative"
+        else:
+            dst = _prepare_test_map_copy(w3, src_map, DEFAULT_TEST_MAP_REL)
+            loadfile_arg = str(DEFAULT_TEST_MAP_REL).replace("/", "\\")
+            map_launch_mode = "copied-short-path"
+        source_map_sha256 = sha256_file(src_map)
+        target_map_sha256 = sha256_file(dst)
+        if source_map_sha256.lower() != target_map_sha256.lower():
+            raise RuntimeError(
+                "AutoTest 启动地图 SHA-256 与源候选不一致: "
+                f"source={source_map_sha256} target={target_map_sha256}"
+            )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"部署测试地图失败: {exc}",
+            "code": "TEST_MAP_DEPLOY_FAILED",
+            "sourceMap": str(src_map),
+            "targetMap": str(w3 / DEFAULT_TEST_MAP_REL),
+        }
 
     effective_windowed = bool(windowed)
     forced_windowed = False
@@ -2867,16 +6234,31 @@ def launch_war3_test(
                 "videoBaseline": video_baseline,
                 "desktop": desktop,
             }
+        pre_state_transaction.own_desktop(
+            desktop.get("handle", 0)
+        )
         if not effective_windowed:
             effective_windowed = True
             forced_windowed = True
 
-    args = [str(war3_exe)]
+    if launch_mode == YDWE_LAUNCHER_MODE_YDWE:
+        args = [
+            str(ydwe_dir / "YDWE.exe"),
+            "-war3",
+            "-loadfile",
+            loadfile_arg,
+            "-closew2l",
+        ]
+        launch_cwd = ydwe_dir
+    else:
+        args = [str(war3_exe)]
+        launch_cwd = w3
     if effective_windowed:
         args.append("-window")
     if opengl:
         args.append("-opengl")
-    args.extend(["-loadfile", loadfile_arg])
+    if launch_mode == YDWE_LAUNCHER_MODE_DIRECT:
+        args.extend(["-loadfile", loadfile_arg])
     if extra_args.strip():
         args.extend(extra_args.strip().split())
 
@@ -2902,12 +6284,24 @@ def launch_war3_test(
     parse_error = extra_env.pop("__parse_error__", "")
     if parse_error:
         return {"ok": False, "error": f"env_overrides_json 解析失败: {parse_error}"}
-    # 运行时姿态链目前仍是实验路径。默认把 pose hook 显式钉成关闭，
-    # 避免宿主 Python/PowerShell 进程残留的环境变量把 War3 拉回
-    # pose-heavy 模式，导致低压图性能与阴影判断一起失真。
-    if "DXVK_WAR3_MODEL_POSE_HOOK" not in extra_env:
-        env["DXVK_WAR3_MODEL_POSE_HOOK"] = "0"
+    # 与隔离实例入口保持同一默认：每次 AutoTest 都使用准确的后台 cadence，
+    # 但调用者仍可通过 env_overrides_json 明确恢复原生后台节流。
+    extra_env.setdefault(AUTOTEST_BACKGROUND_THROTTLE_ENV, "1")
+    extra_env.setdefault(AUTOTEST_GAME_PAUSE_ENV, "1")
+    # 高频 SpriteFrame/runtime-matrix pose hooks are no longer the default
+    # semantic palette producer. The production path samples Blizzard's
+    # already-evaluated CModel palette from the visible contract; tests that
+    # specifically need the legacy hook path can still opt in explicitly.
     env.update(extra_env)
+    # Return the exact project-specific environment actually handed to the
+    # child, not only caller overrides. This makes inherited DXVK_WAR3_*
+    # variables and conductor-injected PERF controls visible to strict test
+    # contracts without exposing unrelated host environment entries.
+    effective_war3_environment = {
+        str(key): str(value)
+        for key, value in sorted(env.items())
+        if str(key).upper().startswith("DXVK_WAR3_")
+    }
 
     for stale in (
         _runtime_status_file(w3),
@@ -2932,16 +6326,48 @@ def launch_war3_test(
     # 给监听线程一点启动时间，降低“进程启动瞬间日志”丢失概率。
     time.sleep(0.2)
 
+    ydwe_lock: Dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "reason": "launcher_mode=direct",
+        "handle": 0,
+    }
+    if launch_mode == YDWE_LAUNCHER_MODE_YDWE:
+        ydwe_lock = _acquire_ydwe_root_lock(ydwe_dir)
+        if not ydwe_lock.get("ok"):
+            return {
+                "ok": False,
+                "error": ydwe_lock.get("error", "获取 YDWE 根互斥锁失败"),
+                "code": ydwe_lock.get("code", "YDWE_ROOT_LOCK_FAILED"),
+                "ydweLock": ydwe_lock,
+                "desktop": desktop,
+            }
+        pre_state_transaction.own_ydwe_lock(ydwe_lock)
+        locked_log_probe = _probe_ydwe_log_writable(ydwe_dir)
+        if not locked_log_probe.get("ok"):
+            return {
+                "ok": False,
+                "error": locked_log_probe.get("error", "YDWE war3.log 不可写"),
+                "code": locked_log_probe.get("code", "YDWE_LOG_NOT_WRITABLE"),
+                "ydweLock": ydwe_lock,
+                "logWritable": locked_log_probe,
+                "desktop": desktop,
+            }
+
+    preexisting_pids = {
+        int(row.get("pid", 0) or 0)
+        for row in _snapshot_process_entries()
+        if int(row.get("pid", 0) or 0) > 0
+    }
     launch_result: Dict[str, Any]
     if use_isolated_desktop:
         launch_result = _launch_process_on_desktop(
             args=args,
-            cwd=w3,
+            cwd=launch_cwd,
             env=env,
             desktop_name=str(desktop.get("name", "")),
         )
         if not launch_result.get("ok"):
-            _close_desktop_handle(int(desktop.get("handle", 0) or 0))
             return {
                 "ok": False,
                 "error": launch_result.get("error", "CreateProcessW 失败"),
@@ -2954,18 +6380,169 @@ def launch_war3_test(
     else:
         proc = subprocess.Popen(
             args,
-            cwd=str(w3),
+            cwd=str(launch_cwd),
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         launch_result = {"ok": True, "pid": int(proc.pid)}
         pid = int(proc.pid)
+        pre_state_transaction.own_popen("launcher", proc)
+
+    native_launcher_witness = launch_result.pop(
+        "_nativeProcessWitness", None,
+    )
+    pre_state_transaction.own_native_process(
+        "launcher", native_launcher_witness,
+    )
+
+    launcher_pid = int(pid)
+    launcher_created_at_ms = _get_process_creation_epoch_ms(launcher_pid)
+    child_discovery: Dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "reason": "launcher_mode=direct",
+        "pid": int(pid),
+    }
+    ydwe_child_witness: Optional[RetainedNativeProcessWitness] = None
+    ydwe_child_acquisition: Dict[str, Any] = {}
+    if launch_mode == YDWE_LAUNCHER_MODE_YDWE:
+        child_discovery = _wait_for_ydwe_war3_child(
+            launcher_pid=launcher_pid,
+            expected_war3_exe=war3_exe,
+            preexisting_pids=preexisting_pids,
+            timeout_sec=max(1, int(ydwe_child_timeout_sec)),
+        )
+        if not child_discovery.get("ok"):
+            return {
+                "ok": False,
+                "error": child_discovery.get("error", "未发现 YDWE 的 War3 子进程"),
+                "code": child_discovery.get("code", "YDWE_WAR3_CHILD_NOT_FOUND"),
+                "launcherMode": launch_mode,
+                "launcherPid": launcher_pid,
+                "childDiscovery": child_discovery,
+                "ydwePreflight": ydwe_preflight,
+                "desktop": desktop,
+            }
+        pid = int(child_discovery["pid"])
+        proc = None
+        ydwe_child_witness, ydwe_child_acquisition = (
+            _open_native_process_witness(
+                pid,
+                war3_exe,
+                "launch_war3_test-prestate-ydwe-child",
+            )
+        )
+        pre_state_transaction.own_native_process(
+            "ydwe-game-child", ydwe_child_witness,
+        )
+        if ydwe_child_witness is None:
+            pre_state_transaction.mark_unresolved_process(
+                "ydwe-game-child",
+                pid,
+                "exact native child HANDLE acquisition failed",
+            )
+            return {
+                "ok": False,
+                "error": "无法冻结 YDWE War3 子进程清理 HANDLE",
+                "code": "YDWE_CHILD_NATIVE_HANDLE_UNAVAILABLE",
+                "launcherMode": launch_mode,
+                "launcherPid": launcher_pid,
+                "gamePid": pid,
+                "childDiscovery": child_discovery,
+                "nativeProcessWitnessAcquisition": (
+                    ydwe_child_acquisition
+                ),
+            }
+
+    runtime_modules: Dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "reason": "launcher_mode=direct",
+    }
+    if launch_mode == YDWE_LAUNCHER_MODE_YDWE:
+        runtime_modules = _wait_for_ydwe_runtime_modules(
+            pid=pid,
+            expected_paths={
+                "LuaEngine.dll": Path(str(ydwe_preflight["luaEngine"])),
+                "yd_jass_api.dll": Path(str(ydwe_preflight["ydJassApi"])),
+            },
+            expected_sha256=dict(ydwe_preflight.get("runtimeSha256", {})),
+            timeout_sec=max(1, int(ydwe_module_timeout_sec)),
+        )
+        if not runtime_modules.get("ok"):
+            return {
+                "ok": False,
+                "error": runtime_modules.get("error", "YDWE/JAPI 运行时模块校验失败"),
+                "code": runtime_modules.get("code", "YDWE_JAPI_MODULES_NOT_VERIFIED"),
+                "launcherMode": launch_mode,
+                "launcherPid": launcher_pid,
+                "gamePid": pid,
+                "runtimeModules": runtime_modules,
+                "ydwePreflight": ydwe_preflight,
+                "desktop": desktop,
+            }
+
+    native_process_witness: Optional[
+        RetainedNativeProcessWitness
+    ] = None
+    native_process_acquisition: Dict[str, Any] = {}
+    if (
+        launch_mode == YDWE_LAUNCHER_MODE_DIRECT
+        and native_launcher_witness is not None
+    ):
+        native_process_witness = native_launcher_witness
+        native_process_acquisition = dict(
+            launch_result.get("nativeProcessWitnessAcquisition", {}) or {}
+        )
+    elif launch_mode == YDWE_LAUNCHER_MODE_YDWE:
+        native_process_witness = ydwe_child_witness
+        native_process_acquisition = dict(ydwe_child_acquisition)
+    else:
+        native_process_witness, native_process_acquisition = (
+            _open_native_process_witness(
+                pid,
+                war3_exe,
+                "launch_war3_test-bound-direct-process",
+            )
+        )
+        pre_state_transaction.own_native_process(
+            "direct-game", native_process_witness,
+        )
+    if native_process_witness is None:
+        return {
+            "ok": False,
+            "error": "无法建立精确绑定的原生 War3 进程 witness",
+            "code": "WAR3_NATIVE_PROCESS_WITNESS_UNAVAILABLE",
+            "nativeProcessWitnessAcquisition": (
+                native_process_acquisition
+            ),
+            "launcherMode": launch_mode,
+            "launcherPid": launcher_pid,
+            "gamePid": pid,
+            "desktop": desktop,
+        }
+
+    native_snapshot = native_process_witness.snapshot()
+    if launch_mode == YDWE_LAUNCHER_MODE_DIRECT:
+        launcher_created_at_ms = int(
+            native_snapshot.get("creationEpochMs", 0) or 0
+        )
 
     priority = _set_process_priority_high(pid)
 
+    previous_native_process_close = (
+        _replace_state_retained_native_process(native_process_witness)
+    )
     STATE.war3_proc = proc
     STATE.war3_pid = pid
+    STATE.launcher_pid = launcher_pid
+    STATE.launcher_created_at_ms = launcher_created_at_ms
+    STATE.launcher_mode = launch_mode
+    STATE.launcher_exe = str(args[0])
+    STATE.ydwe_lock_handle = int(ydwe_lock.get("handle", 0) or 0)
+    STATE.ydwe_lock_name = str(ydwe_lock.get("name", ""))
+    STATE.ydwe_lock_root = str(ydwe_lock.get("ydweRoot", ""))
     STATE.war3_dir = w3
     STATE.test_map_path = src_map
     STATE.desktop_name = str(desktop.get("name", "")) if use_isolated_desktop else ""
@@ -2977,10 +6554,15 @@ def launch_war3_test(
 
     # 进程创建后收敛到目标 pid，避免跨进程噪声。
     _start_debug_monitor(pid)
+    pre_state_transaction.publish_state()
 
     return {
         "ok": True,
         "pid": pid,
+        "gamePid": pid,
+        "launcherPid": launcher_pid,
+        "launcherMode": launch_mode,
+        "launcherExe": str(args[0]),
         "args": args,
         "windowed": bool(effective_windowed),
         "requestedWindowed": bool(windowed),
@@ -2991,34 +6573,92 @@ def launch_war3_test(
         "disableModules": disable_csv,
         "recordAfterGameStarted": bool(record_after_game_started),
         "envOverrides": extra_env,
+        "effectiveWar3Environment": effective_war3_environment,
         "copiedMap": str(dst),
         "loadfileArg": loadfile_arg,
         "mapLaunchMode": map_launch_mode,
+        "sourceMapSha256": source_map_sha256,
+        "targetMapSha256": target_map_sha256,
+        "ydwePreflight": ydwe_preflight,
+        "ydweLock": {
+            "ok": bool(ydwe_lock.get("ok", False)),
+            "name": str(ydwe_lock.get("name", "")),
+            "ydweRoot": str(ydwe_lock.get("ydweRoot", "")),
+            "heldUntilStop": launch_mode == YDWE_LAUNCHER_MODE_YDWE,
+        },
+        "childDiscovery": child_discovery,
+        "runtimeModules": runtime_modules,
         "deploy": deploy,
         "videoBaseline": video_baseline,
         "priority": priority,
+        "nativeProcessWitness": native_snapshot,
+        "nativeProcessWitnessAcquisition": native_process_acquisition,
+        "previousNativeProcessWitnessClose": (
+            previous_native_process_close
+        ),
         "time": _now_str(),
     }
 
 
 @mcp.tool()
-def is_war3_running(pid: int = 0) -> Dict[str, Any]:
+def is_war3_running(pid: int = 0, session_id: str = "") -> Dict[str, Any]:
     """检查 War3 进程是否仍在运行。"""
-    check_pid = pid or (STATE.war3_pid or 0)
+    session = _session_by_selector(session_id=session_id, pid=pid)
+    check_pid = int(session.pid) if session is not None else (pid or (STATE.war3_pid or 0))
     if check_pid <= 0:
-        return {"ok": True, "running": False, "pid": 0}
-    return {"ok": True, "running": _pid_alive(check_pid), "pid": check_pid}
+        return {"ok": True, "running": False, "pid": 0, "sessionId": session_id}
+    return {
+        "ok": True,
+        "running": _registered_session_alive(session) if session is not None else _pid_alive(check_pid),
+        "pid": check_pid,
+        "sessionId": session.session_id if session is not None else "",
+    }
 
 
 @mcp.tool()
-def read_runtime_status(war3_dir: str = str(DEFAULT_WAR3_DIR)) -> Dict[str, Any]:
+def read_runtime_status(
+    war3_dir: str = str(DEFAULT_WAR3_DIR),
+    session_id: str = "",
+    pid: int = 0,
+) -> Dict[str, Any]:
     """读取项目侧 runtime_status.json（由 DXVK 运行时周期写入）。"""
-    w3 = Path(war3_dir)
+    registered = _session_by_selector(session_id=session_id, pid=pid)
+    if session_id and registered is None:
+        return {"ok": False, "error": f"未找到 session_id: {session_id}"}
+    w3 = Path(registered.instance_root) if registered is not None else Path(war3_dir)
+    target_pid = int(registered.pid) if registered is not None else (pid or STATE.war3_pid or 0)
+    target_alive = (
+        _registered_session_alive(registered)
+        if registered is not None
+        else (target_pid > 0 and _pid_alive(target_pid))
+    )
+    if target_pid > 0 and target_alive:
+        pipe_res = _control_plane_request(
+            pid=target_pid,
+            command="get_runtime_status",
+            payload={},
+            timeout_sec=2.0,
+        )
+        if pipe_res.get("transportOk"):
+            return {
+                "ok": bool(pipe_res.get("ok")),
+                "sessionId": registered.session_id if registered is not None else "",
+                "mode": "control-plane",
+                "pipeName": str(pipe_res.get("pipeName", "") or ""),
+                "data": dict(pipe_res.get("result", {}) or {}),
+                "detail": pipe_res,
+            }
+
     path = _runtime_status_file(w3)
     data = _read_runtime_status_file(w3)
     if not data:
         return {"ok": False, "error": "runtime_status.json 不存在或解析失败", "path": str(path)}
-    return {"ok": True, "path": str(path), "data": data}
+    return {
+        "ok": True,
+        "sessionId": registered.session_id if registered is not None else "",
+        "path": str(path),
+        "data": data,
+    }
 
 
 @mcp.tool()
@@ -3028,16 +6668,24 @@ def wait_for_runtime_status(
     require_runtime_ready: bool = False,
     require_game_started: bool = True,
     min_timestamp_ms: int = 0,
+    session_id: str = "",
 ) -> Dict[str, Any]:
     """轮询 runtime_status.json，等待进入目标状态。"""
-    w3 = Path(war3_dir)
+    registered = _session_by_selector(session_id=session_id)
+    if session_id and registered is None:
+        return {"ok": False, "error": f"未找到 session_id: {session_id}"}
+    w3 = Path(registered.instance_root) if registered is not None else Path(war3_dir)
+    effective_min_timestamp_ms = max(
+        int(min_timestamp_ms),
+        int(registered.process_created_at_ms) - 5_000 if registered is not None else 0,
+    )
     path = _runtime_status_file(w3)
     t0 = time.time()
     while time.time() - t0 < max(1, timeout_sec):
         data = _read_runtime_status_file(w3)
         if data:
             ts = int(data.get("timestampMs", 0))
-            if min_timestamp_ms > 0 and ts < min_timestamp_ms:
+            if effective_min_timestamp_ms > 0 and ts < effective_min_timestamp_ms:
                 time.sleep(0.25)
                 continue
             runtime = data.get("runtime", {})
@@ -3063,11 +6711,24 @@ def wait_for_runtime_status(
 
 
 @mcp.tool()
-def get_runtime_events(since_id: int = 0, limit: int = 200, contains: str = "") -> Dict[str, Any]:
+def get_runtime_events(
+    since_id: int = 0,
+    limit: int = 200,
+    contains: str = "",
+    session_id: str = "",
+) -> Dict[str, Any]:
     """拉取 OutputDebugString 事件（可作为订阅轮询）。"""
-    rows = STATE.get_events(since_id=since_id, limit=limit, contains=contains)
+    session = _session_by_selector(session_id=session_id)
+    if session_id and session is None:
+        return {"ok": False, "error": f"未找到 session_id: {session_id}"}
+    rows = (
+        session.get_events(since_id=since_id, limit=limit, contains=contains)
+        if session is not None
+        else STATE.get_events(since_id=since_id, limit=limit, contains=contains)
+    )
     return {
         "ok": True,
+        "sessionId": session.session_id if session is not None else "",
         "count": len(rows),
         "events": rows,
         "latestId": rows[-1]["id"] if rows else since_id,
@@ -3082,17 +6743,131 @@ def wait_for_game_ready(
     fallback_min_elapsed_sec: int = 20,
     fallback_min_cpu_sec: float = 1.0,
     require_game_started_for_fallback: bool = True,
+    session_id: str = "",
+    auto_continue_loading: bool = False,
+    continue_key: str = "RIGHT",
+    continue_interval_sec: int = 12,
 ) -> Dict[str, Any]:
     """
     等待“正式进入游戏”：
     - 先命中 runtime init：`JASS runtime fully initialized`
     - 再命中 in-game 渲染信号：`War3Shadow: Run frame=` 或 `War3StageSig: stage=19`
     """
-    target_pid = pid or (STATE.war3_pid or 0)
+    registered = _session_by_selector(session_id=session_id, pid=pid)
+    target_pid = int(registered.pid) if registered is not None else (pid or (STATE.war3_pid or 0))
     if target_pid <= 0:
         return {"ok": False, "error": "无有效 pid，请先 launch_war3_test"}
+    target_war3_dir = Path(registered.instance_root) if registered is not None else Path(STATE.war3_dir)
+    launch_epoch_ms = (
+        int(registered.process_created_at_ms)
+        if registered is not None
+        else int(STATE.launch_epoch_ms)
+    )
+    def target_alive() -> bool:
+        return (
+            _registered_session_alive(registered)
+            if registered is not None
+            else _pid_alive(target_pid)
+        )
 
-    _start_debug_monitor(target_pid)
+    _start_debug_monitor(None)
+
+    pipe_wait_t0 = time.time()
+    pipe_ready: Dict[str, Any] = {}
+    continue_pulses: List[Dict[str, Any]] = []
+    last_continue_at = 0.0
+    while True:
+        elapsed_wait = time.time() - pipe_wait_t0
+        remaining_timeout = max(0.0, float(timeout_sec) - elapsed_wait)
+        if remaining_timeout <= 0.0:
+            break
+
+        # 超大地图在加载条结束后会停在“按下任意键以继续”。以短 wait_until
+        # 分片等待，才能在不切换隔离桌面的情况下向 War3 窗口投递继续键；一次
+        # 性等待完整 timeout 会让已经完成加载的地图永远卡在确认页。
+        request_timeout = remaining_timeout
+        if auto_continue_loading:
+            request_timeout = min(
+                remaining_timeout,
+                float(max(5, int(continue_interval_sec))),
+            )
+
+        pipe_ready = _control_plane_request(
+            pid=target_pid,
+            command="wait_until",
+            payload={
+                "timeoutSec": max(1, int(math.ceil(request_timeout))),
+                "pollIntervalMs": 50,
+            },
+            timeout_sec=max(2.0, request_timeout + 2.0),
+        )
+        if pipe_ready.get("transportOk"):
+            if pipe_ready.get("ok"):
+                break
+            runtime_status = dict(
+                ((pipe_ready.get("result", {}) or {}).get("runtimeStatus", {})) or {}
+            )
+            runtime = dict(runtime_status.get("runtime", {}) or {})
+            now = time.time()
+            can_continue = (
+                auto_continue_loading
+                and target_alive()
+                and bool(runtime.get("jassReady", False))
+                and not bool(runtime.get("gameStarted", False))
+                and (now - pipe_wait_t0) >= 10.0
+                and (last_continue_at <= 0.0 or
+                     (now - last_continue_at) >= max(5, int(continue_interval_sec)))
+            )
+            if can_continue:
+                pulse = _post_war3_key_pulse(
+                    target_pid,
+                    key=continue_key,
+                    hold_ms=55,
+                    repeat=1,
+                    foreground=False,
+                )
+                pulse["elapsedSec"] = round(now - pipe_wait_t0, 3)
+                continue_pulses.append(pulse)
+                last_continue_at = now
+            if auto_continue_loading and target_alive():
+                time.sleep(0.2)
+                continue
+            break
+        if not target_alive():
+            break
+        time.sleep(0.2)
+
+    if pipe_ready.get("transportOk"):
+        runtime_status = dict(((pipe_ready.get("result", {}) or {}).get("runtimeStatus", {})) or {})
+        if pipe_ready.get("ok"):
+            return {
+                "ok": True,
+                "mode": "control-plane",
+                "pid": target_pid,
+                "elapsedSec": round(float(pipe_ready.get("elapsedSec", 0.0) or 0.0), 3),
+                "runtimeStatus": runtime_status,
+                "continuePulses": continue_pulses,
+                "detail": pipe_ready,
+            }
+        return {
+            "ok": False,
+            "error": str(pipe_ready.get("error", "control plane wait_until 失败")),
+            "mode": "control-plane",
+            "pid": target_pid,
+            "elapsedSec": round(time.time() - pipe_wait_t0, 3),
+            "runtimeStatus": runtime_status,
+            "continuePulses": continue_pulses,
+            "detail": pipe_ready,
+        }
+    if not allow_fallback:
+        return {
+            "ok": False,
+            "error": str(pipe_ready.get("error", "control plane 不可用")),
+            "mode": "control-plane-required",
+            "pid": target_pid,
+            "elapsedSec": round(time.time() - pipe_wait_t0, 3),
+            "detail": pipe_ready,
+        }
 
     t0 = time.time()
     last_id = 0
@@ -3105,14 +6880,14 @@ def wait_for_game_ready(
     dead_grace_checks = 0
 
     while time.time() - t0 < max(1, timeout_sec):
-        if not _pid_alive(target_pid):
-            runtime_status = _read_runtime_status_file(STATE.war3_dir)
+        if not target_alive():
+            runtime_status = _read_runtime_status_file(target_war3_dir)
             if runtime_status:
                 rt = runtime_status.get("runtime", {})
                 module = runtime_status.get("module", {})
                 ts = int(runtime_status.get("timestampMs", 0))
                 if (
-                    ts >= max(0, STATE.launch_epoch_ms - 5_000)
+                    ts >= max(0, launch_epoch_ms - 5_000)
                     and bool(rt.get("gameStarted", False))
                     and str(module.get("state", "")) == "Running"
                 ):
@@ -3130,7 +6905,11 @@ def wait_for_game_ready(
             }
         dead_grace_checks = 0
 
-        batch = STATE.get_events(since_id=last_id, limit=256)
+        batch = (
+            registered.get_events(since_id=last_id, limit=256)
+            if registered is not None
+            else STATE.get_events(since_id=last_id, limit=256)
+        )
         if batch:
             last_id = batch[-1]["id"]
         for e in batch:
@@ -3146,6 +6925,37 @@ def wait_for_game_ready(
                 hit_ingame = e
 
         if hit_init and hit_ingame:
+            if not allow_fallback:
+                status0 = _read_runtime_status_best_effort(target_pid)
+                time.sleep(1.0)
+                status1 = _read_runtime_status_best_effort(target_pid)
+                if isinstance(status0, dict) and isinstance(status1, dict):
+                    frame0 = int(status0.get("frameIndex", 0) or 0)
+                    frame1 = int(status1.get("frameIndex", 0) or 0)
+                    render0 = dict(status0.get("render", {}) or {})
+                    render1 = dict(status1.get("render", {}) or {})
+                    module0 = dict(status0.get("module", {}) or {})
+                    module1 = dict(status1.get("module", {}) or {})
+                    dispatch0 = int(module0.get("dispatchCalls", 0) or 0)
+                    dispatch1 = int(module1.get("dispatchCalls", 0) or 0)
+                    if (
+                        frame0 > 0
+                        and frame1 <= frame0
+                        and dispatch1 <= dispatch0
+                        and bool(render1.get("inGameRenderReady", False))
+                        and not bool(render1.get("isInGame", False))
+                    ):
+                        return {
+                            "ok": False,
+                            "error": "debug-events ready 后 frameIndex 未继续推进，疑似首帧卡住",
+                            "mode": "debug-events-stalled",
+                            "pid": target_pid,
+                            "elapsedSec": round(time.time() - t0, 3),
+                            "hitInit": hit_init,
+                            "hitInGame": hit_ingame,
+                            "status0": status0,
+                            "status1": status1,
+                        }
             return {
                 "ok": True,
                 "mode": "debug-events",
@@ -3156,7 +6966,7 @@ def wait_for_game_ready(
             }
 
         # 优先读取项目侧 runtime_status（更稳定，不依赖 DBWIN）。
-        runtime_status = _read_runtime_status_file(STATE.war3_dir)
+        runtime_status = _read_runtime_status_file(target_war3_dir)
         if runtime_status:
             last_runtime_status = runtime_status
             rt = runtime_status.get("runtime", {})
@@ -3164,17 +6974,24 @@ def wait_for_game_ready(
             module = runtime_status.get("module", {})
             ts = int(runtime_status.get("timestampMs", 0))
             runtime_ready = bool(rt.get("runtimeReady", False))
+            jass_ready = bool(rt.get("jassReady", False))
             game_started = bool(rt.get("gameStarted", False))
             frame_index = int(runtime_status.get("frameIndex", 0) or 0)
             periodic_source = str(runtime_status.get("source", "")) == "periodic"
             module_running = str(module.get("state", "")) == "Running"
-            if ts >= max(0, STATE.launch_epoch_ms - 5_000) and runtime_ready:
+            if hit_init is None and jass_ready:
+                hit_init = {
+                    "id": -1,
+                    "ts": ts,
+                    "msg": "runtime_status.runtime.jassReady=true",
+                }
+            if ts >= max(0, launch_epoch_ms - 5_000) and runtime_ready:
                 return {
                     "ok": True,
                     "mode": "runtime-status-file",
                     "pid": target_pid,
                     "elapsedSec": round(time.time() - t0, 3),
-                    "runtimeStatusPath": str(_runtime_status_file(STATE.war3_dir)),
+                    "runtimeStatusPath": str(_runtime_status_file(target_war3_dir)),
                     "runtimeStatus": runtime_status,
                     "runtimeReady": runtime_ready,
                     "gameStarted": game_started,
@@ -3186,7 +7003,7 @@ def wait_for_game_ready(
             # runtime_status 必须持续变新、模块持续 Running，且具备 recording /
             # periodic / frameIndex>0 三者之一，才允许进入采样。
             soft_game_started = (
-                ts >= max(0, STATE.launch_epoch_ms - 5_000)
+                ts >= max(0, launch_epoch_ms - 5_000)
                 and game_started
                 and module_running
             )
@@ -3221,7 +7038,7 @@ def wait_for_game_ready(
                     "mode": "runtime-status-stable",
                     "pid": target_pid,
                     "elapsedSec": round(time.time() - t0, 3),
-                    "runtimeStatusPath": str(_runtime_status_file(STATE.war3_dir)),
+                    "runtimeStatusPath": str(_runtime_status_file(target_war3_dir)),
                     "runtimeStatus": runtime_status,
                     "runtimeReady": runtime_ready,
                     "gameStarted": game_started,
@@ -3240,7 +7057,7 @@ def wait_for_game_ready(
                     "mode": "runtime-status-game-started",
                     "pid": target_pid,
                     "elapsedSec": round(time.time() - t0, 3),
-                    "runtimeStatusPath": str(_runtime_status_file(STATE.war3_dir)),
+                    "runtimeStatusPath": str(_runtime_status_file(target_war3_dir)),
                     "runtimeStatus": runtime_status,
                     "runtimeReady": runtime_ready,
                     "gameStarted": game_started,
@@ -3259,7 +7076,7 @@ def wait_for_game_ready(
                     "mode": "runtime-status-game-started",
                     "pid": target_pid,
                     "elapsedSec": round(time.time() - t0, 3),
-                    "runtimeStatusPath": str(_runtime_status_file(STATE.war3_dir)),
+                    "runtimeStatusPath": str(_runtime_status_file(target_war3_dir)),
                     "runtimeStatus": runtime_status,
                     "runtimeReady": runtime_ready,
                     "gameStarted": game_started,
@@ -3301,6 +7118,1158 @@ def wait_for_game_ready(
         "hitInit": hit_init,
         "hitInGame": hit_ingame,
     }
+
+
+def _shadow_summary_int(summary: Dict[str, Any], key: str) -> int:
+    try:
+        return int(summary.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _native_execute_success_draw_count(summary: Dict[str, Any]) -> int:
+    """Return a stable native execute draw count.
+
+    The current-frame executed counter can be reset when a later control-plane
+    summary prepares a new native frame. The stable last-success fields preserve
+    the actual render-thread execute result.
+    """
+    current = _shadow_summary_int(summary, "nativeD3D9BackendExecutedDrawCount")
+    stable = _shadow_summary_int(
+        summary,
+        "nativeD3D9BackendLastSuccessfulExecutedDrawCount",
+    )
+    if stable <= 0 and _shadow_summary_int(
+        summary,
+        "nativeD3D9BackendExecuteSuccessCount",
+    ) > 0:
+        submitted = _shadow_summary_int(
+            summary,
+            "nativeD3D9BackendLastExecuteSubmittedDrawCount",
+        )
+        failed = _shadow_summary_int(
+            summary,
+            "nativeD3D9BackendLastExecuteFailedDrawCount",
+        )
+        stable = max(0, submitted - failed)
+    return max(current, stable)
+
+
+def _nested_status_int(status: Dict[str, Any], *path: str) -> int:
+    cur: Any = status
+    for key in path:
+        if not isinstance(cur, dict):
+            return 0
+        cur = cur.get(key)
+    try:
+        return int(cur or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _runtime_frame_progress_status(
+    runtime_status: Dict[str, Any],
+    *,
+    frame_advance_stalled: bool = False,
+    frame_stall_sec: float = 0.0,
+) -> Dict[str, Any]:
+    """Expose frame-tail state without changing the ready contract."""
+    render = runtime_status.get("render", {}) if isinstance(runtime_status, dict) else {}
+    frame = runtime_status.get("frame", {}) if isinstance(runtime_status, dict) else {}
+    render_in_game_ready = bool(render.get("inGameRenderReady", False))
+    render_is_in_game = bool(render.get("isInGame", False))
+    tail_stalled = render_in_game_ready and bool(frame_advance_stalled)
+    inactive_tail_stalled = tail_stalled and not render_is_in_game
+    return {
+        "runtimeFrameIndex": _nested_status_int(runtime_status, "frameIndex"),
+        "runtimeFrameNumber": _nested_status_int(runtime_status, "frame", "frameNumber"),
+        "runtimeFramePublishRevision": _nested_status_int(
+            runtime_status,
+            "frame",
+            "publishRevision",
+        ),
+        "runtimeRenderInGameReady": render_in_game_ready,
+        "runtimeRenderIsInGame": render_is_in_game,
+        "runtimeFrameAdvanceStalled": bool(frame_advance_stalled),
+        "runtimeFrameStallSec": round(max(0.0, float(frame_stall_sec)), 3),
+        "runtimeRenderTailStalled": bool(tail_stalled),
+        "runtimeRenderInactiveTailStalled": bool(inactive_tail_stalled),
+        "runtimeVisibleCount": _nested_status_int(runtime_status, "frame", "visibleCount"),
+        "runtimeUnitCount": _nested_status_int(runtime_status, "frame", "unitCount"),
+        "runtimeRecordsWithRuntimeModel": _nested_status_int(
+            runtime_status,
+            "frame",
+            "recordsWithRuntimeModel",
+        ),
+        "runtimeRecordsWithModelResource": _nested_status_int(
+            runtime_status,
+            "frame",
+            "recordsWithModelResource",
+        ),
+    }
+
+
+def _semantic_scene_consumption_status(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Classify whether the DXVK scene pass consumed the latest semantic frame."""
+    near_latest_max_lag = 2
+    core_submitted = _shadow_summary_int(summary, "semanticCoreSubmittedDrawCount")
+    scene_submitted = _shadow_summary_int(summary, "semanticSceneLastSubmittedDrawCount")
+    scene_skinned = _shadow_summary_int(summary, "semanticSceneSubmittedSkinned")
+    direct_currentdraw_ready = _shadow_summary_int(
+        summary,
+        "semanticSceneCurrentDrawResolveReadyCount",
+    )
+    canonical_ready = _shadow_summary_int(summary, "semanticSceneCanonicalReadyCount")
+    fallback = _shadow_summary_int(summary, "objectFallbackDrawCount")
+    scene_publish_count = _shadow_summary_int(summary, "semanticSceneStatsPublishCount")
+    scene_lag = _shadow_summary_int(summary, "semanticScenePublishRevisionLag")
+    scene_frame_serial = _shadow_summary_int(
+        summary,
+        "semanticSceneLastFrameSerial",
+    )
+    core_frame_serial = _shadow_summary_int(
+        summary,
+        "semanticCoreFrameSerial",
+    )
+    revision_consumed = (
+        scene_publish_count > 0
+        and scene_submitted > 0
+        and scene_lag == 0
+    )
+    same_frame_consumed = (
+        scene_publish_count > 0
+        and scene_submitted > 0
+        and scene_frame_serial > 0
+        and core_frame_serial > 0
+        and scene_frame_serial >= core_frame_serial
+    )
+    near_latest_consumed = (
+        scene_publish_count > 0
+        and scene_submitted > 0
+        and scene_frame_serial > 0
+        and core_frame_serial > 0
+        and scene_lag >= 0
+        and scene_lag <= near_latest_max_lag
+        and core_frame_serial >= scene_frame_serial
+        and (core_frame_serial - scene_frame_serial) <= near_latest_max_lag
+    )
+    direct_currentdraw_consumed = (
+        scene_submitted > 0
+        and scene_skinned > 0
+        and direct_currentdraw_ready > 0
+        and canonical_ready > 0
+        and fallback == 0
+    )
+    consumed = (
+        revision_consumed
+        or same_frame_consumed
+        or near_latest_consumed
+        or direct_currentdraw_consumed
+    )
+    supplemented_revision_pending = same_frame_consumed and not revision_consumed
+    waiting_for_render_scene = (
+        core_submitted > 0 and not consumed and not direct_currentdraw_consumed
+    )
+    if revision_consumed:
+        consumption_mode = "revision"
+    elif same_frame_consumed:
+        consumption_mode = "same-frame"
+    elif near_latest_consumed:
+        consumption_mode = "near-latest"
+    elif direct_currentdraw_consumed:
+        consumption_mode = "current-draw-direct"
+    else:
+        consumption_mode = "pending"
+    return {
+        "semanticSceneConsumptionFresh": bool(consumed),
+        "semanticSceneRevisionConsumed": bool(revision_consumed),
+        "semanticSceneSameFrameConsumed": bool(same_frame_consumed),
+        "semanticSceneNearLatestConsumed": bool(near_latest_consumed),
+        "semanticSceneDirectCurrentDrawConsumed": bool(direct_currentdraw_consumed),
+        "semanticSceneNearLatestMaxLag": int(near_latest_max_lag),
+        "semanticSceneSupplementedRevisionPending": bool(supplemented_revision_pending),
+        "semanticSceneConsumptionMode": consumption_mode,
+        "semanticSceneWaitingForRenderPass": bool(waiting_for_render_scene),
+        "semanticScenePublishRevisionLag": int(scene_lag),
+        "semanticSceneStatsPublishCount": int(scene_publish_count),
+        "semanticSceneLastSubmittedDrawCount": int(scene_submitted),
+        "semanticSceneLastFrameSerial": scene_frame_serial,
+        "semanticCoreFrameSerial": core_frame_serial,
+        "semanticSceneLastSourcePublishRevision": _shadow_summary_int(
+            summary,
+            "semanticSceneLastSourcePublishRevision",
+        ),
+        "semanticCoreSourcePublishRevision": _shadow_summary_int(
+            summary,
+            "semanticCoreSourcePublishRevision",
+        ),
+    }
+
+
+def _refresh_shadow_runtime_summary_until(
+    *,
+    pid: int,
+    wait_sec: float,
+    min_submitted_draw_count: int = 0,
+    min_attachment_rigid_resolved: int = 0,
+    require_semantic_frame_fresh: bool = True,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Poll the control plane summary after a failed hot-frame wait.
+
+    wait_until can return the last pre-rebuild summary when semantic resources
+    are populated late in the same frame. A short explicit summary poll keeps
+    the failure diagnostic tied to the latest semantic contract state.
+    """
+    deadline = time.time() + max(0.0, float(wait_sec))
+    last_detail: Dict[str, Any] = {}
+    best_summary: Dict[str, Any] = {}
+
+    while True:
+        detail = _control_plane_request(
+            pid=pid,
+            command="get_shadow_runtime_summary",
+            payload={
+                "refreshSemanticFrameIfStale": True,
+                "forceSemanticFrameBuild": True,
+                "allowControlPlaneSemanticDrain": True,
+                "semanticBuildMinIntervalMs": 0,
+                "semanticBuildDrainMaxChunks": 32,
+                "semanticBuildDrainBudgetUs": 50000,
+                "semanticBuildDrainRecordCeiling": 1024,
+            },
+            timeout_sec=2.0,
+        )
+        last_detail = detail
+        if detail.get("transportOk") and detail.get("ok"):
+            summary = dict(detail.get("result", {}) or {})
+            best_summary = summary
+            submitted = _shadow_summary_int(summary, "semanticCoreSubmittedDrawCount")
+            attachment = _shadow_summary_int(summary, "semanticCoreAttachmentRigidResolved")
+            supplemental = _shadow_summary_int(
+                summary,
+                "semanticCoreAttachmentRigidSupplementalResolvedCount",
+            )
+            frame_fresh = bool(summary.get("semanticCoreFrameFresh", False))
+            if (
+                submitted >= max(0, int(min_submitted_draw_count))
+                and max(attachment, supplemental)
+                >= max(0, int(min_attachment_rigid_resolved))
+                and (not bool(require_semantic_frame_fresh) or frame_fresh)
+            ):
+                return summary, detail
+
+        if time.time() >= deadline:
+            break
+        # The attachment supplemental path can settle a few ticks after ready
+        # even when the isolated desktop stops advancing visible frames.
+        time.sleep(0.5)
+
+    return best_summary, last_detail
+
+
+@mcp.tool()
+def wait_for_hot_shadow_frame(
+    timeout_sec: int = 120,
+    pid: int = 0,
+    min_visible_count: int = 1,
+    min_stable_identity_count: int = 1,
+    min_unit_count: int = 1,
+    min_semantic_resolved: int = 1,
+    min_semantic_skinned_resolved: int = 0,
+    min_native_executed_draw_count: int = 0,
+    require_semantic_frame_fresh: bool = True,
+    min_frame_advance: int = 2,
+    allow_semantic_rigid_only: bool = False,
+    allow_semantic_attachment_rigid_only: bool = False,
+    min_semantic_attachment_rigid_resolved: int = 0,
+    post_failure_summary_wait_sec: int = 6,
+    prefer_summary_poll: bool = False,
+    require_semantic_scene_consumed: bool = False,
+    allow_scene_pending_if_core_and_currentdraw_ready: bool = False,
+    min_semantic_static_world_submitted: int = 0,
+    allow_semantic_static_world_only: bool = False,
+) -> Dict[str, Any]:
+    """等待进入热帧语义阴影状态，而不是只等待 ready 首帧。"""
+    target_pid = pid or (STATE.war3_pid or 0)
+    if target_pid <= 0:
+        return {"ok": False, "error": "无有效 pid，请先 launch_war3_test"}
+    timeout_sec = max(1, int(timeout_sec))
+    t0 = time.time()
+    if bool(prefer_summary_poll):
+        deadline = t0 + float(timeout_sec)
+        last_detail: Dict[str, Any] = {}
+        last_manifest: Dict[str, Any] = {}
+        last_runtime_status: Dict[str, Any] = {}
+        last_summary: Dict[str, Any] = {}
+        last_frame_index: Optional[int] = None
+        last_frame_advance_at = t0
+        response: Dict[str, Any] = {
+            "ok": False,
+            "mode": "control-plane-hot-frame-summary-poll",
+            "pid": target_pid,
+            "elapsedSec": 0.0,
+            "error": "等待 hot shadow summary 超时",
+        }
+        while time.time() < deadline:
+            latest = _control_plane_request(
+                pid=target_pid,
+                command="get_hot_shadow_probe",
+                payload={
+                    "refreshSemanticFrameIfStale": True,
+                    "forceSemanticFrameBuild": True,
+                    "allowControlPlaneSemanticDrain": True,
+                    "semanticBuildMinIntervalMs": 0,
+                    "semanticBuildDrainMaxChunks": 32,
+                    "semanticBuildDrainBudgetUs": 50000,
+                    "semanticBuildDrainRecordCeiling": 1024,
+                },
+                timeout_sec=3.0,
+            )
+            last_detail = latest
+            latest_result = dict(latest.get("result", {}) or {}) if latest.get("ok") else {}
+            latest_summary = dict(latest_result.get("shadowRuntimeSummary", {}) or {})
+            if latest_summary:
+                last_summary = latest_summary
+            else:
+                latest_summary = last_summary
+            last_manifest = dict(latest_result.get("frameManifestSummary", {}) or last_manifest or {})
+            last_runtime_status = dict(latest_result.get("runtimeStatus", {}) or last_runtime_status or {})
+            runtime_frame_index = _nested_status_int(last_runtime_status, "frameIndex")
+            now = time.time()
+            if last_frame_index is None or runtime_frame_index != last_frame_index:
+                last_frame_index = runtime_frame_index
+                last_frame_advance_at = now
+            frame_stall_sec = now - last_frame_advance_at
+            runtime_frame_status = _runtime_frame_progress_status(
+                last_runtime_status,
+                frame_advance_stalled=frame_stall_sec >= 3.0,
+                frame_stall_sec=frame_stall_sec,
+            )
+            response = {
+                "ok": False,
+                "mode": "control-plane-hot-frame-summary-poll",
+                "pid": target_pid,
+                "elapsedSec": round(time.time() - t0, 3),
+                "runtimeStatus": last_runtime_status,
+                "frameManifestSummary": last_manifest,
+                "shadowRuntimeSummary": latest_summary,
+                "error": "",
+                "detail": latest,
+            }
+            response.update(runtime_frame_status)
+            semantic_resolved = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreResolved",
+            )
+            submitted = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreSubmittedDrawCount",
+            )
+            rigid_resolved = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreRigidResolved",
+            )
+            explicit_rigid = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreExplicitResourceOwnerRigidResolved",
+            )
+            attachment_resolved = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreAttachmentRigidResolved",
+            )
+            attachment_supplemental_resolved = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreAttachmentRigidSupplementalResolvedCount",
+            )
+            skinned_resolved = _shadow_summary_int(
+                latest_summary,
+                "semanticCoreSkinnedResolved",
+            )
+            native_draws = _native_execute_success_draw_count(latest_summary)
+            response["nativeD3D9BackendEffectiveExecutedDrawCount"] = native_draws
+            fallback = _shadow_summary_int(latest_summary, "objectFallbackDrawCount")
+            frame_fresh = bool(latest_summary.get("semanticCoreFrameFresh", False))
+            scene_status = _semantic_scene_consumption_status(latest_summary)
+            response.update(scene_status)
+            scene_submitted = _shadow_summary_int(
+                latest_summary,
+                "semanticSceneLastSubmittedDrawCount",
+            )
+            scene_skinned = _shadow_summary_int(
+                latest_summary,
+                "semanticSceneSubmittedSkinned",
+            )
+            scene_building = _shadow_summary_int(
+                latest_summary,
+                "semanticSceneSubmittedBuilding",
+            )
+            scene_destructible = _shadow_summary_int(
+                latest_summary,
+                "semanticSceneSubmittedDestructible",
+            )
+            explicit_rigid_scene = _shadow_summary_int(
+                latest_summary,
+                "semanticSceneAcceptedExplicitResourceOwnerRigid",
+            )
+            currentdraw_query_hit = _shadow_summary_int(
+                latest_summary,
+                "currentDrawContractQueryHitCount",
+            )
+            currentdraw_palette_hit = _shadow_summary_int(
+                latest_summary,
+                "currentDrawCapturedPaletteQueryHitCount",
+            )
+            currentdraw_group_decode_hit = _shadow_summary_int(
+                latest_summary,
+                "currentDrawGroupSlotDecodeHitCount",
+            )
+            scene_lag = int(
+                scene_status.get("semanticScenePublishRevisionLag", 0) or 0
+            )
+            scene_frame_serial = int(
+                scene_status.get("semanticSceneLastFrameSerial", 0) or 0
+            )
+            core_frame_serial = int(
+                scene_status.get("semanticCoreFrameSerial", 0) or 0
+            )
+            manifest_ok = True
+            if last_manifest:
+                manifest_ok = (
+                    _shadow_summary_int(last_manifest, "visibleCount")
+                    >= max(0, int(min_visible_count))
+                    and _shadow_summary_int(last_manifest, "recordsWithStableIdentity")
+                    >= max(0, int(min_stable_identity_count))
+                    and _shadow_summary_int(last_manifest, "unitCount")
+                    >= max(0, int(min_unit_count))
+                )
+            semantic_contract_ok = (
+                semantic_resolved >= max(0, int(min_semantic_resolved))
+                and submitted > 0
+                and fallback == 0
+                and (not bool(require_semantic_frame_fresh) or frame_fresh)
+            )
+            scene_consumption_required = bool(require_semantic_scene_consumed) or not (
+                bool(allow_semantic_rigid_only)
+                or bool(allow_semantic_attachment_rigid_only)
+            )
+            strict_ok = (
+                semantic_contract_ok
+                and manifest_ok
+                and skinned_resolved >= max(0, int(min_semantic_skinned_resolved))
+                and native_draws >= max(0, int(min_native_executed_draw_count))
+                and (
+                    not scene_consumption_required
+                    or bool(scene_status.get("semanticSceneConsumptionFresh"))
+                )
+            )
+            scene_contract_ok = (
+                scene_submitted > 0
+                and fallback == 0
+                and manifest_ok
+                and (
+                    not scene_consumption_required
+                    or bool(scene_status.get("semanticSceneConsumptionFresh"))
+                )
+                and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+            )
+            static_world_scene_submitted = (
+                scene_building + scene_destructible + explicit_rigid_scene
+            )
+            static_world_contract_ok = (
+                scene_submitted > 0
+                and fallback == 0
+                and manifest_ok
+                and static_world_scene_submitted
+                >= max(0, int(min_semantic_static_world_submitted))
+                and (
+                    not scene_consumption_required
+                    or bool(scene_status.get("semanticSceneConsumptionFresh"))
+                )
+            )
+            direct_currentdraw_contract_ok = (
+                scene_submitted > 0
+                and fallback == 0
+                and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+                and _shadow_summary_int(
+                    latest_summary,
+                    "semanticSceneCurrentDrawResolveReadyCount",
+                )
+                > 0
+                and _shadow_summary_int(
+                    latest_summary,
+                    "semanticSceneCanonicalReadyCount",
+                )
+                > 0
+                and bool(scene_status.get("semanticSceneDirectCurrentDrawConsumed"))
+            )
+            attachment_contract_ok = (
+                semantic_contract_ok
+                and max(attachment_resolved, attachment_supplemental_resolved)
+                >= max(1, int(min_semantic_attachment_rigid_resolved))
+            )
+            if int(min_semantic_attachment_rigid_resolved) > 0:
+                # Attachment-rigid was the previous proof that semantic data had
+                # reached the renderer. Once a strict skinned semantic frame is
+                # present, do not keep dynamic_shadow_pressure blocked on the
+                # older attachment diagnostic. model_runtime_probe still passes
+                # min_semantic_skinned_resolved=0 and therefore keeps the
+                # attachment contract gate as intended.
+                strict_ok = strict_ok and (
+                    attachment_contract_ok
+                    or skinned_resolved >= max(
+                        1, int(min_semantic_skinned_resolved)
+                    )
+                )
+            if strict_ok:
+                response["ok"] = True
+                return response
+            if scene_contract_ok:
+                response["ok"] = True
+                response["semanticSceneOnlyAccepted"] = True
+                response["semanticSceneOnlyReason"] = (
+                    "DXVK semantic scene submitted and consumed draw packets; "
+                    "native backend counters are not required for this visual "
+                    "validation gate"
+                )
+                return response
+            if direct_currentdraw_contract_ok:
+                response["ok"] = True
+                response["semanticSceneOnlyAccepted"] = True
+                response["semanticSceneOnlyReason"] = (
+                    "current-draw canonical scene submitted skinned packets "
+                    "with fallback disabled; this Phase 3 validation path does "
+                    "not require the older semantic core/manifest consumer"
+                )
+                response["semanticShadowPhase"] = "current-draw-direct-ok"
+                return response
+            if allow_semantic_static_world_only and static_world_contract_ok:
+                response["ok"] = True
+                response["semanticSceneOnlyAccepted"] = True
+                response["semanticSceneOnlyReason"] = (
+                    "static-world canonical scene submitted building/destructible "
+                    "packets with fallback disabled"
+                )
+                response["semanticShadowPhase"] = "static-world-direct-ok"
+                return response
+            if (
+                bool(allow_scene_pending_if_core_and_currentdraw_ready)
+                and semantic_contract_ok
+                and fallback == 0
+                and currentdraw_query_hit > 0
+                and currentdraw_palette_hit > 0
+                and currentdraw_group_decode_hit > 0
+            ):
+                response["ok"] = True
+                response["semanticSceneOnlyAccepted"] = True
+                response["semanticSceneOnlyReason"] = (
+                    "semantic core is fresh, current-draw contract/palette/group-slot "
+                    "queries are hot, and isolated-desktop render-scene consumption "
+                    "is stalled at tail; accepted as low-pressure tail artifact"
+                )
+                response["semanticShadowPhase"] = "low-pressure-tail-accepted"
+                return response
+            if (
+                semantic_contract_ok
+                and manifest_ok
+                and scene_submitted > 0
+                and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+                and scene_status.get("semanticSceneWaitingForRenderPass")
+                and scene_lag <= 16
+                and scene_frame_serial > 0
+                and core_frame_serial > 0
+                and scene_frame_serial <= core_frame_serial
+                and (core_frame_serial - scene_frame_serial) <= 1
+            ):
+                response["ok"] = True
+                response["semanticTailSceneNearLatestAccepted"] = True
+                response["semanticTailSceneNearLatestReason"] = (
+                    "semantic core is fresh and the DXVK render-scene pass has "
+                    "already consumed the immediately previous semantic frame "
+                    "with fallback disabled; the latest publish revision is "
+                    "waiting for one more isolated-desktop render tick, so this "
+                    "is accepted as a tail-frame validation artifact"
+                )
+                return response
+
+            core_packets_present = (
+                submitted > 0
+                and fallback == 0
+                and semantic_resolved >= max(0, int(min_semantic_resolved))
+            )
+            if (
+                core_packets_present
+                and scene_status.get("semanticSceneWaitingForRenderPass")
+            ):
+                if native_draws > 0:
+                    response["semanticShadowPhase"] = (
+                        "native-semantic-executed-scene-pending"
+                    )
+                    response["semanticNativeExecuted"] = True
+                    response["semanticShadowPhaseReason"] = (
+                        "native D3D9 backend has successfully executed semantic "
+                        "draws, but the DXVK render-scene validation pass has "
+                        "not consumed the latest semantic publish revision yet"
+                    )
+                else:
+                    response["semanticShadowPhase"] = (
+                        "core-fresh-waiting-render-scene"
+                        if frame_fresh
+                        else "core-packets-waiting-render-scene"
+                    )
+                    response["semanticShadowPhaseReason"] = (
+                        "semantic core has submitted draw packets, but the DXVK "
+                        "render-scene pass has not consumed the latest semantic "
+                        "publish revision yet"
+                    )
+                if not frame_fresh:
+                    response["semanticShadowPhaseReason"] += (
+                        "; semantic core freshness is also pending because the "
+                        "latest render-scene tick has not advanced"
+                    )
+                if response.get("runtimeRenderTailStalled"):
+                    response["semanticShadowPhaseReason"] += (
+                        "; runtime frame advance is stalled after in-game render "
+                        "readiness, so this is a render-scene consumption wait, "
+                        "not a semantic data-chain miss"
+                    )
+                response["error"] = response["semanticShadowPhaseReason"]
+
+            pending_without_consumer = (
+                response.get("runtimeRenderTailStalled")
+                and bool(latest_summary.get("semanticCoreBuildRequestPending", False))
+                and not bool(latest_summary.get("semanticCoreBuildInProgress", False))
+                and submitted <= 0
+                and scene_submitted <= 0
+            )
+            if pending_without_consumer and frame_stall_sec >= 8.0:
+                response["semanticShadowPhase"] = "core-build-pending-no-render-consumer"
+                response["semanticShadowPhaseReason"] = (
+                    "semantic contract is pending, but the isolated-desktop "
+                    "runtime frame has stopped advancing before the DXVK render "
+                    "scene consumed any build chunks; this is a render-thread "
+                    "consumer timing blocker, not a control-plane timeout"
+                )
+                response["error"] = response["semanticShadowPhaseReason"]
+                return response
+
+            if attachment_contract_ok:
+                response["semanticAttachmentRigidOnlyAccepted"] = True
+                response["semanticAttachmentRigidGateSatisfied"] = True
+                if not response.get("semanticShadowPhase"):
+                    response["semanticShadowPhase"] = (
+                        "attachment-rigid-ok-skinned-pending"
+                    )
+                    response["semanticShadowPhaseReason"] = (
+                        "attachment rigid semantic path is producing submitted draw "
+                        "packets with fallback disabled; skinned/upper-layer/native "
+                        "gates remain pending"
+                    )
+                if bool(allow_semantic_attachment_rigid_only):
+                    response["ok"] = True
+                else:
+                    response["error"] = response["semanticShadowPhaseReason"]
+                return response
+
+            if (
+                semantic_contract_ok
+                and (explicit_rigid > 0 or rigid_resolved > 0)
+                and skinned_resolved <= 0
+            ):
+                response["semanticShadowPhase"] = (
+                    "semantic-rigid-ok-skinned-pending"
+                )
+                response["semanticShadowPhaseReason"] = (
+                    "semantic rigid path is producing draw packets, but skinned "
+                    "gate is still pending"
+                )
+                if bool(allow_semantic_rigid_only):
+                    response["ok"] = True
+                    response["semanticRigidOnlyAccepted"] = True
+                    response["error"] = ""
+                    return response
+
+            time.sleep(0.5)
+
+        response["ok"] = False
+        response["elapsedSec"] = round(time.time() - t0, 3)
+        response["error"] = response.get("error") or "等待 hot shadow summary 超时"
+        response["detail"] = last_detail
+        return response
+
+    require_frame_advance = int(min_frame_advance) > 0
+    pipe_ready = _control_plane_request(
+        pid=target_pid,
+        command="wait_until",
+        payload={
+            "timeoutSec": timeout_sec,
+            "pollIntervalMs": 50,
+            "requireFrameAdvance": require_frame_advance,
+            "minFrameAdvance": max(0, int(min_frame_advance)),
+            "requireSemanticFrameFresh": bool(require_semantic_frame_fresh),
+            "requireSemanticSceneConsumed": bool(require_semantic_scene_consumed),
+            "minVisibleCount": max(0, int(min_visible_count)),
+            "minStableIdentityCount": max(0, int(min_stable_identity_count)),
+            "minUnitCount": max(0, int(min_unit_count)),
+            "minSemanticResolved": max(0, int(min_semantic_resolved)),
+            "minSemanticSkinnedResolved": max(0, int(min_semantic_skinned_resolved)),
+            "requestSemanticFrameBuild": True,
+            "forceSemanticFrameBuild": True,
+            "allowControlPlaneSemanticDrain": True,
+            "allowPreInGameSemanticBuild": False,
+            "semanticBuildMinIntervalMs": 0,
+            "semanticBuildDrainMaxChunks": 32,
+            "semanticBuildDrainBudgetUs": 50000,
+            "semanticBuildDrainRecordCeiling": 1024,
+            "stalledFrameTimeoutMs": 3000,
+        },
+        timeout_sec=max(2.0, float(timeout_sec) + 2.0),
+    )
+    if not pipe_ready.get("transportOk"):
+        return {
+            "ok": False,
+            "mode": "control-plane-hot-frame",
+            "pid": target_pid,
+            "elapsedSec": round(float(pipe_ready.get("elapsedSec", 0.0) or 0.0), 3),
+            "error": str(pipe_ready.get("error", "control plane 不可用")),
+            "detail": pipe_ready,
+        }
+
+    result = dict(pipe_ready.get("result", {}) or {})
+    runtime_status = dict(result.get("runtimeStatus", {}) or {})
+    wait_stalled = str(pipe_ready.get("error", "") or "") == "wait_until stalled"
+    response = {
+        "ok": bool(pipe_ready.get("ok")),
+        "mode": "control-plane-hot-frame",
+        "pid": target_pid,
+        "elapsedSec": round(float(pipe_ready.get("elapsedSec", 0.0) or 0.0), 3),
+        "runtimeStatus": runtime_status,
+        "frameManifestSummary": dict(result.get("frameManifestSummary", {}) or {}),
+        "shadowRuntimeSummary": dict(result.get("shadowRuntimeSummary", {}) or {}),
+        "readyFrameBaseline": int(result.get("readyFrameBaseline", 0) or 0),
+        "requestedSemanticFrameBuild": bool(result.get("requestedSemanticFrameBuild", False)),
+        "semanticBuildRequestReason": str(result.get("semanticBuildRequestReason", "") or ""),
+        "error": str(pipe_ready.get("error", "") or ""),
+        "detail": pipe_ready,
+    }
+    response.update(
+        _runtime_frame_progress_status(
+            runtime_status,
+            frame_advance_stalled=wait_stalled,
+            frame_stall_sec=float(result.get("stalledFrameTimeoutMs", 0) or 0) / 1000.0
+            if wait_stalled
+            else 0.0,
+        )
+    )
+    latest_summary = dict(response.get("shadowRuntimeSummary", {}) or {})
+    if not response.get("ok"):
+        refreshed_summary, refresh_detail = _refresh_shadow_runtime_summary_until(
+            pid=target_pid,
+            wait_sec=max(0, int(post_failure_summary_wait_sec)),
+            min_submitted_draw_count=1,
+            min_attachment_rigid_resolved=max(
+                0,
+                int(min_semantic_attachment_rigid_resolved),
+            ),
+            require_semantic_frame_fresh=bool(require_semantic_frame_fresh),
+        )
+        if refreshed_summary:
+            response["shadowRuntimeSummary"] = refreshed_summary
+            response["postFailureSummaryRefresh"] = refresh_detail
+            latest_summary = refreshed_summary
+
+    semantic_resolved = _shadow_summary_int(latest_summary, "semanticCoreResolved")
+    submitted = _shadow_summary_int(latest_summary, "semanticCoreSubmittedDrawCount")
+    rigid_resolved = _shadow_summary_int(latest_summary, "semanticCoreRigidResolved")
+    explicit_rigid = _shadow_summary_int(
+        latest_summary,
+        "semanticCoreExplicitResourceOwnerRigidResolved",
+    )
+    attachment_resolved = _shadow_summary_int(
+        latest_summary,
+        "semanticCoreAttachmentRigidResolved",
+    )
+    attachment_supplemental_resolved = _shadow_summary_int(
+        latest_summary,
+        "semanticCoreAttachmentRigidSupplementalResolvedCount",
+    )
+    skinned_resolved = _shadow_summary_int(
+        latest_summary,
+        "semanticCoreSkinnedResolved",
+    )
+    fallback = _shadow_summary_int(latest_summary, "objectFallbackDrawCount")
+    frame_fresh = bool(latest_summary.get("semanticCoreFrameFresh", False))
+    scene_status = _semantic_scene_consumption_status(latest_summary)
+    response.update(scene_status)
+    native_draws = _native_execute_success_draw_count(latest_summary)
+    response["nativeD3D9BackendEffectiveExecutedDrawCount"] = native_draws
+    scene_submitted = _shadow_summary_int(
+        latest_summary,
+        "semanticSceneLastSubmittedDrawCount",
+    )
+    scene_skinned = _shadow_summary_int(
+        latest_summary,
+        "semanticSceneSubmittedSkinned",
+    )
+    scene_building = _shadow_summary_int(
+        latest_summary,
+        "semanticSceneSubmittedBuilding",
+    )
+    scene_destructible = _shadow_summary_int(
+        latest_summary,
+        "semanticSceneSubmittedDestructible",
+    )
+    explicit_rigid_scene = _shadow_summary_int(
+        latest_summary,
+        "semanticSceneAcceptedExplicitResourceOwnerRigid",
+    )
+    currentdraw_query_hit = _shadow_summary_int(
+        latest_summary,
+        "currentDrawContractQueryHitCount",
+    )
+    currentdraw_palette_hit = _shadow_summary_int(
+        latest_summary,
+        "currentDrawCapturedPaletteQueryHitCount",
+    )
+    currentdraw_group_decode_hit = _shadow_summary_int(
+        latest_summary,
+        "currentDrawGroupSlotDecodeHitCount",
+    )
+    scene_lag = int(scene_status.get("semanticScenePublishRevisionLag", 0) or 0)
+    scene_frame_serial = int(
+        scene_status.get("semanticSceneLastFrameSerial", 0) or 0
+    )
+    core_frame_serial = int(scene_status.get("semanticCoreFrameSerial", 0) or 0)
+    manifest_summary = dict(response.get("frameManifestSummary", {}) or {})
+    manifest_ok = True
+    if manifest_summary:
+        manifest_ok = (
+            _shadow_summary_int(manifest_summary, "visibleCount")
+            >= max(0, int(min_visible_count))
+            and _shadow_summary_int(manifest_summary, "recordsWithStableIdentity")
+            >= max(0, int(min_stable_identity_count))
+            and _shadow_summary_int(manifest_summary, "unitCount")
+            >= max(0, int(min_unit_count))
+        )
+    core_contract_ok = (
+        semantic_resolved >= max(0, int(min_semantic_resolved))
+        and submitted > 0
+        and fallback == 0
+        and (not bool(require_semantic_frame_fresh) or frame_fresh)
+    )
+    semantic_contract_ok = (
+        core_contract_ok
+        and (
+            not bool(require_semantic_scene_consumed)
+            or bool(scene_status.get("semanticSceneConsumptionFresh"))
+        )
+    )
+    scene_contract_ok = (
+        scene_submitted > 0
+        and fallback == 0
+        and manifest_ok
+        and (
+            not bool(require_semantic_scene_consumed)
+            or bool(scene_status.get("semanticSceneConsumptionFresh"))
+        )
+        and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+    )
+    static_world_scene_submitted = (
+        scene_building + scene_destructible + explicit_rigid_scene
+    )
+    static_world_contract_ok = (
+        scene_submitted > 0
+        and fallback == 0
+        and manifest_ok
+        and static_world_scene_submitted
+        >= max(0, int(min_semantic_static_world_submitted))
+        and (
+            not bool(require_semantic_scene_consumed)
+            or bool(scene_status.get("semanticSceneConsumptionFresh"))
+        )
+    )
+    direct_currentdraw_contract_ok = (
+        scene_submitted > 0
+        and fallback == 0
+        and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+        and _shadow_summary_int(
+            latest_summary,
+            "semanticSceneCurrentDrawResolveReadyCount",
+        )
+        > 0
+        and _shadow_summary_int(
+            latest_summary,
+            "semanticSceneCanonicalReadyCount",
+        )
+        > 0
+        and bool(scene_status.get("semanticSceneDirectCurrentDrawConsumed"))
+    )
+    core_packets_present = (
+        submitted > 0
+        and fallback == 0
+        and semantic_resolved >= max(0, int(min_semantic_resolved))
+    )
+    if (
+        core_packets_present
+        and scene_status.get("semanticSceneWaitingForRenderPass")
+    ):
+        if native_draws > 0:
+            response["semanticShadowPhase"] = (
+                "native-semantic-executed-scene-pending"
+            )
+            response["semanticNativeExecuted"] = True
+            response["semanticShadowPhaseReason"] = (
+                "native D3D9 backend has successfully executed semantic draws, "
+                "but the DXVK render-scene validation pass has not consumed the "
+                "latest semantic publish revision yet"
+            )
+        else:
+            response["semanticShadowPhase"] = (
+                "core-fresh-waiting-render-scene"
+                if frame_fresh
+                else "core-packets-waiting-render-scene"
+            )
+            response["semanticShadowPhaseReason"] = (
+                "semantic core has submitted draw packets, but the DXVK "
+                "render-scene pass has not consumed the latest semantic publish "
+                "revision yet"
+            )
+        if not frame_fresh:
+            response["semanticShadowPhaseReason"] += (
+                "; semantic core freshness is also pending because the latest "
+                "render-scene tick has not advanced"
+            )
+        if response.get("runtimeRenderTailStalled"):
+            response["semanticShadowPhaseReason"] += (
+                "; runtime frame advance is stalled after in-game render "
+                "readiness, so this is a render-scene consumption wait, not a "
+                "semantic data-chain miss"
+            )
+        if not response.get("ok"):
+            response["error"] = response["semanticShadowPhaseReason"]
+    attachment_contract_ok = (
+        core_contract_ok
+        and max(attachment_resolved, attachment_supplemental_resolved)
+        >= max(1, int(min_semantic_attachment_rigid_resolved))
+    )
+    attachment_gate_ok = (
+        int(min_semantic_attachment_rigid_resolved) <= 0
+        or attachment_contract_ok
+        or skinned_resolved >= max(1, int(min_semantic_skinned_resolved))
+    )
+    if scene_contract_ok:
+        response["ok"] = True
+        response["semanticSceneOnlyAccepted"] = True
+        response["semanticSceneOnlyReason"] = (
+            "DXVK semantic scene submitted and consumed draw packets; native "
+            "backend counters are not required for this visual validation gate"
+        )
+        response["error"] = ""
+        return response
+    if direct_currentdraw_contract_ok:
+        response["ok"] = True
+        response["semanticSceneOnlyAccepted"] = True
+        response["semanticSceneOnlyReason"] = (
+            "current-draw canonical scene submitted skinned packets with "
+            "fallback disabled; this Phase 3 validation path does not require "
+            "the older semantic core/manifest consumer"
+        )
+        response["semanticShadowPhase"] = "current-draw-direct-ok"
+        response["error"] = ""
+        return response
+    if allow_semantic_static_world_only and static_world_contract_ok:
+        response["ok"] = True
+        response["semanticSceneOnlyAccepted"] = True
+        response["semanticSceneOnlyReason"] = (
+            "static-world canonical scene submitted building/destructible "
+            "packets with fallback disabled"
+        )
+        response["semanticShadowPhase"] = "static-world-direct-ok"
+        response["error"] = ""
+        return response
+    if (
+        bool(allow_scene_pending_if_core_and_currentdraw_ready)
+        and core_contract_ok
+        and currentdraw_query_hit > 0
+        and currentdraw_palette_hit > 0
+        and currentdraw_group_decode_hit > 0
+    ):
+        response["ok"] = True
+        response["semanticSceneOnlyAccepted"] = True
+        response["semanticSceneOnlyReason"] = (
+            "semantic core is fresh, current-draw contract/palette/group-slot "
+            "queries are hot, and isolated-desktop render-scene consumption is "
+            "stalled at tail; accepted as low-pressure tail artifact"
+        )
+        response["semanticShadowPhase"] = "low-pressure-tail-accepted"
+        response["error"] = ""
+        return response
+    if (
+        not response.get("ok")
+        and scene_contract_ok
+        and attachment_gate_ok
+        and native_draws >= max(0, int(min_native_executed_draw_count))
+    ):
+        response["ok"] = True
+        response["semanticSceneOnlyAccepted"] = True
+        response["originalError"] = response.get("error", "")
+        response["error"] = ""
+        response["semanticSceneOnlyReason"] = (
+            "DXVK semantic scene submitted and consumed draw packets with "
+            "fallback disabled; this gate does not require the control-plane "
+            "wait_until call to classify the final state as stalled"
+        )
+    if (
+        not response.get("ok")
+        and wait_stalled
+        and semantic_contract_ok
+        and manifest_ok
+        and skinned_resolved >= max(0, int(min_semantic_skinned_resolved))
+        and native_draws >= max(0, int(min_native_executed_draw_count))
+        and attachment_gate_ok
+    ):
+        response["ok"] = True
+        response["semanticTailFrameAccepted"] = True
+        response["originalError"] = response.get("error", "")
+        response["error"] = ""
+        response["semanticTailFrameReason"] = (
+            "semantic frame was fresh, consumed by the render scene, and "
+            "executed by the native backend before the isolated-desktop frame "
+            "advance gate stalled"
+        )
+    if (
+        not response.get("ok")
+        and wait_stalled
+        and scene_contract_ok
+        and manifest_ok
+    ):
+        response["ok"] = True
+        response["semanticTailSceneAccepted"] = True
+        response["originalError"] = response.get("error", "")
+        response["error"] = ""
+        response["semanticTailSceneReason"] = (
+            "semantic scene submitted and consumed draw packets before the "
+            "isolated-desktop frame advance gate stalled; core counters may be "
+            "reset by EndFrame flush, so the scene submission counters are the "
+            "authoritative visual-consumption signal for this gate"
+        )
+    if (
+        not response.get("ok")
+        and (
+            wait_stalled
+            or scene_status.get("semanticSceneWaitingForRenderPass")
+        )
+        and frame_fresh
+        and core_contract_ok
+        and manifest_ok
+        and scene_submitted > 0
+        and scene_skinned >= max(0, int(min_semantic_skinned_resolved))
+        and scene_lag <= 16
+        and scene_frame_serial > 0
+        and core_frame_serial > 0
+        and scene_frame_serial <= core_frame_serial
+        and (core_frame_serial - scene_frame_serial) <= 1
+    ):
+        response["ok"] = True
+        response["semanticTailSceneNearLatestAccepted"] = True
+        response["originalError"] = response.get("error", "")
+        response["error"] = ""
+        response["semanticTailSceneNearLatestReason"] = (
+            "semantic core was advanced by the bounded control-plane tail drain "
+            "after the isolated-desktop render tick stalled; the DXVK scene had "
+            "already consumed the immediately previous semantic frame with "
+            "fallback disabled, so this is accepted as a tail-frame validation "
+            "artifact rather than a data-chain failure"
+        )
+    if attachment_contract_ok:
+        response["semanticAttachmentRigidOnlyAccepted"] = True
+        response["semanticAttachmentRigidGateSatisfied"] = True
+        if not response.get("semanticShadowPhase"):
+            response["semanticShadowPhase"] = "attachment-rigid-ok-skinned-pending"
+            response["semanticShadowPhaseReason"] = (
+                "attachment rigid semantic path is producing submitted draw packets "
+                "with fallback disabled; skinned/upper-layer/native gates remain pending"
+            )
+        if not response.get("ok"):
+            response["originalError"] = response.get("error", "")
+            response["error"] = response["semanticShadowPhaseReason"]
+        if bool(allow_semantic_attachment_rigid_only):
+            response["ok"] = True
+            response["error"] = ""
+
+    if (
+        not response.get("ok")
+        and bool(allow_semantic_rigid_only)
+        and semantic_contract_ok
+        and (explicit_rigid > 0 or rigid_resolved > 0)
+    ):
+        response["ok"] = True
+        response["semanticRigidOnlyAccepted"] = True
+        response["originalError"] = response.get("error", "")
+        response["error"] = ""
+        response["semanticRigidOnlyReason"] = (
+            "semantic rigid path is producing submitted draw packets with "
+            "fallback disabled; skinned/attachment gates remain pending"
+        )
+    elif not response.get("ok") and semantic_contract_ok and skinned_resolved <= 0:
+        response.setdefault("semanticShadowPhase", "semantic-rigid-ok-skinned-pending")
+        response.setdefault(
+            "semanticShadowPhaseReason",
+            "semantic rigid path is producing draw packets, but skinned gate is still pending",
+        )
+    if (
+        not response.get("ok")
+        or int(min_native_executed_draw_count) <= 0
+        or response.get("semanticSceneOnlyAccepted")
+        or response.get("semanticTailSceneAccepted")
+        or response.get("semanticTailSceneNearLatestAccepted")
+    ):
+        return response
+
+    if native_draws >= int(min_native_executed_draw_count):
+        return response
+
+    deadline = t0 + float(timeout_sec)
+    last_detail: Dict[str, Any] = {}
+    while time.time() < deadline:
+        latest = _control_plane_request(
+            pid=target_pid,
+            command="get_shadow_runtime_summary",
+            payload={
+                "refreshSemanticFrameIfStale": True,
+                "forceSemanticFrameBuild": True,
+                "allowControlPlaneSemanticDrain": True,
+                "semanticBuildMinIntervalMs": 0,
+                "semanticBuildDrainMaxChunks": 32,
+                "semanticBuildDrainBudgetUs": 50000,
+                "semanticBuildDrainRecordCeiling": 1024,
+            },
+            timeout_sec=2.0,
+        )
+        last_detail = latest
+        if latest.get("transportOk") and latest.get("ok"):
+            latest_summary = dict(latest.get("result", {}) or {})
+            native_draws = _native_execute_success_draw_count(latest_summary)
+            if native_draws >= int(min_native_executed_draw_count):
+                response["shadowRuntimeSummary"] = latest_summary
+                response["nativeD3D9BackendEffectiveExecutedDrawCount"] = (
+                    native_draws
+                )
+                response["elapsedSec"] = round(time.time() - t0, 3)
+                response["nativeExecuteWaitMode"] = "control-plane-summary"
+                response["nativeExecuteWaitDetail"] = latest
+                return response
+        time.sleep(0.1)
+
+    response["ok"] = False
+    response["error"] = (
+        f"等待 native D3D9 effective executed draw count>="
+        f"{int(min_native_executed_draw_count)} 超时"
+    )
+    response["elapsedSec"] = round(time.time() - t0, 3)
+    response["shadowRuntimeSummary"] = latest_summary
+    response["nativeExecuteWaitMode"] = "control-plane-summary"
+    response["nativeExecuteWaitDetail"] = last_detail
+    return response
 
 
 @mcp.tool()
@@ -3353,6 +8322,27 @@ def wait_for_war3_window_ready(
         timeout_sec=max(1, int(timeout_sec)),
         min_cpu_sec=max(0.0, float(min_cpu_sec)),
         stable_sec=max(0.1, float(stable_sec)),
+    )
+
+
+@mcp.tool()
+def send_war3_input_plan(
+    actions_json: str,
+    pid: int = 0,
+    timeout_sec: int = 20,
+) -> Dict[str, Any]:
+    """在目标隔离桌面执行键盘/客户端坐标点击计划；不会切换当前桌面。"""
+    target_pid = pid or (STATE.war3_pid or 0)
+    try:
+        actions = json.loads(str(actions_json or "[]"))
+    except Exception as exc:
+        return {"ok": False, "error": f"actions_json 解析失败: {exc}"}
+    if not isinstance(actions, list):
+        return {"ok": False, "error": "actions_json 必须是 JSON array"}
+    return _run_war3_input_plan(
+        pid=int(target_pid),
+        actions=actions,
+        timeout_sec=max(2, int(timeout_sec)),
     )
 
 
@@ -3623,7 +8613,7 @@ def capture_war3_screenshot(
     timeout_sec: int = 8,
     fallback_to_window_capture: bool = True,
 ) -> Dict[str, Any]:
-    """抓取 War3 最终帧图片（优先内部截图，失败时回退窗口抓图）。"""
+    """抓取 War3 最终帧；隔离 Desktop 永不回退到当前输入桌面截图。"""
     target_pid = pid or (STATE.war3_pid or 0)
     if target_pid <= 0:
         return {"ok": False, "error": "无有效 pid"}
@@ -3637,6 +8627,7 @@ def capture_war3_screenshot(
     _ensure_dir(out.parent)
 
     internal_res: Optional[Dict[str, Any]] = None
+    isolated_desktop = _uses_isolated_desktop(target_pid)
     if prefer_internal:
         internal_res = _request_internal_frame_capture(
             pid=target_pid,
@@ -3648,6 +8639,16 @@ def capture_war3_screenshot(
             return internal_res
         if not fallback_to_window_capture:
             return internal_res
+
+    if isolated_desktop:
+        return {
+            "ok": False,
+            "pid": target_pid,
+            "mode": "isolated-window-capture-blocked",
+            "error": "隔离 Desktop 的内部截图不可用；拒绝回退并捕获当前可见桌面",
+            "internalAttempt": internal_res or {},
+            "fallbackUsed": False,
+        }
 
     fallback_out = out if out.suffix.lower() == ".png" else out.with_suffix(".png")
     result = _powershell_capture_window(target_pid, fallback_out)
@@ -3671,7 +8672,7 @@ def invoke_internal_test_api(
     war3_dir: str = "",
     timeout_sec: int = 6,
 ) -> Dict[str, Any]:
-    """通过 internal_test_request.json 调用游戏内测试 API。"""
+    """通过 named pipe control plane 调用游戏内测试命令。"""
     target_pid = pid or (STATE.war3_pid or 0)
     if target_pid <= 0:
         return {"ok": False, "error": "无有效 pid"}
@@ -3801,6 +8802,7 @@ def capture_shadow_factor_sequence(
     label: str = "",
     frame_count: int = 5,
     interval_sec: float = 0.25,
+    warmup_sec: float = 0.35,
     timeout_sec: int = 8,
 ) -> Dict[str, Any]:
     """切换阴影调试模式并抓取一组连续最终帧，用于稳定性比较。"""
@@ -3809,7 +8811,12 @@ def capture_shadow_factor_sequence(
         return {"ok": False, "error": "无有效 pid"}
     target_war3_dir = Path(war3_dir) if war3_dir else (STATE.war3_dir or DEFAULT_WAR3_DIR)
     mode_name = str(mode or "shadow_factor").strip().lower()
-    debug_mode = 2 if mode_name in ("shadow_factor", "shadowfactor", "factor") else 0
+    if mode_name in ("shadow_factor", "shadowfactor", "factor"):
+        debug_mode = 2
+    elif mode_name in ("point_shadow", "pointshadow", "point"):
+        debug_mode = 6
+    else:
+        debug_mode = 0
 
     set_mode = _invoke_internal_test_request(
         pid=target_pid,
@@ -3820,6 +8827,8 @@ def capture_shadow_factor_sequence(
     )
     if not set_mode.get("ok"):
         return {"ok": False, "stage": "set-debug-mode", "detail": set_mode}
+    if float(warmup_sec) > 0.0:
+        time.sleep(max(0.0, float(warmup_sec)))
 
     out_dir = _ensure_dir(ARTIFACT_ROOT / "city_suite" / _now_compact() / (label or mode_name))
     frame_rows: List[Dict[str, Any]] = []
@@ -3832,6 +8841,27 @@ def capture_shadow_factor_sequence(
             output_path=out_path,
             timeout_sec=max(2.0, float(timeout_sec)),
         )
+        status_after = _read_runtime_status_best_effort(target_pid) or {}
+        cap["runtimeStatusAfterCapture"] = status_after
+        shadow_status = status_after.get("shadow", {}) if isinstance(status_after, dict) else {}
+        cap["shadowSummaryAfterCapture"] = {
+            "semanticSceneReceiverInputValid": shadow_status.get("semanticSceneReceiverInputValid"),
+            "semanticSceneReceiverInputRejectReason": shadow_status.get("semanticSceneReceiverInputRejectReason"),
+            "semanticSceneReceiverNeedPass": shadow_status.get("semanticSceneReceiverNeedPass"),
+            "semanticSceneReceiverNeedShadowMap": shadow_status.get("semanticSceneReceiverNeedShadowMap"),
+            "semanticSceneReceiverHasCompleteShadowMap": shadow_status.get("semanticSceneReceiverHasCompleteShadowMap"),
+            "semanticSceneReceiverHasUsableDirectionalShadow": shadow_status.get("semanticSceneReceiverHasUsableDirectionalShadow"),
+            "semanticSceneReceiverActiveStrengthMilli": shadow_status.get("semanticSceneReceiverActiveStrengthMilli"),
+            "semanticSceneReceiverUboStrengthMilli": shadow_status.get("semanticSceneReceiverUboStrengthMilli"),
+            "semanticSceneReceiverDebugMode": shadow_status.get("semanticSceneReceiverDebugMode"),
+            "semanticSceneReceiverCsmCascadeCount": shadow_status.get("semanticSceneReceiverCsmCascadeCount"),
+            "semanticSceneReceiverReuseShadowMap": shadow_status.get("semanticSceneReceiverReuseShadowMap"),
+            "semanticSceneShadowMapSkinnedDrawnCount": shadow_status.get("semanticSceneShadowMapSkinnedDrawnCount"),
+            "semanticSceneReplayDrawsCount": shadow_status.get("semanticSceneReplayDrawsCount"),
+            "semanticSceneSubmittedSkinned": shadow_status.get("semanticSceneSubmittedSkinned"),
+            "semanticSceneCurrentDrawResolveReadyCount": shadow_status.get("semanticSceneCurrentDrawResolveReadyCount"),
+            "objectFallbackDrawCount": shadow_status.get("objectFallbackDrawCount"),
+        }
         frame_rows.append(cap)
         if not cap.get("ok"):
             return {
@@ -3852,6 +8882,237 @@ def capture_shadow_factor_sequence(
         "outputDir": str(out_dir),
         "frames": frame_rows,
         "comparison": comparison,
+    }
+
+
+@mcp.tool()
+def capture_shadow_factor_camera_step_sequence(
+    pid: int = 0,
+    war3_dir: str = "",
+    mode: str = "shadow_factor",
+    label: str = "",
+    frame_count: int = 6,
+    interval_sec: float = 0.20,
+    warmup_sec: float = 0.35,
+    rotation_step: float = 0.0,
+    angle_step: float = 0.0,
+    target_distance_step: float = 0.0,
+    z_offset_step: float = 0.0,
+    quick_position: bool = True,
+    input_fallback: bool = True,
+    input_key: str = "RIGHT",
+    input_hold_ms: int = 45,
+    input_repeat: int = 1,
+    input_foreground: bool = False,
+    timeout_sec: int = 8,
+) -> Dict[str, Any]:
+    """按固定小步移动相机并抓取 shadow-factor 帧，用于排查相机运动下 CSM/TAA 抖动。"""
+    target_pid = pid or (STATE.war3_pid or 0)
+    if target_pid <= 0:
+        return {"ok": False, "error": "无有效 pid"}
+    target_war3_dir = Path(war3_dir) if war3_dir else (STATE.war3_dir or DEFAULT_WAR3_DIR)
+
+    mode_name = str(mode or "shadow_factor").strip().lower()
+    if mode_name in ("shadow_factor", "shadowfactor", "factor"):
+        debug_mode = 2
+    elif mode_name in ("motion", "motion_vector", "motionvector"):
+        debug_mode = 4
+    elif mode_name in ("point_shadow", "pointshadow", "point"):
+        debug_mode = 6
+    else:
+        debug_mode = 0
+
+    set_mode = _invoke_internal_test_request(
+        pid=target_pid,
+        war3_dir=target_war3_dir,
+        command="shadow.debug_mode",
+        payload={"mode": int(debug_mode)},
+        timeout_sec=4.0,
+    )
+    if not set_mode.get("ok"):
+        return {"ok": False, "stage": "set-debug-mode", "detail": set_mode}
+
+    snap = _invoke_internal_test_request(
+        pid=target_pid,
+        war3_dir=target_war3_dir,
+        command="camera.snapshot",
+        payload={},
+        timeout_sec=4.0,
+    )
+    if not snap.get("ok"):
+        if not bool(input_fallback):
+            return {"ok": False, "stage": "camera-snapshot", "detail": snap}
+        control_mode = "window-key-fallback"
+        snapshot = {
+            "fallbackReason": "camera.snapshot unsupported or failed",
+            "detail": snap,
+        }
+    else:
+        control_mode = "camera-command"
+        snapshot = dict(snap.get("result", {}) or {})
+
+    base_rotation = float(snapshot.get("rotation", 0.0) or 0.0)
+    base_aoa = float(snapshot.get("angleOfAttack", 0.0) or 0.0)
+    base_distance = float(snapshot.get("targetDistance", 0.0) or 0.0)
+    base_z_offset = float(snapshot.get("zOffset", 0.0) or 0.0)
+
+    if abs(float(rotation_step)) <= 1e-8:
+        rotation_step = 1.5 if abs(base_rotation) > 6.5 else 0.025
+    if abs(float(angle_step)) <= 1e-8:
+        angle_step = 0.0
+
+    if float(warmup_sec) > 0.0:
+        time.sleep(max(0.0, float(warmup_sec)))
+
+    out_dir = _ensure_dir(
+        ARTIFACT_ROOT / "city_suite" / _now_compact() /
+        (label or f"{mode_name}_camera_step"))
+    frame_rows: List[Dict[str, Any]] = []
+    frame_paths: List[Path] = []
+    camera_rows: List[Dict[str, Any]] = []
+
+    for index in range(max(2, int(frame_count))):
+        if control_mode == "camera-command":
+            apply = _invoke_internal_test_request(
+                pid=target_pid,
+                war3_dir=target_war3_dir,
+                command="camera.apply",
+                payload={
+                    "targetX": float(snapshot.get("targetX", 0.0) or 0.0),
+                    "targetY": float(snapshot.get("targetY", 0.0) or 0.0),
+                    "targetDistance": base_distance +
+                    float(target_distance_step) * float(index),
+                    "angleOfAttack": base_aoa + float(angle_step) * float(index),
+                    "rotation": base_rotation + float(rotation_step) * float(index),
+                    "zOffset": base_z_offset + float(z_offset_step) * float(index),
+                    "duration": 0.0,
+                    "quickPosition": bool(quick_position),
+                },
+                timeout_sec=4.0,
+            )
+            camera_rows.append({
+                "index": index,
+                "controlMode": control_mode,
+                "rotation": base_rotation + float(rotation_step) * float(index),
+                "angleOfAttack": base_aoa + float(angle_step) * float(index),
+                "targetDistance": base_distance +
+                float(target_distance_step) * float(index),
+                "zOffset": base_z_offset + float(z_offset_step) * float(index),
+                "apply": apply,
+            })
+        else:
+            if index == 0:
+                apply = {
+                    "ok": True,
+                    "sessionId": registered.session_id if registered is not None else "",
+                    "skipped": True,
+                    "reason": "baseline frame before input pulse",
+                }
+            else:
+                apply = _post_war3_key_pulse(
+                    pid=target_pid,
+                    key=input_key,
+                    hold_ms=int(input_hold_ms),
+                    repeat=max(1, int(input_repeat)),
+                    foreground=bool(input_foreground),
+                )
+            camera_rows.append({
+                "index": index,
+                "controlMode": control_mode,
+                "inputKey": str(input_key or "RIGHT").strip().upper(),
+                "inputHoldMs": int(input_hold_ms),
+                "inputRepeat": max(1, int(input_repeat)),
+                "inputForeground": bool(input_foreground),
+                "apply": apply,
+            })
+
+        if not apply.get("ok"):
+            return {
+                "ok": False,
+                "stage": "camera-apply" if control_mode == "camera-command" else "input-fallback",
+                "camera": camera_rows,
+                "frames": frame_rows,
+            }
+
+        if index > 0 or float(interval_sec) > 0.0:
+            time.sleep(max(0.0, float(interval_sec)))
+
+        out_path = out_dir / f"{label or mode_name}_camera_{index + 1:02d}.bmp"
+        cap = _capture_final_frame_via_internal_test_api(
+            pid=target_pid,
+            war3_dir=target_war3_dir,
+            output_path=out_path,
+            timeout_sec=max(2.0, float(timeout_sec)),
+        )
+        status_after = _read_runtime_status_best_effort(target_pid) or {}
+        shadow_status = status_after.get("shadow", {}) if isinstance(status_after, dict) else {}
+        cap["shadowSummaryAfterCapture"] = {
+            "semanticSceneReceiverInputValid": shadow_status.get("semanticSceneReceiverInputValid"),
+            "semanticSceneReceiverInputRejectReason": shadow_status.get("semanticSceneReceiverInputRejectReason"),
+            "semanticSceneReceiverNeedPass": shadow_status.get("semanticSceneReceiverNeedPass"),
+            "semanticSceneReceiverHasCompleteShadowMap": shadow_status.get("semanticSceneReceiverHasCompleteShadowMap"),
+            "semanticSceneReceiverHasUsableDirectionalShadow": shadow_status.get("semanticSceneReceiverHasUsableDirectionalShadow"),
+            "semanticSceneReceiverDebugMode": shadow_status.get("semanticSceneReceiverDebugMode"),
+            "semanticSceneReceiverCsmCascadeCount": shadow_status.get("semanticSceneReceiverCsmCascadeCount"),
+            "semanticSceneShadowTaaActive": shadow_status.get("semanticSceneShadowTaaActive"),
+            "semanticSceneShadowTaaMode": shadow_status.get("semanticSceneShadowTaaMode"),
+            "semanticSceneReplayDrawsCount": shadow_status.get("semanticSceneReplayDrawsCount"),
+            "semanticSceneShadowMapDrawnCasters": shadow_status.get("semanticSceneShadowMapDrawnCasters"),
+        }
+        frame_rows.append(cap)
+        if not cap.get("ok"):
+            return {
+                "ok": False,
+                "stage": "capture",
+                "camera": camera_rows,
+                "frames": frame_rows,
+            }
+        frame_paths.append(Path(str(cap.get("output", ""))))
+
+    comparison = _compare_bmp_sequence(frame_paths)
+    comparison_summary = dict(comparison.get("summary", {}) or {})
+    receiver_invalid = 0
+    incomplete_shadow_map = 0
+    unusable_directional_shadow = 0
+    for frame in frame_rows:
+        shadow = dict(frame.get("shadowSummaryAfterCapture", {}) or {})
+        if int(shadow.get("semanticSceneReceiverInputValid", 0) or 0) == 0:
+            receiver_invalid += 1
+        if int(shadow.get("semanticSceneReceiverHasCompleteShadowMap", 0) or 0) == 0:
+            incomplete_shadow_map += 1
+        if int(shadow.get("semanticSceneReceiverHasUsableDirectionalShadow", 0) or 0) == 0:
+            unusable_directional_shadow += 1
+    motion_aware_summary = {
+        "frameCount": len(frame_rows),
+        "movementAware": True,
+        "receiverInvalidFrames": int(receiver_invalid),
+        "incompleteShadowMapFrames": int(incomplete_shadow_map),
+        "unusableDirectionalShadowFrames": int(unusable_directional_shadow),
+        "darkRatioRangePct": comparison_summary.get("darkRatioRangePct"),
+        "avgLumaRange": comparison_summary.get("avgLumaRange"),
+        "missingShadowSuspect": bool(comparison_summary.get("missingShadowSuspect", False)),
+    }
+    dark_range = float(comparison_summary.get("darkRatioRangePct", 0.0) or 0.0)
+    luma_range = float(comparison_summary.get("avgLumaRange", 0.0) or 0.0)
+    motion_aware_summary["motionFlickerSuspect"] = bool(
+        receiver_invalid > 0 or
+        incomplete_shadow_map > 0 or
+        unusable_directional_shadow > 0 or
+        bool(comparison_summary.get("missingShadowSuspect", False)) or
+        dark_range >= 6.0 or
+        luma_range >= 12.0
+    )
+    return {
+        "ok": bool(comparison.get("ok")),
+        "mode": mode_name,
+        "debugMode": int(debug_mode),
+        "controlMode": control_mode,
+        "outputDir": str(out_dir),
+        "baseSnapshot": snapshot,
+        "camera": camera_rows,
+        "frames": frame_rows,
+        "comparison": comparison,
+        "motionAwareSummary": motion_aware_summary,
     }
 
 
@@ -3881,7 +9142,6 @@ def run_city_shadow_stability_suite(
     before_mtime = before_report.stat().st_mtime if before_report and before_report.exists() else 0.0
     log_offsets = _snapshot_log_offsets(w3)
     env_overrides = {
-        "DXVK_WAR3_INTERNAL_TEST_API": "1",
         "DXVK_WAR3_RUNTIME_BENCHMARK": "1",
         "DXVK_WAR3_RUNTIME_BENCHMARK_WARMUP_SEC": "1",
         "DXVK_WAR3_RUNTIME_BENCHMARK_SAMPLE_SEC": str(max(3, int(sample_duration_sec))),
@@ -4229,20 +9489,332 @@ def run_city_shadow_pressure_suite(
     }
 
 
+def _write_session_manifest(session: AutoTestSession) -> Dict[str, Any]:
+    try:
+        session.artifact_dir.mkdir(parents=True, exist_ok=True)
+        path = session.artifact_dir / "session.json"
+        payload = session.to_dict(alive=_registered_session_alive(session))
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        identity_path = session.instance_root.parent / "session.autotest.json"
+        identity_path.parent.mkdir(parents=True, exist_ok=True)
+        identity_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        event_path = session.artifact_dir / "dbwin.jsonl"
+        first_id = max(0, int(session.debug_seq) - 1000)
+        event_rows = session.get_events(first_id, 1000)
+        event_text = "".join(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for row in event_rows
+        )
+        event_path.write_text(event_text, encoding="utf-8")
+        return {
+            "ok": True,
+            "path": str(path),
+            "identityPath": str(identity_path),
+            "dbwinPath": str(event_path),
+            "dbwinEventsWritten": len(event_rows),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _stop_registered_session(
+    session_id: str,
+    graceful_wait_sec: int,
+    force: bool,
+    avoid_foreground_switch: bool,
+) -> Dict[str, Any]:
+    session = SESSION_REGISTRY.get(session_id=str(session_id or ""))
+    if session is None:
+        return {"ok": False, "error": f"未找到 session_id: {session_id}"}
+    target_pid = int(session.pid or 0)
+    alive = _registered_session_alive(session)
+    close_sent = False
+    shutdown_session: Dict[str, Any] = {"ok": True, "skipped": True, "reason": "process already stopped"}
+
+    if alive and not avoid_foreground_switch:
+        shutdown_session = _control_plane_request(
+            pid=target_pid,
+            command="shutdown_session",
+            payload={},
+            timeout_sec=2.0,
+        )
+        close_sent = _post_close(target_pid)
+        deadline = time.time() + max(1, int(graceful_wait_sec))
+        while time.time() < deadline and _registered_session_alive(session):
+            time.sleep(0.25)
+        alive = _registered_session_alive(session)
+
+    if alive and avoid_foreground_switch and not force:
+        _taskkill(target_pid, force=False)
+        time.sleep(0.6)
+        alive = _registered_session_alive(session)
+
+    forced_by_job = False
+    if alive and force:
+        # 关闭 KILL_ON_JOB_CLOSE handle 会同时回收 War3 及其所有子进程。
+        if int(session.job_handle or 0):
+            forced_by_job = _close_job_handle(session.job_handle)
+            session.job_handle = 0
+        if not forced_by_job:
+            _taskkill(target_pid, force=True)
+        time.sleep(0.6)
+        alive = _registered_session_alive(session)
+
+    desktop_result: Dict[str, Any]
+    if not alive:
+        if int(session.job_handle or 0):
+            _close_job_handle(session.job_handle)
+            session.job_handle = 0
+        if int(session.desktop_handle or 0):
+            handle = int(session.desktop_handle)
+            desktop_result = {
+                "ok": _close_desktop_handle(handle),
+                "name": session.desktop_name,
+                "handle": handle,
+            }
+            session.desktop_handle = 0
+        else:
+            desktop_result = {"ok": True, "skipped": True, "reason": "无隔离桌面"}
+        session.process = None
+        SESSION_REGISTRY.mark_stopped(session.session_id, "stop_war3_batch/stop_war3")
+    else:
+        desktop_result = {"ok": True, "skipped": True, "reason": "进程仍存活"}
+
+    manifest = _write_session_manifest(session)
+    return {
+        "ok": not alive,
+        "stopped": not alive,
+        "runId": session.run_id,
+        "sessionId": session.session_id,
+        "pid": target_pid,
+        "closeSent": close_sent,
+        "forced": bool(force),
+        "forcedByJobObject": forced_by_job,
+        "avoidForegroundSwitch": bool(avoid_foreground_switch),
+        "shutdownSession": shutdown_session,
+        "desktop": desktop_result,
+        "manifest": manifest,
+    }
+
+
+@mcp.tool()
+def list_war3_sessions(run_id: str = "", include_stopped: bool = True) -> Dict[str, Any]:
+    """列出所有多实例会话；每行包含独立 PID、根目录、Desktop、Job 与工件目录。"""
+    rows = []
+    for session in SESSION_REGISTRY.list(run_id=run_id, include_stopped=include_stopped):
+        alive = _registered_session_alive(session)
+        rows.append(session.to_dict(alive=alive))
+    return {"ok": True, "runId": run_id, "count": len(rows), "sessions": rows}
+
+
+@mcp.tool()
+def stop_war3_batch(
+    session_ids_json: str = "",
+    run_id: str = "",
+    graceful_wait_sec: int = 8,
+    force: bool = True,
+    avoid_foreground_switch: bool = True,
+) -> Dict[str, Any]:
+    """按 session_id 列表或 run_id 停止一批会话，不影响其他批次。"""
+    session_ids: List[str] = []
+    if str(session_ids_json or "").strip():
+        try:
+            parsed = json.loads(session_ids_json)
+        except Exception as exc:
+            return {"ok": False, "error": f"session_ids_json 解析失败: {exc}"}
+        if not isinstance(parsed, list) or not all(isinstance(value, str) for value in parsed):
+            return {"ok": False, "error": "session_ids_json 必须是字符串数组"}
+        session_ids = [value for value in parsed if value]
+    elif run_id:
+        session_ids = [
+            row.session_id
+            for row in SESSION_REGISTRY.list(run_id=run_id, include_stopped=False)
+        ]
+    else:
+        return {"ok": False, "error": "必须提供 session_ids_json 或 run_id，拒绝无范围停止"}
+
+    results = [
+        _stop_registered_session(
+            session_id=value,
+            graceful_wait_sec=graceful_wait_sec,
+            force=force,
+            avoid_foreground_switch=avoid_foreground_switch,
+        )
+        for value in session_ids
+    ]
+    return {
+        "ok": all(bool(row.get("ok")) for row in results),
+        "runId": run_id,
+        "requested": len(session_ids),
+        "stopped": sum(1 for row in results if row.get("stopped")),
+        "results": results,
+    }
+
+
+@mcp.tool()
+def cleanup_orphan_sessions(
+    run_id: str = "",
+    remove_instance_roots: bool = False,
+    forget_sessions: bool = False,
+) -> Dict[str, Any]:
+    """回收已退出进程的 Job/Desktop；可选删除边界内实例根并移出注册表。"""
+    rows: List[Dict[str, Any]] = []
+    known_roots = {
+        os.path.normcase(str(Path(session.instance_root).resolve(strict=False)))
+        for session in SESSION_REGISTRY.list(include_stopped=True)
+    }
+    for session in SESSION_REGISTRY.list(run_id=run_id, include_stopped=True):
+        if _registered_session_alive(session):
+            continue
+        if session.state not in {"stopped", "orphaned", "failed"}:
+            SESSION_REGISTRY.mark_stopped(session.session_id, "process no longer exists", state="orphaned")
+        job_closed = _close_job_handle(session.job_handle) if int(session.job_handle or 0) else True
+        desktop_closed = _close_desktop_handle(session.desktop_handle) if int(session.desktop_handle or 0) else True
+        session.job_handle = 0
+        session.desktop_handle = 0
+        removed_root = False
+        remove_error = ""
+        if remove_instance_roots and session.managed_root and session.instance_root.exists():
+            pool_root = session.sandbox_root / "_AutoTestInstances"
+            try:
+                target = require_path_within(session.instance_root, pool_root, "orphan instance root")
+                shutil.rmtree(target)
+                removed_root = True
+            except Exception as exc:
+                remove_error = str(exc)
+        manifest = _write_session_manifest(session)
+        rows.append(
+            {
+                "sessionId": session.session_id,
+                "pid": int(session.pid),
+                "state": session.state,
+                "jobClosed": job_closed,
+                "desktopClosed": desktop_closed,
+                "instanceRootRemoved": removed_root,
+                "removeError": remove_error,
+                "manifest": manifest,
+            }
+        )
+        if forget_sessions:
+            SESSION_REGISTRY.remove(session.session_id)
+
+    # MCP 重启会自动关闭 Job handle 并杀掉子进程，但实例目录仍需可发现、可回收。
+    # 仅扫描专用沙盒固定层级，绝不枚举或删除其他 Warcraft 目录。
+    pool_root = DEFAULT_SANDBOX_ROOT / "_AutoTestInstances"
+    if pool_root.is_dir():
+        for candidate in pool_root.glob("*/*/root"):
+            try:
+                root = require_path_within(candidate, pool_root, "discovered orphan root")
+            except ValueError:
+                continue
+            root_key = os.path.normcase(str(root))
+            if root_key in known_roots:
+                continue
+            session_dir = root.parent
+            discovered_session_id = session_dir.name
+            discovered_run_id = session_dir.parent.name
+            if run_id and discovered_run_id != run_id:
+                continue
+
+            identity_path = session_dir / "session.autotest.json"
+            manifest_path = (
+                identity_path
+                if identity_path.is_file()
+                else ARTIFACT_ROOT / discovered_run_id / discovered_session_id / "session.json"
+            )
+            manifest_data = _read_json_file(manifest_path) or {}
+            manifest_pid = int(manifest_data.get("pid", 0) or 0)
+            expected_creation = int(manifest_data.get("processCreatedAtMs", 0) or 0)
+            actual_creation = _get_process_creation_epoch_ms(manifest_pid) if manifest_pid > 0 else 0
+            process_matches = bool(
+                manifest_pid > 0
+                and _pid_alive(manifest_pid)
+                and (
+                    expected_creation <= 0
+                    or actual_creation <= 0
+                    or abs(expected_creation - actual_creation) <= 2_000
+                )
+            )
+            removed_root = False
+            remove_error = ""
+            if remove_instance_roots and not process_matches and manifest_data:
+                try:
+                    shutil.rmtree(root)
+                    removed_root = True
+                except Exception as exc:
+                    remove_error = str(exc)
+            elif remove_instance_roots and not manifest_data:
+                remove_error = "缺少 session identity manifest，拒绝删除未知实例根"
+            rows.append(
+                {
+                    "sessionId": discovered_session_id,
+                    "runId": discovered_run_id,
+                    "pid": manifest_pid,
+                    "state": "active-unregistered" if process_matches else "unregistered-orphan",
+                    "discoveredAfterRestart": True,
+                    "instanceRoot": str(root),
+                    "instanceRootRemoved": removed_root,
+                    "removeError": remove_error,
+                }
+            )
+    return {
+        "ok": all(not row["removeError"] for row in rows),
+        "runId": run_id,
+        "cleaned": len(rows),
+        "sessions": rows,
+    }
+
+
 @mcp.tool()
 def stop_war3(
     pid: int = 0,
     graceful_wait_sec: int = 8,
     force: bool = True,
     avoid_foreground_switch: bool = False,
+    session_id: str = "",
 ) -> Dict[str, Any]:
     """停止 War3：优先 WM_CLOSE，超时后可强杀。"""
+    registered = _session_by_selector(session_id=session_id, pid=pid)
+    if registered is not None:
+        return _stop_registered_session(
+            session_id=registered.session_id,
+            graceful_wait_sec=graceful_wait_sec,
+            force=force,
+            avoid_foreground_switch=avoid_foreground_switch,
+        )
     target_pid = pid or (STATE.war3_pid or 0)
     if target_pid <= 0:
         return {"ok": True, "stopped": True, "pid": 0, "message": "无活跃 pid"}
 
+    # Isolated/background tests retain the original process HANDLE and must
+    # settle that exact process instance. Do this before any PID liveness
+    # query: a reused numeric PID must never authorize taskkill or /T child
+    # traversal. Identity ambiguity is fail-closed and does not fall through.
+    if avoid_foreground_switch:
+        exact_stop = _stop_retained_state_process_exact(target_pid)
+        if exact_stop.get("handled") is True:
+            return exact_stop
+        return {
+            "ok": False,
+            "stopped": False,
+            "pid": int(target_pid),
+            "silentStop": True,
+            "avoidForegroundSwitch": True,
+            "exactNativeHandleStop": False,
+            "error": (
+                "background stop lacks an exact retained native-process "
+                "witness; PID/taskkill fallback is forbidden"
+            ),
+            "exactStopPreflight": exact_stop,
+            "pidTerminationCommandIssued": False,
+        }
+
     if not _pid_alive(target_pid):
         restore = _restore_video_config_if_needed(target_pid)
+        launcher = _stop_tracked_launcher_if_needed(target_pid)
         desktop = _close_state_desktop_if_needed(target_pid)
         _clear_war3_launch_state(target_pid)
         return {
@@ -4251,39 +9823,23 @@ def stop_war3(
             "pid": target_pid,
             "message": "进程已不在",
             "videoRestore": restore,
+            "launcher": launcher,
             "desktop": desktop,
         }
 
-    # 静默结束模式：不发送 WM_CLOSE，直接 taskkill，避免窗口抢焦点。
-    if avoid_foreground_switch:
-        _taskkill(target_pid, force=bool(force))
-        time.sleep(0.6)
-        alive = _pid_alive(target_pid)
-        restore = (
-            _restore_video_config_if_needed(target_pid)
-            if not alive
-            else {"ok": True, "skipped": True, "reason": "进程仍存活，未恢复视频配置"}
-        )
-        desktop = _close_state_desktop_if_needed(target_pid) if not alive else {"ok": True, "skipped": True, "reason": "进程仍存活，未关闭隔离桌面"}
-        if not alive:
-            _clear_war3_launch_state(target_pid)
-        return {
-            "ok": not alive,
-            "stopped": not alive,
-            "pid": target_pid,
-            "closeSent": False,
-            "forced": force,
-            "silentStop": True,
-            "avoidForegroundSwitch": True,
-            "videoRestore": restore,
-            "desktop": desktop,
-        }
+    shutdown_session = _control_plane_request(
+        pid=target_pid,
+        command="shutdown_session",
+        payload={},
+        timeout_sec=2.0,
+    )
 
     close_sent = _post_close(target_pid)
     t0 = time.time()
     while time.time() - t0 < max(1, graceful_wait_sec):
         if not _pid_alive(target_pid):
             restore = _restore_video_config_if_needed(target_pid)
+            launcher = _stop_tracked_launcher_if_needed(target_pid)
             desktop = _close_state_desktop_if_needed(target_pid)
             _clear_war3_launch_state(target_pid)
             return {
@@ -4293,7 +9849,9 @@ def stop_war3(
                 "closeSent": close_sent,
                 "silentStop": False,
                 "avoidForegroundSwitch": False,
+                "shutdownSession": shutdown_session,
                 "videoRestore": restore,
+                "launcher": launcher,
                 "desktop": desktop,
             }
         time.sleep(0.25)
@@ -4307,6 +9865,11 @@ def stop_war3(
         if not alive
         else {"ok": True, "skipped": True, "reason": "进程仍存活，未恢复视频配置"}
     )
+    launcher = (
+        _stop_tracked_launcher_if_needed(target_pid)
+        if not alive
+        else {"ok": True, "skipped": True, "reason": "游戏进程仍存活"}
+    )
     desktop = _close_state_desktop_if_needed(target_pid) if not alive else {"ok": True, "skipped": True, "reason": "进程仍存活，未关闭隔离桌面"}
     if not alive:
         _clear_war3_launch_state(target_pid)
@@ -4318,7 +9881,9 @@ def stop_war3(
         "forced": force,
         "silentStop": False,
         "avoidForegroundSwitch": False,
+        "shutdownSession": shutdown_session,
         "videoRestore": restore,
+        "launcher": launcher,
         "desktop": desktop,
     }
 
@@ -4361,6 +9926,10 @@ def read_perf_report(
 def run_quick_autotest(
     war3_dir: str = str(DEFAULT_WAR3_DIR),
     map_path: str = str(DEFAULT_TEST_MAP),
+    launcher_mode: str = YDWE_LAUNCHER_MODE_DIRECT,
+    ydwe_root: str = "",
+    ydwe_child_timeout_sec: int = 20,
+    ydwe_module_timeout_sec: int = 30,
     ready_timeout_sec: int = 120,
     sample_duration_sec: int = 20,
     windowed: bool = False,
@@ -4383,6 +9952,9 @@ def run_quick_autotest(
     disable_modules: str = "",
     env_overrides_json: str = "",
     scenario_name: str = "",
+    require_control_plane_ready: bool = True,
+    require_hot_shadow_frame: bool = False,
+    hot_shadow_timeout_sec: int = 60,
 ) -> Dict[str, Any]:
     """
     一键流程：
@@ -4407,6 +9979,9 @@ def run_quick_autotest(
         "DXVK_WAR3_RUNTIME_BENCHMARK_SAMPLE_SEC",
         str(max(3, int(sample_duration_sec) - 1)),
     )
+    native_semantic_preview_enabled = _bool_env(
+        merged_env.get("DXVK_WAR3_NATIVE_SEMANTIC_SHADOW_PREVIEW", "")
+    )
     if runtime_profile["name"] == "dxvk_only":
         merged_env.setdefault(
             "DXVK_WAR3_FPS_UNLOCK_ONLY_WARMUP_SEC",
@@ -4425,6 +10000,10 @@ def run_quick_autotest(
     launch = launch_war3_test(
         war3_dir=war3_dir,
         map_path=map_path,
+        launcher_mode=launcher_mode,
+        ydwe_root=ydwe_root,
+        ydwe_child_timeout_sec=ydwe_child_timeout_sec,
+        ydwe_module_timeout_sec=ydwe_module_timeout_sec,
         windowed=windowed,
         use_isolated_desktop=use_isolated_desktop,
         desktop_name=desktop_name,
@@ -4456,24 +10035,210 @@ def run_quick_autotest(
     ready = wait_for_game_ready(
         timeout_sec=ready_timeout_sec,
         pid=pid,
-        allow_fallback=True,
+        allow_fallback=not bool(require_control_plane_ready),
         fallback_min_elapsed_sec=20 if strict_ready_profile else 10,
         fallback_min_cpu_sec=1.0 if strict_ready_profile else 0.5,
         require_game_started_for_fallback=strict_ready_profile,
+        auto_continue_loading=True,
+        continue_key="SPACE",
+        continue_interval_sec=12,
     )
     if not ready.get("ok"):
-        stop_war3(
+        # 在结束隔离桌面进程之前保存 UI 证据。仅有 control-plane 状态无法
+        # 区分地图选择失败、错误对话框和加载后崩溃。
+        failure_screenshot = capture_war3_screenshot(
+            pid=pid,
+            war3_dir=war3_dir,
+            prefer_internal=True,
+            timeout_sec=5,
+            fallback_to_window_capture=True,
+        )
+        failure_window = query_war3_window(
+            pid=pid,
+            wait_sec=1,
+            require_visible=False,
+        )
+        stop = stop_war3(
             pid=pid,
             graceful_wait_sec=3,
             force=True,
             avoid_foreground_switch=avoid_focus_on_stop,
         )
-        return {"ok": False, "stage": "ready", "launch": launch, "ready": ready}
+        if (not bool(require_control_plane_ready) and auto_perf_record and
+                not bool(record_after_game_started)):
+            latest: Dict[str, Any] = {"ok": False, "error": "未找到报告"}
+            new_report_detected = False
+            for _ in range(20):
+                maybe = find_latest_perf_report(war3_dir=war3_dir)
+                if maybe.get("ok"):
+                    mtime = datetime.fromisoformat(maybe["mtime"]).timestamp()
+                    if mtime > before_mtime + 0.5:
+                        latest = maybe
+                        new_report_detected = True
+                        break
+                    latest = maybe
+                time.sleep(1.0)
+            if latest.get("ok") and new_report_detected:
+                summary = read_perf_report(
+                    latest["reportPath"],
+                    include_sections=include_sections_in_report,
+                    section_top_n=section_top_n,
+                )
+                if isinstance(summary, dict):
+                    summary["newReportDetected"] = True
+                    summary["scenarioName"] = scenario_name_norm
+                    summary["latestReportPath"] = latest.get("reportPath")
+                    summary["reportWasStale"] = False
+                    summary["perfOnlyReadyTimeout"] = True
+                    summary["readyTimeoutMode"] = str(ready.get("mode", ""))
+                    summary["readyTimeoutError"] = str(ready.get("error", ""))
+                return {
+                    "ok": bool(summary.get("ok")),
+                    "stage": "perf-only-ready-timeout",
+                    "launch": launch,
+                    "ready": ready,
+                    "failureScreenshot": failure_screenshot,
+                    "failureWindow": failure_window,
+                    "hotShadow": {
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "ready timeout perf-only",
+                    },
+                    "windowResize": {
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "ready timeout",
+                    },
+                    "screenshot": {"ok": False, "error": "ready timeout"},
+                    "screenshotSize": {
+                        "width": 0,
+                        "height": 0,
+                        "matchBaseline": False,
+                        "baselineWidth": baseline_width,
+                        "baselineHeight": baseline_height,
+                    },
+                    "warnings": [
+                        "ready gate timed out; returned perf-only report "
+                        "because control-plane readiness was not required"
+                    ],
+                    "stop": stop,
+                    "report": summary,
+                    "logSummary": _read_runtime_log_summary(
+                        w3, log_offsets=log_offsets),
+                    "scenarioName": scenario_name_norm,
+                }
+        return {
+            "ok": False,
+            "stage": "ready",
+            "launch": launch,
+            "ready": ready,
+            "failureScreenshot": failure_screenshot,
+            "failureWindow": failure_window,
+            "stop": stop,
+        }
 
     if str(ready.get("mode", "")) in ("fallback-window-cpu",
                                       "runtime-status-game-started",
                                       "runtime-status-stable"):
         time.sleep(2.0)
+
+    shadow_scenario_names = {
+        "low_pressure_static_reuse",
+        "dynamic_shadow_pressure",
+        "model_runtime_probe",
+        "static_world_caster_acceptance",
+        "phase4_world_caster_acceptance",
+    }
+    effective_require_hot_shadow_frame = bool(require_hot_shadow_frame) or (
+        scenario_name_norm in shadow_scenario_names
+    )
+    hot_shadow: Dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "reason": "not required",
+    }
+    if effective_require_hot_shadow_frame:
+        attachment_probe = scenario_name_norm in (
+            "dynamic_shadow_pressure",
+            "model_runtime_probe",
+        )
+        rigid_observe_probe = (
+            scenario_name_norm == "model_runtime_probe"
+        )
+        hot_shadow = wait_for_hot_shadow_frame(
+            timeout_sec=max(1, int(hot_shadow_timeout_sec)),
+            pid=pid,
+            min_visible_count=1,
+            min_stable_identity_count=0 if rigid_observe_probe else 1,
+            min_unit_count=0
+            if scenario_name_norm in ("low_pressure_static_reuse", "model_runtime_probe")
+            else 1,
+            min_semantic_resolved=1,
+            min_semantic_skinned_resolved=0
+            if scenario_name_norm in ("low_pressure_static_reuse", "model_runtime_probe")
+            else 1,
+            min_native_executed_draw_count=1
+            if native_semantic_preview_enabled and not rigid_observe_probe
+            else 0,
+            require_semantic_frame_fresh=True,
+            min_frame_advance=0
+            if scenario_name_norm == "dynamic_shadow_pressure"
+            else 2,
+            allow_semantic_rigid_only=rigid_observe_probe,
+            allow_semantic_attachment_rigid_only=
+            scenario_name_norm == "model_runtime_probe",
+            min_semantic_attachment_rigid_resolved=1
+            if attachment_probe
+            else 0,
+            post_failure_summary_wait_sec=8
+            if attachment_probe
+            else 6,
+            prefer_summary_poll=attachment_probe,
+            require_semantic_scene_consumed=scenario_name_norm
+            in ("dynamic_shadow_pressure", "low_pressure_static_reuse",
+                "static_world_caster_acceptance",
+                "phase4_world_caster_acceptance"),
+            allow_scene_pending_if_core_and_currentdraw_ready=
+            scenario_name_norm == "low_pressure_static_reuse",
+            min_semantic_static_world_submitted=1
+            if scenario_name_norm in (
+                "static_world_caster_acceptance",
+                "phase4_world_caster_acceptance",
+            )
+            else 0,
+            allow_semantic_static_world_only=
+            scenario_name_norm in (
+                "static_world_caster_acceptance",
+                "phase4_world_caster_acceptance",
+            ),
+        )
+        if not hot_shadow.get("ok"):
+            hot_shadow_phase = str(hot_shadow.get("semanticShadowPhase", "") or "")
+            if hot_shadow_phase in (
+                "native-semantic-executed-scene-pending",
+                "core-fresh-waiting-render-scene",
+                "core-packets-waiting-render-scene",
+            ):
+                hot_shadow_stage = "hot-shadow-render-scene-pending"
+            elif hot_shadow_phase == "attachment-rigid-ok-skinned-pending":
+                hot_shadow_stage = "hot-shadow-skinned-pending"
+            elif hot_shadow_phase == "semantic-rigid-ok-skinned-pending":
+                hot_shadow_stage = "hot-shadow-skinned-pending"
+            else:
+                hot_shadow_stage = "hot-shadow"
+            stop_war3(
+                pid=pid,
+                graceful_wait_sec=3,
+                force=True,
+                avoid_foreground_switch=avoid_focus_on_stop,
+            )
+            return {
+                "ok": False,
+                "stage": hot_shadow_stage,
+                "launch": launch,
+                "ready": ready,
+                "hotShadow": hot_shadow,
+            }
 
     launched_windowed = bool(launch.get("windowed"))
     window_resize: Dict[str, Any] = {
@@ -4540,7 +10305,7 @@ def run_quick_autotest(
             avoid_foreground_switch=avoid_focus_on_stop,
         )
     # 给报告写盘留一点时间
-    if not new_report_detected:
+    if auto_perf_record and not new_report_detected:
         for _ in range(20):
             maybe = find_latest_perf_report(war3_dir=war3_dir)
             if maybe.get("ok"):
@@ -4553,7 +10318,14 @@ def run_quick_autotest(
             time.sleep(1.0)
 
     benchmark_summary = {"ok": False, "error": "未在运行日志中找到 runtime benchmark 输出"}
-    if latest.get("ok") and new_report_detected:
+    if not auto_perf_record:
+        summary = {
+            "ok": True,
+            "skipped": True,
+            "reason": "auto_perf_record=false；本次只验收真实进图与运行时状态",
+            "reportType": "entry-gate",
+        }
+    elif latest.get("ok") and new_report_detected:
         summary = read_perf_report(
             latest["reportPath"],
             include_sections=include_sections_in_report,
@@ -4573,14 +10345,52 @@ def run_quick_autotest(
         if benchmark_summary.get("ok"):
             summary = benchmark_summary
         else:
-            summary = latest if runtime_profile["diagEnabled"] else benchmark_summary
+            summary = benchmark_summary
     if isinstance(summary, dict):
         summary["newReportDetected"] = new_report_detected
         summary["scenarioName"] = scenario_name_norm
+        summary["latestReportPath"] = latest.get("reportPath") if isinstance(latest, dict) else None
+        summary["reportWasStale"] = bool(latest.get("ok")) and not new_report_detected
+        runtime_ready_frame = _nested_status_int(
+            dict(ready.get("runtimeStatus", {}) or {}),
+            "frameIndex",
+        )
+        runtime_hot_frame = int(hot_shadow.get("runtimeFrameIndex", 0) or 0)
+        if runtime_hot_frame <= 0:
+            runtime_hot_frame = _nested_status_int(
+                dict(hot_shadow.get("runtimeStatus", {}) or {}),
+                "frameIndex",
+            )
+        runtime_frame_delta = (
+            max(0, runtime_hot_frame - runtime_ready_frame)
+            if runtime_ready_frame > 0 and runtime_hot_frame > 0
+            else 0
+        )
+        report_frame_count = _shadow_summary_int(summary, "frameCount")
+        try:
+            report_window_sec = float(summary.get("windowSec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            report_window_sec = 0.0
+        fps_sample_reliable = (
+            str(summary.get("reportType", "")) == "benchmark_log"
+            or (report_frame_count >= 10 and report_window_sec >= 1.0)
+        )
+        summary["fpsSampleReliable"] = bool(fps_sample_reliable)
+        summary["fpsSampleFrameCount"] = report_frame_count
+        summary["fpsSampleWindowSec"] = round(max(0.0, report_window_sec), 3)
+        summary["runtimeFrameDeltaReadyToHotShadow"] = runtime_frame_delta
+        if not fps_sample_reliable:
+            summary["fpsSampleReliabilityReason"] = (
+                "perf report recorded too few Present frames for an FPS "
+                "judgement; isolated desktop/windowed runs can tail-stall or "
+                "only present on capture/stop, so use semantic counters for "
+                "correctness and a dedicated visible-desktop perf run for FPS"
+            )
         if summary.get("reportType") == "benchmark_log":
             summary["newReportDetected"] = True
             summary["benchmarkFallback"] = True
-        elif not new_report_detected and summary.get("ok"):
+            summary["reportWasStale"] = False
+        elif auto_perf_record and not new_report_detected and summary.get("ok"):
             summary["ok"] = False
             summary["error"] = "未检测到新报告（可能未部署最新 d3d9.dll 或进程未优雅退出）"
 
@@ -4601,6 +10411,7 @@ def run_quick_autotest(
         "stage": "done",
         "launch": launch,
         "ready": ready,
+        "hotShadow": hot_shadow,
         "windowResize": window_resize,
         "screenshot": shot,
         "screenshotSize": shot_size,
@@ -4639,6 +10450,13 @@ def run_named_scenario(
             "availablePresets": _scenario_preset_rows(),
         }
 
+    merged_env = dict(preset.get("envOverrides", {}) or {})
+    user_env = _parse_env_overrides_json(env_overrides_json)
+    parse_error = user_env.pop("__parse_error__", "")
+    if parse_error:
+        return {"ok": False, "stage": "preset", "error": f"env_overrides_json 解析失败: {parse_error}"}
+    merged_env.update(user_env)
+
     result = run_quick_autotest(
         war3_dir=war3_dir,
         map_path=str(preset.get("mapPath", DEFAULT_TEST_MAP)),
@@ -4659,11 +10477,16 @@ def run_named_scenario(
         baseline_refresh_rate=int(preset.get("baselineRefreshRate", DEFAULT_BENCHMARK_REFRESH) or DEFAULT_BENCHMARK_REFRESH),
         include_sections_in_report=include_sections_in_report,
         section_top_n=section_top_n,
-        avoid_focus_on_stop=not bool(preset.get("useIsolatedDesktop", True)),
+        avoid_focus_on_stop=True,
         profile=str(preset.get("profile", "full_default")),
         disable_modules=str(preset.get("disableModules", "")),
-        env_overrides_json=env_overrides_json,
+        env_overrides_json=json.dumps(merged_env, ensure_ascii=False),
         scenario_name=scenario_name,
+        require_control_plane_ready=True,
+        require_hot_shadow_frame=bool(
+            preset.get("requireHotShadowFrame", True)
+        ),
+        hot_shadow_timeout_sec=int(preset.get("hotShadowTimeoutSec", preset.get("readyTimeoutSec", 120)) or 120),
     )
     if isinstance(result, dict):
         result["scenarioPreset"] = dict(preset)
@@ -5225,6 +11048,15 @@ def start_periodic_perf_test(
                     "avgGpuTimeMs": float(report.get("avgGpuTimeMs", 0.0) or 0.0),
                     "avgTrackedActiveCpuMs": float(report.get("avgTrackedActiveCpuMs", 0.0) or 0.0),
                     "avgUntrackedActiveCpuMs": float(report.get("avgUntrackedActiveCpuMs", 0.0) or 0.0),
+                    "avgTrackedAdditiveRootWallMs": float(
+                        report.get("avgTrackedAdditiveRootWallMs", 0.0) or 0.0
+                    ),
+                    "avgUncoveredFrameWallMs": float(
+                        report.get("avgUncoveredFrameWallMs", 0.0) or 0.0
+                    ),
+                    "frameWallScopeCoveragePct": float(
+                        report.get("frameWallScopeCoveragePct", 0.0) or 0.0
+                    ),
                     "cpuCoveragePct": float(report.get("cpuCoveragePct", 0.0) or 0.0),
                     "cpuCoverageWithIdlePct": float(report.get("cpuCoverageWithIdlePct", 0.0) or 0.0),
                     "jank16": int(report.get("jank16", 0) or 0),
@@ -5499,11 +11331,16 @@ def sync_all_debug(
 @mcp.tool()
 def current_state() -> Dict[str, Any]:
     """查看当前 MCP 运行态。"""
+    registered_sessions = SESSION_REGISTRY.list(include_stopped=True)
     return {
         "ok": True,
         "time": _now_str(),
         "war3Pid": STATE.war3_pid,
         "war3Alive": _pid_alive(STATE.war3_pid) if STATE.war3_pid else False,
+        "launcherPid": STATE.launcher_pid,
+        "launcherAlive": _pid_alive(STATE.launcher_pid) if STATE.launcher_pid else False,
+        "launcherMode": str(STATE.launcher_mode),
+        "launcherExe": str(STATE.launcher_exe),
         "war3Dir": str(STATE.war3_dir),
         "testMapPath": str(STATE.test_map_path),
         "desktopMode": str(STATE.desktop_mode),
@@ -5515,6 +11352,16 @@ def current_state() -> Dict[str, Any]:
         "videoRestoreSnapshot": dict(STATE.video_restore_snapshot),
         "debugEvents": len(STATE.debug_events),
         "debugMonitorRunning": bool(STATE.debug_thread and STATE.debug_thread.is_alive()),
+        "registeredSessions": len(registered_sessions),
+        "activeSessions": sum(
+            1
+            for session in registered_sessions
+            if _registered_session_alive(session)
+        ),
+        "sessionRegistry": [
+            session.to_dict(alive=_registered_session_alive(session))
+            for session in registered_sessions
+        ],
         "perfJob": _get_perf_job_snapshot(limit_results=10),
     }
 

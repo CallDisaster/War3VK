@@ -1,8 +1,11 @@
 #include "war3_hook_jass.h"
 #include "war3_hook_address_book.h"
 #include "war3_hook_install_util.h"
+#include "war3_hook_perf.h"
+#include "war3_jass_command_bridge.h"
 #include "war3_jass_native_plan_cache.h"
 #include "../../d3d9_war3_debug.h"
+#include "../japi/war3_japi_v1.h"
 
 #include "../core/war3_internal_test_config.h"
 #include "../tools/war3_perf_monitor.h"
@@ -343,6 +346,12 @@ static int __cdecl Hook_InitJassNatives() {
     result = g_trampolineInitJassNatives();
   }
 
+  // A rebuilt JASS VM starts a new map generation. Retire only objects owned
+  // by the public WarVK JAPI before publishing the new carrier table.
+  dxvk::war3::japi::Reset();
+  ResetJassCommandBridgeInstallState();
+  TryInstallJassCommandBridge("InitJassNatives");
+
   war3dbg::Print("DXVK War3Hook: Hook_InitJassNatives EXIT\n");
   return result;
 }
@@ -350,6 +359,20 @@ static int __cdecl Hook_InitJassNatives() {
 int __fastcall Hook_ExecuteJassFunction(void *thisPtr, void *edx, int a2,
                                         uint32_t *a3, int *a4, int a5, int a6,
                                         uint32_t *a7) {
+  War3HotHookCallTiming hookTiming(
+      War3HotHookId::ExecuteJassFunction, 8u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    if (g_trampolineExecuteJassFunction) {
+      return g_trampolineExecuteJassFunction(
+          thisPtr, edx, a2, a3, a4, a5, a6, a7);
+    }
+    if (g_originalExecuteJassFunction) {
+      return g_originalExecuteJassFunction(
+          thisPtr, edx, a2, a3, a4, a5, a6, a7);
+    }
+    return 1;
+  };
   // 当前策略：保持完全透传，仅保留可观测性与预算策略切入点。
   static bool s_firstCallLogged = false;
   if (!s_firstCallLogged) {
@@ -376,6 +399,8 @@ int __fastcall Hook_ExecuteJassFunction(void *thisPtr, void *edx, int a2,
     }
   }
 
+  TryInstallJassCommandBridge("ExecuteJassFunction");
+
   war3::War3PerfMonitor::ScopedCpuScope perfScope;
   if constexpr (dxvk::war3::internal::kNativeJassVmPerfTrackingEnabled) {
     perfScope =
@@ -384,22 +409,13 @@ int __fastcall Hook_ExecuteJassFunction(void *thisPtr, void *edx, int a2,
 
   const auto begin = PerfClock::now();
   int result = 1;
-  if (g_trampolineExecuteJassFunction) {
+  if (g_trampolineExecuteJassFunction || g_originalExecuteJassFunction) {
     war3::War3PerfMonitor::ScopedCpuScope origScope;
     if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
       origScope = war3::War3PerfMonitor::instance().cpuScope(
-          "JassVM/ExecuteJassFunction/Orig");
+          "JassVM/ExecuteJassFunction/NativeOriginal");
     }
-    result = g_trampolineExecuteJassFunction(thisPtr, edx, a2, a3, a4, a5, a6,
-                                             a7);
-  } else if (g_originalExecuteJassFunction) {
-    war3::War3PerfMonitor::ScopedCpuScope origScope;
-    if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
-      origScope = war3::War3PerfMonitor::instance().cpuScope(
-          "JassVM/ExecuteJassFunction/Orig");
-    }
-    result = g_originalExecuteJassFunction(thisPtr, edx, a2, a3, a4, a5, a6,
-                                           a7);
+    result = callNativeOriginal();
   }
   const auto end = PerfClock::now();
   RecordJassExecuteStats(
@@ -436,7 +452,7 @@ int __fastcall Hook_ExecuteJassFunctionInternal(void *thisPtr, void *edx, int a2
     war3::War3PerfMonitor::ScopedCpuScope origScope;
     if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
       origScope = war3::War3PerfMonitor::instance().cpuScope(
-          "JassVM/ExecuteFunctionInternal/Orig");
+          "JassVM/ExecuteFunctionInternal/NativeOriginal");
     }
     return g_trampolineExecuteJassFunctionInternal(thisPtr, edx, a2, a3, a4,
                                                    opBudget, a6, a7);
@@ -445,7 +461,7 @@ int __fastcall Hook_ExecuteJassFunctionInternal(void *thisPtr, void *edx, int a2
     war3::War3PerfMonitor::ScopedCpuScope origScope;
     if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
       origScope = war3::War3PerfMonitor::instance().cpuScope(
-          "JassVM/ExecuteFunctionInternal/Orig");
+          "JassVM/ExecuteFunctionInternal/NativeOriginal");
     }
     return g_originalExecuteJassFunctionInternal(thisPtr, edx, a2, a3, a4,
                                                  opBudget, a6, a7);
@@ -473,14 +489,16 @@ int __fastcall Hook_JassInterpreterMainLoop(void *thisPtr, void *edx, int a2,
     war3::War3PerfMonitor::ScopedCpuScope origScope;
     if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
       origScope =
-          war3::War3PerfMonitor::instance().cpuScope("JassVM/MainLoop/Orig");
+          war3::War3PerfMonitor::instance().cpuScope(
+              "JassVM/MainLoop/NativeOriginal");
     }
     ret = g_trampolineJassInterpreterMainLoop(thisPtr, edx, a2, a3, a4, a5);
   } else if (g_originalJassInterpreterMainLoop) {
     war3::War3PerfMonitor::ScopedCpuScope origScope;
     if constexpr (dxvk::war3::internal::kNativeJassVmDetailedScopesEnabled) {
       origScope =
-          war3::War3PerfMonitor::instance().cpuScope("JassVM/MainLoop/Orig");
+          war3::War3PerfMonitor::instance().cpuScope(
+              "JassVM/MainLoop/NativeOriginal");
     }
     ret = g_originalJassInterpreterMainLoop(thisPtr, edx, a2, a3, a4, a5);
   }
@@ -616,6 +634,7 @@ void War3HookJass::Install(uintptr_t gameBase) {
   }
   ConfigureNativeCallHelperFns(
       {g_getTlsJassData, g_regFuncAddr2Handle, g_computeHandleMemoryAddr});
+  ConfigureJassCommandBridge(g_getTlsJassData);
   ResetNativeCallPlanCaches();
   if constexpr (dxvk::war3::internal::kNativeJassNativeCallHookEnabled) {
     war3dbg::Print(
@@ -747,6 +766,74 @@ void War3HookJass::Install(uintptr_t gameBase) {
     war3dbg::Print(
         "DXVK War3Hook[Jass]: Deep VM hooks disabled (ExecuteInternal/MainLoop)\n");
   }
+}
+
+bool War3HookJass::InstallCommandBridgeOnly(uintptr_t gameBase,
+                                            const char *reason) {
+  if (gameBase == 0u) {
+    war3dbg::Print(
+        "DXVK War3Hook[Jass]: bridge-only install skipped - Game.dll base is null reason=%s\n",
+        reason ? reason : "<unknown>");
+    return false;
+  }
+
+  const auto &book = GetWar3HookAddressBook127a();
+  constexpr size_t kProbeSize = 32;
+  auto resolveCode = [&](uintptr_t rva) -> LPVOID {
+    return reinterpret_cast<LPVOID>(gameBase + rva);
+  };
+
+  LPVOID getTlsJassDataAddr = resolveCode(book.getTlsJassData);
+  LPVOID regFuncAddr2HandleAddr = resolveCode(book.regFuncAddr2Handle);
+  LPVOID computeHandleMemoryAddrAddr =
+      resolveCode(book.computeHandleMemoryAddr);
+
+  g_getTlsJassData = nullptr;
+  g_regFuncAddr2Handle = nullptr;
+  g_computeHandleMemoryAddr = nullptr;
+
+  if (IsExecutableReadableRange(getTlsJassDataAddr, kProbeSize)) {
+    g_getTlsJassData = reinterpret_cast<GetTlsJassDataFn>(getTlsJassDataAddr);
+  } else {
+    war3dbg::Print(
+        "DXVK War3Hook[Jass]: bridge-only helper getTlsJassData invalid (%p) reason=%s\n",
+        getTlsJassDataAddr, reason ? reason : "<unknown>");
+  }
+
+  if (IsExecutableReadableRange(regFuncAddr2HandleAddr, kProbeSize)) {
+    g_regFuncAddr2Handle =
+        reinterpret_cast<RegFuncAddr2HandleFn>(regFuncAddr2HandleAddr);
+  } else {
+    war3dbg::Print(
+        "DXVK War3Hook[Jass]: bridge-only helper regFuncAddr2Handle invalid (%p) reason=%s\n",
+        regFuncAddr2HandleAddr, reason ? reason : "<unknown>");
+  }
+
+  if (IsExecutableReadableRange(computeHandleMemoryAddrAddr, kProbeSize)) {
+    g_computeHandleMemoryAddr =
+        reinterpret_cast<ComputeHandleMemoryAddrFn>(
+            computeHandleMemoryAddrAddr);
+  } else {
+    war3dbg::Print(
+        "DXVK War3Hook[Jass]: bridge-only helper computeHandleMemoryAddr invalid (%p) reason=%s\n",
+        computeHandleMemoryAddrAddr, reason ? reason : "<unknown>");
+  }
+
+  ConfigureNativeCallHelperFns(
+      {g_getTlsJassData, g_regFuncAddr2Handle, g_computeHandleMemoryAddr});
+  ConfigureJassCommandBridge(g_getTlsJassData);
+  ResetNativeCallPlanCaches();
+  ResetJassCommandBridgeInstallState();
+  TryInstallJassCommandBridge(reason ? reason : "CommandBridgeOnly");
+
+  const bool installed = IsJassCommandBridgeInstalled();
+  war3dbg::Print(
+      "DXVK War3Hook[Jass]: bridge-only install reason=%s installed=%d tls=%p regCode=%p handleMem=%p\n",
+      reason ? reason : "<unknown>", installed ? 1 : 0,
+      reinterpret_cast<void *>(g_getTlsJassData),
+      reinterpret_cast<void *>(g_regFuncAddr2Handle),
+      reinterpret_cast<void *>(g_computeHandleMemoryAddr));
+  return installed;
 }
 
 } // namespace dxvk::war3::hooks

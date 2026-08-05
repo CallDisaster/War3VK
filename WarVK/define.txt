@@ -1,36 +1,58 @@
 [TriggerCategories]
 
-TC_WARVK=[WarVK],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_TIME=[时间],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_LIGHT=[光影],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_SHADOW=[阴影],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_OUTLINE=[描边],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_HANDLE=[句柄],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_POINTLIGHT=[点光源],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_POSTFX=[后处理],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_BLOOM=[Bloom],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_SSAO=[SSAO],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_AA=[抗锯齿],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_DAYNIGHT=[日夜],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
-TC_WARVK_DEBUG=[调试],ReplaceableTextures\CommandButtons\BTNMarkOfFire.blp
+TC_WarVK=[WarVK] 基础与版本,ui\\WarVK\\icons\\atom.blp
+TC_WarVKDiagnostics=[WarVK] 诊断与统计,ui\\WarVK\\icons\\atom.blp
+TC_WarVKSunShadow=[WarVK] 太阳光与 CSM,ui\\WarVK\\icons\\atom.blp
+TC_WarVKLightingClock=[WarVK] 光照时钟与昼夜,ui\\WarVK\\icons\\atom.blp
+TC_WarVKPointLight=[WarVK] 点光源,ui\\WarVK\\icons\\atom.blp
+TC_WarVKVolumetricLight=[WarVK] 体积光,ui\\WarVK\\icons\\atom.blp
+TC_WarVKVolumetricFog=[WarVK] 体积雾,ui\\WarVK\\icons\\atom.blp
+TC_WarVKLightning=[WarVK] 闪电效果,ui\\WarVK\\icons\\atom.blp
+TC_WarVKLightningTemplate=[WarVK] 闪电模板,ui\\WarVK\\icons\\atom.blp
+TC_WarVKMath=[WarVK] 数学计算,ui\\WarVK\\icons\\atom.blp
+TC_WarVKCurve=[WarVK] 曲线,ui\\WarVK\\icons\\atom.blp
 
 [TriggerTypes]
-WARVK_AAMODE=0,0,0,抗锯齿模式,integer
-WARVK_SHADOW_DEBUG=0,0,0,阴影调试,integer
-WARVK_OUTLINE_MODE=0,0,0,描边模式,integer
+
+WarVKCsmCascadeCount=0,0,0,CSM级联数量,integer
+WarVKPointShadowResolution=0,0,0,点光阴影分辨率,integer
+WarVKLightingClockMode=0,0,0,光照时钟来源,integer
+WarVKLightningRenderMode=0,0,0,闪电渲染模式,integer
+WarVKCurveCoordinateMode=0,0,0,曲线坐标模式,integer
+WarVKCurveComponent=0,0,0,曲线坐标分量,integer
+WarVKMathRoundingMode=0,0,0,整数舍入方式,integer
 
 [TriggerParams]
-AAMODE_NONE=0,WARVK_AAMODE,"AAMODE_NONE",无
-AAMODE_FXAA=1,WARVK_AAMODE,"AAMODE_FXAA",FXAA
-AAMODE_SMAA_LOW=2,WARVK_AAMODE,"AAMODE_SMAA_LOW",SMAA 低
-AAMODE_SMAA_MEDIUM=3,WARVK_AAMODE,"AAMODE_SMAA_MEDIUM",SMAA 中
-AAMODE_SMAA_HIGH=4,WARVK_AAMODE,"AAMODE_SMAA_HIGH",SMAA 高
-AAMODE_SMAA_ULTRA=5,WARVK_AAMODE,"AAMODE_SMAA_ULTRA",SMAA 极高
 
-SHADOW_DEBUG_NONE=0,WARVK_SHADOW_DEBUG,"WARVK_SHADOW_DEBUG_NONE",无
-SHADOW_DEBUG_CASCADES=1,WARVK_SHADOW_DEBUG,"WARVK_SHADOW_DEBUG_CASCADES",级联调试
-SHADOW_DEBUG_FACTOR=2,WARVK_SHADOW_DEBUG,"WARVK_SHADOW_DEBUG_FACTOR",阴影因子
-SHADOW_DEBUG_DEPTH=3,WARVK_SHADOW_DEBUG,"WARVK_SHADOW_DEBUG_DEPTH",深度
+WARVK_CSM_CASCADES_1=0,WarVKCsmCascadeCount,"1",1级联
+WARVK_CSM_CASCADES_2=0,WarVKCsmCascadeCount,"2",2级联
+WARVK_CSM_CASCADES_3=0,WarVKCsmCascadeCount,"3",3级联
+WARVK_CSM_CASCADES_4=0,WarVKCsmCascadeCount,"4",4级联
 
-OUTLINE_MODE_FILL=0,WARVK_OUTLINE_MODE,"OUTLINE_MODE_FILL",填充
-OUTLINE_MODE_SILHOUETTE=1,WARVK_OUTLINE_MODE,"OUTLINE_MODE_SILHOUETTE",轮廓
+WARVK_POINT_SHADOW_RESOLUTION_128=0,WarVKPointShadowResolution,"128",128
+WARVK_POINT_SHADOW_RESOLUTION_256=0,WarVKPointShadowResolution,"256",256
+WARVK_POINT_SHADOW_RESOLUTION_512=0,WarVKPointShadowResolution,"512",512
+WARVK_POINT_SHADOW_RESOLUTION_1024=0,WarVKPointShadowResolution,"1024",1024
+WARVK_POINT_SHADOW_RESOLUTION_2048=0,WarVKPointShadowResolution,"2048",2048
+
+WARVK_LIGHTING_CLOCK_GAME_TIME=0,WarVKLightingClockMode,"WARVK_LIGHTING_CLOCK_GAME_TIME",跟随游戏时间
+WARVK_LIGHTING_CLOCK_HELD=0,WarVKLightingClockMode,"WARVK_LIGHTING_CLOCK_HELD",保持作者时刻
+WARVK_LIGHTING_CLOCK_INDEPENDENT=0,WarVKLightingClockMode,"WARVK_LIGHTING_CLOCK_INDEPENDENT",独立光照时钟
+
+WARVK_LIGHTNING_RENDER_ALPHA_NO_DEPTH=0,WarVKLightningRenderMode,"WARVK_LIGHTNING_RENDER_ALPHA_NO_DEPTH",Alpha混合（无深度测试）
+WARVK_LIGHTNING_RENDER_ALPHA_DEPTH=0,WarVKLightningRenderMode,"WARVK_LIGHTNING_RENDER_ALPHA_DEPTH",Alpha混合（深度测试）
+WARVK_LIGHTNING_RENDER_ADDITIVE_NO_DEPTH=0,WarVKLightningRenderMode,"WARVK_LIGHTNING_RENDER_ADDITIVE_NO_DEPTH",加法混合（无深度测试）
+WARVK_LIGHTNING_RENDER_ADDITIVE_DEPTH=0,WarVKLightningRenderMode,"WARVK_LIGHTNING_RENDER_ADDITIVE_DEPTH",加法混合（深度测试）
+
+WARVK_CURVE_COORDINATE_OFFSET=0,WarVKCurveCoordinateMode,"WARVK_CURVE_COORDINATE_OFFSET",端点基准偏移
+WARVK_CURVE_COORDINATE_LOCAL=0,WarVKCurveCoordinateMode,"WARVK_CURVE_COORDINATE_LOCAL",局部坐标
+WARVK_CURVE_COORDINATE_WORLD=0,WarVKCurveCoordinateMode,"WARVK_CURVE_COORDINATE_WORLD",世界坐标
+
+WARVK_CURVE_COMPONENT_X=0,WarVKCurveComponent,"WARVK_CURVE_COMPONENT_X",X分量
+WARVK_CURVE_COMPONENT_Y=0,WarVKCurveComponent,"WARVK_CURVE_COMPONENT_Y",Y分量
+WARVK_CURVE_COMPONENT_Z=0,WarVKCurveComponent,"WARVK_CURVE_COMPONENT_Z",Z分量
+
+WARVK_MATH_ROUND_NEAREST=0,WarVKMathRoundingMode,"WARVK_MATH_ROUND_NEAREST",最近整数
+WARVK_MATH_ROUND_FLOOR=0,WarVKMathRoundingMode,"WARVK_MATH_ROUND_FLOOR",向下取整
+WARVK_MATH_ROUND_CEIL=0,WarVKMathRoundingMode,"WARVK_MATH_ROUND_CEIL",向上取整
+WARVK_MATH_ROUND_TRUNCATE=0,WarVKMathRoundingMode,"WARVK_MATH_ROUND_TRUNCATE",截断小数

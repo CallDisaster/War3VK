@@ -161,11 +161,18 @@ public:
   }
 
   void SetPartner(IDirect3DVertexShader9 *p) {
+    // AddRef the incoming partner BEFORE releasing the old one. m_partner is a
+    // fork-only link (not in upstream DXVK); the previous Release-before-AddRef
+    // order is a latent self-assignment use-after-free (if p == m_partner with
+    // refcount 1, Release() frees it and the following AddRef() touches freed
+    // memory). The only current caller passes a fresh distinct shader into a
+    // null m_partner, so this is hardening, not a live-path change: for a
+    // distinct pointer the net refcount effect is identical to before.
+    if (p)
+      p->AddRef();
     if (m_partner)
       m_partner->Release();
     m_partner = p;
-    if (m_partner)
-      m_partner->AddRef();
   }
 
   IDirect3DVertexShader9 *GetPartner() {

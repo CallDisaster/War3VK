@@ -11,7 +11,7 @@ if not exist "subprojects\imgui\meson.build" (
 )
 
 if "%~1"=="" (
-  ninja -C build32 src/d3d9/d3d9.dll -j8
+  ninja -C build32 src/d3d9/d3d9.dll -j2
 ) else (
   ninja -C build32 %*
 )

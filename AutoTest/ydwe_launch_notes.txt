@@ -32,5 +32,15 @@ YDWE 启动链结论（源码定位）
 5. 对 AutoTest 的直接启发
 --------------------------
 - 只要复刻“复制到固定短路径 + -loadfile 相对路径”，即可稳定直进地图。
-- 不需要先集成 YDWE 注入链（LuaEngine/Storm 替换），即可完成渲染回归自动化。
+- 纯渲染回归可直接启动 war3.exe；历史地图使用 YDWE JAPI 时不能这样做，必须显式走
+  `launcher_mode=ydwe`，由 YDWE wrapper 注入 LuaEngine/JAPI。
+- JAPI 模式只允许既有 `E:\Work\War3_AutoTestSandbox`，只读校验 HKCU InstallPath；
+  候选图和短路径目标 SHA 必须一致，并追加 `-closew2l` 禁止二次转换。
+- AutoTest 必须发现 YDWE 子树内且镜像路径精确匹配沙盒的 war3 PID，并校验
+  LuaEngine.dll / yd_jass_api.dll 已按路径与 SHA 加载。
+- 已打开的 worldeditydwe/YDWEConfig 会让共享 wrapper 不产出 child；此时
+  fail-closed 返回 `USER_YDWE_PROCESS_CONFLICT`，不得关闭用户进程或降级成无 JAPI 启动。
+- LuaEngine 在 DLL 初始化阶段打开固定的 `logs\war3.log`。日志无写权限或被占用会先抛
+  `Failed to open file ... for writing`，随后以 `0xC0000409` 退出；此时尚未加载 JAPI/地图。
+  AutoTest 必须先做日志写入预检，并对规范化 YDWE 根持有跨进程互斥锁直到 War3 停止。
 

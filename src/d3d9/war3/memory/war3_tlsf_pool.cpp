@@ -5,8 +5,10 @@
 //   1. 去除独立 Logger，改用 dxvk war3dbg::Print
 //   2. 添加 TlsfPool_AllocArenaBlock（Shadow Arena 专用预留接口）
 //   3. 使用独占 Spinlock 保护 TLSF 元数据，避免 shared_mutex 的错误并发
-//   4. 池范围表通过原子快照发布，IsFromPool 零锁读取
-//   4. 整合进 dxvk::war3::memory 命名空间
+//   4. 使用固定 64 KiB 页目录完成 O(1) 所有权负查询
+//   5. 扩池尺寸按 TLSF 真实 size class 计算，空扩展池即时归还
+//   6. 所有返回给 Storm/Game 的范围必须完整位于低 2 GiB
+//   7. 整合进 dxvk::war3::memory 命名空间
 
 #include "war3_tlsf_pool.h"
 #include "../../d3d9_war3_debug.h" // war3dbg::Print
@@ -19,6 +21,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 #include <windows.h>
@@ -34,8 +37,10 @@ constexpr size_t kInitialPoolSize = 64 * 1024 * 1024;   // 64 MB
 constexpr size_t kMaxPoolSize = 1024 * 1024 * 1024;     // 1 GB
 constexpr size_t kExtendGranularity = 16 * 1024 * 1024; // 16 MB
 constexpr size_t kDefaultAlignment = 16;
-constexpr size_t kMaxExtraPoolCount =
-    (kMaxPoolSize - kInitialPoolSize) / kExtendGranularity;
+constexpr size_t kAddressPageShift = 16;
+constexpr size_t kAddressPageSize = size_t{1} << kAddressPageShift;
+constexpr size_t kAddressPageCount = size_t{1} << (32 - kAddressPageShift);
+constexpr uintptr_t kStormSignedAddressLimit = 0x80000000u;
 
 // ============================================================================
 // 内部状态
@@ -54,24 +59,13 @@ struct ArenaBlock {
   size_t size = 0;
 };
 
-struct PoolRange {
-  void *base = nullptr;
-  size_t size = 0;
-};
-
-struct PoolRangeSnapshot {
-  uint32_t count = 0;
-  std::array<PoolRange, kMaxExtraPoolCount + 1> ranges = {};
-};
-
 tlsf_t g_tlsf = nullptr;
 void *g_mainPool = nullptr;
 std::vector<ExtraPool> g_extraPools;
 std::vector<ArenaBlock> g_arenaBlocks;
-std::vector<std::unique_ptr<PoolRangeSnapshot>> g_rangeSnapshots;
-std::atomic<PoolRangeSnapshot *> g_activeRanges{nullptr};
+std::array<std::atomic<uint8_t>, kAddressPageCount> g_addressDirectory{};
 
-// 线程安全开关：默认开启，但单线程场景可禁用以获得更低开销
+// 兼容旧接口保留该状态；生产实现始终保持 allocator 生命周期锁开启。
 std::atomic<bool> g_lockEnabled{true};
 sync::Spinlock g_poolLock;
 
@@ -94,10 +88,61 @@ std::atomic<size_t> g_trimCount{0};
 
 // ---- 辅助 ----
 
-inline bool InRange(void *ptr, void *base, size_t size) {
+inline bool InRange(const void *ptr, const void *base, size_t size) {
   auto p = reinterpret_cast<uintptr_t>(ptr);
   auto b = reinterpret_cast<uintptr_t>(base);
   return p >= b && p < b + size;
+}
+
+bool IsStormCompatibleAddressRange(const void *base, size_t size) {
+  if (!base || size == 0)
+    return false;
+  const uintptr_t start = reinterpret_cast<uintptr_t>(base);
+  return start < kStormSignedAddressLimit &&
+         size <= kStormSignedAddressLimit - start;
+}
+
+void *AllocateLowRange(size_t size, const char *purpose) {
+  void *base =
+      VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (!base || IsStormCompatibleAddressRange(base, size))
+    return base;
+
+  war3dbg::Print(
+      "DXVK War3[TlsfPool]: 拒绝高地址范围 purpose=%s base=%p size=%zu\n",
+      purpose ? purpose : "?", base, size);
+  VirtualFree(base, 0, MEM_RELEASE);
+  return nullptr;
+}
+
+bool RegisterAddressRangeLocked(const void *base, size_t size) {
+  if (!IsStormCompatibleAddressRange(base, size))
+    return false;
+  const uintptr_t start = reinterpret_cast<uintptr_t>(base);
+  const size_t first = start >> kAddressPageShift;
+  const size_t last = (start + size - 1) >> kAddressPageShift;
+  if (last >= g_addressDirectory.size())
+    return false;
+
+  for (size_t page = first; page <= last; ++page) {
+    if (g_addressDirectory[page].load(std::memory_order_relaxed) != 0)
+      return false;
+  }
+  for (size_t page = first; page <= last; ++page)
+    g_addressDirectory[page].store(1, std::memory_order_release);
+  return true;
+}
+
+void UnregisterAddressRangeLocked(const void *base, size_t size) {
+  if (!base || size == 0)
+    return;
+  const uintptr_t start = reinterpret_cast<uintptr_t>(base);
+  const size_t first = start >> kAddressPageShift;
+  const size_t last = (start + size - 1) >> kAddressPageShift;
+  if (last >= g_addressDirectory.size())
+    return;
+  for (size_t page = first; page <= last; ++page)
+    g_addressDirectory[page].store(0, std::memory_order_release);
 }
 
 void UpdatePeak(size_t cur) {
@@ -107,11 +152,10 @@ void UpdatePeak(size_t cur) {
   }
 }
 
-void PublishRangeSnapshotLocked();
-
-bool AddExtraPool(size_t size) {
-  void *mem =
-      VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+bool AddExtraPool(size_t size, void **addedBase = nullptr) {
+  if (addedBase)
+    *addedBase = nullptr;
+  void *mem = AllocateLowRange(size, "growth");
   if (!mem) {
     war3dbg::Print("DXVK War3[TlsfPool]: VirtualAlloc 失败 size=%zu err=%lu\n",
                    size, GetLastError());
@@ -123,37 +167,100 @@ bool AddExtraPool(size_t size) {
     VirtualFree(mem, 0, MEM_RELEASE);
     return false;
   }
-  g_extraPools.push_back(ExtraPool{mem, size, ph});
-  PublishRangeSnapshotLocked();
+  if (!RegisterAddressRangeLocked(mem, size)) {
+    war3dbg::Print(
+        "DXVK War3[TlsfPool]: 扩展池页目录登记失败 base=%p size=%zu\n",
+        mem, size);
+    tlsf_remove_pool(g_tlsf, ph);
+    VirtualFree(mem, 0, MEM_RELEASE);
+    return false;
+  }
+  try {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(mem);
+    const auto insertion = std::lower_bound(
+        g_extraPools.begin(), g_extraPools.end(), address,
+        [](const ExtraPool &pool, uintptr_t value) {
+          return reinterpret_cast<uintptr_t>(pool.base) < value;
+        });
+    g_extraPools.insert(insertion, ExtraPool{mem, size, ph});
+  } catch (...) {
+    UnregisterAddressRangeLocked(mem, size);
+    tlsf_remove_pool(g_tlsf, ph);
+    VirtualFree(mem, 0, MEM_RELEASE);
+    return false;
+  }
   g_totalSize.fetch_add(size, std::memory_order_relaxed);
   g_extendCount.fetch_add(1, std::memory_order_relaxed);
+  if (addedBase)
+    *addedBase = mem;
   war3dbg::Print("DXVK War3[TlsfPool]: 扩展池 +%zu MB，当前总计 %zu MB\n",
                  size >> 20, g_totalSize.load() >> 20);
   return true;
 }
 
-void PublishRangeSnapshotLocked() {
-  auto snapshot = std::make_unique<PoolRangeSnapshot>();
-  if (g_mainPool) {
-    snapshot->ranges[snapshot->count++] = PoolRange{g_mainPool,
-                                                    kInitialPoolSize};
+void ApplyUsedSizeDelta(size_t oldSize, size_t newSize) {
+  if (newSize > oldSize) {
+    const size_t growth = newSize - oldSize;
+    UpdatePeak(g_usedSize.fetch_add(growth, std::memory_order_relaxed) +
+               growth);
+  } else if (oldSize > newSize) {
+    g_usedSize.fetch_sub(oldSize - newSize, std::memory_order_relaxed);
   }
+}
 
-  for (const auto &ep : g_extraPools) {
-    if (!ep.base || !ep.size)
-      continue;
-    if (snapshot->count >= snapshot->ranges.size())
-      break;
-    snapshot->ranges[snapshot->count++] = PoolRange{ep.base, ep.size};
-  }
+auto FindExtraPoolLocked(const void *ptr) {
+  const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+  auto candidate = std::upper_bound(
+      g_extraPools.begin(), g_extraPools.end(), address,
+      [](uintptr_t value, const ExtraPool &pool) {
+        return value < reinterpret_cast<uintptr_t>(pool.base);
+      });
+  if (candidate == g_extraPools.begin())
+    return g_extraPools.end();
+  --candidate;
+  return InRange(ptr, candidate->base, candidate->size)
+             ? candidate
+             : g_extraPools.end();
+}
 
-  PoolRangeSnapshot *published = snapshot.get();
-  g_rangeSnapshots.push_back(std::move(snapshot));
-  g_activeRanges.store(published, std::memory_order_release);
+bool IsExactAllocatedBlockLocked(void *ptr) {
+  if (!ptr)
+    return false;
+  if (InRange(ptr, g_mainPool, kInitialPoolSize))
+    return tlsf_block_is_valid_in_range(ptr, g_mainPool,
+                                        kInitialPoolSize) != 0;
+  const auto owner = FindExtraPoolLocked(ptr);
+  return owner != g_extraPools.end() &&
+         tlsf_block_is_valid_in_range(ptr, owner->base, owner->size) != 0;
+}
+
+bool RemoveEmptyExtraPoolLocked(void *base) {
+  const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+  const auto found = std::lower_bound(
+      g_extraPools.begin(), g_extraPools.end(), address,
+      [](const ExtraPool &pool, uintptr_t value) {
+        return reinterpret_cast<uintptr_t>(pool.base) < value;
+      });
+  if (found == g_extraPools.end() || !tlsf_pool_is_empty(found->handle))
+    return false;
+  if (found->base != base)
+    return false;
+
+  const size_t size = found->size;
+  tlsf_remove_pool(g_tlsf, found->handle);
+  UnregisterAddressRangeLocked(found->base, found->size);
+  VirtualFree(found->base, 0, MEM_RELEASE);
+  g_extraPools.erase(found);
+  g_totalSize.fetch_sub(size, std::memory_order_relaxed);
+  g_trimCount.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 // 带自动扩展的分配（持锁版本，供 Alloc/AllocAligned 调用）
 void *AllocWithExtendLocked(size_t size, size_t align) {
+  const size_t effectiveAlignment = align ? align : tlsf_align_size();
+  if (tlsf_allocation_pool_size(size, effectiveAlignment) == 0u)
+    return nullptr;
   // 先尝试不扩展
   void *ptr =
       align ? tlsf_memalign(g_tlsf, align, size) : tlsf_malloc(g_tlsf, size);
@@ -164,13 +271,35 @@ void *AllocWithExtendLocked(size_t size, size_t align) {
   if (g_totalSize.load(std::memory_order_relaxed) >= kMaxPoolSize)
     return nullptr;
 
-  size_t ext = std::max(kExtendGranularity,
-                        ((size + kExtendGranularity - 1) / kExtendGranularity) *
-                            kExtendGranularity);
-  if (!AddExtraPool(ext))
+  constexpr size_t kGrowthSlack = 64 * 1024;
+  const size_t allocationAlignment = align ? align : tlsf_align_size();
+  const size_t minimum =
+      tlsf_allocation_pool_size(size, allocationAlignment);
+  if (!minimum || minimum > SIZE_MAX - kGrowthSlack)
+    return nullptr;
+  const size_t required = minimum + kGrowthSlack;
+  const size_t granularity =
+      required > kExtendGranularity ? kAddressPageSize : kExtendGranularity;
+  if (required > SIZE_MAX - (granularity - 1))
     return nullptr;
 
-  return align ? tlsf_memalign(g_tlsf, align, size) : tlsf_malloc(g_tlsf, size);
+  size_t ext = ((required + granularity - 1) / granularity) * granularity;
+  const size_t total = g_totalSize.load(std::memory_order_relaxed);
+  const size_t remaining = total < kMaxPoolSize ? kMaxPoolSize - total : 0;
+  if (ext > remaining) {
+    if (remaining < required)
+      return nullptr;
+    ext = remaining;
+  }
+
+  void *addedBase = nullptr;
+  if (!AddExtraPool(ext, &addedBase))
+    return nullptr;
+
+  ptr = align ? tlsf_memalign(g_tlsf, align, size) : tlsf_malloc(g_tlsf, size);
+  if (!ptr && addedBase)
+    RemoveEmptyExtraPoolLocked(addedBase);
+  return ptr;
 }
 
 } // anonymous namespace
@@ -190,8 +319,11 @@ bool TlsfPool_Init() {
     return expected == kInitReady;
   }
 
-  g_mainPool = VirtualAlloc(nullptr, kInitialPoolSize, MEM_COMMIT | MEM_RESERVE,
-                            PAGE_READWRITE);
+  // vendored locality cache 是进程级单例，会把已释放块继续标为 used；
+  // 这既破坏并发隔离，也会让 O(1) 空池判断永远无法闭合。
+  tlsf_toggle_optimized_memory_locality(0);
+
+  g_mainPool = AllocateLowRange(kInitialPoolSize, "main");
   if (!g_mainPool) {
     war3dbg::Print("DXVK War3[TlsfPool]: 主池 VirtualAlloc 失败 err=%lu\n",
                    GetLastError());
@@ -208,6 +340,15 @@ bool TlsfPool_Init() {
     return false;
   }
 
+  if (!RegisterAddressRangeLocked(g_mainPool, kInitialPoolSize)) {
+    war3dbg::Print("DXVK War3[TlsfPool]: 主池页目录登记失败\n");
+    VirtualFree(g_mainPool, 0, MEM_RELEASE);
+    g_mainPool = nullptr;
+    g_tlsf = nullptr;
+    g_initState.store(kInitUninitialized, std::memory_order_release);
+    return false;
+  }
+
   g_totalSize.store(kInitialPoolSize, std::memory_order_relaxed);
   g_usedSize.store(0u, std::memory_order_relaxed);
   g_peakUsed.store(0u, std::memory_order_relaxed);
@@ -215,10 +356,6 @@ bool TlsfPool_Init() {
   g_freeCount.store(0u, std::memory_order_relaxed);
   g_extendCount.store(0u, std::memory_order_relaxed);
   g_trimCount.store(0u, std::memory_order_relaxed);
-  {
-    std::lock_guard<sync::Spinlock> lock(g_poolLock);
-    PublishRangeSnapshotLocked();
-  }
   g_initState.store(kInitReady, std::memory_order_release);
   war3dbg::Print("DXVK War3[TlsfPool]: 初始化完成 base=%p size=%zu MB\n",
                  g_mainPool, kInitialPoolSize >> 20);
@@ -232,8 +369,10 @@ void TlsfPool_Shutdown() {
 
   std::lock_guard<sync::Spinlock> lock(g_poolLock);
   for (auto &ep : g_extraPools) {
-    if (ep.handle)
+    if (ep.handle) {
       tlsf_remove_pool(g_tlsf, ep.handle);
+      UnregisterAddressRangeLocked(ep.base, ep.size);
+    }
     if (ep.base)
       VirtualFree(ep.base, 0, MEM_RELEASE);
   }
@@ -243,10 +382,9 @@ void TlsfPool_Shutdown() {
       VirtualFree(ab.base, 0, MEM_RELEASE);
   }
   g_arenaBlocks.clear();
-  g_rangeSnapshots.clear();
-  g_activeRanges.store(nullptr, std::memory_order_release);
 
   if (g_mainPool) {
+    UnregisterAddressRangeLocked(g_mainPool, kInitialPoolSize);
     VirtualFree(g_mainPool, 0, MEM_RELEASE);
     g_mainPool = nullptr;
   }
@@ -290,6 +428,14 @@ void *TlsfPool_AllocAligned(size_t size, size_t alignment) {
     return nullptr;
   if (alignment == 0)
     alignment = kDefaultAlignment;
+  const size_t minimumAlignment = tlsf_align_size();
+  if (alignment < minimumAlignment ||
+      (alignment & (alignment - 1u)) != 0u ||
+      alignment > std::numeric_limits<size_t>::max() - size ||
+      size + alignment >
+          std::numeric_limits<size_t>::max() - tlsf_pool_overhead() ||
+      tlsf_allocation_pool_size(size, alignment) == 0u)
+    return nullptr;
 
   void *ptr = nullptr;
   size_t blockSize = 0;
@@ -321,6 +467,8 @@ void *TlsfPool_Realloc(void *ptr, size_t newSize) {
     TlsfPool_Free(ptr);
     return nullptr;
   }
+  if (tlsf_allocation_pool_size(newSize, tlsf_align_size()) == 0u)
+    return nullptr;
 
   size_t oldSize = 0;
   size_t newBlockSize = 0;
@@ -328,63 +476,122 @@ void *TlsfPool_Realloc(void *ptr, size_t newSize) {
 
   if (g_lockEnabled.load(std::memory_order_acquire)) {
     std::lock_guard<sync::Spinlock> lock(g_poolLock);
+    if (!IsExactAllocatedBlockLocked(ptr))
+      return nullptr;
+    const auto oldPool = FindExtraPoolLocked(ptr);
+    void *oldPoolBase =
+        oldPool != g_extraPools.end() ? oldPool->base : nullptr;
     oldSize = tlsf_block_size(ptr);
     newPtr = tlsf_realloc(g_tlsf, ptr, newSize);
-    if (newPtr)
+    if (newPtr) {
       newBlockSize = tlsf_block_size(newPtr);
+      ApplyUsedSizeDelta(oldSize, newBlockSize);
+    }
+    if (newPtr && oldPoolBase)
+      RemoveEmptyExtraPoolLocked(oldPoolBase);
   } else {
+    if (!IsExactAllocatedBlockLocked(ptr))
+      return nullptr;
     oldSize = tlsf_block_size(ptr);
     newPtr = tlsf_realloc(g_tlsf, ptr, newSize);
-    if (newPtr)
+    if (newPtr) {
       newBlockSize = tlsf_block_size(newPtr);
-  }
-
-  if (newPtr) {
-    if (newBlockSize > oldSize) {
-      UpdatePeak(g_usedSize.fetch_add(newBlockSize - oldSize,
-                                      std::memory_order_relaxed) +
-                 (newBlockSize - oldSize));
-    } else if (oldSize > newBlockSize) {
-      g_usedSize.fetch_sub(oldSize - newBlockSize, std::memory_order_relaxed);
+      ApplyUsedSizeDelta(oldSize, newBlockSize);
     }
   }
   return newPtr;
 }
 
-void TlsfPool_Free(void *ptr) {
+void *TlsfPool_ReallocInPlace(void *ptr, size_t newSize) {
+  if (!TlsfPool_IsInitialized() || !ptr || !newSize)
+    return nullptr;
+  if (tlsf_allocation_pool_size(newSize, tlsf_align_size()) == 0u)
+    return nullptr;
+
+  size_t oldSize = 0;
+  size_t newBlockSize = 0;
+  void *result = nullptr;
+  if (g_lockEnabled.load(std::memory_order_acquire)) {
+    std::lock_guard<sync::Spinlock> lock(g_poolLock);
+    if (!IsExactAllocatedBlockLocked(ptr))
+      return nullptr;
+    oldSize = tlsf_block_size(ptr);
+    result = tlsf_realloc_in_place(g_tlsf, ptr, newSize);
+    if (result)
+      newBlockSize = tlsf_block_size(result);
+  } else {
+    if (!IsExactAllocatedBlockLocked(ptr))
+      return nullptr;
+    oldSize = tlsf_block_size(ptr);
+    result = tlsf_realloc_in_place(g_tlsf, ptr, newSize);
+    if (result)
+      newBlockSize = tlsf_block_size(result);
+  }
+
+  if (result) {
+    if (newBlockSize > oldSize) {
+      const size_t growth = newBlockSize - oldSize;
+      UpdatePeak(g_usedSize.fetch_add(growth, std::memory_order_relaxed) +
+                 growth);
+    } else if (oldSize > newBlockSize) {
+      g_usedSize.fetch_sub(oldSize - newBlockSize,
+                           std::memory_order_relaxed);
+    }
+  }
+  return result;
+}
+
+bool TlsfPool_Free(void *ptr) {
   if (!ptr || !TlsfPool_IsInitialized())
-    return;
+    return false;
 
   size_t blockSize = 0;
 
   if (g_lockEnabled.load(std::memory_order_acquire)) {
     std::lock_guard<sync::Spinlock> lock(g_poolLock);
+    if (!IsExactAllocatedBlockLocked(ptr))
+      return false;
+    const auto owner = FindExtraPoolLocked(ptr);
+    void *ownerBase = owner != g_extraPools.end() ? owner->base : nullptr;
     blockSize = tlsf_block_size(ptr);
     tlsf_free(g_tlsf, ptr);
+    if (blockSize)
+      g_usedSize.fetch_sub(blockSize, std::memory_order_relaxed);
+    if (ownerBase)
+      RemoveEmptyExtraPoolLocked(ownerBase);
   } else {
+    if (!IsExactAllocatedBlockLocked(ptr))
+      return false;
     blockSize = tlsf_block_size(ptr);
     tlsf_free(g_tlsf, ptr);
+    if (blockSize)
+      g_usedSize.fetch_sub(blockSize, std::memory_order_relaxed);
   }
 
   g_freeCount.fetch_add(1, std::memory_order_relaxed);
-  if (blockSize)
-    g_usedSize.fetch_sub(blockSize, std::memory_order_relaxed);
+  return true;
+}
+
+bool TlsfPool_InspectExactBlock(void *ptr,
+                                TlsfPoolExactBlockInspector inspector,
+                                void *context) {
+  if (!ptr || !inspector || !TlsfPool_IsFromPool(ptr))
+    return false;
+  if (g_lockEnabled.load(std::memory_order_acquire)) {
+    std::lock_guard<sync::Spinlock> lock(g_poolLock);
+    return IsExactAllocatedBlockLocked(ptr) && inspector(ptr, context);
+  }
+  return IsExactAllocatedBlockLocked(ptr) && inspector(ptr, context);
 }
 
 bool TlsfPool_IsFromPool(void *ptr) {
   if (!ptr || !TlsfPool_IsInitialized())
     return false;
-
-  const PoolRangeSnapshot *snapshot =
-      g_activeRanges.load(std::memory_order_acquire);
-  if (!snapshot)
+  const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+  if (address >= kStormSignedAddressLimit)
     return false;
-
-  for (uint32_t i = 0; i < snapshot->count; i++) {
-    if (InRange(ptr, snapshot->ranges[i].base, snapshot->ranges[i].size))
-      return true;
-  }
-  return false;
+  return g_addressDirectory[address >> kAddressPageShift].load(
+             std::memory_order_acquire) != 0;
 }
 
 size_t TlsfPool_BlockSize(void *ptr) {
@@ -392,9 +599,9 @@ size_t TlsfPool_BlockSize(void *ptr) {
     return 0;
   if (g_lockEnabled.load(std::memory_order_acquire)) {
     std::lock_guard<sync::Spinlock> lock(g_poolLock);
-    return tlsf_block_size(ptr);
+    return IsExactAllocatedBlockLocked(ptr) ? tlsf_block_size(ptr) : 0u;
   }
-  return tlsf_block_size(ptr);
+  return IsExactAllocatedBlockLocked(ptr) ? tlsf_block_size(ptr) : 0u;
 }
 
 // ---- Arena 预留 ----
@@ -403,8 +610,7 @@ void *TlsfPool_AllocArenaBlock(size_t size, const char *purpose) {
   if (!TlsfPool_IsInitialized() || size == 0)
     return nullptr;
 
-  void *ptr =
-      VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  void *ptr = AllocateLowRange(size, purpose ? purpose : "arena");
   if (!ptr) {
     war3dbg::Print("DXVK War3[TlsfPool]: Arena 预留失败 size=%zu purpose=%s\n",
                    size, purpose ? purpose : "?");
@@ -412,7 +618,12 @@ void *TlsfPool_AllocArenaBlock(size_t size, const char *purpose) {
   }
   {
     std::lock_guard<sync::Spinlock> lock(g_poolLock);
-    g_arenaBlocks.push_back(ArenaBlock{ptr, size});
+    try {
+      g_arenaBlocks.push_back(ArenaBlock{ptr, size});
+    } catch (...) {
+      VirtualFree(ptr, 0, MEM_RELEASE);
+      return nullptr;
+    }
   }
   war3dbg::Print(
       "DXVK War3[TlsfPool]: Arena 预留 ptr=%p size=%zu MB purpose=%s\n", ptr,
@@ -429,37 +640,23 @@ void TlsfPool_TrimFreePages() {
   std::lock_guard<sync::Spinlock> lock(g_poolLock);
 
   size_t reclaimed = 0;
-  bool rangesChanged = false;
   for (auto it = g_extraPools.begin(); it != g_extraPools.end();) {
     if (!it->handle) {
       ++it;
       continue;
     }
 
-    // 检查此扩展池中是否有已分配块
-    size_t usedInPool = 0;
-    tlsf_walk_pool(
-        it->handle,
-        [](void *, size_t sz, int used, void *ctx) {
-          if (used)
-            *static_cast<size_t *>(ctx) += sz;
-        },
-        &usedInPool);
-
-    if (usedInPool == 0) {
+    if (tlsf_pool_is_empty(it->handle)) {
       tlsf_remove_pool(g_tlsf, it->handle);
+      UnregisterAddressRangeLocked(it->base, it->size);
       VirtualFree(it->base, 0, MEM_RELEASE);
       g_totalSize.fetch_sub(it->size, std::memory_order_relaxed);
       reclaimed += it->size;
       it = g_extraPools.erase(it);
-      rangesChanged = true;
     } else {
       ++it;
     }
   }
-
-  if (rangesChanged)
-    PublishRangeSnapshotLocked();
 
   g_trimCount.fetch_add(1, std::memory_order_relaxed);
   if (reclaimed)
@@ -493,8 +690,10 @@ void TlsfPool_PrintStats() {
 // ---- 线程安全控制 ----
 
 void TlsfPool_DisableLock() {
-  g_lockEnabled.store(false, std::memory_order_release);
-  war3dbg::Print("DXVK War3[TlsfPool]: 锁已禁用（单线程模式）\n");
+  // 扩展池会在 Free/Realloc 中即时退役；生产路径必须保留 allocator
+  // 生命周期锁，不能再暴露旧版“假定 Storm 永远单线程”的优化开关。
+  g_lockEnabled.store(true, std::memory_order_release);
+  war3dbg::Print("DXVK War3[TlsfPool]: 生产路径拒绝禁用 allocator 锁\n");
 }
 
 void TlsfPool_EnableLock() {

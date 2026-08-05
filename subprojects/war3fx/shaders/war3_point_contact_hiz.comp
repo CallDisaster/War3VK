@@ -1,0 +1,1180 @@
+#version 460
+
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2DArray s_depth;
+layout(set = 0, binding = 1) uniform texture2D s_hiz;
+layout(set = 0, binding = 2, rg16f)
+writeonly uniform image2DArray s_visibilityConfidence;
+
+layout(set = 0, binding = 3, scalar, row_major)
+uniform HybridRayData {
+  mat4 u_view;
+  mat4 u_invViewProj;
+  mat4 u_proj;
+  vec4 u_viewport;
+  // x=MinZ y=MaxZ z=far clear raw value w=clear value known
+  vec4 u_viewportZ;
+  // x=maxDistance y=thickness z=startOffset w=maxNodeVisits
+  vec4 u_rayParams;
+  // x=raw depth quantum y=reserved z=reserved w=reserved
+  vec4 u_rayParams2;
+  // xyz=view-space position, w=authored range
+  vec4 u_lightViewPos[2];
+  // x=CPU-normalized maxRGB*intensity*shadowStrength
+  vec4 u_lightEnergy[2];
+} ray;
+
+layout(push_constant, scalar)
+uniform PushData {
+  uint p_srcMip;
+  uint p_dstMip;
+  uint p_mipCount;
+  uint p_layerCount;
+  uvec4 p_extent;   // full width/height, base width/height
+  // contact: ROI x/y/width/height; seed/reduce retain their own semantics
+  uvec4 p_dispatch;
+} pc;
+
+const float kInfinity = 3.402823466e38;
+
+struct DepthSample {
+  bool valid;
+  vec3 viewPos;
+  float viewDepth;
+  float depthError;
+};
+
+bool finiteFloat(float value) {
+  return !isnan(value) && !isinf(value) && abs(value) < 1.0e30;
+}
+
+bool finiteVec2(vec2 value) {
+  return !any(isnan(value)) && !any(isinf(value)) &&
+         all(lessThan(abs(value), vec2(1.0e30)));
+}
+
+bool finiteVec3(vec3 value) {
+  return !any(isnan(value)) && !any(isinf(value)) &&
+         all(lessThan(abs(value), vec3(1.0e30)));
+}
+
+bool finiteVec4(vec4 value) {
+  return !any(isnan(value)) && !any(isinf(value)) &&
+         all(lessThan(abs(value), vec4(1.0e30)));
+}
+
+DepthSample invalidDepthSample() {
+  DepthSample result;
+  result.valid = false;
+  result.viewPos = vec3(0.0);
+  result.viewDepth = 0.0;
+  result.depthError = 0.0;
+  return result;
+}
+
+// Reconstruct one stable receiver normal from the same 2x2 footprint that the
+// Hi-Z seed has already proved homogeneous. Both triangles use the same
+// screen-space winding: down x right. Their unit normals must agree before the
+// footprint may contribute trusted occlusion. This test is independent of raw
+// depth direction because it operates only on reconstructed view positions;
+// the final camera-facing flip is performed by the caller.
+//
+// Keeping the footprint explicit also avoids reading left/right/up/down around
+// the selected representative. Those neighbours can cross the very depth edge
+// that the half-resolution homogeneity gate was designed to isolate. Missing
+// points at an odd render-target edge are not clamped or duplicated: the
+// caller leaves the result unknown instead of fabricating a plane.
+bool reconstructFootprintNormal(
+    DepthSample p00, DepthSample p10,
+    DepthSample p01, DepthSample p11,
+    out vec3 normal, out float planarityConfidence,
+    out float footprintDepthError) {
+  normal = vec3(0.0);
+  planarityConfidence = 0.0;
+  footprintDepthError = 0.0;
+  if (!p00.valid || !p10.valid || !p01.valid || !p11.valid)
+    return false;
+
+  vec3 down0 = p01.viewPos - p00.viewPos;
+  vec3 right0 = p10.viewPos - p00.viewPos;
+  vec3 down1 = p11.viewPos - p10.viewPos;
+  vec3 right1 = p11.viewPos - p01.viewPos;
+  if (!finiteVec3(down0) || !finiteVec3(right0) ||
+      !finiteVec3(down1) || !finiteVec3(right1))
+    return false;
+
+  float down0Length2 = dot(down0, down0);
+  float right0Length2 = dot(right0, right0);
+  float down1Length2 = dot(down1, down1);
+  float right1Length2 = dot(right1, right1);
+  if (!finiteFloat(down0Length2) || !finiteFloat(right0Length2) ||
+      !finiteFloat(down1Length2) || !finiteFloat(right1Length2) ||
+      down0Length2 <= 1.0e-20 || right0Length2 <= 1.0e-20 ||
+      down1Length2 <= 1.0e-20 || right1Length2 <= 1.0e-20)
+    return false;
+
+  down0 *= inversesqrt(down0Length2);
+  right0 *= inversesqrt(right0Length2);
+  down1 *= inversesqrt(down1Length2);
+  right1 *= inversesqrt(right1Length2);
+  vec3 normal0 = cross(down0, right0);
+  vec3 normal1 = cross(down1, right1);
+  float normal0Length2 = dot(normal0, normal0);
+  float normal1Length2 = dot(normal1, normal1);
+  // A nearly collinear triangle has no stable normal. It can only discard A1
+  // evidence; it must never fall back to an arbitrary normal and create a hit.
+  if (!finiteFloat(normal0Length2) || !finiteFloat(normal1Length2) ||
+      normal0Length2 <= 1.0e-8 || normal1Length2 <= 1.0e-8)
+    return false;
+  normal0 *= inversesqrt(normal0Length2);
+  normal1 *= inversesqrt(normal1Length2);
+
+  float agreement = dot(normal0, normal1);
+  if (!finiteFloat(agreement) || agreement <= 0.5)
+    return false;
+  planarityConfidence = smoothstep(0.5, 0.98, agreement);
+  if (!finiteFloat(planarityConfidence) ||
+      planarityConfidence <= 1.0e-4)
+    return false;
+
+  normal = normal0 + normal1;
+  float normalLength2 = dot(normal, normal);
+  if (!finiteVec3(normal) || !finiteFloat(normalLength2) ||
+      normalLength2 <= 1.0e-12)
+    return false;
+  normal *= inversesqrt(normalLength2);
+
+  footprintDepthError = max(
+      max(p00.depthError, p10.depthError),
+      max(p01.depthError, p11.depthError));
+  return finiteVec3(normal) && finiteFloat(footprintDepthError) &&
+         footprintDepthError >= 0.0;
+}
+
+bool reconstructViewSample(ivec2 localPixel, ivec2 viewportSize,
+                           float rawDepth, float minZ, float maxZ,
+                           out vec3 viewPosition, out float viewDepth) {
+  float denom = maxZ - minZ;
+  if (!finiteFloat(denom) || abs(denom) <= 1.0e-6)
+    return false;
+
+  float depthN = (rawDepth - minZ) / denom;
+  if (!finiteFloat(depthN) || depthN < -1.0e-5 || depthN > 1.0 + 1.0e-5)
+    return false;
+  depthN = clamp(depthN, 0.0, 1.0);
+
+  vec2 uvViewport = vec2(localPixel) / vec2(viewportSize);
+  vec4 clip = vec4(uvViewport.x * 2.0 - 1.0,
+                   1.0 - uvViewport.y * 2.0,
+                   depthN, 1.0);
+  vec4 worldH = clip * ray.u_invViewProj;
+  if (!finiteVec4(worldH) || abs(worldH.w) <= 1.0e-6)
+    return false;
+
+  vec4 viewH = vec4(worldH.xyz / worldH.w, 1.0) * ray.u_view;
+  if (!finiteVec4(viewH))
+    return false;
+
+  viewPosition = viewH.xyz;
+  viewDepth = abs(viewH.z);
+  return finiteVec3(viewPosition) && finiteFloat(viewDepth) &&
+         viewDepth > 1.0e-5;
+}
+
+DepthSample loadDepthPixel(ivec2 absolutePixel) {
+  DepthSample result = invalidDepthSample();
+  ivec2 fullExtent = ivec2(pc.p_extent.xy);
+  if (any(lessThan(absolutePixel, ivec2(0))) ||
+      any(greaterThanEqual(absolutePixel, fullExtent)))
+    return result;
+
+  ivec2 viewportMin = ivec2(ray.u_viewport.xy);
+  ivec2 viewportSize = ivec2(max(ray.u_viewport.zw, vec2(1.0)));
+  ivec2 localPixel = absolutePixel - viewportMin;
+  if (any(lessThan(localPixel, ivec2(0))) ||
+      any(greaterThanEqual(localPixel, viewportSize)))
+    return result;
+
+  float rawDepth = texelFetch(s_depth, ivec3(absolutePixel, 0), 0).r;
+  if (!finiteFloat(rawDepth))
+    return result;
+
+  float minZ = ray.u_viewportZ.x;
+  float maxZ = ray.u_viewportZ.y;
+  float quantum = max(ray.u_rayParams2.x, 1.0e-7);
+  float rawLo = min(minZ, maxZ);
+  float rawHi = max(minZ, maxZ);
+  if (rawDepth < rawLo - quantum || rawDepth > rawHi + quantum)
+    return result;
+
+  if (ray.u_viewportZ.w > 0.5 &&
+      abs(rawDepth - ray.u_viewportZ.z) <= max(0.5 * quantum, 1.0e-7))
+    return result;
+
+  if (!reconstructViewSample(localPixel, viewportSize, rawDepth, minZ, maxZ,
+                             result.viewPos, result.viewDepth))
+    return result;
+
+  // Convert one raw-depth quantum into view-space uncertainty. Perspective
+  // depth loses precision rapidly near the far plane (especially D16); a
+  // sample whose uncertainty is too large is deliberately classified as
+  // unknown instead of manufacturing a false blocker.
+  result.depthError = 0.0;
+  for (int direction = -1; direction <= 1; direction += 2) {
+    float adjacentRaw = clamp(rawDepth + float(direction) * quantum,
+                              rawLo, rawHi);
+    if (abs(adjacentRaw - rawDepth) <= 0.25 * quantum)
+      continue;
+    vec3 adjacentPosition;
+    float adjacentDepth;
+    if (!reconstructViewSample(localPixel, viewportSize, adjacentRaw,
+                               minZ, maxZ, adjacentPosition,
+                               adjacentDepth))
+      return invalidDepthSample();
+    result.depthError = max(result.depthError,
+                            abs(adjacentDepth - result.viewDepth));
+  }
+
+  float uncertaintyLimit = max(2.0, result.viewDepth * 0.002);
+  result.valid = finiteFloat(result.depthError) &&
+                 result.depthError <= uncertaintyLimit;
+  return result;
+}
+
+bool projectViewPosition(vec3 viewPosition, float frontWSign,
+                         out vec4 clip, out vec2 uvViewport,
+                         out vec2 basePosition) {
+  clip = vec4(viewPosition, 1.0) * ray.u_proj;
+  if (!finiteVec4(clip) || clip.w * frontWSign <= 1.0e-6)
+    return false;
+
+  vec3 ndc = clip.xyz / clip.w;
+  if (!finiteVec3(ndc) || ndc.z < 0.0 || ndc.z > 1.0)
+    return false;
+
+  uvViewport = vec2(ndc.x * 0.5 + 0.5,
+                    0.5 - ndc.y * 0.5);
+  if (any(lessThanEqual(uvViewport, vec2(0.0))) ||
+      any(greaterThanEqual(uvViewport, vec2(1.0))))
+    return false;
+
+  vec2 absoluteFull = ray.u_viewport.xy + uvViewport * ray.u_viewport.zw;
+  basePosition = absoluteFull * 0.5;
+  return finiteVec2(basePosition);
+}
+
+float baseNumerator(vec4 clip, bool yAxis) {
+  if (!yAxis) {
+    float a = 0.25 * ray.u_viewport.z;
+    float b = 0.5 * ray.u_viewport.x + a;
+    return a * clip.x + b * clip.w;
+  }
+  float a = 0.25 * ray.u_viewport.w;
+  float b = 0.5 * ray.u_viewport.y + a;
+  return -a * clip.y + b * clip.w;
+}
+
+float baseDerivativeInvariant(vec4 clipOrigin, vec4 clipDirection,
+                              bool yAxis) {
+  float n0 = baseNumerator(clipOrigin, yAxis);
+  float nd = baseNumerator(clipDirection, yAxis);
+  return nd * clipOrigin.w - n0 * clipDirection.w;
+}
+
+bool basePositionAtDistance(vec4 clipOrigin, vec4 clipDirection,
+                            float distance, float frontWSign,
+                            out vec2 basePosition) {
+  basePosition = vec2(0.0);
+  float clipW = clipOrigin.w + distance * clipDirection.w;
+  if (!finiteFloat(distance) || !finiteFloat(clipW) ||
+      clipW * frontWSign <= 1.0e-6)
+    return false;
+
+  float x = (baseNumerator(clipOrigin, false) +
+             distance * baseNumerator(clipDirection, false)) / clipW;
+  float y = (baseNumerator(clipOrigin, true) +
+             distance * baseNumerator(clipDirection, true)) / clipW;
+  basePosition = vec2(x, y);
+  return finiteVec2(basePosition);
+}
+
+// Cell intervals are half-open in the projected direction. At an exact grid
+// boundary a positive ray owns the cell above the boundary, while a negative
+// ray owns the cell below it. The final Vulkan mip texel may absorb an orphaned
+// base row/column, so a proven in-domain coordinate is clamped only into that
+// extended final cell; out-of-domain coordinates are never clamped.
+bool ownedCellIndex(float coordinate, int cellSpan, int cellCount,
+                    int baseExtent, int direction, out int cellIndex) {
+  cellIndex = -1;
+  if (!finiteFloat(coordinate) || cellSpan <= 0 || cellCount <= 0 ||
+      baseExtent <= 0 || coordinate < 0.0 ||
+      coordinate > float(baseExtent))
+    return false;
+  if (coordinate == float(baseExtent)) {
+    if (direction >= 0)
+      return false;
+    cellIndex = cellCount - 1;
+    return true;
+  }
+
+  float scaled = coordinate / float(cellSpan);
+  if (!finiteFloat(scaled))
+    return false;
+  float lower = floor(scaled);
+  cellIndex = direction < 0 && scaled == lower
+      ? int(lower) - 1
+      : int(lower);
+  if (cellIndex >= cellCount)
+    cellIndex = cellCount - 1;
+  return cellIndex >= 0 && cellIndex < cellCount;
+}
+
+// Solve the exact ray distance at which a projected half-resolution base
+// coordinate reaches an arbitrary boundary. Unlike the coarse cell traversal
+// helper, this solver deliberately has no world-distance epsilon: a positive
+// full-pixel interval, however short, must be tested or classified unknown.
+bool solveBaseBoundaryDistance(vec4 clipOrigin, vec4 clipDirection,
+                               float boundary, bool yAxis,
+                               out float distance) {
+  distance = kInfinity;
+  float n0 = baseNumerator(clipOrigin, yAxis);
+  float nd = baseNumerator(clipDirection, yAxis);
+  float denominator = nd - boundary * clipDirection.w;
+  if (!finiteFloat(n0) || !finiteFloat(nd) ||
+      !finiteFloat(denominator) || abs(denominator) <= 1.0e-10)
+    return false;
+
+  distance = (boundary * clipOrigin.w - n0) / denominator;
+  return finiteFloat(distance);
+}
+
+// Return -1 for a numerically ambiguous crossing, 0 when both endpoints prove
+// that no positive-length interval crosses the boundary, and 1 when split is
+// a strict interior crossing. A failed root solve is never silently treated as
+// "same pixel" unless the projected segment endpoints independently prove the
+// same side. This keeps clip-scale-dependent solver thresholds fail-soft.
+int classifyBaseBoundaryCrossing(
+    vec4 clipOrigin, vec4 clipDirection,
+    float segmentStart, float segmentEnd,
+    float startCoord, float endCoord,
+    float boundary, float coordEpsilon, bool yAxis,
+    out float split) {
+  int startSide = startCoord < boundary - coordEpsilon
+      ? -1 : (startCoord > boundary + coordEpsilon ? 1 : 0);
+  int endSide = endCoord < boundary - coordEpsilon
+      ? -1 : (endCoord > boundary + coordEpsilon ? 1 : 0);
+
+  bool solved = solveBaseBoundaryDistance(
+      clipOrigin, clipDirection, boundary, yAxis, split);
+  bool interior = solved && split > segmentStart && split < segmentEnd;
+
+  // Monotonic projected coordinates with same-sign clip W cannot leave and
+  // re-enter the same half-plane. An interior root that contradicts two
+  // confidently same-side endpoints is therefore numerical ambiguity.
+  if (startSide != 0 && startSide == endSide)
+    return interior ? -1 : 0;
+
+  // Both endpoints live in the uncertainty band: there may be an arbitrarily
+  // short crossed interval even when the root is not representable.
+  if (startSide == 0 && endSide == 0)
+    return -1;
+  if (interior)
+    return 1;
+  if (!solved)
+    return -1;
+
+  // A root at or behind a boundary-valued start, or at/ahead of a
+  // boundary-valued end, creates no positive-length interval in this segment.
+  if (startSide == 0 && endSide != 0 && split <= segmentStart)
+    return 0;
+  if (endSide == 0 && startSide != 0 && split >= segmentEnd)
+    return 0;
+  return -1;
+}
+
+// Classify the next strict exit from one hierarchical cell along one axis.
+// Both edges are checked so solver failure, a direction contradiction, and an
+// unresolvable line-on-edge case cannot masquerade as "no exit".
+int classifyCellAxisExit(
+    vec4 clipOrigin, vec4 clipDirection,
+    float segmentStart, float traceEnd,
+    float startCoord, float traceEndCoord,
+    int cellIndex, int cellSpan, int cellCount, int baseExtent,
+    int direction, bool yAxis,
+    out float exitDistance, out int cellStep,
+    out float crossedBoundary) {
+  exitDistance = traceEnd;
+  cellStep = 0;
+  crossedBoundary = 0.0;
+
+  float lowerBoundary = float(cellIndex * cellSpan);
+  float upperBoundary = float(cellIndex + 1 >= cellCount
+      ? baseExtent
+      : (cellIndex + 1) * cellSpan);
+  const float floatEpsilon = 1.192092896e-7;
+  float lowerEpsilon = 4.0 * floatEpsilon *
+      max(abs(lowerBoundary), 1.0);
+  float upperEpsilon = 4.0 * floatEpsilon *
+      max(abs(upperBoundary), 1.0);
+  float lowerSplit = kInfinity;
+  float upperSplit = kInfinity;
+  int lowerCrossing = classifyBaseBoundaryCrossing(
+      clipOrigin, clipDirection, segmentStart, traceEnd,
+      startCoord, traceEndCoord, lowerBoundary, lowerEpsilon, yAxis,
+      lowerSplit);
+  int upperCrossing = classifyBaseBoundaryCrossing(
+      clipOrigin, clipDirection, segmentStart, traceEnd,
+      startCoord, traceEndCoord, upperBoundary, upperEpsilon, yAxis,
+      upperSplit);
+  if (lowerCrossing < 0 || upperCrossing < 0 ||
+      (lowerCrossing > 0 && upperCrossing > 0))
+    return -1;
+
+  if (lowerCrossing > 0) {
+    if (direction >= 0 || cellIndex <= 0)
+      return -1;
+    exitDistance = lowerSplit;
+    cellStep = -1;
+    crossedBoundary = lowerBoundary;
+    return 1;
+  }
+  if (upperCrossing > 0) {
+    if (direction <= 0 || cellIndex + 1 >= cellCount)
+      return -1;
+    exitDistance = upperSplit;
+    cellStep = 1;
+    crossedBoundary = upperBoundary;
+    return 1;
+  }
+  return 0;
+}
+
+bool prepareBoundaryEntry(
+    vec4 clipOrigin, vec4 clipDirection,
+    float boundaryDistance, float frontWSign,
+    bvec2 crossedAxis, vec2 crossedBoundary, ivec2 cellStep,
+    ivec2 currentCell, int cellSpan, ivec2 cellCount,
+    ivec2 baseExtent, ivec2 direction,
+    out vec2 entryBase) {
+  if (!basePositionAtDistance(clipOrigin, clipDirection, boundaryDistance,
+                              frontWSign, entryBase))
+    return false;
+  if (crossedAxis.x)
+    entryBase.x = crossedBoundary.x;
+  if (crossedAxis.y)
+    entryBase.y = crossedBoundary.y;
+
+  int nextX = -1;
+  int nextY = -1;
+  if (!ownedCellIndex(entryBase.x, cellSpan, cellCount.x, baseExtent.x,
+                      direction.x, nextX) ||
+      !ownedCellIndex(entryBase.y, cellSpan, cellCount.y, baseExtent.y,
+                      direction.y, nextY))
+    return false;
+
+  ivec2 expectedCell = currentCell + cellStep;
+  return all(equal(ivec2(nextX, nextY), expectedCell));
+}
+
+vec2 unknownResult() {
+  return vec2(1.0, 0.0);
+}
+
+vec2 traceContactRay(vec3 receiverView, vec3 receiverNormal,
+                     float receiverDepthError, vec3 toLight,
+                     float lightDistance, int maxVisits) {
+  if (!finiteFloat(lightDistance) || lightDistance <= 1.0e-4)
+    return unknownResult();
+
+  vec3 direction = toLight / lightDistance;
+  float maxDistance = clamp(ray.u_rayParams.x, 32.0, 2400.0);
+  float startOffset = clamp(ray.u_rayParams.z, 1.0, 96.0);
+  float traceLength = min(maxDistance, max(lightDistance - startOffset, 0.0));
+  if (traceLength <= 0.0)
+    return vec2(1.0, 1.0);
+
+  float normalSign = dot(receiverNormal, direction) >= 0.0 ? 1.0 : -1.0;
+  vec3 origin = receiverView + direction * startOffset +
+      receiverNormal * (normalSign * min(startOffset * 0.20, 3.0));
+
+  vec4 clipOrigin = vec4(origin, 1.0) * ray.u_proj;
+  vec4 clipDirection = vec4(direction, 0.0) * ray.u_proj;
+  if (!finiteVec4(clipOrigin) || !finiteVec4(clipDirection) ||
+      abs(clipOrigin.w) <= 1.0e-6)
+    return unknownResult();
+  float frontWSign = sign(clipOrigin.w);
+  if (frontWSign == 0.0)
+    return unknownResult();
+
+  vec4 startClip;
+  vec2 startUv;
+  vec2 startBase;
+  vec4 endClip;
+  vec2 endUv;
+  vec2 endBase;
+  if (!projectViewPosition(origin, frontWSign, startClip, startUv, startBase) ||
+      !projectViewPosition(origin + direction * traceLength, frontWSign,
+                           endClip, endUv, endBase))
+    return unknownResult();
+
+  // Keep traversal coordinates on the same rational projection used by every
+  // boundary solve. Matrix reconstruction remains above as the clip/viewport
+  // validity gate, while the rational form avoids disagreeing ownership at an
+  // exactly solved boundary.
+  if (!basePositionAtDistance(clipOrigin, clipDirection, 0.0, frontWSign,
+                              startBase) ||
+      !basePositionAtDistance(clipOrigin, clipDirection, traceLength,
+                              frontWSign, endBase))
+    return unknownResult();
+  vec2 derivativeInvariant = vec2(
+      baseDerivativeInvariant(clipOrigin, clipDirection, false),
+      baseDerivativeInvariant(clipOrigin, clipDirection, true));
+  if (!finiteVec2(derivativeInvariant))
+    return unknownResult();
+  const float floatEpsilon = 1.192092896e-7;
+  vec2 motionEpsilon = 4.0 * floatEpsilon * max(
+      max(abs(startBase), abs(endBase)), vec2(1.0));
+  vec2 baseDelta = endBase - startBase;
+  if ((baseDelta.x > motionEpsilon.x && derivativeInvariant.x <= 0.0) ||
+      (baseDelta.x < -motionEpsilon.x && derivativeInvariant.x >= 0.0) ||
+      (baseDelta.y > motionEpsilon.y && derivativeInvariant.y <= 0.0) ||
+      (baseDelta.y < -motionEpsilon.y && derivativeInvariant.y >= 0.0))
+    return unknownResult();
+  // Sub-ULP endpoint motion has no reliable directional ownership. Treat it as
+  // stationary; a nearby edge crossing will then classify unknown instead of
+  // assigning an arbitrary side.
+  ivec2 cellDirection = ivec2(
+      baseDelta.x > motionEpsilon.x ? 1
+          : (baseDelta.x < -motionEpsilon.x ? -1 : 0),
+      baseDelta.y > motionEpsilon.y ? 1
+          : (baseDelta.y < -motionEpsilon.y ? -1 : 0));
+
+  int maxMip = max(int(pc.p_mipCount) - 1, 0);
+  float projectedLength = length(endBase - startBase);
+  float coarseRatio = max(projectedLength / float(maxVisits), 1.0);
+  int mip = clamp(int(floor(log2(coarseRatio))), 0, maxMip);
+
+  float distanceAlongRay = 0.0;
+  vec2 traversalBase = startBase;
+  int exactTests = 0;
+  float depthBias = max(1.0, startOffset * 0.35);
+  float thickness = max(clamp(ray.u_rayParams.y, 1.0, 160.0),
+                        depthBias * 2.25);
+
+  for (int visit = 0; visit < 64; ++visit) {
+    if (visit >= maxVisits)
+      return unknownResult();
+    if (distanceAlongRay >= traceLength)
+      return vec2(1.0, 1.0);
+
+    vec3 segmentStart = origin + direction * distanceAlongRay;
+    vec4 currentClip;
+    vec2 currentUv;
+    vec2 projectedCurrentBase;
+    if (!projectViewPosition(segmentStart, frontWSign, currentClip,
+                             currentUv, projectedCurrentBase))
+      return unknownResult();
+
+    int cellSpan = 1 << mip;
+    ivec2 mipExtent = textureSize(s_hiz, mip);
+    ivec2 hierarchyBaseExtent = ivec2(pc.p_extent.zw);
+    int cellX = -1;
+    int cellY = -1;
+    if (!ownedCellIndex(traversalBase.x, cellSpan, mipExtent.x,
+                        hierarchyBaseExtent.x, cellDirection.x, cellX) ||
+        !ownedCellIndex(traversalBase.y, cellSpan, mipExtent.y,
+                        hierarchyBaseExtent.y, cellDirection.y, cellY))
+      return unknownResult();
+    ivec2 cell = ivec2(cellX, cellY);
+    int projectedCellX = -1;
+    int projectedCellY = -1;
+    if (!ownedCellIndex(projectedCurrentBase.x, cellSpan, mipExtent.x,
+                        hierarchyBaseExtent.x, cellDirection.x,
+                        projectedCellX) ||
+        !ownedCellIndex(projectedCurrentBase.y, cellSpan, mipExtent.y,
+                        hierarchyBaseExtent.y, cellDirection.y,
+                        projectedCellY) ||
+        any(notEqual(ivec2(projectedCellX, projectedCellY), cell)))
+      return unknownResult();
+
+    vec2 encoded = texelFetch(s_hiz, cell, mip).rg;
+    bool hasValid = encoded.x > 0.0;
+    bool allValid = hasValid && encoded.y > 0.0;
+    if (!hasValid || !allValid) {
+      if (mip > 0) {
+        --mip;
+        continue;
+      }
+      return unknownResult();
+    }
+
+    float exitX = traceLength;
+    float exitY = traceLength;
+    int stepX = 0;
+    int stepY = 0;
+    float cellBoundaryX = 0.0;
+    float cellBoundaryY = 0.0;
+    int exitClassX = classifyCellAxisExit(
+        clipOrigin, clipDirection, distanceAlongRay, traceLength,
+        traversalBase.x, endBase.x, cell.x, cellSpan, mipExtent.x,
+        hierarchyBaseExtent.x, cellDirection.x, false,
+        exitX, stepX, cellBoundaryX);
+    int exitClassY = classifyCellAxisExit(
+        clipOrigin, clipDirection, distanceAlongRay, traceLength,
+        traversalBase.y, endBase.y, cell.y, cellSpan, mipExtent.y,
+        hierarchyBaseExtent.y, cellDirection.y, true,
+        exitY, stepY, cellBoundaryY);
+    if (exitClassX < 0 || exitClassY < 0)
+      return unknownResult();
+
+    bool crossesX = false;
+    bool crossesY = false;
+    float segmentEndDistance = traceLength;
+    if (exitClassX > 0) {
+      segmentEndDistance = exitX;
+      crossesX = true;
+    }
+    if (exitClassY > 0) {
+      if (!crossesX || exitY < segmentEndDistance) {
+        segmentEndDistance = exitY;
+        crossesX = false;
+        crossesY = true;
+      } else if (exitY == segmentEndDistance) {
+        // An exact/collapsed corner has no uniquely representable intermediate
+        // cell. Choosing a diagonal would be capable of skipping a blocker.
+        return unknownResult();
+      }
+    }
+    bool hasCellExit = crossesX || crossesY;
+    if (!finiteFloat(segmentEndDistance) ||
+        !(segmentEndDistance > distanceAlongRay))
+      return unknownResult();
+    bvec2 crossedAxis = bvec2(crossesX, crossesY);
+    vec2 crossedBoundary = vec2(cellBoundaryX, cellBoundaryY);
+    ivec2 crossedStep = ivec2(crossesX ? stepX : 0,
+                              crossesY ? stepY : 0);
+
+    vec3 segmentEnd = origin + direction * segmentEndDistance;
+    if (segmentStart.z * segmentEnd.z <= 0.0)
+      return unknownResult();
+
+    float rayMin = min(abs(segmentStart.z), abs(segmentEnd.z));
+    float rayMax = max(abs(segmentStart.z), abs(segmentEnd.z));
+    float possibleMin = rayMin - thickness;
+    float possibleMax = rayMax - depthBias;
+    float nodeMin = encoded.x;
+    float nodeMax = encoded.y;
+    bool overlaps = nodeMax >= possibleMin && nodeMin <= possibleMax;
+
+    if (!overlaps) {
+      if (!hasCellExit)
+        return vec2(1.0, 1.0);
+      vec2 nextEntryBase;
+      if (!prepareBoundaryEntry(
+              clipOrigin, clipDirection, segmentEndDistance, frontWSign,
+              crossedAxis, crossedBoundary, crossedStep, cell, cellSpan,
+              mipExtent, hierarchyBaseExtent, cellDirection,
+              nextEntryBase))
+        return unknownResult();
+      distanceAlongRay = segmentEndDistance;
+      traversalBase = nextEntryBase;
+      mip = min(mip + 1, maxMip);
+      continue;
+    }
+
+    if (mip > 0) {
+      --mip;
+      continue;
+    }
+
+    // mip0 summarizes a 2x2 full-resolution footprint. A projected line can
+    // cross three of those pixels, so two fixed samples can miss a thin
+    // blocker in the third pixel and incorrectly return confident visibility.
+    // Split at the exact internal x/y full-pixel boundaries instead. Each
+    // projected coordinate is monotonic while clip W keeps its sign, hence at
+    // most two distinct cuts and three positive-length pixel intervals exist.
+    ivec2 fullExtent = ivec2(pc.p_extent.xy);
+    bool hasInternalX = cell.x * 2 + 1 < fullExtent.x;
+    bool hasInternalY = cell.y * 2 + 1 < fullExtent.y;
+    float boundaryX = float(cell.x) + 0.5;
+    float boundaryY = float(cell.y) + 0.5;
+    vec2 segmentEndBase;
+    if (!basePositionAtDistance(clipOrigin, clipDirection,
+                                segmentEndDistance, frontWSign,
+                                segmentEndBase))
+      return unknownResult();
+
+    // A ray exactly along a full-pixel edge has no unique pixel ownership.
+    // Preserve the cube-shadow fallback instead of choosing a side by float
+    // rounding. A transverse ray that merely starts on the edge is safe: its
+    // positive-length interval immediately belongs to one side. The crossing
+    // classifier below proves that distinction from both segment endpoints.
+    float coordEpsX = 4.0 * floatEpsilon * max(abs(boundaryX), 1.0);
+    float coordEpsY = 4.0 * floatEpsilon * max(abs(boundaryY), 1.0);
+
+    float splitX = kInfinity;
+    float splitY = kInfinity;
+    int xCrossing = hasInternalX
+        ? classifyBaseBoundaryCrossing(
+              clipOrigin, clipDirection, distanceAlongRay,
+              segmentEndDistance, traversalBase.x, segmentEndBase.x,
+              boundaryX, coordEpsX, false, splitX)
+        : 0;
+    int yCrossing = hasInternalY
+        ? classifyBaseBoundaryCrossing(
+              clipOrigin, clipDirection, distanceAlongRay,
+              segmentEndDistance, traversalBase.y, segmentEndBase.y,
+              boundaryY, coordEpsY, true, splitY)
+        : 0;
+    if (xCrossing < 0 || yCrossing < 0)
+      return unknownResult();
+    bool xInside = xCrossing > 0;
+    bool yInside = yCrossing > 0;
+
+    if (xInside && yInside) {
+      float tieEpsilon = 4.0 * floatEpsilon *
+          max(max(abs(splitX), abs(splitY)), 1.0);
+      if (abs(splitX - splitY) <= tieEpsilon)
+        return unknownResult();
+    }
+
+    float cuts[4];
+    int cutCount = 0;
+    cuts[cutCount++] = distanceAlongRay;
+    if (xInside)
+      cuts[cutCount++] = splitX;
+    if (yInside)
+      cuts[cutCount++] = splitY;
+    if (xInside && yInside && cuts[1] > cuts[2]) {
+      float temp = cuts[1];
+      cuts[1] = cuts[2];
+      cuts[2] = temp;
+    }
+    cuts[cutCount++] = segmentEndDistance;
+
+    ivec2 previousScenePixel = ivec2(-1);
+    for (int sub = 0; sub < 3; ++sub) {
+      if (sub + 1 >= cutCount)
+        break;
+      float subStart = cuts[sub];
+      float subEnd = cuts[sub + 1];
+      if (!finiteFloat(subStart) || !finiteFloat(subEnd) ||
+          !(subEnd > subStart))
+        return unknownResult();
+      if (exactTests >= 8)
+        return unknownResult();
+
+      float ownershipDistance = subStart + (subEnd - subStart) * 0.5;
+      // Adjacent-float endpoints may have no representable interior midpoint.
+      // Skipping that interval would reintroduce confident false visibility.
+      if (!(ownershipDistance > subStart && ownershipDistance < subEnd))
+        return unknownResult();
+      ++exactTests;
+
+      vec3 ownershipPosition = origin + direction * ownershipDistance;
+      vec4 ownershipClip;
+      vec2 ownershipUv;
+      vec2 ownershipBase;
+      if (!projectViewPosition(ownershipPosition, frontWSign, ownershipClip,
+                               ownershipUv, ownershipBase))
+        return unknownResult();
+      vec2 ownershipTraversalBase;
+      if (!basePositionAtDistance(clipOrigin, clipDirection,
+                                  ownershipDistance, frontWSign,
+                                  ownershipTraversalBase))
+        return unknownResult();
+
+      // A stale/rounded coarse exit must never let one mip0 test stride into a
+      // neighbouring 2x2 cell or choose a different full pixel than the same
+      // rational projection used by the DDA. A midpoint inside the coordinate
+      // uncertainty band has no defensible pixel ownership.
+      if (any(notEqual(ivec2(floor(ownershipTraversalBase)), cell)) ||
+          any(notEqual(ivec2(floor(ownershipBase)), cell)) ||
+          (hasInternalX &&
+           abs(ownershipTraversalBase.x - boundaryX) <= coordEpsX) ||
+          (hasInternalY &&
+           abs(ownershipTraversalBase.y - boundaryY) <= coordEpsY))
+        return unknownResult();
+      ivec2 scenePixel = ivec2(floor(ownershipTraversalBase * 2.0));
+      ivec2 projectedPixel = ivec2(floor(ownershipBase * 2.0));
+      if (any(notEqual(projectedPixel, scenePixel)) ||
+          (sub > 0 && all(equal(scenePixel, previousScenePixel))))
+        return unknownResult();
+      if (any(lessThan(scenePixel, ivec2(0))) ||
+          any(greaterThanEqual(scenePixel, fullExtent)))
+        return unknownResult();
+      previousScenePixel = scenePixel;
+      DepthSample scene = loadDepthPixel(scenePixel);
+      if (!scene.valid)
+        return unknownResult();
+
+      float quantizationError = receiverDepthError + scene.depthError;
+      if (!finiteFloat(quantizationError))
+        return unknownResult();
+
+      // The pixel owns the entire positive-length [subStart, subEnd)
+      // interval, not only its midpoint. With a fixed scene-depth sample and a
+      // front-facing ray, abs(view-z) is linear over that interval. Test the
+      // complete ray-depth range against the admissible hit window; otherwise
+      // a long near-axis interval can cross a blocker between the midpoint and
+      // an endpoint yet be incorrectly returned as confidently visible.
+      float subStartDepth = abs(origin.z + direction.z * subStart);
+      float subEndDepth = abs(origin.z + direction.z * subEnd);
+      if (!finiteFloat(subStartDepth) || !finiteFloat(subEndDepth))
+        return unknownResult();
+      float deltaMin = min(subStartDepth, subEndDepth) - scene.viewDepth;
+      float deltaMax = max(subStartDepth, subEndDepth) - scene.viewDepth;
+      // The expanded window proves a miss under every depth value covered by
+      // the quantization error. The shrunken window below is only the subset
+      // that can prove a blocker. Falling between the two is ambiguous and
+      // must retain cube fallback rather than becoming confident visibility.
+      float possibleBias = depthBias - quantizationError;
+      float possibleThickness = thickness + quantizationError;
+      if (deltaMax < possibleBias || deltaMin > possibleThickness)
+        continue;
+
+      float intervalQuantizationLimit = max(
+          1.0, min(thickness * 0.20,
+                   min(subStartDepth, subEndDepth) * 0.002));
+      if (quantizationError > intervalQuantizationLimit)
+        return unknownResult();
+
+      // Quantization uncertainty shrinks the admissible hit interval from
+      // both sides. It may prove a blocker, while only the expanded interval
+      // above is allowed to prove a miss.
+      float effectiveBias = depthBias + quantizationError;
+      float effectiveThickness = thickness - quantizationError;
+      if (effectiveThickness <= effectiveBias + 1.0e-3)
+        return unknownResult();
+      if (deltaMax < effectiveBias || deltaMin > effectiveThickness)
+        return unknownResult();
+
+      float depthSpan = subEndDepth - subStartDepth;
+      float depthEpsilon = 4.0 * floatEpsilon *
+          max(max(abs(subStartDepth), abs(subEndDepth)), 1.0);
+      float targetDelta = 0.0;
+      if (abs(depthSpan) <= depthEpsilon) {
+        float constantDelta =
+            abs(ownershipPosition.z) - scene.viewDepth;
+        if (!(constantDelta > effectiveBias &&
+              constantDelta < effectiveThickness))
+          return unknownResult();
+        targetDelta = constantDelta;
+      } else {
+        float overlapLo = max(deltaMin, effectiveBias);
+        float overlapHi = min(deltaMax, effectiveThickness);
+        if (!(overlapHi > overlapLo))
+          return unknownResult();
+        targetDelta = 0.5 * (overlapLo + overlapHi);
+      }
+      float targetDepth = scene.viewDepth + targetDelta;
+      float exactDistance = ownershipDistance;
+      if (abs(depthSpan) > depthEpsilon) {
+        float intervalFraction = (targetDepth - subStartDepth) / depthSpan;
+        if (!finiteFloat(intervalFraction) ||
+            !(intervalFraction > 0.0 && intervalFraction < 1.0))
+          return unknownResult();
+        exactDistance = subStart + (subEnd - subStart) * intervalFraction;
+        if (!(exactDistance > subStart && exactDistance < subEnd))
+          return unknownResult();
+      }
+
+      vec3 rayPosition = origin + direction * exactDistance;
+      vec4 exactClip;
+      vec2 exactUv;
+      vec2 exactBase;
+      if (!projectViewPosition(rayPosition, frontWSign, exactClip,
+                               exactUv, exactBase))
+        return unknownResult();
+      vec2 exactTraversalBase;
+      if (!basePositionAtDistance(clipOrigin, clipDirection, exactDistance,
+                                  frontWSign, exactTraversalBase))
+        return unknownResult();
+      if (any(notEqual(ivec2(floor(exactTraversalBase)), cell)) ||
+          any(notEqual(ivec2(floor(exactBase)), cell)) ||
+          (hasInternalX &&
+           abs(exactTraversalBase.x - boundaryX) <= coordEpsX) ||
+          (hasInternalY &&
+           abs(exactTraversalBase.y - boundaryY) <= coordEpsY) ||
+          any(notEqual(ivec2(floor(exactTraversalBase * 2.0)), scenePixel)) ||
+          any(notEqual(ivec2(floor(exactBase * 2.0)), scenePixel)))
+        return unknownResult();
+
+      float delta = abs(rayPosition.z) - scene.viewDepth;
+      float quantizationLimit = max(
+          1.0, min(thickness * 0.20, abs(rayPosition.z) * 0.002));
+      if (quantizationError > quantizationLimit)
+        return unknownResult();
+      float hitWindow = effectiveThickness - effectiveBias;
+      float enter = smoothstep(effectiveBias,
+                               effectiveBias + 0.25 * hitWindow, delta);
+      float leave = 1.0 - smoothstep(
+          effectiveBias + 0.75 * hitWindow, effectiveThickness, delta);
+      float quantizationConfidence = 1.0 - smoothstep(
+          0.0, quantizationLimit, quantizationError);
+      float hit = clamp(enter * leave * quantizationConfidence, 0.0, 1.0);
+      if (hit > 1.0e-4) {
+        float edgeDistance = min(min(exactUv.x, exactUv.y),
+                                 min(1.0 - exactUv.x, 1.0 - exactUv.y));
+        float edgeConfidence = smoothstep(0.0, 0.035, edgeDistance);
+        return vec2(1.0 - hit, clamp(edgeConfidence, 0.0, 1.0));
+      }
+      // Interval overlap was proven above. A numerically tiny representative
+      // must not be upgraded to confident visibility; retain cube fallback.
+      return unknownResult();
+    }
+
+    if (!hasCellExit)
+      return vec2(1.0, 1.0);
+    vec2 nextEntryBase;
+    if (!prepareBoundaryEntry(
+            clipOrigin, clipDirection, segmentEndDistance, frontWSign,
+            crossedAxis, crossedBoundary, crossedStep, cell, cellSpan,
+            mipExtent, hierarchyBaseExtent, cellDirection,
+            nextEntryBase))
+      return unknownResult();
+    distanceAlongRay = segmentEndDistance;
+    traversalBase = nextEntryBase;
+    mip = min(1, maxMip);
+  }
+
+  return unknownResult();
+}
+
+// 与 receiver 完全一致的有限范围能量窗。基础能量已在 CPU 侧按本批最多
+// 两灯归一化，因此返回值有界于 [0,1]，可安全用于固定节点预算分配。
+float pointLightTraversalImportance(vec3 receiverView, int lightIndex,
+                                    out float distanceSquared,
+                                    out float rangeRelevance) {
+  distanceSquared = 0.0;
+  rangeRelevance = 0.0;
+  if (lightIndex < 0 || lightIndex >= int(pc.p_layerCount) ||
+      lightIndex >= 2)
+    return 0.0;
+
+  vec4 lightViewPosRange = ray.u_lightViewPos[lightIndex];
+  float baseEnergy = ray.u_lightEnergy[lightIndex].x;
+  if (!finiteVec4(lightViewPosRange) || !finiteFloat(baseEnergy) ||
+      baseEnergy <= 0.0)
+    return 0.0;
+
+  vec3 toLight = lightViewPosRange.xyz - receiverView;
+  distanceSquared = dot(toLight, toLight);
+  float range = max(lightViewPosRange.w, 1.0);
+  float rangeSquared = range * range;
+  if (!finiteFloat(distanceSquared) || !finiteFloat(rangeSquared) ||
+      distanceSquared < 0.0 || distanceSquared >= rangeSquared)
+    return 0.0;
+
+  float rangeN2 = clamp(distanceSquared / rangeSquared, 0.0, 1.0);
+  float rangeWindow = max(1.0 - rangeN2, 0.0);
+  rangeWindow *= rangeWindow;
+  rangeRelevance = rangeWindow / (1.0 + 6.0 * rangeN2);
+  if (!finiteFloat(rangeRelevance)) {
+    rangeRelevance = 0.0;
+    return 0.0;
+  }
+  return baseEnergy * rangeRelevance;
+}
+
+void main() {
+  ivec2 localInvocation = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 regionExtent = ivec2(pc.p_dispatch.zw);
+  if (any(greaterThanEqual(localInvocation, regionExtent)))
+    return;
+
+  int lightIndex = int(pc.p_srcMip);
+  ivec3 invocation = ivec3(localInvocation + ivec2(pc.p_dispatch.xy),
+                            lightIndex);
+  ivec2 baseExtent = ivec2(pc.p_extent.zw);
+  if (any(greaterThanEqual(invocation.xy, baseExtent)) ||
+      lightIndex < 0 || lightIndex >= int(pc.p_layerCount))
+    return;
+
+  vec2 baseRange = texelFetch(s_hiz, invocation.xy, 0).rg;
+  if (baseRange.x <= 0.0 || baseRange.y <= 0.0) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+
+  ivec2 first = invocation.xy * 2;
+  ivec2 fullExtent = ivec2(pc.p_extent.xy);
+  float targetDepth = 0.5 * (baseRange.x + baseRange.y);
+  // One half-resolution result must never bridge a foreground/background
+  // discontinuity. We do not store the representative receiver depth in the
+  // output, so a wide 2x2 range is deliberately classified as unknown.
+  float baseSpread = baseRange.y - baseRange.x;
+  float homogeneousDepthWindow = max(2.0, targetDepth * 0.002);
+  if (!finiteFloat(baseSpread) || baseSpread > homogeneousDepthWindow) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+  // A partial 2x2 footprint at an odd full-resolution edge has no independent
+  // sample pair on both axes. Duplicating/clamping the final row or column
+  // would invent a zero-area plane, so keep the transfer-cleared unknown value.
+  if (first.x + 1 >= fullExtent.x || first.y + 1 >= fullExtent.y) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+
+  // Keep these as four explicit locals. This lets the shader compiler
+  // scalarize the footprint instead of materializing a dynamically indexed
+  // local array in an already register-heavy traversal kernel.
+  DepthSample footprint00 = loadDepthPixel(first);
+  DepthSample footprint10 = loadDepthPixel(first + ivec2(1, 0));
+  DepthSample footprint01 = loadDepthPixel(first + ivec2(0, 1));
+  DepthSample footprint11 = loadDepthPixel(first + ivec2(1, 1));
+  if (!footprint00.valid || !footprint10.valid ||
+      !footprint01.valid || !footprint11.valid) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+
+  DepthSample receiver = footprint00;
+  float bestDistance = abs(footprint00.viewDepth - targetDepth);
+  float candidateDistance = abs(footprint10.viewDepth - targetDepth);
+  if (candidateDistance < bestDistance) {
+    receiver = footprint10;
+    bestDistance = candidateDistance;
+  }
+  candidateDistance = abs(footprint01.viewDepth - targetDepth);
+  if (candidateDistance < bestDistance) {
+    receiver = footprint01;
+    bestDistance = candidateDistance;
+  }
+  candidateDistance = abs(footprint11.viewDepth - targetDepth);
+  if (candidateDistance < bestDistance)
+    receiver = footprint11;
+
+  // Cull before footprint-plane reconstruction and hierarchy traversal. The
+  // receiver consumes this layer only inside the authored point-light range,
+  // so out-of-range work is explicitly unknown and leaves the cube shadow or
+  // direct-light path intact.
+  vec4 lightViewPosRange = ray.u_lightViewPos[invocation.z];
+  if (!finiteVec4(lightViewPosRange)) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+
+  float lightDistanceSquared = 0.0;
+  float relevance = 0.0;
+  float currentImportance = pointLightTraversalImportance(
+      receiver.viewPos, lightIndex, lightDistanceSquared, relevance);
+  if (!finiteFloat(currentImportance) || currentImportance <= 0.0) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+
+  float lightDistance = sqrt(max(lightDistanceSquared, 0.0));
+  vec3 toLight = lightViewPosRange.xyz - receiver.viewPos;
+
+  // Match the receiver's range-normalized direct-light falloff. Rays near the
+  // source retain the configured quality；低能量外圈会降低 traversal 预算并
+  // 平滑退回 cube shadow。未追踪像素绝不会凭空制造遮挡。
+  if (!finiteFloat(relevance)) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+
+  int configuredMaxVisits = clamp(int(ray.u_rayParams.w + 0.5), 8, 64);
+  int activeLayerCount = clamp(int(pc.p_layerCount), 1, 2);
+  float totalImportance = 0.0;
+  int contributingLightCount = 0;
+  for (int candidate = 0; candidate < 2; ++candidate) {
+    if (candidate >= activeLayerCount)
+      break;
+    float candidateImportance = 0.0;
+    if (candidate == lightIndex) {
+      candidateImportance = currentImportance;
+    } else {
+      float unusedDistanceSquared = 0.0;
+      float unusedRangeRelevance = 0.0;
+      candidateImportance = pointLightTraversalImportance(
+          receiver.viewPos, candidate, unusedDistanceSquared,
+          unusedRangeRelevance);
+    }
+    if (candidateImportance > 0.0) {
+      totalImportance += candidateImportance;
+      ++contributingLightCount;
+    }
+  }
+  if (!finiteFloat(totalImportance) || totalImportance <= 0.0) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+
+  // 一灯保持旧上限。两灯时，每灯固定保留 8 次 fail-soft 基础预算，剩余
+  // configured-8 次按当前 receiver 的真实直射能量份额分配。两层重叠区域
+  // 的最大节点访问总和因此 <= configured+8，而不是旧的 2*configured。
+  float budgetShare = clamp(currentImportance / totalImportance, 0.0, 1.0);
+  float budgetWeight = sqrt(clamp(relevance, 0.0, 1.0));
+  int extraVisitBudget = max(configuredMaxVisits - 8, 0);
+  float weightedExtra = float(extraVisitBudget) * budgetShare * budgetWeight;
+  int allocatedExtra = contributingLightCount == 1
+      ? clamp(int(mix(8.0, float(configuredMaxVisits), budgetWeight) + 0.5),
+              8, configuredMaxVisits) - 8
+      : int(floor(weightedExtra));
+  int localMaxVisits = clamp(8 + allocatedExtra, 8, configuredMaxVisits);
+  float rangeConfidence = smoothstep(0.002, 0.08, relevance);
+  if (rangeConfidence <= 1.0e-4) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+
+  vec3 normal = vec3(0.0);
+  float planarityConfidence = 0.0;
+  float footprintDepthError = 0.0;
+  if (!reconstructFootprintNormal(
+          footprint00, footprint10, footprint01, footprint11,
+          normal, planarityConfidence, footprintDepthError)) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+
+  float viewDirectionLength2 = dot(receiver.viewPos, receiver.viewPos);
+  if (!finiteFloat(viewDirectionLength2) ||
+      viewDirectionLength2 <= 1.0e-12) {
+    imageStore(s_visibilityConfidence, invocation,
+               vec4(unknownResult(), 0.0, 0.0));
+    return;
+  }
+  vec3 viewDirection = -receiver.viewPos * inversesqrt(viewDirectionLength2);
+  if (dot(normal, viewDirection) < 0.0)
+    normal = -normal;
+
+  vec2 result = traceContactRay(receiver.viewPos, normal,
+                                footprintDepthError,
+                                toLight, lightDistance, localMaxVisits);
+
+  // Reduce confidence continuously as the 2x2 footprint stops behaving like
+  // one surface. At the discontinuity threshold the result becomes unknown.
+  float homogeneityConfidence = 1.0 - smoothstep(
+      0.0, homogeneousDepthWindow, baseSpread);
+  result.y *= clamp(homogeneityConfidence * rangeConfidence *
+                    planarityConfidence, 0.0, 1.0);
+
+  // Zero-confidence occlusion is not actionable evidence. Canonicalize every
+  // non-finite or effectively unknown result so the receiver keeps its cube
+  // fallback instead of retaining an occluded visibility with no confidence.
+  if (!finiteVec2(result) || result.y <= 1.0e-4)
+    result = unknownResult();
+  else
+    result = clamp(result, vec2(0.0), vec2(1.0));
+
+  imageStore(s_visibilityConfidence, invocation,
+             vec4(result, 0.0, 0.0));
+}

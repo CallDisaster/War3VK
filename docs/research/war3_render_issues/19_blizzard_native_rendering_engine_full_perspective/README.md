@@ -2,6 +2,13 @@
 
 更新日期：2026-04-04
 
+> 2026-07-15 范围说明：本页保留全景透视，但不代表相关类字段与虚函数均已完成。
+> `CWorldFrameWar3`、`CWorldObjects`、`CWorldObjectsClippable`、`CDoodads`、`CBlightPuffs`
+> 的 raw RTTI/ASM inventory 与 Unknown 边界见
+> [30_cworld_class_family_full_reverse](../30_cworld_class_family_full_reverse/README.md)。
+> `0x6F184EE0` 的 canonical receiver 已修正为 `CSprite*`；下文 `WorldObjectEntry` 与
+> slot5=PreRender 是历史术语，不再是 authoritative 类型/语义。
+
 ## 1. 目标
 本页从“暴雪原生渲染引擎视角”统一描述 Warcraft III 1.27a 的 3D 渲染系统，而不是只看某个 Hook 点或某个效果模块。
 
@@ -25,7 +32,7 @@ flowchart TD
   B --> C["RenderScene / DispatchStage"]
   C --> D["TerrainShadow / Terrain passes"]
   C --> E["WorldObjects_RenderGroup"]
-  E --> F["WorldObjectEntry_Render"]
+  E --> F["CSprite_PrepareAndQueueAttachedRenderObject"]
   F --> G["SceneNode / RenderQueue_AddBatch"]
   G --> H["RenderBatch_Submit"]
   H --> I["Opaque Queue / Transparent Queue"]
@@ -78,13 +85,13 @@ flowchart TD
 `WorldObjects_RenderGroup @ 0x6F368E30` 的本质是：
 
 1. 取 `CWorldFrameWar3 + 0x16C/+0x170/+0x174` 三个列表
-2. 遍历 `WorldObjectListEntry`
-3. 对每个 `WorldObjectEntry` 调 `WorldObjectEntry_Render`
+2. 遍历 `WorldGroupRecord`（stride `0x18`）
+3. 从 record `+0` 取 `CSprite*`，调用 `CSprite_PrepareAndQueueAttachedRenderObject`
 
-而 `WorldObjectEntry_Render @ 0x6F184EE0` 也不是 draw call，它做的是：
+而 `CSprite_PrepareAndQueueAttachedRenderObject @ 0x6F184EE0` 也不是 draw call，它做的是：
 
-1. 调对象虚函数 `vtable[5]` 预渲染
-2. 把 `sceneNode` 丢给 `RenderQueue_AddBatch`
+1. `sprite+0x20` 非空时调 vslot5；该槽不是通用预渲染，base/Mini no-op，Uber 只 flush pending state
+2. 把 `[sprite+0x20]` 丢给 `RenderQueue_AddBatch`；visibility/prepare 在 vslot3
 
 这意味着原生引擎的真正“CPU 热点主链”在 `SceneNode -> Batch -> Queue -> Flush -> Dispatch`。
 
@@ -102,7 +109,7 @@ flowchart TD
 sequenceDiagram
   participant World as CWorldFrameWar3
   participant Group as WorldObjects_RenderGroup
-  participant Entry as WorldObjectEntry_Render
+  participant Entry as CSprite_PrepareAndQueueAttachedRenderObject
   participant Node as SceneNode
   participant Submit as RenderBatch_Submit
   participant Queue as RenderQueue

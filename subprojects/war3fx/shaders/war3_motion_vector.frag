@@ -62,8 +62,10 @@ void main() {
   float minZ = ubo.u_viewportZ.x;
   float maxZ = ubo.u_viewportZ.y;
   float depthN = depth;
-  float denom = max(maxZ - minZ, 1e-6);
-  depthN = clamp((depth - minZ) / denom, 0.0, 1.0);
+  float denom = maxZ - minZ;
+  if (abs(denom) > 1e-6)
+    depthN = (depth - minZ) / denom;
+  depthN = clamp(depthN, 0.0, 1.0);
 
   // D3D-style NDC（与 receiver 保持一致）
   vec4 clip = vec4(uvVp.x * 2.0 - 1.0, 1.0 - uvVp.y * 2.0, depthN, 1.0);

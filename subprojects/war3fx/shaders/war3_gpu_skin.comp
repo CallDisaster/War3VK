@@ -1,0 +1,208 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 64, std430) readonly restrict buffer StaticSource {
+  uint sourceWords[];
+};
+
+layout(set = 0, binding = 65, std430) readonly restrict buffer Palette {
+  uint paletteWords[];
+};
+
+layout(set = 0, binding = 66, std430) readonly restrict buffer Jobs {
+  uint jobWords[];
+};
+
+layout(set = 0, binding = 67, std430) writeonly restrict buffer Output {
+  uint outputWords[];
+};
+
+const uint kJobWordCount = 16u;
+const uint kJobInputVertexOffset = 4u;
+const uint kJobPaletteOffset = 5u;
+const uint kJobOutputOffset = 6u;
+const uint kJobVertexCount = 7u;
+const uint kJobOutputStride = 8u;
+const uint kJobOutputFormat = 9u;
+const uint kJobPaletteMatrixCount = 13u;
+const uint kJobSourceUvLayerCount = 14u;
+const uint kJobReservedGuard = 15u;
+const uint kJobCoreWordCount =
+    kJobOutputFormat - kJobInputVertexOffset + 1u;
+const uint kJobTailWordCount =
+    kJobReservedGuard - kJobPaletteMatrixCount + 1u;
+const uint kCachedJobWordCount = kJobCoreWordCount + kJobTailWordCount;
+
+shared uint cachedJobWords[kJobWordCount];
+
+uint loadRawJobWord(uint job, uint word) {
+  return jobWords[job * kJobWordCount + word];
+}
+
+uint loadCachedJobWord(uint word) {
+  return cachedJobWords[word];
+}
+
+uint loadSourceWord(uint byteOffset) {
+  return sourceWords[byteOffset >> 2u];
+}
+
+uint loadSourceByte(uint byteOffset) {
+  uint packed = sourceWords[byteOffset >> 2u];
+  return (packed >> ((byteOffset & 3u) * 8u)) & 0xffu;
+}
+
+float loadPaletteFloat(uint byteOffset) {
+  return uintBitsToFloat(paletteWords[byteOffset >> 2u]);
+}
+
+void storeOutputFloat(uint byteOffset, float value) {
+  outputWords[byteOffset >> 2u] = floatBitsToUint(value);
+}
+
+void storeOutputWord(uint byteOffset, uint value) {
+  outputWords[byteOffset >> 2u] = value;
+}
+
+uint align4(uint value) {
+  return (value + 3u) & ~3u;
+}
+
+void main() {
+  uint vertex = gl_GlobalInvocationID.x;
+  uint job = gl_GlobalInvocationID.y;
+
+  // Dispatch Y is the job dimension and local_size_y is one, so every lane in
+  // a workgroup consumes the same immutable job. Cache the six consecutive
+  // words [inputVertexOffset, outputFormat] plus the three compute-owned tail
+  // words once per workgroup instead of reloading them for every vertex.
+  // All lanes must reach the barrier before any bounds/validation return.
+  uint localLane = gl_LocalInvocationIndex;
+  if (localLane < kCachedJobWordCount) {
+    uint jobWord = localLane < kJobCoreWordCount
+        ? kJobInputVertexOffset + localLane
+        : kJobPaletteMatrixCount + localLane - kJobCoreWordCount;
+    cachedJobWords[jobWord] = loadRawJobWord(job, jobWord);
+  }
+  barrier();
+
+  uint vertexCount = loadCachedJobWord(kJobVertexCount);
+  if (vertex >= vertexCount)
+    return;
+
+  uint outputFormat = loadCachedJobWord(kJobOutputFormat);
+  if (outputFormat > 5u ||
+      loadCachedJobWord(kJobReservedGuard) != 0u)
+    return;
+
+  uint uvLayerCount = outputFormat / 2u;
+  uint sourceUvLayerCount = loadCachedJobWord(kJobSourceUvLayerCount);
+  uint expectedOutputStride = 24u + (outputFormat & 1u) * 4u +
+      uvLayerCount * 8u;
+  if (loadCachedJobWord(kJobOutputStride) != expectedOutputStride ||
+      sourceUvLayerCount > 2u || uvLayerCount > sourceUvLayerCount)
+    return;
+
+  uint sourceBase = loadCachedJobWord(kJobInputVertexOffset);
+  uint positionBase = sourceBase;
+  uint normalBase = positionBase + vertexCount * 12u;
+  uint groupSlotBase = normalBase + vertexCount * 12u;
+  uint texcoord0Base = align4(groupSlotBase + vertexCount);
+  uint texcoord1Base = texcoord0Base + vertexCount * 8u;
+
+  uint positionAddress = positionBase + vertex * 12u;
+  uint normalAddress = normalBase + vertex * 12u;
+  precise float px = uintBitsToFloat(loadSourceWord(positionAddress + 0u));
+  precise float py = uintBitsToFloat(loadSourceWord(positionAddress + 4u));
+  precise float pz = uintBitsToFloat(loadSourceWord(positionAddress + 8u));
+  precise float nx = uintBitsToFloat(loadSourceWord(normalAddress + 0u));
+  precise float ny = uintBitsToFloat(loadSourceWord(normalAddress + 4u));
+  precise float nz = uintBitsToFloat(loadSourceWord(normalAddress + 8u));
+
+  uint groupSlot = loadSourceByte(groupSlotBase + vertex);
+  uint paletteMatrixCount = loadCachedJobWord(kJobPaletteMatrixCount);
+
+  precise float m0 = 1.0;
+  precise float m1 = 0.0;
+  precise float m2 = 0.0;
+  precise float m3 = 0.0;
+  precise float m4 = 1.0;
+  precise float m5 = 0.0;
+  precise float m6 = 0.0;
+  precise float m7 = 0.0;
+  precise float m8 = 1.0;
+  precise float m9 = 0.0;
+  precise float m10 = 0.0;
+  precise float m11 = 0.0;
+
+  // Invalid slots must be rejected before dispatch. Identity is only a final
+  // bounds guard that prevents a malformed job from reading outside palette.
+  if (groupSlot < paletteMatrixCount) {
+    uint matrixAddress = loadCachedJobWord(kJobPaletteOffset) +
+        groupSlot * 48u;
+    m0 = loadPaletteFloat(matrixAddress + 0u);
+    m1 = loadPaletteFloat(matrixAddress + 4u);
+    m2 = loadPaletteFloat(matrixAddress + 8u);
+    m3 = loadPaletteFloat(matrixAddress + 12u);
+    m4 = loadPaletteFloat(matrixAddress + 16u);
+    m5 = loadPaletteFloat(matrixAddress + 20u);
+    m6 = loadPaletteFloat(matrixAddress + 24u);
+    m7 = loadPaletteFloat(matrixAddress + 28u);
+    m8 = loadPaletteFloat(matrixAddress + 32u);
+    m9 = loadPaletteFloat(matrixAddress + 36u);
+    m10 = loadPaletteFloat(matrixAddress + 40u);
+    m11 = loadPaletteFloat(matrixAddress + 44u);
+  }
+
+  // Scalar sequencing plus precise prevents contraction/reassociation. This
+  // is the native 3x4 layout, not a GLSL matrix multiply.
+  precise float positionX01 = m0 * px + m3 * py;
+  precise float positionX2 = positionX01 + m6 * pz;
+  precise float positionX = positionX2 + m9;
+  precise float positionY01 = m1 * px + m4 * py;
+  precise float positionY2 = positionY01 + m7 * pz;
+  precise float positionY = positionY2 + m10;
+  precise float positionZ01 = m2 * px + m5 * py;
+  precise float positionZ2 = positionZ01 + m8 * pz;
+  precise float positionZ = positionZ2 + m11;
+
+  precise float normalX01 = m0 * nx + m3 * ny;
+  precise float normalX = normalX01 + m6 * nz;
+  precise float normalY01 = m1 * nx + m4 * ny;
+  precise float normalY = normalY01 + m7 * nz;
+  precise float normalZ01 = m2 * nx + m5 * ny;
+  precise float normalZ = normalZ01 + m8 * nz;
+
+  uint outputAddress = loadCachedJobWord(kJobOutputOffset) +
+      vertex * expectedOutputStride;
+  storeOutputFloat(outputAddress + 0u, positionX);
+  storeOutputFloat(outputAddress + 4u, positionY);
+  storeOutputFloat(outputAddress + 8u, positionZ);
+  storeOutputFloat(outputAddress + 12u, normalX);
+  storeOutputFloat(outputAddress + 16u, normalY);
+  storeOutputFloat(outputAddress + 20u, normalZ);
+
+  bool hasDiffuse = (outputFormat & 1u) != 0u;
+  uint texcoordOutputOffset = 24u;
+  if (hasDiffuse) {
+    storeOutputWord(outputAddress + 24u, 0xffffffffu);
+    texcoordOutputOffset = 28u;
+  }
+
+  if (uvLayerCount >= 1u) {
+    uint texcoordAddress = texcoord0Base + vertex * 8u;
+    storeOutputWord(outputAddress + texcoordOutputOffset + 0u,
+                    loadSourceWord(texcoordAddress + 0u));
+    storeOutputWord(outputAddress + texcoordOutputOffset + 4u,
+                    loadSourceWord(texcoordAddress + 4u));
+  }
+
+  if (uvLayerCount >= 2u) {
+    uint texcoordAddress = texcoord1Base + vertex * 8u;
+    storeOutputWord(outputAddress + texcoordOutputOffset + 8u,
+                    loadSourceWord(texcoordAddress + 0u));
+    storeOutputWord(outputAddress + texcoordOutputOffset + 12u,
+                    loadSourceWord(texcoordAddress + 4u));
+  }
+}

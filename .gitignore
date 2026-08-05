@@ -60,6 +60,7 @@ subprojects/*/build/
 Agents/
 .claude/worktrees/
 .claude/settings.local.json
+.kiro/
 
 # 本地分析/交接草稿与一次性构建记录，不应进入正式发布
 /architecture_analysis.md
@@ -72,3 +73,39 @@ Agents/
 /README_War3VK.md
 /STATUS.md
 /war3_optimization_plan/
+
+# 本地自动化/调试运行产物，不进入正式里程碑提交
+/AutoTest/_archive/logs/
+/AutoTest/_archive/probes/
+/AutoTest/_archive/ida_scripts/
+/AutoTest/artifacts/
+/AutoTest/capture_window_same_desktop.ps1
+/AutoTest/isolated_desktop_smoke.ps1
+/docs/plan/automation_exchange/
+/WarVK/bin/
+
+# 本地构建、浏览器与测试预览状态
+/.codex-shadow-build.err.log
+/.codex-shadow-build.out.log
+/.cache/
+/.playwright-cli/
+/.pytest_cache/
+/output/
+/research_bundles/
+
+# 一次性补丁、预览和本地头文件副本
+/AutoTest/_gen_perf_report_preview.py
+/AutoTest/_patch_*.py
+/AutoTest/SIX_HERO_GAMEPLAY_GATE.md
+/_apply_dark_theme.py
+/_gen_preview.py
+/_preview_*.py
+/_preview_*.html
+/lorenz_attractor_icon.html
+/diff_codex*.txt
+/t.cpp
+/src/d3d9/war3/core/war3_internal_test_config(R*).h
+
+# 一次性压缩包/临时分析文件
+/src/src.rar
+/tiara.ai

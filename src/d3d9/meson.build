@@ -14,6 +14,28 @@ d3d9_shaders = files([
 
 d3d9_shaders += war3fx_shaders
 
+# War3 GPU 蒙皮使用独立的 fixed-function VS 变体。stock shader 仍由通用
+# generator 原样生成，避免所有 D3D9 fixed-function draw 都承担私有 binding 契约。
+d3d9_war3_gpu_skin_ff_vs_args = [
+  '--quiet',
+  '--target-env', 'vulkan1.3',
+  '--vn', 'd3d9_war3_gpu_skin_fixed_function_vert',
+  '--depfile', '@DEPFILE@',
+  '-DD3D9_WAR3_GPU_SKIN=1',
+  '@INPUT@',
+  '-o', '@OUTPUT@',
+]
+if get_option('debug')
+  d3d9_war3_gpu_skin_ff_vs_args += ['-gVS']
+endif
+d3d9_war3_gpu_skin_ff_vs = custom_target(
+  'd3d9_war3_gpu_skin_fixed_function_vert',
+  input   : 'shaders/d3d9_fixed_function_vert.vert',
+  output  : 'd3d9_war3_gpu_skin_fixed_function_vert.h',
+  depfile : 'd3d9_war3_gpu_skin_fixed_function_vert.h.d',
+  command : [glsl_compiler] + d3d9_war3_gpu_skin_ff_vs_args,
+)
+
 d3d9_src = [
   'd3d9_main.cpp',
   'd3d9_interface.cpp',
@@ -59,6 +81,8 @@ d3d9_src = [
   'd3d9_war3_shadow.cpp',
   'd3d9_war3_shadow_resources.cpp',
   'd3d9_war3_shadow_outline.cpp',
+  'd3d9_war3_volumetric_light.cpp',
+  'war3/render/war3_hybrid_ray_tracing.cpp',
   'd3d9_war3_ssao.cpp',
   'war3_shader_api.cpp',
   'war3_shaderpack.cpp',
@@ -73,40 +97,85 @@ d3d9_src = [
   'jass/war3_hook.cpp',
   # War3 新模块
   'war3/war3.cpp',
+  'war3/bridge/war3_visual_bridge_v1.cpp',
+  'war3/japi/war3_japi_v1.cpp',
   'war3/core/war3_memory.cpp',
+  'war3/core/war3_crash_handler.cpp',
   'war3/core/war3_runtime_profile.cpp',
+  'war3/core/war3_semantic_shadow_gate.cpp',
   'war3/platform/war3_module_api.cpp',
+  'war3/platform/war3_native_device_resolver.cpp',
   'war3/platform/war3_runtime_bootstrap.cpp',
+  'war3/math/war3_math_expression.cpp',
+  'war3/math/war3_curve_runtime.cpp',
   'war3/memory/tlsf.c',
   'war3/memory/war3_tlsf_pool.cpp',
   'war3/memory/war3_storm_hook.cpp',
+  'war3/memory/war3_storm_native_small_repair.cpp',
   'war3/memory/war3_shadow_arena.cpp',
+  'war3/memory/war3_cpu_readable_buffer_span.cpp',
   'war3/handle/war3_handle_resolver.cpp',
   'war3/render/war3_render_objects.cpp',
   'war3/render/war3_render_identity_bridge.cpp',
   'war3/render/war3_shadow_runtime_bridge.cpp',
+  'war3/render/war3_shadow_lifecycle.cpp',
+  'war3/render/war3_shadow_producer_policy.cpp',
+  'war3/render/war3_shadow_replay_validation.cpp',
+  'war3/render/war3_point_shadow_cpu_plan.cpp',
+  'war3/render/war3_union_consumer_visibility.cpp',
+  'war3/render/war3_current_draw_contract.cpp',
   'war3/render/war3_scene_collector.cpp',
   'war3/render/war3_renderer.cpp',
   'war3/render/war3_shadow_object_registry.cpp',
   'war3/render/war3_render_dispatcher.cpp',
   'war3/render/war3_frame_graph.cpp',
+  'war3/render/war3_canonical_draw.cpp',
   'war3/render/war3_render_queue_tracker.cpp',
   'war3/render/war3_render_exec_batch.cpp',
   'war3/render/war3_render_state.cpp',
+  'war3/render/war3_upper_layer_shadow.cpp',
+  'war3/render/war3_visible_renderables.cpp',
   'war3/render/war3_shadow_capture_frontend.cpp',
   'war3/render/war3_native_renderer_probe.cpp',
   'war3/render/war3_post_process.cpp',
+  'war3/render/war3_lightning_runtime.cpp',
   'war3/state/war3_render_state.cpp',
   'war3/debug/war3_debug.cpp',
   'war3/tools/war3_perf_monitor.cpp',
+  'war3/tools/war3_resource_residency_census.cpp',
   'war3/tools/war3_diagnostics_hub.cpp',
+  'war3/tools/war3_control_plane.cpp',
   'war3/tools/war3_frame_capture.cpp',
   'war3/tools/war3_internal_test_api.cpp',
   'war3/core/war3_storm.cpp',
   'war3/core/war3_file_manager.cpp',
   'war3/model/war3_model_hook.cpp',
+  'war3/model/war3_model_resource_cache.cpp',
   'war3/model/war3_model_registry.cpp',
+  'war3/gpu_skin/war3_gpu_skin_compute.cpp',
+  'war3/gpu_skin/war3_cpu_skin_mt.cpp',
+  'war3/gpu_skin/war3_gpu_skin_manager.cpp',
+  'war3/gpu_skin/war3_gpu_skin_native_bridge.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_observer.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_d3d9_observe_owner.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_owner.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_proof_catalog.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_immutable.cpp',
+  'war3/gpu_skin/war3_persistent_gpu_package_store.cpp',
+  'war3/gpu_skin/war3_gpu_skin_resources.cpp',
+  'war3/shadow/war3_shadow_runtime_contract.cpp',
+  'war3/shadow/war3_shadow_renderer_core.cpp',
+  'war3/shadow/war3_shadow_backend_dxvk.cpp',
+  'war3/shadow/war3_shadow_backend_native_d3d9.cpp',
+  'war3/shadow/war3_shadow_native_runtime.cpp',
+  'war3/shadow/war3_shadow_alpha_test_payload.cpp',
+  'war3/native/war3_native_hooks.cpp',
+  'war3/native/war3_native_renderer.cpp',
+  'war3/native/war3_native_renderer_core.cpp',
+  'war3/native/war3_native_shadow.cpp',
   'war3/native/war3_native_shadow_hint.cpp',
+  'war3/native/war3_native_symbols.cpp',
   'war3/war3_user_example.cpp',
   'war3/game/war3_unit.cpp',
   'war3/game/war3_agent.cpp',
@@ -116,6 +185,7 @@ d3d9_src = [
   'war3/hooks/war3_hook_address_book.cpp',
   'war3/hooks/war3_hook_ui.cpp',
   'war3/hooks/war3_hook_shadow.cpp',
+  'war3/hooks/war3_hook_widget_identity.cpp',
   'war3/hooks/war3_hook_install_util.cpp',
   'war3/hooks/war3_hook_render_identity.cpp',
   'war3/hooks/war3_dispatch_contract.cpp',
@@ -124,6 +194,7 @@ d3d9_src = [
   'war3/hooks/war3_hook_render.cpp',
   'war3/hooks/war3_hook_lifecycle.cpp',
   'war3/hooks/war3_hook_jass.cpp',
+  'war3/hooks/war3_jass_command_bridge.cpp',
   'war3/hooks/war3_jass_native_plan_cache.cpp',
   'war3/hooks/war3_jass_native_invoke_x86.cpp',
   'war3/hooks/war3_stage_tag_map.cpp',
@@ -148,9 +219,11 @@ if platform != 'windows'
 endif
 
 lib_dwmapi = cpp.find_library('dwmapi')
+lib_dbghelp = cpp.find_library('dbghelp')
 
-d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src, glsl_generator.process(d3d9_shaders), d3d9_res,
-  dependencies        : [ dxso_dep, dxvk_dep, imgui_dep, lib_dwmapi ],
+d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
+  glsl_generator.process(d3d9_shaders), d3d9_war3_gpu_skin_ff_vs, d3d9_res,
+  dependencies        : [ dxso_dep, dxvk_dep, imgui_dep, lib_dwmapi, lib_dbghelp ],
   include_directories : [ dxvk_include_path, minhook_inc_path ],
   install             : true,
   vs_module_defs      : 'd3d9'+def_spec_ext,
@@ -162,6 +235,270 @@ d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src, glsl_generator.proc
 d3d9_dep = declare_dependency(
   link_with           : [ d3d9_dll ],
   include_directories : [ dxvk_include_path ],
+)
+
+# Public WarVK v1 parser/dispatcher contract. This compiles the exact
+# production source with the rendering backend replaced by a fail-closed stub,
+# so strict wire parsing can run without loading d3d9.dll or Warcraft.
+war3_japi_v1_protocol_test = executable(
+  'war3_japi_v1_protocol_test',
+  [
+    'war3/japi/war3_japi_v1.cpp',
+    'war3/japi/tests/war3_japi_v1_protocol_test.cpp',
+  ],
+  cpp_args            : [ '-DWARVK_JAPI_PROTOCOL_TEST=1' ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_japi_v1_protocol',
+  war3_japi_v1_protocol_test,
+  timeout : 30,
+)
+
+# Pure Phase-1 math-expression and curve-runtime test. It compiles and
+# evaluates bounded bytecode without loading Warcraft or creating GPU state.
+war3_math_curve_runtime_test = executable(
+  'war3_math_curve_runtime_test',
+  [
+    'war3/math/war3_math_expression.cpp',
+    'war3/math/war3_curve_runtime.cpp',
+    'war3/math/tests/war3_math_curve_runtime_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_math_curve_runtime',
+  war3_math_curve_runtime_test,
+  timeout : 30,
+)
+
+# Pure, runnable policy test. It does not link d3d9.dll and therefore cannot
+# mutate or accidentally exercise the live War3 render paths.
+war3_union_consumer_visibility_test = executable(
+  'war3_union_consumer_visibility_test',
+  [
+    'war3/render/war3_union_consumer_visibility.cpp',
+    'war3/render/tests/war3_union_consumer_visibility_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_union_consumer_visibility',
+  war3_union_consumer_visibility_test,
+  timeout : 30,
+)
+
+war3_shadow_replay_validation_test = executable(
+  'war3_shadow_replay_validation_test',
+  [
+    'war3/render/war3_shadow_replay_validation.cpp',
+    'war3/render/tests/war3_shadow_replay_validation_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_replay_validation',
+  war3_shadow_replay_validation_test,
+  timeout : 30,
+)
+
+war3_shadow_arena_lifecycle_test = executable(
+  'war3_shadow_arena_lifecycle_test',
+  [
+    'war3/memory/tests/war3_shadow_arena_lifecycle_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_arena_lifecycle',
+  war3_shadow_arena_lifecycle_test,
+  timeout : 30,
+)
+
+# P0 ownership/API policy test. It constructs no DXVK object and proves that
+# the new persistent package store cannot create itself at the D3D9 boundary.
+war3_persistent_gpu_package_owner_test = executable(
+  'war3_persistent_gpu_package_owner_test',
+  [
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_owner_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_owner',
+  war3_persistent_gpu_package_owner_test,
+  timeout : 30,
+)
+
+# Value-only P1 lifecycle proof. It records upload and consumer last-use fence
+# identities/values for isolated tests, but is not instantiated by the store,
+# D3D9 device or any renderer consumer.
+war3_persistent_gpu_package_generation_owner_test = executable(
+  'war3_persistent_gpu_package_generation_owner_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_owner.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_generation_owner_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_generation_owner',
+  war3_persistent_gpu_package_generation_owner_test,
+  timeout : 30,
+)
+
+# Value-only P1 package observer. Production compiles the policy/table, but no
+# renderer, store or D3D9 object instantiates it and Consume remains denied.
+war3_persistent_gpu_package_observer_test = executable(
+  'war3_persistent_gpu_package_observer_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_proof_catalog.cpp',
+    'war3/gpu_skin/war3_persistent_gpu_package_observer.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_observer_test.cpp',
+  ],
+  dependencies        : [ dependency('threads') ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_observer',
+  war3_persistent_gpu_package_observer_test,
+  timeout : 30,
+)
+
+# Runtime-integrated but evidence-only Stage11 adapter. The isolated runnable
+# proves source generations, exact accepted-witness gates, hard zero package /
+# consumer authority and timing aggregation without constructing DXVK/GPU
+# resources.
+war3_persistent_gpu_package_stage11_observe_adapter_test = executable(
+  'war3_persistent_gpu_package_stage11_observe_adapter_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_stage11_observe_adapter_test.cpp',
+  ],
+  dependencies        : [ dependency('threads') ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_stage11_observe_adapter',
+  war3_persistent_gpu_package_stage11_observe_adapter_test,
+  timeout : 30,
+)
+
+# Immutable CPU/value-only package proof publication. The production library
+# compiles this catalog, but no store, manager, D3D9 device or renderer path
+# instantiates it and shared-package Consume remains denied.
+war3_persistent_gpu_package_proof_catalog_test = executable(
+  'war3_persistent_gpu_package_proof_catalog_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_proof_catalog.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_proof_catalog_test.cpp',
+  ],
+  dependencies        : [ dependency('threads') ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_proof_catalog',
+  war3_persistent_gpu_package_proof_catalog_test,
+  timeout : 30,
+)
+
+# CPU-only immutable model/package authority test. It never constructs a
+# device, Store, renderer, atlas or GPU slice.
+war3_persistent_gpu_package_immutable_test = executable(
+  'war3_persistent_gpu_package_immutable_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_immutable.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_immutable_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_immutable',
+  war3_persistent_gpu_package_immutable_test,
+  timeout : 30,
+)
+
+# Value-only current-draw/package equivalence gate. It hashes exact strided
+# FLOAT3 bytes and rejects every incomplete route before any future renderer
+# consumer can publish would-use authority.
+war3_persistent_gpu_package_current_draw_equivalence_test = executable(
+  'war3_persistent_gpu_package_current_draw_equivalence_test',
+  [
+    'war3/gpu_skin/war3_persistent_gpu_package_immutable.cpp',
+    'war3/gpu_skin/tests/war3_persistent_gpu_package_current_draw_equivalence_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_persistent_gpu_package_current_draw_equivalence',
+  war3_persistent_gpu_package_current_draw_equivalence_test,
+  timeout : 30,
+)
+
+# Runnable ownership/lifetime test for the point-shadow persistent mailbox.
+# The production pass lazily instantiates the same mailbox only when its
+# explicit Observe/Consume mode is requested; release default remains Off.
+war3_point_shadow_prepare_worker_test = executable(
+  'war3_point_shadow_prepare_worker_test',
+  [
+    'war3/render/tests/war3_point_shadow_prepare_worker_test.cpp',
+  ],
+  dependencies        : [ dependency('threads') ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_point_shadow_prepare_worker_foundation',
+  war3_point_shadow_prepare_worker_test,
+  timeout : 30,
+)
+
+# Pure owned-value planner used by the opt-in persistent point-shadow path and
+# independently linked into this runnable for algorithm/ownership oracles.
+war3_point_shadow_cpu_plan_test = executable(
+  'war3_point_shadow_cpu_plan_test',
+  [
+    'war3/render/war3_point_shadow_cpu_plan.cpp',
+    'war3/render/tests/war3_point_shadow_cpu_plan_test.cpp',
+  ],
+  dependencies        : [ dependency('threads') ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_point_shadow_cpu_plan_foundation',
+  war3_point_shadow_cpu_plan_test,
+  timeout : 30,
+)
+
+# Runnable boundary proof for CPU shadow-source reads. The guard-page case
+# proves that invalid D3D9 binding offsets are rejected from the allocation
+# metadata without touching the adjacent inaccessible page.
+war3_cpu_readable_buffer_span_test = executable(
+  'war3_cpu_readable_buffer_span_test',
+  [
+    'war3/memory/war3_cpu_readable_buffer_span.cpp',
+    'war3/memory/tests/war3_cpu_readable_buffer_span_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_cpu_readable_buffer_span',
+  war3_cpu_readable_buffer_span_test,
+  timeout : 30,
 )
 
 if platform != 'windows'

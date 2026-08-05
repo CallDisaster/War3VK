@@ -116,6 +116,19 @@ namespace dxvk::war3 {
         m_device = device;
         m_globalVsConstants.reset(caps::MaxFloatConstantsVS);
         m_globalPsConstants.reset(caps::MaxSM3FloatConstantsPS);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_effectiveOverrideStageMask.store(0u, std::memory_order_release);
+            m_internalTestStageOverrides.clear();
+            for (auto& slot : m_internalTestStageMaterialSlots) {
+                std::atomic_store_explicit(
+                    &slot, std::shared_ptr<War3Material>{},
+                    std::memory_order_release);
+            }
+            ++m_internalTestStageOverrideGeneration;
+            if (m_internalTestStageOverrideGeneration == 0u)
+                ++m_internalTestStageOverrideGeneration;
+        }
         loadConfig("shader_packs.json");
     }
 
@@ -128,13 +141,30 @@ namespace dxvk::war3 {
     }
 
     bool ShaderManager::hasOverride(RenderStageId stage) const {
-        return m_activeOverrides.find(stage) != m_activeOverrides.end();
+        const uint32_t bit = static_cast<uint32_t>(stage);
+        const uint32_t mask = bit < 32u ? (1u << bit) : 0u;
+        return mask != 0u &&
+            (m_effectiveOverrideStageMask.load(std::memory_order_acquire) &
+             mask) != 0u;
     }
 
     War3Material* ShaderManager::getMaterial(RenderStageId stage) {
-        auto it = m_activeOverrides.find(stage);
-        if (it != m_activeOverrides.end()) {
-            War3Material* mat = it->second;
+        std::shared_ptr<War3Material> testMaterial;
+        const uint32_t testStage = static_cast<uint32_t>(stage);
+        if (testStage < m_internalTestStageMaterialSlots.size()) {
+            testMaterial = std::atomic_load_explicit(
+                &m_internalTestStageMaterialSlots[testStage],
+                std::memory_order_acquire);
+        }
+        War3Material* mat = nullptr;
+        if (testMaterial) {
+            mat = testMaterial.get();
+        } else {
+            auto it = m_activeOverrides.find(stage);
+            if (it != m_activeOverrides.end())
+                mat = it->second;
+        }
+        if (mat != nullptr) {
             if (!mat->isCompiled()) {
                 if (!mat->hasCompileFailure() && m_device) {
                     mat->compile(m_device, false);
@@ -143,6 +173,194 @@ namespace dxvk::war3 {
             return mat;
         }
         return nullptr;
+    }
+
+    ShaderStageOverrideTestStatus
+    ShaderManager::activateStageOverrideForTest(
+        RenderStageId stage, const std::string& exactPackName) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ShaderStageOverrideTestStatus status;
+        if (stage != RenderStageId::Outline || exactPackName.empty())
+            return status;
+
+        const auto stageMask = [](RenderStageId value) {
+            const uint32_t bit = static_cast<uint32_t>(value);
+            return bit < 32u ? (1u << bit) : 0u;
+        };
+        const auto activeMask = [&]() {
+            uint32_t mask = 0u;
+            for (const auto& entry : m_activeOverrides)
+                mask |= stageMask(entry.first);
+            for (const auto& entry : m_internalTestStageOverrides)
+                mask |= stageMask(entry.first);
+            return mask;
+        };
+        const auto effectiveOverrides = [&]() {
+            std::map<RenderStageId, War3Material*> result = m_activeOverrides;
+            for (const auto& entry : m_internalTestStageOverrides) {
+                result[entry.first] = entry.second.material
+                    ? entry.second.material.get() : nullptr;
+            }
+            return result;
+        };
+
+        const auto activeBefore = effectiveOverrides();
+        std::vector<bool> packEnabledBefore;
+        packEnabledBefore.reserve(m_packs.size());
+        for (const auto& pack : m_packs)
+            packEnabledBefore.push_back(pack.enabled);
+        status.activeStageMaskBefore = activeMask();
+        status.worldOverrideBefore = activeBefore.find(RenderStageId::World) !=
+            activeBefore.end();
+
+        std::shared_ptr<War3Material> material;
+        for (const auto& pack : m_packs) {
+            if (pack.name != exactPackName)
+                continue;
+            status.exactPackMatched = true;
+            auto candidate = pack.materials.find(stage);
+            if (candidate != pack.materials.end() && candidate->second) {
+                material = candidate->second;
+                status.sourcePack = pack.name;
+            }
+            break;
+        }
+
+        status.materialExists = material != nullptr;
+        auto existing = m_internalTestStageOverrides.find(stage);
+        if (existing != m_internalTestStageOverrides.end()) {
+            const bool sameLeaseTarget = material &&
+                existing->second.generation ==
+                    m_internalTestStageOverrideGeneration &&
+                existing->second.sourcePack == exactPackName &&
+                existing->second.material == material;
+            if (sameLeaseTarget) {
+                status.leaseId = existing->second.leaseId;
+                status.generation = existing->second.generation;
+            } else {
+                status.leaseConflict = true;
+            }
+        }
+
+        if (material != nullptr && !status.leaseConflict) {
+            if (!material->isCompiled() && !material->hasCompileFailure() &&
+                m_device != nullptr) {
+                material->compile(m_device, false);
+            }
+            status.materialName = material->getName();
+            status.materialCompiled = material->isCompiled();
+            status.materialCompileFailed = material->hasCompileFailure();
+            status.materialError = material->getLastError();
+
+            // Publish only after compilation succeeds. A failed compile leaves
+            // both the production cache and test overlay unchanged.
+            if (status.materialCompiled && !status.materialCompileFailed &&
+                existing == m_internalTestStageOverrides.end()) {
+                uint64_t leaseId = m_nextInternalTestStageOverrideLeaseId++;
+                if (leaseId == 0u)
+                    leaseId = m_nextInternalTestStageOverrideLeaseId++;
+                InternalTestStageOverride overlay;
+                overlay.leaseId = leaseId;
+                overlay.generation = m_internalTestStageOverrideGeneration;
+                overlay.sourcePack = exactPackName;
+                overlay.material = material;
+                m_internalTestStageOverrides[stage] = std::move(overlay);
+                const uint32_t slot = static_cast<uint32_t>(stage);
+                if (slot < m_internalTestStageMaterialSlots.size()) {
+                    std::atomic_store_explicit(
+                        &m_internalTestStageMaterialSlots[slot], material,
+                        std::memory_order_release);
+                }
+                rebuildEffectiveOverrideStageMask();
+                status.leaseId = leaseId;
+                status.generation = m_internalTestStageOverrideGeneration;
+            }
+        }
+
+        status.activeStageMaskAfter = activeMask();
+        const auto activeAfter = effectiveOverrides();
+        status.worldOverrideAfter = activeAfter.find(RenderStageId::World) !=
+            activeAfter.end();
+        auto activated = m_internalTestStageOverrides.find(stage);
+        status.leaseActive = status.leaseId != 0u &&
+            status.generation == m_internalTestStageOverrideGeneration &&
+            activated != m_internalTestStageOverrides.end() &&
+            activated->second.leaseId == status.leaseId &&
+            activated->second.generation == status.generation;
+        status.overrideActive = status.leaseActive && material &&
+            activated->second.material == material;
+
+        auto otherBefore = activeBefore;
+        auto otherAfter = activeAfter;
+        otherBefore.erase(stage);
+        otherAfter.erase(stage);
+        status.otherStageOverridesChanged = otherBefore != otherAfter;
+
+        std::vector<bool> packEnabledAfter;
+        packEnabledAfter.reserve(m_packs.size());
+        for (const auto& pack : m_packs)
+            packEnabledAfter.push_back(pack.enabled);
+        status.packEnabledMutated = packEnabledBefore != packEnabledAfter;
+        status.stageActivationApplied = status.exactPackMatched &&
+            status.materialExists && !status.leaseConflict &&
+            status.overrideActive && status.materialCompiled &&
+            !status.materialCompileFailed && status.leaseActive &&
+            !status.otherStageOverridesChanged &&
+            !status.packEnabledMutated &&
+            status.worldOverrideBefore == status.worldOverrideAfter;
+        return status;
+    }
+
+    bool ShaderManager::restoreStageOverrideForTest(
+        RenderStageId stage, uint64_t leaseId, uint64_t generation) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (stage != RenderStageId::Outline)
+            return false;
+        auto entry = m_internalTestStageOverrides.find(stage);
+        if (entry == m_internalTestStageOverrides.end() || leaseId == 0u ||
+            generation == 0u || entry->second.leaseId != leaseId ||
+            entry->second.generation != generation ||
+            generation != m_internalTestStageOverrideGeneration) {
+            return false;
+        }
+        const uint32_t slot = static_cast<uint32_t>(stage);
+        m_internalTestStageOverrides.erase(entry);
+        rebuildEffectiveOverrideStageMask();
+        if (slot < m_internalTestStageMaterialSlots.size()) {
+            std::atomic_store_explicit(
+                &m_internalTestStageMaterialSlots[slot],
+                std::shared_ptr<War3Material>{},
+                std::memory_order_release);
+        }
+        return true;
+    }
+
+    bool ShaderManager::isStageOverrideTestLeaseActive(
+        RenderStageId stage, uint64_t leaseId, uint64_t generation) const {
+        if (stage != RenderStageId::Outline)
+            return false;
+        auto entry = m_internalTestStageOverrides.find(stage);
+        return entry != m_internalTestStageOverrides.end() && leaseId != 0u &&
+            generation != 0u && entry->second.leaseId == leaseId &&
+            entry->second.generation == generation &&
+            generation == m_internalTestStageOverrideGeneration;
+    }
+
+    uint32_t ShaderManager::activeOverrideMaskForTest() const {
+        return m_effectiveOverrideStageMask.load(std::memory_order_acquire);
+    }
+
+    void ShaderManager::rebuildEffectiveOverrideStageMask() {
+        const auto stageMask = [](RenderStageId value) {
+            const uint32_t bit = static_cast<uint32_t>(value);
+            return bit < 32u ? (1u << bit) : 0u;
+        };
+        uint32_t mask = 0u;
+        for (const auto& entry : m_activeOverrides)
+            mask |= stageMask(entry.first);
+        for (const auto& entry : m_internalTestStageOverrides)
+            mask |= stageMask(entry.first);
+        m_effectiveOverrideStageMask.store(mask, std::memory_order_release);
     }
 
     static RenderStageId StringToStage(const std::string& s) {
@@ -162,6 +380,9 @@ namespace dxvk::war3 {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_packs.clear();
         m_activeOverrides.clear();
+        // Fail-safe before any I/O/parse early return: remove stale production
+        // bits while preserving any independently leased test overlay.
+        rebuildEffectiveOverrideStageMask();
         m_globalVsConstants.reset(m_globalVsConstants.maxRegisters());
         m_globalPsConstants.reset(m_globalPsConstants.maxRegisters());
         m_missingGlobalUniforms.clear();
@@ -295,6 +516,7 @@ namespace dxvk::war3 {
                 }
             }
         }
+        rebuildEffectiveOverrideStageMask();
     }
 
     void ShaderManager::setGlobalVertexShaderConstantF(UINT startRegister, const float* data, UINT vec4Count) {

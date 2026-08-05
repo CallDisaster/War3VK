@@ -53,6 +53,7 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x1648A0, // engineSleepGate
       0x164B00, // engineSleepGateInner
       0x354240, // gamePause
+      0x1552E0, // backgroundIdleSleepMs（WM_ACTIVATEAPP=后台的 Storm 空闲节流）
       0x0EC6B0, // getD3d9Parameters
       0x151F90, // windowMessageTargetLookup
       0xBDAA1C, // windowSizeLParamState
@@ -62,16 +63,47 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
 
       // Render 域
       0x7B28F0, // renderDispatcher
+      0x368480, // worldFrameUpdateAndPreparePasses
+      0x3681C0, // worldRenderScene
       0x139190, // renderQueueAddBatch
       0x1375C0, // renderBatchSubmit
+      0x137AF0, // aucTransparentAddEntry
       0x7B7830, // sceneSubmitBatch
+      0x0CB110, // worldObjectListEntryWrite
       0x184EE0, // worldObjectEntryRender
       0x363020, // worldDispatch
       0x368E30, // worldObjectsRenderGroup
       0x13A5E0, // dispatchCommon
       0x13A780, // dispatchSpecial
+      0x138EE0, // applyDrawStateAndSamplerPair (__fastcall, ret 4)
+      0x138F70, // applyDrawStateAndDraw (prepared-slice probe inner wrapper)
+      0x0EEA50, // gxDeviceD3dDynamicVertexUpload (__thiscall, ret 34h)
       0x1380A0, // flushSortedItems
       0x737110, // terrainRenderAllTiles
+      0x0D2370, // worldPrepareCameraBuildFrustum (__fastcall, ECX/EDX + 1 stack arg)
+      0x76EF80, // worldPrepareTerrainShadowFlush (__fastcall, ECX/EDX)
+      0x770670, // worldPrepareTerrainExtraPass (__fastcall, ECX/EDX + float)
+      0x76D920, // worldPrepareShadowProjectorFlush (__cdecl)
+      0x3702A0, // worldPrepareTargetIndicatorRingAdvance (__thiscall + float)
+      0x3B6600, // worldPrepareCinematicFilterTimeAdvance (__thiscall + float)
+      0x3B8760, // worldPrepareRuntimeFlagClockAdvance3B8760 (__thiscall + float)
+      0x368E00, // worldPrepareFlushDeferredSelectionObjects (__thiscall)
+      0x3AC130, // worldPrepareGlobalRenderCallbackPass (__thiscall, ECX token)
+      0x369370, // worldPrepareRenderWaypointIndicators (__thiscall + float + ptr)
+      0x0A2300, // worldPrepareFrameUpdateGate (__thiscall + 3 args)
+      0x37C520, // worldPrepareGameUiFrameSync (__thiscall)
+      0x368D60, // worldPrepareUpdateIndicatorAnchor (__thiscall)
+      0x346980, // worldPrepareCameraAdvance (__thiscall + float + ptr)
+      0x0E3A00, // worldPrepareCameraPrepareConstants (__thiscall)
+      0x0E3910, // worldPrepareViewProjPrepare (__thiscall)
+      0x139860, // worldPrepareSceneQueryFlushSync (__cdecl)
+      0x0528B0, // worldPrepareFixedPointRemap (__fastcall + 1 stack arg)
+      0x378420, // worldPreparePostVisibilityGlobalAdvanceA (__cdecl)
+      0x377FD0, // worldPreparePostVisibilityFrameAnchorUpdate (__thiscall)
+      0x358CF0, // worldPreparePostVisibilityFrameAnchorVisibilityQuery (__fastcall)
+      0x3AC290, // worldPreparePostVisibilityGlobalAdvanceB (__cdecl)
+      0x0A2AA0, // worldPrepareVisibilityTailAdvanceA (__thiscall + 3 args)
+      0x0A2AE0, // worldPrepareVisibilityTailAdvanceB (__thiscall + 3 args)
 
       // Shadow 域
       0x737620, // terrainShadowLayer
@@ -84,6 +116,8 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x74DB30, // shadowToggleStaticStampFromObject
       0x74DE40, // shadowToggleEmitterStamp (函数入口，74DF50 为内部 call 点)
       0x74E420, // shadowPathStaticStampToggle
+      0x3358C0, // cunitUiRecordSetUnitShadow（UnitUI.slk unitShadow -> record +0x4C）
+      0x335A00, // cunitUiRecordSetStructureShadow（UnitUI.slk buildingShadow -> record +0x50）
       0x764AC0, // shadowProjectorSimpleBridge
       0x38D7A0, // shadowPathObjectProjectorRuntime
       0x1DEEA0, // shadowPathObjectProjectorJassBridge
@@ -95,6 +129,13 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0x76D5A4, // shadowRegisterRetMarkOcclusion
       0x76D69A, // shadowRegisterRetFromPoint
       0x76D719, // shadowRegisterRetFromTwoPoints
+      0x65A140, // widgetRegisterFootprintAndShadowMask（论文第6章中央 sync 入口）
+      0x74DB30, // terrainShadowToggleStaticStampFromObject（2026-05-30 doodad 贴花阴影）
+      0x74DE40, // terrainShadowToggleEmitterStamp（2026-05-30 doodad emitter 贴花阴影）
+      0x7370A0, // terrainShadowListARenderPreparedGroups（Phase 7.143 证伪：地形/悬崖 tile）
+      0x737110, // terrainShadowListARenderAllEntries（Phase 7.143 证伪：地形/悬崖 tile）
+      0x234420, // terrainShadowDispatchToShape（旧实验诊断入口，默认关闭）
+      0x234710, // terrainShadowWriteMaskRegion（idx==3 方案已证伪，诊断-only）
 
       // RenderQueue 数据区
       0xBC6BAC, // rqNumOfElements
@@ -108,6 +149,8 @@ const War3HookAddressBook &GetWar3HookAddressBook127a() {
       0xBDA4D4, // rqStateCleanupPending
       0xBE40A8, // handleManager
       0xBE4238, // gameWar3
+      0xBC5420, // gxDevice (global CGxDevice/CGxDeviceD3d singleton pointer)
+      0x584, // gxDeviceD3dNativeDeviceOffset (IDirect3DDevice9*)
 
       // RenderQueue/设备辅助函数
       0x1378B0, // rqItemComparator

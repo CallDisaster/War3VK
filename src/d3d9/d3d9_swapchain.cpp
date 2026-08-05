@@ -8,12 +8,16 @@
 #include "war3/ui/war3_imgui.h"
 #include "war3/core/war3_events.h"
 #include "war3/core/war3_file_manager.h"
+#include "war3/core/war3_internal_test_config.h"
 #include "war3/core/war3_runtime_profile.h"
+#include "war3/hooks/war3_hook_lifecycle.h"
 #include "war3/render/war3_native_renderer_probe.h"
 #include "war3/tools/war3_frame_capture.h"
 #include "war3/tools/war3_perf_monitor.h"
 
 #include <cstdlib>
+#include <atomic>
+#include <cstdio>
 
 static WNDPROC g_War3WndProc = nullptr;
 static LRESULT CALLBACK War3WndProcHook(HWND hWnd, UINT msg, WPARAM wParam,
@@ -159,6 +163,40 @@ static LRESULT CALLBACK War3WndProcHook(HWND hWnd, UINT msg, WPARAM wParam, LPAR
 
 namespace dxvk {
 
+  namespace {
+
+    std::atomic<uint32_t> g_war3PresentTraceCount{0u};
+
+    uint32_t AcquireWar3PresentTraceOrdinal() {
+      uint32_t current = g_war3PresentTraceCount.load(std::memory_order_relaxed);
+      while (current < 4u) {
+        if (g_war3PresentTraceCount.compare_exchange_weak(
+              current, current + 1u, std::memory_order_relaxed,
+              std::memory_order_relaxed))
+          return current + 1u;
+      }
+      return 0u;
+    }
+
+    void TraceWar3Present(uint32_t ordinal, const char* phase,
+                          const void* object, HRESULT hr = S_OK) {
+      // 仅记录前四次 Present；计数耗尽后只剩一次 relaxed load 和分支。
+      if (ordinal == 0u)
+        return;
+      char buffer[256] = { };
+      std::snprintf(
+        buffer, sizeof(buffer),
+        "DXVK W3START pid=%lu tid=%lu tick=%llu comp=D3D9Present ord=%u "
+        "phase=%s object=%p hr=0x%08lx\n",
+        static_cast<unsigned long>(::GetCurrentProcessId()),
+        static_cast<unsigned long>(::GetCurrentThreadId()),
+        static_cast<unsigned long long>(::GetTickCount64()), ordinal,
+        phase ? phase : "<null>", object, static_cast<unsigned long>(hr));
+      ::OutputDebugStringA(buffer);
+    }
+
+  } // namespace
+
   static uint16_t MapGammaControlPoint(float x) {
     if (x < 0.0f) x = 0.0f;
     if (x > 1.0f) x = 1.0f;
@@ -274,19 +312,50 @@ namespace dxvk {
           HWND     hDestWindowOverride,
     const RGNDATA* pDirtyRegion,
           DWORD    dwFlags) {
-    D3D9DeviceLock lock = m_parent->LockDevice();
+    // 收口上一帧的 detached 三段 phase-wall 窗口。正常帧以第二个
+    // WorldFrame 边界为最后起点；loading/reset 帧可能没有 WorldFrame，
+    // 仍必须在 endFrame 前闭合并清空状态，禁止 QPC 起点跨 perf epoch。
+    dxvk::war3::hooks::EndPreWorldLogicPerfPhase();
 
+    const bool tracePresentEntry =
+        !War3UseFpsUnlockOnlyMode() &&
+        dxvk::war3::internal::War3PerfHookLevel() >= 1 &&
+        dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
+            dxvk::war3::runtime::War3RuntimeModule::Diag);
+    auto &perf = war3::War3PerfMonitor::instance();
+    auto presentEntryScope = tracePresentEntry
+        ? perf.cpuScope("D3D9Swapchain/PresentEntry")
+        : war3::War3PerfMonitor::ScopedCpuScope{};
+    auto deviceLockScope = tracePresentEntry
+        ? perf.cpuScope("AcquireDeviceLock")
+        : war3::War3PerfMonitor::ScopedCpuScope{};
+    const uint32_t traceOrdinal = AcquireWar3PresentTraceOrdinal();
+    TraceWar3Present(traceOrdinal, "entry-before-lock", this);
+    D3D9DeviceLock lock = m_parent->LockDevice();
+    TraceWar3Present(traceOrdinal, "lock-acquired", this);
+    deviceLockScope = war3::War3PerfMonitor::ScopedCpuScope{};
+
+    TraceWar3Present(traceOrdinal, "frame-end-begin", this);
     if (!War3UseFpsUnlockOnlyMode() &&
         dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
             dxvk::war3::runtime::War3RuntimeModule::Diag)) {
-      dxvk::war3::render::NativeRendererProbe::instance().OnFrameEnd();
+      {
+        auto probeScope = tracePresentEntry
+            ? perf.cpuScope("NativeRendererProbeFrameEnd")
+            : war3::War3PerfMonitor::ScopedCpuScope{};
+        dxvk::war3::render::NativeRendererProbe::instance().OnFrameEnd();
+      }
+      // endFrame() 会把 active epoch 清零；所有本帧 scope 必须先闭合。
+      presentEntryScope = war3::War3PerfMonitor::ScopedCpuScope{};
       war3::War3PerfMonitor::instance().endFrame();
     }
+    TraceWar3Present(traceOrdinal, "frame-end-end", this);
 
     m_parent->SetMostRecentlyUsedSwapchain(this);
 
     // ========== 注册 OnGameStart 事件回调 (一次性) ==========
     static bool s_eventRegistered = false;
+    TraceWar3Present(traceOrdinal, "event-registration-begin", this);
     if (!War3UseFpsUnlockOnlyMode() &&
         dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
             dxvk::war3::runtime::War3RuntimeModule::Diag) &&
@@ -329,19 +398,25 @@ namespace dxvk {
             war3::War3PerfMonitor::instance().setRecording(false);
         });
     }
+    TraceWar3Present(traceOrdinal, "event-registration-end", this);
     // ========== 事件注册结束 ==========
 
 
-    if (unlikely(m_parent->IsDeviceLost()))
+    if (unlikely(m_parent->IsDeviceLost())) {
+      TraceWar3Present(traceOrdinal, "device-lost-return", this,
+                       D3DERR_DEVICELOST);
       return D3DERR_DEVICELOST;
+    }
 
     // If we have no backbuffers, error out.
     // This handles the case where a ::Reset failed due to OOM
     // or whatever.
     // I am not sure what the actual HRESULT returned here is
     // or should be, but it is better than crashing... probably!
-    if (m_backBuffers.empty())
+    if (m_backBuffers.empty()) {
+      TraceWar3Present(traceOrdinal, "no-backbuffer-return", this);
       return D3D_OK;
+    }
 
     uint32_t presentInterval = m_presentParams.PresentationInterval;
 
@@ -373,7 +448,10 @@ namespace dxvk {
       m_displayRefreshRateDirty = true;
     }
 
-    if (!UpdateWindowCtx())
+    TraceWar3Present(traceOrdinal, "window-context-begin", this);
+    const bool windowContextReady = UpdateWindowCtx();
+    TraceWar3Present(traceOrdinal, "window-context-end", this);
+    if (!windowContextReady)
       return D3D_OK;
 
     if (options->deferSurfaceCreation && IsDeviceReset(m_wctx))
@@ -405,11 +483,25 @@ namespace dxvk {
 
 #ifdef _WIN32
     const bool useGDIFallback = m_partialCopy && !SwapWithFrontBuffer();
-    if (useGDIFallback)
-      return PresentImageGDI(m_window);
+    if (useGDIFallback) {
+      TraceWar3Present(traceOrdinal, "gdi-fallback-begin", this);
+      const HRESULT hr = PresentImageGDI(m_window);
+      TraceWar3Present(traceOrdinal, "gdi-fallback-end", this, hr);
+      return hr;
+    }
 #endif
 
     try {
+      const bool diagEnabled =
+          !War3UseFpsUnlockOnlyMode() &&
+          dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
+              dxvk::war3::runtime::War3RuntimeModule::Diag);
+      if (diagEnabled || war3::tools::HasPendingFrameCaptureRequest()) {
+        war3::tools::ProcessPendingFrameCapture(
+            m_parent,
+            m_backBuffers.empty() ? nullptr : m_backBuffers[0].ptr());
+      }
+
       // War3 ImGui Render
       if (!War3UseFpsUnlockOnlyMode() &&
           dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
@@ -420,28 +512,27 @@ namespace dxvk {
             war3::War3Imgui::get().render(false);
         }
         war3::War3Imgui::get().endFrame();
-
-        if (dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
-                dxvk::war3::runtime::War3RuntimeModule::Diag)) {
-          war3::tools::ProcessPendingFrameCapture(
-              m_parent,
-              m_backBuffers.empty() ? nullptr : m_backBuffers[0].ptr());
-        }
       }
       
       UpdateWindowedRefreshRate();
       UpdateTargetFrameRate(presentInterval);
+      TraceWar3Present(traceOrdinal, "present-image-begin", this);
       PresentImage(presentInterval);
+      TraceWar3Present(traceOrdinal, "present-image-end", this);
       
       if (!War3UseFpsUnlockOnlyMode() &&
           dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
               dxvk::war3::runtime::War3RuntimeModule::Diag)) {
         war3::War3PerfMonitor::instance().beginFrame();
+        dxvk::war3::hooks::BeginPreWorldLogicPerfPhase();
         dxvk::war3::render::NativeRendererProbe::instance().OnFrameBegin();
       }
       
+      TraceWar3Present(traceOrdinal, "success-return", this);
       return D3D_OK;
     } catch (const DxvkError& e) {
+      TraceWar3Present(traceOrdinal, "exception", this,
+                       D3DERR_DEVICEREMOVED);
       Logger::err(e.message());
       if (!War3UseFpsUnlockOnlyMode() &&
           dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
@@ -516,6 +607,14 @@ namespace dxvk {
     D3D9Surface* dst = static_cast<D3D9Surface*>(pDestSurface);
 
     if (unlikely(dst == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    // The backbuffers can be destroyed and not recreated when a call to Reset
+    // fails (OOM etc.). GetFrontBuffer() would then call back() on an empty
+    // vector — undefined behavior. Present() and GetBackBuffer() already guard
+    // this exact failed-Reset state; match them here before dereferencing the
+    // front buffer.
+    if (unlikely(m_backBuffers.empty()))
       return D3DERR_INVALIDCALL;
 
     D3D9CommonTexture* dstTexInfo = dst->GetCommonTexture();
@@ -1714,6 +1813,13 @@ namespace dxvk {
 
   BOOL STDMETHODCALLTYPE D3D9VkExtSwapchain::CheckColorSpaceSupport(
           VkColorSpaceKHR           ColorSpace) {
+    // m_wctx is null after Invalidate() (additional-swapchain creation) until
+    // the next Present re-establishes the window context. SetColorSpace and
+    // SetHDRMetaData already null-check m_wctx; this shared helper (also called
+    // by SetColorSpace and GetCurrentOutputDesc) must too, or a null presenter
+    // gets dereferenced.
+    if (!m_swapchain->m_wctx)
+      return FALSE;
     return m_swapchain->m_wctx->presenter->supportsColorSpace(ColorSpace);
   }
 

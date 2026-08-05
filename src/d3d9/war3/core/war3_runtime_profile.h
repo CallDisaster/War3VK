@@ -32,6 +32,7 @@ enum class War3RuntimeModule : uint32_t {
   PostFx,
   Ssao,
   Aa,
+  SemanticData,
   Count,
 };
 

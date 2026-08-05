@@ -1,0 +1,136 @@
+#version 460
+
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2DArray s_depth;
+layout(set = 0, binding = 1, rg32f)
+writeonly uniform image2D s_hizMip0;
+
+layout(set = 0, binding = 2, scalar, row_major)
+uniform HybridRayData {
+  mat4 u_view;
+  mat4 u_invViewProj;
+  mat4 u_proj;
+  vec4 u_viewport;
+  // x=MinZ y=MaxZ z=far clear raw value w=clear value known
+  vec4 u_viewportZ;
+  // x=maxDistance y=thickness z=startOffset w=maxNodeVisits
+  vec4 u_rayParams;
+  // x=raw depth quantum y=reserved z=reserved w=reserved
+  vec4 u_rayParams2;
+  vec4 u_lightPos[2];
+} ray;
+
+layout(push_constant, scalar)
+uniform PushData {
+  uint p_srcMip;
+  uint p_dstMip;
+  uint p_mipCount;
+  uint p_layerCount;
+  uvec4 p_extent;   // full width/height, base width/height
+  uvec4 p_dispatch; // source width/height, destination width/height
+} pc;
+
+bool finiteFloat(float value) {
+  return !isnan(value) && !isinf(value) && abs(value) < 1.0e30;
+}
+
+bool finiteVec4(vec4 value) {
+  return !any(isnan(value)) && !any(isinf(value)) &&
+         all(lessThan(abs(value), vec4(1.0e30)));
+}
+
+bool loadPositiveViewDepth(ivec2 absolutePixel, out float viewDepth) {
+  viewDepth = 0.0;
+  ivec2 fullExtent = ivec2(pc.p_extent.xy);
+  if (any(lessThan(absolutePixel, ivec2(0))) ||
+      any(greaterThanEqual(absolutePixel, fullExtent)))
+    return false;
+
+  ivec2 viewportMin = ivec2(ray.u_viewport.xy);
+  ivec2 viewportSize = ivec2(max(ray.u_viewport.zw, vec2(1.0)));
+  ivec2 localPixel = absolutePixel - viewportMin;
+  if (any(lessThan(localPixel, ivec2(0))) ||
+      any(greaterThanEqual(localPixel, viewportSize)))
+    return false;
+
+  float rawDepth = texelFetch(s_depth, ivec3(absolutePixel, 0), 0).r;
+  if (!finiteFloat(rawDepth))
+    return false;
+
+  float minZ = ray.u_viewportZ.x;
+  float maxZ = ray.u_viewportZ.y;
+  float denom = maxZ - minZ;
+  float rawLo = min(minZ, maxZ);
+  float rawHi = max(minZ, maxZ);
+  float quantum = max(ray.u_rayParams2.x, 1.0e-7);
+  if (!finiteFloat(denom) || abs(denom) <= 1.0e-6 ||
+      rawDepth < rawLo - quantum || rawDepth > rawHi + quantum)
+    return false;
+
+  if (ray.u_viewportZ.w > 0.5 &&
+      abs(rawDepth - ray.u_viewportZ.z) <= max(0.5 * quantum, 1.0e-7))
+    return false;
+
+  float depthN = (rawDepth - minZ) / denom;
+  if (!finiteFloat(depthN) || depthN < -1.0e-5 || depthN > 1.0 + 1.0e-5)
+    return false;
+  depthN = clamp(depthN, 0.0, 1.0);
+
+  // Match the D3D9/DXVK receiver contract: integer pixel coordinates already
+  // represent pixel centres because the Vulkan viewport carries the half texel.
+  vec2 uvViewport = vec2(localPixel) / vec2(viewportSize);
+  vec4 clip = vec4(uvViewport.x * 2.0 - 1.0,
+                   1.0 - uvViewport.y * 2.0,
+                   depthN, 1.0);
+  vec4 worldH = clip * ray.u_invViewProj;
+  if (!finiteVec4(worldH) || abs(worldH.w) <= 1.0e-6)
+    return false;
+
+  vec4 viewH = vec4(worldH.xyz / worldH.w, 1.0) * ray.u_view;
+  if (!finiteVec4(viewH))
+    return false;
+
+  viewDepth = abs(viewH.z);
+  return finiteFloat(viewDepth) && viewDepth > 1.0e-5;
+}
+
+void main() {
+  ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 dstExtent = ivec2(pc.p_dispatch.zw);
+  if (any(greaterThanEqual(dst, dstExtent)))
+    return;
+
+  ivec2 fullExtent = ivec2(pc.p_extent.xy);
+  ivec2 first = dst * 2;
+  bool hasValid = false;
+  bool allValid = true;
+  float minDepth = 3.402823466e38;
+  float maxDepth = 0.0;
+
+  for (int oy = 0; oy < 2; ++oy) {
+    for (int ox = 0; ox < 2; ++ox) {
+      ivec2 pixel = first + ivec2(ox, oy);
+      // Padding beyond an odd full-resolution edge is not a missing sample.
+      if (any(greaterThanEqual(pixel, fullExtent)))
+        continue;
+
+      float depth;
+      bool valid = loadPositiveViewDepth(pixel, depth);
+      allValid = allValid && valid;
+      if (valid) {
+        hasValid = true;
+        minDepth = min(minDepth, depth);
+        maxDepth = max(maxDepth, depth);
+      }
+    }
+  }
+
+  vec2 encoded = vec2(0.0);
+  if (hasValid)
+    encoded = vec2(minDepth, allValid ? maxDepth : -maxDepth);
+  imageStore(s_hizMip0, dst, vec4(encoded, 0.0, 0.0));
+}

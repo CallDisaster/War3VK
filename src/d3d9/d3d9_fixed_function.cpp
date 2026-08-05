@@ -14,6 +14,7 @@
 #include <cfloat>
 
 #include <d3d9_fixed_function_vert.h>
+#include <d3d9_war3_gpu_skin_fixed_function_vert.h>
 #include <d3d9_fixed_function_frag.h>
 
 namespace dxvk {
@@ -2737,14 +2738,21 @@ namespace dxvk {
 
   D3D9FFShader::D3D9FFShader(
           D3D9DeviceEx*         pDevice,
-          DxsoProgramType       ProgramType) {
+          DxsoProgramType       ProgramType,
+          bool                  War3GpuSkinVariant) {
 
     bool isVS = ProgramType == DxsoProgramType::VertexShader;
 
     if (isVS) {
-      std::array<DxvkBindingInfo, 4> bindings;
+      std::vector<DxvkBindingInfo> bindings(4u);
 
-      SpirvCodeBuffer codeBuffer = SpirvCodeBuffer(sizeof(d3d9_fixed_function_vert) / sizeof(uint32_t), d3d9_fixed_function_vert);
+      SpirvCodeBuffer codeBuffer = War3GpuSkinVariant
+        ? SpirvCodeBuffer(
+            sizeof(d3d9_war3_gpu_skin_fixed_function_vert) / sizeof(uint32_t),
+            d3d9_war3_gpu_skin_fixed_function_vert)
+        : SpirvCodeBuffer(
+            sizeof(d3d9_fixed_function_vert) / sizeof(uint32_t),
+            d3d9_fixed_function_vert);
 
       constexpr uint32_t specConstantBufferBindingId = getSpecConstantBufferSlot();
       auto& specConstantBufferBinding = bindings[0];
@@ -2788,14 +2796,28 @@ namespace dxvk {
       clipPlanesBinding.access          = VK_ACCESS_UNIFORM_READ_BIT;
       clipPlanesBinding.flags.set(DxvkDescriptorFlag::UniformBuffer);
 
+      if (War3GpuSkinVariant) {
+        for (uint32_t slot : { 64u, 65u }) {
+          DxvkBindingInfo binding = { };
+          binding.set = 0u;
+          binding.binding = slot;
+          binding.resourceIndex = slot;
+          binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+          binding.access = VK_ACCESS_SHADER_READ_BIT;
+          bindings.push_back(binding);
+        }
+      }
+
       DxvkSpirvShaderCreateInfo info;
       info.bindingCount = bindings.size();
       info.bindings = bindings.data();
       info.flatShadingInputs = 0;
       info.sharedPushData = DxvkPushDataBlock(0u, sizeof(D3D9RenderStateInfo), 4u, 0u);
-      info.localPushData = DxvkPushDataBlock();
+      info.localPushData = War3GpuSkinVariant
+        ? DxvkPushDataBlock(VK_SHADER_STAGE_VERTEX_BIT, 64u, 32u, 4u, 0u)
+        : DxvkPushDataBlock();
       info.samplerHeap = DxvkShaderBinding();
-      info.debugName = "FF VS";
+      info.debugName = War3GpuSkinVariant ? "War3 GPU Skin FF VS" : "FF VS";
 
       m_shader = new DxvkSpirvShader(info, std::move(codeBuffer));
     } else {
@@ -2879,7 +2901,12 @@ namespace dxvk {
       m_shader = new DxvkSpirvShader(info, std::move(codeBuffer));
     }
 
-    pDevice->GetDXVKDevice()->registerShader(m_shader);
+    // GPU 蒙皮私有 VS 只在显式 VertexShader 路线真正绑定时才需要。
+    // 启动期主动注册会让默认 Compute 路线也触发异步 pipeline-library 编译，
+    // 既增加无收益的驱动工作，也可能与首个 Shadow layout 创建争用驱动锁。
+    // 不主动预热不会改变 shader 对象或描述符 ABI；首次实际 draw 会按需编译。
+    if (!War3GpuSkinVariant)
+      pDevice->GetDXVKDevice()->registerShader(m_shader);
   }
 
 
@@ -2899,7 +2926,9 @@ namespace dxvk {
 
   D3D9FFShaderModuleSet::D3D9FFShaderModuleSet(D3D9DeviceEx* pDevice)
     : m_vsUbershader(pDevice, DxsoProgramType::VertexShader)
-    , m_fsUbershader(pDevice, DxsoProgramType::PixelShader) {}
+    , m_fsUbershader(pDevice, DxsoProgramType::PixelShader)
+    , m_war3GpuSkinVsUbershader(
+        pDevice, DxsoProgramType::VertexShader, true) {}
 
 
   D3D9FFShader D3D9FFShaderModuleSet::GetShaderModule(

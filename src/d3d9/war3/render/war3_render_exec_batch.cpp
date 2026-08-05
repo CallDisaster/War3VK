@@ -5,6 +5,7 @@
 #include "../core/war3_game_structs.h"
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_memory.h"
+#include "war3_current_draw_contract.h"
 #include "war3_render_objects.h"
 #include "war3_render_identity_bridge.h"
 #include "war3_render_queue_tracker.h"
@@ -224,6 +225,7 @@ ExecBatchContext ExecBatchProcessor::Begin(void *element, War3BatchTag tag,
   const RenderObjectInfo *matchedInfoPtr = nullptr;
   ObjectKind resolvedKind = static_cast<ObjectKind>(0);
   bool foundInRegistry = false;
+  void *ctxEntry = nullptr;
 
   const bool isWorldGroup = tag == War3BatchTag::WorldObjects ||
                             tag == War3BatchTag::SelectionOverlay ||
@@ -235,9 +237,30 @@ ExecBatchContext ExecBatchProcessor::Begin(void *element, War3BatchTag tag,
   const bool needsShadowFallbackBridge =
       isWorldGroup && War3RenderState::NeedsShadowDrawFallbackBridge();
   const bool needsShadowSemanticTracking =
-      needsShadowObjectIdentity || needsShadowFallbackBridge;
+      isWorldGroup && War3RenderState::NeedsShadowSemanticTracking();
   const bool shadowSemanticOnly =
       needsShadowSemanticTracking && !needsObjectTracking;
+
+  auto mergeIdentitySnapshot =
+      [&](const RenderObjectIdentitySnapshot &identity) {
+        if (identity.worldObjectEntry != nullptr)
+          resolvedWorldObjectEntry = identity.worldObjectEntry;
+        if (identity.sceneNode != nullptr)
+          elementSceneNode = identity.sceneNode;
+        if (identity.unitPtr != nullptr)
+          unitPtr = identity.unitPtr;
+        if (identity.rawcode != 0u)
+          resolvedRawcode = identity.rawcode;
+        if (identity.kind != ObjectKind::Unknown)
+          resolvedKind = identity.kind;
+        if (identity.jHandle != 0u) {
+          resolvedHandle = identity.jHandle;
+          handleId = identity.jHandle & 0x0FFFFFu;
+        }
+        if (identity.worldObjectEntry != nullptr)
+          ctxEntry = identity.worldObjectEntry;
+        foundInRegistry = foundInRegistry || identity.HasStableIdentity();
+      };
 
   // 当未启用对象/阴影语义追踪时，直接跳过桥接逻辑（降低 ExecBatch 开销）
   if (!isWorldGroup || (!needsObjectTracking && !needsShadowSemanticTracking)) {
@@ -249,12 +272,40 @@ ExecBatchContext ExecBatchProcessor::Begin(void *element, War3BatchTag tag,
     return ctx;
   }
 
-  void *ctxEntry = nullptr;
-
   // [RENDER CONTEXT BRIDGE] 终极方案 (TLS)
   // 设计目标：通过 WorldObjectEntry_Render 设置的 TLS 上下文直接获取 Entry，
   // 绕过 sceneNode 反查和 handle 倒推。
   // 现状：消费者路径已经在这里保留，但生产端还没有正式接线。
+  if (isWorldGroup && needsShadowSemanticTracking && element != nullptr) {
+    // semantic-only cutover still needs the lightweight render context.  Do
+    // not resolve handles here; just carry scene/world-object keys forward so
+    // model hooks and semantic manifest repair have something to join on.
+    const CurrentDrawDispatchContext dispatchContext =
+        GetCurrentDrawDispatchContext();
+    if (dispatchContext.valid &&
+        dispatchContext.renderablePart == element &&
+        dispatchContext.sceneNode != nullptr) {
+      elementSceneNode = dispatchContext.sceneNode;
+    } else {
+      SafeReadPtrFast(element, 0x14, elementSceneNode);
+    }
+  }
+
+  if (isWorldGroup && shadowSemanticOnly) {
+    RenderObjectIdentitySnapshot cachedIdentity = {};
+    if (element != nullptr &&
+        RenderQueueTracker::instance().GetCachedObjectIdentity(
+            element, cachedIdentity)) {
+      mergeIdentitySnapshot(cachedIdentity);
+    } else if (elementSceneNode != nullptr &&
+               TryResolveCurrentRenderObjectIdentity(elementSceneNode,
+                                                     cachedIdentity)) {
+      mergeIdentitySnapshot(cachedIdentity);
+    }
+    if (ctxEntry == nullptr)
+      ctxEntry = GetCurrentBatchEntry();
+  }
+
   if (isWorldGroup && !shadowSemanticOnly) {
     // [RENDER CONTEXT BRIDGE] 优先方案：从 Dispatch 层获取 TLS 句柄
     uint32_t dispatchHandle = War3RenderState::GetTlsDispatchHandle();
@@ -296,20 +347,8 @@ ExecBatchContext ExecBatchProcessor::Begin(void *element, War3BatchTag tag,
       RenderObjectIdentitySnapshot cachedIdentity = {};
       if (RenderQueueTracker::instance().GetCachedObjectIdentity(
               element, cachedIdentity)) {
-        ctxEntry = cachedIdentity.worldObjectEntry;
-        resolvedWorldObjectEntry = cachedIdentity.worldObjectEntry;
-        unitPtr = cachedIdentity.unitPtr;
-        elementSceneNode = cachedIdentity.sceneNode != nullptr
-                               ? cachedIdentity.sceneNode
-                               : elementSceneNode;
-        resolvedRawcode = cachedIdentity.rawcode;
-        resolvedKind = cachedIdentity.kind;
+        mergeIdentitySnapshot(cachedIdentity);
         foundInRegistry = true;
-
-        if (cachedIdentity.jHandle != 0) {
-          handleId = cachedIdentity.jHandle & 0x0FFFFF;
-          resolvedHandle = cachedIdentity.jHandle;
-        }
       }
 
       auto &registry = RenderObjectRegistry::instance();
@@ -478,6 +517,8 @@ ExecBatchContext ExecBatchProcessor::Begin(void *element, War3BatchTag tag,
     semanticState.tag = tag;
     semanticState.stage =
         elementStage >= 0 ? elementStage : War3RenderState::GetStage();
+    semanticState.pathBlocker =
+        dxvk::war3::internal::IsPathBlockerFourCc(semanticState.rawcode);
     War3RenderState::SetTlsShadowSemanticState(semanticState);
 
     if constexpr (dxvk::war3::internal::kNativeHookHotpathVerboseLogging) {

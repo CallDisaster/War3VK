@@ -34,7 +34,13 @@ namespace dxvk {
         Rc<DxvkImageView> colorView;
         Rc<DxvkImageView> depthView; // 预留
         War3FrameScene scene;        // 本帧捕获的世界数据（阴影/光照/后处理共享）
-        uint32_t frameIndex = 0;     // Synchronization: Ring Buffer Index for this frame
+        uint32_t frameIndex = 0;     // Synchronization: 0..2 ring-buffer slot only
+        // Monotonic D3D9 presentation-frame identity. Never use frameIndex for
+        // publication/cache freshness: its 0/1/2 aliases repeat every three
+        // frames and slot zero is a valid resource slot, not an invalid frame.
+        uint64_t frameSerial = 0;
+        uint64_t mapEpoch = 0;
+        uint64_t deviceEpoch = 0;
         const War3RenderSettings* settings = nullptr;
     };
 
@@ -70,6 +76,7 @@ namespace dxvk {
                         War3RenderState::StageCategory category,
                         War3BatchTag batchTag,
                         bool isUiBoundaryDraw);
+        bool ForceBeforeUiInsertion();
 
         void Execute(War3InsertionPoint point,
                      const Rc<DxvkCommandList>& ctx,
@@ -112,11 +119,15 @@ namespace dxvk {
         bool m_hadWorldDraw = false;
         float m_lastAutoExposure = 0.0f;
         bool m_hasAutoExposure = false;
+        uint64_t m_lightingClockRevision = 0u;
+        float m_lightingClockTime01 = 0.5f;
+        std::chrono::steady_clock::time_point m_lightingClockLastUpdate;
 
         // 旁路开关（每帧 OnFrameStart 刷新）
         bool m_wantsBeforeUiInsertion = true;
         bool m_wantsShadowCapture = true;
-        // 日夜循环状态已移动到 War3ShadowReceiverPass
+        // Direction/color consumption remains in War3ShadowReceiverPass; the
+        // render-only authored clock advances here even when shadows are off.
     };
 
 } // namespace dxvk

@@ -100,6 +100,7 @@ static bool WriteJump(void *target, void *destination) {
   ptr[0] = 0xE9; // JMP rel32
   int32_t offset = (int32_t)((uint8_t *)destination - ptr - 5);
   memcpy(ptr + 1, &offset, 4);
+  FlushInstructionCache(GetCurrentProcess(), target, 5);
 
   // 恢复内存保护
   SetMemoryProtection(target, 5, PAGE_EXECUTE_READ);
@@ -121,6 +122,7 @@ static bool WriteNop(void *address, size_t count) {
   }
 
   memset(address, 0x90, count);
+  FlushInstructionCache(GetCurrentProcess(), address, count);
 
   SetMemoryProtection(address, count, PAGE_EXECUTE_READ);
 
@@ -146,6 +148,7 @@ static bool WriteCall(void *target, void *destination) {
   ptr[0] = 0xE8; // CALL rel32
   int32_t offset = (int32_t)((uint8_t *)destination - ptr - 5);
   memcpy(ptr + 1, &offset, 4);
+  FlushInstructionCache(GetCurrentProcess(), target, 5);
 
   SetMemoryProtection(target, 5, PAGE_EXECUTE_READ);
 
@@ -622,16 +625,20 @@ extern "C" int GetInstalledHookCount() { return g_HookState.hookCount; }
 /**
  * @brief 在D3D9设备初始化时安装Hook
  */
-void InitializeNativeRendererHooks(dxvk::D3D9DeviceEx *device) {
-  // 获取Game.dll基址
-  HMODULE gameDll = GetModuleHandleA("Game.dll");
-  if (!gameDll) {
-    WAR3_LOG_ERROR("[War3Hook] Failed to get Game.dll handle\n");
-    return;
+void InitializeNativeRendererHooks(uintptr_t gameBase) {
+  void *baseAddress = reinterpret_cast<void *>(gameBase);
+  if (!baseAddress) {
+    HMODULE gameDll = GetModuleHandleA("Game.dll");
+    if (!gameDll) {
+      WAR3_LOG_ERROR("[War3Hook] Failed to get Game.dll handle\n");
+      return;
+    }
+
+    baseAddress = reinterpret_cast<void *>(gameDll);
   }
 
-  void *baseAddress = (void *)gameDll;
-  WAR3_LOG_INFO("[War3Hook] Ready to install native renderer Hooks\n");
+  WAR3_LOG_INFO("[War3Hook] Ready to install native renderer Hooks base=%p\n",
+                baseAddress);
   // 安装Hook
   int hookCount = InstallNativeRendererHooks(baseAddress);
 

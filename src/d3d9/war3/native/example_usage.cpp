@@ -97,11 +97,11 @@ struct RenderStats {
     int64_t totalTime;
     int64_t frameCount;
     int64_t unitsRendered;
-    int64_t buildingsRendered;
+    int64_t fogShadowDecalsRendered;
     int64_t effectsRendered;
     
     RenderStats() : totalTime(0), frameCount(0),
-        unitsRendered(0), buildingsRendered(0), effectsRendered(0) {}
+        unitsRendered(0), fogShadowDecalsRendered(0), effectsRendered(0) {}
 };
 
 static RenderStats g_stats;
@@ -127,7 +127,7 @@ int __thiscall Monitored_CWorld_RenderScene(CWorldFrameWar3* world) {
         printf("Frames: %lld\n", g_stats.frameCount);
         printf("Avg time: %.2f ms\n", g_stats.totalTime / 1000.0 / g_stats.frameCount);
         printf("Units: %lld\n", g_stats.unitsRendered);
-        printf("Buildings: %lld\n", g_stats.buildingsRendered);
+        printf("Fog/shadow/decals: %lld\n", g_stats.fogShadowDecalsRendered);
         printf("Effects: %lld\n", g_stats.effectsRendered);
         printf("==================\n");
     }
@@ -152,7 +152,7 @@ int __userpurge Monitored_WorldObjects_RenderGroup(
             g_stats.unitsRendered++;
             break;
         case WorldGroupIndex::Group1:
-            g_stats.buildingsRendered++;
+            g_stats.fogShadowDecalsRendered++;
             break;
         case WorldGroupIndex::Group2:
             g_stats.effectsRendered++;
@@ -238,13 +238,13 @@ struct StageFilter {
     bool skyBox;
     bool terrain;
     bool units;
-    bool buildings;
+    bool fogShadowDecals;
     bool effects;
     bool shadows;
     bool transparent;
     
     StageFilter() : skyBox(true), terrain(true), units(true),
-        buildings(true), effects(true), shadows(true), transparent(true) {}
+        fogShadowDecals(true), effects(true), shadows(true), transparent(true) {}
 };
 
 static StageFilter g_filter;
@@ -279,7 +279,7 @@ int __thiscall Filtered_RenderWorld_DispatchStage(
             if (!g_filter.units) return 0;
             break;
         case RenderStage::Stage2_TerrainShadow1:
-            if (!g_filter.buildings) return 0;
+            if (!g_filter.fogShadowDecals) return 0;
             break;
         case RenderStage::Stage8_TerrainShadow10:
             if (!g_filter.effects) return 0;

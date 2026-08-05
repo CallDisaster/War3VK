@@ -9,18 +9,59 @@
 #include "../util/util_singleton.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 
 namespace dxvk {
 
   Singleton<DxvkInstance> g_dxvkInstance;
 
+  namespace {
+
+    std::atomic<uint32_t> g_d3d9InterfaceAcquireOrdinal{0u};
+    std::atomic<uint32_t> g_d3d9InterfaceDestroyOrdinal{0u};
+    std::atomic<uint32_t> g_d3d9CreateDeviceOrdinal{0u};
+    thread_local uint32_t g_d3d9InterfaceCtorOrdinal = 0u;
+
+    void TraceD3D9Interface(const char* phase, uint32_t ordinal,
+                           const void* object = nullptr) {
+      // 仅用于启动期接口生命周期取证；固定栈缓冲，不进入渲染热路径。
+      if (ordinal == 0u || ordinal > 4u)
+        return;
+      char buffer[256] = { };
+      std::snprintf(
+        buffer, sizeof(buffer),
+        "DXVK W3START pid=%lu tid=%lu tick=%llu comp=D3D9Interface ord=%u "
+        "phase=%s object=%p hr=0x00000000\n",
+        static_cast<unsigned long>(::GetCurrentProcessId()),
+        static_cast<unsigned long>(::GetCurrentThreadId()),
+        static_cast<unsigned long long>(::GetTickCount64()), ordinal,
+        phase ? phase : "<null>", object);
+      ::OutputDebugStringA(buffer);
+    }
+
+    Rc<DxvkInstance> AcquireD3D9Instance() {
+      const uint32_t ordinal =
+        g_d3d9InterfaceAcquireOrdinal.fetch_add(1u, std::memory_order_relaxed) + 1u;
+      g_d3d9InterfaceCtorOrdinal = ordinal;
+      TraceD3D9Interface("acquire-begin", ordinal);
+      Rc<DxvkInstance> instance =
+        g_dxvkInstance.acquire(DxvkInstanceFlag::ClientApiIsD3D9);
+      TraceD3D9Interface("acquire-end", ordinal, instance.ptr());
+      return instance;
+    }
+
+  }
+
   D3D9InterfaceEx::D3D9InterfaceEx(bool bExtended, const D3D9ON12_ARGS* pOverrideList, uint32_t OverrideCount)
-    : m_instance    ( g_dxvkInstance.acquire(DxvkInstanceFlag::ClientApiIsD3D9) )
+    : m_instance    ( AcquireD3D9Instance() )
     , m_d3d8Bridge  ( this )
     , m_extended    ( bExtended ) 
     , m_d3d9Options ( nullptr, m_instance->config() )
     , m_d3d9Interop ( this )
     , m_d3d9ExtInterface( this ) {
+    const uint32_t traceOrdinal = g_d3d9InterfaceCtorOrdinal;
+    TraceD3D9Interface("ctor-body-begin", traceOrdinal, this);
     // D3D9 doesn't enumerate adapters like physical adapters...
     // only as connected displays.
 
@@ -76,11 +117,17 @@ namespace dxvk {
 
     if (unlikely(m_d3d9Options.shaderModel == 0))
       Logger::warn("D3D9InterfaceEx: WARNING! Fixed-function exclusive mode is enabled.");
+    TraceD3D9Interface("ctor-body-end", traceOrdinal, this);
+    g_d3d9InterfaceCtorOrdinal = 0u;
   }
 
 
   D3D9InterfaceEx::~D3D9InterfaceEx() {
+    const uint32_t traceOrdinal =
+      g_d3d9InterfaceDestroyOrdinal.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    TraceD3D9Interface("dtor-release-begin", traceOrdinal, this);
     g_dxvkInstance.release();
+    TraceD3D9Interface("dtor-release-end", traceOrdinal, this);
   }
 
 
@@ -363,6 +410,9 @@ namespace dxvk {
           D3DPRESENT_PARAMETERS* pPresentationParameters,
           D3DDISPLAYMODEEX*      pFullscreenDisplayMode,
           IDirect3DDevice9Ex**   ppReturnedDeviceInterface) {
+    const uint32_t traceOrdinal =
+      g_d3d9CreateDeviceOrdinal.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    TraceD3D9Interface("create-device-entry", traceOrdinal, this);
     InitReturnPtr(ppReturnedDeviceInterface);
 
     if (unlikely(ppReturnedDeviceInterface  == nullptr
@@ -405,8 +455,11 @@ namespace dxvk {
     auto dxvkAdapter = adapter->GetDXVKAdapter();
 
     try {
+      TraceD3D9Interface("create-dxvk-device-begin", traceOrdinal, this);
       auto dxvkDevice = dxvkAdapter->createDevice();
+      TraceD3D9Interface("create-dxvk-device-end", traceOrdinal, dxvkDevice.ptr());
 
+      TraceD3D9Interface("device-ctor-begin", traceOrdinal, this);
       auto* device = new D3D9DeviceEx(
         this,
         adapter,
@@ -414,22 +467,34 @@ namespace dxvk {
         hFocusWindow,
         BehaviorFlags,
         dxvkDevice);
+      TraceD3D9Interface("device-ctor-end", traceOrdinal, device);
 
+      TraceD3D9Interface("initial-reset-begin", traceOrdinal, device);
       hr = device->InitialReset(pPresentationParameters, pFullscreenDisplayMode);
+      TraceD3D9Interface("initial-reset-end", traceOrdinal, device);
 
-      if (unlikely(FAILED(hr)))
+      if (unlikely(FAILED(hr))) {
+        // D3D9DeviceEx 是 refCount==0 构造的 ComObject，此失败路径上尚未被任何
+        // ref()/Com<> 持有；InitialReset 失败（交换链创建/显存不足等）若直接
+        // return 会连同其 Rc<DxvkDevice>、adapter 引用整体泄漏。上游用
+        // Com<D3D9DeviceEx> RAII 持有，本改写版丢了 RAII，这里显式补 delete。
+        delete device;
         return hr;
+      }
 
       *ppReturnedDeviceInterface = ref(device);
       
       // Install War3 Hooks immediately after device creation
+      TraceD3D9Interface("install-hooks-begin", traceOrdinal, device);
       War3Hook::InstallHooks(device);
+      TraceD3D9Interface("install-hooks-end", traceOrdinal, device);
     }
     catch (const DxvkError& e) {
       Logger::err(e.message());
       return D3DERR_NOTAVAILABLE;
     }
 
+    TraceD3D9Interface("create-device-return", traceOrdinal, this);
     return D3D_OK;
   }
 
@@ -445,15 +510,18 @@ namespace dxvk {
   HRESULT D3D9InterfaceEx::ValidatePresentationParametersEx(
     const D3DPRESENT_PARAMETERS* pPresentationParameters,
     const D3DDISPLAYMODEEX*      pFullscreenDisplayMode) {
+    // 空指针检查必须先于下方对 pPresentationParameters 的任何解引用。ResetEx
+    // 直接把应用层传入的指针转发到这里；原顺序先解引用 ->Windowed，把这条判空
+    // 变成永不可达的死代码，导致 NULL 实参直接崩溃而非返回 D3DERR_INVALIDCALL。
+    if (unlikely(pPresentationParameters == nullptr))
+      return D3DERR_INVALIDCALL;
+
     // pFullscreenDisplayMode must not be NULL in full screen mode.
     if (unlikely(!pPresentationParameters->Windowed && pFullscreenDisplayMode == nullptr))
       return D3DERR_INVALIDCALL;
 
     // pFullscreenDisplayMode must be NULL in windowed mode.
     if (unlikely(pPresentationParameters->Windowed && pFullscreenDisplayMode != nullptr))
-      return D3DERR_INVALIDCALL;
-
-    if (unlikely(pPresentationParameters == nullptr))
       return D3DERR_INVALIDCALL;
 
     // On extended devices, the backbuffer dimensions

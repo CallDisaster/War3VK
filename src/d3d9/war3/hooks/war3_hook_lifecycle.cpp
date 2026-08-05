@@ -1,6 +1,7 @@
 #include "war3_hook_lifecycle.h"
 #include "war3_hook_address_book.h"
 #include "war3_hook_install_util.h"
+#include "war3_hook_perf.h"
 #include "war3_hook_render.h"
 #include "../../d3d9_war3_hook.h"
 #include "../../d3d9_war3_debug.h"
@@ -21,6 +22,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -40,6 +42,51 @@ namespace dxvk::war3::hooks {
 // - FlushAndReset：帧尾收口、可选空队列跳过、状态复位；
 // - GetD3d9Parameters：覆盖 PresentInterval 以解除帧率限制。
 // ---------------------------------------------------------------------------
+
+static bool EnvFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (!value || !*value)
+    return false;
+  if (value[0] == '0')
+    return false;
+  if ((value[0] == 'f' || value[0] == 'F') &&
+      (value[1] == 'a' || value[1] == 'A'))
+    return false;
+  if ((value[0] == 'n' || value[0] == 'N') &&
+      (value[1] == 'o' || value[1] == 'O'))
+    return false;
+  return true;
+}
+
+thread_local bool s_internalTestGamePauseBypass = false;
+
+static bool ShouldBlockGamePauseForAutoTest() {
+  if (s_internalTestGamePauseBypass)
+    return false;
+  if constexpr (dxvk::war3::internal::kAutoTestDisableGamePause)
+    return true;
+  static const bool s_runtimeEnabled =
+      EnvFlagEnabled("DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE");
+  return s_runtimeEnabled;
+}
+
+// 1.27a IDA 证据：Storm 的窗口过程在 WM_ACTIVATEAPP 失焦时将 active=0，
+// Storm_EventLoop_PeekMessage 随后唯一调用 Game.dll+0x1552E0 取得 idle
+// Sleep 毫秒数。这里只关闭该精确后台分支，不 Hook 全局 Sleep，也不改变
+// SetThreadPriority/SetPriorityClass 或地图的 PauseGame 语义。
+static bool ShouldDisableBackgroundIdleSleepForAutoTest() {
+  if constexpr (dxvk::war3::internal::kAutoTestDisableBackgroundIdleSleep)
+    return true;
+  static const bool s_runtimeEnabled =
+      EnvFlagEnabled("DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE");
+  return s_runtimeEnabled;
+}
+
+bool SetInternalTestGamePauseBypassForCurrentThread(bool enabled) {
+  const bool previous = s_internalTestGamePauseBypass;
+  s_internalTestGamePauseBypass = enabled;
+  return previous;
+}
 
 using MainRunnerFn = int(__fastcall *)(void *, void *);
 using MainRunnerAltFn = int(__fastcall *)(void *, void *);
@@ -65,6 +112,7 @@ using EngineFinalizeWorkerFn = int(__fastcall *)(int, int);
 using EngineComputeWakeDeltaFn = int(__fastcall *)(int, int);
 using EngineSleepGateFn = void(__thiscall *)(uint32_t *, DWORD);
 using EngineSleepGateInnerFn = void(__thiscall *)(uint32_t *, DWORD);
+using BackgroundIdleSleepMsFn = DWORD(__cdecl *)();
 using GamePauseFn =
     void(__fastcall *)(void *, void *, BOOL, uint32_t, uint32_t, uint32_t,
                        uint32_t);
@@ -96,10 +144,8 @@ static MainRunnerFn g_trampolineMainRunner = nullptr;
 static MainRunnerAltFn g_originalMainRunnerAlt = nullptr;
 static MainRunnerAltFn g_trampolineMainRunnerAlt = nullptr;
 
-static GetD3d9ParametersFn g_originalGetD3d9Parameters = nullptr;
 static GetD3d9ParametersFn g_trampolineGetD3d9Parameters =
-    nullptr; // Not hooked with MinHook traditionally in original, but keeping
-             // structure
+    nullptr; // MinHook 返回的原函数入口；Hook 内绝不能回调已被覆盖的目标地址。
 
 static FlushAndResetFn g_originalFlushAndReset = nullptr;
 static FlushAndResetFn g_trampolineFlushAndReset = nullptr;
@@ -157,6 +203,10 @@ static EngineSleepGateFn g_trampolineEngineSleepGate = nullptr;
 
 static EngineSleepGateInnerFn g_originalEngineSleepGateInner = nullptr;
 static EngineSleepGateInnerFn g_trampolineEngineSleepGateInner = nullptr;
+
+static BackgroundIdleSleepMsFn g_originalBackgroundIdleSleepMs = nullptr;
+static BackgroundIdleSleepMsFn g_trampolineBackgroundIdleSleepMs = nullptr;
+static std::atomic<bool> g_backgroundIdleSleepBypassLogged = false;
 
 static GamePauseFn g_originalGamePause = nullptr;
 static GamePauseFn g_trampolineGamePause = nullptr;
@@ -472,6 +522,15 @@ struct MainLoopCycleSample {
 static thread_local MainLoopCycleSample t_mainLoopCycle;
 static thread_local bool t_waitGateCycleReady = false;
 static thread_local PerfClock::time_point t_waitGateLastEnd{};
+// Present -> WorldFrame -> 下一次 Present 的跨函数包络不能占用 PerfMonitor
+// 的 TLS scope 栈：Present 本身可能位于 EventMainCallback/NativeOriginal
+// 等 RAII scope 内，跨函数 push/pop 会破坏严格 LIFO。这里只保存 detached
+// QPC 边界；每段结束时一次性回填 phase-wall interval，不伪造其内部
+// 节点的父子关系。MarkWorldFrameThread 当前由 Prepare 和 RenderScene 入口
+// 各调用一次，因此无需新增任何 per-draw Hook 即可得到三段帧级窗口。
+static std::atomic<int64_t> g_preWorldLogicPerfBeginTicks{0};
+static std::atomic<int64_t> g_framePipelineLastBoundaryTicks{0};
+static std::atomic<uint32_t> g_framePipelineWorldBoundaryCount{0};
 
 static inline size_t CyclePhaseIndex(MainLoopCyclePhase phase) {
   return static_cast<size_t>(phase);
@@ -1142,7 +1201,8 @@ static inline bool ShouldCollectMainLoopPerfSamples() {
   // 性能优先：仅在 PerfMonitor 处于“启用+录制”时进入高成本计时路径。
   // 避免日常游玩/压测时被大量诊断 Hook 放大开销。
   auto &perf = war3::War3PerfMonitor::instance();
-  return perf.isEnabled() && perf.isRecording();
+  return dxvk::war3::internal::War3PerfHookLevel() >= 1 &&
+         perf.isEnabled() && perf.isRecording();
 }
 
 static inline uint64_t DurationUs(PerfClock::time_point begin,
@@ -1816,8 +1876,10 @@ static void InstallMainThreadWaitHooks() {
  */
 static inline war3::War3PerfMonitor::ScopedCpuScope
 MakeLifecycleCpuScope(const char *name) {
-  if constexpr (dxvk::war3::internal::kNativeOptimizationPerfTrackingEnabled) {
-    return war3::War3PerfMonitor::instance().cpuScope(name);
+  // FlushAndReset 为每帧一次的低频路径：帧级计时常开（PERF_LEVEL>=1）。
+  if constexpr (dxvk::war3::internal::kNativePerfFrameHookTimingEnabled) {
+    if (dxvk::war3::internal::War3PerfHookLevel() >= 1)
+      return war3::War3PerfMonitor::instance().cpuScope(name);
   }
   return {};
 }
@@ -1875,8 +1937,8 @@ DWORD __fastcall Hook_GetD3d9Parameters(void *thisPtr, void *edx,
   // 先走原函数填充参数，再覆盖 PresentationInterval，避免破坏其他字段。
   static bool s_loggedOnce = false;
   DWORD result = 0;
-  if (g_originalGetD3d9Parameters)
-    result = g_originalGetD3d9Parameters(thisPtr, edx, params);
+  if (g_trampolineGetD3d9Parameters)
+    result = g_trampolineGetD3d9Parameters(thisPtr, edx, params);
   if (params) {
     if (params->Windowed) {
       UINT width = params->BackBufferWidth;
@@ -1924,10 +1986,15 @@ int __cdecl Hook_EventMainCallback() {
 
   const auto begin = PerfClock::now();
   int result = 1;
-  if (g_trampolineEventMainCallback) {
-    result = g_trampolineEventMainCallback();
-  } else if (g_originalEventMainCallback) {
-    result = g_originalEventMainCallback();
+  {
+    auto nativeScope =
+        war3::War3PerfMonitor::instance().cpuScope("NativeOriginal");
+    War3HotHookBoundaryScope nativeHotHooks;
+    if (g_trampolineEventMainCallback) {
+      result = g_trampolineEventMainCallback();
+    } else if (g_originalEventMainCallback) {
+      result = g_originalEventMainCallback();
+    }
   }
   const auto end = PerfClock::now();
   const uint64_t deltaUs = DurationUs(begin, end);
@@ -1961,10 +2028,15 @@ int __fastcall Hook_EventMessagePump(int a1, int a2) {
 
   const auto begin = PerfClock::now();
   int result = 0;
-  if (g_trampolineEventMessagePump) {
-    result = g_trampolineEventMessagePump(a1, a2);
-  } else if (g_originalEventMessagePump) {
-    result = g_originalEventMessagePump(a1, a2);
+  {
+    auto nativeScope =
+        war3::War3PerfMonitor::instance().cpuScope("NativeOriginal");
+    War3HotHookBoundaryScope nativeHotHooks;
+    if (g_trampolineEventMessagePump) {
+      result = g_trampolineEventMessagePump(a1, a2);
+    } else if (g_originalEventMessagePump) {
+      result = g_originalEventMessagePump(a1, a2);
+    }
   }
   const auto end = PerfClock::now();
   const uint64_t deltaUs = DurationUs(begin, end);
@@ -1987,21 +2059,22 @@ int __fastcall Hook_EventMessagePump(int a1, int a2) {
 void __fastcall Hook_EventDispatch(int a1, int a2, void *a3, void *a4) {
   // 事件分发点：细分 MainLoop 消耗来源（系统/输入/游戏/回调）。
   MarkMainLoopThread();
-  if (!ShouldCollectMainLoopPerfSamples()) {
+  War3HotHookCallTiming hookTiming(War3HotHookId::EventDispatch, 4u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
     if (g_trampolineEventDispatch) {
       g_trampolineEventDispatch(a1, a2, a3, a4);
     } else if (g_originalEventDispatch) {
       g_originalEventDispatch(a1, a2, a3, a4);
     }
+  };
+  if (!ShouldCollectMainLoopPerfSamples()) {
+    callNativeOriginal();
     return;
   }
 
   const auto begin = PerfClock::now();
-  if (g_trampolineEventDispatch) {
-    g_trampolineEventDispatch(a1, a2, a3, a4);
-  } else if (g_originalEventDispatch) {
-    g_originalEventDispatch(a1, a2, a3, a4);
-  }
+  callNativeOriginal();
   const auto end = PerfClock::now();
   const uint64_t deltaUs = DurationUs(begin, end);
 
@@ -2017,24 +2090,30 @@ void __fastcall Hook_EventDispatch(int a1, int a2, void *a3, void *a4) {
 
 int __fastcall Hook_EngineTlsPump(int a1, int a2) {
   // 引擎线程 TLS 消息泵包装：用于定位 EventPump 之外的主循环时间。
+  // 固定 ID 树是 PERF_LEVEL=2 的 Hook/Native/observer 分账；下面既有的
+  // MainLoop/Engine 聚合仍供 stageSeries 使用。两者是同一区间的不同视图，
+  // 报告分析时不可相加。
   MarkMainLoopThread();
-  if (!ShouldCollectMainLoopPerfSamples()) {
-    if (g_trampolineEngineTlsPump)
-      return g_trampolineEngineTlsPump(a1, a2);
-    if (g_originalEngineTlsPump)
-      return g_originalEngineTlsPump(a1, a2);
+  const auto targetFn =
+      g_trampolineEngineTlsPump ? g_trampolineEngineTlsPump
+                                : g_originalEngineTlsPump;
+  if (!targetFn)
     return 0;
+  if (!ShouldCollectMainLoopPerfSamples()) {
+    return targetFn(a1, a2);
   }
 
   auto perfScope =
       war3::War3PerfMonitor::instance().cpuScope("War3MainLoop/Engine/TlsPump");
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EngineTlsPump, 8u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(a1, a2);
+  };
 
   const auto begin = PerfClock::now();
-  int result = 0;
-  if (g_trampolineEngineTlsPump)
-    result = g_trampolineEngineTlsPump(a1, a2);
-  else if (g_originalEngineTlsPump)
-    result = g_originalEngineTlsPump(a1, a2);
+  const int result = callNativeOriginal();
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineTlsPump,
                               DurationUs(begin, end));
@@ -2044,23 +2123,26 @@ int __fastcall Hook_EngineTlsPump(int a1, int a2) {
 int __fastcall Hook_EngineSelectWorker(int a1, int a2) {
   // 从调度队列选择当前 worker/context。
   MarkMainLoopThread();
-  if (!ShouldCollectMainLoopPerfSamples()) {
-    if (g_trampolineEngineSelectWorker)
-      return g_trampolineEngineSelectWorker(a1, a2);
-    if (g_originalEngineSelectWorker)
-      return g_originalEngineSelectWorker(a1, a2);
+  const auto targetFn =
+      g_trampolineEngineSelectWorker ? g_trampolineEngineSelectWorker
+                                     : g_originalEngineSelectWorker;
+  if (!targetFn)
     return 0;
+  if (!ShouldCollectMainLoopPerfSamples()) {
+    return targetFn(a1, a2);
   }
 
   auto perfScope = war3::War3PerfMonitor::instance().cpuScope(
       "War3MainLoop/Engine/SelectWorker");
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EngineSelectWorker, 8u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(a1, a2);
+  };
 
   const auto begin = PerfClock::now();
-  int result = 0;
-  if (g_trampolineEngineSelectWorker)
-    result = g_trampolineEngineSelectWorker(a1, a2);
-  else if (g_originalEngineSelectWorker)
-    result = g_originalEngineSelectWorker(a1, a2);
+  const int result = callNativeOriginal();
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineSelectWorker,
                               DurationUs(begin, end));
@@ -2080,13 +2162,19 @@ int __fastcall Hook_EngineRunCallbacks(int thisPtr, void *edx) {
     return targetFn(thisPtr);
   }
 
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EngineRunCallbacks, 4u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(thisPtr);
+  };
   uintptr_t callerPc = 0;
   if constexpr (
       dxvk::war3::internal::kNativeMainLoopRunCallbacksCallerBreakdownEnabled) {
     callerPc = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
   }
   const auto begin = PerfClock::now();
-  const int result = targetFn(thisPtr);
+  const int result = callNativeOriginal();
   const auto end = PerfClock::now();
   const uint64_t deltaUs = DurationUs(begin, end);
 
@@ -2101,23 +2189,26 @@ int __fastcall Hook_EngineRunCallbacks(int thisPtr, void *edx) {
 int __fastcall Hook_EngineQueueFlush(int thisPtr, void *edx) {
   // 清空并执行 deferred 队列块（LoadResourceBlock stage 触发点）。
   MarkMainLoopThread();
-  if (!ShouldCollectMainLoopPerfSamples()) {
-    if (g_trampolineEngineQueueFlush)
-      return g_trampolineEngineQueueFlush(thisPtr);
-    if (g_originalEngineQueueFlush)
-      return g_originalEngineQueueFlush(thisPtr);
+  const auto targetFn =
+      g_trampolineEngineQueueFlush ? g_trampolineEngineQueueFlush
+                                   : g_originalEngineQueueFlush;
+  if (!targetFn)
     return 0;
+  if (!ShouldCollectMainLoopPerfSamples()) {
+    return targetFn(thisPtr);
   }
 
   auto perfScope =
       war3::War3PerfMonitor::instance().cpuScope("War3MainLoop/Engine/QueueFlush");
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EngineQueueFlush, 4u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(thisPtr);
+  };
 
   const auto begin = PerfClock::now();
-  int result = 0;
-  if (g_trampolineEngineQueueFlush)
-    result = g_trampolineEngineQueueFlush(thisPtr);
-  else if (g_originalEngineQueueFlush)
-    result = g_originalEngineQueueFlush(thisPtr);
+  const int result = callNativeOriginal();
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineQueueFlush,
                               DurationUs(begin, end));
@@ -2127,23 +2218,26 @@ int __fastcall Hook_EngineQueueFlush(int thisPtr, void *edx) {
 int __fastcall Hook_EngineFinalizeTick(int thisPtr, void *edx) {
   // Tick 结束收口（状态机阶段 3/4 + 虚函数提交）。
   MarkMainLoopThread();
-  if (!ShouldCollectMainLoopPerfSamples()) {
-    if (g_trampolineEngineFinalizeTick)
-      return g_trampolineEngineFinalizeTick(thisPtr);
-    if (g_originalEngineFinalizeTick)
-      return g_originalEngineFinalizeTick(thisPtr);
+  const auto targetFn =
+      g_trampolineEngineFinalizeTick ? g_trampolineEngineFinalizeTick
+                                     : g_originalEngineFinalizeTick;
+  if (!targetFn)
     return 0;
+  if (!ShouldCollectMainLoopPerfSamples()) {
+    return targetFn(thisPtr);
   }
 
   auto perfScope = war3::War3PerfMonitor::instance().cpuScope(
       "War3MainLoop/Engine/FinalizeTick");
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EngineFinalizeTick, 4u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(thisPtr);
+  };
 
   const auto begin = PerfClock::now();
-  int result = 0;
-  if (g_trampolineEngineFinalizeTick)
-    result = g_trampolineEngineFinalizeTick(thisPtr);
-  else if (g_originalEngineFinalizeTick)
-    result = g_originalEngineFinalizeTick(thisPtr);
+  const int result = callNativeOriginal();
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineFinalizeTick,
                               DurationUs(begin, end));
@@ -2154,23 +2248,26 @@ int __fastcall Hook_EngineReschedule(uint32_t engineIndex, uint32_t *ctx, int la
                                      uint32_t wakeAt) {
   // 任务重排/迁移：决定下一次 wake 时间与 lane 分配。
   MarkMainLoopThread();
-  if (!ShouldCollectMainLoopPerfSamples()) {
-    if (g_trampolineEngineReschedule)
-      return g_trampolineEngineReschedule(engineIndex, ctx, lane, wakeAt);
-    if (g_originalEngineReschedule)
-      return g_originalEngineReschedule(engineIndex, ctx, lane, wakeAt);
+  const auto targetFn =
+      g_trampolineEngineReschedule ? g_trampolineEngineReschedule
+                                   : g_originalEngineReschedule;
+  if (!targetFn)
     return 0;
+  if (!ShouldCollectMainLoopPerfSamples()) {
+    return targetFn(engineIndex, ctx, lane, wakeAt);
   }
 
   auto perfScope = war3::War3PerfMonitor::instance().cpuScope(
       "War3MainLoop/Engine/Reschedule");
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EngineReschedule, 8u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(engineIndex, ctx, lane, wakeAt);
+  };
 
   const auto begin = PerfClock::now();
-  int result = 0;
-  if (g_trampolineEngineReschedule)
-    result = g_trampolineEngineReschedule(engineIndex, ctx, lane, wakeAt);
-  else if (g_originalEngineReschedule)
-    result = g_originalEngineReschedule(engineIndex, ctx, lane, wakeAt);
+  const int result = callNativeOriginal();
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineReschedule,
                               DurationUs(begin, end));
@@ -2193,10 +2290,14 @@ int __fastcall Hook_EnginePrepareWait(int laneIndex, int workerCtx) {
 
   const auto begin = PerfClock::now();
   int result = 0;
-  if (g_trampolineEnginePrepareWait)
-    result = g_trampolineEnginePrepareWait(laneIndex, workerCtx);
-  else if (g_originalEnginePrepareWait)
-    result = g_originalEnginePrepareWait(laneIndex, workerCtx);
+  {
+    auto nativeScope =
+        war3::War3PerfMonitor::instance().cpuScope("NativeOriginal");
+    if (g_trampolineEnginePrepareWait)
+      result = g_trampolineEnginePrepareWait(laneIndex, workerCtx);
+    else if (g_originalEnginePrepareWait)
+      result = g_originalEnginePrepareWait(laneIndex, workerCtx);
+  }
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EnginePrepareWait,
                               DurationUs(begin, end));
@@ -2216,8 +2317,14 @@ int __fastcall Hook_EnginePrepareDispatch(int thisPtr, void *edx) {
     return targetFn(thisPtr);
   }
 
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EnginePrepareDispatch, 8u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(thisPtr);
+  };
   const auto begin = PerfClock::now();
-  const int result = targetFn(thisPtr);
+  const int result = callNativeOriginal();
   const auto end = PerfClock::now();
   const uint64_t deltaUs = DurationUs(begin, end);
 
@@ -2228,23 +2335,26 @@ int __fastcall Hook_EnginePrepareDispatch(int thisPtr, void *edx) {
 int __fastcall Hook_EngineFinalizeDispatch(int thisPtr, void *edx) {
   // Dispatch 后收口（sub_6F05FD10）。
   MarkMainLoopThread();
-  if (!ShouldCollectMainLoopPerfSamples()) {
-    if (g_trampolineEngineFinalizeDispatch)
-      return g_trampolineEngineFinalizeDispatch(thisPtr);
-    if (g_originalEngineFinalizeDispatch)
-      return g_originalEngineFinalizeDispatch(thisPtr);
+  const auto targetFn =
+      g_trampolineEngineFinalizeDispatch ? g_trampolineEngineFinalizeDispatch
+                                         : g_originalEngineFinalizeDispatch;
+  if (!targetFn)
     return 0;
+  if (!ShouldCollectMainLoopPerfSamples()) {
+    return targetFn(thisPtr);
   }
 
   auto perfScope = war3::War3PerfMonitor::instance().cpuScope(
       "War3MainLoop/Engine/FinalizeDispatch");
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EngineFinalizeDispatch, 8u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(thisPtr);
+  };
 
   const auto begin = PerfClock::now();
-  int result = 0;
-  if (g_trampolineEngineFinalizeDispatch)
-    result = g_trampolineEngineFinalizeDispatch(thisPtr);
-  else if (g_originalEngineFinalizeDispatch)
-    result = g_originalEngineFinalizeDispatch(thisPtr);
+  const int result = callNativeOriginal();
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineFinalizeDispatch,
                               DurationUs(begin, end));
@@ -2265,6 +2375,12 @@ int __fastcall Hook_EngineTickUpdate(int thisPtr, void *edx) {
     return result;
   }
 
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EngineTickUpdate, 4u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(thisPtr);
+  };
   uint64_t preDispatchUs = 0;
   uint64_t preCallbackUs = 0;
   uint64_t preRunCallbacksUs = 0;
@@ -2298,7 +2414,7 @@ int __fastcall Hook_EngineTickUpdate(int thisPtr, void *edx) {
   }
 
   const auto begin = PerfClock::now();
-  const int result = targetFn(thisPtr);
+  const int result = callNativeOriginal();
   dxvk::war3::tools::ProcessPendingInternalTestRequest();
   const auto end = PerfClock::now();
   const uint64_t deltaUs = DurationUs(begin, end);
@@ -2403,23 +2519,26 @@ int __fastcall Hook_EngineTickUpdate(int thisPtr, void *edx) {
 int __fastcall Hook_EngineFinalizeWorker(int laneIndex, int workerCtx) {
   // Worker 完结/回收路径（sub_6F05DCE0）。
   MarkMainLoopThread();
-  if (!ShouldCollectMainLoopPerfSamples()) {
-    if (g_trampolineEngineFinalizeWorker)
-      return g_trampolineEngineFinalizeWorker(laneIndex, workerCtx);
-    if (g_originalEngineFinalizeWorker)
-      return g_originalEngineFinalizeWorker(laneIndex, workerCtx);
+  const auto targetFn =
+      g_trampolineEngineFinalizeWorker ? g_trampolineEngineFinalizeWorker
+                                       : g_originalEngineFinalizeWorker;
+  if (!targetFn)
     return 0;
+  if (!ShouldCollectMainLoopPerfSamples()) {
+    return targetFn(laneIndex, workerCtx);
   }
 
   auto perfScope = war3::War3PerfMonitor::instance().cpuScope(
       "War3MainLoop/Engine/FinalizeWorker");
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EngineFinalizeWorker, 8u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(laneIndex, workerCtx);
+  };
 
   const auto begin = PerfClock::now();
-  int result = 0;
-  if (g_trampolineEngineFinalizeWorker)
-    result = g_trampolineEngineFinalizeWorker(laneIndex, workerCtx);
-  else if (g_originalEngineFinalizeWorker)
-    result = g_originalEngineFinalizeWorker(laneIndex, workerCtx);
+  const int result = callNativeOriginal();
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineFinalizeWorker,
                               DurationUs(begin, end));
@@ -2429,23 +2548,26 @@ int __fastcall Hook_EngineFinalizeWorker(int laneIndex, int workerCtx) {
 int __fastcall Hook_EngineComputeWakeDelta(int thisPtr, int tickNow) {
   // 计算下一次 wake delta（sub_6F060500）。
   MarkMainLoopThread();
-  if (!ShouldCollectMainLoopPerfSamples()) {
-    if (g_trampolineEngineComputeWakeDelta)
-      return g_trampolineEngineComputeWakeDelta(thisPtr, tickNow);
-    if (g_originalEngineComputeWakeDelta)
-      return g_originalEngineComputeWakeDelta(thisPtr, tickNow);
+  const auto targetFn =
+      g_trampolineEngineComputeWakeDelta ? g_trampolineEngineComputeWakeDelta
+                                         : g_originalEngineComputeWakeDelta;
+  if (!targetFn)
     return 0;
+  if (!ShouldCollectMainLoopPerfSamples()) {
+    return targetFn(thisPtr, tickNow);
   }
 
   auto perfScope = war3::War3PerfMonitor::instance().cpuScope(
       "War3MainLoop/Engine/ComputeWakeDelta");
+  War3HotHookRootedCallTiming hookTiming(
+      War3HotHookId::EngineComputeWakeDelta, 8u);
+  const auto callNativeOriginal = [&]() {
+    War3HotHookNativeScope nativeTiming(hookTiming);
+    return targetFn(thisPtr, tickNow);
+  };
 
   const auto begin = PerfClock::now();
-  int result = 0;
-  if (g_trampolineEngineComputeWakeDelta)
-    result = g_trampolineEngineComputeWakeDelta(thisPtr, tickNow);
-  else if (g_originalEngineComputeWakeDelta)
-    result = g_originalEngineComputeWakeDelta(thisPtr, tickNow);
+  const int result = callNativeOriginal();
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineComputeWakeDelta,
                               DurationUs(begin, end));
@@ -2468,10 +2590,14 @@ DWORD __fastcall Hook_EngineWaitGate(HANDLE *thisPtr, void *edx,
       "War3MainLoop/Engine/WaitGate");
   const auto begin = PerfClock::now();
   DWORD result = WAIT_FAILED;
-  if (g_trampolineEngineWaitGate)
-    result = g_trampolineEngineWaitGate(thisPtr, dwMilliseconds);
-  else if (g_originalEngineWaitGate)
-    result = g_originalEngineWaitGate(thisPtr, dwMilliseconds);
+  {
+    auto nativeScope =
+        war3::War3PerfMonitor::instance().cpuScope("NativeOriginal");
+    if (g_trampolineEngineWaitGate)
+      result = g_trampolineEngineWaitGate(thisPtr, dwMilliseconds);
+    else if (g_originalEngineWaitGate)
+      result = g_originalEngineWaitGate(thisPtr, dwMilliseconds);
+  }
   const auto end = PerfClock::now();
   const uint64_t waitUs = DurationUs(begin, end);
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineWaitGate, waitUs);
@@ -2487,13 +2613,14 @@ DWORD __fastcall Hook_EngineWaitGate(HANDLE *thisPtr, void *edx,
 
   const uint64_t cycleUs = activeUs + waitUs;
   if (cycleUs > 0) {
-    constexpr const char *kWaitGatePath = "War3MainLoop/Engine/WaitGate";
-    constexpr const char *kWaitGateCyclePath =
-        "War3MainLoop/Engine/WaitGate/Cycle";
+    // EngineCycle 跨越“上一次 WaitGate 返回 → 本次 WaitGate 进入”。它与
+    // Present frame 没有一一对应关系，绝不能挂在 WaitGate scope 下参与
+    // inclusive/self、帧覆盖率或热点排名；报告把它作为独立 clock domain。
+    constexpr const char *kEngineCyclePath = "EngineCycle";
     war3::War3PerfMonitor &perf = war3::War3PerfMonitor::instance();
-    perf.addCpuSample("Cycle", UsToMs(cycleUs), kWaitGatePath, 1);
-    perf.addCpuSample("Active", UsToMs(activeUs), kWaitGateCyclePath, 1);
-    perf.addCpuSample("Idle", UsToMs(waitUs), kWaitGateCyclePath, 1);
+    perf.addCpuSample("EngineCycle", UsToMs(cycleUs), nullptr, 1);
+    perf.addCpuSample("Active", UsToMs(activeUs), kEngineCyclePath, 1);
+    perf.addCpuSample("Idle", UsToMs(waitUs), kEngineCyclePath, 1);
   }
   return result;
 }
@@ -2514,10 +2641,14 @@ void __fastcall Hook_EngineSleepGate(uint32_t *thisPtr, void *edx,
   auto perfScope = war3::War3PerfMonitor::instance().cpuScope(
       "War3MainLoop/Engine/SleepGate");
   const auto begin = PerfClock::now();
-  if (g_trampolineEngineSleepGate) {
-    g_trampolineEngineSleepGate(thisPtr, dwMilliseconds);
-  } else if (g_originalEngineSleepGate) {
-    g_originalEngineSleepGate(thisPtr, dwMilliseconds);
+  {
+    auto nativeScope =
+        war3::War3PerfMonitor::instance().cpuScope("NativeOriginal");
+    if (g_trampolineEngineSleepGate) {
+      g_trampolineEngineSleepGate(thisPtr, dwMilliseconds);
+    } else if (g_originalEngineSleepGate) {
+      g_originalEngineSleepGate(thisPtr, dwMilliseconds);
+    }
   }
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineSleepGate,
@@ -2540,10 +2671,14 @@ void __fastcall Hook_EngineSleepGateInner(uint32_t *thisPtr, void *edx,
   auto perfScope = war3::War3PerfMonitor::instance().cpuScope(
       "War3MainLoop/Engine/SleepGateInner");
   const auto begin = PerfClock::now();
-  if (g_trampolineEngineSleepGateInner) {
-    g_trampolineEngineSleepGateInner(thisPtr, dwMilliseconds);
-  } else if (g_originalEngineSleepGateInner) {
-    g_originalEngineSleepGateInner(thisPtr, dwMilliseconds);
+  {
+    auto nativeScope =
+        war3::War3PerfMonitor::instance().cpuScope("NativeOriginal");
+    if (g_trampolineEngineSleepGateInner) {
+      g_trampolineEngineSleepGateInner(thisPtr, dwMilliseconds);
+    } else if (g_originalEngineSleepGateInner) {
+      g_originalEngineSleepGateInner(thisPtr, dwMilliseconds);
+    }
   }
   const auto end = PerfClock::now();
   AddMainLoopCyclePhaseSample(MainLoopCyclePhase::EngineSleepGateInner,
@@ -2553,11 +2688,9 @@ void __fastcall Hook_EngineSleepGateInner(uint32_t *thisPtr, void *edx,
 void __fastcall Hook_GamePause(void *gameUi, void *edx, BOOL isPause,
                                uint32_t a2, uint32_t a3, uint32_t a4,
                                uint32_t a5) {
-  if constexpr (dxvk::war3::internal::kAutoTestDisableGamePause) {
-    if (isPause) {
-      Logger::info("DXVK War3Hook[Lifecycle]: blocked GamePause request");
-      return;
-    }
+  if (ShouldBlockGamePauseForAutoTest() && isPause) {
+    Logger::info("DXVK War3Hook[Lifecycle]: blocked GamePause request");
+    return;
   }
 
   if (g_trampolineGamePause) {
@@ -2565,6 +2698,26 @@ void __fastcall Hook_GamePause(void *gameUi, void *edx, BOOL isPause,
   } else if (g_originalGamePause) {
     g_originalGamePause(gameUi, edx, isPause, a2, a3, a4, a5);
   }
+}
+
+DWORD __cdecl Hook_BackgroundIdleSleepMs() {
+  const auto targetFn = g_trampolineBackgroundIdleSleepMs
+                            ? g_trampolineBackgroundIdleSleepMs
+                            : g_originalBackgroundIdleSleepMs;
+  if (!targetFn)
+    return 0u;
+
+  const DWORD nativeSleepMs = targetFn();
+  if (nativeSleepMs == 0u || !ShouldDisableBackgroundIdleSleepForAutoTest())
+    return nativeSleepMs;
+
+  if (!g_backgroundIdleSleepBypassLogged.exchange(true,
+                                                  std::memory_order_relaxed)) {
+    Logger::info(
+        "DXVK War3Hook[Lifecycle]: bypassed WM_ACTIVATEAPP background idle "
+        "sleep for AutoTest");
+  }
+  return 0u;
 }
 
 int __cdecl Hook_FlushAndReset() {
@@ -2610,10 +2763,14 @@ int __cdecl Hook_FlushAndReset() {
   if (!skipOriginalFlush) {
     // 优先调用 trampoline 保持 Hook 链完整，original 作为兜底。
     if (g_trampolineFlushAndReset) {
-      auto origScope = MakeLifecycleCpuScope("Hook_FlushAndReset/Orig");
+      auto origScope =
+          MakeLifecycleCpuScope("Hook_FlushAndReset/NativeOriginal");
+      War3HotHookBoundaryScope nativeHotHooks;
       result = g_trampolineFlushAndReset();
     } else if (g_originalFlushAndReset) {
-      auto origScope = MakeLifecycleCpuScope("Hook_FlushAndReset/Orig");
+      auto origScope =
+          MakeLifecycleCpuScope("Hook_FlushAndReset/NativeOriginal");
+      War3HotHookBoundaryScope nativeHotHooks;
       result = g_originalFlushAndReset();
     }
   } else {
@@ -2669,6 +2826,7 @@ void War3HookLifecycle::Install(uintptr_t gameBase) {
   LPVOID engineSleepGateAddr = resolveCode(book.engineSleepGate);
   LPVOID engineSleepGateInnerAddr = resolveCode(book.engineSleepGateInner);
   LPVOID gamePauseAddr = resolveCode(book.gamePause);
+  LPVOID backgroundIdleSleepMsAddr = resolveCode(book.backgroundIdleSleepMs);
   LPVOID flushResetAddr = resolveCode(book.flushAndReset);
   // GetD3d9Parameters is hooked via direct memory patch elsewhere typically,
   // but MinHooking it is safer
@@ -2714,9 +2872,9 @@ void War3HookLifecycle::Install(uintptr_t gameBase) {
   g_originalEngineSleepGateInner =
       reinterpret_cast<EngineSleepGateInnerFn>(engineSleepGateInnerAddr);
   g_originalGamePause = reinterpret_cast<GamePauseFn>(gamePauseAddr);
+  g_originalBackgroundIdleSleepMs =
+      reinterpret_cast<BackgroundIdleSleepMsFn>(backgroundIdleSleepMsAddr);
   g_originalFlushAndReset = reinterpret_cast<FlushAndResetFn>(flushResetAddr);
-  g_originalGetD3d9Parameters =
-      reinterpret_cast<GetD3d9ParametersFn>(getD3d9ParametersAddr);
   g_windowMessageTargetLookup =
       reinterpret_cast<WindowMessageTargetLookupFn>(windowMessageTargetLookupAddr);
   g_windowSizeLParamStateAddr.store(
@@ -2731,6 +2889,13 @@ void War3HookLifecycle::Install(uintptr_t gameBase) {
                  reinterpret_cast<LPVOID>(&Hook_MainRunner_Alt),
                  reinterpret_cast<LPVOID *>(&g_trampolineMainRunnerAlt),
                  "Lifecycle", "MainRunner_Alt", false, false);
+  // 启动最小化二分只保留运行时激活所需入口；其余 lifecycle hooks
+  // 全部延后，避免把事件泵、等待闸门或参数覆盖误归因给图形初始化。
+  if (EnvFlagEnabled("DXVK_WAR3_BOOTSTRAP_MINIMAL")) {
+    war3dbg::Print(
+        "DXVK War3Hook[Lifecycle]: 启动最小化二分，仅保留 MainRunner 入口\n");
+    return;
+  }
   InstallMinHook(eventMainCallbackAddr,
                  reinterpret_cast<LPVOID>(&Hook_EventMainCallback),
                  reinterpret_cast<LPVOID *>(&g_trampolineEventMainCallback),
@@ -2742,7 +2907,35 @@ void War3HookLifecycle::Install(uintptr_t gameBase) {
   InstallMinHook(eventDispatchAddr, reinterpret_cast<LPVOID>(&Hook_EventDispatch),
                  reinterpret_cast<LPVOID *>(&g_trampolineEventDispatch),
                  "Lifecycle", "EventDispatch", false, false);
-  if constexpr (dxvk::war3::internal::kNativeMainLoopDeepPhaseHookEnabled) {
+  // Phase D：WaitGate/SleepGate 是 Idle 主闸门。
+  // 默认用 kNativeMainLoopWaitGateHookEnabled（轻量），不必开 WaitHook 全套 API
+  // 也不必开 DeepPhase。
+  if constexpr (dxvk::war3::internal::kNativeMainLoopWaitGateHookEnabled ||
+                dxvk::war3::internal::kNativeMainThreadWaitHookEnabled ||
+                dxvk::war3::internal::kNativeMainLoopDeepPhaseHookEnabled) {
+    InstallMinHook(enginePrepareWaitAddr,
+                   reinterpret_cast<LPVOID>(&Hook_EnginePrepareWait),
+                   reinterpret_cast<LPVOID *>(&g_trampolineEnginePrepareWait),
+                   "Lifecycle", "EnginePrepareWait", false, false);
+    InstallMinHook(engineWaitGateAddr,
+                   reinterpret_cast<LPVOID>(&Hook_EngineWaitGate),
+                   reinterpret_cast<LPVOID *>(&g_trampolineEngineWaitGate),
+                   "Lifecycle", "EngineWaitGate", false, false);
+    InstallMinHook(engineSleepGateAddr,
+                   reinterpret_cast<LPVOID>(&Hook_EngineSleepGate),
+                   reinterpret_cast<LPVOID *>(&g_trampolineEngineSleepGate),
+                   "Lifecycle", "EngineSleepGate", false, false);
+    InstallMinHook(engineSleepGateInnerAddr,
+                   reinterpret_cast<LPVOID>(&Hook_EngineSleepGateInner),
+                   reinterpret_cast<LPVOID *>(&g_trampolineEngineSleepGateInner),
+                   "Lifecycle", "EngineSleepGateInner", false, false);
+  }
+  // 深层引擎 Hook 数量多且部分入口高频。默认 PERF_LEVEL=1 不安装，只有
+  // 编译期 coverage 模式或显式 PERF_LEVEL=2 诊断进程才承担 detour 成本。
+  const bool installDeepPhaseHooks =
+      dxvk::war3::internal::kNativeMainLoopDeepPhaseHookEnabled ||
+      dxvk::war3::internal::War3PerfHookLevel() >= 2;
+  if (installDeepPhaseHooks) {
     // 主循环深度阶段：用于拆分 Engine Loop 的 Remaining Untracked。
     InstallMinHook(engineTlsPumpAddr,
                    reinterpret_cast<LPVOID>(&Hook_EngineTlsPump),
@@ -2768,14 +2961,6 @@ void War3HookLifecycle::Install(uintptr_t gameBase) {
                    reinterpret_cast<LPVOID>(&Hook_EngineReschedule),
                    reinterpret_cast<LPVOID *>(&g_trampolineEngineReschedule),
                    "Lifecycle", "EngineReschedule", false, false);
-    InstallMinHook(enginePrepareWaitAddr,
-                   reinterpret_cast<LPVOID>(&Hook_EnginePrepareWait),
-                   reinterpret_cast<LPVOID *>(&g_trampolineEnginePrepareWait),
-                   "Lifecycle", "EnginePrepareWait", false, false);
-    InstallMinHook(engineWaitGateAddr,
-                   reinterpret_cast<LPVOID>(&Hook_EngineWaitGate),
-                   reinterpret_cast<LPVOID *>(&g_trampolineEngineWaitGate),
-                   "Lifecycle", "EngineWaitGate", false, false);
     InstallMinHook(enginePrepareDispatchAddr,
                    reinterpret_cast<LPVOID>(&Hook_EnginePrepareDispatch),
                    reinterpret_cast<LPVOID *>(
@@ -2800,20 +2985,14 @@ void War3HookLifecycle::Install(uintptr_t gameBase) {
                    reinterpret_cast<LPVOID *>(
                        &g_trampolineEngineComputeWakeDelta),
                    "Lifecycle", "EngineComputeWakeDelta", false, false);
-    InstallMinHook(engineSleepGateAddr,
-                   reinterpret_cast<LPVOID>(&Hook_EngineSleepGate),
-                   reinterpret_cast<LPVOID *>(&g_trampolineEngineSleepGate),
-                   "Lifecycle", "EngineSleepGate", false, false);
-    InstallMinHook(engineSleepGateInnerAddr,
-                   reinterpret_cast<LPVOID>(&Hook_EngineSleepGateInner),
-                   reinterpret_cast<LPVOID *>(&g_trampolineEngineSleepGateInner),
-                   "Lifecycle", "EngineSleepGateInner", false, false);
   }
-  if constexpr (dxvk::war3::internal::kAutoTestDisableGamePause) {
-    InstallMinHook(gamePauseAddr, reinterpret_cast<LPVOID>(&Hook_GamePause),
-                   reinterpret_cast<LPVOID *>(&g_trampolineGamePause),
-                   "Lifecycle", "GamePause", false, false);
-  }
+  InstallMinHook(backgroundIdleSleepMsAddr,
+                 reinterpret_cast<LPVOID>(&Hook_BackgroundIdleSleepMs),
+                 reinterpret_cast<LPVOID *>(&g_trampolineBackgroundIdleSleepMs),
+                 "Lifecycle", "BackgroundIdleSleepMs", false, false);
+  InstallMinHook(gamePauseAddr, reinterpret_cast<LPVOID>(&Hook_GamePause),
+                 reinterpret_cast<LPVOID *>(&g_trampolineGamePause),
+                 "Lifecycle", "GamePause", false, false);
   InstallMinHook(flushResetAddr, reinterpret_cast<LPVOID>(&Hook_FlushAndReset),
                  reinterpret_cast<LPVOID *>(&g_trampolineFlushAndReset),
                  "Lifecycle", "FlushAndReset", false, false);
@@ -2954,7 +3133,114 @@ bool TryNotifyWindowedUiSizeChanged(HWND window, UINT width, UINT height) {
 }
 
 DWORD GetMainLoopThreadId() {
-  return g_mainLoopThreadId.load(std::memory_order_relaxed);
+  return g_mainLoopThreadId.load(std::memory_order_acquire);
+}
+
+static void AddDetachedFramePipelineWindow(const char* name,
+                                           int64_t beginTicks,
+                                           int64_t endTicks) {
+  if (!name || beginTicks <= 0 || endTicks < beginTicks)
+    return;
+
+  auto& perf = war3::War3PerfMonitor::instance();
+  if (dxvk::war3::internal::War3PerfHookLevel() < 1 ||
+      !perf.isEnabled() || !perf.isRecording()) {
+    return;
+  }
+
+  const int64_t frequency = dxvk::high_resolution_clock::get_frequency();
+  if (frequency <= 0)
+    return;
+
+  const double elapsedMs =
+      double(endTicks - beginTicks) * 1000.0 / double(frequency);
+  // 固定父路径只用于把 detached phase-wall 窗口集中展示。报告端把整个
+  // FramePipeline 前缀标为 non-additive overlay：它不是 CPU scope、不是
+  // 动态调用树，也不能与窗口内部的 Hook scope 直接相加。
+  perf.addCpuSample(name, elapsedMs, "FramePipeline/DetachedPhaseWall", 1u);
+}
+
+void MarkWorldFrameThread() {
+  const DWORD tid = ::GetCurrentThreadId();
+  if (g_mainLoopThreadId.load(std::memory_order_relaxed) != tid)
+    g_mainLoopThreadId.store(tid, std::memory_order_release);
+
+  const int64_t frameBeginTicks =
+      g_preWorldLogicPerfBeginTicks.load(std::memory_order_acquire);
+  if (frameBeginTicks <= 0)
+    return;
+
+  const int64_t nowTicks = dxvk::high_resolution_clock::get_counter();
+  const uint32_t boundaryOrdinal =
+      g_framePipelineWorldBoundaryCount.fetch_add(
+          1u, std::memory_order_acq_rel);
+  if (boundaryOrdinal == 0u) {
+    AddDetachedFramePipelineWindow(
+        "PresentToFirstWorldBoundaryPhaseWall", frameBeginTicks, nowTicks);
+    g_framePipelineLastBoundaryTicks.store(nowTicks,
+                                           std::memory_order_release);
+  } else if (boundaryOrdinal == 1u) {
+    const int64_t firstBoundaryTicks =
+        g_framePipelineLastBoundaryTicks.exchange(
+            nowTicks, std::memory_order_acq_rel);
+    AddDetachedFramePipelineWindow(
+        "FirstToSecondWorldBoundaryPhaseWall",
+        firstBoundaryTicks, nowTicks);
+  }
+}
+
+void BeginPreWorldLogicPerfPhase() {
+  // PERF_LEVEL 是进程期静态配置。level 0 从这里直接返回，避免每帧为了
+  // 一个永远不会激活的诊断状态执行额外 atomic store。
+  if (dxvk::war3::internal::War3PerfHookLevel() < 1)
+    return;
+
+  auto &perf = war3::War3PerfMonitor::instance();
+  if (!perf.isEnabled() || !perf.isRecording()) {
+    g_preWorldLogicPerfBeginTicks.store(0, std::memory_order_release);
+    g_framePipelineLastBoundaryTicks.store(0, std::memory_order_release);
+    g_framePipelineWorldBoundaryCount.store(0, std::memory_order_release);
+    return;
+  }
+
+  // Begin 在 swapchain beginFrame() 之后执行。原子状态允许 WorldFrame 与
+  // Present 偶尔落在不同线程时仍能安全闭合；War3 正常路径仍是同一主线程。
+  const int64_t beginTicks = dxvk::high_resolution_clock::get_counter();
+  g_framePipelineWorldBoundaryCount.store(0, std::memory_order_release);
+  g_framePipelineLastBoundaryTicks.store(beginTicks,
+                                         std::memory_order_release);
+  g_preWorldLogicPerfBeginTicks.store(beginTicks, std::memory_order_release);
+}
+
+void EndPreWorldLogicPerfPhase() {
+  if (dxvk::war3::internal::War3PerfHookLevel() < 1)
+    return;
+
+  const int64_t beginTicks =
+      g_preWorldLogicPerfBeginTicks.exchange(0, std::memory_order_acq_rel);
+  const int64_t lastBoundaryTicks =
+      g_framePipelineLastBoundaryTicks.exchange(
+          0, std::memory_order_acq_rel);
+  const uint32_t boundaryCount =
+      g_framePipelineWorldBoundaryCount.exchange(
+          0u, std::memory_order_acq_rel);
+  if (beginTicks <= 0)
+    return;
+
+  const int64_t endTicks = dxvk::high_resolution_clock::get_counter();
+  if (boundaryCount == 0u) {
+    // Loading/reset 帧没有 WorldFrame；仍把整个窗口安全收口在本 epoch。
+    AddDetachedFramePipelineWindow(
+        "PresentToPresentNoWorldBoundaryPhaseWall", beginTicks, endTicks);
+  } else if (boundaryCount == 1u) {
+    AddDetachedFramePipelineWindow(
+        "FirstWorldBoundaryToPresentEntryPhaseWall",
+        lastBoundaryTicks, endTicks);
+  } else {
+    AddDetachedFramePipelineWindow(
+        "SecondWorldBoundaryToPresentEntryPhaseWall",
+        lastBoundaryTicks, endTicks);
+  }
 }
 
 } // namespace dxvk::war3::hooks

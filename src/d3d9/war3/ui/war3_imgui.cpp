@@ -3,6 +3,7 @@
 #include "war3_imgui.h"
 #include "../../d3d9_device.h"
 #include "../../d3d9_war3_light.h"
+#include "../../d3d9_war3_shadow.h"
 #include "../../war3_shader_api.h"
 #include "../../war3_shaderpack.h"
 #include "imgui_impl_dx9.h"
@@ -14,6 +15,7 @@
 #include "../render/war3_render_state.h"
 #include "../shader/war3_shader_manager.h"
 #include "../tools/war3_perf_monitor.h"
+#include "../tools/war3_diagnostics_hub.h"
 
 #include <algorithm>
 
@@ -599,16 +601,71 @@ void War3Imgui::drawDebugWindow() {
                              &settings.shadows.alphaShadowFarAlphaRefBias, 0.0f,
                              0.35f, "%.3f");
           ImGui::Separator();
-          ImGui::Checkbox("阴影 TAA", &settings.shadows.shadowTaaEnabled);
-          ImGui::BeginDisabled(!settings.shadows.shadowTaaEnabled);
+          const char* shadowTaaModes[] = {
+              "DirectInline（无历史）",
+              "PrepassCurrentOnly（同源无历史）",
+              "Temporal（TAA v2）",
+          };
+          int shadowTaaMode =
+              static_cast<int>(settings.shadows.shadowTaaMode);
+          if (ImGui::Combo("阴影时域模式", &shadowTaaMode,
+                           shadowTaaModes, IM_ARRAYSIZE(shadowTaaModes))) {
+            shadowTaaMode = std::clamp(shadowTaaMode, 0, 2);
+            settings.shadows.shadowTaaMode =
+                static_cast<War3ShadowTaaMode>(shadowTaaMode);
+            // Keep the old binary setting as a compatibility mirror only.
+            settings.shadows.shadowTaaEnabled =
+                settings.shadows.shadowTaaMode ==
+                War3ShadowTaaMode::Temporal;
+            ++settings.shadows.shadowTaaSettingsRevision;
+          }
+          const auto taaDiagnostics = dxvk::QueryShadowTaaDiagnostics();
+          ImGui::Text(
+              "TAA requested/effective/shader: %u / %u / %u",
+              taaDiagnostics.requestedMode, taaDiagnostics.effectiveMode,
+              taaDiagnostics.shaderMode);
+          ImGui::Text(
+              "history valid/readable: %u / %u  gen=%llu  invalidate=0x%X",
+              taaDiagnostics.historyValid, taaDiagnostics.historyReadable,
+              static_cast<unsigned long long>(
+                  taaDiagnostics.historyGeneration),
+              taaDiagnostics.lastInvalidationReason);
+          ImGui::Text("固定墙旁路帧: %llu  settings rev=%llu",
+                      static_cast<unsigned long long>(
+                          taaDiagnostics.fixedWallBypassCount),
+                      static_cast<unsigned long long>(
+                          taaDiagnostics.settingsRevision));
+          const auto csmDiagnostics = dxvk::QueryCsmResolutionDiagnostics();
+          ImGui::Text("CSM requested/effective: %u / %u  generation=%llu",
+                      csmDiagnostics.requestedResolution,
+                      csmDiagnostics.effectiveResolution,
+                      static_cast<unsigned long long>(
+                          csmDiagnostics.resourceGeneration));
+          ImGui::Text("CSM fallback: %s  reason=%u  rebuilds=%llu",
+                      csmDiagnostics.fallbackLatched ? "latched" : "none",
+                      csmDiagnostics.fallbackReason,
+                      static_cast<unsigned long long>(
+                          csmDiagnostics.resourceRebuildCount));
+          if (ImGui::Button("保留最近阴影证据"))
+            dxvk::war3::tools::RequestShadowEvidenceRetention();
+          ImGui::SameLine();
+          ImGui::Text("采集器: %s",
+                      dxvk::war3::tools::IsShadowEvidenceCollectorAttached()
+                          ? "已连接"
+                          : "未连接");
+          ImGui::BeginDisabled(
+              settings.shadows.shadowTaaMode !=
+              War3ShadowTaaMode::Temporal);
           ImGui::SliderFloat("TAA 混合因子(新帧权重)",
-                             &settings.shadows.shadowTaaBlendFactor, 0.01f,
-                             0.35f, "%.3f");
+                             &settings.shadows.shadowTaaBlendFactor, 0.12f,
+                             0.30f, "%.3f");
           ImGui::Checkbox("TAA 邻域夹紧",
                           &settings.shadows.shadowTaaNeighborClamp);
           ImGui::EndDisabled();
-          const char *debugItems[] = {"关闭", "级联",     "阴影因子",
-                                      "深度", "运动向量", "阴影历史"};
+            const char *debugItems[] = {"关闭", "级联",     "阴影因子",
+                                        "深度", "运动向量", "阴影历史",
+                                        "点阴影", "本帧阴影",
+                                        "本帧阴影覆盖", "CSM失败原因"};
           int debugIndex = static_cast<int>(settings.shadows.debugMode);
           if (ImGui::Combo("调试输出", &debugIndex, debugItems,
                            IM_ARRAYSIZE(debugItems))) {
@@ -619,8 +676,10 @@ void War3Imgui::drawDebugWindow() {
         }
 
         if (ImGui::TreeNode("点光源##panel")) {
-          ImGui::Text("当前数量: %u",
-                      dxvk::War3LightManager::Instance().GetLightCount());
+          ImGui::Text("当前数量: %u (gen=%llu)",
+                      dxvk::War3LightManager::Instance().GetLightCount(),
+                      static_cast<unsigned long long>(
+                          dxvk::War3LightManager::Instance().GetGeneration()));
           ImGui::BeginDisabled(!settings.shadows.pointLightsEnabled);
           if (ImGui::Button("创建测试点光源##create")) {
             dxvk::War3LightManager::Instance().InitTestLight();
@@ -629,6 +688,121 @@ void War3Imgui::drawDebugWindow() {
           if (ImGui::Button("清空点光源##clear")) {
             dxvk::War3LightManager::Instance().ClearLights();
           }
+          int maxShadowLights =
+              static_cast<int>(settings.shadows.pointShadowMaxLights);
+          if (ImGui::SliderInt("点阴影最大光源", &maxShadowLights, 0, 4))
+            settings.shadows.pointShadowMaxLights =
+                static_cast<uint32_t>(maxShadowLights);
+          // Resolution changes recreate a cube array, so expose discrete tiers
+          // instead of a continuous slider that could allocate every integer
+          // size while the user drags it.
+          constexpr uint32_t shadowResValues[] = {128u, 256u, 512u, 1024u,
+                                                   2048u};
+          constexpr const char *shadowResLabels[] = {"128", "256", "512",
+                                                      "1024", "2048 (Ultra)"};
+          int shadowResIndex = 0;
+          uint32_t bestResDelta = ~0u;
+          for (int i = 0; i < IM_ARRAYSIZE(shadowResValues); ++i) {
+            const uint32_t value = shadowResValues[i];
+            const uint32_t current = settings.shadows.pointShadowResolution;
+            const uint32_t delta = value > current ? value - current
+                                                    : current - value;
+            if (delta < bestResDelta) {
+              bestResDelta = delta;
+              shadowResIndex = i;
+            }
+          }
+          if (ImGui::Combo("点阴影分辨率", &shadowResIndex, shadowResLabels,
+                           IM_ARRAYSIZE(shadowResLabels))) {
+            settings.shadows.pointShadowResolution =
+                shadowResValues[shadowResIndex];
+          }
+          const uint64_t pointShadowBytesPerLight =
+              uint64_t(settings.shadows.pointShadowResolution) *
+              uint64_t(settings.shadows.pointShadowResolution) * 4ull * 6ull;
+          const uint32_t pointShadowRequested =
+              std::min<uint32_t>(settings.shadows.pointShadowMaxLights, 4u);
+          const uint32_t pointShadowBudgetCapacity =
+              pointShadowRequested == 0u
+                  ? 0u
+                  : std::min<uint32_t>(
+                        pointShadowRequested,
+                        static_cast<uint32_t>(std::max<uint64_t>(
+                            1ull, (96ull * 1024ull * 1024ull) /
+                                      std::max<uint64_t>(
+                                          pointShadowBytesPerLight, 1ull))));
+          const double pointShadowMiB =
+              double(pointShadowBytesPerLight * pointShadowBudgetCapacity) /
+              (1024.0 * 1024.0);
+          ImGui::TextDisabled("有效阴影灯: %u / %u，D32 预算 %.1f / 96 MiB",
+                              pointShadowBudgetCapacity, pointShadowRequested,
+                              pointShadowMiB);
+          if (pointShadowBudgetCapacity < pointShadowRequested) {
+            ImGui::TextDisabled(
+                "当前分辨率受 96 MiB 安全门限制；其余灯仍保留直接照明");
+          }
+          ImGui::Checkbox("点阴影时序复用",
+                          &settings.shadows.pointShadowTemporalReuse);
+          int updatePeriod =
+              static_cast<int>(settings.shadows.pointShadowUpdatePeriod);
+          if (ImGui::SliderInt("点阴影更新周期", &updatePeriod, 1, 4))
+            settings.shadows.pointShadowUpdatePeriod =
+                static_cast<uint32_t>(updatePeriod);
+          ImGui::Checkbox("点阴影 Face 剔除",
+                          &settings.shadows.pointShadowFaceCulling);
+          ImGui::SliderFloat("点阴影 Bias", &settings.shadows.pointShadowBias,
+                             0.0f, 0.2f, "%.3f");
+          ImGui::SliderFloat("点阴影 PCF 近端",
+                             &settings.shadows.pointShadowPcfRadiusNear, 0.0f,
+                             3.0f, "%.2f");
+          settings.shadows.pointShadowPcfRadiusFar = std::max(
+              settings.shadows.pointShadowPcfRadiusFar,
+              settings.shadows.pointShadowPcfRadiusNear);
+          ImGui::SliderFloat("点阴影 PCF 远端",
+                             &settings.shadows.pointShadowPcfRadiusFar,
+                             settings.shadows.pointShadowPcfRadiusNear, 4.0f,
+                             "%.2f");
+          ImGui::SliderFloat("点阴影 Texel Bias",
+                             &settings.shadows.pointShadowTexelBiasScale, 0.0f,
+                             1.0f, "%.3f");
+          ImGui::SliderFloat("点阴影范围淡出起点",
+                             &settings.shadows.pointShadowRangeFadeStart, 0.50f,
+                             0.98f, "%.2f");
+          ImGui::Separator();
+          ImGui::TextDisabled("软件射线接触阴影");
+          ImGui::Checkbox("启用点光软件射线阴影",
+                          &settings.shadows.pointRayShadowEnabled);
+          ImGui::Checkbox("Hi-Z 分层遍历",
+                          &settings.shadows.pointRayShadowHiZEnabled);
+          int pointRayMaxLights =
+              static_cast<int>(settings.shadows.pointRayShadowMaxLights);
+          if (ImGui::SliderInt("射线光源上限", &pointRayMaxLights, 1, 2))
+            settings.shadows.pointRayShadowMaxLights =
+                static_cast<uint32_t>(pointRayMaxLights);
+          int pointRaySteps =
+              static_cast<int>(settings.shadows.pointRayShadowSteps);
+          if (ImGui::SliderInt("射线步数", &pointRaySteps, 4, 32))
+            settings.shadows.pointRayShadowSteps =
+                static_cast<uint32_t>(pointRaySteps);
+          int pointRayHiZVisits =
+              static_cast<int>(settings.shadows.pointRayShadowHiZMaxVisits);
+          if (ImGui::SliderInt("Hi-Z 节点预算", &pointRayHiZVisits, 8, 64))
+            settings.shadows.pointRayShadowHiZMaxVisits =
+                static_cast<uint32_t>(pointRayHiZVisits);
+          ImGui::SliderFloat("射线最大距离",
+                             &settings.shadows.pointRayShadowMaxDistance,
+                             32.0f, 2400.0f, "%.0f");
+          ImGui::SliderFloat("射线厚度",
+                             &settings.shadows.pointRayShadowThickness,
+                             1.0f, 160.0f, "%.1f");
+          ImGui::SliderFloat("射线起点偏移",
+                             &settings.shadows.pointRayShadowStartOffset,
+                             1.0f, 96.0f, "%.1f");
+          ImGui::SliderFloat("射线阴影强度",
+                             &settings.shadows.pointRayShadowStrength,
+                             0.0f, 1.0f, "%.2f");
+          ImGui::TextDisabled(
+              "仅补短距离屏幕内接触细节；越界/缺深度时自动退回 cube 阴影");
           ImGui::EndDisabled();
           ImGui::TreePop();
         }
@@ -647,6 +821,11 @@ void War3Imgui::drawDebugWindow() {
           bool aaPass = pipeline->IsPassEnabled("AA");
           if (ImGui::Checkbox("AA", &aaPass)) {
             pipeline->SetPassEnabled("AA", aaPass);
+          }
+
+          bool volumetricPass = pipeline->IsPassEnabled("VolumetricLight");
+          if (ImGui::Checkbox("VolumetricLight", &volumetricPass)) {
+            pipeline->SetPassEnabled("VolumetricLight", volumetricPass);
           }
           ImGui::TreePop();
         }
@@ -720,6 +899,62 @@ void War3Imgui::drawDebugWindow() {
                              0.9f, "%.2f");
           ImGui::SliderFloat("衰减远", &settings.postFx.ssao.fadeFar, 0.1f,
                              1.0f, "%.2f");
+          ImGui::TreePop();
+        }
+
+        if (ImGui::TreeNode("体积光")) {
+          ImGui::Checkbox("启用体积光",
+                          &settings.postFx.volumetricLight.enabled);
+          ImGui::Checkbox("需要 CSM 快照",
+                          &settings.postFx.volumetricLight.requireCsmSnapshot);
+          ImGui::Checkbox("叠加点光散射",
+                          &settings.postFx.volumetricLight.includePointLights);
+          int volumetricPointMaxLights =
+              static_cast<int>(settings.postFx.volumetricLight.maxPointLights);
+          if (ImGui::SliderInt("体积点光上限", &volumetricPointMaxLights,
+                               0, 2)) {
+            settings.postFx.volumetricLight.maxPointLights =
+                static_cast<uint32_t>(volumetricPointMaxLights);
+          }
+          ImGui::Checkbox("自适应采样",
+                          &settings.postFx.volumetricLight.adaptiveSampleCount);
+          ImGui::SliderFloat("最低太阳强度",
+                             &settings.postFx.volumetricLight.minSunIntensity,
+                             0.0f, 0.5f, "%.3f");
+          ImGui::SliderFloat("强度(整体能量)",
+                             &settings.postFx.volumetricLight.intensity, 0.0f,
+                             4.0f, "%.3f");
+          ImGui::SliderInt("采样数(安全上限16)",
+                           &settings.postFx.volumetricLight.sampleCount, 4, 16);
+          ImGui::SliderFloat("密度(散射厚度)",
+                             &settings.postFx.volumetricLight.density, 0.0f,
+                             2.0f, "%.3f");
+          ImGui::SliderFloat("权重(阴影束对比度)",
+                             &settings.postFx.volumetricLight.weight, 0.0f,
+                             3.0f, "%.3f");
+          ImGui::TextDisabled(
+              "提示: 可见度请调强度/密度/权重；采样数不会突破 GPU 安全预算");
+          ImGui::SliderFloat("最大距离",
+                             &settings.postFx.volumetricLight.sunDistance,
+                             100.0f, 6000.0f, "%.0f");
+          ImGui::SliderFloat("近处衰减",
+                             &settings.postFx.volumetricLight.fadeNear, 0.0f,
+                             0.95f, "%.2f");
+          ImGui::SliderFloat("远处衰减",
+                             &settings.postFx.volumetricLight.fadeFar, 0.1f,
+                             1.0f, "%.2f");
+          ImGui::SliderFloat("高度雾强度",
+                             &settings.postFx.volumetricLight.heightFogStrength,
+                             0.0f, 2.0f, "%.2f");
+          ImGui::SliderFloat("底图消光强度",
+                             &settings.postFx.volumetricLight.extinctionStrength,
+                             0.0f, 1.0f, "%.2f");
+          ImGui::SliderFloat(
+              "无 CSM 散射保底",
+              &settings.postFx.volumetricLight.unshadowedScattering, 0.0f,
+              1.0f, "%.2f");
+          ImGui::TextDisabled(
+              "关闭“需要 CSM 快照”时，仅使用有界无阴影介质保底，不生成伪阴影束");
           ImGui::TreePop();
         }
 

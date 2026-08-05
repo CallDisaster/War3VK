@@ -24,7 +24,8 @@ enum class War3RenderLayer : uint8_t {
 // 根据用户实测结果建立的 Stage -> Tag 映射:
 // S0=天空盒, S1=地形, S2=阴影/迷雾, S5=地面效果(瘟疫), S6=天气(下雪),
 // S7=选择圈, S9=地面效果(血迹/脚印), S10=装饰物, S11=单位渲染,
-// S12=范围指示器目标(绿色), S14=水, S19=建筑地板贴画, S21=范围指示器
+// S12=范围指示器目标(绿色), S14=水, S19=建筑地板贴画, S20=闪电,
+// S21=范围指示器
 enum class War3BatchTag : int32_t {
   Unknown = -1,
   Terrain = 0,          // S1: 地形
@@ -39,6 +40,7 @@ enum class War3BatchTag : int32_t {
   Water = 9,                // S14: 水面渲染
   BuildingFloorDecal = 10,  // S19: 建筑地板贴画
   RangeIndicator = 11,      // S21: 对象范围指示器渲染
+  Lightning = 12,           // S20: 魔兽原生与 WarVK 闪电
 };
 
 // Shadow 语义桥接：只用于在 draw 热路径中保留稳定对象上下文，
@@ -54,13 +56,23 @@ struct War3TlsShadowSemanticState {
       static_cast<war3::render::ObjectKind>(0);
   War3BatchTag tag = War3BatchTag::Unknown;
   int stage = -1;
+  bool pathBlocker = false;
 
   bool HasAnyContext() const {
     return renderablePart != nullptr || sceneNode != nullptr ||
            worldObjectEntry != nullptr || object != nullptr || jHandle != 0u ||
            rawcode != 0u || static_cast<uint32_t>(objectKind) != 0u ||
-           tag != War3BatchTag::Unknown || stage >= 0;
+           tag != War3BatchTag::Unknown || stage >= 0 || pathBlocker;
   }
+};
+
+struct War3ViewportSnapshot {
+  bool valid = false;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint64_t serial = 0;
 };
 
 // Lightweight render state storage
@@ -167,16 +179,33 @@ public:
   static void SetSkipUi(bool skip);
 
   static bool HasWorldStageThisFrame();
+  static bool HasWorldFramePrepareThisFrame();
+  static bool HasCompletedWorldFramePrepareThisFrame();
+  static bool HasWorldRenderSceneThisFrame();
+  static bool HasCompletedWorldRenderSceneThisFrame();
+  static bool IsWorldRenderSceneActive();
+  static bool IsMainWorldStageActive();
   static bool HasReachedStageThisFrame(int stage);
   static bool HasCompletedStageThisFrame(int stage);
   static bool HasMainWorldCompletedStageThisFrame(int stage);
   static void OnFrameStart();
+  static void OnWorldFramePrepareEnter();
+  static void OnWorldFramePrepareExit();
+  static void OnWorldRenderSceneEnter();
+  static void OnWorldRenderSceneExit();
 
   static void OnUiDispatch();
   static bool HasUiDispatchThisFrame();
 
   static void OnStageExit(int stage);
+  static void OnMainWorldStageEnter(int stage);
   static void OnMainWorldStageExit(int stage);
+
+  static void SetCurrentViewport(uint32_t x,
+                                 uint32_t y,
+                                 uint32_t width,
+                                 uint32_t height);
+  static War3ViewportSnapshot GetCurrentViewportSnapshot();
 
   static void SetGameTime(float time);
   static float GetGameTime();
@@ -188,6 +217,7 @@ public:
   static void SetOutlineDebugAllObjectsEnabled(bool enabled);
   // 调试：强制启用描边设置（与脚本设置解耦）
   static void SetOutlineForceEnabled(bool enabled);
+  static bool IsOutlineForceEnabledForTest();
 
   // 原生阴影模式：0=默认(完整) 1=仅保留雾/边界 2=完全禁用
   static void SetNativeShadowMode(uint32_t mode);

@@ -4,6 +4,21 @@
 
 namespace dxvk::war3::render {
 
+struct SceneCollectorIdentityProbeSummary {
+  bool groupLocalAggregationEnabled = false;
+  uint64_t worldObjectListEntryCount = 0;
+  uint64_t worldObjectListNullEntryCount = 0;
+  uint64_t worldObjectListOwnerHintZeroCount = 0;
+  uint64_t worldObjectListOwnerHintNonzeroCount = 0;
+  uint64_t worldObjectListOwnerHintHandleCount = 0;
+  uint64_t worldObjectListOwnerHintUnitPtrCount = 0;
+  uint64_t worldObjectListOwnerHintZeroContextAcceptedCount = 0;
+  uint64_t worldObjectListAcceptedIdentityCount = 0;
+  uint64_t lastWorldObjectListEntryWorldObjectEntryPtr = 0;
+  uint64_t lastWorldObjectListEntryOwnerHintValue = 0;
+  uint64_t lastWorldObjectListEntrySceneNodePtr = 0;
+};
+
 /**
  * @brief 场景对象收集器
  * 
@@ -24,5 +39,7 @@ public:
      */
     static void CollectWorldObjects(void* gameWorldPtr, int groupIdx);
 };
+
+SceneCollectorIdentityProbeSummary QuerySceneCollectorIdentityProbeSummary();
 
 } // namespace dxvk::war3::render

@@ -1,5 +1,7 @@
 #include "war3_runtime_profile.h"
 
+#include "war3_internal_test_config.h"
+
 #include "../../util/util_env.h"
 
 #include <algorithm>
@@ -22,6 +24,7 @@ constexpr std::array<const char*, static_cast<size_t>(War3RuntimeModule::Count)>
         "diag",           "render.queue", "shadow.capture",
         "shadow.map",     "shadow.receiver", "shadow.taa",
         "postfx",         "ssao",         "aa",
+        "semantic.data",
     };
 
 std::string ToLowerAscii(std::string text) {
@@ -76,7 +79,8 @@ uint32_t DefaultDisabledMaskForProfile(War3RuntimeProfile profile) {
            ModuleBit(War3RuntimeModule::ShadowTaa) |
            ModuleBit(War3RuntimeModule::PostFx) |
            ModuleBit(War3RuntimeModule::Ssao) |
-           ModuleBit(War3RuntimeModule::Aa);
+           ModuleBit(War3RuntimeModule::Aa) |
+           ModuleBit(War3RuntimeModule::SemanticData);
   case War3RuntimeProfile::HooksDefault:
     return ModuleBit(War3RuntimeModule::RenderQueue) |
            ModuleBit(War3RuntimeModule::ShadowCapture) |
@@ -85,7 +89,8 @@ uint32_t DefaultDisabledMaskForProfile(War3RuntimeProfile profile) {
            ModuleBit(War3RuntimeModule::ShadowTaa) |
            ModuleBit(War3RuntimeModule::PostFx) |
            ModuleBit(War3RuntimeModule::Ssao) |
-           ModuleBit(War3RuntimeModule::Aa);
+           ModuleBit(War3RuntimeModule::Aa) |
+           ModuleBit(War3RuntimeModule::SemanticData);
   case War3RuntimeProfile::RenderBase:
     return ModuleBit(War3RuntimeModule::ShadowCapture) |
            ModuleBit(War3RuntimeModule::ShadowMap) |
@@ -93,24 +98,76 @@ uint32_t DefaultDisabledMaskForProfile(War3RuntimeProfile profile) {
            ModuleBit(War3RuntimeModule::ShadowTaa) |
            ModuleBit(War3RuntimeModule::PostFx) |
            ModuleBit(War3RuntimeModule::Ssao) |
-           ModuleBit(War3RuntimeModule::Aa);
+           ModuleBit(War3RuntimeModule::Aa) |
+           ModuleBit(War3RuntimeModule::SemanticData);
   case War3RuntimeProfile::ShadowCaptureOnly:
     return ModuleBit(War3RuntimeModule::ShadowMap) |
            ModuleBit(War3RuntimeModule::ShadowReceiver) |
            ModuleBit(War3RuntimeModule::ShadowTaa) |
            ModuleBit(War3RuntimeModule::PostFx) |
            ModuleBit(War3RuntimeModule::Ssao) |
-           ModuleBit(War3RuntimeModule::Aa);
+           ModuleBit(War3RuntimeModule::Aa) |
+           ModuleBit(War3RuntimeModule::SemanticData);
   case War3RuntimeProfile::ShadowFull:
     return ModuleBit(War3RuntimeModule::PostFx) |
            ModuleBit(War3RuntimeModule::Ssao) |
-           ModuleBit(War3RuntimeModule::Aa);
+           ModuleBit(War3RuntimeModule::Aa) |
+           ModuleBit(War3RuntimeModule::SemanticData);
   case War3RuntimeProfile::FullAnalysis:
   case War3RuntimeProfile::FullPerfExperimental:
   case War3RuntimeProfile::FullDefault:
   default:
     return 0u;
   }
+}
+
+constexpr uint32_t RenderInterferenceMask() {
+  return ModuleBit(War3RuntimeModule::HookRender) |
+         ModuleBit(War3RuntimeModule::RenderQueue) |
+         ModuleBit(War3RuntimeModule::ShadowCapture) |
+         ModuleBit(War3RuntimeModule::ShadowMap) |
+         ModuleBit(War3RuntimeModule::ShadowReceiver) |
+         ModuleBit(War3RuntimeModule::ShadowTaa) |
+         ModuleBit(War3RuntimeModule::PostFx) |
+         ModuleBit(War3RuntimeModule::Ssao) |
+         ModuleBit(War3RuntimeModule::Aa);
+}
+
+constexpr uint32_t ShadowStackMask() {
+  return ModuleBit(War3RuntimeModule::ShadowCapture) |
+         ModuleBit(War3RuntimeModule::ShadowMap) |
+         ModuleBit(War3RuntimeModule::ShadowReceiver) |
+         ModuleBit(War3RuntimeModule::ShadowTaa);
+}
+
+constexpr uint32_t PostFxStackMask() {
+  return ModuleBit(War3RuntimeModule::PostFx) |
+         ModuleBit(War3RuntimeModule::Ssao) |
+         ModuleBit(War3RuntimeModule::Aa);
+}
+
+constexpr uint32_t CompileTimeDisabledMask() {
+  uint32_t mask = 0u;
+
+  if constexpr (internal::kWar3RuntimeConfigDxvkOnlyBaseline)
+    mask |= 0xFFFFFFFFu;
+  if constexpr (internal::kWar3RuntimeConfigDisableRenderInterference)
+    mask |= RenderInterferenceMask();
+  if constexpr (internal::kWar3RuntimeConfigDisableShadowStack)
+    mask |= ShadowStackMask();
+  if constexpr (internal::kWar3RuntimeConfigDisablePostFxStack)
+    mask |= PostFxStackMask();
+  if constexpr (internal::kWar3RuntimeConfigDisableSemanticData)
+    mask |= ModuleBit(War3RuntimeModule::SemanticData);
+
+  if constexpr (!internal::kWar3UiHookEnabled)
+    mask |= ModuleBit(War3RuntimeModule::HookUi);
+  if constexpr (!internal::kWar3RenderHookEnabled)
+    mask |= ModuleBit(War3RuntimeModule::HookRender);
+  if constexpr (!internal::kWar3ModelHookEnabled)
+    mask |= ModuleBit(War3RuntimeModule::SemanticData);
+
+  return mask;
 }
 
 uint32_t ParseDisableMask(std::string csv) {
@@ -134,6 +191,15 @@ uint32_t ParseDisableMask(std::string csv) {
               ModuleBit(War3RuntimeModule::ShadowMap) |
               ModuleBit(War3RuntimeModule::ShadowReceiver) |
               ModuleBit(War3RuntimeModule::ShadowTaa);
+      continue;
+    }
+    if (item == "render") {
+      mask |= RenderInterferenceMask();
+      continue;
+    }
+    if (item == "semantic" || item == "semantic-data" ||
+        item == "upper" || item == "upper.data") {
+      mask |= ModuleBit(War3RuntimeModule::SemanticData);
       continue;
     }
 
@@ -160,7 +226,8 @@ const War3RuntimeConfig& BuildConfig() {
       cfg.profile = ParseProfile(profileText);
     }
 
-    cfg.defaultDisabledMask = DefaultDisabledMaskForProfile(cfg.profile);
+    cfg.defaultDisabledMask =
+        DefaultDisabledMaskForProfile(cfg.profile) | CompileTimeDisabledMask();
     cfg.explicitDisabledMask =
         ParseDisableMask(dxvk::env::getEnvVar("DXVK_WAR3_DISABLE"));
     cfg.effectiveDisabledMask =

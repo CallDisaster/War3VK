@@ -1,7 +1,13 @@
 #pragma once
-// WarVK JASS 初始化入口
+// WarVK map-side entry.
+//
+// Include this file from the map library. It will not declare custom natives,
+// so the map can pass native-table validation before WarVK is loaded.
 
-library WarVKInit
+#include "warvk_bridge.j"
+#include "warvk_api.j"
+
+library WarVKInitLib initializer WarVK_AutoInit
     globals
         private boolean WARVK_INITIALIZED = false
     endglobals
@@ -11,10 +17,24 @@ library WarVKInit
             return
         endif
         set WARVK_INITIALIZED = true
+        call WarVK_Load()
+    endfunction
 
-        // 触发一次空调用，确保 JAPI 注入已生效
-        call ExecuteFunc("DoNothing")
+    function WarVKInit takes nothing returns nothing
+        call WarVK_Init()
+    endfunction
+
+    private function WarVK_AutoInitDelayed takes nothing returns nothing
+        local timer t = GetExpiredTimer()
+        call PauseTimer(t)
+        call DestroyTimer(t)
+        set t = null
+        call WarVK_Init()
+    endfunction
+
+    private function WarVK_AutoInit takes nothing returns nothing
+        local timer t = CreateTimer()
+        call TimerStart(t, WARVK_AUTO_INIT_DELAY_SEC, false, function WarVK_AutoInitDelayed)
+        set t = null
     endfunction
 endlibrary
-
-#include "API/warvk_render.j"
