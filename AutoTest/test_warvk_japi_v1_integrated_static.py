@@ -8,6 +8,9 @@ WARVK_ROOT = ROOT / "WarVK"
 JASS_PATH = WARVK_ROOT / "jass/warvk_api.j"
 SMOKE_JASS_PATH = WARVK_ROOT / "jass/warvk_smoke_test.j"
 INIT_JASS_PATH = WARVK_ROOT / "jass/warvk_init.j"
+BRIDGE_JASS_PATH = WARVK_ROOT / "jass/warvk_bridge.j"
+CONSTANT_JASS_PATH = WARVK_ROOT / "jass/warvk_constant.j"
+PACKAGE_SCRIPT_PATH = WARVK_ROOT / "package_warvk.ps1"
 ACTION_PATH = WARVK_ROOT / "action.txt"
 CALL_PATH = WARVK_ROOT / "call.txt"
 RUNTIME_PATH = ROOT / "src/d3d9/war3/japi/war3_japi_v1.cpp"
@@ -27,6 +30,9 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
         cls.jass = JASS_PATH.read_text(encoding="utf-8")
         cls.smoke_jass = SMOKE_JASS_PATH.read_text(encoding="utf-8")
         cls.init_jass = INIT_JASS_PATH.read_text(encoding="utf-8")
+        cls.bridge_jass = BRIDGE_JASS_PATH.read_text(encoding="utf-8")
+        cls.constant_jass = CONSTANT_JASS_PATH.read_text(encoding="utf-8")
+        cls.package_script = PACKAGE_SCRIPT_PATH.read_text(encoding="utf-8")
         cls.action = ACTION_PATH.read_text(encoding="utf-8")
         cls.call = CALL_PATH.read_text(encoding="utf-8")
         cls.define = (WARVK_ROOT / "define.txt").read_text(encoding="utf-8")
@@ -51,6 +57,33 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
         self.assertNotIn('warvk_lightning_templates.j', self.init_jass)
         self.assertNotIn('API/warvk_render.j', self.init_jass)
         self.assertNotIn('API/warvk_lightning.j', self.init_jass)
+
+    def test_public_package_is_proxy_only_and_has_no_runtime_loader(self):
+        self.assertFalse((WARVK_ROOT / "loader").exists())
+        public_surface = (
+            self.init_jass
+            + self.bridge_jass
+            + self.constant_jass
+            + self.package_script
+            + self.action
+            + self.call
+            + self.define
+        )
+        for forbidden in (
+            "WARVK_LOADER_",
+            "WarVK_Load",
+            "WarVK_RequestDllLoad",
+            "WarVKRequestDllLoad",
+            "exec-lua",
+            "StartCampaignAI",
+            "LoadLibraryA",
+            "warvk.ai",
+            "warvk.blp",
+            "WarVK.dll",
+        ):
+            self.assertNotIn(forbidden, public_surface)
+        self.assertIn('Join-Path $out "d3d9.dll"', self.package_script)
+        self.assertIn("proxy d3d9.dll", self.bridge_jass)
 
     def test_cpp_command_table_matches_public_jass(self):
         rows = re.findall(

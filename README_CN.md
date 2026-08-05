@@ -40,7 +40,7 @@ WarVK 是面向 Warcraft III 1.27a 的画面增强运行时。它以 DXVK 派生
 
 ### 地图作者 API
 
-- WarVK JAPI 已内置在 `d3d9.dll` 中；WarVK 已作为代理运行时加载时，不需要额外编译 `war3map.dll`。
+- WarVK JAPI 已内置在代理 `d3d9.dll` 中，必须在启动 Warcraft III 前完成安装。作者包不再包含地图内 DLL Loader，也不需要额外编译 `war3map.dll`。
 - 对外线协议继续保持 `warvk:v1`。高频纯数值调用可走经过 Game.dll 签名验证的强类型 Hashtable 通道，文本命令继续使用兼容字符串通道。
 - 作者可以创建和移动点光、开启点阴影、控制体积光和全局高度雾，并将 WarVK 光照时钟与 Warcraft 玩法时间解耦。
 - 闪电模板支持贴图、颜色、宽度、动画、分支、公式曲线与上传的点曲线。
@@ -86,7 +86,7 @@ WarVK 只针对经典 1.27a 可执行文件与已验证的 `Game.dll` 布局。�
 
 - 启动黑屏通常来自显卡驱动过旧，或游戏目录中存在冲突的第三方 `d3d9.dll`。
 - 性能不足时优先关闭体积效果，其次减少点阴影，再降低后处理。太阳 CSM 会保持 4096，除非运行时发生安全的锁存式分配回退。
-- 不要在同一游戏目录同时放入多个 D3D9 代理或加载器。
+- 不要在同一游戏目录同时放入多个 D3D9 代理 DLL。
 - 反馈时优先提供 `d3d9.log`、`runtime_status.json`、GPU incident JSON 和 WarVK 崩溃转储；公开前请移除个人路径或私有地图信息。
 - 若在未重启游戏的情况下切换过地图，请先完整退出 Warcraft III，再重新启动并只进入目标地图；反馈跨地图问题时请同时说明地图进入顺序与第一次异常时的证据。
 
@@ -101,7 +101,7 @@ WarVK 只针对经典 1.27a 可执行文件与已验证的 `Game.dll` 布局。�
 - `src/d3d9/`：D3D9 运行时、设置、阴影/光照管线与接入层
 - `src/d3d9/war3/`：游戏 Hook、语义桥、资源生命周期、GPU 蒙皮、JAPI、数学与诊断
 - `subprojects/war3fx/`：WarVK Shader
-- `WarVK/`：JASS 库、YDWE Catalog、加载资源、图标与作者文档
+- `WarVK/`：JASS 库、YDWE Catalog、图标与作者文档
 - `AutoTest/`：静态合同、Win32 runnable、性能门与 attach-only 取证
 
 32 位构建：

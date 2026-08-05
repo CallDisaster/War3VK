@@ -11,7 +11,7 @@
 - 发布文档与许可证：`README.md`、`README_CN.md`、`CHANGELOG.md`、`LICENSE`、`COPYING`、
   `THIRD_PARTY_NOTICES.md` 和本文件。
 - 可复现的静态/Win32 测试、分析器与正式 AutoTest conductor。
-- `WarVK/` 中的 JASS 库、YDWE `action/call/define`、loader、作者文档与 `icons/atom.blp`、
+- `WarVK/` 中的 JASS 库、YDWE `action/call/define`、作者文档与 `icons/atom.blp`、
   `icons/atom.png`。
 - `docs/` 中仍用于解释公开架构、逆向证据、正确性合同和维护边界的源文档。
 
@@ -31,12 +31,11 @@
 
 - `WarVK/action.txt`、`WarVK/call.txt`、`WarVK/define.txt`。
 - `WarVK/jass/`。
-- `WarVK/loader/` 与 `WarVK/package_warvk.ps1`。
 - `WarVK/icons/atom.blp`、`WarVK/icons/atom.png`。
 - `WarVK/README.md`、`WarVK/MATH_CURVE_API.md`。
 
-`WarVK/bin/` 是本地打包输出，不进入源码提交；若发布 map-contained DLL carrier，应从最终同哈希
-`d3d9.dll` 重新生成，不能复用旧产物。
+作者包不得包含 `loader/`、`bin/`、`WarVK.dll`、伪装为 `.blp` 的 DLL carrier 或 Lua/AI
+加载脚本。WarVK 仅由玩家在启动游戏前安装的代理 `d3d9.dll` 提供运行时。
 
 ## 明确不上传
 

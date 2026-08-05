@@ -35,19 +35,16 @@ Carrier 保持可用。
 - `jass/warvk_constant.j`：公开常量（含 `WARVK_LIGHTNING_RENDER_*`）。
 - `MATH_CURVE_API.md`：公式语法、内置变量/函数、坐标模式和阶段边界。
 - `jass/warvk_smoke_test.j`：点光与闪电模板的可选验收函数（不自动 include）。
-- `loader/warvk.ai`：地图内 AI 加载路线。
-- `loader/warvk_loader.lua`：Lua 加载兼容路线。
-- `package_warvk.ps1`：生成 `WarVK.dll` 与地图载荷。
+- `package_warvk.ps1`：从本地 Win32 构建复制代理 `d3d9.dll`。
 
 ## YDWE 接入
 
 把整个根目录作为一个独立的 `ui/WarVK` 层接入 YDWE；至少保留根目录的
 `action.txt`、`call.txt`、`define.txt` 和 `jass`。不要把 action 定义复制到
 `MapUI` 后再改写返回类型。编辑器中的函数 `comment` 已写明参数含义与有效范围。
-地图预处理入口包含 `jass/warvk_init.j`。如果使用地图内加载路线，同时导入
-`warvk.ai` 和由构建脚本生成的 `warvk.blp`。
-
-DXVK 已作为代理 DLL 启动时，初始化函数会直接检测到 bridge；无需再次加载 DLL。
+地图预处理入口包含 `jass/warvk_init.j`。WarVK 只支持代理 DLL 启动：玩家必须先把
+`d3d9.dll` 安装到 `war3.exe` 同级目录，再启动游戏。地图与作者包不携带 DLL、不导入
+AI/Lua Loader，也不会在游戏运行期间尝试加载 DLL；bridge 不可用时 API 会安全返回失败值。
 
 YDWE 菜单按功能拆分为 WarVK 系统/诊断、太阳与阴影、光照时钟与昼夜、点光源、体积光、体积雾、
 闪电、闪电模板、数学公式和曲线。根 `WarVK` 分类只保留版本、协议、功能位与运行时
