@@ -65,6 +65,10 @@ struct War3ShadowReplayValidationInput {
   uint32_t firstVertex = 0u;
   uint32_t vertexCount = 0u;
   bool actualIndexDomainKnown = false;
+  // The producer froze the complete current VB because the exact IB domain
+  // was CPU-opaque. numVertices then describes the frozen backing rather than
+  // a D3D draw range that should be shifted by vertexOffset again.
+  bool fullVertexDomainFallback = false;
   uint32_t actualIndexMin = 0u;
   uint32_t actualIndexMax = 0u;
 

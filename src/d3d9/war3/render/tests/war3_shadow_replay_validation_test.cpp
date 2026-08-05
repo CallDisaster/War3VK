@@ -53,6 +53,13 @@ int main() {
   assert(ValidateWar3ShadowReplayDraw(input).reason ==
          War3ShadowReplayRejectReason::PositionRangeOutOfBounds);
   input = ValidIndexed();
+  input.actualIndexDomainKnown = false;
+  input.fullVertexDomainFallback = true;
+  input.vertexOffset = 4096;
+  input.numVertices = 16u;
+  input.position.size = 16u * input.position.stride;
+  assert(ValidateWar3ShadowReplayDraw(input));
+  input = ValidIndexed();
   input.blendRequired = true;
   assert(ValidateWar3ShadowReplayDraw(input).reason ==
          War3ShadowReplayRejectReason::MissingBlendBuffer);

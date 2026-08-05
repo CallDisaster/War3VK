@@ -1,5 +1,45 @@
 # Agents.md - 项目进度与交接文档
 
+## 🚨 2026-08-05（跨地图生命周期候选的整屏阴影回归热修）
+
+用户部署跨地图 epoch/replay 验证候选后，地图启动时出现整屏阴影，稳定后仍有覆盖近半屏的
+错误暗区。事发快照并非 Arena 或 epoch 错配：153 个计划 caster 全部在最终 replay
+验证器被 `PositionRangeOutOfBounds` 拒绝，累计 8644 次，validated/drawn 均为 0。
+
+**确定回归与修复**：
+
+- exact-index domain 无法由 CPU 读取时，生产者已经冻结完整 bounded VB，并保留原始
+  `BaseVertexIndex` 给 Vulkan replay。新验证器却把该偏移再次加到完整 backing 容量末端，
+  因此 512 KiB backing 被虚构成需要 663532 bytes。新增明确的
+  `fullVertexDomainFallback` 验证输入：该路线验证完整 position/blend/UV backing 覆盖与
+  exact IB 字节范围，不再把 BaseVertex 偏移重复施加到 backing 容量；实际 draw addressing
+  保持不变。
+- 同 epoch last-good 的 8 帧上限原先只把计数减为零，却未撤销
+  `m_hasCompleteShadowMap`，导致加载阶段的不完整 CSM 可被永久采样。验证持续失败且 hold
+  用尽后现在真正撤销 complete publication 并清空 last-good 身份。
+- 新 epoch 尚无完整 CSM 时，receiver 原先仍以正常强度采样新分配但未发布的 depth image，
+  会把地图整体压黑。现在只有 `receiverHasUsableDirectionalShadow` 成立才向 UBO 写入阴影
+  强度，否则固定为 0；资源仍保留，第一张完整 candidate 建立后一次性启用。
+
+**验证与候选**：
+
+- 全量 `test_*_static.py` 456/456 PASS；全部 15 个 Win32 Meson runnable PASS；Win32
+  DLL build PASS，`ninja -C build32 -n` no-work，targeted diff-check 无 whitespace error。
+- 隔离桌面高压光影图短门完成：最终 planned/validated/drawn 为 257/257/257，validation
+  reject、partial prevented、Arena overflow/partial 和 device lost 均为 0；首张完整 CSM
+  latency 为 1 帧。旧 `hot-shadow` semantic marker 仍会假阴性，按既有 `--no-hot-shadow`
+  门复跑后 `stage=done`；没有放宽 replay/Arena/device 正确性计数。
+- 最终截图 `AutoTest/artifacts/screenshots/war3_20260805_093430.png` 目检未见整屏/半屏错误
+  阴影，普通局部投影恢复。build32 与部署 `E:\\Work\\War3\\d3d9.dll` exact：
+  33,721,526 bytes，SHA-256
+  `B111320D81D087C3DF8C93FCBF6BCDCEE3AB02F4413672ABBCC534465756A501`；直接回退为
+  `E:\\Work\\War3\\d3d9.dll.bak_20260805_109A_cross_map_visual_regression`，SHA-256
+  `109A46B88B18E96BAB75F0A43F038A72F78A3CC53B6B020B398158812EF2A5C3`。
+
+**验收边界**：隔离桌面只能证明本次确定性 regression 与高压图短门闭合；仍需用户在物理
+桌面复测光影图启动、A→B 跨地图及“生与死”低视角。物理验收前不得宣称完整跨地图 TDR
+问题已经发布完成。
+
 ## 🚨 2026-08-05（跨地图阴影 epoch、Arena quarantine 与 replay 原子发布静态候选）
 
 用户确认只有“光影测试图 → 退出 → 生与死”同进程链容易触发整批阴影全灭/逐个补回及

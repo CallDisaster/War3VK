@@ -118,6 +118,19 @@ War3ShadowReplayValidationResult ValidateWar3ShadowReplayDraw(
             War3ShadowReplayRejectReason::InvalidActualIndexDomain);
       sourceMinimum = input.actualIndexMin;
       sourceMaximum = input.actualIndexMax;
+    } else if (input.fullVertexDomainFallback) {
+      // The exact current IB was frozen together with the complete bounded VB,
+      // but its domain was CPU-opaque. Applying BaseVertexIndex to the entire
+      // [0, capacity) backing falsely rejects every positive base vertex.
+      // Validate complete attribute coverage; index byte bounds are already
+      // proven above and replay uses the same current-draw addressing tuple.
+      const uint64_t count = input.numVertices != 0u
+          ? input.numVertices
+          : input.vertexCount;
+      if (count == 0u)
+        return Reject(War3ShadowReplayRejectReason::EmptyDraw);
+      sourceMinimum = 0u;
+      sourceMaximum = count - 1u;
     } else {
       const uint64_t count = input.numVertices != 0u
           ? input.numVertices
@@ -127,8 +140,12 @@ War3ShadowReplayValidationResult ValidateWar3ShadowReplayDraw(
       if (!CheckedAdd(sourceMinimum, count - 1u, sourceMaximum))
         return Reject(War3ShadowReplayRejectReason::VertexDomainOverflow);
     }
-    minimumVertex = int64_t(sourceMinimum) + int64_t(input.vertexOffset);
-    maximumVertex = int64_t(sourceMaximum) + int64_t(input.vertexOffset);
+    const int64_t appliedVertexOffset =
+        input.fullVertexDomainFallback && !input.actualIndexDomainKnown
+            ? 0
+            : int64_t(input.vertexOffset);
+    minimumVertex = int64_t(sourceMinimum) + appliedVertexOffset;
+    maximumVertex = int64_t(sourceMaximum) + appliedVertexOffset;
     if (minimumVertex < 0 || maximumVertex < minimumVertex)
       return Reject(War3ShadowReplayRejectReason::NegativeVertexDomain, 0u,
                     input.position.size, minimumVertex, maximumVertex);

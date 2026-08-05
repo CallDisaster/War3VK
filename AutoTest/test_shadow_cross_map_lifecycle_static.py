@@ -127,6 +127,8 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
         self.assertLess(incomplete, clear)
         self.assertIn("IncompleteReplayPlan", render)
         self.assertIn("m_replayValidationHoldFramesRemaining = 8u", SHADOW)
+        self.assertIn("m_hasCompleteShadowMap = false", SHADOW)
+        self.assertIn("receiverHasUsableDirectionalShadow\n        ? receiverShadowStrength", SHADOW)
 
     def test_receiver_rejects_cross_epoch_and_invalidates_publication(self) -> None:
         invalidate = body(

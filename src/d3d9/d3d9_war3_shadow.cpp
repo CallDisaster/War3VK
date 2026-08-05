@@ -408,6 +408,7 @@ MakeWar3ShadowReplayValidationInput(
   validation.firstVertex = draw.firstVertex;
   validation.vertexCount = draw.vertexCount;
   validation.actualIndexDomainKnown = draw.shadowActualIndexDomainKnown;
+  validation.fullVertexDomainFallback = draw.shadowFullVertexDomainFallback;
   validation.actualIndexMin = draw.shadowActualIndexMin;
   validation.actualIndexMax = draw.shadowActualIndexMax;
 
@@ -9787,20 +9788,30 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         --m_replayValidationHoldFramesRemaining;
         reconciliation.receiverReuseShadowMap = 1u;
         directionalMapResolvedForFrame = true;
-      } else if (!m_hasCompleteShadowMap) {
-        m_lastShadowMapCasterCount = 0u;
-        m_lastDynamicPoseSignature = 0u;
-        m_lastShadowMapReplayContentHash = 0u;
-        m_lastShadowMapReplayBackingHash = 0u;
-        m_lastShadowMapStagePolicyRevision = 0u;
-        m_lastShadowMapCsmHash = 0u;
-        m_lastShadowMapResourceGeneration = 0u;
-        m_lastShadowMapSemanticIdentityHash = 0u;
-        m_pendingShadowMapSemanticIdentityHash = 0u;
-        m_pendingShadowMapSemanticIdentityStableFrames = 0u;
-        m_semanticIdentityChurnHoldFramesRemaining = 0u;
-        m_transientEmptyReplayHoldFramesRemaining = 0u;
-        m_hasLastShadowMapLighting = false;
+      } else {
+        // The same-epoch recovery window is a real upper bound. The old code
+        // stopped decrementing at zero but left completeness set forever,
+        // allowing a loading-camera CSM to cover the screen indefinitely.
+        if (m_replayValidationFailedThisFrame &&
+            m_hasCompleteShadowMap &&
+            m_replayValidationHoldFramesRemaining == 0u) {
+          m_hasCompleteShadowMap = false;
+        }
+        if (!m_hasCompleteShadowMap) {
+          m_lastShadowMapCasterCount = 0u;
+          m_lastDynamicPoseSignature = 0u;
+          m_lastShadowMapReplayContentHash = 0u;
+          m_lastShadowMapReplayBackingHash = 0u;
+          m_lastShadowMapStagePolicyRevision = 0u;
+          m_lastShadowMapCsmHash = 0u;
+          m_lastShadowMapResourceGeneration = 0u;
+          m_lastShadowMapSemanticIdentityHash = 0u;
+          m_pendingShadowMapSemanticIdentityHash = 0u;
+          m_pendingShadowMapSemanticIdentityStableFrames = 0u;
+          m_semanticIdentityChurnHoldFramesRemaining = 0u;
+          m_transientEmptyReplayHoldFramesRemaining = 0u;
+          m_hasLastShadowMapLighting = false;
+        }
       }
     }
   }
@@ -10219,7 +10230,12 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     const bool receiverHasUsableDirectionalShadow =
         receiverNeedsShadowMap && m_hasCompleteShadowMap && m_shadowMap &&
         m_shadowMapSampleView;
-    const float uboShadowStrength = receiverShadowStrength;
+    // Newly allocated/new-epoch depth images have no meaningful contents
+    // before the first complete candidate. Sampling them with normal strength
+    // turns the entire map black during fail-closed admission.
+    const float uboShadowStrength = receiverHasUsableDirectionalShadow
+        ? receiverShadowStrength
+        : 0.0f;
     reconciliation.receiverHasUsableDirectionalShadow =
         receiverHasUsableDirectionalShadow ? 1u : 0u;
     reconciliation.receiverUboStrengthMilli =
