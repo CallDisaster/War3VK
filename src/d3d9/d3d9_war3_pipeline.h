@@ -119,11 +119,15 @@ namespace dxvk {
         bool m_hadWorldDraw = false;
         float m_lastAutoExposure = 0.0f;
         bool m_hasAutoExposure = false;
+        uint64_t m_lightingClockRevision = 0u;
+        float m_lightingClockTime01 = 0.5f;
+        std::chrono::steady_clock::time_point m_lightingClockLastUpdate;
 
         // 旁路开关（每帧 OnFrameStart 刷新）
         bool m_wantsBeforeUiInsertion = true;
         bool m_wantsShadowCapture = true;
-        // 日夜循环状态已移动到 War3ShadowReceiverPass
+        // Direction/color consumption remains in War3ShadowReceiverPass; the
+        // render-only authored clock advances here even when shadows are off.
     };
 
 } // namespace dxvk

@@ -8,7 +8,7 @@
  * - 注册渲染事件回调
  * - 禁用内置渲染效果
  * 
- * @version 1.1.0
+ * @version 1.2.0 Release
  * @date 2024-12-21
  * 
  * @copyright Copyright (c) 2024 War3MapReforge
@@ -51,7 +51,7 @@ struct LightData;
  */
 constexpr uint32_t API_VERSION_MAJOR = 1;
 constexpr uint32_t API_VERSION_MINOR = 2;
-constexpr uint32_t API_VERSION_PATCH = 2;
+constexpr uint32_t API_VERSION_PATCH = 0;
 
 /**
  * @brief 获取 API 版本号
@@ -612,6 +612,7 @@ WAR3_SHADER_API bool SetVolumetricLightParams(
     uint32_t sampleCount);
 WAR3_SHADER_API bool SetVolumetricLightFade(
     float fadeNear, float fadeFar, float maxRayDistance);
+WAR3_SHADER_API bool SetVolumetricHeightFogEnabled(bool enabled);
 WAR3_SHADER_API bool SetVolumetricHeightFog(
     float baseHeight, float falloff, float strength);
 WAR3_SHADER_API bool SetVolumetricResolutionDivisor(uint32_t divisor);

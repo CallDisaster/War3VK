@@ -8699,32 +8699,35 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
   float rawTime01 = 0.0f;
   const float realGameTime = War3RenderState::GetGameTime();
+  const War3DayNightSettings &dayNightSettings = settings->dayNight;
+  auto *globalSettings = const_cast<War3RenderSettings *>(settings);
 
   static bool s_hasValidGameTime = false;
-  const bool hasRealGameTime = (realGameTime >= 0.0f && realGameTime <= 24.0f);
-  if (hasRealGameTime) {
-    // 使用真实游戏时间
+  const bool hasRealGameTime =
+      realGameTime >= 0.0f && realGameTime <= 24.0f;
+  const War3LightingClockMode clockMode = dayNightSettings.clockMode;
+  if (clockMode != War3LightingClockMode::GameTime) {
+    rawTime01 = wrap01(dayNightSettings.renderTimeHours / 24.0f);
+    m_timeSmoothingInitialized = false;
+  } else if (hasRealGameTime) {
+    // Game Time 0=Midnight, 6=Sunrise, 18=Sunset, 24=Midnight.
     if (!s_hasValidGameTime) {
       s_hasValidGameTime = true;
       WAR3_RENDER_LOG("DXVK War3Shadow: Switched to Real Game Time! t=%f\n",
                       realGameTime);
     }
-    // Game Time 0=Midnight, 6=Sunrise, 18=Sunset, 24=Midnight
-    // Logic expects: 0.0=Midnight, 0.25=Sunrise, 0.5=Noon, 0.75=Sunset
-    // Conversion: time01 = time / 24.0
     rawTime01 = wrap01(realGameTime / 24.0f);
   } else {
-    // Fallback to simulated time if Jass not ready yet
-
-    // Diagnostic: Why was realGameTime rejected?
+    // Follow-game mode retains the historical startup fallback until the
+    // native TIME_OF_DAY source becomes readable.
     static int s_failLog = 0;
     if (s_failLog++ < 10) {
       WAR3_RENDER_LOG("DXVK War3Shadow: Fallback used. RealGameTime=%.4f "
                       "(Valid Range: 0-24)\n",
                       realGameTime);
     }
-
-    float elapsed = std::chrono::duration<float>(now - m_timeStart).count();
+    const float elapsed =
+        std::chrono::duration<float>(now - m_timeStart).count();
     rawTime01 = wrap01(elapsed / m_dayLengthSeconds + m_startTime01);
   }
 
@@ -8738,7 +8741,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   // 说明：TIME_OF_DAY 通常是 100ms 台阶更新；这里把它平滑成逐帧连续值，
   // 以消除日夜切换/太阳移动时的高频跳变（尤其在 CSM 与阴影接收器上很明显）。
   float time01 = rawTime01;
-  if (hasRealGameTime && !shadowSettings.lockSun) {
+  if (clockMode == War3LightingClockMode::GameTime && hasRealGameTime &&
+      !shadowSettings.lockSun) {
     if (!m_timeSmoothingInitialized) {
       m_timeSmoothingInitialized = true;
       m_time01Smoothed = rawTime01;
@@ -8795,6 +8799,9 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     }
     time01 = m_time01Smoothed;
   }
+
+  if (globalSettings)
+    globalSettings->dayNight.renderTimeHours = wrap01(time01) * 24.0f;
 
   // 2. 计算太阳的“真实”轨迹 (Real Trajectory)
   // 假设：X=东, -X=西, Y=北, -Y=南, Z=上
@@ -9024,6 +9031,42 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   finalLightColor = useDayLight ? dayLightColor : nightLightColor;
   finalShadowStrength = useDayLight ? dayShadowStrength : nightShadowStrength;
 
+  if (dayNightSettings.timeColorGradingEnabled &&
+      dayNightSettings.customColorTemperatureProfile) {
+    const auto validKelvin = [](float value, float fallback) {
+      return std::isfinite(value)
+          ? std::clamp(value, 1000.0f, 20000.0f)
+          : fallback;
+    };
+    const float keyKelvin[4] = {
+        validKelvin(dayNightSettings.midnightKelvin, 9000.0f),
+        validKelvin(dayNightSettings.dawnKelvin, 2500.0f),
+        validKelvin(dayNightSettings.noonKelvin, 6500.0f),
+        validKelvin(dayNightSettings.duskKelvin, 2500.0f),
+    };
+    const float hours = wrap01(time01) * 24.0f;
+    const uint32_t segment =
+        std::min(3u, static_cast<uint32_t>(hours / 6.0f));
+    const uint32_t next = (segment + 1u) & 3u;
+    const float segmentT = smoothstep01(
+        (hours - static_cast<float>(segment) * 6.0f) / 6.0f);
+    const float kelvin = keyKelvin[segment] +
+        (keyKelvin[next] - keyKelvin[segment]) * segmentT;
+    const float brightness =
+        useDayLight ? dayLightFactor : nightLightFactor;
+    finalLightColor = kelvinToRgb(kelvin) * brightness;
+  }
+
+  // Manual ownership is final. When a cycle is disabled the pass neither
+  // rewrites the corresponding global sun value nor substitutes a local CSM
+  // value, so a JASS setting remains stable on every subsequent frame.
+  if (!dayNightSettings.celestialMotionEnabled) {
+    finalLightDir = settings->sun.direction;
+    finalShadowStrength = settings->shadows.strength;
+  }
+  if (!dayNightSettings.timeColorGradingEnabled)
+    finalLightColor = settings->sun.color;
+
   // [Event System] Update Phase
   bool isRising = std::cos(time01 * (2.0f * 3.14159265f)) >= 0.0f;
   UpdatePhase(realAltitudeRad, isRising, kTransitionRad);
@@ -9032,10 +9075,11 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   // fixed-function main light and volumetric pass can see the same cold/warm
   // cycle. Only direction/color are synchronized here; shadow strength stays
   // local so shadow-specific tuning is not hard-overwritten every frame.
-  auto *globalSettings = const_cast<War3RenderSettings *>(settings);
   if (globalSettings) {
-    globalSettings->sun.direction = finalLightDir;
-    globalSettings->sun.color = finalLightColor;
+    if (dayNightSettings.celestialMotionEnabled)
+      globalSettings->sun.direction = finalLightDir;
+    if (dayNightSettings.timeColorGradingEnabled)
+      globalSettings->sun.color = finalLightColor;
   }
 
   // Shadow-specific day-night strength remains local to this pass.
@@ -9093,7 +9137,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     m_csmConfig.farCasterDepthExtension =
         std::clamp(s_farCasterDepthExtensionOverride, 0.0f, 4096.0f);
   }
-  if (!shadowSettings.lockSun && !shadowSettings.stableSnapWhenSunMoving) {
+  if (dayNightSettings.celestialMotionEnabled && !shadowSettings.lockSun &&
+      !shadowSettings.stableSnapWhenSunMoving) {
     m_csmConfig.stableSnap = 0.0f;
   }
   // Settings can also arrive through runtime/UI paths, so keep a consumer-side

@@ -2,7 +2,7 @@
  * @file war3_shader_api.cpp
  * @brief War3MapReforge 外部 Shader API 实现
  * 
- * @version 1.1.0
+ * @version 1.2.0 Release
  * @date 2024-12-21
  */
 
@@ -869,6 +869,14 @@ WAR3_SHADER_API bool SetVolumetricLightFade(float fadeNear, float fadeFar,
     volumetric.fadeFar =
         std::clamp(fadeFar, volumetric.fadeNear + 0.01f, 1.0f);
     volumetric.maxRayDistance = std::max(0.05f, maxRayDistance);
+    return true;
+}
+
+WAR3_SHADER_API bool SetVolumetricHeightFogEnabled(bool enabled) {
+    auto* settings = GetMutableSettings();
+    if (!settings)
+        return false;
+    settings->postFx.volumetricLight.heightFogEnabled = enabled;
     return true;
 }
 

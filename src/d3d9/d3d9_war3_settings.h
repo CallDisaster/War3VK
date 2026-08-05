@@ -262,6 +262,10 @@ struct War3VolumetricLightSettings {
   // 地表端 [L-D,L] 下 D=sunDistance*maxRayDistance；1400 覆盖常见 RTS 射线尾。
   float sunDistance = 1400.0f;
   float froxelNear = 20.0f;
+  // Global height fog is an independent author control. Disabling it keeps
+  // directional and point-light scattering active while removing the height
+  // density profile from the medium.
+  bool heightFogEnabled = true;
   float heightFogBase = 0.0f;
   float heightFogFalloff = 0.0012f;
   float heightFogStrength = 0.35f;
@@ -317,8 +321,38 @@ struct War3PostFxSettings {
   bool useSrgb = false;
 };
 
+enum class War3LightingClockMode : uint8_t {
+  GameTime = 0,
+  Held = 1,
+  Independent = 2,
+};
+
 struct War3DayNightSettings {
   bool enabled = true;
+  // Author-facing ownership is deliberately split. Celestial motion owns the
+  // directional-light vector and shadow strength; time color grading owns the
+  // sun color plus the ambient/exposure cycle. Disabling both leaves manual
+  // sun direction/color writes untouched across subsequent render frames.
+  bool celestialMotionEnabled = true;
+  bool timeColorGradingEnabled = true;
+
+  // GameTime follows Warcraft TIME_OF_DAY. Held uses renderTimeHours without
+  // advancing. Independent advances from renderTimeHours using a render-only
+  // day duration and never mutates Warcraft gameplay time.
+  War3LightingClockMode clockMode = War3LightingClockMode::GameTime;
+  float renderTimeHours = 12.0f;
+  float independentDayLengthSeconds = 480.0f;
+  uint64_t clockRevision = 1u;
+
+  // The legacy curve remains the default until an author submits a profile.
+  // Custom values are sampled at 00:00/06:00/12:00/18:00 and interpolated
+  // cyclically. Kelvin values are bounded by the public JAPI to 1000..20000.
+  bool customColorTemperatureProfile = false;
+  float midnightKelvin = 9000.0f;
+  float dawnKelvin = 2500.0f;
+  float noonKelvin = 6500.0f;
+  float duskKelvin = 2500.0f;
+
   bool affectAmbient = true;
   bool affectExposure = false;
   float transitionMinFactor = 0.85f;

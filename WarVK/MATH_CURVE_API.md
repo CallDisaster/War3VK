@@ -21,6 +21,23 @@ JASS 编译公式并设置参数
   -> 闪电 Ribbon 消费曲线点
 ```
 
+## 直接取得科学计算结果
+
+返回 `scalar` 的程序不必绑定闪电。用 `WarVKCreateCurve` 建立参数化计算、通过
+`WarVKSetCurveReal` 写入公式参数后，可以调用：
+
+- `WarVKEvaluateMathReal(curveId, t, time, seed)`：返回 JASS `real`；
+- `WarVKEvaluateMathInteger(curveId, t, time, seed, roundingMode)`：返回 JASS `integer`。
+
+这两个查询在 `1.2.0 Release` 中优先通过原生 Hashtable 的 `SaveReal`/
+`LoadReal` 与 `SaveInteger`/`LoadInteger` 传递数值，不再为每次求值创建命令字符串或
+实数返回字符串；公开函数签名保持不变，快速通道不可用时自动回退到 `warvk:v1`。
+
+整数舍入模式为 `WARVK_MATH_ROUND_NEAREST/FLOOR/CEIL/TRUNCATE`。`t` 限制在
+0..1，`time` 与 `seed` 作为本次求值上下文；不使用它们的普通科学公式可直接传 0。
+公式计算失败、结果非有限或整数越界时接口返回 0，同时设置 WarVK 最后错误，因此
+需要区分“正确结果为 0”和失败时应读取 `WarVKGetLastErrorCode()`。
+
 ## 表达式语法
 
 第一阶段支持有限浮点数、圆括号、一元正负号、`+ - * /`、函数调用，以及

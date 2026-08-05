@@ -55,11 +55,23 @@ using NativeDisplayTextToPlayerFn =
     void(__cdecl *)(uint32_t, float *, float *, uint32_t);
 using NativeDisplayTimedTextToPlayerFn =
     void(__cdecl *)(uint32_t, float *, float *, float *, uint32_t);
+using NativeSaveIntegerFn =
+    void(__cdecl *)(uint32_t, int32_t, int32_t, int32_t);
+using NativeSaveRealFn =
+    void(__cdecl *)(uint32_t, int32_t, int32_t, float *);
+using NativeLoadIntegerFn =
+    int32_t(__cdecl *)(uint32_t, int32_t, int32_t);
+using NativeLoadRealFn =
+    float(__cdecl *)(uint32_t, int32_t, int32_t);
 
 enum class CarrierKind {
   Command,
   IntQuery,
   StringQuery,
+  TypedSaveInteger,
+  TypedSaveReal,
+  TypedLoadInteger,
+  TypedLoadReal,
 };
 
 struct CarrierPatch {
@@ -84,8 +96,12 @@ struct BridgeState {
 
 std::atomic<uintptr_t> s_lookupFn{0};
 std::atomic<bool> s_allInstalled{false};
+std::atomic<bool> s_typedInstalled{false};
+std::atomic<bool> s_typedInstallAttempted{false};
 std::atomic<uint64_t> s_installAttempts{0};
 std::atomic<uint64_t> s_installSuccesses{0};
+std::atomic<uint64_t> s_typedInstallAttempts{0};
+std::atomic<uint64_t> s_typedInstallSuccesses{0};
 std::mutex s_installMutex;
 std::mutex s_stateMutex;
 BridgeState s_state;
@@ -845,12 +861,6 @@ bool CopyNativeSignature(const char *signature, std::string &out) {
   return false;
 }
 
-bool SignatureLooksLikeOneStringArg(const char *sigPtr) {
-  if (!sigPtr || !dxvk::war3::IsReadableRange(sigPtr, 4))
-    return false;
-  return sigPtr[0] == '(' && sigPtr[1] == 'S';
-}
-
 const char *ExpectedCarrierSignature(CarrierKind kind) {
   switch (kind) {
   case CarrierKind::Command:
@@ -859,15 +869,41 @@ const char *ExpectedCarrierSignature(CarrierKind kind) {
     return "(S)I";
   case CarrierKind::StringQuery:
     return "(S)S";
+  case CarrierKind::TypedSaveInteger:
+    return "(Hhashtable;III)V";
+  case CarrierKind::TypedSaveReal:
+    return "(Hhashtable;IIR)V";
+  case CarrierKind::TypedLoadInteger:
+    return "(Hhashtable;II)I";
+  case CarrierKind::TypedLoadReal:
+    return "(Hhashtable;II)R";
   }
   return "";
 }
 
+uint32_t ExpectedCarrierParameterCount(CarrierKind kind) {
+  switch (kind) {
+  case CarrierKind::Command:
+  case CarrierKind::IntQuery:
+  case CarrierKind::StringQuery:
+    return 1u;
+  case CarrierKind::TypedSaveInteger:
+  case CarrierKind::TypedSaveReal:
+    return 4u;
+  case CarrierKind::TypedLoadInteger:
+  case CarrierKind::TypedLoadReal:
+    return 3u;
+  }
+  return 0u;
+}
+
 bool SignatureMatchesCarrier(const char *sigPtr, CarrierKind kind) {
   const char *expected = ExpectedCarrierSignature(kind);
-  if (!sigPtr || !expected || !dxvk::war3::IsReadableRange(sigPtr, 5u))
+  const size_t length = expected ? std::strlen(expected) : 0u;
+  if (!sigPtr || !expected || length == 0u ||
+      !dxvk::war3::IsReadableRange(sigPtr, length + 1u))
     return false;
-  return std::memcmp(sigPtr, expected, 5u) == 0;
+  return std::memcmp(sigPtr, expected, length + 1u) == 0;
 }
 
 bool WriteNativeFuncPtr(void *entry, void *bridgeFn) {
@@ -902,6 +938,11 @@ int HandleWarVkPayload(CarrierKind kind, const std::string &payload,
   case CarrierKind::StringQuery:
     s_state.stringQueryCount += 1;
     break;
+  case CarrierKind::TypedSaveInteger:
+  case CarrierKind::TypedSaveReal:
+  case CarrierKind::TypedLoadInteger:
+  case CarrierKind::TypedLoadReal:
+    return 0;
   }
 
   if (payload == "ping") {
@@ -1100,6 +1141,14 @@ uint32_t MakeSyntheticNativeStringArg(const char *text) {
 void __cdecl Bridge_Preloader(uint32_t nativeArg);
 int __cdecl Bridge_GetLocalizedHotkey(uint32_t nativeArg);
 uint32_t __cdecl Bridge_GetLocalizedString(uint32_t nativeArg);
+void __cdecl Bridge_SaveInteger(uint32_t table, int32_t parentKey,
+                                int32_t childKey, int32_t value);
+void __cdecl Bridge_SaveReal(uint32_t table, int32_t parentKey,
+                             int32_t childKey, float *value);
+int32_t __cdecl Bridge_LoadInteger(uint32_t table, int32_t parentKey,
+                                  int32_t childKey);
+float __cdecl Bridge_LoadReal(uint32_t table, int32_t parentKey,
+                              int32_t childKey);
 
 CarrierPatch s_preloader{
     "Preloader", CarrierKind::Command,
@@ -1110,8 +1159,22 @@ CarrierPatch s_hotkey{
 CarrierPatch s_string{
     "GetLocalizedString", CarrierKind::StringQuery,
     reinterpret_cast<void *>(&Bridge_GetLocalizedString)};
+CarrierPatch s_saveInteger{
+    "SaveInteger", CarrierKind::TypedSaveInteger,
+    reinterpret_cast<void *>(&Bridge_SaveInteger)};
+CarrierPatch s_saveReal{
+    "SaveReal", CarrierKind::TypedSaveReal,
+    reinterpret_cast<void *>(&Bridge_SaveReal)};
+CarrierPatch s_loadInteger{
+    "LoadInteger", CarrierKind::TypedLoadInteger,
+    reinterpret_cast<void *>(&Bridge_LoadInteger)};
+CarrierPatch s_loadReal{
+    "LoadReal", CarrierKind::TypedLoadReal,
+    reinterpret_cast<void *>(&Bridge_LoadReal)};
 
-CarrierPatch *AllCarriers[] = {&s_preloader, &s_hotkey, &s_string};
+CarrierPatch *CoreCarriers[] = {&s_preloader, &s_hotkey, &s_string};
+CarrierPatch *TypedCarriers[] = {
+    &s_saveInteger, &s_saveReal, &s_loadInteger, &s_loadReal};
 
 void CallOriginalVoid(CarrierPatch &patch, uint32_t nativeArg) {
   const auto fn = reinterpret_cast<NativeVoidStringFn>(
@@ -1130,6 +1193,36 @@ uint32_t CallOriginalString(CarrierPatch &patch, uint32_t nativeArg) {
   const auto fn = reinterpret_cast<NativeStringStringFn>(
       patch.originalFn.load(std::memory_order_relaxed));
   return fn ? fn(nativeArg) : 0;
+}
+
+void CallOriginalSaveInteger(uint32_t table, int32_t parentKey,
+                             int32_t childKey, int32_t value) {
+  const auto fn = reinterpret_cast<NativeSaveIntegerFn>(
+      s_saveInteger.originalFn.load(std::memory_order_relaxed));
+  if (fn)
+    fn(table, parentKey, childKey, value);
+}
+
+void CallOriginalSaveReal(uint32_t table, int32_t parentKey,
+                          int32_t childKey, float *value) {
+  const auto fn = reinterpret_cast<NativeSaveRealFn>(
+      s_saveReal.originalFn.load(std::memory_order_relaxed));
+  if (fn)
+    fn(table, parentKey, childKey, value);
+}
+
+int32_t CallOriginalLoadInteger(uint32_t table, int32_t parentKey,
+                                int32_t childKey) {
+  const auto fn = reinterpret_cast<NativeLoadIntegerFn>(
+      s_loadInteger.originalFn.load(std::memory_order_relaxed));
+  return fn ? fn(table, parentKey, childKey) : 0;
+}
+
+float CallOriginalLoadReal(uint32_t table, int32_t parentKey,
+                           int32_t childKey) {
+  const auto fn = reinterpret_cast<NativeLoadRealFn>(
+      s_loadReal.originalFn.load(std::memory_order_relaxed));
+  return fn ? fn(table, parentKey, childKey) : 0.0f;
 }
 
 void __cdecl Bridge_Preloader(uint32_t nativeArg) {
@@ -1162,6 +1255,57 @@ uint32_t __cdecl Bridge_GetLocalizedString(uint32_t nativeArg) {
   return CallOriginalString(s_string, nativeArg);
 }
 
+void __cdecl Bridge_SaveInteger(uint32_t table, int32_t parentKey,
+                                int32_t childKey, int32_t value) {
+  if (dxvk::war3::internal::kWar3JassCommandBridgeEnabled &&
+      dxvk::war3::japi::TryTypedSaveInteger(
+          table, parentKey, childKey, value)) {
+    s_saveInteger.handled.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  s_saveInteger.passedThrough.fetch_add(1, std::memory_order_relaxed);
+  CallOriginalSaveInteger(table, parentKey, childKey, value);
+}
+
+void __cdecl Bridge_SaveReal(uint32_t table, int32_t parentKey,
+                             int32_t childKey, float *value) {
+  if (dxvk::war3::internal::kWar3JassCommandBridgeEnabled && value &&
+      dxvk::war3::IsReadableRange(value, sizeof(float)) &&
+      dxvk::war3::japi::TryTypedSaveReal(
+          table, parentKey, childKey, *value)) {
+    s_saveReal.handled.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  s_saveReal.passedThrough.fetch_add(1, std::memory_order_relaxed);
+  CallOriginalSaveReal(table, parentKey, childKey, value);
+}
+
+int32_t __cdecl Bridge_LoadInteger(uint32_t table, int32_t parentKey,
+                                  int32_t childKey) {
+  int32_t result = 0;
+  if (dxvk::war3::internal::kWar3JassCommandBridgeEnabled &&
+      dxvk::war3::japi::TryTypedLoadInteger(
+          table, parentKey, childKey, result)) {
+    s_loadInteger.handled.fetch_add(1, std::memory_order_relaxed);
+    return result;
+  }
+  s_loadInteger.passedThrough.fetch_add(1, std::memory_order_relaxed);
+  return CallOriginalLoadInteger(table, parentKey, childKey);
+}
+
+float __cdecl Bridge_LoadReal(uint32_t table, int32_t parentKey,
+                              int32_t childKey) {
+  float result = 0.0f;
+  if (dxvk::war3::internal::kWar3JassCommandBridgeEnabled &&
+      dxvk::war3::japi::TryTypedLoadReal(
+          table, parentKey, childKey, result)) {
+    s_loadReal.handled.fetch_add(1, std::memory_order_relaxed);
+    return result;
+  }
+  s_loadReal.passedThrough.fetch_add(1, std::memory_order_relaxed);
+  return CallOriginalLoadReal(table, parentKey, childKey);
+}
+
 struct PreparedCarrier {
   CarrierPatch *patch = nullptr;
   void *entry = nullptr;
@@ -1188,7 +1332,7 @@ bool PrepareCarrier(GetTlsJassDataFn lookupFn, CarrierPatch &patch,
   uint32_t retType = 0;
   if (!ReadNativeMeta(entry, funcPtr, sigPtr, paramCount, retType))
     return false;
-  if (paramCount != 1 || !SignatureLooksLikeOneStringArg(sigPtr) ||
+  if (paramCount != ExpectedCarrierParameterCount(patch.kind) ||
       !SignatureMatchesCarrier(sigPtr, patch.kind)) {
     war3dbg::Print(
         "DXVK War3JassBridge: skip %s unexpected signature sig=%s argc=%u ret=%u\n",
@@ -1215,18 +1359,108 @@ bool PrepareCarrier(GetTlsJassDataFn lookupFn, CarrierPatch &patch,
   return true;
 }
 
+bool TryInstallTypedCarriers(GetTlsJassDataFn lookupFn, const char *reason) {
+  if (s_typedInstalled.load(std::memory_order_acquire))
+    return true;
+  if (s_typedInstallAttempted.exchange(true, std::memory_order_acq_rel))
+    return false;
+
+  const uint64_t attempt =
+      s_typedInstallAttempts.fetch_add(1, std::memory_order_relaxed) + 1u;
+  std::array<PreparedCarrier, 4u> prepared = {};
+  bool allOk = true;
+  for (size_t index = 0u; index < prepared.size(); ++index) {
+    allOk = PrepareCarrier(
+                lookupFn, *TypedCarriers[index], prepared[index]) &&
+            allOk;
+  }
+
+  std::array<bool, 4u> written = {};
+  if (allOk) {
+    for (size_t index = 0u; index < prepared.size(); ++index) {
+      PreparedCarrier &item = prepared[index];
+      item.patch->entry.store(
+          reinterpret_cast<uintptr_t>(item.entry),
+          std::memory_order_relaxed);
+      if (item.alreadyInstalled)
+        continue;
+      item.patch->originalFn.store(
+          reinterpret_cast<uintptr_t>(item.currentFn),
+          std::memory_order_release);
+      if (!WriteNativeFuncPtr(item.entry, item.patch->bridgeFn)) {
+        allOk = false;
+        break;
+      }
+      written[index] = true;
+    }
+  }
+
+  if (!allOk) {
+    for (size_t index = 0u; index < prepared.size(); ++index) {
+      PreparedCarrier &item = prepared[index];
+      if (!item.patch)
+        continue;
+      if (written[index])
+        static_cast<void>(WriteNativeFuncPtr(item.entry, item.currentFn));
+      item.patch->entry.store(item.previousEntry,
+                              std::memory_order_release);
+      item.patch->originalFn.store(item.previousOriginalFn,
+                                   std::memory_order_release);
+    }
+    s_typedInstalled.store(false, std::memory_order_release);
+    if (attempt <= 8u || (attempt % 128u) == 0u) {
+      war3dbg::Print(
+          "DXVK War3JassBridge: optional typed carriers unavailable reason=%s attempt=%llu; string v1 remains active\n",
+          reason ? reason : "<unknown>",
+          static_cast<unsigned long long>(attempt));
+    }
+    return false;
+  }
+
+  for (PreparedCarrier &item : prepared) {
+    if (!item.alreadyInstalled) {
+      item.patch->installCount.fetch_add(1, std::memory_order_relaxed);
+      war3dbg::Print(
+          "DXVK War3JassBridge: installed typed carrier %s entry=%p original=%p bridge=%p sig=%s ret=%u\n",
+          item.patch->name, item.entry, item.currentFn,
+          item.patch->bridgeFn, item.signature, item.returnType);
+    }
+  }
+  s_typedInstalled.store(true, std::memory_order_release);
+  const uint64_t success =
+      s_typedInstallSuccesses.fetch_add(1, std::memory_order_relaxed) + 1u;
+  war3dbg::Print(
+      "DXVK War3JassBridge: typed data plane installed reason=%s attempt=%llu success=%llu\n",
+      reason ? reason : "<unknown>",
+      static_cast<unsigned long long>(attempt),
+      static_cast<unsigned long long>(success));
+  return true;
+}
+
 } // namespace
 
 void ConfigureJassCommandBridge(GetTlsJassDataFn lookupFn) {
   s_lookupFn.store(reinterpret_cast<uintptr_t>(lookupFn),
                    std::memory_order_relaxed);
   s_allInstalled.store(false, std::memory_order_relaxed);
+  s_typedInstalled.store(false, std::memory_order_relaxed);
+  s_typedInstallAttempted.store(false, std::memory_order_relaxed);
+  dxvk::war3::japi::ResetTypedTransport();
 }
 
 void ResetJassCommandBridgeInstallState() {
   std::lock_guard<std::mutex> lock(s_installMutex);
   s_allInstalled.store(false, std::memory_order_release);
-  for (CarrierPatch *patch : AllCarriers) {
+  s_typedInstalled.store(false, std::memory_order_release);
+  s_typedInstallAttempted.store(false, std::memory_order_release);
+  dxvk::war3::japi::ResetTypedTransport();
+  for (CarrierPatch *patch : CoreCarriers) {
+    patch->entry.store(0, std::memory_order_relaxed);
+    // Preserve the proven stock target. Reset can run while an existing table
+    // is still patched; clearing it here would make exact forwarding
+    // impossible until the game happened to publish a fresh entry.
+  }
+  for (CarrierPatch *patch : TypedCarriers) {
     patch->entry.store(0, std::memory_order_relaxed);
     // Preserve the proven stock target. Reset can run while an existing table
     // is still patched; clearing it here would make exact forwarding
@@ -1239,7 +1473,8 @@ void TryInstallJassCommandBridge(const char *reason) {
     return;
   }
 
-  if (s_allInstalled.load(std::memory_order_acquire))
+  if (s_allInstalled.load(std::memory_order_acquire) &&
+      s_typedInstalled.load(std::memory_order_acquire))
     return;
 
   const auto lookupFn = reinterpret_cast<GetTlsJassDataFn>(
@@ -1248,8 +1483,10 @@ void TryInstallJassCommandBridge(const char *reason) {
     return;
 
   std::lock_guard<std::mutex> lock(s_installMutex);
-  if (s_allInstalled.load(std::memory_order_relaxed))
+  if (s_allInstalled.load(std::memory_order_relaxed)) {
+    static_cast<void>(TryInstallTypedCarriers(lookupFn, reason));
     return;
+  }
 
   const uint64_t attempt =
       s_installAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1258,7 +1495,7 @@ void TryInstallJassCommandBridge(const char *reason) {
   bool allOk = true;
   for (size_t index = 0u; index < prepared.size(); ++index) {
     allOk = PrepareCarrier(
-                lookupFn, *AllCarriers[index], prepared[index]) &&
+                lookupFn, *CoreCarriers[index], prepared[index]) &&
             allOk;
   }
 
@@ -1320,6 +1557,7 @@ void TryInstallJassCommandBridge(const char *reason) {
         reason ? reason : "<unknown>",
         static_cast<unsigned long long>(attempt),
         static_cast<unsigned long long>(success));
+    static_cast<void>(TryInstallTypedCarriers(lookupFn, reason));
   } else if (attempt <= 8 || (attempt % 128) == 0) {
     war3dbg::Print(
         "DXVK War3JassBridge: carrier install incomplete reason=%s attempt=%llu preloader=%p hotkey=%p string=%p\n",
@@ -1335,11 +1573,16 @@ bool IsJassCommandBridgeInstalled() {
   return s_allInstalled.load(std::memory_order_acquire);
 }
 
+bool IsJassTypedTransportInstalled() {
+  return s_typedInstalled.load(std::memory_order_acquire);
+}
+
 JassCommandBridgeSelfTestResult RunJassCommandBridgeSelfTest(bool displayText) {
   JassCommandBridgeSelfTestResult result = {};
 
   TryInstallJassCommandBridge("selftest");
   result.installed = IsJassCommandBridgeInstalled();
+  result.typedTransportInstalled = IsJassTypedTransportInstalled();
   if (!result.installed) {
     result.error = "bridge carriers are not installed";
     return result;
@@ -1393,7 +1636,7 @@ JassCommandBridgeSelfTestResult RunJassCommandBridgeSelfTest(bool displayText) {
   }
   result.publicV1Ok =
       result.publicProtocolVersion == 1 &&
-      result.publicVersionText.find("WarVK JAPI 1.3.0-polyline-curves") !=
+      result.publicVersionText.find("WarVK JAPI 1.2.0 Release") !=
           std::string::npos;
 
   if (displayText) {

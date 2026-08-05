@@ -72,6 +72,17 @@ globals
     constant integer WARVK_FEATURE_MATH_CURVE = 8192
     constant integer WARVK_FEATURE_POLYLINE_CURVE = 16384
 
+    // 渲染光照时钟来源。只影响 WarVK 光照，不修改 Warcraft 玩法时间。
+    constant integer WARVK_LIGHTING_CLOCK_GAME_TIME = 0
+    constant integer WARVK_LIGHTING_CLOCK_HELD = 1
+    constant integer WARVK_LIGHTING_CLOCK_INDEPENDENT = 2
+
+    // 标量公式转 integer 的舍入方式。
+    constant integer WARVK_MATH_ROUND_NEAREST = 0
+    constant integer WARVK_MATH_ROUND_FLOOR = 1
+    constant integer WARVK_MATH_ROUND_CEIL = 2
+    constant integer WARVK_MATH_ROUND_TRUNCATE = 3
+
     constant integer WARVK_OBJECT_NONE = 0
     constant integer WARVK_OBJECT_POINT_LIGHT = 1
     constant integer WARVK_OBJECT_LIGHTNING = 2

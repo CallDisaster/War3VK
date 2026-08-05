@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <string>
 
 namespace {
@@ -9,6 +10,7 @@ namespace {
 using dxvk::war3::japi::Carrier;
 using dxvk::war3::japi::Dispatch;
 using dxvk::war3::japi::ErrorCode;
+using dxvk::war3::japi::TypedOpcode;
 
 int g_failures = 0;
 
@@ -33,7 +35,7 @@ void TestSystemAndForwarding() {
   const auto version =
       Dispatch(Carrier::LocalizedString, "warvk:v1;system.version");
   Check(version.ok(), "system.version must succeed without a backend");
-  Check(version.text == "WarVK JAPI 1.3.0-polyline-curves",
+  Check(version.text == "WarVK JAPI 1.2.0 Release",
         "system.version must identify the integrated runtime");
 
   const auto protocol =
@@ -71,6 +73,21 @@ void TestStrictScalars() {
       "warvk:v1;pointLight.create;r:0;r:0;r:100;r:900;r:1;r:1;r:1;r:4");
   Check(validBackendRequest.error == ErrorCode::BackendUnavailable,
         "valid backend request must pass parsing before the test stub");
+
+  const auto validLightingClock = Dispatch(
+      Carrier::Preloader, "warvk:v1;lightingClock.holdTime;r:16.5");
+  Check(validLightingClock.error == ErrorCode::BackendUnavailable,
+        "lighting clock time must pass strict protocol parsing");
+  const auto validTemperatureProfile = Dispatch(
+      Carrier::Preloader,
+      "warvk:v1;lightingCycle.setColorTemperatureProfile;"
+      "r:9000;r:2500;r:6500;r:2800");
+  Check(validTemperatureProfile.error == ErrorCode::BackendUnavailable,
+        "temperature profile must pass strict protocol parsing");
+  CheckError(Carrier::Preloader,
+             "warvk:v1;lightingClock.setMode;r:1",
+             ErrorCode::InvalidInteger,
+             "lighting clock mode must require an integer token");
 }
 
 void TestMessageShapeAndLimits() {
@@ -151,6 +168,18 @@ void TestMathCurveWireContract() {
   Check(evaluate.error == ErrorCode::BackendUnavailable,
         "curve component query must match its declared signature");
 
+  const auto evaluateScalar = Dispatch(
+      Carrier::LocalizedString,
+      "warvk:v1;math.evaluateReal;d:1;r:0.5;r:2;i:7");
+  Check(evaluateScalar.error == ErrorCode::BackendUnavailable,
+        "scalar real query must match its declared signature");
+
+  const auto evaluateInteger = Dispatch(
+      Carrier::Hotkey,
+      "warvk:v1;math.evaluateInteger;d:1;r:0.5;r:2;i:7;i:0");
+  Check(evaluateInteger.error == ErrorCode::BackendUnavailable,
+        "scalar integer query must match its declared signature");
+
   const auto arcLength = Dispatch(
       Carrier::LocalizedString,
       "warvk:v1;curve.arcLength;d:1;r:0;r:0;r:0;r:0;"
@@ -208,6 +237,120 @@ void TestStableLastError() {
         "clearError must reset the thread-local code");
 }
 
+void RegisterTypedTable(uint32_t table) {
+  using namespace dxvk::war3::japi;
+  Check(!TryTypedSaveInteger(
+            table, kTypedRegisterParent, kTypedRegisterChildA,
+            kTypedRegisterCookieA),
+        "typed registration A must preserve stock SaveInteger forwarding");
+  Check(!TryTypedSaveInteger(
+            table, kTypedRegisterParent, kTypedRegisterChildB,
+            kTypedRegisterCookieB),
+        "typed registration B must preserve stock SaveInteger forwarding");
+}
+
+void TestTypedHashtableTransport() {
+  using namespace dxvk::war3::japi;
+  constexpr uint32_t table = 0x12345678u;
+  constexpr uint32_t otherTable = 0x87654321u;
+  int32_t integer = -1;
+  float real = -1.0f;
+
+  ResetTypedTransport();
+  Check(!TryTypedLoadInteger(
+            table, kTypedRegisterParent, kTypedProbeChild, integer),
+        "unregistered table must forward LoadInteger");
+  RegisterTypedTable(table);
+  Check(TryTypedLoadInteger(
+            table, kTypedRegisterParent, kTypedProbeChild, integer) &&
+            integer == kTypedProbeAck,
+        "registered table must receive the typed capability ack");
+  Check(!TryTypedLoadInteger(
+            otherTable, kTypedRegisterParent, kTypedProbeChild, integer),
+        "capability must be bound to the exact hashtable handle");
+
+  constexpr int32_t positionTx = 11;
+  const int32_t positionOpcode =
+      static_cast<int32_t>(TypedOpcode::PointLightSetPosition);
+  Check(TryTypedSaveInteger(
+            table, positionTx, kTypedBeginChild, positionOpcode),
+        "typed point position begin must be consumed");
+  Check(TryTypedSaveInteger(table, positionTx, 0, 7),
+        "typed id slot must be consumed");
+  Check(TryTypedSaveReal(table, positionTx, 1, 100.0f) &&
+            TryTypedSaveReal(table, positionTx, 2, 200.0f) &&
+            TryTypedSaveReal(table, positionTx, 3, 300.0f),
+        "typed position real slots must be consumed");
+  Check(TryTypedSaveInteger(
+            table, positionTx, kTypedCommitChild, positionOpcode),
+        "complete typed setter commit must be consumed atomically");
+  const auto setterError =
+      Dispatch(Carrier::Hotkey, "warvk:v1;system.lastErrorCode");
+  Check(setterError.integer ==
+            static_cast<int32_t>(ErrorCode::BackendUnavailable),
+        "typed setter must reach the protocol-test backend stub");
+
+  constexpr int32_t realTx = 12;
+  const int32_t realOpcode =
+      static_cast<int32_t>(TypedOpcode::MathEvaluateReal);
+  Check(TryTypedSaveInteger(table, realTx, kTypedBeginChild, realOpcode) &&
+            TryTypedSaveInteger(table, realTx, 0, 1) &&
+            TryTypedSaveReal(table, realTx, 1, 0.5f) &&
+            TryTypedSaveReal(table, realTx, 2, 2.0f) &&
+            TryTypedSaveInteger(table, realTx, 3, 7),
+        "typed real query arguments must be accepted by declared type");
+  Check(TryTypedLoadReal(
+            table, realTx, kTypedQueryRealChild, real) && real == 0.0f,
+        "typed real query must be consumed without creating a JASS string");
+
+  constexpr int32_t integerTx = 14;
+  const int32_t integerOpcode =
+      static_cast<int32_t>(TypedOpcode::MathEvaluateInteger);
+  Check(TryTypedSaveInteger(
+            table, integerTx, kTypedBeginChild, integerOpcode) &&
+            TryTypedSaveInteger(table, integerTx, 0, 1) &&
+            TryTypedSaveReal(table, integerTx, 1, 0.5f) &&
+            TryTypedSaveReal(table, integerTx, 2, 2.0f) &&
+            TryTypedSaveInteger(table, integerTx, 3, 7) &&
+            TryTypedSaveInteger(table, integerTx, 4, 0) &&
+            TryTypedLoadInteger(
+                table, integerTx, kTypedQueryIntegerChild, integer) &&
+            integer == 0,
+        "typed integer query must be consumed through LoadInteger");
+
+  constexpr int32_t zeroArgTx = 15;
+  const int32_t zeroArgOpcode =
+      static_cast<int32_t>(TypedOpcode::TimeVisualSeconds);
+  Check(TryTypedSaveInteger(
+            table, zeroArgTx, kTypedBeginChild, zeroArgOpcode) &&
+            TryTypedLoadReal(
+                table, zeroArgTx, kTypedQueryRealChild, real),
+        "zero-argument typed real query must close atomically");
+
+  constexpr int32_t invalidTx = 13;
+  Check(TryTypedSaveInteger(
+            table, invalidTx, kTypedBeginChild, positionOpcode) &&
+            TryTypedSaveInteger(table, invalidTx, 0, 7) &&
+            TryTypedSaveReal(
+                table, invalidTx, 1,
+                std::numeric_limits<float>::quiet_NaN()) &&
+            TryTypedSaveReal(table, invalidTx, 2, 2.0f) &&
+            TryTypedSaveReal(table, invalidTx, 3, 3.0f) &&
+            TryTypedSaveInteger(
+                table, invalidTx, kTypedCommitChild, positionOpcode),
+        "malformed typed transaction must remain consumed fail-closed");
+  const auto invalidError =
+      Dispatch(Carrier::Hotkey, "warvk:v1;system.lastErrorCode");
+  Check(invalidError.integer ==
+            static_cast<int32_t>(ErrorCode::InvalidArgumentType),
+        "non-finite typed real must invalidate the whole transaction");
+
+  ResetTypedTransport();
+  Check(!TryTypedLoadReal(
+            table, realTx, kTypedQueryRealChild, real),
+        "map reset must revoke the previous hashtable capability");
+}
+
 } // namespace
 
 int main() {
@@ -216,6 +359,7 @@ int main() {
   TestMessageShapeAndLimits();
   TestMathCurveWireContract();
   TestStableLastError();
+  TestTypedHashtableTransport();
   if (g_failures != 0) {
     std::cerr << g_failures << " WarVK JAPI protocol test(s) failed\n";
     return 1;

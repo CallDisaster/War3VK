@@ -22,8 +22,8 @@ public:
    *
    * 用于 `.ai`/LoadLibrary 中途载入路径：此时 InitJassNatives 通常已经
    * 结束，不应再晚装完整 JASS/生命周期 Hook；只需要把
-   * Preloader/GetLocalizedHotkey/GetLocalizedString 三个低频 carrier 指向
-   * WarVK 自己的命令桥。
+   * 三个字符串 carrier 指向 WarVK 控制面；可选 Hashtable Save/Load
+   * carrier 指向强类型数值数据面。
    *
    * @param gameBase Game.dll 基址。
    * @param reason 诊断来源。

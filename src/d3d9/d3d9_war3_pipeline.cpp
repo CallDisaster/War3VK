@@ -201,7 +201,12 @@ namespace dxvk {
             return value;
         }
 
-        float ResolvePipelineDayNightTime01(float realGameTime) {
+        float ResolvePipelineDayNightTime01(
+                float realGameTime,
+                const War3DayNightSettings& dayNight) {
+            if (dayNight.clockMode != War3LightingClockMode::GameTime)
+                return Wrap01(dayNight.renderTimeHours / 24.0f);
+
             if (realGameTime >= 0.0f && realGameTime <= 24.0f)
                 return Wrap01(realGameTime / 24.0f);
 
@@ -807,6 +812,37 @@ namespace dxvk {
         m_wantsShadowCapture = false;
         // 日夜色调在帧开始进行更新，保证主线程渲染状态可见且避免跨线程写入。
 
+        auto& lightingClock = m_settings.dayNight;
+        const auto lightingNow = std::chrono::steady_clock::now();
+        if (m_lightingClockRevision != lightingClock.clockRevision) {
+            m_lightingClockRevision = lightingClock.clockRevision;
+            m_lightingClockTime01 =
+                Wrap01(lightingClock.renderTimeHours / 24.0f);
+            m_lightingClockLastUpdate = lightingNow;
+        }
+
+        if (lightingClock.clockMode == War3LightingClockMode::GameTime) {
+            m_lightingClockTime01 = ResolvePipelineDayNightTime01(
+                War3RenderState::GetGameTime(), lightingClock);
+            m_lightingClockLastUpdate = lightingNow;
+        } else if (lightingClock.clockMode ==
+                   War3LightingClockMode::Independent) {
+            float dt = std::chrono::duration<float>(
+                lightingNow - m_lightingClockLastUpdate).count();
+            m_lightingClockLastUpdate = lightingNow;
+            if (!std::isfinite(dt) || dt < 0.0f)
+                dt = 0.0f;
+            dt = std::min(dt, 0.25f);
+            const float dayLength = std::clamp(
+                lightingClock.independentDayLengthSeconds,
+                1.0f, 86400.0f);
+            m_lightingClockTime01 = Wrap01(
+                m_lightingClockTime01 + dt / dayLength);
+        } else {
+            m_lightingClockLastUpdate = lightingNow;
+        }
+        lightingClock.renderTimeHours = m_lightingClockTime01 * 24.0f;
+
         // ====================================================================
         // [性能] 关闭路径旁路判定
         // 说明：
@@ -917,10 +953,11 @@ namespace dxvk {
 
         // 日夜色调：在帧开始应用到全局设置，保证主线程渲染状态与后处理能读取到
         const auto& dayNight = m_settings.dayNight;
-        if (dayNight.enabled) {
+        if (dayNight.enabled && dayNight.timeColorGradingEnabled) {
             float realGameTime = War3RenderState::GetGameTime();
             {
-                float time01 = ResolvePipelineDayNightTime01(realGameTime);
+                float time01 = ResolvePipelineDayNightTime01(
+                    realGameTime, dayNight);
                 float t = 0.0f;
                 if (ComputeDayNightFactor(time01, dayNight, t)) {
                     if (dayNight.affectAmbient) {

@@ -18,7 +18,7 @@ returns = integer
 title = "获取最后错误码"
 description = "返回最后错误码。"
 comment = "无参数；返回0表示成功，其余值见 WARVK_ERROR_* 常量。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKGetLastErrorCode"
 returns = integer
 
@@ -26,7 +26,7 @@ returns = integer
 title = "获取最后错误文本"
 description = "返回稳定英文错误文本。"
 comment = "无参数；返回最近一次请求的错误文本。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKGetLastError"
 returns = string
 
@@ -50,7 +50,7 @@ returns = boolean
 title = "创建点光源"
 description = "以位置 ${x}、${y}、${z}、半径 ${radius}、颜色 ${red}、${green}、${blue}、强度 ${intensity} 创建点光并返回 WarVK id。"
 comment = "x/y/z 为有限世界坐标；radius 必须大于0；red/green/blue 非负；intensity 非负。成功返回正整数 id。"
-category = "TC_WarVK"
+category = "TC_WarVKPointLight"
 script = "WarVKCreatePointLight"
 returns = integer
 [[.args]]
@@ -74,7 +74,7 @@ type = real
 title = "查询点光存活"
 description = "查询 WarVK 点光 id ${lightId} 是否存活。"
 comment = "lightId 使用创建返回的正整数；返回true表示对象仍有效。"
-category = "TC_WarVK"
+category = "TC_WarVKPointLight"
 script = "WarVKIsPointLightAlive"
 returns = boolean
 [[.args]]
@@ -84,7 +84,7 @@ type = integer
 title = "创建闪电"
 description = "以起点 ${startX}、${startY}、${startZ}、终点 ${endX}、${endY}、${endZ}、颜色 ${red}、${green}、${blue}、${alpha}、宽度 ${width} 创建闪电并返回 WarVK id。"
 comment = "端点为有限世界坐标；颜色各分量建议0..1；width 必须大于0。成功返回正整数 id。"
-category = "TC_WarVK"
+category = "TC_WarVKLightning"
 script = "WarVKCreateLightning"
 returns = integer
 [[.args]]
@@ -114,7 +114,7 @@ type = real
 title = "查询闪电存活"
 description = "查询 WarVK 闪电 id ${lightningId} 是否存活。"
 comment = "lightningId 使用创建返回的正整数；返回true表示对象仍有效。"
-category = "TC_WarVK"
+category = "TC_WarVKLightning"
 script = "WarVKIsLightningAlive"
 returns = boolean
 [[.args]]
@@ -124,7 +124,7 @@ type = integer
 title = "查询托管对象数量"
 description = "只读返回 WarVK 托管对象数量。"
 comment = "无参数；返回当前点光和闪电对象数量。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKGetManagedObjectCount"
 returns = integer
 
@@ -132,7 +132,7 @@ returns = integer
 title = "查询托管对象存活"
 description = "只读查询 WarVK 对象 id ${objectId} 是否存活。"
 comment = "objectId 使用创建返回的正整数；返回true表示对象仍有效。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKIsManagedObjectAlive"
 returns = boolean
 [[.args]]
@@ -142,7 +142,7 @@ type = integer
 title = "查询托管对象类型"
 description = "只读返回 WarVK 对象 id ${objectId} 的类型。"
 comment = "objectId 使用创建返回的正整数；返回 WARVK_OBJECT_* 类型值，无效 id 返回0。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKGetManagedObjectType"
 returns = integer
 [[.args]]
@@ -152,7 +152,7 @@ type = integer
 title = "查询视觉时间"
 description = "只读返回渲染时间秒数。"
 comment = "无参数；返回渲染器累计视觉时间，单位秒。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKGetVisualTimeSeconds"
 returns = real
 
@@ -160,7 +160,7 @@ returns = real
 title = "查询帧序号"
 description = "只读返回渲染帧序号。"
 comment = "无参数；返回当前渲染帧序号。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKGetFrameIndex"
 returns = integer
 
@@ -168,7 +168,7 @@ returns = integer
 title = "查询帧率"
 description = "只读返回渲染帧率。"
 comment = "无参数；返回最近测得的帧率，单位FPS。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKGetFramesPerSecond"
 returns = real
 
@@ -176,7 +176,7 @@ returns = real
 title = "查询帧耗时"
 description = "返回帧耗时毫秒。"
 comment = "无参数；返回最近帧耗时，单位毫秒。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKGetFrameTimeMilliseconds"
 returns = real
 
@@ -184,7 +184,7 @@ returns = real
 title = "查询绘制调用数"
 description = "只读返回最近一帧绘制调用数。"
 comment = "无参数；返回最近完成帧的绘制调用数量。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKGetDrawCallCount"
 returns = integer
 
@@ -192,7 +192,7 @@ returns = integer
 title = "创建闪电模板"
 description = "创建名为 ${name} 的 WarVK 闪电模板并返回模板 id。"
 comment = "name=作者可读模板名，中文/英文均可；API 会自动转换为 ASCII 内部标识，后续请始终保存并使用返回的正整数 templateId。失败返回0（可用 WarVKGetLastError 查询）。创建后依次：SetBasic → SetAdvanced → SetOptional(可选) → SetFormulaCurve(可选) → Finalize → CreateFromTemplate。模板配置只写 DXVK CPU 描述，不必等首帧渲染。"
-category = "TC_WarVK"
+category = "TC_WarVKLightningTemplate"
 script = "WarVKCreateLightningTemplate"
 returns = integer
 [[.args]]
@@ -202,7 +202,7 @@ type = string
 title = "按模板创建闪电"
 description = "以模板 ${templateId}、起点 ${startX}/${startY}/${startZ}、终点 ${endX}/${endY}/${endZ} 和种子 ${seed} 创建闪电并返回实例 id。"
 comment = "templateId=已 Finalize 的模板 id。start/end 六个坐标为有限世界坐标，两端不要重合过近。seed=噪声/分叉随机种子：0=稳定自动种子；非0 时同种子可复现同一锯齿形态（便于联机一致）。返回正整数闪电实例 id；之后可用 SetEndpoints/SetColor/SetWidth/Destroy 管理实例。实例拷贝冻结参数，后续改模板不影响已创建实例。"
-category = "TC_WarVK"
+category = "TC_WarVKLightningTemplate"
 script = "WarVKCreateLightningFromTemplate"
 returns = integer
 [[.args]]
@@ -226,7 +226,7 @@ type = integer
 title = "编译数学公式"
 description = "编译纯数学表达式 ${expression} 并返回 programId。"
 comment = "expression 必须为 ASCII、最长384字节且不能包含分号；禁止循环、递归和副作用。失败返回0，可调用 WarVKGetMathProgramLastError。"
-category = "TC_WarVK"
+category = "TC_WarVKMath"
 script = "WarVKCompileMathProgram"
 returns = integer
 [[.args]]
@@ -236,7 +236,7 @@ type = string
 title = "查询数学程序存活"
 description = "查询数学程序 ${programId} 是否仍可创建曲线。"
 comment = "销毁 programId 不会使已创建曲线或已绑定闪电的不可变快照失效。"
-category = "TC_WarVK"
+category = "TC_WarVKMath"
 script = "WarVKIsMathProgramAlive"
 returns = boolean
 [[.args]]
@@ -246,31 +246,65 @@ type = integer
 title = "获取数学公式编译错误"
 description = "返回最近一次数学公式编译错误。"
 comment = "成功编译后返回空字符串；失败文本包含错误原因和字节位置。"
-category = "TC_WarVK"
+category = "TC_WarVKMath"
 script = "WarVKGetMathProgramLastError"
 returns = string
 
 [WarVKCreateCurve]
-title = "创建公式曲线"
-description = "从数学程序 ${programId} 创建曲线并返回 curveId。"
-comment = "新曲线默认 OFFSET 坐标模式并锁定两端；成功返回正整数，失败返回0。"
-category = "TC_WarVK"
+title = "创建数学计算或公式曲线"
+description = "从数学程序 ${programId} 创建参数化计算并返回 curveId。"
+comment = "scalar 公式可直接求实数/整数；vec2/vec3 公式可继续配置为曲线。成功返回正整数，失败返回0。"
+category = "TC_WarVKMath"
 script = "WarVKCreateCurve"
 returns = integer
 [[.args]]
 type = integer
 
+[WarVKEvaluateMathReal]
+title = "计算数学公式实数"
+description = "计算标量公式 ${curveId}：参数 ${t}、时间 ${time}、种子 ${seed}，返回实数。"
+comment = "curveId 由创建数学计算返回，参数先用设置数学公式参数写入；公式必须返回 scalar，t 范围0..1。失败返回0并写入最后错误。"
+category = "TC_WarVKMath"
+script = "WarVKEvaluateMathReal"
+returns = real
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = integer
+
+[WarVKEvaluateMathInteger]
+title = "计算数学公式整数"
+description = "计算标量公式 ${curveId}：参数 ${t}、时间 ${time}、种子 ${seed}，按 ${roundingMode} 返回整数。"
+comment = "roundingMode：0最近整数、1向下、2向上、3截断；结果须在int32范围。失败返回0并写入最后错误。"
+category = "TC_WarVKMath"
+script = "WarVKEvaluateMathInteger"
+returns = integer
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = integer
+[[.args]]
+type = WarVKMathRoundingMode
+
 [WarVKEvaluateCurveComponent]
 title = "计算曲线坐标分量"
 description = "计算曲线 ${curveId} 的分量 ${component}：参数 ${t}、时间 ${time}、起点 ${startX}/${startY}/${startZ}、终点 ${endX}/${endY}/${endZ}、种子 ${seed}。"
 comment = "低频调试/游戏逻辑查询；component 使用 X/Y/Z 常量，t 范围0..1。闪电渲染不会经 JASS 逐点调用。"
-category = "TC_WarVK"
+category = "TC_WarVKCurve"
 script = "WarVKEvaluateCurveComponent"
 returns = real
 [[.args]]
 type = integer
 [[.args]]
-type = integer
+type = WarVKCurveComponent
 [[.args]]
 type = real
 [[.args]]
@@ -294,13 +328,13 @@ type = integer
 title = "计算曲线导数分量"
 description = "计算曲线 ${curveId} 的导数分量 ${component}：参数 ${t}、时间 ${time}、起点 ${startX}/${startY}/${startZ}、终点 ${endX}/${endY}/${endZ}、种子 ${seed}。"
 comment = "使用有界中心差分（端点为单侧差分），适合低频切线/速度查询。"
-category = "TC_WarVK"
+category = "TC_WarVKCurve"
 script = "WarVKEvaluateCurveDerivativeComponent"
 returns = real
 [[.args]]
 type = integer
 [[.args]]
-type = integer
+type = WarVKCurveComponent
 [[.args]]
 type = real
 [[.args]]
@@ -324,7 +358,7 @@ type = integer
 title = "计算曲线弧长"
 description = "计算曲线 ${curveId} 的弧长：时间 ${time}、起点 ${startX}/${startY}/${startZ}、终点 ${endX}/${endY}/${endZ}、种子 ${seed}、采样段数 ${samples}。"
 comment = "samples 范围2..256；这是低频查询，渲染器自身会在 C++ 中生成折线。"
-category = "TC_WarVK"
+category = "TC_WarVKCurve"
 script = "WarVKGetCurveArcLength"
 returns = real
 [[.args]]
@@ -352,7 +386,7 @@ type = integer
 title = "创建点曲线上传记录"
 description = "创建一条预期包含 ${expectedPointCount} 个点的世界坐标点曲线并返回 curveId。"
 comment = "点数范围2..1024；随后使用追加点曲线（最多4点）并冻结。冻结前不能用于渲染。"
-category = "TC_WarVK"
+category = "TC_WarVKCurve"
 script = "WarVKCreatePointCurve"
 returns = integer
 [[.args]]
@@ -362,7 +396,7 @@ type = integer
 title = "由点曲线创建连续闪电"
 description = "使用闪电模板 ${templateId}、已冻结点曲线 ${curveId} 与种子 ${seed} 创建一个连续 Ribbon 闪电并返回实例 id。"
 comment = "整条点曲线是一个托管闪电实例；主 Ribbon 一次绘制，可选辉光增加一次绘制。点坐标按世界坐标解释。"
-category = "TC_WarVK"
+category = "TC_WarVKLightning"
 script = "WarVKCreatePolylineLightning"
 returns = integer
 [[.args]]

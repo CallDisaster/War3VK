@@ -1,3 +1,70 @@
+globals
+    // 私有数值通道。桥接不可用时所有公开函数自动回退到 warvk:v1 字符串协议。
+    hashtable wvkTypedTable = null
+    integer wvkTypedState = 0
+    integer wvkTypedSequence = 0
+
+    constant integer wvkTypedRegisterParent = 1465273172
+    constant integer wvkTypedRegisterChildA = 1380271921
+    constant integer wvkTypedRegisterChildB = 1380271922
+    constant integer wvkTypedRegisterCookieA = 324478056
+    constant integer wvkTypedRegisterCookieB = 610800471
+    constant integer wvkTypedProbeChild = 1347571522
+    constant integer wvkTypedProbeAck = 1464555058
+    constant integer wvkTypedBeginChild = -2147418111
+    constant integer wvkTypedCommitChild = -2147418110
+    constant integer wvkTypedQueryIntegerChild = -2147418109
+    constant integer wvkTypedQueryRealChild = -2147418108
+
+    constant integer wvkTypedPointLightSetPosition = 101
+    constant integer wvkTypedPointLightSetColorIntensity = 102
+    constant integer wvkTypedPointLightSetRadius = 103
+    constant integer wvkTypedMathEvaluateReal = 201
+    constant integer wvkTypedMathEvaluateInteger = 202
+    constant integer wvkTypedCurveEvaluateComponent = 203
+    constant integer wvkTypedCurveDerivativeComponent = 204
+    constant integer wvkTypedCurveArcLength = 205
+    constant integer wvkTypedCurvePointAppend4 = 206
+    constant integer wvkTypedLightningSetEndpoints = 301
+    constant integer wvkTypedLightningSetColor = 302
+    constant integer wvkTypedLightningSetWidth = 303
+    constant integer wvkTypedTimeVisualSeconds = 401
+    constant integer wvkTypedStatsFramesPerSecond = 402
+    constant integer wvkTypedStatsFrameTimeMilliseconds = 403
+endglobals
+
+function WVKTypedReady takes nothing returns boolean
+    if wvkTypedState == 1 then
+        return true
+    endif
+    if wvkTypedState == -1 then
+        return false
+    endif
+    set wvkTypedTable = InitHashtable()
+    if wvkTypedTable == null then
+        set wvkTypedState = -1
+        return false
+    endif
+    call SaveInteger(wvkTypedTable, wvkTypedRegisterParent, wvkTypedRegisterChildA, wvkTypedRegisterCookieA)
+    call SaveInteger(wvkTypedTable, wvkTypedRegisterParent, wvkTypedRegisterChildB, wvkTypedRegisterCookieB)
+    if LoadInteger(wvkTypedTable, wvkTypedRegisterParent, wvkTypedProbeChild) == wvkTypedProbeAck then
+        set wvkTypedState = 1
+        return true
+    endif
+    set wvkTypedState = -1
+    return false
+endfunction
+
+function WVKTypedBegin takes integer opcode returns integer
+    if wvkTypedSequence <= 0 or wvkTypedSequence >= 2147483000 then
+        set wvkTypedSequence = 1
+    else
+        set wvkTypedSequence = wvkTypedSequence + 1
+    endif
+    call SaveInteger(wvkTypedTable, wvkTypedSequence, wvkTypedBeginChild, opcode)
+    return wvkTypedSequence
+endfunction
+
 function WarVKBoolToken takes boolean value returns string
     if value then
         return "1"
@@ -92,17 +159,49 @@ function WarVKSetPointLightEnabled takes integer lightId, boolean enabled return
 endfunction
 
 function WarVKSetPointLightPosition takes integer lightId, real x, real y, real z returns nothing
-    local string payload = "warvk:v1;pointLight.setPosition" + ";d:" + I2S(lightId) + ";r:" + R2S(x) + ";r:" + R2S(y) + ";r:" + R2S(z)
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedPointLightSetPosition)
+        call SaveInteger(wvkTypedTable, transaction, 0, lightId)
+        call SaveReal(wvkTypedTable, transaction, 1, x)
+        call SaveReal(wvkTypedTable, transaction, 2, y)
+        call SaveReal(wvkTypedTable, transaction, 3, z)
+        call SaveInteger(wvkTypedTable, transaction, wvkTypedCommitChild, wvkTypedPointLightSetPosition)
+        return
+    endif
+    set payload = "warvk:v1;pointLight.setPosition" + ";d:" + I2S(lightId) + ";r:" + R2S(x) + ";r:" + R2S(y) + ";r:" + R2S(z)
     call Preloader(payload)
 endfunction
 
 function WarVKSetPointLightColorIntensity takes integer lightId, real red, real green, real blue, real intensity returns nothing
-    local string payload = "warvk:v1;pointLight.setColorIntensity" + ";d:" + I2S(lightId) + ";r:" + R2S(red) + ";r:" + R2S(green) + ";r:" + R2S(blue) + ";r:" + R2S(intensity)
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedPointLightSetColorIntensity)
+        call SaveInteger(wvkTypedTable, transaction, 0, lightId)
+        call SaveReal(wvkTypedTable, transaction, 1, red)
+        call SaveReal(wvkTypedTable, transaction, 2, green)
+        call SaveReal(wvkTypedTable, transaction, 3, blue)
+        call SaveReal(wvkTypedTable, transaction, 4, intensity)
+        call SaveInteger(wvkTypedTable, transaction, wvkTypedCommitChild, wvkTypedPointLightSetColorIntensity)
+        return
+    endif
+    set payload = "warvk:v1;pointLight.setColorIntensity" + ";d:" + I2S(lightId) + ";r:" + R2S(red) + ";r:" + R2S(green) + ";r:" + R2S(blue) + ";r:" + R2S(intensity)
     call Preloader(payload)
 endfunction
 
 function WarVKSetPointLightRadius takes integer lightId, real radius returns nothing
-    local string payload = "warvk:v1;pointLight.setRadius" + ";d:" + I2S(lightId) + ";r:" + R2S(radius)
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedPointLightSetRadius)
+        call SaveInteger(wvkTypedTable, transaction, 0, lightId)
+        call SaveReal(wvkTypedTable, transaction, 1, radius)
+        call SaveInteger(wvkTypedTable, transaction, wvkTypedCommitChild, wvkTypedPointLightSetRadius)
+        return
+    endif
+    set payload = "warvk:v1;pointLight.setRadius" + ";d:" + I2S(lightId) + ";r:" + R2S(radius)
     call Preloader(payload)
 endfunction
 
@@ -131,13 +230,27 @@ function WarVKSetVolumetricDensity takes real density returns nothing
     call Preloader(payload)
 endfunction
 
-function WarVKSetVolumetricScattering takes real scattering, real anisotropy returns nothing
-    local string payload = "warvk:v1;volumetric.setScattering" + ";r:" + R2S(scattering) + ";r:" + R2S(anisotropy)
+function WarVKSetVolumetricScattering takes real scattering, real decay returns nothing
+    local string payload = "warvk:v1;volumetric.setScattering" + ";r:" + R2S(scattering) + ";r:" + R2S(decay)
     call Preloader(payload)
 endfunction
 
 function WarVKSetVolumetricQuality takes integer stepCount, real maxDistance returns nothing
     local string payload = "warvk:v1;volumetric.setQuality" + ";i:" + I2S(stepCount) + ";r:" + R2S(maxDistance)
+    call Preloader(payload)
+endfunction
+
+// 高度雾开关不会自动开启体积光通道；要看到雾效还需调用
+// WarVKSetVolumetricEnabled(true)。关闭高度雾不会关闭太阳/点光散射。
+function WarVKSetGlobalVolumetricFogEnabled takes boolean enabled returns nothing
+    local string payload = "warvk:v1;volumetricFog.setEnabled" + ";b:" + WarVKBoolToken(enabled)
+    call Preloader(payload)
+endfunction
+
+// baseHeight 为雾层基准世界高度；falloff 为随高度衰减率（0..0.05）；
+// strength 为全局高度雾强度（0..2）。
+function WarVKSetGlobalVolumetricFog takes real baseHeight, real falloff, real strength returns nothing
+    local string payload = "warvk:v1;volumetricFog.setSettings" + ";r:" + R2S(baseHeight) + ";r:" + R2S(falloff) + ";r:" + R2S(strength)
     call Preloader(payload)
 endfunction
 
@@ -211,6 +324,49 @@ function WarVKSetDayNightSpeed takes real scale returns nothing
     call Preloader(payload)
 endfunction
 
+// 选择 WarVK 光照时钟来源：跟随游戏、保持当前时刻或独立推进。
+// 该设置只影响渲染，不改变 Warcraft 的玩法时间。
+function WarVKSetLightingClockMode takes integer mode returns nothing
+    local string payload = "warvk:v1;lightingClock.setMode" + ";i:" + I2S(mode)
+    call Preloader(payload)
+endfunction
+
+// 设置 0..24 小时的当前渲染时刻，并自动切换到 HELD 模式。
+function WarVKSetLightingClockTime takes real hours returns nothing
+    local string payload = "warvk:v1;lightingClock.holdTime" + ";r:" + R2S(hours)
+    call Preloader(payload)
+endfunction
+
+// 设置独立光照时钟走完 24 小时所需的现实秒数（1..86400）。
+function WarVKSetLightingDayDuration takes real seconds returns nothing
+    local string payload = "warvk:v1;lightingClock.setDayDuration" + ";r:" + R2S(seconds)
+    call Preloader(payload)
+endfunction
+
+// 控制太阳/月亮方向及方向光阴影强度是否随光照时钟变化。
+function WarVKSetCelestialMotionEnabled takes boolean enabled returns nothing
+    local string payload = "warvk:v1;lightingCycle.setCelestialMotionEnabled" + ";b:" + WarVKBoolToken(enabled)
+    call Preloader(payload)
+endfunction
+
+// 控制方向光色温、亮度和环境色调是否随光照时钟变化。
+function WarVKSetTimeColorGradingEnabled takes boolean enabled returns nothing
+    local string payload = "warvk:v1;lightingCycle.setTimeColorGradingEnabled" + ";b:" + WarVKBoolToken(enabled)
+    call Preloader(payload)
+endfunction
+
+// 设置 00:00、06:00、12:00、18:00 四个采样点的色温（1000..20000K）。
+function WarVKSetTimeColorTemperatureProfile takes real midnightKelvin, real dawnKelvin, real noonKelvin, real duskKelvin returns nothing
+    local string payload = "warvk:v1;lightingCycle.setColorTemperatureProfile" + ";r:" + R2S(midnightKelvin) + ";r:" + R2S(dawnKelvin) + ";r:" + R2S(noonKelvin) + ";r:" + R2S(duskKelvin)
+    call Preloader(payload)
+endfunction
+
+// 恢复 WarVK 内置的自然昼夜色温曲线。
+function WarVKResetTimeColorTemperatureProfile takes nothing returns nothing
+    local string payload = "warvk:v1;lightingCycle.resetColorTemperatureProfile"
+    call Preloader(payload)
+endfunction
+
 function WarVKCreateLightning takes real startX, real startY, real startZ, real endX, real endY, real endZ, real red, real green, real blue, real alpha, real width returns integer
     local string payload = "warvk:v1;lightning.create" + ";r:" + R2S(startX) + ";r:" + R2S(startY) + ";r:" + R2S(startZ) + ";r:" + R2S(endX) + ";r:" + R2S(endY) + ";r:" + R2S(endZ) + ";r:" + R2S(red) + ";r:" + R2S(green) + ";r:" + R2S(blue) + ";r:" + R2S(alpha) + ";r:" + R2S(width)
     return GetLocalizedHotkey(payload)
@@ -248,6 +404,41 @@ function WarVKGetMathProgramLastError takes nothing returns string
     return GetLocalizedString(payload)
 endfunction
 
+// 对标量公式求值并直接返回 JASS real。curveId 由 WarVKCreateCurve 创建，
+// 公式参数先用 WarVKSetCurveReal 写入；t 范围0..1，time/seed 为本次求值输入。
+function WarVKEvaluateMathReal takes integer curveId, real t, real time, integer seed returns real
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedMathEvaluateReal)
+        call SaveInteger(wvkTypedTable, transaction, 0, curveId)
+        call SaveReal(wvkTypedTable, transaction, 1, t)
+        call SaveReal(wvkTypedTable, transaction, 2, time)
+        call SaveInteger(wvkTypedTable, transaction, 3, seed)
+        return LoadReal(wvkTypedTable, transaction, wvkTypedQueryRealChild)
+    endif
+    set payload = "warvk:v1;math.evaluateReal" + ";d:" + I2S(curveId) + ";r:" + R2S(t) + ";r:" + R2S(time) + ";i:" + I2S(seed)
+    return S2R(GetLocalizedString(payload))
+endfunction
+
+// 对同一标量公式求值并返回 JASS integer。roundingMode 使用
+// WARVK_MATH_ROUND_*；结果超出 int32 或公式不是 scalar 时调用失败。
+function WarVKEvaluateMathInteger takes integer curveId, real t, real time, integer seed, integer roundingMode returns integer
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedMathEvaluateInteger)
+        call SaveInteger(wvkTypedTable, transaction, 0, curveId)
+        call SaveReal(wvkTypedTable, transaction, 1, t)
+        call SaveReal(wvkTypedTable, transaction, 2, time)
+        call SaveInteger(wvkTypedTable, transaction, 3, seed)
+        call SaveInteger(wvkTypedTable, transaction, 4, roundingMode)
+        return LoadInteger(wvkTypedTable, transaction, wvkTypedQueryIntegerChild)
+    endif
+    set payload = "warvk:v1;math.evaluateInteger" + ";d:" + I2S(curveId) + ";r:" + R2S(t) + ";r:" + R2S(time) + ";i:" + I2S(seed) + ";i:" + I2S(roundingMode)
+    return GetLocalizedHotkey(payload)
+endfunction
+
 function WarVKCreateCurve takes integer programId returns integer
     local string payload = "warvk:v1;curve.create" + ";d:" + I2S(programId)
     return GetLocalizedHotkey(payload)
@@ -277,17 +468,67 @@ endfunction
 
 // 低频查询/调试接口；闪电渲染不会经 JASS 逐点调用它。
 function WarVKEvaluateCurveComponent takes integer curveId, integer component, real t, real time, real startX, real startY, real startZ, real endX, real endY, real endZ, integer seed returns real
-    local string payload = "warvk:v1;curve.evaluateComponent" + ";d:" + I2S(curveId) + ";i:" + I2S(component) + ";r:" + R2S(t) + ";r:" + R2S(time) + ";r:" + R2S(startX) + ";r:" + R2S(startY) + ";r:" + R2S(startZ) + ";r:" + R2S(endX) + ";r:" + R2S(endY) + ";r:" + R2S(endZ) + ";i:" + I2S(seed)
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedCurveEvaluateComponent)
+        call SaveInteger(wvkTypedTable, transaction, 0, curveId)
+        call SaveInteger(wvkTypedTable, transaction, 1, component)
+        call SaveReal(wvkTypedTable, transaction, 2, t)
+        call SaveReal(wvkTypedTable, transaction, 3, time)
+        call SaveReal(wvkTypedTable, transaction, 4, startX)
+        call SaveReal(wvkTypedTable, transaction, 5, startY)
+        call SaveReal(wvkTypedTable, transaction, 6, startZ)
+        call SaveReal(wvkTypedTable, transaction, 7, endX)
+        call SaveReal(wvkTypedTable, transaction, 8, endY)
+        call SaveReal(wvkTypedTable, transaction, 9, endZ)
+        call SaveInteger(wvkTypedTable, transaction, 10, seed)
+        return LoadReal(wvkTypedTable, transaction, wvkTypedQueryRealChild)
+    endif
+    set payload = "warvk:v1;curve.evaluateComponent" + ";d:" + I2S(curveId) + ";i:" + I2S(component) + ";r:" + R2S(t) + ";r:" + R2S(time) + ";r:" + R2S(startX) + ";r:" + R2S(startY) + ";r:" + R2S(startZ) + ";r:" + R2S(endX) + ";r:" + R2S(endY) + ";r:" + R2S(endZ) + ";i:" + I2S(seed)
     return S2R(GetLocalizedString(payload))
 endfunction
 
 function WarVKEvaluateCurveDerivativeComponent takes integer curveId, integer component, real t, real time, real startX, real startY, real startZ, real endX, real endY, real endZ, integer seed returns real
-    local string payload = "warvk:v1;curve.derivativeComponent" + ";d:" + I2S(curveId) + ";i:" + I2S(component) + ";r:" + R2S(t) + ";r:" + R2S(time) + ";r:" + R2S(startX) + ";r:" + R2S(startY) + ";r:" + R2S(startZ) + ";r:" + R2S(endX) + ";r:" + R2S(endY) + ";r:" + R2S(endZ) + ";i:" + I2S(seed)
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedCurveDerivativeComponent)
+        call SaveInteger(wvkTypedTable, transaction, 0, curveId)
+        call SaveInteger(wvkTypedTable, transaction, 1, component)
+        call SaveReal(wvkTypedTable, transaction, 2, t)
+        call SaveReal(wvkTypedTable, transaction, 3, time)
+        call SaveReal(wvkTypedTable, transaction, 4, startX)
+        call SaveReal(wvkTypedTable, transaction, 5, startY)
+        call SaveReal(wvkTypedTable, transaction, 6, startZ)
+        call SaveReal(wvkTypedTable, transaction, 7, endX)
+        call SaveReal(wvkTypedTable, transaction, 8, endY)
+        call SaveReal(wvkTypedTable, transaction, 9, endZ)
+        call SaveInteger(wvkTypedTable, transaction, 10, seed)
+        return LoadReal(wvkTypedTable, transaction, wvkTypedQueryRealChild)
+    endif
+    set payload = "warvk:v1;curve.derivativeComponent" + ";d:" + I2S(curveId) + ";i:" + I2S(component) + ";r:" + R2S(t) + ";r:" + R2S(time) + ";r:" + R2S(startX) + ";r:" + R2S(startY) + ";r:" + R2S(startZ) + ";r:" + R2S(endX) + ";r:" + R2S(endY) + ";r:" + R2S(endZ) + ";i:" + I2S(seed)
     return S2R(GetLocalizedString(payload))
 endfunction
 
 function WarVKGetCurveArcLength takes integer curveId, real time, real startX, real startY, real startZ, real endX, real endY, real endZ, integer seed, integer samples returns real
-    local string payload = "warvk:v1;curve.arcLength" + ";d:" + I2S(curveId) + ";r:" + R2S(time) + ";r:" + R2S(startX) + ";r:" + R2S(startY) + ";r:" + R2S(startZ) + ";r:" + R2S(endX) + ";r:" + R2S(endY) + ";r:" + R2S(endZ) + ";i:" + I2S(seed) + ";i:" + I2S(samples)
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedCurveArcLength)
+        call SaveInteger(wvkTypedTable, transaction, 0, curveId)
+        call SaveReal(wvkTypedTable, transaction, 1, time)
+        call SaveReal(wvkTypedTable, transaction, 2, startX)
+        call SaveReal(wvkTypedTable, transaction, 3, startY)
+        call SaveReal(wvkTypedTable, transaction, 4, startZ)
+        call SaveReal(wvkTypedTable, transaction, 5, endX)
+        call SaveReal(wvkTypedTable, transaction, 6, endY)
+        call SaveReal(wvkTypedTable, transaction, 7, endZ)
+        call SaveInteger(wvkTypedTable, transaction, 8, seed)
+        call SaveInteger(wvkTypedTable, transaction, 9, samples)
+        return LoadReal(wvkTypedTable, transaction, wvkTypedQueryRealChild)
+    endif
+    set payload = "warvk:v1;curve.arcLength" + ";d:" + I2S(curveId) + ";r:" + R2S(time) + ";r:" + R2S(startX) + ";r:" + R2S(startY) + ";r:" + R2S(startZ) + ";r:" + R2S(endX) + ";r:" + R2S(endY) + ";r:" + R2S(endZ) + ";i:" + I2S(seed) + ";i:" + I2S(samples)
     return S2R(GetLocalizedString(payload))
 endfunction
 
@@ -301,7 +542,28 @@ endfunction
 // 每次最多上传四个世界坐标点，pointCount 为 1..4。最后一批不足四点时，
 // 未使用的坐标仍需传入任意有限值（推荐重复最后一个有效点），底层会忽略它们。
 function WarVKAppendPointCurve4 takes integer curveId, integer pointCount, real x0, real y0, real z0, real x1, real y1, real z1, real x2, real y2, real z2, real x3, real y3, real z3 returns nothing
-    local string payload = "warvk:v1;curve.points.append4" + ";d:" + I2S(curveId) + ";i:" + I2S(pointCount) + ";r:" + R2S(x0) + ";r:" + R2S(y0) + ";r:" + R2S(z0) + ";r:" + R2S(x1) + ";r:" + R2S(y1) + ";r:" + R2S(z1) + ";r:" + R2S(x2) + ";r:" + R2S(y2) + ";r:" + R2S(z2) + ";r:" + R2S(x3) + ";r:" + R2S(y3) + ";r:" + R2S(z3)
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedCurvePointAppend4)
+        call SaveInteger(wvkTypedTable, transaction, 0, curveId)
+        call SaveInteger(wvkTypedTable, transaction, 1, pointCount)
+        call SaveReal(wvkTypedTable, transaction, 2, x0)
+        call SaveReal(wvkTypedTable, transaction, 3, y0)
+        call SaveReal(wvkTypedTable, transaction, 4, z0)
+        call SaveReal(wvkTypedTable, transaction, 5, x1)
+        call SaveReal(wvkTypedTable, transaction, 6, y1)
+        call SaveReal(wvkTypedTable, transaction, 7, z1)
+        call SaveReal(wvkTypedTable, transaction, 8, x2)
+        call SaveReal(wvkTypedTable, transaction, 9, y2)
+        call SaveReal(wvkTypedTable, transaction, 10, z2)
+        call SaveReal(wvkTypedTable, transaction, 11, x3)
+        call SaveReal(wvkTypedTable, transaction, 12, y3)
+        call SaveReal(wvkTypedTable, transaction, 13, z3)
+        call SaveInteger(wvkTypedTable, transaction, wvkTypedCommitChild, wvkTypedCurvePointAppend4)
+        return
+    endif
+    set payload = "warvk:v1;curve.points.append4" + ";d:" + I2S(curveId) + ";i:" + I2S(pointCount) + ";r:" + R2S(x0) + ";r:" + R2S(y0) + ";r:" + R2S(z0) + ";r:" + R2S(x1) + ";r:" + R2S(y1) + ";r:" + R2S(z1) + ";r:" + R2S(x2) + ";r:" + R2S(y2) + ";r:" + R2S(z2) + ";r:" + R2S(x3) + ";r:" + R2S(y3) + ";r:" + R2S(z3)
     call Preloader(payload)
 endfunction
 
@@ -445,17 +707,52 @@ function WarVKSetLightningEnabled takes integer lightningId, boolean enabled ret
 endfunction
 
 function WarVKSetLightningEndpoints takes integer lightningId, real startX, real startY, real startZ, real endX, real endY, real endZ returns nothing
-    local string payload = "warvk:v1;lightning.setEndpoints" + ";d:" + I2S(lightningId) + ";r:" + R2S(startX) + ";r:" + R2S(startY) + ";r:" + R2S(startZ) + ";r:" + R2S(endX) + ";r:" + R2S(endY) + ";r:" + R2S(endZ)
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedLightningSetEndpoints)
+        call SaveInteger(wvkTypedTable, transaction, 0, lightningId)
+        call SaveReal(wvkTypedTable, transaction, 1, startX)
+        call SaveReal(wvkTypedTable, transaction, 2, startY)
+        call SaveReal(wvkTypedTable, transaction, 3, startZ)
+        call SaveReal(wvkTypedTable, transaction, 4, endX)
+        call SaveReal(wvkTypedTable, transaction, 5, endY)
+        call SaveReal(wvkTypedTable, transaction, 6, endZ)
+        call SaveInteger(wvkTypedTable, transaction, wvkTypedCommitChild, wvkTypedLightningSetEndpoints)
+        return
+    endif
+    set payload = "warvk:v1;lightning.setEndpoints" + ";d:" + I2S(lightningId) + ";r:" + R2S(startX) + ";r:" + R2S(startY) + ";r:" + R2S(startZ) + ";r:" + R2S(endX) + ";r:" + R2S(endY) + ";r:" + R2S(endZ)
     call Preloader(payload)
 endfunction
 
 function WarVKSetLightningColor takes integer lightningId, real red, real green, real blue, real alpha returns nothing
-    local string payload = "warvk:v1;lightning.setColor" + ";d:" + I2S(lightningId) + ";r:" + R2S(red) + ";r:" + R2S(green) + ";r:" + R2S(blue) + ";r:" + R2S(alpha)
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedLightningSetColor)
+        call SaveInteger(wvkTypedTable, transaction, 0, lightningId)
+        call SaveReal(wvkTypedTable, transaction, 1, red)
+        call SaveReal(wvkTypedTable, transaction, 2, green)
+        call SaveReal(wvkTypedTable, transaction, 3, blue)
+        call SaveReal(wvkTypedTable, transaction, 4, alpha)
+        call SaveInteger(wvkTypedTable, transaction, wvkTypedCommitChild, wvkTypedLightningSetColor)
+        return
+    endif
+    set payload = "warvk:v1;lightning.setColor" + ";d:" + I2S(lightningId) + ";r:" + R2S(red) + ";r:" + R2S(green) + ";r:" + R2S(blue) + ";r:" + R2S(alpha)
     call Preloader(payload)
 endfunction
 
 function WarVKSetLightningWidth takes integer lightningId, real width returns nothing
-    local string payload = "warvk:v1;lightning.setWidth" + ";d:" + I2S(lightningId) + ";r:" + R2S(width)
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedLightningSetWidth)
+        call SaveInteger(wvkTypedTable, transaction, 0, lightningId)
+        call SaveReal(wvkTypedTable, transaction, 1, width)
+        call SaveInteger(wvkTypedTable, transaction, wvkTypedCommitChild, wvkTypedLightningSetWidth)
+        return
+    endif
+    set payload = "warvk:v1;lightning.setWidth" + ";d:" + I2S(lightningId) + ";r:" + R2S(width)
     call Preloader(payload)
 endfunction
 
@@ -492,7 +789,13 @@ function WarVKGetManagedObjectType takes integer objectId returns integer
 endfunction
 
 function WarVKGetVisualTimeSeconds takes nothing returns real
-    local string payload = "warvk:v1;time.visualSeconds"
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedTimeVisualSeconds)
+        return LoadReal(wvkTypedTable, transaction, wvkTypedQueryRealChild)
+    endif
+    set payload = "warvk:v1;time.visualSeconds"
     return S2R(GetLocalizedString(payload))
 endfunction
 
@@ -502,12 +805,24 @@ function WarVKGetFrameIndex takes nothing returns integer
 endfunction
 
 function WarVKGetFramesPerSecond takes nothing returns real
-    local string payload = "warvk:v1;stats.framesPerSecond"
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedStatsFramesPerSecond)
+        return LoadReal(wvkTypedTable, transaction, wvkTypedQueryRealChild)
+    endif
+    set payload = "warvk:v1;stats.framesPerSecond"
     return S2R(GetLocalizedString(payload))
 endfunction
 
 function WarVKGetFrameTimeMilliseconds takes nothing returns real
-    local string payload = "warvk:v1;stats.frameTimeMilliseconds"
+    local integer transaction = 0
+    local string payload
+    if WVKTypedReady() then
+        set transaction = WVKTypedBegin(wvkTypedStatsFrameTimeMilliseconds)
+        return LoadReal(wvkTypedTable, transaction, wvkTypedQueryRealChild)
+    endif
+    set payload = "warvk:v1;stats.frameTimeMilliseconds"
     return S2R(GetLocalizedString(payload))
 endfunction
 

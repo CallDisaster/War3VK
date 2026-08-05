@@ -998,7 +998,7 @@ namespace dxvk {
         float m_time01Speed = 0.0f;  // time01 每秒变化量（约等于 1 / dayLengthSeconds）
         std::chrono::steady_clock::time_point m_time01LastUpdate;
         std::chrono::steady_clock::time_point m_time01LastRawSample;
-        
+
         // 配置参数 (可根据需求调整或暴露给 Config)
         float m_dayLengthSeconds = 480.0f;       // 8分钟 = 24小时
         float m_startTime01 = 0.22f;             // 进游戏起始时间 (0.25=日出, 0.5=正午)

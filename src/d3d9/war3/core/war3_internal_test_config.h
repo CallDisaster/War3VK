@@ -203,8 +203,9 @@ inline constexpr bool kNativeInternalTestApiEnabled = false;
 // WarVK 无声明 JASS command bridge。
 // 说明：
 // - 不注册新 native，不 patch JASS opcode；
-// - 仅包裹 Preloader/GetLocalizedHotkey/GetLocalizedString 三个低频原生函数；
-// - 只有第一个字符串参数以 "warvk:" 开头时才被 WarVK 消费，其余调用完全透传。
+// - 兼容控制面包裹三个低频字符串原生函数；
+// - 可选强类型数据面包裹四个 Hashtable Save/Load 原生函数，并要求私有表握手；
+// - 非 WarVK 字符串及非当前能力表调用全部透传。
 inline constexpr bool kWar3JassCommandBridgeEnabled = true;
 // 是否启用 JASS VM 主循环追踪（MainLoop / ExecuteInternal 分段）。
 // 性能优先默认关闭，排障时再开启。

@@ -84,6 +84,28 @@ Agents/
 /docs/plan/automation_exchange/
 /WarVK/bin/
 
+# 本地构建、浏览器与测试预览状态
+/.codex-shadow-build.err.log
+/.codex-shadow-build.out.log
+/.cache/
+/.playwright-cli/
+/.pytest_cache/
+/output/
+/research_bundles/
+
+# 一次性补丁、预览和本地头文件副本
+/AutoTest/_gen_perf_report_preview.py
+/AutoTest/_patch_*.py
+/AutoTest/SIX_HERO_GAMEPLAY_GATE.md
+/_apply_dark_theme.py
+/_gen_preview.py
+/_preview_*.py
+/_preview_*.html
+/lorenz_attractor_icon.html
+/diff_codex*.txt
+/t.cpp
+/src/d3d9/war3/core/war3_internal_test_config(R*).h
+
 # 一次性压缩包/临时分析文件
 /src/src.rar
 /tiara.ai

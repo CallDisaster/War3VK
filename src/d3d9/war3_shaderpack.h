@@ -73,7 +73,7 @@
  * // vec4 color = texture(sampler2D(u_colorTex, s_samplers[u_samplerColor]), uv);
  * ```
  * 
- * @version 1.1.0
+ * @version 1.2.0 Release
  * @date 2024-12-21
  * 
  * @copyright Copyright (c) 2024 War3MapReforge

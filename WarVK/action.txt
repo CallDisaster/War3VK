@@ -2,14 +2,14 @@
 title = "清除最后错误"
 description = "清除当前线程的最后错误。"
 comment = "无参数；清除最近一次错误状态。"
-category = "TC_WarVK"
+category = "TC_WarVKDiagnostics"
 script = "WarVKClearError"
 
 [WarVKSetSunEnabled]
 title = "启用太阳光"
 description = "设置太阳光开关 ${enabled}。"
 comment = "enabled=true 开启，false 关闭。"
-category = "TC_WarVK"
+category = "TC_WarVKSunShadow"
 script = "WarVKSetSunEnabled"
 [[.args]]
 type = boolean
@@ -18,7 +18,7 @@ type = boolean
 title = "设置太阳方向"
 description = "设置太阳方向 ${x}、${y}、${z}。"
 comment = "x/y/z 为方向向量分量；须为有限数且长度不能为0，建议使用归一化向量。"
-category = "TC_WarVK"
+category = "TC_WarVKSunShadow"
 script = "WarVKSetSunDirection"
 [[.args]]
 type = real
@@ -31,7 +31,7 @@ type = real
 title = "设置太阳颜色与强度"
 description = "设置太阳颜色 ${red}、${green}、${blue} 与强度 ${intensity}。"
 comment = "red/green/blue 为非负颜色分量；intensity 为非负强度，通常使用0..16。"
-category = "TC_WarVK"
+category = "TC_WarVKSunShadow"
 script = "WarVKSetSunColorIntensity"
 [[.args]]
 type = real
@@ -46,7 +46,7 @@ type = real
 title = "启用 CSM"
 description = "设置级联阴影开关 ${enabled}。"
 comment = "enabled=true 开启级联阴影，false 关闭。"
-category = "TC_WarVK"
+category = "TC_WarVKSunShadow"
 script = "WarVKSetCsmEnabled"
 [[.args]]
 type = boolean
@@ -55,10 +55,10 @@ type = boolean
 title = "设置 CSM 布局"
 description = "设置级联数 ${cascadeCount} 与最大距离 ${maxDistance}。"
 comment = "cascadeCount 范围1..4；maxDistance 范围256..50000，单位为世界坐标。"
-category = "TC_WarVK"
+category = "TC_WarVKSunShadow"
 script = "WarVKSetCsmLayout"
 [[.args]]
-type = integer
+type = WarVKCsmCascadeCount
 [[.args]]
 type = real
 
@@ -66,18 +66,85 @@ type = real
 title = "调整 CSM"
 description = "设置深度偏移 ${depthBias} 与混合宽度 ${blendWidth}。"
 comment = "depthBias 范围0..1；blendWidth 范围0..10000，单位为世界坐标。"
-category = "TC_WarVK"
+category = "TC_WarVKSunShadow"
 script = "WarVKSetCsmTuning"
 [[.args]]
 type = real
 [[.args]]
 type = real
 
+[WarVKSetLightingClockMode]
+title = "选择光照时钟来源"
+description = "将 WarVK 光照时钟来源设置为 ${mode}。"
+comment = "0=跟随游戏时间，1=保持作者时刻，2=按独立日长推进；只影响渲染，不修改玩法时间。"
+category = "TC_WarVKLightingClock"
+script = "WarVKSetLightingClockMode"
+[[.args]]
+type = WarVKLightingClockMode
+
+[WarVKSetLightingClockTime]
+title = "设置当前光照时刻"
+description = "将当前渲染光照时刻设置为 ${hours} 小时。"
+comment = "hours 范围0..24；调用后自动进入保持模式，24等价于0。"
+category = "TC_WarVKLightingClock"
+script = "WarVKSetLightingClockTime"
+[[.args]]
+type = real
+
+[WarVKSetLightingDayDuration]
+title = "设置独立昼夜时长"
+description = "将独立光照时钟的一整天设置为 ${seconds} 秒。"
+comment = "seconds 范围1..86400；需将时钟来源设置为 WARVK_LIGHTING_CLOCK_INDEPENDENT 才会推进。"
+category = "TC_WarVKLightingClock"
+script = "WarVKSetLightingDayDuration"
+[[.args]]
+type = real
+
+[WarVKSetCelestialMotionEnabled]
+title = "启用天体光照轨迹"
+description = "设置太阳/月亮轨迹自动更新 ${enabled}。"
+comment = "关闭后，太阳方向和方向光阴影强度保持作者设置；色温仍可独立随光照时钟变化。"
+category = "TC_WarVKLightingClock"
+script = "WarVKSetCelestialMotionEnabled"
+[[.args]]
+type = boolean
+
+[WarVKSetTimeColorGradingEnabled]
+title = "启用时间色温变化"
+description = "设置方向光色温与环境色调自动更新 ${enabled}。"
+comment = "关闭后，WarVKSetSunColorIntensity 设置的颜色不会再被时间曲线覆盖。"
+category = "TC_WarVKLightingClock"
+script = "WarVKSetTimeColorGradingEnabled"
+[[.args]]
+type = boolean
+
+[WarVKSetTimeColorTemperatureProfile]
+title = "设置昼夜色温曲线"
+description = "设置午夜 ${midnightKelvin}、黎明 ${dawnKelvin}、正午 ${noonKelvin}、黄昏 ${duskKelvin} 的色温。"
+comment = "四个值范围均为1000..20000K；分别对应00:00、06:00、12:00、18:00，时段之间平滑循环插值。"
+category = "TC_WarVKLightingClock"
+script = "WarVKSetTimeColorTemperatureProfile"
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKResetTimeColorTemperatureProfile]
+title = "恢复默认昼夜色温"
+description = "恢复 WarVK 内置的自然昼夜色温曲线。"
+comment = "无参数；恢复内置曲线，不改变光照时钟来源或两个自动更新开关。"
+category = "TC_WarVKLightingClock"
+script = "WarVKResetTimeColorTemperatureProfile"
+
 [WarVKDestroyPointLight]
 title = "销毁点光源"
 description = "销毁 WarVK 点光 id ${lightId}。"
 comment = "lightId 使用创建函数返回的正整数；无效或已销毁 id 会被拒绝。"
-category = "TC_WarVK"
+category = "TC_WarVKPointLight"
 script = "WarVKDestroyPointLight"
 [[.args]]
 type = integer
@@ -86,7 +153,7 @@ type = integer
 title = "启用点光源"
 description = "设置点光 ${lightId} 开关 ${enabled}。"
 comment = "lightId 为点光 id；enabled=true 开启，false 关闭。"
-category = "TC_WarVK"
+category = "TC_WarVKPointLight"
 script = "WarVKSetPointLightEnabled"
 [[.args]]
 type = integer
@@ -97,7 +164,7 @@ type = boolean
 title = "设置点光位置"
 description = "设置点光 ${lightId} 位置 ${x}、${y}、${z}。"
 comment = "lightId 为点光 id；x/y/z 为有限世界坐标。"
-category = "TC_WarVK"
+category = "TC_WarVKPointLight"
 script = "WarVKSetPointLightPosition"
 [[.args]]
 type = integer
@@ -112,7 +179,7 @@ type = real
 title = "设置点光颜色与强度"
 description = "设置点光 ${lightId} 颜色 ${red}、${green}、${blue} 与强度 ${intensity}。"
 comment = "lightId 为点光 id；red/green/blue 为非负颜色分量，intensity 为非负强度。"
-category = "TC_WarVK"
+category = "TC_WarVKPointLight"
 script = "WarVKSetPointLightColorIntensity"
 [[.args]]
 type = integer
@@ -129,7 +196,7 @@ type = real
 title = "设置点光半径"
 description = "设置点光 ${lightId} 半径 ${radius}。"
 comment = "lightId 为点光 id；radius 必须大于0，单位为世界坐标。"
-category = "TC_WarVK"
+category = "TC_WarVKPointLight"
 script = "WarVKSetPointLightRadius"
 [[.args]]
 type = integer
@@ -140,7 +207,7 @@ type = real
 title = "启用点光阴影"
 description = "设置点光 ${lightId} 阴影开关 ${enabled}。"
 comment = "lightId 为点光 id；enabled=true 开启点光阴影，false 关闭。"
-category = "TC_WarVK"
+category = "TC_WarVKPointLight"
 script = "WarVKSetPointLightShadowEnabled"
 [[.args]]
 type = integer
@@ -151,12 +218,12 @@ type = boolean
 title = "设置点光阴影参数"
 description = "设置点光 ${lightId} 阴影分辨率 ${resolution} 与偏移 ${bias}。"
 comment = "lightId 为点光 id；resolution 只能为128..2048的2次幂；bias 范围0..10。"
-category = "TC_WarVK"
+category = "TC_WarVKPointLight"
 script = "WarVKSetPointLightShadowConfig"
 [[.args]]
 type = integer
 [[.args]]
-type = integer
+type = WarVKPointShadowResolution
 [[.args]]
 type = real
 
@@ -164,7 +231,7 @@ type = real
 title = "启用体积光"
 description = "设置体积光开关 ${enabled}。"
 comment = "enabled=true 开启体积光，false 关闭。"
-category = "TC_WarVK"
+category = "TC_WarVKVolumetricLight"
 script = "WarVKSetVolumetricEnabled"
 [[.args]]
 type = boolean
@@ -172,17 +239,17 @@ type = boolean
 [WarVKSetVolumetricDensity]
 title = "设置体积光密度"
 description = "设置体积光密度 ${density}。"
-comment = "density 建议范围0..1；使用有限非负数。"
-category = "TC_WarVK"
+comment = "density 范围0..2；0表示介质不产生散射。"
+category = "TC_WarVKVolumetricLight"
 script = "WarVKSetVolumetricDensity"
 [[.args]]
 type = real
 
 [WarVKSetVolumetricScattering]
 title = "设置体积光散射"
-description = "设置散射 ${scattering} 与各向异性 ${anisotropy}。"
-comment = "scattering 建议范围0..1；anisotropy 范围-1..1。"
-category = "TC_WarVK"
+description = "设置散射权重 ${scattering} 与采样衰减 ${decay}。"
+comment = "scattering 范围0..3；decay 范围0.70..0.999，越接近1光柱延伸越稳定。"
+category = "TC_WarVKVolumetricLight"
 script = "WarVKSetVolumetricScattering"
 [[.args]]
 type = real
@@ -192,155 +259,33 @@ type = real
 [WarVKSetVolumetricQuality]
 title = "设置体积光质量"
 description = "设置步数 ${stepCount} 与最大距离 ${maxDistance}。"
-comment = "stepCount 建议1..256；maxDistance 必须为正数，单位为世界坐标。"
-category = "TC_WarVK"
+comment = "stepCount 范围4..16；maxDistance 范围1..50000，单位为世界坐标。"
+category = "TC_WarVKVolumetricLight"
 script = "WarVKSetVolumetricQuality"
 [[.args]]
 type = integer
 [[.args]]
 type = real
 
-[WarVKSetOutlineEnabled]
-title = "启用轮廓"
-description = "设置轮廓开关 ${enabled}。"
-comment = "enabled=true 开启轮廓，false 关闭。"
-category = "TC_WarVK"
-script = "WarVKSetOutlineEnabled"
+[WarVKSetGlobalVolumetricFogEnabled]
+title = "启用全局体积雾"
+description = "设置全局高度雾开关 ${enabled}。"
+comment = "enabled=true 启用高度雾，false 仅移除高度雾；仍需单独启用体积光通道才会显示。"
+category = "TC_WarVKVolumetricFog"
+script = "WarVKSetGlobalVolumetricFogEnabled"
 [[.args]]
 type = boolean
 
-[WarVKSetOutlineColor]
-title = "设置轮廓颜色"
-description = "设置轮廓颜色 ${red}、${green}、${blue}、${alpha}。"
-comment = "red/green/blue/alpha 建议范围0..1；alpha=0透明，alpha=1不透明。"
-category = "TC_WarVK"
-script = "WarVKSetOutlineColor"
+[WarVKSetGlobalVolumetricFog]
+title = "设置全局体积雾"
+description = "设置雾层基准高度 ${baseHeight}、高度衰减 ${falloff} 与强度 ${strength}。"
+comment = "baseHeight 为世界高度；falloff 范围0..0.05；strength 范围0..2。该接口控制全图高度雾，不创建局部区域雾体积。"
+category = "TC_WarVKVolumetricFog"
+script = "WarVKSetGlobalVolumetricFog"
 [[.args]]
 type = real
 [[.args]]
 type = real
-[[.args]]
-type = real
-[[.args]]
-type = real
-
-[WarVKSetOutlineParameters]
-title = "设置轮廓参数"
-description = "设置轮廓宽度 ${width} 与深度阈值 ${depthThreshold}。"
-comment = "width 建议0..16像素；depthThreshold 建议0..1。"
-category = "TC_WarVK"
-script = "WarVKSetOutlineParameters"
-[[.args]]
-type = real
-[[.args]]
-type = real
-
-[WarVKSetBloomEnabled]
-title = "启用泛光"
-description = "设置泛光开关 ${enabled}。"
-comment = "enabled=true 开启泛光，false 关闭。"
-category = "TC_WarVK"
-script = "WarVKSetBloomEnabled"
-[[.args]]
-type = boolean
-
-[WarVKSetBloomParameters]
-title = "设置泛光参数"
-description = "设置阈值 ${threshold}、强度 ${intensity} 与软膝 ${softKnee}。"
-comment = "threshold 和 intensity 使用非负数；softKnee 建议范围0..1。"
-category = "TC_WarVK"
-script = "WarVKSetBloomParameters"
-[[.args]]
-type = real
-[[.args]]
-type = real
-[[.args]]
-type = real
-
-[WarVKSetBloomRadius]
-title = "设置泛光半径"
-description = "设置泛光半径 ${radius}。"
-comment = "radius 使用非负数，单位为像素或后处理采样半径。"
-category = "TC_WarVK"
-script = "WarVKSetBloomRadius"
-[[.args]]
-type = real
-
-[WarVKSetPostfxEnabled]
-title = "启用后处理"
-description = "设置后处理开关 ${enabled}。"
-comment = "enabled=true 开启后处理，false 关闭。"
-category = "TC_WarVK"
-script = "WarVKSetPostfxEnabled"
-[[.args]]
-type = boolean
-
-[WarVKSetPostfxExposureGamma]
-title = "设置曝光与伽马"
-description = "设置曝光 ${exposure} 与伽马 ${gamma}。"
-comment = "exposure 建议-16..16；gamma 必须为正数，常用范围0.1..4。"
-category = "TC_WarVK"
-script = "WarVKSetPostfxExposureGamma"
-[[.args]]
-type = real
-[[.args]]
-type = real
-
-[WarVKSetPostfxColorGrade]
-title = "设置色彩分级"
-description = "设置饱和度 ${saturation} 与对比度 ${contrast}。"
-comment = "saturation 和 contrast 建议范围0..4，1表示保持原值。"
-category = "TC_WarVK"
-script = "WarVKSetPostfxColorGrade"
-[[.args]]
-type = real
-[[.args]]
-type = real
-
-[WarVKSetAaMode]
-title = "设置抗锯齿模式"
-description = "设置抗锯齿模式 ${mode} 与质量 ${quality}。"
-comment = "mode 使用渲染器定义的整数模式；quality 为非负质量级别，未知值会被拒绝。"
-category = "TC_WarVK"
-script = "WarVKSetAaMode"
-[[.args]]
-type = integer
-[[.args]]
-type = integer
-
-[WarVKSetAaSharpness]
-title = "设置抗锯齿锐度"
-description = "设置抗锯齿锐度 ${sharpness}。"
-comment = "sharpness 建议范围0..2；0为不增强，1为常用值。"
-category = "TC_WarVK"
-script = "WarVKSetAaSharpness"
-[[.args]]
-type = real
-
-[WarVKSetDayNightEnabled]
-title = "启用昼夜视觉"
-description = "设置昼夜视觉开关 ${enabled}。"
-comment = "enabled=true 开启昼夜调节，false 关闭。"
-category = "TC_WarVK"
-script = "WarVKSetDayNightEnabled"
-[[.args]]
-type = boolean
-
-[WarVKSetDayNightTime]
-title = "设置渲染时间"
-description = "设置昼夜时间 ${hours}。"
-comment = "hours 范围0..24；0为午夜，12为正午。"
-category = "TC_WarVK"
-script = "WarVKSetDayNightTime"
-[[.args]]
-type = real
-
-[WarVKSetDayNightSpeed]
-title = "设置昼夜速度"
-description = "设置昼夜速度 ${scale}。"
-comment = "scale 使用非负时间倍率；0暂停昼夜推进，1为正常速度。"
-category = "TC_WarVK"
-script = "WarVKSetDayNightSpeed"
 [[.args]]
 type = real
 
@@ -348,7 +293,7 @@ type = real
 title = "销毁闪电"
 description = "销毁 WarVK 闪电 id ${lightningId}。"
 comment = "lightningId 使用创建函数返回的正整数；无效或已销毁 id 会被拒绝。"
-category = "TC_WarVK"
+category = "TC_WarVKLightning"
 script = "WarVKDestroyLightning"
 [[.args]]
 type = integer
@@ -357,7 +302,7 @@ type = integer
 title = "启用闪电"
 description = "设置闪电 ${lightningId} 开关 ${enabled}。"
 comment = "lightningId 为闪电 id；enabled=true 显示，false 隐藏。"
-category = "TC_WarVK"
+category = "TC_WarVKLightning"
 script = "WarVKSetLightningEnabled"
 [[.args]]
 type = integer
@@ -368,7 +313,7 @@ type = boolean
 title = "设置闪电端点"
 description = "设置闪电 ${lightningId} 起点 ${startX}、${startY}、${startZ} 与终点 ${endX}、${endY}、${endZ}。"
 comment = "lightningId 为闪电 id；六个坐标为有限世界坐标。"
-category = "TC_WarVK"
+category = "TC_WarVKLightning"
 script = "WarVKSetLightningEndpoints"
 [[.args]]
 type = integer
@@ -389,7 +334,7 @@ type = real
 title = "设置闪电颜色"
 description = "设置闪电 ${lightningId} 颜色 ${red}、${green}、${blue}、${alpha}。"
 comment = "lightningId 为闪电 id；red/green/blue/alpha 建议范围0..1。"
-category = "TC_WarVK"
+category = "TC_WarVKLightning"
 script = "WarVKSetLightningColor"
 [[.args]]
 type = integer
@@ -406,7 +351,7 @@ type = real
 title = "设置闪电宽度"
 description = "设置闪电 ${lightningId} 宽度 ${width}。"
 comment = "lightningId 为闪电 id；width 必须大于0，单位为世界坐标宽度。"
-category = "TC_WarVK"
+category = "TC_WarVKLightning"
 script = "WarVKSetLightningWidth"
 [[.args]]
 type = integer
@@ -417,7 +362,7 @@ type = real
 title = "设置闪电模板基础参数"
 description = "设置模板 ${templateId} 贴图 ${texturePath}、起点颜色 ${startRed}/${startGreen}/${startBlue}/${startAlpha}、终点颜色 ${endRed}/${endGreen}/${endBlue}/${endAlpha}、宽度 ${startWidth}/${endWidth}、UV ${uvTiling}/${uvScrollSpeed} 与渲染模式 ${renderMode}。"
 comment = "templateId=CreateLightningTemplate 返回的未冻结 id。texturePath=相对地图/MPQ 路径（非空），支持 BLP1(JPEG/索引色)/TGA/PNG/JPG/JPEG/BMP，不支持 BLP2；例 ReplaceableTextures\\Weather\\Lightning.blp。BLP1 JPEG 不含 Alpha，闪电会自动从边缘背景生成软遮罩；要精确透明请用带 Alpha 的 PNG/TGA。start/end 颜色：RGB 建议 0..1（>=0 有限数），Alpha 必须 0..1（不要填 255）。startWidth/endWidth=世界坐标带宽，范围 1..4096。uvTiling=沿电弧贴图重复次数 0.01..128；uvScrollSpeed=贴图滚动速度 -128..128。renderMode：0 ALPHA无深度 / 1 ALPHA深度测试 / 2 加法无深度 / 3 加法深度测试（推荐 WARVK_LIGHTNING_RENDER_ADDITIVE_DEPTH=3）。须在 Finalize 前调用。"
-category = "TC_WarVK"
+category = "TC_WarVKLightningTemplate"
 script = "WarVKSetLightningTemplateBasic"
 [[.args]]
 type = integer
@@ -448,13 +393,13 @@ type = real
 [[.args]]
 type = real
 [[.args]]
-type = integer
+type = WarVKLightningRenderMode
 
 [WarVKSetLightningTemplateAdvanced]
 title = "设置闪电模板进阶参数"
 description = "设置模板 ${templateId} 段长 ${averageSegmentLength}、最小/最大段 ${minimumSegments}/${maximumSegments}、弧度 ${curveAmplitude}、噪声 ${noiseAmplitude}/${noiseFrequency}/${noiseScrollSpeed}、octaves ${noiseOctaves}、分支 ${branchCount}/${branchLengthScale}/${branchWidthScale}。"
 comment = "templateId=未冻结模板 id。averageSegmentLength=目标段长(世界坐标) 4..8192，越短越密越耗。minimumSegments/maximumSegments=段数钳制，各自 2..64 且 max>=min。curveAmplitude=大尺度弯曲 -4096..4096。noiseAmplitude=分形噪声位移 0..4096；noiseFrequency=噪声频率 0..64；noiseScrollSpeed=噪声相位滚动 -64..64。noiseOctaves=噪声层数 1..4。branchCount=分叉数 0..8；branchLengthScale=分叉相对主电长度 0..8（常用1）；branchWidthScale=分叉相对主电宽度 0.05..4（常用0.45）。推荐：80,4,32,70,36,9,1,2,2,1,0.45。Finalize 前调用。"
-category = "TC_WarVK"
+category = "TC_WarVKLightningTemplate"
 script = "WarVKSetLightningTemplateAdvanced"
 [[.args]]
 type = integer
@@ -485,7 +430,7 @@ type = real
 title = "设置闪电模板可选参数"
 description = "设置模板 ${templateId} 生命周期 ${lifetimeSec}、淡入/淡出 ${fadeInSec}/${fadeOutSec}、脉冲 ${pulseAmplitude}/${pulseFrequency}/${pulseTravelSpeed}、闪烁 ${flickerAmplitude}/${flickerFrequencyHz}、辉光 ${glowWidthScale}/${glowOpacity}。"
 comment = "templateId=未冻结模板 id。lifetimeSec=寿命秒 0..600，0=常驻直到 DestroyLightning；>0 时 fadeIn/fadeOut 各自不能超过 lifetime。fadeInSec/fadeOutSec=淡入淡出秒 0..600。pulseAmplitude=脉冲强度 0..1；pulseFrequency=脉冲频率(Hz) 0..120；pulseTravelSpeed=脉冲沿电弧传播 -120..120（0=原地脉冲）。flickerAmplitude=随机闪烁强度 0..1；flickerFrequencyHz=闪烁频率 0..120。glowWidthScale=外层辉光宽度倍率 1..8（1=不更宽）；glowOpacity=辉光不透明度 0..1（0=关闭辉光，共用主贴图）。推荐常驻：0,0.08,0.16,0.25,7,0,0.08,11,1.8,0.22。Finalize 前调用。"
-category = "TC_WarVK"
+category = "TC_WarVKLightningTemplate"
 script = "WarVKSetLightningTemplateOptional"
 [[.args]]
 type = integer
@@ -514,7 +459,7 @@ type = real
 title = "冻结闪电模板"
 description = "冻结闪电模板 ${templateId}。"
 comment = "templateId=已配置的模板 id。建议顺序：Create → Basic → Advanced → Optional → FormulaCurve(可选) → Finalize → CreateFromTemplate。至少需完成基础（通常也需进阶）配置；冻结后 setBasic/Advanced/Optional/setFormulaCurve 均会被拒绝；之后创建的实例复制冻结快照，互不影响。"
-category = "TC_WarVK"
+category = "TC_WarVKLightningTemplate"
 script = "WarVKFinalizeLightningTemplate"
 [[.args]]
 type = integer
@@ -523,7 +468,7 @@ type = integer
 title = "销毁数学程序句柄"
 description = "销毁数学程序句柄 ${programId}。"
 comment = "只销毁可再次创建曲线的 programId；已经创建的曲线和已绑定的闪电持有不可变快照，不受影响。"
-category = "TC_WarVK"
+category = "TC_WarVKMath"
 script = "WarVKDestroyMathProgram"
 [[.args]]
 type = integer
@@ -532,16 +477,16 @@ type = integer
 title = "销毁公式曲线句柄"
 description = "销毁公式曲线句柄 ${curveId}。"
 comment = "已经绑定到模板或闪电实例的曲线快照不受影响。"
-category = "TC_WarVK"
+category = "TC_WarVKCurve"
 script = "WarVKDestroyCurve"
 [[.args]]
 type = integer
 
 [WarVKSetCurveReal]
-title = "设置曲线公式参数"
-description = "设置曲线 ${curveId} 中名为 ${name} 的实数参数为 ${value}。"
+title = "设置数学公式参数"
+description = "设置计算/曲线 ${curveId} 中名为 ${name} 的实数参数为 ${value}。"
 comment = "name 必须是公式里出现的 ASCII 参数标识符且区分大小写；内置上下文变量不能覆盖。绑定到闪电时会复制当前参数快照。"
-category = "TC_WarVK"
+category = "TC_WarVKMath"
 script = "WarVKSetCurveReal"
 [[.args]]
 type = integer
@@ -554,18 +499,18 @@ type = real
 title = "设置曲线坐标模式"
 description = "设置曲线 ${curveId} 的坐标模式为 ${mode}。"
 comment = "使用 WARVK_CURVE_COORDINATE_OFFSET(公式返回vec2偏移)、LOCAL(返回局部vec3) 或 WORLD(返回世界vec3)。"
-category = "TC_WarVK"
+category = "TC_WarVKCurve"
 script = "WarVKSetCurveCoordinateMode"
 [[.args]]
 type = integer
 [[.args]]
-type = integer
+type = WarVKCurveCoordinateMode
 
 [WarVKSetCurveEndpointLocks]
 title = "设置曲线端点锁定"
 description = "设置曲线 ${curveId} 起点锁 ${lockStart} 与终点锁 ${lockEnd}。"
 comment = "锁定会对公式输出施加平滑端点遮罩，确保闪电接触起点/终点；OFFSET 模式推荐两者都开启。"
-category = "TC_WarVK"
+category = "TC_WarVKCurve"
 script = "WarVKSetCurveEndpointLocks"
 [[.args]]
 type = integer
@@ -576,9 +521,9 @@ type = boolean
 
 [WarVKSetLightningTemplateFormulaCurve]
 title = "设置闪电模板公式曲线"
-description = "把曲线 ${curveId} 的当前快照绑定到闪电模板 ${templateId}。"
+description = "把当前闪电模板 ${templateId} 绑定到曲线 ${curveId} 的当前快照。"
 comment = "必须在冻结模板之前调用。绑定后修改/销毁曲线或程序不会改变模板；公式由 C++ 批量执行，不逐点回调 JASS。"
-category = "TC_WarVK"
+category = "TC_WarVKLightningTemplate"
 script = "WarVKSetLightningTemplateFormulaCurve"
 [[.args]]
 type = integer
@@ -587,9 +532,9 @@ type = integer
 
 [WarVKSetLightningFormulaCurve]
 title = "设置闪电实例公式曲线"
-description = "把曲线 ${curveId} 的当前快照绑定到闪电实例 ${lightningId}。"
+description = "把当前闪电实例 ${lightningId} 绑定到曲线 ${curveId} 的当前快照。"
 comment = "对现有闪电立即生效；绑定后修改/销毁曲线或程序不会改变该闪电实例。"
-category = "TC_WarVK"
+category = "TC_WarVKLightning"
 script = "WarVKSetLightningFormulaCurve"
 [[.args]]
 type = integer
@@ -600,7 +545,7 @@ type = integer
 title = "追加点曲线（最多4点）"
 description = "向点曲线 ${curveId} 追加 ${pointCount} 个点：${x0}/${y0}/${z0}、${x1}/${y1}/${z1}、${x2}/${y2}/${z2}、${x3}/${y3}/${z3}。"
 comment = "pointCount 范围1..4；未使用坐标仍填有限值，推荐重复最后一个有效点。累计点数不能超过创建时声明的数量。"
-category = "TC_WarVK"
+category = "TC_WarVKCurve"
 script = "WarVKAppendPointCurve4"
 [[.args]]
 type = integer
@@ -635,7 +580,7 @@ type = real
 title = "冻结点曲线"
 description = "冻结点曲线 ${curveId} 并建立累计弧长表。"
 comment = "只有实际追加数量恰好等于预期点数且总长度非零时成功；冻结后不可继续追加。"
-category = "TC_WarVK"
+category = "TC_WarVKCurve"
 script = "WarVKFinalizePointCurve"
 [[.args]]
 type = integer
@@ -644,7 +589,7 @@ type = integer
 title = "替换连续闪电点曲线"
 description = "把闪电实例 ${lightningId} 的中心线原子替换为已冻结点曲线 ${curveId}。"
 comment = "用于低频重建动态轨迹；实例 id 保持不变，渲染线程只看到完整不可变快照。"
-category = "TC_WarVK"
+category = "TC_WarVKLightning"
 script = "WarVKSetPolylineLightningCurve"
 [[.args]]
 type = integer

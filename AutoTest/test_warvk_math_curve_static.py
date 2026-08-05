@@ -101,13 +101,15 @@ class WarVKMathCurveStaticTests(unittest.TestCase):
         self.assertIn("nowSec - record.createdSec", center)
 
     def test_japi_exposes_cpu_only_math_curve_contract(self):
-        self.assertIn('kApiVersion = "WarVK JAPI 1.3.0-polyline-curves"', self.japi)
+        self.assertIn('kApiVersion = "WarVK JAPI 1.2.0 Release"', self.japi)
         self.assertIn("kFeatureMathCurve = 0x00002000u", self.japi)
         for command in (
             "math.program.compile",
             "math.program.destroy",
             "math.program.isAlive",
             "math.program.lastError",
+            "math.evaluateReal",
+            "math.evaluateInteger",
             "curve.create",
             "curve.destroy",
             "curve.setReal",
@@ -123,7 +125,7 @@ class WarVKMathCurveStaticTests(unittest.TestCase):
         self.assertIn("mathCurveCpuCommand", self.japi)
         self.assertIn("math::CurveRuntime::instance().reset()", self.japi)
         bridge = JASS_BRIDGE.read_text(encoding="utf-8")
-        self.assertIn("WarVK JAPI 1.3.0-polyline-curves", bridge)
+        self.assertIn("WarVK JAPI 1.2.0 Release", bridge)
         self.assertNotIn("WarVK JAPI 1.2.0-math-curves", bridge)
         bootstrap = RUNTIME_BOOTSTRAP.read_text(encoding="utf-8")
         self.assertIn("math::CurveRuntime::instance().reset()", bootstrap)
@@ -135,6 +137,8 @@ class WarVKMathCurveStaticTests(unittest.TestCase):
             "WarVKSetCurveReal",
             "WarVKSetCurveCoordinateMode",
             "WarVKSetCurveEndpointLocks",
+            "WarVKEvaluateMathReal",
+            "WarVKEvaluateMathInteger",
             "WarVKEvaluateCurveComponent",
             "WarVKEvaluateCurveDerivativeComponent",
             "WarVKGetCurveArcLength",

@@ -531,6 +531,7 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
         dxvk::war3::hooks::RunJassCommandBridgeSelfTest(displayText);
     response["installed"] = test.installed;
     response["preloaderOk"] = test.preloaderOk;
+    response["typedTransportInstalled"] = test.typedTransportInstalled;
     response["intQueryOk"] = test.intQueryOk;
     response["stringQueryOk"] = test.stringQueryOk;
     response["publicV1Ok"] = test.publicV1Ok;

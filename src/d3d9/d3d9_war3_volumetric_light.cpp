@@ -1138,8 +1138,9 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   const float heightFogBase = finiteOr(settings.heightFogBase, 0.0f);
   const float heightFogFalloff =
       clampFinite(settings.heightFogFalloff, 0.00001f, 0.05f, 0.0012f);
-  const float heightFogStrength =
-      clampFinite(settings.heightFogStrength, 0.0f, 2.0f, 0.20f);
+  const float heightFogStrength = settings.heightFogEnabled
+      ? clampFinite(settings.heightFogStrength, 0.0f, 2.0f, 0.20f)
+      : 0.0f;
   csmUbo.params =
       Vector4(receiverBias, invShadowRes, float(cascadeCount), pcfRadius);
   csmUbo.params2 = Vector4(cascadeBlendRange, heightFogBase, heightFogFalloff,

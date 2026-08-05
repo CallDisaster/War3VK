@@ -1,3 +1,3 @@
 #pragma once
 
-#define DXVK_VERSION "1.1.0"
+#define DXVK_VERSION "1.2.0 Release"

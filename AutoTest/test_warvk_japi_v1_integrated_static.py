@@ -29,6 +29,7 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
         cls.init_jass = INIT_JASS_PATH.read_text(encoding="utf-8")
         cls.action = ACTION_PATH.read_text(encoding="utf-8")
         cls.call = CALL_PATH.read_text(encoding="utf-8")
+        cls.define = (WARVK_ROOT / "define.txt").read_text(encoding="utf-8")
         cls.runtime = RUNTIME_PATH.read_text(encoding="utf-8")
         cls.bridge = BRIDGE_PATH.read_text(encoding="utf-8")
 
@@ -57,12 +58,12 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             r'"([birds]*)",\s*[^,]+,\s*(true|false)\}',
             self.runtime,
         )
-        self.assertEqual(len(rows), 80)
+        self.assertEqual(len(rows), 91)
         cpp_commands = {
             name: (carrier, signature)
             for name, carrier, signature, _required in rows
         }
-        self.assertEqual(len(cpp_commands), 80)
+        self.assertEqual(len(cpp_commands), 91)
 
         self.assertNotIn("JapiFunc", self.jass)
         self.assertNotRegex(self.jass, r"(?m)^\s*native\s+WarVK")
@@ -96,7 +97,25 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
         ui_scripts = set(
             re.findall(r'(?m)^script = "(WarVK\w+)"$', self.action + self.call)
         )
-        self.assertEqual(ui_scripts, public_functions)
+        self.assertTrue(ui_scripts.issubset(public_functions))
+        for hidden_until_implemented in (
+            "WarVKSetOutlineEnabled",
+            "WarVKSetOutlineColor",
+            "WarVKSetOutlineParameters",
+            "WarVKSetBloomEnabled",
+            "WarVKSetBloomParameters",
+            "WarVKSetBloomRadius",
+            "WarVKSetPostfxEnabled",
+            "WarVKSetPostfxExposureGamma",
+            "WarVKSetPostfxColorGrade",
+            "WarVKSetAaMode",
+            "WarVKSetAaSharpness",
+            "WarVKSetDayNightEnabled",
+            "WarVKSetDayNightTime",
+            "WarVKSetDayNightSpeed",
+        ):
+            self.assertIn(hidden_until_implemented, public_functions)
+            self.assertNotIn(hidden_until_implemented, ui_scripts)
 
     def test_public_jass_and_ui_have_concise_descriptions(self):
         combined = self.jass + self.smoke_jass + self.action + self.call
@@ -161,6 +180,8 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             "kFeatureSun",
             "kFeatureCsm",
             "kFeaturePointLight",
+            "kFeatureVolumetric",
+            "kFeatureDayNight",
             "kFeatureLightning",
             "kFeatureManagedObject",
             "kFeatureTime",
@@ -170,15 +191,160 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
         ):
             self.assertIn(feature, implemented)
         for absent in (
-            "0x00000008u",
             "0x00000010u",
             "0x00000020u",
             "0x00000040u",
             "0x00000080u",
-            "0x00000100u",
         ):
             self.assertNotIn(absent, implemented)
         self.assertIn("return Failure(ErrorCode::UnsupportedFeature);", self.runtime)
+
+    def test_ydwe_categories_are_specific_and_root_is_system_only(self):
+        for category in (
+            "TC_WarVKDiagnostics",
+            "TC_WarVKSunShadow",
+            "TC_WarVKLightingClock",
+            "TC_WarVKPointLight",
+            "TC_WarVKVolumetricLight",
+            "TC_WarVKVolumetricFog",
+            "TC_WarVKLightning",
+            "TC_WarVKLightningTemplate",
+            "TC_WarVKMath",
+            "TC_WarVKCurve",
+        ):
+            self.assertIn(f"{category}=[", self.define)
+        self.assertNotIn("\\\\CommandButtons\\\\", self.define)
+        root_scripts = set()
+        for block in re.split(r"\n\s*\n(?=\[)", self.action + "\n\n" + self.call):
+            if 'category = "TC_WarVK"' in block:
+                match = re.search(r'(?m)^script = "(WarVK\w+)"$', block)
+                if match:
+                    root_scripts.add(match.group(1))
+        self.assertEqual(root_scripts, {
+            "WarVKGetVersion",
+            "WarVKGetProtocolVersion",
+            "WarVKGetFeatureFlags",
+            "WarVKIsRuntimeReady",
+        })
+
+    def test_ydwe_enumerations_are_clickable_trigger_types(self):
+        custom_types = (
+            "WarVKCsmCascadeCount",
+            "WarVKPointShadowResolution",
+            "WarVKLightingClockMode",
+            "WarVKLightningRenderMode",
+            "WarVKCurveCoordinateMode",
+            "WarVKCurveComponent",
+            "WarVKMathRoundingMode",
+        )
+        for type_name in custom_types:
+            self.assertRegex(
+                self.define,
+                rf"(?m)^{type_name}=0,0,0,[^,]+,integer$",
+            )
+
+        symbolic_params = {
+            "WarVKLightingClockMode": (
+                "WARVK_LIGHTING_CLOCK_GAME_TIME",
+                "WARVK_LIGHTING_CLOCK_HELD",
+                "WARVK_LIGHTING_CLOCK_INDEPENDENT",
+            ),
+            "WarVKLightningRenderMode": (
+                "WARVK_LIGHTNING_RENDER_ALPHA_NO_DEPTH",
+                "WARVK_LIGHTNING_RENDER_ALPHA_DEPTH",
+                "WARVK_LIGHTNING_RENDER_ADDITIVE_NO_DEPTH",
+                "WARVK_LIGHTNING_RENDER_ADDITIVE_DEPTH",
+            ),
+            "WarVKCurveCoordinateMode": (
+                "WARVK_CURVE_COORDINATE_OFFSET",
+                "WARVK_CURVE_COORDINATE_LOCAL",
+                "WARVK_CURVE_COORDINATE_WORLD",
+            ),
+            "WarVKCurveComponent": (
+                "WARVK_CURVE_COMPONENT_X",
+                "WARVK_CURVE_COMPONENT_Y",
+                "WARVK_CURVE_COMPONENT_Z",
+            ),
+            "WarVKMathRoundingMode": (
+                "WARVK_MATH_ROUND_NEAREST",
+                "WARVK_MATH_ROUND_FLOOR",
+                "WARVK_MATH_ROUND_CEIL",
+                "WARVK_MATH_ROUND_TRUNCATE",
+            ),
+        }
+        for type_name, symbols in symbolic_params.items():
+            for symbol in symbols:
+                self.assertRegex(
+                    self.define,
+                    rf'(?m)^{symbol}=0,{type_name},"{symbol}",[^,]+$',
+                )
+
+        def argument_types(source, function_name):
+            block = re.search(
+                rf"(?ms)^\[{function_name}\]\n(.*?)(?=^\[(?!\[)|\Z)", source
+            ).group(1)
+            return re.findall(r"(?m)^type\s*=\s*(\S+)$", block)
+
+        expected = {
+            "WarVKSetCsmLayout": (self.action, 0, "WarVKCsmCascadeCount"),
+            "WarVKSetLightingClockMode": (
+                self.action, 0, "WarVKLightingClockMode"
+            ),
+            "WarVKSetPointLightShadowConfig": (
+                self.action, 1, "WarVKPointShadowResolution"
+            ),
+            "WarVKSetLightningTemplateBasic": (
+                self.action, 14, "WarVKLightningRenderMode"
+            ),
+            "WarVKSetCurveCoordinateMode": (
+                self.action, 1, "WarVKCurveCoordinateMode"
+            ),
+            "WarVKEvaluateMathInteger": (
+                self.call, 4, "WarVKMathRoundingMode"
+            ),
+            "WarVKEvaluateCurveComponent": (
+                self.call, 1, "WarVKCurveComponent"
+            ),
+            "WarVKEvaluateCurveDerivativeComponent": (
+                self.call, 1, "WarVKCurveComponent"
+            ),
+        }
+        for function_name, (source, index, type_name) in expected.items():
+            self.assertEqual(argument_types(source, function_name)[index], type_name)
+
+        self.assertNotIn(
+            "WarVKCurveCoordinateMode",
+            argument_types(self.action, "WarVKSetLightningTemplateAdvanced"),
+        )
+
+    def test_volumetric_and_scalar_author_controls_are_real_commands(self):
+        for command in (
+            "volumetric.setEnabled",
+            "volumetric.setDensity",
+            "volumetric.setScattering",
+            "volumetric.setQuality",
+            "volumetricFog.setEnabled",
+            "volumetricFog.setSettings",
+            "math.evaluateReal",
+            "math.evaluateInteger",
+        ):
+            self.assertIn(f'"{command}"', self.runtime)
+        for dispatch in (
+            "case CommandId::VolumetricSetEnabled",
+            "case CommandId::VolumetricFogSetEnabled",
+            "case CommandId::VolumetricFogSetSettings",
+            "case CommandId::MathEvaluateReal",
+            "case CommandId::MathEvaluateInteger",
+        ):
+            self.assertIn(dispatch, self.runtime)
+        for script in (
+            "WarVKSetGlobalVolumetricFogEnabled",
+            "WarVKSetGlobalVolumetricFog",
+            "WarVKEvaluateMathReal",
+            "WarVKEvaluateMathInteger",
+        ):
+            self.assertIn(f"function {script}", self.jass)
+            self.assertIn(f'script = "{script}"', self.action + self.call)
 
     def test_managed_ids_and_lightning_enable_have_real_lifetimes(self):
         self.assertIn("std::unordered_map<int32_t, ManagedObject> g_objects", self.runtime)

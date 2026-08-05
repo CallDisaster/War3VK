@@ -9,6 +9,7 @@ namespace dxvk::war3::hooks {
 
 struct JassCommandBridgeSelfTestResult {
   bool installed = false;
+  bool typedTransportInstalled = false;
   bool preloaderOk = false;
   bool intQueryOk = false;
   bool stringQueryOk = false;
@@ -86,8 +87,11 @@ struct JassFixedCameraTestResult {
  * WarVK JASS command bridge.
  *
  * This bridge does not register new natives and does not patch JASS bytecode.
- * It wraps a few existing, low-frequency native carriers and only consumes
- * calls whose first string argument starts with "warvk:".
+ * Its compatibility/control plane wraps three low-frequency string carriers
+ * and only consumes calls whose first argument starts with "warvk:". An
+ * optional, independently designed numeric data plane wraps the stock
+ * hashtable Save/Load natives. That path requires a private-table capability
+ * handshake and otherwise forwards the original native unchanged.
  */
 void ConfigureJassCommandBridge(GetTlsJassDataFn lookupFn);
 
@@ -104,6 +108,7 @@ void ResetJassCommandBridgeInstallState();
 void TryInstallJassCommandBridge(const char *reason);
 
 bool IsJassCommandBridgeInstalled();
+bool IsJassTypedTransportInstalled();
 
 /**
  * Directly invoke War3 native table entries to simulate JASS calling the
