@@ -13,6 +13,7 @@
 - Shadow Arena 使用事务式 bundle、GPU completion fence、map/device epoch 和最终 replay 验证。
 - exact-index 有界批量读取修复了 write-combined 索引缓冲造成的明显 CPU 性能回归。
 - WarVK JAPI 内置于 `d3d9.dll`，新增强类型数值通道、点光/光照时钟、闪电、数学表达式和曲线接口。
+- 作者包已移除不可用的地图内 AI/Lua Loader 与 DLL carrier；WarVK 仅以游戏启动前安装的代理 `d3d9.dll` 运行。
 - YDWE Catalog 按功能分类，并为模式参数提供可点击选择项。
 
 完整变更见 [CHANGELOG.md](../CHANGELOG.md)，安装与使用说明见

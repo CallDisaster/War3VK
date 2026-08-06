@@ -40,7 +40,7 @@ Version 1.2.0 is the first public release of the newer semantic rendering archit
 
 ### Map-author API
 
-- WarVK JAPI is built into `d3d9.dll`; a separate `war3map.dll` is not required when WarVK is already loaded as the proxy runtime.
+- WarVK JAPI is built into the proxy `d3d9.dll`, which must be installed before Warcraft III starts. The author package contains no in-map DLL loader and does not require a separate `war3map.dll`.
 - The public wire protocol remains `warvk:v1`. High-frequency numeric calls can use a verified typed Hashtable transport while text commands retain the compatible string route.
 - Authors can create and update point lights, enable point shadows, control volumetric lighting and global height fog, and manage the WarVK lighting clock independently from Warcraft gameplay time.
 - Lightning templates support textures, colours, widths, animation, branching, formula curves, and uploaded polyline curves.
@@ -86,7 +86,7 @@ The player package needs only the files explicitly listed in the release archive
 
 - A black screen at startup usually indicates an outdated Vulkan driver or a conflicting third-party `d3d9.dll`.
 - For poor performance, disable volumetric effects first, then reduce point-shadow count and post-processing. Directional CSM remains 4096 unless the runtime safely latches the allocation fallback.
-- Do not copy multiple D3D9 proxy/loaders into the same game directory.
+- Do not copy multiple D3D9 proxy DLLs into the same game directory.
 - Useful report files include `d3d9.log`, `runtime_status.json`, GPU incident JSON, and WarVK crash dumps. Remove personal paths or map data before publishing logs.
 - If a map has already been left in the current process, fully exit Warcraft III, restart it, and load only the target map. Cross-map reports should include the exact transition order and the first incident snapshot.
 
@@ -101,7 +101,7 @@ The primary code areas are:
 - `src/d3d9/`: D3D9 runtime, settings, shadow/lighting pipeline, and integration
 - `src/d3d9/war3/`: Warcraft hooks, semantic bridge, resource lifetime, GPU skinning, JAPI, math, and diagnostics
 - `subprojects/war3fx/`: WarVK shaders
-- `WarVK/`: JASS library, YDWE catalog, loader assets, icon, and author documentation
+- `WarVK/`: JASS library, YDWE catalog, icon, and author documentation
 - `AutoTest/`: static contracts, runnable tests, performance gates, and attach-only diagnostics
 
 Build the 32-bit runtime with:

@@ -68,6 +68,8 @@
 
 - 将 clean-room WarVK JAPI 正式内置到 DXVK `d3d9.dll`。通过 Warcraft stock native carrier
   转发 `warvk:v1`，不声明额外 Native，也不依赖 `war3map.dll` 提供接口。
+- 发布修订移除了作者包中的 AI/Lua Loader、`WarVK.dll` 与伪装 `.blp` DLL carrier；正式版只支持
+  在游戏启动前安装代理 `d3d9.dll`，地图侧初始化仅检测 bridge，不再请求运行时加载。
 - 新增可选强类型 Hashtable 数据面：验证 `SaveInteger/SaveReal/LoadInteger/LoadReal` 的
   Game.dll 签名后，以私有表、序号、操作码和 commit/query 事务传递高频数值；其他 Hashtable
   调用无条件转发原函数。

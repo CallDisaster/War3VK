@@ -10,6 +10,7 @@
 #include <memory>
 #include <vector>
 #include <chrono>
+#include <cstddef>
 #include <string>
 
 namespace dxvk {
@@ -129,5 +130,29 @@ namespace dxvk {
         // Direction/color consumption remains in War3ShadowReceiverPass; the
         // render-only authored clock advances here even when shadows are off.
     };
+
+    // Allocation and destruction stay in the same translation unit as the
+    // constructor. The ABI tag is part of the factory symbol, so a stale
+    // caller compiled with an older pipeline/settings layout fails to link
+    // instead of under-allocating the object and crashing in the constructor.
+    template <std::size_t PipelineSize,
+              std::size_t PipelineAlignment,
+              std::size_t SettingsSize,
+              std::size_t SettingsAlignment>
+    struct War3RenderPipelineAbiTag { };
+
+    using War3RenderPipelineAbi = War3RenderPipelineAbiTag<
+        sizeof(War3RenderPipeline),
+        alignof(War3RenderPipeline),
+        sizeof(War3RenderSettings),
+        alignof(War3RenderSettings)>;
+
+    War3RenderPipeline* CreateWar3RenderPipeline(
+        const Rc<DxvkDevice>& device,
+        War3RenderPipelineAbi);
+
+    void DestroyWar3RenderPipeline(
+        War3RenderPipeline* pipeline,
+        War3RenderPipelineAbi);
 
 } // namespace dxvk

@@ -1,13 +1,13 @@
 #pragma once
 // WarVK map-side entry.
 //
-// Include this file from the map library. It will not declare custom natives,
-// so the map can pass native-table validation before WarVK is loaded.
+// Include this file from the map library. It declares no custom natives and
+// only probes the proxy runtime that must already be active at process start.
 
 #include "warvk_bridge.j"
 #include "warvk_api.j"
 
-library WarVKInitLib initializer WarVK_AutoInit
+library WarVKInitLib initializer WarVK_Init
     globals
         private boolean WARVK_INITIALIZED = false
     endglobals
@@ -17,24 +17,11 @@ library WarVKInitLib initializer WarVK_AutoInit
             return
         endif
         set WARVK_INITIALIZED = true
-        call WarVK_Load()
+        // Public calls perform their own readiness check. Initialization never
+        // attempts to load a DLL or start an AI/Lua loader.
     endfunction
 
     function WarVKInit takes nothing returns nothing
         call WarVK_Init()
-    endfunction
-
-    private function WarVK_AutoInitDelayed takes nothing returns nothing
-        local timer t = GetExpiredTimer()
-        call PauseTimer(t)
-        call DestroyTimer(t)
-        set t = null
-        call WarVK_Init()
-    endfunction
-
-    private function WarVK_AutoInit takes nothing returns nothing
-        local timer t = CreateTimer()
-        call TimerStart(t, WARVK_AUTO_INIT_DELAY_SEC, false, function WarVK_AutoInitDelayed)
-        set t = null
     endfunction
 endlibrary

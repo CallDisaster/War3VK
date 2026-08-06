@@ -501,6 +501,23 @@ test(
   timeout : 30,
 )
 
+# Value-only crash-capture policy test. It proves that recoverable first-chance
+# observations cannot consume the one-shot fatal dump gate and does not load
+# DbgHelp or install process exception handlers.
+war3_crash_capture_policy_test = executable(
+  'war3_crash_capture_policy_test',
+  [
+    'war3/core/tests/war3_crash_capture_policy_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_crash_capture_policy',
+  war3_crash_capture_policy_test,
+  timeout : 30,
+)
+
 if platform != 'windows'
   pkg.generate(d3d9_dll,
     filebase: dxvk_pkg_prefix + 'd3d9',
