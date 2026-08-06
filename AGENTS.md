@@ -59,11 +59,17 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   16/16 Win32 runnable 通过。高压光影图 AutoTest 两轮分别完成 969/1636 采样帧，均进入
   地图且 device lost、frame incomplete、budget exceeded 和新增 dump 为 0。clean DLL 已由
   AutoTest 部署到 `E:\Work\War3\d3d9.dll`；仍不能据此排除 ReShade/InputHost 自身问题。
+- 2026-08-07 的单地图高压候选已区分 receiver 终态与 pre-receiver 占位发布，并为 direct geoset
+  快取补齐 map/immutable generation 门。默认可见桌面下“生与死”完成 DirectInline 三轮及 TAA v2
+  一轮各 10 分钟巡航，receiver 全零、Arena/replay 异常、incident 和 GPU 事件均为 0；504/504 静态、
+  16/16 runnable 通过。部署 DLL SHA-256 为
+  `9FE2F6132015D6BF5413B844915187F80D9F53E14F204564890CD9E71E12AED3`。详细证据见
+  `docs/agent-history/2026-08-07-life-and-death-night-gate.md`。
 - 1.2.0 的发布范围限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍会造成
   性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；点光开启点阴影后，部分
   地面/角度仍有摩尔纹或带状伪影。README/CHANGELOG 必须保留这两项已知问题，后续不得描述为已修复。
-- 当前 JAPI/体积效果、光影图启动及低视角压力场景仍需用户地图物理验收；不得把静态/构建通过
-  表述为视觉、性能或 TDR 问题已在物理环境完成验收。
+- 当前 JAPI/体积效果仍需用户地图物理验收；可见桌面 AutoTest 的低视角稳定门不能代替玩家前台
+  视觉判断，也不能外推为跨地图或点阴影摩尔纹已经修复。
 
 ## 不可破坏的工程约束
 
