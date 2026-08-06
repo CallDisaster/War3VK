@@ -27,6 +27,7 @@ DIAG_CPP = (ROOT / "src/d3d9/war3/tools/war3_diagnostics_hub.cpp").read_text(
 CONTROL = (ROOT / "src/d3d9/war3/tools/war3_control_plane.cpp").read_text(
     encoding="utf-8"
 )
+AUTOTEST = (ROOT / "AutoTest/war3_autotest_mcp.py").read_text(encoding="utf-8")
 
 
 class PerfGpuUnionAndShadowRouteContracts(unittest.TestCase):
@@ -77,6 +78,22 @@ class PerfGpuUnionAndShadowRouteContracts(unittest.TestCase):
             self.assertIn(name, DIAG_H)
             self.assertIn(f'{{"{name}"', DIAG_CPP)
             self.assertIn(f'result["{name}"]', CONTROL)
+
+    def test_life_and_death_gate_observes_before_consume(self) -> None:
+        start = AUTOTEST.index("def run_life_and_death_tdr_scenario(")
+        block = AUTOTEST[start : AUTOTEST.index("def ", start + 10)]
+        self.assertIn(
+            'user_env.setdefault("DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", "1")',
+            block,
+        )
+        self.assertIn(
+            'user_env.setdefault("DXVK_WAR3_SEMANTIC_DIRECT_PHASE_BREAKDOWN", "1")',
+            block,
+        )
+        self.assertIn(
+            'user_env.setdefault("DXVK_WAR3_SEMANTIC_BUILD_ELIGIBLE_TRACE_PERIOD", "64")',
+            block,
+        )
 
 
 if __name__ == "__main__":

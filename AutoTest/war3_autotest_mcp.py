@@ -9015,6 +9015,15 @@ def run_life_and_death_tdr_scenario(
     user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK", "1")
     user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK_WARMUP_SEC", "1")
     user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK_SAMPLE_SEC", str(duration))
+    # Dedicated high-pressure runs collect proof before any Consume default is
+    # considered. Observe recomputes the canonical decision and records
+    # mismatches; sampled phase breakdown gives proportional hotspot evidence
+    # without turning every record into a timing scope.
+    user_env.setdefault("DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", "1")
+    user_env.setdefault("DXVK_WAR3_SEMANTIC_DIRECT_PHASE_BREAKDOWN", "1")
+    user_env.setdefault("DXVK_WAR3_SEMANTIC_FAST_APPEND_TRACE_PERIOD", "64")
+    user_env.setdefault("DXVK_WAR3_SEMANTIC_BUILD_ELIGIBLE_BREAKDOWN", "1")
+    user_env.setdefault("DXVK_WAR3_SEMANTIC_BUILD_ELIGIBLE_TRACE_PERIOD", "64")
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     artifact_dir = ARTIFACT_ROOT / "life_and_death_tdr" / stamp
