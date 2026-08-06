@@ -804,6 +804,18 @@ namespace dxvk {
 
     War3RenderPipeline::~War3RenderPipeline() = default;
 
+    War3RenderPipeline* CreateWar3RenderPipeline(
+        const Rc<DxvkDevice>& device,
+        War3RenderPipelineAbi) {
+        return new War3RenderPipeline(device);
+    }
+
+    void DestroyWar3RenderPipeline(
+        War3RenderPipeline* pipeline,
+        War3RenderPipelineAbi) {
+        delete pipeline;
+    }
+
     void War3RenderPipeline::OnFrameStart() {
         m_insertedBeforeUi = false;
         m_armedBeforeUi = false;

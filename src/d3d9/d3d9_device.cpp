@@ -9593,7 +9593,8 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   war3dbg::InstallCrashHandlerOnce();
   TraceD3D9Device(traceOrdinal, "crash-handler-ready", this);
   TraceD3D9Device(traceOrdinal, "war3-pipeline-begin", this);
-  m_war3Pipeline = new War3RenderPipeline(m_dxvkDevice);
+  m_war3Pipeline = CreateWar3RenderPipeline(
+      m_dxvkDevice, War3RenderPipelineAbi { });
   m_war3PostProcess = new War3PostProcess(this);
   TraceD3D9Device(traceOrdinal, "war3-pipeline-end", this);
   war3::SetActiveDevice(this);
@@ -9841,7 +9842,8 @@ D3D9DeviceEx::~D3D9DeviceEx() {
 
   delete m_initializer;
   delete m_converter;
-  delete m_war3Pipeline;
+  DestroyWar3RenderPipeline(
+      m_war3Pipeline, War3RenderPipelineAbi { });
   delete m_war3PostProcess;
   m_shadowReceiverPass = nullptr;
   m_ssaoPass = nullptr;

@@ -1,4 +1,5 @@
 #include "../../d3d9_war3_debug.h"
+#include "war3_crash_capture_policy.h"
 
 #include <dbghelp.h>
 #include <tlhelp32.h>
@@ -7,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <string>
 #include <vector>
@@ -22,8 +24,8 @@ struct ModuleInfo {
 };
 
 LONG g_handlerInstalled = 0;
-LONG g_dumpInProgress = 0;
 PVOID g_vectoredHandler = nullptr;
+War3CrashCaptureCoordinator g_captureCoordinator;
 
 std::string WideToUtf8(const std::wstring& value) {
   if (value.empty())
@@ -134,7 +136,9 @@ std::string TimestampIso(SYSTEMTIME st) {
   return buf;
 }
 
-void WriteInstallMarker(const std::wstring& crashDir, PVOID vectoredHandler) {
+void WriteInstallMarker(const std::wstring& crashDir,
+                        PVOID vectoredHandler,
+                        bool firstChanceTraceEnabled) {
   const std::wstring path = crashDir + L"\\crash_handler_status.json";
   FILE* file = nullptr;
   _wfopen_s(&file, path.c_str(), L"wb");
@@ -144,6 +148,7 @@ void WriteInstallMarker(const std::wstring& crashDir, PVOID vectoredHandler) {
   SYSTEMTIME now = {};
   GetLocalTime(&now);
   std::fprintf(file, "{\n");
+  std::fprintf(file, "  \"schemaVersion\": 2,\n");
   std::fprintf(file, "  \"ok\": true,\n");
   std::fprintf(file, "  \"timestamp\": \"%s\",\n", TimestampIso(now).c_str());
   std::fprintf(file, "  \"pid\": %lu,\n", GetCurrentProcessId());
@@ -152,6 +157,10 @@ void WriteInstallMarker(const std::wstring& crashDir, PVOID vectoredHandler) {
                JsonEscape(WideToUtf8(GetProcessPath())).c_str());
   std::fprintf(file, "  \"vectoredHandler\": \"%s\",\n",
                Hex64(reinterpret_cast<uintptr_t>(vectoredHandler)).c_str());
+  std::fprintf(file, "  \"firstChanceMode\": \"%s\",\n",
+               firstChanceTraceEnabled ? "memory-only-opt-in" : "disabled");
+  std::fprintf(file, "  \"fullDumpOnUnhandledOnly\": true,\n");
+  std::fprintf(file, "  \"latestCrashMeansFatal\": true,\n");
   std::fprintf(file, "  \"unhandledFilter\": true,\n");
   std::fprintf(file, "  \"dumpDir\": \"%s\"\n",
                JsonEscape(WideToUtf8(crashDir)).c_str());
@@ -207,7 +216,7 @@ void WriteSummaryJson(const std::wstring& path,
                       const std::wstring& dumpPath,
                       bool dumpOk,
                       const std::string& dumpError,
-                      bool firstChance) {
+                      const War3FirstChanceSnapshot& firstChanceSnapshot) {
   const auto* record = exceptionPointers ? exceptionPointers->ExceptionRecord : nullptr;
   const auto* context = exceptionPointers ? exceptionPointers->ContextRecord : nullptr;
   const uintptr_t exceptionAddress = record
@@ -224,8 +233,10 @@ void WriteSummaryJson(const std::wstring& path,
   GetLocalTime(&now);
 
   std::fprintf(file, "{\n");
+  std::fprintf(file, "  \"schemaVersion\": 2,\n");
   std::fprintf(file, "  \"ok\": true,\n");
-  std::fprintf(file, "  \"firstChance\": %s,\n", firstChance ? "true" : "false");
+  std::fprintf(file, "  \"kind\": \"fatal\",\n");
+  std::fprintf(file, "  \"firstChance\": false,\n");
   std::fprintf(file, "  \"timestamp\": \"%s\",\n", TimestampIso(now).c_str());
   std::fprintf(file, "  \"pid\": %lu,\n", GetCurrentProcessId());
   std::fprintf(file, "  \"tid\": %lu,\n", GetCurrentThreadId());
@@ -253,6 +264,16 @@ void WriteSummaryJson(const std::wstring& path,
   std::fprintf(file, "    \"modulePath\": \"%s\"\n",
                JsonEscape(WideToUtf8(module.path)).c_str());
   std::fprintf(file, "  },\n");
+  std::fprintf(file, "  \"firstChanceObserved\": {\n");
+  std::fprintf(file, "    \"enabled\": %s,\n",
+               g_vectoredHandler ? "true" : "false");
+  std::fprintf(file, "    \"count\": %u,\n", firstChanceSnapshot.count);
+  std::fprintf(file, "    \"lastExceptionCode\": \"%s\",\n",
+               Hex64(firstChanceSnapshot.exceptionCode).c_str());
+  std::fprintf(file, "    \"lastExceptionAddress\": \"%s\",\n",
+               Hex64(firstChanceSnapshot.exceptionAddress).c_str());
+  std::fprintf(file, "    \"lastThreadId\": %u\n", firstChanceSnapshot.threadId);
+  std::fprintf(file, "  },\n");
   std::fprintf(file, "  \"registers\": {\n");
 #if defined(_M_IX86) || defined(__i386__)
   std::fprintf(file, "    \"Eax\": \"%s\",\n", Hex64(context ? context->Eax : 0).c_str());
@@ -279,25 +300,12 @@ void WriteSummaryJson(const std::wstring& path,
   CopyFileBestEffort(path, latestPath);
 }
 
-LONG HandleCrash(EXCEPTION_POINTERS* exceptionPointers, bool firstChance) {
+LONG CaptureUnhandledCrash(EXCEPTION_POINTERS* exceptionPointers) {
   if (!exceptionPointers || !exceptionPointers->ExceptionRecord)
     return EXCEPTION_CONTINUE_SEARCH;
 
   const DWORD code = exceptionPointers->ExceptionRecord->ExceptionCode;
-  switch (code) {
-  case EXCEPTION_ACCESS_VIOLATION:
-  case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
-  case EXCEPTION_DATATYPE_MISALIGNMENT:
-  case EXCEPTION_ILLEGAL_INSTRUCTION:
-  case EXCEPTION_IN_PAGE_ERROR:
-  case EXCEPTION_INT_DIVIDE_BY_ZERO:
-  case EXCEPTION_STACK_OVERFLOW:
-    break;
-  default:
-    return EXCEPTION_CONTINUE_SEARCH;
-  }
-
-  if (InterlockedCompareExchange(&g_dumpInProgress, 1, 0) != 0)
+  if (!g_captureCoordinator.tryBeginFatalCapture())
     return EXCEPTION_CONTINUE_SEARCH;
 
   SYSTEMTIME now = {};
@@ -345,25 +353,42 @@ LONG HandleCrash(EXCEPTION_POINTERS* exceptionPointers, bool firstChance) {
   }
 
   WriteSummaryJson(summaryPath, latestPath, exceptionPointers, dumpPath,
-                   dumpOk, dumpError, firstChance);
+                   dumpOk, dumpError,
+                   g_captureCoordinator.firstChanceSnapshot());
 
-  Print("DXVK War3Crash: captured exception code=0x%08lX addr=%p dump=%ls ok=%d firstChance=%d\n",
+  Print("DXVK War3Crash: captured fatal exception code=0x%08lX addr=%p dump=%ls ok=%d\n",
         code,
         exceptionPointers->ExceptionRecord->ExceptionAddress,
         dumpPath.c_str(),
-        dumpOk ? 1 : 0,
-        firstChance ? 1 : 0);
+        dumpOk ? 1 : 0);
 
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
 LONG WINAPI War3VectoredExceptionHandler(EXCEPTION_POINTERS* exceptionPointers) {
-  return HandleCrash(exceptionPointers, true);
+  if (exceptionPointers && exceptionPointers->ExceptionRecord) {
+    g_captureCoordinator.recordFirstChance(
+      exceptionPointers->ExceptionRecord->ExceptionCode,
+      reinterpret_cast<uintptr_t>(exceptionPointers->ExceptionRecord->ExceptionAddress),
+      GetCurrentThreadId());
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
 }
 
 LONG WINAPI War3UnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionPointers) {
-  HandleCrash(exceptionPointers, false);
+  CaptureUnhandledCrash(exceptionPointers);
   return EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool IsEnvironmentFlagEnabled(const char* name) {
+  char value[16] = {};
+  const DWORD length = GetEnvironmentVariableA(
+    name, value, static_cast<DWORD>(sizeof(value)));
+  if (length == 0 || length >= sizeof(value))
+    return false;
+  return std::strcmp(value, "1") == 0 ||
+         _stricmp(value, "true") == 0 ||
+         _stricmp(value, "on") == 0;
 }
 
 } // namespace
@@ -374,12 +399,20 @@ void InstallCrashHandlerOnce() {
 
   const std::wstring crashDir = MakeCrashDirectory();
   SetErrorMode(GetErrorMode() | SEM_NOGPFAULTERRORBOX);
-  g_vectoredHandler = AddVectoredExceptionHandler(1, War3VectoredExceptionHandler);
+  const bool firstChanceTraceEnabled =
+    IsEnvironmentFlagEnabled("DXVK_WAR3_CRASH_FIRST_CHANCE_TRACE");
+  if (firstChanceTraceEnabled) {
+    // Register last and keep this handler memory-only so recoverable OS/runtime
+    // exceptions are never delayed by DbgHelp, disk I/O or module enumeration.
+    g_vectoredHandler = AddVectoredExceptionHandler(
+      0, War3VectoredExceptionHandler);
+  }
   SetUnhandledExceptionFilter(War3UnhandledExceptionFilter);
-  WriteInstallMarker(crashDir, g_vectoredHandler);
+  WriteInstallMarker(crashDir, g_vectoredHandler, firstChanceTraceEnabled);
 
-  Print("DXVK War3Crash: handler installed veh=%p dir=%ls\n",
+  Print("DXVK War3Crash: fatal handler installed veh=%p firstChance=%s dir=%ls\n",
         g_vectoredHandler,
+        firstChanceTraceEnabled ? "memory-only" : "disabled",
         crashDir.c_str());
 
   char selfTest[32] = {};

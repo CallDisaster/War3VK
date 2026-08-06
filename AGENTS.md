@@ -1,6 +1,6 @@
 # WarVK / DXVK Agent Guide
 
-> 最后整理：2026-08-05。本文是后续 agent 的快速入口，不记录逐轮实验、历史改动或路线图；
+> 最后整理：2026-08-06。本文是后续 agent 的快速入口，不记录逐轮实验、历史改动或路线图；
 > 需要追溯时按需检索 [历史归档](docs/agent-history/README.md)。
 
 ## 项目是什么
@@ -45,6 +45,20 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 - 当前候选验证为：474/474 静态测试、15/15 Win32 runnable、真实 YDWE Catalog 35/35 回读与
   WTG/WCT 校验、Win32 DLL 构建及 `ninja -C build32 -n` no-work。DLL 为 33,745,880 bytes，
   SHA-256 `84112587871BD421A3B927C65119258851A3E471734633220167AA81877FFF80`；未部署或启动游戏。
+- 2026-08-06 的玩家 dump 证明 1.2.0 崩溃处理器把可恢复的 InputHost/CoreMessaging 首机会
+  异常同步写成约 59 MiB dump；旧 `g_dumpInProgress` 还会永久遮蔽之后真正的 fatal。当前
+  诊断热修默认不再注册 VEH；显式 `DXVK_WAR3_CRASH_FIRST_CHANCE_TRACE=1` 时也只做锁自由
+  内存计数。完整 dump 仅由 UEF 为未处理异常生成，`latest_crash.json` 只表示 fatal，且
+  首机会状态与 fatal 一次性门已经分离。
+- 首个诊断候选暴露出既有增量构建污染：`d3d9_device.cpp.obj` 的 Ninja 依赖表为 0，调用方
+  按旧布局只为 `War3RenderPipeline` 分配 656 bytes，而新构造函数按 736-byte 布局写到
+  `this+0x2D8`，因此启动即在 d3d9.dll 内越界。现在 pipeline 创建/销毁移入构造函数同一
+  翻译单元，factory 符号编码 pipeline/settings 的 size+alignment；旧布局调用方会链接失败，
+  不再生成混合对象 DLL。全新目录 clean build 后为 33,750,533 bytes，SHA-256
+  `36AC64802D36BEC4327F85E7B3B0CB2878B12BDEAFF54CA2223063C609B90DAC`；483/483 静态测试、
+  16/16 Win32 runnable 通过。高压光影图 AutoTest 两轮分别完成 969/1636 采样帧，均进入
+  地图且 device lost、frame incomplete、budget exceeded 和新增 dump 为 0。clean DLL 已由
+  AutoTest 部署到 `E:\Work\War3\d3d9.dll`；仍不能据此排除 ReShade/InputHost 自身问题。
 - 1.2.0 的发布范围限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍会造成
   性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；点光开启点阴影后，部分
   地面/角度仍有摩尔纹或带状伪影。README/CHANGELOG 必须保留这两项已知问题，后续不得描述为已修复。
