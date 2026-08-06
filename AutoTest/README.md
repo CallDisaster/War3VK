@@ -114,12 +114,14 @@ identity fail-closed、固定 System32 工具和 timeout。完成前不得签收
 launcher_mode="ydwe"
 ydwe_root="E:\\Work\\War3\\YDWE1.32.13 - MemoryHack"
 war3_dir="E:\\Work\\War3_AutoTestSandbox"
-use_isolated_desktop=true
+use_isolated_desktop=false
 ```
 
 该模式启动命令为
-`YDWE.exe -war3 -loadfile Maps\Test\WorldEditTestMap.w3x -closew2l`，仍在既有隔离
-Win32 Desktop 上运行。`-closew2l` 禁止启动时再次转换候选图。工具先把候选图原子部署到
+`YDWE.exe -war3 -loadfile Maps\Test\WorldEditTestMap.w3x -closew2l`。当前机器的 Win32
+Desktop-object 路径已被安全隔离：实测显示栈可能令交互桌面黑屏，同时把 War3 留在非输入
+桌面，因此显式请求 `use_isolated_desktop=true` 会在启动前失败。使用可见桌面或 attach-only；
+`-closew2l` 禁止启动时再次转换候选图。工具先把候选图原子部署到
 专用沙盒短路径并复核源/目标 SHA-256；目标被占用或哈希不一致时直接失败，绝不复用旧的
 `WorldEditTestMap.w3x`。
 

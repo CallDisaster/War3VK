@@ -6244,6 +6244,9 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneCompactWorkTableRejectIdentityCount;
     summary.semanticSceneCompactWorkTableMismatchCount =
         g_shadowSceneStats.semanticSceneCompactWorkTableMismatchCount;
+    summary.drawTimeSemanticProducerOwnedDirectGroupedSkipCount =
+        g_shadowSceneStats
+            .drawTimeSemanticProducerOwnedDirectGroupedSkipCount;
     summary.semanticSceneDirectLastSubmittedRecordCount =
         g_shadowSceneStats.semanticSceneDirectLastSubmittedRecordCount;
     summary.semanticSceneDirectLastUniqueObjectCount =
@@ -6791,6 +6794,18 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneShadowMapSkinnedInvalidPipelineCount;
     summary.semanticSceneShadowMapSkinnedDrawnCount =
         g_shadowSceneStats.semanticSceneShadowMapSkinnedDrawnCount;
+    summary.gpuSkinVsShadowDirectAttempts =
+        g_shadowSceneStats.gpuSkinVsShadowDirectAttempts;
+    summary.gpuSkinVsShadowDirectInputRejects =
+        g_shadowSceneStats.gpuSkinVsShadowDirectInputRejects;
+    summary.gpuSkinVsShadowDirectStateRejects =
+        g_shadowSceneStats.gpuSkinVsShadowDirectStateRejects;
+    summary.gpuSkinVsShadowDirectDrawsSubmitted =
+        g_shadowSceneStats.gpuSkinVsShadowDirectDrawsSubmitted;
+    summary.gpuSkinVsShadowReplayDirectional =
+        g_shadowSceneStats.gpuSkinVsShadowReplayDirectional;
+    summary.gpuSkinVsShadowReplayPoint =
+        g_shadowSceneStats.gpuSkinVsShadowReplayPoint;
     summary.semanticSceneShadowTaaActive =
         g_shadowSceneStats.semanticSceneShadowTaaActive;
     summary.semanticSceneReceiverReuseShadowMap =

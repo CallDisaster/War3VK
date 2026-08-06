@@ -188,6 +188,32 @@ bool TestExactIndexVertexDomainBulkRead() {
   return true;
 }
 
+bool TestExactIndexDomainRebase() {
+  const uint16_t indices16[] = {9u, 4u, 7u, 9u, 5u, 7u};
+  const auto span16 = BuildWar3CpuReadableBufferSpan(
+      ValidInput(indices16, sizeof(indices16), 0u, sizeof(indices16)));
+  uint16_t rebased16[6] = {};
+  CHECK(RebaseWar3ExactIndexDomain(
+      span16, 2u, 6u, 4u, 9u, rebased16, sizeof(rebased16)));
+  const uint16_t expected16[] = {5u, 0u, 3u, 5u, 1u, 3u};
+  CHECK(std::memcmp(rebased16, expected16, sizeof(expected16)) == 0);
+
+  const uint32_t indices32[] = {101u, 104u, 103u};
+  const auto span32 = BuildWar3CpuReadableBufferSpan(
+      ValidInput(indices32, sizeof(indices32), 0u, sizeof(indices32)));
+  uint32_t rebased32[3] = {};
+  CHECK(RebaseWar3ExactIndexDomain(
+      span32, 4u, 3u, 101u, 104u, rebased32, sizeof(rebased32)));
+  const uint32_t expected32[] = {0u, 3u, 2u};
+  CHECK(std::memcmp(rebased32, expected32, sizeof(expected32)) == 0);
+
+  CHECK(!RebaseWar3ExactIndexDomain(
+      span16, 2u, 6u, 5u, 9u, rebased16, sizeof(rebased16)));
+  CHECK(!RebaseWar3ExactIndexDomain(
+      span16, 2u, 6u, 4u, 9u, rebased16, sizeof(rebased16) - 1u));
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -196,7 +222,8 @@ int main() {
       !TestGenerationAndCpuReadabilityGates() ||
       !TestCurrentUpBytesAndAddressOverflow() || !TestDiagnostics() ||
       !TestExactIndexVertexDomain() ||
-      !TestExactIndexVertexDomainBulkRead())
+      !TestExactIndexVertexDomainBulkRead() ||
+      !TestExactIndexDomainRebase())
     return 1;
   std::cout << "war3_cpu_readable_buffer_span_test: PASS\n";
   return 0;

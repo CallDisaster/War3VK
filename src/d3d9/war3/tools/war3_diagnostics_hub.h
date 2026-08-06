@@ -1,10 +1,34 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace dxvk::war3::tools {
+
+enum class GpuFlightBreadcrumb : uint32_t {
+  Idle = 0u,
+  PipelineBeforeUi,
+  ShadowReceiverEntry,
+  CsmPreflight,
+  CsmCascade,
+  CsmTerrainMask,
+  VolumeSunShadow,
+  PointShadowPlan,
+  PointShadowFace,
+  ShadowCopy,
+  ShadowMotionVectors,
+  ShadowVisibility,
+  ShadowReceiverDraw,
+  ShadowOutline,
+  VolumetricLight,
+  Ssao,
+  Aa,
+  ShaderPack,
+  BeforeUiPostEvents,
+  BeforeUiComplete,
+};
 
 struct War3RuntimeStatusModuleSnapshot {
   uint32_t registered = 0;
@@ -30,6 +54,37 @@ struct GpuFlightFrame {
   uint64_t timestampMs = 0u;
   uint64_t frameSerial = 0u;
   std::string lastRenderStage;
+  uint64_t breadcrumbSerial = 0u;
+  uint32_t activeCsmCascade = 0xFFFFFFFFu;
+  uint32_t activePointLight = 0xFFFFFFFFu;
+  uint32_t activePointFace = 0xFFFFFFFFu;
+  uint32_t autoTestWaypointIndex = 0xFFFFFFFFu;
+  float autoTestTargetX = 0.0f;
+  float autoTestTargetY = 0.0f;
+  float autoTestPanSeconds = 0.0f;
+  float cameraTargetX = 0.0f;
+  float cameraTargetY = 0.0f;
+  float cameraTargetDistance = 0.0f;
+  float cameraAngleOfAttack = 0.0f;
+  float worldMinX = 0.0f;
+  float worldMinY = 0.0f;
+  float worldMaxX = 0.0f;
+  float worldMaxY = 0.0f;
+  uint32_t autoTestContextValid = 0u;
+  uint32_t csmPlannedCasterCount = 0u;
+  uint32_t csmValidatedCasterCount = 0u;
+  uint32_t csmDrawnCasterCount = 0u;
+  uint32_t csmLastRejectReason = 0u;
+  uint64_t csmValidationRejectCount = 0u;
+  uint64_t csmPartialPreventedCount = 0u;
+  uint64_t csmFirstCompleteLatencyFrames = 0u;
+  std::array<uint32_t, 4u> csmCascadeDrawCount = {};
+  std::array<uint64_t, 4u> csmCascadeTriangleCount = {};
+  uint32_t pointShadowLightCount = 0u;
+  std::array<uint32_t, 24u> pointShadowFaceCandidateCount = {};
+  std::array<uint32_t, 24u> pointShadowFaceKeptCount = {};
+  std::array<uint32_t, 24u> pointShadowFaceDrawCount = {};
+  std::array<uint64_t, 24u> pointShadowFaceTriangleCount = {};
   uint32_t csmRequestedResolution = 0u;
   uint32_t csmEffectiveResolution = 0u;
   uint32_t csmFallbackReason = 0u;
@@ -43,6 +98,7 @@ struct GpuFlightFrame {
   uint32_t taaHistoryValid = 0u;
   uint64_t taaHistoryGeneration = 0u;
   uint64_t arenaUsedBytes = 0u;
+  uint64_t arenaFrameUsedDeltaBytes = 0u;
   uint64_t arenaResidentBytes = 0u;
   uint64_t arenaGeneration = 0u;
   uint64_t arenaQuarantineCount = 0u;
@@ -75,6 +131,28 @@ struct GpuFlightFrame {
   uint64_t queueCompletedSerial = 0u;
   int64_t queueResult = 0;
 };
+
+void SetGpuFlightBreadcrumb(
+    GpuFlightBreadcrumb breadcrumb,
+    uint32_t csmCascade = 0xFFFFFFFFu,
+    uint32_t pointLight = 0xFFFFFFFFu,
+    uint32_t pointFace = 0xFFFFFFFFu) noexcept;
+void ResetGpuFlightCsmWork() noexcept;
+void SetGpuFlightCsmCascadeWork(
+    uint32_t cascade, uint32_t drawCount, uint64_t triangleCount) noexcept;
+void ResetGpuFlightPointShadowWork(uint32_t lightCount) noexcept;
+void SetGpuFlightPointShadowFacePlan(
+    uint32_t light, uint32_t face, uint32_t candidateCount,
+    uint32_t keptCount) noexcept;
+void SetGpuFlightPointShadowFaceWork(
+    uint32_t light, uint32_t face, uint32_t drawCount,
+    uint64_t triangleCount) noexcept;
+void SetGpuFlightAutoTestContext(
+    uint32_t waypointIndex, float targetX, float targetY, float panSeconds,
+    float cameraTargetX, float cameraTargetY, float cameraTargetDistance,
+    float cameraAngleOfAttack, float worldMinX, float worldMinY,
+    float worldMaxX, float worldMaxY) noexcept;
+void ClearGpuFlightAutoTestContext() noexcept;
 
 struct GpuIncidentSnapshot {
   uint64_t timestampMs = 0u;
@@ -345,6 +423,7 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t semanticSceneCompactWorkTableRejectFrameCount = 0;
   uint64_t semanticSceneCompactWorkTableRejectIdentityCount = 0;
   uint64_t semanticSceneCompactWorkTableMismatchCount = 0;
+  uint64_t drawTimeSemanticProducerOwnedDirectGroupedSkipCount = 0;
   uint64_t semanticSceneDirectLastSubmittedRecordCount = 0;
   uint64_t semanticSceneDirectLastUniqueObjectCount = 0;
   uint64_t semanticSceneDirectLastSubmittedObjectCount = 0;
@@ -522,6 +601,12 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t semanticSceneShadowMapSkinnedInvalidBufferCount = 0;
   uint64_t semanticSceneShadowMapSkinnedInvalidPipelineCount = 0;
   uint64_t semanticSceneShadowMapSkinnedDrawnCount = 0;
+  uint64_t gpuSkinVsShadowDirectAttempts = 0;
+  uint64_t gpuSkinVsShadowDirectInputRejects = 0;
+  uint64_t gpuSkinVsShadowDirectStateRejects = 0;
+  uint64_t gpuSkinVsShadowDirectDrawsSubmitted = 0;
+  uint64_t gpuSkinVsShadowReplayDirectional = 0;
+  uint64_t gpuSkinVsShadowReplayPoint = 0;
   uint64_t semanticSceneShadowTaaActive = 0;
   uint64_t shadowTaaRequestedMode = 0;
   uint64_t shadowTaaEffectiveMode = 0;
@@ -697,6 +782,24 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t shadowReplayLastOffenderMapEpoch = 0;
   uint64_t shadowReplayLastRequiredEnd = 0;
   uint64_t shadowReplayLastAvailableSize = 0;
+  int64_t shadowReplayLastMinimumVertex = 0;
+  int64_t shadowReplayLastMaximumVertex = 0;
+  int32_t shadowReplayLastVertexOffset = 0;
+  int32_t shadowReplayLastStage = -1;
+  uint32_t shadowReplayLastCategory = 0;
+  uint32_t shadowReplayLastBatchTag = 0;
+  uint32_t shadowReplayLastObjectKind = 0;
+  uint32_t shadowReplayLastRawcode = 0;
+  uint32_t shadowReplayLastJHandle = 0;
+  uint32_t shadowReplayLastIndexCount = 0;
+  uint32_t shadowReplayLastFirstIndex = 0;
+  uint32_t shadowReplayLastMinVertexIndex = 0;
+  uint32_t shadowReplayLastNumVertices = 0;
+  uint32_t shadowReplayLastActualIndexMin = 0;
+  uint32_t shadowReplayLastActualIndexMax = 0;
+  uint32_t shadowReplayLastActualIndexDomainKnown = 0;
+  uint32_t shadowReplayLastFullVertexDomainFallback = 0;
+  uint64_t shadowReplayLastPositionSize = 0;
   uint64_t shadowReplayCandidateFrameSerial = 0;
   uint32_t shadowMapTransitionState = 0;
   uint32_t shadowMapProducerReady = 0;

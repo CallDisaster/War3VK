@@ -255,6 +255,11 @@ struct FrameSnapshot {
     bool mainThreadCpuClampedToProcess = false;
     std::chrono::steady_clock::time_point timestamp;
     std::vector<SectionTiming> sections;
+    // Raw device timestamp intervals for every completed GPU scope assigned
+    // to this Present epoch. Section timings intentionally retain inclusive
+    // scope costs, while totalGpuMs is the union of these intervals so nested
+    // scopes cannot count the same GPU work more than once.
+    std::vector<std::array<uint64_t, 2>> gpuTimestampIntervals;
     FrameWorkloadSnapshot workload;
 };
 
@@ -1239,6 +1244,7 @@ private:
     std::chrono::steady_clock::time_point m_frameStart;
     CpuProbeSnapshot m_frameCpuProbeStart;
     FrameWorkloadSnapshot m_currentFrameWorkload = {};
+    std::vector<std::array<uint64_t, 2>> m_currentGpuTimestampIntervals;
     bool m_inFrame = false;
     std::atomic<uint64_t> m_activeFrameEpoch { 0 };
     HANDLE m_mainThreadHandle = nullptr;

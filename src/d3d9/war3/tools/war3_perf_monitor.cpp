@@ -30,6 +30,46 @@
 #include "../../util/util_env.h"
 namespace dxvk::war3 {
 
+namespace {
+
+double GpuTimestampIntervalUnionMs(
+    const std::vector<std::array<uint64_t, 2>>& intervals,
+    double timestampPeriodNs) {
+  if (intervals.empty() || timestampPeriodNs <= 0.0)
+    return 0.0;
+
+  std::vector<std::array<uint64_t, 2>> sorted;
+  sorted.reserve(intervals.size());
+  for (const auto& interval : intervals) {
+    if (interval[1] > interval[0])
+      sorted.push_back(interval);
+  }
+  if (sorted.empty())
+    return 0.0;
+
+  std::sort(sorted.begin(), sorted.end(),
+      [](const auto& a, const auto& b) {
+        return a[0] < b[0] || (a[0] == b[0] && a[1] < b[1]);
+      });
+
+  uint64_t unionTicks = 0u;
+  uint64_t begin = sorted.front()[0];
+  uint64_t end = sorted.front()[1];
+  for (size_t i = 1u; i < sorted.size(); ++i) {
+    if (sorted[i][0] <= end) {
+      end = std::max(end, sorted[i][1]);
+      continue;
+    }
+    unionTicks += end - begin;
+    begin = sorted[i][0];
+    end = sorted[i][1];
+  }
+  unionTicks += end - begin;
+  return double(unionTicks) * timestampPeriodNs / 1.0e6;
+}
+
+} // namespace
+
 using Clock = std::chrono::steady_clock;
 
 static double toMs(Clock::duration d) {
@@ -2523,6 +2563,7 @@ void War3PerfMonitor::shutdown() {
     m_lastReport = Clock::now();
     m_frameCpuProbeStart = {};
     m_currentFrameWorkload = {};
+    m_currentGpuTimestampIntervals.clear();
     closeMainThreadHandleLocked();
   }
 }
@@ -2538,6 +2579,7 @@ void War3PerfMonitor::beginFrame() {
   m_frameStart = Clock::now();
   m_frameCpuProbeStart = captureCpuProbeLocked(false);
   m_currentFrameWorkload = {};
+  m_currentGpuTimestampIntervals.clear();
   // Present increments the business serial before archiving the perf frame.
   // Snapshot it at frame start so workloadSeries aligns with the draw and
   // ShadowBudget work recorded during this interval, rather than S+1.
@@ -3169,6 +3211,7 @@ void War3PerfMonitor::tick() {
         byThread.gpuCount += 1;
         byThread.gpuSumMs += gpuMs;
         byThread.gpuMaxMs = std::max(byThread.gpuMaxMs, gpuMs);
+        m_currentGpuTimestampIntervals.push_back({beginTs, endTs});
       } else {
         // Timestamp queries are asynchronous by design. A result becoming
         // ready next frame is valid, not a cross-frame scope. Backfill the
@@ -3198,7 +3241,9 @@ void War3PerfMonitor::tick() {
           timingIt->maxGpuMs = std::max(timingIt->maxGpuMs, gpuMs);
           if (timingIt->gpuCount != std::numeric_limits<uint32_t>::max())
             ++timingIt->gpuCount;
-          frameIt->totalGpuMs += gpuMs;
+          frameIt->gpuTimestampIntervals.push_back({beginTs, endTs});
+          frameIt->totalGpuMs = GpuTimestampIntervalUnionMs(
+              frameIt->gpuTimestampIntervals, m_timestampPeriodNs);
           frameIt->hasGpuTiming = true;
           ++m_profilerCounters.lateGpuSamplesRecovered;
         }
@@ -3259,7 +3304,6 @@ void War3PerfMonitor::archiveFrame() {
     snapshot.workerThreadsCpuMs = snapshot.processCpuMs;
   }
 
-  double totalGpu = 0.0;
   bool hasGpuTiming = false;
   // 保留线程维度，而不是在 FrameSnapshot 前把 worker 贡献压扁到同一节点。
   // 键只在批量 flush 时写入，避免默认粗粒度 scope 在热路径加锁。
@@ -3282,10 +3326,11 @@ void War3PerfMonitor::archiveFrame() {
     timing.gpuCount = static_cast<uint32_t>(std::min<uint64_t>(
         s.gpuCount, std::numeric_limits<uint32_t>::max()));
     snapshot.sections.push_back(std::move(timing));
-    totalGpu += s.gpuSumMs;
     hasGpuTiming = hasGpuTiming || s.gpuCount > 0u;
   }
-  snapshot.totalGpuMs = totalGpu;
+  snapshot.gpuTimestampIntervals = std::move(m_currentGpuTimestampIntervals);
+  snapshot.totalGpuMs = GpuTimestampIntervalUnionMs(
+      snapshot.gpuTimestampIntervals, m_timestampPeriodNs);
   snapshot.hasGpuTiming = hasGpuTiming;
 
   m_frameHistory.push_back(std::move(snapshot));
@@ -3306,6 +3351,7 @@ void War3PerfMonitor::resetHistory() {
   m_inFrame = false;
   m_frameCpuProbeStart = {};
   m_currentFrameWorkload = {};
+  m_currentGpuTimestampIntervals.clear();
   m_lastReport = Clock::now();
   m_lastAutoExport = Clock::now();
 }

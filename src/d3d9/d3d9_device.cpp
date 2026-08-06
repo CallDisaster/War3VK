@@ -167,6 +167,22 @@ struct D3D9DeviceEx::War3SemanticDirectPartPacketLeaseState {
 
 namespace {
 
+// A draw-time exact capture rebases its private VB while retaining the
+// original IB bytes.  vertexOffset alone is therefore not a complete replay
+// contract: every consumer must carry the exact index domain (or the explicit
+// full-domain fallback) that justified that offset.  Keeping this copy in one
+// helper prevents DirectGrouped, the exact producer, and FastAppend from
+// drifting into different validator inputs.
+template <typename Entry>
+void War3CopyDrawTimeReplayDomain(War3ShadowCasterDraw& draw,
+                                  const Entry& entry) {
+  draw.shadowActualIndexMin = entry.actualIndexMin;
+  draw.shadowActualIndexMax = entry.actualIndexMax;
+  draw.shadowActualIndexDomainKnown = entry.actualIndexDomainKnown;
+  draw.shadowFullVertexDomainFallback = entry.fullVertexDomainFallback;
+  draw.shadowIndexHintMismatch = entry.indexHintMismatch;
+}
+
 // Old final-caster traces contain 11,550 post-proof anonymous-marker Grace
 // records, and every one falls within eight frames of the preceding exact
 // rejection; none survives at age nine or later. Retain only this negative
@@ -2181,6 +2197,18 @@ uint64_t War3BuildS1TerrainEarlyKey(
 bool War3SemanticObjectGroupedSelectionRuntime() {
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SEMANTIC_OBJECT_GROUPED_SELECTION", 1u) != 0u;
+  return s_enabled;
+}
+
+bool War3ExactIndexedFreezeTrimRuntime() {
+  // Disabled by default after the life-and-death TDR A/B. The CPU-readable IB
+  // generation can prove an exact index domain, but the dynamic REAL position
+  // backing copied later on the command stream has no matching immutable
+  // content generation. Even canonical zero-based indices only delayed the
+  // NVIDIA reset. Keep the implementation as an explicit diagnostic until a
+  // single producer can provide both bytes under one generation contract.
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SHADOW_EXACT_INDEX_TRIM", 0u) != 0u;
   return s_enabled;
 }
 
@@ -20221,6 +20249,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       if (War3DrawTimeAnonymousMarkerRejectionActive(
               packet.renderable.renderablePart, contract.meshPayloadPtr,
               packet.renderable.layerIndex)) {
+        m_war3Scene.shadowStats
+            .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
         return false;
       }
       const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
@@ -20230,14 +20260,19 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       if (War3CurrentDrawContractNamesExactSlice(
               packet.renderable.renderablePart,
               packet.renderable.layerIndex, contract)) {
-        if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
+        if (War3DrawTimeExactRejectedCurrentFrame(cacheKey)) {
+          m_war3Scene.shadowStats
+              .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
           return false;
+        }
         const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
         if (vbIt != m_war3DrawTimeVBCache.end() &&
             vbIt->second.MatchesKey(cacheKey) &&
             vbIt->second.frameSerial == m_war3ShadowPersistentFrameSerial &&
             vbIt->second.exactOwnerFrameSerial ==
                 m_war3ShadowPersistentFrameSerial) {
+          m_war3Scene.shadowStats
+              .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
           return false;
         }
       }
@@ -22142,6 +22177,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         draw.positionOffset = entry.positionOffset;
         draw.positionFormat = entry.positionFormat;
         draw.gpuSkinInput = entry.gpuSkinInput;
+        War3CopyDrawTimeReplayDomain(draw, entry);
         // 关闭 GPU skinning：positions 已是 CPU skin 后的世界空间顶点
         draw.vertexBlendEnabled = false;
         draw.vertexBlendIndexed = false;
@@ -23478,11 +23514,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
         War3ShadowPartLifecycleState::RequiredCurrent;
     draw.alphaPayloadComplete =
         !entry.alphaTestEnabled || entry.HasCompleteAlphaPayload();
-    draw.shadowActualIndexMin = entry.actualIndexMin;
-    draw.shadowActualIndexMax = entry.actualIndexMax;
-    draw.shadowActualIndexDomainKnown = entry.actualIndexDomainKnown;
-    draw.shadowFullVertexDomainFallback = entry.fullVertexDomainFallback;
-    draw.shadowIndexHintMismatch = entry.indexHintMismatch;
+    War3CopyDrawTimeReplayDomain(draw, entry);
     draw.indexed = entry.indexed;
     draw.positionStorage = entry.positionBuffer;
     draw.positionInfo = entry.positionInfo;
@@ -23490,6 +23522,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     draw.positionOffset = entry.positionOffset;
     draw.positionFormat = entry.positionFormat;
     draw.gpuSkinInput = entry.gpuSkinInput;
+    War3CopyDrawTimeReplayDomain(draw, entry);
     draw.topology = entry.topology;
     draw.worldMatrix = entry.capturedWorldMatrix;
     draw.vertexBlendEnabled = false;
@@ -44399,6 +44432,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   uint64_t exactIndexedFreezeBytesAfter = 0u;
   uint32_t exactIndexedFreezeFirstVertex = 0u;
   uint32_t exactIndexedFreezeVertexCount = 0u;
+  uint32_t exactIndexedFreezeMinIndex = 0u;
+  uint32_t exactIndexedFreezeMaxIndex = 0u;
+  bool exactIndexedFreezeRebased = false;
+  thread_local std::vector<uint8_t> s_exactRebasedIndexScratch;
+  s_exactRebasedIndexScratch.clear();
   // Both per-draw SYSTEMMEM uploads and ordinary D3DUSAGE_DYNAMIC position
   // buffers are frozen into the Arena below.  The latter are the dominant
   // Warcraft terrain path, so restricting this proof to DynamicSysmemVBOs
@@ -44406,7 +44444,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   // separately validated IB mapping here; the position payload remains a GPU
   // copy ordered on the render command stream.
   const bool exactIndexedFreezeTrimCandidate =
-      indexed && !gpuSkinLegacyBacking &&
+      War3ExactIndexedFreezeTrimRuntime() && indexed && !gpuSkinLegacyBacking &&
       (DynamicSysmemVBOs || posDynamic) && posStride != 0u &&
       posInfo.size >= posStride;
   if (exactIndexedFreezeTrimCandidate) {
@@ -44511,8 +44549,22 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               end <= uint64_t(uvInfo.size / uvStride);
         }
 
-        if (allStreamsFit &&
-            (first != 0u || count != positionCapacity64)) {
+        const uint64_t exactIndexBytes =
+            uint64_t(indexElementBytes) * uint64_t(CountVal);
+        const bool compactVertexRange =
+            first != 0u || count != positionCapacity64;
+        bool rebasedIndexReady = false;
+        if (allStreamsFit && compactVertexRange && exactIndexBytes != 0u &&
+            exactIndexBytes <= uint64_t(std::numeric_limits<size_t>::max())) {
+          s_exactRebasedIndexScratch.resize(size_t(exactIndexBytes));
+          rebasedIndexReady =
+              dxvk::war3::memory::RebaseWar3ExactIndexDomain(
+                  exactIndexSpan, indexElementBytes, CountVal,
+                  exactDomain.minIndex, exactDomain.maxIndex,
+                  s_exactRebasedIndexScratch.data(), exactIndexBytes);
+        }
+
+        if (allStreamsFit && compactVertexRange && rebasedIndexReady) {
           exactIndexedFreezeBytesBefore = uint64_t(posBytesNeeded) +
               uint64_t(blendBytesNeeded) +
               (captureAlphaTest && resolvedUvBinding == 2u
@@ -44531,7 +44583,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           vertexRangeEnd = int64_t(end);
           exactIndexedFreezeFirstVertex = uint32_t(first);
           exactIndexedFreezeVertexCount = uint32_t(count);
+          exactIndexedFreezeMinIndex = exactDomain.minIndex;
+          exactIndexedFreezeMaxIndex = exactDomain.maxIndex;
           exactIndexedFreezeTrimmed = true;
+          exactIndexedFreezeRebased = true;
+          idxBytesNeeded = VkDeviceSize(exactIndexBytes);
           exactIndexedFreezeBytesAfter = uint64_t(posBytesNeeded) +
               uint64_t(blendBytesNeeded) +
               (captureAlphaTest && resolvedUvBinding == 2u
@@ -46224,7 +46280,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   const bool shouldFreezeIndexBuffer =
       indexed && s_freezeDynamicShadowBuffers &&
       (ibDynamic || forceFreezeUnitLikeGeometry ||
-       forceFreezeFallbackWorldGeometry);
+       forceFreezeFallbackWorldGeometry || exactIndexedFreezeRebased);
 
   const uint64_t fallbackPosBudgetBytes =
       shouldFreezePosBuffer ? static_cast<uint64_t>(posBytesNeeded) : 0ull;
@@ -46593,8 +46649,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   uint32_t capturedPositionOffset = uint32_t(declInfo.posOffset);
   VkFormat capturedPositionFormat = posFormat;
   int32_t capturedVertexOffset = exactIndexedFreezeTrimmed
-      ? int32_t(int64_t(BaseVertexIndex) -
-                int64_t(exactIndexedFreezeFirstVertex))
+      ? (exactIndexedFreezeRebased
+             ? 0
+             : int32_t(int64_t(BaseVertexIndex) -
+                       int64_t(exactIndexedFreezeFirstVertex)))
       : BaseVertexIndex;
   uint32_t capturedNumVertices = exactIndexedFreezeTrimmed
       ? exactIndexedFreezeVertexCount : NumVertices;
@@ -46942,16 +47000,34 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   }
 
   if (shouldFreezeIndexBuffer) {
-    const bool stable =
-        DynamicSysmemIBO && m_war3PerDrawUpload.ibValid;
+    const bool stable = exactIndexedFreezeRebased ||
+        (DynamicSysmemIBO && m_war3PerDrawUpload.ibValid);
     auto* indexCommon = m_state.indices.ptr() != nullptr
         ? m_state.indices.ptr()->GetCommonBuffer() : nullptr;
+    const VkDeviceSize indexElementBytes =
+        indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
+    const VkDeviceSize exactIndexOffset =
+        VkDeviceSize(StartVal) * indexElementBytes;
+    const bool exactIndexRangeValid = exactIndexedFreezeRebased &&
+        exactIndexOffset <= idxSlice.length() &&
+        idxBytesNeeded <= idxSlice.length() - exactIndexOffset;
+    const auto indexFreezeSlice = exactIndexedFreezeRebased
+        ? (exactIndexRangeValid
+               ? idxSlice.subSlice(exactIndexOffset, idxBytesNeeded)
+               : DxvkBufferSlice())
+        : idxSlice;
+    const void* stableIndexBytes = exactIndexedFreezeRebased
+        ? static_cast<const void*>(s_exactRebasedIndexScratch.data())
+        : (stable ? m_war3PerDrawUpload.ibUploadBytes : nullptr);
+    const VkDeviceSize stableIndexLength = exactIndexedFreezeRebased
+        ? VkDeviceSize(s_exactRebasedIndexScratch.size())
+        : (stable ? m_war3PerDrawUpload.ibUploadLength : 0u);
     appendFreezePlan(
         War3FrameFreezeStreamType::Index,
         dxvk::war3::memory::ShadowArenaAllocationTag::Index,
-        idxSlice, idxBytesNeeded, stable, 0u, indexCommon,
-        stable ? m_war3PerDrawUpload.ibUploadBytes : nullptr,
-        stable ? m_war3PerDrawUpload.ibUploadLength : 0u,
+        indexFreezeSlice, idxBytesNeeded, stable, 0u,
+        exactIndexedFreezeRebased ? nullptr : indexCommon,
+        stableIndexBytes, stableIndexLength,
         idxAlloc, idxInfo);
   }
 
@@ -47136,12 +47212,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.indexInfo = idxInfo;
     draw.indexType = indexType;
     draw.indexCount = CountVal;
-    draw.firstIndex = StartVal;
+    draw.firstIndex = exactIndexedFreezeRebased ? 0u : StartVal;
     draw.vertexOffset = capturedVertexOffset;
     draw.vertexCount = 0;
     draw.firstVertex = 0;
     draw.minVertexIndex = MinVertexIndex;
     draw.numVertices = capturedNumVertices;
+    // The compact Arena position slice begins at BaseVertexIndex +
+    // exactDomain.minIndex. The production path rewrites the exact IB range to
+    // [0, max-min], so replay no longer relies on a negative vertexOffset.
+    // Preserve that rewritten domain for the final range validator.
+    if (exactIndexedFreezeTrimmed) {
+      draw.shadowActualIndexMin = exactIndexedFreezeRebased
+          ? 0u : exactIndexedFreezeMinIndex;
+      draw.shadowActualIndexMax = exactIndexedFreezeRebased
+          ? exactIndexedFreezeMaxIndex - exactIndexedFreezeMinIndex
+          : exactIndexedFreezeMaxIndex;
+      draw.shadowActualIndexDomainKnown = true;
+    }
   } else {
     draw.vertexCount = CountVal;
     draw.firstVertex = StartVal;

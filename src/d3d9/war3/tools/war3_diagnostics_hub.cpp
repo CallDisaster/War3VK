@@ -25,12 +25,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <array>
 
 namespace dxvk::war3::tools {
 
@@ -50,6 +52,65 @@ bool s_shadowArenaIncidentLatched = false;
 uint64_t s_shadowArenaLastOverflowCount = 0u;
 uint64_t s_shadowArenaLastAdmissionRejectedCount = 0u;
 uint64_t s_shadowArenaLastPartialTransactionCount = 0u;
+std::atomic<uint32_t> s_gpuFlightBreadcrumb{
+    static_cast<uint32_t>(GpuFlightBreadcrumb::Idle)};
+std::atomic<uint64_t> s_gpuFlightBreadcrumbSerial{0u};
+std::atomic<uint32_t> s_gpuFlightActiveCsmCascade{0xFFFFFFFFu};
+std::atomic<uint32_t> s_gpuFlightActivePointLight{0xFFFFFFFFu};
+std::atomic<uint32_t> s_gpuFlightActivePointFace{0xFFFFFFFFu};
+std::array<std::atomic<uint32_t>, 4u> s_gpuFlightCsmCascadeDrawCount = {};
+std::array<std::atomic<uint64_t>, 4u> s_gpuFlightCsmCascadeTriangleCount = {};
+std::atomic<uint32_t> s_gpuFlightPointShadowLightCount{0u};
+std::array<std::atomic<uint32_t>, 24u>
+    s_gpuFlightPointShadowFaceCandidateCount = {};
+std::array<std::atomic<uint32_t>, 24u> s_gpuFlightPointShadowFaceKeptCount = {};
+std::array<std::atomic<uint32_t>, 24u> s_gpuFlightPointShadowFaceDrawCount = {};
+std::array<std::atomic<uint64_t>, 24u>
+    s_gpuFlightPointShadowFaceTriangleCount = {};
+std::atomic<uint32_t> s_gpuFlightAutoTestContextValid{0u};
+std::atomic<uint32_t> s_gpuFlightAutoTestWaypointIndex{0xFFFFFFFFu};
+std::array<std::atomic<uint32_t>, 11u> s_gpuFlightAutoTestFloatBits = {};
+uint64_t s_gpuFlightLastArenaGeneration = 0u;
+uint64_t s_gpuFlightLastArenaUsedBytes = 0u;
+
+uint32_t FloatBits(float value) noexcept {
+  uint32_t bits = 0u;
+  static_assert(sizeof(bits) == sizeof(value));
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+float FloatFromBits(uint32_t bits) noexcept {
+  float value = 0.0f;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+const char* GpuFlightBreadcrumbName(GpuFlightBreadcrumb value) noexcept {
+  switch (value) {
+  case GpuFlightBreadcrumb::Idle: return "Idle";
+  case GpuFlightBreadcrumb::PipelineBeforeUi: return "BeforeUi.Entry";
+  case GpuFlightBreadcrumb::ShadowReceiverEntry: return "ShadowReceiver.Entry";
+  case GpuFlightBreadcrumb::CsmPreflight: return "Shadow.CSM.Preflight";
+  case GpuFlightBreadcrumb::CsmCascade: return "Shadow.CSM.Cascade";
+  case GpuFlightBreadcrumb::CsmTerrainMask: return "Shadow.CSM.TerrainMask";
+  case GpuFlightBreadcrumb::VolumeSunShadow: return "Shadow.VolumeSun";
+  case GpuFlightBreadcrumb::PointShadowPlan: return "Shadow.Point.Plan";
+  case GpuFlightBreadcrumb::PointShadowFace: return "Shadow.Point.Face";
+  case GpuFlightBreadcrumb::ShadowCopy: return "Shadow.Copy";
+  case GpuFlightBreadcrumb::ShadowMotionVectors: return "Shadow.MotionVectors";
+  case GpuFlightBreadcrumb::ShadowVisibility: return "Shadow.Visibility";
+  case GpuFlightBreadcrumb::ShadowReceiverDraw: return "Shadow.Receiver";
+  case GpuFlightBreadcrumb::ShadowOutline: return "Shadow.Outline";
+  case GpuFlightBreadcrumb::VolumetricLight: return "VolumetricLight";
+  case GpuFlightBreadcrumb::Ssao: return "SSAO";
+  case GpuFlightBreadcrumb::Aa: return "AA";
+  case GpuFlightBreadcrumb::ShaderPack: return "ShaderPack";
+  case GpuFlightBreadcrumb::BeforeUiPostEvents: return "BeforeUi.PostEvents";
+  case GpuFlightBreadcrumb::BeforeUiComplete: return "BeforeUi.Complete";
+  }
+  return "Unknown";
+}
 
 uint64_t EpochMilliseconds() {
   return static_cast<uint64_t>(std::chrono::duration_cast<
@@ -326,6 +387,36 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"timestampMs", frame.timestampMs},
         {"frameSerial", frame.frameSerial},
         {"lastRenderStage", frame.lastRenderStage},
+        {"breadcrumbSerial", frame.breadcrumbSerial},
+        {"activeCsmCascade", frame.activeCsmCascade},
+        {"activePointLight", frame.activePointLight},
+        {"activePointFace", frame.activePointFace},
+        {"autoTestContextValid", frame.autoTestContextValid},
+        {"autoTestWaypointIndex", frame.autoTestWaypointIndex},
+        {"autoTestTarget", {frame.autoTestTargetX, frame.autoTestTargetY}},
+        {"autoTestPanSeconds", frame.autoTestPanSeconds},
+        {"cameraTarget", {frame.cameraTargetX, frame.cameraTargetY}},
+        {"cameraTargetDistance", frame.cameraTargetDistance},
+        {"cameraAngleOfAttack", frame.cameraAngleOfAttack},
+        {"worldBounds", {frame.worldMinX, frame.worldMinY,
+                         frame.worldMaxX, frame.worldMaxY}},
+        {"csmPlannedCasterCount", frame.csmPlannedCasterCount},
+        {"csmValidatedCasterCount", frame.csmValidatedCasterCount},
+        {"csmDrawnCasterCount", frame.csmDrawnCasterCount},
+        {"csmLastRejectReason", frame.csmLastRejectReason},
+        {"csmValidationRejectCount", frame.csmValidationRejectCount},
+        {"csmPartialPreventedCount", frame.csmPartialPreventedCount},
+        {"csmFirstCompleteLatencyFrames",
+         frame.csmFirstCompleteLatencyFrames},
+        {"csmCascadeDrawCount", frame.csmCascadeDrawCount},
+        {"csmCascadeTriangleCount", frame.csmCascadeTriangleCount},
+        {"pointShadowLightCount", frame.pointShadowLightCount},
+        {"pointShadowFaceCandidateCount",
+         frame.pointShadowFaceCandidateCount},
+        {"pointShadowFaceKeptCount", frame.pointShadowFaceKeptCount},
+        {"pointShadowFaceDrawCount", frame.pointShadowFaceDrawCount},
+        {"pointShadowFaceTriangleCount",
+         frame.pointShadowFaceTriangleCount},
         {"csmRequestedResolution", frame.csmRequestedResolution},
         {"csmEffectiveResolution", frame.csmEffectiveResolution},
         {"csmFallbackReason", frame.csmFallbackReason},
@@ -339,6 +430,7 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"taaHistoryValid", frame.taaHistoryValid},
         {"taaHistoryGeneration", frame.taaHistoryGeneration},
         {"arenaUsedBytes", frame.arenaUsedBytes},
+        {"arenaFrameUsedDeltaBytes", frame.arenaFrameUsedDeltaBytes},
         {"arenaResidentBytes", frame.arenaResidentBytes},
         {"arenaGeneration", frame.arenaGeneration},
         {"arenaQuarantineCount", frame.arenaQuarantineCount},
@@ -427,7 +519,68 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   GpuFlightFrame frame = {};
   frame.timestampMs = EpochMilliseconds();
   frame.frameSerial = frameSerial;
-  frame.lastRenderStage = "War3Pipeline.BeforeUi.PostPass";
+  frame.lastRenderStage = GpuFlightBreadcrumbName(
+      static_cast<GpuFlightBreadcrumb>(
+          s_gpuFlightBreadcrumb.load(std::memory_order_acquire)));
+  frame.breadcrumbSerial =
+      s_gpuFlightBreadcrumbSerial.load(std::memory_order_acquire);
+  frame.activeCsmCascade =
+      s_gpuFlightActiveCsmCascade.load(std::memory_order_acquire);
+  frame.activePointLight =
+      s_gpuFlightActivePointLight.load(std::memory_order_acquire);
+  frame.activePointFace =
+      s_gpuFlightActivePointFace.load(std::memory_order_acquire);
+  frame.autoTestContextValid =
+      s_gpuFlightAutoTestContextValid.load(std::memory_order_acquire);
+  frame.autoTestWaypointIndex =
+      s_gpuFlightAutoTestWaypointIndex.load(std::memory_order_acquire);
+  const auto loadAutoTestFloat = [](size_t index) {
+    return FloatFromBits(s_gpuFlightAutoTestFloatBits[index].load(
+        std::memory_order_acquire));
+  };
+  frame.autoTestTargetX = loadAutoTestFloat(0u);
+  frame.autoTestTargetY = loadAutoTestFloat(1u);
+  frame.autoTestPanSeconds = loadAutoTestFloat(2u);
+  frame.cameraTargetX = loadAutoTestFloat(3u);
+  frame.cameraTargetY = loadAutoTestFloat(4u);
+  frame.cameraTargetDistance = loadAutoTestFloat(5u);
+  frame.cameraAngleOfAttack = loadAutoTestFloat(6u);
+  frame.worldMinX = loadAutoTestFloat(7u);
+  frame.worldMinY = loadAutoTestFloat(8u);
+  frame.worldMaxX = loadAutoTestFloat(9u);
+  frame.worldMaxY = loadAutoTestFloat(10u);
+  const auto replay = dxvk::QueryShadowReplayDiagnostics();
+  frame.csmPlannedCasterCount = replay.plannedCasterCount;
+  frame.csmValidatedCasterCount = replay.validatedCasterCount;
+  frame.csmDrawnCasterCount = replay.drawnCasterCount;
+  frame.csmLastRejectReason = replay.lastRejectReason;
+  frame.csmValidationRejectCount = replay.validationRejectCount;
+  frame.csmPartialPreventedCount = replay.partialPreventedCount;
+  frame.csmFirstCompleteLatencyFrames = replay.firstCompleteLatencyFrames;
+  for (size_t index = 0u; index < frame.csmCascadeDrawCount.size(); ++index) {
+    frame.csmCascadeDrawCount[index] =
+        s_gpuFlightCsmCascadeDrawCount[index].load(std::memory_order_acquire);
+    frame.csmCascadeTriangleCount[index] =
+        s_gpuFlightCsmCascadeTriangleCount[index].load(
+            std::memory_order_acquire);
+  }
+  frame.pointShadowLightCount =
+      s_gpuFlightPointShadowLightCount.load(std::memory_order_acquire);
+  for (size_t index = 0u;
+       index < frame.pointShadowFaceCandidateCount.size(); ++index) {
+    frame.pointShadowFaceCandidateCount[index] =
+        s_gpuFlightPointShadowFaceCandidateCount[index].load(
+            std::memory_order_acquire);
+    frame.pointShadowFaceKeptCount[index] =
+        s_gpuFlightPointShadowFaceKeptCount[index].load(
+            std::memory_order_acquire);
+    frame.pointShadowFaceDrawCount[index] =
+        s_gpuFlightPointShadowFaceDrawCount[index].load(
+            std::memory_order_acquire);
+    frame.pointShadowFaceTriangleCount[index] =
+        s_gpuFlightPointShadowFaceTriangleCount[index].load(
+            std::memory_order_acquire);
+  }
   const auto taa = dxvk::QueryShadowTaaDiagnostics();
   const auto csm = dxvk::QueryCsmResolutionDiagnostics();
   const auto arena = dxvk::war3::memory::ShadowArena_QueryDiagnostics();
@@ -444,6 +597,13 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.taaHistoryValid = taa.historyValid;
   frame.taaHistoryGeneration = taa.historyGeneration;
   frame.arenaUsedBytes = arena.usedBytes;
+  frame.arenaFrameUsedDeltaBytes =
+      arena.generation == s_gpuFlightLastArenaGeneration &&
+              arena.usedBytes >= s_gpuFlightLastArenaUsedBytes
+          ? arena.usedBytes - s_gpuFlightLastArenaUsedBytes
+          : arena.usedBytes;
+  s_gpuFlightLastArenaGeneration = arena.generation;
+  s_gpuFlightLastArenaUsedBytes = arena.usedBytes;
   frame.arenaResidentBytes = arena.residentBytes;
   frame.arenaGeneration = arena.generation;
   frame.arenaQuarantineCount = arena.quarantineCount;
@@ -628,6 +788,8 @@ War3RuntimeStatusFrameSnapshot BuildFrameSnapshot() {
 War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
   War3RuntimeStatusShadowSnapshot summary = {};
   const auto bridgeSummary = dxvk::war3::render::QueryShadowRuntimeBridgeSummary();
+  const auto gpuSkinVsShadow =
+      dxvk::war3::render::QueryGpuSkinVsShadowRuntimeCounters();
   const auto taaDiagnostics = dxvk::QueryShadowTaaDiagnostics();
   const auto pointPersistentDiagnostics =
       dxvk::QueryPointShadowPersistentDiagnostics();
@@ -929,6 +1091,26 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       replayDiagnostics.lastOffenderMapEpoch;
   summary.shadowReplayLastRequiredEnd = replayDiagnostics.lastRequiredEnd;
   summary.shadowReplayLastAvailableSize = replayDiagnostics.lastAvailableSize;
+  summary.shadowReplayLastMinimumVertex = replayDiagnostics.lastMinimumVertex;
+  summary.shadowReplayLastMaximumVertex = replayDiagnostics.lastMaximumVertex;
+  summary.shadowReplayLastVertexOffset = replayDiagnostics.lastVertexOffset;
+  summary.shadowReplayLastStage = replayDiagnostics.lastStage;
+  summary.shadowReplayLastCategory = replayDiagnostics.lastCategory;
+  summary.shadowReplayLastBatchTag = replayDiagnostics.lastBatchTag;
+  summary.shadowReplayLastObjectKind = replayDiagnostics.lastObjectKind;
+  summary.shadowReplayLastRawcode = replayDiagnostics.lastRawcode;
+  summary.shadowReplayLastJHandle = replayDiagnostics.lastJHandle;
+  summary.shadowReplayLastIndexCount = replayDiagnostics.lastIndexCount;
+  summary.shadowReplayLastFirstIndex = replayDiagnostics.lastFirstIndex;
+  summary.shadowReplayLastMinVertexIndex = replayDiagnostics.lastMinVertexIndex;
+  summary.shadowReplayLastNumVertices = replayDiagnostics.lastNumVertices;
+  summary.shadowReplayLastActualIndexMin = replayDiagnostics.lastActualIndexMin;
+  summary.shadowReplayLastActualIndexMax = replayDiagnostics.lastActualIndexMax;
+  summary.shadowReplayLastActualIndexDomainKnown =
+      replayDiagnostics.lastActualIndexDomainKnown;
+  summary.shadowReplayLastFullVertexDomainFallback =
+      replayDiagnostics.lastFullVertexDomainFallback;
+  summary.shadowReplayLastPositionSize = replayDiagnostics.lastPositionSize;
   summary.shadowReplayCandidateFrameSerial =
       replayDiagnostics.candidateFrameSerial;
   summary.shadowReplayPlannedCasterCount =
@@ -1330,6 +1512,8 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       bridgeSummary.semanticSceneCompactWorkTableRejectIdentityCount;
   summary.semanticSceneCompactWorkTableMismatchCount =
       bridgeSummary.semanticSceneCompactWorkTableMismatchCount;
+  summary.drawTimeSemanticProducerOwnedDirectGroupedSkipCount =
+      bridgeSummary.drawTimeSemanticProducerOwnedDirectGroupedSkipCount;
   summary.semanticSceneDirectLastSubmittedRecordCount =
       bridgeSummary.semanticSceneDirectLastSubmittedRecordCount;
   summary.semanticSceneDirectLastUniqueObjectCount =
@@ -1728,6 +1912,18 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       bridgeSummary.semanticSceneShadowMapSkinnedInvalidPipelineCount;
   summary.semanticSceneShadowMapSkinnedDrawnCount =
       bridgeSummary.semanticSceneShadowMapSkinnedDrawnCount;
+  summary.gpuSkinVsShadowDirectAttempts =
+      gpuSkinVsShadow.directAttempts;
+  summary.gpuSkinVsShadowDirectInputRejects =
+      gpuSkinVsShadow.directInputRejects;
+  summary.gpuSkinVsShadowDirectStateRejects =
+      gpuSkinVsShadow.directStateRejects;
+  summary.gpuSkinVsShadowDirectDrawsSubmitted =
+      gpuSkinVsShadow.directDrawsSubmitted;
+  summary.gpuSkinVsShadowReplayDirectional =
+      gpuSkinVsShadow.replayDirectional;
+  summary.gpuSkinVsShadowReplayPoint =
+      gpuSkinVsShadow.replayPoint;
   summary.semanticSceneShadowTaaActive =
       bridgeSummary.semanticSceneShadowTaaActive;
   summary.semanticSceneReceiverReuseShadowMap =
@@ -2402,6 +2598,9 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.semanticSceneCompactWorkTableRejectIdentityCount},
         {"semanticSceneCompactWorkTableMismatchCount",
          snapshot.shadow.semanticSceneCompactWorkTableMismatchCount},
+        {"drawTimeSemanticProducerOwnedDirectGroupedSkipCount",
+         snapshot.shadow
+             .drawTimeSemanticProducerOwnedDirectGroupedSkipCount},
         {"semanticSceneDirectLastSubmittedRecordCount",
          snapshot.shadow.semanticSceneDirectLastSubmittedRecordCount},
         {"semanticSceneDirectLastUniqueObjectCount",
@@ -2804,6 +3003,18 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.semanticSceneShadowMapSkinnedInvalidPipelineCount},
         {"semanticSceneShadowMapSkinnedDrawnCount",
          snapshot.shadow.semanticSceneShadowMapSkinnedDrawnCount},
+        {"gpuSkinVsShadowDirectAttempts",
+         snapshot.shadow.gpuSkinVsShadowDirectAttempts},
+        {"gpuSkinVsShadowDirectInputRejects",
+         snapshot.shadow.gpuSkinVsShadowDirectInputRejects},
+        {"gpuSkinVsShadowDirectStateRejects",
+         snapshot.shadow.gpuSkinVsShadowDirectStateRejects},
+        {"gpuSkinVsShadowDirectDrawsSubmitted",
+         snapshot.shadow.gpuSkinVsShadowDirectDrawsSubmitted},
+        {"gpuSkinVsShadowReplayDirectional",
+         snapshot.shadow.gpuSkinVsShadowReplayDirectional},
+        {"gpuSkinVsShadowReplayPoint",
+         snapshot.shadow.gpuSkinVsShadowReplayPoint},
         {"semanticSceneShadowTaaActive",
          snapshot.shadow.semanticSceneShadowTaaActive},
         {"shadowTaaRequestedMode", snapshot.shadow.shadowTaaRequestedMode},
@@ -3138,6 +3349,40 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.shadowReplayLastRequiredEnd},
         {"shadowReplayLastAvailableSize",
          snapshot.shadow.shadowReplayLastAvailableSize},
+        {"shadowReplayLastMinimumVertex",
+         snapshot.shadow.shadowReplayLastMinimumVertex},
+        {"shadowReplayLastMaximumVertex",
+         snapshot.shadow.shadowReplayLastMaximumVertex},
+        {"shadowReplayLastVertexOffset",
+         snapshot.shadow.shadowReplayLastVertexOffset},
+        {"shadowReplayLastStage", snapshot.shadow.shadowReplayLastStage},
+        {"shadowReplayLastCategory",
+         snapshot.shadow.shadowReplayLastCategory},
+        {"shadowReplayLastBatchTag",
+         snapshot.shadow.shadowReplayLastBatchTag},
+        {"shadowReplayLastObjectKind",
+         snapshot.shadow.shadowReplayLastObjectKind},
+        {"shadowReplayLastRawcode", snapshot.shadow.shadowReplayLastRawcode},
+        {"shadowReplayLastJHandle",
+         snapshot.shadow.shadowReplayLastJHandle},
+        {"shadowReplayLastIndexCount",
+         snapshot.shadow.shadowReplayLastIndexCount},
+        {"shadowReplayLastFirstIndex",
+         snapshot.shadow.shadowReplayLastFirstIndex},
+        {"shadowReplayLastMinVertexIndex",
+         snapshot.shadow.shadowReplayLastMinVertexIndex},
+        {"shadowReplayLastNumVertices",
+         snapshot.shadow.shadowReplayLastNumVertices},
+        {"shadowReplayLastActualIndexMin",
+         snapshot.shadow.shadowReplayLastActualIndexMin},
+        {"shadowReplayLastActualIndexMax",
+         snapshot.shadow.shadowReplayLastActualIndexMax},
+        {"shadowReplayLastActualIndexDomainKnown",
+         snapshot.shadow.shadowReplayLastActualIndexDomainKnown},
+        {"shadowReplayLastFullVertexDomainFallback",
+         snapshot.shadow.shadowReplayLastFullVertexDomainFallback},
+        {"shadowReplayLastPositionSize",
+         snapshot.shadow.shadowReplayLastPositionSize},
         {"shadowFirstCompleteLatencyFrames",
          snapshot.shadow.shadowFirstCompleteLatencyFrames},
         {"shadowPointWorkerCancelCount",
@@ -3318,6 +3563,100 @@ void WriteRuntimeStatusSnapshot(const War3RuntimeStatusSnapshot& snapshot) {
   f << BuildRuntimeStatusJson(snapshot).dump(2) << '\n';
 }
 } // namespace
+
+void SetGpuFlightBreadcrumb(
+    GpuFlightBreadcrumb breadcrumb, uint32_t csmCascade,
+    uint32_t pointLight, uint32_t pointFace) noexcept {
+  s_gpuFlightActiveCsmCascade.store(csmCascade, std::memory_order_release);
+  s_gpuFlightActivePointLight.store(pointLight, std::memory_order_release);
+  s_gpuFlightActivePointFace.store(pointFace, std::memory_order_release);
+  s_gpuFlightBreadcrumb.store(
+      static_cast<uint32_t>(breadcrumb), std::memory_order_release);
+  s_gpuFlightBreadcrumbSerial.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+void ResetGpuFlightCsmWork() noexcept {
+  for (size_t index = 0u; index < s_gpuFlightCsmCascadeDrawCount.size();
+       ++index) {
+    s_gpuFlightCsmCascadeDrawCount[index].store(0u, std::memory_order_release);
+    s_gpuFlightCsmCascadeTriangleCount[index].store(
+        0u, std::memory_order_release);
+  }
+}
+
+void SetGpuFlightCsmCascadeWork(
+    uint32_t cascade, uint32_t drawCount, uint64_t triangleCount) noexcept {
+  if (cascade >= s_gpuFlightCsmCascadeDrawCount.size())
+    return;
+  s_gpuFlightCsmCascadeDrawCount[cascade].store(
+      drawCount, std::memory_order_release);
+  s_gpuFlightCsmCascadeTriangleCount[cascade].store(
+      triangleCount, std::memory_order_release);
+}
+
+void ResetGpuFlightPointShadowWork(uint32_t lightCount) noexcept {
+  s_gpuFlightPointShadowLightCount.store(lightCount, std::memory_order_release);
+  for (size_t index = 0u;
+       index < s_gpuFlightPointShadowFaceCandidateCount.size(); ++index) {
+    s_gpuFlightPointShadowFaceCandidateCount[index].store(
+        0u, std::memory_order_release);
+    s_gpuFlightPointShadowFaceKeptCount[index].store(
+        0u, std::memory_order_release);
+    s_gpuFlightPointShadowFaceDrawCount[index].store(
+        0u, std::memory_order_release);
+    s_gpuFlightPointShadowFaceTriangleCount[index].store(
+        0u, std::memory_order_release);
+  }
+}
+
+void SetGpuFlightPointShadowFacePlan(
+    uint32_t light, uint32_t face, uint32_t candidateCount,
+    uint32_t keptCount) noexcept {
+  if (light >= 4u || face >= 6u)
+    return;
+  const size_t index = size_t(light) * 6u + face;
+  s_gpuFlightPointShadowFaceCandidateCount[index].store(
+      candidateCount, std::memory_order_release);
+  s_gpuFlightPointShadowFaceKeptCount[index].store(
+      keptCount, std::memory_order_release);
+}
+
+void SetGpuFlightPointShadowFaceWork(
+    uint32_t light, uint32_t face, uint32_t drawCount,
+    uint64_t triangleCount) noexcept {
+  if (light >= 4u || face >= 6u)
+    return;
+  const size_t index = size_t(light) * 6u + face;
+  s_gpuFlightPointShadowFaceDrawCount[index].store(
+      drawCount, std::memory_order_release);
+  s_gpuFlightPointShadowFaceTriangleCount[index].store(
+      triangleCount, std::memory_order_release);
+}
+
+void SetGpuFlightAutoTestContext(
+    uint32_t waypointIndex, float targetX, float targetY, float panSeconds,
+    float cameraTargetX, float cameraTargetY, float cameraTargetDistance,
+    float cameraAngleOfAttack, float worldMinX, float worldMinY,
+    float worldMaxX, float worldMaxY) noexcept {
+  const std::array<float, 11u> values = {
+      targetX, targetY, panSeconds, cameraTargetX, cameraTargetY,
+      cameraTargetDistance, cameraAngleOfAttack, worldMinX, worldMinY,
+      worldMaxX, worldMaxY};
+  s_gpuFlightAutoTestContextValid.store(0u, std::memory_order_release);
+  for (size_t index = 0u; index < values.size(); ++index) {
+    s_gpuFlightAutoTestFloatBits[index].store(
+        FloatBits(values[index]), std::memory_order_release);
+  }
+  s_gpuFlightAutoTestWaypointIndex.store(
+      waypointIndex, std::memory_order_release);
+  s_gpuFlightAutoTestContextValid.store(1u, std::memory_order_release);
+}
+
+void ClearGpuFlightAutoTestContext() noexcept {
+  s_gpuFlightAutoTestContextValid.store(0u, std::memory_order_release);
+  s_gpuFlightAutoTestWaypointIndex.store(
+      0xFFFFFFFFu, std::memory_order_release);
+}
 
 void ExportRuntimeStatusSnapshot(const char* source, uint64_t frameIndex) {
   WriteRuntimeStatusSnapshot(BuildRuntimeStatusSnapshot(source, frameIndex));

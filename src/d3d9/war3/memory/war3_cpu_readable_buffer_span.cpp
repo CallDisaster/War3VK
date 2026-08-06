@@ -279,4 +279,46 @@ War3ExactIndexVertexDomain ComputeWar3ExactIndexVertexDomainPrepared(
   return ComputeExactIndexDomainPreparedImpl(input);
 }
 
+bool RebaseWar3ExactIndexDomain(
+    const War3CpuReadableBufferSpan& indices, uint32_t indexElementBytes,
+    uint32_t indexCount, uint32_t minIndex, uint32_t maxIndex,
+    void* output, uint64_t outputBytes) noexcept {
+  if (!indices || output == nullptr || indexCount == 0u ||
+      minIndex > maxIndex ||
+      (indexElementBytes != 2u && indexElementBytes != 4u)) {
+    return false;
+  }
+
+  const uint64_t requiredBytes =
+      uint64_t(indexElementBytes) * uint64_t(indexCount);
+  if (requiredBytes > indices.length || requiredBytes > outputBytes)
+    return false;
+
+  auto* destination = static_cast<uint8_t*>(output);
+  for (uint32_t i = 0u; i < indexCount; ++i) {
+    uint32_t rawIndex = 0u;
+    if (indexElementBytes == 2u) {
+      uint16_t value = 0u;
+      std::memcpy(&value, indices.data + size_t(i) * 2u, sizeof(value));
+      rawIndex = uint32_t(value);
+    } else {
+      std::memcpy(&rawIndex, indices.data + size_t(i) * 4u,
+                  sizeof(rawIndex));
+    }
+    if (rawIndex < minIndex || rawIndex > maxIndex)
+      return false;
+
+    const uint32_t rebased = rawIndex - minIndex;
+    if (indexElementBytes == 2u) {
+      if (rebased > uint32_t(std::numeric_limits<uint16_t>::max()))
+        return false;
+      const uint16_t value = uint16_t(rebased);
+      std::memcpy(destination + size_t(i) * 2u, &value, sizeof(value));
+    } else {
+      std::memcpy(destination + size_t(i) * 4u, &rebased, sizeof(rebased));
+    }
+  }
+  return true;
+}
+
 }  // namespace dxvk::war3::memory

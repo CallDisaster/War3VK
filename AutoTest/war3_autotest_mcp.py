@@ -58,12 +58,20 @@ DEFAULT_TEST_MAP = DEFAULT_SANDBOX_ROOT / "Maps" / "光影测试.w3x"
 DEFAULT_LOW_PRESSURE_TEST_MAP = DEFAULT_SANDBOX_ROOT / "Maps" / "ShadowTest" / "光影测试.w3x"
 DEFAULT_CITY_MAP = DEFAULT_SANDBOX_ROOT / "Maps" / "dz" / "rpg" / "City.w3x"
 DEFAULT_CITY_FALLBACK_MAP = DEFAULT_TEST_MAP
+DEFAULT_LIFE_AND_DEATH_MAP = Path(
+    r"E:\Work\Warcraft III\Maps\(4)生与死v1.28读档bug修复.w3x"
+)
 DEFAULT_TEST_MAP_REL = Path(r"Maps\Test\WorldEditTestMap.w3x")
 DEFAULT_BENCHMARK_WIDTH = 2560
 DEFAULT_BENCHMARK_HEIGHT = 1440
 DEFAULT_BENCHMARK_REFRESH = 59
 AUTOTEST_BACKGROUND_THROTTLE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE"
 AUTOTEST_GAME_PAUSE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE"
+AUTOTEST_INTERNAL_TEST_API_ENV = "DXVK_WAR3_INTERNAL_TEST_API"
+# Win32 Desktop-object launches are quarantined on the current test machine.
+# The display stack can blank the interactive desktop while War3 remains alive
+# on the non-input desktop, which makes an unattended test unsafe for the user.
+ISOLATED_DESKTOP_QUARANTINED = True
 WAR3_VIDEO_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III\Video"
 WAR3_INSTALL_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III"
 YDWE_LAUNCHER_MODE_DIRECT = "direct"
@@ -955,6 +963,32 @@ SEMANTIC_SHADOW_VALIDATION_ENV: Dict[str, str] = {
 }
 
 SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
+    "life_and_death_tdr": {
+        "title": "生与死低视角 TDR 巡航",
+        "description": "冷启动进入生与死，开启全图视野并按 5x5 蛇形路径低视角巡航；首次设备错误立即止损。",
+        "mapPath": str(DEFAULT_LIFE_AND_DEATH_MAP),
+        "launcherMode": YDWE_LAUNCHER_MODE_YDWE,
+        "ydweRoot": r"E:\Work\War3\YDWE1.32.13 - MemoryHack",
+        "profile": "full_default",
+        "disableModules": "",
+        "windowed": True,
+        "useIsolatedDesktop": False,
+        "desktopName": "War3LifeAndDeathTdr",
+        "readyTimeoutSec": 240,
+        "sampleDurationSec": 600,
+        "autoPerfRecord": True,
+        "recordAfterGameStarted": True,
+        "autoPerfExportSec": 604,
+        "deployD3d9BeforeLaunch": True,
+        "opengl": False,
+        "enforceVideoBaseline": False,
+        "baselineWidth": DEFAULT_BENCHMARK_WIDTH,
+        "baselineHeight": DEFAULT_BENCHMARK_HEIGHT,
+        "baselineRefreshRate": DEFAULT_BENCHMARK_REFRESH,
+        "requireHotShadowFrame": False,
+        "specializedRunner": "run_life_and_death_tdr_scenario",
+        "envOverrides": {},
+    },
     "low_pressure_static_reuse": {
         "title": "低压静态复用",
         "description": "低压图静态复用基线，用于观察 persistent cache 的静态收益与 shadowRuntimeV2 占位摘要。",
@@ -1230,6 +1264,8 @@ def _scenario_preset_rows() -> List[Dict[str, Any]]:
                 "title": str(preset.get("title", key)),
                 "description": str(preset.get("description", "")),
                 "mapPath": str(preset.get("mapPath", "")),
+                "launcherMode": str(preset.get("launcherMode", YDWE_LAUNCHER_MODE_DIRECT)),
+                "ydweRoot": str(preset.get("ydweRoot", "")),
                 "profile": str(preset.get("profile", "")),
                 "disableModules": str(preset.get("disableModules", "")),
                 "windowed": bool(preset.get("windowed", False)),
@@ -1373,6 +1409,18 @@ def _create_isolated_desktop(name: str) -> Dict[str, Any]:
     desktop_name = str(name or "").strip()
     if not desktop_name:
         desktop_name = f"War3AutoTest_{_now_compact()}"
+
+    if ISOLATED_DESKTOP_QUARANTINED:
+        return {
+            "ok": False,
+            "stage": "preflight",
+            "error": (
+                "隔离桌面启动已被安全隔离：当前显示栈可能令交互桌面黑屏，"
+                "同时把 War3 留在非输入桌面。请使用可见桌面或 attach-only。"
+            ),
+            "name": desktop_name,
+            "quarantined": True,
+        }
 
     result: Dict[str, Any] = {}
     cancelled = threading.Event()
@@ -2775,6 +2823,7 @@ def _launch_suite_map_until_ready(
     ready_fallback_min_elapsed_sec: int,
     ready_fallback_min_cpu_sec: float,
     launch_kwargs: Dict[str, Any],
+    startup_input_actions: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     requested_map = Path(requested_map_path)
     attempts: List[Dict[str, Any]] = []
@@ -2801,6 +2850,34 @@ def _launch_suite_map_until_ready(
             continue
 
         pid = int(launch["pid"])
+        startup_input: Dict[str, Any] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "no startup input requested",
+        }
+        if startup_input_actions:
+            # Some protected maps accept -loadfile but stop at their own
+            # pre-game splash screen.  A scenario may acknowledge that screen
+            # through the existing same-desktop input helper before waiting for
+            # gameStarted.  The helper remains restricted to the AutoTest-owned
+            # isolated Desktop and the exact process registered above.
+            startup_input = _run_war3_input_plan(
+                pid=pid,
+                actions=list(startup_input_actions),
+                timeout_sec=min(60.0, max(12.0, ready_timeout_sec * 0.65)),
+            )
+        row["startupInput"] = startup_input
+        if startup_input_actions and not startup_input.get("ok"):
+            stop = stop_war3(
+                pid=pid,
+                graceful_wait_sec=3,
+                force=True,
+                avoid_foreground_switch=True,
+            )
+            row["stop"] = stop
+            row["stage"] = "startup-input"
+            attempts.append(row)
+            continue
         ready = wait_for_game_ready(
             timeout_sec=ready_timeout_sec,
             pid=pid,
@@ -4139,6 +4216,11 @@ def _run_war3_input_plan(
         os.environ.copy(),
         desktop_name,
     )
+    # The desktop launcher transfers an owned native process witness through
+    # this private field.  The input helper is short lived and is not part of
+    # RuntimeState, so consume and close that HANDLE locally; never leak the
+    # Python owner into an MCP/JSON result.
+    helper_witness = helper.pop("_nativeProcessWitness", None)
     deadline = time.time() + max(2.0, float(timeout_sec))
     while helper.get("ok") and time.time() < deadline:
         if status_path.exists():
@@ -4155,8 +4237,21 @@ def _run_war3_input_plan(
         except Exception as exc:
             status = f"ERROR:status read failed: {exc}"
     ok = bool(helper.get("ok")) and status.startswith("OK:") and ";ok=True;" in status
+    helper_witness_close: Dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "reason": "launcher did not return a native witness",
+    }
+    if helper_witness is not None:
+        try:
+            helper_witness_close = dict(helper_witness.close() or {})
+        except Exception as exc:
+            helper_witness_close = {
+                "ok": False,
+                "error": f"input helper witness close failed: {type(exc).__name__}: {exc}",
+            }
     return {
-        "ok": ok,
+        "ok": bool(ok and helper_witness_close.get("ok") is True),
         "pid": target_pid,
         "hwnd": int(hwnd),
         "desktop": desktop_name,
@@ -4166,6 +4261,7 @@ def _run_war3_input_plan(
         "actionsPath": str(actions_path),
         "statusPath": str(status_path),
         "helper": helper,
+        "helperNativeWitnessClose": helper_witness_close,
         "helperStatus": status,
         "window": window,
     }
@@ -5292,6 +5388,8 @@ def _launch_war3_instance_impl(
     extra_env.setdefault(AUTOTEST_BACKGROUND_THROTTLE_ENV, "1")
     # 旧的 GamePause 防护改为 AutoTest 子进程专用，避免普通游戏被编译期开关影响。
     extra_env.setdefault(AUTOTEST_GAME_PAUSE_ENV, "1")
+    # 相机、视野和取证命令只在 AutoTest 拥有的子进程中开放。
+    extra_env.setdefault(AUTOTEST_INTERNAL_TEST_API_ENV, "1")
     env.update(extra_env)
 
     _start_debug_monitor(None)
@@ -6288,6 +6386,7 @@ def launch_war3_test(
     # 但调用者仍可通过 env_overrides_json 明确恢复原生后台节流。
     extra_env.setdefault(AUTOTEST_BACKGROUND_THROTTLE_ENV, "1")
     extra_env.setdefault(AUTOTEST_GAME_PAUSE_ENV, "1")
+    extra_env.setdefault(AUTOTEST_INTERNAL_TEST_API_ENV, "1")
     # 高频 SpriteFrame/runtime-matrix pose hooks are no longer the default
     # semantic palette producer. The production path samples Blizzard's
     # already-evaluated CModel palette from the visible contract; tests that
@@ -6646,8 +6745,79 @@ def read_runtime_status(
                 "mode": "control-plane",
                 "pipeName": str(pipe_res.get("pipeName", "") or ""),
                 "data": dict(pipe_res.get("result", {}) or {}),
-                "detail": pipe_res,
-            }
+        "detail": pipe_res,
+    }
+
+
+def _query_windows_gpu_events() -> List[Dict[str, Any]]:
+    script = (
+        "$OutputEncoding=[System.Text.UTF8Encoding]::new($false);"
+        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);"
+        "$rows=@(Get-WinEvent -FilterHashtable @{LogName='System';Id=153,4101} "
+        "-MaxEvents 128 -ErrorAction SilentlyContinue | "
+        "Where-Object {$_.ProviderName -eq 'nvlddmkm' -or $_.ProviderName -eq 'Display'} | "
+        "Select-Object TimeCreated,Id,ProviderName,RecordId,LevelDisplayName,Message);"
+        "$rows | ConvertTo-Json -Depth 4 -Compress"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return []
+        parsed = json.loads(proc.stdout)
+        if isinstance(parsed, dict):
+            return [parsed]
+        return [row for row in parsed if isinstance(row, dict)]
+    except Exception:
+        return []
+
+
+def _gpu_event_identity(row: Dict[str, Any]) -> str:
+    return "|".join(
+        str(row.get(key, ""))
+        for key in ("ProviderName", "Id", "RecordId", "TimeCreated")
+    )
+
+
+def _runtime_status_device_lost(status: Dict[str, Any]) -> bool:
+    def _walk(value: Any, key: str = "") -> bool:
+        lowered = str(key or "").lower()
+        if "devicelost" in lowered or "device_lost" in lowered:
+            if value is True or str(value).strip().lower() in {"1", "true", "yes"}:
+                return True
+        if lowered in {"queueresult", "submitresult", "presentresult", "waitresult"}:
+            try:
+                if int(value) == -4:
+                    return True
+            except Exception:
+                pass
+        if isinstance(value, dict):
+            return any(_walk(child, str(child_key)) for child_key, child in value.items())
+        if isinstance(value, list):
+            return any(_walk(child, key) for child in value)
+        return False
+
+    return _walk(status)
+
+
+def _new_gpu_incident_files(roots: List[Path], before: set[str]) -> List[str]:
+    rows: List[str] = []
+    for root in roots:
+        log_dir = root / "WarVK" / "Log"
+        if not log_dir.is_dir():
+            continue
+        for path in sorted(log_dir.glob("gpu_incident_*.json")):
+            key = str(path.resolve(strict=False)).lower()
+            if key not in before:
+                rows.append(str(path))
+    return rows
 
     path = _runtime_status_file(w3)
     data = _read_runtime_status_file(w3)
@@ -8697,6 +8867,594 @@ def invoke_internal_test_api(
 
 
 @mcp.tool()
+def get_test_camera_state(
+    pid: int = 0,
+    war3_dir: str = "",
+) -> Dict[str, Any]:
+    """读取 AutoTest 子进程当前本地相机的完整状态。"""
+    target_pid = pid or (STATE.war3_pid or 0)
+    if target_pid <= 0:
+        return {"ok": False, "error": "无有效 pid"}
+    target_war3_dir = Path(war3_dir) if war3_dir else (STATE.war3_dir or DEFAULT_WAR3_DIR)
+    return _invoke_internal_test_request(
+        target_pid, target_war3_dir, "camera.snapshot", {}, timeout_sec=4.0
+    )
+
+
+@mcp.tool()
+def get_test_world_bounds(
+    pid: int = 0,
+    war3_dir: str = "",
+) -> Dict[str, Any]:
+    """读取 AutoTest 子进程地图的可巡航世界边界。"""
+    target_pid = pid or (STATE.war3_pid or 0)
+    if target_pid <= 0:
+        return {"ok": False, "error": "无有效 pid"}
+    target_war3_dir = Path(war3_dir) if war3_dir else (STATE.war3_dir or DEFAULT_WAR3_DIR)
+    return _invoke_internal_test_request(
+        target_pid, target_war3_dir, "camera.world_bounds", {}, timeout_sec=4.0
+    )
+
+
+@mcp.tool()
+def set_test_full_map_visibility(
+    enabled: bool = True,
+    pid: int = 0,
+    war3_dir: str = "",
+) -> Dict[str, Any]:
+    """获取或释放 AutoTest 的全图视野租约，并恢复原 Fog/FogMask 状态。"""
+    target_pid = pid or (STATE.war3_pid or 0)
+    if target_pid <= 0:
+        return {"ok": False, "error": "无有效 pid"}
+    target_war3_dir = Path(war3_dir) if war3_dir else (STATE.war3_dir or DEFAULT_WAR3_DIR)
+    return _invoke_internal_test_request(
+        target_pid,
+        target_war3_dir,
+        "visibility.full_map",
+        {"enabled": bool(enabled)},
+        timeout_sec=4.0,
+    )
+
+
+@mcp.tool()
+def pan_test_camera(
+    target_x: float,
+    target_y: float,
+    seconds: float,
+    pid: int = 0,
+    war3_dir: str = "",
+) -> Dict[str, Any]:
+    """通过 PanCameraToTimed 平移 AutoTest 子进程的本地相机。"""
+    target_pid = pid or (STATE.war3_pid or 0)
+    if target_pid <= 0:
+        return {"ok": False, "error": "无有效 pid"}
+    target_war3_dir = Path(war3_dir) if war3_dir else (STATE.war3_dir or DEFAULT_WAR3_DIR)
+    duration = max(0.0, min(30.0, float(seconds)))
+    return _invoke_internal_test_request(
+        target_pid,
+        target_war3_dir,
+        "camera.pan_to",
+        {"targetX": float(target_x), "targetY": float(target_y), "duration": duration},
+        timeout_sec=max(4.0, duration + 2.0),
+    )
+
+
+def _compact_life_and_death_status(status: Dict[str, Any]) -> Dict[str, Any]:
+    interesting = (
+        "shadow", "csm", "cascade", "replay", "arena", "queue", "device",
+        "epoch", "complete", "incomplete", "planned", "validated", "drawn",
+        "point", "publication", "frame", "gpu", "submit", "present",
+        "semantic", "captured", "skipped", "fallback", "budget", "populate",
+        "currentdraw", "manifest", "direct", "worktable",
+    )
+    compact: Dict[str, Any] = {
+        "timestampMs": status.get("timestampMs"),
+        "frameIndex": status.get("frameIndex"),
+        "source": status.get("source"),
+    }
+    for section_name in ("runtime", "frame", "render", "shadow", "gpu"):
+        section = status.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        selected: Dict[str, Any] = {}
+        for key, value in section.items():
+            lowered = str(key).lower()
+            if not any(token in lowered for token in interesting):
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                selected[str(key)] = value
+        compact[section_name] = selected
+    return compact
+
+
+@mcp.tool()
+def run_life_and_death_tdr_scenario(
+    war3_dir: str = r"E:\Work\War3",
+    map_path: str = str(DEFAULT_LIFE_AND_DEATH_MAP),
+    duration_sec: int = 600,
+    grid_size: int = 5,
+    ready_timeout_sec: int = 240,
+    use_isolated_desktop: bool = False,
+    desktop_name: str = "War3LifeAndDeathTdr",
+    launcher_mode: str = YDWE_LAUNCHER_MODE_DIRECT,
+    ydwe_root: str = r"E:\Work\War3\YDWE1.32.13 - MemoryHack",
+    deploy_d3d9_before_launch: bool = True,
+    build_d3d9_path: str = "build32/src/d3d9/d3d9.dll",
+    disable_modules: str = "",
+    env_overrides_json: str = "{}",
+    attach_pid: int = 0,
+    screenshot_count: int = 12,
+    birth_hold_sec: int = 120,
+) -> Dict[str, Any]:
+    """冷启动或连接“生与死”，以低视角巡航并在首次 GPU 故障时止损。"""
+    if bool(use_isolated_desktop):
+        return {
+            "ok": False,
+            "stage": "preflight",
+            "error": (
+                "life_and_death_tdr 禁止隔离桌面启动；"
+                "请使用默认可见桌面或 attach_pid 连接用户手动启动的 War3。"
+            ),
+            "isolatedDesktopQuarantined": True,
+        }
+    w3 = Path(war3_dir)
+    source_map = Path(map_path)
+    if not source_map.is_file():
+        return {"ok": False, "stage": "preflight", "error": f"地图不存在: {source_map}"}
+    grid = max(2, min(9, int(grid_size)))
+    duration = max(15, min(3600, int(duration_sec)))
+    requested_screenshot_count = max(0, min(160, int(screenshot_count)))
+    requested_birth_hold_sec = max(
+        0, min(max(0, duration - 15), int(birth_hold_sec))
+    )
+    user_env = _parse_env_overrides_json(env_overrides_json)
+    parse_error = user_env.pop("__parse_error__", "")
+    if parse_error:
+        return {"ok": False, "stage": "preflight", "error": parse_error}
+    user_env.setdefault("DXVK_WAR3_SCENARIO", "life_and_death_tdr")
+    user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK", "1")
+    user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK_WARMUP_SEC", "1")
+    user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK_SAMPLE_SEC", str(duration))
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    artifact_dir = ARTIFACT_ROOT / "life_and_death_tdr" / stamp
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    events_before = _query_windows_gpu_events()
+    event_keys_before = {_gpu_event_identity(row) for row in events_before}
+    log_offsets = _snapshot_log_offsets(w3)
+    incident_roots = [w3]
+    incidents_before = {
+        str(path.resolve(strict=False)).lower()
+        for root in incident_roots
+        for path in (root / "WarVK" / "Log").glob("gpu_incident_*.json")
+        if (root / "WarVK" / "Log").is_dir()
+    }
+
+    owned_process = int(attach_pid) <= 0
+    if owned_process:
+        start = _launch_suite_map_until_ready(
+            war3_dir=war3_dir,
+            requested_map_path=str(source_map),
+            allow_fallback_to_default_test_map=False,
+            ready_timeout_sec=ready_timeout_sec,
+            ready_allow_fallback=False,
+            ready_require_game_started_for_fallback=True,
+            ready_fallback_min_elapsed_sec=20,
+            ready_fallback_min_cpu_sec=1.0,
+            launch_kwargs={
+                "launcher_mode": str(launcher_mode or YDWE_LAUNCHER_MODE_DIRECT),
+                "ydwe_root": str(ydwe_root or ""),
+                "windowed": True,
+                "use_isolated_desktop": bool(use_isolated_desktop),
+                "desktop_name": str(desktop_name or "War3LifeAndDeathTdr"),
+                "opengl": False,
+                "auto_perf_record": True,
+                "auto_perf_export_sec": duration + 4,
+                "deploy_d3d9_before_launch": bool(deploy_d3d9_before_launch),
+                "build_d3d9_path": build_d3d9_path,
+                "enforce_video_baseline": False,
+                "render_log": False,
+                "profile": "full_default",
+                "disable_modules": str(disable_modules or ""),
+                "env_overrides_json": json.dumps(user_env, ensure_ascii=False),
+                "extra_args": "",
+            },
+            startup_input_actions=[
+                {"type": "sleep", "ms": 10000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 8000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 8000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 8000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 1200},
+            ],
+        )
+    else:
+        pid = int(attach_pid)
+        start = {
+            "ok": _pid_alive(pid),
+            "stage": "attached" if _pid_alive(pid) else "attach",
+            "pid": pid,
+            "launch": {"instanceRoot": str(w3), "attached": True},
+            "note": (
+                "attach-only: AutoTest does not launch, deploy, foreground, or stop War3"
+            ),
+        }
+    if not start.get("ok"):
+        early_result = {
+            "ok": False,
+            "stage": str(start.get("stage", "ready")),
+            "sourceMap": str(source_map),
+            "sourceMapSha256": sha256_file(source_map),
+            "start": start,
+            "artifactDir": str(artifact_dir),
+        }
+        early_path = artifact_dir / "life_and_death_tdr_result.json"
+        early_path.write_text(
+            json.dumps(early_result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        early_result["resultPath"] = str(early_path)
+        return early_result
+
+    launch = dict(start.get("launch", {}) or {})
+    pid = int(start["pid"])
+    instance_root = Path(str(launch.get("instanceRoot", war3_dir)))
+    if instance_root not in incident_roots:
+        incident_roots.append(instance_root)
+    camera_before: Dict[str, Any] = {}
+    bounds: Dict[str, Any] = {}
+    visibility_enable: Dict[str, Any] = {}
+    visibility_restore: Dict[str, Any] = {}
+    camera_restore: Dict[str, Any] = {}
+    samples: List[Dict[str, Any]] = []
+    waypoint_rows: List[Dict[str, Any]] = []
+    screenshot_rows: List[Dict[str, Any]] = []
+    failure_reason = ""
+    stop_result: Dict[str, Any] = {}
+    started_at = time.monotonic()
+    screenshot_interval = (
+        float(duration) / float(max(1, requested_screenshot_count - 1))
+        if requested_screenshot_count > 1
+        else float(duration)
+    )
+    next_screenshot_at = started_at + screenshot_interval
+
+    def capture_aligned_screenshot(label: str, waypoint_index: int) -> None:
+        shot_index = len(screenshot_rows)
+        shot_path = artifact_dir / "screenshots" / f"{shot_index:03d}_{label}.png"
+        status_reply = _control_plane_request(
+            pid=pid, command="get_runtime_status", payload={}, timeout_sec=2.0
+        )
+        status = dict(status_reply.get("result") or {})
+        file_status = _read_runtime_status_file(w3)
+        if isinstance(file_status, dict):
+            file_timestamp = int(file_status.get("timestampMs", 0) or 0)
+            now_timestamp = int(time.time() * 1000)
+            if file_timestamp > 0 and abs(now_timestamp - file_timestamp) <= 5000:
+                status = file_status
+        screenshot_rows.append(
+            {
+                "index": shot_index,
+                "label": label,
+                "elapsedSec": round(time.monotonic() - started_at, 3),
+                "waypointIndex": int(waypoint_index),
+                "status": _compact_life_and_death_status(status) if status else {},
+                "screenshot": capture_war3_screenshot(
+                    output_path=str(shot_path),
+                    pid=pid,
+                    war3_dir=str(w3),
+                    prefer_internal=True,
+                    timeout_sec=8,
+                    fallback_to_window_capture=False,
+                ),
+            }
+        )
+
+    try:
+        camera_before = _invoke_internal_test_request(
+            pid, w3, "camera.snapshot", {}, timeout_sec=4.0
+        )
+        bounds = _invoke_internal_test_request(
+            pid, w3, "camera.world_bounds", {}, timeout_sec=4.0
+        )
+        if requested_screenshot_count > 0:
+            capture_aligned_screenshot("initial", -1)
+        if not camera_before.get("ok") or not bounds.get("ok"):
+            failure_reason = "internal camera preflight failed"
+        else:
+            next_sample = time.monotonic()
+            birth_deadline = min(
+                started_at + float(requested_birth_hold_sec),
+                started_at + float(duration),
+            )
+            while time.monotonic() < birth_deadline:
+                if not _pid_alive(pid):
+                    failure_reason = "war3 process exited during birth hold"
+                    break
+                now = time.monotonic()
+                if (
+                    len(screenshot_rows) < requested_screenshot_count
+                    and now >= next_screenshot_at
+                ):
+                    capture_aligned_screenshot(
+                        f"birth_hold_{len(screenshot_rows):03d}", -1
+                    )
+                    next_screenshot_at = now + screenshot_interval
+                if now >= next_sample:
+                    reply = _control_plane_request(
+                        pid=pid,
+                        command="get_runtime_status",
+                        payload={},
+                        timeout_sec=2.0,
+                    )
+                    status = dict(reply.get("result") or {})
+                    file_status = _read_runtime_status_file(w3)
+                    if isinstance(file_status, dict):
+                        file_timestamp = int(file_status.get("timestampMs", 0) or 0)
+                        now_timestamp = int(time.time() * 1000)
+                        if (
+                            file_timestamp > 0
+                            and abs(now_timestamp - file_timestamp) <= 5000
+                        ):
+                            status = file_status
+                    if status:
+                        samples.append(
+                            {
+                                "elapsedSec": round(now - started_at, 3),
+                                "waypointIndex": -1,
+                                "phase": "birth-hold",
+                                "status": _compact_life_and_death_status(status),
+                            }
+                        )
+                        if _runtime_status_device_lost(status):
+                            failure_reason = "runtime status reported device lost"
+                            break
+                    next_sample = now + 0.5
+                time.sleep(0.1)
+
+        if not failure_reason:
+            visibility_enable = _invoke_internal_test_request(
+                pid, w3, "visibility.full_map", {"enabled": True}, timeout_sec=4.0
+            )
+            if not visibility_enable.get("ok"):
+                failure_reason = "internal visibility preflight failed"
+
+        if not failure_reason:
+            snapshot = dict(camera_before.get("result", {}) or {})
+            world = dict(bounds.get("result", {}) or {})
+            current_aoa = float(snapshot.get("angleOfAttack", 304.0) or 304.0)
+            # Warcraft uses 270 degrees for a vertical top-down camera and
+            # approaches the horizon as the angle moves toward 360.  The
+            # snapshot bridge normalizes getter radians to setter degrees, so a
+            # bounded positive offset creates the intended low-angle stress
+            # view without crossing through the terrain.
+            low_aoa = min(335.0, max(280.0, current_aoa + 24.0))
+            low_apply = _invoke_internal_test_request(
+                pid,
+                w3,
+                "camera.apply",
+                {
+                    "targetX": float(snapshot.get("targetX", 0.0) or 0.0),
+                    "targetY": float(snapshot.get("targetY", 0.0) or 0.0),
+                    "targetDistance": max(1650.0, float(snapshot.get("targetDistance", 1650.0) or 1650.0)),
+                    "angleOfAttack": low_aoa,
+                    "rotation": float(snapshot.get("rotation", 0.0) or 0.0),
+                    "fieldOfView": float(snapshot.get("fieldOfView", 70.0) or 70.0),
+                    "farZ": max(5000.0, float(snapshot.get("farZ", 5000.0) or 5000.0)),
+                    "roll": float(snapshot.get("roll", 0.0) or 0.0),
+                    "zOffset": float(snapshot.get("zOffset", 0.0) or 0.0),
+                    "duration": 0.0,
+                    "quickPosition": True,
+                },
+                timeout_sec=4.0,
+            )
+            if not low_apply.get("ok"):
+                failure_reason = "low camera apply failed"
+            else:
+                min_x = float(world.get("minX", 0.0) or 0.0)
+                min_y = float(world.get("minY", 0.0) or 0.0)
+                max_x = float(world.get("maxX", 0.0) or 0.0)
+                max_y = float(world.get("maxY", 0.0) or 0.0)
+                margin_x = min(max(256.0, (max_x - min_x) * 0.06), (max_x - min_x) * 0.2)
+                margin_y = min(max(256.0, (max_y - min_y) * 0.06), (max_y - min_y) * 0.2)
+                xs = [min_x + margin_x + (max_x - min_x - 2.0 * margin_x) * i / (grid - 1) for i in range(grid)]
+                ys = [min_y + margin_y + (max_y - min_y - 2.0 * margin_y) * i / (grid - 1) for i in range(grid)]
+                waypoints = [
+                    (x, y)
+                    for row, y in enumerate(ys)
+                    for x in (xs if row % 2 == 0 else list(reversed(xs)))
+                ]
+                current_x = float(snapshot.get("targetX", 0.0) or 0.0)
+                current_y = float(snapshot.get("targetY", 0.0) or 0.0)
+                waypoint_index = 0
+                next_sample = time.monotonic()
+                while time.monotonic() - started_at < duration:
+                    if not _pid_alive(pid):
+                        failure_reason = "war3 process exited during cruise"
+                        break
+                    target_x, target_y = waypoints[waypoint_index % len(waypoints)]
+                    distance = math.hypot(target_x - current_x, target_y - current_y)
+                    pan_seconds = max(0.75, min(4.0, distance / 4096.0))
+                    marker = _invoke_internal_test_request(
+                        pid,
+                        w3,
+                        "autotest.waypoint",
+                        {
+                            "active": True,
+                            "index": waypoint_index,
+                            "targetX": target_x,
+                            "targetY": target_y,
+                            "panSeconds": pan_seconds,
+                            "cameraTargetX": current_x,
+                            "cameraTargetY": current_y,
+                            "cameraTargetDistance": float(snapshot.get("targetDistance", 0.0) or 0.0),
+                            "cameraAngleOfAttack": low_aoa,
+                            "worldMinX": min_x,
+                            "worldMinY": min_y,
+                            "worldMaxX": max_x,
+                            "worldMaxY": max_y,
+                        },
+                        timeout_sec=3.0,
+                    )
+                    pan = _invoke_internal_test_request(
+                        pid,
+                        w3,
+                        "camera.pan_to",
+                        {"targetX": target_x, "targetY": target_y, "duration": pan_seconds},
+                        timeout_sec=4.0,
+                    )
+                    row = {
+                        "index": waypoint_index,
+                        "targetX": round(target_x, 3),
+                        "targetY": round(target_y, 3),
+                        "distance": round(distance, 3),
+                        "panSeconds": round(pan_seconds, 3),
+                        "issuedAtSec": round(time.monotonic() - started_at, 3),
+                        "marker": marker,
+                        "pan": pan,
+                    }
+                    waypoint_rows.append(row)
+                    if not pan.get("ok"):
+                        failure_reason = "camera pan failed"
+                        break
+                    wait_deadline = time.monotonic() + pan_seconds
+                    while time.monotonic() < wait_deadline:
+                        if not _pid_alive(pid):
+                            failure_reason = "war3 process exited during pan"
+                            break
+                        now = time.monotonic()
+                        if (
+                            len(screenshot_rows) < requested_screenshot_count
+                            and now >= next_screenshot_at
+                        ):
+                            capture_aligned_screenshot(
+                                f"waypoint_{waypoint_index:03d}", waypoint_index
+                            )
+                            next_screenshot_at = now + screenshot_interval
+                        if now >= next_sample:
+                            reply = _control_plane_request(
+                                pid=pid, command="get_runtime_status", payload={}, timeout_sec=2.0
+                            )
+                            status = dict(reply.get("result") or {})
+                            # The control-plane reply is intentionally compact.
+                            # The atomically replaced status file carries the
+                            # full replay/Arena offender tuple. Prefer it only
+                            # while fresh so a prior process cannot pollute a
+                            # newly launched route.
+                            file_status = _read_runtime_status_file(w3)
+                            if isinstance(file_status, dict):
+                                file_timestamp = int(
+                                    file_status.get("timestampMs", 0) or 0
+                                )
+                                now_timestamp = int(time.time() * 1000)
+                                if (
+                                    file_timestamp > 0
+                                    and abs(now_timestamp - file_timestamp) <= 5000
+                                ):
+                                    status = file_status
+                            if status:
+                                samples.append(
+                                    {
+                                        "elapsedSec": round(now - started_at, 3),
+                                        "waypointIndex": waypoint_index,
+                                        "status": _compact_life_and_death_status(status),
+                                    }
+                                )
+                                if _runtime_status_device_lost(status):
+                                    failure_reason = "runtime status reported device lost"
+                                    break
+                            next_sample = now + 0.5
+                        time.sleep(0.1)
+                    if failure_reason:
+                        break
+                    current_x, current_y = target_x, target_y
+                    row["arrivedAtSec"] = round(time.monotonic() - started_at, 3)
+                    waypoint_index += 1
+    finally:
+        if _pid_alive(pid):
+            _invoke_internal_test_request(
+                pid, w3, "autotest.waypoint", {"active": False}, timeout_sec=3.0
+            )
+            visibility_restore = _invoke_internal_test_request(
+                pid, w3, "visibility.full_map", {"enabled": False}, timeout_sec=4.0
+            )
+            snapshot = dict(camera_before.get("result", {}) or {})
+            if snapshot:
+                restore_payload = dict(snapshot)
+                restore_payload["duration"] = 0.0
+                restore_payload["quickPosition"] = True
+                camera_restore = _invoke_internal_test_request(
+                    pid, w3, "camera.apply", restore_payload, timeout_sec=4.0
+                )
+        if owned_process:
+            stop_result = stop_war3(
+                pid=pid,
+                graceful_wait_sec=8 if not failure_reason else 2,
+                force=True,
+                avoid_foreground_switch=True,
+            )
+        else:
+            stop_result = {
+                "ok": True,
+                "pid": pid,
+                "mode": "attach-only",
+                "stopped": False,
+            }
+
+    events_after = _query_windows_gpu_events()
+    new_gpu_events = [
+        row for row in events_after if _gpu_event_identity(row) not in event_keys_before
+    ]
+    new_incidents = _new_gpu_incident_files(incident_roots, incidents_before)
+    log_summary = _read_runtime_log_summary(w3, log_offsets=log_offsets)
+    keyword_counts = dict(log_summary.get("keywordCounts", {}) or {})
+    device_lost = bool(
+        new_gpu_events
+        or new_incidents
+        or int(keyword_counts.get("deviceLost", 0) or 0) > 0
+        or "device lost" in failure_reason.lower()
+        or "process exited" in failure_reason.lower()
+    )
+    route_ok = not failure_reason and not device_lost
+    result = {
+        "ok": route_ok,
+        "stage": (
+            "gpu-failure" if device_lost
+            else ("control-failure" if failure_reason else "done")
+        ),
+        "failureReason": failure_reason,
+        "durationRequestedSec": duration,
+        "durationObservedSec": round(time.monotonic() - started_at, 3),
+        "birthHoldRequestedSec": requested_birth_hold_sec,
+        "gridSize": grid,
+        "attachOnly": not owned_process,
+        "sourceMap": str(source_map),
+        "sourceMapSha256": sha256_file(source_map),
+        "start": start,
+        "cameraBefore": camera_before,
+        "worldBounds": bounds,
+        "visibilityEnable": visibility_enable,
+        "visibilityRestore": visibility_restore,
+        "cameraRestore": camera_restore,
+        "waypoints": waypoint_rows,
+        "runtimeSamples": samples,
+        "screenshots": screenshot_rows,
+        "gpuEventsBefore": events_before,
+        "newGpuEvents": new_gpu_events,
+        "newGpuIncidents": new_incidents,
+        "logSummary": log_summary,
+        "stop": stop_result,
+        "artifactDir": str(artifact_dir),
+    }
+    result_path = artifact_dir / "life_and_death_tdr_result.json"
+    result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    result["resultPath"] = str(result_path)
+    return result
+
+
+@mcp.tool()
 def set_city_test_view(
     view: str = "mid",
     pid: int = 0,
@@ -9231,6 +9989,14 @@ def run_city_shadow_stability_suite(
     markers.append(_invoke_internal_test_request(pid, Path(war3_dir), "shadow.debug_mode", {"mode": 0}, timeout_sec=4.0))
     time.sleep(max(1, int(sample_duration_sec)))
 
+    visibility_restore = _invoke_internal_test_request(
+        pid,
+        Path(war3_dir),
+        "visibility.full_map",
+        {"enabled": False},
+        timeout_sec=4.0,
+    )
+
     stop = stop_war3(pid=pid, graceful_wait_sec=20, force=False, avoid_foreground_switch=True)
     if not stop.get("stopped"):
         stop = stop_war3(pid=pid, graceful_wait_sec=3, force=True, avoid_foreground_switch=True)
@@ -9302,6 +10068,7 @@ def run_city_shadow_stability_suite(
         "launch": launch,
         "ready": ready,
         "fullMap": full_map,
+        "visibilityRestore": visibility_restore,
         "baseSnapshot": base_snapshot,
         "markers": markers,
         "sequences": sequences,
@@ -10456,6 +11223,27 @@ def run_named_scenario(
     if parse_error:
         return {"ok": False, "stage": "preset", "error": f"env_overrides_json 解析失败: {parse_error}"}
     merged_env.update(user_env)
+
+    if str(preset.get("specializedRunner", "")) == "run_life_and_death_tdr_scenario":
+        result = run_life_and_death_tdr_scenario(
+            war3_dir=war3_dir,
+            map_path=str(preset.get("mapPath", DEFAULT_LIFE_AND_DEATH_MAP)),
+            duration_sec=int(preset.get("sampleDurationSec", 600) or 600),
+            grid_size=5,
+            ready_timeout_sec=int(preset.get("readyTimeoutSec", 240) or 240),
+            use_isolated_desktop=bool(preset.get("useIsolatedDesktop", True)),
+            desktop_name=str(preset.get("desktopName", "War3LifeAndDeathTdr")),
+            launcher_mode=str(preset.get("launcherMode", YDWE_LAUNCHER_MODE_DIRECT)),
+            ydwe_root=str(preset.get("ydweRoot", "")),
+            deploy_d3d9_before_launch=bool(preset.get("deployD3d9BeforeLaunch", True)),
+            build_d3d9_path="build32/src/d3d9/d3d9.dll",
+            disable_modules=str(preset.get("disableModules", "")),
+            env_overrides_json=json.dumps(merged_env, ensure_ascii=False),
+        )
+        if isinstance(result, dict):
+            result["scenarioPreset"] = dict(preset)
+            result["scenarioName"] = _normalize_scenario_name(scenario_name)
+        return result
 
     result = run_quick_autotest(
         war3_dir=war3_dir,

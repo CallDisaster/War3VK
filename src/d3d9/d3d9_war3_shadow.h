@@ -214,6 +214,24 @@ namespace dxvk {
       uint64_t lastOffenderMapEpoch = 0u;
       uint64_t lastRequiredEnd = 0u;
       uint64_t lastAvailableSize = 0u;
+      int64_t lastMinimumVertex = 0;
+      int64_t lastMaximumVertex = 0;
+      int32_t lastVertexOffset = 0;
+      int32_t lastStage = -1;
+      uint32_t lastCategory = 0u;
+      uint32_t lastBatchTag = 0u;
+      uint32_t lastObjectKind = 0u;
+      uint32_t lastRawcode = 0u;
+      uint32_t lastJHandle = 0u;
+      uint32_t lastIndexCount = 0u;
+      uint32_t lastFirstIndex = 0u;
+      uint32_t lastMinVertexIndex = 0u;
+      uint32_t lastNumVertices = 0u;
+      uint32_t lastActualIndexMin = 0u;
+      uint32_t lastActualIndexMax = 0u;
+      uint32_t lastActualIndexDomainKnown = 0u;
+      uint32_t lastFullVertexDomainFallback = 0u;
+      uint64_t lastPositionSize = 0u;
     };
 
     enum class CsmResolutionFallbackReason : uint32_t {

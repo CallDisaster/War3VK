@@ -208,6 +208,9 @@ War3 AutoTest MCP（自动化测试服务）
      方便后续的模型/姿态/语义追踪指标直接落位，不会因为字段缺失阻塞报表流水。
 
 4.8) 隔离桌面测试（新增）
+   - 当前全局安全隔离：实测 Win32 desktop object 会令交互桌面黑屏，同时把 War3
+     留在非输入桌面。所有 `use_isolated_desktop=true` 请求会在 CreateProcess 前失败；
+     必须改用可见桌面或 attach-only，修复并完成用户桌面验收前不得解除。
    - `launch_war3_test` / `run_quick_autotest` / `run_profile_matrix` 新增：
      - `use_isolated_desktop`
      - `desktop_name`

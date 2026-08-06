@@ -44,6 +44,12 @@ class WarVkTypedTransportStaticTest(unittest.TestCase):
         self.assertIn("return false;", self.japi_cpp)
         self.assertIn("table != g_typedActiveTable", self.japi_cpp)
 
+    def test_real_native_return_uses_jass_eax_bits(self):
+        self.assertIn("uint32_t(__cdecl *)(uint32_t, int32_t, int32_t)", self.bridge_cpp)
+        self.assertIn("uint32_t __cdecl Bridge_LoadReal", self.bridge_cpp)
+        self.assertIn("return EncodeJassRealReturn(result);", self.bridge_cpp)
+        self.assertIn("uint32_t CallOriginalLoadReal", self.bridge_cpp)
+
     def test_handshake_constants_match_jass(self):
         expected = {
             "kTypedRegisterParent": 1465273172,

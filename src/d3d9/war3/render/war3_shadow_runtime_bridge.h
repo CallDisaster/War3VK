@@ -745,6 +745,7 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneCompactWorkTableRejectFrameCount = 0;
   uint64_t semanticSceneCompactWorkTableRejectIdentityCount = 0;
   uint64_t semanticSceneCompactWorkTableMismatchCount = 0;
+  uint64_t drawTimeSemanticProducerOwnedDirectGroupedSkipCount = 0;
   uint64_t semanticSceneDirectLastSubmittedRecordCount = 0;
   uint64_t semanticSceneDirectLastUniqueObjectCount = 0;
   uint64_t semanticSceneDirectLastSubmittedObjectCount = 0;
@@ -983,6 +984,12 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneShadowMapSkinnedInvalidBufferCount = 0;
   uint64_t semanticSceneShadowMapSkinnedInvalidPipelineCount = 0;
   uint64_t semanticSceneShadowMapSkinnedDrawnCount = 0;
+  uint64_t gpuSkinVsShadowDirectAttempts = 0;
+  uint64_t gpuSkinVsShadowDirectInputRejects = 0;
+  uint64_t gpuSkinVsShadowDirectStateRejects = 0;
+  uint64_t gpuSkinVsShadowDirectDrawsSubmitted = 0;
+  uint64_t gpuSkinVsShadowReplayDirectional = 0;
+  uint64_t gpuSkinVsShadowReplayPoint = 0;
   uint64_t semanticSceneShadowTaaActive = 0;
   uint64_t semanticSceneReceiverReuseShadowMap = 0;
   uint64_t semanticSceneReceiverInputValid = 0;

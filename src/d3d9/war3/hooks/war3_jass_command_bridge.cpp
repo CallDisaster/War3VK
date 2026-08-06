@@ -49,6 +49,13 @@ using NativeConvertCameraFieldFn = uint32_t(__cdecl *)(int32_t);
 using NativeSetCameraFieldFn =
     void(__cdecl *)(uint32_t, float *, float *);
 using NativeSetCameraPositionFn = void(__cdecl *)(float *, float *);
+using NativePanCameraToTimedFn =
+    void(__cdecl *)(float *, float *, float *);
+using NativeGetCameraFieldFn = uint32_t(__cdecl *)(uint32_t);
+using NativeRealVoidFn = uint32_t(__cdecl *)();
+using NativeHandleVoidFn = uint32_t(__cdecl *)();
+using NativeRealHandleFn = uint32_t(__cdecl *)(uint32_t);
+using NativeBooleanVoidFn = uint32_t(__cdecl *)();
 using NativePlayerFn = uint32_t(__cdecl *)(int);
 using NativeGetLocalPlayerFn = uint32_t(__cdecl *)();
 using NativeDisplayTextToPlayerFn =
@@ -62,7 +69,21 @@ using NativeSaveRealFn =
 using NativeLoadIntegerFn =
     int32_t(__cdecl *)(uint32_t, int32_t, int32_t);
 using NativeLoadRealFn =
-    float(__cdecl *)(uint32_t, int32_t, int32_t);
+    uint32_t(__cdecl *)(uint32_t, int32_t, int32_t);
+
+float DecodeJassRealReturn(uint32_t bits) {
+  float value = 0.0f;
+  static_assert(sizeof(value) == sizeof(bits));
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+uint32_t EncodeJassRealReturn(float value) {
+  uint32_t bits = 0u;
+  static_assert(sizeof(value) == sizeof(bits));
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
 
 enum class CarrierKind {
   Command,
@@ -103,6 +124,15 @@ std::atomic<uint64_t> s_installSuccesses{0};
 std::atomic<uint64_t> s_typedInstallAttempts{0};
 std::atomic<uint64_t> s_typedInstallSuccesses{0};
 std::mutex s_installMutex;
+std::mutex s_internalTestNativeMutex;
+
+struct InternalTestVisibilityLease {
+  bool active = false;
+  bool fogEnabled = false;
+  bool fogMaskEnabled = false;
+};
+
+InternalTestVisibilityLease s_visibilityLease;
 std::mutex s_stateMutex;
 BridgeState s_state;
 
@@ -861,6 +891,102 @@ bool CopyNativeSignature(const char *signature, std::string &out) {
   return false;
 }
 
+bool ResolveNativeStrict(const char *name, const char *expectedSignature,
+                         uint32_t expectedParamCount, void *&funcPtr,
+                         std::string &actualSignature, std::string &error) {
+  funcPtr = nullptr;
+  actualSignature.clear();
+  void *entry = LookupNativeEntry(name);
+  if (!entry) {
+    error = std::string(name) + " native entry was not found";
+    return false;
+  }
+
+  const char *signature = nullptr;
+  uint32_t paramCount = 0u;
+  uint32_t returnType = 0u;
+  if (!ReadNativeMeta(entry, funcPtr, signature, paramCount, returnType) ||
+      !CopyNativeSignature(signature, actualSignature)) {
+    error = std::string(name) + " native metadata is unreadable";
+    funcPtr = nullptr;
+    return false;
+  }
+  if (paramCount != expectedParamCount ||
+      actualSignature != expectedSignature) {
+    error = std::string(name) + " native signature mismatch: " +
+        actualSignature;
+    funcPtr = nullptr;
+    return false;
+  }
+  return true;
+}
+
+struct ResolvedCameraTestNatives {
+  NativeConvertCameraFieldFn convert = nullptr;
+  NativeSetCameraFieldFn set = nullptr;
+  NativeSetCameraPositionFn position = nullptr;
+  NativePanCameraToTimedFn pan = nullptr;
+  NativeGetCameraFieldFn getField = nullptr;
+  NativeRealVoidFn getTargetX = nullptr;
+  NativeRealVoidFn getTargetY = nullptr;
+  NativeRealVoidFn getTargetZ = nullptr;
+};
+
+bool ResolveCameraApplyNatives(ResolvedCameraTestNatives &out,
+                               bool needPosition, bool needPan,
+                               std::string &error) {
+  void *ptr = nullptr;
+  std::string signature;
+  if (!ResolveNativeStrict("ConvertCameraField", "(I)Hcamerafield;", 1u,
+                           ptr, signature, error))
+    return false;
+  out.convert = reinterpret_cast<NativeConvertCameraFieldFn>(ptr);
+  if (!ResolveNativeStrict("SetCameraField", "(Hcamerafield;RR)V", 3u,
+                           ptr, signature, error))
+    return false;
+  out.set = reinterpret_cast<NativeSetCameraFieldFn>(ptr);
+  if (needPosition) {
+    if (!ResolveNativeStrict("SetCameraPosition", "(RR)V", 2u, ptr,
+                             signature, error))
+      return false;
+    out.position = reinterpret_cast<NativeSetCameraPositionFn>(ptr);
+  }
+  if (needPan) {
+    if (!ResolveNativeStrict("PanCameraToTimed", "(RRR)V", 3u, ptr,
+                             signature, error))
+      return false;
+    out.pan = reinterpret_cast<NativePanCameraToTimedFn>(ptr);
+  }
+  return true;
+}
+
+bool ResolveCameraSnapshotNatives(ResolvedCameraTestNatives &out,
+                                  std::string &error) {
+  void *ptr = nullptr;
+  std::string signature;
+  if (!ResolveNativeStrict("ConvertCameraField", "(I)Hcamerafield;", 1u,
+                           ptr, signature, error))
+    return false;
+  out.convert = reinterpret_cast<NativeConvertCameraFieldFn>(ptr);
+  if (!ResolveNativeStrict("GetCameraField", "(Hcamerafield;)R", 1u, ptr,
+                           signature, error))
+    return false;
+  out.getField = reinterpret_cast<NativeGetCameraFieldFn>(ptr);
+  if (!ResolveNativeStrict("GetCameraTargetPositionX", "()R", 0u, ptr,
+                           signature, error))
+    return false;
+  out.getTargetX = reinterpret_cast<NativeRealVoidFn>(ptr);
+  if (!ResolveNativeStrict("GetCameraTargetPositionY", "()R", 0u, ptr,
+                           signature, error))
+    return false;
+  out.getTargetY = reinterpret_cast<NativeRealVoidFn>(ptr);
+  if (!ResolveNativeStrict("GetCameraTargetPositionZ", "()R", 0u, ptr,
+                           signature, error))
+    return false;
+  out.getTargetZ = reinterpret_cast<NativeRealVoidFn>(ptr);
+  return true;
+}
+
 const char *ExpectedCarrierSignature(CarrierKind kind) {
   switch (kind) {
   case CarrierKind::Command:
@@ -1147,8 +1273,8 @@ void __cdecl Bridge_SaveReal(uint32_t table, int32_t parentKey,
                              int32_t childKey, float *value);
 int32_t __cdecl Bridge_LoadInteger(uint32_t table, int32_t parentKey,
                                   int32_t childKey);
-float __cdecl Bridge_LoadReal(uint32_t table, int32_t parentKey,
-                              int32_t childKey);
+uint32_t __cdecl Bridge_LoadReal(uint32_t table, int32_t parentKey,
+                                 int32_t childKey);
 
 CarrierPatch s_preloader{
     "Preloader", CarrierKind::Command,
@@ -1218,11 +1344,11 @@ int32_t CallOriginalLoadInteger(uint32_t table, int32_t parentKey,
   return fn ? fn(table, parentKey, childKey) : 0;
 }
 
-float CallOriginalLoadReal(uint32_t table, int32_t parentKey,
-                           int32_t childKey) {
+uint32_t CallOriginalLoadReal(uint32_t table, int32_t parentKey,
+                              int32_t childKey) {
   const auto fn = reinterpret_cast<NativeLoadRealFn>(
       s_loadReal.originalFn.load(std::memory_order_relaxed));
-  return fn ? fn(table, parentKey, childKey) : 0.0f;
+  return fn ? fn(table, parentKey, childKey) : 0u;
 }
 
 void __cdecl Bridge_Preloader(uint32_t nativeArg) {
@@ -1293,14 +1419,14 @@ int32_t __cdecl Bridge_LoadInteger(uint32_t table, int32_t parentKey,
   return CallOriginalLoadInteger(table, parentKey, childKey);
 }
 
-float __cdecl Bridge_LoadReal(uint32_t table, int32_t parentKey,
-                              int32_t childKey) {
+uint32_t __cdecl Bridge_LoadReal(uint32_t table, int32_t parentKey,
+                                 int32_t childKey) {
   float result = 0.0f;
   if (dxvk::war3::internal::kWar3JassCommandBridgeEnabled &&
       dxvk::war3::japi::TryTypedLoadReal(
           table, parentKey, childKey, result)) {
     s_loadReal.handled.fetch_add(1, std::memory_order_relaxed);
-    return result;
+    return EncodeJassRealReturn(result);
   }
   s_loadReal.passedThrough.fetch_add(1, std::memory_order_relaxed);
   return CallOriginalLoadReal(table, parentKey, childKey);
@@ -1942,6 +2068,269 @@ JassFixedCameraTestResult SetJassFixedCameraForTest(
     ++result.fieldInvocations;
   }
   result.invoked = result.positionInvoked && result.fieldInvocations == 7u;
+  return result;
+}
+
+JassCameraSnapshotTestResult SnapshotJassCameraForTest() {
+  JassCameraSnapshotTestResult result = {};
+  TryInstallJassCommandBridge("camera-snapshot-test");
+  std::lock_guard<std::mutex> lock(s_internalTestNativeMutex);
+
+  ResolvedCameraTestNatives natives = {};
+  if (!ResolveCameraSnapshotNatives(natives, result.error))
+    return result;
+  result.resolved = true;
+  result.signaturesValidated = true;
+
+  for (int32_t index = 0; index < 7; ++index) {
+    result.cameraFieldHandles[index] = natives.convert(index);
+    if (index != 0 && result.cameraFieldHandles[index] == 0u) {
+      result.error = "ConvertCameraField returned a null handle";
+      return result;
+    }
+  }
+
+  result.targetX = DecodeJassRealReturn(natives.getTargetX());
+  result.targetY = DecodeJassRealReturn(natives.getTargetY());
+  result.targetZ = DecodeJassRealReturn(natives.getTargetZ());
+  float fields[7] = {};
+  for (uint32_t index = 0u; index < 7u; ++index) {
+    fields[index] = DecodeJassRealReturn(
+        natives.getField(result.cameraFieldHandles[index]));
+    ++result.fieldInvocations;
+  }
+  const float values[] = {
+      result.targetX, result.targetY, result.targetZ,
+      fields[0], fields[1], fields[2], fields[3],
+      fields[4], fields[5], fields[6],
+  };
+  for (const float value : values) {
+    if (!std::isfinite(value)) {
+      result.error = "camera snapshot returned a non-finite value";
+      return result;
+    }
+  }
+
+  // Warcraft's getter exposes angular camera fields in radians while
+  // SetCameraField consumes degrees.  Keep the private AutoTest snapshot/apply
+  // contract round-trippable by publishing every angular field in the setter's
+  // unit.  Passing the getter bits back unchanged places the camera below the
+  // terrain (5.3058 radians was interpreted as 5.3058 degrees instead of the
+  // intended 304 degrees).
+  constexpr float kRadiansToDegrees =
+      57.295779513082320876798154814105f;
+  result.targetDistance = fields[0];
+  result.farZ = fields[1];
+  result.angleOfAttack = fields[2] * kRadiansToDegrees;
+  result.fieldOfView = fields[3] * kRadiansToDegrees;
+  result.roll = fields[4] * kRadiansToDegrees;
+  result.rotation = fields[5] * kRadiansToDegrees;
+  result.zOffset = fields[6];
+  result.invoked = result.fieldInvocations == 7u;
+  return result;
+}
+
+JassCameraApplyTestResult ApplyJassCameraForTest(
+    float targetX, float targetY, float targetDistance, float angleOfAttack,
+    float rotation, float fieldOfView, float farZ, float roll, float zOffset,
+    float duration, bool quickPosition) {
+  JassCameraApplyTestResult result = {};
+  result.targetX = targetX;
+  result.targetY = targetY;
+  result.duration = duration;
+  result.quickPosition = quickPosition;
+  const float values[] = {
+      targetX, targetY, targetDistance, angleOfAttack, rotation,
+      fieldOfView, farZ, roll, zOffset, duration,
+  };
+  for (const float value : values) {
+    if (!std::isfinite(value)) {
+      result.error = "camera apply input is not finite";
+      return result;
+    }
+  }
+  if (targetDistance <= 0.0f || fieldOfView <= 0.0f || farZ <= 0.0f ||
+      duration < 0.0f) {
+    result.error = "camera distance/FOV/FarZ/duration is invalid";
+    return result;
+  }
+
+  TryInstallJassCommandBridge("camera-apply-test");
+  std::lock_guard<std::mutex> lock(s_internalTestNativeMutex);
+  ResolvedCameraTestNatives natives = {};
+  if (!ResolveCameraApplyNatives(natives, quickPosition, !quickPosition,
+                                 result.error))
+    return result;
+  result.resolved = true;
+  result.signaturesValidated = true;
+
+  uint32_t fieldHandles[7] = {};
+  for (int32_t index = 0; index < 7; ++index) {
+    fieldHandles[index] = natives.convert(index);
+    if (index != 0 && fieldHandles[index] == 0u) {
+      result.error = "ConvertCameraField returned a null handle";
+      return result;
+    }
+  }
+
+  float x = targetX;
+  float y = targetY;
+  float transition = duration;
+  if (quickPosition)
+    natives.position(&x, &y);
+  else
+    natives.pan(&x, &y, &transition);
+  result.positionInvoked = true;
+
+  float fieldValues[7] = {
+      targetDistance, farZ, angleOfAttack, fieldOfView,
+      roll, rotation, zOffset,
+  };
+  for (uint32_t index = 0u; index < 7u; ++index) {
+    float fieldTransition = duration;
+    natives.set(fieldHandles[index], &fieldValues[index], &fieldTransition);
+    ++result.fieldInvocations;
+  }
+  result.invoked = result.positionInvoked && result.fieldInvocations == 7u;
+  return result;
+}
+
+JassCameraPanTestResult PanJassCameraForTest(
+    float targetX, float targetY, float duration) {
+  JassCameraPanTestResult result = {};
+  result.targetX = targetX;
+  result.targetY = targetY;
+  result.duration = duration;
+  if (!std::isfinite(targetX) || !std::isfinite(targetY) ||
+      !std::isfinite(duration) || duration < 0.0f) {
+    result.error = "camera pan input is invalid";
+    return result;
+  }
+
+  TryInstallJassCommandBridge("camera-pan-test");
+  std::lock_guard<std::mutex> lock(s_internalTestNativeMutex);
+  void *funcPtr = nullptr;
+  if (!ResolveNativeStrict("PanCameraToTimed", "(RRR)V", 3u, funcPtr,
+                           result.signature, result.error))
+    return result;
+  result.resolved = true;
+  result.signatureValidated = true;
+  float x = targetX;
+  float y = targetY;
+  float seconds = duration;
+  reinterpret_cast<NativePanCameraToTimedFn>(funcPtr)(&x, &y, &seconds);
+  result.invoked = true;
+  return result;
+}
+
+JassWorldBoundsTestResult QueryJassWorldBoundsForTest() {
+  JassWorldBoundsTestResult result = {};
+  TryInstallJassCommandBridge("world-bounds-test");
+  std::lock_guard<std::mutex> lock(s_internalTestNativeMutex);
+
+  void *worldBoundsPtr = nullptr;
+  void *minXPtr = nullptr;
+  void *minYPtr = nullptr;
+  void *maxXPtr = nullptr;
+  void *maxYPtr = nullptr;
+  std::string signature;
+  if (!ResolveNativeStrict("GetWorldBounds", "()Hrect;", 0u,
+                           worldBoundsPtr, signature, result.error) ||
+      !ResolveNativeStrict("GetRectMinX", "(Hrect;)R", 1u, minXPtr,
+                           signature, result.error) ||
+      !ResolveNativeStrict("GetRectMinY", "(Hrect;)R", 1u, minYPtr,
+                           signature, result.error) ||
+      !ResolveNativeStrict("GetRectMaxX", "(Hrect;)R", 1u, maxXPtr,
+                           signature, result.error) ||
+      !ResolveNativeStrict("GetRectMaxY", "(Hrect;)R", 1u, maxYPtr,
+                           signature, result.error))
+    return result;
+  result.resolved = true;
+  result.signaturesValidated = true;
+
+  result.rectHandle = reinterpret_cast<NativeHandleVoidFn>(worldBoundsPtr)();
+  if (result.rectHandle == 0u) {
+    result.error = "GetWorldBounds returned a null rect";
+    return result;
+  }
+  result.minX = DecodeJassRealReturn(
+      reinterpret_cast<NativeRealHandleFn>(minXPtr)(result.rectHandle));
+  result.minY = DecodeJassRealReturn(
+      reinterpret_cast<NativeRealHandleFn>(minYPtr)(result.rectHandle));
+  result.maxX = DecodeJassRealReturn(
+      reinterpret_cast<NativeRealHandleFn>(maxXPtr)(result.rectHandle));
+  result.maxY = DecodeJassRealReturn(
+      reinterpret_cast<NativeRealHandleFn>(maxYPtr)(result.rectHandle));
+  if (!std::isfinite(result.minX) || !std::isfinite(result.minY) ||
+      !std::isfinite(result.maxX) || !std::isfinite(result.maxY) ||
+      result.minX >= result.maxX || result.minY >= result.maxY ||
+      std::abs(result.minX) > 1000000.0f ||
+      std::abs(result.minY) > 1000000.0f ||
+      std::abs(result.maxX) > 1000000.0f ||
+      std::abs(result.maxY) > 1000000.0f) {
+    result.error = "GetWorldBounds returned an invalid rect";
+    return result;
+  }
+  result.invoked = true;
+  return result;
+}
+
+JassVisibilityTestResult SetJassFullMapVisibilityForTest(bool enabled) {
+  JassVisibilityTestResult result = {};
+  result.enabled = enabled;
+  TryInstallJassCommandBridge("full-map-visibility-test");
+  std::lock_guard<std::mutex> lock(s_internalTestNativeMutex);
+
+  void *fogEnablePtr = nullptr;
+  void *fogMaskEnablePtr = nullptr;
+  void *isFogEnabledPtr = nullptr;
+  void *isFogMaskEnabledPtr = nullptr;
+  std::string signature;
+  if (!ResolveNativeStrict("FogEnable", "(B)V", 1u, fogEnablePtr,
+                           signature, result.error) ||
+      !ResolveNativeStrict("FogMaskEnable", "(B)V", 1u, fogMaskEnablePtr,
+                           signature, result.error) ||
+      !ResolveNativeStrict("IsFogEnabled", "()B", 0u, isFogEnabledPtr,
+                           signature, result.error) ||
+      !ResolveNativeStrict("IsFogMaskEnabled", "()B", 0u,
+                           isFogMaskEnabledPtr, signature, result.error))
+    return result;
+  result.resolved = true;
+  result.signaturesValidated = true;
+
+  const auto fogEnable = reinterpret_cast<NativeVoidBooleanFn>(fogEnablePtr);
+  const auto fogMaskEnable =
+      reinterpret_cast<NativeVoidBooleanFn>(fogMaskEnablePtr);
+  const auto isFogEnabled =
+      reinterpret_cast<NativeBooleanVoidFn>(isFogEnabledPtr);
+  const auto isFogMaskEnabled =
+      reinterpret_cast<NativeBooleanVoidFn>(isFogMaskEnabledPtr);
+  result.fogBefore = isFogEnabled() != 0u;
+  result.fogMaskBefore = isFogMaskEnabled() != 0u;
+
+  if (enabled) {
+    if (!s_visibilityLease.active) {
+      s_visibilityLease.active = true;
+      s_visibilityLease.fogEnabled = result.fogBefore;
+      s_visibilityLease.fogMaskEnabled = result.fogMaskBefore;
+      result.capturedOriginal = true;
+    }
+    fogEnable(0u);
+    fogMaskEnable(0u);
+  } else if (s_visibilityLease.active) {
+    fogEnable(s_visibilityLease.fogEnabled ? 1u : 0u);
+    fogMaskEnable(s_visibilityLease.fogMaskEnabled ? 1u : 0u);
+    s_visibilityLease = {};
+  }
+
+  result.fogAfter = isFogEnabled() != 0u;
+  result.fogMaskAfter = isFogMaskEnabled() != 0u;
+  result.leaseActive = s_visibilityLease.active;
+  result.invoked = enabled
+      ? (!result.fogAfter && !result.fogMaskAfter)
+      : !result.leaseActive;
+  if (!result.invoked)
+    result.error = "fog/fog-mask state did not reach the requested state";
   return result;
 }
 

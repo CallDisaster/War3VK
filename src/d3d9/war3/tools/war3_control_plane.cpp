@@ -911,7 +911,7 @@ json ToJson(const render::ShadowRuntimeBridgeSummary& summary) {
   for (uint32_t i = 0u; i < cadenceSampleCount; ++i)
     cadenceSamples.push_back(ToJson(summary.shadowCadenceSamples[i]));
 
-  return json{
+  json result = {
       {"modelRegistryCount", summary.modelRegistryCount},
       {"instanceRegistryCount", summary.instanceRegistryCount},
       {"runtimeBoundCount", summary.runtimeBoundCount},
@@ -4068,6 +4068,24 @@ json ToJson(const render::ShadowRuntimeBridgeSummary& summary) {
       {"runtimeChainWarm", summary.runtimeChainWarm},
       {"runtimeChainNeedsRepair", summary.runtimeChainNeedsRepair},
   };
+  // Keep newly added diagnostics outside the already very large initializer.
+  // MinGW otherwise instantiates a json constructor with more than 1600
+  // arguments and exceeds nlohmann/json's initializer parsing limit.
+  result["drawTimeSemanticProducerOwnedDirectGroupedSkipCount"] =
+      summary.drawTimeSemanticProducerOwnedDirectGroupedSkipCount;
+  result["gpuSkinVsShadowDirectAttempts"] =
+      summary.gpuSkinVsShadowDirectAttempts;
+  result["gpuSkinVsShadowDirectInputRejects"] =
+      summary.gpuSkinVsShadowDirectInputRejects;
+  result["gpuSkinVsShadowDirectStateRejects"] =
+      summary.gpuSkinVsShadowDirectStateRejects;
+  result["gpuSkinVsShadowDirectDrawsSubmitted"] =
+      summary.gpuSkinVsShadowDirectDrawsSubmitted;
+  result["gpuSkinVsShadowReplayDirectional"] =
+      summary.gpuSkinVsShadowReplayDirectional;
+  result["gpuSkinVsShadowReplayPoint"] =
+      summary.gpuSkinVsShadowReplayPoint;
+  return result;
 }
 
 bool IsReadySnapshot(const War3RuntimeStatusSnapshot& snapshot) {

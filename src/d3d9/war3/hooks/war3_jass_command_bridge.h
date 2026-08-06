@@ -83,6 +83,75 @@ struct JassFixedCameraTestResult {
   std::string error;
 };
 
+struct JassCameraSnapshotTestResult {
+  bool resolved = false;
+  bool signaturesValidated = false;
+  bool invoked = false;
+  float targetX = 0.0f;
+  float targetY = 0.0f;
+  float targetZ = 0.0f;
+  float targetDistance = 0.0f;
+  float farZ = 0.0f;
+  float angleOfAttack = 0.0f;
+  float fieldOfView = 0.0f;
+  float roll = 0.0f;
+  float rotation = 0.0f;
+  float zOffset = 0.0f;
+  uint32_t cameraFieldHandles[7] = {};
+  uint32_t fieldInvocations = 0;
+  std::string error;
+};
+
+struct JassCameraApplyTestResult {
+  bool resolved = false;
+  bool signaturesValidated = false;
+  bool positionInvoked = false;
+  bool invoked = false;
+  bool quickPosition = true;
+  float targetX = 0.0f;
+  float targetY = 0.0f;
+  float duration = 0.0f;
+  uint32_t fieldInvocations = 0;
+  std::string error;
+};
+
+struct JassCameraPanTestResult {
+  bool resolved = false;
+  bool signatureValidated = false;
+  bool invoked = false;
+  float targetX = 0.0f;
+  float targetY = 0.0f;
+  float duration = 0.0f;
+  std::string signature;
+  std::string error;
+};
+
+struct JassWorldBoundsTestResult {
+  bool resolved = false;
+  bool signaturesValidated = false;
+  bool invoked = false;
+  uint32_t rectHandle = 0;
+  float minX = 0.0f;
+  float minY = 0.0f;
+  float maxX = 0.0f;
+  float maxY = 0.0f;
+  std::string error;
+};
+
+struct JassVisibilityTestResult {
+  bool resolved = false;
+  bool signaturesValidated = false;
+  bool invoked = false;
+  bool enabled = false;
+  bool leaseActive = false;
+  bool capturedOriginal = false;
+  bool fogBefore = false;
+  bool fogMaskBefore = false;
+  bool fogAfter = false;
+  bool fogMaskAfter = false;
+  std::string error;
+};
+
 /**
  * WarVK JASS command bridge.
  *
@@ -143,5 +212,24 @@ JassFixedCameraTestResult SetJassFixedCameraForTest(
     float targetX, float targetY, float targetDistance, float angleDegrees,
     float rotationDegrees, float fieldOfViewDegrees, float farZ,
     float rollDegrees, float zOffset);
+
+/** Read the local camera through stock camera getter natives. */
+JassCameraSnapshotTestResult SnapshotJassCameraForTest();
+
+/** Apply a complete local camera state with a bounded transition duration. */
+JassCameraApplyTestResult ApplyJassCameraForTest(
+    float targetX, float targetY, float targetDistance, float angleOfAttack,
+    float rotation, float fieldOfView, float farZ, float roll, float zOffset,
+    float duration, bool quickPosition);
+
+/** Pan the local camera through the stock PanCameraToTimed native. */
+JassCameraPanTestResult PanJassCameraForTest(
+    float targetX, float targetY, float duration);
+
+/** Query the game-owned world-bounds rect without destroying it. */
+JassWorldBoundsTestResult QueryJassWorldBoundsForTest();
+
+/** Acquire or release the process-local AutoTest fog/fog-mask lease. */
+JassVisibilityTestResult SetJassFullMapVisibilityForTest(bool enabled);
 
 } // namespace dxvk::war3::hooks

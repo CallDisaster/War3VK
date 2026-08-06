@@ -111,4 +111,12 @@ War3ExactIndexVertexDomain ComputeWar3ExactIndexVertexDomain(
 War3ExactIndexVertexDomain ComputeWar3ExactIndexVertexDomainPrepared(
     const War3ExactIndexDomainScanInput& input) noexcept;
 
+// Rewrites one already-validated raw index range to a zero-based domain.
+// This lets a compacted vertex slice be replayed with vertexOffset=0 instead
+// of pairing original large indices with a negative base-vertex offset.
+bool RebaseWar3ExactIndexDomain(
+    const War3CpuReadableBufferSpan& indices, uint32_t indexElementBytes,
+    uint32_t indexCount, uint32_t minIndex, uint32_t maxIndex,
+    void* output, uint64_t outputBytes) noexcept;
+
 }  // namespace dxvk::war3::memory

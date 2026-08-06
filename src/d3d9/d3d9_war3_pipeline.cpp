@@ -1246,6 +1246,10 @@ namespace dxvk {
 void War3RenderPipeline::Execute(War3InsertionPoint point,
                                      const Rc<DxvkCommandList>& ctx,
                                      const War3PipelineInput& input) {
+        if (point == War3InsertionPoint::BeforeUi) {
+            dxvk::war3::tools::SetGpuFlightBreadcrumb(
+                dxvk::war3::tools::GpuFlightBreadcrumb::PipelineBeforeUi);
+        }
         auto& perf = war3::War3PerfMonitor::instance();
         const char* rootScope = (point == War3InsertionPoint::BeforeUi) ? "Draw" : "Present";
         auto rootPerfScope = perf.cpuScope(rootScope);
@@ -1280,6 +1284,19 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
                 continue;
             if (entry.pass->Point() == point) {
                 try {
+                    if (entry.name == "ShadowReceiver") {
+                        dxvk::war3::tools::SetGpuFlightBreadcrumb(
+                            dxvk::war3::tools::GpuFlightBreadcrumb::ShadowReceiverEntry);
+                    } else if (entry.name == "VolumetricLight") {
+                        dxvk::war3::tools::SetGpuFlightBreadcrumb(
+                            dxvk::war3::tools::GpuFlightBreadcrumb::VolumetricLight);
+                    } else if (entry.name == "SSAO") {
+                        dxvk::war3::tools::SetGpuFlightBreadcrumb(
+                            dxvk::war3::tools::GpuFlightBreadcrumb::Ssao);
+                    } else if (entry.name == "AA") {
+                        dxvk::war3::tools::SetGpuFlightBreadcrumb(
+                            dxvk::war3::tools::GpuFlightBreadcrumb::Aa);
+                    }
                     auto passScope = perf.cpuScope(entry.name.c_str());
                     entry.pass->Run(ctx, input);
                 } catch (const dxvk::DxvkError& e) {
@@ -1314,6 +1331,8 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
                 dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(
                     dxvk::war3::runtime::War3RuntimeModule::PostFx)) {
                 try {
+                    dxvk::war3::tools::SetGpuFlightBreadcrumb(
+                        dxvk::war3::tools::GpuFlightBreadcrumb::ShaderPack);
                     auto packScope = perf.cpuScope("ShaderPack");
                     war3shader::internal::RunShaderPackPasses(ctx, input);
                 } catch (const dxvk::DxvkError& e) {
@@ -1344,6 +1363,8 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
 
         if (hasListeners) {
             if (point == War3InsertionPoint::BeforeUi) {
+                dxvk::war3::tools::SetGpuFlightBreadcrumb(
+                    dxvk::war3::tools::GpuFlightBreadcrumb::BeforeUiPostEvents);
                 const auto& postEvents = frameGraphPlan.Events(
                     dxvk::war3::render::FrameGraphDispatchStage::BeforeUiPostPass);
                 for (auto eventId : postEvents) {
@@ -1356,6 +1377,11 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
                     war3shader::internal::DispatchRenderEvent(eventId);
                 }
             }
+        }
+
+        if (point == War3InsertionPoint::BeforeUi) {
+            dxvk::war3::tools::SetGpuFlightBreadcrumb(
+                dxvk::war3::tools::GpuFlightBreadcrumb::BeforeUiComplete);
         }
 
         // 低频运行时健康日志（默认每 1200 帧）。

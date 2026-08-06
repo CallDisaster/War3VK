@@ -85,6 +85,24 @@ struct ShadowReplayDiagnosticsAtomic {
   std::atomic<uint64_t> lastOffenderMapEpoch{0u};
   std::atomic<uint64_t> lastRequiredEnd{0u};
   std::atomic<uint64_t> lastAvailableSize{0u};
+  std::atomic<int64_t> lastMinimumVertex{0};
+  std::atomic<int64_t> lastMaximumVertex{0};
+  std::atomic<int32_t> lastVertexOffset{0};
+  std::atomic<int32_t> lastStage{-1};
+  std::atomic<uint32_t> lastCategory{0u};
+  std::atomic<uint32_t> lastBatchTag{0u};
+  std::atomic<uint32_t> lastObjectKind{0u};
+  std::atomic<uint32_t> lastRawcode{0u};
+  std::atomic<uint32_t> lastJHandle{0u};
+  std::atomic<uint32_t> lastIndexCount{0u};
+  std::atomic<uint32_t> lastFirstIndex{0u};
+  std::atomic<uint32_t> lastMinVertexIndex{0u};
+  std::atomic<uint32_t> lastNumVertices{0u};
+  std::atomic<uint32_t> lastActualIndexMin{0u};
+  std::atomic<uint32_t> lastActualIndexMax{0u};
+  std::atomic<uint32_t> lastActualIndexDomainKnown{0u};
+  std::atomic<uint32_t> lastFullVertexDomainFallback{0u};
+  std::atomic<uint64_t> lastPositionSize{0u};
 };
 ShadowReplayDiagnosticsAtomic g_shadowReplayDiagnostics = {};
 std::atomic<uint64_t> g_pointShadowPersistentRendererEpoch{1u};
@@ -1955,6 +1973,24 @@ ShadowReplayDiagnostics QueryShadowReplayDiagnostics() {
   WAR3_LOAD_REPLAY_DIAG(lastOffenderMapEpoch);
   WAR3_LOAD_REPLAY_DIAG(lastRequiredEnd);
   WAR3_LOAD_REPLAY_DIAG(lastAvailableSize);
+  WAR3_LOAD_REPLAY_DIAG(lastMinimumVertex);
+  WAR3_LOAD_REPLAY_DIAG(lastMaximumVertex);
+  WAR3_LOAD_REPLAY_DIAG(lastVertexOffset);
+  WAR3_LOAD_REPLAY_DIAG(lastStage);
+  WAR3_LOAD_REPLAY_DIAG(lastCategory);
+  WAR3_LOAD_REPLAY_DIAG(lastBatchTag);
+  WAR3_LOAD_REPLAY_DIAG(lastObjectKind);
+  WAR3_LOAD_REPLAY_DIAG(lastRawcode);
+  WAR3_LOAD_REPLAY_DIAG(lastJHandle);
+  WAR3_LOAD_REPLAY_DIAG(lastIndexCount);
+  WAR3_LOAD_REPLAY_DIAG(lastFirstIndex);
+  WAR3_LOAD_REPLAY_DIAG(lastMinVertexIndex);
+  WAR3_LOAD_REPLAY_DIAG(lastNumVertices);
+  WAR3_LOAD_REPLAY_DIAG(lastActualIndexMin);
+  WAR3_LOAD_REPLAY_DIAG(lastActualIndexMax);
+  WAR3_LOAD_REPLAY_DIAG(lastActualIndexDomainKnown);
+  WAR3_LOAD_REPLAY_DIAG(lastFullVertexDomainFallback);
+  WAR3_LOAD_REPLAY_DIAG(lastPositionSize);
 #undef WAR3_LOAD_REPLAY_DIAG
   return result;
 }
@@ -3293,6 +3329,53 @@ bool War3ShadowReceiverPass::validateShadowReplayDraws(
         result.requiredEnd, std::memory_order_release);
     g_shadowReplayDiagnostics.lastAvailableSize.store(
         result.availableSize, std::memory_order_release);
+    g_shadowReplayDiagnostics.lastMinimumVertex.store(
+        result.minimumVertex, std::memory_order_release);
+    g_shadowReplayDiagnostics.lastMaximumVertex.store(
+        result.maximumVertex, std::memory_order_release);
+    g_shadowReplayDiagnostics.lastVertexOffset.store(
+        draw != nullptr ? draw->vertexOffset : 0, std::memory_order_release);
+    g_shadowReplayDiagnostics.lastStage.store(
+        draw != nullptr ? static_cast<int32_t>(draw->stage) : -1,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastCategory.store(
+        draw != nullptr ? static_cast<uint32_t>(draw->category) : 0u,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastBatchTag.store(
+        draw != nullptr ? static_cast<uint32_t>(draw->batchTag) : 0u,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastObjectKind.store(
+        draw != nullptr ? static_cast<uint32_t>(draw->objectKind) : 0u,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastRawcode.store(
+        draw != nullptr ? draw->rawcode : 0u, std::memory_order_release);
+    g_shadowReplayDiagnostics.lastJHandle.store(
+        draw != nullptr ? draw->jHandle : 0u, std::memory_order_release);
+    g_shadowReplayDiagnostics.lastIndexCount.store(
+        draw != nullptr ? draw->indexCount : 0u, std::memory_order_release);
+    g_shadowReplayDiagnostics.lastFirstIndex.store(
+        draw != nullptr ? draw->firstIndex : 0u, std::memory_order_release);
+    g_shadowReplayDiagnostics.lastMinVertexIndex.store(
+        draw != nullptr ? draw->minVertexIndex : 0u,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastNumVertices.store(
+        draw != nullptr ? draw->numVertices : 0u,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastActualIndexMin.store(
+        draw != nullptr ? draw->shadowActualIndexMin : 0u,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastActualIndexMax.store(
+        draw != nullptr ? draw->shadowActualIndexMax : 0u,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastActualIndexDomainKnown.store(
+        draw != nullptr && draw->shadowActualIndexDomainKnown ? 1u : 0u,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastFullVertexDomainFallback.store(
+        draw != nullptr && draw->shadowFullVertexDomainFallback ? 1u : 0u,
+        std::memory_order_release);
+    g_shadowReplayDiagnostics.lastPositionSize.store(
+        draw != nullptr ? draw->positionInfo.size : 0u,
+        std::memory_order_release);
     m_replayValidationFailedThisFrame = true;
 
     static uint32_t s_replayRejectLogs = 0u;
@@ -3300,14 +3383,37 @@ bool War3ShadowReceiverPass::validateShadowReplayDraws(
         (s_replayRejectLogs % 240u) == 0u) {
       WAR3_RENDER_LOG(
           "DXVK War3ShadowReplay: reject consumer=%s reason=%s "
-          "drawEpoch=%llu expectedEpoch=%llu required=%llu available=%llu\n",
+          "drawEpoch=%llu expectedEpoch=%llu required=%llu available=%llu "
+          "vertexDomain=[%lld,%lld] vertexOffset=%d stage=%d category=%u "
+          "batchTag=%u objectKind=%u rawcode=%08x jHandle=%08x "
+          "indices=%u firstIndex=%u minVertex=%u numVertices=%u "
+          "actualDomain=%u[%u,%u] fullFallback=%u positionSize=%llu\n",
           consumer != nullptr ? consumer : "unknown",
           war3::render::War3ShadowReplayRejectReasonName(result.reason),
           static_cast<unsigned long long>(
               draw != nullptr ? draw->mapEpoch : 0u),
           static_cast<unsigned long long>(input.mapEpoch),
           static_cast<unsigned long long>(result.requiredEnd),
-          static_cast<unsigned long long>(result.availableSize));
+          static_cast<unsigned long long>(result.availableSize),
+          static_cast<long long>(result.minimumVertex),
+          static_cast<long long>(result.maximumVertex),
+          draw != nullptr ? draw->vertexOffset : 0,
+          draw != nullptr ? static_cast<int>(draw->stage) : -1,
+          draw != nullptr ? static_cast<unsigned>(draw->category) : 0u,
+          draw != nullptr ? static_cast<unsigned>(draw->batchTag) : 0u,
+          draw != nullptr ? static_cast<unsigned>(draw->objectKind) : 0u,
+          draw != nullptr ? draw->rawcode : 0u,
+          draw != nullptr ? draw->jHandle : 0u,
+          draw != nullptr ? draw->indexCount : 0u,
+          draw != nullptr ? draw->firstIndex : 0u,
+          draw != nullptr ? draw->minVertexIndex : 0u,
+          draw != nullptr ? draw->numVertices : 0u,
+          draw != nullptr && draw->shadowActualIndexDomainKnown ? 1u : 0u,
+          draw != nullptr ? draw->shadowActualIndexMin : 0u,
+          draw != nullptr ? draw->shadowActualIndexMax : 0u,
+          draw != nullptr && draw->shadowFullVertexDomainFallback ? 1u : 0u,
+          static_cast<unsigned long long>(
+              draw != nullptr ? draw->positionInfo.size : 0u));
     }
     return false;
   }
@@ -3319,6 +3425,10 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
                                              const std::vector<
                                                  const War3ShadowCasterDraw*>*
                                                  replayDrawOverride) {
+  war3::tools::SetGpuFlightBreadcrumb(
+      war3::tools::GpuFlightBreadcrumb::CsmPreflight);
+  if (!m_volumeSunRenderPathActive)
+    war3::tools::ResetGpuFlightCsmWork();
   const uint32_t shadowMapPhaseSampleWeight =
       !m_volumeSunRenderPathActive
           ? War3ShadowPhaseSampleWeight(
@@ -3573,7 +3683,13 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     const auto &draw = *replayDraws[i];
     if (s_debugCasterStage >= 0 && draw.stage != s_debugCasterStage)
       continue;
-    const bool skinnedDraw = draw.vertexBlendEnabled;
+    // A GPU-direct input draw deliberately disables the legacy blend binding:
+    // the shadow shader consumes immutable source vertices and its palette
+    // through gpuSkinInput instead. Count that route as skinned as well, or a
+    // high-pressure scene appears to have zero skinned casters while still
+    // executing all of their CSM work.
+    const bool skinnedDraw =
+        draw.vertexBlendEnabled || draw.gpuSkinInput.valid;
     if (skinnedDraw)
       skinnedCasterCount++;
     if (draw.positionInfo.buffer == VK_NULL_HANDLE ||
@@ -4047,6 +4163,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   uint32_t csmDescriptorVerifierMismatchCount = 0u;
 
   for (uint32_t c = 0; c < cascadeCount; c++) {
+    war3::tools::SetGpuFlightBreadcrumb(
+        war3::tools::GpuFlightBreadcrumb::CsmCascade, c);
     shadowMapPhaseTiming.enter(static_cast<size_t>(
         War3DirectionalShadowMapRawPhase::CascadeCull));
     if (!m_shadowMapLayerViews[c])
@@ -4135,6 +4253,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     VkIndexType boundIbType = VK_INDEX_TYPE_UINT16;
 
     uint32_t cascadeDrawn = 0;
+    uint64_t cascadeTriangles = 0u;
     bool csmDescriptorCacheValid = false;
     War3CsmDescriptorSignature csmDescriptorCacheKey = {};
     std::array<DxvkDescriptorWrite, 5> csmDescriptorCacheWrites = {};
@@ -4412,8 +4531,10 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
         ctx->cmdDrawIndexed(draw.indexCount, 1, draw.firstIndex,
                             draw.vertexOffset, 0);
+        cascadeTriangles += uint64_t(draw.indexCount / 3u);
       } else {
         ctx->cmdDraw(draw.vertexCount, 1, draw.firstVertex, 0);
+        cascadeTriangles += uint64_t(draw.vertexCount / 3u);
       }
 
       if (gpuSkinDirect) {
@@ -4449,16 +4570,22 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         else if (draw.stage == 1)
           terrainS1DrawnPerCascade[c]++;
       }
-      if (draw.vertexBlendEnabled)
+      if (draw.vertexBlendEnabled || draw.gpuSkinInput.valid)
         skinnedDrawnPerCascade[c]++;
     }
 
     drawnPerCascade[c] = cascadeDrawn;
+    if (!m_volumeSunRenderPathActive) {
+      war3::tools::SetGpuFlightCsmCascadeWork(
+          c, cascadeDrawn, cascadeTriangles);
+    }
     ctx->cmdEndRendering();
   }
 
   shadowMapPhaseTiming.enter(static_cast<size_t>(
       War3DirectionalShadowMapRawPhase::TerrainMask));
+  war3::tools::SetGpuFlightBreadcrumb(
+      war3::tools::GpuFlightBreadcrumb::CsmTerrainMask);
   // S1 terrain is kept in the CSM depth map only as a blocker so flying/unit
   // shadows stop at the first cliff/ground surface. A separate tiny mask pass
   // records where that nearest blocker is terrain; the receiver then ignores
@@ -6735,6 +6862,9 @@ void War3ShadowReceiverPass::renderPointShadow(
     const Rc<DxvkCommandList> &ctx, const War3PipelineInput &input,
     const War3PointLightFrameSnapshot &lightSnapshot,
     const std::vector<const War3ShadowCasterDraw *> *replayDrawsOverride) {
+  war3::tools::SetGpuFlightBreadcrumb(
+      war3::tools::GpuFlightBreadcrumb::PointShadowPlan);
+  war3::tools::ResetGpuFlightPointShadowWork(0u);
   auto perfScope = war3::War3PerfMonitor::instance().scope("PointShadow", ctx);
 
   waitPointShadowCpuPrepare();
@@ -6924,6 +7054,15 @@ void War3ShadowReceiverPass::renderPointShadow(
   }
 
   const uint32_t shadowLightCount = m_pointShadowCpuPlan.shadowLightCount;
+  war3::tools::ResetGpuFlightPointShadowWork(shadowLightCount);
+  for (uint32_t light = 0u; light < shadowLightCount; ++light) {
+    for (uint32_t face = 0u; face < 6u; ++face) {
+      const uint32_t index = light * 6u + face;
+      war3::tools::SetGpuFlightPointShadowFacePlan(
+          light, face, m_pointShadowCpuPlan.faceCandidateCount[index],
+          m_pointShadowCpuPlan.faceKeptCount[index]);
+    }
+  }
   const uint32_t pointShadowResolution = m_pointShadowCpuPlan.resolution;
   const uint32_t pointShadowCapacityLights =
       m_pointShadowCpuPlan.resourceCapacityLights;
@@ -7225,6 +7364,11 @@ void War3ShadowReceiverPass::renderPointShadow(
         continue;
       const auto &faceCasterIdx =
           m_pointShadowCpuPlan.faceCasters[lightIndex * 6u + face];
+      war3::tools::SetGpuFlightBreadcrumb(
+          war3::tools::GpuFlightBreadcrumb::PointShadowFace,
+          0xFFFFFFFFu, lightIndex, face);
+      uint32_t pointFaceDrawCount = 0u;
+      uint64_t pointFaceTriangleCount = 0u;
 
       VkRenderingAttachmentInfo depthAtt = {
           VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -7447,9 +7591,12 @@ void War3ShadowReceiverPass::renderPointShadow(
                                    draw.indexInfo.size, draw.indexType);
           ctx->cmdDrawIndexed(draw.indexCount, 1, draw.firstIndex,
                               draw.vertexOffset, 0);
+          pointFaceTriangleCount += uint64_t(draw.indexCount / 3u);
         } else {
           ctx->cmdDraw(draw.vertexCount, 1, draw.firstVertex, 0);
+          pointFaceTriangleCount += uint64_t(draw.vertexCount / 3u);
         }
+        ++pointFaceDrawCount;
 
         if (gpuSkinDirect) {
           auto clearedDescriptors = descriptors;
@@ -7475,6 +7622,8 @@ void War3ShadowReceiverPass::renderPointShadow(
 
       ctx->cmdEndRendering();
       pointShadowDynamicRenderingActive = false;
+      war3::tools::SetGpuFlightPointShadowFaceWork(
+          lightIndex, face, pointFaceDrawCount, pointFaceTriangleCount);
       m_pointShadowFaceAge[lightIndex][face] = 0;
       m_pointShadowFaceValidMask[lightIndex] |= uint8_t(1u << face);
     }
@@ -9880,6 +10029,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         volSettings.volumeSunShadowEnabled && hasCandidateCsm &&
         m_csmData.cascadeCount > 0u && !replayDraws.empty();
     if (wantVolumeSun) {
+      war3::tools::SetGpuFlightBreadcrumb(
+          war3::tools::GpuFlightBreadcrumb::VolumeSunShadow);
       auto volScope =
           war3::War3PerfMonitor::instance().scope("VolumeSunShadow", ctx);
       if (!renderVolumeSunShadow(ctx, input, &replayDraws))
@@ -9950,6 +10101,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   }
 
   if (needCopyColor || needCopyDepth) {
+    war3::tools::SetGpuFlightBreadcrumb(
+        war3::tools::GpuFlightBreadcrumb::ShadowCopy);
     auto perfScope = war3::War3PerfMonitor::instance().scope("ShadowCopy", ctx);
     if (needCopyColor) {
       copyColor(ctx, input.colorView);
@@ -10134,6 +10287,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
     // 先确保资源存在：避免 Resize/重建导致 ubo 中的 hasHistory/prev 状态不同步
     if (needMotionVectors) {
+      war3::tools::SetGpuFlightBreadcrumb(
+          war3::tools::GpuFlightBreadcrumb::ShadowMotionVectors);
       ensureMotionVectorResources(extent);
     }
     if (allowShadowTaaAuxiliaryPasses &&
@@ -10589,6 +10744,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     }
 
     if (needShadowVisibility) {
+      war3::tools::SetGpuFlightBreadcrumb(
+          war3::tools::GpuFlightBreadcrumb::ShadowVisibility);
       auto perfScope =
           war3::War3PerfMonitor::instance().scope("Shadow/Visibility", ctx);
       renderShadowVisibility(ctx, input);
@@ -10640,6 +10797,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     }
 
     if (needReceiverPass) {
+      war3::tools::SetGpuFlightBreadcrumb(
+          war3::tools::GpuFlightBreadcrumb::ShadowReceiverDraw);
       auto perfScope =
           war3::War3PerfMonitor::instance().scope("ShadowReceiver", ctx);
       const uint32_t receiverDrawBefore =
@@ -10756,6 +10915,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   // 单位被遮挡描边
   // 此时场景已完全渲染，深度缓冲完整，可以正确判断遮挡
   if (settings->occludedOutline.enabled) {
+    war3::tools::SetGpuFlightBreadcrumb(
+        war3::tools::GpuFlightBreadcrumb::ShadowOutline);
     auto perfScope = war3::War3PerfMonitor::instance().scope("Outline", ctx);
     renderUnitOutline(ctx, input);
   }

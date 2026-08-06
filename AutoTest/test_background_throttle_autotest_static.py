@@ -51,6 +51,10 @@ class BackgroundThrottleAutoTestContracts(unittest.TestCase):
             'AUTOTEST_GAME_PAUSE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE"',
             text,
         )
+        self.assertIn(
+            'AUTOTEST_INTERNAL_TEST_API_ENV = "DXVK_WAR3_INTERNAL_TEST_API"',
+            text,
+        )
         self.assertEqual(
             text.count(
                 'extra_env.setdefault(AUTOTEST_BACKGROUND_THROTTLE_ENV, "1")'
@@ -59,6 +63,12 @@ class BackgroundThrottleAutoTestContracts(unittest.TestCase):
         )
         self.assertEqual(
             text.count('extra_env.setdefault(AUTOTEST_GAME_PAUSE_ENV, "1")'),
+            2,
+        )
+        self.assertEqual(
+            text.count(
+                'extra_env.setdefault(AUTOTEST_INTERNAL_TEST_API_ENV, "1")'
+            ),
             2,
         )
         self.assertIn("backgroundIdleSleepBypassed", text)

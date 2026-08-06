@@ -5,17 +5,21 @@
 #include "../../d3d9_war3_settings.h"
 
 #include "../gpu_skin/war3_gpu_skin_native_bridge.h"
+#include "../core/war3_internal_test_config.h"
 #include "../hooks/war3_jass_command_bridge.h"
 #include "../render/war3_render_state.h"
 #include "../shader/war3_shader_manager.h"
 #include "../war3.h"
+#include "war3_diagnostics_hub.h"
 
 #include "../../../util/log/log.h"
+#include "../../../util/util_env.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -145,10 +149,20 @@ void SetResult(std::shared_ptr<PendingInternalTestRequest>& state,
 } // namespace
 
 bool IsInternalTestApiEnabled() {
-  return true;
+  static const bool enabled = []() {
+    if constexpr (dxvk::war3::internal::kNativeInternalTestApiEnabled)
+      return true;
+    const std::string value =
+        dxvk::env::getEnvVar("DXVK_WAR3_INTERNAL_TEST_API");
+    return value == "1" || value == "true" || value == "TRUE" ||
+        value == "on" || value == "ON" || value == "yes" ||
+        value == "YES";
+  }();
+  return enabled;
 }
 
 void ResetInternalTestApiState() {
+  ClearGpuFlightAutoTestContext();
   std::deque<std::shared_ptr<PendingInternalTestRequest>> stale;
   {
     std::lock_guard<std::mutex> lock(s_mutex);
@@ -182,6 +196,17 @@ void ResetInternalTestApiState() {
 bool SubmitInternalTestRequest(const War3InternalTestRequest& request,
                                uint32_t timeoutMs,
                                War3InternalTestResult* outResult) {
+  if (!IsInternalTestApiEnabled()) {
+    War3InternalTestResult disabled = {};
+    disabled.handled = true;
+    disabled.ok = false;
+    disabled.requestId = request.requestId;
+    disabled.command = request.command;
+    disabled.error = "internal test api is disabled";
+    if (outResult)
+      *outResult = disabled;
+    return false;
+  }
   auto state = std::make_shared<PendingInternalTestRequest>();
   state->request = request;
   if (state->request.requestId.empty())
@@ -265,6 +290,47 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     response["marker"] = marker;
     response["frameIndex"] = frameIndex;
     result.ok = true;
+  } else if (state->request.command == "autotest.waypoint") {
+    const bool active = payload.value("active", true);
+    if (!active) {
+      ClearGpuFlightAutoTestContext();
+      response["active"] = false;
+      response["frameIndex"] = frameIndex;
+      result.ok = true;
+    } else {
+      const uint32_t index = payload.value("index", 0u);
+      const auto bounded = [&payload](const char* name, float fallback) {
+        const float value = payload.value(name, fallback);
+        return std::isfinite(value)
+            ? std::clamp(value, -100000.0f, 100000.0f)
+            : fallback;
+      };
+      const float targetX = bounded("targetX", 0.0f);
+      const float targetY = bounded("targetY", 0.0f);
+      const float panSeconds = std::clamp(
+          bounded("panSeconds", 0.0f), 0.0f, 30.0f);
+      SetGpuFlightAutoTestContext(
+          index, targetX, targetY, panSeconds,
+          bounded("cameraTargetX", targetX),
+          bounded("cameraTargetY", targetY),
+          std::clamp(bounded("cameraTargetDistance", 0.0f), 0.0f, 20000.0f),
+          std::clamp(bounded("cameraAngleOfAttack", 0.0f), -3600.0f, 3600.0f),
+          bounded("worldMinX", 0.0f), bounded("worldMinY", 0.0f),
+          bounded("worldMaxX", 0.0f), bounded("worldMaxY", 0.0f));
+      war3dbg::Print(
+          "DXVK War3Test: waypoint=%u target=(%.3f,%.3f) seconds=%.3f "
+          "frame=%llu\n",
+          index, static_cast<double>(targetX), static_cast<double>(targetY),
+          static_cast<double>(panSeconds),
+          static_cast<unsigned long long>(frameIndex));
+      response["active"] = true;
+      response["index"] = index;
+      response["targetX"] = targetX;
+      response["targetY"] = targetY;
+      response["panSeconds"] = panSeconds;
+      response["frameIndex"] = frameIndex;
+      result.ok = true;
+    }
   } else if (state->request.command == "shadow.debug_mode") {
     const uint32_t mode = payload.value("mode", 0u);
     auto* settings = dxvk::war3::GetMutableSettings();
@@ -308,6 +374,147 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     result.ok = pauseResult.invoked;
     if (!result.ok)
       result.error = pauseResult.error;
+  } else if (state->request.command == "camera.snapshot") {
+    const auto cameraResult =
+        dxvk::war3::hooks::SnapshotJassCameraForTest();
+    response["targetX"] = cameraResult.targetX;
+    response["targetY"] = cameraResult.targetY;
+    response["targetZ"] = cameraResult.targetZ;
+    response["targetDistance"] = cameraResult.targetDistance;
+    response["farZ"] = cameraResult.farZ;
+    response["angleOfAttack"] = cameraResult.angleOfAttack;
+    response["fieldOfView"] = cameraResult.fieldOfView;
+    response["roll"] = cameraResult.roll;
+    response["rotation"] = cameraResult.rotation;
+    response["zOffset"] = cameraResult.zOffset;
+    response["resolved"] = cameraResult.resolved;
+    response["signaturesValidated"] = cameraResult.signaturesValidated;
+    response["invoked"] = cameraResult.invoked;
+    response["fieldInvocations"] = cameraResult.fieldInvocations;
+    response["executionThread"] = "war3-main-loop";
+    result.ok = cameraResult.invoked;
+    if (!result.ok)
+      result.error = cameraResult.error;
+  } else if (state->request.command == "camera.apply") {
+    const auto snapshot =
+        dxvk::war3::hooks::SnapshotJassCameraForTest();
+    if (!snapshot.invoked) {
+      response["snapshotInvoked"] = false;
+      result.ok = false;
+      result.error = snapshot.error;
+    } else {
+      const float targetX = std::clamp(
+          payload.value("targetX", snapshot.targetX),
+          -100000.0f, 100000.0f);
+      const float targetY = std::clamp(
+          payload.value("targetY", snapshot.targetY),
+          -100000.0f, 100000.0f);
+      const float targetDistance = std::clamp(
+          payload.value("targetDistance", snapshot.targetDistance),
+          64.0f, 20000.0f);
+      const float angleOfAttack = std::clamp(
+          payload.value("angleOfAttack", snapshot.angleOfAttack),
+          -3600.0f, 3600.0f);
+      const float rotation = std::clamp(
+          payload.value("rotation", snapshot.rotation),
+          -3600.0f, 3600.0f);
+      const float fieldOfView = std::clamp(
+          payload.value("fieldOfView", snapshot.fieldOfView),
+          1.0f, 170.0f);
+      const float farZ = std::clamp(
+          payload.value("farZ", snapshot.farZ),
+          256.0f, 100000.0f);
+      const float roll = std::clamp(
+          payload.value("roll", snapshot.roll),
+          -360.0f, 360.0f);
+      const float zOffset = std::clamp(
+          payload.value("zOffset", snapshot.zOffset),
+          -10000.0f, 10000.0f);
+      const float duration = std::clamp(
+          payload.value("duration", 0.0f), 0.0f, 30.0f);
+      const bool quickPosition = payload.value("quickPosition", true);
+      const auto cameraResult =
+          dxvk::war3::hooks::ApplyJassCameraForTest(
+              targetX, targetY, targetDistance, angleOfAttack, rotation,
+              fieldOfView, farZ, roll, zOffset, duration, quickPosition);
+      response["snapshotInvoked"] = true;
+      response["targetX"] = targetX;
+      response["targetY"] = targetY;
+      response["targetDistance"] = targetDistance;
+      response["angleOfAttack"] = angleOfAttack;
+      response["rotation"] = rotation;
+      response["fieldOfView"] = fieldOfView;
+      response["farZ"] = farZ;
+      response["roll"] = roll;
+      response["zOffset"] = zOffset;
+      response["duration"] = duration;
+      response["quickPosition"] = quickPosition;
+      response["resolved"] = cameraResult.resolved;
+      response["signaturesValidated"] =
+          cameraResult.signaturesValidated;
+      response["positionInvoked"] = cameraResult.positionInvoked;
+      response["fieldInvocations"] = cameraResult.fieldInvocations;
+      response["invoked"] = cameraResult.invoked;
+      response["executionThread"] = "war3-main-loop";
+      result.ok = cameraResult.invoked;
+      if (!result.ok)
+        result.error = cameraResult.error;
+    }
+  } else if (state->request.command == "camera.pan_to") {
+    const float targetX = std::clamp(
+        payload.value("targetX", 0.0f), -100000.0f, 100000.0f);
+    const float targetY = std::clamp(
+        payload.value("targetY", 0.0f), -100000.0f, 100000.0f);
+    const float duration = std::clamp(
+        payload.value("duration", 1.0f), 0.0f, 30.0f);
+    const auto cameraResult =
+        dxvk::war3::hooks::PanJassCameraForTest(targetX, targetY, duration);
+    response["targetX"] = cameraResult.targetX;
+    response["targetY"] = cameraResult.targetY;
+    response["duration"] = cameraResult.duration;
+    response["resolved"] = cameraResult.resolved;
+    response["signatureValidated"] = cameraResult.signatureValidated;
+    response["signature"] = cameraResult.signature;
+    response["invoked"] = cameraResult.invoked;
+    response["executionThread"] = "war3-main-loop";
+    result.ok = cameraResult.invoked;
+    if (!result.ok)
+      result.error = cameraResult.error;
+  } else if (state->request.command == "camera.world_bounds") {
+    const auto boundsResult =
+        dxvk::war3::hooks::QueryJassWorldBoundsForTest();
+    response["rectHandle"] = boundsResult.rectHandle;
+    response["minX"] = boundsResult.minX;
+    response["minY"] = boundsResult.minY;
+    response["maxX"] = boundsResult.maxX;
+    response["maxY"] = boundsResult.maxY;
+    response["resolved"] = boundsResult.resolved;
+    response["signaturesValidated"] =
+        boundsResult.signaturesValidated;
+    response["invoked"] = boundsResult.invoked;
+    response["executionThread"] = "war3-main-loop";
+    result.ok = boundsResult.invoked;
+    if (!result.ok)
+      result.error = boundsResult.error;
+  } else if (state->request.command == "visibility.full_map") {
+    const bool enabled = payload.value("enabled", true);
+    const auto visibilityResult =
+        dxvk::war3::hooks::SetJassFullMapVisibilityForTest(enabled);
+    response["enabled"] = visibilityResult.enabled;
+    response["leaseActive"] = visibilityResult.leaseActive;
+    response["capturedOriginal"] = visibilityResult.capturedOriginal;
+    response["fogBefore"] = visibilityResult.fogBefore;
+    response["fogMaskBefore"] = visibilityResult.fogMaskBefore;
+    response["fogAfter"] = visibilityResult.fogAfter;
+    response["fogMaskAfter"] = visibilityResult.fogMaskAfter;
+    response["resolved"] = visibilityResult.resolved;
+    response["signaturesValidated"] =
+        visibilityResult.signaturesValidated;
+    response["invoked"] = visibilityResult.invoked;
+    response["executionThread"] = "war3-main-loop";
+    result.ok = visibilityResult.invoked;
+    if (!result.ok)
+      result.error = visibilityResult.error;
   } else if (state->request.command == "camera.angle_of_attack") {
     const float angleDegrees =
         std::clamp(payload.value("angleDegrees", 304.0f), 250.0f, 359.0f);
