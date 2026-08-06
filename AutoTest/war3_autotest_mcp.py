@@ -2858,9 +2858,10 @@ def _launch_suite_map_until_ready(
         if startup_input_actions:
             # Some protected maps accept -loadfile but stop at their own
             # pre-game splash screen.  A scenario may acknowledge that screen
-            # through the existing same-desktop input helper before waiting for
-            # gameStarted.  The helper remains restricted to the AutoTest-owned
-            # isolated Desktop and the exact process registered above.
+            # through the bounded input helper before waiting for gameStarted.
+            # The helper is restricted to the exact AutoTest-owned process. It
+            # runs on that session's desktop and never targets an arbitrary
+            # foreground window.
             startup_input = _run_war3_input_plan(
                 pid=pid,
                 actions=list(startup_input_actions),
@@ -4113,7 +4114,7 @@ def _run_war3_input_plan(
     actions: List[Dict[str, Any]],
     timeout_sec: float = 20.0,
 ) -> Dict[str, Any]:
-    """Run keyboard/client-click actions from a helper on War3's isolated desktop."""
+    """Run bounded input actions against an exact AutoTest-owned War3 process."""
     target_pid = int(pid)
     if target_pid <= 0 or not _pid_alive(target_pid):
         return {"ok": False, "error": f"进程不存在: {target_pid}"}
@@ -4123,14 +4124,37 @@ def _run_war3_input_plan(
         return {"ok": False, "error": "单次输入计划最多 512 个动作"}
 
     registered = SESSION_REGISTRY.get(pid=target_pid)
-    desktop_name = str(registered.desktop_name or "") if registered is not None else ""
-    if not desktop_name and STATE.war3_pid == target_pid:
-        desktop_name = str(STATE.desktop_name or "")
-    if not desktop_name:
+    state_owned = bool(
+        int(STATE.war3_pid or 0) == target_pid
+        and _state_owned_process_alive(target_pid) is True
+    )
+    if registered is None and not state_owned:
         return {
             "ok": False,
-            "error": "输入计划只允许用于已登记的隔离桌面 War3 会话",
-            "code": "ISOLATED_DESKTOP_REQUIRED",
+            "error": "输入计划只允许用于精确绑定的 AutoTest War3 会话",
+            "code": "AUTOTEST_SESSION_REQUIRED",
+        }
+    desktop_name = (
+        str(registered.desktop_name or "")
+        if registered is not None
+        else str(STATE.desktop_name or "")
+    )
+    desktop_mode = (
+        str(registered.desktop_mode or "default")
+        if registered is not None
+        else str(STATE.desktop_mode or "default")
+    ).strip().lower()
+    if desktop_mode not in ("default", "isolated"):
+        return {
+            "ok": False,
+            "error": f"未知 AutoTest desktop mode: {desktop_mode}",
+            "code": "AUTOTEST_DESKTOP_MODE_INVALID",
+        }
+    if desktop_mode == "isolated" and not desktop_name:
+        return {
+            "ok": False,
+            "error": "隔离桌面会话缺少 desktop name",
+            "code": "AUTOTEST_DESKTOP_NAME_REQUIRED",
         }
 
     hwnd = _wait_for_main_window_hwnd(target_pid, timeout_sec=8.0, require_visible=True)
@@ -4210,12 +4234,37 @@ def _run_war3_input_plan(
         "-StatusPath",
         str(status_path),
     ]
-    helper = _launch_process_on_desktop(
-        helper_args,
-        Path(__file__).resolve().parent,
-        os.environ.copy(),
-        desktop_name,
-    )
+    helper_proc: Optional[subprocess.Popen] = None
+    if desktop_mode == "isolated":
+        helper = _launch_process_on_desktop(
+            helper_args,
+            Path(__file__).resolve().parent,
+            os.environ.copy(),
+            desktop_name,
+        )
+    else:
+        try:
+            helper_proc = subprocess.Popen(
+                helper_args,
+                cwd=str(Path(__file__).resolve().parent),
+                env=os.environ.copy(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+            )
+            helper = {
+                "ok": True,
+                "pid": int(helper_proc.pid),
+                "desktop": "",
+                "mode": "default-visible",
+            }
+        except Exception as exc:
+            helper = {
+                "ok": False,
+                "error": f"默认桌面输入 helper 启动失败: {type(exc).__name__}: {exc}",
+                "desktop": "",
+                "mode": "default-visible",
+            }
     # The desktop launcher transfers an owned native process witness through
     # this private field.  The input helper is short lived and is not part of
     # RuntimeState, so consume and close that HANDLE locally; never leak the
@@ -4226,9 +4275,39 @@ def _run_war3_input_plan(
         if status_path.exists():
             break
         helper_pid = int(helper.get("pid", 0) or 0)
-        if helper_pid > 0 and not _pid_alive(helper_pid):
+        helper_exited = (
+            helper_proc.poll() is not None
+            if helper_proc is not None
+            else helper_pid > 0 and not _pid_alive(helper_pid)
+        )
+        if helper_exited:
             break
         time.sleep(0.05)
+
+    helper_timeout_stop: Dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "reason": "helper exited or published status",
+    }
+    if helper_proc is not None and helper_proc.poll() is None:
+        helper_timeout_stop = {
+            "ok": False,
+            "terminated": False,
+            "killed": False,
+        }
+        try:
+            helper_proc.terminate()
+            helper_proc.wait(timeout=2.0)
+            helper_timeout_stop.update(ok=True, terminated=True)
+        except Exception:
+            try:
+                helper_proc.kill()
+                helper_proc.wait(timeout=2.0)
+                helper_timeout_stop.update(ok=True, killed=True)
+            except Exception as exc:
+                helper_timeout_stop["error"] = (
+                    f"input helper stop failed: {type(exc).__name__}: {exc}"
+                )
 
     status = ""
     if status_path.exists():
@@ -4251,9 +4330,14 @@ def _run_war3_input_plan(
                 "error": f"input helper witness close failed: {type(exc).__name__}: {exc}",
             }
     return {
-        "ok": bool(ok and helper_witness_close.get("ok") is True),
+        "ok": bool(
+            ok
+            and helper_witness_close.get("ok") is True
+            and helper_timeout_stop.get("ok") is True
+        ),
         "pid": target_pid,
         "hwnd": int(hwnd),
+        "desktopMode": desktop_mode,
         "desktop": desktop_name,
         "clientWidth": client_width,
         "clientHeight": client_height,
@@ -4262,6 +4346,7 @@ def _run_war3_input_plan(
         "statusPath": str(status_path),
         "helper": helper,
         "helperNativeWitnessClose": helper_witness_close,
+        "helperTimeoutStop": helper_timeout_stop,
         "helperStatus": status,
         "window": window,
     }
