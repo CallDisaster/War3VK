@@ -95,6 +95,47 @@ class PerfGpuUnionAndShadowRouteContracts(unittest.TestCase):
             block,
         )
 
+    def test_visible_index_slice_reuse_requires_authoritative_generation(self) -> None:
+        start = DEVICE_CPP.index(
+            "class War3CurrentDrawVisibleIndexSliceCache final"
+        )
+        end = DEVICE_CPP.index(
+            "bool War3TryAttachCurrentDrawVisibleIndexSlice", start
+        )
+        cache = DEVICE_CPP[start:end]
+        self.assertIn("static thread_local std::array<Entry", cache)
+        self.assertIn(
+            "DXVK_WAR3_CURRENT_DRAW_GENERATION_INDEX_SLICE_CACHE",
+            DEVICE_CPP,
+        )
+        self.assertIn(
+            '"DXVK_WAR3_CURRENT_DRAW_GENERATION_INDEX_SLICE_CACHE", 0u',
+            DEVICE_CPP,
+        )
+        self.assertIn("entry.mapEpoch == geoset->mapEpoch", cache)
+        self.assertIn(
+            "entry.immutableModelGeneration == geoset->immutableModelGeneration",
+            cache,
+        )
+        self.assertIn("geoset->readyForShadowConsumer()", cache)
+        self.assertNotIn("contentHash ==", cache)
+        self.assertNotIn("memcmp", cache)
+
+        find_start = DEVICE_CPP.index("War3FindDirectPacketGeosetResource(")
+        find_end = DEVICE_CPP.index(
+            "War3GetDirectPacketGeosetResource(", find_start
+        )
+        find = DEVICE_CPP[find_start:find_end]
+        self.assertIn("it->second->mapEpoch != currentMapEpoch", find)
+
+        get_end = DEVICE_CPP.index(
+            "bool War3SemanticMaterialSignatureCacheRuntime()", find_end
+        )
+        get = DEVICE_CPP[find_end:get_end]
+        self.assertGreaterEqual(
+            get.count("it->second->immutableModelGeneration"), 2
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

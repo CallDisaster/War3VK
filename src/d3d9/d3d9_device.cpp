@@ -1818,9 +1818,18 @@ bool War3CurrentDrawGroupRangeCacheRuntime() {
 
 bool War3CurrentDrawVisibleIndexSliceCacheRuntime() {
   // 同一 Populate 内相同 geoset/primitive 的 index slice 是不可变的。
-  // 默认复用其 owned vector；cache 不跨帧，环境变量保留旧逐包复制路径。
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_CURRENT_DRAW_INDEX_SLICE_CACHE", 1u) != 0u;
+  return s_enabled;
+}
+
+bool War3CurrentDrawGenerationIndexSliceCacheRuntime() {
+  // Same-DLL A/B switch. Reuse remains map/generation backed; disabling this
+  // restores the old per-Populate cache without disabling all slice caching.
+  // The physical A-B-B-A reduced slice allocation work but saved only about
+  // 0.02 ms/frame, below the 0.15 ms product admission threshold.
+  static const bool s_enabled = War3GetEnvU32(
+      "DXVK_WAR3_CURRENT_DRAW_GENERATION_INDEX_SLICE_CACHE", 0u) != 0u;
   return s_enabled;
 }
 
@@ -4703,10 +4712,13 @@ War3FindDirectPacketGeosetResource(void* geosetOrDataPtr) {
   if (geosetOrDataPtr == nullptr)
     return nullptr;
 
+  const uint64_t currentMapEpoch =
+      dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
   std::shared_lock<std::shared_mutex> lock(War3DirectPacketGeosetCacheMutex());
   const auto& s_cache = War3DirectPacketGeosetResourceCache();
   const auto it = s_cache.find(geosetOrDataPtr);
   if (it == s_cache.end() || it->second == nullptr ||
+      it->second->mapEpoch != currentMapEpoch ||
       !it->second->readyForShadowConsumer()) {
     return nullptr;
   }
@@ -4721,6 +4733,9 @@ War3GetDirectPacketGeosetResource(
   if (key == nullptr)
     return std::make_shared<War3DirectPacketGeosetRecord>(std::move(geoset));
 
+  const uint64_t currentMapEpoch =
+      dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
+
   // Step 1：fast path 走 shared_lock 看缓存命中。
   {
     std::shared_lock<std::shared_mutex> lock(
@@ -4728,6 +4743,10 @@ War3GetDirectPacketGeosetResource(
     const auto& cache = War3DirectPacketGeosetResourceCache();
     const auto it = cache.find(key);
     if (it != cache.end() && it->second != nullptr &&
+        geoset.mapEpoch == currentMapEpoch &&
+        it->second->mapEpoch == currentMapEpoch &&
+        it->second->immutableModelGeneration ==
+            geoset.immutableModelGeneration &&
         it->second->contentHash == geoset.contentHash &&
         it->second->vertexCount == geoset.vertexCount &&
         it->second->indexCount == geoset.indexCount &&
@@ -4742,6 +4761,9 @@ War3GetDirectPacketGeosetResource(
   // 重新检查（双锁释放/获取之间可能其他线程已写入）。
   const auto it = cache.find(key);
   if (it != cache.end() && it->second != nullptr &&
+      geoset.mapEpoch == currentMapEpoch &&
+      it->second->mapEpoch == currentMapEpoch &&
+      it->second->immutableModelGeneration == geoset.immutableModelGeneration &&
       it->second->contentHash == geoset.contentHash &&
       it->second->vertexCount == geoset.vertexCount &&
       it->second->indexCount == geoset.indexCount &&
@@ -5150,8 +5172,10 @@ uint64_t War3ComputeCurrentDrawVisibleIndexSliceHash(
 
 class War3CurrentDrawVisibleIndexSliceCache final {
 public:
-  explicit War3CurrentDrawVisibleIndexSliceCache(bool enabled)
-      : m_enabled(enabled) {
+  War3CurrentDrawVisibleIndexSliceCache(bool enabled,
+                                        bool generationReuseEnabled)
+      : m_enabled(enabled),
+        m_generationReuseEnabled(generationReuseEnabled) {
   }
 
   bool find(const dxvk::war3::model::ShadowGeosetResourceRecord* geoset,
@@ -5164,10 +5188,33 @@ public:
       ++m_bypassCount;
       return false;
     }
-    for (uint32_t i = 0u; i < m_entryCount; ++i) {
-      const auto& entry = m_entries[i];
-      if (entry.geoset != geoset || entry.primitiveIndex != primitiveIndex)
-        continue;
+    if (geoset == nullptr || !geoset->readyForShadowConsumer() ||
+        geoset->mapEpoch == 0u || geoset->immutableModelGeneration == 0u) {
+      ++m_missCount;
+      return false;
+    }
+    if (!m_generationReuseEnabled) {
+      for (uint32_t i = 0u; i < m_frameEntryCount; ++i) {
+        const auto& frameEntry = m_frameEntries[i];
+        if (frameEntry.geoset != geoset ||
+            frameEntry.primitiveIndex != primitiveIndex) {
+          continue;
+        }
+        outIndices = frameEntry.indices;
+        outBaseIndex = frameEntry.baseIndex;
+        outIndexCount = frameEntry.indexCount;
+        outTopology = frameEntry.topology;
+        ++m_hitCount;
+        return true;
+      }
+      ++m_missCount;
+      return false;
+    }
+    const auto& entry = generationEntries()[slotFor(geoset, primitiveIndex)];
+    if (entry.geoset == geoset &&
+        entry.mapEpoch == geoset->mapEpoch &&
+        entry.immutableModelGeneration == geoset->immutableModelGeneration &&
+        entry.primitiveIndex == primitiveIndex && entry.indices != nullptr) {
       outIndices = entry.indices;
       outBaseIndex = entry.baseIndex;
       outIndexCount = entry.indexCount;
@@ -5185,16 +5232,23 @@ public:
              uint32_t baseIndex,
              uint32_t indexCount,
              dxvk::war3::shadow::ShadowPrimitiveTopology topology) {
-    if (!m_enabled || geoset == nullptr || indices == nullptr ||
-        indices->empty()) {
+    if (!m_enabled || geoset == nullptr || !geoset->readyForShadowConsumer() ||
+        geoset->mapEpoch == 0u || geoset->immutableModelGeneration == 0u ||
+        indices == nullptr || indices->empty()) {
+      return;
+    }
+    const Entry stored = {
+        geoset, geoset->mapEpoch, geoset->immutableModelGeneration,
+        primitiveIndex, std::move(indices), baseIndex, indexCount, topology};
+    if (m_generationReuseEnabled) {
+      generationEntries()[slotFor(geoset, primitiveIndex)] = stored;
       return;
     }
     const uint32_t slot =
-        m_entryCount < m_entries.size()
-            ? m_entryCount++
-            : m_replaceIndex++ % uint32_t(m_entries.size());
-    m_entries[slot] = {geoset, primitiveIndex, std::move(indices), baseIndex,
-                       indexCount, topology};
+        m_frameEntryCount < m_frameEntries.size()
+            ? m_frameEntryCount++
+            : m_frameReplaceIndex++ % uint32_t(m_frameEntries.size());
+    m_frameEntries[slot] = stored;
   }
 
   uint32_t hitCount() const { return m_hitCount; }
@@ -5204,6 +5258,8 @@ public:
 private:
   struct Entry {
     const dxvk::war3::model::ShadowGeosetResourceRecord* geoset = nullptr;
+    uint64_t mapEpoch = 0u;
+    uint64_t immutableModelGeneration = 0u;
     uint32_t primitiveIndex = 0u;
     std::shared_ptr<const std::vector<uint16_t>> indices;
     uint32_t baseIndex = 0u;
@@ -5212,10 +5268,33 @@ private:
         dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
   };
 
+  static constexpr size_t kEntryCount = 256u;
+
+  static std::array<Entry, kEntryCount>& generationEntries() {
+    // The sub-vector owns its CPU bytes. Reuse is admitted only when the
+    // process-monotonic immutable model generation and map epoch both match;
+    // a recycled Warcraft pointer or a same-address replacement therefore
+    // cannot revive an old slice. This is not a content-hash/fingerprint
+    // cache and never supplies GPU ownership.
+    static thread_local std::array<Entry, kEntryCount> s_entries = {};
+    return s_entries;
+  }
+
+  static size_t slotFor(
+      const dxvk::war3::model::ShadowGeosetResourceRecord* geoset,
+      uint32_t primitiveIndex) {
+    uint64_t hash = bit::fnv1a_init();
+    hash = bit::fnv1a_iter(hash, geoset->mapEpoch);
+    hash = bit::fnv1a_iter(hash, geoset->immutableModelGeneration);
+    hash = bit::fnv1a_iter(hash, primitiveIndex);
+    return size_t(hash) & (kEntryCount - 1u);
+  }
+
   bool m_enabled = false;
-  std::array<Entry, 64> m_entries = {};
-  uint32_t m_entryCount = 0u;
-  uint32_t m_replaceIndex = 0u;
+  bool m_generationReuseEnabled = false;
+  std::array<Entry, 64> m_frameEntries = {};
+  uint32_t m_frameEntryCount = 0u;
+  uint32_t m_frameReplaceIndex = 0u;
   uint32_t m_hitCount = 0u;
   uint32_t m_missCount = 0u;
   uint32_t m_bypassCount = 0u;
@@ -25203,7 +25282,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           &currentDrawGroupRangeCache,
           &War3PopulateReadableRegionCache::Validate};
   War3CurrentDrawVisibleIndexSliceCache currentDrawVisibleIndexSliceCache(
-      War3CurrentDrawVisibleIndexSliceCacheRuntime());
+      War3CurrentDrawVisibleIndexSliceCacheRuntime(),
+      War3CurrentDrawGenerationIndexSliceCacheRuntime());
 
   enterBuildEligiblePhase("RecordLoop");
   for (size_t recordIndex = 0u; recordIndex < recordsForBuild.size();

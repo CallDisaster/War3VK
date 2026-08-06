@@ -8637,7 +8637,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         reconciliation.shadowHistoryInvalidationMask;
     stats.semanticSceneShadowReceiverSampleSource =
         reconciliation.shadowReceiverSampleSource;
-    dxvk::war3::render::NoteShadowSceneStats(stats);
+    dxvk::war3::render::NoteShadowSceneTerminalStats(stats);
     war3::War3PerfMonitor::instance().noteShadowBudgetFrame(stats);
   };
 

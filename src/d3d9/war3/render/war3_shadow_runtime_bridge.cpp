@@ -971,6 +971,7 @@ std::atomic<uint64_t> g_nativeSemanticWorldStageLastExecuteDrawCount{0u};
 std::shared_mutex g_shadowSceneStatsMutex;
 War3ShadowCaptureStats g_shadowSceneStats = {};
 uint64_t g_shadowSceneStatsPublishCount = 0u;
+bool g_shadowSceneTerminalPublished = false;
 std::mutex g_shadowCadenceMutex;
 std::array<ShadowRuntimeCadenceSample,
            kShadowRuntimeCadenceSampleCapacity>
@@ -4032,7 +4033,8 @@ void NoteShadowRuntimePose(void* runtimeModelPtr, void* sceneNode, void* unitPtr
       matrixHash);
 }
 
-void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
+void NoteShadowSceneStatsImpl(const War3ShadowCaptureStats& stats,
+                              bool terminalReceiverPublication) {
   std::unique_lock<std::shared_mutex> lock(g_shadowSceneStatsMutex);
   War3ShadowCaptureStats merged = stats;
   const auto& previous = g_shadowSceneStats;
@@ -4089,7 +4091,8 @@ void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
            value.semanticSceneReceiverViewportHeight != 0u;
   };
   if (merged.semanticSceneReplayDrawsCount != 0u ||
-      merged.semanticSceneShadowCastersCount != 0u) {
+      merged.semanticSceneShadowCastersCount != 0u ||
+      (!terminalReceiverPublication && g_shadowSceneTerminalPublished)) {
     const bool incomingHasReceiverDetails = hasReceiverDetails(merged);
     const bool previousHasReceiverDetails = hasReceiverDetails(previous);
     // The semantic scene is published once before the receiver pass runs and
@@ -4098,7 +4101,8 @@ void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
     // not let that transient placeholder zero the last completed shadow-map /
     // receiver reconciliation, since hot status polling then reports a global
     // off-frame even though the replay input is non-empty.
-    if (!incomingHasReceiverDetails && previousHasReceiverDetails) {
+    if ((!incomingHasReceiverDetails && previousHasReceiverDetails) ||
+        (!terminalReceiverPublication && g_shadowSceneTerminalPublished)) {
       merged.semanticSceneShadowMapDrawnCasters =
           previous.semanticSceneShadowMapDrawnCasters;
       merged.semanticSceneShadowMapCascadeCulledCount =
@@ -4345,7 +4349,17 @@ void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
       merged.gpuSkinVsShadowReplayUnknown,
       previous.gpuSkinVsShadowReplayUnknown);
   g_shadowSceneStats = merged;
+  if (terminalReceiverPublication)
+    g_shadowSceneTerminalPublished = true;
   ++g_shadowSceneStatsPublishCount;
+}
+
+void NoteShadowSceneStats(const War3ShadowCaptureStats& stats) {
+  NoteShadowSceneStatsImpl(stats, false);
+}
+
+void NoteShadowSceneTerminalStats(const War3ShadowCaptureStats& stats) {
+  NoteShadowSceneStatsImpl(stats, true);
 }
 
 GpuSkinVsShadowRuntimeCounters QueryGpuSkinVsShadowRuntimeCounters() {
@@ -9228,6 +9242,11 @@ void ResetShadowRuntimeBridgeState() {
   g_semanticSummaryRefreshFrameSerial.store(0u, std::memory_order_relaxed);
   g_semanticSummaryRefreshPublishRevision.store(0u,
                                                 std::memory_order_relaxed);
+  {
+    std::unique_lock<std::shared_mutex> lock(g_shadowSceneStatsMutex);
+    g_shadowSceneStats = {};
+    g_shadowSceneTerminalPublished = false;
+  }
   {
     std::lock_guard<std::mutex> lock(g_shadowCadenceMutex);
     g_shadowCadenceSamples = {};

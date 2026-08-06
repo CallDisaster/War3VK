@@ -336,6 +336,34 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
             self.runtime_bridge,
         )
 
+    def test_terminal_receiver_publication_survives_prepass_republish(self) -> None:
+        self.assertIn(
+            "NoteShadowSceneTerminalStats(stats);",
+            self.shadow,
+        )
+        self.assertIn(
+            "void NoteShadowSceneStatsImpl(const War3ShadowCaptureStats& stats,",
+            self.runtime_bridge,
+        )
+        self.assertIn(
+            "(!terminalReceiverPublication && g_shadowSceneTerminalPublished)",
+            self.runtime_bridge,
+        )
+        self.assertIn(
+            "if (terminalReceiverPublication)\n"
+            "    g_shadowSceneTerminalPublished = true;",
+            self.runtime_bridge,
+        )
+        reset_start = self.runtime_bridge.index(
+            "void ResetShadowRuntimeBridgeState()"
+        )
+        reset_end = self.runtime_bridge.index(
+            "bool AugmentShadowSemanticContext", reset_start
+        )
+        reset = self.runtime_bridge[reset_start:reset_end]
+        self.assertIn("g_shadowSceneStats = {};", reset)
+        self.assertIn("g_shadowSceneTerminalPublished = false;", reset)
+
     def test_static_s1_source_is_retained_without_pool_charge(self) -> None:
         name = "DXVK_WAR3_S1_PERSISTENT_BORROW_STATIC"
         self.assertIn(f'"{name}", 1u', self.device)

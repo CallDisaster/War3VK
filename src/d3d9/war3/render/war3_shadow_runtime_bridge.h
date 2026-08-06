@@ -2331,6 +2331,12 @@ struct GpuSkinVsShadowRuntimeCounters {
 };
 
 void NoteShadowSceneStats(const War3ShadowCaptureStats& stats);
+
+// Publishes the authoritative post-receiver reconciliation for a render
+// frame. Later command-list/prepass snapshots may still update producer
+// counters, but must not replace this terminal receiver state with their
+// immutable pre-receiver copy.
+void NoteShadowSceneTerminalStats(const War3ShadowCaptureStats& stats);
 GpuSkinVsShadowRuntimeCounters QueryGpuSkinVsShadowRuntimeCounters();
 void NoteShadowFrameCadenceSample(uint64_t frameIndex,
                                   const War3ShadowCaptureStats& stats);
