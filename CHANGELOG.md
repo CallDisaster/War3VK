@@ -17,6 +17,10 @@ JAPI、YDWE Catalog 和 `warvk:v1` 协议没有变化。
   BaseVertex 合同；最终验证失败仍整份 fail-closed，不放宽 VB/IB 范围与代际检查。
 - receiver 的终态 CSM publication 改为独立终态记录。后续 pre-receiver 或 command-tail
   快照不能再把本帧已经完成的阴影状态覆盖成零，地图/设备会话重置时会同时清除该终态。
+- 修复 [#4](https://github.com/CallDisaster/War3VK/issues/4) 中单位选择圈不显示的问题：原生
+  ListB 的 type 1/2 UI decal 与 type 4 UberSplat 现在会被保留，而旧单位 blob 阴影和建筑静态
+  阴影仍由精确 producer gate 拒绝，不再用整层屏蔽误伤选择反馈。用户实机复测确认选择圈恢复，
+  本轮也未再观察到报告中的树木闪烁。
 - 扩充 CSM 各 cascade、点阴影各 light/face、receiver、volume、TAA、submit/present 的
   GPU flight breadcrumb，以及最后一个 replay offender 的对象、索引域和 buffer 范围信息。
 
@@ -30,7 +34,7 @@ JAPI、YDWE Catalog 和 `warvk:v1` 协议没有变化。
 
 ### 验证
 
-- 静态合同 504/504、Win32 runnable 16/16、Win32 DLL 构建、`ninja -n` no-work 和
+- 静态合同 508/508、Win32 runnable 16/16、Win32 DLL 构建、`ninja -n` no-work 和
   `git diff --check` 全部通过。
 - 在默认可见桌面、4096 CSM 下完成“生与死”DirectInline 三轮各 10 分钟，以及 TAA v2
   一轮 10 分钟；四轮均未记录 AV、device lost、Event 153/4101、Arena/replay 异常或 GPU incident。
@@ -39,8 +43,9 @@ JAPI、YDWE Catalog 和 `warvk:v1` 协议没有变化。
 
 ### 已知问题与下一阶段
 
-- 高密度区域压低镜头时，CSM 候选、蒙皮和四级联工作量仍可能超过安全预算；不完整 candidate
-  会被拒绝发布，表现为阴影闪烁或暂时消失，同时仍产生准备成本。跟踪见
+- 高密度区域压低镜头时，CSM 候选、蒙皮和四级联工作量仍可能超过安全预算。为避免把超量工作
+  提交给 GPU 并触发 TDR，不完整 candidate 会被拒绝发布，因此可能表现为阴影闪烁或暂时消失，
+  同时仍产生准备成本。该问题将尽量在下一个小版本中通过保守剔除和工作复用解决，跟踪见
   [#5](https://github.com/CallDisaster/War3VK/issues/5)。
 - 同进程跨地图生命周期问题继续跟踪于
   [#6](https://github.com/CallDisaster/War3VK/issues/6)；点阴影残留摩尔纹跟踪于

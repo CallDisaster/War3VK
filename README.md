@@ -24,6 +24,7 @@ Version 1.2.0 is the first public release of the newer semantic rendering archit
 - Sharper PCF tuning reduces overly soft CSM edges without changing point-shadow filtering.
 - Alpha-tested foliage, animated/skinned units, rigid geometry, buildings, and terrain use stricter current-frame source ownership.
 - Path blockers and native static/blob shadow residue are excluded from the WarVK shadow scene.
+- Fixes Issue #4, where broad filtering of the native shadow layer also removed unit selection circles. UI decals such as selection circles are now preserved while legacy unit/building shadows remain precisely rejected. Physical retesting confirmed that selection circles are restored and the reported tree flicker was no longer observed.
 - Point-light shadows use radial depth, receiver-plane bias, texel-centred sampling, and explicit depth synchronization to substantially reduce the previous severe moiré/banding artifacts. Some surfaces and viewing angles remain affected; see Known issues below.
 - TAA v2 is available as an optional temporal mode with variance clipping, reactive feedback, history diagnostics, and one-shot history invalidation. DirectInline remains the release default.
 - Volumetric sunlight, volumetric point lights, and independently controlled global height fog are available through the runtime and author API.
@@ -78,7 +79,7 @@ The player package needs only the files explicitly listed in the release archive
 
 ## Known issues in 1.2.0 Release
 
-- In dense scenes, lowering the camera can push directional-shadow candidate collection, skinning, and four-cascade replay beyond the safe budget. An incomplete CSM is rejected, which can appear as flickering or temporarily missing shadows while preparation cost remains. Progress is tracked in [#5](https://github.com/CallDisaster/War3VK/issues/5).
+- In dense scenes, lowering the camera can push directional-shadow candidate collection, skinning, and four-cascade replay beyond the safe budget. To avoid submitting excessive GPU work that may trigger a TDR, an incomplete CSM is rejected; this can appear as flickering or temporarily missing shadows while preparation cost remains. We plan to address this with conservative culling and work reuse in the next minor release where possible. Progress is tracked in [#5](https://github.com/CallDisaster/War3VK/issues/5).
 - Point lights with point shadows enabled can still produce moire or banding artifacts on some ground surfaces and viewing angles. This is not fully fixed in 1.2.0; if the artifact is distracting, keep the point light enabled but disable its point shadow.
 - Leaving a map and then loading another map in the same Warcraft III process can cause persistent performance loss, shadow corruption, or other resource-lifetime problems. Reliable cross-map sessions are not supported in 1.2.0. Fully exit Warcraft III and restart it before loading another map.
 - These issues remain scheduled for follow-up; cross-map lifetime and point-shadow artifacts are tracked in [#6](https://github.com/CallDisaster/War3VK/issues/6) and [#7](https://github.com/CallDisaster/War3VK/issues/7). Launching the game, playing one map, and then exiting remains the recommended workflow for the 1.2.0 series.
