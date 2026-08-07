@@ -581,8 +581,9 @@ int __fastcall Hook_CUnitUIManager_RecordSetStructureShadow(void *thisPtr,
 }
 
 // 地形阴影层入口：
-// - mode=1：关闭该入口触发的 ListB（stage14 直调链路由 ListB Hook 处理）
-// - mode>=2：完全禁用原生阴影层
+// - ListB 同时承载选择圈、MarkColor/Occlusion 与合法 UberSplat，不能在上层
+//   整批关闭；具体阴影条目统一交给 Hook_Terrain_RenderListB 按 type 过滤。
+// - mode>=2 只关闭 ListA；ListB 仍进入逐类型过滤，以保留游戏 UI decal。
 void __fastcall Hook_Terrain_RenderShadowLayer(void *thisPtr, void *edx, int a2,
                                                int a3, int a4) {
   War3HotHookCallTiming hookTiming(
@@ -595,17 +596,9 @@ void __fastcall Hook_Terrain_RenderShadowLayer(void *thisPtr, void *edx, int a2,
         "DXVK War3Hook: ShadowLayer mode=%u a2=%d a3=%d a4=%d\n", mode, a2, a3,
         a4);
   }
-  if (mode == 1u) {
-    // [ASM 已确认] TerrainShadow_RenderLayer:
-    // - a2!=0 => RenderListA
-    // - a3!=0 => RenderListB
-    // mode=1 默认只关闭该入口触发的 ListB；stage14 的 ListB 直调由
-    // Hook_Terrain_RenderListB 处理。
-    a3 = 0;
-  } else if (mode >= 2u) {
-    // 完全禁用原生阴影
+  if (mode >= 2u) {
+    // 完全禁用模式仍必须保留选择圈等非阴影 ListB 条目。
     a2 = 0;
-    a3 = 0;
   }
 
   if (g_trampolineTerrainShadowLayer) {
@@ -730,11 +723,16 @@ void __fastcall Hook_Terrain_RenderListB(void *thisPtr, void *edx, int argType,
   const uint32_t mode = War3RenderState::GetNativeShadowMode();
   bool blocked = false;
   const char *reason = "PassThrough";
+  const bool preserveUiDecalByDefault =
+      (argType == 1 || argType == 2) &&
+      dxvk::war3::internal::kNativeShadowListBPreserveUiDecalsByDefault;
   const bool preserveType4ByDefault =
       argType == 4 &&
       dxvk::war3::internal::kNativeShadowListBPreserveType4ByDefault;
 
-  if (preserveType4ByDefault) {
+  if (preserveUiDecalByDefault) {
+    reason = "PreserveUiDecalType1Or2";
+  } else if (preserveType4ByDefault) {
     reason = "PreserveType4UberSplat";
   } else if constexpr (dxvk::war3::internal::kNativeShadowListBBlockAllByDefault) {
     blocked = true;

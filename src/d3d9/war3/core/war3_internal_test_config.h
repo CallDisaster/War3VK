@@ -1613,8 +1613,15 @@ inline constexpr bool kNativeShadowListAStatsLogging = false;
 // 稳定解决；ListB 保留为默认移除，用来干掉老版单位脚下黑色 blob 圆影。
 inline constexpr bool kNativeShadowListBHookEnabled = true;
 
-// 生产默认：不依赖 NativeShadowMode，直接拦截 ListB 非 type4 条目。
+// 生产默认：不依赖 NativeShadowMode，拦截 ListB 中未获证明的阴影条目。
+// type1/type2 是选择圈与 MarkColor/Occlusion 等游戏可见 UI decal，必须保留；
+// type4 承载合法 UberSplat/HMED，也由下一项单独保留。
 inline constexpr bool kNativeShadowListBBlockAllByDefault = true;
+
+// IDA 已确认 CWorldObjects_RegisterSelectionCircleImageForEntry 注册 type1
+// terrain image；历史运行证据也要求 type1/type2 保守放行。它们不是原生单位
+// blob 阴影，不能被 ListB 的末端兜底误杀。
+inline constexpr bool kNativeShadowListBPreserveUiDecalsByDefault = true;
 
 // ListB type=4 也承载 S19 建筑地面贴花 / UberSplat（例如国王祭坛 HMED）。
 // 不能再被“单位黑圆影”策略粗暴全拦；单位 blob 现在由 +0x4C producer gate 清理。
