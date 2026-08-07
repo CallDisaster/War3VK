@@ -78,9 +78,10 @@ The player package needs only the files explicitly listed in the release archive
 
 ## Known issues in 1.2.0 Release
 
+- In dense scenes, lowering the camera can push directional-shadow candidate collection, skinning, and four-cascade replay beyond the safe budget. An incomplete CSM is rejected, which can appear as flickering or temporarily missing shadows while preparation cost remains. Progress is tracked in [#5](https://github.com/CallDisaster/War3VK/issues/5).
 - Point lights with point shadows enabled can still produce moire or banding artifacts on some ground surfaces and viewing angles. This is not fully fixed in 1.2.0; if the artifact is distracting, keep the point light enabled but disable its point shadow.
 - Leaving a map and then loading another map in the same Warcraft III process can cause persistent performance loss, shadow corruption, or other resource-lifetime problems. Reliable cross-map sessions are not supported in 1.2.0. Fully exit Warcraft III and restart it before loading another map.
-- Both issues are deferred to a later release. The common platform workflow of launching the game, playing one map, and then exiting remains the recommended usage for 1.2.0.
+- These issues remain scheduled for follow-up; cross-map lifetime and point-shadow artifacts are tracked in [#6](https://github.com/CallDisaster/War3VK/issues/6) and [#7](https://github.com/CallDisaster/War3VK/issues/7). Launching the game, playing one map, and then exiting remains the recommended workflow for the 1.2.0 series.
 
 ## Troubleshooting and reports
 

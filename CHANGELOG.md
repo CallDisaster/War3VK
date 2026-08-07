@@ -1,5 +1,54 @@
 # 更新日志
 
+## v1.2.0 Hotfix 2 - 2026-08-07
+
+这是面向高单位密度地图的第二个稳定性热修。建议 `v1.2.0` 和
+`v1.2.0-hotfix.1` 用户更新。DLL 内显示版本仍为兼容的 **1.2.0 Release**，
+JAPI、YDWE Catalog 和 `warvk:v1` 协议没有变化。
+
+### 稳定性与正确性修复
+
+- 默认关闭高压测试中被证明不安全的 exact-index compact trim 实验路线。该路线只能证明 CPU
+  可读 IB 的索引代际，却无法同时证明稍后复制的动态 REAL position backing 属于同一份不可变内容；
+  正式路径继续使用完整 exact source 合同，避免把不配套的 VB/IB 证明提交给 GPU。
+- Direct packet geoset 缓存命中现在必须同时匹配当前 map epoch 和权威
+  immutable-model generation，旧地图资源或同地址替换不能命中陈旧快照。
+- DirectGrouped、exact producer 和 replay 统一携带实际索引域、full-domain fallback 与
+  BaseVertex 合同；最终验证失败仍整份 fail-closed，不放宽 VB/IB 范围与代际检查。
+- receiver 的终态 CSM publication 改为独立终态记录。后续 pre-receiver 或 command-tail
+  快照不能再把本帧已经完成的阴影状态覆盖成零，地图/设备会话重置时会同时清除该终态。
+- 扩充 CSM 各 cascade、点阴影各 light/face、receiver、volume、TAA、submit/present 的
+  GPU flight breadcrumb，以及最后一个 replay offender 的对象、索引域和 buffer 范围信息。
+
+### 自动化与性能计量
+
+- AutoTest 的高压测试现在只绑定自身启动的默认可见桌面 War3 进程和窗口；isolated desktop
+  路径继续拒绝。加入相机快照、低视角、全图视野、世界边界和 5×5 蛇形巡航控制。
+- GPU profiler 使用 root interval union 统计嵌套区间，避免把同一段 GPU 时间重复累计。
+- generation-backed index-slice cache、Compact WorkTable、Persistent Package 与联合剔除的
+  Consume 均未达到正式收益门，继续默认关闭；HotFix 2 不用实验性性能路线换取表面帧率。
+
+### 验证
+
+- 静态合同 504/504、Win32 runnable 16/16、Win32 DLL 构建、`ninja -n` no-work 和
+  `git diff --check` 全部通过。
+- 在默认可见桌面、4096 CSM 下完成“生与死”DirectInline 三轮各 10 分钟，以及 TAA v2
+  一轮 10 分钟；四轮均未记录 AV、device lost、Event 153/4101、Arena/replay 异常或 GPU incident。
+- 上述结果证明当前候选满足本机单地图 HotFix 发布门，但不宣称所有硬件、极端镜头或跨地图路径
+  已经根治 TDR。
+
+### 已知问题与下一阶段
+
+- 高密度区域压低镜头时，CSM 候选、蒙皮和四级联工作量仍可能超过安全预算；不完整 candidate
+  会被拒绝发布，表现为阴影闪烁或暂时消失，同时仍产生准备成本。跟踪见
+  [#5](https://github.com/CallDisaster/War3VK/issues/5)。
+- 同进程跨地图生命周期问题继续跟踪于
+  [#6](https://github.com/CallDisaster/War3VK/issues/6)；点阴影残留摩尔纹跟踪于
+  [#7](https://github.com/CallDisaster/War3VK/issues/7)。
+- HotFix 2 发布后进入性能优化阶段：优先补齐可信 terrain/model/skinned-geoset bounds，采用
+  receiver 驱动的保守 per-cascade caster volume，在蒙皮、freeze、Arena reservation 和
+  packet build 之前剔除无贡献工作，并让多个阴影消费者共享同一份姿态和持久几何。
+
 ## v1.2.0 Release - 2026-08-05
 
 这是自 GitHub `v1.1.0` 以来的第一个正式大版本。此前文档中的
