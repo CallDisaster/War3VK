@@ -9809,6 +9809,9 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   TraceD3D9Device(traceOrdinal, "ctor-body-begin", this);
   m_war3ShadowArenaFence = new sync::Fence();
   m_war3GpuSkinMapEpoch = MintWar3ShadowMapEpoch();
+  m_war3ShadowTombstoneSerialSeen =
+      war3::render::ResetShadowCasterLifecycleMapEpoch(
+          m_war3GpuSkinMapEpoch);
   m_war3ShadowDiagCurrentMapEpoch.store(
       m_war3GpuSkinMapEpoch, std::memory_order_relaxed);
 
@@ -14378,6 +14381,9 @@ void D3D9DeviceEx::War3ResetGpuSkinMapEpoch() {
   const auto bridgeReset = war3::gpu_skin::RequestNativeBridgeReset(
       war3::gpu_skin::NativePoisonLedgerResetReason::MapEpoch);
   m_war3GpuSkinMapEpoch = MintWar3ShadowMapEpoch();
+  m_war3ShadowTombstoneSerialSeen =
+      war3::render::ResetShadowCasterLifecycleMapEpoch(
+          m_war3GpuSkinMapEpoch);
   m_war3ShadowDiagCurrentMapEpoch.store(
       m_war3GpuSkinMapEpoch, std::memory_order_release);
   war3::render::VisibleRenderableRegistry::instance()
@@ -24032,6 +24038,15 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3SemanticDirectPrevStableGroupHash = 0u;
   m_war3SemanticDirectPrevStream1Ptr = 0u;
   m_war3SemanticDirectPrevGeometrySourceHash = 0u;
+  m_war3SemanticDirectPrevSceneNode = 0u;
+  m_war3SemanticDirectPrevRenderablePart = 0u;
+  m_war3SemanticDirectPrevMeshData = 0u;
+  m_war3PerDrawUpload = War3PerDrawUploadInfo{};
+  m_war3LastGoodCamera = War3WorldCameraState{};
+  m_war3LastWorldRt0 = nullptr;
+  m_war3LastWorldDs = nullptr;
+  m_war3BestWorldViewportArea = 0u;
+  m_war3BestWorldCameraTier = 0u;
   m_war3SceneRotatedFrameSerial = 0u;
   m_war3Scene = War3FrameScene{};
   m_war3ShadowPaletteHashIndex.clear();
@@ -24134,6 +24149,10 @@ bool D3D9DeviceEx::War3DrainShadowCasterTombstones() {
       };
 
   for (const ShadowCasterTombstone& tombstone : tombstones) {
+    if (!ShadowCasterTombstoneBelongsToMap(
+            tombstone, m_war3GpuSkinMapEpoch)) {
+      continue;
+    }
     const CurrentDrawRetireResult currentDrawRetired =
         RetireCurrentDrawContracts(tombstone);
     const auto manifestRetired =

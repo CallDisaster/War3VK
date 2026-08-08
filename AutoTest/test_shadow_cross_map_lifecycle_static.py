@@ -18,6 +18,9 @@ VISIBLE = (
 ARENA = (ROOT / "src/d3d9/war3/memory/war3_shadow_arena.cpp").read_text(
     encoding="utf-8"
 )
+LIFECYCLE = (
+    ROOT / "src/d3d9/war3/render/war3_shadow_lifecycle.cpp"
+).read_text(encoding="utf-8")
 DIAGNOSTICS = (
     ROOT / "src/d3d9/war3/tools/war3_diagnostics_hub.cpp"
 ).read_text(encoding="utf-8")
@@ -148,6 +151,35 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
         ):
             self.assertIn(required, invalidate)
         self.assertIn("input.mapEpoch != m_shadowMapEpoch", SHADOW)
+
+    def test_identity_tombstones_are_map_epoch_scoped(self) -> None:
+        self.assertIn("g_mapEpoch", LIFECYCLE)
+        self.assertIn("ResetShadowCasterLifecycleMapEpoch", LIFECYCLE)
+        self.assertIn("State().activeByIdentity.clear()", LIFECYCLE)
+        self.assertIn("ShadowCasterTombstoneBelongsToMap", LIFECYCLE)
+        self.assertIn("tombstone.mapEpoch == mapEpoch", LIFECYCLE)
+        self.assertIn("ShadowCasterTombstoneReason::StageDisabled", LIFECYCLE)
+        self.assertIn(
+            "m_war3ShadowTombstoneSerialSeen =\n"
+            "      war3::render::ResetShadowCasterLifecycleMapEpoch",
+            DEVICE,
+        )
+
+    def test_device_frame_fallbacks_do_not_cross_map_epoch(self) -> None:
+        reset = body(
+            DEVICE,
+            "void D3D9DeviceEx::War3ResetShadowSessionState",
+            "bool D3D9DeviceEx::War3DrainShadowCasterTombstones",
+        )
+        for token in (
+            "m_war3PerDrawUpload = War3PerDrawUploadInfo{}",
+            "m_war3LastGoodCamera = War3WorldCameraState{}",
+            "m_war3LastWorldRt0 = nullptr",
+            "m_war3LastWorldDs = nullptr",
+            "m_war3BestWorldViewportArea = 0u",
+            "m_war3BestWorldCameraTier = 0u",
+        ):
+            self.assertIn(token, reset)
 
     def test_runtime_status_exports_transition_and_replay_contract(self) -> None:
         for field in (

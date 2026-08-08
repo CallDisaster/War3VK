@@ -2926,6 +2926,10 @@ void War3ShadowReceiverPass::InvalidateMapEpoch(uint64_t mapEpoch,
 
   m_shadowMapEpoch = mapEpoch;
   m_shadowDeviceEpoch = deviceEpoch;
+  m_shadowLifecycleTombstoneSerialSeen =
+      war3::render::CurrentShadowCasterTombstoneSerial();
+  m_shadowStagePolicyRevisionSeen =
+      war3::render::CurrentShadowStagePolicyRevision();
   m_epochFirstCandidateFrameSerial = 0u;
   m_epochFirstCompleteLatencyFrames = 0u;
   g_shadowReplayDiagnostics.mapEpoch.store(mapEpoch,

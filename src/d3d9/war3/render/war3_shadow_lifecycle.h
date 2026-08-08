@@ -33,6 +33,10 @@ struct ShadowCasterTombstone {
   ShadowCasterIdentity identity = {};
   ShadowCasterTombstoneReason reason =
       ShadowCasterTombstoneReason::Removed;
+  // Identity tombstones are valid only inside the map epoch in which the
+  // event was published. Stage policy tombstones are process-scoped and use
+  // zero so an explicit disabled stage remains disabled after a map change.
+  uint64_t mapEpoch = 0u;
   uint64_t eventSerial = 0u;
   uint64_t stagePolicyRevision = 0u;
   uint64_t visibleFrameSerial = 0u;
@@ -68,6 +72,14 @@ bool IsShadowCasterTombstoned(
     const ShadowCasterIdentity& identity);
 
 uint64_t CurrentShadowCasterTombstoneSerial();
+
+// Starts a new identity domain and returns the event serial at the boundary.
+// Existing stage-policy state is preserved, while raw pointer/handle identity
+// tombstones from the previous map become ineligible immediately.
+uint64_t ResetShadowCasterLifecycleMapEpoch(uint64_t mapEpoch);
+
+bool ShadowCasterTombstoneBelongsToMap(
+    const ShadowCasterTombstone& tombstone, uint64_t mapEpoch);
 
 uint64_t CurrentShadowStagePolicyRevision();
 

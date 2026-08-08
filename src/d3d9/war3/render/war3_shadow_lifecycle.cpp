@@ -1,7 +1,7 @@
 #include "war3_shadow_lifecycle.h"
 #include "war3_shadow_producer_policy.h"
 
-#include "../../util/util_bit.h"
+#include "../../../util/util_bit.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +30,7 @@ LifecycleState& State() {
 }
 
 std::atomic<uint64_t> g_eventSerial{0u};
+std::atomic<uint64_t> g_mapEpoch{0u};
 std::atomic<uint64_t> g_stagePolicyRevision{1u};
 std::atomic<uint64_t> g_publishedCount{0u};
 std::atomic<uint64_t> g_acknowledgedFreshCount{0u};
@@ -111,6 +112,10 @@ uint64_t PublishShadowCasterTombstone(
     return 0u;
   }
 
+  tombstone.mapEpoch =
+      tombstone.reason == ShadowCasterTombstoneReason::StageDisabled
+      ? 0u
+      : g_mapEpoch.load(std::memory_order_acquire);
   tombstone.eventSerial =
       g_eventSerial.fetch_add(1u, std::memory_order_acq_rel) + 1u;
   if (tombstone.stagePolicyRevision == 0u) {
@@ -158,6 +163,8 @@ void AcknowledgeFreshShadowCaster(
 
   std::array<uint64_t, 5u> keys = {};
   const size_t keyCount = BuildIdentityKeys(identity, keys);
+  const uint64_t currentMapEpoch =
+      g_mapEpoch.load(std::memory_order_acquire);
   bool acknowledged = false;
   std::lock_guard<std::mutex> lock(State().mutex);
   if (identity.producerStage >= 0) {
@@ -174,6 +181,11 @@ void AcknowledgeFreshShadowCaster(
     if (it == State().activeByIdentity.end())
       continue;
     const ShadowCasterTombstone& tombstone = it->second;
+    if (!ShadowCasterTombstoneBelongsToMap(
+            tombstone, currentMapEpoch)) {
+      State().activeByIdentity.erase(it);
+      continue;
+    }
     if (!SameStageDomain(tombstone, identity))
       continue;
     if (tombstone.reason == ShadowCasterTombstoneReason::StageDisabled &&
@@ -198,6 +210,8 @@ bool IsShadowCasterTombstoned(
     return false;
   std::array<uint64_t, 5u> keys = {};
   const size_t keyCount = BuildIdentityKeys(identity, keys);
+  const uint64_t currentMapEpoch =
+      g_mapEpoch.load(std::memory_order_acquire);
   std::lock_guard<std::mutex> lock(State().mutex);
   if (identity.producerStage >= 0 &&
       State().activeDisabledStages.find(identity.producerStage) !=
@@ -207,6 +221,8 @@ bool IsShadowCasterTombstoned(
   for (size_t i = 0u; i < keyCount; ++i) {
     const auto it = State().activeByIdentity.find(keys[i]);
     if (it != State().activeByIdentity.end() &&
+        ShadowCasterTombstoneBelongsToMap(
+            it->second, currentMapEpoch) &&
         SameStageDomain(it->second, identity)) {
       return true;
     }
@@ -216,6 +232,22 @@ bool IsShadowCasterTombstoned(
 
 uint64_t CurrentShadowCasterTombstoneSerial() {
   return g_eventSerial.load(std::memory_order_acquire);
+}
+
+uint64_t ResetShadowCasterLifecycleMapEpoch(uint64_t mapEpoch) {
+  if (mapEpoch == 0u)
+    return CurrentShadowCasterTombstoneSerial();
+
+  std::lock_guard<std::mutex> lock(State().mutex);
+  g_mapEpoch.store(mapEpoch, std::memory_order_release);
+  State().activeByIdentity.clear();
+  return g_eventSerial.load(std::memory_order_acquire);
+}
+
+bool ShadowCasterTombstoneBelongsToMap(
+    const ShadowCasterTombstone& tombstone, uint64_t mapEpoch) {
+  return tombstone.reason == ShadowCasterTombstoneReason::StageDisabled ||
+      (mapEpoch != 0u && tombstone.mapEpoch == mapEpoch);
 }
 
 uint64_t CurrentShadowStagePolicyRevision() {

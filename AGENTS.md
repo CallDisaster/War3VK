@@ -75,6 +75,10 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   已验证 position span 的精确 bounds 才能授权 C2/C3 剔除，猜测或陈旧 bounds 一律 fail-visible。
   当前仅完成离线验证，未部署且未通过实机 A/B；详见
   `docs/agent-history/2026-08-09-issue5-terrain-bounds-observer.md`。
+- Issue #6 已先闭合两个确定的跨地图 CPU 身份泄漏：caster tombstone 现在按 map epoch 隔离，且
+  旧相机、per-draw upload、RT/DS fallback 会在 Present 安全点重置；显式禁用 producer stage 的
+  进程级策略仍跨地图保留。该阶段仅通过离线合同和 Win32 runnable，尚未部署或完成 A→B→A
+  物理验收，详见 `docs/agent-history/2026-08-09-issue6-map-identity-isolation.md`。
 - 1.2.0 的发布范围限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍会造成
   性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；点光开启点阴影后，部分
   地面/角度仍有摩尔纹或带状伪影。README/CHANGELOG 必须保留这两项已知问题，后续不得描述为已修复。
