@@ -593,24 +593,39 @@ float samplePointShadowPcf(uint lightIndex, vec3 dir, float currentDist,
   float currentDepth = clamp(currentDist / max(shadowRange, 1e-4), 0.0, 1.0);
   float texelWorld = texelAngle * currentDist;
   float texelBiasScale = clamp(pointShadow.u_filterParams.z, 0.0, 1.0);
-  // Keep a small residual depth bias for quantization. The actual slope term
-  // is handled per tap below by intersecting that cube ray with the receiver
-  // plane; scaling one centre depth for the entire PCF disk is what creates
-  // coherent alternating self-shadow bands on terrain and unit surfaces.
+  // Keep a small residual depth bias for quantization. When a reconstructed
+  // receiver plane is trustworthy, every tap compares against the exact
+  // intersection on the quantized cube-texel ray. If that proof is unavailable
+  // (most often at grazing surfaces and silhouettes), use one conservative,
+  // bounded slope fallback for the entire kernel. Mixing exact plane taps with
+  // uncorrected centre-depth taps creates coherent moire bands.
   float biasWorld = max(biasBase, 0.0) +
                     texelWorld * texelBiasScale;
   float biasDepth = clamp(biasWorld / max(shadowRange, 1.0), 0.0, 0.01);
   float normalLenSq = dot(receiverNormalWorld, receiverNormalWorld);
-  bool receiverPlaneValid =
+  bool receiverNormalValid =
       validFloat(normalLenSq) && normalLenSq > 1.0e-8 &&
       receiverNormalConfidence > 0.20;
-  vec3 receiverNormal = receiverPlaneValid
+  vec3 receiverNormal = receiverNormalValid
       ? receiverNormalWorld * inversesqrt(normalLenSq)
       : -dirN;
   if (dot(receiverNormal, dirN) > 0.0)
     receiverNormal = -receiverNormal;
+  float receiverCosine = receiverNormalValid
+      ? clamp(-dot(receiverNormal, dirN), 0.0, 1.0)
+      : 0.0;
+  float receiverCosineSafe = max(receiverCosine, 0.20);
+  float receiverSlope = receiverNormalValid
+      ? sqrt(max(1.0 - receiverCosineSafe * receiverCosineSafe, 0.0)) /
+            receiverCosineSafe
+      : 4.0;
+  float fallbackSlopeScale = 1.0 + 0.75 * min(receiverSlope, 4.0);
+  float fallbackBiasWorld = max(biasBase, 0.0) +
+                            texelWorld * texelBiasScale * fallbackSlopeScale;
+  float fallbackBiasDepth = clamp(
+      fallbackBiasWorld / max(shadowRange, 1.0), 0.0, 0.01);
   float planeNumerator = dot(receiverNormal, dir);
-  receiverPlaneValid = receiverPlaneValid &&
+  bool receiverPlaneValid = receiverNormalValid &&
       validFloat(planeNumerator) &&
       planeNumerator < -0.12 * max(currentDist, 1.0e-4);
   float visible = 0.0;
@@ -624,6 +639,7 @@ float samplePointShadowPcf(uint lightIndex, vec3 dir, float currentDist,
     vec3 texelRay = pointCubeNearestTexelRay(
         sampleDir, cubeResolution);
     float receiverDepth = currentDepth;
+    float tapBiasDepth = receiverPlaneValid ? biasDepth : fallbackBiasDepth;
     if (receiverPlaneValid) {
       float texelRayLenSq = dot(texelRay, texelRay);
       float planeDenominator = dot(receiverNormal, texelRay);
@@ -639,7 +655,16 @@ float samplePointShadowPcf(uint lightIndex, vec3 dir, float currentDist,
             receiverPlaneDistance >= 0.0) {
           receiverDepth = clamp(
               receiverPlaneDistance / max(shadowRange, 1.0e-4), 0.0, 1.0);
+        } else {
+          // Exact-plane mode is kernel-wide. A numerically invalid tap must
+          // fail soft instead of switching this tap to a different reference
+          // domain and reintroducing a regular band pattern.
+          visible += 1.0;
+          continue;
         }
+      } else {
+        visible += 1.0;
+        continue;
       }
     }
     float storedDepth = texture(
@@ -647,7 +672,7 @@ float samplePointShadowPcf(uint lightIndex, vec3 dir, float currentDist,
         s_samplers[nonuniformEXT(pointShadow.u_samplerIndex)]),
       vec4(texelRay, float(lightIndex))).r;
 
-    visible += (receiverDepth > storedDepth + biasDepth) ? 0.0 : 1.0;
+    visible += (receiverDepth > storedDepth + tapBiasDepth) ? 0.0 : 1.0;
   }
 
   return visible * (1.0 / 16.0);

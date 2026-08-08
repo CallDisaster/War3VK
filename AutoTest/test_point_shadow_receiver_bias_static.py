@@ -87,11 +87,13 @@ class PointShadowReceiverBiasTests(unittest.TestCase):
         self.assertIn("float planeDenominator = dot(receiverNormal, texelRay);", block)
         self.assertIn("receiverPlaneDistance =", block)
         self.assertIn("planeNumerator * texelRayLength / planeDenominator", block)
-        self.assertIn("receiverDepth > storedDepth + biasDepth", block)
+        self.assertIn("receiverDepth > storedDepth + tapBiasDepth", block)
         self.assertIn("max(biasBase, 0.0) +", block)
         self.assertIn("texelWorld * texelBiasScale", block)
-        self.assertNotIn("receiverSlope", block)
-        self.assertNotIn("slopeScale", block)
+        self.assertIn("float fallbackSlopeScale =", block)
+        self.assertIn("float fallbackBiasDepth =", block)
+        self.assertIn("tapBiasDepth = receiverPlaneValid ?", block)
+        self.assertIn("visible += 1.0;\n          continue;", block)
         self.assertNotIn("float slopeBias", self.receiver)
         self.assertIn("pointNormV * transpose(mat3(ubo.u_view))", self.receiver)
         self.assertIn("ps.bias, pointNormW, normalTrust", self.receiver)
@@ -115,6 +117,26 @@ class PointShadowReceiverBiasTests(unittest.TestCase):
                 sum(a * b for a, b in zip(normal, point)), numerator,
                 places=6,
             )
+
+    def test_fallback_bias_is_bounded_and_monotonic_with_slope(self) -> None:
+        def scale(cosine: float) -> float:
+            cosine_safe = max(cosine, 0.20)
+            slope = math.sqrt(max(1.0 - cosine_safe * cosine_safe, 0.0)) / cosine_safe
+            return 1.0 + 0.75 * min(slope, 4.0)
+
+        samples = [scale(c) for c in (1.0, 0.75, 0.50, 0.25, 0.0)]
+        self.assertEqual(samples[0], 1.0)
+        self.assertTrue(all(a <= b for a, b in zip(samples, samples[1:])))
+        self.assertLessEqual(samples[-1], 4.0)
+
+    def test_exact_plane_mode_never_mixes_in_center_depth(self) -> None:
+        start = self.receiver.index("float samplePointShadowPcf(")
+        end = self.receiver.index("return visible * (1.0 / 16.0);", start)
+        block = self.receiver[start:end]
+        plane_start = block.index("if (receiverPlaneValid) {")
+        plane_block = block[plane_start:]
+        self.assertIn("visible += 1.0;", plane_block)
+        self.assertNotIn("receiverDepth = currentDepth;", plane_block)
 
     def test_volume_uses_same_additive_radial_depth_contract(self) -> None:
         start = self.volume.index("float samplePointVolumeShadow(")
