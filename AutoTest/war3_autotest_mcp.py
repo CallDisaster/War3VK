@@ -2999,6 +2999,168 @@ def _extract_json_object(text: str, marker: str = "const data =") -> Optional[Di
         return None
 
 
+def _extract_shadow_cull_observe_summary(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the complete, non-mutating Issue #5 observer gate.
+
+    These counters are aggregated inside the perf recorder for every recorded
+    Present.  Polling runtime_status.json cannot replace this summary because
+    it only exposes the most recent frame and can miss a one-frame mismatch.
+    """
+
+    def _integer(name: str) -> int:
+        try:
+            return int(data.get(name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    frame_count = _integer("frameCount")
+    terrain_candidates = _integer(
+        "semanticSceneTerrainBoundsCandidateCount"
+    )
+    terrain_would_cull = _integer(
+        "semanticSceneTerrainBoundsWouldCullCount"
+    )
+    union_candidates = _integer("semanticSceneUnionCullCandidateCount")
+    union_both_far = _integer(
+        "semanticSceneUnionCullBothFarWouldCullCount"
+    )
+    terrain_far_tests = max(0, terrain_candidates * 2)
+
+    shadow_budget = data.get("shadowBudgetSummary", {})
+    if not isinstance(shadow_budget, dict):
+        shadow_budget = {}
+    frames_incomplete = int(shadow_budget.get("framesIncomplete", 0) or 0)
+    frames_budget_exceeded = int(
+        shadow_budget.get("framesBudgetExceeded", 0) or 0
+    )
+
+    terrain_mode = _integer("semanticSceneTerrainBoundsCullMode")
+    union_mode = _integer("semanticSceneUnionCullMode")
+    union_observe_frames = _integer(
+        "semanticSceneUnionCullObserveFrameCount"
+    )
+    false_negative = _integer(
+        "semanticSceneUnionCullFalseNegativeCount"
+    )
+    false_positive = _integer(
+        "semanticSceneUnionCullFalsePositiveCount"
+    )
+    terrain_applied = _integer(
+        "semanticSceneTerrainBoundsAppliedCullCount"
+    )
+    object_applied = _integer(
+        "semanticSceneObjectBoundsAppliedCullCount"
+    )
+
+    minimum_frames = 10000
+    mode_is_observe = terrain_mode == 1 and union_mode == 1
+    enough_frames = (
+        frame_count >= minimum_frames and
+        union_observe_frames >= minimum_frames
+    )
+    observe_is_non_mutating = terrain_applied == 0 and object_applied == 0
+    correctness_closed = (
+        false_negative == 0 and
+        frames_incomplete == 0 and
+        frames_budget_exceeded == 0
+    )
+    admission_ready = (
+        mode_is_observe and enough_frames and observe_is_non_mutating and
+        correctness_closed and union_candidates > 0
+    )
+
+    return {
+        "minimumRequiredFrames": minimum_frames,
+        "frameCount": frame_count,
+        "terrain": {
+            "mode": terrain_mode,
+            "candidateCount": terrain_candidates,
+            "proofAcceptedCount": _integer(
+                "semanticSceneTerrainBoundsProofAcceptedCount"
+            ),
+            "failVisibleCount": _integer(
+                "semanticSceneTerrainBoundsFailVisibleCount"
+            ),
+            "wouldCullCount": terrain_would_cull,
+            "appliedCullCount": terrain_applied,
+            "c0WouldCullCount": _integer(
+                "semanticSceneTerrainBoundsC0WouldCullCount"
+            ),
+            "c1WouldCullCount": _integer(
+                "semanticSceneTerrainBoundsC1WouldCullCount"
+            ),
+            "c2WouldCullCount": _integer(
+                "semanticSceneTerrainBoundsC2WouldCullCount"
+            ),
+            "c3WouldCullCount": _integer(
+                "semanticSceneTerrainBoundsC3WouldCullCount"
+            ),
+            "farCascadeWouldCullPct": (
+                100.0 * terrain_would_cull / terrain_far_tests
+                if terrain_far_tests else 0.0
+            ),
+        },
+        "object": {
+            "candidateCount": _integer(
+                "semanticSceneObjectBoundsCandidateCount"
+            ),
+            "proofAcceptedCount": _integer(
+                "semanticSceneObjectBoundsProofAcceptedCount"
+            ),
+            "failVisibleCount": _integer(
+                "semanticSceneObjectBoundsFailVisibleCount"
+            ),
+            "wouldCullCount": _integer(
+                "semanticSceneObjectBoundsWouldCullCount"
+            ),
+            "appliedCullCount": object_applied,
+        },
+        "union": {
+            "mode": union_mode,
+            "observeFrameCount": union_observe_frames,
+            "candidateCount": union_candidates,
+            "proofAcceptedCount": _integer(
+                "semanticSceneUnionCullProofAcceptedCount"
+            ),
+            "failVisibleCount": _integer(
+                "semanticSceneUnionCullFailVisibleCount"
+            ),
+            "dynamicConservativeCount": _integer(
+                "semanticSceneUnionCullDynamicConservativeCount"
+            ),
+            "unknownOrStaleCount": _integer(
+                "semanticSceneUnionCullUnknownOrStaleCount"
+            ),
+            "c2WouldCullCount": _integer(
+                "semanticSceneUnionCullC2WouldCullCount"
+            ),
+            "c3WouldCullCount": _integer(
+                "semanticSceneUnionCullC3WouldCullCount"
+            ),
+            "bothFarWouldCullCount": union_both_far,
+            "bothFarWouldCullPct": (
+                100.0 * union_both_far / union_candidates
+                if union_candidates else 0.0
+            ),
+            "falseNegativeCount": false_negative,
+            "falsePositiveCount": false_positive,
+        },
+        "safety": {
+            "framesIncomplete": frames_incomplete,
+            "framesBudgetExceeded": frames_budget_exceeded,
+            "observeOutputMutationCount": terrain_applied + object_applied,
+        },
+        "gate": {
+            "modeIsObserve": mode_is_observe,
+            "enoughFrames": enough_frames,
+            "observeIsNonMutating": observe_is_non_mutating,
+            "correctnessClosed": correctness_closed,
+            "hasEligibleUnionCandidates": union_candidates > 0,
+            "consumeAdmissionReady": admission_ready,
+        },
+    }
+
+
 def _build_perf_section_breakdown(data: Dict[str, Any], top_n: int = 20) -> Dict[str, Any]:
     """
     从 perf report 的 sections 提取函数/节点级热点（CPU/GPU）。
@@ -3096,6 +3258,7 @@ def _read_perf_summary(
         "jank16": data.get("jank16", 0),
         "jank33": data.get("jank33", 0),
         "idleActiveOverlapLikely": data.get("idleActiveOverlapLikely", False),
+        "shadowCullObserveSummary": _extract_shadow_cull_observe_summary(data),
     }
 
     cycle = data.get("mainLoopCycle", {}) if isinstance(data, dict) else {}
