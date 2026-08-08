@@ -1992,6 +1992,16 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.semanticSceneTerrainBoundsC2WouldCullCount;
   agg.semanticSceneTerrainBoundsC3WouldCullCount +=
       stats.semanticSceneTerrainBoundsC3WouldCullCount;
+  agg.semanticSceneObjectBoundsCandidateCount +=
+      stats.semanticSceneObjectBoundsCandidateCount;
+  agg.semanticSceneObjectBoundsProofAcceptedCount +=
+      stats.semanticSceneObjectBoundsProofAcceptedCount;
+  agg.semanticSceneObjectBoundsFailVisibleCount +=
+      stats.semanticSceneObjectBoundsFailVisibleCount;
+  agg.semanticSceneObjectBoundsWouldCullCount +=
+      stats.semanticSceneObjectBoundsWouldCullCount;
+  agg.semanticSceneObjectBoundsAppliedCullCount +=
+      stats.semanticSceneObjectBoundsAppliedCullCount;
   agg.semanticSceneUnionCullMode = std::max(
       agg.semanticSceneUnionCullMode,
       uint64_t(stats.semanticSceneUnionCullMode));
@@ -6726,6 +6736,16 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneTerrainBoundsC2WouldCullCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsC3WouldCullCount\": "
        << shadowAgg.semanticSceneTerrainBoundsC3WouldCullCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsCandidateCount\": "
+       << shadowAgg.semanticSceneObjectBoundsCandidateCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsProofAcceptedCount\": "
+       << shadowAgg.semanticSceneObjectBoundsProofAcceptedCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsFailVisibleCount\": "
+       << shadowAgg.semanticSceneObjectBoundsFailVisibleCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsWouldCullCount\": "
+       << shadowAgg.semanticSceneObjectBoundsWouldCullCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsAppliedCullCount\": "
+       << shadowAgg.semanticSceneObjectBoundsAppliedCullCount << ",\n";
   json << "    \"semanticSceneUnionCullMode\": "
        << shadowAgg.semanticSceneUnionCullMode << ",\n";
   json << "    \"semanticSceneUnionCullObserveFrameCount\": "
@@ -8057,6 +8077,16 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneTerrainBoundsC2WouldCullCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsC3WouldCullCount\": "
        << shadowAgg.semanticSceneTerrainBoundsC3WouldCullCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsCandidateCount\": "
+       << shadowAgg.semanticSceneObjectBoundsCandidateCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsProofAcceptedCount\": "
+       << shadowAgg.semanticSceneObjectBoundsProofAcceptedCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsFailVisibleCount\": "
+       << shadowAgg.semanticSceneObjectBoundsFailVisibleCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsWouldCullCount\": "
+       << shadowAgg.semanticSceneObjectBoundsWouldCullCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsAppliedCullCount\": "
+       << shadowAgg.semanticSceneObjectBoundsAppliedCullCount << ",\n";
   json << "    \"semanticSceneUnionCullMode\": "
        << shadowAgg.semanticSceneUnionCullMode << ",\n";
   json << "    \"semanticSceneUnionCullObserveFrameCount\": "

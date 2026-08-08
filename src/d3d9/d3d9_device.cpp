@@ -18918,6 +18918,16 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
             rec.terrainBoundsC2WouldCullCount;
         cInput.scene.shadowStats.semanticSceneTerrainBoundsC3WouldCullCount =
             rec.terrainBoundsC3WouldCullCount;
+        cInput.scene.shadowStats.semanticSceneObjectBoundsCandidateCount =
+            rec.objectBoundsCandidateCount;
+        cInput.scene.shadowStats.semanticSceneObjectBoundsProofAcceptedCount =
+            rec.objectBoundsProofAcceptedCount;
+        cInput.scene.shadowStats.semanticSceneObjectBoundsFailVisibleCount =
+            rec.objectBoundsFailVisibleCount;
+        cInput.scene.shadowStats.semanticSceneObjectBoundsWouldCullCount =
+            rec.objectBoundsWouldCullCount;
+        cInput.scene.shadowStats.semanticSceneObjectBoundsAppliedCullCount =
+            rec.objectBoundsAppliedCullCount;
         cInput.scene.shadowStats.semanticSceneShadowMapPreparedDrawCount =
             rec.shadowMapPreparedDrawCount;
         cInput.scene.shadowStats.semanticSceneShadowMapAlphaTestPreparedCount =
@@ -30581,6 +30591,11 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
       cInput.scene.shadowStats.semanticSceneTerrainBoundsC1WouldCullCount = rec.terrainBoundsC1WouldCullCount;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsC2WouldCullCount = rec.terrainBoundsC2WouldCullCount;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsC3WouldCullCount = rec.terrainBoundsC3WouldCullCount;
+      cInput.scene.shadowStats.semanticSceneObjectBoundsCandidateCount = rec.objectBoundsCandidateCount;
+      cInput.scene.shadowStats.semanticSceneObjectBoundsProofAcceptedCount = rec.objectBoundsProofAcceptedCount;
+      cInput.scene.shadowStats.semanticSceneObjectBoundsFailVisibleCount = rec.objectBoundsFailVisibleCount;
+      cInput.scene.shadowStats.semanticSceneObjectBoundsWouldCullCount = rec.objectBoundsWouldCullCount;
+      cInput.scene.shadowStats.semanticSceneObjectBoundsAppliedCullCount = rec.objectBoundsAppliedCullCount;
       cInput.scene.shadowStats.semanticSceneShadowMapPreparedDrawCount = rec.shadowMapPreparedDrawCount;
       cInput.scene.shadowStats.semanticSceneShadowMapAlphaTestPreparedCount = rec.shadowMapAlphaTestPreparedCount;
       cInput.scene.shadowStats.semanticSceneShadowMapAlphaPromotedPreparedCount = rec.shadowMapAlphaPromotedPreparedCount;

@@ -3507,6 +3507,11 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   reconciliation.terrainBoundsC1WouldCullCount = 0u;
   reconciliation.terrainBoundsC2WouldCullCount = 0u;
   reconciliation.terrainBoundsC3WouldCullCount = 0u;
+  reconciliation.objectBoundsCandidateCount = 0u;
+  reconciliation.objectBoundsProofAcceptedCount = 0u;
+  reconciliation.objectBoundsFailVisibleCount = 0u;
+  reconciliation.objectBoundsWouldCullCount = 0u;
+  reconciliation.objectBoundsAppliedCullCount = 0u;
   reconciliation.unionCullMode = 0u;
   reconciliation.unionCullObserveFrameCount = 0u;
   reconciliation.unionCullCandidateCount = 0u;
@@ -3922,7 +3927,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   reconciliation.terrainBoundsCullMode =
       static_cast<uint32_t>(terrainBoundsCullMode);
 
-  const auto evaluateTerrainBoundsPolicy = [&](
+  const auto evaluateBoundsPolicy = [&](
       const War3ShadowCasterDraw& draw) {
     const bool finiteBounds =
         std::isfinite(draw.boundsCenter.x) &&
@@ -3942,19 +3947,12 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         draw.boundsRadius > 0.0f});
   };
 
-  auto intersectsCascade = [&](const War3ShadowCasterDraw &draw,
-                               uint32_t cascadeIdx,
-                               bool allowTerrainBoundsTest) -> bool {
+  auto intersectsCascadeUnchecked = [&](const War3ShadowCasterDraw &draw,
+                                        uint32_t cascadeIdx) -> bool {
     using war3::render::ObjectKind;
 
     const bool terrainDraw =
         draw.category == War3RenderState::StageCategory::Terrain;
-    if (terrainDraw &&
-        (!war3::internal::kShadowCascadeCullTerrainWithBounds ||
-         !allowTerrainBoundsTest ||
-         !evaluateTerrainBoundsPolicy(draw).mayCull)) {
-      return true;
-    }
     if (!(draw.boundsRadius > 0.0f))
       return true;
     // Phase 7.92：适配 War3 RTS 俯视镜头。cascade 0/1 覆盖玩家视野核心区域，
@@ -4028,6 +4026,24 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     return true;
   };
 
+  // Bounds mathematics and culling authority are deliberately separate.
+  // Guessed scene-node spheres remain useful for Observe telemetry, but can
+  // never remove a required caster.  This applies to buildings, trees and
+  // animated attachments as well as terrain.
+  const auto intersectsCascadeAuthorized = [&]
+      (const War3ShadowCasterDraw& draw,
+       uint32_t cascadeIdx,
+       const war3::render::War3ShadowBoundsCullDecision& boundsPolicy) {
+    const bool terrainDraw =
+        draw.category == War3RenderState::StageCategory::Terrain;
+    if (terrainDraw &&
+        !war3::internal::kShadowCascadeCullTerrainWithBounds)
+      return true;
+    if (!boundsPolicy.mayCull)
+      return true;
+    return intersectsCascadeUnchecked(draw, cascadeIdx);
+  };
+
   m_shadowSortedDrawIndicesScratch.clear();
   m_shadowSortedDrawIndicesScratch.reserve(casterCount);
   auto& sortedDrawIndices = m_shadowSortedDrawIndicesScratch;
@@ -4057,17 +4073,21 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     const auto& draw = *replayDraws[drawIndex];
     const bool terrainDraw =
         draw.category == War3RenderState::StageCategory::Terrain;
-    const auto terrainPolicy = terrainDraw
-        ? evaluateTerrainBoundsPolicy(draw)
-        : war3::render::War3ShadowBoundsCullDecision{};
+    const auto boundsPolicy = evaluateBoundsPolicy(draw);
     if (terrainDraw &&
         terrainBoundsCullMode !=
             war3::render::War3TerrainBoundsCullMode::Off) {
       ++reconciliation.terrainBoundsCandidateCount;
-      if (terrainPolicy.mayCull)
+      if (boundsPolicy.mayCull)
         ++reconciliation.terrainBoundsProofAcceptedCount;
       else
         ++reconciliation.terrainBoundsFailVisibleCount;
+    } else if (!terrainDraw && draw.boundsRadius > 0.0f) {
+      ++reconciliation.objectBoundsCandidateCount;
+      if (boundsPolicy.mayCull)
+        ++reconciliation.objectBoundsProofAcceptedCount;
+      else
+        ++reconciliation.objectBoundsFailVisibleCount;
     }
 
     uint8_t actualMask = 0u;
@@ -4076,8 +4096,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
           !terrainDraw ||
           terrainBoundsCullMode ==
               war3::render::War3TerrainBoundsCullMode::Off ||
-          intersectsCascade(draw, c, true);
-      if (terrainDraw && terrainPolicy.mayCull &&
+          intersectsCascadeAuthorized(draw, c, boundsPolicy);
+      if (terrainDraw && boundsPolicy.mayCull &&
           terrainBoundsCullMode !=
               war3::render::War3TerrainBoundsCullMode::Off &&
           !terrainWouldBeVisible) {
@@ -4096,13 +4116,20 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
           terrainBoundsCullMode ==
               war3::render::War3TerrainBoundsCullMode::Consume &&
           c >= 2u;
+      const bool objectWouldBeVisible = terrainDraw ||
+          intersectsCascadeUnchecked(draw, c);
+      if (!terrainDraw && c >= 2u && !objectWouldBeVisible) {
+        ++reconciliation.objectBoundsWouldCullCount;
+      }
       const bool actualVisible = terrainDraw
           ? !consumeTerrainCascade || terrainWouldBeVisible
-          : intersectsCascade(draw, c, false);
+          : intersectsCascadeAuthorized(draw, c, boundsPolicy);
       if (actualVisible) {
         actualMask |= uint8_t(1u << c);
       } else if (terrainDraw) {
         ++reconciliation.terrainBoundsAppliedCullCount;
+      } else {
+        ++reconciliation.objectBoundsAppliedCullCount;
       }
     }
     m_shadowCascadeVisibilityMasksScratch[drawIndex] = actualMask;
@@ -8553,6 +8580,16 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         reconciliation.terrainBoundsC2WouldCullCount;
     stats.semanticSceneTerrainBoundsC3WouldCullCount =
         reconciliation.terrainBoundsC3WouldCullCount;
+    stats.semanticSceneObjectBoundsCandidateCount =
+        reconciliation.objectBoundsCandidateCount;
+    stats.semanticSceneObjectBoundsProofAcceptedCount =
+        reconciliation.objectBoundsProofAcceptedCount;
+    stats.semanticSceneObjectBoundsFailVisibleCount =
+        reconciliation.objectBoundsFailVisibleCount;
+    stats.semanticSceneObjectBoundsWouldCullCount =
+        reconciliation.objectBoundsWouldCullCount;
+    stats.semanticSceneObjectBoundsAppliedCullCount =
+        reconciliation.objectBoundsAppliedCullCount;
     stats.semanticSceneUnionCullMode = reconciliation.unionCullMode;
     stats.semanticSceneUnionCullObserveFrameCount =
         reconciliation.unionCullObserveFrameCount;

@@ -1068,6 +1068,11 @@ namespace dxvk {
         uint32_t semanticSceneTerrainBoundsC1WouldCullCount = 0;
         uint32_t semanticSceneTerrainBoundsC2WouldCullCount = 0;
         uint32_t semanticSceneTerrainBoundsC3WouldCullCount = 0;
+        uint32_t semanticSceneObjectBoundsCandidateCount = 0;
+        uint32_t semanticSceneObjectBoundsProofAcceptedCount = 0;
+        uint32_t semanticSceneObjectBoundsFailVisibleCount = 0;
+        uint32_t semanticSceneObjectBoundsWouldCullCount = 0;
+        uint32_t semanticSceneObjectBoundsAppliedCullCount = 0;
         uint32_t semanticSceneShadowMapPreparedDrawCount = 0;         // 有效 prepared draw 数（排序/级联重放输入）
         uint32_t semanticSceneShadowMapAlphaTestPreparedCount = 0;    // prepare 后会执行 alpha discard 的 draw 数
         uint32_t semanticSceneShadowMapAlphaPromotedPreparedCount = 0; // alphaBlend+UV+diffuse promote 成 alpha shadow 的 draw 数

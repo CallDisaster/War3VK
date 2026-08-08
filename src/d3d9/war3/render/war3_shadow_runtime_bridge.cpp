@@ -4047,6 +4047,7 @@ void NoteShadowSceneStatsImpl(const War3ShadowCaptureStats& stats,
            value.semanticSceneShadowMapCascade0DrawnCount != 0u ||
            value.semanticSceneTerrainBoundsCullMode != 0u ||
            value.semanticSceneTerrainBoundsCandidateCount != 0u ||
+           value.semanticSceneObjectBoundsCandidateCount != 0u ||
            value.semanticSceneShadowMapSkinnedPreparedCount != 0u ||
            value.semanticSceneShadowMapSkinnedInvalidBufferCount != 0u ||
            value.semanticSceneShadowMapSkinnedInvalidPipelineCount != 0u ||
@@ -4129,6 +4130,16 @@ void NoteShadowSceneStatsImpl(const War3ShadowCaptureStats& stats,
           previous.semanticSceneTerrainBoundsC2WouldCullCount;
       merged.semanticSceneTerrainBoundsC3WouldCullCount =
           previous.semanticSceneTerrainBoundsC3WouldCullCount;
+      merged.semanticSceneObjectBoundsCandidateCount =
+          previous.semanticSceneObjectBoundsCandidateCount;
+      merged.semanticSceneObjectBoundsProofAcceptedCount =
+          previous.semanticSceneObjectBoundsProofAcceptedCount;
+      merged.semanticSceneObjectBoundsFailVisibleCount =
+          previous.semanticSceneObjectBoundsFailVisibleCount;
+      merged.semanticSceneObjectBoundsWouldCullCount =
+          previous.semanticSceneObjectBoundsWouldCullCount;
+      merged.semanticSceneObjectBoundsAppliedCullCount =
+          previous.semanticSceneObjectBoundsAppliedCullCount;
       merged.semanticSceneShadowMapPreparedDrawCount =
           previous.semanticSceneShadowMapPreparedDrawCount;
       merged.semanticSceneShadowMapAlphaTestPreparedCount =
@@ -6840,6 +6851,16 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneTerrainBoundsC2WouldCullCount;
     summary.semanticSceneTerrainBoundsC3WouldCullCount =
         g_shadowSceneStats.semanticSceneTerrainBoundsC3WouldCullCount;
+    summary.semanticSceneObjectBoundsCandidateCount =
+        g_shadowSceneStats.semanticSceneObjectBoundsCandidateCount;
+    summary.semanticSceneObjectBoundsProofAcceptedCount =
+        g_shadowSceneStats.semanticSceneObjectBoundsProofAcceptedCount;
+    summary.semanticSceneObjectBoundsFailVisibleCount =
+        g_shadowSceneStats.semanticSceneObjectBoundsFailVisibleCount;
+    summary.semanticSceneObjectBoundsWouldCullCount =
+        g_shadowSceneStats.semanticSceneObjectBoundsWouldCullCount;
+    summary.semanticSceneObjectBoundsAppliedCullCount =
+        g_shadowSceneStats.semanticSceneObjectBoundsAppliedCullCount;
     summary.semanticSceneShadowMapSkinnedCasterCount =
         g_shadowSceneStats.semanticSceneShadowMapSkinnedCasterCount;
     summary.semanticSceneShadowMapSkinnedPreparedCount =

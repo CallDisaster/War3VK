@@ -989,6 +989,11 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneTerrainBoundsC1WouldCullCount = 0;
   uint64_t semanticSceneTerrainBoundsC2WouldCullCount = 0;
   uint64_t semanticSceneTerrainBoundsC3WouldCullCount = 0;
+  uint64_t semanticSceneObjectBoundsCandidateCount = 0;
+  uint64_t semanticSceneObjectBoundsProofAcceptedCount = 0;
+  uint64_t semanticSceneObjectBoundsFailVisibleCount = 0;
+  uint64_t semanticSceneObjectBoundsWouldCullCount = 0;
+  uint64_t semanticSceneObjectBoundsAppliedCullCount = 0;
   uint64_t semanticSceneShadowMapSkinnedCasterCount = 0;
   uint64_t semanticSceneShadowMapSkinnedPreparedCount = 0;
   uint64_t semanticSceneShadowMapSkinnedInvalidBufferCount = 0;

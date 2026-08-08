@@ -66,6 +66,10 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   16/16 runnable 通过。部署 DLL SHA-256 为
   `9FE2F6132015D6BF5413B844915187F80D9F53E14F204564890CD9E71E12AED3`。详细证据见
   `docs/agent-history/2026-08-07-life-and-death-night-gate.md`。
+- 2026-08-09 已确认最终 CSM 曾允许非地形 C2/C3 使用未证明的猜测包围球剔除；当前本地候选统一使用
+  bounds provenance 授权，Unknown/Generic/Animated/Skinned 一律 fail-visible，并保留 would-cull 统计。
+  该候选会增加远级联工作，尚未部署或通过低视角物理 A/B，详见
+  `docs/agent-history/2026-08-09-object-bounds-fail-visible.md`。
 - 2026-08-09 已修复 Transparent Type0 建造附件在 Stage11 被错误拒绝的问题：Type0 现在拥有常驻的
   exact CurrentDraw 边界，使用子部件身份和同帧 VB/IB/UV/完整矩阵调色板，并正确支持
   `D3DVBF_0WEIGHTS` 索引蒙皮。用户已确认不死族 UBirth 建造阴影不再闪烁；该路径没有重新开启

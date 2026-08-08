@@ -70,6 +70,14 @@ class TerrainBoundsCullContracts(unittest.TestCase):
         self.assertIn("? !consumeTerrainCascade || terrainWouldBeVisible", shadow)
         self.assertIn("m_shadowCascadeVisibilityMasksScratch", shadow)
 
+    def test_non_terrain_far_cull_requires_the_same_bounds_proof(self) -> None:
+        shadow = SHADOW.read_text(encoding="utf-8")
+        self.assertIn("intersectsCascadeUnchecked", shadow)
+        self.assertIn("intersectsCascadeAuthorized", shadow)
+        self.assertIn("if (!boundsPolicy.mayCull)", shadow)
+        self.assertIn("semanticSceneObjectBoundsFailVisibleCount", shadow)
+        self.assertNotIn("intersectsCascade(draw, c, false)", shadow)
+
     def test_runtime_status_exposes_observe_and_consume_counts(self) -> None:
         control = CONTROL.read_text(encoding="utf-8")
         for token in (
@@ -79,6 +87,11 @@ class TerrainBoundsCullContracts(unittest.TestCase):
             "semanticSceneTerrainBoundsFailVisibleCount",
             "semanticSceneTerrainBoundsWouldCullCount",
             "semanticSceneTerrainBoundsAppliedCullCount",
+            "semanticSceneObjectBoundsCandidateCount",
+            "semanticSceneObjectBoundsProofAcceptedCount",
+            "semanticSceneObjectBoundsFailVisibleCount",
+            "semanticSceneObjectBoundsWouldCullCount",
+            "semanticSceneObjectBoundsAppliedCullCount",
         ):
             self.assertIn(token, control)
 

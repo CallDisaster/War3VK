@@ -330,6 +330,11 @@ namespace dxvk {
           uint32_t terrainBoundsC1WouldCullCount = 0;
           uint32_t terrainBoundsC2WouldCullCount = 0;
           uint32_t terrainBoundsC3WouldCullCount = 0;
+          uint32_t objectBoundsCandidateCount = 0;
+          uint32_t objectBoundsProofAcceptedCount = 0;
+          uint32_t objectBoundsFailVisibleCount = 0;
+          uint32_t objectBoundsWouldCullCount = 0;
+          uint32_t objectBoundsAppliedCullCount = 0;
           uint32_t unionCullMode = 0;
           uint32_t unionCullObserveFrameCount = 0;
           uint32_t unionCullCandidateCount = 0;

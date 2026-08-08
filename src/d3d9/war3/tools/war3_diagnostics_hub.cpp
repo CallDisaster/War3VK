@@ -1935,6 +1935,16 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       bridgeSummary.semanticSceneTerrainBoundsC2WouldCullCount;
   summary.semanticSceneTerrainBoundsC3WouldCullCount =
       bridgeSummary.semanticSceneTerrainBoundsC3WouldCullCount;
+  summary.semanticSceneObjectBoundsCandidateCount =
+      bridgeSummary.semanticSceneObjectBoundsCandidateCount;
+  summary.semanticSceneObjectBoundsProofAcceptedCount =
+      bridgeSummary.semanticSceneObjectBoundsProofAcceptedCount;
+  summary.semanticSceneObjectBoundsFailVisibleCount =
+      bridgeSummary.semanticSceneObjectBoundsFailVisibleCount;
+  summary.semanticSceneObjectBoundsWouldCullCount =
+      bridgeSummary.semanticSceneObjectBoundsWouldCullCount;
+  summary.semanticSceneObjectBoundsAppliedCullCount =
+      bridgeSummary.semanticSceneObjectBoundsAppliedCullCount;
   summary.semanticSceneShadowMapSkinnedCasterCount =
       bridgeSummary.semanticSceneShadowMapSkinnedCasterCount;
   summary.semanticSceneShadowMapSkinnedPreparedCount =
@@ -3046,6 +3056,16 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.semanticSceneTerrainBoundsC2WouldCullCount},
         {"semanticSceneTerrainBoundsC3WouldCullCount",
          snapshot.shadow.semanticSceneTerrainBoundsC3WouldCullCount},
+        {"semanticSceneObjectBoundsCandidateCount",
+         snapshot.shadow.semanticSceneObjectBoundsCandidateCount},
+        {"semanticSceneObjectBoundsProofAcceptedCount",
+         snapshot.shadow.semanticSceneObjectBoundsProofAcceptedCount},
+        {"semanticSceneObjectBoundsFailVisibleCount",
+         snapshot.shadow.semanticSceneObjectBoundsFailVisibleCount},
+        {"semanticSceneObjectBoundsWouldCullCount",
+         snapshot.shadow.semanticSceneObjectBoundsWouldCullCount},
+        {"semanticSceneObjectBoundsAppliedCullCount",
+         snapshot.shadow.semanticSceneObjectBoundsAppliedCullCount},
         {"semanticSceneShadowMapSkinnedCasterCount",
          snapshot.shadow.semanticSceneShadowMapSkinnedCasterCount},
         {"semanticSceneShadowMapSkinnedPreparedCount",
