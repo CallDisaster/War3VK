@@ -71,6 +71,10 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   `D3DVBF_0WEIGHTS` 索引蒙皮。用户已确认不死族 UBirth 建造阴影不再闪烁；该路径没有重新开启
   全局跨帧 VB/IB cache。详细证据见
   `docs/agent-history/2026-08-09-stage11-type0-correctness-baseline.md`。
+- Issue #5 的地形级联剔除现为默认关闭的 `Off / Observe / Consume` 合同；只有同帧、同代且来自
+  已验证 position span 的精确 bounds 才能授权 C2/C3 剔除，猜测或陈旧 bounds 一律 fail-visible。
+  当前仅完成离线验证，未部署且未通过实机 A/B；详见
+  `docs/agent-history/2026-08-09-issue5-terrain-bounds-observer.md`。
 - 1.2.0 的发布范围限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍会造成
   性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；点光开启点阴影后，部分
   地面/角度仍有摩尔纹或带状伪影。README/CHANGELOG 必须保留这两项已知问题，后续不得描述为已修复。

@@ -320,6 +320,16 @@ namespace dxvk {
           uint32_t shadowMapCascade1CulledCount = 0;
           uint32_t shadowMapCascade2CulledCount = 0;
           uint32_t shadowMapCascade3CulledCount = 0;
+          uint32_t terrainBoundsCullMode = 0;
+          uint32_t terrainBoundsCandidateCount = 0;
+          uint32_t terrainBoundsProofAcceptedCount = 0;
+          uint32_t terrainBoundsFailVisibleCount = 0;
+          uint32_t terrainBoundsWouldCullCount = 0;
+          uint32_t terrainBoundsAppliedCullCount = 0;
+          uint32_t terrainBoundsC0WouldCullCount = 0;
+          uint32_t terrainBoundsC1WouldCullCount = 0;
+          uint32_t terrainBoundsC2WouldCullCount = 0;
+          uint32_t terrainBoundsC3WouldCullCount = 0;
           uint32_t unionCullMode = 0;
           uint32_t unionCullObserveFrameCount = 0;
           uint32_t unionCullCandidateCount = 0;
@@ -591,6 +601,7 @@ namespace dxvk {
         std::unordered_map<ShadowCasterPipelineKey, ShadowCasterPipeline, DxvkHash, DxvkEq> m_shadowCasterPipelines;
         std::vector<PreparedShadowCaster> m_shadowPreparedScratch;
         std::vector<uint32_t> m_shadowSortedDrawIndicesScratch;
+        std::vector<uint8_t> m_shadowCascadeVisibilityMasksScratch;
         std::vector<uint32_t> m_shadowDrawIndicesScratch;
         std::vector<uint32_t> m_shadowTerrainMaskDrawIndicesScratch;
 

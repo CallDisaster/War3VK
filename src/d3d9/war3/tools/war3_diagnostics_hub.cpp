@@ -1902,6 +1902,26 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       bridgeSummary.semanticSceneShadowMapDrawnCasters;
   summary.semanticSceneShadowMapCascadeCulledCount =
       bridgeSummary.semanticSceneShadowMapCascadeCulledCount;
+  summary.semanticSceneTerrainBoundsCullMode =
+      bridgeSummary.semanticSceneTerrainBoundsCullMode;
+  summary.semanticSceneTerrainBoundsCandidateCount =
+      bridgeSummary.semanticSceneTerrainBoundsCandidateCount;
+  summary.semanticSceneTerrainBoundsProofAcceptedCount =
+      bridgeSummary.semanticSceneTerrainBoundsProofAcceptedCount;
+  summary.semanticSceneTerrainBoundsFailVisibleCount =
+      bridgeSummary.semanticSceneTerrainBoundsFailVisibleCount;
+  summary.semanticSceneTerrainBoundsWouldCullCount =
+      bridgeSummary.semanticSceneTerrainBoundsWouldCullCount;
+  summary.semanticSceneTerrainBoundsAppliedCullCount =
+      bridgeSummary.semanticSceneTerrainBoundsAppliedCullCount;
+  summary.semanticSceneTerrainBoundsC0WouldCullCount =
+      bridgeSummary.semanticSceneTerrainBoundsC0WouldCullCount;
+  summary.semanticSceneTerrainBoundsC1WouldCullCount =
+      bridgeSummary.semanticSceneTerrainBoundsC1WouldCullCount;
+  summary.semanticSceneTerrainBoundsC2WouldCullCount =
+      bridgeSummary.semanticSceneTerrainBoundsC2WouldCullCount;
+  summary.semanticSceneTerrainBoundsC3WouldCullCount =
+      bridgeSummary.semanticSceneTerrainBoundsC3WouldCullCount;
   summary.semanticSceneShadowMapSkinnedCasterCount =
       bridgeSummary.semanticSceneShadowMapSkinnedCasterCount;
   summary.semanticSceneShadowMapSkinnedPreparedCount =
@@ -2993,6 +3013,26 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.semanticSceneShadowMapDrawnCasters},
         {"semanticSceneShadowMapCascadeCulledCount",
          snapshot.shadow.semanticSceneShadowMapCascadeCulledCount},
+        {"semanticSceneTerrainBoundsCullMode",
+         snapshot.shadow.semanticSceneTerrainBoundsCullMode},
+        {"semanticSceneTerrainBoundsCandidateCount",
+         snapshot.shadow.semanticSceneTerrainBoundsCandidateCount},
+        {"semanticSceneTerrainBoundsProofAcceptedCount",
+         snapshot.shadow.semanticSceneTerrainBoundsProofAcceptedCount},
+        {"semanticSceneTerrainBoundsFailVisibleCount",
+         snapshot.shadow.semanticSceneTerrainBoundsFailVisibleCount},
+        {"semanticSceneTerrainBoundsWouldCullCount",
+         snapshot.shadow.semanticSceneTerrainBoundsWouldCullCount},
+        {"semanticSceneTerrainBoundsAppliedCullCount",
+         snapshot.shadow.semanticSceneTerrainBoundsAppliedCullCount},
+        {"semanticSceneTerrainBoundsC0WouldCullCount",
+         snapshot.shadow.semanticSceneTerrainBoundsC0WouldCullCount},
+        {"semanticSceneTerrainBoundsC1WouldCullCount",
+         snapshot.shadow.semanticSceneTerrainBoundsC1WouldCullCount},
+        {"semanticSceneTerrainBoundsC2WouldCullCount",
+         snapshot.shadow.semanticSceneTerrainBoundsC2WouldCullCount},
+        {"semanticSceneTerrainBoundsC3WouldCullCount",
+         snapshot.shadow.semanticSceneTerrainBoundsC3WouldCullCount},
         {"semanticSceneShadowMapSkinnedCasterCount",
          snapshot.shadow.semanticSceneShadowMapSkinnedCasterCount},
         {"semanticSceneShadowMapSkinnedPreparedCount",

@@ -4045,6 +4045,8 @@ void NoteShadowSceneStatsImpl(const War3ShadowCaptureStats& stats,
            value.semanticSceneShadowMapDynamicPreparedCount != 0u ||
            value.semanticSceneShadowMapStaticPreparedCount != 0u ||
            value.semanticSceneShadowMapCascade0DrawnCount != 0u ||
+           value.semanticSceneTerrainBoundsCullMode != 0u ||
+           value.semanticSceneTerrainBoundsCandidateCount != 0u ||
            value.semanticSceneShadowMapSkinnedPreparedCount != 0u ||
            value.semanticSceneShadowMapSkinnedInvalidBufferCount != 0u ||
            value.semanticSceneShadowMapSkinnedInvalidPipelineCount != 0u ||
@@ -4107,6 +4109,26 @@ void NoteShadowSceneStatsImpl(const War3ShadowCaptureStats& stats,
           previous.semanticSceneShadowMapDrawnCasters;
       merged.semanticSceneShadowMapCascadeCulledCount =
           previous.semanticSceneShadowMapCascadeCulledCount;
+      merged.semanticSceneTerrainBoundsCullMode =
+          previous.semanticSceneTerrainBoundsCullMode;
+      merged.semanticSceneTerrainBoundsCandidateCount =
+          previous.semanticSceneTerrainBoundsCandidateCount;
+      merged.semanticSceneTerrainBoundsProofAcceptedCount =
+          previous.semanticSceneTerrainBoundsProofAcceptedCount;
+      merged.semanticSceneTerrainBoundsFailVisibleCount =
+          previous.semanticSceneTerrainBoundsFailVisibleCount;
+      merged.semanticSceneTerrainBoundsWouldCullCount =
+          previous.semanticSceneTerrainBoundsWouldCullCount;
+      merged.semanticSceneTerrainBoundsAppliedCullCount =
+          previous.semanticSceneTerrainBoundsAppliedCullCount;
+      merged.semanticSceneTerrainBoundsC0WouldCullCount =
+          previous.semanticSceneTerrainBoundsC0WouldCullCount;
+      merged.semanticSceneTerrainBoundsC1WouldCullCount =
+          previous.semanticSceneTerrainBoundsC1WouldCullCount;
+      merged.semanticSceneTerrainBoundsC2WouldCullCount =
+          previous.semanticSceneTerrainBoundsC2WouldCullCount;
+      merged.semanticSceneTerrainBoundsC3WouldCullCount =
+          previous.semanticSceneTerrainBoundsC3WouldCullCount;
       merged.semanticSceneShadowMapPreparedDrawCount =
           previous.semanticSceneShadowMapPreparedDrawCount;
       merged.semanticSceneShadowMapAlphaTestPreparedCount =
@@ -6798,6 +6820,26 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneShadowMapDrawnCasters;
     summary.semanticSceneShadowMapCascadeCulledCount =
         g_shadowSceneStats.semanticSceneShadowMapCascadeCulledCount;
+    summary.semanticSceneTerrainBoundsCullMode =
+        g_shadowSceneStats.semanticSceneTerrainBoundsCullMode;
+    summary.semanticSceneTerrainBoundsCandidateCount =
+        g_shadowSceneStats.semanticSceneTerrainBoundsCandidateCount;
+    summary.semanticSceneTerrainBoundsProofAcceptedCount =
+        g_shadowSceneStats.semanticSceneTerrainBoundsProofAcceptedCount;
+    summary.semanticSceneTerrainBoundsFailVisibleCount =
+        g_shadowSceneStats.semanticSceneTerrainBoundsFailVisibleCount;
+    summary.semanticSceneTerrainBoundsWouldCullCount =
+        g_shadowSceneStats.semanticSceneTerrainBoundsWouldCullCount;
+    summary.semanticSceneTerrainBoundsAppliedCullCount =
+        g_shadowSceneStats.semanticSceneTerrainBoundsAppliedCullCount;
+    summary.semanticSceneTerrainBoundsC0WouldCullCount =
+        g_shadowSceneStats.semanticSceneTerrainBoundsC0WouldCullCount;
+    summary.semanticSceneTerrainBoundsC1WouldCullCount =
+        g_shadowSceneStats.semanticSceneTerrainBoundsC1WouldCullCount;
+    summary.semanticSceneTerrainBoundsC2WouldCullCount =
+        g_shadowSceneStats.semanticSceneTerrainBoundsC2WouldCullCount;
+    summary.semanticSceneTerrainBoundsC3WouldCullCount =
+        g_shadowSceneStats.semanticSceneTerrainBoundsC3WouldCullCount;
     summary.semanticSceneShadowMapSkinnedCasterCount =
         g_shadowSceneStats.semanticSceneShadowMapSkinnedCasterCount;
     summary.semanticSceneShadowMapSkinnedPreparedCount =

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "war3/render/war3_render_state.h"
+#include "war3/render/war3_shadow_bounds_policy.h"
 #include "war3/gpu_skin/war3_gpu_skin_types.h"
 
 #include "../dxvk/dxvk_buffer.h"
@@ -232,6 +233,13 @@ namespace dxvk {
         // 这是保守优化：半径偏大只会减少剔除命中率，不会造成阴影缺失。
         Vector4 boundsCenter = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
         float boundsRadius = 0.0f; // 0 表示未提供 bounds（不做剔除）
+        war3::render::War3ShadowBoundsProvenance boundsProvenance =
+            war3::render::War3ShadowBoundsProvenance::Unknown;
+        uint64_t boundsSourceGeneration = 0u;
+        uint64_t boundsFrameSerial = 0u;
+        bool boundsSourceWasSkinned = false;
+        bool boundsFrameLocalDynamic = false;
+        bool boundsAnimatedAttachment = false;
     };
 
     // fullVertexDomainFallback describes how much backing storage had to be
@@ -1030,6 +1038,16 @@ namespace dxvk {
         uint32_t semanticSceneReplayDrawsCount = 0;                   // replayDraws count 本帧
         uint32_t semanticSceneShadowMapDrawnCasters = 0;              // renderShadowMap 实际 draw 调用数
         uint32_t semanticSceneShadowMapCascadeCulledCount = 0;        // cascade cull 跳过数
+        uint32_t semanticSceneTerrainBoundsCullMode = 0;
+        uint32_t semanticSceneTerrainBoundsCandidateCount = 0;
+        uint32_t semanticSceneTerrainBoundsProofAcceptedCount = 0;
+        uint32_t semanticSceneTerrainBoundsFailVisibleCount = 0;
+        uint32_t semanticSceneTerrainBoundsWouldCullCount = 0;
+        uint32_t semanticSceneTerrainBoundsAppliedCullCount = 0;
+        uint32_t semanticSceneTerrainBoundsC0WouldCullCount = 0;
+        uint32_t semanticSceneTerrainBoundsC1WouldCullCount = 0;
+        uint32_t semanticSceneTerrainBoundsC2WouldCullCount = 0;
+        uint32_t semanticSceneTerrainBoundsC3WouldCullCount = 0;
         uint32_t semanticSceneShadowMapPreparedDrawCount = 0;         // 有效 prepared draw 数（排序/级联重放输入）
         uint32_t semanticSceneShadowMapAlphaTestPreparedCount = 0;    // prepare 后会执行 alpha discard 的 draw 数
         uint32_t semanticSceneShadowMapAlphaPromotedPreparedCount = 0; // alphaBlend+UV+diffuse promote 成 alpha shadow 的 draw 数

@@ -3036,13 +3036,23 @@ inline bool War3ShadowCapturePostBreakdownRuntime() {
   return s_enabled;
 }
 
-inline bool War3TerrainBoundsCullRuntime() {
-  // Exact same-DLL A/B gate for the S1 terrain CPU bounds scan and the matching
-  // cascade rejection policy. Disabling it is visually conservative: terrain
-  // casters are submitted to every cascade instead of risking a false reject.
-  static const bool s_enabled =
-      War3GetEnvU32("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", 0u) != 0u;
-  return s_enabled;
+inline dxvk::war3::render::War3TerrainBoundsCullMode
+War3TerrainBoundsCullModeRuntime() {
+  static const auto s_mode = [] {
+    const char* mode = std::getenv("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE");
+    if (mode != nullptr && mode[0] != '\0') {
+      return static_cast<dxvk::war3::render::War3TerrainBoundsCullMode>(
+          std::min<uint32_t>(War3GetEnvU32(
+                                 "DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", 0u),
+                             2u));
+    }
+    // Compatibility: the old boolean explicitly requested the historical
+    // direct-consume experiment.
+    return War3GetEnvU32("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", 0u) != 0u
+        ? dxvk::war3::render::War3TerrainBoundsCullMode::Consume
+        : dxvk::war3::render::War3TerrainBoundsCullMode::Off;
+  }();
+  return s_mode;
 }
 
 inline bool War3LegacyPerDrawSemanticScopesRuntime() {
@@ -18791,6 +18801,27 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
             rec.shadowMapDrawnCasters;
         cInput.scene.shadowStats.semanticSceneShadowMapCascadeCulledCount =
             rec.cascadeCulledCount;
+        cInput.scene.shadowStats.semanticSceneTerrainBoundsCullMode =
+            rec.terrainBoundsCullMode;
+        cInput.scene.shadowStats.semanticSceneTerrainBoundsCandidateCount =
+            rec.terrainBoundsCandidateCount;
+        cInput.scene.shadowStats
+            .semanticSceneTerrainBoundsProofAcceptedCount =
+            rec.terrainBoundsProofAcceptedCount;
+        cInput.scene.shadowStats.semanticSceneTerrainBoundsFailVisibleCount =
+            rec.terrainBoundsFailVisibleCount;
+        cInput.scene.shadowStats.semanticSceneTerrainBoundsWouldCullCount =
+            rec.terrainBoundsWouldCullCount;
+        cInput.scene.shadowStats.semanticSceneTerrainBoundsAppliedCullCount =
+            rec.terrainBoundsAppliedCullCount;
+        cInput.scene.shadowStats.semanticSceneTerrainBoundsC0WouldCullCount =
+            rec.terrainBoundsC0WouldCullCount;
+        cInput.scene.shadowStats.semanticSceneTerrainBoundsC1WouldCullCount =
+            rec.terrainBoundsC1WouldCullCount;
+        cInput.scene.shadowStats.semanticSceneTerrainBoundsC2WouldCullCount =
+            rec.terrainBoundsC2WouldCullCount;
+        cInput.scene.shadowStats.semanticSceneTerrainBoundsC3WouldCullCount =
+            rec.terrainBoundsC3WouldCullCount;
         cInput.scene.shadowStats.semanticSceneShadowMapPreparedDrawCount =
             rec.shadowMapPreparedDrawCount;
         cInput.scene.shadowStats.semanticSceneShadowMapAlphaTestPreparedCount =
@@ -30207,6 +30238,16 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
       cInput.scene.shadowStats.semanticSceneReplayDrawsCount = rec.replayDrawsCount;
       cInput.scene.shadowStats.semanticSceneShadowMapDrawnCasters = rec.shadowMapDrawnCasters;
       cInput.scene.shadowStats.semanticSceneShadowMapCascadeCulledCount = rec.cascadeCulledCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsCullMode = rec.terrainBoundsCullMode;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsCandidateCount = rec.terrainBoundsCandidateCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsProofAcceptedCount = rec.terrainBoundsProofAcceptedCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsFailVisibleCount = rec.terrainBoundsFailVisibleCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsWouldCullCount = rec.terrainBoundsWouldCullCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsAppliedCullCount = rec.terrainBoundsAppliedCullCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsC0WouldCullCount = rec.terrainBoundsC0WouldCullCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsC1WouldCullCount = rec.terrainBoundsC1WouldCullCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsC2WouldCullCount = rec.terrainBoundsC2WouldCullCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsC3WouldCullCount = rec.terrainBoundsC3WouldCullCount;
       cInput.scene.shadowStats.semanticSceneShadowMapPreparedDrawCount = rec.shadowMapPreparedDrawCount;
       cInput.scene.shadowStats.semanticSceneShadowMapAlphaTestPreparedCount = rec.shadowMapAlphaTestPreparedCount;
       cInput.scene.shadowStats.semanticSceneShadowMapAlphaPromotedPreparedCount = rec.shadowMapAlphaPromotedPreparedCount;
@@ -46600,6 +46641,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   shadowCaptureBoundsTiming.enter(War3ShadowCaptureBoundsPhase::ObjectBounds);
   float estimatedBoundsRadius = 0.0f;
   Vector4 estimatedBoundsCenter = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+  uint64_t estimatedBoundsSourceGeneration = 0u;
+  bool estimatedBoundsExactCurrentWorld = false;
   if (cat == War3RenderState::StageCategory::WorldObject ||
       cat == War3RenderState::StageCategory::Effect) {
       estimatedBoundsRadius = estimateObjectBaseRadius();
@@ -46623,7 +46666,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
   } else if (terrainS1Caster &&
              dxvk::war3::internal::kShadowCascadeCullTerrainWithBounds &&
-             War3TerrainBoundsCullRuntime()) {
+             War3TerrainBoundsCullModeRuntime() !=
+                 dxvk::war3::render::War3TerrainBoundsCullMode::Off) {
     shadowCaptureBoundsTiming.enter(
         War3ShadowCaptureBoundsPhase::TerrainBoundsKey);
     War3LocalGeometryBounds terrainBounds = {};
@@ -46751,6 +46795,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                                           localCenter, localRadius);
         estimatedBoundsCenter = boundsProbe.boundsCenter;
         estimatedBoundsRadius = boundsProbe.boundsRadius;
+        estimatedBoundsSourceGeneration =
+            terrainPositionReadableSpan.contentGeneration;
+        estimatedBoundsExactCurrentWorld =
+            static_cast<bool>(terrainPositionReadableSpan);
       }
     }
   }
@@ -47631,6 +47679,19 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   if (terrainS1Caster && estimatedBoundsRadius > 0.0f) {
     draw.boundsCenter = estimatedBoundsCenter;
     draw.boundsRadius = estimatedBoundsRadius;
+    draw.boundsProvenance =
+        estimatedBoundsExactCurrentWorld &&
+                estimatedBoundsSourceGeneration != 0u
+            ? dxvk::war3::render::
+                  War3ShadowBoundsProvenance::ExactCurrentWorld
+            : dxvk::war3::render::War3ShadowBoundsProvenance::Unknown;
+    draw.boundsSourceGeneration = estimatedBoundsSourceGeneration;
+    draw.boundsFrameSerial = estimatedBoundsExactCurrentWorld
+        ? m_war3ShadowPersistentFrameSerial + 1u
+        : 0u;
+    draw.boundsSourceWasSkinned = false;
+    draw.boundsFrameLocalDynamic = posDynamic || DynamicSysmemVBOs;
+    draw.boundsAnimatedAttachment = false;
   }
   if (!finalizeShadowDrawCommon(draw))
     return;

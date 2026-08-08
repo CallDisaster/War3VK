@@ -1,4 +1,5 @@
 #include "../war3_union_consumer_visibility.h"
+#include "../war3_shadow_bounds_policy.h"
 
 #include <cstdio>
 #include <limits>
@@ -207,6 +208,47 @@ void TestOffAndUnprovenClassificationFailVisible() {
   CHECK(result.effectiveVisibleMask == query.requestedMask);
 }
 
+void TestBoundsProvenanceRequiresExactCurrentEvidence() {
+  War3ShadowBoundsCullEvidence evidence = {};
+  evidence.provenance = War3ShadowBoundsProvenance::GenericDiagnostic;
+  evidence.sourceGeneration = 9u;
+  evidence.boundsFrameSerial = 17u;
+  evidence.currentFrameSerial = 17u;
+  evidence.identityProven = true;
+  evidence.finiteBounds = true;
+  evidence.positiveRadius = true;
+  auto result = War3EvaluateBoundsCullEvidence(evidence);
+  CHECK(!result.mayCull);
+  CHECK(result.rejectReason ==
+        War3ShadowBoundsCullRejectReason::DiagnosticOnly);
+
+  evidence.provenance = War3ShadowBoundsProvenance::ExactCurrentWorld;
+  evidence.boundsFrameSerial = 16u;
+  result = War3EvaluateBoundsCullEvidence(evidence);
+  CHECK(!result.mayCull);
+  CHECK(result.rejectReason ==
+        War3ShadowBoundsCullRejectReason::FrameGenerationStale);
+
+  evidence.boundsFrameSerial = 17u;
+  evidence.frameLocalDynamic = true;
+  result = War3EvaluateBoundsCullEvidence(evidence);
+  CHECK(result.mayCull);
+  CHECK(result.rejectReason == War3ShadowBoundsCullRejectReason::None);
+
+  evidence.sourceWasSkinned = true;
+  result = War3EvaluateBoundsCullEvidence(evidence);
+  CHECK(!result.mayCull);
+  CHECK(result.rejectReason ==
+        War3ShadowBoundsCullRejectReason::DynamicOrSkinned);
+
+  evidence.sourceWasSkinned = false;
+  evidence.animatedAttachment = true;
+  result = War3EvaluateBoundsCullEvidence(evidence);
+  CHECK(!result.mayCull);
+  CHECK(result.rejectReason ==
+        War3ShadowBoundsCullRejectReason::AnimatedAttachment);
+}
+
 } // namespace
 
 int main() {
@@ -217,6 +259,7 @@ int main() {
   TestUnknownAndStaleInputsFailVisible();
   TestNonFiniteAndDegenerateInputsFailVisible();
   TestOffAndUnprovenClassificationFailVisible();
+  TestBoundsProvenanceRequiresExactCurrentEvidence();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d union visibility checks failed\n", g_failures);

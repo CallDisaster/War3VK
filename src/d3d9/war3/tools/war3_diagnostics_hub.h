@@ -596,6 +596,16 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t semanticSceneReplayDrawsCount = 0;
   uint64_t semanticSceneShadowMapDrawnCasters = 0;
   uint64_t semanticSceneShadowMapCascadeCulledCount = 0;
+  uint64_t semanticSceneTerrainBoundsCullMode = 0;
+  uint64_t semanticSceneTerrainBoundsCandidateCount = 0;
+  uint64_t semanticSceneTerrainBoundsProofAcceptedCount = 0;
+  uint64_t semanticSceneTerrainBoundsFailVisibleCount = 0;
+  uint64_t semanticSceneTerrainBoundsWouldCullCount = 0;
+  uint64_t semanticSceneTerrainBoundsAppliedCullCount = 0;
+  uint64_t semanticSceneTerrainBoundsC0WouldCullCount = 0;
+  uint64_t semanticSceneTerrainBoundsC1WouldCullCount = 0;
+  uint64_t semanticSceneTerrainBoundsC2WouldCullCount = 0;
+  uint64_t semanticSceneTerrainBoundsC3WouldCullCount = 0;
   uint64_t semanticSceneShadowMapSkinnedCasterCount = 0;
   uint64_t semanticSceneShadowMapSkinnedPreparedCount = 0;
   uint64_t semanticSceneShadowMapSkinnedInvalidBufferCount = 0;
