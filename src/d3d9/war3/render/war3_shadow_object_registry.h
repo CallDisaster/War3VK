@@ -107,6 +107,7 @@ public:
 
   void beginFrame();
   void endFrame();
+  void resetMapSession();
 
   void noteRenderObject(const RenderObjectInfo &info);
   void noteRenderObjectsBatch(

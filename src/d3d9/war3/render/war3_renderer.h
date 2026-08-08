@@ -16,6 +16,7 @@ public:
     // 帧生命周期
     void BeginFrame();
     void EndFrame();
+    void ResetMapSession();
     void PublishSemanticRegistriesForScene();
 
     // 世界对象收集

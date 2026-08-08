@@ -16,6 +16,12 @@ namespace war3 {
 namespace model {
 
 namespace {
+template <typename Map>
+void ClearRegistryMap(Map& map) {
+  Map empty;
+  map.swap(empty);
+}
+
 uint64_t Fnv1a64(const void *data, size_t size,
                  uint64_t seed = 1469598103934665603ull) {
   const auto *bytes = static_cast<const uint8_t *>(data);
@@ -504,6 +510,14 @@ void ModelRegistry::endFrame() {
     it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
 }
 
+void ModelRegistry::resetMapSession() {
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  ClearRegistryMap(m_bySprite);
+  ClearRegistryMap(m_byRuntimeModel);
+  ClearRegistryMap(m_byPath);
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
+}
+
 void ModelRegistry::recordSpriteModelPath(void *spritePtr, const char *modelPath,
                                           uint32_t modelType, uint32_t flags) {
   if (!spritePtr || !modelPath || !modelPath[0])
@@ -662,6 +676,25 @@ void ModelInstanceRegistry::endFrame() {
     it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
   for (auto &it : m_byHandle)
     it.second.lastSeenFrame = m_frameNumber.load(std::memory_order_relaxed);
+}
+
+void ModelInstanceRegistry::resetMapSession() {
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
+  ClearRegistryMap(m_byWorldObjectEntry);
+  ClearRegistryMap(m_bySceneNode);
+  ClearRegistryMap(m_byUnitPtr);
+  ClearRegistryMap(m_bySpritePtr);
+  ClearRegistryMap(m_byRuntimeModel);
+  ClearRegistryMap(m_runtimeOwnerByRuntimeModel);
+  ClearRegistryMap(m_bySourceObject);
+  ClearRegistryMap(m_bySourceSpriteObject);
+  ClearRegistryMap(m_byHandle);
+  m_trackingRuntimeBoundCount = 0u;
+  m_trackingCompleteIdentityCount = 0u;
+  m_sameFrameIdentityDedupStats = {};
+  m_lastSceneCollectorBatchFrame = 0u;
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void ModelInstanceRegistry::storeRuntimeModelRecordLocked(
@@ -1705,6 +1738,17 @@ void PoseRegistry::endFrame() {
   std::unique_lock<std::shared_mutex> lock(m_mutex);
 }
 
+void PoseRegistry::resetMapSession() {
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  ClearRegistryMap(m_byRuntimeModel);
+  ClearRegistryMap(m_bySceneNode);
+  ClearRegistryMap(m_byUnitPtr);
+  m_trackingReadyPoseCount = 0u;
+  m_trackingSpriteFramePoseCount = 0u;
+  m_trackingMatrixPaletteCount = 0u;
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
+}
+
 void PoseRegistry::storeRuntimeModelRecordLocked(const PoseRecord& record) {
   assert(record.runtimeModelPtr != nullptr);
   if (record.runtimeModelPtr == nullptr)
@@ -2063,6 +2107,18 @@ void AttachmentRigidRegistry::beginFrame() {
 
 void AttachmentRigidRegistry::endFrame() {
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+}
+
+void AttachmentRigidRegistry::resetMapSession() {
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  ClearRegistryMap(m_byChildRuntimeModel);
+  ClearRegistryMap(m_byOwnerRuntimeModel);
+  ClearRegistryMap(m_byRootRuntimeModel);
+  ClearRegistryMap(m_byWorldObjectEntry);
+  ClearRegistryMap(m_bySceneNode);
+  ClearRegistryMap(m_byUnitPtr);
+  ClearRegistryMap(m_byHandle);
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void AttachmentRigidRegistry::storeRecord(

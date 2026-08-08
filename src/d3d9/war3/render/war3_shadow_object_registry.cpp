@@ -11,6 +11,12 @@ namespace war3 {
 namespace render {
 
 namespace {
+template <typename Map>
+void ClearRegistryMap(Map& map) {
+  Map empty;
+  map.swap(empty);
+}
+
 bool LooksLikeRuntimeModelPtr(void* candidate) {
   if (candidate == nullptr)
     return false;
@@ -217,6 +223,20 @@ void ShadowObjectRegistry::beginFrame() {
 
 void ShadowObjectRegistry::endFrame() {
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+}
+
+void ShadowObjectRegistry::resetMapSession() {
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
+  ClearRegistryMap(m_byWorldObjectEntry);
+  ClearRegistryMap(m_bySceneNode);
+  ClearRegistryMap(m_byUnitPtr);
+  ClearRegistryMap(m_bySpritePtr);
+  ClearRegistryMap(m_byRuntimeModel);
+  ClearRegistryMap(m_byHandle);
+  m_sameFrameIdentityDedupStats = {};
+  m_lastSceneCollectorBatchFrame = 0u;
+  m_frameNumber.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void ShadowObjectRegistry::storeRecord(const ShadowObjectRecord &record) {

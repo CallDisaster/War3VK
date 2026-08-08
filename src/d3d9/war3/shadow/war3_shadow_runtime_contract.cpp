@@ -3609,6 +3609,30 @@ void ShadowRuntimeContractCache::beginFrame() {
   // 把最后一个已发布快照清空，否则外部观察者会在帧中途读到“假空帧”。
 }
 
+void ShadowRuntimeContractCache::resetMapSession() {
+  auto manifest = std::make_shared<ShadowFrameManifest>();
+  auto resources = std::make_shared<ShadowModelResourceStore>();
+  auto poses = std::make_shared<ShadowPoseStore>();
+  auto attachments = std::make_shared<ShadowAttachmentRigidStore>();
+
+  std::unique_lock<std::shared_mutex> lock(m_mutex);
+  manifest->publishRevision = ++m_publishRevision;
+  m_manifest = std::move(manifest);
+  m_resources = std::move(resources);
+  m_poses = std::move(poses);
+  m_attachments = std::move(attachments);
+  m_stats = {};
+  m_stats.publishRevision = m_publishRevision;
+  m_resourceRevision = 0u;
+  m_resourceRefreshFrameSerial = 0u;
+  m_lastManifestCopyVisibleScanned.store(0u, std::memory_order_relaxed);
+  m_lastManifestCopyAppended.store(0u, std::memory_order_relaxed);
+  m_lastManifestCopyDeduplicatedSkipped.store(
+      0u, std::memory_order_relaxed);
+  m_lastManifestCopyRejectedSkipped.store(0u,
+                                           std::memory_order_relaxed);
+}
+
 void ShadowRuntimeContractCache::captureLiveState() {
   if (!dxvk::war3::internal::
           kWar3RuntimeConfigSemanticContractCaptureEffective)

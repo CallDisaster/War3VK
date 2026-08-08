@@ -220,6 +220,7 @@ public:
 
   void beginFrame();
   void endFrame();
+  void resetMapSession();
 
   void recordSpriteModelPath(void *spritePtr, const char *modelPath,
                              uint32_t modelType, uint32_t flags);
@@ -259,6 +260,7 @@ public:
 
   void beginFrame();
   void endFrame();
+  void resetMapSession();
 
   void noteRenderObject(const render::RenderObjectInfo &info);
   void noteRenderObjectsBatch(
@@ -391,6 +393,7 @@ public:
 
   void beginFrame();
   void endFrame();
+  void resetMapSession();
 
   void recordPose(void *runtimeModelPtr, void *sceneNode, void *unitPtr,
                   uint32_t sequenceId, float sequenceTime, float scale, float yaw,
@@ -472,6 +475,7 @@ public:
 
   void beginFrame();
   void endFrame();
+  void resetMapSession();
 
   void noteAttachmentRigid(void* rootRuntimeModelPtr, void* ownerRuntimeModelPtr,
                            void* childRuntimeModelPtr, void* childSpritePtr,

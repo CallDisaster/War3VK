@@ -21,6 +21,18 @@ ARENA = (ROOT / "src/d3d9/war3/memory/war3_shadow_arena.cpp").read_text(
 LIFECYCLE = (
     ROOT / "src/d3d9/war3/render/war3_shadow_lifecycle.cpp"
 ).read_text(encoding="utf-8")
+MODEL_REGISTRY = (
+    ROOT / "src/d3d9/war3/model/war3_model_registry.cpp"
+).read_text(encoding="utf-8")
+SHADOW_OBJECT = (
+    ROOT / "src/d3d9/war3/render/war3_shadow_object_registry.cpp"
+).read_text(encoding="utf-8")
+CONTRACT_CACHE = (
+    ROOT / "src/d3d9/war3/shadow/war3_shadow_runtime_contract.cpp"
+).read_text(encoding="utf-8")
+RENDERER = (
+    ROOT / "src/d3d9/war3/render/war3_renderer.cpp"
+).read_text(encoding="utf-8")
 DIAGNOSTICS = (
     ROOT / "src/d3d9/war3/tools/war3_diagnostics_hub.cpp"
 ).read_text(encoding="utf-8")
@@ -180,6 +192,76 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
             "m_war3BestWorldCameraTier = 0u",
         ):
             self.assertIn(token, reset)
+
+    def test_semantic_pointer_and_pose_registries_reset_at_present(self) -> None:
+        transition = body(
+            DEVICE,
+            "bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent",
+            "bool D3D9DeviceEx::War3GpuSkinDeviceReady",
+        )
+        self.assertIn("War3Renderer::instance().ResetMapSession()", transition)
+        self.assertNotIn("War3Renderer::instance().EndFrame()", transition)
+
+        reset = body(
+            RENDERER,
+            "void War3Renderer::ResetMapSession()",
+            "void War3Renderer::BeginFrame()",
+        )
+        for token in (
+            "RenderObjectRegistry::instance().beginFrame()",
+            "VisibleRenderableRegistry::instance().beginFrame()",
+            "ModelRegistry::instance().resetMapSession()",
+            "ModelInstanceRegistry::instance().resetMapSession()",
+            "PoseRegistry::instance().resetMapSession()",
+            "AttachmentRigidRegistry::instance().resetMapSession()",
+            "ShadowObjectRegistry::instance().resetMapSession()",
+            "ShadowRuntimeContractCache::instance().resetMapSession()",
+        ):
+            self.assertIn(token, reset)
+
+        for signature, next_signature, required in (
+            (
+                "void ModelRegistry::resetMapSession()",
+                "void ModelRegistry::recordSpriteModelPath",
+                ("m_bySprite", "m_byRuntimeModel", "m_byPath"),
+            ),
+            (
+                "void ModelInstanceRegistry::resetMapSession()",
+                "void ModelInstanceRegistry::storeRuntimeModelRecordLocked",
+                ("m_byWorldObjectEntry", "m_byRuntimeModel", "m_byHandle"),
+            ),
+            (
+                "void PoseRegistry::resetMapSession()",
+                "void PoseRegistry::storeRuntimeModelRecordLocked",
+                ("m_byRuntimeModel", "m_bySceneNode", "m_byUnitPtr"),
+            ),
+            (
+                "void AttachmentRigidRegistry::resetMapSession()",
+                "void AttachmentRigidRegistry::storeRecord",
+                ("m_byChildRuntimeModel", "m_bySceneNode", "m_byHandle"),
+            ),
+        ):
+            section = body(MODEL_REGISTRY, signature, next_signature)
+            for token in required:
+                self.assertIn(f"ClearRegistryMap({token})", section)
+
+        shadow_object_reset = body(
+            SHADOW_OBJECT,
+            "void ShadowObjectRegistry::resetMapSession()",
+            "void ShadowObjectRegistry::storeRecord",
+        )
+        self.assertIn("RegistryMutationGenerationGuard", shadow_object_reset)
+        self.assertIn("ClearRegistryMap(m_byRuntimeModel)", shadow_object_reset)
+        self.assertIn("ClearRegistryMap(m_byHandle)", shadow_object_reset)
+
+        contract_reset = body(
+            CONTRACT_CACHE,
+            "void ShadowRuntimeContractCache::resetMapSession()",
+            "void ShadowRuntimeContractCache::captureLiveState()",
+        )
+        self.assertIn("std::make_shared<ShadowFrameManifest>()", contract_reset)
+        self.assertIn("manifest->publishRevision = ++m_publishRevision", contract_reset)
+        self.assertIn("m_resourceRefreshFrameSerial = 0u", contract_reset)
 
     def test_runtime_status_exports_transition_and_replay_contract(self) -> None:
         for field in (

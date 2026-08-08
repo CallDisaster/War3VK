@@ -351,6 +351,7 @@ public:
   static ShadowRuntimeContractCache& instance();
 
   void beginFrame();
+  void resetMapSession();
   void captureLiveState();
   void capturePoseOnlyLiveState();
 

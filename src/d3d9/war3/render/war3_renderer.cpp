@@ -140,6 +140,37 @@ War3Renderer& War3Renderer::instance() {
     return *s_instance;
 }
 
+void War3Renderer::ResetMapSession() {
+    // Publish empty frame-local snapshots without touching the snapshot that
+    // may still be held by an asynchronous reader. The ordinary next
+    // BeginFrame will recycle the old slot after this empty publication.
+    RenderObjectRegistry::instance().beginFrame();
+    RenderObjectRegistry::instance().endFrame();
+    VisibleRenderableRegistry::instance().beginFrame();
+    VisibleRenderableRegistry::instance().endFrame();
+    UpperLayerShadowRegistry::instance().beginFrame();
+
+    // These registries are intentionally persistent within one map and have
+    // their end-frame sweeps disabled in the production profile. They contain
+    // raw Warcraft pointers and complete pose palettes, so they must not be
+    // allowed to survive an address-reusing map transition.
+    model::ModelRegistry::instance().resetMapSession();
+    model::ModelInstanceRegistry::instance().resetMapSession();
+    model::PoseRegistry::instance().resetMapSession();
+    model::AttachmentRigidRegistry::instance().resetMapSession();
+    ShadowObjectRegistry::instance().resetMapSession();
+    shadow::ShadowRuntimeContractCache::instance().resetMapSession();
+
+    ClearCurrentWorldObjectContext();
+    SetCurrentBatchHandle(0u);
+    SetCurrentBatchObject(nullptr);
+    m_semanticEndFrameBuildAttemptsThisFrame = 0u;
+    m_semanticEndFrameSawSkinnedThisFrame = false;
+    m_lastSemanticRegistryPublishFrameSerial = 0u;
+    m_lastSemanticEndFrameFlushFrameSerial = 0u;
+    m_lastSemanticEndFrameFlushPublishRevision = 0u;
+}
+
 void War3Renderer::BeginFrame() {
     ++m_rendererFrameSerial;
     m_semanticEndFrameBuildAttemptsThisFrame = 0;

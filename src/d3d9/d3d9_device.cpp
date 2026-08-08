@@ -14471,8 +14471,7 @@ bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(
   dxvk::war3::render::ResetShadowRuntimeBridgeState();
   dxvk::war3::render::War3LightningRuntime::instance().reset();
   dxvk::war3::shadow::ShadowValidationRuntime::instance().reset();
-  dxvk::war3::render::War3Renderer::instance().EndFrame();
-  dxvk::war3::render::War3Renderer::instance().BeginFrame();
+  dxvk::war3::render::War3Renderer::instance().ResetMapSession();
   War3ResetShadowSessionState(retireSerial);
   War3ResetGpuSkinMapEpoch();
   if (m_shadowReceiverPass != nullptr) {
