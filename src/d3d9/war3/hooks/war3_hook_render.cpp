@@ -1393,9 +1393,14 @@ class CurrentDrawDispatchScope {
 public:
   CurrentDrawDispatchScope(void* sceneNode,
                            void* renderablePart,
-                           uint32_t layerIndex)
+                           uint32_t layerIndex,
+                           dxvk::war3::render::CurrentDrawDispatchDomain domain =
+                               dxvk::war3::render::CurrentDrawDispatchDomain::Common,
+                           bool layerKnown = true,
+                           void* meshPayload = nullptr)
       : m_previous(dxvk::war3::render::PushCurrentDrawDispatchContext(
-            sceneNode, renderablePart, layerIndex)) {
+            sceneNode, renderablePart, layerIndex, domain, layerKnown,
+            meshPayload)) {
   }
 
   ~CurrentDrawDispatchScope() {
@@ -2088,12 +2093,14 @@ static bool War3TransparentDispatchTimingHooksRuntimeEnabled() {
     Hook_FlushTransparentTiming, g_trampolineFlushTransparentTiming,            \
     "Hook_RenderQueue_FlushTransparent")
 
-#define WAR3_RENDERPERF_TRANSPARENT_DISPATCH_HOOKS(X)                          \
+#define WAR3_RENDER_SEMANTIC_TRANSPARENT_TYPE0_HOOK(X)                         \
   X(RenderPerfTransparentDispatchType0,                                        \
     "TransparentDispatch_Type0_RenderBatch", rqTransparentDispatchType0,        \
-    Hook_TransparentDispatchType0Timing,                                       \
+    Hook_TransparentDispatchType0Semantic,                                     \
     g_trampolineTransparentDispatchType0,                                      \
-    "Hook_TransparentDispatch_Type0_RenderBatch")                              \
+    "Hook_TransparentDispatch_Type0_RenderBatch")
+
+#define WAR3_RENDERPERF_TRANSPARENT_DISPATCH_HOOKS(X)                          \
   X(RenderPerfTransparentDispatchType1,                                        \
     "TransparentDispatch_Type1_ParticleEmitter",                               \
     rqTransparentDispatchType1, Hook_TransparentDispatchType1Timing,            \
@@ -3113,11 +3120,24 @@ int __cdecl Hook_FlushTransparentTiming() {
 // 进入的 CurrentDraw/D3D9 Draw/ShadowCapture 会继续成为该 Type 的真实子树。
 // Type5 是队列条目携带的任意 callback，没有稳定目标地址，因此留在透明队列
 // native residual 中，不用错误的统一签名强行 Hook。
-void __fastcall Hook_TransparentDispatchType0Timing(uint32_t context,
-                                                    void* batch) {
+void __fastcall Hook_TransparentDispatchType0Semantic(uint32_t context,
+                                                      void* batch) {
   War3HotHookCallTiming hookTiming(
       War3HotHookId::TransparentDispatchType0, 4u);
   if (g_trampolineTransparentDispatchType0) {
+    // Type0 is the native model-batch lane used by construction attachments.
+    // Unlike Common/Special it carries no material-layer argument.  The scope
+    // therefore publishes an explicit unknown-layer domain together with the
+    // batch's exact mesh payload; DrawPrimitive remains synchronous inside
+    // this call, so consumers never need to retain either raw pointer.
+    void* meshPayload = nullptr;
+    if (batch != nullptr)
+      dxvk::war3::SafeReadPtrFast(batch, 0x0cu, meshPayload);
+    CurrentDrawDispatchScope currentDrawDispatchScope(
+        reinterpret_cast<void*>(uintptr_t(context)), batch,
+        dxvk::war3::render::kRenderQueueUnknownLayerIndex,
+        dxvk::war3::render::CurrentDrawDispatchDomain::TransparentType0,
+        false, meshPayload);
     War3HotHookNativeScope nativeTiming(hookTiming);
     g_trampolineTransparentDispatchType0(context, batch);
   }
@@ -4183,7 +4203,8 @@ int __fastcall Hook_RenderQueue_Dispatch_Common(void *thisPtr, void *edx,
   const uint32_t currentDrawLayerIndex =
       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
   CurrentDrawDispatchScope currentDrawDispatchScope(
-      thisPtr, edx, currentDrawLayerIndex);
+      thisPtr, edx, currentDrawLayerIndex,
+      dxvk::war3::render::CurrentDrawDispatchDomain::Common, true);
   War3BatchTag tag = War3RenderState::GetTlsBatchTag();
   phase1DispatchScope.SetStageTag(tag);
   int elementStage = -1;
@@ -4368,7 +4389,8 @@ int __fastcall Hook_RenderQueue_Dispatch_Special(void *thisPtr, void *edx,
   const uint32_t currentDrawLayerIndex =
       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(a3));
   CurrentDrawDispatchScope currentDrawDispatchScope(
-      thisPtr, edx, currentDrawLayerIndex);
+      thisPtr, edx, currentDrawLayerIndex,
+      dxvk::war3::render::CurrentDrawDispatchDomain::Special, true);
   if constexpr (dxvk::war3::internal::kShadowSemanticDispatchContractProbeEnabled) {
     dxvk::war3::render::VisibleRenderableRecord visible = {};
     dxvk::war3::reimpl::RenderBatchElement syntheticBatch = {};
@@ -4967,6 +4989,9 @@ static void RegisterRenderPerfHookCatalog(
       "RenderPerf",
       "kNativePerfDetailHookTimingEnabled && "
       "DXVK_WAR3_PERF_TRANSPARENT_DISPATCH_HOOKS=1"};
+  const War3HookActivationGate type0SemanticGate = {
+      "", "", 0u, "", "Render",
+      "resident exact current-draw semantic boundary"};
   const War3HookActivationGate unsafeGate = {
       "", "", 0u, "", "RenderPerf",
       "catalog-only: ordinary C++ MinHook detour cannot preserve caller EDI"};
@@ -4996,6 +5021,11 @@ static void RegisterRenderPerfHookCatalog(
   {War3HookId::id, "RenderPerf", hookName, War3HookKind::MinHookDetour,         \
    book.bookField, timingRoot, "trampoline", "ObserverOverhead",               \
    "OptInABIObserver", transparentGate},
+#define WAR3_RENDER_SEMANTIC_TYPE0_DESCRIPTOR(                                  \
+    id, hookName, bookField, detour, trampoline, timingRoot)                    \
+  {War3HookId::id, "Render", hookName, War3HookKind::MinHookDetour,            \
+   book.bookField, timingRoot, "trampoline", "SemanticWitness",               \
+   "VerifiedABIObserver", type0SemanticGate},
 
   const War3HookDescriptor descriptors[] = {
       WAR3_RENDERPERF_WORLD_PREPARE_DEEP_HOOKS(
@@ -5012,6 +5042,8 @@ static void RegisterRenderPerfHookCatalog(
           WAR3_RENDERPERF_CORE_DESCRIPTOR)
       WAR3_RENDERPERF_RENDERQUEUE_DEEP_HOOKS(
           WAR3_RENDERPERF_QUEUE_DESCRIPTOR)
+      WAR3_RENDER_SEMANTIC_TRANSPARENT_TYPE0_HOOK(
+          WAR3_RENDER_SEMANTIC_TYPE0_DESCRIPTOR)
       WAR3_RENDERPERF_TRANSPARENT_DISPATCH_HOOKS(
           WAR3_RENDERPERF_TRANSPARENT_DESCRIPTOR)
   };
@@ -5019,6 +5051,7 @@ static void RegisterRenderPerfHookCatalog(
                           sizeof(descriptors) / sizeof(descriptors[0]));
 
 #undef WAR3_RENDERPERF_TRANSPARENT_DESCRIPTOR
+#undef WAR3_RENDER_SEMANTIC_TYPE0_DESCRIPTOR
 #undef WAR3_RENDERPERF_QUEUE_DESCRIPTOR
 #undef WAR3_RENDERPERF_CORE_DESCRIPTOR
 #undef WAR3_RENDERPERF_RESIDUAL_DESCRIPTOR
@@ -5537,6 +5570,14 @@ void War3HookRender::Install(uintptr_t gameBase) {
     WAR3_RENDERPERF_RENDERQUEUE_DEEP_HOOKS(
         WAR3_MARK_RENDERPERF_CATALOG_HOOK)
   }
+  // Type0 is a correctness boundary, not an optional profiler hook.  Install
+  // it once for the process lifetime. Types 1-4 remain opt-in timing probes.
+  InstallMinHook(
+      War3HookId::RenderPerfTransparentDispatchType0,
+      transparentDispatchType0Addr,
+      reinterpret_cast<LPVOID>(&Hook_TransparentDispatchType0Semantic),
+      reinterpret_cast<LPVOID*>(&g_trampolineTransparentDispatchType0),
+      "Render", "TransparentDispatch_Type0_RenderBatch", false, false);
   if (War3TransparentDispatchTimingHooksRuntimeEnabled()) {
     WAR3_RENDERPERF_TRANSPARENT_DISPATCH_HOOKS(
         WAR3_INSTALL_RENDERPERF_CATALOG_HOOK)
@@ -5657,6 +5698,7 @@ void War3HookRender::Install(uintptr_t gameBase) {
 }
 
 #undef WAR3_RENDERPERF_TRANSPARENT_DISPATCH_HOOKS
+#undef WAR3_RENDER_SEMANTIC_TRANSPARENT_TYPE0_HOOK
 #undef WAR3_RENDERPERF_RENDERQUEUE_DEEP_HOOKS
 #undef WAR3_RENDERPERF_WORLD_PREPARE_CORE_HOOKS
 #undef WAR3_RENDERPERF_WORLD_PREPARE_RESIDUAL_HOOKS

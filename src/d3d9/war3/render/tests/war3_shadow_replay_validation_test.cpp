@@ -63,6 +63,15 @@ int main() {
   input.blendRequired = true;
   assert(ValidateWar3ShadowReplayDraw(input).reason ==
          War3ShadowReplayRejectReason::MissingBlendBuffer);
+  // Indexed D3DVBF_0WEIGHTS has no explicit weight attribute, but the one
+  // matrix index consumed by the vertex shader still needs a bounded stream.
+  input = ValidIndexed();
+  input.blendRequired = true;
+  input.blend = {true, 16u, 4u, 0u, 4u};
+  assert(ValidateWar3ShadowReplayDraw(input));
+  input.blend.size = 12u;
+  assert(ValidateWar3ShadowReplayDraw(input).reason ==
+         War3ShadowReplayRejectReason::BlendRangeOutOfBounds);
   input = ValidIndexed();
   input.uvRequired = true;
   input.uv = {true, 16u, 8u, 0u, 8u};

@@ -430,11 +430,16 @@ MakeWar3ShadowReplayValidationInput(
   validation.actualIndexMin = draw.shadowActualIndexMin;
   validation.actualIndexMax = draw.shadowActualIndexMax;
 
-  validation.blendRequired =
-      draw.vertexBlendEnabled && draw.vertexBlendCount != 0u;
+  // D3DVBF_0WEIGHTS still consumes one indexed matrix when
+  // INDEXEDVERTEXBLENDENABLE is set.  It has no explicit weight attribute, but
+  // its blend-index attribute and (possibly separate) backing are mandatory.
+  validation.blendRequired = draw.vertexBlendEnabled &&
+      (draw.vertexBlendCount != 0u || draw.vertexBlendIndexed);
   if (validation.blendRequired) {
-    const uint32_t weightEnd = War3ShadowAttributeEnd(
-        draw.blendWeightOffset, draw.blendWeightFormat);
+    const uint32_t weightEnd = draw.vertexBlendCount != 0u
+        ? War3ShadowAttributeEnd(draw.blendWeightOffset,
+                                draw.blendWeightFormat)
+        : 0u;
     const uint32_t indexEnd = draw.vertexBlendIndexed
         ? War3ShadowAttributeEnd(draw.blendIndexOffset,
                                 draw.blendIndexFormat)

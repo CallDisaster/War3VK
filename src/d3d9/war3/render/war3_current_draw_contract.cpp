@@ -1870,12 +1870,20 @@ CurrentDrawRetireResult RetireCurrentDrawContracts(
 CurrentDrawDispatchContext PushCurrentDrawDispatchContext(
     void* sceneNode,
     void* renderablePart,
-    uint32_t layerIndex) {
+    uint32_t layerIndex,
+    CurrentDrawDispatchDomain domain,
+    bool layerKnown,
+    void* meshPayload) {
   CurrentDrawDispatchContext previous = g_currentDrawDispatchContext;
   g_currentDrawDispatchContext.valid = true;
+  g_currentDrawDispatchContext.domain = domain;
   g_currentDrawDispatchContext.sceneNode = sceneNode;
   g_currentDrawDispatchContext.renderablePart = renderablePart;
-  g_currentDrawDispatchContext.layerIndex = layerIndex;
+  g_currentDrawDispatchContext.meshPayload = meshPayload;
+  g_currentDrawDispatchContext.layerKnown = layerKnown;
+  g_currentDrawDispatchContext.layerIndex = layerKnown
+      ? layerIndex
+      : kRenderQueueUnknownLayerIndex;
   return previous;
 }
 

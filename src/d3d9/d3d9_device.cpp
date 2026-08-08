@@ -249,6 +249,125 @@ bool War3CurrentDrawContractMatchesSemanticInstance(
   return matched;
 }
 
+// Stage11 construction effects are rendered as child runtime models.  The
+// semantic bridge names the owning building/destructible, while the native
+// dispatch scope names the child scene node and renderable part that actually
+// supplied the D3D draw.  Treating those two identity domains as one made the
+// exact current-frame producer reject UBirth and Night-Elf construction
+// attachments before their VB/IB could be captured.
+//
+// Keep geometry and owner identity separate: geometry always comes from the
+// active native dispatch, while gameplay classification (rawcode, blocker,
+// object kind) remains tied to an independently matching owner identity.
+struct War3CurrentDrawCaptureBinding {
+  void* renderablePart = nullptr;
+  void* sceneNode = nullptr;
+  void* meshPayload = nullptr;
+  war3::render::CurrentDrawDispatchDomain dispatchDomain =
+      war3::render::CurrentDrawDispatchDomain::Unknown;
+  bool layerKnown = false;
+  uint32_t layerIndex = 0u;
+  bool attachmentBridge = false;
+};
+
+bool War3ResolveCurrentDrawCaptureBinding(
+    const War3ShadowSemanticContext& semantic,
+    const war3::render::CurrentDrawDispatchContext& dispatch,
+    War3CurrentDrawCaptureBinding& out) {
+  out = {};
+  if (!dispatch.valid || dispatch.renderablePart == nullptr)
+    return false;
+
+  const bool transparentType0 =
+      dispatch.domain ==
+      war3::render::CurrentDrawDispatchDomain::TransparentType0;
+  if (transparentType0) {
+    if (dispatch.layerKnown ||
+        dispatch.layerIndex != war3::render::kRenderQueueUnknownLayerIndex ||
+        dispatch.meshPayload == nullptr) {
+      return false;
+    }
+  } else if (!dispatch.layerKnown ||
+             (dispatch.domain !=
+                  war3::render::CurrentDrawDispatchDomain::Common &&
+              dispatch.domain !=
+                  war3::render::CurrentDrawDispatchDomain::Special)) {
+    return false;
+  }
+
+  out.renderablePart = dispatch.renderablePart;
+  out.sceneNode = dispatch.sceneNode;
+  out.meshPayload = dispatch.meshPayload;
+  out.dispatchDomain = dispatch.domain;
+  out.layerKnown = dispatch.layerKnown;
+  out.layerIndex = dispatch.layerIndex;
+  out.attachmentBridge =
+      transparentType0 ||
+      semantic.renderablePart != dispatch.renderablePart ||
+      (semantic.sceneNode != nullptr && dispatch.sceneNode != nullptr &&
+       semantic.sceneNode != dispatch.sceneNode);
+  if (!out.attachmentBridge)
+    return semantic.renderablePart != nullptr;
+
+  // A child draw may differ from its owner's scene node/part, but it must
+  // still have a strong owner witness.  Rawcode/model name alone is not an
+  // instance identity and cannot authorize capture or publication.
+  const void* const semanticUnitPtr =
+      semantic.object != nullptr ? semantic.object->unitPtr : nullptr;
+  const uint32_t semanticJHandle =
+      semantic.jHandle != 0u
+          ? semantic.jHandle
+          : (semantic.object != nullptr ? semantic.object->jHandle : 0u);
+  return semantic.worldObjectEntry != nullptr || semanticUnitPtr != nullptr ||
+         semanticJHandle != 0u;
+}
+
+bool War3CurrentDrawContractMatchesCaptureBinding(
+    const war3::render::CurrentDrawContractRecord& contract,
+    const War3ShadowSemanticContext& semantic,
+    const War3CurrentDrawCaptureBinding& binding) {
+  if (!contract.known ||
+      contract.renderablePart != binding.renderablePart ||
+      contract.layerIndex != binding.layerIndex) {
+    return false;
+  }
+  if (binding.sceneNode != nullptr && contract.sceneNode != nullptr &&
+      binding.sceneNode != contract.sceneNode) {
+    return false;
+  }
+  if (!binding.attachmentBridge)
+    return War3CurrentDrawContractMatchesSemanticInstance(contract, semantic);
+
+  // Do not compare semantic.sceneNode here: for a construction attachment it
+  // intentionally names the parent while contract.sceneNode names the child.
+  // Every overlapping owner component must agree, and at least one must
+  // match, so a shared model part can never borrow another instance's draw.
+  bool ownerMatched = false;
+  if (semantic.worldObjectEntry != nullptr &&
+      contract.worldObjectEntry != nullptr) {
+    if (semantic.worldObjectEntry != contract.worldObjectEntry)
+      return false;
+    ownerMatched = true;
+  }
+  void* const semanticUnitPtr =
+      semantic.object != nullptr ? semantic.object->unitPtr : nullptr;
+  if (semanticUnitPtr != nullptr && contract.unitPtr != nullptr) {
+    if (semanticUnitPtr != contract.unitPtr)
+      return false;
+    ownerMatched = true;
+  }
+  const uint32_t semanticJHandle =
+      semantic.jHandle != 0u
+          ? semantic.jHandle
+          : (semantic.object != nullptr ? semantic.object->jHandle : 0u);
+  if (semanticJHandle != 0u && contract.jHandle != 0u) {
+    if (semanticJHandle != contract.jHandle)
+      return false;
+    ownerMatched = true;
+  }
+  return ownerMatched;
+}
+
 bool War3CurrentDrawContractMatchesRenderableInstance(
     const war3::render::CurrentDrawContractRecord& contract,
     const war3::shadow::ShadowRenderableRecord& renderable) {
@@ -38984,16 +39103,22 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
       batchTag == War3BatchTag::SelectionOverlay)
     return false;
 
-  void* const renderablePart = semantic.renderablePart;
-  if (renderablePart == nullptr)
-    return false;
   const auto dispatch =
       dxvk::war3::render::GetCurrentDrawDispatchContext();
-  if (!dispatch.valid || dispatch.renderablePart != renderablePart ||
-      (dispatch.sceneNode != nullptr && semantic.sceneNode != nullptr &&
-       dispatch.sceneNode != semantic.sceneNode)) {
+  War3CurrentDrawCaptureBinding captureBinding = {};
+  if (!War3ResolveCurrentDrawCaptureBinding(
+          semantic, dispatch, captureBinding)) {
     return false;
   }
+  // Transparent Type0 has an exact synchronous child/mesh identity but no
+  // canonical layer contract. Its geometry is handled by the same-frame
+  // fallback below; it must never be inserted into the layer-keyed metadata
+  // cache under a fabricated layer zero.
+  if (captureBinding.dispatchDomain ==
+      dxvk::war3::render::CurrentDrawDispatchDomain::TransparentType0) {
+    return false;
+  }
+  void* const renderablePart = captureBinding.renderablePart;
 
   void* const semanticUnitPtr =
       semantic.object != nullptr ? semantic.object->unitPtr : nullptr;
@@ -39006,7 +39131,8 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
   dxvk::war3::render::CurrentDrawContractRecord contract = {};
   const bool geometryLedgerHit =
       dxvk::war3::render::QueryCurrentDrawGeometryContract(
-          renderablePart, semantic.sceneNode, semantic.worldObjectEntry,
+          renderablePart, captureBinding.sceneNode,
+          semantic.worldObjectEntry,
           semanticUnitPtr, semanticJHandle, currentRenderFrameIndex, contract);
   const bool legacyContractHit =
       !geometryLedgerHit &&
@@ -39016,8 +39142,9 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
       contract.producerStage != 11 || !contract.producerFreshThisFrame ||
       contract.fromGrace ||
       !War3CurrentDrawContractNamesExactSlice(
-          renderablePart, dispatch.layerIndex, contract) ||
-      !War3CurrentDrawContractMatchesSemanticInstance(contract, semantic)) {
+          renderablePart, captureBinding.layerIndex, contract) ||
+      !War3CurrentDrawContractMatchesCaptureBinding(
+          contract, semantic, captureBinding)) {
     return false;
   }
 
@@ -39098,7 +39225,7 @@ bool D3D9DeviceEx::War3CaptureShadowDrawMetadata(
               : War3ShadowMetadataBlockerReason::KnownRawcode);
       War3MarkDrawTimeExactRejectedCurrentFrame(
           War3MakeDrawTimeVBCacheKey(
-              renderablePart, dispatch.layerIndex, &contract,
+              renderablePart, captureBinding.layerIndex, &contract,
               m_war3GpuSkinMapEpoch));
       return true;
     }
@@ -40045,6 +40172,18 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   // semantic preview runtime gate; the receiver/shadow-map passes still consume
   // the semantic packets submitted later in the frame.
   bool gpuSkinSemanticFallbackToLegacy = false;
+  // A Stage11 construction attachment may be owned by the semantic building
+  // while the D3D draw itself belongs to a child runtime model.  When that
+  // child still uses fixed-function palette skinning, the ordinary draw-time
+  // producer is not sufficient: it deliberately publishes captured positions
+  // as FixedWorld.  Preserve the exact current-draw identity here and route
+  // only that narrow case through the existing current-frame palette/stream
+  // snapshot path below.
+  bool stage11AttachmentLegacyFallback = false;
+  bool stage11AttachmentAllowOpaqueBlend = false;
+  War3CurrentDrawCaptureBinding stage11AttachmentCaptureBinding = {};
+  dxvk::war3::render::CurrentDrawContractRecord
+      stage11AttachmentCaptureContract = {};
   shadowCaptureGateTiming.enter(
       War3ShadowCaptureGatePhase::SemanticRuntimeGate);
   if (War3SemanticConsumerEnabled() &&
@@ -40289,28 +40428,32 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           break;
         drawTimeCaptureTiming.enter(
             War3ShadowDrawTimeCapturePhase::IdentityResolve);
-        void* const vbCachePart = semantic.renderablePart;
-        if (vbCachePart == nullptr) {
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoRenderablePart++;
-          break;
-        }
         const auto drawDispatchContext =
             dxvk::war3::render::GetCurrentDrawDispatchContext();
-        const bool dispatchPartMatches =
-            drawDispatchContext.valid &&
-            drawDispatchContext.renderablePart == vbCachePart &&
-            (drawDispatchContext.sceneNode == nullptr ||
-             semantic.sceneNode == nullptr ||
-             drawDispatchContext.sceneNode == semantic.sceneNode);
+        War3CurrentDrawCaptureBinding captureBinding = {};
+        const bool nativeDispatchBindingReady =
+            War3ResolveCurrentDrawCaptureBinding(
+                semantic, drawDispatchContext, captureBinding);
         const bool gpuSkinLayerMatches =
             gpuSkinResolvedExact && gpuSkinResolved != nullptr &&
             gpuSkinResolved->key.renderablePart ==
-                reinterpret_cast<uintptr_t>(vbCachePart);
-        if (!dispatchPartMatches && !gpuSkinLayerMatches) {
+                reinterpret_cast<uintptr_t>(semantic.renderablePart);
+        if (!nativeDispatchBindingReady && !gpuSkinLayerMatches) {
           // The geometry ledger repairs CurrentDraw hash collisions; it does
           // not guess a layer. A draw without either authoritative layer
           // witness remains fail-closed.
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
+          break;
+        }
+        if (!nativeDispatchBindingReady) {
+          captureBinding.renderablePart = semantic.renderablePart;
+          captureBinding.sceneNode = semantic.sceneNode;
+          captureBinding.layerIndex = gpuSkinResolved->key.layerIndex;
+          captureBinding.attachmentBridge = false;
+        }
+        void* const vbCachePart = captureBinding.renderablePart;
+        if (vbCachePart == nullptr) {
+          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoRenderablePart++;
           break;
         }
         void* const semanticUnitPtr =
@@ -40322,51 +40465,102 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         const uint32_t currentRenderFrameIndex =
             dxvk::war3::state::RenderState::instance().getFrameIndex();
         dxvk::war3::render::CurrentDrawContractRecord vbCacheContract = {};
-        const bool geometryLedgerHit =
-            dxvk::war3::render::QueryCurrentDrawGeometryContract(
-                vbCachePart, semantic.sceneNode, semantic.worldObjectEntry,
-                semanticUnitPtr, semanticJHandle, currentRenderFrameIndex,
-                vbCacheContract);
-        if (!geometryLedgerHit &&
-            !dxvk::war3::render::QueryCurrentDrawContract(
-                vbCachePart, vbCacheContract)) {
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectContractLookup++;
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
-          break;
+        const bool transparentType0Exact =
+            nativeDispatchBindingReady &&
+            captureBinding.dispatchDomain == dxvk::war3::render::
+                CurrentDrawDispatchDomain::TransparentType0;
+        if (transparentType0Exact) {
+          // Type0 is already the exact synchronous native draw boundary. It
+          // has no ordinary layer publication, so build a value-only contract
+          // from the active child scope and the independently resolved owner.
+          // Nothing here is retained or published back to the global contract
+          // cache.
+          vbCacheContract.known = true;
+          vbCacheContract.sceneNode = captureBinding.sceneNode;
+          vbCacheContract.renderablePart = captureBinding.renderablePart;
+          vbCacheContract.meshPayloadPtr = captureBinding.meshPayload;
+          vbCacheContract.worldObjectEntry = semantic.worldObjectEntry;
+          vbCacheContract.unitPtr = semanticUnitPtr;
+          vbCacheContract.jHandle = semanticJHandle;
+          vbCacheContract.rawcode = semantic.rawcode;
+          vbCacheContract.objectKind = semantic.objectKind;
+          vbCacheContract.layerIndex =
+              dxvk::war3::render::kRenderQueueUnknownLayerIndex;
+          vbCacheContract.stage = 11;
+          vbCacheContract.batchTag = earlyTag;
+          vbCacheContract.producerStage = 11;
+          vbCacheContract.producerGroup = earlyTag;
+          vbCacheContract.producerFreshThisFrame = true;
+          vbCacheContract.renderFrameIndex = currentRenderFrameIndex;
+          vbCacheContract.visibleFrameSerial =
+              m_war3ShadowPersistentFrameSerial;
+          vbCacheContract.pathBlocker = semantic.pathBlocker;
+          dxvk::war3::SafeReadU32Fast(
+              captureBinding.meshPayload, 0xF0u,
+              vbCacheContract.payloadWordF0);
+          dxvk::war3::SafeReadU32Fast(
+              captureBinding.meshPayload, 0x104u,
+              vbCacheContract.payloadWord104);
+          dxvk::war3::SafeReadU32Fast(
+              captureBinding.meshPayload, 0x108u,
+              vbCacheContract.payloadWord108);
+          dxvk::war3::SafeReadU32Fast(
+              captureBinding.meshPayload, 0x11Cu,
+              vbCacheContract.payloadWord11C);
+          dxvk::war3::SafeReadU32Fast(
+              captureBinding.meshPayload, 0x48u,
+              vbCacheContract.payloadWord48);
+        } else {
+          const bool geometryLedgerHit =
+              dxvk::war3::render::QueryCurrentDrawGeometryContract(
+                  vbCachePart, captureBinding.sceneNode,
+                  semantic.worldObjectEntry,
+                  semanticUnitPtr, semanticJHandle, currentRenderFrameIndex,
+                  vbCacheContract);
+          if (!geometryLedgerHit &&
+              !dxvk::war3::render::QueryCurrentDrawContract(
+                  vbCachePart, vbCacheContract)) {
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectContractLookup++;
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
+            break;
+          }
+          if (!vbCacheContract.producerFreshThisFrame ||
+              vbCacheContract.fromGrace) {
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectContractFreshness++;
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
+            break;
+          }
+          if (vbCacheContract.producerStage != 11) {
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectContractStage++;
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
+            break;
+          }
+          if (vbCacheContract.renderFrameIndex !=
+              currentRenderFrameIndex) {
+            // The global CurrentDraw fallback is shared across threads and can
+            // retain a record after its TLS dispatch scope has ended. Only the
+            // exact current render-frame Stage11 producer may name this draw.
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectContractRenderFrame++;
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
+            break;
+          }
+          const bool contractMatchesCapture = nativeDispatchBindingReady
+              ? War3CurrentDrawContractMatchesCaptureBinding(
+                    vbCacheContract, semantic, captureBinding)
+              : War3CurrentDrawContractMatchesSemanticInstance(
+                    vbCacheContract, semantic);
+          if (!contractMatchesCapture) {
+            // QueryCurrentDrawContract is indexed by renderablePart; model
+            // parts are shared across unit instances. Never attach the latest
+            // unit's contract to another instance's VB/IB/world tuple.
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectContractInstance++;
+            m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
+            break;
+          }
         }
-        if (!vbCacheContract.producerFreshThisFrame ||
-            vbCacheContract.fromGrace) {
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectContractFreshness++;
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
-          break;
-        }
-        if (vbCacheContract.producerStage != 11) {
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectContractStage++;
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
-          break;
-        }
-        if (vbCacheContract.renderFrameIndex !=
-            currentRenderFrameIndex) {
-          // The global CurrentDraw fallback is shared across threads and can
-          // retain a record after its TLS dispatch scope has ended. Only the
-          // exact current render-frame Stage11 producer may name this draw.
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectContractRenderFrame++;
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
-          break;
-        }
-        if (!War3CurrentDrawContractMatchesSemanticInstance(
-                vbCacheContract, semantic)) {
-          // QueryCurrentDrawContract is indexed by renderablePart; model parts
-          // are shared across unit instances. Never attach the latest unit's
-          // contract to the current unit's VB/IB/world tuple.
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectContractInstance++;
-          m_war3Scene.shadowStats.drawTimeVBCacheRejectNoLayerContext++;
-          break;
-        }
-        const uint32_t vbCacheLayerIndex =
-            dispatchPartMatches ? drawDispatchContext.layerIndex
-                                : gpuSkinResolved->key.layerIndex;
-        if (!War3CurrentDrawContractNamesExactSlice(
+        const uint32_t vbCacheLayerIndex = captureBinding.layerIndex;
+        if (!transparentType0Exact &&
+            !War3CurrentDrawContractNamesExactSlice(
                 vbCachePart, vbCacheLayerIndex, vbCacheContract)) {
           // A live stronger witness disagreeing with the CurrentDraw slice is
           // a hard rejection. Never switch to the contract layer merely to
@@ -40449,11 +40643,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         const bool gpuSkinSemanticBacking =
             gpuSkinBackingEligible && gpuSkinResolved != nullptr &&
             gpuSkinResolved->key.renderablePart ==
-                reinterpret_cast<uintptr_t>(semantic.renderablePart);
+                reinterpret_cast<uintptr_t>(vbCachePart);
         const bool gpuSkinSemanticInputIdentity =
             gpuSkinResolvedExact && gpuSkinResolved != nullptr &&
             gpuSkinResolved->key.renderablePart ==
-                reinterpret_cast<uintptr_t>(semantic.renderablePart);
+                reinterpret_cast<uintptr_t>(vbCachePart);
         if (gpuSkinSemanticBacking)
           ++m_war3GpuSkinP2IdentityMatchInputs;
         War3GpuSkinDrawInput gpuSkinSemanticInput = {};
@@ -40467,6 +40661,37 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         const bool gpuSkinSemanticDirectOnly =
             gpuSkinVsBypassRoute && gpuSkinIrreversibleBypass &&
             gpuSkinSemanticInputExact && gpuSkinSemanticInput.irreversible;
+        const DWORD nativeVertexBlendState =
+            m_state.renderStates[D3DRS_VERTEXBLEND];
+        const bool nativeVertexBlendIndexed =
+            m_state.renderStates[D3DRS_INDEXEDVERTEXBLENDENABLE] != FALSE;
+        const bool nativeFixedFunctionBlend =
+            nativeVertexBlendIndexed ||
+            (nativeVertexBlendState != D3DVBF_DISABLE &&
+             !(nativeVertexBlendState == D3DVBF_0WEIGHTS &&
+               !nativeVertexBlendIndexed));
+        if (captureBinding.attachmentBridge &&
+            (transparentType0Exact || nativeFixedFunctionBlend) &&
+            !gpuSkinSemanticBacking && !gpuSkinSemanticInputExact) {
+          // Do not let unskinned child input reach the rigid draw-time
+          // producer.  The fallback remains same-frame only: it freezes this
+          // draw's exact VB/IB/UV streams and captures the currently bound D3D
+          // matrix palette before the game can overwrite either source.
+          stage11AttachmentLegacyFallback = true;
+          stage11AttachmentCaptureBinding = captureBinding;
+          stage11AttachmentCaptureContract = vbCacheContract;
+          const bool buildingOwner =
+              semantic.objectKind ==
+                  dxvk::war3::render::ObjectKind::Building ||
+              (semantic.object != nullptr &&
+               semantic.object->kind ==
+                   dxvk::war3::render::ObjectKind::Building);
+          stage11AttachmentAllowOpaqueBlend =
+              transparentType0Exact && buildingOwner &&
+              m_state.renderStates[D3DRS_ZWRITEENABLE] != FALSE;
+          gpuSkinSemanticFallbackToLegacy = true;
+          break;
+        }
         const bool gpuSkinSemanticOutputHasUv =
             (gpuSkinSemanticBacking &&
              (gpuSkinResolved->key.outputFormat == 2u ||
@@ -42825,7 +43050,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
        (currentObj != nullptr &&
         currentObj->kind == dxvk::war3::render::ObjectKind::Unit) ||
        ((cat == War3RenderState::StageCategory::WorldObject) && stage == 11));
-  if (earlySemanticSceneUnitLikeCandidate) {
+  if (earlySemanticSceneUnitLikeCandidate &&
+      !stage11AttachmentLegacyFallback) {
     noteSemanticSceneBypassCandidate();
     return;
   }
@@ -42942,7 +43168,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       m_war3Scene.shadowStats.skippedOverlay++;
       return;
     }
-    if (!alphaTestEnabled) {
+    if (!alphaTestEnabled && !stage11AttachmentAllowOpaqueBlend) {
       // Transparent/additive material state is never converted to an
       // invented 0.5 alpha-test. Await an authoritative material producer.
       m_war3Scene.shadowStats.skippedAlphaTest++;
@@ -43152,7 +43378,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
   }
 
-  if (vertexBlendEnabled && semantic.runtimeModelPtr != nullptr) {
+  if (vertexBlendEnabled && semantic.runtimeModelPtr != nullptr &&
+      !stage11AttachmentLegacyFallback) {
     dxvk::war3::model::PoseRecord posePaletteRecord = {};
     auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
     if (poseRegistry.findByRuntimeModel(semantic.runtimeModelPtr,
@@ -47280,6 +47507,32 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   War3ShadowCasterDraw draw = {};
   draw.mapEpoch = m_war3GpuSkinMapEpoch;
   draw.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+  if (stage11AttachmentLegacyFallback) {
+    draw.shadowRenderablePart =
+        stage11AttachmentCaptureBinding.renderablePart;
+    draw.shadowLayerIndex = stage11AttachmentCaptureBinding.layerIndex;
+    draw.shadowExactGeometryKeyHash = uint64_t(War3DrawTimeVBCacheKeyHash{}(
+        War3MakeDrawTimeVBCacheKey(
+            stage11AttachmentCaptureBinding.renderablePart,
+            stage11AttachmentCaptureBinding.layerIndex,
+            &stage11AttachmentCaptureContract, m_war3GpuSkinMapEpoch)));
+    draw.shadowExactGeometryKeyHash = bit::fnv1a_iter(
+        draw.shadowExactGeometryKeyHash, uint32_t(PrimitiveType));
+    draw.shadowExactGeometryKeyHash = bit::fnv1a_iter(
+        draw.shadowExactGeometryKeyHash, uint32_t(BaseVertexIndex));
+    draw.shadowExactGeometryKeyHash = bit::fnv1a_iter(
+        draw.shadowExactGeometryKeyHash, MinVertexIndex);
+    draw.shadowExactGeometryKeyHash = bit::fnv1a_iter(
+        draw.shadowExactGeometryKeyHash, NumVertices);
+    draw.shadowExactGeometryKeyHash = bit::fnv1a_iter(
+        draw.shadowExactGeometryKeyHash, StartVal);
+    draw.shadowExactGeometryKeyHash = bit::fnv1a_iter(
+        draw.shadowExactGeometryKeyHash, CountVal);
+    if (draw.shadowExactGeometryKeyHash == 0u)
+      draw.shadowExactGeometryKeyHash = 1u;
+    draw.shadowPartLifecycleState =
+        War3ShadowPartLifecycleState::RequiredCurrent;
+  }
   draw.indexed = indexed;
   draw.positionStorage = std::move(posAlloc);
   draw.positionInfo = posInfo;
@@ -47471,7 +47724,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
        War3ShadowReplayMode::SnapshotFallback,
        draw.batchHandle,
        semantic.worldObjectEntry,
-       semantic.sceneNode,
+       stage11AttachmentLegacyFallback
+           ? stage11AttachmentCaptureBinding.sceneNode
+           : semantic.sceneNode,
        semantic.runtimeModelPtr,
        semantic.modelKey});
   m_war3Scene.shadowStats.fallbackSnapshotCount++;

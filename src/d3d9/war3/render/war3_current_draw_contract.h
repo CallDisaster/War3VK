@@ -2,6 +2,7 @@
 
 #include "../../util/util_matrix.h"
 #include "war3_render_objects.h"
+#include "war3_render_queue_tracker.h"
 #include "war3_render_state.h"
 #include "war3_shadow_producer_policy.h"
 
@@ -29,6 +30,18 @@ enum class PaletteProvenance : uint32_t {
   ProducerPartPacket = 3,       // 预留：Phase 2 producer ring
   RangeCopyPoseRebuild = 4,     // 预留：Phase 4 基于 0x12FDC0 重建
   CModelFallback = 5,           // 预留：CModel + 0x60 直读
+};
+
+// The ordinary render-queue dispatchers carry a proven material layer.  The
+// transparent Type0 model dispatcher is a separate native boundary and does
+// not: it identifies the exact child render batch, but not a normal layer
+// index.  Keep that distinction explicit so an unknown layer can never be
+// forged as layer zero.
+enum class CurrentDrawDispatchDomain : uint8_t {
+  Unknown = 0u,
+  Common = 1u,
+  Special = 2u,
+  TransparentType0 = 3u,
 };
 
 struct CurrentDrawContractRecord {
@@ -74,9 +87,12 @@ struct CurrentDrawContractRecord {
 
 struct CurrentDrawDispatchContext {
   bool valid = false;
+  CurrentDrawDispatchDomain domain = CurrentDrawDispatchDomain::Unknown;
   void* sceneNode = nullptr;
   void* renderablePart = nullptr;
-  uint32_t layerIndex = 0u;
+  void* meshPayload = nullptr;
+  bool layerKnown = false;
+  uint32_t layerIndex = kRenderQueueUnknownLayerIndex;
 };
 
 struct CurrentDrawPreparedSliceRecord {
@@ -337,7 +353,10 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
 CurrentDrawDispatchContext PushCurrentDrawDispatchContext(
     void* sceneNode,
     void* renderablePart,
-    uint32_t layerIndex);
+    uint32_t layerIndex,
+    CurrentDrawDispatchDomain domain = CurrentDrawDispatchDomain::Common,
+    bool layerKnown = true,
+    void* meshPayload = nullptr);
 
 void RestoreCurrentDrawDispatchContext(
     const CurrentDrawDispatchContext& previous);

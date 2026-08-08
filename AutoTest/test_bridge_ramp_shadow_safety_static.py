@@ -81,7 +81,10 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
             capture,
         )
         capture_block = self.device[capture:cache_setup + 260]
-        self.assertIn("drawDispatchContext.layerIndex", capture_block)
+        self.assertIn(
+            "War3ResolveCurrentDrawCaptureBinding(", capture_block
+        )
+        self.assertIn("captureBinding.layerIndex", capture_block)
         self.assertIn("gpuSkinResolved->key.layerIndex", capture_block)
         self.assertIn("QueryCurrentDrawContract(", capture_block)
         self.assertIn("QueryCurrentDrawGeometryContract(", capture_block)
@@ -94,8 +97,11 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
             "War3CurrentDrawContractMatchesSemanticInstance(", capture_block
         )
         self.assertIn(
-            "if (!dispatchPartMatches && !gpuSkinLayerMatches)", capture_block
+            "if (!nativeDispatchBindingReady && !gpuSkinLayerMatches)",
+            capture_block,
         )
+        self.assertIn("const bool transparentType0Exact =", capture_block)
+        self.assertIn("kRenderQueueUnknownLayerIndex", capture_block)
         self.assertNotIn("vbCacheLayerIndex = 0", capture_block)
         self.assertIn("War3MakeDrawTimeVBCacheKey(", capture_block)
         self.assertIn(

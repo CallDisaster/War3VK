@@ -1,6 +1,6 @@
 # WarVK / DXVK Agent Guide
 
-> 最后整理：2026-08-06。本文是后续 agent 的快速入口，不记录逐轮实验、历史改动或路线图；
+> 最后整理：2026-08-09。本文是后续 agent 的快速入口，不记录逐轮实验、历史改动或路线图；
 > 需要追溯时按需检索 [历史归档](docs/agent-history/README.md)。
 
 ## 项目是什么
@@ -32,7 +32,8 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 
 ## 当前状态
 
-- 当前分支：`codex/war3-arena-performance-20260802`。工作树已有用户未提交的源码与文档改动；
+- 当前分支：`codex/stage11-exact-attachment-fallback-20260809`。工作树另有用户未提交的外部子模块、
+  PlayerCrash 与构建日志；
   保留它们，避免 reset、checkout 或覆盖式操作。
 - 最近已提交的阴影基础已将地图/设备 epoch、Arena quarantine、fence retirement 与最终 replay
   验证接入生命周期。跨地图时旧资源不得发布给新地图；新地图在没有完整 CSM 前应安全退化为
@@ -65,6 +66,11 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   16/16 runnable 通过。部署 DLL SHA-256 为
   `9FE2F6132015D6BF5413B844915187F80D9F53E14F204564890CD9E71E12AED3`。详细证据见
   `docs/agent-history/2026-08-07-life-and-death-night-gate.md`。
+- 2026-08-09 已修复 Transparent Type0 建造附件在 Stage11 被错误拒绝的问题：Type0 现在拥有常驻的
+  exact CurrentDraw 边界，使用子部件身份和同帧 VB/IB/UV/完整矩阵调色板，并正确支持
+  `D3DVBF_0WEIGHTS` 索引蒙皮。用户已确认不死族 UBirth 建造阴影不再闪烁；该路径没有重新开启
+  全局跨帧 VB/IB cache。详细证据见
+  `docs/agent-history/2026-08-09-stage11-type0-correctness-baseline.md`。
 - 1.2.0 的发布范围限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍会造成
   性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；点光开启点阴影后，部分
   地面/角度仍有摩尔纹或带状伪影。README/CHANGELOG 必须保留这两项已知问题，后续不得描述为已修复。

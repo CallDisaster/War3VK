@@ -69,7 +69,10 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             "vbCacheContract.producerStage != 11",
             "vbCacheContract.renderFrameIndex",
             "War3CurrentDrawContractMatchesSemanticInstance(",
-            "if (!dispatchPartMatches && !gpuSkinLayerMatches)",
+            "War3ResolveCurrentDrawCaptureBinding(",
+            "if (!nativeDispatchBindingReady && !gpuSkinLayerMatches)",
+            "const bool transparentType0Exact =",
+            "kRenderQueueUnknownLayerIndex",
         ):
             self.assertIn(contract, capture_block, contract)
         self.assertNotIn("vbCacheLayerIndex = 0", capture_block)
