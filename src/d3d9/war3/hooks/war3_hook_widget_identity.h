@@ -19,9 +19,8 @@
 //   widget+0x30  rawcode (4-byte fourcc)
 //   handle resolved via HandleResolver::findHandleByUnitPtr
 //
-// Cache lifetime: process-wide, additive. War3 does not reuse widget pointers
-// across different rawcodes (verified by paper chapter 6 + 24). Even if it
-// happened, the next lifecycle hook fire would update the entry.
+// Cache lifetime: one map session. Present-owned transition code clears it
+// because both widget pointers and JASS handles can be reused by the next map.
 //
 // Hot-path safety: cache reads use std::shared_mutex (multi-reader). Lookups
 // only fire when rawcode is missing on the candidate object, so hot-path cost
@@ -40,6 +39,11 @@ namespace dxvk::war3::hooks {
 // Returns true if installed; false if address is null or env-disabled.
 bool InstallWidgetIdentityHook(void* widgetRegisterAddr);
 
+// Present-owned map transition hook. Game.dll may immediately reuse widget
+// pointers and JASS handles after leaving a map, so neither identity key may
+// survive into the next map session.
+void ResetWidgetIdentityMapSession();
+
 // Lookup cached identity by widget pointer (CWidget*/CUnit*/CDestructable*).
 bool QueryWidgetIdentityByPtr(
     void* widgetPtr,
@@ -57,8 +61,8 @@ uint32_t QueryWidgetRawcodeByHandle(uint32_t jHandle);
 // Phase 7.101 write-through cache：从 D3D9 draw call 路径已经验证过 magic
 // 并直读到 rawcode 后调用本接口写入 cache，下次同 widgetPtr/jHandle 即可
 // O(1) 命中、避免重复 SafeRead。线程安全（unique_lock）。
-// 当 widgetPtr/rawcode 为空或新值与已有不一致时直接覆盖（widget 在 War3
-// 1.27a 上不会复用指针 + rawcode 不变更，参见论文第 6 章）。
+// 当 widgetPtr/rawcode 为空或新值与已有不一致时直接覆盖；地图切换时由
+// ResetWidgetIdentityMapSession 清空地址与句柄索引。
 void NoteWidgetIdentityFromDrawcall(
     void* widgetPtr,
     uint32_t rawcode,

@@ -6,6 +6,7 @@
 #include "../game/war3_agent.h"
 #include "../gpu_skin/war3_gpu_skin_native_bridge.h"
 #include "../handle/war3_handle_resolver.h"
+#include "../model/war3_model_resource_cache.h"
 #include "war3_native_renderer_probe.h"
 #include "war3_render_exec_batch.h"
 #include "war3_render_objects.h"
@@ -529,7 +530,15 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
 
     thread_local std::unordered_map<void *, uint32_t> s_unitHandleCache;
     thread_local uint32_t s_unitHandleCacheGcCounter = 0;
+    thread_local uint64_t s_unitHandleCacheMapEpoch = 0u;
     if (needHandleResolution) {
+      const uint64_t mapEpoch =
+          model::ShadowModelResourceCache::instance().mapEpoch();
+      if (s_unitHandleCacheMapEpoch != mapEpoch) {
+        s_unitHandleCache.clear();
+        s_unitHandleCacheGcCounter = 0u;
+        s_unitHandleCacheMapEpoch = mapEpoch;
+      }
       if (s_unitHandleCache.size() > 65536u ||
           ++s_unitHandleCacheGcCounter >= 4096u) {
         s_unitHandleCache.clear();

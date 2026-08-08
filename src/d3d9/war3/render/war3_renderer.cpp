@@ -9,6 +9,7 @@
 #include "../core/war3_internal_test_config.h"
 #include "../core/war3_runtime_profile.h"
 #include "../core/war3_semantic_shadow_gate.h"
+#include "../hooks/war3_hook_widget_identity.h"
 #include "../platform/war3_runtime_bootstrap.h"
 #include "../shadow/war3_shadow_native_runtime.h"
 #include "../shadow/war3_shadow_renderer_core.h"
@@ -142,6 +143,7 @@ War3Renderer& War3Renderer::instance() {
 
 void War3Renderer::ResetMapSession() {
     ResetRenderObjectMapSessionCaches();
+    hooks::ResetWidgetIdentityMapSession();
 
     // Publish empty frame-local snapshots without touching the snapshot that
     // may still be held by an asynchronous reader. The ordinary next

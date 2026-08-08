@@ -2,8 +2,8 @@
 //
 // Read-only hook for CWidget_RegisterFootprintAndShadowMask @ 0x6F65A140.
 // We only read widget+0x0C (magic) and widget+0x30 (rawcode), then push the
-// (widgetPtr -> {rawcode, jHandle, kind}) mapping into a process-lifetime
-// cache so that destructible/path-blocker shadow filtering, outline matching,
+// (widgetPtr -> {rawcode, jHandle, kind}) mapping into a map-session cache so
+// that destructible/path-blocker shadow filtering, outline matching,
 // and bloom matching can resolve identity without depending on
 // Hook_WorldObjects_RenderGroup (which destructibles never pass through).
 
@@ -72,9 +72,8 @@ WidgetRegisterFootprintFn g_originalWidgetRegister = nullptr;
 WidgetRegisterFootprintFn g_trampolineWidgetRegister = nullptr;
 std::atomic<uintptr_t> g_widgetIdentityGameBase{0u};
 
-// One identity record per widget. Lifetime tracks the widget itself; on
-// destruction the entry simply stops being looked up. War3 does not reuse
-// widget pointers for different rawcodes, so an additive cache is safe.
+// One identity record per widget. Addresses and handles may be reused by the
+// next map, so Present-owned map transition code clears both indexes.
 struct WidgetIdentityRecord {
   void* widgetPtr = nullptr;
   uint32_t rawcode = 0;
@@ -373,6 +372,12 @@ int __fastcall HookedWidgetRegisterFootprintAndShadowMask(
 }
 
 }  // namespace
+
+void ResetWidgetIdentityMapSession() {
+  std::unique_lock<std::shared_mutex> lock(cache().mutex);
+  cache().byPtr.clear();
+  cache().byHandle.clear();
+}
 
 bool InstallWidgetIdentityHook(void* widgetRegisterAddr) {
   // Phase 7.99：避免重复 install（早装 + 常规 install 会调两次）。
