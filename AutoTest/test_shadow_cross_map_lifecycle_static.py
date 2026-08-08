@@ -7,6 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
 HOOK = (ROOT / "src/d3d9/d3d9_war3_hook.cpp").read_text(encoding="utf-8")
+RENDER_HOOK = (
+    ROOT / "src/d3d9/war3/hooks/war3_hook_render.cpp"
+).read_text(encoding="utf-8")
 BOOTSTRAP = (
     ROOT / "src/d3d9/war3/platform/war3_runtime_bootstrap.cpp"
 ).read_text(encoding="utf-8")
@@ -54,6 +57,17 @@ def body(text: str, signature: str, next_signature: str) -> str:
 
 
 class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
+    def test_render_hook_unit_identity_hot_cache_is_map_scoped(self) -> None:
+        identity = body(
+            RENDER_HOOK,
+            "static void TryFillUnitIdentityFromUnitPtr(",
+            "static void ClassifyWorldTagIdentity(",
+        )
+        self.assertIn("uint64_t mapEpoch", identity)
+        self.assertIn("ShadowModelResourceCache::instance().mapEpoch()", identity)
+        self.assertIn("cacheEntry.mapEpoch == mapEpoch", identity)
+        self.assertIn("cacheEntry.mapEpoch = mapEpoch", identity)
+
     def test_model_hook_map_reset_preserves_hooks_and_drops_raw_pointer_state(self) -> None:
         reset = body(MODEL_HOOK, "void ResetMapSession()", "void Shutdown()")
         for required in (

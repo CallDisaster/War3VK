@@ -20,6 +20,7 @@
 #include "../core/war3_runtime_profile.h"
 #include "../core/war3_semantic_shadow_gate.h"
 #include "../gpu_skin/war3_gpu_skin_native_bridge.h"
+#include "../model/war3_model_resource_cache.h"
 #include "../reimpl/war3_render_queue.h"
 #include "../render/war3_native_renderer_probe.h"
 #include "../render/war3_render_identity_bridge.h"
@@ -1202,6 +1203,7 @@ static void TryFillUnitIdentityFromUnitPtr(
     dxvk::war3::render::RenderObjectIdentitySnapshot& identity) {
   struct UnitIdentityHotCacheEntry {
     void* unitPtr = nullptr;
+    uint64_t mapEpoch = 0u;
     uint32_t rawcode = 0u;
     uint32_t flags5C = 0u;
     uint32_t handleId = 0u;
@@ -1231,11 +1233,14 @@ static void TryFillUnitIdentityFromUnitPtr(
 
   static thread_local std::array<UnitIdentityHotCacheEntry, 1024>
       s_unitIdentityHotCache = {};
+  const uint64_t mapEpoch =
+      dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
   const uintptr_t key = reinterpret_cast<uintptr_t>(identity.unitPtr);
   auto& cacheEntry = s_unitIdentityHotCache[(key >> 4u) &
                                             (s_unitIdentityHotCache.size() -
                                              1u)];
-  if (cacheEntry.valid && cacheEntry.unitPtr == identity.unitPtr) {
+  if (cacheEntry.valid && cacheEntry.unitPtr == identity.unitPtr &&
+      cacheEntry.mapEpoch == mapEpoch) {
     mergeCachedIdentity(identity, cacheEntry);
     return;
   }
@@ -1260,6 +1265,7 @@ static void TryFillUnitIdentityFromUnitPtr(
     return;
 
   cacheEntry.unitPtr = identity.unitPtr;
+  cacheEntry.mapEpoch = mapEpoch;
   cacheEntry.rawcode = rawcode;
   cacheEntry.flags5C = flags5C;
   cacheEntry.kind =
