@@ -141,6 +141,8 @@ War3Renderer& War3Renderer::instance() {
 }
 
 void War3Renderer::ResetMapSession() {
+    ResetRenderObjectMapSessionCaches();
+
     // Publish empty frame-local snapshots without touching the snapshot that
     // may still be held by an asynchronous reader. The ordinary next
     // BeginFrame will recycle the old slot after this empty publication.

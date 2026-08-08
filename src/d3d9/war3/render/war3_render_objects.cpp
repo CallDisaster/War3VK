@@ -271,6 +271,21 @@ void SetCurrentBatchObject(const RenderObjectInfo *info) {
   g_tlsCurrentBatchObject = info;
 }
 
+void ResetRenderObjectMapSessionCaches() {
+  // Handles and Warcraft object addresses are both reusable immediately after
+  // leaving a map. Periodic size/age eviction is therefore not a correctness
+  // boundary for the first frames of the next map.
+  auto& rawcode = GetBridgeRawcodeState();
+  rawcode.handleToRawcode.clear();
+  rawcode.handleToUnitPtr.clear();
+  rawcode.failedHandles.clear();
+  rawcode.loggedRawcodes.clear();
+  GetUnitMetaCache().clear();
+
+  g_tlsCurrentBatchHandle = 0u;
+  g_tlsCurrentBatchObject = nullptr;
+}
+
 // ============================================================================
 // ObjectKind 工具
 // ============================================================================

@@ -335,6 +335,11 @@ static std::array<RenderablePartPaletteBindingEntry,
 static std::atomic<uint64_t> s_renderablePartPaletteBindingSerial{0u};
 static std::atomic<uint64_t> s_renderablePartPaletteSnapshotSerial{0u};
 static std::atomic<uintptr_t> s_cachedGlobalPaletteBufBase{0u};
+// Positive pointer validation is cached in TLS because the hook is hot. Raw
+// runtime-model addresses can be reused by a later map, so ResetMapSession
+// advances this generation and forces every participating thread to validate
+// the first use in the new session again.
+static std::atomic<uint64_t> s_runtimeModelValidationSessionGeneration{1u};
 
 bool TryReadCurrentPaletteFrameTag(uint32_t& outFrameTag) {
   // Phase 7.31 Iteration F：避免每次调用都 syscall GetModuleHandleA。
@@ -1040,6 +1045,14 @@ bool LooksLikeRuntimeModelPtrCached(void* candidate) {
     return false;
 
   static thread_local std::unordered_set<void*> s_validRuntimeModels;
+  static thread_local uint64_t s_seenSessionGeneration = 0u;
+  const uint64_t sessionGeneration =
+      s_runtimeModelValidationSessionGeneration.load(
+          std::memory_order_acquire);
+  if (s_seenSessionGeneration != sessionGeneration) {
+    s_validRuntimeModels.clear();
+    s_seenSessionGeneration = sessionGeneration;
+  }
   if (s_validRuntimeModels.find(candidate) != s_validRuntimeModels.end())
     return true;
 
@@ -10180,6 +10193,13 @@ void ResetMapSession() {
     entry.paletteWriteSerial.store(0u, std::memory_order_release);
   }
   s_cachedGlobalPaletteBufBase.store(0u, std::memory_order_release);
+  uint64_t validationGeneration =
+      s_runtimeModelValidationSessionGeneration.fetch_add(
+          1u, std::memory_order_acq_rel) + 1u;
+  if (validationGeneration == 0u) {
+    s_runtimeModelValidationSessionGeneration.store(
+        1u, std::memory_order_release);
+  }
 
   {
     std::unique_lock<std::shared_mutex> lock(g_runtimePoseArrayRangeMutex);

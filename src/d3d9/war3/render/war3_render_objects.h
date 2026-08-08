@@ -188,6 +188,11 @@ const RenderObjectInfo *GetCurrentBatchObject();
 // 设置当前批次的对象信息
 void SetCurrentBatchObject(const RenderObjectInfo *info);
 
+// Present-owned map transition hook. This invalidates only process-global
+// lookup aliases; published frame snapshots keep their existing two-slot
+// lifetime and are replaced by War3Renderer::ResetMapSession().
+void ResetRenderObjectMapSessionCaches();
+
 } // namespace render
 } // namespace war3
 } // namespace dxvk

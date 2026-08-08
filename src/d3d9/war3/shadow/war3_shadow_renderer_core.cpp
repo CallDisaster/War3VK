@@ -711,11 +711,22 @@ static thread_local PaletteSlotCacheEntry s_paletteSlotCache[kMaxPaletteSlotCach
 static thread_local size_t s_paletteSlotCacheIndex = 0;
 static std::atomic<uint64_t> g_paletteSlotCacheHitCount{0};
 static std::atomic<uint64_t> g_paletteSlotCacheMissCount{0};
+static std::atomic<uint64_t> g_paletteSlotCacheSessionGeneration{1u};
 
 // 查找或更新调色板槽位索引缓存
 static uint32_t FindOrUpdatePaletteSlotCache(void* renderablePart, uint32_t currentSlotIndex) {
   if (renderablePart == nullptr)
     return 0xFFFFFFFF;
+
+  static thread_local uint64_t s_seenSessionGeneration = 0u;
+  const uint64_t sessionGeneration =
+      g_paletteSlotCacheSessionGeneration.load(std::memory_order_acquire);
+  if (s_seenSessionGeneration != sessionGeneration) {
+    for (auto& entry : s_paletteSlotCache)
+      entry = {};
+    s_paletteSlotCacheIndex = 0u;
+    s_seenSessionGeneration = sessionGeneration;
+  }
 
   // 查找缓存
   for (size_t i = 0; i < kMaxPaletteSlotCacheEntries; ++i) {
@@ -9495,6 +9506,13 @@ void ShadowValidationRuntime::reset() {
   std::unique_lock<std::shared_mutex> cacheLock(
       StaticMeshDataResourceCacheMutex());
   StaticMeshDataResourceCache().clear();
+  uint64_t paletteSessionGeneration =
+      g_paletteSlotCacheSessionGeneration.fetch_add(
+          1u, std::memory_order_acq_rel) + 1u;
+  if (paletteSessionGeneration == 0u) {
+    g_paletteSlotCacheSessionGeneration.store(
+        1u, std::memory_order_release);
+  }
 }
 
 ShadowValidationFrameStats ShadowValidationRuntime::snapshot() const {
