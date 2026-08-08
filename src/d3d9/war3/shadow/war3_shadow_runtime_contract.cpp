@@ -56,6 +56,7 @@ dxvk::war3::War3PerfMonitor::ScopedCpuScope ContractCpuScope(
 
 struct PointerBoolCacheEntry {
   void* ptr = nullptr;
+  uint64_t mapEpoch = 0u;
   bool value = false;
 };
 
@@ -135,12 +136,15 @@ bool CachedPointerBool(std::array<PointerBoolCacheEntry, N>& cache, void* ptr,
   if (ptr == nullptr)
     return false;
   static_assert((N & (N - 1u)) == 0u, "cache size must be a power of two");
+  const uint64_t mapEpoch =
+      model::ShadowModelResourceCache::instance().mapEpoch();
   const uintptr_t hash = reinterpret_cast<uintptr_t>(ptr) >> 4u;
   auto& slot = cache[hash & (N - 1u)];
-  if (slot.ptr == ptr)
+  if (slot.ptr == ptr && slot.mapEpoch == mapEpoch)
     return slot.value;
   const bool value = fn();
   slot.ptr = ptr;
+  slot.mapEpoch = mapEpoch;
   slot.value = value;
   return value;
 }
@@ -325,6 +329,7 @@ void ResolveCurrentRuntimeGeosetFromDataLegacy(
     void* runtimeModel = nullptr;
     void* runtimeGeosetData = nullptr;
     void* geosetPtr = nullptr;
+    uint64_t mapEpoch = 0u;
     uint32_t index = 0;
     bool valid = false;
   };
@@ -333,8 +338,11 @@ void ResolveCurrentRuntimeGeosetFromDataLegacy(
                         reinterpret_cast<uintptr_t>(record.runtimeGeosetDataPtr));
   const size_t slot = (hk >> 4) & (s_cache.size() - 1u);
   ResolveCacheEntry& entry = s_cache[slot];
+  const uint64_t mapEpoch =
+      model::ShadowModelResourceCache::instance().mapEpoch();
   if (entry.valid && entry.runtimeModel == record.runtimeModelPtr &&
-      entry.runtimeGeosetData == record.runtimeGeosetDataPtr) {
+      entry.runtimeGeosetData == record.runtimeGeosetDataPtr &&
+      entry.mapEpoch == mapEpoch) {
     ++diagnostics.legacyCacheHitCount;
     record.runtimeGeosetPtr = entry.geosetPtr;
     record.meshIndex = entry.index;
@@ -382,6 +390,7 @@ void ResolveCurrentRuntimeGeosetFromDataLegacy(
     entry.runtimeModel = record.runtimeModelPtr;
     entry.runtimeGeosetData = record.runtimeGeosetDataPtr;
     entry.geosetPtr = geosetPtr;
+    entry.mapEpoch = mapEpoch;
     entry.index = i;
     entry.valid = true;
     return;

@@ -95,10 +95,11 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   CPU backing，并在 completion serial 回收后递增 collected 计数；它不改变 fence 或释放时机，仍需
   冷启动 B / A→B / A→B→A 物理数据确认，详见
   `docs/agent-history/2026-08-09-issue6-retired-session-census.md`。
-- Issue #6 另有一组 Direct geoset、unit flags、材质、palette slot、terrain bounds 与 index slice
-  CPU 热缓存现已按 map epoch 失效；全局别名在 Present reset 清除，固定 TLS 容器在新图首次使用时
-  拒绝/释放旧条目。该候选不改变 GPU 退役，仍未部署或完成跨地图物理门，详见
-  `docs/agent-history/2026-08-09-issue6-map-scoped-hot-caches.md`。
+- Issue #6 的 Direct geoset、unit flags、材质、palette slot、terrain bounds、index slice、static
+  mesh-data 及 runtime-geoset CPU 热缓存现已按 map epoch 失效；进程全局别名在 Present reset 清除，
+  固定 TLS 容器拒绝旧条目。该候选不改变 GPU 退役，仍未部署或完成跨地图物理门，详见
+  `docs/agent-history/2026-08-09-issue6-map-scoped-hot-caches.md` 与
+  `docs/agent-history/2026-08-09-issue6-shadow-core-cache-isolation.md`。
 - DirectGrouped 的 Producer Claim 目前只有默认关闭的同帧 Observe 预测器；Consume 请求会被明确
   拒绝且不改变 caster。旧性能报告显示 BuildEligible 是主要 CPU 热点，但 reduced key 尚缺已证明的
   source/material/alpha 身份，必须先完成至少 10,000 帧零误判实机门，详见

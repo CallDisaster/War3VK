@@ -327,6 +327,7 @@ bool IsStaticMeshDataPreviewCandidate(const ShadowRenderableRecord& record) {
 }
 
 struct StaticMeshDataResourceCacheEntry {
+  uint64_t mapEpoch = 0u;
   size_t resourceRecordCount = 0u;
   const void* primaryStreamPtr = nullptr;
   uint32_t primaryStride = 0u;
@@ -508,12 +509,15 @@ const ShadowModelResourceRecord* TryFindStaticMeshDataResource(
   }
 
   const size_t resourceRecordCount = resources.records().size();
+  const uint64_t currentMapEpoch =
+      model::ShadowModelResourceCache::instance().mapEpoch();
   {
     std::shared_lock<std::shared_mutex> lock(
         StaticMeshDataResourceCacheMutex());
     auto& cache = StaticMeshDataResourceCache();
     const auto it = cache.find(record.meshData);
     if (it != cache.end() &&
+        it->second.mapEpoch == currentMapEpoch &&
         it->second.resourceRecordCount == resourceRecordCount &&
         it->second.primaryStreamPtr == primaryStreamPtr &&
         it->second.primaryStride == primaryStride &&
@@ -604,6 +608,7 @@ const ShadowModelResourceRecord* TryFindStaticMeshDataResource(
   if (fallbackMatch == nullptr)
   {
     StaticMeshDataResourceCacheEntry entry = {};
+    entry.mapEpoch = currentMapEpoch;
     entry.resourceRecordCount = resourceRecordCount;
     entry.primaryStreamPtr = primaryStreamPtr;
     entry.primaryStride = primaryStride;
@@ -618,6 +623,7 @@ const ShadowModelResourceRecord* TryFindStaticMeshDataResource(
   outResource = *fallbackMatch;
   ApplyStaticMeshDataResource(record, outResource);
   StaticMeshDataResourceCacheEntry entry = {};
+  entry.mapEpoch = currentMapEpoch;
   entry.resourceRecordCount = resourceRecordCount;
   entry.primaryStreamPtr = primaryStreamPtr;
   entry.primaryStride = primaryStride;
@@ -9466,19 +9472,29 @@ void ShadowValidationRuntime::runObserveValidation() {
 }
 
 void ShadowValidationRuntime::reset() {
-  std::unique_lock<std::shared_mutex> lock(m_mutex);
-  m_buildInProgress = false;
-  m_buildFrameSerial = 0;
-  m_buildPublishRevision = 0;
-  m_pendingManifest.reset();
-  m_pendingResources.reset();
-  m_pendingPoses.reset();
-  m_pendingAttachments.reset();
-  m_buildWork.reset();
-  m_stalePendingBuildClearedCount = 0;
-  m_lastStats = {};
-  m_lastFrame = std::make_shared<ShadowSubmissionFrame>();
-  m_lastRenderableFrame = std::make_shared<ShadowSubmissionFrame>();
+  {
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    m_buildInProgress = false;
+    m_buildFrameSerial = 0;
+    m_buildPublishRevision = 0;
+    m_pendingManifest.reset();
+    m_pendingResources.reset();
+    m_pendingPoses.reset();
+    m_pendingAttachments.reset();
+    m_buildWork.reset();
+    m_stalePendingBuildClearedCount = 0;
+    m_lastStats = {};
+    m_lastFrame = std::make_shared<ShadowSubmissionFrame>();
+    m_lastRenderableFrame = std::make_shared<ShadowSubmissionFrame>();
+  }
+
+  // MeshData and its primary stream are Warcraft-owned addresses. Both may be
+  // reused by the next map while a process-global cache still owns map-A CPU
+  // vectors. The validation runtime is reset only at the Present-owned map
+  // transition, so this is the authoritative place to discard those aliases.
+  std::unique_lock<std::shared_mutex> cacheLock(
+      StaticMeshDataResourceCacheMutex());
+  StaticMeshDataResourceCache().clear();
 }
 
 ShadowValidationFrameStats ShadowValidationRuntime::snapshot() const {

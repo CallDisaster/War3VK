@@ -30,6 +30,9 @@ SHADOW_OBJECT = (
 CONTRACT_CACHE = (
     ROOT / "src/d3d9/war3/shadow/war3_shadow_runtime_contract.cpp"
 ).read_text(encoding="utf-8")
+RENDERER_CORE = (
+    ROOT / "src/d3d9/war3/shadow/war3_shadow_renderer_core.cpp"
+).read_text(encoding="utf-8")
 RENDERER = (
     ROOT / "src/d3d9/war3/render/war3_renderer.cpp"
 ).read_text(encoding="utf-8")
@@ -48,6 +51,53 @@ def body(text: str, signature: str, next_signature: str) -> str:
 
 
 class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
+    def test_shadow_runtime_hot_caches_are_map_scoped(self) -> None:
+        pointer_cache = body(
+            CONTRACT_CACHE,
+            "struct PointerBoolCacheEntry",
+            "struct ManifestResolveDiagnostics",
+        )
+        self.assertIn("uint64_t mapEpoch", pointer_cache)
+
+        cached_pointer = body(
+            CONTRACT_CACHE,
+            "bool CachedPointerBool",
+            "bool LooksLikeRuntimeModelPtrForContract",
+        )
+        self.assertIn("ShadowModelResourceCache::instance().mapEpoch()", cached_pointer)
+        self.assertIn("slot.mapEpoch == mapEpoch", cached_pointer)
+        self.assertIn("slot.mapEpoch = mapEpoch", cached_pointer)
+
+        legacy_geoset = body(
+            CONTRACT_CACHE,
+            "void ResolveCurrentRuntimeGeosetFromDataLegacy",
+            "void ResolveCurrentRuntimeGeosetFromData(",
+        )
+        self.assertIn("uint64_t mapEpoch", legacy_geoset)
+        self.assertIn("entry.mapEpoch == mapEpoch", legacy_geoset)
+        self.assertIn("entry.mapEpoch = mapEpoch", legacy_geoset)
+
+        static_entry = body(
+            RENDERER_CORE,
+            "struct StaticMeshDataResourceCacheEntry",
+            "void ApplyStaticMeshDataResource",
+        )
+        self.assertIn("uint64_t mapEpoch", static_entry)
+        static_lookup = body(
+            RENDERER_CORE,
+            "const ShadowModelResourceRecord* TryFindStaticMeshDataResource",
+            "ShadowPoseRecord ConvertPoseRecord",
+        )
+        self.assertIn("it->second.mapEpoch == currentMapEpoch", static_lookup)
+        self.assertGreaterEqual(static_lookup.count("entry.mapEpoch = currentMapEpoch"), 2)
+
+        validation_reset = body(
+            RENDERER_CORE,
+            "void ShadowValidationRuntime::reset()",
+            "ShadowValidationFrameStats ShadowValidationRuntime::snapshot() const",
+        )
+        self.assertIn("StaticMeshDataResourceCache().clear()", validation_reset)
+
     def test_unload_is_request_only_for_render_owned_state(self) -> None:
         reset = body(HOOK, "void ResetWar3RuntimeState()", "bool ValidateGameModule")
         self.assertIn("War3RequestShadowMapEpochReset", reset)
