@@ -4521,14 +4521,18 @@ bool War3TryReadUnitFlags5CCached(void* unitPtr, uint32_t& outFlags5C) {
 
   struct UnitFlagsCacheEntry {
     void* unitPtr = nullptr;
+    uint64_t mapEpoch = 0u;
     uint32_t flags5C = 0u;
     bool readable = false;
     bool valid = false;
   };
   static thread_local std::array<UnitFlagsCacheEntry, 4096> s_cache = {};
+  const uint64_t mapEpoch =
+      dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
   const uintptr_t key = reinterpret_cast<uintptr_t>(unitPtr);
   auto& entry = s_cache[(key >> 4u) & (s_cache.size() - 1u)];
-  if (entry.valid && entry.unitPtr == unitPtr) {
+  if (entry.valid && entry.unitPtr == unitPtr &&
+      entry.mapEpoch == mapEpoch) {
     outFlags5C = entry.flags5C;
     return entry.readable;
   }
@@ -4539,6 +4543,7 @@ bool War3TryReadUnitFlags5CCached(void* unitPtr, uint32_t& outFlags5C) {
                                   dxvk::war3::CUnitOffsets::Flags5C,
                                   flags5C);
   entry.unitPtr = unitPtr;
+  entry.mapEpoch = mapEpoch;
   entry.flags5C = readable ? flags5C : 0u;
   entry.readable = readable;
   entry.valid = true;
@@ -4907,6 +4912,15 @@ War3DirectPacketGeosetCache& War3DirectPacketGeosetResourceCache() {
   return s_cache;
 }
 
+void War3ResetDirectPacketMapCaches() {
+  // This owner contains immutable CPU model snapshots only. Packets already
+  // published retain their own shared_ptr, so dropping the map-A lookup
+  // aliases cannot release backing still referenced by old command lists.
+  std::unique_lock<std::shared_mutex> lock(
+      War3DirectPacketGeosetCacheMutex());
+  War3DirectPacketGeosetResourceCache().clear();
+}
+
 std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>
 War3FindDirectPacketGeosetResource(void* geosetOrDataPtr) {
   if (geosetOrDataPtr == nullptr)
@@ -5015,6 +5029,7 @@ War3BuildShadowMaterialSignatureCached(
 
   struct CacheEntry {
     bool valid = false;
+    uint64_t mapEpoch = 0u;
     // Phase 7.26：为了提高命中率，去掉 renderablePart 这个每帧抖动的 key 字段。
     // key 改为 sceneNode + meshIndex + layerIndex + modelResource + flags 组合，
     // 这些在同一 unit/geoset 上稳定得多。renderablePart 不参与命中；meshData
@@ -5034,7 +5049,10 @@ War3BuildShadowMaterialSignatureCached(
     dxvk::war3::shadow::ShadowMaterialSignature signature = {};
   };
 
+  const uint64_t mapEpoch =
+      dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
   uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, mapEpoch);
   hash = bit::fnv1a_iter(hash, reinterpret_cast<uintptr_t>(renderable.sceneNode));
   // Phase 7.26：key 不再包含 renderablePart（随帧抖动会让 material cache
   // miss 率持续偏高）。sceneNode + mesh/layer + modelResource 足以唯一确定
@@ -5051,7 +5069,7 @@ War3BuildShadowMaterialSignatureCached(
 
   static thread_local std::array<CacheEntry, 16384> s_cache = {};
   auto& entry = s_cache[size_t(hash) & (s_cache.size() - 1u)];
-  if (entry.valid &&
+  if (entry.valid && entry.mapEpoch == mapEpoch &&
       entry.sceneNode == renderable.sceneNode &&
       entry.layerState == renderable.layerState &&
       entry.modelResourcePtr == renderable.modelResourcePtr &&
@@ -5068,6 +5086,7 @@ War3BuildShadowMaterialSignatureCached(
   auto signature =
       dxvk::war3::shadow::BuildShadowMaterialSignatureForRenderable(renderable);
   entry.valid = true;
+  entry.mapEpoch = mapEpoch;
   entry.sceneNode = renderable.sceneNode;
   entry.meshData = renderable.meshData;
   entry.layerState = renderable.layerState;
@@ -5376,6 +5395,8 @@ public:
                                         bool generationReuseEnabled)
       : m_enabled(enabled),
         m_generationReuseEnabled(generationReuseEnabled) {
+    resetGenerationEntriesForMapEpoch(
+        dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch());
   }
 
   bool find(const dxvk::war3::model::ShadowGeosetResourceRecord* geoset,
@@ -5478,6 +5499,14 @@ private:
     // cache and never supplies GPU ownership.
     static thread_local std::array<Entry, kEntryCount> s_entries = {};
     return s_entries;
+  }
+
+  static void resetGenerationEntriesForMapEpoch(uint64_t mapEpoch) {
+    static thread_local uint64_t s_mapEpoch = 0u;
+    if (mapEpoch == 0u || s_mapEpoch == mapEpoch)
+      return;
+    generationEntries() = {};
+    s_mapEpoch = mapEpoch;
   }
 
   static size_t slotFor(
@@ -7669,6 +7698,7 @@ bool War3TryBuildLiveRuntimeGroupPalette(
 
     struct PaletteSlotCacheEntry {
       void* renderablePart = nullptr;
+      uint64_t mapEpoch = 0u;
       uint32_t paletteSlotIndex = 0xFFFFFFFFu;
       uint64_t lastSeenFrameSerial = 0u;
     };
@@ -7695,9 +7725,11 @@ bool War3TryBuildLiveRuntimeGroupPalette(
                                    kMaxPaletteSlotCacheEntries>
         s_paletteSlotCache = {};
     static thread_local size_t s_paletteSlotCacheCursor = 0u;
+    const uint64_t mapEpoch =
+        dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
 
     for (auto& entry : s_paletteSlotCache) {
-      if (entry.renderablePart != partPtr)
+      if (entry.renderablePart != partPtr || entry.mapEpoch != mapEpoch)
         continue;
       entry.lastSeenFrameSerial = frameSerial;
       if (currentSlotIndex != 0xFFFFFFFFu && currentSlotIndex < 0x3A98u) {
@@ -7723,6 +7755,7 @@ bool War3TryBuildLiveRuntimeGroupPalette(
         s_paletteSlotCache[s_paletteSlotCacheCursor++ %
                            kMaxPaletteSlotCacheEntries];
     entry.renderablePart = partPtr;
+    entry.mapEpoch = mapEpoch;
     entry.paletteSlotIndex = currentSlotIndex;
     entry.lastSeenFrameSerial = frameSerial;
     return currentSlotIndex;
@@ -9010,6 +9043,7 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
     uint64_t stableSourceSequence = 0u) {
   struct TerrainBoundsCacheEntry {
     bool valid = false;
+    uint64_t mapEpoch = 0u;
     const void* keyIdentity = nullptr;
     uint64_t keyOffset = 0u;
     uint64_t keyLength = 0u;
@@ -9144,7 +9178,10 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
       s_stats.sliceKeyPath++;
   }
 
+  const uint64_t mapEpoch =
+      dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
   uint64_t hash = 0xcbf29ce484222325ull;
+  hash = fold(hash, mapEpoch);
   hash = fold(hash, reinterpret_cast<uintptr_t>(keyIdentity));
   hash = fold(hash, keyOffset);
   hash = fold(hash, keyLength);
@@ -9162,7 +9199,8 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
       {};
   TerrainBoundsCacheEntry& entry = s_cache[hash & (kCacheSize - 1u)];
 
-  if (entry.valid && entry.keyIdentity == keyIdentity &&
+  if (entry.valid && entry.mapEpoch == mapEpoch &&
+      entry.keyIdentity == keyIdentity &&
       entry.keyOffset == keyOffset && entry.keyLength == keyLength &&
       entry.keySequence == keySequence &&
       entry.keyElementCount == keyElementCount &&
@@ -9199,6 +9237,7 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
   }
 
   entry.valid = true;
+  entry.mapEpoch = mapEpoch;
   entry.keyIdentity = keyIdentity;
   entry.keyOffset = keyOffset;
   entry.keyLength = keyLength;
@@ -24251,6 +24290,11 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3DrawTimeVBCache = {};
   m_war3S1TerrainCasterStash = {};
   m_war3S1TerrainEarlyCache = {};
+
+  // The GPU-owned containers remain in the retired session above. This only
+  // drops CPU lookup aliases so a recycled map-B address cannot inherit a
+  // map-A immutable snapshot.
+  War3ResetDirectPacketMapCaches();
 
   ResetCurrentDrawContractCache();
   VisibleRenderableRegistry::instance().clearShadowManifest();

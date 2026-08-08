@@ -193,6 +193,36 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
         ):
             self.assertIn(token, reset)
 
+    def test_cpu_hot_caches_are_map_epoch_scoped(self) -> None:
+        reset = body(
+            DEVICE,
+            "void D3D9DeviceEx::War3ResetShadowSessionState",
+            "bool D3D9DeviceEx::War3DrainShadowCasterTombstones",
+        )
+        self.assertIn("War3ResetDirectPacketMapCaches()", reset)
+
+        direct_reset = body(
+            DEVICE,
+            "void War3ResetDirectPacketMapCaches()",
+            "std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>\n"
+            "War3FindDirectPacketGeosetResource",
+        )
+        self.assertIn(
+            "War3DirectPacketGeosetResourceCache().clear()", direct_reset
+        )
+        self.assertIn("War3DirectPacketGeosetCacheMutex", direct_reset)
+
+        # Fixed-size TLS caches must reject a recycled Warcraft pointer after
+        # A -> B. The index-slice cache also releases its shared CPU vectors
+        # lazily on the first Populate in the new map.
+        for token in (
+            "entry.mapEpoch == mapEpoch",
+            "entry.mapEpoch = mapEpoch",
+            "resetGenerationEntriesForMapEpoch",
+            "generationEntries() = {}",
+        ):
+            self.assertIn(token, DEVICE)
+
     def test_semantic_pointer_and_pose_registries_reset_at_present(self) -> None:
         transition = body(
             DEVICE,
