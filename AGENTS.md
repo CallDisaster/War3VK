@@ -79,6 +79,11 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   `D3DVBF_0WEIGHTS` 索引蒙皮。用户已确认不死族 UBirth 建造阴影不再闪烁；该路径没有重新开启
   全局跨帧 VB/IB cache。详细证据见
   `docs/agent-history/2026-08-09-stage11-type0-correctness-baseline.md`。
+- 2026-08-09 的当前集成候选为 `203932c` / `codex/integrated-correctness-baseline-20260809`，
+  build32 DLL SHA-256 为 `56566E0418E2C51AE22C7978E5934AC45ACDB32191F7E02E15C83EBB3FAF8190`。
+  它把用户分别确认过的 Type0/UBirth 修复与点阴影 receiver-bias 修复合入同一源码线，并包含本轮
+  跨地图 CPU 身份缓存失效；73 个静态脚本、18/18 Win32 runnable、DLL 构建和 no-work 已通过。
+  该组合 DLL 尚未部署或完成前台物理回归，不能把两个旧候选的独立验收冒充组合验收。
 - Issue #5 的地形级联剔除现为默认关闭的 `Off / Observe / Consume` 合同；只有同帧、同代且来自
   已验证 position span 的精确 bounds 才能授权 C2/C3 剔除，猜测或陈旧 bounds 一律 fail-visible。
   当前仅完成离线验证，未部署且未通过实机 A/B；详见
@@ -102,11 +107,17 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   跨地图物理门，详见 `docs/agent-history/2026-08-09-issue6-map-scoped-hot-caches.md`、
   `docs/agent-history/2026-08-09-issue6-shadow-core-cache-isolation.md` 与
   `docs/agent-history/2026-08-09-issue6-model-hook-map-session-reset.md`；render-hook 补充见
-  `docs/agent-history/2026-08-09-issue6-render-hook-unit-cache.md`。
+  `docs/agent-history/2026-08-09-issue6-render-hook-unit-cache.md`。后续还清除了 widget/rawcode/handle
+  映射及 SceneCollector 的 CUnit→handle TLS，并让 runtime-model 正验证和 palette-slot TLS 随地图
+  会话失效；细节见 `docs/agent-history/2026-08-09-issue6-render-identity-cache-reset.md` 与
+  `docs/agent-history/2026-08-09-issue6-widget-scene-identity-reset.md`。
 - DirectGrouped 的 Producer Claim 目前只有默认关闭的同帧 Observe 预测器；Consume 请求会被明确
   拒绝且不改变 caster。旧性能报告显示 BuildEligible 是主要 CPU 热点，但 reduced key 尚缺已证明的
   source/material/alpha 身份，必须先完成至少 10,000 帧零误判实机门，详见
   `docs/agent-history/2026-08-09-producer-claim-observe.md`。
+- 当前 RTX 4060 Ti 的主 15.73 GiB device-local heap 不可 host-visible；唯一同时
+  `DEVICE_LOCAL | HOST_VISIBLE` 的 heap 只有 214 MiB。因此 ReBAR direct-upload 实验不满足既定
+  准入条件，保持未实现/默认关闭，不能占用小 BAR heap 冒充完整 ReBAR 收益。
 - 1.2.0 的发布范围限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍会造成
   性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；点光开启点阴影后，部分
   地面/角度仍有摩尔纹或带状伪影。README/CHANGELOG 必须保留这两项已知问题，后续不得描述为已修复。
