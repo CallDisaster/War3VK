@@ -696,6 +696,26 @@ namespace dxvk {
         uint32_t semanticSceneCompactWorkTableRejectFrameCount = 0;
         uint32_t semanticSceneCompactWorkTableRejectIdentityCount = 0;
         uint32_t semanticSceneCompactWorkTableMismatchCount = 0;
+        // Observe-only pre-build predictor for a future Producer Claim
+        // Ledger. The strict key retains payloadWord11C; the logical key
+        // deliberately omits that known draw-local field. Neither key may
+        // authorize a skip until both have been compared with the existing
+        // post-build exact-owner decision on real maps.
+        uint32_t semanticSceneProducerClaimObserveMode = 0;
+        uint32_t semanticSceneProducerClaimExactKeyCount = 0;
+        uint32_t semanticSceneProducerClaimCandidateCount = 0;
+        uint32_t semanticSceneProducerClaimCanonicalOwnedCount = 0;
+        uint32_t semanticSceneProducerClaimMissingKeyCount = 0;
+        uint32_t semanticSceneProducerClaimUnresolvedCount = 0;
+        uint32_t semanticSceneProducerClaimStrictPredictedCount = 0;
+        uint32_t semanticSceneProducerClaimStrictMatchCount = 0;
+        uint32_t semanticSceneProducerClaimStrictFalsePositiveCount = 0;
+        uint32_t semanticSceneProducerClaimStrictFalseNegativeCount = 0;
+        uint32_t semanticSceneProducerClaimLogicalPredictedCount = 0;
+        uint32_t semanticSceneProducerClaimLogicalMatchCount = 0;
+        uint32_t semanticSceneProducerClaimLogicalFalsePositiveCount = 0;
+        uint32_t semanticSceneProducerClaimLogicalFalseNegativeCount = 0;
+        uint32_t semanticSceneProducerClaimConsumeDeniedCount = 0;
         uint32_t semanticSceneRejectedPathBlockerProducerCount = 0;
         uint32_t semanticSceneRejectedPathBlockerStaticSupplementCount = 0;
         uint32_t semanticSceneRejectedPathBlockerLegacyCaptureCount = 0;

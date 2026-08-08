@@ -2764,6 +2764,60 @@ uint64_t War3SemanticDirectRecordSelectionKey(
   return 0u;
 }
 
+uint64_t War3ProducerClaimObserveObjectKey(
+    const dxvk::war3::render::CurrentDrawContractRecord& record) {
+  const auto makeKey = [](uint32_t tag, uint64_t value) {
+    uint64_t hash = bit::fnv1a_init();
+    hash = bit::fnv1a_iter(hash, tag);
+    hash = bit::fnv1a_iter(hash, value);
+    return hash != 0u ? hash : uint64_t(1u);
+  };
+  const auto ptrValue = [](const void* ptr) {
+    return uint64_t(reinterpret_cast<uintptr_t>(ptr));
+  };
+  // Do not consult VisibleRenderableRegistry here. A renderable part can be
+  // shared by multiple instances and the registry intentionally retains one
+  // winner; using it in an ownership key would merge different units.
+  if (record.jHandle != 0u)
+    return makeKey(1u, record.jHandle);
+  if (record.unitPtr != nullptr)
+    return makeKey(2u, ptrValue(record.unitPtr));
+  if (record.worldObjectEntry != nullptr)
+    return makeKey(3u, ptrValue(record.worldObjectEntry));
+  if (record.sceneNode != nullptr)
+    return makeKey(4u, ptrValue(record.sceneNode));
+  return 0u;
+}
+
+uint64_t War3ProducerClaimObserveKey(
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    uint64_t mapEpoch, uint64_t deviceEpoch, uint64_t frameSerial,
+    bool includeDrawLocalPayload) {
+  const uint64_t objectKey = War3ProducerClaimObserveObjectKey(record);
+  if (!record.known || mapEpoch == 0u || deviceEpoch == 0u ||
+      frameSerial == 0u || objectKey == 0u ||
+      record.renderablePart == nullptr || record.meshPayloadPtr == nullptr ||
+      record.layerIndex == dxvk::war3::render::kRenderQueueUnknownLayerIndex) {
+    return 0u;
+  }
+
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, 0x434C41494D4F4253ull); // CLAIMOBS
+  hash = bit::fnv1a_iter(hash, mapEpoch);
+  hash = bit::fnv1a_iter(hash, deviceEpoch);
+  hash = bit::fnv1a_iter(hash, frameSerial);
+  hash = bit::fnv1a_iter(hash, objectKey);
+  hash = bit::fnv1a_iter(
+      hash, uint64_t(reinterpret_cast<uintptr_t>(record.renderablePart)));
+  hash = bit::fnv1a_iter(
+      hash, uint64_t(reinterpret_cast<uintptr_t>(record.meshPayloadPtr)));
+  hash = bit::fnv1a_iter(hash, record.layerIndex);
+  hash = bit::fnv1a_iter(hash, record.payloadWord108);
+  if (includeDrawLocalPayload)
+    hash = bit::fnv1a_iter(hash, record.payloadWord11C);
+  return hash != 0u ? hash : uint64_t(1u);
+}
+
 bool War3VisibleRecordMatchesCurrentDrawSlice(
     const dxvk::war3::render::CurrentDrawContractRecord& record,
     const dxvk::war3::render::VisibleRenderableRecord& visible) {
@@ -3052,6 +3106,23 @@ War3TerrainBoundsCullModeRuntime() {
         ? dxvk::war3::render::War3TerrainBoundsCullMode::Consume
         : dxvk::war3::render::War3TerrainBoundsCullMode::Off;
   }();
+  return s_mode;
+}
+
+enum class War3ProducerClaimObserveMode : uint8_t {
+  Off = 0u,
+  Observe = 1u,
+  Consume = 2u,
+};
+
+War3ProducerClaimObserveMode War3ProducerClaimObserveModeRuntime() {
+  // Consume is parsed for experiment compatibility but deliberately behaves
+  // as Observe below. The reduced pre-build identity has not yet proved
+  // collision-free parity with the post-build exact-owner key.
+  static const auto s_mode = static_cast<War3ProducerClaimObserveMode>(
+      std::min<uint32_t>(
+          2u,
+          War3GetEnvU32("DXVK_WAR3_SEMANTIC_PRODUCER_CLAIM_LEDGER", 0u)));
   return s_mode;
 }
 
@@ -24678,6 +24749,18 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       compactWorkTableMode == War3CompactWorkTableMode::Consume;
   m_war3Scene.shadowStats.semanticSceneCompactWorkTableMode =
       uint32_t(compactWorkTableMode);
+  const War3ProducerClaimObserveMode producerClaimObserveMode =
+      War3ProducerClaimObserveModeRuntime();
+  const bool observeProducerClaims =
+      producerClaimObserveMode != War3ProducerClaimObserveMode::Off;
+  m_war3Scene.shadowStats.semanticSceneProducerClaimObserveMode =
+      uint32_t(producerClaimObserveMode);
+  if (producerClaimObserveMode == War3ProducerClaimObserveMode::Consume) {
+    // Deliberately keep behavior identical to Observe until real-map parity
+    // proves that the reduced key is not merging different parts or sources.
+    m_war3Scene.shadowStats
+        .semanticSceneProducerClaimConsumeDeniedCount++;
+  }
   m_war3CompactWorkTable.reset(
       m_war3ShadowPersistentFrameSerial,
       compactWorkTableMode == War3CompactWorkTableMode::Off
@@ -25259,6 +25342,68 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       shadowEligibleManifestRecords.end(),
       exactSubmittedManifestRecords.begin(),
       exactSubmittedManifestRecords.end());
+  std::vector<uint64_t> producerClaimStrictKeys;
+  std::vector<uint64_t> producerClaimLogicalKeys;
+  if (observeProducerClaims) {
+    producerClaimStrictKeys.reserve(exactSubmittedManifestRecords.size());
+    producerClaimLogicalKeys.reserve(exactSubmittedManifestRecords.size());
+    for (const auto& exactRecord : exactSubmittedManifestRecords) {
+      const uint64_t strictKey = War3ProducerClaimObserveKey(
+          exactRecord, m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+          m_war3ShadowPersistentFrameSerial, true);
+      const uint64_t logicalKey = War3ProducerClaimObserveKey(
+          exactRecord, m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+          m_war3ShadowPersistentFrameSerial, false);
+      if (strictKey != 0u)
+        producerClaimStrictKeys.push_back(strictKey);
+      if (logicalKey != 0u)
+        producerClaimLogicalKeys.push_back(logicalKey);
+    }
+    const auto sortUnique = [](std::vector<uint64_t>& keys) {
+      std::sort(keys.begin(), keys.end());
+      keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    };
+    sortUnique(producerClaimStrictKeys);
+    sortUnique(producerClaimLogicalKeys);
+    m_war3Scene.shadowStats.semanticSceneProducerClaimExactKeyCount =
+        uint32_t(producerClaimLogicalKeys.size());
+  }
+  const auto producerClaimContains = [](const std::vector<uint64_t>& keys,
+                                        uint64_t key) {
+    return key != 0u && std::binary_search(keys.begin(), keys.end(), key);
+  };
+  const auto builtPacketHasCanonicalExactOwner =
+      [&](const dxvk::war3::shadow::ShadowDrawPacket& packet,
+          const dxvk::war3::render::CurrentDrawAuthoritativeSample& sample) {
+        if (!War3DrawTimeCurrentFrameGeometryRuntime())
+          return false;
+        const auto& contract = sample.contract;
+        const int16_t effectiveProducerStage =
+            contract.producerStage >= 0 ? contract.producerStage
+                                        : contract.stage;
+        void* const renderablePart = packet.renderable.renderablePart;
+        const uint32_t layerIndex = packet.renderable.layerIndex;
+        if (effectiveProducerStage != 11 || renderablePart == nullptr)
+          return false;
+        if (War3DrawTimeAnonymousMarkerRejectionActive(
+                renderablePart, contract.meshPayloadPtr, layerIndex)) {
+          return true;
+        }
+        if (!War3CurrentDrawContractNamesExactSlice(
+                renderablePart, layerIndex, contract)) {
+          return false;
+        }
+        const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
+            renderablePart, layerIndex, &contract, m_war3GpuSkinMapEpoch);
+        if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
+          return true;
+        const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
+        return vbIt != m_war3DrawTimeVBCache.end() &&
+            vbIt->second.MatchesKey(cacheKey) &&
+            vbIt->second.frameSerial == m_war3ShadowPersistentFrameSerial &&
+            vbIt->second.exactOwnerFrameSerial ==
+                m_war3ShadowPersistentFrameSerial;
+      };
   auto manifestRecordForEligible =
       [](const dxvk::war3::render::CurrentDrawContractRecord& record,
          const dxvk::war3::shadow::ShadowDrawPacket& packet,
@@ -25523,6 +25668,32 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
     if (!recordsForBuildAlphaPrefiltered)
       bucket.shadowEligibleParts++;
+    uint64_t producerClaimStrictKey = 0u;
+    uint64_t producerClaimLogicalKey = 0u;
+    bool producerClaimStrictPredicted = false;
+    bool producerClaimLogicalPredicted = false;
+    if (observeProducerClaims) {
+      auto& stats = m_war3Scene.shadowStats;
+      stats.semanticSceneProducerClaimCandidateCount++;
+      producerClaimStrictKey = War3ProducerClaimObserveKey(
+          record, m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+          m_war3ShadowPersistentFrameSerial, true);
+      producerClaimLogicalKey = War3ProducerClaimObserveKey(
+          record, m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+          m_war3ShadowPersistentFrameSerial, false);
+      if (producerClaimStrictKey == 0u || producerClaimLogicalKey == 0u) {
+        stats.semanticSceneProducerClaimMissingKeyCount++;
+      } else {
+        producerClaimStrictPredicted = producerClaimContains(
+            producerClaimStrictKeys, producerClaimStrictKey);
+        producerClaimLogicalPredicted = producerClaimContains(
+            producerClaimLogicalKeys, producerClaimLogicalKey);
+        if (producerClaimStrictPredicted)
+          stats.semanticSceneProducerClaimStrictPredictedCount++;
+        if (producerClaimLogicalPredicted)
+          stats.semanticSceneProducerClaimLogicalPredictedCount++;
+      }
+    }
     EligibleRecord eligible = {};
     eligible.completenessKey = completenessKeyForRecord(record);
     buildRecordTiming.enter(War3BuildEligibleRecordPhase::Prebuild);
@@ -25548,12 +25719,36 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       packetBuildTiming.finish();
       if (!packetBuilt) {
         bucket.packetBuildFailParts++;
+        if (observeProducerClaims)
+          m_war3Scene.shadowStats
+              .semanticSceneProducerClaimUnresolvedCount++;
         continue;
       }
       m_war3Scene.shadowStats.semanticSceneDirectCurrentDrawBuiltPacketCount++;
       if (eligible.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned)
         m_war3Scene.shadowStats
           .semanticSceneDirectCurrentDrawBuiltSkinnedPacketCount++;
+    }
+    if (observeProducerClaims) {
+      auto& stats = m_war3Scene.shadowStats;
+      const bool canonicalOwned = builtPacketHasCanonicalExactOwner(
+          eligible.packet, eligible.sample);
+      if (canonicalOwned)
+        stats.semanticSceneProducerClaimCanonicalOwnedCount++;
+      if (producerClaimStrictPredicted == canonicalOwned) {
+        stats.semanticSceneProducerClaimStrictMatchCount++;
+      } else if (producerClaimStrictPredicted) {
+        stats.semanticSceneProducerClaimStrictFalsePositiveCount++;
+      } else {
+        stats.semanticSceneProducerClaimStrictFalseNegativeCount++;
+      }
+      if (producerClaimLogicalPredicted == canonicalOwned) {
+        stats.semanticSceneProducerClaimLogicalMatchCount++;
+      } else if (producerClaimLogicalPredicted) {
+        stats.semanticSceneProducerClaimLogicalFalsePositiveCount++;
+      } else {
+        stats.semanticSceneProducerClaimLogicalFalseNegativeCount++;
+      }
     }
     // LT/YT world objects are known to masquerade as Unit in TLS. Their
     // current-frame native draw is the only safe representation; if it was

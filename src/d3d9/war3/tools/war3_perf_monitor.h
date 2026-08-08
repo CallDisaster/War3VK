@@ -820,6 +820,21 @@ private:
         uint64_t drawTimeSemanticProducerFallbackCurrentDrawCount = 0;
         uint64_t drawTimeSemanticProducerOwnedDirectGroupedSkipCount = 0;
         uint64_t drawTimeSemanticProducerLifecycleMergedCount = 0;
+        uint64_t semanticSceneProducerClaimObserveMode = 0;
+        uint64_t semanticSceneProducerClaimExactKeyCount = 0;
+        uint64_t semanticSceneProducerClaimCandidateCount = 0;
+        uint64_t semanticSceneProducerClaimCanonicalOwnedCount = 0;
+        uint64_t semanticSceneProducerClaimMissingKeyCount = 0;
+        uint64_t semanticSceneProducerClaimUnresolvedCount = 0;
+        uint64_t semanticSceneProducerClaimStrictPredictedCount = 0;
+        uint64_t semanticSceneProducerClaimStrictMatchCount = 0;
+        uint64_t semanticSceneProducerClaimStrictFalsePositiveCount = 0;
+        uint64_t semanticSceneProducerClaimStrictFalseNegativeCount = 0;
+        uint64_t semanticSceneProducerClaimLogicalPredictedCount = 0;
+        uint64_t semanticSceneProducerClaimLogicalMatchCount = 0;
+        uint64_t semanticSceneProducerClaimLogicalFalsePositiveCount = 0;
+        uint64_t semanticSceneProducerClaimLogicalFalseNegativeCount = 0;
+        uint64_t semanticSceneProducerClaimConsumeDeniedCount = 0;
         // === Phase 7.2: single-caster flicker + reconciliation ===
         uint64_t semanticSceneDirectLastRawRecordCount = 0;
         uint64_t semanticSceneDirectLastEligibleRecordCount = 0;

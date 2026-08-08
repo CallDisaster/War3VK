@@ -1531,6 +1531,37 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.drawTimeSemanticProducerOwnedDirectGroupedSkipCount;
   agg.drawTimeSemanticProducerLifecycleMergedCount +=
       stats.drawTimeSemanticProducerLifecycleMergedCount;
+  agg.semanticSceneProducerClaimObserveMode = std::max(
+      agg.semanticSceneProducerClaimObserveMode,
+      uint64_t(stats.semanticSceneProducerClaimObserveMode));
+  agg.semanticSceneProducerClaimExactKeyCount +=
+      stats.semanticSceneProducerClaimExactKeyCount;
+  agg.semanticSceneProducerClaimCandidateCount +=
+      stats.semanticSceneProducerClaimCandidateCount;
+  agg.semanticSceneProducerClaimCanonicalOwnedCount +=
+      stats.semanticSceneProducerClaimCanonicalOwnedCount;
+  agg.semanticSceneProducerClaimMissingKeyCount +=
+      stats.semanticSceneProducerClaimMissingKeyCount;
+  agg.semanticSceneProducerClaimUnresolvedCount +=
+      stats.semanticSceneProducerClaimUnresolvedCount;
+  agg.semanticSceneProducerClaimStrictPredictedCount +=
+      stats.semanticSceneProducerClaimStrictPredictedCount;
+  agg.semanticSceneProducerClaimStrictMatchCount +=
+      stats.semanticSceneProducerClaimStrictMatchCount;
+  agg.semanticSceneProducerClaimStrictFalsePositiveCount +=
+      stats.semanticSceneProducerClaimStrictFalsePositiveCount;
+  agg.semanticSceneProducerClaimStrictFalseNegativeCount +=
+      stats.semanticSceneProducerClaimStrictFalseNegativeCount;
+  agg.semanticSceneProducerClaimLogicalPredictedCount +=
+      stats.semanticSceneProducerClaimLogicalPredictedCount;
+  agg.semanticSceneProducerClaimLogicalMatchCount +=
+      stats.semanticSceneProducerClaimLogicalMatchCount;
+  agg.semanticSceneProducerClaimLogicalFalsePositiveCount +=
+      stats.semanticSceneProducerClaimLogicalFalsePositiveCount;
+  agg.semanticSceneProducerClaimLogicalFalseNegativeCount +=
+      stats.semanticSceneProducerClaimLogicalFalseNegativeCount;
+  agg.semanticSceneProducerClaimConsumeDeniedCount +=
+      stats.semanticSceneProducerClaimConsumeDeniedCount;
   // Phase 7.2: flicker diagnostics + reconciliation
   agg.semanticSceneDirectLastRawRecordCount = std::max(
       agg.semanticSceneDirectLastRawRecordCount,
@@ -6128,6 +6159,41 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << ",\n";
   json << "    \"drawTimeSemanticProducerLifecycleMergedCount\": "
        << shadowAgg.drawTimeSemanticProducerLifecycleMergedCount << ",\n";
+  json << "    \"semanticSceneProducerClaimObserveMode\": "
+       << shadowAgg.semanticSceneProducerClaimObserveMode << ",\n";
+  json << "    \"semanticSceneProducerClaimExactKeyCount\": "
+       << shadowAgg.semanticSceneProducerClaimExactKeyCount << ",\n";
+  json << "    \"semanticSceneProducerClaimCandidateCount\": "
+       << shadowAgg.semanticSceneProducerClaimCandidateCount << ",\n";
+  json << "    \"semanticSceneProducerClaimCanonicalOwnedCount\": "
+       << shadowAgg.semanticSceneProducerClaimCanonicalOwnedCount << ",\n";
+  json << "    \"semanticSceneProducerClaimMissingKeyCount\": "
+       << shadowAgg.semanticSceneProducerClaimMissingKeyCount << ",\n";
+  json << "    \"semanticSceneProducerClaimUnresolvedCount\": "
+       << shadowAgg.semanticSceneProducerClaimUnresolvedCount << ",\n";
+  json << "    \"semanticSceneProducerClaimStrictPredictedCount\": "
+       << shadowAgg.semanticSceneProducerClaimStrictPredictedCount << ",\n";
+  json << "    \"semanticSceneProducerClaimStrictMatchCount\": "
+       << shadowAgg.semanticSceneProducerClaimStrictMatchCount << ",\n";
+  json << "    \"semanticSceneProducerClaimStrictFalsePositiveCount\": "
+       << shadowAgg.semanticSceneProducerClaimStrictFalsePositiveCount
+       << ",\n";
+  json << "    \"semanticSceneProducerClaimStrictFalseNegativeCount\": "
+       << shadowAgg.semanticSceneProducerClaimStrictFalseNegativeCount
+       << ",\n";
+  json << "    \"semanticSceneProducerClaimLogicalPredictedCount\": "
+       << shadowAgg.semanticSceneProducerClaimLogicalPredictedCount << ",\n";
+  json << "    \"semanticSceneProducerClaimLogicalMatchCount\": "
+       << shadowAgg.semanticSceneProducerClaimLogicalMatchCount << ",\n";
+  json << "    \"semanticSceneProducerClaimLogicalFalsePositiveCount\": "
+       << shadowAgg.semanticSceneProducerClaimLogicalFalsePositiveCount
+       << ",\n";
+  json << "    \"semanticSceneProducerClaimLogicalFalseNegativeCount\": "
+       << shadowAgg.semanticSceneProducerClaimLogicalFalseNegativeCount
+       << ",\n";
+  json << "    \"semanticSceneProducerClaimConsumeDeniedCount\": "
+       << shadowAgg.semanticSceneProducerClaimConsumeDeniedCount << ",\n";
+
   // Phase 7.2: flicker diagnostics + reconciliation
   json << "    \"semanticSceneDirectLastRawRecordCount\": "
        << shadowAgg.semanticSceneDirectLastRawRecordCount << ",\n";
@@ -7424,6 +7490,41 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << ",\n";
   json << "    \"drawTimeSemanticProducerLifecycleMergedCount\": "
        << shadowAgg.drawTimeSemanticProducerLifecycleMergedCount << ",\n";
+  json << "    \"semanticSceneProducerClaimObserveMode\": "
+       << shadowAgg.semanticSceneProducerClaimObserveMode << ",\n";
+  json << "    \"semanticSceneProducerClaimExactKeyCount\": "
+       << shadowAgg.semanticSceneProducerClaimExactKeyCount << ",\n";
+  json << "    \"semanticSceneProducerClaimCandidateCount\": "
+       << shadowAgg.semanticSceneProducerClaimCandidateCount << ",\n";
+  json << "    \"semanticSceneProducerClaimCanonicalOwnedCount\": "
+       << shadowAgg.semanticSceneProducerClaimCanonicalOwnedCount << ",\n";
+  json << "    \"semanticSceneProducerClaimMissingKeyCount\": "
+       << shadowAgg.semanticSceneProducerClaimMissingKeyCount << ",\n";
+  json << "    \"semanticSceneProducerClaimUnresolvedCount\": "
+       << shadowAgg.semanticSceneProducerClaimUnresolvedCount << ",\n";
+  json << "    \"semanticSceneProducerClaimStrictPredictedCount\": "
+       << shadowAgg.semanticSceneProducerClaimStrictPredictedCount << ",\n";
+  json << "    \"semanticSceneProducerClaimStrictMatchCount\": "
+       << shadowAgg.semanticSceneProducerClaimStrictMatchCount << ",\n";
+  json << "    \"semanticSceneProducerClaimStrictFalsePositiveCount\": "
+       << shadowAgg.semanticSceneProducerClaimStrictFalsePositiveCount
+       << ",\n";
+  json << "    \"semanticSceneProducerClaimStrictFalseNegativeCount\": "
+       << shadowAgg.semanticSceneProducerClaimStrictFalseNegativeCount
+       << ",\n";
+  json << "    \"semanticSceneProducerClaimLogicalPredictedCount\": "
+       << shadowAgg.semanticSceneProducerClaimLogicalPredictedCount << ",\n";
+  json << "    \"semanticSceneProducerClaimLogicalMatchCount\": "
+       << shadowAgg.semanticSceneProducerClaimLogicalMatchCount << ",\n";
+  json << "    \"semanticSceneProducerClaimLogicalFalsePositiveCount\": "
+       << shadowAgg.semanticSceneProducerClaimLogicalFalsePositiveCount
+       << ",\n";
+  json << "    \"semanticSceneProducerClaimLogicalFalseNegativeCount\": "
+       << shadowAgg.semanticSceneProducerClaimLogicalFalseNegativeCount
+       << ",\n";
+  json << "    \"semanticSceneProducerClaimConsumeDeniedCount\": "
+       << shadowAgg.semanticSceneProducerClaimConsumeDeniedCount << ",\n";
+
   // Phase 7.2: flicker diagnostics + reconciliation
   json << "    \"semanticSceneDirectLastRawRecordCount\": "
        << shadowAgg.semanticSceneDirectLastRawRecordCount << ",\n";

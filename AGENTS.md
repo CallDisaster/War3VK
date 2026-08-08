@@ -83,6 +83,10 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   contract 原先都不会在地图切换时清空；现在由 `War3Renderer::ResetMapSession` 在 Present 安全点
   发布空快照并清除纯 CPU 指针/姿态表，旧 contract 仍由 `shared_ptr` 保护在途读者。该候选同样尚未
   部署或物理验收，详见 `docs/agent-history/2026-08-09-issue6-semantic-registry-reset.md`。
+- DirectGrouped 的 Producer Claim 目前只有默认关闭的同帧 Observe 预测器；Consume 请求会被明确
+  拒绝且不改变 caster。旧性能报告显示 BuildEligible 是主要 CPU 热点，但 reduced key 尚缺已证明的
+  source/material/alpha 身份，必须先完成至少 10,000 帧零误判实机门，详见
+  `docs/agent-history/2026-08-09-producer-claim-observe.md`。
 - 1.2.0 的发布范围限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍会造成
   性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；点光开启点阴影后，部分
   地面/角度仍有摩尔纹或带状伪影。README/CHANGELOG 必须保留这两项已知问题，后续不得描述为已修复。
