@@ -782,6 +782,13 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t shadowMapQuarantinedRetireSerial = 0;
   uint64_t shadowMapCompletedRetireSerial = 0;
   uint64_t shadowRetiredSessionCount = 0;
+  uint64_t shadowRetiredSessionEntryCount = 0;
+  uint64_t shadowRetiredSessionAllocatorBytes = 0;
+  uint64_t shadowRetiredSessionCachedGpuLogicalBytes = 0;
+  uint64_t shadowRetiredSessionCpuOwnedBytes = 0;
+  uint64_t shadowRetiredSessionOldestRetireSerial = 0;
+  uint64_t shadowRetiredSessionCollectedCount = 0;
+  uint64_t shadowRetiredLastMapEpoch = 0;
   uint64_t shadowPendingProducerRejectCount = 0;
   uint64_t shadowStaleEpochConsumerRejectCount = 0;
   uint64_t shadowReplayValidationRejectCount = 0;

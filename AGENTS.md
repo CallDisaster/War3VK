@@ -83,6 +83,10 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   contract 原先都不会在地图切换时清空；现在由 `War3Renderer::ResetMapSession` 在 Present 安全点
   发布空快照并清除纯 CPU 指针/姿态表，旧 contract 仍由 `shared_ptr` 保护在途读者。该候选同样尚未
   部署或物理验收，详见 `docs/agent-history/2026-08-09-issue6-semantic-registry-reset.md`。
+- Issue #6 的 retired-session census 现可分别报告在途缓存条目、allocator chunk、逻辑 GPU 引用和
+  CPU backing，并在 completion serial 回收后递增 collected 计数；它不改变 fence 或释放时机，仍需
+  冷启动 B / A→B / A→B→A 物理数据确认，详见
+  `docs/agent-history/2026-08-09-issue6-retired-session-census.md`。
 - DirectGrouped 的 Producer Claim 目前只有默认关闭的同帧 Observe 预测器；Consume 请求会被明确
   拒绝且不改变 caster。旧性能报告显示 BuildEligible 是主要 CPU 热点，但 reduced key 尚缺已证明的
   source/material/alpha 身份，必须先完成至少 10,000 帧零误判实机门，详见

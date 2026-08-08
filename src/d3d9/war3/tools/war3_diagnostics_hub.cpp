@@ -1132,6 +1132,19 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
         lifecycle.quarantinedRetireSerial;
     summary.shadowMapCompletedRetireSerial = lifecycle.completedRetireSerial;
     summary.shadowRetiredSessionCount = lifecycle.retiredSessionCount;
+    summary.shadowRetiredSessionEntryCount =
+        lifecycle.retiredSessionEntryCount;
+    summary.shadowRetiredSessionAllocatorBytes =
+        lifecycle.retiredSessionAllocatorBytes;
+    summary.shadowRetiredSessionCachedGpuLogicalBytes =
+        lifecycle.retiredSessionCachedGpuLogicalBytes;
+    summary.shadowRetiredSessionCpuOwnedBytes =
+        lifecycle.retiredSessionCpuOwnedBytes;
+    summary.shadowRetiredSessionOldestRetireSerial =
+        lifecycle.retiredSessionOldestRetireSerial;
+    summary.shadowRetiredSessionCollectedCount =
+        lifecycle.retiredSessionCollectedCount;
+    summary.shadowRetiredLastMapEpoch = lifecycle.retiredLastMapEpoch;
     summary.shadowPendingProducerRejectCount =
         lifecycle.pendingProducerRejectCount;
     summary.shadowMapTransitionState = lifecycle.transitionState;
@@ -3359,6 +3372,20 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.shadowMapCompletedRetireSerial},
         {"shadowRetiredSessionCount",
          snapshot.shadow.shadowRetiredSessionCount},
+        {"shadowRetiredSessionEntryCount",
+         snapshot.shadow.shadowRetiredSessionEntryCount},
+        {"shadowRetiredSessionAllocatorBytes",
+         snapshot.shadow.shadowRetiredSessionAllocatorBytes},
+        {"shadowRetiredSessionCachedGpuLogicalBytes",
+         snapshot.shadow.shadowRetiredSessionCachedGpuLogicalBytes},
+        {"shadowRetiredSessionCpuOwnedBytes",
+         snapshot.shadow.shadowRetiredSessionCpuOwnedBytes},
+        {"shadowRetiredSessionOldestRetireSerial",
+         snapshot.shadow.shadowRetiredSessionOldestRetireSerial},
+        {"shadowRetiredSessionCollectedCount",
+         snapshot.shadow.shadowRetiredSessionCollectedCount},
+        {"shadowRetiredLastMapEpoch",
+         snapshot.shadow.shadowRetiredLastMapEpoch},
         {"shadowPendingProducerRejectCount",
          snapshot.shadow.shadowPendingProducerRejectCount},
         {"shadowStaleEpochConsumerRejectCount",

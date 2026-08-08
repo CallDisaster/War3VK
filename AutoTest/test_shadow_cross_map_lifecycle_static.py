@@ -273,8 +273,41 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
             "shadowReplayPartialPreventedCount",
             "shadowFirstCompleteLatencyFrames",
             "shadowPointLateResultRejectCount",
+            "shadowRetiredSessionEntryCount",
+            "shadowRetiredSessionAllocatorBytes",
+            "shadowRetiredSessionCachedGpuLogicalBytes",
+            "shadowRetiredSessionCpuOwnedBytes",
+            "shadowRetiredSessionOldestRetireSerial",
+            "shadowRetiredSessionCollectedCount",
+            "shadowRetiredLastMapEpoch",
         ):
             self.assertIn(f'"{field}"', DIAGNOSTICS)
+
+    def test_retired_session_census_follows_fence_collection(self) -> None:
+        reset = body(
+            DEVICE,
+            "void D3D9DeviceEx::War3ResetShadowSessionState",
+            "bool D3D9DeviceEx::War3DrainShadowCasterTombstones",
+        )
+        for token in (
+            "retired.entryCount",
+            "retired.allocatorBytes",
+            "retired.cachedGpuLogicalBytes",
+            "retired.cpuOwnedBytes",
+            "entry.ownedGpuBytes",
+            "entry.logicalReferencedBytes",
+            "War3RefreshRetiredShadowSessionDiagnostics()",
+        ):
+            self.assertIn(token, reset)
+
+        collect = body(
+            DEVICE,
+            "void D3D9DeviceEx::War3CollectRetiredShadowSessions",
+            "void D3D9DeviceEx::War3RefreshRetiredShadowSessionDiagnostics",
+        )
+        self.assertIn("session.retireSerial <= completedSerial", collect)
+        self.assertIn("m_war3ShadowDiagRetiredSessionCollectedCount.fetch_add", collect)
+        self.assertIn("War3RefreshRetiredShadowSessionDiagnostics()", collect)
 
     def test_cross_map_recorder_is_attach_only(self) -> None:
         self.assertIn("--attach-pid", RECORDER)

@@ -363,6 +363,13 @@ struct War3ShadowLifecycleDiagnostics {
   uint64_t quarantinedRetireSerial = 0u;
   uint64_t completedRetireSerial = 0u;
   uint64_t retiredSessionCount = 0u;
+  uint64_t retiredSessionEntryCount = 0u;
+  uint64_t retiredSessionAllocatorBytes = 0u;
+  uint64_t retiredSessionCachedGpuLogicalBytes = 0u;
+  uint64_t retiredSessionCpuOwnedBytes = 0u;
+  uint64_t retiredSessionOldestRetireSerial = 0u;
+  uint64_t retiredSessionCollectedCount = 0u;
+  uint64_t retiredLastMapEpoch = 0u;
   uint64_t pendingProducerRejectCount = 0u;
   uint32_t transitionState = 0u; // 0=ready, 1=requested, 2=quarantined
   uint32_t producerReady = 0u;
@@ -1358,6 +1365,7 @@ private:
   bool War3ApplyShadowMapEpochResetAtPresent(uint64_t retireSerial);
   void War3ResetShadowSessionState(uint64_t retireSerial);
   void War3CollectRetiredShadowSessions(uint64_t completedSerial);
+  void War3RefreshRetiredShadowSessionDiagnostics();
 
   // War3：捕获世界相机与投影（用于 CSM/后处理）
   void War3RecordWorldCamera();
@@ -1800,6 +1808,15 @@ private:
   std::atomic<uint64_t> m_war3ShadowDiagQuarantinedRetireSerial { 0u };
   std::atomic<uint64_t> m_war3ShadowDiagCompletedRetireSerial { 0u };
   std::atomic<uint64_t> m_war3ShadowDiagRetiredSessionCount { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagRetiredSessionEntryCount { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagRetiredSessionAllocatorBytes { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagRetiredSessionCachedGpuLogicalBytes {
+    0u };
+  std::atomic<uint64_t> m_war3ShadowDiagRetiredSessionCpuOwnedBytes { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagRetiredSessionOldestRetireSerial {
+    0u };
+  std::atomic<uint64_t> m_war3ShadowDiagRetiredSessionCollectedCount { 0u };
+  std::atomic<uint64_t> m_war3ShadowDiagRetiredLastMapEpoch { 0u };
   std::atomic<uint64_t> m_war3ShadowDiagPendingProducerRejectCount { 0u };
   std::atomic<uint32_t> m_war3ShadowDiagTransitionState { 0u };
   Rc<DxvkFence> m_war3GpuSkinFence;
@@ -2699,6 +2716,13 @@ private:
   struct War3RetiredShadowSession {
     uint64_t mapEpoch = 0u;
     uint64_t retireSerial = 0u;
+    // Census fields are computed once when the live containers move into this
+    // fence-owned record. GPU logical bytes can contain aliases and are not a
+    // unique residency measurement; allocator bytes are reported separately.
+    uint64_t entryCount = 0u;
+    uint64_t allocatorBytes = 0u;
+    uint64_t cachedGpuLogicalBytes = 0u;
+    uint64_t cpuOwnedBytes = 0u;
     std::array<War3ShadowBufferAllocator, 3> shadowAllocators;
     std::array<War3ShadowMappedBufferAllocator, 3> shadowMappedAllocators;
     std::array<War3ShadowFrozenGeometryCache, 3> frozenGeometryCaches;

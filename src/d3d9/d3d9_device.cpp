@@ -14499,6 +14499,26 @@ D3D9DeviceEx::QueryWar3ShadowLifecycleDiagnostics() const {
       m_war3ShadowDiagCompletedRetireSerial.load(std::memory_order_acquire);
   result.retiredSessionCount = m_war3ShadowDiagRetiredSessionCount.load(
       std::memory_order_acquire);
+  result.retiredSessionEntryCount =
+      m_war3ShadowDiagRetiredSessionEntryCount.load(
+          std::memory_order_acquire);
+  result.retiredSessionAllocatorBytes =
+      m_war3ShadowDiagRetiredSessionAllocatorBytes.load(
+          std::memory_order_acquire);
+  result.retiredSessionCachedGpuLogicalBytes =
+      m_war3ShadowDiagRetiredSessionCachedGpuLogicalBytes.load(
+          std::memory_order_acquire);
+  result.retiredSessionCpuOwnedBytes =
+      m_war3ShadowDiagRetiredSessionCpuOwnedBytes.load(
+          std::memory_order_acquire);
+  result.retiredSessionOldestRetireSerial =
+      m_war3ShadowDiagRetiredSessionOldestRetireSerial.load(
+          std::memory_order_acquire);
+  result.retiredSessionCollectedCount =
+      m_war3ShadowDiagRetiredSessionCollectedCount.load(
+          std::memory_order_acquire);
+  result.retiredLastMapEpoch = m_war3ShadowDiagRetiredLastMapEpoch.load(
+      std::memory_order_acquire);
   result.pendingProducerRejectCount =
       m_war3ShadowDiagPendingProducerRejectCount.load(
           std::memory_order_acquire);
@@ -24007,6 +24027,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
 
 void D3D9DeviceEx::War3CollectRetiredShadowSessions(
     uint64_t completedSerial) {
+  const size_t beforeCount = m_war3RetiredShadowSessions.size();
   m_war3RetiredShadowSessions.erase(
       std::remove_if(
           m_war3RetiredShadowSessions.begin(),
@@ -24016,10 +24037,51 @@ void D3D9DeviceEx::War3CollectRetiredShadowSessions(
                    session.retireSerial <= completedSerial;
           }),
       m_war3RetiredShadowSessions.end());
+  const size_t collectedCount =
+      beforeCount - m_war3RetiredShadowSessions.size();
+  if (collectedCount != 0u) {
+    m_war3ShadowDiagRetiredSessionCollectedCount.fetch_add(
+        uint64_t(collectedCount), std::memory_order_relaxed);
+  }
   m_war3ShadowDiagCompletedRetireSerial.store(
       completedSerial, std::memory_order_release);
+  War3RefreshRetiredShadowSessionDiagnostics();
+}
+
+void D3D9DeviceEx::War3RefreshRetiredShadowSessionDiagnostics() {
+  uint64_t entryCount = 0u;
+  uint64_t allocatorBytes = 0u;
+  uint64_t cachedGpuLogicalBytes = 0u;
+  uint64_t cpuOwnedBytes = 0u;
+  uint64_t oldestRetireSerial = 0u;
+  const auto saturatingAdd = [](uint64_t& total, uint64_t value) {
+    const uint64_t limit = std::numeric_limits<uint64_t>::max();
+    total = value > limit - total ? limit : total + value;
+  };
+  for (const auto& session : m_war3RetiredShadowSessions) {
+    saturatingAdd(entryCount, session.entryCount);
+    saturatingAdd(allocatorBytes, session.allocatorBytes);
+    saturatingAdd(cachedGpuLogicalBytes, session.cachedGpuLogicalBytes);
+    saturatingAdd(cpuOwnedBytes, session.cpuOwnedBytes);
+    if (session.retireSerial != 0u &&
+        (oldestRetireSerial == 0u ||
+         session.retireSerial < oldestRetireSerial)) {
+      oldestRetireSerial = session.retireSerial;
+    }
+  }
   m_war3ShadowDiagRetiredSessionCount.store(
-      m_war3RetiredShadowSessions.size(), std::memory_order_release);
+      uint64_t(m_war3RetiredShadowSessions.size()),
+      std::memory_order_release);
+  m_war3ShadowDiagRetiredSessionEntryCount.store(
+      entryCount, std::memory_order_release);
+  m_war3ShadowDiagRetiredSessionAllocatorBytes.store(
+      allocatorBytes, std::memory_order_release);
+  m_war3ShadowDiagRetiredSessionCachedGpuLogicalBytes.store(
+      cachedGpuLogicalBytes, std::memory_order_release);
+  m_war3ShadowDiagRetiredSessionCpuOwnedBytes.store(
+      cpuOwnedBytes, std::memory_order_release);
+  m_war3ShadowDiagRetiredSessionOldestRetireSerial.store(
+      oldestRetireSerial, std::memory_order_release);
 }
 
 void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
@@ -24046,9 +24108,67 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   retired.drawTimeVbCache = std::move(m_war3DrawTimeVBCache);
   retired.s1TerrainCasterStash = std::move(m_war3S1TerrainCasterStash);
   retired.s1TerrainEarlyCache = std::move(m_war3S1TerrainEarlyCache);
+
+  const auto saturatingAdd = [](uint64_t& total, uint64_t value) {
+    const uint64_t limit = std::numeric_limits<uint64_t>::max();
+    total = value > limit - total ? limit : total + value;
+  };
+  const auto addEntries = [&saturatingAdd](uint64_t& total, size_t count) {
+    saturatingAdd(total, uint64_t(count));
+  };
+  for (const auto& allocator : retired.shadowAllocators) {
+    saturatingAdd(
+        retired.allocatorBytes,
+        uint64_t(allocator.chunks.size()) *
+            uint64_t(War3ShadowBufferAllocator::ChunkSize));
+  }
+  for (const auto& allocator : retired.shadowMappedAllocators) {
+    saturatingAdd(
+        retired.allocatorBytes,
+        uint64_t(allocator.chunks.size()) *
+            uint64_t(War3ShadowMappedBufferAllocator::ChunkSize));
+  }
+  for (const auto& cache : retired.frozenGeometryCaches) {
+    addEntries(retired.entryCount, cache.size());
+    for (const auto& [key, entry] : cache) {
+      (void)key;
+      saturatingAdd(retired.cachedGpuLogicalBytes, entry.totalFreezeBytes);
+    }
+  }
+  addEntries(retired.entryCount, retired.frameFreezeCatalog.size());
+  for (const auto& [key, entry] : retired.frameFreezeCatalog) {
+    (void)key;
+    saturatingAdd(retired.cachedGpuLogicalBytes, entry.sourceBytes);
+  }
+  addEntries(retired.entryCount, retired.geometryRegistry.size());
+  addEntries(retired.entryCount, retired.persistentGeometries.size());
+  for (const auto& [geometryId, entry] : retired.persistentGeometries) {
+    (void)geometryId;
+    saturatingAdd(retired.cachedGpuLogicalBytes, entry.totalBytes);
+  }
+  addEntries(retired.entryCount, retired.stage13RetainedCasters.size());
+  for (const auto& [key, entry] : retired.stage13RetainedCasters) {
+    (void)key;
+    saturatingAdd(retired.cpuOwnedBytes,
+                  uint64_t(entry.positionBytes.size()));
+  }
+  addEntries(retired.entryCount, retired.persistentExpiryQueue.size());
+  addEntries(retired.entryCount, retired.drawTimeVbCache.size());
+  for (const auto& [key, entry] : retired.drawTimeVbCache) {
+    (void)key;
+    saturatingAdd(retired.cachedGpuLogicalBytes, entry.ownedGpuBytes);
+  }
+  addEntries(retired.entryCount, retired.s1TerrainCasterStash.size());
+  addEntries(retired.entryCount, retired.s1TerrainEarlyCache.size());
+  for (const auto& [key, entry] : retired.s1TerrainEarlyCache) {
+    (void)key;
+    saturatingAdd(retired.cachedGpuLogicalBytes,
+                  entry.logicalReferencedBytes);
+  }
+  m_war3ShadowDiagRetiredLastMapEpoch.store(
+      retired.mapEpoch, std::memory_order_release);
   m_war3RetiredShadowSessions.emplace_back(std::move(retired));
-  m_war3ShadowDiagRetiredSessionCount.store(
-      m_war3RetiredShadowSessions.size(), std::memory_order_release);
+  War3RefreshRetiredShadowSessionDiagnostics();
 
   m_war3ShadowAllocators = {};
   m_war3ShadowMappedAllocators = {};
