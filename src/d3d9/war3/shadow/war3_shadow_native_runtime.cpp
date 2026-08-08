@@ -219,6 +219,10 @@ bool NativeD3D9BackendRuntime::buildCanonicalFrame(
     packet.resource.primitiveRecordCount = mesh.primitiveRecordCount;
     packet.resource.explicitBlendCount = skin.explicitBlendCount;
     packet.resource.contentHash = mesh.contentHash;
+    packet.resource.mapEpoch = mesh.mapEpoch;
+    packet.resource.immutableModelGeneration =
+        mesh.immutableModelGeneration;
+    packet.resource.localBounds = mesh.localBounds;
     packet.resource.topology = mesh.topology;
     packet.resource.ownedPositions = canonicalDraw.positions;
     packet.resource.positions = &packet.resource.ownedPositions;

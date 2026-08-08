@@ -100,6 +100,9 @@ struct CanonicalMeshAsset {
   uint32_t vertexCount = 0u;
   uint32_t primitiveRecordCount = 0u;
   uint64_t contentHash = 0u;
+  uint64_t mapEpoch = 0u;
+  uint64_t immutableModelGeneration = 0u;
+  model::ShadowGeosetLocalBounds localBounds = {};
   shadow::ShadowPrimitiveTopology topology =
       shadow::ShadowPrimitiveTopology::TriangleList;
   CanonicalGeometrySource geometrySource =

@@ -1374,6 +1374,13 @@ uint64_t ShadowCasterTraceContentHash(
   ShadowCasterTraceHashBytes(hash, &draw.boundsCenter,
                              sizeof(draw.boundsCenter));
   ShadowCasterTraceHashValue(hash, draw.boundsRadius);
+  ShadowCasterTraceHashValue(hash, draw.boundsProvenance);
+  ShadowCasterTraceHashValue(hash, draw.boundsSourceGeneration);
+  ShadowCasterTraceHashValue(hash, draw.boundsFrameSerial);
+  ShadowCasterTraceHashValue(hash, draw.boundsIdentityProven);
+  ShadowCasterTraceHashValue(hash, draw.boundsSourceWasSkinned);
+  ShadowCasterTraceHashValue(hash, draw.boundsFrameLocalDynamic);
+  ShadowCasterTraceHashValue(hash, draw.boundsAnimatedAttachment);
   ShadowCasterTraceHashValue(hash, draw.positionStride);
   ShadowCasterTraceHashValue(hash, draw.positionOffset);
   ShadowCasterTraceHashValue(hash, draw.positionFormat);
@@ -1550,6 +1557,19 @@ void WriteFinalShadowCasterRecordEvent(
      << draw.boundsCenter.y << ',' << draw.boundsCenter.z << ','
      << draw.boundsCenter.w << ']'
      << ",\"boundsRadius\":" << draw.boundsRadius
+     << ",\"boundsProvenance\":"
+     << static_cast<uint32_t>(draw.boundsProvenance)
+     << ",\"boundsSourceGeneration\":"
+     << draw.boundsSourceGeneration
+     << ",\"boundsFrameSerial\":" << draw.boundsFrameSerial
+     << ",\"boundsIdentityProven\":"
+     << (draw.boundsIdentityProven ? 1 : 0)
+     << ",\"boundsSourceWasSkinned\":"
+     << (draw.boundsSourceWasSkinned ? 1 : 0)
+     << ",\"boundsFrameLocalDynamic\":"
+     << (draw.boundsFrameLocalDynamic ? 1 : 0)
+     << ",\"boundsAnimatedAttachment\":"
+     << (draw.boundsAnimatedAttachment ? 1 : 0)
      << ",\"worldTranslation\":[" << draw.worldMatrix[3].x << ','
      << draw.worldMatrix[3].y << ',' << draw.worldMatrix[3].z << ']'
      << ",\"worldMatrix\":";

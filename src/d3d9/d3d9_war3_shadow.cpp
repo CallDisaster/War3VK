@@ -3921,6 +3921,11 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
   static const bool s_disableFarCascadeCull =
       EnvFlagDefault("DXVK_WAR3_CSM_DISABLE_FAR_CASCADE_CULL", false);
+  // Generation-backed object bounds remain Observe-only by default.  A
+  // physical A/B must prove zero false negatives before this experimental
+  // switch may consume C2/C3 visibility decisions.
+  static const bool s_objectBoundsCullConsume =
+      EnvFlagDefault("DXVK_WAR3_OBJECT_BOUNDS_CULL_CONSUME", false);
   const auto terrainBoundsCullMode = m_volumeSunRenderPathActive
       ? war3::render::War3TerrainBoundsCullMode::Off
       : War3TerrainBoundsCullModeRuntime();
@@ -3939,7 +3944,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         draw.boundsSourceGeneration,
         draw.boundsFrameSerial,
         input.frameSerial,
-        draw.boundsSourceGeneration != 0u,
+        draw.boundsIdentityProven,
         draw.boundsSourceWasSkinned,
         draw.boundsFrameLocalDynamic,
         draw.boundsAnimatedAttachment,
@@ -4117,13 +4122,16 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
               war3::render::War3TerrainBoundsCullMode::Consume &&
           c >= 2u;
       const bool objectWouldBeVisible = terrainDraw ||
-          intersectsCascadeUnchecked(draw, c);
-      if (!terrainDraw && c >= 2u && !objectWouldBeVisible) {
+          intersectsCascadeAuthorized(draw, c, boundsPolicy);
+      if (!terrainDraw && boundsPolicy.mayCull && c >= 2u &&
+          !objectWouldBeVisible) {
         ++reconciliation.objectBoundsWouldCullCount;
       }
+      const bool consumeObjectCascade =
+          s_objectBoundsCullConsume && c >= 2u;
       const bool actualVisible = terrainDraw
           ? !consumeTerrainCascade || terrainWouldBeVisible
-          : intersectsCascadeAuthorized(draw, c, boundsPolicy);
+          : !consumeObjectCascade || objectWouldBeVisible;
       if (actualVisible) {
         actualMask |= uint8_t(1u << c);
       } else if (terrainDraw) {

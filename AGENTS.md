@@ -66,6 +66,10 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   16/16 runnable 通过。部署 DLL SHA-256 为
   `9FE2F6132015D6BF5413B844915187F80D9F53E14F204564890CD9E71E12AED3`。详细证据见
   `docs/agent-history/2026-08-07-life-and-death-night-gate.md`。
+- 2026-08-09 的对象 bounds 候选已由模型缓存的 map epoch 与 process-monotonic immutable
+  generation 派生精确局部 geoset bounds，并以独立 identity proof 贯穿到最终 CSM；skinned/
+  动态附件保持 fail-visible。对象 C2/C3 消费默认关闭，只允许先收集 Observe 证据，详见
+  `docs/agent-history/2026-08-09-generation-backed-object-bounds-observe.md`。
 - 2026-08-09 已确认最终 CSM 曾允许非地形 C2/C3 使用未证明的猜测包围球剔除；当前本地候选统一使用
   bounds provenance 授权，Unknown/Generic/Animated/Skinned 一律 fail-visible，并保留 would-cull 统计。
   该候选会增加远级联工作，尚未部署或通过低视角物理 A/B，详见

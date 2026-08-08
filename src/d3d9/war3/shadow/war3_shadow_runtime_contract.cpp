@@ -845,6 +845,9 @@ ShadowModelResourceRecord ConvertGeoset(
   for (const auto& uvLayer : src.uvLayers)
     dst.uvLayers.push_back(uvLayer.uvPairs);
   dst.contentHash = src.contentHash;
+  dst.mapEpoch = src.mapEpoch;
+  dst.immutableModelGeneration = src.immutableModelGeneration;
+  dst.localBounds = src.localBounds;
   dst.frameSerial = frameSerial;
   return dst;
 }

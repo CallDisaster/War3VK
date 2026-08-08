@@ -996,6 +996,7 @@ void ReplaceGeosetImmutablePayload(ShadowGeosetResourceRecord& dst,
   dst.matrixIndices = src.matrixIndices;
   dst.contentHash = src.contentHash;
   dst.immutableModelGeneration = 0u;
+  dst.localBounds = {};
   dst.immutableCaptureStatus = src.immutableCaptureStatus;
 }
 
@@ -1125,6 +1126,7 @@ ShadowGeosetResourceSnapshot ShadowModelResourceCache::storeGeosetRecord(
     MergeGeosetMetadata(unresolved, record);
     unresolved.immutableCaptureStatus = record.immutableCaptureStatus;
     unresolved.immutableModelGeneration = 0u;
+    unresolved.localBounds = {};
     unresolved.contentHash = ComputeGeosetContentHash(unresolved);
     const bool changed = existingByGeoset->immutableModelGeneration != 0u ||
         existingByGeoset->immutableCaptureStatus !=
@@ -1156,6 +1158,7 @@ ShadowGeosetResourceSnapshot ShadowModelResourceCache::storeGeosetRecord(
     merged.immutableCaptureStatus =
         ShadowGeosetImmutableCaptureStatus::AttemptedFailed;
     merged.immutableModelGeneration = 0u;
+    merged.localBounds = {};
     merged.contentHash = ComputeGeosetContentHash(merged);
   } else {
     // Header-only metadata may reuse immutable bytes only from the same
@@ -1196,6 +1199,9 @@ ShadowGeosetResourceSnapshot ShadowModelResourceCache::storeGeosetRecord(
     }
   }
   merged.immutableModelGeneration = generation;
+  merged.localBounds = generation != 0u
+      ? ComputeShadowGeosetLocalBounds(merged.positions, merged.vertexCount)
+      : ShadowGeosetLocalBounds{};
 
   const ShadowGeosetResourceRecord* comparison = existingByData != nullptr
       ? existingByData.get() : existingByGeoset;

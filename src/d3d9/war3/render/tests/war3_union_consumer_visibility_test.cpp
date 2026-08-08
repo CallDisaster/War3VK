@@ -230,6 +230,13 @@ void TestBoundsProvenanceRequiresExactCurrentEvidence() {
         War3ShadowBoundsCullRejectReason::FrameGenerationStale);
 
   evidence.boundsFrameSerial = 17u;
+  evidence.identityProven = false;
+  result = War3EvaluateBoundsCullEvidence(evidence);
+  CHECK(!result.mayCull);
+  CHECK(result.rejectReason ==
+        War3ShadowBoundsCullRejectReason::IdentityUnproven);
+
+  evidence.identityProven = true;
   evidence.frameLocalDynamic = true;
   result = War3EvaluateBoundsCullEvidence(evidence);
   CHECK(result.mayCull);

@@ -6521,6 +6521,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     resource.primitiveRecordCount = geo.primitiveCount;
     resource.explicitBlendCount = 0u;
     resource.contentHash = geo.contentHash;
+    resource.mapEpoch = geo.mapEpoch;
+    resource.immutableModelGeneration = geo.immutableModelGeneration;
+    resource.localBounds = geo.localBounds;
     resource.topology =
         dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
     resource.positions = &geo.positions;
@@ -22806,6 +22809,52 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           baseRadius * War3SemanticBoundsMaxScale(draw.worldMatrix);
     }
   }
+
+  // Only the model-cache generation authority may promote a diagnostic
+  // sphere into an exact static culling proof.  The current scene-node matrix
+  // supplies this frame's transform; the immutable model generation supplies
+  // the local geoset bytes.  Animated/skinned attachments intentionally fail
+  // this gate and remain visible in every cascade.
+  const bool exactStaticKind =
+      resolvedObjectKind == dxvk::war3::render::ObjectKind::Building ||
+      resolvedObjectKind ==
+          dxvk::war3::render::ObjectKind::Destructible;
+  const bool exactGeosetIdentity =
+      canonicalIdentity.renderablePart != nullptr &&
+      canonicalIdentity.meshDataPtr != nullptr &&
+      canonicalIdentity.runtimeGeosetDataPtr != nullptr &&
+      canonicalIdentity.meshDataPtr ==
+          canonicalIdentity.runtimeGeosetDataPtr &&
+      canonicalMesh.runtimeGeosetDataPtr ==
+          canonicalIdentity.runtimeGeosetDataPtr;
+  const bool exactStaticBounds =
+      exactStaticKind && !skinned && !frameLocalDynamicGeometry &&
+      canonicalMesh.geometrySource ==
+          dxvk::war3::render::CanonicalGeometrySource::StaticResource &&
+      canonicalMesh.mapEpoch == m_war3GpuSkinMapEpoch &&
+      canonicalMesh.immutableModelGeneration != 0u &&
+      canonicalMesh.localBounds.valid && exactGeosetIdentity &&
+      canonicalWorldTransform.valid &&
+      canonicalWorldTransform.source ==
+          dxvk::war3::render::CanonicalWorldTransformSource::SceneNode;
+  if (exactStaticBounds) {
+    const Vector4 exactLocalCenter(
+        canonicalMesh.localBounds.centerX,
+        canonicalMesh.localBounds.centerY,
+        canonicalMesh.localBounds.centerZ, 1.0f);
+    War3ApplySemanticBoundsFromMatrix(
+        draw, canonicalWorldTransform.matrix, exactLocalCenter,
+        canonicalMesh.localBounds.radius);
+    draw.boundsProvenance = dxvk::war3::render::
+        War3ShadowBoundsProvenance::ExactLocalGeoset;
+    draw.boundsSourceGeneration =
+        canonicalMesh.immutableModelGeneration;
+    draw.boundsFrameSerial = m_war3ShadowPersistentFrameSerial + 1u;
+    draw.boundsIdentityProven = true;
+    draw.boundsSourceWasSkinned = false;
+    draw.boundsFrameLocalDynamic = false;
+    draw.boundsAnimatedAttachment = false;
+  }
   }
 
   fallbackAppendTiming.enter(War3FallbackAppendPhase::Publish);
@@ -22819,6 +22868,17 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   // cascade 0/1 不 cull（intersectsCascade 里 cascadeIdx<2 直接 return true），
   // 所以即使 bounds 不完美也不会让近处阴影消失。
   if (drawTimeVBOverrideApplied) {
+    // The draw-time override is current-frame geometry with a different
+    // ownership contract.  It may keep a diagnostic sphere, but it must not
+    // inherit the immutable model record's culling authority.
+    draw.boundsProvenance =
+        dxvk::war3::render::War3ShadowBoundsProvenance::Unknown;
+    draw.boundsSourceGeneration = 0u;
+    draw.boundsFrameSerial = 0u;
+    draw.boundsIdentityProven = false;
+    draw.boundsSourceWasSkinned = skinned;
+    draw.boundsFrameLocalDynamic = true;
+    draw.boundsAnimatedAttachment = skinned;
     if (drawTimeVBEntry != nullptr && drawTimeVBEntry->sceneNode != nullptr) {
       const auto* matBase = reinterpret_cast<const uint8_t*>(
           drawTimeVBEntry->sceneNode) + dxvk::war3::SceneNodeOffsets::WorldMatrix;
@@ -30160,6 +30220,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
       packet.resource.primitiveRecordCount =
           uint32_t(resourceRecord->primitiveRecords.size());
       packet.resource.contentHash = resourceRecord->contentHash;
+      packet.resource.mapEpoch = resourceRecord->mapEpoch;
+      packet.resource.immutableModelGeneration =
+          resourceRecord->immutableModelGeneration;
+      packet.resource.localBounds = resourceRecord->localBounds;
       packet.resource.topology =
           dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
       packet.resource.positions = &resourceRecord->positions;
@@ -48037,6 +48101,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.boundsFrameSerial = estimatedBoundsExactCurrentWorld
         ? m_war3ShadowPersistentFrameSerial + 1u
         : 0u;
+    draw.boundsIdentityProven = estimatedBoundsExactCurrentWorld &&
+        estimatedBoundsSourceGeneration != 0u;
     draw.boundsSourceWasSkinned = false;
     draw.boundsFrameLocalDynamic = posDynamic || DynamicSysmemVBOs;
     draw.boundsAnimatedAttachment = false;

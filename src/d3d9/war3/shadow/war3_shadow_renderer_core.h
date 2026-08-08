@@ -31,6 +31,9 @@ struct ShadowPacketResource {
   uint32_t primitiveRecordCount = 0;
   uint8_t explicitBlendCount = 0;
   uint64_t contentHash = 0;
+  uint64_t mapEpoch = 0u;
+  uint64_t immutableModelGeneration = 0u;
+  model::ShadowGeosetLocalBounds localBounds = {};
   ShadowPrimitiveTopology topology = ShadowPrimitiveTopology::TriangleList;
   const std::vector<float>* positions = nullptr;
   const std::vector<uint8_t>* vertexGroupIndices = nullptr;

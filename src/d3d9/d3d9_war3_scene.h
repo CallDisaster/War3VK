@@ -237,6 +237,7 @@ namespace dxvk {
             war3::render::War3ShadowBoundsProvenance::Unknown;
         uint64_t boundsSourceGeneration = 0u;
         uint64_t boundsFrameSerial = 0u;
+        bool boundsIdentityProven = false;
         bool boundsSourceWasSkinned = false;
         bool boundsFrameLocalDynamic = false;
         bool boundsAnimatedAttachment = false;

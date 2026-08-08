@@ -291,6 +291,20 @@ test(
   timeout : 30,
 )
 
+war3_geoset_local_bounds_test = executable(
+  'war3_geoset_local_bounds_test',
+  [
+    'war3/model/tests/war3_geoset_local_bounds_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_geoset_local_bounds',
+  war3_geoset_local_bounds_test,
+  timeout : 30,
+)
+
 war3_shadow_replay_validation_test = executable(
   'war3_shadow_replay_validation_test',
   [

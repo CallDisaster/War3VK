@@ -86,6 +86,9 @@ bool BuildCanonicalShadowDrawItem(const CanonicalShadowBuildInputs& inputs,
   mesh.vertexCount = inputs.vertexCount;
   mesh.primitiveRecordCount = packet.resource.primitiveRecordCount;
   mesh.contentHash = packet.resource.contentHash;
+  mesh.mapEpoch = packet.resource.mapEpoch;
+  mesh.immutableModelGeneration = packet.resource.immutableModelGeneration;
+  mesh.localBounds = packet.resource.localBounds;
   mesh.topology = packet.resource.topology;
   mesh.useIndices = inputs.useIndices;
   mesh.effectiveIndexCount = inputs.effectiveIndexCount;

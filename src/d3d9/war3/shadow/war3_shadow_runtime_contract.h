@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../model/war3_geoset_local_bounds.h"
 #include "../render/war3_render_objects.h"
 #include "../render/war3_visible_renderables.h"
 
@@ -91,6 +92,9 @@ struct ShadowModelResourceRecord {
   std::vector<uint16_t> indices;
   std::vector<std::vector<float>> uvLayers;
   uint64_t contentHash = 0;
+  uint64_t mapEpoch = 0u;
+  uint64_t immutableModelGeneration = 0u;
+  model::ShadowGeosetLocalBounds localBounds = {};
   uint64_t frameSerial = 0;
 
   bool readyForConsumer() const {

@@ -154,6 +154,9 @@ ShadowModelResourceRecord ConvertGeosetRecord(
   for (const auto& uvLayer : src.uvLayers)
     dst.uvLayers.push_back(uvLayer.uvPairs);
   dst.contentHash = src.contentHash;
+  dst.mapEpoch = src.mapEpoch;
+  dst.immutableModelGeneration = src.immutableModelGeneration;
+  dst.localBounds = src.localBounds;
   dst.frameSerial = frameSerial;
   return dst;
 }
@@ -773,6 +776,9 @@ ShadowPacketResource MakePacketResourceRef(
   dst.vertexCount = src.vertexCount;
   dst.primitiveRecordCount = uint32_t(src.primitiveRecords.size());
   dst.contentHash = src.contentHash;
+  dst.mapEpoch = src.mapEpoch;
+  dst.immutableModelGeneration = src.immutableModelGeneration;
+  dst.localBounds = src.localBounds;
   dst.topology = ShadowPrimitiveTopology::TriangleList;
   dst.positions = &src.positions;
   dst.vertexGroupIndices = &src.vertexGroupIndices;
@@ -1400,6 +1406,9 @@ ShadowPacketResource MakePacketResourceOwned(
   dst.vertexCount = src.vertexCount;
   dst.primitiveRecordCount = uint32_t(src.primitiveRecords.size());
   dst.contentHash = src.contentHash;
+  dst.mapEpoch = src.mapEpoch;
+  dst.immutableModelGeneration = src.immutableModelGeneration;
+  dst.localBounds = src.localBounds;
   dst.topology = ShadowPrimitiveTopology::TriangleList;
   dst.ownedPositions = src.positions;
   dst.ownedVertexGroupIndices = src.vertexGroupIndices;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "war3_geoset_local_bounds.h"
 #include "war3_immutable_model_generation.h"
 
 #include <atomic>
@@ -76,6 +77,10 @@ struct ShadowGeosetResourceRecord {
   // Callers may carry this value, but incoming values are never trusted or
   // merged when the cache publishes a replacement immutable snapshot.
   uint64_t immutableModelGeneration = 0;
+  // Valid only as a derivative of positions belonging to the generation
+  // above.  It is cleared on every unresolved/failed publication and is never
+  // accepted from an incoming runtime record.
+  ShadowGeosetLocalBounds localBounds = {};
   ShadowGeosetImmutableCaptureStatus immutableCaptureStatus =
       ShadowGeosetImmutableCaptureStatus::NotAttempted;
   uint64_t firstSeenFrame = 0;
