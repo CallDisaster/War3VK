@@ -24,6 +24,9 @@ LIFECYCLE = (
 MODEL_REGISTRY = (
     ROOT / "src/d3d9/war3/model/war3_model_registry.cpp"
 ).read_text(encoding="utf-8")
+MODEL_HOOK = (
+    ROOT / "src/d3d9/war3/model/war3_model_hook.cpp"
+).read_text(encoding="utf-8")
 SHADOW_OBJECT = (
     ROOT / "src/d3d9/war3/render/war3_shadow_object_registry.cpp"
 ).read_text(encoding="utf-8")
@@ -51,6 +54,49 @@ def body(text: str, signature: str, next_signature: str) -> str:
 
 
 class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
+    def test_model_hook_map_reset_preserves_hooks_and_drops_raw_pointer_state(self) -> None:
+        reset = body(MODEL_HOOK, "void ResetMapSession()", "void Shutdown()")
+        for required in (
+            "entry.valid = false",
+            "entry.renderablePart.store(0u",
+            "entry.paletteWriteSerial.store(0u",
+            "s_cachedGlobalPaletteBufBase.store(0u",
+            "g_runtimePoseArrayByModel.clear()",
+            "g_runtimePoseArrayByMatrixPtr.clear()",
+            "g_runtimePoseArrayRegistrySize.store(0u",
+            "g_runtimeParentLinks.clear()",
+            "g_runtimePaletteTreeDedupeRoots.clear()",
+            "g_runtimePaletteTreeDedupeOwnerRoots.clear()",
+        ):
+            self.assertIn(required, reset)
+        for forbidden in (
+            "g_active.store(false",
+            "g_bootstrapHooksInstalled.store(false",
+            "g_fullHooksInstalled.store(false",
+            "g_gameBase = 0u",
+        ):
+            self.assertNotIn(forbidden, reset)
+
+        shutdown = body(MODEL_HOOK, "void Shutdown()", "bool IsActive()")
+        self.assertIn("ResetMapSession()", shutdown)
+        self.assertIn("g_active.store(false", shutdown)
+
+        epoch_reset = body(
+            DEVICE,
+            "void D3D9DeviceEx::War3ResetGpuSkinMapEpoch()",
+            "void D3D9DeviceEx::War3RequestShadowMapEpochReset()",
+        )
+        resource_epoch = epoch_reset.index("resetMapEpoch(")
+        producer_reset = epoch_reset.index("war3::model::ResetMapSession()")
+        self.assertLess(resource_epoch, producer_reset)
+
+        transition = body(
+            DEVICE,
+            "bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(",
+            "bool D3D9DeviceEx::War3GpuSkinDeviceReady() const",
+        )
+        self.assertNotIn("war3::model::Shutdown()", transition)
+
     def test_shadow_runtime_hot_caches_are_map_scoped(self) -> None:
         pointer_cache = body(
             CONTRACT_CACHE,

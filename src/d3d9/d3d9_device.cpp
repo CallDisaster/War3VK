@@ -9956,6 +9956,9 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
       .resetShadowManifestMapEpoch(m_war3GpuSkinMapEpoch);
   war3::model::ShadowModelResourceCache::instance().resetMapEpoch(
       m_war3GpuSkinMapEpoch);
+  // A fresh D3D9 owner must not inherit producer caches populated by an older
+  // device in the same process.
+  war3::model::ResetMapSession();
   war3shader::internal::InitShaderPackRuntime(m_dxvkDevice);
   war3shader::internal::SetVulkanHandles(
       reinterpret_cast<void *>(m_dxvkDevice->instance()->handle()),
@@ -14503,6 +14506,10 @@ void D3D9DeviceEx::War3ResetGpuSkinMapEpoch() {
       .resetShadowManifestMapEpoch(m_war3GpuSkinMapEpoch);
   war3::model::ShadowModelResourceCache::instance().resetMapEpoch(
       m_war3GpuSkinMapEpoch);
+  // Keep the already-installed Game.dll hooks alive across maps, but discard
+  // every producer cache whose raw pointers, palette slots or frame tags can
+  // be reused by the new session.
+  war3::model::ResetMapSession();
   if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
     m_war3PersistentPackageD3D9ObserveOwner->invalidateMapEpoch(
         m_war3GpuSkinMapEpoch);
@@ -14600,7 +14607,6 @@ bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(
   dxvk::war3::render::RenderQueueTracker::instance().Reset();
   dxvk::war3::render::ExecBatchProcessor::ResetCaches();
   War3RenderState::ResetRuntimeState();
-  dxvk::war3::model::Shutdown();
   dxvk::war3::render::ResetShadowRuntimeBridgeState();
   dxvk::war3::render::War3LightningRuntime::instance().reset();
   dxvk::war3::shadow::ShadowValidationRuntime::instance().reset();

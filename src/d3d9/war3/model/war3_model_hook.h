@@ -415,7 +415,11 @@ struct RuntimeParentLinkQueryResult {
 // sprite/pose/local-point 这类高侵入 hook 提前到 runtime 激活之前。
 void Init(uintptr_t gameBase, bool bootstrapOnly = false);
 
-// 关闭/重置状态（当前仅占位）
+// 清理只属于当前地图的 producer/cache 状态。Hook 仍保持安装和激活；
+// 地图切换不能把已安装的 MinHook 伪装成已卸载。
+void ResetMapSession();
+
+// 进程级关闭。仅在真正停止模型 Hook 时使用。
 void Shutdown();
 
 // 查询是否已启用模型 Hook

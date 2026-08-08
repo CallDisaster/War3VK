@@ -10164,7 +10164,49 @@ void Init(uintptr_t gameBase, bool bootstrapOnly) {
                  std::memory_order_relaxed);
 }
 
+void ResetMapSession() {
+  // These producer-side caches are keyed by raw Warcraft pointers or palette
+  // slots. Both address spaces may be reused by the next map, and the game's
+  // palette frame tag may restart, so freshness checks alone cannot isolate
+  // them across a map transition.
+  for (auto& entry : s_slotBlendedPaletteCache)
+    entry.valid = false;
+
+  for (auto& entry : s_renderablePartPaletteBindings) {
+    // renderablePart is the publication word read first by every query.
+    // Clearing it with release semantics invalidates the remaining payload
+    // without rewriting 8192 embedded 64-matrix snapshots.
+    entry.renderablePart.store(0u, std::memory_order_release);
+    entry.paletteWriteSerial.store(0u, std::memory_order_release);
+  }
+  s_cachedGlobalPaletteBufBase.store(0u, std::memory_order_release);
+
+  {
+    std::unique_lock<std::shared_mutex> lock(g_runtimePoseArrayRangeMutex);
+    g_runtimePoseArrayByModel.clear();
+    g_runtimePoseArrayByMatrixPtr.clear();
+    g_runtimePoseArrayRegistrySize.store(0u, std::memory_order_release);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_runtimeParentLinkMutex);
+    g_runtimeParentLinks.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_runtimePaletteTreeDedupeMutex);
+    g_runtimePaletteTreeDedupeFrame = 0u;
+    g_runtimePaletteTreeDedupeRoots.clear();
+    g_runtimePaletteTreeDedupeOwnerRoots.clear();
+  }
+
+  // These scopes are main-thread producer context. Present applies the map
+  // transition at a render-owner safe point before the next map can publish.
+  g_attachModelToPointScopeState = {};
+  g_attachedEffectInitScopeState = {};
+  g_buildChildRuntimeScopeState = {};
+}
+
 void Shutdown() {
+  ResetMapSession();
   g_active.store(false, std::memory_order_relaxed);
   g_bootstrapHooksInstalled.store(false, std::memory_order_relaxed);
   g_fullHooksInstalled.store(false, std::memory_order_relaxed);
