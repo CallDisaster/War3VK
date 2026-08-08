@@ -79,6 +79,24 @@ class PerfGpuUnionAndShadowRouteContracts(unittest.TestCase):
             self.assertIn(f'{{"{name}"', DIAG_CPP)
             self.assertIn(f'result["{name}"]', CONTROL)
 
+    def test_perf_report_closes_draw_time_producer_ledger(self) -> None:
+        names = (
+            "drawTimeSemanticProducerVisibleCandidateCount",
+            "drawTimeSemanticProducerFreshEntryCount",
+            "drawTimeSemanticProducerClaimedCount",
+            "drawTimeSemanticProducerSubmittedCount",
+            "drawTimeSemanticProducerMissNoFreshEntryCount",
+            "drawTimeSemanticProducerFallbackCurrentDrawCount",
+            "drawTimeSemanticProducerOwnedDirectGroupedSkipCount",
+            "drawTimeSemanticProducerLifecycleMergedCount",
+        )
+        for name in names:
+            self.assertIn(f"uint64_t {name} = 0", PERF_H)
+            self.assertIn(f"agg.{name} +=", PERF_CPP)
+            # Both shadowBudgetSummary and shadowRuntimeV2Summary export the
+            # same closed ledger for report-side ratio checks.
+            self.assertEqual(PERF_CPP.count(f'\\"{name}\\"'), 2)
+
     def test_life_and_death_gate_observes_before_consume(self) -> None:
         start = AUTOTEST.index("def run_life_and_death_tdr_scenario(")
         block = AUTOTEST[start : AUTOTEST.index("def ", start + 10)]

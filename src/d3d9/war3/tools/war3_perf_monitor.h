@@ -808,6 +808,18 @@ private:
         uint64_t semanticSceneDirectCurrentDrawUnitsFilterRejectNonSkinnedCount = 0;
         uint64_t semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount = 0;
         uint64_t semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount = 0;
+        // Close the DirectGrouped admission ledger in exported perf reports.
+        // These counters already exist in the authoritative per-frame shadow
+        // stats, but omitting them here made an exact-owner suppression look
+        // indistinguishable from an expensive late append failure.
+        uint64_t drawTimeSemanticProducerVisibleCandidateCount = 0;
+        uint64_t drawTimeSemanticProducerFreshEntryCount = 0;
+        uint64_t drawTimeSemanticProducerClaimedCount = 0;
+        uint64_t drawTimeSemanticProducerSubmittedCount = 0;
+        uint64_t drawTimeSemanticProducerMissNoFreshEntryCount = 0;
+        uint64_t drawTimeSemanticProducerFallbackCurrentDrawCount = 0;
+        uint64_t drawTimeSemanticProducerOwnedDirectGroupedSkipCount = 0;
+        uint64_t drawTimeSemanticProducerLifecycleMergedCount = 0;
         // === Phase 7.2: single-caster flicker + reconciliation ===
         uint64_t semanticSceneDirectLastRawRecordCount = 0;
         uint64_t semanticSceneDirectLastEligibleRecordCount = 0;

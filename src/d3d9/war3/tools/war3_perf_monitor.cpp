@@ -1515,6 +1515,22 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount +=
       stats
           .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount;
+  agg.drawTimeSemanticProducerVisibleCandidateCount +=
+      stats.drawTimeSemanticProducerVisibleCandidateCount;
+  agg.drawTimeSemanticProducerFreshEntryCount +=
+      stats.drawTimeSemanticProducerFreshEntryCount;
+  agg.drawTimeSemanticProducerClaimedCount +=
+      stats.drawTimeSemanticProducerClaimedCount;
+  agg.drawTimeSemanticProducerSubmittedCount +=
+      stats.drawTimeSemanticProducerSubmittedCount;
+  agg.drawTimeSemanticProducerMissNoFreshEntryCount +=
+      stats.drawTimeSemanticProducerMissNoFreshEntryCount;
+  agg.drawTimeSemanticProducerFallbackCurrentDrawCount +=
+      stats.drawTimeSemanticProducerFallbackCurrentDrawCount;
+  agg.drawTimeSemanticProducerOwnedDirectGroupedSkipCount +=
+      stats.drawTimeSemanticProducerOwnedDirectGroupedSkipCount;
+  agg.drawTimeSemanticProducerLifecycleMergedCount +=
+      stats.drawTimeSemanticProducerLifecycleMergedCount;
   // Phase 7.2: flicker diagnostics + reconciliation
   agg.semanticSceneDirectLastRawRecordCount = std::max(
       agg.semanticSceneDirectLastRawRecordCount,
@@ -6092,9 +6108,26 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
               .semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount
        << ",\n";
   json << "    \"semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount\": "
-        << shadowAgg
-               .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount
-        << ",\n";
+       << shadowAgg
+              .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount
+       << ",\n";
+  json << "    \"drawTimeSemanticProducerVisibleCandidateCount\": "
+       << shadowAgg.drawTimeSemanticProducerVisibleCandidateCount << ",\n";
+  json << "    \"drawTimeSemanticProducerFreshEntryCount\": "
+       << shadowAgg.drawTimeSemanticProducerFreshEntryCount << ",\n";
+  json << "    \"drawTimeSemanticProducerClaimedCount\": "
+       << shadowAgg.drawTimeSemanticProducerClaimedCount << ",\n";
+  json << "    \"drawTimeSemanticProducerSubmittedCount\": "
+       << shadowAgg.drawTimeSemanticProducerSubmittedCount << ",\n";
+  json << "    \"drawTimeSemanticProducerMissNoFreshEntryCount\": "
+       << shadowAgg.drawTimeSemanticProducerMissNoFreshEntryCount << ",\n";
+  json << "    \"drawTimeSemanticProducerFallbackCurrentDrawCount\": "
+       << shadowAgg.drawTimeSemanticProducerFallbackCurrentDrawCount << ",\n";
+  json << "    \"drawTimeSemanticProducerOwnedDirectGroupedSkipCount\": "
+       << shadowAgg.drawTimeSemanticProducerOwnedDirectGroupedSkipCount
+       << ",\n";
+  json << "    \"drawTimeSemanticProducerLifecycleMergedCount\": "
+       << shadowAgg.drawTimeSemanticProducerLifecycleMergedCount << ",\n";
   // Phase 7.2: flicker diagnostics + reconciliation
   json << "    \"semanticSceneDirectLastRawRecordCount\": "
        << shadowAgg.semanticSceneDirectLastRawRecordCount << ",\n";
@@ -7371,9 +7404,26 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
               .semanticSceneDirectCurrentDrawUnitsFilterRejectNoIdentityCount
        << ",\n";
   json << "    \"semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount\": "
-        << shadowAgg
-               .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount
-        << ",\n";
+       << shadowAgg
+              .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount
+       << ",\n";
+  json << "    \"drawTimeSemanticProducerVisibleCandidateCount\": "
+       << shadowAgg.drawTimeSemanticProducerVisibleCandidateCount << ",\n";
+  json << "    \"drawTimeSemanticProducerFreshEntryCount\": "
+       << shadowAgg.drawTimeSemanticProducerFreshEntryCount << ",\n";
+  json << "    \"drawTimeSemanticProducerClaimedCount\": "
+       << shadowAgg.drawTimeSemanticProducerClaimedCount << ",\n";
+  json << "    \"drawTimeSemanticProducerSubmittedCount\": "
+       << shadowAgg.drawTimeSemanticProducerSubmittedCount << ",\n";
+  json << "    \"drawTimeSemanticProducerMissNoFreshEntryCount\": "
+       << shadowAgg.drawTimeSemanticProducerMissNoFreshEntryCount << ",\n";
+  json << "    \"drawTimeSemanticProducerFallbackCurrentDrawCount\": "
+       << shadowAgg.drawTimeSemanticProducerFallbackCurrentDrawCount << ",\n";
+  json << "    \"drawTimeSemanticProducerOwnedDirectGroupedSkipCount\": "
+       << shadowAgg.drawTimeSemanticProducerOwnedDirectGroupedSkipCount
+       << ",\n";
+  json << "    \"drawTimeSemanticProducerLifecycleMergedCount\": "
+       << shadowAgg.drawTimeSemanticProducerLifecycleMergedCount << ",\n";
   // Phase 7.2: flicker diagnostics + reconciliation
   json << "    \"semanticSceneDirectLastRawRecordCount\": "
        << shadowAgg.semanticSceneDirectLastRawRecordCount << ",\n";
