@@ -275,8 +275,23 @@ namespace dxvk {
       if (status != VK_ERROR_DEVICE_LOST)
         return;
 
+      // This provenance bit authorizes the optional diagnostic query, but the
+      // submission and finish threads must never wait for that query before
+      // completing their CPU-side terminal retirement.
+      m_driverDeviceLossObserved.store(true, std::memory_order_release);
       notifyDeviceError(status);
-      m_deviceFault.captureOnce(status);
+    }
+
+    /**
+     * \brief Captures bounded fault text after a direct driver loss
+     *
+     * This is deliberately separate from the driver-result notifier. The D3D
+     * owner invokes it only after a base terminal incident is durable and the
+     * queue has been allowed to drain its CPU-side retirement work.
+     */
+    void captureDeviceFaultIfDriverLossObserved() noexcept {
+      if (m_driverDeviceLossObserved.load(std::memory_order_acquire))
+        m_deviceFault.captureOnce(VK_ERROR_DEVICE_LOST);
     }
 
     DxvkDeviceFaultSnapshot getDeviceFaultSnapshot() const noexcept {
@@ -768,6 +783,7 @@ namespace dxvk {
     DxvkRecycler<DxvkCommandList, 16> m_recycledCommandLists;
 
     std::atomic<VkResult>       m_terminalStatus = { VK_SUCCESS };
+    std::atomic<bool>           m_driverDeviceLossObserved = { false };
     DxvkDeviceFaultCapture      m_deviceFault;
     DxvkSubmissionQueue         m_submissionQueue;
 

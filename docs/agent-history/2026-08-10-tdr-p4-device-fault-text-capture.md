@@ -6,11 +6,13 @@ fail-stop, queue retirement, map/device epoch, shadow replay, or shader ABI.
 
 When the extension feature and loader entrypoint are both available, the
 `DxvkDevice` arms one preallocated capture object. Only a direct Vulkan API
-result of `VK_ERROR_DEVICE_LOST` may trigger it. The terminal status is
-published first, then a compare-and-swap allows exactly one
-`vkGetDeviceFaultInfoEXT` call. Synthetic command-stream failures and queue
-results that were merely overwritten by an already-visible terminal latch stay
-on the publish-only path.
+result of `VK_ERROR_DEVICE_LOST` marks the query eligible. The terminal status
+is published without querying from submission or finish workers, allowing them
+to complete CPU-side retirement first. The D3D owner writes a base terminal
+incident, then invokes the compare-and-swap guarded query exactly once; a
+completed query may add at most one related enrichment incident. Synthetic
+command-stream failures and queue results that were merely overwritten by an
+already-visible terminal latch stay on the publish-only path.
 
 The capture stores at most 64 address records and 32 vendor text records by
 value, together with the bounded standard descriptions and the query result.

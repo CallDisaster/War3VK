@@ -49,6 +49,9 @@ std::chrono::steady_clock::time_point s_gpuLastProgressAt =
     std::chrono::steady_clock::now();
 bool s_gpuIncidentLatched = false;
 bool s_gpuDeviceLostIncidentLatched = false;
+bool s_gpuDeviceLostDeviceFaultEnrichmentLatched = false;
+uint64_t s_gpuDeviceLostBaseTimestampMs = 0u;
+std::string s_gpuDeviceLostFirstErrorOrigin;
 bool s_shadowArenaIncidentLatched = false;
 uint64_t s_shadowArenaLastOverflowCount = 0u;
 uint64_t s_shadowArenaLastAdmissionRejectedCount = 0u;
@@ -447,6 +450,7 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
 
   json payload = {
       {"timestampMs", incident.timestampMs},
+      {"deviceLossBaseTimestampMs", incident.deviceLossBaseTimestampMs},
       {"reason", incident.reason},
       {"firstErrorOrigin", incident.firstErrorOrigin},
       {"queueResult", incident.queueResult},
@@ -773,27 +777,25 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
         frame.arenaPartialTransactionCount;
     const bool terminalQueueFailure =
         frame.queueResult == VK_ERROR_DEVICE_LOST;
+    // A terminal device-lost incident belongs exclusively to the D3D owner.
+    // The flight poll may observe it first, but must not consume its base or
+    // device-fault enrichment latches with a partial snapshot.
     const bool queueIncident =
-        (queueFailed || queueStalled) &&
-        (terminalQueueFailure ? !s_gpuDeviceLostIncidentLatched
-                              : !s_gpuIncidentLatched);
+        !terminalQueueFailure && (queueFailed || queueStalled) &&
+        !s_gpuIncidentLatched;
     const bool arenaIncident =
         (arenaOverflow || arenaAdmissionRejected || arenaPartial) &&
         !s_shadowArenaIncidentLatched;
     if (queueIncident || arenaIncident) {
-      if (queueIncident) {
-        if (terminalQueueFailure)
-          s_gpuDeviceLostIncidentLatched = true;
-        else
-          s_gpuIncidentLatched = true;
-      }
+      if (queueIncident)
+        s_gpuIncidentLatched = true;
       if (arenaIncident)
         s_shadowArenaIncidentLatched = true;
       incident.timestampMs = frame.timestampMs;
       incident.firstErrorOrigin = "gpu-flight-poll";
-      if (queueFailed)
+      if (queueIncident && queueFailed)
         incident.reason = "queue-error";
-      else if (queueStalled)
+      else if (queueIncident && queueStalled)
         incident.reason = "gpu-no-progress-10s";
       else if (arenaPartial)
         incident.reason = "shadow-arena-partial-transaction";
@@ -3813,19 +3815,46 @@ void NotifyGpuDeviceLostFailStop(
     const ::dxvk::DxvkDeviceFaultSnapshot& deviceFault) noexcept {
   try {
     GpuIncidentSnapshot incident = {};
+    bool writeIncident = false;
     {
       std::lock_guard<std::mutex> lock(s_gpuFlightMutex);
-      if (s_gpuDeviceLostIncidentLatched)
+      const bool captureFinal =
+          deviceFault.captureState ==
+              ::dxvk::DxvkDeviceFaultCaptureState::Disabled ||
+          deviceFault.captureState ==
+              ::dxvk::DxvkDeviceFaultCaptureState::Complete;
+
+      // Terminal loss has independent base and enrichment gates. A prior
+      // recoverable queue incident must never suppress either record.
+      if (!s_gpuDeviceLostIncidentLatched) {
+        s_gpuDeviceLostIncidentLatched = true;
+        s_gpuDeviceLostBaseTimestampMs = EpochMilliseconds();
+        s_gpuDeviceLostFirstErrorOrigin =
+            origin != nullptr ? origin : "unknown";
+        incident.timestampMs = s_gpuDeviceLostBaseTimestampMs;
+        incident.deviceLossBaseTimestampMs = s_gpuDeviceLostBaseTimestampMs;
+        incident.reason = "queue-error-device-lost-fail-stop";
+        incident.firstErrorOrigin = s_gpuDeviceLostFirstErrorOrigin;
+        incident.queueResult = VK_ERROR_DEVICE_LOST;
+        incident.deviceFault = deviceFault;
+        s_gpuDeviceLostDeviceFaultEnrichmentLatched = captureFinal;
+        writeIncident = true;
+      } else if (!s_gpuDeviceLostDeviceFaultEnrichmentLatched &&
+                 deviceFault.captureState ==
+                     ::dxvk::DxvkDeviceFaultCaptureState::Complete) {
+        s_gpuDeviceLostDeviceFaultEnrichmentLatched = true;
+        incident.timestampMs = EpochMilliseconds();
+        incident.deviceLossBaseTimestampMs = s_gpuDeviceLostBaseTimestampMs;
+        incident.reason = "queue-error-device-lost-device-fault-enrichment";
+        incident.firstErrorOrigin = s_gpuDeviceLostFirstErrorOrigin;
+        incident.queueResult = VK_ERROR_DEVICE_LOST;
+        incident.deviceFault = deviceFault;
+        writeIncident = true;
+      }
+
+      if (!writeIncident)
         return;
 
-      // Terminal loss has its own one-shot gate. A prior recoverable stall or
-      // transient queue incident must never suppress the fatal snapshot.
-      s_gpuDeviceLostIncidentLatched = true;
-      incident.timestampMs = EpochMilliseconds();
-      incident.reason = "queue-error-device-lost-fail-stop";
-      incident.firstErrorOrigin = origin != nullptr ? origin : "unknown";
-      incident.queueResult = VK_ERROR_DEVICE_LOST;
-      incident.deviceFault = deviceFault;
       incident.recentFrames.assign(
           s_gpuFlightFrames.begin(), s_gpuFlightFrames.end());
 

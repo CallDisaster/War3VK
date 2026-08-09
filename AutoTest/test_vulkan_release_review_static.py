@@ -208,8 +208,10 @@ class VulkanReleaseReviewStaticTests(unittest.TestCase):
             self.diagnostics,
             "void NotifyGpuDeviceLostFailStop(",
         )
-        self.assertIn("if (s_gpuDeviceLostIncidentLatched)", notify)
+        self.assertIn("if (!s_gpuDeviceLostIncidentLatched)", notify)
         self.assertIn("s_gpuDeviceLostIncidentLatched = true", notify)
+        self.assertIn("s_gpuDeviceLostDeviceFaultEnrichmentLatched", notify)
+        self.assertIn("queue-error-device-lost-device-fault-enrichment", notify)
         self.assertNotIn("if (s_gpuIncidentLatched)", notify)
 
 

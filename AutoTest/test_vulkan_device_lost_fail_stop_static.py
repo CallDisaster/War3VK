@@ -334,6 +334,16 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         self.assertIn("s_gpuDeviceLostIncidentLatched = true", notify)
         self.assertNotIn("s_gpuIncidentLatched = true", notify)
         self.assertIn("queue-error-device-lost-fail-stop", notify)
+        self.assertIn(
+            "queue-error-device-lost-device-fault-enrichment", notify
+        )
+        self.assertIn("s_gpuDeviceLostDeviceFaultEnrichmentLatched", notify)
+        self.assertIn("deviceLossBaseTimestampMs", notify)
+        self.assertIn("captureFinal", notify)
+        self.assertLess(
+            notify.index("if (!s_gpuDeviceLostIncidentLatched)"),
+            notify.index("else if (!s_gpuDeviceLostDeviceFaultEnrichmentLatched"),
+        )
         self.assertIn("s_gpuFlightBreadcrumb.load", notify)
         self.assertNotIn("RunWithActiveDevice", notify)
         self.assertIn('"firstErrorOrigin"', DIAGNOSTICS)
@@ -384,10 +394,18 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         driver_entry = function_body(
             DXVK_DEVICE_H, "void notifyDeviceErrorFromDriverResult"
         )
-        self.assertLess(
-            driver_entry.index("notifyDeviceError(status);"),
-            driver_entry.index("m_deviceFault.captureOnce(status);"),
+        self.assertIn(
+            "m_driverDeviceLossObserved.store(true, std::memory_order_release)",
+            driver_entry,
         )
+        self.assertIn("notifyDeviceError(status);", driver_entry)
+        self.assertNotIn("m_deviceFault.captureOnce", driver_entry)
+        self.assertNotIn("vkGetDeviceFaultInfoEXT", driver_entry)
+        capture_entry = function_body(
+            DXVK_DEVICE_H, "void captureDeviceFaultIfDriverLossObserved"
+        )
+        self.assertIn("m_driverDeviceLossObserved.load", capture_entry)
+        self.assertIn("m_deviceFault.captureOnce(VK_ERROR_DEVICE_LOST)", capture_entry)
         self.assertIn("getDeviceFaultSnapshot() const noexcept", DXVK_DEVICE_H)
 
         submit = function_body(QUEUE, "DxvkSubmissionQueue::submitCmdLists")
@@ -411,9 +429,37 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         self.assertIn("m_device->notifyDeviceError(VK_ERROR_DEVICE_LOST);", submit)
         self.assertIn("m_device->notifyDeviceError(status);", finish)
         self.assertNotIn("notifyDeviceErrorFromDriverResult", CS_THREAD)
+        self.assertNotIn("m_driverDeviceLossObserved", CS_THREAD)
+        self.assertNotIn("captureDeviceFaultIfDriverLossObserved", CS_THREAD)
 
         for source in (DXVK_DEVICE_CPP, MEMORY, PRESENTER):
             self.assertIn("notifyDeviceErrorFromDriverResult", source)
+
+    def test_d3d_owner_captures_after_base_incident_and_enriches_once(self):
+        latch = function_body(
+            DEVICE_CPP, "D3D9DeviceEx::CheckVulkanDeviceLostFailStop"
+        )
+        base_notify = latch.index(
+            "origin, deviceFaultBeforeCapture"
+        )
+        capture = latch.index("captureDeviceFaultIfDriverLossObserved")
+        enrichment_notify = latch.index(
+            "origin, deviceFaultAfterCapture"
+        )
+        self.assertLess(base_notify, capture)
+        self.assertLess(capture, enrichment_notify)
+        self.assertIn("if (firstFailStop)", latch)
+        self.assertLess(
+            latch.index("m_war3ShadowSessionReady.store(false"), base_notify
+        )
+
+    def test_terminal_flight_poll_cannot_consume_device_lost_incident(self):
+        flight = function_body(DIAGNOSTICS, "void RecordGpuFlightFrame")
+        self.assertIn("const bool terminalQueueFailure", flight)
+        self.assertIn("!terminalQueueFailure", flight)
+        self.assertNotIn("s_gpuDeviceLostIncidentLatched", flight)
+        self.assertNotIn("NotifyGpuDeviceLostFailStop", flight)
+        self.assertNotIn("queue-error-device-lost-fail-stop", flight)
 
     def test_device_fault_json_owns_bounded_text_without_vendor_binary(self):
         self.assertNotIn(

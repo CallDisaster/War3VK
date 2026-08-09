@@ -15163,18 +15163,33 @@ bool D3D9DeviceEx::CheckVulkanDeviceLostFailStop(const char* origin) {
     return false;
 
   bool expected = false;
-  if (m_vkDeviceLostFailStop.compare_exchange_strong(
-          expected, true, std::memory_order_acq_rel,
-          std::memory_order_acquire)) {
-    const Rc<DxvkDevice> device = m_dxvkDevice;
-    const DxvkDeviceFaultSnapshot deviceFault = device != nullptr
+  const bool firstFailStop = m_vkDeviceLostFailStop.compare_exchange_strong(
+      expected, true, std::memory_order_acq_rel,
+      std::memory_order_acquire);
+  const Rc<DxvkDevice> device = m_dxvkDevice;
+
+  if (firstFailStop) {
+    const DxvkDeviceFaultSnapshot deviceFaultBeforeCapture = device != nullptr
       ? device->getDeviceFaultSnapshot()
       : DxvkDeviceFaultSnapshot{};
     m_war3ShadowSessionReady.store(false, std::memory_order_release);
     Logger::err(str::format(
         "D3D9DeviceEx: Vulkan device lost; entering irreversible fail-stop at ",
         origin != nullptr ? origin : "unknown"));
-    dxvk::war3::tools::NotifyGpuDeviceLostFailStop(origin, deviceFault);
+    // Persist a useful terminal record before asking the driver for optional
+    // diagnostics. vkGetDeviceFaultInfoEXT has no finite-return contract.
+    dxvk::war3::tools::NotifyGpuDeviceLostFailStop(
+        origin, deviceFaultBeforeCapture);
+  }
+
+  // A direct-driver eligibility bit is required, so synthetic command-stream
+  // terminal states remain publish-only. The capture itself is one-shot.
+  if (device != nullptr) {
+    device->captureDeviceFaultIfDriverLossObserved();
+    const DxvkDeviceFaultSnapshot deviceFaultAfterCapture =
+        device->getDeviceFaultSnapshot();
+    dxvk::war3::tools::NotifyGpuDeviceLostFailStop(
+        origin, deviceFaultAfterCapture);
   }
 
   return true;

@@ -166,6 +166,7 @@ void ClearGpuFlightAutoTestContext() noexcept;
 
 struct GpuIncidentSnapshot {
   uint64_t timestampMs = 0u;
+  uint64_t deviceLossBaseTimestampMs = 0u;
   std::string reason;
   std::string firstErrorOrigin;
   int64_t queueResult = 0;
