@@ -135,8 +135,13 @@ namespace dxvk {
 
       VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
-      if (vk->vkAllocateCommandBuffers(vk->device(), &allocInfo, &commandBuffer))
+      VkResult vr = vk->vkAllocateCommandBuffers(
+        vk->device(), &allocInfo, &commandBuffer);
+
+      if (vr != VK_SUCCESS) {
+        m_device->notifyDeviceErrorFromDriverResult(vr);
         throw DxvkError("DxvkCommandPool: Failed to allocate command buffer");
+      }
 
       m_primaryBuffers.push_back(commandBuffer);
     }
@@ -148,8 +153,12 @@ namespace dxvk {
     VkCommandBufferBeginInfo info = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-    if (vk->vkBeginCommandBuffer(commandBuffer, &info))
+    VkResult vr = vk->vkBeginCommandBuffer(commandBuffer, &info);
+
+    if (vr != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       throw DxvkError("DxvkCommandPool: Failed to begin command buffer");
+    }
 
     if (m_device->debugFlags().test(DxvkDebugFlag::Capture)) {
       auto vki = m_device->vki();
@@ -186,8 +195,13 @@ namespace dxvk {
 
       VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
-      if (vk->vkAllocateCommandBuffers(vk->device(), &allocInfo, &commandBuffer))
+      VkResult vr = vk->vkAllocateCommandBuffers(
+        vk->device(), &allocInfo, &commandBuffer);
+
+      if (vr != VK_SUCCESS) {
+        m_device->notifyDeviceErrorFromDriverResult(vr);
         throw DxvkError("DxvkCommandPool: Failed to allocate secondary command buffer");
+      }
 
       m_secondaryBuffers.push_back(commandBuffer);
     }
@@ -200,8 +214,12 @@ namespace dxvk {
                | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
     info.pInheritanceInfo = &inheritanceInfo;
 
-    if (vk->vkBeginCommandBuffer(commandBuffer, &info))
+    VkResult vr = vk->vkBeginCommandBuffer(commandBuffer, &info);
+
+    if (vr != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       throw DxvkError("DxvkCommandPool: Failed to begin secondary command buffer");
+    }
 
     return commandBuffer;
   }
@@ -211,8 +229,12 @@ namespace dxvk {
     auto vk = m_device->vkd();
 
     if (m_nextPrimary || m_nextSecondary) {
-      if (vk->vkResetCommandPool(vk->device(), m_commandPool, 0))
+      VkResult vr = vk->vkResetCommandPool(vk->device(), m_commandPool, 0);
+
+      if (vr != VK_SUCCESS) {
+        m_device->notifyDeviceErrorFromDriverResult(vr);
         throw DxvkError("DxvkCommandPool: Failed to reset command pool");
+      }
 
       m_nextPrimary = 0;
       m_nextSecondary = 0;
@@ -775,8 +797,12 @@ namespace dxvk {
   VkCommandBuffer DxvkCommandList::endSecondaryCommandBuffer() {
     VkCommandBuffer cmd = getCmdBuffer();
 
-    if (m_vkd->vkEndCommandBuffer(cmd))
+    VkResult vr = m_vkd->vkEndCommandBuffer(cmd);
+
+    if (vr != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       throw DxvkError("DxvkCommandList: Failed to end secondary command buffer");
+    }
 
     m_cmd.cmdBuffers[uint32_t(DxvkCmdBuffer::ExecBuffer)] = m_execBuffer;
     m_execBuffer = VK_NULL_HANDLE;
@@ -847,8 +873,12 @@ namespace dxvk {
     if (m_device->debugFlags().test(DxvkDebugFlag::Capture))
       m_vki->vkCmdEndDebugUtilsLabelEXT(cmdBuffer);
 
-    if (vk->vkEndCommandBuffer(cmdBuffer))
+    VkResult vr = vk->vkEndCommandBuffer(cmdBuffer);
+
+    if (vr != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       throw DxvkError("DxvkCommandList: Failed to end command buffer");
+    }
   }
 
 

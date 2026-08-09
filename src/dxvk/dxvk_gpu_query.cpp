@@ -100,8 +100,10 @@ namespace dxvk {
 
     if (result == VK_NOT_READY)
       return DxvkGpuQueryStatus::Pending;
-    else if (result != VK_SUCCESS)
+    else if (result != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(result);
       return DxvkGpuQueryStatus::Failed;
+    }
 
     // Add numbers to the destination structure
     switch (m_type) {
@@ -232,7 +234,11 @@ namespace dxvk {
 
     VkQueryPool queryPool = VK_NULL_HANDLE;
 
-    if (vk->vkCreateQueryPool(vk->device(), &info, nullptr, &queryPool)) {
+    VkResult vr = vk->vkCreateQueryPool(
+      vk->device(), &info, nullptr, &queryPool);
+
+    if (vr != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       Logger::err(str::format("DXVK: Failed to create query pool (", m_queryType, "; ", m_queryPoolSize, ")"));
       return;
     }

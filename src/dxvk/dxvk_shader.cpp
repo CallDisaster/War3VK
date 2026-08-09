@@ -421,6 +421,9 @@ namespace dxvk {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
+    if (vr != VK_SUCCESS && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
+      m_device->notifyDeviceErrorFromDriverResult(vr);
+
     if (vr && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
       Logger::err(str::format("DxvkShaderPipelineLibrary: Failed to create vertex shader pipeline: ", vr));
 
@@ -522,6 +525,9 @@ namespace dxvk {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
+    if (vr != VK_SUCCESS && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
+      m_device->notifyDeviceErrorFromDriverResult(vr);
+
     if (vr && !(flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT))
       Logger::err(str::format("DxvkShaderPipelineLibrary: Failed to create fragment shader pipeline: ", vr));
 
@@ -551,6 +557,9 @@ namespace dxvk {
 
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateComputePipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+
+    if (vr != VK_SUCCESS && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
+      m_device->notifyDeviceErrorFromDriverResult(vr);
 
     if (vr && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
       Logger::err(str::format("DxvkShaderPipelineLibrary: Failed to create compute shader pipeline: ", vr));

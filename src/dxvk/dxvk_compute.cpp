@@ -120,6 +120,7 @@ namespace dxvk {
           VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
     if (vr != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       Logger::err(str::format("DxvkComputePipeline: Failed to compile pipeline: ", vr));
       this->logPipelineState(LogLevel::Error, state);
       return VK_NULL_HANDLE;
