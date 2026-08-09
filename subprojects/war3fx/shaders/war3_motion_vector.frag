@@ -34,7 +34,9 @@ uniform ShadowData {
 layout(push_constant, scalar)
 uniform push_block {
   uint p_colorSampler;
-  uint p_shadowSampler;
+  uint p_rawShadowSampler;
+  uint p_compareShadowSampler;
+  uint p_shadowCompareMode;
 };
 
 layout(location = 0) out vec2 o_motion;

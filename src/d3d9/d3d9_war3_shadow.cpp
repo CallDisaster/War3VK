@@ -155,7 +155,11 @@ auto MakeWar3ScopeExit(Fn &&fn) {
 
 struct ReceiverPushConstants {
   uint32_t colorSampler;
-  uint32_t shadowSampler;
+  uint32_t rawShadowSampler;
+  uint32_t compareShadowSampler;
+  // 0=nearest comparison, 1=hardware comparison-linear,
+  // 2=manual compare-first 2x2 fallback.
+  uint32_t shadowCompareMode;
 };
 
 enum War3ShadowTaaHistoryInvalidationBits : uint32_t {
@@ -2067,15 +2071,33 @@ War3ShadowReceiverPass::War3ShadowReceiverPass(D3D9DeviceEx *device)
   shadowSampler.setUsePixelCoordinates(false);
   m_shadowSampler = m_device->createSampler(shadowSampler);
 
-  DxvkSamplerKey shadowSamplerLinear = {};
-  shadowSamplerLinear.setFilter(VK_FILTER_LINEAR, VK_FILTER_LINEAR,
-                                VK_SAMPLER_MIPMAP_MODE_NEAREST);
-  shadowSamplerLinear.setAddressModes(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-  shadowSamplerLinear.setUsePixelCoordinates(false);
-  m_shadowSamplerLinear = m_device->createSampler(shadowSamplerLinear);
-  m_shadowSamplerActive = m_shadowSampler;
+  DxvkSamplerKey shadowCompareSampler = shadowSampler;
+  shadowCompareSampler.setDepthCompare(true, VK_COMPARE_OP_LESS_OR_EQUAL);
+  m_shadowCompareSampler = m_device->createSampler(shadowCompareSampler);
+
+  DxvkSamplerKey shadowCompareSamplerLinear = {};
+  shadowCompareSamplerLinear.setFilter(VK_FILTER_LINEAR, VK_FILTER_LINEAR,
+                                       VK_SAMPLER_MIPMAP_MODE_NEAREST);
+  shadowCompareSamplerLinear.setAddressModes(
+      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+  shadowCompareSamplerLinear.setUsePixelCoordinates(false);
+  shadowCompareSamplerLinear.setDepthCompare(
+      true, VK_COMPARE_OP_LESS_OR_EQUAL);
+  m_shadowCompareSamplerLinear =
+      m_device->createSampler(shadowCompareSamplerLinear);
+  m_shadowCompareSamplerActive = m_shadowCompareSampler;
+
+  const VkFormatFeatureFlags2 d32Features =
+      m_device->getFormatFeatures(VK_FORMAT_D32_SFLOAT).optimal;
+  m_shadowCompareLinearSupported =
+      (d32Features &
+       VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0u;
+  WAR3_RENDER_LOG(
+      "DXVK War3Shadow: D32 comparison-linear PCF %s; unsupported devices "
+      "use manual compare-first 2x2.\n",
+      m_shadowCompareLinearSupported ? "supported" : "unsupported");
 
   // 初始化性能监控设备句柄（用于 GPU 时间戳）
   war3::War3PerfMonitor::instance().setDevice(m_device.ptr());
@@ -2859,7 +2881,10 @@ void War3ShadowReceiverPass::renderMotionVectors(
 
   ReceiverPushConstants pc = {};
   pc.colorSampler = m_samplerLinear->getDescriptor().samplerIndex;
-  pc.shadowSampler = m_shadowSamplerActive->getDescriptor().samplerIndex;
+  pc.rawShadowSampler = m_shadowSampler->getDescriptor().samplerIndex;
+  pc.compareShadowSampler =
+      m_shadowCompareSamplerActive->getDescriptor().samplerIndex;
+  pc.shadowCompareMode = m_shadowCompareMode;
 
   ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
                        VK_PIPELINE_BIND_POINT_GRAPHICS, m_motionVectorPipeline);
@@ -2890,7 +2915,8 @@ void War3ShadowReceiverPass::renderMotionVectors(
   if (m_shadowHistory[readIndex])
   ctx->track(m_shadowHistory[readIndex], DxvkAccess::Read);
   ctx->track(m_samplerLinear);
-  ctx->track(m_shadowSamplerActive);
+  ctx->track(m_shadowSampler);
+  ctx->track(m_shadowCompareSamplerActive);
   reconciliation.shadowMotionVectorExecutedThisFrame = 1u;
 }
 
@@ -3125,7 +3151,10 @@ void War3ShadowReceiverPass::renderShadowVisibility(
 
   ReceiverPushConstants pc = {};
   pc.colorSampler = m_samplerLinear->getDescriptor().samplerIndex;
-  pc.shadowSampler = m_shadowSamplerActive->getDescriptor().samplerIndex;
+  pc.rawShadowSampler = m_shadowSampler->getDescriptor().samplerIndex;
+  pc.compareShadowSampler =
+      m_shadowCompareSamplerActive->getDescriptor().samplerIndex;
+  pc.shadowCompareMode = m_shadowCompareMode;
 
   ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
                        VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -3158,7 +3187,8 @@ void War3ShadowReceiverPass::renderShadowVisibility(
     ctx->track(m_shadowCasterMask, DxvkAccess::Read);
   ctx->track(m_shadowUniformBuffer, DxvkAccess::Read);
   ctx->track(m_samplerLinear);
-  ctx->track(m_shadowSamplerActive);
+  ctx->track(m_shadowSampler);
+  ctx->track(m_shadowCompareSamplerActive);
   reconciliation.shadowVisibilityExecutedThisFrame = 1u;
 }
 
@@ -7991,7 +8021,7 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
   // Manual 16-tap PCF requires the dedicated nearest sampler. Reusing the CSM
   // linear sampler double-filtered comparisons and shifted blocker edges.
   const Rc<DxvkSampler> pointShadowSampler =
-      m_shadowSampler ? m_shadowSampler : m_shadowSamplerActive;
+      m_shadowSampler;
   if (!pointShadowSampler)
     return;
   pointShadowUbo.samplerIndex =
@@ -8153,7 +8183,10 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
 
   ReceiverPushConstants pc = {};
   pc.colorSampler = m_samplerLinear->getDescriptor().samplerIndex;
-  pc.shadowSampler = m_shadowSamplerActive->getDescriptor().samplerIndex;
+  pc.rawShadowSampler = m_shadowSampler->getDescriptor().samplerIndex;
+  pc.compareShadowSampler =
+      m_shadowCompareSamplerActive->getDescriptor().samplerIndex;
+  pc.shadowCompareMode = m_shadowCompareMode;
 
   ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
                        VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline);
@@ -8188,7 +8221,7 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
   if (m_shadowHistory[writeIndex])
     ctx->track(m_shadowHistory[writeIndex], DxvkAccess::Write);
   ctx->track(m_samplerLinear);
-  ctx->track(m_shadowSamplerActive);
+  ctx->track(m_shadowCompareSamplerActive);
   ctx->track(pointShadowSampler);
   ctx->track(m_shadowSampler);
   reconciliation.receiverDrawExecutedThisFrame = 1u;
@@ -8925,10 +8958,20 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
       input.settings ? input.settings.get() : &defaultSettings;
-  m_shadowSamplerActive =
-      (settings->shadows.filterMode == War3ShadowFilterMode::Linear)
-          ? m_shadowSamplerLinear
-          : m_shadowSampler;
+  const bool linearShadowFilter =
+      settings->shadows.filterMode == War3ShadowFilterMode::Linear;
+  if (!linearShadowFilter) {
+    m_shadowCompareSamplerActive = m_shadowCompareSampler;
+    m_shadowCompareMode = 0u;
+  } else if (m_shadowCompareLinearSupported) {
+    m_shadowCompareSamplerActive = m_shadowCompareSamplerLinear;
+    m_shadowCompareMode = 1u;
+  } else {
+    // The comparison sampler remains nearest; the shader compares the four
+    // raw D32 texels before bilinear interpolation.
+    m_shadowCompareSamplerActive = m_shadowCompareSampler;
+    m_shadowCompareMode = 2u;
+  }
   const float casterBias = std::max(settings->shadows.casterDepthBias, 0.0f);
   const float casterSlope = std::max(settings->shadows.casterSlopeBias, 0.0f);
   const float casterClamp = std::max(settings->shadows.casterBiasClamp, 0.0f);

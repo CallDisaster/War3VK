@@ -223,7 +223,7 @@ bool War3ShadowReceiverPass::GetVolumetricPointShadowSnapshot(
   }
 
   const Rc<DxvkSampler> pointShadowSampler =
-      m_shadowSampler ? m_shadowSampler : m_shadowSamplerActive;
+      m_shadowSampler;
   if (!pointShadowSampler || !m_pointShadowCubeView)
     return false;
 
@@ -266,8 +266,6 @@ bool War3ShadowReceiverPass::GetVolumetricPointShadowSnapshot(
 }
 
 uint32_t War3ShadowReceiverPass::GetShadowSamplerIndex() const {
-  if (m_shadowSamplerActive)
-    return m_shadowSamplerActive->getDescriptor().samplerIndex;
   if (m_shadowSampler)
     return m_shadowSampler->getDescriptor().samplerIndex;
   if (m_samplerLinear)

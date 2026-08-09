@@ -593,9 +593,15 @@ namespace dxvk {
         Com<IDirect3DSurface9> m_shadowSurface;
         
         Rc<DxvkSampler> m_samplerLinear;
+        // Directional CSM keeps raw-depth reads separate from comparison
+        // sampling. PCSS blocker search, caster masks, diagnostics and point
+        // shadows must never inherit comparison filtering.
         Rc<DxvkSampler> m_shadowSampler;
-        Rc<DxvkSampler> m_shadowSamplerLinear;
-        Rc<DxvkSampler> m_shadowSamplerActive;
+        Rc<DxvkSampler> m_shadowCompareSampler;
+        Rc<DxvkSampler> m_shadowCompareSamplerLinear;
+        Rc<DxvkSampler> m_shadowCompareSamplerActive;
+        uint32_t m_shadowCompareMode = 0u;
+        bool m_shadowCompareLinearSupported = false;
         float m_shadowCasterBiasConstant = 1.0f;
         float m_shadowCasterBiasSlope = 1.5f;
         float m_shadowCasterBiasClamp = 0.0f;

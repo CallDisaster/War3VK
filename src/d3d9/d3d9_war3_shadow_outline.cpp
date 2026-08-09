@@ -465,8 +465,8 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
   edgeDescriptors[1].descriptor = m_outlineMaskAllView->getDescriptor();
 
   OutlineEdgePushConstants pc = {};
-  pc.visibleSampler = m_shadowSamplerActive->getDescriptor().samplerIndex;
-  pc.allSampler = m_shadowSamplerActive->getDescriptor().samplerIndex;
+  pc.visibleSampler = m_shadowSampler->getDescriptor().samplerIndex;
+  pc.allSampler = m_shadowSampler->getDescriptor().samplerIndex;
   pc.invWidth = 1.0f / float(extent.width);
   pc.invHeight = 1.0f / float(extent.height);
   pc.widthPx = (std::max)(1.0f, outline.widthPx);
@@ -487,7 +487,7 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
   ctx->track(colorView->image(), DxvkAccess::Write);
   ctx->track(m_outlineMaskVisibleView->image(), DxvkAccess::Read);
   ctx->track(m_outlineMaskAllView->image(), DxvkAccess::Read);
-  ctx->track(m_shadowSamplerActive);
+  ctx->track(m_shadowSampler);
 
   static bool s_logged = false;
   if (!s_logged) {

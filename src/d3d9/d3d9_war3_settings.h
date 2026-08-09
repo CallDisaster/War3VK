@@ -82,8 +82,11 @@ struct War3ShadowSettings {
   float receiverBias = 0.004f;
   float cascadeBlendRange = 120.0f;
   War3ShadowPcfKernel pcfKernel = War3ShadowPcfKernel::Poisson16;
-  bool pcfRotate = true;
-  War3ShadowPcfRotateMode pcfRotateMode = War3ShadowPcfRotateMode::World;
+  // DirectInline has no temporal integration. Rotating a PCF kernel with a
+  // periodic world-position seed makes moving sun shadows crawl through a
+  // visible stripe field, so the release baseline is deterministic.
+  bool pcfRotate = false;
+  War3ShadowPcfRotateMode pcfRotateMode = War3ShadowPcfRotateMode::Off;
   float cascadeBiasScale = 0.5f;
   float pcfCascadeRadiusScale = 0.5f;
 

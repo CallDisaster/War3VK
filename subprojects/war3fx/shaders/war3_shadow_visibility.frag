@@ -36,27 +36,81 @@ uniform ShadowData {
 layout(push_constant, scalar)
 uniform push_block {
   uint p_colorSampler;
-  uint p_shadowSampler;
+  uint p_rawShadowSampler;
+  uint p_compareShadowSampler;
+  // 0=nearest comparison, 1=hardware comparison-linear,
+  // 2=manual compare-first 2x2 fallback.
+  uint p_shadowCompareMode;
 };
 
 layout(location = 0) out float o_vis;
 
 float shadowMapDepth(uint cascadeIndex, vec2 uv) {
   return texture(
-    sampler2DArray(s_shadow, s_samplers[nonuniformEXT(p_shadowSampler)]),
+    sampler2DArray(s_shadow, s_samplers[nonuniformEXT(p_rawShadowSampler)]),
     vec3(uv, float(cascadeIndex))).r;
 }
 
+float manualShadowCompareLinear2x2(uint cascadeIndex, vec2 uv,
+                                   float refDepth) {
+  ivec3 extent = textureSize(
+    sampler2DArray(
+      s_shadow, s_samplers[nonuniformEXT(p_rawShadowSampler)]),
+    0);
+  if (any(lessThanEqual(extent, ivec3(0))))
+    return 1.0;
+
+  int layer = clamp(int(cascadeIndex), 0, extent.z - 1);
+  vec2 texelPosition = uv * vec2(extent.xy) - vec2(0.5);
+  ivec2 base = ivec2(floor(texelPosition));
+  vec2 weight = fract(texelPosition);
+  ivec2 p00 = clamp(base, ivec2(0), extent.xy - ivec2(1));
+  ivec2 p10 = clamp(base + ivec2(1, 0), ivec2(0),
+                    extent.xy - ivec2(1));
+  ivec2 p01 = clamp(base + ivec2(0, 1), ivec2(0),
+                    extent.xy - ivec2(1));
+  ivec2 p11 = clamp(base + ivec2(1, 1), ivec2(0),
+                    extent.xy - ivec2(1));
+  float v00 = refDepth <= texelFetch(
+      sampler2DArray(
+        s_shadow, s_samplers[nonuniformEXT(p_rawShadowSampler)]),
+      ivec3(p00, layer), 0).r
+      ? 1.0 : 0.0;
+  float v10 = refDepth <= texelFetch(
+      sampler2DArray(
+        s_shadow, s_samplers[nonuniformEXT(p_rawShadowSampler)]),
+      ivec3(p10, layer), 0).r
+      ? 1.0 : 0.0;
+  float v01 = refDepth <= texelFetch(
+      sampler2DArray(
+        s_shadow, s_samplers[nonuniformEXT(p_rawShadowSampler)]),
+      ivec3(p01, layer), 0).r
+      ? 1.0 : 0.0;
+  float v11 = refDepth <= texelFetch(
+      sampler2DArray(
+        s_shadow, s_samplers[nonuniformEXT(p_rawShadowSampler)]),
+      ivec3(p11, layer), 0).r
+      ? 1.0 : 0.0;
+  return mix(mix(v00, v10, weight.x),
+             mix(v01, v11, weight.x), weight.y);
+}
+
 float shadowCompare(uint cascadeIndex, vec2 uv, float refDepth) {
-  float d = shadowMapDepth(cascadeIndex, uv);
-  return (refDepth <= d) ? 1.0 : 0.0;
+  if (p_shadowCompareMode == 2u)
+    return manualShadowCompareLinear2x2(cascadeIndex, uv, refDepth);
+  return texture(
+    sampler2DArrayShadow(
+      s_shadow,
+      s_samplers[nonuniformEXT(p_compareShadowSampler)]),
+    vec4(uv, float(cascadeIndex), refDepth));
 }
 
 float casterMaskValue(uint cascadeIndex, vec2 uv) {
   if (ubo.u_viewportZ.z <= 0.5)
     return 0.0;
   return texture(
-    sampler2DArray(s_casterMask, s_samplers[nonuniformEXT(p_shadowSampler)]),
+    sampler2DArray(s_casterMask,
+                   s_samplers[nonuniformEXT(p_rawShadowSampler)]),
     vec3(uv, float(cascadeIndex))).r;
 }
 
@@ -75,21 +129,21 @@ bool isTerrainMaskedOccluder(uint cascadeIndex, vec2 uv, float refDepth) {
 
 const vec2 kPoisson16[16] = vec2[](
   vec2(-0.94201624, -0.39906216),
+  vec2( 0.94201624,  0.39906216),
   vec2( 0.94558609, -0.76890725),
+  vec2(-0.94558609,  0.76890725),
   vec2(-0.09418410, -0.92938870),
+  vec2( 0.09418410,  0.92938870),
   vec2( 0.34495938,  0.29387760),
+  vec2(-0.34495938, -0.29387760),
   vec2(-0.91588581,  0.45771432),
+  vec2( 0.91588581, -0.45771432),
   vec2(-0.81544232, -0.87912464),
+  vec2( 0.81544232,  0.87912464),
   vec2(-0.38277543,  0.27676845),
+  vec2( 0.38277543, -0.27676845),
   vec2( 0.97484398,  0.75648379),
-  vec2( 0.44323325, -0.97511554),
-  vec2( 0.53742981, -0.47373420),
-  vec2(-0.26496911, -0.41893023),
-  vec2( 0.79197514,  0.19090188),
-  vec2(-0.24188840,  0.99706507),
-  vec2(-0.81409955,  0.91437590),
-  vec2( 0.19984126,  0.78641367),
-  vec2( 0.14383161, -0.14100790)
+  vec2(-0.97484398, -0.75648379)
 );
 
 const vec2 kPoisson25[25] = vec2[](
@@ -291,14 +345,19 @@ float computeWallStabilityFactor(vec3 normV, vec3 viewPos, vec3 lightDirV) {
   return wallFactor * max(viewFactor, lightFactor);
 }
 
-float sampleShadowStableWall(uint cascadeIndex, vec2 uv, float refDepth, float radiusTexel) {
-  float invRes = max(ubo.u_params.z, 1e-6);
-  vec2 snappedUv = (floor(uv / invRes) + 0.5) * invRes;
-  float stableRadius = max(radiusTexel, 1.75);
-  return sampleShadowGrid(cascadeIndex, snappedUv, refDepth, stableRadius, 2);
+float computeWallFilterWeight(float wallFactor, float wallStabilityFactor,
+                              float lightGrazingFactor,
+                              float viewGrazingFactor) {
+  float receiverWeight = smoothstep(0.18, 0.60, wallFactor);
+  float grazingWeight = smoothstep(
+      0.04, 0.40,
+      max(wallStabilityFactor,
+          max(lightGrazingFactor, viewGrazingFactor)));
+  return clamp(receiverWeight * grazingWeight, 0.0, 1.0);
 }
 
-float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra, vec2 rot, bool stableWallPath) {
+float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra,
+                              vec2 rot, float wallFilterWeight) {
   const bool diagnoseCsm = int(ubo.u_params2.z + 0.5) == 9;
   int cascadeCount = clamp(int(ubo.u_params.w), 1, 4);
 
@@ -350,12 +409,8 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra, v
 
   float radius0 = max(ubo.u_params.y, 0.0);
   radius0 = computeCascadePcfRadius(radius0, c0, cascadeCount, pcfCascadeRadiusScale);
-
-  // The visibility source must preserve the receiver's cascade contract.
-  // Stable walls previously returned here and hard-switched at splitFar.
-  float vis0 = stableWallPath
-      ? sampleShadowStableWall(uint(c0), uv0, ref0, radius0)
-      : sampleShadowPcf(uint(c0), uv0, ref0, radius0, rot);
+  radius0 = mix(radius0, max(radius0, 1.50), wallFilterWeight);
+  float vis0 = sampleShadowPcf(uint(c0), uv0, ref0, radius0, rot);
 
   // Match receiver-side cascade blending. Without this, the TAA source texture
   // has hard split transitions that history cannot fully hide during camera
@@ -377,13 +432,10 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra, v
           float ref1 = clamp(n1.z - bias1, 0.0, 1.0);
           float radius1 = max(ubo.u_params.y, 0.0);
           radius1 = computeCascadePcfRadius(radius1, c1, cascadeCount, pcfCascadeRadiusScale);
+          radius1 = mix(radius1, max(radius1, 1.50), wallFilterWeight);
           float vis1 = 1.0;
           if (!isTerrainMaskedOccluder(uint(c1), uv1, ref1)) {
-            // Stable-wall filtering is used on both cascades before blending;
-            // never mix its snapped grid with the generic PCF family.
-            vis1 = stableWallPath
-                ? sampleShadowStableWall(uint(c1), uv1, ref1, radius1)
-                : sampleShadowPcf(uint(c1), uv1, ref1, radius1, rot);
+            vis1 = sampleShadowPcf(uint(c1), uv1, ref1, radius1, rot);
           }
           return mix(vis0, vis1, w);
         }
@@ -459,10 +511,9 @@ void main() {
       ? computeWallStabilityFactor(normV, viewPos, lightDirV)
       : 0.0;
   float wallFactor = needNormal ? computeWallReceiverFactor(normV) : 0.0;
-  bool stableWallPath =
-      wallFactor > 0.28 &&
-      (wallStabilityFactor > 0.08 || lightGrazingFactor > 0.08 ||
-       viewGrazingFactor > 0.20);
+  float wallFilterWeight = computeWallFilterWeight(
+      wallFactor, wallStabilityFactor, lightGrazingFactor,
+      viewGrazingFactor);
   if (receiverMode > 0.5 && normalBiasScale > 0.0) {
     float ndotl = abs(dot(normV, lightDirV));
 
@@ -471,8 +522,8 @@ void main() {
     const float minFarWeight = 0.35;
     float normalBiasWeight = mix(1.0, minFarWeight, depthRatio * depthRatio);
     float wallBiasDampen = mix(1.0, 0.45, wallStabilityFactor);
-    if (stableWallPath)
-      wallBiasDampen = min(wallBiasDampen, 0.40);
+    wallBiasDampen = mix(
+        wallBiasDampen, min(wallBiasDampen, 0.40), wallFilterWeight);
     float finalNormalScale = normalBiasScale * normalBiasWeight * wallBiasDampen;
 
     biasExtra = finalNormalScale * (1.0 - ndotl);
@@ -487,15 +538,17 @@ void main() {
     float extraBiasMax = max(baseReceiverBias * 0.75, texelBiasFloor);
     float wallBiasCap = max(baseReceiverBias * 0.65, texelBiasFloor * 1.25);
     extraBiasMax = mix(extraBiasMax, wallBiasCap, wallStabilityFactor);
-    if (stableWallPath)
-      extraBiasMax = min(extraBiasMax, max(baseReceiverBias * 0.55, texelBiasFloor * 1.35));
+    float stableBiasCap =
+        max(baseReceiverBias * 0.55, texelBiasFloor * 1.35);
+    extraBiasMax = mix(
+        extraBiasMax, min(extraBiasMax, stableBiasCap), wallFilterWeight);
     biasExtra = clamp(biasExtra, 0.0, extraBiasMax);
   }
 
   vec2 pcfRot = vec2(1.0, 0.0);
-  // This pass feeds Shadow TAA. Any per-pixel rotated Poisson pattern becomes
-  // part of the temporal input and shows up as edge crawl, so keep the current
-  // visibility source deterministic. Non-TAA receiver sampling may still rotate.
+  // Direct and prepass share one deterministic, zero-centroid kernel. A
+  // periodic rotation field in either source becomes visible edge crawl.
 
-  o_vis = computeShadowVisibility(worldPos, viewDepth, biasExtra, pcfRot, stableWallPath);
+  o_vis = computeShadowVisibility(
+      worldPos, viewDepth, biasExtra, pcfRot, wallFilterWeight);
 }

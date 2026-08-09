@@ -53,28 +53,23 @@ class ShadowNonTaaContinuityStaticTest(unittest.TestCase):
         self.assertIsNone(forbidden.search(self.receiver))
         self.assertIsNone(forbidden.search(self.visibility))
 
-    def test_stable_wall_samples_both_cascades(self) -> None:
+    def test_stable_wall_uses_continuous_filter_parameters(self) -> None:
         for source in (self.receiver, self.visibility):
-            self.assertRegex(
-                source,
-                r"stableWallPath\s*\?\s*"
-                r"sampleShadowStableWall\s*\(\s*uint\s*\(\s*c0\s*\)",
-            )
-            self.assertRegex(
-                source,
-                r"stableWallPath\s*\?\s*"
-                r"sampleShadowStableWall\s*\(\s*uint\s*\(\s*c1\s*\)",
+            self.assertNotIn("sampleShadowStableWall", source)
+            self.assertNotIn("snappedUv", source)
+            self.assertIn("wallFilterWeight", source)
+            self.assertIn(
+                "mix(radius0, max(radius0, 1.50), wallFilterWeight)", source
             )
             self.assertIn("return mix(vis0, vis1, w);", source)
 
-    def test_non_taa_rotation_is_world_anchored(self) -> None:
+    def test_non_taa_release_default_has_no_periodic_rotation(self) -> None:
         start = self.receiver.index("vec2 pcfRot = vec2(1.0, 0.0);")
         end = self.receiver.index("float vis = 1.0;", start)
         rotation_block = self.receiver[start:end]
-        self.assertIn("dot(worldPos.xy", rotation_block)
+        self.assertNotIn("dot(worldPos.xy", rotation_block)
         self.assertNotIn("dot(vec2(pix)", rotation_block)
-        self.assertNotIn("viewDepth > ubo.u_splitFar", rotation_block)
-        self.assertNotIn("useScreenRotate", rotation_block)
+        self.assertNotIn("fract(", rotation_block)
 
     def test_csm_publishes_exact_snap_and_texel_diagnostics(self) -> None:
         for token in ("snappedCenterLightSpace", "texelSize"):
