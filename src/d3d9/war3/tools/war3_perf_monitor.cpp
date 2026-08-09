@@ -3255,8 +3255,20 @@ void War3PerfMonitor::tick() {
         vk->device(), beginHandle.first, beginHandle.second, 1,
         sizeof(uint64_t), &beginTs, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
 
+    const auto dropCurrentSample = [&]() {
+      ++m_profilerCounters.gpuSamplesDropped;
+      m_pending[i] = std::move(m_pending.back());
+      m_pending.pop_back();
+    };
+
     if (beginRes == VK_NOT_READY) {
       i++;
+      continue;
+    }
+
+    if (beginRes != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(beginRes);
+      dropCurrentSample();
       continue;
     }
 
@@ -3269,10 +3281,9 @@ void War3PerfMonitor::tick() {
       continue;
     }
 
-    if (beginRes != VK_SUCCESS || endRes != VK_SUCCESS) {
-      ++m_profilerCounters.gpuSamplesDropped;
-      m_pending[i] = std::move(m_pending.back());
-      m_pending.pop_back();
+    if (endRes != VK_SUCCESS) {
+      m_device->notifyDeviceErrorFromDriverResult(endRes);
+      dropCurrentSample();
       continue;
     }
 

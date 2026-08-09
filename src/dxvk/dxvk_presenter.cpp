@@ -487,7 +487,9 @@ namespace dxvk {
     waitInfo.pSemaphores = &info.signalSemaphore;
     waitInfo.pValues = &info.value;
 
-    m_vkd->vkWaitSemaphores(m_vkd->device(), &waitInfo, ~0ull);
+    VkResult vr = m_vkd->vkWaitSemaphores(
+      m_vkd->device(), &waitInfo, ~0ull);
+    m_device->notifyDeviceErrorFromDriverResult(vr);
 
     auto t1 = dxvk::high_resolution_clock::now();
     return t1 - t0;

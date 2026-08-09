@@ -685,8 +685,12 @@ namespace dxvk {
     m_submissionQueue.waitForIdle();
     m_submissionQueue.lockDeviceQueue();
 
-    if (m_vkd->vkDeviceWaitIdle(m_vkd->device()) != VK_SUCCESS)
+    VkResult vr = m_vkd->vkDeviceWaitIdle(m_vkd->device());
+
+    if (vr != VK_SUCCESS) {
+      notifyDeviceErrorFromDriverResult(vr);
       Logger::err("DxvkDevice: waitForIdle: Operation failed");
+    }
 
     m_submissionQueue.unlockDeviceQueue();
   }
