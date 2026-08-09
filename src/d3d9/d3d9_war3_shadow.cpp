@@ -624,6 +624,8 @@ int EnvIntOverride(const char* name, int minValue, int maxValue) {
 }
 
 war3::render::War3UnionVisibilityMode War3UnionCullModeRuntime() {
+  if constexpr (war3::internal::kReleaseFreezeExperimentalShadowRoutes)
+    return war3::render::War3UnionVisibilityMode::Off;
   static const auto mode = static_cast<war3::render::War3UnionVisibilityMode>(
       std::min<uint32_t>(
           EnvU32Default("DXVK_WAR3_UNION_CONSUMER_CULL_MODE", 0u), 2u));
@@ -632,6 +634,8 @@ war3::render::War3UnionVisibilityMode War3UnionCullModeRuntime() {
 
 war3::render::War3TerrainBoundsCullMode
 War3TerrainBoundsCullModeRuntime() {
+  if constexpr (war3::internal::kReleaseFreezeExperimentalShadowRoutes)
+    return war3::render::War3TerrainBoundsCullMode::Off;
   static const auto mode = [] {
     const std::string explicitMode =
         env::getEnvVar("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE");
@@ -3925,6 +3929,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   // physical A/B must prove zero false negatives before this experimental
   // switch may consume C2/C3 visibility decisions.
   static const bool s_objectBoundsCullConsume =
+      !war3::internal::kReleaseFreezeExperimentalShadowRoutes &&
       EnvFlagDefault("DXVK_WAR3_OBJECT_BOUNDS_CULL_CONSUME", false);
   const auto terrainBoundsCullMode = m_volumeSunRenderPathActive
       ? war3::render::War3TerrainBoundsCullMode::Off
@@ -5183,6 +5188,8 @@ enum class War3PointShadowPersistentMode : uint32_t {
 };
 
 War3PointShadowPersistentMode PointShadowPersistentMode() {
+  if constexpr (war3::internal::kReleaseFreezeExperimentalShadowRoutes)
+    return War3PointShadowPersistentMode::Off;
   static const War3PointShadowPersistentMode mode = [] {
     const char *env =
         std::getenv("DXVK_WAR3_POINT_SHADOW_PERSISTENT_PREPARE_MODE");

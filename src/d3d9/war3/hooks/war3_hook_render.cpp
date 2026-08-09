@@ -1425,6 +1425,9 @@ private:
 static inline bool War3PublishVisibleBreakdownRuntimeEnabled() noexcept {
   if constexpr (!dxvk::war3::internal::kNativePerfDetailHookTimingEnabled)
     return false;
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool enabled = [] {
     if (dxvk::war3::internal::War3PerfHookLevel() < 2)
       return false;
@@ -1949,6 +1952,9 @@ static bool War3TransparentDispatchTimingHooksRuntimeEnabled() {
   // isolated per-type crash gate. The enclosing FlushTransparent hook remains
   // enabled, so the queue still has a stable aggregate timing boundary.
   if constexpr (!dxvk::war3::internal::kNativePerfDetailHookTimingEnabled)
+    return false;
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
     return false;
   static const bool enabled = [] {
     const char* value =

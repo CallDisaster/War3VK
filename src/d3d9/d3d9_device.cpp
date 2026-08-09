@@ -2335,6 +2335,9 @@ bool War3ExactIndexedFreezeTrimRuntime() {
   // content generation. Even canonical zero-based indices only delayed the
   // NVIDIA reset. Keep the implementation as an explicit diagnostic until a
   // single producer can provide both bytes under one generation contract.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SHADOW_EXACT_INDEX_TRIM", 0u) != 0u;
   return s_enabled;
@@ -2350,6 +2353,9 @@ War3CompactWorkTableMode War3SemanticCompactWorkTableModeRuntime() {
   // The table is a correctness-neutral control-plane optimization. Keep the
   // release default disabled until Observe has proved parity and its measured
   // overhead stays below the 0.15 ms/frame admission gate.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return War3CompactWorkTableMode::Off;
   static const auto s_mode = static_cast<War3CompactWorkTableMode>(
       std::min<uint32_t>(
           2u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", 0u)));
@@ -2362,6 +2368,9 @@ War3PersistentPackageStage11EvidenceModeRuntime() {
       War3PersistentGpuPackageStage11ObserveAdapter::Mode;
   // This bridge is evidence-only. Keep release behavior entirely absent until
   // an explicit Observe request; Consume remains a hard capability failure.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return Mode::Off;
   static const auto s_mode = static_cast<Mode>((std::min)(
       2u, War3GetEnvU32(
               "DXVK_WAR3_PERSISTENT_GPU_PACKAGE_STAGE11_EVIDENCE_MODE", 0u)));
@@ -2375,6 +2384,9 @@ War3PersistentPackageD3D9OwnerModeRuntime() {
   // Separate from CPU source evidence so the proven low-overhead Stage11
   // observer can still run without allocating an atlas. Consume remains a
   // hard failure in this stage.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return Mode::Off;
   static const auto s_mode = [] {
     const auto configured = static_cast<Mode>((std::min)(
         2u, War3GetEnvU32(
@@ -2394,6 +2406,9 @@ War3PersistentPackageCurrentDrawEquivalenceModeRuntime() {
   // Content hashing is independently gated because it walks HOST_CACHED
   // current-draw bytes. Release behavior remains zero-overhead and Consume is
   // not accepted until recording and last-use authorities exist.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return Mode::Off;
   static const auto s_mode = [] {
     const auto configured = static_cast<Mode>((std::min)(
         2u, War3GetEnvU32(
@@ -3085,6 +3100,9 @@ inline bool War3ShadowCapturePostBreakdownRuntime() {
   // frame flush, so the tree remains closed. Each leaf subtracts the measured
   // QPC lower bound; nested probes can still add a small observer tax to the
   // exact parent while this explicit diagnostic mode is enabled.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SHADOW_CAPTURE_BREAKDOWN", 0u) != 0u;
   return s_enabled;
@@ -3092,6 +3110,9 @@ inline bool War3ShadowCapturePostBreakdownRuntime() {
 
 inline dxvk::war3::render::War3TerrainBoundsCullMode
 War3TerrainBoundsCullModeRuntime() {
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return dxvk::war3::render::War3TerrainBoundsCullMode::Off;
   static const auto s_mode = [] {
     const char* mode = std::getenv("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE");
     if (mode != nullptr && mode[0] != '\0') {
@@ -3119,6 +3140,9 @@ War3ProducerClaimObserveMode War3ProducerClaimObserveModeRuntime() {
   // Consume is parsed for experiment compatibility but deliberately behaves
   // as Observe below. The reduced pre-build identity has not yet proved
   // collision-free parity with the post-build exact-owner key.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return War3ProducerClaimObserveMode::Off;
   static const auto s_mode = static_cast<War3ProducerClaimObserveMode>(
       std::min<uint32_t>(
           2u,
@@ -3172,6 +3196,9 @@ inline bool War3DrawTimeVBCacheRuntime() {
   // the large transient geometry was the master cache-off path, so the cache
   // now stays fail-closed by default while the final-caster trace identifies
   // the remaining unsafe consumer tuple. Explicit =1 is diagnostic only.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_DRAWTIME_VB_CACHE", 0u) != 0u;
   return s_enabled;
@@ -3217,6 +3244,9 @@ inline bool War3ShadowMetadataBlockerRuntime() {
 inline bool War3DrawTimeCacheIteratorReuseVerifyRuntime() {
   // Opt-in proof mode deliberately performs the legacy second lookup and
   // asserts that both routes select the identical node.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_DRAWTIME_CACHE_ITERATOR_REUSE_VERIFY", 0u) !=
       0u;
@@ -3229,6 +3259,9 @@ inline bool War3DrawTimeSourceFingerprintReuseRuntime() {
   // therefore reuse stale backing and make bridge/ramp shadows flicker.
   // Fail closed until the complete descriptor verifier is implemented; the
   // old reuse contract is retained only as an explicit diagnostic rollback.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_DRAWTIME_SOURCE_FINGERPRINT_REUSE", 0u) != 0u;
   return s_enabled;

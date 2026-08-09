@@ -1,4 +1,4 @@
-project('warvk', ['c', 'cpp'], version : '1.2.0', meson_version : '>= 0.58', default_options : [ 'cpp_std=c++17', 'b_vscrt=static_from_buildtype', 'warning_level=2' ])
+project('warvk', ['c', 'cpp'], version : '1.2003', meson_version : '>= 0.58', default_options : [ 'cpp_std=c++17', 'b_vscrt=static_from_buildtype', 'warning_level=2' ])
 
 pkg = import('pkgconfig')
 cpu_family = target_machine.cpu_family()
@@ -131,7 +131,7 @@ else
   dxvk_version_raw = meson.project_version().strip('v').split('.')
   dxvk_version = [ dxvk_version_raw[0] ]
   foreach i : [ 1, 2 ]
-    padded = dxvk_version_raw[i]
+    padded = i < dxvk_version_raw.length() ? dxvk_version_raw[i] : '0'
     if padded.to_int() < 10
       padded = '0' + padded
     endif

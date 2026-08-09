@@ -1,5 +1,6 @@
 #include "war3_gpu_skin_resources.h"
 #include "war3_persistent_gpu_package_store.h"
+#include "../core/war3_internal_test_config.h"
 
 #include <algorithm>
 #include <array>
@@ -223,6 +224,13 @@ GpuSkinRuntimeConfig GpuSkinRuntimeConfig::fromEnvironment() {
   config.outsidePoisonSidecarPolicyExplicit = !outsidePoisonSidecar.empty();
   config.outsidePoisonSidecarPolicy = ParseOutsidePoisonSidecarPolicy(
       outsidePoisonSidecar, config.outsidePoisonSidecarPolicyInvalid);
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes) {
+    config.mode = GpuSkinMode::Disabled;
+    config.diffSamplePeriod = 0u;
+    config.fullDiagnostics = false;
+    config.diagnosticPeriodFrames = 0u;
+  }
   return config;
 }
 

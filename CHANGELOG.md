@@ -1,5 +1,43 @@
 # 更新日志
 
+## v1.2003 Hotfix 3 - 2026-08-09
+
+本版本开始采用 `1.2MHH` 编号：`1.2` 是大版本系列，`M` 是功能小版本，末两位
+`HH` 是热修复序号。因此本轮正确性修复为 **1.2003**；完成剔除并形成正式性能更新时，
+版本将进入 **1.2100**，而不是继续增加热修复号。
+
+### 阴影正确性修复
+
+- 修复不死族与暗夜精灵建筑建造过程中的动画附件阴影缺失或周期闪烁。Stage11 的
+  Transparent Type0 现在保留父建筑的语义所有者身份，同时使用子 runtime model/scene node
+  的真实 draw identity；固定功能蒙皮附件从同一绘制帧冻结精确 VB、IB、UV 与完整矩阵调色板，
+  不再因为父子 `renderablePart` 不同而被误判为陈旧或静态对象。
+- 该兼容路线不是恢复全局旧式 VB/IB 跨帧缓存。几何只在当前 Type0 绘制边界内捕获，仍须通过
+  map/device epoch、资源代际、范围、索引域、owner 和最终 replay 验证；证明不足时继续
+  fail-closed。
+- 修复点阴影地面和单位表面的摩尔纹/条带。可信 receiver plane 的全部 PCF tap 统一使用同一
+  精确径向深度域；单个 tap 不再在 exact plane 与中心深度之间混算。没有可靠平面的表面使用
+  有界、单调的斜率回退。
+
+### 发布冻结
+
+- Hotfix3 强制关闭尚未通过发布门的 Compact WorkTable、Producer Claim Ledger、联合/Bounds
+  剔除、Persistent GPU Package、GPU-skin 实验模式、persistent point-shadow worker、资源
+  census、deep hook timing、旧 VB cache 和 source-fingerprint reuse。即使启动器遗留旧
+  `DXVK_WAR3_*` 环境变量也不能重新打开这些路径。
+- 保留 Type0 当帧捕获、点阴影修复、Arena fence、epoch 隔离和最终 replay 验证等正确性合同。
+  普通 `Ctrl + F1` 性能报告仍可使用。
+
+### 验证与已知边界
+
+- 用户前台物理验收确认：不死族/暗夜精灵建造动画阴影连续，点阴影摩尔纹不再复现。
+- Hotfix3 冻结合同、相关阴影/点阴影静态测试、Win32 runnable 18/18、Win32 DLL 构建、
+  `ninja -n` no-work 与 `git diff --check` 通过。
+- 高压低视角下的 CSM 安全预算与提前剔除问题仍由 [#5](https://github.com/CallDisaster/War3VK/issues/5)
+  跟踪；超过预算时仍可能出现阴影闪烁或暂时消失，以避免提交可能触发 TDR 的超量工作。
+- 同进程跨地图仍不宣称修复，继续由 [#6](https://github.com/CallDisaster/War3VK/issues/6) 跟踪。
+  1.2003 仍建议一次启动只游玩一张地图，换图前完整重启游戏。
+
 ## v1.2.0 Hotfix 2 - 2026-08-07
 
 这是面向高单位密度地图的第二个稳定性热修。建议 `v1.2.0` 和
