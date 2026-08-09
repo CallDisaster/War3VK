@@ -39,6 +39,9 @@ VKAPI_ATTR VkResult VKAPI_CALL fakeGetDeviceFaultInfo(
   gFake.sawNoVendorBinary =
       counts->vendorBinarySize == 0u && info->pVendorBinaryData == nullptr;
 
+  if (gFake.result != VK_SUCCESS && gFake.result != VK_INCOMPLETE)
+    return gFake.result;
+
   std::memset(info->description, 0, VK_MAX_DESCRIPTION_SIZE);
   std::memcpy(info->description, "fake device fault", 17u);
 
@@ -145,7 +148,9 @@ bool testIncompleteClampsAndMarksTruncated() {
 }
 
 bool testQueryFailureCompletesWithoutRetry() {
-  resetFake(VK_ERROR_UNKNOWN, 0u, 0u);
+  resetFake(VK_ERROR_UNKNOWN,
+      dxvk::DxvkDeviceFaultSnapshot::MaxAddressInfos,
+      dxvk::DxvkDeviceFaultSnapshot::MaxVendorInfos);
   dxvk::DxvkDeviceFaultCapture capture(
       true, fakeDevice(), fakeGetDeviceFaultInfo);
   capture.captureOnce(VK_ERROR_DEVICE_LOST);
@@ -155,7 +160,12 @@ bool testQueryFailureCompletesWithoutRetry() {
   return check(gFake.calls == 1u, "failed query retried") &&
     check(snapshot.complete, "failed query did not publish Complete") &&
     check(snapshot.queryResult == VK_ERROR_UNKNOWN,
-      "failed query result was hidden");
+      "failed query result was hidden") &&
+    check(snapshot.addressInfoCount == 0u && snapshot.vendorInfoCount == 0u,
+      "failed query consumed undefined output counts") &&
+    check(!snapshot.truncated, "failed query marked undefined output truncated") &&
+    check(snapshot.description[0] == '\0',
+      "failed query consumed undefined output description");
 }
 
 bool testLostPathDoesNotAllocate() {

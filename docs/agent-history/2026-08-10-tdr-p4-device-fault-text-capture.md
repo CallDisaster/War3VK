@@ -16,8 +16,8 @@ The capture stores at most 64 address records and 32 vendor text records by
 value, together with the bounded standard descriptions and the query result.
 It accepts `VK_SUCCESS` and `VK_INCOMPLETE`; oversized counts and the latter
 are marked as truncated. Any other query result is also completed and recorded
-without retry. The lost-device path does not allocate, lock, wait, log, or
-write files.
+without retry, but never consumes its undefined count, text, or record output.
+The lost-device path does not allocate, lock, wait, log, or write files.
 
 No vendor binary is enabled, requested, retained, or written. The incident JSON
 is created later by the D3D9 diagnostic path from an owning snapshot and always

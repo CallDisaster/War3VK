@@ -41,16 +41,28 @@ namespace dxvk {
 
     const VkResult result = m_getDeviceFaultInfo(m_device, &counts, &info);
     m_queryResult = result;
-    m_truncated = result == VK_INCOMPLETE ||
-      counts.addressInfoCount > DxvkDeviceFaultSnapshot::MaxAddressInfos ||
-      counts.vendorInfoCount > DxvkDeviceFaultSnapshot::MaxVendorInfos ||
-      counts.vendorBinarySize != 0u;
+    const bool acceptedResult =
+      result == VK_SUCCESS || result == VK_INCOMPLETE;
 
-    m_addressInfoCount = std::min(counts.addressInfoCount,
-      DxvkDeviceFaultSnapshot::MaxAddressInfos);
-    m_vendorInfoCount = std::min(counts.vendorInfoCount,
-      DxvkDeviceFaultSnapshot::MaxVendorInfos);
-    std::memcpy(m_description.data(), info.description, m_description.size());
+    if (acceptedResult) {
+      m_truncated = result == VK_INCOMPLETE ||
+        counts.addressInfoCount > DxvkDeviceFaultSnapshot::MaxAddressInfos ||
+        counts.vendorInfoCount > DxvkDeviceFaultSnapshot::MaxVendorInfos ||
+        counts.vendorBinarySize != 0u;
+      m_addressInfoCount = std::min(counts.addressInfoCount,
+        DxvkDeviceFaultSnapshot::MaxAddressInfos);
+      m_vendorInfoCount = std::min(counts.vendorInfoCount,
+        DxvkDeviceFaultSnapshot::MaxVendorInfos);
+      std::memcpy(m_description.data(), info.description, m_description.size());
+    } else {
+      // The Vulkan contract does not require failed queries to initialize any
+      // output. Do not consume input capacities or zero-filled output storage
+      // as if they were driver-provided fault records.
+      m_addressInfoCount = 0u;
+      m_vendorInfoCount = 0u;
+      m_truncated = false;
+      m_description = { };
+    }
 
     // Publish query errors as Complete as well. Retrying a terminal driver
     // query can itself add unbounded work to the lost-device path.

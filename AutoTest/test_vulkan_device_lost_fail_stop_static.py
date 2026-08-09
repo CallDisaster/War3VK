@@ -368,6 +368,10 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         self.assertIn("counts.vendorBinarySize = 0u", capture)
         self.assertIn("info.pVendorBinaryData = nullptr", capture)
         self.assertIn("result == VK_INCOMPLETE", capture)
+        self.assertIn("const bool acceptedResult", capture)
+        self.assertIn("if (acceptedResult)", capture)
+        self.assertIn("m_addressInfoCount = 0u", capture)
+        self.assertIn("m_vendorInfoCount = 0u", capture)
         self.assertIn("DxvkDeviceFaultCaptureState::Complete", capture)
         for forbidden in ("new ", "std::vector", "std::string", "mutex", "wait", "sleep", "Logger"):
             self.assertNotIn(forbidden, capture)
@@ -428,8 +432,13 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
             "BoundedDeviceFaultText",
             "MaxAddressInfos",
             "MaxVendorInfos",
+            "hasDeviceFaultData",
         ):
             self.assertIn(token, DIAGNOSTICS)
+        json_start = DIAGNOSTICS.index("const bool hasDeviceFaultData")
+        address_loop = DIAGNOSTICS.index("for (uint32_t index = 0u; index < addressInfoCount")
+        self.assertLess(json_start, address_loop)
+        self.assertIn("hasDeviceFaultData ?", DIAGNOSTICS[json_start:address_loop])
         self.assertNotIn("NV checkpoint", DIAGNOSTICS)
 
 

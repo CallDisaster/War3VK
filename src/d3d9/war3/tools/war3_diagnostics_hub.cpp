@@ -391,20 +391,23 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
     return;
 
   const ::dxvk::DxvkDeviceFaultSnapshot& deviceFault = incident.deviceFault;
-  const uint32_t addressInfoCount = std::min(
+  const bool hasDeviceFaultData = deviceFault.complete &&
+      (deviceFault.queryResult == VK_SUCCESS ||
+       deviceFault.queryResult == VK_INCOMPLETE);
+  const uint32_t addressInfoCount = hasDeviceFaultData ? std::min(
       deviceFault.addressInfoCount,
-      ::dxvk::DxvkDeviceFaultSnapshot::MaxAddressInfos);
-  const uint32_t vendorInfoCount = std::min(
+      ::dxvk::DxvkDeviceFaultSnapshot::MaxAddressInfos) : 0u;
+  const uint32_t vendorInfoCount = hasDeviceFaultData ? std::min(
       deviceFault.vendorInfoCount,
-      ::dxvk::DxvkDeviceFaultSnapshot::MaxVendorInfos);
+      ::dxvk::DxvkDeviceFaultSnapshot::MaxVendorInfos) : 0u;
   json deviceFaultPayload = {
       {"supported", deviceFault.supported},
       {"captureState", DeviceFaultCaptureStateName(deviceFault.captureState)},
       {"complete", deviceFault.complete},
       {"queryResult", static_cast<int64_t>(deviceFault.queryResult)},
       {"truncated", deviceFault.truncated},
-      {"description", BoundedDeviceFaultText(
-          deviceFault.description.data(), VK_MAX_DESCRIPTION_SIZE)},
+      {"description", hasDeviceFaultData ? BoundedDeviceFaultText(
+          deviceFault.description.data(), VK_MAX_DESCRIPTION_SIZE) : std::string{}},
       {"vendorBinaryEnabled", false},
       {"addressInfos", json::array()},
       {"vendorInfos", json::array()},
