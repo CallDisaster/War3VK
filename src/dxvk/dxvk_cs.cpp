@@ -245,9 +245,14 @@ namespace dxvk {
           bool isHighPrio = highPrioIndex < highPrio.size();
           auto& entry = isHighPrio ? highPrio[highPrioIndex++] : ordered[orderedIndex++];
 
-          m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
-
-          entry.chunk->executeAll(m_context.ptr());
+          // The Vulkan logical device cannot recover after DEVICE_LOST. Drain
+          // queued chunks for ownership/sequence progress, but never execute
+          // them: some chunks allocate resources or begin a fresh command list
+          // even though the submission queue has already stopped.
+          if (likely(m_device->getDeviceStatus() != VK_ERROR_DEVICE_LOST)) {
+            m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
+            entry.chunk->executeAll(m_context.ptr());
+          }
 
           if (entry.seq) {
             // Use a separate mutex for the chunk counter, this will only

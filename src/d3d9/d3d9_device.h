@@ -1248,8 +1248,30 @@ public:
 
   // Device Lost
   bool IsDeviceLost() const {
-    return m_deviceLostState != D3D9DeviceLostState::Ok;
+    return m_deviceLostState != D3D9DeviceLostState::Ok ||
+           IsVulkanDeviceLostFailStop();
   }
+
+  /**
+   * \brief Tests the irreversible Vulkan device-loss latch
+   *
+   * Unlike the legacy D3D9 focus-loss state, a lost Vulkan logical device
+   * cannot be recovered by Reset. This query is lock-free so command emission
+   * can stop as soon as the submission queue publishes VK_ERROR_DEVICE_LOST.
+   */
+  bool IsVulkanDeviceLostFailStop() const {
+    return m_vkDeviceLostFailStop.load(std::memory_order_acquire) ||
+           (m_dxvkDevice != nullptr &&
+            m_dxvkDevice->getDeviceStatus() == VK_ERROR_DEVICE_LOST);
+  }
+
+  /**
+   * \brief Latches and records the first Vulkan device-loss observation
+   *
+   * \param origin Stable diagnostic label for the observing front-end path.
+   * \returns true if the Vulkan logical device is lost.
+   */
+  bool CheckVulkanDeviceLostFailStop(const char* origin);
 
   void NotifyFullscreen(HWND window, bool fullscreen);
   void NotifyWindowActivated(HWND window, bool activated);
@@ -1310,6 +1332,9 @@ public:
   void InjectCsChunk(DxvkCsChunkRef &&Chunk, bool Synchronize);
 
   template <typename Fn> void InjectCs(Fn &&Command) {
+    if (unlikely(IsVulkanDeviceLostFailStop()))
+      return;
+
     auto chunk = AllocCsChunk();
     chunk->push(std::move(Command));
 
@@ -1325,6 +1350,9 @@ public:
 
 private:
   template <bool AllowFlush = true, typename Cmd> void EmitCs(Cmd &&command) {
+    if (unlikely(IsVulkanDeviceLostFailStop()))
+      return;
+
     if (unlikely(!m_csChunk->push(command))) {
       EmitCsChunk(std::move(m_csChunk));
       m_csChunk = AllocCsChunk();
@@ -1339,6 +1367,13 @@ private:
   void EmitCsChunk(DxvkCsChunkRef &&chunk);
 
   void FlushCsChunk() {
+    if (unlikely(IsVulkanDeviceLostFailStop())) {
+      // Drop CPU-side commands which can no longer be submitted. Releasing the
+      // chunk here also releases resource references retained by those lambdas.
+      m_csChunk = AllocCsChunk();
+      return;
+    }
+
     if (likely(!m_csChunk->empty())) {
       EmitCsChunk(std::move(m_csChunk));
       m_csChunk = AllocCsChunk();
@@ -2150,6 +2185,7 @@ private:
   std::atomic<int64_t> m_availableMemory = {0};
 
   D3D9DeviceLostState m_deviceLostState = D3D9DeviceLostState::Ok;
+  std::atomic<bool> m_vkDeviceLostFailStop{false};
   HWND m_fullscreenWindow = NULL;
   std::atomic<uint32_t> m_losableResourceCounter = {0};
 

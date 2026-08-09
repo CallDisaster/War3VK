@@ -15156,8 +15156,29 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::QueryInterface(REFIID riid,
   return E_NOINTERFACE;
 }
 
+bool D3D9DeviceEx::CheckVulkanDeviceLostFailStop(const char* origin) {
+  if (!IsVulkanDeviceLostFailStop())
+    return false;
+
+  bool expected = false;
+  if (m_vkDeviceLostFailStop.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+    m_war3ShadowSessionReady.store(false, std::memory_order_release);
+    Logger::err(str::format(
+        "D3D9DeviceEx: Vulkan device lost; entering irreversible fail-stop at ",
+        origin != nullptr ? origin : "unknown"));
+    dxvk::war3::tools::NotifyGpuDeviceLostFailStop(origin);
+  }
+
+  return true;
+}
+
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::TestCooperativeLevel() {
   D3D9DeviceLock lock = LockDevice();
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.TestCooperativeLevel"))
+    return D3DERR_DEVICEREMOVED;
 
   // Equivelant of D3D11/DXGI present tests. We can always present.
   if (likely(m_deviceLostState == D3D9DeviceLostState::Ok)) {
@@ -15390,6 +15411,11 @@ HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   D3D9DeviceLock lock = LockDevice();
 
+  // A Vulkan logical device cannot be recovered by a D3D9 Reset. Do not
+  // reopen producers or rebuild GPU resources after the queue reported loss.
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.Reset"))
+    return D3DERR_DEVICEREMOVED;
+
   // [War3] FPS 解锁时强制禁用 VSync
   War3ForceImmediatePresent(pPresentationParameters);
 
@@ -15505,6 +15531,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::Present(const RECT *pSourceRect,
                                                 const RECT *pDestRect,
                                                 HWND hDestWindowOverride,
                                                 const RGNDATA *pDirtyRegion) {
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.Present"))
+    return D3DERR_DEVICEREMOVED;
+
   War3MaybeInsertBeforeUi(true);
   War3ResetShadowAllocator();
 
@@ -15558,6 +15587,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateTexture(
     UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format,
     D3DPOOL Pool, IDirect3DTexture9 **ppTexture, HANDLE *pSharedHandle) {
   InitReturnPtr(ppTexture);
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateTexture"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(ppTexture == nullptr))
     return D3DERR_INVALIDCALL;
@@ -15631,6 +15663,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVolumeTexture(
     HANDLE *pSharedHandle) {
   InitReturnPtr(ppVolumeTexture);
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateVolumeTexture"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(ppVolumeTexture == nullptr))
     return D3DERR_INVALIDCALL;
 
@@ -15690,6 +15725,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateCubeTexture(
     UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DCubeTexture9 **ppCubeTexture, HANDLE *pSharedHandle) {
   InitReturnPtr(ppCubeTexture);
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateCubeTexture"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(ppCubeTexture == nullptr))
     return D3DERR_INVALIDCALL;
@@ -15752,6 +15790,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVertexBuffer(
     IDirect3DVertexBuffer9 **ppVertexBuffer, HANDLE *pSharedHandle) {
   InitReturnPtr(ppVertexBuffer);
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateVertexBuffer"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(ppVertexBuffer == nullptr))
     return D3DERR_INVALIDCALL;
 
@@ -15797,6 +15838,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateIndexBuffer(
     UINT Length, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DIndexBuffer9 **ppIndexBuffer, HANDLE *pSharedHandle) {
   InitReturnPtr(ppIndexBuffer);
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateIndexBuffer"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(ppIndexBuffer == nullptr))
     return D3DERR_INVALIDCALL;
@@ -16751,6 +16795,9 @@ D3D9DeviceEx::GetDepthStencilSurface(IDirect3DSurface9 **ppZStencilSurface) {
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::BeginScene() {
   D3D9DeviceLock lock = LockDevice();
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.BeginScene"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(m_inScene))
     return D3DERR_INVALIDCALL;
 
@@ -16761,6 +16808,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::BeginScene() {
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceEx::EndScene() {
   D3D9DeviceLock lock = LockDevice();
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.EndScene"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(!m_inScene))
     return D3DERR_INVALIDCALL;
@@ -18072,6 +18122,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitive(
       war3::hooks::War3HotHookId::D3D9DrawPrimitive, 4u);
   D3D9DeviceLock lock = LockDevice();
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawPrimitive"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(m_state.vertexDecl == nullptr))
     return D3DERR_INVALIDCALL;
 
@@ -18168,6 +18221,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitive(
 }
 
 void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
+  if (CheckVulkanDeviceLostFailStop("War3.BeforeUi"))
+    return;
+
   if (!m_war3Pipeline)
     return;
 
@@ -31420,6 +31476,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitive(
       war3::hooks::War3HotHookId::D3D9DrawIndexedPrimitive, 4u);
   D3D9DeviceLock lock = LockDevice();
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawIndexedPrimitive"))
+    return D3DERR_DEVICEREMOVED;
+
   // [War3] 16位索引溢出防护：拆分过大的批次，避免索引越界导致模型撕裂
   // 说明：
   // - 该保护只在 War3 管线存在时启用
@@ -32205,6 +32264,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitiveUP(
       war3::hooks::War3HotHookId::D3D9DrawPrimitiveUP, 4u);
   D3D9DeviceLock lock = LockDevice();
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawPrimitiveUP"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(!VertexStreamZeroStride))
     return D3DERR_INVALIDCALL;
 
@@ -32304,6 +32366,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawIndexedPrimitiveUP(
   war3::hooks::War3HotHookCallTiming dxvkDrawTiming(
       war3::hooks::War3HotHookId::D3D9DrawIndexedPrimitiveUP, 4u);
   D3D9DeviceLock lock = LockDevice();
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.DrawIndexedPrimitiveUP"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(!VertexStreamZeroStride))
     return D3DERR_INVALIDCALL;
@@ -33474,6 +33539,9 @@ D3D9DeviceEx::GetMaximumFrameLatency(UINT *pMaxLatency) {
 
 HRESULT STDMETHODCALLTYPE
 D3D9DeviceEx::CheckDeviceState(HWND hDestinationWindow) {
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CheckDeviceState"))
+    return D3DERR_DEVICEREMOVED;
+
   static bool s_errorShown = false;
 
   if (!std::exchange(s_errorShown, true))
@@ -33487,6 +33555,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
                                                   HWND hDestWindowOverride,
                                                   const RGNDATA *pDirtyRegion,
                                                   DWORD dwFlags) {
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.PresentEx"))
+    return D3DERR_DEVICEREMOVED;
+
   // War3MaybeInsertBeforeUi moves the completed scene into the pipeline and
   // immediately prepares a reserved, empty scene for the next frame. Preserve
   // that fact across OnFrameStart(), which clears HasInsertedBeforeUi().
@@ -34008,6 +34079,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateRenderTargetEx(
     HANDLE *pSharedHandle, DWORD Usage) {
   InitReturnPtr(ppSurface);
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateRenderTargetEx"))
+    return D3DERR_DEVICEREMOVED;
+
   if (unlikely(ppSurface == nullptr))
     return D3DERR_INVALIDCALL;
 
@@ -34075,6 +34149,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateOffscreenPlainSurfaceEx(
     UINT Width, UINT Height, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DSurface9 **ppSurface, HANDLE *pSharedHandle, DWORD Usage) {
   InitReturnPtr(ppSurface);
+
+  if (CheckVulkanDeviceLostFailStop(
+          "D3D9Device.CreateOffscreenPlainSurfaceEx"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(ppSurface == nullptr))
     return D3DERR_INVALIDCALL;
@@ -34159,6 +34237,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateDepthStencilSurfaceEx(
     DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9 **ppSurface,
     HANDLE *pSharedHandle, DWORD Usage) {
   InitReturnPtr(ppSurface);
+
+  if (CheckVulkanDeviceLostFailStop(
+          "D3D9Device.CreateDepthStencilSurfaceEx"))
+    return D3DERR_DEVICEREMOVED;
 
   if (unlikely(ppSurface == nullptr))
     return D3DERR_INVALIDCALL;
@@ -36134,11 +36216,17 @@ void D3D9DeviceEx::UploadPerDrawData(UINT &FirstVertexIndex, UINT NumVertices,
 }
 
 void D3D9DeviceEx::InjectCsChunk(DxvkCsChunkRef &&Chunk, bool Synchronize) {
+  if (unlikely(IsVulkanDeviceLostFailStop()))
+    return;
+
   m_csThread.injectChunk(DxvkCsQueue::HighPriority, std::move(Chunk),
                          Synchronize);
 }
 
 void D3D9DeviceEx::EmitCsChunk(DxvkCsChunkRef &&chunk) {
+  if (unlikely(IsVulkanDeviceLostFailStop()))
+    return;
+
   // Flush init commands so that the CS thread
   // can processe them before the first use.
   m_initializer->FlushCsChunk();
@@ -36156,6 +36244,9 @@ void D3D9DeviceEx::ConsiderFlush(GpuFlushType FlushType) {
 
 void D3D9DeviceEx::SynchronizeCsThread(uint64_t SequenceNumber) {
   D3D9DeviceLock lock = LockDevice();
+
+  if (unlikely(IsVulkanDeviceLostFailStop()))
+    return;
 
   // Dispatch current chunk so that all commands
   // recorded prior to this function will be run
@@ -36554,6 +36645,9 @@ template <D3D9RenderStateItem Item> void D3D9DeviceEx::UpdatePushConstant() {
 
 template <bool Synchronize9On12> void D3D9DeviceEx::ExecuteFlush() {
   D3D9DeviceLock lock = LockDevice();
+
+  if (unlikely(CheckVulkanDeviceLostFailStop("D3D9Device.Flush")))
+    return;
 
   if constexpr (Synchronize9On12)
     m_submitStatus.result = VK_NOT_READY;

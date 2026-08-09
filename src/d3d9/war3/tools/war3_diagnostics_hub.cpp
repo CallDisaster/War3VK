@@ -370,6 +370,7 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
   json payload = {
       {"timestampMs", incident.timestampMs},
       {"reason", incident.reason},
+      {"firstErrorOrigin", incident.firstErrorOrigin},
       {"queueResult", incident.queueResult},
       {"stalledMilliseconds", incident.stalledMilliseconds},
       {"lastRenderStage",
@@ -694,6 +695,7 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
       if (arenaIncident)
         s_shadowArenaIncidentLatched = true;
       incident.timestampMs = frame.timestampMs;
+      incident.firstErrorOrigin = "gpu-flight-poll";
       if (queueFailed)
         incident.reason = "queue-error";
       else if (queueStalled)
@@ -3658,6 +3660,51 @@ void SetGpuFlightBreadcrumb(
   s_gpuFlightBreadcrumb.store(
       static_cast<uint32_t>(breadcrumb), std::memory_order_release);
   s_gpuFlightBreadcrumbSerial.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+void NotifyGpuDeviceLostFailStop(const char* origin) noexcept {
+  try {
+    GpuIncidentSnapshot incident = {};
+    {
+      std::lock_guard<std::mutex> lock(s_gpuFlightMutex);
+      if (s_gpuIncidentLatched)
+        return;
+
+      s_gpuIncidentLatched = true;
+      incident.timestampMs = EpochMilliseconds();
+      incident.reason = "queue-error-device-lost-fail-stop";
+      incident.firstErrorOrigin = origin != nullptr ? origin : "unknown";
+      incident.queueResult = VK_ERROR_DEVICE_LOST;
+      incident.recentFrames.assign(
+          s_gpuFlightFrames.begin(), s_gpuFlightFrames.end());
+
+      // Add a terminal record from atomics only. Do not query the active D3D9
+      // device here: callers may already hold its lock while observing the
+      // first error, and diagnostics must not re-enter that lock.
+      GpuFlightFrame terminal = {};
+      terminal.timestampMs = incident.timestampMs;
+      terminal.lastRenderStage = GpuFlightBreadcrumbName(
+          static_cast<GpuFlightBreadcrumb>(
+              s_gpuFlightBreadcrumb.load(std::memory_order_acquire)));
+      terminal.breadcrumbSerial =
+          s_gpuFlightBreadcrumbSerial.load(std::memory_order_acquire);
+      terminal.activeCsmCascade =
+          s_gpuFlightActiveCsmCascade.load(std::memory_order_acquire);
+      terminal.activePointLight =
+          s_gpuFlightActivePointLight.load(std::memory_order_acquire);
+      terminal.activePointFace =
+          s_gpuFlightActivePointFace.load(std::memory_order_acquire);
+      terminal.queueResult = VK_ERROR_DEVICE_LOST;
+      incident.recentFrames.push_back(std::move(terminal));
+      if (incident.recentFrames.size() > 240u)
+        incident.recentFrames.erase(incident.recentFrames.begin());
+    }
+
+    WriteGpuIncidentSnapshot(incident);
+  } catch (...) {
+    // Device-loss handling must remain fail-stop even if incident output is
+    // unavailable or serialization itself fails.
+  }
 }
 
 void ResetGpuFlightCsmWork() noexcept {

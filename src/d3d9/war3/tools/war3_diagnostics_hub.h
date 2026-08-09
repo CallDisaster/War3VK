@@ -137,6 +137,7 @@ void SetGpuFlightBreadcrumb(
     uint32_t csmCascade = 0xFFFFFFFFu,
     uint32_t pointLight = 0xFFFFFFFFu,
     uint32_t pointFace = 0xFFFFFFFFu) noexcept;
+void NotifyGpuDeviceLostFailStop(const char* origin) noexcept;
 void ResetGpuFlightCsmWork() noexcept;
 void SetGpuFlightCsmCascadeWork(
     uint32_t cascade, uint32_t drawCount, uint64_t triangleCount) noexcept;
@@ -157,6 +158,7 @@ void ClearGpuFlightAutoTestContext() noexcept;
 struct GpuIncidentSnapshot {
   uint64_t timestampMs = 0u;
   std::string reason;
+  std::string firstErrorOrigin;
   int64_t queueResult = 0;
   uint64_t stalledMilliseconds = 0u;
   std::vector<GpuFlightFrame> recentFrames;
