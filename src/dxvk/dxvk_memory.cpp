@@ -104,6 +104,7 @@ namespace dxvk {
           vk->device(), &info, nullptr, &descriptor.legacy.bufferView);
 
         if (vr != VK_SUCCESS) {
+          m_device->notifyDeviceError(vr);
           throw DxvkError(str::format("Failed to create Vulkan buffer view: ", vr,
             "\n   usage:  0x", std::hex, key.usage,
             "\n   format: ", key.format,
@@ -189,8 +190,10 @@ namespace dxvk {
     VkResult vr = vk->vkCreateImageView(
       vk->device(), &info, nullptr, &descriptor.legacy.image.imageView);
 
-    if (vr != VK_SUCCESS)
+    if (vr != VK_SUCCESS) {
+      m_device->notifyDeviceError(vr);
       throw DxvkError(str::format("Failed to create Vulkan image view: ", vr));
+    }
 
     if (m_device->canUseDescriptorBuffer() && shaderResourceUsage) {
       VkDescriptorGetInfoEXT info = { VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT };
@@ -962,6 +965,7 @@ namespace dxvk {
       &createInfo, nullptr, &buffer);
 
     if (vr != VK_SUCCESS) {
+      m_device->notifyDeviceError(vr);
       throw DxvkError(str::format("Failed to create buffer: ", vr,
         "\n  size:    ", createInfo.size,
         "\n  usage:   ", std::hex, createInfo.usage,
@@ -1032,6 +1036,7 @@ namespace dxvk {
         allocation->m_memory, allocation->m_address & DxvkPageAllocator::ChunkAddressMask);
 
       if (vr != VK_SUCCESS) {
+        m_device->notifyDeviceError(vr);
         throw DxvkError(str::format("Failed to bind buffer memory: ", vr,
           "\n  size:    ", createInfo.size,
           "\n  usage:   ", std::hex, createInfo.usage,
@@ -1057,6 +1062,7 @@ namespace dxvk {
     VkResult vr = vk->vkCreateImage(vk->device(), &createInfo, nullptr, &image);
 
     if (vr != VK_SUCCESS) {
+      m_device->notifyDeviceError(vr);
       throw DxvkError(str::format("Failed to create image: ", vr,
         "\n  type:    ", createInfo.imageType,
         "\n  format:  ", createInfo.format,
@@ -1182,6 +1188,7 @@ namespace dxvk {
         allocation->m_address & DxvkPageAllocator::ChunkAddressMask);
 
       if (vr != VK_SUCCESS) {
+        m_device->notifyDeviceError(vr);
         throw DxvkError(str::format("Failed to bind image memory: ", vr,
           "\n  type:    ", createInfo.imageType,
           "\n  format:  ", createInfo.format,
@@ -1771,6 +1778,7 @@ namespace dxvk {
         memory.memory, 0, memory.size, 0, &memory.mapPtr);
 
       if (vr != VK_SUCCESS) {
+        m_device->notifyDeviceError(vr);
         throw DxvkError(str::format("Failed to map Vulkan memory: ", vr,
           "\n  size: ", memory.size, " bytes"));
       }

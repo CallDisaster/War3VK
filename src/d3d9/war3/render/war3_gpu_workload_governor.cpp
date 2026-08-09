@@ -26,6 +26,18 @@ bool AddCost(const War3GpuWorkloadCost& lhs,
   return true;
 }
 
+bool SubtractCost(const War3GpuWorkloadCost& lhs,
+                  const War3GpuWorkloadCost& rhs,
+                  War3GpuWorkloadCost& result) noexcept {
+  if (!lhs.valid || !rhs.valid || rhs.draws > lhs.draws ||
+      rhs.vertices > lhs.vertices || rhs.indices > lhs.indices) {
+    return false;
+  }
+  result = {lhs.draws - rhs.draws, lhs.vertices - rhs.vertices,
+            lhs.indices - rhs.indices, true};
+  return true;
+}
+
 bool ExactF32(float lhs, float rhs) noexcept {
   uint32_t lhsBits = 0u;
   uint32_t rhsBits = 0u;
@@ -184,6 +196,33 @@ bool War3GpuWorkloadGovernor::tryReserve(
   consumerDiagnostics.accepted = accepted;
   consumerDiagnostics.acceptedItems = acceptedItems;
   ++consumerDiagnostics.acceptedReservations;
+  return true;
+}
+
+bool War3GpuWorkloadGovernor::cancelReservation(
+    War3GpuWorkloadConsumer consumer, uint64_t itemCount,
+    const War3GpuWorkloadCost& cost) noexcept {
+  const size_t index = consumerIndex(consumer);
+  if (index >= m_diagnostics.consumers.size() || itemCount == 0u ||
+      !cost.valid)
+    return false;
+
+  auto& consumerDiagnostics = m_diagnostics.consumers[index];
+  if (consumerDiagnostics.acceptedItems < itemCount ||
+      consumerDiagnostics.acceptedReservations == 0u)
+    return false;
+
+  War3GpuWorkloadCost used = {};
+  War3GpuWorkloadCost accepted = {};
+  if (!SubtractCost(m_diagnostics.used, cost, used) ||
+      !SubtractCost(consumerDiagnostics.accepted, cost, accepted))
+    return false;
+
+  m_diagnostics.used = used;
+  consumerDiagnostics.accepted = accepted;
+  consumerDiagnostics.acceptedItems -= itemCount;
+  --consumerDiagnostics.acceptedReservations;
+  ++consumerDiagnostics.rolledBackReservations;
   return true;
 }
 

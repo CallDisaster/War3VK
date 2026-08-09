@@ -80,6 +80,31 @@ void TestAtomicReservation() {
         "point budget fallback outcome is diagnosable");
 }
 
+void TestProvisionalReservationRollback() {
+  War3GpuWorkloadGovernor governor;
+  governor.beginFrame(43u);
+  const War3GpuWorkloadCost volume = {4u, 400u, 1200u, true};
+  Check(governor.tryReserve(War3GpuWorkloadConsumer::VolumeSun, 4u,
+                            volume),
+        "provisional volume reservation fits");
+  Check(governor.cancelReservation(War3GpuWorkloadConsumer::VolumeSun, 4u,
+                                   volume),
+        "unrecorded volume reservation rolls back");
+  const auto& diagnostics = governor.diagnostics();
+  const auto& volumeDiagnostics = diagnostics.consumers[
+      static_cast<size_t>(War3GpuWorkloadConsumer::VolumeSun)];
+  Check(diagnostics.used.draws == 0u && diagnostics.used.vertices == 0u &&
+            diagnostics.used.indices == 0u,
+        "rollback restores complete frame budget");
+  Check(volumeDiagnostics.acceptedReservations == 0u &&
+            volumeDiagnostics.acceptedItems == 0u &&
+            volumeDiagnostics.rolledBackReservations == 1u,
+        "rollback diagnostics distinguish provisional cancellation");
+  Check(!governor.cancelReservation(War3GpuWorkloadConsumer::VolumeSun, 4u,
+                                    volume),
+        "same reservation cannot roll back twice");
+}
+
 void TestIndependentLimitsAndFrameReset() {
   War3GpuWorkloadLimits limits = {};
   limits.maxDraws = 100u;
@@ -187,6 +212,7 @@ void TestPointLastCompleteOwnership() {
 int main() {
   TestCheckedArithmetic();
   TestAtomicReservation();
+  TestProvisionalReservationRollback();
   TestIndependentLimitsAndFrameReset();
   TestInvalidAndOverflowRequests();
   TestPointLastCompleteOwnership();

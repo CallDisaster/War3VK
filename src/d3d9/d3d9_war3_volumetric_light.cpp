@@ -526,11 +526,41 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
                                                VkFormat colorFormat,
                                                VkFormat depthFormat,
                                                uint32_t resolutionDivisor) {
-  if (!m_colorCopy || m_cachedExtent.width != extent.width ||
-      m_cachedExtent.height != extent.height || m_cachedFormat != colorFormat) {
-    m_cachedExtent = extent;
-    m_cachedFormat = colorFormat;
+  const bool replaceColor =
+      !m_colorCopy || !m_colorCopyView ||
+      m_cachedExtent.width != extent.width ||
+      m_cachedExtent.height != extent.height || m_cachedFormat != colorFormat;
+  const bool replaceDepth =
+      !m_depthCopy || !m_depthCopyView ||
+      m_cachedDepthExtent.width != extent.width ||
+      m_cachedDepthExtent.height != extent.height ||
+      m_cachedDepthFormat != depthFormat;
+  const uint32_t divisor = std::clamp<uint32_t>(
+      resolutionDivisor, kVolumetricMinResolutionDivisor,
+      kVolumetricMaxResolutionDivisor);
+  const VkExtent3D effectExtent = {
+      std::max<uint32_t>(1u, (extent.width + divisor - 1u) / divisor),
+      std::max<uint32_t>(1u, (extent.height + divisor - 1u) / divisor),
+      1u};
+  constexpr VkFormat effectFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+  const bool replaceEffect =
+      !m_effectImage || !m_effectView ||
+      m_cachedEffectExtent.width != effectExtent.width ||
+      m_cachedEffectExtent.height != effectExtent.height ||
+      m_cachedEffectFormat != effectFormat;
 
+  // Rebuild the complete resource set as candidates. No cache key, layout
+  // state or published image changes until every required image and view has
+  // been created successfully. This keeps an allocation failure from pairing
+  // a new extent with an old, smaller image on the next optional-pass retry.
+  Rc<DxvkImage> candidateColor = m_colorCopy;
+  Rc<DxvkImageView> candidateColorView = m_colorCopyView;
+  Rc<DxvkImage> candidateDepth = m_depthCopy;
+  Rc<DxvkImageView> candidateDepthView = m_depthCopyView;
+  Rc<DxvkImage> candidateEffect = m_effectImage;
+  Rc<DxvkImageView> candidateEffectView = m_effectView;
+
+  if (replaceColor) {
     DxvkImageCreateInfo info = {};
     info.type = VK_IMAGE_TYPE_2D;
     info.format = colorFormat;
@@ -548,8 +578,8 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    m_colorCopy = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    m_colorCopyLayout.reset();
+    candidateColor =
+        m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     DxvkImageViewKey viewInfo;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -567,15 +597,10 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
                                   VK_COMPONENT_SWIZZLE_IDENTITY};
     viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
 
-    m_colorCopyView = m_colorCopy->createView(viewInfo);
+    candidateColorView = candidateColor->createView(viewInfo);
   }
 
-  if (!m_depthCopy || m_cachedDepthExtent.width != extent.width ||
-      m_cachedDepthExtent.height != extent.height ||
-      m_cachedDepthFormat != depthFormat) {
-    m_cachedDepthExtent = extent;
-    m_cachedDepthFormat = depthFormat;
-
+  if (replaceDepth) {
     DxvkImageCreateInfo info = {};
     info.type = VK_IMAGE_TYPE_2D;
     info.format = depthFormat;
@@ -593,8 +618,8 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    m_depthCopy = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    m_depthCopyLayout.reset();
+    candidateDepth =
+        m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     DxvkImageViewKey viewInfo;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -612,23 +637,10 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
                                   VK_COMPONENT_SWIZZLE_IDENTITY};
     viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
 
-    m_depthCopyView = m_depthCopy->createView(viewInfo);
+    candidateDepthView = candidateDepth->createView(viewInfo);
   }
 
-  const uint32_t divisor = std::clamp<uint32_t>(
-      resolutionDivisor, kVolumetricMinResolutionDivisor,
-      kVolumetricMaxResolutionDivisor);
-  VkExtent3D effectExtent = {
-      std::max<uint32_t>(1u, (extent.width + divisor - 1u) / divisor),
-      std::max<uint32_t>(1u, (extent.height + divisor - 1u) / divisor),
-      1u};
-  constexpr VkFormat effectFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
-  if (!m_effectImage || m_cachedEffectExtent.width != effectExtent.width ||
-      m_cachedEffectExtent.height != effectExtent.height ||
-      m_cachedEffectFormat != effectFormat) {
-    m_cachedEffectExtent = effectExtent;
-    m_cachedEffectFormat = effectFormat;
-
+  if (replaceEffect) {
     DxvkImageCreateInfo info = {};
     info.type = VK_IMAGE_TYPE_2D;
     info.format = effectFormat;
@@ -646,9 +658,8 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    m_effectImage =
+    candidateEffect =
         m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    m_effectLayout.reset();
 
     DxvkImageViewKey viewInfo;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -667,7 +678,29 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
                                   VK_COMPONENT_SWIZZLE_IDENTITY};
     viewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
 
-    m_effectView = m_effectImage->createView(viewInfo);
+    candidateEffectView = candidateEffect->createView(viewInfo);
+  }
+
+  if (replaceColor) {
+    m_colorCopy = std::move(candidateColor);
+    m_colorCopyView = std::move(candidateColorView);
+    m_colorCopyLayout.reset();
+    m_cachedExtent = extent;
+    m_cachedFormat = colorFormat;
+  }
+  if (replaceDepth) {
+    m_depthCopy = std::move(candidateDepth);
+    m_depthCopyView = std::move(candidateDepthView);
+    m_depthCopyLayout.reset();
+    m_cachedDepthExtent = extent;
+    m_cachedDepthFormat = depthFormat;
+  }
+  if (replaceEffect) {
+    m_effectImage = std::move(candidateEffect);
+    m_effectView = std::move(candidateEffectView);
+    m_effectLayout.reset();
+    m_cachedEffectExtent = effectExtent;
+    m_cachedEffectFormat = effectFormat;
   }
 }
 

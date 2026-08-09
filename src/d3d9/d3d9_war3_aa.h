@@ -88,7 +88,7 @@ namespace dxvk {
 
         void ensureResources(const Rc<DxvkCommandList>& ctx, VkExtent3D extent, VkFormat format);
         void ensureSmaaResources(const Rc<DxvkCommandList>& ctx, VkExtent3D extent);
-        void createSmaaLookupTextures(const Rc<DxvkCommandList>& ctx);
+        bool createSmaaLookupTextures(const Rc<DxvkCommandList>& ctx);
         void createSamplers();
         void createFxaaPipeline(VkFormat format);
         void createSmaaPipelines(VkFormat format);

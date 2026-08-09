@@ -33,7 +33,15 @@ class GpuWorkloadGovernorStaticTest(unittest.TestCase):
         start = text.index("bool War3ShadowReceiverPass::renderShadowMap")
         end = text.index("namespace {\n// A2 Worker_Prepare", start)
         body = text[start:end]
-        volume_reserve = body.index("m_gpuWorkloadGovernor.tryReserve")
+        self.assertIn(
+            "ScopedWar3GpuWorkloadReservation volumeWorkloadReservation",
+            body,
+        )
+        self.assertIn(
+            "ScopedWar3GpuWorkloadReservation directionalWorkloadReservation",
+            body,
+        )
+        volume_reserve = body.index("volumeWorkloadReservation.reserve")
         directional_reserve = body.index(
             "War3GpuWorkloadConsumer::DirectionalCsm", volume_reserve
         )
@@ -44,6 +52,15 @@ class GpuWorkloadGovernorStaticTest(unittest.TestCase):
         self.assertIn("War3GpuWorkloadConsumer::DirectionalCsm", body)
         self.assertIn("visibleCascadeCount", body)
         self.assertIn("restoreShadowTargetsToRead", body[directional_reserve:])
+        first_render = body.index("ctx->cmdBeginRendering", directional_reserve)
+        self.assertLess(
+            body.index("volumeWorkloadReservation.commit", directional_reserve),
+            first_render,
+        )
+        self.assertLess(
+            body.index("directionalWorkloadReservation.commit", directional_reserve),
+            first_render,
+        )
 
     def test_point_faces_are_one_atomic_pre_record_reservation(self):
         text = SHADOW.read_text(encoding="utf-8")

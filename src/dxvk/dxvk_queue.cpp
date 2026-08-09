@@ -202,6 +202,7 @@ namespace dxvk {
           m_finishQueue.push(std::move(entry));
         } else {
           Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", entry.result));
+          m_device->notifyDeviceError(entry.result);
           m_lastError = entry.result;
 
           if (m_lastError != VK_ERROR_DEVICE_LOST)
@@ -266,6 +267,7 @@ namespace dxvk {
         }
 
         if (status != VK_SUCCESS) {
+          m_device->notifyDeviceError(status);
           m_lastError = status;
 
           if (status != VK_ERROR_DEVICE_LOST)

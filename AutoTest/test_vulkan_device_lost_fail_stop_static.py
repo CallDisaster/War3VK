@@ -112,7 +112,8 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         notify = function_body(
             DIAGNOSTICS, "NotifyGpuDeviceLostFailStop(const char* origin)"
         )
-        self.assertIn("s_gpuIncidentLatched = true", notify)
+        self.assertIn("s_gpuDeviceLostIncidentLatched = true", notify)
+        self.assertNotIn("s_gpuIncidentLatched = true", notify)
         self.assertIn("queue-error-device-lost-fail-stop", notify)
         self.assertIn("s_gpuFlightBreadcrumb.load", notify)
         self.assertNotIn("RunWithActiveDevice", notify)

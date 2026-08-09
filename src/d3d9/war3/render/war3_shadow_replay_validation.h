@@ -29,6 +29,8 @@ enum class War3ShadowReplayRejectReason : uint32_t {
   MissingUvBuffer,
   InvalidUvLayout,
   UvRangeOutOfBounds,
+  InvalidPaletteIndex,
+  PaletteRangeOverflow,
   InvalidGpuSkinLease,
   StaleGpuSkinMapEpoch,
   StaleGpuSkinDeviceEpoch,
@@ -77,6 +79,11 @@ struct War3ShadowReplayValidationInput {
   War3ShadowReplayBufferAccess blend = {};
   bool uvRequired = false;
   War3ShadowReplayBufferAccess uv = {};
+
+  bool paletteRequired = false;
+  uint32_t paletteIndex = 0u;
+  uint32_t paletteCount = 0u;
+  uint32_t paletteMatricesPerEntry = 256u;
 
   bool gpuSkinRequired = false;
   bool gpuSkinLeaseValid = false;

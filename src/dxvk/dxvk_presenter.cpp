@@ -71,6 +71,9 @@ namespace dxvk {
   VkResult Presenter::checkSwapChainStatus() {
     std::lock_guard lock(m_surfaceMutex);
 
+    if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return VK_ERROR_DEVICE_LOST;
+
     if (!m_swapchain)
       return recreateSwapChain();
 
@@ -101,11 +104,14 @@ namespace dxvk {
     if (m_acquireStatus == VK_NOT_READY && m_swapchain) {
       PresenterSync sync = m_semaphores.at(m_frameIndex);
 
-      waitForSwapchainFence(sync);
+      const VkResult fenceStatus = waitForSwapchainFence(sync);
+      if (fenceStatus != VK_SUCCESS)
+        return softError(fenceStatus);
 
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
         m_swapchain, std::numeric_limits<uint64_t>::max(),
         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+      m_device->notifyDeviceError(m_acquireStatus);
     }
 
     // This is a normal occurence, but may be useful for
@@ -116,8 +122,12 @@ namespace dxvk {
     // If the swap chain is out of date, recreate it and retry. It
     // is possible that we do not get a new swap chain here, e.g.
     // because the window is minimized.
+    if (m_acquireStatus == VK_ERROR_DEVICE_LOST)
+      return m_acquireStatus;
+
     if (m_acquireStatus != VK_SUCCESS || !m_swapchain) {
       VkResult vr = recreateSwapChain();
+      m_device->notifyDeviceError(vr);
 
       if (vr == VK_NOT_READY && hasSwapchain)
         Logger::info("Presenter: Surface does not allow swapchain creation.");
@@ -130,6 +140,7 @@ namespace dxvk {
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
         m_swapchain, std::numeric_limits<uint64_t>::max(),
         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+      m_device->notifyDeviceError(m_acquireStatus);
 
       if (m_acquireStatus < 0) {
         Logger::info(str::format("Presenter: Got ", m_acquireStatus, " from fresh swapchain"));
@@ -172,6 +183,13 @@ namespace dxvk {
 
 
   VkResult Presenter::presentImage(uint64_t frameId, const Rc<DxvkLatencyTracker>& tracker) {
+    if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST) {
+      std::lock_guard lock(m_surfaceMutex);
+      m_presentPending = false;
+      m_surfaceCond.notify_one();
+      return VK_ERROR_DEVICE_LOST;
+    }
+
     PresenterSync& currSync = m_semaphores.at(m_frameIndex);
 
     VkPresentIdKHR presentId = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
@@ -211,6 +229,7 @@ namespace dxvk {
 
     VkResult status = m_vkd->vkQueuePresentKHR(
       m_device->queues().graphics.queueHandle, &info);
+    m_device->notifyDeviceError(status);
 
     // Maintain valid state if presentation succeeded, even if we want to
     // recreate the swapchain. Spec says that 'queue' operations, i.e. the
@@ -249,18 +268,23 @@ namespace dxvk {
     // order to hide potential delays from the application thread.
     if (status == VK_SUCCESS) {
       PresenterSync& nextSync = m_semaphores.at(m_frameIndex);
-      waitForSwapchainFence(nextSync);
+      status = waitForSwapchainFence(nextSync);
 
-      m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
-        m_swapchain, std::numeric_limits<uint64_t>::max(),
-        nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+      if (status == VK_SUCCESS) {
+        m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+          m_swapchain, std::numeric_limits<uint64_t>::max(),
+          nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+        m_device->notifyDeviceError(m_acquireStatus);
+        if (m_acquireStatus == VK_ERROR_DEVICE_LOST)
+          status = m_acquireStatus;
+      }
     }
 
     // Recreate the swapchain on the next acquire, even if we get suboptimal.
     // There is no guarantee that suboptimal state is returned by both functions.
     std::lock_guard lock(m_surfaceMutex);
 
-    if (status != VK_SUCCESS) {
+    if (status != VK_SUCCESS && status != VK_ERROR_DEVICE_LOST) {
       Logger::info(str::format("Presenter: Got ", status, ", recreating swapchain"));
 
       m_dirtySwapchain = true;
@@ -520,6 +544,9 @@ namespace dxvk {
 
 
   VkResult Presenter::recreateSwapChain() {
+    if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return VK_ERROR_DEVICE_LOST;
+
     VkResult vr;
 
     if (m_swapchain)
@@ -539,6 +566,7 @@ namespace dxvk {
         vr = createSwapChain();
     }
 
+    m_device->notifyDeviceError(vr);
     return vr;
   }
 
@@ -1256,21 +1284,28 @@ namespace dxvk {
   }
 
 
-  void Presenter::waitForSwapchainFence(
+  VkResult Presenter::waitForSwapchainFence(
           PresenterSync&            sync) {
     if (!sync.fenceSignaled)
-      return;
+      return VK_SUCCESS;
 
     VkResult vr = m_vkd->vkWaitForFences(m_vkd->device(),
       1, &sync.fence, VK_TRUE, ~0ull);
 
-    if (vr)
+    if (vr) {
       Logger::err(str::format("Presenter: Failed to wait for WSI fence: ", vr));
+      m_device->notifyDeviceError(vr);
+      return vr;
+    }
 
-    if ((vr = m_vkd->vkResetFences(m_vkd->device(), 1, &sync.fence)))
+    if ((vr = m_vkd->vkResetFences(m_vkd->device(), 1, &sync.fence))) {
       Logger::err(str::format("Presenter: Failed to reset WSI fence: ", vr));
+      m_device->notifyDeviceError(vr);
+      return vr;
+    }
 
     sync.fenceSignaled = VK_FALSE;
+    return VK_SUCCESS;
   }
 
 
@@ -1314,6 +1349,7 @@ namespace dxvk {
             m_swapchain, frame.frameId, std::numeric_limits<uint64_t>::max());
         }
 
+        m_device->notifyDeviceError(vr);
         if (vr < 0 && vr != VK_ERROR_OUT_OF_DATE_KHR && vr != VK_ERROR_SURFACE_LOST_KHR)
           Logger::err(str::format("Presenter: vkWaitForPresentKHR failed: ", vr));
       }

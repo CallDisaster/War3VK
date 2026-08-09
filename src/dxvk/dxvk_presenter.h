@@ -382,7 +382,7 @@ namespace dxvk {
 
     void destroyLatencySemaphore();
 
-    void waitForSwapchainFence(
+    VkResult waitForSwapchainFence(
             PresenterSync&            sync);
 
     void runFrameThread();

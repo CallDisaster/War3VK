@@ -13,6 +13,7 @@ def read(relative: str) -> str:
 
 
 ARENA = read("src/d3d9/war3/memory/war3_shadow_arena.cpp")
+MEMORY = read("src/dxvk/dxvk_memory.h")
 BUDGET = read("src/d3d9/war3/memory/war3_shadow_arena_budget.h")
 DIAG_H = read("src/d3d9/war3/tools/war3_diagnostics_hub.h")
 DIAG_CPP = read("src/d3d9/war3/tools/war3_diagnostics_hub.cpp")
@@ -31,7 +32,7 @@ class ShadowArenaMemoryBudgetStaticTests(unittest.TestCase):
         self.assertIn("if (!saneSnapshot)", BUDGET)
 
     def test_budget_query_is_confined_to_generation_safe_points(self) -> None:
-        init = ARENA.split("bool ShadowArena_Init()", 1)[1].split(
+        init = ARENA.split("bool ShadowArena_Init(DxvkDevice* device)", 1)[1].split(
             "bool ShadowArena_IsInitialized()", 1
         )[0]
         begin = ARENA.split("bool ShadowArena_BeginFrame(", 1)[1].split(
@@ -44,6 +45,20 @@ class ShadowArenaMemoryBudgetStaticTests(unittest.TestCase):
         self.assertIn("RefreshArenaMemoryBudget(frameSerial)", begin)
         self.assertNotIn("getMemoryHeapInfo", allocate)
         self.assertIn("CanGrowArenaBy(pageCapacity)", allocate)
+
+    def test_budget_uses_the_allocator_selected_heap(self) -> None:
+        refresh = ARENA.split("void RefreshArenaMemoryBudget(", 1)[1].split(
+            "bool CanGrowArenaBy", 1
+        )[0]
+        allocate = ARENA.split("bool AllocateArenaPage(", 1)[1].split(
+            "bool IsValidAlignment", 1
+        )[0]
+        self.assertIn("getMemoryHeapIndex()", MEMORY)
+        self.assertIn("g_allocationHeapIndex", refresh)
+        self.assertNotIn("heap.heapSize <= input.heapSizeBytes", refresh)
+        self.assertIn("pageBuffer->storage()->getMemoryHeapIndex()", allocate)
+        self.assertIn("pageHeapIndex != g_allocationHeapIndex", allocate)
+        self.assertIn("RefreshArenaMemoryBudget(0u)", allocate)
 
     def test_pressure_blocks_new_pages_without_reclaiming_inflight_pages(self) -> None:
         grow = ARENA.split("bool CanGrowArenaBy(", 1)[1].split(

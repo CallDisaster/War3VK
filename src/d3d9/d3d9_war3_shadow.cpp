@@ -475,6 +475,14 @@ MakeWar3ShadowReplayValidationInput(
         draw.uvOffset, War3ShadowFormatByteSize(draw.uvFormat)};
   }
 
+  validation.paletteRequired = draw.vertexBlendEnabled;
+  validation.paletteIndex = draw.paletteIndex;
+  validation.paletteCount =
+      static_cast<uint32_t>((std::min)(
+          input.scene.shadowPalettes.size(),
+          size_t(std::numeric_limits<uint32_t>::max())));
+  validation.paletteMatricesPerEntry = 256u;
+
   validation.gpuSkinRequired = draw.gpuSkinInput.valid;
   if (validation.gpuSkinRequired) {
     const auto& skin = draw.gpuSkinInput;
@@ -2000,6 +2008,45 @@ const char* War3GpuWorkloadConsumerName(
     return "invalid";
   }
 }
+
+class ScopedWar3GpuWorkloadReservation final {
+public:
+  explicit ScopedWar3GpuWorkloadReservation(
+      war3::render::War3GpuWorkloadGovernor& governor) noexcept
+      : m_governor(governor) {}
+
+  ~ScopedWar3GpuWorkloadReservation() {
+    if (m_active && !m_committed) {
+      m_governor.cancelReservation(m_consumer, m_itemCount, m_cost);
+    }
+  }
+
+  bool reserve(war3::render::War3GpuWorkloadConsumer consumer,
+               uint64_t itemCount,
+               const war3::render::War3GpuWorkloadCost& cost) noexcept {
+    if (m_active || !m_governor.tryReserve(consumer, itemCount, cost))
+      return false;
+    m_consumer = consumer;
+    m_itemCount = itemCount;
+    m_cost = cost;
+    m_active = true;
+    return true;
+  }
+
+  void commit() noexcept {
+    if (m_active)
+      m_committed = true;
+  }
+
+private:
+  war3::render::War3GpuWorkloadGovernor& m_governor;
+  war3::render::War3GpuWorkloadConsumer m_consumer =
+      war3::render::War3GpuWorkloadConsumer::Count;
+  uint64_t m_itemCount = 0u;
+  war3::render::War3GpuWorkloadCost m_cost = {};
+  bool m_active = false;
+  bool m_committed = false;
+};
 } // namespace
 
 ShadowTaaDiagnostics QueryShadowTaaDiagnostics() {
@@ -2685,8 +2732,8 @@ War3ShadowReceiverPass::createOutlineMaskPipeline(
 
   // Dynamic State
   std::vector<VkDynamicState> dynamicStates;
-  dynamicStates.push_back(VK_DYNAMIC_STATE_VIEWPORT);
-  dynamicStates.push_back(VK_DYNAMIC_STATE_SCISSOR);
+  dynamicStates.push_back(VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT);
+  dynamicStates.push_back(VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT);
 
   VkPipelineDynamicStateCreateInfo dyInfo = {
       VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
@@ -3729,6 +3776,14 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     }
   }
 
+  // Admission is provisional until the first shadow rendering scope begins.
+  // Matrix allocation, pipeline preflight or cohort validation may still
+  // reject the candidate without submitting the expensive replay workload.
+  ScopedWar3GpuWorkloadReservation volumeWorkloadReservation(
+      m_gpuWorkloadGovernor);
+  ScopedWar3GpuWorkloadReservation directionalWorkloadReservation(
+      m_gpuWorkloadGovernor);
+
   // Volume-sun is optional and has no canonical per-cascade culling. Reserve
   // its complete single-layer replay before matrix upload or any command. The
   // main CSM waits for its canonical visibility mask below so normal scenes are
@@ -3744,7 +3799,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         break;
       }
     }
-    if (!m_gpuWorkloadGovernor.tryReserve(workloadConsumer, cascadeCount,
+    if (!volumeWorkloadReservation.reserve(workloadConsumer, cascadeCount,
                                            workloadCost)) {
       const auto& governor = m_gpuWorkloadGovernor.diagnostics();
       static uint32_t s_workloadRejectLogs = 0u;
@@ -4518,7 +4573,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         break;
       }
     }
-    if (!m_gpuWorkloadGovernor.tryReserve(
+    if (!directionalWorkloadReservation.reserve(
             war3::render::War3GpuWorkloadConsumer::DirectionalCsm,
             std::max<uint64_t>(workloadCascadeItems, 1u), workloadCost)) {
       restoreShadowTargetsToRead();
@@ -4624,6 +4679,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     renderInfo.pColorAttachments = nullptr;
     renderInfo.pDepthAttachment = &depthAttachment;
 
+    volumeWorkloadReservation.commit();
+    directionalWorkloadReservation.commit();
     ctx->cmdBeginRendering(&renderInfo);
 
     // D3D-style NDC needs a negative viewport height (receiver shader assumes
@@ -7794,7 +7851,9 @@ void War3ShadowReceiverPass::renderPointShadow(
     if (!pointWorkloadCost.valid)
       break;
   }
-  if (!m_gpuWorkloadGovernor.tryReserve(
+  ScopedWar3GpuWorkloadReservation pointWorkloadReservation(
+      m_gpuWorkloadGovernor);
+  if (!pointWorkloadReservation.reserve(
           war3::render::War3GpuWorkloadConsumer::PointShadow,
           pointWorkloadFaceCount, pointWorkloadCost)) {
     const bool heldLastComplete =
@@ -8035,6 +8094,7 @@ void War3ShadowReceiverPass::renderPointShadow(
       renderInfo.renderArea = {{0, 0}, {resolution, resolution}};
       renderInfo.layerCount = 1;
       renderInfo.pDepthAttachment = &depthAtt;
+      pointWorkloadReservation.commit();
       ctx->cmdBeginRendering(&renderInfo);
       pointShadowDynamicRenderingActive = true;
 

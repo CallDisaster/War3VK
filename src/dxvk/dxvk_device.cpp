@@ -320,8 +320,10 @@ namespace dxvk {
     VkResult vr = m_vkd->vkCreateComputePipelines(m_vkd->device(),
       VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
 
-    if (vr)
+    if (vr) {
+      notifyDeviceError(vr);
       throw DxvkError(str::format("Failed to create built-in compute pipeline: ", vr));
+    }
 
     return pipeline;
   }
@@ -477,8 +479,10 @@ namespace dxvk {
     VkResult vr = m_vkd->vkCreateGraphicsPipelines(m_vkd->device(),
       VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
 
-    if (vr)
+    if (vr) {
+      notifyDeviceError(vr);
       throw DxvkError(str::format("Failed to create built-in graphics pipeline: ", vr));
+    }
 
     return pipeline;
   }

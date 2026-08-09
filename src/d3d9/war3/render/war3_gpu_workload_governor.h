@@ -50,6 +50,7 @@ struct War3GpuWorkloadConsumerDiagnostics {
   uint64_t requestedItems = 0u;
   uint64_t acceptedItems = 0u;
   uint64_t acceptedReservations = 0u;
+  uint64_t rolledBackReservations = 0u;
   uint64_t rejectedReservations = 0u;
 };
 
@@ -122,6 +123,11 @@ public:
 
   bool tryReserve(War3GpuWorkloadConsumer consumer, uint64_t itemCount,
                   const War3GpuWorkloadCost& cost) noexcept;
+
+  /** Roll back one previously accepted provisional reservation. */
+  bool cancelReservation(War3GpuWorkloadConsumer consumer,
+                         uint64_t itemCount,
+                         const War3GpuWorkloadCost& cost) noexcept;
 
   void notePointShadowBudgetFallback(bool heldLastComplete) noexcept;
 

@@ -34,6 +34,20 @@ int main() {
   auto input = ValidIndexed();
   assert(ValidateWar3ShadowReplayDraw(input));
 
+  input.paletteRequired = true;
+  input.paletteCount = 2u;
+  input.paletteIndex = 1u;
+  input.paletteMatricesPerEntry = 256u;
+  assert(ValidateWar3ShadowReplayDraw(input));
+  input.paletteIndex = 2u;
+  assert(ValidateWar3ShadowReplayDraw(input).reason ==
+         War3ShadowReplayRejectReason::InvalidPaletteIndex);
+  input.paletteIndex = 0u;
+  input.paletteCount = 0u;
+  assert(ValidateWar3ShadowReplayDraw(input).reason ==
+         War3ShadowReplayRejectReason::InvalidPaletteIndex);
+  input.paletteRequired = false;
+
   input.drawMapEpoch = 6u;
   assert(ValidateWar3ShadowReplayDraw(input).reason ==
          War3ShadowReplayRejectReason::StaleMapEpoch);

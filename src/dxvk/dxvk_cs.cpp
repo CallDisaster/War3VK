@@ -18,21 +18,28 @@ namespace dxvk {
 
 
   void DxvkCsChunk::executeAll(DxvkContext* ctx) {
-    auto cmd = m_head;
-    
     if (m_flags.test(DxvkCsChunkFlag::SingleUse)) {
-      m_commandOffset = 0;
-      
-      while (cmd != nullptr) {
-        auto next = cmd->next();
-        cmd->exec(ctx);
+      while (m_head != nullptr) {
+        DxvkCsCmd* cmd = m_head;
+        m_head = cmd->next();
+        if (m_head == nullptr)
+          m_next = &m_head;
+
+        try {
+          cmd->exec(ctx);
+        } catch (...) {
+          cmd->~DxvkCsCmd();
+          // m_head already points at the first command that has not been
+          // destroyed, so reset cannot destroy the failing command twice.
+          reset();
+          throw;
+        }
         cmd->~DxvkCsCmd();
-        cmd = next;
       }
 
-      m_head = nullptr;
-      m_next = &m_head;
+      m_commandOffset = 0;
     } else {
+      auto cmd = m_head;
       while (cmd != nullptr) {
         cmd->exec(ctx);
         cmd = cmd->next();
@@ -198,8 +205,7 @@ namespace dxvk {
     std::vector<DxvkCsQueuedChunk> ordered;
     std::vector<DxvkCsQueuedChunk> highPrio;
 
-    try {
-      while (!m_stopped.load()) {
+    while (!m_stopped.load()) {
         { std::unique_lock<dxvk::mutex> lock(m_mutex);
 
           auto pred = [this] { return
@@ -249,9 +255,21 @@ namespace dxvk {
           // queued chunks for ownership/sequence progress, but never execute
           // them: some chunks allocate resources or begin a fresh command list
           // even though the submission queue has already stopped.
-          if (likely(m_device->getDeviceStatus() != VK_ERROR_DEVICE_LOST)) {
-            m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
-            entry.chunk->executeAll(m_context.ptr());
+          if (likely(m_device->getDeviceStatus() != VK_ERROR_DEVICE_LOST) &&
+              likely(!m_aborted.load(std::memory_order_acquire))) {
+            try {
+              m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
+              entry.chunk->executeAll(m_context.ptr());
+            } catch (const DxvkError& e) {
+              Logger::err("Exception on CS thread; aborting queued Vulkan work!");
+              Logger::err(e.message());
+              m_aborted.store(true, std::memory_order_release);
+              m_device->notifyDeviceError(VK_ERROR_DEVICE_LOST);
+            } catch (...) {
+              Logger::err("Unknown exception on CS thread; aborting queued Vulkan work!");
+              m_aborted.store(true, std::memory_order_release);
+              m_device->notifyDeviceError(VK_ERROR_DEVICE_LOST);
+            }
           }
 
           if (entry.seq) {
@@ -272,10 +290,6 @@ namespace dxvk {
 
         ordered.clear();
         highPrio.clear();
-      }
-    } catch (const DxvkError& e) {
-      Logger::err("Exception on CS thread!");
-      Logger::err(e.message());
     }
   }
   

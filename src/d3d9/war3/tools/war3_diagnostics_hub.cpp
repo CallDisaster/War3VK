@@ -48,6 +48,7 @@ uint64_t s_gpuLastCompletedSerial = 0u;
 std::chrono::steady_clock::time_point s_gpuLastProgressAt =
     std::chrono::steady_clock::now();
 bool s_gpuIncidentLatched = false;
+bool s_gpuDeviceLostIncidentLatched = false;
 bool s_shadowArenaIncidentLatched = false;
 uint64_t s_shadowArenaLastOverflowCount = 0u;
 uint64_t s_shadowArenaLastAdmissionRejectedCount = 0u;
@@ -696,14 +697,22 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
         frame.arenaAdmissionRejectedCount;
     s_shadowArenaLastPartialTransactionCount =
         frame.arenaPartialTransactionCount;
+    const bool terminalQueueFailure =
+        frame.queueResult == VK_ERROR_DEVICE_LOST;
     const bool queueIncident =
-        (queueFailed || queueStalled) && !s_gpuIncidentLatched;
+        (queueFailed || queueStalled) &&
+        (terminalQueueFailure ? !s_gpuDeviceLostIncidentLatched
+                              : !s_gpuIncidentLatched);
     const bool arenaIncident =
         (arenaOverflow || arenaAdmissionRejected || arenaPartial) &&
         !s_shadowArenaIncidentLatched;
     if (queueIncident || arenaIncident) {
-      if (queueIncident)
-        s_gpuIncidentLatched = true;
+      if (queueIncident) {
+        if (terminalQueueFailure)
+          s_gpuDeviceLostIncidentLatched = true;
+        else
+          s_gpuIncidentLatched = true;
+      }
       if (arenaIncident)
         s_shadowArenaIncidentLatched = true;
       incident.timestampMs = frame.timestampMs;
@@ -3730,10 +3739,12 @@ void NotifyGpuDeviceLostFailStop(const char* origin) noexcept {
     GpuIncidentSnapshot incident = {};
     {
       std::lock_guard<std::mutex> lock(s_gpuFlightMutex);
-      if (s_gpuIncidentLatched)
+      if (s_gpuDeviceLostIncidentLatched)
         return;
 
-      s_gpuIncidentLatched = true;
+      // Terminal loss has its own one-shot gate. A prior recoverable stall or
+      // transient queue incident must never suppress the fatal snapshot.
+      s_gpuDeviceLostIncidentLatched = true;
       incident.timestampMs = EpochMilliseconds();
       incident.reason = "queue-error-device-lost-fail-stop";
       incident.firstErrorOrigin = origin != nullptr ? origin : "unknown";

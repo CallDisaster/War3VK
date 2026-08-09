@@ -526,6 +526,10 @@ namespace dxvk {
       TraceWar3Present(traceOrdinal, "present-image-begin", this);
       PresentImage(presentInterval);
       TraceWar3Present(traceOrdinal, "present-image-end", this);
+
+      if (m_parent->CheckVulkanDeviceLostFailStop(
+              "D3D9SwapChain.PresentImage"))
+        return D3DERR_DEVICEREMOVED;
       
       if (!War3UseFpsUnlockOnlyMode() &&
           dxvk::war3::runtime::IsWar3RuntimeModuleEnabled(

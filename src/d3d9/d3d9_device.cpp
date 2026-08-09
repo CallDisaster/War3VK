@@ -10262,6 +10262,8 @@ D3D9DeviceEx::~D3D9DeviceEx() {
   // Drain the device before destroying any pass owner.
   m_dxvkDevice->waitForIdle(); // Sync Device
 
+  dxvk::war3::memory::ShadowArena_Shutdown(m_dxvkDevice.ptr());
+
   if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
     m_war3PersistentPackageD3D9ObserveOwner->pollProducerCompletions();
     m_war3PersistentPackageD3D9ObserveOwner.reset();
@@ -14666,7 +14668,7 @@ void D3D9DeviceEx::War3RequestShadowDeviceEpochTransition(
 
 void D3D9DeviceEx::War3QuarantineShadowSessionAtPresent(
     uint64_t retireSerial) {
-  if (dxvk::war3::memory::ShadowArena_IsInitialized())
+  if (dxvk::war3::memory::ShadowArena_IsOwnedBy(m_dxvkDevice.ptr()))
     dxvk::war3::memory::ShadowArena_QuarantineCurrentGeneration(retireSerial);
 
   // This signal is ordered after every command emitted by the old epoch and
@@ -19863,8 +19865,19 @@ Rc<DxvkBuffer> D3D9DeviceEx::War3AllocFreezeBuffer(VkDeviceSize size,
   outOffset = 0u;
 
   if (!hostVisible && dxvk::war3::render::IsShadowArenaCaptureEnabled()) {
-    if (!dxvk::war3::memory::ShadowArena_IsInitialized() &&
-        dxvk::war3::memory::ShadowArena_Init()) {
+    bool arenaInitializedNow = false;
+    if (!dxvk::war3::memory::ShadowArena_IsOwnedBy(m_dxvkDevice.ptr()) &&
+        !dxvk::war3::memory::ShadowArena_Init(m_dxvkDevice.ptr())) {
+      return nullptr;
+    }
+    if (!dxvk::war3::memory::ShadowArena_IsOwnedBy(m_dxvkDevice.ptr()))
+      return nullptr;
+    // Init may have just created the warm generations before the Present
+    // boundary has selected one. Detect that state by zero capacity rather
+    // than rewinding a valid but empty current generation.
+    arenaInitializedNow =
+        dxvk::war3::memory::ShadowArena_CapacityBytes() == 0u;
+    if (arenaInitializedNow) {
       const uint64_t completedSerial =
           m_war3ShadowArenaFence != nullptr
               ? m_war3ShadowArenaFence->value()
@@ -33738,17 +33751,18 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
         War3PresentFrameTransitionScope("ShadowArenaBeginFrame");
     dxvk::war3::render::BeginShadowArenaCaptureFrame();
     if (dxvk::war3::render::IsShadowArenaCaptureEnabled()) {
-      if (!dxvk::war3::memory::ShadowArena_IsInitialized())
-        dxvk::war3::memory::ShadowArena_Init();
+      const bool arenaOwned =
+          dxvk::war3::memory::ShadowArena_IsOwnedBy(m_dxvkDevice.ptr()) ||
+          dxvk::war3::memory::ShadowArena_Init(m_dxvkDevice.ptr());
       // Present is the last command-producing boundary for the current world
       // frame. Retire its Arena generation, enqueue a dedicated completion
       // signal, then acquire a proven-free generation for the next frame.
       const uint64_t retiringFrameSerial =
           m_war3ShadowPersistentFrameSerial + 1u;
       const uint64_t nextFrameSerial = retiringFrameSerial + 1u;
-      if (!war3ArenaRetiredAtEpochTransition)
+      if (arenaOwned && !war3ArenaRetiredAtEpochTransition)
         dxvk::war3::memory::ShadowArena_EndFrame(retiringFrameSerial);
-      if (!war3ArenaRetiredAtEpochTransition &&
+      if (arenaOwned && !war3ArenaRetiredAtEpochTransition &&
           m_war3ShadowArenaFence != nullptr) {
         const Rc<sync::Fence> cShadowArenaFence = m_war3ShadowArenaFence;
         EmitCs([cShadowArenaFence,
@@ -33761,8 +33775,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
               ? m_war3ShadowArenaFence->value()
               : 0u;
       War3CollectRetiredShadowSessions(completedSerial);
-      const bool arenaReady = dxvk::war3::memory::ShadowArena_BeginFrame(
-          nextFrameSerial, completedSerial);
+      const bool arenaReady = arenaOwned &&
+          dxvk::war3::memory::ShadowArena_BeginFrame(
+              nextFrameSerial, completedSerial);
       const bool resetFullyApplied =
           m_war3ShadowMapResetRequestedSerial.load(
               std::memory_order_acquire) ==
@@ -36244,9 +36259,6 @@ void D3D9DeviceEx::ConsiderFlush(GpuFlushType FlushType) {
 
 void D3D9DeviceEx::SynchronizeCsThread(uint64_t SequenceNumber) {
   D3D9DeviceLock lock = LockDevice();
-
-  if (unlikely(IsVulkanDeviceLostFailStop()))
-    return;
 
   // Dispatch current chunk so that all commands
   // recorded prior to this function will be run

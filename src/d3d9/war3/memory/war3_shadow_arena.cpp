@@ -44,6 +44,8 @@ struct ShadowArenaFrameState {
 };
 
 std::vector<ShadowArenaFrameState> g_frameStates;
+DxvkDevice* g_ownerDevice = nullptr;
+uint32_t g_allocationHeapIndex = kInvalidGenerationIndex;
 std::atomic<uint32_t> g_currentFrameIndex{kInvalidGenerationIndex};
 uint32_t g_arenaPageSize = kDefaultArenaPageSize;
 uint32_t g_arenaMaxFrameSize = kDefaultArenaPageSize;
@@ -201,35 +203,25 @@ void PublishArenaMemoryBudget(
 
 void RefreshArenaMemoryBudget(uint64_t frameSerial) {
   ShadowArenaMemoryBudgetInput input = {};
-  uint32_t primaryHeapIndex = kInvalidGenerationIndex;
-  const bool activeOwner = dxvk::war3::RunWithActiveDevice(
-      [&](D3D9DeviceEx& device) {
-        const auto dxvkDevice = device.GetDXVKDevice();
-        if (dxvkDevice == nullptr)
-          return;
-        input.extensionSupported =
-            dxvkDevice->features().extMemoryBudget != 0u;
-        if (!input.extensionSupported)
-          return;
-
-        const DxvkAdapterMemoryInfo memoryInfo =
-            dxvkDevice->adapter()->getMemoryHeapInfo();
-        for (uint32_t i = 0u; i < memoryInfo.heapCount; ++i) {
-          const auto& heap = memoryInfo.heaps[i];
-          if ((heap.heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0u)
-            continue;
-          if (primaryHeapIndex != kInvalidGenerationIndex &&
-              heap.heapSize <= input.heapSizeBytes)
-            continue;
-          primaryHeapIndex = i;
-          input.primaryDeviceLocalHeapFound = true;
-          input.heapSizeBytes = heap.heapSize;
-          input.heapBudgetBytes = heap.memoryBudget;
-          input.heapAllocatedBytes = heap.memoryAllocated;
+  const uint32_t primaryHeapIndex = g_allocationHeapIndex;
+  DxvkDevice* const device = g_ownerDevice;
+  if (device != nullptr) {
+    input.extensionSupported = device->features().extMemoryBudget != 0u;
+    if (input.extensionSupported &&
+        primaryHeapIndex != kInvalidGenerationIndex) {
+      const DxvkAdapterMemoryInfo memoryInfo =
+          device->adapter()->getMemoryHeapInfo();
+      if (primaryHeapIndex < memoryInfo.heapCount) {
+        const auto& heap = memoryInfo.heaps[primaryHeapIndex];
+        if ((heap.heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0u) {
+        input.primaryDeviceLocalHeapFound = true;
+        input.heapSizeBytes = heap.heapSize;
+        input.heapBudgetBytes = heap.memoryBudget;
+        input.heapAllocatedBytes = heap.memoryAllocated;
         }
-      });
-  if (!activeOwner)
-    input = {};
+      }
+    }
+  }
 
   PublishArenaMemoryBudget(ResolveShadowArenaMemoryBudget(input),
                            primaryHeapIndex, frameSerial);
@@ -270,25 +262,44 @@ bool AllocateArenaPage(ShadowArenaFrameState& frameState,
   const uint32_t pageCapacity =
       (std::min)(g_arenaPageSize, remainingCapacity);
 
-  const uint64_t residentBefore =
-      g_residentBytes.load(std::memory_order_acquire);
-  if (!CanGrowArenaBy(pageCapacity))
+  const bool allocationHeapKnown =
+      g_allocationHeapIndex != kInvalidGenerationIndex;
+  if (allocationHeapKnown && !CanGrowArenaBy(pageCapacity))
     return false;
 
-  Rc<DxvkBuffer> pageBuffer;
-  const bool activeOwner = dxvk::war3::RunWithActiveDevice(
-      [&](D3D9DeviceEx& device) {
-        pageBuffer = device.GetDXVKDevice()->createBuffer(
-            MakeArenaBufferInfo(pageCapacity),
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-      });
-  if (!activeOwner)
+  DxvkDevice* const device = g_ownerDevice;
+  if (device == nullptr)
     return false;
+  Rc<DxvkBuffer> pageBuffer = device->createBuffer(
+      MakeArenaBufferInfo(pageCapacity),
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   if (pageBuffer == nullptr || !pageBuffer->storage()) {
     war3dbg::Print("DXVK War3[ShadowArena]: Arena 页创建失败 size=%u MB。\n",
                    pageCapacity >> 20);
     return false;
   }
+
+  const uint32_t pageHeapIndex = pageBuffer->storage()->getMemoryHeapIndex();
+  if (pageHeapIndex == kInvalidGenerationIndex)
+    return false;
+
+  if (!allocationHeapKnown) {
+    // The allocator's actual memory type is the only valid authority for the
+    // budget heap. Query that exact heap before publishing the first page.
+    g_allocationHeapIndex = pageHeapIndex;
+    RefreshArenaMemoryBudget(0u);
+    if (!CanGrowArenaBy(pageCapacity)) {
+      g_allocationHeapIndex = kInvalidGenerationIndex;
+      RefreshArenaMemoryBudget(0u);
+      return false;
+    }
+  } else if (pageHeapIndex != g_allocationHeapIndex) {
+    // Never authorize a page using a different heap's budget snapshot.
+    return false;
+  }
+
+  const uint64_t residentBefore =
+      g_residentBytes.load(std::memory_order_acquire);
 
   frameState.pages.push_back(ShadowArenaPage{std::move(pageBuffer), pageCapacity});
   frameState.totalCapacity += pageCapacity;
@@ -374,15 +385,21 @@ void NoteArenaAdmissionFailure(const ShadowArenaFrameState& frameState) {
 
 } // namespace
 
-bool ShadowArena_Init() {
-  if (ShadowArena_IsInitialized())
-    return true;
-
-  if (!dxvk::war3::HasActivePipeline()) {
+bool ShadowArena_Init(DxvkDevice* device) {
+  if (device == nullptr) {
     war3dbg::Print(
         "DXVK War3[ShadowArena]: 活跃 D3D9 设备为空，初始化延期。\n");
     return false;
   }
+
+  if (ShadowArena_IsInitialized())
+    return g_ownerDevice == device;
+
+  // A non-empty owner stamp without pages indicates an interrupted teardown
+  // or failed initialization. Never let a different VkDevice inherit it.
+  if (g_ownerDevice != nullptr && g_ownerDevice != device)
+    return false;
+  g_ownerDevice = device;
 
   g_arenaPageSize = ResolveArenaPageSize();
   g_arenaMaxFrameSize = ResolveArenaMaxFrameSize(g_arenaPageSize);
@@ -390,6 +407,7 @@ bool ShadowArena_Init() {
 
   g_frameStates.clear();
   g_frameStates.resize(g_arenaFrameCount);
+  g_allocationHeapIndex = kInvalidGenerationIndex;
   g_residentBytes.store(0u, std::memory_order_release);
   g_budgetRefreshCount.store(0u, std::memory_order_release);
   g_budgetGrowthRejectCount.store(0u, std::memory_order_release);
@@ -404,6 +422,8 @@ bool ShadowArena_Init() {
           i, g_arenaPageSize >> 20);
       g_frameStates.clear();
       g_residentBytes.store(0u, std::memory_order_release);
+      g_allocationHeapIndex = kInvalidGenerationIndex;
+      g_ownerDevice = nullptr;
       return false;
     }
   }
@@ -455,7 +475,29 @@ bool ShadowArena_Init() {
 }
 
 bool ShadowArena_IsInitialized() {
-  return !g_frameStates.empty();
+  return g_ownerDevice != nullptr && !g_frameStates.empty();
+}
+
+bool ShadowArena_IsOwnedBy(const DxvkDevice* device) {
+  return device != nullptr && g_ownerDevice == device &&
+      ShadowArena_IsInitialized();
+}
+
+void ShadowArena_Shutdown(DxvkDevice* device) {
+  if (device == nullptr || g_ownerDevice != device)
+    return;
+
+  // The D3D9 owner calls this only after CS drain and device idle (or terminal
+  // device loss). Releasing the Rc pages here prevents a later CreateDeviceEx
+  // from binding buffers whose parent VkDevice has already been destroyed.
+  g_currentFrameIndex.store(kInvalidGenerationIndex,
+                            std::memory_order_release);
+  g_frameStates.clear();
+  g_residentBytes.store(0u, std::memory_order_release);
+  g_currentUsedBytes.store(0u, std::memory_order_release);
+  g_activeGenerationCount.store(0u, std::memory_order_release);
+  g_allocationHeapIndex = kInvalidGenerationIndex;
+  g_ownerDevice = nullptr;
 }
 
 bool ShadowArena_BeginFrame(uint64_t frameSerial, uint64_t completedSerial) {

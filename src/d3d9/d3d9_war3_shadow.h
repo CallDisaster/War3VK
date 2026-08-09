@@ -1114,6 +1114,13 @@ namespace dxvk {
         // [NEW] MRT Outline Pipeline Helpers
         const DxvkPipelineLayout* createOutlineMaskPipelineLayout() const;
         ShadowCasterPipeline createOutlineMaskPipeline(const ShadowCasterPipelineKey& key) const;
+        ShadowCasterPipelineKey makeUnitOutlinePipelineKey(
+            const War3ShadowCasterDraw& draw,
+            War3OutlineMode mode) const;
+        VkPipeline getOrCreateUnitOutlinePipeline(
+            const ShadowCasterPipelineKey& key,
+            VkFormat colorFormat,
+            VkFormat depthFormat);
 
         void ensureCopyResources(VkExtent3D extent, VkFormat format);
         void ensureDepthCopyResources(VkExtent3D extent, VkFormat format);

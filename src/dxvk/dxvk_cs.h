@@ -582,6 +582,7 @@ namespace dxvk {
 
     std::atomic<bool>           m_stopped     = { false };
     std::atomic<bool>           m_hasHighPrio = { false };
+    std::atomic<bool>           m_aborted     = { false };
 
     alignas(CACHE_LINE_SIZE)
     dxvk::mutex                 m_mutex;

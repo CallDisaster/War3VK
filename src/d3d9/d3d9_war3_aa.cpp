@@ -131,6 +131,9 @@ namespace dxvk {
             war3::render::CommitWar3OwnedImageLayout(
                 layoutState, readTransition, *image, subresources);
 
+            // The copy command stores a raw VkBuffer handle. Keep the upload
+            // allocation alive until this command list has completed on the GPU.
+            ctx->track(uploadBuffer, DxvkAccess::Read);
             ctx->track(image, DxvkAccess::Write);
             return true;
         }
@@ -263,9 +266,14 @@ namespace dxvk {
         // Run selected AA algorithm
         if (aaSettings.mode == War3AAMode::FXAA) {
             runFxaa(ctx, input.colorView, aaSettings);
-        } else {
+        } else if (m_lookupTablesCreated) {
             // SMAA (any quality level)
             runSmaa(ctx, input.colorView, aaSettings);
+        } else {
+            // Lookup-table publication is transactional. A failed candidate
+            // remains unpublished and this frame uses the already-created FXAA
+            // path. ensureSmaaResources will retry on a later frame.
+            runFxaa(ctx, input.colorView, aaSettings);
         }
 
         // Debug: Log every frame AA execution (only once)
@@ -420,16 +428,25 @@ namespace dxvk {
         }
     }
 
-    void War3AAPass::createSmaaLookupTextures(const Rc<DxvkCommandList>& ctx) {
+    bool War3AAPass::createSmaaLookupTextures(const Rc<DxvkCommandList>& ctx) {
         if (!ctx) {
             Logger::err("War3AAPass: SMAA lookup upload skipped (null command list)");
-            return;
+            return false;
         }
         VkComponentMapping mapping = {
             VK_COMPONENT_SWIZZLE_IDENTITY,
             VK_COMPONENT_SWIZZLE_IDENTITY,
             VK_COMPONENT_SWIZZLE_IDENTITY,
             VK_COMPONENT_SWIZZLE_IDENTITY };
+
+        Rc<DxvkImage> candidateAreaTex;
+        Rc<DxvkImageView> candidateAreaView;
+        war3::render::War3OwnedImageLayoutState candidateAreaLayout;
+        Rc<DxvkImage> candidateSearchTex;
+        Rc<DxvkImageView> candidateSearchView;
+        war3::render::War3OwnedImageLayoutState candidateSearchLayout;
+        bool areaUploaded = false;
+        bool searchUploaded = false;
 
         // Area texture: 160x560, RG8
         {
@@ -447,8 +464,9 @@ namespace dxvk {
             areaInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
             areaInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            m_areaTex = m_device->createImage(areaInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            m_areaLayout.reset();
+            candidateAreaTex = m_device->createImage(
+                areaInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            candidateAreaLayout.reset();
 
             DxvkImageViewKey areaViewKey = { };
             areaViewKey.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -461,7 +479,7 @@ namespace dxvk {
             areaViewKey.layerIndex = 0;
             areaViewKey.layerCount = 1;
             areaViewKey.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-            m_areaView = m_areaTex->createView(areaViewKey);
+            candidateAreaView = candidateAreaTex->createView(areaViewKey);
 
             if (!dxvk::smaa::areaTexSize ||
                 dxvk::smaa::areaTexWidth != 160 ||
@@ -470,11 +488,14 @@ namespace dxvk {
             } else {
                 const VkExtent3D areaExtent = { uint32_t(dxvk::smaa::areaTexWidth),
                                                 uint32_t(dxvk::smaa::areaTexHeight), 1u };
-                if (!UploadLookupTexture(ctx, m_device, m_areaTex, m_areaLayout,
+                areaUploaded = UploadLookupTexture(
+                                         ctx, m_device, candidateAreaTex,
+                                         candidateAreaLayout,
                                          areaExtent,
                                          dxvk::smaa::areaTexBytes,
                                          dxvk::smaa::areaTexSize,
-                                         "War3SmaaAreaUpload")) {
+                                         "War3SmaaAreaUpload");
+                if (!areaUploaded) {
                     Logger::err("War3AAPass: SMAA area texture upload failed");
                 }
             }
@@ -496,8 +517,9 @@ namespace dxvk {
             searchInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
             searchInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            m_searchTex = m_device->createImage(searchInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            m_searchLayout.reset();
+            candidateSearchTex = m_device->createImage(
+                searchInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            candidateSearchLayout.reset();
 
             DxvkImageViewKey searchViewKey = { };
             searchViewKey.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -510,7 +532,7 @@ namespace dxvk {
             searchViewKey.layerIndex = 0;
             searchViewKey.layerCount = 1;
             searchViewKey.packedSwizzle = DxvkImageViewKey::packSwizzle(mapping);
-            m_searchView = m_searchTex->createView(searchViewKey);
+            candidateSearchView = candidateSearchTex->createView(searchViewKey);
 
             if (!dxvk::smaa::searchTexSize ||
                 dxvk::smaa::searchTexWidth != 64 ||
@@ -519,18 +541,34 @@ namespace dxvk {
             } else {
                 const VkExtent3D searchExtent = { uint32_t(dxvk::smaa::searchTexWidth),
                                                   uint32_t(dxvk::smaa::searchTexHeight), 1u };
-                if (!UploadLookupTexture(ctx, m_device, m_searchTex,
-                                         m_searchLayout, searchExtent,
+                searchUploaded = UploadLookupTexture(
+                                         ctx, m_device, candidateSearchTex,
+                                         candidateSearchLayout, searchExtent,
                                          dxvk::smaa::searchTexBytes,
                                          dxvk::smaa::searchTexSize,
-                                         "War3SmaaSearchUpload")) {
+                                         "War3SmaaSearchUpload");
+                if (!searchUploaded) {
                     Logger::err("War3AAPass: SMAA search texture upload failed");
                 }
             }
         }
 
+        if (!areaUploaded || !searchUploaded || !candidateAreaTex ||
+            !candidateAreaView || !candidateSearchTex || !candidateSearchView) {
+            Logger::err(
+                "War3AAPass: SMAA lookup candidate rejected; using FXAA and retrying");
+            return false;
+        }
+
+        m_areaTex = std::move(candidateAreaTex);
+        m_areaView = std::move(candidateAreaView);
+        m_areaLayout = candidateAreaLayout;
+        m_searchTex = std::move(candidateSearchTex);
+        m_searchView = std::move(candidateSearchView);
+        m_searchLayout = candidateSearchLayout;
         m_lookupTablesCreated = true;
         WAR3_RENDER_LOG("DXVK War3AAPass: SMAA lookup textures created\n");
+        return true;
     }
 
     void War3AAPass::createFxaaPipeline(VkFormat format) {

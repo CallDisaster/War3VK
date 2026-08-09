@@ -106,9 +106,9 @@ void InitializeRuntimeCore(uintptr_t gameBase) {
     dxvk::war3dbg::Print("DXVK War3[StormHook]: 二分诊断态跳过运行时初始化\n");
   }
 
-  if (dxvk::war3::internal::kWar3RenderModuleTakeoverEnabled &&
-      !dxvk::war3::memory::ShadowArena_IsInitialized())
-    dxvk::war3::memory::ShadowArena_Init();
+  // ShadowArena is VkDevice-owned. Its initialization is intentionally
+  // deferred to the D3D9 render owner, which supplies the exact DxvkDevice;
+  // this game-thread bootstrap must never bind process-global pages.
 }
 
 void ResetRuntimeCore() {

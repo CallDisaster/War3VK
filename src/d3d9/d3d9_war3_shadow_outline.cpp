@@ -42,6 +42,140 @@ struct OutlineEdgePushConstants {
 };
 
 } // namespace
+
+War3ShadowReceiverPass::ShadowCasterPipelineKey
+War3ShadowReceiverPass::makeUnitOutlinePipelineKey(
+    const War3ShadowCasterDraw& draw, War3OutlineMode mode) const {
+  ShadowCasterPipelineKey key = {};
+  key.positionFormat = draw.positionFormat;
+  key.positionStride = draw.positionStride;
+  key.positionOffset = draw.positionOffset;
+  key.topology = draw.topology;
+  key.alphaTestEnabled = draw.alphaTestEnabled && draw.diffuseTexture &&
+                         draw.HasUsableUvBinding();
+  if (key.alphaTestEnabled) {
+    key.uvFormat = draw.uvFormat;
+    key.uvOffset = draw.uvOffset;
+    key.uvStride = draw.uvStride;
+    key.uvBinding = draw.uvBinding;
+  }
+  key.outlineMode = static_cast<uint8_t>(mode);
+  if (draw.vertexBlendEnabled && draw.vertexBlendCount > 0u) {
+    key.blendWeightFormat = draw.blendWeightFormat;
+    key.blendWeightOffset = draw.blendWeightOffset;
+  } else {
+    key.blendWeightFormat = VK_FORMAT_UNDEFINED;
+    key.blendWeightOffset = 0u;
+  }
+  if (draw.vertexBlendEnabled && draw.vertexBlendIndexed) {
+    key.blendIndexFormat = draw.blendIndexFormat;
+    key.blendIndexOffset = draw.blendIndexOffset;
+  } else {
+    key.blendIndexFormat = VK_FORMAT_UNDEFINED;
+    key.blendIndexOffset = 0u;
+  }
+  key.blendBinding = draw.blendBinding;
+  key.blendStride = draw.blendStride;
+  return key;
+}
+
+VkPipeline War3ShadowReceiverPass::getOrCreateUnitOutlinePipeline(
+    const ShadowCasterPipelineKey& key, VkFormat colorFormat,
+    VkFormat depthFormat) {
+  auto cached = m_outlinePipelines.find(key);
+  if (cached != m_outlinePipelines.end())
+    return cached->second;
+
+  VkVertexInputBindingDescription bindings[3] = {};
+  uint32_t bindingCount = 1u;
+  bindings[0] = {0u, key.positionStride, VK_VERTEX_INPUT_RATE_VERTEX};
+  if (key.blendBinding == 1u) {
+    bindings[bindingCount++] = {
+        1u, key.blendStride, VK_VERTEX_INPUT_RATE_VERTEX};
+  }
+  if (key.alphaTestEnabled && key.uvBinding != 0u &&
+      key.uvBinding != key.blendBinding) {
+    bindings[bindingCount++] = {
+        key.uvBinding, key.uvStride, VK_VERTEX_INPUT_RATE_VERTEX};
+  }
+
+  std::array<VkVertexInputAttributeDescription, 4> attributes = {};
+  uint32_t attributeCount = 0u;
+  attributes[attributeCount++] = {
+      0u, 0u, key.positionFormat, key.positionOffset};
+  if (key.blendWeightFormat != VK_FORMAT_UNDEFINED) {
+    attributes[attributeCount++] = {
+        1u, key.blendBinding, key.blendWeightFormat, key.blendWeightOffset};
+  }
+  if (key.blendIndexFormat != VK_FORMAT_UNDEFINED) {
+    attributes[attributeCount++] = {
+        2u, key.blendBinding, key.blendIndexFormat, key.blendIndexOffset};
+  }
+  if (key.alphaTestEnabled && key.uvFormat != VK_FORMAT_UNDEFINED) {
+    attributes[attributeCount++] = {
+        3u, key.uvBinding, key.uvFormat, key.uvOffset};
+  }
+
+  VkPipelineVertexInputStateCreateInfo viState = {
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  viState.vertexBindingDescriptionCount = bindingCount;
+  viState.pVertexBindingDescriptions = bindings;
+  viState.vertexAttributeDescriptionCount = attributeCount;
+  viState.pVertexAttributeDescriptions = attributes.data();
+
+  VkPipelineInputAssemblyStateCreateInfo iaState = {
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  iaState.topology = key.topology;
+
+  const bool silhouette =
+      key.outlineMode == static_cast<uint8_t>(War3OutlineMode::Silhouette);
+  VkPipelineRasterizationStateCreateInfo rsState = {
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rsState.polygonMode = VK_POLYGON_MODE_FILL;
+  rsState.cullMode = VK_CULL_MODE_FRONT_BIT;
+  rsState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  rsState.depthBiasEnable = VK_TRUE;
+  rsState.depthBiasConstantFactor = silhouette ? 1.0f : -100.0f;
+  rsState.depthBiasSlopeFactor = silhouette ? 0.5f : -2.0f;
+  rsState.lineWidth = 1.0f;
+
+  VkPipelineDepthStencilStateCreateInfo dsState = {
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  dsState.depthTestEnable = VK_TRUE;
+  dsState.depthWriteEnable = VK_FALSE;
+  dsState.depthCompareOp =
+      silhouette ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_GREATER;
+
+  VkPipelineColorBlendAttachmentState blendAtt = {};
+  blendAtt.blendEnable = VK_TRUE;
+  blendAtt.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  blendAtt.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  blendAtt.colorBlendOp = VK_BLEND_OP_ADD;
+  blendAtt.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+  blendAtt.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+  blendAtt.alphaBlendOp = VK_BLEND_OP_ADD;
+  blendAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+      VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+      VK_COLOR_COMPONENT_A_BIT;
+
+  util::DxvkBuiltInGraphicsState state = {};
+  state.vs = util::DxvkBuiltInShaderStage(war3_outline_expand_vert, nullptr);
+  state.fs = util::DxvkBuiltInShaderStage(war3_unit_outline, nullptr);
+  state.colorFormat = colorFormat;
+  state.depthFormat = depthFormat;
+  state.viState = &viState;
+  state.iaState = &iaState;
+  state.rsState = &rsState;
+  state.dsState = &dsState;
+  state.cbAttachment = &blendAtt;
+
+  const VkPipeline pipeline =
+      m_device->createBuiltInGraphicsPipeline(m_outlineLayout, state);
+  if (pipeline != VK_NULL_HANDLE)
+    m_outlinePipelines.insert({key, pipeline});
+  return pipeline;
+}
+
 void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
     const Rc<DxvkCommandList> &ctx, const War3PipelineInput &input) {
   if (!War3RenderState::HasOutlineHandles()) {
@@ -119,6 +253,59 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
     m_outlineMaskLayout = createOutlineMaskPipelineLayout();
   }
 
+  auto makeMaskPipelineKey = [](const War3ShadowCasterDraw& draw) {
+    ShadowCasterPipelineKey key = {};
+    key.positionFormat = draw.positionFormat;
+    key.positionStride = draw.positionStride;
+    key.positionOffset = draw.positionOffset;
+    key.topology = draw.topology;
+    key.alphaTestEnabled = draw.alphaTestEnabled && draw.diffuseTexture &&
+                           draw.HasUsableUvBinding();
+    if (key.alphaTestEnabled) {
+      key.uvFormat = draw.uvFormat;
+      key.uvOffset = draw.uvOffset;
+      key.uvStride = draw.uvStride;
+      key.uvBinding = draw.uvBinding;
+    }
+    key.outlineMode = 0u;
+    if (draw.vertexBlendEnabled && draw.vertexBlendCount > 0u) {
+      key.blendWeightFormat = draw.blendWeightFormat;
+      key.blendWeightOffset = draw.blendWeightOffset;
+    } else {
+      key.blendWeightFormat = VK_FORMAT_UNDEFINED;
+      key.blendWeightOffset = 0u;
+    }
+    if (draw.vertexBlendEnabled && draw.vertexBlendIndexed) {
+      key.blendIndexFormat = draw.blendIndexFormat;
+      key.blendIndexOffset = draw.blendIndexOffset;
+    } else {
+      key.blendIndexFormat = VK_FORMAT_UNDEFINED;
+      key.blendIndexOffset = 0u;
+    }
+    key.blendBinding = draw.blendBinding;
+    key.blendStride = draw.blendStride;
+    return key;
+  };
+
+  // Pipeline creation is a CPU/Vulkan preflight operation. Complete it for
+  // the entire immutable batch before changing image layouts or beginning a
+  // dynamic-rendering scope, so an allocation/creation failure cannot leave
+  // an unterminated render pass.
+  std::vector<VkPipeline> maskPipelines;
+  maskPipelines.reserve(outlineDraws.size());
+  for (const War3ShadowCasterDraw* draw : outlineDraws) {
+    const ShadowCasterPipelineKey key = makeMaskPipelineKey(*draw);
+    auto it = m_outlineMaskMRTPipelines.find(key);
+    if (it == m_outlineMaskMRTPipelines.end()) {
+      const auto candidate = createOutlineMaskPipeline(key);
+      if (candidate.pipeline == VK_NULL_HANDLE)
+        return;
+      it = m_outlineMaskMRTPipelines.insert(
+          {key, candidate.pipeline}).first;
+    }
+    maskPipelines.push_back(it->second);
+  }
+
   auto transitionMasksToColorAttachment = [&]() {
     const auto plan = war3::render::PlanWar3OutlineMaskBegin(
         m_outlineMaskLayoutState);
@@ -154,6 +341,10 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
         static_cast<uint32_t>(barriers.size());
     dependency.pImageMemoryBarriers = barriers.data();
     ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dependency);
+    for (const auto& view : views)
+      view->image()->trackLayout(
+          view->imageSubresources(),
+          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     m_outlineMaskLayoutState = plan.newState;
     return true;
   };
@@ -186,6 +377,10 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
         static_cast<uint32_t>(barriers.size());
     dependency.pImageMemoryBarriers = barriers.data();
     ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dependency);
+    for (const auto& view : views)
+      view->image()->trackLayout(
+          view->imageSubresources(),
+          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     m_outlineMaskLayoutState = plan.newState;
     return true;
   };
@@ -257,56 +452,8 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
       const uint32_t drawIdx = outlineDrawIndices[targetIndex];
       const auto &draw = *outlineDraws[targetIndex];
 
-      ShadowCasterPipelineKey key = {};
-      key.positionFormat = draw.positionFormat;
-      key.positionStride = draw.positionStride;
-      key.positionOffset = draw.positionOffset;
-      key.topology = draw.topology;
-      key.alphaTestEnabled = draw.alphaTestEnabled && draw.diffuseTexture &&
-                             draw.HasUsableUvBinding();
-      if (key.alphaTestEnabled) {
-        key.uvFormat = draw.uvFormat;
-        key.uvOffset = draw.uvOffset;
-        key.uvStride = draw.uvStride;
-        key.uvBinding = draw.uvBinding;
-      }
-      key.outlineMode = 0;
-
-      if (draw.vertexBlendEnabled && draw.vertexBlendCount > 0) {
-        key.blendWeightFormat = draw.blendWeightFormat;
-        key.blendWeightOffset = draw.blendWeightOffset;
-      } else {
-        key.blendWeightFormat = VK_FORMAT_UNDEFINED;
-        key.blendWeightOffset = 0;
-      }
-
-      if (draw.vertexBlendEnabled && draw.vertexBlendIndexed) {
-        key.blendIndexFormat = draw.blendIndexFormat;
-        key.blendIndexOffset = draw.blendIndexOffset;
-      } else {
-        key.blendIndexFormat = VK_FORMAT_UNDEFINED;
-        key.blendIndexOffset = 0;
-      }
-
-      key.blendBinding = draw.blendBinding;
-      key.blendStride = draw.blendStride;
-
-      // Use a separate pipeline map for MRT pipelines
-      auto it = m_outlineMaskMRTPipelines.find(key);
-      VkPipeline pipeline = VK_NULL_HANDLE;
-
-      if (it != m_outlineMaskMRTPipelines.end()) {
-        pipeline = it->second;
-      } else {
-        // Create MRT Pipeline
-        auto p = createOutlineMaskPipeline(key);
-        pipeline = p.pipeline;
-        m_outlineMaskMRTPipelines.insert({key, pipeline});
-      }
-
-      if (pipeline == VK_NULL_HANDLE) {
-        continue;
-      }
+      const ShadowCasterPipelineKey key = makeMaskPipelineKey(draw);
+      const VkPipeline pipeline = maskPipelines[targetIndex];
 
       ShadowCasterPushConstants pc = {};
       pc.blendCount = draw.vertexBlendCount;
@@ -695,6 +842,18 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
     return;
   }
 
+  std::vector<VkPipeline> outlinePipelines;
+  outlinePipelines.reserve(outlineDraws.size());
+  for (const War3ShadowCasterDraw* draw : outlineDraws) {
+    const ShadowCasterPipelineKey key =
+        makeUnitOutlinePipelineKey(*draw, outlineMode);
+    const VkPipeline pipeline = getOrCreateUnitOutlinePipeline(
+        key, colorFormat, depthFormat);
+    if (pipeline == VK_NULL_HANDLE)
+      return;
+    outlinePipelines.push_back(pipeline);
+  }
+
   // 开始渲染
   ctx->cmdBeginRendering(&renderInfo);
 
@@ -715,200 +874,14 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
   uint32_t drawnUnits = 0;
 
   // 遍历单位并渲染描边
-  for (const War3ShadowCasterDraw *drawPtr : outlineDraws) {
+  for (size_t outlineIndex = 0u; outlineIndex < outlineDraws.size();
+       ++outlineIndex) {
+    const War3ShadowCasterDraw *drawPtr = outlineDraws[outlineIndex];
     const auto &draw = *drawPtr;
 
-    // 构建管线 key
-    ShadowCasterPipelineKey key = {};
-    key.positionFormat = draw.positionFormat;
-    key.positionStride = draw.positionStride;
-    key.positionOffset = draw.positionOffset;
-    key.topology = draw.topology;
-    key.alphaTestEnabled = draw.alphaTestEnabled && draw.diffuseTexture &&
-                           draw.HasUsableUvBinding();
-    if (key.alphaTestEnabled) {
-      key.uvFormat = draw.uvFormat;
-      key.uvOffset = draw.uvOffset;
-      key.uvStride = draw.uvStride;
-      key.uvBinding = draw.uvBinding;
-    }
-    key.outlineMode = static_cast<uint8_t>(outlineMode);
-
-    if (draw.vertexBlendEnabled && draw.vertexBlendCount > 0) {
-      key.blendWeightFormat = draw.blendWeightFormat;
-      key.blendWeightOffset = draw.blendWeightOffset;
-    } else {
-      key.blendWeightFormat = VK_FORMAT_UNDEFINED;
-      key.blendWeightOffset = 0;
-    }
-
-    if (draw.vertexBlendEnabled && draw.vertexBlendIndexed) {
-      key.blendIndexFormat = draw.blendIndexFormat;
-      key.blendIndexOffset = draw.blendIndexOffset;
-    } else {
-      key.blendIndexFormat = VK_FORMAT_UNDEFINED;
-      key.blendIndexOffset = 0;
-    }
-
-    key.blendBinding = draw.blendBinding;
-    key.blendStride = draw.blendStride;
-
-    // 查找或创建描边管线
-    auto it = m_outlinePipelines.find(key);
-    VkPipeline outlinePipeline = VK_NULL_HANDLE;
-
-    if (it != m_outlinePipelines.end()) {
-      outlinePipeline = it->second;
-    } else {
-      // 创建描边管线（与 shadow caster 类似，但深度测试 = GREATER，有颜色输出）
-      VkVertexInputBindingDescription bindings[3] = {};
-      uint32_t bindingCount = 1;
-
-      bindings[0].binding = 0;
-      bindings[0].stride = key.positionStride;
-      bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-      if (key.blendBinding == 1) {
-        bindings[bindingCount].binding = 1;
-        bindings[bindingCount].stride = key.blendStride;
-        bindings[bindingCount].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        ++bindingCount;
-      }
-
-      if (key.alphaTestEnabled && key.uvBinding != 0u &&
-          key.uvBinding != key.blendBinding) {
-        bindings[bindingCount].binding = key.uvBinding;
-        bindings[bindingCount].stride = key.uvStride;
-        bindings[bindingCount].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        ++bindingCount;
-      }
-
-      // Alpha-tested skinned outline draws may need position + blend weight +
-      // blend index + UV. Keep the outline VI layout capacity in sync with the
-      // caster path to avoid corrupting the stack when all four are present.
-      std::array<VkVertexInputAttributeDescription, 4> attributes = {};
-      uint32_t attributeCount = 0;
-
-      // 位置 (location = 0)
-      attributes[attributeCount].location = 0;
-      attributes[attributeCount].binding = 0;
-      attributes[attributeCount].format = key.positionFormat;
-      attributes[attributeCount].offset = key.positionOffset;
-      attributeCount++;
-
-      // 混合权重 (location = 1)
-      if (key.blendWeightFormat != VK_FORMAT_UNDEFINED) {
-        attributes[attributeCount].location = 1;
-        attributes[attributeCount].binding = key.blendBinding;
-        attributes[attributeCount].format = key.blendWeightFormat;
-        attributes[attributeCount].offset = key.blendWeightOffset;
-        attributeCount++;
-      }
-
-      // 混合索引 (location = 2)
-      if (key.blendIndexFormat != VK_FORMAT_UNDEFINED) {
-        attributes[attributeCount].location = 2;
-        attributes[attributeCount].binding = key.blendBinding;
-        attributes[attributeCount].format = key.blendIndexFormat;
-        attributes[attributeCount].offset = key.blendIndexOffset;
-        attributeCount++;
-      }
-
-      // UV (location = 3)
-      if (key.alphaTestEnabled && key.uvFormat != VK_FORMAT_UNDEFINED) {
-        attributes[attributeCount].location = 3;
-        attributes[attributeCount].binding = key.uvBinding;
-        attributes[attributeCount].format = key.uvFormat;
-        attributes[attributeCount].offset = key.uvOffset;
-        attributeCount++;
-      }
-
-      VkPipelineVertexInputStateCreateInfo viState = {
-          VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-      viState.vertexBindingDescriptionCount = bindingCount;
-      viState.pVertexBindingDescriptions = bindings;
-      viState.vertexAttributeDescriptionCount = attributeCount;
-      viState.pVertexAttributeDescriptions = attributes.data();
-
-      VkPipelineInputAssemblyStateCreateInfo iaState = {
-          VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-      iaState.topology = key.topology;
-      iaState.primitiveRestartEnable = VK_FALSE;
-
-      VkPipelineRasterizationStateCreateInfo rsState = {
-          VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-      rsState.depthClampEnable = VK_FALSE;
-      rsState.rasterizerDiscardEnable = VK_FALSE;
-      rsState.polygonMode = VK_POLYGON_MODE_FILL;
-      rsState.cullMode =
-          VK_CULL_MODE_FRONT_BIT; // Cull front faces, draw back faces only for
-                                  // outline silhouette
-      rsState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-      const bool silhouette = outlineMode == War3OutlineMode::Silhouette;
-      if (silhouette) {
-        // 轮廓模式：轻微正向深度偏移，避免薄片/单面模型整块填充
-        rsState.depthBiasEnable = VK_TRUE;
-        rsState.depthBiasConstantFactor = 1.0f;
-        rsState.depthBiasSlopeFactor = 0.5f;
-      } else {
-        // 遮挡高亮：强负偏移，防止自遮挡
-        rsState.depthBiasEnable = VK_TRUE;
-        rsState.depthBiasConstantFactor = -100.0f;
-        rsState.depthBiasSlopeFactor = -2.0f;
-      }
-      rsState.lineWidth = 1.0f;
-
-      // 关键：轮廓模式使用 LESS_OR_EQUAL（只绘制轮廓外扩部分）
-      // 被遮挡高亮使用 GREATER（只绘制遮挡区域）
-      VkPipelineDepthStencilStateCreateInfo dsState = {
-          VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-      dsState.depthTestEnable = VK_TRUE;
-      dsState.depthWriteEnable = VK_FALSE; // 不写入深度
-      dsState.depthCompareOp =
-          silhouette ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_GREATER;
-      dsState.depthBoundsTestEnable = VK_FALSE;
-      dsState.stencilTestEnable = VK_FALSE;
-
-      // 颜色混合（Alpha 混合）
-      VkPipelineColorBlendAttachmentState blendAtt = {};
-      blendAtt.blendEnable = VK_TRUE;
-      blendAtt.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-      blendAtt.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-      blendAtt.colorBlendOp = VK_BLEND_OP_ADD;
-      blendAtt.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-      blendAtt.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-      blendAtt.alphaBlendOp = VK_BLEND_OP_ADD;
-      blendAtt.colorWriteMask =
-          VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
-      util::DxvkBuiltInGraphicsState state = {};
-      state.vs = util::DxvkBuiltInShaderStage(
-          war3_outline_expand_vert,
-          nullptr); // 使用专用 Outline VS (带剪裁空间扩展)
-      state.fs = util::DxvkBuiltInShaderStage(war3_unit_outline,
-                                              nullptr); // 使用 Outline FS
-      state.colorFormat = colorFormat;
-      state.depthFormat = depthFormat;
-      state.viState = &viState;
-      state.iaState = &iaState;
-      state.rsState = &rsState;
-      state.dsState = &dsState;
-      state.cbAttachment = &blendAtt;
-
-      outlinePipeline =
-          m_device->createBuiltInGraphicsPipeline(m_outlineLayout, state);
-      m_outlinePipelines.insert({key, outlinePipeline});
-
-      WAR3_RENDER_LOG("DXVK War3ShadowReceiverPass: created outline pipeline "
-                      "posF=%u topology=%u alpha=%d mode=%u\n",
-                      uint32_t(key.positionFormat), uint32_t(key.topology),
-                      key.alphaTestEnabled, uint32_t(key.outlineMode));
-    }
-
-    if (outlinePipeline == VK_NULL_HANDLE) {
-      continue;
-    }
+    const ShadowCasterPipelineKey key =
+        makeUnitOutlinePipelineKey(draw, outlineMode);
+    const VkPipeline outlinePipeline = outlinePipelines[outlineIndex];
 
     // Push constants
     ShadowCasterPushConstants pc = {};

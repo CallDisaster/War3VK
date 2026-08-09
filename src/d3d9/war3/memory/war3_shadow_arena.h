@@ -132,8 +132,10 @@ struct ShadowArenaDiagnostics {
  *
  * @return 成功返回 true。
  */
-bool ShadowArena_Init();
+bool ShadowArena_Init(DxvkDevice* device);
 bool ShadowArena_IsInitialized();
+bool ShadowArena_IsOwnedBy(const DxvkDevice* device);
+void ShadowArena_Shutdown(DxvkDevice* device);
 
 /**
  * @brief 切换到当前渲染帧对应的 Arena 分区。

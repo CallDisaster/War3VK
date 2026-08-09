@@ -187,6 +187,31 @@ War3ShadowReplayValidationResult ValidateWar3ShadowReplayDraw(
       return uv;
   }
 
+  if (input.paletteRequired) {
+    if (input.paletteCount == 0u ||
+        input.paletteIndex >= input.paletteCount ||
+        input.paletteMatricesPerEntry == 0u) {
+      return Reject(War3ShadowReplayRejectReason::InvalidPaletteIndex,
+                    input.paletteIndex, input.paletteCount);
+    }
+
+    uint64_t paletteOffset = 0u;
+    uint64_t paletteEnd = 0u;
+    uint64_t totalMatrices = 0u;
+    if (!CheckedMul(uint64_t(input.paletteIndex),
+                    uint64_t(input.paletteMatricesPerEntry), paletteOffset) ||
+        !CheckedAdd(paletteOffset,
+                    uint64_t(input.paletteMatricesPerEntry), paletteEnd) ||
+        !CheckedMul(uint64_t(input.paletteCount),
+                    uint64_t(input.paletteMatricesPerEntry), totalMatrices)) {
+      return Reject(War3ShadowReplayRejectReason::PaletteRangeOverflow);
+    }
+    if (paletteEnd > totalMatrices) {
+      return Reject(War3ShadowReplayRejectReason::InvalidPaletteIndex,
+                    paletteEnd, totalMatrices);
+    }
+  }
+
   if (input.gpuSkinRequired) {
     if (!input.gpuSkinLeaseValid)
       return Reject(War3ShadowReplayRejectReason::InvalidGpuSkinLease);
@@ -248,7 +273,8 @@ const char* War3ShadowReplayRejectReasonName(
       "vertex-domain-overflow", "invalid-actual-index-domain",
       "missing-blend-buffer", "invalid-blend-layout",
       "blend-range-out-of-bounds", "missing-uv-buffer", "invalid-uv-layout",
-      "uv-range-out-of-bounds", "invalid-gpu-skin-lease",
+      "uv-range-out-of-bounds", "invalid-palette-index",
+      "palette-range-overflow", "invalid-gpu-skin-lease",
       "stale-gpu-skin-map-epoch", "stale-gpu-skin-device-epoch",
       "gpu-skin-source-range-out-of-bounds",
       "gpu-skin-palette-range-out-of-bounds",

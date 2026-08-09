@@ -248,7 +248,19 @@ namespace dxvk {
      * \returns Device status
      */
     VkResult getDeviceStatus() const {
-      return m_submissionQueue.getLastError();
+      const VkResult terminal = m_terminalStatus.load(std::memory_order_acquire);
+      return terminal != VK_SUCCESS
+        ? terminal
+        : m_submissionQueue.getLastError();
+    }
+
+    void notifyDeviceError(VkResult status) {
+      if (status != VK_ERROR_DEVICE_LOST)
+        return;
+      VkResult expected = VK_SUCCESS;
+      m_terminalStatus.compare_exchange_strong(
+        expected, status, std::memory_order_acq_rel,
+        std::memory_order_acquire);
     }
 
     /**
@@ -735,6 +747,7 @@ namespace dxvk {
 
     DxvkRecycler<DxvkCommandList, 16> m_recycledCommandLists;
 
+    std::atomic<VkResult>       m_terminalStatus = { VK_SUCCESS };
     DxvkSubmissionQueue         m_submissionQueue;
 
     Rc<DxvkShaderCache>         m_shaderCache;
