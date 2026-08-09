@@ -5,6 +5,7 @@
 #include "war3/render/war3_outline_mask_layout.h"
 #include "war3/render/war3_point_shadow_cpu_plan.h"
 #include "war3/render/war3_tracked_vk_pipeline.h"
+#include "war3/render/war3_owned_image_layout.h"
 
 #include "../dxvk/dxvk_hash.h"
 
@@ -659,6 +660,7 @@ namespace dxvk {
         // 中间颜色副本（可采样）
         Rc<DxvkImage> m_colorCopy;
         Rc<DxvkImageView> m_colorCopyView;
+        war3::render::War3OwnedImageLayoutState m_colorCopyLayout;
         VkExtent3D m_cachedExtent = {0, 0, 1};
         VkFormat m_cachedFormat = VK_FORMAT_UNDEFINED;
 
@@ -666,6 +668,7 @@ namespace dxvk {
         Rc<DxvkImage> m_depthCopy;
         Rc<DxvkImageView> m_depthCopyView;   // 2D array，用于 ShadowReceiver
         Rc<DxvkImageView> m_depthCopyView2D; // 2D 视图，用于描边遮罩
+        war3::render::War3OwnedImageLayoutState m_depthCopyLayout;
         VkExtent3D m_cachedDepthExtent = {0, 0, 1};
         VkFormat m_cachedDepthFormat = VK_FORMAT_UNDEFINED;
 
@@ -673,16 +676,20 @@ namespace dxvk {
         // 说明：当前阶段仅提供“相机运动向量”（基于深度 + prevViewProj 重投影）。
         Rc<DxvkImage> m_motionVectorImage;
         Rc<DxvkImageView> m_motionVectorView;
+        war3::render::War3OwnedImageLayoutState m_motionVectorLayout;
         VkExtent3D m_mvCachedExtent = {0, 0, 1};
 
         // Shadow TAA 资源：当前帧阴影因子（未滤波）+ 历史（Ping-Pong）
         Rc<DxvkImage> m_shadowCurrent;
         Rc<DxvkImageView> m_shadowCurrentView;
+        war3::render::War3OwnedImageLayoutState m_shadowCurrentLayout;
         VkExtent3D m_shadowCurrentExtent = {0, 0, 1};
 
         std::array<Rc<DxvkImage>, 2> m_shadowHistory = { };
         std::array<Rc<DxvkImageView>, 2> m_shadowHistoryView = { };
         std::array<Rc<DxvkImageView>, 2> m_shadowHistoryStorageView = { };
+        std::array<war3::render::War3OwnedImageLayoutState, 2>
+            m_shadowHistoryLayouts = { };
         VkExtent3D m_shadowHistoryExtent = {0, 0, 1};
         uint32_t m_shadowHistoryIndex = 0; // 当前作为“历史读取”的索引
         bool m_shadowHistoryValid = false; // 历史是否已写入过（避免首次启用时读到旧数据）
@@ -844,6 +851,8 @@ namespace dxvk {
         Rc<DxvkImage> m_shadowCasterMask;
         Rc<DxvkImageView> m_shadowCasterMaskSampleView;
         std::array<Rc<DxvkImageView>, 4> m_shadowCasterMaskLayerViews = { };
+        war3::render::War3OwnedImageLayoutState m_shadowMapLayout;
+        war3::render::War3OwnedImageLayoutState m_shadowCasterMaskLayout;
         uint32_t m_shadowMapLayers = 0;
         uint32_t m_shadowMapResolution = 0;
 
@@ -851,6 +860,7 @@ namespace dxvk {
         Rc<DxvkImage> m_volumeSunShadowMap;
         Rc<DxvkImageView> m_volumeSunShadowSampleView;
         std::array<Rc<DxvkImageView>, 2> m_volumeSunShadowLayerViews = {};
+        war3::render::War3OwnedImageLayoutState m_volumeSunShadowLayout;
         uint32_t m_volumeSunShadowResolution = 0;
         uint32_t m_volumeSunShadowLayers = 0;
         Matrix4 m_volumeSunLightViewProj[2] = {};

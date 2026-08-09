@@ -13,6 +13,7 @@
 #include "war3/core/war3_storm.h"
 #include "war3/render/war3_render_state.h"
 #include "war3/render/war3_tracked_vk_pipeline.h"
+#include "war3/render/war3_owned_image_layout.h"
 
 #include "../dxvk/dxvk_device.h"
 #include "../dxvk/dxvk_buffer.h"
@@ -102,13 +103,18 @@ struct ShaderPackRuntime {
 
     dxvk::Rc<dxvk::DxvkImage> colorCopy;
     dxvk::Rc<dxvk::DxvkImageView> colorCopyView;
+    dxvk::war3::render::War3OwnedImageLayoutState colorCopyLayout;
     dxvk::Rc<dxvk::DxvkImage> pingImage;
     dxvk::Rc<dxvk::DxvkImageView> pingView;
+    dxvk::war3::render::War3OwnedImageLayoutState pingLayout;
     dxvk::Rc<dxvk::DxvkImage> pongImage;
     dxvk::Rc<dxvk::DxvkImageView> pongView;
+    dxvk::war3::render::War3OwnedImageLayoutState pongLayout;
 
     dxvk::Rc<dxvk::DxvkImage> fallbackImage;
     dxvk::Rc<dxvk::DxvkImageView> fallbackView;
+    dxvk::war3::render::War3OwnedImageLayoutState fallbackLayout;
+    bool fallbackReady = false;
 
     VkExtent3D cachedInputExtent = { 0, 0, 1 };
     VkExtent3D cachedPassExtent = { 0, 0, 1 };
@@ -119,6 +125,8 @@ struct ShaderPackRuntime {
     PackState pack;
     std::array<dxvk::Vector4, SHADERPACK_MAX_PARAMS> params = { };
     std::array<dxvk::Rc<dxvk::DxvkImageView>, SHADERPACK_MAX_TEXTURES> textures = { };
+    std::array<dxvk::war3::render::War3OwnedImageLayoutState,
+               SHADERPACK_MAX_TEXTURES> textureLayouts = { };
     std::vector<PendingTextureUpload> pendingUploads;
     bool shadowReceiverEnabled = policy::kRawShaderPackEnabled;
 
@@ -406,6 +414,8 @@ void EnsureFallbackTexture() {
     info.debugName = "War3ShaderPackFallback";
 
     g_runtime.fallbackImage = g_runtime.device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    g_runtime.fallbackLayout.reset();
+    g_runtime.fallbackReady = false;
 
     VkComponentMapping mapping = {
         VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -426,6 +436,49 @@ void EnsureFallbackTexture() {
     viewKey.layerCount = 1;
     viewKey.packedSwizzle = dxvk::DxvkImageViewKey::packSwizzle(mapping);
     g_runtime.fallbackView = g_runtime.fallbackImage->createView(viewKey);
+}
+
+void EnsureFallbackTextureReady(
+    const dxvk::Rc<dxvk::DxvkCommandList>& ctx) {
+    EnsureFallbackTexture();
+    if (!ctx || !g_runtime.fallbackImage || g_runtime.fallbackReady)
+        return;
+
+    const auto subresources =
+        g_runtime.fallbackImage->getAvailableSubresources();
+    const auto clearTransition = g_runtime.fallbackLayout.plan(
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageMemoryBarrier2 barrier =
+        dxvk::war3::render::MakeWar3OwnedImageBarrier(
+            clearTransition, g_runtime.fallbackImage->handle(), subresources);
+    VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo.imageMemoryBarrierCount = 1u;
+    depInfo.pImageMemoryBarriers = &barrier;
+    ctx->cmdPipelineBarrier(dxvk::DxvkCmdBuffer::InitBuffer, &depInfo);
+    dxvk::war3::render::CommitWar3OwnedImageLayout(
+        g_runtime.fallbackLayout, clearTransition, *g_runtime.fallbackImage,
+        subresources);
+
+    const VkClearColorValue clear = {};
+    ctx->cmdClearColorImage(
+        dxvk::DxvkCmdBuffer::InitBuffer, g_runtime.fallbackImage->handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1u, &subresources);
+
+    const auto readTransition = g_runtime.fallbackLayout.plan(
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_READ_BIT);
+    barrier = dxvk::war3::render::MakeWar3OwnedImageBarrier(
+        readTransition, g_runtime.fallbackImage->handle(), subresources);
+    depInfo.pImageMemoryBarriers = &barrier;
+    ctx->cmdPipelineBarrier(dxvk::DxvkCmdBuffer::InitBuffer, &depInfo);
+    dxvk::war3::render::CommitWar3OwnedImageLayout(
+        g_runtime.fallbackLayout, readTransition, *g_runtime.fallbackImage,
+        subresources);
+    ctx->track(g_runtime.fallbackImage, dxvk::DxvkAccess::Write);
+    g_runtime.fallbackReady = true;
 }
 
 bool UploadTexture(const dxvk::Rc<dxvk::DxvkCommandList>& ctx, const PendingTextureUpload& upload) {
@@ -451,6 +504,7 @@ bool UploadTexture(const dxvk::Rc<dxvk::DxvkCommandList>& ctx, const PendingText
     auto image = g_runtime.device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (!image)
         return false;
+    dxvk::war3::render::War3OwnedImageLayoutState imageLayout;
 
     VkComponentMapping mapping = {
         VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -489,20 +543,23 @@ bool UploadTexture(const dxvk::Rc<dxvk::DxvkCommandList>& ctx, const PendingText
     std::memcpy(uploadBuffer->mapPtr(0), upload.pixels.data(), dataSize);
     auto uploadSlice = uploadBuffer->getSliceInfo();
 
-    VkImageMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const auto subresources = image->getAvailableSubresources();
+    const auto writeTransition = imageLayout.plan(
+        image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageMemoryBarrier2 barrier =
+        dxvk::war3::render::MakeWar3OwnedImageBarrier(
+            writeTransition, image->handle(), subresources);
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image->handle();
-    barrier.subresourceRange = image->getAvailableSubresources();
 
     VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &barrier;
     ctx->cmdPipelineBarrier(dxvk::DxvkCmdBuffer::InitBuffer, &depInfo);
+    dxvk::war3::render::CommitWar3OwnedImageLayout(
+        imageLayout, writeTransition, *image, subresources);
 
     VkBufferImageCopy2 imageRegion = { VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2 };
     imageRegion.bufferOffset = uploadSlice.offset;
@@ -518,30 +575,27 @@ bool UploadTexture(const dxvk::Rc<dxvk::DxvkCommandList>& ctx, const PendingText
     imageCopy.pRegions = &imageRegion;
     ctx->cmdCopyBufferToImage(dxvk::DxvkCmdBuffer::InitBuffer, &imageCopy);
 
-    barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    barrier.dstAccessMask = info.access;
-    barrier.dstStageMask = info.stages;
-    barrier.oldLayout = image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    barrier.newLayout = info.layout;
+    const auto readTransition = imageLayout.plan(
+        info.layout, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_READ_BIT);
+    barrier = dxvk::war3::render::MakeWar3OwnedImageBarrier(
+        readTransition, image->handle(), subresources);
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image->handle();
-    barrier.subresourceRange = image->getAvailableSubresources();
 
     depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &barrier;
     ctx->cmdPipelineBarrier(dxvk::DxvkCmdBuffer::InitBuffer, &depInfo);
-
-    image->trackLayout(image->getAvailableSubresources(), info.layout);
+    dxvk::war3::render::CommitWar3OwnedImageLayout(
+        imageLayout, readTransition, *image, subresources);
 
     ctx->track(uploadBuffer, dxvk::DxvkAccess::Read);
     ctx->track(image, dxvk::DxvkAccess::Write);
 
     if (upload.slot < g_runtime.textures.size()) {
         g_runtime.textures[upload.slot] = std::move(view);
+        g_runtime.textureLayouts[upload.slot] = imageLayout;
     }
     return true;
 }
@@ -575,6 +629,7 @@ void CreateColorCopy(VkExtent3D extent, VkFormat format) {
     info.debugName = "War3ShaderPackColorCopy";
 
     g_runtime.colorCopy = g_runtime.device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    g_runtime.colorCopyLayout.reset();
 
     VkComponentMapping mapping = {
         VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -614,6 +669,8 @@ void CreatePingPong(VkExtent3D extent, VkFormat format) {
 
     g_runtime.pingImage = g_runtime.device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     g_runtime.pongImage = g_runtime.device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    g_runtime.pingLayout.reset();
+    g_runtime.pongLayout.reset();
 
     VkComponentMapping mapping = {
         VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -682,7 +739,8 @@ void CopyColorToInput(const dxvk::Rc<dxvk::DxvkCommandList>& ctx, const dxvk::Rc
     if (!g_runtime.colorCopy || !g_runtime.colorCopyView || !srcView)
         return;
 
-    VkImageLayout srcLayout = srcView->getLayout();
+    const auto srcSubresources = srcView->imageSubresources();
+    VkImageLayout srcLayout = srcView->image()->queryLayout(srcSubresources);
 
     VkImageMemoryBarrier2 barriers[2] = { };
     for (auto& barrier : barriers) {
@@ -696,21 +754,24 @@ void CopyColorToInput(const dxvk::Rc<dxvk::DxvkCommandList>& ctx, const dxvk::Rc
     barriers[0].oldLayout = srcLayout;
     barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barriers[0].image = srcView->image()->handle();
-    barriers[0].subresourceRange = srcView->imageSubresources();
+    barriers[0].subresourceRange = srcSubresources;
 
-    barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    barriers[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barriers[1].image = g_runtime.colorCopy->handle();
-    barriers[1].subresourceRange = g_runtime.colorCopyView->imageSubresources();
+    const auto dstSubresources =
+        g_runtime.colorCopyView->imageSubresources();
+    const auto dstWriteTransition = g_runtime.colorCopyLayout.plan(
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    barriers[1] = dxvk::war3::render::MakeWar3OwnedImageBarrier(
+        dstWriteTransition, g_runtime.colorCopy->handle(), dstSubresources);
 
     VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     depInfo.imageMemoryBarrierCount = 2;
     depInfo.pImageMemoryBarriers = barriers;
     ctx->cmdPipelineBarrier(dxvk::DxvkCmdBuffer::ExecBuffer, &depInfo);
+    dxvk::war3::render::CommitWar3OwnedImageLayout(
+        g_runtime.colorCopyLayout, dstWriteTransition,
+        *g_runtime.colorCopy, dstSubresources);
 
     VkImageCopy2 copyRegion = { VK_STRUCTURE_TYPE_IMAGE_COPY_2 };
     copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -736,14 +797,17 @@ void CopyColorToInput(const dxvk::Rc<dxvk::DxvkCommandList>& ctx, const dxvk::Rc
     barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barriers[0].newLayout = srcLayout;
 
-    barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    const auto dstReadTransition = g_runtime.colorCopyLayout.plan(
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_READ_BIT);
+    barriers[1] = dxvk::war3::render::MakeWar3OwnedImageBarrier(
+        dstReadTransition, g_runtime.colorCopy->handle(), dstSubresources);
 
     ctx->cmdPipelineBarrier(dxvk::DxvkCmdBuffer::ExecBuffer, &depInfo);
+    dxvk::war3::render::CommitWar3OwnedImageLayout(
+        g_runtime.colorCopyLayout, dstReadTransition,
+        *g_runtime.colorCopy, dstSubresources);
 
     ctx->track(srcView->image(), dxvk::DxvkAccess::Read);
     ctx->track(g_runtime.colorCopy, dxvk::DxvkAccess::Write);
@@ -842,7 +906,8 @@ void TransitionDepthToReadOnly(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
                                VkImageLayout& oldLayout) {
     if (!depthView)
         return;
-    oldLayout = depthView->getLayout();
+    oldLayout = depthView->image()->queryLayout(
+        depthView->imageSubresources());
     if (oldLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
         return;
 
@@ -892,41 +957,79 @@ void RestoreDepthLayout(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
 
 void TransitionImageForRender(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
                               const dxvk::Rc<dxvk::DxvkImageView>& view,
+                              dxvk::war3::render::War3OwnedImageLayoutState*
+                                  ownedLayout,
                               VkImageLayout newLayout) {
-    VkImageMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    barrier.oldLayout = view->getLayout();
-    barrier.newLayout = newLayout;
-    barrier.image = view->image()->handle();
-    barrier.subresourceRange = view->imageSubresources();
+    const auto subresources = view->imageSubresources();
+    VkImageMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    dxvk::war3::render::War3OwnedImageLayoutTransition transition = {};
+    if (ownedLayout != nullptr) {
+        transition = ownedLayout->plan(
+            newLayout, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        barrier = dxvk::war3::render::MakeWar3OwnedImageBarrier(
+            transition, view->image()->handle(), subresources);
+    } else {
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT |
+                                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.oldLayout = view->image()->queryLayout(subresources);
+        barrier.newLayout = newLayout;
+        barrier.image = view->image()->handle();
+        barrier.subresourceRange = subresources;
+    }
 
     VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &barrier;
     ctx->cmdPipelineBarrier(dxvk::DxvkCmdBuffer::ExecBuffer, &depInfo);
+    if (ownedLayout != nullptr) {
+        dxvk::war3::render::CommitWar3OwnedImageLayout(
+            *ownedLayout, transition, *view->image(), subresources);
+    }
 }
 
 void TransitionImageToReadOnly(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
                                const dxvk::Rc<dxvk::DxvkImageView>& view,
+                               dxvk::war3::render::War3OwnedImageLayoutState*
+                                   ownedLayout,
                                VkImageLayout newLayout) {
     const bool toReadOnly = (newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    VkImageMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    barrier.dstStageMask = toReadOnly ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    barrier.dstAccessMask = toReadOnly ? VK_ACCESS_2_SHADER_READ_BIT : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    barrier.newLayout = newLayout;
-    barrier.image = view->image()->handle();
-    barrier.subresourceRange = view->imageSubresources();
+    const VkPipelineStageFlags2 dstStages = toReadOnly
+        ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+        : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    const VkAccessFlags2 dstAccess = toReadOnly
+        ? VK_ACCESS_2_SHADER_READ_BIT
+        : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    const auto subresources = view->imageSubresources();
+    VkImageMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    dxvk::war3::render::War3OwnedImageLayoutTransition transition = {};
+    if (ownedLayout != nullptr) {
+        transition = ownedLayout->plan(newLayout, dstStages, dstAccess);
+        barrier = dxvk::war3::render::MakeWar3OwnedImageBarrier(
+            transition, view->image()->handle(), subresources);
+    } else {
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstStageMask = dstStages;
+        barrier.dstAccessMask = dstAccess;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.newLayout = newLayout;
+        barrier.image = view->image()->handle();
+        barrier.subresourceRange = subresources;
+    }
 
     VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &barrier;
     ctx->cmdPipelineBarrier(dxvk::DxvkCmdBuffer::ExecBuffer, &depInfo);
+    if (ownedLayout != nullptr) {
+        dxvk::war3::render::CommitWar3OwnedImageLayout(
+            *ownedLayout, transition, *view->image(), subresources);
+    }
 }
 bool LoadDefaultPass(const std::string& packPath, const std::string& name, const std::string& file, std::vector<PackPass>& outPasses) {
     if (outPasses.size() >= SHADERPACK_MAX_PASSES) {
@@ -1339,6 +1442,7 @@ WAR3_PACK_API ShaderPackError ClearTexture(TextureSlot slot) {
         return ShaderPackError::INVALID_SLOT;
     }
     g_runtime.textures[index] = nullptr;
+    g_runtime.textureLayouts[index].reset();
     auto& pending = g_runtime.pendingUploads;
     pending.erase(
         std::remove_if(pending.begin(), pending.end(),
@@ -1503,6 +1607,7 @@ void RunShaderPackPasses(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
     EnsureLayout();
     EnsureUboBuffer();
     EnsureFallbackTexture();
+    EnsureFallbackTextureReady(ctx);
 
     // [健壮性] 确保关键资源已正确初始化
     if (!g_runtime.samplerLinear) {
@@ -1543,13 +1648,23 @@ void RunShaderPackPasses(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
     if (!g_runtime.colorCopyView || !g_runtime.pingView || !g_runtime.pongView)
         return;
 
+    uint32_t activePasses = 0;
+    for (const auto& pass : g_runtime.pack.passes) {
+        if (pass.enabled)
+            activePasses++;
+    }
+
+    // Do not transition caller-owned attachments when there is no work.  In
+    // particular, an early return after moving depth to read-only would leave
+    // DXVK's render target in the wrong actual layout.
+    if (activePasses == 0)
+        return;
+
     CopyColorToInput(ctx, input.colorView);
 
-
     VkImageLayout depthOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (input.depthView) {
+    if (input.depthView)
         TransitionDepthToReadOnly(ctx, input.depthView, depthOldLayout);
-    }
 
     auto now = std::chrono::steady_clock::now();
     float frameTime = 0.0f;
@@ -1568,15 +1683,6 @@ void RunShaderPackPasses(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
     const VkFormat outFormat = g_runtime.cachedFormat;
     const VkExtent3D passExtent = g_runtime.cachedPassExtent;
 
-    uint32_t activePasses = 0;
-    for (auto& pass : g_runtime.pack.passes) {
-        if (pass.enabled)
-            activePasses++;
-    }
-
-    if (activePasses == 0)
-        return;
-
     uint32_t passIndex = 0;
     for (auto& pass : g_runtime.pack.passes) {
         if (!pass.enabled)
@@ -1591,19 +1697,33 @@ void RunShaderPackPasses(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
 
         const bool isLast = (passIndex + 1) >= activePasses;
         dxvk::Rc<dxvk::DxvkImageView> dstView = isLast ? input.colorView : currView;
+        auto* dstOwnedLayout = isLast
+            ? nullptr
+            : (currView == g_runtime.pingView
+                   ? &g_runtime.pingLayout
+                   : &g_runtime.pongLayout);
 
         if (!EnsurePassPipeline(pass, outFormat)) {
             SetError(ShaderPackError::SHADER_COMPILE_ERROR, "ShaderPass pipeline 创建失败");
             g_runtime.pack.enabled = false;
             Logger::err("ShaderPack: Pipeline 创建失败，已禁用 pack（需重载）");
+            if (input.depthView) {
+                RestoreDepthLayout(ctx, input.depthView, depthOldLayout);
+                ctx->track(input.depthView->image(), dxvk::DxvkAccess::Read);
+            }
             return;
         }
 
         VkExtent3D extent = isLast ? input.colorView->mipLevelExtent(0u) : passExtent;
         UpdateUboOnCmd(ctx, input, extent, frameTime, g_runtime.totalTime);
 
-        VkImageLayout originalLayout = dstView->getLayout();
-        TransitionImageForRender(ctx, dstView, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        const auto dstSubresources = dstView->imageSubresources();
+        VkImageLayout originalLayout = isLast
+            ? dstView->image()->queryLayout(dstSubresources)
+            : dstOwnedLayout->layout();
+        TransitionImageForRender(
+            ctx, dstView, dstOwnedLayout,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
         VkRenderingAttachmentInfo attachment = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
         attachment.imageView = dstView->handle();
@@ -1675,11 +1795,14 @@ void RunShaderPackPasses(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
         ctx->cmdEndRendering();
 
         if (!isLast) {
-            TransitionImageToReadOnly(ctx, dstView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            TransitionImageToReadOnly(
+                ctx, dstView, dstOwnedLayout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             prevView = dstView;
             currView = (currView == g_runtime.pingView) ? g_runtime.pongView : g_runtime.pingView;
         } else {
-            TransitionImageToReadOnly(ctx, dstView, originalLayout);
+            TransitionImageToReadOnly(
+                ctx, dstView, nullptr, originalLayout);
         }
 
         ctx->track(dstView->image(), dxvk::DxvkAccess::Write);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d9_war3_pipeline.h"
+#include "war3/render/war3_owned_image_layout.h"
 #include "../dxvk/dxvk_hash.h"
 
 #include <unordered_map>
@@ -54,11 +55,13 @@ namespace dxvk {
 
         Rc<DxvkImage> m_colorCopy;
         Rc<DxvkImageView> m_colorCopyView;
+        war3::render::War3OwnedImageLayoutState m_colorCopyLayout;
         VkExtent3D m_cachedExtent = {0, 0, 1};
         VkFormat m_cachedFormat = VK_FORMAT_UNDEFINED;
 
         Rc<DxvkImage> m_depthCopy;
         Rc<DxvkImageView> m_depthCopyView;
+        war3::render::War3OwnedImageLayoutState m_depthCopyLayout;
         VkExtent3D m_cachedDepthExtent = {0, 0, 1};
         VkFormat m_cachedDepthFormat = VK_FORMAT_UNDEFINED;
     };

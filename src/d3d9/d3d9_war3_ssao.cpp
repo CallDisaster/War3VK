@@ -120,6 +120,7 @@ namespace dxvk {
             info.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
             m_colorCopy = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            m_colorCopyLayout.reset();
 
             DxvkImageViewKey viewInfo;
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -166,6 +167,7 @@ namespace dxvk {
             info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
             m_depthCopy = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            m_depthCopyLayout.reset();
 
             DxvkImageViewKey viewInfo;
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -192,7 +194,9 @@ namespace dxvk {
         if (!m_colorCopy || !m_colorCopyView)
             return;
 
-        const VkImageLayout srcLayout = srcView->getLayout();
+        const auto srcSubresources = srcView->imageSubresources();
+        const VkImageLayout srcLayout =
+            srcView->image()->queryLayout(srcSubresources);
 
         VkImageMemoryBarrier2 barriers[2] = { };
         for (auto& b : barriers)
@@ -205,21 +209,23 @@ namespace dxvk {
         barriers[0].oldLayout     = srcLayout;
         barriers[0].newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barriers[0].image         = srcView->image()->handle();
-        barriers[0].subresourceRange = srcView->imageSubresources();
+        barriers[0].subresourceRange = srcSubresources;
 
-        barriers[1].srcStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-        barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-        barriers[1].dstStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barriers[1].oldLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        barriers[1].newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].image         = m_colorCopy->handle();
-        barriers[1].subresourceRange = m_colorCopyView->imageSubresources();
+        const auto dstSubresources = m_colorCopyView->imageSubresources();
+        const auto dstWriteTransition = m_colorCopyLayout.plan(
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+            dstWriteTransition, m_colorCopy->handle(), dstSubresources);
 
         VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         depInfo.imageMemoryBarrierCount = 2;
         depInfo.pImageMemoryBarriers = barriers;
         ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+        war3::render::CommitWar3OwnedImageLayout(
+            m_colorCopyLayout, dstWriteTransition, *m_colorCopy,
+            dstSubresources);
 
         VkImageCopy2 copyRegion = { VK_STRUCTURE_TYPE_IMAGE_COPY_2 };
         copyRegion.srcSubresource = toLayers(srcView->imageSubresources());
@@ -243,14 +249,17 @@ namespace dxvk {
         barriers[0].oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barriers[0].newLayout     = srcLayout;
 
-        barriers[1].srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barriers[1].dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-        barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-        barriers[1].oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        const auto dstReadTransition = m_colorCopyLayout.plan(
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_READ_BIT);
+        barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+            dstReadTransition, m_colorCopy->handle(), dstSubresources);
 
         ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+        war3::render::CommitWar3OwnedImageLayout(
+            m_colorCopyLayout, dstReadTransition, *m_colorCopy,
+            dstSubresources);
 
         ctx->track(srcView->image(), DxvkAccess::Read);
         ctx->track(m_colorCopy, DxvkAccess::Write);
@@ -260,7 +269,9 @@ namespace dxvk {
         if (!m_depthCopy || !m_depthCopyView)
             return;
 
-        const VkImageLayout srcLayout = srcView->getLayout();
+        const auto srcSubresources = srcView->imageSubresources();
+        const VkImageLayout srcLayout =
+            srcView->image()->queryLayout(srcSubresources);
 
         VkImageMemoryBarrier2 barriers[2] = { };
         for (auto& b : barriers)
@@ -273,21 +284,23 @@ namespace dxvk {
         barriers[0].oldLayout     = srcLayout;
         barriers[0].newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barriers[0].image         = srcView->image()->handle();
-        barriers[0].subresourceRange = srcView->imageSubresources();
+        barriers[0].subresourceRange = srcSubresources;
 
-        barriers[1].srcStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-        barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-        barriers[1].dstStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barriers[1].oldLayout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-        barriers[1].newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].image         = m_depthCopy->handle();
-        barriers[1].subresourceRange = m_depthCopyView->imageSubresources();
+        const auto dstSubresources = m_depthCopyView->imageSubresources();
+        const auto dstWriteTransition = m_depthCopyLayout.plan(
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+            dstWriteTransition, m_depthCopy->handle(), dstSubresources);
 
         VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         depInfo.imageMemoryBarrierCount = 2;
         depInfo.pImageMemoryBarriers = barriers;
         ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+        war3::render::CommitWar3OwnedImageLayout(
+            m_depthCopyLayout, dstWriteTransition, *m_depthCopy,
+            dstSubresources);
 
         VkImageCopy2 copyRegion = { VK_STRUCTURE_TYPE_IMAGE_COPY_2 };
         copyRegion.srcSubresource = toLayers(srcView->imageSubresources());
@@ -311,14 +324,17 @@ namespace dxvk {
         barriers[0].oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barriers[0].newLayout     = srcLayout;
 
-        barriers[1].srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barriers[1].dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-        barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-        barriers[1].oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].newLayout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        const auto dstReadTransition = m_depthCopyLayout.plan(
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_READ_BIT);
+        barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+            dstReadTransition, m_depthCopy->handle(), dstSubresources);
 
         ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+        war3::render::CommitWar3OwnedImageLayout(
+            m_depthCopyLayout, dstReadTransition, *m_depthCopy,
+            dstSubresources);
 
         ctx->track(srcView->image(), DxvkAccess::Read);
         ctx->track(m_depthCopy, DxvkAccess::Write);

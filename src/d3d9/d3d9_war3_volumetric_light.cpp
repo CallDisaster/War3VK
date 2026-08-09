@@ -484,6 +484,7 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     m_colorCopy = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    m_colorCopyLayout.reset();
 
     DxvkImageViewKey viewInfo;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -528,6 +529,7 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
     info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
     m_depthCopy = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    m_depthCopyLayout.reset();
 
     DxvkImageViewKey viewInfo;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -581,6 +583,7 @@ void War3VolumetricLightPass::ensureResources(VkExtent3D extent,
 
     m_effectImage =
         m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    m_effectLayout.reset();
 
     DxvkImageViewKey viewInfo;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -642,6 +645,7 @@ void War3VolumetricLightPass::ensurePointShadowFallbackResources(
 
     m_pointShadowFallbackCube = std::move(newCube);
     m_pointShadowFallbackCubeView = std::move(newView);
+    m_pointShadowFallbackLayout.reset();
     m_pointShadowFallbackReady = false;
   }
 
@@ -651,20 +655,20 @@ void War3VolumetricLightPass::ensurePointShadowFallbackResources(
   ctx->track(m_pointShadowFallbackCube, DxvkAccess::Write);
   const VkImageSubresourceRange range = {
       VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 6u};
-  VkImageMemoryBarrier2 toClear = {
-      VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-  toClear.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
-  toClear.srcAccessMask = 0u;
-  toClear.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  toClear.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  toClear.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  toClear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  toClear.image = m_pointShadowFallbackCube->handle();
-  toClear.subresourceRange = range;
+  const auto clearTransition = m_pointShadowFallbackLayout.plan(
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  VkImageMemoryBarrier2 toClear =
+      war3::render::MakeWar3OwnedImageBarrier(
+          clearTransition, m_pointShadowFallbackCube->handle(), range);
   VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
   depInfo.imageMemoryBarrierCount = 1u;
   depInfo.pImageMemoryBarriers = &toClear;
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_pointShadowFallbackLayout, clearTransition,
+      *m_pointShadowFallbackCube, range);
 
   VkClearColorValue clear = {};
   clear.float32[0] = 1.0f;
@@ -676,18 +680,18 @@ void War3VolumetricLightPass::ensurePointShadowFallbackResources(
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                           &clear, 1u, &range);
 
-  VkImageMemoryBarrier2 toRead = {
-      VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-  toRead.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  toRead.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  toRead.image = m_pointShadowFallbackCube->handle();
-  toRead.subresourceRange = range;
+  const auto readTransition = m_pointShadowFallbackLayout.plan(
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      VK_ACCESS_2_SHADER_READ_BIT);
+  VkImageMemoryBarrier2 toRead =
+      war3::render::MakeWar3OwnedImageBarrier(
+          readTransition, m_pointShadowFallbackCube->handle(), range);
   depInfo.pImageMemoryBarriers = &toRead;
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_pointShadowFallbackLayout, readTransition,
+      *m_pointShadowFallbackCube, range);
   m_pointShadowFallbackReady = true;
 }
 
@@ -696,7 +700,9 @@ void War3VolumetricLightPass::copyColor(const Rc<DxvkCommandList>& ctx,
   if (!srcView || !m_colorCopy || !m_colorCopyView)
     return;
 
-  const VkImageLayout srcLayout = srcView->getLayout();
+  const auto srcSubresources = srcView->imageSubresources();
+  const VkImageLayout srcLayout =
+      srcView->image()->queryLayout(srcSubresources);
 
   VkImageMemoryBarrier2 barriers[2] = {};
   for (auto& b : barriers)
@@ -709,21 +715,22 @@ void War3VolumetricLightPass::copyColor(const Rc<DxvkCommandList>& ctx,
   barriers[0].oldLayout = srcLayout;
   barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].image = srcView->image()->handle();
-  barriers[0].subresourceRange = srcView->imageSubresources();
+  barriers[0].subresourceRange = srcSubresources;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].image = m_colorCopy->handle();
-  barriers[1].subresourceRange = m_colorCopyView->imageSubresources();
+  const auto dstSubresources = m_colorCopyView->imageSubresources();
+  const auto dstWriteTransition = m_colorCopyLayout.plan(
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstWriteTransition, m_colorCopy->handle(), dstSubresources);
 
   VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
   depInfo.imageMemoryBarrierCount = 2;
   depInfo.pImageMemoryBarriers = barriers;
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_colorCopyLayout, dstWriteTransition, *m_colorCopy, dstSubresources);
 
   VkImageCopy2 copyRegion = {VK_STRUCTURE_TYPE_IMAGE_COPY_2};
   copyRegion.srcSubresource = toLayers(srcView->imageSubresources());
@@ -747,14 +754,16 @@ void War3VolumetricLightPass::copyColor(const Rc<DxvkCommandList>& ctx,
   barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].newLayout = srcLayout;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  const auto dstReadTransition = m_colorCopyLayout.plan(
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      VK_ACCESS_2_SHADER_READ_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstReadTransition, m_colorCopy->handle(), dstSubresources);
 
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_colorCopyLayout, dstReadTransition, *m_colorCopy, dstSubresources);
 
   ctx->track(srcView->image(), DxvkAccess::Read);
   ctx->track(m_colorCopy, DxvkAccess::Write);
@@ -765,7 +774,9 @@ void War3VolumetricLightPass::copyDepth(const Rc<DxvkCommandList>& ctx,
   if (!srcView || !m_depthCopy || !m_depthCopyView)
     return;
 
-  const VkImageLayout srcLayout = srcView->getLayout();
+  const auto srcSubresources = srcView->imageSubresources();
+  const VkImageLayout srcLayout =
+      srcView->image()->queryLayout(srcSubresources);
 
   VkImageMemoryBarrier2 barriers[2] = {};
   for (auto& b : barriers)
@@ -779,21 +790,22 @@ void War3VolumetricLightPass::copyDepth(const Rc<DxvkCommandList>& ctx,
   barriers[0].oldLayout = srcLayout;
   barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].image = srcView->image()->handle();
-  barriers[0].subresourceRange = srcView->imageSubresources();
+  barriers[0].subresourceRange = srcSubresources;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].image = m_depthCopy->handle();
-  barriers[1].subresourceRange = m_depthCopyView->imageSubresources();
+  const auto dstSubresources = m_depthCopyView->imageSubresources();
+  const auto dstWriteTransition = m_depthCopyLayout.plan(
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstWriteTransition, m_depthCopy->handle(), dstSubresources);
 
   VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
   depInfo.imageMemoryBarrierCount = 2;
   depInfo.pImageMemoryBarriers = barriers;
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_depthCopyLayout, dstWriteTransition, *m_depthCopy, dstSubresources);
 
   VkImageCopy2 copyRegion = {VK_STRUCTURE_TYPE_IMAGE_COPY_2};
   copyRegion.srcSubresource = toLayers(srcView->imageSubresources());
@@ -817,14 +829,16 @@ void War3VolumetricLightPass::copyDepth(const Rc<DxvkCommandList>& ctx,
   barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   barriers[0].newLayout = srcLayout;
 
-  barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barriers[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+  const auto dstReadTransition = m_depthCopyLayout.plan(
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      VK_ACCESS_2_SHADER_READ_BIT);
+  barriers[1] = war3::render::MakeWar3OwnedImageBarrier(
+      dstReadTransition, m_depthCopy->handle(), dstSubresources);
 
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+  war3::render::CommitWar3OwnedImageLayout(
+      m_depthCopyLayout, dstReadTransition, *m_depthCopy, dstSubresources);
 
   ctx->track(srcView->image(), DxvkAccess::Read);
   ctx->track(m_depthCopy, DxvkAccess::Write);
@@ -1009,20 +1023,21 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   VkExtent3D effectExtent = effectImage->info().extent;
 
   {
-    VkImageMemoryBarrier2 toWrite = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toWrite.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    toWrite.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    toWrite.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    toWrite.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    toWrite.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    toWrite.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toWrite.image = effectImage->handle();
-    toWrite.subresourceRange = m_effectView->imageSubresources();
+    const auto subresources = m_effectView->imageSubresources();
+    const auto transition = m_effectLayout.plan(
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkImageMemoryBarrier2 toWrite =
+        war3::render::MakeWar3OwnedImageBarrier(
+            transition, effectImage->handle(), subresources);
 
     VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &toWrite;
     ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+    war3::render::CommitWar3OwnedImageLayout(
+        m_effectLayout, transition, *m_effectImage, subresources);
   }
 
   VkRenderingAttachmentInfo attachment = {
@@ -1384,20 +1399,21 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   ctx->cmdEndRendering();
 
   {
-    VkImageMemoryBarrier2 toRead = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toRead.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    toRead.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    toRead.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    toRead.image = effectImage->handle();
-    toRead.subresourceRange = m_effectView->imageSubresources();
+    const auto subresources = m_effectView->imageSubresources();
+    const auto transition = m_effectLayout.plan(
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_READ_BIT);
+    VkImageMemoryBarrier2 toRead =
+        war3::render::MakeWar3OwnedImageBarrier(
+            transition, effectImage->handle(), subresources);
 
     VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &toRead;
     ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+    war3::render::CommitWar3OwnedImageLayout(
+        m_effectLayout, transition, *m_effectImage, subresources);
   }
 
   ctx->track(m_effectImage, DxvkAccess::Write);

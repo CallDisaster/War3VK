@@ -26,7 +26,21 @@ class ShadowDepthSynchronizationTests(unittest.TestCase):
     def test_csm_final_transition_waits_for_early_and_late_depth(self) -> None:
         start = self.shadow.index("// 3) Transition shadow map back to read-only")
         end = self.shadow.index("if (terrainCasterMaskEnabled)", start)
-        self._requires_complete_depth_source_scope(self.shadow[start:end])
+        final_transition = self.shadow[start:end]
+        if "MakeWar3OwnedImageBarrier" in final_transition:
+            attach_start = self.shadow.index(
+                "// 2) Transition shadow map to depth attachment"
+            )
+            attach_end = self.shadow.index(
+                "if (terrainCasterMaskEnabled)", attach_start
+            )
+            self._requires_complete_depth_source_scope(
+                self.shadow[attach_start:attach_end]
+            )
+            self.assertIn("shadowMapLayout.plan", final_transition)
+            self.assertIn("CommitWar3OwnedImageLayout", final_transition)
+        else:
+            self._requires_complete_depth_source_scope(final_transition)
 
     def test_point_shadow_normal_and_exception_transitions_match(self) -> None:
         point = self.shadow[self.shadow.index(

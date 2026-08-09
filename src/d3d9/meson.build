@@ -423,6 +423,20 @@ test(
   timeout : 30,
 )
 
+war3_owned_image_layout_test = executable(
+  'war3_owned_image_layout_test',
+  [
+    'war3/render/tests/war3_owned_image_layout_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_owned_image_layout',
+  war3_owned_image_layout_test,
+  timeout : 30,
+)
+
 war3_shadow_arena_lifecycle_test = executable(
   'war3_shadow_arena_lifecycle_test',
   [

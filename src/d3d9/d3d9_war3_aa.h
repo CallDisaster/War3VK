@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d9_war3_pipeline.h"
+#include "war3/render/war3_owned_image_layout.h"
 
 #include "../dxvk/dxvk_hash.h"
 
@@ -47,20 +48,25 @@ namespace dxvk {
         // 中间颜色副本（AA 输入）
         Rc<DxvkImage> m_colorCopy;
         Rc<DxvkImageView> m_colorCopyView;
+        war3::render::War3OwnedImageLayoutState m_colorCopyLayout;
         VkExtent3D m_cachedExtent = {0, 0, 1};
         VkFormat m_cachedFormat = VK_FORMAT_UNDEFINED;
 
         // SMAA 中间缓冲区
         Rc<DxvkImage> m_edgesTex;      // 边缘检测输出 (RG8)
         Rc<DxvkImageView> m_edgesView;
+        war3::render::War3OwnedImageLayoutState m_edgesLayout;
         Rc<DxvkImage> m_blendTex;      // 混合权重输出 (RGBA8)
         Rc<DxvkImageView> m_blendView;
+        war3::render::War3OwnedImageLayoutState m_blendLayout;
 
         // SMAA 查找表纹理
         Rc<DxvkImage> m_areaTex;       // 160x560, RG8
         Rc<DxvkImageView> m_areaView;
+        war3::render::War3OwnedImageLayoutState m_areaLayout;
         Rc<DxvkImage> m_searchTex;     // 64x16, R8
         Rc<DxvkImageView> m_searchView;
+        war3::render::War3OwnedImageLayoutState m_searchLayout;
         bool m_lookupTablesCreated = false;
 
         // Samplers

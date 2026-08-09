@@ -2,6 +2,7 @@
 
 #include "d3d9_war3_light.h"
 #include "d3d9_war3_pipeline.h"
+#include "war3/render/war3_owned_image_layout.h"
 #include "../dxvk/dxvk_hash.h"
 #include "../dxvk/dxvk_buffer.h"
 
@@ -79,16 +80,19 @@ namespace dxvk {
 
         Rc<DxvkImage> m_colorCopy;
         Rc<DxvkImageView> m_colorCopyView;
+        war3::render::War3OwnedImageLayoutState m_colorCopyLayout;
         VkExtent3D m_cachedExtent = {0, 0, 1};
         VkFormat m_cachedFormat = VK_FORMAT_UNDEFINED;
 
         Rc<DxvkImage> m_depthCopy;
         Rc<DxvkImageView> m_depthCopyView;
+        war3::render::War3OwnedImageLayoutState m_depthCopyLayout;
         VkExtent3D m_cachedDepthExtent = {0, 0, 1};
         VkFormat m_cachedDepthFormat = VK_FORMAT_UNDEFINED;
 
         Rc<DxvkImage> m_effectImage;
         Rc<DxvkImageView> m_effectView;
+        war3::render::War3OwnedImageLayoutState m_effectLayout;
         VkExtent3D m_cachedEffectExtent = {0, 0, 1};
         VkFormat m_cachedEffectFormat = VK_FORMAT_UNDEFINED;
 
@@ -96,6 +100,7 @@ namespace dxvk {
         // where no exact point-shadow publication is available.
         Rc<DxvkImage> m_pointShadowFallbackCube;
         Rc<DxvkImageView> m_pointShadowFallbackCubeView;
+        war3::render::War3OwnedImageLayoutState m_pointShadowFallbackLayout;
         bool m_pointShadowFallbackReady = false;
 
         // CSM / 点光 UBO：每帧更新。改为环形缓冲，消除与上一帧 volumetric draw
