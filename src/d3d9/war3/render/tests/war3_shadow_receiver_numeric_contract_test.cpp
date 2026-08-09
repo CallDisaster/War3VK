@@ -26,12 +26,24 @@ bool testCompareFirstSubTexelContinuity() {
   // to the horizontal sub-texel phase. Filtering raw depth first would turn
   // much of this interval into one hard lit result instead.
   constexpr std::array<double, 4> depth = {0.2, 1.0, 0.2, 1.0};
+  constexpr int kExtent = 2048;
   constexpr int kSteps = 2048;
   double previous = -1.0;
-  for (int i = 0; i <= kSteps; i++) {
+  for (int i = 0; i < kSteps; i++) {
     const double phase = static_cast<double>(i) / kSteps;
+    math::ManualCompareFootprint footprint = {};
+    if (!require(math::manualCompareFootprint(
+                     {(0.5 + phase) / kExtent, 1.0 / kExtent},
+                     kExtent, kExtent, footprint),
+                 "2048 manual-compare footprint rejected a finite UV"))
+      return false;
+    if (!require(footprint.p00x == 0 && footprint.p10x == 1 &&
+                     near(footprint.phaseX, phase, 1.0e-12),
+                 "uv * extent - 0.5 no longer produces the shader phase"))
+      return false;
     const double visibility =
-      math::manualCompareLinear2x2(depth, 0.5, phase, 0.5);
+      math::manualCompareLinear2x2(
+          depth, 0.5, footprint.phaseX, footprint.phaseY);
     if (!require(near(visibility, phase, 1.0e-12),
                  "compare-first fallback lost sub-texel linearity"))
       return false;
@@ -40,7 +52,56 @@ bool testCompareFirstSubTexelContinuity() {
       return false;
     previous = visibility;
   }
+
+  math::ManualCompareFootprint left = {};
+  math::ManualCompareFootprint right = {};
+  if (!require(math::manualCompareFootprint(
+                   {0.0, 0.0}, kExtent, kExtent, left) &&
+                   math::manualCompareFootprint(
+                   {1.0, 1.0}, kExtent, kExtent, right),
+               "manual-compare edge footprints were rejected"))
+    return false;
+  if (!require(left.p00x == 0 && left.p10x == 0 && left.p00y == 0 &&
+                   left.p01y == 0 && right.p00x == kExtent - 1 &&
+                   right.p10x == kExtent - 1 &&
+                   right.p00y == kExtent - 1 && right.p01y == kExtent - 1,
+               "manual-compare edge clamp does not match shader texel clamp"))
+    return false;
   return true;
+}
+
+bool testRowMajorReceiverPlaneYFlip() {
+  math::RowMajorMat4 lightViewProj = {};
+  lightViewProj.rows[0] = {2.0, 0.0, 0.0, 0.0};
+  lightViewProj.rows[1] = {0.0, 3.0, 0.0, 0.0};
+  lightViewProj.rows[2] = {0.0, 0.0, 4.0, 0.0};
+  lightViewProj.rows[3] = {0.5, -0.25, 0.75, 1.0};
+  math::ReceiverPlaneDifferentials differentials = {};
+  if (!require(math::receiverPlaneDifferentialsRowMajor(
+                   lightViewProj, {1.0, 2.0, 3.0}, {0.25, -0.5, 0.75},
+                   {-0.5, 0.25, -0.5}, differentials),
+               "finite row-major light differential was rejected"))
+    return false;
+  // Hand-derived from row-vector multiplication: ndcDx=(0.5,-1.5,3),
+  // ndcDy=(-1,0.75,-2). The negative half Y is intentional and must not
+  // silently turn into +0.5 * ndcY.
+  if (!require(near(differentials.uvDx.x, 0.25) &&
+                   near(differentials.uvDx.y, 0.75) &&
+                   near(differentials.uvDy.x, -0.5) &&
+                   near(differentials.uvDy.y, -0.375) &&
+                   near(differentials.depthDx, 3.0) &&
+                   near(differentials.depthDy, -2.0),
+               "row-major NDC-to-UV differential lost the fixed Y flip"))
+    return false;
+  Vec2 gradient = {};
+  if (!require(math::receiverPlaneDepthGradient(
+                   differentials.uvDx, differentials.uvDy,
+                   differentials.depthDx, differentials.depthDy, gradient),
+               "row-major receiver-plane gradient was rejected"))
+    return false;
+  return require(near(gradient.x, 4.0 / 3.0) &&
+                     near(gradient.y, 32.0 / 9.0),
+                 "row-major receiver-plane gradient disagrees with oracle");
 }
 
 bool testReceiverPlaneSignedSlopeAndAtomicFallback() {
@@ -80,11 +141,21 @@ bool testReceiverPlaneSignedSlopeAndAtomicFallback() {
   if (!require(!math::receiverPlaneKernelValid({0.25, -0.25}, 0.01),
                "unsafe whole kernel was accepted"))
     return false;
-  if (!require(near(math::receiverPlaneTapReference(
-                         0.42, {0.25, -0.25}, {0.25, -0.25}, false),
-                      0.42),
-               "fallback changed only some taps instead of the whole kernel"))
+  const std::array<Vec2, 4> kernelOffsets = {
+    Vec2{-0.01, -0.01}, Vec2{0.01, -0.01},
+    Vec2{-0.01, 0.01}, Vec2{0.01, 0.01},
+  };
+  const bool kernelValid = math::receiverPlaneKernelValid(
+      {0.25, -0.25}, 0.01);
+  if (!require(!kernelValid, "unsafe whole kernel was accepted"))
     return false;
+  for (const Vec2 offset : kernelOffsets) {
+    if (!require(near(math::receiverPlaneTapReference(
+                           0.42, offset, {0.25, -0.25}, kernelValid),
+                       0.42),
+                 "fallback changed only some taps instead of the whole kernel"))
+      return false;
+  }
   return true;
 }
 
@@ -122,12 +193,41 @@ bool testCascadeBoundaryContinuityAndInvalidNextFallback() {
                  "invalid next cascade blended a synthetic lit sample");
 }
 
+bool testCascadeProjectionDecisionChain() {
+  const math::Vec4 valid = {0.0, 0.0, 0.5, 1.0};
+  const math::Vec4 invalidW = {0.0, 0.0, 0.5, 0.0};
+  const math::Vec4 invalidNdc = {0.0, 0.0, 1.5, 1.0};
+  const math::Vec4 invalidUv = {1.5, 0.0, 0.5, 1.0};
+  const math::Vec4 invalidFinite = {
+    std::numeric_limits<double>::quiet_NaN(), 0.0, 0.5, 1.0,
+  };
+  if (!require(math::cascadeProjectionValid(valid),
+               "valid cascade projection was rejected"))
+    return false;
+  for (const math::Vec4 invalid : {
+           invalidW, invalidNdc, invalidUv, invalidFinite,
+       }) {
+    if (!require(!math::cascadeProjectionValid(invalid),
+                 "clip/NDC/UV invalid projection was accepted"))
+      return false;
+    if (!require(near(math::blendCascadeVisibility(
+                           0.31, 0.79, 99.0, 100.0, 20.0,
+                           math::cascadeProjectionValid(invalid)),
+                       0.31),
+                 "invalid next cascade did not retain primary visibility"))
+      return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int main() {
   if (!testCompareFirstSubTexelContinuity() ||
+      !testRowMajorReceiverPlaneYFlip() ||
       !testReceiverPlaneSignedSlopeAndAtomicFallback() ||
-      !testCascadeBoundaryContinuityAndInvalidNextFallback())
+      !testCascadeBoundaryContinuityAndInvalidNextFallback() ||
+      !testCascadeProjectionDecisionChain())
     return 1;
   std::cout << "war3_shadow_receiver_numeric_contract_test: PASS\n";
   return 0;

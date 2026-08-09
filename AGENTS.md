@@ -89,7 +89,8 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 - 同一调查确认现有 3794 帧取证全为 4096 DirectInline，阴影边缘持续爬动并非 Temporal 或自适应
   降档所致；首要源码嫌疑是 CSM 先线性过滤原始深度再比较，以及默认周期性世界坐标 Poisson 旋转。
   compare-first PCF、固定对称核和关闭周期旋转已在候选中实现；2026-08-10 又统一了 Direct/Prepass
-  的 PCSS、级联失效回退及 receiver-plane 数值合同。仍未获得玩家物理复审，不能描述为视觉问题已修复；
+  的 PCSS、级联失效回退、receiver-plane 数值合同、non-uniform 控制流前的导数和 UBO fail-soft。
+  仍未获得玩家物理复审，不能描述为视觉问题已修复；
   详见 `docs/agent-history/2026-08-10-issue4-receiver-prepass-numeric-contract.md`。
 - Issue #5 的地形级联剔除现为默认关闭的 `Off / Observe / Consume` 合同；只有同帧、同代且来自
   已验证 position span 的精确 bounds 才能授权 C2/C3 剔除，猜测或陈旧 bounds 一律 fail-visible。

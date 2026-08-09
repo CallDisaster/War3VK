@@ -49,6 +49,10 @@ bool validFloat(float v) {
   return (v == v) && abs(v) < 1.0e20;
 }
 
+bool validVec2(vec2 v) {
+  return validFloat(v.x) && validFloat(v.y);
+}
+
 bool validVec3(vec3 v) {
   return validFloat(v.x) && validFloat(v.y) && validFloat(v.z);
 }
@@ -56,6 +60,20 @@ bool validVec3(vec3 v) {
 bool validVec4(vec4 v) {
   return validFloat(v.x) && validFloat(v.y) &&
          validFloat(v.z) && validFloat(v.w);
+}
+
+// These values become texture offsets, array-loop bounds, and (after the
+// proof below) integer cascade/kernel selectors. Keep the proof shared with
+// the direct receiver so a malformed UBO always means "no directional
+// shadow", never an undefined float-to-int conversion or sample offset.
+bool directionalCsmParamsValid() {
+  return validFloat(ubo.u_params.w) &&
+         ubo.u_params.w >= 1.0 && ubo.u_params.w <= 4.0 &&
+         validFloat(ubo.u_params.z) && ubo.u_params.z > 0.0 &&
+         validFloat(ubo.u_params6.x) &&
+         ubo.u_params6.x >= 0.0 && ubo.u_params6.x <= 3.0 &&
+         validFloat(ubo.u_params6.z) &&
+         ubo.u_params6.z >= 0.0 && ubo.u_params6.z <= 1.0;
 }
 
 float shadowMapDepth(uint cascadeIndex, vec2 uv) {
@@ -275,8 +293,10 @@ float computePcssRadius(uint cascadeIndex, vec2 uv, float refDepth,
   float minRadius = max(ubo.u_params4.x, 0.0);
   float maxRadius = max(ubo.u_params4.y, minRadius);
   float depthScale = max(ubo.u_params4.z, 0.0);
-  int searchKernel = int(ubo.u_params6.z + 0.5);
-  int searchExtent = searchKernel > 0 ? 2 : 1;
+  if (!validFloat(ubo.u_params6.z) || ubo.u_params6.z < 0.0 ||
+      ubo.u_params6.z > 1.0)
+    return radius;
+  int searchExtent = ubo.u_params6.z > 0.5 ? 2 : 1;
   if (!validFloat(invRes) || invRes <= 0.0 ||
       !validFloat(searchRadius) || !validFloat(minRadius) ||
       !validFloat(maxRadius) || !validFloat(depthScale))
@@ -401,14 +421,16 @@ float sampleShadowPcf(uint cascadeIndex, vec2 uv, float refDepth,
                       float radiusTexel, vec2 rot,
                       vec2 receiverPlaneGradient,
                       bool receiverPlaneValid) {
-  int kernel = int(ubo.u_params6.x + 0.5);
-  if (kernel == 1)
+  float kernel = ubo.u_params6.x;
+  if (!validFloat(kernel) || kernel < 0.0 || kernel > 3.0)
+    return 1.0;
+  if (kernel >= 0.5 && kernel < 1.5)
     return sampleShadowGrid(cascadeIndex, uv, refDepth, radiusTexel, 2,
                             receiverPlaneGradient, receiverPlaneValid);
-  if (kernel == 2)
+  if (kernel >= 1.5 && kernel < 2.5)
     return sampleShadowPoisson16(cascadeIndex, uv, refDepth, radiusTexel, rot,
                                  receiverPlaneGradient, receiverPlaneValid);
-  if (kernel == 3)
+  if (kernel >= 2.5)
     return sampleShadowPoisson25(cascadeIndex, uv, refDepth, radiusTexel, rot,
                                  receiverPlaneGradient, receiverPlaneValid);
   return sampleShadowGrid(cascadeIndex, uv, refDepth, radiusTexel, 1,
@@ -443,11 +465,9 @@ float sampleShadowCross5(uint cascadeIndex, vec2 uv, float refDepth, float radiu
   return sum * 0.2;
 }
 
-vec3 computeViewNormal(vec3 viewPos) {
+vec3 computeViewNormal(vec3 viewPos, vec3 viewDx, vec3 viewDy) {
   // Use derivatives for stable slope estimation on steep walls and props.
-  vec3 dX = dFdx(viewPos);
-  vec3 dY = dFdy(viewPos);
-  vec3 normV_raw = cross(dY, dX);
+  vec3 normV_raw = cross(viewDy, viewDx);
   float n2 = dot(normV_raw, normV_raw);
   vec3 normV =
       (n2 > 1e-14) ? (normV_raw * inversesqrt(n2)) : vec3(0.0, 0.0, 1.0);
@@ -508,16 +528,18 @@ float computeWallFilterWeight(float wallFactor, float wallStabilityFactor,
 float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
                               float viewDepth, float biasExtra, vec2 rot,
                               float wallFilterWeight) {
-  const bool diagnoseCsm = int(ubo.u_params2.z + 0.5) == 9;
+  const bool diagnoseCsm = validFloat(ubo.u_params2.z) &&
+      ubo.u_params2.z >= 8.5 && ubo.u_params2.z < 9.5;
   if (!validVec3(worldPos) || !validVec3(worldDx) || !validVec3(worldDy) ||
       !validFloat(viewDepth) || !validFloat(biasExtra) ||
       !validFloat(wallFilterWeight))
     return diagnoseCsm ? 0.0 : 1.0;
-  if (!validFloat(ubo.u_params.w) || !validFloat(ubo.u_params2.x) ||
+  if (!directionalCsmParamsValid() ||
+      !validFloat(ubo.u_params2.x) ||
       !validFloat(ubo.u_params2.y) || !validFloat(ubo.u_params4.w) ||
       !validFloat(ubo.u_params6.w))
     return diagnoseCsm ? 0.0 : 1.0;
-  int cascadeCount = clamp(int(ubo.u_params.w), 1, 4);
+  int cascadeCount = int(ubo.u_params.w);
 
   float splits[4];
   splits[0] = ubo.u_splitFar.x;
@@ -636,50 +658,102 @@ void main() {
     ivec3(pix, layer),
     0).r;
 
+  // Derivatives are undefined in non-uniform control flow. Build finite,
+  // branchless-safe reconstruction candidates before *any* per-pixel return,
+  // then keep the visibility pass fail-soft below. Invalid data contributes a
+  // zero derivative candidate and never reaches a sample coordinate, array
+  // index, or float-to-int conversion.
+  vec2 rawVpMin = ubo.u_viewport.xy;
+  vec2 rawVpSize = ubo.u_viewport.zw;
+  bool viewportValid = validVec2(rawVpMin) && validVec2(rawVpSize);
+  vec2 vpMin = viewportValid ? rawVpMin : vec2(0.0);
+  vec2 vpSize = max(viewportValid ? rawVpSize : vec2(1.0), vec2(1.0));
+  bool depthValid = validFloat(depth);
+  float safeDepth = depthValid ? depth : 0.0;
+  float minZ = ubo.u_viewportZ.x;
+  float maxZ = ubo.u_viewportZ.y;
+  bool depthRangeValid = validFloat(minZ) && validFloat(maxZ);
+  float safeMinZ = validFloat(minZ) ? minZ : 0.0;
+  float safeMaxZ = validFloat(maxZ) ? maxZ : 1.0;
+  float depthSpan = safeMaxZ - safeMinZ;
+  bool normalizedDepth = depthRangeValid && abs(depthSpan) > 1e-6;
+  float safeDepthSpan = normalizedDepth ? depthSpan : 1.0;
+  float depthNCandidate = normalizedDepth
+      ? (safeDepth - safeMinZ) / safeDepthSpan
+      : safeDepth;
+  depthNCandidate = clamp(depthNCandidate, 0.0, 1.0);
+  vec2 uvVpCandidate = (vec2(pix) - vpMin) / vpSize;
+  vec4 clipCandidate = vec4(
+      uvVpCandidate.x * 2.0 - 1.0,
+      1.0 - uvVpCandidate.y * 2.0,
+      depthNCandidate, 1.0);
+  vec4 worldHCandidate = clipCandidate * ubo.u_invViewProj;
+  bool worldHCandidateValid = validVec4(worldHCandidate) &&
+      abs(worldHCandidate.w) >= 1e-6;
+  float safeWorldW = worldHCandidateValid ? worldHCandidate.w : 1.0;
+  vec3 worldPosCandidate = worldHCandidateValid
+      ? worldHCandidate.xyz / safeWorldW
+      : vec3(0.0);
+  bool worldPosCandidateValid = worldHCandidateValid &&
+      validVec3(worldPosCandidate);
+  vec3 safeWorldPos = worldPosCandidateValid
+      ? worldPosCandidate : vec3(0.0);
+  vec4 viewHCandidate = vec4(safeWorldPos, 1.0) * ubo.u_view;
+  bool viewHCandidateValid = validVec4(viewHCandidate);
+  vec3 viewPosCandidate = viewHCandidateValid
+      ? viewHCandidate.xyz : vec3(0.0);
+  float viewDepthCandidate = viewHCandidateValid
+      ? abs(viewHCandidate.z) : 0.0;
+  bool viewDepthCandidateValid = viewHCandidateValid &&
+      validFloat(viewDepthCandidate);
+  float safeFarSplitForDepth = validFloat(ubo.u_splitFar.w)
+      ? max(ubo.u_splitFar.w, 1e-4) : 1e-4;
+  float linearDepthCandidate = clamp(
+      viewDepthCandidate / safeFarSplitForDepth, 0.0, 1.0);
+  vec3 worldDx = dFdx(safeWorldPos);
+  vec3 worldDy = dFdy(safeWorldPos);
+  vec3 viewDx = dFdx(viewPosCandidate);
+  vec3 viewDy = dFdy(viewPosCandidate);
+  float linearDepthDx = dFdx(linearDepthCandidate);
+  float linearDepthDy = dFdy(linearDepthCandidate);
+
   // 仅对主世界 viewport 区域做阴影处理，避免影响 UI/空白区域
-  vec2 vpMin  = ubo.u_viewport.xy;
-  vec2 vpSize = max(ubo.u_viewport.zw, vec2(1.0));
-  if (float(pix.x) < vpMin.x || float(pix.y) < vpMin.y ||
+  if (!depthValid || !viewportValid || !depthRangeValid ||
+      float(pix.x) < vpMin.x || float(pix.y) < vpMin.y ||
       float(pix.x) >= (vpMin.x + vpSize.x) ||
       float(pix.y) >= (vpMin.y + vpSize.y)) {
     o_vis = 1.0;
     return;
   }
 
-  float minZ = ubo.u_viewportZ.x;
-  float maxZ = ubo.u_viewportZ.y;
-  float depthN = depth;
-  if (abs(maxZ - minZ) > 1e-6) {
-    depthN = (depth - minZ) / (maxZ - minZ);
-  }
-  depthN = clamp(depthN, 0.0, 1.0);
+  float depthN = depthNCandidate;
 
   // 以 viewport 为基准重建 NDC（与 receiver 保持一致）
-  vec2 uvVp = (vec2(pix) - vpMin) / vpSize;
-  vec4 clip = vec4(uvVp.x * 2.0 - 1.0, 1.0 - uvVp.y * 2.0, depthN, 1.0);
+  vec2 uvVp = uvVpCandidate;
+  vec4 clip = clipCandidate;
 
-  vec4 worldH = clip * ubo.u_invViewProj;
-  if (!validVec4(worldH) || abs(worldH.w) < 1e-6) {
+  vec4 worldH = worldHCandidate;
+  if (!worldHCandidateValid) {
     o_vis = 1.0;
     return;
   }
-  vec3 worldPos = worldH.xyz / worldH.w;
-  if (!validVec3(worldPos)) {
+  vec3 worldPos = worldPosCandidate;
+  if (!worldPosCandidateValid) {
     o_vis = 1.0;
     return;
   }
 
-  vec4 viewH = vec4(worldPos, 1.0) * ubo.u_view;
-  if (!validVec4(viewH)) {
+  vec4 viewH = viewHCandidate;
+  if (!viewHCandidateValid) {
     o_vis = 1.0;
     return;
   }
-  float viewDepth = abs(viewH.z);
-  if (!validFloat(viewDepth)) {
+  float viewDepth = viewDepthCandidate;
+  if (!viewDepthCandidateValid) {
     o_vis = 1.0;
     return;
   }
-  vec3 viewPos = viewH.xyz;
+  vec3 viewPos = viewPosCandidate;
 
   float receiverMode = ubo.u_params5.w;
   float normalBiasScale = max(ubo.u_params5.x, 0.0);
@@ -687,7 +761,7 @@ void main() {
   bool needNormal = true;
   vec3 normV = vec3(0.0, 0.0, 1.0);
   if (needNormal) {
-    normV = computeViewNormal(viewPos);
+    normV = computeViewNormal(viewPos, viewDx, viewDy);
   }
   vec3 lightDirV = vec3(0.0, 0.0, 1.0);
   if (needNormal) {
@@ -706,7 +780,9 @@ void main() {
   float wallFilterWeight = computeWallFilterWeight(
       wallFactor, wallStabilityFactor, lightGrazingFactor,
       viewGrazingFactor);
-  if (receiverMode > 0.5 && normalBiasScale > 0.0) {
+  bool directionalCsmValid = directionalCsmParamsValid();
+  if (directionalCsmValid && receiverMode > 0.5 &&
+      normalBiasScale > 0.0) {
     float ndotl = abs(dot(normV, lightDirV));
 
     // Keep non-zero bias in far cascades to prevent wall-striping acne.
@@ -741,8 +817,6 @@ void main() {
   // Direct and prepass share one deterministic, zero-centroid kernel. A
   // periodic rotation field in either source becomes visible edge crawl.
 
-  vec3 worldDx = dFdx(worldPos);
-  vec3 worldDy = dFdy(worldPos);
   o_vis = computeShadowVisibility(
       worldPos, worldDx, worldDy, viewDepth, biasExtra, pcfRot,
       wallFilterWeight);
