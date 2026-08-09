@@ -34322,6 +34322,9 @@ D3D9DeviceEx::ResetEx(D3DPRESENT_PARAMETERS *pPresentationParameters,
                       D3DDISPLAYMODEEX *pFullscreenDisplayMode) {
   D3D9DeviceLock lock = LockDevice();
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.ResetEx"))
+    return D3DERR_DEVICEREMOVED;
+
   HRESULT hr;
   if (likely(m_deviceType != D3DDEVTYPE_NULLREF)) {
     hr = m_parent->ValidatePresentationParametersEx(pPresentationParameters,
@@ -34357,6 +34360,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateAdditionalSwapChainEx(
 
   if (ppSwapChain == nullptr || pPresentationParameters == nullptr)
     return D3DERR_INVALIDCALL;
+
+  if (CheckVulkanDeviceLostFailStop(
+          "D3D9Device.CreateAdditionalSwapChainEx"))
+    return D3DERR_DEVICEREMOVED;
 
   // Additional fullscreen swapchains are forbidden.
   if (!pPresentationParameters->Windowed)

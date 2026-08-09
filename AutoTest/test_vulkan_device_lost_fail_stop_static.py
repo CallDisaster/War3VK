@@ -81,6 +81,46 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         )
         self.assertIn("D3DERR_DEVICEREMOVED", cooperative)
 
+    def test_d3d9ex_reset_and_additional_swapchain_fail_stop(self):
+        reset_ex = function_body(DEVICE_CPP, "D3D9DeviceEx::ResetEx(")
+        reset_gate = reset_ex.index(
+            'CheckVulkanDeviceLostFailStop("D3D9Device.ResetEx")'
+        )
+        validate = reset_ex.index("ValidatePresentationParametersEx")
+        reset_swapchain = reset_ex.index("ResetSwapChain")
+        reset_gpu_skin = reset_ex.index("War3ResetGpuSkinDeviceEpoch")
+
+        self.assertLess(reset_ex.index("D3D9DeviceLock lock = LockDevice();"), reset_gate)
+        self.assertLess(reset_gate, validate)
+        self.assertLess(reset_gate, reset_swapchain)
+        self.assertLess(reset_gate, reset_gpu_skin)
+        terminal_reset = reset_ex[reset_gate:validate]
+        self.assertIn("return D3DERR_DEVICEREMOVED;", terminal_reset)
+
+        additional = function_body(
+            DEVICE_CPP, "D3D9DeviceEx::CreateAdditionalSwapChainEx"
+        )
+        init = additional.index("InitReturnPtr(ppSwapChain);")
+        null_check = additional.index(
+            "ppSwapChain == nullptr || pPresentationParameters == nullptr"
+        )
+        additional_gate = additional.index(
+            '"D3D9Device.CreateAdditionalSwapChainEx"'
+        )
+        window_check = additional.index("if (!pPresentationParameters->Windowed)")
+        invalidate = additional.index("m_implicitSwapchain->Invalidate")
+        allocate = additional.index("new D3D9SwapChainEx")
+
+        self.assertLess(init, null_check)
+        self.assertLess(null_check, additional_gate)
+        self.assertLess(additional_gate, window_check)
+        self.assertLess(additional_gate, invalidate)
+        self.assertLess(additional_gate, allocate)
+        terminal_additional = additional[additional_gate:window_check]
+        self.assertIn("return D3DERR_DEVICEREMOVED;", terminal_additional)
+        self.assertNotIn("*ppSwapChain =", terminal_additional)
+        self.assertIn("if (unlikely(IsDeviceLost()))", additional)
+
     def test_command_stream_is_dropped_and_sequences_still_drain(self):
         self.assertRegex(
             DEVICE_H,

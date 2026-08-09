@@ -93,6 +93,9 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 - 2026-08-10 的 TDR P2 候选在已锁存的设备丢失后拒绝新的 D3D9 shader、PipelineManager 与
   compiler-worker 工作，并 CPU 排空既有 worker entry；它不把 pipeline 编译失败解释为 device loss，
   仅完成离线合同/构建，详见 `docs/agent-history/2026-08-10-tdr-p2-pipeline-compiler-drain.md`。
+- 2026-08-10 的 TDR P3 候选将同一不可逆 fail-stop 语义补到 D3D9Ex `ResetEx` 和额外 swapchain
+  创建入口，终态时不再重建原 Vulkan device；仅完成离线合同/构建，详见
+  `docs/agent-history/2026-08-10-tdr-p3-d3d9ex-reset-fail-stop.md`。
 - 同一调查确认现有 3794 帧取证全为 4096 DirectInline，阴影边缘持续爬动并非 Temporal 或自适应
   降档所致；首要源码嫌疑是 CSM 先线性过滤原始深度再比较，以及默认周期性世界坐标 Poisson 旋转。
   compare-first PCF、固定对称核和关闭周期旋转已在候选中实现；2026-08-10 又统一了 Direct/Prepass
