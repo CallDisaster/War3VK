@@ -4,6 +4,7 @@
 #include "d3d9_war3_csm.h"
 #include "war3/render/war3_outline_mask_layout.h"
 #include "war3/render/war3_point_shadow_cpu_plan.h"
+#include "war3/render/war3_tracked_vk_pipeline.h"
 
 #include "../dxvk/dxvk_hash.h"
 
@@ -557,6 +558,10 @@ namespace dxvk {
         struct ShadowCasterPipeline {
             const DxvkPipelineLayout* layout = nullptr;
             VkPipeline pipeline = VK_NULL_HANDLE;
+            // Every command list that binds pipeline must track this owner.
+            // Cache invalidation may release its reference immediately; the
+            // VkPipeline is destroyed only after all tracked GPU work retires.
+            Rc<war3::render::War3TrackedVkPipeline> lifetime;
         };
 
         struct PreparedShadowCaster {

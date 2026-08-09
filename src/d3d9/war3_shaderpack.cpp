@@ -8,9 +8,11 @@
 
 #include "war3_shaderpack.h"
 #include "war3_shaderpack_internal.h"
+#include "war3_shaderpack_policy.h"
 #include "d3d9_war3_pipeline.h"
 #include "war3/core/war3_storm.h"
 #include "war3/render/war3_render_state.h"
+#include "war3/render/war3_tracked_vk_pipeline.h"
 
 #include "../dxvk/dxvk_device.h"
 #include "../dxvk/dxvk_buffer.h"
@@ -71,6 +73,7 @@ struct PackPass {
     bool enabled = true;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkFormat pipelineFormat = VK_FORMAT_UNDEFINED;
+    dxvk::Rc<dxvk::war3::render::War3TrackedVkPipeline> pipelineLifetime;
 };
 
 struct PendingTextureUpload {
@@ -117,7 +120,7 @@ struct ShaderPackRuntime {
     std::array<dxvk::Vector4, SHADERPACK_MAX_PARAMS> params = { };
     std::array<dxvk::Rc<dxvk::DxvkImageView>, SHADERPACK_MAX_TEXTURES> textures = { };
     std::vector<PendingTextureUpload> pendingUploads;
-    bool shadowReceiverEnabled = true;
+    bool shadowReceiverEnabled = policy::kRawShaderPackEnabled;
 
     std::string lastErrorMessage;
     ShaderLogCallback logCallback = nullptr;
@@ -151,8 +154,18 @@ void SetError(ShaderPackError error, const std::string& message) {
     }
 }
 
+ShaderPackError RejectRawShaderPackPolicy() {
+    g_runtime.pack.loaded = false;
+    g_runtime.pack.enabled = false;
+    SetError(ShaderPackError::POLICY_DISABLED,
+             policy::kReleaseDisabledMessage);
+    return ShaderPackError::POLICY_DISABLED;
+}
+
 uint32_t BuildPackFlags() {
     uint32_t flags = PACK_FLAG_NONE;
+    if constexpr (!policy::kRawShaderPackEnabled)
+        flags |= PACK_FLAG_POLICY_DISABLED;
     if (g_runtime.pack.loaded) {
         flags |= PACK_FLAG_LOADED;
     }
@@ -302,17 +315,12 @@ bool HasValidSpirv(const std::vector<uint32_t>& spirv) {
     return spirv[0] == 0x07230203u;
 }
 
-void DestroyPipeline(VkPipeline pipeline) {
-    if (pipeline == VK_NULL_HANDLE || !g_runtime.device)
-        return;
-    g_runtime.device->vkd()->vkDestroyPipeline(g_runtime.device->vkd()->device(), pipeline, nullptr);
-}
-
 void ClearPack() {
     for (auto& pass : g_runtime.pack.passes) {
-        DestroyPipeline(pass.pipeline);
         pass.pipeline = VK_NULL_HANDLE;
         pass.pipelineFormat = VK_FORMAT_UNDEFINED;
+        // Submitted command lists retain this owner until GPU completion.
+        pass.pipelineLifetime = nullptr;
     }
     g_runtime.pack.passes.clear();
     g_runtime.pack.shadowReceiverSpirv.clear();
@@ -322,14 +330,14 @@ void ClearPack() {
     g_runtime.pack.name.clear();
     g_runtime.pack.path.clear();
     g_runtime.pendingUploads.clear();
-    g_runtime.shadowReceiverEnabled = true;
+    g_runtime.shadowReceiverEnabled = policy::kRawShaderPackEnabled;
 }
 
 void InvalidatePassPipelines() {
     for (auto& pass : g_runtime.pack.passes) {
-        DestroyPipeline(pass.pipeline);
         pass.pipeline = VK_NULL_HANDLE;
         pass.pipelineFormat = VK_FORMAT_UNDEFINED;
+        pass.pipelineLifetime = nullptr;
     }
 }
 
@@ -801,9 +809,12 @@ bool EnsurePassPipeline(PackPass& pass, VkFormat format) {
     if (pass.pipeline != VK_NULL_HANDLE && pass.pipelineFormat == format)
         return true;
 
-    DestroyPipeline(pass.pipeline);
     pass.pipeline = VK_NULL_HANDLE;
     pass.pipelineFormat = VK_FORMAT_UNDEFINED;
+    // Format changes revoke future use only.  The old owner remains held by
+    // every command list that recorded it and destroys the VkPipeline after
+    // the final GPU completion notification.
+    pass.pipelineLifetime = nullptr;
 
     if (!HasValidSpirv(pass.spirv)) {
         return false;
@@ -818,6 +829,10 @@ bool EnsurePassPipeline(PackPass& pass, VkFormat format) {
     state.sampleCount = VK_SAMPLE_COUNT_1_BIT;
 
     pass.pipeline = g_runtime.device->createBuiltInGraphicsPipeline(g_runtime.layout, state);
+    pass.pipelineLifetime = dxvk::war3::render::AdoptWar3TrackedVkPipeline(
+        g_runtime.device, pass.pipeline);
+    if (!pass.pipelineLifetime)
+        pass.pipeline = VK_NULL_HANDLE;
     pass.pipelineFormat = format;
     return pass.pipeline != VK_NULL_HANDLE;
 }
@@ -1106,12 +1121,15 @@ bool LoadPackFromFolder(const std::string& path) {
 //=============================================================================
 
 WAR3_PACK_API ShaderPackError LoadShaderPack(const char* path) {
+    std::lock_guard<std::mutex> lock(g_runtime.mutex);
+    if constexpr (!policy::kRawShaderPackEnabled)
+        return RejectRawShaderPackPolicy();
+
     if (!path || std::strlen(path) == 0) {
         SetError(ShaderPackError::NOT_FOUND, "ShaderPack 路径为空");
         return ShaderPackError::NOT_FOUND;
     }
 
-    std::lock_guard<std::mutex> lock(g_runtime.mutex);
     if (!g_runtime.device) {
         SetError(ShaderPackError::INTERNAL_ERROR, "ShaderPack 运行时未初始化");
         return ShaderPackError::INTERNAL_ERROR;
@@ -1142,6 +1160,9 @@ WAR3_PACK_API ShaderPackError UnloadShaderPack() {
 
 WAR3_PACK_API ShaderPackError ReloadShaderPack() {
     std::lock_guard<std::mutex> lock(g_runtime.mutex);
+    if constexpr (!policy::kRawShaderPackEnabled)
+        return RejectRawShaderPackPolicy();
+
     if (!g_runtime.pack.loaded) {
         SetError(ShaderPackError::NO_PACK_LOADED, "未加载 ShaderPack");
         return ShaderPackError::NO_PACK_LOADED;
@@ -1171,6 +1192,12 @@ WAR3_PACK_API ShaderPackError ReloadShaderPack() {
 WAR3_PACK_API bool EnableShaderPack(bool enable) {
     std::lock_guard<std::mutex> lock(g_runtime.mutex);
     bool prev = g_runtime.pack.enabled;
+    if constexpr (!policy::kRawShaderPackEnabled) {
+        g_runtime.pack.enabled = false;
+        if (enable)
+            RejectRawShaderPackPolicy();
+        return prev;
+    }
     g_runtime.pack.enabled = enable;
     return prev;
 }
@@ -1178,6 +1205,10 @@ WAR3_PACK_API bool EnableShaderPack(bool enable) {
 WAR3_PACK_API bool IsShaderPackLoaded() {
     std::lock_guard<std::mutex> lock(g_runtime.mutex);
     return g_runtime.pack.loaded;
+}
+
+WAR3_PACK_API bool IsRawShaderPackLoadingEnabled() {
+    return policy::kRawShaderPackEnabled;
 }
 
 WAR3_PACK_API ShaderPackError GetShaderPackInfo(ShaderPackInfo* outInfo) {
@@ -1363,6 +1394,7 @@ WAR3_PACK_API const char* GetErrorString(ShaderPackError error) {
         case ShaderPackError::NO_PACK_LOADED: return "NO_PACK_LOADED";
         case ShaderPackError::INVALID_SLOT: return "INVALID_SLOT";
         case ShaderPackError::INTERNAL_ERROR: return "INTERNAL_ERROR";
+        case ShaderPackError::POLICY_DISABLED: return "POLICY_DISABLED";
         default: return "UNKNOWN";
     }
 }
@@ -1421,6 +1453,13 @@ WAR3_PACK_API bool IsShadowReceiverOverrideEnabled() {
 namespace internal {
 void InitShaderPackRuntime(const dxvk::Rc<dxvk::DxvkDevice>& device) {
     std::lock_guard<std::mutex> lock(g_runtime.mutex);
+    if constexpr (!policy::kRawShaderPackEnabled) {
+        g_runtime.pack.lastError = ShaderPackError::POLICY_DISABLED;
+        g_runtime.lastErrorMessage = policy::kReleaseDisabledMessage;
+        g_runtime.shadowReceiverEnabled = false;
+        LogMessage("ShaderPack: raw SPIR-V loading disabled by release policy");
+        return;
+    }
     if (g_runtime.device)
         return;
     g_runtime.device = device;
@@ -1433,6 +1472,11 @@ void InitShaderPackRuntime(const dxvk::Rc<dxvk::DxvkDevice>& device) {
 
 void RunShaderPackPasses(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
                          const dxvk::War3PipelineInput& input) {
+    if constexpr (!policy::kRawShaderPackEnabled) {
+        (void)ctx;
+        (void)input;
+        return;
+    }
     std::lock_guard<std::mutex> lock(g_runtime.mutex);
     if (!g_runtime.device)
         return;
@@ -1575,6 +1619,9 @@ void RunShaderPackPasses(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
         renderInfo.pColorAttachments = &attachment;
 
         ctx->cmdBeginRendering(&renderInfo);
+        // Hot reload and format changes revoke the cache reference, but the
+        // command list retains this owner until the draw completes on GPU.
+        ctx->track(pass.pipelineLifetime);
         ctx->cmdBindPipeline(dxvk::DxvkCmdBuffer::ExecBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass.pipeline);
 
         VkViewport viewport = { 0.0f, 0.0f, float(extent.width), float(extent.height), 0.0f, 1.0f };
@@ -1646,6 +1693,8 @@ void RunShaderPackPasses(const dxvk::Rc<dxvk::DxvkCommandList>& ctx,
 }
 
 const std::vector<uint32_t>* GetShadowReceiverSpirv() {
+    if constexpr (!policy::kRawShaderPackEnabled)
+        return nullptr;
     std::lock_guard<std::mutex> lock(g_runtime.mutex);
     if (!g_runtime.pack.loaded || !g_runtime.pack.enabled)
         return nullptr;

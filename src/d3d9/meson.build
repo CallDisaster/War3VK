@@ -133,6 +133,7 @@ d3d9_src = [
   'war3/render/war3_render_queue_tracker.cpp',
   'war3/render/war3_render_exec_batch.cpp',
   'war3/render/war3_render_state.cpp',
+  'war3/render/war3_tracked_vk_pipeline.cpp',
   'war3/render/war3_upper_layer_shadow.cpp',
   'war3/render/war3_visible_renderables.cpp',
   'war3/render/war3_shadow_capture_frontend.cpp',
@@ -288,6 +289,58 @@ war3_jass_legacy_command_policy_dev_test = executable(
 test(
   'war3_jass_legacy_command_policy_dev',
   war3_jass_legacy_command_policy_dev_test,
+  timeout : 30,
+)
+
+# Raw SPIR-V ShaderPack loading is compile-time developer-only.  Test both the
+# production default-deny policy and the one explicit development capability;
+# the production d3d9 shared library above never receives the enable macro.
+war3_shaderpack_policy_release_test = executable(
+  'war3_shaderpack_policy_release_test',
+  [
+    'war3/render/tests/war3_shaderpack_policy_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shaderpack_policy_release',
+  war3_shaderpack_policy_release_test,
+  timeout : 30,
+)
+
+war3_shaderpack_policy_dev_test = executable(
+  'war3_shaderpack_policy_dev_test',
+  [
+    'war3/render/tests/war3_shaderpack_policy_test.cpp',
+  ],
+  cpp_args            : [
+    '-DWARVK_ENABLE_RAW_SHADERPACK_DEV=1',
+    '-DWARVK_EXPECT_RAW_SHADERPACK_DEV=1',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shaderpack_policy_dev',
+  war3_shaderpack_policy_dev_test,
+  timeout : 30,
+)
+
+# The production pipeline owner uses the same Rc lifetime semantics exercised
+# here: a cache may release immediately, while an in-flight command list holds
+# the final owner until its GPU completion notification.
+war3_tracked_vk_pipeline_test = executable(
+  'war3_tracked_vk_pipeline_test',
+  [
+    'war3/render/tests/war3_tracked_vk_pipeline_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_tracked_vk_pipeline',
+  war3_tracked_vk_pipeline_test,
   timeout : 30,
 )
 

@@ -2158,10 +2158,9 @@ War3ShadowReceiverPass::~War3ShadowReceiverPass() {
     if (kv.second.pipeline != VK_NULL_HANDLE)
       vk->vkDestroyPipeline(vk->device(), kv.second.pipeline, nullptr);
   }
-  for (auto &kv : m_shadowCasterPipelines) {
-    if (kv.second.pipeline != VK_NULL_HANDLE)
-      vk->vkDestroyPipeline(vk->device(), kv.second.pipeline, nullptr);
-  }
+  // Shadow-caster pipelines are command-list-owned.  Releasing the cache
+  // here cannot destroy a pipeline still referenced by submitted GPU work.
+  m_shadowCasterPipelines.clear();
   if (m_motionVectorPipeline != VK_NULL_HANDLE)
     vk->vkDestroyPipeline(vk->device(), m_motionVectorPipeline, nullptr);
   if (m_shadowVisibilityPipeline != VK_NULL_HANDLE)
@@ -2519,6 +2518,10 @@ War3ShadowReceiverPass::createShadowCasterPipeline(
   p.layout = m_shadowCasterLayout;
   p.pipeline =
       m_device->createBuiltInGraphicsPipeline(m_shadowCasterLayout, state);
+  p.lifetime = war3::render::AdoptWar3TrackedVkPipeline(
+      m_device, p.pipeline);
+  if (!p.lifetime)
+    p.pipeline = VK_NULL_HANDLE;
   return p;
 }
 
@@ -3510,6 +3513,21 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
                                              const std::vector<
                                                  const War3ShadowCasterDraw*>*
                                                  replayDrawOverride) {
+  std::vector<const war3::render::War3TrackedVkPipeline*>
+      trackedCasterPipelines;
+  const auto trackCasterPipeline = [&] (const ShadowCasterPipeline& pipeline) {
+    if (!pipeline.lifetime)
+      return;
+    const auto* owner = pipeline.lifetime.ptr();
+    if (std::find(trackedCasterPipelines.begin(),
+                  trackedCasterPipelines.end(), owner) !=
+        trackedCasterPipelines.end())
+      return;
+    // DxvkCommandList releases tracked objects only after GPU completion.
+    ctx->track(pipeline.lifetime);
+    trackedCasterPipelines.push_back(owner);
+  };
+
   war3::tools::SetGpuFlightBreadcrumb(
       war3::tools::GpuFlightBreadcrumb::CsmPreflight);
   if (!m_volumeSunRenderPathActive)
@@ -4537,6 +4555,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       }
 
       if (prep.pipeline.pipeline != boundPipeline) {
+        trackCasterPipeline(prep.pipeline);
         ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
                              VK_PIPELINE_BIND_POINT_GRAPHICS,
                              prep.pipeline.pipeline);
@@ -4964,6 +4983,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         }
 
         if (pipeline.pipeline != boundPipeline) {
+          trackCasterPipeline(pipeline);
           ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
                                VK_PIPELINE_BIND_POINT_GRAPHICS,
                                pipeline.pipeline);
@@ -7083,6 +7103,20 @@ void War3ShadowReceiverPass::renderPointShadow(
     const Rc<DxvkCommandList> &ctx, const War3PipelineInput &input,
     const War3PointLightFrameSnapshot &lightSnapshot,
     const std::vector<const War3ShadowCasterDraw *> *replayDrawsOverride) {
+  std::vector<const war3::render::War3TrackedVkPipeline*>
+      trackedCasterPipelines;
+  const auto trackCasterPipeline = [&] (const ShadowCasterPipeline& pipeline) {
+    if (!pipeline.lifetime)
+      return;
+    const auto* owner = pipeline.lifetime.ptr();
+    if (std::find(trackedCasterPipelines.begin(),
+                  trackedCasterPipelines.end(), owner) !=
+        trackedCasterPipelines.end())
+      return;
+    ctx->track(pipeline.lifetime);
+    trackedCasterPipelines.push_back(owner);
+  };
+
   war3::tools::SetGpuFlightBreadcrumb(
       war3::tools::GpuFlightBreadcrumb::PointShadowPlan);
   war3::tools::ResetGpuFlightPointShadowWork(0u);
@@ -7686,6 +7720,7 @@ void War3ShadowReceiverPass::renderPointShadow(
             ++m_gpuSkinVsShadowDirectStateRejects;
         }
 
+        trackCasterPipeline(pipeline);
         ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
                              VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline);
 
@@ -9008,11 +9043,9 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     m_shadowCasterBiasSlope = casterSlope;
     m_shadowCasterBiasClamp = casterClamp;
 
-    auto vk = m_device->vkd();
-    for (auto &kv : m_shadowCasterPipelines) {
-      if (kv.second.pipeline != VK_NULL_HANDLE)
-        vk->vkDestroyPipeline(vk->device(), kv.second.pipeline, nullptr);
-    }
+    // The old cache entries may already be referenced by submitted command
+    // buffers. Their tracked owners defer vkDestroyPipeline until the last
+    // command list completes; clearing this map only prevents future binds.
     m_shadowCasterPipelines.clear();
   }
   const bool shadowsEnabled = settings->shadows.enabled;
