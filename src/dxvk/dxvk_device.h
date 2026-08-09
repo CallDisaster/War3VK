@@ -249,6 +249,8 @@ namespace dxvk {
      * \returns Device status
      */
     VkResult getDeviceStatus() const {
+      if (m_vkd->driverDeviceLossObserved())
+        return VK_ERROR_DEVICE_LOST;
       const VkResult terminal = m_terminalStatus.load(std::memory_order_acquire);
       return terminal != VK_SUCCESS
         ? terminal
@@ -272,13 +274,7 @@ namespace dxvk {
      * notifyDeviceError and must not be treated as a driver query trigger.
      */
     void notifyDeviceErrorFromDriverResult(VkResult status) noexcept {
-      if (status != VK_ERROR_DEVICE_LOST)
-        return;
-
-      // This provenance bit authorizes the optional diagnostic query, but the
-      // submission and finish threads must never wait for that query before
-      // completing their CPU-side terminal retirement.
-      m_driverDeviceLossObserved.store(true, std::memory_order_release);
+      m_vkd->notifyDeviceErrorFromDriverResult(status);
       notifyDeviceError(status);
     }
 
@@ -290,7 +286,7 @@ namespace dxvk {
      * queue has been allowed to drain its CPU-side retirement work.
      */
     void captureDeviceFaultIfDriverLossObserved() noexcept {
-      if (m_driverDeviceLossObserved.load(std::memory_order_acquire))
+      if (m_vkd->driverDeviceLossObserved())
         m_deviceFault.captureOnce(VK_ERROR_DEVICE_LOST);
     }
 
@@ -783,7 +779,6 @@ namespace dxvk {
     DxvkRecycler<DxvkCommandList, 16> m_recycledCommandLists;
 
     std::atomic<VkResult>       m_terminalStatus = { VK_SUCCESS };
-    std::atomic<bool>           m_driverDeviceLossObserved = { false };
     DxvkDeviceFaultCapture      m_deviceFault;
     DxvkSubmissionQueue         m_submissionQueue;
 

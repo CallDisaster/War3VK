@@ -1,4 +1,5 @@
 #include "../../../../dxvk/dxvk_device_fault.h"
+#include "../../../../vulkan/vulkan_loader.h"
 
 #include <algorithm>
 #include <atomic>
@@ -178,6 +179,26 @@ bool testLostPathDoesNotAllocate() {
   return check(before == after, "lost capture allocated memory");
 }
 
+bool testDeviceLossStateIsMonotonicAndAllocationFree() {
+  dxvk::vk::DeviceLossState state = {};
+  const size_t before = gNewCalls.load(std::memory_order_relaxed);
+
+  state.notifyDeviceErrorFromDriverResult(VK_SUCCESS);
+  state.notifyDeviceErrorFromDriverResult(VK_ERROR_UNKNOWN);
+  const bool ignoredNonLoss = !state.driverDeviceLossObserved();
+
+  state.notifyDeviceErrorFromDriverResult(VK_ERROR_DEVICE_LOST);
+  const bool observedLoss = state.driverDeviceLossObserved();
+  state.notifyDeviceErrorFromDriverResult(VK_SUCCESS);
+  state.notifyDeviceErrorFromDriverResult(VK_ERROR_UNKNOWN);
+  const size_t after = gNewCalls.load(std::memory_order_relaxed);
+
+  return check(ignoredNonLoss, "non-loss result set direct driver-loss state") &&
+    check(observedLoss, "device-loss result did not set direct state") &&
+    check(state.driverDeviceLossObserved(), "direct driver-loss state regressed") &&
+    check(before == after, "direct driver-loss state allocated memory");
+}
+
 }
 
 void* operator new(std::size_t size) {
@@ -217,5 +238,6 @@ int main() {
   passed = testIncompleteClampsAndMarksTruncated() && passed;
   passed = testQueryFailureCompletesWithoutRetry() && passed;
   passed = testLostPathDoesNotAllocate() && passed;
+  passed = testDeviceLossStateIsMonotonicAndAllocationFree() && passed;
   return passed ? 0 : 1;
 }

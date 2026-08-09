@@ -395,17 +395,29 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
             DXVK_DEVICE_H, "void notifyDeviceErrorFromDriverResult"
         )
         self.assertIn(
-            "m_driverDeviceLossObserved.store(true, std::memory_order_release)",
+            "m_vkd->notifyDeviceErrorFromDriverResult(status);",
             driver_entry,
         )
         self.assertIn("notifyDeviceError(status);", driver_entry)
         self.assertNotIn("m_deviceFault.captureOnce", driver_entry)
         self.assertNotIn("vkGetDeviceFaultInfoEXT", driver_entry)
+        self.assertIn("struct DeviceLossState", VULKAN_LOADER)
+        self.assertIn(
+            "m_driverDeviceLossObserved.store(true, std::memory_order_release)",
+            VULKAN_LOADER,
+        )
+        self.assertIn("m_deviceLossState.notifyDeviceErrorFromDriverResult", VULKAN_LOADER)
         capture_entry = function_body(
             DXVK_DEVICE_H, "void captureDeviceFaultIfDriverLossObserved"
         )
-        self.assertIn("m_driverDeviceLossObserved.load", capture_entry)
+        self.assertIn("m_vkd->driverDeviceLossObserved()", capture_entry)
         self.assertIn("m_deviceFault.captureOnce(VK_ERROR_DEVICE_LOST)", capture_entry)
+        device_status = function_body(DXVK_DEVICE_H, "VkResult getDeviceStatus")
+        self.assertLess(
+            device_status.index("m_vkd->driverDeviceLossObserved()"),
+            device_status.index("m_terminalStatus.load"),
+        )
+        self.assertNotIn("m_driverDeviceLossObserved = { false }", DXVK_DEVICE_H)
         self.assertIn("getDeviceFaultSnapshot() const noexcept", DXVK_DEVICE_H)
 
         submit = function_body(QUEUE, "DxvkSubmissionQueue::submitCmdLists")
