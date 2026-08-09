@@ -67,6 +67,8 @@ std::mutex g_shadowDiagnosticsMutex;
 ShadowTaaDiagnostics g_shadowTaaDiagnostics = {};
 CsmResolutionDiagnostics g_csmResolutionDiagnostics = {};
 PointShadowPersistentDiagnostics g_pointShadowPersistentDiagnostics = {};
+war3::render::War3GpuWorkloadGovernorDiagnostics
+    g_gpuWorkloadGovernorDiagnostics = {};
 struct ShadowReplayDiagnosticsAtomic {
   std::atomic<uint64_t> mapEpoch{0u};
   std::atomic<uint64_t> deviceEpoch{0u};
@@ -1964,6 +1966,40 @@ Matrix4 MakeLookAtLH(const Vector4 &eye, const Vector4 &target,
                  -(eye.x * f.x + eye.y * f.y + eye.z * f.z), 1.0f);
   return m;
 }
+
+uint64_t War3ShadowWorkloadVertexCount(
+    const War3ShadowCasterDraw& draw) noexcept {
+  if (!draw.indexed)
+    return draw.vertexCount;
+  if (draw.numVertices != 0u)
+    return draw.numVertices;
+  if (draw.vertexCount != 0u)
+    return draw.vertexCount;
+  // A missing indexed vertex hint must not make the workload look free.
+  return draw.indexCount;
+}
+
+bool AddWar3ShadowWorkloadDraw(
+    war3::render::War3GpuWorkloadCost& cost,
+    const War3ShadowCasterDraw& draw, uint64_t repeatCount) noexcept {
+  return war3::render::War3GpuWorkloadGovernor::addRepeatedDraw(
+      cost, repeatCount, War3ShadowWorkloadVertexCount(draw),
+      draw.indexed ? uint64_t(draw.indexCount) : 0u);
+}
+
+const char* War3GpuWorkloadConsumerName(
+    war3::render::War3GpuWorkloadConsumer consumer) noexcept {
+  switch (consumer) {
+  case war3::render::War3GpuWorkloadConsumer::DirectionalCsm:
+    return "directional-csm";
+  case war3::render::War3GpuWorkloadConsumer::VolumeSun:
+    return "volume-sun";
+  case war3::render::War3GpuWorkloadConsumer::PointShadow:
+    return "point-shadow";
+  default:
+    return "invalid";
+  }
+}
 } // namespace
 
 ShadowTaaDiagnostics QueryShadowTaaDiagnostics() {
@@ -1980,6 +2016,12 @@ PointShadowPersistentDiagnostics
 QueryPointShadowPersistentDiagnostics() {
   std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
   return g_pointShadowPersistentDiagnostics;
+}
+
+war3::render::War3GpuWorkloadGovernorDiagnostics
+QueryWar3GpuWorkloadGovernorDiagnostics() {
+  std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
+  return g_gpuWorkloadGovernorDiagnostics;
 }
 
 ShadowReplayDiagnostics QueryShadowReplayDiagnostics() {
@@ -3668,6 +3710,64 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       std::min<uint32_t>(std::max<uint32_t>(m_csmData.cascadeCount, 1u), 4u);
   if (cascadeCount == 0)
     return false;
+  for (uint32_t cascade = 0u; cascade < cascadeCount; ++cascade) {
+    if (!m_shadowMapLayerViews[cascade] ||
+        (terrainCasterMaskEnabled &&
+         !m_shadowCasterMaskLayerViews[cascade])) {
+      if (!m_volumeSunRenderPathActive) {
+        m_replayValidationFailedThisFrame = true;
+        reconciliation.replayValidationLastReason = static_cast<uint32_t>(
+            war3::render::War3ShadowReplayRejectReason::IncompleteReplayPlan);
+        g_shadowReplayDiagnostics.partialPreventedCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_shadowReplayDiagnostics.lastRejectReason.store(
+            reconciliation.replayValidationLastReason,
+            std::memory_order_release);
+      }
+      ++reconciliation.replayPartialPreventedCount;
+      return false;
+    }
+  }
+
+  // Volume-sun is optional and has no canonical per-cascade culling. Reserve
+  // its complete single-layer replay before matrix upload or any command. The
+  // main CSM waits for its canonical visibility mask below so normal scenes are
+  // not rejected by a replayDraws*4 upper bound.
+  if (m_volumeSunRenderPathActive) {
+    constexpr auto workloadConsumer =
+        war3::render::War3GpuWorkloadConsumer::VolumeSun;
+    war3::render::War3GpuWorkloadCost workloadCost = {};
+    for (const War3ShadowCasterDraw* draw : replayDraws) {
+      if (draw == nullptr ||
+          !AddWar3ShadowWorkloadDraw(workloadCost, *draw, cascadeCount)) {
+        workloadCost.valid = false;
+        break;
+      }
+    }
+    if (!m_gpuWorkloadGovernor.tryReserve(workloadConsumer, cascadeCount,
+                                           workloadCost)) {
+      const auto& governor = m_gpuWorkloadGovernor.diagnostics();
+      static uint32_t s_workloadRejectLogs = 0u;
+      const uint32_t logIndex = s_workloadRejectLogs++;
+      if (logIndex < 16u || (logIndex % 240u) == 0u) {
+        WAR3_RENDER_LOG(
+            "DXVK War3GpuWorkload: reject %s frame=%llu "
+            "request(draw=%llu vertex=%llu index=%llu items=%u) "
+            "used(draw=%llu vertex=%llu index=%llu) reason=%u\n",
+            War3GpuWorkloadConsumerName(workloadConsumer),
+            static_cast<unsigned long long>(input.frameSerial),
+            static_cast<unsigned long long>(workloadCost.draws),
+            static_cast<unsigned long long>(workloadCost.vertices),
+            static_cast<unsigned long long>(workloadCost.indices),
+            cascadeCount,
+            static_cast<unsigned long long>(governor.used.draws),
+            static_cast<unsigned long long>(governor.used.vertices),
+            static_cast<unsigned long long>(governor.used.indices),
+            governor.lastRejectReason);
+      }
+      return false;
+    }
+  }
 
   // 首帧诊断：默认关闭（env DXVK_WAR3_SHADOWMAP_REPLAY_LOG=1 才输出），
   // 避免每次进程启动前 5 帧写日志污染热路径。
@@ -3708,6 +3808,42 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       uint64_t(paletteDesc.buffer.gpuAddress);
 
   const uint32_t objectBase = m_shadowMatrixObjectBase;
+
+  const auto restoreShadowTargetsToRead = [&]() {
+    const VkImageSubresourceRange depthSubresources = {
+        VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u, cascadeCount};
+    const auto depthTransition = shadowMapLayout.plan(
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_READ_BIT);
+    VkImageMemoryBarrier2 toRead =
+        war3::render::MakeWar3OwnedImageBarrier(
+            depthTransition, m_shadowMap->handle(), depthSubresources);
+    VkDependencyInfo depthDep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depthDep.imageMemoryBarrierCount = 1u;
+    depthDep.pImageMemoryBarriers = &toRead;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depthDep);
+    war3::render::CommitWar3OwnedImageLayout(
+        shadowMapLayout, depthTransition, *m_shadowMap, depthSubresources);
+    if (terrainCasterMaskEnabled) {
+      const VkImageSubresourceRange maskSubresources = {
+          VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, cascadeCount};
+      const auto maskTransition = m_shadowCasterMaskLayout.plan(
+          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+          VK_ACCESS_2_SHADER_READ_BIT);
+      VkImageMemoryBarrier2 maskToRead =
+          war3::render::MakeWar3OwnedImageBarrier(
+              maskTransition, m_shadowCasterMask->handle(), maskSubresources);
+      VkDependencyInfo maskDep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      maskDep.imageMemoryBarrierCount = 1u;
+      maskDep.pImageMemoryBarriers = &maskToRead;
+      ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &maskDep);
+      war3::render::CommitWar3OwnedImageLayout(
+          m_shadowCasterMaskLayout, maskTransition, *m_shadowCasterMask,
+          maskSubresources);
+    }
+  };
 
   // capture 的冻结缓冲由 transfer 写入，GPU 蒙皮共享输出页由 compute 写入，
   // VS-S1 的 palette 也由 transfer 写入。阴影重放会同时把它们作为
@@ -3942,40 +4078,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     // Pipeline/material preparation is part of the publication transaction.
     // The old complete contents have not been cleared or drawn over, so put
     // both images back into their sampling layouts and reject the candidate.
-    const VkImageSubresourceRange depthSubresources = {
-        VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u, cascadeCount};
-    const auto depthTransition = shadowMapLayout.plan(
-        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-        VK_ACCESS_2_SHADER_READ_BIT);
-    VkImageMemoryBarrier2 toRead =
-        war3::render::MakeWar3OwnedImageBarrier(
-            depthTransition, m_shadowMap->handle(), depthSubresources);
-    VkDependencyInfo depthDep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    depthDep.imageMemoryBarrierCount = 1u;
-    depthDep.pImageMemoryBarriers = &toRead;
-    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depthDep);
-    war3::render::CommitWar3OwnedImageLayout(
-        shadowMapLayout, depthTransition, *m_shadowMap,
-        depthSubresources);
-    if (terrainCasterMaskEnabled) {
-      const VkImageSubresourceRange maskSubresources = {
-          VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, cascadeCount};
-      const auto maskTransition = m_shadowCasterMaskLayout.plan(
-          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-          VK_ACCESS_2_SHADER_READ_BIT);
-      VkImageMemoryBarrier2 maskToRead =
-          war3::render::MakeWar3OwnedImageBarrier(
-              maskTransition, m_shadowCasterMask->handle(), maskSubresources);
-      VkDependencyInfo maskDep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-      maskDep.imageMemoryBarrierCount = 1u;
-      maskDep.pImageMemoryBarriers = &maskToRead;
-      ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &maskDep);
-      war3::render::CommitWar3OwnedImageLayout(
-          m_shadowCasterMaskLayout, maskTransition, *m_shadowCasterMask,
-          maskSubresources);
-    }
+    restoreShadowTargetsToRead();
     ++reconciliation.replayValidationRejectedCount;
     ++reconciliation.replayPartialPreventedCount;
     reconciliation.replayValidationLastReason = static_cast<uint32_t>(
@@ -4381,6 +4484,64 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
           draw.stage == 1) {
         terrainMaskDrawIndices.push_back(i);
       }
+    }
+  }
+
+  if (!m_volumeSunRenderPathActive) {
+    // Charge only canonical prepared draws retained by each cascade. This is
+    // the exact work the recording loops below can submit, including the
+    // separate Stage1 terrain-mask replay. Reservation remains transactional
+    // and precedes the first BeginRendering/clear/draw command.
+    war3::render::War3GpuWorkloadCost workloadCost = {};
+    uint64_t workloadCascadeItems = 0u;
+    for (const uint32_t drawIndex : sortedDrawIndices) {
+      const auto& draw = *replayDraws[drawIndex];
+      uint32_t visibleCascadeCount = 0u;
+      for (uint32_t cascade = 0u; cascade < cascadeCount; ++cascade) {
+        if (cascadeVisible(drawIndex, cascade))
+          ++visibleCascadeCount;
+      }
+      if (visibleCascadeCount == 0u)
+        continue;
+      workloadCascadeItems += visibleCascadeCount;
+      if (!AddWar3ShadowWorkloadDraw(workloadCost, draw,
+                                     visibleCascadeCount)) {
+        workloadCost.valid = false;
+        break;
+      }
+      if (terrainCasterMaskEnabled &&
+          draw.category == War3RenderState::StageCategory::Terrain &&
+          draw.stage == 1 &&
+          !AddWar3ShadowWorkloadDraw(workloadCost, draw,
+                                     visibleCascadeCount)) {
+        workloadCost.valid = false;
+        break;
+      }
+    }
+    if (!m_gpuWorkloadGovernor.tryReserve(
+            war3::render::War3GpuWorkloadConsumer::DirectionalCsm,
+            std::max<uint64_t>(workloadCascadeItems, 1u), workloadCost)) {
+      restoreShadowTargetsToRead();
+      m_workloadGovernorRejectedThisFrame = true;
+      const auto& governor = m_gpuWorkloadGovernor.diagnostics();
+      static uint32_t s_directionalWorkloadRejectLogs = 0u;
+      const uint32_t logIndex = s_directionalWorkloadRejectLogs++;
+      if (logIndex < 16u || (logIndex % 240u) == 0u) {
+        WAR3_RENDER_LOG(
+            "DXVK War3GpuWorkload: reject directional-csm frame=%llu "
+            "request(draw=%llu vertex=%llu index=%llu items=%llu) "
+            "used(draw=%llu vertex=%llu index=%llu) reason=%u\n",
+            static_cast<unsigned long long>(input.frameSerial),
+            static_cast<unsigned long long>(workloadCost.draws),
+            static_cast<unsigned long long>(workloadCost.vertices),
+            static_cast<unsigned long long>(workloadCost.indices),
+            static_cast<unsigned long long>(workloadCascadeItems),
+            static_cast<unsigned long long>(governor.used.draws),
+            static_cast<unsigned long long>(governor.used.vertices),
+            static_cast<unsigned long long>(governor.used.indices),
+            governor.lastRejectReason);
+      }
+      return false;
     }
   }
 
@@ -5723,6 +5884,10 @@ void War3ShadowReceiverPass::invalidatePointShadowPublishedState() {
   m_pointShadowContentSignature = 0u;
   m_pointShadowPublishedLightGeneration = 0u;
   m_pointShadowPublishedFrameSerial = 0u;
+  m_pointShadowPublishedMapEpoch = 0u;
+  m_pointShadowPublishedDeviceEpoch = 0u;
+  m_pointShadowPublishedResourceGeneration = 0u;
+  m_pointShadowPublishedPolicyRevision = 0u;
   m_pointShadowPublishedLightCount = 0u;
   m_pointShadowPublishedLightIds.fill(0);
 }
@@ -5739,6 +5904,11 @@ bool War3ShadowReceiverPass::pointShadowPublishedStateMatchesCurrentPlan()
       m_pointShadowPublishedFrameSerial <
           m_pointShadowCpuPlan.lightFrameSerial;
   return m_pointShadowCube && m_pointShadowCubeView &&
+         m_pointShadowPublishedMapEpoch == m_shadowMapEpoch &&
+         m_pointShadowPublishedDeviceEpoch == m_shadowDeviceEpoch &&
+         m_pointShadowPublishedResourceGeneration != 0u &&
+         m_pointShadowPublishedResourceGeneration ==
+             m_pointShadowResourceGeneration &&
          m_pointShadowReadyCount > 0u &&
          m_pointShadowCpuPlan.ready &&
          !m_pointShadowCpuPlan.failed &&
@@ -5748,6 +5918,95 @@ bool War3ShadowReceiverPass::pointShadowPublishedStateMatchesCurrentPlan()
              m_pointShadowContentSignature &&
          m_pointShadowCpuPlan.lightGeneration ==
              m_pointShadowPublishedLightGeneration;
+}
+
+bool War3ShadowReceiverPass::holdPointShadowLastCompleteAfterBudgetReject(
+    const War3PipelineInput& input,
+    const War3PointLightFrameSnapshot& lightSnapshot,
+    const War3RenderSettings& settings) {
+  using war3::render::War3GpuPointShadowPublicationIdentity;
+  constexpr uint32_t kCompleteFaceMask = 0x3fu;
+
+  War3GpuPointShadowPublicationIdentity current = {};
+  current.mapEpoch = input.mapEpoch;
+  current.deviceEpoch = input.deviceEpoch;
+  current.resourceGeneration = m_pointShadowResourceGeneration;
+  current.lightGeneration = lightSnapshot.generation;
+  current.settingsRevision =
+      PointShadowPolicySeal(FreezePointShadowSettings(settings));
+  current.resolution = m_pointShadowCpuPlan.resolution;
+  current.capacityLights = m_pointShadowCpuPlan.resourceCapacityLights;
+  current.lightCount = m_pointShadowCpuPlan.shadowLightCount;
+  current.complete = current.lightCount != 0u &&
+      current.lightCount <= kMaxPointShadowLights &&
+      current.lightCount <= lightSnapshot.shadowCount &&
+      lightSnapshot.frameSerial == input.frameSerial &&
+      input.mapEpoch == m_shadowMapEpoch &&
+      input.deviceEpoch == m_shadowDeviceEpoch;
+
+  War3GpuPointShadowPublicationIdentity published = {};
+  published.mapEpoch = m_pointShadowPublishedMapEpoch;
+  published.deviceEpoch = m_pointShadowPublishedDeviceEpoch;
+  published.resourceGeneration = m_pointShadowPublishedResourceGeneration;
+  published.lightGeneration = m_pointShadowPublishedLightGeneration;
+  published.settingsRevision = m_pointShadowPublishedPolicyRevision;
+  published.resolution = m_pointShadowResolution;
+  published.capacityLights = m_pointShadowCapacityLights;
+  published.lightCount = m_pointShadowPublishedLightCount;
+  published.complete = published.lightCount != 0u &&
+      published.lightCount <= kMaxPointShadowLights &&
+      m_pointShadowReadyCount >= published.lightCount;
+
+  const uint32_t currentCount = std::min<uint32_t>(
+      current.lightCount, War3GpuPointShadowPublicationIdentity::kMaxLights);
+  for (uint32_t light = 0u; light < currentCount; ++light) {
+    const auto& source = lightSnapshot.lights[light];
+    current.lights[light] = {
+        source.id, source.position.x, source.position.y, source.position.z,
+        std::max(source.position.w, 1.0f),
+        std::clamp(source.params.x, 0.0f, 1.0f)};
+  }
+
+  const uint32_t publishedCount = std::min<uint32_t>(
+      published.lightCount,
+      War3GpuPointShadowPublicationIdentity::kMaxLights);
+  for (uint32_t light = 0u; light < publishedCount; ++light) {
+    const auto& source = m_pointShadowData[light];
+    published.lights[light] = {
+        m_pointShadowPublishedLightIds[light], source.lightPos.x,
+        source.lightPos.y, source.lightPos.z, source.lightPos.w,
+        source.shadowIntensity};
+    published.complete = published.complete && m_pointShadowReady[light] &&
+        (m_pointShadowFaceValidMask[light] & kCompleteFaceMask) ==
+            kCompleteFaceMask;
+  }
+
+  if (!war3::render::War3GpuCanHoldPointShadowLastComplete(current,
+                                                            published))
+    return false;
+
+  // Turn this rejected update into an explicit reference to the immutable
+  // last-complete cube. No command was recorded and no face validity changed.
+  m_pointShadowCpuPlan.ready = true;
+  m_pointShadowCpuPlan.failed = false;
+  m_pointShadowCpuPlan.shouldRender = false;
+  m_pointShadowCpuPlan.reusePublished = true;
+  m_pointShadowCpuPlan.forceFullFaceUpdate = false;
+  m_pointShadowCpuPlan.shadowLightCount = m_pointShadowPublishedLightCount;
+  m_pointShadowCpuPlan.resourceCapacityLights = m_pointShadowCapacityLights;
+  m_pointShadowCpuPlan.resolution = m_pointShadowResolution;
+  m_pointShadowCpuPlan.lightGeneration = lightSnapshot.generation;
+  m_pointShadowCpuPlan.lightFrameSerial = input.frameSerial;
+  m_pointShadowCpuPlan.contentSignature = m_pointShadowContentSignature;
+  m_pointShadowCpuPlan.updateMask.fill(0u);
+  m_pointShadowCpuPlan.faceCandidateCount.fill(0u);
+  m_pointShadowCpuPlan.faceKeptCount.fill(0u);
+  m_pointShadowCpuPlan.faceDroppedCount.fill(0u);
+  for (auto& faceCasters : m_pointShadowCpuPlan.faceCasters)
+    faceCasters.clear();
+  if (m_pointShadowTemporalAge != std::numeric_limits<uint32_t>::max())
+    ++m_pointShadowTemporalAge;
+  return pointShadowPublishedStateMatchesCurrentPlan();
 }
 
 void War3ShadowReceiverPass::waitPointShadowCpuPrepare() {
@@ -7506,6 +7765,67 @@ void War3ShadowReceiverPass::renderPointShadow(
     return;
   }
 
+  // A point update is one command-recording transaction. Build the cost of
+  // every scheduled complete face first, then reserve the whole batch in one
+  // atomic governor operation. Budget pressure may cancel the optional cube,
+  // but it can never leave a prefix of faces recorded or published.
+  war3::render::War3GpuWorkloadCost pointWorkloadCost = {};
+  uint64_t pointWorkloadFaceCount = 0u;
+  for (uint32_t lightIndex = 0u; lightIndex < shadowLightCount; ++lightIndex) {
+    const uint8_t updateMask = m_pointShadowCpuPlan.updateMask[lightIndex];
+    for (uint32_t face = 0u; face < 6u; ++face) {
+      if ((updateMask & uint8_t(1u << face)) == 0u)
+        continue;
+      ++pointWorkloadFaceCount;
+      const auto& faceCasters =
+          m_pointShadowCpuPlan.faceCasters[lightIndex * 6u + face];
+      for (const uint32_t drawIndex : faceCasters) {
+        if (drawIndex >= replayDraws.size() ||
+            replayDraws[drawIndex] == nullptr ||
+            !AddWar3ShadowWorkloadDraw(pointWorkloadCost,
+                                       *replayDraws[drawIndex], 1u)) {
+          pointWorkloadCost.valid = false;
+          break;
+        }
+      }
+      if (!pointWorkloadCost.valid)
+        break;
+    }
+    if (!pointWorkloadCost.valid)
+      break;
+  }
+  if (!m_gpuWorkloadGovernor.tryReserve(
+          war3::render::War3GpuWorkloadConsumer::PointShadow,
+          pointWorkloadFaceCount, pointWorkloadCost)) {
+    const bool heldLastComplete =
+        holdPointShadowLastCompleteAfterBudgetReject(input, lightSnapshot,
+                                                     *settings);
+    if (!heldLastComplete) {
+      invalidatePointShadowPublishedState();
+      m_pointShadowCpuPlan.shouldRender = false;
+    }
+    m_gpuWorkloadGovernor.notePointShadowBudgetFallback(heldLastComplete);
+    const auto& governor = m_gpuWorkloadGovernor.diagnostics();
+    static uint32_t s_pointWorkloadRejectLogs = 0u;
+    const uint32_t logIndex = s_pointWorkloadRejectLogs++;
+    if (logIndex < 16u || (logIndex % 240u) == 0u) {
+      WAR3_RENDER_LOG(
+          "DXVK War3GpuWorkload: reject point-shadow frame=%llu "
+          "request(draw=%llu vertex=%llu index=%llu faces=%llu) "
+          "used(draw=%llu vertex=%llu index=%llu) reason=%u held=%u\n",
+          static_cast<unsigned long long>(input.frameSerial),
+          static_cast<unsigned long long>(pointWorkloadCost.draws),
+          static_cast<unsigned long long>(pointWorkloadCost.vertices),
+          static_cast<unsigned long long>(pointWorkloadCost.indices),
+          static_cast<unsigned long long>(pointWorkloadFaceCount),
+          static_cast<unsigned long long>(governor.used.draws),
+          static_cast<unsigned long long>(governor.used.vertices),
+          static_cast<unsigned long long>(governor.used.indices),
+          governor.lastRejectReason, heldLastComplete ? 1u : 0u);
+    }
+    return;
+  }
+
   // 不整表清 ready：face budget 下未更新的 face 仍保留上一帧 depth。
   m_pointShadowReadyCount = 0;
 
@@ -7988,6 +8308,12 @@ void War3ShadowReceiverPass::renderPointShadow(
   m_pointShadowPublishedLightGeneration =
       m_pointShadowCpuPlan.lightGeneration;
   m_pointShadowPublishedFrameSerial = input.frameSerial;
+  m_pointShadowPublishedMapEpoch = input.mapEpoch;
+  m_pointShadowPublishedDeviceEpoch = input.deviceEpoch;
+  m_pointShadowPublishedResourceGeneration =
+      m_pointShadowResourceGeneration;
+  m_pointShadowPublishedPolicyRevision =
+      PointShadowPolicySeal(FreezePointShadowSettings(*settings));
   m_pointShadowPublishedLightCount = shadowLightCount;
   m_pointShadowPublishedLightIds.fill(0);
   for (uint32_t lightIndex = 0u; lightIndex < shadowLightCount; ++lightIndex)
@@ -8356,6 +8682,14 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
                                  const War3PipelineInput &input) {
   // [Perf] Add timing scope for Shadow/Outline pass
   auto perfScope = war3::War3PerfMonitor::instance().scope("Shadow/Main", ctx);
+  m_gpuWorkloadGovernor.beginFrame(input.frameSerial);
+  m_workloadGovernorRejectedThisFrame = false;
+  [[maybe_unused]] auto gpuWorkloadDiagnosticsPublish =
+      MakeWar3ScopeExit([&]() {
+        std::lock_guard<std::mutex> lock(g_shadowDiagnosticsMutex);
+        g_gpuWorkloadGovernorDiagnostics =
+            m_gpuWorkloadGovernor.diagnostics();
+      });
   const uint32_t shadowMainPhaseSampleWeight = War3ShadowPhaseSampleWeight(
       input.frameSerial, 0x5a17c93de0428f61ull);
   War3SampledPhaseRawTiming<kWar3ShadowMainRawPhaseCount>
@@ -10245,6 +10579,10 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
   shadowMainPhaseTiming.enter(
       static_cast<size_t>(War3ShadowMainRawPhase::ShadowMapAndVolume));
+  // m_csmData names the matrices paired with the current complete depth map.
+  // A fallible candidate render may temporarily replace it below, so retain
+  // the full value bundle for the bounded same-epoch last-good path.
+  const War3CsmData csmDataBeforeShadowCandidate = m_csmData;
   if (!reuseLastShadowMap && hasCandidateCsm) {
     m_csmData = newCsm;
   }
@@ -10349,20 +10687,23 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
             replayCasterCount != 0u
                 ? dxvk::war3::internal::kShadowTransientEmptyReplayHoldFrames
                 : 0u;
-      } else if (m_replayValidationFailedThisFrame &&
+      } else if ((m_replayValidationFailedThisFrame ||
+                  m_workloadGovernorRejectedThisFrame) &&
                  m_hasCompleteShadowMap &&
                  m_replayValidationHoldFramesRemaining != 0u) {
         // The candidate was rejected before clear/draw. Preserve only the
         // complete map produced by this same receiver epoch, with a strict
         // bounded hold; a new epoch starts with m_hasCompleteShadowMap=false.
         --m_replayValidationHoldFramesRemaining;
+        m_csmData = csmDataBeforeShadowCandidate;
         reconciliation.receiverReuseShadowMap = 1u;
         directionalMapResolvedForFrame = true;
       } else {
         // The same-epoch recovery window is a real upper bound. The old code
         // stopped decrementing at zero but left completeness set forever,
         // allowing a loading-camera CSM to cover the screen indefinitely.
-        if (m_replayValidationFailedThisFrame &&
+        if ((m_replayValidationFailedThisFrame ||
+             m_workloadGovernorRejectedThisFrame) &&
             m_hasCompleteShadowMap &&
             m_replayValidationHoldFramesRemaining == 0u) {
           m_hasCompleteShadowMap = false;

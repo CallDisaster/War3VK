@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 namespace dxvk {
@@ -1149,6 +1150,10 @@ void War3ShadowReceiverPass::ensurePointShadowResources(
   m_pointShadowCapacityLights = capacityLights;
   for (auto& layout : m_pointShadowFaceLayouts)
     layout.reset();
+  m_pointShadowResourceGeneration =
+      m_pointShadowResourceGeneration == std::numeric_limits<uint64_t>::max()
+          ? 0u
+          : m_pointShadowResourceGeneration + 1u;
   // A recreated image contains no valid face data. Keeping the old validity
   // mask would let a low face-budget update sample untouched faces from the
   // new (empty) cube as if they were temporal history.

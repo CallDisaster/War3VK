@@ -3,6 +3,7 @@
 #include "d3d9_war3_pipeline.h"
 #include "d3d9_war3_csm.h"
 #include "war3/render/war3_outline_mask_layout.h"
+#include "war3/render/war3_gpu_workload_governor.h"
 #include "war3/render/war3_point_shadow_cpu_plan.h"
 #include "war3/render/war3_tracked_vk_pipeline.h"
 #include "war3/render/war3_owned_image_layout.h"
@@ -260,6 +261,8 @@ namespace dxvk {
     PointShadowPersistentDiagnostics
     QueryPointShadowPersistentDiagnostics();
     ShadowReplayDiagnostics QueryShadowReplayDiagnostics();
+    war3::render::War3GpuWorkloadGovernorDiagnostics
+    QueryWar3GpuWorkloadGovernorDiagnostics();
     void PublishShadowTaaDiagnostics(const ShadowTaaDiagnostics& diagnostics);
     void PublishCsmResolutionDiagnostics(
         const CsmResolutionDiagnostics& diagnostics);
@@ -790,6 +793,8 @@ namespace dxvk {
         War3CsmData m_csmData;
         bool m_hasCompleteShadowMap = false;
         bool m_replayValidationFailedThisFrame = false;
+        bool m_workloadGovernorRejectedThisFrame = false;
+        war3::render::War3GpuWorkloadGovernor m_gpuWorkloadGovernor;
         uint32_t m_replayValidationHoldFramesRemaining = 0u;
         uint64_t m_epochFirstCandidateFrameSerial = 0u;
         uint64_t m_epochFirstCompleteLatencyFrames = 0u;
@@ -877,6 +882,7 @@ namespace dxvk {
         static constexpr uint32_t kMaxPointShadowLights = 4;  // 限制投射阴影的点光源数量
         uint32_t m_pointShadowResolution = 0;                 // 当前 cube face 分辨率
         uint32_t m_pointShadowCapacityLights = 0;             // 当前 cube array 实际容量（1..4）
+        uint64_t m_pointShadowResourceGeneration = 0;
         Rc<DxvkImage> m_pointShadowCube;                      // Cube Depth Texture
         Rc<DxvkImageView> m_pointShadowCubeView;              // CubeArray 采样视图
         std::array<war3::render::War3OwnedImageLayoutState,
@@ -912,6 +918,10 @@ namespace dxvk {
         // current CPU plan's semantic content signature both match.
         uint64_t m_pointShadowPublishedLightGeneration = 0;
         uint64_t m_pointShadowPublishedFrameSerial = 0;
+        uint64_t m_pointShadowPublishedMapEpoch = 0;
+        uint64_t m_pointShadowPublishedDeviceEpoch = 0;
+        uint64_t m_pointShadowPublishedResourceGeneration = 0;
+        uint64_t m_pointShadowPublishedPolicyRevision = 0;
         uint32_t m_pointShadowPublishedLightCount = 0;
         std::array<int32_t, kMaxPointShadowLights>
             m_pointShadowPublishedLightIds = {};
@@ -1194,6 +1204,10 @@ namespace dxvk {
         /** @brief Whether the current immutable plan names the exact published
          *         cube content/light generation. */
         bool pointShadowPublishedStateMatchesCurrentPlan() const;
+        bool holdPointShadowLastCompleteAfterBudgetReject(
+            const War3PipelineInput& input,
+            const War3PointLightFrameSnapshot& lightSnapshot,
+            const War3RenderSettings& settings);
         /**
          * @brief 点阴影 CPU 计划：签名、face budget、range/face caster 列表。
          * @return false 表示本帧应跳过 GPU cube 渲染（关闭/无灯/时序复用）。

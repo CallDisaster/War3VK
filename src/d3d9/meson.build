@@ -122,6 +122,7 @@ d3d9_src = [
   'war3/render/war3_shadow_producer_policy.cpp',
   'war3/render/war3_shadow_replay_validation.cpp',
   'war3/render/war3_point_shadow_cpu_plan.cpp',
+  'war3/render/war3_gpu_workload_governor.cpp',
   'war3/render/war3_union_consumer_visibility.cpp',
   'war3/render/war3_current_draw_contract.cpp',
   'war3/render/war3_scene_collector.cpp',
@@ -376,6 +377,24 @@ war3_union_consumer_visibility_test = executable(
 test(
   'war3_union_consumer_visibility',
   war3_union_consumer_visibility_test,
+  timeout : 30,
+)
+
+# Pure all-or-nothing shadow workload reservation contract. The runnable has
+# no Vulkan or Warcraft dependency and covers arithmetic overflow as well as
+# per-consumer draw/vertex/index admission.
+war3_gpu_workload_governor_test = executable(
+  'war3_gpu_workload_governor_test',
+  [
+    'war3/render/war3_gpu_workload_governor.cpp',
+    'war3/render/tests/war3_gpu_workload_governor_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_gpu_workload_governor',
+  war3_gpu_workload_governor_test,
   timeout : 30,
 )
 
