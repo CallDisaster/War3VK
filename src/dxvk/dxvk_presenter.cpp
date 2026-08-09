@@ -184,9 +184,7 @@ namespace dxvk {
 
   VkResult Presenter::presentImage(uint64_t frameId, const Rc<DxvkLatencyTracker>& tracker) {
     if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST) {
-      std::lock_guard lock(m_surfaceMutex);
-      m_presentPending = false;
-      m_surfaceCond.notify_one();
+      retireTerminalFrame(frameId, tracker);
       return VK_ERROR_DEVICE_LOST;
     }
 
@@ -296,9 +294,37 @@ namespace dxvk {
   }
 
 
-  void Presenter::signalFrame(
+  void Presenter::retireTerminalFrame(
           uint64_t                frameId,
     const Rc<DxvkLatencyTracker>& tracker) {
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    bool hasPresentWait = false;
+
+    { std::lock_guard lock(m_surfaceMutex);
+      mode = m_presentMode;
+      hasPresentWait = m_hasPresentWait;
+      m_presentPending = false;
+      m_surfaceCond.notify_one();
+    }
+
+    if (!hasPresentWait)
+      return;
+
+    { std::lock_guard lock(m_frameMutex);
+      auto& frame = m_frameQueue.emplace();
+      frame.frameId = frameId;
+      frame.tracker = tracker;
+      frame.mode = mode;
+      frame.result = VK_ERROR_DEVICE_LOST;
+      m_frameCond.notify_one();
+    }
+  }
+
+
+  void Presenter::signalFrame(
+          uint64_t                frameId,
+    const Rc<DxvkLatencyTracker>& tracker,
+          bool                    terminal) {
     if (m_signal == nullptr || !frameId)
       return;
 
@@ -314,7 +340,8 @@ namespace dxvk {
       if (canSignal)
         m_signal->signal(frameId);
     } else {
-      m_fpsLimiter.delay();
+      if (!terminal)
+        m_fpsLimiter.delay();
       m_signal->signal(frameId);
 
       if (tracker)
@@ -1286,6 +1313,9 @@ namespace dxvk {
 
   VkResult Presenter::waitForSwapchainFence(
           PresenterSync&            sync) {
+    if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return VK_ERROR_DEVICE_LOST;
+
     if (!sync.fenceSignaled)
       return VK_SUCCESS;
 
@@ -1335,7 +1365,10 @@ namespace dxvk {
       // If the present operation has succeeded, actually wait for it to complete.
       // Don't bother with it on MAILBOX / IMMEDIATE modes since doing so would
       // restrict us to the display refresh rate on some platforms (XWayland).
-      if (frame.result >= 0 && (frame.mode == VK_PRESENT_MODE_FIFO_KHR || frame.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
+      bool terminal = frame.result == VK_ERROR_DEVICE_LOST
+                   || m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST;
+
+      if (!terminal && frame.result >= 0 && (frame.mode == VK_PRESENT_MODE_FIFO_KHR || frame.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
         VkResult vr;
 
         if (m_device->features().khrPresentWait2.presentWait2) {
@@ -1350,6 +1383,7 @@ namespace dxvk {
         }
 
         m_device->notifyDeviceError(vr);
+        terminal = m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST;
         if (vr < 0 && vr != VK_ERROR_OUT_OF_DATE_KHR && vr != VK_ERROR_SURFACE_LOST_KHR)
           Logger::err(str::format("Presenter: vkWaitForPresentKHR failed: ", vr));
       }
@@ -1364,7 +1398,8 @@ namespace dxvk {
       // Apply FPS limiter here to align it as closely with scanout as we can,
       // and delay signaling the frame latency event to emulate behaviour of a
       // low refresh rate display as closely as we can.
-      m_fpsLimiter.delay();
+      if (!terminal)
+        m_fpsLimiter.delay();
 
       // Wake up any thread that may be waiting for the queue to become empty
       bool canSignal = false;

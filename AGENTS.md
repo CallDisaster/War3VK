@@ -86,6 +86,10 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   `A36253BC63854B4B9F620DE6303B076C5361B8511A3A732D8768459F42A4147F`。前两项视觉修复已有用户
   前台确认，新增运行时安全组合仍未部署或完成 Reset/A→B→A 物理门。详细证据见
   `docs/agent-history/2026-08-09-runtime-safety-and-shadow-edge-research.md`。
+- 2026-08-10 的 TDR terminal-drain 候选让 D3D9 CS 在终态设备丢失时仅等待已派发序号，并让
+  submission/finish/presenter 只做 CPU 收尾、停止新增 GPU/WSI wait；仅通过离线合同和构建，尚无
+  实际 device-lost 注入或玩家前台证据，详见
+  `docs/agent-history/2026-08-10-tdr-terminal-drain.md`。
 - 同一调查确认现有 3794 帧取证全为 4096 DirectInline，阴影边缘持续爬动并非 Temporal 或自适应
   降档所致；首要源码嫌疑是 CSM 先线性过滤原始深度再比较，以及默认周期性世界坐标 Poisson 旋转。
   compare-first PCF、固定对称核和关闭周期旋转已在候选中实现；2026-08-10 又统一了 Direct/Prepass

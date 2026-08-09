@@ -36260,6 +36260,16 @@ void D3D9DeviceEx::ConsiderFlush(GpuFlushType FlushType) {
 void D3D9DeviceEx::SynchronizeCsThread(uint64_t SequenceNumber) {
   D3D9DeviceLock lock = LockDevice();
 
+  // A non-empty, not-yet-dispatched chunk is reported to callers as the
+  // next sequence number. Once the Vulkan device is terminally lost,
+  // FlushCsChunk deliberately drops that chunk instead of dispatching it,
+  // so only wait for a sequence that has actually been submitted.
+  if (unlikely(IsVulkanDeviceLostFailStop())) {
+    FlushCsChunk();
+    m_csThread.synchronize(m_csSeqNum);
+    return;
+  }
+
   // Dispatch current chunk so that all commands
   // recorded prior to this function will be run
   if (SequenceNumber > m_csSeqNum)

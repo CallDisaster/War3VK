@@ -132,6 +132,16 @@ namespace dxvk {
       const Rc<DxvkLatencyTracker>& tracker);
 
     /**
+     * \brief Retires a queued frame without issuing WSI work
+     *
+     * Used by the submission queue after a terminal device loss so that
+     * latency and frame completion bookkeeping can drain on the CPU.
+     */
+    void retireTerminalFrame(
+            uint64_t                frameId,
+      const Rc<DxvkLatencyTracker>& tracker);
+
+    /**
      * \brief Signals a given frame
      *
      * Waits for the present operation to complete and then signals
@@ -143,7 +153,8 @@ namespace dxvk {
      */
     void signalFrame(
             uint64_t                frameId,
-      const Rc<DxvkLatencyTracker>& tracker);
+      const Rc<DxvkLatencyTracker>& tracker,
+            bool                    terminal = false);
 
     /**
      * \brief Changes sync interval

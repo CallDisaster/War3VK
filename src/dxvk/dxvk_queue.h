@@ -221,6 +221,8 @@ namespace dxvk {
     void submitCmdLists();
 
     void finishCmdLists();
+
+    void setQueueError(VkResult status);
     
   };
   

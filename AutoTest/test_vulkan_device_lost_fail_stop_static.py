@@ -14,6 +14,10 @@ PIPELINE = (ROOT / "src/d3d9/d3d9_war3_pipeline.cpp").read_text(
     encoding="utf-8"
 )
 CS_THREAD = (ROOT / "src/dxvk/dxvk_cs.cpp").read_text(encoding="utf-8")
+QUEUE = (ROOT / "src/dxvk/dxvk_queue.cpp").read_text(encoding="utf-8")
+PRESENTER = (ROOT / "src/dxvk/dxvk_presenter.cpp").read_text(
+    encoding="utf-8"
+)
 DIAGNOSTICS = (
     ROOT / "src/d3d9/war3/tools/war3_diagnostics_hub.cpp"
 ).read_text(encoding="utf-8")
@@ -84,6 +88,74 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
             "m_device->getDeviceStatus() != VK_ERROR_DEVICE_LOST", CS_THREAD
         )
         self.assertIn("if (entry.seq)", CS_THREAD)
+
+    def test_lost_cs_sync_waits_only_for_an_emitted_sequence(self):
+        sync = function_body(DEVICE_CPP, "D3D9DeviceEx::SynchronizeCsThread")
+        lost_gate = sync.index("if (unlikely(IsVulkanDeviceLostFailStop()))")
+        normal_flush = sync.index("if (SequenceNumber > m_csSeqNum)")
+        lost_path = sync[lost_gate:normal_flush]
+
+        self.assertIn("FlushCsChunk();", lost_path)
+        self.assertIn("m_csThread.synchronize(m_csSeqNum);", lost_path)
+        self.assertIn("return;", lost_path)
+        self.assertNotIn("m_csThread.synchronize(SequenceNumber);", lost_path)
+
+    def test_terminal_submission_entries_still_finish_on_the_cpu(self):
+        submit = function_body(QUEUE, "DxvkSubmissionQueue::submitCmdLists")
+        finish = function_body(QUEUE, "DxvkSubmissionQueue::finishCmdLists")
+        queue_error = function_body(QUEUE, "DxvkSubmissionQueue::setQueueError")
+
+        first_submit = submit.index("entry.submit.cmdList->submit")
+        first_terminal_gate = submit.index(
+            "m_device->getDeviceStatus() != VK_ERROR_DEVICE_LOST"
+        )
+        self.assertLess(first_terminal_gate, first_submit)
+        self.assertIn("retireTerminalFrame", submit)
+        self.assertIn("m_finishQueue.push(std::move(entry));", submit)
+        self.assertIn("m_submitCond.notify_all();", submit)
+
+        first_timeline_wait = finish.index("vk->vkWaitSemaphores")
+        self.assertLess(
+            finish.index("m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST"),
+            first_timeline_wait,
+        )
+        self.assertIn("status == VK_SUCCESS", finish[:first_timeline_wait])
+        for token in (
+            "entry.submit.cmdList->notifyObjects();",
+            "entry.submit.cmdList->reset();",
+            "m_device->recycleCommandList(entry.submit.cmdList);",
+            "m_finishCond.notify_all();",
+        ):
+            self.assertIn(token, finish)
+
+        self.assertIn("m_lastError.store(status);", queue_error)
+        self.assertIn("current != VK_ERROR_DEVICE_LOST", queue_error)
+
+    def test_terminal_present_frames_skip_wsi_waits_but_signal(self):
+        retire = function_body(PRESENTER, "Presenter::retireTerminalFrame")
+        frame_thread = function_body(PRESENTER, "Presenter::runFrameThread")
+        fence_wait = function_body(PRESENTER, "Presenter::waitForSwapchainFence")
+        signal = function_body(PRESENTER, "Presenter::signalFrame")
+
+        self.assertIn("frame.result = VK_ERROR_DEVICE_LOST;", retire)
+        self.assertIn("m_presentPending = false;", retire)
+        self.assertIn("m_frameCond.notify_one();", retire)
+        self.assertNotIn("m_vkd->", retire)
+
+        first_present_wait = frame_thread.index("vkWaitForPresent")
+        self.assertLess(
+            frame_thread.index("m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST"),
+            first_present_wait,
+        )
+        self.assertIn("if (!terminal)", frame_thread)
+        self.assertIn("m_frameDrain.notify_one();", frame_thread)
+        self.assertIn("m_lastCompleted = frame.frameId;", frame_thread)
+
+        self.assertLess(
+            fence_wait.index("m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST"),
+            fence_wait.index("vkWaitForFences"),
+        )
+        self.assertIn("if (!terminal)", signal)
 
     def test_front_end_draws_resources_and_war3_passes_fail_closed(self):
         for origin in (
