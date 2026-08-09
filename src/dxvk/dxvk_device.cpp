@@ -24,6 +24,8 @@ namespace dxvk {
     m_properties        (adapter->deviceProperties()),
     m_perfHints         (getPerfHints()),
     m_objects           (this),
+    m_deviceFault       (features.extDeviceFault.deviceFault == VK_TRUE,
+                         vkd->device(), vkd->vkGetDeviceFaultInfoEXT),
     m_submissionQueue   (this, queueCallback) {
 
     if (adapter->kmtLocal()) {
@@ -321,7 +323,7 @@ namespace dxvk {
       VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
 
     if (vr) {
-      notifyDeviceError(vr);
+      notifyDeviceErrorFromDriverResult(vr);
       throw DxvkError(str::format("Failed to create built-in compute pipeline: ", vr));
     }
 
@@ -480,7 +482,7 @@ namespace dxvk {
       VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
 
     if (vr) {
-      notifyDeviceError(vr);
+      notifyDeviceErrorFromDriverResult(vr);
       throw DxvkError(str::format("Failed to create built-in graphics pipeline: ", vr));
     }
 

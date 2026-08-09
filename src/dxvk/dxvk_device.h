@@ -5,6 +5,7 @@
 #include "dxvk_compute.h"
 #include "dxvk_constant_state.h"
 #include "dxvk_context.h"
+#include "dxvk_device_fault.h"
 #include "dxvk_fence.h"
 #include "dxvk_framebuffer.h"
 #include "dxvk_image.h"
@@ -261,6 +262,25 @@ namespace dxvk {
       m_terminalStatus.compare_exchange_strong(
         expected, status, std::memory_order_acq_rel,
         std::memory_order_acquire);
+    }
+
+    /**
+     * \brief Reports a direct Vulkan driver result
+     *
+     * Only this provenance-aware entrypoint may request the bounded
+     * VK_EXT_device_fault text record. Derived terminal states use
+     * notifyDeviceError and must not be treated as a driver query trigger.
+     */
+    void notifyDeviceErrorFromDriverResult(VkResult status) noexcept {
+      if (status != VK_ERROR_DEVICE_LOST)
+        return;
+
+      notifyDeviceError(status);
+      m_deviceFault.captureOnce(status);
+    }
+
+    DxvkDeviceFaultSnapshot getDeviceFaultSnapshot() const noexcept {
+      return m_deviceFault.snapshot();
     }
 
     /**
@@ -748,6 +768,7 @@ namespace dxvk {
     DxvkRecycler<DxvkCommandList, 16> m_recycledCommandLists;
 
     std::atomic<VkResult>       m_terminalStatus = { VK_SUCCESS };
+    DxvkDeviceFaultCapture      m_deviceFault;
     DxvkSubmissionQueue         m_submissionQueue;
 
     Rc<DxvkShaderCache>         m_shaderCache;

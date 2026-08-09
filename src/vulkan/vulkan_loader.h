@@ -271,6 +271,11 @@ namespace dxvk::vk {
     VULKAN_FN(vkGetSemaphoreCounterValue);
     VULKAN_FN(vkSignalSemaphore);
     VULKAN_FN(vkWaitSemaphores);
+
+    #ifdef VK_EXT_device_fault
+    VULKAN_FN(vkGetDeviceFaultInfoEXT);
+    #endif
+
     VULKAN_FN(vkCmdBindPipeline);
     VULKAN_FN(vkCmdSetViewport);
     VULKAN_FN(vkCmdSetScissor);

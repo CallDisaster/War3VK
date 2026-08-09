@@ -21,6 +21,7 @@ namespace dxvk {
     HANDLE_EXT(extCustomBorderColor);              \
     HANDLE_EXT(extDepthClipEnable);                \
     HANDLE_EXT(extDepthBiasControl);               \
+    HANDLE_EXT(extDeviceFault);                    \
     HANDLE_EXT(extDescriptorBuffer);               \
     HANDLE_EXT(extExtendedDynamicState3);          \
     HANDLE_EXT(extFragmentShaderInterlock);        \
@@ -839,6 +840,9 @@ namespace dxvk {
       ENABLE_EXT_FEATURE(extDepthBiasControl, leastRepresentableValueForceUnormRepresentation, false),
       ENABLE_EXT_FEATURE(extDepthBiasControl, floatRepresentation, false),
       ENABLE_EXT_FEATURE(extDepthBiasControl, depthBiasExact, false),
+
+      /* Bounded text-only device-loss diagnostics */
+      ENABLE_EXT_FEATURE(extDeviceFault, deviceFault, false),
 
       /* Descriptor buffers for a more efficient binding model */
       ENABLE_EXT_FEATURE(extDescriptorBuffer, descriptorBuffer, false),

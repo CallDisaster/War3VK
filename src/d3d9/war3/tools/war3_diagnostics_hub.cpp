@@ -74,6 +74,28 @@ std::array<std::atomic<uint32_t>, 11u> s_gpuFlightAutoTestFloatBits = {};
 uint64_t s_gpuFlightLastArenaGeneration = 0u;
 uint64_t s_gpuFlightLastArenaUsedBytes = 0u;
 
+const char* DeviceFaultCaptureStateName(
+    ::dxvk::DxvkDeviceFaultCaptureState state) noexcept {
+  switch (state) {
+    case ::dxvk::DxvkDeviceFaultCaptureState::Disabled:
+      return "disabled";
+    case ::dxvk::DxvkDeviceFaultCaptureState::Armed:
+      return "armed";
+    case ::dxvk::DxvkDeviceFaultCaptureState::Capturing:
+      return "capturing";
+    case ::dxvk::DxvkDeviceFaultCaptureState::Complete:
+      return "complete";
+  }
+  return "unknown";
+}
+
+std::string BoundedDeviceFaultText(const char* text, size_t capacity) {
+  size_t length = 0u;
+  while (length < capacity && text[length] != '\0')
+    ++length;
+  return std::string(text, length);
+}
+
 uint32_t FloatBits(float value) noexcept {
   uint32_t bits = 0u;
   static_assert(sizeof(bits) == sizeof(value));
@@ -368,6 +390,58 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
   if (directory.empty())
     return;
 
+  const ::dxvk::DxvkDeviceFaultSnapshot& deviceFault = incident.deviceFault;
+  const uint32_t addressInfoCount = std::min(
+      deviceFault.addressInfoCount,
+      ::dxvk::DxvkDeviceFaultSnapshot::MaxAddressInfos);
+  const uint32_t vendorInfoCount = std::min(
+      deviceFault.vendorInfoCount,
+      ::dxvk::DxvkDeviceFaultSnapshot::MaxVendorInfos);
+  json deviceFaultPayload = {
+      {"supported", deviceFault.supported},
+      {"captureState", DeviceFaultCaptureStateName(deviceFault.captureState)},
+      {"complete", deviceFault.complete},
+      {"queryResult", static_cast<int64_t>(deviceFault.queryResult)},
+      {"truncated", deviceFault.truncated},
+      {"description", BoundedDeviceFaultText(
+          deviceFault.description.data(), VK_MAX_DESCRIPTION_SIZE)},
+      {"vendorBinaryEnabled", false},
+      {"addressInfos", json::array()},
+      {"vendorInfos", json::array()},
+  };
+
+  if (!deviceFault.supported) {
+    deviceFaultPayload["reason"] =
+        "VK_EXT_device_fault was unavailable for this Vulkan device";
+  } else if (!deviceFault.complete) {
+    deviceFaultPayload["reason"] =
+        "no completed VK_EXT_device_fault query was available";
+  } else if (deviceFault.queryResult != VK_SUCCESS &&
+             deviceFault.queryResult != VK_INCOMPLETE) {
+    deviceFaultPayload["reason"] =
+        "vkGetDeviceFaultInfoEXT returned an error";
+  }
+
+  for (uint32_t index = 0u; index < addressInfoCount; ++index) {
+    const VkDeviceFaultAddressInfoEXT& address =
+        deviceFault.addressInfos[index];
+    deviceFaultPayload["addressInfos"].push_back({
+        {"type", static_cast<int64_t>(address.addressType)},
+        {"reportedAddress", address.reportedAddress},
+        {"addressPrecision", address.addressPrecision},
+    });
+  }
+
+  for (uint32_t index = 0u; index < vendorInfoCount; ++index) {
+    const VkDeviceFaultVendorInfoEXT& vendor = deviceFault.vendorInfos[index];
+    deviceFaultPayload["vendorInfos"].push_back({
+        {"description", BoundedDeviceFaultText(
+            vendor.description, VK_MAX_DESCRIPTION_SIZE)},
+        {"faultCode", vendor.vendorFaultCode},
+        {"faultData", vendor.vendorFaultData},
+    });
+  }
+
   json payload = {
       {"timestampMs", incident.timestampMs},
       {"reason", incident.reason},
@@ -378,10 +452,7 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
        incident.recentFrames.empty()
            ? std::string{}
            : incident.recentFrames.back().lastRenderStage},
-      {"deviceFault", {
-          {"supported", false},
-          {"reason", "VK_EXT_device_fault is not exposed by this DXVK build"},
-      }},
+      {"deviceFault", std::move(deviceFaultPayload)},
       {"frames", json::array()},
   };
   for (const auto& frame : incident.recentFrames) {
@@ -3734,7 +3805,9 @@ void SetGpuFlightBreadcrumb(
   s_gpuFlightBreadcrumbSerial.fetch_add(1u, std::memory_order_acq_rel);
 }
 
-void NotifyGpuDeviceLostFailStop(const char* origin) noexcept {
+void NotifyGpuDeviceLostFailStop(
+    const char* origin,
+    const ::dxvk::DxvkDeviceFaultSnapshot& deviceFault) noexcept {
   try {
     GpuIncidentSnapshot incident = {};
     {
@@ -3749,6 +3822,7 @@ void NotifyGpuDeviceLostFailStop(const char* origin) noexcept {
       incident.reason = "queue-error-device-lost-fail-stop";
       incident.firstErrorOrigin = origin != nullptr ? origin : "unknown";
       incident.queueResult = VK_ERROR_DEVICE_LOST;
+      incident.deviceFault = deviceFault;
       incident.recentFrames.assign(
           s_gpuFlightFrames.begin(), s_gpuFlightFrames.end());
 

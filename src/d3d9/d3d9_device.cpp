@@ -15166,11 +15166,15 @@ bool D3D9DeviceEx::CheckVulkanDeviceLostFailStop(const char* origin) {
   if (m_vkDeviceLostFailStop.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel,
           std::memory_order_acquire)) {
+    const Rc<DxvkDevice> device = m_dxvkDevice;
+    const DxvkDeviceFaultSnapshot deviceFault = device != nullptr
+      ? device->getDeviceFaultSnapshot()
+      : DxvkDeviceFaultSnapshot{};
     m_war3ShadowSessionReady.store(false, std::memory_order_release);
     Logger::err(str::format(
         "D3D9DeviceEx: Vulkan device lost; entering irreversible fail-stop at ",
         origin != nullptr ? origin : "unknown"));
-    dxvk::war3::tools::NotifyGpuDeviceLostFailStop(origin);
+    dxvk::war3::tools::NotifyGpuDeviceLostFailStop(origin, deviceFault);
   }
 
   return true;

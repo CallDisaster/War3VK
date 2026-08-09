@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "../../../dxvk/dxvk_device_fault.h"
+
 namespace dxvk::war3::tools {
 
 enum class GpuFlightBreadcrumb : uint32_t {
@@ -142,7 +144,9 @@ void SetGpuFlightBreadcrumb(
     uint32_t csmCascade = 0xFFFFFFFFu,
     uint32_t pointLight = 0xFFFFFFFFu,
     uint32_t pointFace = 0xFFFFFFFFu) noexcept;
-void NotifyGpuDeviceLostFailStop(const char* origin) noexcept;
+void NotifyGpuDeviceLostFailStop(
+    const char* origin,
+    const ::dxvk::DxvkDeviceFaultSnapshot& deviceFault) noexcept;
 void ResetGpuFlightCsmWork() noexcept;
 void SetGpuFlightCsmCascadeWork(
     uint32_t cascade, uint32_t drawCount, uint64_t triangleCount) noexcept;
@@ -166,6 +170,7 @@ struct GpuIncidentSnapshot {
   std::string firstErrorOrigin;
   int64_t queueResult = 0;
   uint64_t stalledMilliseconds = 0u;
+  ::dxvk::DxvkDeviceFaultSnapshot deviceFault = {};
   std::vector<GpuFlightFrame> recentFrames;
 };
 

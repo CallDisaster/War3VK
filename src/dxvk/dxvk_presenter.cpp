@@ -111,7 +111,7 @@ namespace dxvk {
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
         m_swapchain, std::numeric_limits<uint64_t>::max(),
         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
-      m_device->notifyDeviceError(m_acquireStatus);
+      m_device->notifyDeviceErrorFromDriverResult(m_acquireStatus);
     }
 
     // This is a normal occurence, but may be useful for
@@ -140,7 +140,7 @@ namespace dxvk {
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
         m_swapchain, std::numeric_limits<uint64_t>::max(),
         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
-      m_device->notifyDeviceError(m_acquireStatus);
+      m_device->notifyDeviceErrorFromDriverResult(m_acquireStatus);
 
       if (m_acquireStatus < 0) {
         Logger::info(str::format("Presenter: Got ", m_acquireStatus, " from fresh swapchain"));
@@ -227,7 +227,7 @@ namespace dxvk {
 
     VkResult status = m_vkd->vkQueuePresentKHR(
       m_device->queues().graphics.queueHandle, &info);
-    m_device->notifyDeviceError(status);
+    m_device->notifyDeviceErrorFromDriverResult(status);
 
     // Maintain valid state if presentation succeeded, even if we want to
     // recreate the swapchain. Spec says that 'queue' operations, i.e. the
@@ -272,7 +272,7 @@ namespace dxvk {
         m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
           m_swapchain, std::numeric_limits<uint64_t>::max(),
           nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
-        m_device->notifyDeviceError(m_acquireStatus);
+        m_device->notifyDeviceErrorFromDriverResult(m_acquireStatus);
         if (m_acquireStatus == VK_ERROR_DEVICE_LOST)
           status = m_acquireStatus;
       }
@@ -593,7 +593,7 @@ namespace dxvk {
         vr = createSwapChain();
     }
 
-    m_device->notifyDeviceError(vr);
+    m_device->notifyDeviceErrorFromDriverResult(vr);
     return vr;
   }
 
@@ -1324,13 +1324,13 @@ namespace dxvk {
 
     if (vr) {
       Logger::err(str::format("Presenter: Failed to wait for WSI fence: ", vr));
-      m_device->notifyDeviceError(vr);
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       return vr;
     }
 
     if ((vr = m_vkd->vkResetFences(m_vkd->device(), 1, &sync.fence))) {
       Logger::err(str::format("Presenter: Failed to reset WSI fence: ", vr));
-      m_device->notifyDeviceError(vr);
+      m_device->notifyDeviceErrorFromDriverResult(vr);
       return vr;
     }
 
@@ -1382,7 +1382,7 @@ namespace dxvk {
             m_swapchain, frame.frameId, std::numeric_limits<uint64_t>::max());
         }
 
-        m_device->notifyDeviceError(vr);
+        m_device->notifyDeviceErrorFromDriverResult(vr);
         terminal = m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST;
         if (vr < 0 && vr != VK_ERROR_OUT_OF_DATE_KHR && vr != VK_ERROR_SURFACE_LOST_KHR)
           Logger::err(str::format("Presenter: vkWaitForPresentKHR failed: ", vr));

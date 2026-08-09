@@ -17,6 +17,24 @@ CS_THREAD = (ROOT / "src/dxvk/dxvk_cs.cpp").read_text(encoding="utf-8")
 DXVK_DEVICE_CPP = (ROOT / "src/dxvk/dxvk_device.cpp").read_text(
     encoding="utf-8"
 )
+DXVK_DEVICE_H = (ROOT / "src/dxvk/dxvk_device.h").read_text(
+    encoding="utf-8"
+)
+DXVK_DEVICE_INFO_CPP = (ROOT / "src/dxvk/dxvk_device_info.cpp").read_text(
+    encoding="utf-8"
+)
+DXVK_DEVICE_INFO_H = (ROOT / "src/dxvk/dxvk_device_info.h").read_text(
+    encoding="utf-8"
+)
+DXVK_DEVICE_FAULT_H = (ROOT / "src/dxvk/dxvk_device_fault.h").read_text(
+    encoding="utf-8"
+)
+DXVK_DEVICE_FAULT_CPP = (ROOT / "src/dxvk/dxvk_device_fault.cpp").read_text(
+    encoding="utf-8"
+)
+VULKAN_LOADER = (ROOT / "src/vulkan/vulkan_loader.h").read_text(
+    encoding="utf-8"
+)
 PIPELINE_MANAGER = (ROOT / "src/dxvk/dxvk_pipemanager.cpp").read_text(
     encoding="utf-8"
 )
@@ -24,6 +42,7 @@ QUEUE = (ROOT / "src/dxvk/dxvk_queue.cpp").read_text(encoding="utf-8")
 PRESENTER = (ROOT / "src/dxvk/dxvk_presenter.cpp").read_text(
     encoding="utf-8"
 )
+MEMORY = (ROOT / "src/dxvk/dxvk_memory.cpp").read_text(encoding="utf-8")
 DIAGNOSTICS = (
     ROOT / "src/d3d9/war3/tools/war3_diagnostics_hub.cpp"
 ).read_text(encoding="utf-8")
@@ -310,7 +329,7 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
 
     def test_first_error_incident_uses_atomic_breadcrumbs_only(self):
         notify = function_body(
-            DIAGNOSTICS, "NotifyGpuDeviceLostFailStop(const char* origin)"
+            DIAGNOSTICS, "NotifyGpuDeviceLostFailStop("
         )
         self.assertIn("s_gpuDeviceLostIncidentLatched = true", notify)
         self.assertNotIn("s_gpuIncidentLatched = true", notify)
@@ -318,6 +337,100 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         self.assertIn("s_gpuFlightBreadcrumb.load", notify)
         self.assertNotIn("RunWithActiveDevice", notify)
         self.assertIn('"firstErrorOrigin"', DIAGNOSTICS)
+
+    def test_device_fault_extension_is_text_only_and_bounded(self):
+        for source in (DXVK_DEVICE_INFO_H, DXVK_DEVICE_INFO_CPP):
+            self.assertIn("extDeviceFault", source)
+        self.assertIn(
+            "ENABLE_EXT_FEATURE(extDeviceFault, deviceFault, false)",
+            DXVK_DEVICE_INFO_CPP,
+        )
+        self.assertNotIn("deviceFaultVendorBinary", DXVK_DEVICE_INFO_CPP)
+        self.assertIn("#ifdef VK_EXT_device_fault", VULKAN_LOADER)
+        self.assertIn("VULKAN_FN(vkGetDeviceFaultInfoEXT)", VULKAN_LOADER)
+
+        for token in (
+            "MaxAddressInfos = 64u",
+            "MaxVendorInfos  = 32u",
+            "std::array<VkDeviceFaultAddressInfoEXT",
+            "std::array<VkDeviceFaultVendorInfoEXT",
+            "captureOnce(VkResult trigger)",
+            "snapshot() const noexcept",
+        ):
+            self.assertIn(token, DXVK_DEVICE_FAULT_H)
+
+        capture = function_body(
+            DXVK_DEVICE_FAULT_CPP, "DxvkDeviceFaultCapture::captureOnce"
+        )
+        self.assertIn("trigger != VK_ERROR_DEVICE_LOST", capture)
+        self.assertIn("counts.addressInfoCount = DxvkDeviceFaultSnapshot::MaxAddressInfos", capture)
+        self.assertIn("counts.vendorInfoCount = DxvkDeviceFaultSnapshot::MaxVendorInfos", capture)
+        self.assertIn("counts.vendorBinarySize = 0u", capture)
+        self.assertIn("info.pVendorBinaryData = nullptr", capture)
+        self.assertIn("result == VK_INCOMPLETE", capture)
+        self.assertIn("DxvkDeviceFaultCaptureState::Complete", capture)
+        for forbidden in ("new ", "std::vector", "std::string", "mutex", "wait", "sleep", "Logger"):
+            self.assertNotIn(forbidden, capture)
+
+    def test_only_real_driver_results_request_device_fault_text(self):
+        self.assertIn(
+            "void notifyDeviceErrorFromDriverResult(VkResult status)",
+            DXVK_DEVICE_H,
+        )
+        driver_entry = function_body(
+            DXVK_DEVICE_H, "void notifyDeviceErrorFromDriverResult"
+        )
+        self.assertLess(
+            driver_entry.index("notifyDeviceError(status);"),
+            driver_entry.index("m_deviceFault.captureOnce(status);"),
+        )
+        self.assertIn("getDeviceFaultSnapshot() const noexcept", DXVK_DEVICE_H)
+
+        submit = function_body(QUEUE, "DxvkSubmissionQueue::submitCmdLists")
+        submit_result = submit.index("entry.submit.cmdList->submit")
+        submit_fault = submit.index(
+            "m_device->notifyDeviceErrorFromDriverResult(entry.result);"
+        )
+        submit_terminal = submit.index(
+            "if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)",
+            submit_fault,
+        )
+        self.assertLess(submit_result, submit_fault)
+        self.assertLess(submit_fault, submit_terminal)
+
+        finish = function_body(QUEUE, "DxvkSubmissionQueue::finishCmdLists")
+        wait = finish.index("vk->vkWaitSemaphores")
+        wait_fault = finish.index(
+            "m_device->notifyDeviceErrorFromDriverResult(status);"
+        )
+        self.assertLess(wait, wait_fault)
+        self.assertIn("m_device->notifyDeviceError(VK_ERROR_DEVICE_LOST);", submit)
+        self.assertIn("m_device->notifyDeviceError(status);", finish)
+        self.assertNotIn("notifyDeviceErrorFromDriverResult", CS_THREAD)
+
+        for source in (DXVK_DEVICE_CPP, MEMORY, PRESENTER):
+            self.assertIn("notifyDeviceErrorFromDriverResult", source)
+
+    def test_device_fault_json_owns_bounded_text_without_vendor_binary(self):
+        self.assertNotIn(
+            "VK_EXT_device_fault is not exposed by this DXVK build",
+            DIAGNOSTICS,
+        )
+        for token in (
+            '"supported"',
+            '"captureState"',
+            '"complete"',
+            '"queryResult"',
+            '"truncated"',
+            '"addressInfos"',
+            '"vendorInfos"',
+            '"vendorBinaryEnabled", false',
+            "BoundedDeviceFaultText",
+            "MaxAddressInfos",
+            "MaxVendorInfos",
+        ):
+            self.assertIn(token, DIAGNOSTICS)
+        self.assertNotIn("NV checkpoint", DIAGNOSTICS)
 
 
 if __name__ == "__main__":

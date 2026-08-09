@@ -721,6 +721,23 @@ test(
   timeout : 30,
 )
 
+# Bounded text-only VK_EXT_device_fault capture. The runnable links no DXVK
+# device and uses a fake dispatch function to prove one-shot terminal policy.
+war3_dxvk_device_fault_capture_test = executable(
+  'war3_dxvk_device_fault_capture_test',
+  [
+    '../dxvk/dxvk_device_fault.cpp',
+    'war3/core/tests/dxvk_device_fault_capture_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_dxvk_device_fault_capture',
+  war3_dxvk_device_fault_capture_test,
+  timeout : 30,
+)
+
 if platform != 'windows'
   pkg.generate(d3d9_dll,
     filebase: dxvk_pkg_prefix + 'd3d9',

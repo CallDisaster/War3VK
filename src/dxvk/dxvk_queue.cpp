@@ -203,6 +203,7 @@ namespace dxvk {
 
           entry.result = entry.submit.cmdList->submit(
             m_semaphores, m_timelines, trackedSubmitId);
+          m_device->notifyDeviceErrorFromDriverResult(entry.result);
           entry.timelines = m_timelines;
         } else if (entry.present.presenter != nullptr) {
           if (entry.latency.tracker)
@@ -333,7 +334,7 @@ namespace dxvk {
 
           status = vk->vkWaitSemaphores(vk->device(), &waitInfo, ~0ull);
 
-          m_device->notifyDeviceError(status);
+          m_device->notifyDeviceErrorFromDriverResult(status);
 
           if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
             status = VK_ERROR_DEVICE_LOST;
