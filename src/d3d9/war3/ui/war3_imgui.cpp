@@ -11,6 +11,7 @@
 
 #include "../core/war3_internal_test_config.h"
 #include "../debug/war3_debug.h"
+#include "../war3.h"
 #include "../render/war3_render_queue_tracker.h"
 #include "../render/war3_render_state.h"
 #include "../shader/war3_shader_manager.h"
@@ -278,7 +279,11 @@ void War3Imgui::drawDebugWindow() {
         ImGui::TextDisabled("渲染管线未就绪");
       } else {
         auto *pipeline = m_device->GetWar3Pipeline();
-        auto &settings = pipeline->MutableSettings();
+        auto settingsWrite = dxvk::war3::GetMutableSettings();
+        if (!settingsWrite)
+          ImGui::TextDisabled("渲染设置暂不可写");
+        if (settingsWrite) {
+        auto &settings = *settingsWrite;
         ImGui::Checkbox("光影", &settings.shadows.enabled);
 
         if (ImGui::TreeNode("Shadow Debug Items")) {
@@ -1036,6 +1041,7 @@ void War3Imgui::drawDebugWindow() {
                              16.0f, "%.1f");
 
           ImGui::TreePop();
+        }
         }
       }
     }

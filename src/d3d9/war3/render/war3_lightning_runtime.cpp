@@ -793,15 +793,35 @@ void War3LightningRuntime::setDevice(IDirect3DDevice9* device) {
   m_summary.hasDevice = m_device != nullptr;
 }
 
+void War3LightningRuntime::resetAuthorState() {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  resetAuthorStateLocked();
+}
+
 void War3LightningRuntime::reset() {
   std::lock_guard<std::mutex> lock(m_mutex);
-  m_records.clear();
-  m_templates.clear();
+  resetAuthorStateLocked();
   releaseTexturesLocked();
-  m_nextId = 1;
-  m_nextTemplateId = 1;
   m_summary = {};
   m_summary.hasDevice = m_device != nullptr;
+}
+
+void War3LightningRuntime::resetAuthorStateLocked() {
+  m_records.clear();
+  m_templates.clear();
+  m_nextId = 1;
+  m_nextTemplateId = 1;
+  m_summary.activeCount = 0u;
+  m_summary.polylineActiveCount = 0u;
+  m_summary.templateCount = 0u;
+  m_summary.finalizedTemplateCount = 0u;
+  m_summary.createCount = 0u;
+  m_summary.polylineCreateCount = 0u;
+  m_summary.templateCreateCount = 0u;
+  m_summary.templateFinalizeCount = 0u;
+  m_summary.destroyCount = 0u;
+  m_summary.commandFailureCount = 0u;
+  m_summary.lastPolylinePointCount = 0u;
 }
 
 void War3LightningRuntime::releaseTexturesLocked() {

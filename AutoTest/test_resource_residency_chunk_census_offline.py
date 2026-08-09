@@ -417,14 +417,15 @@ class ResourceResidencyChunkCensusOfflineTests(unittest.TestCase):
         self.assertIn("std::lock_guard lock(m_mutex)", clear)
         self.assertIn("m_resourceCensusAllocator == allocator", clear)
 
-        active = device.index("war3::SetActiveDevice(this);")
-        register = device.index("setResourceCensusAllocator(", active)
         constructor_success_tail = device.index(
-            "m_unlockAdditionalFormats = m_parent->HasFormatsUnlocked();",
-            active,
+            "m_unlockAdditionalFormats = m_parent->HasFormatsUnlocked();"
         )
+        active = device.index(
+            "war3::PublishActiveDeviceAfter(this", constructor_success_tail
+        )
+        register = device.index("setResourceCensusAllocator(", active)
+        self.assertLess(constructor_success_tail, active)
         self.assertLess(active, register)
-        self.assertLess(constructor_success_tail, register)
         destructor = device.index("D3D9DeviceEx::~D3D9DeviceEx()")
         export = device.index("perfMonitor.exportHtmlReport", destructor)
         clear_owner = device.index(

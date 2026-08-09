@@ -154,10 +154,6 @@ DxvkBufferCreateInfo MakeArenaBufferInfo(uint32_t size) {
 bool AllocateArenaPage(ShadowArenaFrameState& frameState,
                        uint32_t minCapacityBytes,
                        bool logGrowth) {
-  auto* device = dxvk::war3::GetActiveDevice();
-  if (!device)
-    return false;
-
   if (frameState.totalCapacity >= g_arenaMaxFrameSize)
     return false;
 
@@ -179,8 +175,15 @@ bool AllocateArenaPage(ShadowArenaFrameState& frameState,
   if (residentBefore + uint64_t(pageCapacity) > kArenaMaxResidentSize)
     return false;
 
-  Rc<DxvkBuffer> pageBuffer = device->GetDXVKDevice()->createBuffer(
-      MakeArenaBufferInfo(pageCapacity), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  Rc<DxvkBuffer> pageBuffer;
+  const bool activeOwner = dxvk::war3::RunWithActiveDevice(
+      [&](D3D9DeviceEx& device) {
+        pageBuffer = device.GetDXVKDevice()->createBuffer(
+            MakeArenaBufferInfo(pageCapacity),
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      });
+  if (!activeOwner)
+    return false;
   if (pageBuffer == nullptr || !pageBuffer->storage()) {
     war3dbg::Print("DXVK War3[ShadowArena]: Arena 页创建失败 size=%u MB。\n",
                    pageCapacity >> 20);
@@ -270,8 +273,7 @@ bool ShadowArena_Init() {
   if (ShadowArena_IsInitialized())
     return true;
 
-  auto* device = dxvk::war3::GetActiveDevice();
-  if (!device) {
+  if (!dxvk::war3::HasActivePipeline()) {
     war3dbg::Print(
         "DXVK War3[ShadowArena]: 活跃 D3D9 设备为空，初始化延期。\n");
     return false;

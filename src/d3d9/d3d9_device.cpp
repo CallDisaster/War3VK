@@ -2335,6 +2335,9 @@ bool War3ExactIndexedFreezeTrimRuntime() {
   // content generation. Even canonical zero-based indices only delayed the
   // NVIDIA reset. Keep the implementation as an explicit diagnostic until a
   // single producer can provide both bytes under one generation contract.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SHADOW_EXACT_INDEX_TRIM", 0u) != 0u;
   return s_enabled;
@@ -2350,6 +2353,9 @@ War3CompactWorkTableMode War3SemanticCompactWorkTableModeRuntime() {
   // The table is a correctness-neutral control-plane optimization. Keep the
   // release default disabled until Observe has proved parity and its measured
   // overhead stays below the 0.15 ms/frame admission gate.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return War3CompactWorkTableMode::Off;
   static const auto s_mode = static_cast<War3CompactWorkTableMode>(
       std::min<uint32_t>(
           2u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", 0u)));
@@ -2362,6 +2368,9 @@ War3PersistentPackageStage11EvidenceModeRuntime() {
       War3PersistentGpuPackageStage11ObserveAdapter::Mode;
   // This bridge is evidence-only. Keep release behavior entirely absent until
   // an explicit Observe request; Consume remains a hard capability failure.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return Mode::Off;
   static const auto s_mode = static_cast<Mode>((std::min)(
       2u, War3GetEnvU32(
               "DXVK_WAR3_PERSISTENT_GPU_PACKAGE_STAGE11_EVIDENCE_MODE", 0u)));
@@ -2375,6 +2384,9 @@ War3PersistentPackageD3D9OwnerModeRuntime() {
   // Separate from CPU source evidence so the proven low-overhead Stage11
   // observer can still run without allocating an atlas. Consume remains a
   // hard failure in this stage.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return Mode::Off;
   static const auto s_mode = [] {
     const auto configured = static_cast<Mode>((std::min)(
         2u, War3GetEnvU32(
@@ -2394,6 +2406,9 @@ War3PersistentPackageCurrentDrawEquivalenceModeRuntime() {
   // Content hashing is independently gated because it walks HOST_CACHED
   // current-draw bytes. Release behavior remains zero-overhead and Consume is
   // not accepted until recording and last-use authorities exist.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return Mode::Off;
   static const auto s_mode = [] {
     const auto configured = static_cast<Mode>((std::min)(
         2u, War3GetEnvU32(
@@ -3085,6 +3100,9 @@ inline bool War3ShadowCapturePostBreakdownRuntime() {
   // frame flush, so the tree remains closed. Each leaf subtracts the measured
   // QPC lower bound; nested probes can still add a small observer tax to the
   // exact parent while this explicit diagnostic mode is enabled.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SHADOW_CAPTURE_BREAKDOWN", 0u) != 0u;
   return s_enabled;
@@ -3092,6 +3110,9 @@ inline bool War3ShadowCapturePostBreakdownRuntime() {
 
 inline dxvk::war3::render::War3TerrainBoundsCullMode
 War3TerrainBoundsCullModeRuntime() {
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return dxvk::war3::render::War3TerrainBoundsCullMode::Off;
   static const auto s_mode = [] {
     const char* mode = std::getenv("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE");
     if (mode != nullptr && mode[0] != '\0') {
@@ -3119,6 +3140,9 @@ War3ProducerClaimObserveMode War3ProducerClaimObserveModeRuntime() {
   // Consume is parsed for experiment compatibility but deliberately behaves
   // as Observe below. The reduced pre-build identity has not yet proved
   // collision-free parity with the post-build exact-owner key.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return War3ProducerClaimObserveMode::Off;
   static const auto s_mode = static_cast<War3ProducerClaimObserveMode>(
       std::min<uint32_t>(
           2u,
@@ -3172,6 +3196,9 @@ inline bool War3DrawTimeVBCacheRuntime() {
   // the large transient geometry was the master cache-off path, so the cache
   // now stays fail-closed by default while the final-caster trace identifies
   // the remaining unsafe consumer tuple. Explicit =1 is diagnostic only.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_DRAWTIME_VB_CACHE", 0u) != 0u;
   return s_enabled;
@@ -3217,6 +3244,9 @@ inline bool War3ShadowMetadataBlockerRuntime() {
 inline bool War3DrawTimeCacheIteratorReuseVerifyRuntime() {
   // Opt-in proof mode deliberately performs the legacy second lookup and
   // asserts that both routes select the identical node.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_DRAWTIME_CACHE_ITERATOR_REUSE_VERIFY", 0u) !=
       0u;
@@ -3229,6 +3259,9 @@ inline bool War3DrawTimeSourceFingerprintReuseRuntime() {
   // therefore reuse stale backing and make bridge/ramp shadows flicker.
   // Fail closed until the complete descriptor verifier is implemented; the
   // old reuse contract is retained only as an explicit diagnostic rollback.
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_DRAWTIME_SOURCE_FINGERPRINT_REUSE", 0u) != 0u;
   return s_enabled;
@@ -9867,6 +9900,7 @@ namespace {
 
 std::atomic<uint32_t> g_d3d9DeviceTraceOrdinal{0u};
 std::atomic<uint64_t> g_war3ShadowMapEpochIssuer{0u};
+std::mutex g_war3CpuSemanticMapSessionMutex;
 
 uint64_t MintWar3ShadowMapEpoch() {
   // A process-wide monotonically increasing epoch prevents A -> B -> A address
@@ -9898,6 +9932,41 @@ void TraceD3D9Device(uint32_t ordinal, const char* phase, const void* device) {
 
 } // namespace
 
+// Process-global semantic registries outlive an individual D3D9 device. Keep
+// their map-session reset in one CPU-only helper so the Present-owned map
+// transition, replacement-device handoff and no-active-device unload fallback
+// all start from the same empty identity domain. This helper deliberately does
+// not touch Arena generations, receiver resources, GPU-skin resources or any
+// other old-device GPU owner.
+uint64_t D3D9DeviceEx::War3ResetCpuSemanticMapSession(
+    uint64_t* outTombstoneSerial) {
+  // Mint and commit the complete process-global tuple under one writer lock.
+  // In particular, a constructor cannot reserve N, lose to a no-active
+  // fallback that commits N+1, and later roll registries back to N.
+  std::lock_guard<std::mutex> lock(g_war3CpuSemanticMapSessionMutex);
+  const uint64_t mapEpoch = MintWar3ShadowMapEpoch();
+  const uint64_t tombstoneSerial =
+      dxvk::war3::render::ResetShadowCasterLifecycleMapEpoch(mapEpoch);
+  dxvk::war3::render::VisibleRenderableRegistry::instance()
+      .resetShadowManifestMapEpoch(mapEpoch);
+  dxvk::war3::model::ShadowModelResourceCache::instance().resetMapEpoch(
+      mapEpoch);
+  dxvk::war3::render::RenderQueueTracker::instance().Reset();
+  dxvk::war3::render::ExecBatchProcessor::ResetCaches();
+  War3RenderState::ResetRuntimeState();
+  dxvk::war3::render::ResetShadowRuntimeBridgeState();
+  dxvk::war3::shadow::ShadowValidationRuntime::instance().reset();
+  dxvk::war3::render::War3Renderer::instance().ResetMapSession();
+  dxvk::war3::model::ResetMapSession();
+  dxvk::war3::render::ResetCurrentDrawContractCache();
+  War3ResetDirectPacketMapCaches();
+  dxvk::war3::shadow::War3ShadowDrawMetadataStore().clear();
+  dxvk_war3_alpha_test_internal::ClearPayloadsForLifecycleOverflow();
+  if (outTombstoneSerial != nullptr)
+    *outTombstoneSerial = tombstoneSerial;
+  return mapEpoch;
+}
+
 D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
                            D3DDEVTYPE DeviceType, HWND hFocusWindow,
                            DWORD BehaviorFlags, Rc<DxvkDevice> dxvkDevice)
@@ -9921,12 +9990,6 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
       g_d3d9DeviceTraceOrdinal.fetch_add(1u, std::memory_order_relaxed) + 1u;
   TraceD3D9Device(traceOrdinal, "ctor-body-begin", this);
   m_war3ShadowArenaFence = new sync::Fence();
-  m_war3GpuSkinMapEpoch = MintWar3ShadowMapEpoch();
-  m_war3ShadowTombstoneSerialSeen =
-      war3::render::ResetShadowCasterLifecycleMapEpoch(
-          m_war3GpuSkinMapEpoch);
-  m_war3ShadowDiagCurrentMapEpoch.store(
-      m_war3GpuSkinMapEpoch, std::memory_order_relaxed);
 
   // If we can SWVP, then we use an extended constant set
   // as SWVP has many more slots available than HWVP.
@@ -9949,16 +10012,6 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
       m_dxvkDevice, War3RenderPipelineAbi { });
   m_war3PostProcess = new War3PostProcess(this);
   TraceD3D9Device(traceOrdinal, "war3-pipeline-end", this);
-  war3::SetActiveDevice(this);
-  // A newly-created D3D9 owner starts a fresh address domain even when a
-  // previous device disappeared before the normal map-unload hook ran.
-  war3::render::VisibleRenderableRegistry::instance()
-      .resetShadowManifestMapEpoch(m_war3GpuSkinMapEpoch);
-  war3::model::ShadowModelResourceCache::instance().resetMapEpoch(
-      m_war3GpuSkinMapEpoch);
-  // A fresh D3D9 owner must not inherit producer caches populated by an older
-  // device in the same process.
-  war3::model::ResetMapSession();
   war3shader::internal::InitShaderPackRuntime(m_dxvkDevice);
   war3shader::internal::SetVulkanHandles(
       reinterpret_cast<void *>(m_dxvkDevice->instance()->handle()),
@@ -9969,8 +10022,6 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
     TraceD3D9Device(traceOrdinal, "shadow-pass-begin", this);
     auto shadowPass = std::make_unique<War3ShadowReceiverPass>(this);
     m_shadowReceiverPass = shadowPass.get();
-    m_shadowReceiverPass->InvalidateMapEpoch(
-        m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch);
     m_war3Pipeline->RegisterPass(
         "ShadowReceiver", std::move(shadowPass),
         war3::runtime::IsWar3RuntimeModuleEnabled(
@@ -10150,6 +10201,24 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
   war3::ShaderManager::get().initialize(this);
   TraceD3D9Device(traceOrdinal, "shader-manager-end", this);
   m_unlockAdditionalFormats = m_parent->HasFormatsUnlocked();
+  // A newly-created D3D9 owner starts a fresh address domain even when a
+  // previous device disappeared before the normal map-unload hook ran. Do
+  // this only at the successful constructor exit: no capture callback can see
+  // this device until every pass exists and the complete CPU semantic reset
+  // has finished, and no old-device GPU owner is touched here.
+  // Serialize the fresh CPU identity domain with active-device publication.
+  // The receiver is still constructor-exclusive here, so direct initialization
+  // is safe; every post-publication epoch change is CS-ordered at Present.
+  war3::PublishActiveDeviceAfter(this, [this]() {
+    m_war3GpuSkinMapEpoch = War3ResetCpuSemanticMapSession(
+        &m_war3ShadowTombstoneSerialSeen);
+    m_war3ShadowDiagCurrentMapEpoch.store(
+        m_war3GpuSkinMapEpoch, std::memory_order_release);
+    if (m_shadowReceiverPass != nullptr) {
+      m_shadowReceiverPass->InvalidateMapEpoch(
+          m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch);
+    }
+  });
   // 非 owning 指针只能在构造函数的成功出口登记；否则后续初始化抛异常时
   // 不会执行 D3D9DeviceEx 析构，monitor 将留下悬空 allocator。
   TraceD3D9Device(traceOrdinal, "census-allocator-begin", this);
@@ -10160,6 +10229,12 @@ D3D9DeviceEx::D3D9DeviceEx(D3D9InterfaceEx *pParent, D3D9Adapter *pAdapter,
 }
 
 D3D9DeviceEx::~D3D9DeviceEx() {
+  // Revoke the process-global non-owning pointer before any callback owner,
+  // pipeline mutex or GPU resource begins teardown. A compare-exchange keeps
+  // an older device destructor from clearing a newer device published during
+  // handoff. All active-device callers are optional diagnostics/producers and
+  // correctly fail closed once this publication is gone.
+  war3::ClearActiveDeviceIfCurrent(this);
   // [War3 Perf] Export HTML report before shutdown
   auto& perfMonitor = war3::War3PerfMonitor::instance();
   perfMonitor.exportHtmlReport("war3_perf_report.html");
@@ -10204,8 +10279,6 @@ D3D9DeviceEx::~D3D9DeviceEx() {
   m_ssaoPass = nullptr;
   m_aaPass = nullptr;
   m_war3PostProcess = nullptr;
-  if (war3::GetActiveDevice() == this)
-    war3::SetActiveDevice(nullptr);
 }
 
 void D3D9DeviceEx::War3AttachGpuSkinNativeBridge(uintptr_t gameBase) {
@@ -10271,7 +10344,7 @@ bool D3D9DeviceEx::War3GpuSkinQueryFlushRequest(
   auto* device = static_cast<D3D9DeviceEx*>(userData);
   if (device == nullptr || request == nullptr ||
       !device->War3GpuSkinDeviceReady() ||
-      war3::GetActiveDevice() != device ||
+      !war3::IsActiveDevice(device) ||
       device->m_deviceLostState != D3D9DeviceLostState::Ok ||
       observation.renderThreadId != ::GetCurrentThreadId())
     return false;
@@ -10296,7 +10369,7 @@ D3D9DeviceEx::War3GpuSkinSubmitFlushBatch(
   if (device == nullptr || device->m_war3GpuSkinCompute == nullptr ||
       device->m_war3GpuSkinFence == nullptr || batch.batchId == 0u ||
       !device->War3GpuSkinDeviceReady() ||
-      war3::GetActiveDevice() != device ||
+      !war3::IsActiveDevice(device) ||
       device->m_deviceLostState != D3D9DeviceLostState::Ok ||
       batch.request.deviceEpoch != device->m_war3GpuSkinDeviceEpoch ||
       batch.renderThreadId != ::GetCurrentThreadId())
@@ -10750,7 +10823,7 @@ bool D3D9DeviceEx::War3GpuSkinResolveNativeCpuRewriteOutputProof(
       observation.nativeD3DDevice != nativeDevice ||
       observation.nativeVertexBuffer == 0u ||
       observation.nativeVertexBuffer != comVertexBuffer ||
-      war3::GetActiveDevice() != device || vertexBuffer == nullptr ||
+      !war3::IsActiveDevice(device) || vertexBuffer == nullptr ||
       vertexBuffer->GetParent() != device || vertexCommon == nullptr ||
       vertexDesc == nullptr || vertexDesc->Type != D3DRTYPE_VERTEXBUFFER ||
       vertexDesc->Pool != D3DPOOL_DEFAULT ||
@@ -11034,7 +11107,7 @@ bool D3D9DeviceEx::War3GpuSkinPreflightNativeBypass(
       request.executionRoute !=
           device->m_war3GpuSkinManager->executionRoute() ||
       !NativeBridgeHooksEnabled() || device->m_war3Pipeline == nullptr ||
-      war3::GetActiveDevice() != device ||
+      !war3::IsActiveDevice(device) ||
       request.epoch.renderThreadId == 0u ||
       request.epoch.renderThreadId != ::GetCurrentThreadId() ||
       request.epoch.flushEpoch == 0u ||
@@ -11450,7 +11523,7 @@ war3::gpu_skin::GpuSkinResolvedDraw D3D9DeviceEx::War3NotifyGpuSkinDip(
   const bool exactOwner = m_war3GpuSkinManager != nullptr &&
       War3GpuSkinDeviceReady() &&
       m_war3GpuSkinManager->IsDeviceReady(m_war3GpuSkinDeviceEpoch) &&
-      war3::GetActiveDevice() == this &&
+      war3::IsActiveDevice(this) &&
       m_deviceLostState == D3D9DeviceLostState::Ok &&
       !ShouldRecord() && !IsSWVP() && !CanOnlySWVP() &&
       observation.epoch.renderThreadId == ::GetCurrentThreadId();
@@ -14491,25 +14564,21 @@ void D3D9DeviceEx::War3RetireGpuSkinFrameBatches() {
 }
 
 void D3D9DeviceEx::War3ResetGpuSkinMapEpoch() {
+  // Caller holds the active-device publication transaction. This keeps all
+  // process-global reset state owned by the same device until the new tuple
+  // has committed.
   War3LogGpuSkinDiagnostics(true);
   War3RetireGpuSkinFrameBatches();
   m_war3GpuSkinD3D9IndexTicket = {};
   const auto bridgeReset = war3::gpu_skin::RequestNativeBridgeReset(
       war3::gpu_skin::NativePoisonLedgerResetReason::MapEpoch);
-  m_war3GpuSkinMapEpoch = MintWar3ShadowMapEpoch();
-  m_war3ShadowTombstoneSerialSeen =
-      war3::render::ResetShadowCasterLifecycleMapEpoch(
-          m_war3GpuSkinMapEpoch);
+  // Keep the already-installed Game.dll hooks alive across maps, but discard
+  // every process-global CPU semantic cache whose raw pointers, palette slots
+  // or frame tags can be reused by the new session.
+  m_war3GpuSkinMapEpoch = War3ResetCpuSemanticMapSession(
+      &m_war3ShadowTombstoneSerialSeen);
   m_war3ShadowDiagCurrentMapEpoch.store(
       m_war3GpuSkinMapEpoch, std::memory_order_release);
-  war3::render::VisibleRenderableRegistry::instance()
-      .resetShadowManifestMapEpoch(m_war3GpuSkinMapEpoch);
-  war3::model::ShadowModelResourceCache::instance().resetMapEpoch(
-      m_war3GpuSkinMapEpoch);
-  // Keep the already-installed Game.dll hooks alive across maps, but discard
-  // every producer cache whose raw pointers, palette slots or frame tags can
-  // be reused by the new session.
-  war3::model::ResetMapSession();
   if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
     m_war3PersistentPackageD3D9ObserveOwner->invalidateMapEpoch(
         m_war3GpuSkinMapEpoch);
@@ -14578,19 +14647,29 @@ D3D9DeviceEx::QueryWar3ShadowLifecycleDiagnostics() const {
   return result;
 }
 
-bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(
-    uint64_t retireSerial) {
-  const uint64_t requested =
-      m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire);
-  if (requested == m_war3ShadowMapResetAppliedSerial)
-    return false;
+void D3D9DeviceEx::War3RequestShadowDeviceEpochTransition(
+    uint64_t deviceEpoch) {
+  if (deviceEpoch == 0u ||
+      deviceEpoch == m_war3ShadowDeviceEpochApplied.load(
+          std::memory_order_acquire)) {
+    return;
+  }
 
+  // GPU-skin publishes a device epoch only after its resource rebind commits.
+  // Close all shadow producers immediately, but leave receiver and GPU-owned
+  // D3D shadow resources to the next render-owner Present transaction.
+  m_war3ShadowDeviceEpochRequested.store(
+      deviceEpoch, std::memory_order_release);
   m_war3ShadowSessionReady.store(false, std::memory_order_release);
-  m_war3ShadowDiagTransitionState.store(2u, std::memory_order_release);
+  m_war3ShadowDiagTransitionState.store(1u, std::memory_order_release);
+}
+
+void D3D9DeviceEx::War3QuarantineShadowSessionAtPresent(
+    uint64_t retireSerial) {
   if (dxvk::war3::memory::ShadowArena_IsInitialized())
     dxvk::war3::memory::ShadowArena_QuarantineCurrentGeneration(retireSerial);
 
-  // This signal is ordered after every command emitted by the old session and
+  // This signal is ordered after every command emitted by the old epoch and
   // is shared by Arena generations and retired-session Rc ownership.
   if (m_war3ShadowArenaFence != nullptr) {
     const Rc<sync::Fence> cShadowArenaFence = m_war3ShadowArenaFence;
@@ -14601,28 +14680,54 @@ bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(
   m_war3ShadowArenaQuarantinedRetireSerial = retireSerial;
   m_war3ShadowDiagQuarantinedRetireSerial.store(
       retireSerial, std::memory_order_release);
+}
+
+void D3D9DeviceEx::War3InvalidateShadowReceiverEpochOnCs(
+    uint64_t mapEpoch, uint64_t deviceEpoch) {
+  if (m_shadowReceiverPass == nullptr || mapEpoch == 0u || deviceEpoch == 0u)
+    return;
+
+  War3ShadowReceiverPass* const receiver = m_shadowReceiverPass;
+  // Receiver state and its async point/volume publications belong to the CS
+  // thread. The caller enqueues this only after the old-epoch completion
+  // signal, so earlier Run() calls finish before invalidation and later Run()
+  // calls observe the new tuple.
+  EmitCs([receiver, mapEpoch, deviceEpoch](DxvkContext*) {
+    receiver->InvalidateMapEpoch(mapEpoch, deviceEpoch);
+  });
+}
+
+bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(
+    uint64_t retireSerial) {
+  const uint64_t requested =
+      m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire);
+  if (requested == m_war3ShadowMapResetAppliedSerial)
+    return false;
+
+  m_war3ShadowSessionReady.store(false, std::memory_order_release);
+  m_war3ShadowDiagTransitionState.store(2u, std::memory_order_release);
+  War3QuarantineShadowSessionAtPresent(retireSerial);
 
   // Map-wide render registries are reset only for the lifecycle transition,
   // not for a shadow tombstone overflow that merely rebuilds caster caches.
-  dxvk::war3::render::RenderQueueTracker::instance().Reset();
-  dxvk::war3::render::ExecBatchProcessor::ResetCaches();
-  War3RenderState::ResetRuntimeState();
-  dxvk::war3::render::ResetShadowRuntimeBridgeState();
   dxvk::war3::render::War3LightningRuntime::instance().reset();
-  dxvk::war3::shadow::ShadowValidationRuntime::instance().reset();
-  dxvk::war3::render::War3Renderer::instance().ResetMapSession();
   War3ResetShadowSessionState(retireSerial);
   War3ResetGpuSkinMapEpoch();
-  if (m_shadowReceiverPass != nullptr) {
-    War3ShadowReceiverPass* const receiver = m_shadowReceiverPass;
-    const uint64_t mapEpoch = m_war3GpuSkinMapEpoch;
-    const uint64_t deviceEpoch = m_war3GpuSkinDeviceEpoch;
-    // Receiver state belongs to the CS thread. Ordering this command after the
-    // old-session completion signal avoids racing an earlier Run() while still
-    // ensuring every new-session Run observes the invalidation first.
-    EmitCs([receiver, mapEpoch, deviceEpoch](DxvkContext*) {
-      receiver->InvalidateMapEpoch(mapEpoch, deviceEpoch);
-    });
+  const uint64_t deviceEpoch = m_war3GpuSkinDeviceEpoch;
+  War3InvalidateShadowReceiverEpochOnCs(
+      m_war3GpuSkinMapEpoch, deviceEpoch);
+  // A map reset subsumes every committed device transition observed before
+  // this transaction because the receiver receives the complete current tuple.
+  m_war3ShadowDeviceEpochApplied.store(
+      deviceEpoch, std::memory_order_release);
+  const uint64_t requestedDeviceEpoch =
+      m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire);
+  if (requestedDeviceEpoch == deviceEpoch && War3GpuSkinDeviceReady()) {
+    // Only the Present-owned transaction may reopen a reset that entered the
+    // device-rebind-pending state. A failed SetDevice therefore stays closed
+    // even if its last published epoch still equals the applied epoch.
+    m_war3ShadowDeviceRebindPending.store(
+        false, std::memory_order_release);
   }
 
   // Coalesce every request observed before this Present into one epoch bump.
@@ -14633,6 +14738,49 @@ bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(
       requested, std::memory_order_release);
   m_war3ShadowDiagAppliedFrameSerial.store(
       m_war3ShadowMapResetAppliedFrameSerial, std::memory_order_release);
+  return true;
+}
+
+bool D3D9DeviceEx::War3ApplyShadowDeviceEpochTransitionAtPresent(
+    uint64_t retireSerial) {
+  const uint64_t requested = m_war3ShadowDeviceEpochRequested.load(
+      std::memory_order_acquire);
+  const uint64_t applied = m_war3ShadowDeviceEpochApplied.load(
+      std::memory_order_acquire);
+  if (requested == applied) {
+    if (m_war3ShadowDeviceRebindPending.load(
+            std::memory_order_acquire)) {
+      m_war3ShadowSessionReady.store(false, std::memory_order_release);
+    }
+    return false;
+  }
+
+  // A pending GPU-skin rebind has not published an epoch yet and therefore
+  // cannot authorize a receiver transition. Keep the producer gate closed
+  // until the committed epoch and manager resource owner agree.
+  if (requested == 0u || requested != m_war3GpuSkinDeviceEpoch ||
+      !War3GpuSkinDeviceReady()) {
+    m_war3ShadowSessionReady.store(false, std::memory_order_release);
+    return false;
+  }
+
+  m_war3ShadowSessionReady.store(false, std::memory_order_release);
+  m_war3ShadowDiagTransitionState.store(2u, std::memory_order_release);
+  War3QuarantineShadowSessionAtPresent(retireSerial);
+
+  // Every D3D shadow owner below contains draws or publications stamped with
+  // the old device epoch. Move GPU-backed containers behind the completion
+  // fence and clear only this device's CPU aliases; map-level semantic
+  // registries remain valid because Warcraft did not change maps.
+  War3ResetShadowSessionState(retireSerial);
+  War3InvalidateShadowReceiverEpochOnCs(
+      m_war3GpuSkinMapEpoch, requested);
+  m_war3ShadowDeviceEpochApplied.store(
+      requested, std::memory_order_release);
+  // SetDevice and the GPU-skin owner are proven ready above; keep the gate
+  // closed until this CS-ordered receiver transition has been published.
+  m_war3ShadowDeviceRebindPending.store(
+      false, std::memory_order_release);
   return true;
 }
 
@@ -14653,6 +14801,7 @@ void D3D9DeviceEx::War3RetryGpuSkinDeviceRebind() {
   }
 
   const uint64_t candidateEpoch = m_war3GpuSkinPendingDeviceEpoch;
+  const uint64_t previousEpoch = m_war3GpuSkinDeviceEpoch;
   const auto mode = m_war3GpuSkinManager != nullptr
       ? m_war3GpuSkinManager->mode()
       : war3::gpu_skin::GpuSkinMode::Disabled;
@@ -14666,6 +14815,9 @@ void D3D9DeviceEx::War3RetryGpuSkinDeviceRebind() {
     m_war3GpuSkinPendingDeviceEpoch = 0u;
     m_war3GpuSkinDeviceBindingState =
         War3GpuSkinDeviceBindingState::Ready;
+    if (m_war3GpuSkinDeviceEpoch != previousEpoch) {
+      War3RequestShadowDeviceEpochTransition(m_war3GpuSkinDeviceEpoch);
+    }
     if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
       m_war3PersistentPackageD3D9ObserveOwner->invalidateDeviceEpoch(
           m_war3GpuSkinDeviceEpoch);
@@ -14688,6 +14840,9 @@ void D3D9DeviceEx::War3RetryGpuSkinDeviceRebind() {
     m_war3GpuSkinPendingDeviceEpoch = 0u;
     m_war3GpuSkinDeviceBindingState =
         War3GpuSkinDeviceBindingState::Ready;
+    if (m_war3GpuSkinDeviceEpoch != previousEpoch) {
+      War3RequestShadowDeviceEpochTransition(m_war3GpuSkinDeviceEpoch);
+    }
     if (m_war3PersistentPackageD3D9ObserveOwner != nullptr) {
       m_war3PersistentPackageD3D9ObserveOwner->invalidateDeviceEpoch(
           m_war3GpuSkinDeviceEpoch);
@@ -14712,6 +14867,14 @@ void D3D9DeviceEx::War3RetryGpuSkinDeviceRebind() {
 }
 
 void D3D9DeviceEx::War3ResetGpuSkinDeviceEpoch() {
+  // Reset/ResetEx has replaced the D3D9 device-resource domain. Close every
+  // shadow producer before diagnostics, retirement, or a possibly failing
+  // GPU-skin SetDevice attempt. Only a committed Present transition clears
+  // this bit after the receiver and all device-stamped publications are
+  // revoked in CS order.
+  m_war3ShadowDeviceRebindPending.store(true, std::memory_order_release);
+  m_war3ShadowSessionReady.store(false, std::memory_order_release);
+  m_war3ShadowDiagTransitionState.store(1u, std::memory_order_release);
   War3LogGpuSkinDiagnostics(true);
   War3RetireGpuSkinFrameBatches();
   m_war3GpuSkinD3D9IndexTicket = {};
@@ -14736,7 +14899,7 @@ bool D3D9DeviceEx::War3ResetGpuSkinBridgeForTest(bool deviceEpoch) {
   if (deviceEpoch)
     War3ResetGpuSkinDeviceEpoch();
   else
-    War3ResetGpuSkinMapEpoch();
+    War3RequestShadowMapEpochReset();
   War3LogGpuSkinDiagnostics(true);
   return true;
 }
@@ -18013,7 +18176,10 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   // Arena generation; until then no old/new mixed caster set may reach replay.
   if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
       m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
-          m_war3ShadowMapResetAppliedSerial) {
+          m_war3ShadowMapResetAppliedSerial ||
+      m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire) !=
+          m_war3ShadowDeviceEpochApplied.load(std::memory_order_acquire) ||
+      m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire)) {
     m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
         1u, std::memory_order_relaxed);
     return;
@@ -18860,7 +19026,10 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   // receiver run carrying the old epoch.
   if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
       m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
-          m_war3ShadowMapResetAppliedSerial) {
+          m_war3ShadowMapResetAppliedSerial ||
+      m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire) !=
+          m_war3ShadowDeviceEpochApplied.load(std::memory_order_acquire) ||
+      m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire)) {
     m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
         1u, std::memory_order_relaxed);
     return;
@@ -18912,7 +19081,7 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
       WAR3_RENDER_LOG("DXVK War3Camera: using last-good camera fallback\n");
     }
   }
-  input.settings = &m_war3Pipeline->GetSettings();
+  m_war3Pipeline->CaptureSettingsSnapshot(input);
   input.frameIndex =
       m_war3FrameIndex; // Capture Current Frame Index for CS Thread
   // m_war3ShadowPersistentFrameSerial advances at Present after the current
@@ -19247,7 +19416,8 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
             s_logged = true;
             Logger::err("War3PostProcess: 执行失败，已回退到原版渲染");
           }
-          m_war3Pipeline->MutableSettings().postFx.enabled = false;
+          if (auto settingsWrite = war3::GetMutableSettings())
+            settingsWrite->postFx.enabled = false;
         }
       }
     }
@@ -20600,7 +20770,10 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     bool fromStalePoseRestore) {
   if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
       m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
-          m_war3ShadowMapResetAppliedSerial) {
+          m_war3ShadowMapResetAppliedSerial ||
+      m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire) !=
+          m_war3ShadowDeviceEpochApplied.load(std::memory_order_acquire) ||
+      m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire)) {
     m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
         1u, std::memory_order_relaxed);
     return false;
@@ -23437,7 +23610,7 @@ void D3D9DeviceEx::War3ObservePersistentPackageD3D9Owner(
       evidence.disposition !=
           Adapter::Disposition::RecordedCurrentMapSource ||
       !evidence.provesCurrentGameMemory ||
-      !War3GpuSkinDeviceReady() || war3::GetActiveDevice() != this ||
+      !War3GpuSkinDeviceReady() || !war3::IsActiveDevice(this) ||
       m_deviceLostState != D3D9DeviceLostState::Ok) {
     return;
   }
@@ -29268,7 +29441,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
 
   if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
       m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
-          m_war3ShadowMapResetAppliedSerial) {
+          m_war3ShadowMapResetAppliedSerial ||
+      m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire) !=
+          m_war3ShadowDeviceEpochApplied.load(std::memory_order_acquire) ||
+      m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire)) {
     m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
         1u, std::memory_order_relaxed);
     return 0u;
@@ -30593,7 +30769,10 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
     bool executeNativeBackendValidation) {
   if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
       m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
-          m_war3ShadowMapResetAppliedSerial) {
+          m_war3ShadowMapResetAppliedSerial ||
+      m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire) !=
+          m_war3ShadowDeviceEpochApplied.load(std::memory_order_acquire) ||
+      m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire)) {
     m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
         1u, std::memory_order_relaxed);
     return false;
@@ -30672,7 +30851,7 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
       War3WorldCameraIsFreshForFrame(m_war3LastGoodCamera,
                                      pipelineFrameSerial))
     input.scene.worldCamera = m_war3LastGoodCamera;
-  input.settings = &m_war3Pipeline->GetSettings();
+  m_war3Pipeline->CaptureSettingsSnapshot(input);
   input.frameIndex = m_war3FrameIndex;
   input.frameSerial = pipelineFrameSerial;
   input.mapEpoch = m_war3GpuSkinMapEpoch;
@@ -33312,7 +33491,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
   // immediately prepares a reserved, empty scene for the next frame. Preserve
   // that fact across OnFrameStart(), which clears HasInsertedBeforeUi().
   bool war3FrameSceneAlreadyRotated = false;
-  bool war3ArenaRetiredAtMapTransition = false;
+  bool war3ArenaRetiredAtEpochTransition = false;
   {
   // This root intentionally ends before m_implicitSwapchain->Present. It is
   // the WarVK/DXVK pre-swapchain frame transition, not swapchain wait/present.
@@ -33347,8 +33526,31 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
         War3PresentFrameTransitionScope("ShadowMapEpochTransition");
     const uint64_t retiringFrameSerial =
         m_war3ShadowPersistentFrameSerial + 1u;
-    war3ArenaRetiredAtMapTransition =
-        War3ApplyShadowMapEpochResetAtPresent(retiringFrameSerial);
+    const bool mapEpochTransitionPending =
+        m_war3ShadowMapResetRequestedSerial.load(
+            std::memory_order_acquire) !=
+        m_war3ShadowMapResetAppliedSerial;
+    const bool deviceEpochTransitionPending =
+        m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire) ||
+        m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire) !=
+            m_war3ShadowDeviceEpochApplied.load(std::memory_order_acquire);
+    if (mapEpochTransitionPending || deviceEpochTransitionPending) {
+      bool mapEpochTransition = false;
+      bool deviceEpochTransition = false;
+      const bool stillActiveOwner = war3::RunWithActiveDevicePublication(
+          this, [this, retiringFrameSerial, &mapEpochTransition,
+                 &deviceEpochTransition]() {
+            mapEpochTransition =
+                War3ApplyShadowMapEpochResetAtPresent(retiringFrameSerial);
+            deviceEpochTransition =
+                War3ApplyShadowDeviceEpochTransitionAtPresent(
+                    retiringFrameSerial);
+          });
+      if (!stillActiveOwner)
+        m_war3ShadowSessionReady.store(false, std::memory_order_release);
+      war3ArenaRetiredAtEpochTransition =
+          mapEpochTransition || deviceEpochTransition;
+    }
   }
   {
     auto phaseScope =
@@ -33387,7 +33589,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     const bool shadowSessionReady =
         m_war3ShadowSessionReady.load(std::memory_order_acquire) &&
         m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) ==
-            m_war3ShadowMapResetAppliedSerial;
+            m_war3ShadowMapResetAppliedSerial &&
+        m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire) ==
+            m_war3ShadowDeviceEpochApplied.load(std::memory_order_acquire) &&
+        !m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire);
     const bool wantsShadowCapture = shadowSessionReady &&
         m_war3Pipeline && m_war3Pipeline->WantsShadowCapture();
     const bool wantsSemanticSceneIdentity =
@@ -33470,9 +33675,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       const uint64_t retiringFrameSerial =
           m_war3ShadowPersistentFrameSerial + 1u;
       const uint64_t nextFrameSerial = retiringFrameSerial + 1u;
-      if (!war3ArenaRetiredAtMapTransition)
+      if (!war3ArenaRetiredAtEpochTransition)
         dxvk::war3::memory::ShadowArena_EndFrame(retiringFrameSerial);
-      if (!war3ArenaRetiredAtMapTransition &&
+      if (!war3ArenaRetiredAtEpochTransition &&
           m_war3ShadowArenaFence != nullptr) {
         const Rc<sync::Fence> cShadowArenaFence = m_war3ShadowArenaFence;
         EmitCs([cShadowArenaFence,
@@ -33490,7 +33695,13 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       const bool resetFullyApplied =
           m_war3ShadowMapResetRequestedSerial.load(
               std::memory_order_acquire) ==
-          m_war3ShadowMapResetAppliedSerial;
+              m_war3ShadowMapResetAppliedSerial &&
+          m_war3ShadowDeviceEpochRequested.load(
+              std::memory_order_acquire) ==
+              m_war3ShadowDeviceEpochApplied.load(
+                  std::memory_order_acquire) &&
+          !m_war3ShadowDeviceRebindPending.load(
+              std::memory_order_acquire);
       m_war3ShadowSessionReady.store(
           arenaReady && resetFullyApplied, std::memory_order_release);
       m_war3ShadowDiagTransitionState.store(
@@ -33508,7 +33719,13 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       const bool resetFullyApplied =
           m_war3ShadowMapResetRequestedSerial.load(
               std::memory_order_acquire) ==
-          m_war3ShadowMapResetAppliedSerial;
+              m_war3ShadowMapResetAppliedSerial &&
+          m_war3ShadowDeviceEpochRequested.load(
+              std::memory_order_acquire) ==
+              m_war3ShadowDeviceEpochApplied.load(
+                  std::memory_order_acquire) &&
+          !m_war3ShadowDeviceRebindPending.load(
+              std::memory_order_acquire);
       m_war3ShadowSessionReady.store(resetFullyApplied,
                                      std::memory_order_release);
       m_war3ShadowDiagTransitionState.store(
@@ -40225,7 +40442,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
   if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
       m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
-          m_war3ShadowMapResetAppliedSerial) {
+          m_war3ShadowMapResetAppliedSerial ||
+      m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire) !=
+          m_war3ShadowDeviceEpochApplied.load(std::memory_order_acquire) ||
+      m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire)) {
     m_war3ShadowDiagPendingProducerRejectCount.fetch_add(
         1u, std::memory_order_relaxed);
     return;

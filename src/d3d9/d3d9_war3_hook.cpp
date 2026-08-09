@@ -366,8 +366,11 @@ void ResetWar3RuntimeState() {
   // apply after the final BeforeUi boundary. GPU-owned caches and Arena
   // generations must never be rewound from this callback.
   g_war3_runtime_activated.store(false, std::memory_order_release);
-  if (auto* device = dxvk::war3::GetActiveDevice())
-    device->War3RequestShadowMapEpochReset();
+  // Keep active-device lookup, request publication, destructor revocation and
+  // the no-owner CPU fallback in one publication transaction. This prevents
+  // both dereferencing a destroyed device and clearing a just-published new
+  // device's semantic identity domain behind its back.
+  dxvk::war3::RequestActiveDeviceShadowMapResetOrCpuFallback();
   dxvk::war3::platform::ResetRuntimeCore();
 }
 

@@ -2,6 +2,7 @@
 
 #include "../model/war3_model_resource_cache.h"
 #include "../shadow/war3_shadow_runtime_contract.h"
+#include "../core/war3_internal_test_config.h"
 
 #include "../../d3d9_mem.h"
 #include "../../../util/util_env.h"
@@ -313,6 +314,9 @@ D3D9HostAllocatorSnapshot MakeHostAllocatorSnapshot(
 } // namespace
 
 bool Enabled() noexcept {
+  if constexpr (dxvk::war3::internal::
+                    kReleaseFreezeExperimentalShadowRoutes)
+    return false;
   static const bool enabled = ParseEnabled();
   return enabled;
 }

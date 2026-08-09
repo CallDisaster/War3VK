@@ -13,6 +13,16 @@
 namespace dxvk::war3::internal {
 
 // ========================================================================
+// Hotfix release containment
+// ========================================================================
+// Hotfix3 is a correctness-only release candidate. Keep unfinished shadow
+// optimization observers and every corresponding Consume path unreachable,
+// even when a launcher inherits stale DXVK_WAR3_* experiment variables.
+// Correctness contracts such as current-frame Type0 capture, replay validation,
+// epoch isolation, Arena ownership and point-shadow receiver bias remain on.
+inline constexpr bool kReleaseFreezeExperimentalShadowRoutes = true;
+
+// ========================================================================
 // MainLoop 逻辑层覆盖分析模式（第四轮专项）
 // ========================================================================
 // 目的：

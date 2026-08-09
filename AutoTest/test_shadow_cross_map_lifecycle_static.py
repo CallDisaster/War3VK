@@ -6,7 +6,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
+DEVICE_H = (ROOT / "src/d3d9/d3d9_device.h").read_text(encoding="utf-8")
 HOOK = (ROOT / "src/d3d9/d3d9_war3_hook.cpp").read_text(encoding="utf-8")
+WAR3 = (ROOT / "src/d3d9/war3/war3.cpp").read_text(encoding="utf-8")
+VISUAL_BRIDGE = (
+    ROOT / "src/d3d9/war3/bridge/war3_visual_bridge_v1.cpp"
+).read_text(encoding="utf-8")
+JAPI = (ROOT / "src/d3d9/war3/japi/war3_japi_v1.cpp").read_text(
+    encoding="utf-8"
+)
+INTERNAL_TEST_API = (
+    ROOT / "src/d3d9/war3/tools/war3_internal_test_api.cpp"
+).read_text(encoding="utf-8")
 RENDER_HOOK = (
     ROOT / "src/d3d9/war3/hooks/war3_hook_render.cpp"
 ).read_text(encoding="utf-8")
@@ -15,6 +26,9 @@ BOOTSTRAP = (
 ).read_text(encoding="utf-8")
 SHADOW = (ROOT / "src/d3d9/d3d9_war3_shadow.cpp").read_text(encoding="utf-8")
 SCENE = (ROOT / "src/d3d9/d3d9_war3_scene.h").read_text(encoding="utf-8")
+SCENE_COLLECTOR = (
+    ROOT / "src/d3d9/war3/render/war3_scene_collector.cpp"
+).read_text(encoding="utf-8")
 VISIBLE = (
     ROOT / "src/d3d9/war3/render/war3_visible_renderables.cpp"
 ).read_text(encoding="utf-8")
@@ -100,14 +114,26 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
             "void D3D9DeviceEx::War3ResetGpuSkinMapEpoch()",
             "void D3D9DeviceEx::War3RequestShadowMapEpochReset()",
         )
-        resource_epoch = epoch_reset.index("resetMapEpoch(")
-        producer_reset = epoch_reset.index("war3::model::ResetMapSession()")
-        self.assertLess(resource_epoch, producer_reset)
+        self.assertIn(
+            "m_war3GpuSkinMapEpoch = War3ResetCpuSemanticMapSession(",
+            epoch_reset,
+        )
+
+        cpu_reset = body(
+            DEVICE,
+            "uint64_t D3D9DeviceEx::War3ResetCpuSemanticMapSession(",
+            "D3D9DeviceEx::D3D9DeviceEx(",
+        )
+        self.assertLess(
+            cpu_reset.index("ShadowModelResourceCache::instance().resetMapEpoch"),
+            cpu_reset.index("war3::model::ResetMapSession()"),
+        )
+        self.assertIn("war3::model::ResetMapSession()", cpu_reset)
 
         transition = body(
             DEVICE,
             "bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(",
-            "bool D3D9DeviceEx::War3GpuSkinDeviceReady() const",
+            "bool D3D9DeviceEx::War3ApplyShadowDeviceEpochTransitionAtPresent(",
         )
         self.assertNotIn("war3::model::Shutdown()", transition)
 
@@ -160,9 +186,20 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
 
     def test_unload_is_request_only_for_render_owned_state(self) -> None:
         reset = body(HOOK, "void ResetWar3RuntimeState()", "bool ValidateGameModule")
-        self.assertIn("War3RequestShadowMapEpochReset", reset)
+        self.assertIn("RequestActiveDeviceShadowMapResetOrCpuFallback", reset)
         self.assertNotIn("ShadowArena_Reset", reset)
         self.assertNotIn("War3ResetGpuSkinMapEpoch", reset)
+        self.assertNotIn("GetActiveDevice", reset)
+        self.assertNotIn("War3ResetCpuSemanticMapSession", reset)
+
+        fallback = body(
+            WAR3,
+            "void RequestActiveDeviceShadowMapResetOrCpuFallback()",
+            "struct War3SettingsWrite::Impl",
+        )
+        self.assertIn("s_activePublicationMutex", fallback)
+        self.assertIn("device->War3RequestShadowMapEpochReset()", fallback)
+        self.assertIn("D3D9DeviceEx::War3ResetCpuSemanticMapSession()", fallback)
 
         cpu_reset = body(BOOTSTRAP, "void ResetRuntimeCore()", "void BindNativeShadowDevice")
         for forbidden in (
@@ -184,10 +221,14 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
             "HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateRenderTargetEx",
         )
         before = present.index("War3MaybeInsertBeforeUi(true)")
-        transition = present.index("War3ApplyShadowMapEpochResetAtPresent")
+        map_transition = present.index("War3ApplyShadowMapEpochResetAtPresent")
+        device_transition = present.index(
+            "War3ApplyShadowDeviceEpochTransitionAtPresent"
+        )
         tracking = present.index('War3PresentFrameTransitionScope("TrackingDecision")')
-        self.assertLess(before, transition)
-        self.assertLess(transition, tracking)
+        self.assertLess(before, map_transition)
+        self.assertLess(map_transition, device_transition)
+        self.assertLess(device_transition, tracking)
         self.assertIn("ShadowArena_QuarantineCurrentGeneration", DEVICE)
         self.assertIn("ctx->signal(cShadowArenaFence", DEVICE)
         allocator_reset = body(
@@ -197,6 +238,8 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
         )
         self.assertIn("m_war3ShadowSessionReady.load", allocator_reset)
         self.assertIn("m_war3ShadowMapResetRequestedSerial.load", allocator_reset)
+        self.assertIn("m_war3ShadowDeviceEpochRequested.load", allocator_reset)
+        self.assertIn("m_war3ShadowDeviceRebindPending.load", allocator_reset)
 
     def test_epoch_is_process_monotonic_and_stamped_on_final_draws(self) -> None:
         self.assertIn("MintWar3ShadowMapEpoch", DEVICE)
@@ -224,6 +267,250 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
             section = body(DEVICE, signature, next_signature)
             self.assertIn("m_war3ShadowSessionReady.load", section)
             self.assertIn("m_war3ShadowMapResetRequestedSerial.load", section)
+            self.assertIn("m_war3ShadowDeviceEpochRequested.load", section)
+            self.assertIn("m_war3ShadowDeviceEpochApplied.load", section)
+            self.assertIn("m_war3ShadowDeviceRebindPending.load", section)
+
+    def test_device_epoch_commit_is_a_present_owned_receiver_transaction(self) -> None:
+        rebind = body(
+            DEVICE,
+            "void D3D9DeviceEx::War3RetryGpuSkinDeviceRebind()",
+            "void D3D9DeviceEx::War3ResetGpuSkinDeviceEpoch()",
+        )
+        self.assertEqual(
+            rebind.count("m_war3GpuSkinDeviceEpoch = candidateEpoch"), 2
+        )
+        self.assertEqual(
+            rebind.count("War3RequestShadowDeviceEpochTransition("), 2
+        )
+        first_commit = rebind.index("m_war3GpuSkinDeviceEpoch = candidateEpoch")
+        first_request = rebind.index("War3RequestShadowDeviceEpochTransition(")
+        second_commit = rebind.index(
+            "m_war3GpuSkinDeviceEpoch = candidateEpoch", first_commit + 1
+        )
+        second_request = rebind.index(
+            "War3RequestShadowDeviceEpochTransition(", first_request + 1
+        )
+        self.assertLess(first_commit, first_request)
+        self.assertLess(first_request, second_commit)
+        self.assertLess(second_commit, second_request)
+
+        invalidate = body(
+            DEVICE,
+            "void D3D9DeviceEx::War3InvalidateShadowReceiverEpochOnCs(",
+            "bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent(",
+        )
+        self.assertIn("EmitCs([receiver, mapEpoch, deviceEpoch]", invalidate)
+        self.assertIn("receiver->InvalidateMapEpoch(mapEpoch, deviceEpoch)", invalidate)
+
+        transition = body(
+            DEVICE,
+            "bool D3D9DeviceEx::War3ApplyShadowDeviceEpochTransitionAtPresent(",
+            "bool D3D9DeviceEx::War3GpuSkinDeviceReady() const",
+        )
+        for token in (
+            "War3QuarantineShadowSessionAtPresent(retireSerial)",
+            "War3ResetShadowSessionState(retireSerial)",
+            "War3InvalidateShadowReceiverEpochOnCs(",
+            "m_war3ShadowDeviceEpochApplied.store(",
+            "m_war3ShadowDeviceRebindPending.store(",
+        ):
+            self.assertIn(token, transition)
+        self.assertNotIn("receiver->InvalidateMapEpoch", transition)
+
+        present = body(
+            DEVICE,
+            "HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx",
+            "HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateRenderTargetEx",
+        )
+        self.assertGreaterEqual(
+            present.count("m_war3ShadowDeviceEpochRequested.load("), 3
+        )
+        self.assertIn("war3::RunWithActiveDevicePublication(", present)
+
+    def test_failed_device_rebind_keeps_every_shadow_gate_closed(self) -> None:
+        rebind = body(
+            DEVICE,
+            "void D3D9DeviceEx::War3ResetGpuSkinDeviceEpoch()",
+            "bool D3D9DeviceEx::War3ResetGpuSkinBridgeForTest",
+        )
+        gate = rebind.index("m_war3ShadowDeviceRebindPending.store(true")
+        diagnostics = rebind.index("War3LogGpuSkinDiagnostics(true)")
+        retry = rebind.index("War3RetryGpuSkinDeviceRebind()")
+        self.assertLess(gate, diagnostics)
+        self.assertLess(gate, retry)
+        self.assertIn("m_war3ShadowSessionReady.store(false", rebind)
+        self.assertNotIn("m_war3ShadowDeviceRebindPending.store(false", rebind)
+
+        transition = body(
+            DEVICE,
+            "bool D3D9DeviceEx::War3ApplyShadowDeviceEpochTransitionAtPresent(",
+            "bool D3D9DeviceEx::War3GpuSkinDeviceReady() const",
+        )
+        clear = transition.index("m_war3ShadowDeviceRebindPending.store(")
+        invalidate = transition.index("War3InvalidateShadowReceiverEpochOnCs(")
+        self.assertLess(invalidate, clear)
+        self.assertIn("!War3GpuSkinDeviceReady()", transition)
+
+        self.assertIn(
+            "std::atomic<uint64_t> m_war3ShadowDeviceEpochApplied",
+            DEVICE_H,
+        )
+
+    def test_internal_map_reset_probe_only_publishes_a_present_request(self) -> None:
+        probe = body(
+            DEVICE,
+            "bool D3D9DeviceEx::War3ResetGpuSkinBridgeForTest(bool deviceEpoch)",
+            "bool D3D9DeviceEx::War3LogGpuSkinDiagnosticsForTest(",
+        )
+        self.assertIn("War3RequestShadowMapEpochReset()", probe)
+        self.assertNotIn("War3ResetGpuSkinMapEpoch()", probe)
+        command = body(
+            INTERNAL_TEST_API,
+            '} else if (state->request.command == "gpu_skin.reset_bridge") {',
+            '} else if (state->request.command == "shutdown.session") {',
+        )
+        self.assertIn("shadowMapResetRequestedBefore", command)
+        self.assertIn("shadowMapResetRequestedAfter", command)
+        self.assertIn('scope == "map"', command)
+
+    def test_cpu_semantic_reset_is_shared_without_old_gpu_ownership(self) -> None:
+        reset = body(
+            DEVICE,
+            "uint64_t D3D9DeviceEx::War3ResetCpuSemanticMapSession(",
+            "D3D9DeviceEx::D3D9DeviceEx(",
+        )
+        for token in (
+            "RenderQueueTracker::instance().Reset()",
+            "ExecBatchProcessor::ResetCaches()",
+            "War3RenderState::ResetRuntimeState()",
+            "ResetShadowRuntimeBridgeState()",
+            "ShadowValidationRuntime::instance().reset()",
+            "War3Renderer::instance().ResetMapSession()",
+            "war3::model::ResetMapSession()",
+            "ResetCurrentDrawContractCache()",
+            "War3ResetDirectPacketMapCaches()",
+            "War3ShadowDrawMetadataStore().clear()",
+            "ClearPayloadsForLifecycleOverflow()",
+        ):
+            self.assertIn(token, reset)
+        for forbidden in (
+            "ShadowArena_",
+            "m_shadowReceiverPass",
+            "m_war3GpuSkinManager",
+            "War3ResetShadowSessionState",
+        ):
+            self.assertNotIn(forbidden, reset)
+        semantic_lock = reset.index("g_war3CpuSemanticMapSessionMutex")
+        mint = reset.index("MintWar3ShadowMapEpoch()")
+        registry_reset = reset.index("resetShadowManifestMapEpoch(mapEpoch)")
+        self.assertLess(semantic_lock, mint)
+        self.assertLess(mint, registry_reset)
+
+        constructor = body(
+            DEVICE,
+            "D3D9DeviceEx::D3D9DeviceEx(",
+            "D3D9DeviceEx::~D3D9DeviceEx()",
+        )
+        publish_transaction = constructor.index("war3::PublishActiveDeviceAfter(this")
+        cpu_reset = constructor.index("War3ResetCpuSemanticMapSession(")
+        receiver_init = constructor.index("m_shadowReceiverPass->InvalidateMapEpoch(")
+        self.assertLess(publish_transaction, cpu_reset)
+        self.assertLess(cpu_reset, receiver_init)
+        self.assertLess(constructor.index("RegisterPass("), publish_transaction)
+        self.assertNotIn("MintWar3ShadowMapEpoch()", constructor)
+
+    def test_active_device_handoff_and_map_transition_share_one_transaction(self) -> None:
+        publish = body(
+            WAR3,
+            "void PublishActiveDeviceAfter(",
+            "bool ClearActiveDeviceIfCurrent(",
+        )
+        self.assertIn("s_activePublicationMutex", publish)
+        self.assertLess(
+            publish.index("beforePublish()"),
+            publish.index("PublishActiveDeviceLocked(device)"),
+        )
+
+        run = body(
+            WAR3,
+            "bool RunWithActiveDevicePublication(",
+            "void RequestActiveDeviceShadowMapResetOrCpuFallback()",
+        )
+        self.assertIn("s_activePublicationMutex", run)
+        self.assertIn("s_activeDevice.load", run)
+        self.assertIn("transaction()", run)
+
+        present = body(
+            DEVICE,
+            "HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx",
+            "HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateRenderTargetEx",
+        )
+        transaction = present.index("war3::RunWithActiveDevicePublication(")
+        map_reset = present.index("War3ApplyShadowMapEpochResetAtPresent(")
+        device_reset = present.index("War3ApplyShadowDeviceEpochTransitionAtPresent(")
+        self.assertLess(transaction, map_reset)
+        self.assertLess(map_reset, device_reset)
+
+    def test_active_device_queries_do_not_export_dereferenceable_raw_pointers(self) -> None:
+        run = body(
+            WAR3,
+            "bool RunWithActiveDevice(",
+            "bool HasActivePipeline()",
+        )
+        self.assertIn("s_activePublicationMutex", run)
+        self.assertIn("transaction(*device)", run)
+
+        has_pipeline = body(
+            WAR3,
+            "bool HasActivePipeline()",
+            "bool RunWithActiveDevicePublication(",
+        )
+        self.assertIn("RunWithActiveDevice", has_pipeline)
+        self.assertIn("device.GetWar3Pipeline() != nullptr", has_pipeline)
+        self.assertIn("HasActivePipeline()", VISUAL_BRIDGE)
+        self.assertIn("HasActivePipeline()", JAPI)
+
+        offenders = []
+        for path in (ROOT / "src").rglob("*"):
+            if path.suffix not in {".cpp", ".h"}:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if (
+                "GetActiveDevice(" in text
+                or "GetActivePipeline(" in text
+                or "SetActiveDevice(" in text
+            ):
+                offenders.append(str(path.relative_to(ROOT)))
+        self.assertEqual([], offenders)
+
+    def test_scene_collector_pointer_tls_invalidates_before_empty_early_return(self) -> None:
+        tracked_epoch = SCENE_COLLECTOR.index(
+            "if (s_trackedPtrMapMapEpoch != mapEpoch)"
+        )
+        unit_epoch = SCENE_COLLECTOR.index(
+            "if (s_unitHandleCacheMapEpoch != mapEpoch)"
+        )
+        early_return = SCENE_COLLECTOR.index(
+            "if (filtered && s_trackedHandles.empty() && !probeEnabled)"
+        )
+        first_early_return = SCENE_COLLECTOR.index("if (!gameWorldPtr)")
+        self.assertLess(tracked_epoch, first_early_return)
+        self.assertLess(unit_epoch, first_early_return)
+        self.assertLess(tracked_epoch, early_return)
+        self.assertLess(unit_epoch, early_return)
+        before_return = SCENE_COLLECTOR[tracked_epoch:first_early_return]
+        for token in (
+            "s_trackedHandles.clear()",
+            "s_trackedHandlesCached.clear()",
+            "s_trackedPtrMap.clear()",
+            "s_cachedResolverReady = false",
+            "s_cachedBuildIncomplete = false",
+            "s_trackedPtrMapMapEpoch = mapEpoch",
+            "s_unitHandleCache.clear()",
+            "s_unitHandleCacheMapEpoch = mapEpoch",
+        ):
+            self.assertIn(token, before_return)
 
     def test_arena_quarantine_never_rewinds_current_generation(self) -> None:
         quarantine = body(
@@ -282,10 +569,14 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
         self.assertIn("tombstone.mapEpoch == mapEpoch", LIFECYCLE)
         self.assertIn("ShadowCasterTombstoneReason::StageDisabled", LIFECYCLE)
         self.assertIn(
-            "m_war3ShadowTombstoneSerialSeen =\n"
-            "      war3::render::ResetShadowCasterLifecycleMapEpoch",
-            DEVICE,
+            "ResetShadowCasterLifecycleMapEpoch(mapEpoch)", DEVICE
         )
+        epoch_reset = body(
+            DEVICE,
+            "void D3D9DeviceEx::War3ResetGpuSkinMapEpoch()",
+            "void D3D9DeviceEx::War3RequestShadowMapEpochReset()",
+        )
+        self.assertIn("&m_war3ShadowTombstoneSerialSeen", epoch_reset)
 
     def test_device_frame_fallbacks_do_not_cross_map_epoch(self) -> None:
         reset = body(
@@ -337,10 +628,17 @@ class ShadowCrossMapLifecycleStaticTests(unittest.TestCase):
         transition = body(
             DEVICE,
             "bool D3D9DeviceEx::War3ApplyShadowMapEpochResetAtPresent",
-            "bool D3D9DeviceEx::War3GpuSkinDeviceReady",
+            "bool D3D9DeviceEx::War3ApplyShadowDeviceEpochTransitionAtPresent",
         )
-        self.assertIn("War3Renderer::instance().ResetMapSession()", transition)
+        self.assertIn("War3ResetGpuSkinMapEpoch()", transition)
         self.assertNotIn("War3Renderer::instance().EndFrame()", transition)
+
+        cpu_reset = body(
+            DEVICE,
+            "uint64_t D3D9DeviceEx::War3ResetCpuSemanticMapSession(",
+            "D3D9DeviceEx::D3D9DeviceEx(",
+        )
+        self.assertIn("War3Renderer::instance().ResetMapSession()", cpu_reset)
 
         reset = body(
             RENDERER,

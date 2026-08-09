@@ -81,7 +81,7 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
 
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
-      input.settings ? input.settings : &defaultSettings;
+      input.settings ? input.settings.get() : &defaultSettings;
   const War3OccludedOutlineSettings &outline = settings->occludedOutline;
 
   const auto &colorView = input.colorView;
@@ -519,7 +519,7 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
   }
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
-      input.settings ? input.settings : &defaultSettings;
+      input.settings ? input.settings.get() : &defaultSettings;
   if (settings->occludedOutline.useScreenSpace) {
     renderUnitOutlineScreenSpace(ctx, input);
     return;

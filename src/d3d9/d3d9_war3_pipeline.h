@@ -8,12 +8,38 @@
 #include "../dxvk/dxvk_cmdlist.h"
 
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <chrono>
 #include <cstddef>
 #include <string>
 
+namespace dxvk::war3 {
+    class War3SettingsWrite;
+}
+
 namespace dxvk {
+
+    // Shared authoring mailbox. Scoped writers may outlive the active-device
+    // publication they acquired it from, so this state must not be embedded
+    // directly in War3RenderPipeline.
+    struct War3RenderSettingsMailbox {
+        mutable std::mutex mutex;
+        War3RenderSettings pending = { };
+        uint64_t pendingRevision = 0u;
+        uint64_t appliedRevision = 0u;
+        uint64_t pendingExposureRevision = 0u;
+        uint64_t appliedExposureRevision = 0u;
+    };
+
+    // Per-command derived lighting. The queued command owns this object; the
+    // shadow pass may resolve the authored day/night cycle and later passes
+    // consume that result without mutating the immutable authored snapshot.
+    struct War3FrameLightingState {
+        Vector4 sunDirection = Vector4(0.0f, 0.0f, -1.0f, 0.0f);
+        Vector4 sunColor = Vector4(1.0f, 1.0f, 1.0f, 0.0f);
+        float renderTimeHours = 12.0f;
+    };
 
     /**
      * @brief War3 DXVK 渲染管线插入点
@@ -42,7 +68,18 @@ namespace dxvk {
         uint64_t frameSerial = 0;
         uint64_t mapEpoch = 0;
         uint64_t deviceEpoch = 0;
-        const War3RenderSettings* settings = nullptr;
+        // Immutable ownership is carried with the queued CS command. A raw
+        // pointer into War3RenderPipeline would race the next JASS/UI update
+        // and could observe a torn multi-field configuration.
+        std::shared_ptr<const War3RenderSettings> settings;
+        // Shared only by passes within this queued command. It never aliases
+        // the render-owner or authoring copies.
+        std::shared_ptr<War3FrameLightingState> lighting;
+        // Safe feedback channel for derived day/night values. The expected
+        // revision prevents a stale CS command from overwriting newer author
+        // input.
+        std::shared_ptr<War3RenderSettingsMailbox> settingsMailbox;
+        uint64_t settingsRevision = 0u;
     };
 
     /**
@@ -93,8 +130,21 @@ namespace dxvk {
         bool SetPassEnabled(const char* name, bool enabled);
         bool IsPassEnabled(const char* name) const;
 
+        // Render-owner view. External/JASS writers must use the scoped editor
+        // exposed by war3::GetMutableSettings().
         const War3RenderSettings& GetSettings() const { return m_settings; }
-        War3RenderSettings& MutableSettings() { return m_settings; }
+        void CaptureSettingsSnapshot(War3PipelineInput& input) const;
+        std::shared_ptr<War3RenderSettingsMailbox> GetSettingsMailbox() const {
+            return m_settingsMailbox;
+        }
+        bool CopyPendingSettings(War3RenderSettings& out) const {
+            const auto mailbox = m_settingsMailbox;
+            if (!mailbox)
+                return false;
+            std::lock_guard<std::mutex> lock(mailbox->mutex);
+            out = mailbox->pending;
+            return true;
+        }
 
         bool HasInsertedBeforeUi() const { return m_insertedBeforeUi; }
         bool HasArmedBeforeUi() const { return m_armedBeforeUi; }
@@ -113,7 +163,12 @@ namespace dxvk {
         Rc<DxvkDevice> m_device;
         std::vector<PassEntry> m_passes;
 
+        // m_settings is render-owner state. Cross-thread authoring edits are
+        // serialized into the shared mailbox and become visible only at the
+        // next OnFrameStart safe point.
         War3RenderSettings m_settings = { };
+        std::shared_ptr<War3RenderSettingsMailbox> m_settingsMailbox =
+            std::make_shared<War3RenderSettingsMailbox>();
 
         bool m_insertedBeforeUi = false;
         bool m_armedBeforeUi = false;

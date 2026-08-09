@@ -17,13 +17,49 @@
 // 调试模块
 #include "debug/war3_debug.h"
 
+#include <cstddef>
+#include <functional>
+#include <memory>
+
 namespace dxvk {
 class D3D9DeviceEx;
 class War3RenderPipeline;
 struct War3RenderSettings;
+struct War3RenderSettingsMailbox;
 }
 
 namespace dxvk::war3 {
+
+// Scoped, serialized editor for map/JAPI/UI authored render settings. The
+// returned pointer is valid only for the lifetime of this guard and never
+// points at the render-owner copy consumed by the DXVK CS thread.
+class War3SettingsWrite final {
+public:
+    War3SettingsWrite() noexcept;
+    War3SettingsWrite(War3SettingsWrite&& other) noexcept;
+    War3SettingsWrite& operator=(War3SettingsWrite&& other) noexcept;
+    ~War3SettingsWrite();
+
+    War3SettingsWrite(const War3SettingsWrite&) = delete;
+    War3SettingsWrite& operator=(const War3SettingsWrite&) = delete;
+
+    explicit operator bool() const noexcept;
+    bool operator==(std::nullptr_t) const noexcept;
+    bool operator!=(std::nullptr_t) const noexcept;
+    War3RenderSettings* get() const noexcept;
+    War3RenderSettings* operator->() const noexcept;
+    War3RenderSettings& operator*() const noexcept;
+
+private:
+    struct Impl;
+    explicit War3SettingsWrite(
+        std::shared_ptr<War3RenderSettingsMailbox> mailbox);
+    void Commit() noexcept;
+
+    std::unique_ptr<Impl> m_impl;
+
+    friend War3SettingsWrite GetMutableSettings();
+};
 
 // 初始化所有 War3 模块
 // gameDllBase: Game.dll 的基址，传 0 则自动获取
@@ -38,15 +74,23 @@ bool IsInitialized();
 // 获取 Game.dll 基址
 uintptr_t GetGameDllBase();
 
-// 设置/获取当前活跃的 D3D9 设备
-void SetActiveDevice(D3D9DeviceEx* device);
-D3D9DeviceEx* GetActiveDevice();
+// Publish/revoke the active D3D9 owner only through lifecycle transactions.
+void PublishActiveDeviceAfter(
+    D3D9DeviceEx* device, const std::function<void()>& beforePublish);
+bool ClearActiveDeviceIfCurrent(D3D9DeviceEx* device);
+bool IsActiveDevice(const D3D9DeviceEx* expected);
+bool HasActivePipeline();
+bool RunWithActiveDevice(
+    const std::function<void(D3D9DeviceEx&)>& transaction);
+bool RunWithActiveDevicePublication(
+    D3D9DeviceEx* expected, const std::function<void()>& transaction);
+void RequestActiveDeviceShadowMapResetOrCpuFallback();
 
-// 获取当前渲染管线（可能为空）
-War3RenderPipeline* GetActivePipeline();
+// 获取有生命周期约束的可写渲染设置；离开作用域时提交到下一帧安全点。
+War3SettingsWrite GetMutableSettings();
 
-// 获取可写的渲染设置（可能为空）
-War3RenderSettings* GetMutableSettings();
+// 复制当前 author/pending 设置，供只读查询使用。
+bool GetSettingsSnapshot(War3RenderSettings& out);
 
 // DXVK validation host helper: consume the latest semantic shadow scene on the
 // active device without exposing D3D9DeviceEx to render-layer code.

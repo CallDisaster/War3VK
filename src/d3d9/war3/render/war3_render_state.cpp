@@ -653,7 +653,7 @@ void War3RenderState::OnFrameStart() {
 
   // [调试] 可通过环境变量强制开启描边参数（默认不覆盖脚本配置）
   if (IsOutlineForceEnabled()) {
-    auto *settings = dxvk::war3::GetMutableSettings();
+    auto settings = dxvk::war3::GetMutableSettings();
     if (settings) {
       settings->occludedOutline.enabled = true;
       settings->occludedOutline.showVisible = true;

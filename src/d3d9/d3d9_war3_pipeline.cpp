@@ -800,9 +800,31 @@ namespace dxvk {
                     std::clamp(unshadowedScattering, 0.0f, 1.0f);
             }
         }
+
+        // External authoring never mutates m_settings directly. Seed the
+        // serialized pending copy only after all constructor/env overrides
+        // have been applied.
+        m_settingsMailbox->pending = m_settings;
+        m_settingsMailbox->pendingRevision = 1u;
+        m_settingsMailbox->appliedRevision = 1u;
     }
 
     War3RenderPipeline::~War3RenderPipeline() = default;
+
+    void War3RenderPipeline::CaptureSettingsSnapshot(
+            War3PipelineInput& input) const {
+        const auto mailbox = m_settingsMailbox;
+        std::lock_guard<std::mutex> lock(mailbox->mutex);
+        input.settings =
+            std::make_shared<const War3RenderSettings>(m_settings);
+        input.lighting = std::make_shared<War3FrameLightingState>();
+        input.lighting->sunDirection = m_settings.sun.direction;
+        input.lighting->sunColor = m_settings.sun.color;
+        input.lighting->renderTimeHours =
+            m_settings.dayNight.renderTimeHours;
+        input.settingsMailbox = mailbox;
+        input.settingsRevision = mailbox->appliedRevision;
+    }
 
     War3RenderPipeline* CreateWar3RenderPipeline(
         const Rc<DxvkDevice>& device,
@@ -817,6 +839,21 @@ namespace dxvk {
     }
 
     void War3RenderPipeline::OnFrameStart() {
+        bool authoredExposureChanged = false;
+        {
+            const auto mailbox = m_settingsMailbox;
+            std::lock_guard<std::mutex> lock(mailbox->mutex);
+            if (mailbox->pendingRevision != mailbox->appliedRevision) {
+                m_settings = mailbox->pending;
+                mailbox->appliedRevision = mailbox->pendingRevision;
+            }
+            authoredExposureChanged =
+                mailbox->pendingExposureRevision !=
+                mailbox->appliedExposureRevision;
+            mailbox->appliedExposureRevision =
+                mailbox->pendingExposureRevision;
+        }
+
         m_insertedBeforeUi = false;
         m_armedBeforeUi = false;
         m_hadWorldDraw = false;
@@ -1005,8 +1042,7 @@ namespace dxvk {
                             autoExposure = minExposure;
 
                         // 若用户手动修改曝光，则自动关闭日夜曝光覆盖，避免“回弹到 1.0”
-                        if (m_hasAutoExposure &&
-                            std::abs(m_settings.postFx.exposure - m_lastAutoExposure) > 1e-3f) {
+                        if (m_hasAutoExposure && authoredExposureChanged) {
                             m_settings.dayNight.affectExposure = false;
                             m_hasAutoExposure = false;
                             static bool s_logged = false;
@@ -1028,6 +1064,16 @@ namespace dxvk {
             m_settings.ambient.overrideEnabled = false;
             m_settings.ambient.autoOverride = false;
             m_hasAutoExposure = false;
+        }
+
+        // Keep the next scoped authoring edit based on the latest resolved
+        // state, but never overwrite a command that arrived while this frame
+        // was being resolved.
+        {
+            const auto mailbox = m_settingsMailbox;
+            std::lock_guard<std::mutex> lock(mailbox->mutex);
+            if (mailbox->pendingRevision == mailbox->appliedRevision)
+                mailbox->pending = m_settings;
         }
     }
 

@@ -1449,9 +1449,13 @@ public:
   // GPU skin hooks are process-lifetime, while the device and map epochs are
   // explicit. Disabled mode never allocates a manager or GPU resources.
   void War3AttachGpuSkinNativeBridge(uintptr_t gameBase);
+  // Process-global CPU semantic state has no device owner. This shared reset
+  // is safe for a new-device handoff and for map unload with no active device;
+  // it deliberately does not touch any GPU-owned resource.
+  static uint64_t War3ResetCpuSemanticMapSession(
+      uint64_t* outTombstoneSerial = nullptr);
   void War3RequestShadowMapEpochReset();
   War3ShadowLifecycleDiagnostics QueryWar3ShadowLifecycleDiagnostics() const;
-  void War3ResetGpuSkinMapEpoch();
   bool War3ResetGpuSkinBridgeForTest(bool deviceEpoch);
   bool War3LogGpuSkinDiagnosticsForTest(
       bool requireQuiescent = false, bool* outQuiescent = nullptr);
@@ -1488,8 +1492,14 @@ private:
   void War3PollGpuSkinParity();
   void War3LogGpuSkinDiagnostics(bool force);
   void War3RetireGpuSkinFrameBatches();
+  void War3ResetGpuSkinMapEpoch();
   void War3ResetGpuSkinDeviceEpoch();
   void War3RetryGpuSkinDeviceRebind();
+  void War3RequestShadowDeviceEpochTransition(uint64_t deviceEpoch);
+  bool War3ApplyShadowDeviceEpochTransitionAtPresent(uint64_t retireSerial);
+  void War3QuarantineShadowSessionAtPresent(uint64_t retireSerial);
+  void War3InvalidateShadowReceiverEpochOnCs(uint64_t mapEpoch,
+                                             uint64_t deviceEpoch);
   bool War3GpuSkinDeviceReady() const;
 
   /**
@@ -1802,6 +1812,16 @@ private:
   uint64_t m_war3ShadowMapResetAppliedFrameSerial = 0u;
   uint64_t m_war3ShadowArenaQuarantinedRetireSerial = 0u;
   std::atomic<bool> m_war3ShadowSessionReady { true };
+  // A D3D9 Reset keeps the Warcraft map alive but publishes a new logical
+  // device epoch after GPU-skin rebind. Receiver state belongs to the CS
+  // thread, so the render owner records the committed epoch here and applies
+  // it at the next Present boundary before producers may reopen.
+  std::atomic<uint64_t> m_war3ShadowDeviceEpochRequested { 1u };
+  std::atomic<uint64_t> m_war3ShadowDeviceEpochApplied { 1u };
+  // Reset/ResetEx closes admission before GPU-skin rebind begins. This stays
+  // true across failed retries and is cleared only by the Present transaction
+  // that publishes the committed receiver/device tuple.
+  std::atomic<bool> m_war3ShadowDeviceRebindPending { false };
   std::atomic<uint64_t> m_war3ShadowDiagAppliedResetSerial { 0u };
   std::atomic<uint64_t> m_war3ShadowDiagCurrentMapEpoch { 0u };
   std::atomic<uint64_t> m_war3ShadowDiagAppliedFrameSerial { 0u };
@@ -2921,7 +2941,10 @@ private:
     // transition moves all backing into the fence-retired session instead.
     if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
         m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
-            m_war3ShadowMapResetAppliedSerial)
+            m_war3ShadowMapResetAppliedSerial ||
+        m_war3ShadowDeviceEpochRequested.load(std::memory_order_acquire) !=
+            m_war3ShadowDeviceEpochApplied.load(std::memory_order_acquire) ||
+        m_war3ShadowDeviceRebindPending.load(std::memory_order_acquire))
       return;
     // Reset the allocator for the NEXT frame (to be used in next BeginFrame
     // cycle)
