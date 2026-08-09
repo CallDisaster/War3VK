@@ -35,6 +35,14 @@ def bilinear_compare(depths, reference, fx, fy):
     return top * (1.0 - fy) + bottom * fy
 
 
+def receiver_plane_gradient(uv_dx, uv_dy, depth_dx, depth_dy):
+    determinant = uv_dx[0] * uv_dy[1] - uv_dx[1] * uv_dy[0]
+    return (
+        (depth_dx * uv_dy[1] - uv_dx[1] * depth_dy) / determinant,
+        (uv_dx[0] * depth_dy - depth_dx * uv_dy[0]) / determinant,
+    )
+
+
 class ShadowComparePcfStaticTests(unittest.TestCase):
     def test_compare_happens_before_bilinear_filtering(self):
         self.assertEqual(
@@ -140,6 +148,38 @@ class ShadowComparePcfStaticTests(unittest.TestCase):
             self.assertIn("wallFilterWeight", source)
             self.assertIn(
                 "mix(radius0, max(radius0, 1.50), wallFilterWeight)", source
+            )
+
+    def test_receiver_plane_reference_is_per_tap_and_kernel_atomic(self):
+        gradient = receiver_plane_gradient(
+            (0.5, 0.0), (0.0, 0.25), 0.1, -0.05
+        )
+        self.assertAlmostEqual(gradient[0], 0.2)
+        self.assertAlmostEqual(gradient[1], -0.2)
+        tap_reference = 0.5 + gradient[0] * 0.01 + gradient[1] * -0.02
+        self.assertAlmostEqual(tap_reference, 0.506)
+
+        for source in (RECEIVER, VISIBILITY):
+            for token in (
+                "computeReceiverPlaneDepthGradient",
+                "receiverPlaneKernelValid",
+                "receiverPlaneTapReference",
+                "dot(gradient, tapOffsetUv)",
+                "kMaxReceiverPlaneDepthDelta = 0.0025",
+                "worldDx = dFdx(worldPos)",
+                "worldDy = dFdy(worldPos)",
+            ):
+                self.assertIn(token, source)
+            self.assertIn(
+                "receiverPlaneGradient, kernelPlaneValid", source
+            )
+            self.assertRegex(
+                source,
+                re.compile(
+                    r"bool\s+kernelPlaneValid\s*=\s*receiverPlaneValid\s*&&\s*"
+                    r"receiverPlaneKernelValid",
+                    re.DOTALL,
+                ),
             )
 
 

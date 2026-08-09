@@ -254,7 +254,65 @@ float computeCascadePcfRadius(float baseRadiusTexel, int cascadeIndex, int casca
   return baseRadiusTexel / max(scale, 1e-6);
 }
 
-float sampleShadowGrid(uint cascadeIndex, vec2 uv, float refDepth, float radiusTexel, int gridRadius) {
+bool computeReceiverPlaneDepthGradient(vec4 lightClip, mat4 lightViewProj,
+                                       vec3 worldDx, vec3 worldDy,
+                                       out vec2 gradient) {
+  gradient = vec2(0.0);
+  if (!validVec4(lightClip) || abs(lightClip.w) < 1.0e-6 ||
+      !validVec3(worldDx) || !validVec3(worldDy))
+    return false;
+
+  vec4 lightDx = vec4(worldDx, 0.0) * lightViewProj;
+  vec4 lightDy = vec4(worldDy, 0.0) * lightViewProj;
+  if (!validVec4(lightDx) || !validVec4(lightDy))
+    return false;
+
+  float invW = 1.0 / lightClip.w;
+  vec3 ndc = lightClip.xyz * invW;
+  vec3 ndcDx = (lightDx.xyz - ndc * lightDx.w) * invW;
+  vec3 ndcDy = (lightDy.xyz - ndc * lightDy.w) * invW;
+  if (!validVec3(ndcDx) || !validVec3(ndcDy))
+    return false;
+
+  // The shadow texture flips NDC Y, so its differential must be flipped too.
+  vec2 uvDx = vec2(0.5 * ndcDx.x, -0.5 * ndcDx.y);
+  vec2 uvDy = vec2(0.5 * ndcDy.x, -0.5 * ndcDy.y);
+  float determinant = uvDx.x * uvDy.y - uvDx.y * uvDy.x;
+  if (!validFloat(determinant) || abs(determinant) < 1.0e-10)
+    return false;
+
+  gradient = vec2(
+      (ndcDx.z * uvDy.y - uvDx.y * ndcDy.z) / determinant,
+      (uvDx.x * ndcDy.z - ndcDx.z * uvDy.x) / determinant);
+  return validFloat(gradient.x) && validFloat(gradient.y);
+}
+
+bool receiverPlaneKernelValid(vec2 gradient, float maxAbsOffsetUv) {
+  if (!validFloat(gradient.x) || !validFloat(gradient.y) ||
+      !validFloat(maxAbsOffsetUv) || maxAbsOffsetUv < 0.0)
+    return false;
+  // Reject discontinuities and degenerate reconstructed planes as one whole
+  // kernel. 0.25% of normalized cascade depth is deliberately conservative;
+  // a rejected proof uses the historical centre reference for every tap.
+  const float kMaxReceiverPlaneDepthDelta = 0.0025;
+  float worstDepthDelta =
+      (abs(gradient.x) + abs(gradient.y)) * maxAbsOffsetUv;
+  return validFloat(worstDepthDelta) &&
+         worstDepthDelta <= kMaxReceiverPlaneDepthDelta;
+}
+
+float receiverPlaneTapReference(float centerReference, vec2 tapOffsetUv,
+                                vec2 gradient, bool kernelValid) {
+  float reference = kernelValid
+      ? centerReference + dot(gradient, tapOffsetUv)
+      : centerReference;
+  return clamp(reference, 0.0, 1.0);
+}
+
+float sampleShadowGrid(uint cascadeIndex, vec2 uv, float refDepth,
+                       float radiusTexel, int gridRadius,
+                       vec2 receiverPlaneGradient,
+                       bool receiverPlaneValid) {
   if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
     return 1.0;
 
@@ -262,6 +320,8 @@ float sampleShadowGrid(uint cascadeIndex, vec2 uv, float refDepth, float radiusT
   float radius = max(radiusTexel, 0.0);
   float sum = 0.0;
   float count = 0.0;
+  bool kernelPlaneValid = receiverPlaneValid && receiverPlaneKernelValid(
+      receiverPlaneGradient, float(gridRadius) * radius * invRes);
 
   for (int y = -gridRadius; y <= gridRadius; y++) {
     for (int x = -gridRadius; x <= gridRadius; x++) {
@@ -271,20 +331,28 @@ float sampleShadowGrid(uint cascadeIndex, vec2 uv, float refDepth, float radiusT
       if (tapUv.x < 0.0 || tapUv.x > 1.0 || tapUv.y < 0.0 || tapUv.y > 1.0)
         sum += 1.0;
       else
-        sum += shadowCompare(cascadeIndex, tapUv, refDepth);
+        sum += shadowCompare(
+            cascadeIndex, tapUv,
+            receiverPlaneTapReference(
+                refDepth, o, receiverPlaneGradient, kernelPlaneValid));
       count += 1.0;
     }
   }
   return sum / max(count, 1.0);
 }
 
-float sampleShadowPoisson16(uint cascadeIndex, vec2 uv, float refDepth, float radiusTexel, vec2 rot) {
+float sampleShadowPoisson16(uint cascadeIndex, vec2 uv, float refDepth,
+                            float radiusTexel, vec2 rot,
+                            vec2 receiverPlaneGradient,
+                            bool receiverPlaneValid) {
   if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
     return 1.0;
 
   float invRes = ubo.u_params.z;
   float radius = max(radiusTexel, 0.0);
   float sum = 0.0;
+  bool kernelPlaneValid = receiverPlaneValid && receiverPlaneKernelValid(
+      receiverPlaneGradient, radius * invRes);
 
   for (int i = 0; i < 16; i++) {
     vec2 d = kPoisson16[i];
@@ -293,18 +361,26 @@ float sampleShadowPoisson16(uint cascadeIndex, vec2 uv, float refDepth, float ra
     if (tapUv.x < 0.0 || tapUv.x > 1.0 || tapUv.y < 0.0 || tapUv.y > 1.0)
       sum += 1.0;
     else
-      sum += shadowCompare(cascadeIndex, tapUv, refDepth);
+      sum += shadowCompare(
+          cascadeIndex, tapUv,
+          receiverPlaneTapReference(
+              refDepth, o, receiverPlaneGradient, kernelPlaneValid));
   }
   return sum * (1.0 / 16.0);
 }
 
-float sampleShadowPoisson25(uint cascadeIndex, vec2 uv, float refDepth, float radiusTexel, vec2 rot) {
+float sampleShadowPoisson25(uint cascadeIndex, vec2 uv, float refDepth,
+                            float radiusTexel, vec2 rot,
+                            vec2 receiverPlaneGradient,
+                            bool receiverPlaneValid) {
   if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
     return 1.0;
 
   float invRes = ubo.u_params.z;
   float radius = max(radiusTexel, 0.0);
   float sum = 0.0;
+  bool kernelPlaneValid = receiverPlaneValid && receiverPlaneKernelValid(
+      receiverPlaneGradient, radius * invRes);
 
   for (int i = 0; i < 25; i++) {
     vec2 d = kPoisson25[i];
@@ -313,20 +389,30 @@ float sampleShadowPoisson25(uint cascadeIndex, vec2 uv, float refDepth, float ra
     if (tapUv.x < 0.0 || tapUv.x > 1.0 || tapUv.y < 0.0 || tapUv.y > 1.0)
       sum += 1.0;
     else
-      sum += shadowCompare(cascadeIndex, tapUv, refDepth);
+      sum += shadowCompare(
+          cascadeIndex, tapUv,
+          receiverPlaneTapReference(
+              refDepth, o, receiverPlaneGradient, kernelPlaneValid));
   }
   return sum * (1.0 / 25.0);
 }
 
-float sampleShadowPcf(uint cascadeIndex, vec2 uv, float refDepth, float radiusTexel, vec2 rot) {
+float sampleShadowPcf(uint cascadeIndex, vec2 uv, float refDepth,
+                      float radiusTexel, vec2 rot,
+                      vec2 receiverPlaneGradient,
+                      bool receiverPlaneValid) {
   int kernel = int(ubo.u_params6.x + 0.5);
   if (kernel == 1)
-    return sampleShadowGrid(cascadeIndex, uv, refDepth, radiusTexel, 2);
+    return sampleShadowGrid(cascadeIndex, uv, refDepth, radiusTexel, 2,
+                            receiverPlaneGradient, receiverPlaneValid);
   if (kernel == 2)
-    return sampleShadowPoisson16(cascadeIndex, uv, refDepth, radiusTexel, rot);
+    return sampleShadowPoisson16(cascadeIndex, uv, refDepth, radiusTexel, rot,
+                                 receiverPlaneGradient, receiverPlaneValid);
   if (kernel == 3)
-    return sampleShadowPoisson25(cascadeIndex, uv, refDepth, radiusTexel, rot);
-  return sampleShadowGrid(cascadeIndex, uv, refDepth, radiusTexel, 1);
+    return sampleShadowPoisson25(cascadeIndex, uv, refDepth, radiusTexel, rot,
+                                 receiverPlaneGradient, receiverPlaneValid);
+  return sampleShadowGrid(cascadeIndex, uv, refDepth, radiusTexel, 1,
+                          receiverPlaneGradient, receiverPlaneValid);
 }
 
 vec3 computeViewNormal(vec3 viewPos) {
@@ -392,8 +478,9 @@ float computeWallFilterWeight(float wallFactor, float wallStabilityFactor,
   return clamp(receiverWeight * grazingWeight, 0.0, 1.0);
 }
 
-float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra,
-                              vec2 rot, float wallFilterWeight) {
+float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
+                              float viewDepth, float biasExtra, vec2 rot,
+                              float wallFilterWeight) {
   int cascadeCount = clamp(int(ubo.u_params.w), 1, 4);
 
   float splits[4];
@@ -444,6 +531,10 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra,
   // 之前 refDepth<0 直接返回全亮，会在高视角/远级联下把接触阴影“截掉一块”。
   // 这里改为 clamp，避免底部阴影突然消失。
   float ref0 = clamp(n0.z - bias0, 0.0, 1.0);
+  vec2 receiverPlaneGradient0 = vec2(0.0);
+  bool receiverPlaneValid0 = computeReceiverPlaneDepthGradient(
+      l0, ubo.u_lightViewProj[c0], worldDx, worldDy,
+      receiverPlaneGradient0);
   if (isTerrainMaskedOccluder(uint(c0), uv0, ref0))
     return 1.0;
 
@@ -452,11 +543,17 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra,
     float sum = 0.0;
     float cnt = 0.0;
     float invRes = ubo.u_params.z;
+    bool blockerPlaneValid = receiverPlaneValid0 &&
+        receiverPlaneKernelValid(
+            receiverPlaneGradient0,
+            float(searchRadius) * pcssSearchRadius * invRes);
     for (int y = -searchRadius; y <= searchRadius; y++) {
       for (int x = -searchRadius; x <= searchRadius; x++) {
         vec2 o = vec2(float(x), float(y)) * pcssSearchRadius * invRes;
         float d = shadowMapDepth(uint(c0), uv0 + o);
-        if (d < ref0) {
+        float tapRef = receiverPlaneTapReference(
+            ref0, o, receiverPlaneGradient0, blockerPlaneValid);
+        if (d < tapRef) {
           sum += d;
           cnt += 1.0;
         }
@@ -475,7 +572,9 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra,
   // kernel. Snapping the receiver UV or switching filter families introduces
   // whole-texel jumps as camera/sun motion crosses a classification boundary.
   radius0 = mix(radius0, max(radius0, 1.50), wallFilterWeight);
-  float vis0 = sampleShadowPcf(uint(c0), uv0, ref0, radius0, rot);
+  float vis0 = sampleShadowPcf(
+      uint(c0), uv0, ref0, radius0, rot,
+      receiverPlaneGradient0, receiverPlaneValid0);
 
   // Blend into next cascade to hide seams
   if (blendRange > 0.0 && c0 < cascadeCount - 1) {
@@ -496,16 +595,26 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra,
       return vis0;
     float bias1 = baseBias * computeCascadeBiasScale(c1, cascadeCount, cascadeBiasScale);
     float ref1 = clamp(n1.z - bias1, 0.0, 1.0);
+    vec2 receiverPlaneGradient1 = vec2(0.0);
+    bool receiverPlaneValid1 = computeReceiverPlaneDepthGradient(
+        l1, ubo.u_lightViewProj[c1], worldDx, worldDy,
+        receiverPlaneGradient1);
     float radius1 = max(ubo.u_params.y, 0.0);
     if (pcssEnabled) {
       float sum = 0.0;
       float cnt = 0.0;
       float invRes = ubo.u_params.z;
+      bool blockerPlaneValid = receiverPlaneValid1 &&
+          receiverPlaneKernelValid(
+              receiverPlaneGradient1,
+              float(searchRadius) * pcssSearchRadius * invRes);
       for (int y = -searchRadius; y <= searchRadius; y++) {
         for (int x = -searchRadius; x <= searchRadius; x++) {
           vec2 o = vec2(float(x), float(y)) * pcssSearchRadius * invRes;
           float d = shadowMapDepth(uint(c1), uv1 + o);
-          if (d < ref1) {
+          float tapRef = receiverPlaneTapReference(
+              ref1, o, receiverPlaneGradient1, blockerPlaneValid);
+          if (d < tapRef) {
             sum += d;
             cnt += 1.0;
           }
@@ -523,7 +632,9 @@ float computeShadowVisibility(vec3 worldPos, float viewDepth, float biasExtra,
     radius1 = mix(radius1, max(radius1, 1.50), wallFilterWeight);
     float vis1 = 1.0;
     if (!isTerrainMaskedOccluder(uint(c1), uv1, ref1)) {
-      vis1 = sampleShadowPcf(uint(c1), uv1, ref1, radius1, rot);
+      vis1 = sampleShadowPcf(
+          uint(c1), uv1, ref1, radius1, rot,
+          receiverPlaneGradient1, receiverPlaneValid1);
     }
 
     return mix(vis0, vis1, w);
@@ -1399,8 +1510,11 @@ void main() {
         pix,
         0).r;
     } else {
+      vec3 worldDx = dFdx(worldPos);
+      vec3 worldDy = dFdy(worldPos);
       currVis = computeShadowVisibility(
-          worldPos, viewDepth, biasExtra, pcfRot, wallFilterWeight);
+          worldPos, worldDx, worldDy, viewDepth, biasExtra, pcfRot,
+          wallFilterWeight);
     }
 
     vis = validFloat(currVis) ? clamp(currVis, 0.0, 1.0) : 1.0;
