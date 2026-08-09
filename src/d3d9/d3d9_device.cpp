@@ -15180,6 +15180,12 @@ bool D3D9DeviceEx::CheckVulkanDeviceLostFailStop(const char* origin) {
     // diagnostics. vkGetDeviceFaultInfoEXT has no finite-return contract.
     dxvk::war3::tools::NotifyGpuDeviceLostFailStop(
         origin, deviceFaultBeforeCapture);
+    m_vkDeviceLostBaseIncidentReady.store(true, std::memory_order_release);
+  } else if (!m_vkDeviceLostBaseIncidentReady.load(
+                 std::memory_order_acquire)) {
+    // A concurrent first observer is still writing the base record. Do not
+    // wait or seize its origin; a later D3D entrypoint may enrich it.
+    return true;
   }
 
   // A direct-driver eligibility bit is required, so synthetic command-stream

@@ -2186,6 +2186,7 @@ private:
 
   D3D9DeviceLostState m_deviceLostState = D3D9DeviceLostState::Ok;
   std::atomic<bool> m_vkDeviceLostFailStop{false};
+  std::atomic<bool> m_vkDeviceLostBaseIncidentReady{false};
   HWND m_fullscreenWindow = NULL;
   std::atomic<uint32_t> m_losableResourceCounter = {0};
 

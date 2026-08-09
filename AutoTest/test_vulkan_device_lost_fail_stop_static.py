@@ -436,6 +436,10 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
             self.assertIn("notifyDeviceErrorFromDriverResult", source)
 
     def test_d3d_owner_captures_after_base_incident_and_enriches_once(self):
+        self.assertIn(
+            "std::atomic<bool> m_vkDeviceLostBaseIncidentReady{false}",
+            DEVICE_H,
+        )
         latch = function_body(
             DEVICE_CPP, "D3D9DeviceEx::CheckVulkanDeviceLostFailStop"
         )
@@ -446,9 +450,23 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         enrichment_notify = latch.index(
             "origin, deviceFaultAfterCapture"
         )
+        base_ready = latch.index(
+            "m_vkDeviceLostBaseIncidentReady.store(true, std::memory_order_release)"
+        )
         self.assertLess(base_notify, capture)
+        self.assertLess(base_notify, base_ready)
+        self.assertLess(base_ready, capture)
         self.assertLess(capture, enrichment_notify)
         self.assertIn("if (firstFailStop)", latch)
+        self.assertIn(
+            "else if (!m_vkDeviceLostBaseIncidentReady.load(\n"
+            "                 std::memory_order_acquire))",
+            latch,
+        )
+        self.assertLess(
+            latch.index("else if (!m_vkDeviceLostBaseIncidentReady.load"),
+            capture,
+        )
         self.assertLess(
             latch.index("m_war3ShadowSessionReady.store(false"), base_notify
         )
