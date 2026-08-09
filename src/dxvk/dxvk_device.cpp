@@ -561,12 +561,18 @@ namespace dxvk {
   
   
   void DxvkDevice::registerShader(const Rc<DxvkShader>& shader) {
+    if (getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return;
+
     m_objects.pipelineManager().registerShader(shader);
   }
   
   
   void DxvkDevice::requestCompileShader(
     const Rc<DxvkShader>&           shader) {
+    if (getDeviceStatus() == VK_ERROR_DEVICE_LOST)
+      return;
+
     m_objects.pipelineManager().requestCompileShader(shader);
   }
 

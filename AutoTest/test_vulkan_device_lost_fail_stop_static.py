@@ -14,6 +14,12 @@ PIPELINE = (ROOT / "src/d3d9/d3d9_war3_pipeline.cpp").read_text(
     encoding="utf-8"
 )
 CS_THREAD = (ROOT / "src/dxvk/dxvk_cs.cpp").read_text(encoding="utf-8")
+DXVK_DEVICE_CPP = (ROOT / "src/dxvk/dxvk_device.cpp").read_text(
+    encoding="utf-8"
+)
+PIPELINE_MANAGER = (ROOT / "src/dxvk/dxvk_pipemanager.cpp").read_text(
+    encoding="utf-8"
+)
 QUEUE = (ROOT / "src/dxvk/dxvk_queue.cpp").read_text(encoding="utf-8")
 PRESENTER = (ROOT / "src/dxvk/dxvk_presenter.cpp").read_text(
     encoding="utf-8"
@@ -99,6 +105,88 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         self.assertIn("m_csThread.synchronize(m_csSeqNum);", lost_path)
         self.assertIn("return;", lost_path)
         self.assertNotIn("m_csThread.synchronize(SequenceNumber);", lost_path)
+
+    def test_terminal_latch_blocks_new_shader_compiler_work(self):
+        vertex = function_body(DEVICE_CPP, "D3D9DeviceEx::CreateVertexShader")
+        pixel = function_body(DEVICE_CPP, "D3D9DeviceEx::CreatePixelShader")
+
+        vertex_gate = vertex.index(
+            'CheckVulkanDeviceLostFailStop("D3D9Device.CreateVertexShader")'
+        )
+        vertex_module = vertex.index("CreateShaderModule")
+        self.assertLess(vertex.index("ppShader == nullptr"), vertex_gate)
+        self.assertLess(vertex_gate, vertex_module)
+        self.assertLess(vertex_gate, vertex.index("new D3D9VertexShader"))
+        terminal_vertex = vertex[vertex_gate:vertex_module]
+        self.assertIn("return D3DERR_DEVICEREMOVED;", terminal_vertex)
+        self.assertNotIn("*ppShader", terminal_vertex)
+
+        pixel_gate = pixel.index(
+            'CheckVulkanDeviceLostFailStop("D3D9Device.CreatePixelShader")'
+        )
+        pixel_module = pixel.index("CreateShaderModule")
+        self.assertLess(pixel.index("InitReturnPtr(ppShader);"), pixel_gate)
+        self.assertLess(pixel.index("ppShader == nullptr"), pixel_gate)
+        self.assertLess(pixel_gate, pixel_module)
+        self.assertLess(pixel_gate, pixel.index("new D3D9PixelShader"))
+        terminal_pixel = pixel[pixel_gate:pixel_module]
+        self.assertIn("return D3DERR_DEVICEREMOVED;", terminal_pixel)
+        self.assertNotIn("*ppShader =", terminal_pixel)
+
+        register = function_body(DXVK_DEVICE_CPP, "DxvkDevice::registerShader")
+        request = function_body(DXVK_DEVICE_CPP, "DxvkDevice::requestCompileShader")
+        for wrapper, dispatch in (
+            (register, "m_objects.pipelineManager().registerShader(shader);"),
+            (request, "m_objects.pipelineManager().requestCompileShader(shader);"),
+        ):
+            self.assertLess(
+                wrapper.index("getDeviceStatus() == VK_ERROR_DEVICE_LOST"),
+                wrapper.index(dispatch),
+            )
+
+        library = function_body(
+            PIPELINE_MANAGER, "DxvkPipelineWorkers::compilePipelineLibrary"
+        )
+        graphics = function_body(
+            PIPELINE_MANAGER, "DxvkPipelineWorkers::compileGraphicsPipeline"
+        )
+        worker = function_body(PIPELINE_MANAGER, "DxvkPipelineWorkers::runWorker")
+
+        for enqueue in (library, graphics):
+            terminal_gate = enqueue.index(
+                "m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST"
+            )
+            self.assertLess(enqueue.index("std::unique_lock lock(m_lock);"), terminal_gate)
+            for token in (
+                "this->startWorkers();",
+                "m_tasksTotal += 1;",
+                "m_buckets[uint32_t(priority)].queue.emplace",
+                "notifyWorkers(priority);",
+            ):
+                self.assertLess(terminal_gate, enqueue.index(token))
+
+        self.assertLess(
+            graphics.index("m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST"),
+            graphics.index("pipeline->acquirePipeline();"),
+        )
+
+        worker_gate = worker.index(
+            "m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST"
+        )
+        first_compile = worker.index("entry.pipelineLibrary->compilePipeline()")
+        self.assertLess(worker.index("if (!m_workersRunning)"), worker_gate)
+        self.assertLess(worker_gate, first_compile)
+        self.assertLess(
+            worker_gate,
+            worker.index("entry.graphicsPipeline->compilePipeline(entry.graphicsState)"),
+        )
+        terminal_worker = worker[worker_gate:first_compile]
+        self.assertNotIn("compilePipeline", terminal_worker)
+        self.assertEqual(
+            terminal_worker.count("entry.graphicsPipeline->releasePipeline();"), 1
+        )
+        self.assertEqual(terminal_worker.count("m_tasksCompleted += 1;"), 1)
+        self.assertIn("continue;", terminal_worker)
 
     def test_terminal_submission_entries_still_finish_on_the_cpu(self):
         submit = function_body(QUEUE, "DxvkSubmissionQueue::submitCmdLists")

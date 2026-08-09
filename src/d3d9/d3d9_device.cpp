@@ -32785,6 +32785,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreateVertexShader(
   if (unlikely(ppShader == nullptr))
     return D3DERR_INVALIDCALL;
 
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreateVertexShader"))
+    return D3DERR_DEVICEREMOVED;
+
   DxsoModuleInfo moduleInfo;
   moduleInfo.options = m_dxsoOptions;
 
@@ -33195,6 +33198,9 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CreatePixelShader(
 
   if (unlikely(ppShader == nullptr))
     return D3DERR_INVALIDCALL;
+
+  if (CheckVulkanDeviceLostFailStop("D3D9Device.CreatePixelShader"))
+    return D3DERR_DEVICEREMOVED;
 
   DxsoModuleInfo moduleInfo;
   moduleInfo.options = m_dxsoOptions;
