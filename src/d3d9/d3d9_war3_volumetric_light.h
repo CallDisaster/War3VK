@@ -3,6 +3,7 @@
 #include "d3d9_war3_light.h"
 #include "d3d9_war3_pipeline.h"
 #include "war3/render/war3_owned_image_layout.h"
+#include "war3/render/war3_volumetric_shader_work_admission.h"
 #include "../dxvk/dxvk_hash.h"
 #include "../dxvk/dxvk_buffer.h"
 
@@ -10,6 +11,18 @@
 #include <unordered_map>
 
 namespace dxvk {
+
+    struct War3VolumetricShaderWorkRuntimeDiagnostics {
+        uint64_t frameSerial = 0u;
+        uint64_t evaluatedFrameCount = 0u;
+        uint64_t acceptedFrameCount = 0u;
+        uint64_t rejectedFrameCount = 0u;
+        uint64_t arithmeticOverflowCount = 0u;
+        war3::render::War3VolumetricShaderWorkEstimate last = {};
+    };
+
+    War3VolumetricShaderWorkRuntimeDiagnostics
+    QueryWar3VolumetricShaderWorkRuntimeDiagnostics() noexcept;
 
     class D3D9DeviceEx;
 
@@ -61,10 +74,11 @@ namespace dxvk {
                                      selectedPointIndices,
                                  uint32_t selectedPointCount,
                                  const Vector4& cameraPos,
-                                 float farClearRaw, float rawDepthQuantum,
-                                 bool farIsOne,
-                                 const VkRect2D& effectScissor,
-                                 uint32_t& outPointShadowedLightCount);
+                                  float farClearRaw, float rawDepthQuantum,
+                                  bool farIsOne,
+                                  const VkRect2D& effectScissor,
+                                  int effectiveSamples,
+                                  uint32_t& outPointShadowedLightCount);
         bool compositeVolumetricLight(const Rc<DxvkCommandList>& ctx,
                                       const War3PipelineInput& input,
                                       const VkRect2D& compositeScissor);

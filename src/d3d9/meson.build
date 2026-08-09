@@ -123,6 +123,7 @@ d3d9_src = [
   'war3/render/war3_shadow_replay_validation.cpp',
   'war3/render/war3_point_shadow_cpu_plan.cpp',
   'war3/render/war3_gpu_workload_governor.cpp',
+  'war3/render/war3_volumetric_shader_work_admission.cpp',
   'war3/render/war3_union_consumer_visibility.cpp',
   'war3/render/war3_current_draw_contract.cpp',
   'war3/render/war3_scene_collector.cpp',
@@ -395,6 +396,24 @@ war3_gpu_workload_governor_test = executable(
 test(
   'war3_gpu_workload_governor',
   war3_gpu_workload_governor_test,
+  timeout : 30,
+)
+
+# Pure-value P0 shader-work admission. It proves that the ray-segment loop,
+# directional D32 taps, point-cube probes and full-resolution composite reads
+# are checked as one bounded request before the optional volume pass executes.
+war3_volumetric_shader_work_admission_test = executable(
+  'war3_volumetric_shader_work_admission_test',
+  [
+    'war3/render/war3_volumetric_shader_work_admission.cpp',
+    'war3/render/tests/war3_volumetric_shader_work_admission_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_volumetric_shader_work_admission',
+  war3_volumetric_shader_work_admission_test,
   timeout : 30,
 )
 

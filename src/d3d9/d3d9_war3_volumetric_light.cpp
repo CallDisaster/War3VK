@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <mutex>
 #include <utility>
 
 namespace dxvk {
@@ -29,11 +30,37 @@ constexpr uint32_t kVolumetricMaxResolutionDivisor = 8u;
 constexpr int kVolumetricMinSamples = 4;
 constexpr int kVolumetricMaxSamples = 16;
 constexpr uint32_t kVolumetricMaxPointLights = 2u;
-// Counts ray-march segments before the bounded inner loops: at most eight raw
-// CSM probes plus two visibility probes for each of two point lights. This
-// caps the fragment workload independently of every external setting surface,
-// including stale INI/JASS values and direct mutable-settings users.
 constexpr uint64_t kVolumetricRaySegmentBudget = 4'000'000ull;
+constexpr uint32_t kVolumetricDirectionalProbesPerSegment = 8u;
+constexpr uint32_t kVolumetricDirectionalCascadeSamples = 2u;
+constexpr uint32_t kVolumetricVolumeSunTapsPerCascade = 9u;
+constexpr uint32_t kVolumetricCsmTapsPerCascade = 4u;
+constexpr uint32_t kVolumetricPointProbesPerLight = 2u;
+// The low-resolution effect is reconstructed with one base-color read, one
+// centre-depth read, four effect reads and four guide-depth reads.
+constexpr uint32_t kVolumetricCompositeTextureReadsPerPixel = 10u;
+
+std::mutex g_volumetricShaderWorkDiagnosticsMutex;
+War3VolumetricShaderWorkRuntimeDiagnostics
+    g_volumetricShaderWorkRuntimeDiagnostics = {};
+
+void PublishVolumetricShaderWorkDiagnostics(
+    uint64_t frameSerial,
+    const war3::render::War3VolumetricShaderWorkEstimate& estimate) noexcept {
+  std::lock_guard<std::mutex> lock(g_volumetricShaderWorkDiagnosticsMutex);
+  auto& diagnostics = g_volumetricShaderWorkRuntimeDiagnostics;
+  diagnostics.frameSerial = frameSerial;
+  ++diagnostics.evaluatedFrameCount;
+  diagnostics.last = estimate;
+  if (estimate.accepted) {
+    ++diagnostics.acceptedFrameCount;
+  } else {
+    ++diagnostics.rejectedFrameCount;
+    if (estimate.rejectReason == war3::render::
+            War3VolumetricShaderWorkRejectReason::ArithmeticOverflow)
+      ++diagnostics.arithmeticOverflowCount;
+  }
+}
 
 struct VolumetricLightPushConstants {
   uint32_t colorSampler;
@@ -123,6 +150,38 @@ float finiteOr(float value, float fallback) {
 
 float clampFinite(float value, float lo, float hi, float fallback) {
   return std::clamp(finiteOr(value, fallback), lo, hi);
+}
+
+int ComputeVolumetricEffectiveSamples(
+    const War3VolumetricLightSettings& settings, float sunIntensity,
+    bool hasSunVolume, bool hasPointVolume, uint64_t effectPixelCount) {
+  int effectiveSamples = std::clamp(
+      settings.sampleCount, kVolumetricMinSamples, kVolumetricMaxSamples);
+  if (settings.adaptiveSampleCount) {
+    const float intensity =
+        clampFinite(settings.intensity, 0.0f, 4.0f, 0.0f);
+    const float intensity01 =
+        std::clamp(intensity / 0.35f, 0.55f, 1.0f);
+    const float source01 = hasSunVolume
+        ? std::clamp(sunIntensity, 0.45f, 1.0f)
+        : (hasPointVolume ? 1.0f : 0.55f);
+    const float quality = std::min(intensity01, source01);
+    const int adaptive =
+        static_cast<int>(std::lround(float(effectiveSamples) * quality));
+    const int adaptiveFloor = std::min(12, effectiveSamples);
+    effectiveSamples =
+        std::clamp(adaptive, adaptiveFloor, effectiveSamples);
+  }
+
+  const uint64_t budgetedSamples = effectPixelCount != 0u
+      ? kVolumetricRaySegmentBudget / effectPixelCount
+      : uint64_t(kVolumetricMinSamples);
+  return std::min(
+      effectiveSamples,
+      std::clamp<int>(
+          static_cast<int>(std::min<uint64_t>(
+              budgetedSamples, uint64_t(kVolumetricMaxSamples))),
+          kVolumetricMinSamples, kVolumetricMaxSamples));
 }
 
 Vector4 SanitizeVolumetricPointPosition(const War3PointLight& light) {
@@ -316,6 +375,12 @@ VolumetricPointSelection SelectVolumetricPointLights(
   return result;
 }
 } // namespace
+
+War3VolumetricShaderWorkRuntimeDiagnostics
+QueryWar3VolumetricShaderWorkRuntimeDiagnostics() noexcept {
+  std::lock_guard<std::mutex> lock(g_volumetricShaderWorkDiagnosticsMutex);
+  return g_volumetricShaderWorkRuntimeDiagnostics;
+}
 
 War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
     : m_parent(device), m_device(device->GetDXVKDevice()) {
@@ -851,7 +916,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
         selectedPointIndices,
     uint32_t selectedPointCount, const Vector4& cameraPos,
     float farClearRaw, float rawDepthQuantum, bool farIsOne,
-    const VkRect2D& effectScissor,
+    const VkRect2D& effectScissor, int effectiveSamples,
     uint32_t& outPointShadowedLightCount) {
   outPointShadowedLightCount = 0u;
   if (!m_layout || !m_linearSampler || !m_colorCopyView || !m_depthCopyView ||
@@ -1339,37 +1404,8 @@ bool War3VolumetricLightPass::drawVolumetricLight(
       input.settings->shadows.enabled
           ? clampFinite(input.settings->shadows.strength, 0.0f, 1.0f, 1.0f)
           : 0.0f;
-  // Adaptive quality is subordinate to the hard ray-segment budget below.
-  // Raising an external setting can never restore the old TDR-prone loop.
-  int effectiveSamples = std::clamp(
-      settings.sampleCount, kVolumetricMinSamples, kVolumetricMaxSamples);
-  if (settings.adaptiveSampleCount) {
-    const float intensity01 = std::clamp(pc.params0.x / 0.35f, 0.55f, 1.0f);
-    const float source01 = sunIntensity > 1e-6f
-        ? std::clamp(sunIntensity, 0.45f, 1.0f)
-        : (lightUbo.count > 0u ? 1.0f : 0.55f);
-    // Shadow strength controls radiometric contrast, not geometric sampling
-    // frequency. Scaling samples by it made a perfectly valid .60 shadow
-    // setting turn a requested 16-step unit silhouette into only ~12 probes.
-    // The independent ray-segment budget below remains the hard TDR backstop.
-    const float quality = std::min(intensity01, source01);
-    const int adaptive =
-        static_cast<int>(std::lround(float(effectiveSamples) * quality));
-    const int adaptiveFloor = std::min(12, effectiveSamples);
-    effectiveSamples =
-        std::clamp(adaptive, adaptiveFloor, effectiveSamples);
-  }
-  const uint64_t effectPixelCount =
-      uint64_t(effectExtent.width) * uint64_t(effectExtent.height);
-  const uint64_t budgetedSamples = effectPixelCount != 0u
-      ? kVolumetricRaySegmentBudget / effectPixelCount
-      : uint64_t(kVolumetricMinSamples);
-  effectiveSamples = std::min(
-      effectiveSamples,
-      std::clamp<int>(
-          static_cast<int>(std::min<uint64_t>(
-              budgetedSamples, uint64_t(kVolumetricMaxSamples))),
-          kVolumetricMinSamples, kVolumetricMaxSamples));
+  effectiveSamples = std::clamp(
+      effectiveSamples, kVolumetricMinSamples, kVolumetricMaxSamples);
   pc.params2 =
       Vector4(float(effectiveSamples),
               clampFinite(settings.sunDistance, 100.0f, 6000.0f, 1200.0f),
@@ -1674,18 +1710,29 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
         1u};
   };
   VkExtent3D effectExtent = effectExtentForDivisor(resolutionDivisor);
-  const auto minimumRaySegments = [](const VkExtent3D& value) {
-    return uint64_t(value.width) * uint64_t(value.height) *
-        uint64_t(kVolumetricMinSamples);
+  const auto minimumRaySegments = [](const VkExtent3D& value,
+                                     uint64_t& out) {
+    uint64_t pixels = 0u;
+    return war3::render::War3VolumetricCheckedMultiply(
+               value.width, value.height, pixels) &&
+        war3::render::War3VolumetricCheckedMultiply(
+               pixels, kVolumetricMinSamples, out);
   };
-  while (minimumRaySegments(effectExtent) > kVolumetricRaySegmentBudget &&
+  uint64_t minimumSegments = 0u;
+  bool minimumSegmentsValid =
+      minimumRaySegments(effectExtent, minimumSegments);
+  while ((!minimumSegmentsValid ||
+          minimumSegments > kVolumetricRaySegmentBudget) &&
          resolutionDivisor < kVolumetricMaxResolutionDivisor) {
     effectExtent = effectExtentForDivisor(++resolutionDivisor);
+    minimumSegmentsValid =
+        minimumRaySegments(effectExtent, minimumSegments);
   }
   // The fragment shader deliberately keeps a four-sample quality floor.  If
   // even divisor=8 cannot honor the watchdog budget, skip this optional pass
   // instead of silently exceeding the advertised hard limit.
-  if (minimumRaySegments(effectExtent) > kVolumetricRaySegmentBudget)
+  if (!minimumSegmentsValid ||
+      minimumSegments > kVolumetricRaySegmentBudget)
     return;
   VkRect2D effectScissor = FullRect(effectExtent);
   VkRect2D compositeScissor = FullRect(extent);
@@ -1716,6 +1763,78 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
         unionRegion, effectExtent, extent);
   }
 
+  uint64_t effectPixelCount = 0u;
+  if (!war3::render::War3VolumetricCheckedMultiply(
+          effectScissor.extent.width, effectScissor.extent.height,
+          effectPixelCount))
+    return;
+  const int effectiveSamples = ComputeVolumetricEffectiveSamples(
+      settings, sunIntensity, hasSunVolume, hasPointVolume,
+      effectPixelCount);
+
+  // This is a conservative, source-proven upper bound evaluated before any
+  // volume resource allocation, color/depth copy, UBO update or draw command.
+  // It deliberately assumes the maximum shader branch allowed by the current
+  // settings: eight probes, two directional layers, and either the volume-sun
+  // 3x3 kernel or the camera-CSM 2x2 kernel. A missing snapshot can only make
+  // the executed work smaller than this admission request.
+  war3::render::War3VolumetricShaderWorkRequest workRequest = {};
+  workRequest.rayWidth = effectScissor.extent.width;
+  workRequest.rayHeight = effectScissor.extent.height;
+  workRequest.sampleCount = static_cast<uint32_t>(effectiveSamples);
+  const bool directionalShadowRequested =
+      hasSunVolume && input.settings->shadows.enabled &&
+      clampFinite(input.settings->shadows.strength, 0.0f, 1.0f, 0.0f) >
+          1.0e-6f;
+  if (directionalShadowRequested) {
+    workRequest.directionalProbeCount =
+        kVolumetricDirectionalProbesPerSegment;
+    workRequest.directionalCascadeSamples =
+        kVolumetricDirectionalCascadeSamples;
+    workRequest.directionalTapsPerCascade =
+        settings.volumeSunShadowEnabled
+            ? kVolumetricVolumeSunTapsPerCascade
+            : kVolumetricCsmTapsPerCascade;
+  }
+  const bool pointShadowRequested =
+      hasPointVolume && input.settings->shadows.pointLightsEnabled &&
+      input.settings->shadows.pointShadowEnabled;
+  if (pointShadowRequested) {
+    workRequest.shadowedPointLightCount = std::min<uint32_t>(
+        pointSelection.count, kVolumetricMaxPointLights);
+    workRequest.pointProbesPerLight = kVolumetricPointProbesPerLight;
+  }
+  workRequest.compositeWidth = compositeScissor.extent.width;
+  workRequest.compositeHeight = compositeScissor.extent.height;
+  workRequest.compositeTextureReadsPerPixel =
+      kVolumetricCompositeTextureReadsPerPixel;
+
+  const auto workEstimate =
+      war3::render::EvaluateWar3VolumetricShaderWork(workRequest);
+  PublishVolumetricShaderWorkDiagnostics(input.frameSerial, workEstimate);
+  if (!workEstimate.accepted) {
+    static uint32_t s_workRejectLogs = 0u;
+    const uint32_t rejectLog = s_workRejectLogs++;
+    if (rejectLog < 16u || (rejectLog % 240u) == 0u) {
+      WAR3_RENDER_LOG(
+          "DXVK War3Volumetric: shader-work admission rejected frame=%llu "
+          "reason=%u segments=%llu directionalD32=%llu pointCube=%llu "
+          "compositeTexture=%llu total=%llu budget=%llu\n",
+          static_cast<unsigned long long>(input.frameSerial),
+          static_cast<unsigned>(workEstimate.rejectReason),
+          static_cast<unsigned long long>(workEstimate.raySegments),
+          static_cast<unsigned long long>(
+              workEstimate.directionalD32Reads),
+          static_cast<unsigned long long>(workEstimate.pointCubeReads),
+          static_cast<unsigned long long>(
+              workEstimate.compositeTextureReads),
+          static_cast<unsigned long long>(workEstimate.totalWork),
+          static_cast<unsigned long long>(
+              workEstimate.limits.maxTotalWork));
+    }
+    return;
+  }
+
   ensureResources(extent, colorInfo.format, depthInfo.format,
                   resolutionDivisor);
 
@@ -1725,7 +1844,8 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   const bool effectSubmitted = drawVolumetricLight(
       ctx, input, pointLights, pointSelection.sourceIndices,
       pointSelection.count, cameraPos, farClearRaw, rawDepthQuantum,
-      farIsOne, effectScissor, pointShadowedLightCount);
+      farIsOne, effectScissor, effectiveSamples,
+      pointShadowedLightCount);
   if (effectSubmitted &&
       compositeVolumetricLight(ctx, input, compositeScissor)) {
     // Exact execution evidence: this is emitted only after both the low-res
