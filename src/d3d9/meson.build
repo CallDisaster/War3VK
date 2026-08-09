@@ -329,6 +329,23 @@ test(
   timeout : 30,
 )
 
+# Numerical CSM receiver oracle. It deliberately contains no Vulkan or game
+# state so its sub-texel, receiver-plane and cascade-boundary contracts run on
+# every Win32 build.
+war3_shadow_receiver_numeric_contract_test = executable(
+  'war3_shadow_receiver_numeric_contract_test',
+  [
+    'war3/render/tests/war3_shadow_receiver_numeric_contract_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_receiver_numeric_contract',
+  war3_shadow_receiver_numeric_contract_test,
+  timeout : 30,
+)
+
 # The production pipeline owner uses the same Rc lifetime semantics exercised
 # here: a cache may release immediately, while an in-flight command list holds
 # the final owner until its GPU completion notification.

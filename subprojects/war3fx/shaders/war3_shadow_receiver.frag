@@ -269,6 +269,8 @@ bool computeReceiverPlaneDepthGradient(vec4 lightClip, mat4 lightViewProj,
 
   float invW = 1.0 / lightClip.w;
   vec3 ndc = lightClip.xyz * invW;
+  if (!validVec3(ndc))
+    return false;
   vec3 ndcDx = (lightDx.xyz - ndc * lightDx.w) * invW;
   vec3 ndcDy = (lightDy.xyz - ndc * lightDy.w) * invW;
   if (!validVec3(ndcDx) || !validVec3(ndcDy))
@@ -307,6 +309,60 @@ float receiverPlaneTapReference(float centerReference, vec2 tapOffsetUv,
       ? centerReference + dot(gradient, tapOffsetUv)
       : centerReference;
   return clamp(reference, 0.0, 1.0);
+}
+
+// PCSS searches raw shadow depth for blockers, then the final PCF below uses
+// comparison sampling. Keeping this helper identical in the direct receiver
+// and visibility prepass prevents TAA from changing the CSM penumbra model.
+float computePcssRadius(uint cascadeIndex, vec2 uv, float refDepth,
+                        vec2 receiverPlaneGradient,
+                        bool receiverPlaneValid) {
+  float radius = validFloat(ubo.u_params.y)
+      ? max(ubo.u_params.y, 0.0) : 0.0;
+  bool pcssEnabled = validFloat(ubo.u_params3.z) &&
+      ubo.u_params3.z > 0.5;
+  if (!pcssEnabled)
+    return radius;
+
+  float invRes = ubo.u_params.z;
+  float searchRadius = max(ubo.u_params3.w, 0.0);
+  float minRadius = max(ubo.u_params4.x, 0.0);
+  float maxRadius = max(ubo.u_params4.y, minRadius);
+  float depthScale = max(ubo.u_params4.z, 0.0);
+  int searchKernel = int(ubo.u_params6.z + 0.5);
+  int searchExtent = searchKernel > 0 ? 2 : 1;
+  if (!validFloat(invRes) || invRes <= 0.0 ||
+      !validFloat(searchRadius) || !validFloat(minRadius) ||
+      !validFloat(maxRadius) || !validFloat(depthScale))
+    return radius;
+
+  float sum = 0.0;
+  float count = 0.0;
+  bool blockerPlaneValid = receiverPlaneValid && receiverPlaneKernelValid(
+      receiverPlaneGradient,
+      float(searchExtent) * searchRadius * invRes);
+  for (int y = -searchExtent; y <= searchExtent; y++) {
+    for (int x = -searchExtent; x <= searchExtent; x++) {
+      vec2 offset = vec2(float(x), float(y)) * searchRadius * invRes;
+      vec2 tapUv = uv + offset;
+      // A blocker search may not manufacture an edge blocker by sampling the
+      // clamped border outside its cascade.
+      if (tapUv.x < 0.0 || tapUv.x > 1.0 ||
+          tapUv.y < 0.0 || tapUv.y > 1.0)
+        continue;
+      float tapRef = receiverPlaneTapReference(
+          refDepth, offset, receiverPlaneGradient, blockerPlaneValid);
+      float depth = shadowMapDepth(cascadeIndex, tapUv);
+      if (depth < tapRef) {
+        sum += depth;
+        count += 1.0;
+      }
+    }
+  }
+  if (count <= 0.0)
+    return minRadius;
+  float penumbra = (refDepth - sum / count) * depthScale;
+  return clamp(minRadius + penumbra, minRadius, maxRadius);
 }
 
 float sampleShadowGrid(uint cascadeIndex, vec2 uv, float refDepth,
@@ -481,6 +537,14 @@ float computeWallFilterWeight(float wallFactor, float wallStabilityFactor,
 float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
                               float viewDepth, float biasExtra, vec2 rot,
                               float wallFilterWeight) {
+  if (!validVec3(worldPos) || !validVec3(worldDx) || !validVec3(worldDy) ||
+      !validFloat(viewDepth) || !validFloat(biasExtra) ||
+      !validFloat(wallFilterWeight))
+    return 1.0;
+  if (!validFloat(ubo.u_params.w) || !validFloat(ubo.u_params2.x) ||
+      !validFloat(ubo.u_params2.y) || !validFloat(ubo.u_params4.w) ||
+      !validFloat(ubo.u_params6.w))
+    return 1.0;
   int cascadeCount = clamp(int(ubo.u_params.w), 1, 4);
 
   float splits[4];
@@ -488,6 +552,10 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
   splits[1] = ubo.u_splitFar.y;
   splits[2] = ubo.u_splitFar.z;
   splits[3] = ubo.u_splitFar.w;
+  for (int i = 0; i < cascadeCount; i++) {
+    if (!validFloat(splits[i]))
+      return 1.0;
+  }
 
   int c0 = cascadeCount - 1;
   for (int i = 0; i < cascadeCount; i++) {
@@ -499,25 +567,18 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
 
   float baseBias = max(ubo.u_params2.x, 0.0) + max(biasExtra, 0.0);
   float blendRange = max(ubo.u_params2.y, 0.0);
-  bool pcssEnabled = (ubo.u_params3.z > 0.5);
-  float pcssSearchRadius = max(ubo.u_params3.w, 0.0);
-  float pcssMinRadius = max(ubo.u_params4.x, 0.0);
-  float pcssMaxRadius = max(ubo.u_params4.y, pcssMinRadius);
-  float pcssDepthScale = max(ubo.u_params4.z, 0.0);
   float cascadeBiasScale = max(ubo.u_params4.w, 0.0);
   float pcfCascadeRadiusScale = max(ubo.u_params6.w, 0.0);
-  int pcssSearchKernel = int(ubo.u_params6.z + 0.5);
-  int searchRadius = (pcssSearchKernel > 0) ? 2 : 1;
 
   vec4 p = vec4(worldPos, 1.0);
 
   // Sample primary cascade
   vec4 l0 = p * ubo.u_lightViewProj[c0];
   // Outside the light clip volume: treat as fully lit
-  if (l0.w <= 0.0)
+  if (!validVec4(l0) || l0.w <= 0.0)
     return 1.0;
   vec3 n0 = l0.xyz / l0.w;
-  if (n0.z < 0.0 || n0.z > 1.0)
+  if (!validVec3(n0) || n0.z < 0.0 || n0.z > 1.0)
     return 1.0;
   // Shadow map is rendered with a negative viewport height (DXVK/D3D style),
   // which flips NDC-Y. Vulkan texture coordinates use top-left origin, so
@@ -538,35 +599,8 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
   if (isTerrainMaskedOccluder(uint(c0), uv0, ref0))
     return 1.0;
 
-  float radius0 = max(ubo.u_params.y, 0.0);
-  if (pcssEnabled) {
-    float sum = 0.0;
-    float cnt = 0.0;
-    float invRes = ubo.u_params.z;
-    bool blockerPlaneValid = receiverPlaneValid0 &&
-        receiverPlaneKernelValid(
-            receiverPlaneGradient0,
-            float(searchRadius) * pcssSearchRadius * invRes);
-    for (int y = -searchRadius; y <= searchRadius; y++) {
-      for (int x = -searchRadius; x <= searchRadius; x++) {
-        vec2 o = vec2(float(x), float(y)) * pcssSearchRadius * invRes;
-        float d = shadowMapDepth(uint(c0), uv0 + o);
-        float tapRef = receiverPlaneTapReference(
-            ref0, o, receiverPlaneGradient0, blockerPlaneValid);
-        if (d < tapRef) {
-          sum += d;
-          cnt += 1.0;
-        }
-      }
-    }
-    if (cnt > 0.0) {
-      float avgBlocker = sum / cnt;
-      float penumbra = (ref0 - avgBlocker) * pcssDepthScale;
-      radius0 = clamp(pcssMinRadius + penumbra, pcssMinRadius, pcssMaxRadius);
-    } else {
-      radius0 = pcssMinRadius;
-    }
-  }
+  float radius0 = computePcssRadius(
+      uint(c0), uv0, ref0, receiverPlaneGradient0, receiverPlaneValid0);
   radius0 = computeCascadePcfRadius(radius0, c0, cascadeCount, pcfCascadeRadiusScale);
   // Wall stabilization is a continuous radius adjustment on the same PCF
   // kernel. Snapping the receiver UV or switching filter families introduces
@@ -584,10 +618,10 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
 
     int c1 = c0 + 1;
     vec4 l1 = p * ubo.u_lightViewProj[c1];
-    if (l1.w <= 0.0)
+    if (!validVec4(l1) || l1.w <= 0.0)
       return vis0;
     vec3 n1 = l1.xyz / l1.w;
-    if (n1.z < 0.0 || n1.z > 1.0)
+    if (!validVec3(n1) || n1.z < 0.0 || n1.z > 1.0)
       return vis0;
     vec2 uv1 = n1.xy * 0.5 + 0.5;
     uv1.y = 1.0 - uv1.y;
@@ -599,35 +633,8 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
     bool receiverPlaneValid1 = computeReceiverPlaneDepthGradient(
         l1, ubo.u_lightViewProj[c1], worldDx, worldDy,
         receiverPlaneGradient1);
-    float radius1 = max(ubo.u_params.y, 0.0);
-    if (pcssEnabled) {
-      float sum = 0.0;
-      float cnt = 0.0;
-      float invRes = ubo.u_params.z;
-      bool blockerPlaneValid = receiverPlaneValid1 &&
-          receiverPlaneKernelValid(
-              receiverPlaneGradient1,
-              float(searchRadius) * pcssSearchRadius * invRes);
-      for (int y = -searchRadius; y <= searchRadius; y++) {
-        for (int x = -searchRadius; x <= searchRadius; x++) {
-          vec2 o = vec2(float(x), float(y)) * pcssSearchRadius * invRes;
-          float d = shadowMapDepth(uint(c1), uv1 + o);
-          float tapRef = receiverPlaneTapReference(
-              ref1, o, receiverPlaneGradient1, blockerPlaneValid);
-          if (d < tapRef) {
-            sum += d;
-            cnt += 1.0;
-          }
-        }
-      }
-      if (cnt > 0.0) {
-        float avgBlocker = sum / cnt;
-        float penumbra = (ref1 - avgBlocker) * pcssDepthScale;
-        radius1 = clamp(pcssMinRadius + penumbra, pcssMinRadius, pcssMaxRadius);
-      } else {
-        radius1 = pcssMinRadius;
-      }
-    }
+    float radius1 = computePcssRadius(
+        uint(c1), uv1, ref1, receiverPlaneGradient1, receiverPlaneValid1);
     radius1 = computeCascadePcfRadius(radius1, c1, cascadeCount, pcfCascadeRadiusScale);
     radius1 = mix(radius1, max(radius1, 1.50), wallFilterWeight);
     float vis1 = 1.0;

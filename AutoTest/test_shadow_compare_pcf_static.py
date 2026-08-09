@@ -182,6 +182,28 @@ class ShadowComparePcfStaticTests(unittest.TestCase):
                 ),
             )
 
+    def test_direct_and_prepass_share_pcss_and_finite_fallbacks(self):
+        for source in (RECEIVER, VISIBILITY):
+            for token in (
+                "float computePcssRadius",
+                "float depth = shadowMapDepth(cascadeIndex, tapUv)",
+                "if (tapUv.x < 0.0 || tapUv.x > 1.0",
+                "!validVec3(ndc)",
+                "!validVec4(l0)",
+                "!validVec3(n0)",
+            ):
+                self.assertIn(token, source)
+        self.assertIn("!validVec4(l1)", RECEIVER)
+        self.assertIn("!validVec3(n1)", RECEIVER)
+        self.assertIn("validVec4(l1) && l1.w > 0.0", VISIBILITY)
+        self.assertIn("validVec3(n1) && n1.z >= 0.0", VISIBILITY)
+        self.assertIn(
+            "return vis0;", VISIBILITY[
+                VISIBILITY.index("float computeShadowVisibility") :
+                VISIBILITY.index("void main()")
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -219,6 +219,8 @@ bool computeReceiverPlaneDepthGradient(vec4 lightClip, mat4 lightViewProj,
 
   float invW = 1.0 / lightClip.w;
   vec3 ndc = lightClip.xyz * invW;
+  if (!validVec3(ndc))
+    return false;
   vec3 ndcDx = (lightDx.xyz - ndc * lightDx.w) * invW;
   vec3 ndcDy = (lightDy.xyz - ndc * lightDy.w) * invW;
   if (!validVec3(ndcDx) || !validVec3(ndcDy))
@@ -253,6 +255,58 @@ float receiverPlaneTapReference(float centerReference, vec2 tapOffsetUv,
       ? centerReference + dot(gradient, tapOffsetUv)
       : centerReference;
   return clamp(reference, 0.0, 1.0);
+}
+
+// Keep the raw blocker search and comparison-sampled final PCF bit-for-bit
+// aligned with the direct receiver. The prepass is an alternate source for
+// TAA, not an alternate CSM filtering model.
+float computePcssRadius(uint cascadeIndex, vec2 uv, float refDepth,
+                        vec2 receiverPlaneGradient,
+                        bool receiverPlaneValid) {
+  float radius = validFloat(ubo.u_params.y)
+      ? max(ubo.u_params.y, 0.0) : 0.0;
+  bool pcssEnabled = validFloat(ubo.u_params3.z) &&
+      ubo.u_params3.z > 0.5;
+  if (!pcssEnabled)
+    return radius;
+
+  float invRes = ubo.u_params.z;
+  float searchRadius = max(ubo.u_params3.w, 0.0);
+  float minRadius = max(ubo.u_params4.x, 0.0);
+  float maxRadius = max(ubo.u_params4.y, minRadius);
+  float depthScale = max(ubo.u_params4.z, 0.0);
+  int searchKernel = int(ubo.u_params6.z + 0.5);
+  int searchExtent = searchKernel > 0 ? 2 : 1;
+  if (!validFloat(invRes) || invRes <= 0.0 ||
+      !validFloat(searchRadius) || !validFloat(minRadius) ||
+      !validFloat(maxRadius) || !validFloat(depthScale))
+    return radius;
+
+  float sum = 0.0;
+  float count = 0.0;
+  bool blockerPlaneValid = receiverPlaneValid && receiverPlaneKernelValid(
+      receiverPlaneGradient,
+      float(searchExtent) * searchRadius * invRes);
+  for (int y = -searchExtent; y <= searchExtent; y++) {
+    for (int x = -searchExtent; x <= searchExtent; x++) {
+      vec2 offset = vec2(float(x), float(y)) * searchRadius * invRes;
+      vec2 tapUv = uv + offset;
+      if (tapUv.x < 0.0 || tapUv.x > 1.0 ||
+          tapUv.y < 0.0 || tapUv.y > 1.0)
+        continue;
+      float tapRef = receiverPlaneTapReference(
+          refDepth, offset, receiverPlaneGradient, blockerPlaneValid);
+      float depth = shadowMapDepth(cascadeIndex, tapUv);
+      if (depth < tapRef) {
+        sum += depth;
+        count += 1.0;
+      }
+    }
+  }
+  if (count <= 0.0)
+    return minRadius;
+  float penumbra = (refDepth - sum / count) * depthScale;
+  return clamp(minRadius + penumbra, minRadius, maxRadius);
 }
 
 float sampleShadowGrid(uint cascadeIndex, vec2 uv, float refDepth,
@@ -455,6 +509,14 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
                               float viewDepth, float biasExtra, vec2 rot,
                               float wallFilterWeight) {
   const bool diagnoseCsm = int(ubo.u_params2.z + 0.5) == 9;
+  if (!validVec3(worldPos) || !validVec3(worldDx) || !validVec3(worldDy) ||
+      !validFloat(viewDepth) || !validFloat(biasExtra) ||
+      !validFloat(wallFilterWeight))
+    return diagnoseCsm ? 0.0 : 1.0;
+  if (!validFloat(ubo.u_params.w) || !validFloat(ubo.u_params2.x) ||
+      !validFloat(ubo.u_params2.y) || !validFloat(ubo.u_params4.w) ||
+      !validFloat(ubo.u_params6.w))
+    return diagnoseCsm ? 0.0 : 1.0;
   int cascadeCount = clamp(int(ubo.u_params.w), 1, 4);
 
   float splits[4];
@@ -462,6 +524,10 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
   splits[1] = ubo.u_splitFar.y;
   splits[2] = ubo.u_splitFar.z;
   splits[3] = ubo.u_splitFar.w;
+  for (int i = 0; i < cascadeCount; i++) {
+    if (!validFloat(splits[i]))
+      return diagnoseCsm ? 0.0 : 1.0;
+  }
 
   int c0 = cascadeCount - 1;
   for (int i = 0; i < cascadeCount; i++) {
@@ -477,19 +543,19 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
 
   vec4 p = vec4(worldPos, 1.0);
 
-  // Sample primary cascade only (skip cascade blending for TAA - temporal filter smooths it)
+  // The prepass is an alternate source for TAA, not an alternate CSM model:
+  // it must keep the same cascade blend as DirectInline.
   vec4 l0 = p * ubo.u_lightViewProj[c0];
-  if (l0.w <= 0.0)
+  if (!validVec4(l0) || l0.w <= 0.0)
     return diagnoseCsm ? 0.05 : 1.0;
   vec3 n0 = l0.xyz / l0.w;
-  if (n0.z < 0.0 || n0.z > 1.0)
+  if (!validVec3(n0) || n0.z < 0.0 || n0.z > 1.0)
     return diagnoseCsm ? 0.15 : 1.0;
 
   vec2 uv0 = n0.xy * 0.5 + 0.5;
   uv0.y = 1.0 - uv0.y;
-  if (diagnoseCsm &&
-      (uv0.x < 0.0 || uv0.x > 1.0 || uv0.y < 0.0 || uv0.y > 1.0))
-    return 0.25;
+  if (uv0.x < 0.0 || uv0.x > 1.0 || uv0.y < 0.0 || uv0.y > 1.0)
+    return diagnoseCsm ? 0.25 : 1.0;
   float bias0 = baseBias * computeCascadeBiasScale(c0, cascadeCount, cascadeBiasScale);
   // 与 receiver.frag 一致：越界直接全亮会造成接触阴影突然断裂。
   float ref0 = clamp(n0.z - bias0, 0.0, 1.0);
@@ -507,7 +573,8 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
     return ref0 <= blockerDepth ? 0.55 : 0.65;
   }
 
-  float radius0 = max(ubo.u_params.y, 0.0);
+  float radius0 = computePcssRadius(
+      uint(c0), uv0, ref0, receiverPlaneGradient0, receiverPlaneValid0);
   radius0 = computeCascadePcfRadius(radius0, c0, cascadeCount, pcfCascadeRadiusScale);
   radius0 = mix(radius0, max(radius0, 1.50), wallFilterWeight);
   float vis0 = sampleShadowPcf(
@@ -525,18 +592,23 @@ float computeShadowVisibility(vec3 worldPos, vec3 worldDx, vec3 worldDy,
     if (w > 1e-6) {
       int c1 = c0 + 1;
       vec4 l1 = p * ubo.u_lightViewProj[c1];
-      if (l1.w > 0.0) {
+      if (validVec4(l1) && l1.w > 0.0) {
         vec3 n1 = l1.xyz / l1.w;
-        if (n1.z >= 0.0 && n1.z <= 1.0) {
+        if (validVec3(n1) && n1.z >= 0.0 && n1.z <= 1.0) {
           vec2 uv1 = n1.xy * 0.5 + 0.5;
           uv1.y = 1.0 - uv1.y;
+          if (uv1.x < 0.0 || uv1.x > 1.0 ||
+              uv1.y < 0.0 || uv1.y > 1.0)
+            return vis0;
           float bias1 = baseBias * computeCascadeBiasScale(c1, cascadeCount, cascadeBiasScale);
           float ref1 = clamp(n1.z - bias1, 0.0, 1.0);
           vec2 receiverPlaneGradient1 = vec2(0.0);
           bool receiverPlaneValid1 = computeReceiverPlaneDepthGradient(
               l1, ubo.u_lightViewProj[c1], worldDx, worldDy,
               receiverPlaneGradient1);
-          float radius1 = max(ubo.u_params.y, 0.0);
+          float radius1 = computePcssRadius(
+              uint(c1), uv1, ref1,
+              receiverPlaneGradient1, receiverPlaneValid1);
           radius1 = computeCascadePcfRadius(radius1, c1, cascadeCount, pcfCascadeRadiusScale);
           radius1 = mix(radius1, max(radius1, 1.50), wallFilterWeight);
           float vis1 = 1.0;
@@ -587,14 +659,26 @@ void main() {
   vec4 clip = vec4(uvVp.x * 2.0 - 1.0, 1.0 - uvVp.y * 2.0, depthN, 1.0);
 
   vec4 worldH = clip * ubo.u_invViewProj;
-  if (abs(worldH.w) < 1e-6) {
+  if (!validVec4(worldH) || abs(worldH.w) < 1e-6) {
     o_vis = 1.0;
     return;
   }
   vec3 worldPos = worldH.xyz / worldH.w;
+  if (!validVec3(worldPos)) {
+    o_vis = 1.0;
+    return;
+  }
 
   vec4 viewH = vec4(worldPos, 1.0) * ubo.u_view;
+  if (!validVec4(viewH)) {
+    o_vis = 1.0;
+    return;
+  }
   float viewDepth = abs(viewH.z);
+  if (!validFloat(viewDepth)) {
+    o_vis = 1.0;
+    return;
+  }
   vec3 viewPos = viewH.xyz;
 
   float receiverMode = ubo.u_params5.w;
