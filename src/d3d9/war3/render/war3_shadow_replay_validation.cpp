@@ -211,6 +211,31 @@ War3ShadowReplayValidationResult ValidateWar3ShadowReplayDraw(
   return {};
 }
 
+War3ShadowReplayBatchValidationResult ValidateWar3ShadowReplayBatch(
+    const War3ShadowReplayValidationInput* inputs,
+    std::size_t count) noexcept {
+  War3ShadowReplayBatchValidationResult batch = {};
+  if (count != 0u && inputs == nullptr) {
+    batch.valid = false;
+    batch.failure.reason =
+        War3ShadowReplayRejectReason::MissingPositionBuffer;
+    return batch;
+  }
+
+  for (std::size_t i = 0u; i < count; ++i) {
+    const War3ShadowReplayValidationResult result =
+        ValidateWar3ShadowReplayDraw(inputs[i]);
+    if (!result) {
+      batch.valid = false;
+      batch.failureIndex = i;
+      batch.failure = result;
+      return batch;
+    }
+    ++batch.validatedCount;
+  }
+  return batch;
+}
+
 const char* War3ShadowReplayRejectReasonName(
     War3ShadowReplayRejectReason reason) noexcept {
   static constexpr const char* kNames[] = {

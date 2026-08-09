@@ -48,19 +48,28 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
     return;
   }
 
-  // 统计需要渲染的单位数量（仅描边表内的单位）
-  uint32_t unitCount = 0;
-  for (const auto &caster : input.scene.shadowCasters) {
+  // Seal the exact target set first. Both the MRT mask and geometry outline
+  // are replay consumers and must reject a malformed batch before recording
+  // any Vulkan draw or beginning rendering.
+  std::vector<const War3ShadowCasterDraw*> outlineDraws;
+  std::vector<uint32_t> outlineDrawIndices;
+  outlineDraws.reserve(input.scene.shadowCasters.size());
+  outlineDrawIndices.reserve(input.scene.shadowCasters.size());
+  for (uint32_t drawIdx = 0u;
+       drawIdx < static_cast<uint32_t>(input.scene.shadowCasters.size());
+       ++drawIdx) {
+    const auto &caster = input.scene.shadowCasters[drawIdx];
     // 说明：描边目标以 batchHandle 匹配为准，不再强依赖
     // batchTag==WorldObjects。 原因：部分对象会在 SelectionOverlay/Decorations
     // 等 WorldGroup Tag 下绘制， 但仍需要支持描边；同时 terrain
     // 等通常没有有效句柄，不会误命中。
     if (War3RenderState::IsOutlineHandle(caster.batchHandle)) {
-      unitCount++;
+      outlineDraws.push_back(&caster);
+      outlineDrawIndices.push_back(drawIdx);
     }
   }
 
-  if (unitCount == 0) {
+  if (outlineDraws.empty()) {
     static bool s_loggedNoMatch = false;
     if (!s_loggedNoMatch) {
       s_loggedNoMatch = true;
@@ -78,6 +87,12 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
     }
     return;
   }
+
+  if (!validateShadowReplayDraws(input, outlineDraws,
+                                 "outline-screen-space")) {
+    return;
+  }
+  const uint32_t unitCount = static_cast<uint32_t>(outlineDraws.size());
 
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
@@ -104,10 +119,81 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
     m_outlineMaskLayout = createOutlineMaskPipelineLayout();
   }
 
+  auto transitionMasksToColorAttachment = [&]() {
+    const auto plan = war3::render::PlanWar3OutlineMaskBegin(
+        m_outlineMaskLayoutState);
+    if (!plan)
+      return false;
+
+    const bool discard = plan.discardContents;
+    const VkImageLayout oldLayout = discard
+        ? VK_IMAGE_LAYOUT_UNDEFINED
+        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    std::array<VkImageMemoryBarrier2, 2> barriers = {};
+    const std::array<Rc<DxvkImageView>, 2> views = {
+        m_outlineMaskVisibleView, m_outlineMaskAllView};
+    for (uint32_t i = 0u; i < barriers.size(); ++i) {
+      auto &barrier = barriers[i];
+      barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+      barrier.srcStageMask = discard
+          ? VK_PIPELINE_STAGE_2_NONE
+          : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+      barrier.srcAccessMask =
+          discard ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_READ_BIT;
+      barrier.dstStageMask =
+          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+      barrier.oldLayout = oldLayout;
+      barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      barrier.image = views[i]->image()->handle();
+      barrier.subresourceRange = views[i]->imageSubresources();
+    }
+
+    VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount =
+        static_cast<uint32_t>(barriers.size());
+    dependency.pImageMemoryBarriers = barriers.data();
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dependency);
+    m_outlineMaskLayoutState = plan.newState;
+    return true;
+  };
+
+  auto transitionMasksToShaderRead = [&]() {
+    const auto plan =
+        war3::render::PlanWar3OutlineMaskEnd(m_outlineMaskLayoutState);
+    if (!plan)
+      return false;
+
+    std::array<VkImageMemoryBarrier2, 2> barriers = {};
+    const std::array<Rc<DxvkImageView>, 2> views = {
+        m_outlineMaskVisibleView, m_outlineMaskAllView};
+    for (uint32_t i = 0u; i < barriers.size(); ++i) {
+      auto &barrier = barriers[i];
+      barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+      barrier.srcStageMask =
+          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      barrier.image = views[i]->image()->handle();
+      barrier.subresourceRange = views[i]->imageSubresources();
+    }
+
+    VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount =
+        static_cast<uint32_t>(barriers.size());
+    dependency.pImageMemoryBarriers = barriers.data();
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dependency);
+    m_outlineMaskLayoutState = plan.newState;
+    return true;
+  };
+
   // MRT Render Logic
-  auto drawMaskPassMRT = [&]() {
+  auto drawMaskPassMRT = [&]() -> bool {
     if (!m_outlineMaskLayout)
-      return;
+      return false;
 
     // Clear values for 2 attachments (Visible, All)
     VkClearValue clearValues[2];
@@ -144,11 +230,11 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
     DxvkResourceBufferInfo paletteBufferInfo =
         ensureShadowMatrixBuffer(ctx, input);
     if (paletteBufferInfo.buffer == VK_NULL_HANDLE)
-      return;
+      return false;
 
     const uint32_t objectBase = m_shadowMatrixObjectBase;
-    const uint32_t casterCount =
-        static_cast<uint32_t>(input.scene.shadowCasters.size());
+    if (!transitionMasksToColorAttachment())
+      return false;
 
     ctx->cmdBeginRendering(&renderInfo);
 
@@ -165,11 +251,11 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
     VkRect2D scissor = {{0, 0}, {extent.width, extent.height}};
     ctx->cmdSetScissor(1, &scissor);
 
-    for (uint32_t drawIdx = 0; drawIdx < casterCount; drawIdx++) {
-      const auto &draw = input.scene.shadowCasters[drawIdx];
-      if (!War3RenderState::IsOutlineHandle(draw.batchHandle)) {
-        continue;
-      }
+    for (uint32_t targetIndex = 0u;
+         targetIndex < static_cast<uint32_t>(outlineDraws.size());
+         ++targetIndex) {
+      const uint32_t drawIdx = outlineDrawIndices[targetIndex];
+      const auto &draw = *outlineDraws[targetIndex];
 
       ShadowCasterPipelineKey key = {};
       key.positionFormat = draw.positionFormat;
@@ -345,30 +431,11 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
 
     // Track Input Depth
     ctx->track(m_depthCopyView->image(), DxvkAccess::Read);
+    return true;
   };
 
-  drawMaskPassMRT();
-
-  // 遮罩写入后：切回 SHADER_READ
-  auto transitionMaskToRead = [&](const Rc<DxvkImageView> &view) {
-    VkImageMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    barrier.newLayout = view->getLayout();
-    barrier.image = view->image()->handle();
-    barrier.subresourceRange = view->imageSubresources();
-
-    VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    depInfo.imageMemoryBarrierCount = 1;
-    depInfo.pImageMemoryBarriers = &barrier;
-    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
-  };
-
-  transitionMaskToRead(m_outlineMaskVisibleView);
-  transitionMaskToRead(m_outlineMaskAllView);
+  if (!drawMaskPassMRT() || !transitionMasksToShaderRead())
+    return;
 
   // ===== 边缘检测并合成到主颜色 =====
   if (!m_outlineEdgeLayout) {
@@ -529,15 +596,17 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
     return;
   }
 
-  // 统计需要渲染的单位数量（仅描边表内的单位）
-  uint32_t unitCount = 0;
+  // Seal and validate the complete geometry-outline replay batch before any
+  // BeginRendering. One malformed target rejects the whole outline pass.
+  std::vector<const War3ShadowCasterDraw*> outlineDraws;
+  outlineDraws.reserve(input.scene.shadowCasters.size());
   for (const auto &caster : input.scene.shadowCasters) {
     if (War3RenderState::IsOutlineHandle(caster.batchHandle)) {
-      unitCount++;
+      outlineDraws.push_back(&caster);
     }
   }
 
-  if (unitCount == 0) {
+  if (outlineDraws.empty()) {
     static bool s_loggedNoMatch = false;
     if (!s_loggedNoMatch) {
       s_loggedNoMatch = true;
@@ -555,6 +624,12 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
     }
     return;
   }
+
+  if (!validateShadowReplayDraws(input, outlineDraws,
+                                 "outline-geometry")) {
+    return;
+  }
+  const uint32_t unitCount = static_cast<uint32_t>(outlineDraws.size());
 
   static bool s_loggedOutline = false;
   if (!s_loggedOutline) {
@@ -640,11 +715,8 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
   uint32_t drawnUnits = 0;
 
   // 遍历单位并渲染描边
-  for (const auto &draw : input.scene.shadowCasters) {
-    // 只渲染描边表命中（batchTag 不再强依赖 WorldObjects，避免遗漏）
-    if (!War3RenderState::IsOutlineHandle(draw.batchHandle)) {
-      continue;
-    }
+  for (const War3ShadowCasterDraw *drawPtr : outlineDraws) {
+    const auto &draw = *drawPtr;
 
     // 构建管线 key
     ShadowCasterPipelineKey key = {};

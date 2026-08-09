@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace dxvk::war3::render {
@@ -102,8 +103,28 @@ struct War3ShadowReplayValidationResult {
   }
 };
 
+/**
+ * Result of validating one immutable replay batch before command recording.
+ * A consumer must reject the entire batch when valid is false; failureIndex
+ * names the first malformed draw and no earlier draw is permission to submit.
+ */
+struct War3ShadowReplayBatchValidationResult {
+  bool valid = true;
+  std::size_t failureIndex = 0u;
+  std::size_t validatedCount = 0u;
+  War3ShadowReplayValidationResult failure = {};
+
+  explicit operator bool() const noexcept {
+    return valid;
+  }
+};
+
 War3ShadowReplayValidationResult ValidateWar3ShadowReplayDraw(
     const War3ShadowReplayValidationInput& input) noexcept;
+
+War3ShadowReplayBatchValidationResult ValidateWar3ShadowReplayBatch(
+    const War3ShadowReplayValidationInput* inputs,
+    std::size_t count) noexcept;
 
 const char* War3ShadowReplayRejectReasonName(
     War3ShadowReplayRejectReason reason) noexcept;

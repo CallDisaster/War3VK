@@ -568,7 +568,11 @@ void War3ShadowReceiverPass::ensureOutlineMaskResources(VkExtent3D extent) {
   DxvkImageViewKey viewInfo = {};
   viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
   viewInfo.format = VK_FORMAT_R8_UNORM;
-  viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  // The exact same view is first bound as an MRT color attachment and then
+  // sampled by the edge pass. Restricting it to SAMPLED makes the attachment
+  // use invalid even though the underlying image advertises both usages.
+  viewInfo.usage =
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   viewInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   viewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
   viewInfo.mipIndex = 0;
@@ -579,6 +583,10 @@ void War3ShadowReceiverPass::ensureOutlineMaskResources(VkExtent3D extent) {
 
   m_outlineMaskVisibleView = m_outlineMaskVisible->createView(viewInfo);
   m_outlineMaskAllView = m_outlineMaskAll->createView(viewInfo);
+  // Vulkan images are born UNDEFINED. DxvkImageViewKey::layout is descriptor
+  // metadata, not a query for the image's current layout.
+  m_outlineMaskLayoutState =
+      war3::render::War3OutlineMaskLayoutState::Undefined;
 }
 
 bool War3ShadowReceiverPass::ensureShadowResources(uint32_t cascadeCount,

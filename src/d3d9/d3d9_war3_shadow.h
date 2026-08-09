@@ -2,6 +2,7 @@
 
 #include "d3d9_war3_pipeline.h"
 #include "d3d9_war3_csm.h"
+#include "war3/render/war3_outline_mask_layout.h"
 #include "war3/render/war3_point_shadow_cpu_plan.h"
 
 #include "../dxvk/dxvk_hash.h"
@@ -647,6 +648,8 @@ namespace dxvk {
         Rc<DxvkImage> m_outlineMaskAll;
         Rc<DxvkImageView> m_outlineMaskAllView;
         VkExtent3D m_outlineMaskExtent = {0, 0, 1};
+        war3::render::War3OutlineMaskLayoutState m_outlineMaskLayoutState =
+            war3::render::War3OutlineMaskLayoutState::Undefined;
 
         // 中间颜色副本（可采样）
         Rc<DxvkImage> m_colorCopy;

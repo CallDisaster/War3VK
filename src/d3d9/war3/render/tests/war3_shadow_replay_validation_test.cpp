@@ -1,4 +1,5 @@
 #include "../war3_shadow_replay_validation.h"
+#include "../war3_outline_mask_layout.h"
 
 #include <cassert>
 #include <limits>
@@ -96,5 +97,39 @@ int main() {
   nonIndexed.firstVertex = 2u;
   nonIndexed.position.size = 72u;
   assert(ValidateWar3ShadowReplayDraw(nonIndexed));
+
+  // Outline and every other replay consumer validate an immutable batch
+  // before command recording. A malformed second draw rejects the entire
+  // batch rather than granting permission to submit the valid prefix.
+  War3ShadowReplayValidationInput batchInputs[2] = {
+      ValidIndexed(), ValidIndexed()};
+  auto batch = ValidateWar3ShadowReplayBatch(batchInputs, 2u);
+  assert(batch);
+  assert(batch.validatedCount == 2u);
+  batchInputs[1].position.size = 1u;
+  batch = ValidateWar3ShadowReplayBatch(batchInputs, 2u);
+  assert(!batch);
+  assert(batch.failureIndex == 1u);
+  assert(batch.validatedCount == 1u);
+  assert(batch.failure.reason ==
+         War3ShadowReplayRejectReason::PositionRangeOutOfBounds);
+  assert(!ValidateWar3ShadowReplayBatch(nullptr, 1u));
+
+  // First use discards UNDEFINED contents. Every later frame performs a real
+  // ShaderReadOnly -> ColorAttachment -> ShaderReadOnly round trip.
+  auto begin = PlanWar3OutlineMaskBegin(
+      War3OutlineMaskLayoutState::Undefined);
+  assert(begin);
+  assert(begin.discardContents);
+  assert(begin.newState == War3OutlineMaskLayoutState::ColorAttachment);
+  auto end = PlanWar3OutlineMaskEnd(begin.newState);
+  assert(end);
+  assert(end.newState == War3OutlineMaskLayoutState::ShaderReadOnly);
+  begin = PlanWar3OutlineMaskBegin(end.newState);
+  assert(begin);
+  assert(!begin.discardContents);
+  assert(!PlanWar3OutlineMaskBegin(begin.newState));
+  assert(!PlanWar3OutlineMaskEnd(
+      War3OutlineMaskLayoutState::Undefined));
   return 0;
 }

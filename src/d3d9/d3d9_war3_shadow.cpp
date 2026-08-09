@@ -3357,16 +3357,41 @@ bool War3ShadowReceiverPass::validateShadowReplayDraws(
     const War3PipelineInput& input,
     const std::vector<const War3ShadowCasterDraw*>& replayDraws,
     const char* consumer) {
+  // Validate the complete immutable batch before any consumer begins Vulkan
+  // rendering. A valid prefix is never permission to submit partial output.
+  thread_local std::vector<
+      war3::render::War3ShadowReplayValidationInput> validationInputs;
+  validationInputs.clear();
+  validationInputs.reserve(replayDraws.size());
   for (const War3ShadowCasterDraw* draw : replayDraws) {
-    war3::render::War3ShadowReplayValidationResult result = {};
-    if (draw == nullptr) {
-      result.reason =
-          war3::render::War3ShadowReplayRejectReason::MissingPositionBuffer;
-    } else {
-      result = war3::render::ValidateWar3ShadowReplayDraw(
+    if (draw != nullptr) {
+      validationInputs.push_back(
           MakeWar3ShadowReplayValidationInput(*draw, input));
+      continue;
     }
-    if (result) continue;
+
+    // Preserve the historical null-draw diagnostic while still routing the
+    // entire batch through the same pure validator.
+    war3::render::War3ShadowReplayValidationInput missing = {};
+    missing.expectedMapEpoch = input.mapEpoch;
+    missing.expectedDeviceEpoch = input.deviceEpoch;
+    missing.drawMapEpoch = input.mapEpoch;
+    missing.drawDeviceEpoch = input.deviceEpoch;
+    missing.worldMatrixFinite = true;
+    missing.indexed = false;
+    missing.vertexCount = 1u;
+    validationInputs.push_back(missing);
+  }
+
+  const auto batch = war3::render::ValidateWar3ShadowReplayBatch(
+      validationInputs.data(), validationInputs.size());
+  if (!batch) {
+    const War3ShadowCasterDraw* draw =
+        batch.failureIndex < replayDraws.size()
+            ? replayDraws[batch.failureIndex]
+            : nullptr;
+    const war3::render::War3ShadowReplayValidationResult result =
+        batch.failure;
 
     ++reconciliation.replayValidationRejectedCount;
     ++reconciliation.replayPartialPreventedCount;
