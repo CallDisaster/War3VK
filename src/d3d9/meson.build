@@ -470,6 +470,23 @@ test(
   timeout : 30,
 )
 
+# Pure P1 residency admission policy. No Vulkan device is created: the test
+# proves release fallback, trusted memory-budget clamps and overflow-safe page
+# growth decisions independently from the Arena's GPU-owned generations.
+war3_shadow_arena_budget_test = executable(
+  'war3_shadow_arena_budget_test',
+  [
+    'war3/memory/tests/war3_shadow_arena_budget_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_arena_budget',
+  war3_shadow_arena_budget_test,
+  timeout : 30,
+)
+
 # P0 ownership/API policy test. It constructs no DXVK object and proves that
 # the new persistent package store cannot create itself at the D3D9 boundary.
 war3_persistent_gpu_package_owner_test = executable(

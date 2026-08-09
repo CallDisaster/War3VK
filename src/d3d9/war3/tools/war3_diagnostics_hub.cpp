@@ -433,6 +433,13 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"arenaUsedBytes", frame.arenaUsedBytes},
         {"arenaFrameUsedDeltaBytes", frame.arenaFrameUsedDeltaBytes},
         {"arenaResidentBytes", frame.arenaResidentBytes},
+        {"arenaResidentLimitBytes", frame.arenaResidentLimitBytes},
+        {"arenaMemoryAvailableBytes", frame.arenaMemoryAvailableBytes},
+        {"arenaBudgetGrowthRejectCount",
+         frame.arenaBudgetGrowthRejectCount},
+        {"arenaMemoryBudgetSupported",
+         frame.arenaMemoryBudgetSupported},
+        {"arenaMemoryBudgetTrusted", frame.arenaMemoryBudgetTrusted},
         {"arenaGeneration", frame.arenaGeneration},
         {"arenaQuarantineCount", frame.arenaQuarantineCount},
         {"arenaQuarantinedRetireSerial",
@@ -606,6 +613,11 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   s_gpuFlightLastArenaGeneration = arena.generation;
   s_gpuFlightLastArenaUsedBytes = arena.usedBytes;
   frame.arenaResidentBytes = arena.residentBytes;
+  frame.arenaResidentLimitBytes = arena.residentLimitBytes;
+  frame.arenaMemoryAvailableBytes = arena.memoryAvailableBytes;
+  frame.arenaBudgetGrowthRejectCount = arena.budgetGrowthRejectCount;
+  frame.arenaMemoryBudgetSupported = arena.memoryBudgetSupported;
+  frame.arenaMemoryBudgetTrusted = arena.memoryBudgetTrusted;
   frame.arenaGeneration = arena.generation;
   frame.arenaQuarantineCount = arena.quarantineCount;
   frame.arenaQuarantinedRetireSerial =
@@ -1004,6 +1016,31 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
   summary.shadowArenaResidentBytes = arenaDiagnostics.residentBytes;
   summary.shadowArenaResidentLimitBytes =
       arenaDiagnostics.residentLimitBytes;
+  summary.shadowArenaFixedResidentLimitBytes =
+      arenaDiagnostics.fixedResidentLimitBytes;
+  summary.shadowArenaMemoryHeapSizeBytes =
+      arenaDiagnostics.memoryHeapSizeBytes;
+  summary.shadowArenaMemoryBudgetBytes =
+      arenaDiagnostics.memoryBudgetBytes;
+  summary.shadowArenaMemoryAllocatedBytes =
+      arenaDiagnostics.memoryAllocatedBytes;
+  summary.shadowArenaMemoryAvailableBytes =
+      arenaDiagnostics.memoryAvailableBytes;
+  summary.shadowArenaProportionalLimitBytes =
+      arenaDiagnostics.proportionalLimitBytes;
+  summary.shadowArenaReserveLimitBytes =
+      arenaDiagnostics.reserveLimitBytes;
+  summary.shadowArenaBudgetRefreshCount =
+      arenaDiagnostics.budgetRefreshCount;
+  summary.shadowArenaBudgetGrowthRejectCount =
+      arenaDiagnostics.budgetGrowthRejectCount;
+  summary.shadowArenaBudgetSnapshotFrameSerial =
+      arenaDiagnostics.budgetSnapshotFrameSerial;
+  summary.shadowArenaPrimaryHeapIndex = arenaDiagnostics.primaryHeapIndex;
+  summary.shadowArenaMemoryBudgetSupported =
+      arenaDiagnostics.memoryBudgetSupported;
+  summary.shadowArenaMemoryBudgetTrusted =
+      arenaDiagnostics.memoryBudgetTrusted;
   summary.shadowArenaGeneration = arenaDiagnostics.generation;
   summary.shadowArenaQuarantineCount = arenaDiagnostics.quarantineCount;
   summary.shadowArenaLastQuarantinedGeneration =
@@ -3301,6 +3338,32 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
         {"shadowArenaResidentBytes", snapshot.shadow.shadowArenaResidentBytes},
         {"shadowArenaResidentLimitBytes",
          snapshot.shadow.shadowArenaResidentLimitBytes},
+        {"shadowArenaFixedResidentLimitBytes",
+         snapshot.shadow.shadowArenaFixedResidentLimitBytes},
+        {"shadowArenaMemoryHeapSizeBytes",
+         snapshot.shadow.shadowArenaMemoryHeapSizeBytes},
+        {"shadowArenaMemoryBudgetBytes",
+         snapshot.shadow.shadowArenaMemoryBudgetBytes},
+        {"shadowArenaMemoryAllocatedBytes",
+         snapshot.shadow.shadowArenaMemoryAllocatedBytes},
+        {"shadowArenaMemoryAvailableBytes",
+         snapshot.shadow.shadowArenaMemoryAvailableBytes},
+        {"shadowArenaProportionalLimitBytes",
+         snapshot.shadow.shadowArenaProportionalLimitBytes},
+        {"shadowArenaReserveLimitBytes",
+         snapshot.shadow.shadowArenaReserveLimitBytes},
+        {"shadowArenaBudgetRefreshCount",
+         snapshot.shadow.shadowArenaBudgetRefreshCount},
+        {"shadowArenaBudgetGrowthRejectCount",
+         snapshot.shadow.shadowArenaBudgetGrowthRejectCount},
+        {"shadowArenaBudgetSnapshotFrameSerial",
+         snapshot.shadow.shadowArenaBudgetSnapshotFrameSerial},
+        {"shadowArenaPrimaryHeapIndex",
+         snapshot.shadow.shadowArenaPrimaryHeapIndex},
+        {"shadowArenaMemoryBudgetSupported",
+         snapshot.shadow.shadowArenaMemoryBudgetSupported},
+        {"shadowArenaMemoryBudgetTrusted",
+         snapshot.shadow.shadowArenaMemoryBudgetTrusted},
         {"shadowArenaGeneration", snapshot.shadow.shadowArenaGeneration},
         {"shadowArenaQuarantineCount",
          snapshot.shadow.shadowArenaQuarantineCount},
