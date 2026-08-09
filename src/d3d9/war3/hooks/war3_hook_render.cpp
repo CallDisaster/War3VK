@@ -2472,13 +2472,13 @@ static void TryNativeSemanticWorldStageValidation(int stage, int a3, int a4,
     if (stage ==
         dxvk::war3::internal::kNativeSemanticShadowExecuteStage) {
       if constexpr (dxvk::war3::internal::
-                        kShadowSemanticCoreSceneSubmissionEnabled) {
+        kShadowSemanticCoreSceneSubmissionEnabled) {
         if (dxvk::war3::internal::IsSemanticSceneSubmissionRuntimeEnabled()) {
-          if (auto* device = dxvk::war3::GetActiveDevice()) {
-            device->War3PopulateSemanticShadowSceneForValidation(
+          dxvk::war3::RunWithActiveDevice([&](D3D9DeviceEx& device) {
+            device.War3PopulateSemanticShadowSceneForValidation(
                 dxvk::war3::internal::kShadowSemanticCoreSceneUnitsOnly,
                 false);
-          }
+          });
         }
       }
       {
@@ -4793,8 +4793,12 @@ int __cdecl Hook_FlushSortedItems() {
         g_sortedBatchPtrs ? reinterpret_cast<void *>(g_sortedBatchPtrs) : nullptr);
   };
 
-  auto *device = dxvk::war3::GetActiveDevice();
-  if (!device || !g_numOfElementsPtr || !g_batchArrayPtr ||
+  int activeDeviceResult = 0;
+  const bool ranWithActiveDevice = dxvk::war3::RunWithActiveDevice(
+      [&](D3D9DeviceEx& activeDevice) {
+    activeDeviceResult = [&]() -> int {
+  auto *device = &activeDevice;
+  if (!g_numOfElementsPtr || !g_batchArrayPtr ||
       !g_sortedBatchCountPtr || !g_sortedBatchPtrs) {
     phase1DispatchRootScope.SetTerminal(
         dxvk::war3::render::
@@ -4942,6 +4946,17 @@ int __cdecl Hook_FlushSortedItems() {
       dxvk::war3::render::
           WorldObjectsPhase1FlushTerminal::TakeoverSuccess);
   return 0;
+    }();
+  });
+  if (!ranWithActiveDevice) {
+    phase1DispatchRootScope.SetTerminal(
+        dxvk::war3::render::
+            WorldObjectsPhase1FlushTerminal::MissingGlobalsOriginal);
+    maybeLogTakeoverGate("missing-active-device", nullptr, nullptr, nullptr,
+                         nullptr);
+    return CallOriginalFlushSortedItems();
+  }
+  return activeDeviceResult;
 }
 
 void __fastcall Hook_Terrain_RenderAllTiles(void *thisPtr, void * /*edx*/) {
@@ -5660,8 +5675,9 @@ void War3HookRender::Install(uintptr_t gameBase) {
           gxDeviceD3dDynamicVertexUploadAddr,
           gxDeviceD3dSkinCopyKernelAddr);
       ::dxvk::Logger::info(gpuSkinHookLine);
-      if (auto* activeDevice = dxvk::war3::GetActiveDevice())
-        activeDevice->War3AttachGpuSkinNativeBridge(gameBase);
+      dxvk::war3::RunWithActiveDevice([&](D3D9DeviceEx& activeDevice) {
+        activeDevice.War3AttachGpuSkinNativeBridge(gameBase);
+      });
     } else {
       const bool rollbackComplete =
           UninstallNativeGpuSkinHookTransaction();

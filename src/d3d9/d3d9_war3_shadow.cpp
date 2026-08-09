@@ -3579,7 +3579,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
-      input.settings ? input.settings : &defaultSettings;
+      input.settings ? input.settings.get() : &defaultSettings;
   const bool alphaShadowHashed = settings->shadows.alphaShadowHashed;
   const float alphaShadowFarAlphaRefBias =
       std::max(settings->shadows.alphaShadowFarAlphaRefBias, 0.0f);
@@ -7198,7 +7198,7 @@ void War3ShadowReceiverPass::renderPointShadow(
 
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
-      input.settings ? input.settings : &defaultSettings;
+      input.settings ? input.settings.get() : &defaultSettings;
   const bool alphaShadowHashed = settings->shadows.alphaShadowHashed;
 
   const std::vector<const War3ShadowCasterDraw *> *replayDrawsPtr =
@@ -8924,7 +8924,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
   War3RenderSettings defaultSettings = {};
   const War3RenderSettings *settings =
-      input.settings ? input.settings : &defaultSettings;
+      input.settings ? input.settings.get() : &defaultSettings;
   m_shadowSamplerActive =
       (settings->shadows.filterMode == War3ShadowFilterMode::Linear)
           ? m_shadowSamplerLinear
@@ -9045,7 +9045,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   float rawTime01 = 0.0f;
   const float realGameTime = War3RenderState::GetGameTime();
   const War3DayNightSettings &dayNightSettings = settings->dayNight;
-  auto *globalSettings = const_cast<War3RenderSettings *>(settings);
+  War3RenderSettings mutableSettings = *settings;
 
   static bool s_hasValidGameTime = false;
   const bool hasRealGameTime =
@@ -9145,8 +9145,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     time01 = m_time01Smoothed;
   }
 
-  if (globalSettings)
-    globalSettings->dayNight.renderTimeHours = wrap01(time01) * 24.0f;
+  mutableSettings.dayNight.renderTimeHours = wrap01(time01) * 24.0f;
 
   // 2. 计算太阳的“真实”轨迹 (Real Trajectory)
   // 假设：X=东, -X=西, Y=北, -Y=南, Z=上
@@ -9205,7 +9204,6 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   }
   float shadowAltRad = calcShadowAltitude01(dayAlt01);
 
-  War3RenderSettings mutableSettings = *settings;
   // 2026-07-21 优化：进程环境变量在启动后不可变，每帧两次 getenv+string
   // 分配是纯浪费。与其他 flag 一致改为静态缓存（语义完全等价）。
   static const int s_debugOverride =
@@ -9416,21 +9414,37 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   bool isRising = std::cos(time01 * (2.0f * 3.14159265f)) >= 0.0f;
   UpdatePhase(realAltitudeRad, isRising, kTransitionRad);
 
-  // Feed the computed day/night light back into the shared sun settings so the
-  // fixed-function main light and volumetric pass can see the same cold/warm
-  // cycle. Only direction/color are synchronized here; shadow strength stays
-  // local so shadow-specific tuning is not hard-overwritten every frame.
-  if (globalSettings) {
-    if (dayNightSettings.celestialMotionEnabled)
-      globalSettings->sun.direction = finalLightDir;
-    if (dayNightSettings.timeColorGradingEnabled)
-      globalSettings->sun.color = finalLightColor;
-  }
-
   // Shadow-specific day-night strength remains local to this pass.
   mutableSettings.sun.direction = finalLightDir;
   mutableSettings.sun.color = finalLightColor;
   mutableSettings.shadows.strength = finalShadowStrength;
+
+  // Later passes in this queued command consume a private derived-lighting
+  // object. Never cast away const on the authored settings snapshot: it may be
+  // shared by async readers and is intentionally immutable.
+  if (input.lighting != nullptr) {
+    input.lighting->renderTimeHours =
+        mutableSettings.dayNight.renderTimeHours;
+    input.lighting->sunDirection = finalLightDir;
+    input.lighting->sunColor = finalLightColor;
+  }
+
+  // Feed only resolved day/night fields back for the next render-owner frame.
+  // A newer JASS/UI edit increments pendingRevision and rejects this stale CS
+  // feedback instead of being overwritten by an older queued command.
+  if (input.settingsMailbox != nullptr) {
+    const auto mailbox = input.settingsMailbox;
+    std::lock_guard<std::mutex> lock(mailbox->mutex);
+    if (mailbox->pendingRevision == input.settingsRevision) {
+      mailbox->pending.dayNight.renderTimeHours =
+          mutableSettings.dayNight.renderTimeHours;
+      if (dayNightSettings.celestialMotionEnabled)
+        mailbox->pending.sun.direction = finalLightDir;
+      if (dayNightSettings.timeColorGradingEnabled)
+        mailbox->pending.sun.color = finalLightColor;
+      ++mailbox->pendingRevision;
+    }
+  }
 
   // 调试输出 (每 60 帧或满足条件时)
   /*         static int s_logTimer = 0;

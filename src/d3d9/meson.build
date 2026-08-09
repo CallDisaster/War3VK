@@ -256,6 +256,41 @@ test(
   timeout : 30,
 )
 
+# The old warvk:cmd: bridge is release-disabled.  Build the policy twice so
+# both the default-deny binary and the explicit developer-only capability are
+# executable contracts; neither path relies on an environment variable.
+war3_jass_legacy_command_policy_release_test = executable(
+  'war3_jass_legacy_command_policy_release_test',
+  [
+    'war3/hooks/tests/war3_jass_legacy_command_policy_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_jass_legacy_command_policy_release',
+  war3_jass_legacy_command_policy_release_test,
+  timeout : 30,
+)
+
+war3_jass_legacy_command_policy_dev_test = executable(
+  'war3_jass_legacy_command_policy_dev_test',
+  [
+    'war3/hooks/tests/war3_jass_legacy_command_policy_test.cpp',
+  ],
+  cpp_args            : [
+    '-DWARVK_ENABLE_LEGACY_JASS_COMMANDS_DEV=1',
+    '-DWARVK_EXPECT_LEGACY_JASS_COMMANDS_DEV=1',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_jass_legacy_command_policy_dev',
+  war3_jass_legacy_command_policy_dev_test,
+  timeout : 30,
+)
+
 # Pure Phase-1 math-expression and curve-runtime test. It compiles and
 # evaluates bounded bytecode without loading Warcraft or creating GPU state.
 war3_math_curve_runtime_test = executable(

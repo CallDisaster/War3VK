@@ -345,10 +345,10 @@ void TestTypedHashtableTransport() {
             static_cast<int32_t>(ErrorCode::InvalidArgumentType),
         "non-finite typed real must invalidate the whole transaction");
 
-  ResetTypedTransport();
+  ResetAuthorState();
   Check(!TryTypedLoadReal(
             table, realTx, kTypedQueryRealChild, real),
-        "map reset must revoke the previous hashtable capability");
+        "CPU-only author reset must revoke the previous hashtable capability");
 }
 
 } // namespace

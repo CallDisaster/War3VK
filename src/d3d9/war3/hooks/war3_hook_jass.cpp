@@ -348,7 +348,7 @@ static int __cdecl Hook_InitJassNatives() {
 
   // A rebuilt JASS VM starts a new map generation. Retire only objects owned
   // by the public WarVK JAPI before publishing the new carrier table.
-  dxvk::war3::japi::Reset();
+  dxvk::war3::japi::ResetAuthorState();
   ResetJassCommandBridgeInstallState();
   TryInstallJassCommandBridge("InitJassNatives");
 

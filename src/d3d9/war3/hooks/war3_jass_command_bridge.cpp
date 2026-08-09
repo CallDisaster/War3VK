@@ -1,4 +1,5 @@
 #include "war3_jass_command_bridge.h"
+#include "war3_jass_legacy_command_policy.h"
 #include "war3_hook_lifecycle.h"
 
 #include "../../d3d9_war3_debug.h"
@@ -204,14 +205,7 @@ bool ParseUIntArg(const std::string &value, uint32_t &out) {
 }
 
 bool ParseFloatArg(const std::string &value, float &out) {
-  if (value.empty())
-    return false;
-  char *end = nullptr;
-  const float parsed = std::strtof(value.c_str(), &end);
-  if (!end || *end != '\0')
-    return false;
-  out = parsed;
-  return true;
+  return legacy::ParseFiniteFloat(value, out);
 }
 
 void SetCommandOk(BridgeState &state, const std::string &result,
@@ -1157,7 +1151,33 @@ int HandleWarVkPayload(CarrierKind kind, const std::string &payload,
   }
 
   if (StartsWith(payload, "cmd:")) {
-    return HandleShaderApiCommand(s_state, payload.substr(4), stringResult);
+    if constexpr (!legacy::kDevelopmentCommandsEnabled) {
+      return SetCommandFailure(
+          s_state, -403, "legacy shader commands disabled in release build",
+          stringResult);
+    }
+
+    const std::string command = payload.substr(4);
+    const size_t delimiter = command.find('|');
+    const std::string_view commandName(
+        command.data(), delimiter == std::string::npos
+            ? command.size() : delimiter);
+    const uint32_t requiredFeature =
+        legacy::RequiredFeatureMask(commandName);
+    if (requiredFeature == 0u) {
+      return SetCommandFailure(s_state, -404,
+                               "unknown legacy shader command: " +
+                                   std::string(commandName),
+                               stringResult);
+    }
+    if (!legacy::IsCommandAllowed(
+            commandName, dxvk::war3::japi::GetFeatureFlags())) {
+      return SetCommandFailure(
+          s_state, -403, "legacy shader command feature unavailable: " +
+              std::string(commandName),
+          stringResult);
+    }
+    return HandleShaderApiCommand(s_state, command, stringResult);
   }
 
   s_state.lastErrorCode = -404;

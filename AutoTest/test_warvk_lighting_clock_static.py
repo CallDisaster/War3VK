@@ -53,13 +53,16 @@ class WarVKLightingClockStaticTests(unittest.TestCase):
         self.assertRegex(
             self.shadow,
             r"if \(dayNightSettings\.celestialMotionEnabled\)\s+"
-            r"globalSettings->sun\.direction = finalLightDir",
+            r"mailbox->pending\.sun\.direction = finalLightDir",
         )
         self.assertRegex(
             self.shadow,
             r"if \(dayNightSettings\.timeColorGradingEnabled\)\s+"
-            r"globalSettings->sun\.color = finalLightColor",
+            r"mailbox->pending\.sun\.color = finalLightColor",
         )
+        self.assertIn("input.lighting->sunDirection = finalLightDir", self.shadow)
+        self.assertIn("input.lighting->sunColor = finalLightColor", self.shadow)
+        self.assertNotIn("const_cast<War3RenderSettings", self.shadow)
 
     def test_custom_temperature_profile_is_bounded_and_cyclic(self):
         self.assertIn("customColorTemperatureProfile", self.settings)

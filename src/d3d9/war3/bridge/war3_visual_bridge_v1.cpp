@@ -54,7 +54,7 @@ std::uint32_t __cdecl WarVKVisualV1_GetFeatureFlags() {
 }
 
 std::int32_t __cdecl WarVKVisualV1_IsRuntimeReady() {
-  return BoolResult(dxvk::war3::GetActivePipeline() != nullptr);
+  return BoolResult(dxvk::war3::HasActivePipeline());
 }
 
 std::int32_t __cdecl WarVKVisualV1_PointLightCreate(
@@ -125,7 +125,7 @@ std::int32_t __cdecl WarVKVisualV1_PointLightSetShadowConfig(
   if (!IsValidLightId(lightId) || !IsValidResolution(resolution) ||
       !IsFinite(bias) || bias < 0.0f)
     return 0;
-  auto* const settings = dxvk::war3::GetMutableSettings();
+  auto settings = dxvk::war3::GetMutableSettings();
   if (settings == nullptr)
     return 0;
   // The current renderer owns one global cube-map resolution/bias policy.

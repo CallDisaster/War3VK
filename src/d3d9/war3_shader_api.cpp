@@ -149,7 +149,7 @@ std::chrono::steady_clock::time_point g_lastFrameTime;
 double g_frameTimeCounter = 0.0;
 bool g_timeInitialized = false;
 
-dxvk::War3RenderSettings* GetMutableSettings() {
+dxvk::war3::War3SettingsWrite GetMutableSettings() {
     return dxvk::war3::GetMutableSettings();
 }
 
@@ -460,7 +460,7 @@ WAR3_SHADER_API int32_t AddPointLight(
     const int32_t id = dxvk::War3LightManager::Instance().AddPointLight(
         x, y, z, range, r, g, b, intensity, shadowIntensity);
     if (id != 0) {
-        if (auto* settings = GetMutableSettings()) {
+        if (auto settings = GetMutableSettings()) {
             settings->shadows.pointLightsEnabled = true;
             if (shadowIntensity > 0.0f)
                 settings->shadows.pointShadowEnabled = true;
@@ -489,7 +489,7 @@ WAR3_SHADER_API bool UpdatePointLightEx(
     const bool ok = dxvk::War3LightManager::Instance().UpdatePointLightEx(
         id, x, y, z, range, r, g, b, intensity, shadowIntensity);
     if (ok && shadowIntensity > 0.0f) {
-        if (auto* settings = GetMutableSettings()) {
+        if (auto settings = GetMutableSettings()) {
             settings->shadows.pointLightsEnabled = true;
             settings->shadows.pointShadowEnabled = true;
         }
@@ -502,7 +502,7 @@ WAR3_SHADER_API bool SetPointLightShadowIntensity(int32_t id,
     const bool ok = dxvk::War3LightManager::Instance().SetPointLightShadowIntensity(
         id, shadowIntensity);
     if (ok && shadowIntensity > 0.0f) {
-        if (auto* settings = GetMutableSettings()) {
+        if (auto settings = GetMutableSettings()) {
             settings->shadows.pointLightsEnabled = true;
             settings->shadows.pointShadowEnabled = true;
         }
@@ -523,7 +523,7 @@ WAR3_SHADER_API uint32_t GetPointLightCount() {
 }
 
 WAR3_SHADER_API bool SetLightingEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->sun.enabled = enabled;
@@ -531,7 +531,7 @@ WAR3_SHADER_API bool SetLightingEnabled(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetSunDirection(float x, float y, float z) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->sun.direction = dxvk::Vector4(x, y, z, 0.0f);
@@ -539,7 +539,7 @@ WAR3_SHADER_API bool SetSunDirection(float x, float y, float z) {
 }
 
 WAR3_SHADER_API bool SetSunColor(float r, float g, float b) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->sun.color = dxvk::Vector4(r, g, b, 0.0f);
@@ -547,7 +547,7 @@ WAR3_SHADER_API bool SetSunColor(float r, float g, float b) {
 }
 
 WAR3_SHADER_API bool SetSunIntensity(float intensity) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->sun.intensity = intensity;
@@ -555,7 +555,7 @@ WAR3_SHADER_API bool SetSunIntensity(float intensity) {
 }
 
 WAR3_SHADER_API bool SetShadowEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.enabled = enabled;
@@ -563,7 +563,7 @@ WAR3_SHADER_API bool SetShadowEnabled(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetShadowStrength(float strength) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.strength = std::max(0.0f, std::min(1.0f, strength));
@@ -571,7 +571,7 @@ WAR3_SHADER_API bool SetShadowStrength(float strength) {
 }
 
 WAR3_SHADER_API bool SetShadowBias(float bias) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.receiverBias = std::max(0.0f, bias);
@@ -580,7 +580,7 @@ WAR3_SHADER_API bool SetShadowBias(float bias) {
 
 WAR3_SHADER_API bool SetShadowCasterBias(float constantBias, float slopeBias,
                                          float clamp) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.casterDepthBias = std::max(0.0f, constantBias);
@@ -590,7 +590,7 @@ WAR3_SHADER_API bool SetShadowCasterBias(float constantBias, float slopeBias,
 }
 
 WAR3_SHADER_API bool SetShadowDepthRangeMargin(float margin) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.csm.depthRangeMargin = std::max(0.0f, margin);
@@ -598,7 +598,7 @@ WAR3_SHADER_API bool SetShadowDepthRangeMargin(float margin) {
 }
 
 WAR3_SHADER_API bool SetShadowPcfRadius(float radius) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.pcfRadius = std::max(0.0f, radius);
@@ -606,7 +606,7 @@ WAR3_SHADER_API bool SetShadowPcfRadius(float radius) {
 }
 
 WAR3_SHADER_API bool SetShadowPcfKernel(uint32_t kernel) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     const uint32_t maxKernel =
@@ -619,7 +619,7 @@ WAR3_SHADER_API bool SetShadowPcfKernel(uint32_t kernel) {
 }
 
 WAR3_SHADER_API bool SetShadowPcfRotate(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.pcfRotate = enabled;
@@ -627,7 +627,7 @@ WAR3_SHADER_API bool SetShadowPcfRotate(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetShadowPcfRotateMode(uint32_t mode) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     if (mode > 2u)
@@ -639,7 +639,7 @@ WAR3_SHADER_API bool SetShadowPcfRotateMode(uint32_t mode) {
 }
 
 WAR3_SHADER_API bool SetShadowPcssSearchKernel(uint32_t kernel) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     if (kernel > 1u)
@@ -650,7 +650,7 @@ WAR3_SHADER_API bool SetShadowPcssSearchKernel(uint32_t kernel) {
 }
 
 WAR3_SHADER_API bool SetShadowCascadeBiasScale(float scale) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.cascadeBiasScale = std::clamp(scale, 0.0f, 1.0f);
@@ -658,7 +658,7 @@ WAR3_SHADER_API bool SetShadowCascadeBiasScale(float scale) {
 }
 
 WAR3_SHADER_API bool SetShadowPcfCascadeRadiusScale(float scale) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.pcfCascadeRadiusScale = std::clamp(scale, 0.0f, 1.0f);
@@ -666,7 +666,7 @@ WAR3_SHADER_API bool SetShadowPcfCascadeRadiusScale(float scale) {
 }
 
 WAR3_SHADER_API bool SetShadowAlphaHashed(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.alphaShadowHashed = enabled;
@@ -674,7 +674,7 @@ WAR3_SHADER_API bool SetShadowAlphaHashed(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetShadowAlphaUseMip(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.alphaShadowUseMip = enabled;
@@ -682,7 +682,7 @@ WAR3_SHADER_API bool SetShadowAlphaUseMip(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetShadowAlphaMipLodBias(float bias) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.alphaShadowMipLodBias = std::clamp(bias, -4.0f, 4.0f);
@@ -690,7 +690,7 @@ WAR3_SHADER_API bool SetShadowAlphaMipLodBias(float bias) {
 }
 
 WAR3_SHADER_API bool SetShadowAlphaFarAlphaRefBias(float bias) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.alphaShadowFarAlphaRefBias = std::max(0.0f, bias);
@@ -703,7 +703,7 @@ WAR3_SHADER_API bool SetNativeShadowMode(uint32_t mode) {
 }
 
 WAR3_SHADER_API bool SetShadowLockSun(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.lockSun = enabled;
@@ -711,7 +711,7 @@ WAR3_SHADER_API bool SetShadowLockSun(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetShadowLockSunTime(float time01) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.lockSunTime = std::clamp(time01, 0.0f, 1.0f);
@@ -719,7 +719,7 @@ WAR3_SHADER_API bool SetShadowLockSunTime(float time01) {
 }
 
 WAR3_SHADER_API bool SetShadowStableSnapWhenSunMoving(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.stableSnapWhenSunMoving = enabled;
@@ -727,7 +727,7 @@ WAR3_SHADER_API bool SetShadowStableSnapWhenSunMoving(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetShadowDebugMode(uint32_t mode) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     if (mode > 6u)
@@ -737,7 +737,7 @@ WAR3_SHADER_API bool SetShadowDebugMode(uint32_t mode) {
 }
 
 WAR3_SHADER_API bool SetShadowReceiverMode(uint32_t mode) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     if (mode > 2u)
@@ -748,7 +748,7 @@ WAR3_SHADER_API bool SetShadowReceiverMode(uint32_t mode) {
 }
 
 WAR3_SHADER_API bool SetShadowNormalBiasScale(float scale) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.normalBiasScale = std::max(0.0f, scale);
@@ -756,7 +756,7 @@ WAR3_SHADER_API bool SetShadowNormalBiasScale(float scale) {
 }
 
 WAR3_SHADER_API bool SetShadowFilterMode(uint32_t mode) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     if (mode > 1u)
@@ -767,7 +767,7 @@ WAR3_SHADER_API bool SetShadowFilterMode(uint32_t mode) {
 }
 
 WAR3_SHADER_API bool SetShadowAltitudeMode(uint32_t mode) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     if (mode > 1u)
@@ -778,7 +778,7 @@ WAR3_SHADER_API bool SetShadowAltitudeMode(uint32_t mode) {
 }
 
 WAR3_SHADER_API bool SetShadowLengthScale(float scale) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.shadowLengthScale = std::max(0.1f, scale);
@@ -786,7 +786,7 @@ WAR3_SHADER_API bool SetShadowLengthScale(float scale) {
 }
 
 WAR3_SHADER_API bool SetShadowMaxLengthScale(float scale) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.shadowMaxLengthScale = std::max(0.1f, scale);
@@ -794,7 +794,7 @@ WAR3_SHADER_API bool SetShadowMaxLengthScale(float scale) {
 }
 
 WAR3_SHADER_API bool SetShadowRimIntensity(float intensity) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.rimIntensity = std::max(0.0f, intensity);
@@ -802,7 +802,7 @@ WAR3_SHADER_API bool SetShadowRimIntensity(float intensity) {
 }
 
 WAR3_SHADER_API bool SetShadowRimPower(float power) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.rimPower = std::max(0.1f, power);
@@ -810,7 +810,7 @@ WAR3_SHADER_API bool SetShadowRimPower(float power) {
 }
 
 WAR3_SHADER_API bool SetPointLightsEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.pointLightsEnabled = enabled;
@@ -818,7 +818,7 @@ WAR3_SHADER_API bool SetPointLightsEnabled(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetPointShadowEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.pointShadowEnabled = enabled;
@@ -826,7 +826,7 @@ WAR3_SHADER_API bool SetPointShadowEnabled(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetPointShadowBias(float bias) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->shadows.pointShadowBias = std::max(0.0f, bias);
@@ -834,7 +834,7 @@ WAR3_SHADER_API bool SetPointShadowBias(float bias) {
 }
 
 WAR3_SHADER_API bool SetVolumetricLightEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.volumetricLight.enabled = enabled;
@@ -846,7 +846,7 @@ WAR3_SHADER_API bool SetVolumetricLightEnabled(bool enabled) {
 WAR3_SHADER_API bool SetVolumetricLightParams(
     float intensity, float density, float weight, float decay,
     uint32_t sampleCount) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     auto& volumetric = settings->postFx.volumetricLight;
@@ -861,7 +861,7 @@ WAR3_SHADER_API bool SetVolumetricLightParams(
 
 WAR3_SHADER_API bool SetVolumetricLightFade(float fadeNear, float fadeFar,
                                             float maxRayDistance) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     auto& volumetric = settings->postFx.volumetricLight;
@@ -873,7 +873,7 @@ WAR3_SHADER_API bool SetVolumetricLightFade(float fadeNear, float fadeFar,
 }
 
 WAR3_SHADER_API bool SetVolumetricHeightFogEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.volumetricLight.heightFogEnabled = enabled;
@@ -882,7 +882,7 @@ WAR3_SHADER_API bool SetVolumetricHeightFogEnabled(bool enabled) {
 
 WAR3_SHADER_API bool SetVolumetricHeightFog(float baseHeight, float falloff,
                                             float strength) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     auto& volumetric = settings->postFx.volumetricLight;
@@ -893,7 +893,7 @@ WAR3_SHADER_API bool SetVolumetricHeightFog(float baseHeight, float falloff,
 }
 
 WAR3_SHADER_API bool SetVolumetricResolutionDivisor(uint32_t divisor) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.volumetricLight.resolutionDivisor =
@@ -902,7 +902,7 @@ WAR3_SHADER_API bool SetVolumetricResolutionDivisor(uint32_t divisor) {
 }
 
 WAR3_SHADER_API bool SetOutlineEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->occludedOutline.enabled = enabled;
@@ -910,7 +910,7 @@ WAR3_SHADER_API bool SetOutlineEnabled(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetOutlineWidth(float widthPx) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->occludedOutline.widthPx = std::max(0.0f, widthPx);
@@ -918,7 +918,7 @@ WAR3_SHADER_API bool SetOutlineWidth(float widthPx) {
 }
 
 WAR3_SHADER_API bool SetOutlineColor(float r, float g, float b, float a) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->occludedOutline.colorR = r;
@@ -929,7 +929,7 @@ WAR3_SHADER_API bool SetOutlineColor(float r, float g, float b, float a) {
 }
 
 WAR3_SHADER_API bool SetOutlineMode(uint32_t mode) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     if (mode > 1u)
@@ -939,7 +939,7 @@ WAR3_SHADER_API bool SetOutlineMode(uint32_t mode) {
 }
 
 WAR3_SHADER_API bool SetOutlineVisibility(bool showVisible, bool showOccluded) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->occludedOutline.showVisible = showVisible;
@@ -948,7 +948,7 @@ WAR3_SHADER_API bool SetOutlineVisibility(bool showVisible, bool showOccluded) {
 }
 
 WAR3_SHADER_API bool SetOutlineScreenSpace(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->occludedOutline.useScreenSpace = enabled;
@@ -956,7 +956,7 @@ WAR3_SHADER_API bool SetOutlineScreenSpace(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetPostFxEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.enabled = enabled;
@@ -964,7 +964,7 @@ WAR3_SHADER_API bool SetPostFxEnabled(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetExposure(float exposure) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.exposure = exposure;
@@ -973,7 +973,7 @@ WAR3_SHADER_API bool SetExposure(float exposure) {
 }
 
 WAR3_SHADER_API bool SetBloomEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.bloom.enabled = enabled;
@@ -981,7 +981,7 @@ WAR3_SHADER_API bool SetBloomEnabled(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetBloomParams(float threshold, float softKnee, float intensity) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.bloom.threshold = threshold;
@@ -991,7 +991,7 @@ WAR3_SHADER_API bool SetBloomParams(float threshold, float softKnee, float inten
 }
 
 WAR3_SHADER_API bool SetAcesEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.bloom.acesToneMap = enabled;
@@ -999,7 +999,7 @@ WAR3_SHADER_API bool SetAcesEnabled(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetSsaoEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.ssao.enabled = enabled;
@@ -1007,7 +1007,7 @@ WAR3_SHADER_API bool SetSsaoEnabled(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetSsaoParams(float radiusPx, float strength, float bias, float power) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.ssao.radiusPx = radiusPx;
@@ -1018,7 +1018,7 @@ WAR3_SHADER_API bool SetSsaoParams(float radiusPx, float strength, float bias, f
 }
 
 WAR3_SHADER_API bool SetAaMode(uint32_t mode) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     if (mode > 5u)
@@ -1028,7 +1028,7 @@ WAR3_SHADER_API bool SetAaMode(uint32_t mode) {
 }
 
 WAR3_SHADER_API bool SetFxaaParams(float subpix, float edgeThreshold, float edgeThresholdMin) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.aa.fxaaQualitySubpix = subpix;
@@ -1038,7 +1038,7 @@ WAR3_SHADER_API bool SetFxaaParams(float subpix, float edgeThreshold, float edge
 }
 
 WAR3_SHADER_API bool SetSmaaParams(float threshold, int32_t search, int32_t diagSearch) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->postFx.aa.smaaThreshold = threshold;
@@ -1048,7 +1048,7 @@ WAR3_SHADER_API bool SetSmaaParams(float threshold, int32_t search, int32_t diag
 }
 
 WAR3_SHADER_API bool SetDayNightEnabled(bool enabled) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->dayNight.enabled = enabled;
@@ -1056,7 +1056,7 @@ WAR3_SHADER_API bool SetDayNightEnabled(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetDayNightMinFactor(float minFactor) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->dayNight.transitionMinFactor = std::max(0.0f, std::min(1.0f, minFactor));
@@ -1066,7 +1066,7 @@ WAR3_SHADER_API bool SetDayNightMinFactor(float minFactor) {
 WAR3_SHADER_API bool SetDayNightAmbient(
     float dayR, float dayG, float dayB,
     float nightR, float nightG, float nightB) {
-    auto* settings = GetMutableSettings();
+    auto settings = GetMutableSettings();
     if (!settings)
         return false;
     settings->dayNight.dayAmbient = dxvk::Vector4(dayR, dayG, dayB, 1.0f);

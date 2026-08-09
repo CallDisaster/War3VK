@@ -107,8 +107,12 @@ void ResetTypedTransport() noexcept;
 // Strict public protocol entry point. Non-WarVK strings are never consumed.
 Reply Dispatch(Carrier carrier, std::string_view payload) noexcept;
 
-// Destroys only objects created through this JAPI generation and resets its
-// thread-local error state. Call after War3 rebuilds the JASS VM/native table.
+// Retires map-authored CPU state and resets the thread-local error state after
+// War3 rebuilds the JASS VM/native table. This function never releases GPU or
+// texture resources; the renderer owner performs that work at Present.
+void ResetAuthorState() noexcept;
+
+// Compatibility alias for the CPU-only reset above.
 void Reset() noexcept;
 
 // Carrier conversion failures are transport errors, not backend success.

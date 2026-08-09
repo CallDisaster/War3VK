@@ -84,6 +84,14 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   它把用户分别确认过的 Type0/UBirth 修复与点阴影 receiver-bias 修复合入同一源码线，并包含本轮
   跨地图 CPU 身份缓存失效；73 个静态脚本、18/18 Win32 runnable、DLL 构建和 no-work 已通过。
   该组合 DLL 尚未部署或完成前台物理回归，不能把两个旧候选的独立验收冒充组合验收。
+- 2026-08-09 的本地运行时安全候选默认编译期禁用 legacy `warvk:cmd`，并闭合 JASS reset、异步
+  settings 生命周期、active-device 发布、Reset device epoch 与 SceneCollector 早退身份残留风险；
+  76/76 静态、20/20 Win32 runnable、32 位 DLL link 与 no-work 已通过，但尚未部署或完成 Reset/
+  A→B→A 前台物理门。详细证据见
+  `docs/agent-history/2026-08-09-runtime-safety-and-shadow-edge-research.md`。
+- 同一调查确认现有 3794 帧取证全为 4096 DirectInline，阴影边缘持续爬动并非 Temporal 或自适应
+  降档所致；首要源码嫌疑是 CSM 先线性过滤原始深度再比较，以及默认周期性世界坐标 Poisson 旋转。
+  这些算法项仍是研究/执行方案，不能描述为已修复；详见上述研究文档。
 - Issue #5 的地形级联剔除现为默认关闭的 `Off / Observe / Consume` 合同；只有同帧、同代且来自
   已验证 position span 的精确 bounds 才能授权 C2/C3 剔除，猜测或陈旧 bounds 一律 fail-visible。
   当前仅完成离线验证，未部署且未通过实机 A/B；详见

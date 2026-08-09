@@ -217,6 +217,38 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
   auto collectScope = MakeSceneCollectorCpuScope(
       "SceneCollector/CollectWorldObjects");
   WorldObjectsPhase1CollectorScope phase1Scope(groupIdx);
+  struct TrackedPtrMapEntry {
+    uintptr_t keyPtr = 0;
+    uint32_t jHandle = 0;
+  };
+  thread_local std::vector<uint32_t> s_trackedHandles;
+  thread_local std::vector<uint32_t> s_trackedHandlesCached;
+  thread_local std::vector<TrackedPtrMapEntry> s_trackedPtrMap;
+  thread_local bool s_cachedResolverReady = false;
+  thread_local bool s_cachedBuildIncomplete = false;
+  thread_local uint64_t s_trackedPtrMapMapEpoch = 0u;
+  thread_local std::unordered_map<void *, uint32_t> s_unitHandleCache;
+  thread_local uint32_t s_unitHandleCacheGcCounter = 0u;
+  thread_local uint64_t s_unitHandleCacheMapEpoch = 0u;
+
+  // These caches hold raw Warcraft pointers. Invalidate them before every
+  // early return, including malformed/empty world lists, so a caller thread
+  // cannot carry map-A pointers into its first populated map-B collection.
+  const uint64_t mapEpoch =
+      model::ShadowModelResourceCache::instance().mapEpoch();
+  if (s_trackedPtrMapMapEpoch != mapEpoch) {
+    s_trackedHandles.clear();
+    s_trackedHandlesCached.clear();
+    s_trackedPtrMap.clear();
+    s_cachedResolverReady = false;
+    s_cachedBuildIncomplete = false;
+    s_trackedPtrMapMapEpoch = mapEpoch;
+  }
+  if (s_unitHandleCacheMapEpoch != mapEpoch) {
+    s_unitHandleCache.clear();
+    s_unitHandleCacheGcCounter = 0u;
+    s_unitHandleCacheMapEpoch = mapEpoch;
+  }
   // [DEBUG] 追踪函数调用
   // [DISABLED] ENTER LOG
 
@@ -383,7 +415,6 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
 
     // 采样/统计时也需要该快照（用于计算 trackedHit），因此 probeEnabled 时强制刷新一次。
     const bool probeEnabled = NativeRendererProbe::IsEnabled();
-    thread_local std::vector<uint32_t> s_trackedHandles;
     const bool needTrackedSnapshot =
         filtered || probeEnabled || War3RenderState::HasOutlineHandles() ||
         War3RenderState::HasBloomHandles();
@@ -430,16 +461,6 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
     // [正确性修复] 过滤模式下，列表元素的 unitPtr 并不总能通过 CUnit+0x0C/+0x10 推导出 handleId。
     // 例如部分版本/对象类型会导致该偏移无效，从而 jHandle=0 被过滤，最终描边/高亮无法匹配 draw。
     // 因此这里对 tracked handles 做一次 handleId -> (agentPtr/unitPtr) 反查，并用“指针匹配”快速命中。
-    struct TrackedPtrMapEntry {
-      uintptr_t keyPtr = 0;
-      uint32_t jHandle = 0;
-    };
-
-    thread_local std::vector<uint32_t> s_trackedHandlesCached;
-    thread_local std::vector<TrackedPtrMapEntry> s_trackedPtrMap;
-    thread_local bool s_cachedResolverReady = false;
-    thread_local bool s_cachedBuildIncomplete = false;
-
     const bool resolverReady =
         dxvk::war3::HandleResolver::instance().isInitialized();
     if (needTrackedSnapshot) {
@@ -528,17 +549,7 @@ void SceneCollector::CollectWorldObjects(void *gameWorldPtr, int groupIdx) {
     uint32_t keptHandleCount = 0;
     uint32_t trackedHitCount = 0;
 
-    thread_local std::unordered_map<void *, uint32_t> s_unitHandleCache;
-    thread_local uint32_t s_unitHandleCacheGcCounter = 0;
-    thread_local uint64_t s_unitHandleCacheMapEpoch = 0u;
     if (needHandleResolution) {
-      const uint64_t mapEpoch =
-          model::ShadowModelResourceCache::instance().mapEpoch();
-      if (s_unitHandleCacheMapEpoch != mapEpoch) {
-        s_unitHandleCache.clear();
-        s_unitHandleCacheGcCounter = 0u;
-        s_unitHandleCacheMapEpoch = mapEpoch;
-      }
       if (s_unitHandleCache.size() > 65536u ||
           ++s_unitHandleCacheGcCounter >= 4096u) {
         s_unitHandleCache.clear();

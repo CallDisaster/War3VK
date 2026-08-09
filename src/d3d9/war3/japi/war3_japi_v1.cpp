@@ -963,17 +963,47 @@ bool ConvertAuthorScalarToInteger(float value, int32_t roundingMode,
   return true;
 }
 
+bool CommandUsesDirectRenderSettings(CommandId command) noexcept {
+  switch (command) {
+    case CommandId::SunSetEnabled:
+    case CommandId::SunSetDirection:
+    case CommandId::SunSetColorIntensity:
+    case CommandId::CsmSetEnabled:
+    case CommandId::CsmSetLayout:
+    case CommandId::CsmSetTuning:
+    case CommandId::PointLightSetShadowConfig:
+    case CommandId::VolumetricSetDensity:
+    case CommandId::VolumetricSetScattering:
+    case CommandId::VolumetricSetQuality:
+    case CommandId::DayNightSetEnabled:
+    case CommandId::DayNightSetTime:
+    case CommandId::DayNightSetSpeed:
+    case CommandId::LightingClockSetMode:
+    case CommandId::LightingClockHoldTime:
+    case CommandId::LightingClockSetDayDuration:
+    case CommandId::LightingCycleSetCelestialMotionEnabled:
+    case CommandId::LightingCycleSetTimeColorGradingEnabled:
+    case CommandId::LightingCycleSetColorTemperatureProfile:
+    case CommandId::LightingCycleResetColorTemperatureProfile:
+      return true;
+    default:
+      return false;
+  }
+}
+
 Reply DispatchBackend(const ParsedRequest& request) {
   const auto& a = request.arguments;
-  auto* const settings = dxvk::war3::GetMutableSettings();
-  const bool mathCurveCpuCommand =
-      request.spec->id >= CommandId::MathProgramCompile &&
-      request.spec->id <= CommandId::CurvePointFinalize;
-  const bool lightningCpuCommand =
-      request.spec->id >= CommandId::LightningCreate &&
-      request.spec->id <= CommandId::LightningSetPolylineCurve;
-  if (!settings && !mathCurveCpuCommand && !lightningCpuCommand)
-    return Failure(ErrorCode::BackendUnavailable);
+
+  // Acquire the settings mailbox only for cases that mutate it directly.
+  // Point-light and volumetric delegate APIs acquire the mailbox themselves;
+  // holding it here would self-deadlock and would also invert the
+  // LightManager -> settings lock order used by AddPointLight.
+  dxvk::war3::War3SettingsWrite settings;
+  if (CommandUsesDirectRenderSettings(request.spec->id)) {
+    settings = dxvk::war3::GetMutableSettings();
+    if (!settings)
+      return Failure(ErrorCode::BackendUnavailable);
+  }
 
   switch (request.spec->id) {
     case CommandId::SunSetEnabled:
@@ -1031,7 +1061,6 @@ Reply DispatchBackend(const ParsedRequest& request) {
         static_cast<void>(war3shader::RemovePointLight(internalId));
         return Failure(ErrorCode::InternalError);
       }
-      settings->shadows.pointLightsEnabled = true;
       return SuccessInteger(publicId);
     }
     case CommandId::PointLightDestroy: {
@@ -1086,10 +1115,6 @@ Reply DispatchBackend(const ParsedRequest& request) {
           !war3shader::SetPointLightShadowIntensity(
               internalId, a[1].boolean ? 1.0f : 0.0f))
         return BackendRejected();
-      if (a[1].boolean) {
-        settings->shadows.pointLightsEnabled = true;
-        settings->shadows.pointShadowEnabled = true;
-      }
       return SuccessVoid();
     }
     case CommandId::PointLightSetShadowConfig: {
@@ -1697,8 +1722,7 @@ bool IsRuntimeReady() noexcept {
 #if defined(WARVK_JAPI_PROTOCOL_TEST)
   return false;
 #else
-  return dxvk::war3::GetActivePipeline() != nullptr &&
-         dxvk::war3::GetMutableSettings() != nullptr;
+  return dxvk::war3::HasActivePipeline();
 #endif
 }
 
@@ -1975,7 +1999,7 @@ void ResetTypedTransport() noexcept {
   }
 }
 
-void Reset() noexcept {
+void ResetAuthorState() noexcept {
   ResetTypedTransport();
 #if !defined(WARVK_JAPI_PROTOCOL_TEST)
   std::vector<ManagedObject> objects;
@@ -1990,18 +2014,19 @@ void Reset() noexcept {
   for (const ManagedObject& object : objects) {
     if (object.type == ManagedType::PointLight)
       static_cast<void>(war3shader::RemovePointLight(object.internalId));
-    else if (object.type == ManagedType::Lightning)
-      static_cast<void>(
-          render::War3LightningRuntime::instance().destroy(object.internalId));
   }
-  // Templates are map-scoped CPU descriptors. They are not managed objects,
-  // so a JASS VM rebuild must explicitly drop them and their texture cache.
-  render::War3LightningRuntime::instance().reset();
+  // Records and templates are map-scoped author data. Texture cache ownership
+  // remains with the renderer and is retired only by the Present transaction.
+  render::War3LightningRuntime::instance().resetAuthorState();
   // Programs and mutable curve handles are map-scoped as well. Lightning
   // records already own immutable snapshots, so reset order is intentional.
   math::CurveRuntime::instance().reset();
 #endif
   g_lastError = ErrorCode::None;
+}
+
+void Reset() noexcept {
+  ResetAuthorState();
 }
 
 void NoteTransportFailure() noexcept {

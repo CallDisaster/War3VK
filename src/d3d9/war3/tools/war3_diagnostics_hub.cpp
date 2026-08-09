@@ -638,19 +638,17 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.exactIndexDomainOversizeFallbackCount =
       cpuSpan.exactIndexDomainOversizeFallbackCount;
   frame.arenaFrameIncomplete = arena.frameIncomplete;
-  if (auto* device = dxvk::war3::GetActiveDevice()) {
-    const auto lifecycle = device->QueryWar3ShadowLifecycleDiagnostics();
+  dxvk::war3::RunWithActiveDevice([&](D3D9DeviceEx& device) {
+    const auto lifecycle = device.QueryWar3ShadowLifecycleDiagnostics();
     frame.shadowMapEpoch = lifecycle.currentMapEpoch;
     frame.shadowMapResetRequestedSerial = lifecycle.requestedResetSerial;
     frame.shadowMapResetAppliedSerial = lifecycle.appliedResetSerial;
     frame.shadowMapTransitionState = lifecycle.transitionState;
-  }
+    frame.queueResult = static_cast<int64_t>(
+        device.GetDXVKDevice()->getDeviceStatus());
+  });
   frame.queueSubmittedSerial = arena.submittedSerial;
   frame.queueCompletedSerial = arena.completedSerial;
-  if (auto* device = dxvk::war3::GetActiveDevice()) {
-    frame.queueResult =
-        static_cast<int64_t>(device->GetDXVKDevice()->getDeviceStatus());
-  }
 
   GpuIncidentSnapshot incident = {};
   bool writeIncident = false;
@@ -1120,10 +1118,10 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       replayDiagnostics.validatedCasterCount;
   summary.shadowReplayDrawnCasterCount = replayDiagnostics.drawnCasterCount;
   summary.shadowReplayLastRejectReason = replayDiagnostics.lastRejectReason;
-  if (auto* device = dxvk::war3::GetActiveDevice()) {
-    summary.queueLastResult =
-        static_cast<int64_t>(device->GetDXVKDevice()->getDeviceStatus());
-    const auto lifecycle = device->QueryWar3ShadowLifecycleDiagnostics();
+  dxvk::war3::RunWithActiveDevice([&](D3D9DeviceEx& device) {
+    summary.queueLastResult = static_cast<int64_t>(
+        device.GetDXVKDevice()->getDeviceStatus());
+    const auto lifecycle = device.QueryWar3ShadowLifecycleDiagnostics();
     summary.shadowMapResetRequestedSerial = lifecycle.requestedResetSerial;
     summary.shadowMapResetAppliedSerial = lifecycle.appliedResetSerial;
     summary.shadowMapEpoch = lifecycle.currentMapEpoch;
@@ -1149,7 +1147,7 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
         lifecycle.pendingProducerRejectCount;
     summary.shadowMapTransitionState = lifecycle.transitionState;
     summary.shadowMapProducerReady = lifecycle.producerReady;
-  }
+  });
   summary.shadowEvidenceRetentionRevision =
       s_shadowEvidenceRetentionRevision.load(std::memory_order_acquire);
   summary.shadowEvidenceCollectorAttached =

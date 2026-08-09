@@ -855,10 +855,17 @@ bool War3VolumetricLightPass::drawVolumetricLight(
 
   const auto& settings = input.settings->postFx.volumetricLight;
 
+  const Vector4 frameSunColor = input.lighting != nullptr
+      ? input.lighting->sunColor
+      : input.settings->sun.color;
+  const Vector4 frameSunDirection = input.lighting != nullptr
+      ? input.lighting->sunDirection
+      : input.settings->sun.direction;
+
   const Vector4 sanitizedSunColor =
-      Vector4(clampFinite(input.settings->sun.color.x, 0.0f, 64.0f, 0.0f),
-              clampFinite(input.settings->sun.color.y, 0.0f, 64.0f, 0.0f),
-              clampFinite(input.settings->sun.color.z, 0.0f, 64.0f, 0.0f),
+      Vector4(clampFinite(frameSunColor.x, 0.0f, 64.0f, 0.0f),
+              clampFinite(frameSunColor.y, 0.0f, 64.0f, 0.0f),
+              clampFinite(frameSunColor.z, 0.0f, 64.0f, 0.0f),
               0.0f);
   const float sunColorPeak = std::max(
       {sanitizedSunColor.x, sanitizedSunColor.y, sanitizedSunColor.z});
@@ -922,7 +929,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     shadowMapView = m_depthCopyView;
     shadowResolution = 1u;
     csmData = {};
-    csmSunDir = input.settings->sun.direction;
+    csmSunDir = frameSunDirection;
     csmWorldUp = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
     if (wantsSunVolume) {
       if (settings.requireCsmSnapshot) {
@@ -952,7 +959,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     shadowMapView = m_depthCopyView;
     shadowResolution = 1u;
     csmData = {};
-    csmSunDir = input.settings->sun.direction;
+    csmSunDir = frameSunDirection;
     csmWorldUp = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
   }
 
@@ -1537,10 +1544,13 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   const float sunIntensity = clampFinite(
       input.settings->sun.enabled ? input.settings->sun.intensity : 0.0f,
       0.0f, 64.0f, 0.0f);
+  const Vector4 frameSunColor = input.lighting != nullptr
+      ? input.lighting->sunColor
+      : input.settings->sun.color;
   const float sunColorPeak = std::max(
-      {clampFinite(input.settings->sun.color.x, 0.0f, 64.0f, 0.0f),
-       clampFinite(input.settings->sun.color.y, 0.0f, 64.0f, 0.0f),
-       clampFinite(input.settings->sun.color.z, 0.0f, 64.0f, 0.0f)});
+      {clampFinite(frameSunColor.x, 0.0f, 64.0f, 0.0f),
+       clampFinite(frameSunColor.y, 0.0f, 64.0f, 0.0f),
+       clampFinite(frameSunColor.z, 0.0f, 64.0f, 0.0f)});
   const float minSunIntensity =
       clampFinite(settings.minSunIntensity, 0.0f, 1.0f, 0.08f);
   const bool pointFeatureRequested = settings.includePointLights &&

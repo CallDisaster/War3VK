@@ -122,7 +122,15 @@ class WarVKMathCurveStaticTests(unittest.TestCase):
             "lightning.setFormulaCurve",
         ):
             self.assertIn(f'"{command}"', self.japi)
-        self.assertIn("mathCurveCpuCommand", self.japi)
+        direct_settings_policy = self.japi.split(
+            "bool CommandUsesDirectRenderSettings", 1
+        )[1].split("Reply DispatchBackend", 1)[0]
+        self.assertNotIn("MathProgramCompile", direct_settings_policy)
+        self.assertNotIn("CurvePointFinalize", direct_settings_policy)
+        self.assertIn(
+            "if (CommandUsesDirectRenderSettings(request.spec->id))",
+            self.japi,
+        )
         self.assertIn("math::CurveRuntime::instance().reset()", self.japi)
         bridge = JASS_BRIDGE.read_text(encoding="utf-8")
         self.assertIn("WarVK JAPI 1.2003", bridge)

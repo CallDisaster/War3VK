@@ -89,7 +89,7 @@ OutlineTestRestoreResult RestoreOutlineTestModeState() {
     return result;
   }
 
-  auto* settings = dxvk::war3::GetMutableSettings();
+  auto settings = dxvk::war3::GetMutableSettings();
   if (previous.settingsCaptured && settings != nullptr)
     settings->occludedOutline = previous.settingsBefore;
   dxvk::War3RenderState::SetOutlineDebugAllObjectsEnabled(
@@ -333,7 +333,7 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     }
   } else if (state->request.command == "shadow.debug_mode") {
     const uint32_t mode = payload.value("mode", 0u);
-    auto* settings = dxvk::war3::GetMutableSettings();
+    auto settings = dxvk::war3::GetMutableSettings();
     if (settings != nullptr) {
       settings->shadows.debugMode = static_cast<dxvk::War3ShadowDebugMode>(
           (std::min)(mode, 9u));
@@ -348,7 +348,7 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     const bool enabled = payload.value("enabled", true);
     const float time01 =
         std::clamp(payload.value("time01", 0.5f), 0.0f, 1.0f);
-    auto* settings = dxvk::war3::GetMutableSettings();
+    auto settings = dxvk::war3::GetMutableSettings();
     if (settings != nullptr) {
       settings->shadows.lockSun = enabled;
       settings->shadows.lockSunTime = time01;
@@ -591,7 +591,7 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
       result.error = cameraResult.error;
   } else if (state->request.command == "gpu_skin.outline_test_mode") {
     const bool enabled = payload.value("enabled", true);
-    auto* settings = dxvk::war3::GetMutableSettings();
+    auto settings = dxvk::war3::GetMutableSettings();
     dxvk::war3::ShaderStageOverrideTestStatus shaderStatus = {};
     bool restoreApplied = false;
     bool shaderRestored = false;
@@ -761,7 +761,6 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     const std::string snapshotId = state->request.requestId;
     const bool requireQuiescent =
         payload.value("requireQuiescent", false);
-    auto* device = dxvk::war3::GetActiveDevice();
     char snapshotMarker[256] = {};
     std::snprintf(
         snapshotMarker, sizeof(snapshotMarker),
@@ -769,9 +768,12 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     war3dbg::Print("%s\n", snapshotMarker);
     ::dxvk::Logger::info(snapshotMarker);
     bool quiescent = false;
-    const bool logged = device != nullptr &&
-        device->War3LogGpuSkinDiagnosticsForTest(
-            requireQuiescent, &quiescent);
+    bool logged = false;
+    const bool activeDeviceAvailable = dxvk::war3::RunWithActiveDevice(
+        [&](D3D9DeviceEx& device) {
+          logged = device.War3LogGpuSkinDiagnosticsForTest(
+              requireQuiescent, &quiescent);
+        });
     response["logged"] = logged;
     response["requireQuiescent"] = requireQuiescent;
     response["quiescent"] = quiescent;
@@ -786,7 +788,7 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
         snapshotId.c_str(), logged ? 1u : 0u);
     war3dbg::Print("%s\n", snapshotMarker);
     ::dxvk::Logger::info(snapshotMarker);
-    if (!logged && device == nullptr) {
+    if (!logged && !activeDeviceAvailable) {
       result.error = "active D3D9 device unavailable";
     } else if (!logged && requireQuiescent) {
       result.error = "GPU skin diagnostics not quiescent";
@@ -795,12 +797,22 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
     }
   } else if (state->request.command == "gpu_skin.reset_bridge") {
     const std::string scope = payload.value("scope", std::string());
-    auto* device = dxvk::war3::GetActiveDevice();
     const auto before =
         dxvk::war3::gpu_skin::GetNativeBridgeQuiescenceSnapshot();
     const bool validScope = scope == "map" || scope == "device";
-    const bool accepted = validScope && device != nullptr &&
-        device->War3ResetGpuSkinBridgeForTest(scope == "device");
+    bool accepted = false;
+    uint64_t shadowMapResetRequestedBefore = 0u;
+    uint64_t shadowMapResetRequestedAfter = 0u;
+    const bool activeDeviceAvailable = validScope &&
+        dxvk::war3::RunWithActiveDevice([&](D3D9DeviceEx& device) {
+          shadowMapResetRequestedBefore =
+              device.QueryWar3ShadowLifecycleDiagnostics()
+                  .requestedResetSerial;
+          accepted = device.War3ResetGpuSkinBridgeForTest(scope == "device");
+          shadowMapResetRequestedAfter =
+              device.QueryWar3ShadowLifecycleDiagnostics()
+                  .requestedResetSerial;
+        });
     const auto after =
         dxvk::war3::gpu_skin::GetNativeBridgeQuiescenceSnapshot();
     response["scope"] = scope;
@@ -809,6 +821,10 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
         before.requestedResetGeneration;
     response["requestedGenerationAfter"] =
         after.requestedResetGeneration;
+    response["shadowMapResetRequestedBefore"] =
+        shadowMapResetRequestedBefore;
+    response["shadowMapResetRequestedAfter"] =
+        shadowMapResetRequestedAfter;
     response["completedGenerationAfter"] =
         after.completedResetGeneration;
     response["acknowledgedGenerationAfter"] =
@@ -818,17 +834,22 @@ bool ProcessPendingInternalTestRequest(uint64_t frameIndex,
         after.poisonRangesOutstanding;
     response["retirementPendingAfter"] =
         after.retirementEventsPending;
-    result.ok = accepted &&
-        after.requestedResetGeneration > before.requestedResetGeneration;
+    const bool transitionPublished = scope == "map"
+        ? shadowMapResetRequestedAfter > shadowMapResetRequestedBefore
+        : after.requestedResetGeneration > before.requestedResetGeneration;
+    response["transitionPublished"] = transitionPublished;
+    result.ok = accepted && transitionPublished;
     if (!result.ok) {
       if (!validScope)
         result.error = "gpu skin reset scope must be map or device";
-      else if (device == nullptr)
+      else if (!activeDeviceAvailable)
         result.error = "active D3D9 device unavailable";
       else if (!accepted)
         result.error = "GPU skin bridge reset was not accepted";
       else
-        result.error = "GPU skin bridge reset generation did not advance";
+        result.error = scope == "map"
+            ? "shadow map reset request serial did not advance"
+            : "GPU skin bridge reset generation did not advance";
     }
   } else if (state->request.command == "shutdown.session") {
     response["accepted"] = true;

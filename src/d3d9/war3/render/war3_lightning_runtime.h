@@ -138,6 +138,10 @@ public:
   static War3LightningRuntime& instance();
 
   void setDevice(IDirect3DDevice9* device);
+  // Game/JASS threads may retire map-authored CPU descriptors, but must not
+  // release the renderer-owned texture cache. The Present owner calls reset()
+  // for the full CPU + GPU transition.
+  void resetAuthorState();
   void reset();
 
   int32_t create(const War3LightningCreateDesc& desc);
@@ -205,6 +209,7 @@ private:
 
   bool executeLockedCopy(const std::vector<LightningRecord>& records,
                          double nowSec);
+  void resetAuthorStateLocked();
   void releaseTexturesLocked();
   IDirect3DTexture9* acquireTexture(IDirect3DDevice9* device,
                                      const std::string& texturePath);
