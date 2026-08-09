@@ -39,9 +39,9 @@ Motion-vector and TAA-current image views now include
 ## Deliberate exclusions
 
 - `d3d9_war3_shadow_outline.cpp` is handled by the separate outline P0 work.
-- Point-shadow cube state was not converted here; that path already has a
-  dedicated initialization/publication contract and needs a separate
-  per-layer ownership audit rather than sharing the CSM state blindly.
+- Point-shadow cube state was converted by the bounded follow-up documented in
+  `2026-08-09-tdr-p0-point-shadow-image-layout.md`; it uses independent face
+  state rather than sharing the CSM state blindly.
 - This change does not alter resource retirement or publication fences.
 
 ## Verification boundary

@@ -1037,9 +1037,10 @@ void War3ShadowReceiverPass::ensurePointShadowNeutralResources() {
   info.extent = VkExtent3D{1u, 1u, 1u};
   info.numLayers = 6u;
   info.mipLevels = 1u;
-  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-  info.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  info.access = VK_ACCESS_SHADER_READ_BIT;
+  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  info.stages =
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+  info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
   info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
@@ -1047,7 +1048,7 @@ void War3ShadowReceiverPass::ensurePointShadowNeutralResources() {
 
   m_pointShadowNeutralCube =
       m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  m_pointShadowNeutralReady = false;
+  m_pointShadowNeutralLayout.reset();
 
   DxvkImageViewKey viewInfo;
   viewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
@@ -1096,6 +1097,7 @@ void War3ShadowReceiverPass::ensurePointShadowResources(
                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
   info.access =
+      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
@@ -1145,7 +1147,8 @@ void War3ShadowReceiverPass::ensurePointShadowResources(
   m_pointShadowFaceViews = newFaceViews;
   m_pointShadowResolution = resolution;
   m_pointShadowCapacityLights = capacityLights;
-  m_pointShadowCubeLayoutInitialized = false;
+  for (auto& layout : m_pointShadowFaceLayouts)
+    layout.reset();
   // A recreated image contains no valid face data. Keeping the old validity
   // mask would let a low face-budget update sample untouched faces from the
   // new (empty) cube as if they were temporal history.

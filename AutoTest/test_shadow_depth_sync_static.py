@@ -44,13 +44,65 @@ class ShadowDepthSynchronizationTests(unittest.TestCase):
 
     def test_point_shadow_normal_and_exception_transitions_match(self) -> None:
         point = self.shadow[self.shadow.index(
-            "void War3ShadowReceiverPass::renderPointShadow(") :]
-        normal_start = point.index("VkImageMemoryBarrier2 toRead")
-        normal_end = point.index("pointShadowLayersInAttachmentLayout = false", normal_start)
-        self._requires_complete_depth_source_scope(point[normal_start:normal_end])
-        restore_start = point.index("VkImageMemoryBarrier2 restoreRead")
-        restore_end = point.index("throw;", restore_start)
-        self._requires_complete_depth_source_scope(point[restore_start:restore_end])
+            "void War3ShadowReceiverPass::renderPointShadow(") :
+            self.shadow.index("void War3ShadowReceiverPass::drawReceiver(")]
+        if "transitionPointShadowWriteLayers" in point:
+            transition_start = point.index(
+                "auto transitionPointShadowWriteLayers"
+            )
+            transition_end = point.index(
+                "bool pointShadowLayersInAttachmentLayout", transition_start
+            )
+            transition = point[transition_start:transition_end]
+            self.assertIn("m_pointShadowFaceLayouts[layer].plan", transition)
+            self.assertIn("CommitWar3OwnedImageLayout", transition)
+
+            attachment_start = point.index(
+                "transitionPointShadowWriteLayers(", transition_end
+            )
+            attachment_end = point.index(
+                "pointShadowLayersInAttachmentLayout = true", attachment_start
+            )
+            self._requires_complete_depth_source_scope(
+                point[attachment_start:attachment_end]
+            )
+
+            normal_start = point.index(
+                "transitionPointShadowWriteLayers(", attachment_end
+            )
+            normal_end = point.index(
+                "pointShadowLayersInAttachmentLayout = false", normal_start
+            )
+            normal = point[normal_start:normal_end]
+            self.assertIn(
+                "VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL", normal
+            )
+            self.assertIn("VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT", normal)
+            self.assertIn("VK_ACCESS_2_SHADER_READ_BIT", normal)
+
+            restore_start = point.index(
+                "transitionPointShadowWriteLayers(", normal_end
+            )
+            restore_end = point.index("throw;", restore_start)
+            restore = point[restore_start:restore_end]
+            self.assertIn(
+                "VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL", restore
+            )
+            self.assertIn("VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT", restore)
+            self.assertIn("VK_ACCESS_2_SHADER_READ_BIT", restore)
+        else:
+            normal_start = point.index("VkImageMemoryBarrier2 toRead")
+            normal_end = point.index(
+                "pointShadowLayersInAttachmentLayout = false", normal_start
+            )
+            self._requires_complete_depth_source_scope(
+                point[normal_start:normal_end]
+            )
+            restore_start = point.index("VkImageMemoryBarrier2 restoreRead")
+            restore_end = point.index("throw;", restore_start)
+            self._requires_complete_depth_source_scope(
+                point[restore_start:restore_end]
+            )
 
     def test_terrain_mask_has_explicit_depth_write_to_read_dependency(self) -> None:
         start = self.shadow.index("VkImageMemoryBarrier2 mainDepthToTerrainMask")

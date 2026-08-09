@@ -879,12 +879,13 @@ namespace dxvk {
         uint32_t m_pointShadowCapacityLights = 0;             // 当前 cube array 实际容量（1..4）
         Rc<DxvkImage> m_pointShadowCube;                      // Cube Depth Texture
         Rc<DxvkImageView> m_pointShadowCubeView;              // CubeArray 采样视图
-        bool m_pointShadowCubeLayoutInitialized = false;
+        std::array<war3::render::War3OwnedImageLayoutState,
+                   kMaxPointShadowLights * 6u> m_pointShadowFaceLayouts = {};
         // Receiver shader 静态声明 textureCubeArray；点阴影未就绪时也必须
         // 绑定维度匹配的合法 view，不能用 CSM texture2DArray 充当 fallback。
         Rc<DxvkImage> m_pointShadowNeutralCube;
         Rc<DxvkImageView> m_pointShadowNeutralCubeView;
-        bool m_pointShadowNeutralReady = false;
+        war3::render::War3OwnedImageLayoutState m_pointShadowNeutralLayout;
         std::array<Rc<DxvkImageView>, kMaxPointShadowLights * 6> m_pointShadowFaceViews; // 每光源6个面的渲染视图
         std::array<bool, kMaxPointShadowLights> m_pointShadowReady = {};
         uint32_t m_pointShadowReadyCount = 0;

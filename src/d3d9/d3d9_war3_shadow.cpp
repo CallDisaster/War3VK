@@ -7551,29 +7551,103 @@ void War3ShadowReceiverPass::renderPointShadow(
   }
 
   const uint32_t resolution = pointShadowResolution;
-  const uint32_t shadowLayerCount = shadowLightCount * 6u;
+  const uint32_t pointShadowCapacityLayerCount =
+      m_pointShadowCapacityLights * 6u;
+  if (m_pointShadowFaceLayouts[0].layout() == VK_IMAGE_LAYOUT_UNDEFINED) {
+    bool allFacesUndefined = true;
+    for (uint32_t layer = 0u; layer < pointShadowCapacityLayerCount; ++layer) {
+      allFacesUndefined &= m_pointShadowFaceLayouts[layer].layout() ==
+                           VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    if (!allFacesUndefined) {
+      invalidatePointShadowPublishedState();
+      m_pointShadowCpuPlan.shouldRender = false;
+      return;
+    }
 
-  if (!m_pointShadowCubeLayoutInitialized) {
-    // VkImage starts in UNDEFINED even though its steady-state descriptor
-    // layout is read-only. Initialize all possible cube-array layers once so a
-    // later increase in shadowLightCount never spans mixed old layouts.
-    VkImageMemoryBarrier2 initRead = {
-        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    initRead.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
-    initRead.srcAccessMask = 0u;
-    initRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    initRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    initRead.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    initRead.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    initRead.image = m_pointShadowCube->handle();
-    initRead.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u,
-                                 m_pointShadowCapacityLights * 6u};
+    // The descriptor spans the full allocated CubeArray, so establish one
+    // coherent sampled layout before any face is updated independently.
+    const VkImageSubresourceRange fullCubeRange = {
+        VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u,
+        pointShadowCapacityLayerCount};
+    const auto initialRead = m_pointShadowFaceLayouts[0].plan(
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_READ_BIT);
+    const VkImageMemoryBarrier2 initialReadBarrier =
+        war3::render::MakeWar3OwnedImageBarrier(
+            initialRead, m_pointShadowCube->handle(), fullCubeRange);
     VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 1u;
-    depInfo.pImageMemoryBarriers = &initRead;
+    depInfo.pImageMemoryBarriers = &initialReadBarrier;
     ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
-    m_pointShadowCubeLayoutInitialized = true;
+    for (uint32_t layer = 0u; layer < pointShadowCapacityLayerCount; ++layer)
+      m_pointShadowFaceLayouts[layer].commit(initialRead);
+    m_pointShadowCube->trackLayout(
+        fullCubeRange, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
   }
+
+  for (uint32_t layer = 0u; layer < pointShadowCapacityLayerCount; ++layer) {
+    if (m_pointShadowFaceLayouts[layer].layout() !=
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) {
+      invalidatePointShadowPublishedState();
+      m_pointShadowCpuPlan.shouldRender = false;
+      return;
+    }
+  }
+
+  std::array<uint32_t, kMaxPointShadowLights * 6u> pointShadowWriteLayers = {};
+  uint32_t pointShadowWriteLayerCount = 0u;
+  for (uint32_t lightIndex = 0u; lightIndex < shadowLightCount; ++lightIndex) {
+    const uint8_t updateMask = m_pointShadowCpuPlan.updateMask[lightIndex];
+    for (uint32_t face = 0u; face < 6u; ++face) {
+      if ((updateMask & (1u << face)) != 0u)
+        pointShadowWriteLayers[pointShadowWriteLayerCount++] =
+            lightIndex * 6u + face;
+    }
+  }
+  if (pointShadowWriteLayerCount == 0u) {
+    invalidatePointShadowPublishedState();
+    m_pointShadowCpuPlan.shouldRender = false;
+    return;
+  }
+
+  // The cube can contain preserved history, freshly rendered faces and layers
+  // that have never been used. Track every face independently so neither the
+  // cube sampling view's preferred layout nor one face's state is used as the
+  // oldLayout proof for another face.
+  auto transitionPointShadowWriteLayers =
+      [&](VkImageLayout newLayout, VkPipelineStageFlags2 dstStages,
+          VkAccessFlags2 dstAccess) {
+        std::array<war3::render::War3OwnedImageLayoutTransition,
+                   kMaxPointShadowLights * 6u> transitions = {};
+        std::array<VkImageMemoryBarrier2, kMaxPointShadowLights * 6u> barriers =
+            {};
+        for (uint32_t i = 0u; i < pointShadowWriteLayerCount; ++i) {
+          const uint32_t layer = pointShadowWriteLayers[i];
+          const VkImageSubresourceRange range = {
+              VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, layer, 1u};
+          transitions[i] =
+              m_pointShadowFaceLayouts[layer].plan(newLayout, dstStages,
+                                                    dstAccess);
+          barriers[i] = war3::render::MakeWar3OwnedImageBarrier(
+              transitions[i], m_pointShadowCube->handle(), range);
+        }
+
+        VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        depInfo.imageMemoryBarrierCount = pointShadowWriteLayerCount;
+        depInfo.pImageMemoryBarriers = barriers.data();
+        ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+
+        for (uint32_t i = 0u; i < pointShadowWriteLayerCount; ++i) {
+          const uint32_t layer = pointShadowWriteLayers[i];
+          const VkImageSubresourceRange range = {
+              VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, layer, 1u};
+          war3::render::CommitWar3OwnedImageLayout(
+              m_pointShadowFaceLayouts[layer], transitions[i],
+              *m_pointShadowCube, range);
+        }
+      };
 
   // Vulkan recording has a second transaction boundary in addition to the
   // CPU publication rollback above. Once the cube layers enter attachment
@@ -7583,22 +7657,13 @@ void War3ShadowReceiverPass::renderPointShadow(
   bool pointShadowLayersInAttachmentLayout = false;
   bool pointShadowDynamicRenderingActive = false;
   try {
-    VkImageMemoryBarrier2 toWrite = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toWrite.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    toWrite.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    toWrite.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    toWrite.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    toWrite.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    toWrite.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    toWrite.image = m_pointShadowCube->handle();
-    toWrite.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0,
-                                shadowLayerCount};
-    VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    depInfo.imageMemoryBarrierCount = 1;
-    depInfo.pImageMemoryBarriers = &toWrite;
-    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
-  pointShadowLayersInAttachmentLayout = true;
+    transitionPointShadowWriteLayers(
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+    pointShadowLayersInAttachmentLayout = true;
 
   // Hoist the per-draw GPU-skin-direct decision out of the (face x draw)
   // inner loop: it depends only on the draw, so the exact-input probe was
@@ -7910,24 +7975,9 @@ void War3ShadowReceiverPass::renderPointShadow(
     }
   }
 
-  {
-    VkImageMemoryBarrier2 toRead = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toRead.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    toRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    toRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    toRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    toRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    toRead.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    toRead.image = m_pointShadowCube->handle();
-    toRead.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0,
-                               shadowLayerCount};
-    VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    depInfo.imageMemoryBarrierCount = 1;
-    depInfo.pImageMemoryBarriers = &toRead;
-    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
-  }
+  transitionPointShadowWriteLayers(
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
   pointShadowLayersInAttachmentLayout = false;
 
   ctx->track(m_pointShadowCube, DxvkAccess::Write);
@@ -7954,25 +8004,10 @@ void War3ShadowReceiverPass::renderPointShadow(
       pointShadowDynamicRenderingActive = false;
     }
     if (pointShadowLayersInAttachmentLayout) {
-      VkImageMemoryBarrier2 restoreRead = {
-          VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-      restoreRead.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                                 VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-      restoreRead.srcAccessMask =
-          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-      restoreRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-      restoreRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-      restoreRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-      restoreRead.newLayout =
-          VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-      restoreRead.image = m_pointShadowCube->handle();
-      restoreRead.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u,
-                                      shadowLayerCount};
-      VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-      depInfo.imageMemoryBarrierCount = 1u;
-      depInfo.pImageMemoryBarriers = &restoreRead;
-      ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+      transitionPointShadowWriteLayers(
+          VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+          VK_ACCESS_2_SHADER_READ_BIT);
       pointShadowLayersInAttachmentLayout = false;
     }
     throw;
@@ -8020,23 +8055,40 @@ void War3ShadowReceiverPass::drawReceiver(const Rc<DxvkCommandList> &ctx,
     return;
 
   ensurePointShadowNeutralResources();
-  if (m_pointShadowNeutralCube && !m_pointShadowNeutralReady) {
-    VkImageMemoryBarrier2 neutralToRead = {
-        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    neutralToRead.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
-    neutralToRead.srcAccessMask = 0u;
-    neutralToRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    neutralToRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    neutralToRead.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    neutralToRead.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    neutralToRead.image = m_pointShadowNeutralCube->handle();
-    neutralToRead.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u,
-                                      6u};
+  if (m_pointShadowNeutralCube &&
+      m_pointShadowNeutralLayout.layout() !=
+          VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) {
+    const VkImageSubresourceRange range = {
+        VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u, 6u};
+    const auto toClear = m_pointShadowNeutralLayout.plan(
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const VkImageMemoryBarrier2 clearBarrier =
+        war3::render::MakeWar3OwnedImageBarrier(
+            toClear, m_pointShadowNeutralCube->handle(), range);
     VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 1u;
-    depInfo.pImageMemoryBarriers = &neutralToRead;
+    depInfo.pImageMemoryBarriers = &clearBarrier;
     ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
-    m_pointShadowNeutralReady = true;
+    war3::render::CommitWar3OwnedImageLayout(
+        m_pointShadowNeutralLayout, toClear, *m_pointShadowNeutralCube, range);
+
+    const VkClearDepthStencilValue neutralDepth = {1.0f, 0u};
+    ctx->cmdClearDepthStencilImage(
+        DxvkCmdBuffer::ExecBuffer, m_pointShadowNeutralCube->handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &neutralDepth, 1u, &range);
+
+    const auto toRead = m_pointShadowNeutralLayout.plan(
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+    const VkImageMemoryBarrier2 readBarrier =
+        war3::render::MakeWar3OwnedImageBarrier(
+            toRead, m_pointShadowNeutralCube->handle(), range);
+    depInfo.pImageMemoryBarriers = &readBarrier;
+    ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+    war3::render::CommitWar3OwnedImageLayout(
+        m_pointShadowNeutralLayout, toRead, *m_pointShadowNeutralCube, range);
+    ctx->track(m_pointShadowNeutralCube, DxvkAccess::Write);
   }
   const bool pointShadowPublicationCurrent =
       pointShadowPublishedStateMatchesCurrentPlan();
