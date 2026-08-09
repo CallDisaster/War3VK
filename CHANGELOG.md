@@ -19,6 +19,24 @@
   精确径向深度域；单个 tap 不再在 exact plane 与中心深度之间混算。没有可靠平面的表面使用
   有界、单调的斜率回退。
 
+### 运行时安全修复
+
+- 发布构建在编译期关闭旧式 `warvk:cmd` 字符串命令入口，不提供环境变量绕过；专用开发测试构建
+  即使开启该入口，也会拒绝未知命令、未发布 feature、非有限数、溢出及尾随字符。公开的强类型
+  WarVK JAPI 和 `warvk:v1` 协议不受影响。
+- JASS VM 重建只清理地图作者的 CPU 状态，不再由 Hook 线程释放渲染线程拥有的 Lightning 纹理；
+  完整 GPU 资源清理继续由 Present 所有者在地图事务安全点执行。
+- 异步渲染设置改为互斥 mailbox 与不可变 `shared_ptr` 帧快照，修复设置撕裂、对象析构后访问、
+  settings/PointLight 锁序反转及递归自锁风险。
+- 删除 active device/pipeline 的裸指针旁路；设备构造发布、调用事务、析构撤销和 settings 生命周期
+  现在由同一发布锁闭合。
+- `Reset`/`ResetEx` 的 device epoch 迁移只允许 Present 所有者提交：先关闭 producer、quarantine
+  旧资源并推进 fence，再按命令流顺序失效 receiver。GPU-skin 重绑失败时保持无阴影，不会错误
+  重新开放旧资源。
+- 地图 epoch 变化时会在所有早退路径之前清理语义注册表、SceneCollector 的裸指针/handle TLS
+  与关联 CPU 身份，避免 Map A 地址别名进入 Map B。该修复增强 fail-closed 边界，但本版本仍不
+  宣称完整跨地图游玩已经通过物理验收。
+
 ### 发布冻结
 
 - Hotfix3 强制关闭尚未通过发布门的 Compact WorkTable、Producer Claim Ledger、联合/Bounds
@@ -31,7 +49,8 @@
 ### 验证与已知边界
 
 - 用户前台物理验收确认：不死族/暗夜精灵建造动画阴影连续，点阴影摩尔纹不再复现。
-- Hotfix3 冻结合同、相关阴影/点阴影静态测试、Win32 runnable 18/18、Win32 DLL 构建、
+- Hotfix3 冻结合同、相关阴影/点阴影及运行时安全静态测试 76 个脚本/581 个用例、Win32 runnable
+  20/20、Win32 DLL clean build、
   `ninja -n` no-work 与 `git diff --check` 通过。
 - 高压低视角下的 CSM 安全预算与提前剔除问题仍由 [#5](https://github.com/CallDisaster/War3VK/issues/5)
   跟踪；超过预算时仍可能出现阴影闪烁或暂时消失，以避免提交可能触发 TDR 的超量工作。

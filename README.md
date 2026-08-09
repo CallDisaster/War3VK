@@ -37,6 +37,9 @@ Version 1.2003 is Hotfix 3 for the 1.2 semantic rendering architecture. WarVK co
 - Map/device epochs isolate manifests, cached geometry, GPU skinning, point-shadow work, TAA history, and receiver publications across map changes.
 - Final CSM and point-shadow replay validates buffer ranges, index domains, formats, generations, matrices, and skinning inputs before issuing Vulkan draws.
 - Incomplete CSM candidates are never published caster by caster. A complete same-map shadow is published atomically, or the receiver safely shows no directional shadow.
+- Release builds compile out the legacy `warvk:cmd` development entry point, and JASS VM rebuilds no longer release render-owned resources from a hook thread.
+- Render settings cross asynchronous work through a locked mailbox and immutable frame snapshots; active device and pipeline pointers no longer escape without lifetime protection.
+- `Reset`/`ResetEx` device-epoch changes, Arena quarantine, GPU-skin rebinding, and receiver invalidation are serialized by the Present owner and remain fail-closed on failure.
 - Bounded bulk reads for write-combined index buffers remove a major CPU regression without restoring unsafe cross-frame VB/IB caches.
 - Compact work tables, conservative union culling, persistent GPU packages, a persistent point-shadow planner, and CPU multi-threaded skinning contracts are included as guarded infrastructure. Experimental Consume paths remain disabled until their correctness and performance gates pass.
 

@@ -79,15 +79,12 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   `D3DVBF_0WEIGHTS` 索引蒙皮。用户已确认不死族 UBirth 建造阴影不再闪烁；该路径没有重新开启
   全局跨帧 VB/IB cache。详细证据见
   `docs/agent-history/2026-08-09-stage11-type0-correctness-baseline.md`。
-- 2026-08-09 的当前集成候选为 `203932c` / `codex/integrated-correctness-baseline-20260809`，
-  build32 DLL SHA-256 为 `56566E0418E2C51AE22C7978E5934AC45ACDB32191F7E02E15C83EBB3FAF8190`。
-  它把用户分别确认过的 Type0/UBirth 修复与点阴影 receiver-bias 修复合入同一源码线，并包含本轮
-  跨地图 CPU 身份缓存失效；73 个静态脚本、18/18 Win32 runnable、DLL 构建和 no-work 已通过。
-  该组合 DLL 尚未部署或完成前台物理回归，不能把两个旧候选的独立验收冒充组合验收。
-- 2026-08-09 的本地运行时安全候选默认编译期禁用 legacy `warvk:cmd`，并闭合 JASS reset、异步
-  settings 生命周期、active-device 发布、Reset device epoch 与 SceneCollector 早退身份残留风险；
-  76/76 静态、20/20 Win32 runnable、32 位 DLL link 与 no-work 已通过，但尚未部署或完成 Reset/
-  A→B→A 前台物理门。详细证据见
+- 2026-08-09 的本地 `1.2003` Hotfix3 组合候选已合入用户确认过的 Type0/UBirth 建造阴影、点阴影
+  receiver-bias，以及编译期关闭 legacy `warvk:cmd`、JASS CPU-only reset、异步 settings mailbox、
+  active-device 发布、Reset device epoch 和 SceneCollector 早退身份清理。76 个静态脚本/581 个用例、
+  20/20 Win32 runnable、32 位 clean build 与 no-work 通过；DLL SHA-256 为
+  `A36253BC63854B4B9F620DE6303B076C5361B8511A3A732D8768459F42A4147F`。前两项视觉修复已有用户
+  前台确认，新增运行时安全组合仍未部署或完成 Reset/A→B→A 物理门。详细证据见
   `docs/agent-history/2026-08-09-runtime-safety-and-shadow-edge-research.md`。
 - 同一调查确认现有 3794 帧取证全为 4096 DirectInline，阴影边缘持续爬动并非 Temporal 或自适应
   降档所致；首要源码嫌疑是 CSM 先线性过滤原始深度再比较，以及默认周期性世界坐标 Poisson 旋转。
@@ -126,11 +123,11 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 - 当前 RTX 4060 Ti 的主 15.73 GiB device-local heap 不可 host-visible；唯一同时
   `DEVICE_LOCAL | HOST_VISIBLE` 的 heap 只有 214 MiB。因此 ReBAR direct-upload 实验不满足既定
   准入条件，保持未实现/默认关闭，不能占用小 BAR heap 冒充完整 ReBAR 收益。
-- 1.2.0 的发布范围限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍会造成
-  性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；点光开启点阴影后，部分
-  地面/角度仍有摩尔纹或带状伪影。README/CHANGELOG 必须保留这两项已知问题，后续不得描述为已修复。
+- 1.2003 的发布范围仍限定为“新启动进程只进入一张地图”。同进程退出地图后再进入其他地图仍可能
+  造成性能下降、阴影异常或其他生命周期问题，已由用户决定延期到下一版本；README/CHANGELOG
+  必须保留该已知问题。点阴影 receiver-bias 修复已由用户前台确认，不再把旧摩尔纹列为当前已知问题。
 - 当前 JAPI/体积效果仍需用户地图物理验收；可见桌面 AutoTest 的低视角稳定门不能代替玩家前台
-  视觉判断，也不能外推为跨地图或点阴影摩尔纹已经修复。
+  视觉判断，也不能外推为跨地图生命周期已经修复。
 
 ## 不可破坏的工程约束
 

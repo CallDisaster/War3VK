@@ -37,6 +37,9 @@ WarVK 是面向 Warcraft III 1.27a 的画面增强运行时。它以 DXVK 派生
 - 统一 map/device epoch 隔离 Manifest、缓存几何、GPU 蒙皮、点阴影任务、TAA 历史与 receiver 发布，避免旧地图资源污染新地图。
 - 最终 CSM/点阴影 replay 在发出 Vulkan draw 前验证 VB/IB 范围、索引域、格式、代际、矩阵与蒙皮输入。
 - 不完整 CSM 不会再“一个 caster 一个 caster”地逐步发布；只有完整的同地图 candidate 才原子生效，否则安全显示为无太阳阴影。
+- 发布构建在编译期关闭旧式 `warvk:cmd` 开发入口；JASS VM 重建不再从 Hook 线程释放渲染资源。
+- 渲染设置通过带锁 mailbox 和不可变帧快照交付；active device/pipeline 不再向外暴露无生命周期保护的裸指针。
+- `Reset`/`ResetEx` 的 device epoch、Arena quarantine、GPU-skin 重绑和 receiver 失效统一由 Present 所有者按顺序提交；失败时保持 fail-closed。
 - 对 write-combined 索引缓冲采用有界批量读取，修复 exact-index 检查引入的明显 CPU 性能回归，同时不恢复危险的跨帧 VB/IB 缓存。
 - Compact WorkTable、联合消费者剔除、Persistent GPU Package、持久点阴影规划器和 CPU 多线程蒙皮合同已经进入受控基础设施阶段；未通过完整门槛的 Consume 路线仍默认关闭。
 
