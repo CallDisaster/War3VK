@@ -164,6 +164,12 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   不能为方便而让渲染线程回调 JASS 或暴露未实现 feature bit。
 - 不要将 `AutoTest` 的 isolated desktop 数据宣称为玩家前台性能；涉及性能时按
   `AutoTest/README.md` 的前台基线和特性矩阵规则执行。
+- 修改阴影、过滤、抗锯齿、同步或其他图形学算法时，只要结论不是十足确定，必须先查阅原始或同行评审
+  论文、Microsoft DirectX 指南、Khronos Vulkan 规范或 GPU 厂商研究资料，并在 `docs/research/`
+  记录公式、适用边界、来源与本项目映射。博客只能作为检索线索，不能单独授权 Release 默认值。
+- Unreal Engine 官方源码只允许从已获 EULA 权限的 `EpicGames/UnrealEngine` 检出到项目外部
+  `E:\Mycode\Source\References\UnrealEngine`，作为只读架构参考。不得复制、改写或提交 UE 源码、
+  Shader、资产到 WarVK/DXVK 开源树；实现必须独立完成并优先引用公开论文/规范。
 - 构建或测试不会自动授权部署 DLL、覆盖 YDWE/Warcraft 文件、启动/关闭编辑器或游戏。此类操作需有
   用户明确请求，并先检查目标进程与精确备份/哈希。
 
