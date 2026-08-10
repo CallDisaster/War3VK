@@ -1,5 +1,6 @@
 #include "../war3_shadow_receiver_numeric_contract.h"
 #include "../war3_shadow_alpha_cascade_contract.h"
+#include "../war3_shadow_hashed_alpha_contract.h"
 
 #include <array>
 #include <cmath>
@@ -11,6 +12,7 @@ namespace {
 using dxvk::war3::render::shadowmath::Vec2;
 namespace math = dxvk::war3::render::shadowmath;
 namespace alpha = dxvk::war3::render;
+namespace hashed = dxvk::war3::render::shadowalpha;
 
 bool near(double actual, double expected, double epsilon = 1.0e-10) {
   return std::abs(actual - expected) <= epsilon;
@@ -266,6 +268,68 @@ bool testAlphaCascadeParityContract() {
   return true;
 }
 
+bool testStableHashedAlphaContract() {
+  double threshold = 0.0;
+  const hashed::Vec3 surface = {0.25, 1.5, -0.75};
+  const hashed::Vec3 dx = {0.125, 0.0, 0.0};
+  const hashed::Vec3 dy = {0.0, 0.125, 0.0};
+  if (!require(hashed::stableHashedThreshold(
+                   surface, dx, dy, 1.0, threshold),
+               "finite stable hashed-alpha input was rejected") ||
+      !require(threshold >= 1.0e-6 && threshold <= 1.0,
+               "stable hashed-alpha threshold left its bounded range"))
+    return false;
+
+  const double originalThreshold = threshold;
+  if (!require(hashed::stableHashedThreshold(
+                   {surface.x + 0.01, surface.y, surface.z},
+                   dx, dy, 1.0, threshold) &&
+                   near(threshold, originalThreshold, 1.0e-12),
+               "sub-cell translation changed the surface-anchored hash"))
+    return false;
+
+  for (const hashed::Vec3 invalid : {
+           hashed::Vec3{std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0},
+           hashed::Vec3{std::numeric_limits<double>::infinity(), 0.0, 0.0},
+       }) {
+    if (!require(!hashed::stableHashedThreshold(
+                     invalid, dx, dy, 1.0, threshold),
+                 "non-finite hashed-alpha coordinate was accepted"))
+      return false;
+  }
+  if (!require(!hashed::stableHashedThreshold(
+                   surface, {}, {}, 1.0, threshold),
+               "degenerate hashed-alpha derivatives were accepted"))
+    return false;
+
+  if (!require(hashed::coverageBlendFromTextureFootprint(
+                   {1.0 / 1024.0, 0.0}, {0.0, 1.0 / 1024.0},
+                   1024.0, 1024.0) == 0.0,
+               "magnified/one-texel alpha unexpectedly enabled hashing"))
+    return false;
+  const double minifiedBlend = hashed::coverageBlendFromTextureFootprint(
+      {8.0 / 1024.0, 0.0}, {0.0, 8.0 / 1024.0}, 1024.0, 1024.0);
+  if (!require(near(minifiedBlend, 0.25, 1.0e-12),
+               "six-level quadratic hashed-alpha fade changed"))
+    return false;
+
+  if (!require(near(hashed::stableCoverageThreshold(0.7, 0.2, 0.0), 0.7) &&
+                   near(hashed::stableCoverageThreshold(0.7, 0.2, 1.0), 0.2),
+               "hashed-alpha blend no longer preserves near authored cutoff"))
+    return false;
+
+  for (double interpolation : {0.0, 0.125, 0.5, 0.875, 1.0}) {
+    for (double mixed = 0.0; mixed <= 1.0; mixed += 1.0 / 128.0) {
+      const double value = hashed::uniformizeInterpolatedHashes(
+          mixed, interpolation);
+      if (!require(std::isfinite(value) && value >= 1.0e-6 && value <= 1.0,
+                   "CDF-uniformized threshold was non-finite or out of range"))
+        return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -274,7 +338,8 @@ int main() {
       !testReceiverPlaneSignedSlopeAndAtomicFallback() ||
       !testCascadeBoundaryContinuityAndInvalidNextFallback() ||
       !testCascadeProjectionDecisionChain() ||
-      !testAlphaCascadeParityContract())
+      !testAlphaCascadeParityContract() ||
+      !testStableHashedAlphaContract())
     return 1;
   std::cout << "war3_shadow_receiver_numeric_contract_test: PASS\n";
   return 0;
