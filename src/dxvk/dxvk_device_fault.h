@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "dxvk_include.h"
+#include "dxvk_device_address_binding.h"
 
 namespace dxvk {
 
@@ -36,6 +37,7 @@ namespace dxvk {
     uint32_t vendorInfoCount = 0u;
     std::array<VkDeviceFaultVendorInfoEXT, MaxVendorInfos> vendorInfos = { };
     bool vendorBinaryEnabled = false;
+    DxvkDeviceAddressBindingSnapshot addressBinding = { };
   };
 
   /**
@@ -74,6 +76,7 @@ namespace dxvk {
     uint32_t m_vendorInfoCount = 0u;
     std::array<VkDeviceFaultVendorInfoEXT,
       DxvkDeviceFaultSnapshot::MaxVendorInfos> m_vendorInfos = { };
+    DxvkDeviceAddressBindingSnapshot m_addressBinding = { };
   };
 
 }

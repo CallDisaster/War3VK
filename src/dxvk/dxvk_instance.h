@@ -3,6 +3,7 @@
 #include "../util/config/config.h"
 
 #include "dxvk_adapter.h"
+#include "dxvk_device_address_binding.h"
 #include "dxvk_device_filter.h"
 #include "dxvk_extension_provider.h"
 #include "dxvk_options.h"
@@ -204,6 +205,7 @@ namespace dxvk {
     DxvkDebugFlags            m_debugFlags = 0u;
 
     VkDebugUtilsMessengerEXT  m_messenger = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT  m_addressBindingMessenger = VK_NULL_HANDLE;
 
     std::vector<DxvkExtensionProvider*> m_extProviders;
     std::vector<Rc<DxvkAdapter>> m_adapters;
@@ -221,6 +223,12 @@ namespace dxvk {
             DxvkInstanceExtensionInfo& extensions);
 
     static VkBool32 VKAPI_CALL debugCallback(
+            VkDebugUtilsMessageSeverityFlagBitsEXT  messageSeverity,
+            VkDebugUtilsMessageTypeFlagsEXT         messageTypes,
+      const VkDebugUtilsMessengerCallbackDataEXT*   pCallbackData,
+            void*                                   pUserData);
+
+    static VkBool32 VKAPI_CALL addressBindingCallback(
             VkDebugUtilsMessageSeverityFlagBitsEXT  messageSeverity,
             VkDebugUtilsMessageTypeFlagsEXT         messageTypes,
       const VkDebugUtilsMessengerCallbackDataEXT*   pCallbackData,

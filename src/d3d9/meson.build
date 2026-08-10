@@ -228,6 +228,11 @@ d3d9_cpp_args = []
 if get_option('warvk_shadow_observers_dev')
   d3d9_cpp_args += [ '-DWARVK_ENABLE_SHADOW_OBSERVERS_DEV=1' ]
 endif
+if get_option('warvk_device_address_binding_report_dev')
+  # Keep the fixed-capacity tracker type identical across the DXVK static
+  # library and every D3D9 translation unit that includes its value snapshots.
+  d3d9_cpp_args += [ '-DWARVK_ENABLE_DEVICE_ADDRESS_BINDING_REPORT_DEV=1' ]
+endif
 
 d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
   glsl_generator.process(d3d9_shaders), d3d9_war3_gpu_skin_ff_vs, d3d9_res,
@@ -798,6 +803,7 @@ test(
 war3_dxvk_device_fault_capture_test = executable(
   'war3_dxvk_device_fault_capture_test',
   [
+    '../dxvk/dxvk_device_address_binding.cpp',
     '../dxvk/dxvk_device_fault.cpp',
     'war3/core/tests/dxvk_device_fault_capture_test.cpp',
   ],
@@ -807,6 +813,25 @@ war3_dxvk_device_fault_capture_test = executable(
 test(
   'war3_dxvk_device_fault_capture',
   war3_dxvk_device_fault_capture_test,
+  timeout : 30,
+)
+
+# Development-only bounded VK_EXT_device_address_binding_report policy. This
+# runnable does not create a Vulkan instance and tests only the lock-free ring
+# and fault-range correlation value contract.
+war3_dxvk_device_address_binding_test = executable(
+  'war3_dxvk_device_address_binding_test',
+  [
+    '../dxvk/dxvk_device_address_binding.cpp',
+    'war3/core/tests/dxvk_device_address_binding_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  cpp_args            : [ '-DWARVK_ENABLE_DEVICE_ADDRESS_BINDING_REPORT_DEV=1' ],
+  install             : false,
+)
+test(
+  'war3_dxvk_device_address_binding',
+  war3_dxvk_device_address_binding_test,
   timeout : 30,
 )
 

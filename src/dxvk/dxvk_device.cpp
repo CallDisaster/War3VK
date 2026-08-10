@@ -28,6 +28,9 @@ namespace dxvk {
                          vkd->device(), vkd->vkGetDeviceFaultInfoEXT),
     m_submissionQueue   (this, queueCallback) {
 
+    GetDxvkDeviceAddressBindingTracker().setDeviceFeatureEnabled(
+      features.extDeviceAddressBindingReport.reportAddressBinding == VK_TRUE);
+
     if (adapter->kmtLocal()) {
       D3DKMT_CREATEDEVICE create = { };
       create.hAdapter = adapter->kmtLocal();
@@ -45,6 +48,8 @@ namespace dxvk {
   
   
   DxvkDevice::~DxvkDevice() {
+    GetDxvkDeviceAddressBindingTracker().setDeviceFeatureEnabled(false);
+
     if (m_kmtLocal) {
       D3DKMT_DESTROYDEVICE destroy = { };
       destroy.hDevice = m_kmtLocal;

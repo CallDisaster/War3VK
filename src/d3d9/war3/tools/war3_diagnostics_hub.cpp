@@ -415,6 +415,20 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
       {"addressInfos", json::array()},
       {"vendorInfos", json::array()},
   };
+  const ::dxvk::DxvkDeviceAddressBindingSnapshot& addressBinding =
+      deviceFault.addressBinding;
+  const uint32_t addressBindingMatchCount = std::min(
+      addressBinding.matchCount,
+      ::dxvk::DxvkDeviceAddressBindingSnapshot::MaxMatches);
+  json addressBindingPayload = {
+      {"buildEnabled", addressBinding.buildEnabled},
+      {"messengerAvailable", addressBinding.messengerAvailable},
+      {"deviceFeatureEnabled", addressBinding.deviceFeatureEnabled},
+      {"observedEventCount", addressBinding.observedEventCount},
+      {"droppedEventCount", addressBinding.droppedEventCount},
+      {"truncated", addressBinding.truncated},
+      {"matches", json::array()},
+  };
 
   if (!deviceFault.supported) {
     deviceFaultPayload["reason"] =
@@ -447,6 +461,23 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"faultData", vendor.vendorFaultData},
     });
   }
+
+  for (uint32_t index = 0u; index < addressBindingMatchCount; ++index) {
+    const ::dxvk::DxvkDeviceAddressBindingMatch& match =
+        addressBinding.matches[index];
+    addressBindingPayload["matches"].push_back({
+        {"faultInfoIndex", match.faultInfoIndex},
+        {"sequence", match.sequence},
+        {"bindingType", static_cast<int64_t>(match.bindingType)},
+        {"flags", static_cast<uint64_t>(match.flags)},
+        {"baseAddress", match.baseAddress},
+        {"size", match.size},
+        {"objectType", static_cast<int64_t>(match.objectType)},
+        {"objectHandle", match.objectHandle},
+    });
+  }
+  deviceFaultPayload["addressBindingReport"] =
+      std::move(addressBindingPayload);
 
   json payload = {
       {"timestampMs", incident.timestampMs},

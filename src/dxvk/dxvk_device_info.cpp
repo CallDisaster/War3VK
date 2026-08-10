@@ -21,6 +21,7 @@ namespace dxvk {
     HANDLE_EXT(extCustomBorderColor);              \
     HANDLE_EXT(extDepthClipEnable);                \
     HANDLE_EXT(extDepthBiasControl);               \
+    HANDLE_EXT(extDeviceAddressBindingReport);     \
     HANDLE_EXT(extDeviceFault);                    \
     HANDLE_EXT(extDescriptorBuffer);               \
     HANDLE_EXT(extExtendedDynamicState3);          \
@@ -452,6 +453,15 @@ namespace dxvk {
 
   void DxvkDeviceCapabilities::disableUnusedFeatures(
     const DxvkInstance&               instance) {
+#if defined(WARVK_ENABLE_DEVICE_ADDRESS_BINDING_REPORT_DEV) && \
+    WARVK_ENABLE_DEVICE_ADDRESS_BINDING_REPORT_DEV
+    // VK_EXT_device_address_binding_report is delivered through a dedicated
+    // VK_EXT_debug_utils messenger. Never enable the device feature when the
+    // instance cannot receive the corresponding notifications.
+    if (!instance.extensions().extDebugUtils.specVersion)
+      m_featuresSupported.extDeviceAddressBindingReport.reportAddressBinding = VK_FALSE;
+#endif
+
     // Descriptor buffers cause perf regressions on some GPUs
     if (m_featuresSupported.extDescriptorBuffer.descriptorBuffer) {
       bool enableDescriptorBuffer = m_properties.vk12.driverID == VK_DRIVER_ID_MESA_RADV
@@ -840,6 +850,12 @@ namespace dxvk {
       ENABLE_EXT_FEATURE(extDepthBiasControl, leastRepresentableValueForceUnormRepresentation, false),
       ENABLE_EXT_FEATURE(extDepthBiasControl, floatRepresentation, false),
       ENABLE_EXT_FEATURE(extDepthBiasControl, depthBiasExact, false),
+
+#if defined(WARVK_ENABLE_DEVICE_ADDRESS_BINDING_REPORT_DEV) && \
+    WARVK_ENABLE_DEVICE_ADDRESS_BINDING_REPORT_DEV
+      /* Development-only GPU virtual address crash correlation */
+      ENABLE_EXT_FEATURE(extDeviceAddressBindingReport, reportAddressBinding, false),
+#endif
 
       /* Bounded text-only device-loss diagnostics */
       ENABLE_EXT_FEATURE(extDeviceFault, deviceFault, false),

@@ -74,6 +74,10 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   bounds provenance 授权，Unknown/Generic/Animated/Skinned 一律 fail-visible，并保留 would-cull 统计。
   该候选会增加远级联工作，尚未部署或通过低视角物理 A/B，详见
   `docs/agent-history/2026-08-09-object-bounds-fail-visible.md`。
+- 2026-08-11 的夜间高压门捕获到真实 NVIDIA `READ_INVALID` device fault；当前仅新增一个默认关闭、
+  编译期开发专用的 `VK_EXT_device_address_binding_report` 有界环，用于下一次复现时把 fault 地址关联到
+  Vulkan 对象。它尚未部署或实机取证，不能描述为 TDR 修复；详见
+  `docs/agent-history/2026-08-11-device-address-binding-fault-correlation.md`。
 - 2026-08-09 已修复 Transparent Type0 建造附件在 Stage11 被错误拒绝的问题：Type0 现在拥有常驻的
   exact CurrentDraw 边界，使用子部件身份和同帧 VB/IB/UV/完整矩阵调色板，并正确支持
   `D3DVBF_0WEIGHTS` 索引蒙皮。用户已确认不死族 UBirth 建造阴影不再闪烁；该路径没有重新开启

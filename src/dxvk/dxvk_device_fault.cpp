@@ -54,6 +54,8 @@ namespace dxvk {
       m_vendorInfoCount = std::min(counts.vendorInfoCount,
         DxvkDeviceFaultSnapshot::MaxVendorInfos);
       std::memcpy(m_description.data(), info.description, m_description.size());
+      m_addressBinding = GetDxvkDeviceAddressBindingTracker().correlate(
+        m_addressInfos.data(), m_addressInfoCount);
     } else {
       // The Vulkan contract does not require failed queries to initialize any
       // output. Do not consume input capacities or zero-filled output storage
@@ -62,6 +64,7 @@ namespace dxvk {
       m_vendorInfoCount = 0u;
       m_truncated = false;
       m_description = { };
+      m_addressBinding = GetDxvkDeviceAddressBindingTracker().metadata();
     }
 
     // Publish query errors as Complete as well. Retrying a terminal driver
@@ -80,6 +83,7 @@ namespace dxvk {
     result.captureState = state;
     result.complete = state == DxvkDeviceFaultCaptureState::Complete;
     result.vendorBinaryEnabled = false;
+    result.addressBinding = GetDxvkDeviceAddressBindingTracker().metadata();
 
     // Do not race the capture writer. Capturing is observable but returns no
     // partial text or arrays; Complete's acquire load makes the copies below
@@ -94,6 +98,7 @@ namespace dxvk {
     result.addressInfos = m_addressInfos;
     result.vendorInfoCount = m_vendorInfoCount;
     result.vendorInfos = m_vendorInfos;
+    result.addressBinding = m_addressBinding;
     return result;
   }
 
