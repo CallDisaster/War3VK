@@ -75,24 +75,47 @@ If the candidate misses any gate, Release remains on the hard cutoff and the
 result is retained only as a bounded experiment. No offline result in this
 document claims that the player-reported shimmer has been fixed.
 
-## A-B-B-A result
+## Superseded first A-B-B-A attempt
 
-The visible-desktop `Off A -> Hash B1 -> Hash B2 -> Off A2` run completed on
-Turtle Rock with 16 identical locked-sun steps per round. All four fresh game
-processes completed without device loss, Arena/replay failure or an incomplete
-directional publication. The aggregate image metrics were:
+The first artifact at
+`AutoTest/artifacts/shadow_alpha_coverage_abba/20260811_020854` is not valid
+physical evidence. The scene was paused and the runner did not prove that the
+directional shadow map had been republished after each locked-sun command.
+Repeated captures could therefore compare an old depth publication against new
+settings. Its percentages must not be used for promotion or rejection.
 
-- hard-cutoff edge-toggle p95 mean: `0.243596`;
-- hashed edge-toggle p95 mean: `0.241909`;
-- relative improvement: `0.6926%`;
-- dark-coverage ratio: `1.000210`;
-- fine-edge-length ratio: `0.997996`.
+## Publication-qualified A-B-B-A result
 
-Coverage was preserved, but the edge-toggle improvement is far below the 40%
-promotion gate. `alphaShadowHashed` therefore remains Release-default Off and
-this candidate is retained only as a bounded negative experiment. The result
-narrows the next investigation toward CSM projection/texel-grid stability and
-receiver sampling of sub-texel silhouettes; it does not justify changing the
-alpha contract or claiming that Issue #4 is visually fixed.
+The corrected runner leaves the producer live and requires
+`shadowMapRenderSerial` to increase after every sun step before recording the
+image. The visible-desktop `Off A -> Hash B1 -> Hash B2 -> Off A2` run completed
+on Turtle Rock with 12 publication-qualified steps per round. All four fresh
+processes completed without device loss or a directional publication timeout.
+The aggregate metrics were:
 
-Artifact: `AutoTest/artifacts/shadow_alpha_coverage_abba/20260811_020854`.
+- hard-cutoff edge-toggle p95 mean: `0.329167`;
+- hashed edge-toggle p95 mean: `0.330205`;
+- relative improvement: `-0.3153%`;
+- dark-coverage ratio: `0.999980`;
+- fine-edge-length ratio: `0.999327`.
+
+The candidate preserves coverage but does not reduce this scene's temporal edge
+change. `alphaShadowHashed` therefore remains Release-default Off. This is a
+bounded negative experiment, not proof that hashed alpha is universally
+ineffective and not proof that Issue #4 is visually fixed. The sun-step metric
+also includes legitimate physical shadow movement, so it can reject a candidate
+that demonstrably fails to improve the result but cannot by itself identify all
+sources of player-visible shimmer.
+
+Artifact: `AutoTest/artifacts/shadow_alpha_coverage_abba/20260811_023543`.
+
+## Receiver-filter control
+
+The same publication-qualified harness compared the Release Poisson16 kernel
+at radius `0.70` against the existing Grid5x5 kernel at the same radius. Grid5x5
+made edge-toggle p95 `5.54%` worse and increased measured fine-edge length by
+`9.47%`; it therefore also failed the image gate. This rules out blindly
+expanding the existing PCF support as a safe default and avoids treating added
+blur as temporal stability.
+
+Artifact: `AutoTest/artifacts/shadow_filter_abba/20260811_023947`.

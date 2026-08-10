@@ -2,8 +2,9 @@
 """Visible-desktop A-B-B-A gate for directional alpha-cutout shadow coverage.
 
 The runner owns every War3 process it launches. It uses only the internal test
-pipe after startup, freezes simulation, fixes the camera and steps a locked sun
-through the same sequence for hard-cutoff and hashed-coverage processes.
+pipe after startup, fixes the camera and steps a locked sun through the same
+sequence for hard-cutoff and hashed-coverage processes. Every recorded image
+must be paired with a newly published directional shadow map.
 It never enables an isolated desktop and never deploys a DLL.
 """
 
@@ -164,16 +165,40 @@ def launch_round(
     hashed: bool,
     sun_steps: int,
     settle_sec: float,
+    environment_overrides: Dict[str, str] | None = None,
+    candidate_enabled: bool | None = None,
+    pause_simulation: bool = False,
+    camera_config: Dict[str, float] | None = None,
+    full_map_visibility: bool = False,
+    publication_timeout_sec: float = 4.0,
 ) -> Dict[str, Any]:
+    camera = {
+        "targetX": 0.0,
+        "targetY": 0.0,
+        "targetDistance": 1200.0,
+        "angleOfAttack": 328.0,
+        "rotation": 90.0,
+        "fieldOfView": 70.0,
+        "farZ": 3000.0,
+        "roll": 0.0,
+        "zOffset": 0.0,
+        "duration": 0.0,
+        "quickPosition": True,
+    }
+    if camera_config:
+        camera.update(camera_config)
     env = {
         "DXVK_WAR3_SHADOW_ALPHA_HASH": "1" if hashed else "0",
         "DXVK_WAR3_SHADOW_TAA_MODE": "0",
+        "DXVK_WAR3_CSM_CONTINUITY_TRACE": "1",
         "DXVK_WAR3_RUNTIME_BENCHMARK": "1",
         "DXVK_WAR3_RUNTIME_BENCHMARK_WARMUP_SEC": "1",
         "DXVK_WAR3_RUNTIME_BENCHMARK_SAMPLE_SEC": str(
             max(20, int(math.ceil(sun_steps * settle_sec + 12.0)))
         ),
     }
+    if environment_overrides:
+        env.update(environment_overrides)
     events_before = war3._query_windows_gpu_events()
     event_keys = {war3._gpu_event_identity(row) for row in events_before}
     log_offsets = war3._snapshot_log_offsets(war3_dir)
@@ -219,6 +244,11 @@ def launch_round(
     row: Dict[str, Any] = {
         "label": label,
         "hashed": bool(hashed),
+        "candidateEnabled": (
+            bool(hashed) if candidate_enabled is None else bool(candidate_enabled)
+        ),
+        "camera": camera,
+        "fullMapVisibility": bool(full_map_visibility),
         "environment": env,
         "launch": launch,
         "frames": [],
@@ -236,27 +266,13 @@ def launch_round(
     failure = ""
     try:
         camera_before = invoke(pid, root, "camera.snapshot", {})
-        for command, payload in (
-            ("visibility.full_map", {"enabled": True}),
-            ("game.pause", {"paused": True}),
-            ("shadow.debug_mode", {"mode": 2}),
-            (
-                "camera.apply",
-                {
-                    "targetX": 0.0,
-                    "targetY": 0.0,
-                    "targetDistance": 1650.0,
-                    "angleOfAttack": 328.0,
-                    "rotation": 90.0,
-                    "fieldOfView": 70.0,
-                    "farZ": 5000.0,
-                    "roll": 0.0,
-                    "zOffset": 0.0,
-                    "duration": 0.0,
-                    "quickPosition": True,
-                },
-            ),
-        ):
+        setup_commands = [("shadow.debug_mode", {"mode": 2})]
+        if full_map_visibility:
+            setup_commands.insert(0, ("visibility.full_map", {"enabled": True}))
+        setup_commands.append(("camera.apply", camera))
+        if pause_simulation:
+            setup_commands.insert(1, ("game.pause", {"paused": True}))
+        for command, payload in setup_commands:
             reply = invoke(pid, root, command, payload)
             row.setdefault("setup", []).append(
                 {"command": command, "ok": bool(reply.get("ok")), "reply": reply}
@@ -265,6 +281,22 @@ def launch_round(
                 failure = f"setup failed: {command}"
                 break
         time.sleep(0.5)
+
+        preflight_path = round_dir / "_preflight.bmp"
+        preflight = war3._capture_final_frame_via_internal_test_api(
+            pid=pid,
+            war3_dir=root,
+            output_path=preflight_path,
+            timeout_sec=8.0,
+        )
+        row["preflightCapture"] = preflight
+        previous_render_serial = int(
+            dict(dict(preflight.get("details", {}) or {}).get("result", {}) or {})
+            .get("shadowMapRenderSerial", 0)
+            or 0
+        )
+        if not preflight.get("ok") or previous_render_serial <= 0:
+            failure = "preflight did not observe a published shadow map"
 
         for index in range(sun_steps):
             if failure:
@@ -279,20 +311,41 @@ def launch_round(
             if not sun.get("ok"):
                 failure = "sun lock failed"
                 break
-            time.sleep(max(0.05, settle_sec))
             output = round_dir / f"{index:03d}_{time01:.6f}.bmp"
-            capture = war3._capture_final_frame_via_internal_test_api(
-                pid=pid,
-                war3_dir=root,
-                output_path=output,
-                timeout_sec=8.0,
+            deadline = time.monotonic() + max(
+                0.5, min(10.0, float(publication_timeout_sec))
             )
+            capture: Dict[str, Any] = {}
+            observed_render_serial = previous_render_serial
+            publication_polls = 0
+            time.sleep(max(0.05, settle_sec))
+            while time.monotonic() < deadline:
+                publication_polls += 1
+                capture = war3._capture_final_frame_via_internal_test_api(
+                    pid=pid,
+                    war3_dir=root,
+                    output_path=output,
+                    timeout_sec=8.0,
+                )
+                observed_render_serial = int(
+                    dict(
+                        dict(capture.get("details", {}) or {}).get("result", {})
+                        or {}
+                    ).get("shadowMapRenderSerial", 0)
+                    or 0
+                )
+                if capture.get("ok") and observed_render_serial > previous_render_serial:
+                    break
+                time.sleep(0.05)
             status = war3._read_runtime_status_best_effort(pid) or {}
             row["frames"].append(
                 {
                     "index": index,
                     "time01": time01,
                     "capture": capture,
+                    "publicationPolls": publication_polls,
+                    "previousShadowMapRenderSerial": previous_render_serial,
+                    "observedShadowMapRenderSerial": observed_render_serial,
                     "output": str(output),
                     "runtimeStatus": status,
                 }
@@ -300,6 +353,10 @@ def launch_round(
             if not capture.get("ok"):
                 failure = "internal framebuffer capture failed"
                 break
+            if observed_render_serial <= previous_render_serial:
+                failure = "shadow map publication timed out after sun step"
+                break
+            previous_render_serial = observed_render_serial
             if war3._runtime_status_device_lost(status):
                 failure = "runtime status reported device lost"
                 break
@@ -307,8 +364,10 @@ def launch_round(
         if war3._pid_alive(pid):
             invoke(pid, root, "shadow.debug_mode", {"mode": 0})
             invoke(pid, root, "shadow.lock_sun", {"enabled": False, "time01": 0.5})
-            invoke(pid, root, "game.pause", {"paused": False})
-            invoke(pid, root, "visibility.full_map", {"enabled": False})
+            if pause_simulation:
+                invoke(pid, root, "game.pause", {"paused": False})
+            if full_map_visibility:
+                invoke(pid, root, "visibility.full_map", {"enabled": False})
             snapshot = dict(camera_before.get("result", {}) or {})
             if snapshot:
                 snapshot["duration"] = 0.0
@@ -334,6 +393,28 @@ def launch_round(
         if bool(dict(frame.get("capture", {}) or {}).get("ok"))
     ]
     row["metrics"] = sequence_metrics(paths) if len(paths) >= 2 else {}
+    render_serials = [
+        int(
+            dict(
+                dict(dict(frame.get("capture", {}) or {}).get("details", {}) or {})
+                .get("result", {})
+                or {}
+            ).get("shadowMapRenderSerial", 0)
+            or 0
+        )
+        for frame in row["frames"]
+    ]
+    row["shadowMapRenderSerials"] = render_serials
+    row["shadowMapPublicationAdvanced"] = bool(
+        len(render_serials) == sun_steps
+        and all(serial > 0 for serial in render_serials)
+        and all(
+            render_serials[index] > render_serials[index - 1]
+            for index in range(1, len(render_serials))
+        )
+    )
+    if not failure and not row["shadowMapPublicationAdvanced"]:
+        failure = "shadow map publication did not advance for every sun step"
     row["newGpuEvents"] = new_events
     row["logSummary"] = log_summary
     device_lost = bool(
@@ -342,7 +423,12 @@ def launch_round(
         or "device lost" in failure.lower()
     )
     row.update(
-        ok=not failure and not device_lost and len(paths) == sun_steps,
+        ok=(
+            not failure
+            and not device_lost
+            and len(paths) == sun_steps
+            and row["shadowMapPublicationAdvanced"]
+        ),
         stage="done" if not failure and not device_lost else "failed",
         failureReason=failure,
         deviceLost=device_lost,
@@ -352,11 +438,13 @@ def launch_round(
 
 
 def aggregate(rounds: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    def selected(hashed: bool, field: str) -> List[float]:
+    def selected(candidate_enabled: bool, field: str) -> List[float]:
         return [
             float(dict(row.get("metrics", {}) or {}).get(field, 0.0) or 0.0)
             for row in rounds
-            if bool(row.get("ok")) and bool(row.get("hashed")) == hashed
+            if bool(row.get("ok"))
+            and bool(row.get("candidateEnabled", row.get("hashed")))
+            == candidate_enabled
         ]
 
     off_toggle = selected(False, "edgeToggleP95")
@@ -412,6 +500,19 @@ def main() -> int:
     parser.add_argument("--map", dest="map_path", type=Path, default=DEFAULT_MAP)
     parser.add_argument("--sun-steps", type=int, default=24)
     parser.add_argument("--settle-sec", type=float, default=0.18)
+    parser.add_argument("--target-x", type=float, default=0.0)
+    parser.add_argument("--target-y", type=float, default=0.0)
+    parser.add_argument("--target-distance", type=float, default=1200.0)
+    parser.add_argument("--angle-of-attack", type=float, default=328.0)
+    parser.add_argument("--rotation", type=float, default=90.0)
+    parser.add_argument("--far-z", type=float, default=3000.0)
+    parser.add_argument("--full-map-visibility", action="store_true")
+    parser.add_argument(
+        "--single-round",
+        choices=("off", "on"),
+        default="",
+        help="Run one diagnostic round instead of the default A-B-B-A gate.",
+    )
     args = parser.parse_args()
 
     if not args.map_path.is_file():
@@ -428,11 +529,29 @@ def main() -> int:
         "war3Dir": str(args.war3_dir),
         "sunSteps": max(8, min(64, int(args.sun_steps))),
         "settleSec": max(0.05, min(1.0, float(args.settle_sec))),
-        "sequence": ["off-a", "on-b1", "on-b2", "off-a2"],
+        "camera": {
+            "targetX": float(args.target_x),
+            "targetY": float(args.target_y),
+            "targetDistance": float(args.target_distance),
+            "angleOfAttack": float(args.angle_of_attack),
+            "rotation": float(args.rotation),
+            "farZ": float(args.far_z),
+        },
+        "fullMapVisibility": bool(args.full_map_visibility),
+        "sequence": (
+            [f"single-{args.single_round}"]
+            if args.single_round
+            else ["off-a", "on-b1", "on-b2", "off-a2"]
+        ),
         "rounds": [],
     }
-    for label, hashed in (("off-a", False), ("on-b1", True),
-                          ("on-b2", True), ("off-a2", False)):
+    round_modes = (
+        [(f"single-{args.single_round}", args.single_round == "on")]
+        if args.single_round
+        else [("off-a", False), ("on-b1", True),
+              ("on-b2", True), ("off-a2", False)]
+    )
+    for label, hashed in round_modes:
         row = launch_round(
             war3_dir=args.war3_dir,
             map_path=args.map_path,
@@ -441,6 +560,8 @@ def main() -> int:
             hashed=hashed,
             sun_steps=result["sunSteps"],
             settle_sec=result["settleSec"],
+            camera_config=result["camera"],
+            full_map_visibility=result["fullMapVisibility"],
         )
         result["rounds"].append(row)
         (artifact_dir / "partial_result.json").write_text(
@@ -451,7 +572,11 @@ def main() -> int:
             break
 
     result["aggregate"] = aggregate(result["rounds"])
-    result["ok"] = bool(result["aggregate"].get("roundsComplete"))
+    result["ok"] = (
+        bool(result["rounds"]) and bool(result["rounds"][0].get("ok"))
+        if args.single_round
+        else bool(result["aggregate"].get("roundsComplete"))
+    )
     result_path = artifact_dir / "shadow_alpha_coverage_abba_result.json"
     result_path.write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
