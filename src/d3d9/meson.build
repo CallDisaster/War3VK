@@ -224,6 +224,11 @@ endif
 lib_dwmapi = cpp.find_library('dwmapi')
 lib_dbghelp = cpp.find_library('dbghelp')
 
+d3d9_cpp_args = []
+if get_option('warvk_shadow_observers_dev')
+  d3d9_cpp_args += [ '-DWARVK_ENABLE_SHADOW_OBSERVERS_DEV=1' ]
+endif
+
 d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
   glsl_generator.process(d3d9_shaders), d3d9_war3_gpu_skin_ff_vs, d3d9_res,
   dependencies        : [ dxso_dep, dxvk_dep, imgui_dep, lib_dwmapi, lib_dbghelp ],
@@ -232,6 +237,7 @@ d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src,
   vs_module_defs      : 'd3d9'+def_spec_ext,
   link_args           : d3d9_ld_args,
   link_depends        : [ d3d9_link_depends ],
+  cpp_args            : d3d9_cpp_args,
   kwargs              : dxvk_so_version,
 )
 
@@ -343,6 +349,41 @@ war3_shadow_receiver_numeric_contract_test = executable(
 test(
   'war3_shadow_receiver_numeric_contract',
   war3_shadow_receiver_numeric_contract_test,
+  timeout : 30,
+)
+
+# Release and development policy tests are separate pure executables. The
+# production DLL only receives the development macro through the explicit
+# Meson option above; neither policy can return Consume.
+war3_shadow_observer_build_policy_release_test = executable(
+  'war3_shadow_observer_build_policy_release_test',
+  [
+    'war3/render/tests/war3_shadow_observer_build_policy_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_observer_build_policy_release',
+  war3_shadow_observer_build_policy_release_test,
+  timeout : 30,
+)
+
+war3_shadow_observer_build_policy_dev_test = executable(
+  'war3_shadow_observer_build_policy_dev_test',
+  [
+    'war3/render/tests/war3_shadow_observer_build_policy_test.cpp',
+  ],
+  cpp_args            : [
+    '-DWARVK_ENABLE_SHADOW_OBSERVERS_DEV=1',
+    '-DWARVK_EXPECT_SHADOW_OBSERVERS_DEV=1',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_observer_build_policy_dev',
+  war3_shadow_observer_build_policy_dev_test,
   timeout : 30,
 )
 

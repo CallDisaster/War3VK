@@ -19,10 +19,14 @@ class TerrainBoundsCullContracts(unittest.TestCase):
             self.assertIn(token, policy)
         device = DEVICE.read_text(encoding="utf-8")
         shadow = SHADOW.read_text(encoding="utf-8")
-        for content in (device, shadow):
-            self.assertIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", content)
-            self.assertIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", content)
-            self.assertIn("War3TerrainBoundsCullMode::Off", content)
+        self.assertIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", device)
+        self.assertIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", device)
+        self.assertIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", shadow)
+        self.assertIn("War3TerrainBoundsCullMode::Off", shadow)
+        runtime = shadow.split("War3TerrainBoundsCullModeRuntime", 1)[1].split(
+            "War3ShadowTaaMode", 1
+        )[0]
+        self.assertNotIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", runtime)
 
     def test_only_exact_current_bounds_can_authorize_culling(self) -> None:
         policy = POLICY.read_text(encoding="utf-8")

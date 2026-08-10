@@ -9,6 +9,7 @@
 #include "war3/render/war3_hybrid_ray_tracing.h"
 #include "war3/render/war3_shadow_lifecycle.h"
 #include "war3/render/war3_shadow_alpha_cascade_contract.h"
+#include "war3/render/war3_shadow_observer_build_policy.h"
 #include "war3/render/war3_shadow_producer_policy.h"
 #include "war3/render/war3_shadow_replay_validation.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
@@ -639,31 +640,24 @@ int EnvIntOverride(const char* name, int minValue, int maxValue) {
 }
 
 war3::render::War3UnionVisibilityMode War3UnionCullModeRuntime() {
-  if constexpr (war3::internal::kReleaseFreezeExperimentalShadowRoutes)
+  if constexpr (!war3::render::kDevelopmentShadowObserversEnabled)
     return war3::render::War3UnionVisibilityMode::Off;
-  static const auto mode = static_cast<war3::render::War3UnionVisibilityMode>(
-      std::min<uint32_t>(
-          EnvU32Default("DXVK_WAR3_UNION_CONSUMER_CULL_MODE", 0u), 2u));
-  return mode;
+  static const auto mode = war3::render::ParseShadowObserverBuildMode(
+      EnvU32Default("DXVK_WAR3_UNION_CONSUMER_CULL_MODE", 0u));
+  return mode == war3::render::War3ShadowObserverBuildMode::Observe
+      ? war3::render::War3UnionVisibilityMode::Observe
+      : war3::render::War3UnionVisibilityMode::Off;
 }
 
 war3::render::War3TerrainBoundsCullMode
 War3TerrainBoundsCullModeRuntime() {
-  if constexpr (war3::internal::kReleaseFreezeExperimentalShadowRoutes)
+  if constexpr (!war3::render::kDevelopmentShadowObserversEnabled)
     return war3::render::War3TerrainBoundsCullMode::Off;
-  static const auto mode = [] {
-    const std::string explicitMode =
-        env::getEnvVar("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE");
-    if (!explicitMode.empty()) {
-      return static_cast<war3::render::War3TerrainBoundsCullMode>(
-          std::min<uint32_t>(
-              EnvU32Default("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", 0u), 2u));
-    }
-    return EnvFlagDefault("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", false)
-        ? war3::render::War3TerrainBoundsCullMode::Consume
-        : war3::render::War3TerrainBoundsCullMode::Off;
-  }();
-  return mode;
+  static const auto mode = war3::render::ParseShadowObserverBuildMode(
+      EnvU32Default("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", 0u));
+  return mode == war3::render::War3ShadowObserverBuildMode::Observe
+      ? war3::render::War3TerrainBoundsCullMode::Observe
+      : war3::render::War3TerrainBoundsCullMode::Off;
 }
 
 War3ShadowTaaMode ResolveShadowTaaRequestedMode(
