@@ -591,6 +591,12 @@ private:
 
         uint64_t framesObserved = 0;
         uint64_t framesIncomplete = 0;
+        uint64_t framesProducerIncomplete = 0;
+        uint64_t producerRequiredCasterOmissionCount = 0;
+        uint64_t producerExactBudgetDeferredUniqueCasterCount = 0;
+        uint64_t drawTimeVBCacheStaticProtectedBytesLast = 0;
+        uint64_t drawTimeVBCacheStaticOverCapBytesLast = 0;
+        uint64_t drawTimeVBCacheStaticEvictedBytes = 0;
         uint64_t framesBudgetExceeded = 0;
         uint64_t framesReuseLastComplete = 0;
         uint64_t framesRenderCurrentPartial = 0;

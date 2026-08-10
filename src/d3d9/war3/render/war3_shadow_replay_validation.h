@@ -37,6 +37,8 @@ enum class War3ShadowReplayRejectReason : uint32_t {
   GpuSkinSourceRangeOutOfBounds,
   GpuSkinPaletteRangeOutOfBounds,
   IncompleteReplayPlan,
+  ProducerIncomplete,
+  ProducerStampMismatch,
   Count,
 };
 

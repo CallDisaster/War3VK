@@ -1234,6 +1234,21 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.stage13ReplayDrawCount +=
       stats.semanticSceneStage13ReplayDrawCount;
   agg.framesBudgetExceeded += stats.budgetExceeded != 0 ? 1u : 0u;
+  const bool producerIncomplete = stats.producerCompletenessSealed != 0u &&
+      (stats.producerRequiredCasterOmissionCount != 0u ||
+       stats.producerCompletenessCounterOverflow != 0u);
+  agg.framesIncomplete += producerIncomplete ? 1u : 0u;
+  agg.framesProducerIncomplete += producerIncomplete ? 1u : 0u;
+  agg.producerRequiredCasterOmissionCount +=
+      stats.producerRequiredCasterOmissionCount;
+  agg.producerExactBudgetDeferredUniqueCasterCount +=
+      stats.producerExactBudgetDeferredUniqueCasterCount;
+  agg.drawTimeVBCacheStaticProtectedBytesLast =
+      stats.drawTimeVBCacheStaticProtectedBytes;
+  agg.drawTimeVBCacheStaticOverCapBytesLast =
+      stats.drawTimeVBCacheStaticOverCapBytes;
+  agg.drawTimeVBCacheStaticEvictedBytes +=
+      stats.drawTimeVBCacheStaticEvictedBytes;
   agg.totalBudgetBytes += stats.fallbackBudgetBytes;
   agg.totalUsedBytes += stats.fallbackBudgetUsedBytes;
   agg.maxBudgetBytes =
@@ -5771,6 +5786,18 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
   json << "  \"shadowBudgetSummary\": {\n";
   json << "    \"framesObserved\": " << shadowAgg.framesObserved << ",\n";
   json << "    \"framesIncomplete\": " << shadowAgg.framesIncomplete << ",\n";
+  json << "    \"framesProducerIncomplete\": "
+       << shadowAgg.framesProducerIncomplete << ",\n";
+  json << "    \"producerRequiredCasterOmissionCount\": "
+       << shadowAgg.producerRequiredCasterOmissionCount << ",\n";
+  json << "    \"producerExactBudgetDeferredUniqueCasterCount\": "
+       << shadowAgg.producerExactBudgetDeferredUniqueCasterCount << ",\n";
+  json << "    \"drawTimeVBCacheStaticProtectedBytesLast\": "
+       << shadowAgg.drawTimeVBCacheStaticProtectedBytesLast << ",\n";
+  json << "    \"drawTimeVBCacheStaticOverCapBytesLast\": "
+       << shadowAgg.drawTimeVBCacheStaticOverCapBytesLast << ",\n";
+  json << "    \"drawTimeVBCacheStaticEvictedBytes\": "
+       << shadowAgg.drawTimeVBCacheStaticEvictedBytes << ",\n";
   json << "    \"framesBudgetExceeded\": " << shadowAgg.framesBudgetExceeded
        << ",\n";
   json << "    \"framesReuseLastComplete\": "

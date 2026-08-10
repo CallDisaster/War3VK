@@ -352,6 +352,20 @@ test(
   timeout : 30,
 )
 
+war3_shadow_producer_completeness_policy_test = executable(
+  'war3_shadow_producer_completeness_policy_test',
+  [
+    'war3/render/tests/war3_shadow_producer_completeness_policy_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_producer_completeness_policy',
+  war3_shadow_producer_completeness_policy_test,
+  timeout : 30,
+)
+
 # Release and development policy tests are separate pure executables. The
 # production DLL only receives the development macro through the explicit
 # Meson option above; neither policy can return Consume.

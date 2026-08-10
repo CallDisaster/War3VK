@@ -2734,6 +2734,13 @@ private:
   std::unordered_set<War3DrawTimeVBCacheKey, War3DrawTimeVBCacheKeyHash>
       m_war3DrawTimeExactRejectedKeys;
   uint64_t m_war3DrawTimeExactRejectedFrameSerial = 0u;
+  // Producer completeness is intentionally independent from the exact reject
+  // owner set above: blocker/transparent fail-closed rejections protect
+  // representation ownership, but do not by themselves prove a required
+  // caster was omitted.
+  std::unordered_set<War3DrawTimeVBCacheKey, War3DrawTimeVBCacheKeyHash>
+      m_war3RequiredCasterOmissionKeys;
+  uint64_t m_war3RequiredCasterOmissionFrameSerial = 0u;
   // Short-lived terminal witnesses for the verified anonymous 4v/6i marker
   // only. The value is the last exact-proof frame. This weaker slice identity
   // exists solely to stop a prior CurrentDraw/Grace representation from
@@ -2742,6 +2749,7 @@ private:
                      War3DrawTimeAnonymousMarkerSliceKeyHash>
       m_war3DrawTimeAnonymousMarkerRejectedSlices;
   uint64_t m_war3DrawTimeVBCacheLastCleanFrame = 0u;
+  uint64_t m_war3DrawTimeVBCacheStaticOverCapFrameCount = 0u;
   // S1 地形 legacy capture 分帧复用：period>1 时 off 帧注入上一批 stash，
   // 避免每帧数千 tile 全量 freeze（实测 ~6ms/帧）。
   std::vector<War3ShadowCasterDraw> m_war3S1TerrainCasterStash;
@@ -2936,6 +2944,15 @@ private:
       bool fromStalePoseRestore);
   void War3MarkDrawTimeExactRejectedCurrentFrame(
       const War3DrawTimeVBCacheKey& key);
+  void War3RecordRequiredCasterOmission(
+      const War3DrawTimeVBCacheKey& key,
+      War3RequiredCasterOmissionReason reason);
+  void War3RecordRequiredCasterOmission(
+      War3RequiredCasterOmissionReason reason);
+  void War3SealShadowProducerCompleteness(War3FrameScene& scene,
+                                          uint64_t frameSerial,
+                                          uint64_t mapEpoch,
+                                          uint64_t deviceEpoch) const;
   bool War3DrawTimeExactRejectedCurrentFrame(
       const War3DrawTimeVBCacheKey& key) const;
   void War3RememberDrawTimeAnonymousMarkerRejection(

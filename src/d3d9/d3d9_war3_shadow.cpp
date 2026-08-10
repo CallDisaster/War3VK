@@ -3290,6 +3290,8 @@ bool War3ShadowReceiverPass::renderVolumeSunShadow(
     const std::vector<const War3ShadowCasterDraw*>* replayDraws) {
   if (!ctx || !input.settings || !replayDraws || replayDraws->empty())
     return false;
+  if (!validateShadowProducerCompleteness(input, "volume-sun"))
+    return false;
   if (!input.scene.worldCamera.valid || m_csmData.cascadeCount == 0u)
     return false;
 
@@ -3444,6 +3446,47 @@ bool War3ShadowReceiverPass::renderVolumeSunShadow(
   m_volumeSunPublishedFrameSerial = input.frameSerial;
   m_volumeSunShadowReady = true;
   return true;
+}
+
+bool War3ShadowReceiverPass::validateShadowProducerCompleteness(
+    const War3PipelineInput& input, const char* consumer) {
+  (void)consumer;
+  const auto& completeness = input.scene.producerCompleteness;
+  if (completeness.accepts(input.frameSerial, input.mapEpoch,
+                           input.deviceEpoch)) {
+    return true;
+  }
+
+  const bool stampMatches = completeness.sealed &&
+      completeness.sealFrameSerial == input.frameSerial &&
+      completeness.mapEpoch == input.mapEpoch &&
+      completeness.deviceEpoch == input.deviceEpoch;
+  const auto reason = stampMatches
+      ? war3::render::War3ShadowReplayRejectReason::ProducerIncomplete
+      : war3::render::War3ShadowReplayRejectReason::ProducerStampMismatch;
+  ++reconciliation.replayValidationRejectedCount;
+  ++reconciliation.replayPartialPreventedCount;
+  reconciliation.replayValidationLastReason =
+      static_cast<uint32_t>(reason);
+  reconciliation.replayValidationLastDrawMapEpoch = completeness.mapEpoch;
+  reconciliation.replayValidationLastExpectedMapEpoch = input.mapEpoch;
+  reconciliation.replayValidationLastRequiredEnd =
+      completeness.requiredCasterOmissionCount;
+  reconciliation.replayValidationLastAvailableSize = completeness.reasonMask;
+  g_shadowReplayDiagnostics.validationRejectCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  g_shadowReplayDiagnostics.partialPreventedCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  g_shadowReplayDiagnostics.lastRejectReason.store(
+      static_cast<uint32_t>(reason), std::memory_order_release);
+  g_shadowReplayDiagnostics.lastOffenderMapEpoch.store(
+      completeness.mapEpoch, std::memory_order_release);
+  g_shadowReplayDiagnostics.lastRequiredEnd.store(
+      completeness.requiredCasterOmissionCount, std::memory_order_release);
+  g_shadowReplayDiagnostics.lastAvailableSize.store(
+      completeness.reasonMask, std::memory_order_release);
+  m_replayValidationFailedThisFrame = true;
+  return false;
 }
 
 bool War3ShadowReceiverPass::validateShadowReplayDraws(
@@ -3732,6 +3775,10 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         0u, std::memory_order_release);
   }
   m_replayValidationFailedThisFrame = false;
+  if (!validateShadowProducerCompleteness(
+          input, m_volumeSunRenderPathActive ? "volume-sun" : "csm")) {
+    return false;
+  }
   if (!validateShadowReplayDraws(input, replayDraws,
                                  m_volumeSunRenderPathActive
                                      ? "volume-sun"
@@ -6840,6 +6887,11 @@ void War3ShadowReceiverPass::beginPointShadowCpuPrepare(
     const War3PipelineInput &input,
     const War3PointLightFrameSnapshot &lightSnapshot,
     const std::vector<const War3ShadowCasterDraw *> *replayDraws) {
+  if (!validateShadowProducerCompleteness(input, "point-shadow-prepare")) {
+    resetPointShadowCpuPlanPreservingCapacity();
+    m_pointShadowCpuPlan.failed = true;
+    return;
+  }
   waitPointShadowCpuPrepare();
   resetPointShadowCpuPlanPreservingCapacity();
   // Name the attempted snapshot before std::async. If launch or worker
@@ -7427,6 +7479,10 @@ void War3ShadowReceiverPass::renderPointShadow(
     const Rc<DxvkCommandList> &ctx, const War3PipelineInput &input,
     const War3PointLightFrameSnapshot &lightSnapshot,
     const std::vector<const War3ShadowCasterDraw *> *replayDrawsOverride) {
+  if (!validateShadowProducerCompleteness(input, "point-shadow")) {
+    invalidatePointShadowPublishedState();
+    return;
+  }
   std::vector<const war3::render::War3TrackedVkPipeline*>
       trackedCasterPipelines;
   const auto trackCasterPipeline = [&] (const ShadowCasterPipeline& pipeline) {
@@ -10702,7 +10758,11 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     } else {
       auto perfScope = war3::War3PerfMonitor::instance().scope("ShadowMap", ctx);
       const bool renderedShadowMap = renderShadowMap(ctx, input, &replayDraws);
-      if (renderedShadowMap) {
+      const bool producerComplete = input.scene.producerCompleteness.accepts(
+          input.frameSerial, input.mapEpoch, input.deviceEpoch);
+      if (renderedShadowMap && producerComplete &&
+          !m_replayValidationFailedThisFrame &&
+          !m_workloadGovernorRejectedThisFrame) {
         directionalMapResolvedForFrame = true;
         m_semanticCoverageDropHoldStreak = 0u;
         m_hasCompleteShadowMap = true;

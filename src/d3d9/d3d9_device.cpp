@@ -19,6 +19,7 @@
 #include "war3/render/war3_render_state.h"
 #include "war3/render/war3_renderer.h"
 #include "war3/render/war3_shadow_capture_frontend.h"
+#include "war3/render/war3_shadow_drawtime_cache_policy.h"
 #include "war3/render/war3_shadow_lifecycle.h"
 #include "war3/render/war3_shadow_object_registry.h"
 #include "war3/render/war3_shadow_producer_policy.h"
@@ -19085,6 +19086,12 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
         categoryHistogram[categoryBin]++;
     }
   }
+  // The pre-receiver runtime publication and the later move into
+  // War3PipelineInput must carry the same producer stamp.  An unsealed scene
+  // is deliberately not interpreted as a complete empty caster set.
+  War3SealShadowProducerCompleteness(
+      m_war3Scene, m_war3ShadowPersistentFrameSerial + 1u,
+      m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch);
   dxvk::war3::render::NoteShadowSceneStats(m_war3Scene.shadowStats);
 
   static uint32_t s_casterDiag = 0;
@@ -19173,6 +19180,8 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   input.frameSerial = pipelineFrameSerial;
   input.mapEpoch = m_war3GpuSkinMapEpoch;
   input.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+  War3SealShadowProducerCompleteness(input.scene, input.frameSerial,
+                                     input.mapEpoch, input.deviceEpoch);
 
   EmitCs([this, cInput = std::move(input)](DxvkContext *ctx) mutable {
     Rc<DxvkCommandList> cmd;
@@ -23642,6 +23651,86 @@ void D3D9DeviceEx::War3MarkDrawTimeExactRejectedCurrentFrame(
   m_war3DrawTimeExactRejectedKeys.insert(key);
 }
 
+void D3D9DeviceEx::War3RecordRequiredCasterOmission(
+    const War3DrawTimeVBCacheKey& key,
+    War3RequiredCasterOmissionReason reason) {
+  if (m_war3RequiredCasterOmissionFrameSerial !=
+      m_war3ShadowPersistentFrameSerial) {
+    m_war3RequiredCasterOmissionKeys.clear();
+    m_war3RequiredCasterOmissionFrameSerial =
+        m_war3ShadowPersistentFrameSerial;
+  }
+  const bool uniqueCaster =
+      m_war3RequiredCasterOmissionKeys.insert(key).second;
+  auto& completeness = m_war3Scene.producerCompleteness;
+  completeness.note(reason, uniqueCaster);
+  if (reason == War3RequiredCasterOmissionReason::PositionAllocBudget ||
+      reason == War3RequiredCasterOmissionReason::UvAllocBudget ||
+      reason == War3RequiredCasterOmissionReason::IndexAllocBudget) {
+    if (uniqueCaster)
+      completeness.noteExactBudgetDeferredUniqueCaster();
+  }
+  auto& stats = m_war3Scene.shadowStats;
+  stats.producerRequiredCasterOmissionCount =
+      completeness.requiredCasterOmissionCount;
+  stats.producerExactBudgetDeferredUniqueCasterCount =
+      completeness.exactBudgetDeferredUniqueCasterCount;
+  stats.producerPositionAllocBudgetCount = completeness.positionAllocBudgetCount;
+  stats.producerUvAllocBudgetCount = completeness.uvAllocBudgetCount;
+  stats.producerIndexAllocBudgetCount = completeness.indexAllocBudgetCount;
+  stats.producerAllocationFailureCount = completeness.allocationFailureCount;
+  stats.producerFallbackByteBudgetCount = completeness.fallbackByteBudgetCount;
+  stats.producerArenaAdmissionCount = completeness.arenaAdmissionCount;
+  stats.producerFreezeFailureCount = completeness.freezeFailureCount;
+  stats.producerCompletenessReasonMask = completeness.reasonMask;
+  stats.producerCompletenessCounterOverflow =
+      completeness.counterOverflow ? 1u : 0u;
+}
+
+void D3D9DeviceEx::War3RecordRequiredCasterOmission(
+    War3RequiredCasterOmissionReason reason) {
+  auto& completeness = m_war3Scene.producerCompleteness;
+  completeness.note(reason, true);
+  auto& stats = m_war3Scene.shadowStats;
+  stats.producerRequiredCasterOmissionCount =
+      completeness.requiredCasterOmissionCount;
+  stats.producerExactBudgetDeferredUniqueCasterCount =
+      completeness.exactBudgetDeferredUniqueCasterCount;
+  stats.producerPositionAllocBudgetCount = completeness.positionAllocBudgetCount;
+  stats.producerUvAllocBudgetCount = completeness.uvAllocBudgetCount;
+  stats.producerIndexAllocBudgetCount = completeness.indexAllocBudgetCount;
+  stats.producerAllocationFailureCount = completeness.allocationFailureCount;
+  stats.producerFallbackByteBudgetCount = completeness.fallbackByteBudgetCount;
+  stats.producerArenaAdmissionCount = completeness.arenaAdmissionCount;
+  stats.producerFreezeFailureCount = completeness.freezeFailureCount;
+  stats.producerCompletenessReasonMask = completeness.reasonMask;
+  stats.producerCompletenessCounterOverflow =
+      completeness.counterOverflow ? 1u : 0u;
+}
+
+void D3D9DeviceEx::War3SealShadowProducerCompleteness(
+    War3FrameScene& scene, uint64_t frameSerial, uint64_t mapEpoch,
+    uint64_t deviceEpoch) const {
+  scene.producerCompleteness.seal(frameSerial, mapEpoch, deviceEpoch);
+  auto& stats = scene.shadowStats;
+  const auto& completeness = scene.producerCompleteness;
+  stats.producerCompletenessSealed = 1u;
+  stats.producerCompletenessCounterOverflow =
+      completeness.counterOverflow ? 1u : 0u;
+  stats.producerCompletenessReasonMask = completeness.reasonMask;
+  stats.producerRequiredCasterOmissionCount =
+      completeness.requiredCasterOmissionCount;
+  stats.producerExactBudgetDeferredUniqueCasterCount =
+      completeness.exactBudgetDeferredUniqueCasterCount;
+  stats.producerPositionAllocBudgetCount = completeness.positionAllocBudgetCount;
+  stats.producerUvAllocBudgetCount = completeness.uvAllocBudgetCount;
+  stats.producerIndexAllocBudgetCount = completeness.indexAllocBudgetCount;
+  stats.producerAllocationFailureCount = completeness.allocationFailureCount;
+  stats.producerFallbackByteBudgetCount = completeness.fallbackByteBudgetCount;
+  stats.producerArenaAdmissionCount = completeness.arenaAdmissionCount;
+  stats.producerFreezeFailureCount = completeness.freezeFailureCount;
+}
+
 bool D3D9DeviceEx::War3DrawTimeExactRejectedCurrentFrame(
     const War3DrawTimeVBCacheKey& key) const {
   return m_war3DrawTimeExactRejectedFrameSerial ==
@@ -24582,6 +24671,9 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3SemanticDirectCasterContracts.clear();
   m_war3DrawTimeExactRejectedKeys.clear();
   m_war3DrawTimeExactRejectedFrameSerial =
+      m_war3ShadowPersistentFrameSerial;
+  m_war3RequiredCasterOmissionKeys.clear();
+  m_war3RequiredCasterOmissionFrameSerial =
       m_war3ShadowPersistentFrameSerial;
   m_war3DrawTimeAnonymousMarkerRejectedSlices.clear();
   m_war3S1TerrainEarlyKeysByPersistentGeometryId.clear();
@@ -33976,6 +34068,10 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     const uint64_t staticMaxIdle =
         dxvk::war3::internal::kShadowDrawTimeVBCacheStaticMaxIdleFrames;
     uint64_t staticBytesLive = 0u;
+    uint64_t staticBytesProtected = 0u;
+    uint64_t staticBytesInactive = 0u;
+    uint64_t evictedEntries = 0u;
+    uint64_t evictedBytes = 0u;
     for (auto it = m_war3DrawTimeVBCache.begin();
          it != m_war3DrawTimeVBCache.end();) {
       const auto &e = it->second;
@@ -33986,10 +34082,18 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
                 ? (m_war3ShadowPersistentFrameSerial - e.lastAccessFrameSerial)
                 : 0u;
         if (idleAge > staticMaxIdle) {
+          evictedEntries++;
+          evictedBytes += e.ownedGpuBytes;
           it = m_war3DrawTimeVBCache.erase(it);
           continue;
         }
         staticBytesLive += e.ownedGpuBytes;
+        if (war3::render::IsWar3ShadowDrawTimeStaticWorkingSetProtected(
+                e.lastAccessFrameSerial, m_war3ShadowPersistentFrameSerial)) {
+          staticBytesProtected += e.ownedGpuBytes;
+        } else {
+          staticBytesInactive += e.ownedGpuBytes;
+        }
         ++it;
       } else {
         // 动态对象：保持原 16 帧 TTL 淘汰。
@@ -34001,18 +34105,44 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       }
     }
 
-    // 静态常驻字节上限 LRU：超过上限时回收最久未访问（lastAccessFrameSerial
-    // 最小）的静态 entry，直到回到上限以下。
+    // The fixed 64 MiB is a target for inactive static residency, not a hard
+    // cap on the current Stage11 working set.  Evict only non-protected
+    // entries so visible trees cannot be cyclically evicted and then delayed
+    // behind the 32-allocation gate on the next camera update.
     const uint64_t staticCap =
         dxvk::war3::internal::kShadowDrawTimeVBCacheStaticPersistMaxBytes;
-    while (staticBytesLive > staticCap) {
+    const auto stableKeyLess = [] (const War3DrawTimeVBCacheKey& a,
+                                   const War3DrawTimeVBCacheKey& b) {
+      const auto pa = reinterpret_cast<uintptr_t>(a.instanceIdentity);
+      const auto pb = reinterpret_cast<uintptr_t>(b.instanceIdentity);
+      if (a.mapEpoch != b.mapEpoch) return a.mapEpoch < b.mapEpoch;
+      if (pa != pb) return pa < pb;
+      const auto ma = reinterpret_cast<uintptr_t>(a.meshPayloadPtr);
+      const auto mb = reinterpret_cast<uintptr_t>(b.meshPayloadPtr);
+      if (ma != mb) return ma < mb;
+      const auto ra = reinterpret_cast<uintptr_t>(a.renderablePart);
+      const auto rb = reinterpret_cast<uintptr_t>(b.renderablePart);
+      if (ra != rb) return ra < rb;
+      if (a.jHandle != b.jHandle) return a.jHandle < b.jHandle;
+      if (a.layerIndex != b.layerIndex) return a.layerIndex < b.layerIndex;
+      if (a.payloadWord108 != b.payloadWord108)
+        return a.payloadWord108 < b.payloadWord108;
+      return a.payloadWord11C < b.payloadWord11C;
+    };
+    while (staticBytesInactive > staticCap) {
       auto victim = m_war3DrawTimeVBCache.end();
       uint64_t oldestAccess = UINT64_MAX;
       for (auto it = m_war3DrawTimeVBCache.begin();
            it != m_war3DrawTimeVBCache.end(); ++it) {
-        if (!it->second.isStaticGeometry)
+        if (!it->second.isStaticGeometry ||
+            war3::render::IsWar3ShadowDrawTimeStaticWorkingSetProtected(
+                it->second.lastAccessFrameSerial,
+                m_war3ShadowPersistentFrameSerial))
           continue;
-        if (it->second.lastAccessFrameSerial < oldestAccess) {
+        if (it->second.lastAccessFrameSerial < oldestAccess ||
+            (it->second.lastAccessFrameSerial == oldestAccess &&
+             (victim == m_war3DrawTimeVBCache.end() ||
+              stableKeyLess(it->first, victim->first)))) {
           oldestAccess = it->second.lastAccessFrameSerial;
           victim = it;
         }
@@ -34020,8 +34150,25 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       if (victim == m_war3DrawTimeVBCache.end())
         break;
       staticBytesLive -= victim->second.ownedGpuBytes;
+      staticBytesInactive -= victim->second.ownedGpuBytes;
+      evictedEntries++;
+      evictedBytes += victim->second.ownedGpuBytes;
       m_war3DrawTimeVBCache.erase(victim);
     }
+    const uint64_t overCapBytes =
+        war3::render::War3ShadowDrawTimeStaticOverCapBytes(
+            staticBytesLive, staticCap);
+    if (overCapBytes != 0u)
+      ++m_war3DrawTimeVBCacheStaticOverCapFrameCount;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticLiveBytes = staticBytesLive;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticProtectedBytes =
+        staticBytesProtected;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticOverCapBytes = overCapBytes;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticOverCapFrameCount =
+        m_war3DrawTimeVBCacheStaticOverCapFrameCount;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticEvictedBytes = evictedBytes;
+    m_war3Scene.shadowStats.drawTimeVBCacheStaticEvictedEntryCount =
+        evictedEntries;
     }
   }
   {
@@ -42813,6 +42960,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             // backing while allocation is deferred.
             entry.positionInfo = {};
             War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::PositionAllocBudget);
             break;
           }
         }
@@ -42842,6 +42992,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
              entry.positionCapacity < posBytes)) {
           entry.positionInfo = {};
           War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+          if (needsNewPositionBuffer) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::AllocationFailure);
+          }
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoBuffer++;
           break;
         }
@@ -42876,6 +43031,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         entry.uvOffset = 0u;
         entry.uvFormat = VK_FORMAT_UNDEFINED;
         entry.uvSharesPositionBuffer = false;
+        bool mandatoryUvBudgetDeferred = false;
+        bool mandatoryUvAllocationFailed = false;
         const bool gpuSkinOutputHasUv = gpuSkinSemanticOutputHasUv;
         if (gpuSkinSemanticDirectOnly && gpuSkinOutputHasUv) {
           const auto directLayout =
@@ -42989,12 +43146,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     // 才是真正的卡点）。如果预算耗尽就保留 entry 现有 uvBuffer
                     // 状态（可能是 nullptr → 下游 alpha-test 暂时不可用，但
                     // position 已经 ready，可以照常画硬阴影）。
-                    if (dxvk::war3::internal::
+                      if (dxvk::war3::internal::
                             kShadowDrawTimeVBCacheAllocBudgetEnabled &&
                         m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
                             dxvk::war3::internal::
-                                kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
+                          kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
                       m_war3DrawTimeVBCacheBudgetDeferredCount++;
+                      mandatoryUvBudgetDeferred = true;
                     } else {
                     DxvkBufferCreateInfo uvCi = {};
                     uvCi.size = War3AlignPersistentBytes(uvBytes);
@@ -43014,6 +43172,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                       m_war3Scene.shadowStats.drawTimeVBCacheUvAllocCount++;
                       // Phase 7.123：扣 UV alloc 预算。
                       m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
+                    } else {
+                      mandatoryUvAllocationFailed = true;
                     }
                     } // end Phase 7.123 budget else
                     }
@@ -43053,6 +43213,15 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           // degrade to an opaque rectangle or escape through a generic lane.
           entry.captureComplete = false;
           War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+          if (mandatoryUvBudgetDeferred) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::UvAllocBudget);
+          } else if (mandatoryUvAllocationFailed) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::AllocationFailure);
+          }
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoSlice++;
           break;
         }
@@ -43065,6 +43234,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // command sequence without reading write-combined memory or pinning a
         // frame allocator chunk. Indices are never rebased.
         bool idxOk = false;
+        bool indexBudgetDeferred = false;
+        bool indexAllocationFailed = false;
         if (indexed && drawTimeIndexSlice.buffer() != nullptr) {
           const VkDeviceSize idxSrcOffset =
               drawTimeIndexSlice.offset() + drawTimeIndexRangeOffset;
@@ -43083,6 +43254,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                       dxvk::war3::internal::
                           kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
                 m_war3DrawTimeVBCacheBudgetDeferredCount++;
+                indexBudgetDeferred = true;
               } else {
                 DxvkBufferCreateInfo idxInfoCi = {};
                 idxInfoCi.size = War3AlignPersistentBytes(idxBytes);
@@ -43101,6 +43273,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   m_war3Scene.shadowStats.drawTimeVBCacheIndexAllocCount++;
                   // Phase 7.123：扣 IB alloc 预算。
                   m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
+                } else {
+                  indexAllocationFailed = true;
                 }
               } // end Phase 7.123 budget else
             }
@@ -43140,6 +43314,15 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.indexCount = 0u;
           entry.captureComplete = false;
           War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
+          if (indexBudgetDeferred) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::IndexAllocBudget);
+          } else if (indexAllocationFailed) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::AllocationFailure);
+          }
           m_war3Scene.shadowStats.drawTimeVBCacheRejectIncompleteIndex++;
           break;
         }
@@ -47742,6 +47925,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
   if (overWorldFreezeCountCap || overUnitFreezeCountCap) {
     m_war3Scene.shadowStats.skippedCasterCap++;
+    War3RecordRequiredCasterOmission(
+        War3RequiredCasterOmissionReason::FreezeFailure);
     m_war3Scene.shadowStats.fallbackBudgetBytes =
         m_war3ShadowFallbackBudgetCapBytes;
     m_war3Scene.shadowStats.fallbackBudgetUsedBytes =
@@ -47796,6 +47981,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     m_war3Scene.shadowStats.degradedAlphaBudget++;
     m_war3Scene.shadowStats.skippedAlphaTest++;
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    War3RecordRequiredCasterOmission(
+        War3RequiredCasterOmissionReason::FallbackByteBudget);
     m_war3ShadowFallbackBudgetExceeded = true;
     return;
   }
@@ -47806,6 +47993,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     else
       m_war3Scene.shadowStats.skippedPriorityBudget++;
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    War3RecordRequiredCasterOmission(
+        predictedFallbackBytes > budgetPolicy.hardBudgetBytes
+            ? War3RequiredCasterOmissionReason::FallbackByteBudget
+            : War3RequiredCasterOmissionReason::FreezeFailure);
     m_war3Scene.shadowStats.fallbackBudgetBytes =
         m_war3ShadowFallbackBudgetCapBytes;
     m_war3Scene.shadowStats.fallbackBudgetUsedBytes =
@@ -48224,6 +48415,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
   if (freezePlanInvalid) {
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    War3RecordRequiredCasterOmission(
+        War3RequiredCasterOmissionReason::FreezeFailure);
     m_war3ShadowFallbackBudgetExceeded = true;
     return;
   }
@@ -48234,6 +48427,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   std::array<VkDeviceSize, 4> snapshotOffset = {};
   dxvk::war3::memory::ShadowArenaBundleTransaction arenaTransaction = {};
   bool arenaTransactionActive = false;
+  bool arenaAdmissionRejected = false;
   if (freezePlanCount != 0u && arenaCaptureEnabled) {
     std::array<dxvk::war3::memory::ShadowArenaBundleRequest, 4> requests = {};
     for (uint32_t i = 0u; i < freezePlanCount; ++i) {
@@ -48258,6 +48452,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       }
     } else {
       freezePlanInvalid = true;
+      arenaAdmissionRejected = true;
+      // Arena admission is all-or-nothing for this caster bundle.
+      War3RecordRequiredCasterOmission(
+          War3RequiredCasterOmissionReason::ArenaAdmission);
     }
   } else if (freezePlanCount != 0u) {
     for (uint32_t i = 0u; i < freezePlanCount; ++i) {
@@ -48297,6 +48495,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     if (arenaTransactionActive)
       dxvk::war3::memory::ShadowArena_RollbackBundle(arenaTransaction);
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    // The Arena path recorded admission above; source/snapshot failures are
+    // separately observable as a freeze failure.
+    if (!arenaTransactionActive && !arenaAdmissionRejected) {
+      War3RecordRequiredCasterOmission(
+          War3RequiredCasterOmissionReason::FreezeFailure);
+    }
     m_war3ShadowFallbackBudgetExceeded = true;
     return;
   }
@@ -48304,6 +48508,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   if (arenaTransactionActive &&
       !dxvk::war3::memory::ShadowArena_CommitBundle(arenaTransaction)) {
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    War3RecordRequiredCasterOmission(
+        War3RequiredCasterOmissionReason::ArenaAdmission);
     m_war3ShadowFallbackBudgetExceeded = true;
     return;
   }
@@ -48374,6 +48580,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       (shouldFreezeIndexBuffer &&
        (idxAlloc == nullptr || idxInfo.buffer == VK_NULL_HANDLE))) {
     m_war3Scene.shadowStats.budgetExceeded = 1u;
+    War3RecordRequiredCasterOmission(
+        War3RequiredCasterOmissionReason::FreezeFailure);
     m_war3ShadowFallbackBudgetExceeded = true;
     return;
   }

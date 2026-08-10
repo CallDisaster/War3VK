@@ -2045,6 +2045,42 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCacheConsumeHitCount
      << ",\"drawTimeVBCacheConsumeMissCount\":"
      << stats.drawTimeVBCacheConsumeMissCount
+     << ",\"producerCompletenessSealed\":"
+     << stats.producerCompletenessSealed
+     << ",\"producerRequiredCasterOmissionCount\":"
+     << stats.producerRequiredCasterOmissionCount
+     << ",\"producerExactBudgetDeferredUniqueCasterCount\":"
+     << stats.producerExactBudgetDeferredUniqueCasterCount
+     << ",\"producerPositionAllocBudgetCount\":"
+     << stats.producerPositionAllocBudgetCount
+     << ",\"producerUvAllocBudgetCount\":"
+     << stats.producerUvAllocBudgetCount
+     << ",\"producerIndexAllocBudgetCount\":"
+     << stats.producerIndexAllocBudgetCount
+     << ",\"producerAllocationFailureCount\":"
+     << stats.producerAllocationFailureCount
+     << ",\"producerFallbackByteBudgetCount\":"
+     << stats.producerFallbackByteBudgetCount
+     << ",\"producerArenaAdmissionCount\":"
+     << stats.producerArenaAdmissionCount
+     << ",\"producerFreezeFailureCount\":"
+     << stats.producerFreezeFailureCount
+     << ",\"producerCompletenessReasonMask\":"
+     << stats.producerCompletenessReasonMask
+     << ",\"producerCompletenessCounterOverflow\":"
+     << stats.producerCompletenessCounterOverflow
+     << ",\"drawTimeVBCacheStaticLiveBytes\":"
+     << stats.drawTimeVBCacheStaticLiveBytes
+     << ",\"drawTimeVBCacheStaticProtectedBytes\":"
+     << stats.drawTimeVBCacheStaticProtectedBytes
+     << ",\"drawTimeVBCacheStaticOverCapBytes\":"
+     << stats.drawTimeVBCacheStaticOverCapBytes
+     << ",\"drawTimeVBCacheStaticOverCapFrameCount\":"
+     << stats.drawTimeVBCacheStaticOverCapFrameCount
+     << ",\"drawTimeVBCacheStaticEvictedBytes\":"
+     << stats.drawTimeVBCacheStaticEvictedBytes
+     << ",\"drawTimeVBCacheStaticEvictedEntryCount\":"
+     << stats.drawTimeVBCacheStaticEvictedEntryCount
      << ",\"drawTimeSemanticProducerVisibleCandidateCount\":"
      << stats.drawTimeSemanticProducerVisibleCandidateCount
      << ",\"drawTimeSemanticProducerFreshEntryCount\":"

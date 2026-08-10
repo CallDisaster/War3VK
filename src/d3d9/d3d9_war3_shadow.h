@@ -1152,6 +1152,8 @@ namespace dxvk {
             const War3PipelineInput& input,
             const std::vector<const War3ShadowCasterDraw*>& replayDraws,
             const char* consumer);
+        bool validateShadowProducerCompleteness(
+            const War3PipelineInput& input, const char* consumer);
         /**
          * @brief 渲染体积专用太阳 ortho 深度（单层 texture2DArray）。
          * @note 复用本帧 replay draws 与矩阵 SSBO；不改表面 CSM 资源。

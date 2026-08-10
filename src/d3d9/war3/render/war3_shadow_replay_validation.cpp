@@ -278,7 +278,8 @@ const char* War3ShadowReplayRejectReasonName(
       "stale-gpu-skin-map-epoch", "stale-gpu-skin-device-epoch",
       "gpu-skin-source-range-out-of-bounds",
       "gpu-skin-palette-range-out-of-bounds",
-      "incomplete-replay-plan"};
+      "incomplete-replay-plan", "producer-incomplete",
+      "producer-stamp-mismatch"};
   const uint32_t index = static_cast<uint32_t>(reason);
   return index < static_cast<uint32_t>(War3ShadowReplayRejectReason::Count)
       ? kNames[index]

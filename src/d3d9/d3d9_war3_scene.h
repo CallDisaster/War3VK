@@ -13,6 +13,7 @@
 #include <array>
 #include <vector>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 namespace dxvk {
@@ -402,6 +403,98 @@ namespace dxvk {
         uint32_t evictedThisFrame = 0;
     };
 
+    // This is deliberately a producer-owned, value-only contract.  A replay
+    // list can be internally valid while a required Stage11 caster never made
+    // it into that list because exact backing admission was deferred.  The
+    // consumer must therefore validate this seal before it is allowed to
+    // clear or publish a new shadow target.
+    enum class War3RequiredCasterOmissionReason : uint32_t {
+        PositionAllocBudget = 1u << 0u,
+        UvAllocBudget = 1u << 1u,
+        IndexAllocBudget = 1u << 2u,
+        AllocationFailure = 1u << 3u,
+        FallbackByteBudget = 1u << 4u,
+        ArenaAdmission = 1u << 5u,
+        FreezeFailure = 1u << 6u,
+    };
+
+    inline constexpr uint64_t War3SaturatingAddU64(uint64_t value,
+                                                    uint64_t increment,
+                                                    bool& overflow) noexcept {
+      if (std::numeric_limits<uint64_t>::max() - value < increment) {
+        overflow = true;
+        return std::numeric_limits<uint64_t>::max();
+      }
+      return value + increment;
+    }
+
+    struct War3ShadowProducerCompleteness {
+        // Default-unsealed is intentionally not a complete empty scene.
+        bool sealed = false;
+        bool counterOverflow = false;
+        uint64_t sealFrameSerial = 0u;
+        uint64_t mapEpoch = 0u;
+        uint64_t deviceEpoch = 0u;
+        uint32_t reasonMask = 0u;
+        uint64_t requiredCasterOmissionCount = 0u;
+        uint64_t exactBudgetDeferredUniqueCasterCount = 0u;
+        uint64_t positionAllocBudgetCount = 0u;
+        uint64_t uvAllocBudgetCount = 0u;
+        uint64_t indexAllocBudgetCount = 0u;
+        uint64_t allocationFailureCount = 0u;
+        uint64_t fallbackByteBudgetCount = 0u;
+        uint64_t arenaAdmissionCount = 0u;
+        uint64_t freezeFailureCount = 0u;
+
+        void note(War3RequiredCasterOmissionReason reason,
+                  bool uniqueCaster) noexcept {
+          reasonMask |= static_cast<uint32_t>(reason);
+          uint64_t* counter = nullptr;
+          switch (reason) {
+          case War3RequiredCasterOmissionReason::PositionAllocBudget:
+            counter = &positionAllocBudgetCount; break;
+          case War3RequiredCasterOmissionReason::UvAllocBudget:
+            counter = &uvAllocBudgetCount; break;
+          case War3RequiredCasterOmissionReason::IndexAllocBudget:
+            counter = &indexAllocBudgetCount; break;
+          case War3RequiredCasterOmissionReason::AllocationFailure:
+            counter = &allocationFailureCount; break;
+          case War3RequiredCasterOmissionReason::FallbackByteBudget:
+            counter = &fallbackByteBudgetCount; break;
+          case War3RequiredCasterOmissionReason::ArenaAdmission:
+            counter = &arenaAdmissionCount; break;
+          case War3RequiredCasterOmissionReason::FreezeFailure:
+            counter = &freezeFailureCount; break;
+          }
+          *counter = War3SaturatingAddU64(*counter, 1u, counterOverflow);
+          if (uniqueCaster) {
+            requiredCasterOmissionCount = War3SaturatingAddU64(
+                requiredCasterOmissionCount, 1u, counterOverflow);
+          }
+        }
+
+        void noteExactBudgetDeferredUniqueCaster() noexcept {
+          exactBudgetDeferredUniqueCasterCount = War3SaturatingAddU64(
+              exactBudgetDeferredUniqueCasterCount, 1u, counterOverflow);
+        }
+
+        void seal(uint64_t frameSerial, uint64_t newMapEpoch,
+                  uint64_t newDeviceEpoch) noexcept {
+          sealFrameSerial = frameSerial;
+          mapEpoch = newMapEpoch;
+          deviceEpoch = newDeviceEpoch;
+          sealed = true;
+        }
+
+        bool accepts(uint64_t frameSerial, uint64_t expectedMapEpoch,
+                     uint64_t expectedDeviceEpoch) const noexcept {
+          return sealed && !counterOverflow &&
+              sealFrameSerial == frameSerial && mapEpoch == expectedMapEpoch &&
+              deviceEpoch == expectedDeviceEpoch &&
+              requiredCasterOmissionCount == 0u;
+        }
+    };
+
     struct War3ShadowCaptureStats {
         uint32_t considered = 0;
         uint32_t captured = 0;
@@ -583,6 +676,27 @@ namespace dxvk {
         uint32_t drawTimeVBCacheCaptureCount = 0;
         uint32_t drawTimeVBCacheConsumeHitCount = 0;
         uint32_t drawTimeVBCacheConsumeMissCount = 0;
+        // Producer-completeness diagnostics.  They mirror the scene-owned
+        // seal so runtime reports can explain fail-closed publication without
+        // treating generic transparent/blocker rejects as missing casters.
+        uint64_t producerRequiredCasterOmissionCount = 0u;
+        uint64_t producerExactBudgetDeferredUniqueCasterCount = 0u;
+        uint64_t producerPositionAllocBudgetCount = 0u;
+        uint64_t producerUvAllocBudgetCount = 0u;
+        uint64_t producerIndexAllocBudgetCount = 0u;
+        uint64_t producerAllocationFailureCount = 0u;
+        uint64_t producerFallbackByteBudgetCount = 0u;
+        uint64_t producerArenaAdmissionCount = 0u;
+        uint64_t producerFreezeFailureCount = 0u;
+        uint32_t producerCompletenessReasonMask = 0u;
+        uint32_t producerCompletenessSealed = 0u;
+        uint32_t producerCompletenessCounterOverflow = 0u;
+        uint64_t drawTimeVBCacheStaticLiveBytes = 0u;
+        uint64_t drawTimeVBCacheStaticProtectedBytes = 0u;
+        uint64_t drawTimeVBCacheStaticOverCapBytes = 0u;
+        uint64_t drawTimeVBCacheStaticOverCapFrameCount = 0u;
+        uint64_t drawTimeVBCacheStaticEvictedBytes = 0u;
+        uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0u;
         // Phase 7.55 v4：诊断 capture path 早退原因
         uint32_t drawTimeVBCacheRejectNoRenderablePart = 0;
         // A renderable part may contain several independent layers. Capturing
@@ -1342,6 +1456,7 @@ namespace dxvk {
     struct War3FrameScene {
         War3WorldCameraState worldCamera;
         War3ShadowCaptureStats shadowStats;
+        War3ShadowProducerCompleteness producerCompleteness;
         War3ShadowPersistentGeometryPool shadowPersistentPool;
         std::vector<War3ShadowMatrixPalette> shadowPalettes;
         std::vector<War3ShadowInstanceRef> shadowInstances;
