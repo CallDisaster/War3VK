@@ -115,6 +115,9 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
 - 2026-08-10 的 Issue #5 observer build policy 候选保持正式 DLL 的 terrain/union observer 永远 Off；
   仅独立 `warvk_shadow_observers_dev=true` 开发构建可用环境值 `1` 收集 Observe，`2` 仍为 Off，不能授权
   Consume 或部署发布。
+- 2026-08-11 的本地候选补齐 S1 persistent/early-hit 与 Stage10 的 exact terrain bounds 来源：indexed
+  draw 只接受当前 IB 扫描域，persistent local bounds 由不可变 geometry generation 拥有；Release 仍 Off，
+  尚待 10,000 帧开发 Observe 门，详见 `docs/agent-history/2026-08-11-issue5-exact-terrain-bounds-provenance.md`。
 - Issue #6 已先闭合两个确定的跨地图 CPU 身份泄漏：caster tombstone 现在按 map epoch 隔离，且
   旧相机、per-draw upload、RT/DS fallback 会在 Present 安全点重置；显式禁用 producer stage 的
   进程级策略仍跨地图保留。该阶段仅通过离线合同和 Win32 runnable，尚未部署或完成 A→B→A

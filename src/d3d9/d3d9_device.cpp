@@ -24,6 +24,7 @@
 #include "war3/render/war3_shadow_object_registry.h"
 #include "war3/render/war3_shadow_producer_policy.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
+#include "war3/render/war3_terrain_bounds_provenance.h"
 #include "war3/render/war3_upper_layer_shadow.h"
 #include "war3/render/war3_visible_renderables.h"
 #include "war3/render/war3_canonical_draw.h"
@@ -20796,10 +20797,22 @@ bool D3D9DeviceEx::War3CreateShadowPersistentGeometryAfterMiss(
     }
   }
 
+  const uint32_t geometryId = m_war3NextShadowGeometryId++;
   War3ShadowPersistentGeometry stored = candidate;
   stored.key = key;
   stored.totalBytes = bytesNeeded;
   stored.lastSeenFrame = m_war3ShadowPersistentFrameSerial;
+  if (stored.localBoundsIdentityProven &&
+      stored.localBoundsRadius > 0.0f &&
+      std::isfinite(stored.localBoundsRadius)) {
+    // The persistent allocation is immutable after insertion. Its registry
+    // generation, not the transient upload/ring generation, owns the cached
+    // local-bounds proof used by later S1 cache hits.
+    stored.localBoundsSourceGeneration = uint64_t(geometryId);
+  } else {
+    stored.localBoundsSourceGeneration = 0u;
+    stored.localBoundsIdentityProven = false;
+  }
 
   if (uploads[0].bytes > 0) {
     if (!War3CreateShadowPersistentBuffer(uploads[0], stored.positionStorage,
@@ -20827,7 +20840,6 @@ bool D3D9DeviceEx::War3CreateShadowPersistentGeometryAfterMiss(
     }
   }
 
-  const uint32_t geometryId = m_war3NextShadowGeometryId++;
   War3ShadowPersistentGeometryEntry entry = {};
   entry.key = key;
   entry.geometry = std::move(stored);
@@ -43866,6 +43878,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     auto earlyIt = m_war3S1TerrainEarlyCache.find(s1EarlyKey);
     if (earlyIt != m_war3S1TerrainEarlyCache.end()) {
       bool backingValid = true;
+      const War3ShadowPersistentGeometry* earlyPersistentGeometry = nullptr;
       if (earlyIt->second.sourceFingerprint != s1SourceFingerprint) {
         // early key 碰撞（identity world + 相同顶点数的不同 tile）或 VB 指针
         // 复用：冻结内容不属于本 draw，重放会画出另一块地形并让本块缺失。
@@ -43894,6 +43907,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               m_war3ShadowPersistentFrameSerial;
           backingIt->second.geometry.lastSeenFrame =
               m_war3ShadowPersistentFrameSerial;
+          earlyPersistentGeometry = &backingIt->second.geometry;
         }
       }
 
@@ -43913,6 +43927,36 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         hitDraw.worldMatrix = s1World;
         hitDraw.category = War3RenderState::StageCategory::Terrain;
         hitDraw.stage = 1;
+        // The cached draw's world-space sphere and frame stamp belong to the
+        // insertion frame. Refresh them from the registry-owned immutable
+        // local bounds and this draw's current transform. If that proof is not
+        // present, remove culling authority instead of replaying stale bounds.
+        if (earlyPersistentGeometry != nullptr &&
+            earlyPersistentGeometry->localBoundsIdentityProven &&
+            earlyPersistentGeometry->localBoundsSourceGeneration != 0u &&
+            earlyPersistentGeometry->localBoundsRadius > 0.0f &&
+            std::isfinite(earlyPersistentGeometry->localBoundsRadius)) {
+          War3ApplySemanticBoundsFromMatrix(
+              hitDraw, hitDraw.worldMatrix,
+              earlyPersistentGeometry->localBoundsCenter,
+              earlyPersistentGeometry->localBoundsRadius);
+          hitDraw.boundsProvenance = dxvk::war3::render::
+              War3ShadowBoundsProvenance::ExactLocalGeoset;
+          hitDraw.boundsSourceGeneration =
+              earlyPersistentGeometry->localBoundsSourceGeneration;
+          hitDraw.boundsFrameSerial =
+              m_war3ShadowPersistentFrameSerial + 1u;
+          hitDraw.boundsIdentityProven = true;
+          hitDraw.boundsSourceWasSkinned = false;
+          hitDraw.boundsFrameLocalDynamic = false;
+          hitDraw.boundsAnimatedAttachment = false;
+        } else {
+          hitDraw.boundsProvenance = dxvk::war3::render::
+              War3ShadowBoundsProvenance::Unknown;
+          hitDraw.boundsSourceGeneration = 0u;
+          hitDraw.boundsFrameSerial = 0u;
+          hitDraw.boundsIdentityProven = false;
+        }
         earlyIt->second.lastSeenFrame = m_war3ShadowPersistentFrameSerial;
 
         auto& persistentDiagnostics =
@@ -45807,6 +45851,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   uint32_t exactIndexedFreezeMinIndex = 0u;
   uint32_t exactIndexedFreezeMaxIndex = 0u;
   bool exactIndexedFreezeRebased = false;
+  // The domain proof is useful even when the position range already spans the
+  // complete buffer and no rebasing is necessary. Keep it separate from the
+  // freeze optimization so bounds never fall back to D3D9's Min/Num hint.
+  uint32_t exactIndexedDomainFirstVertex = 0u;
+  uint32_t exactIndexedDomainVertexCount = 0u;
+  bool exactIndexedDomainKnown = false;
   thread_local std::vector<uint8_t> s_exactRebasedIndexScratch;
   s_exactRebasedIndexScratch.clear();
   // Both per-draw SYSTEMMEM uploads and ordinary D3DUSAGE_DYNAMIC position
@@ -45911,6 +45961,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 int64_t(std::numeric_limits<int32_t>::min()) &&
             adjustedVertexOffset <=
                 int64_t(std::numeric_limits<int32_t>::max());
+        if (end <= positionCapacity64 &&
+            first <= uint64_t(std::numeric_limits<uint32_t>::max()) &&
+            count <= uint64_t(std::numeric_limits<uint32_t>::max()) &&
+            count != 0u) {
+          exactIndexedDomainFirstVertex = uint32_t(first);
+          exactIndexedDomainVertexCount = uint32_t(count);
+          exactIndexedDomainKnown = true;
+        }
         if (allStreamsFit && blendBinding == 1u) {
           allStreamsFit = blendStride != 0u &&
               end <= uint64_t(blendInfo.size / blendStride);
@@ -47368,6 +47426,78 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       candidate.numVertices = indexed ? NumVertices : CountVal;
       candidate.uvBinding = persistentUvBinding;
 
+      // S1 can return through the persistent path before the legacy bounds
+      // block below. Compute its local bounds on the miss that creates the
+      // immutable geometry, using only the exact current index domain and a
+      // generation-validated CPU-readable position span. Cache hits reuse the
+      // bounds owned by that immutable geometry, never D3D9's Min/Num hint.
+      if (s1TerrainPersistentPath &&
+          dxvk::war3::internal::kShadowCascadeCullTerrainWithBounds &&
+          War3TerrainBoundsCullModeRuntime() !=
+              dxvk::war3::render::War3TerrainBoundsCullMode::Off) {
+        const auto boundsRange =
+            dxvk::war3::render::War3ResolveTerrainBoundsVertexRange(
+                indexed, StartVal, CountVal, exactIndexedDomainKnown,
+                exactIndexedDomainFirstVertex,
+                exactIndexedDomainVertexCount);
+        Rc<DxvkResourceAllocation> mappedAllocation = nullptr;
+        dxvk::war3::memory::War3CpuReadableBufferSpan positionSpan = {};
+        const bool upSourceExact =
+            DynamicSysmemVBOs && posStream < caps::MaxStreams &&
+            m_war3PerDrawUpload.vbSourceValid[posStream] &&
+            m_war3PerDrawUpload.vbSourceResource[posStream] ==
+                reinterpret_cast<uintptr_t>(vbCommon) &&
+            m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream] != 0u &&
+            m_war3PerDrawUpload.vbSourceSequence[posStream] != 0u &&
+            m_war3PerDrawUpload.vbSourceContentGeneration[posStream] != 0u &&
+            m_war3PerDrawUpload.vbUploadBytes[posStream] != nullptr &&
+            m_war3PerDrawUpload.vbUploadLength[posStream] != 0u;
+        if (upSourceExact) {
+          positionSpan = dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+              m_war3PerDrawUpload.vbUploadBytes[posStream],
+              m_war3PerDrawUpload.vbUploadLength[posStream], 0u,
+              m_war3PerDrawUpload.vbUploadLength[posStream],
+              m_war3PerDrawUpload.vbSourceResource[posStream],
+              m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream],
+              m_war3PerDrawUpload.vbSourceSequence[posStream],
+              m_war3PerDrawUpload.vbSourceContentGeneration[posStream], true});
+        } else if (!DynamicSysmemVBOs && vbCommon != nullptr &&
+                   !vbCommon->NeedsReadback()) {
+          mappedAllocation = vbCommon->GetMappedSlice();
+          if (mappedAllocation != nullptr) {
+            const auto allocationInfo = mappedAllocation->getBufferInfo();
+            const bool hostVisible =
+                (mappedAllocation->getMemoryProperties() &
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+            positionSpan =
+                dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+                    mappedAllocation->mapPtr(), uint64_t(allocationInfo.size),
+                    uint64_t(posSlice.offset()), uint64_t(posSlice.length()),
+                    reinterpret_cast<uintptr_t>(vbCommon),
+                    vbCommon->War3IdentityGeneration(),
+                    vbCommon->War3MapAllocationGeneration(),
+                    vbCommon->War3ContentGeneration(), hostVisible});
+          }
+        }
+
+        War3LocalGeometryBounds localBounds = {};
+        if (boundsRange.exact && positionSpan &&
+            War3ComputeCachedMappedTerrainBoundsFromSpan(
+                positionSpan, posStride, uint32_t(declInfo.posOffset),
+                posFormat, boundsRange.firstVertex, boundsRange.vertexCount,
+                false, localBounds)) {
+          War3LocalBoundsToSphere(localBounds, candidate.localBoundsCenter,
+                                  candidate.localBoundsRadius);
+          candidate.localBoundsIdentityProven =
+              candidate.localBoundsRadius > 0.0f &&
+              std::isfinite(candidate.localBoundsRadius);
+          candidate.localBoundsSourceGeneration =
+              candidate.localBoundsIdentityProven
+                  ? positionSpan.contentGeneration
+                  : 0u;
+        }
+      }
+
       persistentGeometryReady = War3CreateShadowPersistentGeometryAfterMiss(
           key, candidate, uploads, geometryId, geometry, createdNewGeometry,
           &persistentCreateFailure);
@@ -47460,6 +47590,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           compatDraw.uvStorage = geometry->uvStorage;
           compatDraw.uvInfo = geometry->uvInfo;
         }
+      }
+      if (terrainS1Caster && geometry->localBoundsIdentityProven &&
+          geometry->localBoundsSourceGeneration != 0u &&
+          geometry->localBoundsRadius > 0.0f &&
+          std::isfinite(geometry->localBoundsRadius)) {
+        War3ApplySemanticBoundsFromMatrix(
+            compatDraw, compatDraw.worldMatrix, geometry->localBoundsCenter,
+            geometry->localBoundsRadius);
+        compatDraw.boundsProvenance = dxvk::war3::render::
+            War3ShadowBoundsProvenance::ExactLocalGeoset;
+        compatDraw.boundsSourceGeneration =
+            geometry->localBoundsSourceGeneration;
+        compatDraw.boundsFrameSerial =
+            m_war3ShadowPersistentFrameSerial + 1u;
+        compatDraw.boundsIdentityProven = true;
+        compatDraw.boundsSourceWasSkinned = false;
+        compatDraw.boundsFrameLocalDynamic = false;
+        compatDraw.boundsAnimatedAttachment = false;
       }
 
       shadowCapturePersistentTiming.pause();
@@ -47688,17 +47836,17 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           (std::max)(1.0f, (std::max)(sx, (std::max)(sy, sz)));
       estimatedBoundsRadius *= maxScale;
     }
-  } else if (terrainS1Caster &&
+  } else if (terrainCaster &&
              dxvk::war3::internal::kShadowCascadeCullTerrainWithBounds &&
              War3TerrainBoundsCullModeRuntime() !=
                  dxvk::war3::render::War3TerrainBoundsCullMode::Off) {
     shadowCaptureBoundsTiming.enter(
         War3ShadowCaptureBoundsPhase::TerrainBoundsKey);
     War3LocalGeometryBounds terrainBounds = {};
-    const int64_t terrainFirstVertex =
-        indexed ? int64_t(BaseVertexIndex) + int64_t(MinVertexIndex)
-                : int64_t(StartVal);
-    const uint32_t terrainVertexCount = indexed ? NumVertices : CountVal;
+    const auto terrainVertexRange =
+        dxvk::war3::render::War3ResolveTerrainBoundsVertexRange(
+            indexed, StartVal, CountVal, exactIndexedDomainKnown,
+            exactIndexedDomainFirstVertex, exactIndexedDomainVertexCount);
     Rc<DxvkResourceAllocation> terrainMappedAllocation = nullptr;
     dxvk::war3::memory::War3CpuReadableBufferSpan
         terrainPositionReadableSpan = {};
@@ -47750,13 +47898,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           !DynamicSysmemVBOs && posDynamic && vbCommon != nullptr &&
           terrainPositionReadableSpan;
       terrainDynamicSliceContentKey =
-          (terrainDynamicSliceKeyValid && terrainFirstVertex >= 0 &&
-           terrainVertexCount != 0u)
+          (terrainDynamicSliceKeyValid && terrainVertexRange.exact)
               ? War3ComputeTerrainBoundsContentKey(
-                    terrainPositionReadableSpan, posStride,
-                    uint32_t(declInfo.posOffset),
-                    posFormat, uint32_t(terrainFirstVertex),
-                    terrainVertexCount)
+                  terrainPositionReadableSpan, posStride,
+                  uint32_t(declInfo.posOffset),
+                    posFormat, terrainVertexRange.firstVertex,
+                    terrainVertexRange.vertexCount)
               : 0u;
       terrainDynamicSliceContentKeyValid =
           terrainDynamicSliceKeyValid && terrainDynamicSliceContentKey != 0u;
@@ -47780,8 +47927,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     const uint64_t terrainStableKeyLength =
         terrainUploadSourceKeyValid
             ? uint64_t(m_war3PerDrawUpload.vbSourceLength[posStream])
-            : (terrainDynamicSliceContentKeyValid ? uint64_t(terrainVertexCount)
-                                                  : 0u);
+             : (terrainDynamicSliceContentKeyValid
+                    ? uint64_t(terrainVertexRange.vertexCount)
+                                                   : 0u);
     const uint32_t terrainStableKeyElementCount =
         terrainUploadSourceKeyValid
             ? m_war3PerDrawUpload.vbSourceElementCount[posStream]
@@ -47800,13 +47948,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             : (terrainDynamicSliceContentKeyValid
                    ? terrainDynamicSliceContentKey
                    : 0u);
-    if (terrainFirstVertex >= 0 && terrainVertexCount != 0u) {
+    if (terrainVertexRange.exact) {
       shadowCaptureBoundsTiming.enter(
           War3ShadowCaptureBoundsPhase::TerrainBoundsCompute);
       if (War3ComputeCachedMappedTerrainBoundsFromSpan(
               terrainPositionReadableSpan, posStride,
               uint32_t(declInfo.posOffset), posFormat,
-              uint32_t(terrainFirstVertex), terrainVertexCount,
+              terrainVertexRange.firstVertex, terrainVertexRange.vertexCount,
               allowTerrainBoundsCache, terrainBounds, terrainStableKeyBase,
               terrainStableKeyOffset, terrainStableKeyLength,
               terrainStableKeyElementCount, terrainStableKeyElementStride,
@@ -48725,7 +48873,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   draw.depthWriteEnabled = zWriteEnabled;
   draw.depthTestEnabled = zTestEnabled;
   draw.additiveBlend = additiveBlend;
-  if (terrainS1Caster && estimatedBoundsRadius > 0.0f) {
+  if (terrainCaster && estimatedBoundsRadius > 0.0f) {
     draw.boundsCenter = estimatedBoundsCenter;
     draw.boundsRadius = estimatedBoundsRadius;
     draw.boundsProvenance =

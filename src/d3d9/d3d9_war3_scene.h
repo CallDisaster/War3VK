@@ -363,6 +363,13 @@ namespace dxvk {
 
         Vector4 localBoundsCenter = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
         float localBoundsRadius = 0.0f;
+        // Bounds are authoritative only when they were computed from the
+        // exact vertex domain copied into this immutable geometry record.
+        // The source generation is rewritten to the registry-owned geometry
+        // generation after insertion, so cache hits never rely on a stale
+        // upload/ring generation.
+        uint64_t localBoundsSourceGeneration = 0u;
+        bool localBoundsIdentityProven = false;
         uint64_t totalBytes = 0;
         uint64_t lastSeenFrame = 0;
     };

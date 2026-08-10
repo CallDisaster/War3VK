@@ -401,6 +401,23 @@ test(
   timeout : 30,
 )
 
+# Exact terrain bounds may consume a non-indexed draw range directly, but an
+# indexed draw must first prove its real domain from current IB bytes. This
+# policy test deliberately has no D3D9/Vulkan dependency.
+war3_terrain_bounds_provenance_test = executable(
+  'war3_terrain_bounds_provenance_test',
+  [
+    'war3/render/tests/war3_terrain_bounds_provenance_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_terrain_bounds_provenance',
+  war3_terrain_bounds_provenance_test,
+  timeout : 30,
+)
+
 # The production pipeline owner uses the same Rc lifetime semantics exercised
 # here: a cache may release immediately, while an in-flight command list holds
 # the final owner until its GPU completion notification.
