@@ -74,3 +74,25 @@ allowed only after an A-B-B-A physical gate demonstrates all of the following:
 If the candidate misses any gate, Release remains on the hard cutoff and the
 result is retained only as a bounded experiment. No offline result in this
 document claims that the player-reported shimmer has been fixed.
+
+## A-B-B-A result
+
+The visible-desktop `Off A -> Hash B1 -> Hash B2 -> Off A2` run completed on
+Turtle Rock with 16 identical locked-sun steps per round. All four fresh game
+processes completed without device loss, Arena/replay failure or an incomplete
+directional publication. The aggregate image metrics were:
+
+- hard-cutoff edge-toggle p95 mean: `0.243596`;
+- hashed edge-toggle p95 mean: `0.241909`;
+- relative improvement: `0.6926%`;
+- dark-coverage ratio: `1.000210`;
+- fine-edge-length ratio: `0.997996`.
+
+Coverage was preserved, but the edge-toggle improvement is far below the 40%
+promotion gate. `alphaShadowHashed` therefore remains Release-default Off and
+this candidate is retained only as a bounded negative experiment. The result
+narrows the next investigation toward CSM projection/texel-grid stability and
+receiver sampling of sub-texel silhouettes; it does not justify changing the
+alpha contract or claiming that Issue #4 is visually fixed.
+
+Artifact: `AutoTest/artifacts/shadow_alpha_coverage_abba/20260811_020854`.
