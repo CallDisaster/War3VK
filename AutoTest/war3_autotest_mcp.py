@@ -3007,8 +3007,23 @@ def _extract_shadow_cull_observe_summary(data: Dict[str, Any]) -> Dict[str, Any]
     it only exposes the most recent frame and can miss a one-frame mismatch.
     """
 
+    # Current perf reports place the per-frame shadow counters in the bounded
+    # runtime summary. Older reports and synthetic contract fixtures exported
+    # them at the top level. Accept both schemas, preferring the current nested
+    # snapshot so an obsolete top-level zero cannot hide a live Observe run.
+    runtime_summary = data.get("shadowRuntimeV2Summary", {})
+    if not isinstance(runtime_summary, dict):
+        runtime_summary = {}
+    shadow_budget = data.get("shadowBudgetSummary", {})
+    if not isinstance(shadow_budget, dict):
+        shadow_budget = {}
+    if not runtime_summary:
+        runtime_summary = shadow_budget
+
     def _integer(name: str) -> int:
         try:
+            if name in runtime_summary:
+                return int(runtime_summary.get(name, 0) or 0)
             return int(data.get(name, 0) or 0)
         except (TypeError, ValueError):
             return 0
@@ -3026,9 +3041,6 @@ def _extract_shadow_cull_observe_summary(data: Dict[str, Any]) -> Dict[str, Any]
     )
     terrain_far_tests = max(0, terrain_candidates * 2)
 
-    shadow_budget = data.get("shadowBudgetSummary", {})
-    if not isinstance(shadow_budget, dict):
-        shadow_budget = {}
     frames_incomplete = int(shadow_budget.get("framesIncomplete", 0) or 0)
     frames_budget_exceeded = int(
         shadow_budget.get("framesBudgetExceeded", 0) or 0
