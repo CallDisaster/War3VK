@@ -695,6 +695,9 @@ namespace dxvk {
         uint64_t producerFallbackByteBudgetCount = 0u;
         uint64_t producerArenaAdmissionCount = 0u;
         uint64_t producerFreezeFailureCount = 0u;
+        uint64_t producerSealFrameSerial = 0u;
+        uint64_t producerSealMapEpoch = 0u;
+        uint64_t producerSealDeviceEpoch = 0u;
         uint32_t producerCompletenessReasonMask = 0u;
         uint32_t producerCompletenessSealed = 0u;
         uint32_t producerCompletenessCounterOverflow = 0u;

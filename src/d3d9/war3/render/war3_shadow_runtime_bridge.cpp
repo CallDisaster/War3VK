@@ -2047,6 +2047,12 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCacheConsumeMissCount
      << ",\"producerCompletenessSealed\":"
      << stats.producerCompletenessSealed
+     << ",\"producerSealFrameSerial\":"
+     << stats.producerSealFrameSerial
+     << ",\"producerSealMapEpoch\":"
+     << stats.producerSealMapEpoch
+     << ",\"producerSealDeviceEpoch\":"
+     << stats.producerSealDeviceEpoch
      << ",\"producerRequiredCasterOmissionCount\":"
      << stats.producerRequiredCasterOmissionCount
      << ",\"producerExactBudgetDeferredUniqueCasterCount\":"
@@ -5016,6 +5022,53 @@ void NoteShadowRuntimeSpriteFramePose(void* runtimeModelPtr, void* spritePtr,
       worldTransform, matrixCount, matrixHash);
 }
 
+ShadowProducerRuntimeDiagnostics QueryShadowProducerRuntimeDiagnostics() {
+  ShadowProducerRuntimeDiagnostics summary = {};
+  std::shared_lock<std::shared_mutex> lock(g_shadowSceneStatsMutex);
+  summary.producerSealFrameSerial = g_shadowSceneStats.producerSealFrameSerial;
+  summary.producerSealMapEpoch = g_shadowSceneStats.producerSealMapEpoch;
+  summary.producerSealDeviceEpoch = g_shadowSceneStats.producerSealDeviceEpoch;
+  summary.producerRequiredCasterOmissionCount =
+      g_shadowSceneStats.producerRequiredCasterOmissionCount;
+  summary.producerExactBudgetDeferredUniqueCasterCount =
+      g_shadowSceneStats.producerExactBudgetDeferredUniqueCasterCount;
+  summary.producerPositionAllocBudgetCount =
+      g_shadowSceneStats.producerPositionAllocBudgetCount;
+  summary.producerUvAllocBudgetCount =
+      g_shadowSceneStats.producerUvAllocBudgetCount;
+  summary.producerIndexAllocBudgetCount =
+      g_shadowSceneStats.producerIndexAllocBudgetCount;
+  summary.producerAllocationFailureCount =
+      g_shadowSceneStats.producerAllocationFailureCount;
+  summary.producerFallbackByteBudgetCount =
+      g_shadowSceneStats.producerFallbackByteBudgetCount;
+  summary.producerArenaAdmissionCount =
+      g_shadowSceneStats.producerArenaAdmissionCount;
+  summary.producerFreezeFailureCount =
+      g_shadowSceneStats.producerFreezeFailureCount;
+  summary.producerCompletenessReasonMask =
+      g_shadowSceneStats.producerCompletenessReasonMask;
+  summary.producerCompletenessSealed =
+      g_shadowSceneStats.producerCompletenessSealed;
+  summary.producerCompletenessCounterOverflow =
+      g_shadowSceneStats.producerCompletenessCounterOverflow;
+  summary.drawTimeVBCacheStaticLiveBytes =
+      g_shadowSceneStats.drawTimeVBCacheStaticLiveBytes;
+  summary.drawTimeVBCacheStaticProtectedBytes =
+      g_shadowSceneStats.drawTimeVBCacheStaticProtectedBytes;
+  summary.drawTimeVBCacheStaticOverCapBytes =
+      g_shadowSceneStats.drawTimeVBCacheStaticOverCapBytes;
+  summary.drawTimeVBCacheStaticOverCapFrameCount =
+      g_shadowSceneStats.drawTimeVBCacheStaticOverCapFrameCount;
+  summary.drawTimeVBCacheStaticEvictedBytes =
+      g_shadowSceneStats.drawTimeVBCacheStaticEvictedBytes;
+  summary.drawTimeVBCacheStaticEvictedEntryCount =
+      g_shadowSceneStats.drawTimeVBCacheStaticEvictedEntryCount;
+  summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
+      g_shadowSceneStats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+  return summary;
+}
+
 ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
     bool refreshSemanticFrameIfStale) {
   ShadowRuntimeBridgeSummary summary = {};
@@ -6887,6 +6940,49 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.semanticSceneShadowMapDrawnCasters;
     summary.semanticSceneShadowMapCascadeCulledCount =
         g_shadowSceneStats.semanticSceneShadowMapCascadeCulledCount;
+    summary.producerSealFrameSerial =
+        g_shadowSceneStats.producerSealFrameSerial;
+    summary.producerSealMapEpoch = g_shadowSceneStats.producerSealMapEpoch;
+    summary.producerSealDeviceEpoch =
+        g_shadowSceneStats.producerSealDeviceEpoch;
+    summary.producerRequiredCasterOmissionCount =
+        g_shadowSceneStats.producerRequiredCasterOmissionCount;
+    summary.producerExactBudgetDeferredUniqueCasterCount =
+        g_shadowSceneStats.producerExactBudgetDeferredUniqueCasterCount;
+    summary.producerPositionAllocBudgetCount =
+        g_shadowSceneStats.producerPositionAllocBudgetCount;
+    summary.producerUvAllocBudgetCount =
+        g_shadowSceneStats.producerUvAllocBudgetCount;
+    summary.producerIndexAllocBudgetCount =
+        g_shadowSceneStats.producerIndexAllocBudgetCount;
+    summary.producerAllocationFailureCount =
+        g_shadowSceneStats.producerAllocationFailureCount;
+    summary.producerFallbackByteBudgetCount =
+        g_shadowSceneStats.producerFallbackByteBudgetCount;
+    summary.producerArenaAdmissionCount =
+        g_shadowSceneStats.producerArenaAdmissionCount;
+    summary.producerFreezeFailureCount =
+        g_shadowSceneStats.producerFreezeFailureCount;
+    summary.producerCompletenessReasonMask =
+        g_shadowSceneStats.producerCompletenessReasonMask;
+    summary.producerCompletenessSealed =
+        g_shadowSceneStats.producerCompletenessSealed;
+    summary.producerCompletenessCounterOverflow =
+        g_shadowSceneStats.producerCompletenessCounterOverflow;
+    summary.drawTimeVBCacheStaticLiveBytes =
+        g_shadowSceneStats.drawTimeVBCacheStaticLiveBytes;
+    summary.drawTimeVBCacheStaticProtectedBytes =
+        g_shadowSceneStats.drawTimeVBCacheStaticProtectedBytes;
+    summary.drawTimeVBCacheStaticOverCapBytes =
+        g_shadowSceneStats.drawTimeVBCacheStaticOverCapBytes;
+    summary.drawTimeVBCacheStaticOverCapFrameCount =
+        g_shadowSceneStats.drawTimeVBCacheStaticOverCapFrameCount;
+    summary.drawTimeVBCacheStaticEvictedBytes =
+        g_shadowSceneStats.drawTimeVBCacheStaticEvictedBytes;
+    summary.drawTimeVBCacheStaticEvictedEntryCount =
+        g_shadowSceneStats.drawTimeVBCacheStaticEvictedEntryCount;
+    summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
+        g_shadowSceneStats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
     summary.semanticSceneTerrainBoundsCullMode =
         g_shadowSceneStats.semanticSceneTerrainBoundsCullMode;
     summary.semanticSceneTerrainBoundsCandidateCount =

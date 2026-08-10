@@ -1243,12 +1243,34 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.producerRequiredCasterOmissionCount;
   agg.producerExactBudgetDeferredUniqueCasterCount +=
       stats.producerExactBudgetDeferredUniqueCasterCount;
+  agg.producerPositionAllocBudgetCount +=
+      stats.producerPositionAllocBudgetCount;
+  agg.producerUvAllocBudgetCount += stats.producerUvAllocBudgetCount;
+  agg.producerIndexAllocBudgetCount += stats.producerIndexAllocBudgetCount;
+  agg.producerAllocationFailureCount += stats.producerAllocationFailureCount;
+  agg.producerFallbackByteBudgetCount +=
+      stats.producerFallbackByteBudgetCount;
+  agg.producerArenaAdmissionCount += stats.producerArenaAdmissionCount;
+  agg.producerFreezeFailureCount += stats.producerFreezeFailureCount;
+  agg.producerCompletenessCounterOverflowFrames +=
+      stats.producerCompletenessCounterOverflow != 0u ? 1u : 0u;
+  agg.producerSealFrameSerialLast = stats.producerSealFrameSerial;
+  agg.producerSealMapEpochLast = stats.producerSealMapEpoch;
+  agg.producerSealDeviceEpochLast = stats.producerSealDeviceEpoch;
+  agg.drawTimeVBCacheStaticLiveBytesLast =
+      stats.drawTimeVBCacheStaticLiveBytes;
   agg.drawTimeVBCacheStaticProtectedBytesLast =
       stats.drawTimeVBCacheStaticProtectedBytes;
   agg.drawTimeVBCacheStaticOverCapBytesLast =
       stats.drawTimeVBCacheStaticOverCapBytes;
+  agg.drawTimeVBCacheStaticOverCapFrameCountLast =
+      stats.drawTimeVBCacheStaticOverCapFrameCount;
   agg.drawTimeVBCacheStaticEvictedBytes +=
       stats.drawTimeVBCacheStaticEvictedBytes;
+  agg.drawTimeVBCacheStaticEvictedEntryCount +=
+      stats.drawTimeVBCacheStaticEvictedEntryCount;
+  agg.drawTimeVBCacheIndexedUnknownRangeFallbackCount +=
+      stats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
   agg.totalBudgetBytes += stats.fallbackBudgetBytes;
   agg.totalUsedBytes += stats.fallbackBudgetUsedBytes;
   agg.maxBudgetBytes =
@@ -5792,12 +5814,42 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.producerRequiredCasterOmissionCount << ",\n";
   json << "    \"producerExactBudgetDeferredUniqueCasterCount\": "
        << shadowAgg.producerExactBudgetDeferredUniqueCasterCount << ",\n";
+  json << "    \"producerPositionAllocBudgetCount\": "
+       << shadowAgg.producerPositionAllocBudgetCount << ",\n";
+  json << "    \"producerUvAllocBudgetCount\": "
+       << shadowAgg.producerUvAllocBudgetCount << ",\n";
+  json << "    \"producerIndexAllocBudgetCount\": "
+       << shadowAgg.producerIndexAllocBudgetCount << ",\n";
+  json << "    \"producerAllocationFailureCount\": "
+       << shadowAgg.producerAllocationFailureCount << ",\n";
+  json << "    \"producerFallbackByteBudgetCount\": "
+       << shadowAgg.producerFallbackByteBudgetCount << ",\n";
+  json << "    \"producerArenaAdmissionCount\": "
+       << shadowAgg.producerArenaAdmissionCount << ",\n";
+  json << "    \"producerFreezeFailureCount\": "
+       << shadowAgg.producerFreezeFailureCount << ",\n";
+  json << "    \"producerCompletenessCounterOverflowFrames\": "
+       << shadowAgg.producerCompletenessCounterOverflowFrames << ",\n";
+  json << "    \"producerSealFrameSerialLast\": "
+       << shadowAgg.producerSealFrameSerialLast << ",\n";
+  json << "    \"producerSealMapEpochLast\": "
+       << shadowAgg.producerSealMapEpochLast << ",\n";
+  json << "    \"producerSealDeviceEpochLast\": "
+       << shadowAgg.producerSealDeviceEpochLast << ",\n";
+  json << "    \"drawTimeVBCacheStaticLiveBytesLast\": "
+       << shadowAgg.drawTimeVBCacheStaticLiveBytesLast << ",\n";
   json << "    \"drawTimeVBCacheStaticProtectedBytesLast\": "
        << shadowAgg.drawTimeVBCacheStaticProtectedBytesLast << ",\n";
   json << "    \"drawTimeVBCacheStaticOverCapBytesLast\": "
        << shadowAgg.drawTimeVBCacheStaticOverCapBytesLast << ",\n";
+  json << "    \"drawTimeVBCacheStaticOverCapFrameCountLast\": "
+       << shadowAgg.drawTimeVBCacheStaticOverCapFrameCountLast << ",\n";
   json << "    \"drawTimeVBCacheStaticEvictedBytes\": "
        << shadowAgg.drawTimeVBCacheStaticEvictedBytes << ",\n";
+  json << "    \"drawTimeVBCacheStaticEvictedEntryCount\": "
+       << shadowAgg.drawTimeVBCacheStaticEvictedEntryCount << ",\n";
+  json << "    \"drawTimeVBCacheIndexedUnknownRangeFallbackCount\": "
+       << shadowAgg.drawTimeVBCacheIndexedUnknownRangeFallbackCount << ",\n";
   json << "    \"framesBudgetExceeded\": " << shadowAgg.framesBudgetExceeded
        << ",\n";
   json << "    \"framesReuseLastComplete\": "

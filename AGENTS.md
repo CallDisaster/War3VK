@@ -117,7 +117,13 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   Consume 或部署发布。
 - 2026-08-11 的本地候选补齐 S1 persistent/early-hit 与 Stage10 的 exact terrain bounds 来源：indexed
   draw 只接受当前 IB 扫描域，persistent local bounds 由不可变 geometry generation 拥有；Release 仍 Off，
-  尚待 10,000 帧开发 Observe 门，详见 `docs/agent-history/2026-08-11-issue5-exact-terrain-bounds-provenance.md`。
+  但实机开发 Observe 的 proof accepted 仍为零，因为 indexed-domain 计算受历史禁用的 exact-trim 门
+  阻断，不能据此宣称剔除可用；详见 `docs/agent-history/2026-08-11-issue5-exact-terrain-bounds-provenance.md`。
+- 2026-08-11 的高压低视角门捕获到真实 `VK_ERROR_DEVICE_LOST`：device fault 报告
+  `READ_INVALID`，点阴影为零且 Arena 无 ownership/overflow 违规；TDR 前同时存在连续
+  `ProducerIncomplete` 与四级联重复重放。本地诊断候选已把独立 producer/cache/unknown-index 原因
+  贯通到 runtime、flight、incident 和 perf，仍不等于 TDR 已修复；详见
+  `docs/agent-history/2026-08-11-night-tdr-invalid-read-evidence.md`。
 - Issue #6 已先闭合两个确定的跨地图 CPU 身份泄漏：caster tombstone 现在按 map epoch 隔离，且
   旧相机、per-draw upload、RT/DS fallback 会在 Present 安全点重置；显式禁用 producer stage 的
   进程级策略仍跨地图保留。该阶段仅通过离线合同和 Win32 runnable，尚未部署或完成 A→B→A

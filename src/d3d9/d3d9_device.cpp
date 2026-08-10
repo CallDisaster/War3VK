@@ -23727,6 +23727,9 @@ void D3D9DeviceEx::War3SealShadowProducerCompleteness(
   auto& stats = scene.shadowStats;
   const auto& completeness = scene.producerCompleteness;
   stats.producerCompletenessSealed = 1u;
+  stats.producerSealFrameSerial = completeness.sealFrameSerial;
+  stats.producerSealMapEpoch = completeness.mapEpoch;
+  stats.producerSealDeviceEpoch = completeness.deviceEpoch;
   stats.producerCompletenessCounterOverflow =
       completeness.counterOverflow ? 1u : 0u;
   stats.producerCompletenessReasonMask = completeness.reasonMask;

@@ -165,6 +165,34 @@ struct ShadowPoseFullTraceStatus {
   std::string path;
 };
 
+// Compact, by-value snapshot for the per-frame GPU flight recorder.  The full
+// bridge summary contains hundreds of unrelated counters and is reserved for
+// low-frequency control-plane queries.
+struct ShadowProducerRuntimeDiagnostics {
+  uint64_t producerSealFrameSerial = 0;
+  uint64_t producerSealMapEpoch = 0;
+  uint64_t producerSealDeviceEpoch = 0;
+  uint64_t producerRequiredCasterOmissionCount = 0;
+  uint64_t producerExactBudgetDeferredUniqueCasterCount = 0;
+  uint64_t producerPositionAllocBudgetCount = 0;
+  uint64_t producerUvAllocBudgetCount = 0;
+  uint64_t producerIndexAllocBudgetCount = 0;
+  uint64_t producerAllocationFailureCount = 0;
+  uint64_t producerFallbackByteBudgetCount = 0;
+  uint64_t producerArenaAdmissionCount = 0;
+  uint64_t producerFreezeFailureCount = 0;
+  uint64_t producerCompletenessReasonMask = 0;
+  uint64_t producerCompletenessSealed = 0;
+  uint64_t producerCompletenessCounterOverflow = 0;
+  uint64_t drawTimeVBCacheStaticLiveBytes = 0;
+  uint64_t drawTimeVBCacheStaticProtectedBytes = 0;
+  uint64_t drawTimeVBCacheStaticOverCapBytes = 0;
+  uint64_t drawTimeVBCacheStaticOverCapFrameCount = 0;
+  uint64_t drawTimeVBCacheStaticEvictedBytes = 0;
+  uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0;
+  uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
+};
+
 struct ShadowRuntimeBridgeSummary {
   uint64_t runtimeChildLinkBuildCount = 0;
   uint64_t runtimeChildLinkBuiltChildCount = 0;
@@ -979,6 +1007,28 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t semanticSceneReplayDrawsCount = 0;
   uint64_t semanticSceneShadowMapDrawnCasters = 0;
   uint64_t semanticSceneShadowMapCascadeCulledCount = 0;
+  uint64_t producerSealFrameSerial = 0;
+  uint64_t producerSealMapEpoch = 0;
+  uint64_t producerSealDeviceEpoch = 0;
+  uint64_t producerRequiredCasterOmissionCount = 0;
+  uint64_t producerExactBudgetDeferredUniqueCasterCount = 0;
+  uint64_t producerPositionAllocBudgetCount = 0;
+  uint64_t producerUvAllocBudgetCount = 0;
+  uint64_t producerIndexAllocBudgetCount = 0;
+  uint64_t producerAllocationFailureCount = 0;
+  uint64_t producerFallbackByteBudgetCount = 0;
+  uint64_t producerArenaAdmissionCount = 0;
+  uint64_t producerFreezeFailureCount = 0;
+  uint64_t producerCompletenessReasonMask = 0;
+  uint64_t producerCompletenessSealed = 0;
+  uint64_t producerCompletenessCounterOverflow = 0;
+  uint64_t drawTimeVBCacheStaticLiveBytes = 0;
+  uint64_t drawTimeVBCacheStaticProtectedBytes = 0;
+  uint64_t drawTimeVBCacheStaticOverCapBytes = 0;
+  uint64_t drawTimeVBCacheStaticOverCapFrameCount = 0;
+  uint64_t drawTimeVBCacheStaticEvictedBytes = 0;
+  uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0;
+  uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
   uint64_t semanticSceneTerrainBoundsCullMode = 0;
   uint64_t semanticSceneTerrainBoundsCandidateCount = 0;
   uint64_t semanticSceneTerrainBoundsProofAcceptedCount = 0;
@@ -2397,6 +2447,7 @@ void NoteShadowRuntimeSpriteFramePose(void* runtimeModelPtr, void* spritePtr,
 
 ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
     bool refreshSemanticFrameIfStale = false);
+ShadowProducerRuntimeDiagnostics QueryShadowProducerRuntimeDiagnostics();
 ShadowRuntimeBridgeTrackingDecision ComputeShadowRuntimeBridgeTracking();
 void FinalizeWorldObjectsPhase1PreviousFrameWithoutNewDecision() noexcept;
 void ResetShadowRuntimeBridgeState();

@@ -488,6 +488,44 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"csmPartialPreventedCount", frame.csmPartialPreventedCount},
         {"csmFirstCompleteLatencyFrames",
          frame.csmFirstCompleteLatencyFrames},
+        {"producerSealFrameSerial", frame.producerSealFrameSerial},
+        {"producerSealMapEpoch", frame.producerSealMapEpoch},
+        {"producerSealDeviceEpoch", frame.producerSealDeviceEpoch},
+        {"producerRequiredCasterOmissionCount",
+         frame.producerRequiredCasterOmissionCount},
+        {"producerExactBudgetDeferredUniqueCasterCount",
+         frame.producerExactBudgetDeferredUniqueCasterCount},
+        {"producerPositionAllocBudgetCount",
+         frame.producerPositionAllocBudgetCount},
+        {"producerUvAllocBudgetCount", frame.producerUvAllocBudgetCount},
+        {"producerIndexAllocBudgetCount",
+         frame.producerIndexAllocBudgetCount},
+        {"producerAllocationFailureCount",
+         frame.producerAllocationFailureCount},
+        {"producerFallbackByteBudgetCount",
+         frame.producerFallbackByteBudgetCount},
+        {"producerArenaAdmissionCount",
+         frame.producerArenaAdmissionCount},
+        {"producerFreezeFailureCount", frame.producerFreezeFailureCount},
+        {"producerCompletenessReasonMask",
+         frame.producerCompletenessReasonMask},
+        {"producerCompletenessSealed", frame.producerCompletenessSealed},
+        {"producerCompletenessCounterOverflow",
+         frame.producerCompletenessCounterOverflow},
+        {"drawTimeVBCacheStaticLiveBytes",
+         frame.drawTimeVBCacheStaticLiveBytes},
+        {"drawTimeVBCacheStaticProtectedBytes",
+         frame.drawTimeVBCacheStaticProtectedBytes},
+        {"drawTimeVBCacheStaticOverCapBytes",
+         frame.drawTimeVBCacheStaticOverCapBytes},
+        {"drawTimeVBCacheStaticOverCapFrameCount",
+         frame.drawTimeVBCacheStaticOverCapFrameCount},
+        {"drawTimeVBCacheStaticEvictedBytes",
+         frame.drawTimeVBCacheStaticEvictedBytes},
+        {"drawTimeVBCacheStaticEvictedEntryCount",
+         frame.drawTimeVBCacheStaticEvictedEntryCount},
+        {"drawTimeVBCacheIndexedUnknownRangeFallbackCount",
+         frame.drawTimeVBCacheIndexedUnknownRangeFallbackCount},
         {"csmCascadeDrawCount", frame.csmCascadeDrawCount},
         {"csmCascadeTriangleCount", frame.csmCascadeTriangleCount},
         {"pointShadowLightCount", frame.pointShadowLightCount},
@@ -637,6 +675,8 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.worldMaxX = loadAutoTestFloat(9u);
   frame.worldMaxY = loadAutoTestFloat(10u);
   const auto replay = dxvk::QueryShadowReplayDiagnostics();
+  const auto producer =
+      dxvk::war3::render::QueryShadowProducerRuntimeDiagnostics();
   frame.csmPlannedCasterCount = replay.plannedCasterCount;
   frame.csmValidatedCasterCount = replay.validatedCasterCount;
   frame.csmDrawnCasterCount = replay.drawnCasterCount;
@@ -644,6 +684,46 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.csmValidationRejectCount = replay.validationRejectCount;
   frame.csmPartialPreventedCount = replay.partialPreventedCount;
   frame.csmFirstCompleteLatencyFrames = replay.firstCompleteLatencyFrames;
+  frame.producerSealFrameSerial = producer.producerSealFrameSerial;
+  frame.producerSealMapEpoch = producer.producerSealMapEpoch;
+  frame.producerSealDeviceEpoch = producer.producerSealDeviceEpoch;
+  frame.producerRequiredCasterOmissionCount =
+      producer.producerRequiredCasterOmissionCount;
+  frame.producerExactBudgetDeferredUniqueCasterCount =
+      producer.producerExactBudgetDeferredUniqueCasterCount;
+  frame.producerPositionAllocBudgetCount =
+      producer.producerPositionAllocBudgetCount;
+  frame.producerUvAllocBudgetCount = producer.producerUvAllocBudgetCount;
+  frame.producerIndexAllocBudgetCount =
+      producer.producerIndexAllocBudgetCount;
+  frame.producerAllocationFailureCount =
+      producer.producerAllocationFailureCount;
+  frame.producerFallbackByteBudgetCount =
+      producer.producerFallbackByteBudgetCount;
+  frame.producerArenaAdmissionCount =
+      producer.producerArenaAdmissionCount;
+  frame.producerFreezeFailureCount =
+      producer.producerFreezeFailureCount;
+  frame.producerCompletenessReasonMask =
+      producer.producerCompletenessReasonMask;
+  frame.producerCompletenessSealed =
+      producer.producerCompletenessSealed;
+  frame.producerCompletenessCounterOverflow =
+      producer.producerCompletenessCounterOverflow;
+  frame.drawTimeVBCacheStaticLiveBytes =
+      producer.drawTimeVBCacheStaticLiveBytes;
+  frame.drawTimeVBCacheStaticProtectedBytes =
+      producer.drawTimeVBCacheStaticProtectedBytes;
+  frame.drawTimeVBCacheStaticOverCapBytes =
+      producer.drawTimeVBCacheStaticOverCapBytes;
+  frame.drawTimeVBCacheStaticOverCapFrameCount =
+      producer.drawTimeVBCacheStaticOverCapFrameCount;
+  frame.drawTimeVBCacheStaticEvictedBytes =
+      producer.drawTimeVBCacheStaticEvictedBytes;
+  frame.drawTimeVBCacheStaticEvictedEntryCount =
+      producer.drawTimeVBCacheStaticEvictedEntryCount;
+  frame.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
+      producer.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
   for (size_t index = 0u; index < frame.csmCascadeDrawCount.size(); ++index) {
     frame.csmCascadeDrawCount[index] =
         s_gpuFlightCsmCascadeDrawCount[index].load(std::memory_order_acquire);
@@ -2037,6 +2117,47 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       bridgeSummary.semanticSceneShadowMapDrawnCasters;
   summary.semanticSceneShadowMapCascadeCulledCount =
       bridgeSummary.semanticSceneShadowMapCascadeCulledCount;
+  summary.producerSealFrameSerial = bridgeSummary.producerSealFrameSerial;
+  summary.producerSealMapEpoch = bridgeSummary.producerSealMapEpoch;
+  summary.producerSealDeviceEpoch = bridgeSummary.producerSealDeviceEpoch;
+  summary.producerRequiredCasterOmissionCount =
+      bridgeSummary.producerRequiredCasterOmissionCount;
+  summary.producerExactBudgetDeferredUniqueCasterCount =
+      bridgeSummary.producerExactBudgetDeferredUniqueCasterCount;
+  summary.producerPositionAllocBudgetCount =
+      bridgeSummary.producerPositionAllocBudgetCount;
+  summary.producerUvAllocBudgetCount =
+      bridgeSummary.producerUvAllocBudgetCount;
+  summary.producerIndexAllocBudgetCount =
+      bridgeSummary.producerIndexAllocBudgetCount;
+  summary.producerAllocationFailureCount =
+      bridgeSummary.producerAllocationFailureCount;
+  summary.producerFallbackByteBudgetCount =
+      bridgeSummary.producerFallbackByteBudgetCount;
+  summary.producerArenaAdmissionCount =
+      bridgeSummary.producerArenaAdmissionCount;
+  summary.producerFreezeFailureCount =
+      bridgeSummary.producerFreezeFailureCount;
+  summary.producerCompletenessReasonMask =
+      bridgeSummary.producerCompletenessReasonMask;
+  summary.producerCompletenessSealed =
+      bridgeSummary.producerCompletenessSealed;
+  summary.producerCompletenessCounterOverflow =
+      bridgeSummary.producerCompletenessCounterOverflow;
+  summary.drawTimeVBCacheStaticLiveBytes =
+      bridgeSummary.drawTimeVBCacheStaticLiveBytes;
+  summary.drawTimeVBCacheStaticProtectedBytes =
+      bridgeSummary.drawTimeVBCacheStaticProtectedBytes;
+  summary.drawTimeVBCacheStaticOverCapBytes =
+      bridgeSummary.drawTimeVBCacheStaticOverCapBytes;
+  summary.drawTimeVBCacheStaticOverCapFrameCount =
+      bridgeSummary.drawTimeVBCacheStaticOverCapFrameCount;
+  summary.drawTimeVBCacheStaticEvictedBytes =
+      bridgeSummary.drawTimeVBCacheStaticEvictedBytes;
+  summary.drawTimeVBCacheStaticEvictedEntryCount =
+      bridgeSummary.drawTimeVBCacheStaticEvictedEntryCount;
+  summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
+      bridgeSummary.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
   summary.semanticSceneTerrainBoundsCullMode =
       bridgeSummary.semanticSceneTerrainBoundsCullMode;
   summary.semanticSceneTerrainBoundsCandidateCount =
