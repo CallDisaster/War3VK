@@ -8,6 +8,7 @@
 #include "war3/render/war3_render_objects.h"
 #include "war3/render/war3_hybrid_ray_tracing.h"
 #include "war3/render/war3_shadow_lifecycle.h"
+#include "war3/render/war3_shadow_alpha_cascade_contract.h"
 #include "war3/render/war3_shadow_producer_policy.h"
 #include "war3/render/war3_shadow_replay_validation.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
@@ -2280,7 +2281,9 @@ Rc<DxvkSampler> War3ShadowReceiverPass::getFallbackSampler(bool useMip,
 
   // 量化 LOD bias，避免每次微调都创建新的 VkSampler
   // 经验值：0.25 步进足以满足调参，同时不会引入明显“卡档”感。
-  const float clampedBias = std::clamp(mipLodBias, -4.0f, 4.0f);
+  const float finiteMipLodBias =
+      std::isfinite(mipLodBias) ? mipLodBias : 0.0f;
+  const float clampedBias = std::clamp(finiteMipLodBias, -4.0f, 4.0f);
   constexpr float kStep = 0.25f;
   const int32_t q = int32_t(std::lround(clampedBias / kStep));
   if (q == 0)
@@ -3751,7 +3754,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       input.settings ? input.settings.get() : &defaultSettings;
   const bool alphaShadowHashed = settings->shadows.alphaShadowHashed;
   const float alphaShadowFarAlphaRefBias =
-      std::max(settings->shadows.alphaShadowFarAlphaRefBias, 0.0f);
+      war3::render::SanitizeShadowAlphaFarRefBias(
+          settings->shadows.alphaShadowFarAlphaRefBias);
 
   const uint32_t cascadeCount =
       std::min<uint32_t>(std::max<uint32_t>(m_csmData.cascadeCount, 1u), 4u);
@@ -4654,9 +4658,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     shadowMapPhaseTiming.enter(static_cast<size_t>(
         War3DirectionalShadowMapRawPhase::CascadeRecord));
     const float alphaRefBiasCascade =
-        (cascadeCount > 1)
-            ? alphaShadowFarAlphaRefBias * (float(c) / float(cascadeCount - 1))
-            : 0.0f;
+        war3::render::ShadowAlphaRefBiasForCascade(
+            alphaShadowFarAlphaRefBias, c, cascadeCount);
 
     VkClearValue clearValue = {};
     clearValue.depthStencil.depth = 1.0f;
@@ -5098,10 +5101,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         continue;
 
       const float alphaRefBiasCascade =
-          (cascadeCount > 1)
-              ? alphaShadowFarAlphaRefBias *
-                    (float(c) / float(cascadeCount - 1))
-              : 0.0f;
+          war3::render::ShadowAlphaRefBiasForCascade(
+              alphaShadowFarAlphaRefBias, c, cascadeCount);
 
       VkClearValue maskClearValue = {};
       maskClearValue.color.float32[0] = 0.0f;

@@ -682,6 +682,8 @@ WAR3_SHADER_API bool SetShadowAlphaUseMip(bool enabled) {
 }
 
 WAR3_SHADER_API bool SetShadowAlphaMipLodBias(float bias) {
+    if (!std::isfinite(bias))
+        return false;
     auto settings = GetMutableSettings();
     if (!settings)
         return false;
@@ -690,10 +692,12 @@ WAR3_SHADER_API bool SetShadowAlphaMipLodBias(float bias) {
 }
 
 WAR3_SHADER_API bool SetShadowAlphaFarAlphaRefBias(float bias) {
+    if (!std::isfinite(bias))
+        return false;
     auto settings = GetMutableSettings();
     if (!settings)
         return false;
-    settings->shadows.alphaShadowFarAlphaRefBias = std::max(0.0f, bias);
+    settings->shadows.alphaShadowFarAlphaRefBias = std::clamp(bias, 0.0f, 1.0f);
     return true;
 }
 

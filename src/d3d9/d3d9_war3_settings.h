@@ -108,7 +108,10 @@ struct War3ShadowSettings {
   bool alphaShadowHashed = false;
   bool alphaShadowUseMip = false;
   float alphaShadowMipLodBias = 0.0f;
-  float alphaShadowFarAlphaRefBias = 0.05f;
+  // Release keeps the same cutout threshold in every directional cascade so
+  // a cascade blend or transition cannot change a foliage silhouette. A
+  // non-zero value is only an explicit debug or author opt-in.
+  float alphaShadowFarAlphaRefBias = 0.0f;
 
   // The bool remains as a compatibility surface for the existing UI and
   // DXVK_WAR3_SHADOW_TAA switch. A true legacy value promotes the default

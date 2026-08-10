@@ -1,4 +1,5 @@
 #include "../war3_shadow_receiver_numeric_contract.h"
+#include "../war3_shadow_alpha_cascade_contract.h"
 
 #include <array>
 #include <cmath>
@@ -9,6 +10,7 @@ namespace {
 
 using dxvk::war3::render::shadowmath::Vec2;
 namespace math = dxvk::war3::render::shadowmath;
+namespace alpha = dxvk::war3::render;
 
 bool near(double actual, double expected, double epsilon = 1.0e-10) {
   return std::abs(actual - expected) <= epsilon;
@@ -220,6 +222,50 @@ bool testCascadeProjectionDecisionChain() {
   return true;
 }
 
+bool testAlphaCascadeParityContract() {
+  const std::array<float, 4> rejected = {
+      std::numeric_limits<float>::quiet_NaN(),
+      std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+      -0.25f,
+  };
+  for (float bias : rejected) {
+    if (!require(alpha::SanitizeShadowAlphaFarRefBias(bias) == 0.0f,
+                 "non-finite or negative alpha cascade bias was accepted"))
+      return false;
+  }
+
+  if (!require(near(alpha::SanitizeShadowAlphaFarRefBias(0.35f), 0.35f) &&
+                   near(alpha::SanitizeShadowAlphaFarRefBias(2.0f), 1.0f),
+               "finite alpha cascade bias sanitize range changed"))
+    return false;
+
+  for (uint32_t cascadeCount : {1u, 4u}) {
+    for (uint32_t cascadeIndex = 0u; cascadeIndex < 6u; cascadeIndex++) {
+      if (!require(alpha::ShadowAlphaRefBiasForCascade(
+                       0.0f, cascadeIndex, cascadeCount) == 0.0f,
+                   "default alpha cascade bias changed a cutout threshold"))
+        return false;
+    }
+  }
+
+  constexpr std::array<double, 4> expected = {0.0, 0.1, 0.2, 0.3};
+  for (uint32_t cascadeIndex = 0u; cascadeIndex < expected.size();
+       cascadeIndex++) {
+    if (!require(near(alpha::ShadowAlphaRefBiasForCascade(
+                         0.3f, cascadeIndex, 4u), expected[cascadeIndex],
+                      1.0e-6),
+                 "opt-in alpha cascade bias interpolation changed"))
+      return false;
+  }
+
+  if (!require(alpha::ShadowAlphaRefBiasForCascade(0.3f, 9u, 4u) == 0.3f &&
+                   alpha::ShadowAlphaRefBiasForCascade(0.3f, 9u, 1u) == 0.0f,
+               "alpha cascade count/index guards changed"))
+    return false;
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -227,7 +273,8 @@ int main() {
       !testRowMajorReceiverPlaneYFlip() ||
       !testReceiverPlaneSignedSlopeAndAtomicFallback() ||
       !testCascadeBoundaryContinuityAndInvalidNextFallback() ||
-      !testCascadeProjectionDecisionChain())
+      !testCascadeProjectionDecisionChain() ||
+      !testAlphaCascadeParityContract())
     return 1;
   std::cout << "war3_shadow_receiver_numeric_contract_test: PASS\n";
   return 0;

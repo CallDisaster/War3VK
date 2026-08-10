@@ -33,6 +33,17 @@ Direct/Prepass 的确定性不一致，并把数值退化路径锁为可测合�
 现有 `test_shadow_compare_pcf_static.py` 将数值 oracle 与两条 GLSL 实现的 comparison/raw sampler、PCSS、
 固定 Y 翻转、UBO 保护以及导数位置绑定；它不替代数值测试，也不构成玩家视觉验收。
 
+## Alpha-cascade parity 候选
+
+Release 默认 `alphaShadowFarAlphaRefBias` 现为零。此前的默认 `0.05` 会让同一 alpha-cutout caster
+在 C0..C3 使用递增阈值；级联 blend 或切换时，树叶 silhouette 因而必然不同。本阶段新增纯数值 helper，
+由主 CSM depth replay 与 terrain caster-mask replay 共同生成可选 bias，并对非有限值、负值、级联数和
+索引作 fail-soft 保护。默认值使每一级联的 bias 都为零；非零值只保留给显式调试或作者 opt-in。
+
+这只消除了一个确定的跨级联 silhouette 变化源；没有开启 hashed alpha、mip alpha 或 TAA，也没有改动
+PCF/PCSS、shader/push-constant/descriptor ABI、point-shadow 或 caster producer。仍需玩家在固定与移动相机
+下复测树木、地面、墙面及级联边界，不能据此宣称持续闪烁已经修复。
+
 ## 验证结果
 
 - `test_shadow_compare_pcf_static.py`、`test_shadow_non_taa_continuity_static.py`、
