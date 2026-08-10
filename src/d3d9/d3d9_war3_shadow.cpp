@@ -10500,9 +10500,22 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   } else if (m_recentSemanticDynamicHoldFramesRemaining != 0u) {
     m_recentSemanticDynamicHoldFramesRemaining--;
   }
+  const bool producerCompleteForFrame =
+      input.scene.producerCompleteness.accepts(
+          input.frameSerial, input.mapEpoch, input.deviceEpoch);
+  const auto shadowCandidateRejectedForRecovery = [&] () noexcept {
+    return !producerCompleteForFrame || m_replayValidationFailedThisFrame ||
+           m_workloadGovernorRejectedThisFrame;
+  };
+  // Ordinary adaptive and semantic continuity holds must never relabel an
+  // incomplete/rejected candidate as this frame's directional result. The
+  // separate rejected-candidate branch below keeps the existing bounded,
+  // same-epoch eight-frame recovery policy.
+  const bool ordinaryShadowMapReuseAllowed =
+      !shadowCandidateRejectedForRecovery();
   const bool canHoldCompleteShadowMap =
-      receiverNeedsShadowMap && m_hasCompleteShadowMap && m_shadowMap &&
-      m_shadowMapSampleView;
+      ordinaryShadowMapReuseAllowed && receiverNeedsShadowMap &&
+      m_hasCompleteShadowMap && m_shadowMap && m_shadowMapSampleView;
   const bool holdForInvalidCsm =
       dxvk::war3::internal::kShadowHoldLastGoodMapOnInvalidCsm &&
       canHoldCompleteShadowMap && csmFallbackToLastGood;
@@ -10584,7 +10597,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   // the last complete map available for recovery, but it must not relabel that
   // old map as a current-frame result unless reuse was explicitly selected.
   bool directionalMapResolvedForFrame = false;
-  if (receiverNeedsShadowMap && ShadowAdaptiveMapUpdateRuntimeEnabled() &&
+  if (ordinaryShadowMapReuseAllowed && receiverNeedsShadowMap &&
+      ShadowAdaptiveMapUpdateRuntimeEnabled() &&
       m_hasCompleteShadowMap && hasCandidateCsm &&
       m_csmData.cascadeCount != 0 &&
       replayCasterCount >=
@@ -10637,9 +10651,10 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         dynamicContentStable;
   }
 
-  if (holdForInvalidCsm || holdForTransientEmptyReplay ||
+  if (ordinaryShadowMapReuseAllowed &&
+      (holdForInvalidCsm || holdForTransientEmptyReplay ||
       holdForSemanticDynamicEmptyReplay || holdForSemanticIdentityChurn ||
-      holdForSemanticCoverageDrop) {
+      holdForSemanticCoverageDrop)) {
     reuseLastShadowMap = true;
     if (holdForTransientEmptyReplay &&
         m_transientEmptyReplayHoldFramesRemaining != 0u) {
@@ -10758,9 +10773,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     } else {
       auto perfScope = war3::War3PerfMonitor::instance().scope("ShadowMap", ctx);
       const bool renderedShadowMap = renderShadowMap(ctx, input, &replayDraws);
-      const bool producerComplete = input.scene.producerCompleteness.accepts(
-          input.frameSerial, input.mapEpoch, input.deviceEpoch);
-      if (renderedShadowMap && producerComplete &&
+      if (renderedShadowMap && producerCompleteForFrame &&
           !m_replayValidationFailedThisFrame &&
           !m_workloadGovernorRejectedThisFrame) {
         directionalMapResolvedForFrame = true;
@@ -10802,8 +10815,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
             replayCasterCount != 0u
                 ? dxvk::war3::internal::kShadowTransientEmptyReplayHoldFrames
                 : 0u;
-      } else if ((m_replayValidationFailedThisFrame ||
-                  m_workloadGovernorRejectedThisFrame) &&
+      } else if (shadowCandidateRejectedForRecovery() &&
                  m_hasCompleteShadowMap &&
                  m_replayValidationHoldFramesRemaining != 0u) {
         // The candidate was rejected before clear/draw. Preserve only the
@@ -10817,8 +10829,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         // The same-epoch recovery window is a real upper bound. The old code
         // stopped decrementing at zero but left completeness set forever,
         // allowing a loading-camera CSM to cover the screen indefinitely.
-        if ((m_replayValidationFailedThisFrame ||
-             m_workloadGovernorRejectedThisFrame) &&
+        if (shadowCandidateRejectedForRecovery() &&
             m_hasCompleteShadowMap &&
             m_replayValidationHoldFramesRemaining == 0u) {
           m_hasCompleteShadowMap = false;

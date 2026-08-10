@@ -99,9 +99,12 @@ class ShadowNonTaaContinuityStaticTest(unittest.TestCase):
     def test_adaptive_reuse_requires_exact_content_csm_and_generation(self) -> None:
         start = self.shadow_cpp.index("bool reuseLastShadowMap = false;")
         end = self.shadow_cpp.index(
-            "if (holdForInvalidCsm || holdForTransientEmptyReplay", start
+            "if (ordinaryShadowMapReuseAllowed &&\n"
+            "      (holdForInvalidCsm || holdForTransientEmptyReplay",
+            start,
         )
         adaptive = self.shadow_cpp[start:end]
+        self.assertIn("ordinaryShadowMapReuseAllowed", adaptive)
         for token in (
             "exactReplayContractStable",
             "stagePolicyStable",

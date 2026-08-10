@@ -14,6 +14,20 @@ MESON = (ROOT / "src/d3d9/meson.build").read_text(encoding="utf-8")
 
 
 class ProducerCompletenessContractTest(unittest.TestCase):
+    @staticmethod
+    def function_body(source: str, signature: str) -> str:
+        start = source.index(signature)
+        open_brace = source.index("{", start)
+        depth = 0
+        for index in range(open_brace, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start : index + 1]
+        raise AssertionError(f"unterminated function: {signature}")
+
     def test_contract_is_unsealed_by_default_and_stamped(self):
         self.assertIn("bool sealed = false", SCENE)
         self.assertIn("sealFrameSerial", SCENE)
@@ -61,6 +75,52 @@ class ProducerCompletenessContractTest(unittest.TestCase):
         self.assertIn("renderedShadowMap && producerComplete", SHADOW)
         self.assertIn("!m_replayValidationFailedThisFrame", SHADOW)
         self.assertIn("!m_workloadGovernorRejectedThisFrame", SHADOW)
+
+    def test_semantic_validation_fallback_seals_after_final_stamp(self):
+        body = self.function_body(
+            DEVICE,
+            "bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(",
+        )
+        moved_scene = body.index("input.scene = std::move(m_war3Scene);")
+        frame_stamp = body.index("input.frameSerial = pipelineFrameSerial;")
+        device_stamp = body.index(
+            "input.deviceEpoch = m_war3GpuSkinDeviceEpoch;", frame_stamp
+        )
+        seal = body.index("War3SealShadowProducerCompleteness(", device_stamp)
+        emit = body.index("EmitCs(", seal)
+        self.assertLess(moved_scene, frame_stamp)
+        self.assertLess(frame_stamp, device_stamp)
+        self.assertLess(device_stamp, seal)
+        self.assertLess(seal, emit)
+        sealed = body[seal:emit]
+        self.assertIn("input.scene, input.frameSerial", sealed)
+        self.assertIn("input.mapEpoch, input.deviceEpoch", sealed)
+
+    def test_incomplete_producer_cannot_take_semantic_empty_hold(self):
+        body = self.function_body(
+            SHADOW,
+            "void War3ShadowReceiverPass::Run(",
+        )
+        producer = body.index("const bool producerCompleteForFrame =")
+        ordinary = body.index("const bool ordinaryShadowMapReuseAllowed =", producer)
+        hold = body.index("if (ordinaryShadowMapReuseAllowed &&", ordinary)
+        recovery = body.index("shadowCandidateRejectedForRecovery()", hold)
+        self.assertIn("input.scene.producerCompleteness.accepts(", body[producer:ordinary])
+        ordinary_block = body[ordinary:hold]
+        for token in (
+            "!producerCompleteForFrame",
+            "m_replayValidationFailedThisFrame",
+            "m_workloadGovernorRejectedThisFrame",
+        ):
+            self.assertIn(token, body[producer:ordinary])
+        self.assertIn("holdForSemanticDynamicEmptyReplay", body[hold:recovery])
+        self.assertIn(
+            "m_recentSemanticDynamicHoldFramesRemaining",
+            body[hold:recovery],
+        )
+        self.assertIn("m_replayValidationHoldFramesRemaining != 0u", body[recovery:])
+        self.assertIn("--m_replayValidationHoldFramesRemaining;", body[recovery:])
+        self.assertIn("m_hasCompleteShadowMap = false;", body[recovery:])
 
     def test_policy_runnable_is_registered(self):
         self.assertIn("war3_shadow_producer_completeness_policy_test", MESON)

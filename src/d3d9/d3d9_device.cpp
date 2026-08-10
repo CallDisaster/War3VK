@@ -31042,6 +31042,11 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
   input.frameSerial = pipelineFrameSerial;
   input.mapEpoch = m_war3GpuSkinMapEpoch;
   input.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+  // EndFrame/SemanticValidation moves the same producer scene as BeforeUi.
+  // Seal only after its final input stamp is known; an unsealed zero scene is
+  // not permission for the receiver to publish or reuse a directional map.
+  War3SealShadowProducerCompleteness(input.scene, input.frameSerial,
+                                     input.mapEpoch, input.deviceEpoch);
 
   EmitCs([this, cInput = std::move(input)](DxvkContext *ctx) mutable {
     Rc<DxvkCommandList> cmd;
