@@ -29,6 +29,26 @@ fingerprint。它只把多个精确逻辑 slice 放入少量 16 MiB device-local
   snapshot。16 MiB 页让完整 384 MiB 代际最多创建 24 个真实 Vulkan
   buffer，在不放宽 32 次门和驻留上限的情况下闭合该峰值。
 
+## 隔离 smoke 证据
+
+2026-08-12 使用同一地图、120 秒、2×2 低视角巡航比较：
+
+| 指标 | 4 MiB 页 | 16 MiB 页 |
+| --- | ---: | ---: |
+| 观察帧 | 5229 | 5322 |
+| producer incomplete 帧 | 3 | 0 |
+| required caster omission | 274 | 0 |
+| position page-create budget reject | 225 | 0 |
+| fallback byte-budget reject | 49 | 0 |
+| Vulkan 页创建 | 187 | 60 |
+| Arena 峰值 | 383.848 MiB | 375.587 MiB |
+
+两轮均未产生 `VK_ERROR_DEVICE_LOST`、Event 153/4101、Arena overflow 或
+ownership violation，AutoTest 结束后部署 DLL 按 SHA-256 精确恢复。该证据只
+证明隔离桌面的资源/完整性门；内部 framebuffer 不能代替玩家前台对细影稳定性
+和绝对 FPS 的肉眼验收。terrain fallback 仍约 61 万次，Arena 平均仍约
+51 MiB，后续减负不能把这次 omission 归零误写成 Persistent Package 已完成。
+
 ## 诊断与验证
 
 新增运行时/性能字段报告页驻留、已用、创建、逻辑子分配、回收、容量拒绝
