@@ -38,6 +38,7 @@
 #include "war3/hooks/war3_hook_perf.h"
 #include "war3/memory/war3_cpu_readable_buffer_span.h"
 #include "war3/memory/war3_coherent_up_index_trim_contract.h"
+#include "war3/memory/war3_coherent_real_index_trim_contract.h"
 #include "war3/memory/war3_current_up_shadow_replay_contract.h"
 #include "war3/memory/war3_exact_index_domain_observer_cache.h"
 #include "war3/memory/war3_shadow_arena.h"
@@ -3170,6 +3171,16 @@ War3CurrentUpShadowReplayModeRuntime() {
     return War3CurrentUpShadowReplayMode::Off;
   static const auto s_mode = ParseWar3CurrentUpShadowReplayMode(
       War3GetEnvU32("DXVK_WAR3_CURRENT_UP_SHADOW_REPLAY_MODE", 0u));
+  return s_mode;
+}
+
+dxvk::war3::memory::War3CoherentRealIndexTrimMode
+War3CoherentRealIndexTrimModeRuntime() {
+  using namespace dxvk::war3::memory;
+  if constexpr (!kCoherentRealIndexTrimDevelopmentEnabled)
+    return War3CoherentRealIndexTrimMode::Off;
+  static const auto s_mode = ParseWar3CoherentRealIndexTrimMode(
+      War3GetEnvU32("DXVK_WAR3_COHERENT_REAL_INDEX_TRIM_MODE", 0u));
   return s_mode;
 }
 
@@ -46669,7 +46680,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   uint32_t exactIndexedDomainVertexCount = 0u;
   bool exactIndexedDomainKnown = false;
   thread_local std::vector<uint8_t> s_exactRebasedIndexScratch;
+  thread_local std::vector<uint8_t> s_coherentRealPositionScratch;
   s_exactRebasedIndexScratch.clear();
+  s_coherentRealPositionScratch.clear();
   using CoherentUpTrimMode =
       dxvk::war3::memory::War3CoherentUpIndexTrimMode;
   const CoherentUpTrimMode coherentUpTrimMode =
@@ -46710,6 +46723,42 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   bool coherentUpTrimEligible = false;
   uint64_t coherentUpTrimBytesBefore = 0u;
   uint64_t coherentUpTrimBytesAfter = 0u;
+  using CoherentRealTrimMode =
+      dxvk::war3::memory::War3CoherentRealIndexTrimMode;
+  const CoherentRealTrimMode coherentRealTrimMode =
+      War3CoherentRealIndexTrimModeRuntime();
+  const bool coherentRealTrimObserved =
+      coherentRealTrimMode != CoherentRealTrimMode::Off && indexed &&
+      terrainCaster;
+  Rc<DxvkResourceAllocation> coherentRealPositionMappedAllocation = nullptr;
+  dxvk::war3::memory::War3CpuReadableBufferSpan
+      coherentRealPositionSpan = {};
+  if (coherentRealTrimObserved && !DynamicSysmemVBOs && posDynamic &&
+      vbCommon != nullptr && !vbCommon->NeedsReadback()) {
+    coherentRealPositionMappedAllocation = vbCommon->GetMappedSlice();
+    if (coherentRealPositionMappedAllocation != nullptr) {
+      const auto allocationInfo =
+          coherentRealPositionMappedAllocation->getBufferInfo();
+      const bool hostVisible =
+          (coherentRealPositionMappedAllocation->getMemoryProperties() &
+           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+      coherentRealPositionSpan =
+          dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+              coherentRealPositionMappedAllocation->mapPtr(),
+              uint64_t(allocationInfo.size), uint64_t(posSlice.offset()),
+              uint64_t(posSlice.length()),
+              reinterpret_cast<uintptr_t>(vbCommon),
+              vbCommon->War3IdentityGeneration(),
+              vbCommon->War3MapAllocationGeneration(),
+              vbCommon->War3ContentGeneration(), hostVisible});
+    }
+  }
+  const bool coherentRealTrimScanCandidate =
+      coherentRealTrimObserved && bool(coherentRealPositionSpan);
+  bool coherentRealTrimEligible = false;
+  bool coherentRealTrimConsumed = false;
+  uint64_t coherentRealTrimBytesBefore = 0u;
+  uint64_t coherentRealTrimBytesAfter = 0u;
   // Both per-draw SYSTEMMEM uploads and ordinary D3DUSAGE_DYNAMIC position
   // buffers are frozen into the Arena below.  The latter are the dominant
   // Warcraft terrain path, so restricting this proof to DynamicSysmemVBOs
@@ -46743,6 +46792,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   const bool exactIndexedDomainScanCandidate =
       exactIndexedFreezeTrimCandidate ||
       coherentUpTrimCandidate ||
+      coherentRealTrimScanCandidate ||
       exactIndexedTerrainBoundsAuditSample;
   const uint64_t positionCapacity64 = posInfo.size / posStride;
   if (exactIndexedDomainScanCandidate) {
@@ -46804,6 +46854,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       // buffer still has pending CPU writes, queue its normal upload before
       // the Arena copy so the scanned generation and frozen IB are identical.
       const bool uploadReady = !exactIndexCommon->NeedsUpload() ||
+          coherentRealTrimScanCandidate ||
           (exactIndexedFreezeTrimCandidate &&
            SUCCEEDED(FlushBuffer(exactIndexCommon)));
       auto exactIndexAllocation = exactIndexCommon->GetMappedSlice();
@@ -46985,7 +47036,71 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               coherentUpTrimBytesAfter < coherentUpTrimBytesBefore;
         }
 
-        if (exactIndexedFreezeTrimCandidate && allStreamsFit &&
+        if (coherentRealTrimScanCandidate) {
+          const auto coherentRealDecision =
+              dxvk::war3::memory::EvaluateWar3CoherentRealIndexTrim({
+                  indexed && terrainCaster,
+                  gpuSkinLegacyBacking,
+                  vertexBlendEnabled,
+                  captureAlphaTest,
+                  alphaBlend,
+                  !DynamicSysmemVBOs && posDynamic,
+                  bool(coherentRealPositionSpan),
+                  bool(exactIndexSpan),
+                  coherentRealPositionSpan.length,
+                  posStride,
+                  exactIndexSpan.length,
+                  indexElementBytes,
+                  CountVal,
+              });
+          if (coherentRealDecision) {
+            coherentRealTrimBytesBefore = uint64_t(posBytesNeeded);
+            coherentRealTrimBytesAfter = uint64_t(count) * uint64_t(posStride);
+            coherentRealTrimEligible = allStreamsFit && compactVertexRange &&
+                rebasedIndexReady &&
+                coherentRealTrimBytesAfter < coherentRealTrimBytesBefore;
+          }
+        }
+
+        bool coherentRealPositionSnapshotReady = false;
+        if (coherentRealTrimEligible &&
+            coherentRealTrimMode == CoherentRealTrimMode::Consume) {
+          const uint64_t compactPositionOffset = first * uint64_t(posStride);
+          const uint64_t compactPositionBytes = count * uint64_t(posStride);
+          const auto currentMapping = vbCommon != nullptr
+              ? vbCommon->GetMappedSlice() : nullptr;
+          const bool generationStillCurrent =
+              vbCommon != nullptr && currentMapping != nullptr &&
+              coherentRealPositionMappedAllocation != nullptr &&
+              currentMapping.ptr() ==
+                  coherentRealPositionMappedAllocation.ptr() &&
+              vbCommon->War3IdentityGeneration() ==
+                  coherentRealPositionSpan.identityGeneration &&
+              vbCommon->War3MapAllocationGeneration() ==
+                  coherentRealPositionSpan.allocationGeneration &&
+              vbCommon->War3ContentGeneration() ==
+                  coherentRealPositionSpan.contentGeneration;
+          if (generationStillCurrent &&
+              compactPositionOffset <= coherentRealPositionSpan.length &&
+              compactPositionBytes <=
+                  coherentRealPositionSpan.length - compactPositionOffset &&
+              compactPositionBytes <=
+                  uint64_t(std::numeric_limits<size_t>::max())) {
+            s_coherentRealPositionScratch.resize(
+                static_cast<size_t>(compactPositionBytes));
+            std::memcpy(
+                s_coherentRealPositionScratch.data(),
+                coherentRealPositionSpan.data + compactPositionOffset,
+                static_cast<size_t>(compactPositionBytes));
+            coherentRealPositionSnapshotReady = true;
+          }
+        }
+
+        const bool consumeCoherentRealTrim =
+            coherentRealTrimEligible && coherentRealPositionSnapshotReady &&
+            coherentRealTrimMode == CoherentRealTrimMode::Consume;
+        if ((exactIndexedFreezeTrimCandidate || consumeCoherentRealTrim) &&
+            allStreamsFit &&
             compactVertexRange && rebasedIndexReady) {
           exactIndexedFreezeBytesBefore = uint64_t(posBytesNeeded) +
               uint64_t(blendBytesNeeded) +
@@ -47009,6 +47124,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           exactIndexedFreezeMaxIndex = exactDomain.maxIndex;
           exactIndexedFreezeTrimmed = true;
           exactIndexedFreezeRebased = true;
+          coherentRealTrimConsumed = consumeCoherentRealTrim;
           idxBytesNeeded = VkDeviceSize(exactIndexBytes);
           exactIndexedFreezeBytesAfter = uint64_t(posBytesNeeded) +
               uint64_t(blendBytesNeeded) +
@@ -47029,6 +47145,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         coherentUpTrimMode == CoherentUpTrimMode::Consume &&
             exactIndexedFreezeTrimmed,
         coherentUpTrimBytesBefore, coherentUpTrimBytesAfter);
+  }
+  if (coherentRealTrimObserved) {
+    dxvk::war3::memory::ShadowArena_NoteCoherentRealIndexTrim(
+        true, coherentRealTrimEligible, coherentRealTrimConsumed,
+        coherentRealTrimBytesBefore, coherentRealTrimBytesAfter);
   }
 
   auto resolveTerrainBoundsVertexRange = [&]() {
@@ -49727,14 +49848,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       [&](War3FrameFreezeStreamType streamType,
           dxvk::war3::memory::ShadowArenaAllocationTag allocationTag,
           const DxvkBufferSlice& sourceSlice, VkDeviceSize bytes,
-          bool stableUpload, uint32_t sourceStream,
+          bool stableUpload, bool immediateCpuSnapshot,
+          uint32_t sourceStream,
           D3D9CommonBuffer* common, const void* stableBytes,
           VkDeviceSize stableLength, Rc<DxvkBuffer>& outputStorage,
           DxvkResourceBufferInfo& outputInfo) {
     if (freezePlanCount >= freezePlans.size() ||
         sourceSlice.buffer() == nullptr || bytes == 0u ||
         bytes > sourceSlice.length() ||
-        (stableUpload && (stableBytes == nullptr || bytes > stableLength))) {
+        (immediateCpuSnapshot &&
+         (stableBytes == nullptr || bytes > stableLength))) {
       freezePlanInvalid = true;
       return;
     }
@@ -49767,8 +49890,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     auto& plan = freezePlans[freezePlanCount++];
     plan.sourceSlice = sourceSlice;
     plan.bytes = bytes;
-    plan.stableSourceBytes = stableUpload ? stableBytes : nullptr;
-    plan.stableSourceLength = stableUpload ? stableLength : 0u;
+    plan.stableSourceBytes = immediateCpuSnapshot ? stableBytes : nullptr;
+    plan.stableSourceLength = immediateCpuSnapshot ? stableLength : 0u;
     plan.outputStorage = &outputStorage;
     plan.outputInfo = &outputInfo;
     plan.cacheKey = key;
@@ -49788,31 +49911,36 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       m_war3Scene.shadowStats.gpuSkinShadowBackingFallbackCount++;
       ++m_war3GpuSkinP2BackingFallbacks;
     }
-    const bool stable =
+    const bool currentUpStable =
         DynamicSysmemVBOs && m_war3PerDrawUpload.vbValid[posStream];
+    const bool immediateCpuSnapshot =
+        currentUpStable || coherentRealTrimConsumed;
     const bool positionRangeValid =
         posFreezeByteOffset <= posSlice.length() &&
         posBytesNeeded <= posSlice.length() - posFreezeByteOffset;
     const auto positionFreezeSlice = positionRangeValid
         ? posSlice.subSlice(posFreezeByteOffset, posBytesNeeded)
         : DxvkBufferSlice();
-    const auto* positionStableBytes = stable &&
-            posFreezeByteOffset <=
-                VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream])
-        ? reinterpret_cast<const uint8_t*>(
-              m_war3PerDrawUpload.vbUploadBytes[posStream]) +
-              size_t(posFreezeByteOffset)
-        : nullptr;
-    const VkDeviceSize positionStableLength = stable &&
-            posFreezeByteOffset <=
-                VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream])
-        ? VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream]) -
-              posFreezeByteOffset
-        : 0u;
+    const auto* positionStableBytes = coherentRealTrimConsumed
+        ? s_coherentRealPositionScratch.data()
+        : currentUpStable && posFreezeByteOffset <=
+                  VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream])
+            ? reinterpret_cast<const uint8_t*>(
+                  m_war3PerDrawUpload.vbUploadBytes[posStream]) +
+                  size_t(posFreezeByteOffset)
+            : nullptr;
+    const VkDeviceSize positionStableLength = coherentRealTrimConsumed
+        ? VkDeviceSize(s_coherentRealPositionScratch.size())
+        : currentUpStable && posFreezeByteOffset <=
+                  VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream])
+            ? VkDeviceSize(m_war3PerDrawUpload.vbUploadLength[posStream]) -
+                  posFreezeByteOffset
+            : 0u;
     appendFreezePlan(
         War3FrameFreezeStreamType::Position,
         dxvk::war3::memory::ShadowArenaAllocationTag::Position,
-        positionFreezeSlice, posBytesNeeded, stable, posStream,
+        positionFreezeSlice, posBytesNeeded, currentUpStable,
+        immediateCpuSnapshot, posStream,
         gpuSkinLegacyBacking ? nullptr : commonForStream(posStream),
         positionStableBytes, positionStableLength,
         posAlloc, posInfo);
@@ -49843,7 +49971,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     appendFreezePlan(
         War3FrameFreezeStreamType::Blend,
         dxvk::war3::memory::ShadowArenaAllocationTag::Blend,
-        blendFreezeSlice, blendBytesNeeded, stable, blendStream,
+        blendFreezeSlice, blendBytesNeeded, stable, stable, blendStream,
         commonForStream(blendStream),
         blendStableBytes, blendStableLength,
         blendAlloc, blendInfo);
@@ -49876,15 +50004,18 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     appendFreezePlan(
         War3FrameFreezeStreamType::Uv,
         dxvk::war3::memory::ShadowArenaAllocationTag::Uv,
-        uvFreezeSlice, uvBytesNeeded, uvRequiresStableUploadSource, uvStream,
+        uvFreezeSlice, uvBytesNeeded, uvRequiresStableUploadSource,
+        uvRequiresStableUploadSource, uvStream,
         commonForStream(uvStream),
         uvStableBytes, uvStableLength,
         uvAlloc, uvInfo);
   }
 
   if (shouldFreezeIndexBuffer) {
-    const bool stable = exactIndexedFreezeRebased ||
-        (DynamicSysmemIBO && m_war3PerDrawUpload.ibValid);
+    const bool currentUpStable = !exactIndexedFreezeRebased &&
+        DynamicSysmemIBO && m_war3PerDrawUpload.ibValid;
+    const bool immediateCpuSnapshot =
+        exactIndexedFreezeRebased || currentUpStable;
     auto* indexCommon = m_state.indices.ptr() != nullptr
         ? m_state.indices.ptr()->GetCommonBuffer() : nullptr;
     const VkDeviceSize indexElementBytes =
@@ -49901,14 +50032,15 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         : idxSlice;
     const void* stableIndexBytes = exactIndexedFreezeRebased
         ? static_cast<const void*>(s_exactRebasedIndexScratch.data())
-        : (stable ? m_war3PerDrawUpload.ibUploadBytes : nullptr);
+        : (currentUpStable ? m_war3PerDrawUpload.ibUploadBytes : nullptr);
     const VkDeviceSize stableIndexLength = exactIndexedFreezeRebased
         ? VkDeviceSize(s_exactRebasedIndexScratch.size())
-        : (stable ? m_war3PerDrawUpload.ibUploadLength : 0u);
+        : (currentUpStable ? m_war3PerDrawUpload.ibUploadLength : 0u);
     appendFreezePlan(
         War3FrameFreezeStreamType::Index,
         dxvk::war3::memory::ShadowArenaAllocationTag::Index,
-        indexFreezeSlice, idxBytesNeeded, stable, 0u,
+        indexFreezeSlice, idxBytesNeeded, currentUpStable,
+        immediateCpuSnapshot, 0u,
         exactIndexedFreezeRebased ? nullptr : indexCommon,
         stableIndexBytes, stableIndexLength,
         idxAlloc, idxInfo);

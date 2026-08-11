@@ -116,6 +116,11 @@ struct ShadowArenaDiagnostics {
   uint64_t coherentUpTrimWouldSaveBytes = 0u;
   uint64_t coherentUpTrimConsumedCount = 0u;
   uint64_t coherentUpTrimConsumedBytesSaved = 0u;
+  uint64_t coherentRealTrimObservedCount = 0u;
+  uint64_t coherentRealTrimEligibleCount = 0u;
+  uint64_t coherentRealTrimWouldSaveBytes = 0u;
+  uint64_t coherentRealTrimConsumedCount = 0u;
+  uint64_t coherentRealTrimConsumedBytesSaved = 0u;
   uint64_t currentUpPositionReplayObservedCount = 0u;
   uint64_t currentUpPositionReplayEligibleCount = 0u;
   uint64_t currentUpPositionReplayWouldAvoidBytes = 0u;
@@ -185,6 +190,9 @@ void ShadowArena_NoteExactIndexTrim(
     bool accepted, uint64_t bytesBefore, uint64_t bytesAfter);
 void ShadowArena_NoteCoherentUpIndexTrim(
     bool eligible, bool consumed, uint64_t bytesBefore,
+    uint64_t bytesAfter);
+void ShadowArena_NoteCoherentRealIndexTrim(
+    bool observed, bool eligible, bool consumed, uint64_t bytesBefore,
     uint64_t bytesAfter);
 void ShadowArena_NoteCurrentUpPositionReplay(
     bool observed, bool eligible, bool consumed, uint64_t avoidedBytes);

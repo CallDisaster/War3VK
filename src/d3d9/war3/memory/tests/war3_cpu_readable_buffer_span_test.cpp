@@ -1,5 +1,6 @@
 #include "../war3_cpu_readable_buffer_span.h"
 #include "../war3_coherent_up_index_trim_contract.h"
+#include "../war3_coherent_real_index_trim_contract.h"
 #include "../war3_current_up_shadow_replay_contract.h"
 #include "../war3_exact_index_domain_observer_cache.h"
 
@@ -305,6 +306,58 @@ bool TestCurrentUpPositionReplayContract() {
   return true;
 }
 
+bool TestCoherentCurrentRealIndexTrimContract() {
+  War3CoherentRealIndexTrimInput input = {};
+  input.indexedTerrain = true;
+  input.dynamicRealPosition = true;
+  input.currentPositionSpan = true;
+  input.currentIndexSpan = true;
+  input.positionSpanBytes = 512u * 1024u;
+  input.positionStride = 32u;
+  input.indexSpanBytes = 12u;
+  input.indexElementBytes = 2u;
+  input.indexCount = 6u;
+  const auto accepted = EvaluateWar3CoherentRealIndexTrim(input);
+  CHECK(accepted);
+  CHECK(accepted.indexBytes == 12u);
+  CHECK(accepted.positionCapacity == 16384u);
+
+  auto rejected = input;
+  rejected.vertexBlendEnabled = true;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::NotRigidOpaque);
+  rejected = input;
+  rejected.alphaTestEnabled = true;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::NotRigidOpaque);
+  rejected = input;
+  rejected.dynamicRealPosition = false;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::NotDynamicRealPosition);
+  rejected = input;
+  rejected.currentPositionSpan = false;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::MissingCurrentPositionSpan);
+  rejected = input;
+  rejected.currentIndexSpan = false;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::MissingCurrentIndexSpan);
+  rejected = input;
+  rejected.indexSpanBytes = 10u;
+  CHECK(EvaluateWar3CoherentRealIndexTrim(rejected).rejectReason ==
+        War3CoherentRealIndexTrimRejectReason::IndexRangeOutsideSpan);
+
+  CHECK(ParseWar3CoherentRealIndexTrimMode(0u) ==
+        War3CoherentRealIndexTrimMode::Off);
+  CHECK(ParseWar3CoherentRealIndexTrimMode(1u) ==
+        War3CoherentRealIndexTrimMode::Observe);
+  CHECK(ParseWar3CoherentRealIndexTrimMode(2u) ==
+        War3CoherentRealIndexTrimMode::Consume);
+  CHECK(ParseWar3CoherentRealIndexTrimMode(3u) ==
+        War3CoherentRealIndexTrimMode::Off);
+  return true;
+}
+
 War3ExactIndexDomainObserverKey ObserverKey(uint64_t contentGeneration) {
   War3ExactIndexDomainObserverKey key = {};
   key.mapEpoch = 3u;
@@ -441,6 +494,7 @@ int main() {
       !TestExactIndexDomainRebase() ||
       !TestCoherentCurrentUpIndexTrimContract() ||
       !TestCurrentUpPositionReplayContract() ||
+      !TestCoherentCurrentRealIndexTrimContract() ||
       !TestExactIndexDomainObserverCacheIdentity() ||
       !TestExactIndexDomainObserverCacheDeterministicReplacement())
     return 1;

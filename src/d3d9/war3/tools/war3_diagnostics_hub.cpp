@@ -643,6 +643,16 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
          frame.arenaCoherentUpTrimConsumedCount},
         {"arenaCoherentUpTrimConsumedBytesSaved",
          frame.arenaCoherentUpTrimConsumedBytesSaved},
+        {"arenaCoherentRealTrimObservedCount",
+         frame.arenaCoherentRealTrimObservedCount},
+        {"arenaCoherentRealTrimEligibleCount",
+         frame.arenaCoherentRealTrimEligibleCount},
+        {"arenaCoherentRealTrimWouldSaveBytes",
+         frame.arenaCoherentRealTrimWouldSaveBytes},
+        {"arenaCoherentRealTrimConsumedCount",
+         frame.arenaCoherentRealTrimConsumedCount},
+        {"arenaCoherentRealTrimConsumedBytesSaved",
+         frame.arenaCoherentRealTrimConsumedBytesSaved},
         {"arenaCurrentUpPositionReplayObservedCount",
          frame.arenaCurrentUpPositionReplayObservedCount},
         {"arenaCurrentUpPositionReplayEligibleCount",
@@ -890,6 +900,16 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
       arena.coherentUpTrimConsumedCount;
   frame.arenaCoherentUpTrimConsumedBytesSaved =
       arena.coherentUpTrimConsumedBytesSaved;
+  frame.arenaCoherentRealTrimObservedCount =
+      arena.coherentRealTrimObservedCount;
+  frame.arenaCoherentRealTrimEligibleCount =
+      arena.coherentRealTrimEligibleCount;
+  frame.arenaCoherentRealTrimWouldSaveBytes =
+      arena.coherentRealTrimWouldSaveBytes;
+  frame.arenaCoherentRealTrimConsumedCount =
+      arena.coherentRealTrimConsumedCount;
+  frame.arenaCoherentRealTrimConsumedBytesSaved =
+      arena.coherentRealTrimConsumedBytesSaved;
   frame.arenaCurrentUpPositionReplayObservedCount =
       arena.currentUpPositionReplayObservedCount;
   frame.arenaCurrentUpPositionReplayEligibleCount =
@@ -1359,6 +1379,16 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       arenaDiagnostics.coherentUpTrimConsumedCount;
   summary.shadowArenaCoherentUpTrimConsumedBytesSaved =
       arenaDiagnostics.coherentUpTrimConsumedBytesSaved;
+  summary.shadowArenaCoherentRealTrimObservedCount =
+      arenaDiagnostics.coherentRealTrimObservedCount;
+  summary.shadowArenaCoherentRealTrimEligibleCount =
+      arenaDiagnostics.coherentRealTrimEligibleCount;
+  summary.shadowArenaCoherentRealTrimWouldSaveBytes =
+      arenaDiagnostics.coherentRealTrimWouldSaveBytes;
+  summary.shadowArenaCoherentRealTrimConsumedCount =
+      arenaDiagnostics.coherentRealTrimConsumedCount;
+  summary.shadowArenaCoherentRealTrimConsumedBytesSaved =
+      arenaDiagnostics.coherentRealTrimConsumedBytesSaved;
   summary.shadowArenaCurrentUpPositionReplayObservedCount =
       arenaDiagnostics.currentUpPositionReplayObservedCount;
   summary.shadowArenaCurrentUpPositionReplayEligibleCount =
@@ -3758,6 +3788,16 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.shadowArenaCoherentUpTrimConsumedCount},
         {"shadowArenaCoherentUpTrimConsumedBytesSaved",
          snapshot.shadow.shadowArenaCoherentUpTrimConsumedBytesSaved},
+        {"shadowArenaCoherentRealTrimObservedCount",
+         snapshot.shadow.shadowArenaCoherentRealTrimObservedCount},
+        {"shadowArenaCoherentRealTrimEligibleCount",
+         snapshot.shadow.shadowArenaCoherentRealTrimEligibleCount},
+        {"shadowArenaCoherentRealTrimWouldSaveBytes",
+         snapshot.shadow.shadowArenaCoherentRealTrimWouldSaveBytes},
+        {"shadowArenaCoherentRealTrimConsumedCount",
+         snapshot.shadow.shadowArenaCoherentRealTrimConsumedCount},
+        {"shadowArenaCoherentRealTrimConsumedBytesSaved",
+         snapshot.shadow.shadowArenaCoherentRealTrimConsumedBytesSaved},
         {"shadowArenaCurrentUpPositionReplayObservedCount",
          snapshot.shadow.shadowArenaCurrentUpPositionReplayObservedCount},
         {"shadowArenaCurrentUpPositionReplayEligibleCount",

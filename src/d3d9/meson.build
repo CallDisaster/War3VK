@@ -237,6 +237,9 @@ endif
 if get_option('warvk_current_up_shadow_replay_dev')
   d3d9_cpp_args += [ '-DWARVK_ENABLE_CURRENT_UP_SHADOW_REPLAY_DEV=1' ]
 endif
+if get_option('warvk_coherent_real_index_trim_dev')
+  d3d9_cpp_args += [ '-DWARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV=1' ]
+endif
 if get_option('warvk_device_address_binding_report_dev')
   # Keep the fixed-capacity tracker type identical across the DXVK static
   # library and every D3D9 translation unit that includes its value snapshots.
@@ -801,6 +804,7 @@ war3_cpu_readable_buffer_span_test = executable(
   cpp_args            : [
     '-DWARVK_ENABLE_COHERENT_UP_INDEX_TRIM_DEV=1',
     '-DWARVK_ENABLE_CURRENT_UP_SHADOW_REPLAY_DEV=1',
+    '-DWARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV=1',
   ],
   include_directories : [ dxvk_include_path ],
   install             : false,

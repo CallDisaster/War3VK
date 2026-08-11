@@ -634,6 +634,11 @@ private:
         uint64_t drawTimeSnapshotPageCapacityRejectCount = 0;
         uint64_t drawTimeSnapshotPageAllocationFailureCount = 0;
         uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
+        uint64_t coherentRealTrimObservedCountLast = 0;
+        uint64_t coherentRealTrimEligibleCountLast = 0;
+        uint64_t coherentRealTrimWouldSaveBytesLast = 0;
+        uint64_t coherentRealTrimConsumedCountLast = 0;
+        uint64_t coherentRealTrimConsumedBytesSavedLast = 0;
         uint64_t framesBudgetExceeded = 0;
         uint64_t framesReuseLastComplete = 0;
         uint64_t framesRenderCurrentPartial = 0;

@@ -95,6 +95,11 @@ std::atomic<uint64_t> g_coherentUpTrimEligibleCount{0u};
 std::atomic<uint64_t> g_coherentUpTrimWouldSaveBytes{0u};
 std::atomic<uint64_t> g_coherentUpTrimConsumedCount{0u};
 std::atomic<uint64_t> g_coherentUpTrimConsumedBytesSaved{0u};
+std::atomic<uint64_t> g_coherentRealTrimObservedCount{0u};
+std::atomic<uint64_t> g_coherentRealTrimEligibleCount{0u};
+std::atomic<uint64_t> g_coherentRealTrimWouldSaveBytes{0u};
+std::atomic<uint64_t> g_coherentRealTrimConsumedCount{0u};
+std::atomic<uint64_t> g_coherentRealTrimConsumedBytesSaved{0u};
 std::atomic<uint64_t> g_currentUpPositionReplayObservedCount{0u};
 std::atomic<uint64_t> g_currentUpPositionReplayEligibleCount{0u};
 std::atomic<uint64_t> g_currentUpPositionReplayWouldAvoidBytes{0u};
@@ -469,6 +474,11 @@ bool ShadowArena_Init(DxvkDevice* device) {
   g_coherentUpTrimWouldSaveBytes.store(0u, std::memory_order_release);
   g_coherentUpTrimConsumedCount.store(0u, std::memory_order_release);
   g_coherentUpTrimConsumedBytesSaved.store(0u, std::memory_order_release);
+  g_coherentRealTrimObservedCount.store(0u, std::memory_order_release);
+  g_coherentRealTrimEligibleCount.store(0u, std::memory_order_release);
+  g_coherentRealTrimWouldSaveBytes.store(0u, std::memory_order_release);
+  g_coherentRealTrimConsumedCount.store(0u, std::memory_order_release);
+  g_coherentRealTrimConsumedBytesSaved.store(0u, std::memory_order_release);
   g_currentUpPositionReplayObservedCount.store(0u,
                                                std::memory_order_release);
   g_currentUpPositionReplayEligibleCount.store(0u,
@@ -844,6 +854,26 @@ void ShadowArena_NoteCoherentUpIndexTrim(
                                                 std::memory_order_relaxed);
 }
 
+void ShadowArena_NoteCoherentRealIndexTrim(
+    bool observed, bool eligible, bool consumed, uint64_t bytesBefore,
+    uint64_t bytesAfter) {
+  if (!observed)
+    return;
+  g_coherentRealTrimObservedCount.fetch_add(1u, std::memory_order_relaxed);
+  if (!eligible)
+    return;
+  g_coherentRealTrimEligibleCount.fetch_add(1u, std::memory_order_relaxed);
+  const uint64_t saved = bytesAfter < bytesBefore
+      ? bytesBefore - bytesAfter : 0u;
+  g_coherentRealTrimWouldSaveBytes.fetch_add(saved,
+                                              std::memory_order_relaxed);
+  if (!consumed)
+    return;
+  g_coherentRealTrimConsumedCount.fetch_add(1u, std::memory_order_relaxed);
+  g_coherentRealTrimConsumedBytesSaved.fetch_add(saved,
+                                                  std::memory_order_relaxed);
+}
+
 void ShadowArena_NoteCurrentUpPositionReplay(
     bool observed, bool eligible, bool consumed, uint64_t avoidedBytes) {
   if (!observed)
@@ -1022,6 +1052,16 @@ ShadowArenaDiagnostics ShadowArena_QueryDiagnostics() {
       g_coherentUpTrimConsumedCount.load(std::memory_order_acquire);
   diagnostics.coherentUpTrimConsumedBytesSaved =
       g_coherentUpTrimConsumedBytesSaved.load(std::memory_order_acquire);
+  diagnostics.coherentRealTrimObservedCount =
+      g_coherentRealTrimObservedCount.load(std::memory_order_acquire);
+  diagnostics.coherentRealTrimEligibleCount =
+      g_coherentRealTrimEligibleCount.load(std::memory_order_acquire);
+  diagnostics.coherentRealTrimWouldSaveBytes =
+      g_coherentRealTrimWouldSaveBytes.load(std::memory_order_acquire);
+  diagnostics.coherentRealTrimConsumedCount =
+      g_coherentRealTrimConsumedCount.load(std::memory_order_acquire);
+  diagnostics.coherentRealTrimConsumedBytesSaved =
+      g_coherentRealTrimConsumedBytesSaved.load(std::memory_order_acquire);
   diagnostics.currentUpPositionReplayObservedCount =
       g_currentUpPositionReplayObservedCount.load(std::memory_order_acquire);
   diagnostics.currentUpPositionReplayEligibleCount =

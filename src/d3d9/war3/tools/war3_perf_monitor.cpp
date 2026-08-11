@@ -21,6 +21,7 @@
 #include "../hooks/war3_hook_install_util.h"
 #include "../hooks/war3_hook_render.h"
 #include "../core/war3_runtime_profile.h"
+#include "../memory/war3_shadow_arena.h"
 #include "../model/war3_model_registry.h"
 #include "../render/war3_shadow_object_registry.h"
 #include "../render/war3_shadow_lifecycle.h"
@@ -1297,6 +1298,17 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.drawTimeSnapshotPageAllocationFailureCount;
   agg.drawTimeVBCacheIndexedUnknownRangeFallbackCount +=
       stats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+  const auto arenaDiagnostics = memory::ShadowArena_QueryDiagnostics();
+  agg.coherentRealTrimObservedCountLast =
+      arenaDiagnostics.coherentRealTrimObservedCount;
+  agg.coherentRealTrimEligibleCountLast =
+      arenaDiagnostics.coherentRealTrimEligibleCount;
+  agg.coherentRealTrimWouldSaveBytesLast =
+      arenaDiagnostics.coherentRealTrimWouldSaveBytes;
+  agg.coherentRealTrimConsumedCountLast =
+      arenaDiagnostics.coherentRealTrimConsumedCount;
+  agg.coherentRealTrimConsumedBytesSavedLast =
+      arenaDiagnostics.coherentRealTrimConsumedBytesSaved;
   agg.totalBudgetBytes += stats.fallbackBudgetBytes;
   agg.totalUsedBytes += stats.fallbackBudgetUsedBytes;
   agg.maxBudgetBytes =
@@ -6068,6 +6080,16 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeSnapshotPageAllocationFailureCount << ",\n";
   json << "    \"drawTimeVBCacheIndexedUnknownRangeFallbackCount\": "
        << shadowAgg.drawTimeVBCacheIndexedUnknownRangeFallbackCount << ",\n";
+  json << "    \"coherentRealTrimObservedCountLast\": "
+       << shadowAgg.coherentRealTrimObservedCountLast << ",\n";
+  json << "    \"coherentRealTrimEligibleCountLast\": "
+       << shadowAgg.coherentRealTrimEligibleCountLast << ",\n";
+  json << "    \"coherentRealTrimWouldSaveBytesLast\": "
+       << shadowAgg.coherentRealTrimWouldSaveBytesLast << ",\n";
+  json << "    \"coherentRealTrimConsumedCountLast\": "
+       << shadowAgg.coherentRealTrimConsumedCountLast << ",\n";
+  json << "    \"coherentRealTrimConsumedBytesSavedLast\": "
+       << shadowAgg.coherentRealTrimConsumedBytesSavedLast << ",\n";
   json << "    \"framesBudgetExceeded\": " << shadowAgg.framesBudgetExceeded
        << ",\n";
   json << "    \"framesReuseLastComplete\": "
