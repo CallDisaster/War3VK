@@ -349,6 +349,13 @@ class RetainedNativeProcessWitness:
     def to_dict(self) -> Dict[str, Any]:
         return self.snapshot()
 
+    def snapshot_modules(self) -> List[Dict[str, Any]]:
+        """Enumerate modules through the already-owned launch HANDLE."""
+        with self._lock:
+            if self._closed or self._handle <= 0:
+                return []
+            return _snapshot_process_modules_psapi_handle(self._handle)
+
     def _binding_exact(
         self, pid: int, creation_epoch_ms: int, canonical_exe_path: str,
     ) -> bool:
@@ -2055,6 +2062,111 @@ def _snapshot_process_modules(pid: int) -> List[Dict[str, Any]]:
     finally:
         kernel32.CloseHandle(snapshot)
     return rows
+
+
+def _snapshot_process_modules_psapi_handle(
+    process_handle: int,
+) -> List[Dict[str, Any]]:
+    """Read a WOW64 module list through an already-owned process HANDLE."""
+    LIST_MODULES_ALL = 0x03
+    capacity = 2048
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    psapi.EnumProcessModulesEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HMODULE),
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.DWORD,
+    ]
+    psapi.EnumProcessModulesEx.restype = wintypes.BOOL
+    psapi.GetModuleFileNameExW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.HMODULE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    psapi.GetModuleFileNameExW.restype = wintypes.DWORD
+    handle = wintypes.HANDLE(int(process_handle))
+    if not handle:
+        return []
+    rows: List[Dict[str, Any]] = []
+    modules = (wintypes.HMODULE * capacity)()
+    needed = wintypes.DWORD(0)
+    if not psapi.EnumProcessModulesEx(
+        handle,
+        modules,
+        ctypes.sizeof(modules),
+        ctypes.byref(needed),
+        LIST_MODULES_ALL,
+    ):
+        return []
+    count = min(
+        capacity,
+        int(needed.value) // ctypes.sizeof(wintypes.HMODULE),
+    )
+    for index in range(count):
+        path_buffer = ctypes.create_unicode_buffer(32768)
+        length = int(psapi.GetModuleFileNameExW(
+            handle,
+            modules[index],
+            path_buffer,
+            len(path_buffer),
+        ))
+        if length <= 0:
+            continue
+        path = str(path_buffer.value)
+        rows.append({
+            "name": Path(path).name,
+            "path": path,
+            "size": 0,
+            "enumerationBackend": "psapi-owned-process-handle",
+        })
+    return rows
+
+
+def _snapshot_process_modules_psapi(pid: int) -> List[Dict[str, Any]]:
+    """Open a read-only process handle and use the shared PSAPI backend."""
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_VM_READ = 0x0010
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+        False,
+        int(pid),
+    )
+    if not handle:
+        return []
+    try:
+        return _snapshot_process_modules_psapi_handle(
+            int(ctypes.cast(handle, ctypes.c_void_p).value or 0)
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _wait_for_process_module_snapshot(
+    pid: int,
+    timeout_sec: float = 5.0,
+) -> List[Dict[str, Any]]:
+    """Retry Toolhelp's documented transient empty/ERROR_BAD_LENGTH window."""
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        rows = _snapshot_process_modules(int(pid))
+        if not rows:
+            rows = _snapshot_process_modules_psapi(int(pid))
+        if (
+            not rows
+            and int(STATE.war3_pid or 0) == int(pid)
+            and STATE.retained_native_process is not None
+        ):
+            rows = STATE.retained_native_process.snapshot_modules()
+        if rows or time.monotonic() >= deadline or not _pid_alive(int(pid)):
+            return rows
+        time.sleep(0.1)
 
 
 _STRICT_STABILITY_EXTERNAL_GRAPHICS_HOOKS = frozenset(
@@ -4241,6 +4353,99 @@ def _post_window_syscommand(pid: int, command: int) -> Dict[str, Any]:
     }
 
 
+def _post_war3_virtual_key_message(
+    pid: int,
+    vk: int,
+    hold_ms: int = 45,
+    repeat: int = 1,
+) -> Dict[str, Any]:
+    """Post a bounded key message to the exact War3 HWND without activation."""
+    target_pid = int(pid)
+    hwnd = _wait_for_main_window_hwnd(
+        target_pid, timeout_sec=8.0, require_visible=True
+    )
+    if not hwnd:
+        return {"ok": False, "error": f"未找到可见主窗口: pid={target_pid}"}
+
+    registered = SESSION_REGISTRY.get(pid=target_pid)
+    desktop_name = (
+        str(registered.desktop_name or "")
+        if registered is not None
+        else str(STATE.desktop_name or "")
+    )
+    desktop_mode = (
+        str(registered.desktop_mode or "default")
+        if registered is not None
+        else str(STATE.desktop_mode or "default")
+    ).strip().lower()
+    input_desktop_before = _query_input_desktop_name()
+    if desktop_mode == "isolated" and (
+        not desktop_name
+        or not input_desktop_before
+        or desktop_name.casefold() == input_desktop_before.casefold()
+    ):
+        return {
+            "ok": False,
+            "pid": target_pid,
+            "code": "ISOLATED_DESKTOP_NOT_HIDDEN",
+            "desktop": desktop_name,
+            "inputDesktopBefore": input_desktop_before,
+        }
+
+    user32 = ctypes.windll.user32
+    virtual_key = int(vk)
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    scan = int(user32.MapVirtualKeyW(virtual_key, 0)) & 0xFF
+    lparam_down = 1 | (scan << 16)
+    lparam_up = 1 | (scan << 16) | (1 << 30) | (1 << 31)
+    posts: List[Dict[str, Any]] = []
+    ok_all = True
+    for _ in range(max(1, int(repeat))):
+        down_ok = bool(user32.PostMessageW(
+            ctypes.c_void_p(hwnd),
+            WM_KEYDOWN,
+            ctypes.c_void_p(virtual_key),
+            ctypes.c_void_p(lparam_down),
+        ))
+        time.sleep(max(0.0, float(hold_ms) / 1000.0))
+        up_ok = bool(user32.PostMessageW(
+            ctypes.c_void_p(hwnd),
+            WM_KEYUP,
+            ctypes.c_void_p(virtual_key),
+            ctypes.c_void_p(lparam_up),
+        ))
+        posts.append({"down": down_ok, "up": up_ok})
+        ok_all = ok_all and down_ok and up_ok
+        time.sleep(0.02)
+    input_desktop_after = _query_input_desktop_name()
+    input_desktop_stable = bool(
+        input_desktop_before
+        and input_desktop_after == input_desktop_before
+    )
+    return {
+        "ok": bool(ok_all and input_desktop_stable),
+        "pid": target_pid,
+        "hwnd": int(hwnd),
+        "vk": virtual_key,
+        "scan": scan,
+        "holdMs": int(hold_ms),
+        "repeat": max(1, int(repeat)),
+        "posts": posts,
+        "mode": (
+            "isolated-window-message"
+            if desktop_mode == "isolated"
+            else "default-window-message"
+        ),
+        "desktop": desktop_name,
+        "inputDesktopBefore": input_desktop_before,
+        "inputDesktopAfter": input_desktop_after,
+        "inputDesktopStable": input_desktop_stable,
+        "foregroundChanged": False,
+        "window": _query_window_info_by_hwnd(hwnd, pid=target_pid),
+    }
+
+
 def _post_war3_key_pulse(
     pid: int,
     key: str = "RIGHT",
@@ -4259,20 +4464,6 @@ def _post_war3_key_pulse(
             else "default"
         )
     ).strip().lower()
-    if desktop_mode == "isolated":
-        return {
-            "ok": False,
-            "pid": int(pid),
-            "code": "ISOLATED_DESKTOP_INPUT_UNSUPPORTED",
-            "error": (
-                "隔离桌面为非交互模式；键盘输入被拒绝。"
-                "请使用 named pipe/JASS 场景命令。"
-            ),
-        }
-    hwnd = _wait_for_main_window_hwnd(pid, timeout_sec=8.0, require_visible=True)
-    if not hwnd:
-        return {"ok": False, "error": f"未找到可见主窗口: pid={pid}"}
-
     key_name = str(key or "RIGHT").strip().upper()
     vk_map = {
         "SPACE": 0x20,
@@ -4320,12 +4511,21 @@ def _post_war3_key_pulse(
             "supported": sorted(vk_map.keys()),
         }
 
+    if desktop_mode == "isolated":
+        result = _post_war3_virtual_key_message(
+            pid=int(pid),
+            vk=vk,
+            hold_ms=hold_ms,
+            repeat=repeat,
+        )
+        result["key"] = key_name
+        result["foreground"] = False
+        return result
+
     user32 = ctypes.windll.user32
 
-    # War3 1.27a 的“按下任意键以继续”由 DirectInput/键盘状态读取，
-    # WM_KEYDOWN/WM_KEYUP 只足以驱动部分窗口消息路径。目标位于隔离
-    # Win32 Desktop 时，在同一 Desktop 内启动一次性 keybd_event helper；
-    # 这不会切换作者当前桌面，也不需要把 War3 窗口带到前台桌面。
+    # The historical helper remains available only to a verified input
+    # desktop. Hidden desktops returned through the HWND-only branch above.
     desktop_name = ""
     if registered is not None:
         desktop_name = str(registered.desktop_name or "")
@@ -4497,18 +4697,6 @@ def _run_war3_input_plan(
             "error": "隔离桌面会话缺少 desktop name",
             "code": "AUTOTEST_DESKTOP_NAME_REQUIRED",
         }
-    if desktop_mode == "isolated":
-        return {
-            "ok": False,
-            "pid": target_pid,
-            "desktopMode": desktop_mode,
-            "desktop": desktop_name,
-            "code": "ISOLATED_DESKTOP_INPUT_UNSUPPORTED",
-            "error": (
-                "隔离桌面为非交互模式；键鼠输入计划被拒绝。"
-                "请使用 named pipe/JASS 场景命令。"
-            ),
-        }
 
     hwnd = _wait_for_main_window_hwnd(target_pid, timeout_sec=8.0, require_visible=True)
     if not hwnd:
@@ -4551,6 +4739,60 @@ def _run_war3_input_plan(
             })
         else:
             return {"ok": False, "error": f"action[{index}] type 不支持: {kind}"}
+
+    if desktop_mode == "isolated":
+        if any(action["type"] == "click" for action in normalized):
+            return {
+                "ok": False,
+                "pid": target_pid,
+                "desktopMode": desktop_mode,
+                "desktop": desktop_name,
+                "code": "ISOLATED_DESKTOP_INPUT_UNSUPPORTED",
+                "error": "隔离桌面只允许 HWND 定向 key/sleep，不允许鼠标注入。",
+            }
+        deadline = time.monotonic() + max(2.0, float(timeout_sec))
+        results: List[Dict[str, Any]] = []
+        for action in normalized:
+            if time.monotonic() >= deadline:
+                return {
+                    "ok": False,
+                    "pid": target_pid,
+                    "code": "ISOLATED_DESKTOP_INPUT_TIMEOUT",
+                    "actions": results,
+                }
+            if action["type"] == "sleep":
+                time.sleep(min(
+                    float(action["ms"]) / 1000.0,
+                    max(0.0, deadline - time.monotonic()),
+                ))
+                results.append({"type": "sleep", "ok": True, "ms": action["ms"]})
+                continue
+            pulse = _post_war3_virtual_key_message(
+                pid=target_pid,
+                vk=int(action["vk"]),
+                hold_ms=int(action["holdMs"]),
+                repeat=1,
+            )
+            results.append({"type": "key", **pulse})
+            if not pulse.get("ok"):
+                return {
+                    "ok": False,
+                    "pid": target_pid,
+                    "desktopMode": desktop_mode,
+                    "desktop": desktop_name,
+                    "code": "ISOLATED_DESKTOP_WINDOW_MESSAGE_FAILED",
+                    "actions": results,
+                }
+        return {
+            "ok": True,
+            "pid": target_pid,
+            "desktopMode": desktop_mode,
+            "desktop": desktop_name,
+            "mode": "isolated-window-message-plan",
+            "actionCount": len(normalized),
+            "actions": results,
+            "foregroundChanged": False,
+        }
 
     helper_script = Path(__file__).with_name("send_input_plan_same_desktop.ps1")
     powershell_exe = (
@@ -9475,10 +9717,7 @@ def run_life_and_death_tdr_scenario(
         # all later camera/visibility control goes through the named pipe/JASS
         # bridge.  Visible-desktop compatibility keeps the historical bounded
         # key plan for maps with an acknowledgement screen.
-        startup_input_actions = (
-            []
-            if bool(use_isolated_desktop)
-            else [
+        startup_input_actions = [
                 {"type": "sleep", "ms": 10000},
                 {"type": "key", "vk": 0x20, "holdMs": 80},
                 {"type": "sleep", "ms": 8000},
@@ -9489,7 +9728,6 @@ def run_life_and_death_tdr_scenario(
                 {"type": "key", "vk": 0x20, "holdMs": 80},
                 {"type": "sleep", "ms": 1200},
             ]
-        )
         start = _launch_suite_map_until_ready(
             war3_dir=war3_dir,
             requested_map_path=str(source_map),
@@ -9551,7 +9789,7 @@ def run_life_and_death_tdr_scenario(
     instance_root = Path(str(launch.get("instanceRoot", war3_dir)))
     if instance_root not in incident_roots:
         incident_roots.append(instance_root)
-    loaded_modules = _snapshot_process_modules(pid)
+    loaded_modules = _wait_for_process_module_snapshot(pid, timeout_sec=5.0)
     external_graphics_hooks = _external_graphics_hook_evidence(loaded_modules)
     camera_before: Dict[str, Any] = {}
     bounds: Dict[str, Any] = {}

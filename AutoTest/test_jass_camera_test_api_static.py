@@ -167,7 +167,6 @@ class JassCameraTestApiStaticTests(unittest.TestCase):
         self.assertIn('"visibility.full_map", {"enabled": False}', runner)
         self.assertIn("_runtime_status_device_lost(status)", runner)
         self.assertIn("startup_input_actions", runner)
-        self.assertIn("if bool(use_isolated_desktop)", runner)
         self.assertIn("startup_input_actions=startup_input_actions", runner)
         self.assertIn('{"type": "key", "vk": 0x20, "holdMs": 80}', runner)
         self.assertIn('"code": "AUTOTEST_SESSION_REQUIRED"', runner)
@@ -187,6 +186,16 @@ class JassCameraTestApiStaticTests(unittest.TestCase):
         self.assertIn("screenshot_count: int = 12", runner)
         self.assertIn("birth_hold_sec: int = 120", runner)
         self.assertIn("strict_external_graphics_hooks: bool = True", runner)
+        self.assertIn(
+            "_wait_for_process_module_snapshot(pid, timeout_sec=5.0)",
+            runner,
+        )
+        self.assertIn("def _snapshot_process_modules_psapi(", runner)
+        self.assertIn("def _snapshot_process_modules_psapi_handle(", runner)
+        self.assertIn("def snapshot_modules(self)", runner)
+        self.assertIn("STATE.retained_native_process.snapshot_modules()", runner)
+        self.assertIn("EnumProcessModulesEx", runner)
+        self.assertIn("GetModuleFileNameExW", runner)
         self.assertIn("_external_graphics_hook_evidence(loaded_modules)", runner)
         self.assertIn('"graphics-hook32.dll"', runner)
         self.assertIn('"reshade32.dll"', runner)

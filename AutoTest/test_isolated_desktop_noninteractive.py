@@ -59,23 +59,43 @@ class IsolatedDesktopNonInteractiveTests(unittest.TestCase):
         )[0]
         self.assertNotIn("0x0100", mask)
 
-    def test_isolated_input_paths_fail_before_window_or_helper_work(self) -> None:
+    def test_isolated_input_is_hwnd_scoped_without_global_helper(self) -> None:
         runner = (AUTOTEST / "war3_autotest_mcp.py").read_text(
             encoding="utf-8"
         )
         key_body = runner.split("def _post_war3_key_pulse", 1)[1].split(
             "def _run_war3_input_plan", 1
         )[0]
-        key_gate = key_body.index("ISOLATED_DESKTOP_INPUT_UNSUPPORTED")
-        self.assertLess(key_gate, key_body.index("_wait_for_main_window_hwnd"))
-        self.assertLess(key_gate, key_body.index("_launch_process_on_desktop"))
+        isolated_branch = key_body.split(
+            'if desktop_mode == "isolated":', 1
+        )[1].split("return result", 1)[0]
+        self.assertIn("_post_war3_virtual_key_message", isolated_branch)
+        self.assertNotIn("_launch_process_on_desktop", isolated_branch)
+        self.assertNotIn("SetForegroundWindow", isolated_branch)
 
         plan_body = runner.split("def _run_war3_input_plan", 1)[1].split(
             "def _wait_for_window_ready", 1
         )[0]
-        plan_gate = plan_body.index("ISOLATED_DESKTOP_INPUT_UNSUPPORTED")
-        self.assertLess(plan_gate, plan_body.index("_wait_for_main_window_hwnd"))
-        self.assertLess(plan_gate, plan_body.index("_launch_process_on_desktop"))
+        self.assertIn('if desktop_mode == "isolated":', plan_body)
+        self.assertIn("_post_war3_virtual_key_message", plan_body)
+        self.assertIn("ISOLATED_DESKTOP_INPUT_UNSUPPORTED", plan_body)
+        self.assertIn("不允许鼠标注入", plan_body)
+        self.assertIn('mode": "isolated-window-message-plan"', plan_body)
+
+        message_body = runner.split(
+            "def _post_war3_virtual_key_message", 1
+        )[1].split("def _post_war3_key_pulse", 1)[0]
+        self.assertIn("PostMessageW", message_body)
+        self.assertIn("_query_input_desktop_name", message_body)
+        self.assertIn('"foregroundChanged": False', message_body)
+        for forbidden in (
+            "SwitchDesktop",
+            "SetForegroundWindow",
+            "keybd_event",
+            "mouse_event",
+            "SendInput",
+        ):
+            self.assertNotIn(forbidden, message_body)
 
         input_plan = (AUTOTEST / "send_input_plan_same_desktop.ps1").read_text(
             encoding="utf-8"
