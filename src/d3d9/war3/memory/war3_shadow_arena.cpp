@@ -95,6 +95,11 @@ std::atomic<uint64_t> g_coherentUpTrimEligibleCount{0u};
 std::atomic<uint64_t> g_coherentUpTrimWouldSaveBytes{0u};
 std::atomic<uint64_t> g_coherentUpTrimConsumedCount{0u};
 std::atomic<uint64_t> g_coherentUpTrimConsumedBytesSaved{0u};
+std::atomic<uint64_t> g_currentUpPositionReplayObservedCount{0u};
+std::atomic<uint64_t> g_currentUpPositionReplayEligibleCount{0u};
+std::atomic<uint64_t> g_currentUpPositionReplayWouldAvoidBytes{0u};
+std::atomic<uint64_t> g_currentUpPositionReplayConsumedCount{0u};
+std::atomic<uint64_t> g_currentUpPositionReplayAvoidedBytes{0u};
 std::atomic<uint64_t> g_quarantineCount{0u};
 std::atomic<uint64_t> g_lastQuarantinedGeneration{0u};
 std::atomic<uint64_t> g_lastQuarantinedRetireSerial{0u};
@@ -464,6 +469,16 @@ bool ShadowArena_Init(DxvkDevice* device) {
   g_coherentUpTrimWouldSaveBytes.store(0u, std::memory_order_release);
   g_coherentUpTrimConsumedCount.store(0u, std::memory_order_release);
   g_coherentUpTrimConsumedBytesSaved.store(0u, std::memory_order_release);
+  g_currentUpPositionReplayObservedCount.store(0u,
+                                               std::memory_order_release);
+  g_currentUpPositionReplayEligibleCount.store(0u,
+                                               std::memory_order_release);
+  g_currentUpPositionReplayWouldAvoidBytes.store(0u,
+                                                 std::memory_order_release);
+  g_currentUpPositionReplayConsumedCount.store(0u,
+                                               std::memory_order_release);
+  g_currentUpPositionReplayAvoidedBytes.store(0u,
+                                              std::memory_order_release);
   g_quarantineCount.store(0u, std::memory_order_release);
   g_lastQuarantinedGeneration.store(0u, std::memory_order_release);
   g_lastQuarantinedRetireSerial.store(0u, std::memory_order_release);
@@ -829,6 +844,26 @@ void ShadowArena_NoteCoherentUpIndexTrim(
                                                 std::memory_order_relaxed);
 }
 
+void ShadowArena_NoteCurrentUpPositionReplay(
+    bool observed, bool eligible, bool consumed, uint64_t avoidedBytes) {
+  if (!observed)
+    return;
+  g_currentUpPositionReplayObservedCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  if (!eligible)
+    return;
+  g_currentUpPositionReplayEligibleCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  g_currentUpPositionReplayWouldAvoidBytes.fetch_add(
+      avoidedBytes, std::memory_order_relaxed);
+  if (!consumed)
+    return;
+  g_currentUpPositionReplayConsumedCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  g_currentUpPositionReplayAvoidedBytes.fetch_add(
+      avoidedBytes, std::memory_order_relaxed);
+}
+
 void ShadowArena_Reset() {
   if (!ShadowArena_IsInitialized())
     return;
@@ -987,6 +1022,16 @@ ShadowArenaDiagnostics ShadowArena_QueryDiagnostics() {
       g_coherentUpTrimConsumedCount.load(std::memory_order_acquire);
   diagnostics.coherentUpTrimConsumedBytesSaved =
       g_coherentUpTrimConsumedBytesSaved.load(std::memory_order_acquire);
+  diagnostics.currentUpPositionReplayObservedCount =
+      g_currentUpPositionReplayObservedCount.load(std::memory_order_acquire);
+  diagnostics.currentUpPositionReplayEligibleCount =
+      g_currentUpPositionReplayEligibleCount.load(std::memory_order_acquire);
+  diagnostics.currentUpPositionReplayWouldAvoidBytes =
+      g_currentUpPositionReplayWouldAvoidBytes.load(std::memory_order_acquire);
+  diagnostics.currentUpPositionReplayConsumedCount =
+      g_currentUpPositionReplayConsumedCount.load(std::memory_order_acquire);
+  diagnostics.currentUpPositionReplayAvoidedBytes =
+      g_currentUpPositionReplayAvoidedBytes.load(std::memory_order_acquire);
   diagnostics.quarantineCount =
       g_quarantineCount.load(std::memory_order_acquire);
   diagnostics.lastQuarantinedGeneration =

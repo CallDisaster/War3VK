@@ -38,6 +38,7 @@
 #include "war3/hooks/war3_hook_perf.h"
 #include "war3/memory/war3_cpu_readable_buffer_span.h"
 #include "war3/memory/war3_coherent_up_index_trim_contract.h"
+#include "war3/memory/war3_current_up_shadow_replay_contract.h"
 #include "war3/memory/war3_exact_index_domain_observer_cache.h"
 #include "war3/memory/war3_shadow_arena.h"
 #include "war3/memory/war3_storm_hook.h"
@@ -3159,6 +3160,16 @@ War3CoherentUpIndexTrimModeRuntime() {
     return War3CoherentUpIndexTrimMode::Off;
   static const auto s_mode = ParseWar3CoherentUpIndexTrimMode(
       War3GetEnvU32("DXVK_WAR3_COHERENT_UP_INDEX_TRIM_MODE", 0u));
+  return s_mode;
+}
+
+dxvk::war3::memory::War3CurrentUpShadowReplayMode
+War3CurrentUpShadowReplayModeRuntime() {
+  using namespace dxvk::war3::memory;
+  if constexpr (!kCurrentUpShadowReplayDevelopmentEnabled)
+    return War3CurrentUpShadowReplayMode::Off;
+  static const auto s_mode = ParseWar3CurrentUpShadowReplayMode(
+      War3GetEnvU32("DXVK_WAR3_CURRENT_UP_SHADOW_REPLAY_MODE", 0u));
   return s_mode;
 }
 
@@ -46369,6 +46380,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   DxvkBufferSlice posSlice;
   uint32_t posStride = 0;
   Rc<DxvkBuffer> posAlloc;
+  Rc<DxvkResourceAllocation> posPinnedAllocation;
   if (gpuSkinLegacyBacking) {
     posSlice = gpuSkinResolved->lease.slice;
     posStride = gpuSkinResolved->lease.desc.vertexStride;
@@ -49069,8 +49081,57 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       (ibDynamic || forceFreezeUnitLikeGeometry ||
        forceFreezeFallbackWorldGeometry || exactIndexedFreezeRebased);
 
+  using CurrentUpReplayMode =
+      dxvk::war3::memory::War3CurrentUpShadowReplayMode;
+  const CurrentUpReplayMode currentUpReplayMode =
+      War3CurrentUpShadowReplayModeRuntime();
+  const bool currentUpReplayObserved =
+      currentUpReplayMode != CurrentUpReplayMode::Off &&
+      shouldFreezePosBuffer && !exactIndexedFreezeTrimmed;
+  const auto& currentUpPositionSlice = posStream < caps::MaxStreams
+      ? m_war3PerDrawUpload.vbSlices[posStream]
+      : DxvkBufferSlice();
+  const auto currentUpReplayDecision =
+      dxvk::war3::memory::EvaluateWar3CurrentUpPositionReplay({
+          DynamicSysmemVBOs && posStream < caps::MaxStreams &&
+              m_war3PerDrawUpload.vbValid[posStream],
+          gpuSkinLegacyBacking,
+          m_war3PerDrawUpload.storage != nullptr,
+          currentUpPositionSlice.buffer() != nullptr,
+          currentUpPositionSlice.buffer() == posSlice.buffer(),
+          uint64_t(currentUpPositionSlice.offset()),
+          uint64_t(currentUpPositionSlice.length()),
+          uint64_t(posInfo.offset) + uint64_t(posFreezeByteOffset),
+          uint64_t(posBytesNeeded),
+      });
+  DxvkResourceBufferInfo currentUpPinnedPositionInfo = {};
+  bool currentUpReplayEligible = currentUpReplayObserved &&
+      bool(currentUpReplayDecision);
+  if (currentUpReplayEligible) {
+    currentUpPinnedPositionInfo = War3PinnedAllocationSliceInfo(
+        m_war3PerDrawUpload.storage,
+        VkDeviceSize(currentUpReplayDecision.replayOffset),
+        VkDeviceSize(currentUpReplayDecision.replayLength));
+    currentUpReplayEligible =
+        currentUpPinnedPositionInfo.buffer != VK_NULL_HANDLE &&
+        currentUpPinnedPositionInfo.buffer == posInfo.buffer;
+  }
+  const bool currentUpReplayConsumed = currentUpReplayEligible &&
+      currentUpReplayMode == CurrentUpReplayMode::Consume;
+  dxvk::war3::memory::ShadowArena_NoteCurrentUpPositionReplay(
+      currentUpReplayObserved, currentUpReplayEligible,
+      currentUpReplayConsumed,
+      currentUpReplayEligible ? uint64_t(posBytesNeeded) : 0u);
+  if (currentUpReplayConsumed) {
+    posPinnedAllocation = m_war3PerDrawUpload.storage;
+    posInfo = currentUpPinnedPositionInfo;
+  }
+  const bool shouldFreezePosBufferIntoArena =
+      shouldFreezePosBuffer && !currentUpReplayConsumed;
+
   const uint64_t fallbackPosBudgetBytes =
-      shouldFreezePosBuffer ? static_cast<uint64_t>(posBytesNeeded) : 0ull;
+      shouldFreezePosBufferIntoArena
+          ? static_cast<uint64_t>(posBytesNeeded) : 0ull;
   const uint64_t fallbackBlendBudgetBytes =
       shouldFreezeBlendBuffer ? static_cast<uint64_t>(blendBytesNeeded) : 0ull;
   const uint64_t fallbackUvBudgetBytes = estimateFallbackUvBytes();
@@ -49722,7 +49783,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 : dxvk::war3::memory::ShadowArenaSourceClass::Model;
   };
 
-  if (shouldFreezePosBuffer) {
+  if (shouldFreezePosBufferIntoArena) {
     if (gpuSkinFormalShadowMode) {
       m_war3Scene.shadowStats.gpuSkinShadowBackingFallbackCount++;
       ++m_war3GpuSkinP2BackingFallbacks;
@@ -50011,7 +50072,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
   }
 
-  if ((shouldFreezePosBuffer &&
+  if ((shouldFreezePosBufferIntoArena &&
        (posAlloc == nullptr || posInfo.buffer == VK_NULL_HANDLE)) ||
       (shouldFreezeBlendBuffer &&
        (blendAlloc == nullptr || blendInfo.buffer == VK_NULL_HANDLE)) ||
@@ -50067,6 +50128,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   }
   draw.indexed = indexed;
   draw.positionStorage = std::move(posAlloc);
+  draw.positionPinnedAllocation = std::move(posPinnedAllocation);
   draw.positionInfo = posInfo;
   draw.positionStride = posStride;
   draw.positionOffset = capturedPositionOffset;

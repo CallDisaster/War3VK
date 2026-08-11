@@ -10,6 +10,8 @@ option('warvk_rts_shadow_candidate_dev', type : 'boolean', value : false,
   description : 'Enable the development-only RTS receiver-band directional-shadow candidate; Release remains unchanged')
 option('warvk_coherent_up_index_trim_dev', type : 'boolean', value : false,
   description : 'Enable development-only current-draw coherent UP index trim Observe/Consume; Release remains unchanged')
+option('warvk_current_up_shadow_replay_dev', type : 'boolean', value : false,
+  description : 'Enable development-only current-UP position replay Observe/Consume; Release remains unchanged')
 option('warvk_device_address_binding_report_dev', type : 'boolean', value : false,
   description : 'Enable development-only bounded VK_EXT_device_address_binding_report crash correlation')
 option('native_glfw',  type : 'feature', value : 'auto', description: 'Enable GLFW WSI for DXVK Native')

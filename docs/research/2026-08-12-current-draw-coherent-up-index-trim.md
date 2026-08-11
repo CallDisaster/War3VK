@@ -67,3 +67,50 @@ UP allocation, so this route has no opportunity here and must not be enabled
 for Consume. The next experiment must retain the already-owned current
 position allocation independently of the index source; it must not infer a
 cross-frame immutable terrain generation.
+
+## Current-UP position replay candidate
+
+The follow-up candidate keeps the exact `DxvkResourceAllocation` that
+`UploadPerDrawData` created for the current main draw and lets the shadow draw
+reference that same position range. It does not retain the Warcraft caller's
+pointer, invent an immutable generation, or reuse anything in a later frame.
+The replay binding records the pinned allocation and the consumer command list
+tracks it until its completion fence retires.
+
+The production eligibility helper requires the current UP marker, identical
+virtual buffer owner, a non-null pinned allocation, and a replay byte range
+fully contained in the uploaded slice. The initial scope is position only;
+blend, UV and index streams continue through their existing exact paths. This
+keeps mixed-stream ownership explicit and avoids changing skinned geometry.
+
+The additional build option `warvk_current_up_shadow_replay_dev` defaults to
+false. Mode 1 is Observe and mode 2 is an isolated Consume candidate. Neither
+mode is reachable in the default Release build. A Consume decision removes
+only the proven position bytes from fallback admission and Arena reservation;
+all remaining streams still form their normal transaction.
+
+Vulkan permits binding buffers backed by host-visible memory; correctness is
+defined by the buffer usage, range and synchronization contracts rather than a
+requirement that vertex data reside in device-local memory. WarVK already uses
+this allocation for the main draw. See the Vulkan vertex-input chapter and
+buffer binding command reference:
+
+- <https://docs.vulkan.org/spec/latest/chapters/fxvertex.html>
+- <https://registry.khronos.org/vulkan/specs/latest/man/html/vkCmdBindVertexBuffers.html>
+
+### Isolated Observe result
+
+The 120-second isolated run under
+`AutoTest/artifacts/life_and_death_tdr/20260812_044653` completed without a GPU
+event, incident, Arena overflow, busy reuse or frame-incomplete signal. It
+observed 817,360 position-freeze draws, but accepted zero current-UP position
+ranges and therefore reported zero avoidable bytes. The deployed baseline DLL
+was restored to SHA-256
+`79CA8DB4C73E47357E586CA3B6BE74F267F378AC13E2272F1D4F4722CDD8B2A4`.
+
+This is a useful negative result: the high-pressure terrain producer uses the
+ordinary dynamic REAL-buffer route rather than the per-draw UP allocation. A
+current-UP Consume run has no work to remove and is rejected. Directly pinning
+the ordinary dynamic buffer would not be equivalent because subsequent draws
+can replace its contents before shadow replay. That route remains forbidden
+without an upper-layer immutable tile generation or an earlier cull decision.

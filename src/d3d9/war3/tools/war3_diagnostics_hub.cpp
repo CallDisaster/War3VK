@@ -643,6 +643,16 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
          frame.arenaCoherentUpTrimConsumedCount},
         {"arenaCoherentUpTrimConsumedBytesSaved",
          frame.arenaCoherentUpTrimConsumedBytesSaved},
+        {"arenaCurrentUpPositionReplayObservedCount",
+         frame.arenaCurrentUpPositionReplayObservedCount},
+        {"arenaCurrentUpPositionReplayEligibleCount",
+         frame.arenaCurrentUpPositionReplayEligibleCount},
+        {"arenaCurrentUpPositionReplayWouldAvoidBytes",
+         frame.arenaCurrentUpPositionReplayWouldAvoidBytes},
+        {"arenaCurrentUpPositionReplayConsumedCount",
+         frame.arenaCurrentUpPositionReplayConsumedCount},
+        {"arenaCurrentUpPositionReplayAvoidedBytes",
+         frame.arenaCurrentUpPositionReplayAvoidedBytes},
         {"exactIndexDomainScannedBytes",
          frame.exactIndexDomainScannedBytes},
         {"exactIndexDomainNonHostCachedScanCount",
@@ -880,6 +890,16 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
       arena.coherentUpTrimConsumedCount;
   frame.arenaCoherentUpTrimConsumedBytesSaved =
       arena.coherentUpTrimConsumedBytesSaved;
+  frame.arenaCurrentUpPositionReplayObservedCount =
+      arena.currentUpPositionReplayObservedCount;
+  frame.arenaCurrentUpPositionReplayEligibleCount =
+      arena.currentUpPositionReplayEligibleCount;
+  frame.arenaCurrentUpPositionReplayWouldAvoidBytes =
+      arena.currentUpPositionReplayWouldAvoidBytes;
+  frame.arenaCurrentUpPositionReplayConsumedCount =
+      arena.currentUpPositionReplayConsumedCount;
+  frame.arenaCurrentUpPositionReplayAvoidedBytes =
+      arena.currentUpPositionReplayAvoidedBytes;
   const auto cpuSpan =
       dxvk::war3::memory::QueryWar3CpuReadableSpanDiagnostics();
   frame.exactIndexDomainScannedBytes =
@@ -1339,6 +1359,16 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       arenaDiagnostics.coherentUpTrimConsumedCount;
   summary.shadowArenaCoherentUpTrimConsumedBytesSaved =
       arenaDiagnostics.coherentUpTrimConsumedBytesSaved;
+  summary.shadowArenaCurrentUpPositionReplayObservedCount =
+      arenaDiagnostics.currentUpPositionReplayObservedCount;
+  summary.shadowArenaCurrentUpPositionReplayEligibleCount =
+      arenaDiagnostics.currentUpPositionReplayEligibleCount;
+  summary.shadowArenaCurrentUpPositionReplayWouldAvoidBytes =
+      arenaDiagnostics.currentUpPositionReplayWouldAvoidBytes;
+  summary.shadowArenaCurrentUpPositionReplayConsumedCount =
+      arenaDiagnostics.currentUpPositionReplayConsumedCount;
+  summary.shadowArenaCurrentUpPositionReplayAvoidedBytes =
+      arenaDiagnostics.currentUpPositionReplayAvoidedBytes;
   summary.shadowArenaFrameIncomplete = arenaDiagnostics.frameIncomplete;
   const auto cpuSpanDiagnostics =
       dxvk::war3::memory::QueryWar3CpuReadableSpanDiagnostics();
@@ -3728,6 +3758,16 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.shadowArenaCoherentUpTrimConsumedCount},
         {"shadowArenaCoherentUpTrimConsumedBytesSaved",
          snapshot.shadow.shadowArenaCoherentUpTrimConsumedBytesSaved},
+        {"shadowArenaCurrentUpPositionReplayObservedCount",
+         snapshot.shadow.shadowArenaCurrentUpPositionReplayObservedCount},
+        {"shadowArenaCurrentUpPositionReplayEligibleCount",
+         snapshot.shadow.shadowArenaCurrentUpPositionReplayEligibleCount},
+        {"shadowArenaCurrentUpPositionReplayWouldAvoidBytes",
+         snapshot.shadow.shadowArenaCurrentUpPositionReplayWouldAvoidBytes},
+        {"shadowArenaCurrentUpPositionReplayConsumedCount",
+         snapshot.shadow.shadowArenaCurrentUpPositionReplayConsumedCount},
+        {"shadowArenaCurrentUpPositionReplayAvoidedBytes",
+         snapshot.shadow.shadowArenaCurrentUpPositionReplayAvoidedBytes},
         {"shadowArenaFrameIncomplete",
          snapshot.shadow.shadowArenaFrameIncomplete},
         {"shadowCpuSpanAcceptedCount",

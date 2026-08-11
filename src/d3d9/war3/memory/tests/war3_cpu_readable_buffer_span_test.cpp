@@ -1,5 +1,6 @@
 #include "../war3_cpu_readable_buffer_span.h"
 #include "../war3_coherent_up_index_trim_contract.h"
+#include "../war3_current_up_shadow_replay_contract.h"
 #include "../war3_exact_index_domain_observer_cache.h"
 
 #include <windows.h>
@@ -264,6 +265,46 @@ bool TestCoherentCurrentUpIndexTrimContract() {
   return true;
 }
 
+bool TestCurrentUpPositionReplayContract() {
+  War3CurrentUpPositionReplayInput input = {};
+  input.currentPositionUpload = true;
+  input.hasPinnedAllocation = true;
+  input.hasUploadBuffer = true;
+  input.sameBuffer = true;
+  input.uploadOffset = 4096u;
+  input.uploadLength = 16384u;
+  input.replayOffset = 6144u;
+  input.replayLength = 8192u;
+  const auto accepted = EvaluateWar3CurrentUpPositionReplay(input);
+  CHECK(accepted);
+  CHECK(accepted.replayOffset == 6144u);
+  CHECK(accepted.replayLength == 8192u);
+
+  auto rejected = input;
+  rejected.sameBuffer = false;
+  CHECK(EvaluateWar3CurrentUpPositionReplay(rejected).rejectReason ==
+        War3CurrentUpPositionReplayRejectReason::BufferMismatch);
+  rejected = input;
+  rejected.replayOffset = 2048u;
+  CHECK(EvaluateWar3CurrentUpPositionReplay(rejected).rejectReason ==
+        War3CurrentUpPositionReplayRejectReason::RangeOutsideUpload);
+  rejected = input;
+  rejected.replayOffset = UINT64_MAX - 4u;
+  rejected.replayLength = 16u;
+  CHECK(EvaluateWar3CurrentUpPositionReplay(rejected).rejectReason ==
+        War3CurrentUpPositionReplayRejectReason::RangeOutsideUpload);
+
+  CHECK(ParseWar3CurrentUpShadowReplayMode(0u) ==
+        War3CurrentUpShadowReplayMode::Off);
+  CHECK(ParseWar3CurrentUpShadowReplayMode(1u) ==
+        War3CurrentUpShadowReplayMode::Observe);
+  CHECK(ParseWar3CurrentUpShadowReplayMode(2u) ==
+        War3CurrentUpShadowReplayMode::Consume);
+  CHECK(ParseWar3CurrentUpShadowReplayMode(3u) ==
+        War3CurrentUpShadowReplayMode::Off);
+  return true;
+}
+
 War3ExactIndexDomainObserverKey ObserverKey(uint64_t contentGeneration) {
   War3ExactIndexDomainObserverKey key = {};
   key.mapEpoch = 3u;
@@ -399,6 +440,7 @@ int main() {
       !TestExactIndexVertexDomainBulkRead() ||
       !TestExactIndexDomainRebase() ||
       !TestCoherentCurrentUpIndexTrimContract() ||
+      !TestCurrentUpPositionReplayContract() ||
       !TestExactIndexDomainObserverCacheIdentity() ||
       !TestExactIndexDomainObserverCacheDeterministicReplacement())
     return 1;

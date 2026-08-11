@@ -116,6 +116,11 @@ struct ShadowArenaDiagnostics {
   uint64_t coherentUpTrimWouldSaveBytes = 0u;
   uint64_t coherentUpTrimConsumedCount = 0u;
   uint64_t coherentUpTrimConsumedBytesSaved = 0u;
+  uint64_t currentUpPositionReplayObservedCount = 0u;
+  uint64_t currentUpPositionReplayEligibleCount = 0u;
+  uint64_t currentUpPositionReplayWouldAvoidBytes = 0u;
+  uint64_t currentUpPositionReplayConsumedCount = 0u;
+  uint64_t currentUpPositionReplayAvoidedBytes = 0u;
   uint64_t quarantineCount = 0u;
   uint64_t lastQuarantinedGeneration = 0u;
   uint64_t lastQuarantinedRetireSerial = 0u;
@@ -181,6 +186,8 @@ void ShadowArena_NoteExactIndexTrim(
 void ShadowArena_NoteCoherentUpIndexTrim(
     bool eligible, bool consumed, uint64_t bytesBefore,
     uint64_t bytesAfter);
+void ShadowArena_NoteCurrentUpPositionReplay(
+    bool observed, bool eligible, bool consumed, uint64_t avoidedBytes);
 
 /**
  * @brief 重置分配器游标。
