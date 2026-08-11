@@ -90,6 +90,11 @@ std::atomic<uint64_t> g_duplicateBytesSaved{0u};
 std::atomic<uint64_t> g_exactIndexTrimAcceptedCount{0u};
 std::atomic<uint64_t> g_exactIndexTrimRejectedCount{0u};
 std::atomic<uint64_t> g_exactIndexTrimBytesSaved{0u};
+std::atomic<uint64_t> g_coherentUpTrimObservedCount{0u};
+std::atomic<uint64_t> g_coherentUpTrimEligibleCount{0u};
+std::atomic<uint64_t> g_coherentUpTrimWouldSaveBytes{0u};
+std::atomic<uint64_t> g_coherentUpTrimConsumedCount{0u};
+std::atomic<uint64_t> g_coherentUpTrimConsumedBytesSaved{0u};
 std::atomic<uint64_t> g_quarantineCount{0u};
 std::atomic<uint64_t> g_lastQuarantinedGeneration{0u};
 std::atomic<uint64_t> g_lastQuarantinedRetireSerial{0u};
@@ -454,6 +459,11 @@ bool ShadowArena_Init(DxvkDevice* device) {
   g_exactIndexTrimAcceptedCount.store(0u, std::memory_order_release);
   g_exactIndexTrimRejectedCount.store(0u, std::memory_order_release);
   g_exactIndexTrimBytesSaved.store(0u, std::memory_order_release);
+  g_coherentUpTrimObservedCount.store(0u, std::memory_order_release);
+  g_coherentUpTrimEligibleCount.store(0u, std::memory_order_release);
+  g_coherentUpTrimWouldSaveBytes.store(0u, std::memory_order_release);
+  g_coherentUpTrimConsumedCount.store(0u, std::memory_order_release);
+  g_coherentUpTrimConsumedBytesSaved.store(0u, std::memory_order_release);
   g_quarantineCount.store(0u, std::memory_order_release);
   g_lastQuarantinedGeneration.store(0u, std::memory_order_release);
   g_lastQuarantinedRetireSerial.store(0u, std::memory_order_release);
@@ -801,6 +811,24 @@ void ShadowArena_NoteExactIndexTrim(
   }
 }
 
+void ShadowArena_NoteCoherentUpIndexTrim(
+    bool eligible, bool consumed, uint64_t bytesBefore,
+    uint64_t bytesAfter) {
+  g_coherentUpTrimObservedCount.fetch_add(1u, std::memory_order_relaxed);
+  if (!eligible)
+    return;
+  g_coherentUpTrimEligibleCount.fetch_add(1u, std::memory_order_relaxed);
+  const uint64_t saved = bytesAfter < bytesBefore
+      ? bytesBefore - bytesAfter : 0u;
+  g_coherentUpTrimWouldSaveBytes.fetch_add(saved,
+                                           std::memory_order_relaxed);
+  if (!consumed)
+    return;
+  g_coherentUpTrimConsumedCount.fetch_add(1u, std::memory_order_relaxed);
+  g_coherentUpTrimConsumedBytesSaved.fetch_add(saved,
+                                                std::memory_order_relaxed);
+}
+
 void ShadowArena_Reset() {
   if (!ShadowArena_IsInitialized())
     return;
@@ -949,6 +977,16 @@ ShadowArenaDiagnostics ShadowArena_QueryDiagnostics() {
       g_exactIndexTrimRejectedCount.load(std::memory_order_acquire);
   diagnostics.exactIndexTrimBytesSaved =
       g_exactIndexTrimBytesSaved.load(std::memory_order_acquire);
+  diagnostics.coherentUpTrimObservedCount =
+      g_coherentUpTrimObservedCount.load(std::memory_order_acquire);
+  diagnostics.coherentUpTrimEligibleCount =
+      g_coherentUpTrimEligibleCount.load(std::memory_order_acquire);
+  diagnostics.coherentUpTrimWouldSaveBytes =
+      g_coherentUpTrimWouldSaveBytes.load(std::memory_order_acquire);
+  diagnostics.coherentUpTrimConsumedCount =
+      g_coherentUpTrimConsumedCount.load(std::memory_order_acquire);
+  diagnostics.coherentUpTrimConsumedBytesSaved =
+      g_coherentUpTrimConsumedBytesSaved.load(std::memory_order_acquire);
   diagnostics.quarantineCount =
       g_quarantineCount.load(std::memory_order_acquire);
   diagnostics.lastQuarantinedGeneration =

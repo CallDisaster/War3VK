@@ -1,4 +1,5 @@
 #include "../war3_cpu_readable_buffer_span.h"
+#include "../war3_coherent_up_index_trim_contract.h"
 #include "../war3_exact_index_domain_observer_cache.h"
 
 #include <windows.h>
@@ -215,6 +216,54 @@ bool TestExactIndexDomainRebase() {
   return true;
 }
 
+bool TestCoherentCurrentUpIndexTrimContract() {
+  War3CoherentUpIndexTrimInput input = {};
+  input.indexed = true;
+  input.currentPositionUpload = true;
+  input.currentIndexUpload = true;
+  input.samePinnedAllocation = true;
+  input.hasPositionBytes = true;
+  input.hasIndexBytes = true;
+  input.positionUploadBytes = 16u * 32u;
+  input.positionSliceBytes = 16u * 32u;
+  input.positionStride = 16u;
+  input.indexUploadBytes = 12u;
+  input.indexSliceBytes = 12u;
+  input.indexElementBytes = 2u;
+  input.indexCount = 6u;
+  input.firstIndex = 0u;
+  const auto accepted = EvaluateWar3CoherentUpIndexTrim(input);
+  CHECK(accepted);
+  CHECK(accepted.indexBytes == 12u);
+  CHECK(accepted.positionCapacity == 32u);
+
+  auto rejected = input;
+  rejected.samePinnedAllocation = false;
+  CHECK(!EvaluateWar3CoherentUpIndexTrim(rejected));
+  rejected = input;
+  rejected.firstIndex = 1u;
+  CHECK(EvaluateWar3CoherentUpIndexTrim(rejected).rejectReason ==
+        War3CoherentUpIndexTrimRejectReason::NonZeroUploadedFirstIndex);
+  rejected = input;
+  rejected.indexUploadBytes = 10u;
+  CHECK(EvaluateWar3CoherentUpIndexTrim(rejected).rejectReason ==
+        War3CoherentUpIndexTrimRejectReason::IndexRangeOutsideUpload);
+  rejected = input;
+  rejected.positionUploadBytes = 15u;
+  CHECK(EvaluateWar3CoherentUpIndexTrim(rejected).rejectReason ==
+        War3CoherentUpIndexTrimRejectReason::PositionRangeOutsideUpload);
+
+  CHECK(ParseWar3CoherentUpIndexTrimMode(0u) ==
+        War3CoherentUpIndexTrimMode::Off);
+  CHECK(ParseWar3CoherentUpIndexTrimMode(1u) ==
+        War3CoherentUpIndexTrimMode::Observe);
+  CHECK(ParseWar3CoherentUpIndexTrimMode(2u) ==
+        War3CoherentUpIndexTrimMode::Consume);
+  CHECK(ParseWar3CoherentUpIndexTrimMode(3u) ==
+        War3CoherentUpIndexTrimMode::Off);
+  return true;
+}
+
 War3ExactIndexDomainObserverKey ObserverKey(uint64_t contentGeneration) {
   War3ExactIndexDomainObserverKey key = {};
   key.mapEpoch = 3u;
@@ -349,6 +398,7 @@ int main() {
       !TestExactIndexVertexDomain() ||
       !TestExactIndexVertexDomainBulkRead() ||
       !TestExactIndexDomainRebase() ||
+      !TestCoherentCurrentUpIndexTrimContract() ||
       !TestExactIndexDomainObserverCacheIdentity() ||
       !TestExactIndexDomainObserverCacheDeterministicReplacement())
     return 1;

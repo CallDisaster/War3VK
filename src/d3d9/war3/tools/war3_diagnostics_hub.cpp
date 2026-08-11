@@ -633,6 +633,16 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
          frame.arenaExactIndexTrimRejectedCount},
         {"arenaExactIndexTrimBytesSaved",
          frame.arenaExactIndexTrimBytesSaved},
+        {"arenaCoherentUpTrimObservedCount",
+         frame.arenaCoherentUpTrimObservedCount},
+        {"arenaCoherentUpTrimEligibleCount",
+         frame.arenaCoherentUpTrimEligibleCount},
+        {"arenaCoherentUpTrimWouldSaveBytes",
+         frame.arenaCoherentUpTrimWouldSaveBytes},
+        {"arenaCoherentUpTrimConsumedCount",
+         frame.arenaCoherentUpTrimConsumedCount},
+        {"arenaCoherentUpTrimConsumedBytesSaved",
+         frame.arenaCoherentUpTrimConsumedBytesSaved},
         {"exactIndexDomainScannedBytes",
          frame.exactIndexDomainScannedBytes},
         {"exactIndexDomainNonHostCachedScanCount",
@@ -860,6 +870,16 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
   frame.arenaExactIndexTrimAcceptedCount = arena.exactIndexTrimAcceptedCount;
   frame.arenaExactIndexTrimRejectedCount = arena.exactIndexTrimRejectedCount;
   frame.arenaExactIndexTrimBytesSaved = arena.exactIndexTrimBytesSaved;
+  frame.arenaCoherentUpTrimObservedCount =
+      arena.coherentUpTrimObservedCount;
+  frame.arenaCoherentUpTrimEligibleCount =
+      arena.coherentUpTrimEligibleCount;
+  frame.arenaCoherentUpTrimWouldSaveBytes =
+      arena.coherentUpTrimWouldSaveBytes;
+  frame.arenaCoherentUpTrimConsumedCount =
+      arena.coherentUpTrimConsumedCount;
+  frame.arenaCoherentUpTrimConsumedBytesSaved =
+      arena.coherentUpTrimConsumedBytesSaved;
   const auto cpuSpan =
       dxvk::war3::memory::QueryWar3CpuReadableSpanDiagnostics();
   frame.exactIndexDomainScannedBytes =
@@ -1309,6 +1329,16 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       arenaDiagnostics.exactIndexTrimRejectedCount;
   summary.shadowArenaExactIndexTrimBytesSaved =
       arenaDiagnostics.exactIndexTrimBytesSaved;
+  summary.shadowArenaCoherentUpTrimObservedCount =
+      arenaDiagnostics.coherentUpTrimObservedCount;
+  summary.shadowArenaCoherentUpTrimEligibleCount =
+      arenaDiagnostics.coherentUpTrimEligibleCount;
+  summary.shadowArenaCoherentUpTrimWouldSaveBytes =
+      arenaDiagnostics.coherentUpTrimWouldSaveBytes;
+  summary.shadowArenaCoherentUpTrimConsumedCount =
+      arenaDiagnostics.coherentUpTrimConsumedCount;
+  summary.shadowArenaCoherentUpTrimConsumedBytesSaved =
+      arenaDiagnostics.coherentUpTrimConsumedBytesSaved;
   summary.shadowArenaFrameIncomplete = arenaDiagnostics.frameIncomplete;
   const auto cpuSpanDiagnostics =
       dxvk::war3::memory::QueryWar3CpuReadableSpanDiagnostics();
@@ -3688,6 +3718,16 @@ json BuildRuntimeStatusJson(const War3RuntimeStatusSnapshot& snapshot) {
          snapshot.shadow.shadowArenaExactIndexTrimRejectedCount},
         {"shadowArenaExactIndexTrimBytesSaved",
          snapshot.shadow.shadowArenaExactIndexTrimBytesSaved},
+        {"shadowArenaCoherentUpTrimObservedCount",
+         snapshot.shadow.shadowArenaCoherentUpTrimObservedCount},
+        {"shadowArenaCoherentUpTrimEligibleCount",
+         snapshot.shadow.shadowArenaCoherentUpTrimEligibleCount},
+        {"shadowArenaCoherentUpTrimWouldSaveBytes",
+         snapshot.shadow.shadowArenaCoherentUpTrimWouldSaveBytes},
+        {"shadowArenaCoherentUpTrimConsumedCount",
+         snapshot.shadow.shadowArenaCoherentUpTrimConsumedCount},
+        {"shadowArenaCoherentUpTrimConsumedBytesSaved",
+         snapshot.shadow.shadowArenaCoherentUpTrimConsumedBytesSaved},
         {"shadowArenaFrameIncomplete",
          snapshot.shadow.shadowArenaFrameIncomplete},
         {"shadowCpuSpanAcceptedCount",

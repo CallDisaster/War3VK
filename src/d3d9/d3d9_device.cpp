@@ -37,6 +37,7 @@
 #include "war3/hooks/war3_hook_widget_identity.h"
 #include "war3/hooks/war3_hook_perf.h"
 #include "war3/memory/war3_cpu_readable_buffer_span.h"
+#include "war3/memory/war3_coherent_up_index_trim_contract.h"
 #include "war3/memory/war3_exact_index_domain_observer_cache.h"
 #include "war3/memory/war3_shadow_arena.h"
 #include "war3/memory/war3_storm_hook.h"
@@ -3149,6 +3150,16 @@ inline bool War3Stage11DirectStaticSourceRuntime() {
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", 1u) == 1u;
   return s_enabled;
+}
+
+dxvk::war3::memory::War3CoherentUpIndexTrimMode
+War3CoherentUpIndexTrimModeRuntime() {
+  using namespace dxvk::war3::memory;
+  if constexpr (!kCoherentUpIndexTrimDevelopmentEnabled)
+    return War3CoherentUpIndexTrimMode::Off;
+  static const auto s_mode = ParseWar3CoherentUpIndexTrimMode(
+      War3GetEnvU32("DXVK_WAR3_COHERENT_UP_INDEX_TRIM_MODE", 0u));
+  return s_mode;
 }
 
 inline bool War3Stage11DirectUploadSourceRuntime() {
@@ -46647,6 +46658,46 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   bool exactIndexedDomainKnown = false;
   thread_local std::vector<uint8_t> s_exactRebasedIndexScratch;
   s_exactRebasedIndexScratch.clear();
+  using CoherentUpTrimMode =
+      dxvk::war3::memory::War3CoherentUpIndexTrimMode;
+  const CoherentUpTrimMode coherentUpTrimMode =
+      War3CoherentUpIndexTrimModeRuntime();
+  const uint32_t coherentUpIndexElementBytes =
+      indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
+  const bool coherentUpTrimConsidered =
+      coherentUpTrimMode != CoherentUpTrimMode::Off && indexed &&
+      (DynamicSysmemVBOs || DynamicSysmemIBO);
+  const auto coherentUpTrimDecision =
+      dxvk::war3::memory::EvaluateWar3CoherentUpIndexTrim({
+          indexed,
+          gpuSkinLegacyBacking,
+          DynamicSysmemVBOs && posStream < caps::MaxStreams &&
+              m_war3PerDrawUpload.vbValid[posStream] &&
+              m_war3PerDrawUpload.vbSourceValid[posStream],
+          DynamicSysmemIBO && m_war3PerDrawUpload.ibValid &&
+              m_war3PerDrawUpload.ibSourceValid,
+          m_war3PerDrawUpload.storage != nullptr &&
+              m_war3PerDrawUpload.ibStorage.ptr() ==
+                  m_war3PerDrawUpload.storage.ptr(),
+          posStream < caps::MaxStreams &&
+              m_war3PerDrawUpload.vbUploadBytes[posStream] != nullptr,
+          m_war3PerDrawUpload.ibUploadBytes != nullptr,
+          posStream < caps::MaxStreams
+              ? uint64_t(m_war3PerDrawUpload.vbUploadLength[posStream])
+              : 0u,
+          uint64_t(posSlice.length()),
+          posStride,
+          uint64_t(m_war3PerDrawUpload.ibUploadLength),
+          uint64_t(idxSlice.length()),
+          coherentUpIndexElementBytes,
+          CountVal,
+          StartVal,
+      });
+  const bool coherentUpTrimCandidate =
+      coherentUpTrimConsidered && bool(coherentUpTrimDecision);
+  bool coherentUpTrimEligible = false;
+  uint64_t coherentUpTrimBytesBefore = 0u;
+  uint64_t coherentUpTrimBytesAfter = 0u;
   // Both per-draw SYSTEMMEM uploads and ordinary D3DUSAGE_DYNAMIC position
   // buffers are frozen into the Arena below.  The latter are the dominant
   // Warcraft terrain path, so restricting this proof to DynamicSysmemVBOs
@@ -46654,9 +46705,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   // separately validated IB mapping here; the position payload remains a GPU
   // copy ordered on the render command stream.
   const bool exactIndexedFreezeTrimCandidate =
-      War3ExactIndexedFreezeTrimRuntime() && indexed && !gpuSkinLegacyBacking &&
-      (DynamicSysmemVBOs || posDynamic) && posStride != 0u &&
-      posInfo.size >= posStride;
+      (War3ExactIndexedFreezeTrimRuntime() && indexed &&
+       !gpuSkinLegacyBacking && (DynamicSysmemVBOs || posDynamic) &&
+       posStride != 0u && posInfo.size >= posStride) ||
+      (coherentUpTrimMode == CoherentUpTrimMode::Consume &&
+       coherentUpTrimCandidate);
   // The release freeze disables geometry trimming. The development bounds
   // observer uses D3D9's documented draw range conservatively and audits a
   // deterministic 1/64 sample against current-generation exact IB bytes.
@@ -46677,6 +46730,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           reinterpret_cast<uintptr_t>(exactIndexCommon), StartVal, CountVal);
   const bool exactIndexedDomainScanCandidate =
       exactIndexedFreezeTrimCandidate ||
+      coherentUpTrimCandidate ||
       exactIndexedTerrainBoundsAuditSample;
   const uint64_t positionCapacity64 = posInfo.size / posStride;
   if (exactIndexedDomainScanCandidate) {
@@ -46684,7 +46738,21 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     bool exactIndexHostCached = false;
     const uint32_t indexElementBytes =
         indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
-    if (DynamicSysmemIBO && StartVal == 0u &&
+    if (coherentUpTrimCandidate) {
+      const auto memoryProperties =
+          m_war3PerDrawUpload.ibStorage->getMemoryProperties();
+      exactIndexHostCached = (memoryProperties &
+          VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
+      exactIndexSpan =
+          dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
+              m_war3PerDrawUpload.ibUploadBytes,
+              uint64_t(m_war3PerDrawUpload.ibUploadLength), 0u,
+              coherentUpTrimDecision.indexBytes,
+              m_war3PerDrawUpload.ibSourceResource,
+              m_war3PerDrawUpload.ibSourceIdentityGeneration,
+              m_war3PerDrawUpload.ibSourceSequence,
+              m_war3PerDrawUpload.ibSourceContentGeneration, true});
+    } else if (DynamicSysmemIBO && StartVal == 0u &&
         exactIndexCommon != nullptr &&
         m_war3PerDrawUpload.ibSourceValid &&
         m_war3PerDrawUpload.ibSourceResource != 0u &&
@@ -46890,6 +46958,21 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   s_exactRebasedIndexScratch.data(), exactIndexBytes);
         }
 
+        if (coherentUpTrimCandidate) {
+          coherentUpTrimBytesBefore = uint64_t(posBytesNeeded) +
+              uint64_t(blendBytesNeeded) +
+              (captureAlphaTest && resolvedUvBinding == 2u
+                   ? uint64_t(uvBytesNeeded) : 0u);
+          coherentUpTrimBytesAfter = uint64_t(count) * uint64_t(posStride) +
+              (blendBinding == 1u
+                   ? uint64_t(count) * uint64_t(blendStride) : 0u) +
+              (captureAlphaTest && resolvedUvBinding == 2u
+                   ? uint64_t(count) * uint64_t(uvStride) : 0u);
+          coherentUpTrimEligible = allStreamsFit && compactVertexRange &&
+              rebasedIndexReady &&
+              coherentUpTrimBytesAfter < coherentUpTrimBytesBefore;
+        }
+
         if (exactIndexedFreezeTrimCandidate && allStreamsFit &&
             compactVertexRange && rebasedIndexReady) {
           exactIndexedFreezeBytesBefore = uint64_t(posBytesNeeded) +
@@ -46927,6 +47010,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     dxvk::war3::memory::ShadowArena_NoteExactIndexTrim(
         exactIndexedFreezeTrimmed, exactIndexedFreezeBytesBefore,
         exactIndexedFreezeBytesAfter);
+  }
+  if (coherentUpTrimConsidered) {
+    dxvk::war3::memory::ShadowArena_NoteCoherentUpIndexTrim(
+        coherentUpTrimEligible,
+        coherentUpTrimMode == CoherentUpTrimMode::Consume &&
+            exactIndexedFreezeTrimmed,
+        coherentUpTrimBytesBefore, coherentUpTrimBytesAfter);
   }
 
   auto resolveTerrainBoundsVertexRange = [&]() {

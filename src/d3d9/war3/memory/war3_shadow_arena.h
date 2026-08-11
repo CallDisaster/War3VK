@@ -111,6 +111,11 @@ struct ShadowArenaDiagnostics {
   uint64_t exactIndexTrimAcceptedCount = 0u;
   uint64_t exactIndexTrimRejectedCount = 0u;
   uint64_t exactIndexTrimBytesSaved = 0u;
+  uint64_t coherentUpTrimObservedCount = 0u;
+  uint64_t coherentUpTrimEligibleCount = 0u;
+  uint64_t coherentUpTrimWouldSaveBytes = 0u;
+  uint64_t coherentUpTrimConsumedCount = 0u;
+  uint64_t coherentUpTrimConsumedBytesSaved = 0u;
   uint64_t quarantineCount = 0u;
   uint64_t lastQuarantinedGeneration = 0u;
   uint64_t lastQuarantinedRetireSerial = 0u;
@@ -173,6 +178,9 @@ void ShadowArena_NoteFreezeCatalogBytes(
     uint64_t uniqueBytes, uint64_t duplicateBytesSaved);
 void ShadowArena_NoteExactIndexTrim(
     bool accepted, uint64_t bytesBefore, uint64_t bytesAfter);
+void ShadowArena_NoteCoherentUpIndexTrim(
+    bool eligible, bool consumed, uint64_t bytesBefore,
+    uint64_t bytesAfter);
 
 /**
  * @brief 重置分配器游标。

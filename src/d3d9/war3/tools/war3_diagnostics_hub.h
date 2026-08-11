@@ -149,6 +149,11 @@ struct GpuFlightFrame {
   uint64_t arenaExactIndexTrimAcceptedCount = 0u;
   uint64_t arenaExactIndexTrimRejectedCount = 0u;
   uint64_t arenaExactIndexTrimBytesSaved = 0u;
+  uint64_t arenaCoherentUpTrimObservedCount = 0u;
+  uint64_t arenaCoherentUpTrimEligibleCount = 0u;
+  uint64_t arenaCoherentUpTrimWouldSaveBytes = 0u;
+  uint64_t arenaCoherentUpTrimConsumedCount = 0u;
+  uint64_t arenaCoherentUpTrimConsumedBytesSaved = 0u;
   uint64_t exactIndexDomainScannedBytes = 0u;
   uint64_t exactIndexDomainNonHostCachedScanCount = 0u;
   uint64_t exactIndexDomainNonHostCachedScannedBytes = 0u;
@@ -840,6 +845,11 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t shadowArenaExactIndexTrimAcceptedCount = 0;
   uint64_t shadowArenaExactIndexTrimRejectedCount = 0;
   uint64_t shadowArenaExactIndexTrimBytesSaved = 0;
+  uint64_t shadowArenaCoherentUpTrimObservedCount = 0;
+  uint64_t shadowArenaCoherentUpTrimEligibleCount = 0;
+  uint64_t shadowArenaCoherentUpTrimWouldSaveBytes = 0;
+  uint64_t shadowArenaCoherentUpTrimConsumedCount = 0;
+  uint64_t shadowArenaCoherentUpTrimConsumedBytesSaved = 0;
   uint64_t shadowArenaFrameIncomplete = 0;
   uint64_t shadowCpuSpanAcceptedCount = 0;
   uint64_t shadowCpuSpanRejectedCount = 0;
