@@ -3714,6 +3714,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   reconciliation.terrainBoundsCandidateCount = 0u;
   reconciliation.terrainBoundsProofAcceptedCount = 0u;
   reconciliation.terrainBoundsFailVisibleCount = 0u;
+  reconciliation.terrainBoundsRejectReasonHistogram.fill(0u);
   reconciliation.terrainBoundsWouldCullCount = 0u;
   reconciliation.terrainBoundsAppliedCullCount = 0u;
   reconciliation.terrainBoundsC0WouldCullCount = 0u;
@@ -3723,6 +3724,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   reconciliation.objectBoundsCandidateCount = 0u;
   reconciliation.objectBoundsProofAcceptedCount = 0u;
   reconciliation.objectBoundsFailVisibleCount = 0u;
+  reconciliation.objectBoundsRejectReasonHistogram.fill(0u);
   reconciliation.objectBoundsWouldCullCount = 0u;
   reconciliation.objectBoundsAppliedCullCount = 0u;
   reconciliation.unionCullMode = 0u;
@@ -4379,14 +4381,22 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       ++reconciliation.terrainBoundsCandidateCount;
       if (boundsPolicy.mayCull)
         ++reconciliation.terrainBoundsProofAcceptedCount;
-      else
+      else {
         ++reconciliation.terrainBoundsFailVisibleCount;
+        ++reconciliation.terrainBoundsRejectReasonHistogram[
+            war3::render::War3ShadowBoundsCullRejectReasonIndex(
+                boundsPolicy.rejectReason)];
+      }
     } else if (!terrainDraw && draw.boundsRadius > 0.0f) {
       ++reconciliation.objectBoundsCandidateCount;
       if (boundsPolicy.mayCull)
         ++reconciliation.objectBoundsProofAcceptedCount;
-      else
+      else {
         ++reconciliation.objectBoundsFailVisibleCount;
+        ++reconciliation.objectBoundsRejectReasonHistogram[
+            war3::render::War3ShadowBoundsCullRejectReasonIndex(
+                boundsPolicy.rejectReason)];
+      }
     }
 
     uint8_t actualMask = 0u;
@@ -4460,6 +4470,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
     for (const uint32_t drawIndex : sortedDrawIndices) {
       const auto& draw = *replayDraws[drawIndex];
+      const auto boundsPolicy = evaluateBoundsPolicy(draw);
       const auto objectKind =
           static_cast<war3::render::ObjectKind>(draw.objectKind);
       const bool dynamicOrSkinned =
@@ -4481,7 +4492,8 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
           draw.shadowRenderablePart != nullptr &&
           draw.shadowExactGeometryKeyHash != 0u;
       if (!staticRigid || !exactCurrentSource || !cameraCurrent ||
-          !consumerStateCurrent || !(draw.boundsRadius > 0.0f) ||
+          !consumerStateCurrent || !boundsPolicy.mayCull ||
+          !(draw.boundsRadius > 0.0f) ||
           m_shadowMapResourceGeneration == 0u) {
         ++reconciliation.unionCullUnknownOrStaleCount;
         continue;
@@ -4508,21 +4520,21 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
         query.generations.currentFrameGeneration = input.frameSerial;
         query.generations.candidateFrameGeneration = input.frameSerial;
-        query.generations.boundsFrameGeneration = input.frameSerial;
+        query.generations.boundsFrameGeneration = draw.boundsFrameSerial;
         query.generations.cameraFrameGeneration = input.frameSerial;
         query.generations.consumerStateFrameGeneration = input.frameSerial;
         query.generations.resourceGeneration = m_shadowMapResourceGeneration;
         query.generations.expectedResourceGeneration =
             m_shadowMapResourceGeneration;
-        query.identityKnown = true;
+        query.identityKnown = draw.boundsIdentityProven;
         query.exactCurrentFrameSource = true;
-        query.boundsKnown = true;
+        query.boundsKnown = boundsPolicy.mayCull;
         query.cameraKnown = cameraCurrent;
         query.consumerStateKnown = consumerStateCurrent;
         query.matrixKnown = true;
         query.staticRigidProven = true;
-        query.dynamic = false;
-        query.skinned = false;
+        query.dynamic = draw.boundsFrameLocalDynamic;
+        query.skinned = draw.boundsSourceWasSkinned;
         query.radiusScale = 1.0f;
         query.guardBandNdc = war3::internal::kShadowCascadeCullGuardBandNdc;
         query.depthGuardBandNdc = query.guardBandNdc;
@@ -9225,6 +9237,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         reconciliation.terrainBoundsProofAcceptedCount;
     stats.semanticSceneTerrainBoundsFailVisibleCount =
         reconciliation.terrainBoundsFailVisibleCount;
+    stats.semanticSceneTerrainBoundsRejectReasonHistogram =
+        reconciliation.terrainBoundsRejectReasonHistogram;
     stats.semanticSceneTerrainBoundsWouldCullCount =
         reconciliation.terrainBoundsWouldCullCount;
     stats.semanticSceneTerrainBoundsAppliedCullCount =
@@ -9243,6 +9257,8 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
         reconciliation.objectBoundsProofAcceptedCount;
     stats.semanticSceneObjectBoundsFailVisibleCount =
         reconciliation.objectBoundsFailVisibleCount;
+    stats.semanticSceneObjectBoundsRejectReasonHistogram =
+        reconciliation.objectBoundsRejectReasonHistogram;
     stats.semanticSceneObjectBoundsWouldCullCount =
         reconciliation.objectBoundsWouldCullCount;
     stats.semanticSceneObjectBoundsAppliedCullCount =

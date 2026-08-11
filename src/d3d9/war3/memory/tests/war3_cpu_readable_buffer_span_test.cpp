@@ -1,4 +1,5 @@
 #include "../war3_cpu_readable_buffer_span.h"
+#include "../war3_exact_index_domain_observer_cache.h"
 
 #include <windows.h>
 
@@ -214,6 +215,130 @@ bool TestExactIndexDomainRebase() {
   return true;
 }
 
+War3ExactIndexDomainObserverKey ObserverKey(uint64_t contentGeneration) {
+  War3ExactIndexDomainObserverKey key = {};
+  key.mapEpoch = 3u;
+  key.deviceEpoch = 5u;
+  key.ownerIdentity = 0x1010u;
+  key.spanDataIdentity = 0x2020u;
+  key.identityGeneration = 7u;
+  key.allocationGeneration = 11u;
+  key.contentGeneration = contentGeneration;
+  key.spanLength = 24u;
+  key.indexElementBytes = 2u;
+  key.indexCount = 12u;
+  key.baseVertex = -4;
+  key.vertexCapacity = 256u;
+  return key;
+}
+
+bool TestExactIndexDomainObserverCacheIdentity() {
+  War3ExactIndexDomainObserverCache<1u, 16u> cache;
+  const auto key = ObserverKey(13u);
+  War3ExactIndexVertexDomain domain = {};
+  domain.firstVertex = 2u;
+  domain.vertexCount = 9u;
+  domain.minIndex = 6u;
+  domain.maxIndex = 14u;
+  domain.valid = true;
+  CHECK(cache.store(key, domain) ==
+        War3ExactIndexDomainObserverStore::Inserted);
+
+  War3ExactIndexVertexDomain observed = {};
+  CHECK(cache.lookup(key, observed) ==
+        War3ExactIndexDomainObserverLookup::Hit);
+  CHECK(observed.valid && observed.firstVertex == domain.firstVertex &&
+        observed.vertexCount == domain.vertexCount &&
+        observed.minIndex == domain.minIndex &&
+        observed.maxIndex == domain.maxIndex);
+
+  auto expectMiss = [&](War3ExactIndexDomainObserverKey changed) {
+    War3ExactIndexVertexDomain ignored = {};
+    return cache.lookup(changed, ignored) !=
+        War3ExactIndexDomainObserverLookup::Hit;
+  };
+  auto changed = key;
+  changed.mapEpoch++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.deviceEpoch++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.ownerIdentity++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.spanDataIdentity++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.identityGeneration++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.allocationGeneration++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.contentGeneration++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.spanLength += 2u;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.indexElementBytes = 4u;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.indexCount++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.baseVertex++;
+  CHECK(expectMiss(changed));
+  changed = key;
+  changed.vertexCapacity++;
+  CHECK(expectMiss(changed));
+
+  auto invalid = key;
+  invalid.mapEpoch = 0u;
+  CHECK(cache.lookup(invalid, observed) ==
+        War3ExactIndexDomainObserverLookup::InvalidKey);
+  CHECK(cache.store(invalid, domain) ==
+        War3ExactIndexDomainObserverStore::InvalidKey);
+  return true;
+}
+
+bool TestExactIndexDomainObserverCacheDeterministicReplacement() {
+  War3ExactIndexDomainObserverCache<1u, 2u> cache;
+  const auto first = ObserverKey(101u);
+  const auto second = ObserverKey(103u);
+  const auto third = ObserverKey(107u);
+  War3ExactIndexVertexDomain domain = {};
+  domain.valid = true;
+  domain.vertexCount = 1u;
+
+  CHECK(cache.store(first, domain) ==
+        War3ExactIndexDomainObserverStore::Inserted);
+  CHECK(cache.store(second, domain) ==
+        War3ExactIndexDomainObserverStore::Inserted);
+  War3ExactIndexVertexDomain observed = {};
+  CHECK(cache.lookup(first, observed) ==
+        War3ExactIndexDomainObserverLookup::Hit);
+  CHECK(cache.store(third, domain) ==
+        War3ExactIndexDomainObserverStore::Replaced);
+  CHECK(cache.lookup(first, observed) ==
+        War3ExactIndexDomainObserverLookup::Hit);
+  CHECK(cache.lookup(third, observed) ==
+        War3ExactIndexDomainObserverLookup::Hit);
+  CHECK(cache.lookup(second, observed) ==
+        War3ExactIndexDomainObserverLookup::MissCollision);
+
+  War3ExactIndexVertexDomain invalidDomain = {};
+  const auto invalidDomainKey = ObserverKey(109u);
+  CHECK(cache.store(invalidDomainKey, invalidDomain) ==
+        War3ExactIndexDomainObserverStore::Replaced);
+  observed.valid = true;
+  CHECK(cache.lookup(invalidDomainKey, observed) ==
+        War3ExactIndexDomainObserverLookup::Hit);
+  CHECK(!observed.valid);
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -223,7 +348,9 @@ int main() {
       !TestCurrentUpBytesAndAddressOverflow() || !TestDiagnostics() ||
       !TestExactIndexVertexDomain() ||
       !TestExactIndexVertexDomainBulkRead() ||
-      !TestExactIndexDomainRebase())
+      !TestExactIndexDomainRebase() ||
+      !TestExactIndexDomainObserverCacheIdentity() ||
+      !TestExactIndexDomainObserverCacheDeterministicReplacement())
     return 1;
   std::cout << "war3_cpu_readable_buffer_span_test: PASS\n";
   return 0;

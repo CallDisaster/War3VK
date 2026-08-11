@@ -1229,9 +1229,48 @@ namespace dxvk {
         uint32_t semanticSceneShadowMapDrawnCasters = 0;              // renderShadowMap 实际 draw 调用数
         uint32_t semanticSceneShadowMapCascadeCulledCount = 0;        // cascade cull 跳过数
         uint32_t semanticSceneTerrainBoundsCullMode = 0;
+        // Development-observer diagnostics for the producer proof chain.
+        // These counters never authorize culling; they identify the first
+        // missing prerequisite before a terrain draw reaches the final policy.
+        uint32_t semanticSceneTerrainBoundsProducerS1AttemptCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerFallbackAttemptCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerExactRangeCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerMissingExactRangeCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerUpSourceAttemptCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerMappedSourceAttemptCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerNoSourceCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerSpanAcceptedCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerSpanRejectedCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerSpanNullBaseRejectCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerSpanNotCpuReadableRejectCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerSpanMissingOwnerRejectCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerSpanMissingGenerationRejectCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerSpanRangeRejectCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerSpanAddressOverflowRejectCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerComputeSuccessCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerComputeFailureCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerValidSphereCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerInvalidSphereCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerPublishedExactCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerDomainCacheLookupCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerDomainCacheHitCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerDomainCacheMissCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerDomainCacheCollisionMissCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerDomainCacheStoreCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerDomainCacheEvictionCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerHintComparableCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerHintExactCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerHintSupersetCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerHintUnderCoverageCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerHintInvalidCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerHintRangeAcceptedCount = 0;
+        uint32_t semanticSceneTerrainBoundsProducerHintRangeRejectedCount = 0;
         uint32_t semanticSceneTerrainBoundsCandidateCount = 0;
         uint32_t semanticSceneTerrainBoundsProofAcceptedCount = 0;
         uint32_t semanticSceneTerrainBoundsFailVisibleCount = 0;
+        std::array<uint32_t,
+            war3::render::kWar3ShadowBoundsCullRejectReasonCount>
+            semanticSceneTerrainBoundsRejectReasonHistogram = {};
         uint32_t semanticSceneTerrainBoundsWouldCullCount = 0;
         uint32_t semanticSceneTerrainBoundsAppliedCullCount = 0;
         uint32_t semanticSceneTerrainBoundsC0WouldCullCount = 0;
@@ -1241,6 +1280,9 @@ namespace dxvk {
         uint32_t semanticSceneObjectBoundsCandidateCount = 0;
         uint32_t semanticSceneObjectBoundsProofAcceptedCount = 0;
         uint32_t semanticSceneObjectBoundsFailVisibleCount = 0;
+        std::array<uint32_t,
+            war3::render::kWar3ShadowBoundsCullRejectReasonCount>
+            semanticSceneObjectBoundsRejectReasonHistogram = {};
         uint32_t semanticSceneObjectBoundsWouldCullCount = 0;
         uint32_t semanticSceneObjectBoundsAppliedCullCount = 0;
         uint32_t semanticSceneShadowMapPreparedDrawCount = 0;         // 有效 prepared draw 数（排序/级联重放输入）

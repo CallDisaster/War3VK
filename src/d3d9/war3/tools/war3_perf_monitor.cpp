@@ -2098,12 +2098,86 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.semanticSceneTerrainBoundsCullMode = std::max(
       agg.semanticSceneTerrainBoundsCullMode,
       uint64_t(stats.semanticSceneTerrainBoundsCullMode));
+#define WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(name) \
+  agg.name += stats.name
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerS1AttemptCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerFallbackAttemptCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerExactRangeCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerMissingExactRangeCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerUpSourceAttemptCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerMappedSourceAttemptCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerNoSourceCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanAcceptedCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanRejectedCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanNullBaseRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanNotCpuReadableRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanMissingOwnerRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanMissingGenerationRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanRangeRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerSpanAddressOverflowRejectCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerComputeSuccessCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerComputeFailureCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerValidSphereCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerInvalidSphereCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerPublishedExactCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheLookupCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheHitCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheMissCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheCollisionMissCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheStoreCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerDomainCacheEvictionCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintComparableCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintExactCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintSupersetCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintUnderCoverageCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintInvalidCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintRangeAcceptedCount);
+  WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD(
+      semanticSceneTerrainBoundsProducerHintRangeRejectedCount);
+#undef WAR3_ACCUMULATE_TERRAIN_BOUNDS_PRODUCER_FIELD
   agg.semanticSceneTerrainBoundsCandidateCount +=
       stats.semanticSceneTerrainBoundsCandidateCount;
   agg.semanticSceneTerrainBoundsProofAcceptedCount +=
       stats.semanticSceneTerrainBoundsProofAcceptedCount;
   agg.semanticSceneTerrainBoundsFailVisibleCount +=
       stats.semanticSceneTerrainBoundsFailVisibleCount;
+  for (uint32_t i = 0u;
+       i < render::kWar3ShadowBoundsCullRejectReasonCount; ++i) {
+    agg.semanticSceneTerrainBoundsRejectReasonHistogram[i] +=
+        stats.semanticSceneTerrainBoundsRejectReasonHistogram[i];
+  }
   agg.semanticSceneTerrainBoundsWouldCullCount +=
       stats.semanticSceneTerrainBoundsWouldCullCount;
   agg.semanticSceneTerrainBoundsAppliedCullCount +=
@@ -2122,6 +2196,11 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.semanticSceneObjectBoundsProofAcceptedCount;
   agg.semanticSceneObjectBoundsFailVisibleCount +=
       stats.semanticSceneObjectBoundsFailVisibleCount;
+  for (uint32_t i = 0u;
+       i < render::kWar3ShadowBoundsCullRejectReasonCount; ++i) {
+    agg.semanticSceneObjectBoundsRejectReasonHistogram[i] +=
+        stats.semanticSceneObjectBoundsRejectReasonHistogram[i];
+  }
   agg.semanticSceneObjectBoundsWouldCullCount +=
       stats.semanticSceneObjectBoundsWouldCullCount;
   agg.semanticSceneObjectBoundsAppliedCullCount +=
@@ -6992,12 +7071,54 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneShadowMapCascadeCulledCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsCullMode\": "
        << shadowAgg.semanticSceneTerrainBoundsCullMode << ",\n";
+  json << "    \"semanticSceneTerrainBoundsProducerHistogram\": ["
+       << shadowAgg.semanticSceneTerrainBoundsProducerS1AttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerFallbackAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerExactRangeCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerMissingExactRangeCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerUpSourceAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerMappedSourceAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerNoSourceCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanAcceptedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanRejectedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanNullBaseRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanNotCpuReadableRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanMissingOwnerRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanMissingGenerationRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanRangeRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanAddressOverflowRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerComputeSuccessCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerComputeFailureCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerValidSphereCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerInvalidSphereCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerPublishedExactCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheLookupCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheHitCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheMissCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheCollisionMissCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheStoreCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheEvictionCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintComparableCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintExactCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintSupersetCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintUnderCoverageCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintInvalidCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintRangeAcceptedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintRangeRejectedCount << "],\n";
   json << "    \"semanticSceneTerrainBoundsCandidateCount\": "
        << shadowAgg.semanticSceneTerrainBoundsCandidateCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsProofAcceptedCount\": "
        << shadowAgg.semanticSceneTerrainBoundsProofAcceptedCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsFailVisibleCount\": "
        << shadowAgg.semanticSceneTerrainBoundsFailVisibleCount << ",\n";
+  json << "    \"semanticSceneTerrainBoundsRejectReasonHistogram\": [";
+  for (uint32_t i = 0u;
+       i < render::kWar3ShadowBoundsCullRejectReasonCount; ++i) {
+    if (i != 0u)
+      json << ", ";
+    json << shadowAgg.semanticSceneTerrainBoundsRejectReasonHistogram[i];
+  }
+  json << "],\n";
   json << "    \"semanticSceneTerrainBoundsWouldCullCount\": "
        << shadowAgg.semanticSceneTerrainBoundsWouldCullCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsAppliedCullCount\": "
@@ -7016,6 +7137,14 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneObjectBoundsProofAcceptedCount << ",\n";
   json << "    \"semanticSceneObjectBoundsFailVisibleCount\": "
        << shadowAgg.semanticSceneObjectBoundsFailVisibleCount << ",\n";
+  json << "    \"semanticSceneObjectBoundsRejectReasonHistogram\": [";
+  for (uint32_t i = 0u;
+       i < render::kWar3ShadowBoundsCullRejectReasonCount; ++i) {
+    if (i != 0u)
+      json << ", ";
+    json << shadowAgg.semanticSceneObjectBoundsRejectReasonHistogram[i];
+  }
+  json << "],\n";
   json << "    \"semanticSceneObjectBoundsWouldCullCount\": "
        << shadowAgg.semanticSceneObjectBoundsWouldCullCount << ",\n";
   json << "    \"semanticSceneObjectBoundsAppliedCullCount\": "
@@ -8427,6 +8556,40 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.semanticSceneShadowMapCascadeCulledCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsCullMode\": "
        << shadowAgg.semanticSceneTerrainBoundsCullMode << ",\n";
+  json << "    \"semanticSceneTerrainBoundsProducerHistogram\": ["
+       << shadowAgg.semanticSceneTerrainBoundsProducerS1AttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerFallbackAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerExactRangeCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerMissingExactRangeCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerUpSourceAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerMappedSourceAttemptCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerNoSourceCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanAcceptedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanRejectedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanNullBaseRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanNotCpuReadableRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanMissingOwnerRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanMissingGenerationRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanRangeRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerSpanAddressOverflowRejectCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerComputeSuccessCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerComputeFailureCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerValidSphereCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerInvalidSphereCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerPublishedExactCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheLookupCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheHitCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheMissCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheCollisionMissCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheStoreCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerDomainCacheEvictionCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintComparableCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintExactCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintSupersetCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintUnderCoverageCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintInvalidCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintRangeAcceptedCount << ", "
+       << shadowAgg.semanticSceneTerrainBoundsProducerHintRangeRejectedCount << "],\n";
   json << "    \"semanticSceneTerrainBoundsCandidateCount\": "
        << shadowAgg.semanticSceneTerrainBoundsCandidateCount << ",\n";
   json << "    \"semanticSceneTerrainBoundsProofAcceptedCount\": "

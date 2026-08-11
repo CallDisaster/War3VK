@@ -1096,9 +1096,45 @@ private:
         uint64_t semanticSceneShadowMapDrawnCasters = 0;
         uint64_t semanticSceneShadowMapCascadeCulledCount = 0;
         uint64_t semanticSceneTerrainBoundsCullMode = 0;
+        uint64_t semanticSceneTerrainBoundsProducerS1AttemptCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerFallbackAttemptCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerExactRangeCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerMissingExactRangeCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerUpSourceAttemptCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerMappedSourceAttemptCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerNoSourceCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerSpanAcceptedCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerSpanRejectedCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerSpanNullBaseRejectCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerSpanNotCpuReadableRejectCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerSpanMissingOwnerRejectCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerSpanMissingGenerationRejectCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerSpanRangeRejectCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerSpanAddressOverflowRejectCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerComputeSuccessCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerComputeFailureCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerValidSphereCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerInvalidSphereCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerPublishedExactCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerDomainCacheLookupCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerDomainCacheHitCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerDomainCacheMissCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerDomainCacheCollisionMissCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerDomainCacheStoreCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerDomainCacheEvictionCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerHintComparableCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerHintExactCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerHintSupersetCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerHintUnderCoverageCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerHintInvalidCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerHintRangeAcceptedCount = 0;
+        uint64_t semanticSceneTerrainBoundsProducerHintRangeRejectedCount = 0;
         uint64_t semanticSceneTerrainBoundsCandidateCount = 0;
         uint64_t semanticSceneTerrainBoundsProofAcceptedCount = 0;
         uint64_t semanticSceneTerrainBoundsFailVisibleCount = 0;
+        std::array<uint64_t,
+            render::kWar3ShadowBoundsCullRejectReasonCount>
+            semanticSceneTerrainBoundsRejectReasonHistogram = {};
         uint64_t semanticSceneTerrainBoundsWouldCullCount = 0;
         uint64_t semanticSceneTerrainBoundsAppliedCullCount = 0;
         uint64_t semanticSceneTerrainBoundsC0WouldCullCount = 0;
@@ -1108,6 +1144,9 @@ private:
         uint64_t semanticSceneObjectBoundsCandidateCount = 0;
         uint64_t semanticSceneObjectBoundsProofAcceptedCount = 0;
         uint64_t semanticSceneObjectBoundsFailVisibleCount = 0;
+        std::array<uint64_t,
+            render::kWar3ShadowBoundsCullRejectReasonCount>
+            semanticSceneObjectBoundsRejectReasonHistogram = {};
         uint64_t semanticSceneObjectBoundsWouldCullCount = 0;
         uint64_t semanticSceneObjectBoundsAppliedCullCount = 0;
         uint64_t semanticSceneUnionCullMode = 0;

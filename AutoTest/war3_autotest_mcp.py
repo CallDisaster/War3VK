@@ -3287,6 +3287,86 @@ def _extract_shadow_cull_observe_summary(data: Dict[str, Any]) -> Dict[str, Any]
         except (TypeError, ValueError):
             return 0
 
+    reject_reason_names = (
+        "none",
+        "unknownProvenance",
+        "diagnosticOnly",
+        "animatedConservativeOnly",
+        "sourceGenerationUnknown",
+        "frameGenerationUnknown",
+        "frameGenerationStale",
+        "identityUnproven",
+        "dynamicOrSkinned",
+        "animatedAttachment",
+        "nonFiniteBounds",
+        "invalidRadius",
+    )
+
+    def _reject_histogram(name: str) -> Dict[str, int]:
+        value = runtime_summary.get(name)
+        if not isinstance(value, list):
+            value = shadow_budget.get(name, data.get(name, []))
+        if not isinstance(value, list):
+            value = []
+        result: Dict[str, int] = {}
+        for index, reason in enumerate(reject_reason_names):
+            try:
+                result[reason] = int(value[index] or 0)
+            except (IndexError, TypeError, ValueError):
+                result[reason] = 0
+        return result
+
+    producer_stage_names = (
+        "s1Attempts",
+        "fallbackAttempts",
+        "exactRanges",
+        "missingExactRanges",
+        "upSourceAttempts",
+        "mappedSourceAttempts",
+        "noSource",
+        "spanAccepted",
+        "spanRejected",
+        "spanNullBase",
+        "spanNotCpuReadable",
+        "spanMissingOwner",
+        "spanMissingGeneration",
+        "spanRange",
+        "spanAddressOverflow",
+        "computeSuccess",
+        "computeFailure",
+        "validSphere",
+        "invalidSphere",
+        "publishedExact",
+        "domainCacheLookups",
+        "domainCacheHits",
+        "domainCacheMisses",
+        "domainCacheCollisionMisses",
+        "domainCacheStores",
+        "domainCacheEvictions",
+        "hintComparable",
+        "hintExact",
+        "hintConservativeSuperset",
+        "hintUnderCoverage",
+        "hintInvalid",
+        "hintRangeAccepted",
+        "hintRangeRejected",
+    )
+
+    def _terrain_producer_histogram() -> Dict[str, int]:
+        name = "semanticSceneTerrainBoundsProducerHistogram"
+        value = runtime_summary.get(name)
+        if not isinstance(value, list):
+            value = shadow_budget.get(name, data.get(name, []))
+        if not isinstance(value, list):
+            value = []
+        result: Dict[str, int] = {}
+        for index, stage in enumerate(producer_stage_names):
+            try:
+                result[stage] = int(value[index] or 0)
+            except (IndexError, TypeError, ValueError):
+                result[stage] = 0
+        return result
+
     frame_count = _integer("frameCount")
     terrain_candidates = _integer(
         "semanticSceneTerrainBoundsCandidateCount"
@@ -3345,12 +3425,16 @@ def _extract_shadow_cull_observe_summary(data: Dict[str, Any]) -> Dict[str, Any]
         "frameCount": frame_count,
         "terrain": {
             "mode": terrain_mode,
+            "producer": _terrain_producer_histogram(),
             "candidateCount": terrain_candidates,
             "proofAcceptedCount": _integer(
                 "semanticSceneTerrainBoundsProofAcceptedCount"
             ),
             "failVisibleCount": _integer(
                 "semanticSceneTerrainBoundsFailVisibleCount"
+            ),
+            "rejectReasons": _reject_histogram(
+                "semanticSceneTerrainBoundsRejectReasonHistogram"
             ),
             "wouldCullCount": terrain_would_cull,
             "appliedCullCount": terrain_applied,
@@ -3380,6 +3464,9 @@ def _extract_shadow_cull_observe_summary(data: Dict[str, Any]) -> Dict[str, Any]
             ),
             "failVisibleCount": _integer(
                 "semanticSceneObjectBoundsFailVisibleCount"
+            ),
+            "rejectReasons": _reject_histogram(
+                "semanticSceneObjectBoundsRejectReasonHistogram"
             ),
             "wouldCullCount": _integer(
                 "semanticSceneObjectBoundsWouldCullCount"
@@ -9769,6 +9856,11 @@ def run_life_and_death_tdr_scenario(
     user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK", "1")
     user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK_WARMUP_SEC", "1")
     user_env.setdefault("DXVK_WAR3_RUNTIME_BENCHMARK_SAMPLE_SEC", str(duration))
+    # Development observer builds classify the exact Stage11 allocation debt
+    # that can make an otherwise complete CSM fail closed under a camera sweep.
+    # Release builds compile this observer out, and this setting never enables
+    # direct-source binding, culling Consume, or any other rendering route.
+    user_env.setdefault("DXVK_WAR3_STAGE11_ALLOC_OBSERVER", "1")
     # Dedicated high-pressure runs collect proof before any Consume default is
     # considered. Observe recomputes the canonical decision and records
     # mismatches; sampled phase breakdown gives proportional hotspot evidence

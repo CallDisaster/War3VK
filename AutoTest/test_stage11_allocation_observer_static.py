@@ -29,6 +29,26 @@ class Stage11AllocationObserverStaticTest(unittest.TestCase):
         self.assertIn("== 1u", runtime)
         self.assertIn("WARVK_ENABLE_SHADOW_OBSERVERS_DEV", DEVICE_H)
 
+    def test_high_pressure_scenario_requests_observe_only_classification(self) -> None:
+        runner = (ROOT / "AutoTest/war3_autotest_mcp.py").read_text(
+            encoding="utf-8"
+        )
+        start = runner.index("def run_life_and_death_tdr_scenario(")
+        end = runner.index("def set_city_test_view(", start)
+        scenario = runner[start:end]
+        self.assertIn(
+            'user_env.setdefault("DXVK_WAR3_STAGE11_ALLOC_OBSERVER", "1")',
+            scenario,
+        )
+        self.assertNotIn(
+            'user_env.setdefault("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", "1")',
+            scenario,
+        )
+        self.assertNotIn(
+            'user_env.setdefault("DXVK_WAR3_STAGE11_DIRECT_UPLOAD_SOURCE_MODE", "1")',
+            scenario,
+        )
+
     def test_allocation_reasons_are_counted_before_budget_defer(self) -> None:
         begin = DEVICE.index("const bool needsNewPositionBuffer")
         end = DEVICE.index("if (needsNewPositionBuffer) {", begin)

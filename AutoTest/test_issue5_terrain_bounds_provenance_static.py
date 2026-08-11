@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "src/d3d9/war3/render/war3_terrain_bounds_provenance.h"
 SCENE = ROOT / "src/d3d9/d3d9_war3_scene.h"
 DEVICE = ROOT / "src/d3d9/d3d9_device.cpp"
+CONFIG = ROOT / "src/d3d9/war3/core/war3_internal_test_config.h"
 
 
 class TerrainBoundsProvenanceContracts(unittest.TestCase):
@@ -16,15 +17,23 @@ class TerrainBoundsProvenanceContracts(unittest.TestCase):
         cls.helper = HELPER.read_text(encoding="utf-8")
         cls.scene = SCENE.read_text(encoding="utf-8")
         cls.device = DEVICE.read_text(encoding="utf-8")
+        cls.config = CONFIG.read_text(encoding="utf-8")
 
-    def test_indexed_hints_cannot_authorize_bounds(self) -> None:
+    def test_indexed_hint_is_observer_only_and_trim_stays_exact(self) -> None:
         self.assertIn("War3ResolveTerrainBoundsVertexRange", self.helper)
         self.assertIn("if (!exactIndexedDomainKnown", self.helper)
-        self.assertIn("return {};", self.helper)
+        self.assertIn(
+            "War3ResolveConservativeTerrainIndexedHintRange", self.helper
+        )
+        self.assertIn("exactIndexedTerrainBoundsAuditSample", self.device)
         self.assertIn("exactIndexedDomainKnown = true", self.device)
         scan = self.device.index("ComputeWar3ExactIndexVertexDomainPrepared")
         known = self.device.index("exactIndexedDomainKnown = true", scan)
         self.assertGreater(known, scan)
+        trim = self.device.index(
+            "if (exactIndexedFreezeTrimCandidate && allStreamsFit", known
+        )
+        self.assertGreater(trim, known)
 
     def test_persistent_geometry_owns_exact_local_bounds(self) -> None:
         for token in (
@@ -38,7 +47,7 @@ class TerrainBoundsProvenanceContracts(unittest.TestCase):
         )
         body = self.device[miss:create]
         for token in (
-            "War3ResolveTerrainBoundsVertexRange",
+            "resolveTerrainBoundsVertexRange",
             "BuildWar3CpuReadableBufferSpan",
             "War3ComputeCachedMappedTerrainBoundsFromSpan",
             "candidate.localBoundsIdentityProven",
@@ -76,11 +85,8 @@ class TerrainBoundsProvenanceContracts(unittest.TestCase):
             "if (terrainCaster && estimatedBoundsRadius > 0.0f)", fallback
         )
         body = self.device[fallback:apply]
-        self.assertIn("War3ResolveTerrainBoundsVertexRange", body)
+        self.assertIn("resolveTerrainBoundsVertexRange", body)
         self.assertIn("terrainVertexRange.exact", body)
-        self.assertNotIn(
-            "int64_t(BaseVertexIndex) + int64_t(MinVertexIndex)", body
-        )
 
     def test_release_path_still_requires_observer_mode(self) -> None:
         miss = self.device.index("S1 can return through the persistent path")
@@ -90,6 +96,44 @@ class TerrainBoundsProvenanceContracts(unittest.TestCase):
         body = self.device[miss:create]
         self.assertIn("War3TerrainBoundsCullModeRuntime()", body)
         self.assertIn("War3TerrainBoundsCullMode::Off", body)
+
+    def test_dynamic_mapped_bounds_cache_is_development_observe_only(self) -> None:
+        self.assertIn(
+            "kShadowS1TerrainBoundsCacheCurrentGenerationObserverEnabled",
+            self.config,
+        )
+        dev = self.config.index("WARVK_ENABLE_SHADOW_OBSERVERS_DEV")
+        enabled = self.config.index(
+            "kShadowS1TerrainBoundsCacheCurrentGenerationObserverEnabled = true",
+            dev,
+        )
+        disabled = self.config.index(
+            "kShadowS1TerrainBoundsCacheCurrentGenerationObserverEnabled = false",
+            enabled,
+        )
+        self.assertLess(enabled, disabled)
+        cache_gate = self.device.index("const bool allowTerrainBoundsCache")
+        cache_call = self.device.index(
+            "War3ComputeCachedMappedTerrainBoundsFromSpan(", cache_gate
+        )
+        body = self.device[cache_gate:cache_call]
+        self.assertIn(
+            "kShadowS1TerrainBoundsCacheCurrentGenerationObserverEnabled",
+            body,
+        )
+        self.assertIn("terrainPositionReadableSpan", body)
+        self.assertIn("keyIdentityGeneration", self.device)
+        self.assertIn("keyAllocationGeneration", self.device)
+        self.assertIn("keyContentGeneration", self.device)
+        self.assertIn(
+            "entry.stableSourceKey == useStableSourceKey", self.device
+        )
+        self.assertNotIn(
+            "positionSpan.identityGeneration ^",
+            self.device,
+            "generation components must be compared exactly, not XOR-folded",
+        )
+
 
 
 if __name__ == "__main__":

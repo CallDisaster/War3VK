@@ -37,6 +37,7 @@
 #include "war3/hooks/war3_hook_widget_identity.h"
 #include "war3/hooks/war3_hook_perf.h"
 #include "war3/memory/war3_cpu_readable_buffer_span.h"
+#include "war3/memory/war3_exact_index_domain_observer_cache.h"
 #include "war3/memory/war3_shadow_arena.h"
 #include "war3/memory/war3_storm_hook.h"
 #include "war3/model/war3_model_hook.h"
@@ -9100,6 +9101,46 @@ inline uint64_t War3ComputeTerrainBoundsContentKey(
   return hash != 0u ? hash : 1u;
 }
 
+inline void War3RecordTerrainBoundsProducerSpan(
+    War3ShadowCaptureStats& stats,
+    const dxvk::war3::memory::War3CpuReadableBufferSpan& span,
+    bool buildAttempted) {
+  if (!buildAttempted) {
+    ++stats.semanticSceneTerrainBoundsProducerNoSourceCount;
+    return;
+  }
+  if (span) {
+    ++stats.semanticSceneTerrainBoundsProducerSpanAcceptedCount;
+    return;
+  }
+
+  ++stats.semanticSceneTerrainBoundsProducerSpanRejectedCount;
+  using Reject = dxvk::war3::memory::War3CpuReadableSpanRejectReason;
+  switch (span.rejectReason) {
+    case Reject::NullBase:
+      ++stats.semanticSceneTerrainBoundsProducerSpanNullBaseRejectCount;
+      break;
+    case Reject::NotCpuReadable:
+      ++stats.semanticSceneTerrainBoundsProducerSpanNotCpuReadableRejectCount;
+      break;
+    case Reject::MissingOwner:
+      ++stats.semanticSceneTerrainBoundsProducerSpanMissingOwnerRejectCount;
+      break;
+    case Reject::MissingGeneration:
+      ++stats.semanticSceneTerrainBoundsProducerSpanMissingGenerationRejectCount;
+      break;
+    case Reject::OffsetOutsideAllocation:
+    case Reject::LengthOutsideAllocation:
+      ++stats.semanticSceneTerrainBoundsProducerSpanRangeRejectCount;
+      break;
+    case Reject::AddressOverflow:
+      ++stats.semanticSceneTerrainBoundsProducerSpanAddressOverflowRejectCount;
+      break;
+    case Reject::None:
+      break;
+  }
+}
+
 inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
     const dxvk::war3::memory::War3CpuReadableBufferSpan& positionSpan,
     uint32_t positionStride,
@@ -9115,11 +9156,15 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
     uint64_t stableSourceSequence = 0u) {
   struct TerrainBoundsCacheEntry {
     bool valid = false;
+    bool stableSourceKey = false;
     uint64_t mapEpoch = 0u;
     const void* keyIdentity = nullptr;
     uint64_t keyOffset = 0u;
     uint64_t keyLength = 0u;
-    uint64_t keySequence = 0u;
+    uint64_t keyStableSourceSequence = 0u;
+    uint64_t keyIdentityGeneration = 0u;
+    uint64_t keyAllocationGeneration = 0u;
+    uint64_t keyContentGeneration = 0u;
     uint32_t keyElementCount = 0u;
     uint32_t keyElementStride = 0u;
     uint32_t keyElementSize = 0u;
@@ -9229,12 +9274,14 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
   const uint64_t keyLength = useStableSourceKey
                                  ? stableSourceLength
                                  : positionSpan.length;
-  const uint64_t keySequence =
-      useStableSourceKey
-          ? stableSourceSequence
-          : positionSpan.identityGeneration ^
-                (positionSpan.allocationGeneration << 1u) ^
-                (positionSpan.contentGeneration << 2u);
+  const uint64_t keyStableSourceSequence =
+      useStableSourceKey ? stableSourceSequence : 0u;
+  const uint64_t keyIdentityGeneration =
+      useStableSourceKey ? 0u : positionSpan.identityGeneration;
+  const uint64_t keyAllocationGeneration =
+      useStableSourceKey ? 0u : positionSpan.allocationGeneration;
+  const uint64_t keyContentGeneration =
+      useStableSourceKey ? 0u : positionSpan.contentGeneration;
   const uint32_t keyElementCount =
       useStableSourceKey ? stableSourceElementCount : 0u;
   const uint32_t keyElementStride =
@@ -9257,7 +9304,11 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
   hash = fold(hash, reinterpret_cast<uintptr_t>(keyIdentity));
   hash = fold(hash, keyOffset);
   hash = fold(hash, keyLength);
-  hash = fold(hash, keySequence);
+  hash = fold(hash, uint64_t(useStableSourceKey));
+  hash = fold(hash, keyStableSourceSequence);
+  hash = fold(hash, keyIdentityGeneration);
+  hash = fold(hash, keyAllocationGeneration);
+  hash = fold(hash, keyContentGeneration);
   hash = fold(hash, uint64_t(keyElementCount) |
                         (uint64_t(keyElementStride) << 32));
   hash = fold(hash, uint64_t(keyElementSize));
@@ -9271,10 +9322,14 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
       {};
   TerrainBoundsCacheEntry& entry = s_cache[hash & (kCacheSize - 1u)];
 
-  if (entry.valid && entry.mapEpoch == mapEpoch &&
+  if (entry.valid && entry.stableSourceKey == useStableSourceKey &&
+      entry.mapEpoch == mapEpoch &&
       entry.keyIdentity == keyIdentity &&
       entry.keyOffset == keyOffset && entry.keyLength == keyLength &&
-      entry.keySequence == keySequence &&
+      entry.keyStableSourceSequence == keyStableSourceSequence &&
+      entry.keyIdentityGeneration == keyIdentityGeneration &&
+      entry.keyAllocationGeneration == keyAllocationGeneration &&
+      entry.keyContentGeneration == keyContentGeneration &&
       entry.keyElementCount == keyElementCount &&
       entry.keyElementStride == keyElementStride &&
       entry.keyElementSize == keyElementSize &&
@@ -9309,11 +9364,15 @@ inline bool War3ComputeCachedMappedTerrainBoundsFromSpan(
   }
 
   entry.valid = true;
+  entry.stableSourceKey = useStableSourceKey;
   entry.mapEpoch = mapEpoch;
   entry.keyIdentity = keyIdentity;
   entry.keyOffset = keyOffset;
   entry.keyLength = keyLength;
-  entry.keySequence = keySequence;
+  entry.keyStableSourceSequence = keyStableSourceSequence;
+  entry.keyIdentityGeneration = keyIdentityGeneration;
+  entry.keyAllocationGeneration = keyAllocationGeneration;
+  entry.keyContentGeneration = keyContentGeneration;
   entry.keyElementCount = keyElementCount;
   entry.keyElementStride = keyElementStride;
   entry.keyElementSize = keyElementSize;
@@ -19253,6 +19312,9 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
             rec.terrainBoundsProofAcceptedCount;
         cInput.scene.shadowStats.semanticSceneTerrainBoundsFailVisibleCount =
             rec.terrainBoundsFailVisibleCount;
+        cInput.scene.shadowStats
+            .semanticSceneTerrainBoundsRejectReasonHistogram =
+            rec.terrainBoundsRejectReasonHistogram;
         cInput.scene.shadowStats.semanticSceneTerrainBoundsWouldCullCount =
             rec.terrainBoundsWouldCullCount;
         cInput.scene.shadowStats.semanticSceneTerrainBoundsAppliedCullCount =
@@ -19271,6 +19333,9 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
             rec.objectBoundsProofAcceptedCount;
         cInput.scene.shadowStats.semanticSceneObjectBoundsFailVisibleCount =
             rec.objectBoundsFailVisibleCount;
+        cInput.scene.shadowStats
+            .semanticSceneObjectBoundsRejectReasonHistogram =
+            rec.objectBoundsRejectReasonHistogram;
         cInput.scene.shadowStats.semanticSceneObjectBoundsWouldCullCount =
             rec.objectBoundsWouldCullCount;
         cInput.scene.shadowStats.semanticSceneObjectBoundsAppliedCullCount =
@@ -31161,6 +31226,8 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
       cInput.scene.shadowStats.semanticSceneTerrainBoundsCandidateCount = rec.terrainBoundsCandidateCount;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsProofAcceptedCount = rec.terrainBoundsProofAcceptedCount;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsFailVisibleCount = rec.terrainBoundsFailVisibleCount;
+      cInput.scene.shadowStats.semanticSceneTerrainBoundsRejectReasonHistogram =
+          rec.terrainBoundsRejectReasonHistogram;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsWouldCullCount = rec.terrainBoundsWouldCullCount;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsAppliedCullCount = rec.terrainBoundsAppliedCullCount;
       cInput.scene.shadowStats.semanticSceneTerrainBoundsC0WouldCullCount = rec.terrainBoundsC0WouldCullCount;
@@ -31170,6 +31237,8 @@ bool D3D9DeviceEx::War3ExecuteSemanticShadowSceneForValidation(
       cInput.scene.shadowStats.semanticSceneObjectBoundsCandidateCount = rec.objectBoundsCandidateCount;
       cInput.scene.shadowStats.semanticSceneObjectBoundsProofAcceptedCount = rec.objectBoundsProofAcceptedCount;
       cInput.scene.shadowStats.semanticSceneObjectBoundsFailVisibleCount = rec.objectBoundsFailVisibleCount;
+      cInput.scene.shadowStats.semanticSceneObjectBoundsRejectReasonHistogram =
+          rec.objectBoundsRejectReasonHistogram;
       cInput.scene.shadowStats.semanticSceneObjectBoundsWouldCullCount = rec.objectBoundsWouldCullCount;
       cInput.scene.shadowStats.semanticSceneObjectBoundsAppliedCullCount = rec.objectBoundsAppliedCullCount;
       cInput.scene.shadowStats.semanticSceneShadowMapPreparedDrawCount = rec.shadowMapPreparedDrawCount;
@@ -44489,6 +44558,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           hitDraw.boundsSourceWasSkinned = false;
           hitDraw.boundsFrameLocalDynamic = false;
           hitDraw.boundsAnimatedAttachment = false;
+          ++m_war3Scene.shadowStats
+                .semanticSceneTerrainBoundsProducerPublishedExactCount;
         } else {
           hitDraw.boundsProvenance = dxvk::war3::render::
               War3ShadowBoundsProvenance::Unknown;
@@ -46408,9 +46479,29 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       War3ExactIndexedFreezeTrimRuntime() && indexed && !gpuSkinLegacyBacking &&
       (DynamicSysmemVBOs || posDynamic) && posStride != 0u &&
       posInfo.size >= posStride;
-  if (exactIndexedFreezeTrimCandidate) {
-    auto* exactIndexCommon = m_state.indices.ptr() != nullptr
-        ? m_state.indices.ptr()->GetCommonBuffer() : nullptr;
+  // The release freeze disables geometry trimming. The development bounds
+  // observer uses D3D9's documented draw range conservatively and audits a
+  // deterministic 1/64 sample against current-generation exact IB bytes.
+  // Neither path authorizes draw mutation; rebasing/trimming remains guarded
+  // solely by exactIndexedFreezeTrimCandidate below.
+  const bool exactIndexedTerrainBoundsObserveCandidate =
+      indexed && terrainCaster && !gpuSkinLegacyBacking &&
+      dxvk::war3::internal::kShadowCascadeCullTerrainWithBounds &&
+      War3TerrainBoundsCullModeRuntime() !=
+          dxvk::war3::render::War3TerrainBoundsCullMode::Off &&
+      posStride != 0u && posInfo.size >= posStride;
+  auto* exactIndexCommon = m_state.indices.ptr() != nullptr
+      ? m_state.indices.ptr()->GetCommonBuffer() : nullptr;
+  const bool exactIndexedTerrainBoundsAuditSample =
+      exactIndexedTerrainBoundsObserveCandidate &&
+      dxvk::war3::render::War3ShouldAuditTerrainIndexedHint(
+          m_war3ShadowPersistentFrameSerial + 1u,
+          reinterpret_cast<uintptr_t>(exactIndexCommon), StartVal, CountVal);
+  const bool exactIndexedDomainScanCandidate =
+      exactIndexedFreezeTrimCandidate ||
+      exactIndexedTerrainBoundsAuditSample;
+  const uint64_t positionCapacity64 = posInfo.size / posStride;
+  if (exactIndexedDomainScanCandidate) {
     dxvk::war3::memory::War3CpuReadableBufferSpan exactIndexSpan = {};
     bool exactIndexHostCached = false;
     const uint32_t indexElementBytes =
@@ -46455,7 +46546,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       // buffer still has pending CPU writes, queue its normal upload before
       // the Arena copy so the scanned generation and frozen IB are identical.
       const bool uploadReady = !exactIndexCommon->NeedsUpload() ||
-          SUCCEEDED(FlushBuffer(exactIndexCommon));
+          (exactIndexedFreezeTrimCandidate &&
+           SUCCEEDED(FlushBuffer(exactIndexCommon)));
       auto exactIndexAllocation = exactIndexCommon->GetMappedSlice();
       if (uploadReady && exactIndexAllocation != nullptr) {
         const auto allocationInfo = exactIndexAllocation->getBufferInfo();
@@ -46480,15 +46572,102 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       }
     }
 
-    const uint64_t positionCapacity64 = posInfo.size / posStride;
     if (exactIndexSpan && positionCapacity64 != 0u &&
         positionCapacity64 <=
             uint64_t(std::numeric_limits<uint32_t>::max())) {
-      const auto exactDomain =
-          dxvk::war3::memory::ComputeWar3ExactIndexVertexDomainPrepared({
-              exactIndexSpan, indexElementBytes, CountVal, BaseVertexIndex,
-              uint32_t(positionCapacity64), exactIndexHostCached,
-              s_exactIndexDomainBulkReadEnabled});
+      dxvk::war3::memory::War3ExactIndexVertexDomain exactDomain = {};
+      const bool useObserverDomainCache =
+          exactIndexedTerrainBoundsAuditSample &&
+          !exactIndexedFreezeTrimCandidate;
+      bool observerDomainCacheHit = false;
+      if (useObserverDomainCache) {
+        using ObserverCache = dxvk::war3::memory::
+            War3ExactIndexDomainObserverCache<256u, 4u>;
+        using Lookup = dxvk::war3::memory::
+            War3ExactIndexDomainObserverLookup;
+        using Store = dxvk::war3::memory::
+            War3ExactIndexDomainObserverStore;
+        static thread_local ObserverCache s_observerDomainCache = {};
+        const dxvk::war3::memory::War3ExactIndexDomainObserverKey cacheKey = {
+            dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch(),
+            m_war3GpuSkinDeviceEpoch,
+            exactIndexSpan.ownerIdentity,
+            reinterpret_cast<uintptr_t>(exactIndexSpan.data),
+            exactIndexSpan.identityGeneration,
+            exactIndexSpan.allocationGeneration,
+            exactIndexSpan.contentGeneration,
+            exactIndexSpan.length,
+            indexElementBytes,
+            CountVal,
+            BaseVertexIndex,
+            uint32_t(positionCapacity64),
+        };
+        auto& cacheStats = m_war3Scene.shadowStats;
+        ++cacheStats.semanticSceneTerrainBoundsProducerDomainCacheLookupCount;
+        const Lookup lookup =
+            s_observerDomainCache.lookup(cacheKey, exactDomain);
+        observerDomainCacheHit = lookup == Lookup::Hit;
+        if (observerDomainCacheHit) {
+          ++cacheStats.semanticSceneTerrainBoundsProducerDomainCacheHitCount;
+        } else {
+          ++cacheStats.semanticSceneTerrainBoundsProducerDomainCacheMissCount;
+          if (lookup == Lookup::MissCollision) {
+            ++cacheStats.
+                semanticSceneTerrainBoundsProducerDomainCacheCollisionMissCount;
+          }
+          exactDomain =
+              dxvk::war3::memory::ComputeWar3ExactIndexVertexDomainPrepared({
+                  exactIndexSpan, indexElementBytes, CountVal,
+                  BaseVertexIndex, uint32_t(positionCapacity64),
+                  exactIndexHostCached, s_exactIndexDomainBulkReadEnabled});
+          const Store store = s_observerDomainCache.store(cacheKey, exactDomain);
+          if (store != Store::InvalidKey) {
+            ++cacheStats.
+                semanticSceneTerrainBoundsProducerDomainCacheStoreCount;
+          }
+          if (store == Store::Replaced) {
+            ++cacheStats.
+                semanticSceneTerrainBoundsProducerDomainCacheEvictionCount;
+          }
+        }
+      }
+      if (!useObserverDomainCache || !observerDomainCacheHit) {
+        if (!useObserverDomainCache) {
+          exactDomain =
+              dxvk::war3::memory::ComputeWar3ExactIndexVertexDomainPrepared({
+                  exactIndexSpan, indexElementBytes, CountVal,
+                  BaseVertexIndex, uint32_t(positionCapacity64),
+                  exactIndexHostCached, s_exactIndexDomainBulkReadEnabled});
+        }
+      }
+      if (exactIndexedTerrainBoundsObserveCandidate && exactDomain.valid) {
+        using HintRelation =
+            dxvk::war3::render::War3TerrainIndexedHintRelation;
+        const auto hintDecision = dxvk::war3::render::
+            War3EvaluateTerrainIndexedHintAgainstExactDomain({
+                BaseVertexIndex, MinVertexIndex, NumVertices,
+                uint32_t(positionCapacity64), exactDomain.firstVertex,
+                exactDomain.vertexCount, true});
+        auto& hintStats = m_war3Scene.shadowStats;
+        switch (hintDecision.relation) {
+          case HintRelation::Exact:
+            ++hintStats.semanticSceneTerrainBoundsProducerHintComparableCount;
+            ++hintStats.semanticSceneTerrainBoundsProducerHintExactCount;
+            break;
+          case HintRelation::ConservativeSuperset:
+            ++hintStats.semanticSceneTerrainBoundsProducerHintComparableCount;
+            ++hintStats.semanticSceneTerrainBoundsProducerHintSupersetCount;
+            break;
+          case HintRelation::UnderCoversExactDomain:
+            ++hintStats.semanticSceneTerrainBoundsProducerHintComparableCount;
+            ++hintStats.
+                semanticSceneTerrainBoundsProducerHintUnderCoverageCount;
+            break;
+          case HintRelation::Invalid:
+            ++hintStats.semanticSceneTerrainBoundsProducerHintInvalidCount;
+            break;
+        }
+      }
       if (exactDomain.valid) {
         const uint64_t first = exactDomain.firstVertex;
         const uint64_t count = exactDomain.vertexCount;
@@ -46533,7 +46712,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   s_exactRebasedIndexScratch.data(), exactIndexBytes);
         }
 
-        if (allStreamsFit && compactVertexRange && rebasedIndexReady) {
+        if (exactIndexedFreezeTrimCandidate && allStreamsFit &&
+            compactVertexRange && rebasedIndexReady) {
           exactIndexedFreezeBytesBefore = uint64_t(posBytesNeeded) +
               uint64_t(blendBytesNeeded) +
               (captureAlphaTest && resolvedUvBinding == 2u
@@ -46570,6 +46750,29 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         exactIndexedFreezeTrimmed, exactIndexedFreezeBytesBefore,
         exactIndexedFreezeBytesAfter);
   }
+
+  auto resolveTerrainBoundsVertexRange = [&]() {
+    auto range = dxvk::war3::render::War3ResolveTerrainBoundsVertexRange(
+        indexed, StartVal, CountVal, exactIndexedDomainKnown,
+        exactIndexedDomainFirstVertex, exactIndexedDomainVertexCount);
+    if (!range.exact && exactIndexedTerrainBoundsObserveCandidate &&
+        positionCapacity64 != 0u &&
+        positionCapacity64 <=
+            uint64_t(std::numeric_limits<uint32_t>::max())) {
+      range = dxvk::war3::render::
+          War3ResolveConservativeTerrainIndexedHintRange(
+              BaseVertexIndex, MinVertexIndex, NumVertices,
+              uint32_t(positionCapacity64));
+      if (range.exact) {
+        ++m_war3Scene.shadowStats.
+            semanticSceneTerrainBoundsProducerHintRangeAcceptedCount;
+      } else {
+        ++m_war3Scene.shadowStats.
+            semanticSceneTerrainBoundsProducerHintRangeRejectedCount;
+      }
+    }
+    return range;
+  };
 
   const bool dynamicShadowSource =
       DynamicSysmemVBOs || DynamicSysmemIBO || posDynamic || blendDynamic ||
@@ -48204,20 +48407,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
       // S1 can return through the persistent path before the legacy bounds
       // block below. Compute its local bounds on the miss that creates the
-      // immutable geometry, using only the exact current index domain and a
+      // immutable geometry, using a validated current draw range and a
       // generation-validated CPU-readable position span. Cache hits reuse the
-      // bounds owned by that immutable geometry, never D3D9's Min/Num hint.
+      // bounds owned by that immutable geometry. The development observer may
+      // use D3D9's documented conservative range; Release remains Off.
       if (s1TerrainPersistentPath &&
           dxvk::war3::internal::kShadowCascadeCullTerrainWithBounds &&
           War3TerrainBoundsCullModeRuntime() !=
               dxvk::war3::render::War3TerrainBoundsCullMode::Off) {
-        const auto boundsRange =
-            dxvk::war3::render::War3ResolveTerrainBoundsVertexRange(
-                indexed, StartVal, CountVal, exactIndexedDomainKnown,
-                exactIndexedDomainFirstVertex,
-                exactIndexedDomainVertexCount);
+        auto& boundsStats = m_war3Scene.shadowStats;
+        ++boundsStats.semanticSceneTerrainBoundsProducerS1AttemptCount;
+        const auto boundsRange = resolveTerrainBoundsVertexRange();
+        if (boundsRange.exact)
+          ++boundsStats.semanticSceneTerrainBoundsProducerExactRangeCount;
+        else
+          ++boundsStats.semanticSceneTerrainBoundsProducerMissingExactRangeCount;
         Rc<DxvkResourceAllocation> mappedAllocation = nullptr;
         dxvk::war3::memory::War3CpuReadableBufferSpan positionSpan = {};
+        bool positionSpanBuildAttempted = false;
         const bool upSourceExact =
             DynamicSysmemVBOs && posStream < caps::MaxStreams &&
             m_war3PerDrawUpload.vbSourceValid[posStream] &&
@@ -48229,6 +48436,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             m_war3PerDrawUpload.vbUploadBytes[posStream] != nullptr &&
             m_war3PerDrawUpload.vbUploadLength[posStream] != 0u;
         if (upSourceExact) {
+          ++boundsStats.semanticSceneTerrainBoundsProducerUpSourceAttemptCount;
+          positionSpanBuildAttempted = true;
           positionSpan = dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
               m_war3PerDrawUpload.vbUploadBytes[posStream],
               m_war3PerDrawUpload.vbUploadLength[posStream], 0u,
@@ -48239,8 +48448,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               m_war3PerDrawUpload.vbSourceContentGeneration[posStream], true});
         } else if (!DynamicSysmemVBOs && vbCommon != nullptr &&
                    !vbCommon->NeedsReadback()) {
+          ++boundsStats.semanticSceneTerrainBoundsProducerMappedSourceAttemptCount;
           mappedAllocation = vbCommon->GetMappedSlice();
           if (mappedAllocation != nullptr) {
+            positionSpanBuildAttempted = true;
             const auto allocationInfo = mappedAllocation->getBufferInfo();
             const bool hostVisible =
                 (mappedAllocation->getMemoryProperties() &
@@ -48255,6 +48466,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     vbCommon->War3ContentGeneration(), hostVisible});
           }
         }
+        War3RecordTerrainBoundsProducerSpan(
+            boundsStats, positionSpan, positionSpanBuildAttempted);
 
         War3LocalGeometryBounds localBounds = {};
         if (boundsRange.exact && positionSpan &&
@@ -48262,15 +48475,22 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 positionSpan, posStride, uint32_t(declInfo.posOffset),
                 posFormat, boundsRange.firstVertex, boundsRange.vertexCount,
                 false, localBounds)) {
+          ++boundsStats.semanticSceneTerrainBoundsProducerComputeSuccessCount;
           War3LocalBoundsToSphere(localBounds, candidate.localBoundsCenter,
                                   candidate.localBoundsRadius);
           candidate.localBoundsIdentityProven =
               candidate.localBoundsRadius > 0.0f &&
               std::isfinite(candidate.localBoundsRadius);
+          if (candidate.localBoundsIdentityProven)
+            ++boundsStats.semanticSceneTerrainBoundsProducerValidSphereCount;
+          else
+            ++boundsStats.semanticSceneTerrainBoundsProducerInvalidSphereCount;
           candidate.localBoundsSourceGeneration =
               candidate.localBoundsIdentityProven
                   ? positionSpan.contentGeneration
                   : 0u;
+        } else if (boundsRange.exact && positionSpan) {
+          ++boundsStats.semanticSceneTerrainBoundsProducerComputeFailureCount;
         }
       }
 
@@ -48384,6 +48604,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         compatDraw.boundsSourceWasSkinned = false;
         compatDraw.boundsFrameLocalDynamic = false;
         compatDraw.boundsAnimatedAttachment = false;
+        ++m_war3Scene.shadowStats
+              .semanticSceneTerrainBoundsProducerPublishedExactCount;
       }
 
       shadowCapturePersistentTiming.pause();
@@ -48616,16 +48838,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
              dxvk::war3::internal::kShadowCascadeCullTerrainWithBounds &&
              War3TerrainBoundsCullModeRuntime() !=
                  dxvk::war3::render::War3TerrainBoundsCullMode::Off) {
+    auto& boundsStats = m_war3Scene.shadowStats;
+    ++boundsStats.semanticSceneTerrainBoundsProducerFallbackAttemptCount;
     shadowCaptureBoundsTiming.enter(
         War3ShadowCaptureBoundsPhase::TerrainBoundsKey);
     War3LocalGeometryBounds terrainBounds = {};
-    const auto terrainVertexRange =
-        dxvk::war3::render::War3ResolveTerrainBoundsVertexRange(
-            indexed, StartVal, CountVal, exactIndexedDomainKnown,
-            exactIndexedDomainFirstVertex, exactIndexedDomainVertexCount);
+    const auto terrainVertexRange = resolveTerrainBoundsVertexRange();
+    if (terrainVertexRange.exact)
+      ++boundsStats.semanticSceneTerrainBoundsProducerExactRangeCount;
+    else
+      ++boundsStats.semanticSceneTerrainBoundsProducerMissingExactRangeCount;
     Rc<DxvkResourceAllocation> terrainMappedAllocation = nullptr;
     dxvk::war3::memory::War3CpuReadableBufferSpan
         terrainPositionReadableSpan = {};
+    bool terrainSpanBuildAttempted = false;
     const bool terrainUpSourceExact =
         DynamicSysmemVBOs && posStream < caps::MaxStreams &&
         m_war3PerDrawUpload.vbSourceValid[posStream] &&
@@ -48634,6 +48860,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         m_war3PerDrawUpload.vbUploadBytes[posStream] != nullptr &&
         m_war3PerDrawUpload.vbUploadLength[posStream] != 0u;
     if (terrainUpSourceExact) {
+      ++boundsStats.semanticSceneTerrainBoundsProducerUpSourceAttemptCount;
+      terrainSpanBuildAttempted = true;
       terrainPositionReadableSpan =
           dxvk::war3::memory::BuildWar3CpuReadableBufferSpan({
               m_war3PerDrawUpload.vbUploadBytes[posStream],
@@ -48645,8 +48873,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               m_war3PerDrawUpload.vbSourceContentGeneration[posStream], true});
     } else if (!DynamicSysmemVBOs && vbCommon != nullptr &&
                !vbCommon->NeedsReadback()) {
+      ++boundsStats.semanticSceneTerrainBoundsProducerMappedSourceAttemptCount;
       terrainMappedAllocation = vbCommon->GetMappedSlice();
       if (terrainMappedAllocation != nullptr) {
+        terrainSpanBuildAttempted = true;
         const auto allocationInfo = terrainMappedAllocation->getBufferInfo();
         const bool hostVisible =
             (terrainMappedAllocation->getMemoryProperties() &
@@ -48662,6 +48892,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 vbCommon->War3ContentGeneration(), hostVisible});
       }
     }
+    War3RecordTerrainBoundsProducerSpan(
+        boundsStats, terrainPositionReadableSpan, terrainSpanBuildAttempted);
     const bool terrainUploadSourceKeyValid =
         terrainUpSourceExact && terrainPositionReadableSpan &&
         dxvk::war3::internal::
@@ -48686,7 +48918,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
     const bool allowTerrainBoundsCache =
         (!DynamicSysmemVBOs && !posDynamic) || terrainUploadSourceKeyValid ||
-        terrainDynamicSliceContentKeyValid;
+        terrainDynamicSliceContentKeyValid ||
+        (dxvk::war3::internal::
+             kShadowS1TerrainBoundsCacheCurrentGenerationObserverEnabled &&
+         terrainPositionReadableSpan);
     static const uint8_t s_war3TerrainDynamicBoundsContentKey = 0u;
     const void* terrainStableKeyBase =
         terrainUploadSourceKeyValid
@@ -48735,6 +48970,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               terrainStableKeyOffset, terrainStableKeyLength,
               terrainStableKeyElementCount, terrainStableKeyElementStride,
               terrainStableKeyElementSize, terrainStableKeySequence)) {
+        ++boundsStats.semanticSceneTerrainBoundsProducerComputeSuccessCount;
         Vector4 localCenter = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
         float localRadius = 0.0f;
         War3LocalBoundsToSphere(terrainBounds, localCenter, localRadius);
@@ -48747,6 +48983,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             terrainPositionReadableSpan.contentGeneration;
         estimatedBoundsExactCurrentWorld =
             static_cast<bool>(terrainPositionReadableSpan);
+        if (estimatedBoundsExactCurrentWorld &&
+            estimatedBoundsRadius > 0.0f &&
+            std::isfinite(estimatedBoundsRadius))
+          ++boundsStats.semanticSceneTerrainBoundsProducerValidSphereCount;
+        else
+          ++boundsStats.semanticSceneTerrainBoundsProducerInvalidSphereCount;
+      } else if (terrainPositionReadableSpan) {
+        ++boundsStats.semanticSceneTerrainBoundsProducerComputeFailureCount;
       }
     }
   }
@@ -49665,6 +49909,9 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.boundsSourceWasSkinned = false;
     draw.boundsFrameLocalDynamic = posDynamic || DynamicSysmemVBOs;
     draw.boundsAnimatedAttachment = false;
+    if (draw.boundsIdentityProven)
+      ++m_war3Scene.shadowStats
+            .semanticSceneTerrainBoundsProducerPublishedExactCount;
   }
   if (!finalizeShadowDrawCommon(draw))
     return;

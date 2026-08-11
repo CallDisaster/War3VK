@@ -330,6 +330,9 @@ namespace dxvk {
           uint32_t terrainBoundsCandidateCount = 0;
           uint32_t terrainBoundsProofAcceptedCount = 0;
           uint32_t terrainBoundsFailVisibleCount = 0;
+          std::array<uint32_t,
+              war3::render::kWar3ShadowBoundsCullRejectReasonCount>
+              terrainBoundsRejectReasonHistogram = {};
           uint32_t terrainBoundsWouldCullCount = 0;
           uint32_t terrainBoundsAppliedCullCount = 0;
           uint32_t terrainBoundsC0WouldCullCount = 0;
@@ -339,6 +342,9 @@ namespace dxvk {
           uint32_t objectBoundsCandidateCount = 0;
           uint32_t objectBoundsProofAcceptedCount = 0;
           uint32_t objectBoundsFailVisibleCount = 0;
+          std::array<uint32_t,
+              war3::render::kWar3ShadowBoundsCullRejectReasonCount>
+              objectBoundsRejectReasonHistogram = {};
           uint32_t objectBoundsWouldCullCount = 0;
           uint32_t objectBoundsAppliedCullCount = 0;
           uint32_t unionCullMode = 0;
