@@ -2358,14 +2358,16 @@ enum class War3CompactWorkTableMode : uint8_t {
 War3CompactWorkTableMode War3SemanticCompactWorkTableModeRuntime() {
   // The table is a correctness-neutral control-plane optimization. Keep the
   // release default disabled until Observe has proved parity and its measured
-  // overhead stays below the 0.15 ms/frame admission gate.
-  if constexpr (dxvk::war3::internal::
-                    kReleaseFreezeExperimentalShadowRoutes)
+  // overhead stays below the 0.15 ms/frame admission gate.  A dedicated
+  // observer build may request mode 1; mode 2 can never reach Consume here.
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
     return War3CompactWorkTableMode::Off;
-  static const auto s_mode = static_cast<War3CompactWorkTableMode>(
-      std::min<uint32_t>(
-          2u, War3GetEnvU32("DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", 0u)));
-  return s_mode;
+  static const auto s_mode =
+      dxvk::war3::render::ParseShadowObserverBuildMode(War3GetEnvU32(
+          "DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", 0u));
+  return s_mode == dxvk::war3::render::War3ShadowObserverBuildMode::Observe
+      ? War3CompactWorkTableMode::Observe
+      : War3CompactWorkTableMode::Off;
 }
 
 dxvk::war3::gpu_skin::War3PersistentGpuPackageStage11ObserveAdapter::Mode
@@ -3184,17 +3186,17 @@ enum class War3ProducerClaimObserveMode : uint8_t {
 };
 
 War3ProducerClaimObserveMode War3ProducerClaimObserveModeRuntime() {
-  // Consume is parsed for experiment compatibility but deliberately behaves
-  // as Observe below. The reduced pre-build identity has not yet proved
-  // collision-free parity with the post-build exact-owner key.
-  if constexpr (dxvk::war3::internal::
-                    kReleaseFreezeExperimentalShadowRoutes)
+  // The reduced pre-build identity has not yet proved collision-free parity
+  // with the post-build exact-owner key.  Release is always Off; a dedicated
+  // observer build accepts only mode 1 and mode 2 remains unreachable.
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
     return War3ProducerClaimObserveMode::Off;
-  static const auto s_mode = static_cast<War3ProducerClaimObserveMode>(
-      std::min<uint32_t>(
-          2u,
-          War3GetEnvU32("DXVK_WAR3_SEMANTIC_PRODUCER_CLAIM_LEDGER", 0u)));
-  return s_mode;
+  static const auto s_mode =
+      dxvk::war3::render::ParseShadowObserverBuildMode(War3GetEnvU32(
+          "DXVK_WAR3_SEMANTIC_PRODUCER_CLAIM_LEDGER", 0u));
+  return s_mode == dxvk::war3::render::War3ShadowObserverBuildMode::Observe
+      ? War3ProducerClaimObserveMode::Observe
+      : War3ProducerClaimObserveMode::Off;
 }
 
 inline bool War3LegacyPerDrawSemanticScopesRuntime() {

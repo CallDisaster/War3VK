@@ -17,7 +17,7 @@ CONTROL = (ROOT / "src/d3d9/war3/tools/war3_control_plane.cpp").read_text(
 
 
 class CompactWorkTableContracts(unittest.TestCase):
-    def test_release_default_is_off_and_modes_are_bounded(self):
+    def test_release_is_off_and_dev_build_is_observe_only(self):
         block = DEVICE[
             DEVICE.index("enum class War3CompactWorkTableMode") :
             DEVICE.index("bool War3PopulateSubmitPermutationViewRuntime")
@@ -26,7 +26,15 @@ class CompactWorkTableContracts(unittest.TestCase):
         self.assertIn("Observe = 1u", block)
         self.assertIn("Consume = 2u", block)
         self.assertIn('"DXVK_WAR3_SEMANTIC_COMPACT_WORK_TABLE", 0u', block)
-        self.assertIn("std::min<uint32_t>(", block)
+        self.assertIn("kDevelopmentShadowObserversEnabled", block)
+        self.assertIn("ParseShadowObserverBuildMode", block)
+        runtime = block[
+            block.index("War3SemanticCompactWorkTableModeRuntime") :
+            block.index("War3PersistentPackageStage11EvidenceModeRuntime")
+        ]
+        self.assertIn("War3CompactWorkTableMode::Observe", runtime)
+        self.assertIn("War3CompactWorkTableMode::Off", runtime)
+        self.assertNotIn("War3CompactWorkTableMode::Consume", runtime)
 
     def test_only_exact_current_generation_items_are_sealed(self):
         start = DEVICE.index("// A compact item is consumable only")
