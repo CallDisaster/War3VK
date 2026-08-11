@@ -274,6 +274,8 @@ namespace dxvk {
      * notifyDeviceError and must not be treated as a driver query trigger.
      */
     void notifyDeviceErrorFromDriverResult(VkResult status) noexcept {
+      if (status == VK_ERROR_DEVICE_LOST)
+        GetDxvkDeviceAddressBindingTracker().markDriverLossObserved();
       m_vkd->notifyDeviceErrorFromDriverResult(status);
       notifyDeviceError(status);
     }

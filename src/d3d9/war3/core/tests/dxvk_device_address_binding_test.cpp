@@ -165,6 +165,39 @@ bool testLatestLifecycleAndOwnedObjectName() {
       "callback object name was not copied by value");
 }
 
+bool testDriverLossCutoffExcludesRetirementEvents() {
+  auto& bindingTracker = tracker();
+  bindingTracker.resetForInstance(true);
+  bindingTracker.setDeviceFeatureEnabled(true);
+
+  const auto unnamed = objectInfo(VK_OBJECT_TYPE_BUFFER, 0x7777u);
+  const auto named = objectInfo(
+    VK_OBJECT_TYPE_BUFFER, 0x7777u, "War3ShadowArena");
+  const auto bind = bindingInfo(0xa000u, 0x1000u,
+    VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+  const auto unbind = bindingInfo(0xa000u, 0x1000u,
+    VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
+  bindingTracker.record(bind, &unnamed);
+  bindingTracker.markDriverLossObserved();
+  bindingTracker.record(unbind, &named);
+  bindingTracker.markDriverLossObserved();
+
+  const auto fault = faultInfo(0xa888u, 0x100u);
+  const auto snapshot = bindingTracker.correlate(&fault, 1u);
+  return check(snapshot.driverLossObserved &&
+        snapshot.driverLossSequence == 1u &&
+        snapshot.postDriverLossEventCount == 1u,
+      "driver-loss sequence was not frozen exactly once") &&
+    check(snapshot.matchCount == 1u &&
+        snapshot.matches[0].bindingType ==
+          VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT,
+      "post-loss retirement changed the fault-time lifecycle state") &&
+    check(std::string(snapshot.matches[0].objectName.data()) ==
+        "War3ShadowArena" &&
+        snapshot.matches[0].nameObservedAfterDriverLoss,
+      "exact post-loss event did not provide bounded diagnostic naming");
+}
+
 }
 
 void* operator new(std::size_t size) {
@@ -192,5 +225,6 @@ int main() {
   passed = testFaultPrecisionAndLatestEventCorrelation() && passed;
   passed = testRingIsBoundedAndAllocationFree() && passed;
   passed = testLatestLifecycleAndOwnedObjectName() && passed;
+  passed = testDriverLossCutoffExcludesRetirementEvents() && passed;
   return passed ? 0 : 1;
 }

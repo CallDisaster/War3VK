@@ -1391,7 +1391,8 @@ namespace dxvk {
 
     result.cookie = ++m_nextCookie;
 
-    if (unlikely(m_device->debugFlags().test(DxvkDebugFlag::Capture)))
+    if (unlikely(m_device->debugFlags().test(DxvkDebugFlag::Capture) ||
+                 DxvkDeviceAddressBindingBuildEnabled))
       assignMemoryDebugName(result, type);
 
     type.stats.memoryAllocated += size;

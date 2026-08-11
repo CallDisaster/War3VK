@@ -426,6 +426,9 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
       {"deviceFeatureEnabled", addressBinding.deviceFeatureEnabled},
       {"observedEventCount", addressBinding.observedEventCount},
       {"droppedEventCount", addressBinding.droppedEventCount},
+      {"driverLossObserved", addressBinding.driverLossObserved},
+      {"driverLossSequence", addressBinding.driverLossSequence},
+      {"postDriverLossEventCount", addressBinding.postDriverLossEventCount},
       {"truncated", addressBinding.truncated},
       {"matches", json::array()},
   };
@@ -486,6 +489,7 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"hasPriorBind", match.hasPriorBind},
         {"priorBindSequence", match.priorBindSequence},
         {"nameSourceSequence", match.nameSourceSequence},
+        {"nameObservedAfterDriverLoss", match.nameObservedAfterDriverLoss},
     });
   }
   deviceFaultPayload["addressBindingReport"] =

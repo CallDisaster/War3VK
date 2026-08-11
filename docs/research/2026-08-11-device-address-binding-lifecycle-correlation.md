@@ -28,3 +28,12 @@ Primary references:
 This is a diagnostic candidate, not a TDR fix. One controlled hidden
 reproduction is still required to identify the exact resource class and then
 repair its ownership/lifetime contract.
+
+The first lifecycle-enabled reproduction showed that CPU-side terminal
+retirement appended many unbind reports before the delayed D3D fault query.
+The tracker therefore now freezes the binding sequence at the first direct
+driver `VK_ERROR_DEVICE_LOST` result and excludes later events from lifecycle
+state. A later exact-key event may contribute only its bounded debug name. The
+development build also preserves DXVK buffer/image/memory names even when the
+normal capture debug flag is off. These changes prevent teardown activity from
+being mistaken for the fault-time ownership state.

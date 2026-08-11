@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <limits>
 
 #include "dxvk_include.h"
 
@@ -36,6 +37,7 @@ namespace dxvk {
     bool hasPriorBind = false;
     uint32_t priorBindSequence = 0u;
     uint32_t nameSourceSequence = 0u;
+    bool nameObservedAfterDriverLoss = false;
   };
 
   struct DxvkDeviceAddressBindingSnapshot {
@@ -46,6 +48,9 @@ namespace dxvk {
     bool deviceFeatureEnabled = false;
     uint32_t observedEventCount = 0u;
     uint32_t droppedEventCount = 0u;
+    bool driverLossObserved = false;
+    uint32_t driverLossSequence = 0u;
+    uint32_t postDriverLossEventCount = 0u;
     bool truncated = false;
     uint32_t matchCount = 0u;
     std::array<DxvkDeviceAddressBindingMatch, MaxMatches> matches = { };
@@ -68,6 +73,8 @@ namespace dxvk {
     void resetForInstance(bool messengerAvailable) noexcept;
 
     void setDeviceFeatureEnabled(bool enabled) noexcept;
+
+    void markDriverLossObserved() noexcept;
 
     void record(
       const VkDeviceAddressBindingCallbackDataEXT& binding,
@@ -121,6 +128,8 @@ namespace dxvk {
     std::atomic<uint32_t> m_nextSequence = { 0u };
     std::atomic<uint32_t> m_observedEventCount = { 0u };
     std::atomic<uint32_t> m_droppedEventCount = { 0u };
+    std::atomic<uint32_t> m_driverLossSequence = {
+      std::numeric_limits<uint32_t>::max() };
     std::array<Slot, Capacity> m_slots = { };
   };
 

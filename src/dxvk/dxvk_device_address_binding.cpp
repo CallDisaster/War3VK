@@ -61,11 +61,28 @@ namespace dxvk {
     m_nextSequence.store(0u, std::memory_order_relaxed);
     m_observedEventCount.store(0u, std::memory_order_relaxed);
     m_droppedEventCount.store(0u, std::memory_order_relaxed);
+    m_driverLossSequence.store(std::numeric_limits<uint32_t>::max(),
+      std::memory_order_relaxed);
     for (auto& slot : m_slots)
       slot.guard.store(0u, std::memory_order_relaxed);
     m_messengerAvailable.store(
       DxvkDeviceAddressBindingBuildEnabled && messengerAvailable,
       std::memory_order_release);
+  }
+
+
+  void DxvkDeviceAddressBindingTracker::markDriverLossObserved() noexcept {
+    if (!DxvkDeviceAddressBindingBuildEnabled ||
+        !m_messengerAvailable.load(std::memory_order_acquire) ||
+        !m_deviceFeatureEnabled.load(std::memory_order_acquire))
+      return;
+
+    const uint32_t cutoff = std::min(
+      m_nextSequence.load(std::memory_order_acquire),
+      std::numeric_limits<uint32_t>::max() - 1u);
+    uint32_t expected = std::numeric_limits<uint32_t>::max();
+    m_driverLossSequence.compare_exchange_strong(expected, cutoff,
+      std::memory_order_release, std::memory_order_relaxed);
   }
 
 
@@ -178,6 +195,19 @@ namespace dxvk {
       std::memory_order_acquire);
     result.droppedEventCount = m_droppedEventCount.load(
       std::memory_order_acquire);
+    const uint32_t driverLossSequence = m_driverLossSequence.load(
+      std::memory_order_acquire);
+    result.driverLossObserved = driverLossSequence !=
+      std::numeric_limits<uint32_t>::max();
+    result.driverLossSequence = result.driverLossObserved
+      ? driverLossSequence
+      : 0u;
+    const uint32_t nextSequence = m_nextSequence.load(
+      std::memory_order_acquire);
+    result.postDriverLossEventCount = result.driverLossObserved &&
+      nextSequence > driverLossSequence
+        ? nextSequence - driverLossSequence
+        : 0u;
     result.truncated = result.observedEventCount > Capacity ||
       result.droppedEventCount != 0u;
     return result;
@@ -197,6 +227,9 @@ namespace dxvk {
     for (uint32_t slotIndex = 0u; slotIndex < Capacity; ++slotIndex) {
       DxvkDeviceAddressBindingMatch event = { };
       if (!readSlot(slotIndex, event))
+        continue;
+      if (result.driverLossObserved &&
+          event.sequence > result.driverLossSequence)
         continue;
 
       const uint64_t eventLower = event.baseAddress;
@@ -260,8 +293,21 @@ namespace dxvk {
         if (!readSlot(slotIndex, previous))
           continue;
         previous.faultInfoIndex = match.faultInfoIndex;
-        if (!SameObjectRange(match, previous) ||
-            previous.sequence >= match.sequence)
+        if (!SameObjectRange(match, previous))
+          continue;
+
+        // A debug name may only become visible after object creation, and a
+        // terminal driver result can race CPU-side retirement. It is safe to
+        // borrow a bounded name from a later event with the same exact Vulkan
+        // object/range identity, but never use that event as lifecycle state.
+        if (!HasObjectName(match) && HasObjectName(previous) &&
+            previous.sequence > match.nameSourceSequence) {
+          match.objectName = previous.objectName;
+          match.nameSourceSequence = previous.sequence;
+          match.nameObservedAfterDriverLoss = result.driverLossObserved &&
+            previous.sequence > result.driverLossSequence;
+        }
+        if (previous.sequence >= match.sequence)
           continue;
 
         if (!match.hasPreviousEvent ||
@@ -275,11 +321,6 @@ namespace dxvk {
              previous.sequence > match.priorBindSequence)) {
           match.hasPriorBind = true;
           match.priorBindSequence = previous.sequence;
-        }
-        if (!HasObjectName(match) && HasObjectName(previous) &&
-            previous.sequence > match.nameSourceSequence) {
-          match.objectName = previous.objectName;
-          match.nameSourceSequence = previous.sequence;
         }
       }
       if (HasObjectName(match) && !match.nameSourceSequence)

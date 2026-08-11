@@ -25,6 +25,10 @@ class DeviceAddressBindingReportStaticTests(unittest.TestCase):
         cls.tracker_h = read("src/dxvk/dxvk_device_address_binding.h")
         cls.tracker_cpp = read("src/dxvk/dxvk_device_address_binding.cpp")
         cls.fault_cpp = read("src/dxvk/dxvk_device_fault.cpp")
+        cls.device_h = read("src/dxvk/dxvk_device.h")
+        cls.buffer_cpp = read("src/dxvk/dxvk_buffer.cpp")
+        cls.image_cpp = read("src/dxvk/dxvk_image.cpp")
+        cls.memory_cpp = read("src/dxvk/dxvk_memory.cpp")
         cls.diagnostics = read(
             "src/d3d9/war3/tools/war3_diagnostics_hub.cpp"
         )
@@ -118,6 +122,8 @@ class DeviceAddressBindingReportStaticTests(unittest.TestCase):
             '"baseAddress"', '"objectHandle"',
             '"objectName"', '"latestState"', '"previousBindingType"',
             '"priorBindSequence"',
+            '"driverLossSequence"', '"postDriverLossEventCount"',
+            '"nameObservedAfterDriverLoss"',
         ):
             self.assertIn(field, self.diagnostics)
 
@@ -127,6 +133,24 @@ class DeviceAddressBindingReportStaticTests(unittest.TestCase):
         self.assertIn("previous.sequence > match.previousSequence", self.tracker_cpp)
         self.assertIn("previous.sequence > match.priorBindSequence", self.tracker_cpp)
         self.assertIn("VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT", self.tracker_cpp)
+
+    def test_driver_loss_cutoff_precedes_terminal_publish(self) -> None:
+        notify_at = self.device_h.index(
+            "void notifyDeviceErrorFromDriverResult(VkResult status)"
+        )
+        notify = self.device_h[notify_at:self.device_h.index("/**", notify_at)]
+        cutoff_at = notify.index("markDriverLossObserved")
+        driver_at = notify.index("m_vkd->notifyDeviceErrorFromDriverResult")
+        terminal_at = notify.index("notifyDeviceError(status)")
+        self.assertLess(cutoff_at, driver_at)
+        self.assertLess(driver_at, terminal_at)
+        self.assertNotIn("captureDeviceFault", notify)
+        self.assertIn("event.sequence > result.driverLossSequence", self.tracker_cpp)
+
+    def test_dev_build_preserves_dxvk_debug_names(self) -> None:
+        for source in (self.buffer_cpp, self.image_cpp, self.memory_cpp):
+            self.assertIn("DxvkDeviceAddressBindingBuildEnabled", source)
+            self.assertIn("vkSetDebugUtilsObjectNameEXT", source)
 
     def test_callback_path_does_not_write_incidents_or_query_faults(self) -> None:
         combined = self.instance + self.tracker_cpp
