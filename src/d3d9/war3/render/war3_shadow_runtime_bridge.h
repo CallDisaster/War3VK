@@ -181,6 +181,7 @@ struct ShadowProducerRuntimeDiagnostics {
   uint64_t producerFallbackByteBudgetCount = 0;
   uint64_t producerArenaAdmissionCount = 0;
   uint64_t producerFreezeFailureCount = 0;
+  uint64_t producerSoftPriorityBudgetCount = 0;
   uint64_t producerCompletenessReasonMask = 0;
   uint64_t producerCompletenessSealed = 0;
   uint64_t producerCompletenessCounterOverflow = 0;
@@ -1019,6 +1020,7 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t producerFallbackByteBudgetCount = 0;
   uint64_t producerArenaAdmissionCount = 0;
   uint64_t producerFreezeFailureCount = 0;
+  uint64_t producerSoftPriorityBudgetCount = 0;
   uint64_t producerCompletenessReasonMask = 0;
   uint64_t producerCompletenessSealed = 0;
   uint64_t producerCompletenessCounterOverflow = 0;

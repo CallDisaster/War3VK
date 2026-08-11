@@ -1,4 +1,5 @@
 #include "../../../d3d9_war3_scene.h"
+#include "../war3_shadow_capture_frontend.h"
 #include "../war3_shadow_drawtime_cache_policy.h"
 
 #include <algorithm>
@@ -99,9 +100,51 @@ bool testProtectedWorkingSetLru() {
                  "inactive LRU tie-break was not deterministic/protected");
 }
 
+bool testRequiredCasterHardAdmissionIsOrderIndependent() {
+  constexpr uint64_t mib = 1024u * 1024u;
+  constexpr uint64_t hardBudget = 384u * mib;
+  const std::array<uint64_t, 4u> bundles = {
+      48u * mib, 120u * mib, 40u * mib, 80u * mib};
+  std::array<uint32_t, 4u> order = {0u, 1u, 2u, 3u};
+  do {
+    uint64_t used = 0u;
+    for (const uint32_t index : order) {
+      policy::ShadowCaptureBudgetPolicy budget = {};
+      budget.hardBudgetBytes = hardBudget;
+      budget.usedBudgetBytes = used;
+      budget.posBytes = bundles[index];
+      budget.requiredDirectionalCaster = true;
+      if (!require(policy::RequiredShadowCasterFitsHardBudget(budget),
+                   "required caster below hard capacity was rejected"))
+        return false;
+      used += bundles[index];
+    }
+    if (!require(used == 288u * mib,
+                 "permutation changed required caster byte total"))
+      return false;
+  } while (std::next_permutation(order.begin(), order.end()));
+
+  policy::ShadowCaptureBudgetPolicy overHard = {};
+  overHard.hardBudgetBytes = hardBudget;
+  overHard.usedBudgetBytes = 380u * mib;
+  overHard.posBytes = 8u * mib;
+  overHard.requiredDirectionalCaster = true;
+  if (!require(!policy::RequiredShadowCasterFitsHardBudget(overHard),
+               "required caster beyond hard capacity was admitted"))
+    return false;
+
+  overHard.usedBudgetBytes = std::numeric_limits<uint64_t>::max() - 1u;
+  overHard.hardBudgetBytes = std::numeric_limits<uint64_t>::max();
+  overHard.posBytes = 1u;
+  overHard.indexBytes = 1u;
+  return require(!policy::RequiredShadowCasterFitsHardBudget(overHard),
+                 "overflowing bundle byte sum was admitted");
+}
+
 } // namespace
 
 int main() {
   return testProducerCompletenessStampAndSaturation() &&
-      testProtectedWorkingSetLru() ? 0 : 1;
+      testProtectedWorkingSetLru() &&
+      testRequiredCasterHardAdmissionIsOrderIndependent() ? 0 : 1;
 }

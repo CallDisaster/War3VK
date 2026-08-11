@@ -128,6 +128,8 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   `ProducerIncomplete` 与四级联重复重放。本地诊断候选已把独立 producer/cache/unknown-index 原因
   贯通到 runtime、flight、incident 和 perf，仍不等于 TDR 已修复；详见
   `docs/agent-history/2026-08-11-night-tdr-invalid-read-evidence.md`。
+- 2026-08-11 最新报告证明高压全体阴影闪烁主要来自必需 Caster 被软优先级预算拒绝，而非 Arena
+  硬容量耗尽；本地候选改为低于 384 MiB 硬上限时全部准入并增加独立原因诊断，尚待前台物理 A/B。
 - Issue #6 已先闭合两个确定的跨地图 CPU 身份泄漏：caster tombstone 现在按 map epoch 隔离，且
   旧相机、per-draw upload、RT/DS fallback 会在 Present 安全点重置；显式禁用 producer stage 的
   进程级策略仍跨地图保留。该阶段仅通过离线合同和 Win32 runnable，尚未部署或完成 A→B→A

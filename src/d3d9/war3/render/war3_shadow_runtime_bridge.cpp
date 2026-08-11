@@ -2071,6 +2071,8 @@ void WriteTraceFrameEvent(
      << stats.producerArenaAdmissionCount
      << ",\"producerFreezeFailureCount\":"
      << stats.producerFreezeFailureCount
+     << ",\"producerSoftPriorityBudgetCount\":"
+     << stats.producerSoftPriorityBudgetCount
      << ",\"producerCompletenessReasonMask\":"
      << stats.producerCompletenessReasonMask
      << ",\"producerCompletenessCounterOverflow\":"
@@ -5046,6 +5048,8 @@ ShadowProducerRuntimeDiagnostics QueryShadowProducerRuntimeDiagnostics() {
       g_shadowSceneStats.producerArenaAdmissionCount;
   summary.producerFreezeFailureCount =
       g_shadowSceneStats.producerFreezeFailureCount;
+  summary.producerSoftPriorityBudgetCount =
+      g_shadowSceneStats.producerSoftPriorityBudgetCount;
   summary.producerCompletenessReasonMask =
       g_shadowSceneStats.producerCompletenessReasonMask;
   summary.producerCompletenessSealed =
@@ -6963,6 +6967,8 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.producerArenaAdmissionCount;
     summary.producerFreezeFailureCount =
         g_shadowSceneStats.producerFreezeFailureCount;
+    summary.producerSoftPriorityBudgetCount =
+        g_shadowSceneStats.producerSoftPriorityBudgetCount;
     summary.producerCompletenessReasonMask =
         g_shadowSceneStats.producerCompletenessReasonMask;
     summary.producerCompletenessSealed =

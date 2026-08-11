@@ -423,6 +423,7 @@ namespace dxvk {
         FallbackByteBudget = 1u << 4u,
         ArenaAdmission = 1u << 5u,
         FreezeFailure = 1u << 6u,
+        SoftPriorityBudget = 1u << 7u,
     };
 
     inline constexpr uint64_t War3SaturatingAddU64(uint64_t value,
@@ -452,6 +453,7 @@ namespace dxvk {
         uint64_t fallbackByteBudgetCount = 0u;
         uint64_t arenaAdmissionCount = 0u;
         uint64_t freezeFailureCount = 0u;
+        uint64_t softPriorityBudgetCount = 0u;
 
         void note(War3RequiredCasterOmissionReason reason,
                   bool uniqueCaster) noexcept {
@@ -472,6 +474,8 @@ namespace dxvk {
             counter = &arenaAdmissionCount; break;
           case War3RequiredCasterOmissionReason::FreezeFailure:
             counter = &freezeFailureCount; break;
+          case War3RequiredCasterOmissionReason::SoftPriorityBudget:
+            counter = &softPriorityBudgetCount; break;
           }
           *counter = War3SaturatingAddU64(*counter, 1u, counterOverflow);
           if (uniqueCaster) {
@@ -695,6 +699,7 @@ namespace dxvk {
         uint64_t producerFallbackByteBudgetCount = 0u;
         uint64_t producerArenaAdmissionCount = 0u;
         uint64_t producerFreezeFailureCount = 0u;
+        uint64_t producerSoftPriorityBudgetCount = 0u;
         uint64_t producerSealFrameSerial = 0u;
         uint64_t producerSealMapEpoch = 0u;
         uint64_t producerSealDeviceEpoch = 0u;

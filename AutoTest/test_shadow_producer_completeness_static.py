@@ -10,6 +10,8 @@ SCENE = (ROOT / "src/d3d9/d3d9_war3_scene.h").read_text(encoding="utf-8")
 DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
 SHADOW = (ROOT / "src/d3d9/d3d9_war3_shadow.cpp").read_text(encoding="utf-8")
 POLICY = (ROOT / "src/d3d9/war3/render/war3_shadow_drawtime_cache_policy.h").read_text(encoding="utf-8")
+CAPTURE = (ROOT / "src/d3d9/war3/render/war3_shadow_capture_frontend.cpp").read_text(encoding="utf-8")
+CAPTURE_H = (ROOT / "src/d3d9/war3/render/war3_shadow_capture_frontend.h").read_text(encoding="utf-8")
 MESON = (ROOT / "src/d3d9/meson.build").read_text(encoding="utf-8")
 
 
@@ -55,6 +57,18 @@ class ProducerCompletenessContractTest(unittest.TestCase):
             self.assertIn(f"War3RequiredCasterOmissionReason::{name}", DEVICE)
         self.assertIn("ShadowArena_BeginBundle", DEVICE)
         self.assertIn("War3RecordRequiredCasterOmission(", DEVICE)
+
+    def test_required_directional_casters_only_use_hard_capacity(self):
+        self.assertIn("bool requiredDirectionalCaster = false", CAPTURE_H)
+        self.assertIn("RequiredShadowCasterFitsHardBudget", CAPTURE_H)
+        required = CAPTURE.index("if (policy.requiredDirectionalCaster)")
+        soft = CAPTURE.index("const float softScale", required)
+        block = CAPTURE[required:soft]
+        self.assertIn("RequiredShadowCasterFitsHardBudget(policy)", block)
+        self.assertIn('decision.reason = "required_caster_hard_budget"', block)
+        self.assertNotIn("softBudgetBytes", block)
+        self.assertIn("budgetPolicy.requiredDirectionalCaster = true", DEVICE)
+        self.assertIn("War3RequiredCasterOmissionReason::SoftPriorityBudget", DEVICE)
 
     def test_active_working_set_is_not_lru_evicted(self):
         self.assertIn("kWar3ShadowDrawTimeStaticRecentProtectFrames", POLICY)

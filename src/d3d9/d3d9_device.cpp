@@ -23694,6 +23694,7 @@ void D3D9DeviceEx::War3RecordRequiredCasterOmission(
   stats.producerFallbackByteBudgetCount = completeness.fallbackByteBudgetCount;
   stats.producerArenaAdmissionCount = completeness.arenaAdmissionCount;
   stats.producerFreezeFailureCount = completeness.freezeFailureCount;
+  stats.producerSoftPriorityBudgetCount = completeness.softPriorityBudgetCount;
   stats.producerCompletenessReasonMask = completeness.reasonMask;
   stats.producerCompletenessCounterOverflow =
       completeness.counterOverflow ? 1u : 0u;
@@ -23715,6 +23716,7 @@ void D3D9DeviceEx::War3RecordRequiredCasterOmission(
   stats.producerFallbackByteBudgetCount = completeness.fallbackByteBudgetCount;
   stats.producerArenaAdmissionCount = completeness.arenaAdmissionCount;
   stats.producerFreezeFailureCount = completeness.freezeFailureCount;
+  stats.producerSoftPriorityBudgetCount = completeness.softPriorityBudgetCount;
   stats.producerCompletenessReasonMask = completeness.reasonMask;
   stats.producerCompletenessCounterOverflow =
       completeness.counterOverflow ? 1u : 0u;
@@ -23744,6 +23746,7 @@ void D3D9DeviceEx::War3SealShadowProducerCompleteness(
   stats.producerFallbackByteBudgetCount = completeness.fallbackByteBudgetCount;
   stats.producerArenaAdmissionCount = completeness.arenaAdmissionCount;
   stats.producerFreezeFailureCount = completeness.freezeFailureCount;
+  stats.producerSoftPriorityBudgetCount = completeness.softPriorityBudgetCount;
 }
 
 bool D3D9DeviceEx::War3DrawTimeExactRejectedCurrentFrame(
@@ -48118,16 +48121,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   budgetPolicy.indexBytes = fallbackIndexBudgetBytes;
   budgetPolicy.freezeDynamicEnabled = s_freezeDynamicShadowBuffers;
   budgetPolicy.aggressiveExperimental = false;
+  budgetPolicy.requiredDirectionalCaster = true;
 
   shadowCaptureBoundsTiming.enter(War3ShadowCaptureBoundsPhase::BudgetDecision);
   const auto budgetDecision =
       dxvk::war3::render::DecideShadowCaptureBudget(budgetCandidate,
                                                     budgetPolicy);
-  const uint64_t requestedFallbackBytes =
-      budgetPolicy.posBytes + budgetPolicy.blendBytes + budgetPolicy.uvBytes +
-      budgetPolicy.indexBytes;
-  const uint64_t predictedFallbackBytes =
-      budgetPolicy.usedBudgetBytes + requestedFallbackBytes;
+  const bool requestedBundleFitsHardBudget =
+      dxvk::war3::render::RequiredShadowCasterFitsHardBudget(budgetPolicy);
 
   shadowCaptureBoundsTiming.enter(
       War3ShadowCaptureBoundsPhase::BudgetAccounting);
@@ -48144,15 +48145,15 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   }
 
   if (budgetDecision.skipCaster) {
-    if (predictedFallbackBytes > budgetPolicy.hardBudgetBytes)
+    if (!requestedBundleFitsHardBudget)
       m_war3Scene.shadowStats.skippedFreezeBudget++;
     else
       m_war3Scene.shadowStats.skippedPriorityBudget++;
     m_war3Scene.shadowStats.budgetExceeded = 1u;
     War3RecordRequiredCasterOmission(
-        predictedFallbackBytes > budgetPolicy.hardBudgetBytes
+        !requestedBundleFitsHardBudget
             ? War3RequiredCasterOmissionReason::FallbackByteBudget
-            : War3RequiredCasterOmissionReason::FreezeFailure);
+            : War3RequiredCasterOmissionReason::SoftPriorityBudget);
     m_war3Scene.shadowStats.fallbackBudgetBytes =
         m_war3ShadowFallbackBudgetCapBytes;
     m_war3Scene.shadowStats.fallbackBudgetUsedBytes =

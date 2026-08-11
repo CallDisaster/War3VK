@@ -601,6 +601,7 @@ private:
         uint64_t producerFallbackByteBudgetCount = 0;
         uint64_t producerArenaAdmissionCount = 0;
         uint64_t producerFreezeFailureCount = 0;
+        uint64_t producerSoftPriorityBudgetCount = 0;
         uint64_t producerCompletenessCounterOverflowFrames = 0;
         uint64_t producerSealFrameSerialLast = 0;
         uint64_t producerSealMapEpochLast = 0;

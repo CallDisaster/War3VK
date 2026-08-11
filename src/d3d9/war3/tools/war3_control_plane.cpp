@@ -2604,6 +2604,8 @@ json ToJson(const render::ShadowRuntimeBridgeSummary& summary) {
       {"producerArenaAdmissionCount",
        summary.producerArenaAdmissionCount},
       {"producerFreezeFailureCount", summary.producerFreezeFailureCount},
+      {"producerSoftPriorityBudgetCount",
+       summary.producerSoftPriorityBudgetCount},
       {"producerCompletenessReasonMask",
        summary.producerCompletenessReasonMask},
       {"producerCompletenessSealed", summary.producerCompletenessSealed},

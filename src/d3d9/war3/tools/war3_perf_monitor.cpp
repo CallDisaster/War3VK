@@ -1252,6 +1252,8 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.producerFallbackByteBudgetCount;
   agg.producerArenaAdmissionCount += stats.producerArenaAdmissionCount;
   agg.producerFreezeFailureCount += stats.producerFreezeFailureCount;
+  agg.producerSoftPriorityBudgetCount +=
+      stats.producerSoftPriorityBudgetCount;
   agg.producerCompletenessCounterOverflowFrames +=
       stats.producerCompletenessCounterOverflow != 0u ? 1u : 0u;
   agg.producerSealFrameSerialLast = stats.producerSealFrameSerial;
@@ -5828,6 +5830,8 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.producerArenaAdmissionCount << ",\n";
   json << "    \"producerFreezeFailureCount\": "
        << shadowAgg.producerFreezeFailureCount << ",\n";
+  json << "    \"producerSoftPriorityBudgetCount\": "
+       << shadowAgg.producerSoftPriorityBudgetCount << ",\n";
   json << "    \"producerCompletenessCounterOverflowFrames\": "
        << shadowAgg.producerCompletenessCounterOverflowFrames << ",\n";
   json << "    \"producerSealFrameSerialLast\": "

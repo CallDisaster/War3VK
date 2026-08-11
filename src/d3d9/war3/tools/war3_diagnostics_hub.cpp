@@ -538,6 +538,8 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"producerArenaAdmissionCount",
          frame.producerArenaAdmissionCount},
         {"producerFreezeFailureCount", frame.producerFreezeFailureCount},
+        {"producerSoftPriorityBudgetCount",
+         frame.producerSoftPriorityBudgetCount},
         {"producerCompletenessReasonMask",
          frame.producerCompletenessReasonMask},
         {"producerCompletenessSealed", frame.producerCompletenessSealed},
@@ -735,6 +737,8 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
       producer.producerArenaAdmissionCount;
   frame.producerFreezeFailureCount =
       producer.producerFreezeFailureCount;
+  frame.producerSoftPriorityBudgetCount =
+      producer.producerSoftPriorityBudgetCount;
   frame.producerCompletenessReasonMask =
       producer.producerCompletenessReasonMask;
   frame.producerCompletenessSealed =
@@ -2169,6 +2173,8 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       bridgeSummary.producerArenaAdmissionCount;
   summary.producerFreezeFailureCount =
       bridgeSummary.producerFreezeFailureCount;
+  summary.producerSoftPriorityBudgetCount =
+      bridgeSummary.producerSoftPriorityBudgetCount;
   summary.producerCompletenessReasonMask =
       bridgeSummary.producerCompletenessReasonMask;
   summary.producerCompletenessSealed =
