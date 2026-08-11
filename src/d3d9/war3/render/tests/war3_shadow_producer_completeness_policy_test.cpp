@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
-#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -115,40 +114,6 @@ bool testGenerationObservationClock() {
           policy::AdvanceWar3ShadowGenerationObservationClock(clock, 110u) ==
               3u,
       "sparse Present serials did not form adjacent producer observations");
-}
-
-bool testGenerationBackedStreamProofMapIdentity() {
-  using Proof = policy::War3ShadowGenerationBackedStreamProof;
-  using Kind = policy::War3ShadowStreamKind;
-  Proof proof = {};
-  proof.ownerIdentity = 0x1234u;
-  proof.identityGeneration = 2u;
-  proof.allocationGeneration = 3u;
-  proof.contentGeneration = 4u;
-  proof.sourceOffset = 64u;
-  proof.sourceLength = 192u;
-  proof.elementStride = 12u;
-  proof.elementSize = 12u;
-  proof.mapEpoch = 5u;
-  proof.deviceEpoch = 6u;
-  proof.streamKind = Kind::Position;
-
-  std::unordered_map<Proof, uint32_t,
-                     policy::War3ShadowGenerationBackedStreamProofHash>
-      backings;
-  backings.emplace(proof, 7u);
-  Proof changedGeneration = proof;
-  changedGeneration.contentGeneration++;
-  Proof changedRange = proof;
-  changedRange.sourceOffset += 12u;
-  Proof changedEpoch = proof;
-  changedEpoch.mapEpoch++;
-  return require(proof.valid() && proof.matches(proof) &&
-                     backings.find(proof) != backings.end() &&
-                     backings.find(changedGeneration) == backings.end() &&
-                     backings.find(changedRange) == backings.end() &&
-                     backings.find(changedEpoch) == backings.end(),
-                 "shared stream map accepted a changed generation/range/epoch");
 }
 
 bool testRequiredCasterHardAdmissionIsOrderIndependent() {
@@ -328,7 +293,6 @@ int main() {
   return testProducerCompletenessStampAndSaturation() &&
       testProtectedWorkingSetLru() &&
       testGenerationObservationClock() &&
-      testGenerationBackedStreamProofMapIdentity() &&
       testRequiredCasterHardAdmissionIsOrderIndependent() &&
       testGenerationBackedStreamProof() &&
       testGenerationBackedStabilityProbation() ? 0 : 1;

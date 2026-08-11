@@ -24679,8 +24679,6 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3Stage13RetainedCasters = {};
   m_war3ShadowPersistentExpiryQueue = {};
   m_war3DrawTimeVBCache = {};
-  m_war3DrawTimeSharedStreamBackings.clear();
-  m_war3DrawTimeSharedStreamBackingFrameSerial = 0u;
   m_war3S1TerrainCasterStash = {};
   m_war3S1TerrainEarlyCache = {};
   m_war3S1GenerationProofObservations.clear();
@@ -42982,86 +42980,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
           return m_war3DrawTimeVBCache[vbCacheKey];
         }();
-        if (m_war3DrawTimeSharedStreamBackingFrameSerial !=
-            m_war3ShadowPersistentFrameSerial) {
-          m_war3DrawTimeSharedStreamBackings.clear();
-          m_war3DrawTimeSharedStreamBackingFrameSerial =
-              m_war3ShadowPersistentFrameSerial;
-        }
-        const auto tryBindSharedStreamBacking =
-            [&](const GenerationBackedStreamProof& proof,
-                VkDeviceSize requiredBytes, Rc<DxvkBuffer>& buffer,
-                VkDeviceSize& capacity) {
-              if (!generationBackedStaticCandidate || !proof.valid() ||
-                  m_war3ShadowPersistentFrameSerial == 0u)
-                return false;
-              const auto sharedIt =
-                  m_war3DrawTimeSharedStreamBackings.find(proof);
-              if (sharedIt == m_war3DrawTimeSharedStreamBackings.end() ||
-                  sharedIt->second.buffer == nullptr ||
-                  sharedIt->second.capacity < requiredBytes)
-                return false;
-              buffer = sharedIt->second.buffer;
-              capacity = sharedIt->second.capacity;
-              return true;
-            };
-        const auto publishSharedStreamBacking =
-            [&](const GenerationBackedStreamProof& proof,
-                const Rc<DxvkBuffer>& buffer, VkDeviceSize capacity) {
-              if (!generationBackedStaticCandidate || !proof.valid() ||
-                  buffer == nullptr || capacity < proof.sourceLength ||
-                  m_war3ShadowPersistentFrameSerial == 0u)
-                return;
-              m_war3DrawTimeSharedStreamBackings.try_emplace(
-                  proof, War3DrawTimeSharedStreamBacking{buffer, capacity});
-            };
-        const bool generationBackedPositionEntryReuse =
+        const bool generationBackedPositionReuse =
             generationBackedStaticCandidate && entry.isStaticGeometry &&
             entry.positionSourceProof.matches(currentPositionSourceProof) &&
             entry.positionBuffer != nullptr &&
             entry.positionCapacity >= posBytes &&
             entry.vertexCount == vRangeCount &&
             entry.positionStride == posStride;
-        if (entry.positionGenerationShared &&
-            !generationBackedPositionEntryReuse) {
-          entry.positionBuffer = nullptr;
-          entry.positionInfo = {};
-          entry.positionCapacity = 0u;
-          entry.positionGenerationShared = false;
-        }
-        const bool generationBackedPositionSharedReuse =
-            !generationBackedPositionEntryReuse &&
-            tryBindSharedStreamBacking(
-                currentPositionSourceProof, posBytes, entry.positionBuffer,
-                entry.positionCapacity);
-        if (generationBackedPositionSharedReuse)
-          entry.positionGenerationShared = true;
-        const bool generationBackedPositionReuse =
-            generationBackedPositionEntryReuse ||
-            generationBackedPositionSharedReuse;
-        const bool generationBackedIndexEntryReuse =
+        const bool generationBackedIndexReuse =
             generationBackedStaticCandidate && indexed &&
             entry.isStaticGeometry &&
             entry.indexSourceProof.matches(currentIndexSourceProof) &&
             entry.indexBuffer != nullptr &&
             entry.indexCapacity >= drawTimeIndexRangeBytes &&
             entry.indexType == drawTimeIndexType;
-        if (entry.indexGenerationShared &&
-            !generationBackedIndexEntryReuse) {
-          entry.indexBuffer = nullptr;
-          entry.indexInfo = {};
-          entry.indexCapacity = 0u;
-          entry.indexGenerationShared = false;
-        }
-        const bool generationBackedIndexSharedReuse =
-            indexed && !generationBackedIndexEntryReuse &&
-            tryBindSharedStreamBacking(
-                currentIndexSourceProof, drawTimeIndexRangeBytes,
-                entry.indexBuffer, entry.indexCapacity);
-        if (generationBackedIndexSharedReuse)
-          entry.indexGenerationShared = true;
-        const bool generationBackedIndexReuse =
-            generationBackedIndexEntryReuse || generationBackedIndexSharedReuse;
         if (War3DrawTimeCacheIteratorReuseVerifyRuntime()) {
           auto& legacyEntry = m_war3DrawTimeVBCache[vbCacheKey];
           if (&legacyEntry != &entry)
@@ -43144,7 +43076,6 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.positionBuffer = nullptr;
           entry.positionInfo = {};
           entry.positionCapacity = 0u;
-          entry.positionGenerationShared = false;
         }
         // 记录 capture 时的 D3DTS_WORLD 矩阵。静态建筑（未 skin）顶点是
         // 模型本地空间，必须用这个矩阵变换到世界；动态单位（CPU skin 后）
@@ -43303,12 +43234,6 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) {
           entry.positionInfo =
               entry.positionBuffer->getSliceInfo(0, posBytes);
-          publishSharedStreamBacking(
-              currentPositionSourceProof, entry.positionBuffer,
-              entry.positionCapacity);
-          if (generationBackedStaticCandidate &&
-              currentPositionSourceProof.valid())
-            entry.positionGenerationShared = true;
           if (generationBackedPositionReuse) {
             m_war3Scene.shadowStats
                 .drawTimeGenerationBackedPositionReuseCount++;
@@ -43325,7 +43250,6 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.uvBuffer = nullptr;
           entry.uvInfo = {};
           entry.uvCapacity = 0u;
-          entry.uvGenerationShared = false;
         }
         entry.uvStride = 0u;
         entry.uvOffset = 0u;
@@ -43440,44 +43364,6 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   if (uvSrcSlice.length() >=
                       VkDeviceSize(vRangeStart + vRangeCount) *
                           VkDeviceSize(uvStride)) {
-                    GenerationBackedStreamProof currentUvSourceProof = {};
-                    if (DynamicSysmemVBOs) {
-                      currentUvSourceProof = makeUploadVertexStreamProof(
-                          uvStream,
-                          uint64_t(vRangeStart) * uint64_t(uvStride),
-                          uint64_t(uvBytes), ShadowStreamKind::Uv);
-                    } else {
-                      auto* uvVb =
-                          m_state.vertexBuffers[uvStream].vertexBuffer.ptr();
-                      auto* uvCommon =
-                          uvVb != nullptr ? uvVb->GetCommonBuffer() : nullptr;
-                      currentUvSourceProof = makeDirectStreamProof(
-                          uvCommon, uint64_t(uvSrcOffset), uint64_t(uvBytes),
-                          uvStride, uvStride, ShadowStreamKind::Uv);
-                    }
-                    const bool generationBackedUvEntryReuse =
-                        generationBackedStaticCandidate &&
-                        entry.isStaticGeometry &&
-                        entry.uvSourceProof.matches(currentUvSourceProof) &&
-                        entry.uvBuffer != nullptr &&
-                        entry.uvCapacity >= uvBytes;
-                    if (entry.uvGenerationShared &&
-                        !generationBackedUvEntryReuse) {
-                      entry.uvBuffer = nullptr;
-                      entry.uvInfo = {};
-                      entry.uvCapacity = 0u;
-                      entry.uvGenerationShared = false;
-                    }
-                    const bool generationBackedUvSharedReuse =
-                        !generationBackedUvEntryReuse &&
-                        tryBindSharedStreamBacking(
-                            currentUvSourceProof, uvBytes, entry.uvBuffer,
-                            entry.uvCapacity);
-                    if (generationBackedUvSharedReuse)
-                      entry.uvGenerationShared = true;
-                    const bool generationBackedUvReuse =
-                        generationBackedUvEntryReuse ||
-                        generationBackedUvSharedReuse;
                     if (entry.uvBuffer == nullptr ||
                         entry.uvCapacity < uvBytes) {
                     // Phase 7.123：UV buffer alloc 也扣预算（同帧多次 alloc
@@ -43515,6 +43401,27 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     }
                     } // end Phase 7.123 budget else
                     }
+                    GenerationBackedStreamProof currentUvSourceProof = {};
+                    if (DynamicSysmemVBOs) {
+                      currentUvSourceProof = makeUploadVertexStreamProof(
+                          uvStream,
+                          uint64_t(vRangeStart) * uint64_t(uvStride),
+                          uint64_t(uvBytes), ShadowStreamKind::Uv);
+                    } else {
+                      auto* uvVb =
+                          m_state.vertexBuffers[uvStream].vertexBuffer.ptr();
+                      auto* uvCommon =
+                          uvVb != nullptr ? uvVb->GetCommonBuffer() : nullptr;
+                      currentUvSourceProof = makeDirectStreamProof(
+                          uvCommon, uint64_t(uvSrcOffset), uint64_t(uvBytes),
+                          uvStride, uvStride, ShadowStreamKind::Uv);
+                    }
+                    const bool generationBackedUvReuse =
+                        generationBackedStaticCandidate &&
+                        entry.isStaticGeometry &&
+                        entry.uvSourceProof.matches(currentUvSourceProof) &&
+                        entry.uvBuffer != nullptr &&
+                        entry.uvCapacity >= uvBytes;
                     if (entry.uvBuffer != nullptr &&
                         entry.uvCapacity >= uvBytes) {
                     if (!generationBackedUvReuse) {
@@ -43536,12 +43443,6 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     }
                     entry.uvInfo =
                         entry.uvBuffer->getSliceInfo(0, uvBytes);
-                    publishSharedStreamBacking(
-                        currentUvSourceProof, entry.uvBuffer,
-                        entry.uvCapacity);
-                    if (generationBackedStaticCandidate &&
-                        currentUvSourceProof.valid())
-                      entry.uvGenerationShared = true;
                     entry.uvStride = uvStride;
                     entry.uvOffset = uvElem->Offset;
                     entry.uvFormat = uvFmt;
@@ -43651,12 +43552,6 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                         uint64_t(idxBytes);
               }
               entry.indexInfo = entry.indexBuffer->getSliceInfo(0, idxBytes);
-              publishSharedStreamBacking(
-                  currentIndexSourceProof, entry.indexBuffer,
-                  entry.indexCapacity);
-              if (generationBackedStaticCandidate &&
-                  currentIndexSourceProof.valid())
-                entry.indexGenerationShared = true;
               entry.indexed = true;
               entry.indexCount = CountVal;
               entry.indexType = drawTimeIndexType;
@@ -44063,7 +43958,6 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             entry.positionBuffer = nullptr;
             entry.positionInfo = {};
             entry.positionCapacity = 0u;
-            entry.positionGenerationShared = false;
             entry.gpuSkinLeaseBacked = false;
             entry.gpuSkinInput = {};
             if (entry.uvSharesPositionBuffer) {

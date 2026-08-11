@@ -2623,12 +2623,6 @@ private:
     war3::render::War3ShadowGenerationBackedStreamProof positionSourceProof = {};
     war3::render::War3ShadowGenerationBackedStreamProof uvSourceProof = {};
     war3::render::War3ShadowGenerationBackedStreamProof indexSourceProof = {};
-    // A shared generation-backed allocation is immutable. If its proof stops
-    // matching, this entry must detach instead of overwriting bytes that may
-    // still back another instance or an in-flight draw.
-    bool positionGenerationShared = false;
-    bool uvGenerationShared = false;
-    bool indexGenerationShared = false;
 
     bool MatchesKey(const War3DrawTimeVBCacheKey& key) const {
       return mapEpoch == key.mapEpoch &&
@@ -2755,20 +2749,6 @@ private:
   std::unordered_map<War3DrawTimeVBCacheKey, War3DrawTimeVBEntry,
                      War3DrawTimeVBCacheKeyHash>
       m_war3DrawTimeVBCache;
-  struct War3DrawTimeSharedStreamBacking {
-    Rc<DxvkBuffer> buffer;
-    VkDeviceSize capacity = 0u;
-  };
-  // Same-producer-batch aliases are admitted only by the complete immutable
-  // generation proof. This index never uses a model name, raw buffer address
-  // or content fingerprint as authority, and is cleared before a later
-  // Present serial can publish new source generations.
-  std::unordered_map<
-      war3::render::War3ShadowGenerationBackedStreamProof,
-      War3DrawTimeSharedStreamBacking,
-      war3::render::War3ShadowGenerationBackedStreamProofHash>
-      m_war3DrawTimeSharedStreamBackings;
-  uint64_t m_war3DrawTimeSharedStreamBackingFrameSerial = 0u;
   // A positive current-frame rejection is an owner decision even when no VB
   // entry was published.  It prevents generic reconstruction and historical
   // packet leases from resurrecting a blocker after an early capture gate.
