@@ -125,3 +125,22 @@ work, so it proves that the multi-millisecond scratch regression was removed;
 it does not yet prove a foreground FPS gain. The remaining approximately
 `0.8 ms` ResourceResolve cost is the current exact index-domain scan and is not
 authorized for Release without a generation-safe reuse design and a new A/B.
+
+The corrected direct-span/raw-index candidate then completed a 303.844-second
+isolated low-view patrol:
+
+- commit: `22fa27e`;
+- artifact: `AutoTest/artifacts/life_and_death_tdr/20260812_064731`;
+- report: `war3_perf_report_auto_2026_08_12_06_52_36.html`;
+- 8,750 observed shadow frames and 368,838 consumed terrain draws;
+- 192,253,295,072 bytes avoided;
+- producer incomplete, required omission, allocation/fallback/admission/freeze
+  failures, budget exceeded, partial publication and replay rejection: zero;
+- sampled Arena p50/p95: `26.706/63.929 MiB`; frame-window average/maximum:
+  `64.316/369.132 MiB`;
+- device lost, new Event 153/4101 and new GPU incident: zero.
+
+The p95 target is met, but the instantaneous peak remains above the desired
+128 MiB target. The route therefore remains development-only and needs a
+foreground visual gate plus further peak reduction before any Release default
+decision.

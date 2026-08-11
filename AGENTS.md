@@ -130,9 +130,10 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   `docs/agent-history/2026-08-11-night-tdr-invalid-read-evidence.md`。
 - 2026-08-11 最新报告证明高压全体阴影闪烁主要来自必需 Caster 被软优先级预算拒绝，而非 Arena
   硬容量耗尽；本地候选改为低于 384 MiB 硬上限时全部准入并增加独立原因诊断，尚待前台物理 A/B。
-- 2026-08-12 的开发专用 coherent REAL index-trim 候选只对同一 draw 内可同时快照的刚体不透明
-  地形收紧 position/index 域；13,780 帧长门实际少复制 264.67 GB，Arena 平均 60.879 MiB，且
-  producer-incomplete/TDR 均为零。Release 默认仍不可达，前台视觉验收尚未完成；详见
+- 2026-08-12 的开发专用 coherent REAL index-trim 候选只对同一 draw 内可同步冻结的刚体不透明
+  地形收紧 position/index 域；已删除会产生多毫秒回归的中间 scratch copy，303 秒门的 Arena
+  p95 为 63.929 MiB，producer-incomplete/TDR 均为零，但瞬时峰值仍为 369.132 MiB。Release 默认
+  仍不可达，前台视觉验收尚未完成；详见
   `docs/research/2026-08-12-coherent-real-index-trim.md`。
 - Issue #6 已先闭合两个确定的跨地图 CPU 身份泄漏：caster tombstone 现在按 map epoch 隔离，且
   旧相机、per-draw upload、RT/DS fallback 会在 Present 安全点重置；显式禁用 producer stage 的
