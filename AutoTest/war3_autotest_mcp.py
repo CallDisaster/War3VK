@@ -68,6 +68,7 @@ DEFAULT_BENCHMARK_REFRESH = 59
 AUTOTEST_BACKGROUND_THROTTLE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE"
 AUTOTEST_GAME_PAUSE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE"
 AUTOTEST_INTERNAL_TEST_API_ENV = "DXVK_WAR3_INTERNAL_TEST_API"
+AUTOTEST_DISABLE_OBS_VULKAN_CAPTURE_ENV = "DISABLE_VULKAN_OBS_CAPTURE"
 # Isolated desktop launches are non-interactive by contract.  AutoTest may
 # create a process on another Win32 desktop, but it must never switch the
 # session's input desktop or inject keyboard/mouse input into that desktop.
@@ -7237,6 +7238,11 @@ def launch_war3_test(
     extra_env.setdefault(AUTOTEST_BACKGROUND_THROTTLE_ENV, "1")
     extra_env.setdefault(AUTOTEST_GAME_PAUSE_ENV, "1")
     extra_env.setdefault(AUTOTEST_INTERNAL_TEST_API_ENV, "1")
+    # OBS installs VK_LAYER_OBS_HOOK as a system-wide implicit Vulkan layer,
+    # so graphics-hook32.dll can be loaded even when no OBS process is alive.
+    # Scope the documented layer opt-out to the AutoTest-owned child only;
+    # never change the registry or disable unrelated overlays globally.
+    extra_env.setdefault(AUTOTEST_DISABLE_OBS_VULKAN_CAPTURE_ENV, "1")
     # 高频 SpriteFrame/runtime-matrix pose hooks are no longer the default
     # semantic palette producer. The production path samples Blizzard's
     # already-evaluated CModel palette from the visible contract; tests that

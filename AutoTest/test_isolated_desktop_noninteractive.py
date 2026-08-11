@@ -106,6 +106,28 @@ class IsolatedDesktopNonInteractiveTests(unittest.TestCase):
         )[0]
         self.assertNotIn("0x0100", mask)
 
+    def test_owned_child_disables_obs_implicit_layer_without_global_change(
+        self,
+    ) -> None:
+        runner = (AUTOTEST / "war3_autotest_mcp.py").read_text(
+            encoding="utf-8"
+        )
+        launch_body = runner.split("def launch_war3_test", 1)[1].split(
+            "def _wait_until", 1
+        )[0]
+        self.assertIn(
+            'AUTOTEST_DISABLE_OBS_VULKAN_CAPTURE_ENV = '
+            '"DISABLE_VULKAN_OBS_CAPTURE"',
+            runner,
+        )
+        self.assertIn(
+            'extra_env.setdefault('
+            'AUTOTEST_DISABLE_OBS_VULKAN_CAPTURE_ENV, "1")',
+            launch_body,
+        )
+        self.assertNotIn("ImplicitLayers", launch_body)
+        self.assertNotIn("Set-ItemProperty", launch_body)
+
     def test_isolated_input_is_hwnd_scoped_without_global_helper(self) -> None:
         runner = (AUTOTEST / "war3_autotest_mcp.py").read_text(
             encoding="utf-8"
