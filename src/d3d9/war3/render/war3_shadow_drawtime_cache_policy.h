@@ -4,13 +4,14 @@
 
 namespace dxvk::war3::render {
 
-// Warcraft can submit several Present calls between two world-producer
-// batches.  Keep the recent static window aligned with the existing 16-frame
-// dynamic-cache safety horizon so a still-visible Stage11 working set cannot
-// become inactive merely because GC ran between two native world updates.
-// This remains deliberately short: the 64 MiB inactive target still governs
-// geometry that has actually left the active producer window.
-constexpr uint64_t kWar3ShadowDrawTimeStaticRecentProtectFrames = 16u;
+// Draw-time cache GC runs on a fixed cadence.  Warcraft can skip or defer a
+// native world-producer batch across a Present boundary, so a protected
+// static working set must survive at least one complete GC interval.  Two
+// intervals cover one missed producer batch without turning the 64 MiB
+// inactive-residency target into an unbounded cache.
+constexpr uint64_t kWar3ShadowDrawTimeVBCacheGcIntervalFrames = 60u;
+constexpr uint64_t kWar3ShadowDrawTimeStaticRecentProtectFrames =
+    2u * kWar3ShadowDrawTimeVBCacheGcIntervalFrames;
 
 constexpr bool IsWar3ShadowDrawTimeStaticWorkingSetProtected(
     uint64_t lastAccessFrame, uint64_t currentFrame) noexcept {

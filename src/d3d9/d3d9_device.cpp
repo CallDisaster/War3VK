@@ -34238,7 +34238,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
                 completed.s1EarlyReplayFallbackCount;
     war3::War3PerfMonitor::instance().notePersistentGeometryFrame(stats);
   }
-  // Phase 7.55 v4：每 60 帧清理一次 draw-time VB cache 中的 stale entry。
+  // Phase 7.55 v4：按共享策略周期清理 draw-time VB cache 中的 stale entry。
   // 2026-05-30 问题2：静态几何（桥/斜坡/建筑/装饰物/可破坏物）常驻，
   // 离开视野后不淘汰 GPU buffer，再次进入视野 O(1) 复用；只有动态对象按
   // 16 帧 TTL 淘汰。静态常驻受总字节上限约束做 LRU 回收，防止超大地图无限增长。
@@ -34246,7 +34246,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     auto phaseScope =
         War3PresentFrameTransitionScope("DrawTimeVbCacheGc");
     if (m_war3ShadowPersistentFrameSerial >=
-        m_war3DrawTimeVBCacheLastCleanFrame + 60u) {
+        m_war3DrawTimeVBCacheLastCleanFrame +
+            war3::render::kWar3ShadowDrawTimeVBCacheGcIntervalFrames) {
     m_war3DrawTimeVBCacheLastCleanFrame = m_war3ShadowPersistentFrameSerial;
     const uint64_t dynamicMaxAge =
         dxvk::war3::internal::kShadowDrawTimeVBCacheDynamicMaxAgeFrames;

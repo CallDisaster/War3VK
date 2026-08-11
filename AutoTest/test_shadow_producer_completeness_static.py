@@ -71,8 +71,18 @@ class ProducerCompletenessContractTest(unittest.TestCase):
         self.assertIn("War3RequiredCasterOmissionReason::SoftPriorityBudget", DEVICE)
 
     def test_active_working_set_is_not_lru_evicted(self):
+        self.assertIn("kWar3ShadowDrawTimeVBCacheGcIntervalFrames = 60u", POLICY)
         self.assertIn("kWar3ShadowDrawTimeStaticRecentProtectFrames", POLICY)
+        self.assertIn(
+            "2u * kWar3ShadowDrawTimeVBCacheGcIntervalFrames", POLICY
+        )
         self.assertIn("IsWar3ShadowDrawTimeStaticWorkingSetProtected", POLICY)
+        self.assertIn(
+            "m_war3DrawTimeVBCacheLastCleanFrame +\n"
+            "            war3::render::kWar3ShadowDrawTimeVBCacheGcIntervalFrames",
+            DEVICE,
+        )
+        self.assertNotIn("m_war3DrawTimeVBCacheLastCleanFrame + 60u", DEVICE)
         self.assertIn("while (staticBytesInactive > staticCap)", DEVICE)
         self.assertIn("stableKeyLess", DEVICE)
         self.assertIn("drawTimeVBCacheStaticProtectedBytes", DEVICE)

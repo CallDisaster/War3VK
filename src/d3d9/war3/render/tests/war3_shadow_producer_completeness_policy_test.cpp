@@ -55,12 +55,20 @@ bool testProducerCompletenessStampAndSaturation() {
 bool testProtectedWorkingSetLru() {
   struct Entry { uint64_t key; uint64_t last; uint64_t bytes; };
   constexpr uint64_t mib = 1024u * 1024u;
-  constexpr uint64_t frame = 100u;
+  constexpr uint64_t protectFrames =
+      policy::kWar3ShadowDrawTimeStaticRecentProtectFrames;
+  constexpr uint64_t frame = protectFrames + 100u;
   constexpr uint64_t inactiveTarget = 64u * mib;
   std::vector<Entry> entries = {
-      {3u, frame, 48u * mib}, {2u, frame - 1u, 40u * mib},
-      {9u, frame - 20u, 40u * mib}, {5u, frame - 20u, 40u * mib},
+      {3u, frame, 48u * mib},
+      {2u, frame - protectFrames, 40u * mib},
+      {9u, frame - protectFrames - 1u, 40u * mib},
+      {5u, frame - protectFrames - 1u, 40u * mib},
   };
+  if (!require(protectFrames >=
+                   policy::kWar3ShadowDrawTimeVBCacheGcIntervalFrames,
+               "static working-set protection is shorter than GC cadence"))
+    return false;
   uint64_t protectedBytes = 0u;
   uint64_t inactiveBytes = 0u;
   for (const auto& entry : entries) {
