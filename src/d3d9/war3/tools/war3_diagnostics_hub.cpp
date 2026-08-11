@@ -559,6 +559,14 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
          frame.drawTimeVBCacheStaticEvictedEntryCount},
         {"drawTimeVBCacheIndexedUnknownRangeFallbackCount",
          frame.drawTimeVBCacheIndexedUnknownRangeFallbackCount},
+        {"drawTimeGenerationBackedPositionReuseCount",
+         frame.drawTimeGenerationBackedPositionReuseCount},
+        {"drawTimeGenerationBackedUvReuseCount",
+         frame.drawTimeGenerationBackedUvReuseCount},
+        {"drawTimeGenerationBackedIndexReuseCount",
+         frame.drawTimeGenerationBackedIndexReuseCount},
+        {"drawTimeGenerationBackedCopyBytesSaved",
+         frame.drawTimeGenerationBackedCopyBytesSaved},
         {"csmCascadeDrawCount", frame.csmCascadeDrawCount},
         {"csmCascadeTriangleCount", frame.csmCascadeTriangleCount},
         {"pointShadowLightCount", frame.pointShadowLightCount},
@@ -759,6 +767,14 @@ void RecordGpuFlightFrame(uint64_t frameSerial) {
       producer.drawTimeVBCacheStaticEvictedEntryCount;
   frame.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
       producer.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+  frame.drawTimeGenerationBackedPositionReuseCount =
+      producer.drawTimeGenerationBackedPositionReuseCount;
+  frame.drawTimeGenerationBackedUvReuseCount =
+      producer.drawTimeGenerationBackedUvReuseCount;
+  frame.drawTimeGenerationBackedIndexReuseCount =
+      producer.drawTimeGenerationBackedIndexReuseCount;
+  frame.drawTimeGenerationBackedCopyBytesSaved =
+      producer.drawTimeGenerationBackedCopyBytesSaved;
   for (size_t index = 0u; index < frame.csmCascadeDrawCount.size(); ++index) {
     frame.csmCascadeDrawCount[index] =
         s_gpuFlightCsmCascadeDrawCount[index].load(std::memory_order_acquire);
@@ -2195,6 +2211,14 @@ War3RuntimeStatusShadowSnapshot BuildShadowSnapshot() {
       bridgeSummary.drawTimeVBCacheStaticEvictedEntryCount;
   summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
       bridgeSummary.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+  summary.drawTimeGenerationBackedPositionReuseCount =
+      bridgeSummary.drawTimeGenerationBackedPositionReuseCount;
+  summary.drawTimeGenerationBackedUvReuseCount =
+      bridgeSummary.drawTimeGenerationBackedUvReuseCount;
+  summary.drawTimeGenerationBackedIndexReuseCount =
+      bridgeSummary.drawTimeGenerationBackedIndexReuseCount;
+  summary.drawTimeGenerationBackedCopyBytesSaved =
+      bridgeSummary.drawTimeGenerationBackedCopyBytesSaved;
   summary.semanticSceneTerrainBoundsCullMode =
       bridgeSummary.semanticSceneTerrainBoundsCullMode;
   summary.semanticSceneTerrainBoundsCandidateCount =

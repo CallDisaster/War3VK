@@ -103,6 +103,10 @@ struct GpuFlightFrame {
   uint64_t drawTimeVBCacheStaticEvictedBytes = 0u;
   uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0u;
   uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0u;
+  uint64_t drawTimeGenerationBackedPositionReuseCount = 0u;
+  uint64_t drawTimeGenerationBackedUvReuseCount = 0u;
+  uint64_t drawTimeGenerationBackedIndexReuseCount = 0u;
+  uint64_t drawTimeGenerationBackedCopyBytesSaved = 0u;
   std::array<uint32_t, 4u> csmCascadeDrawCount = {};
   std::array<uint64_t, 4u> csmCascadeTriangleCount = {};
   uint32_t pointShadowLightCount = 0u;
@@ -655,6 +659,10 @@ struct War3RuntimeStatusShadowSnapshot {
   uint64_t drawTimeVBCacheStaticEvictedBytes = 0;
   uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0;
   uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
+  uint64_t drawTimeGenerationBackedPositionReuseCount = 0;
+  uint64_t drawTimeGenerationBackedUvReuseCount = 0;
+  uint64_t drawTimeGenerationBackedIndexReuseCount = 0;
+  uint64_t drawTimeGenerationBackedCopyBytesSaved = 0;
   uint64_t semanticSceneTerrainBoundsCullMode = 0;
   uint64_t semanticSceneTerrainBoundsCandidateCount = 0;
   uint64_t semanticSceneTerrainBoundsProofAcceptedCount = 0;

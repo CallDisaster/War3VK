@@ -154,6 +154,10 @@ struct FrameWorkloadSnapshot {
     uint64_t drawTimeVBCacheRejectContractInstance = 0;
     uint64_t drawTimeVBCacheRejectContractSlice = 0;
     uint64_t drawTimeVBCacheSameFrameDedupMiss = 0;
+    uint64_t drawTimeGenerationBackedPositionReuseCount = 0;
+    uint64_t drawTimeGenerationBackedUvReuseCount = 0;
+    uint64_t drawTimeGenerationBackedIndexReuseCount = 0;
+    uint64_t drawTimeGenerationBackedCopyBytesSaved = 0;
     uint64_t semanticSceneSubmitted = 0;
     uint64_t semanticSceneSubmittedSkinned = 0;
     uint64_t skippedCasterCap = 0;
@@ -710,6 +714,10 @@ private:
         uint64_t drawTimeVBCacheConsumeMissCount = 0;
         uint64_t drawTimeVBCacheRejectNoLayerContext = 0;
         uint64_t drawTimeVBCacheSameFrameDedupMiss = 0;
+        uint64_t drawTimeGenerationBackedPositionReuseCount = 0;
+        uint64_t drawTimeGenerationBackedUvReuseCount = 0;
+        uint64_t drawTimeGenerationBackedIndexReuseCount = 0;
+        uint64_t drawTimeGenerationBackedCopyBytesSaved = 0;
         uint64_t semanticBridgeHit = 0;
         uint64_t semanticBridgeMiss = 0;
         uint64_t semanticBridgeBypassed = 0;

@@ -1,6 +1,7 @@
 #include "../../../d3d9_war3_scene.h"
 #include "../war3_shadow_capture_frontend.h"
 #include "../war3_shadow_drawtime_cache_policy.h"
+#include "../war3_shadow_generation_backed_stream.h"
 
 #include <algorithm>
 #include <array>
@@ -141,10 +142,61 @@ bool testRequiredCasterHardAdmissionIsOrderIndependent() {
                  "overflowing bundle byte sum was admitted");
 }
 
+bool testGenerationBackedStreamProof() {
+  using Proof = policy::War3ShadowGenerationBackedStreamProof;
+  using Kind = policy::War3ShadowStreamKind;
+  Proof proof = {};
+  if (!require(!proof.valid() && !proof.matches(proof),
+               "empty stream proof was accepted"))
+    return false;
+
+  proof.ownerIdentity = 0x1234u;
+  proof.identityGeneration = 3u;
+  proof.allocationGeneration = 5u;
+  proof.contentGeneration = 7u;
+  proof.sourceOffset = 64u;
+  proof.sourceLength = 384u;
+  proof.elementStride = 12u;
+  proof.elementSize = 12u;
+  proof.mapEpoch = 11u;
+  proof.deviceEpoch = 13u;
+  proof.streamKind = Kind::Position;
+  if (!require(proof.valid() && proof.matches(proof),
+               "exact generation-backed proof was rejected"))
+    return false;
+
+  const auto requireMismatch = [&](auto mutate, const char* message) {
+    Proof changed = proof;
+    mutate(changed);
+    return require(!proof.matches(changed), message);
+  };
+  return requireMismatch([](Proof& p) { ++p.ownerIdentity; },
+                         "owner alias was accepted") &&
+      requireMismatch([](Proof& p) { ++p.identityGeneration; },
+                      "identity generation mismatch was accepted") &&
+      requireMismatch([](Proof& p) { ++p.allocationGeneration; },
+                      "allocation generation mismatch was accepted") &&
+      requireMismatch([](Proof& p) { ++p.contentGeneration; },
+                      "content generation mismatch was accepted") &&
+      requireMismatch([](Proof& p) { ++p.sourceOffset; },
+                      "source range mismatch was accepted") &&
+      requireMismatch([](Proof& p) { ++p.sourceLength; },
+                      "source length mismatch was accepted") &&
+      requireMismatch([](Proof& p) { ++p.mapEpoch; },
+                      "map epoch mismatch was accepted") &&
+      requireMismatch([](Proof& p) { ++p.deviceEpoch; },
+                      "device epoch mismatch was accepted") &&
+      requireMismatch([](Proof& p) { p.streamKind = Kind::Index; },
+                      "stream-kind mismatch was accepted") &&
+      requireMismatch([](Proof& p) { p.elementSize = p.elementStride + 1u; },
+                      "invalid element coverage was accepted");
+}
+
 } // namespace
 
 int main() {
   return testProducerCompletenessStampAndSaturation() &&
       testProtectedWorkingSetLru() &&
-      testRequiredCasterHardAdmissionIsOrderIndependent() ? 0 : 1;
+      testRequiredCasterHardAdmissionIsOrderIndependent() &&
+      testGenerationBackedStreamProof() ? 0 : 1;
 }

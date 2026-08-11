@@ -2209,6 +2209,14 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCacheSameFrameDedupHit
      << ",\"drawTimeVBCacheSameFrameDedupMiss\":"
      << stats.drawTimeVBCacheSameFrameDedupMiss
+     << ",\"drawTimeGenerationBackedPositionReuseCount\":"
+     << stats.drawTimeGenerationBackedPositionReuseCount
+     << ",\"drawTimeGenerationBackedUvReuseCount\":"
+     << stats.drawTimeGenerationBackedUvReuseCount
+     << ",\"drawTimeGenerationBackedIndexReuseCount\":"
+     << stats.drawTimeGenerationBackedIndexReuseCount
+     << ",\"drawTimeGenerationBackedCopyBytesSaved\":"
+     << stats.drawTimeGenerationBackedCopyBytesSaved
      << ",\"drawTimeVBCacheSameFrameStateRefresh\":"
      << stats.drawTimeVBCacheSameFrameStateRefresh
      << ",\"drawTimeD3DPoseAttemptCount\":"
@@ -5070,6 +5078,14 @@ ShadowProducerRuntimeDiagnostics QueryShadowProducerRuntimeDiagnostics() {
       g_shadowSceneStats.drawTimeVBCacheStaticEvictedEntryCount;
   summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
       g_shadowSceneStats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+  summary.drawTimeGenerationBackedPositionReuseCount =
+      g_shadowSceneStats.drawTimeGenerationBackedPositionReuseCount;
+  summary.drawTimeGenerationBackedUvReuseCount =
+      g_shadowSceneStats.drawTimeGenerationBackedUvReuseCount;
+  summary.drawTimeGenerationBackedIndexReuseCount =
+      g_shadowSceneStats.drawTimeGenerationBackedIndexReuseCount;
+  summary.drawTimeGenerationBackedCopyBytesSaved =
+      g_shadowSceneStats.drawTimeGenerationBackedCopyBytesSaved;
   return summary;
 }
 
@@ -6989,6 +7005,14 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.drawTimeVBCacheStaticEvictedEntryCount;
     summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
         g_shadowSceneStats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
+    summary.drawTimeGenerationBackedPositionReuseCount =
+        g_shadowSceneStats.drawTimeGenerationBackedPositionReuseCount;
+    summary.drawTimeGenerationBackedUvReuseCount =
+        g_shadowSceneStats.drawTimeGenerationBackedUvReuseCount;
+    summary.drawTimeGenerationBackedIndexReuseCount =
+        g_shadowSceneStats.drawTimeGenerationBackedIndexReuseCount;
+    summary.drawTimeGenerationBackedCopyBytesSaved =
+        g_shadowSceneStats.drawTimeGenerationBackedCopyBytesSaved;
     summary.semanticSceneTerrainBoundsCullMode =
         g_shadowSceneStats.semanticSceneTerrainBoundsCullMode;
     summary.semanticSceneTerrainBoundsCandidateCount =

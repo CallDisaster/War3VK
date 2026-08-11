@@ -45,6 +45,7 @@
 #include "d3d9_war3_shadow.h"
 #include "d3d9_war3_ssao.h"
 #include "war3/shadow/war3_shadow_backend_dxvk.h"
+#include "war3/render/war3_shadow_generation_backed_stream.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_d3d9_observe_owner.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.h"
 #include <type_traits>
@@ -2602,6 +2603,12 @@ private:
     // no GPU slice and cannot authorize a renderer mutation.
     war3::gpu_skin::PersistentGpuPackageCurrentDrawProof
         persistentPackageCurrentDrawProof = {};
+    // Cross-frame reuse is authorized only by the exact D3D9 source owner and
+    // its allocation/content generations.  These proofs never accept the
+    // historical pointer/fingerprint shortcut.
+    war3::render::War3ShadowGenerationBackedStreamProof positionSourceProof = {};
+    war3::render::War3ShadowGenerationBackedStreamProof uvSourceProof = {};
+    war3::render::War3ShadowGenerationBackedStreamProof indexSourceProof = {};
 
     bool MatchesKey(const War3DrawTimeVBCacheKey& key) const {
       return mapEpoch == key.mapEpoch &&

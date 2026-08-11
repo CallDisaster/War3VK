@@ -779,6 +779,10 @@ namespace dxvk {
         uint32_t drawTimeVBCacheSameFrameDedupHit = 0;
         uint32_t drawTimeVBCacheSameFrameDedupMiss = 0;
         uint32_t drawTimeVBCacheSameFrameStateRefresh = 0;
+        uint32_t drawTimeGenerationBackedPositionReuseCount = 0;
+        uint32_t drawTimeGenerationBackedUvReuseCount = 0;
+        uint32_t drawTimeGenerationBackedIndexReuseCount = 0;
+        uint64_t drawTimeGenerationBackedCopyBytesSaved = 0;
         uint32_t drawTimeSemanticProducerVisibleCandidateCount = 0;
         uint32_t drawTimeSemanticProducerFreshEntryCount = 0;
         uint32_t drawTimeSemanticProducerClaimedCount = 0;

@@ -1193,6 +1193,14 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.drawTimeVBCacheRejectContractSlice;
   m_currentFrameWorkload.drawTimeVBCacheSameFrameDedupMiss =
       stats.drawTimeVBCacheSameFrameDedupMiss;
+  m_currentFrameWorkload.drawTimeGenerationBackedPositionReuseCount =
+      stats.drawTimeGenerationBackedPositionReuseCount;
+  m_currentFrameWorkload.drawTimeGenerationBackedUvReuseCount =
+      stats.drawTimeGenerationBackedUvReuseCount;
+  m_currentFrameWorkload.drawTimeGenerationBackedIndexReuseCount =
+      stats.drawTimeGenerationBackedIndexReuseCount;
+  m_currentFrameWorkload.drawTimeGenerationBackedCopyBytesSaved =
+      stats.drawTimeGenerationBackedCopyBytesSaved;
   m_currentFrameWorkload.semanticSceneSubmitted =
       stats.semanticSceneSubmitted;
   m_currentFrameWorkload.semanticSceneSubmittedSkinned =
@@ -1314,6 +1322,14 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.drawTimeVBCacheRejectNoLayerContext;
   agg.drawTimeVBCacheSameFrameDedupMiss +=
       stats.drawTimeVBCacheSameFrameDedupMiss;
+  agg.drawTimeGenerationBackedPositionReuseCount +=
+      stats.drawTimeGenerationBackedPositionReuseCount;
+  agg.drawTimeGenerationBackedUvReuseCount +=
+      stats.drawTimeGenerationBackedUvReuseCount;
+  agg.drawTimeGenerationBackedIndexReuseCount +=
+      stats.drawTimeGenerationBackedIndexReuseCount;
+  agg.drawTimeGenerationBackedCopyBytesSaved +=
+      stats.drawTimeGenerationBackedCopyBytesSaved;
   agg.semanticBridgeHit += stats.semanticBridgeHit;
   agg.semanticBridgeMiss += stats.semanticBridgeMiss;
   agg.semanticBridgeBypassed += stats.semanticBridgeBypassed;
@@ -5986,6 +6002,14 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "
        << shadowAgg.drawTimeVBCacheSameFrameDedupMiss << ",\n";
+  json << "    \"drawTimeGenerationBackedPositionReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedPositionReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedUvReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedUvReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedIndexReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedIndexReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedCopyBytesSaved\": "
+       << shadowAgg.drawTimeGenerationBackedCopyBytesSaved << ",\n";
   json << "    \"semanticBridgeHit\": " << shadowAgg.semanticBridgeHit
        << ",\n";
   json << "    \"semanticBridgeMiss\": " << shadowAgg.semanticBridgeMiss
@@ -7292,6 +7316,14 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "
        << shadowAgg.drawTimeVBCacheSameFrameDedupMiss << ",\n";
+  json << "    \"drawTimeGenerationBackedPositionReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedPositionReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedUvReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedUvReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedIndexReuseCount\": "
+       << shadowAgg.drawTimeGenerationBackedIndexReuseCount << ",\n";
+  json << "    \"drawTimeGenerationBackedCopyBytesSaved\": "
+       << shadowAgg.drawTimeGenerationBackedCopyBytesSaved << ",\n";
   json << "    \"semanticBridgeHit\": " << shadowAgg.semanticBridgeHit
        << ",\n";
   json << "    \"semanticBridgeMiss\": " << shadowAgg.semanticBridgeMiss
@@ -9075,6 +9107,10 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
           "\"drawTimeVBCacheRejectContractInstance\", "
           "\"drawTimeVBCacheRejectContractSlice\", "
           "\"drawTimeVBCacheSameFrameDedupMiss\", "
+          "\"drawTimeGenerationBackedPositionReuseCount\", "
+          "\"drawTimeGenerationBackedUvReuseCount\", "
+          "\"drawTimeGenerationBackedIndexReuseCount\", "
+          "\"drawTimeGenerationBackedCopyBytesSaved\", "
           "\"semanticSceneSubmitted\", \"semanticSceneSubmittedSkinned\", "
           "\"skippedCasterCap\", \"skippedDistanceCull\", "
           "\"hasShadowReceiver\", \"replayCasterCount\", "
@@ -9183,6 +9219,10 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
          << w.drawTimeVBCacheRejectContractInstance << ", "
          << w.drawTimeVBCacheRejectContractSlice << ", "
          << w.drawTimeVBCacheSameFrameDedupMiss << ", "
+         << w.drawTimeGenerationBackedPositionReuseCount << ", "
+         << w.drawTimeGenerationBackedUvReuseCount << ", "
+         << w.drawTimeGenerationBackedIndexReuseCount << ", "
+         << w.drawTimeGenerationBackedCopyBytesSaved << ", "
          << w.semanticSceneSubmitted << ", "
          << w.semanticSceneSubmittedSkinned << ", " << w.skippedCasterCap
          << ", " << w.skippedDistanceCull << ", "

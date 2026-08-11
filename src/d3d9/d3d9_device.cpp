@@ -42449,6 +42449,151 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheRejectInsufficientLength++;
           break;
         }
+        using GenerationBackedStreamProof =
+            dxvk::war3::render::War3ShadowGenerationBackedStreamProof;
+        using ShadowStreamKind = dxvk::war3::render::War3ShadowStreamKind;
+        const bool semanticHasDynamicPose =
+            War3SemanticContextHasDynamicPoseEvidence(semantic);
+        const bool unitKindWithIdentity =
+            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+            War3SemanticContextHasDynamicUnitObjectEvidence(semantic);
+        const bool unitKindWithoutIdentity =
+            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+            !unitKindWithIdentity && !semanticHasDynamicPose;
+        const bool treatUnitlessRigidAsStatic =
+            dxvk::war3::internal::
+                kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled &&
+            unitKindWithoutIdentity;
+        const bool isDynamicUnit =
+            semanticHasDynamicPose ||
+            (semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
+             !treatUnitlessRigidAsStatic);
+        const bool generationBackedStaticCandidate =
+            dxvk::war3::internal::kShadowDrawTimeVBCacheStaticPersistEnabled &&
+            !isDynamicUnit && !gpuSkinSemanticBacking &&
+            !gpuSkinSemanticDirectOnly;
+
+        const auto makeDirectStreamProof =
+            [&](D3D9CommonBuffer* source, uint64_t sourceOffset,
+                uint64_t sourceLength, uint32_t elementStride,
+                uint32_t elementSize,
+                ShadowStreamKind streamKind) -> GenerationBackedStreamProof {
+          GenerationBackedStreamProof proof = {};
+          if (source == nullptr || source->NeedsReadback())
+            return proof;
+          proof.ownerIdentity = reinterpret_cast<uintptr_t>(source);
+          proof.identityGeneration = source->War3IdentityGeneration();
+          proof.allocationGeneration = source->War3MapAllocationGeneration();
+          proof.contentGeneration = source->War3ContentGeneration();
+          proof.sourceOffset = sourceOffset;
+          proof.sourceLength = sourceLength;
+          proof.elementStride = elementStride;
+          proof.elementSize = elementSize;
+          proof.mapEpoch = m_war3GpuSkinMapEpoch;
+          proof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+          proof.streamKind = streamKind;
+          return proof.valid() ? proof : GenerationBackedStreamProof{};
+        };
+        const auto makeUploadVertexStreamProof =
+            [&](uint32_t stream, uint64_t localByteOffset,
+                uint64_t capturedBytes,
+                ShadowStreamKind streamKind) -> GenerationBackedStreamProof {
+          GenerationBackedStreamProof proof = {};
+          if (stream >= caps::MaxStreams ||
+              !m_war3PerDrawUpload.vbSourceValid[stream] ||
+              m_war3PerDrawUpload.vbSourceResource[stream] == 0u ||
+              m_war3PerDrawUpload.vbSourceIdentityGeneration[stream] == 0u ||
+              m_war3PerDrawUpload.vbSourceSequence[stream] == 0u ||
+              m_war3PerDrawUpload.vbSourceContentGeneration[stream] == 0u)
+            return proof;
+          const uint32_t sourceStride =
+              m_war3PerDrawUpload.vbSourceElementStride[stream];
+          const uint32_t capturedStride =
+              m_war3PerDrawUpload.vbSourceElementSize[stream];
+          if (sourceStride == 0u || capturedStride == 0u ||
+              capturedStride > sourceStride ||
+              localByteOffset % capturedStride != 0u ||
+              capturedBytes % capturedStride != 0u)
+            return proof;
+          const uint64_t firstElement = localByteOffset / capturedStride;
+          const uint64_t elementCount = capturedBytes / capturedStride;
+          if (elementCount == 0u ||
+              firstElement > (UINT64_MAX -
+                  m_war3PerDrawUpload.vbSourceOffset[stream]) / sourceStride ||
+              elementCount - 1u >
+                  (UINT64_MAX - capturedStride) / sourceStride)
+            return proof;
+          proof.ownerIdentity =
+              m_war3PerDrawUpload.vbSourceResource[stream];
+          proof.identityGeneration =
+              m_war3PerDrawUpload.vbSourceIdentityGeneration[stream];
+          proof.allocationGeneration =
+              m_war3PerDrawUpload.vbSourceSequence[stream];
+          proof.contentGeneration =
+              m_war3PerDrawUpload.vbSourceContentGeneration[stream];
+          proof.sourceOffset =
+              uint64_t(m_war3PerDrawUpload.vbSourceOffset[stream]) +
+              firstElement * uint64_t(sourceStride);
+          proof.sourceLength =
+              (elementCount - 1u) * uint64_t(sourceStride) + capturedStride;
+          proof.elementStride = sourceStride;
+          proof.elementSize = capturedStride;
+          proof.mapEpoch = m_war3GpuSkinMapEpoch;
+          proof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+          proof.streamKind = streamKind;
+          return proof.valid() ? proof : GenerationBackedStreamProof{};
+        };
+
+        const GenerationBackedStreamProof currentPositionSourceProof =
+            DynamicSysmemVBOs
+                ? makeUploadVertexStreamProof(
+                      posStream, uint64_t(vRangeStart) * uint64_t(posStride),
+                      uint64_t(posBytes), ShadowStreamKind::Position)
+                : makeDirectStreamProof(
+                      posCommon, uint64_t(posSrcOffset), uint64_t(posBytes),
+                      posStride, posStride, ShadowStreamKind::Position);
+        GenerationBackedStreamProof currentIndexSourceProof = {};
+        if (indexed) {
+          if (DynamicSysmemIBO &&
+              m_war3PerDrawUpload.ibSourceValid &&
+              m_war3PerDrawUpload.ibSourceResource != 0u &&
+              m_war3PerDrawUpload.ibSourceIdentityGeneration != 0u &&
+              m_war3PerDrawUpload.ibSourceSequence != 0u &&
+              m_war3PerDrawUpload.ibSourceContentGeneration != 0u &&
+              uint64_t(m_war3PerDrawUpload.ibSourceOffset) <=
+                  UINT64_MAX - uint64_t(drawTimeIndexRangeOffset)) {
+            currentIndexSourceProof.ownerIdentity =
+                m_war3PerDrawUpload.ibSourceResource;
+            currentIndexSourceProof.identityGeneration =
+                m_war3PerDrawUpload.ibSourceIdentityGeneration;
+            currentIndexSourceProof.allocationGeneration =
+                m_war3PerDrawUpload.ibSourceSequence;
+            currentIndexSourceProof.contentGeneration =
+                m_war3PerDrawUpload.ibSourceContentGeneration;
+            currentIndexSourceProof.sourceOffset =
+                uint64_t(m_war3PerDrawUpload.ibSourceOffset) +
+                uint64_t(drawTimeIndexRangeOffset);
+            currentIndexSourceProof.sourceLength =
+                uint64_t(drawTimeIndexRangeBytes);
+            currentIndexSourceProof.elementStride =
+                uint32_t(drawTimeIndexStride);
+            currentIndexSourceProof.elementSize =
+                uint32_t(drawTimeIndexStride);
+            currentIndexSourceProof.mapEpoch = m_war3GpuSkinMapEpoch;
+            currentIndexSourceProof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+            currentIndexSourceProof.streamKind = ShadowStreamKind::Index;
+            if (!currentIndexSourceProof.valid())
+              currentIndexSourceProof = {};
+          } else {
+            currentIndexSourceProof = makeDirectStreamProof(
+                drawTimeIndexCommon,
+                uint64_t(drawTimeIndexSlice.offset()) +
+                    uint64_t(drawTimeIndexRangeOffset),
+                uint64_t(drawTimeIndexRangeBytes),
+                uint32_t(drawTimeIndexStride),
+                uint32_t(drawTimeIndexStride), ShadowStreamKind::Index);
+          }
+        }
         const VkPrimitiveTopology captureTopology = [&]() {
           switch (PrimitiveType) {
           case D3DPT_TRIANGLESTRIP:
@@ -42802,6 +42947,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
           return m_war3DrawTimeVBCache[vbCacheKey];
         }();
+        const bool generationBackedPositionReuse =
+            generationBackedStaticCandidate && entry.isStaticGeometry &&
+            entry.positionSourceProof.matches(currentPositionSourceProof) &&
+            entry.positionBuffer != nullptr &&
+            entry.positionCapacity >= posBytes &&
+            entry.vertexCount == vRangeCount &&
+            entry.positionStride == posStride;
+        const bool generationBackedIndexReuse =
+            generationBackedStaticCandidate && indexed &&
+            entry.isStaticGeometry &&
+            entry.indexSourceProof.matches(currentIndexSourceProof) &&
+            entry.indexBuffer != nullptr &&
+            entry.indexCapacity >= drawTimeIndexRangeBytes &&
+            entry.indexType == drawTimeIndexType;
         if (War3DrawTimeCacheIteratorReuseVerifyRuntime()) {
           auto& legacyEntry = m_war3DrawTimeVBCache[vbCacheKey];
           if (&legacyEntry != &entry)
@@ -43023,7 +43182,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           m_war3Scene.shadowStats.drawTimeVBCacheRejectNoBuffer++;
           break;
         }
-        if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) {
+        if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
+            !generationBackedPositionReuse) {
           auto srcBuf = posSlice.buffer();
           EmitCs([cDst = entry.positionBuffer, cSrc = srcBuf,
                   cSrcOff = posSrcOffset,
@@ -43037,8 +43197,16 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             m_war3Scene.shadowStats.gpuSkinShadowBackingFallbackCount++;
             ++m_war3GpuSkinP2BackingFallbacks;
           }
+        }
+        if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) {
           entry.positionInfo =
               entry.positionBuffer->getSliceInfo(0, posBytes);
+          if (generationBackedPositionReuse) {
+            m_war3Scene.shadowStats
+                .drawTimeGenerationBackedPositionReuseCount++;
+            m_war3Scene.shadowStats
+                .drawTimeGenerationBackedCopyBytesSaved += uint64_t(posBytes);
+          }
         }
 
         drawTimeCaptureTiming.enter(
@@ -43200,8 +43368,30 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     }
                     } // end Phase 7.123 budget else
                     }
+                    GenerationBackedStreamProof currentUvSourceProof = {};
+                    if (DynamicSysmemVBOs) {
+                      currentUvSourceProof = makeUploadVertexStreamProof(
+                          uvStream,
+                          uint64_t(vRangeStart) * uint64_t(uvStride),
+                          uint64_t(uvBytes), ShadowStreamKind::Uv);
+                    } else {
+                      auto* uvVb =
+                          m_state.vertexBuffers[uvStream].vertexBuffer.ptr();
+                      auto* uvCommon =
+                          uvVb != nullptr ? uvVb->GetCommonBuffer() : nullptr;
+                      currentUvSourceProof = makeDirectStreamProof(
+                          uvCommon, uint64_t(uvSrcOffset), uint64_t(uvBytes),
+                          uvStride, uvStride, ShadowStreamKind::Uv);
+                    }
+                    const bool generationBackedUvReuse =
+                        generationBackedStaticCandidate &&
+                        entry.isStaticGeometry &&
+                        entry.uvSourceProof.matches(currentUvSourceProof) &&
+                        entry.uvBuffer != nullptr &&
+                        entry.uvCapacity >= uvBytes;
                     if (entry.uvBuffer != nullptr &&
                         entry.uvCapacity >= uvBytes) {
+                    if (!generationBackedUvReuse) {
                     auto uvSrcBuf = uvSrcSlice.buffer();
                     EmitCs([cDst = entry.uvBuffer, cSrc = uvSrcBuf,
                             cSrcOff = uvSrcOffset,
@@ -43211,11 +43401,19 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     m_war3Scene.shadowStats.drawTimeVBCacheUvCopyCount++;
                     m_war3Scene.shadowStats.drawTimeVBCacheUvCopyBytes +=
                         uint64_t(uvBytes);
+                    } else {
+                      m_war3Scene.shadowStats
+                          .drawTimeGenerationBackedUvReuseCount++;
+                      m_war3Scene.shadowStats
+                          .drawTimeGenerationBackedCopyBytesSaved +=
+                              uint64_t(uvBytes);
+                    }
                     entry.uvInfo =
                         entry.uvBuffer->getSliceInfo(0, uvBytes);
                     entry.uvStride = uvStride;
                     entry.uvOffset = uvElem->Offset;
                     entry.uvFormat = uvFmt;
+                    entry.uvSourceProof = currentUvSourceProof;
                     } else {
                       // Never submit a larger copy into an older allocation
                       // when the per-frame budget or allocation failed.
@@ -43303,6 +43501,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             }
             if (entry.indexBuffer != nullptr &&
                 entry.indexCapacity >= idxBytes) {
+              if (!generationBackedIndexReuse) {
               auto idxSrcBuf = drawTimeIndexSlice.buffer();
               EmitCs([cDst = entry.indexBuffer, cSrc = idxSrcBuf,
                       cSrcOff = idxSrcOffset,
@@ -43312,6 +43511,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyCount++;
               m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyBytes +=
                   uint64_t(idxBytes);
+              } else {
+                m_war3Scene.shadowStats
+                    .drawTimeGenerationBackedIndexReuseCount++;
+                m_war3Scene.shadowStats
+                    .drawTimeGenerationBackedCopyBytesSaved +=
+                        uint64_t(idxBytes);
+              }
               entry.indexInfo = entry.indexBuffer->getSliceInfo(0, idxBytes);
               entry.indexed = true;
               entry.indexCount = CountVal;
@@ -43355,6 +43561,17 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.indexCount = 0u;
         }
         entry.captureComplete = true;
+        if (generationBackedStaticCandidate) {
+          entry.positionSourceProof = currentPositionSourceProof;
+          entry.indexSourceProof = indexed
+              ? currentIndexSourceProof : GenerationBackedStreamProof{};
+          if (entry.uvSharesPositionBuffer)
+            entry.uvSourceProof = {};
+        } else {
+          entry.positionSourceProof = {};
+          entry.indexSourceProof = {};
+          entry.uvSourceProof = {};
+        }
         drawTimeCaptureTiming.enter(
             War3ShadowDrawTimeCapturePhase::FinalizeAccounting);
         m_war3Scene.shadowStats.drawTimeVBCacheCaptureCount++;
@@ -43400,25 +43617,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // 但同时没有 unit/rawcode/handle/runtime pose。若继续把这种匿名
         // Unit 当动态单位，它会按 16 帧 TTL 回收，导致离开视野后再次进入
         // 时重复 createBuffer。真正的动态单位必须有稳定单位身份或 pose。
-        const bool semanticHasDynamicPose =
-            War3SemanticContextHasDynamicPoseEvidence(semantic);
-        const bool unitKindWithIdentity =
-            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
-            War3SemanticContextHasDynamicUnitObjectEvidence(semantic);
-        const bool unitKindWithoutIdentity =
-            semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
-            !unitKindWithIdentity && !semanticHasDynamicPose;
-        const bool treatUnitlessRigidAsStatic =
-            dxvk::war3::internal::
-                kShadowDrawTimeVBCacheUnitlessRigidStaticPersistEnabled &&
-            unitKindWithoutIdentity;
-        const bool isDynamicUnit =
-            semanticHasDynamicPose ||
-            (semantic.objectKind == dxvk::war3::render::ObjectKind::Unit &&
-             !treatUnitlessRigidAsStatic);
-        entry.isStaticGeometry =
-            dxvk::war3::internal::kShadowDrawTimeVBCacheStaticPersistEnabled &&
-            !isDynamicUnit && !entry.gpuSkinLeaseBacked;
+        entry.isStaticGeometry = generationBackedStaticCandidate &&
+            !entry.gpuSkinLeaseBacked;
         entry.lastAccessFrameSerial = m_war3ShadowPersistentFrameSerial;
         entry.ownedGpuBytes =
             uint64_t(entry.positionCapacity) + uint64_t(entry.indexCapacity) +

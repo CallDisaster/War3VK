@@ -192,6 +192,10 @@ struct ShadowProducerRuntimeDiagnostics {
   uint64_t drawTimeVBCacheStaticEvictedBytes = 0;
   uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0;
   uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
+  uint64_t drawTimeGenerationBackedPositionReuseCount = 0;
+  uint64_t drawTimeGenerationBackedUvReuseCount = 0;
+  uint64_t drawTimeGenerationBackedIndexReuseCount = 0;
+  uint64_t drawTimeGenerationBackedCopyBytesSaved = 0;
 };
 
 struct ShadowRuntimeBridgeSummary {
@@ -1031,6 +1035,10 @@ struct ShadowRuntimeBridgeSummary {
   uint64_t drawTimeVBCacheStaticEvictedBytes = 0;
   uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0;
   uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
+  uint64_t drawTimeGenerationBackedPositionReuseCount = 0;
+  uint64_t drawTimeGenerationBackedUvReuseCount = 0;
+  uint64_t drawTimeGenerationBackedIndexReuseCount = 0;
+  uint64_t drawTimeGenerationBackedCopyBytesSaved = 0;
   uint64_t semanticSceneTerrainBoundsCullMode = 0;
   uint64_t semanticSceneTerrainBoundsCandidateCount = 0;
   uint64_t semanticSceneTerrainBoundsProofAcceptedCount = 0;
