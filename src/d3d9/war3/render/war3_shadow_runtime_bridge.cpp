@@ -2173,6 +2173,42 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCachePositionCopyBytes
      << ",\"drawTimeVBCachePositionAllocCount\":"
      << stats.drawTimeVBCachePositionAllocCount
+     << ",\"drawTimeAllocObserverEnabled\":"
+     << stats.drawTimeAllocObserverEnabled
+     << ",\"drawTimePositionAllocRequestCount\":"
+     << stats.drawTimePositionAllocRequestCount
+     << ",\"drawTimePositionAllocNewEntryCount\":"
+     << stats.drawTimePositionAllocNewEntryCount
+     << ",\"drawTimePositionAllocMissingBackingCount\":"
+     << stats.drawTimePositionAllocMissingBackingCount
+     << ",\"drawTimePositionAllocCapacityGrowthCount\":"
+     << stats.drawTimePositionAllocCapacityGrowthCount
+     << ",\"drawTimePositionAllocLeaseDetachCount\":"
+     << stats.drawTimePositionAllocLeaseDetachCount
+     << ",\"drawTimePositionAllocStaticRequestCount\":"
+     << stats.drawTimePositionAllocStaticRequestCount
+     << ",\"drawTimePositionAllocDynamicRequestCount\":"
+     << stats.drawTimePositionAllocDynamicRequestCount
+     << ",\"drawTimePositionDeferredNewEntryCount\":"
+     << stats.drawTimePositionDeferredNewEntryCount
+     << ",\"drawTimePositionDeferredMissingBackingCount\":"
+     << stats.drawTimePositionDeferredMissingBackingCount
+     << ",\"drawTimePositionDeferredCapacityGrowthCount\":"
+     << stats.drawTimePositionDeferredCapacityGrowthCount
+     << ",\"drawTimePositionDeferredLeaseDetachCount\":"
+     << stats.drawTimePositionDeferredLeaseDetachCount
+     << ",\"drawTimePositionProofUniqueCount\":"
+     << stats.drawTimePositionProofUniqueCount
+     << ",\"drawTimePositionProofDuplicateCount\":"
+     << stats.drawTimePositionProofDuplicateCount
+     << ",\"drawTimePositionProofInvalidCount\":"
+     << stats.drawTimePositionProofInvalidCount
+     << ",\"drawTimePositionProofSetOverflowCount\":"
+     << stats.drawTimePositionProofSetOverflowCount
+     << ",\"drawTimePositionProofUniqueBytes\":"
+     << stats.drawTimePositionProofUniqueBytes
+     << ",\"drawTimePositionProofDuplicateBytes\":"
+     << stats.drawTimePositionProofDuplicateBytes
      << ",\"drawTimeVBCacheUvCopyCount\":"
      << stats.drawTimeVBCacheUvCopyCount
      << ",\"drawTimeVBCacheUvCopyBytes\":"

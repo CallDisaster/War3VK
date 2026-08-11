@@ -1318,6 +1318,42 @@ void War3PerfMonitor::noteShadowBudgetFrame(
   agg.drawTimeVBCacheCaptureCount += stats.drawTimeVBCacheCaptureCount;
   agg.drawTimeVBCacheConsumeHitCount += stats.drawTimeVBCacheConsumeHitCount;
   agg.drawTimeVBCacheConsumeMissCount += stats.drawTimeVBCacheConsumeMissCount;
+  agg.drawTimeAllocObserverFrames +=
+      stats.drawTimeAllocObserverEnabled != 0u ? 1u : 0u;
+  agg.drawTimePositionAllocRequestCount +=
+      stats.drawTimePositionAllocRequestCount;
+  agg.drawTimePositionAllocNewEntryCount +=
+      stats.drawTimePositionAllocNewEntryCount;
+  agg.drawTimePositionAllocMissingBackingCount +=
+      stats.drawTimePositionAllocMissingBackingCount;
+  agg.drawTimePositionAllocCapacityGrowthCount +=
+      stats.drawTimePositionAllocCapacityGrowthCount;
+  agg.drawTimePositionAllocLeaseDetachCount +=
+      stats.drawTimePositionAllocLeaseDetachCount;
+  agg.drawTimePositionAllocStaticRequestCount +=
+      stats.drawTimePositionAllocStaticRequestCount;
+  agg.drawTimePositionAllocDynamicRequestCount +=
+      stats.drawTimePositionAllocDynamicRequestCount;
+  agg.drawTimePositionDeferredNewEntryCount +=
+      stats.drawTimePositionDeferredNewEntryCount;
+  agg.drawTimePositionDeferredMissingBackingCount +=
+      stats.drawTimePositionDeferredMissingBackingCount;
+  agg.drawTimePositionDeferredCapacityGrowthCount +=
+      stats.drawTimePositionDeferredCapacityGrowthCount;
+  agg.drawTimePositionDeferredLeaseDetachCount +=
+      stats.drawTimePositionDeferredLeaseDetachCount;
+  agg.drawTimePositionProofUniqueCount +=
+      stats.drawTimePositionProofUniqueCount;
+  agg.drawTimePositionProofDuplicateCount +=
+      stats.drawTimePositionProofDuplicateCount;
+  agg.drawTimePositionProofInvalidCount +=
+      stats.drawTimePositionProofInvalidCount;
+  agg.drawTimePositionProofSetOverflowCount +=
+      stats.drawTimePositionProofSetOverflowCount;
+  agg.drawTimePositionProofUniqueBytes +=
+      stats.drawTimePositionProofUniqueBytes;
+  agg.drawTimePositionProofDuplicateBytes +=
+      stats.drawTimePositionProofDuplicateBytes;
   agg.drawTimeVBCacheRejectNoLayerContext +=
       stats.drawTimeVBCacheRejectNoLayerContext;
   agg.drawTimeVBCacheSameFrameDedupMiss +=
@@ -6019,6 +6055,42 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeVBCacheConsumeHitCount << ",\n";
   json << "    \"drawTimeVBCacheConsumeMissCount\": "
        << shadowAgg.drawTimeVBCacheConsumeMissCount << ",\n";
+  json << "    \"drawTimeAllocObserverFrames\": "
+       << shadowAgg.drawTimeAllocObserverFrames << ",\n";
+  json << "    \"drawTimePositionAllocRequestCount\": "
+       << shadowAgg.drawTimePositionAllocRequestCount << ",\n";
+  json << "    \"drawTimePositionAllocNewEntryCount\": "
+       << shadowAgg.drawTimePositionAllocNewEntryCount << ",\n";
+  json << "    \"drawTimePositionAllocMissingBackingCount\": "
+       << shadowAgg.drawTimePositionAllocMissingBackingCount << ",\n";
+  json << "    \"drawTimePositionAllocCapacityGrowthCount\": "
+       << shadowAgg.drawTimePositionAllocCapacityGrowthCount << ",\n";
+  json << "    \"drawTimePositionAllocLeaseDetachCount\": "
+       << shadowAgg.drawTimePositionAllocLeaseDetachCount << ",\n";
+  json << "    \"drawTimePositionAllocStaticRequestCount\": "
+       << shadowAgg.drawTimePositionAllocStaticRequestCount << ",\n";
+  json << "    \"drawTimePositionAllocDynamicRequestCount\": "
+       << shadowAgg.drawTimePositionAllocDynamicRequestCount << ",\n";
+  json << "    \"drawTimePositionDeferredNewEntryCount\": "
+       << shadowAgg.drawTimePositionDeferredNewEntryCount << ",\n";
+  json << "    \"drawTimePositionDeferredMissingBackingCount\": "
+       << shadowAgg.drawTimePositionDeferredMissingBackingCount << ",\n";
+  json << "    \"drawTimePositionDeferredCapacityGrowthCount\": "
+       << shadowAgg.drawTimePositionDeferredCapacityGrowthCount << ",\n";
+  json << "    \"drawTimePositionDeferredLeaseDetachCount\": "
+       << shadowAgg.drawTimePositionDeferredLeaseDetachCount << ",\n";
+  json << "    \"drawTimePositionProofUniqueCount\": "
+       << shadowAgg.drawTimePositionProofUniqueCount << ",\n";
+  json << "    \"drawTimePositionProofDuplicateCount\": "
+       << shadowAgg.drawTimePositionProofDuplicateCount << ",\n";
+  json << "    \"drawTimePositionProofInvalidCount\": "
+       << shadowAgg.drawTimePositionProofInvalidCount << ",\n";
+  json << "    \"drawTimePositionProofSetOverflowCount\": "
+       << shadowAgg.drawTimePositionProofSetOverflowCount << ",\n";
+  json << "    \"drawTimePositionProofUniqueBytes\": "
+       << shadowAgg.drawTimePositionProofUniqueBytes << ",\n";
+  json << "    \"drawTimePositionProofDuplicateBytes\": "
+       << shadowAgg.drawTimePositionProofDuplicateBytes << ",\n";
   json << "    \"drawTimeVBCacheRejectNoLayerContext\": "
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "
@@ -7353,6 +7425,42 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeVBCacheConsumeHitCount << ",\n";
   json << "    \"drawTimeVBCacheConsumeMissCount\": "
        << shadowAgg.drawTimeVBCacheConsumeMissCount << ",\n";
+  json << "    \"drawTimeAllocObserverFrames\": "
+       << shadowAgg.drawTimeAllocObserverFrames << ",\n";
+  json << "    \"drawTimePositionAllocRequestCount\": "
+       << shadowAgg.drawTimePositionAllocRequestCount << ",\n";
+  json << "    \"drawTimePositionAllocNewEntryCount\": "
+       << shadowAgg.drawTimePositionAllocNewEntryCount << ",\n";
+  json << "    \"drawTimePositionAllocMissingBackingCount\": "
+       << shadowAgg.drawTimePositionAllocMissingBackingCount << ",\n";
+  json << "    \"drawTimePositionAllocCapacityGrowthCount\": "
+       << shadowAgg.drawTimePositionAllocCapacityGrowthCount << ",\n";
+  json << "    \"drawTimePositionAllocLeaseDetachCount\": "
+       << shadowAgg.drawTimePositionAllocLeaseDetachCount << ",\n";
+  json << "    \"drawTimePositionAllocStaticRequestCount\": "
+       << shadowAgg.drawTimePositionAllocStaticRequestCount << ",\n";
+  json << "    \"drawTimePositionAllocDynamicRequestCount\": "
+       << shadowAgg.drawTimePositionAllocDynamicRequestCount << ",\n";
+  json << "    \"drawTimePositionDeferredNewEntryCount\": "
+       << shadowAgg.drawTimePositionDeferredNewEntryCount << ",\n";
+  json << "    \"drawTimePositionDeferredMissingBackingCount\": "
+       << shadowAgg.drawTimePositionDeferredMissingBackingCount << ",\n";
+  json << "    \"drawTimePositionDeferredCapacityGrowthCount\": "
+       << shadowAgg.drawTimePositionDeferredCapacityGrowthCount << ",\n";
+  json << "    \"drawTimePositionDeferredLeaseDetachCount\": "
+       << shadowAgg.drawTimePositionDeferredLeaseDetachCount << ",\n";
+  json << "    \"drawTimePositionProofUniqueCount\": "
+       << shadowAgg.drawTimePositionProofUniqueCount << ",\n";
+  json << "    \"drawTimePositionProofDuplicateCount\": "
+       << shadowAgg.drawTimePositionProofDuplicateCount << ",\n";
+  json << "    \"drawTimePositionProofInvalidCount\": "
+       << shadowAgg.drawTimePositionProofInvalidCount << ",\n";
+  json << "    \"drawTimePositionProofSetOverflowCount\": "
+       << shadowAgg.drawTimePositionProofSetOverflowCount << ",\n";
+  json << "    \"drawTimePositionProofUniqueBytes\": "
+       << shadowAgg.drawTimePositionProofUniqueBytes << ",\n";
+  json << "    \"drawTimePositionProofDuplicateBytes\": "
+       << shadowAgg.drawTimePositionProofDuplicateBytes << ",\n";
   json << "    \"drawTimeVBCacheRejectNoLayerContext\": "
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "

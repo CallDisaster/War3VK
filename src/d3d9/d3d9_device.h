@@ -2749,6 +2749,45 @@ private:
   std::unordered_map<War3DrawTimeVBCacheKey, War3DrawTimeVBEntry,
                      War3DrawTimeVBCacheKeyHash>
       m_war3DrawTimeVBCache;
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+  struct War3Stage11AllocationObserverProofHash {
+    size_t operator()(
+        const war3::render::War3ShadowGenerationBackedStreamProof& proof)
+        const noexcept {
+      size_t h = size_t(proof.ownerIdentity);
+      const auto fold = [&h](uint64_t value) {
+        h ^= size_t(value) + size_t(0x9e3779b9u) + (h << 6u) + (h >> 2u);
+      };
+      fold(proof.identityGeneration);
+      fold(proof.allocationGeneration);
+      fold(proof.contentGeneration);
+      fold(proof.sourceOffset);
+      fold(proof.sourceLength);
+      fold(proof.elementStride);
+      fold(proof.elementSize);
+      fold(proof.mapEpoch);
+      fold(proof.deviceEpoch);
+      fold(static_cast<uint8_t>(proof.streamKind));
+      return h;
+    }
+  };
+  struct War3Stage11AllocationObserverProofEqual {
+    bool operator()(
+        const war3::render::War3ShadowGenerationBackedStreamProof& lhs,
+        const war3::render::War3ShadowGenerationBackedStreamProof& rhs)
+        const noexcept {
+      return lhs.matches(rhs);
+    }
+  };
+  static constexpr size_t kWar3Stage11AllocationObserverMaxProofs = 65536u;
+  std::unordered_set<
+      war3::render::War3ShadowGenerationBackedStreamProof,
+      War3Stage11AllocationObserverProofHash,
+      War3Stage11AllocationObserverProofEqual>
+      m_war3Stage11AllocationObserverProofs;
+  uint64_t m_war3Stage11AllocationObserverFrameSerial = 0u;
+#endif
   // A positive current-frame rejection is an owner decision even when no VB
   // entry was published.  It prevents generic reconstruction and historical
   // packet leases from resurrecting a blocker after an early capture gate.

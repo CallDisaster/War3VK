@@ -24,6 +24,7 @@
 #include "war3/render/war3_shadow_object_registry.h"
 #include "war3/render/war3_shadow_observer_build_policy.h"
 #include "war3/render/war3_shadow_producer_policy.h"
+#include "war3/render/war3_shadow_stage11_allocation_observer.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
 #include "war3/render/war3_terrain_bounds_provenance.h"
 #include "war3/render/war3_upper_layer_shadow.h"
@@ -3121,6 +3122,14 @@ War3TerrainBoundsCullModeRuntime() {
   return mode == dxvk::war3::render::War3ShadowObserverBuildMode::Observe
       ? dxvk::war3::render::War3TerrainBoundsCullMode::Observe
       : dxvk::war3::render::War3TerrainBoundsCullMode::Off;
+}
+
+inline bool War3Stage11AllocationObserverRuntime() {
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
+    return false;
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_STAGE11_ALLOC_OBSERVER", 0u) == 1u;
+  return s_enabled;
 }
 
 enum class War3ProducerClaimObserveMode : uint8_t {
@@ -24679,6 +24688,11 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3Stage13RetainedCasters = {};
   m_war3ShadowPersistentExpiryQueue = {};
   m_war3DrawTimeVBCache = {};
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+  m_war3Stage11AllocationObserverProofs.clear();
+  m_war3Stage11AllocationObserverFrameSerial = 0u;
+#endif
   m_war3S1TerrainCasterStash = {};
   m_war3S1TerrainEarlyCache = {};
   m_war3S1GenerationProofObservations.clear();
@@ -42627,6 +42641,41 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 uint32_t(drawTimeIndexStride), ShadowStreamKind::Index);
           }
         }
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+        if (War3Stage11AllocationObserverRuntime() &&
+            generationBackedStaticCandidate) {
+          auto& observerStats = m_war3Scene.shadowStats;
+          observerStats.drawTimeAllocObserverEnabled = 1u;
+          if (m_war3Stage11AllocationObserverFrameSerial !=
+              m_war3ShadowPersistentFrameSerial) {
+            m_war3Stage11AllocationObserverFrameSerial =
+                m_war3ShadowPersistentFrameSerial;
+            m_war3Stage11AllocationObserverProofs.clear();
+          }
+          if (!currentPositionSourceProof.valid()) {
+            ++observerStats.drawTimePositionProofInvalidCount;
+          } else {
+            const auto duplicate =
+                m_war3Stage11AllocationObserverProofs.find(
+                    currentPositionSourceProof);
+            if (duplicate != m_war3Stage11AllocationObserverProofs.end()) {
+              ++observerStats.drawTimePositionProofDuplicateCount;
+              observerStats.drawTimePositionProofDuplicateBytes +=
+                  uint64_t(posBytes);
+            } else if (m_war3Stage11AllocationObserverProofs.size() <
+                       kWar3Stage11AllocationObserverMaxProofs) {
+              m_war3Stage11AllocationObserverProofs.insert(
+                  currentPositionSourceProof);
+              ++observerStats.drawTimePositionProofUniqueCount;
+              observerStats.drawTimePositionProofUniqueBytes +=
+                  uint64_t(posBytes);
+            } else {
+              ++observerStats.drawTimePositionProofSetOverflowCount;
+            }
+          }
+        }
+#endif
         const VkPrimitiveTopology captureTopology = [&]() {
           switch (PrimitiveType) {
           case D3DPT_TRIANGLESTRIP:
@@ -42973,6 +43022,20 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
         drawTimeCaptureTiming.enter(
             War3ShadowDrawTimeCapturePhase::CacheRecordSetup);
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+        const bool observerEntryExisted =
+            drawTimeCacheIt != m_war3DrawTimeVBCache.end();
+        const bool observerHadPositionBuffer =
+            observerEntryExisted &&
+            drawTimeCacheIt->second.positionBuffer != nullptr;
+        const uint64_t observerPreviousPositionCapacity =
+            observerEntryExisted
+                ? uint64_t(drawTimeCacheIt->second.positionCapacity)
+                : 0u;
+        const bool observerReplacingGpuSkinLease =
+            observerEntryExisted && drawTimeCacheIt->second.gpuSkinLeaseBacked;
+#endif
         auto& entry = [&]() -> decltype(m_war3DrawTimeVBCache)::mapped_type& {
           if (War3DrawTimeCacheIteratorReuseRuntime() &&
               drawTimeCacheIt != m_war3DrawTimeVBCache.end()) {
@@ -43164,12 +43227,68 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             !gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
             (entry.positionBuffer == nullptr ||
              entry.positionCapacity < posBytes);
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+        war3::render::War3Stage11PositionAllocationClass
+            observerPositionAllocationClass =
+                war3::render::War3Stage11PositionAllocationClass::NewEntry;
+        if (needsNewPositionBuffer &&
+            War3Stage11AllocationObserverRuntime()) {
+          auto& observerStats = m_war3Scene.shadowStats;
+          observerStats.drawTimeAllocObserverEnabled = 1u;
+          ++observerStats.drawTimePositionAllocRequestCount;
+          if (generationBackedStaticCandidate)
+            ++observerStats.drawTimePositionAllocStaticRequestCount;
+          else
+            ++observerStats.drawTimePositionAllocDynamicRequestCount;
+          observerPositionAllocationClass =
+              war3::render::ClassifyWar3Stage11PositionAllocation(
+                  observerEntryExisted, observerHadPositionBuffer,
+                  observerPreviousPositionCapacity, uint64_t(posBytes),
+                  observerReplacingGpuSkinLease);
+          switch (observerPositionAllocationClass) {
+          case war3::render::War3Stage11PositionAllocationClass::NewEntry:
+            ++observerStats.drawTimePositionAllocNewEntryCount; break;
+          case war3::render::War3Stage11PositionAllocationClass::
+              ExistingMissingBacking:
+            ++observerStats.drawTimePositionAllocMissingBackingCount; break;
+          case war3::render::War3Stage11PositionAllocationClass::
+              CapacityGrowth:
+            ++observerStats.drawTimePositionAllocCapacityGrowthCount; break;
+          case war3::render::War3Stage11PositionAllocationClass::
+              GpuSkinLeaseDetach:
+            ++observerStats.drawTimePositionAllocLeaseDetachCount; break;
+          }
+        }
+#endif
         if (needsNewPositionBuffer &&
             dxvk::war3::internal::kShadowDrawTimeVBCacheAllocBudgetEnabled) {
           if (m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
               dxvk::war3::internal::
                   kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
             m_war3DrawTimeVBCacheBudgetDeferredCount++;
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+            if (War3Stage11AllocationObserverRuntime()) {
+              auto& observerStats = m_war3Scene.shadowStats;
+              switch (observerPositionAllocationClass) {
+              case war3::render::War3Stage11PositionAllocationClass::NewEntry:
+                ++observerStats.drawTimePositionDeferredNewEntryCount; break;
+              case war3::render::War3Stage11PositionAllocationClass::
+                  ExistingMissingBacking:
+                ++observerStats.drawTimePositionDeferredMissingBackingCount;
+                break;
+              case war3::render::War3Stage11PositionAllocationClass::
+                  CapacityGrowth:
+                ++observerStats.drawTimePositionDeferredCapacityGrowthCount;
+                break;
+              case war3::render::War3Stage11PositionAllocationClass::
+                  GpuSkinLeaseDetach:
+                ++observerStats.drawTimePositionDeferredLeaseDetachCount;
+                break;
+              }
+            }
+#endif
             // The entry may still own an older, undersized buffer. Invalidate
             // its descriptor so this frame cannot publish stale/out-of-range
             // backing while allocation is deferred.

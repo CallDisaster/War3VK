@@ -2,6 +2,7 @@
 #include "../war3_shadow_capture_frontend.h"
 #include "../war3_shadow_drawtime_cache_policy.h"
 #include "../war3_shadow_generation_backed_stream.h"
+#include "../war3_shadow_stage11_allocation_observer.h"
 
 #include <algorithm>
 #include <array>
@@ -114,6 +115,22 @@ bool testGenerationObservationClock() {
           policy::AdvanceWar3ShadowGenerationObservationClock(clock, 110u) ==
               3u,
       "sparse Present serials did not form adjacent producer observations");
+}
+
+bool testStage11AllocationClassification() {
+  using Class = policy::War3Stage11PositionAllocationClass;
+  using policy::ClassifyWar3Stage11PositionAllocation;
+  return require(
+      ClassifyWar3Stage11PositionAllocation(
+          false, false, 0u, 4096u, false) == Class::NewEntry &&
+      ClassifyWar3Stage11PositionAllocation(
+          true, false, 0u, 4096u, false) ==
+          Class::ExistingMissingBacking &&
+      ClassifyWar3Stage11PositionAllocation(
+          true, true, 2048u, 4096u, false) == Class::CapacityGrowth &&
+      ClassifyWar3Stage11PositionAllocation(
+          true, true, 8192u, 4096u, true) == Class::GpuSkinLeaseDetach,
+      "Stage11 position-allocation observer classification changed");
 }
 
 bool testRequiredCasterHardAdmissionIsOrderIndependent() {
@@ -293,6 +310,7 @@ int main() {
   return testProducerCompletenessStampAndSaturation() &&
       testProtectedWorkingSetLru() &&
       testGenerationObservationClock() &&
+      testStage11AllocationClassification() &&
       testRequiredCasterHardAdmissionIsOrderIndependent() &&
       testGenerationBackedStreamProof() &&
       testGenerationBackedStabilityProbation() ? 0 : 1;
