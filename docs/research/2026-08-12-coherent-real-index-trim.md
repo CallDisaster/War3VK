@@ -80,7 +80,16 @@ Consume short gate using the same implementation:
   transactions: all zero;
 - device lost, new GPU events and new GPU incidents: zero.
 
+Final rebuilt development candidate:
+
+- SHA-256: `D1A14CB05BE7952893742D4C688291851C36CDB43FBEEFC4850C1C3C6A2F5E9C`
+- artifact: `AutoTest/artifacts/life_and_death_tdr/20260812_060219`
+- 13,780 frames; 507,638 consumed draws; 264,666,924,256 bytes avoided;
+- Arena average/peak: 60.879 / 367.789 MiB;
+- producer incomplete, required caster omission, fallback byte-budget
+  omission, budget exceeded, partial publication, device lost, new GPU events
+  and new incidents: all zero.
+
 These are isolated-desktop stability and relative A/B results, not foreground
-FPS or player visual acceptance. The final rebuilt candidate still requires a
-ten-minute Consume gate and later foreground review before any Release default
-decision.
+FPS or player visual acceptance. Release remains Off until a later explicitly
+authorized default decision and foreground visual review.
