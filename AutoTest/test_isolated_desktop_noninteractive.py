@@ -13,6 +13,32 @@ import war3_autotest_mcp as autotest  # noqa: E402
 
 
 class IsolatedDesktopNonInteractiveTests(unittest.TestCase):
+    def test_strict_stability_hook_classifier_is_bounded_and_case_insensitive(
+        self,
+    ) -> None:
+        modules = [
+            {"name": "War3.exe", "path": r"C:\Game\War3.exe", "size": 1},
+            {
+                "name": "GRAPHICS-HOOK32.DLL",
+                "path": r"C:\ProgramData\obs-studio-hook\graphics-hook32.dll",
+                "size": 2,
+            },
+            {
+                "name": "ReShade32.dll",
+                "path": r"C:\Game\ReShade32.dll",
+                "size": 3,
+            },
+            {"name": "nvoglv32.dll", "path": r"C:\Windows\nvoglv32.dll", "size": 4},
+        ]
+        evidence = autotest._external_graphics_hook_evidence(modules)
+        self.assertEqual(
+            [row["name"] for row in evidence],
+            ["GRAPHICS-HOOK32.DLL", "ReShade32.dll"],
+        )
+        self.assertTrue(
+            all(len(row["sha256"]) in (0, 64) for row in evidence)
+        )
+
     def test_active_autotest_has_no_desktop_switch_capability(self) -> None:
         runner = (AUTOTEST / "war3_autotest_mcp.py").read_text(
             encoding="utf-8"

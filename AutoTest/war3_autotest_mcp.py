@@ -2057,6 +2057,42 @@ def _snapshot_process_modules(pid: int) -> List[Dict[str, Any]]:
     return rows
 
 
+_STRICT_STABILITY_EXTERNAL_GRAPHICS_HOOKS = frozenset(
+    {
+        "graphics-hook32.dll",
+        "graphics-hook64.dll",
+        "reshade32.dll",
+        "reshade64.dll",
+    }
+)
+
+
+def _external_graphics_hook_evidence(
+    modules: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return bounded evidence for injected graphics hooks.
+
+    Stability runs must not attribute a third-party capture/injection crash to
+    WarVK.  This helper is observational only: it never stops an overlay or
+    changes global capture settings.
+    """
+    evidence: List[Dict[str, Any]] = []
+    for row in modules:
+        name = str(row.get("name", "") or "").strip()
+        if name.casefold() not in _STRICT_STABILITY_EXTERNAL_GRAPHICS_HOOKS:
+            continue
+        path = Path(str(row.get("path", "") or ""))
+        evidence.append(
+            {
+                "name": name,
+                "path": str(path),
+                "size": int(row.get("size", 0) or 0),
+                "sha256": sha256_file(path) if path.is_file() else "",
+            }
+        )
+    return evidence
+
+
 def _wait_for_ydwe_runtime_modules(
     pid: int,
     expected_paths: Dict[str, Path],
@@ -9387,18 +9423,9 @@ def run_life_and_death_tdr_scenario(
     attach_pid: int = 0,
     screenshot_count: int = 12,
     birth_hold_sec: int = 120,
+    strict_external_graphics_hooks: bool = True,
 ) -> Dict[str, Any]:
     """冷启动或连接“生与死”，以低视角巡航并在首次 GPU 故障时止损。"""
-    if bool(use_isolated_desktop):
-        return {
-            "ok": False,
-            "stage": "preflight",
-            "error": (
-                "life_and_death_tdr 禁止隔离桌面启动；"
-                "请使用默认可见桌面或 attach_pid 连接用户手动启动的 War3。"
-            ),
-            "isolatedDesktopQuarantined": True,
-        }
     w3 = Path(war3_dir)
     source_map = Path(map_path)
     if not source_map.is_file():
@@ -9443,6 +9470,26 @@ def run_life_and_death_tdr_scenario(
 
     owned_process = int(attach_pid) <= 0
     if owned_process:
+        # A hidden desktop is deliberately non-interactive.  Direct -loadfile
+        # maps that reach the game loop need no keyboard acknowledgement, and
+        # all later camera/visibility control goes through the named pipe/JASS
+        # bridge.  Visible-desktop compatibility keeps the historical bounded
+        # key plan for maps with an acknowledgement screen.
+        startup_input_actions = (
+            []
+            if bool(use_isolated_desktop)
+            else [
+                {"type": "sleep", "ms": 10000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 8000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 8000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 8000},
+                {"type": "key", "vk": 0x20, "holdMs": 80},
+                {"type": "sleep", "ms": 1200},
+            ]
+        )
         start = _launch_suite_map_until_ready(
             war3_dir=war3_dir,
             requested_map_path=str(source_map),
@@ -9470,17 +9517,7 @@ def run_life_and_death_tdr_scenario(
                 "env_overrides_json": json.dumps(user_env, ensure_ascii=False),
                 "extra_args": "",
             },
-            startup_input_actions=[
-                {"type": "sleep", "ms": 10000},
-                {"type": "key", "vk": 0x20, "holdMs": 80},
-                {"type": "sleep", "ms": 8000},
-                {"type": "key", "vk": 0x20, "holdMs": 80},
-                {"type": "sleep", "ms": 8000},
-                {"type": "key", "vk": 0x20, "holdMs": 80},
-                {"type": "sleep", "ms": 8000},
-                {"type": "key", "vk": 0x20, "holdMs": 80},
-                {"type": "sleep", "ms": 1200},
-            ],
+            startup_input_actions=startup_input_actions,
         )
     else:
         pid = int(attach_pid)
@@ -9514,6 +9551,8 @@ def run_life_and_death_tdr_scenario(
     instance_root = Path(str(launch.get("instanceRoot", war3_dir)))
     if instance_root not in incident_roots:
         incident_roots.append(instance_root)
+    loaded_modules = _snapshot_process_modules(pid)
+    external_graphics_hooks = _external_graphics_hook_evidence(loaded_modules)
     camera_before: Dict[str, Any] = {}
     bounds: Dict[str, Any] = {}
     visibility_enable: Dict[str, Any] = {}
@@ -9525,6 +9564,11 @@ def run_life_and_death_tdr_scenario(
     failure_reason = ""
     stop_result: Dict[str, Any] = {}
     started_at = time.monotonic()
+    if bool(strict_external_graphics_hooks):
+        if not loaded_modules:
+            failure_reason = "strict module enumeration failed"
+        elif external_graphics_hooks:
+            failure_reason = "external graphics hook contamination"
     screenshot_interval = (
         float(duration) / float(max(1, requested_screenshot_count - 1))
         if requested_screenshot_count > 1
@@ -9564,17 +9608,18 @@ def run_life_and_death_tdr_scenario(
         )
 
     try:
-        camera_before = _invoke_internal_test_request(
-            pid, w3, "camera.snapshot", {}, timeout_sec=4.0
-        )
-        bounds = _invoke_internal_test_request(
-            pid, w3, "camera.world_bounds", {}, timeout_sec=4.0
-        )
-        if requested_screenshot_count > 0:
-            capture_aligned_screenshot("initial", -1)
-        if not camera_before.get("ok") or not bounds.get("ok"):
-            failure_reason = "internal camera preflight failed"
-        else:
+        if not failure_reason:
+            camera_before = _invoke_internal_test_request(
+                pid, w3, "camera.snapshot", {}, timeout_sec=4.0
+            )
+            bounds = _invoke_internal_test_request(
+                pid, w3, "camera.world_bounds", {}, timeout_sec=4.0
+            )
+            if requested_screenshot_count > 0:
+                capture_aligned_screenshot("initial", -1)
+            if not camera_before.get("ok") or not bounds.get("ok"):
+                failure_reason = "internal camera preflight failed"
+        if not failure_reason:
             next_sample = time.monotonic()
             birth_deadline = min(
                 started_at + float(requested_birth_hold_sec),
@@ -9844,6 +9889,9 @@ def run_life_and_death_tdr_scenario(
         "sourceMap": str(source_map),
         "sourceMapSha256": sha256_file(source_map),
         "start": start,
+        "strictExternalGraphicsHooks": bool(strict_external_graphics_hooks),
+        "loadedModules": loaded_modules,
+        "externalGraphicsHooks": external_graphics_hooks,
         "cameraBefore": camera_before,
         "worldBounds": bounds,
         "visibilityEnable": visibility_enable,
