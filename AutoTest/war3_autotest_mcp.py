@@ -68,10 +68,11 @@ DEFAULT_BENCHMARK_REFRESH = 59
 AUTOTEST_BACKGROUND_THROTTLE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_BACKGROUND_THROTTLE"
 AUTOTEST_GAME_PAUSE_ENV = "DXVK_WAR3_AUTOTEST_DISABLE_GAME_PAUSE"
 AUTOTEST_INTERNAL_TEST_API_ENV = "DXVK_WAR3_INTERNAL_TEST_API"
-# Win32 Desktop-object launches are quarantined on the current test machine.
-# The display stack can blank the interactive desktop while War3 remains alive
-# on the non-input desktop, which makes an unattended test unsafe for the user.
-ISOLATED_DESKTOP_QUARANTINED = True
+# Isolated desktop launches are non-interactive by contract.  AutoTest may
+# create a process on another Win32 desktop, but it must never switch the
+# session's input desktop or inject keyboard/mouse input into that desktop.
+# Scenario control must use the named pipe/JASS bridge and framebuffer capture.
+ISOLATED_DESKTOP_NONINTERACTIVE_ONLY = True
 WAR3_VIDEO_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III\Video"
 WAR3_INSTALL_REG_KEY = r"Software\Blizzard Entertainment\Warcraft III"
 YDWE_LAUNCHER_MODE_DIRECT = "direct"
@@ -84,7 +85,6 @@ DESKTOP_READOBJECTS = 0x0001
 DESKTOP_CREATEWINDOW = 0x0002
 DESKTOP_ENUMERATE = 0x0040
 DESKTOP_WRITEOBJECTS = 0x0080
-DESKTOP_SWITCHDESKTOP = 0x0100
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 CREATE_NEW_CONSOLE = 0x00000010
 GENERIC_READ = 0x80000000
@@ -1401,8 +1401,63 @@ def _desktop_access_mask() -> int:
         | DESKTOP_CREATEWINDOW
         | DESKTOP_ENUMERATE
         | DESKTOP_WRITEOBJECTS
-        | DESKTOP_SWITCHDESKTOP
     )
+
+
+def _desktop_name_from_handle(handle: Any) -> str:
+    handle_value = _native_handle_value(handle)
+    if handle_value <= 0:
+        return ""
+    user32 = ctypes.windll.user32
+    user32.GetUserObjectInformationW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetUserObjectInformationW.restype = wintypes.BOOL
+    needed = wintypes.DWORD(0)
+    UOI_NAME = 2
+    user32.GetUserObjectInformationW(
+        wintypes.HANDLE(handle_value), UOI_NAME, None, 0, ctypes.byref(needed)
+    )
+    if int(needed.value) <= 0:
+        return ""
+    wchar_count = max(
+        2,
+        (int(needed.value) + ctypes.sizeof(ctypes.c_wchar) - 1)
+        // ctypes.sizeof(ctypes.c_wchar),
+    )
+    buffer = ctypes.create_unicode_buffer(wchar_count)
+    if not user32.GetUserObjectInformationW(
+        wintypes.HANDLE(handle_value),
+        UOI_NAME,
+        ctypes.cast(buffer, wintypes.LPVOID),
+        wintypes.DWORD(ctypes.sizeof(buffer)),
+        ctypes.byref(needed),
+    ):
+        return ""
+    return str(buffer.value or "")
+
+
+def _query_input_desktop_name() -> str:
+    user32 = ctypes.windll.user32
+    user32.OpenInputDesktop.argtypes = [
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    user32.OpenInputDesktop.restype = wintypes.HANDLE
+    user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    user32.CloseDesktop.restype = wintypes.BOOL
+    handle = user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
+    if not handle:
+        return ""
+    try:
+        return _desktop_name_from_handle(handle)
+    finally:
+        user32.CloseDesktop(wintypes.HANDLE(handle))
 
 
 def _create_isolated_desktop(name: str) -> Dict[str, Any]:
@@ -1410,16 +1465,23 @@ def _create_isolated_desktop(name: str) -> Dict[str, Any]:
     if not desktop_name:
         desktop_name = f"War3AutoTest_{_now_compact()}"
 
-    if ISOLATED_DESKTOP_QUARANTINED:
+    input_desktop_before = _query_input_desktop_name()
+    if not input_desktop_before:
         return {
             "ok": False,
             "stage": "preflight",
-            "error": (
-                "隔离桌面启动已被安全隔离：当前显示栈可能令交互桌面黑屏，"
-                "同时把 War3 留在非输入桌面。请使用可见桌面或 attach-only。"
-            ),
+            "error": "无法证明当前输入桌面身份，拒绝创建隔离桌面",
             "name": desktop_name,
-            "quarantined": True,
+            "code": "INPUT_DESKTOP_IDENTITY_UNAVAILABLE",
+        }
+    if desktop_name.casefold() == input_desktop_before.casefold():
+        return {
+            "ok": False,
+            "stage": "preflight",
+            "error": "隔离桌面名称不得等于当前输入桌面",
+            "name": desktop_name,
+            "inputDesktop": input_desktop_before,
+            "code": "ISOLATED_DESKTOP_NAME_COLLISION",
         }
 
     result: Dict[str, Any] = {}
@@ -1478,6 +1540,21 @@ def _create_isolated_desktop(name: str) -> Dict[str, Any]:
         }
     if not result.get("ok"):
         return {"ok": False, "error": result.get("error", "CreateDesktopW 失败"), "name": desktop_name}
+    input_desktop_after = _query_input_desktop_name()
+    if input_desktop_after != input_desktop_before:
+        _close_desktop_handle(int(result.get("handle", 0) or 0))
+        return {
+            "ok": False,
+            "stage": "post-create-witness",
+            "error": "创建隔离桌面期间输入桌面发生变化，已关闭隔离桌面",
+            "name": desktop_name,
+            "inputDesktopBefore": input_desktop_before,
+            "inputDesktopAfter": input_desktop_after,
+            "code": "INPUT_DESKTOP_CHANGED",
+        }
+    result["inputDesktopBefore"] = input_desktop_before
+    result["inputDesktopAfter"] = input_desktop_after
+    result["nonInteractiveOnly"] = True
     return result
 
 
@@ -1499,6 +1576,22 @@ def _launch_process_on_desktop(
     env: Dict[str, str],
     desktop_name: str,
 ) -> Dict[str, Any]:
+    input_desktop_before = _query_input_desktop_name()
+    if not input_desktop_before:
+        return {
+            "ok": False,
+            "error": "无法证明当前输入桌面身份，拒绝后台进程启动",
+            "desktop": desktop_name,
+            "code": "INPUT_DESKTOP_IDENTITY_UNAVAILABLE",
+        }
+    if str(desktop_name or "").casefold() == input_desktop_before.casefold():
+        return {
+            "ok": False,
+            "error": "目标桌面与当前输入桌面相同，拒绝隔离启动",
+            "desktop": desktop_name,
+            "inputDesktop": input_desktop_before,
+            "code": "ISOLATED_DESKTOP_NAME_COLLISION",
+        }
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateProcessW.argtypes = [
         wintypes.LPCWSTR,
@@ -1547,6 +1640,21 @@ def _launch_process_on_desktop(
     pid = int(proc_info.dwProcessId)
     if proc_info.hThread:
         kernel32.CloseHandle(proc_info.hThread)
+    input_desktop_after = _query_input_desktop_name()
+    if input_desktop_after != input_desktop_before:
+        cleanup = _terminate_and_close_owned_create_process_handle(
+            proc_info.hProcess,
+        )
+        return {
+            "ok": False,
+            "error": "隔离进程创建期间输入桌面发生变化，已终止该进程",
+            "pid": pid,
+            "desktop": desktop_name,
+            "inputDesktopBefore": input_desktop_before,
+            "inputDesktopAfter": input_desktop_after,
+            "cleanup": cleanup,
+            "code": "INPUT_DESKTOP_CHANGED",
+        }
     witness, witness_acquisition = _adopt_native_process_witness(
         proc_info.hProcess,
         pid,
@@ -1572,6 +1680,9 @@ def _launch_process_on_desktop(
         "ok": True,
         "pid": pid,
         "desktop": desktop_name,
+        "inputDesktopBefore": input_desktop_before,
+        "inputDesktopAfter": input_desktop_after,
+        "nonInteractiveOnly": True,
         "nativeProcessWitness": witness.snapshot(),
         "nativeProcessWitnessAcquisition": witness_acquisition,
         # Internal-only ownership transfer to launch_war3_test. This object is
@@ -4102,6 +4213,26 @@ def _post_war3_key_pulse(
     foreground: bool = False,
 ) -> Dict[str, Any]:
     """Send a small keyboard pulse to the War3 window without requiring camera internals."""
+    registered = SESSION_REGISTRY.get(pid=int(pid))
+    desktop_mode = (
+        str(registered.desktop_mode or "default")
+        if registered is not None
+        else (
+            str(STATE.desktop_mode or "default")
+            if int(STATE.war3_pid or 0) == int(pid)
+            else "default"
+        )
+    ).strip().lower()
+    if desktop_mode == "isolated":
+        return {
+            "ok": False,
+            "pid": int(pid),
+            "code": "ISOLATED_DESKTOP_INPUT_UNSUPPORTED",
+            "error": (
+                "隔离桌面为非交互模式；键盘输入被拒绝。"
+                "请使用 named pipe/JASS 场景命令。"
+            ),
+        }
     hwnd = _wait_for_main_window_hwnd(pid, timeout_sec=8.0, require_visible=True)
     if not hwnd:
         return {"ok": False, "error": f"未找到可见主窗口: pid={pid}"}
@@ -4159,7 +4290,6 @@ def _post_war3_key_pulse(
     # WM_KEYDOWN/WM_KEYUP 只足以驱动部分窗口消息路径。目标位于隔离
     # Win32 Desktop 时，在同一 Desktop 内启动一次性 keybd_event helper；
     # 这不会切换作者当前桌面，也不需要把 War3 窗口带到前台桌面。
-    registered = SESSION_REGISTRY.get(pid=int(pid))
     desktop_name = ""
     if registered is not None:
         desktop_name = str(registered.desktop_name or "")
@@ -4330,6 +4460,18 @@ def _run_war3_input_plan(
             "ok": False,
             "error": "隔离桌面会话缺少 desktop name",
             "code": "AUTOTEST_DESKTOP_NAME_REQUIRED",
+        }
+    if desktop_mode == "isolated":
+        return {
+            "ok": False,
+            "pid": target_pid,
+            "desktopMode": desktop_mode,
+            "desktop": desktop_name,
+            "code": "ISOLATED_DESKTOP_INPUT_UNSUPPORTED",
+            "error": (
+                "隔离桌面为非交互模式；键鼠输入计划被拒绝。"
+                "请使用 named pipe/JASS 场景命令。"
+            ),
         }
 
     hwnd = _wait_for_main_window_hwnd(target_pid, timeout_sec=8.0, require_visible=True)

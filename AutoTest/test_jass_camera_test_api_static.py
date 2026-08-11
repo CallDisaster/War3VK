@@ -149,11 +149,14 @@ class JassCameraTestApiStaticTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('"life_and_death_tdr": {', runner)
         self.assertIn("def run_life_and_death_tdr_scenario(", runner)
-        self.assertIn("ISOLATED_DESKTOP_QUARANTINED = True", runner)
+        self.assertIn(
+            "ISOLATED_DESKTOP_NONINTERACTIVE_ONLY = True", runner
+        )
         self.assertIn('"useIsolatedDesktop": False', runner)
         self.assertIn("use_isolated_desktop: bool = False", runner)
         self.assertIn("life_and_death_tdr 禁止隔离桌面启动", runner)
         self.assertIn('"isolatedDesktopQuarantined": True', runner)
+        self.assertIn("ISOLATED_DESKTOP_INPUT_UNSUPPORTED", runner)
         self.assertIn('"camera.world_bounds"', runner)
         self.assertIn('"camera.pan_to"', runner)
         self.assertIn("for row, y in enumerate(ys)", runner)
