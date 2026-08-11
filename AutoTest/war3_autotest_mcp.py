@@ -7881,6 +7881,32 @@ def wait_for_game_ready(
                 time.sleep(0.2)
                 continue
             break
+        # The control plane is created only after War3 reaches the renderer/JASS
+        # bootstrap.  A protected map may wait for a local acknowledgement
+        # before that point, so requiring the pipe before posting the key makes
+        # isolated startup circular.  Keep this strictly HWND-scoped: the
+        # helper verifies the owned PID and that the target desktop is not the
+        # current input desktop, and never foregrounds or switches desktops.
+        now = time.time()
+        can_continue_without_pipe = (
+            auto_continue_loading
+            and target_alive()
+            and (now - pipe_wait_t0) >= 10.0
+            and (last_continue_at <= 0.0 or
+                 (now - last_continue_at) >= max(5, int(continue_interval_sec)))
+        )
+        if can_continue_without_pipe:
+            pulse = _post_war3_key_pulse(
+                target_pid,
+                key=continue_key,
+                hold_ms=55,
+                repeat=1,
+                foreground=False,
+            )
+            pulse["elapsedSec"] = round(now - pipe_wait_t0, 3)
+            pulse["controlPlaneReady"] = False
+            continue_pulses.append(pulse)
+            last_continue_at = now
         if not target_alive():
             break
         time.sleep(0.2)

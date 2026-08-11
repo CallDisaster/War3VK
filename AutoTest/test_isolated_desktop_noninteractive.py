@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -184,6 +185,64 @@ class IsolatedDesktopNonInteractiveTests(unittest.TestCase):
             "non-input desktop injection is forbidden"
         )
         self.assertLess(key_proof, key_pulse.index("keybd_event("))
+
+    def test_ready_wait_can_acknowledge_before_control_plane_exists(self) -> None:
+        calls = []
+        responses = [
+            {
+                "transportOk": False,
+                "ok": False,
+                "error": "named pipe unavailable",
+            },
+            {
+                "transportOk": True,
+                "ok": True,
+                "elapsedSec": 0.0,
+                "result": {"runtimeStatus": {}},
+            },
+        ]
+
+        def request(**_kwargs):
+            return responses.pop(0)
+
+        def pulse(pid, **kwargs):
+            calls.append((pid, kwargs))
+            return {"ok": True, "mode": "isolated-window-message"}
+
+        clock = iter((0.0, 0.0, 11.0, 12.0))
+        old_pid = autotest.STATE.war3_pid
+        old_dir = autotest.STATE.war3_dir
+        old_epoch = autotest.STATE.launch_epoch_ms
+        autotest.STATE.war3_pid = 4321
+        autotest.STATE.war3_dir = ROOT
+        autotest.STATE.launch_epoch_ms = 0
+        try:
+            with (
+                mock.patch.object(autotest, "_start_debug_monitor"),
+                mock.patch.object(autotest, "_control_plane_request", request),
+                mock.patch.object(autotest, "_pid_alive", return_value=True),
+                mock.patch.object(autotest, "_post_war3_key_pulse", pulse),
+                mock.patch.object(autotest.time, "time", side_effect=lambda: next(clock)),
+                mock.patch.object(autotest.time, "sleep"),
+            ):
+                result = autotest.wait_for_game_ready(
+                    timeout_sec=30,
+                    pid=4321,
+                    allow_fallback=False,
+                    auto_continue_loading=True,
+                    continue_key="SPACE",
+                    continue_interval_sec=5,
+                )
+        finally:
+            autotest.STATE.war3_pid = old_pid
+            autotest.STATE.war3_dir = old_dir
+            autotest.STATE.launch_epoch_ms = old_epoch
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], 4321)
+        self.assertEqual(calls[0][1]["key"], "SPACE")
+        self.assertFalse(result["continuePulses"][0]["controlPlaneReady"])
 
     @unittest.skipUnless(os.name == "nt", "Win32 Desktop probe")
     def test_process_launch_does_not_change_input_desktop(self) -> None:
