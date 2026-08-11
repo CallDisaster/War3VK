@@ -3135,10 +3135,17 @@ inline bool War3Stage11AllocationObserverRuntime() {
 }
 
 inline bool War3Stage11DirectStaticSourceRuntime() {
+  // A non-UP source is accepted only after the Stage11 path has proved a
+  // rigid/static owner and stamped the exact D3D9 buffer identity, allocation
+  // generation, content generation and map/device epochs.  The draw pins the
+  // resolved allocation until every shadow consumer has completed, so this is
+  // source sharing rather than the unsafe cross-frame fingerprint cache.
+  // Development observer builds retain an explicit off switch for A/B; the
+  // Release path uses the proven source-sharing route by default.
   if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
-    return false;
+    return true;
   static const bool s_enabled =
-      War3GetEnvU32("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", 0u) == 1u;
+      War3GetEnvU32("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", 1u) == 1u;
   return s_enabled;
 }
 

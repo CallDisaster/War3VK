@@ -80,13 +80,19 @@ class Stage11AllocationObserverStaticTest(unittest.TestCase):
         self.assertNotIn("positionBuffer =", block)
         self.assertNotIn("EmitCs", block)
 
-    def test_direct_source_candidate_is_development_only_and_exact(self) -> None:
+    def test_direct_static_source_is_release_default_and_exact(self) -> None:
         runtime = DEVICE[
             DEVICE.index("inline bool War3Stage11DirectStaticSourceRuntime") :
             DEVICE.index("enum class War3ProducerClaimObserveMode")
         ]
         self.assertIn("kDevelopmentShadowObserversEnabled", runtime)
+        self.assertRegex(runtime, r"if constexpr \(!.*kDevelopmentShadowObserversEnabled\)")
+        self.assertIn("return true;", runtime)
         self.assertIn("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", runtime)
+        self.assertIn(
+            'War3GetEnvU32("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", 1u)',
+            runtime,
+        )
         begin = DEVICE.index("directStaticPositionAllocation")
         end = DEVICE.index("GenerationBackedStreamProof currentIndexSourceProof", begin)
         gate = DEVICE[begin:end]
