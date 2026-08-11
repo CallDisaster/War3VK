@@ -152,19 +152,19 @@ bool testStage11SnapshotPagePolicy() {
                    aligned == 512u,
                "snapshot alignment accepted an empty range or misaligned"))
     return false;
-  if (!require(policy::War3Stage11SnapshotPageCapacity(1u) == 4u * mib &&
-                   policy::War3Stage11SnapshotPageCapacity(5u * mib) ==
-                       8u * mib &&
+  if (!require(policy::War3Stage11SnapshotPageCapacity(1u) == 16u * mib &&
+                   policy::War3Stage11SnapshotPageCapacity(17u * mib) ==
+                       32u * mib &&
                    policy::War3Stage11SnapshotPageCapacity(385u * mib) == 0u,
                "snapshot page sizing escaped its bounded policy"))
     return false;
 
   const auto first = policy::War3PlanStage11SnapshotSuballocation(
-      0u, 4u * mib, 1000u);
+      0u, 16u * mib, 1000u);
   const auto second = policy::War3PlanStage11SnapshotSuballocation(
-      first.nextUsed, 4u * mib, 257u);
+      first.nextUsed, 16u * mib, 257u);
   const auto overflow = policy::War3PlanStage11SnapshotSuballocation(
-      4u * mib - 128u, 4u * mib, 256u);
+      16u * mib - 128u, 16u * mib, 256u);
   return require(first.valid && first.offset == 0u &&
                      first.capacity == 1024u && second.valid &&
                      second.offset == 1024u && second.capacity == 512u &&

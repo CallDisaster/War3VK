@@ -11,8 +11,12 @@ namespace dxvk::war3::render {
 // valid casters.  Pages amortize the Vulkan allocation while retaining a
 // distinct, immutable logical range for every cache entry.
 inline constexpr uint64_t kWar3Stage11SnapshotAlignment = 256u;
-inline constexpr uint64_t kWar3Stage11SnapshotPageBytes = 4u << 20u;
 inline constexpr uint64_t kWar3Stage11SnapshotResidentCapBytes = 384u << 20u;
+// Keep a full resident generation below the unchanged 32-create safety gate:
+// 384 MiB / 16 MiB = 24 pages.  The previous 4 MiB granularity could require
+// more than 32 real Vulkan buffer creations during one high-pressure camera
+// transition even though total resident capacity was still available.
+inline constexpr uint64_t kWar3Stage11SnapshotPageBytes = 16u << 20u;
 
 struct War3Stage11SnapshotSuballocation {
   bool valid = false;

@@ -9,7 +9,7 @@ incomplete，方向光接收器随后正确地拒绝整份候选。这能避免�
 但会表现为全体 Caster 周期性消失。
 
 本阶段没有提高 32 次门、Arena 容量或宽限期，也没有恢复跨帧
-fingerprint。它只把多个精确逻辑 slice 放入少量 4 MiB device-local 页，
+fingerprint。它只把多个精确逻辑 slice 放入少量 16 MiB device-local 页，
 使旧门限制的是实际 Vulkan 页创建而不是逻辑 Caster 数量。
 
 ## 生命周期合同
@@ -24,6 +24,10 @@ fingerprint。它只把多个精确逻辑 slice 放入少量 4 MiB device-local 
   清空当前页查找表；新 epoch 不会继续从旧页分配。
 - 活跃页总容量硬限制为 384 MiB；失败继续进入既有 producer completeness
   fail-closed，不扩大 Arena 的 384 MiB/代际和 1.125 GiB 总上限。
+- 首轮 4 MiB 候选在“生与死”隔离 smoke 中把 required omission 从 3685
+  降到 274，但 3 个压力帧仍因页创建数超过 32 而拒绝 225 个 position
+  snapshot。16 MiB 页让完整 384 MiB 代际最多创建 24 个真实 Vulkan
+  buffer，在不放宽 32 次门和驻留上限的情况下闭合该峰值。
 
 ## 诊断与验证
 

@@ -43,8 +43,9 @@ class Stage11SnapshotPagePoolStaticTest(unittest.TestCase):
 
     def test_policy_is_bounded_and_never_reuses_holes(self):
         self.assertIn("kWar3Stage11SnapshotAlignment = 256u", POLICY)
-        self.assertIn("kWar3Stage11SnapshotPageBytes = 4u << 20u", POLICY)
+        self.assertIn("kWar3Stage11SnapshotPageBytes = 16u << 20u", POLICY)
         self.assertIn("kWar3Stage11SnapshotResidentCapBytes = 384u << 20u", POLICY)
+        self.assertIn("384 MiB / 16 MiB = 24 pages", POLICY)
         self.assertIn("result.offset = alignedUsed", POLICY)
         self.assertIn("result.nextUsed = alignedUsed + alignedBytes", POLICY)
         self.assertNotIn("freeList", POLICY)
