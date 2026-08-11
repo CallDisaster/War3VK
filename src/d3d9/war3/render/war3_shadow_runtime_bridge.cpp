@@ -2089,6 +2089,22 @@ void WriteTraceFrameEvent(
      << stats.drawTimeVBCacheStaticEvictedBytes
      << ",\"drawTimeVBCacheStaticEvictedEntryCount\":"
      << stats.drawTimeVBCacheStaticEvictedEntryCount
+     << ",\"drawTimeSnapshotPageResidentBytes\":"
+     << stats.drawTimeSnapshotPageResidentBytes
+     << ",\"drawTimeSnapshotPageUsedBytes\":"
+     << stats.drawTimeSnapshotPageUsedBytes
+     << ",\"drawTimeSnapshotPageCreateCount\":"
+     << stats.drawTimeSnapshotPageCreateCount
+     << ",\"drawTimeSnapshotSuballocationCount\":"
+     << stats.drawTimeSnapshotSuballocationCount
+     << ",\"drawTimeSnapshotSuballocationBytes\":"
+     << stats.drawTimeSnapshotSuballocationBytes
+     << ",\"drawTimeSnapshotPageReclaimedCount\":"
+     << stats.drawTimeSnapshotPageReclaimedCount
+     << ",\"drawTimeSnapshotPageCapacityRejectCount\":"
+     << stats.drawTimeSnapshotPageCapacityRejectCount
+     << ",\"drawTimeSnapshotPageAllocationFailureCount\":"
+     << stats.drawTimeSnapshotPageAllocationFailureCount
      << ",\"drawTimeSemanticProducerVisibleCandidateCount\":"
      << stats.drawTimeSemanticProducerVisibleCandidateCount
      << ",\"drawTimeSemanticProducerFreshEntryCount\":"
@@ -5142,6 +5158,22 @@ ShadowProducerRuntimeDiagnostics QueryShadowProducerRuntimeDiagnostics() {
       g_shadowSceneStats.drawTimeVBCacheStaticEvictedBytes;
   summary.drawTimeVBCacheStaticEvictedEntryCount =
       g_shadowSceneStats.drawTimeVBCacheStaticEvictedEntryCount;
+  summary.drawTimeSnapshotPageResidentBytes =
+      g_shadowSceneStats.drawTimeSnapshotPageResidentBytes;
+  summary.drawTimeSnapshotPageUsedBytes =
+      g_shadowSceneStats.drawTimeSnapshotPageUsedBytes;
+  summary.drawTimeSnapshotPageCreateCount =
+      g_shadowSceneStats.drawTimeSnapshotPageCreateCount;
+  summary.drawTimeSnapshotSuballocationCount =
+      g_shadowSceneStats.drawTimeSnapshotSuballocationCount;
+  summary.drawTimeSnapshotSuballocationBytes =
+      g_shadowSceneStats.drawTimeSnapshotSuballocationBytes;
+  summary.drawTimeSnapshotPageReclaimedCount =
+      g_shadowSceneStats.drawTimeSnapshotPageReclaimedCount;
+  summary.drawTimeSnapshotPageCapacityRejectCount =
+      g_shadowSceneStats.drawTimeSnapshotPageCapacityRejectCount;
+  summary.drawTimeSnapshotPageAllocationFailureCount =
+      g_shadowSceneStats.drawTimeSnapshotPageAllocationFailureCount;
   summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
       g_shadowSceneStats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
   summary.drawTimeGenerationBackedPositionReuseCount =
@@ -7069,6 +7101,22 @@ ShadowRuntimeBridgeSummary QueryShadowRuntimeBridgeSummary(
         g_shadowSceneStats.drawTimeVBCacheStaticEvictedBytes;
     summary.drawTimeVBCacheStaticEvictedEntryCount =
         g_shadowSceneStats.drawTimeVBCacheStaticEvictedEntryCount;
+    summary.drawTimeSnapshotPageResidentBytes =
+        g_shadowSceneStats.drawTimeSnapshotPageResidentBytes;
+    summary.drawTimeSnapshotPageUsedBytes =
+        g_shadowSceneStats.drawTimeSnapshotPageUsedBytes;
+    summary.drawTimeSnapshotPageCreateCount =
+        g_shadowSceneStats.drawTimeSnapshotPageCreateCount;
+    summary.drawTimeSnapshotSuballocationCount =
+        g_shadowSceneStats.drawTimeSnapshotSuballocationCount;
+    summary.drawTimeSnapshotSuballocationBytes =
+        g_shadowSceneStats.drawTimeSnapshotSuballocationBytes;
+    summary.drawTimeSnapshotPageReclaimedCount =
+        g_shadowSceneStats.drawTimeSnapshotPageReclaimedCount;
+    summary.drawTimeSnapshotPageCapacityRejectCount =
+        g_shadowSceneStats.drawTimeSnapshotPageCapacityRejectCount;
+    summary.drawTimeSnapshotPageAllocationFailureCount =
+        g_shadowSceneStats.drawTimeSnapshotPageAllocationFailureCount;
     summary.drawTimeVBCacheIndexedUnknownRangeFallbackCount =
         g_shadowSceneStats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
     summary.drawTimeGenerationBackedPositionReuseCount =

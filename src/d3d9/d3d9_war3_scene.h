@@ -1042,6 +1042,14 @@ namespace dxvk {
         uint64_t drawTimeVBCacheStaticOverCapFrameCount = 0u;
         uint64_t drawTimeVBCacheStaticEvictedBytes = 0u;
         uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0u;
+        uint64_t drawTimeSnapshotPageResidentBytes = 0u;
+        uint64_t drawTimeSnapshotPageUsedBytes = 0u;
+        uint64_t drawTimeSnapshotPageCreateCount = 0u;
+        uint64_t drawTimeSnapshotSuballocationCount = 0u;
+        uint64_t drawTimeSnapshotSuballocationBytes = 0u;
+        uint64_t drawTimeSnapshotPageReclaimedCount = 0u;
+        uint64_t drawTimeSnapshotPageCapacityRejectCount = 0u;
+        uint64_t drawTimeSnapshotPageAllocationFailureCount = 0u;
         // Phase 7.55 v4：诊断 capture path 早退原因
         uint32_t drawTimeVBCacheRejectNoRenderablePart = 0;
         // A renderable part may contain several independent layers. Capturing

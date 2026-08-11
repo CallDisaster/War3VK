@@ -24750,6 +24750,136 @@ void D3D9DeviceEx::War3RefreshRetiredShadowSessionDiagnostics() {
       oldestRetireSerial, std::memory_order_release);
 }
 
+D3D9DeviceEx::War3Stage11SnapshotAllocationResult
+D3D9DeviceEx::War3AllocateStage11Snapshot(
+    VkDeviceSize requiredBytes,
+    std::shared_ptr<War3Stage11SnapshotPage>& outPage,
+    VkDeviceSize& outOffset, VkDeviceSize& outCapacity) {
+  using namespace dxvk::war3::render;
+  outPage.reset();
+  outOffset = 0u;
+  outCapacity = 0u;
+
+  uint64_t alignedBytes = 0u;
+  if (!War3TryAlignStage11SnapshotBytes(
+          uint64_t(requiredBytes), alignedBytes)) {
+    return War3Stage11SnapshotAllocationResult::InvalidRange;
+  }
+
+  const auto tryExistingPage = [&]() -> bool {
+    for (auto it = m_war3Stage11SnapshotPages.rbegin();
+         it != m_war3Stage11SnapshotPages.rend(); ++it) {
+      const auto plan = War3PlanStage11SnapshotSuballocation(
+          uint64_t((*it)->used), uint64_t((*it)->capacity), alignedBytes);
+      if (!plan.valid)
+        continue;
+      (*it)->used = VkDeviceSize(plan.nextUsed);
+      outPage = *it;
+      outOffset = VkDeviceSize(plan.offset);
+      outCapacity = VkDeviceSize(plan.capacity);
+      return true;
+    }
+    return false;
+  };
+
+  if (!tryExistingPage()) {
+    War3CollectUnusedStage11SnapshotPages();
+    if (!tryExistingPage()) {
+      const uint64_t pageBytes =
+          War3Stage11SnapshotPageCapacity(alignedBytes);
+      if (pageBytes == 0u || !War3Stage11SnapshotCanAddPage(
+              m_war3Stage11SnapshotResidentBytes, pageBytes)) {
+        ++m_war3Scene.shadowStats
+              .drawTimeSnapshotPageCapacityRejectCount;
+        return War3Stage11SnapshotAllocationResult::ResidentCapacity;
+      }
+      if (dxvk::war3::internal::
+              kShadowDrawTimeVBCacheAllocBudgetEnabled &&
+          m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
+              dxvk::war3::internal::
+                  kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
+        return War3Stage11SnapshotAllocationResult::PageCreateBudget;
+      }
+
+      DxvkBufferCreateInfo info = {};
+      info.size = VkDeviceSize(pageBytes);
+      info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                   VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+      info.access = VK_ACCESS_TRANSFER_WRITE_BIT |
+                    VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                    VK_ACCESS_INDEX_READ_BIT;
+      info.debugName = "War3Stage11SnapshotPage";
+      auto buffer = m_dxvkDevice->createBuffer(
+          info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      if (buffer == nullptr) {
+        ++m_war3Scene.shadowStats
+              .drawTimeSnapshotPageAllocationFailureCount;
+        return War3Stage11SnapshotAllocationResult::AllocationFailure;
+      }
+
+      auto page = std::make_shared<War3Stage11SnapshotPage>();
+      if (m_war3Stage11SnapshotNextPageId == 0u)
+        m_war3Stage11SnapshotNextPageId = 1u;
+      page->id = m_war3Stage11SnapshotNextPageId++;
+      page->buffer = std::move(buffer);
+      page->capacity = info.size;
+      m_war3Stage11SnapshotResidentBytes += pageBytes;
+      m_war3Stage11SnapshotPages.emplace_back(std::move(page));
+      ++m_war3DrawTimeVBCacheAllocBudgetThisFrame;
+      ++m_war3Scene.shadowStats.drawTimeSnapshotPageCreateCount;
+
+      if (!tryExistingPage())
+        return War3Stage11SnapshotAllocationResult::InvalidRange;
+    }
+  }
+
+  ++m_war3Scene.shadowStats.drawTimeSnapshotSuballocationCount;
+  m_war3Scene.shadowStats.drawTimeSnapshotSuballocationBytes += alignedBytes;
+  m_war3Scene.shadowStats.drawTimeSnapshotPageResidentBytes =
+      m_war3Stage11SnapshotResidentBytes;
+  uint64_t usedBytes = 0u;
+  for (const auto& page : m_war3Stage11SnapshotPages) {
+    usedBytes = page->used > std::numeric_limits<uint64_t>::max() - usedBytes
+        ? std::numeric_limits<uint64_t>::max()
+        : usedBytes + uint64_t(page->used);
+  }
+  m_war3Scene.shadowStats.drawTimeSnapshotPageUsedBytes = usedBytes;
+  return War3Stage11SnapshotAllocationResult::Success;
+}
+
+void D3D9DeviceEx::War3CollectUnusedStage11SnapshotPages() {
+  for (auto it = m_war3Stage11SnapshotPages.begin();
+       it != m_war3Stage11SnapshotPages.end();) {
+    if (it->use_count() != 1u) {
+      ++it;
+      continue;
+    }
+    const uint64_t capacity = uint64_t((*it)->capacity);
+    m_war3Stage11SnapshotResidentBytes =
+        capacity > m_war3Stage11SnapshotResidentBytes
+            ? 0u : m_war3Stage11SnapshotResidentBytes - capacity;
+    ++m_war3Stage11SnapshotReclaimedPages;
+    it = m_war3Stage11SnapshotPages.erase(it);
+  }
+  m_war3Scene.shadowStats.drawTimeSnapshotPageResidentBytes =
+      m_war3Stage11SnapshotResidentBytes;
+  m_war3Scene.shadowStats.drawTimeSnapshotPageReclaimedCount =
+      m_war3Stage11SnapshotReclaimedPages;
+}
+
+void D3D9DeviceEx::War3ResetStage11SnapshotPages() {
+  // Cache entries already moved to the fence-owned retired session keep
+  // their page references. Clearing this lookup cannot destroy an in-flight
+  // buffer and guarantees that the new map/device epoch never suballocates
+  // from an old page.
+  m_war3Stage11SnapshotPages.clear();
+  m_war3Stage11SnapshotResidentBytes = 0u;
+}
+
 void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   using namespace dxvk::war3::render;
 
@@ -24772,6 +24902,7 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   retired.persistentExpiryQueue =
       std::move(m_war3ShadowPersistentExpiryQueue);
   retired.drawTimeVbCache = std::move(m_war3DrawTimeVBCache);
+  War3ResetStage11SnapshotPages();
   retired.s1TerrainCasterStash = std::move(m_war3S1TerrainCasterStash);
   retired.s1TerrainEarlyCache = std::move(m_war3S1TerrainEarlyCache);
 
@@ -34404,6 +34535,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     m_war3Scene.shadowStats.drawTimeVBCacheStaticEvictedBytes = evictedBytes;
     m_war3Scene.shadowStats.drawTimeVBCacheStaticEvictedEntryCount =
         evictedEntries;
+    War3CollectUnusedStage11SnapshotPages();
     }
   }
   {
@@ -43384,6 +43516,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.vertexCount = lease.desc.vertexCount;
           entry.consumeVertexOffset = 0;
           entry.positionCapacity = 0u;
+          entry.positionSnapshotPage.reset();
+          entry.positionSnapshotOffset = 0u;
           entry.gpuSkinLeaseBacked = true;
           if (gpuSkinSemanticInputExact)
             entry.gpuSkinInput = gpuSkinSemanticInput;
@@ -43400,6 +43534,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.vertexCount = gpuSkinSemanticInput.desc.vertexCount;
           entry.consumeVertexOffset = 0;
           entry.positionCapacity = 0u;
+          entry.positionSnapshotPage.reset();
+          entry.positionSnapshotOffset = 0u;
           entry.gpuSkinLeaseBacked = true;
           entry.gpuSkinInput = gpuSkinSemanticInput;
         } else if (directStaticPositionSource) {
@@ -43407,6 +43543,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.positionPinnedAllocation = directStaticPositionAllocation;
           entry.positionInfo = directStaticPositionInfo;
           entry.positionCapacity = 0u;
+          entry.positionSnapshotPage.reset();
+          entry.positionSnapshotOffset = 0u;
           m_war3Scene.shadowStats.drawTimeDirectStaticPositionBindCount++;
           m_war3Scene.shadowStats.drawTimeDirectStaticPositionBytes +=
               uint64_t(posBytes);
@@ -43415,6 +43553,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.positionPinnedAllocation = directUploadPositionAllocation;
           entry.positionInfo = directUploadPositionInfo;
           entry.positionCapacity = 0u;
+          entry.positionSnapshotPage.reset();
+          entry.positionSnapshotOffset = 0u;
           m_war3Scene.shadowStats.drawTimeDirectUploadPositionBindCount++;
           m_war3Scene.shadowStats.drawTimeDirectUploadPositionBytes +=
               uint64_t(posBytes);
@@ -43482,11 +43622,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
         }
 #endif
-        if (needsNewPositionBuffer &&
-            dxvk::war3::internal::kShadowDrawTimeVBCacheAllocBudgetEnabled) {
-          if (m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
-              dxvk::war3::internal::
-                  kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
+        bool positionPageBudgetDeferred = false;
+        bool positionPageAllocationFailed = false;
+        if (needsNewPositionBuffer) {
+          std::shared_ptr<War3Stage11SnapshotPage> snapshotPage;
+          VkDeviceSize snapshotOffset = 0u;
+          VkDeviceSize snapshotCapacity = 0u;
+          const auto snapshotResult = War3AllocateStage11Snapshot(
+              posBytes, snapshotPage, snapshotOffset, snapshotCapacity);
+          if (snapshotResult ==
+              War3Stage11SnapshotAllocationResult::Success) {
+            entry.positionSnapshotPage = std::move(snapshotPage);
+            entry.positionSnapshotOffset = snapshotOffset;
+            entry.positionBuffer = entry.positionSnapshotPage->buffer;
+            entry.positionCapacity = snapshotCapacity;
+            m_war3Scene.shadowStats.drawTimeVBCachePositionAllocCount++;
+          } else if (snapshotResult ==
+                     War3Stage11SnapshotAllocationResult::PageCreateBudget) {
+            positionPageBudgetDeferred = true;
             m_war3DrawTimeVBCacheBudgetDeferredCount++;
 #if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
     WARVK_ENABLE_SHADOW_OBSERVERS_DEV
@@ -43510,36 +43663,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               }
             }
 #endif
-            // The entry may still own an older, undersized buffer. Invalidate
-            // its descriptor so this frame cannot publish stale/out-of-range
-            // backing while allocation is deferred.
-            entry.positionInfo = {};
-            War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
-            War3RecordRequiredCasterOmission(
-                vbCacheKey,
-                War3RequiredCasterOmissionReason::PositionAllocBudget);
-            break;
-          }
-        }
-        if (needsNewPositionBuffer) {
-          DxvkBufferCreateInfo posInfoCi = {};
-          posInfoCi.size = War3AlignPersistentBytes(posBytes);
-          posInfoCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-          posInfoCi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
-                             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
-          posInfoCi.access = VK_ACCESS_TRANSFER_WRITE_BIT |
-                             VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-          posInfoCi.debugName = "War3DrawTimeVBPos";
-          auto buf = m_dxvkDevice->createBuffer(
-              posInfoCi, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-          if (buf != nullptr) {
-            entry.positionBuffer = std::move(buf);
-            entry.positionCapacity = posInfoCi.size;
-            m_war3Scene.shadowStats.drawTimeVBCachePositionAllocCount++;
-            // Phase 7.123：扣减预算。
-            m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
+          } else {
+            positionPageAllocationFailed = true;
           }
         }
         if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
@@ -43549,7 +43674,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
              entry.positionCapacity < posBytes)) {
           entry.positionInfo = {};
           War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey);
-          if (needsNewPositionBuffer) {
+          if (positionPageBudgetDeferred) {
+            War3RecordRequiredCasterOmission(
+                vbCacheKey,
+                War3RequiredCasterOmissionReason::PositionAllocBudget);
+          } else if (needsNewPositionBuffer ||
+                     positionPageAllocationFailed) {
             War3RecordRequiredCasterOmission(
                 vbCacheKey,
                 War3RequiredCasterOmissionReason::AllocationFailure);
@@ -43563,9 +43693,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             !generationBackedPositionReuse) {
           auto srcBuf = posSlice.buffer();
           EmitCs([cDst = entry.positionBuffer, cSrc = srcBuf,
+                  cDstOff = entry.positionSnapshotOffset,
                   cSrcOff = posSrcOffset,
                   cBytes = posBytes](DxvkContext *ctx) {
-            ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+            ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
           });
           m_war3Scene.shadowStats.drawTimeVBCachePositionCopyCount++;
           m_war3Scene.shadowStats.drawTimeVBCachePositionCopyBytes +=
@@ -43578,7 +43709,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) {
           if (!directStaticPositionSource && !directUploadPositionSource) {
             entry.positionInfo =
-                entry.positionBuffer->getSliceInfo(0, posBytes);
+                entry.positionBuffer->getSliceInfo(
+                    entry.positionSnapshotOffset, posBytes);
           }
           if (generationBackedPositionReuse) {
             m_war3Scene.shadowStats
@@ -43596,6 +43728,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.uvBuffer = nullptr;
           entry.uvInfo = {};
           entry.uvCapacity = 0u;
+          entry.uvSnapshotPage.reset();
+          entry.uvSnapshotOffset = 0u;
         }
         entry.uvPinnedAllocation = nullptr;
         entry.uvStride = 0u;
@@ -43619,6 +43753,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.uvOffset = 0u;
           entry.uvFormat = VK_FORMAT_R32G32_SFLOAT;
           entry.uvCapacity = 0u;
+          entry.uvSnapshotPage.reset();
+          entry.uvSnapshotOffset = 0u;
         } else if (gpuSkinOutputHasUv) {
           entry.uvSharesPositionBuffer = true;
           entry.uvBuffer = entry.positionBuffer;
@@ -43627,6 +43763,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.uvStride = entry.positionStride;
           entry.uvOffset = 24u;
           entry.uvFormat = VK_FORMAT_R32G32_SFLOAT;
+          entry.uvSnapshotPage = entry.positionSnapshotPage;
+          entry.uvSnapshotOffset = entry.positionSnapshotOffset;
           m_war3Scene.shadowStats.drawTimeVBCacheUvSharedPositionCount++;
         } else if (!gpuSkinIrreversibleBypass) {
           // Format 0 不包含 UV payload，因此保留原有 source-UV capture；
@@ -43657,6 +43795,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 entry.uvBuffer = entry.positionBuffer;
                 entry.uvPinnedAllocation = entry.positionPinnedAllocation;
                 entry.uvInfo = entry.positionInfo;
+                entry.uvSnapshotPage = entry.positionSnapshotPage;
+                entry.uvSnapshotOffset = entry.positionSnapshotOffset;
                 m_war3Scene.shadowStats
                     .drawTimeVBCacheUvSharedPositionCount++;
               } else {
@@ -43743,6 +43883,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                       entry.uvPinnedAllocation = directUploadUvAllocation;
                       entry.uvInfo = directUploadUvInfo;
                       entry.uvCapacity = 0u;
+                      entry.uvSnapshotPage.reset();
+                      entry.uvSnapshotOffset = 0u;
                       m_war3Scene.shadowStats
                           .drawTimeDirectUploadUvBindCount++;
                       m_war3Scene.shadowStats.drawTimeDirectUploadUvBytes +=
@@ -43751,40 +43893,28 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     if (!directUploadUvSource &&
                         (entry.uvBuffer == nullptr ||
                          entry.uvCapacity < uvBytes)) {
-                    // Phase 7.123：UV buffer alloc 也扣预算（同帧多次 alloc
-                    // 才是真正的卡点）。如果预算耗尽就保留 entry 现有 uvBuffer
-                    // 状态（可能是 nullptr → 下游 alpha-test 暂时不可用，但
-                    // position 已经 ready，可以照常画硬阴影）。
-                      if (dxvk::war3::internal::
-                            kShadowDrawTimeVBCacheAllocBudgetEnabled &&
-                        m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
-                            dxvk::war3::internal::
-                          kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
-                      m_war3DrawTimeVBCacheBudgetDeferredCount++;
-                      mandatoryUvBudgetDeferred = true;
-                    } else {
-                    DxvkBufferCreateInfo uvCi = {};
-                    uvCi.size = War3AlignPersistentBytes(uvBytes);
-                    uvCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-                    uvCi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
-                                  VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
-                    uvCi.access = VK_ACCESS_TRANSFER_WRITE_BIT |
-                                  VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-                    uvCi.debugName = "War3DrawTimeVBUv";
-                    auto uvBuf = m_dxvkDevice->createBuffer(
-                        uvCi, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                    if (uvBuf != nullptr) {
-                      entry.uvBuffer = std::move(uvBuf);
-                      entry.uvCapacity = uvCi.size;
-                      m_war3Scene.shadowStats.drawTimeVBCacheUvAllocCount++;
-                      // Phase 7.123：扣 UV alloc 预算。
-                      m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
-                    } else {
-                      mandatoryUvAllocationFailed = true;
-                    }
-                    } // end Phase 7.123 budget else
+                      std::shared_ptr<War3Stage11SnapshotPage> snapshotPage;
+                      VkDeviceSize snapshotOffset = 0u;
+                      VkDeviceSize snapshotCapacity = 0u;
+                      const auto snapshotResult = War3AllocateStage11Snapshot(
+                          uvBytes, snapshotPage, snapshotOffset,
+                          snapshotCapacity);
+                      if (snapshotResult ==
+                          War3Stage11SnapshotAllocationResult::Success) {
+                        entry.uvSnapshotPage = std::move(snapshotPage);
+                        entry.uvSnapshotOffset = snapshotOffset;
+                        entry.uvBuffer = entry.uvSnapshotPage->buffer;
+                        entry.uvCapacity = snapshotCapacity;
+                        m_war3Scene.shadowStats
+                            .drawTimeVBCacheUvAllocCount++;
+                      } else if (snapshotResult ==
+                          War3Stage11SnapshotAllocationResult::
+                              PageCreateBudget) {
+                        ++m_war3DrawTimeVBCacheBudgetDeferredCount;
+                        mandatoryUvBudgetDeferred = true;
+                      } else {
+                        mandatoryUvAllocationFailed = true;
+                      }
                     }
                     const bool generationBackedUvReuse =
                         generationBackedStaticCandidate &&
@@ -43799,9 +43929,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                         !generationBackedUvReuse) {
                     auto uvSrcBuf = uvSrcSlice.buffer();
                     EmitCs([cDst = entry.uvBuffer, cSrc = uvSrcBuf,
+                            cDstOff = entry.uvSnapshotOffset,
                             cSrcOff = uvSrcOffset,
                             cBytes = uvBytes](DxvkContext* ctx) {
-                      ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+                      ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
                     });
                     m_war3Scene.shadowStats.drawTimeVBCacheUvCopyCount++;
                     m_war3Scene.shadowStats.drawTimeVBCacheUvCopyBytes +=
@@ -43815,7 +43946,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     }
                     if (!directUploadUvSource) {
                       entry.uvInfo =
-                          entry.uvBuffer->getSliceInfo(0, uvBytes);
+                          entry.uvBuffer->getSliceInfo(
+                              entry.uvSnapshotOffset, uvBytes);
                     }
                     entry.uvStride = uvStride;
                     entry.uvOffset = uvElem->Offset;
@@ -43898,6 +44030,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               entry.indexPinnedAllocation = directStaticIndexAllocation;
               entry.indexInfo = directStaticIndexInfo;
               entry.indexCapacity = 0u;
+              entry.indexSnapshotPage.reset();
+              entry.indexSnapshotOffset = 0u;
               m_war3Scene.shadowStats.drawTimeDirectStaticIndexBindCount++;
               m_war3Scene.shadowStats.drawTimeDirectStaticIndexBytes +=
                   uint64_t(idxBytes);
@@ -43906,6 +44040,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               entry.indexPinnedAllocation = directUploadIndexAllocation;
               entry.indexInfo = directUploadIndexInfo;
               entry.indexCapacity = 0u;
+              entry.indexSnapshotPage.reset();
+              entry.indexSnapshotOffset = 0u;
               m_war3Scene.shadowStats.drawTimeDirectUploadIndexBindCount++;
               m_war3Scene.shadowStats.drawTimeDirectUploadIndexBytes +=
                   uint64_t(idxBytes);
@@ -43913,38 +44049,27 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             if (!directStaticIndexSource && !directUploadIndexSource &&
                 (entry.indexBuffer == nullptr ||
                  entry.indexCapacity < idxBytes)) {
-              // Phase 7.123：IB alloc 也扣预算。预算耗尽时跳过 IB alloc，
-              // 整条 entry 留作"无 IB 状态"。下游消费者看到 indexBuffer ==
-              // nullptr 会跳过这次 caster 提交，第二帧补齐。
-              if (dxvk::war3::internal::
-                      kShadowDrawTimeVBCacheAllocBudgetEnabled &&
-                  m_war3DrawTimeVBCacheAllocBudgetThisFrame >=
-                      dxvk::war3::internal::
-                          kShadowDrawTimeVBCacheAllocBudgetPerFrame) {
-                m_war3DrawTimeVBCacheBudgetDeferredCount++;
+              std::shared_ptr<War3Stage11SnapshotPage> snapshotPage;
+              VkDeviceSize snapshotOffset = 0u;
+              VkDeviceSize snapshotCapacity = 0u;
+              const auto snapshotResult = War3AllocateStage11Snapshot(
+                  idxBytes, snapshotPage, snapshotOffset,
+                  snapshotCapacity);
+              if (snapshotResult ==
+                  War3Stage11SnapshotAllocationResult::Success) {
+                entry.indexSnapshotPage = std::move(snapshotPage);
+                entry.indexSnapshotOffset = snapshotOffset;
+                entry.indexBuffer = entry.indexSnapshotPage->buffer;
+                entry.indexCapacity = snapshotCapacity;
+                m_war3Scene.shadowStats
+                    .drawTimeVBCacheIndexAllocCount++;
+              } else if (snapshotResult ==
+                  War3Stage11SnapshotAllocationResult::PageCreateBudget) {
+                ++m_war3DrawTimeVBCacheBudgetDeferredCount;
                 indexBudgetDeferred = true;
               } else {
-                DxvkBufferCreateInfo idxInfoCi = {};
-                idxInfoCi.size = War3AlignPersistentBytes(idxBytes);
-                idxInfoCi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-                idxInfoCi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT |
-                                   VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
-                idxInfoCi.access = VK_ACCESS_TRANSFER_WRITE_BIT |
-                                   VK_ACCESS_INDEX_READ_BIT;
-                idxInfoCi.debugName = "War3DrawTimeVBIdx";
-                auto idxBuf = m_dxvkDevice->createBuffer(
-                    idxInfoCi, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                if (idxBuf != nullptr) {
-                  entry.indexBuffer = std::move(idxBuf);
-                  entry.indexCapacity = idxInfoCi.size;
-                  m_war3Scene.shadowStats.drawTimeVBCacheIndexAllocCount++;
-                  // Phase 7.123：扣 IB alloc 预算。
-                  m_war3DrawTimeVBCacheAllocBudgetThisFrame++;
-                } else {
-                  indexAllocationFailed = true;
-                }
-              } // end Phase 7.123 budget else
+                indexAllocationFailed = true;
+              }
             }
             if (directStaticIndexSource || directUploadIndexSource ||
                 (entry.indexBuffer != nullptr &&
@@ -43953,9 +44078,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   !generationBackedIndexReuse) {
               auto idxSrcBuf = drawTimeIndexSlice.buffer();
               EmitCs([cDst = entry.indexBuffer, cSrc = idxSrcBuf,
+                      cDstOff = entry.indexSnapshotOffset,
                       cSrcOff = idxSrcOffset,
                       cBytes = idxBytes](DxvkContext *ctx) {
-                ctx->copyBuffer(cDst, 0, cSrc, cSrcOff, cBytes);
+                ctx->copyBuffer(cDst, cDstOff, cSrc, cSrcOff, cBytes);
               });
               m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyCount++;
               m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyBytes +=
@@ -43969,7 +44095,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               }
               if (!directStaticIndexSource && !directUploadIndexSource) {
                 entry.indexInfo =
-                    entry.indexBuffer->getSliceInfo(0, idxBytes);
+                    entry.indexBuffer->getSliceInfo(
+                        entry.indexSnapshotOffset, idxBytes);
               }
               entry.indexed = true;
               entry.indexCount = CountVal;

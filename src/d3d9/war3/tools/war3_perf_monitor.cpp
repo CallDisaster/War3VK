@@ -1279,6 +1279,22 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.drawTimeVBCacheStaticEvictedBytes;
   agg.drawTimeVBCacheStaticEvictedEntryCount +=
       stats.drawTimeVBCacheStaticEvictedEntryCount;
+  agg.drawTimeSnapshotPageResidentBytesLast =
+      stats.drawTimeSnapshotPageResidentBytes;
+  agg.drawTimeSnapshotPageUsedBytesLast =
+      stats.drawTimeSnapshotPageUsedBytes;
+  agg.drawTimeSnapshotPageCreateCount +=
+      stats.drawTimeSnapshotPageCreateCount;
+  agg.drawTimeSnapshotSuballocationCount +=
+      stats.drawTimeSnapshotSuballocationCount;
+  agg.drawTimeSnapshotSuballocationBytes +=
+      stats.drawTimeSnapshotSuballocationBytes;
+  agg.drawTimeSnapshotPageReclaimedCountLast =
+      stats.drawTimeSnapshotPageReclaimedCount;
+  agg.drawTimeSnapshotPageCapacityRejectCount +=
+      stats.drawTimeSnapshotPageCapacityRejectCount;
+  agg.drawTimeSnapshotPageAllocationFailureCount +=
+      stats.drawTimeSnapshotPageAllocationFailureCount;
   agg.drawTimeVBCacheIndexedUnknownRangeFallbackCount +=
       stats.drawTimeVBCacheIndexedUnknownRangeFallbackCount;
   agg.totalBudgetBytes += stats.fallbackBudgetBytes;
@@ -6034,6 +6050,22 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeVBCacheStaticEvictedBytes << ",\n";
   json << "    \"drawTimeVBCacheStaticEvictedEntryCount\": "
        << shadowAgg.drawTimeVBCacheStaticEvictedEntryCount << ",\n";
+  json << "    \"drawTimeSnapshotPageResidentBytesLast\": "
+       << shadowAgg.drawTimeSnapshotPageResidentBytesLast << ",\n";
+  json << "    \"drawTimeSnapshotPageUsedBytesLast\": "
+       << shadowAgg.drawTimeSnapshotPageUsedBytesLast << ",\n";
+  json << "    \"drawTimeSnapshotPageCreateCount\": "
+       << shadowAgg.drawTimeSnapshotPageCreateCount << ",\n";
+  json << "    \"drawTimeSnapshotSuballocationCount\": "
+       << shadowAgg.drawTimeSnapshotSuballocationCount << ",\n";
+  json << "    \"drawTimeSnapshotSuballocationBytes\": "
+       << shadowAgg.drawTimeSnapshotSuballocationBytes << ",\n";
+  json << "    \"drawTimeSnapshotPageReclaimedCountLast\": "
+       << shadowAgg.drawTimeSnapshotPageReclaimedCountLast << ",\n";
+  json << "    \"drawTimeSnapshotPageCapacityRejectCount\": "
+       << shadowAgg.drawTimeSnapshotPageCapacityRejectCount << ",\n";
+  json << "    \"drawTimeSnapshotPageAllocationFailureCount\": "
+       << shadowAgg.drawTimeSnapshotPageAllocationFailureCount << ",\n";
   json << "    \"drawTimeVBCacheIndexedUnknownRangeFallbackCount\": "
        << shadowAgg.drawTimeVBCacheIndexedUnknownRangeFallbackCount << ",\n";
   json << "    \"framesBudgetExceeded\": " << shadowAgg.framesBudgetExceeded

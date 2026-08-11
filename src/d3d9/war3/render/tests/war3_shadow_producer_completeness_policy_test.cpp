@@ -4,6 +4,7 @@
 #include "../war3_shadow_generation_backed_stream.h"
 #include "../war3_shadow_pinned_upload_policy.h"
 #include "../war3_shadow_stage11_allocation_observer.h"
+#include "../war3_stage11_snapshot_page_policy.h"
 
 #include <algorithm>
 #include <array>
@@ -140,6 +141,39 @@ bool testStage11AllocationClassification() {
       ClassifyWar3Stage11PositionAllocation(
           true, true, 8192u, 4096u, true) == Class::GpuSkinLeaseDetach,
       "Stage11 position-allocation observer classification changed");
+}
+
+bool testStage11SnapshotPagePolicy() {
+  constexpr uint64_t mib = 1024u * 1024u;
+  uint64_t aligned = 0u;
+  if (!require(!policy::War3TryAlignStage11SnapshotBytes(0u, aligned) &&
+                   aligned == 0u &&
+                   policy::War3TryAlignStage11SnapshotBytes(257u, aligned) &&
+                   aligned == 512u,
+               "snapshot alignment accepted an empty range or misaligned"))
+    return false;
+  if (!require(policy::War3Stage11SnapshotPageCapacity(1u) == 4u * mib &&
+                   policy::War3Stage11SnapshotPageCapacity(5u * mib) ==
+                       8u * mib &&
+                   policy::War3Stage11SnapshotPageCapacity(385u * mib) == 0u,
+               "snapshot page sizing escaped its bounded policy"))
+    return false;
+
+  const auto first = policy::War3PlanStage11SnapshotSuballocation(
+      0u, 4u * mib, 1000u);
+  const auto second = policy::War3PlanStage11SnapshotSuballocation(
+      first.nextUsed, 4u * mib, 257u);
+  const auto overflow = policy::War3PlanStage11SnapshotSuballocation(
+      4u * mib - 128u, 4u * mib, 256u);
+  return require(first.valid && first.offset == 0u &&
+                     first.capacity == 1024u && second.valid &&
+                     second.offset == 1024u && second.capacity == 512u &&
+                     !overflow.valid &&
+                     policy::War3Stage11SnapshotCanAddPage(
+                         380u * mib, 4u * mib) &&
+                     !policy::War3Stage11SnapshotCanAddPage(
+                         381u * mib, 4u * mib),
+                 "snapshot page cursor reused or exceeded a physical range");
 }
 
 bool testPinnedUploadRange() {
@@ -337,6 +371,7 @@ int main() {
       testProtectedWorkingSetLru() &&
       testGenerationObservationClock() &&
       testStage11AllocationClassification() &&
+      testStage11SnapshotPagePolicy() &&
       testPinnedUploadRange() &&
       testRequiredCasterHardAdmissionIsOrderIndependent() &&
       testGenerationBackedStreamProof() &&

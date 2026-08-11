@@ -46,6 +46,7 @@
 #include "d3d9_war3_ssao.h"
 #include "war3/shadow/war3_shadow_backend_dxvk.h"
 #include "war3/render/war3_shadow_generation_backed_stream.h"
+#include "war3/render/war3_stage11_snapshot_page_policy.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_d3d9_observe_owner.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.h"
 #include <type_traits>
@@ -2546,6 +2547,24 @@ private:
   uint64_t m_war3SemanticDrawTimePoseDirtyFrameSerial = 0;
   uint64_t m_war3SemanticLastMatrixPublisherPoseRevision = 0;
   std::vector<uint64_t> m_war3SemanticDrawTimePoseKeys;
+  struct War3Stage11SnapshotPage {
+    uint64_t id = 0u;
+    Rc<DxvkBuffer> buffer;
+    VkDeviceSize capacity = 0u;
+    VkDeviceSize used = 0u;
+  };
+  enum class War3Stage11SnapshotAllocationResult : uint8_t {
+    Success,
+    PageCreateBudget,
+    ResidentCapacity,
+    AllocationFailure,
+    InvalidRange,
+  };
+  std::vector<std::shared_ptr<War3Stage11SnapshotPage>>
+      m_war3Stage11SnapshotPages;
+  uint64_t m_war3Stage11SnapshotNextPageId = 1u;
+  uint64_t m_war3Stage11SnapshotResidentBytes = 0u;
+  uint64_t m_war3Stage11SnapshotReclaimedPages = 0u;
   // Phase 7.55 v4：draw-time VB position cache（GPU copy 自有 buffer 版本）。
   // ring buffer 问题：保存 Rc<DxvkBuffer> 引用不够——War3 后续 draw 会覆盖
   // 同一 buffer 的不同 offset，cache 里的引用 read 时拿到的是错乱数据。
@@ -2575,6 +2594,8 @@ private:
     // 读取 xyz。
     Rc<DxvkBuffer> positionBuffer;
     Rc<DxvkResourceAllocation> positionPinnedAllocation;
+    std::shared_ptr<War3Stage11SnapshotPage> positionSnapshotPage;
+    VkDeviceSize positionSnapshotOffset = 0u;
     DxvkResourceBufferInfo positionInfo = {};
     uint32_t positionStride = 0u;
     uint32_t positionOffset = 0u;
@@ -2593,6 +2614,8 @@ private:
     // index buffer（未 rebase；index 值仍指向原 vertex 编号空间）
     Rc<DxvkBuffer> indexBuffer;
     Rc<DxvkResourceAllocation> indexPinnedAllocation;
+    std::shared_ptr<War3Stage11SnapshotPage> indexSnapshotPage;
+    VkDeviceSize indexSnapshotOffset = 0u;
     DxvkResourceBufferInfo indexInfo = {};
     VkIndexType indexType = VK_INDEX_TYPE_UINT16;
     uint32_t indexCount = 0u;
@@ -2678,6 +2701,8 @@ private:
     // 与 position stream 相同，复用 positionBuffer；否则单独 GPU copy 一份。
     Rc<DxvkBuffer> uvBuffer;
     Rc<DxvkResourceAllocation> uvPinnedAllocation;
+    std::shared_ptr<War3Stage11SnapshotPage> uvSnapshotPage;
+    VkDeviceSize uvSnapshotOffset = 0u;
     DxvkResourceBufferInfo uvInfo = {};
     uint32_t uvStride = 0u;
     uint32_t uvOffset = 0u;
@@ -2987,6 +3012,12 @@ private:
       uint32_t persistentGeometryId);
   void War3GcS1TerrainEarlyCache();
   void War3GcS1GenerationProofObservations();
+  War3Stage11SnapshotAllocationResult War3AllocateStage11Snapshot(
+      VkDeviceSize requiredBytes,
+      std::shared_ptr<War3Stage11SnapshotPage>& outPage,
+      VkDeviceSize& outOffset, VkDeviceSize& outCapacity);
+  void War3CollectUnusedStage11SnapshotPages();
+  void War3ResetStage11SnapshotPages();
   void War3TryCaptureShadowCaster(D3DPRIMITIVETYPE PrimitiveType,
                                   INT BaseVertexIndex, UINT MinVertexIndex,
                                   UINT NumVertices, UINT StartVal,

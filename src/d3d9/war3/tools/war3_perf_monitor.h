@@ -625,6 +625,14 @@ private:
         uint64_t drawTimeVBCacheStaticOverCapFrameCountLast = 0;
         uint64_t drawTimeVBCacheStaticEvictedBytes = 0;
         uint64_t drawTimeVBCacheStaticEvictedEntryCount = 0;
+        uint64_t drawTimeSnapshotPageResidentBytesLast = 0;
+        uint64_t drawTimeSnapshotPageUsedBytesLast = 0;
+        uint64_t drawTimeSnapshotPageCreateCount = 0;
+        uint64_t drawTimeSnapshotSuballocationCount = 0;
+        uint64_t drawTimeSnapshotSuballocationBytes = 0;
+        uint64_t drawTimeSnapshotPageReclaimedCountLast = 0;
+        uint64_t drawTimeSnapshotPageCapacityRejectCount = 0;
+        uint64_t drawTimeSnapshotPageAllocationFailureCount = 0;
         uint64_t drawTimeVBCacheIndexedUnknownRangeFallbackCount = 0;
         uint64_t framesBudgetExceeded = 0;
         uint64_t framesReuseLastComplete = 0;
