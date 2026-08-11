@@ -16,6 +16,8 @@ namespace dxvk {
 #endif
 
   struct DxvkDeviceAddressBindingMatch {
+    static constexpr uint32_t ObjectNameCapacity = 96u;
+
     uint32_t faultInfoIndex = 0u;
     uint32_t sequence = 0u;
     VkDeviceAddressBindingTypeEXT bindingType =
@@ -25,6 +27,15 @@ namespace dxvk {
     VkDeviceSize size = 0u;
     VkObjectType objectType = VK_OBJECT_TYPE_UNKNOWN;
     uint64_t objectHandle = 0u;
+    std::array<char, ObjectNameCapacity> objectName = { };
+    bool latestForObjectRange = false;
+    bool hasPreviousEvent = false;
+    uint32_t previousSequence = 0u;
+    VkDeviceAddressBindingTypeEXT previousBindingType =
+      VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT;
+    bool hasPriorBind = false;
+    uint32_t priorBindSequence = 0u;
+    uint32_t nameSourceSequence = 0u;
   };
 
   struct DxvkDeviceAddressBindingSnapshot {
@@ -86,6 +97,9 @@ namespace dxvk {
     };
 
     struct Slot {
+      static constexpr uint32_t ObjectNameWordCount =
+        DxvkDeviceAddressBindingMatch::ObjectNameCapacity / sizeof(uint32_t);
+
       std::atomic<uint32_t> guard = { 0u };
       std::atomic<uint32_t> bindingType = { 0u };
       std::atomic<uint32_t> flags = { 0u };
@@ -93,7 +107,11 @@ namespace dxvk {
       AtomicU64 size = { };
       std::atomic<uint32_t> objectType = { 0u };
       AtomicU64 objectHandle = { };
+      std::array<std::atomic<uint32_t>, ObjectNameWordCount> objectName = { };
     };
+
+    static_assert(DxvkDeviceAddressBindingMatch::ObjectNameCapacity %
+      sizeof(uint32_t) == 0u);
 
     bool readSlot(uint32_t index,
       DxvkDeviceAddressBindingMatch& event) const noexcept;

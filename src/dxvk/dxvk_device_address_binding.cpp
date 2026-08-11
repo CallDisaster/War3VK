@@ -36,6 +36,21 @@ namespace dxvk {
       upper = address.reportedAddress | mask;
     }
 
+
+    bool SameObjectRange(const DxvkDeviceAddressBindingMatch& lhs,
+                         const DxvkDeviceAddressBindingMatch& rhs) noexcept {
+      return lhs.faultInfoIndex == rhs.faultInfoIndex &&
+        lhs.objectType == rhs.objectType &&
+        lhs.objectHandle == rhs.objectHandle &&
+        lhs.baseAddress == rhs.baseAddress &&
+        lhs.size == rhs.size;
+    }
+
+
+    bool HasObjectName(const DxvkDeviceAddressBindingMatch& event) noexcept {
+      return event.objectName[0] != '\0';
+    }
+
   }
 
 
@@ -96,6 +111,23 @@ namespace dxvk {
       : static_cast<uint32_t>(VK_OBJECT_TYPE_UNKNOWN),
       std::memory_order_relaxed);
     slot.objectHandle.store(object ? object->objectHandle : 0u);
+    std::array<char, DxvkDeviceAddressBindingMatch::ObjectNameCapacity>
+      objectName = { };
+    if (object && object->pObjectName) {
+      for (uint32_t index = 0u; index + 1u < objectName.size() &&
+           object->pObjectName[index] != '\0'; ++index)
+        objectName[index] = object->pObjectName[index];
+    }
+    for (uint32_t wordIndex = 0u;
+         wordIndex < Slot::ObjectNameWordCount; ++wordIndex) {
+      uint32_t word = 0u;
+      for (uint32_t byteIndex = 0u; byteIndex < sizeof(uint32_t); ++byteIndex) {
+        const uint32_t nameIndex = wordIndex * sizeof(uint32_t) + byteIndex;
+        word |= static_cast<uint32_t>(
+          static_cast<uint8_t>(objectName[nameIndex])) << (byteIndex * 8u);
+      }
+      slot.objectName[wordIndex].store(word, std::memory_order_relaxed);
+    }
     slot.guard.store(sequence << 1u, std::memory_order_release);
     SaturatingIncrement(m_observedEventCount);
   }
@@ -118,6 +150,17 @@ namespace dxvk {
     event.objectType = static_cast<VkObjectType>(
       slot.objectType.load(std::memory_order_relaxed));
     event.objectHandle = slot.objectHandle.load();
+    for (uint32_t wordIndex = 0u;
+         wordIndex < Slot::ObjectNameWordCount; ++wordIndex) {
+      const uint32_t word = slot.objectName[wordIndex].load(
+        std::memory_order_relaxed);
+      for (uint32_t byteIndex = 0u; byteIndex < sizeof(uint32_t); ++byteIndex) {
+        const uint32_t nameIndex = wordIndex * sizeof(uint32_t) + byteIndex;
+        event.objectName[nameIndex] = static_cast<char>(
+          (word >> (byteIndex * 8u)) & 0xffu);
+      }
+    }
+    event.objectName.back() = '\0';
 
     const uint32_t after = slot.guard.load(std::memory_order_acquire);
     return before == after && !(after & 1u);
@@ -169,21 +212,78 @@ namespace dxvk {
         event.faultInfoIndex = faultIndex;
         matchingEventCount += 1u;
 
-        uint32_t insert = std::min(result.matchCount,
-          DxvkDeviceAddressBindingSnapshot::MaxMatches - 1u);
-        if (result.matchCount < DxvkDeviceAddressBindingSnapshot::MaxMatches)
-          result.matchCount += 1u;
-        else if (event.sequence <= result.matches[insert].sequence)
-          break;
-
-        while (insert &&
-               result.matches[insert - 1u].sequence < event.sequence) {
-          result.matches[insert] = result.matches[insert - 1u];
-          insert -= 1u;
+        uint32_t existing = result.matchCount;
+        for (uint32_t index = 0u; index < result.matchCount; ++index) {
+          if (SameObjectRange(result.matches[index], event)) {
+            existing = index;
+            break;
+          }
         }
-        result.matches[insert] = event;
+
+        if (existing < result.matchCount) {
+          if (event.sequence > result.matches[existing].sequence)
+            result.matches[existing] = event;
+          break;
+        }
+
+        if (result.matchCount < DxvkDeviceAddressBindingSnapshot::MaxMatches) {
+          result.matches[result.matchCount++] = event;
+          break;
+        }
+
+        uint32_t oldest = 0u;
+        for (uint32_t index = 1u; index < result.matchCount; ++index) {
+          if (result.matches[index].sequence < result.matches[oldest].sequence)
+            oldest = index;
+        }
+        if (event.sequence > result.matches[oldest].sequence)
+          result.matches[oldest] = event;
         break;
       }
+    }
+
+    std::sort(result.matches.begin(),
+      result.matches.begin() + result.matchCount,
+      [] (const auto& lhs, const auto& rhs) {
+        return lhs.sequence > rhs.sequence;
+      });
+
+    // The first pass retains only the newest overlapping event for each exact
+    // object/range key. A bounded second pass attaches prior lifecycle context
+    // without allocating or treating unrelated aliased objects as one owner.
+    for (uint32_t matchIndex = 0u;
+         matchIndex < result.matchCount; ++matchIndex) {
+      auto& match = result.matches[matchIndex];
+      match.latestForObjectRange = true;
+      for (uint32_t slotIndex = 0u; slotIndex < Capacity; ++slotIndex) {
+        DxvkDeviceAddressBindingMatch previous = { };
+        if (!readSlot(slotIndex, previous))
+          continue;
+        previous.faultInfoIndex = match.faultInfoIndex;
+        if (!SameObjectRange(match, previous) ||
+            previous.sequence >= match.sequence)
+          continue;
+
+        if (!match.hasPreviousEvent ||
+            previous.sequence > match.previousSequence) {
+          match.hasPreviousEvent = true;
+          match.previousSequence = previous.sequence;
+          match.previousBindingType = previous.bindingType;
+        }
+        if (previous.bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT &&
+            (!match.hasPriorBind ||
+             previous.sequence > match.priorBindSequence)) {
+          match.hasPriorBind = true;
+          match.priorBindSequence = previous.sequence;
+        }
+        if (!HasObjectName(match) && HasObjectName(previous) &&
+            previous.sequence > match.nameSourceSequence) {
+          match.objectName = previous.objectName;
+          match.nameSourceSequence = previous.sequence;
+        }
+      }
+      if (HasObjectName(match) && !match.nameSourceSequence)
+        match.nameSourceSequence = match.sequence;
     }
 
     result.truncated = result.truncated ||

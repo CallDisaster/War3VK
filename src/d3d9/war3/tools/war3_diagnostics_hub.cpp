@@ -474,6 +474,18 @@ void WriteGpuIncidentSnapshot(const GpuIncidentSnapshot& incident) {
         {"size", match.size},
         {"objectType", static_cast<int64_t>(match.objectType)},
         {"objectHandle", match.objectHandle},
+        {"objectName", BoundedDeviceFaultText(
+            match.objectName.data(), match.objectName.size())},
+        {"latestForObjectRange", match.latestForObjectRange},
+        {"latestState", match.bindingType ==
+            VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT ? "bound" : "unbound"},
+        {"hasPreviousEvent", match.hasPreviousEvent},
+        {"previousSequence", match.previousSequence},
+        {"previousBindingType",
+         static_cast<int64_t>(match.previousBindingType)},
+        {"hasPriorBind", match.hasPriorBind},
+        {"priorBindSequence", match.priorBindSequence},
+        {"nameSourceSequence", match.nameSourceSequence},
     });
   }
   deviceFaultPayload["addressBindingReport"] =

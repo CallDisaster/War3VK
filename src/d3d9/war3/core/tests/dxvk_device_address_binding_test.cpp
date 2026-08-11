@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <new>
+#include <string>
 
 namespace {
 
@@ -16,11 +17,12 @@ bool check(bool value, const char* message) {
 }
 
 VkDebugUtilsObjectNameInfoEXT objectInfo(
-    VkObjectType type, uint64_t handle) {
+    VkObjectType type, uint64_t handle, const char* name = nullptr) {
   VkDebugUtilsObjectNameInfoEXT result = {
     VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
   result.objectType = type;
   result.objectHandle = handle;
+  result.pObjectName = name;
   return result;
 }
 
@@ -115,10 +117,52 @@ bool testRingIsBoundedAndAllocationFree() {
     check(snapshot.observedEventCount ==
         dxvk::DxvkDeviceAddressBindingTracker::Capacity + 8u,
       "bounded ring lost its monotonic event count") &&
-    check(snapshot.matchCount ==
-        dxvk::DxvkDeviceAddressBindingSnapshot::MaxMatches,
-      "bounded correlation did not clamp matches") &&
+    check(snapshot.matchCount == 1u,
+      "exact lifecycle correlation did not collapse repeated events") &&
     check(snapshot.truncated, "wrapped/match-clamped ring was not marked truncated");
+}
+
+bool testLatestLifecycleAndOwnedObjectName() {
+  auto& bindingTracker = tracker();
+  bindingTracker.resetForInstance(true);
+  bindingTracker.setDeviceFeatureEnabled(true);
+
+  char mutableName[] = "War3ShadowArena";
+  const auto image = objectInfo(VK_OBJECT_TYPE_IMAGE, 0x5555u, mutableName);
+  const auto bind = bindingInfo(0x8000u, 0x1000u,
+    VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+  const auto unbind = bindingInfo(0x8000u, 0x1000u,
+    VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
+  bindingTracker.record(bind, &image);
+  bindingTracker.record(unbind, &image);
+  mutableName[0] = 'X';
+
+  const auto buffer = objectInfo(
+    VK_OBJECT_TYPE_BUFFER, 0x6666u, "War3DrawTimeVBPos");
+  bindingTracker.record(bind, &buffer);
+
+  const auto fault = faultInfo(0x8888u, 0x100u);
+  const auto snapshot = bindingTracker.correlate(&fault, 1u);
+  return check(snapshot.matchCount == 2u,
+      "lifecycle correlation did not collapse an exact object/range") &&
+    check(snapshot.matches[0].objectHandle == 0x6666u &&
+        snapshot.matches[0].bindingType ==
+          VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT,
+      "latest live object was not ordered first") &&
+    check(snapshot.matches[0].latestForObjectRange,
+      "latest live object was not marked as latest") &&
+    check(snapshot.matches[1].objectHandle == 0x5555u &&
+        snapshot.matches[1].bindingType ==
+          VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT,
+      "latest retired object state was not retained") &&
+    check(snapshot.matches[1].hasPreviousEvent &&
+        snapshot.matches[1].previousBindingType ==
+          VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT &&
+        snapshot.matches[1].hasPriorBind,
+      "prior bind lifecycle was not attached") &&
+    check(std::string(snapshot.matches[1].objectName.data()) ==
+        "War3ShadowArena",
+      "callback object name was not copied by value");
 }
 
 }
@@ -147,5 +191,6 @@ int main() {
   passed = testInactiveTrackerDoesNotRecord() && passed;
   passed = testFaultPrecisionAndLatestEventCorrelation() && passed;
   passed = testRingIsBoundedAndAllocationFree() && passed;
+  passed = testLatestLifecycleAndOwnedObjectName() && passed;
   return passed ? 0 : 1;
 }

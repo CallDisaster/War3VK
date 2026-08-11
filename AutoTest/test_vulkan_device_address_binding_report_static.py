@@ -103,6 +103,9 @@ class DeviceAddressBindingReportStaticTests(unittest.TestCase):
             self.tracker_h,
         )
         self.assertIn("MaxMatches = 32u", self.tracker_h)
+        self.assertIn("ObjectNameCapacity = 96u", self.tracker_h)
+        self.assertIn("std::array<std::atomic<uint32_t>", self.tracker_h)
+        self.assertIn("object->pObjectName", record)
 
     def test_fault_correlation_uses_khronos_precision_contract(self) -> None:
         self.assertIn("address.reportedAddress & ~mask", self.tracker_cpp)
@@ -113,8 +116,17 @@ class DeviceAddressBindingReportStaticTests(unittest.TestCase):
         for field in (
             '"observedEventCount"', '"droppedEventCount"', '"matches"',
             '"baseAddress"', '"objectHandle"',
+            '"objectName"', '"latestState"', '"previousBindingType"',
+            '"priorBindSequence"',
         ):
             self.assertIn(field, self.diagnostics)
+
+    def test_correlation_reports_latest_exact_lifecycle(self) -> None:
+        self.assertIn("SameObjectRange", self.tracker_cpp)
+        self.assertIn("latestForObjectRange = true", self.tracker_cpp)
+        self.assertIn("previous.sequence > match.previousSequence", self.tracker_cpp)
+        self.assertIn("previous.sequence > match.priorBindSequence", self.tracker_cpp)
+        self.assertIn("VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT", self.tracker_cpp)
 
     def test_callback_path_does_not_write_incidents_or_query_faults(self) -> None:
         combined = self.instance + self.tracker_cpp
