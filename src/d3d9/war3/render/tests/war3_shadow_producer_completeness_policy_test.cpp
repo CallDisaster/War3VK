@@ -57,7 +57,7 @@ bool testProtectedWorkingSetLru() {
   constexpr uint64_t inactiveTarget = 64u * mib;
   std::vector<Entry> entries = {
       {3u, frame, 48u * mib}, {2u, frame - 1u, 40u * mib},
-      {9u, frame - 10u, 40u * mib}, {5u, frame - 10u, 40u * mib},
+      {9u, frame - 20u, 40u * mib}, {5u, frame - 20u, 40u * mib},
   };
   uint64_t protectedBytes = 0u;
   uint64_t inactiveBytes = 0u;
@@ -99,6 +99,21 @@ bool testProtectedWorkingSetLru() {
   return require(evicted.size() == 1u && evicted[0] == 5u &&
                      entries.size() == 3u,
                  "inactive LRU tie-break was not deterministic/protected");
+}
+
+bool testGenerationObservationClock() {
+  policy::War3ShadowGenerationObservationClock clock = {};
+  return require(
+      policy::AdvanceWar3ShadowGenerationObservationClock(clock, 0u) == 0u &&
+          policy::AdvanceWar3ShadowGenerationObservationClock(clock, 100u) ==
+              1u &&
+          policy::AdvanceWar3ShadowGenerationObservationClock(clock, 100u) ==
+              1u &&
+          policy::AdvanceWar3ShadowGenerationObservationClock(clock, 104u) ==
+              2u &&
+          policy::AdvanceWar3ShadowGenerationObservationClock(clock, 110u) ==
+              3u,
+      "sparse Present serials did not form adjacent producer observations");
 }
 
 bool testRequiredCasterHardAdmissionIsOrderIndependent() {
@@ -277,6 +292,7 @@ bool testGenerationBackedStabilityProbation() {
 int main() {
   return testProducerCompletenessStampAndSaturation() &&
       testProtectedWorkingSetLru() &&
+      testGenerationObservationClock() &&
       testRequiredCasterHardAdmissionIsOrderIndependent() &&
       testGenerationBackedStreamProof() &&
       testGenerationBackedStabilityProbation() ? 0 : 1;

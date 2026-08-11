@@ -25,6 +25,8 @@ PERF_CPP = (ROOT / "src/d3d9/war3/tools/war3_perf_monitor.cpp").read_text(
 class S1GenerationProofObserveStaticTest(unittest.TestCase):
     def test_observer_is_value_semantic_and_two_distinct_frames(self):
         self.assertIn("War3ShadowGenerationBackedGeometryProof", PROOF_H)
+        self.assertIn("War3ShadowGenerationObservationClock", PROOF_H)
+        self.assertIn("AdvanceWar3ShadowGenerationObservationClock", PROOF_H)
         self.assertIn("frameSerial == state.lastObservedFrame", PROOF_H)
         self.assertIn("frameSerial != state.lastObservedFrame + 1u", PROOF_H)
         self.assertIn("state.distinctStableFrames >= requiredDistinctFrames", PROOF_H)
@@ -48,6 +50,11 @@ class S1GenerationProofObserveStaticTest(unittest.TestCase):
         ]
         self.assertIn("s1GenerationProof.valid()", observe)
         self.assertIn("ObserveWar3ShadowGenerationStability", observe)
+        self.assertIn("AdvanceWar3ShadowGenerationObservationClock", observe)
+        self.assertNotIn(
+            "const uint64_t observationFrame =\n            m_war3ShadowPersistentFrameSerial + 1u;",
+            observe,
+        )
         self.assertIn("!alphaTestEnabled && !alphaBlend", observe)
 
     def test_observer_does_not_enable_persistent_or_arena_consume(self):
@@ -68,6 +75,7 @@ class S1GenerationProofObserveStaticTest(unittest.TestCase):
             DEVICE_CPP.index("void D3D9DeviceEx::", DEVICE_CPP.index("void D3D9DeviceEx::War3ResetShadowSessionState") + 10)
         ]
         self.assertIn("m_war3S1GenerationProofObservations.clear()", reset)
+        self.assertIn("m_war3S1GenerationProofObservationClock = {}", reset)
         self.assertIn("m_war3S1GenerationProofLastGcFrame = 0u", reset)
 
     def test_diagnostics_reach_perf_json(self):

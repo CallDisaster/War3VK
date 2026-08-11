@@ -24710,6 +24710,7 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3S1TerrainEarlyPersistentBackedCount = 0u;
   m_war3S1TerrainEarlyFallbackBackedCount = 0u;
   m_war3S1TerrainEarlyLogicalReferencedBytes = 0u;
+  m_war3S1GenerationProofObservationClock = {};
   m_war3S1GenerationProofLastGcFrame = 0u;
   m_war3S1TerrainStashBuiltFrameSerial = 0u;
   m_war3S1TerrainStashCaptureFrameSerial = 0u;
@@ -46510,7 +46511,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             m_war3S1GenerationProofObservations.try_emplace(observationKey);
         (void)inserted;
         const uint64_t observationFrame =
-            m_war3ShadowPersistentFrameSerial + 1u;
+            dxvk::war3::render::
+                AdvanceWar3ShadowGenerationObservationClock(
+                    m_war3S1GenerationProofObservationClock,
+                    m_war3ShadowPersistentFrameSerial + 1u);
         const auto result =
             dxvk::war3::render::ObserveWar3ShadowGenerationStability(
                 it->second.state, s1GenerationProof, observationFrame);

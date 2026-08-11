@@ -75,6 +75,29 @@ struct War3ShadowGenerationStabilityState {
   uint32_t distinctStableFrames = 0u;
 };
 
+// Presents are not Warcraft world-production frames: the native renderer can
+// present the same world several times before Stage11 runs again.  Compress
+// the sparse Present serials into a monotonic observation clock so "adjacent"
+// below means adjacent observed producer batches, not adjacent swapchain
+// presents. Multiple S1 draws from one producer batch share one serial.
+struct War3ShadowGenerationObservationClock {
+  uint64_t sourceFrameSerial = 0u;
+  uint64_t observationFrameSerial = 0u;
+};
+
+constexpr uint64_t AdvanceWar3ShadowGenerationObservationClock(
+    War3ShadowGenerationObservationClock& clock,
+    uint64_t sourceFrameSerial) noexcept {
+  if (sourceFrameSerial == 0u)
+    return 0u;
+  if (clock.sourceFrameSerial == sourceFrameSerial)
+    return clock.observationFrameSerial;
+  clock.sourceFrameSerial = sourceFrameSerial;
+  if (clock.observationFrameSerial != UINT64_MAX)
+    ++clock.observationFrameSerial;
+  return clock.observationFrameSerial;
+}
+
 enum class War3ShadowGenerationObservation : uint8_t {
   Invalid = 0u,
   First,

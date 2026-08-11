@@ -2834,6 +2834,8 @@ private:
   };
   std::unordered_map<uint64_t, War3S1GenerationProofObservationEntry>
       m_war3S1GenerationProofObservations;
+  dxvk::war3::render::War3ShadowGenerationObservationClock
+      m_war3S1GenerationProofObservationClock = {};
   uint64_t m_war3S1GenerationProofLastGcFrame = 0u;
   // One persistent geometry can back multiple S1 tiles because the persistent
   // key may omit worldMatrix while the early key includes it. Keep a one-to-many

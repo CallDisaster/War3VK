@@ -4,10 +4,13 @@
 
 namespace dxvk::war3::render {
 
-// The GC runs before producer/Present handoff can finish observing every
-// Stage11 entry.  Protect a deliberately short recent window instead of
-// treating the inactive 64 MiB target as permission to evict live geometry.
-constexpr uint64_t kWar3ShadowDrawTimeStaticRecentProtectFrames = 2u;
+// Warcraft can submit several Present calls between two world-producer
+// batches.  Keep the recent static window aligned with the existing 16-frame
+// dynamic-cache safety horizon so a still-visible Stage11 working set cannot
+// become inactive merely because GC ran between two native world updates.
+// This remains deliberately short: the 64 MiB inactive target still governs
+// geometry that has actually left the active producer window.
+constexpr uint64_t kWar3ShadowDrawTimeStaticRecentProtectFrames = 16u;
 
 constexpr bool IsWar3ShadowDrawTimeStaticWorkingSetProtected(
     uint64_t lastAccessFrame, uint64_t currentFrame) noexcept {
