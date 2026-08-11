@@ -30,3 +30,18 @@ bounds. The A/B and the corrected direct-span implementation are documented in
   evidence does not exist.
 - The direct-span coherent REAL candidate is still development-only and needs
   a longer stability gate plus foreground visual confirmation.
+
+## Exact-domain cache follow-up
+
+A complete-key POD cache removed repeated exact index-domain scans without
+retaining resource ownership or physical bindings. Development-only B-A-B-A
+reports measured `ResourceResolve` at `0.523 / 0.742 / 0.536 / 0.731 ms` for
+on/off/on/off, respectively. The average improvement is about `0.207 ms/frame`
+and all four reports kept producer-incomplete and budget-exceeded frames at
+zero. A larger table did not improve the roughly 21% hit rate, so the final
+candidate retains the original bounded 1,024-entry table. Release remains Off
+pending foreground visual review.
+
+The final 1,024-entry binary repeated the result at `0.511 ms/frame` over
+7,200 frames (`07_55_31`) with zero incomplete/budget frames, GPU incidents or
+new driver events. AutoTest restored the stable deployed DLL after the gate.

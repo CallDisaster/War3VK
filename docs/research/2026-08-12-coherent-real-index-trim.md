@@ -144,3 +144,47 @@ The p95 target is met, but the instantaneous peak remains above the desired
 128 MiB target. The route therefore remains development-only and needs a
 foreground visual gate plus further peak reduction before any Release default
 decision.
+
+## Generation-backed exact-domain reuse
+
+The remaining `ResourceResolve` cost was the repeated min/max scan over the
+current index span. A development-only cache now reuses only that derived POD
+domain. Its key includes map/device epoch, buffer owner and mapped address,
+identity/allocation/content generation, span length, index width/count,
+base-vertex and position capacity. Every lookup therefore starts after the
+current readable span and all generations have been revalidated. The cache
+does not retain CPU bytes, a resource owner, a `DxvkBuffer` slice or a Vulkan
+binding, and cannot restore the retired cross-frame fingerprint route.
+
+The same development DLL exposes
+`DXVK_WAR3_COHERENT_REAL_DOMAIN_CACHE=0/1` only when coherent REAL development
+support is compiled. Release cannot reach either the trim route or this cache.
+Four 7,200-frame isolated reports formed a B-A-B-A sequence:
+
+| Report | Cache | ResourceResolve | Calls/frame | Incomplete/budget exceeded |
+| --- | --- | ---: | ---: | ---: |
+| `07_35_17` | on | 0.523 ms | 94.620 | 0 / 0 |
+| `07_42_30` | off | 0.742 ms | 90.384 | 0 / 0 |
+| `07_46_36` | on | 0.536 ms | 94.553 | 0 / 0 |
+| `07_49_55` | off | 0.731 ms | 92.782 | 0 / 0 |
+
+The two on runs save about `0.207 ms/frame` against the two off runs even
+though they perform more measured resolve calls. They record roughly 685k
+lookups and 145k hits each (about 21%). Enlarging the table from 1,024 to
+16,384 entries did not materially change the hit count because most misses
+carry a genuinely different content generation. The final source therefore
+keeps the 1,024-entry deterministic set-associative table instead of spending
+additional TLS memory for false capacity. No TDR, new GPU event, incident,
+producer-incomplete frame or budget-exceeded frame occurred in these runs.
+
+This proves an isolated relative CPU win for the generation-backed lookup. It
+does not prove foreground FPS or visual acceptance, and does not authorize a
+Release default.
+
+The final 1,024-entry build (`917B1503...E44`) was then run independently in
+`AutoTest/artifacts/life_and_death_tdr/20260812_075326`; report
+`war3_perf_report_auto_2026_08_12_07_55_31.html` measured
+`ResourceResolve=0.511 ms/frame` at 96.656 calls/frame, with 148,036 hits from
+699,675 lookups. All 7,200 report frames again had zero producer-incomplete or
+budget-exceeded frames, and the run created no GPU event or incident. The
+stable deployed DLL was restored to SHA-256 `79CA8DB4...B2A4` afterward.

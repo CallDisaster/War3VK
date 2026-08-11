@@ -3187,6 +3187,15 @@ War3CoherentRealIndexTrimModeRuntime() {
   return s_mode;
 }
 
+inline bool War3CoherentRealDomainCacheRuntime() {
+  if constexpr (!dxvk::war3::memory::
+                    kCoherentRealIndexTrimDevelopmentEnabled)
+    return false;
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_COHERENT_REAL_DOMAIN_CACHE", 1u) == 1u;
+  return s_enabled;
+}
+
 inline bool War3Stage11DirectUploadSourceRuntime() {
   if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
     return false;
@@ -46892,11 +46901,27 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         positionCapacity64 <=
             uint64_t(std::numeric_limits<uint32_t>::max())) {
       dxvk::war3::memory::War3ExactIndexVertexDomain exactDomain = {};
-      const bool useObserverDomainCache =
+      const bool useBoundsObserverDomainCache =
           exactIndexedTerrainBoundsAuditSample &&
           !exactIndexedFreezeTrimCandidate;
+      // The coherent REAL route already rebuilds a current mapped span and
+      // revalidates owner plus identity/allocation/content generations before
+      // every draw. Reuse only the derived POD min/max domain when that full
+      // immutable key still matches. No CPU pointer, DxvkBuffer slice or
+      // Vulkan binding is retained by this cache.
+      const bool useCoherentRealDomainCache =
+          coherentRealTrimScanCandidate &&
+          coherentRealTrimMode == CoherentRealTrimMode::Consume &&
+          War3CoherentRealDomainCacheRuntime() &&
+          !exactIndexedFreezeTrimCandidate;
+      const bool useGenerationBackedDomainCache =
+          useBoundsObserverDomainCache || useCoherentRealDomainCache;
       bool observerDomainCacheHit = false;
-      if (useObserverDomainCache) {
+      if (useGenerationBackedDomainCache) {
+        // The useful hits are repeated draws inside the current generation,
+        // while most misses are genuine content-generation changes. Keep the
+        // table small and bounded: a 16K-entry A/B produced the same hit count
+        // as this 1024-entry table and only increased TLS residency.
         using ObserverCache = dxvk::war3::memory::
             War3ExactIndexDomainObserverCache<256u, 4u>;
         using Lookup = dxvk::war3::memory::
@@ -46947,8 +46972,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
         }
       }
-      if (!useObserverDomainCache || !observerDomainCacheHit) {
-        if (!useObserverDomainCache) {
+      if (!useGenerationBackedDomainCache || !observerDomainCacheHit) {
+        if (!useGenerationBackedDomainCache) {
           exactDomain =
               dxvk::war3::memory::ComputeWar3ExactIndexVertexDomainPrepared({
                   exactIndexSpan, indexElementBytes, CountVal,

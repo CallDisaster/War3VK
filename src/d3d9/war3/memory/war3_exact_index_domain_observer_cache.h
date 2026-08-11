@@ -95,10 +95,12 @@ enum class War3ExactIndexDomainObserverStore : uint8_t {
   Replaced,
 };
 
-// Small fixed, set-associative cache for the development bounds observer.
-// It stores only a derived POD domain and never resource ownership. The
-// replacement order is deterministic: first invalid way, otherwise least
-// recently used with the lowest way index as the tie-break.
+// Small fixed, set-associative cache for development exact-domain consumers.
+// It stores only a derived POD domain and never resource ownership, mapped
+// bytes or a Vulkan binding. Every lookup therefore still starts from a
+// current readable span and its complete generation key. The replacement
+// order is deterministic: first invalid way, otherwise least recently used
+// with the lowest way index as the tie-break.
 template <size_t SetCount = 256u, size_t WayCount = 4u>
 class War3ExactIndexDomainObserverCache {
   static_assert(SetCount != 0u && (SetCount & (SetCount - 1u)) == 0u);

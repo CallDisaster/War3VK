@@ -49,6 +49,15 @@ class CoherentRealIndexTrimStaticTest(unittest.TestCase):
         runtime = function_body(DEVICE, "War3CoherentRealIndexTrimModeRuntime()")
         self.assertIn("kCoherentRealIndexTrimDevelopmentEnabled", runtime)
         self.assertIn("War3CoherentRealIndexTrimMode::Off", runtime)
+        cache_runtime = function_body(
+            DEVICE, "inline bool War3CoherentRealDomainCacheRuntime()"
+        )
+        self.assertIn("kCoherentRealIndexTrimDevelopmentEnabled", cache_runtime)
+        self.assertIn("return false", cache_runtime)
+        self.assertIn(
+            'War3GetEnvU32("DXVK_WAR3_COHERENT_REAL_DOMAIN_CACHE", 1u)',
+            cache_runtime,
+        )
 
     def test_contract_is_current_rigid_opaque_terrain_only(self):
         body = function_body(HEADER, "EvaluateWar3CoherentRealIndexTrim(")
@@ -97,6 +106,44 @@ class CoherentRealIndexTrimStaticTest(unittest.TestCase):
         self.assertLess(consume, budget)
         self.assertLess(budget, reserve)
         self.assertIn("posBytesNeeded = VkDeviceSize(count * posStride)", body)
+
+    def test_consume_reuses_only_generation_backed_pod_index_domain(self):
+        body = function_body(DEVICE, "void D3D9DeviceEx::War3TryCaptureShadowCaster(")
+        cache_gate = body.index("const bool useCoherentRealDomainCache")
+        cache_key = body.index("War3ExactIndexDomainObserverKey cacheKey", cache_gate)
+        lookup = body.index("s_observerDomainCache.lookup(cacheKey", cache_key)
+        scan = body.index("ComputeWar3ExactIndexVertexDomainPrepared", lookup)
+        store = body.index("s_observerDomainCache.store(cacheKey", scan)
+        self.assertLess(cache_gate, cache_key)
+        self.assertLess(cache_key, lookup)
+        self.assertLess(lookup, scan)
+        self.assertLess(scan, store)
+        for token in (
+            "mapEpoch()",
+            "m_war3GpuSkinDeviceEpoch",
+            "exactIndexSpan.ownerIdentity",
+            "reinterpret_cast<uintptr_t>(exactIndexSpan.data)",
+            "exactIndexSpan.identityGeneration",
+            "exactIndexSpan.allocationGeneration",
+            "exactIndexSpan.contentGeneration",
+            "exactIndexSpan.length",
+            "indexElementBytes",
+            "CountVal",
+            "BaseVertexIndex",
+            "uint32_t(positionCapacity64)",
+        ):
+            self.assertIn(token, body[cache_key:lookup])
+        self.assertIn("!exactIndexedFreezeTrimCandidate", body[cache_gate:cache_key])
+        self.assertIn(
+            "War3CoherentRealDomainCacheRuntime()", body[cache_gate:cache_key]
+        )
+        self.assertIn("War3ExactIndexDomainObserverCache<256u, 4u>", body)
+        cache_header = (
+            ROOT / "src/d3d9/war3/memory/war3_exact_index_domain_observer_cache.h"
+        ).read_text(encoding="utf-8")
+        self.assertIn("derived POD domain", cache_header)
+        self.assertNotIn("Rc<DxvkBuffer", cache_header)
+        self.assertNotIn("VkBuffer", cache_header)
 
     def test_diagnostics_are_bounded_counters(self):
         for token in (
