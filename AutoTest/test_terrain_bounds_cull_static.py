@@ -20,13 +20,20 @@ class TerrainBoundsCullContracts(unittest.TestCase):
         device = DEVICE.read_text(encoding="utf-8")
         shadow = SHADOW.read_text(encoding="utf-8")
         self.assertIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", device)
-        self.assertIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", device)
         self.assertIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", shadow)
         self.assertIn("War3TerrainBoundsCullMode::Off", shadow)
-        runtime = shadow.split("War3TerrainBoundsCullModeRuntime", 1)[1].split(
-            "War3ShadowTaaMode", 1
-        )[0]
-        self.assertNotIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", runtime)
+        for source, end_marker in (
+            (device, "enum class War3ProducerClaimObserveMode"),
+            (shadow, "War3ShadowTaaMode"),
+        ):
+            runtime = source.split(
+                "War3TerrainBoundsCullModeRuntime", 1
+            )[1].split(end_marker, 1)[0]
+            self.assertIn("kDevelopmentShadowObserversEnabled", runtime)
+            self.assertIn("ParseShadowObserverBuildMode", runtime)
+            self.assertIn("War3ShadowObserverBuildMode::Observe", runtime)
+            self.assertNotIn("War3TerrainBoundsCullMode::Consume", runtime)
+            self.assertNotIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", runtime)
 
     def test_only_exact_current_bounds_can_authorize_culling(self) -> None:
         policy = POLICY.read_text(encoding="utf-8")

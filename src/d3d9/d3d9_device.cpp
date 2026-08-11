@@ -22,6 +22,7 @@
 #include "war3/render/war3_shadow_drawtime_cache_policy.h"
 #include "war3/render/war3_shadow_lifecycle.h"
 #include "war3/render/war3_shadow_object_registry.h"
+#include "war3/render/war3_shadow_observer_build_policy.h"
 #include "war3/render/war3_shadow_producer_policy.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
 #include "war3/render/war3_terrain_bounds_provenance.h"
@@ -3112,24 +3113,14 @@ inline bool War3ShadowCapturePostBreakdownRuntime() {
 
 inline dxvk::war3::render::War3TerrainBoundsCullMode
 War3TerrainBoundsCullModeRuntime() {
-  if constexpr (dxvk::war3::internal::
-                    kReleaseFreezeExperimentalShadowRoutes)
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
     return dxvk::war3::render::War3TerrainBoundsCullMode::Off;
-  static const auto s_mode = [] {
-    const char* mode = std::getenv("DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE");
-    if (mode != nullptr && mode[0] != '\0') {
-      return static_cast<dxvk::war3::render::War3TerrainBoundsCullMode>(
-          std::min<uint32_t>(War3GetEnvU32(
-                                 "DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", 0u),
-                             2u));
-    }
-    // Compatibility: the old boolean explicitly requested the historical
-    // direct-consume experiment.
-    return War3GetEnvU32("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", 0u) != 0u
-        ? dxvk::war3::render::War3TerrainBoundsCullMode::Consume
-        : dxvk::war3::render::War3TerrainBoundsCullMode::Off;
-  }();
-  return s_mode;
+  static const auto mode =
+      dxvk::war3::render::ParseShadowObserverBuildMode(War3GetEnvU32(
+          "DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE", 0u));
+  return mode == dxvk::war3::render::War3ShadowObserverBuildMode::Observe
+      ? dxvk::war3::render::War3TerrainBoundsCullMode::Observe
+      : dxvk::war3::render::War3TerrainBoundsCullMode::Off;
 }
 
 enum class War3ProducerClaimObserveMode : uint8_t {

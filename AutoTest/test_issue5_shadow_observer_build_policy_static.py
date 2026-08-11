@@ -12,6 +12,7 @@ POLICY = (
     ROOT / "src/d3d9/war3/render/war3_shadow_observer_build_policy.h"
 ).read_text(encoding="utf-8")
 SHADOW = (ROOT / "src/d3d9/d3d9_war3_shadow.cpp").read_text(encoding="utf-8")
+DEVICE = (ROOT / "src/d3d9/d3d9_device.cpp").read_text(encoding="utf-8")
 INTERNAL = (
     ROOT / "src/d3d9/war3/core/war3_internal_test_config.h"
 ).read_text(encoding="utf-8")
@@ -70,10 +71,16 @@ class Issue5ShadowObserverBuildPolicyStaticTests(unittest.TestCase):
 
     def test_runtime_entrypoints_share_observe_only_policy(self):
         union = function_body(SHADOW, "War3UnionCullModeRuntime")
-        terrain = function_body(SHADOW, "War3TerrainBoundsCullModeRuntime")
+        terrain_consumer = function_body(
+            SHADOW, "War3TerrainBoundsCullModeRuntime"
+        )
+        terrain_producer = function_body(
+            DEVICE, "War3TerrainBoundsCullModeRuntime"
+        )
         for runtime, variable in (
             (union, "DXVK_WAR3_UNION_CONSUMER_CULL_MODE"),
-            (terrain, "DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE"),
+            (terrain_consumer, "DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE"),
+            (terrain_producer, "DXVK_WAR3_CSM_TERRAIN_BOUNDS_MODE"),
         ):
             self.assertIn("kDevelopmentShadowObserversEnabled", runtime)
             self.assertIn("ParseShadowObserverBuildMode", runtime)
@@ -81,8 +88,11 @@ class Issue5ShadowObserverBuildPolicyStaticTests(unittest.TestCase):
             self.assertIn("::Observe", runtime)
             self.assertIn("::Off", runtime)
             self.assertNotIn("::Consume", runtime)
-        self.assertNotIn("DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", terrain)
-        self.assertNotIn("EnvFlagDefault", terrain)
+        for terrain_runtime in (terrain_consumer, terrain_producer):
+            self.assertNotIn(
+                "DXVK_WAR3_CSM_TERRAIN_BOUNDS_CULL", terrain_runtime
+            )
+            self.assertNotIn("EnvFlagDefault", terrain_runtime)
 
     def test_release_freeze_and_consume_denials_remain_intact(self):
         self.assertIn(
