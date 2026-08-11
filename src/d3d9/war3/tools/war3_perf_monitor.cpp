@@ -1354,6 +1354,14 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.drawTimePositionProofUniqueBytes;
   agg.drawTimePositionProofDuplicateBytes +=
       stats.drawTimePositionProofDuplicateBytes;
+  agg.drawTimeDirectStaticPositionBindCount +=
+      stats.drawTimeDirectStaticPositionBindCount;
+  agg.drawTimeDirectStaticPositionBytes +=
+      stats.drawTimeDirectStaticPositionBytes;
+  agg.drawTimeDirectStaticIndexBindCount +=
+      stats.drawTimeDirectStaticIndexBindCount;
+  agg.drawTimeDirectStaticIndexBytes +=
+      stats.drawTimeDirectStaticIndexBytes;
   agg.drawTimeVBCacheRejectNoLayerContext +=
       stats.drawTimeVBCacheRejectNoLayerContext;
   agg.drawTimeVBCacheSameFrameDedupMiss +=
@@ -6091,6 +6099,14 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimePositionProofUniqueBytes << ",\n";
   json << "    \"drawTimePositionProofDuplicateBytes\": "
        << shadowAgg.drawTimePositionProofDuplicateBytes << ",\n";
+  json << "    \"drawTimeDirectStaticPositionBindCount\": "
+       << shadowAgg.drawTimeDirectStaticPositionBindCount << ",\n";
+  json << "    \"drawTimeDirectStaticPositionBytes\": "
+       << shadowAgg.drawTimeDirectStaticPositionBytes << ",\n";
+  json << "    \"drawTimeDirectStaticIndexBindCount\": "
+       << shadowAgg.drawTimeDirectStaticIndexBindCount << ",\n";
+  json << "    \"drawTimeDirectStaticIndexBytes\": "
+       << shadowAgg.drawTimeDirectStaticIndexBytes << ",\n";
   json << "    \"drawTimeVBCacheRejectNoLayerContext\": "
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "
@@ -7461,6 +7477,14 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimePositionProofUniqueBytes << ",\n";
   json << "    \"drawTimePositionProofDuplicateBytes\": "
        << shadowAgg.drawTimePositionProofDuplicateBytes << ",\n";
+  json << "    \"drawTimeDirectStaticPositionBindCount\": "
+       << shadowAgg.drawTimeDirectStaticPositionBindCount << ",\n";
+  json << "    \"drawTimeDirectStaticPositionBytes\": "
+       << shadowAgg.drawTimeDirectStaticPositionBytes << ",\n";
+  json << "    \"drawTimeDirectStaticIndexBindCount\": "
+       << shadowAgg.drawTimeDirectStaticIndexBindCount << ",\n";
+  json << "    \"drawTimeDirectStaticIndexBytes\": "
+       << shadowAgg.drawTimeDirectStaticIndexBytes << ",\n";
   json << "    \"drawTimeVBCacheRejectNoLayerContext\": "
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "

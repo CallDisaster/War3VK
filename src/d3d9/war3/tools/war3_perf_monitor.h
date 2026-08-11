@@ -739,6 +739,10 @@ private:
         uint64_t drawTimePositionProofSetOverflowCount = 0;
         uint64_t drawTimePositionProofUniqueBytes = 0;
         uint64_t drawTimePositionProofDuplicateBytes = 0;
+        uint64_t drawTimeDirectStaticPositionBindCount = 0;
+        uint64_t drawTimeDirectStaticPositionBytes = 0;
+        uint64_t drawTimeDirectStaticIndexBindCount = 0;
+        uint64_t drawTimeDirectStaticIndexBytes = 0;
         uint64_t drawTimeVBCacheRejectNoLayerContext = 0;
         uint64_t drawTimeVBCacheSameFrameDedupMiss = 0;
         uint64_t drawTimeGenerationBackedPositionReuseCount = 0;

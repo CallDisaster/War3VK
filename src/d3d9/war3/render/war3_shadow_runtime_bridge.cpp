@@ -2209,6 +2209,14 @@ void WriteTraceFrameEvent(
      << stats.drawTimePositionProofUniqueBytes
      << ",\"drawTimePositionProofDuplicateBytes\":"
      << stats.drawTimePositionProofDuplicateBytes
+     << ",\"drawTimeDirectStaticPositionBindCount\":"
+     << stats.drawTimeDirectStaticPositionBindCount
+     << ",\"drawTimeDirectStaticPositionBytes\":"
+     << stats.drawTimeDirectStaticPositionBytes
+     << ",\"drawTimeDirectStaticIndexBindCount\":"
+     << stats.drawTimeDirectStaticIndexBindCount
+     << ",\"drawTimeDirectStaticIndexBytes\":"
+     << stats.drawTimeDirectStaticIndexBytes
      << ",\"drawTimeVBCacheUvCopyCount\":"
      << stats.drawTimeVBCacheUvCopyCount
      << ",\"drawTimeVBCacheUvCopyBytes\":"

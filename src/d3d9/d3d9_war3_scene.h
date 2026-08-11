@@ -760,6 +760,10 @@ namespace dxvk {
         uint32_t drawTimePositionProofSetOverflowCount = 0;
         uint64_t drawTimePositionProofUniqueBytes = 0u;
         uint64_t drawTimePositionProofDuplicateBytes = 0u;
+        uint32_t drawTimeDirectStaticPositionBindCount = 0;
+        uint64_t drawTimeDirectStaticPositionBytes = 0u;
+        uint32_t drawTimeDirectStaticIndexBindCount = 0;
+        uint64_t drawTimeDirectStaticIndexBytes = 0u;
         uint32_t drawTimeVBCacheUvCopyCount = 0;
         uint64_t drawTimeVBCacheUvCopyBytes = 0;
         uint32_t drawTimeVBCacheUvSharedPositionCount = 0;

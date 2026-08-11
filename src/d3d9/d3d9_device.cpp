@@ -3132,6 +3132,14 @@ inline bool War3Stage11AllocationObserverRuntime() {
   return s_enabled;
 }
 
+inline bool War3Stage11DirectStaticSourceRuntime() {
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
+    return false;
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", 0u) == 1u;
+  return s_enabled;
+}
+
 enum class War3ProducerClaimObserveMode : uint8_t {
   Off = 0u,
   Observe = 1u,
@@ -42599,6 +42607,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 : makeDirectStreamProof(
                       posCommon, uint64_t(posSrcOffset), uint64_t(posBytes),
                       posStride, posStride, ShadowStreamKind::Position);
+        const bool directStaticPositionSource =
+            War3Stage11DirectStaticSourceRuntime() &&
+            generationBackedStaticCandidate && !DynamicSysmemVBOs &&
+            currentPositionSourceProof.valid() &&
+            posSlice.buffer() != nullptr;
         GenerationBackedStreamProof currentIndexSourceProof = {};
         if (indexed) {
           if (DynamicSysmemIBO &&
@@ -43202,6 +43215,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.positionCapacity = 0u;
           entry.gpuSkinLeaseBacked = true;
           entry.gpuSkinInput = gpuSkinSemanticInput;
+        } else if (directStaticPositionSource) {
+          entry.positionBuffer = posSlice.buffer();
+          entry.positionInfo = entry.positionBuffer->getSliceInfo(
+              posSrcOffset, posBytes);
+          entry.positionCapacity = 0u;
+          m_war3Scene.shadowStats.drawTimeDirectStaticPositionBindCount++;
+          m_war3Scene.shadowStats.drawTimeDirectStaticPositionBytes +=
+              uint64_t(posBytes);
         }
 
         drawTimeCaptureTiming.enter(
@@ -43225,6 +43246,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         // 同步阻塞。已存在足够 capacity 的 entry 直接走，不消耗预算。
         const bool needsNewPositionBuffer =
             !gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
+            !directStaticPositionSource &&
             (entry.positionBuffer == nullptr ||
              entry.positionCapacity < posBytes);
 #if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
@@ -43322,6 +43344,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
         }
         if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
+            !directStaticPositionSource &&
             (entry.positionBuffer == nullptr ||
              entry.positionCapacity < posBytes)) {
           entry.positionInfo = {};
@@ -43335,6 +43358,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           break;
         }
         if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
+            !directStaticPositionSource &&
             !generationBackedPositionReuse) {
           auto srcBuf = posSlice.buffer();
           EmitCs([cDst = entry.positionBuffer, cSrc = srcBuf,
@@ -43351,8 +43375,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
         }
         if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) {
-          entry.positionInfo =
-              entry.positionBuffer->getSliceInfo(0, posBytes);
+          if (!directStaticPositionSource) {
+            entry.positionInfo =
+                entry.positionBuffer->getSliceInfo(0, posBytes);
+          }
           if (generationBackedPositionReuse) {
             m_war3Scene.shadowStats
                 .drawTimeGenerationBackedPositionReuseCount++;
@@ -43613,11 +43639,25 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           const VkDeviceSize idxSrcOffset =
               drawTimeIndexSlice.offset() + drawTimeIndexRangeOffset;
           const VkDeviceSize idxBytes = drawTimeIndexRangeBytes;
+          const bool directStaticIndexSource =
+              War3Stage11DirectStaticSourceRuntime() &&
+              generationBackedStaticCandidate && !DynamicSysmemIBO &&
+              currentIndexSourceProof.valid();
           if (drawTimeIndexRangeOffset <= drawTimeIndexSlice.length() &&
               idxBytes <=
                   drawTimeIndexSlice.length() - drawTimeIndexRangeOffset) {
-            if (entry.indexBuffer == nullptr ||
-                entry.indexCapacity < idxBytes) {
+            if (directStaticIndexSource) {
+              entry.indexBuffer = drawTimeIndexSlice.buffer();
+              entry.indexInfo = entry.indexBuffer->getSliceInfo(
+                  idxSrcOffset, idxBytes);
+              entry.indexCapacity = 0u;
+              m_war3Scene.shadowStats.drawTimeDirectStaticIndexBindCount++;
+              m_war3Scene.shadowStats.drawTimeDirectStaticIndexBytes +=
+                  uint64_t(idxBytes);
+            }
+            if (!directStaticIndexSource &&
+                (entry.indexBuffer == nullptr ||
+                 entry.indexCapacity < idxBytes)) {
               // Phase 7.123：IB alloc 也扣预算。预算耗尽时跳过 IB alloc，
               // 整条 entry 留作"无 IB 状态"。下游消费者看到 indexBuffer ==
               // nullptr 会跳过这次 caster 提交，第二帧补齐。
@@ -43651,9 +43691,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 }
               } // end Phase 7.123 budget else
             }
-            if (entry.indexBuffer != nullptr &&
-                entry.indexCapacity >= idxBytes) {
-              if (!generationBackedIndexReuse) {
+            if (directStaticIndexSource ||
+                (entry.indexBuffer != nullptr &&
+                 entry.indexCapacity >= idxBytes)) {
+              if (!directStaticIndexSource &&
+                  !generationBackedIndexReuse) {
               auto idxSrcBuf = drawTimeIndexSlice.buffer();
               EmitCs([cDst = entry.indexBuffer, cSrc = idxSrcBuf,
                       cSrcOff = idxSrcOffset,
@@ -43670,7 +43712,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     .drawTimeGenerationBackedCopyBytesSaved +=
                         uint64_t(idxBytes);
               }
-              entry.indexInfo = entry.indexBuffer->getSliceInfo(0, idxBytes);
+              if (!directStaticIndexSource) {
+                entry.indexInfo =
+                    entry.indexBuffer->getSliceInfo(0, idxBytes);
+              }
               entry.indexed = true;
               entry.indexCount = CountVal;
               entry.indexType = drawTimeIndexType;

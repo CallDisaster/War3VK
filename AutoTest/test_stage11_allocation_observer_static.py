@@ -53,6 +53,30 @@ class Stage11AllocationObserverStaticTest(unittest.TestCase):
         self.assertNotIn("positionBuffer =", block)
         self.assertNotIn("EmitCs", block)
 
+    def test_direct_source_candidate_is_development_only_and_exact(self) -> None:
+        runtime = DEVICE[
+            DEVICE.index("inline bool War3Stage11DirectStaticSourceRuntime") :
+            DEVICE.index("enum class War3ProducerClaimObserveMode")
+        ]
+        self.assertIn("kDevelopmentShadowObserversEnabled", runtime)
+        self.assertIn("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", runtime)
+        begin = DEVICE.index("const bool directStaticPositionSource")
+        end = DEVICE.index("GenerationBackedStreamProof currentIndexSourceProof", begin)
+        gate = DEVICE[begin:end]
+        self.assertIn("generationBackedStaticCandidate", gate)
+        self.assertIn("!DynamicSysmemVBOs", gate)
+        self.assertIn("currentPositionSourceProof.valid()", gate)
+        self.assertIn("posSlice.buffer() != nullptr", gate)
+
+    def test_direct_source_binding_skips_copy_and_allocation(self) -> None:
+        begin = DEVICE.index("const bool needsNewPositionBuffer")
+        end = DEVICE.index("War3ShadowDrawTimeCapturePhase::UvBacking", begin)
+        body = DEVICE[begin:end]
+        self.assertIn("!directStaticPositionSource", body)
+        self.assertIn("drawTimeDirectStaticPositionBindCount", DEVICE)
+        self.assertIn("directStaticIndexSource", DEVICE)
+        self.assertIn("drawTimeDirectStaticIndexBindCount", DEVICE)
+
     def test_diagnostics_reach_runtime_and_perf_json(self) -> None:
         for name in (
             "drawTimePositionAllocRequestCount",
