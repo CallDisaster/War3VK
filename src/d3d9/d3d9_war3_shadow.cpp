@@ -10,6 +10,7 @@
 #include "war3/render/war3_shadow_lifecycle.h"
 #include "war3/render/war3_shadow_alpha_cascade_contract.h"
 #include "war3/render/war3_shadow_observer_build_policy.h"
+#include "war3/render/war3_rts_shadow_stability_contract.h"
 #include "war3/render/war3_shadow_producer_policy.h"
 #include "war3/render/war3_shadow_replay_validation.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
@@ -10198,6 +10199,29 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
   }
 
   m_csmConfig = mutableSettings.shadows.csm;
+#if defined(WARVK_ENABLE_RTS_SHADOW_CANDIDATE_DEV) && \
+    WARVK_ENABLE_RTS_SHADOW_CANDIDATE_DEV
+  static const auto s_rtsShadowCandidateMode =
+      war3::render::ParseRtsShadowCandidateMode(
+          EnvU32Default("DXVK_WAR3_RTS_SHADOW_CANDIDATE_MODE", 0u));
+  if (war3::render::kDevelopmentRtsShadowCandidateEnabled &&
+      s_rtsShadowCandidateMode ==
+          war3::render::War3RtsShadowCandidateMode::ReceiverBand) {
+    m_csmConfig.fitMode = War3CsmFitMode::RtsReceiverBand;
+    m_csmConfig.rtsReceiverPlaneHeight = EnvFloatDefault(
+        "DXVK_WAR3_RTS_SHADOW_RECEIVER_PLANE_HEIGHT", 0.0f);
+    m_csmConfig.rtsReceiverBandHalfHeight = std::clamp(
+        EnvFloatDefault("DXVK_WAR3_RTS_SHADOW_RECEIVER_BAND_HALF_HEIGHT",
+                        512.0f),
+        0.0f, 2048.0f);
+    m_csmConfig.rtsReceiverPadding = std::clamp(
+        EnvFloatDefault("DXVK_WAR3_RTS_SHADOW_RECEIVER_PADDING", 64.0f),
+        0.0f, 512.0f);
+    m_csmConfig.rtsBaseWorldTexelSize = std::clamp(
+        EnvFloatDefault("DXVK_WAR3_RTS_SHADOW_BASE_WORLD_TEXEL", 0.25f),
+        0.0625f, 2.0f);
+  }
+#endif
   // The ordinary surface CSM remains bit-for-bit unchanged while volumetrics
   // are disabled. When the volume consumer is active, reserve a fixed
   // toward-sun slice in C2/C3 so an upstream tree/building is not clipped out

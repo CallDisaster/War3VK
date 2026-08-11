@@ -228,6 +228,9 @@ d3d9_cpp_args = []
 if get_option('warvk_shadow_observers_dev')
   d3d9_cpp_args += [ '-DWARVK_ENABLE_SHADOW_OBSERVERS_DEV=1' ]
 endif
+if get_option('warvk_rts_shadow_candidate_dev')
+  d3d9_cpp_args += [ '-DWARVK_ENABLE_RTS_SHADOW_CANDIDATE_DEV=1' ]
+endif
 if get_option('warvk_device_address_binding_report_dev')
   # Keep the fixed-capacity tracker type identical across the DXVK static
   # library and every D3D9 translation unit that includes its value snapshots.
@@ -354,6 +357,23 @@ war3_shadow_receiver_numeric_contract_test = executable(
 test(
   'war3_shadow_receiver_numeric_contract',
   war3_shadow_receiver_numeric_contract_test,
+  timeout : 30,
+)
+
+# Pure receiver-band clipmap fit used by the default-off RTS shadow candidate.
+# It exercises fixed world-texel density, snapping and fail-closed coverage
+# without loading the game or Vulkan.
+war3_rts_shadow_stability_contract_test = executable(
+  'war3_rts_shadow_stability_contract_test',
+  [
+    'war3/render/tests/war3_rts_shadow_stability_contract_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_rts_shadow_stability_contract',
+  war3_rts_shadow_stability_contract_test,
   timeout : 30,
 )
 

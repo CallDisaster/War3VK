@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "d3d9_war3_csm.h"
 #include "d3d9_war3_debug.h"
+#include "war3/render/war3_rts_shadow_stability_contract.h"
 
 #include "../util/util_env.h"
 #include "../util/util_math.h"
@@ -416,7 +417,7 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
     // radius. Averaging eight world-space corners first quantizes the camera
     // translation eight times; transforming the view-space center once is
     // mathematically equivalent but avoids that frame-dependent low-bit noise.
-    Vector4 center = config.fitMode == War3CsmFitMode::StableSphere
+    Vector4 center = config.fitMode != War3CsmFitMode::TightAabb
                          ? invView * centerView
                          : centerAvg;
     center.w = 1.0f;
@@ -461,6 +462,31 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
       // else: 低仰角退化，保留 radius3d（包围球保底），不引入爆炸值
     }
 
+    war3::render::War3RtsShadowReceiverBandFit rtsFit = {};
+    if (config.fitMode == War3CsmFitMode::RtsReceiverBand) {
+      war3::render::War3RtsShadowReceiverBandQuery query = {};
+      for (uint32_t i = 0u; i < worldCorners.size(); i++) {
+        query.frustumCorners[i] = {
+            double(worldCorners[i].x), double(worldCorners[i].y),
+            double(worldCorners[i].z)};
+      }
+      query.planeNormal = {double(out.worldUp.x), double(out.worldUp.y),
+                           double(out.worldUp.z)};
+      query.lightRight = {double(r.x), double(r.y), double(r.z)};
+      query.lightUp = {double(u.x), double(u.y), double(u.z)};
+      query.receiverPlaneHeight = double(config.rtsReceiverPlaneHeight);
+      query.receiverBandHalfHeight =
+          double(config.rtsReceiverBandHalfHeight);
+      query.receiverPadding = double(config.rtsReceiverPadding);
+      query.worldTexelSize = double(config.rtsBaseWorldTexelSize) *
+          double(uint32_t(1u) << c);
+      query.shadowResolution = (std::max)(config.shadowResolution, 1u);
+      query.stableSnap = config.stableSnap > 0.5f;
+      rtsFit = war3::render::War3FitRtsShadowReceiverBand(query);
+      if (rtsFit.valid)
+        radius = float(rtsFit.halfExtent);
+    }
+
     const uint32_t shadowResU = (std::max)(config.shadowResolution, 1u);
     const float shadowRes = float(shadowResU);
 
@@ -475,7 +501,12 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
     // 真正的量化应该是为了让 texelSize 在相邻几帧内保持绝对一致。
 
     float radiusPadded = radius;
-    if (config.fitMode == War3CsmFitMode::StableSphere) {
+    if (rtsFit.valid) {
+      // The clip radius and texel size are fixed by the development candidate.
+      // The numeric contract already proves the snapped center still covers
+      // the complete receiver band, so no breathing safety expansion is used.
+      radiusPadded = radius;
+    } else if (config.fitMode != War3CsmFitMode::TightAabb) {
       // 对于 StableSphere，我们通过量化半径来锁定 texelSize。
       // 步进值选为 16.0f (可以根据精度需求调整)，确保微小的旋转/移动不会导致
       // Radius 波动。
@@ -493,7 +524,7 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
     const bool doSnap = (config.stableSnap > 0.5f) && (texelSize > 1e-6f);
 
     // Add a 1-texel safety margin to avoid edge clipping after snapping.
-    if (doSnap) {
+    if (doSnap && !rtsFit.valid) {
       radiusPadded = radiusPadded + texelSize;
       texelSize = (2.0f * radiusPadded) / shadowRes;
     }
@@ -507,8 +538,12 @@ War3CsmData War3CsmCalculator::Compute(const War3WorldCameraState &camera,
       return double(p.x) * double(axis.x) + double(p.y) * double(axis.y) +
              double(p.z) * double(axis.z);
     };
-    double lightCenterX = projectCenter(center, r);
-    double lightCenterY = projectCenter(center, u);
+    double lightCenterX = rtsFit.valid
+        ? rtsFit.centerLightX
+        : projectCenter(center, r);
+    double lightCenterY = rtsFit.valid
+        ? rtsFit.centerLightY
+        : projectCenter(center, u);
     const double lightCenterZ = projectCenter(center, f);
     if (doSnap) {
       // Round-to-nearest texel to minimize drift (handle negative coordinates
