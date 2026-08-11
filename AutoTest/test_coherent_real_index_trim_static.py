@@ -67,15 +67,22 @@ class CoherentRealIndexTrimStaticTest(unittest.TestCase):
             self.assertIn(token, body)
         self.assertNotIn("fingerprint", HEADER.lower())
 
-    def test_position_and_rebased_index_are_immediate_cpu_snapshots(self):
+    def test_position_span_and_rebased_index_are_immediate_cpu_snapshots(self):
         body = function_body(DEVICE, "void D3D9DeviceEx::War3TryCaptureShadowCaster(")
-        position_copy = body.index("s_coherentRealPositionScratch.data(),")
+        position_proof = body.index("coherentRealPositionSpanStillCurrent = true")
         mutation = body.index("const bool consumeCoherentRealTrim")
         freeze_plan = body.index("struct FrameFreezePlan")
-        self.assertLess(position_copy, mutation)
+        self.assertLess(position_proof, mutation)
         self.assertLess(mutation, freeze_plan)
         self.assertIn("s_exactRebasedIndexScratch.data()", body)
         self.assertIn("immediateCpuSnapshot", body)
+        self.assertIn(
+            "coherentRealPositionSpan.data + size_t(posFreezeByteOffset)", body
+        )
+        self.assertNotIn("s_coherentRealPositionScratch", body)
+        self.assertIn("coherentRealIndexRangeSnapshot", body)
+        self.assertIn("coherentRealIndexBytes = exactIndexSpan.data", body)
+        self.assertIn("currentIndexMapping.ptr() ==", body)
         self.assertIn("currentMapping.ptr() ==", body)
         self.assertIn("coherentRealPositionMappedAllocation.ptr()", body)
         self.assertIn("War3IdentityGeneration() ==", body)

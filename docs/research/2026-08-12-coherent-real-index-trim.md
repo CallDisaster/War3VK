@@ -51,12 +51,16 @@ The route accepts only the same current D3D9 draw when all of these facts hold:
 - finite, in-range position/index domain with the current identity,
   allocation and content generations still unchanged.
 
-Consume immediately copies the compact position range and rebased index bytes
-into CPU-owned scratch during that same draw. The existing Arena transaction
-then copies those immutable bytes into its own mapped snapshot. Dynamic,
-skinned, alpha-tested, blend, unreadable or generation-ambiguous draws retain
-the existing exact fallback. This is not a persistent VB/IB cache and does not
-restore the retired fingerprint path.
+The first Consume prototype copied the compact position range and a rebased
+index range into CPU scratch before the Arena transaction. PostGate attribution
+proved that this double copy was not acceptable. The revised candidate retains
+the mapped allocations, revalidates both generations, and synchronously freezes
+the exact position and raw index subranges into the Arena before returning from
+the same D3D draw. Replay uses the corresponding signed vertex offset and the
+existing exact-domain validator. It does not retain either mapped pointer after
+the draw. Dynamic, skinned, alpha-tested, blend, unreadable or
+generation-ambiguous draws retain the existing exact fallback. This is not a
+persistent VB/IB cache and does not restore the retired fingerprint path.
 
 ## Evidence
 
@@ -93,3 +97,31 @@ Final rebuilt development candidate:
 These are isolated-desktop stability and relative A/B results, not foreground
 FPS or player visual acceptance. Release remains Off until a later explicitly
 authorized default decision and foreground visual review.
+
+## CPU A/B correction
+
+A development-only PostGate observer was enabled only in builds configured
+with `warvk_shadow_observers_dev=true`; the default Release configuration
+cannot enter the observer. It identified that the first Consume implementation
+reduced Arena traffic at the cost of CPU copies:
+
+- Off report `war3_perf_report_auto_2026_08_12_06_31_34.html`:
+  `ResourceResolve=0.048 ms`, main CPU `10.308 ms`, Arena average/peak
+  `79.157/383.976 MiB`, but 19 producer-incomplete frames and 2,564 required
+  omissions;
+- scratch Consume report `war3_perf_report_auto_2026_08_12_06_28_02.html`:
+  `ResourceResolve=4.972 ms`, main CPU `13.448 ms`, Arena average/peak
+  `54.389/365.604 MiB`, with no incomplete frame;
+- direct position span report
+  `war3_perf_report_auto_2026_08_12_06_37_37.html`:
+  `ResourceResolve=4.426 ms`;
+- direct position plus raw-index span report
+  `war3_perf_report_auto_2026_08_12_06_45_11.html`:
+  `ResourceResolve=0.882 ms`, main CPU `10.399 ms`, Arena average/peak
+  `60.129/366.742 MiB`, with no incomplete frame or required omission.
+
+The final pair had similar aggregate main/process CPU despite differing scene
+work, so it proves that the multi-millisecond scratch regression was removed;
+it does not yet prove a foreground FPS gain. The remaining approximately
+`0.8 ms` ResourceResolve cost is the current exact index-domain scan and is not
+authorized for Release without a generation-safe reuse design and a new A/B.

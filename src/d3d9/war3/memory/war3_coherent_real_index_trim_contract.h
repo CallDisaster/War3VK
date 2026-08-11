@@ -74,7 +74,7 @@ struct War3CoherentRealIndexTrimDecision {
 };
 
 // This contract only admits the ordinary D3D9 REAL-buffer terrain lane. The
-// caller must still prove the exact index domain and immediately copy the
+// caller must still prove the exact index domain and synchronously freeze the
 // compact position/index bytes before returning to Warcraft. It never grants
 // cross-frame reuse or permission to retain a mutable mapped pointer.
 constexpr War3CoherentRealIndexTrimDecision
