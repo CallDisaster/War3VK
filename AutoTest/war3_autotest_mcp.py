@@ -4556,6 +4556,138 @@ def _post_war3_virtual_key_message(
     }
 
 
+def _post_war3_client_click_message(
+    pid: int,
+    x: int,
+    y: int,
+    button: str = "left",
+    hold_ms: int = 45,
+    count: int = 1,
+) -> Dict[str, Any]:
+    """Post a bounded client click to the exact AutoTest-owned War3 HWND."""
+    target_pid = int(pid)
+    registered = SESSION_REGISTRY.get(pid=target_pid)
+    state_owned = bool(
+        int(STATE.war3_pid or 0) == target_pid
+        and _state_owned_process_alive(target_pid) is True
+    )
+    if registered is None and not state_owned:
+        return {
+            "ok": False,
+            "pid": target_pid,
+            "code": "AUTOTEST_SESSION_REQUIRED",
+            "error": "窗口点击只允许用于精确绑定的 AutoTest War3 会话",
+        }
+
+    hwnd = _wait_for_main_window_hwnd(
+        target_pid, timeout_sec=8.0, require_visible=True
+    )
+    if not hwnd:
+        return {"ok": False, "error": f"未找到可见主窗口: pid={target_pid}"}
+
+    desktop_name = (
+        str(registered.desktop_name or "")
+        if registered is not None
+        else str(STATE.desktop_name or "")
+    )
+    desktop_mode = (
+        str(registered.desktop_mode or "default")
+        if registered is not None
+        else str(STATE.desktop_mode or "default")
+    ).strip().lower()
+    input_desktop_before = _query_input_desktop_name()
+    if desktop_mode == "isolated" and (
+        not desktop_name
+        or not input_desktop_before
+        or desktop_name.casefold() == input_desktop_before.casefold()
+    ):
+        return {
+            "ok": False,
+            "pid": target_pid,
+            "code": "ISOLATED_DESKTOP_NOT_HIDDEN",
+            "desktop": desktop_name,
+            "inputDesktopBefore": input_desktop_before,
+        }
+
+    window = _query_window_info_by_hwnd(hwnd, pid=target_pid)
+    client = dict(window.get("clientRect", {}) or {})
+    client_width = max(1, int(client.get("width", 0) or 0))
+    client_height = max(1, int(client.get("height", 0) or 0))
+    client_x = max(0, min(int(x), client_width - 1))
+    client_y = max(0, min(int(y), client_height - 1))
+    button_name = str(button or "left").strip().lower()
+    if button_name == "left":
+        down_message, up_message, down_state = 0x0201, 0x0202, 0x0001
+    elif button_name == "right":
+        down_message, up_message, down_state = 0x0204, 0x0205, 0x0002
+    else:
+        return {
+            "ok": False,
+            "pid": target_pid,
+            "code": "AUTOTEST_MOUSE_BUTTON_INVALID",
+            "button": button_name,
+        }
+
+    user32 = ctypes.windll.user32
+    move_message = 0x0200
+    packed_position = (client_x & 0xFFFF) | ((client_y & 0xFFFF) << 16)
+    posts: List[Dict[str, Any]] = []
+    ok_all = True
+    click_count = max(1, min(int(count), 4))
+    hold_seconds = max(0.02, min(float(hold_ms) / 1000.0, 2.0))
+    for _ in range(click_count):
+        move_ok = bool(user32.PostMessageW(
+            ctypes.c_void_p(hwnd),
+            move_message,
+            ctypes.c_void_p(0),
+            ctypes.c_void_p(packed_position),
+        ))
+        down_ok = bool(user32.PostMessageW(
+            ctypes.c_void_p(hwnd),
+            down_message,
+            ctypes.c_void_p(down_state),
+            ctypes.c_void_p(packed_position),
+        ))
+        time.sleep(hold_seconds)
+        up_ok = bool(user32.PostMessageW(
+            ctypes.c_void_p(hwnd),
+            up_message,
+            ctypes.c_void_p(0),
+            ctypes.c_void_p(packed_position),
+        ))
+        posts.append({"move": move_ok, "down": down_ok, "up": up_ok})
+        ok_all = ok_all and move_ok and down_ok and up_ok
+        time.sleep(0.02)
+
+    input_desktop_after = _query_input_desktop_name()
+    input_desktop_stable = bool(
+        input_desktop_before
+        and input_desktop_after == input_desktop_before
+    )
+    return {
+        "ok": bool(ok_all and input_desktop_stable),
+        "pid": target_pid,
+        "hwnd": int(hwnd),
+        "x": client_x,
+        "y": client_y,
+        "button": button_name,
+        "holdMs": int(hold_ms),
+        "count": click_count,
+        "posts": posts,
+        "mode": (
+            "isolated-window-message"
+            if desktop_mode == "isolated"
+            else "default-window-message"
+        ),
+        "desktop": desktop_name,
+        "inputDesktopBefore": input_desktop_before,
+        "inputDesktopAfter": input_desktop_after,
+        "inputDesktopStable": input_desktop_stable,
+        "foregroundChanged": False,
+        "window": window,
+    }
+
+
 def _post_war3_key_pulse(
     pid: int,
     key: str = "RIGHT",
@@ -4851,15 +4983,6 @@ def _run_war3_input_plan(
             return {"ok": False, "error": f"action[{index}] type 不支持: {kind}"}
 
     if desktop_mode == "isolated":
-        if any(action["type"] == "click" for action in normalized):
-            return {
-                "ok": False,
-                "pid": target_pid,
-                "desktopMode": desktop_mode,
-                "desktop": desktop_name,
-                "code": "ISOLATED_DESKTOP_INPUT_UNSUPPORTED",
-                "error": "隔离桌面只允许 HWND 定向 key/sleep，不允许鼠标注入。",
-            }
         deadline = time.monotonic() + max(2.0, float(timeout_sec))
         results: List[Dict[str, Any]] = []
         for action in normalized:
@@ -4877,13 +5000,23 @@ def _run_war3_input_plan(
                 ))
                 results.append({"type": "sleep", "ok": True, "ms": action["ms"]})
                 continue
-            pulse = _post_war3_virtual_key_message(
-                pid=target_pid,
-                vk=int(action["vk"]),
-                hold_ms=int(action["holdMs"]),
-                repeat=1,
-            )
-            results.append({"type": "key", **pulse})
+            if action["type"] == "click":
+                pulse = _post_war3_client_click_message(
+                    pid=target_pid,
+                    x=int(action["x"]),
+                    y=int(action["y"]),
+                    button=str(action["button"]),
+                    hold_ms=int(action["holdMs"]),
+                    count=int(action["count"]),
+                )
+            else:
+                pulse = _post_war3_virtual_key_message(
+                    pid=target_pid,
+                    vk=int(action["vk"]),
+                    hold_ms=int(action["holdMs"]),
+                    repeat=1,
+                )
+            results.append({"type": action["type"], **pulse})
             if not pulse.get("ok"):
                 return {
                     "ok": False,
@@ -9890,6 +10023,7 @@ def run_life_and_death_tdr_scenario(
     screenshot_count: int = 12,
     birth_hold_sec: int = 120,
     strict_external_graphics_hooks: bool = True,
+    acknowledge_difficulty_dialog: bool = True,
 ) -> Dict[str, Any]:
     """冷启动或连接“生与死”，以低视角巡航并在首次 GPU 故障时止损。"""
     w3 = Path(war3_dir)
@@ -10068,6 +10202,11 @@ def run_life_and_death_tdr_scenario(
     visibility_enable: Dict[str, Any] = {}
     visibility_restore: Dict[str, Any] = {}
     camera_restore: Dict[str, Any] = {}
+    difficulty_acknowledgement: Dict[str, Any] = {
+        "ok": True,
+        "skipped": True,
+        "reason": "difficulty acknowledgement not requested",
+    }
     samples: List[Dict[str, Any]] = []
     waypoint_rows: List[Dict[str, Any]] = []
     screenshot_rows: List[Dict[str, Any]] = []
@@ -10118,6 +10257,46 @@ def run_life_and_death_tdr_scenario(
         )
 
     try:
+        if (
+            not failure_reason
+            and owned_process
+            and bool(use_isolated_desktop)
+            and bool(acknowledge_difficulty_dialog)
+        ):
+            # This scenario targets a known map whose first difficulty button
+            # is centred near the upper quarter of the client.  The click is a
+            # bounded HWND PostMessage to the exact AutoTest-owned process; it
+            # never moves the system cursor or changes the input desktop.
+            window = _query_window_info_by_hwnd(
+                _wait_for_main_window_hwnd(pid, timeout_sec=8.0, require_visible=True),
+                pid=pid,
+            )
+            client = dict(window.get("clientRect", {}) or {})
+            client_width = max(1, int(client.get("width", 0) or 0))
+            client_height = max(1, int(client.get("height", 0) or 0))
+            difficulty_acknowledgement = _run_war3_input_plan(
+                pid=pid,
+                actions=[
+                    {"type": "sleep", "ms": 1200},
+                    {
+                        "type": "click",
+                        "x": int(round(float(client_width - 1) * 0.5)),
+                        "y": int(round(float(client_height - 1) * 0.24)),
+                        "button": "left",
+                        "holdMs": 60,
+                        "count": 1,
+                    },
+                    {"type": "sleep", "ms": 1000},
+                ],
+                timeout_sec=8.0,
+            )
+            difficulty_acknowledgement["dialogDismissedVerified"] = False
+            difficulty_acknowledgement["verificationNote"] = (
+                "PostMessage acceptance is not proof that a DirectInput/JASS "
+                "dialog consumed the click; internal screenshots remain authoritative"
+            )
+            if not difficulty_acknowledgement.get("ok"):
+                failure_reason = "isolated difficulty acknowledgement failed"
         if not failure_reason:
             camera_before = _invoke_internal_test_request(
                 pid, w3, "camera.snapshot", {}, timeout_sec=4.0
@@ -10418,6 +10597,7 @@ def run_life_and_death_tdr_scenario(
         "strictExternalGraphicsHooks": bool(strict_external_graphics_hooks),
         "loadedModules": loaded_modules,
         "externalGraphicsHooks": external_graphics_hooks,
+        "difficultyAcknowledgement": difficulty_acknowledgement,
         "cameraBefore": camera_before,
         "worldBounds": bounds,
         "visibilityEnable": visibility_enable,

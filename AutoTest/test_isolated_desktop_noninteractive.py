@@ -148,8 +148,7 @@ class IsolatedDesktopNonInteractiveTests(unittest.TestCase):
         )[0]
         self.assertIn('if desktop_mode == "isolated":', plan_body)
         self.assertIn("_post_war3_virtual_key_message", plan_body)
-        self.assertIn("ISOLATED_DESKTOP_INPUT_UNSUPPORTED", plan_body)
-        self.assertIn("不允许鼠标注入", plan_body)
+        self.assertIn("_post_war3_client_click_message", plan_body)
         self.assertIn('mode": "isolated-window-message-plan"', plan_body)
 
         message_body = runner.split(
@@ -166,6 +165,33 @@ class IsolatedDesktopNonInteractiveTests(unittest.TestCase):
             "SendInput",
         ):
             self.assertNotIn(forbidden, message_body)
+
+        click_body = runner.split(
+            "def _post_war3_client_click_message", 1
+        )[1].split("def _post_war3_key_pulse", 1)[0]
+        self.assertIn("AUTOTEST_SESSION_REQUIRED", click_body)
+        self.assertIn("ISOLATED_DESKTOP_NOT_HIDDEN", click_body)
+        self.assertIn("PostMessageW", click_body)
+        self.assertIn("_query_input_desktop_name", click_body)
+        self.assertIn('"foregroundChanged": False', click_body)
+        for forbidden in (
+            "SwitchDesktop",
+            "SetForegroundWindow",
+            "SetCursorPos",
+            "keybd_event",
+            "mouse_event",
+            "SendInput",
+        ):
+            self.assertNotIn(forbidden, click_body)
+
+        scenario_body = runner.split(
+            "def run_life_and_death_tdr_scenario", 1
+        )[1].split("def set_city_test_view", 1)[0]
+        self.assertIn("acknowledge_difficulty_dialog: bool = True", scenario_body)
+        self.assertIn("difficultyAcknowledgement", scenario_body)
+        self.assertIn("_run_war3_input_plan(", scenario_body)
+        self.assertNotIn("SetCursorPos", scenario_body)
+        self.assertNotIn("SwitchDesktop", scenario_body)
 
         input_plan = (AUTOTEST / "send_input_plan_same_desktop.ps1").read_text(
             encoding="utf-8"
