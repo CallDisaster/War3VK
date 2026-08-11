@@ -4101,8 +4101,10 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     // AlphaBlend alone is not an authoritative cutout contract. Reject it
     // instead of inventing a 0.5 threshold, and reject native alpha-test when
     // any texture/UV backing is incomplete rather than drawing an opaque card.
+    const DxvkDescriptor* currentAlphaDescriptor =
+        draw.alphaTestEnabled ? draw.CurrentTextureDescriptor() : nullptr;
     const bool alphaPayloadComplete =
-        draw.diffuseTexture && draw.HasUsableUvBinding();
+        currentAlphaDescriptor != nullptr && draw.HasUsableUvBinding();
     if (draw.alphaBlendEnabled && !draw.alphaTestEnabled)
       continue;
     ++requiredPreparedDrawCount;
@@ -4135,9 +4137,12 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
     // Phase 7.52 AlphaTest 修复：保留 prepare 阶段的 effective alpha-test 决定，
     // 让 pc.flags 写入循环直接复用，不再仅看 draw.alphaTestEnabled。
     out.effectiveAlphaTest = effectiveAlphaTestShadow;
-    out.alphaImageView = (effectiveAlphaTestShadow && draw.diffuseTexture)
-                             ? draw.textureDescriptor.legacy.image.imageView
-                             : VK_NULL_HANDLE;
+    out.alphaDescriptor = effectiveAlphaTestShadow
+        ? currentAlphaDescriptor
+        : nullptr;
+    out.alphaImageView = out.alphaDescriptor != nullptr
+        ? out.alphaDescriptor->legacy.image.imageView
+        : VK_NULL_HANDLE;
     // The direct-input contract depends only on immutable replay-draw state.
     // Cache it once here instead of repeating the same probe for every
     // cascade. Per-cascade telemetry remains at the consumption site below.
@@ -4855,7 +4860,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
       if (prep.effectiveAlphaTest && draw.diffuseTexture) {
         descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        descriptors[1].descriptor = &draw.textureDescriptor;
+        descriptors[1].descriptor = prep.alphaDescriptor;
         ctx->track(draw.diffuseTexture->image(), DxvkAccess::Read);
       } else {
         descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -5293,7 +5298,7 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
         descriptors[0].buffer = paletteDesc.buffer;
         if (prep.effectiveAlphaTest && draw.diffuseTexture) {
           descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-          descriptors[1].descriptor = &draw.textureDescriptor;
+          descriptors[1].descriptor = prep.alphaDescriptor;
           ctx->track(draw.diffuseTexture->image(), DxvkAccess::Read);
         } else {
           descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -7821,6 +7826,9 @@ void War3ShadowReceiverPass::renderPointShadow(
   // transitioned or cleared. A point-shadow candidate is one transaction:
   // missing views, stale plan indices, alpha payload gaps or pipeline failure
   // revoke publication instead of leaving a partially refreshed cube.
+  thread_local std::vector<const DxvkDescriptor*>
+      pointShadowAlphaDescriptors;
+  pointShadowAlphaDescriptors.assign(replayDraws.size(), nullptr);
   bool pointReplayPlanComplete = true;
   for (uint32_t lightIndex = 0u;
        pointReplayPlanComplete && lightIndex < shadowLightCount;
@@ -7845,12 +7853,16 @@ void War3ShadowReceiverPass::renderPointShadow(
         const auto& draw = *replayDraws[drawIdx];
         if (draw.alphaBlendEnabled && !draw.alphaTestEnabled)
           continue;
+        const DxvkDescriptor* currentAlphaDescriptor =
+            draw.alphaTestEnabled ? draw.CurrentTextureDescriptor() : nullptr;
         const bool alphaPayloadComplete =
-            draw.diffuseTexture && draw.HasUsableUvBinding();
+            currentAlphaDescriptor != nullptr && draw.HasUsableUvBinding();
         if (draw.alphaTestEnabled && !alphaPayloadComplete) {
           pointReplayPlanComplete = false;
           break;
         }
+        if (draw.alphaTestEnabled)
+          pointShadowAlphaDescriptors[drawIdx] = currentAlphaDescriptor;
 
         ShadowCasterPipelineKey key = {};
         key.positionFormat = draw.positionFormat;
@@ -8234,8 +8246,11 @@ void War3ShadowReceiverPass::renderPointShadow(
         key.blendBinding = draw.blendBinding;
         key.blendStride = draw.blendStride;
 
+        const DxvkDescriptor* currentAlphaDescriptor =
+            draw.alphaTestEnabled ? pointShadowAlphaDescriptors[drawIdx]
+                                  : nullptr;
         const bool alphaPayloadComplete =
-            draw.diffuseTexture && draw.HasUsableUvBinding();
+            currentAlphaDescriptor != nullptr && draw.HasUsableUvBinding();
         if ((draw.alphaBlendEnabled && !draw.alphaTestEnabled) ||
             (draw.alphaTestEnabled && !alphaPayloadComplete)) {
           continue;
@@ -8323,7 +8338,7 @@ void War3ShadowReceiverPass::renderPointShadow(
         descriptors[0].buffer = paletteDesc.buffer;
         if (effectiveAlphaTestShadowPoint && draw.diffuseTexture) {
           descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-          descriptors[1].descriptor = &draw.textureDescriptor;
+          descriptors[1].descriptor = currentAlphaDescriptor;
           ctx->track(draw.diffuseTexture->image(), DxvkAccess::Read);
         } else {
           descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;

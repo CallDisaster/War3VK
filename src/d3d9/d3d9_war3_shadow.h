@@ -578,6 +578,7 @@ namespace dxvk {
             bool valid = false;
             ShadowCasterPipeline pipeline = {};
             size_t pipelineHash = 0;
+            const DxvkDescriptor* alphaDescriptor = nullptr;
             VkImageView alphaImageView = VK_NULL_HANDLE;
             VkBuffer positionBuffer = VK_NULL_HANDLE;
             VkBuffer indexBuffer = VK_NULL_HANDLE;

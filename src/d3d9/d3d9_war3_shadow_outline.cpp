@@ -292,9 +292,16 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
   // dynamic-rendering scope, so an allocation/creation failure cannot leave
   // an unterminated render pass.
   std::vector<VkPipeline> maskPipelines;
+  std::vector<const DxvkDescriptor*> maskAlphaDescriptors;
   maskPipelines.reserve(outlineDraws.size());
+  maskAlphaDescriptors.reserve(outlineDraws.size());
   for (const War3ShadowCasterDraw* draw : outlineDraws) {
     const ShadowCasterPipelineKey key = makeMaskPipelineKey(*draw);
+    const DxvkDescriptor* alphaDescriptor = key.alphaTestEnabled
+        ? draw->CurrentTextureDescriptor()
+        : nullptr;
+    if (key.alphaTestEnabled && alphaDescriptor == nullptr)
+      return;
     auto it = m_outlineMaskMRTPipelines.find(key);
     if (it == m_outlineMaskMRTPipelines.end()) {
       const auto candidate = createOutlineMaskPipeline(key);
@@ -304,6 +311,7 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
           {key, candidate.pipeline}).first;
     }
     maskPipelines.push_back(it->second);
+    maskAlphaDescriptors.push_back(alphaDescriptor);
   }
 
   auto transitionMasksToColorAttachment = [&]() {
@@ -486,7 +494,7 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
 
       if (key.alphaTestEnabled) {
         descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        descriptors[1].descriptor = &draw.textureDescriptor;
+        descriptors[1].descriptor = maskAlphaDescriptors[targetIndex];
         ctx->track(draw.diffuseTexture->image(), DxvkAccess::Read);
       } else {
         descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -843,15 +851,23 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
   }
 
   std::vector<VkPipeline> outlinePipelines;
+  std::vector<const DxvkDescriptor*> outlineAlphaDescriptors;
   outlinePipelines.reserve(outlineDraws.size());
+  outlineAlphaDescriptors.reserve(outlineDraws.size());
   for (const War3ShadowCasterDraw* draw : outlineDraws) {
     const ShadowCasterPipelineKey key =
         makeUnitOutlinePipelineKey(*draw, outlineMode);
+    const DxvkDescriptor* alphaDescriptor = key.alphaTestEnabled
+        ? draw->CurrentTextureDescriptor()
+        : nullptr;
+    if (key.alphaTestEnabled && alphaDescriptor == nullptr)
+      return;
     const VkPipeline pipeline = getOrCreateUnitOutlinePipeline(
         key, colorFormat, depthFormat);
     if (pipeline == VK_NULL_HANDLE)
       return;
     outlinePipelines.push_back(pipeline);
+    outlineAlphaDescriptors.push_back(alphaDescriptor);
   }
 
   // 开始渲染
@@ -919,8 +935,7 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
     // Binding 1: Alpha Texture
     if (key.alphaTestEnabled) {
       descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-      descriptors[1].descriptor =
-          &draw.textureDescriptor; // Need to ensure this is set?
+      descriptors[1].descriptor = outlineAlphaDescriptors[outlineIndex];
       ctx->track(draw.diffuseTexture->image(), DxvkAccess::Read);
     } else {
       descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;

@@ -191,8 +191,22 @@ namespace dxvk {
         // 漫反射纹理 (Stage 0 纹理，用于读取Alpha通道)
         Rc<DxvkImageView> diffuseTexture;   // 纹理视图 (Ref Count)
         Rc<DxvkSampler>   diffuseSampler;   // 采样器 (Ref Count)
-        DxvkDescriptor    textureDescriptor; // 完整的描述符 (View + Sampler)，用于绑定
+        // Capture-time descriptor snapshot. This is identity/diagnostic data
+        // only: DxvkImage backing storage can be relocated, which invalidates
+        // the VkImageView stored in this value. Replay must resolve the current
+        // descriptor from diffuseTexture immediately before recording.
+        DxvkDescriptor    textureDescriptor;
         uint32_t          diffuseSamplerIndex = 0; // [NEW] Bindless Sampler Index
+
+        const DxvkDescriptor* CurrentTextureDescriptor() const {
+            if (diffuseTexture == nullptr)
+                return nullptr;
+            const DxvkDescriptor* descriptor = diffuseTexture->getDescriptor();
+            return descriptor != nullptr &&
+                   descriptor->legacy.image.imageView != VK_NULL_HANDLE
+                ? descriptor
+                : nullptr;
+        }
 
         // 分类信息（用于调试/过滤）
         War3RenderState::StageCategory category = War3RenderState::StageCategory::Unknown;
