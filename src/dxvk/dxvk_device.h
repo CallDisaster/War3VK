@@ -280,6 +280,20 @@ namespace dxvk {
       notifyDeviceError(status);
     }
 
+    uint32_t deviceAddressBindingSequenceBeforeDriverCall() const noexcept {
+      return GetDxvkDeviceAddressBindingTracker().sequenceBeforeDriverCall();
+    }
+
+    void notifyDeviceErrorFromDriverResult(
+            VkResult status,
+            uint32_t bindingSequenceBeforeCall) noexcept {
+      if (status == VK_ERROR_DEVICE_LOST)
+        GetDxvkDeviceAddressBindingTracker().markDriverLossObserved(
+          bindingSequenceBeforeCall);
+      m_vkd->notifyDeviceErrorFromDriverResult(status);
+      notifyDeviceError(status);
+    }
+
     /**
      * \brief Captures bounded fault text after a direct driver loss
      *

@@ -37,3 +37,11 @@ state. A later exact-key event may contribute only its bounded debug name. The
 development build also preserves DXVK buffer/image/memory names even when the
 normal capture debug flag is off. These changes prevent teardown activity from
 being mistaken for the fault-time ownership state.
+
+A subsequent run proved that the driver may emit the teardown unbind callbacks
+inside the Vulkan call that ultimately returns `VK_ERROR_DEVICE_LOST`. The
+post-call marker is therefore still too late. Queue submit/timeline wait and
+WSI acquire/present/wait/fence paths now snapshot the binding sequence before
+entering the driver and pass that token to the terminal notifier. The tracker
+keeps the earliest direct-loss token, so later terminal reports cannot move the
+cutoff forward into driver teardown.

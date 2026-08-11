@@ -29,6 +29,8 @@ class DeviceAddressBindingReportStaticTests(unittest.TestCase):
         cls.buffer_cpp = read("src/dxvk/dxvk_buffer.cpp")
         cls.image_cpp = read("src/dxvk/dxvk_image.cpp")
         cls.memory_cpp = read("src/dxvk/dxvk_memory.cpp")
+        cls.queue_cpp = read("src/dxvk/dxvk_queue.cpp")
+        cls.presenter_cpp = read("src/dxvk/dxvk_presenter.cpp")
         cls.diagnostics = read(
             "src/d3d9/war3/tools/war3_diagnostics_hub.cpp"
         )
@@ -146,6 +148,26 @@ class DeviceAddressBindingReportStaticTests(unittest.TestCase):
         self.assertLess(driver_at, terminal_at)
         self.assertNotIn("captureDeviceFault", notify)
         self.assertIn("event.sequence > result.driverLossSequence", self.tracker_cpp)
+
+    def test_submit_and_wsi_capture_sequence_before_driver_call(self) -> None:
+        for source, call in (
+            (self.queue_cpp, "entry.submit.cmdList->submit"),
+            (self.queue_cpp, "vk->vkWaitSemaphores"),
+            (self.presenter_cpp, "m_vkd->vkQueuePresentKHR"),
+            (self.presenter_cpp, "m_vkd->vkAcquireNextImageKHR"),
+            (self.presenter_cpp, "m_vkd->vkWaitForFences"),
+            (self.presenter_cpp, "m_vkd->vkWaitForPresent"),
+        ):
+            call_at = source.index(call)
+            token_at = source.rfind(
+                "deviceAddressBindingSequenceBeforeDriverCall", 0, call_at
+            )
+            notify_at = source.index(
+                "notifyDeviceErrorFromDriverResult", call_at
+            )
+            self.assertGreaterEqual(token_at, 0)
+            self.assertLess(token_at, call_at)
+            self.assertLess(call_at, notify_at)
 
     def test_dev_build_preserves_dxvk_debug_names(self) -> None:
         for source in (self.buffer_cpp, self.image_cpp, self.memory_cpp):

@@ -71,18 +71,31 @@ namespace dxvk {
   }
 
 
+  uint32_t DxvkDeviceAddressBindingTracker::sequenceBeforeDriverCall()
+      const noexcept {
+    return std::min(m_nextSequence.load(std::memory_order_acquire),
+      std::numeric_limits<uint32_t>::max() - 1u);
+  }
+
+
   void DxvkDeviceAddressBindingTracker::markDriverLossObserved() noexcept {
+    markDriverLossObserved(sequenceBeforeDriverCall());
+  }
+
+
+  void DxvkDeviceAddressBindingTracker::markDriverLossObserved(
+          uint32_t sequenceBeforeCall) noexcept {
     if (!DxvkDeviceAddressBindingBuildEnabled ||
         !m_messengerAvailable.load(std::memory_order_acquire) ||
         !m_deviceFeatureEnabled.load(std::memory_order_acquire))
       return;
 
-    const uint32_t cutoff = std::min(
-      m_nextSequence.load(std::memory_order_acquire),
+    const uint32_t cutoff = std::min(sequenceBeforeCall,
       std::numeric_limits<uint32_t>::max() - 1u);
     uint32_t expected = std::numeric_limits<uint32_t>::max();
-    m_driverLossSequence.compare_exchange_strong(expected, cutoff,
-      std::memory_order_release, std::memory_order_relaxed);
+    while (cutoff < expected &&
+           !m_driverLossSequence.compare_exchange_weak(expected, cutoff,
+             std::memory_order_release, std::memory_order_relaxed)) { }
   }
 
 

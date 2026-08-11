@@ -423,7 +423,7 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         submit = function_body(QUEUE, "DxvkSubmissionQueue::submitCmdLists")
         submit_result = submit.index("entry.submit.cmdList->submit")
         submit_fault = submit.index(
-            "m_device->notifyDeviceErrorFromDriverResult(entry.result);"
+            "m_device->notifyDeviceErrorFromDriverResult(", submit_result
         )
         submit_terminal = submit.index(
             "if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)",
@@ -435,7 +435,7 @@ class VulkanDeviceLostFailStopStaticTests(unittest.TestCase):
         finish = function_body(QUEUE, "DxvkSubmissionQueue::finishCmdLists")
         wait = finish.index("vk->vkWaitSemaphores")
         wait_fault = finish.index(
-            "m_device->notifyDeviceErrorFromDriverResult(status);"
+            "m_device->notifyDeviceErrorFromDriverResult(", wait
         )
         self.assertLess(wait, wait_fault)
         self.assertIn("m_device->notifyDeviceError(VK_ERROR_DEVICE_LOST);", submit)

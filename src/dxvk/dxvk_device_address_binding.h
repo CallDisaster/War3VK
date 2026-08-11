@@ -74,7 +74,11 @@ namespace dxvk {
 
     void setDeviceFeatureEnabled(bool enabled) noexcept;
 
+    uint32_t sequenceBeforeDriverCall() const noexcept;
+
     void markDriverLossObserved() noexcept;
+
+    void markDriverLossObserved(uint32_t sequenceBeforeCall) noexcept;
 
     void record(
       const VkDeviceAddressBindingCallbackDataEXT& binding,

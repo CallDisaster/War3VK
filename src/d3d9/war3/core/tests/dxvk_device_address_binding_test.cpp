@@ -178,8 +178,10 @@ bool testDriverLossCutoffExcludesRetirementEvents() {
   const auto unbind = bindingInfo(0xa000u, 0x1000u,
     VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
   bindingTracker.record(bind, &unnamed);
-  bindingTracker.markDriverLossObserved();
+  const uint32_t sequenceBeforeCall =
+    bindingTracker.sequenceBeforeDriverCall();
   bindingTracker.record(unbind, &named);
+  bindingTracker.markDriverLossObserved(sequenceBeforeCall);
   bindingTracker.markDriverLossObserved();
 
   const auto fault = faultInfo(0xa888u, 0x100u);

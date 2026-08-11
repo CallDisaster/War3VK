@@ -201,9 +201,12 @@ namespace dxvk {
               trackedSubmitId = entry.latency.frameId;
           }
 
+          const uint32_t bindingSequenceBeforeSubmit =
+            m_device->deviceAddressBindingSequenceBeforeDriverCall();
           entry.result = entry.submit.cmdList->submit(
             m_semaphores, m_timelines, trackedSubmitId);
-          m_device->notifyDeviceErrorFromDriverResult(entry.result);
+          m_device->notifyDeviceErrorFromDriverResult(
+            entry.result, bindingSequenceBeforeSubmit);
           entry.timelines = m_timelines;
         } else if (entry.present.presenter != nullptr) {
           if (entry.latency.tracker)
@@ -332,9 +335,12 @@ namespace dxvk {
           waitInfo.pSemaphores = semaphores.data();
           waitInfo.pValues = timelines.data();
 
+          const uint32_t bindingSequenceBeforeWait =
+            m_device->deviceAddressBindingSequenceBeforeDriverCall();
           status = vk->vkWaitSemaphores(vk->device(), &waitInfo, ~0ull);
 
-          m_device->notifyDeviceErrorFromDriverResult(status);
+          m_device->notifyDeviceErrorFromDriverResult(
+            status, bindingSequenceBeforeWait);
 
           if (m_device->getDeviceStatus() == VK_ERROR_DEVICE_LOST)
             status = VK_ERROR_DEVICE_LOST;
