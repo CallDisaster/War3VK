@@ -327,6 +327,15 @@ public:
         uint64_t s1EarlyReplayFallbackCount = 0;
         uint64_t s1EarlySourceMismatchEvictCount = 0;
         bool s1EarlyReplayClosureMismatch = false;
+        uint64_t s1GenerationProofEntryCount = 0;
+        uint64_t s1GenerationProofEligibleCount = 0;
+        uint64_t s1GenerationProofFirstCount = 0;
+        uint64_t s1GenerationProofSameFrameCount = 0;
+        uint64_t s1GenerationProofAdvancedCount = 0;
+        uint64_t s1GenerationProofChangedCount = 0;
+        uint64_t s1GenerationProofStaleRestartCount = 0;
+        uint64_t s1GenerationProofPromotionReadyCount = 0;
+        uint64_t s1GenerationProofCapacityRejectCount = 0;
     };
 
     /**
@@ -1175,6 +1184,16 @@ private:
         uint64_t persistentS1EarlyReplayFallbackCount = 0;
         uint64_t persistentS1EarlySourceMismatchEvictCount = 0;
         uint64_t persistentS1EarlyReplayClosureMismatchFrames = 0;
+        uint64_t persistentS1GenerationProofEntryCountLast = 0;
+        uint64_t persistentS1GenerationProofEntryCountMax = 0;
+        uint64_t persistentS1GenerationProofEligibleCount = 0;
+        uint64_t persistentS1GenerationProofFirstCount = 0;
+        uint64_t persistentS1GenerationProofSameFrameCount = 0;
+        uint64_t persistentS1GenerationProofAdvancedCount = 0;
+        uint64_t persistentS1GenerationProofChangedCount = 0;
+        uint64_t persistentS1GenerationProofStaleRestartCount = 0;
+        uint64_t persistentS1GenerationProofPromotionReadyCount = 0;
+        uint64_t persistentS1GenerationProofCapacityRejectCount = 0;
         uint64_t semanticFallbackPruned = 0;
         uint64_t semanticFallbackPrunedByHandle = 0;
         uint64_t semanticFallbackPrunedByWorldObjectEntry = 0;

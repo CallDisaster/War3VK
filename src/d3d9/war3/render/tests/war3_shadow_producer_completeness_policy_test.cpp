@@ -192,11 +192,92 @@ bool testGenerationBackedStreamProof() {
                       "invalid element coverage was accepted");
 }
 
+bool testGenerationBackedStabilityProbation() {
+  using GeometryProof = policy::War3ShadowGenerationBackedGeometryProof;
+  using Observation = policy::War3ShadowGenerationObservation;
+  using Proof = policy::War3ShadowGenerationBackedStreamProof;
+  using State = policy::War3ShadowGenerationStabilityState;
+  using Kind = policy::War3ShadowStreamKind;
+
+  auto makeProof = [](uintptr_t owner, Kind kind) {
+    Proof proof = {};
+    proof.ownerIdentity = owner;
+    proof.identityGeneration = 3u;
+    proof.allocationGeneration = 5u;
+    proof.contentGeneration = 7u;
+    proof.sourceOffset = kind == Kind::Position ? 64u : 128u;
+    proof.sourceLength = kind == Kind::Position ? 384u : 96u;
+    proof.elementStride = kind == Kind::Position ? 12u : 2u;
+    proof.elementSize = proof.elementStride;
+    proof.mapEpoch = 11u;
+    proof.deviceEpoch = 13u;
+    proof.streamKind = kind;
+    return proof;
+  };
+
+  GeometryProof proof = {};
+  proof.position = makeProof(0x1234u, Kind::Position);
+  proof.index = makeProof(0x5678u, Kind::Index);
+  proof.indexed = true;
+  State state = {};
+
+  auto first = policy::ObserveWar3ShadowGenerationStability(
+      state, proof, 100u);
+  if (!require(first.observation == Observation::First &&
+                   !first.promotionReady && state.distinctStableFrames == 1u,
+               "first proof observation incorrectly authorized promotion"))
+    return false;
+  auto sameFrame = policy::ObserveWar3ShadowGenerationStability(
+      state, proof, 100u);
+  if (!require(sameFrame.observation == Observation::SameFrame &&
+                   !sameFrame.promotionReady &&
+                   state.distinctStableFrames == 1u,
+               "same-frame draws manufactured generation stability"))
+    return false;
+  auto advanced = policy::ObserveWar3ShadowGenerationStability(
+      state, proof, 101u);
+  if (!require(advanced.observation == Observation::Advanced &&
+                   advanced.promotionReady &&
+                   state.distinctStableFrames == 2u,
+               "adjacent exact proof did not become promotion-ready"))
+    return false;
+
+  auto changedProof = proof;
+  ++changedProof.position.contentGeneration;
+  auto changed = policy::ObserveWar3ShadowGenerationStability(
+      state, changedProof, 102u);
+  if (!require(changed.observation == Observation::Changed &&
+                   !changed.promotionReady &&
+                   state.distinctStableFrames == 1u,
+               "content generation change did not restart probation"))
+    return false;
+
+  auto stale = policy::ObserveWar3ShadowGenerationStability(
+      state, changedProof, 110u);
+  if (!require(stale.observation == Observation::StaleRestart &&
+                   !stale.promotionReady &&
+                   state.distinctStableFrames == 1u,
+               "non-adjacent observation retained stale stability"))
+    return false;
+
+  GeometryProof invalid = proof;
+  invalid.index.contentGeneration = 0u;
+  const auto before = state;
+  auto rejected = policy::ObserveWar3ShadowGenerationStability(
+      state, invalid, 111u);
+  return require(rejected.observation == Observation::Invalid &&
+                     !rejected.promotionReady &&
+                     state.lastObservedFrame == before.lastObservedFrame &&
+                     state.distinctStableFrames == before.distinctStableFrames,
+                 "invalid proof mutated probation state");
+}
+
 } // namespace
 
 int main() {
   return testProducerCompletenessStampAndSaturation() &&
       testProtectedWorkingSetLru() &&
       testRequiredCasterHardAdmissionIsOrderIndependent() &&
-      testGenerationBackedStreamProof() ? 0 : 1;
+      testGenerationBackedStreamProof() &&
+      testGenerationBackedStabilityProbation() ? 0 : 1;
 }

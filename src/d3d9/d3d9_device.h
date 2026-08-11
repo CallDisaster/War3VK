@@ -2401,6 +2401,20 @@ private:
     // 命中但源指纹不匹配（key 碰撞或 VB 指针复用）而被淘汰的次数。
     // 非零即证明 early key 碰撞在真实运行中发生过。
     uint64_t s1EarlySourceMismatchEvictCount = 0;
+
+    // Observe-only generation proof for dynamic S1 terrain. These counters do
+    // not authorize cache consumption; they establish whether the exact owner,
+    // allocation, content generation and source ranges remain identical on
+    // adjacent frames before a later persistent-promotion candidate is built.
+    uint64_t s1GenerationProofEntryCount = 0;
+    uint64_t s1GenerationProofEligibleCount = 0;
+    uint64_t s1GenerationProofFirstCount = 0;
+    uint64_t s1GenerationProofSameFrameCount = 0;
+    uint64_t s1GenerationProofAdvancedCount = 0;
+    uint64_t s1GenerationProofChangedCount = 0;
+    uint64_t s1GenerationProofStaleRestartCount = 0;
+    uint64_t s1GenerationProofPromotionReadyCount = 0;
+    uint64_t s1GenerationProofCapacityRejectCount = 0;
   };
   struct War3ShadowPersistentGeometryEntry {
     War3ShadowGeometryRegistryKey key = {};
@@ -2814,6 +2828,13 @@ private:
   };
   std::vector<War3RetiredShadowSession> m_war3RetiredShadowSessions;
   War3S1TerrainEarlyCache m_war3S1TerrainEarlyCache;
+  struct War3S1GenerationProofObservationEntry {
+    dxvk::war3::render::War3ShadowGenerationStabilityState state = {};
+    uint64_t lastSeenFrame = 0u;
+  };
+  std::unordered_map<uint64_t, War3S1GenerationProofObservationEntry>
+      m_war3S1GenerationProofObservations;
+  uint64_t m_war3S1GenerationProofLastGcFrame = 0u;
   // One persistent geometry can back multiple S1 tiles because the persistent
   // key may omit worldMatrix while the early key includes it. Keep a one-to-many
   // reverse index so retiring a persistent geometry also releases every strong
@@ -2921,6 +2942,7 @@ private:
   void War3EraseS1TerrainEarlyAliasesForPersistentGeometry(
       uint32_t persistentGeometryId);
   void War3GcS1TerrainEarlyCache();
+  void War3GcS1GenerationProofObservations();
   void War3TryCaptureShadowCaster(D3DPRIMITIVETYPE PrimitiveType,
                                   INT BaseVertexIndex, UINT MinVertexIndex,
                                   UINT NumVertices, UINT StartVal,

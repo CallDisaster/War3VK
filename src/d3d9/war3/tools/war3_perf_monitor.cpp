@@ -2363,6 +2363,27 @@ void War3PerfMonitor::notePersistentGeometryFrame(
       stats.s1EarlySourceMismatchEvictCount;
   if (stats.s1EarlyReplayClosureMismatch)
     agg.persistentS1EarlyReplayClosureMismatchFrames++;
+  agg.persistentS1GenerationProofEntryCountLast =
+      stats.s1GenerationProofEntryCount;
+  agg.persistentS1GenerationProofEntryCountMax =
+      (std::max)(agg.persistentS1GenerationProofEntryCountMax,
+                 stats.s1GenerationProofEntryCount);
+  agg.persistentS1GenerationProofEligibleCount +=
+      stats.s1GenerationProofEligibleCount;
+  agg.persistentS1GenerationProofFirstCount +=
+      stats.s1GenerationProofFirstCount;
+  agg.persistentS1GenerationProofSameFrameCount +=
+      stats.s1GenerationProofSameFrameCount;
+  agg.persistentS1GenerationProofAdvancedCount +=
+      stats.s1GenerationProofAdvancedCount;
+  agg.persistentS1GenerationProofChangedCount +=
+      stats.s1GenerationProofChangedCount;
+  agg.persistentS1GenerationProofStaleRestartCount +=
+      stats.s1GenerationProofStaleRestartCount;
+  agg.persistentS1GenerationProofPromotionReadyCount +=
+      stats.s1GenerationProofPromotionReadyCount;
+  agg.persistentS1GenerationProofCapacityRejectCount +=
+      stats.s1GenerationProofCapacityRejectCount;
 }
 
 void War3PerfMonitor::noteShadowMapFallback(bool reusedLastComplete,
@@ -7212,6 +7233,26 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.persistentS1EarlyReplayFallbackCount << ",\n";
   json << "    \"persistentS1EarlyReplayClosureMismatchFrames\": "
        << shadowAgg.persistentS1EarlyReplayClosureMismatchFrames << ",\n";
+  json << "    \"persistentS1GenerationProofEntryCount\": "
+       << shadowAgg.persistentS1GenerationProofEntryCountLast << ",\n";
+  json << "    \"persistentS1GenerationProofEntryCountMax\": "
+       << shadowAgg.persistentS1GenerationProofEntryCountMax << ",\n";
+  json << "    \"persistentS1GenerationProofEligibleCount\": "
+       << shadowAgg.persistentS1GenerationProofEligibleCount << ",\n";
+  json << "    \"persistentS1GenerationProofFirstCount\": "
+       << shadowAgg.persistentS1GenerationProofFirstCount << ",\n";
+  json << "    \"persistentS1GenerationProofSameFrameCount\": "
+       << shadowAgg.persistentS1GenerationProofSameFrameCount << ",\n";
+  json << "    \"persistentS1GenerationProofAdvancedCount\": "
+       << shadowAgg.persistentS1GenerationProofAdvancedCount << ",\n";
+  json << "    \"persistentS1GenerationProofChangedCount\": "
+       << shadowAgg.persistentS1GenerationProofChangedCount << ",\n";
+  json << "    \"persistentS1GenerationProofStaleRestartCount\": "
+       << shadowAgg.persistentS1GenerationProofStaleRestartCount << ",\n";
+  json << "    \"persistentS1GenerationProofPromotionReadyCount\": "
+       << shadowAgg.persistentS1GenerationProofPromotionReadyCount << ",\n";
+  json << "    \"persistentS1GenerationProofCapacityRejectCount\": "
+       << shadowAgg.persistentS1GenerationProofCapacityRejectCount << ",\n";
   json << "    \"semanticFallbackPruned\": "
        << shadowAgg.semanticFallbackPruned << ",\n";
   json << "    \"semanticFallbackPrunedByHandle\": "
@@ -8519,6 +8560,26 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.persistentS1EarlyReplayFallbackCount << ",\n";
   json << "    \"persistentS1EarlyReplayClosureMismatchFrames\": "
        << shadowAgg.persistentS1EarlyReplayClosureMismatchFrames << ",\n";
+  json << "    \"persistentS1GenerationProofEntryCount\": "
+       << shadowAgg.persistentS1GenerationProofEntryCountLast << ",\n";
+  json << "    \"persistentS1GenerationProofEntryCountMax\": "
+       << shadowAgg.persistentS1GenerationProofEntryCountMax << ",\n";
+  json << "    \"persistentS1GenerationProofEligibleCount\": "
+       << shadowAgg.persistentS1GenerationProofEligibleCount << ",\n";
+  json << "    \"persistentS1GenerationProofFirstCount\": "
+       << shadowAgg.persistentS1GenerationProofFirstCount << ",\n";
+  json << "    \"persistentS1GenerationProofSameFrameCount\": "
+       << shadowAgg.persistentS1GenerationProofSameFrameCount << ",\n";
+  json << "    \"persistentS1GenerationProofAdvancedCount\": "
+       << shadowAgg.persistentS1GenerationProofAdvancedCount << ",\n";
+  json << "    \"persistentS1GenerationProofChangedCount\": "
+       << shadowAgg.persistentS1GenerationProofChangedCount << ",\n";
+  json << "    \"persistentS1GenerationProofStaleRestartCount\": "
+       << shadowAgg.persistentS1GenerationProofStaleRestartCount << ",\n";
+  json << "    \"persistentS1GenerationProofPromotionReadyCount\": "
+       << shadowAgg.persistentS1GenerationProofPromotionReadyCount << ",\n";
+  json << "    \"persistentS1GenerationProofCapacityRejectCount\": "
+       << shadowAgg.persistentS1GenerationProofCapacityRejectCount << ",\n";
   json << "    \"semanticFallbackPruned\": "
        << shadowAgg.semanticFallbackPruned << ",\n";
   json << "    \"semanticFallbackPrunedByHandle\": "

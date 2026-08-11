@@ -20546,6 +20546,26 @@ void D3D9DeviceEx::War3GcS1TerrainEarlyCache() {
   }
 }
 
+void D3D9DeviceEx::War3GcS1GenerationProofObservations() {
+  const uint64_t currentFrame = m_war3ShadowPersistentFrameSerial;
+  if (currentFrame < m_war3S1GenerationProofLastGcFrame ||
+      currentFrame - m_war3S1GenerationProofLastGcFrame < 120u) {
+    return;
+  }
+
+  m_war3S1GenerationProofLastGcFrame = currentFrame;
+  const uint64_t maxAge = War3GetShadowPersistentMaxAgeFrames();
+  for (auto it = m_war3S1GenerationProofObservations.begin();
+       it != m_war3S1GenerationProofObservations.end();) {
+    if (currentFrame > it->second.lastSeenFrame &&
+        currentFrame - it->second.lastSeenFrame > maxAge) {
+      it = m_war3S1GenerationProofObservations.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 bool D3D9DeviceEx::War3CreateShadowPersistentBuffer(
     const War3ShadowPersistentUpload &upload, Rc<DxvkBuffer> &outStorage,
     DxvkResourceBufferInfo &outInfo) {
@@ -24670,6 +24690,7 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3DrawTimeVBCache = {};
   m_war3S1TerrainCasterStash = {};
   m_war3S1TerrainEarlyCache = {};
+  m_war3S1GenerationProofObservations.clear();
 
   // The GPU-owned containers remain in the retired session above. This only
   // drops CPU lookup aliases so a recycled map-B address cannot inherit a
@@ -24698,6 +24719,7 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   m_war3S1TerrainEarlyPersistentBackedCount = 0u;
   m_war3S1TerrainEarlyFallbackBackedCount = 0u;
   m_war3S1TerrainEarlyLogicalReferencedBytes = 0u;
+  m_war3S1GenerationProofLastGcFrame = 0u;
   m_war3S1TerrainStashBuiltFrameSerial = 0u;
   m_war3S1TerrainStashCaptureFrameSerial = 0u;
   m_war3FrameFreezeCatalogSerial = 0u;
@@ -33997,6 +34019,7 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     auto phaseScope =
         War3PresentFrameTransitionScope("S1TerrainEarlyCacheGc");
     War3GcS1TerrainEarlyCache();
+    War3GcS1GenerationProofObservations();
   }
   {
     auto phaseScope =
@@ -34018,6 +34041,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
         m_war3S1TerrainEarlyFallbackBackedCount;
     m_war3ShadowPersistentDiagnosticsFrame.s1EarlyLogicalReferencedBytes =
         m_war3S1TerrainEarlyLogicalReferencedBytes;
+    m_war3ShadowPersistentDiagnosticsFrame.s1GenerationProofEntryCount =
+        static_cast<uint64_t>(m_war3S1GenerationProofObservations.size());
     const auto completed =
         std::exchange(m_war3ShadowPersistentDiagnosticsFrame, {});
     war3::War3PerfMonitor::PersistentGeometryFrameStats stats = {};
@@ -34068,6 +34093,22 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
         completed.s1EarlyReplayFallbackCount;
     stats.s1EarlySourceMismatchEvictCount =
         completed.s1EarlySourceMismatchEvictCount;
+    stats.s1GenerationProofEntryCount = completed.s1GenerationProofEntryCount;
+    stats.s1GenerationProofEligibleCount =
+        completed.s1GenerationProofEligibleCount;
+    stats.s1GenerationProofFirstCount = completed.s1GenerationProofFirstCount;
+    stats.s1GenerationProofSameFrameCount =
+        completed.s1GenerationProofSameFrameCount;
+    stats.s1GenerationProofAdvancedCount =
+        completed.s1GenerationProofAdvancedCount;
+    stats.s1GenerationProofChangedCount =
+        completed.s1GenerationProofChangedCount;
+    stats.s1GenerationProofStaleRestartCount =
+        completed.s1GenerationProofStaleRestartCount;
+    stats.s1GenerationProofPromotionReadyCount =
+        completed.s1GenerationProofPromotionReadyCount;
+    stats.s1GenerationProofCapacityRejectCount =
+        completed.s1GenerationProofCapacityRejectCount;
     stats.s1EarlyReplayClosureMismatch =
         completed.s1EarlyAcceptedHitCount !=
             completed.s1EarlyReplayPublishedCount ||
@@ -46280,6 +46321,240 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     return currentWorld;
   };
   Matrix4 shadowWorldMatrix = chooseShadowWorldMatrix(currentWorldMatrix);
+
+  // Observe whether opaque S1 terrain has an exact source generation that is
+  // genuinely stable across adjacent frames. This does not change routing:
+  // the existing stable-static persistent path and exact Arena fallback remain
+  // authoritative until a separate consume candidate is built and validated.
+  using GenerationBackedGeometryProof =
+      dxvk::war3::render::War3ShadowGenerationBackedGeometryProof;
+  using GenerationBackedStreamProof =
+      dxvk::war3::render::War3ShadowGenerationBackedStreamProof;
+  using ShadowStreamKind = dxvk::war3::render::War3ShadowStreamKind;
+  GenerationBackedGeometryProof s1GenerationProof = {};
+  bool s1GenerationProofPromotionReady = false;
+  if (terrainS1Caster && !alphaTestEnabled && !alphaBlend &&
+      War3ClassifyShadowReplayMode(vertexBlendEnabled, vbIndexed) ==
+          War3ShadowReplayMode::FixedWorld) {
+    const auto makeDirectProof =
+        [&](const D3D9CommonBuffer* common, uint64_t sourceOffset,
+            uint64_t sourceLength, uint32_t elementStride,
+            ShadowStreamKind streamKind) {
+          GenerationBackedStreamProof proof = {};
+          if (common == nullptr || common->NeedsReadback() ||
+              sourceLength == 0u || elementStride == 0u)
+            return proof;
+          proof.ownerIdentity = reinterpret_cast<uintptr_t>(common);
+          proof.identityGeneration = common->War3IdentityGeneration();
+          proof.allocationGeneration = common->War3MapAllocationGeneration();
+          proof.contentGeneration = common->War3ContentGeneration();
+          proof.sourceOffset = sourceOffset;
+          proof.sourceLength = sourceLength;
+          proof.elementStride = elementStride;
+          proof.elementSize = elementStride;
+          proof.mapEpoch = m_war3GpuSkinMapEpoch;
+          proof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+          proof.streamKind = streamKind;
+          return proof.valid() ? proof : GenerationBackedStreamProof{};
+        };
+    const auto makeUploadPositionProof = [&]() {
+      GenerationBackedStreamProof proof = {};
+      if (!DynamicSysmemVBOs || posStream >= caps::MaxStreams ||
+          vbCommon == nullptr ||
+          !m_war3PerDrawUpload.vbSourceValid[posStream] ||
+          m_war3PerDrawUpload.vbSourceResource[posStream] !=
+              reinterpret_cast<uintptr_t>(vbCommon) ||
+          m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream] !=
+              vbCommon->War3IdentityGeneration() ||
+          m_war3PerDrawUpload.vbSourceSequence[posStream] !=
+              vbCommon->GetMappingBufferSequenceNumber() ||
+          m_war3PerDrawUpload.vbSourceContentGeneration[posStream] !=
+              vbCommon->War3ContentGeneration()) {
+        return proof;
+      }
+      const uint32_t sourceStride =
+          m_war3PerDrawUpload.vbSourceElementStride[posStream];
+      const uint32_t packedStride =
+          m_war3PerDrawUpload.vbSourceElementSize[posStream];
+      if (sourceStride == 0u || packedStride == 0u ||
+          packedStride > sourceStride ||
+          uint64_t(posFreezeByteOffset) % packedStride != 0u ||
+          uint64_t(posBytesNeeded) % packedStride != 0u)
+        return proof;
+      const uint64_t firstElement = uint64_t(posFreezeByteOffset) / packedStride;
+      const uint64_t elementCount = uint64_t(posBytesNeeded) / packedStride;
+      if (elementCount == 0u ||
+          firstElement >
+              (UINT64_MAX -
+               m_war3PerDrawUpload.vbSourceOffset[posStream]) /
+                  sourceStride ||
+          elementCount - 1u >
+              (UINT64_MAX - packedStride) / sourceStride)
+        return proof;
+      const uint64_t canonicalOffset =
+          uint64_t(m_war3PerDrawUpload.vbSourceOffset[posStream]) +
+          firstElement * uint64_t(sourceStride);
+      const uint64_t canonicalLength =
+          (elementCount - 1u) * uint64_t(sourceStride) + packedStride;
+      const uint64_t sourceBegin =
+          m_war3PerDrawUpload.vbSourceOffset[posStream];
+      const uint64_t sourceLength =
+          m_war3PerDrawUpload.vbSourceLength[posStream];
+      if (canonicalOffset < sourceBegin ||
+          canonicalOffset - sourceBegin > sourceLength ||
+          canonicalLength > sourceLength - (canonicalOffset - sourceBegin))
+        return proof;
+      proof.ownerIdentity =
+          m_war3PerDrawUpload.vbSourceResource[posStream];
+      proof.identityGeneration =
+          m_war3PerDrawUpload.vbSourceIdentityGeneration[posStream];
+      proof.allocationGeneration =
+          m_war3PerDrawUpload.vbSourceSequence[posStream];
+      proof.contentGeneration =
+          m_war3PerDrawUpload.vbSourceContentGeneration[posStream];
+      proof.sourceOffset = canonicalOffset;
+      proof.sourceLength = canonicalLength;
+      proof.elementStride = sourceStride;
+      proof.elementSize = packedStride;
+      proof.mapEpoch = m_war3GpuSkinMapEpoch;
+      proof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+      proof.streamKind = ShadowStreamKind::Position;
+      return proof.valid() ? proof : GenerationBackedStreamProof{};
+    };
+
+    s1GenerationProof.indexed = indexed;
+    if (DynamicSysmemVBOs) {
+      s1GenerationProof.position = makeUploadPositionProof();
+    } else if (uint64_t(posFreezeByteOffset) <= posSlice.length() &&
+               uint64_t(posBytesNeeded) <=
+                   posSlice.length() - uint64_t(posFreezeByteOffset)) {
+      s1GenerationProof.position = makeDirectProof(
+          vbCommon, uint64_t(posSlice.offset()) + uint64_t(posFreezeByteOffset),
+          uint64_t(posBytesNeeded), posStride, ShadowStreamKind::Position);
+    }
+
+    if (indexed) {
+      const uint32_t indexStride =
+          indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u;
+      const uint64_t drawIndexOffset = uint64_t(StartVal) * indexStride;
+      const uint64_t drawIndexBytes = uint64_t(CountVal) * indexStride;
+      auto* indexCommon = m_state.indices.ptr() != nullptr
+          ? m_state.indices.ptr()->GetCommonBuffer()
+          : nullptr;
+      if (DynamicSysmemIBO && indexCommon != nullptr &&
+          m_war3PerDrawUpload.ibSourceValid &&
+          m_war3PerDrawUpload.ibSourceResource ==
+              reinterpret_cast<uintptr_t>(indexCommon) &&
+          m_war3PerDrawUpload.ibSourceIdentityGeneration ==
+              indexCommon->War3IdentityGeneration() &&
+          m_war3PerDrawUpload.ibSourceSequence ==
+              indexCommon->GetMappingBufferSequenceNumber() &&
+          m_war3PerDrawUpload.ibSourceContentGeneration ==
+              indexCommon->War3ContentGeneration() &&
+          drawIndexOffset <= m_war3PerDrawUpload.ibSourceLength &&
+          drawIndexBytes <=
+              uint64_t(m_war3PerDrawUpload.ibSourceLength) - drawIndexOffset) {
+        auto& proof = s1GenerationProof.index;
+        proof.ownerIdentity = m_war3PerDrawUpload.ibSourceResource;
+        proof.identityGeneration =
+            m_war3PerDrawUpload.ibSourceIdentityGeneration;
+        proof.allocationGeneration = m_war3PerDrawUpload.ibSourceSequence;
+        proof.contentGeneration =
+            m_war3PerDrawUpload.ibSourceContentGeneration;
+        proof.sourceOffset =
+            uint64_t(m_war3PerDrawUpload.ibSourceOffset) + drawIndexOffset;
+        proof.sourceLength = drawIndexBytes;
+        proof.elementStride = indexStride;
+        proof.elementSize = indexStride;
+        proof.mapEpoch = m_war3GpuSkinMapEpoch;
+        proof.deviceEpoch = m_war3GpuSkinDeviceEpoch;
+        proof.streamKind = ShadowStreamKind::Index;
+        if (!proof.valid())
+          proof = {};
+      } else if (!DynamicSysmemIBO &&
+                 drawIndexOffset <= idxSlice.length() &&
+                 drawIndexBytes <= idxSlice.length() - drawIndexOffset) {
+        s1GenerationProof.index = makeDirectProof(
+            indexCommon, uint64_t(idxSlice.offset()) + drawIndexOffset,
+            drawIndexBytes, indexStride, ShadowStreamKind::Index);
+      }
+    }
+
+    if (s1GenerationProof.valid()) {
+      auto& diagnostics = m_war3ShadowPersistentDiagnosticsFrame;
+      diagnostics.s1GenerationProofEligibleCount++;
+      uint64_t observationKey = bit::fnv1a_init();
+      const auto hashProofIdentity = [&](const GenerationBackedStreamProof& p) {
+        observationKey = bit::fnv1a_iter(observationKey, p.ownerIdentity);
+        observationKey = bit::fnv1a_iter(
+            observationKey, p.identityGeneration);
+        observationKey = bit::fnv1a_iter(observationKey, p.sourceOffset);
+        observationKey = bit::fnv1a_iter(observationKey, p.sourceLength);
+        observationKey = bit::fnv1a_iter(observationKey, p.elementStride);
+        observationKey = bit::fnv1a_iter(observationKey, p.elementSize);
+      };
+      hashProofIdentity(s1GenerationProof.position);
+      if (indexed)
+        hashProofIdentity(s1GenerationProof.index);
+      observationKey = bit::fnv1a_iter(observationKey, uint32_t(topo));
+      observationKey = bit::fnv1a_iter(observationKey, uint32_t(StartVal));
+      observationKey = bit::fnv1a_iter(observationKey, uint32_t(CountVal));
+      observationKey = bit::fnv1a_iter(
+          observationKey, uint32_t(BaseVertexIndex));
+      for (uint32_t col = 0u; col < 4u; ++col) {
+        for (uint32_t row = 0u; row < 4u; ++row) {
+          observationKey = bit::fnv1a_iter(
+              observationKey,
+              bit::cast<uint32_t>(shadowWorldMatrix[col][row]));
+        }
+      }
+
+      constexpr size_t kMaxS1GenerationProofObservations = 16384u;
+      auto observationIt =
+          m_war3S1GenerationProofObservations.find(observationKey);
+      if (observationIt != m_war3S1GenerationProofObservations.end() ||
+          m_war3S1GenerationProofObservations.size() <
+              kMaxS1GenerationProofObservations) {
+        auto [it, inserted] =
+            m_war3S1GenerationProofObservations.try_emplace(observationKey);
+        (void)inserted;
+        const uint64_t observationFrame =
+            m_war3ShadowPersistentFrameSerial + 1u;
+        const auto result =
+            dxvk::war3::render::ObserveWar3ShadowGenerationStability(
+                it->second.state, s1GenerationProof, observationFrame);
+        it->second.lastSeenFrame = observationFrame;
+        using Observation =
+            dxvk::war3::render::War3ShadowGenerationObservation;
+        switch (result.observation) {
+        case Observation::First:
+          diagnostics.s1GenerationProofFirstCount++;
+          break;
+        case Observation::SameFrame:
+          diagnostics.s1GenerationProofSameFrameCount++;
+          break;
+        case Observation::Advanced:
+          diagnostics.s1GenerationProofAdvancedCount++;
+          break;
+        case Observation::Changed:
+          diagnostics.s1GenerationProofChangedCount++;
+          break;
+        case Observation::StaleRestart:
+          diagnostics.s1GenerationProofStaleRestartCount++;
+          break;
+        case Observation::Invalid:
+          break;
+        }
+        if (result.promotionReady) {
+          diagnostics.s1GenerationProofPromotionReadyCount++;
+          s1GenerationProofPromotionReady = true;
+        }
+      } else {
+        diagnostics.s1GenerationProofCapacityRejectCount++;
+      }
+    }
+  }
+  (void)s1GenerationProofPromotionReady;
   if (terrainDoodadCaster) {
     const float translationLenSq =
         matrixTranslationLenSq(shadowWorldMatrix);

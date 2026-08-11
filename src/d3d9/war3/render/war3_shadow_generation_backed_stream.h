@@ -49,4 +49,98 @@ struct War3ShadowGenerationBackedStreamProof {
   }
 };
 
+struct War3ShadowGenerationBackedGeometryProof {
+  War3ShadowGenerationBackedStreamProof position = {};
+  War3ShadowGenerationBackedStreamProof index = {};
+  bool indexed = false;
+
+  constexpr bool valid() const noexcept {
+    return position.valid() &&
+        position.streamKind == War3ShadowStreamKind::Position &&
+        (!indexed || (index.valid() &&
+            index.streamKind == War3ShadowStreamKind::Index));
+  }
+
+  constexpr bool matches(
+      const War3ShadowGenerationBackedGeometryProof& other) const noexcept {
+    return valid() && other.valid() && indexed == other.indexed &&
+        position.matches(other.position) &&
+        (!indexed || index.matches(other.index));
+  }
+};
+
+struct War3ShadowGenerationStabilityState {
+  War3ShadowGenerationBackedGeometryProof proof = {};
+  uint64_t lastObservedFrame = 0u;
+  uint32_t distinctStableFrames = 0u;
+};
+
+enum class War3ShadowGenerationObservation : uint8_t {
+  Invalid = 0u,
+  First,
+  SameFrame,
+  Advanced,
+  Changed,
+  StaleRestart,
+};
+
+struct War3ShadowGenerationObservationResult {
+  War3ShadowGenerationObservation observation =
+      War3ShadowGenerationObservation::Invalid;
+  bool promotionReady = false;
+};
+
+// A source is eligible for persistent promotion only after the exact same
+// generation-backed proof was observed on distinct, adjacent render frames.
+// Multiple terrain draws in one frame cannot manufacture stability, and a
+// source-generation change restarts probation instead of reusing old bytes.
+constexpr War3ShadowGenerationObservationResult
+ObserveWar3ShadowGenerationStability(
+    War3ShadowGenerationStabilityState& state,
+    const War3ShadowGenerationBackedGeometryProof& proof,
+    uint64_t frameSerial,
+    uint32_t requiredDistinctFrames = 2u) noexcept {
+  War3ShadowGenerationObservationResult result = {};
+  if (!proof.valid() || frameSerial == 0u || requiredDistinctFrames == 0u)
+    return result;
+
+  const auto restart = [&](War3ShadowGenerationObservation observation) {
+    state.proof = proof;
+    state.lastObservedFrame = frameSerial;
+    state.distinctStableFrames = 1u;
+    result.observation = observation;
+    result.promotionReady = requiredDistinctFrames <= 1u;
+  };
+
+  if (!state.proof.valid() || state.lastObservedFrame == 0u) {
+    restart(War3ShadowGenerationObservation::First);
+    return result;
+  }
+
+  if (!state.proof.matches(proof)) {
+    restart(War3ShadowGenerationObservation::Changed);
+    return result;
+  }
+
+  if (frameSerial == state.lastObservedFrame) {
+    result.observation = War3ShadowGenerationObservation::SameFrame;
+    result.promotionReady =
+        state.distinctStableFrames >= requiredDistinctFrames;
+    return result;
+  }
+
+  if (frameSerial != state.lastObservedFrame + 1u) {
+    restart(War3ShadowGenerationObservation::StaleRestart);
+    return result;
+  }
+
+  state.lastObservedFrame = frameSerial;
+  if (state.distinctStableFrames != UINT32_MAX)
+    ++state.distinctStableFrames;
+  result.observation = War3ShadowGenerationObservation::Advanced;
+  result.promotionReady =
+      state.distinctStableFrames >= requiredDistinctFrames;
+  return result;
+}
+
 } // namespace dxvk::war3::render
