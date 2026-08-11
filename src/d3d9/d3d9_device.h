@@ -2574,6 +2574,7 @@ private:
     // 包含完整 stride 的 vertex 数据；shader 用 positionStride/positionOffset
     // 读取 xyz。
     Rc<DxvkBuffer> positionBuffer;
+    Rc<DxvkResourceAllocation> positionPinnedAllocation;
     DxvkResourceBufferInfo positionInfo = {};
     uint32_t positionStride = 0u;
     uint32_t positionOffset = 0u;
@@ -2591,6 +2592,7 @@ private:
     int32_t consumeVertexOffset = 0;
     // index buffer（未 rebase；index 值仍指向原 vertex 编号空间）
     Rc<DxvkBuffer> indexBuffer;
+    Rc<DxvkResourceAllocation> indexPinnedAllocation;
     DxvkResourceBufferInfo indexInfo = {};
     VkIndexType indexType = VK_INDEX_TYPE_UINT16;
     uint32_t indexCount = 0u;
@@ -2675,6 +2677,7 @@ private:
     // 注意：可能与 positionBuffer 不在同一个 stream。capture 时如果 UV stream
     // 与 position stream 相同，复用 positionBuffer；否则单独 GPU copy 一份。
     Rc<DxvkBuffer> uvBuffer;
+    Rc<DxvkResourceAllocation> uvPinnedAllocation;
     DxvkResourceBufferInfo uvInfo = {};
     uint32_t uvStride = 0u;
     uint32_t uvOffset = 0u;

@@ -2217,6 +2217,28 @@ void WriteTraceFrameEvent(
      << stats.drawTimeDirectStaticIndexBindCount
      << ",\"drawTimeDirectStaticIndexBytes\":"
      << stats.drawTimeDirectStaticIndexBytes
+     << ",\"drawTimeDirectUploadPositionBindCount\":"
+     << stats.drawTimeDirectUploadPositionBindCount
+     << ",\"drawTimeDirectUploadPositionBytes\":"
+     << stats.drawTimeDirectUploadPositionBytes
+     << ",\"drawTimeDirectUploadUvBindCount\":"
+     << stats.drawTimeDirectUploadUvBindCount
+     << ",\"drawTimeDirectUploadUvBytes\":"
+     << stats.drawTimeDirectUploadUvBytes
+     << ",\"drawTimeDirectUploadIndexBindCount\":"
+     << stats.drawTimeDirectUploadIndexBindCount
+     << ",\"drawTimeDirectUploadIndexBytes\":"
+     << stats.drawTimeDirectUploadIndexBytes
+     << ",\"drawTimeDirectUploadCandidateCount\":"
+     << stats.drawTimeDirectUploadCandidateCount
+     << ",\"drawTimeDirectUploadRejectNoProofCount\":"
+     << stats.drawTimeDirectUploadRejectNoProofCount
+     << ",\"drawTimeDirectUploadRejectNoStorageCount\":"
+     << stats.drawTimeDirectUploadRejectNoStorageCount
+     << ",\"drawTimeDirectUploadRejectRangeCount\":"
+     << stats.drawTimeDirectUploadRejectRangeCount
+     << ",\"drawTimePositionAllocDirectMutableRequestCount\":"
+     << stats.drawTimePositionAllocDirectMutableRequestCount
      << ",\"drawTimeVBCacheUvCopyCount\":"
      << stats.drawTimeVBCacheUvCopyCount
      << ",\"drawTimeVBCacheUvCopyBytes\":"

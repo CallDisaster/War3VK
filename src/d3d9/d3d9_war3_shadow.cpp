@@ -4937,9 +4937,15 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
       if (!prep.lifetimeResourcesTracked) {
         if (draw.positionStorage.ptr() != nullptr)
           ctx->track(draw.positionStorage);
+        if (draw.positionPinnedAllocation.ptr() != nullptr)
+          ctx->track(draw.positionPinnedAllocation);
         if (draw.indexStorage.ptr() != nullptr &&
             draw.indexStorage.ptr() != draw.positionStorage.ptr())
           ctx->track(draw.indexStorage);
+        if (draw.indexPinnedAllocation.ptr() != nullptr &&
+            draw.indexPinnedAllocation.ptr() !=
+                draw.positionPinnedAllocation.ptr())
+          ctx->track(draw.indexPinnedAllocation);
         if (draw.blendStorage.ptr() != nullptr)
           ctx->track(draw.blendStorage);
         if (prep.effectiveAlphaTest && draw.uvBinding != 0u &&
@@ -4947,6 +4953,13 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
             draw.uvStorage.ptr() != draw.positionStorage.ptr() &&
             draw.uvStorage.ptr() != draw.blendStorage.ptr())
           ctx->track(draw.uvStorage);
+        if (prep.effectiveAlphaTest &&
+            draw.uvPinnedAllocation.ptr() != nullptr &&
+            draw.uvPinnedAllocation.ptr() !=
+                draw.positionPinnedAllocation.ptr() &&
+            draw.uvPinnedAllocation.ptr() !=
+                draw.indexPinnedAllocation.ptr())
+          ctx->track(draw.uvPinnedAllocation);
         if (gpuSkinDirect) {
           ctx->track(draw.gpuSkinInput.staticSource.buffer());
           if (draw.gpuSkinInput.palette.buffer().ptr() !=
@@ -5285,9 +5298,15 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
 
         if (draw.positionStorage.ptr() != nullptr)
           ctx->track(draw.positionStorage);
+        if (draw.positionPinnedAllocation.ptr() != nullptr)
+          ctx->track(draw.positionPinnedAllocation);
         if (draw.indexStorage.ptr() != nullptr &&
             draw.indexStorage.ptr() != draw.positionStorage.ptr())
           ctx->track(draw.indexStorage);
+        if (draw.indexPinnedAllocation.ptr() != nullptr &&
+            draw.indexPinnedAllocation.ptr() !=
+                draw.positionPinnedAllocation.ptr())
+          ctx->track(draw.indexPinnedAllocation);
         if (draw.blendStorage.ptr() != nullptr &&
             draw.blendStorage.ptr() != draw.positionStorage.ptr())
           ctx->track(draw.blendStorage);
@@ -5296,6 +5315,13 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
             draw.uvStorage.ptr() != draw.positionStorage.ptr() &&
             draw.uvStorage.ptr() != draw.blendStorage.ptr())
           ctx->track(draw.uvStorage);
+        if (prep.effectiveAlphaTest &&
+            draw.uvPinnedAllocation.ptr() != nullptr &&
+            draw.uvPinnedAllocation.ptr() !=
+                draw.positionPinnedAllocation.ptr() &&
+            draw.uvPinnedAllocation.ptr() !=
+                draw.indexPinnedAllocation.ptr())
+          ctx->track(draw.uvPinnedAllocation);
 
         VkBuffer vb0 = draw.positionInfo.buffer;
         VkDeviceSize vb0Off = draw.positionInfo.offset;
@@ -8302,9 +8328,15 @@ void War3ShadowReceiverPass::renderPointShadow(
 
         if (draw.positionStorage.ptr() != nullptr)
           ctx->track(draw.positionStorage);
+        if (draw.positionPinnedAllocation.ptr() != nullptr)
+          ctx->track(draw.positionPinnedAllocation);
         if (draw.indexStorage.ptr() != nullptr &&
             draw.indexStorage.ptr() != draw.positionStorage.ptr())
           ctx->track(draw.indexStorage);
+        if (draw.indexPinnedAllocation.ptr() != nullptr &&
+            draw.indexPinnedAllocation.ptr() !=
+                draw.positionPinnedAllocation.ptr())
+          ctx->track(draw.indexPinnedAllocation);
         if (draw.blendStorage.ptr() != nullptr)
           ctx->track(draw.blendStorage);
         if (effectiveAlphaTestShadowPoint && draw.uvBinding != 0u &&
@@ -8312,6 +8344,13 @@ void War3ShadowReceiverPass::renderPointShadow(
             draw.uvStorage.ptr() != draw.positionStorage.ptr() &&
             draw.uvStorage.ptr() != draw.blendStorage.ptr())
           ctx->track(draw.uvStorage);
+        if (effectiveAlphaTestShadowPoint &&
+            draw.uvPinnedAllocation.ptr() != nullptr &&
+            draw.uvPinnedAllocation.ptr() !=
+                draw.positionPinnedAllocation.ptr() &&
+            draw.uvPinnedAllocation.ptr() !=
+                draw.indexPinnedAllocation.ptr())
+          ctx->track(draw.uvPinnedAllocation);
         if (gpuSkinDirect) {
           ctx->track(draw.gpuSkinInput.staticSource.buffer());
           if (draw.gpuSkinInput.palette.buffer().ptr() !=

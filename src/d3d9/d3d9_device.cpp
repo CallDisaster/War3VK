@@ -23,6 +23,7 @@
 #include "war3/render/war3_shadow_lifecycle.h"
 #include "war3/render/war3_shadow_object_registry.h"
 #include "war3/render/war3_shadow_observer_build_policy.h"
+#include "war3/render/war3_shadow_pinned_upload_policy.h"
 #include "war3/render/war3_shadow_producer_policy.h"
 #include "war3/render/war3_shadow_stage11_allocation_observer.h"
 #include "war3/render/war3_shadow_runtime_bridge.h"
@@ -3138,6 +3139,34 @@ inline bool War3Stage11DirectStaticSourceRuntime() {
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", 0u) == 1u;
   return s_enabled;
+}
+
+inline bool War3Stage11DirectUploadSourceRuntime() {
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
+    return false;
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_STAGE11_DIRECT_UPLOAD_SOURCE_MODE", 0u) == 1u;
+  return s_enabled;
+}
+
+inline DxvkResourceBufferInfo War3PinnedAllocationSliceInfo(
+    const Rc<DxvkResourceAllocation>& allocation,
+    VkDeviceSize localOffset, VkDeviceSize requestedBytes) {
+  if (allocation == nullptr)
+    return {};
+  const DxvkResourceBufferInfo whole = allocation->getBufferInfo();
+  const auto range = dxvk::war3::render::MakeWar3PinnedUploadRange(
+      uint64_t(whole.size), uint64_t(localOffset), uint64_t(requestedBytes));
+  if (!range.valid || whole.buffer == VK_NULL_HANDLE)
+    return {};
+  DxvkResourceBufferInfo result = whole;
+  result.offset += VkDeviceSize(range.offset);
+  result.size = VkDeviceSize(range.length);
+  if (result.mapPtr != nullptr)
+    result.mapPtr = reinterpret_cast<uint8_t*>(result.mapPtr) + range.offset;
+  if (result.gpuAddress != 0u)
+    result.gpuAddress += VkDeviceAddress(range.offset);
+  return result;
 }
 
 enum class War3ProducerClaimObserveMode : uint8_t {
@@ -22871,6 +22900,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         drawTimeVBEntry = &entry;
         // 用 capture 时拷的 device-local buffer
         draw.positionStorage = entry.positionBuffer;
+        draw.positionPinnedAllocation = entry.positionPinnedAllocation;
         draw.positionInfo = entry.positionInfo;
         draw.positionStride = entry.positionStride;
         draw.positionOffset = entry.positionOffset;
@@ -22900,6 +22930,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
             entry.indexInfo.buffer != VK_NULL_HANDLE) {
           draw.indexed = true;
           draw.indexStorage = entry.indexBuffer;
+          draw.indexPinnedAllocation = entry.indexPinnedAllocation;
           draw.indexInfo = entry.indexInfo;
           draw.indexType = entry.indexType;
           draw.indexCount = entry.indexCount;
@@ -22923,6 +22954,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
             entry.uvBuffer != nullptr &&
             entry.uvInfo.buffer != VK_NULL_HANDLE) {
           draw.uvStorage = entry.uvBuffer;
+          draw.uvPinnedAllocation = entry.uvPinnedAllocation;
           draw.uvInfo = entry.uvInfo;
           draw.uvStride = entry.uvStride;
           draw.uvOffset = entry.uvOffset;
@@ -24359,6 +24391,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
     War3CopyDrawTimeReplayDomain(draw, entry);
     draw.indexed = entry.indexed;
     draw.positionStorage = entry.positionBuffer;
+    draw.positionPinnedAllocation = entry.positionPinnedAllocation;
     draw.positionInfo = entry.positionInfo;
     draw.positionStride = entry.positionStride;
     draw.positionOffset = entry.positionOffset;
@@ -24397,6 +24430,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
         draw.uvInfo = entry.positionInfo;
       } else {
         draw.uvStorage = entry.uvBuffer;
+        draw.uvPinnedAllocation = entry.uvPinnedAllocation;
         draw.uvInfo = entry.uvInfo;
       }
     }
@@ -24425,6 +24459,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
 
     if (entry.indexed) {
       draw.indexStorage = entry.indexBuffer;
+      draw.indexPinnedAllocation = entry.indexPinnedAllocation;
       draw.indexInfo = entry.indexInfo;
       draw.indexType = entry.indexType;
       draw.indexCount = entry.indexCount;
@@ -27681,6 +27716,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     draw.deviceEpoch = m_war3GpuSkinDeviceEpoch;
     draw.indexed = entry.indexed;
     draw.positionStorage = entry.positionBuffer;
+    draw.positionPinnedAllocation = entry.positionPinnedAllocation;
     draw.positionInfo = entry.positionInfo;
     draw.positionStride = entry.positionStride;
     draw.positionOffset = entry.positionOffset;
@@ -27724,6 +27760,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         draw.uvInfo = entry.positionInfo;
       } else {
         draw.uvStorage = entry.uvBuffer;
+        draw.uvPinnedAllocation = entry.uvPinnedAllocation;
         draw.uvInfo = entry.uvInfo;
       }
     }
@@ -27754,6 +27791,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       nestedTiming->enter(War3SubmitAppendNestedPhase::FastGeometryIdentity);
     if (entry.indexed) {
       draw.indexStorage = entry.indexBuffer;
+      draw.indexPinnedAllocation = entry.indexPinnedAllocation;
       draw.indexInfo = entry.indexInfo;
       draw.indexType = entry.indexType;
       draw.indexCount = entry.indexCount;
@@ -42607,11 +42645,40 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 : makeDirectStreamProof(
                       posCommon, uint64_t(posSrcOffset), uint64_t(posBytes),
                       posStride, posStride, ShadowStreamKind::Position);
-        const bool directStaticPositionSource =
+        const Rc<DxvkResourceAllocation> directStaticPositionAllocation =
             War3Stage11DirectStaticSourceRuntime() &&
             generationBackedStaticCandidate && !DynamicSysmemVBOs &&
             currentPositionSourceProof.valid() &&
-            posSlice.buffer() != nullptr;
+            posSlice.buffer() != nullptr
+                ? posSlice.buffer()->storage() : nullptr;
+        const DxvkResourceBufferInfo directStaticPositionInfo =
+            War3PinnedAllocationSliceInfo(
+                directStaticPositionAllocation, posSrcOffset, posBytes);
+        const bool directStaticPositionSource =
+            directStaticPositionInfo.buffer != VK_NULL_HANDLE;
+        const Rc<DxvkResourceAllocation> directUploadPositionAllocation =
+            War3Stage11DirectUploadSourceRuntime() && DynamicSysmemVBOs &&
+            currentPositionSourceProof.valid() &&
+            m_war3PerDrawUpload.storage != nullptr
+                ? m_war3PerDrawUpload.storage : nullptr;
+        const DxvkResourceBufferInfo directUploadPositionInfo =
+            War3PinnedAllocationSliceInfo(
+                directUploadPositionAllocation, posSrcOffset, posBytes);
+        const bool directUploadPositionSource =
+            directUploadPositionInfo.buffer != VK_NULL_HANDLE;
+#if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
+    WARVK_ENABLE_SHADOW_OBSERVERS_DEV
+        if (War3Stage11AllocationObserverRuntime() && DynamicSysmemVBOs) {
+          auto& observerStats = m_war3Scene.shadowStats;
+          ++observerStats.drawTimeDirectUploadCandidateCount;
+          if (!currentPositionSourceProof.valid())
+            ++observerStats.drawTimeDirectUploadRejectNoProofCount;
+          else if (m_war3PerDrawUpload.storage == nullptr)
+            ++observerStats.drawTimeDirectUploadRejectNoStorageCount;
+          else if (!directUploadPositionSource)
+            ++observerStats.drawTimeDirectUploadRejectRangeCount;
+        }
+#endif
         GenerationBackedStreamProof currentIndexSourceProof = {};
         if (indexed) {
           if (DynamicSysmemIBO &&
@@ -43148,6 +43215,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         const bool replacingGpuSkinLease = entry.gpuSkinLeaseBacked;
         entry.gpuSkinLeaseBacked = false;
         entry.gpuSkinInput = {};
+        entry.positionPinnedAllocation = nullptr;
         if (!gpuSkinSemanticBacking && replacingGpuSkinLease) {
           entry.positionBuffer = nullptr;
           entry.positionInfo = {};
@@ -43217,11 +43285,19 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.gpuSkinInput = gpuSkinSemanticInput;
         } else if (directStaticPositionSource) {
           entry.positionBuffer = posSlice.buffer();
-          entry.positionInfo = entry.positionBuffer->getSliceInfo(
-              posSrcOffset, posBytes);
+          entry.positionPinnedAllocation = directStaticPositionAllocation;
+          entry.positionInfo = directStaticPositionInfo;
           entry.positionCapacity = 0u;
           m_war3Scene.shadowStats.drawTimeDirectStaticPositionBindCount++;
           m_war3Scene.shadowStats.drawTimeDirectStaticPositionBytes +=
+              uint64_t(posBytes);
+        } else if (directUploadPositionSource) {
+          entry.positionBuffer = posSlice.buffer();
+          entry.positionPinnedAllocation = directUploadPositionAllocation;
+          entry.positionInfo = directUploadPositionInfo;
+          entry.positionCapacity = 0u;
+          m_war3Scene.shadowStats.drawTimeDirectUploadPositionBindCount++;
+          m_war3Scene.shadowStats.drawTimeDirectUploadPositionBytes +=
               uint64_t(posBytes);
         }
 
@@ -43247,6 +43323,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         const bool needsNewPositionBuffer =
             !gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
             !directStaticPositionSource &&
+            !directUploadPositionSource &&
             (entry.positionBuffer == nullptr ||
              entry.positionCapacity < posBytes);
 #if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
@@ -43261,8 +43338,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           ++observerStats.drawTimePositionAllocRequestCount;
           if (generationBackedStaticCandidate)
             ++observerStats.drawTimePositionAllocStaticRequestCount;
-          else
+          else {
             ++observerStats.drawTimePositionAllocDynamicRequestCount;
+            if (!DynamicSysmemVBOs)
+              ++observerStats.drawTimePositionAllocDirectMutableRequestCount;
+          }
           observerPositionAllocationClass =
               war3::render::ClassifyWar3Stage11PositionAllocation(
                   observerEntryExisted, observerHadPositionBuffer,
@@ -43345,6 +43425,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
         if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
             !directStaticPositionSource &&
+            !directUploadPositionSource &&
             (entry.positionBuffer == nullptr ||
              entry.positionCapacity < posBytes)) {
           entry.positionInfo = {};
@@ -43359,6 +43440,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         }
         if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&
             !directStaticPositionSource &&
+            !directUploadPositionSource &&
             !generationBackedPositionReuse) {
           auto srcBuf = posSlice.buffer();
           EmitCs([cDst = entry.positionBuffer, cSrc = srcBuf,
@@ -43375,7 +43457,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
         }
         if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) {
-          if (!directStaticPositionSource) {
+          if (!directStaticPositionSource && !directUploadPositionSource) {
             entry.positionInfo =
                 entry.positionBuffer->getSliceInfo(0, posBytes);
           }
@@ -43396,6 +43478,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           entry.uvInfo = {};
           entry.uvCapacity = 0u;
         }
+        entry.uvPinnedAllocation = nullptr;
         entry.uvStride = 0u;
         entry.uvOffset = 0u;
         entry.uvFormat = VK_FORMAT_UNDEFINED;
@@ -43420,6 +43503,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         } else if (gpuSkinOutputHasUv) {
           entry.uvSharesPositionBuffer = true;
           entry.uvBuffer = entry.positionBuffer;
+          entry.uvPinnedAllocation = entry.positionPinnedAllocation;
           entry.uvInfo = entry.positionInfo;
           entry.uvStride = entry.positionStride;
           entry.uvOffset = 24u;
@@ -43452,6 +43536,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 entry.uvOffset = uvElem->Offset;
                 entry.uvFormat = uvFmt;
                 entry.uvBuffer = entry.positionBuffer;
+                entry.uvPinnedAllocation = entry.positionPinnedAllocation;
                 entry.uvInfo = entry.positionInfo;
                 m_war3Scene.shadowStats
                     .drawTimeVBCacheUvSharedPositionCount++;
@@ -43509,8 +43594,44 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   if (uvSrcSlice.length() >=
                       VkDeviceSize(vRangeStart + vRangeCount) *
                           VkDeviceSize(uvStride)) {
-                    if (entry.uvBuffer == nullptr ||
-                        entry.uvCapacity < uvBytes) {
+                    GenerationBackedStreamProof currentUvSourceProof = {};
+                    if (DynamicSysmemVBOs) {
+                      currentUvSourceProof = makeUploadVertexStreamProof(
+                          uvStream,
+                          uint64_t(vRangeStart) * uint64_t(uvStride),
+                          uint64_t(uvBytes), ShadowStreamKind::Uv);
+                    } else {
+                      auto* uvVb =
+                          m_state.vertexBuffers[uvStream].vertexBuffer.ptr();
+                      auto* uvCommon =
+                          uvVb != nullptr ? uvVb->GetCommonBuffer() : nullptr;
+                      currentUvSourceProof = makeDirectStreamProof(
+                          uvCommon, uint64_t(uvSrcOffset), uint64_t(uvBytes),
+                          uvStride, uvStride, ShadowStreamKind::Uv);
+                    }
+                    const Rc<DxvkResourceAllocation> directUploadUvAllocation =
+                        War3Stage11DirectUploadSourceRuntime() &&
+                        DynamicSysmemVBOs && currentUvSourceProof.valid() &&
+                        m_war3PerDrawUpload.storage != nullptr
+                            ? m_war3PerDrawUpload.storage : nullptr;
+                    const DxvkResourceBufferInfo directUploadUvInfo =
+                        War3PinnedAllocationSliceInfo(
+                            directUploadUvAllocation, uvSrcOffset, uvBytes);
+                    const bool directUploadUvSource =
+                        directUploadUvInfo.buffer != VK_NULL_HANDLE;
+                    if (directUploadUvSource) {
+                      entry.uvBuffer = uvSrcSlice.buffer();
+                      entry.uvPinnedAllocation = directUploadUvAllocation;
+                      entry.uvInfo = directUploadUvInfo;
+                      entry.uvCapacity = 0u;
+                      m_war3Scene.shadowStats
+                          .drawTimeDirectUploadUvBindCount++;
+                      m_war3Scene.shadowStats.drawTimeDirectUploadUvBytes +=
+                          uint64_t(uvBytes);
+                    }
+                    if (!directUploadUvSource &&
+                        (entry.uvBuffer == nullptr ||
+                         entry.uvCapacity < uvBytes)) {
                     // Phase 7.123：UV buffer alloc 也扣预算（同帧多次 alloc
                     // 才是真正的卡点）。如果预算耗尽就保留 entry 现有 uvBuffer
                     // 状态（可能是 nullptr → 下游 alpha-test 暂时不可用，但
@@ -43546,30 +43667,17 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     }
                     } // end Phase 7.123 budget else
                     }
-                    GenerationBackedStreamProof currentUvSourceProof = {};
-                    if (DynamicSysmemVBOs) {
-                      currentUvSourceProof = makeUploadVertexStreamProof(
-                          uvStream,
-                          uint64_t(vRangeStart) * uint64_t(uvStride),
-                          uint64_t(uvBytes), ShadowStreamKind::Uv);
-                    } else {
-                      auto* uvVb =
-                          m_state.vertexBuffers[uvStream].vertexBuffer.ptr();
-                      auto* uvCommon =
-                          uvVb != nullptr ? uvVb->GetCommonBuffer() : nullptr;
-                      currentUvSourceProof = makeDirectStreamProof(
-                          uvCommon, uint64_t(uvSrcOffset), uint64_t(uvBytes),
-                          uvStride, uvStride, ShadowStreamKind::Uv);
-                    }
                     const bool generationBackedUvReuse =
                         generationBackedStaticCandidate &&
                         entry.isStaticGeometry &&
                         entry.uvSourceProof.matches(currentUvSourceProof) &&
                         entry.uvBuffer != nullptr &&
                         entry.uvCapacity >= uvBytes;
-                    if (entry.uvBuffer != nullptr &&
-                        entry.uvCapacity >= uvBytes) {
-                    if (!generationBackedUvReuse) {
+                    if (directUploadUvSource ||
+                        (entry.uvBuffer != nullptr &&
+                         entry.uvCapacity >= uvBytes)) {
+                    if (!directUploadUvSource &&
+                        !generationBackedUvReuse) {
                     auto uvSrcBuf = uvSrcSlice.buffer();
                     EmitCs([cDst = entry.uvBuffer, cSrc = uvSrcBuf,
                             cSrcOff = uvSrcOffset,
@@ -43579,15 +43687,17 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                     m_war3Scene.shadowStats.drawTimeVBCacheUvCopyCount++;
                     m_war3Scene.shadowStats.drawTimeVBCacheUvCopyBytes +=
                         uint64_t(uvBytes);
-                    } else {
+                    } else if (generationBackedUvReuse) {
                       m_war3Scene.shadowStats
                           .drawTimeGenerationBackedUvReuseCount++;
                       m_war3Scene.shadowStats
                           .drawTimeGenerationBackedCopyBytesSaved +=
                               uint64_t(uvBytes);
                     }
-                    entry.uvInfo =
-                        entry.uvBuffer->getSliceInfo(0, uvBytes);
+                    if (!directUploadUvSource) {
+                      entry.uvInfo =
+                          entry.uvBuffer->getSliceInfo(0, uvBytes);
+                    }
                     entry.uvStride = uvStride;
                     entry.uvOffset = uvElem->Offset;
                     entry.uvFormat = uvFmt;
@@ -43635,27 +43745,53 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         bool idxOk = false;
         bool indexBudgetDeferred = false;
         bool indexAllocationFailed = false;
+        entry.indexPinnedAllocation = nullptr;
         if (indexed && drawTimeIndexSlice.buffer() != nullptr) {
           const VkDeviceSize idxSrcOffset =
               drawTimeIndexSlice.offset() + drawTimeIndexRangeOffset;
           const VkDeviceSize idxBytes = drawTimeIndexRangeBytes;
-          const bool directStaticIndexSource =
+          const Rc<DxvkResourceAllocation> directStaticIndexAllocation =
               War3Stage11DirectStaticSourceRuntime() &&
               generationBackedStaticCandidate && !DynamicSysmemIBO &&
-              currentIndexSourceProof.valid();
+              currentIndexSourceProof.valid() &&
+              drawTimeIndexSlice.buffer() != nullptr
+                  ? drawTimeIndexSlice.buffer()->storage() : nullptr;
+          const DxvkResourceBufferInfo directStaticIndexInfo =
+              War3PinnedAllocationSliceInfo(
+                  directStaticIndexAllocation, idxSrcOffset, idxBytes);
+          const bool directStaticIndexSource =
+              directStaticIndexInfo.buffer != VK_NULL_HANDLE;
+          const Rc<DxvkResourceAllocation> directUploadIndexAllocation =
+              War3Stage11DirectUploadSourceRuntime() && DynamicSysmemIBO &&
+              currentIndexSourceProof.valid() &&
+              m_war3PerDrawUpload.ibStorage != nullptr
+                  ? m_war3PerDrawUpload.ibStorage : nullptr;
+          const DxvkResourceBufferInfo directUploadIndexInfo =
+              War3PinnedAllocationSliceInfo(
+                  directUploadIndexAllocation, idxSrcOffset, idxBytes);
+          const bool directUploadIndexSource =
+              directUploadIndexInfo.buffer != VK_NULL_HANDLE;
           if (drawTimeIndexRangeOffset <= drawTimeIndexSlice.length() &&
               idxBytes <=
                   drawTimeIndexSlice.length() - drawTimeIndexRangeOffset) {
             if (directStaticIndexSource) {
               entry.indexBuffer = drawTimeIndexSlice.buffer();
-              entry.indexInfo = entry.indexBuffer->getSliceInfo(
-                  idxSrcOffset, idxBytes);
+              entry.indexPinnedAllocation = directStaticIndexAllocation;
+              entry.indexInfo = directStaticIndexInfo;
               entry.indexCapacity = 0u;
               m_war3Scene.shadowStats.drawTimeDirectStaticIndexBindCount++;
               m_war3Scene.shadowStats.drawTimeDirectStaticIndexBytes +=
                   uint64_t(idxBytes);
+            } else if (directUploadIndexSource) {
+              entry.indexBuffer = drawTimeIndexSlice.buffer();
+              entry.indexPinnedAllocation = directUploadIndexAllocation;
+              entry.indexInfo = directUploadIndexInfo;
+              entry.indexCapacity = 0u;
+              m_war3Scene.shadowStats.drawTimeDirectUploadIndexBindCount++;
+              m_war3Scene.shadowStats.drawTimeDirectUploadIndexBytes +=
+                  uint64_t(idxBytes);
             }
-            if (!directStaticIndexSource &&
+            if (!directStaticIndexSource && !directUploadIndexSource &&
                 (entry.indexBuffer == nullptr ||
                  entry.indexCapacity < idxBytes)) {
               // Phase 7.123：IB alloc 也扣预算。预算耗尽时跳过 IB alloc，
@@ -43691,10 +43827,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 }
               } // end Phase 7.123 budget else
             }
-            if (directStaticIndexSource ||
+            if (directStaticIndexSource || directUploadIndexSource ||
                 (entry.indexBuffer != nullptr &&
                  entry.indexCapacity >= idxBytes)) {
-              if (!directStaticIndexSource &&
+              if (!directStaticIndexSource && !directUploadIndexSource &&
                   !generationBackedIndexReuse) {
               auto idxSrcBuf = drawTimeIndexSlice.buffer();
               EmitCs([cDst = entry.indexBuffer, cSrc = idxSrcBuf,
@@ -43705,14 +43841,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyCount++;
               m_war3Scene.shadowStats.drawTimeVBCacheIndexCopyBytes +=
                   uint64_t(idxBytes);
-              } else {
+              } else if (generationBackedIndexReuse) {
                 m_war3Scene.shadowStats
                     .drawTimeGenerationBackedIndexReuseCount++;
                 m_war3Scene.shadowStats
                     .drawTimeGenerationBackedCopyBytesSaved +=
                         uint64_t(idxBytes);
               }
-              if (!directStaticIndexSource) {
+              if (!directStaticIndexSource && !directUploadIndexSource) {
                 entry.indexInfo =
                     entry.indexBuffer->getSliceInfo(0, idxBytes);
               }

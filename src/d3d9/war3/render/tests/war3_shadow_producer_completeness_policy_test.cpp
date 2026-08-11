@@ -2,6 +2,7 @@
 #include "../war3_shadow_capture_frontend.h"
 #include "../war3_shadow_drawtime_cache_policy.h"
 #include "../war3_shadow_generation_backed_stream.h"
+#include "../war3_shadow_pinned_upload_policy.h"
 #include "../war3_shadow_stage11_allocation_observer.h"
 
 #include <algorithm>
@@ -131,6 +132,23 @@ bool testStage11AllocationClassification() {
       ClassifyWar3Stage11PositionAllocation(
           true, true, 8192u, 4096u, true) == Class::GpuSkinLeaseDetach,
       "Stage11 position-allocation observer classification changed");
+}
+
+bool testPinnedUploadRange() {
+  const auto valid = policy::MakeWar3PinnedUploadRange(4096u, 512u, 1024u);
+  const auto zero = policy::MakeWar3PinnedUploadRange(4096u, 0u, 0u);
+  const auto offsetPastEnd =
+      policy::MakeWar3PinnedUploadRange(4096u, 4097u, 1u);
+  const auto lengthPastEnd =
+      policy::MakeWar3PinnedUploadRange(4096u, 3584u, 513u);
+  const auto exactEnd =
+      policy::MakeWar3PinnedUploadRange(4096u, 3584u, 512u);
+  return require(valid.valid && valid.offset == 512u &&
+                     valid.length == 1024u && !zero.valid &&
+                     !offsetPastEnd.valid && !lengthPastEnd.valid &&
+                     exactEnd.valid && exactEnd.offset == 3584u &&
+                     exactEnd.length == 512u,
+                 "pinned upload range did not fail closed");
 }
 
 bool testRequiredCasterHardAdmissionIsOrderIndependent() {
@@ -311,6 +329,7 @@ int main() {
       testProtectedWorkingSetLru() &&
       testGenerationObservationClock() &&
       testStage11AllocationClassification() &&
+      testPinnedUploadRange() &&
       testRequiredCasterHardAdmissionIsOrderIndependent() &&
       testGenerationBackedStreamProof() &&
       testGenerationBackedStabilityProbation() ? 0 : 1;

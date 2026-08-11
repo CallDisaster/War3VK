@@ -1362,6 +1362,28 @@ void War3PerfMonitor::noteShadowBudgetFrame(
       stats.drawTimeDirectStaticIndexBindCount;
   agg.drawTimeDirectStaticIndexBytes +=
       stats.drawTimeDirectStaticIndexBytes;
+  agg.drawTimeDirectUploadPositionBindCount +=
+      stats.drawTimeDirectUploadPositionBindCount;
+  agg.drawTimeDirectUploadPositionBytes +=
+      stats.drawTimeDirectUploadPositionBytes;
+  agg.drawTimeDirectUploadUvBindCount +=
+      stats.drawTimeDirectUploadUvBindCount;
+  agg.drawTimeDirectUploadUvBytes +=
+      stats.drawTimeDirectUploadUvBytes;
+  agg.drawTimeDirectUploadIndexBindCount +=
+      stats.drawTimeDirectUploadIndexBindCount;
+  agg.drawTimeDirectUploadIndexBytes +=
+      stats.drawTimeDirectUploadIndexBytes;
+  agg.drawTimeDirectUploadCandidateCount +=
+      stats.drawTimeDirectUploadCandidateCount;
+  agg.drawTimeDirectUploadRejectNoProofCount +=
+      stats.drawTimeDirectUploadRejectNoProofCount;
+  agg.drawTimeDirectUploadRejectNoStorageCount +=
+      stats.drawTimeDirectUploadRejectNoStorageCount;
+  agg.drawTimeDirectUploadRejectRangeCount +=
+      stats.drawTimeDirectUploadRejectRangeCount;
+  agg.drawTimePositionAllocDirectMutableRequestCount +=
+      stats.drawTimePositionAllocDirectMutableRequestCount;
   agg.drawTimeVBCacheRejectNoLayerContext +=
       stats.drawTimeVBCacheRejectNoLayerContext;
   agg.drawTimeVBCacheSameFrameDedupMiss +=
@@ -6107,6 +6129,28 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeDirectStaticIndexBindCount << ",\n";
   json << "    \"drawTimeDirectStaticIndexBytes\": "
        << shadowAgg.drawTimeDirectStaticIndexBytes << ",\n";
+  json << "    \"drawTimeDirectUploadPositionBindCount\": "
+       << shadowAgg.drawTimeDirectUploadPositionBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadPositionBytes\": "
+       << shadowAgg.drawTimeDirectUploadPositionBytes << ",\n";
+  json << "    \"drawTimeDirectUploadUvBindCount\": "
+       << shadowAgg.drawTimeDirectUploadUvBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadUvBytes\": "
+       << shadowAgg.drawTimeDirectUploadUvBytes << ",\n";
+  json << "    \"drawTimeDirectUploadIndexBindCount\": "
+       << shadowAgg.drawTimeDirectUploadIndexBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadIndexBytes\": "
+       << shadowAgg.drawTimeDirectUploadIndexBytes << ",\n";
+  json << "    \"drawTimeDirectUploadCandidateCount\": "
+       << shadowAgg.drawTimeDirectUploadCandidateCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectNoProofCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectNoProofCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectNoStorageCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectNoStorageCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectRangeCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectRangeCount << ",\n";
+  json << "    \"drawTimePositionAllocDirectMutableRequestCount\": "
+       << shadowAgg.drawTimePositionAllocDirectMutableRequestCount << ",\n";
   json << "    \"drawTimeVBCacheRejectNoLayerContext\": "
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "
@@ -7485,6 +7529,28 @@ std::string War3PerfMonitor::generateJsonDataFromSnapshot(
        << shadowAgg.drawTimeDirectStaticIndexBindCount << ",\n";
   json << "    \"drawTimeDirectStaticIndexBytes\": "
        << shadowAgg.drawTimeDirectStaticIndexBytes << ",\n";
+  json << "    \"drawTimeDirectUploadPositionBindCount\": "
+       << shadowAgg.drawTimeDirectUploadPositionBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadPositionBytes\": "
+       << shadowAgg.drawTimeDirectUploadPositionBytes << ",\n";
+  json << "    \"drawTimeDirectUploadUvBindCount\": "
+       << shadowAgg.drawTimeDirectUploadUvBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadUvBytes\": "
+       << shadowAgg.drawTimeDirectUploadUvBytes << ",\n";
+  json << "    \"drawTimeDirectUploadIndexBindCount\": "
+       << shadowAgg.drawTimeDirectUploadIndexBindCount << ",\n";
+  json << "    \"drawTimeDirectUploadIndexBytes\": "
+       << shadowAgg.drawTimeDirectUploadIndexBytes << ",\n";
+  json << "    \"drawTimeDirectUploadCandidateCount\": "
+       << shadowAgg.drawTimeDirectUploadCandidateCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectNoProofCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectNoProofCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectNoStorageCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectNoStorageCount << ",\n";
+  json << "    \"drawTimeDirectUploadRejectRangeCount\": "
+       << shadowAgg.drawTimeDirectUploadRejectRangeCount << ",\n";
+  json << "    \"drawTimePositionAllocDirectMutableRequestCount\": "
+       << shadowAgg.drawTimePositionAllocDirectMutableRequestCount << ",\n";
   json << "    \"drawTimeVBCacheRejectNoLayerContext\": "
        << shadowAgg.drawTimeVBCacheRejectNoLayerContext << ",\n";
   json << "    \"drawTimeVBCacheSameFrameDedupMiss\": "

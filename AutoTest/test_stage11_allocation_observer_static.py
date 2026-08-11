@@ -9,6 +9,13 @@ SCENE = (ROOT / "src/d3d9/d3d9_war3_scene.h").read_text(encoding="utf-8")
 PERF = (ROOT / "src/d3d9/war3/tools/war3_perf_monitor.cpp").read_text(
     encoding="utf-8"
 )
+RUNTIME = (ROOT / "src/d3d9/war3/render/war3_shadow_runtime_bridge.cpp").read_text(
+    encoding="utf-8"
+)
+SHADOW = (ROOT / "src/d3d9/d3d9_war3_shadow.cpp").read_text(encoding="utf-8")
+PIN_POLICY = (
+    ROOT / "src/d3d9/war3/render/war3_shadow_pinned_upload_policy.h"
+).read_text(encoding="utf-8")
 
 
 class Stage11AllocationObserverStaticTest(unittest.TestCase):
@@ -60,7 +67,7 @@ class Stage11AllocationObserverStaticTest(unittest.TestCase):
         ]
         self.assertIn("kDevelopmentShadowObserversEnabled", runtime)
         self.assertIn("DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE", runtime)
-        begin = DEVICE.index("const bool directStaticPositionSource")
+        begin = DEVICE.index("directStaticPositionAllocation")
         end = DEVICE.index("GenerationBackedStreamProof currentIndexSourceProof", begin)
         gate = DEVICE[begin:end]
         self.assertIn("generationBackedStaticCandidate", gate)
@@ -77,6 +84,32 @@ class Stage11AllocationObserverStaticTest(unittest.TestCase):
         self.assertIn("directStaticIndexSource", DEVICE)
         self.assertIn("drawTimeDirectStaticIndexBindCount", DEVICE)
 
+    def test_pinned_direct_upload_is_exact_and_retained(self) -> None:
+        runtime = DEVICE[
+            DEVICE.index("inline bool War3Stage11DirectUploadSourceRuntime") :
+            DEVICE.index("enum class War3ProducerClaimObserveMode")
+        ]
+        self.assertIn("kDevelopmentShadowObserversEnabled", runtime)
+        self.assertIn("DXVK_WAR3_STAGE11_DIRECT_UPLOAD_SOURCE_MODE", runtime)
+        self.assertIn("DynamicSysmemVBOs", DEVICE)
+        self.assertIn("currentPositionSourceProof.valid()", DEVICE)
+        self.assertIn("m_war3PerDrawUpload.storage", DEVICE)
+        self.assertIn("positionPinnedAllocation", DEVICE_H)
+        self.assertIn("positionPinnedAllocation", SCENE)
+        self.assertGreaterEqual(SHADOW.count("ctx->track(draw.positionPinnedAllocation)"), 3)
+        self.assertIn("requestedBytes > allocationBytes - localOffset", PIN_POLICY)
+
+    def test_direct_upload_skips_secondary_alloc_and_copy(self) -> None:
+        begin = DEVICE.index("const bool needsNewPositionBuffer")
+        end = DEVICE.index("War3ShadowDrawTimeCapturePhase::UvBacking", begin)
+        body = DEVICE[begin:end]
+        self.assertIn("!directUploadPositionSource", body)
+        self.assertIn("drawTimeDirectUploadPositionBindCount", DEVICE)
+        self.assertIn("directUploadIndexSource", DEVICE)
+        self.assertIn("drawTimeDirectUploadIndexBindCount", DEVICE)
+        self.assertIn("directUploadUvSource", DEVICE)
+        self.assertIn("drawTimeDirectUploadUvBindCount", DEVICE)
+
     def test_diagnostics_reach_runtime_and_perf_json(self) -> None:
         for name in (
             "drawTimePositionAllocRequestCount",
@@ -84,9 +117,18 @@ class Stage11AllocationObserverStaticTest(unittest.TestCase):
             "drawTimePositionProofDuplicateCount",
             "drawTimePositionProofInvalidCount",
             "drawTimePositionProofSetOverflowCount",
+            "drawTimeDirectUploadPositionBindCount",
+            "drawTimeDirectUploadUvBindCount",
+            "drawTimeDirectUploadIndexBindCount",
+            "drawTimeDirectUploadCandidateCount",
+            "drawTimeDirectUploadRejectNoProofCount",
+            "drawTimeDirectUploadRejectNoStorageCount",
+            "drawTimeDirectUploadRejectRangeCount",
+            "drawTimePositionAllocDirectMutableRequestCount",
         ):
             self.assertIn(name, SCENE)
             self.assertGreaterEqual(PERF.count(name), 3)
+            self.assertIn(name, RUNTIME)
 
 
 if __name__ == "__main__":

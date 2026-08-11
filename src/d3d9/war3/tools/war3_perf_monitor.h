@@ -743,6 +743,17 @@ private:
         uint64_t drawTimeDirectStaticPositionBytes = 0;
         uint64_t drawTimeDirectStaticIndexBindCount = 0;
         uint64_t drawTimeDirectStaticIndexBytes = 0;
+        uint64_t drawTimeDirectUploadPositionBindCount = 0;
+        uint64_t drawTimeDirectUploadPositionBytes = 0;
+        uint64_t drawTimeDirectUploadUvBindCount = 0;
+        uint64_t drawTimeDirectUploadUvBytes = 0;
+        uint64_t drawTimeDirectUploadIndexBindCount = 0;
+        uint64_t drawTimeDirectUploadIndexBytes = 0;
+        uint64_t drawTimeDirectUploadCandidateCount = 0;
+        uint64_t drawTimeDirectUploadRejectNoProofCount = 0;
+        uint64_t drawTimeDirectUploadRejectNoStorageCount = 0;
+        uint64_t drawTimeDirectUploadRejectRangeCount = 0;
+        uint64_t drawTimePositionAllocDirectMutableRequestCount = 0;
         uint64_t drawTimeVBCacheRejectNoLayerContext = 0;
         uint64_t drawTimeVBCacheSameFrameDedupMiss = 0;
         uint64_t drawTimeGenerationBackedPositionReuseCount = 0;

@@ -104,6 +104,7 @@ namespace dxvk {
         // 进而读取到错误/被覆盖的数据（表现为阴影残缺/错位/乱飞）。
         // 因此需要在 capture 时固化 VkBuffer/offset，并持有对应 allocation 保活。
         Rc<DxvkBuffer> positionStorage;
+        Rc<DxvkResourceAllocation> positionPinnedAllocation;
         DxvkResourceBufferInfo positionInfo;
         uint32_t positionStride = 0;
         uint32_t positionOffset = 0;
@@ -111,6 +112,7 @@ namespace dxvk {
 
         // Index input
         Rc<DxvkBuffer> indexStorage;
+        Rc<DxvkResourceAllocation> indexPinnedAllocation;
         DxvkResourceBufferInfo indexInfo;
         VkIndexType indexType = VK_INDEX_TYPE_UINT32;
 
@@ -153,6 +155,7 @@ namespace dxvk {
 
         // UV流 (纹理坐标，用于采样漫反射贴图)
         Rc<DxvkBuffer> uvStorage;           // UV数据缓冲区
+        Rc<DxvkResourceAllocation> uvPinnedAllocation;
         DxvkResourceBufferInfo uvInfo;      // UV缓冲区信息
         uint32_t uvStride = 0;              // UV步长
         uint32_t uvOffset = 0;              // UV偏移
@@ -764,6 +767,17 @@ namespace dxvk {
         uint64_t drawTimeDirectStaticPositionBytes = 0u;
         uint32_t drawTimeDirectStaticIndexBindCount = 0;
         uint64_t drawTimeDirectStaticIndexBytes = 0u;
+        uint32_t drawTimeDirectUploadPositionBindCount = 0;
+        uint64_t drawTimeDirectUploadPositionBytes = 0u;
+        uint32_t drawTimeDirectUploadUvBindCount = 0;
+        uint64_t drawTimeDirectUploadUvBytes = 0u;
+        uint32_t drawTimeDirectUploadIndexBindCount = 0;
+        uint64_t drawTimeDirectUploadIndexBytes = 0u;
+        uint32_t drawTimeDirectUploadCandidateCount = 0;
+        uint32_t drawTimeDirectUploadRejectNoProofCount = 0;
+        uint32_t drawTimeDirectUploadRejectNoStorageCount = 0;
+        uint32_t drawTimeDirectUploadRejectRangeCount = 0;
+        uint32_t drawTimePositionAllocDirectMutableRequestCount = 0;
         uint32_t drawTimeVBCacheUvCopyCount = 0;
         uint64_t drawTimeVBCacheUvCopyBytes = 0;
         uint32_t drawTimeVBCacheUvSharedPositionCount = 0;
