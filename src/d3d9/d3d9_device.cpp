@@ -20962,6 +20962,34 @@ bool D3D9DeviceEx::War3CreateShadowPersistentGeometryAfterMiss(
     }
   }
 
+  // Capture the package's logical slices after all backing buffers have been
+  // finalized. Future cache hits copy these value bindings so command replay
+  // can follow a relocatable DxvkBuffer from backing A to backing B without
+  // retaining A's raw VkBuffer/offset.
+  const uint64_t replaySourceGeneration = uint64_t(geometryId);
+  stored.positionReplayBinding.capture(
+      stored.positionStorage, nullptr, stored.positionInfo,
+      m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+      replaySourceGeneration, War3ShadowReplayStreamType::Position);
+  if (stored.indexed) {
+    stored.indexReplayBinding.capture(
+        stored.indexStorage, nullptr, stored.indexInfo,
+        m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+        replaySourceGeneration, War3ShadowReplayStreamType::Index);
+  }
+  if (stored.blendBinding == 1u) {
+    stored.blendReplayBinding.capture(
+        stored.blendStorage, nullptr, stored.blendInfo,
+        m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+        replaySourceGeneration, War3ShadowReplayStreamType::Blend);
+  }
+  if (stored.alphaTestEnabled && stored.uvBinding == 2u) {
+    stored.uvReplayBinding.capture(
+        stored.uvStorage, nullptr, stored.uvInfo,
+        m_war3GpuSkinMapEpoch, m_war3GpuSkinDeviceEpoch,
+        replaySourceGeneration, War3ShadowReplayStreamType::Uv);
+  }
+
   War3ShadowPersistentGeometryEntry entry = {};
   entry.key = key;
   entry.geometry = std::move(stored);
@@ -22895,6 +22923,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   draw.indexed = geometry->indexed;
   draw.positionStorage = geometry->positionStorage;
   draw.positionInfo = geometry->positionInfo;
+  War3CopyPersistentReplayBindings(draw, *geometry);
   draw.positionStride = geometry->positionStride;
   draw.positionOffset = geometry->positionOffset;
   draw.positionFormat = geometry->positionFormat;
@@ -23850,6 +23879,17 @@ void D3D9DeviceEx::War3RecordRequiredCasterOmission(
 void D3D9DeviceEx::War3SealShadowProducerCompleteness(
     War3FrameScene& scene, uint64_t frameSerial, uint64_t mapEpoch,
     uint64_t deviceEpoch) const {
+  // Capture logical buffer ranges while the producer's physical snapshot and
+  // virtual owner still describe the same backing. Consumers resolve these
+  // bindings on the CS thread after any queued DXVK defrag relocation.
+  for (auto& draw : scene.shadowCasters) {
+    War3CaptureShadowReplayBindings(
+        draw, frameSerial, mapEpoch, deviceEpoch);
+  }
+  for (auto& fallback : scene.shadowFallbacks) {
+    War3CaptureShadowReplayBindings(
+        fallback.snapshot, frameSerial, mapEpoch, deviceEpoch);
+  }
   scene.producerCompleteness.seal(frameSerial, mapEpoch, deviceEpoch);
   auto& stats = scene.shadowStats;
   const auto& completeness = scene.producerCompleteness;
@@ -46001,6 +46041,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     draw.indexed = geometry->indexed;
     draw.positionStorage = geometry->positionStorage;
     draw.positionInfo = geometry->positionInfo;
+    War3CopyPersistentReplayBindings(draw, *geometry);
     draw.positionStride = geometry->positionStride;
     draw.positionOffset = geometry->positionOffset;
     draw.positionFormat = geometry->positionFormat;
@@ -48523,6 +48564,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       compatDraw.indexed = geometry->indexed;
       compatDraw.positionStorage = geometry->positionStorage;
       compatDraw.positionInfo = geometry->positionInfo;
+      War3CopyPersistentReplayBindings(compatDraw, *geometry);
       compatDraw.positionStride = geometry->positionStride;
       compatDraw.positionOffset = geometry->positionOffset;
       compatDraw.positionFormat = geometry->positionFormat;

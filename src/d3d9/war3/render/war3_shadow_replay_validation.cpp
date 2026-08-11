@@ -76,6 +76,10 @@ bool RangeFits(uint64_t total, uint64_t offset, uint64_t length,
 
 War3ShadowReplayValidationResult ValidateWar3ShadowReplayDraw(
     const War3ShadowReplayValidationInput& input) noexcept {
+  if (!input.bufferBindingsResolved) {
+    return Reject(War3ShadowReplayRejectReason::UnresolvedBufferBinding,
+                  input.bufferBindingRejectReason, 0u);
+  }
   if (input.drawMapEpoch == 0u || input.expectedMapEpoch == 0u)
     return Reject(War3ShadowReplayRejectReason::MissingMapEpoch);
   if (input.drawMapEpoch != input.expectedMapEpoch)
@@ -279,7 +283,7 @@ const char* War3ShadowReplayRejectReasonName(
       "gpu-skin-source-range-out-of-bounds",
       "gpu-skin-palette-range-out-of-bounds",
       "incomplete-replay-plan", "producer-incomplete",
-      "producer-stamp-mismatch"};
+      "producer-stamp-mismatch", "unresolved-buffer-binding"};
   const uint32_t index = static_cast<uint32_t>(reason);
   return index < static_cast<uint32_t>(War3ShadowReplayRejectReason::Count)
       ? kNames[index]

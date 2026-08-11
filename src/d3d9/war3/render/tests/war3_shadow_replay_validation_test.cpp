@@ -1,4 +1,5 @@
 #include "../war3_shadow_replay_validation.h"
+#include "../war3_shadow_replay_binding_policy.h"
 #include "../war3_outline_mask_layout.h"
 
 #include <cassert>
@@ -31,8 +32,40 @@ War3ShadowReplayValidationInput ValidIndexed() {
 } // namespace
 
 int main() {
+  // A relocatable owner preserves the logical subrange while the physical
+  // backing base changes from A to B.
+  const auto logical = MakeWar3ShadowReplayLogicalRange(
+      1000u, 4096u, 1128u, 512u);
+  assert(logical.valid);
+  assert(logical.offset == 128u);
+  assert(logical.length == 512u);
+  uint64_t resolvedOffset = 0u;
+  uint64_t resolvedLength = 0u;
+  assert(ResolveWar3ShadowReplayLogicalRange(
+      9000u, 4096u, logical, resolvedOffset, resolvedLength));
+  assert(resolvedOffset == 9128u);
+  assert(resolvedLength == 512u);
+  // A pinned allocation deliberately resolves against capture-time A.
+  assert(ResolveWar3ShadowReplayLogicalRange(
+      1000u, 4096u, logical, resolvedOffset, resolvedLength));
+  assert(resolvedOffset == 1128u);
+  assert(!MakeWar3ShadowReplayLogicalRange(
+      1000u, 256u, 1200u, 128u).valid);
+  assert(!ResolveWar3ShadowReplayLogicalRange(
+      std::numeric_limits<uint64_t>::max() - 8u, 4096u,
+      logical, resolvedOffset, resolvedLength));
+
   auto input = ValidIndexed();
   assert(ValidateWar3ShadowReplayDraw(input));
+
+  input.bufferBindingsResolved = false;
+  input.bufferBindingRejectReason = static_cast<uint32_t>(
+      War3ShadowReplayBindingRejectReason::RangeOutOfBounds);
+  auto unresolved = ValidateWar3ShadowReplayDraw(input);
+  assert(unresolved.reason ==
+         War3ShadowReplayRejectReason::UnresolvedBufferBinding);
+  assert(unresolved.requiredEnd == input.bufferBindingRejectReason);
+  input = ValidIndexed();
 
   input.paletteRequired = true;
   input.paletteCount = 2u;

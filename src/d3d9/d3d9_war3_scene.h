@@ -2,6 +2,7 @@
 
 #include "war3/render/war3_render_state.h"
 #include "war3/render/war3_shadow_bounds_policy.h"
+#include "war3/render/war3_shadow_replay_binding_policy.h"
 #include "war3/gpu_skin/war3_gpu_skin_types.h"
 
 #include "../dxvk/dxvk_buffer.h"
@@ -88,6 +89,134 @@ namespace dxvk {
         Tombstoned = 3u,
     };
 
+    enum class War3ShadowReplayStreamType : uint8_t {
+        Position = 0u,
+        Index,
+        Blend,
+        Uv,
+    };
+
+    // VkBuffer and absolute offsets are physical backing details and may change
+    // when DXVK defrag relocates a virtual buffer. A replay entry therefore
+    // retains the logical owner/range and resolves the physical slice on the
+    // command-recording thread. Explicitly pinned allocations remain tied to
+    // their captured backing and are tracked until the consumer fence retires.
+    struct War3ShadowReplayBufferBinding {
+        Rc<DxvkBuffer> owner;
+        Rc<DxvkResourceAllocation> pinnedAllocation;
+        war3::render::War3ShadowReplayLogicalRange logicalRange = {};
+        uint64_t mapEpoch = 0u;
+        uint64_t deviceEpoch = 0u;
+        uint64_t sourceGeneration = 0u;
+        uint64_t captureStorageGeneration = 0u;
+        War3ShadowReplayStreamType stream =
+            War3ShadowReplayStreamType::Position;
+        bool pinned = false;
+        bool captured = false;
+
+        bool capture(
+            const Rc<DxvkBuffer>& storage,
+            const Rc<DxvkResourceAllocation>& allocation,
+            const DxvkResourceBufferInfo& capturedInfo,
+            uint64_t drawMapEpoch, uint64_t drawDeviceEpoch,
+            uint64_t drawSourceGeneration,
+            War3ShadowReplayStreamType streamType) noexcept {
+          owner = storage;
+          pinnedAllocation = allocation;
+          logicalRange = {};
+          mapEpoch = drawMapEpoch;
+          deviceEpoch = drawDeviceEpoch;
+          sourceGeneration = drawSourceGeneration;
+          captureStorageGeneration =
+              storage != nullptr ? storage->diagnosticStorageGeneration() : 0u;
+          stream = streamType;
+          pinned = allocation != nullptr;
+          captured = false;
+
+          if (storage == nullptr || capturedInfo.buffer == VK_NULL_HANDLE ||
+              capturedInfo.size == 0u || drawMapEpoch == 0u ||
+              drawDeviceEpoch == 0u || drawSourceGeneration == 0u) {
+            return false;
+          }
+
+          const DxvkResourceBufferInfo backing = pinned
+              ? allocation->getBufferInfo()
+              : storage->getSliceInfo();
+          if (backing.buffer == VK_NULL_HANDLE ||
+              backing.buffer != capturedInfo.buffer) {
+            return false;
+          }
+
+          logicalRange = war3::render::MakeWar3ShadowReplayLogicalRange(
+              uint64_t(backing.offset), uint64_t(backing.size),
+              uint64_t(capturedInfo.offset), uint64_t(capturedInfo.size));
+          captured = logicalRange.valid;
+          return captured;
+        }
+
+        bool resolve(
+            uint64_t expectedMapEpoch, uint64_t expectedDeviceEpoch,
+            uint64_t expectedSourceGeneration,
+            DxvkResourceBufferInfo& outInfo,
+            war3::render::War3ShadowReplayBindingRejectReason& outReason)
+            const noexcept {
+          outInfo = {};
+          outReason =
+              war3::render::War3ShadowReplayBindingRejectReason::None;
+          if (!captured || !logicalRange.valid) {
+            outReason = war3::render::
+                War3ShadowReplayBindingRejectReason::MissingCapture;
+            return false;
+          }
+          if (mapEpoch != expectedMapEpoch ||
+              deviceEpoch != expectedDeviceEpoch) {
+            outReason = war3::render::
+                War3ShadowReplayBindingRejectReason::EpochMismatch;
+            return false;
+          }
+          if (sourceGeneration == 0u || expectedSourceGeneration == 0u) {
+            outReason = war3::render::
+                War3ShadowReplayBindingRejectReason::SourceGenerationMissing;
+            return false;
+          }
+          if (sourceGeneration != expectedSourceGeneration) {
+            outReason = war3::render::
+                War3ShadowReplayBindingRejectReason::SourceGenerationMismatch;
+            return false;
+          }
+          if (owner == nullptr || (pinned && pinnedAllocation == nullptr)) {
+            outReason = war3::render::
+                War3ShadowReplayBindingRejectReason::OwnerMismatch;
+            return false;
+          }
+
+          const DxvkResourceBufferInfo backing = pinned
+              ? pinnedAllocation->getBufferInfo()
+              : owner->getSliceInfo();
+          uint64_t resolvedOffset = 0u;
+          uint64_t resolvedLength = 0u;
+          if (backing.buffer == VK_NULL_HANDLE ||
+              !war3::render::ResolveWar3ShadowReplayLogicalRange(
+                  uint64_t(backing.offset), uint64_t(backing.size),
+                  logicalRange, resolvedOffset, resolvedLength)) {
+            outReason = war3::render::
+                War3ShadowReplayBindingRejectReason::RangeOutOfBounds;
+            return false;
+          }
+
+          outInfo = backing;
+          outInfo.offset = VkDeviceSize(resolvedOffset);
+          outInfo.size = VkDeviceSize(resolvedLength);
+          if (outInfo.mapPtr != nullptr) {
+            outInfo.mapPtr = reinterpret_cast<uint8_t*>(outInfo.mapPtr) +
+                logicalRange.offset;
+          }
+          if (outInfo.gpuAddress != 0u)
+            outInfo.gpuAddress += VkDeviceAddress(logicalRange.offset);
+          return true;
+        }
+    };
+
     struct War3ShadowCasterDraw {
         bool indexed = true;
 
@@ -96,13 +225,21 @@ namespace dxvk {
         uint64_t mapEpoch = 0u;
         uint64_t deviceEpoch = 0u;
 
+        War3ShadowReplayBufferBinding positionReplayBinding = {};
+        War3ShadowReplayBufferBinding indexReplayBinding = {};
+        War3ShadowReplayBufferBinding blendReplayBinding = {};
+        War3ShadowReplayBufferBinding uvReplayBinding = {};
+        war3::render::War3ShadowReplayBindingRejectReason
+            replayBindingRejectReason =
+                war3::render::War3ShadowReplayBindingRejectReason::None;
+        bool replayBindingsResolved = false;
+
         War3GpuSkinDrawInput gpuSkinInput = {};
 
-        // Vertex input (position only)
-        // 注意：DXVK 的 D3D9 buffer 可能在同一帧内被 invalidate（更换 VkBuffer backing）。
-        // 若仅存 DxvkBufferSlice，在 shadow caster 重放时 getSliceInfo() 可能拿到“新的 VkBuffer”，
-        // 进而读取到错误/被覆盖的数据（表现为阴影残缺/错位/乱飞）。
-        // 因此需要在 capture 时固化 VkBuffer/offset，并持有对应 allocation 保活。
+        // Vertex input (position only). positionInfo is the producer snapshot
+        // used to derive a logical range; replay resolves that range against
+        // positionStorage on the command-recording thread. Only an explicit
+        // pinned allocation keeps the capture-time physical backing.
         Rc<DxvkBuffer> positionStorage;
         Rc<DxvkResourceAllocation> positionPinnedAllocation;
         DxvkResourceBufferInfo positionInfo;
@@ -261,6 +398,162 @@ namespace dxvk {
         bool boundsAnimatedAttachment = false;
     };
 
+    inline uint64_t War3ShadowReplaySourceGeneration(
+        const War3ShadowCasterDraw& draw, uint64_t frameSerial) noexcept {
+      if (draw.boundsSourceGeneration != 0u)
+        return draw.boundsSourceGeneration;
+      if (draw.shadowExactGeometryKeyHash != 0u)
+        return draw.shadowExactGeometryKeyHash;
+      if (draw.gpuSkinInput.storagePageGeneration != 0u)
+        return draw.gpuSkinInput.storagePageGeneration;
+      if (draw.positionReplayBinding.captured &&
+          draw.positionReplayBinding.sourceGeneration != 0u) {
+        return draw.positionReplayBinding.sourceGeneration;
+      }
+      return frameSerial;
+    }
+
+    inline void War3CaptureShadowReplayBindings(
+        War3ShadowCasterDraw& draw, uint64_t frameSerial,
+        uint64_t mapEpoch, uint64_t deviceEpoch) noexcept {
+      const uint64_t sourceGeneration =
+          War3ShadowReplaySourceGeneration(draw, frameSerial);
+      draw.replayBindingsResolved = false;
+      draw.replayBindingRejectReason =
+          war3::render::War3ShadowReplayBindingRejectReason::None;
+
+      const auto needsCapture = [&](
+          const War3ShadowReplayBufferBinding& binding,
+          const Rc<DxvkBuffer>& owner,
+          const Rc<DxvkResourceAllocation>& pinned) {
+        return !binding.captured || binding.owner != owner ||
+            binding.pinnedAllocation != pinned ||
+            binding.mapEpoch != mapEpoch ||
+            binding.deviceEpoch != deviceEpoch ||
+            binding.sourceGeneration != sourceGeneration;
+      };
+
+      if (needsCapture(draw.positionReplayBinding, draw.positionStorage,
+                       draw.positionPinnedAllocation)) {
+        draw.positionReplayBinding.capture(
+            draw.positionStorage, draw.positionPinnedAllocation,
+            draw.positionInfo, mapEpoch, deviceEpoch, sourceGeneration,
+            War3ShadowReplayStreamType::Position);
+      }
+      if (draw.indexed &&
+          needsCapture(draw.indexReplayBinding, draw.indexStorage,
+                       draw.indexPinnedAllocation)) {
+        draw.indexReplayBinding.capture(
+            draw.indexStorage, draw.indexPinnedAllocation, draw.indexInfo,
+            mapEpoch, deviceEpoch, sourceGeneration,
+            War3ShadowReplayStreamType::Index);
+      }
+      if (draw.blendBinding == 1u &&
+          needsCapture(draw.blendReplayBinding, draw.blendStorage, nullptr)) {
+        draw.blendReplayBinding.capture(
+            draw.blendStorage, nullptr, draw.blendInfo,
+            mapEpoch, deviceEpoch, sourceGeneration,
+            War3ShadowReplayStreamType::Blend);
+      }
+      if (draw.alphaTestEnabled && draw.uvBinding != 0u &&
+          !(draw.uvBinding == 1u && draw.blendBinding == 1u) &&
+          needsCapture(draw.uvReplayBinding, draw.uvStorage,
+                       draw.uvPinnedAllocation)) {
+        draw.uvReplayBinding.capture(
+            draw.uvStorage, draw.uvPinnedAllocation, draw.uvInfo,
+            mapEpoch, deviceEpoch, sourceGeneration,
+            War3ShadowReplayStreamType::Uv);
+      }
+    }
+
+    inline bool War3ResolveShadowReplayBindings(
+        const War3ShadowCasterDraw& source, uint64_t expectedFrameSerial,
+        uint64_t expectedMapEpoch, uint64_t expectedDeviceEpoch,
+        War3ShadowCasterDraw& resolved) {
+      resolved = source;
+      if (source.replayBindingsResolved)
+        return source.replayBindingRejectReason ==
+            war3::render::War3ShadowReplayBindingRejectReason::None;
+
+      auto fail = [&](war3::render::War3ShadowReplayBindingRejectReason reason) {
+        resolved.replayBindingsResolved = false;
+        resolved.replayBindingRejectReason = reason;
+        return false;
+      };
+      war3::render::War3ShadowReplayBindingRejectReason reason =
+          war3::render::War3ShadowReplayBindingRejectReason::None;
+      const uint64_t expectedSourceGeneration =
+          War3ShadowReplaySourceGeneration(source, expectedFrameSerial);
+      if (source.positionStorage != source.positionReplayBinding.owner ||
+          source.positionPinnedAllocation !=
+              source.positionReplayBinding.pinnedAllocation) {
+        return fail(war3::render::
+            War3ShadowReplayBindingRejectReason::OwnerMismatch);
+      }
+      if (!source.positionReplayBinding.resolve(
+              expectedMapEpoch, expectedDeviceEpoch,
+              expectedSourceGeneration,
+              resolved.positionInfo, reason)) {
+        resolved.positionInfo = {};
+        return fail(reason);
+      }
+      if (source.indexed) {
+        if (source.indexStorage != source.indexReplayBinding.owner ||
+            source.indexPinnedAllocation !=
+                source.indexReplayBinding.pinnedAllocation) {
+          return fail(war3::render::
+              War3ShadowReplayBindingRejectReason::OwnerMismatch);
+        }
+        if (!source.indexReplayBinding.resolve(
+                expectedMapEpoch, expectedDeviceEpoch,
+                expectedSourceGeneration,
+                resolved.indexInfo, reason)) {
+          resolved.indexInfo = {};
+          return fail(reason);
+        }
+      }
+      if (source.blendBinding == 1u) {
+        if (source.blendStorage != source.blendReplayBinding.owner) {
+          return fail(war3::render::
+              War3ShadowReplayBindingRejectReason::OwnerMismatch);
+        }
+        if (!source.blendReplayBinding.resolve(
+                expectedMapEpoch, expectedDeviceEpoch,
+                expectedSourceGeneration,
+                resolved.blendInfo, reason)) {
+          resolved.blendInfo = {};
+          return fail(reason);
+        }
+      }
+
+      if (source.alphaTestEnabled) {
+        if (source.uvBinding == 0u) {
+          resolved.uvInfo = resolved.positionInfo;
+        } else if (source.uvBinding == 1u && source.blendBinding == 1u) {
+          resolved.uvInfo = resolved.blendInfo;
+        } else {
+          if (source.uvStorage != source.uvReplayBinding.owner ||
+              source.uvPinnedAllocation !=
+                  source.uvReplayBinding.pinnedAllocation) {
+            return fail(war3::render::
+                War3ShadowReplayBindingRejectReason::OwnerMismatch);
+          }
+          if (!source.uvReplayBinding.resolve(
+                  expectedMapEpoch, expectedDeviceEpoch,
+                  expectedSourceGeneration,
+                  resolved.uvInfo, reason)) {
+            resolved.uvInfo = {};
+            return fail(reason);
+          }
+        }
+      }
+
+      resolved.replayBindingsResolved = true;
+      resolved.replayBindingRejectReason =
+          war3::render::War3ShadowReplayBindingRejectReason::None;
+      return true;
+    }
+
     // fullVertexDomainFallback describes how much backing storage had to be
     // copied, not how many vertices the indexed draw can reference.  When the
     // immutable IB is CPU-opaque, indexCount is still a strict upper bound on
@@ -331,6 +624,14 @@ namespace dxvk {
     struct War3ShadowPersistentGeometry {
         War3ShadowGeometryKey key = {};
 
+        // Persistent packages retain logical subranges, not the physical
+        // VkBuffer selected when the package was created. Defrag may relocate
+        // the owner while the package identity remains unchanged.
+        War3ShadowReplayBufferBinding positionReplayBinding = {};
+        War3ShadowReplayBufferBinding indexReplayBinding = {};
+        War3ShadowReplayBufferBinding blendReplayBinding = {};
+        War3ShadowReplayBufferBinding uvReplayBinding = {};
+
         Rc<DxvkBuffer> positionStorage;
         DxvkResourceBufferInfo positionInfo = {};
         uint32_t positionStride = 0;
@@ -390,6 +691,18 @@ namespace dxvk {
         uint64_t totalBytes = 0;
         uint64_t lastSeenFrame = 0;
     };
+
+    inline void War3CopyPersistentReplayBindings(
+        War3ShadowCasterDraw& draw,
+        const War3ShadowPersistentGeometry& geometry) noexcept {
+      draw.positionReplayBinding = geometry.positionReplayBinding;
+      draw.indexReplayBinding = geometry.indexReplayBinding;
+      draw.blendReplayBinding = geometry.blendReplayBinding;
+      draw.uvReplayBinding = geometry.uvReplayBinding;
+      draw.replayBindingRejectReason =
+          war3::render::War3ShadowReplayBindingRejectReason::None;
+      draw.replayBindingsResolved = false;
+    }
 
     struct War3ShadowInstanceRef {
         uint32_t geometryId = 0;

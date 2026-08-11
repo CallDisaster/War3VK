@@ -414,6 +414,9 @@ MakeWar3ShadowReplayValidationInput(
   validation.drawMapEpoch = draw.mapEpoch;
   validation.drawDeviceEpoch = draw.deviceEpoch;
   validation.worldMatrixFinite = War3ShadowMatrixFinite(draw.worldMatrix);
+  validation.bufferBindingsResolved = draw.replayBindingsResolved;
+  validation.bufferBindingRejectReason =
+      static_cast<uint32_t>(draw.replayBindingRejectReason);
   validation.position = {
       draw.positionStorage != nullptr &&
           draw.positionInfo.buffer != VK_NULL_HANDLE,
@@ -1577,6 +1580,35 @@ const std::vector<const War3ShadowCasterDraw*>& BuildShadowReplayDraws(
   cache.valid = true;
   war3::render::NoteFinalShadowCasterFrame(scene, draws, frameSerial);
   return draws;
+}
+
+bool ResolveWar3ShadowReplayDraws(
+    const std::vector<const War3ShadowCasterDraw*>& capturedDraws,
+    uint64_t frameSerial, uint64_t mapEpoch, uint64_t deviceEpoch,
+    std::vector<War3ShadowCasterDraw>& resolvedStorage,
+    std::vector<const War3ShadowCasterDraw*>& resolvedDraws) {
+  resolvedStorage.clear();
+  resolvedDraws.clear();
+  resolvedStorage.reserve(capturedDraws.size());
+  resolvedDraws.reserve(capturedDraws.size());
+
+  bool complete = true;
+  for (const War3ShadowCasterDraw* captured : capturedDraws) {
+    if (captured == nullptr) {
+      resolvedDraws.push_back(nullptr);
+      complete = false;
+      continue;
+    }
+
+    resolvedStorage.emplace_back();
+    War3ShadowCasterDraw& resolved = resolvedStorage.back();
+    if (!War3ResolveShadowReplayBindings(
+            *captured, frameSerial, mapEpoch, deviceEpoch, resolved)) {
+      complete = false;
+    }
+    resolvedDraws.push_back(&resolved);
+  }
+  return complete;
 }
 
 uint32_t ComputeAdaptiveShadowMapPeriod(size_t replayCasterCount) {
@@ -3751,12 +3783,19 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   reconciliation.skinnedPreparedCount = 0u;
   reconciliation.skinnedDrawnCount = 0u;
 
-  const std::vector<const War3ShadowCasterDraw*>* replayDrawsPtr =
+  const std::vector<const War3ShadowCasterDraw*>* capturedReplayDrawsPtr =
       replayDrawOverride;
-  if (replayDrawsPtr == nullptr) {
-    replayDrawsPtr = &BuildShadowReplayDraws(input.scene, input.frameSerial);
+  if (capturedReplayDrawsPtr == nullptr) {
+    capturedReplayDrawsPtr =
+        &BuildShadowReplayDraws(input.scene, input.frameSerial);
   }
-  const auto& replayDraws = *replayDrawsPtr;
+  std::vector<War3ShadowCasterDraw> resolvedReplayStorage;
+  std::vector<const War3ShadowCasterDraw*> resolvedReplayDraws;
+  ResolveWar3ShadowReplayDraws(
+      *capturedReplayDrawsPtr, input.frameSerial,
+      input.mapEpoch, input.deviceEpoch,
+      resolvedReplayStorage, resolvedReplayDraws);
+  const auto& replayDraws = resolvedReplayDraws;
   const uint32_t replayCasterCount = static_cast<uint32_t>(
       std::min<size_t>(replayDraws.size(),
                        std::numeric_limits<uint32_t>::max()));
@@ -7713,12 +7752,19 @@ void War3ShadowReceiverPass::renderPointShadow(
       input.settings ? input.settings.get() : &defaultSettings;
   const bool alphaShadowHashed = settings->shadows.alphaShadowHashed;
 
-  const std::vector<const War3ShadowCasterDraw *> *replayDrawsPtr =
+  const std::vector<const War3ShadowCasterDraw *> *capturedReplayDrawsPtr =
       replayDrawsOverride;
-  if (replayDrawsPtr == nullptr) {
-    replayDrawsPtr = &BuildShadowReplayDraws(input.scene, input.frameSerial);
+  if (capturedReplayDrawsPtr == nullptr) {
+    capturedReplayDrawsPtr =
+        &BuildShadowReplayDraws(input.scene, input.frameSerial);
   }
-  const auto &replayDraws = *replayDrawsPtr;
+  std::vector<War3ShadowCasterDraw> resolvedReplayStorage;
+  std::vector<const War3ShadowCasterDraw*> resolvedReplayDraws;
+  ResolveWar3ShadowReplayDraws(
+      *capturedReplayDrawsPtr, input.frameSerial,
+      input.mapEpoch, input.deviceEpoch,
+      resolvedReplayStorage, resolvedReplayDraws);
+  const auto &replayDraws = resolvedReplayDraws;
   if (replayDraws.empty()) {
     invalidatePointShadowPublishedState();
     m_pointShadowCpuPlan.shouldRender = false;
@@ -10302,15 +10348,24 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
 
   shadowMainPhaseTiming.enter(
       static_cast<size_t>(War3ShadowMainRawPhase::ReplayAndCsmPrepare));
-  const auto& replayDraws = BuildShadowReplayDraws(input.scene, input.frameSerial);
-  // replayDraws 是 thread_local 缓存的 const 引用，其地址被 Worker_Prepare 消费。
-  // 在任何正常/异常退出前排空 future，保证 worker 不会读到被下一帧重建的
-  // cache。guard 刻意紧跟其后创建。
+  const auto& capturedReplayDraws =
+      BuildShadowReplayDraws(input.scene, input.frameSerial);
+  std::vector<War3ShadowCasterDraw> resolvedReplayStorage;
+  std::vector<const War3ShadowCasterDraw*> resolvedReplayDraws;
+  const bool replayBindingsResolvedForFrame = ResolveWar3ShadowReplayDraws(
+      capturedReplayDraws, input.frameSerial,
+      input.mapEpoch, input.deviceEpoch,
+      resolvedReplayStorage, resolvedReplayDraws);
+  const auto& replayDraws = resolvedReplayDraws;
+  // Worker_Prepare consumes pointers into resolvedReplayStorage. Drain it on
+  // every exit before the value snapshot is destroyed.
   [[maybe_unused]] auto pointShadowPrepareWaitGuard =
       MakeWar3ScopeExit([this]() noexcept { waitPointShadowCpuPrepare(); });
   waitPointShadowCpuPrepare();
   resetPointShadowCpuPlanPreservingCapacity();
   const size_t replayCasterCount = replayDraws.size();
+  if (!replayBindingsResolvedForFrame)
+    m_replayValidationFailedThisFrame = true;
   // Adaptive reuse is only correct when the exact replay descriptor and all
   // backing identities match the map that was actually rendered. This hash is
   // therefore always computed; the optional continuity report merely exposes
@@ -10783,7 +10838,7 @@ void War3ShadowReceiverPass::Run(const Rc<DxvkCommandList> &ctx,
     m_csmData = newCsm;
   }
 
-  const bool allowPointShadowPrepare =
+  const bool allowPointShadowPrepare = replayBindingsResolvedForFrame &&
       (!semanticReceiverStabilityActive ||
        !SemanticReceiverDisablePointLightsEnabled()) &&
       m_pointLightsEnabled && mutableSettings.shadows.pointShadowEnabled &&

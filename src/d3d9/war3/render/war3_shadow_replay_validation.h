@@ -39,6 +39,7 @@ enum class War3ShadowReplayRejectReason : uint32_t {
   IncompleteReplayPlan,
   ProducerIncomplete,
   ProducerStampMismatch,
+  UnresolvedBufferBinding,
   Count,
 };
 
@@ -56,6 +57,8 @@ struct War3ShadowReplayValidationInput {
   uint64_t drawMapEpoch = 0u;
   uint64_t drawDeviceEpoch = 0u;
   bool worldMatrixFinite = false;
+  bool bufferBindingsResolved = true;
+  uint32_t bufferBindingRejectReason = 0u;
 
   War3ShadowReplayBufferAccess position = {};
   bool indexed = false;

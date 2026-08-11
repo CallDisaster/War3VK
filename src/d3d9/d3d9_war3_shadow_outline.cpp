@@ -41,6 +41,33 @@ struct OutlineEdgePushConstants {
   float color[4];
 };
 
+bool ResolveOutlineReplayDraws(
+    const War3PipelineInput& input,
+    const std::vector<const War3ShadowCasterDraw*>& captured,
+    std::vector<War3ShadowCasterDraw>& storage,
+    std::vector<const War3ShadowCasterDraw*>& resolved) {
+  storage.clear();
+  resolved.clear();
+  storage.reserve(captured.size());
+  resolved.reserve(captured.size());
+  bool complete = true;
+  for (const War3ShadowCasterDraw* draw : captured) {
+    if (draw == nullptr) {
+      resolved.push_back(nullptr);
+      complete = false;
+      continue;
+    }
+    storage.emplace_back();
+    if (!War3ResolveShadowReplayBindings(
+            *draw, input.frameSerial, input.mapEpoch, input.deviceEpoch,
+            storage.back())) {
+      complete = false;
+    }
+    resolved.push_back(&storage.back());
+  }
+  return complete;
+}
+
 } // namespace
 
 War3ShadowReceiverPass::ShadowCasterPipelineKey
@@ -185,9 +212,9 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
   // Seal the exact target set first. Both the MRT mask and geometry outline
   // are replay consumers and must reject a malformed batch before recording
   // any Vulkan draw or beginning rendering.
-  std::vector<const War3ShadowCasterDraw*> outlineDraws;
+  std::vector<const War3ShadowCasterDraw*> capturedOutlineDraws;
   std::vector<uint32_t> outlineDrawIndices;
-  outlineDraws.reserve(input.scene.shadowCasters.size());
+  capturedOutlineDraws.reserve(input.scene.shadowCasters.size());
   outlineDrawIndices.reserve(input.scene.shadowCasters.size());
   for (uint32_t drawIdx = 0u;
        drawIdx < static_cast<uint32_t>(input.scene.shadowCasters.size());
@@ -198,12 +225,12 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
     // 等 WorldGroup Tag 下绘制， 但仍需要支持描边；同时 terrain
     // 等通常没有有效句柄，不会误命中。
     if (War3RenderState::IsOutlineHandle(caster.batchHandle)) {
-      outlineDraws.push_back(&caster);
+      capturedOutlineDraws.push_back(&caster);
       outlineDrawIndices.push_back(drawIdx);
     }
   }
 
-  if (outlineDraws.empty()) {
+  if (capturedOutlineDraws.empty()) {
     static bool s_loggedNoMatch = false;
     if (!s_loggedNoMatch) {
       s_loggedNoMatch = true;
@@ -221,6 +248,11 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
     }
     return;
   }
+
+  std::vector<War3ShadowCasterDraw> resolvedOutlineStorage;
+  std::vector<const War3ShadowCasterDraw*> outlineDraws;
+  ResolveOutlineReplayDraws(
+      input, capturedOutlineDraws, resolvedOutlineStorage, outlineDraws);
 
   if (!validateShadowReplayDraws(input, outlineDraws,
                                  "outline-screen-space")) {
@@ -515,9 +547,15 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
 
       if (draw.positionStorage.ptr() != nullptr)
         ctx->track(draw.positionStorage);
+      if (draw.positionPinnedAllocation.ptr() != nullptr)
+        ctx->track(draw.positionPinnedAllocation);
       if (draw.indexStorage.ptr() != nullptr &&
           draw.indexStorage.ptr() != draw.positionStorage.ptr())
         ctx->track(draw.indexStorage);
+      if (draw.indexPinnedAllocation.ptr() != nullptr &&
+          draw.indexPinnedAllocation.ptr() !=
+              draw.positionPinnedAllocation.ptr())
+        ctx->track(draw.indexPinnedAllocation);
       if (draw.blendStorage.ptr() != nullptr)
         ctx->track(draw.blendStorage);
       if (key.alphaTestEnabled && draw.uvBinding != 0u &&
@@ -525,6 +563,13 @@ void War3ShadowReceiverPass::renderUnitOutlineScreenSpace(
           draw.uvStorage.ptr() != draw.positionStorage.ptr() &&
           draw.uvStorage.ptr() != draw.blendStorage.ptr())
         ctx->track(draw.uvStorage);
+      if (key.alphaTestEnabled &&
+          draw.uvPinnedAllocation.ptr() != nullptr &&
+          draw.uvPinnedAllocation.ptr() !=
+              draw.positionPinnedAllocation.ptr() &&
+          draw.uvPinnedAllocation.ptr() !=
+              draw.indexPinnedAllocation.ptr())
+        ctx->track(draw.uvPinnedAllocation);
 
       VkBuffer vbs[2];
       VkDeviceSize offsets[2];
@@ -753,15 +798,15 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
 
   // Seal and validate the complete geometry-outline replay batch before any
   // BeginRendering. One malformed target rejects the whole outline pass.
-  std::vector<const War3ShadowCasterDraw*> outlineDraws;
-  outlineDraws.reserve(input.scene.shadowCasters.size());
+  std::vector<const War3ShadowCasterDraw*> capturedOutlineDraws;
+  capturedOutlineDraws.reserve(input.scene.shadowCasters.size());
   for (const auto &caster : input.scene.shadowCasters) {
     if (War3RenderState::IsOutlineHandle(caster.batchHandle)) {
-      outlineDraws.push_back(&caster);
+      capturedOutlineDraws.push_back(&caster);
     }
   }
 
-  if (outlineDraws.empty()) {
+  if (capturedOutlineDraws.empty()) {
     static bool s_loggedNoMatch = false;
     if (!s_loggedNoMatch) {
       s_loggedNoMatch = true;
@@ -779,6 +824,11 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
     }
     return;
   }
+
+  std::vector<War3ShadowCasterDraw> resolvedOutlineStorage;
+  std::vector<const War3ShadowCasterDraw*> outlineDraws;
+  ResolveOutlineReplayDraws(
+      input, capturedOutlineDraws, resolvedOutlineStorage, outlineDraws);
 
   if (!validateShadowReplayDraws(input, outlineDraws,
                                  "outline-geometry")) {
@@ -954,9 +1004,15 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
     // 追踪资源
     if (draw.positionStorage.ptr() != nullptr)
       ctx->track(draw.positionStorage);
+    if (draw.positionPinnedAllocation.ptr() != nullptr)
+      ctx->track(draw.positionPinnedAllocation);
     if (draw.indexStorage.ptr() != nullptr &&
         draw.indexStorage.ptr() != draw.positionStorage.ptr())
       ctx->track(draw.indexStorage);
+    if (draw.indexPinnedAllocation.ptr() != nullptr &&
+        draw.indexPinnedAllocation.ptr() !=
+            draw.positionPinnedAllocation.ptr())
+      ctx->track(draw.indexPinnedAllocation);
     if (draw.blendStorage.ptr() != nullptr)
       ctx->track(draw.blendStorage);
     if (key.alphaTestEnabled && draw.uvBinding != 0u &&
@@ -964,6 +1020,13 @@ void War3ShadowReceiverPass::renderUnitOutline(const Rc<DxvkCommandList> &ctx,
         draw.uvStorage.ptr() != draw.positionStorage.ptr() &&
         draw.uvStorage.ptr() != draw.blendStorage.ptr())
       ctx->track(draw.uvStorage);
+    if (key.alphaTestEnabled &&
+        draw.uvPinnedAllocation.ptr() != nullptr &&
+        draw.uvPinnedAllocation.ptr() !=
+            draw.positionPinnedAllocation.ptr() &&
+        draw.uvPinnedAllocation.ptr() !=
+            draw.indexPinnedAllocation.ptr())
+      ctx->track(draw.uvPinnedAllocation);
 
     // 绑定顶点缓冲区
     VkBuffer vbs[2];
