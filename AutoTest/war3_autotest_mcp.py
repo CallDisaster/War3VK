@@ -3148,6 +3148,13 @@ def _launch_suite_map_until_ready(
             require_game_started_for_fallback=bool(
                 ready_require_game_started_for_fallback
             ),
+            # Isolated sessions cannot receive normal foreground input. Keep
+            # acknowledging a completed loading screen with HWND-scoped
+            # PostMessage pulses while the control plane proves that JASS is
+            # ready but the game session has not started. This never switches
+            # the input desktop and cannot target the user's foreground app.
+            auto_continue_loading=bool(launch.get("useIsolatedDesktop", False)),
+            continue_key="SPACE",
         )
         row["ready"] = ready
         if ready.get("ok"):
@@ -3163,6 +3170,21 @@ def _launch_suite_map_until_ready(
                 "attempts": attempts,
             }
 
+        # Preserve the actual isolated frame before terminating a launch that
+        # failed to reach the game loop. Without this, a menu/loading-screen
+        # timeout is indistinguishable from a renderer or map failure.
+        row["readyFailureScreenshot"] = capture_war3_screenshot(
+            output_path=str(
+                ARTIFACT_ROOT
+                / "ready_failures"
+                / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{pid}.png"
+            ),
+            pid=pid,
+            war3_dir=str(launch.get("instanceRoot", war3_dir)),
+            prefer_internal=True,
+            timeout_sec=8,
+            fallback_to_window_capture=False,
+        )
         stop = stop_war3(
             pid=pid,
             graceful_wait_sec=3,
