@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace dxvk::war3::render {
@@ -35,8 +36,12 @@ struct War3ShadowGenerationBackedStreamProof {
 
   constexpr bool matches(
       const War3ShadowGenerationBackedStreamProof& other) const noexcept {
-    return valid() && other.valid() &&
-        ownerIdentity == other.ownerIdentity &&
+    return valid() && other.valid() && *this == other;
+  }
+
+  constexpr bool operator==(
+      const War3ShadowGenerationBackedStreamProof& other) const noexcept {
+    return ownerIdentity == other.ownerIdentity &&
         identityGeneration == other.identityGeneration &&
         allocationGeneration == other.allocationGeneration &&
         contentGeneration == other.contentGeneration &&
@@ -46,6 +51,32 @@ struct War3ShadowGenerationBackedStreamProof {
         elementSize == other.elementSize &&
         mapEpoch == other.mapEpoch && deviceEpoch == other.deviceEpoch &&
         streamKind == other.streamKind;
+  }
+};
+
+// Hashing is used only after valid() has established the exact owner,
+// allocation/content generations, map/device epochs and byte range. A hash
+// match never authorizes reuse by itself: unordered_map still applies the
+// complete value equality above.
+struct War3ShadowGenerationBackedStreamProofHash {
+  size_t operator()(
+      const War3ShadowGenerationBackedStreamProof& proof) const noexcept {
+    uint64_t hash = uint64_t(proof.ownerIdentity);
+    const auto mix = [&](uint64_t value) {
+      hash ^= value + UINT64_C(0x9e3779b97f4a7c15) +
+          (hash << 6u) + (hash >> 2u);
+    };
+    mix(proof.identityGeneration);
+    mix(proof.allocationGeneration);
+    mix(proof.contentGeneration);
+    mix(proof.sourceOffset);
+    mix(proof.sourceLength);
+    mix(proof.elementStride);
+    mix(proof.elementSize);
+    mix(proof.mapEpoch);
+    mix(proof.deviceEpoch);
+    mix(uint8_t(proof.streamKind));
+    return size_t(hash);
   }
 };
 
