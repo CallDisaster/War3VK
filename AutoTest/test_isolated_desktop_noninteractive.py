@@ -1,6 +1,7 @@
 import os
 import pathlib
 import sys
+import tempfile
 import time
 import unittest
 
@@ -13,6 +14,52 @@ import war3_autotest_mcp as autotest  # noqa: E402
 
 
 class IsolatedDesktopNonInteractiveTests(unittest.TestCase):
+    def test_owned_scenario_d3d9_backup_restore_is_hash_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            war3_dir = root / "war3"
+            artifact_dir = root / "artifacts"
+            war3_dir.mkdir()
+            target = war3_dir / "d3d9.dll"
+            original = b"user-release-dll\x00\x01"
+            candidate = b"autotest-candidate-dll\x02\x03"
+            target.write_bytes(original)
+
+            backup = autotest._backup_scenario_d3d9(
+                war3_dir, artifact_dir
+            )
+            self.assertTrue(backup.get("ok"), backup)
+            self.assertTrue(backup.get("originalExisted"), backup)
+            self.assertEqual(
+                backup.get("sha256"), autotest.sha256_file(target)
+            )
+
+            target.write_bytes(candidate)
+            restore = autotest._restore_scenario_d3d9(
+                backup, str(target)
+            )
+            self.assertTrue(restore.get("ok"), restore)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(
+                restore.get("sha256"), backup.get("sha256")
+            )
+
+    def test_owned_scenario_restore_wraps_launch_and_result(self) -> None:
+        runner = (AUTOTEST / "war3_autotest_mcp.py").read_text(
+            encoding="utf-8"
+        )
+        body = runner.split(
+            "def run_life_and_death_tdr_scenario", 1
+        )[1].split("def run_cross_map_shadow_scenario", 1)[0]
+        backup_index = body.index("_backup_scenario_d3d9(")
+        launch_index = body.index("_launch_suite_map_until_ready(")
+        stop_index = body.index("stop_war3(", launch_index)
+        restore_index = body.index("_restore_scenario_d3d9(", stop_index)
+        self.assertLess(backup_index, launch_index)
+        self.assertLess(stop_index, restore_index)
+        self.assertIn("owned War3 process still alive; DLL restore refused", body)
+        self.assertIn("and restore_ok", body)
+
     def test_strict_stability_hook_classifier_is_bounded_and_case_insensitive(
         self,
     ) -> None:

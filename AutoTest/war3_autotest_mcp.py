@@ -5901,6 +5901,89 @@ def _deploy_d3d9(build_dll: Path, war3_dir: Path) -> Dict[str, Any]:
     }
 
 
+def _backup_scenario_d3d9(war3_dir: Path, artifact_dir: Path) -> Dict[str, Any]:
+    """Snapshot the exact deployed DLL before an owned scenario mutates it."""
+    target = (war3_dir / "d3d9.dll").resolve(strict=False)
+    result: Dict[str, Any] = {
+        "ok": True,
+        "target": str(target),
+        "originalExisted": target.is_file(),
+    }
+    if not target.is_file():
+        return result
+    backup = artifact_dir / "deployment_backup" / "d3d9.dll"
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(target, backup)
+    source_sha = sha256_file(target)
+    backup_sha = sha256_file(backup)
+    if source_sha != backup_sha:
+        return {
+            **result,
+            "ok": False,
+            "error": "d3d9 deployment backup SHA-256 mismatch",
+            "sourceSha256": source_sha,
+            "backupSha256": backup_sha,
+        }
+    result.update(
+        {
+            "backup": str(backup),
+            "sha256": backup_sha,
+            "size": backup.stat().st_size,
+        }
+    )
+    return result
+
+
+def _restore_scenario_d3d9(
+    backup: Dict[str, Any], expected_deploy_target: str = ""
+) -> Dict[str, Any]:
+    """Restore an owned scenario's DLL after its retained process has stopped."""
+    if not backup:
+        return {"ok": True, "skipped": True, "reason": "no deployment backup"}
+    if not backup.get("ok"):
+        return {"ok": False, "error": "deployment backup was not valid"}
+    target = Path(str(backup.get("target", ""))).resolve(strict=False)
+    if expected_deploy_target:
+        deployed = Path(expected_deploy_target).resolve(strict=False)
+        if deployed != target:
+            return {
+                "ok": False,
+                "error": "refusing to restore a different deployment target",
+                "backupTarget": str(target),
+                "deployedTarget": str(deployed),
+            }
+    if not bool(backup.get("originalExisted", False)):
+        if target.exists():
+            target.unlink()
+        return {"ok": True, "target": str(target), "restoredMissing": True}
+
+    source = Path(str(backup.get("backup", "")))
+    expected_sha = str(backup.get("sha256", ""))
+    if not source.is_file() or not expected_sha:
+        return {"ok": False, "error": "deployment backup file is missing"}
+    if sha256_file(source) != expected_sha:
+        return {"ok": False, "error": "deployment backup changed before restore"}
+
+    restore_tmp = target.with_name(
+        f".{target.name}.autotest-restore-{os.getpid()}.tmp"
+    )
+    try:
+        shutil.copy2(source, restore_tmp)
+        if sha256_file(restore_tmp) != expected_sha:
+            return {"ok": False, "error": "temporary restore SHA-256 mismatch"}
+        os.replace(restore_tmp, target)
+    finally:
+        if restore_tmp.exists():
+            restore_tmp.unlink()
+    restored_sha = sha256_file(target)
+    return {
+        "ok": restored_sha == expected_sha,
+        "target": str(target),
+        "sha256": restored_sha,
+        "expectedSha256": expected_sha,
+    }
+
+
 def _preflight_instance_pool_impl(
     sandbox_root: Path,
     artifact_root: Path,
@@ -9711,6 +9794,29 @@ def run_life_and_death_tdr_scenario(
     }
 
     owned_process = int(attach_pid) <= 0
+    deployment_backup: Dict[str, Any] = {}
+    deployment_restore: Dict[str, Any] = {}
+    if owned_process and bool(deploy_d3d9_before_launch):
+        try:
+            deployment_backup = _backup_scenario_d3d9(w3, artifact_dir)
+        except Exception as exc:
+            deployment_backup = {"ok": False, "error": str(exc)}
+        if not deployment_backup.get("ok"):
+            early_result = {
+                "ok": False,
+                "stage": "deployment-backup",
+                "sourceMap": str(source_map),
+                "sourceMapSha256": sha256_file(source_map),
+                "deploymentBackup": deployment_backup,
+                "artifactDir": str(artifact_dir),
+            }
+            early_path = artifact_dir / "life_and_death_tdr_result.json"
+            early_path.write_text(
+                json.dumps(early_result, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            early_result["resultPath"] = str(early_path)
+            return early_result
     if owned_process:
         # A hidden desktop is deliberately non-interactive.  Direct -loadfile
         # maps that reach the game loop need no keyboard acknowledgement, and
@@ -9769,12 +9875,32 @@ def run_life_and_death_tdr_scenario(
             ),
         }
     if not start.get("ok"):
+        if owned_process and deployment_backup:
+            start_pid = int(start.get("pid", 0) or 0)
+            if start_pid > 0 and _pid_alive(start_pid):
+                stop_war3(
+                    pid=start_pid,
+                    graceful_wait_sec=2,
+                    force=True,
+                    avoid_foreground_switch=True,
+                )
+            if start_pid <= 0 or not _pid_alive(start_pid):
+                deploy_target = str(
+                    dict(start.get("launch", {}) or {})
+                    .get("deploy", {})
+                    .get("target", "")
+                )
+                deployment_restore = _restore_scenario_d3d9(
+                    deployment_backup, deploy_target
+                )
         early_result = {
             "ok": False,
             "stage": str(start.get("stage", "ready")),
             "sourceMap": str(source_map),
             "sourceMapSha256": sha256_file(source_map),
             "start": start,
+            "deploymentBackup": deployment_backup,
+            "deploymentRestore": deployment_restore,
             "artifactDir": str(artifact_dir),
         }
         early_path = artifact_dir / "life_and_death_tdr_result.json"
@@ -10089,6 +10215,19 @@ def run_life_and_death_tdr_scenario(
                 force=True,
                 avoid_foreground_switch=True,
             )
+            if _pid_alive(pid):
+                deployment_restore = {
+                    "ok": False,
+                    "error": "owned War3 process still alive; DLL restore refused",
+                    "pid": pid,
+                }
+            elif deployment_backup:
+                deploy_target = str(
+                    dict(launch.get("deploy", {}) or {}).get("target", "")
+                )
+                deployment_restore = _restore_scenario_d3d9(
+                    deployment_backup, deploy_target
+                )
         else:
             stop_result = {
                 "ok": True,
@@ -10111,7 +10250,8 @@ def run_life_and_death_tdr_scenario(
         or "device lost" in failure_reason.lower()
         or "process exited" in failure_reason.lower()
     )
-    route_ok = not failure_reason and not device_lost
+    restore_ok = not deployment_restore or bool(deployment_restore.get("ok"))
+    route_ok = not failure_reason and not device_lost and restore_ok
     result = {
         "ok": route_ok,
         "stage": (
@@ -10127,6 +10267,8 @@ def run_life_and_death_tdr_scenario(
         "sourceMap": str(source_map),
         "sourceMapSha256": sha256_file(source_map),
         "start": start,
+        "deploymentBackup": deployment_backup,
+        "deploymentRestore": deployment_restore,
         "strictExternalGraphicsHooks": bool(strict_external_graphics_hooks),
         "loadedModules": loaded_modules,
         "externalGraphicsHooks": external_graphics_hooks,
