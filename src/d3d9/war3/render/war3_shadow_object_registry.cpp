@@ -796,8 +796,13 @@ bool ShadowObjectRegistry::findFirstForDirectPacket(
 bool ShadowObjectRegistry::findFirstForDirectPacketView(
     void* worldObjectEntry, void* sceneNode, uint32_t jHandle,
     void* primaryRuntimeModelPtr, void* secondaryRuntimeModelPtr,
-    ShadowObjectAugmentView& out) const {
+    ShadowObjectAugmentView& out,
+    uint64_t* mutationGenerationOut) const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
+  if (mutationGenerationOut != nullptr) {
+    *mutationGenerationOut =
+        m_mutationGeneration.load(std::memory_order_acquire);
+  }
 
   const ShadowObjectRecord* record = nullptr;
   const auto findPointer = [&](const auto& map, void* key) -> bool {

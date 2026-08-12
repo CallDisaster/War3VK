@@ -153,7 +153,8 @@ public:
                                     uint32_t jHandle,
                                     void* primaryRuntimeModelPtr,
                                     void* secondaryRuntimeModelPtr,
-                                    ShadowObjectAugmentView& out) const;
+                                    ShadowObjectAugmentView& out,
+                                    uint64_t* mutationGenerationOut = nullptr) const;
   // Per-draw semantic augment lookup. Preserves the legacy key priority while
   // holding one shared lock instead of reacquiring it for every miss.
   bool findFirstForAugment(void* worldObjectEntry, void* sceneNode,

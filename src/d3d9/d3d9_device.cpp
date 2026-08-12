@@ -5814,6 +5814,88 @@ private:
   uint32_t m_missCount = 0u;
 };
 
+// ShadowObject identity/pose metadata is shared by every geoset of one object.
+// Cache only the registry's value projection for this Populate call and use its
+// seqlock-style mutation generation as the authority for every hit.
+class War3CurrentDrawShadowObjectSnapshotCache final {
+public:
+  bool find(
+      const dxvk::war3::render::ShadowObjectRegistry& registry,
+      void* worldObjectEntry, void* sceneNode, uint32_t jHandle,
+      void* primaryRuntimeModelPtr, void* secondaryRuntimeModelPtr,
+      dxvk::war3::render::ShadowObjectAugmentView& out) {
+    const uint64_t currentGeneration = registry.mutationGeneration();
+    const size_t slot = slotFor(worldObjectEntry, sceneNode, jHandle,
+                                primaryRuntimeModelPtr,
+                                secondaryRuntimeModelPtr);
+    const auto& entry = m_entries[slot];
+    if ((currentGeneration & 1u) == 0u &&
+        entry.generation == currentGeneration &&
+        entry.worldObjectEntry == worldObjectEntry &&
+        entry.sceneNode == sceneNode && entry.jHandle == jHandle &&
+        entry.primaryRuntimeModelPtr == primaryRuntimeModelPtr &&
+        entry.secondaryRuntimeModelPtr == secondaryRuntimeModelPtr) {
+      out = entry.value;
+      ++m_hitCount;
+      return entry.found;
+    }
+
+    uint64_t observedGeneration = 0u;
+    dxvk::war3::render::ShadowObjectAugmentView value = {};
+    const bool found = registry.findFirstForDirectPacketView(
+        worldObjectEntry, sceneNode, jHandle, primaryRuntimeModelPtr,
+        secondaryRuntimeModelPtr, value, &observedGeneration);
+    const uint64_t publishedGeneration = registry.mutationGeneration();
+    if ((observedGeneration & 1u) == 0u &&
+        observedGeneration == publishedGeneration) {
+      m_entries[slot] = Entry{worldObjectEntry, sceneNode, jHandle,
+                              primaryRuntimeModelPtr,
+                              secondaryRuntimeModelPtr, observedGeneration,
+                              value, found};
+    }
+    out = value;
+    ++m_missCount;
+    return found;
+  }
+
+  uint32_t hitCount() const { return m_hitCount; }
+  uint32_t missCount() const { return m_missCount; }
+
+private:
+  struct Entry {
+    void* worldObjectEntry = nullptr;
+    void* sceneNode = nullptr;
+    uint32_t jHandle = 0u;
+    void* primaryRuntimeModelPtr = nullptr;
+    void* secondaryRuntimeModelPtr = nullptr;
+    uint64_t generation = ~uint64_t(0u);
+    dxvk::war3::render::ShadowObjectAugmentView value = {};
+    bool found = false;
+  };
+
+  static constexpr size_t kEntryCount = 128u;
+
+  static size_t slotFor(void* worldObjectEntry, void* sceneNode,
+                        uint32_t jHandle, void* primaryRuntimeModelPtr,
+                        void* secondaryRuntimeModelPtr) {
+    uint64_t hash = bit::fnv1a_init();
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(worldObjectEntry)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(sceneNode)));
+    hash = bit::fnv1a_iter(hash, jHandle);
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(primaryRuntimeModelPtr)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(secondaryRuntimeModelPtr)));
+    return size_t(hash) & (kEntryCount - 1u);
+  }
+
+  std::array<Entry, kEntryCount> m_entries = {};
+  uint32_t m_hitCount = 0u;
+  uint32_t m_missCount = 0u;
+};
+
 bool War3TryAttachCurrentDrawVisibleIndexSlice(
     const dxvk::war3::render::CurrentDrawContractRecord& record,
     const dxvk::war3::model::ShadowGeosetResourceRecord& geoset,
@@ -6391,7 +6473,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         groupRangeValidator = nullptr,
     War3CurrentDrawVisibleIndexSliceCache* visibleIndexSliceCache = nullptr,
     War3CurrentDrawGeosetSnapshotCache* geosetSnapshotCache = nullptr,
-    War3CurrentDrawInstanceSnapshotCache* instanceSnapshotCache = nullptr) {
+    War3CurrentDrawInstanceSnapshotCache* instanceSnapshotCache = nullptr,
+    War3CurrentDrawShadowObjectSnapshotCache*
+        shadowObjectSnapshotCache = nullptr) {
   const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
       record.stage,
       record.batchTag,
@@ -6611,10 +6695,20 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     auto shadowObjectLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/ShadowObjectLookup");
     auto& shadowRegistry = dxvk::war3::render::ShadowObjectRegistry::instance();
-    shadowHit = shadowRegistry.findFirstForDirectPacketView(
-        record.worldObjectEntry, record.sceneNode, record.jHandle,
-        ownerHit ? ownerBinding.runtimeModelPtr : nullptr,
-        instanceHit ? instanceRecord.runtimeModelPtr : nullptr, shadowRecord);
+    if (shadowObjectSnapshotCache != nullptr) {
+      shadowHit = shadowObjectSnapshotCache->find(
+          shadowRegistry, record.worldObjectEntry, record.sceneNode,
+          record.jHandle,
+          ownerHit ? ownerBinding.runtimeModelPtr : nullptr,
+          instanceHit ? instanceRecord.runtimeModelPtr : nullptr,
+          shadowRecord);
+    } else {
+      shadowHit = shadowRegistry.findFirstForDirectPacketView(
+          record.worldObjectEntry, record.sceneNode, record.jHandle,
+          ownerHit ? ownerBinding.runtimeModelPtr : nullptr,
+          instanceHit ? instanceRecord.runtimeModelPtr : nullptr,
+          shadowRecord);
+    }
   }
 
   dxvk::war3::render::VisibleRenderableRecord visibleRecord = {};
@@ -26829,6 +26923,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   War3CurrentDrawGeosetSnapshotCache currentDrawGeosetSnapshotCache(
       dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch());
   War3CurrentDrawInstanceSnapshotCache currentDrawInstanceSnapshotCache;
+  War3CurrentDrawShadowObjectSnapshotCache
+      currentDrawShadowObjectSnapshotCache;
 
   enterBuildEligiblePhase("RecordLoop");
   for (size_t buildIndex = 0u;
@@ -26960,7 +27056,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           &currentDrawGroupRangeValidator,
           &currentDrawVisibleIndexSliceCache,
           &currentDrawGeosetSnapshotCache,
-          &currentDrawInstanceSnapshotCache);
+          &currentDrawInstanceSnapshotCache,
+          &currentDrawShadowObjectSnapshotCache);
       packetBuildTiming.finish();
       if (!packetBuilt) {
         bucket.packetBuildFailParts++;
