@@ -25816,8 +25816,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   // instead: all policy/order keys and the eventual packet builder still read
   // the exact same record, while the hot path moves only a uint32_t.
   static thread_local std::vector<uint32_t> s_recordIndicesForBuild;
+  static thread_local std::vector<uint64_t> s_recordSelectionKeysForBuild;
   auto& recordIndicesForBuild = s_recordIndicesForBuild;
+  auto& recordSelectionKeysForBuild = s_recordSelectionKeysForBuild;
   recordIndicesForBuild.clear();
+  recordSelectionKeysForBuild.clear();
   const War3CompactWorkTableMode compactWorkTableMode =
       War3SemanticCompactWorkTableModeRuntime();
   const bool observeCompactWorkTable =
@@ -26122,6 +26125,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
     enterDirectDetailPhase("PreselectSelection");
     recordIndicesForBuild.reserve(directStickyRecordBudget);
+    recordSelectionKeysForBuild.reserve(directStickyRecordBudget);
     const bool stickyLease =
         War3SemanticStickySelectionLeaseRuntime() &&
         !preferredSelectionKeys.empty();
@@ -26143,6 +26147,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       const size_t beforeSize = recordIndicesForBuild.size();
       for (uint32_t i = group.startIdx; i < group.startIdx + group.count; ++i) {
         recordIndicesForBuild.push_back(preselectedRecords[i].recordIndex);
+        recordSelectionKeysForBuild.push_back(
+            preselectedRecords[i].selectionKey);
         if (compactWorkTableMode != War3CompactWorkTableMode::Off)
           m_war3CompactWorkTable.append(preselectedRecords[i].work);
       }
@@ -26189,6 +26195,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     enterDirectDetailPhase("SnapshotFallbackCopy");
     recordIndicesForBuild.resize(directRecords.size());
     std::iota(recordIndicesForBuild.begin(), recordIndicesForBuild.end(), 0u);
+    // Zero means the uncapped fallback did not run the grouped preselector;
+    // BuildEligible retains its historical on-demand identity resolution.
+    recordSelectionKeysForBuild.assign(directRecords.size(), 0u);
   }
 
   // --- Step 2: build eligible record list (per-record filtering) ---
@@ -26635,6 +26644,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (recordIndex >= directRecords.size())
       continue;
     const auto& record = directRecords[recordIndex];
+    const uint64_t preselectedRecordSelectionKey =
+        buildIndex < recordSelectionKeysForBuild.size()
+            ? recordSelectionKeysForBuild[buildIndex]
+            : 0u;
     War3CompactWorkItem compactWork = {};
     const bool hasCompactWork =
         m_war3CompactWorkTable.load(buildIndex, compactWork);
@@ -26864,7 +26877,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     eligible.sceneNode = eligible.packet.renderable.sceneNode;
     eligible.recordSelectionKey = useSealedWork
         ? compactWork.selectionKey
-        : War3SemanticDirectRecordSelectionKey(record);
+        : preselectedRecordSelectionKey != 0u
+              ? preselectedRecordSelectionKey
+              : War3SemanticDirectRecordSelectionKey(record);
     War3SemanticDirectSelectionKeySource selectionKeySource =
         War3SemanticDirectSelectionKeySource::None;
     eligible.selectionKey =
