@@ -27661,25 +27661,27 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               War3SemanticStickyPartSelectionMinRecordsRuntime());
       if (retainedRecordCount >= minStickyPartRecords) {
         // Decide before moving. If the sticky set is below the threshold we
-        // must leave every EligibleRecord intact for the fallback submission;
-        // moving first would empty packet-owned vectors while leaving their
-        // raw aliases behind.
-        std::vector<EligibleRecord> retainedRecords;
-        retainedRecords.reserve(retainedRecordCount);
-        for (auto& eligible : eligibleRecords) {
-          if (eligible.previouslySubmittedPart) {
-            retainedRecords.push_back(std::move(eligible));
-            War3RebindEligibleRecordPacket(retainedRecords.back());
-          }
-        }
+        // must leave every EligibleRecord intact for fallback submission.
+        // Once accepted, stable in-place compaction preserves the old record
+        // order without allocating and moving a second packet vector. Moving
+        // may invalidate packet self-aliases, so rebind the retained range
+        // before any consumer observes it.
+        const uint32_t droppedRecordCount =
+            uint32_t(eligibleRecords.size()) - retainedRecordCount;
+        eligibleRecords.erase(
+            std::remove_if(
+                eligibleRecords.begin(), eligibleRecords.end(),
+                [](const EligibleRecord& eligible) {
+                  return !eligible.previouslySubmittedPart;
+                }),
+            eligibleRecords.end());
+        War3RebindEligibleRecordPackets(eligibleRecords);
         m_war3Scene.shadowStats
             .semanticSceneDirectStickyPartSelectionRetainedCount =
             retainedRecordCount;
         m_war3Scene.shadowStats
             .semanticSceneDirectStickyPartSelectionDroppedCount =
-            uint32_t(eligibleRecords.size() - retainedRecordCount);
-        eligibleRecords = std::move(retainedRecords);
-        War3RebindEligibleRecordPackets(eligibleRecords);
+            droppedRecordCount;
         eligibleRecordCount = uint32_t(eligibleRecords.size());
         m_war3Scene.shadowStats.semanticSceneDirectLastEligibleRecordCount =
             eligibleRecordCount;
