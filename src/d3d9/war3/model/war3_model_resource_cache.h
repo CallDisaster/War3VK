@@ -354,6 +354,27 @@ public:
   std::vector<ShadowModelAliasSnapshotRecord> snapshotModelAliases() const;
   std::vector<ShadowModelAliasSnapshotRecord>
   snapshotRuntimeModelAliases() const;
+  // ResourceStore hydration consumes aliases immediately and never re-enters
+  // this cache. Enumerate the same model-resource-then-runtime-model sequence
+  // under one shared lock, avoiding two temporary vector allocations on every
+  // resource-store rebuild. Callback references are value projections and are
+  // valid only for the duration of the call.
+  template <typename Fn>
+  void forEachResourceStoreAlias(Fn&& fn) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    for (const auto& entry : m_byModelResource) {
+      const auto& record = entry.second;
+      fn(ShadowModelAliasSnapshotRecord{
+          record.runtimeModelPtr, record.modelResourcePtr,
+          record.geosetCount});
+    }
+    for (const auto& entry : m_byRuntimeModel) {
+      const auto& record = entry.second;
+      fn(ShadowModelAliasSnapshotRecord{
+          record.runtimeModelPtr, record.modelResourcePtr,
+          record.geosetCount});
+    }
+  }
   size_t geosetRecordCount() const;
   size_t readyGeosetCount() const;
   size_t modelResourceCount() const;

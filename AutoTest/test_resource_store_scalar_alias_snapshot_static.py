@@ -38,10 +38,20 @@ for body, source in ((model_snapshot, "m_byModelResource"),
 resource_build = contract.split("auto buildResourceStore =", 1)[1].split(
     "return freshResources;", 1
 )[0]
-assert "snapshotModelAliases()" in resource_build
-assert "snapshotRuntimeModelAliases()" in resource_build
+assert "forEachResourceStoreAlias(" in resource_build
+assert "snapshotModelAliases()" not in resource_build
+assert "snapshotRuntimeModelAliases()" not in resource_build
 assert "snapshotModels()" not in resource_build
 assert "snapshotRuntimeModels()" not in resource_build
+
+direct_alias = header.split(
+    "void forEachResourceStoreAlias", 1
+)[1].split("size_t geosetRecordCount", 1)[0]
+assert "std::shared_lock<std::shared_mutex>" in direct_alias
+assert direct_alias.index("m_byModelResource") < direct_alias.index("m_byRuntimeModel")
+assert "ShadowModelAliasSnapshotRecord" in direct_alias
+assert "record.geosetPtrs" not in direct_alias
+assert "record.geosetDataPtrs" not in direct_alias
 
 cold_sweep = contract.split("constexpr size_t kColdStartSweepBudget", 1)[1].split(
     "bool TryResolveRuntimeModelSemanticKey", 1

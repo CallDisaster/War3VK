@@ -3984,20 +3984,16 @@ void ShadowRuntimeContractCache::captureLiveState() {
               ConvertGeoset(geoset, manifest.frameSerial, alias));
         });
 
-    // 先补 modelResource->runtimeModel alias，再补纯 runtimeModel alias。
-    for (const auto& modelRecord : resourceCache.snapshotModelAliases()) {
-      for (uint32_t i = 0; i < modelRecord.geosetCount; ++i) {
-        freshResources->bindRuntimeModelAlias(modelRecord.runtimeModelPtr, i,
-                                              modelRecord.modelResourcePtr);
-      }
-    }
-    for (const auto& runtimeRecord :
-         resourceCache.snapshotRuntimeModelAliases()) {
-      for (uint32_t i = 0; i < runtimeRecord.geosetCount; ++i) {
-        freshResources->bindRuntimeModelAlias(runtimeRecord.runtimeModelPtr, i,
-                                              runtimeRecord.modelResourcePtr);
-      }
-    }
+    // Keep the historical model-resource aliases first and runtime-model
+    // aliases second, but consume their scalar projections directly instead
+    // of allocating two short-lived snapshot vectors.
+    resourceCache.forEachResourceStoreAlias(
+        [&](const model::ShadowModelAliasSnapshotRecord& alias) {
+          for (uint32_t i = 0; i < alias.geosetCount; ++i) {
+            freshResources->bindRuntimeModelAlias(
+                alias.runtimeModelPtr, i, alias.modelResourcePtr);
+          }
+        });
     return freshResources;
   };
   std::shared_ptr<ShadowModelResourceStore> resourcesPtr;
