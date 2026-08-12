@@ -5670,6 +5670,72 @@ private:
   uint32_t m_bypassCount = 0u;
 };
 
+// One Populate call can contain hundreds of instances which all refer to the
+// same immutable geoset. The process-wide cache remains the generation owner,
+// but taking its shared mutex and probing its hash table for every instance is
+// unnecessary. Keep a small direct-mapped view for this scene build only.
+class War3CurrentDrawGeosetSnapshotCache final {
+public:
+  explicit War3CurrentDrawGeosetSnapshotCache(uint64_t mapEpoch)
+      : m_mapEpoch(mapEpoch) {}
+
+  std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>
+  find(void* meshPayloadPtr) {
+    if (meshPayloadPtr == nullptr || m_mapEpoch == 0u) {
+      ++m_missCount;
+      return nullptr;
+    }
+
+    const auto& entry = m_entries[slotFor(meshPayloadPtr)];
+    if (entry.meshPayloadPtr != meshPayloadPtr || entry.snapshot == nullptr ||
+        entry.snapshot->mapEpoch != m_mapEpoch ||
+        entry.snapshot->immutableModelGeneration == 0u ||
+        !entry.snapshot->readyForShadowConsumer()) {
+      ++m_missCount;
+      return nullptr;
+    }
+
+    ++m_hitCount;
+    return entry.snapshot;
+  }
+
+  void store(
+      void* meshPayloadPtr,
+      std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>
+          snapshot) {
+    if (meshPayloadPtr == nullptr || snapshot == nullptr ||
+        m_mapEpoch == 0u || snapshot->mapEpoch != m_mapEpoch ||
+        snapshot->immutableModelGeneration == 0u ||
+        !snapshot->readyForShadowConsumer()) {
+      return;
+    }
+    m_entries[slotFor(meshPayloadPtr)] =
+        Entry{meshPayloadPtr, std::move(snapshot)};
+  }
+
+  uint32_t hitCount() const { return m_hitCount; }
+  uint32_t missCount() const { return m_missCount; }
+
+private:
+  struct Entry {
+    void* meshPayloadPtr = nullptr;
+    std::shared_ptr<const dxvk::war3::model::ShadowGeosetResourceRecord>
+        snapshot;
+  };
+
+  static constexpr size_t kEntryCount = 128u;
+
+  static size_t slotFor(void* meshPayloadPtr) {
+    const uintptr_t value = reinterpret_cast<uintptr_t>(meshPayloadPtr);
+    return size_t((value >> 4u) ^ (value >> 13u)) & (kEntryCount - 1u);
+  }
+
+  uint64_t m_mapEpoch = 0u;
+  std::array<Entry, kEntryCount> m_entries = {};
+  uint32_t m_hitCount = 0u;
+  uint32_t m_missCount = 0u;
+};
+
 bool War3TryAttachCurrentDrawVisibleIndexSlice(
     const dxvk::war3::render::CurrentDrawContractRecord& record,
     const dxvk::war3::model::ShadowGeosetResourceRecord& geoset,
@@ -6245,7 +6311,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     War3PacketBuildRawTiming* packetBuildTiming = nullptr,
     const dxvk::war3::render::CurrentDrawRangeValidator*
         groupRangeValidator = nullptr,
-    War3CurrentDrawVisibleIndexSliceCache* visibleIndexSliceCache = nullptr) {
+    War3CurrentDrawVisibleIndexSliceCache* visibleIndexSliceCache = nullptr,
+    War3CurrentDrawGeosetSnapshotCache* geosetSnapshotCache = nullptr) {
   const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
       record.stage,
       record.batchTag,
@@ -6280,7 +6347,10 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto geosetLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/GeosetLookup");
-    sharedGeoset = War3FindDirectPacketGeosetResource(record.meshPayloadPtr);
+    if (geosetSnapshotCache != nullptr)
+      sharedGeoset = geosetSnapshotCache->find(record.meshPayloadPtr);
+    if (sharedGeoset == nullptr)
+      sharedGeoset = War3FindDirectPacketGeosetResource(record.meshPayloadPtr);
     geoset = sharedGeoset.get();
     geosetHit = geoset != nullptr;
     if (!geosetHit) {
@@ -6626,6 +6696,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (sharedGeoset == nullptr)
     sharedGeoset =
         War3GetDirectPacketGeosetResource(std::move(geosetLocal));
+  if (geosetSnapshotCache != nullptr)
+    geosetSnapshotCache->store(record.meshPayloadPtr, sharedGeoset);
   const auto& geo = *sharedGeoset;
 
   auto& resource = out.resource;
@@ -26661,6 +26733,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   War3CurrentDrawVisibleIndexSliceCache currentDrawVisibleIndexSliceCache(
       War3CurrentDrawVisibleIndexSliceCacheRuntime(),
       War3CurrentDrawGenerationIndexSliceCacheRuntime());
+  War3CurrentDrawGeosetSnapshotCache currentDrawGeosetSnapshotCache(
+      dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch());
 
   enterBuildEligiblePhase("RecordLoop");
   for (size_t buildIndex = 0u;
@@ -26790,7 +26864,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           &eligible.sample,
           traceBuildRecord ? &packetBuildTiming : nullptr,
           &currentDrawGroupRangeValidator,
-          &currentDrawVisibleIndexSliceCache);
+          &currentDrawVisibleIndexSliceCache,
+          &currentDrawGeosetSnapshotCache);
       packetBuildTiming.finish();
       if (!packetBuilt) {
         bucket.packetBuildFailParts++;
