@@ -1497,8 +1497,15 @@ struct MeshLayerBindingContract {
   }
 };
 
+enum class MeshLayerBindingResolveExtent : uint8_t {
+  MaterialSignature,
+  Full,
+};
+
 bool TryResolveMeshLayerBindingContract(const ShadowRenderableRecord& renderable,
-                                        MeshLayerBindingContract& out);
+                                        MeshLayerBindingContract& out,
+                                        MeshLayerBindingResolveExtent extent =
+                                            MeshLayerBindingResolveExtent::Full);
 
 ShadowAlphaMode ResolveShadowAlphaMode(
     const ShadowRenderableRecord& renderable,
@@ -1584,7 +1591,9 @@ ShadowMaterialSignature BuildShadowMaterialSignatureForRenderable(
     const ShadowRenderableRecord& renderable) {
   MeshLayerBindingContract layerContract = {};
   const bool hasLayerContract =
-      TryResolveMeshLayerBindingContract(renderable, layerContract);
+      TryResolveMeshLayerBindingContract(
+          renderable, layerContract,
+          MeshLayerBindingResolveExtent::MaterialSignature);
   return BuildShadowMaterialSignature(renderable,
                                       hasLayerContract ? &layerContract : nullptr);
 }
@@ -1594,7 +1603,9 @@ bool InspectShadowMaterialBindingForRenderable(
     ShadowMaterialBindingDiagnostics& out) {
   out = {};
   MeshLayerBindingContract layerContract = {};
-  if (!TryResolveMeshLayerBindingContract(renderable, layerContract))
+  if (!TryResolveMeshLayerBindingContract(
+          renderable, layerContract,
+          MeshLayerBindingResolveExtent::MaterialSignature))
     return false;
 
   out.resolved = true;
@@ -1895,7 +1906,8 @@ DynamicAuxStreamCandidates CollectDynamicAuxStreamCandidates(
 }
 
 bool TryResolveMeshLayerBindingContract(const ShadowRenderableRecord& renderable,
-                                        MeshLayerBindingContract& out) {
+                                        MeshLayerBindingContract& out,
+                                        MeshLayerBindingResolveExtent extent) {
   out = {};
 
   if (renderable.queueKind != render::VisibleRenderableQueueKind::MainQueue ||
@@ -2047,6 +2059,14 @@ bool TryResolveMeshLayerBindingContract(const ShadowRenderableRecord& renderable
   dxvk::war3::SafeReadU32Fast(dispatchPtr,
                               dxvk::war3::MeshLayerDispatchRecordOffsets::StageMode1,
                               out.stageMode1);
+
+  // Material identity ends at the canonical layer/dispatch record. Resolving
+  // the auxiliary stream table is substantially more expensive (and may walk
+  // multiple guarded game-memory ranges), while none of those stream pointers
+  // or snapshots participate in BuildShadowMaterialSignature. Full geometry
+  // consumers still use the default Full extent below.
+  if (extent == MeshLayerBindingResolveExtent::MaterialSignature)
+    return true;
 
   void* auxTable = nullptr;
   if (!dxvk::war3::SafeReadPtrFast(renderable.meshData,
@@ -6395,7 +6415,9 @@ bool TryConvertUpperLayerResolvedItem(
   outPacket.pose = ConvertPoseRecord(src.pose, frameSerial);
   MeshLayerBindingContract layerContract = {};
   const bool hasLayerContract =
-      TryResolveMeshLayerBindingContract(outPacket.renderable, layerContract);
+      TryResolveMeshLayerBindingContract(
+          outPacket.renderable, layerContract,
+          MeshLayerBindingResolveExtent::MaterialSignature);
   outPacket.material = BuildShadowMaterialSignature(
       outPacket.renderable, hasLayerContract ? &layerContract : nullptr);
   outPacket.path =
