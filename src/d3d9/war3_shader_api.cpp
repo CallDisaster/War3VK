@@ -13,6 +13,7 @@
 #include "war3/platform/war3_module_api.h"
 #include "d3d9_war3_pipeline.h"
 #include "d3d9_war3_scene.h"
+#include "d3d9_war3_fog_volume.h"
 #include "d3d9_war3_light.h"
 #include "d3d9_war3_settings.h"
 #include "war3/render/war3_render_state.h"
@@ -522,6 +523,85 @@ WAR3_SHADER_API uint32_t GetPointLightCount() {
     return dxvk::War3LightManager::Instance().GetLightCount();
 }
 
+WAR3_SHADER_API int32_t AddSphereFogVolume(
+    float x, float y, float z, float radius,
+    float density, float edgeFeather) {
+    return dxvk::War3FogVolumeManager::Instance().AddSphere(
+        x, y, z, radius, density, edgeFeather);
+}
+
+WAR3_SHADER_API int32_t AddBoxFogVolume(
+    float x, float y, float z,
+    float sizeX, float sizeY, float sizeZ,
+    float density, float edgeFeather) {
+    return dxvk::War3FogVolumeManager::Instance().AddBox(
+        x, y, z, sizeX, sizeY, sizeZ, density, edgeFeather);
+}
+
+WAR3_SHADER_API int32_t AddCylinderFogVolume(
+    float x, float y, float z, float radius, float height,
+    float density, float edgeFeather) {
+    return dxvk::War3FogVolumeManager::Instance().AddCylinder(
+        x, y, z, radius, height, density, edgeFeather);
+}
+
+WAR3_SHADER_API bool SetFogVolumeEnabled(int32_t id, bool enabled) {
+    return dxvk::War3FogVolumeManager::Instance().SetActive(id, enabled);
+}
+
+WAR3_SHADER_API bool SetFogVolumePosition(
+    int32_t id, float x, float y, float z) {
+    return dxvk::War3FogVolumeManager::Instance().SetPosition(id, x, y, z);
+}
+
+WAR3_SHADER_API bool SetFogVolumeRotation(
+    int32_t id, float xDegrees, float yDegrees, float zDegrees) {
+    return dxvk::War3FogVolumeManager::Instance().SetRotationDegrees(
+        id, xDegrees, yDegrees, zDegrees);
+}
+
+WAR3_SHADER_API bool SetFogVolumeDensity(int32_t id, float density) {
+    return dxvk::War3FogVolumeManager::Instance().SetDensity(id, density);
+}
+
+WAR3_SHADER_API bool SetFogVolumeEdgeFeather(
+    int32_t id, float edgeFeather) {
+    return dxvk::War3FogVolumeManager::Instance().SetEdgeFeather(
+        id, edgeFeather);
+}
+
+WAR3_SHADER_API bool SetSphereFogVolumeRadius(int32_t id, float radius) {
+    return dxvk::War3FogVolumeManager::Instance().SetSphereRadius(id, radius);
+}
+
+WAR3_SHADER_API bool SetBoxFogVolumeSize(
+    int32_t id, float sizeX, float sizeY, float sizeZ) {
+    return dxvk::War3FogVolumeManager::Instance().SetBoxSize(
+        id, sizeX, sizeY, sizeZ);
+}
+
+WAR3_SHADER_API bool SetCylinderFogVolumeSize(
+    int32_t id, float radius, float height) {
+    return dxvk::War3FogVolumeManager::Instance().SetCylinderSize(
+        id, radius, height);
+}
+
+WAR3_SHADER_API bool IsFogVolumeAlive(int32_t id) {
+    return dxvk::War3FogVolumeManager::Instance().IsAlive(id);
+}
+
+WAR3_SHADER_API bool RemoveFogVolume(int32_t id) {
+    return dxvk::War3FogVolumeManager::Instance().Remove(id);
+}
+
+WAR3_SHADER_API void ClearFogVolumes() {
+    dxvk::War3FogVolumeManager::Instance().Clear();
+}
+
+WAR3_SHADER_API uint32_t GetFogVolumeCount() {
+    return dxvk::War3FogVolumeManager::Instance().GetVolumeCount();
+}
+
 WAR3_SHADER_API bool SetLightingEnabled(bool enabled) {
     auto settings = GetMutableSettings();
     if (!settings)
@@ -860,7 +940,7 @@ WAR3_SHADER_API bool SetVolumetricLightParams(
 }
 
 WAR3_SHADER_API bool SetVolumetricLightFade(float fadeNear, float fadeFar,
-                                            float maxRayDistance) {
+                                             float maxRayDistance) {
     auto settings = GetMutableSettings();
     if (!settings)
         return false;
@@ -869,6 +949,14 @@ WAR3_SHADER_API bool SetVolumetricLightFade(float fadeNear, float fadeFar,
     volumetric.fadeFar =
         std::clamp(fadeFar, volumetric.fadeNear + 0.01f, 1.0f);
     volumetric.maxRayDistance = std::max(0.05f, maxRayDistance);
+    return true;
+}
+
+WAR3_SHADER_API bool SetVolumetricGlobalMediumEnabled(bool enabled) {
+    auto settings = GetMutableSettings();
+    if (!settings)
+        return false;
+    settings->postFx.volumetricLight.globalMediumEnabled = enabled;
     return true;
 }
 

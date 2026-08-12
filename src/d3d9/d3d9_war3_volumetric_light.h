@@ -1,5 +1,6 @@
 #pragma once
 
+#include "d3d9_war3_fog_volume.h"
 #include "d3d9_war3_light.h"
 #include "d3d9_war3_pipeline.h"
 #include "../dxvk/dxvk_hash.h"
@@ -55,6 +56,7 @@ namespace dxvk {
         bool drawVolumetricLight(const Rc<DxvkCommandList>& ctx,
                                  const War3PipelineInput& input,
                                  const War3PointLightFrameSnapshot& pointLights,
+                                 const War3FogVolumeFrameSnapshot& fogVolumes,
                                  const std::array<uint32_t,
                                      War3PointLightFrameSnapshot::kMaxLights>&
                                      selectedPointIndices,
@@ -105,6 +107,7 @@ namespace dxvk {
         static constexpr uint32_t kUboRingSlots = 24u;
         std::array<Rc<DxvkBuffer>, kUboRingSlots> m_csmUniformBuffers;
         std::array<Rc<DxvkBuffer>, kUboRingSlots> m_lightBuffers;
+        std::array<Rc<DxvkBuffer>, kUboRingSlots> m_fogVolumeBuffers;
     };
 
 } // namespace dxvk

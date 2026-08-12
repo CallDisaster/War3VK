@@ -568,6 +568,37 @@ WAR3_SHADER_API void ClearPointLights();
 WAR3_SHADER_API uint32_t GetPointLightCount();
 
 /**
+ * @brief 局部体积雾管理。尺寸为世界单位；edgeFeather 为归一化边缘宽度 0..1。
+ * @note Box 的 sizeX/Y/Z 与 Cylinder 的 height 均为完整尺寸，不是半径/半高。
+ */
+WAR3_SHADER_API int32_t AddSphereFogVolume(
+    float x, float y, float z, float radius,
+    float density, float edgeFeather);
+WAR3_SHADER_API int32_t AddBoxFogVolume(
+    float x, float y, float z,
+    float sizeX, float sizeY, float sizeZ,
+    float density, float edgeFeather);
+WAR3_SHADER_API int32_t AddCylinderFogVolume(
+    float x, float y, float z, float radius, float height,
+    float density, float edgeFeather);
+WAR3_SHADER_API bool SetFogVolumeEnabled(int32_t id, bool enabled);
+WAR3_SHADER_API bool SetFogVolumePosition(
+    int32_t id, float x, float y, float z);
+WAR3_SHADER_API bool SetFogVolumeRotation(
+    int32_t id, float xDegrees, float yDegrees, float zDegrees);
+WAR3_SHADER_API bool SetFogVolumeDensity(int32_t id, float density);
+WAR3_SHADER_API bool SetFogVolumeEdgeFeather(int32_t id, float edgeFeather);
+WAR3_SHADER_API bool SetSphereFogVolumeRadius(int32_t id, float radius);
+WAR3_SHADER_API bool SetBoxFogVolumeSize(
+    int32_t id, float sizeX, float sizeY, float sizeZ);
+WAR3_SHADER_API bool SetCylinderFogVolumeSize(
+    int32_t id, float radius, float height);
+WAR3_SHADER_API bool IsFogVolumeAlive(int32_t id);
+WAR3_SHADER_API bool RemoveFogVolume(int32_t id);
+WAR3_SHADER_API void ClearFogVolumes();
+WAR3_SHADER_API uint32_t GetFogVolumeCount();
+
+/**
  * @brief 渲染设置 API（高阶控制）
  */
 WAR3_SHADER_API bool SetLightingEnabled(bool enabled);
@@ -612,6 +643,7 @@ WAR3_SHADER_API bool SetVolumetricLightParams(
     uint32_t sampleCount);
 WAR3_SHADER_API bool SetVolumetricLightFade(
     float fadeNear, float fadeFar, float maxRayDistance);
+WAR3_SHADER_API bool SetVolumetricGlobalMediumEnabled(bool enabled);
 WAR3_SHADER_API bool SetVolumetricHeightFogEnabled(bool enabled);
 WAR3_SHADER_API bool SetVolumetricHeightFog(
     float baseHeight, float falloff, float strength);

@@ -39,8 +39,11 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   验证接入生命周期。跨地图时旧资源不得发布给新地图；新地图在没有完整 CSM 前应安全退化为
   **无阴影**，不能采样未发布的深度图。
 - 当前工作树含 **WarVK JAPI 1.2.0 Release 候选**：补齐点光位置、体积光和全局高度雾
-  的作者接口，新增 scalar 数学求值，并重整 YDWE 分类。局部 Box/Sphere/Cylinder 雾体积并未实现，
-  未发布功能也不能在 YDWE 菜单中伪装为可用。
+  的作者接口，新增 scalar 数学求值，并重整 YDWE 分类。2026-08-12 的局部雾候选已进一步接通
+  最多 8 个 Sphere/Box/Cylinder、解析射线区间、独立全局介质开关、受预算约束的局部 half-res ROI，
+  并以视角无关 CSM 光学证据替代阴影柱俯仰特判；77/77 静态、21/21 Win32 runnable、DLL 构建及
+  no-work 通过，但尚未部署、真实 Catalog 回读或玩家前台物理验收，详见
+  `docs/agent-history/2026-08-12-local-volumetric-fog-candidate.md`。
 - 产品、DLL 资源、外部 Shader API 与 JAPI 显示版本已统一为 `1.2.0 Release`；GitHub 源码、
   玩家包、地图作者包及明确排除项见 `docs/RELEASE_1.2.0.md`。
 - 当前候选验证为：474/474 静态测试、15/15 Win32 runnable、真实 YDWE Catalog 35/35 回读与
@@ -143,6 +146,13 @@ WarVK 是一个面向 **Warcraft III 1.27a** 的 Windows 图形增强项目。�
   不等于消费者的 last-use 权限。
 - WarVK JAPI 是有界的外部输入面：保留 wire 长度、参数数、句柄、数值有限性、溢出和生命周期检查；
   不能为方便而让渲染线程回调 JASS 或暴露未实现 feature bit。
+- 修改阴影、滤波、抗锯齿、资源同步或其他图形学算法时，只要实现者不能从现有合同中完整证明公式与
+  Vulkan 行为，就必须先查阅一手资料：原始/同行评审论文、Microsoft DirectX 指南、Khronos Vulkan
+  规范或 GPU 厂商研究资料；在 `docs/research/` 记录公式、适用条件、来源链接及其到 WarVK 的映射。
+  博客和二手总结只能作为检索线索，不能单独授权 Release 默认改动。
+- Unreal Engine 官方源码只允许从 EULA 授权的 `EpicGames/UnrealEngine` 仓库检出到项目外部的
+  `E:\Mycode\Source\References\UnrealEngine` 并作为只读架构参考。不得把 UE 源码、片段或资产复制、
+  改写进 WarVK/DXVK 开源树或提交历史；WarVK 的实现、测试和注释必须保持独立表达与可追溯的一手依据。
 - 不要将 `AutoTest` 的 isolated desktop 数据宣称为玩家前台性能；涉及性能时按
   `AutoTest/README.md` 的前台基线和特性矩阵规则执行。
 - 构建或测试不会自动授权部署 DLL、覆盖 YDWE/Warcraft 文件、启动/关闭编辑器或游戏。此类操作需有

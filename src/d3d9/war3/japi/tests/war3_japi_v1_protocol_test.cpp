@@ -217,6 +217,50 @@ void TestMathCurveWireContract() {
              "formula strings must not escape the semicolon boundary");
 }
 
+void TestLocalFogWireContract() {
+  const auto globalMedium = Dispatch(
+      Carrier::Preloader,
+      "warvk:v1;volumetric.setGlobalMediumEnabled;b:0");
+  Check(globalMedium.error == ErrorCode::BackendUnavailable,
+        "global-medium gate must match its declared boolean signature");
+
+  const auto sphere = Dispatch(
+      Carrier::Hotkey,
+      "warvk:v1;localFog.createSphere;"
+      "r:100;r:200;r:300;r:400;r:0.5;r:0.2");
+  Check(sphere.error == ErrorCode::BackendUnavailable,
+        "sphere fog creation must match its declared signature");
+
+  const auto box = Dispatch(
+      Carrier::Hotkey,
+      "warvk:v1;localFog.createBox;"
+      "r:100;r:200;r:300;r:800;r:600;r:400;r:0.5;r:0.2");
+  Check(box.error == ErrorCode::BackendUnavailable,
+        "box fog creation must match its declared signature");
+
+  const auto cylinder = Dispatch(
+      Carrier::Hotkey,
+      "warvk:v1;localFog.createCylinder;"
+      "r:100;r:200;r:300;r:250;r:700;r:0.5;r:0.2");
+  Check(cylinder.error == ErrorCode::BackendUnavailable,
+        "cylinder fog creation must match its declared signature");
+
+  const auto rotation = Dispatch(
+      Carrier::Preloader,
+      "warvk:v1;localFog.setRotation;d:1;r:10;r:20;r:30");
+  Check(rotation.error == ErrorCode::BackendUnavailable,
+        "fog rotation must match its declared signature");
+
+  CheckError(Carrier::Hotkey,
+             "warvk:v1;localFog.isAlive;i:1",
+             ErrorCode::InvalidId,
+             "fog lifetime queries must require managed-id tokens");
+  CheckError(Carrier::Preloader,
+             "warvk:v1;localFog.setDensity;d:1;r:nan",
+             ErrorCode::InvalidReal,
+             "fog density must reject non-finite wire values");
+}
+
 void TestStableLastError() {
   CheckError(Carrier::Preloader, "warvk:v1;sun.setEnabled;b:2",
              ErrorCode::InvalidBoolean, "fixture must set last error");
@@ -358,6 +402,7 @@ int main() {
   TestStrictScalars();
   TestMessageShapeAndLimits();
   TestMathCurveWireContract();
+  TestLocalFogWireContract();
   TestStableLastError();
   TestTypedHashtableTransport();
   if (g_failures != 0) {

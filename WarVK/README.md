@@ -46,11 +46,11 @@ Carrier 保持可用。
 `d3d9.dll` 安装到 `war3.exe` 同级目录，再启动游戏。地图与作者包不携带 DLL、不导入
 AI/Lua Loader，也不会在游戏运行期间尝试加载 DLL；bridge 不可用时 API 会安全返回失败值。
 
-YDWE 菜单按功能拆分为 WarVK 系统/诊断、太阳与阴影、光照时钟与昼夜、点光源、体积光、体积雾、
-闪电、闪电模板、数学公式和曲线。根 `WarVK` 分类只保留版本、协议、功能位与运行时
+YDWE 菜单按功能拆分为 WarVK 系统/诊断、太阳与阴影、光照时钟与昼夜、点光源、体积光、全局体积雾、
+局部体积雾、闪电、闪电模板、数学公式和曲线。根 `WarVK` 分类只保留版本、协议、功能位与运行时
 状态；没有 C++ dispatch 的预留接口不会出现在作者菜单中。
 
-## 点光源、体积光与全局高度雾
+## 点光源、体积光与局部体积雾
 
 `WarVKSetPointLightPosition(lightId, x, y, z)` 会更新已有托管点光的位置；创建函数返回的
 `lightId` 在销毁前保持有效，因此可由计时器或技能逻辑持续移动。同一组接口还可以更新
@@ -60,6 +60,7 @@ YDWE 菜单按功能拆分为 WarVK 系统/诊断、太阳与阴影、光照时�
 
 ```jass
 call WarVKSetVolumetricEnabled(true)
+call WarVKSetGlobalVolumetricMediumEnabled(true)
 call WarVKSetVolumetricDensity(0.80)
 call WarVKSetVolumetricScattering(1.50, 0.95)
 call WarVKSetVolumetricQuality(16, 1400.00)
@@ -68,9 +69,35 @@ call WarVKSetGlobalVolumetricFogEnabled(true)
 call WarVKSetGlobalVolumetricFog(0.00, 0.0012, 0.35)
 ```
 
-高度雾开关不会自动开启体积光通道；关闭高度雾也不会关闭太阳光和点光在介质中的散射。
-当前开放的是覆盖全图的高度雾。按 Box/Sphere/Cylinder 在指定区域创建的局部雾体积尚未
-实现，因此本版不提供无效果的局部雾创建函数。
+`WarVKSetGlobalVolumetricMediumEnabled` 控制均匀的全局介质；关闭它不会销毁 density 参数，也不会
+关闭局部体积。`WarVKSetGlobalVolumetricFogEnabled` 只控制全局介质的高度分布：高度雾开关不会
+自动开启体积光通道，关闭高度雾也不会关闭太阳光和点光在均匀介质中的散射。
+局部雾和全局雾共用同一套太阳/CSM、点光/cube shadow 与散射设置。要得到周围空气清澈、只在
+指定区域出现介质的效果，应关闭全局介质：
+
+```jass
+local integer fogId
+
+call WarVKSetVolumetricEnabled(true)
+call WarVKSetGlobalVolumetricMediumEnabled(false)
+call WarVKSetVolumetricScattering(2.10, 0.96)
+call WarVKSetVolumetricQuality(16, 1800.00)
+
+// Sphere：radius 是半径。
+set fogId = WarVKCreateSphereFogVolume(x, y, z, 420.00, 0.55, 0.25)
+
+// Box：sizeX/Y/Z 均为完整尺寸；旋转单位为度。
+set fogId = WarVKCreateBoxFogVolume(x, y, z, 900.00, 420.00, 280.00, 0.45, 0.18)
+call WarVKSetFogVolumeRotation(fogId, 0.00, 0.00, 35.00)
+
+// Cylinder：radius 是半径，height 是完整高度；初始轴沿世界 Z。
+set fogId = WarVKCreateCylinderFogVolume(x, y, z, 260.00, 700.00, 0.60, 0.30)
+```
+
+最多同时存在 8 个局部体积。density 范围0..2，edgeFeather 范围0..1；所有尺寸和坐标都会在
+JAPI 与后端重复验证。局部雾可以接收现有实体的太阳阴影或点光阴影，但当前不会让一个雾体积
+向另一个雾体积投影。地图会话 reset 会使旧 fogId 失效；销毁或暂时关闭请分别使用
+`WarVKDestroyFogVolume` 与 `WarVKSetFogVolumeEnabled`。
 
 ## 光照时钟、天体轨迹与时间色温
 
@@ -217,6 +244,6 @@ call WarVKFinishPointLightSmokeTest(lightId)
 连续闪电实例提交；它只用于地图作者手动验收，不由 WarVK 初始化自动运行。
 
 验收信息包括 API 版本、协议版本、功能位、正数对象 ID、对象计数变化以及点阴影。
-当前实现的功能位为 `0x7F0F`：Sun、CSM、PointLight、Volumetric、DayNight、Lightning、
-ManagedObject、Time、Stats、MathCurve 和 PolylineCurve。未接通的功能会返回
+当前实现的功能位为 `0xFF0F`：Sun、CSM、PointLight、Volumetric、DayNight、Lightning、
+ManagedObject、Time、Stats、MathCurve、PolylineCurve 和 LocalFog。未接通的功能会返回
 `WARVK_ERROR_UNSUPPORTED_FEATURE`。

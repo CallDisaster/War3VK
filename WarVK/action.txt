@@ -236,6 +236,15 @@ script = "WarVKSetVolumetricEnabled"
 [[.args]]
 type = boolean
 
+[WarVKSetGlobalVolumetricMediumEnabled]
+title = "启用全局体积介质"
+description = "设置均匀全局介质开关 ${enabled}。"
+comment = "false 只清除局部体积外的全局雾，Sphere/Box/Cylinder 局部雾仍可散射并接收阴影；不会改写已设置的全局密度。"
+category = "TC_WarVKVolumetricFog"
+script = "WarVKSetGlobalVolumetricMediumEnabled"
+[[.args]]
+type = boolean
+
 [WarVKSetVolumetricDensity]
 title = "设置体积光密度"
 description = "设置体积光密度 ${density}。"
@@ -268,7 +277,7 @@ type = integer
 type = real
 
 [WarVKSetGlobalVolumetricFogEnabled]
-title = "启用全局体积雾"
+title = "启用全局高度雾"
 description = "设置全局高度雾开关 ${enabled}。"
 comment = "enabled=true 启用高度雾，false 仅移除高度雾；仍需单独启用体积光通道才会显示。"
 category = "TC_WarVKVolumetricFog"
@@ -284,6 +293,117 @@ category = "TC_WarVKVolumetricFog"
 script = "WarVKSetGlobalVolumetricFog"
 [[.args]]
 type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKDestroyFogVolume]
+title = "销毁局部体积雾"
+description = "销毁局部体积雾 ${fogId}。"
+comment = "fogId 使用创建函数返回的正整数；无效或已销毁 id 会被拒绝。"
+category = "TC_WarVKLocalFog"
+script = "WarVKDestroyFogVolume"
+[[.args]]
+type = integer
+
+[WarVKSetFogVolumeEnabled]
+title = "启用局部体积雾"
+description = "设置局部体积雾 ${fogId} 开关 ${enabled}。"
+comment = "enabled=false 暂停该体积，不销毁句柄。体积光总开关仍需单独启用。"
+category = "TC_WarVKLocalFog"
+script = "WarVKSetFogVolumeEnabled"
+[[.args]]
+type = integer
+[[.args]]
+type = boolean
+
+[WarVKSetFogVolumePosition]
+title = "设置局部体积雾位置"
+description = "设置局部体积雾 ${fogId} 位置 ${x}、${y}、${z}。"
+comment = "坐标使用 Warcraft 世界坐标，必须是有限值。"
+category = "TC_WarVKLocalFog"
+script = "WarVKSetFogVolumePosition"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetFogVolumeRotation]
+title = "设置局部体积雾旋转"
+description = "设置局部体积雾 ${fogId} 的 X ${xDegrees}、Y ${yDegrees}、Z ${zDegrees} 旋转。"
+comment = "角度单位为度；Sphere 不受旋转影响，Box/Cylinder 按 X、Y、Z 欧拉角旋转。"
+category = "TC_WarVKLocalFog"
+script = "WarVKSetFogVolumeRotation"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetFogVolumeDensity]
+title = "设置局部体积雾密度"
+description = "设置局部体积雾 ${fogId} 密度 ${density}。"
+comment = "density 范围0..2；0表示该体积不产生介质。"
+category = "TC_WarVKLocalFog"
+script = "WarVKSetFogVolumeDensity"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+
+[WarVKSetFogVolumeEdgeFeather]
+title = "设置局部体积雾边缘过渡"
+description = "设置局部体积雾 ${fogId} 边缘过渡 ${edgeFeather}。"
+comment = "edgeFeather 范围0..1；0为硬边界，值越大边缘越柔和。"
+category = "TC_WarVKLocalFog"
+script = "WarVKSetFogVolumeEdgeFeather"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+
+[WarVKSetSphereFogVolumeRadius]
+title = "设置球形雾半径"
+description = "设置球形局部雾 ${fogId} 半径 ${radius}。"
+comment = "仅接受 Sphere 句柄；radius 范围0.5..100000世界单位。"
+category = "TC_WarVKLocalFog"
+script = "WarVKSetSphereFogVolumeRadius"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+
+[WarVKSetBoxFogVolumeSize]
+title = "设置盒形雾尺寸"
+description = "设置盒形局部雾 ${fogId} 完整尺寸 ${sizeX}、${sizeY}、${sizeZ}。"
+comment = "仅接受 Box 句柄；三个值均为完整尺寸而非半长，范围1..200000世界单位。"
+category = "TC_WarVKLocalFog"
+script = "WarVKSetBoxFogVolumeSize"
+[[.args]]
+type = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKSetCylinderFogVolumeSize]
+title = "设置圆柱雾尺寸"
+description = "设置圆柱局部雾 ${fogId} 半径 ${radius} 与完整高度 ${height}。"
+comment = "仅接受 Cylinder 句柄；height 为完整高度而非半高。"
+category = "TC_WarVKLocalFog"
+script = "WarVKSetCylinderFogVolumeSize"
+[[.args]]
+type = integer
 [[.args]]
 type = real
 [[.args]]

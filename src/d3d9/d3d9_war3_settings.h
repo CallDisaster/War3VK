@@ -244,10 +244,12 @@ struct War3VolumetricLightSettings {
   // soft-clip + composite headroom 防冲白。weight<=1 只通过少加散射形成
   // 物理阴影；weight>1 启用温和柱可读性（地表端积分后不再依赖激进 peak）。
   // 默认可读档：先保证区间正确，再谈强度；勿再靠拉满 intensity 补柱。
-  float intensity = 0.95f;
+  // Clear-air 默认档：空气本身不应先把全屏染灰；强光与真实阴影差值负责
+  // 暴露介质。局部 volume 可在 global density=0 时独立存在。
+  float intensity = 1.20f;
   float decay = 0.95f;
-  float density = 1.10f;
-  float weight = 1.85f;
+  float density = 0.22f;
+  float weight = 2.10f;
   float skyThreshold = 0.72f;
   float fadeNear = 0.0f;
   float fadeFar = 0.45f;
@@ -262,19 +264,23 @@ struct War3VolumetricLightSettings {
   // 地表端 [L-D,L] 下 D=sunDistance*maxRayDistance；1400 覆盖常见 RTS 射线尾。
   float sunDistance = 1400.0f;
   float froxelNear = 20.0f;
+  // Independent gate for the homogeneous/global medium. Turning this off
+  // preserves authored local fog volumes and their sun/point-light scattering.
+  // Keep density as an authored value so toggling the gate does not destroy it.
+  bool globalMediumEnabled = true;
   // Global height fog is an independent author control. Disabling it keeps
   // directional and point-light scattering active while removing the height
   // density profile from the medium.
-  bool heightFogEnabled = true;
+  bool heightFogEnabled = false;
   float heightFogBase = 0.0f;
   float heightFogFalloff = 0.0012f;
   float heightFogStrength = 0.35f;
   // Stylized shaft composite: retain only a controlled part of physical
   // extinction so added scattering is not cancelled by LDR base darkening.
-  float extinctionStrength = 0.18f;
+  float extinctionStrength = 0.05f;
   // When a ray falls outside CSM coverage (or CSM is explicitly optional),
   // permit a low-energy unshadowed medium term rather than an all-or-nothing cut.
-  float unshadowedScattering = 0.22f;
+  float unshadowedScattering = 0.03f;
   // 夜间/太阳过弱时跳过体积光，避免无可见收益仍付 full-screen 成本。
   float minSunIntensity = 0.08f;
   // 要求有效 CSM 快照；没有完整 shadow map 时直接跳过（不回退假散射）。

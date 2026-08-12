@@ -98,6 +98,7 @@ class WarVkJapiSafetyStaticTests(unittest.TestCase):
             "void Reset() noexcept",
         )
         self.assertIn("resetAuthorState()", author_reset)
+        self.assertIn("war3shader::RemoveFogVolume", author_reset)
         self.assertNotIn("War3LightningRuntime::instance().reset()", author_reset)
 
         lightning_author_reset = body(
@@ -144,8 +145,11 @@ class WarVkJapiSafetyStaticTests(unittest.TestCase):
             "PointLightCreate",
             "PointLightSetShadowEnabled",
             "VolumetricSetEnabled",
+            "VolumetricSetGlobalMediumEnabled",
             "VolumetricFogSetEnabled",
             "VolumetricFogSetSettings",
+            "LocalFogCreateSphere",
+            "LocalFogSetPosition",
         ):
             self.assertNotIn(f"case CommandId::{delegated}:", direct_policy)
 
@@ -167,6 +171,8 @@ class WarVkJapiSafetyStaticTests(unittest.TestCase):
 
         for start, end in (
             ("case CommandId::VolumetricSetEnabled:",
+             "case CommandId::VolumetricSetGlobalMediumEnabled:"),
+            ("case CommandId::VolumetricSetGlobalMediumEnabled:",
              "case CommandId::VolumetricSetDensity:"),
             ("case CommandId::VolumetricFogSetEnabled:",
              "case CommandId::VolumetricFogSetSettings:"),
