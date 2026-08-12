@@ -6462,19 +6462,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     auto visibleLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/VisibleLookup");
     auto& visibleRegistry = dxvk::war3::render::VisibleRenderableRegistry::instance();
-    if (record.renderablePart != nullptr)
-      visibleHit = visibleRegistry.queryByRenderablePartAndLayer(
-          record.renderablePart, record.layerIndex, visibleRecord);
-    if (!visibleHit && record.renderablePart != nullptr)
-      visibleHit = visibleRegistry.queryByPayload(record.renderablePart,
-                                                  visibleRecord) &&
-                   War3VisibleRecordMatchesCurrentDrawSlice(record,
-                                                            visibleRecord);
-    if (!visibleHit && record.sceneNode != nullptr)
-      visibleHit = visibleRegistry.queryBySceneNode(record.sceneNode,
-                                                   visibleRecord) &&
-                   War3VisibleRecordMatchesCurrentDrawSlice(record,
-                                                            visibleRecord);
+    visibleHit = visibleRegistry.queryFirstForDirectPacket(record,
+                                                           visibleRecord);
   }
 
   const void* effectiveRuntimeModelPtr =

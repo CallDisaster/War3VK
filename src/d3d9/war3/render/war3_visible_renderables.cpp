@@ -2979,6 +2979,139 @@ bool VisibleRenderableRegistry::queryByRenderablePartAndLayer(
   return false;
 }
 
+bool VisibleRenderableRegistry::queryFirstForDirectPacket(
+    const CurrentDrawContractRecord& record,
+    VisibleRenderableRecord& out) const {
+  out = {};
+  const Snapshot& snap = snapshotForThread();
+
+  // Preserve the canonical lookup order. An exact part/layer match is already
+  // the strongest identity available here; only the weaker payload/scene
+  // fallbacks need the current-draw slice compatibility gate.
+  if (record.renderablePart != nullptr) {
+    const uint64_t partLayerKey =
+        VisibleRenderablePartLayerKey(record.renderablePart,
+                                      record.layerIndex);
+    const auto layerIt = snap.byRenderablePartLayer.find(partLayerKey);
+    if (layerIt != snap.byRenderablePartLayer.end() &&
+        layerIt->second < snap.records.size()) {
+      out = snap.records[layerIt->second];
+      m_shadowManifestVisibleLookupPartLayerHitCount.fetch_add(
+          1u, std::memory_order_relaxed);
+      return true;
+    }
+
+    const auto countIt =
+        snap.renderablePartRecordCount.find(record.renderablePart);
+    const auto partIt = snap.byRenderablePart.find(record.renderablePart);
+    if (countIt != snap.renderablePartRecordCount.end() &&
+        countIt->second == 1u && partIt != snap.byRenderablePart.end() &&
+        partIt->second < snap.records.size()) {
+      out = snap.records[partIt->second];
+      m_shadowManifestVisibleLookupSingleFallbackCount.fetch_add(
+          1u, std::memory_order_relaxed);
+      return true;
+    }
+
+    if constexpr (dxvk::war3::internal::
+                      kWar3RuntimeConfigDeferSemanticVisibleIndexBuild) {
+      const VisibleRenderableRecord* transparentFallback = nullptr;
+      const VisibleRenderableRecord* solePartRecord = nullptr;
+      uint32_t partRecordCount = 0u;
+      for (const auto& candidate : snap.records) {
+        if (candidate.renderablePart != record.renderablePart)
+          continue;
+        ++partRecordCount;
+        solePartRecord = &candidate;
+        if (candidate.layerIndex == record.layerIndex) {
+          if (candidate.queueKind == VisibleRenderableQueueKind::MainQueue) {
+            out = candidate;
+            m_shadowManifestVisibleLookupPartLayerHitCount.fetch_add(
+                1u, std::memory_order_relaxed);
+            return true;
+          }
+          if (transparentFallback == nullptr)
+            transparentFallback = &candidate;
+        }
+      }
+
+      if (transparentFallback != nullptr) {
+        out = *transparentFallback;
+        m_shadowManifestVisibleLookupPartLayerHitCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        return true;
+      }
+      if (partRecordCount == 1u && solePartRecord != nullptr) {
+        out = *solePartRecord;
+        m_shadowManifestVisibleLookupSingleFallbackCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        return true;
+      }
+    }
+  }
+
+  const auto matchesCurrentDrawSlice =
+      [&record](const VisibleRenderableRecord& candidate) {
+        if (candidate.layerIndex != record.layerIndex)
+          return false;
+        if (record.renderablePart != nullptr &&
+            candidate.renderablePart != nullptr &&
+            record.renderablePart != candidate.renderablePart)
+          return false;
+        if (record.sceneNode != nullptr && candidate.sceneNode != nullptr &&
+            record.sceneNode != candidate.sceneNode)
+          return false;
+        return true;
+      };
+
+  if (record.renderablePart != nullptr) {
+    const auto payloadIt = snap.byPayload.find(record.renderablePart);
+    if (payloadIt != snap.byPayload.end() &&
+        payloadIt->second < snap.records.size()) {
+      const auto& candidate = snap.records[payloadIt->second];
+      if (matchesCurrentDrawSlice(candidate)) {
+        out = candidate;
+        return true;
+      }
+    } else if constexpr (dxvk::war3::internal::
+                             kWar3RuntimeConfigDeferSemanticVisibleIndexBuild) {
+      for (const auto& candidate : snap.records) {
+        if (candidate.payload == record.renderablePart &&
+            matchesCurrentDrawSlice(candidate)) {
+          out = candidate;
+          return true;
+        }
+      }
+    }
+  }
+
+  if (record.sceneNode != nullptr) {
+    const auto sceneIt = snap.bySceneNode.find(record.sceneNode);
+    if (sceneIt != snap.bySceneNode.end() &&
+        sceneIt->second < snap.records.size()) {
+      const auto& candidate = snap.records[sceneIt->second];
+      if (matchesCurrentDrawSlice(candidate)) {
+        out = candidate;
+        return true;
+      }
+    } else if constexpr (dxvk::war3::internal::
+                             kWar3RuntimeConfigDeferSemanticVisibleIndexBuild) {
+      for (const auto& candidate : snap.records) {
+        if ((candidate.sceneNode == record.sceneNode ||
+             candidate.identity.sceneNode == record.sceneNode) &&
+            matchesCurrentDrawSlice(candidate)) {
+          out = candidate;
+          return true;
+        }
+      }
+    }
+  }
+
+  m_shadowManifestVisibleLookupMissCount.fetch_add(
+      1u, std::memory_order_relaxed);
+  return false;
+}
+
 bool VisibleRenderableRegistry::queryByWorldObjectEntry(
     void *worldObjectEntry, VisibleRenderableRecord &out) const {
   out = {};

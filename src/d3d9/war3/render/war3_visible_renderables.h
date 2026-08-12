@@ -183,6 +183,8 @@ public:
   bool queryByRenderablePartAndLayer(void *renderablePart,
                                      uint32_t layerIndex,
                                      VisibleRenderableRecord &out) const;
+  bool queryFirstForDirectPacket(const CurrentDrawContractRecord& record,
+                                 VisibleRenderableRecord& out) const;
   bool queryByWorldObjectEntry(void *worldObjectEntry,
                                VisibleRenderableRecord &out) const;
   bool queryByHandle(uint32_t jHandle, VisibleRenderableRecord &out) const;
