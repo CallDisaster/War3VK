@@ -25944,7 +25944,16 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                                   leasedSelectionKeys.begin(),
                                   leasedSelectionKeys.end());
   }
-  if (!preferredSelectionKeys.empty()) {
+  // Previous-submitted vectors are published sorted/unique below and
+  // tombstone erasure preserves that order. Most frames therefore need only a
+  // linear verification, not another O(N log N) sort. Broad lease insertion
+  // and defensive future callers still fall back to canonical normalization.
+  const bool preferredSelectionKeysAlreadySortedUnique =
+      std::adjacent_find(
+          preferredSelectionKeys.begin(), preferredSelectionKeys.end(),
+          [](uint64_t a, uint64_t b) { return a >= b; }) ==
+      preferredSelectionKeys.end();
+  if (!preferredSelectionKeysAlreadySortedUnique) {
     std::sort(preferredSelectionKeys.begin(), preferredSelectionKeys.end());
     preferredSelectionKeys.erase(
         std::unique(preferredSelectionKeys.begin(), preferredSelectionKeys.end()),
@@ -30419,15 +30428,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
   // identity hash: 基于实际提交的 stable caster identity 集合
   {
-    auto computeJaccardMilli = [](std::vector<uint64_t> previousKeys,
-                                  std::vector<uint64_t> currentKeys)
+    // Both inputs are canonical sorted/unique sets. The old diagnostics copied
+    // and sorted all four vectors again every frame even though publication
+    // below already establishes that invariant.
+    const auto computeSortedJaccardMilli = [](
+                                  const std::vector<uint64_t>& previousKeys,
+                                  const std::vector<uint64_t>& currentKeys)
         -> uint32_t {
-      std::sort(previousKeys.begin(), previousKeys.end());
-      previousKeys.erase(std::unique(previousKeys.begin(), previousKeys.end()),
-                         previousKeys.end());
-      std::sort(currentKeys.begin(), currentKeys.end());
-      currentKeys.erase(std::unique(currentKeys.begin(), currentKeys.end()),
-                        currentKeys.end());
       if (previousKeys.empty() && currentKeys.empty())
         return 1000u;
       size_t previousIndex = 0u;
@@ -30461,20 +30468,21 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     sortUniqueKeys(submittedPartIdentityKeys);
 
     uint64_t identityHash = 0xcbf29ce484222325ull;
-    std::vector<uint64_t> sortedKeys = submittedPartIdentityKeys;
-    if (sortedKeys.empty())
-      sortedKeys = submittedIdentityKeys;
-    for (uint64_t key : sortedKeys) {
+    const std::vector<uint64_t>& currentPartIdentityKeys =
+        !submittedPartIdentityKeys.empty()
+            ? submittedPartIdentityKeys
+            : submittedIdentityKeys;
+    for (uint64_t key : currentPartIdentityKeys) {
       identityHash = bit::fnv1a_iter(identityHash, key);
     }
     m_war3Scene.shadowStats.semanticSceneDirectLastSubmittedIdentityHash = identityHash;
 
-    std::vector<uint64_t> sortedObjectKeys = submittedIdentityKeys;
     m_war3Scene.shadowStats.semanticSceneSubmittedObjectJaccardMilli =
-        computeJaccardMilli(previousSubmittedObjectIdentityKeys,
-                            sortedObjectKeys);
+        computeSortedJaccardMilli(previousSubmittedObjectIdentityKeys,
+                                  submittedIdentityKeys);
     m_war3Scene.shadowStats.semanticSceneSubmittedPartJaccardMilli =
-        computeJaccardMilli(previousSubmittedPartIdentityKeys, sortedKeys);
+        computeSortedJaccardMilli(previousSubmittedPartIdentityKeys,
+                                  currentPartIdentityKeys);
 
     if (m_war3SemanticDirectPrevIdentityHash != 0u &&
         m_war3SemanticDirectPrevIdentityHash != identityHash) {
@@ -30491,12 +30499,20 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           .semanticSceneDirectSelectionLeaseSubmittedKeyCount +=
           uint32_t(submittedPreferenceKeys.size());
     }
-    std::vector<uint64_t> sortedPreferenceKeys = submittedPreferenceKeys;
-    m_war3SemanticDirectPrevSubmittedIdentityKeys =
-        std::move(sortedPreferenceKeys);
-    m_war3SemanticDirectPrevSubmittedObjectIdentityKeys =
-        std::move(sortedObjectKeys);
-    m_war3SemanticDirectPrevSubmittedPartIdentityKeys = std::move(sortedKeys);
+    // Exchange the current and previous backing allocations instead of
+    // copying. The TLS scratch receives last frame's capacity and will clear
+    // it on the next populate, keeping both sides allocation-stable.
+    m_war3SemanticDirectPrevSubmittedIdentityKeys.swap(
+        submittedPreferenceKeys);
+    m_war3SemanticDirectPrevSubmittedObjectIdentityKeys.swap(
+        submittedIdentityKeys);
+    if (!submittedPartIdentityKeys.empty()) {
+      m_war3SemanticDirectPrevSubmittedPartIdentityKeys.swap(
+          submittedPartIdentityKeys);
+    } else {
+      m_war3SemanticDirectPrevSubmittedPartIdentityKeys =
+          m_war3SemanticDirectPrevSubmittedObjectIdentityKeys;
+    }
   }
 
   // 更新 frame serial
