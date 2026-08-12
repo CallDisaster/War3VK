@@ -843,14 +843,25 @@ void HydrateManifestRuntimeOwnersFromIndexedCache(
 
 ShadowModelResourceRecord ConvertGeoset(
     const model::ShadowGeosetResourceRecord& src,
-    uint64_t frameSerial) {
+    uint64_t frameSerial,
+    const model::ShadowGeosetResourceRecord* alias = nullptr) {
   ShadowModelResourceRecord dst = {};
-  dst.runtimeGeosetPtr = src.geosetPtr;
-  dst.runtimeGeosetDataPtr = src.geosetDataPtr;
-  dst.modelResourcePtr = src.modelResourcePtr;
-  dst.modelKey = src.modelKey;
-  dst.prefersRuntimeContract = src.prefersRuntimeContract;
-  dst.geosetIndex = src.geosetIndex;
+  dst.runtimeGeosetPtr = alias != nullptr && alias->geosetPtr != nullptr
+      ? alias->geosetPtr : src.geosetPtr;
+  dst.runtimeGeosetDataPtr =
+      alias != nullptr && alias->geosetDataPtr != nullptr
+          ? alias->geosetDataPtr : src.geosetDataPtr;
+  dst.modelResourcePtr =
+      alias != nullptr && alias->modelResourcePtr != nullptr
+          ? alias->modelResourcePtr : src.modelResourcePtr;
+  dst.modelKey = alias != nullptr && alias->modelKey != 0u
+      ? alias->modelKey : src.modelKey;
+  dst.prefersRuntimeContract = src.prefersRuntimeContract ||
+      (alias != nullptr && alias->prefersRuntimeContract);
+  dst.geosetIndex =
+      alias != nullptr &&
+              alias->geosetIndex != model::kInvalidShadowGeosetIndex
+          ? alias->geosetIndex : src.geosetIndex;
   dst.vertexCount = src.vertexCount;
   dst.positions = src.positions;
   dst.normals = src.normals;
@@ -867,7 +878,8 @@ ShadowModelResourceRecord ConvertGeoset(
   for (const auto& uvLayer : src.uvLayers)
     dst.uvLayers.push_back(uvLayer.uvPairs);
   dst.contentHash = src.contentHash;
-  dst.mapEpoch = src.mapEpoch;
+  dst.mapEpoch = alias != nullptr && alias->mapEpoch != 0u
+      ? alias->mapEpoch : src.mapEpoch;
   dst.immutableModelGeneration = src.immutableModelGeneration;
   dst.localBounds = src.localBounds;
   dst.frameSerial = frameSerial;
@@ -3965,8 +3977,12 @@ void ShadowRuntimeContractCache::captureLiveState() {
     auto resourceStoreScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/ResourceStoreBuild");
     auto freshResources = std::make_shared<ShadowModelResourceStore>();
-    for (const auto& geoset : resourceCache.snapshotGeosets())
-      freshResources->add(ConvertGeoset(geoset, manifest.frameSerial));
+    resourceCache.forEachGeosetContractSource(
+        [&](const model::ShadowGeosetResourceRecord& geoset,
+            const model::ShadowGeosetResourceRecord* alias) {
+          freshResources->add(
+              ConvertGeoset(geoset, manifest.frameSerial, alias));
+        });
 
     // 先补 modelResource->runtimeModel alias，再补纯 runtimeModel alias。
     for (const auto& modelRecord : resourceCache.snapshotModelAliases()) {

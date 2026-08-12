@@ -318,6 +318,37 @@ public:
   void* resolveDirectModelResourcePtr(void* modelResourceOrHandlePtr) const;
 
   std::vector<ShadowGeosetResourceRecord> snapshotGeosets() const;
+  // Invokes fn(payload, alias) once for every record represented by
+  // snapshotGeosets, but without cloning payload vectors into an intermediate
+  // container. References are valid only for the duration of the callback;
+  // callbacks must not re-enter this cache while the shared lock is held.
+  template <typename Fn>
+  void forEachGeosetContractSource(Fn&& fn) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    for (const auto& it : m_byGeoset) {
+      const ShadowGeosetResourceRecord& alias = it.second;
+      if (alias.readyForShadowConsumer() &&
+          alias.geosetDataPtr != nullptr) {
+        const auto canonical = m_byGeosetData.find(alias.geosetDataPtr);
+        if (canonical != m_byGeosetData.end() &&
+            canonical->second != nullptr) {
+          fn(*canonical->second, &alias);
+          continue;
+        }
+      }
+      fn(alias, nullptr);
+    }
+    for (const auto& it : m_byGeosetData) {
+      if (it.second == nullptr)
+        continue;
+      const ShadowGeosetResourceRecord& record = *it.second;
+      if (record.geosetPtr != nullptr &&
+          m_byGeoset.find(record.geosetPtr) != m_byGeoset.end()) {
+        continue;
+      }
+      fn(record, nullptr);
+    }
+  }
   std::vector<ShadowModelResourceRecord> snapshotModels() const;
   std::vector<ShadowModelResourceRecord> snapshotRuntimeModels() const;
   std::vector<ShadowModelAliasSnapshotRecord> snapshotModelAliases() const;
