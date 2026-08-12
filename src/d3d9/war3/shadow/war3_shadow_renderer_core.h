@@ -235,12 +235,28 @@ struct ShadowExplicitBlendSkinningResult {
   bool usedSpanRemap = false;
 };
 
+// Non-owning input for the synchronous explicit-blend resolver. The caller
+// retains ownership for the duration of the call; the resolver copies only
+// the final prefix selected by maxGroupSlot into its result.
+struct ShadowMatrixPaletteView {
+  const Matrix4* data = nullptr;
+  uint32_t size = 0u;
+
+  bool empty() const {
+    return data == nullptr || size == 0u;
+  }
+
+  const Matrix4& operator[](uint32_t index) const {
+    return data[index];
+  }
+};
+
 bool TryResolveExplicitBlendSkinningForRenderable(
     const ShadowRenderableRecord& renderable,
     uint32_t vertexCount,
     uint32_t posePaletteLimit,
     uint32_t maxExpectedGroupSize,
-    const ShadowPoseRecord& pose,
+    ShadowMatrixPaletteView posePalette,
     ShadowExplicitBlendSkinningResult& outResult,
     ShadowResolveStats* ioStats = nullptr);
 

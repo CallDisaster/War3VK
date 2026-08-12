@@ -5931,7 +5931,8 @@ bool TryResolveMeshDynamicPackedRuntimeGroups(
 bool TryResolveMeshDynamicExplicitBlendSkinning(
     const ShadowRenderableRecord& renderable, uint32_t vertexCount,
     uint32_t posePaletteLimit, uint32_t maxExpectedGroupSize,
-    const ShadowPoseRecord& pose, const MeshLayerBindingContract* layerContract,
+    ShadowMatrixPaletteView posePalette,
+    const MeshLayerBindingContract* layerContract,
     ExplicitBlendSkinResult& outResult, ShadowResolveStats* ioStats = nullptr) {
   outResult = {};
 
@@ -5942,7 +5943,7 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
       ShouldSkipLegacyMeshDataDecode(renderable) ||
       layerContract == nullptr ||
       vertexCount == 0u || vertexCount > 200000u || posePaletteLimit == 0u ||
-      pose.matrixPalette.empty() || layerContract->auxStreamPtr0 == 0u ||
+      posePalette.empty() || layerContract->auxStreamPtr0 == 0u ||
       !layerContract->hasAuxStream0) {
     return false;
   }
@@ -6230,7 +6231,7 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
   }
 
   if (!valid || explicitBlendCount == 0u ||
-      maxGroupSlot >= pose.matrixPalette.size()) {
+      maxGroupSlot >= posePalette.size) {
     if (ioStats != nullptr)
       ioStats->explicitBlendFinalDecodeMiss++;
     if (SemanticCoreTraceEnabled()) {
@@ -6244,15 +6245,14 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
           "offset=%u\n",
           renderable.runtimeModelPtr, renderable.meshData,
           renderable.geosetIndex, valid ? 1 : 0, explicitBlendCount,
-          maxGroupSlot, pose.matrixPalette.size(), bestStride, bestOffset);
+          maxGroupSlot, size_t(posePalette.size), bestStride, bestOffset);
       }
     }
     return false;
   }
 
   outResult.runtimeGroupPalette.assign(
-      pose.matrixPalette.begin(),
-      pose.matrixPalette.begin() + size_t(maxGroupSlot + 1u));
+      posePalette.data, posePalette.data + size_t(maxGroupSlot + 1u));
   outResult.maxGroupSlot = maxGroupSlot;
   outResult.dynamicHash = bit::fnv1a_iter(
       bit::fnv1a_iter(
@@ -6967,7 +6967,7 @@ bool TryResolveExplicitBlendSkinningForRenderable(
     uint32_t vertexCount,
     uint32_t posePaletteLimit,
     uint32_t maxExpectedGroupSize,
-    const ShadowPoseRecord& pose,
+    ShadowMatrixPaletteView posePalette,
     ShadowExplicitBlendSkinningResult& outResult,
     ShadowResolveStats* ioStats) {
   outResult = {};
@@ -6979,7 +6979,7 @@ bool TryResolveExplicitBlendSkinningForRenderable(
   ExplicitBlendSkinResult internal = {};
   if (!TryResolveMeshDynamicExplicitBlendSkinning(
           renderable, vertexCount, posePaletteLimit, maxExpectedGroupSize,
-          pose, &layerContract, internal, ioStats)) {
+          posePalette, &layerContract, internal, ioStats)) {
     return false;
   }
 
@@ -8390,11 +8390,13 @@ bool ShadowRendererCore::resolveRecord(const ShadowRenderableRecord& record,
           return false;
         }
         ExplicitBlendSkinResult explicitBlendRescue = {};
+        const ShadowMatrixPaletteView explicitPosePalette = {
+            pose.matrixPalette.data(), uint32_t(pose.matrixPalette.size())};
         if (resolvedVertexCountEarly != 0u && hasLayerContract &&
             TryResolveMeshDynamicExplicitBlendSkinning(
                 resolvedRenderable, resolvedVertexCountEarly,
                 uint32_t((std::min)(pose.matrixPalette.size(), size_t(256u))),
-                maxExpectedGroupSize, pose, &layerContract,
+                maxExpectedGroupSize, explicitPosePalette, &layerContract,
                 explicitBlendRescue, &ioStats)) {
           outPacket.resource.ownedVertexBlendWeights =
               std::move(explicitBlendRescue.weights);

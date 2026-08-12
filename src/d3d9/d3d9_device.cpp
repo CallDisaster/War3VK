@@ -6948,29 +6948,13 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         directResolveStatus ==
             dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
         out.hasRuntimeGroupPalette && !out.runtimeGroupPalette.empty()) {
-      // Explicit-blend resolution consumes the current authoritative group
-      // palette below.  Copying `pose` here first deep-copied its (potentially
-      // 256-matrix) fallback palette only to overwrite that vector on the next
-      // line.  Preserve the identical scalar identity/world-transform fields
-      // while leaving the redundant fallback payload out of this temporary.
-      dxvk::war3::shadow::ShadowPoseRecord explicitPose = {};
-      explicitPose.runtimeModelPtr = pose.runtimeModelPtr;
-      explicitPose.sceneNode = pose.sceneNode;
-      explicitPose.unitPtr = pose.unitPtr;
-      explicitPose.hasWorldTransform = pose.hasWorldTransform;
-      explicitPose.worldTransform = pose.worldTransform;
-      explicitPose.frameSerial = pose.frameSerial;
-      explicitPose.matrixPalette = out.runtimeGroupPalette;
-      explicitPose.matrixCount = uint32_t(out.runtimeGroupPalette.size());
-      explicitPose.matrixHash = out.runtimeGroupPaletteHash;
-      explicitPose.runtimeModelPtr =
-          renderable.runtimeModelPtr != nullptr ? renderable.runtimeModelPtr
-                                                : pose.runtimeModelPtr;
-      explicitPose.sceneNode =
-          renderable.sceneNode != nullptr ? renderable.sceneNode : pose.sceneNode;
-      explicitPose.unitPtr =
-          renderable.unitPtr != nullptr ? renderable.unitPtr : pose.unitPtr;
-      explicitPose.frameSerial = renderable.frameSerial;
+      // The explicit-blend decoder is synchronous and reads only the current
+      // authoritative palette. Pass a bounded view so BuildEligible does not
+      // clone up to 256 matrices into a temporary ShadowPoseRecord before the
+      // resolver copies the final maxGroupSlot prefix into its result.
+      const dxvk::war3::shadow::ShadowMatrixPaletteView explicitPalette = {
+          out.runtimeGroupPalette.data(),
+          uint32_t(out.runtimeGroupPalette.size())};
 
       uint32_t maxExpectedGroupSize = 0u;
       for (uint32_t groupSize : geo.matrixGroupSizes)
@@ -6982,11 +6966,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
               ? resource.vertexCount
               : uint32_t(resource.positionVec().size() / 3u);
       const uint32_t explicitPaletteLimit =
-          std::min<uint32_t>(uint32_t(explicitPose.matrixPalette.size()), 256u);
+          std::min<uint32_t>(explicitPalette.size, 256u);
       if (explicitVertexCount != 0u && explicitPaletteLimit != 0u &&
           dxvk::war3::shadow::TryResolveExplicitBlendSkinningForRenderable(
               renderable, explicitVertexCount, explicitPaletteLimit,
-              maxExpectedGroupSize, explicitPose, explicitBlend, nullptr)) {
+              maxExpectedGroupSize, explicitPalette, explicitBlend, nullptr)) {
         resource.ownedVertexBlendWeights = std::move(explicitBlend.weights);
         resource.vertexBlendWeights = &resource.ownedVertexBlendWeights;
         resource.ownedVertexBlendIndices = std::move(explicitBlend.indices);
