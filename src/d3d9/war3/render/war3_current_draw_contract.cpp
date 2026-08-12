@@ -409,7 +409,6 @@ CurrentDrawContractRecord SnapshotRecordWithGrace(
 }
 
 std::atomic<uint64_t> g_publishAttemptCount{0u};
-std::atomic<uint64_t> g_publishReadyCount{0u};
 std::atomic<uint64_t> g_publishMissNoRenderablePart{0u};
 std::atomic<uint64_t> g_publishMissNoMeshPayload{0u};
 std::atomic<uint64_t> g_publishMissInvalidPaletteSlot{0u};
@@ -1696,7 +1695,6 @@ void ResetCurrentDrawContractCache() {
   g_captureSerialCounter.store(0u, std::memory_order_relaxed);
   g_preparedSliceSerialCounter.store(0u, std::memory_order_relaxed);
   g_publishAttemptCount.store(0u, std::memory_order_relaxed);
-  g_publishReadyCount.store(0u, std::memory_order_relaxed);
   g_publishMissNoRenderablePart.store(0u, std::memory_order_relaxed);
   g_publishMissNoMeshPayload.store(0u, std::memory_order_relaxed);
   g_publishMissInvalidPaletteSlot.store(0u, std::memory_order_relaxed);
@@ -2478,7 +2476,6 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
       }
     }
   }
-  g_publishReadyCount.fetch_add(1u, std::memory_order_relaxed);
   g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                          std::memory_order_relaxed);
 }
@@ -2488,8 +2485,6 @@ QueryCurrentDrawContractDiagnosticsSummary() {
   CurrentDrawContractDiagnosticsSummary summary = {};
   summary.publishAttemptCount =
       g_publishAttemptCount.load(std::memory_order_relaxed);
-  summary.publishReadyCount =
-      g_publishReadyCount.load(std::memory_order_relaxed);
   summary.publishMissNoRenderablePart =
       g_publishMissNoRenderablePart.load(std::memory_order_relaxed);
   summary.publishMissNoMeshPayload =
@@ -2500,6 +2495,16 @@ QueryCurrentDrawContractDiagnosticsSummary() {
       g_publishMissInvalidPaletteCount.load(std::memory_order_relaxed);
   summary.publishMissNoGlobalPalette =
       g_publishMissNoGlobalPalette.load(std::memory_order_relaxed);
+  const uint64_t publishRejectedNoTrusted =
+      g_publishRejectedNoTrustedCumulative.load(std::memory_order_relaxed);
+  summary.publishReadyCount = DeriveClassifiedSuccessCount(
+      summary.publishAttemptCount,
+      std::array<uint64_t, 4>{
+          summary.publishMissNoRenderablePart,
+          summary.publishMissInvalidPaletteSlot,
+          summary.publishMissInvalidPaletteCount,
+          summary.publishMissNoGlobalPalette},
+      publishRejectedNoTrusted);
   summary.publishSkippedNonWorldContext =
       g_publishSkippedNonWorldContext.load(std::memory_order_relaxed);
   summary.publishSkippedSmallViewport =
@@ -2681,7 +2686,7 @@ QueryCurrentDrawContractDiagnosticsSummary() {
   summary.publishRawFallbackCumulative =
       g_publishRawFallbackCumulative.load(std::memory_order_relaxed);
   summary.publishRejectedNoTrustedCumulative =
-      g_publishRejectedNoTrustedCumulative.load(std::memory_order_relaxed);
+      publishRejectedNoTrusted;
   summary.publishRecordFrameTagSameRunMax =
       g_publishRecordFrameTagSameRunMax.load(std::memory_order_relaxed);
   summary.publishRecordFrameTagCurrentSameRun =

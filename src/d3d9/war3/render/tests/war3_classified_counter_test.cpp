@@ -23,6 +23,10 @@ bool testDerivedSuccessCount() {
                    3u, std::array<uint64_t, 2>{2u, 2u}) == 0u,
                "inconsistent snapshots must fail soft instead of underflow"))
     return false;
+  if (!require(DeriveClassifiedSuccessCount(
+                   10u, std::array<uint64_t, 2>{1u, 2u}, 3u) == 4u,
+               "additional classified failure bucket was not included"))
+    return false;
   return require(
       DeriveClassifiedSuccessCount(
           (std::numeric_limits<uint64_t>::max)(),
