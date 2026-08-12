@@ -12,6 +12,8 @@
 
 namespace dxvk::war3::render {
 
+class VisibleRenderablePartLayerQueryCache;
+
 enum class CurrentDrawResolveStatus : uint8_t {
   MissingContract = 0,
   MissingPalette = 1,
@@ -349,6 +351,12 @@ struct CurrentDrawContractSnapshotOptions {
   // view and have already canonicalized it to strictly increasing unique
   // values. The default remains defensive for all compatibility callers.
   bool preferredSelectionKeysViewSortedUnique = false;
+  // Synchronous render-thread callers may share a bounded exact part/layer
+  // lookup cache with the selection pass that immediately consumes this
+  // snapshot. The cache owns only value copies from the current immutable
+  // VisibleRenderable snapshot and is reset by its caller for every populate;
+  // it never grants cross-frame identity or lifetime authority.
+  VisibleRenderablePartLayerQueryCache* visiblePartLayerQueryCache = nullptr;
 };
 
 struct CurrentDrawRetireResult {

@@ -3152,8 +3152,14 @@ void SnapshotPublishedCurrentDrawContracts(
 
     uint64_t key = 0u;
     VisibleRenderableRecord visible = {};
-    if (VisibleRenderableRegistry::instance().queryByRenderablePartAndLayer(
-            record.renderablePart, record.layerIndex, visible)) {
+    const auto& visibleRegistry = VisibleRenderableRegistry::instance();
+    const bool foundVisible = options.visiblePartLayerQueryCache != nullptr
+        ? options.visiblePartLayerQueryCache->query(
+              visibleRegistry, record.renderablePart, record.layerIndex,
+              visible)
+        : visibleRegistry.queryByRenderablePartAndLayer(
+              record.renderablePart, record.layerIndex, visible);
+    if (foundVisible) {
       const auto ptrValue = [](const void* ptr) -> uint64_t {
         return uint64_t(reinterpret_cast<uintptr_t>(ptr));
       };

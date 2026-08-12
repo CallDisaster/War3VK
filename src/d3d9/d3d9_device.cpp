@@ -2739,7 +2739,9 @@ uint64_t War3SemanticDirectSelectionKey(
 
 uint64_t War3SemanticDirectRecordSelectionKey(
     const dxvk::war3::render::CurrentDrawContractRecord& record,
-    dxvk::war3::render::VisibleRenderableRecord* outVisibleHint = nullptr) {
+    dxvk::war3::render::VisibleRenderableRecord* outVisibleHint = nullptr,
+    dxvk::war3::render::VisibleRenderablePartLayerQueryCache*
+        visibleQueryCache = nullptr) {
   if (outVisibleHint != nullptr)
     *outVisibleHint = {};
   auto ptrValue = [](const void* ptr) -> uint64_t {
@@ -2760,9 +2762,14 @@ uint64_t War3SemanticDirectRecordSelectionKey(
   // record here; this is bounded by the direct scan cap, not every draw hook.
   if (record.renderablePart != nullptr) {
     dxvk::war3::render::VisibleRenderableRecord visible = {};
-    if (dxvk::war3::render::VisibleRenderableRegistry::instance()
-            .queryByRenderablePartAndLayer(record.renderablePart,
-                                           record.layerIndex, visible)) {
+    const auto& registry =
+        dxvk::war3::render::VisibleRenderableRegistry::instance();
+    const bool foundVisible = visibleQueryCache != nullptr
+        ? visibleQueryCache->query(registry, record.renderablePart,
+                                   record.layerIndex, visible)
+        : registry.queryByRenderablePartAndLayer(
+              record.renderablePart, record.layerIndex, visible);
+    if (foundVisible) {
       if (outVisibleHint != nullptr)
         *outVisibleHint = visible;
       if (visible.identity.jHandle != 0u)
@@ -26030,6 +26037,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   snapshotOptions.unitsOnly = unitsOnly;
   snapshotOptions.preferredSelectionKeysView = &preferredSelectionKeys;
   snapshotOptions.preferredSelectionKeysViewSortedUnique = true;
+  static thread_local dxvk::war3::render::
+      VisibleRenderablePartLayerQueryCache s_visiblePartLayerQueryCache;
+  auto& visiblePartLayerQueryCache = s_visiblePartLayerQueryCache;
+  visiblePartLayerQueryCache.reset();
+  snapshotOptions.visiblePartLayerQueryCache =
+      &visiblePartLayerQueryCache;
   // Contract records are non-owning scalar values. Reuse only the vector
   // allocation on this render thread; the snapshot routine clears every
   // logical element and rebuilds all visibility/generation evidence before
@@ -26507,7 +26520,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       dxvk::war3::render::VisibleRenderableRecord visibleHint = {};
       const uint64_t selectionKey = useSealedWork
           ? work.selectionKey
-          : War3SemanticDirectRecordSelectionKey(record, &visibleHint);
+          : War3SemanticDirectRecordSelectionKey(
+                record, &visibleHint, &visiblePartLayerQueryCache);
       if (!useSealedWork && visibleHint.renderablePart == record.renderablePart) {
         recordVisibleHintsByIndex[recordIndex] = visibleHint;
         recordVisibleHintValidByIndex[recordIndex] = uint8_t(1u);

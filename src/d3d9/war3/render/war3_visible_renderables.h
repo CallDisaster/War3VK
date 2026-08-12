@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <thread>
 #include <unordered_map>
@@ -355,6 +356,32 @@ private:
   mutable std::atomic<uint64_t> m_shadowManifestVisibleLookupSingleFallbackCount{
       0};
   mutable std::atomic<uint64_t> m_shadowManifestVisibleLookupMissCount{0};
+};
+
+// One-populate exact query memoization for the CurrentDraw producer. A direct
+// mapped collision is a harmless cache miss: query() always verifies the full
+// pointer/layer key before returning a value. Keeping this fixed-capacity and
+// caller-reset avoids allocator work and cannot retain authority across a
+// frame or map epoch.
+class VisibleRenderablePartLayerQueryCache {
+public:
+  void reset() noexcept;
+  bool query(const VisibleRenderableRegistry& registry,
+             void* renderablePart, uint32_t layerIndex,
+             VisibleRenderableRecord& out) noexcept;
+
+private:
+  struct Entry {
+    void* renderablePart = nullptr;
+    uint32_t layerIndex = 0u;
+    uint64_t generation = 0u;
+    bool found = false;
+    VisibleRenderableRecord record = {};
+  };
+
+  static constexpr size_t kEntryCount = 512u;
+  std::array<Entry, kEntryCount> m_entries = {};
+  uint64_t m_generation = 0u;
 };
 
 } // namespace dxvk::war3::render

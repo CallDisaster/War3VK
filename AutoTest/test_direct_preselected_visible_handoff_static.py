@@ -44,7 +44,7 @@ class DirectPreselectedVisibleHandoffStaticTests(unittest.TestCase):
             "recordVisibleHintValidByIndex.clear()",
             "recordVisibleHintsByIndex.resize(directRecords.size())",
             "recordVisibleHintValidByIndex.assign(directRecords.size(), uint8_t(0u))",
-            "War3SemanticDirectRecordSelectionKey(record, &visibleHint)",
+                "record, &visibleHint, &visiblePartLayerQueryCache",
             "recordVisibleHintsByIndex[recordIndex] = visibleHint",
         ):
             self.assertIn(token, block)

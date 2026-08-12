@@ -2979,6 +2979,48 @@ bool VisibleRenderableRegistry::queryByRenderablePartAndLayer(
   return false;
 }
 
+void VisibleRenderablePartLayerQueryCache::reset() noexcept {
+  ++m_generation;
+  if (m_generation == 0u) {
+    m_entries = {};
+    ++m_generation;
+  }
+}
+
+bool VisibleRenderablePartLayerQueryCache::query(
+    const VisibleRenderableRegistry& registry,
+    void* renderablePart, uint32_t layerIndex,
+    VisibleRenderableRecord& out) noexcept {
+  out = {};
+  if (renderablePart == nullptr)
+    return false;
+
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(
+      hash, uint64_t(reinterpret_cast<uintptr_t>(renderablePart)));
+  hash = bit::fnv1a_iter(hash, layerIndex);
+  Entry& entry = m_entries[size_t(hash) & (kEntryCount - 1u)];
+  if (entry.generation == m_generation &&
+      entry.renderablePart == renderablePart &&
+      entry.layerIndex == layerIndex) {
+    if (entry.found)
+      out = entry.record;
+    return entry.found;
+  }
+
+  VisibleRenderableRecord record = {};
+  const bool found = registry.queryByRenderablePartAndLayer(
+      renderablePart, layerIndex, record);
+  entry.renderablePart = renderablePart;
+  entry.layerIndex = layerIndex;
+  entry.generation = m_generation;
+  entry.found = found;
+  entry.record = found ? record : VisibleRenderableRecord{};
+  if (found)
+    out = record;
+  return found;
+}
+
 bool VisibleRenderableRegistry::queryFirstForDirectPacket(
     const CurrentDrawContractRecord& record,
     VisibleRenderableRecord& out) const {
