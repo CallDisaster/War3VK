@@ -297,6 +297,12 @@ public:
   bool findByUnitPtr(void *unitPtr, ModelInstanceRecord &out) const;
   bool findBySpritePtr(void *spritePtr, ModelInstanceRecord &out) const;
   bool findByRuntimeModel(void *runtimeModelPtr, ModelInstanceRecord &out) const;
+  // Direct packet lookup keeps the historical priority while holding one
+  // shared lock across all aliases.
+  bool findFirstForDirectPacket(void* sceneNode, void* unitPtr,
+                                void* worldObjectEntry,
+                                void* runtimeModelPtr,
+                                ModelInstanceRecord& out) const;
   bool findOwnerByRuntimeModel(void *runtimeModelPtr,
                                ModelInstanceRecord &out) const;
   bool findBySourceObject(void* sourceObjectPtr, ModelInstanceRecord& out) const;

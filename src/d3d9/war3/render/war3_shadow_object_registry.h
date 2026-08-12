@@ -141,6 +141,13 @@ public:
   bool findByHandle(uint32_t jHandle, ShadowObjectRecord &out) const;
   bool findBySpritePtr(void *spritePtr, ShadowObjectRecord &out) const;
   bool findByRuntimeModel(void *runtimeModelPtr, ShadowObjectRecord &out) const;
+  // Direct packet lookup keeps the historical alias priority while holding
+  // one shared lock. The two runtime aliases may describe different owners.
+  bool findFirstForDirectPacket(void* worldObjectEntry, void* sceneNode,
+                                uint32_t jHandle,
+                                void* primaryRuntimeModelPtr,
+                                void* secondaryRuntimeModelPtr,
+                                ShadowObjectRecord& out) const;
   // Per-draw semantic augment lookup. Preserves the legacy key priority while
   // holding one shared lock instead of reacquiring it for every miss.
   bool findFirstForAugment(void* worldObjectEntry, void* sceneNode,

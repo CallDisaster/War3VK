@@ -1441,6 +1441,27 @@ bool ModelInstanceRegistry::findByRuntimeModel(void *runtimeModelPtr,
   return true;
 }
 
+bool ModelInstanceRegistry::findFirstForDirectPacket(
+    void* sceneNode, void* unitPtr, void* worldObjectEntry,
+    void* runtimeModelPtr, ModelInstanceRecord& out) const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+  const auto findPointer = [&](const auto& map, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto it = map.find(key);
+    if (it == map.end())
+      return false;
+    out = it->second;
+    return true;
+  };
+
+  return findPointer(m_bySceneNode, sceneNode) ||
+         findPointer(m_byUnitPtr, unitPtr) ||
+         findPointer(m_byWorldObjectEntry, worldObjectEntry) ||
+         findPointer(m_byRuntimeModel, runtimeModelPtr);
+}
+
 bool ModelInstanceRegistry::findBySourceObject(void* sourceObjectPtr,
                                                ModelInstanceRecord& out) const {
   out = {};

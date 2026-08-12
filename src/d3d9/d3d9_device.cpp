@@ -6328,15 +6328,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto instanceLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/InstanceLookup");
-    if (record.sceneNode != nullptr)
-      instanceHit = instanceRegistry.findBySceneNode(record.sceneNode, instanceRecord);
-    if (!instanceHit && record.unitPtr != nullptr)
-      instanceHit = instanceRegistry.findByUnitPtr(record.unitPtr, instanceRecord);
-    if (!instanceHit && record.worldObjectEntry != nullptr)
-      instanceHit = instanceRegistry.findByWorldObjectEntry(record.worldObjectEntry, instanceRecord);
-    if (!instanceHit && ownerHit && ownerBinding.runtimeModelPtr != nullptr)
-      instanceHit = instanceRegistry.findByRuntimeModel(ownerBinding.runtimeModelPtr,
-                                                        instanceRecord);
+    instanceHit = instanceRegistry.findFirstForDirectPacket(
+        record.sceneNode, record.unitPtr, record.worldObjectEntry,
+        ownerHit ? ownerBinding.runtimeModelPtr : nullptr, instanceRecord);
   }
 
   if (packetBuildTiming != nullptr)
@@ -6441,12 +6435,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     auto renderObjectLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/RenderObjectLookup");
     auto& renderRegistry = dxvk::war3::render::RenderObjectRegistry::instance();
-    if (record.worldObjectEntry != nullptr)
-      renderObject = renderRegistry.findByEntry(record.worldObjectEntry);
-    if (renderObject == nullptr && record.sceneNode != nullptr)
-      renderObject = renderRegistry.findBySceneNode(record.sceneNode);
-    if (renderObject == nullptr && record.jHandle != 0u)
-      renderObject = renderRegistry.findByHandle(record.jHandle);
+    renderObject = renderRegistry.findFirstForDirectPacket(
+        record.worldObjectEntry, record.sceneNode, record.jHandle);
   }
 
   dxvk::war3::render::ShadowObjectRecord shadowRecord = {};
@@ -6458,19 +6448,10 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     auto shadowObjectLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/ShadowObjectLookup");
     auto& shadowRegistry = dxvk::war3::render::ShadowObjectRegistry::instance();
-    if (record.worldObjectEntry != nullptr)
-      shadowHit = shadowRegistry.findByWorldObjectEntry(record.worldObjectEntry,
-                                                        shadowRecord);
-    if (!shadowHit && record.sceneNode != nullptr)
-      shadowHit = shadowRegistry.findBySceneNode(record.sceneNode, shadowRecord);
-    if (!shadowHit && record.jHandle != 0u)
-      shadowHit = shadowRegistry.findByHandle(record.jHandle, shadowRecord);
-    if (!shadowHit && ownerHit && ownerBinding.runtimeModelPtr != nullptr)
-      shadowHit =
-          shadowRegistry.findByRuntimeModel(ownerBinding.runtimeModelPtr, shadowRecord);
-    if (!shadowHit && instanceHit && instanceRecord.runtimeModelPtr != nullptr)
-      shadowHit = shadowRegistry.findByRuntimeModel(instanceRecord.runtimeModelPtr,
-                                                    shadowRecord);
+    shadowHit = shadowRegistry.findFirstForDirectPacket(
+        record.worldObjectEntry, record.sceneNode, record.jHandle,
+        ownerHit ? ownerBinding.runtimeModelPtr : nullptr,
+        instanceHit ? instanceRecord.runtimeModelPtr : nullptr, shadowRecord);
   }
 
   dxvk::war3::render::VisibleRenderableRecord visibleRecord = {};
