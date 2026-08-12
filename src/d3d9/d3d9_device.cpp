@@ -28336,7 +28336,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         continue;
       }
       leaseScanTiming.enter(War3BuildEligibleLeaseScanPhase::PacketCopy);
-      EligibleRecord leased = {};
+      EligibleRecord leased = acquireEligibleRecord();
       leased.packet = leaseIt->second.packet;
       War3RebindShadowPacketOwnedResourcePointers(leased.packet);
       leased.sample = leaseIt->second.sample;
@@ -28385,6 +28385,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           (!poseFreshForLease && !allowStalePoseForCore)) {
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeaseRejectedPoseStaleCount++;
+        recycleRejectedEligibleRecord(std::move(leased));
         continue;
       }
       // Phase 7.30 Step A probe：标记"通过 stale-pose 宽限门通过"。
@@ -28397,8 +28398,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       leased.sample.contract.fromGrace = true;
       leased.sample.contract.graceAge = uint32_t(directLeaseAge);
       leased.sample.contract.producerFreshThisFrame = false;
-      if (!packetSafeForDirectPartLease(leased, false))
+      if (!packetSafeForDirectPartLease(leased, false)) {
+        recycleRejectedEligibleRecord(std::move(leased));
         continue;
+      }
       if (!leaseInfo.sliceFresh &&
           leased.packet.resource.dynamicIndexStream != nullptr &&
           leased.packet.resource.dynamicIndexCount != 0u &&
@@ -28408,6 +28411,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               leased.packet.resource)) {
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount++;
+        recycleRejectedEligibleRecord(std::move(leased));
         continue;
       }
       DirectObjectCompletenessBucket* bucket = trackCompletenessBuckets
