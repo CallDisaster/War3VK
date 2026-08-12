@@ -1959,6 +1959,26 @@ bool PoseRegistry::findByUnitPtr(void *unitPtr, PoseRecord &out) const {
   return true;
 }
 
+bool PoseRegistry::findFirstForDirectPacket(
+    void* runtimeModelPtr, void* sceneNode, void* unitPtr,
+    PoseRecord& out) const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+  const auto findPointer = [&](const auto& map, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto it = map.find(key);
+    if (it == map.end())
+      return false;
+    out = it->second;
+    return true;
+  };
+
+  return findPointer(m_byRuntimeModel, runtimeModelPtr) ||
+         findPointer(m_bySceneNode, sceneNode) ||
+         findPointer(m_byUnitPtr, unitPtr);
+}
+
 // Project the fields the per-draw shadow augment path actually consumes,
 // skipping the matrixPalette vector so no heap allocation/copy happens.
 static inline void ProjectPoseAugment(const PoseRecord &rec,
@@ -2015,6 +2035,32 @@ bool PoseRegistry::findByUnitPtrAugment(void *unitPtr,
   if (it == m_byUnitPtr.end())
     return false;
   ProjectPoseAugment(it->second, out);
+  return true;
+}
+
+bool PoseRegistry::findFirstForDirectPacketAugment(
+    void* runtimeModelPtr, void* sceneNode, void* unitPtr,
+    PoseAugmentView& out) const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+  const PoseRecord* record = nullptr;
+  const auto findPointer = [&](const auto& map, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto it = map.find(key);
+    if (it == map.end())
+      return false;
+    record = &it->second;
+    return true;
+  };
+
+  if (!findPointer(m_byRuntimeModel, runtimeModelPtr) &&
+      !findPointer(m_bySceneNode, sceneNode) &&
+      !findPointer(m_byUnitPtr, unitPtr)) {
+    return false;
+  }
+
+  ProjectPoseAugment(*record, out);
   return true;
 }
 

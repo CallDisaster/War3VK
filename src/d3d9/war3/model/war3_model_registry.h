@@ -422,6 +422,8 @@ public:
   bool findBySceneNode(void *sceneNode, PoseRecord &out) const;
   bool findByUnitPtr(void *unitPtr, PoseRecord &out) const;
   bool findByRuntimeModel(void *runtimeModelPtr, PoseRecord &out) const;
+  bool findFirstForDirectPacket(void* runtimeModelPtr, void* sceneNode,
+                                void* unitPtr, PoseRecord& out) const;
   // Augment-only lookups: project the matched record into a fixed-size POD
   // under the shared lock, skipping the matrixPalette deep-copy. Used by the
   // per-draw shadow semantic augment path.
@@ -429,6 +431,9 @@ public:
   bool findByUnitPtrAugment(void *unitPtr, PoseAugmentView &out) const;
   bool findByRuntimeModelAugment(void *runtimeModelPtr,
                                  PoseAugmentView &out) const;
+  bool findFirstForDirectPacketAugment(void* runtimeModelPtr,
+                                       void* sceneNode, void* unitPtr,
+                                       PoseAugmentView& out) const;
   // Same logical record set and order as snapshot(), without cloning each
   // matrix palette into an intermediate vector. References are callback-only;
   // callbacks must not re-enter PoseRegistry while the shared lock is held.

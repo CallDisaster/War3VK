@@ -25,13 +25,17 @@ assert (
 
 lookup_body = builder[pose_lookup:pose_install]
 assert "if (needPoseMatrixPayload)" in lookup_body
-for full, augment in (
-    ("findByRuntimeModel(", "findByRuntimeModelAugment("),
-    ("findBySceneNode(", "findBySceneNodeAugment("),
-    ("findByUnitPtr(", "findByUnitPtrAugment("),
+assert lookup_body.count("findFirstForDirectPacket(") == 1
+assert lookup_body.count("findFirstForDirectPacketAugment(") == 1
+for legacy in (
+    "findByRuntimeModel(",
+    "findByRuntimeModelAugment(",
+    "findBySceneNode(",
+    "findBySceneNodeAugment(",
+    "findByUnitPtr(",
+    "findByUnitPtrAugment(",
 ):
-    assert full in lookup_body
-    assert augment in lookup_body
+    assert legacy not in lookup_body
 
 # The common authoritative path must not copy the matrix payload into pose.
 install_body = builder[pose_install:builder.index("ExplicitBlendResolve", pose_install)]
@@ -54,5 +58,25 @@ projection = registry.split("static inline void ProjectPoseAugment", 1)[1].split
 for field in ("runtimeModelPtr", "sceneNode", "unitPtr"):
     assert f"out.{field} = rec.{field};" in projection
 assert "matrixPalette" not in projection
+
+full_lookup = registry.split(
+    "bool PoseRegistry::findFirstForDirectPacket", 1
+)[1].split("// Project the fields", 1)[0]
+assert full_lookup.count("std::shared_lock<std::shared_mutex> lock(m_mutex)") == 1
+augment_lookup = registry.split(
+    "bool PoseRegistry::findFirstForDirectPacketAugment", 1
+)[1].split("std::vector<PoseRecord> PoseRegistry::snapshot", 1)[0]
+assert augment_lookup.count(
+    "std::shared_lock<std::shared_mutex> lock(m_mutex)"
+) == 1
+for lookup in (full_lookup, augment_lookup):
+    priority = [
+        "m_byRuntimeModel, runtimeModelPtr",
+        "m_bySceneNode, sceneNode",
+        "m_byUnitPtr, unitPtr",
+    ]
+    assert [lookup.index(token) for token in priority] == sorted(
+        lookup.index(token) for token in priority
+    )
 
 print("direct pose payload on-demand static checks passed")

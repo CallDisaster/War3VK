@@ -6893,25 +6893,13 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         War3SemanticSubmitScope("War3SemanticScene/Direct/PoseLookup");
     auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
     if (needPoseMatrixPayload) {
-      if (effectiveRuntimeModelPtr != nullptr) {
-        poseHit = poseRegistry.findByRuntimeModel(
-            const_cast<void*>(effectiveRuntimeModelPtr), poseRecord);
-      }
-      if (!poseHit && record.sceneNode != nullptr)
-        poseHit = poseRegistry.findBySceneNode(record.sceneNode, poseRecord);
-      if (!poseHit && record.unitPtr != nullptr)
-        poseHit = poseRegistry.findByUnitPtr(record.unitPtr, poseRecord);
+      poseHit = poseRegistry.findFirstForDirectPacket(
+          const_cast<void*>(effectiveRuntimeModelPtr), record.sceneNode,
+          record.unitPtr, poseRecord);
     } else {
-      if (effectiveRuntimeModelPtr != nullptr) {
-        poseHit = poseRegistry.findByRuntimeModelAugment(
-            const_cast<void*>(effectiveRuntimeModelPtr), poseAugment);
-      }
-      if (!poseHit && record.sceneNode != nullptr) {
-        poseHit =
-            poseRegistry.findBySceneNodeAugment(record.sceneNode, poseAugment);
-      }
-      if (!poseHit && record.unitPtr != nullptr)
-        poseHit = poseRegistry.findByUnitPtrAugment(record.unitPtr, poseAugment);
+      poseHit = poseRegistry.findFirstForDirectPacketAugment(
+          const_cast<void*>(effectiveRuntimeModelPtr), record.sceneNode,
+          record.unitPtr, poseAugment);
     }
   }
 
