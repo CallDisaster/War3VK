@@ -7,12 +7,12 @@ int main() {
 
   static_assert(kCoherentRealIndexTrimDevelopmentEnabled);
   static_assert(kCoherentRealPerformanceCandidateEnabled);
-  static_assert(DefaultWar3CoherentRealIndexTrimConfiguredMode() == 2u);
-  static_assert(DefaultWar3CoherentRealHintDomainEnabled());
+  static_assert(DefaultWar3CoherentRealIndexTrimConfiguredMode() == 0u);
+  static_assert(!DefaultWar3CoherentRealHintDomainEnabled());
 
   assert(ParseWar3CoherentRealIndexTrimMode(
              DefaultWar3CoherentRealIndexTrimConfiguredMode()) ==
-         War3CoherentRealIndexTrimMode::Consume);
+         War3CoherentRealIndexTrimMode::Off);
   assert(ParseWar3CoherentRealIndexTrimMode(0u) ==
          War3CoherentRealIndexTrimMode::Off);
   assert(ParseWar3CoherentRealIndexTrimMode(1u) ==

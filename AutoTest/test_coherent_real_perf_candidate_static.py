@@ -33,10 +33,11 @@ class CoherentRealPerfCandidateStaticTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, block)
 
-    def test_candidate_defaults_to_checked_consume_and_declared_domain(self):
+    def test_candidate_compiles_route_but_runtime_defaults_off(self):
         self.assertIn("DefaultWar3CoherentRealIndexTrimConfiguredMode", CONTRACT)
-        self.assertIn("kCoherentRealPerformanceCandidateEnabled ? 2u : 0u", CONTRACT)
+        self.assertIn("return 0u;", CONTRACT)
         self.assertIn("DefaultWar3CoherentRealHintDomainEnabled", CONTRACT)
+        self.assertIn("return false;", CONTRACT)
         mode = DEVICE[DEVICE.index("War3CoherentRealIndexTrimModeRuntime()") :]
         mode = mode[:mode.index("inline bool War3CoherentRealDomainCacheRuntime")]
         self.assertIn("DefaultWar3CoherentRealIndexTrimConfiguredMode()", mode)

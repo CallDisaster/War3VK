@@ -28,11 +28,11 @@ inline constexpr bool kCoherentRealPerformanceCandidateEnabled = false;
 #endif
 
 constexpr uint32_t DefaultWar3CoherentRealIndexTrimConfiguredMode() noexcept {
-  return kCoherentRealPerformanceCandidateEnabled ? 2u : 0u;
+  return 0u;
 }
 
 constexpr bool DefaultWar3CoherentRealHintDomainEnabled() noexcept {
-  return kCoherentRealPerformanceCandidateEnabled;
+  return false;
 }
 
 constexpr War3CoherentRealIndexTrimMode ParseWar3CoherentRealIndexTrimMode(
