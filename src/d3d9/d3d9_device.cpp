@@ -7263,9 +7263,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
           out.runtimeGroupPalette.data(),
           uint32_t(out.runtimeGroupPalette.size())};
 
-      uint32_t maxExpectedGroupSize = 0u;
-      for (uint32_t groupSize : geo.matrixGroupSizes)
-        maxExpectedGroupSize = std::max(maxExpectedGroupSize, groupSize);
+      const uint32_t maxExpectedGroupSize = geo.maxMatrixGroupSize;
 
       dxvk::war3::shadow::ShadowExplicitBlendSkinningResult explicitBlend = {};
       const uint32_t explicitVertexCount =
@@ -7331,15 +7329,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         War3SemanticSubmitScope("War3SemanticScene/Direct/MaxGroupSlotScan");
     uint32_t maxSlot = directDecodedGroupSlotMaxReady
         ? directDecodedMaxGroupSlot
-        : 0u;
-    if (!directDecodedGroupSlotMaxReady) {
-      const auto& effectiveGroupSlots =
-          !resource.ownedVertexGroupIndices.empty()
-              ? resource.ownedVertexGroupIndices
-              : geo.vertexGroupIndices;
-      for (uint8_t slot : effectiveGroupSlots)
-        maxSlot = std::max(maxSlot, uint32_t(slot));
-    }
+        : geo.maxVertexGroupSlot;
     if (directExplicitBlendResolved)
       maxSlot = std::max(maxSlot, directExplicitBlendMaxGroupSlot);
     out.maxVertexGroupSlot = maxSlot;

@@ -53,6 +53,9 @@ struct ShadowGeosetResourceRecord {
 
   uint32_t vertexGroupCount = 0;
   std::vector<uint8_t> vertexGroupIndices;
+  // Derived once when immutable payload is published. DirectGrouped consumes
+  // the same geoset for every instance and must not rescan this array per draw.
+  uint32_t maxVertexGroupSlot = 0u;
 
   uint32_t uvLayerCount = 0;
   std::vector<ShadowGeosetUvLayerRecord> uvLayers;
@@ -65,6 +68,7 @@ struct ShadowGeosetResourceRecord {
 
   uint32_t matrixGroupCount = 0;
   std::vector<uint32_t> matrixGroupSizes;
+  uint32_t maxMatrixGroupSize = 0u;
 
   uint32_t matrixIndexCount = 0;
   std::vector<uint32_t> matrixIndices;

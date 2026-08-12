@@ -984,6 +984,7 @@ void ReplaceGeosetImmutablePayload(ShadowGeosetResourceRecord& dst,
   dst.normals = src.normals;
   dst.vertexGroupCount = src.vertexGroupCount;
   dst.vertexGroupIndices = src.vertexGroupIndices;
+  dst.maxVertexGroupSlot = src.maxVertexGroupSlot;
   dst.uvLayerCount = src.uvLayerCount;
   dst.uvLayers = src.uvLayers;
   dst.primitiveCount = src.primitiveCount;
@@ -992,12 +993,26 @@ void ReplaceGeosetImmutablePayload(ShadowGeosetResourceRecord& dst,
   dst.indices = src.indices;
   dst.matrixGroupCount = src.matrixGroupCount;
   dst.matrixGroupSizes = src.matrixGroupSizes;
+  dst.maxMatrixGroupSize = src.maxMatrixGroupSize;
   dst.matrixIndexCount = src.matrixIndexCount;
   dst.matrixIndices = src.matrixIndices;
   dst.contentHash = src.contentHash;
   dst.immutableModelGeneration = 0u;
   dst.localBounds = {};
   dst.immutableCaptureStatus = src.immutableCaptureStatus;
+}
+
+void RefreshGeosetImmutableDerivedValues(
+    ShadowGeosetResourceRecord& record) noexcept {
+  record.maxVertexGroupSlot = 0u;
+  for (uint8_t slot : record.vertexGroupIndices)
+    record.maxVertexGroupSlot = (std::max)(record.maxVertexGroupSlot,
+                                           uint32_t(slot));
+
+  record.maxMatrixGroupSize = 0u;
+  for (uint32_t groupSize : record.matrixGroupSizes)
+    record.maxMatrixGroupSize = (std::max)(record.maxMatrixGroupSize,
+                                           groupSize);
 }
 
 void ShadowModelResourceCache::endFrame() {
@@ -1199,6 +1214,7 @@ ShadowGeosetResourceSnapshot ShadowModelResourceCache::storeGeosetRecord(
     }
   }
   merged.immutableModelGeneration = generation;
+  RefreshGeosetImmutableDerivedValues(merged);
   merged.localBounds = generation != 0u
       ? ComputeShadowGeosetLocalBounds(merged.positions, merged.vertexCount)
       : ShadowGeosetLocalBounds{};
