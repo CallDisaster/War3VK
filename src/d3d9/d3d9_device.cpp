@@ -31310,8 +31310,22 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
                 : uint64_t(1u);
   dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
       .beginCanonicalFrame(canonicalNativeFrameSerial);
-  std::vector<dxvk::war3::render::CurrentDrawContractRecord>
-      exactSubmittedManifestRecords;
+  // Exact Stage11 manifest records are scalar, non-owning handoff values.
+  // Reuse only their allocator storage on this render thread; clear the
+  // logical range both before and after the Populate call so no Warcraft
+  // identity survives the call and no caster/resource lifetime is extended.
+  static thread_local std::vector<
+      dxvk::war3::render::CurrentDrawContractRecord>
+      s_exactSubmittedManifestRecords;
+  auto& exactSubmittedManifestRecords = s_exactSubmittedManifestRecords;
+  exactSubmittedManifestRecords.clear();
+  struct ExactSubmittedManifestScratchReset {
+    std::vector<dxvk::war3::render::CurrentDrawContractRecord>& records;
+
+    ~ExactSubmittedManifestScratchReset() {
+      records.clear();
+    }
+  } exactSubmittedManifestScratchReset { exactSubmittedManifestRecords };
   if (War3SemanticDirectOnlyRuntime()) {
     // Stage11 has exactly one preferred current-frame representation.  Run
     // the native draw-time owner first; DirectGrouped then supplements only
