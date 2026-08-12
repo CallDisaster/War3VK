@@ -26782,7 +26782,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
 
     enterDirectDetailPhase("PreselectRecordSort");
-    std::stable_sort(
+    // recordIndex is the source ordinal because the preselect scan appends in
+    // directRecords order.  Use it as the final key so std::sort produces the
+    // exact stable-sort order for otherwise equal records without allocating
+    // a merge buffer every frame.
+    std::sort(
         preselectedRecords.begin(), preselectedRecords.end(),
         [&directRecords](const PreselectedRecord& a,
                          const PreselectedRecord& b) {
@@ -26794,8 +26798,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
             return aRecord.layerIndex < bRecord.layerIndex;
           if (aRecord.payloadWord108 != bRecord.payloadWord108)
             return aRecord.payloadWord108 < bRecord.payloadWord108;
-          return uintptr_t(aRecord.renderablePart) <
-                 uintptr_t(bRecord.renderablePart);
+          if (aRecord.renderablePart != bRecord.renderablePart)
+            return uintptr_t(aRecord.renderablePart) <
+                   uintptr_t(bRecord.renderablePart);
+          return a.recordIndex < b.recordIndex;
         });
 
     enterDirectDetailPhase("PreselectGroupBuild");
