@@ -26390,9 +26390,20 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
     return true;
   };
-  std::vector<EligibleRecord> submittedPartPacketLeaseRecords;
+  // Both lists are bounded by the direct-record budget and are consumed
+  // entirely inside this render-thread call. Reuse their backing storage so
+  // every frame does not allocate/free hundreds of packet objects (including
+  // palette and blend vectors). clear() still destroys all prior-frame packet
+  // ownership; this is capacity reuse, not cross-frame geometry reuse.
+  static thread_local std::vector<EligibleRecord>
+      s_submittedPartPacketLeaseRecords;
+  static thread_local std::vector<EligibleRecord> s_eligibleRecords;
+  auto& submittedPartPacketLeaseRecords =
+      s_submittedPartPacketLeaseRecords;
+  auto& eligibleRecords = s_eligibleRecords;
+  submittedPartPacketLeaseRecords.clear();
+  eligibleRecords.clear();
   // 使用固定大小预分配避免多次 realloc
-  std::vector<EligibleRecord> eligibleRecords;
   eligibleRecords.reserve(std::min<uint32_t>(
       uint32_t(recordIndicesForBuild.size()),
       directRecordCap != 0u ? directRecordCap * 2u
@@ -28413,7 +28424,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       uint32_t priorityScore;
       bool previouslySelected;
     };
-    std::vector<ObjectGroup> objectGroups;
+    static thread_local std::vector<ObjectGroup> s_objectGroups;
+    auto& objectGroups = s_objectGroups;
+    objectGroups.clear();
     objectGroups.reserve(eligibleRecordCount);
 
     const bool useSubmitPermutationView =
