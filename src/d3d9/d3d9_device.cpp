@@ -22317,11 +22317,23 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           ? &packet.resource.ownedVertexGroupIndices
           : currentDrawSample != nullptr ? &currentDrawSample->groupSlots
                                          : nullptr;
+  // BuildPacket and Append receive the same authoritative sample as one
+  // transaction. DecodeCurrentDrawGroupSlots already validated and hashed the
+  // group stream while producing ownedVertexGroupIndices, so do not scan the
+  // per-vertex bytes a second time here. Callers without that sealed sample
+  // retain the exact byte-hash fallback.
+  const uint64_t sealedCurrentDrawGroupHash =
+      currentDrawSample != nullptr && currentDrawSample->groupHash != 0u
+          ? currentDrawSample->groupHash
+          : 0u;
   const uint64_t authoritativeGroupHash =
       packetAuthoritativeSkinnedContractReady
-          ? bit::fnv1a_hash(packet.resource.ownedVertexGroupIndices.data(),
-                            packet.resource.ownedVertexGroupIndices.size())
-          : currentDrawSample != nullptr ? currentDrawSample->groupHash : 0u;
+          ? sealedCurrentDrawGroupHash != 0u
+              ? sealedCurrentDrawGroupHash
+              : bit::fnv1a_hash(
+                    packet.resource.ownedVertexGroupIndices.data(),
+                    packet.resource.ownedVertexGroupIndices.size())
+          : sealedCurrentDrawGroupHash;
   // Phase 7.2: stable group hash（不含 stream1Ptr），用于 geometry key 稳定身份
   const uint64_t authoritativeStableGroupHash =
       currentDrawSample != nullptr && currentDrawSample->stableGroupHash != 0u
