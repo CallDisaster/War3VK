@@ -2738,7 +2738,10 @@ uint64_t War3SemanticDirectSelectionKey(
 }
 
 uint64_t War3SemanticDirectRecordSelectionKey(
-    const dxvk::war3::render::CurrentDrawContractRecord& record) {
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    dxvk::war3::render::VisibleRenderableRecord* outVisibleHint = nullptr) {
+  if (outVisibleHint != nullptr)
+    *outVisibleHint = {};
   auto ptrValue = [](const void* ptr) -> uint64_t {
     return uint64_t(reinterpret_cast<uintptr_t>(ptr));
   };
@@ -2760,6 +2763,8 @@ uint64_t War3SemanticDirectRecordSelectionKey(
     if (dxvk::war3::render::VisibleRenderableRegistry::instance()
             .queryByRenderablePartAndLayer(record.renderablePart,
                                            record.layerIndex, visible)) {
+      if (outVisibleHint != nullptr)
+        *outVisibleHint = visible;
       if (visible.identity.jHandle != 0u)
         return makeKey(2u, visible.identity.jHandle);
       if (visible.identity.handleId != 0u)
@@ -6581,7 +6586,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     War3CurrentDrawShadowObjectSnapshotCache*
         shadowObjectSnapshotCache = nullptr,
     War3CurrentDrawPoseAugmentSnapshotCache*
-        poseAugmentSnapshotCache = nullptr) {
+        poseAugmentSnapshotCache = nullptr,
+    const dxvk::war3::render::VisibleRenderableRecord*
+        preselectedVisibleRecord = nullptr) {
   const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
       record.stage,
       record.batchTag,
@@ -6821,10 +6828,25 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto visibleLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/VisibleLookup");
-    auto& visibleRegistry =
-        dxvk::war3::render::VisibleRenderableRegistry::instance();
-    visibleHit = visibleRegistry.queryFirstForDirectPacket(record,
-                                                           visibleRecord);
+    // The grouped preselector has already queried this exact part/layer from
+    // the immutable current-frame Visible snapshot in order to derive its
+    // stable selection key. Reuse that value copy instead of performing the
+    // same indexed lookup again during packet construction. The uncapped
+    // path, compact-table Consume without a canonical lookup, and any
+    // mismatching hint retain the canonical fallback below.
+    const bool preselectedVisibleMatches =
+        preselectedVisibleRecord != nullptr &&
+        record.renderablePart != nullptr &&
+        preselectedVisibleRecord->renderablePart == record.renderablePart;
+    if (preselectedVisibleMatches) {
+      visibleRecord = *preselectedVisibleRecord;
+      visibleHit = true;
+    } else {
+      auto& visibleRegistry =
+          dxvk::war3::render::VisibleRenderableRegistry::instance();
+      visibleHit = visibleRegistry.queryFirstForDirectPacket(record,
+                                                             visibleRecord);
+    }
   }
 
   // CurrentDraw is already backfilled from the exact visible part at publish
@@ -26229,10 +26251,17 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   // the exact same record, while the hot path moves only a uint32_t.
   static thread_local std::vector<uint32_t> s_recordIndicesForBuild;
   static thread_local std::vector<uint64_t> s_recordSelectionKeysForBuild;
+  static thread_local std::vector<
+      dxvk::war3::render::VisibleRenderableRecord>
+      s_recordVisibleHintsByIndex;
+  static thread_local std::vector<uint8_t> s_recordVisibleHintValidByIndex;
   auto& recordIndicesForBuild = s_recordIndicesForBuild;
   auto& recordSelectionKeysForBuild = s_recordSelectionKeysForBuild;
+  auto& recordVisibleHintsByIndex = s_recordVisibleHintsByIndex;
+  auto& recordVisibleHintValidByIndex = s_recordVisibleHintValidByIndex;
   recordIndicesForBuild.clear();
   recordSelectionKeysForBuild.clear();
+  recordVisibleHintValidByIndex.clear();
   const War3CompactWorkTableMode compactWorkTableMode =
       War3SemanticCompactWorkTableModeRuntime();
   const bool observeCompactWorkTable =
@@ -26353,6 +26382,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   bool recordsForBuildCanonicalPrefiltered = false;
   if (useObjectGrouped && directRecordCap != 0u) {
     enterDirectDetailPhase("PreselectScan");
+    recordVisibleHintsByIndex.resize(directRecords.size());
+    recordVisibleHintValidByIndex.assign(directRecords.size(), uint8_t(0u));
     struct PreselectedRecord {
       uint32_t recordIndex = 0u;
       War3CompactWorkItem work = {};
@@ -26471,9 +26502,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       if (bucket != nullptr)
         bucket->shadowEligibleParts++;
 
+      dxvk::war3::render::VisibleRenderableRecord visibleHint = {};
       const uint64_t selectionKey = useSealedWork
           ? work.selectionKey
-          : War3SemanticDirectRecordSelectionKey(record);
+          : War3SemanticDirectRecordSelectionKey(record, &visibleHint);
+      if (!useSealedWork && visibleHint.renderablePart == record.renderablePart) {
+        recordVisibleHintsByIndex[recordIndex] = visibleHint;
+        recordVisibleHintValidByIndex[recordIndex] = uint8_t(1u);
+      }
       const uint32_t priorityScore = useSealedWork
           ? work.priorityScore
           : War3SemanticDirectRecordPriorityScore(record);
@@ -27089,6 +27125,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (recordIndex >= directRecords.size())
       continue;
     const auto& record = directRecords[recordIndex];
+    const dxvk::war3::render::VisibleRenderableRecord*
+        preselectedVisibleRecord =
+            recordIndex < recordVisibleHintValidByIndex.size() &&
+                recordVisibleHintValidByIndex[recordIndex] != 0u
+            ? &recordVisibleHintsByIndex[recordIndex]
+            : nullptr;
     const uint64_t preselectedRecordSelectionKey =
         buildIndex < recordSelectionKeysForBuild.size()
             ? recordSelectionKeysForBuild[buildIndex]
@@ -27230,7 +27272,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           &currentDrawGeosetSnapshotCache,
           &currentDrawInstanceSnapshotCache,
           &currentDrawShadowObjectSnapshotCache,
-          &currentDrawPoseAugmentSnapshotCache);
+          &currentDrawPoseAugmentSnapshotCache,
+          preselectedVisibleRecord);
       packetBuildTiming.finish();
       if (!packetBuilt) {
         if (bucket != nullptr)
