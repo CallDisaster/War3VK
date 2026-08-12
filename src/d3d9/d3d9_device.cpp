@@ -22477,8 +22477,11 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
 
   fallbackAppendTiming.enter(War3FallbackAppendPhase::LivePalette);
   uint32_t paletteIndex = 0u;
-  std::vector<std::array<uint8_t, 4>> blendIndices;
-  std::vector<std::array<float, 3>> blendWeights;
+  struct SemanticBlendVertex {
+    float weights[3];
+    uint8_t indices[4];
+  };
+  std::vector<SemanticBlendVertex> blendVertices;
   uint64_t submittedRuntimeGroupPaletteHash = 0u;
   bool liveRuntimeGroupPaletteReady = false;
   // Phase 7.28：本次 submit 对应的 palette 来源 + slotIndex 记录。
@@ -23213,28 +23216,34 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         return false;
       }
       if (!cachedPersistentGeometry) {
-        blendIndices.resize(vertexCount);
-        blendWeights.resize(vertexCount);
+        blendVertices.resize(vertexCount);
         for (uint32_t i = 0; i < vertexCount; ++i) {
-          blendWeights[i] = canonicalSkin.explicitBlendWeights[i];
-          blendIndices[i] = canonicalSkin.explicitBlendIndices[i];
+          const auto& sourceWeights = canonicalSkin.explicitBlendWeights[i];
+          const auto& sourceIndices = canonicalSkin.explicitBlendIndices[i];
           const uint32_t maxInfluence =
               uint32_t(canonicalSkin.explicitBlendCount) + 1u;
           for (uint32_t influence = 0u; influence < maxInfluence; ++influence) {
-          const uint32_t groupSlot = blendIndices[i][influence];
-          if (groupSlot >= effectiveCanonicalPaletteCount ||
-              groupSlot >= 256u) {
-            m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
-            notePhase5SkinnedContractReject();
-            return false;
+            const uint32_t groupSlot = sourceIndices[influence];
+            if (groupSlot >= effectiveCanonicalPaletteCount ||
+                groupSlot >= 256u) {
+              m_war3Scene.shadowStats.semanticSceneRejectedSkinnedContract++;
+              notePhase5SkinnedContractReject();
+              return false;
             }
           }
+          blendVertices[i].weights[0] = sourceWeights[0];
+          blendVertices[i].weights[1] = sourceWeights[1];
+          blendVertices[i].weights[2] = sourceWeights[2];
+          blendVertices[i].indices[0] = sourceIndices[0];
+          blendVertices[i].indices[1] = sourceIndices[1];
+          blendVertices[i].indices[2] = sourceIndices[2];
+          blendVertices[i].indices[3] = sourceIndices[3];
         }
       }
     } else if (!cachedPersistentGeometry) {
       auto blendScope = War3SemanticSubmitScope(
           "War3SemanticScene/SubmitFrame/BlendContract");
-      blendIndices.resize(vertexCount);
+      blendVertices.resize(vertexCount);
       for (uint32_t i = 0; i < vertexCount; ++i) {
         const uint32_t groupSlot = uint32_t(canonicalGroupSlots[i]);
         if (groupSlot >= effectiveCanonicalPaletteCount ||
@@ -23243,7 +23252,13 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           notePhase5SkinnedContractReject();
           return false;
         }
-        blendIndices[i] = {uint8_t(groupSlot), 0u, 0u, 0u};
+        blendVertices[i].weights[0] = 0.0f;
+        blendVertices[i].weights[1] = 0.0f;
+        blendVertices[i].weights[2] = 0.0f;
+        blendVertices[i].indices[0] = uint8_t(groupSlot);
+        blendVertices[i].indices[1] = 0u;
+        blendVertices[i].indices[2] = 0u;
+        blendVertices[i].indices[3] = 0u;
       }
     }
   }
@@ -23387,28 +23402,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     uploads[1].usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     uploads[1].debugName = "War3SemanticShadowIdx";
   }
-  struct SemanticBlendVertex {
-    float weights[3];
-    uint8_t indices[4];
-  };
-  std::vector<SemanticBlendVertex> blendVertices;
-  if (skinned && !blendIndices.empty()) {
-    blendVertices.resize(vertexCount);
-    for (uint32_t i = 0u; i < vertexCount; ++i) {
-      if (usesExplicitBlendContract) {
-        blendVertices[i].weights[0] = blendWeights[i][0];
-        blendVertices[i].weights[1] = blendWeights[i][1];
-        blendVertices[i].weights[2] = blendWeights[i][2];
-      } else {
-        blendVertices[i].weights[0] = 0.0f;
-        blendVertices[i].weights[1] = 0.0f;
-        blendVertices[i].weights[2] = 0.0f;
-      }
-      blendVertices[i].indices[0] = blendIndices[i][0];
-      blendVertices[i].indices[1] = blendIndices[i][1];
-      blendVertices[i].indices[2] = blendIndices[i][2];
-      blendVertices[i].indices[3] = blendIndices[i][3];
-    }
+  if (skinned && !blendVertices.empty()) {
     uploads[2].hostData = blendVertices.data();
     uploads[2].bytes =
         VkDeviceSize(blendVertices.size() * sizeof(blendVertices[0]));
