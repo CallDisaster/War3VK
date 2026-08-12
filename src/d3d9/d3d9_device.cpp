@@ -6884,10 +6884,18 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
 
   dxvk::war3::render::ShadowObjectAugmentView shadowRecord = {};
   bool shadowHit = false;
-  if (packetBuildTiming != nullptr)
-    packetBuildTiming->enterNested(
-        War3PacketBuildNestedPhase::ShadowObjectLookup);
-  {
+  // A complete CurrentDraw identity plus an independently matched immutable
+  // geoset/instance owner already supplies every ShadowObject scalar consumed
+  // below: runtime model, object aliases, model identity and object kind. Do
+  // not take another registry generation snapshot and alias lookup for that
+  // common path. Attachments, incomplete identities and owner mismatches keep
+  // the canonical fallback intact.
+  const bool currentDrawShadowAugmentComplete =
+      currentDrawObjectIdentityComplete && ownerSatisfiedByInstance;
+  if (!currentDrawShadowAugmentComplete) {
+    if (packetBuildTiming != nullptr)
+      packetBuildTiming->enterNested(
+          War3PacketBuildNestedPhase::ShadowObjectLookup);
     auto shadowObjectLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/ShadowObjectLookup");
     auto& shadowRegistry = dxvk::war3::render::ShadowObjectRegistry::instance();

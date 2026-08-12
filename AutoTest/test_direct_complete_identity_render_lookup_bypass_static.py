@@ -50,9 +50,16 @@ assert "ObjectKind::Building" in kind_gate_body
 lookup_guard = builder[builder.rfind("if (", gate, render):render]
 assert "!currentDrawObjectIdentityComplete" in lookup_guard
 
-# The bypass may omit only RenderObjectRegistry. Exact visible identity,
-# ShadowObject fallback and map-epoch unit flags remain in the packet path.
+# Exact visible identity and map-epoch unit flags remain in the packet path.
+# ShadowObject may only be omitted when the independent immutable
+# geoset/instance owner proof is also complete; its canonical fallback remains
+# for attachments and incomplete identities.
 assert "shadowObjectSnapshotCache->find" in builder[render:]
+shadow_gate = builder.index("const bool currentDrawShadowAugmentComplete")
+shadow_lookup = builder.index("shadowObjectSnapshotCache->find", shadow_gate)
+shadow_proof = builder[shadow_gate:shadow_lookup]
+assert "currentDrawObjectIdentityComplete && ownerSatisfiedByInstance" in shadow_proof
+assert "if (!currentDrawShadowAugmentComplete)" in shadow_proof
 assert "War3TryReadUnitFlags5CCached" in builder[render:]
 assert "visibleRecord.identity.groupIdx" in builder[render:]
 assert "? visibleRecord.identity.flags5C" in builder[render:]
