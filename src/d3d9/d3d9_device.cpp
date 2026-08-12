@@ -22481,7 +22481,13 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     float weights[3];
     uint8_t indices[4];
   };
-  std::vector<SemanticBlendVertex> blendVertices;
+  // Persistent-buffer creation copies hostData into mapped staging before it
+  // returns, so this scratch never escapes the current append. Reuse its CPU
+  // allocation across packets while dropping pathological oversized capacity.
+  thread_local std::vector<SemanticBlendVertex> blendVertices;
+  dxvk::war3::render::ClearBoundedDirectPacketScratch(
+      blendVertices,
+      dxvk::war3::render::kDirectPacketScratchMaxVertexEntries);
   uint64_t submittedRuntimeGroupPaletteHash = 0u;
   bool liveRuntimeGroupPaletteReady = false;
   // Phase 7.28：本次 submit 对应的 palette 来源 + slotIndex 记录。

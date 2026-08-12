@@ -9,7 +9,13 @@ end = SOURCE.index("void D3D9DeviceEx::War3MarkDrawTimeExactRejectedCurrentFrame
 body = SOURCE[start:end]
 
 assert "struct SemanticBlendVertex" in body
-assert "std::vector<SemanticBlendVertex> blendVertices;" in body
+assert "thread_local std::vector<SemanticBlendVertex> blendVertices;" in body
+assert (
+    "ClearBoundedDirectPacketScratch(\n"
+    "      blendVertices,\n"
+    "      dxvk::war3::render::kDirectPacketScratchMaxVertexEntries);"
+    in body
+)
 assert "std::vector<std::array<uint8_t, 4>> blendIndices" not in body
 assert "std::vector<std::array<float, 3>> blendWeights" not in body
 
@@ -27,5 +33,14 @@ assert 'uploads[2].debugName = "War3SemanticShadowBlend";' in body
 assert "uploads[2].bytes =\n        VkDeviceSize(blendVertices.size() * sizeof(blendVertices[0]));" in body
 assert "candidate.blendStride = (skinned) ? 16u : 0u;" in body
 assert "candidate.blendIndexOffset = skinned ? 12u : 0u;" in body
+
+# The only upload helper consuming hostData performs its memcpy before return;
+# asynchronous CS work captures buffers, never the thread-local pointer.
+create_start = SOURCE.index("bool D3D9DeviceEx::War3CreateShadowPersistentBuffer(")
+create_end = SOURCE.index("void D3D9DeviceEx::War3GcShadowPersistentGeometry(", create_start)
+create_body = SOURCE[create_start:create_end]
+assert "std::memcpy(mapPtr, upload.hostData, size_t(upload.bytes));" in create_body
+emit_start = create_body.index("EmitCs(")
+assert "upload.hostData" not in create_body[emit_start:]
 
 print("semantic blend vertex single-pass contract: ok")
