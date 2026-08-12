@@ -3086,11 +3086,28 @@ void SnapshotPublishedCurrentDrawContracts(
   const bool hasPreferredKeys = !preferredSelectionKeys.empty();
 
   enterSnapshotPhase("SnapshotScratchSetup");
-  // Phase 7.81：thread_local 复用 preferredVisibleKeyCache。
-  static thread_local std::unordered_map<uint64_t, uint64_t>
-      s_preferredVisibleKeyCache;
-  s_preferredVisibleKeyCache.clear();
-  auto& preferredVisibleKeyCache = s_preferredVisibleKeyCache;
+  // Sorting/top-K comparison may ask for the same part/layer identity many
+  // times. A node map charged allocation/bucket work on every snapshot and
+  // keyed only by a folded hash. Keep an exact-key, generation-tagged direct
+  // cache instead: collisions merely recompute the canonical registry query.
+  struct PreferredVisibleKeyCacheEntry {
+    void* renderablePart = nullptr;
+    uint32_t layerIndex = 0u;
+    uint64_t value = 0u;
+    uint64_t generation = 0u;
+  };
+  static constexpr size_t kPreferredVisibleKeyCacheEntries = 512u;
+  static thread_local std::array<PreferredVisibleKeyCacheEntry,
+                                 kPreferredVisibleKeyCacheEntries>
+      s_preferredVisibleKeyCache = {};
+  static thread_local uint64_t s_preferredVisibleKeyCacheGeneration = 0u;
+  uint64_t preferredVisibleKeyCacheGeneration =
+      ++s_preferredVisibleKeyCacheGeneration;
+  if (preferredVisibleKeyCacheGeneration == 0u) {
+    s_preferredVisibleKeyCache = {};
+    preferredVisibleKeyCacheGeneration =
+        ++s_preferredVisibleKeyCacheGeneration;
+  }
   const auto makePreferredKey = [](uint32_t tag, uint64_t value) -> uint64_t {
     uint64_t hash = bit::fnv1a_init();
     hash = bit::fnv1a_iter(hash, tag);
@@ -3101,13 +3118,18 @@ void SnapshotPublishedCurrentDrawContracts(
       [&](const CurrentDrawContractRecord& record) -> uint64_t {
     if (record.renderablePart == nullptr)
       return 0u;
-    uint64_t cacheKey = bit::fnv1a_init();
-    cacheKey = bit::fnv1a_iter(
-        cacheKey, uint64_t(reinterpret_cast<uintptr_t>(record.renderablePart)));
-    cacheKey = bit::fnv1a_iter(cacheKey, record.layerIndex);
-    const auto cached = preferredVisibleKeyCache.find(cacheKey);
-    if (cached != preferredVisibleKeyCache.end())
-      return cached->second;
+    uint64_t cacheHash = bit::fnv1a_init();
+    cacheHash = bit::fnv1a_iter(
+        cacheHash,
+        uint64_t(reinterpret_cast<uintptr_t>(record.renderablePart)));
+    cacheHash = bit::fnv1a_iter(cacheHash, record.layerIndex);
+    auto& cached = s_preferredVisibleKeyCache[
+        size_t(cacheHash) & (kPreferredVisibleKeyCacheEntries - 1u)];
+    if (cached.generation == preferredVisibleKeyCacheGeneration &&
+        cached.renderablePart == record.renderablePart &&
+        cached.layerIndex == record.layerIndex) {
+      return cached.value;
+    }
 
     uint64_t key = 0u;
     VisibleRenderableRecord visible = {};
@@ -3128,7 +3150,8 @@ void SnapshotPublishedCurrentDrawContracts(
       else if (visible.sceneNode != nullptr)
         key = makePreferredKey(5u, ptrValue(visible.sceneNode));
     }
-    preferredVisibleKeyCache.emplace(cacheKey, key);
+    cached = {record.renderablePart, record.layerIndex, key,
+              preferredVisibleKeyCacheGeneration};
     return key;
   };
   const auto isPreferredWithIdentity =
