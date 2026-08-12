@@ -151,7 +151,7 @@ class CompactWorkTableContracts(unittest.TestCase):
 
     def test_unsealed_and_early_rejected_items_skip_expensive_identity_work(self):
         start = DEVICE.index("const auto buildCompactWorkEvidence")
-        end = DEVICE.index("bool recordsForBuildAlphaPrefiltered", start)
+        end = DEVICE.index("bool recordsForBuildCanonicalPrefiltered", start)
         block = DEVICE[start:end]
         seal_exit = block.index("if (!sealed)\n          return evidence;")
         owner_gate = block.index("currentFrameDrawTimeProducerOwnsRecord", seal_exit)

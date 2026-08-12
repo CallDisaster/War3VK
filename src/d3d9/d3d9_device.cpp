@@ -25933,7 +25933,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           evidence.flags |= uint8_t(War3CompactWorkPreviouslySelected);
         return evidence;
       };
-  bool recordsForBuildAlphaPrefiltered = false;
+  // The grouped preselector has already run the canonical exact-owner,
+  // static-world, producer-policy, blocker and alpha gates for every record it
+  // publishes to BuildEligible. Nothing between these two loops mutates those
+  // render-thread contracts, so repeating the same registry/cache probes would
+  // only charge the selected subset twice.
+  bool recordsForBuildCanonicalPrefiltered = false;
   if (useObjectGrouped && directRecordCap != 0u) {
     enterDirectDetailPhase("PreselectScan");
     struct PreselectedRecord {
@@ -26190,7 +26195,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           break;
       }
     }
-    recordsForBuildAlphaPrefiltered = true;
+    recordsForBuildCanonicalPrefiltered = true;
   } else {
     enterDirectDetailPhase("SnapshotFallbackCopy");
     recordIndicesForBuild.resize(directRecords.size());
@@ -26664,15 +26669,18 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // slice under the blocker/alpha fail-closed policy.  In both cases the
     // generic skinned reconstruction must not publish a second, non-equivalent
     // representation for the same part in this frame.
-    if (!useSealedWork && currentFrameDrawTimeProducerOwnsRecord(record)) {
+    const bool rerunCanonicalRecordFilters =
+        !recordsForBuildCanonicalPrefiltered && !useSealedWork;
+    if (rerunCanonicalRecordFilters &&
+        currentFrameDrawTimeProducerOwnsRecord(record)) {
       m_war3Scene.shadowStats
           .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
       continue;
     }
-    if (!useSealedWork &&
+    if (rerunCanonicalRecordFilters &&
         War3SemanticRawcodeLooksStaticWorldCaster(record.rawcode))
       continue;
-    if (!useSealedWork) {
+    if (rerunCanonicalRecordFilters) {
       const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
           record.stage,
           record.batchTag,
@@ -26695,7 +26703,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         buildEligibleRecordPhaseTicks, buildEligibleRecordPhaseCalls);
     buildRecordTiming.enter(War3BuildEligibleRecordPhase::GateFilter);
     auto& bucket = completenessBucketForRecord(record);
-    if (!useSealedWork && dxvk::war3::internal::kPathBlockerHideEnabled &&
+    if (rerunCanonicalRecordFilters &&
+        dxvk::war3::internal::kPathBlockerHideEnabled &&
         War3ShadowIsLosBlocker(record)) {
       m_war3Scene.shadowStats.semanticSceneRejectedPathBlockerCount++;
       m_war3Scene.shadowStats
@@ -26705,14 +26714,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       m_war3Scene.shadowStats.skippedNotCaster++;
       continue;
     }
-    if (!recordsForBuildAlphaPrefiltered &&
+    if (rerunCanonicalRecordFilters &&
         War3RejectCurrentDrawRecordByUnsafeAlphaVisualPolicy(
             record, m_war3ShadowPersistentFrameSerial,
             m_war3Scene.shadowStats)) {
       bucket.alphaRejectedParts++;
       continue;
     }
-    if (!recordsForBuildAlphaPrefiltered)
+    if (rerunCanonicalRecordFilters)
       bucket.shadowEligibleParts++;
     uint64_t producerClaimStrictKey = 0u;
     uint64_t producerClaimLogicalKey = 0u;
