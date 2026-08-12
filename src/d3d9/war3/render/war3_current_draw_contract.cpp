@@ -3054,32 +3054,36 @@ void SnapshotPublishedCurrentDrawContracts(
   out.reserve(reserveCount);
 
   enterSnapshotPhase("SnapshotPreferredSet");
+  const auto& preferredSelectionKeys =
+      options.preferredSelectionKeysView != nullptr
+          ? *options.preferredSelectionKeysView
+          : options.preferredSelectionKeys;
   // DirectGrouped already supplies a sorted/unique lease vector. Keep the
   // public API's arbitrary-order semantics, but use binary search for that hot
   // path instead of rebuilding a node-based hash set every semantic frame.
   // Unsorted callers retain the historical set-membership behavior.
   const bool preferredKeysSorted =
-      std::is_sorted(options.preferredSelectionKeys.begin(),
-                     options.preferredSelectionKeys.end());
+      std::is_sorted(preferredSelectionKeys.begin(),
+                     preferredSelectionKeys.end());
   static thread_local std::unordered_set<uint64_t> s_preferredKeySet;
   s_preferredKeySet.clear();
-  if (!preferredKeysSorted && !options.preferredSelectionKeys.empty()) {
+  if (!preferredKeysSorted && !preferredSelectionKeys.empty()) {
     const size_t retainedCapacity = size_t(
         double(s_preferredKeySet.bucket_count()) *
         double(s_preferredKeySet.max_load_factor()));
-    if (retainedCapacity < options.preferredSelectionKeys.size())
-      s_preferredKeySet.reserve(options.preferredSelectionKeys.size());
-    s_preferredKeySet.insert(options.preferredSelectionKeys.begin(),
-                             options.preferredSelectionKeys.end());
+    if (retainedCapacity < preferredSelectionKeys.size())
+      s_preferredKeySet.reserve(preferredSelectionKeys.size());
+    s_preferredKeySet.insert(preferredSelectionKeys.begin(),
+                             preferredSelectionKeys.end());
   }
   const auto& preferredKeySet = s_preferredKeySet;
   const auto containsPreferredKey = [&](uint64_t key) {
     return preferredKeysSorted
-        ? std::binary_search(options.preferredSelectionKeys.begin(),
-                             options.preferredSelectionKeys.end(), key)
+        ? std::binary_search(preferredSelectionKeys.begin(),
+                             preferredSelectionKeys.end(), key)
         : preferredKeySet.find(key) != preferredKeySet.end();
   };
-  const bool hasPreferredKeys = !options.preferredSelectionKeys.empty();
+  const bool hasPreferredKeys = !preferredSelectionKeys.empty();
 
   enterSnapshotPhase("SnapshotScratchSetup");
   // Phase 7.81：thread_local 复用 preferredVisibleKeyCache。

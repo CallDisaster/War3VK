@@ -330,6 +330,11 @@ struct CurrentDrawContractSnapshotOptions {
   bool unitsOnly = false;
   bool pruneOlderThanMinVisibleFrame = true;
   std::vector<uint64_t> preferredSelectionKeys;
+  // Synchronous hot-path callers may borrow an already sorted key vector to
+  // avoid cloning it into preferredSelectionKeys. The pointed-to vector must
+  // remain alive and immutable for the complete snapshot call. Owned keys
+  // remain the compatibility/default source when this is null.
+  const std::vector<uint64_t>* preferredSelectionKeysView = nullptr;
 };
 
 struct CurrentDrawRetireResult {

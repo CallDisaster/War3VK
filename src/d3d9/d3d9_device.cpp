@@ -25546,7 +25546,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       m_war3SemanticDirectPrevSubmittedObjectIdentityKeys;
   const std::vector<uint64_t>& previousSubmittedPartIdentityKeys =
       m_war3SemanticDirectPrevSubmittedPartIdentityKeys;
-  std::vector<uint64_t> leasedSelectionKeys;
+  static thread_local std::vector<uint64_t> s_leasedSelectionKeys;
+  static thread_local std::vector<uint64_t> s_preferredSelectionKeys;
+  auto& leasedSelectionKeys = s_leasedSelectionKeys;
+  auto& preferredSelectionKeys = s_preferredSelectionKeys;
+  leasedSelectionKeys.clear();
+  preferredSelectionKeys.assign(previousSubmittedSelectionKeys.begin(),
+                                previousSubmittedSelectionKeys.end());
   if (stickySelectionLease) {
     const uint64_t currentFrame = m_war3ShadowPersistentFrameSerial;
     const uint64_t leaseFrames = War3SemanticStickySelectionLeaseFramesRuntime();
@@ -25564,8 +25570,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       }
     }
   }
-  std::vector<uint64_t> preferredSelectionKeys =
-      previousSubmittedSelectionKeys;
   if (stickySelectionLease &&
       (preferredSelectionKeys.empty() ||
        War3SemanticStickySelectionBroadLeasePreferenceRuntime())) {
@@ -25599,7 +25603,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   snapshotOptions.readyOnly = readyOnly;
   snapshotOptions.maxRecords = useObjectFirstSnapshot ? 0u : directScanCap;
   snapshotOptions.unitsOnly = unitsOnly;
-  snapshotOptions.preferredSelectionKeys = preferredSelectionKeys;
+  snapshotOptions.preferredSelectionKeysView = &preferredSelectionKeys;
   // Contract records are non-owning scalar values. Reuse only the vector
   // allocation on this render thread; the snapshot routine clears every
   // logical element and rebuilds all visibility/generation evidence before
