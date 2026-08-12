@@ -26399,11 +26399,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     return true;
   };
   // Both lists are bounded by the direct-record budget and are consumed
-  // entirely inside this render-thread call. Reuse their backing storage so
-  // every frame does not allocate/free hundreds of packet objects (including
-  // palette and blend vectors). clear() still destroys all prior-frame packet
-  // ownership; this is capacity reuse, not cross-frame geometry reuse.
-  static thread_local std::vector<EligibleRecord>
+  // entirely inside this render-thread call. Successful lease candidates only
+  // need an address into eligibleRecords until SubmitLeaseUpdate below. Both
+  // submission layouts finish every resize/move before an address is recorded,
+  // and do not mutate eligibleRecords afterwards. Keep non-owning pointers here
+  // so packet/palette vectors are copied exactly once, into the persistent
+  // lease, instead of once into an intermediate list and again into the lease.
+  // This is strictly an intra-call handoff and grants no cross-frame lifetime.
+  static thread_local std::vector<const EligibleRecord*>
       s_submittedPartPacketLeaseRecords;
   static thread_local std::vector<EligibleRecord> s_eligibleRecords;
   static thread_local std::vector<
@@ -27801,8 +27804,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         packetSafeForDirectPartLease(eligible, true)) {
       if (nestedTiming != nullptr)
         nestedTiming->enter(War3SubmitAppendNestedPhase::BookLeaseCopy);
-      submittedPartPacketLeaseRecords.push_back(eligible);
-      War3RebindEligibleRecordPacket(submittedPartPacketLeaseRecords.back());
+      submittedPartPacketLeaseRecords.push_back(&eligible);
       if (!eligible.fromPartPacketLease && eligible.selectionKey != 0u &&
           eligible.manifestPartLeaseKey != 0u) {
         if (nestedTiming != nullptr)
@@ -29821,7 +29823,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
   enterDirectDetailPhase("SubmitLeaseUpdate");
   if (useDirectPartPacketLease) {
-    for (const auto& eligible : submittedPartPacketLeaseRecords) {
+    for (const EligibleRecord* eligiblePtr :
+         submittedPartPacketLeaseRecords) {
+      if (eligiblePtr == nullptr)
+        continue;
+      const EligibleRecord& eligible = *eligiblePtr;
       if (eligible.manifestPartLeaseKey == 0u ||
           eligible.sample.contract.fromGrace)
         continue;
