@@ -3278,14 +3278,20 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
   summary.poseFreshGenerationVerifierMismatchCount =
       m_shadowManifestSummary.poseFreshGenerationVerifierMismatchCount;
 
-  std::unordered_map<uint64_t, uint64_t> firstSliceByPartAnchor;
-  std::unordered_set<uint64_t> multiSlicePartAnchors;
+  // Multi-slice membership is diagnostic-only, but the old pair of local
+  // unordered containers allocated buckets and nodes on every manifest
+  // refresh. Keep a render-thread scratch of exact anchor/slice pairs instead:
+  // sorting and scanning the scalar values preserves the count while making
+  // steady-state refresh allocation-free.
+  static thread_local std::vector<std::pair<uint64_t, uint64_t>>
+      s_sliceKeysByPartAnchor;
+  auto& sliceKeysByPartAnchor = s_sliceKeysByPartAnchor;
+  sliceKeysByPartAnchor.clear();
   bool hasPoseFreshObject = false;
   const Snapshot& visibleSnapshot = snapshotForThread();
   (void)visibleSnapshot;  // 保留 snapshotForThread() 调用以维持内部快照确认
   const size_t recordCount = firstRecords.size() + secondRecords.size();
-  firstSliceByPartAnchor.reserve(recordCount);
-  multiSlicePartAnchors.reserve(recordCount / 2u + 1u);
+  sliceKeysByPartAnchor.reserve(recordCount);
   const auto forEachRecord = [&](const auto& callback) {
     for (const auto& record : firstRecords)
       callback(record);
@@ -3450,12 +3456,26 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
         ShadowManifestPartAnchorKey(record, objectKey);
     if (partAnchorKey != 0u) {
       const uint64_t sliceKey = ShadowManifestSliceKey(record);
-      const auto inserted =
-          firstSliceByPartAnchor.emplace(partAnchorKey, sliceKey);
-      if (!inserted.second && inserted.first->second != sliceKey)
-        multiSlicePartAnchors.insert(partAnchorKey);
+      sliceKeysByPartAnchor.emplace_back(partAnchorKey, sliceKey);
     }
   });
+
+  std::sort(sliceKeysByPartAnchor.begin(), sliceKeysByPartAnchor.end());
+  uint64_t multiSlicePartCount = 0u;
+  for (size_t begin = 0u; begin < sliceKeysByPartAnchor.size();) {
+    size_t end = begin + 1u;
+    bool hasDifferentSlice = false;
+    while (end < sliceKeysByPartAnchor.size() &&
+           sliceKeysByPartAnchor[end].first ==
+               sliceKeysByPartAnchor[begin].first) {
+      hasDifferentSlice = hasDifferentSlice ||
+          sliceKeysByPartAnchor[end].second !=
+              sliceKeysByPartAnchor[begin].second;
+      ++end;
+    }
+    multiSlicePartCount += hasDifferentSlice ? 1u : 0u;
+    begin = end;
+  }
 
   for (auto it = m_shadowManifestObjects.begin();
        it != m_shadowManifestObjects.end();) {
@@ -3558,7 +3578,7 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     }
   }
 
-  summary.multiSlicePartCount = multiSlicePartAnchors.size();
+  summary.multiSlicePartCount = multiSlicePartCount;
   summary.visibleLookupPartLayerHitCount =
       m_shadowManifestVisibleLookupPartLayerHitCount.load(
           std::memory_order_relaxed);

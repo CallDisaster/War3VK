@@ -47,7 +47,13 @@ class ShadowManifestScatterGatherStaticTests(unittest.TestCase):
         second = body.index("for (const auto& record : secondRecords)")
         self.assertLess(first, second)
         self.assertIn("forEachRecord([&](const CurrentDrawContractRecord& record)", body)
-        self.assertIn("firstSliceByPartAnchor.reserve(recordCount)", body)
+        self.assertIn("static thread_local std::vector<std::pair<uint64_t, uint64_t>>", body)
+        self.assertIn("sliceKeysByPartAnchor.clear()", body)
+        self.assertIn("sliceKeysByPartAnchor.reserve(recordCount)", body)
+        self.assertIn("std::sort(sliceKeysByPartAnchor.begin()", body)
+        self.assertIn("summary.multiSlicePartCount = multiSlicePartCount", body)
+        self.assertNotIn("std::unordered_map<uint64_t, uint64_t> firstSliceByPartAnchor", body)
+        self.assertNotIn("std::unordered_set<uint64_t> multiSlicePartAnchors", body)
         self.assertIn("poseFreshVerifierObjects->reserve(recordCount)", body)
 
     def test_hot_path_does_not_copy_exact_records_into_direct_scratch(self) -> None:
