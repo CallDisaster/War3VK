@@ -4070,11 +4070,15 @@ static thread_local War3CaptureCpuTlsAccum g_war3CaptureCpuTls;
 static thread_local uint32_t g_war3ShadowMetadataTimingOrdinal = 0u;
 
 struct War3CaptureCpuSample {
-  int64_t start = dxvk::high_resolution_clock::get_counter();
+  explicit War3CaptureCpuSample(bool active = true)
+      : start(active ? dxvk::high_resolution_clock::get_counter() : 0) {
+  }
+
+  int64_t start = 0;
   uint64_t* bucketTicks = nullptr;
   uint32_t* bucketCalls = nullptr;
   void stop() {
-    if (bucketTicks == nullptr || bucketCalls == nullptr)
+    if (start == 0 || bucketTicks == nullptr || bucketCalls == nullptr)
       return;
     const int64_t end = dxvk::high_resolution_clock::get_counter();
     if (end > start)
@@ -41661,17 +41665,27 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   war3::hooks::War3HotHookCallTiming shadowCallbackTiming(
       war3::hooks::War3HotHookId::ShadowCaptureCallback, 4u);
 
+  // The exact per-draw QPC tree is report instrumentation, not part of the
+  // shadow producer contract. Keep it available while Ctrl+F1 recording is
+  // active, but do not charge every ordinary gameplay draw for two clock
+  // reads when no report can consume the sample.
+  const auto& shadowPerfMonitor = war3::War3PerfMonitor::instance();
+  const bool trackShadowCaptureCpu =
+      shadowPerfMonitor.isEnabled() && shadowPerfMonitor.isRecording();
+
   // Gates 分段：从入口到 legacy 采样点（早退 draw 也计入 Gates）。
-  War3CaptureCpuSample shadowCaptureGatesSample;
-  shadowCaptureGatesSample.bucketTicks =
-      &g_war3CaptureCpuTls.shadowCaptureGatesTicks;
-  shadowCaptureGatesSample.bucketCalls =
-      &g_war3CaptureCpuTls.shadowCaptureGatesCalls;
+  War3CaptureCpuSample shadowCaptureGatesSample(trackShadowCaptureCpu);
+  if (trackShadowCaptureCpu) {
+    shadowCaptureGatesSample.bucketTicks =
+        &g_war3CaptureCpuTls.shadowCaptureGatesTicks;
+    shadowCaptureGatesSample.bucketCalls =
+        &g_war3CaptureCpuTls.shadowCaptureGatesCalls;
+  }
 
   const bool traceShadowCaptureGates =
-      War3ShadowCaptureGateBreakdownRuntime();
+      trackShadowCaptureCpu && War3ShadowCaptureGateBreakdownRuntime();
   const bool traceShadowDrawTimeCapture =
-      War3ShadowDrawTimeCaptureBreakdownRuntime();
+      trackShadowCaptureCpu && War3ShadowDrawTimeCaptureBreakdownRuntime();
   const bool traceAnyShadowCaptureGateChild =
       traceShadowCaptureGates || traceShadowDrawTimeCapture;
   const uint32_t shadowCaptureGateTracePeriod =
@@ -42407,9 +42421,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       // Gates 分解在此暂停；该区间由精确 DrawTimeCapture 子节点独占，
       // 防止同一段时间同时落入 SemanticContext 与 DrawTimeCapture。
       shadowCaptureGateTiming.pause();
-      War3CaptureCpuSample captureSample;
-      captureSample.bucketTicks = &g_war3CaptureCpuTls.drawTimeCaptureTicks;
-      captureSample.bucketCalls = &g_war3CaptureCpuTls.drawTimeCaptureCalls;
+      War3CaptureCpuSample captureSample(trackShadowCaptureCpu);
+      if (trackShadowCaptureCpu) {
+        captureSample.bucketTicks =
+            &g_war3CaptureCpuTls.drawTimeCaptureTicks;
+        captureSample.bucketCalls =
+            &g_war3CaptureCpuTls.drawTimeCaptureCalls;
+      }
       War3ShadowDrawTimeCaptureRawTiming drawTimeCaptureTiming(
           traceShadowDrawTimeCapture && traceThisShadowCaptureChild,
           shadowCaptureGateTracePeriod,
@@ -45201,11 +45219,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   // 2026-07-09：legacy ShadowCapture（含 S1 地形）用 TLS 累加归属，避免每 tile 开 scope。
   shadowCaptureGateTiming.pause();
   shadowCaptureGatesSample.stop();
-  War3CaptureCpuSample shadowCaptureSample;
-  shadowCaptureSample.bucketTicks = &g_war3CaptureCpuTls.shadowCaptureTicks;
-  shadowCaptureSample.bucketCalls = &g_war3CaptureCpuTls.shadowCaptureCalls;
+  War3CaptureCpuSample shadowCaptureSample(trackShadowCaptureCpu);
+  if (trackShadowCaptureCpu) {
+    shadowCaptureSample.bucketTicks = &g_war3CaptureCpuTls.shadowCaptureTicks;
+    shadowCaptureSample.bucketCalls = &g_war3CaptureCpuTls.shadowCaptureCalls;
+  }
   const bool traceShadowCapturePost =
-      War3ShadowCapturePostBreakdownRuntime();
+      trackShadowCaptureCpu && War3ShadowCapturePostBreakdownRuntime();
   const uint32_t shadowCapturePostTracePeriod = traceShadowCapturePost
       ? War3ShadowCapturePostTracePeriod() : 1u;
   const bool traceThisShadowCapturePost =
@@ -45250,11 +45270,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       m_state.renderStates[D3DRS_ALPHABLENDENABLE] == FALSE &&
       War3S1TerrainPersistentGeometryRuntime() &&
       captureSettings.shadows.enabled) {
-    War3CaptureCpuSample s1EarlySample;
-    s1EarlySample.bucketTicks =
-        &g_war3CaptureCpuTls.shadowCaptureS1EarlyTicks;
-    s1EarlySample.bucketCalls =
-        &g_war3CaptureCpuTls.shadowCaptureS1EarlyCalls;
+    War3CaptureCpuSample s1EarlySample(trackShadowCaptureCpu);
+    if (trackShadowCaptureCpu) {
+      s1EarlySample.bucketTicks =
+          &g_war3CaptureCpuTls.shadowCaptureS1EarlyTicks;
+      s1EarlySample.bucketCalls =
+          &g_war3CaptureCpuTls.shadowCaptureS1EarlyCalls;
+    }
     Matrix4 s1World = m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
     if (War3S1ForceIdentityWorldRuntime()) {
       s1World = Matrix4();
@@ -46337,11 +46359,13 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
 
   auto finalizeShadowDrawCommon = [&](War3ShadowCasterDraw &draw) -> bool {
     shadowCapturePostTiming.enter(War3ShadowCapturePostPhase::Finalize);
-    War3CaptureCpuSample finalizeSample;
-    finalizeSample.bucketTicks =
-        &g_war3CaptureCpuTls.shadowCaptureFinalizeTicks;
-    finalizeSample.bucketCalls =
-        &g_war3CaptureCpuTls.shadowCaptureFinalizeCalls;
+    War3CaptureCpuSample finalizeSample(trackShadowCaptureCpu);
+    if (trackShadowCaptureCpu) {
+      finalizeSample.bucketTicks =
+          &g_war3CaptureCpuTls.shadowCaptureFinalizeTicks;
+      finalizeSample.bucketCalls =
+          &g_war3CaptureCpuTls.shadowCaptureFinalizeCalls;
+    }
     draw.category = cat;
     draw.batchTag = (execTag != War3BatchTag::Unknown) ? execTag : tag;
     draw.stage = static_cast<int16_t>(stage);
