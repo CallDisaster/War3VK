@@ -14,6 +14,7 @@
 #include "../core/war3_memory.h"
 #include "../../d3d9_war3_debug.h"
 #include "../../util/util_env.h"
+#include "../../../util/util_small_vector.h"
 
 #include <algorithm>
 #include <array>
@@ -1625,6 +1626,9 @@ struct DynamicAuxStreamCandidate {
   int auxEntryIndex = -1;
 };
 
+using DynamicAuxStreamCandidates =
+    small_vector<DynamicAuxStreamCandidate, 16u>;
+
 template <size_t N>
 std::array<uint32_t, 10> MakeDynamicAuxStrideHints(
     const std::array<uint32_t, N>& seeds) {
@@ -1652,7 +1656,7 @@ std::array<uint32_t, 10> MakeDynamicAuxStrideHints(
   return hints;
 }
 
-void AppendDynamicAuxCandidate(std::vector<DynamicAuxStreamCandidate>& candidates,
+void AppendDynamicAuxCandidate(DynamicAuxStreamCandidates& candidates,
                                const void* ptr,
                                const std::array<uint32_t, 10>& strides,
                                bool usesPrimaryStream,
@@ -1739,11 +1743,10 @@ bool TryReadAuxStreamSample(uintptr_t rawPtr, uint32_t sampleIndex,
   return true;
 }
 
-std::vector<DynamicAuxStreamCandidate> CollectDynamicAuxStreamCandidates(
+DynamicAuxStreamCandidates CollectDynamicAuxStreamCandidates(
     const ShadowRenderableRecord& renderable,
     const MeshLayerBindingContract* layerContract) {
-  std::vector<DynamicAuxStreamCandidate> candidates;
-  candidates.reserve(12u);
+  DynamicAuxStreamCandidates candidates;
 
   if (renderable.meshData == nullptr ||
       ShouldSkipLegacyMeshDataDecode(renderable))
@@ -4839,6 +4842,10 @@ struct PendingCompactRemapNode {
   uint32_t depth = 0u;
 };
 
+using CompactRemapSpanTables = small_vector<CompactRemapSpanTable, 32u>;
+using PendingCompactRemapNodes = small_vector<PendingCompactRemapNode, 32u>;
+using StagePresetBaseBiasCandidates = small_vector<uint32_t, 4u>;
+
 constexpr uint32_t kMaxCompactRemapDepth = 4u;
 constexpr uint32_t kMaxCompactRemapCandidates = 32u;
 constexpr uint32_t kMaxCompactRemapInlineScan = 0x60u;
@@ -4891,10 +4898,10 @@ int ScoreCompactRemapTableForExplicitBlend(
   return score;
 }
 
-std::vector<CompactRemapSpanTable> MakePrioritizedCompactRemapTables(
-    const std::vector<CompactRemapSpanTable>& remapTables,
+CompactRemapSpanTables MakePrioritizedCompactRemapTables(
+    const CompactRemapSpanTables& remapTables,
     const MeshLayerBindingContract* layerContract) {
-  std::vector<CompactRemapSpanTable> prioritized = remapTables;
+  CompactRemapSpanTables prioritized = remapTables;
   std::stable_sort(
       prioritized.begin(), prioritized.end(),
       [&](const CompactRemapSpanTable& a, const CompactRemapSpanTable& b) {
@@ -4904,9 +4911,9 @@ std::vector<CompactRemapSpanTable> MakePrioritizedCompactRemapTables(
   return prioritized;
 }
 
-std::vector<uint32_t> CollectStagePresetBaseBiasCandidates(
+StagePresetBaseBiasCandidates CollectStagePresetBaseBiasCandidates(
     const MeshLayerBindingContract* layerContract, uint32_t posePaletteLimit) {
-  std::vector<uint32_t> out;
+  StagePresetBaseBiasCandidates out;
   if (layerContract == nullptr || posePaletteLimit == 0u)
     return out;
 
@@ -4951,12 +4958,10 @@ void SortCompactSlots(std::array<uint8_t, 4>& slots, uint32_t count) {
   }
 }
 
-std::vector<CompactRemapSpanTable> CollectCompactRemapSpanTables(
+CompactRemapSpanTables CollectCompactRemapSpanTables(
     const MeshLayerBindingContract* layerContract) {
-  std::vector<CompactRemapSpanTable> out;
-  out.reserve(16u);
-  std::vector<PendingCompactRemapNode> pending;
-  pending.reserve(24u);
+  CompactRemapSpanTables out;
+  PendingCompactRemapNodes pending;
 
   auto appendUnique = [&](const CompactRemapSpanTable& candidate) {
     if (candidate.table == nullptr || candidate.span < 2u)
@@ -5427,7 +5432,7 @@ bool TryBuildOrderedTupleSlotsWithSpanRemapWindowAndBaseBias(
 }
 
 bool TryBuildPackedTupleKeyWithAnySpanRemap(
-    const uint8_t raw[4], const std::vector<CompactRemapSpanTable>& remapTables,
+    const uint8_t raw[4], const CompactRemapSpanTables& remapTables,
     uint32_t posePaletteLimit, uint32_t maxExpectedGroupSize,
     std::array<uint8_t, 4>& outSlots, uint32_t& outCount) {
   for (const auto& remap : remapTables) {
@@ -5441,7 +5446,7 @@ bool TryBuildPackedTupleKeyWithAnySpanRemap(
 }
 
 bool TryBuildPackedTupleKeyWithAnySpanRemapAndBaseBias(
-    const uint8_t raw[4], const std::vector<CompactRemapSpanTable>& remapTables,
+    const uint8_t raw[4], const CompactRemapSpanTables& remapTables,
     uint32_t baseBias, uint32_t posePaletteLimit,
     uint32_t maxExpectedGroupSize, std::array<uint8_t, 4>& outSlots,
     uint32_t& outCount) {
@@ -5458,7 +5463,7 @@ bool TryBuildPackedTupleKeyWithAnySpanRemapAndBaseBias(
 }
 
 bool TryBuildOrderedTupleSlotsWithAnySpanRemap(
-    const uint8_t raw[4], const std::vector<CompactRemapSpanTable>& remapTables,
+    const uint8_t raw[4], const CompactRemapSpanTables& remapTables,
     uint32_t posePaletteLimit, uint32_t maxExpectedGroupSize,
     std::array<uint8_t, 4>& outSlots, uint32_t& outCount) {
   for (const auto& remap : remapTables) {
@@ -5472,7 +5477,7 @@ bool TryBuildOrderedTupleSlotsWithAnySpanRemap(
 }
 
 bool TryBuildOrderedTupleSlotsWithAnySpanRemapAndBaseBias(
-    const uint8_t raw[4], const std::vector<CompactRemapSpanTable>& remapTables,
+    const uint8_t raw[4], const CompactRemapSpanTables& remapTables,
     uint32_t baseBias, uint32_t posePaletteLimit,
     uint32_t maxExpectedGroupSize, std::array<uint8_t, 4>& outSlots,
     uint32_t& outCount) {
@@ -5730,7 +5735,7 @@ bool TryResolveMeshDynamicPackedRuntimeGroups(
   const auto remapTables = MakePrioritizedCompactRemapTables(
       CollectCompactRemapSpanTables(layerContract), layerContract);
   const bool hasRemapTable = !remapTables.empty();
-  std::vector<uint32_t> stagePresetBaseBiases = {0u};
+  StagePresetBaseBiasCandidates stagePresetBaseBiases = {0u};
   for (uint32_t baseBias :
        CollectStagePresetBaseBiasCandidates(layerContract, posePaletteLimit)) {
     stagePresetBaseBiases.push_back(baseBias);
@@ -5968,7 +5973,7 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
   const bool hasRemapTable = !remapTables.empty();
   if (hasRemapTable && ioStats != nullptr)
     ioStats->explicitBlendAttemptWithSpanRemapTable++;
-  std::vector<uint32_t> stagePresetBaseBiases = {0u};
+  StagePresetBaseBiasCandidates stagePresetBaseBiases = {0u};
   for (uint32_t baseBias :
        CollectStagePresetBaseBiasCandidates(layerContract, posePaletteLimit)) {
     stagePresetBaseBiases.push_back(baseBias);
