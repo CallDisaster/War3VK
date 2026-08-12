@@ -202,6 +202,18 @@ struct ShadowModelResourceRecord {
   bool readyForShadowConsumer() const { return readyGeosetCount != 0; }
 };
 
+// Hot-path owner lookups need identity, not the model's geoset pointer arrays.
+// Keep this projection trivially copyable so DirectGrouped and manifest
+// hydration can resolve an owner without cloning the full model record.
+struct ShadowRuntimeModelOwnerBinding {
+  void* runtimeModelPtr = nullptr;
+  void* modelResourcePtr = nullptr;
+  uint64_t modelKey = 0u;
+  uint32_t geosetCount = 0u;
+};
+
+static_assert(std::is_trivially_copyable_v<ShadowRuntimeModelOwnerBinding>);
+
 // ResourceStore alias binding only consumes these three scalar fields.  A
 // dedicated snapshot prevents that hot path from cloning the full model
 // record and its geoset pointer vectors merely to enumerate alias slots.
@@ -287,6 +299,13 @@ public:
   bool findRuntimeModelOwnerIndexed(void* runtimeGeosetPtr,
                                     void* runtimeGeosetDataPtr,
                                     ShadowModelResourceRecord& out) const;
+  bool findRuntimeModelOwnerBinding(
+      void* runtimeGeosetPtr, void* runtimeGeosetDataPtr,
+      uint32_t geosetIndex, void* modelResourcePtr,
+      ShadowRuntimeModelOwnerBinding& out) const;
+  bool findRuntimeModelOwnerBindingIndexed(
+      void* runtimeGeosetPtr, void* runtimeGeosetDataPtr,
+      ShadowRuntimeModelOwnerBinding& out) const;
   bool findModelResource(void *modelResourcePtr,
                          ShadowModelResourceRecord &out) const;
   bool findRuntimeModelResource(void *runtimeModelPtr,

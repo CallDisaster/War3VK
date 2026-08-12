@@ -6294,31 +6294,28 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     packetBuildTiming->enter(War3PacketBuildPhase::OwnerInstanceLookup);
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enterNested(War3PacketBuildNestedPhase::OwnerLookup);
-  dxvk::war3::model::ShadowModelResourceRecord ownerRecord = {};
+  dxvk::war3::model::ShadowRuntimeModelOwnerBinding ownerBinding = {};
   bool ownerHit = false;
   {
     auto ownerLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerLookup");
     if (geosetHit) {
-      ownerHit = resourceCache.findRuntimeModelOwnerIndexed(
-          geoset->geosetPtr, geoset->geosetDataPtr, ownerRecord);
+      ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
+          geoset->geosetPtr, geoset->geosetDataPtr, ownerBinding);
       if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
-        ownerHit =
-            resourceCache.findRuntimeModelOwner(geoset->geosetPtr,
-                                                geoset->geosetDataPtr,
-                                                geoset->geosetIndex,
-                                                geoset->modelResourcePtr,
-                                                ownerRecord);
+        ownerHit = resourceCache.findRuntimeModelOwnerBinding(
+            geoset->geosetPtr, geoset->geosetDataPtr, geoset->geosetIndex,
+            geoset->modelResourcePtr, ownerBinding);
       }
     }
     if (!ownerHit) {
-      ownerHit = resourceCache.findRuntimeModelOwnerIndexed(
-          nullptr, record.meshPayloadPtr, ownerRecord);
+      ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
+          nullptr, record.meshPayloadPtr, ownerBinding);
       if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
-        ownerHit = resourceCache.findRuntimeModelOwner(
+        ownerHit = resourceCache.findRuntimeModelOwnerBinding(
             nullptr, record.meshPayloadPtr,
             dxvk::war3::model::kInvalidShadowGeosetIndex, nullptr,
-            ownerRecord);
+            ownerBinding);
       }
     }
   }
@@ -6336,8 +6333,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       instanceHit = instanceRegistry.findByUnitPtr(record.unitPtr, instanceRecord);
     if (!instanceHit && record.worldObjectEntry != nullptr)
       instanceHit = instanceRegistry.findByWorldObjectEntry(record.worldObjectEntry, instanceRecord);
-    if (!instanceHit && ownerHit && ownerRecord.runtimeModelPtr != nullptr)
-      instanceHit = instanceRegistry.findByRuntimeModel(ownerRecord.runtimeModelPtr,
+    if (!instanceHit && ownerHit && ownerBinding.runtimeModelPtr != nullptr)
+      instanceHit = instanceRegistry.findByRuntimeModel(ownerBinding.runtimeModelPtr,
                                                         instanceRecord);
   }
 
@@ -6362,15 +6359,19 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (!geosetHit) {
     auto ownerScanFallbackScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerGeosetScan");
-    if (ownerHit && ownerRecord.runtimeModelPtr != nullptr) {
-      for (uint32_t i = 0u; i < ownerRecord.geosetCount; ++i) {
-        if (i < ownerRecord.geosetDataPtrs.size() &&
-            ownerRecord.geosetDataPtrs[i] == record.meshPayloadPtr &&
-            resourceCache.findRuntimeModelGeoset(ownerRecord.runtimeModelPtr, i,
-                                                 geosetLocal)) {
-          geosetHit = true;
-          geoset = &geosetLocal;
-          break;
+    if (ownerHit && ownerBinding.runtimeModelPtr != nullptr) {
+      dxvk::war3::model::ShadowModelResourceRecord ownerRecord = {};
+      if (resourceCache.findRuntimeModelResource(ownerBinding.runtimeModelPtr,
+                                                 ownerRecord)) {
+        for (uint32_t i = 0u; i < ownerRecord.geosetCount; ++i) {
+          if (i < ownerRecord.geosetDataPtrs.size() &&
+              ownerRecord.geosetDataPtrs[i] == record.meshPayloadPtr &&
+              resourceCache.findRuntimeModelGeoset(ownerBinding.runtimeModelPtr,
+                                                   i, geosetLocal)) {
+            geosetHit = true;
+            geoset = &geosetLocal;
+            break;
+          }
         }
       }
     }
@@ -6414,21 +6415,18 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (!ownerHit) {
     auto ownerPostLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerPostLookup");
-    ownerHit = resourceCache.findRuntimeModelOwnerIndexed(
-        geoset->geosetPtr, geoset->geosetDataPtr, ownerRecord);
+    ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
+        geoset->geosetPtr, geoset->geosetDataPtr, ownerBinding);
     if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
-      ownerHit =
-          resourceCache.findRuntimeModelOwner(geoset->geosetPtr,
-                                              geoset->geosetDataPtr,
-                                              geoset->geosetIndex,
-                                              geoset->modelResourcePtr,
-                                              ownerRecord);
+      ownerHit = resourceCache.findRuntimeModelOwnerBinding(
+          geoset->geosetPtr, geoset->geosetDataPtr, geoset->geosetIndex,
+          geoset->modelResourcePtr, ownerBinding);
     }
   }
-  if (!instanceHit && ownerHit && ownerRecord.runtimeModelPtr != nullptr) {
+  if (!instanceHit && ownerHit && ownerBinding.runtimeModelPtr != nullptr) {
     auto instancePostLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/InstancePostLookup");
-    instanceHit = instanceRegistry.findByRuntimeModel(ownerRecord.runtimeModelPtr,
+    instanceHit = instanceRegistry.findByRuntimeModel(ownerBinding.runtimeModelPtr,
                                                       instanceRecord);
   }
 
@@ -6466,9 +6464,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       shadowHit = shadowRegistry.findBySceneNode(record.sceneNode, shadowRecord);
     if (!shadowHit && record.jHandle != 0u)
       shadowHit = shadowRegistry.findByHandle(record.jHandle, shadowRecord);
-    if (!shadowHit && ownerHit && ownerRecord.runtimeModelPtr != nullptr)
+    if (!shadowHit && ownerHit && ownerBinding.runtimeModelPtr != nullptr)
       shadowHit =
-          shadowRegistry.findByRuntimeModel(ownerRecord.runtimeModelPtr, shadowRecord);
+          shadowRegistry.findByRuntimeModel(ownerBinding.runtimeModelPtr, shadowRecord);
     if (!shadowHit && instanceHit && instanceRecord.runtimeModelPtr != nullptr)
       shadowHit = shadowRegistry.findByRuntimeModel(instanceRecord.runtimeModelPtr,
                                                     shadowRecord);
@@ -6502,8 +6500,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   const void* effectiveRuntimeModelPtr =
       instanceHit && instanceRecord.runtimeModelPtr != nullptr
           ? instanceRecord.runtimeModelPtr
-          : ownerHit && ownerRecord.runtimeModelPtr != nullptr
-                ? ownerRecord.runtimeModelPtr
+          : ownerHit && ownerBinding.runtimeModelPtr != nullptr
+                ? ownerBinding.runtimeModelPtr
                 : shadowHit && shadowRecord.runtimeModelPtr != nullptr
                       ? shadowRecord.runtimeModelPtr
                       : nullptr;
@@ -6578,7 +6576,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             ? geoset->modelResourcePtr
             : instanceHit && instanceRecord.modelResourcePtr != nullptr
                   ? instanceRecord.modelResourcePtr
-                  : ownerHit ? ownerRecord.modelResourcePtr
+                  : ownerHit ? ownerBinding.modelResourcePtr
                              : shadowHit ? shadowRecord.modelResourcePtr
                                          : nullptr;
     renderable.runtimeGeosetPtr = geoset->geosetPtr;
@@ -6588,8 +6586,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             ? geoset->modelKey
             : instanceHit && instanceRecord.modelKey != 0u
                   ? instanceRecord.modelKey
-                  : ownerHit && ownerRecord.modelKey != 0u
-                        ? ownerRecord.modelKey
+                  : ownerHit && ownerBinding.modelKey != 0u
+                        ? ownerBinding.modelKey
                         : shadowHit ? shadowRecord.modelKey : 0u;
     renderable.flags = 0u;
     renderable.jHandle =

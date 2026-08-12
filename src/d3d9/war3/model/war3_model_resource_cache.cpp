@@ -2156,6 +2156,101 @@ bool ShadowModelResourceCache::findRuntimeModelOwnerIndexed(
   return false;
 }
 
+bool ShadowModelResourceCache::findRuntimeModelOwnerBinding(
+    void* runtimeGeosetPtr, void* runtimeGeosetDataPtr, uint32_t geosetIndex,
+    void* modelResourcePtr, ShadowRuntimeModelOwnerBinding& out) const {
+  out = {};
+  if (runtimeGeosetPtr == nullptr && runtimeGeosetDataPtr == nullptr)
+    return false;
+
+  modelResourcePtr = TryResolveDirectModelResourcePtr(modelResourcePtr);
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto project = [&](const ShadowModelResourceRecord& record) {
+    out.runtimeModelPtr = record.runtimeModelPtr;
+    out.modelResourcePtr = record.modelResourcePtr;
+    out.modelKey = record.modelKey;
+    out.geosetCount = record.geosetCount;
+  };
+  const auto tryIndexedOwner = [&](
+      const std::unordered_map<void*, void*>& index, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto itOwner = index.find(key);
+    if (itOwner == index.end())
+      return false;
+    if (itOwner->second == nullptr)
+      return true;
+    const auto itRuntime = m_byRuntimeModel.find(itOwner->second);
+    if (itRuntime == m_byRuntimeModel.end())
+      return true;
+    project(itRuntime->second);
+    return true;
+  };
+
+  if (tryIndexedOwner(m_runtimeOwnerByGeoset, runtimeGeosetPtr))
+    return out.runtimeModelPtr != nullptr;
+  if (tryIndexedOwner(m_runtimeOwnerByGeosetData, runtimeGeosetDataPtr))
+    return out.runtimeModelPtr != nullptr;
+
+  const ShadowModelResourceRecord* best = nullptr;
+  int bestScore = -1;
+  bool ambiguous = false;
+  for (const auto& itRuntime : m_byRuntimeModel) {
+    const ShadowModelResourceRecord& runtimeRecord = itRuntime.second;
+    const int score = ScoreRuntimeOwnerCandidate(
+        runtimeRecord, runtimeGeosetPtr, runtimeGeosetDataPtr, geosetIndex,
+        modelResourcePtr);
+    if (score < 0)
+      continue;
+    if (score > bestScore) {
+      best = &runtimeRecord;
+      bestScore = score;
+      ambiguous = false;
+    } else if (score == bestScore && best != nullptr &&
+               best->runtimeModelPtr != runtimeRecord.runtimeModelPtr) {
+      ambiguous = true;
+    }
+  }
+
+  if (best == nullptr || ambiguous) {
+    out = {};
+    return false;
+  }
+  project(*best);
+  return out.runtimeModelPtr != nullptr;
+}
+
+bool ShadowModelResourceCache::findRuntimeModelOwnerBindingIndexed(
+    void* runtimeGeosetPtr, void* runtimeGeosetDataPtr,
+    ShadowRuntimeModelOwnerBinding& out) const {
+  out = {};
+  if (runtimeGeosetPtr == nullptr && runtimeGeosetDataPtr == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto tryIndexedOwner = [&](
+      const std::unordered_map<void*, void*>& index, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto itOwner = index.find(key);
+    if (itOwner == index.end() || itOwner->second == nullptr)
+      return false;
+    const auto itRuntime = m_byRuntimeModel.find(itOwner->second);
+    if (itRuntime == m_byRuntimeModel.end())
+      return false;
+    const ShadowModelResourceRecord& record = itRuntime->second;
+    out.runtimeModelPtr = record.runtimeModelPtr;
+    out.modelResourcePtr = record.modelResourcePtr;
+    out.modelKey = record.modelKey;
+    out.geosetCount = record.geosetCount;
+    return out.runtimeModelPtr != nullptr;
+  };
+
+  return tryIndexedOwner(m_runtimeOwnerByGeoset, runtimeGeosetPtr) ||
+      tryIndexedOwner(m_runtimeOwnerByGeosetData, runtimeGeosetDataPtr);
+}
+
 bool ShadowModelResourceCache::findModelResource(
     void *modelResourcePtr, ShadowModelResourceRecord &out) const {
   out = {};

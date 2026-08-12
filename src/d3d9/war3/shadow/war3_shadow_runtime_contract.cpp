@@ -827,10 +827,9 @@ void HydrateManifestRuntimeOwnersFromIndexedCache(
       continue;
     }
 
-    model::ShadowModelResourceRecord owner = {};
-    if (!resourceCache.findRuntimeModelOwnerIndexed(record.runtimeGeosetPtr,
-                                                    record.runtimeGeosetDataPtr,
-                                                    owner)) {
+    model::ShadowRuntimeModelOwnerBinding owner = {};
+    if (!resourceCache.findRuntimeModelOwnerBindingIndexed(
+            record.runtimeGeosetPtr, record.runtimeGeosetDataPtr, owner)) {
       continue;
     }
 
