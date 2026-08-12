@@ -28032,26 +28032,29 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
 
     enterBuildEligibleLeasePhase("LeaseCurrentKeys");
-    // Both containers below hold scalar identity keys only. Keep their bucket
-    // or contiguous storage on this render thread, but clear the logical set
-    // on every call so no previous-frame identity participates in selection.
-    static thread_local std::unordered_set<uint64_t> s_currentPartKeys;
+    // This set is built once, then queried once for every unique sorted lease
+    // key. Reuse contiguous storage and sort it once instead of allocating one
+    // unordered_set node per current part on every frame.
+    static thread_local std::vector<uint64_t> s_currentPartKeys;
     auto& currentPartKeys = s_currentPartKeys;
     currentPartKeys.clear();
     currentPartKeys.reserve(
-        (eligibleRecords.size() + exactSubmittedManifestRecords.size()) * 2u +
-        1u);
+        eligibleRecords.size() + exactSubmittedManifestRecords.size());
     for (const auto& eligible : eligibleRecords) {
       if (eligible.manifestPartLeaseKey != 0u)
-        currentPartKeys.insert(eligible.manifestPartLeaseKey);
+        currentPartKeys.push_back(eligible.manifestPartLeaseKey);
     }
     for (const auto& exactRecord : exactSubmittedManifestRecords) {
       const uint64_t partKey =
           dxvk::war3::render::VisibleRenderableRegistry::
               computeShadowManifestPartKey(exactRecord);
       if (partKey != 0u)
-        currentPartKeys.insert(partKey);
+        currentPartKeys.push_back(partKey);
     }
+    std::sort(currentPartKeys.begin(), currentPartKeys.end());
+    currentPartKeys.erase(
+        std::unique(currentPartKeys.begin(), currentPartKeys.end()),
+        currentPartKeys.end());
 
     enterBuildEligibleLeasePhase("LeaseKeySort");
     const size_t leaseBudget =
@@ -28227,7 +28230,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         break;
       }
       const uint64_t key = leaseKeys[leaseIndex];
-      if (currentPartKeys.find(key) != currentPartKeys.end())
+      if (std::binary_search(currentPartKeys.begin(), currentPartKeys.end(),
+                             key))
         continue;
       const auto leaseIt = directPartPacketLeases.find(key);
       if (leaseIt == directPartPacketLeases.end())
@@ -28254,7 +28258,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                 m_war3GpuSkinMapEpoch);
         if (War3DrawTimeAnonymousMarkerRejectionActive(
                 leasedPart, currentContract.meshPayloadPtr, leasedLayer)) {
-          currentPartKeys.insert(key);
           m_war3Scene.shadowStats
               .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
           continue;
@@ -28262,7 +28265,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         if (War3CurrentDrawContractNamesExactSlice(
                 leasedPart, leasedLayer, currentContract)) {
           if (War3DrawTimeExactRejectedCurrentFrame(currentKey)) {
-            currentPartKeys.insert(key);
             m_war3Scene.shadowStats
                 .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
             continue;
@@ -28274,7 +28276,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                   m_war3ShadowPersistentFrameSerial &&
               currentVbIt->second.exactOwnerFrameSerial ==
                   m_war3ShadowPersistentFrameSerial) {
-            currentPartKeys.insert(key);
             m_war3Scene.shadowStats
                 .drawTimeSemanticProducerOwnedDirectGroupedSkipCount++;
             continue;
@@ -28436,7 +28437,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeaseRestoredPoseStaleCoreCount++;
       }
-      currentPartKeys.insert(key);
     }
 
     if (traceBuildEligible) {
