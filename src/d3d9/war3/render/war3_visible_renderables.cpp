@@ -3216,6 +3216,14 @@ bool VisibleRenderableRegistry::queryByRuntimeModel(
 void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     const std::vector<CurrentDrawContractRecord>& records,
     uint64_t frameNumber) {
+  static const std::vector<CurrentDrawContractRecord> s_emptyRecords;
+  refreshShadowManifestFromCurrentDraw(records, s_emptyRecords, frameNumber);
+}
+
+void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
+    const std::vector<CurrentDrawContractRecord>& firstRecords,
+    const std::vector<CurrentDrawContractRecord>& secondRecords,
+    uint64_t frameNumber) {
   if (m_shadowManifestMapEpoch == 0u) {
     clearShadowManifest();
     return;
@@ -3233,8 +3241,15 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
   bool hasPoseFreshObject = false;
   const Snapshot& visibleSnapshot = snapshotForThread();
   (void)visibleSnapshot;  // 保留 snapshotForThread() 调用以维持内部快照确认
-  firstSliceByPartAnchor.reserve(records.size());
-  multiSlicePartAnchors.reserve(records.size() / 2u + 1u);
+  const size_t recordCount = firstRecords.size() + secondRecords.size();
+  firstSliceByPartAnchor.reserve(recordCount);
+  multiSlicePartAnchors.reserve(recordCount / 2u + 1u);
+  const auto forEachRecord = [&](const auto& callback) {
+    for (const auto& record : firstRecords)
+      callback(record);
+    for (const auto& record : secondRecords)
+      callback(record);
+  };
 
   // Generation 0 is reserved for "never marked".  A refresh receives a new
   // generation even when frameNumber is unchanged, so repeated same-frame
@@ -3255,14 +3270,14 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
   if (War3SemanticShadowManifestPoseGenerationVerifierEnabled()) {
     poseFreshVerifierObjects =
         std::make_unique<std::unordered_set<uint64_t>>();
-    poseFreshVerifierObjects->reserve(records.size());
-    for (const auto& record : records) {
+    poseFreshVerifierObjects->reserve(recordCount);
+    forEachRecord([&](const CurrentDrawContractRecord& record) {
       if (record.fromGrace)
-        continue;
+        return;
       const uint64_t objectKey = ShadowManifestObjectKey(record);
       if (objectKey != 0u)
         poseFreshVerifierObjects->insert(objectKey);
-    }
+    });
   }
 
   // Phase 7.26：runtimeModelPtr 只在 pose restore/pose 诊断开启时才会被后续
@@ -3279,14 +3294,14 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
     return ResolveRuntimeModelForCurrentDrawRecord(visibleSnapshot, record);
   };
 
-  for (const auto& record : records) {
+  forEachRecord([&](const CurrentDrawContractRecord& record) {
     // Grace can fill a one-frame producer hole, but it must never become a
     // fresh Manifest observation or extend structure/pose/slice lifetime.
     if (record.fromGrace)
-      continue;
+      return;
     const uint64_t objectKey = ShadowManifestObjectKey(record);
     if (objectKey == 0u)
-      continue;
+      return;
     hasPoseFreshObject = true;
 
     auto objectIt = m_shadowManifestObjects.find(objectKey);
@@ -3316,7 +3331,7 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
 
     const uint64_t partKey = ShadowManifestPartKey(record, objectKey);
     if (partKey == 0u)
-      continue;
+      return;
 
     auto partIt = m_shadowManifestParts.find(partKey);
     if (partIt == m_shadowManifestParts.end()) {
@@ -3398,7 +3413,7 @@ void VisibleRenderableRegistry::refreshShadowManifestFromCurrentDraw(
       if (!inserted.second && inserted.first->second != sliceKey)
         multiSlicePartAnchors.insert(partAnchorKey);
     }
-  }
+  });
 
   for (auto it = m_shadowManifestObjects.begin();
        it != m_shadowManifestObjects.end();) {

@@ -181,11 +181,10 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
         grouped_block = DEVICE[grouped:grouped_end]
         exact_records = grouped_block.index("exactSubmittedManifestRecords")
         manifest_publish = grouped_block.index(
-            "publishShadowManifestSummary(shadowEligibleManifestRecords)"
+            "publishShadowManifestSummary(exactSubmittedManifestRecords,"
         )
         self.assertLess(exact_records, manifest_publish)
         for contract in (
-            "shadowEligibleManifestRecords.insert(",
             "for (const auto& exactRecord : exactSubmittedManifestRecords)",
             "currentPartKeys.insert(partKey)",
             "eligibleRecordCount == 0u && exactSubmittedManifestRecords.empty()",
@@ -194,6 +193,14 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             "exactCorePartCount",
         ):
             self.assertIn(contract, grouped_block, contract)
+        self.assertIn(
+            "exactSubmittedManifestRecords,\n"
+            "                               shadowEligibleManifestRecords",
+            grouped_block,
+        )
+        self.assertNotIn(
+            "shadowEligibleManifestRecords.insert(", grouped_block
+        )
         for producer_contract in (
             "for (auto& [cacheKey, entry] : m_war3DrawTimeVBCache)",
             "entry.exactSubmittedFrameSerial",

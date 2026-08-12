@@ -195,6 +195,14 @@ public:
   void refreshShadowManifestFromCurrentDraw(
       const std::vector<CurrentDrawContractRecord>& records,
       uint64_t frameNumber);
+  // Hot-path scatter/gather form. The two immutable ranges are observed in
+  // first-then-second order, exactly as if the caller had concatenated them,
+  // without copying large CurrentDrawContractRecord values into a temporary
+  // vector. The single-range overload remains the compatibility entry point.
+  void refreshShadowManifestFromCurrentDraw(
+      const std::vector<CurrentDrawContractRecord>& firstRecords,
+      const std::vector<CurrentDrawContractRecord>& secondRecords,
+      uint64_t frameNumber);
   void resetShadowManifestMapEpoch(uint64_t mapEpoch);
   void noteShadowManifestPartGoodPacket(uint64_t partKey,
                                         uint64_t frameNumber);

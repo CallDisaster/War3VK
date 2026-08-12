@@ -26061,9 +26061,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                                       : visibleRegistry.getFrameNumber();
   auto publishShadowManifestSummary =
       [&](const std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
-              manifestRecords) {
-    visibleRegistry.refreshShadowManifestFromCurrentDraw(manifestRecords,
-                                                         manifestFrame);
+              firstManifestRecords,
+          const std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+              secondManifestRecords) {
+    visibleRegistry.refreshShadowManifestFromCurrentDraw(
+        firstManifestRecords, secondManifestRecords, manifestFrame);
     const auto manifestSummary =
         visibleRegistry.queryShadowManifestSummary();
     auto& stats = m_war3Scene.shadowStats;
@@ -26849,12 +26851,11 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       uint32_t(recordIndicesForBuild.size()),
       directRecordCap != 0u ? directRecordCap * 2u
                             : uint32_t(recordIndicesForBuild.size())));
-  shadowEligibleManifestRecords.reserve(recordIndicesForBuild.size() +
-                                         exactSubmittedManifestRecords.size());
-  shadowEligibleManifestRecords.insert(
-      shadowEligibleManifestRecords.end(),
-      exactSubmittedManifestRecords.begin(),
-      exactSubmittedManifestRecords.end());
+  // Exact Stage11 records already live in their caller-owned immutable range.
+  // Keep only DirectGrouped records here; manifest refresh consumes both
+  // ranges in the historical exact-then-direct order without cloning exact
+  // CurrentDrawContractRecord values into this scratch vector every frame.
+  shadowEligibleManifestRecords.reserve(recordIndicesForBuild.size());
   std::vector<uint64_t> producerClaimStrictKeys;
   std::vector<uint64_t> producerClaimLogicalKeys;
   if (observeProducerClaims) {
@@ -27560,7 +27561,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   }
 
   enterBuildEligiblePhase("ManifestPublish");
-  publishShadowManifestSummary(shadowEligibleManifestRecords);
+  publishShadowManifestSummary(exactSubmittedManifestRecords,
+                               shadowEligibleManifestRecords);
 
   enterBuildEligiblePhase("ProvisionalFilter");
   if (War3SemanticShadowManifestDeferProvisionalPartsRuntime() &&
