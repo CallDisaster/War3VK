@@ -82,6 +82,32 @@ namespace dxvk {
         uint64_t settingsRevision = 0u;
     };
 
+    // UpdateRenderContext lives in a separate translation unit and walks the
+    // scene vectors embedded in War3PipelineInput. Encode every layout that
+    // participates in that walk in a link-time symbol so a stale object with
+    // missing header dependencies cannot silently use an old vector element
+    // stride. A mixed incremental build must fail to link instead of reading
+    // past a caster during map startup.
+    template <std::size_t InputSize,
+              std::size_t InputAlignment,
+              std::size_t SceneSize,
+              std::size_t SceneAlignment,
+              std::size_t CasterSize,
+              std::size_t CasterAlignment,
+              std::size_t ReplayBindingSize,
+              std::size_t ReplayBindingAlignment>
+    struct War3ShaderContextAbiTag { };
+
+    using War3ShaderContextAbi = War3ShaderContextAbiTag<
+        sizeof(War3PipelineInput),
+        alignof(War3PipelineInput),
+        sizeof(War3FrameScene),
+        alignof(War3FrameScene),
+        sizeof(War3ShadowCasterDraw),
+        alignof(War3ShadowCasterDraw),
+        sizeof(War3ShadowReplayBufferBinding),
+        alignof(War3ShadowReplayBufferBinding)>;
+
     /**
      * @brief War3 DXVK 后处理/光照 pass 基类
      */
@@ -211,3 +237,11 @@ namespace dxvk {
         War3RenderPipelineAbi);
 
 } // namespace dxvk
+
+namespace war3shader::internal {
+
+    // Implemented beside UpdateRenderContext. The ABI tag is deliberately a
+    // value parameter so its layout constants become part of the symbol name.
+    void ValidateWar3ShaderContextAbi(::dxvk::War3ShaderContextAbi) noexcept;
+
+} // namespace war3shader::internal

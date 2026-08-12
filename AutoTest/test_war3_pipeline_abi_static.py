@@ -15,6 +15,7 @@ def read(relative: str) -> str:
 PIPELINE_H = read("src/d3d9/d3d9_war3_pipeline.h")
 PIPELINE_CPP = read("src/d3d9/d3d9_war3_pipeline.cpp")
 DEVICE_CPP = read("src/d3d9/d3d9_device.cpp")
+SHADER_API_CPP = read("src/d3d9/war3_shader_api.cpp")
 
 
 class War3PipelineAbiStaticTests(unittest.TestCase):
@@ -39,6 +40,27 @@ class War3PipelineAbiStaticTests(unittest.TestCase):
         ):
             self.assertIn(token, PIPELINE_H)
         self.assertGreaterEqual(DEVICE_CPP.count("War3RenderPipelineAbi { }"), 2)
+
+    def test_shader_context_symbol_encodes_all_walked_scene_layouts(self) -> None:
+        for token in (
+            "War3ShaderContextAbiTag<",
+            "sizeof(War3PipelineInput)",
+            "alignof(War3PipelineInput)",
+            "sizeof(War3FrameScene)",
+            "alignof(War3FrameScene)",
+            "sizeof(War3ShadowCasterDraw)",
+            "alignof(War3ShadowCasterDraw)",
+            "sizeof(War3ShadowReplayBufferBinding)",
+            "alignof(War3ShadowReplayBufferBinding)",
+        ):
+            self.assertIn(token, PIPELINE_H)
+
+        abi_call = "ValidateWar3ShaderContextAbi("
+        context_call = "UpdateRenderContext(input)"
+        self.assertIn(abi_call, PIPELINE_CPP)
+        self.assertIn(context_call, PIPELINE_CPP)
+        self.assertLess(PIPELINE_CPP.index(abi_call), PIPELINE_CPP.index(context_call))
+        self.assertIn("::dxvk::War3ShaderContextAbi) noexcept", SHADER_API_CPP)
 
 
 if __name__ == "__main__":

@@ -1318,6 +1318,8 @@ void War3RenderPipeline::Execute(War3InsertionPoint point,
         if (hasListeners) {
             UpdateShaderApiFrameBuffers(input);
             auto contextScope = perf.cpuScope("UpdateRenderContext");
+            war3shader::internal::ValidateWar3ShaderContextAbi(
+                War3ShaderContextAbi { });
             war3shader::internal::UpdateRenderContext(input);
 
             if (point == War3InsertionPoint::BeforeUi) {

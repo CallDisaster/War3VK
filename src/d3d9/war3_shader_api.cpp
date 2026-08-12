@@ -1371,6 +1371,10 @@ WAR3_SHADER_API void* GetVulkanCommandBuffer() {
 
 namespace internal {
 
+void ValidateWar3ShaderContextAbi(
+    ::dxvk::War3ShaderContextAbi) noexcept {
+}
+
 /**
  * @brief 检查是否禁用内置阴影
  */
