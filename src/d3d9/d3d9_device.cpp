@@ -30155,7 +30155,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // vector 分配与析构。
     constexpr size_t kCoreGateStackBudget = 32u;
     uint64_t coreGateStack[kCoreGateStackBudget];
-    std::vector<uint64_t> coreGateHeap;
+    static thread_local std::vector<uint64_t> s_coreGateHeap;
+    auto& coreGateHeap = s_coreGateHeap;
+    coreGateHeap.clear();
     for (const auto& group : objectGroups) {
       // Committed core is authoritative lifecycle evidence, not an all-or-
       // nothing submission gate. Missing required parts are diagnosed here,
@@ -30784,7 +30786,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       // Phase 7.25 旧语义回退路径：直接覆盖，保持与 7.24 行为一致，
       // 便于 A/B 和回归排查。
       if (!War3SemanticShadowManifestCoreEpochPlannerRuntime()) {
-        coreSet.committedPartKeys = partKeys;
+        if (coreSet.committedPartKeys != partKeys)
+          coreSet.committedPartKeys = partKeys;
         coreSet.authoritativeAbsenceStreak.clear();
         coreSet.lastCommitFrame = directPartPacketLeaseFrame;
         coreSet.observationPartKeys.clear();
@@ -30836,7 +30839,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           coreSet.observationStartFrame = directPartPacketLeaseFrame;
         }
       } else if (covers) {
-        coreSet.committedPartKeys = partKeys;
+        if (coreSet.committedPartKeys != partKeys)
+          coreSet.committedPartKeys = partKeys;
         coreSet.authoritativeAbsenceStreak.clear();
         coreSet.lastCommitFrame = directPartPacketLeaseFrame;
         coreSet.observationPartKeys.clear();
@@ -30848,29 +30852,30 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         // after two consecutive complete authoritative live observations omit
         // it. A reappearing part resets its streak immediately. Tombstones do
         // not wait here and are drained by War3DrainShadowCasterTombstones.
-        std::vector<uint64_t> shrunken;
-        shrunken.reserve(coreSet.committedPartKeys.size());
-        for (uint64_t partKey : coreSet.committedPartKeys) {
-          const bool inLive = std::binary_search(partKeys.begin(),
-                                                 partKeys.end(), partKey);
-          if (inLive) {
-            coreSet.authoritativeAbsenceStreak.erase(partKey);
-            shrunken.push_back(partKey);
-            continue;
-          }
-          uint8_t& streak = coreSet.authoritativeAbsenceStreak[partKey];
-          if (streak < 2u)
-            ++streak;
-          if (streak < 2u) {
-            shrunken.push_back(partKey);
-          } else {
-            coreSet.authoritativeAbsenceStreak.erase(partKey);
-            m_war3Scene.shadowStats
-                .semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount++;
-          }
-        }
-        if (shrunken.size() < coreSet.committedPartKeys.size()) {
-          coreSet.committedPartKeys = std::move(shrunken);
+        const auto retiredBegin = std::remove_if(
+            coreSet.committedPartKeys.begin(),
+            coreSet.committedPartKeys.end(),
+            [&](uint64_t partKey) {
+              const bool inLive = std::binary_search(
+                  partKeys.begin(), partKeys.end(), partKey);
+              if (inLive) {
+                coreSet.authoritativeAbsenceStreak.erase(partKey);
+                return false;
+              }
+              uint8_t& streak =
+                  coreSet.authoritativeAbsenceStreak[partKey];
+              if (streak < 2u)
+                ++streak;
+              if (streak < 2u)
+                return false;
+              coreSet.authoritativeAbsenceStreak.erase(partKey);
+              m_war3Scene.shadowStats
+                  .semanticSceneShadowManifestRetiredAfterAuthoritativeAbsenceCount++;
+              return true;
+            });
+        if (retiredBegin != coreSet.committedPartKeys.end()) {
+          coreSet.committedPartKeys.erase(
+              retiredBegin, coreSet.committedPartKeys.end());
           coreSet.lastCommitFrame = directPartPacketLeaseFrame;
         }
         // Live temporarily does not cover committed; preserve the remaining
