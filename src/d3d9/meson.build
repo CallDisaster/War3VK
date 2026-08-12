@@ -392,6 +392,22 @@ test(
   timeout : 30,
 )
 
+# Palette decoding already touches every matrix. Lock byte-for-byte identity
+# with the historical FNV oracle while producing that hash in the same pass.
+war3_current_draw_palette_hash_test = executable(
+  'war3_current_draw_palette_hash_test',
+  [
+    'war3/render/tests/war3_current_draw_palette_hash_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_current_draw_palette_hash',
+  war3_current_draw_palette_hash_test,
+  timeout : 30,
+)
+
 # Pure CurrentDraw identity normalization shared by packet resolution and the
 # Stage11 exact-owner pre-build gate.
 war3_current_draw_identity_contract_test = executable(

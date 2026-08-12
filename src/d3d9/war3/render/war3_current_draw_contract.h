@@ -451,7 +451,8 @@ bool QueryCurrentDrawGeometryContract(
 bool QueryCurrentDrawContractCapturedPalette(
     void* renderablePart,
     std::vector<Matrix4>& outPalette,
-    uint32_t& outGroupCount);
+    uint32_t& outGroupCount,
+    uint64_t* outPaletteHash = nullptr);
 
 bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  uint32_t vertexCount,

@@ -1,5 +1,6 @@
 #include "war3_current_draw_contract.h"
 #include "war3_current_draw_group_slot_summary.h"
+#include "war3_current_draw_palette_hash.h"
 
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_hook.h"
@@ -1312,9 +1313,12 @@ void ClearPublishedCurrentDrawReadyRecord(void* renderablePart) {
 bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
                                     std::vector<Matrix4>& outPalette,
                                     uint32_t& outGroupCount,
-                                    bool countAttempt) {
+                                    bool countAttempt,
+                                    uint64_t* outPaletteHash) {
   outPalette.clear();
   outGroupCount = 0u;
+  if (outPaletteHash != nullptr)
+    *outPaletteHash = 0u;
   if (countAttempt)
     g_capturedPaletteQueryAttemptCount.fetch_add(1u,
                                                  std::memory_order_relaxed);
@@ -1337,6 +1341,7 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
 
   outPalette.resize(record.capturedPaletteCount);
   const auto decodePaletteBytes = [&](const uint8_t* paletteBytes) {
+    CurrentDrawPaletteHashSummary paletteHash = {};
     for (uint32_t i = 0u; i < record.capturedPaletteCount; ++i) {
       const float* m =
           reinterpret_cast<const float*>(paletteBytes + size_t(i) * 48u);
@@ -1345,7 +1350,11 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
                   Vector4(m[3], m[4], m[5], 0.0f),
                   Vector4(m[6], m[7], m[8], 0.0f),
                   Vector4(m[9], m[10], m[11], 1.0f));
+      if (outPaletteHash != nullptr)
+        paletteHash.include(outPalette[i]);
     }
+    if (outPaletteHash != nullptr)
+      *outPaletteHash = paletteHash.finish();
   };
 
   const PaletteSnapshotEntry* snapshot =
@@ -2872,9 +2881,12 @@ bool QueryCurrentDrawGeometryContract(
 bool QueryCurrentDrawContractCapturedPalette(
     void* renderablePart,
     std::vector<Matrix4>& outPalette,
-    uint32_t& outGroupCount) {
+    uint32_t& outGroupCount,
+    uint64_t* outPaletteHash) {
   outPalette.clear();
   outGroupCount = 0u;
+  if (outPaletteHash != nullptr)
+    *outPaletteHash = 0u;
 
   const CurrentDrawContractRecord* entry = nullptr;
   if (LookupCurrentDrawContractRecord(renderablePart, entry) !=
@@ -2889,7 +2901,7 @@ bool QueryCurrentDrawContractCapturedPalette(
   CurrentDrawContractRecord record = *entry;
   record.known = true;
   return DecodeCapturedPaletteForRecord(record, outPalette, outGroupCount,
-                                        true);
+                                        true, outPaletteHash);
 }
 
 bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
@@ -3508,13 +3520,10 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
   }
 
   QueryCurrentDrawContractCapturedPalette(renderablePart, out.palette,
-                                          out.paletteCount);
+                                          out.paletteCount, &out.paletteHash);
   if (out.paletteCount != 0u && out.palette.size() >= out.paletteCount) {
     if (out.palette.size() > out.paletteCount)
       out.palette.resize(out.paletteCount);
-    out.paletteHash =
-        bit::fnv1a_hash(reinterpret_cast<const uint8_t*>(out.palette.data()),
-                        out.palette.size() * sizeof(Matrix4));
     // Phase 1：从 thread-local snapshot 读取 provenance。
     const PaletteSnapshotEntry* snapshot =
         FindLocalPaletteSnapshot(renderablePart);
@@ -3566,15 +3575,12 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
   if (trace != nullptr)
     trace->note(CurrentDrawResolveTracePhase::PaletteDecode);
   DecodeCapturedPaletteForRecord(out.contract, out.palette, out.paletteCount,
-                                 true);
+                                 true, &out.paletteHash);
   if (out.paletteCount != 0u && out.palette.size() >= out.paletteCount) {
     if (out.palette.size() > out.paletteCount)
       out.palette.resize(out.paletteCount);
     if (trace != nullptr)
       trace->note(CurrentDrawResolveTracePhase::PaletteHash);
-    out.paletteHash =
-        bit::fnv1a_hash(reinterpret_cast<const uint8_t*>(out.palette.data()),
-                        out.palette.size() * sizeof(Matrix4));
   }
 
   if (!out.paletteReady()) {

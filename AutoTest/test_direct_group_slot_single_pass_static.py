@@ -38,11 +38,8 @@ assert "outMaxGroupSlot = summary.maxGroupSlot" in decode
 assert "ComputeStableGroupContentHash(out.contract, out.groupSlots)" not in resolve_record
 assert "uint32_t maxGroupSlot = 0u" in header
 assert "directDecodedGroupSlotMaxReady" in packet
-assert re.search(
-    r"if \(!directDecodedGroupSlotMaxReady\)\s*\{[^}]*for \(uint8_t slot : effectiveGroupSlots\)",
-    packet,
-    re.S,
-)
+assert "directDecodedGroupSlotMaxReady\n        ? directDecodedMaxGroupSlot\n        : geo.maxVertexGroupSlot" in packet
+assert "for (uint8_t slot : effectiveGroupSlots)" not in packet
 assert "outDirectCurrentDrawSample->maxGroupSlot" in packet
 
 print("direct group-slot single-pass static checks passed")
