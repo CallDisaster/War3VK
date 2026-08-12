@@ -37,7 +37,7 @@ assert [model_direct.index(token) for token in model_priority] == sorted(
 shadow_direct = body(
     SHADOW,
     "bool ShadowObjectRegistry::findFirstForDirectPacket",
-    "bool ShadowObjectRegistry::findFirstForAugment",
+    "bool ShadowObjectRegistry::findFirstForDirectPacketView",
 )
 assert shadow_direct.count("std::shared_lock<std::shared_mutex> lock(m_mutex)") == 1
 shadow_priority = [
@@ -51,6 +51,15 @@ assert [shadow_direct.index(token) for token in shadow_priority] == sorted(
     shadow_direct.index(token) for token in shadow_priority
 )
 assert "secondaryRuntimeModelPtr != primaryRuntimeModelPtr" in shadow_direct
+
+shadow_view = body(
+    SHADOW,
+    "bool ShadowObjectRegistry::findFirstForDirectPacketView",
+    "bool ShadowObjectRegistry::findFirstForAugment",
+)
+assert shadow_view.count("std::shared_lock<std::shared_mutex> lock(m_mutex)") == 1
+assert "ProjectShadowObjectAugmentView(*record, out);" in shadow_view
+assert "ShadowObjectRecord& out" not in shadow_view
 
 render_direct = body(
     RENDER,
@@ -74,7 +83,8 @@ builder = body(
 )
 assert builder.count("instanceRegistry.findFirstForDirectPacket(") == 1
 assert builder.count("renderRegistry.findFirstForDirectPacket(") == 1
-assert builder.count("shadowRegistry.findFirstForDirectPacket(") == 1
+assert builder.count("shadowRegistry.findFirstForDirectPacketView(") == 1
+assert "ShadowObjectAugmentView shadowRecord" in builder
 
 instance_lookup = builder.split("Direct/InstanceLookup", 1)[1].split(
     "War3PacketBuildPhase::GeosetFallbacks", 1

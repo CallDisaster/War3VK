@@ -69,6 +69,7 @@ struct ShadowObjectRecord {
 struct ShadowObjectAugmentView {
   void *worldObjectEntry = nullptr;
   void *sceneNode = nullptr;
+  void *unitPtr = nullptr;
   void *runtimeModelPtr = nullptr;
   void *modelResourcePtr = nullptr;
   uint32_t jHandle = 0;
@@ -148,6 +149,11 @@ public:
                                 void* primaryRuntimeModelPtr,
                                 void* secondaryRuntimeModelPtr,
                                 ShadowObjectRecord& out) const;
+  bool findFirstForDirectPacketView(void* worldObjectEntry, void* sceneNode,
+                                    uint32_t jHandle,
+                                    void* primaryRuntimeModelPtr,
+                                    void* secondaryRuntimeModelPtr,
+                                    ShadowObjectAugmentView& out) const;
   // Per-draw semantic augment lookup. Preserves the legacy key priority while
   // holding one shared lock instead of reacquiring it for every miss.
   bool findFirstForAugment(void* worldObjectEntry, void* sceneNode,

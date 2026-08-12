@@ -6439,7 +6439,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         record.worldObjectEntry, record.sceneNode, record.jHandle);
   }
 
-  dxvk::war3::render::ShadowObjectRecord shadowRecord = {};
+  dxvk::war3::render::ShadowObjectAugmentView shadowRecord = {};
   bool shadowHit = false;
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enterNested(
@@ -6448,7 +6448,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     auto shadowObjectLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/ShadowObjectLookup");
     auto& shadowRegistry = dxvk::war3::render::ShadowObjectRegistry::instance();
-    shadowHit = shadowRegistry.findFirstForDirectPacket(
+    shadowHit = shadowRegistry.findFirstForDirectPacketView(
         record.worldObjectEntry, record.sceneNode, record.jHandle,
         ownerHit ? ownerBinding.runtimeModelPtr : nullptr,
         instanceHit ? instanceRecord.runtimeModelPtr : nullptr, shadowRecord);

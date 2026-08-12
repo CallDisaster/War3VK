@@ -131,6 +131,7 @@ void ProjectShadowObjectAugmentView(const ShadowObjectRecord& src,
                                     ShadowObjectAugmentView& out) {
   out.worldObjectEntry = src.worldObjectEntry;
   out.sceneNode = src.sceneNode;
+  out.unitPtr = src.unitPtr;
   out.runtimeModelPtr = src.runtimeModelPtr;
   out.modelResourcePtr = src.modelResourcePtr;
   out.jHandle = src.jHandle;
@@ -790,6 +791,43 @@ bool ShadowObjectRegistry::findFirstForDirectPacket(
   return findPointer(m_byRuntimeModel, primaryRuntimeModelPtr) ||
          (secondaryRuntimeModelPtr != primaryRuntimeModelPtr &&
           findPointer(m_byRuntimeModel, secondaryRuntimeModelPtr));
+}
+
+bool ShadowObjectRegistry::findFirstForDirectPacketView(
+    void* worldObjectEntry, void* sceneNode, uint32_t jHandle,
+    void* primaryRuntimeModelPtr, void* secondaryRuntimeModelPtr,
+    ShadowObjectAugmentView& out) const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+  const ShadowObjectRecord* record = nullptr;
+  const auto findPointer = [&](const auto& map, void* key) -> bool {
+    if (key == nullptr)
+      return false;
+    const auto it = map.find(key);
+    if (it == map.end())
+      return false;
+    record = &it->second;
+    return true;
+  };
+
+  if (!findPointer(m_byWorldObjectEntry, worldObjectEntry) &&
+      !findPointer(m_bySceneNode, sceneNode)) {
+    if (jHandle != 0u) {
+      const auto handleIt = m_byHandle.find(jHandle);
+      if (handleIt != m_byHandle.end())
+        record = &handleIt->second;
+    }
+    if (record == nullptr &&
+        !findPointer(m_byRuntimeModel, primaryRuntimeModelPtr) &&
+        secondaryRuntimeModelPtr != primaryRuntimeModelPtr) {
+      findPointer(m_byRuntimeModel, secondaryRuntimeModelPtr);
+    }
+  }
+
+  if (record == nullptr)
+    return false;
+  ProjectShadowObjectAugmentView(*record, out);
+  return true;
 }
 
 bool ShadowObjectRegistry::findFirstForAugment(
