@@ -3079,8 +3079,11 @@ void SnapshotPublishedCurrentDrawContracts(
   // path instead of rebuilding a node-based hash set every semantic frame.
   // Unsorted callers retain the historical set-membership behavior.
   const bool preferredKeysSorted =
-      std::is_sorted(preferredSelectionKeys.begin(),
-                     preferredSelectionKeys.end());
+      options.preferredSelectionKeysView != nullptr &&
+          options.preferredSelectionKeysViewSortedUnique
+      ? true
+      : std::is_sorted(preferredSelectionKeys.begin(),
+                       preferredSelectionKeys.end());
   static thread_local std::unordered_set<uint64_t> s_preferredKeySet;
   s_preferredKeySet.clear();
   if (!preferredKeysSorted && !preferredSelectionKeys.empty()) {

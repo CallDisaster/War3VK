@@ -335,6 +335,10 @@ struct CurrentDrawContractSnapshotOptions {
   // remain alive and immutable for the complete snapshot call. Owned keys
   // remain the compatibility/default source when this is null.
   const std::vector<uint64_t>* preferredSelectionKeysView = nullptr;
+  // Callers may skip the defensive order scan only when they own the borrowed
+  // view and have already canonicalized it to strictly increasing unique
+  // values. The default remains defensive for all compatibility callers.
+  bool preferredSelectionKeysViewSortedUnique = false;
 };
 
 struct CurrentDrawRetireResult {

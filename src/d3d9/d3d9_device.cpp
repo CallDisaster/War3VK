@@ -25980,6 +25980,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   snapshotOptions.maxRecords = useObjectFirstSnapshot ? 0u : directScanCap;
   snapshotOptions.unitsOnly = unitsOnly;
   snapshotOptions.preferredSelectionKeysView = &preferredSelectionKeys;
+  snapshotOptions.preferredSelectionKeysViewSortedUnique = true;
   // Contract records are non-owning scalar values. Reuse only the vector
   // allocation on this render thread; the snapshot routine clears every
   // logical element and rebuilds all visibility/generation evidence before

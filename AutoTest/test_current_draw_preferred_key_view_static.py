@@ -18,6 +18,7 @@ assert (
     "const std::vector<uint64_t>* preferredSelectionKeysView = nullptr;"
     in options
 )
+assert "bool preferredSelectionKeysViewSortedUnique = false;" in options
 
 snapshot = contract.split(
     "void SnapshotPublishedCurrentDrawContracts(\n"
@@ -27,6 +28,7 @@ assert "options.preferredSelectionKeysView != nullptr" in snapshot
 assert "? *options.preferredSelectionKeysView" in snapshot
 assert ": options.preferredSelectionKeys;" in snapshot
 assert "std::is_sorted(preferredSelectionKeys.begin()" in snapshot
+assert "options.preferredSelectionKeysViewSortedUnique" in snapshot
 assert "std::binary_search(preferredSelectionKeys.begin()" in snapshot
 assert "options.preferredSelectionKeys.begin()" not in snapshot
 
@@ -38,6 +40,7 @@ assert "static thread_local std::vector<uint64_t> s_preferredSelectionKeys;" in 
 assert "leasedSelectionKeys.clear();" in populate
 assert "preferredSelectionKeys.assign(previousSubmittedSelectionKeys.begin()," in populate
 assert "snapshotOptions.preferredSelectionKeysView = &preferredSelectionKeys;" in populate
+assert "snapshotOptions.preferredSelectionKeysViewSortedUnique = true;" in populate
 assert "snapshotOptions.preferredSelectionKeys = preferredSelectionKeys;" not in populate
 
 print("current-draw preferred key view static checks passed")
