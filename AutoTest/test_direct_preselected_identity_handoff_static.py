@@ -42,11 +42,15 @@ class DirectPreselectedIdentityHandoffStaticTests(unittest.TestCase):
         self.assertIn("const uint64_t preselectedRecordSelectionKey", block)
         self.assertIn("buildIndex < recordSelectionKeysForBuild.size()", block)
         self.assertIn(
-            "eligible.recordSelectionKey = useSealedWork\n"
+            "const uint64_t carriedRecordSelectionKey = useSealedWork\n"
             "        ? compactWork.selectionKey\n"
-            "        : preselectedRecordSelectionKey != 0u\n"
-            "              ? preselectedRecordSelectionKey\n"
-            "              : War3SemanticDirectRecordSelectionKey(record)",
+            "        : preselectedRecordSelectionKey",
+            block,
+        )
+        self.assertIn(
+            "eligible.recordSelectionKey = carriedRecordSelectionKey != 0u\n"
+            "        ? carriedRecordSelectionKey\n"
+            "        : War3SemanticDirectRecordSelectionKey(record)",
             block,
         )
 

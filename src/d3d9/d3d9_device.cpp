@@ -27180,7 +27180,20 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       }
     }
     EligibleRecord eligible = {};
-    eligible.completenessKey = completenessKeyForRecord(record);
+    // Completeness buckets are development-only diagnostics. The canonical
+    // object key normally requires an exact VisibleRenderable lookup, which
+    // the grouped preselector has already performed. Do not repeat that
+    // lookup in Release where the bucket is disabled; when diagnostics are
+    // enabled, reuse the sealed/preselected key whenever one was carried into
+    // this loop and only resolve the uncapped fallback on demand.
+    const uint64_t carriedRecordSelectionKey = useSealedWork
+        ? compactWork.selectionKey
+        : preselectedRecordSelectionKey;
+    eligible.completenessKey = trackCompletenessBuckets
+        ? (carriedRecordSelectionKey != 0u
+               ? carriedRecordSelectionKey
+               : completenessKeyForRecord(record))
+        : 0u;
     buildRecordTiming.enter(War3BuildEligibleRecordPhase::Prebuild);
     const bool drawTimePrebuildBypassed =
         tryBuildDrawTimePrebuildBypassEligible(record, eligible);
@@ -27318,11 +27331,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
     buildRecordTiming.enter(War3BuildEligibleRecordPhase::Identity);
     eligible.sceneNode = eligible.packet.renderable.sceneNode;
-    eligible.recordSelectionKey = useSealedWork
-        ? compactWork.selectionKey
-        : preselectedRecordSelectionKey != 0u
-              ? preselectedRecordSelectionKey
-              : War3SemanticDirectRecordSelectionKey(record);
+    eligible.recordSelectionKey = carriedRecordSelectionKey != 0u
+        ? carriedRecordSelectionKey
+        : War3SemanticDirectRecordSelectionKey(record);
     War3SemanticDirectSelectionKeySource selectionKeySource =
         War3SemanticDirectSelectionKeySource::None;
     eligible.selectionKey =
