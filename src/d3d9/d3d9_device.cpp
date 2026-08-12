@@ -2560,6 +2560,16 @@ inline bool War3SemanticDynamicEvidenceStatsRuntime() {
   return s_enabled;
 }
 
+inline bool War3SemanticPaletteDiagnosticsRuntime() {
+  // These historical motion/churn probes do not participate in palette
+  // selection, replay validation, or publication. Keep their large lookup
+  // tables out of the release hot path unless a targeted capture requests
+  // them explicitly.
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_SEMANTIC_PALETTE_DIAGNOSTICS", 0u) != 0u;
+  return s_enabled;
+}
+
 bool War3SemanticDrawTimePrebuildBypassRuntime() {
   // This producer feeds only the unsafe fast append contract. It must not
   // manufacture a Skinned eligible record when fast append is production-off.
@@ -8798,6 +8808,8 @@ void War3NoteLivePaletteMotion(War3ShadowCaptureStats& stats,
                                uint64_t frameSerial,
                                uint64_t rawHash,
                                uint64_t groupHash) {
+  if (!War3SemanticPaletteDiagnosticsRuntime())
+    return;
   if (runtimeModelPtr == nullptr || rawHash == 0u || groupHash == 0u)
     return;
 
@@ -8866,6 +8878,8 @@ void War3NoteDrawTimePoseMotion(War3ShadowCaptureStats& stats,
                                 void* runtimeModelPtr,
                                 uint64_t frameSerial,
                                 uint64_t hash) {
+  if (!War3SemanticPaletteDiagnosticsRuntime())
+    return;
   if (runtimeModelPtr == nullptr || hash == 0u)
     return;
 
@@ -8913,6 +8927,8 @@ void War3NoteSubmittedPaletteMotion(War3ShadowCaptureStats& stats,
                                     void* runtimeModelPtr,
                                     uint64_t frameSerial,
                                     uint64_t hash) {
+  if (!War3SemanticPaletteDiagnosticsRuntime())
+    return;
   if (runtimeModelPtr == nullptr || hash == 0u)
     return;
 
@@ -22735,7 +22751,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     std::vector<Matrix4> trimmedCanonicalPalette;
     const auto& canonicalPaletteVec = canonicalSkin.paletteVec();
     const auto& canonicalGroupSlots = canonicalSkin.groupSlotsVec();
-    if (!usesExplicitBlendContract &&
+    if (War3SemanticPaletteDiagnosticsRuntime() &&
+        !usesExplicitBlendContract &&
         canonicalGroupSlots.size() >= size_t(vertexCount)) {
       std::array<bool, 256> seenGroupSlots = {};
       for (uint32_t i = 0u; i < vertexCount; ++i) {
@@ -22791,7 +22808,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     // "part 稳定但 palette 内容每帧抖动"。
     // 仅在该 submit 真实归属于某个 stable part 时做采样；每个 thread 保持
     // 一份独立表，避免多线程交叉污染。
-    if (skinned) {
+    if (skinned && War3SemanticPaletteDiagnosticsRuntime()) {
       auto& stats = m_war3Scene.shadowStats;
       // palette source 分桶。
       switch (paletteSourceThisSubmit) {
@@ -24087,7 +24104,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       reinterpret_cast<uint64_t>(packet.renderable.renderablePart);
   m_war3Scene.shadowStats.semanticSceneLastAppendedMeshData =
       reinterpret_cast<uint64_t>(packet.renderable.meshData);
-  if (stableAuthoritativeSkinnedGeometryKey && currentDrawSample != nullptr) {
+  if (War3SemanticPaletteDiagnosticsRuntime() &&
+      stableAuthoritativeSkinnedGeometryKey && currentDrawSample != nullptr) {
     auto& st = m_war3Scene.shadowStats;
     const uint64_t contractIdentityKey =
         War3SemanticDirectSelectionKey(packet, *currentDrawSample);
@@ -24288,28 +24306,29 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         vbIt->second.MatchesKey(cacheKey))
       vbIt->second.submittedFrameSerial = m_war3ShadowPersistentFrameSerial;
   }
-  // Phase 7.35 Pose-lag 诊断：在 submit 成功处记录一次时间滞后。
-  // 只要 directCurrentDrawSample 存在就用它的 contract.renderFrameIndex
-  // 作为 record publish 帧号；没有 sample（fallback 路径）按 0 处理即 Lag0。
-  if (directCurrentDrawSample != nullptr &&
-      directCurrentDrawSample->contract.known) {
-    dxvk::war3::render::NoteSubmitPaletteFrameLag(
-        directCurrentDrawSample->contract.renderFrameIndex);
-  } else {
-    dxvk::war3::render::NoteSubmitPaletteFrameLag(0u);
-  }
-  if (skinned) {
-    uint32_t currentPaletteFrameTag = 0u;
-    const uint32_t paletteContentFrameTag =
-        paletteMinFrameTagThisSubmit != 0u ? paletteMinFrameTagThisSubmit
-                                           : paletteMaxFrameTagThisSubmit;
-    if (paletteContentFrameTag != 0u &&
-        dxvk::war3::model::QueryCurrentPaletteFrameTag(
-            currentPaletteFrameTag)) {
-      dxvk::war3::render::NoteSubmitPaletteContentAge(
-          paletteContentFrameTag, currentPaletteFrameTag);
+  if (War3SemanticPaletteDiagnosticsRuntime()) {
+    // Phase 7.35 Pose-lag diagnostics. These counters and the global palette
+    // frame-tag query are attribution-only and stay out of normal submission.
+    if (directCurrentDrawSample != nullptr &&
+        directCurrentDrawSample->contract.known) {
+      dxvk::war3::render::NoteSubmitPaletteFrameLag(
+          directCurrentDrawSample->contract.renderFrameIndex);
     } else {
-      dxvk::war3::render::NoteSubmitPaletteContentAgeUnknown();
+      dxvk::war3::render::NoteSubmitPaletteFrameLag(0u);
+    }
+    if (skinned) {
+      uint32_t currentPaletteFrameTag = 0u;
+      const uint32_t paletteContentFrameTag =
+          paletteMinFrameTagThisSubmit != 0u ? paletteMinFrameTagThisSubmit
+                                             : paletteMaxFrameTagThisSubmit;
+      if (paletteContentFrameTag != 0u &&
+          dxvk::war3::model::QueryCurrentPaletteFrameTag(
+              currentPaletteFrameTag)) {
+        dxvk::war3::render::NoteSubmitPaletteContentAge(
+            paletteContentFrameTag, currentPaletteFrameTag);
+      } else {
+        dxvk::war3::render::NoteSubmitPaletteContentAgeUnknown();
+      }
     }
   }
   if (resolvedObjectKind == dxvk::war3::render::ObjectKind::Building)
