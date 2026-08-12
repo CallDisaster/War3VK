@@ -1763,6 +1763,78 @@ bool ShadowModelResourceCache::findGeosetByData(
   return true;
 }
 
+namespace {
+
+void CopyReadyGeosetBinding(const ShadowGeosetResourceRecord& record,
+                            ShadowReadyGeosetBinding& out) {
+  out.geosetPtr = record.geosetPtr;
+  out.geosetDataPtr = record.geosetDataPtr;
+  out.modelResourcePtr = record.modelResourcePtr;
+  out.modelKey = record.modelKey;
+  out.geosetIndex = record.geosetIndex;
+}
+
+void MergeReadyGeosetAlias(const ShadowGeosetResourceRecord& alias,
+                           ShadowReadyGeosetBinding& out) {
+  if (alias.geosetPtr != nullptr)
+    out.geosetPtr = alias.geosetPtr;
+  if (alias.geosetDataPtr != nullptr)
+    out.geosetDataPtr = alias.geosetDataPtr;
+  if (alias.modelResourcePtr != nullptr)
+    out.modelResourcePtr = alias.modelResourcePtr;
+  if (alias.modelKey != 0u)
+    out.modelKey = alias.modelKey;
+  if (alias.geosetIndex != kInvalidShadowGeosetIndex)
+    out.geosetIndex = alias.geosetIndex;
+}
+
+} // namespace
+
+bool ShadowModelResourceCache::findReadyGeosetBindingByPtr(
+    void* geosetPtr, ShadowReadyGeosetBinding& out) const {
+  out = {};
+  if (geosetPtr == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto aliasIt = m_byGeoset.find(geosetPtr);
+  if (aliasIt == m_byGeoset.end() ||
+      !aliasIt->second.readyForShadowConsumer() ||
+      aliasIt->second.geosetDataPtr == nullptr) {
+    return false;
+  }
+
+  const auto canonicalIt = m_byGeosetData.find(
+      aliasIt->second.geosetDataPtr);
+  if (canonicalIt == m_byGeosetData.end() ||
+      canonicalIt->second == nullptr ||
+      !canonicalIt->second->readyForShadowConsumer()) {
+    return false;
+  }
+
+  CopyReadyGeosetBinding(*canonicalIt->second, out);
+  MergeReadyGeosetAlias(aliasIt->second, out);
+  return true;
+}
+
+bool ShadowModelResourceCache::findReadyGeosetBindingByData(
+    void* geosetDataPtr, ShadowReadyGeosetBinding& out) const {
+  out = {};
+  if (geosetDataPtr == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto canonicalIt = m_byGeosetData.find(geosetDataPtr);
+  if (canonicalIt == m_byGeosetData.end() ||
+      canonicalIt->second == nullptr ||
+      !canonicalIt->second->readyForShadowConsumer()) {
+    return false;
+  }
+
+  CopyReadyGeosetBinding(*canonicalIt->second, out);
+  return true;
+}
+
 ShadowGeosetResourceSnapshot
 ShadowModelResourceCache::findGeosetSnapshotByData(
     void* geosetDataPtr) const {

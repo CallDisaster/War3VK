@@ -523,12 +523,12 @@ bool BackfillVisibleUnitGeosetBindingFromCache(ShadowRenderableRecord& record) {
     return false;
 
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  model::ShadowGeosetResourceRecord geoset = {};
+  model::ShadowReadyGeosetBinding geoset = {};
   if (!((record.runtimeGeosetPtr != nullptr &&
-         resourceCache.findGeosetByPtr(record.runtimeGeosetPtr, geoset) &&
-         geoset.readyForShadowConsumer()) ||
-        (resourceCache.findGeosetByData(record.runtimeGeosetDataPtr, geoset) &&
-         geoset.readyForShadowConsumer()))) {
+         resourceCache.findReadyGeosetBindingByPtr(
+             record.runtimeGeosetPtr, geoset)) ||
+        resourceCache.findReadyGeosetBindingByData(
+            record.runtimeGeosetDataPtr, geoset))) {
     return false;
   }
 

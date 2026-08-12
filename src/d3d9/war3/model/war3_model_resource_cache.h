@@ -174,6 +174,20 @@ struct ShadowGeosetResourceStamp {
       ShadowGeosetImmutableCaptureStatus::NotAttempted;
 };
 
+// Scalar projection used by manifest identity hydration.  It deliberately
+// carries no geometry arrays: readiness remains proven against the canonical
+// immutable cache publication while callers copy only the identity fields
+// they actually consume.
+struct ShadowReadyGeosetBinding {
+  void* geosetPtr = nullptr;
+  void* geosetDataPtr = nullptr;
+  void* modelResourcePtr = nullptr;
+  uint64_t modelKey = 0u;
+  uint32_t geosetIndex = kInvalidShadowGeosetIndex;
+};
+
+static_assert(std::is_trivially_copyable_v<ShadowReadyGeosetBinding>);
+
 struct ShadowModelResourceRecord {
   void *runtimeModelPtr = nullptr;
   void *modelResourcePtr = nullptr;
@@ -250,6 +264,10 @@ public:
   bool findGeosetByPtr(void *geosetPtr, ShadowGeosetResourceRecord &out) const;
   bool findGeosetByData(void *geosetDataPtr,
                         ShadowGeosetResourceRecord &out) const;
+  bool findReadyGeosetBindingByPtr(
+      void* geosetPtr, ShadowReadyGeosetBinding& out) const;
+  bool findReadyGeosetBindingByData(
+      void* geosetDataPtr, ShadowReadyGeosetBinding& out) const;
   ShadowGeosetResourceSnapshot findGeosetSnapshotByData(
       void* geosetDataPtr) const;
   bool findGeosetStampByData(void* geosetDataPtr,
