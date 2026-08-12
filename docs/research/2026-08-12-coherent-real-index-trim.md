@@ -212,3 +212,26 @@ helps repeated draws within an unchanged generation. The next step is an
 Observe-only comparison of D3D9 supplied index-range hints against the already
 computed exact domain. No hint may authorize trimming until under-coverage is
 proven to be zero under an explicit contract.
+
+The follow-up Observe build reused that already-computed domain and compared
+every eligible draw against D3D9's declared range. Artifact
+`20260812_084754`, report `08_58_00`, recorded:
+
+- 3,541,747 comparable indexed terrain draws;
+- 3,514,868 exact ranges;
+- 26,879 conservative supersets;
+- zero under-coverage and zero invalid ranges;
+- zero producer-incomplete/budget-exceeded frames, device loss, new GPU event
+  or incident.
+
+Microsoft's `IDirect3DDevice9::DrawIndexedPrimitive` contract states that
+`MinVertexIndex` is the minimum index relative to `BaseVertexIndex`,
+`NumVertices` defines the used range, and indices outside that range are
+invalid. This is stronger than an informal performance hint:
+
+- https://learn.microsoft.com/en-us/windows/win32/api/d3d9helper/nf-d3d9helper-idirect3ddevice9-drawindexedprimitive
+
+The sample and API contract justify a separate development candidate that can
+use this declared superset for the already restricted terrain/rigid/opaque
+cohort. They do not authorize changing general bounds culling, UP/skinned/
+alpha routes or the Release default in the observer commit itself.

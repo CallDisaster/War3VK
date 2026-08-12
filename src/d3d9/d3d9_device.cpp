@@ -46981,7 +46981,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                   exactIndexHostCached, s_exactIndexDomainBulkReadEnabled});
         }
       }
-      if (exactIndexedTerrainBoundsObserveCandidate && exactDomain.valid) {
+      // Coherent REAL Consume has already paid for the exact domain, so also
+      // compare D3D9's caller-supplied MinVertexIndex/NumVertices range here.
+      // This is observation only: neither relation can authorize trimming or
+      // culling in this candidate.
+      if ((exactIndexedTerrainBoundsObserveCandidate ||
+           coherentRealTrimScanCandidate) && exactDomain.valid) {
         using HintRelation =
             dxvk::war3::render::War3TerrainIndexedHintRelation;
         const auto hintDecision = dxvk::war3::render::

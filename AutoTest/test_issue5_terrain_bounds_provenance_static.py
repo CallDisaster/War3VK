@@ -31,7 +31,8 @@ class TerrainBoundsProvenanceContracts(unittest.TestCase):
         known = self.device.index("exactIndexedDomainKnown = true", scan)
         self.assertGreater(known, scan)
         trim = self.device.index(
-            "if (exactIndexedFreezeTrimCandidate && allStreamsFit", known
+            "if ((exactIndexedFreezeTrimCandidate || consumeCoherentRealTrim) &&",
+            known,
         )
         self.assertGreater(trim, known)
 
