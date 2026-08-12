@@ -2991,6 +2991,15 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
 
 std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
     const CurrentDrawContractSnapshotOptions& options) {
+  std::vector<CurrentDrawContractRecord> out;
+  SnapshotPublishedCurrentDrawContracts(options, out);
+  return out;
+}
+
+void SnapshotPublishedCurrentDrawContracts(
+    const CurrentDrawContractSnapshotOptions& options,
+    std::vector<CurrentDrawContractRecord>& out) {
+  out.clear();
   const bool traceSnapshot = CurrentDrawSnapshotBreakdownEnabled();
   const uint32_t snapshotTracePeriod = traceSnapshot
       ? CurrentDrawSnapshotTraceSamplePeriod()
@@ -3030,7 +3039,6 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
   };
 
   enterSnapshotPhase("SnapshotOutputReserve");
-  std::vector<CurrentDrawContractRecord> out;
   const size_t reserveCount =
       options.maxRecords != 0u
           ? std::min<size_t>(localSnapshotUpperBound,
@@ -3375,7 +3383,6 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
   }
 
   enterSnapshotPhase("SnapshotFinalize");
-  return out;
 }
 
 CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(

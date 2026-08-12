@@ -445,6 +445,13 @@ std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
 std::vector<CurrentDrawContractRecord> SnapshotPublishedCurrentDrawContracts(
     const CurrentDrawContractSnapshotOptions& options);
 
+// Caller-owned output form for render-thread hot paths. The function clears
+// and rebuilds out from the same immutable snapshot policy; retaining vector
+// capacity never authorizes record identity or cross-frame publication.
+void SnapshotPublishedCurrentDrawContracts(
+    const CurrentDrawContractSnapshotOptions& options,
+    std::vector<CurrentDrawContractRecord>& out);
+
 CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
     void* renderablePart,
     uint32_t vertexCount,

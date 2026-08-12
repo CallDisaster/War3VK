@@ -117,9 +117,10 @@ class ShadowFinalCasterTraceStaticTests(unittest.TestCase):
             self.assertIn(token, self.analyzer)
 
     def test_populate_snapshot_is_traced_before_downstream_filters(self) -> None:
-        snapshot = self.device.index(
-            "SnapshotPublishedCurrentDrawContracts(\n            "
-            "snapshotOptions)"
+        snapshot = self.device.index("SnapshotPublishedCurrentDrawContracts(")
+        self.assertIn(
+            "snapshotOptions, directRecords)",
+            self.device[snapshot : snapshot + 200],
         )
         trace = self.device.index("NoteCurrentDrawSnapshotFrame(", snapshot)
         diagnostics = self.device.index(

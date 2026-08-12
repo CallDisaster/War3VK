@@ -25580,13 +25580,26 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   snapshotOptions.maxRecords = useObjectFirstSnapshot ? 0u : directScanCap;
   snapshotOptions.unitsOnly = unitsOnly;
   snapshotOptions.preferredSelectionKeys = preferredSelectionKeys;
-  std::vector<dxvk::war3::render::CurrentDrawContractRecord> directRecords;
+  // Contract records are non-owning scalar values. Reuse only the vector
+  // allocation on this render thread; the snapshot routine clears every
+  // logical element and rebuilds all visibility/generation evidence before
+  // this function can inspect it.
+  static thread_local std::vector<
+      dxvk::war3::render::CurrentDrawContractRecord> s_directRecords;
+  auto& directRecords = s_directRecords;
+  struct DirectRecordScratchReset {
+    std::vector<dxvk::war3::render::CurrentDrawContractRecord>& records;
+
+    ~DirectRecordScratchReset() {
+      records.clear();
+    }
+  };
+  const DirectRecordScratchReset directRecordScratchReset { directRecords };
   {
     auto snapshotScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/Snapshot");
-    directRecords =
-        dxvk::war3::render::SnapshotPublishedCurrentDrawContracts(
-            snapshotOptions);
+    dxvk::war3::render::SnapshotPublishedCurrentDrawContracts(
+        snapshotOptions, directRecords);
   }
   dxvk::war3::render::NoteCurrentDrawSnapshotFrame(
       directRecords, m_war3ShadowPersistentFrameSerial);
