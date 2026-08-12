@@ -43,7 +43,16 @@ A 录制 draw。此前 device-fault 的 `WRITE_INVALID` 与 defrag-on / defrag-o
 
 ## 未完成物理门
 
-- 尚未部署或启动 Warcraft III。
-- 尚未完成 defrag-on 普通图、生与死低视角、连续三轮长门和普通对战。
+- 2026-08-12 默认 Release 构建 `93245824...A8BB` 已在隔离桌面完成三轮
+  “生与死”低视角 10 分钟门：artifact 分别为 `20260812_075908`、
+  `20260812_080948`、`20260812_082027`，实测时长为
+  `602.091/602.426/602.176` 秒。三轮均无 device lost、新 Event 153/4101
+  或 GPU incident，且每轮退出后均恢复稳定 DLL `79CA8DB4...B2A4`。
+- 这三轮只闭合了 TDR 稳定门，没有闭合阴影完整性门：每轮仍有 `79/84/76`
+  个 producer-incomplete/budget-exceeded 帧及约 `9.5k` 个
+  `fallbackByteBudget` omission，Arena 峰值均触及约 384 MiB。它们不会发布
+  partial CSM，但会表现为有界的无阴影窗口。
+- 尚未完成普通对战 20 分钟和用户前台视觉门，因此不能宣称首次历史 TDR 的
+  唯一根因已证明或整个阶段已可发布。
 - 尚未证明首次 TDR 的唯一成因；若仍发生 device lost，必须结合本候选的 binding reject
   和 device-fault incident 形成新假设后再改二进制。

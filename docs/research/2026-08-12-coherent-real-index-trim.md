@@ -188,3 +188,27 @@ The final 1,024-entry build (`917B1503...E44`) was then run independently in
 699,675 lookups. All 7,200 report frames again had zero producer-incomplete or
 budget-exceeded frames, and the run created no GPU event or incident. The
 stable deployed DLL was restored to SHA-256 `79CA8DB4...B2A4` afterward.
+
+## Comparable ten-minute pressure result
+
+The default Release build was then run three times for ten minutes with the
+5x5 low-view path. It produced `79/84/76` incomplete frames, approximately
+`9.5k` fallback-byte omissions per run, and a roughly 384 MiB Arena peak. The
+coherent REAL candidate ran the same 600-second matrix in artifact
+`20260812_083240` and report `08_42_45`:
+
+- 17,327 observed shadow frames;
+- 763,816 consumed terrain draws and 398,147,461,408 bytes avoided;
+- zero producer-incomplete, required-caster omission, fallback-byte omission,
+  budget-exceeded, GPU incident and new driver event;
+- Arena average/peak `66.011/369.375 MiB`.
+
+This closes the candidate completeness problem without increasing the Arena
+limit, but it does not yet satisfy the performance/default gate. In the same
+long matrix, `ShadowCapture` averaged `3.439 ms` versus about `1.706 ms` in the
+default run. The remaining cost is dominated by proving a fresh exact index
+domain when content generation changes; the generation-backed cache only
+helps repeated draws within an unchanged generation. The next step is an
+Observe-only comparison of D3D9 supplied index-range hints against the already
+computed exact domain. No hint may authorize trimming until under-coverage is
+proven to be zero under an explicit contract.
