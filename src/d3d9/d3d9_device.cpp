@@ -6627,6 +6627,18 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (record.renderablePart == nullptr || record.meshPayloadPtr == nullptr)
     return false;
 
+  // Object-grouped preselection resolves this exact part/layer from the
+  // immutable current-frame visible snapshot. Keep the value copy alive for
+  // both instance projection and the later visible-record setup.
+  dxvk::war3::render::VisibleRenderableRecord visibleRecord = {};
+  const bool preselectedVisibleMatches =
+      preselectedVisibleRecord != nullptr &&
+      preselectedVisibleRecord->renderablePart == record.renderablePart &&
+      preselectedVisibleRecord->layerIndex == record.layerIndex;
+  bool visibleHit = preselectedVisibleMatches;
+  if (visibleHit)
+    visibleRecord = *preselectedVisibleRecord;
+
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::GeosetLookup);
   auto& resourceCache = dxvk::war3::model::ShadowModelResourceCache::instance();
@@ -6658,10 +6670,37 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   bool ownerHit = false;
   dxvk::war3::model::ModelInstanceDirectPacketView instanceRecord = {};
   auto& instanceRegistry = dxvk::war3::model::ModelInstanceRegistry::instance();
-  bool instanceHit = false;
+  // A fully populated exact visible record is already the current-frame value
+  // projection of the same instance identity. Reuse it only when every alias
+  // agrees with CurrentDraw; attachments and partial records retain the
+  // generation-checked registry lookup below.
+  const bool visibleProvesInstance =
+      visibleHit && record.worldObjectEntry != nullptr &&
+      record.sceneNode != nullptr && record.unitPtr != nullptr &&
+      record.jHandle != 0u && record.rawcode != 0u &&
+      visibleRecord.identity.worldObjectEntry == record.worldObjectEntry &&
+      visibleRecord.sceneNode == record.sceneNode &&
+      visibleRecord.identity.sceneNode == record.sceneNode &&
+      visibleRecord.identity.unitPtr == record.unitPtr &&
+      visibleRecord.identity.jHandle == record.jHandle &&
+      visibleRecord.identity.rawcode == record.rawcode &&
+      visibleRecord.runtimeModelPtr != nullptr &&
+      visibleRecord.modelResourcePtr != nullptr &&
+      visibleRecord.modelKey != 0u;
+  bool instanceHit = visibleProvesInstance;
+  if (visibleProvesInstance) {
+    instanceRecord.worldObjectEntry = record.worldObjectEntry;
+    instanceRecord.sceneNode = record.sceneNode;
+    instanceRecord.unitPtr = record.unitPtr;
+    instanceRecord.runtimeModelPtr = visibleRecord.runtimeModelPtr;
+    instanceRecord.modelResourcePtr = visibleRecord.modelResourcePtr;
+    instanceRecord.jHandle = record.jHandle;
+    instanceRecord.rawcode = record.rawcode;
+    instanceRecord.modelKey = visibleRecord.modelKey;
+  }
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enterNested(War3PacketBuildNestedPhase::InstanceLookup);
-  {
+  if (!instanceHit) {
     auto instanceLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/InstanceLookup");
     if (instanceSnapshotCache != nullptr) {
@@ -6836,11 +6875,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::RegistryLookups);
 
-  dxvk::war3::render::VisibleRenderableRecord visibleRecord = {};
-  bool visibleHit = false;
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enterNested(War3PacketBuildNestedPhase::VisibleLookup);
-  {
+  if (!visibleHit) {
     auto visibleLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/VisibleLookup");
     // The grouped preselector has already queried this exact part/layer from
@@ -6849,19 +6886,10 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     // same indexed lookup again during packet construction. The uncapped
     // path, compact-table Consume without a canonical lookup, and any
     // mismatching hint retain the canonical fallback below.
-    const bool preselectedVisibleMatches =
-        preselectedVisibleRecord != nullptr &&
-        record.renderablePart != nullptr &&
-        preselectedVisibleRecord->renderablePart == record.renderablePart;
-    if (preselectedVisibleMatches) {
-      visibleRecord = *preselectedVisibleRecord;
-      visibleHit = true;
-    } else {
-      auto& visibleRegistry =
-          dxvk::war3::render::VisibleRenderableRegistry::instance();
-      visibleHit = visibleRegistry.queryFirstForDirectPacket(record,
-                                                             visibleRecord);
-    }
+    auto& visibleRegistry =
+        dxvk::war3::render::VisibleRenderableRegistry::instance();
+    visibleHit = visibleRegistry.queryFirstForDirectPacket(record,
+                                                           visibleRecord);
   }
 
   // CurrentDraw is already backfilled from the exact visible part at publish
