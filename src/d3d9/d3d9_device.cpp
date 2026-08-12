@@ -22666,8 +22666,48 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   bool cachedPersistentGeometry = false;
 
   fallbackAppendTiming.enter(War3FallbackAppendPhase::WorldTransform);
+  // A ready CurrentDraw palette is already expressed in world space and the
+  // canonical builder deliberately selects identity for it. Avoid resolving
+  // two world transforms that cannot affect the resulting draw. For every
+  // other route, preserve the canonical priority by reading the scene-node
+  // matrix first and consulting PoseRegistry only as its fallback.
+  const bool currentDrawPaletteOwnsWorldTransform =
+      skinned && currentDrawSample != nullptr &&
+      currentDrawSample->status ==
+          dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
+      authoritativeGroupSlotsReady && drawTimeCapturedPaletteReady &&
+      drawTimeCapturedPalette != nullptr &&
+      !drawTimeCapturedPalette->empty() &&
+      drawTimeCapturedPaletteHash != 0u;
+  Matrix4 sceneNodeWorldMatrix = Matrix4();
+  const bool hasSceneNodeWorldMatrix = [&]() {
+    if (currentDrawPaletteOwnsWorldTransform)
+      return false;
+    auto worldMatrixScope = War3SemanticSubmitScope(
+        "War3SemanticScene/SubmitFrame/SceneNodeWorldMatrix");
+    if (packet.renderable.sceneNode == nullptr)
+      return false;
+
+    float raw[12] = {};
+    const auto* matrixBase =
+        reinterpret_cast<const uint8_t*>(packet.renderable.sceneNode) +
+        dxvk::war3::SceneNodeOffsets::WorldMatrix;
+    if (!dxvk::war3::IsReadableRange(matrixBase, sizeof(raw)))
+      return false;
+
+    std::memcpy(raw, matrixBase, sizeof(raw));
+    sceneNodeWorldMatrix =
+        Matrix4(Vector4(raw[0], raw[1], raw[2], 0.0f),
+                Vector4(raw[3], raw[4], raw[5], 0.0f),
+                Vector4(raw[6], raw[7], raw[8], 0.0f),
+                Vector4(raw[9], raw[10], raw[11], 1.0f));
+    return true;
+  }();
+
   dxvk::war3::model::PoseAugmentView livePoseRecord = {};
   const bool hasLivePoseWorldTransform = [&]() {
+    if (currentDrawPaletteOwnsWorldTransform || hasSceneNodeWorldMatrix)
+      return false;
     auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
     if (packet.renderable.runtimeModelPtr != nullptr &&
         poseRegistry.findByRuntimeModelAugment(
@@ -22695,29 +22735,6 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
                  ? &livePoseRecord.spriteFrameTransform
                  : &livePoseRecord.worldTransform)
           : nullptr;
-
-  Matrix4 sceneNodeWorldMatrix = Matrix4();
-  const bool hasSceneNodeWorldMatrix = [&]() {
-    auto worldMatrixScope = War3SemanticSubmitScope(
-        "War3SemanticScene/SubmitFrame/SceneNodeWorldMatrix");
-    if (packet.renderable.sceneNode == nullptr)
-      return false;
-
-    float raw[12] = {};
-    const auto* matrixBase =
-        reinterpret_cast<const uint8_t*>(packet.renderable.sceneNode) +
-        dxvk::war3::SceneNodeOffsets::WorldMatrix;
-    if (!dxvk::war3::IsReadableRange(matrixBase, sizeof(raw)))
-      return false;
-
-    std::memcpy(raw, matrixBase, sizeof(raw));
-    sceneNodeWorldMatrix =
-        Matrix4(Vector4(raw[0], raw[1], raw[2], 0.0f),
-                Vector4(raw[3], raw[4], raw[5], 0.0f),
-                Vector4(raw[6], raw[7], raw[8], 0.0f),
-                Vector4(raw[9], raw[10], raw[11], 1.0f));
-    return true;
-  }();
 
   fallbackAppendTiming.enter(War3FallbackAppendPhase::LivePalette);
   uint32_t paletteIndex = 0u;
