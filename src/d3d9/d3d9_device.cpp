@@ -6682,11 +6682,39 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
 
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::RegistryLookups);
+
+  dxvk::war3::render::VisibleRenderableRecord visibleRecord = {};
+  bool visibleHit = false;
+  if (packetBuildTiming != nullptr)
+    packetBuildTiming->enterNested(War3PacketBuildNestedPhase::VisibleLookup);
+  {
+    auto visibleLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/VisibleLookup");
+    auto& visibleRegistry =
+        dxvk::war3::render::VisibleRenderableRegistry::instance();
+    visibleHit = visibleRegistry.queryFirstForDirectPacket(record,
+                                                           visibleRecord);
+  }
+
+  // CurrentDraw is already backfilled from the exact visible part at publish
+  // time. When all object aliases are present and that exact visible lookup
+  // supplies both the render group and unit flags, RenderObjectRegistry cannot
+  // add any field used by this packet. Keep the registry fallback for
+  // incomplete identities, destructibles/effects and unusual queue parts.
+  const bool currentDrawHasUnitKind =
+      record.objectKind == dxvk::war3::render::ObjectKind::Unit ||
+      record.objectKind == dxvk::war3::render::ObjectKind::Building;
+  const bool currentDrawObjectIdentityComplete =
+      record.worldObjectEntry != nullptr && record.sceneNode != nullptr &&
+      record.unitPtr != nullptr && record.jHandle != 0u &&
+      record.rawcode != 0u && currentDrawHasUnitKind && visibleHit &&
+      visibleRecord.identity.groupIdx >= 0 &&
+      visibleRecord.identity.flags5C != 0u;
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enterNested(
         War3PacketBuildNestedPhase::RenderObjectLookup);
   const dxvk::war3::render::RenderObjectInfo* renderObject = nullptr;
-  {
+  if (!currentDrawObjectIdentityComplete) {
     auto renderObjectLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/RenderObjectLookup");
     auto& renderRegistry = dxvk::war3::render::RenderObjectRegistry::instance();
@@ -6717,18 +6745,6 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
           instanceHit ? instanceRecord.runtimeModelPtr : nullptr,
           shadowRecord);
     }
-  }
-
-  dxvk::war3::render::VisibleRenderableRecord visibleRecord = {};
-  bool visibleHit = false;
-  if (packetBuildTiming != nullptr)
-    packetBuildTiming->enterNested(War3PacketBuildNestedPhase::VisibleLookup);
-  {
-    auto visibleLookupScope =
-        War3SemanticSubmitScope("War3SemanticScene/Direct/VisibleLookup");
-    auto& visibleRegistry = dxvk::war3::render::VisibleRenderableRegistry::instance();
-    visibleHit = visibleRegistry.queryFirstForDirectPacket(record,
-                                                           visibleRecord);
   }
 
   const void* effectiveRuntimeModelPtr =
@@ -6834,9 +6850,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         record.pathBlocker || (visibleHit && visibleRecord.pathBlocker) ||
         IsLosBlockerFourCc(renderable.rawcode);
     renderable.unitFlags5C =
-        renderObject != nullptr && renderObject->flags5C != 0u
-            ? renderObject->flags5C
-            : 0u;
+        currentDrawObjectIdentityComplete
+            ? visibleRecord.identity.flags5C
+            : renderObject != nullptr && renderObject->flags5C != 0u
+                  ? renderObject->flags5C
+                  : 0u;
     // In the current-draw contract `payload + 0x108` is the selector used for
     // sceneNode->meshInfoTable. It is not a material layer index. When the
     // visible registry does not provide a layer, default to layer 0; using the
