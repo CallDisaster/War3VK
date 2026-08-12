@@ -8345,7 +8345,14 @@ bool War3TryBuildLiveRuntimeGroupPalette(
       uint64_t lastSeenFrameSerial = 0u;
     };
 
+    struct PaletteSlotCacheLookupEntry {
+      void* renderablePart = nullptr;
+      uint64_t mapEpoch = 0u;
+      uint32_t cacheIndex = 0xFFFFFFFFu;
+    };
+
     static constexpr size_t kMaxPaletteSlotCacheEntries = 4096u;
+    static constexpr size_t kPaletteSlotCacheLookupEntries = 8192u;
     uint32_t currentSlotIndex = 0xFFFFFFFFu;
     dxvk::war3::SafeReadU32Fast(
         partPtr, dxvk::war3::RenderablePartFieldOffsets::StagePresetSpanBaseIndex,
@@ -8366,13 +8373,19 @@ bool War3TryBuildLiveRuntimeGroupPalette(
     static thread_local std::array<PaletteSlotCacheEntry,
                                    kMaxPaletteSlotCacheEntries>
         s_paletteSlotCache = {};
+    // The authoritative cache historically performed a 4096-entry linear
+    // walk for every skinned caster. Keep that walk as the exact collision
+    // fallback, but remember the most recent index in a fixed direct-mapped
+    // accelerator. A collision can only cost a fallback scan; identity and
+    // epoch are revalidated against the original entry before use.
+    static thread_local std::array<PaletteSlotCacheLookupEntry,
+                                   kPaletteSlotCacheLookupEntries>
+        s_paletteSlotCacheLookup = {};
     static thread_local size_t s_paletteSlotCacheCursor = 0u;
     const uint64_t mapEpoch =
         dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
 
-    for (auto& entry : s_paletteSlotCache) {
-      if (entry.renderablePart != partPtr || entry.mapEpoch != mapEpoch)
-        continue;
+    auto useCachedEntry = [&](PaletteSlotCacheEntry& entry) -> uint32_t {
       entry.lastSeenFrameSerial = frameSerial;
       if (currentSlotIndex != 0xFFFFFFFFu && currentSlotIndex < 0x3A98u) {
         entry.paletteSlotIndex = currentSlotIndex;
@@ -8384,6 +8397,27 @@ bool War3TryBuildLiveRuntimeGroupPalette(
         return producerSlotIndex;
       }
       return entry.paletteSlotIndex;
+    };
+
+    const uintptr_t partValue = reinterpret_cast<uintptr_t>(partPtr);
+    const size_t lookupSlot =
+        ((partValue >> 4u) ^ size_t(mapEpoch)) &
+        (kPaletteSlotCacheLookupEntries - 1u);
+    auto& lookup = s_paletteSlotCacheLookup[lookupSlot];
+    if (lookup.renderablePart == partPtr && lookup.mapEpoch == mapEpoch &&
+        lookup.cacheIndex < s_paletteSlotCache.size()) {
+      auto& cached = s_paletteSlotCache[lookup.cacheIndex];
+      if (cached.renderablePart == partPtr && cached.mapEpoch == mapEpoch)
+        return useCachedEntry(cached);
+    }
+
+    for (size_t cacheIndex = 0u; cacheIndex < s_paletteSlotCache.size();
+         ++cacheIndex) {
+      auto& entry = s_paletteSlotCache[cacheIndex];
+      if (entry.renderablePart != partPtr || entry.mapEpoch != mapEpoch)
+        continue;
+      lookup = {partPtr, mapEpoch, uint32_t(cacheIndex)};
+      return useCachedEntry(entry);
     }
 
     if (currentSlotIndex == 0xFFFFFFFFu || currentSlotIndex >= 0x3A98u) {
@@ -8393,13 +8427,14 @@ bool War3TryBuildLiveRuntimeGroupPalette(
       currentSlotIndex = producerSlotIndex;
     }
 
-    auto& entry =
-        s_paletteSlotCache[s_paletteSlotCacheCursor++ %
-                           kMaxPaletteSlotCacheEntries];
+    const size_t cacheIndex =
+        s_paletteSlotCacheCursor++ % kMaxPaletteSlotCacheEntries;
+    auto& entry = s_paletteSlotCache[cacheIndex];
     entry.renderablePart = partPtr;
     entry.mapEpoch = mapEpoch;
     entry.paletteSlotIndex = currentSlotIndex;
     entry.lastSeenFrameSerial = frameSerial;
+    lookup = {partPtr, mapEpoch, uint32_t(cacheIndex)};
     return currentSlotIndex;
   };
 
