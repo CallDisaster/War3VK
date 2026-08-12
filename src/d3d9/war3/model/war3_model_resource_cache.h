@@ -248,6 +248,11 @@ struct ShadowModelResourceMemorySnapshot {
   uint64_t modelPointerCapacityBytes = 0;
 };
 
+struct ShadowResourceStoreCapacityHint {
+  size_t geosetRecordUpperBound = 0u;
+  size_t runtimeAliasUpperBound = 0u;
+};
+
 class ShadowModelResourceCache {
 public:
   // Cache snapshots are immutable once published, but legacy hot paths may
@@ -383,6 +388,7 @@ public:
   size_t readyGeosetCount() const;
   size_t modelResourceCount() const;
   size_t runtimeModelRecordCount() const;
+  ShadowResourceStoreCapacityHint resourceStoreCapacityHint() const;
   ShadowModelResourceMemorySnapshot memorySnapshot() const;
   uint64_t frameNumber() const;
   uint64_t revision() const;

@@ -2456,6 +2456,28 @@ size_t ShadowModelResourceCache::runtimeModelRecordCount() const {
   return m_byRuntimeModel.size();
 }
 
+ShadowResourceStoreCapacityHint
+ShadowModelResourceCache::resourceStoreCapacityHint() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  ShadowResourceStoreCapacityHint result = {};
+  result.geosetRecordUpperBound = m_byGeoset.size() + m_byGeosetData.size();
+
+  const auto addAliasCapacity = [&result](
+      const std::unordered_map<void*, ShadowModelResourceRecord>& records) {
+    for (const auto& entry : records) {
+      if (entry.second.runtimeModelPtr == nullptr)
+        continue;
+      const size_t remaining = (std::numeric_limits<size_t>::max)() -
+          result.runtimeAliasUpperBound;
+      result.runtimeAliasUpperBound +=
+          (std::min)(remaining, size_t(entry.second.geosetCount));
+    }
+  };
+  addAliasCapacity(m_byModelResource);
+  addAliasCapacity(m_byRuntimeModel);
+  return result;
+}
+
 ShadowModelResourceMemorySnapshot
 ShadowModelResourceCache::memorySnapshot() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);

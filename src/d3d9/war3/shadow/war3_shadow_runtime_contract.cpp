@@ -3186,6 +3186,15 @@ void ShadowModelResourceStore::clear() {
   m_byModelResource.clear();
 }
 
+void ShadowModelResourceStore::reserve(size_t geosetRecordCapacity,
+                                       size_t runtimeAliasCapacity) {
+  m_records.reserve(geosetRecordCapacity);
+  m_byRuntimeGeoset.reserve(geosetRecordCapacity);
+  m_byRuntimeGeosetData.reserve(geosetRecordCapacity);
+  m_byModelResource.reserve(geosetRecordCapacity);
+  m_byRuntimeModel.reserve(runtimeAliasCapacity);
+}
+
 void ShadowModelResourceStore::add(ShadowModelResourceRecord record) {
   const size_t index = m_records.size();
   m_records.emplace_back(std::move(record));
@@ -3968,6 +3977,9 @@ void ShadowRuntimeContractCache::captureLiveState() {
     auto resourceStoreScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/ResourceStoreBuild");
     auto freshResources = std::make_shared<ShadowModelResourceStore>();
+    const auto capacityHint = resourceCache.resourceStoreCapacityHint();
+    freshResources->reserve(capacityHint.geosetRecordUpperBound,
+                            capacityHint.runtimeAliasUpperBound);
     resourceCache.forEachGeosetContractSource(
         [&](const model::ShadowGeosetResourceRecord& geoset,
             const model::ShadowGeosetResourceRecord* alias) {
