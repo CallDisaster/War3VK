@@ -1006,6 +1006,11 @@ struct ShadowPoseFullTraceConfigSnapshot {
 };
 
 std::mutex g_shadowPoseFullTraceMutex;
+// Start enabled so the first caller performs the one-time environment probe.
+// Once that probe proves tracing is disabled, render hot paths can return
+// without contending on the trace mutex. Start/stop and terminal trace states
+// republish this gate while holding g_shadowPoseFullTraceMutex.
+std::atomic<bool> g_shadowPoseFullTraceFastEnabled{true};
 std::ofstream g_shadowPoseFullTraceStream;
 bool g_shadowPoseFullTraceEnvLoaded = false;
 bool g_shadowPoseFullTraceEnvEnabled = false;
@@ -1153,7 +1158,13 @@ ShadowPoseFullTraceConfigSnapshot ShadowPoseFullTraceConfigLocked() {
   config.finalCasterSampleBytes =
       g_shadowPoseFullTraceFinalCasterSampleBytes;
   config.epoch = g_shadowPoseFullTraceEpoch;
+  g_shadowPoseFullTraceFastEnabled.store(config.enabled,
+                                         std::memory_order_release);
   return config;
+}
+
+bool ShadowPoseFullTraceFastEnabled() noexcept {
+  return g_shadowPoseFullTraceFastEnabled.load(std::memory_order_acquire);
 }
 
 bool ShadowPoseFullTraceDeadlineReachedLocked() {
@@ -2553,6 +2564,7 @@ bool EnsureShadowPoseFullTraceOpenLocked(
   if (!g_shadowPoseFullTraceStream.is_open()) {
     Logger::err("DXVK War3Shadow: failed to open shadow pose full trace log");
     g_shadowPoseFullTraceStoppedByLimit = true;
+    g_shadowPoseFullTraceFastEnabled.store(false, std::memory_order_release);
     return false;
   }
 
@@ -2594,6 +2606,9 @@ void MaybeWriteShadowPoseFullTrace(
     const ShadowRuntimeCadenceSample& sample,
     const War3ShadowCaptureStats& stats,
     const CurrentDrawContractDiagnosticsSummary& currentDraw) {
+  if (!ShadowPoseFullTraceFastEnabled())
+    return;
+
   ShadowPoseFullTraceConfigSnapshot config = {};
   {
     std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
@@ -2602,6 +2617,8 @@ void MaybeWriteShadowPoseFullTrace(
       return;
     if (ShadowPoseFullTraceDeadlineReachedLocked()) {
       g_shadowPoseFullTraceStoppedByLimit = true;
+      g_shadowPoseFullTraceFastEnabled.store(false,
+                                             std::memory_order_release);
       CloseShadowPoseFullTraceLocked();
       Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
                    "duration limit");
@@ -2640,6 +2657,7 @@ void MaybeWriteShadowPoseFullTrace(
     return;
   if (ShadowPoseFullTraceDeadlineReachedLocked()) {
     g_shadowPoseFullTraceStoppedByLimit = true;
+    g_shadowPoseFullTraceFastEnabled.store(false, std::memory_order_release);
     CloseShadowPoseFullTraceLocked();
     Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
                  "duration limit");
@@ -4574,6 +4592,8 @@ void NoteFinalShadowCasterFrame(
     uint64_t frameSerial) {
   if (frameSerial == 0u)
     return;
+  if (!ShadowPoseFullTraceFastEnabled())
+    return;
 
   std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
   auto config = ShadowPoseFullTraceConfigLocked();
@@ -4581,6 +4601,7 @@ void NoteFinalShadowCasterFrame(
     return;
   if (ShadowPoseFullTraceDeadlineReachedLocked()) {
     g_shadowPoseFullTraceStoppedByLimit = true;
+    g_shadowPoseFullTraceFastEnabled.store(false, std::memory_order_release);
     CloseShadowPoseFullTraceLocked();
     Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
                  "duration limit");
@@ -4692,6 +4713,8 @@ void NoteCurrentDrawSnapshotFrame(
     uint64_t frameSerial) {
   if (frameSerial == 0u)
     return;
+  if (!ShadowPoseFullTraceFastEnabled())
+    return;
 
   std::lock_guard<std::mutex> lock(g_shadowPoseFullTraceMutex);
   auto config = ShadowPoseFullTraceConfigLocked();
@@ -4699,6 +4722,7 @@ void NoteCurrentDrawSnapshotFrame(
     return;
   if (ShadowPoseFullTraceDeadlineReachedLocked()) {
     g_shadowPoseFullTraceStoppedByLimit = true;
+    g_shadowPoseFullTraceFastEnabled.store(false, std::memory_order_release);
     CloseShadowPoseFullTraceLocked();
     Logger::info("DXVK War3Shadow: shadow pose full trace stopped by "
                  "duration limit");
@@ -4944,6 +4968,7 @@ void StartShadowPoseFullTrace(uint32_t maxSeconds, bool includeMatrixBytes,
   g_shadowPoseFullTraceStart = {};
   g_shadowPoseFullTracePath.clear();
   ++g_shadowPoseFullTraceEpoch;
+  g_shadowPoseFullTraceFastEnabled.store(true, std::memory_order_release);
 }
 
 void StopShadowPoseFullTrace() {
@@ -4954,6 +4979,7 @@ void StopShadowPoseFullTrace() {
   g_shadowPoseFullTraceLastFinalCasterFrameSerial = 0u;
   g_shadowPoseFullTraceLastFinalCasterScene = nullptr;
   CloseShadowPoseFullTraceLocked();
+  g_shadowPoseFullTraceFastEnabled.store(false, std::memory_order_release);
 }
 
 ShadowPoseFullTraceStatus QueryShadowPoseFullTraceStatus() {
@@ -9631,6 +9657,10 @@ void ResetShadowRuntimeBridgeState() {
     g_shadowPoseFullTraceStart = {};
     g_shadowPoseFullTracePath.clear();
     ++g_shadowPoseFullTraceEpoch;
+    g_shadowPoseFullTraceFastEnabled.store(
+        g_shadowPoseFullTraceEnvEnabled ||
+            g_shadowPoseFullTraceManualEnabled,
+        std::memory_order_release);
   }
   shadow::NativeD3D9BackendRuntime::instance().reset();
 }
