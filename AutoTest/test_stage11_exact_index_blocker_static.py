@@ -42,7 +42,7 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         cls.capture = cls.device[capture_start:]
         cls.producer = source_block(
             cls.device,
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()",
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(",
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()",
         )
         cls.grouped = source_block(
@@ -947,10 +947,9 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         )
 
         manifest = source_block(
-            self.grouped,
-            "std::vector<dxvk::war3::render::CurrentDrawContractRecord>\n"
-            "      exactSubmittedManifestRecords;",
-            "shadowEligibleManifestRecords.reserve(",
+            self.producer,
+            "const auto appendExactSubmittedManifestRecord =",
+            "uint32_t submitted = 0u;",
         )
         self.assertIn(
             "exactRecord.objectKind = entry.objectKind;",

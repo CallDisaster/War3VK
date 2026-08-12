@@ -63,6 +63,7 @@ struct ShadowSubmissionFrame;
 }
 namespace render {
 enum class ObjectKind : uint8_t;
+struct CurrentDrawContractRecord;
 struct CurrentDrawAuthoritativeSample;
 }
 namespace gpu_skin {
@@ -3064,7 +3065,9 @@ private:
   bool War3DrawTimeAnonymousMarkerRejectionActive(
       void* renderablePart, void* meshPayloadPtr,
       uint32_t layerIndex) const;
-  uint32_t War3TryPopulateDrawTimeSemanticProducer();
+  uint32_t War3TryPopulateDrawTimeSemanticProducer(
+      std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+          exactSubmittedManifestRecords);
   void War3ObservePersistentPackageStage11Evidence(
       const War3DrawTimeVBCacheKey& key,
       const War3DrawTimeVBEntry& entry, int16_t exactProducerStage,
@@ -3088,7 +3091,9 @@ private:
       bool readyOnly,
       bool unitsOnly,
       uint64_t currentVisibleFrameSerial,
-      uint64_t currentDrawMinVisibleFrameSerial);
+      uint64_t currentDrawMinVisibleFrameSerial,
+      const std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+          exactSubmittedManifestRecords);
   uint32_t War3TryPopulateSemanticShadowScene(
       bool unitsOnly,
       bool executeNativeBackendValidation = false);

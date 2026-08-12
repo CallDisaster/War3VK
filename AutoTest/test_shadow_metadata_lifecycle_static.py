@@ -77,7 +77,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             self.assertIn(contract, capture_block, contract)
         self.assertNotIn("vbCacheLayerIndex = 0", capture_block)
         producer = DEVICE.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = DEVICE.index("War3ShadowCasterDraw draw = {};", producer)
         producer_block = DEVICE[producer:producer_end]
@@ -103,7 +103,8 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
     def test_stage11_exact_owner_precedes_and_suppresses_grouped_fallback(self) -> None:
         direct_only = DEVICE.index("if (War3SemanticDirectOnlyRuntime())")
         exact_call = DEVICE.index(
-            "War3TryPopulateDrawTimeSemanticProducer();", direct_only
+            "War3TryPopulateDrawTimeSemanticProducer(\n"
+            "          exactSubmittedManifestRecords);", direct_only
         )
         grouped_call = DEVICE.index(
             "War3TryPopulateDirectCurrentDrawGrouped(", exact_call
@@ -112,7 +113,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
         self.assertIn("uint64_t exactOwnerFrameSerial = 0u;", DEVICE_H)
 
         producer = DEVICE.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = DEVICE.index(
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()", producer
@@ -155,7 +156,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
     def test_exact_submission_refreshes_manifest_selection_and_core_without_lease(self) -> None:
         self.assertIn("uint64_t exactSubmittedFrameSerial = 0u;", DEVICE_H)
         producer = DEVICE.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = DEVICE.index(
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()", producer
@@ -184,10 +185,6 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
         )
         self.assertLess(exact_records, manifest_publish)
         for contract in (
-            "for (const auto& [cacheKey, entry] : m_war3DrawTimeVBCache)",
-            "entry.exactSubmittedFrameSerial",
-            "exactRecord.producerFreshThisFrame = true",
-            "ShadowProducerKind::DrawTimeGeometry",
             "shadowEligibleManifestRecords.insert(",
             "for (const auto& exactRecord : exactSubmittedManifestRecords)",
             "currentPartKeys.insert(partKey)",
@@ -197,6 +194,18 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             "exactCorePartCount",
         ):
             self.assertIn(contract, grouped_block, contract)
+        for producer_contract in (
+            "for (auto& [cacheKey, entry] : m_war3DrawTimeVBCache)",
+            "entry.exactSubmittedFrameSerial",
+            "exactRecord.producerFreshThisFrame = true",
+            "ShadowProducerKind::DrawTimeGeometry",
+            "appendExactSubmittedManifestRecord(",
+        ):
+            self.assertIn(producer_contract, producer_block, producer_contract)
+        self.assertNotIn(
+            "for (const auto& [cacheKey, entry] : m_war3DrawTimeVBCache)",
+            grouped_block,
+        )
 
         merge = grouped_block.index(
             "The exact producer already published these casters"
@@ -229,7 +238,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
 
     def test_static_world_cards_use_exact_native_owner_not_unit_skinning(self) -> None:
         producer = DEVICE.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = DEVICE.index(
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()", producer
@@ -264,7 +273,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
 
     def test_buildings_use_exact_current_frame_owner(self) -> None:
         producer = DEVICE.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = DEVICE.index(
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()", producer

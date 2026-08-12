@@ -24372,11 +24372,63 @@ void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(
   }
 }
 
-uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
+uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(
+    std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+        exactSubmittedManifestRecords) {
   auto& visibleRegistry =
       dxvk::war3::render::VisibleRenderableRegistry::instance();
+  exactSubmittedManifestRecords.clear();
   if (m_war3DrawTimeVBCache.empty())
     return 0u;
+
+  exactSubmittedManifestRecords.reserve(m_war3DrawTimeVBCache.size());
+  const uint64_t manifestFrame = visibleRegistry.getFrameNumber();
+  const uint32_t currentRenderFrameIndex =
+      dxvk::war3::state::RenderState::instance().getFrameIndex();
+  const auto appendExactSubmittedManifestRecord = [&]
+      (const War3DrawTimeVBEntry& entry) {
+    dxvk::war3::render::CurrentDrawContractRecord exactRecord = {};
+    exactRecord.known = true;
+    exactRecord.sceneNode = entry.sceneNode;
+    exactRecord.renderablePart = entry.renderablePart;
+    exactRecord.meshPayloadPtr = entry.meshPayloadPtr;
+    exactRecord.worldObjectEntry = entry.worldObjectEntry;
+    exactRecord.unitPtr = entry.unitPtr;
+    exactRecord.jHandle =
+        entry.jHandle != 0u ? entry.jHandle : entry.contractJHandle;
+    exactRecord.rawcode = entry.rawcode;
+    // Preserve the historical manifest identity exactly.  The actual caster
+    // may use current visible-record enrichment, but that evidence never
+    // authorized the old grouped manifest scan to promote an Unknown entry.
+    exactRecord.objectKind = entry.objectKind;
+    if (War3SemanticRawcodeLooksStaticWorldCaster(exactRecord.rawcode)) {
+      exactRecord.objectKind =
+          dxvk::war3::render::ObjectKind::Destructible;
+    }
+    exactRecord.layerIndex = entry.layerIndex;
+    exactRecord.payloadWord108 = entry.payloadWord108;
+    exactRecord.payloadWord11C = entry.payloadWord11C;
+    exactRecord.stage =
+        entry.producerStage >= 0 ? entry.producerStage : int16_t(11);
+    exactRecord.visibleFrameSerial = manifestFrame;
+    exactRecord.renderFrameIndex = currentRenderFrameIndex;
+    exactRecord.batchTag = War3BatchTag::WorldObjects;
+    exactRecord.producerStage = exactRecord.stage;
+    exactRecord.producerGroup = War3BatchTag::WorldObjects;
+    exactRecord.sourceKind =
+        dxvk::war3::render::ShadowProducerKind::DrawTimeGeometry;
+    exactRecord.producerFreshThisFrame = true;
+    exactRecord.stagePolicyRevision =
+        dxvk::war3::render::CurrentShadowStagePolicyRevision();
+    exactRecord.fromGrace = false;
+    exactRecord.graceAge = 0u;
+    exactRecord.pathBlocker =
+        entry.pathBlocker || entry.pathBlockerGeometryMarker ||
+        IsLosBlockerFourCc(exactRecord.rawcode);
+    exactRecord.alphaPayloadComplete =
+        !entry.alphaTestEnabled || entry.HasCompleteAlphaPayload();
+    exactSubmittedManifestRecords.push_back(std::move(exactRecord));
+  };
 
   uint32_t submitted = 0u;
   if (!War3DrawTimeCurrentFrameGeometryRuntime() &&
@@ -24461,6 +24513,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
 
     m_war3Scene.shadowStats.drawTimeSemanticProducerVisibleCandidateCount++;
     if (entry.exactOwnerFrameSerial == m_war3ShadowPersistentFrameSerial) {
+      if (entry.exactSubmittedFrameSerial ==
+          m_war3ShadowPersistentFrameSerial) {
+        appendExactSubmittedManifestRecord(entry);
+      }
       continue;
     }
 
@@ -24739,6 +24795,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer() {
       m_war3Scene.shadowStats.semanticSceneSubmittedAlphaBlend++;
     m_war3Scene.shadowStats.drawTimeSemanticProducerSubmittedCount++;
     entry.exactSubmittedFrameSerial = m_war3ShadowPersistentFrameSerial;
+    appendExactSubmittedManifestRecord(entry);
     entry.packageLastSubmittedCaptureOrdinal = entry.packageCaptureOrdinal;
     if (packageStage11EvidenceMode != dxvk::war3::gpu_skin::
             War3PersistentGpuPackageStage11ObserveAdapter::Mode::Off) {
@@ -25410,7 +25467,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     bool readyOnly,
     bool unitsOnly,
     uint64_t currentVisibleFrameSerial,
-    uint64_t currentDrawMinVisibleFrameSerial) {
+    uint64_t currentDrawMinVisibleFrameSerial,
+    const std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
+        exactSubmittedManifestRecords) {
   auto directGroupedScope =
       war3::War3PerfMonitor::instance().cpuScope("DirectGrouped");
   std::optional<war3::War3PerfMonitor::ScopedCpuScope> directPhaseScope;
@@ -26293,63 +26352,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                             : uint32_t(recordIndicesForBuild.size())));
   std::vector<dxvk::war3::render::CurrentDrawContractRecord>
       shadowEligibleManifestRecords;
-  std::vector<dxvk::war3::render::CurrentDrawContractRecord>
-      exactSubmittedManifestRecords;
-  exactSubmittedManifestRecords.reserve(m_war3DrawTimeVBCache.size());
-  const uint32_t currentRenderFrameIndex =
-      dxvk::war3::state::RenderState::instance().getFrameIndex();
-  for (const auto& [cacheKey, entry] : m_war3DrawTimeVBCache) {
-    if (entry.frameSerial != m_war3ShadowPersistentFrameSerial ||
-        entry.exactOwnerFrameSerial != m_war3ShadowPersistentFrameSerial ||
-        entry.exactSubmittedFrameSerial !=
-            m_war3ShadowPersistentFrameSerial ||
-        !entry.MatchesKey(cacheKey) || !entry.HasCompleteBacking()) {
-      continue;
-    }
-
-    dxvk::war3::render::CurrentDrawContractRecord exactRecord = {};
-    exactRecord.known = true;
-    exactRecord.sceneNode = entry.sceneNode;
-    exactRecord.renderablePart = entry.renderablePart;
-    exactRecord.meshPayloadPtr = entry.meshPayloadPtr;
-    exactRecord.worldObjectEntry = entry.worldObjectEntry;
-    exactRecord.unitPtr = entry.unitPtr;
-    exactRecord.jHandle =
-        entry.jHandle != 0u ? entry.jHandle : entry.contractJHandle;
-    exactRecord.rawcode = entry.rawcode;
-    // Preserve Unknown.  A cache/part identity is not proof that this draw is
-    // a Unit; promoting it here allowed anonymous path markers to enter the
-    // Unit-only final-caster exemption.
-    exactRecord.objectKind = entry.objectKind;
-    exactRecord.layerIndex = entry.layerIndex;
-    if (War3SemanticRawcodeLooksStaticWorldCaster(exactRecord.rawcode)) {
-      exactRecord.objectKind =
-          dxvk::war3::render::ObjectKind::Destructible;
-    }
-    exactRecord.payloadWord108 = entry.payloadWord108;
-    exactRecord.payloadWord11C = entry.payloadWord11C;
-    exactRecord.stage = entry.producerStage >= 0
-                            ? entry.producerStage
-                            : int16_t(11);
-    exactRecord.visibleFrameSerial = manifestFrame;
-    exactRecord.renderFrameIndex = currentRenderFrameIndex;
-    exactRecord.batchTag = War3BatchTag::WorldObjects;
-    exactRecord.producerStage = exactRecord.stage;
-    exactRecord.producerGroup = War3BatchTag::WorldObjects;
-    exactRecord.sourceKind =
-        dxvk::war3::render::ShadowProducerKind::DrawTimeGeometry;
-    exactRecord.producerFreshThisFrame = true;
-    exactRecord.stagePolicyRevision =
-        dxvk::war3::render::CurrentShadowStagePolicyRevision();
-    exactRecord.fromGrace = false;
-    exactRecord.graceAge = 0u;
-    exactRecord.pathBlocker =
-        entry.pathBlocker || entry.pathBlockerGeometryMarker ||
-        IsLosBlockerFourCc(exactRecord.rawcode);
-    exactRecord.alphaPayloadComplete =
-        !entry.alphaTestEnabled || entry.HasCompleteAlphaPayload();
-    exactSubmittedManifestRecords.push_back(std::move(exactRecord));
-  }
   shadowEligibleManifestRecords.reserve(recordIndicesForBuild.size() +
                                          exactSubmittedManifestRecords.size());
   shadowEligibleManifestRecords.insert(
@@ -30256,6 +30258,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
                 : uint64_t(1u);
   dxvk::war3::shadow::NativeD3D9BackendRuntime::instance()
       .beginCanonicalFrame(canonicalNativeFrameSerial);
+  std::vector<dxvk::war3::render::CurrentDrawContractRecord>
+      exactSubmittedManifestRecords;
   if (War3SemanticDirectOnlyRuntime()) {
     // Stage11 has exactly one preferred current-frame representation.  Run
     // the native draw-time owner first; DirectGrouped then supplements only
@@ -30266,7 +30270,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     if (War3SemanticDrawTimeDirectProducerRuntime()) {
       const uint32_t drawTimeClaimedBefore =
           m_war3Scene.shadowStats.drawTimeSemanticProducerClaimedCount;
-      drawTimeSubmitted = War3TryPopulateDrawTimeSemanticProducer();
+      drawTimeSubmitted = War3TryPopulateDrawTimeSemanticProducer(
+          exactSubmittedManifestRecords);
       if (m_war3Scene.shadowStats.drawTimeSemanticProducerClaimedCount ==
           drawTimeClaimedBefore) {
         m_war3Scene.shadowStats
@@ -30276,7 +30281,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     // Phase 7.1: 使用 object-grouped helper 替代原始逐 record 提交
     const uint32_t directSubmitted = War3TryPopulateDirectCurrentDrawGrouped(
         /*readyOnly=*/true, unitsOnly,
-        currentVisibleFrameSerial, currentDrawMinVisibleFrameSerial);
+        currentVisibleFrameSerial, currentDrawMinVisibleFrameSerial,
+        exactSubmittedManifestRecords);
     const uint32_t totalDirectSubmitted =
         directSubmitted + drawTimeSubmitted;
     if (totalDirectSubmitted != 0u) {
@@ -30806,7 +30812,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(
     // Phase 7.1: 使用 object-grouped helper 替代原始逐 record 提交（fallback 路径，readyOnly=false）
     if (const uint32_t directSubmitted = War3TryPopulateDirectCurrentDrawGrouped(
             /*readyOnly=*/false, unitsOnly,
-            currentVisibleFrameSerial, currentDrawMinVisibleFrameSerial);
+            currentVisibleFrameSerial, currentDrawMinVisibleFrameSerial,
+            exactSubmittedManifestRecords);
         directSubmitted != 0u) {
       bool nativeDirectPrepared = false;
       bool nativeDirectExecuted = false;

@@ -138,7 +138,7 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
         self.assertIn("vbIt->second.MatchesKey(cacheKey)", consume_block)
 
         producer = self.device.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
         producer_end = self.device.index(
             "War3ShadowCasterDraw draw = {};", producer
@@ -178,9 +178,12 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
             capture_gate_block,
         )
         producer = self.device.index(
-            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer()"
+            "uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer("
         )
-        producer_block = self.device[producer:producer + 500]
+        producer_end = self.device.index(
+            "War3ShadowCasterDraw draw = {};", producer
+        )
+        producer_block = self.device[producer:producer_end]
         self.assertIn("War3DrawTimeCurrentFrameGeometryRuntime()", producer_block)
         self.assertIn("!War3DrawTimeVBCacheRuntime()", producer_block)
 
