@@ -7044,7 +7044,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto resourceSetupScope = War3SemanticSubmitScope(
         "War3SemanticScene/Direct/ResourceSetup");
-    resource.resourceKeepAlive = sharedGeoset;
+    // The packet is the final owner for this build result. The Populate-local
+    // snapshot cache already took its own reference above, so move the local
+    // owner instead of paying another shared_ptr atomic increment/decrement
+    // for every caster. `geo` remains valid through resourceKeepAlive.
+    resource.resourceKeepAlive = std::move(sharedGeoset);
     resource.modelResourcePtr = renderable.modelResourcePtr;
     resource.modelKey = renderable.modelKey;
     resource.geosetIndex = geo.geosetIndex;
