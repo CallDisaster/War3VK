@@ -5500,9 +5500,7 @@ War3MapCurrentDrawPrimitiveTypeToTopology(uint32_t primitiveType) {
   }
 }
 
-uint64_t War3ComputeCurrentDrawVisibleIndexSliceHash(
-    const dxvk::war3::render::CurrentDrawContractRecord& record,
-    const dxvk::war3::shadow::ShadowRenderableRecord& renderable,
+uint64_t War3ComputeCurrentDrawVisibleIndexSliceContentHash(
     const dxvk::war3::model::ShadowGeosetResourceRecord& geoset,
     uint32_t primitiveIndex, uint32_t baseIndex, uint32_t indexCount,
     dxvk::war3::shadow::ShadowPrimitiveTopology topology,
@@ -5510,11 +5508,6 @@ uint64_t War3ComputeCurrentDrawVisibleIndexSliceHash(
   uint64_t hash = bit::fnv1a_init();
   hash = bit::fnv1a_iter(hash, geoset.contentHash);
   hash = bit::fnv1a_iter(hash, uint64_t(geoset.geosetIndex));
-  hash = bit::fnv1a_iter(hash, renderable.layerIndex);
-  hash = bit::fnv1a_iter(hash, renderable.subIndex);
-  hash = bit::fnv1a_iter(hash, record.layerIndex);
-  hash = bit::fnv1a_iter(hash, record.payloadWord108);
-  hash = bit::fnv1a_iter(hash, record.payloadWord11C);
   hash = bit::fnv1a_iter(hash, primitiveIndex);
   hash = bit::fnv1a_iter(hash, baseIndex);
   hash = bit::fnv1a_iter(hash, indexCount);
@@ -5527,6 +5520,20 @@ uint64_t War3ComputeCurrentDrawVisibleIndexSliceHash(
     for (uint32_t i = tailStart; i < indexCount; ++i)
       hash = bit::fnv1a_iter(hash, uint32_t(indices[i]));
   }
+  return hash;
+}
+
+uint64_t War3ComputeCurrentDrawVisibleIndexSliceHash(
+    const dxvk::war3::render::CurrentDrawContractRecord& record,
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable,
+    uint64_t immutableSliceContentHash) {
+  uint64_t hash = bit::fnv1a_init();
+  hash = bit::fnv1a_iter(hash, renderable.layerIndex);
+  hash = bit::fnv1a_iter(hash, renderable.subIndex);
+  hash = bit::fnv1a_iter(hash, record.layerIndex);
+  hash = bit::fnv1a_iter(hash, record.payloadWord108);
+  hash = bit::fnv1a_iter(hash, record.payloadWord11C);
+  hash = bit::fnv1a_iter(hash, immutableSliceContentHash);
   return hash;
 }
 
@@ -5545,7 +5552,8 @@ public:
             std::shared_ptr<const std::vector<uint16_t>>& outIndices,
             uint32_t& outBaseIndex,
             uint32_t& outIndexCount,
-            dxvk::war3::shadow::ShadowPrimitiveTopology& outTopology) {
+            dxvk::war3::shadow::ShadowPrimitiveTopology& outTopology,
+            uint64_t& outContentHash) {
     if (!m_enabled) {
       ++m_bypassCount;
       return false;
@@ -5566,6 +5574,7 @@ public:
         outBaseIndex = frameEntry.baseIndex;
         outIndexCount = frameEntry.indexCount;
         outTopology = frameEntry.topology;
+        outContentHash = frameEntry.contentHash;
         ++m_hitCount;
         return true;
       }
@@ -5581,6 +5590,7 @@ public:
       outBaseIndex = entry.baseIndex;
       outIndexCount = entry.indexCount;
       outTopology = entry.topology;
+      outContentHash = entry.contentHash;
       ++m_hitCount;
       return true;
     }
@@ -5593,7 +5603,8 @@ public:
              std::shared_ptr<const std::vector<uint16_t>> indices,
              uint32_t baseIndex,
              uint32_t indexCount,
-             dxvk::war3::shadow::ShadowPrimitiveTopology topology) {
+             dxvk::war3::shadow::ShadowPrimitiveTopology topology,
+             uint64_t contentHash) {
     if (!m_enabled || geoset == nullptr || !geoset->readyForShadowConsumer() ||
         geoset->mapEpoch == 0u || geoset->immutableModelGeneration == 0u ||
         indices == nullptr || indices->empty()) {
@@ -5601,7 +5612,8 @@ public:
     }
     const Entry stored = {
         geoset, geoset->mapEpoch, geoset->immutableModelGeneration,
-        primitiveIndex, std::move(indices), baseIndex, indexCount, topology};
+        primitiveIndex, std::move(indices), baseIndex, indexCount, topology,
+        contentHash};
     if (m_generationReuseEnabled) {
       generationEntries()[slotFor(geoset, primitiveIndex)] = stored;
       return;
@@ -5628,6 +5640,7 @@ private:
     uint32_t indexCount = 0u;
     dxvk::war3::shadow::ShadowPrimitiveTopology topology =
         dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
+    uint64_t contentHash = 0u;
   };
 
   static constexpr size_t kEntryCount = 256u;
@@ -6021,12 +6034,13 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
     dxvk::war3::shadow::ShadowPrimitiveTopology topology =
         dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
     std::shared_ptr<const std::vector<uint16_t>> owned;
+    uint64_t immutableSliceContentHash = 0u;
     if (packetBuildTiming != nullptr)
       packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::CacheLookup);
     const bool cacheHit =
         sliceCache != nullptr &&
         sliceCache->find(&geoset, primitiveIndex, owned, baseIndex, count,
-                         topology);
+                         topology, immutableSliceContentHash);
     if (!cacheHit) {
       if (packetBuildTiming != nullptr)
         packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::PrefixScan);
@@ -6057,9 +6071,13 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
       owned = std::move(mutableOwned);
       topology = War3MapCurrentDrawPrimitiveTypeToTopology(
           primitive.primitiveTypeOrMaterialSlot);
+      immutableSliceContentHash =
+          War3ComputeCurrentDrawVisibleIndexSliceContentHash(
+              geoset, primitiveIndex, baseIndex, count, topology,
+              owned->data());
       if (sliceCache != nullptr) {
         sliceCache->store(&geoset, primitiveIndex, owned, baseIndex, count,
-                          topology);
+                          topology, immutableSliceContentHash);
       }
     }
 
@@ -6067,8 +6085,7 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
       packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::Hash);
     const uint64_t dynamicIndexHash =
         War3ComputeCurrentDrawVisibleIndexSliceHash(
-            record, renderable, geoset, primitiveIndex, baseIndex, count,
-            topology, owned->data());
+            record, renderable, immutableSliceContentHash);
     if (packetBuildTiming != nullptr)
       packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::ResourceWrite);
     resource.ownedDynamicIndices = owned;
