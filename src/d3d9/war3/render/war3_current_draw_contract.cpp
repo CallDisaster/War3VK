@@ -2287,13 +2287,16 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
   //      `DXVK_WAR3_PALETTE_ARBITRATION_STRICT=0` 兼容模式：回退到原 raw arena
   //      行为，供临时回滚调试。
   //   3. raw arena 永远标记 `PaletteProvenance::RawGlobalArena`，仅做诊断。
-  // 2026-07-21 优化：12 KB 栈数组改为 thread_local 复用且不做零初始化。
-  // 下游消费只 memcpy `requiredBytes`（= capturedPaletteCount * 48）前缀，
-  // 数组尾部从不读取；该 publish 路径每帧可达 10K-30K 次，原 `= {}` 每次
-  // 产生 12 KB 无效写带宽（数十 MB/帧）。
-  thread_local std::array<uint8_t, kMaxPaletteMatrices * 48u> trustedPaletteBytes;
+  // Exact writer-backed palettes validate the complete slot range first and
+  // then pack directly into the selected local snapshot. This removes the
+  // former 12 KB thread-local staging buffer and its second memcpy without
+  // allowing a failed query to partially replace the last complete snapshot.
+  const size_t snapshotSlot =
+      SelectLocalPaletteSnapshotSlot(record.renderablePart);
+  auto& snapshot = g_paletteSnapshotCache[snapshotSlot];
   const uint8_t* paletteSource = nullptr;
   PaletteProvenance provenance = PaletteProvenance::Unknown;
+  bool paletteAlreadyStoredInSnapshot = false;
   {
     CurrentDrawFixedPhaseScope trustedPalettePhase(
         dxvk::war3::hooks::War3HotHookId::
@@ -2302,9 +2305,10 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
     if (PaletteAttributionSnapshotEnabled() &&
         dxvk::war3::model::CopyBlendedPaletteBytesBySlotIndexExact(
             record.paletteSlotIndex, record.capturedPaletteCount,
-            record.frameTag, trustedPaletteBytes.data(), requiredBytes)) {
-      paletteSource = trustedPaletteBytes.data();
+            record.frameTag, snapshot.bytes.data(), snapshot.bytes.size())) {
+      paletteSource = snapshot.bytes.data();
       provenance = PaletteProvenance::TrustedBlendedWriter;
+      paletteAlreadyStoredInSnapshot = true;
       g_paletteCaptureTrustedSourceHitCount.fetch_add(
           1u, std::memory_order_relaxed);
       if (CurrentDrawRedundantAtomicsLegacyRuntime()) {
@@ -2393,10 +2397,6 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
       }
     }
 
-    const size_t snapshotSlot =
-        SelectLocalPaletteSnapshotSlot(record.renderablePart);
-    auto& snapshot = g_paletteSnapshotCache[snapshotSlot];
-
     // Phase 7.34 第三轮曾尝试不让 RawGlobalArena 降级覆盖已有 trusted snapshot。
   // 根因：用户观察到"视角边缘对象（门）在压力下闪烁"。
   // 机制：某帧视锥边缘对象的 trusted cache miss → 若允许 raw arena 覆写
@@ -2421,7 +2421,8 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
     snapshot.matrixCount = record.capturedPaletteCount;
     if (!preserveTrustedSnapshot) {
       snapshot.paletteProvenance = provenance;
-      std::memcpy(snapshot.bytes.data(), paletteSource, requiredBytes);
+      if (!paletteAlreadyStoredInSnapshot)
+        std::memcpy(snapshot.bytes.data(), paletteSource, requiredBytes);
     } else {
       g_paletteSnapshotTrustedPreservedCount.fetch_add(
           1u, std::memory_order_relaxed);

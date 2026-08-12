@@ -464,9 +464,8 @@ bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
                                          void* outPaletteVec);
 
 // Same exact slot/frame contract as QueryBlendedPaletteBySlotIndexExact, but
-// writes War3's packed 3x4 byte representation directly. The destination is
-// consumed only when this function returns true; failed queries may have
-// touched a prefix but never publish it.
+// writes War3's packed 3x4 byte representation directly. The complete range
+// is validated first, so a failed query leaves the destination untouched.
 bool CopyBlendedPaletteBytesBySlotIndexExact(uint32_t slotIndex,
                                              uint32_t expectedCount,
                                              uint32_t expectedFrameTag,

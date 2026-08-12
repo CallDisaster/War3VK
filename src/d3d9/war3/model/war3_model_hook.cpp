@@ -9018,11 +9018,9 @@ std::atomic<uint64_t> g_queryBlendedPaletteBestEffortHitCount{0u};
 //   - BestEffort 版本：保留旧宽松行为，**仅供诊断**，不应参与 ready 仲裁。
 //
 // 调用端必须检查 `outPalette.size() == expectedCount`，否则视为 miss。
-template <typename StoreMatrix>
-bool VisitBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
-                                         uint32_t expectedCount,
-                                         uint32_t expectedFrameTag,
-                                         StoreMatrix&& storeMatrix) {
+bool ValidateBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
+                                            uint32_t expectedCount,
+                                            uint32_t expectedFrameTag) {
   if (expectedCount == 0u || expectedCount > 256u)
     return false;
   if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize) {
@@ -9053,9 +9051,7 @@ bool VisitBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
         return false;
       }
     }
-    storeMatrix(i, entry.matrix);
   }
-  g_queryBlendedPaletteExactHitCount.fetch_add(1u, std::memory_order_relaxed);
   return true;
 }
 
@@ -9065,20 +9061,20 @@ bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
                                          void* outPaletteVec) {
   auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
   outPalette.clear();
+  if (!ValidateBlendedPaletteBySlotIndexExact(
+          slotIndex, expectedCount, expectedFrameTag)) {
+    return false;
+  }
   outPalette.reserve(expectedCount);
-  const bool complete = VisitBlendedPaletteBySlotIndexExact(
-      slotIndex, expectedCount, expectedFrameTag,
-      [&outPalette](uint32_t, const Matrix4& matrix) {
-        outPalette.push_back(matrix);
-      });
-  if (!complete || outPalette.size() != expectedCount) {
-    if (complete) {
-      g_queryBlendedPaletteRejectedShortResultCount.fetch_add(
-          1u, std::memory_order_relaxed);
-    }
+  for (uint32_t i = 0u; i < expectedCount; ++i)
+    outPalette.push_back(s_slotBlendedPaletteCache[slotIndex + i].matrix);
+  if (outPalette.size() != expectedCount) {
+    g_queryBlendedPaletteRejectedShortResultCount.fetch_add(
+        1u, std::memory_order_relaxed);
     outPalette.clear();
     return false;
   }
+  g_queryBlendedPaletteExactHitCount.fetch_add(1u, std::memory_order_relaxed);
   return true;
 }
 
@@ -9091,14 +9087,21 @@ bool CopyBlendedPaletteBytesBySlotIndexExact(
           size_t(expectedCount) * kWar3PackedPaletteMatrixBytes) {
     return false;
   }
+  // Validate the complete range before touching destination. A late invalid
+  // slot or frame-tag mismatch must not partially overwrite the caller's last
+  // complete snapshot.
+  if (!ValidateBlendedPaletteBySlotIndexExact(
+          slotIndex, expectedCount, expectedFrameTag)) {
+    return false;
+  }
   auto* destination = reinterpret_cast<uint8_t*>(outPaletteBytes);
-  return VisitBlendedPaletteBySlotIndexExact(
-      slotIndex, expectedCount, expectedFrameTag,
-      [destination](uint32_t index, const Matrix4& matrix) {
-        PackWar3PaletteMatrix3x4(
-            matrix, destination +
-                size_t(index) * kWar3PackedPaletteMatrixBytes);
-      });
+  for (uint32_t i = 0u; i < expectedCount; ++i) {
+    PackWar3PaletteMatrix3x4(
+        s_slotBlendedPaletteCache[slotIndex + i].matrix,
+        destination + size_t(i) * kWar3PackedPaletteMatrixBytes);
+  }
+  g_queryBlendedPaletteExactHitCount.fetch_add(1u, std::memory_order_relaxed);
+  return true;
 }
 
 // Phase 7.34：诊断用的 best-effort 查询，允许 partial 返回。
