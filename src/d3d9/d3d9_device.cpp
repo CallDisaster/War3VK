@@ -6970,7 +6970,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       if (explicitVertexCount != 0u && explicitPaletteLimit != 0u &&
           dxvk::war3::shadow::TryResolveExplicitBlendSkinningForRenderable(
               renderable, explicitVertexCount, explicitPaletteLimit,
-              maxExpectedGroupSize, explicitPalette, explicitBlend, nullptr)) {
+              maxExpectedGroupSize, explicitPalette,
+              false, explicitBlend, nullptr)) {
         resource.ownedVertexBlendWeights = std::move(explicitBlend.weights);
         resource.vertexBlendWeights = &resource.ownedVertexBlendWeights;
         resource.ownedVertexBlendIndices = std::move(explicitBlend.indices);
@@ -6978,12 +6979,14 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         resource.explicitBlendCount = explicitBlend.blendCount;
         resource.contentHash =
             bit::fnv1a_iter(resource.contentHash, explicitBlend.dynamicHash);
-        if (!explicitBlend.runtimeGroupPalette.empty()) {
-          out.runtimeGroupPalette = std::move(explicitBlend.runtimeGroupPalette);
-          out.runtimeGroupPaletteHash = War3SemanticHashMatrixPalette(
-              out.runtimeGroupPalette.data(),
-              uint32_t(out.runtimeGroupPalette.size()));
-        }
+        // The direct packet already owns the exact input palette. The
+        // resolver selected a prefix of that same sequence, so trim in place
+        // instead of allocating and copying an identical result vector.
+        out.runtimeGroupPalette.resize(
+            size_t(explicitBlend.maxGroupSlot) + 1u);
+        out.runtimeGroupPaletteHash = War3SemanticHashMatrixPalette(
+            out.runtimeGroupPalette.data(),
+            uint32_t(out.runtimeGroupPalette.size()));
         directExplicitBlendResolved = true;
         directExplicitBlendMaxGroupSlot = explicitBlend.maxGroupSlot;
       }

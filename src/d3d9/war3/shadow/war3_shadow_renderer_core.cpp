@@ -5932,6 +5932,7 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
     const ShadowRenderableRecord& renderable, uint32_t vertexCount,
     uint32_t posePaletteLimit, uint32_t maxExpectedGroupSize,
     ShadowMatrixPaletteView posePalette,
+    bool materializeRuntimeGroupPalette,
     const MeshLayerBindingContract* layerContract,
     ExplicitBlendSkinResult& outResult, ShadowResolveStats* ioStats = nullptr) {
   outResult = {};
@@ -6251,8 +6252,10 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
     return false;
   }
 
-  outResult.runtimeGroupPalette.assign(
-      posePalette.data, posePalette.data + size_t(maxGroupSlot + 1u));
+  if (materializeRuntimeGroupPalette) {
+    outResult.runtimeGroupPalette.assign(
+        posePalette.data, posePalette.data + size_t(maxGroupSlot + 1u));
+  }
   outResult.maxGroupSlot = maxGroupSlot;
   outResult.dynamicHash = bit::fnv1a_iter(
       bit::fnv1a_iter(
@@ -6968,6 +6971,7 @@ bool TryResolveExplicitBlendSkinningForRenderable(
     uint32_t posePaletteLimit,
     uint32_t maxExpectedGroupSize,
     ShadowMatrixPaletteView posePalette,
+    bool materializeRuntimeGroupPalette,
     ShadowExplicitBlendSkinningResult& outResult,
     ShadowResolveStats* ioStats) {
   outResult = {};
@@ -6979,7 +6983,8 @@ bool TryResolveExplicitBlendSkinningForRenderable(
   ExplicitBlendSkinResult internal = {};
   if (!TryResolveMeshDynamicExplicitBlendSkinning(
           renderable, vertexCount, posePaletteLimit, maxExpectedGroupSize,
-          posePalette, &layerContract, internal, ioStats)) {
+          posePalette, materializeRuntimeGroupPalette, &layerContract,
+          internal, ioStats)) {
     return false;
   }
 
@@ -8396,7 +8401,8 @@ bool ShadowRendererCore::resolveRecord(const ShadowRenderableRecord& record,
             TryResolveMeshDynamicExplicitBlendSkinning(
                 resolvedRenderable, resolvedVertexCountEarly,
                 uint32_t((std::min)(pose.matrixPalette.size(), size_t(256u))),
-                maxExpectedGroupSize, explicitPosePalette, &layerContract,
+                maxExpectedGroupSize, explicitPosePalette,
+                true, &layerContract,
                 explicitBlendRescue, &ioStats)) {
           outPacket.resource.ownedVertexBlendWeights =
               std::move(explicitBlendRescue.weights);

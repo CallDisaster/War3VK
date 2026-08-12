@@ -257,6 +257,7 @@ bool TryResolveExplicitBlendSkinningForRenderable(
     uint32_t posePaletteLimit,
     uint32_t maxExpectedGroupSize,
     ShadowMatrixPaletteView posePalette,
+    bool materializeRuntimeGroupPalette,
     ShadowExplicitBlendSkinningResult& outResult,
     ShadowResolveStats* ioStats = nullptr);
 

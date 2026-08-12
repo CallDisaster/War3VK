@@ -20,7 +20,10 @@ assert "ShadowMatrixPaletteView explicitPalette" in body
 assert "out.runtimeGroupPalette.data()" in body
 assert "uint32_t(out.runtimeGroupPalette.size())" in body
 assert "TryResolveExplicitBlendSkinningForRenderable(" in body
-assert "maxExpectedGroupSize, explicitPalette, explicitBlend, nullptr" in body
+assert "maxExpectedGroupSize, explicitPalette,\n              false, explicitBlend, nullptr" in body
+assert "out.runtimeGroupPalette = std::move(explicitBlend.runtimeGroupPalette)" not in body
+assert "out.runtimeGroupPalette.resize(" in body
+assert "size_t(explicitBlend.maxGroupSlot) + 1u" in body
 
 core_header = (
     ROOT / "src/d3d9/war3/shadow/war3_shadow_renderer_core.h"
@@ -32,6 +35,7 @@ assert "struct ShadowMatrixPaletteView" in core_header
 assert "const Matrix4* data = nullptr;" in core_header
 assert "uint32_t size = 0u;" in core_header
 assert "ShadowMatrixPaletteView posePalette" in core_header
+assert "bool materializeRuntimeGroupPalette" in core_header
 resolver = core.split("bool TryResolveMeshDynamicExplicitBlendSkinning(", 1)[1].split(
     "bool TryBuildDirectPosePaletteForDynamicGroups(", 1
 )[0]
@@ -39,6 +43,7 @@ assert "const ShadowPoseRecord& pose" not in resolver
 assert "pose.matrixPalette" not in resolver
 assert "maxGroupSlot >= posePalette.size" in resolver
 assert "posePalette.data + size_t(maxGroupSlot + 1u)" in resolver
-assert "maxExpectedGroupSize, explicitPosePalette, &layerContract" in core
+assert "if (materializeRuntimeGroupPalette)" in resolver
+assert "maxExpectedGroupSize, explicitPosePalette,\n                true, &layerContract" in core
 
 print("direct explicit-blend palette view static checks passed")
