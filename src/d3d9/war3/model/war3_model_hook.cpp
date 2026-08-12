@@ -5,6 +5,7 @@
 #include "war3_model_resource_cache.h"
 #include "war3_model_registry.h"
 #include "war3_direct_pose_cache.h"
+#include "war3_palette_pack.h"
 
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_hook.h"
@@ -9017,12 +9018,11 @@ std::atomic<uint64_t> g_queryBlendedPaletteBestEffortHitCount{0u};
 //   - BestEffort 版本：保留旧宽松行为，**仅供诊断**，不应参与 ready 仲裁。
 //
 // 调用端必须检查 `outPalette.size() == expectedCount`，否则视为 miss。
-bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
+template <typename StoreMatrix>
+bool VisitBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
                                          uint32_t expectedCount,
                                          uint32_t expectedFrameTag,
-                                         void* outPaletteVec) {
-  auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
-  outPalette.clear();
+                                         StoreMatrix&& storeMatrix) {
   if (expectedCount == 0u || expectedCount > 256u)
     return false;
   if (slotIndex + expectedCount > kSlotBlendedPaletteCacheSize) {
@@ -9030,14 +9030,12 @@ bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
         1u, std::memory_order_relaxed);
     return false;
   }
-  outPalette.reserve(expectedCount);
   for (uint32_t i = 0u; i < expectedCount; ++i) {
     const uint32_t s = slotIndex + i;
     const auto& entry = s_slotBlendedPaletteCache[s];
     if (!entry.valid) {
       g_queryBlendedPaletteRejectedInvalidEntryCount.fetch_add(
           1u, std::memory_order_relaxed);
-      outPalette.clear();
       return false;
     }
     // Phase 7.35 路径 1：原先只允许差 1 帧，但相机移动时骨骼计算 0x12E600
@@ -9052,21 +9050,55 @@ bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
       if (delta > 2u) {
         g_queryBlendedPaletteRejectedFrameTagMismatchCount.fetch_add(
             1u, std::memory_order_relaxed);
-        outPalette.clear();
         return false;
       }
     }
-    outPalette.push_back(entry.matrix);
-  }
-  // 最终完整性复查：任何 partial 情形统一判 fail。
-  if (outPalette.size() != expectedCount) {
-    g_queryBlendedPaletteRejectedShortResultCount.fetch_add(
-        1u, std::memory_order_relaxed);
-    outPalette.clear();
-    return false;
+    storeMatrix(i, entry.matrix);
   }
   g_queryBlendedPaletteExactHitCount.fetch_add(1u, std::memory_order_relaxed);
   return true;
+}
+
+bool QueryBlendedPaletteBySlotIndexExact(uint32_t slotIndex,
+                                         uint32_t expectedCount,
+                                         uint32_t expectedFrameTag,
+                                         void* outPaletteVec) {
+  auto& outPalette = *reinterpret_cast<std::vector<Matrix4>*>(outPaletteVec);
+  outPalette.clear();
+  outPalette.reserve(expectedCount);
+  const bool complete = VisitBlendedPaletteBySlotIndexExact(
+      slotIndex, expectedCount, expectedFrameTag,
+      [&outPalette](uint32_t, const Matrix4& matrix) {
+        outPalette.push_back(matrix);
+      });
+  if (!complete || outPalette.size() != expectedCount) {
+    if (complete) {
+      g_queryBlendedPaletteRejectedShortResultCount.fetch_add(
+          1u, std::memory_order_relaxed);
+    }
+    outPalette.clear();
+    return false;
+  }
+  return true;
+}
+
+bool CopyBlendedPaletteBytesBySlotIndexExact(
+    uint32_t slotIndex, uint32_t expectedCount, uint32_t expectedFrameTag,
+    void* outPaletteBytes, size_t outPaletteByteCapacity) {
+  if (outPaletteBytes == nullptr || expectedCount == 0u ||
+      expectedCount > 256u ||
+      outPaletteByteCapacity <
+          size_t(expectedCount) * kWar3PackedPaletteMatrixBytes) {
+    return false;
+  }
+  auto* destination = reinterpret_cast<uint8_t*>(outPaletteBytes);
+  return VisitBlendedPaletteBySlotIndexExact(
+      slotIndex, expectedCount, expectedFrameTag,
+      [destination](uint32_t index, const Matrix4& matrix) {
+        PackWar3PaletteMatrix3x4(
+            matrix, destination +
+                size_t(index) * kWar3PackedPaletteMatrixBytes);
+      });
 }
 
 // Phase 7.34：诊断用的 best-effort 查询，允许 partial 返回。

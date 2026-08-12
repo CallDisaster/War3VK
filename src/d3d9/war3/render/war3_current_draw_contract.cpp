@@ -2299,27 +2299,10 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
         dxvk::war3::hooks::War3HotHookId::
             CurrentDrawPublishTrustedPaletteQueryPack,
         breakdownSampleWeight);
-    // 2026-07-21 优化：trusted 查询的临时 vector 改 thread_local 复用容量，
-    // 避免每次 ready publish 都产生一次堆分配。本函数在同一线程内不可重入，
-    // 复用安全。
-    thread_local std::vector<Matrix4> trustedPalette;
-    trustedPalette.clear();
     if (PaletteAttributionSnapshotEnabled() &&
-        dxvk::war3::model::QueryBlendedPaletteBySlotIndexExact(
+        dxvk::war3::model::CopyBlendedPaletteBytesBySlotIndexExact(
             record.paletteSlotIndex, record.capturedPaletteCount,
-            record.frameTag, &trustedPalette) &&
-        // Phase 7.34 防御：Exact 版本已经保证 size == expected，这里再 double
-        // check 避免任何下游跳变。
-        trustedPalette.size() == record.capturedPaletteCount) {
-      for (uint32_t i = 0u; i < record.capturedPaletteCount; ++i) {
-        const Matrix4& m = trustedPalette[i];
-        float* dst = reinterpret_cast<float*>(
-            trustedPaletteBytes.data() + size_t(i) * 48u);
-        dst[0] = m[0][0]; dst[1] = m[0][1]; dst[2] = m[0][2];
-        dst[3] = m[1][0]; dst[4] = m[1][1]; dst[5] = m[1][2];
-        dst[6] = m[2][0]; dst[7] = m[2][1]; dst[8] = m[2][2];
-        dst[9] = m[3][0]; dst[10] = m[3][1]; dst[11] = m[3][2];
-      }
+            record.frameTag, trustedPaletteBytes.data(), requiredBytes)) {
       paletteSource = trustedPaletteBytes.data();
       provenance = PaletteProvenance::TrustedBlendedWriter;
       g_paletteCaptureTrustedSourceHitCount.fetch_add(

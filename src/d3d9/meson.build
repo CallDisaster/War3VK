@@ -392,6 +392,23 @@ test(
   timeout : 30,
 )
 
+# Byte-exact War3 palette 3x4 pack contract. The hot publish path writes this
+# representation directly instead of materializing an intermediate vector.
+war3_palette_pack_test = executable(
+  'war3_palette_pack_test',
+  [
+    'war3/model/tests/war3_palette_pack_test.cpp',
+    '../util/util_matrix.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_palette_pack',
+  war3_palette_pack_test,
+  timeout : 30,
+)
+
 # Palette decoding already touches every matrix. Lock byte-for-byte identity
 # with the historical FNV oracle while producing that hash in the same pass.
 war3_current_draw_palette_hash_test = executable(
