@@ -81,6 +81,7 @@ d3d9_src = [
   'd3d9_war3_shadow.cpp',
   'd3d9_war3_shadow_resources.cpp',
   'd3d9_war3_shadow_outline.cpp',
+  'd3d9_war3_fog_volume.cpp',
   'd3d9_war3_volumetric_light.cpp',
   'war3/render/war3_hybrid_ray_tracing.cpp',
   'd3d9_war3_ssao.cpp',
@@ -789,6 +790,24 @@ war3_point_shadow_cpu_plan_test = executable(
 test(
   'war3_point_shadow_cpu_plan_foundation',
   war3_point_shadow_cpu_plan_test,
+  timeout : 30,
+)
+
+# CPU-only local-medium manager test. It validates finite input bounds,
+# normalized shape transforms, immutable frame snapshots and map-reset
+# lifetime without constructing a D3D9 device or any GPU resource.
+war3_fog_volume_manager_test = executable(
+  'war3_fog_volume_manager_test',
+  [
+    'd3d9_war3_fog_volume.cpp',
+    'war3/render/tests/war3_fog_volume_manager_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_fog_volume_manager',
+  war3_fog_volume_manager_test,
   timeout : 30,
 )
 

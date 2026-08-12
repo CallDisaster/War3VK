@@ -25,12 +25,24 @@
 namespace dxvk {
 
 namespace {
+// Author-facing/full-screen quality remains clamped to divisor >= 4. A
+// clear-air frame may use an internal half-resolution target only when the
+// conservative local-volume ROI fits the same ray and interaction budgets at
+// the requested sample count.
+constexpr uint32_t kVolumetricLocalRoiResolutionDivisor = 2u;
 constexpr uint32_t kVolumetricMinResolutionDivisor = 4u;
 constexpr uint32_t kVolumetricMaxResolutionDivisor = 8u;
 constexpr int kVolumetricMinSamples = 4;
 constexpr int kVolumetricMaxSamples = 16;
 constexpr uint32_t kVolumetricMaxPointLights = 2u;
+constexpr uint32_t kVolumetricMaxFogVolumes =
+    War3FogVolumeFrameSnapshot::kMaxVolumes;
 constexpr uint64_t kVolumetricRaySegmentBudget = 4'000'000ull;
+// Local-volume support adds one analytical ray intersection per effect pixel,
+// one medium-overlap integration per march segment, and one additional overlap
+// integration for each selected point light. Bound this dimension separately
+// so authored volumes cannot multiply the base ray budget without limit.
+constexpr uint64_t kVolumetricFogSegmentTestBudget = 96'000'000ull;
 constexpr uint32_t kVolumetricDirectionalProbesPerSegment = 8u;
 constexpr uint32_t kVolumetricDirectionalCascadeSamples = 2u;
 constexpr uint32_t kVolumetricVolumeSunTapsPerCascade = 9u;
@@ -123,6 +135,21 @@ struct VolumetricPointLightUniform {
   } lights[16] = {};
 };
 
+struct VolumetricFogVolumeUniform {
+  uint32_t count = 0u;
+  uint32_t pad0 = 0u;
+  uint32_t pad1 = 0u;
+  uint32_t pad2 = 0u;
+  struct {
+    Vector4 worldToLocal0;
+    Vector4 worldToLocal1;
+    Vector4 worldToLocal2;
+    // x=shape (0 sphere, 1 box, 2 cylinder), y=density,
+    // z=normalized edge feather, w=reserved.
+    Vector4 params;
+  } volumes[kVolumetricMaxFogVolumes] = {};
+};
+
 struct VolumetricCompositePushConstants {
   uint32_t colorSampler;
   uint32_t effectSampler;
@@ -132,6 +159,8 @@ struct VolumetricCompositePushConstants {
 };
 static_assert(sizeof(VolumetricPointLightUniform) == 800u,
               "VolumetricPointLightUniform GLSL ABI drift");
+static_assert(sizeof(VolumetricFogVolumeUniform) == 528u,
+              "VolumetricFogVolumeUniform GLSL ABI drift");
 static_assert(sizeof(VolumetricCompositePushConstants) == 32u,
               "VolumetricCompositePushConstants GLSL ABI drift");
 
@@ -374,6 +403,33 @@ VolumetricPointSelection SelectVolumetricPointLights(
     result.sourceIndices[i] = candidates[i].sourceIndex;
   return result;
 }
+
+War3FogVolumeFrameSnapshot SelectVolumetricFogVolumes(
+    const War3FogVolumeFrameSnapshot& snapshot,
+    const War3WorldCameraState& camera, VkExtent3D fullExtent) {
+  War3FogVolumeFrameSnapshot selected = {};
+  selected.generation = snapshot.generation;
+  selected.frameSerial = snapshot.frameSerial;
+  const uint32_t available = std::min<uint32_t>(
+      snapshot.count, War3FogVolumeFrameSnapshot::kMaxVolumes);
+  for (uint32_t i = 0u; i < available; ++i) {
+    const War3FogVolumeFrameEntry& volume = snapshot.volumes[i];
+    if (!std::isfinite(volume.boundingSphere.x) ||
+        !std::isfinite(volume.boundingSphere.y) ||
+        !std::isfinite(volume.boundingSphere.z) ||
+        !std::isfinite(volume.boundingSphere.w) ||
+        volume.boundingSphere.w <= 0.0f)
+      continue;
+    // The shared projection helper rejects only a sphere proven not to touch
+    // any forward viewport ray. Camera-plane crossings remain conservative.
+    if (!war3::render::War3SphereMayIntersectViewport(
+            camera, volume.boundingSphere, fullExtent))
+      continue;
+    selected.volumes[selected.count++] = volume;
+  }
+  selected.hasAny = selected.count > 0u;
+  return selected;
+}
 } // namespace
 
 War3VolumetricShaderWorkRuntimeDiagnostics
@@ -415,6 +471,16 @@ War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
   lightInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
   lightInfo.debugName = "War3VolumetricPointLightUBO";
 
+  DxvkBufferCreateInfo fogVolumeInfo = {};
+  fogVolumeInfo.size = sizeof(VolumetricFogVolumeUniform);
+  fogVolumeInfo.usage =
+      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  fogVolumeInfo.stages =
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  fogVolumeInfo.access =
+      VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+  fogVolumeInfo.debugName = "War3VolumetricFogVolumeUBO";
+
   // Ring buffers remove the cross-frame WAR hazard on these per-frame-updated
   // UBOs. kUboRingSlots > D3D9 MaxFrameLatency (20) guarantees the slot chosen
   // by input.frameSerial % kUboRingSlots was last used by a frame the GPU has
@@ -424,6 +490,8 @@ War3VolumetricLightPass::War3VolumetricLightPass(D3D9DeviceEx* device)
         m_device->createBuffer(uboInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     m_lightBuffers[slot] =
         m_device->createBuffer(lightInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    m_fogVolumeBuffers[slot] = m_device->createBuffer(
+        fogVolumeInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   }
 }
 
@@ -442,8 +510,8 @@ War3VolumetricLightPass::~War3VolumetricLightPass() {
 const DxvkPipelineLayout* War3VolumetricLightPass::createPipelineLayout() const {
   // 绑定顺序需与 shader 一致：
   // 0=color, 1=depth, 2=shadowMap, 3=CSM UBO, 4=point lights,
-  // 5=point-shadow cube array.
-  std::array<DxvkDescriptorSetLayoutBinding, 6> bindings = {
+  // 5=point-shadow cube array, 6=local fog volumes.
+  std::array<DxvkDescriptorSetLayoutBinding, 7> bindings = {
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT),
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
@@ -455,6 +523,8 @@ const DxvkPipelineLayout* War3VolumetricLightPass::createPipelineLayout() const 
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT),
       DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT),
+      DxvkDescriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT),
   };
 
@@ -945,6 +1015,7 @@ void War3VolumetricLightPass::copyDepth(const Rc<DxvkCommandList>& ctx,
 bool War3VolumetricLightPass::drawVolumetricLight(
     const Rc<DxvkCommandList>& ctx, const War3PipelineInput& input,
     const War3PointLightFrameSnapshot& pointLights,
+    const War3FogVolumeFrameSnapshot& fogVolumes,
     const std::array<uint32_t, War3PointLightFrameSnapshot::kMaxLights>&
         selectedPointIndices,
     uint32_t selectedPointCount, const Vector4& cameraPos,
@@ -954,7 +1025,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   outPointShadowedLightCount = 0u;
   if (!m_layout || !m_linearSampler || !m_colorCopyView || !m_depthCopyView ||
       !m_effectView || !m_csmUniformBuffers[0] || !m_lightBuffers[0] ||
-      !input.settings)
+      !m_fogVolumeBuffers[0] || !input.settings)
     return false;
   if (!input.scene.worldCamera.valid)
     return false;
@@ -1341,12 +1412,25 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   auto lightInfo = m_lightBuffers[uboSlot]->getSliceInfo(
       0u, sizeof(VolumetricPointLightUniform));
 
+  VolumetricFogVolumeUniform fogVolumeUbo = {};
+  fogVolumeUbo.count = std::min<uint32_t>(
+      fogVolumes.count, kVolumetricMaxFogVolumes);
+  for (uint32_t i = 0u; i < fogVolumeUbo.count; ++i) {
+    const War3FogVolumeFrameEntry& source = fogVolumes.volumes[i];
+    fogVolumeUbo.volumes[i].worldToLocal0 = source.worldToLocal0;
+    fogVolumeUbo.volumes[i].worldToLocal1 = source.worldToLocal1;
+    fogVolumeUbo.volumes[i].worldToLocal2 = source.worldToLocal2;
+    fogVolumeUbo.volumes[i].params = source.params;
+  }
+  auto fogVolumeInfo = m_fogVolumeBuffers[uboSlot]->getSliceInfo(
+      0u, sizeof(VolumetricFogVolumeUniform));
+
   // Ring-slice UBOs: this slot was last written kUboRingSlots frames ago
   // (> D3D9 MaxFrameLatency), so no in-flight frame is still reading it. The
   // pre-update barrier therefore uses no source scope (NONE) instead of the
   // former FRAGMENT_SHADER->TRANSFER cross-frame WAR drain; the post-update
   // barrier below still makes the write visible to this frame's uniform reads.
-  std::array<VkBufferMemoryBarrier2, 2> bufferBarriers = {};
+  std::array<VkBufferMemoryBarrier2, 3> bufferBarriers = {};
   bufferBarriers[0] = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
   bufferBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_NONE;
   bufferBarriers[0].srcAccessMask = VK_ACCESS_2_NONE;
@@ -1365,6 +1449,15 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   bufferBarriers[1].offset = lightInfo.offset;
   bufferBarriers[1].size = sizeof(VolumetricPointLightUniform);
 
+  bufferBarriers[2] = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+  bufferBarriers[2].srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+  bufferBarriers[2].srcAccessMask = VK_ACCESS_2_NONE;
+  bufferBarriers[2].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  bufferBarriers[2].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  bufferBarriers[2].buffer = fogVolumeInfo.buffer;
+  bufferBarriers[2].offset = fogVolumeInfo.offset;
+  bufferBarriers[2].size = sizeof(VolumetricFogVolumeUniform);
+
   VkDependencyInfo depInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
   depInfo.bufferMemoryBarrierCount =
       static_cast<uint32_t>(bufferBarriers.size());
@@ -1375,6 +1468,9 @@ bool War3VolumetricLightPass::drawVolumetricLight(
                        sizeof(VolumetricCsmUniform), &csmUbo);
   ctx->cmdUpdateBuffer(DxvkCmdBuffer::ExecBuffer, lightInfo.buffer,
                        lightInfo.offset, sizeof(lightUbo), &lightUbo);
+  ctx->cmdUpdateBuffer(DxvkCmdBuffer::ExecBuffer, fogVolumeInfo.buffer,
+                       fogVolumeInfo.offset, sizeof(fogVolumeUbo),
+                       &fogVolumeUbo);
 
   for (auto &barrier : bufferBarriers) {
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -1384,7 +1480,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   }
   ctx->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
 
-  std::array<DxvkDescriptorWrite, 6> descriptors = {};
+  std::array<DxvkDescriptorWrite, 7> descriptors = {};
   descriptors[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   descriptors[0].descriptor = m_colorCopyView->getDescriptor();
   descriptors[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -1399,6 +1495,9 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   descriptors[4].buffer = lightInfo;
   descriptors[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   descriptors[5].descriptor = pointShadowSampleView->getDescriptor();
+  descriptors[6].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  descriptors[6].descriptor = nullptr;
+  descriptors[6].buffer = fogVolumeInfo;
 
   VolumetricLightPushConstants pc = {};
   pc.colorSampler = m_linearSampler->getDescriptor().samplerIndex;
@@ -1423,7 +1522,9 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   pc.params0 =
       Vector4(clampFinite(settings.intensity, 0.0f, 4.0f, 0.0f),
               clampFinite(settings.decay, 0.70f, 0.999f, 0.945f),
-              clampFinite(settings.density, 0.0f, 2.0f, 0.0f),
+              settings.globalMediumEnabled
+                  ? clampFinite(settings.density, 0.0f, 2.0f, 0.0f)
+                  : 0.0f,
               clampFinite(settings.weight, 0.0f, 3.0f, 1.0f));
   const float fadeNear =
       clampFinite(settings.fadeNear, 0.0f, 0.95f, 0.05f);
@@ -1492,6 +1593,7 @@ bool War3VolumetricLightPass::drawVolumetricLight(
   ctx->track(pointShadowSampleView->image(), DxvkAccess::Read);
   ctx->track(m_csmUniformBuffers[uboSlot], DxvkAccess::Write);
   ctx->track(m_lightBuffers[uboSlot], DxvkAccess::Write);
+  ctx->track(m_fogVolumeBuffers[uboSlot], DxvkAccess::Write);
   ctx->track(m_linearSampler);
   ctx->track(pointShadowSampler);
   static bool s_loggedVolumetricDraw = false;
@@ -1499,11 +1601,12 @@ bool War3VolumetricLightPass::drawVolumetricLight(
     s_loggedVolumetricDraw = true;
     WAR3_RENDER_LOG(
         "DXVK War3Volumetric: draw active effect=%ux%u csm=%d cascades=%u "
-        "points=%u pointShadows=%u samples=%d intensity=%.2f density=%.2f "
+        "points=%u pointShadows=%u fogVolumes=%u samples=%d "
+        "intensity=%.2f density=%.2f "
         "extinction=%.2f\n",
         effectExtent.width, effectExtent.height, hasCsmSnapshot ? 1 : 0,
         cascadeCount, lightUbo.count, lightUbo.pointShadowedLightCount,
-        effectiveSamples,
+        fogVolumeUbo.count, effectiveSamples,
         static_cast<double>(pc.params0.x),
         static_cast<double>(pc.params0.z),
         static_cast<double>(pc.viewportZ.z));
@@ -1604,9 +1707,15 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   const float safeIntensity = finiteOr(settings.intensity, 0.0f);
   const float safeDensity =
       clampFinite(settings.density, 0.0f, 2.0f, 0.0f);
-  // Match the shader's unconditional no-effect gate before any image/resource
-  // work. A zero/non-finite medium cannot scatter either sun or point light.
-  if (safeIntensity <= 1e-6f || safeDensity <= 1e-6f ||
+  const bool hasConfiguredGlobalMedium =
+      settings.globalMediumEnabled && safeDensity > 1e-6f;
+  const bool localMediumRequested =
+      War3FogVolumeManager::Instance().HasActiveVolumes();
+  // Global density zero now means clear air outside authored volumes, not an
+  // unconditional pass kill. Keep the atomic manager probe before any image
+  // allocation or snapshot lock.
+  if (safeIntensity <= 1e-6f ||
+      (!hasConfiguredGlobalMedium && !localMediumRequested) ||
       settings.sampleCount <= 0)
     return;
 
@@ -1679,6 +1788,16 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
       !std::isfinite(cameraPos.z))
     return;
 
+  War3FogVolumeFrameSnapshot fogVolumes = {};
+  if (localMediumRequested) {
+    fogVolumes = SelectVolumetricFogVolumes(
+        War3FogVolumeManager::Instance().GetFrameSnapshot(input.frameSerial),
+        input.scene.worldCamera, extent);
+  }
+  const bool hasLocalMedium = fogVolumes.hasAny && fogVolumes.count > 0u;
+  if (!hasConfiguredGlobalMedium && !hasLocalMedium)
+    return;
+
   War3PointLightFrameSnapshot pointLights = {};
   VolumetricPointSelection pointSelection = {};
   if (pointFeatureRequested) {
@@ -1730,10 +1849,9 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     }
   }
 
-  uint32_t resolutionDivisor =
-      std::clamp<uint32_t>(
-          settings.resolutionDivisor, kVolumetricMinResolutionDivisor,
-          kVolumetricMaxResolutionDivisor);
+  uint32_t resolutionDivisor = std::clamp<uint32_t>(
+      settings.resolutionDivisor, kVolumetricMinResolutionDivisor,
+      kVolumetricMaxResolutionDivisor);
   const auto effectExtentForDivisor = [&](uint32_t divisor) {
     return VkExtent3D{
         static_cast<uint32_t>(std::max<uint64_t>(
@@ -1742,58 +1860,100 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
             1u, (uint64_t(extent.height) + divisor - 1u) / divisor)),
         1u};
   };
-  VkExtent3D effectExtent = effectExtentForDivisor(resolutionDivisor);
+  VkExtent3D effectExtent = {};
   const auto minimumRaySegments = [](const VkExtent3D& value,
-                                     uint64_t& out) {
+                                     uint64_t& out) noexcept {
     uint64_t pixels = 0u;
     return war3::render::War3VolumetricCheckedMultiply(
                value.width, value.height, pixels) &&
         war3::render::War3VolumetricCheckedMultiply(
                pixels, kVolumetricMinSamples, out);
   };
-  uint64_t minimumSegments = 0u;
-  bool minimumSegmentsValid =
-      minimumRaySegments(effectExtent, minimumSegments);
-  while ((!minimumSegmentsValid ||
-          minimumSegments > kVolumetricRaySegmentBudget) &&
-         resolutionDivisor < kVolumetricMaxResolutionDivisor) {
-    effectExtent = effectExtentForDivisor(++resolutionDivisor);
-    minimumSegmentsValid =
-        minimumRaySegments(effectExtent, minimumSegments);
-  }
-  // The fragment shader deliberately keeps a four-sample quality floor.  If
-  // even divisor=8 cannot honor the watchdog budget, skip this optional pass
-  // instead of silently exceeding the advertised hard limit.
-  if (!minimumSegmentsValid ||
-      minimumSegments > kVolumetricRaySegmentBudget)
-    return;
-  VkRect2D effectScissor = FullRect(effectExtent);
+  const auto minimumFogSegmentTests = [&](const VkExtent3D& value,
+                                          uint64_t& out) noexcept {
+    uint64_t segments = 0u;
+    uint64_t fogSegments = 0u;
+    return minimumRaySegments(value, segments) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            segments, fogVolumes.count, fogSegments) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            fogSegments, 1u + pointSelection.count, out);
+  };
+  VkRect2D effectScissor = {};
   VkRect2D compositeScissor = FullRect(extent);
 
-  // v1 ROI is deliberately limited to the exact default ceil-half contract
-  // shared with A1. Any configured sun contribution or other divisor keeps
-  // the established full-screen path; this avoids changing odd-size raster
-  // semantics while removing most point-only fragment/composite work.
-  if (!hasSunVolume && hasPointVolume && resolutionDivisor == 2u) {
-    war3::render::War3ImageRegion unionRegion = {};
-    const uint32_t available = std::min<uint32_t>(
-        pointLights.count, War3PointLightFrameSnapshot::kMaxLights);
-    for (uint32_t i = 0u; i < pointSelection.count; ++i) {
-      const uint32_t sourceIndex = pointSelection.sourceIndices[i];
-      if (sourceIndex >= available)
-        continue;
-      const Vector4 position =
-          SanitizeVolumetricPointPosition(pointLights.lights[sourceIndex]);
-      unionRegion = UnionRegion(
-          unionRegion,
+  // In clear air, every non-zero fragment is confined to the union of authored
+  // local media. Give a distant/small volume twice the linear resolution, but
+  // only when its conservative ceil-half ROI fits both watchdog budgets at the
+  // *requested* sample count. Large/on-camera volumes retain the established
+  // quarter-resolution full-screen path instead of trading away longitudinal
+  // samples for spatial resolution.
+  bool useLocalHalfResRoi = false;
+  if (!hasConfiguredGlobalMedium && hasLocalMedium) {
+    war3::render::War3ImageRegion localRegion = {};
+    for (uint32_t i = 0u; i < fogVolumes.count; ++i) {
+      localRegion = UnionRegion(
+          localRegion,
           war3::render::War3ComputeConservativeHalfResSphereRegion(
-              input.scene.worldCamera, position, extent));
+              input.scene.worldCamera, fogVolumes.volumes[i].boundingSphere,
+              extent));
     }
-    if (unionRegion.empty())
+    if (localRegion.empty())
       return;
-    effectScissor = HalfResRegionRect(unionRegion);
-    compositeScissor = EffectRegionToCompositeRect(
-        unionRegion, effectExtent, extent);
+
+    uint64_t roiPixels = 0u;
+    const uint64_t requestedSamples = uint64_t(std::clamp(
+        settings.sampleCount, kVolumetricMinSamples, kVolumetricMaxSamples));
+    uint64_t requestedRaySegments = 0u;
+    uint64_t requestedFogTests = 0u;
+    const bool roiWorkValid =
+        war3::render::War3VolumetricCheckedMultiply(
+            localRegion.width, localRegion.height, roiPixels) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            roiPixels, requestedSamples, requestedRaySegments) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            requestedRaySegments, fogVolumes.count, requestedFogTests) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            requestedFogTests, 1u + pointSelection.count,
+            requestedFogTests);
+    const bool rayBudgetFits = roiWorkValid &&
+        requestedRaySegments <= kVolumetricRaySegmentBudget;
+    const bool fogBudgetFits = roiWorkValid &&
+        requestedFogTests <= kVolumetricFogSegmentTestBudget;
+    if (rayBudgetFits && fogBudgetFits) {
+      useLocalHalfResRoi = true;
+      resolutionDivisor = kVolumetricLocalRoiResolutionDivisor;
+      effectExtent = effectExtentForDivisor(resolutionDivisor);
+      effectScissor = HalfResRegionRect(localRegion);
+      compositeScissor = EffectRegionToCompositeRect(
+          localRegion, effectExtent, extent);
+    }
+  }
+
+  if (!useLocalHalfResRoi) {
+    effectExtent = effectExtentForDivisor(resolutionDivisor);
+    uint64_t minimumSegments = 0u;
+    uint64_t minimumFogTests = 0u;
+    bool minimumWorkValid =
+        minimumRaySegments(effectExtent, minimumSegments) &&
+        minimumFogSegmentTests(effectExtent, minimumFogTests);
+    while ((!minimumWorkValid ||
+            minimumSegments > kVolumetricRaySegmentBudget ||
+            minimumFogTests > kVolumetricFogSegmentTestBudget) &&
+           resolutionDivisor < kVolumetricMaxResolutionDivisor) {
+      effectExtent = effectExtentForDivisor(++resolutionDivisor);
+      minimumWorkValid =
+          minimumRaySegments(effectExtent, minimumSegments) &&
+          minimumFogSegmentTests(effectExtent, minimumFogTests);
+    }
+    // The fragment shader deliberately keeps a four-sample quality floor. If
+    // even divisor=8 cannot honor the watchdog budget, skip this optional pass
+    // instead of silently exceeding the advertised hard limit.
+    if (!minimumWorkValid ||
+        minimumSegments > kVolumetricRaySegmentBudget ||
+        minimumFogTests > kVolumetricFogSegmentTestBudget)
+      return;
+    effectScissor = FullRect(effectExtent);
   }
 
   uint64_t effectPixelCount = 0u;
@@ -1801,9 +1961,29 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
           effectScissor.extent.width, effectScissor.extent.height,
           effectPixelCount))
     return;
-  const int effectiveSamples = ComputeVolumetricEffectiveSamples(
+  int effectiveSamples = ComputeVolumetricEffectiveSamples(
       settings, sunIntensity, hasSunVolume, hasPointVolume,
       effectPixelCount);
+  if (fogVolumes.count > 0u && effectPixelCount > 0u) {
+    uint64_t fogInteractionsPerSample = 0u;
+    const bool denominatorValid =
+        war3::render::War3VolumetricCheckedMultiply(
+            effectPixelCount, fogVolumes.count,
+            fogInteractionsPerSample) &&
+        war3::render::War3VolumetricCheckedMultiply(
+            fogInteractionsPerSample, 1u + pointSelection.count,
+            fogInteractionsPerSample);
+    if (!denominatorValid || fogInteractionsPerSample == 0u)
+      return;
+    const uint64_t fogBudgetedSamples =
+        kVolumetricFogSegmentTestBudget / fogInteractionsPerSample;
+    if (fogBudgetedSamples < uint64_t(kVolumetricMinSamples))
+      return;
+    effectiveSamples = std::min(
+        effectiveSamples,
+        static_cast<int>(std::min<uint64_t>(
+            fogBudgetedSamples, uint64_t(kVolumetricMaxSamples))));
+  }
 
   // This is a conservative, source-proven upper bound evaluated before any
   // volume resource allocation, color/depth copy, UBO update or draw command.
@@ -1875,7 +2055,7 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
   copyDepth(ctx, input.depthView);
   uint32_t pointShadowedLightCount = 0u;
   const bool effectSubmitted = drawVolumetricLight(
-      ctx, input, pointLights, pointSelection.sourceIndices,
+      ctx, input, pointLights, fogVolumes, pointSelection.sourceIndices,
       pointSelection.count, cameraPos, farClearRaw, rawDepthQuantum,
       farIsOne, effectScissor, effectiveSamples,
       pointShadowedLightCount);
@@ -1889,9 +2069,9 @@ void War3VolumetricLightPass::Run(const Rc<DxvkCommandList>& ctx,
     if (submitLog < 16u || (submitLog % 240u) == 0u) {
       WAR3_RENDER_LOG(
           "DXVK War3Volumetric: composite submitted frame=%llu points=%u "
-          "pointShadows=%u\n",
+          "pointShadows=%u fogVolumes=%u\n",
           static_cast<unsigned long long>(input.frameSerial),
-          pointSelection.count, pointShadowedLightCount);
+          pointSelection.count, pointShadowedLightCount, fogVolumes.count);
     }
   }
 }

@@ -80,6 +80,82 @@ returns = boolean
 [[.args]]
 type = integer
 
+[WarVKCreateSphereFogVolume]
+title = "创建球形局部体积雾"
+description = "在 ${x}、${y}、${z} 创建半径 ${radius}、密度 ${density}、边缘过渡 ${edgeFeather} 的球形雾。"
+comment = "成功返回正整数 fogId；最多8个有效局部雾体积。创建后仍需启用体积光通道。"
+category = "TC_WarVKLocalFog"
+script = "WarVKCreateSphereFogVolume"
+returns = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKCreateBoxFogVolume]
+title = "创建盒形局部体积雾"
+description = "在 ${x}、${y}、${z} 创建尺寸 ${sizeX}、${sizeY}、${sizeZ}、密度 ${density}、边缘过渡 ${edgeFeather} 的盒形雾。"
+comment = "尺寸是完整宽高；成功返回正整数 fogId；最多8个有效局部雾体积。"
+category = "TC_WarVKLocalFog"
+script = "WarVKCreateBoxFogVolume"
+returns = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKCreateCylinderFogVolume]
+title = "创建圆柱局部体积雾"
+description = "在 ${x}、${y}、${z} 创建半径 ${radius}、完整高度 ${height}、密度 ${density}、边缘过渡 ${edgeFeather} 的圆柱雾。"
+comment = "Cylinder 初始轴沿世界Z；可用旋转动作改变方向。成功返回正整数 fogId。"
+category = "TC_WarVKLocalFog"
+script = "WarVKCreateCylinderFogVolume"
+returns = integer
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+[[.args]]
+type = real
+
+[WarVKIsFogVolumeAlive]
+title = "查询局部体积雾存活"
+description = "查询局部体积雾 ${fogId} 是否存活。"
+comment = "返回true表示该句柄仍有效；关闭 enabled 不会使句柄失效。"
+category = "TC_WarVKLocalFog"
+script = "WarVKIsFogVolumeAlive"
+returns = boolean
+[[.args]]
+type = integer
+
 [WarVKCreateLightning]
 title = "创建闪电"
 description = "以起点 ${startX}、${startY}、${startZ}、终点 ${endX}、${endY}、${endZ}、颜色 ${red}、${green}、${blue}、${alpha}、宽度 ${width} 创建闪电并返回 WarVK id。"

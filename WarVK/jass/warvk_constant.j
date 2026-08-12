@@ -48,6 +48,7 @@ globals
     constant integer WARVK_FEATURE_STATS = 4096
     constant integer WARVK_FEATURE_MATH_CURVE = 8192
     constant integer WARVK_FEATURE_POLYLINE_CURVE = 16384
+    constant integer WARVK_FEATURE_LOCAL_FOG = 32768
 
     // 渲染光照时钟来源。只影响 WarVK 光照，不修改 Warcraft 玩法时间。
     constant integer WARVK_LIGHTING_CLOCK_GAME_TIME = 0
@@ -63,6 +64,7 @@ globals
     constant integer WARVK_OBJECT_NONE = 0
     constant integer WARVK_OBJECT_POINT_LIGHT = 1
     constant integer WARVK_OBJECT_LIGHTNING = 2
+    constant integer WARVK_OBJECT_LOCAL_FOG = 3
 
     // 闪电模板渲染模式。渲染器始终关闭深度写入；
     // 模式 1/3 仅开启相对场景的深度测试。

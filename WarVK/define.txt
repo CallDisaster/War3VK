@@ -7,6 +7,7 @@ TC_WarVKLightingClock=[WarVK] 光照时钟与昼夜,ui\\WarVK\\icons\\atom.blp
 TC_WarVKPointLight=[WarVK] 点光源,ui\\WarVK\\icons\\atom.blp
 TC_WarVKVolumetricLight=[WarVK] 体积光,ui\\WarVK\\icons\\atom.blp
 TC_WarVKVolumetricFog=[WarVK] 体积雾,ui\\WarVK\\icons\\atom.blp
+TC_WarVKLocalFog=[WarVK] 局部体积雾,ui\\WarVK\\icons\\atom.blp
 TC_WarVKLightning=[WarVK] 闪电效果,ui\\WarVK\\icons\\atom.blp
 TC_WarVKLightningTemplate=[WarVK] 闪电模板,ui\\WarVK\\icons\\atom.blp
 TC_WarVKMath=[WarVK] 数学计算,ui\\WarVK\\icons\\atom.blp

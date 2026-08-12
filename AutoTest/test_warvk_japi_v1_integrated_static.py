@@ -91,12 +91,12 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             r'"([birds]*)",\s*[^,]+,\s*(true|false)\}',
             self.runtime,
         )
-        self.assertEqual(len(rows), 91)
+        self.assertEqual(len(rows), 105)
         cpp_commands = {
             name: (carrier, signature)
             for name, carrier, signature, _required in rows
         }
-        self.assertEqual(len(cpp_commands), 91)
+        self.assertEqual(len(cpp_commands), 105)
 
         self.assertNotIn("JapiFunc", self.jass)
         self.assertNotRegex(self.jass, r"(?m)^\s*native\s+WarVK")
@@ -221,6 +221,7 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             "kFeatureStats",
             "kFeatureMathCurve",
             "kFeaturePolylineCurve",
+            "kFeatureLocalFog",
         ):
             self.assertIn(feature, implemented)
         for absent in (
@@ -240,6 +241,7 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
             "TC_WarVKPointLight",
             "TC_WarVKVolumetricLight",
             "TC_WarVKVolumetricFog",
+            "TC_WarVKLocalFog",
             "TC_WarVKLightning",
             "TC_WarVKLightningTemplate",
             "TC_WarVKMath",
@@ -353,26 +355,42 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
     def test_volumetric_and_scalar_author_controls_are_real_commands(self):
         for command in (
             "volumetric.setEnabled",
+            "volumetric.setGlobalMediumEnabled",
             "volumetric.setDensity",
             "volumetric.setScattering",
             "volumetric.setQuality",
             "volumetricFog.setEnabled",
             "volumetricFog.setSettings",
+            "localFog.createSphere",
+            "localFog.createBox",
+            "localFog.createCylinder",
+            "localFog.setRotation",
             "math.evaluateReal",
             "math.evaluateInteger",
         ):
             self.assertIn(f'"{command}"', self.runtime)
         for dispatch in (
             "case CommandId::VolumetricSetEnabled",
+            "case CommandId::VolumetricSetGlobalMediumEnabled",
             "case CommandId::VolumetricFogSetEnabled",
             "case CommandId::VolumetricFogSetSettings",
+            "case CommandId::LocalFogCreateSphere",
+            "case CommandId::LocalFogCreateBox",
+            "case CommandId::LocalFogCreateCylinder",
+            "case CommandId::LocalFogSetRotation",
             "case CommandId::MathEvaluateReal",
             "case CommandId::MathEvaluateInteger",
         ):
             self.assertIn(dispatch, self.runtime)
         for script in (
+            "WarVKSetGlobalVolumetricMediumEnabled",
             "WarVKSetGlobalVolumetricFogEnabled",
             "WarVKSetGlobalVolumetricFog",
+            "WarVKCreateSphereFogVolume",
+            "WarVKCreateBoxFogVolume",
+            "WarVKCreateCylinderFogVolume",
+            "WarVKSetFogVolumeRotation",
+            "WarVKIsFogVolumeAlive",
             "WarVKEvaluateMathReal",
             "WarVKEvaluateMathInteger",
         ):
@@ -383,6 +401,7 @@ class WarVKJapiV1IntegratedStaticTests(unittest.TestCase):
         self.assertIn("std::unordered_map<int32_t, ManagedObject> g_objects", self.runtime)
         self.assertIn("RegisterObject(ManagedType::PointLight", self.runtime)
         self.assertIn("RegisterObject(ManagedType::Lightning", self.runtime)
+        self.assertIn("RegisterObject(ManagedType::LocalFog", self.runtime)
         self.assertIn("void Reset() noexcept", self.runtime)
         lightning_header = LIGHTNING_HEADER.read_text(encoding="utf-8")
         lightning_source = LIGHTNING_SOURCE.read_text(encoding="utf-8")

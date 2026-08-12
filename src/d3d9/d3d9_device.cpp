@@ -10116,6 +10116,11 @@ uint64_t D3D9DeviceEx::War3ResetCpuSemanticMapSession(
   dxvk::war3::render::ResetShadowRuntimeBridgeState();
   dxvk::war3::shadow::ShadowValidationRuntime::instance().reset();
   dxvk::war3::render::War3Renderer::instance().ResetMapSession();
+  // Local participating-media descriptions are map-authored CPU state. Clear
+  // them at the Present-owned transition so A -> B cannot retain an old fog
+  // handle or world-space transform. GPU UBO slots remain pass-owned and retire
+  // through the ordinary frame ring.
+  War3FogVolumeManager::Instance().Clear();
   dxvk::war3::model::ResetMapSession();
   dxvk::war3::render::ResetCurrentDrawContractCache();
   War3ResetDirectPacketMapCaches();

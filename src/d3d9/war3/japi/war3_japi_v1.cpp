@@ -46,11 +46,12 @@ constexpr uint32_t kFeatureTime = 0x00000800u;
 constexpr uint32_t kFeatureStats = 0x00001000u;
 constexpr uint32_t kFeatureMathCurve = 0x00002000u;
 constexpr uint32_t kFeaturePolylineCurve = 0x00004000u;
+constexpr uint32_t kFeatureLocalFog = 0x00008000u;
 constexpr uint32_t kImplementedFeatureMask =
     kFeatureSun | kFeatureCsm | kFeaturePointLight | kFeatureVolumetric |
     kFeatureDayNight | kFeatureLightning | kFeatureManagedObject |
     kFeatureTime | kFeatureStats | kFeatureMathCurve |
-    kFeaturePolylineCurve;
+    kFeaturePolylineCurve | kFeatureLocalFog;
 
 enum class WireType : uint8_t {
   Bool,
@@ -84,11 +85,25 @@ enum class CommandId : uint16_t {
   PointLightSetShadowConfig,
   PointLightIsAlive,
   VolumetricSetEnabled,
+  VolumetricSetGlobalMediumEnabled,
   VolumetricSetDensity,
   VolumetricSetScattering,
   VolumetricSetQuality,
   VolumetricFogSetEnabled,
   VolumetricFogSetSettings,
+  LocalFogCreateSphere,
+  LocalFogCreateBox,
+  LocalFogCreateCylinder,
+  LocalFogDestroy,
+  LocalFogSetEnabled,
+  LocalFogSetPosition,
+  LocalFogSetRotation,
+  LocalFogSetDensity,
+  LocalFogSetEdgeFeather,
+  LocalFogSetSphereRadius,
+  LocalFogSetBoxSize,
+  LocalFogSetCylinderSize,
+  LocalFogIsAlive,
   OutlineSetEnabled,
   OutlineSetColor,
   OutlineSetParameters,
@@ -163,7 +178,7 @@ struct CommandSpec {
   bool backendRequired;
 };
 
-constexpr std::array<CommandSpec, 91> kCommands = {{
+constexpr std::array<CommandSpec, 105> kCommands = {{
     {CommandId::SystemVersion, "system.version", Carrier::LocalizedString, "", 0u, false},
     {CommandId::SystemProtocolVersion, "system.protocolVersion", Carrier::Hotkey, "", 0u, false},
     {CommandId::SystemLastErrorCode, "system.lastErrorCode", Carrier::Hotkey, "", 0u, false},
@@ -187,11 +202,25 @@ constexpr std::array<CommandSpec, 91> kCommands = {{
     {CommandId::PointLightSetShadowConfig, "pointLight.setShadowConfig", Carrier::Preloader, "dir", kFeaturePointLight, true},
     {CommandId::PointLightIsAlive, "pointLight.isAlive", Carrier::Hotkey, "d", kFeaturePointLight, true},
     {CommandId::VolumetricSetEnabled, "volumetric.setEnabled", Carrier::Preloader, "b", kFeatureVolumetric, true},
+    {CommandId::VolumetricSetGlobalMediumEnabled, "volumetric.setGlobalMediumEnabled", Carrier::Preloader, "b", kFeatureVolumetric, true},
     {CommandId::VolumetricSetDensity, "volumetric.setDensity", Carrier::Preloader, "r", kFeatureVolumetric, true},
     {CommandId::VolumetricSetScattering, "volumetric.setScattering", Carrier::Preloader, "rr", kFeatureVolumetric, true},
     {CommandId::VolumetricSetQuality, "volumetric.setQuality", Carrier::Preloader, "ir", kFeatureVolumetric, true},
     {CommandId::VolumetricFogSetEnabled, "volumetricFog.setEnabled", Carrier::Preloader, "b", kFeatureVolumetric, true},
     {CommandId::VolumetricFogSetSettings, "volumetricFog.setSettings", Carrier::Preloader, "rrr", kFeatureVolumetric, true},
+    {CommandId::LocalFogCreateSphere, "localFog.createSphere", Carrier::Hotkey, "rrrrrr", kFeatureLocalFog, true},
+    {CommandId::LocalFogCreateBox, "localFog.createBox", Carrier::Hotkey, "rrrrrrrr", kFeatureLocalFog, true},
+    {CommandId::LocalFogCreateCylinder, "localFog.createCylinder", Carrier::Hotkey, "rrrrrrr", kFeatureLocalFog, true},
+    {CommandId::LocalFogDestroy, "localFog.destroy", Carrier::Preloader, "d", kFeatureLocalFog, true},
+    {CommandId::LocalFogSetEnabled, "localFog.setEnabled", Carrier::Preloader, "db", kFeatureLocalFog, true},
+    {CommandId::LocalFogSetPosition, "localFog.setPosition", Carrier::Preloader, "drrr", kFeatureLocalFog, true},
+    {CommandId::LocalFogSetRotation, "localFog.setRotation", Carrier::Preloader, "drrr", kFeatureLocalFog, true},
+    {CommandId::LocalFogSetDensity, "localFog.setDensity", Carrier::Preloader, "dr", kFeatureLocalFog, true},
+    {CommandId::LocalFogSetEdgeFeather, "localFog.setEdgeFeather", Carrier::Preloader, "dr", kFeatureLocalFog, true},
+    {CommandId::LocalFogSetSphereRadius, "localFog.setSphereRadius", Carrier::Preloader, "dr", kFeatureLocalFog, true},
+    {CommandId::LocalFogSetBoxSize, "localFog.setBoxSize", Carrier::Preloader, "drrr", kFeatureLocalFog, true},
+    {CommandId::LocalFogSetCylinderSize, "localFog.setCylinderSize", Carrier::Preloader, "drr", kFeatureLocalFog, true},
+    {CommandId::LocalFogIsAlive, "localFog.isAlive", Carrier::Hotkey, "d", kFeatureLocalFog, true},
     {CommandId::OutlineSetEnabled, "outline.setEnabled", Carrier::Preloader, "b", 0x00000010u, true},
     {CommandId::OutlineSetColor, "outline.setColor", Carrier::Preloader, "rrrr", 0x00000010u, true},
     {CommandId::OutlineSetParameters, "outline.setParameters", Carrier::Preloader, "rr", 0x00000010u, true},
@@ -330,6 +359,7 @@ constexpr size_t kMaximumTypedTransactions = 4u;
 enum class ManagedType : int32_t {
   PointLight = 1,
   Lightning = 2,
+  LocalFog = 3,
 };
 
 struct ManagedObject {
@@ -714,6 +744,34 @@ bool IsValidPointShadowResolution(int32_t resolution) {
   return (value & (value - 1u)) == 0u;
 }
 
+bool IsValidFogPosition(float x, float y, float z) {
+  constexpr float kMaximumCoordinate = 1'000'000.0f;
+  return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
+      std::abs(x) <= kMaximumCoordinate &&
+      std::abs(y) <= kMaximumCoordinate &&
+      std::abs(z) <= kMaximumCoordinate;
+}
+
+bool IsValidFogFullSize(float value) {
+  return std::isfinite(value) && value >= 1.0f && value <= 200'000.0f;
+}
+
+bool IsValidFogRadius(float value) {
+  return std::isfinite(value) && value >= 0.5f && value <= 100'000.0f;
+}
+
+bool IsValidFogDensity(float value) {
+  return std::isfinite(value) && value >= 0.0f && value <= 2.0f;
+}
+
+bool IsValidFogFeather(float value) {
+  return std::isfinite(value) && value >= 0.0f && value <= 1.0f;
+}
+
+bool IsValidFogRotation(float value) {
+  return std::isfinite(value) && std::abs(value) <= 360'000.0f;
+}
+
 bool IsLightningTemplateName(std::string_view value) {
   if (value.empty() || value.size() > 64u)
     return false;
@@ -809,6 +867,8 @@ bool IsBackendObjectAlive(const ManagedObject& object) {
       return War3LightManager::Instance().IsPointLightAlive(object.internalId);
     case ManagedType::Lightning:
       return render::War3LightningRuntime::instance().isAlive(object.internalId);
+    case ManagedType::LocalFog:
+      return war3shader::IsFogVolumeAlive(object.internalId);
   }
   return false;
 }
@@ -1142,6 +1202,9 @@ Reply DispatchBackend(const ParsedRequest& request) {
     case CommandId::VolumetricSetEnabled:
       return war3shader::SetVolumetricLightEnabled(a[0].boolean)
           ? SuccessVoid() : BackendRejected();
+    case CommandId::VolumetricSetGlobalMediumEnabled:
+      return war3shader::SetVolumetricGlobalMediumEnabled(a[0].boolean)
+          ? SuccessVoid() : BackendRejected();
     case CommandId::VolumetricSetDensity:
       if (a[0].real < 0.0f || a[0].real > 2.0f)
         return BackendRejected();
@@ -1172,6 +1235,159 @@ Reply DispatchBackend(const ParsedRequest& request) {
       return war3shader::SetVolumetricHeightFog(
           a[0].real, a[1].real, a[2].real)
           ? SuccessVoid() : BackendRejected();
+    case CommandId::LocalFogCreateSphere: {
+      if (!IsValidFogPosition(a[0].real, a[1].real, a[2].real) ||
+          !IsValidFogRadius(a[3].real) ||
+          !IsValidFogDensity(a[4].real) ||
+          !IsValidFogFeather(a[5].real))
+        return BackendRejected();
+      const int32_t internalId = war3shader::AddSphereFogVolume(
+          a[0].real, a[1].real, a[2].real, a[3].real,
+          a[4].real, a[5].real);
+      if (internalId <= 0)
+        return BackendRejected();
+      const int32_t publicId =
+          RegisterObject(ManagedType::LocalFog, internalId);
+      if (publicId <= 0) {
+        static_cast<void>(war3shader::RemoveFogVolume(internalId));
+        return Failure(ErrorCode::InternalError);
+      }
+      return SuccessInteger(publicId);
+    }
+    case CommandId::LocalFogCreateBox: {
+      if (!IsValidFogPosition(a[0].real, a[1].real, a[2].real) ||
+          !IsValidFogFullSize(a[3].real) ||
+          !IsValidFogFullSize(a[4].real) ||
+          !IsValidFogFullSize(a[5].real) ||
+          !IsValidFogDensity(a[6].real) ||
+          !IsValidFogFeather(a[7].real))
+        return BackendRejected();
+      const int32_t internalId = war3shader::AddBoxFogVolume(
+          a[0].real, a[1].real, a[2].real,
+          a[3].real, a[4].real, a[5].real,
+          a[6].real, a[7].real);
+      if (internalId <= 0)
+        return BackendRejected();
+      const int32_t publicId =
+          RegisterObject(ManagedType::LocalFog, internalId);
+      if (publicId <= 0) {
+        static_cast<void>(war3shader::RemoveFogVolume(internalId));
+        return Failure(ErrorCode::InternalError);
+      }
+      return SuccessInteger(publicId);
+    }
+    case CommandId::LocalFogCreateCylinder: {
+      if (!IsValidFogPosition(a[0].real, a[1].real, a[2].real) ||
+          !IsValidFogRadius(a[3].real) ||
+          !IsValidFogFullSize(a[4].real) ||
+          !IsValidFogDensity(a[5].real) ||
+          !IsValidFogFeather(a[6].real))
+        return BackendRejected();
+      const int32_t internalId = war3shader::AddCylinderFogVolume(
+          a[0].real, a[1].real, a[2].real,
+          a[3].real, a[4].real, a[5].real, a[6].real);
+      if (internalId <= 0)
+        return BackendRejected();
+      const int32_t publicId =
+          RegisterObject(ManagedType::LocalFog, internalId);
+      if (publicId <= 0) {
+        static_cast<void>(war3shader::RemoveFogVolume(internalId));
+        return Failure(ErrorCode::InternalError);
+      }
+      return SuccessInteger(publicId);
+    }
+    case CommandId::LocalFogDestroy: {
+      int32_t internalId = 0;
+      if (!ResolveObject(a[0].integer, ManagedType::LocalFog, internalId) ||
+          !war3shader::RemoveFogVolume(internalId))
+        return BackendRejected();
+      RemoveRegistryEntry(a[0].integer, ManagedType::LocalFog, internalId);
+      return SuccessVoid();
+    }
+    case CommandId::LocalFogSetEnabled: {
+      int32_t internalId = 0;
+      if (!ResolveObject(a[0].integer, ManagedType::LocalFog, internalId) ||
+          !war3shader::SetFogVolumeEnabled(internalId, a[1].boolean))
+        return BackendRejected();
+      return SuccessVoid();
+    }
+    case CommandId::LocalFogSetPosition: {
+      if (!IsValidFogPosition(a[1].real, a[2].real, a[3].real))
+        return BackendRejected();
+      int32_t internalId = 0;
+      if (!ResolveObject(a[0].integer, ManagedType::LocalFog, internalId) ||
+          !war3shader::SetFogVolumePosition(
+              internalId, a[1].real, a[2].real, a[3].real))
+        return BackendRejected();
+      return SuccessVoid();
+    }
+    case CommandId::LocalFogSetRotation: {
+      if (!IsValidFogRotation(a[1].real) ||
+          !IsValidFogRotation(a[2].real) ||
+          !IsValidFogRotation(a[3].real))
+        return BackendRejected();
+      int32_t internalId = 0;
+      if (!ResolveObject(a[0].integer, ManagedType::LocalFog, internalId) ||
+          !war3shader::SetFogVolumeRotation(
+              internalId, a[1].real, a[2].real, a[3].real))
+        return BackendRejected();
+      return SuccessVoid();
+    }
+    case CommandId::LocalFogSetDensity: {
+      if (!IsValidFogDensity(a[1].real))
+        return BackendRejected();
+      int32_t internalId = 0;
+      if (!ResolveObject(a[0].integer, ManagedType::LocalFog, internalId) ||
+          !war3shader::SetFogVolumeDensity(internalId, a[1].real))
+        return BackendRejected();
+      return SuccessVoid();
+    }
+    case CommandId::LocalFogSetEdgeFeather: {
+      if (!IsValidFogFeather(a[1].real))
+        return BackendRejected();
+      int32_t internalId = 0;
+      if (!ResolveObject(a[0].integer, ManagedType::LocalFog, internalId) ||
+          !war3shader::SetFogVolumeEdgeFeather(internalId, a[1].real))
+        return BackendRejected();
+      return SuccessVoid();
+    }
+    case CommandId::LocalFogSetSphereRadius: {
+      if (!IsValidFogRadius(a[1].real))
+        return BackendRejected();
+      int32_t internalId = 0;
+      if (!ResolveObject(a[0].integer, ManagedType::LocalFog, internalId) ||
+          !war3shader::SetSphereFogVolumeRadius(internalId, a[1].real))
+        return BackendRejected();
+      return SuccessVoid();
+    }
+    case CommandId::LocalFogSetBoxSize: {
+      if (!IsValidFogFullSize(a[1].real) ||
+          !IsValidFogFullSize(a[2].real) ||
+          !IsValidFogFullSize(a[3].real))
+        return BackendRejected();
+      int32_t internalId = 0;
+      if (!ResolveObject(a[0].integer, ManagedType::LocalFog, internalId) ||
+          !war3shader::SetBoxFogVolumeSize(
+              internalId, a[1].real, a[2].real, a[3].real))
+        return BackendRejected();
+      return SuccessVoid();
+    }
+    case CommandId::LocalFogSetCylinderSize: {
+      if (!IsValidFogRadius(a[1].real) || !IsValidFogFullSize(a[2].real))
+        return BackendRejected();
+      int32_t internalId = 0;
+      if (!ResolveObject(a[0].integer, ManagedType::LocalFog, internalId) ||
+          !war3shader::SetCylinderFogVolumeSize(
+              internalId, a[1].real, a[2].real))
+        return BackendRejected();
+      return SuccessVoid();
+    }
+    case CommandId::LocalFogIsAlive: {
+      int32_t internalId = 0;
+      return SuccessInteger(
+          ResolveObject(a[0].integer, ManagedType::LocalFog, internalId)
+              ? 1 : 0);
+    }
     case CommandId::DayNightSetEnabled:
       settings->dayNight.enabled = a[0].boolean;
       settings->dayNight.celestialMotionEnabled = a[0].boolean;
@@ -2014,6 +2230,8 @@ void ResetAuthorState() noexcept {
   for (const ManagedObject& object : objects) {
     if (object.type == ManagedType::PointLight)
       static_cast<void>(war3shader::RemovePointLight(object.internalId));
+    else if (object.type == ManagedType::LocalFog)
+      static_cast<void>(war3shader::RemoveFogVolume(object.internalId));
   }
   // Records and templates are map-scoped author data. Texture cache ownership
   // remains with the renderer and is retired only by the Present transaction.

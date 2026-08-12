@@ -49,6 +49,24 @@ uniform LightBlock {
   PointLight u_lights[16];
 } lights;
 
+struct FogVolume {
+  vec4 worldToLocal0;
+  vec4 worldToLocal1;
+  vec4 worldToLocal2;
+  // x=shape (0 sphere, 1 box, 2 cylinder), y=density,
+  // z=normalized edge feather, w=reserved.
+  vec4 params;
+};
+
+layout(set = 1, binding = 6, scalar)
+uniform FogVolumeBlock {
+  uint u_count;
+  uint u_pad0;
+  uint u_pad1;
+  uint u_pad2;
+  FogVolume u_volumes[8];
+} fogVolumes;
+
 layout(push_constant, scalar, row_major)
 uniform push_block {
   uint p_colorSampler;
@@ -92,6 +110,121 @@ bool finiteVec3(vec3 v) {
 
 bool finiteVec4(vec4 v) {
   return !any(isnan(v)) && !any(isinf(v));
+}
+
+vec3 fogWorldToLocalPoint(FogVolume volume, vec3 worldPos) {
+  vec4 p = vec4(worldPos, 1.0);
+  return vec3(dot(volume.worldToLocal0, p),
+              dot(volume.worldToLocal1, p),
+              dot(volume.worldToLocal2, p));
+}
+
+vec3 fogWorldToLocalDirection(FogVolume volume, vec3 worldDir) {
+  vec4 d = vec4(worldDir, 0.0);
+  return vec3(dot(volume.worldToLocal0, d),
+              dot(volume.worldToLocal1, d),
+              dot(volume.worldToLocal2, d));
+}
+
+bool clipFogSlab(float origin, float direction,
+                 inout float rayEnter, inout float rayExit) {
+  if (abs(direction) <= 1.0e-8)
+    return abs(origin) <= 1.0;
+  float t0 = (-1.0 - origin) / direction;
+  float t1 = ( 1.0 - origin) / direction;
+  if (t0 > t1) {
+    float swapValue = t0;
+    t0 = t1;
+    t1 = swapValue;
+  }
+  rayEnter = max(rayEnter, t0);
+  rayExit = min(rayExit, t1);
+  return rayExit > rayEnter + 1.0e-6;
+}
+
+bool intersectFogVolume(FogVolume volume, vec3 cameraPos, vec3 rayDir,
+                        float intervalStart, float intervalEnd,
+                        out vec2 rayInterval) {
+  rayInterval = vec2(1.0, 0.0);
+  if (!finiteVec4(volume.worldToLocal0) ||
+      !finiteVec4(volume.worldToLocal1) ||
+      !finiteVec4(volume.worldToLocal2) || !finiteVec4(volume.params))
+    return false;
+
+  vec3 origin = fogWorldToLocalPoint(volume, cameraPos);
+  vec3 direction = fogWorldToLocalDirection(volume, rayDir);
+  if (!finiteVec3(origin) || !finiteVec3(direction))
+    return false;
+
+  int shape = int(floor(volume.params.x + 0.5));
+  float rayEnter = intervalStart;
+  float rayExit = intervalEnd;
+  if (shape == 0) {
+    float a = dot(direction, direction);
+    float b = dot(origin, direction);
+    float c = dot(origin, origin) - 1.0;
+    float discriminant = b * b - a * c;
+    if (!finiteFloat(a) || !finiteFloat(discriminant) ||
+        a <= 1.0e-12 || discriminant < 0.0)
+      return false;
+    float root = sqrt(max(discriminant, 0.0));
+    rayEnter = max(rayEnter, (-b - root) / a);
+    rayExit = min(rayExit, (-b + root) / a);
+  } else if (shape == 1) {
+    if (!clipFogSlab(origin.x, direction.x, rayEnter, rayExit) ||
+        !clipFogSlab(origin.y, direction.y, rayEnter, rayExit) ||
+        !clipFogSlab(origin.z, direction.z, rayEnter, rayExit))
+      return false;
+  } else if (shape == 2) {
+    float a = dot(direction.xy, direction.xy);
+    float b = dot(origin.xy, direction.xy);
+    float c = dot(origin.xy, origin.xy) - 1.0;
+    if (a <= 1.0e-12) {
+      if (c > 0.0)
+        return false;
+    } else {
+      float discriminant = b * b - a * c;
+      if (!finiteFloat(discriminant) || discriminant < 0.0)
+        return false;
+      float root = sqrt(max(discriminant, 0.0));
+      rayEnter = max(rayEnter, (-b - root) / a);
+      rayExit = min(rayExit, (-b + root) / a);
+    }
+    if (!clipFogSlab(origin.z, direction.z, rayEnter, rayExit))
+      return false;
+  } else {
+    return false;
+  }
+
+  if (!finiteFloat(rayEnter) || !finiteFloat(rayExit) ||
+      rayExit <= rayEnter + 1.0e-5)
+    return false;
+  rayInterval = vec2(rayEnter, rayExit);
+  return true;
+}
+
+float fogVolumeWeight(FogVolume volume, vec3 localPos) {
+  int shape = int(floor(volume.params.x + 0.5));
+  float edge = 2.0;
+  if (shape == 0) {
+    edge = length(localPos);
+  } else if (shape == 1) {
+    edge = max(max(abs(localPos.x), abs(localPos.y)), abs(localPos.z));
+  } else if (shape == 2) {
+    edge = max(length(localPos.xy), abs(localPos.z));
+  }
+  if (!finiteFloat(edge) || edge >= 1.0)
+    return 0.0;
+  float feather = clamp(volume.params.z, 0.0, 1.0);
+  if (feather <= 1.0e-5)
+    return 1.0;
+  return 1.0 - smoothstep(max(1.0 - feather, 0.0), 1.0, edge);
+}
+
+float densityToSigmaT(float density) {
+  float bounded = clamp(density, 0.0, 2.0);
+  float response = bounded / (1.0 + 0.5 * bounded);
+  return response * 0.0006;
 }
 
 float samplePointVolumeShadow(PointLight light, vec3 sampleWorldPos) {
@@ -653,6 +786,33 @@ void main() {
     return;
   }
 
+  // Compute exact ray support once per pixel. March segments below integrate
+  // their overlap with these intervals, so a fog body thinner than ds cannot
+  // disappear merely because no fixed segment midpoint landed inside it.
+  uint fogVolumeCount = min(fogVolumes.u_count, 8u);
+  vec2 fogRayIntervals[8];
+  float fogSigmaT[8];
+  bool hasFogRayInterval = false;
+  float fogDensityHint = 0.0;
+  for (uint vi = 0u; vi < 8u; ++vi) {
+    fogRayIntervals[vi] = vec2(1.0, 0.0);
+    fogSigmaT[vi] = 0.0;
+    if (vi >= fogVolumeCount)
+      continue;
+    FogVolume volume = fogVolumes.u_volumes[vi];
+    float volumeDensity = clamp(volume.params.y, 0.0, 2.0);
+    if (!finiteFloat(volumeDensity) || volumeDensity <= 1.0e-6)
+      continue;
+    vec2 volumeInterval;
+    if (!intersectFogVolume(volume, cameraPos, rayDir,
+                            intervalStart, intervalEnd, volumeInterval))
+      continue;
+    fogRayIntervals[vi] = volumeInterval;
+    fogSigmaT[vi] = densityToSigmaT(volumeDensity);
+    fogDensityHint = max(fogDensityHint, volumeDensity);
+    hasFogRayInterval = true;
+  }
+
   vec3 sunDir = csm.u_sunDir.xyz;
   float sunLen = length(sunDir);
   if (sunLen <= 1e-6)
@@ -688,7 +848,8 @@ void main() {
   float contrastWeight = clamp(pc.p_params0.w, 0.0, 3.0);
   float decay = clamp(pc.p_params0.y, 0.70, 0.999);
   if (!finiteFloat(density) || !finiteFloat(contrastWeight) ||
-      !finiteFloat(decay) || density <= 1e-6) {
+      !finiteFloat(decay) ||
+      (density <= 1e-6 && !hasFogRayInterval)) {
     emitNoEffect();
     return;
   }
@@ -696,13 +857,11 @@ void main() {
   // density 使用饱和响应，极端 UI 值不会把旧游戏画面压成不透明雾墙。
   // sigmaT 决定场景透过率；decay 映射为单次散射反照率。旧实现用
   // decay 去降低 sigmaT，导致用户把“衰减/保持”拉高时散射反而变弱。
-  float densityResponse = density / (1.0 + 0.5 * density);
   float decayN = saturate((decay - 0.70) / 0.299);
   // 提高基础散射系数。旧值 0.00028 在 1200 单位射线上只产生 0.336
   // 光学深度（透过率 71%），远不够在体积中形成可感知的明暗对比。
-  float sigmaT = densityResponse * 0.0006;
+  float sigmaT = densityToSigmaT(density);
   float singleScatteringAlbedo = mix(0.72, 0.96, decayN);
-  float sigmaS = sigmaT * singleScatteringAlbedo;
 
   float fadeNear = clamp(pc.p_params1.y, 0.0, 0.95);
   float fadeFar = clamp(pc.p_params1.z, fadeNear + 0.01, 1.0);
@@ -712,7 +871,9 @@ void main() {
   float fadeReferenceDistance = min(maxWorldDistance, 1000.0);
   float distanceNorm = saturate(marchLength / max(fadeReferenceDistance, 1.0));
   float distanceFade = smoothstep(fadeNear, fadeFar, distanceNorm);
-  float mediumPresence = disableNearFade ? 1.0 : mix(0.20, 1.0, distanceFade);
+  // Clear-air profile: the camera neighbourhood contributes almost no global
+  // haze. Authored local volumes do not use this distance fade at all.
+  float mediumPresence = disableNearFade ? 1.0 : mix(0.03, 1.0, distanceFade);
 
   // 俯视短 ray 不能浪费 20% 在 froxelNear 上，否则柱刚贴地就被跳过。
   vec3 worldUpEarly = csm.u_worldUp.xyz;
@@ -724,7 +885,9 @@ void main() {
   float topDownEarly = abs(dot(rayDir, worldUpEarly));
   // nearSkip 相对积分区间长度，避免地表端区间再被相机端 froxel 错位。
   float froxelNearFrac = mix(0.18, 0.04, smoothstep(0.40, 0.88, topDownEarly));
-  float nearSkip = min(
+  // A local body is an explicit authored support interval and may begin at
+  // the camera. Never discard it through the legacy global-medium near skip.
+  float nearSkip = hasFogRayInterval ? 0.0 : min(
     max(pc.p_params2.z, 0.1), intervalLength * froxelNearFrac);
   float marchStart = intervalStart + nearSkip;
   float segmentLength = max(intervalEnd - marchStart, 0.0);
@@ -743,8 +906,11 @@ void main() {
   float accumSunReference = 0.0;
   float accumLit = 0.0;
   vec3 accumPoint = vec3(0.0);
-  // 俯视短 ray 整段能量比 O 极小；记录路径峰值遮挡供柱可读性使用。
-  float peakSunPhysicalOcclusion = 0.0;
+  // Whole-ray ratios dilute a short blocker on a long grazing ray. Retain a
+  // bounded local blocker ratio plus its actual optical support; this is
+  // view-independent evidence, unlike camera-pitch readability heuristics.
+  float peakSunLocalOcclusion = 0.0;
+  float sunShadowEvidenceOptical = 0.0;
 
   vec3 worldUp = worldUpEarly;
   float upLen = 1.0;
@@ -759,26 +925,19 @@ void main() {
   }
 
   bool sampleDirectionalCsm = hasPublishedCsm;
-  // A ray that crosses the light direction transversely can enter and leave a
-  // thin shadow column between two fixed longitudinal samples. Ordinary RTS
-  // top-down rays need the same conservative coverage: their projected column
-  // footprint is shortest and quarter-resolution rasterization already gives
-  // them fewer independent rays. The hard eight-probe bound remains unchanged;
-  // only probes inside a cascade transition may perform the second raw fetch
-  // required by the authored adjacent-cascade blend (16 fetches worst-case).
-  float rayLightAlignment = abs(dot(rayDir, sunDir));
-  float rayLightCrossing = sqrt(max(
-    1.0 - rayLightAlignment * rayLightAlignment, 0.0));
-  float rayTopDownFactor = abs(dot(rayDir, worldUp));
-  float topDownProbeDemand = smoothstep(0.55, 0.90, rayTopDownFactor);
-  float directionalProbeDemand = max(rayLightCrossing, topDownProbeDemand);
-  float directionalProbeSpacing = mix(
-    24.0, 10.0, smoothstep(0.25, 0.85, directionalProbeDemand));
+  // A thin shadow column must receive the same longitudinal evidence at every
+  // camera pitch. The previous 10..24 world-unit spacing explicitly reduced
+  // probe density for grazing views, exactly where a distant column already
+  // occupies the fewest effect pixels. Ten-unit spacing is still hard-capped at
+  // eight probes per march segment (sixteen raw fetches at a cascade seam).
+  const float directionalProbeSpacing = 10.0;
   // 可读性护栏：即使用户把密度/距离拉满，也不允许体积 pass 独自
   // 把场景压到接近全黑。默认参数通常远达不到此上限。
   // 提高最大光学深度上限，让高 density 设置下雾能量充足。
   // density=2 时从 0.75 提升到 1.20，不会导致不透明雾墙。
-  float maxOpticalDepth = mix(0.35, 1.20, saturate(density * 0.5));
+  float densityHint = max(density, fogDensityHint);
+  float maxOpticalDepth = mix(
+    0.35, 1.20, saturate(densityHint * 0.5));
 
   // Per-pixel stratified jitter applied ONLY to the discontinuous shadow
   // visibility probes below (never the smooth medium). This is the jitter the
@@ -814,24 +973,58 @@ void main() {
     float localDensityMul = heightProfile * heightDensityGain;
     localDensityMul = clamp(localDensityMul, 0.12, 2.8);
 
-    float sigmaSLocal = sigmaS * localDensityMul * mediumPresence;
-    float sigmaTLocal = sigmaT * localDensityMul * mediumPresence;
-
+    float sigmaTGlobal = sigmaT * localDensityMul * mediumPresence;
+    float fullStepOptical = max(sigmaTGlobal * ds, 0.0);
+    float mediumSpanStart = sigmaTGlobal > 1.0e-9
+      ? segmentStart : intervalEnd;
+    float mediumSpanEnd = sigmaTGlobal > 1.0e-9
+      ? segmentEnd : intervalStart;
+    vec2 fogSegmentIntervals[8];
+    float fogSegmentSigmaT[8];
+    for (uint vi = 0u; vi < 8u; ++vi) {
+      fogSegmentIntervals[vi] = vec2(1.0, 0.0);
+      fogSegmentSigmaT[vi] = 0.0;
+      if (vi >= fogVolumeCount || fogSigmaT[vi] <= 0.0)
+        continue;
+      float overlapStart = max(segmentStart, fogRayIntervals[vi].x);
+      float overlapEnd = min(segmentEnd, fogRayIntervals[vi].y);
+      if (overlapEnd <= overlapStart + 1.0e-6)
+        continue;
+      float volumeMidpoint = 0.5 * (overlapStart + overlapEnd);
+      vec3 volumeLocalPos = fogWorldToLocalPoint(
+        fogVolumes.u_volumes[vi],
+        cameraPos + rayDir * volumeMidpoint);
+      float volumeSigmaT = fogSigmaT[vi] * fogVolumeWeight(
+        fogVolumes.u_volumes[vi], volumeLocalPos);
+      float localOptical = volumeSigmaT * (overlapEnd - overlapStart);
+      if (localOptical <= 0.0)
+        continue;
+      fullStepOptical += localOptical;
+      fogSegmentIntervals[vi] = vec2(overlapStart, overlapEnd);
+      fogSegmentSigmaT[vi] = volumeSigmaT;
+      mediumSpanStart = min(mediumSpanStart, overlapStart);
+      mediumSpanEnd = max(mediumSpanEnd, overlapEnd);
+    }
     float remainingOptical = max(maxOpticalDepth - opticalDepth, 0.0);
-    float stepOptical = min(max(sigmaTLocal * ds, 0.0), remainingOptical);
-    if (!finiteFloat(stepOptical) || stepOptical <= 1e-7)
-      break;
+    float stepOptical = min(fullStepOptical, remainingOptical);
+    if (!finiteFloat(stepOptical)) {
+      emitNoEffect();
+      return;
+    }
+    // A clear-air ray can encounter its first local volume in a later segment.
+    // Zero medium here therefore skips this segment instead of terminating the
+    // complete march as the old globally homogeneous model could safely do.
+    if (stepOptical <= 1e-7)
+      continue;
     float stepTransmittance = exp(-min(stepOptical, 80.0));
     float stepScatter =
-      (1.0 - stepTransmittance) *
-      saturate(sigmaSLocal / max(sigmaTLocal, 1e-6));
+      (1.0 - stepTransmittance) * singleScatteringAlbedo;
     // maxOpticalDepth may truncate the last segment. Point-light overlap must
     // not emit from the portion that the shared medium integrator discarded.
-    float fullStepOptical = max(sigmaTLocal * ds, 0.0);
     float effectiveStepFraction = clamp(
       stepOptical / max(fullStepOptical, 1e-20), 0.0, 1.0);
     float effectiveSegmentEnd = mix(
-      segmentStart, segmentEnd, effectiveStepFraction);
+      mediumSpanStart, mediumSpanEnd, effectiveStepFraction);
 
     float segmentSunReferenceOcclusion = 0.0;
     float segmentSunPhysicalOcclusion = 0.0;
@@ -839,7 +1032,9 @@ void main() {
       // Longitudinal probes (≤8). Cascade-seam may double-fetch (≤16 raw).
       // 段内用平均而非 max：旧 max 会把任一 probe 命中扩成整段二值遮挡，
       // 沿视线叠成多层剪影切片（火凤凰“很多个模型”）。平均更接近区间积分。
-      float acceptedLength = max(effectiveSegmentEnd - segmentStart, 0.0);
+      float visibilityStart = max(segmentStart, mediumSpanStart);
+      float visibilityEnd = min(effectiveSegmentEnd, mediumSpanEnd);
+      float acceptedLength = max(visibilityEnd - visibilityStart, 0.0);
       int probeCount = clamp(
         int(ceil(acceptedLength / directionalProbeSpacing)), 2, 8);
       float refOcclusionSum = 0.0;
@@ -850,7 +1045,7 @@ void main() {
           break;
         float probeT = (float(probeIndex) + shadowJitter) / float(probeCount);
         float visibilityDistance = mix(
-          segmentStart, effectiveSegmentEnd, probeT);
+          visibilityStart, visibilityEnd, probeT);
         float visibilityViewDepth =
           cameraViewDepth + rayViewDepthSlope * visibilityDistance;
         float probeCoverage = 0.0;
@@ -903,19 +1098,35 @@ void main() {
         sunPhysicalVisibility = 1.0;
       }
       float sunStep = transmittance * phaseLdr * stepScatter;
-      accumSunReference += sunStep * sunReferenceVisibility;
-      accumLit += sunStep * sunPhysicalVisibility;
-      // 段内物理遮挡峰值（已含 shadowStrength），供上帝视角短 ray 柱对比。
-      peakSunPhysicalOcclusion = max(
-        peakSunPhysicalOcclusion,
-        clamp(1.0 - sunPhysicalVisibility, 0.0, 1.0));
+      float sunReferenceStep = sunStep * sunReferenceVisibility;
+      float sunPhysicalStep = sunStep * sunPhysicalVisibility;
+      accumSunReference += sunReferenceStep;
+      accumLit += sunPhysicalStep;
+      // Difference from the same probe's reference is true CSM blocker
+      // evidence. Normalize locally so a short shadow interval is not diluted
+      // by bright medium elsewhere, then retain optical support as a separate
+      // gate so one noisy/vanishingly thin probe cannot create a dark decal.
+      float blockerVisibilityLoss = max(
+        sunReferenceVisibility - sunPhysicalVisibility, 0.0);
+      float segmentLocalOcclusion = clamp(
+        blockerVisibilityLoss / max(sunReferenceVisibility, 1.0e-4),
+        0.0, 1.0);
+      peakSunLocalOcclusion = max(
+        peakSunLocalOcclusion, segmentLocalOcclusion);
+      sunShadowEvidenceOptical += stepOptical * blockerVisibilityLoss;
     }
 
     if (hasPointVolume) {
       for (uint li = 0u; li < pointLightCount; li++) {
         vec2 rayInterval = pointRayIntervals[li];
-        float overlapStart = max(segmentStart, rayInterval.x);
-        float overlapEnd = min(effectiveSegmentEnd, rayInterval.y);
+        // A clear-air segment may contain only a thin local-medium chord.
+        // Constrain the smooth light sample to the actual medium span as well
+        // as the point-light sphere; otherwise the energy length is correct
+        // but its inverse-range and phase sample can land in empty air.
+        float overlapStart = max(
+          max(segmentStart, mediumSpanStart), rayInterval.x);
+        float overlapEnd = min(
+          min(effectiveSegmentEnd, mediumSpanEnd), rayInterval.y);
         if (overlapEnd <= overlapStart + 1e-6)
           continue;
 
@@ -985,17 +1196,31 @@ void main() {
         // first attenuate from segmentStart to overlapStart, then scatter over
         // the overlap length. For a full overlap these reduce exactly to the
         // shared transmittance and stepScatter used by the sun path.
-        float preOverlapOptical = min(
-          max(sigmaTLocal * (overlapStart - segmentStart), 0.0),
-          stepOptical);
-        float overlapOptical = min(
-          max(sigmaTLocal * (overlapEnd - overlapStart), 0.0),
-          max(stepOptical - preOverlapOptical, 0.0));
+        float preOverlapOptical = max(
+          sigmaTGlobal * (overlapStart - segmentStart), 0.0);
+        float overlapOptical = max(
+          sigmaTGlobal * (overlapEnd - overlapStart), 0.0);
+        for (uint vi = 0u; vi < 8u; ++vi) {
+          if (vi >= fogVolumeCount || fogSegmentSigmaT[vi] <= 0.0)
+            continue;
+          vec2 mediumInterval = fogSegmentIntervals[vi];
+          float preStart = max(segmentStart, mediumInterval.x);
+          float preEnd = min(overlapStart, mediumInterval.y);
+          if (preEnd > preStart)
+            preOverlapOptical += fogSegmentSigmaT[vi] * (preEnd - preStart);
+          float litStart = max(overlapStart, mediumInterval.x);
+          float litEnd = min(overlapEnd, mediumInterval.y);
+          if (litEnd > litStart)
+            overlapOptical += fogSegmentSigmaT[vi] * (litEnd - litStart);
+        }
+        preOverlapOptical = min(preOverlapOptical, stepOptical);
+        overlapOptical = min(
+          overlapOptical, max(stepOptical - preOverlapOptical, 0.0));
         float overlapTransmittance = transmittance *
           exp(-min(preOverlapOptical, 80.0));
         float overlapScatter =
           (1.0 - exp(-min(overlapOptical, 80.0))) *
-          saturate(sigmaSLocal / max(sigmaTLocal, 1e-6));
+          singleScatteringAlbedo;
         accumPoint += overlapTransmittance * pointColor * atten *
                       pointPhaseLdr * overlapScatter * pointShadowVisibility;
       }
@@ -1007,38 +1232,36 @@ void main() {
       break;
   }
 
-  // Whole-ray column contrast + 温和 peak 可读性。
-  // 地表端区间修好后，不再依赖激进 peak→黑柱来“补”俯视；peak 只作轻量辅助，
-  // 避免低镜头逼近时整坨发黑。weight=0 仍精确关掉真实遮挡对比。
+  // Whole-ray physical contrast plus optically supported local evidence. A
+  // short blocker on a long low-pitch ray no longer vanishes through the
+  // L_lit/L_ref denominator, while evidence gating prevents an unsupported
+  // peak probe from becoming a detached black column. weight=0 still disables
+  // all authored blocker contrast exactly.
   float resolvedAccumLit = accumLit;
   float resolvedColumnOcclusion = 0.0;
   if (hasSunVolume && accumSunReference > 1e-7) {
     float physicalRatio = clamp(
       accumLit / max(accumSunReference, 1e-7), 0.0, 1.0);
     float pathOcclusion = 1.0 - physicalRatio;
-    float peakOcclusion = clamp(peakSunPhysicalOcclusion, 0.0, 1.0);
+    float peakOcclusion = clamp(peakSunLocalOcclusion, 0.0, 1.0);
     bool volumeSun = csm.u_volumeSunParams.x > 0.5;
-    // 俯视略偏 peak；低镜头几乎全信 path 能量比。volume-sun 只轻抬一点。
-    float peakBlend = smoothstep(0.45, 0.92, rayTopDownFactor) * 0.55;
-    if (volumeSun)
-      peakBlend = min(peakBlend + 0.12, 0.72);
-    float physicalOcclusion = mix(
+    float shadowEvidenceGate = smoothstep(
+      0.00035, 0.0060, sunShadowEvidenceOptical);
+    float localEvidenceScale = volumeSun ? 0.74 : 0.68;
+    float physicalOcclusion = max(
       pathOcclusion,
-      max(pathOcclusion, peakOcclusion * mix(0.40, 0.72, peakBlend)),
-      peakBlend);
+      peakOcclusion * shadowEvidenceGate * localEvidenceScale);
     float contrastControl = clamp(contrastWeight, 0.0, 2.5);
     float resolvedOcclusion;
     if (contrastControl <= 1.0) {
       resolvedOcclusion = physicalOcclusion * contrastControl;
     } else {
-      // 可读性 toe 仍抬短柱，但指数下限不再压到 0.12（会把中等 O 打成接近 1）。
-      float topDownTargetExponent = mix(
-        0.72, 0.42, smoothstep(0.40, 0.92, rayTopDownFactor));
-      if (volumeSun)
-        topDownTargetExponent = mix(topDownTargetExponent, 0.36, peakBlend);
+      // A fixed target exponent makes the same blocker evidence resolve to the
+      // same contrast at low and top-down camera pitches.
+      float targetExponent = volumeSun ? 0.50 : 0.55;
       float readabilityMix = saturate((contrastControl - 1.0) / 1.5);
       float readabilityExponent = mix(
-        1.0, topDownTargetExponent, readabilityMix);
+        1.0, targetExponent, readabilityMix);
       resolvedOcclusion = pow(
         max(physicalOcclusion, 0.0), max(readabilityExponent, 0.28));
     }
@@ -1073,7 +1296,7 @@ void main() {
   // increasingly energy-inconsistent as density is raised.
   float sceneTransmittance = pow(rawTransmittance, extinctionStrength);
 
-  // Missing in-scattering alone cannot make a short top-down shaft readable
+  // Missing in-scattering alone cannot make a short shaft readable
   // when the authored fog energy is intentionally low. Reuse alpha as the
   // existing base-transmittance channel and apply a small, bounded readability
   // term driven only by the resolved *true* CSM occlusion above. This adds no
@@ -1082,22 +1305,22 @@ void main() {
   // The ratio itself is independent of medium/source energy. Gate it with the
   // actually integrated optical depth and the authored sun-volume energy so a
   // nearly disabled effect cannot leave a detached dark decal behind.
-  // 底图柱可读性：地表端区间恢复后收紧门槛与上限，避免“靠近突然黑坨”。
-  float mediumLo = mix(0.0015, 0.00045, smoothstep(0.35, 0.90, rayTopDownFactor));
-  float mediumHi = mix(0.020, 0.008, smoothstep(0.35, 0.90, rayTopDownFactor));
-  float columnMediumGate = smoothstep(mediumLo, mediumHi, opticalDepth);
+  // Gate base attenuation with blocker-supported optical depth, not the total
+  // fog depth. This is view-neutral and cannot darken a ray that only contains
+  // unshadowed medium.
+  float columnEvidenceGate = smoothstep(
+    0.00035, 0.0060, sunShadowEvidenceOptical);
   float columnSourceGate = smoothstep(
     0.004, 0.040, sunRadiancePeak * intensity);
   float columnReadabilityMix =
     saturate((contrastWeight - 1.0) / 1.5);
-  // 硬封顶约 18%（低镜头）～28%（俯视）；volume-sun 不再额外放大到 0.6+。
-  float attenScale = mix(0.48, 0.72, smoothstep(0.35, 0.90, rayTopDownFactor));
+  // Fixed 24% cap: no camera-pitch branch may make the same column darker.
+  float attenScale = 0.62;
   if (csm.u_volumeSunParams.x > 0.5)
     attenScale *= 1.05;
-  float maxColumnAtten = mix(
-    0.18, 0.28, smoothstep(0.35, 0.90, rayTopDownFactor));
+  float maxColumnAtten = 0.24;
   float columnReadabilityAttenuation = min(
-    resolvedColumnOcclusion * 0.55 * attenScale * columnMediumGate *
+    resolvedColumnOcclusion * 0.55 * attenScale * columnEvidenceGate *
       columnSourceGate * columnReadabilityMix,
     maxColumnAtten);
   sceneTransmittance = clamp(

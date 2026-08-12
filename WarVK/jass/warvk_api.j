@@ -225,6 +225,13 @@ function WarVKSetVolumetricEnabled takes boolean enabled returns nothing
     call Preloader(payload)
 endfunction
 
+// 只控制均匀的全局介质；false 保留局部 Sphere/Box/Cylinder 及其光照和阴影。
+// 该开关不会修改 density，重新启用时会恢复之前设置的全局密度。
+function WarVKSetGlobalVolumetricMediumEnabled takes boolean enabled returns nothing
+    local string payload = "warvk:v1;volumetric.setGlobalMediumEnabled" + ";b:" + WarVKBoolToken(enabled)
+    call Preloader(payload)
+endfunction
+
 function WarVKSetVolumetricDensity takes real density returns nothing
     local string payload = "warvk:v1;volumetric.setDensity" + ";r:" + R2S(density)
     call Preloader(payload)
@@ -252,6 +259,73 @@ endfunction
 function WarVKSetGlobalVolumetricFog takes real baseHeight, real falloff, real strength returns nothing
     local string payload = "warvk:v1;volumetricFog.setSettings" + ";r:" + R2S(baseHeight) + ";r:" + R2S(falloff) + ";r:" + R2S(strength)
     call Preloader(payload)
+endfunction
+
+// 局部雾使用世界坐标。Box 的三个 size 与 Cylinder 的 height 都是完整尺寸；
+// edgeFeather 为 0..1 的归一化边缘过渡宽度。创建局部雾不会自动开启体积光通道。
+function WarVKCreateSphereFogVolume takes real x, real y, real z, real radius, real density, real edgeFeather returns integer
+    local string payload = "warvk:v1;localFog.createSphere" + ";r:" + R2S(x) + ";r:" + R2S(y) + ";r:" + R2S(z) + ";r:" + R2S(radius) + ";r:" + R2S(density) + ";r:" + R2S(edgeFeather)
+    return GetLocalizedHotkey(payload)
+endfunction
+
+function WarVKCreateBoxFogVolume takes real x, real y, real z, real sizeX, real sizeY, real sizeZ, real density, real edgeFeather returns integer
+    local string payload = "warvk:v1;localFog.createBox" + ";r:" + R2S(x) + ";r:" + R2S(y) + ";r:" + R2S(z) + ";r:" + R2S(sizeX) + ";r:" + R2S(sizeY) + ";r:" + R2S(sizeZ) + ";r:" + R2S(density) + ";r:" + R2S(edgeFeather)
+    return GetLocalizedHotkey(payload)
+endfunction
+
+function WarVKCreateCylinderFogVolume takes real x, real y, real z, real radius, real height, real density, real edgeFeather returns integer
+    local string payload = "warvk:v1;localFog.createCylinder" + ";r:" + R2S(x) + ";r:" + R2S(y) + ";r:" + R2S(z) + ";r:" + R2S(radius) + ";r:" + R2S(height) + ";r:" + R2S(density) + ";r:" + R2S(edgeFeather)
+    return GetLocalizedHotkey(payload)
+endfunction
+
+function WarVKDestroyFogVolume takes integer fogId returns nothing
+    local string payload = "warvk:v1;localFog.destroy" + ";d:" + I2S(fogId)
+    call Preloader(payload)
+endfunction
+
+function WarVKSetFogVolumeEnabled takes integer fogId, boolean enabled returns nothing
+    local string payload = "warvk:v1;localFog.setEnabled" + ";d:" + I2S(fogId) + ";b:" + WarVKBoolToken(enabled)
+    call Preloader(payload)
+endfunction
+
+function WarVKSetFogVolumePosition takes integer fogId, real x, real y, real z returns nothing
+    local string payload = "warvk:v1;localFog.setPosition" + ";d:" + I2S(fogId) + ";r:" + R2S(x) + ";r:" + R2S(y) + ";r:" + R2S(z)
+    call Preloader(payload)
+endfunction
+
+function WarVKSetFogVolumeRotation takes integer fogId, real xDegrees, real yDegrees, real zDegrees returns nothing
+    local string payload = "warvk:v1;localFog.setRotation" + ";d:" + I2S(fogId) + ";r:" + R2S(xDegrees) + ";r:" + R2S(yDegrees) + ";r:" + R2S(zDegrees)
+    call Preloader(payload)
+endfunction
+
+function WarVKSetFogVolumeDensity takes integer fogId, real density returns nothing
+    local string payload = "warvk:v1;localFog.setDensity" + ";d:" + I2S(fogId) + ";r:" + R2S(density)
+    call Preloader(payload)
+endfunction
+
+function WarVKSetFogVolumeEdgeFeather takes integer fogId, real edgeFeather returns nothing
+    local string payload = "warvk:v1;localFog.setEdgeFeather" + ";d:" + I2S(fogId) + ";r:" + R2S(edgeFeather)
+    call Preloader(payload)
+endfunction
+
+function WarVKSetSphereFogVolumeRadius takes integer fogId, real radius returns nothing
+    local string payload = "warvk:v1;localFog.setSphereRadius" + ";d:" + I2S(fogId) + ";r:" + R2S(radius)
+    call Preloader(payload)
+endfunction
+
+function WarVKSetBoxFogVolumeSize takes integer fogId, real sizeX, real sizeY, real sizeZ returns nothing
+    local string payload = "warvk:v1;localFog.setBoxSize" + ";d:" + I2S(fogId) + ";r:" + R2S(sizeX) + ";r:" + R2S(sizeY) + ";r:" + R2S(sizeZ)
+    call Preloader(payload)
+endfunction
+
+function WarVKSetCylinderFogVolumeSize takes integer fogId, real radius, real height returns nothing
+    local string payload = "warvk:v1;localFog.setCylinderSize" + ";d:" + I2S(fogId) + ";r:" + R2S(radius) + ";r:" + R2S(height)
+    call Preloader(payload)
+endfunction
+
+function WarVKIsFogVolumeAlive takes integer fogId returns boolean
+    local string payload = "warvk:v1;localFog.isAlive" + ";d:" + I2S(fogId)
+    return GetLocalizedHotkey(payload) != 0
 endfunction
 
 function WarVKSetOutlineEnabled takes boolean enabled returns nothing
