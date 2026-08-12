@@ -3492,7 +3492,7 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
     uint32_t vertexCount,
     uint64_t expectedVisibleFrameSerial,
     CurrentDrawAuthoritativeSample& out) {
-  out = {};
+  ResetCurrentDrawAuthoritativeSamplePreserveScratch(out);
   if (!QueryCurrentDrawContract(renderablePart, out.contract)) {
     out.status = CurrentDrawResolveStatus::MissingContract;
     return out.status;
@@ -3502,7 +3502,7 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
       out.contract.visibleFrameSerial < expectedVisibleFrameSerial) {
     g_lastMissReason.store(uint32_t(CurrentDrawMissReason::StaleVisibleFrame),
                            std::memory_order_relaxed);
-    out = {};
+    ResetCurrentDrawAuthoritativeSamplePreserveScratch(out);
     out.status = CurrentDrawResolveStatus::StaleVisibleFrame;
     return out.status;
   }
@@ -3545,7 +3545,7 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
     CurrentDrawAuthoritativeSample& out,
     const CurrentDrawResolveTrace* trace,
     const CurrentDrawRangeValidator* rangeValidator) {
-  out = {};
+  ResetCurrentDrawAuthoritativeSamplePreserveScratch(out);
   out.contract = record;
   out.contract.known = CurrentDrawContractHasCanonicalIdentity(record);
   if (!out.contract.known) {
@@ -3558,7 +3558,7 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
       out.contract.visibleFrameSerial < expectedVisibleFrameSerial) {
     g_lastMissReason.store(uint32_t(CurrentDrawMissReason::StaleVisibleFrame),
                            std::memory_order_relaxed);
-    out = {};
+    ResetCurrentDrawAuthoritativeSamplePreserveScratch(out);
     out.status = CurrentDrawResolveStatus::StaleVisibleFrame;
     return out.status;
   }

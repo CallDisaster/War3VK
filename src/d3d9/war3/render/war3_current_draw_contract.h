@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace dxvk::war3::render {
@@ -144,6 +145,20 @@ struct CurrentDrawAuthoritativeSample {
     return !groupSlots.empty();
   }
 };
+
+// Reset all authority-bearing state while retaining only caller-owned scratch
+// capacity. Empty buffers carry no cross-frame palette or group-slot proof.
+inline void ResetCurrentDrawAuthoritativeSamplePreserveScratch(
+    CurrentDrawAuthoritativeSample& sample) noexcept {
+  auto palette = std::move(sample.palette);
+  auto groupSlots = std::move(sample.groupSlots);
+
+  sample = {};
+  palette.clear();
+  groupSlots.clear();
+  sample.palette = std::move(palette);
+  sample.groupSlots = std::move(groupSlots);
+}
 
 // Optional low-overhead phase observer for the authoritative decode hot path.
 // The caller owns timing policy and sampling; production calls pass nullptr.

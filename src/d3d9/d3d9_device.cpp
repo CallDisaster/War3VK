@@ -32,6 +32,7 @@
 #include "war3/render/war3_visible_renderables.h"
 #include "war3/render/war3_canonical_draw.h"
 #include "war3/render/war3_current_draw_contract.h"
+#include "war3/render/war3_direct_packet_scratch.h"
 #include "war3/render/war3_lightning_runtime.h"
 #include "war3/handle/war3_handle_resolver.h"
 #include "war3/hooks/war3_hook_widget_identity.h"
@@ -6601,9 +6602,17 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     packetBuildTiming->enter(War3PacketBuildPhase::GateReset);
   auto directBuildScope =
       War3SemanticSubmitScope("War3SemanticScene/Direct/BuildPacket");
-  out = {};
-  if (outDirectCurrentDrawSample != nullptr)
-    *outDirectCurrentDrawSample = {};
+  // A recycled packet contributes capacity only. Clear every identity,
+  // pointer, owner and generation before current-frame validation; the reset
+  // helper retains empty buffers inside the packet until the authoritative
+  // decoder actually needs them, so early geoset/owner rejects do not discard
+  // warmed capacity.
+  dxvk::war3::render::ResetShadowDrawPacketPreserveScratch(out);
+  if (outDirectCurrentDrawSample != nullptr) {
+    dxvk::war3::render::
+        ResetCurrentDrawAuthoritativeSamplePreserveScratch(
+            *outDirectCurrentDrawSample);
+  }
   if (record.renderablePart == nullptr || record.meshPayloadPtr == nullptr)
     return false;
 
@@ -7112,6 +7121,20 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::AuthoritativeSetup);
   dxvk::war3::render::CurrentDrawAuthoritativeSample directCurrentDrawSample = {};
+  directCurrentDrawSample.palette = std::move(out.runtimeGroupPalette);
+  directCurrentDrawSample.groupSlots =
+      std::move(out.resource.ownedVertexGroupIndices);
+  if (outDirectCurrentDrawSample != nullptr) {
+    if (outDirectCurrentDrawSample->palette.capacity() >
+        directCurrentDrawSample.palette.capacity()) {
+      directCurrentDrawSample.palette.swap(outDirectCurrentDrawSample->palette);
+    }
+    if (outDirectCurrentDrawSample->groupSlots.capacity() >
+        directCurrentDrawSample.groupSlots.capacity()) {
+      directCurrentDrawSample.groupSlots.swap(
+          outDirectCurrentDrawSample->groupSlots);
+    }
+  }
   dxvk::war3::render::CurrentDrawResolveStatus directResolveStatus;
   {
     auto directResolveScope = War3SemanticSubmitScope(
@@ -7214,6 +7237,10 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     // Resolve 失败（InvalidPaletteSlot / MissingPalette 等）时尝试 live rebuild。
     // 注意 allowCModelFallbackForCall 保持 false，避免 1.27a 上 CModel 直读拿到
     // 错对象的已知 bug。
+    // The failed authoritative decode no longer needs its palette payload.
+    // Reuse that allocation for the live fallback of the same candidate.
+    liveRebuiltPalette = std::move(directCurrentDrawSample.palette);
+    liveRebuiltPalette.clear();
     dxvk::war3::render::NoteSubmitLiveRebuildAttempt();
     liveRebuildUsed = War3TryBuildLiveRuntimeGroupPalette(
         resource,
@@ -7234,6 +7261,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     if (!liveRebuildUsed || liveRebuiltPalette.empty()) {
       // live rebuild 也失败：这是真正的"没数据"，只能 skip 这帧。
       dxvk::war3::render::NoteSubmitLiveRebuildMiss();
+      out.runtimeGroupPalette = std::move(liveRebuiltPalette);
+      out.resource.ownedVertexGroupIndices =
+          std::move(directCurrentDrawSample.groupSlots);
       return false;
     }
     dxvk::war3::render::NoteSubmitLiveRebuildHit();
@@ -7251,7 +7281,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       directDecodedGroupSlotMaxReady = directGroupSlotsReady;
       directDecodedMaxGroupSlot = directCurrentDrawSample.maxGroupSlot;
       if (outDirectCurrentDrawSample != nullptr) {
-        *outDirectCurrentDrawSample = {};
+        dxvk::war3::render::
+            ResetCurrentDrawAuthoritativeSamplePreserveScratch(
+                *outDirectCurrentDrawSample);
         outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
         outDirectCurrentDrawSample->paletteCount =
             directCurrentDrawSample.paletteCount;
@@ -7298,7 +7330,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       if (outDirectCurrentDrawSample != nullptr) {
         // 用 stale directCurrentDrawSample 的 contract + rebuild 后的 palette
         // 构造一个 "fresh-palette sample" 给调用方，保留 contract/identity 信息。
-        *outDirectCurrentDrawSample = {};
+        dxvk::war3::render::
+            ResetCurrentDrawAuthoritativeSamplePreserveScratch(
+                *outDirectCurrentDrawSample);
         outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
         outDirectCurrentDrawSample->paletteCount =
             uint32_t(out.runtimeGroupPalette.size());
@@ -7308,6 +7342,14 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       }
     } else if (outDirectCurrentDrawSample != nullptr) {
       *outDirectCurrentDrawSample = std::move(directCurrentDrawSample);
+    }
+    // A failed group decode may leave an unused temporary allocation. Keep
+    // its capacity with the packet scratch, but never let partial group bytes
+    // become the packet's active vertex-group source.
+    if (resource.ownedVertexGroupIndices.empty()) {
+      directCurrentDrawSample.groupSlots.clear();
+      resource.ownedVertexGroupIndices =
+          std::move(directCurrentDrawSample.groupSlots);
     }
   }
 
@@ -26898,15 +26940,18 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   static thread_local std::vector<const EligibleRecord*>
       s_submittedPartPacketLeaseRecords;
   static thread_local std::vector<EligibleRecord> s_eligibleRecords;
+  static thread_local std::vector<EligibleRecord> s_recycledEligibleRecords;
   static thread_local std::vector<
       dxvk::war3::render::CurrentDrawContractRecord>
       s_shadowEligibleManifestRecords;
   auto& submittedPartPacketLeaseRecords =
       s_submittedPartPacketLeaseRecords;
   auto& eligibleRecords = s_eligibleRecords;
+  auto& recycledEligibleRecords = s_recycledEligibleRecords;
   auto& shadowEligibleManifestRecords = s_shadowEligibleManifestRecords;
   submittedPartPacketLeaseRecords.clear();
-  eligibleRecords.clear();
+  dxvk::war3::render::RecycleScratchElements(
+      eligibleRecords, recycledEligibleRecords);
   shadowEligibleManifestRecords.clear();
   // 使用固定大小预分配避免多次 realloc
   eligibleRecords.reserve(std::min<uint32_t>(
@@ -27181,6 +27226,31 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   War3CurrentDrawPoseAugmentSnapshotCache
       currentDrawPoseAugmentSnapshotCache;
 
+  const auto acquireEligibleRecord = [&]() {
+    EligibleRecord eligible = dxvk::war3::render::AcquireScratchElement(
+        recycledEligibleRecords);
+    dxvk::war3::render::ResetShadowDrawPacketPreserveScratch(eligible.packet);
+    dxvk::war3::render::ResetCurrentDrawAuthoritativeSamplePreserveScratch(
+        eligible.sample);
+    eligible.sceneNode = nullptr;
+    eligible.completenessKey = 0u;
+    eligible.recordSelectionKey = 0u;
+    eligible.selectionKey = 0u;
+    eligible.submittedPartIdentityKey = 0u;
+    eligible.manifestPartLeaseKey = 0u;
+    eligible.previouslySubmittedPart = false;
+    eligible.fromPartPacketLease = false;
+    eligible.fromStalePoseRestore = false;
+    eligible.fromDrawTimePrebuildBypass = false;
+    eligible.currentFrameExactOwnerPrefiltered = false;
+    eligible.statsDynamicUnitEvidenceKnown = false;
+    eligible.statsDynamicUnitEvidence = false;
+    return eligible;
+  };
+  const auto recycleRejectedEligibleRecord = [&](EligibleRecord&& eligible) {
+    recycledEligibleRecords.push_back(std::move(eligible));
+  };
+
   enterBuildEligiblePhase("RecordLoop");
   for (size_t buildIndex = 0u;
        buildIndex < recordIndicesForBuild.size(); ++buildIndex) {
@@ -27297,7 +27367,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           stats.semanticSceneProducerClaimLogicalPredictedCount++;
       }
     }
-    EligibleRecord eligible = {};
+    EligibleRecord eligible = acquireEligibleRecord();
     eligible.currentFrameExactOwnerPrefiltered =
         recordsForBuildCanonicalPrefiltered && !useSealedWork;
     // Completeness buckets are development-only diagnostics. The canonical
@@ -27346,6 +27416,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         if (observeProducerClaims)
           m_war3Scene.shadowStats
               .semanticSceneProducerClaimUnresolvedCount++;
+        recycleRejectedEligibleRecord(std::move(eligible));
         continue;
       }
       m_war3Scene.shadowStats.semanticSceneDirectCurrentDrawBuiltPacketCount++;
@@ -27380,6 +27451,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // with unrelated palette/world/UV state.
     if (War3SemanticRawcodeLooksStaticWorldCaster(
             eligible.packet.renderable.rawcode)) {
+      recycleRejectedEligibleRecord(std::move(eligible));
       continue;
     }
     buildRecordTiming.enter(War3BuildEligibleRecordPhase::Eligibility);
@@ -27412,6 +27484,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         m_war3Scene.shadowStats
             .semanticSceneDirectCurrentDrawUnitsFilterRejectNoStableResourceCount++;
       }
+      recycleRejectedEligibleRecord(std::move(eligible));
       continue;
     }
     if (unitsOnly && !drawTimePrebuildBypassed) {

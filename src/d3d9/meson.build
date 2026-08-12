@@ -408,6 +408,22 @@ test(
   timeout : 30,
 )
 
+# DirectGrouped scratch reset keeps allocator capacity only. The runnable
+# proves identities, pointer aliases and shared owners never survive reuse.
+war3_direct_packet_scratch_test = executable(
+  'war3_direct_packet_scratch_test',
+  [
+    'war3/render/tests/war3_direct_packet_scratch_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path, include_directories('war3') ],
+  install             : false,
+)
+test(
+  'war3_direct_packet_scratch',
+  war3_direct_packet_scratch_test,
+  timeout : 30,
+)
+
 # Pure receiver-band clipmap fit used by the default-off RTS shadow candidate.
 # It exercises fixed world-texel density, snapping and fail-closed coverage
 # without loading the game or Vulkan.

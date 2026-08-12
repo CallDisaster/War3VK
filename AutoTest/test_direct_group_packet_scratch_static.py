@@ -14,6 +14,7 @@ body = source.split(
 for name in (
     "s_submittedPartPacketLeaseRecords",
     "s_eligibleRecords",
+    "s_recycledEligibleRecords",
     "s_shadowEligibleManifestRecords",
     "s_objectGroups",
     "s_originalIndices",
@@ -21,6 +22,7 @@ for name in (
     assert f"static thread_local std::vector" in body
 
 assert "auto& eligibleRecords = s_eligibleRecords;" in body
+assert "auto& recycledEligibleRecords = s_recycledEligibleRecords;" in body
 assert "auto& shadowEligibleManifestRecords = s_shadowEligibleManifestRecords;" in body
 assert (
     "auto& submittedPartPacketLeaseRecords =\n"
@@ -28,7 +30,10 @@ assert (
 ) in body
 assert "auto& objectGroups = s_objectGroups;" in body
 assert "submittedPartPacketLeaseRecords.clear();" in body
-assert "eligibleRecords.clear();" in body
+assert (
+    "RecycleScratchElements(\n"
+    "      eligibleRecords, recycledEligibleRecords);"
+) in body
 assert "shadowEligibleManifestRecords.clear();" in body
 assert "objectGroups.clear();" in body
 assert "static thread_local std::unordered_set<uint64_t> s_currentPartKeys;" in body
@@ -43,9 +48,14 @@ assert "originalIndices.resize(eligibleRecordCount);" in body
 
 # Retaining allocator capacity must not retain logical packet contents or
 # remove the existing budget-bound reserves and pointer rebinds after moves.
-assert body.index("eligibleRecords.clear();") < body.index(
+assert body.index("RecycleScratchElements(") < body.index(
     "eligibleRecords.reserve("
 )
+assert "ResetShadowDrawPacketPreserveScratch(eligible.packet);" in body
+assert (
+    "ResetCurrentDrawAuthoritativeSamplePreserveScratch(\n"
+    "        eligible.sample);"
+) in body
 assert body.index("shadowEligibleManifestRecords.clear();") < body.index(
     "shadowEligibleManifestRecords.reserve("
 )
