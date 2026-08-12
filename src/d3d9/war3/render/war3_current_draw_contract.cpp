@@ -1,4 +1,5 @@
 #include "war3_current_draw_contract.h"
+#include "war3_current_draw_group_slot_summary.h"
 
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_hook.h"
@@ -2880,10 +2881,14 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  uint32_t paletteCount,
                                  std::vector<uint8_t>& outGroupSlots,
                                  uint64_t& outGroupHash,
+                                 uint64_t& outStableGroupHash,
+                                 uint32_t& outMaxGroupSlot,
                                  const CurrentDrawResolveTrace* trace,
                                  const CurrentDrawRangeValidator* rangeValidator) {
   outGroupSlots.clear();
   outGroupHash = 0u;
+  outStableGroupHash = 0u;
+  outMaxGroupSlot = 0u;
   g_groupSlotDecodeAttemptCount.fetch_add(1u, std::memory_order_relaxed);
 
   if (!record.known || record.stream1Ptr == nullptr || vertexCount == 0u ||
@@ -2929,7 +2934,7 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
   if (trace != nullptr)
     trace->note(CurrentDrawResolveTracePhase::GroupDecodeLoop);
   outGroupSlots.resize(vertexCount);
-  uint64_t hash = bit::fnv1a_init();
+  CurrentDrawGroupSlotSummary summary = {};
   for (uint32_t i = 0u; i < vertexCount; ++i) {
     const uint32_t groupSlot =
         uint32_t(streamBase[size_t(i) * size_t(kCurrentDrawGroupSlotStep)]);
@@ -2944,19 +2949,21 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
     }
 
     outGroupSlots[i] = uint8_t(groupSlot);
-    hash = bit::fnv1a_iter(hash, groupSlot);
+    summary.include(groupSlot);
   }
 
   if (trace != nullptr)
     trace->note(CurrentDrawResolveTracePhase::GroupFinalize);
-  hash = bit::fnv1a_iter(hash,
-                         reinterpret_cast<uintptr_t>(record.stream1Ptr));
-  hash = bit::fnv1a_iter(hash, kCurrentDrawGroupSlotStep);
-  hash = bit::fnv1a_iter(hash, record.payloadWord48);
-  hash = bit::fnv1a_iter(hash, record.payloadWord108);
-  hash = bit::fnv1a_iter(hash, record.payloadWord11C);
-  hash = bit::fnv1a_iter(hash, record.layerIndex);
-  outGroupHash = hash;
+  outGroupHash = summary.diagnosticHash(
+      reinterpret_cast<uintptr_t>(record.stream1Ptr),
+      kCurrentDrawGroupSlotStep, record.payloadWord48, record.payloadWord108,
+      record.payloadWord11C, record.layerIndex);
+  if (trace != nullptr)
+    trace->note(CurrentDrawResolveTracePhase::StableHash);
+  outStableGroupHash = summary.stableHash(
+      kCurrentDrawGroupSlotStep, record.payloadWord48, record.payloadWord108,
+      record.payloadWord11C, record.layerIndex);
+  outMaxGroupSlot = summary.maxGroupSlot;
   g_groupSlotDecodeHitCount.fetch_add(1u, std::memory_order_relaxed);
   g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                          std::memory_order_relaxed);
@@ -3426,13 +3433,12 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSample(
   }
 
   if (!DecodeCurrentDrawGroupSlots(out.contract, vertexCount, out.paletteCount,
-                                   out.groupSlots, out.groupHash)) {
+                                   out.groupSlots, out.groupHash,
+                                   out.stableGroupHash, out.maxGroupSlot)) {
     out.status = CurrentDrawResolveStatus::MissingGroupSlots;
     return out.status;
   }
 
-  out.stableGroupHash =
-      ComputeStableGroupContentHash(out.contract, out.groupSlots);
   out.status = CurrentDrawResolveStatus::Ready;
   return out.status;
 }
@@ -3486,16 +3492,13 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
   if (trace != nullptr)
     trace->note(CurrentDrawResolveTracePhase::GroupGate);
   if (!DecodeCurrentDrawGroupSlots(out.contract, vertexCount, out.paletteCount,
-                                   out.groupSlots, out.groupHash, trace,
+                                   out.groupSlots, out.groupHash,
+                                   out.stableGroupHash, out.maxGroupSlot, trace,
                                    rangeValidator)) {
     out.status = CurrentDrawResolveStatus::MissingGroupSlots;
     return out.status;
   }
 
-  if (trace != nullptr)
-    trace->note(CurrentDrawResolveTracePhase::StableHash);
-  out.stableGroupHash =
-      ComputeStableGroupContentHash(out.contract, out.groupSlots);
   out.status = CurrentDrawResolveStatus::Ready;
   return out.status;
 }

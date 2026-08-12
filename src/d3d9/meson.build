@@ -375,6 +375,23 @@ test(
   timeout : 30,
 )
 
+# Pure one-pass current-draw group-slot aggregate. This locks the historical
+# stable identity hash while allowing BuildEligible to reuse the maximum
+# palette slot produced by the validating decode pass.
+war3_current_draw_group_slot_summary_test = executable(
+  'war3_current_draw_group_slot_summary_test',
+  [
+    'war3/render/tests/war3_current_draw_group_slot_summary_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_current_draw_group_slot_summary',
+  war3_current_draw_group_slot_summary_test,
+  timeout : 30,
+)
+
 # Pure receiver-band clipmap fit used by the default-off RTS shadow candidate.
 # It exercises fixed world-texel density, snapping and fail-closed coverage
 # without loading the game or Vulkan.

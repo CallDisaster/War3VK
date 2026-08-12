@@ -114,6 +114,7 @@ struct CurrentDrawAuthoritativeSample {
   std::vector<uint8_t> groupSlots;
   uint64_t groupHash = 0u;         // 诊断 hash（含 stream1Ptr）
   uint64_t stableGroupHash = 0u;   // 稳定 hash（不含 stream1Ptr），用于 geometry key
+  uint32_t maxGroupSlot = 0u;      // 与 group hash 在同一次验证遍历中生成
   CurrentDrawResolveStatus status = CurrentDrawResolveStatus::MissingContract;
   // Phase 1：palette bytes 的来源标记。
   PaletteProvenance paletteProvenance = PaletteProvenance::Unknown;
@@ -411,6 +412,8 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  uint32_t paletteCount,
                                  std::vector<uint8_t>& outGroupSlots,
                                  uint64_t& outGroupHash,
+                                 uint64_t& outStableGroupHash,
+                                 uint32_t& outMaxGroupSlot,
                                  const CurrentDrawResolveTrace* trace = nullptr,
                                  const CurrentDrawRangeValidator* rangeValidator =
                                      nullptr);

@@ -6709,6 +6709,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   }
   bool directExplicitBlendResolved = false;
   uint32_t directExplicitBlendMaxGroupSlot = 0u;
+  bool directDecodedGroupSlotMaxReady = false;
+  uint32_t directDecodedMaxGroupSlot = 0u;
 
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::AuthoritativeSetup);
@@ -6849,6 +6851,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         directCurrentDrawSample.paletteReady()) {
       const bool directGroupSlotsReady =
           directCurrentDrawSample.groupSlotsReady();
+      directDecodedGroupSlotMaxReady = directGroupSlotsReady;
+      directDecodedMaxGroupSlot = directCurrentDrawSample.maxGroupSlot;
       if (outDirectCurrentDrawSample != nullptr) {
         *outDirectCurrentDrawSample = {};
         outDirectCurrentDrawSample->contract = directCurrentDrawSample.contract;
@@ -6864,6 +6868,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         outDirectCurrentDrawSample->groupHash = directCurrentDrawSample.groupHash;
         outDirectCurrentDrawSample->stableGroupHash =
             directCurrentDrawSample.stableGroupHash;
+        outDirectCurrentDrawSample->maxGroupSlot =
+            directCurrentDrawSample.maxGroupSlot;
         outDirectCurrentDrawSample->status = directCurrentDrawSample.status;
       }
       out.runtimeGroupPalette = std::move(directCurrentDrawSample.palette);
@@ -7016,13 +7022,17 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto maxSlotScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/MaxGroupSlotScan");
-    uint32_t maxSlot = 0u;
-    const auto& effectiveGroupSlots =
-        !resource.ownedVertexGroupIndices.empty()
-            ? resource.ownedVertexGroupIndices
-            : geo.vertexGroupIndices;
-    for (uint8_t slot : effectiveGroupSlots)
-      maxSlot = std::max(maxSlot, uint32_t(slot));
+    uint32_t maxSlot = directDecodedGroupSlotMaxReady
+        ? directDecodedMaxGroupSlot
+        : 0u;
+    if (!directDecodedGroupSlotMaxReady) {
+      const auto& effectiveGroupSlots =
+          !resource.ownedVertexGroupIndices.empty()
+              ? resource.ownedVertexGroupIndices
+              : geo.vertexGroupIndices;
+      for (uint8_t slot : effectiveGroupSlots)
+        maxSlot = std::max(maxSlot, uint32_t(slot));
+    }
     if (directExplicitBlendResolved)
       maxSlot = std::max(maxSlot, directExplicitBlendMaxGroupSlot);
     out.maxVertexGroupSlot = maxSlot;
