@@ -13,13 +13,27 @@ def body_after(text: str, needle: str, span: int) -> str:
     return text[start:start + span]
 
 
+def function_body(text: str, signature: str) -> str:
+    start = text.index(signature)
+    brace = text.index("{", start)
+    depth = 0
+    for pos in range(brace, len(text)):
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : pos + 1]
+    raise AssertionError(f"unterminated function: {signature}")
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
 
 
-builder = body_after(
-    DEVICE, "bool War3TryBuildShadowPacketFromCurrentDrawRecord(", 38000)
+builder = function_body(
+    DEVICE, "bool War3TryBuildShadowPacketFromCurrentDrawRecord(")
 populate = body_after(DEVICE, "struct EligibleRecord {", 125000)
 record_resolver = body_after(
     CONTRACT, "ResolveCurrentDrawAuthoritativeSampleFromRecord(", 3000)

@@ -4914,8 +4914,9 @@ void War3NoteDirectMainWorldBackingStatus(
   }
 }
 
-bool War3SemanticDirectPacketHasMainWorldVisibleBacking(
+bool War3SemanticDirectPacketMatchesMainWorldVisibleRecord(
     const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    const dxvk::war3::render::VisibleRenderableRecord& visible,
     War3SemanticDirectMainWorldBackingStatus* outStatus = nullptr) {
   auto setStatus = [&](War3SemanticDirectMainWorldBackingStatus status) {
     if (outStatus != nullptr)
@@ -4924,14 +4925,6 @@ bool War3SemanticDirectPacketHasMainWorldVisibleBacking(
   const auto& renderable = packet.renderable;
   if (renderable.renderablePart == nullptr) {
     setStatus(War3SemanticDirectMainWorldBackingStatus::NoRenderablePart);
-    return false;
-  }
-
-  dxvk::war3::render::VisibleRenderableRecord visible = {};
-  if (!dxvk::war3::render::VisibleRenderableRegistry::instance()
-           .queryByRenderablePartAndLayer(renderable.renderablePart,
-                                          renderable.layerIndex, visible)) {
-    setStatus(War3SemanticDirectMainWorldBackingStatus::LookupMiss);
     return false;
   }
 
@@ -4979,6 +4972,31 @@ bool War3SemanticDirectPacketHasMainWorldVisibleBacking(
 
   setStatus(War3SemanticDirectMainWorldBackingStatus::Pass);
   return true;
+}
+
+bool War3SemanticDirectPacketHasMainWorldVisibleBacking(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    War3SemanticDirectMainWorldBackingStatus* outStatus = nullptr) {
+  const auto& renderable = packet.renderable;
+  if (renderable.renderablePart == nullptr) {
+    if (outStatus != nullptr) {
+      *outStatus =
+          War3SemanticDirectMainWorldBackingStatus::NoRenderablePart;
+    }
+    return false;
+  }
+
+  dxvk::war3::render::VisibleRenderableRecord visible = {};
+  if (!dxvk::war3::render::VisibleRenderableRegistry::instance()
+           .queryByRenderablePartAndLayer(renderable.renderablePart,
+                                          renderable.layerIndex, visible)) {
+    if (outStatus != nullptr)
+      *outStatus = War3SemanticDirectMainWorldBackingStatus::LookupMiss;
+    return false;
+  }
+
+  return War3SemanticDirectPacketMatchesMainWorldVisibleRecord(
+      packet, visible, outStatus);
 }
 
 bool War3HasSemanticDynamicUnitEvidence(
@@ -6595,7 +6613,13 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     War3CurrentDrawPoseAugmentSnapshotCache*
         poseAugmentSnapshotCache = nullptr,
     const dxvk::war3::render::VisibleRenderableRecord*
-        preselectedVisibleRecord = nullptr) {
+        preselectedVisibleRecord = nullptr,
+    War3SemanticDirectMainWorldBackingStatus*
+        outPrevalidatedMainWorldBackingStatus = nullptr) {
+  if (outPrevalidatedMainWorldBackingStatus != nullptr) {
+    *outPrevalidatedMainWorldBackingStatus =
+        War3SemanticDirectMainWorldBackingStatus::NotChecked;
+  }
   const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
       record.stage,
       record.batchTag,
@@ -6632,7 +6656,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   // both instance projection and the later visible-record setup.
   dxvk::war3::render::VisibleRenderableRecord visibleRecord = {};
   const bool preselectedVisibleMatches =
-      preselectedVisibleRecord != nullptr &&
+      record.renderablePart != nullptr && preselectedVisibleRecord != nullptr &&
       preselectedVisibleRecord->renderablePart == record.renderablePart &&
       preselectedVisibleRecord->layerIndex == record.layerIndex;
   bool visibleHit = preselectedVisibleMatches;
@@ -7106,6 +7130,16 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       War3TryReadUnitFlags5CCached(renderable.unitPtr,
                                    renderable.unitFlags5C);
     }
+  }
+  // Object-grouped preselection obtained this exact part/layer from the same
+  // immutable current-frame Visible snapshot consumed above. Validate the
+  // finished packet against that value once and carry only the result through
+  // eligibility and the same-call lease update. Fallback builders and restored
+  // leases retain the canonical registry query.
+  if (outPrevalidatedMainWorldBackingStatus != nullptr &&
+      preselectedVisibleMatches) {
+    War3SemanticDirectPacketMatchesMainWorldVisibleRecord(
+        out, visibleRecord, outPrevalidatedMainWorldBackingStatus);
   }
 
   if (packetBuildTiming != nullptr)
@@ -7638,6 +7672,8 @@ bool War3LooksSubmitEligibleForDirectCurrentDrawFast(
     bool unitsOnly,
     const dxvk::war3::render::CurrentDrawAuthoritativeSample*
         directCurrentDrawSample,
+    War3SemanticDirectMainWorldBackingStatus
+        prevalidatedMainWorldBackingStatus,
     War3SemanticDirectMainWorldBackingStatus* outMainWorldBackingStatus =
         nullptr) {
   if (outMainWorldBackingStatus != nullptr) {
@@ -7672,9 +7708,15 @@ bool War3LooksSubmitEligibleForDirectCurrentDrawFast(
       War3SemanticRequireDirectUnitVisibleBackingRuntime();
   if (outMainWorldBackingStatus != nullptr ||
       requireMainWorldVisibleBacking) {
+    War3SemanticDirectMainWorldBackingStatus backingStatus =
+        prevalidatedMainWorldBackingStatus;
     const bool hasMainWorldVisibleBacking =
-        War3SemanticDirectPacketHasMainWorldVisibleBacking(
-            packet, outMainWorldBackingStatus);
+        backingStatus != War3SemanticDirectMainWorldBackingStatus::NotChecked
+        ? backingStatus == War3SemanticDirectMainWorldBackingStatus::Pass
+        : War3SemanticDirectPacketHasMainWorldVisibleBacking(
+              packet, &backingStatus);
+    if (outMainWorldBackingStatus != nullptr)
+      *outMainWorldBackingStatus = backingStatus;
     if (requireMainWorldVisibleBacking && !hasMainWorldVisibleBacking)
       return false;
   }
@@ -26972,6 +27014,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     uint64_t selectionKey = 0u;
     uint64_t submittedPartIdentityKey = 0u;
     uint64_t manifestPartLeaseKey = 0u;
+    War3SemanticDirectMainWorldBackingStatus mainWorldBackingStatus =
+        War3SemanticDirectMainWorldBackingStatus::NotChecked;
     bool previouslySubmittedPart = false;
     // Phase 7.25 part lease 路径恢复出来的 packet 标记。
     bool fromPartPacketLease = false;
@@ -27085,9 +27129,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       return false;
     }
     War3SemanticDirectMainWorldBackingStatus backingStatus =
-        War3SemanticDirectMainWorldBackingStatus::NotChecked;
-    if (!War3SemanticDirectPacketHasMainWorldVisibleBacking(packet,
-                                                           &backingStatus)) {
+        eligible.mainWorldBackingStatus;
+    const bool hasMainWorldVisibleBacking =
+        backingStatus != War3SemanticDirectMainWorldBackingStatus::NotChecked
+        ? backingStatus == War3SemanticDirectMainWorldBackingStatus::Pass
+        : War3SemanticDirectPacketHasMainWorldVisibleBacking(
+              packet, &backingStatus);
+    if (!hasMainWorldVisibleBacking) {
       stats.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount++;
       stats.semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount++;
       return false;
@@ -27403,6 +27451,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     eligible.selectionKey = 0u;
     eligible.submittedPartIdentityKey = 0u;
     eligible.manifestPartLeaseKey = 0u;
+    eligible.mainWorldBackingStatus =
+        War3SemanticDirectMainWorldBackingStatus::NotChecked;
     eligible.previouslySubmittedPart = false;
     eligible.fromPartPacketLease = false;
     eligible.fromStalePoseRestore = false;
@@ -27573,7 +27623,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           &currentDrawInstanceSnapshotCache,
           &currentDrawShadowObjectSnapshotCache,
           &currentDrawPoseAugmentSnapshotCache,
-          preselectedVisibleRecord);
+          preselectedVisibleRecord,
+          &eligible.mainWorldBackingStatus);
       packetBuildTiming.finish();
       if (!packetBuilt) {
         if (bucket != nullptr)
@@ -27626,7 +27677,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     bool directSubmitEligible = true;
     if (unitsOnly && !drawTimePrebuildBypassed) {
       directSubmitEligible = War3LooksSubmitEligibleForDirectCurrentDrawFast(
-          eligible.packet, true, &eligible.sample, &mainWorldBackingStatus);
+          eligible.packet, true, &eligible.sample,
+          eligible.mainWorldBackingStatus, &mainWorldBackingStatus);
     }
     // Phase 7.26：移除非 unitsOnly 路径下的 skinned 纯诊断 backing 调用。
     // 这里只是为了分类统计而再次做 visible lookup，实际决策路径并不使用，
