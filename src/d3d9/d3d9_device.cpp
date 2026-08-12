@@ -26216,8 +26216,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     hash = bit::fnv1a_iter(hash, record.payloadWord108);
     return hash;
   };
-  for (const auto& record : directRecords)
-    completenessBucketForRecord(record).observedParts++;
+  if (trackCompletenessBuckets) {
+    for (const auto& record : directRecords)
+      completenessBucketForRecord(record).observedParts++;
+  }
 
   // Keep the immutable snapshot as the only owner of CurrentDraw records.
   // The grouped selector used to copy every record into PreselectedRecord,
@@ -26436,7 +26438,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       if (!producerAllowed) {
         continue;
       }
-      auto& bucket = completenessBucketForRecord(record);
+      DirectObjectCompletenessBucket* bucket = trackCompletenessBuckets
+          ? &completenessBucketForRecord(record)
+          : nullptr;
       const bool canonicalPathBlocker = !useSealedWork || observeCompactWorkTable
           ? (dxvk::war3::internal::kPathBlockerHideEnabled &&
              War3ShadowIsLosBlocker(record))
@@ -26460,10 +26464,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       if (War3RejectCurrentDrawRecordByUnsafeAlphaVisualPolicy(
               record, m_war3ShadowPersistentFrameSerial,
               m_war3Scene.shadowStats)) {
-        bucket.alphaRejectedParts++;
+        if (bucket != nullptr)
+          bucket->alphaRejectedParts++;
         continue;
       }
-      bucket.shadowEligibleParts++;
+      if (bucket != nullptr)
+        bucket->shadowEligibleParts++;
 
       const uint64_t selectionKey = useSealedWork
           ? work.selectionKey
@@ -27088,7 +27094,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
             ? recordSelectionKeysForBuild[buildIndex]
             : 0u;
     War3CompactWorkItem compactWork = {};
-    const bool hasCompactWork =
+    const bool hasCompactWork = consumeCompactWorkTable &&
         m_war3CompactWorkTable.load(buildIndex, compactWork);
     const bool useSealedWork = consumeCompactWorkTable &&
         hasCompactWork &&
@@ -27136,7 +27142,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         buildEligibleQpcOverheadTicks,
         buildEligibleRecordPhaseTicks, buildEligibleRecordPhaseCalls);
     buildRecordTiming.enter(War3BuildEligibleRecordPhase::GateFilter);
-    auto& bucket = completenessBucketForRecord(record);
+    DirectObjectCompletenessBucket* bucket = trackCompletenessBuckets
+        ? &completenessBucketForRecord(record)
+        : nullptr;
     if (rerunCanonicalRecordFilters &&
         dxvk::war3::internal::kPathBlockerHideEnabled &&
         War3ShadowIsLosBlocker(record)) {
@@ -27152,11 +27160,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         War3RejectCurrentDrawRecordByUnsafeAlphaVisualPolicy(
             record, m_war3ShadowPersistentFrameSerial,
             m_war3Scene.shadowStats)) {
-      bucket.alphaRejectedParts++;
+      if (bucket != nullptr)
+        bucket->alphaRejectedParts++;
       continue;
     }
-    if (rerunCanonicalRecordFilters)
-      bucket.shadowEligibleParts++;
+    if (rerunCanonicalRecordFilters && bucket != nullptr)
+      bucket->shadowEligibleParts++;
     uint64_t producerClaimStrictKey = 0u;
     uint64_t producerClaimLogicalKey = 0u;
     bool producerClaimStrictPredicted = false;
@@ -27224,7 +27233,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           &currentDrawPoseAugmentSnapshotCache);
       packetBuildTiming.finish();
       if (!packetBuilt) {
-        bucket.packetBuildFailParts++;
+        if (bucket != nullptr)
+          bucket->packetBuildFailParts++;
         if (observeProducerClaims)
           m_war3Scene.shadowStats
               .semanticSceneProducerClaimUnresolvedCount++;
@@ -27317,20 +27327,22 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // replay, without refreshing Manifest structure/pose/slice timestamps.
     if (!eligible.sample.contract.fromGrace)
       shadowEligibleManifestRecords.push_back(manifestRecord);
-    bucket.eligibleParts++;
-    if (eligible.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
+    if (bucket != nullptr)
+      bucket->eligibleParts++;
+    if (bucket != nullptr &&
+        eligible.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
       if (eligible.packet.resource.dynamicIndexStream != nullptr &&
           eligible.packet.resource.dynamicIndexCount != 0u) {
         if (eligible.packet.resource.dynamicIndexSource ==
             dxvk::war3::shadow::ShadowDynamicIndexSource::PreparedSlice) {
-          bucket.preparedSliceParts++;
+          bucket->preparedSliceParts++;
         } else {
-          bucket.fallbackSliceParts++;
+          bucket->fallbackSliceParts++;
         }
       } else if (drawTimePrebuildBypassed) {
-        bucket.preparedSliceParts++;
+        bucket->preparedSliceParts++;
       } else {
-        bucket.missingSliceParts++;
+        bucket->missingSliceParts++;
       }
     }
     buildRecordTiming.enter(War3BuildEligibleRecordPhase::Identity);
@@ -27956,20 +27968,25 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
             .semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount++;
         continue;
       }
-      auto& bucket = completenessBucketForKey(leased.completenessKey);
-      bucket.shadowEligibleParts++;
-      bucket.eligibleParts++;
-      if (leased.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
+      DirectObjectCompletenessBucket* bucket = trackCompletenessBuckets
+          ? &completenessBucketForKey(leased.completenessKey)
+          : nullptr;
+      if (bucket != nullptr) {
+        bucket->shadowEligibleParts++;
+        bucket->eligibleParts++;
+      }
+      if (bucket != nullptr &&
+          leased.packet.path == dxvk::war3::shadow::ShadowDrawPath::Skinned) {
         if (leased.packet.resource.dynamicIndexStream != nullptr &&
             leased.packet.resource.dynamicIndexCount != 0u) {
           if (leased.packet.resource.dynamicIndexSource ==
               dxvk::war3::shadow::ShadowDynamicIndexSource::PreparedSlice) {
-            bucket.preparedSliceParts++;
+            bucket->preparedSliceParts++;
           } else {
-            bucket.fallbackSliceParts++;
+            bucket->fallbackSliceParts++;
           }
         } else {
-          bucket.missingSliceParts++;
+          bucket->missingSliceParts++;
         }
       }
       if (leasePaletteRefreshAttempted && !paletteFreshenedFromProducer &&
@@ -28781,7 +28798,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         nestedTimingPtr->enter(
             War3SubmitAppendNestedPhase::BookCompleteness);
       }
-      completenessBucketForKey(eligible.completenessKey).submittedParts++;
+      if (trackCompletenessBuckets) {
+        completenessBucketForKey(eligible.completenessKey).submittedParts++;
+      }
       noteSubmittedKeys(eligible, nestedTimingPtr, fastAppended,
                         appendedObjectKind, appendedObjectKindKnown);
     }

@@ -63,8 +63,8 @@ class DirectCanonicalPrefilterHandoffStaticTests(unittest.TestCase):
         ):
             self.assertIn(token, block)
         self.assertIn(
-            "if (rerunCanonicalRecordFilters)\n"
-            "      bucket.shadowEligibleParts++",
+            "if (rerunCanonicalRecordFilters && bucket != nullptr)\n"
+            "      bucket->shadowEligibleParts++",
             block,
         )
 
