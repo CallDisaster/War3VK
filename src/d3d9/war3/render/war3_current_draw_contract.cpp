@@ -2912,7 +2912,9 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  uint64_t& outStableGroupHash,
                                  uint32_t& outMaxGroupSlot,
                                  const CurrentDrawResolveTrace* trace,
-                                 const CurrentDrawRangeValidator* rangeValidator) {
+                                 const CurrentDrawRangeValidator* rangeValidator,
+                                 const CurrentDrawImmutableGroupSlotHint*
+                                     immutableHint) {
   outGroupSlots.clear();
   outGroupHash = 0u;
   outStableGroupHash = 0u;
@@ -2961,6 +2963,29 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
 
   if (trace != nullptr)
     trace->note(CurrentDrawResolveTracePhase::GroupDecodeLoop);
+  if (immutableHint != nullptr &&
+      immutableHint->matches(streamBase, vertexCount, paletteCount)) {
+    outGroupSlots.assign(immutableHint->bytes,
+                         immutableHint->bytes + vertexCount);
+    const CurrentDrawGroupSlotSummary summary = immutableHint->summary();
+    outGroupHash = summary.diagnosticHash(
+        reinterpret_cast<uintptr_t>(record.stream1Ptr),
+        kCurrentDrawGroupSlotStep, record.payloadWord48,
+        record.payloadWord108, record.payloadWord11C, record.layerIndex);
+    if (trace != nullptr)
+      trace->note(CurrentDrawResolveTracePhase::GroupFinalize);
+    outStableGroupHash = summary.stableHash(
+        kCurrentDrawGroupSlotStep, record.payloadWord48,
+        record.payloadWord108, record.payloadWord11C, record.layerIndex);
+    if (trace != nullptr)
+      trace->note(CurrentDrawResolveTracePhase::StableHash);
+    outMaxGroupSlot = summary.maxGroupSlot;
+    g_groupSlotDecodeHitCount.fetch_add(1u, std::memory_order_relaxed);
+    g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
+                           std::memory_order_relaxed);
+    return true;
+  }
+
   outGroupSlots.resize(vertexCount);
   CurrentDrawGroupSlotSummary summary = {};
   for (uint32_t i = 0u; i < vertexCount; ++i) {
@@ -3553,7 +3578,8 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
     uint64_t expectedVisibleFrameSerial,
     CurrentDrawAuthoritativeSample& out,
     const CurrentDrawResolveTrace* trace,
-    const CurrentDrawRangeValidator* rangeValidator) {
+    const CurrentDrawRangeValidator* rangeValidator,
+    const CurrentDrawImmutableGroupSlotHint* immutableGroupSlotHint) {
   ResetCurrentDrawAuthoritativeSamplePreserveScratch(out);
   out.contract = record;
   out.contract.known = CurrentDrawContractHasCanonicalIdentity(record);
@@ -3593,7 +3619,8 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
   if (!DecodeCurrentDrawGroupSlots(out.contract, vertexCount, out.paletteCount,
                                    out.groupSlots, out.groupHash,
                                    out.stableGroupHash, out.maxGroupSlot, trace,
-                                   rangeValidator)) {
+                                   rangeValidator,
+                                   immutableGroupSlotHint)) {
     out.status = CurrentDrawResolveStatus::MissingGroupSlots;
     return out.status;
   }

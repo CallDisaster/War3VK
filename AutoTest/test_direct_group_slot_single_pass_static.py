@@ -33,6 +33,9 @@ packet = function_body(device, "bool War3TryBuildShadowPacketFromCurrentDrawReco
 
 assert "CurrentDrawGroupSlotSummary summary" in decode
 assert "summary.include(groupSlot)" in decode
+assert "immutableHint->matches(streamBase, vertexCount, paletteCount)" in decode
+assert decode.index("immutableHint->matches") < decode.index("for (uint32_t i = 0u; i < vertexCount; ++i)")
+assert "outGroupSlots.assign(immutableHint->bytes" in decode
 assert "outStableGroupHash = summary.stableHash(" in decode
 assert "outMaxGroupSlot = summary.maxGroupSlot" in decode
 assert "ComputeStableGroupContentHash(out.contract, out.groupSlots)" not in resolve_record
@@ -41,5 +44,7 @@ assert "directDecodedGroupSlotMaxReady" in packet
 assert "directDecodedGroupSlotMaxReady\n        ? directDecodedMaxGroupSlot\n        : geo.maxVertexGroupSlot" in packet
 assert "for (uint8_t slot : effectiveGroupSlots)" not in packet
 assert "outDirectCurrentDrawSample->maxGroupSlot" in packet
+assert "geo.vertexGroupSlotWordHash" in packet
+assert "geo.immutableModelGeneration" in packet
 
 print("direct group-slot single-pass static checks passed")

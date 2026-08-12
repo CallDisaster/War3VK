@@ -31,11 +31,14 @@ def body(text: str, signature: str) -> str:
 record = HEADER[HEADER.index("struct ShadowGeosetResourceRecord") :]
 record = record[: record.index("};")]
 assert "uint32_t maxVertexGroupSlot = 0u" in record
+assert "uint64_t vertexGroupSlotWordHash = 0u" in record
 assert "uint32_t maxMatrixGroupSize = 0u" in record
 
 refresh = body(SOURCE, "void RefreshGeosetImmutableDerivedValues(")
 assert "record.maxVertexGroupSlot = 0u" in refresh
 assert "for (uint8_t slot : record.vertexGroupIndices)" in refresh
+assert "record.vertexGroupSlotWordHash = bit::fnv1a_init()" in refresh
+assert "record.vertexGroupSlotWordHash = bit::fnv1a_iter(" in refresh
 assert "record.maxMatrixGroupSize = 0u" in refresh
 assert "for (uint32_t groupSize : record.matrixGroupSizes)" in refresh
 

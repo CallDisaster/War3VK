@@ -56,6 +56,10 @@ struct ShadowGeosetResourceRecord {
   // Derived once when immutable payload is published. DirectGrouped consumes
   // the same geoset for every instance and must not rescan this array per draw.
   uint32_t maxVertexGroupSlot = 0u;
+  // Word-wise FNV state used by CurrentDrawGroupSlotSummary before metadata is
+  // mixed in. It is valid only with the immutable generation above and is
+  // consumed only after an exact byte comparison with the current draw stream.
+  uint64_t vertexGroupSlotWordHash = 0u;
 
   uint32_t uvLayerCount = 0;
   std::vector<ShadowGeosetUvLayerRecord> uvLayers;

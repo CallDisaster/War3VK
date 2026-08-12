@@ -66,8 +66,36 @@ bool testSinglePassSummary() {
                  "stable hash changed with no content change");
 }
 
+bool testImmutableHintRequiresExactBytesAndGeneration() {
+  constexpr std::array<uint8_t, 6> immutable = {0u, 2u, 1u, 3u, 2u, 1u};
+  CurrentDrawGroupSlotSummary summary = {};
+  for (uint8_t slot : immutable)
+    summary.include(slot);
+
+  dxvk::war3::render::CurrentDrawImmutableGroupSlotHint hint = {
+      immutable.data(), immutable.size(), summary.slotHash,
+      summary.maxGroupSlot, 17u};
+  if (!require(hint.matches(immutable.data(), immutable.size(), 4u),
+               "exact immutable bytes were rejected"))
+    return false;
+  if (!require(!hint.matches(immutable.data(), immutable.size(), 3u),
+               "palette upper bound was not enforced"))
+    return false;
+
+  auto changed = immutable;
+  changed[4] = 1u;
+  if (!require(!hint.matches(changed.data(), changed.size(), 4u),
+               "different current bytes reused immutable summary"))
+    return false;
+  hint.immutableGeneration = 0u;
+  return require(!hint.matches(immutable.data(), immutable.size(), 4u),
+                 "unversioned immutable summary was accepted");
+}
+
 } // namespace
 
 int main() {
-  return testSinglePassSummary() ? 0 : 1;
+  return testSinglePassSummary() &&
+          testImmutableHintRequiresExactBytesAndGeneration()
+      ? 0 : 1;
 }

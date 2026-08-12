@@ -32,6 +32,7 @@
 #include "war3/render/war3_visible_renderables.h"
 #include "war3/render/war3_canonical_draw.h"
 #include "war3/render/war3_current_draw_contract.h"
+#include "war3/render/war3_current_draw_group_slot_summary.h"
 #include "war3/render/war3_direct_packet_scratch.h"
 #include "war3/render/war3_lightning_runtime.h"
 #include "war3/handle/war3_handle_resolver.h"
@@ -7255,15 +7256,25 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       };
     }
     directResolveStatus =
-        dxvk::war3::render::ResolveCurrentDrawAuthoritativeSampleFromRecord(
-            record,
-            resource.vertexCount != 0u
-                ? resource.vertexCount
-                : uint32_t(resource.positionVec().size() / 3u),
-            renderable.frameSerial,
-            directCurrentDrawSample,
-            packetBuildTiming != nullptr ? &resolveTrace : nullptr,
-            groupRangeValidator);
+        [&]() {
+          const dxvk::war3::render::CurrentDrawImmutableGroupSlotHint
+              immutableGroupSlotHint = {
+                  geo.vertexGroupIndices.data(),
+                  geo.vertexGroupIndices.size(),
+                  geo.vertexGroupSlotWordHash,
+                  geo.maxVertexGroupSlot,
+                  geo.immutableModelGeneration,
+              };
+          return dxvk::war3::render::
+              ResolveCurrentDrawAuthoritativeSampleFromRecord(
+                  record,
+                  resource.vertexCount != 0u
+                      ? resource.vertexCount
+                      : uint32_t(resource.positionVec().size() / 3u),
+                  renderable.frameSerial, directCurrentDrawSample,
+                  packetBuildTiming != nullptr ? &resolveTrace : nullptr,
+                  groupRangeValidator, &immutableGroupSlotHint);
+        }();
   }
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::SkinningDecision);

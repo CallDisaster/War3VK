@@ -14,6 +14,7 @@
 namespace dxvk::war3::render {
 
 class VisibleRenderablePartLayerQueryCache;
+struct CurrentDrawImmutableGroupSlotHint;
 
 enum class CurrentDrawResolveStatus : uint8_t {
   MissingContract = 0,
@@ -463,7 +464,9 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  uint32_t& outMaxGroupSlot,
                                  const CurrentDrawResolveTrace* trace = nullptr,
                                  const CurrentDrawRangeValidator* rangeValidator =
-                                     nullptr);
+                                     nullptr,
+                                 const CurrentDrawImmutableGroupSlotHint*
+                                     immutableHint = nullptr);
 
 /**
  * @brief Legacy diagnostic normalization for the raw +0x58 bind value.
@@ -514,7 +517,8 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
     uint64_t expectedVisibleFrameSerial,
     CurrentDrawAuthoritativeSample& out,
     const CurrentDrawResolveTrace* trace = nullptr,
-    const CurrentDrawRangeValidator* rangeValidator = nullptr);
+    const CurrentDrawRangeValidator* rangeValidator = nullptr,
+    const CurrentDrawImmutableGroupSlotHint* immutableGroupSlotHint = nullptr);
 
 /**
  * @brief Phase 7.35：记录一次 submit 观察到的 palette 时间滞后。

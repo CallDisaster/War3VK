@@ -3,7 +3,9 @@
 #include "../../../util/util_bit.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace dxvk::war3::render {
 
@@ -48,6 +50,35 @@ struct CurrentDrawGroupSlotSummary {
     hash = bit::fnv1a_iter(hash, payloadWord11C);
     hash = bit::fnv1a_iter(hash, layerIndex);
     return hash;
+  }
+};
+
+// Optional proof supplied by an immutable, generation-backed geoset.  A raw
+// stream address is never sufficient: the current draw bytes must still match
+// the complete immutable slot array before its precomputed summary can replace
+// the per-vertex hash/max pass.  The caller retains ownership of bytes for the
+// duration of the query; this value grants no cross-frame lifetime.
+struct CurrentDrawImmutableGroupSlotHint {
+  const uint8_t* bytes = nullptr;
+  size_t count = 0u;
+  uint64_t slotHash = 0u;
+  uint32_t maxGroupSlot = 0u;
+  uint64_t immutableGeneration = 0u;
+
+  bool matches(const uint8_t* currentBytes,
+               size_t currentCount,
+               uint32_t paletteCount) const noexcept {
+    return immutableGeneration != 0u && bytes != nullptr &&
+        currentBytes != nullptr && count == currentCount && count != 0u &&
+        maxGroupSlot < paletteCount &&
+        std::memcmp(bytes, currentBytes, count) == 0;
+  }
+
+  CurrentDrawGroupSlotSummary summary() const noexcept {
+    CurrentDrawGroupSlotSummary result = {};
+    result.slotHash = slotHash;
+    result.maxGroupSlot = maxGroupSlot;
+    return result;
   }
 };
 

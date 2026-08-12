@@ -4,6 +4,7 @@
 #include "../core/war3_game_structs.h"
 #include "../core/war3_memory.h"
 #include "../tools/war3_resource_residency_census.h"
+#include "../../../util/util_bit.h"
 
 #include <algorithm>
 #include <atomic>
@@ -985,6 +986,7 @@ void ReplaceGeosetImmutablePayload(ShadowGeosetResourceRecord& dst,
   dst.vertexGroupCount = src.vertexGroupCount;
   dst.vertexGroupIndices = src.vertexGroupIndices;
   dst.maxVertexGroupSlot = src.maxVertexGroupSlot;
+  dst.vertexGroupSlotWordHash = src.vertexGroupSlotWordHash;
   dst.uvLayerCount = src.uvLayerCount;
   dst.uvLayers = src.uvLayers;
   dst.primitiveCount = src.primitiveCount;
@@ -1005,9 +1007,13 @@ void ReplaceGeosetImmutablePayload(ShadowGeosetResourceRecord& dst,
 void RefreshGeosetImmutableDerivedValues(
     ShadowGeosetResourceRecord& record) noexcept {
   record.maxVertexGroupSlot = 0u;
-  for (uint8_t slot : record.vertexGroupIndices)
+  record.vertexGroupSlotWordHash = bit::fnv1a_init();
+  for (uint8_t slot : record.vertexGroupIndices) {
     record.maxVertexGroupSlot = (std::max)(record.maxVertexGroupSlot,
                                            uint32_t(slot));
+    record.vertexGroupSlotWordHash = bit::fnv1a_iter(
+        record.vertexGroupSlotWordHash, uint32_t(slot));
+  }
 
   record.maxMatrixGroupSize = 0u;
   for (uint32_t groupSize : record.matrixGroupSizes)
