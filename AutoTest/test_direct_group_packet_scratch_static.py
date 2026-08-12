@@ -15,6 +15,7 @@ for name in (
     "s_submittedPartPacketLeaseRecords",
     "s_eligibleRecords",
     "s_objectGroups",
+    "s_originalIndices",
 ):
     assert f"static thread_local std::vector" in body
 
@@ -27,6 +28,15 @@ assert "auto& objectGroups = s_objectGroups;" in body
 assert "submittedPartPacketLeaseRecords.clear();" in body
 assert "eligibleRecords.clear();" in body
 assert "objectGroups.clear();" in body
+assert "static thread_local std::unordered_set<uint64_t> s_currentPartKeys;" in body
+assert "auto& currentPartKeys = s_currentPartKeys;" in body
+assert "currentPartKeys.clear();" in body
+assert "static thread_local std::vector<uint64_t> s_leaseKeys;" in body
+assert "auto& leaseKeys = s_leaseKeys;" in body
+assert "leaseKeys.clear();" in body
+assert "auto& originalIndices = s_originalIndices;" in body
+assert "originalIndices.clear();" in body
+assert "originalIndices.resize(eligibleRecordCount);" in body
 
 # Retaining allocator capacity must not retain logical packet contents or
 # remove the existing budget-bound reserves and pointer rebinds after moves.
@@ -38,6 +48,18 @@ assert body.index("submittedPartPacketLeaseRecords.clear();") < body.index(
 )
 assert body.index("objectGroups.clear();") < body.index(
     "objectGroups.reserve(eligibleRecordCount);"
+)
+assert body.index("currentPartKeys.clear();") < body.index(
+    "currentPartKeys.reserve("
+)
+assert body.index("leaseKeys.clear();") < body.index(
+    "leaseKeys.reserve(directPartPacketLeases.size());"
+)
+assert body.index("originalIndices.clear();") < body.index(
+    "originalIndices.resize(eligibleRecordCount);"
+)
+assert body.index("originalIndices.resize(eligibleRecordCount);") < body.index(
+    "std::stable_sort(originalIndices.begin(), originalIndices.end(),"
 )
 assert "War3RebindEligibleRecordPacket(eligibleRecords.back());" in body
 assert "War3RebindEligibleRecordPackets(eligibleRecords);" in body

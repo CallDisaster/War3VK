@@ -27188,7 +27188,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
 
     enterBuildEligibleLeasePhase("LeaseCurrentKeys");
-    std::unordered_set<uint64_t> currentPartKeys;
+    // Both containers below hold scalar identity keys only. Keep their bucket
+    // or contiguous storage on this render thread, but clear the logical set
+    // on every call so no previous-frame identity participates in selection.
+    static thread_local std::unordered_set<uint64_t> s_currentPartKeys;
+    auto& currentPartKeys = s_currentPartKeys;
+    currentPartKeys.clear();
     currentPartKeys.reserve(
         (eligibleRecords.size() + exactSubmittedManifestRecords.size()) * 2u +
         1u);
@@ -27208,7 +27213,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     const size_t leaseBudget =
         directRecordCap != 0u ? size_t(directStickyRecordBudget)
                               : eligibleRecords.size() + size_t(64u);
-    std::vector<uint64_t> leaseKeys;
+    static thread_local std::vector<uint64_t> s_leaseKeys;
+    auto& leaseKeys = s_leaseKeys;
+    leaseKeys.clear();
     leaseKeys.reserve(directPartPacketLeases.size());
     for (const auto& [key, _] : directPartPacketLeases)
       leaseKeys.push_back(key);
@@ -28993,7 +29000,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
     // 先按 stable identity 排序以利于分组（稳定排序保持 record 内部顺序）
     enterSubmitGroupSortDetail("IndexInit");
-    std::vector<uint32_t> originalIndices(eligibleRecordCount);
+    // This permutation contains only bounded scalar indices. Reuse its
+    // allocator storage on the render thread instead of paying for a fresh
+    // allocation on every populated frame; no packet or resource ownership is
+    // retained across calls.
+    static thread_local std::vector<uint32_t> s_originalIndices;
+    auto& originalIndices = s_originalIndices;
+    originalIndices.clear();
+    originalIndices.resize(eligibleRecordCount);
     for (uint32_t i = 0u; i < eligibleRecordCount; ++i)
       originalIndices[i] = i;
     enterSubmitGroupSortDetail("StableSort");
