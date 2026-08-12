@@ -425,6 +425,22 @@ test(
   timeout : 30,
 )
 
+# High-frequency classified counters keep only attempts and mutually exclusive
+# failure buckets; successful counts are derived when diagnostics are sampled.
+war3_classified_counter_test = executable(
+  'war3_classified_counter_test',
+  [
+    'war3/render/tests/war3_classified_counter_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_classified_counter',
+  war3_classified_counter_test,
+  timeout : 30,
+)
+
 # Pure CurrentDraw identity normalization shared by packet resolution and the
 # Stage11 exact-owner pre-build gate.
 war3_current_draw_identity_contract_test = executable(

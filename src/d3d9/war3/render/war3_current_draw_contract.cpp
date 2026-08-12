@@ -1,4 +1,5 @@
 #include "war3_current_draw_contract.h"
+#include "war3_classified_counter.h"
 #include "war3_current_draw_group_slot_summary.h"
 #include "war3_current_draw_palette_hash.h"
 
@@ -516,7 +517,6 @@ std::atomic<uint64_t> g_submitLiveRebuildHitCount{0u};
 std::atomic<uint64_t> g_submitLiveRebuildMissCount{0u};
 std::atomic<uint64_t> g_submitLiveRebuildAppliedCount{0u};
 std::atomic<uint64_t> g_groupSlotDecodeAttemptCount{0u};
-std::atomic<uint64_t> g_groupSlotDecodeHitCount{0u};
 std::atomic<uint64_t> g_groupSlotDecodeMissDisabledStream{0u};
 std::atomic<uint64_t> g_groupSlotDecodeMissNoStream{0u};
 std::atomic<uint64_t> g_groupSlotDecodeMissUnreadableStream{0u};
@@ -1716,7 +1716,6 @@ void ResetCurrentDrawContractCache() {
   g_capturedPaletteMissNoSnapshot.store(0u, std::memory_order_relaxed);
   g_capturedPaletteMissUnreadablePalette.store(0u, std::memory_order_relaxed);
   g_groupSlotDecodeAttemptCount.store(0u, std::memory_order_relaxed);
-  g_groupSlotDecodeHitCount.store(0u, std::memory_order_relaxed);
   g_groupSlotDecodeMissDisabledStream.store(0u, std::memory_order_relaxed);
   g_groupSlotDecodeMissNoStream.store(0u, std::memory_order_relaxed);
   g_groupSlotDecodeMissUnreadableStream.store(0u, std::memory_order_relaxed);
@@ -2595,8 +2594,6 @@ QueryCurrentDrawContractDiagnosticsSummary() {
       g_submitLiveRebuildAppliedCount.load(std::memory_order_relaxed);
   summary.groupSlotDecodeAttemptCount =
       g_groupSlotDecodeAttemptCount.load(std::memory_order_relaxed);
-  summary.groupSlotDecodeHitCount =
-      g_groupSlotDecodeHitCount.load(std::memory_order_relaxed);
   summary.groupSlotDecodeMissDisabledStream =
       g_groupSlotDecodeMissDisabledStream.load(std::memory_order_relaxed);
   summary.groupSlotDecodeMissNoStream =
@@ -2605,6 +2602,13 @@ QueryCurrentDrawContractDiagnosticsSummary() {
       g_groupSlotDecodeMissUnreadableStream.load(std::memory_order_relaxed);
   summary.groupSlotDecodeMissGroupOutOfRange =
       g_groupSlotDecodeMissGroupOutOfRange.load(std::memory_order_relaxed);
+  summary.groupSlotDecodeHitCount = DeriveClassifiedSuccessCount(
+      summary.groupSlotDecodeAttemptCount,
+      std::array<uint64_t, 4>{
+          summary.groupSlotDecodeMissDisabledStream,
+          summary.groupSlotDecodeMissNoStream,
+          summary.groupSlotDecodeMissUnreadableStream,
+          summary.groupSlotDecodeMissGroupOutOfRange});
   summary.preparedSliceProbeAttemptCount =
       g_preparedSliceProbeAttemptCount.load(std::memory_order_relaxed);
   summary.preparedSliceProbeContextReadyCount =
@@ -2960,7 +2964,6 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
     if (trace != nullptr)
       trace->note(CurrentDrawResolveTracePhase::StableHash);
     outMaxGroupSlot = summary.maxGroupSlot;
-    g_groupSlotDecodeHitCount.fetch_add(1u, std::memory_order_relaxed);
     g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                            std::memory_order_relaxed);
     return true;
@@ -2997,7 +3000,6 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
       kCurrentDrawGroupSlotStep, record.payloadWord48, record.payloadWord108,
       record.payloadWord11C, record.layerIndex);
   outMaxGroupSlot = summary.maxGroupSlot;
-  g_groupSlotDecodeHitCount.fetch_add(1u, std::memory_order_relaxed);
   g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                          std::memory_order_relaxed);
   return true;
