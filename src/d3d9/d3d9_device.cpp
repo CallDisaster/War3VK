@@ -6856,9 +6856,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             directCurrentDrawSample.paletteCount;
         outDirectCurrentDrawSample->paletteHash =
             directCurrentDrawSample.paletteHash;
-        outDirectCurrentDrawSample->palette = directCurrentDrawSample.palette;
-        outDirectCurrentDrawSample->groupSlots =
-            directCurrentDrawSample.groupSlots;
+        // The packet becomes the sole owner of decoded palette/group payload.
+        // Callers only need the sample's immutable contract and hashes once
+        // packetAuthoritativeSkinnedContractReady is true. Keeping a second
+        // vector copy here charged BuildEligible for every skinned record and
+        // duplicated the same bytes again inside part-lease records.
         outDirectCurrentDrawSample->groupHash = directCurrentDrawSample.groupHash;
         outDirectCurrentDrawSample->stableGroupHash =
             directCurrentDrawSample.stableGroupHash;
@@ -6898,7 +6900,6 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         outDirectCurrentDrawSample->paletteCount =
             uint32_t(out.runtimeGroupPalette.size());
         outDirectCurrentDrawSample->paletteHash = liveRebuiltHash;
-        outDirectCurrentDrawSample->palette = out.runtimeGroupPalette;
         outDirectCurrentDrawSample->status =
             dxvk::war3::render::CurrentDrawResolveStatus::Ready;
       }
@@ -23625,10 +23626,10 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         }
       }
       const bool hasCurrentPalette0 =
-          currentDrawSample->paletteReady() &&
-          !currentDrawSample->palette.empty();
+          drawTimeCapturedPaletteReady && drawTimeCapturedPalette != nullptr &&
+          !drawTimeCapturedPalette->empty();
       const Matrix4 currentPalette0 =
-          hasCurrentPalette0 ? currentDrawSample->palette[0] : Matrix4();
+          hasCurrentPalette0 ? (*drawTimeCapturedPalette)[0] : Matrix4();
 
       auto updateChurn = [](uint64_t& previous, uint64_t current,
                             uint32_t& churnCounter) {
