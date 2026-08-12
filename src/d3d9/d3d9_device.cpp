@@ -28069,9 +28069,19 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     std::sort(leaseKeys.begin(), leaseKeys.end());
     enterBuildEligibleLeasePhase("LeaseRestoreScan");
     static thread_local std::vector<EligibleRecord> s_restoredLeaseRecords;
+    static thread_local std::vector<Matrix4> s_leaseLivePaletteScratch;
     auto& restoredLeaseRecords = s_restoredLeaseRecords;
+    auto& leaseLivePaletteScratch = s_leaseLivePaletteScratch;
     restoredLeaseRecords.clear();
+    leaseLivePaletteScratch.clear();
     restoredLeaseRecords.reserve(leaseKeys.size());
+    const auto installLeaseLivePalette = [&] (
+        EligibleRecord& leased, std::vector<Matrix4>& livePalette) {
+      auto previousPalette = std::move(leased.packet.runtimeGroupPalette);
+      leased.packet.runtimeGroupPalette = std::move(livePalette);
+      livePalette = std::move(previousPalette);
+      livePalette.clear();
+    };
     auto tryRefreshLeasedPaletteFromProducerFacts =
         [&](EligibleRecord& leased,
             const dxvk::war3::render::VisibleRenderableRegistry::
@@ -28093,7 +28103,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           leased.packet.renderable.runtimeModelPtr != nullptr
               ? leased.packet.renderable.runtimeModelPtr
               : leaseInfo.runtimeModelPtr;
-      std::vector<Matrix4> liveRuntimeGroupPalette;
+      leaseLivePaletteScratch.clear();
       uint32_t liveMaxVertexGroupSlot = 0u;
       uint64_t liveRuntimeGroupPaletteHash = 0u;
       uint64_t liveRuntimeRawPaletteHash = 0u;
@@ -28106,7 +28116,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       const bool rebuilt = War3TryBuildLiveRuntimeGroupPalette(
           leased.packet.resource, runtimeModelPtr,
           leased.packet.renderable.renderablePart,
-          m_war3ShadowPersistentFrameSerial, liveRuntimeGroupPalette,
+          m_war3ShadowPersistentFrameSerial, leaseLivePaletteScratch,
           liveMaxVertexGroupSlot, liveRuntimeGroupPaletteHash,
           &liveRuntimeRawPaletteHash, &liveRuntimePoseModelPtr,
            /*allowCModelFallbackForCall=*/false, &livePaletteSource,
@@ -28124,21 +28134,21 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               War3SemanticPaletteSource::SubmitTimeBlendedPaletteCache;
       uint32_t currentPaletteFrameTag = 0u;
       const bool producerPaletteCurrentFrameProven =
-          rebuilt && !liveRuntimeGroupPalette.empty() &&
+          rebuilt && !leaseLivePaletteScratch.empty() &&
           producerPaletteSource &&
           dxvk::war3::model::QueryCurrentPaletteFrameTag(
               currentPaletteFrameTag) &&
           currentPaletteFrameTag != 0u && livePaletteMinFrameTag != 0u &&
           livePaletteMinFrameTag == livePaletteMaxFrameTag &&
           livePaletteMinFrameTag == currentPaletteFrameTag;
-      if (!rebuilt || liveRuntimeGroupPalette.empty() ||
+      if (!rebuilt || leaseLivePaletteScratch.empty() ||
           !producerPaletteSource || !producerPaletteCurrentFrameProven) {
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeasePaletteRefreshMissCount++;
         return false;
       }
 
-      leased.packet.runtimeGroupPalette = std::move(liveRuntimeGroupPalette);
+      installLeaseLivePalette(leased, leaseLivePaletteScratch);
       leased.packet.hasRuntimeGroupPalette = true;
       leased.packet.maxVertexGroupSlot = liveMaxVertexGroupSlot;
       leased.packet.runtimeGroupPaletteHash = liveRuntimeGroupPaletteHash;
@@ -28173,14 +28183,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         return false;
       }
 
-      std::vector<Matrix4> liveRuntimeGroupPalette;
+      leaseLivePaletteScratch.clear();
       uint32_t liveMaxVertexGroupSlot = 0u;
       uint64_t liveRuntimeGroupPaletteHash = 0u;
       uint64_t liveRuntimeRawPaletteHash = 0u;
       void* liveRuntimePoseModelPtr = nullptr;
       if (!War3TryBuildLiveRuntimeGroupPalette(
               leased.packet.resource, leaseInfo.runtimeModelPtr, nullptr,
-              m_war3ShadowPersistentFrameSerial, liveRuntimeGroupPalette,
+              m_war3ShadowPersistentFrameSerial, leaseLivePaletteScratch,
               liveMaxVertexGroupSlot, liveRuntimeGroupPaletteHash,
               &liveRuntimeRawPaletteHash, &liveRuntimePoseModelPtr, true,
               nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -28189,13 +28199,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                           leased.packet.runtimeGroupPalette.size()
                   ? leased.packet.maxVertexGroupSlot
                   : 0xFFFFFFFFu) ||
-          liveRuntimeGroupPalette.empty()) {
+          leaseLivePaletteScratch.empty()) {
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount++;
         return false;
       }
 
-      leased.packet.runtimeGroupPalette = std::move(liveRuntimeGroupPalette);
+      installLeaseLivePalette(leased, leaseLivePaletteScratch);
       leased.packet.hasRuntimeGroupPalette = true;
       leased.packet.maxVertexGroupSlot = liveMaxVertexGroupSlot;
       leased.packet.runtimeGroupPaletteHash = liveRuntimeGroupPaletteHash;
