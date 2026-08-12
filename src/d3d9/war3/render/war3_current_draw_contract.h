@@ -85,6 +85,16 @@ struct CurrentDrawContractRecord {
   bool alphaPayloadComplete = false;
 };
 
+// CurrentDraw publishes the exact part/mesh identity before the optional
+// palette/group resolver finishes.  Keep the normalization rule in one pure
+// helper so pre-build owner checks and the authoritative packet resolver do
+// not disagree about the same record.
+inline bool CurrentDrawContractHasCanonicalIdentity(
+    const CurrentDrawContractRecord& record) noexcept {
+  return record.known ||
+      (record.renderablePart != nullptr && record.meshPayloadPtr != nullptr);
+}
+
 struct CurrentDrawDispatchContext {
   bool valid = false;
   CurrentDrawDispatchDomain domain = CurrentDrawDispatchDomain::Unknown;

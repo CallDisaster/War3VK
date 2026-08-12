@@ -392,6 +392,22 @@ test(
   timeout : 30,
 )
 
+# Pure CurrentDraw identity normalization shared by packet resolution and the
+# Stage11 exact-owner pre-build gate.
+war3_current_draw_identity_contract_test = executable(
+  'war3_current_draw_identity_contract_test',
+  [
+    'war3/render/tests/war3_current_draw_identity_contract_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path, include_directories('war3') ],
+  install             : false,
+)
+test(
+  'war3_current_draw_identity_contract',
+  war3_current_draw_identity_contract_test,
+  timeout : 30,
+)
+
 # Pure receiver-band clipmap fit used by the default-off RTS shadow candidate.
 # It exercises fixed world-texel density, snapping and fail-closed coverage
 # without loading the game or Vulkan.

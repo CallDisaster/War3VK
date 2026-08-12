@@ -3541,9 +3541,7 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
     const CurrentDrawRangeValidator* rangeValidator) {
   out = {};
   out.contract = record;
-  out.contract.known =
-      record.known || (record.renderablePart != nullptr &&
-                       record.meshPayloadPtr != nullptr);
+  out.contract.known = CurrentDrawContractHasCanonicalIdentity(record);
   if (!out.contract.known) {
     out.status = CurrentDrawResolveStatus::MissingContract;
     return out.status;

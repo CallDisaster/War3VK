@@ -447,7 +447,8 @@ War3DrawTimeVBCacheKey War3MakeDrawTimeVBCacheKey(
   key.mapEpoch = mapEpoch;
   key.renderablePart = renderablePart;
   key.layerIndex = layerIndex;
-  if (contract != nullptr && contract->known &&
+  if (contract != nullptr &&
+      war3::render::CurrentDrawContractHasCanonicalIdentity(*contract) &&
       contract->renderablePart == renderablePart &&
       contract->layerIndex == layerIndex) {
     key.instanceIdentity = War3CurrentDrawInstanceIdentity(*contract);
@@ -463,7 +464,8 @@ bool War3CurrentDrawContractNamesExactSlice(
     void* renderablePart,
     uint32_t layerIndex,
     const war3::render::CurrentDrawContractRecord& contract) {
-  return contract.known && contract.renderablePart == renderablePart &&
+  return war3::render::CurrentDrawContractHasCanonicalIdentity(contract) &&
+         contract.renderablePart == renderablePart &&
          contract.layerIndex == layerIndex &&
          contract.meshPayloadPtr != nullptr &&
          (War3CurrentDrawInstanceIdentity(contract) != nullptr ||

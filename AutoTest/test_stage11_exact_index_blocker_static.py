@@ -881,7 +881,9 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
             "War3DrawTimeVBCacheKey War3MakeDrawTimeVBCacheKey(",
             "bool War3CurrentDrawContractNamesExactSlice(",
         )
-        self.assertIn("contract != nullptr && contract->known", key_factory)
+        self.assertIn(
+            "CurrentDrawContractHasCanonicalIdentity(*contract)", key_factory
+        )
         tombstones = source_block(
             self.device,
             "bool D3D9DeviceEx::War3DrainShadowCasterTombstones()",
