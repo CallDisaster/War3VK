@@ -545,17 +545,15 @@ bool BackfillVisibleUnitGeosetBindingFromCache(ShadowRenderableRecord& record) {
   return true;
 }
 
-void MaybePublishVisibleUnitGeosetBinding(ShadowRenderableRecord& record) {
+bool TryPublishMissingVisibleUnitGeosetBinding(
+    ShadowRenderableRecord& record) {
   if (!IsContractUnitCandidate(record))
-    return;
+    return false;
   if (record.runtimeModelPtr == nullptr ||
       record.runtimeGeosetDataPtr == nullptr ||
       record.geosetIndex == model::kInvalidShadowGeosetIndex) {
-    return;
+    return false;
   }
-
-  if (BackfillVisibleUnitGeosetBindingFromCache(record))
-    return;
 
   // This is intentionally a demand-fill, not a per-frame refresh.  The current
   // visible render path often exposes CGeosetData* directly at renderable+0x0C;
@@ -567,7 +565,7 @@ void MaybePublishVisibleUnitGeosetBinding(ShadowRenderableRecord& record) {
       record.runtimeModelPtr, record.geosetIndex, record.runtimeGeosetPtr,
       record.runtimeGeosetDataPtr, record.modelResourcePtr, record.modelKey);
 
-  BackfillVisibleUnitGeosetBindingFromCache(record);
+  return BackfillVisibleUnitGeosetBindingFromCache(record);
 }
 
 void DemandFillVisibleUnitGeosetBindings(ShadowFrameManifest& manifest) {
@@ -575,18 +573,23 @@ void DemandFillVisibleUnitGeosetBindings(ShadowFrameManifest& manifest) {
       "War3SemanticScene/CaptureContract/VisibleGeosetDemandFill");
   constexpr uint32_t kMaxDemandFillPerCapture = 64u;
   static std::atomic<uint64_t> s_demandFillCursor{0u};
-  std::unordered_set<void*> seenMissingGeosetData;
+  std::array<void*, kMaxDemandFillPerCapture> seenMissingGeosetData = {};
+  size_t seenMissingCount = 0u;
   uint32_t capturedThisFrame = 0u;
   if (manifest.records.empty())
     return;
 
   const size_t recordCount = manifest.records.size();
+  // A byte per manifest record avoids repeating a successful scalar binding
+  // lookup in the final repair sweep. No pointer or identity crosses frames.
+  std::vector<uint8_t> readyBinding(recordCount, uint8_t(0u));
   const size_t startIndex =
       size_t(s_demandFillCursor.fetch_add(1u, std::memory_order_relaxed) %
              uint64_t(recordCount));
 
   for (size_t offset = 0u; offset < recordCount; ++offset) {
-    auto& record = manifest.records[(startIndex + offset) % recordCount];
+    const size_t recordIndex = (startIndex + offset) % recordCount;
+    auto& record = manifest.records[recordIndex];
     if (!IsContractUnitCandidate(record))
       continue;
     if (record.runtimeModelPtr == nullptr ||
@@ -594,19 +597,30 @@ void DemandFillVisibleUnitGeosetBindings(ShadowFrameManifest& manifest) {
         record.geosetIndex == model::kInvalidShadowGeosetIndex) {
       continue;
     }
-    if (BackfillVisibleUnitGeosetBindingFromCache(record))
+    if (BackfillVisibleUnitGeosetBindingFromCache(record)) {
+      readyBinding[recordIndex] = uint8_t(1u);
       continue;
-    if (!seenMissingGeosetData.insert(record.runtimeGeosetDataPtr).second)
-      continue;
+    }
     if (capturedThisFrame >= kMaxDemandFillPerCapture)
       continue;
 
-    MaybePublishVisibleUnitGeosetBinding(record);
+    const auto seenEnd = seenMissingGeosetData.begin() + seenMissingCount;
+    if (std::find(seenMissingGeosetData.begin(), seenEnd,
+                  record.runtimeGeosetDataPtr) != seenEnd) {
+      continue;
+    }
+    seenMissingGeosetData[seenMissingCount++] =
+        record.runtimeGeosetDataPtr;
+
+    if (TryPublishMissingVisibleUnitGeosetBinding(record))
+      readyBinding[recordIndex] = uint8_t(1u);
     ++capturedThisFrame;
   }
 
-  for (auto& record : manifest.records)
-    BackfillVisibleUnitGeosetBindingFromCache(record);
+  for (size_t i = 0u; i < recordCount; ++i) {
+    if (readyBinding[i] == 0u)
+      BackfillVisibleUnitGeosetBindingFromCache(manifest.records[i]);
+  }
 }
 
 ShadowRenderableRecord ConvertVisible(

@@ -37,7 +37,7 @@ assert "materializeGeosetDataRecordLocked" not in by_data
 
 backfill = contract.split(
     "bool BackfillVisibleUnitGeosetBindingFromCache(", 1
-)[1].split("void MaybePublishVisibleUnitGeosetBinding", 1)[0]
+)[1].split("bool TryPublishMissingVisibleUnitGeosetBinding", 1)[0]
 assert "ShadowReadyGeosetBinding" in backfill
 assert "findReadyGeosetBindingByPtr" in backfill
 assert "findReadyGeosetBindingByData" in backfill
