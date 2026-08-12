@@ -1098,6 +1098,14 @@ ContractLookupStatus LookupCurrentDrawContractRecord(
         break;
       }
     }
+    // Release defaults to TLS/local publication only. In that mode the
+    // mutex-backed compatibility maps have no writers, so do not serialize
+    // every cache miss just to prove that an empty map is still empty.
+    if (!GlobalCurrentDrawPublishEnabled()) {
+      return occupiedCollision
+          ? ContractLookupStatus::CacheCollision
+          : ContractLookupStatus::MissingRecord;
+    }
     std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
     const auto globalIt = g_publishedCurrentDrawByPart.find(renderablePart);
     if (globalIt == g_publishedCurrentDrawByPart.end()) {
@@ -1367,7 +1375,7 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
     return true;
   }
 
-  {
+  if (GlobalCurrentDrawPublishEnabled()) {
     std::lock_guard<std::mutex> lock(g_publishedCurrentDrawMutex);
     const auto globalIt =
         g_publishedPaletteSnapshotByPart.find(record.renderablePart);
