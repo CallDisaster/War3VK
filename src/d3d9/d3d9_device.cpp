@@ -3196,6 +3196,15 @@ inline bool War3CoherentRealDomainCacheRuntime() {
   return s_enabled;
 }
 
+inline bool War3CoherentRealHintDomainRuntime() {
+  if constexpr (!dxvk::war3::memory::
+                    kCoherentRealIndexTrimDevelopmentEnabled)
+    return false;
+  static const bool s_enabled =
+      War3GetEnvU32("DXVK_WAR3_COHERENT_REAL_HINT_DOMAIN", 0u) == 1u;
+  return s_enabled;
+}
+
 inline bool War3Stage11DirectUploadSourceRuntime() {
   if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
     return false;
@@ -46901,9 +46910,30 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
         positionCapacity64 <=
             uint64_t(std::numeric_limits<uint32_t>::max())) {
       dxvk::war3::memory::War3ExactIndexVertexDomain exactDomain = {};
+      const bool useCoherentRealDeclaredDomain =
+          coherentRealTrimScanCandidate &&
+          coherentRealTrimMode == CoherentRealTrimMode::Consume &&
+          War3CoherentRealHintDomainRuntime() &&
+          !exactIndexedFreezeTrimCandidate;
+      bool exactDomainFromDeclaredHint = false;
+      if (useCoherentRealDeclaredDomain) {
+        const auto declaredDomain = dxvk::war3::render::
+            War3ResolveTerrainIndexedDeclaredDomain(
+                BaseVertexIndex, MinVertexIndex, NumVertices,
+                uint32_t(positionCapacity64), indexElementBytes);
+        if (declaredDomain.valid) {
+          exactDomain.firstVertex = declaredDomain.firstVertex;
+          exactDomain.vertexCount = declaredDomain.vertexCount;
+          exactDomain.minIndex = declaredDomain.minIndex;
+          exactDomain.maxIndex = declaredDomain.maxIndex;
+          exactDomain.valid = true;
+          exactDomainFromDeclaredHint = true;
+        }
+      }
       const bool useBoundsObserverDomainCache =
           exactIndexedTerrainBoundsAuditSample &&
-          !exactIndexedFreezeTrimCandidate;
+          !exactIndexedFreezeTrimCandidate &&
+          !exactDomainFromDeclaredHint;
       // The coherent REAL route already rebuilds a current mapped span and
       // revalidates owner plus identity/allocation/content generations before
       // every draw. Reuse only the derived POD min/max domain when that full
@@ -46913,7 +46943,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           coherentRealTrimScanCandidate &&
           coherentRealTrimMode == CoherentRealTrimMode::Consume &&
           War3CoherentRealDomainCacheRuntime() &&
-          !exactIndexedFreezeTrimCandidate;
+          !exactIndexedFreezeTrimCandidate &&
+          !exactDomainFromDeclaredHint;
       const bool useGenerationBackedDomainCache =
           useBoundsObserverDomainCache || useCoherentRealDomainCache;
       bool observerDomainCacheHit = false;
@@ -46972,7 +47003,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
           }
         }
       }
-      if (!useGenerationBackedDomainCache || !observerDomainCacheHit) {
+      if (!exactDomainFromDeclaredHint &&
+          (!useGenerationBackedDomainCache || !observerDomainCacheHit)) {
         if (!useGenerationBackedDomainCache) {
           exactDomain =
               dxvk::war3::memory::ComputeWar3ExactIndexVertexDomainPrepared({
@@ -46985,7 +47017,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       // compare D3D9's caller-supplied MinVertexIndex/NumVertices range here.
       // This is observation only: neither relation can authorize trimming or
       // culling in this candidate.
-      if ((exactIndexedTerrainBoundsObserveCandidate ||
+      if (!exactDomainFromDeclaredHint &&
+          (exactIndexedTerrainBoundsObserveCandidate ||
            coherentRealTrimScanCandidate) && exactDomain.valid) {
         using HintRelation =
             dxvk::war3::render::War3TerrainIndexedHintRelation;
@@ -47025,7 +47058,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                 int64_t(std::numeric_limits<int32_t>::min()) &&
             adjustedVertexOffset <=
                 int64_t(std::numeric_limits<int32_t>::max());
-        if (end <= positionCapacity64 &&
+        if (!exactDomainFromDeclaredHint && end <= positionCapacity64 &&
             first <= uint64_t(std::numeric_limits<uint32_t>::max()) &&
             count <= uint64_t(std::numeric_limits<uint32_t>::max()) &&
             count != 0u) {

@@ -40,6 +40,19 @@ struct War3TerrainIndexedHintDecision {
   uint32_t vertexCount = 0u;
 };
 
+// DrawIndexedPrimitive declares that every raw index addressed by the draw is
+// in [MinVertexIndex, MinVertexIndex + NumVertices). This value contract turns
+// that declared access domain into the compact position slice used by the
+// development coherent-REAL replay candidate. It deliberately does not prove
+// the tighter, actual min/max domain required by general-purpose culling.
+struct War3TerrainIndexedDeclaredDomain {
+  uint32_t firstVertex = 0u;
+  uint32_t vertexCount = 0u;
+  uint32_t minIndex = 0u;
+  uint32_t maxIndex = 0u;
+  bool valid = false;
+};
+
 inline constexpr uint32_t kWar3TerrainIndexedHintAuditPeriod = 64u;
 
 constexpr War3TerrainBoundsVertexRange
@@ -53,6 +66,30 @@ War3ResolveConservativeTerrainIndexedHintRange(
   if (first < 0 || end <= first || end > int64_t(vertexCapacity))
     return {};
   return {uint32_t(first), numVertices, true};
+}
+
+constexpr War3TerrainIndexedDeclaredDomain
+War3ResolveTerrainIndexedDeclaredDomain(
+    int32_t baseVertex, uint32_t minVertexIndex, uint32_t numVertices,
+    uint32_t vertexCapacity, uint32_t indexElementBytes) {
+  if (numVertices == 0u || vertexCapacity == 0u ||
+      (indexElementBytes != 2u && indexElementBytes != 4u))
+    return {};
+
+  const uint64_t rawEnd = uint64_t(minVertexIndex) + uint64_t(numVertices);
+  const uint64_t rawDomainLimit = indexElementBytes == 2u
+      ? (uint64_t(1u) << 16u)
+      : (uint64_t(1u) << 32u);
+  if (rawEnd <= uint64_t(minVertexIndex) || rawEnd > rawDomainLimit)
+    return {};
+
+  const int64_t first = int64_t(baseVertex) + int64_t(minVertexIndex);
+  const int64_t end = first + int64_t(numVertices);
+  if (first < 0 || end <= first || end > int64_t(vertexCapacity))
+    return {};
+
+  return {uint32_t(first), numVertices, minVertexIndex,
+          uint32_t(rawEnd - 1u), true};
 }
 
 constexpr bool War3ShouldAuditTerrainIndexedHint(
@@ -129,6 +166,8 @@ static_assert(std::is_standard_layout_v<War3TerrainIndexedHintEvidence>);
 static_assert(std::is_trivially_copyable_v<War3TerrainIndexedHintEvidence>);
 static_assert(std::is_standard_layout_v<War3TerrainIndexedHintDecision>);
 static_assert(std::is_trivially_copyable_v<War3TerrainIndexedHintDecision>);
+static_assert(std::is_standard_layout_v<War3TerrainIndexedDeclaredDomain>);
+static_assert(std::is_trivially_copyable_v<War3TerrainIndexedDeclaredDomain>);
 static_assert((kWar3TerrainIndexedHintAuditPeriod &
                (kWar3TerrainIndexedHintAuditPeriod - 1u)) == 0u);
 

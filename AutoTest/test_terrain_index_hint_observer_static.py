@@ -38,12 +38,15 @@ class TerrainIndexHintObserverStaticTest(unittest.TestCase):
         call = self.device.index("War3EvaluateTerrainIndexedHintAgainstExactDomain")
         scan = self.device.rfind("ComputeWar3ExactIndexVertexDomainPrepared", 0, call)
         self.assertGreater(scan, 0)
-        gate = self.device.rfind("if ((exactIndexedTerrainBoundsObserveCandidate", 0, call)
+        gate = self.device.rfind(
+            "if (!exactDomainFromDeclaredHint", scan, call
+        )
         self.assertGreater(gate, scan)
         self.assertIn(
             "coherentRealTrimScanCandidate",
             self.device[gate:call],
         )
+        self.assertIn("exactDomain.valid", self.device[gate:call])
 
     def test_observer_does_not_authorize_bounds(self) -> None:
         self.assertEqual(

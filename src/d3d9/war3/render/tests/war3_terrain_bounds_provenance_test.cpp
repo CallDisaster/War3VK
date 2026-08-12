@@ -48,6 +48,28 @@ int main() {
   const auto invalidConservativeRange =
       policy::War3ResolveConservativeTerrainIndexedHintRange(
           -8, 4u, 8u, 32u);
+  const auto declaredExact =
+      policy::War3ResolveTerrainIndexedDeclaredDomain(
+          -4, 4u, 6u, 32u, 2u);
+  const auto declaredSuperset =
+      policy::War3ResolveTerrainIndexedDeclaredDomain(
+          -4, 4u, 10u, 32u, 2u);
+  const auto declaredNegative =
+      policy::War3ResolveTerrainIndexedDeclaredDomain(
+          -8, 4u, 8u, 32u, 2u);
+  const auto declaredPositionOverflow =
+      policy::War3ResolveTerrainIndexedDeclaredDomain(
+          0, 30u, 8u, 32u, 2u);
+  const auto declaredUint16Overflow =
+      policy::War3ResolveTerrainIndexedDeclaredDomain(
+          -65535, 65535u, 2u, 32u, 2u);
+  const auto declaredUint32Boundary =
+      policy::War3ResolveTerrainIndexedDeclaredDomain(
+          -2147483647, 0x7fffffffu, 0x80000001u,
+          0x80000001u, 4u);
+  const auto declaredEmpty =
+      policy::War3ResolveTerrainIndexedDeclaredDomain(
+          0, 0u, 0u, 32u, 2u);
   uint32_t auditCount = 0u;
   for (uint64_t frame = 1u; frame <= 4096u; ++frame) {
     auditCount += policy::War3ShouldAuditTerrainIndexedHint(
@@ -88,6 +110,26 @@ int main() {
                   conservativeRange.vertexCount == 8u &&
                   !invalidConservativeRange.exact,
               "conservative D3D9 range validation failed") &&
+      require(declaredExact.valid && declaredExact.firstVertex == 0u &&
+                  declaredExact.vertexCount == 6u &&
+                  declaredExact.minIndex == 4u &&
+                  declaredExact.maxIndex == 9u,
+              "exact declared D3D9 access domain was not resolved") &&
+      require(declaredSuperset.valid &&
+                  declaredSuperset.firstVertex == 0u &&
+                  declaredSuperset.vertexCount == 10u &&
+                  declaredSuperset.minIndex == 4u &&
+                  declaredSuperset.maxIndex == 13u,
+              "conservative declared D3D9 access domain was not resolved") &&
+      require(!declaredNegative.valid &&
+                  !declaredPositionOverflow.valid &&
+                  !declaredUint16Overflow.valid &&
+                  !declaredEmpty.valid,
+              "invalid declared D3D9 access domain was accepted") &&
+      require(declaredUint32Boundary.valid &&
+                  declaredUint32Boundary.firstVertex == 0u &&
+                  declaredUint32Boundary.maxIndex == 0xffffffffu,
+              "uint32 declared domain boundary was rejected") &&
       require(auditCount > 32u && auditCount < 96u,
               "deterministic 1/64 audit cadence drifted")
       ? 0

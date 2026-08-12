@@ -235,3 +235,25 @@ The sample and API contract justify a separate development candidate that can
 use this declared superset for the already restricted terrain/rigid/opaque
 cohort. They do not authorize changing general bounds culling, UP/skinned/
 alpha routes or the Release default in the observer commit itself.
+
+## D3D9 declared access-domain development candidate
+
+The follow-up candidate turns the documented D3D9 range into a checked compact
+position slice only for the existing coherent-REAL terrain/rigid/opaque route.
+It validates signed base addition, position capacity and the full UINT16 or
+UINT32 raw-index domain. The declared superset is not published as the tighter
+actual domain used by general bounds culling.
+
+The same DLL ran B-A-B-A for 120 seconds per run with only
+`DXVK_WAR3_COHERENT_REAL_HINT_DOMAIN` changed. `ResourceResolve` measured
+`0.087 / 0.700 / 0.084 / 0.685 ms` for on/off/on/off; total `PostGate` measured
+`1.250 / 1.867 / 1.232 / 1.803 ms`. The average local saving is approximately
+`0.607 ms/frame`. All four runs recorded zero producer-incomplete frames,
+device losses, new GPU events or incidents.
+
+A 601.6-second isolated 5x5 low-view gate (`20260812_092422`) also completed
+with zero incomplete frames, device loss, new Event 153/4101 or incident. Its
+long-run `ResourceResolve` was `0.172 ms/frame`; `FreezeBuffers` is now the
+dominant child at `1.284 ms/frame`. The candidate remains development-only and
+undeployed. Isolated evidence cannot replace foreground visual review or
+authorize a Release default change.
