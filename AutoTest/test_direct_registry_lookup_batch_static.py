@@ -81,7 +81,7 @@ builder = body(
     "bool War3TryBuildShadowPacketFromCurrentDrawRecord",
     "dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKindFast",
 )
-assert builder.count("instanceRegistry.findFirstForDirectPacketView(") == 2
+assert builder.count("instanceRegistry.findFirstForDirectPacketView(") == 3
 assert "instanceRegistry.findFirstForDirectPacket(" not in builder
 assert builder.count("renderRegistry.findFirstForDirectPacket(") == 1
 assert builder.count("shadowRegistry.findFirstForDirectPacketView(") == 1

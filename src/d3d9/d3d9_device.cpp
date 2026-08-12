@@ -6534,33 +6534,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   }
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::OwnerInstanceLookup);
-  if (packetBuildTiming != nullptr)
-    packetBuildTiming->enterNested(War3PacketBuildNestedPhase::OwnerLookup);
   dxvk::war3::model::ShadowRuntimeModelOwnerBinding ownerBinding = {};
   bool ownerHit = false;
-  {
-    auto ownerLookupScope =
-        War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerLookup");
-    if (geosetHit) {
-      ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
-          geoset->geosetPtr, geoset->geosetDataPtr, ownerBinding);
-      if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
-        ownerHit = resourceCache.findRuntimeModelOwnerBinding(
-            geoset->geosetPtr, geoset->geosetDataPtr, geoset->geosetIndex,
-            geoset->modelResourcePtr, ownerBinding);
-      }
-    }
-    if (!ownerHit) {
-      ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
-          nullptr, record.meshPayloadPtr, ownerBinding);
-      if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
-        ownerHit = resourceCache.findRuntimeModelOwnerBinding(
-            nullptr, record.meshPayloadPtr,
-            dxvk::war3::model::kInvalidShadowGeosetIndex, nullptr,
-            ownerBinding);
-      }
-    }
-  }
   dxvk::war3::model::ModelInstanceDirectPacketView instanceRecord = {};
   auto& instanceRegistry = dxvk::war3::model::ModelInstanceRegistry::instance();
   bool instanceHit = false;
@@ -6572,12 +6547,68 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     if (instanceSnapshotCache != nullptr) {
       instanceHit = instanceSnapshotCache->find(
           instanceRegistry, record.sceneNode, record.unitPtr,
-          record.worldObjectEntry,
-          ownerHit ? ownerBinding.runtimeModelPtr : nullptr, instanceRecord);
+          record.worldObjectEntry, nullptr, instanceRecord);
     } else {
       instanceHit = instanceRegistry.findFirstForDirectPacketView(
-          record.sceneNode, record.unitPtr, record.worldObjectEntry,
-          ownerHit ? ownerBinding.runtimeModelPtr : nullptr, instanceRecord);
+          record.sceneNode, record.unitPtr, record.worldObjectEntry, nullptr,
+          instanceRecord);
+    }
+  }
+
+  // The exact instance aliases are published from the same runtime model as
+  // its immutable geoset. If both independent generations agree on model
+  // resource and key, an owner-index probe cannot contribute any scalar used
+  // by this packet. Attachments and incomplete identities retain the owner
+  // lookup and its runtime-model fallback below.
+  const auto instanceProvesGeosetOwner = [&]() {
+    return geosetHit && geoset != nullptr && instanceHit &&
+        instanceRecord.runtimeModelPtr != nullptr &&
+        geoset->modelResourcePtr != nullptr &&
+        instanceRecord.modelResourcePtr == geoset->modelResourcePtr &&
+        geoset->modelKey != 0u && instanceRecord.modelKey == geoset->modelKey;
+  };
+  bool ownerSatisfiedByInstance = instanceProvesGeosetOwner();
+  if (!ownerSatisfiedByInstance) {
+    if (packetBuildTiming != nullptr)
+      packetBuildTiming->enterNested(War3PacketBuildNestedPhase::OwnerLookup);
+    {
+      auto ownerLookupScope =
+          War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerLookup");
+      if (geosetHit) {
+        ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
+            geoset->geosetPtr, geoset->geosetDataPtr, ownerBinding);
+        if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
+          ownerHit = resourceCache.findRuntimeModelOwnerBinding(
+              geoset->geosetPtr, geoset->geosetDataPtr, geoset->geosetIndex,
+              geoset->modelResourcePtr, ownerBinding);
+        }
+      }
+      if (!ownerHit) {
+        ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
+            nullptr, record.meshPayloadPtr, ownerBinding);
+        if (!ownerHit && War3SemanticDirectOwnerScanRuntime()) {
+          ownerHit = resourceCache.findRuntimeModelOwnerBinding(
+              nullptr, record.meshPayloadPtr,
+              dxvk::war3::model::kInvalidShadowGeosetIndex, nullptr,
+              ownerBinding);
+        }
+      }
+    }
+    if (!instanceHit && ownerHit && ownerBinding.runtimeModelPtr != nullptr) {
+      if (packetBuildTiming != nullptr)
+        packetBuildTiming->enterNested(
+            War3PacketBuildNestedPhase::InstanceLookup);
+      auto instancePostOwnerLookupScope = War3SemanticSubmitScope(
+          "War3SemanticScene/Direct/InstancePostOwnerLookup");
+      if (instanceSnapshotCache != nullptr) {
+        instanceHit = instanceSnapshotCache->find(
+            instanceRegistry, nullptr, nullptr, nullptr,
+            ownerBinding.runtimeModelPtr, instanceRecord);
+      } else {
+        instanceHit = instanceRegistry.findFirstForDirectPacketView(
+            nullptr, nullptr, nullptr, ownerBinding.runtimeModelPtr,
+            instanceRecord);
+      }
     }
   }
 
@@ -6655,7 +6686,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (!geosetHit || geoset == nullptr || !geoset->readyForShadowConsumer())
     return false;
 
-  if (!ownerHit) {
+  ownerSatisfiedByInstance =
+      ownerSatisfiedByInstance || instanceProvesGeosetOwner();
+  if (!ownerHit && !ownerSatisfiedByInstance) {
     auto ownerPostLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/OwnerPostLookup");
     ownerHit = resourceCache.findRuntimeModelOwnerBindingIndexed(
