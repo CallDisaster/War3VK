@@ -5736,6 +5736,84 @@ private:
   uint32_t m_missCount = 0u;
 };
 
+// A scene build commonly visits every geoset of the same instance in
+// succession. Avoid reacquiring ModelInstanceRegistry's shared mutex for each
+// part, but invalidate the POD projection on every registry write generation.
+// The cache is stack-owned by one Populate call and never grants cross-frame
+// identity lifetime.
+class War3CurrentDrawInstanceSnapshotCache final {
+public:
+  bool find(
+      const dxvk::war3::model::ModelInstanceRegistry& registry,
+      void* sceneNode, void* unitPtr, void* worldObjectEntry,
+      void* runtimeModelPtr,
+      dxvk::war3::model::ModelInstanceDirectPacketView& out) {
+    const uint64_t currentGeneration = registry.mutationGeneration();
+    const size_t slot = slotFor(sceneNode, unitPtr, worldObjectEntry,
+                                runtimeModelPtr);
+    const auto& entry = m_entries[slot];
+    if ((currentGeneration & 1u) == 0u &&
+        entry.generation == currentGeneration &&
+        entry.sceneNode == sceneNode && entry.unitPtr == unitPtr &&
+        entry.worldObjectEntry == worldObjectEntry &&
+        entry.runtimeModelPtr == runtimeModelPtr) {
+      out = entry.value;
+      ++m_hitCount;
+      return entry.found;
+    }
+
+    uint64_t observedGeneration = 0u;
+    dxvk::war3::model::ModelInstanceDirectPacketView value = {};
+    const bool found = registry.findFirstForDirectPacketView(
+        sceneNode, unitPtr, worldObjectEntry, runtimeModelPtr, value,
+        &observedGeneration);
+    const uint64_t publishedGeneration = registry.mutationGeneration();
+    if ((observedGeneration & 1u) == 0u &&
+        observedGeneration == publishedGeneration) {
+      m_entries[slot] = Entry{sceneNode, unitPtr, worldObjectEntry,
+                              runtimeModelPtr, observedGeneration, value,
+                              found};
+    }
+    out = value;
+    ++m_missCount;
+    return found;
+  }
+
+  uint32_t hitCount() const { return m_hitCount; }
+  uint32_t missCount() const { return m_missCount; }
+
+private:
+  struct Entry {
+    void* sceneNode = nullptr;
+    void* unitPtr = nullptr;
+    void* worldObjectEntry = nullptr;
+    void* runtimeModelPtr = nullptr;
+    uint64_t generation = ~uint64_t(0u);
+    dxvk::war3::model::ModelInstanceDirectPacketView value = {};
+    bool found = false;
+  };
+
+  static constexpr size_t kEntryCount = 128u;
+
+  static size_t slotFor(void* sceneNode, void* unitPtr,
+                        void* worldObjectEntry, void* runtimeModelPtr) {
+    uint64_t hash = bit::fnv1a_init();
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(sceneNode)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(unitPtr)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(worldObjectEntry)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(runtimeModelPtr)));
+    return size_t(hash) & (kEntryCount - 1u);
+  }
+
+  std::array<Entry, kEntryCount> m_entries = {};
+  uint32_t m_hitCount = 0u;
+  uint32_t m_missCount = 0u;
+};
+
 bool War3TryAttachCurrentDrawVisibleIndexSlice(
     const dxvk::war3::render::CurrentDrawContractRecord& record,
     const dxvk::war3::model::ShadowGeosetResourceRecord& geoset,
@@ -6312,7 +6390,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     const dxvk::war3::render::CurrentDrawRangeValidator*
         groupRangeValidator = nullptr,
     War3CurrentDrawVisibleIndexSliceCache* visibleIndexSliceCache = nullptr,
-    War3CurrentDrawGeosetSnapshotCache* geosetSnapshotCache = nullptr) {
+    War3CurrentDrawGeosetSnapshotCache* geosetSnapshotCache = nullptr,
+    War3CurrentDrawInstanceSnapshotCache* instanceSnapshotCache = nullptr) {
   const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
       record.stage,
       record.batchTag,
@@ -6390,7 +6469,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       }
     }
   }
-  dxvk::war3::model::ModelInstanceRecord instanceRecord = {};
+  dxvk::war3::model::ModelInstanceDirectPacketView instanceRecord = {};
   auto& instanceRegistry = dxvk::war3::model::ModelInstanceRegistry::instance();
   bool instanceHit = false;
   if (packetBuildTiming != nullptr)
@@ -6398,9 +6477,16 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto instanceLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/InstanceLookup");
-    instanceHit = instanceRegistry.findFirstForDirectPacket(
-        record.sceneNode, record.unitPtr, record.worldObjectEntry,
-        ownerHit ? ownerBinding.runtimeModelPtr : nullptr, instanceRecord);
+    if (instanceSnapshotCache != nullptr) {
+      instanceHit = instanceSnapshotCache->find(
+          instanceRegistry, record.sceneNode, record.unitPtr,
+          record.worldObjectEntry,
+          ownerHit ? ownerBinding.runtimeModelPtr : nullptr, instanceRecord);
+    } else {
+      instanceHit = instanceRegistry.findFirstForDirectPacketView(
+          record.sceneNode, record.unitPtr, record.worldObjectEntry,
+          ownerHit ? ownerBinding.runtimeModelPtr : nullptr, instanceRecord);
+    }
   }
 
   if (packetBuildTiming != nullptr)
@@ -6491,8 +6577,15 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (!instanceHit && ownerHit && ownerBinding.runtimeModelPtr != nullptr) {
     auto instancePostLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/InstancePostLookup");
-    instanceHit = instanceRegistry.findByRuntimeModel(ownerBinding.runtimeModelPtr,
-                                                      instanceRecord);
+    if (instanceSnapshotCache != nullptr) {
+      instanceHit = instanceSnapshotCache->find(
+          instanceRegistry, nullptr, nullptr, nullptr,
+          ownerBinding.runtimeModelPtr, instanceRecord);
+    } else {
+      instanceHit = instanceRegistry.findFirstForDirectPacketView(
+          nullptr, nullptr, nullptr, ownerBinding.runtimeModelPtr,
+          instanceRecord);
+    }
   }
 
   if (packetBuildTiming != nullptr)
@@ -26735,6 +26828,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       War3CurrentDrawGenerationIndexSliceCacheRuntime());
   War3CurrentDrawGeosetSnapshotCache currentDrawGeosetSnapshotCache(
       dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch());
+  War3CurrentDrawInstanceSnapshotCache currentDrawInstanceSnapshotCache;
 
   enterBuildEligiblePhase("RecordLoop");
   for (size_t buildIndex = 0u;
@@ -26865,7 +26959,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           traceBuildRecord ? &packetBuildTiming : nullptr,
           &currentDrawGroupRangeValidator,
           &currentDrawVisibleIndexSliceCache,
-          &currentDrawGeosetSnapshotCache);
+          &currentDrawGeosetSnapshotCache,
+          &currentDrawInstanceSnapshotCache);
       packetBuildTiming.finish();
       if (!packetBuilt) {
         bucket.packetBuildFailParts++;

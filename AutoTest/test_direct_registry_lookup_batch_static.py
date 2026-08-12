@@ -20,8 +20,8 @@ def body(source: str, signature: str, next_signature: str) -> str:
 
 model_direct = body(
     MODEL,
-    "bool ModelInstanceRegistry::findFirstForDirectPacket",
-    "bool ModelInstanceRegistry::findBySourceObject",
+    "bool ModelInstanceRegistry::findFirstForDirectPacket(\n",
+    "bool ModelInstanceRegistry::findFirstForDirectPacketView",
 )
 assert model_direct.count("std::shared_lock<std::shared_mutex> lock(m_mutex)") == 1
 model_priority = [
@@ -81,7 +81,8 @@ builder = body(
     "bool War3TryBuildShadowPacketFromCurrentDrawRecord",
     "dxvk::war3::render::ObjectKind War3ResolveSemanticPacketObjectKindFast",
 )
-assert builder.count("instanceRegistry.findFirstForDirectPacket(") == 1
+assert builder.count("instanceRegistry.findFirstForDirectPacketView(") == 2
+assert "instanceRegistry.findFirstForDirectPacket(" not in builder
 assert builder.count("renderRegistry.findFirstForDirectPacket(") == 1
 assert builder.count("shadowRegistry.findFirstForDirectPacketView(") == 1
 assert "ShadowObjectAugmentView shadowRecord" in builder

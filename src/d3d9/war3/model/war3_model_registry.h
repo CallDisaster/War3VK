@@ -67,6 +67,20 @@ struct ModelInstanceAugmentView {
   uint64_t modelKey = 0;
 };
 
+// Fixed-size projection for the DirectGrouped packet builder.  It deliberately
+// excludes creator/source provenance and frame bookkeeping: that hot path only
+// consumes identity fields used to resolve one immutable geoset packet.
+struct ModelInstanceDirectPacketView {
+  void* worldObjectEntry = nullptr;
+  void* sceneNode = nullptr;
+  void* unitPtr = nullptr;
+  void* runtimeModelPtr = nullptr;
+  void* modelResourcePtr = nullptr;
+  uint32_t jHandle = 0;
+  uint32_t rawcode = 0;
+  uint64_t modelKey = 0;
+};
+
 struct ModelIdentitySameFrameDedupStats {
   // attempts == hits + every miss* counter. batchMarked is independent.
   uint64_t attempts = 0;
@@ -303,6 +317,11 @@ public:
                                 void* worldObjectEntry,
                                 void* runtimeModelPtr,
                                 ModelInstanceRecord& out) const;
+  bool findFirstForDirectPacketView(void* sceneNode, void* unitPtr,
+                                    void* worldObjectEntry,
+                                    void* runtimeModelPtr,
+                                    ModelInstanceDirectPacketView& out,
+                                    uint64_t* mutationGenerationOut = nullptr) const;
   bool findOwnerByRuntimeModel(void *runtimeModelPtr,
                                ModelInstanceRecord &out) const;
   bool findBySourceObject(void* sourceObjectPtr, ModelInstanceRecord& out) const;
