@@ -5232,7 +5232,8 @@ bool War3LegacyMaterialSignatureScopeRuntime() {
 
 dxvk::war3::shadow::ShadowMaterialSignature
 War3BuildShadowMaterialSignatureCached(
-    const dxvk::war3::shadow::ShadowRenderableRecord& renderable) {
+    const dxvk::war3::shadow::ShadowRenderableRecord& renderable,
+    uint64_t provenMapEpoch = 0u) {
   // Phase 7.74：把 material signature 计算的 CPU 时间显式归类为
   // Shadow/DrawTime/MaterialSig，避免它继续藏在 OutsideMainLoop/Tracked。
   auto& perfMonitor = war3::War3PerfMonitor::instance();
@@ -5258,7 +5259,6 @@ War3BuildShadowMaterialSignatureCached(
     // 在当前 canonical layer contract 路径下只是 draw-local 输入，可能随帧
     // 抖动，因此不再作为命中硬条件。
     void* sceneNode = nullptr;
-    void* meshData = nullptr;
     void* layerState = nullptr;
     void* modelResourcePtr = nullptr;
     uint64_t modelKey = 0u;
@@ -5272,7 +5272,9 @@ War3BuildShadowMaterialSignatureCached(
   };
 
   const uint64_t mapEpoch =
-      dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
+      provenMapEpoch != 0u
+          ? provenMapEpoch
+          : dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch();
   uint64_t hash = bit::fnv1a_init();
   hash = bit::fnv1a_iter(hash, mapEpoch);
   hash = bit::fnv1a_iter(hash, reinterpret_cast<uintptr_t>(renderable.sceneNode));
@@ -5284,7 +5286,6 @@ War3BuildShadowMaterialSignatureCached(
   hash = bit::fnv1a_iter(hash, renderable.meshIndex);
   hash = bit::fnv1a_iter(hash, renderable.layerIndex);
   hash = bit::fnv1a_iter(hash, renderable.flags);
-  hash = bit::fnv1a_iter(hash, reinterpret_cast<uintptr_t>(renderable.layerState));
   hash = bit::fnv1a_iter(hash, renderable.transparentType);
   hash = bit::fnv1a_iter(hash, renderable.transparentSortKey);
   hash = bit::fnv1a_iter(hash, uint32_t(renderable.queueKind));
@@ -5293,7 +5294,12 @@ War3BuildShadowMaterialSignatureCached(
   auto& entry = s_cache[size_t(hash) & (s_cache.size() - 1u)];
   if (entry.valid && entry.mapEpoch == mapEpoch &&
       entry.sceneNode == renderable.sceneNode &&
-      entry.layerState == renderable.layerState &&
+      // A resolved signature comes from the canonical sceneNode mesh/layer
+      // records; renderable.layerState is only a draw-local diagnostic view
+      // and is not read by that resolver. Keep exact pointer matching for the
+      // unresolved fallback, which hashes the layerState prefix directly.
+      (entry.signature.layerContractResolved ||
+       entry.layerState == renderable.layerState) &&
       entry.modelResourcePtr == renderable.modelResourcePtr &&
       entry.modelKey == renderable.modelKey &&
       entry.flags == renderable.flags &&
@@ -5310,7 +5316,6 @@ War3BuildShadowMaterialSignatureCached(
   entry.valid = true;
   entry.mapEpoch = mapEpoch;
   entry.sceneNode = renderable.sceneNode;
-  entry.meshData = renderable.meshData;
   entry.layerState = renderable.layerState;
   entry.modelResourcePtr = renderable.modelResourcePtr;
   entry.modelKey = renderable.modelKey;
@@ -7632,7 +7637,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   {
     auto materialScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/MaterialSignature");
-    out.material = War3BuildShadowMaterialSignatureCached(renderable);
+    // The immutable geoset owner was admitted against the current map epoch
+    // above. Reuse that proof instead of acquiring the global epoch again for
+    // every packet's material-cache lookup.
+    out.material = War3BuildShadowMaterialSignatureCached(
+        renderable, resource.mapEpoch);
   }
 
   if (packetBuildTiming != nullptr)
