@@ -2251,6 +2251,42 @@ bool ShadowModelResourceCache::findRuntimeModelOwnerBindingIndexed(
       tryIndexedOwner(m_runtimeOwnerByGeosetData, runtimeGeosetDataPtr);
 }
 
+bool ShadowModelResourceCache::findModelBinding(
+    void* modelResourcePtr, ShadowRuntimeModelOwnerBinding& out) const {
+  out = {};
+  if (modelResourcePtr == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto it = m_byModelResource.find(modelResourcePtr);
+  if (it == m_byModelResource.end())
+    return false;
+  const ShadowModelResourceRecord& record = it->second;
+  out.runtimeModelPtr = record.runtimeModelPtr;
+  out.modelResourcePtr = record.modelResourcePtr;
+  out.modelKey = record.modelKey;
+  out.geosetCount = record.geosetCount;
+  return true;
+}
+
+bool ShadowModelResourceCache::findRuntimeModelBinding(
+    void* runtimeModelPtr, ShadowRuntimeModelOwnerBinding& out) const {
+  out = {};
+  if (runtimeModelPtr == nullptr)
+    return false;
+
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  const auto it = m_byRuntimeModel.find(runtimeModelPtr);
+  if (it == m_byRuntimeModel.end())
+    return false;
+  const ShadowModelResourceRecord& record = it->second;
+  out.runtimeModelPtr = record.runtimeModelPtr;
+  out.modelResourcePtr = record.modelResourcePtr;
+  out.modelKey = record.modelKey;
+  out.geosetCount = record.geosetCount;
+  return true;
+}
+
 bool ShadowModelResourceCache::findModelResource(
     void *modelResourcePtr, ShadowModelResourceRecord &out) const {
   out = {};

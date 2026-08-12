@@ -306,6 +306,10 @@ public:
   bool findRuntimeModelOwnerBindingIndexed(
       void* runtimeGeosetPtr, void* runtimeGeosetDataPtr,
       ShadowRuntimeModelOwnerBinding& out) const;
+  bool findModelBinding(void* modelResourcePtr,
+                        ShadowRuntimeModelOwnerBinding& out) const;
+  bool findRuntimeModelBinding(
+      void* runtimeModelPtr, ShadowRuntimeModelOwnerBinding& out) const;
   bool findModelResource(void *modelResourcePtr,
                          ShadowModelResourceRecord &out) const;
   bool findRuntimeModelResource(void *runtimeModelPtr,

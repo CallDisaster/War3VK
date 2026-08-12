@@ -1057,12 +1057,10 @@ void ResolveGeosetMetadata(VisibleRenderableRecord &record) {
 
 bool ResolveRuntimeOwnerFromGeosetBinding(VisibleRenderableRecord& record) {
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  model::ShadowModelResourceRecord runtimeOwner = {};
-  if (!resourceCache.findRuntimeModelOwner(record.runtimeGeosetPtr,
-                                           record.runtimeGeosetDataPtr,
-                                           record.geosetIndex,
-                                           record.modelResourcePtr,
-                                           runtimeOwner)) {
+  model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
+  if (!resourceCache.findRuntimeModelOwnerBinding(
+          record.runtimeGeosetPtr, record.runtimeGeosetDataPtr,
+          record.geosetIndex, record.modelResourcePtr, runtimeOwner)) {
     return false;
   }
 
@@ -1255,7 +1253,7 @@ void ResolveModelMetadata(const RenderObjectIdentitySnapshot &identity,
     outModelResourcePtr =
         TryReadDirectModelResourceFromRuntimeModel(outRuntimeModelPtr);
 
-  model::ShadowModelResourceRecord runtimeResourceRecord = {};
+  model::ShadowRuntimeModelOwnerBinding runtimeResourceRecord = {};
   auto& resourceCache = model::ShadowModelResourceCache::instance();
   auto backfillRuntimeResourceCache = [&]() {
     if (outModelResourcePtr != nullptr) {
@@ -1264,10 +1262,10 @@ void ResolveModelMetadata(const RenderObjectIdentitySnapshot &identity,
     }
 
     if (outRuntimeModelPtr != nullptr) {
-      model::ShadowModelResourceRecord existingRuntimeRecord = {};
+      model::ShadowRuntimeModelOwnerBinding existingRuntimeRecord = {};
       const bool hasExistingRuntimeRecord =
-          resourceCache.findRuntimeModelResource(outRuntimeModelPtr,
-                                                 existingRuntimeRecord);
+          resourceCache.findRuntimeModelBinding(outRuntimeModelPtr,
+                                                existingRuntimeRecord);
       const bool needsRuntimeBackfill =
           !hasExistingRuntimeRecord ||
           (existingRuntimeRecord.modelResourcePtr == nullptr &&
@@ -1280,10 +1278,10 @@ void ResolveModelMetadata(const RenderObjectIdentitySnapshot &identity,
     }
 
     if (outModelResourcePtr != nullptr) {
-      model::ShadowModelResourceRecord existingModelRecord = {};
+      model::ShadowRuntimeModelOwnerBinding existingModelRecord = {};
       const bool hasExistingModelRecord =
-          resourceCache.findModelResource(outModelResourcePtr,
-                                          existingModelRecord);
+          resourceCache.findModelBinding(outModelResourcePtr,
+                                         existingModelRecord);
       const bool needsModelBackfill =
           !hasExistingModelRecord ||
           (existingModelRecord.modelKey == 0u && outModelKey != 0u);
@@ -1294,8 +1292,8 @@ void ResolveModelMetadata(const RenderObjectIdentitySnapshot &identity,
   };
 
   if (outRuntimeModelPtr != nullptr &&
-      resourceCache.findRuntimeModelResource(outRuntimeModelPtr,
-                                             runtimeResourceRecord)) {
+      resourceCache.findRuntimeModelBinding(outRuntimeModelPtr,
+                                            runtimeResourceRecord)) {
     if (outModelResourcePtr == nullptr)
       outModelResourcePtr = runtimeResourceRecord.modelResourcePtr;
     if (outModelKey == 0u)

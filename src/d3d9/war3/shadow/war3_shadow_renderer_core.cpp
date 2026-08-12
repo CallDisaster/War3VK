@@ -1078,9 +1078,9 @@ bool TryResolveResourceOwnerWorldPose(const ShadowRenderableRecord& renderable,
   outRuntimeModelPtr = nullptr;
   outPose = {};
 
-  model::ShadowModelResourceRecord runtimeOwner = {};
+  model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  if (resourceCache.findRuntimeModelOwner(
+  if (resourceCache.findRuntimeModelOwnerBinding(
           renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
           renderable.geosetIndex, renderable.modelResourcePtr, runtimeOwner) &&
       runtimeOwner.runtimeModelPtr != nullptr &&
@@ -1106,8 +1106,8 @@ void* TryResolveDirectModelResourceFromRuntimeModel(void* runtimeModelPtr) {
 
   auto& resourceCache = model::ShadowModelResourceCache::instance();
 
-  model::ShadowModelResourceRecord runtimeResource = {};
-  if (resourceCache.findRuntimeModelResource(runtimeModelPtr, runtimeResource) &&
+  model::ShadowRuntimeModelOwnerBinding runtimeResource = {};
+  if (resourceCache.findRuntimeModelBinding(runtimeModelPtr, runtimeResource) &&
       runtimeResource.modelResourcePtr != nullptr) {
     if (void* directModelResourcePtr =
             resourceCache.resolveDirectModelResourcePtr(
@@ -1324,13 +1324,12 @@ void CollectRenderableRuntimeModelRoots(const ShadowRenderableRecord& renderable
                                         std::vector<void*>& outRuntimeModels) {
   outRuntimeModels.clear();
 
-  model::ShadowModelResourceRecord runtimeOwner = {};
+  model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  if (resourceCache.findRuntimeModelOwner(renderable.runtimeGeosetPtr,
-                                          renderable.runtimeGeosetDataPtr,
-                                          renderable.geosetIndex,
-                                          renderable.modelResourcePtr,
-                                          runtimeOwner)) {
+  if (resourceCache.findRuntimeModelOwnerBinding(
+          renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
+          renderable.geosetIndex, renderable.modelResourcePtr,
+          runtimeOwner)) {
     AppendDistinctRuntimeModelPtrTrusted(outRuntimeModels,
                                          runtimeOwner.runtimeModelPtr);
   }
@@ -2381,7 +2380,7 @@ bool TryAugmentRenderableSemanticRecovery(ShadowRenderableRecord& renderable) {
     changed = true;
   }
 
-  model::ShadowModelResourceRecord runtimeOwnerResource = {};
+  model::ShadowRuntimeModelOwnerBinding runtimeOwnerResource = {};
   auto& resourceCache = model::ShadowModelResourceCache::instance();
   const bool needsRuntimeOwnerResource =
       (renderable.runtimeModelPtr == nullptr ||
@@ -2389,7 +2388,7 @@ bool TryAugmentRenderableSemanticRecovery(ShadowRenderableRecord& renderable) {
       (renderable.runtimeGeosetPtr != nullptr ||
        renderable.runtimeGeosetDataPtr != nullptr);
   if (needsRuntimeOwnerResource &&
-      resourceCache.findRuntimeModelOwner(
+      resourceCache.findRuntimeModelOwnerBinding(
           renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
           renderable.geosetIndex, renderable.modelResourcePtr,
           runtimeOwnerResource) &&
@@ -2752,13 +2751,12 @@ bool TryResolveBestPoseForRenderable(const ShadowRenderableRecord& renderable,
     if (!hit &&
         (renderable.runtimeGeosetPtr != nullptr ||
          renderable.runtimeGeosetDataPtr != nullptr)) {
-      model::ShadowModelResourceRecord runtimeOwner = {};
+      model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
       auto& resourceCache = model::ShadowModelResourceCache::instance();
-      if (resourceCache.findRuntimeModelOwner(renderable.runtimeGeosetPtr,
-                                              renderable.runtimeGeosetDataPtr,
-                                              renderable.geosetIndex,
-                                              renderable.modelResourcePtr,
-                                              runtimeOwner) &&
+      if (resourceCache.findRuntimeModelOwnerBinding(
+              renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
+              renderable.geosetIndex, renderable.modelResourcePtr,
+              runtimeOwner) &&
           runtimeOwner.runtimeModelPtr != nullptr &&
           TryResolvePoseByRuntimeModelSnapshotOnly(
               poses, runtimeOwner.runtimeModelPtr, candidate)) {
@@ -3722,13 +3720,12 @@ bool TryResolveAttachmentRigidRecord(
       ioStats->attachmentRigidMatchByRootRuntimeGeoset++;
     return true;
   }
-  model::ShadowModelResourceRecord runtimeOwner = {};
+  model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
   auto& resourceCache = model::ShadowModelResourceCache::instance();
-  if (resourceCache.findRuntimeModelOwner(renderable.runtimeGeosetPtr,
-                                          renderable.runtimeGeosetDataPtr,
-                                          renderable.geosetIndex,
-                                          renderable.modelResourcePtr,
-                                          runtimeOwner) &&
+  if (resourceCache.findRuntimeModelOwnerBinding(
+          renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
+          renderable.geosetIndex, renderable.modelResourcePtr,
+          runtimeOwner) &&
       runtimeOwner.runtimeModelPtr != nullptr &&
       TryResolveAttachmentFromRuntimeOwnerHint(runtimeOwner.runtimeModelPtr,
                                                attachments, outRecord)) {
@@ -3866,8 +3863,8 @@ bool MightResolveAttachmentRigidRecord(
       attachments.findByHandle(renderable.jHandle, probe))
     return true;
 
-  model::ShadowModelResourceRecord runtimeOwner = {};
-  if (model::ShadowModelResourceCache::instance().findRuntimeModelOwner(
+  model::ShadowRuntimeModelOwnerBinding runtimeOwner = {};
+  if (model::ShadowModelResourceCache::instance().findRuntimeModelOwnerBinding(
           renderable.runtimeGeosetPtr, renderable.runtimeGeosetDataPtr,
           renderable.geosetIndex, renderable.modelResourcePtr, runtimeOwner) &&
       runtimeOwner.runtimeModelPtr != nullptr &&
