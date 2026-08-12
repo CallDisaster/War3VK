@@ -1942,6 +1942,9 @@ bool PoseRegistry::findByUnitPtr(void *unitPtr, PoseRecord &out) const {
 // skipping the matrixPalette vector so no heap allocation/copy happens.
 static inline void ProjectPoseAugment(const PoseRecord &rec,
                                       PoseAugmentView &out) {
+  out.runtimeModelPtr = rec.runtimeModelPtr;
+  out.sceneNode = rec.sceneNode;
+  out.unitPtr = rec.unitPtr;
   out.hasWorldTransform = rec.hasWorldTransform;
   out.worldTransform = rec.worldTransform;
   out.hasSpriteFrameTransform = rec.hasSpriteFrameTransform;

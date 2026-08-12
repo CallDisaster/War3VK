@@ -179,6 +179,9 @@ struct PoseRecord {
 // the per-draw heap deep-copy of matrixPalette (up to 256 Matrix4) that a full
 // PoseRecord copy would incur for every skinned unit every frame.
 struct PoseAugmentView {
+  void* runtimeModelPtr = nullptr;
+  void* sceneNode = nullptr;
+  void* unitPtr = nullptr;
   bool hasWorldTransform = false;
   Matrix4 worldTransform;
   bool hasSpriteFrameTransform = false;

@@ -6496,8 +6496,6 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
                                                             visibleRecord);
   }
 
-  dxvk::war3::model::PoseRecord poseRecord = {};
-  bool poseHit = false;
   const void* effectiveRuntimeModelPtr =
       instanceHit && instanceRecord.runtimeModelPtr != nullptr
           ? instanceRecord.runtimeModelPtr
@@ -6506,21 +6504,6 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
                 : shadowHit && shadowRecord.runtimeModelPtr != nullptr
                       ? shadowRecord.runtimeModelPtr
                       : nullptr;
-  if (packetBuildTiming != nullptr)
-    packetBuildTiming->enterNested(War3PacketBuildNestedPhase::PoseLookup);
-  {
-    auto poseLookupScope =
-        War3SemanticSubmitScope("War3SemanticScene/Direct/PoseLookup");
-    auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
-    if (effectiveRuntimeModelPtr != nullptr)
-      poseHit = poseRegistry.findByRuntimeModel(const_cast<void*>(effectiveRuntimeModelPtr),
-                                               poseRecord);
-    if (!poseHit && record.sceneNode != nullptr)
-      poseHit = poseRegistry.findBySceneNode(record.sceneNode, poseRecord);
-    if (!poseHit && record.unitPtr != nullptr)
-      poseHit = poseRegistry.findByUnitPtr(record.unitPtr, poseRecord);
-  }
-
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::RenderableSetup);
   auto& renderable = out.renderable;
@@ -6913,13 +6896,51 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     }
   }
 
+  // The authoritative CurrentDraw path already owns the palette used by the
+  // packet. Query only the fixed-size pose projection in that common case;
+  // copying PoseRegistry::matrixPalette (up to 256 matrices) is reserved for
+  // the non-authoritative fallback that actually consumes it.
+  dxvk::war3::model::PoseRecord poseRecord = {};
+  dxvk::war3::model::PoseAugmentView poseAugment = {};
+  bool poseHit = false;
+  const bool needPoseMatrixPayload =
+      !out.hasRuntimeGroupPalette && !authoritativeSkinnedRequired;
+  if (packetBuildTiming != nullptr)
+    packetBuildTiming->enterNested(War3PacketBuildNestedPhase::PoseLookup);
+  {
+    auto poseLookupScope =
+        War3SemanticSubmitScope("War3SemanticScene/Direct/PoseLookup");
+    auto& poseRegistry = dxvk::war3::model::PoseRegistry::instance();
+    if (needPoseMatrixPayload) {
+      if (effectiveRuntimeModelPtr != nullptr) {
+        poseHit = poseRegistry.findByRuntimeModel(
+            const_cast<void*>(effectiveRuntimeModelPtr), poseRecord);
+      }
+      if (!poseHit && record.sceneNode != nullptr)
+        poseHit = poseRegistry.findBySceneNode(record.sceneNode, poseRecord);
+      if (!poseHit && record.unitPtr != nullptr)
+        poseHit = poseRegistry.findByUnitPtr(record.unitPtr, poseRecord);
+    } else {
+      if (effectiveRuntimeModelPtr != nullptr) {
+        poseHit = poseRegistry.findByRuntimeModelAugment(
+            const_cast<void*>(effectiveRuntimeModelPtr), poseAugment);
+      }
+      if (!poseHit && record.sceneNode != nullptr) {
+        poseHit =
+            poseRegistry.findBySceneNodeAugment(record.sceneNode, poseAugment);
+      }
+      if (!poseHit && record.unitPtr != nullptr)
+        poseHit = poseRegistry.findByUnitPtrAugment(record.unitPtr, poseAugment);
+    }
+  }
+
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::PoseInstall);
   auto& pose = out.pose;
   {
     auto poseInstallScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/PoseInstall");
-    if (poseHit) {
+    if (poseHit && needPoseMatrixPayload) {
       pose.runtimeModelPtr =
           poseRecord.runtimeModelPtr != nullptr
               ? poseRecord.runtimeModelPtr
@@ -6932,6 +6953,19 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       pose.hasWorldTransform = poseRecord.hasWorldTransform;
       if (poseRecord.hasWorldTransform)
         pose.worldTransform = poseRecord.worldTransform;
+      pose.frameSerial = renderable.frameSerial;
+    } else if (poseHit) {
+      pose.runtimeModelPtr =
+          poseAugment.runtimeModelPtr != nullptr
+              ? poseAugment.runtimeModelPtr
+              : const_cast<void*>(effectiveRuntimeModelPtr);
+      pose.sceneNode = poseAugment.sceneNode;
+      pose.unitPtr = poseAugment.unitPtr;
+      pose.matrixCount = poseAugment.matrixCount;
+      pose.matrixHash = poseAugment.matrixHash;
+      pose.hasWorldTransform = poseAugment.hasWorldTransform;
+      if (poseAugment.hasWorldTransform)
+        pose.worldTransform = poseAugment.worldTransform;
       pose.frameSerial = renderable.frameSerial;
     }
   }
