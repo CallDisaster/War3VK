@@ -452,7 +452,8 @@ public:
                                  PoseAugmentView &out) const;
   bool findFirstForDirectPacketAugment(void* runtimeModelPtr,
                                        void* sceneNode, void* unitPtr,
-                                       PoseAugmentView& out) const;
+                                       PoseAugmentView& out,
+                                       uint64_t* mutationGenerationOut = nullptr) const;
   // Same logical record set and order as snapshot(), without cloning each
   // matrix palette into an intermediate vector. References are callback-only;
   // callbacks must not re-enter PoseRegistry while the shared lock is held.
@@ -480,6 +481,7 @@ public:
   PoseTrackingHealthSnapshot debugVerifyTrackingHealthAggregate() const;
 
   uint64_t frameNumber() const;
+  uint64_t mutationGeneration() const;
 
 private:
   PoseRegistry() = default;
@@ -513,6 +515,10 @@ private:
   uint64_t m_trackingSpriteFramePoseCount = 0;
   uint64_t m_trackingMatrixPaletteCount = 0;
   std::atomic<uint64_t> m_frameNumber{0};
+  // Even values describe a stable lookup-visible snapshot. Writers advance
+  // once before and once after mutating pose maps so a Populate-local POD
+  // cache can reject a hit that overlaps any pose publication.
+  std::atomic<uint64_t> m_mutationGeneration{0};
 };
 
 class AttachmentRigidRegistry {

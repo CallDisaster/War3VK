@@ -1807,6 +1807,7 @@ void PoseRegistry::endFrame() {
 
 void PoseRegistry::resetMapSession() {
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   ClearRegistryMap(m_byRuntimeModel);
   ClearRegistryMap(m_bySceneNode);
   ClearRegistryMap(m_byUnitPtr);
@@ -1886,6 +1887,7 @@ void PoseRegistry::recordPose(void *runtimeModelPtr, void *sceneNode,
     return;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   PoseRecord record = {};
   record.runtimeModelPtr = runtimeModelPtr;
   record.sceneNode = sceneNode;
@@ -1920,6 +1922,7 @@ void PoseRegistry::recordSpriteFramePose(void *runtimeModelPtr, void *spritePtr,
     return;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   PoseRecord record = {};
   record.runtimeModelPtr = runtimeModelPtr;
   record.spritePtr = spritePtr;
@@ -1953,6 +1956,7 @@ void PoseRegistry::recordMatrixPalette(void* runtimeModelPtr, void* sceneNode,
     return;
 
   std::unique_lock<std::shared_mutex> lock(m_mutex);
+  RegistryMutationGenerationGuard mutation(m_mutationGeneration);
   PoseRecord record = {};
   record.runtimeModelPtr = runtimeModelPtr;
   record.sceneNode = sceneNode;
@@ -2086,8 +2090,13 @@ bool PoseRegistry::findByUnitPtrAugment(void *unitPtr,
 
 bool PoseRegistry::findFirstForDirectPacketAugment(
     void* runtimeModelPtr, void* sceneNode, void* unitPtr,
-    PoseAugmentView& out) const {
+    PoseAugmentView& out, uint64_t* mutationGenerationOut) const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+  if (mutationGenerationOut != nullptr) {
+    *mutationGenerationOut =
+        m_mutationGeneration.load(std::memory_order_acquire);
+  }
 
   const PoseRecord* record = nullptr;
   const auto findPointer = [&](const auto& map, void* key) -> bool {
@@ -2209,6 +2218,10 @@ PoseTrackingHealthSnapshot PoseRegistry::trackingHealthSnapshotLocked(
 uint64_t PoseRegistry::frameNumber() const {
   // Phase 7.83锛歮_frameNumber 宸叉敼 atomic锛屼笉鍐嶉渶瑕侀攣銆?
   return m_frameNumber.load(std::memory_order_relaxed);
+}
+
+uint64_t PoseRegistry::mutationGeneration() const {
+  return m_mutationGeneration.load(std::memory_order_acquire);
 }
 
 AttachmentRigidRegistry& AttachmentRigidRegistry::instance() {

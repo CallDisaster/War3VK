@@ -5818,6 +5818,79 @@ private:
   uint32_t m_missCount = 0u;
 };
 
+// PoseAugmentView is the allocation-free subset used by the authoritative
+// CurrentDraw route. Adjacent geosets normally resolve the same pose, so keep
+// a Populate-local copy and authorize hits with PoseRegistry's mutation
+// generation. Full matrix-palette fallback records are deliberately excluded.
+class War3CurrentDrawPoseAugmentSnapshotCache final {
+public:
+  bool find(
+      const dxvk::war3::model::PoseRegistry& registry,
+      void* runtimeModelPtr, void* sceneNode, void* unitPtr,
+      dxvk::war3::model::PoseAugmentView& out) {
+    const uint64_t currentGeneration = registry.mutationGeneration();
+    const size_t slot = slotFor(runtimeModelPtr, sceneNode, unitPtr);
+    const auto& entry = m_entries[slot];
+    if ((currentGeneration & 1u) == 0u &&
+        entry.generation == currentGeneration &&
+        entry.runtimeModelPtr == runtimeModelPtr &&
+        entry.sceneNode == sceneNode && entry.unitPtr == unitPtr) {
+      const auto cachedValue = entry.value;
+      const bool cachedFound = entry.found;
+      if (registry.mutationGeneration() == currentGeneration) {
+        out = cachedValue;
+        ++m_hitCount;
+        return cachedFound;
+      }
+    }
+
+    uint64_t observedGeneration = 0u;
+    dxvk::war3::model::PoseAugmentView value = {};
+    const bool found = registry.findFirstForDirectPacketAugment(
+        runtimeModelPtr, sceneNode, unitPtr, value, &observedGeneration);
+    const uint64_t publishedGeneration = registry.mutationGeneration();
+    if ((observedGeneration & 1u) == 0u &&
+        observedGeneration == publishedGeneration) {
+      m_entries[slot] = Entry{runtimeModelPtr, sceneNode, unitPtr,
+                              observedGeneration, value, found};
+    }
+    out = value;
+    ++m_missCount;
+    return found;
+  }
+
+  uint32_t hitCount() const { return m_hitCount; }
+  uint32_t missCount() const { return m_missCount; }
+
+private:
+  struct Entry {
+    void* runtimeModelPtr = nullptr;
+    void* sceneNode = nullptr;
+    void* unitPtr = nullptr;
+    uint64_t generation = ~uint64_t(0u);
+    dxvk::war3::model::PoseAugmentView value = {};
+    bool found = false;
+  };
+
+  static constexpr size_t kEntryCount = 128u;
+
+  static size_t slotFor(void* runtimeModelPtr, void* sceneNode,
+                        void* unitPtr) {
+    uint64_t hash = bit::fnv1a_init();
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(runtimeModelPtr)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(sceneNode)));
+    hash = bit::fnv1a_iter(
+        hash, uint64_t(reinterpret_cast<uintptr_t>(unitPtr)));
+    return size_t(hash) & (kEntryCount - 1u);
+  }
+
+  std::array<Entry, kEntryCount> m_entries = {};
+  uint32_t m_hitCount = 0u;
+  uint32_t m_missCount = 0u;
+};
+
 // ShadowObject identity/pose metadata is shared by every geoset of one object.
 // Cache only the registry's value projection for this Populate call and use its
 // seqlock-style mutation generation as the authority for every hit.
@@ -6483,7 +6556,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     War3CurrentDrawGeosetSnapshotCache* geosetSnapshotCache = nullptr,
     War3CurrentDrawInstanceSnapshotCache* instanceSnapshotCache = nullptr,
     War3CurrentDrawShadowObjectSnapshotCache*
-        shadowObjectSnapshotCache = nullptr) {
+        shadowObjectSnapshotCache = nullptr,
+    War3CurrentDrawPoseAugmentSnapshotCache*
+        poseAugmentSnapshotCache = nullptr) {
   const dxvk::war3::render::ShadowProducerPolicyContext producerContext = {
       record.stage,
       record.batchTag,
@@ -7203,6 +7278,10 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       poseHit = poseRegistry.findFirstForDirectPacket(
           const_cast<void*>(effectiveRuntimeModelPtr), record.sceneNode,
           record.unitPtr, poseRecord);
+    } else if (poseAugmentSnapshotCache != nullptr) {
+      poseHit = poseAugmentSnapshotCache->find(
+          poseRegistry, const_cast<void*>(effectiveRuntimeModelPtr),
+          record.sceneNode, record.unitPtr, poseAugment);
     } else {
       poseHit = poseRegistry.findFirstForDirectPacketAugment(
           const_cast<void*>(effectiveRuntimeModelPtr), record.sceneNode,
@@ -26974,6 +27053,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   War3CurrentDrawInstanceSnapshotCache currentDrawInstanceSnapshotCache;
   War3CurrentDrawShadowObjectSnapshotCache
       currentDrawShadowObjectSnapshotCache;
+  War3CurrentDrawPoseAugmentSnapshotCache
+      currentDrawPoseAugmentSnapshotCache;
 
   enterBuildEligiblePhase("RecordLoop");
   for (size_t buildIndex = 0u;
@@ -27106,7 +27187,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           &currentDrawVisibleIndexSliceCache,
           &currentDrawGeosetSnapshotCache,
           &currentDrawInstanceSnapshotCache,
-          &currentDrawShadowObjectSnapshotCache);
+          &currentDrawShadowObjectSnapshotCache,
+          &currentDrawPoseAugmentSnapshotCache);
       packetBuildTiming.finish();
       if (!packetBuilt) {
         bucket.packetBuildFailParts++;
