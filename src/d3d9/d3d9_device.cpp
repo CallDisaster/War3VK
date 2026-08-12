@@ -6615,7 +6615,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     const dxvk::war3::render::VisibleRenderableRecord*
         preselectedVisibleRecord = nullptr,
     War3SemanticDirectMainWorldBackingStatus*
-        outPrevalidatedMainWorldBackingStatus = nullptr) {
+        outPrevalidatedMainWorldBackingStatus = nullptr,
+    bool producerPolicyPrevalidated = false) {
   if (outPrevalidatedMainWorldBackingStatus != nullptr) {
     *outPrevalidatedMainWorldBackingStatus =
         War3SemanticDirectMainWorldBackingStatus::NotChecked;
@@ -6627,7 +6628,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       War3BatchTag::Unknown,
       false,
   };
-  if (!dxvk::war3::render::ShadowProducerPolicyAllows(
+  if (!producerPolicyPrevalidated &&
+      !dxvk::war3::render::ShadowProducerPolicyAllows(
           dxvk::war3::render::ShadowProducerKind::SemanticDirectGrouped,
           producerContext)) {
     return false;
@@ -27643,7 +27645,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           &currentDrawShadowObjectSnapshotCache,
           &currentDrawPoseAugmentSnapshotCache,
           preselectedVisibleRecord,
-          &eligible.mainWorldBackingStatus);
+          &eligible.mainWorldBackingStatus,
+          recordsForBuildCanonicalPrefiltered && !useSealedWork);
       packetBuildTiming.finish();
       if (!packetBuilt) {
         if (bucket != nullptr)
