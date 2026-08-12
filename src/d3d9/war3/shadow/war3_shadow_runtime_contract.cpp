@@ -4050,8 +4050,9 @@ void ShadowRuntimeContractCache::captureLiveState() {
   {
     auto snapshotScope = ContractCpuScope(
         "War3SemanticScene/CaptureContract/SnapshotPoseAttachment");
-    for (const auto& pose : poseRegistry.snapshot())
+    poseRegistry.forEachSnapshotPose([&](const model::PoseRecord& pose) {
       poses.add(ConvertPose(pose, manifest.frameSerial));
+    });
     if constexpr (kCaptureAttachmentRigidContracts) {
       for (const auto& attachment : attachmentRegistry.snapshot()) {
         auto contractAttachment =
@@ -4224,8 +4225,9 @@ void ShadowRuntimeContractCache::capturePoseOnlyLiveState() {
   poses.reserve(poseRegistry.recordCount() + manifestPtr->records.size() * 3u +
                 32u);
 
-  for (const auto& pose : poseRegistry.snapshot())
+  poseRegistry.forEachSnapshotPose([&](const model::PoseRecord& pose) {
     poses.add(ConvertPose(pose, poseFrameSerial));
+  });
 
   stats.frameSerial = poseFrameSerial;
   stats.publishRevision = manifestPtr->publishRevision;

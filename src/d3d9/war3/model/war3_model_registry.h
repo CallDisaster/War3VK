@@ -420,6 +420,19 @@ public:
   bool findByUnitPtrAugment(void *unitPtr, PoseAugmentView &out) const;
   bool findByRuntimeModelAugment(void *runtimeModelPtr,
                                  PoseAugmentView &out) const;
+  // Same logical record set and order as snapshot(), without cloning each
+  // matrix palette into an intermediate vector. References are callback-only;
+  // callbacks must not re-enter PoseRegistry while the shared lock is held.
+  template <typename Fn>
+  void forEachSnapshotPose(Fn&& fn) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    for (const auto& it : m_byRuntimeModel)
+      fn(it.second);
+    for (const auto& it : m_bySceneNode) {
+      if (it.second.runtimeModelPtr == nullptr)
+        fn(it.second);
+    }
+  }
   std::vector<PoseRecord> snapshot() const;
   size_t recordCount() const;
   size_t readyPoseCount() const;
