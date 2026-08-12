@@ -6575,7 +6575,8 @@ bool War3TryBuildLiveRuntimeGroupPalette(
     uint32_t* outPaletteSlotIndex,
     uint32_t* outPaletteMinFrameTag,
     uint32_t* outPaletteMaxFrameTag,
-    War3LivePaletteBuildTiming* outTiming);
+    War3LivePaletteBuildTiming* outTiming,
+    uint32_t provenMaxVertexGroupSlot);
 
 bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     const dxvk::war3::render::CurrentDrawContractRecord& record,
@@ -7267,7 +7268,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         &liveRebuiltSlotIndex,
         &liveRebuiltMinFrameTag,
         &liveRebuiltMaxFrameTag,
-        nullptr);
+        nullptr,
+        0xFFFFFFFFu);
     if (!liveRebuildUsed || liveRebuiltPalette.empty()) {
       // live rebuild 也失败：这是真正的"没数据"，只能 skip 这帧。
       dxvk::war3::render::NoteSubmitLiveRebuildMiss();
@@ -8298,7 +8300,8 @@ bool War3TryBuildLiveRuntimeGroupPalette(
     uint32_t* outPaletteSlotIndex = nullptr,
     uint32_t* outPaletteMinFrameTag = nullptr,
     uint32_t* outPaletteMaxFrameTag = nullptr,
-    War3LivePaletteBuildTiming* outTiming = nullptr) {
+    War3LivePaletteBuildTiming* outTiming = nullptr,
+    uint32_t provenMaxVertexGroupSlot = 0xFFFFFFFFu) {
   War3LivePaletteBuildRawTiming buildTiming(outTiming);
   auto markSource = [&](War3SemanticPaletteSource source) {
     if (outPaletteSource != nullptr)
@@ -8326,10 +8329,18 @@ bool War3TryBuildLiveRuntimeGroupPalette(
   if (vertexGroups.empty())
     return false;
 
-  buildTiming.enter(War3LivePaletteBuildPhase::GroupScan);
-  for (const uint8_t groupSlot : vertexGroups)
-    outMaxVertexGroupSlot =
-        std::max(outMaxVertexGroupSlot, uint32_t(groupSlot));
+  if (provenMaxVertexGroupSlot < 256u) {
+    // The caller may reuse the immutable group-domain maximum that was sealed
+    // with this packet. Palette bytes can change every frame, but the vertex
+    // group stream and its maximum do not. Unknown callers retain the exact
+    // byte scan below.
+    outMaxVertexGroupSlot = provenMaxVertexGroupSlot;
+  } else {
+    buildTiming.enter(War3LivePaletteBuildPhase::GroupScan);
+    for (const uint8_t groupSlot : vertexGroups)
+      outMaxVertexGroupSlot =
+          std::max(outMaxVertexGroupSlot, uint32_t(groupSlot));
+  }
   const uint32_t requiredPaletteCount = outMaxVertexGroupSlot + 1u;
   if (requiredPaletteCount == 0u || requiredPaletteCount > 256u)
     return false;
@@ -22226,7 +22237,10 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
             &rebuildRawHash, &rebuildRuntimeModelPtr,
             /*allowCModelFallbackForCall=*/false,
             &rebuildSource, &rebuildSlotIndex, &rebuildMinFrameTag,
-            &rebuildMaxFrameTag);
+            &rebuildMaxFrameTag, nullptr,
+            packet.maxVertexGroupSlot < drawTimeCapturedPaletteCount
+                ? packet.maxVertexGroupSlot
+                : 0xFFFFFFFFu);
         if (rebuildOk && !submitLiveRebuildScratchTls.empty()) {
           dxvk::war3::render::NoteSubmitLiveRebuildHit();
           // 覆盖 drawTimeCapturedPalette 指针 + 计数 + hash + ready。
@@ -27952,7 +27966,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
            /*allowCModelFallbackForCall=*/false, &livePaletteSource,
            &livePaletteSlotIndex, &livePaletteMinFrameTag,
            &livePaletteMaxFrameTag,
-           traceBuildEligible ? &buildEligibleLeasePaletteTiming : nullptr);
+           traceBuildEligible ? &buildEligibleLeasePaletteTiming : nullptr,
+           leased.packet.hasRuntimeGroupPalette &&
+                   leased.packet.maxVertexGroupSlot <
+                       leased.packet.runtimeGroupPalette.size()
+               ? leased.packet.maxVertexGroupSlot
+               : 0xFFFFFFFFu);
       const bool producerPaletteSource =
           livePaletteSource == War3SemanticPaletteSource::SubmitTimeGlobalSlot ||
           livePaletteSource ==
@@ -28017,7 +28036,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               leased.packet.resource, leaseInfo.runtimeModelPtr, nullptr,
               m_war3ShadowPersistentFrameSerial, liveRuntimeGroupPalette,
               liveMaxVertexGroupSlot, liveRuntimeGroupPaletteHash,
-              &liveRuntimeRawPaletteHash, &liveRuntimePoseModelPtr, true) ||
+              &liveRuntimeRawPaletteHash, &liveRuntimePoseModelPtr, true,
+              nullptr, nullptr, nullptr, nullptr, nullptr,
+              leased.packet.hasRuntimeGroupPalette &&
+                      leased.packet.maxVertexGroupSlot <
+                          leased.packet.runtimeGroupPalette.size()
+                  ? leased.packet.maxVertexGroupSlot
+                  : 0xFFFFFFFFu) ||
           liveRuntimeGroupPalette.empty()) {
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeasePoseCModelRefreshMissCount++;
