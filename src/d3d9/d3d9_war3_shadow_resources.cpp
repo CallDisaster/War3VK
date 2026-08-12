@@ -40,7 +40,9 @@ uint64_t War3ComputeShadowMatrixUploadKey(
   hash = bit::fnv1a_iter(hash, input.scene.shadowStats.dynamicPoseSignature);
 
   for (uint32_t i = 0; i < paletteCount; ++i)
-    hash = bit::fnv1a_iter(hash, input.scene.shadowPalettes[i].hash);
+    hash = bit::fnv1a_iter(
+        bit::fnv1a_iter(hash, input.scene.shadowPalettes[i].hash),
+        input.scene.shadowPalettes[i].worldMatrices.size());
 
   for (uint32_t i = 0; i < casterCount; ++i) {
     const auto& draw =
@@ -988,9 +990,13 @@ DxvkResourceBufferInfo War3ShadowReceiverPass::ensureShadowMatrixBuffer(
     dst[0] = Matrix4();
   } else {
     for (uint32_t i = 0; i < paletteCount; i++) {
-      std::memcpy(dst + VkDeviceSize(i) * 256u,
-                  input.scene.shadowPalettes[i].worldMatrices.data(),
-                  sizeof(Matrix4) * 256u);
+      const auto& palette = input.scene.shadowPalettes[i];
+      dxvk::war3::render::War3ExpandShadowPaletteForUpload(
+          dst + VkDeviceSize(i) *
+                    dxvk::war3::render::kWar3ShadowPaletteMatrixCapacity,
+          palette.worldMatrices.data(),
+          dxvk::war3::render::War3BoundShadowPaletteMatrixCount(
+              palette.worldMatrices.size()));
     }
 
     for (uint32_t i = 0; i < casterCount; i++) {

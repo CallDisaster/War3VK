@@ -1270,11 +1270,9 @@ inline bool War3SemanticFastAppendStatsReuseVerifierRuntime() {
 }
 
 inline bool War3SemanticPaletteInPlaceAppendRuntime() {
-  // War3ShadowMatrixPalette owns a fixed 256-matrix array. Building a local
-  // value and then moving it into vector still copies the full array. The
-  // in-place route default-constructs the identical zero-filled value directly
-  // in the destination slot and then fills the live prefix. Keep a runtime A/B
-  // gate so isolated tests can compare the two byte-equivalent paths.
+  // Construct the compact live palette directly in its scene slot. Keep a
+  // runtime A/B gate so isolated tests can compare the two byte-equivalent
+  // paths without changing the fixed 256-matrix shader upload layout.
   static const bool s_enabled =
       War3GetEnvU32("DXVK_WAR3_SEMANTIC_PALETTE_IN_PLACE_APPEND", 1u) != 0u;
   return s_enabled;
@@ -20534,7 +20532,8 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPalette() {
       continue;
 
     auto& p = m_war3Scene.shadowPalettes[idx];
-    if (std::memcmp(
+    if (p.worldMatrices.size() == 256u &&
+        std::memcmp(
             p.worldMatrices.data(),
             &m_state.transforms[GetTransformIndex(D3DTS_WORLDMATRIX(0))],
             bytes) == 0) {
@@ -20544,6 +20543,7 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPalette() {
 
   War3ShadowMatrixPalette palette = {};
   palette.hash = h;
+  palette.worldMatrices.resize(256u);
   for (uint32_t i = 0; i < 256; i++) {
     palette.worldMatrices[i] =
         m_state.transforms[GetTransformIndex(D3DTS_WORLDMATRIX(i))];
@@ -20588,7 +20588,8 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
       continue;
 
     auto& existing = m_war3Scene.shadowPalettes[idx];
-    if (std::memcmp(existing.worldMatrices.data(), matrices, bytes) == 0)
+    if (existing.worldMatrices.size() == boundedCount &&
+        std::memcmp(existing.worldMatrices.data(), matrices, bytes) == 0)
       return idx;
   }
 
@@ -20603,6 +20604,7 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
         War3FallbackAppendPhase::PaletteStorageInitCopy);
     auto& palette = m_war3Scene.shadowPalettes[newIndex];
     palette.hash = h;
+    palette.worldMatrices.resize(boundedCount);
     for (uint32_t i = 0; i < boundedCount; ++i)
       palette.worldMatrices[i] = matrices[i];
   } else {
@@ -20610,6 +20612,7 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
         War3FallbackAppendPhase::PaletteStorageInitCopy);
     War3ShadowMatrixPalette palette = {};
     palette.hash = h;
+    palette.worldMatrices.resize(boundedCount);
     for (uint32_t i = 0; i < boundedCount; ++i)
       palette.worldMatrices[i] = matrices[i];
 

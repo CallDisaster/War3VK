@@ -441,6 +441,24 @@ test(
   timeout : 30,
 )
 
+# CPU scene palettes retain only their live prefix. The upload boundary must
+# expand that prefix to the fixed 256-matrix shader stride with an identity
+# tail, preserving the historical GPU-visible representation.
+war3_shadow_palette_storage_test = executable(
+  'war3_shadow_palette_storage_test',
+  [
+    'war3/render/tests/war3_shadow_palette_storage_test.cpp',
+    '../util/util_matrix.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_palette_storage',
+  war3_shadow_palette_storage_test,
+  timeout : 30,
+)
+
 # High-frequency classified counters keep only attempts and mutually exclusive
 # failure buckets; successful counts are derived when diagnostics are sampled.
 war3_classified_counter_test = executable(

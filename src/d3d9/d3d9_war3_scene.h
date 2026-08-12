@@ -2,6 +2,7 @@
 
 #include "war3/render/war3_render_state.h"
 #include "war3/render/war3_shadow_bounds_policy.h"
+#include "war3/render/war3_shadow_palette_storage.h"
 #include "war3/render/war3_shadow_replay_binding_policy.h"
 #include "war3/gpu_skin/war3_gpu_skin_types.h"
 
@@ -10,6 +11,7 @@
 #include "../dxvk/dxvk_sampler.h" // 用于 Rc<DxvkSampler>
 
 #include "../util/util_matrix.h"
+#include "../util/util_small_vector.h"
 
 #include <array>
 #include <vector>
@@ -58,7 +60,11 @@ namespace dxvk {
 
     struct War3ShadowMatrixPalette {
         uint64_t hash = 0;
-        std::array<Matrix4, 256> worldMatrices = { };
+        // Most Warcraft palettes are far smaller than the fixed shader stride.
+        // Embedded storage avoids a per-palette allocation while constructing
+        // and moving only the live prefix on the producer thread. The upload
+        // boundary expands it back to 256 identity-filled matrices.
+        small_vector<Matrix4, 64u> worldMatrices;
     };
 
     // VS-S1 阴影重放只持有 generation-pinned 输入的值语义和强引用。
