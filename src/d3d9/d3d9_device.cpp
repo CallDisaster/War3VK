@@ -20447,16 +20447,21 @@ uint32_t D3D9DeviceEx::War3GetOrCreateSemanticShadowPalette(
       War3SemanticPacketUsesDirectGeosetData(packet) &&
       War3IsSemanticUnitObject(resolvedObjectKind);
   if (directGeosetUnitPalette && packet.pose.hasWorldTransform) {
-    const bool looksModelLocal = War3SemanticPaletteLooksModelLocal(
-        sourceMatrices, matrixCount, packet.pose.worldTransform,
-        static_cast<uint8_t>(resolvedObjectKind), false);
     if (hasOverridePalette) {
       m_war3Scene.shadowStats.semanticScenePaletteOverrideNoComposeCount++;
-      if (looksModelLocal) {
+      // A current-draw override already carries the authoritative palette used
+      // by the game for this draw. Composing it would be incorrect, so the
+      // model-local heuristic is only useful for optional diagnostics.
+      if (War3SemanticPaletteDiagnosticsRuntime() &&
+          War3SemanticPaletteLooksModelLocal(
+              sourceMatrices, matrixCount, packet.pose.worldTransform,
+              static_cast<uint8_t>(resolvedObjectKind), false)) {
         m_war3Scene.shadowStats
             .semanticScenePaletteOverrideWouldComposeCount++;
       }
-    } else if (looksModelLocal) {
+    } else if (War3SemanticPaletteLooksModelLocal(
+                   sourceMatrices, matrixCount, packet.pose.worldTransform,
+                   static_cast<uint8_t>(resolvedObjectKind), false)) {
       composeWorldPalette = true;
       worldHash = War3SemanticHashMatrix4(packet.pose.worldTransform);
       m_war3Scene.shadowStats.semanticScenePalettePacketWorldComposeCount++;
