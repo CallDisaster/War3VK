@@ -28607,14 +28607,49 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   static thread_local std::vector<uint64_t> s_submittedIdentityKeys;
   static thread_local std::vector<uint64_t> s_submittedPreferenceKeys;
   static thread_local std::vector<uint64_t> s_submittedPartIdentityKeys;
-  static thread_local std::unordered_map<uint64_t, std::vector<uint64_t>>
+  struct LiveSubmittedCorePartsEntry {
+    uint64_t frameSerial = 0u;
+    std::vector<uint64_t> partKeys;
+  };
+  static thread_local std::unordered_map<
+      uint64_t, LiveSubmittedCorePartsEntry>
       s_liveSubmittedCorePartsByObject;
+  static thread_local std::vector<uint64_t>
+      s_liveSubmittedCorePartObjectKeys;
+  static thread_local uint64_t s_liveSubmittedCorePartsMapEpoch = 0u;
+  static thread_local uint64_t s_liveSubmittedCorePartsFrameSerial = 0u;
   s_submittedIdentityKeys.clear();
   s_submittedPreferenceKeys.clear();
   s_submittedPartIdentityKeys.clear();
-  for (auto& kv : s_liveSubmittedCorePartsByObject)
-    kv.second.clear();
-  s_liveSubmittedCorePartsByObject.clear();
+  if (s_liveSubmittedCorePartsMapEpoch != m_war3GpuSkinMapEpoch) {
+    s_liveSubmittedCorePartsByObject.clear();
+    s_liveSubmittedCorePartObjectKeys.clear();
+    s_liveSubmittedCorePartsMapEpoch = m_war3GpuSkinMapEpoch;
+    s_liveSubmittedCorePartsFrameSerial = directPartPacketLeaseFrame;
+  } else if (s_liveSubmittedCorePartsFrameSerial !=
+             directPartPacketLeaseFrame) {
+    s_liveSubmittedCorePartObjectKeys.clear();
+    s_liveSubmittedCorePartsFrameSerial = directPartPacketLeaseFrame;
+
+    // This table owns CPU scratch capacity only, but a long-running map can
+    // still see many transient object identities. Amortize stale-node cleanup
+    // instead of either freeing every node every frame or growing forever.
+    constexpr uint64_t kCorePartScratchRetireFrames = 256u;
+    if ((directPartPacketLeaseFrame & 0xFFu) == 0u) {
+      for (auto it = s_liveSubmittedCorePartsByObject.begin();
+           it != s_liveSubmittedCorePartsByObject.end();) {
+        const uint64_t lastFrame = it->second.frameSerial;
+        if (lastFrame == 0u ||
+            (directPartPacketLeaseFrame > lastFrame &&
+             directPartPacketLeaseFrame - lastFrame >
+                 kCorePartScratchRetireFrames)) {
+          it = s_liveSubmittedCorePartsByObject.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
   auto& submittedIdentityKeys = s_submittedIdentityKeys;
   auto& submittedPreferenceKeys = s_submittedPreferenceKeys;
   auto& submittedPartIdentityKeys = s_submittedPartIdentityKeys;
@@ -28625,6 +28660,28 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   submittedPartIdentityKeys.reserve(liveLifecycleRecordCount);
   submittedPartPacketLeaseRecords.reserve(eligibleRecordCount);
   auto& liveSubmittedCorePartsByObject = s_liveSubmittedCorePartsByObject;
+  auto& liveSubmittedCorePartObjectKeys =
+      s_liveSubmittedCorePartObjectKeys;
+  const auto appendLiveSubmittedCorePart = [&] (
+      uint64_t objectKey, uint64_t partKey) {
+    if (objectKey == 0u || partKey == 0u)
+      return;
+    auto& entry = liveSubmittedCorePartsByObject[objectKey];
+    if (entry.frameSerial != directPartPacketLeaseFrame) {
+      entry.frameSerial = directPartPacketLeaseFrame;
+      entry.partKeys.clear();
+      liveSubmittedCorePartObjectKeys.push_back(objectKey);
+    }
+    entry.partKeys.push_back(partKey);
+  };
+  const auto findLiveSubmittedCoreParts = [&] (uint64_t objectKey)
+      -> const std::vector<uint64_t>* {
+    const auto it = liveSubmittedCorePartsByObject.find(objectKey);
+    return it != liveSubmittedCorePartsByObject.end() &&
+            it->second.frameSerial == directPartPacketLeaseFrame
+        ? &it->second.partKeys
+        : nullptr;
+  };
   uint32_t genericStatsObjectKindReuseCount = 0u;
   uint32_t genericStatsObjectKindFallbackCount = 0u;
   uint32_t genericStatsDynamicEvidenceReuseCount = 0u;
@@ -28661,8 +28718,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           eligible.manifestPartLeaseKey != 0u) {
         if (nestedTiming != nullptr)
           nestedTiming->enter(War3SubmitAppendNestedPhase::BookCorePartIndex);
-        liveSubmittedCorePartsByObject[eligible.selectionKey].push_back(
-            eligible.manifestPartLeaseKey);
+        appendLiveSubmittedCorePart(eligible.selectionKey,
+                                    eligible.manifestPartLeaseKey);
       }
     }
     if (nestedTiming != nullptr)
@@ -28831,7 +28888,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (submittedPartIdentityKey != 0u)
       submittedPartIdentityKeys.push_back(submittedPartIdentityKey);
     if (selectionKey != 0u && manifestPartKey != 0u) {
-      liveSubmittedCorePartsByObject[selectionKey].push_back(manifestPartKey);
+      appendLiveSubmittedCorePart(selectionKey, manifestPartKey);
     }
     m_war3Scene.shadowStats
         .drawTimeSemanticProducerLifecycleMergedCount++;
@@ -30112,20 +30169,18 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           !coreIt->second.committedPartKeys.empty()) {
         uint64_t* groupPartKeys = coreGateStack;
         size_t groupPartKeyCount = 0u;
-        const auto exactCoreIt =
-            liveSubmittedCorePartsByObject.find(group.selectionKey);
+        const auto* exactCoreParts =
+            findLiveSubmittedCoreParts(group.selectionKey);
         const size_t exactCorePartCount =
-            exactCoreIt != liveSubmittedCorePartsByObject.end()
-                ? exactCoreIt->second.size()
-                : 0u;
+            exactCoreParts != nullptr ? exactCoreParts->size() : 0u;
         const size_t worstCase = size_t(group.count) + exactCorePartCount;
         bool useHeap = worstCase > kCoreGateStackBudget;
         if (useHeap) {
           coreGateHeap.clear();
           coreGateHeap.reserve(worstCase);
         }
-        if (exactCoreIt != liveSubmittedCorePartsByObject.end()) {
-          for (uint64_t partKey : exactCoreIt->second) {
+        if (exactCoreParts != nullptr) {
+          for (uint64_t partKey : *exactCoreParts) {
             if (partKey == 0u)
               continue;
             if (useHeap) {
@@ -30712,8 +30767,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           .semanticSceneShadowManifestPartLeaseUpdatedFromLiveCount++;
     }
 
-    for (auto& [objectKey, partKeys] : liveSubmittedCorePartsByObject) {
-      if (objectKey == 0u || partKeys.empty())
+    for (uint64_t objectKey : liveSubmittedCorePartObjectKeys) {
+      auto liveIt = liveSubmittedCorePartsByObject.find(objectKey);
+      if (liveIt == liveSubmittedCorePartsByObject.end() ||
+          liveIt->second.frameSerial != directPartPacketLeaseFrame)
+        continue;
+      auto& partKeys = liveIt->second.partKeys;
+      if (partKeys.empty())
         continue;
       std::sort(partKeys.begin(), partKeys.end());
       partKeys.erase(std::unique(partKeys.begin(), partKeys.end()),
