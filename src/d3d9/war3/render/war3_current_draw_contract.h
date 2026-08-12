@@ -329,7 +329,8 @@ struct CurrentDrawContractDiagnosticsSummary {
   // Phase 7.49：per-publish provenance probe
   // 目的：在 full trace 里把 FROZEN/NON-FROZEN 窗口里的 Publish 行为拆开。
   //   publishCallCumulative：Publish 被调的累计次数
-  //   publishTrustedHitCumulative：trusted path 命中累计（与 g_paletteCaptureTrustedSourceHitCount 对齐）
+  //   publishTrustedHitCumulative：trusted path 命中累计（默认由 model-hook
+  //     canonical Exact-query hit counter 提供；legacy A/B 保留旧 duplicate）。
   //   publishRecordFrameTagSameRunMax：Publish 时 record.frameTag 连续相同的最长 run
   //     如果在 FROZEN 段里它 ≥ FROZEN 长度 → record.frameTag 真的多帧不推进（分支 1）
   //   publishRecordFrameTagDistinctInWindowCount：本累计窗口内 record.frameTag 出现过的不同值数量

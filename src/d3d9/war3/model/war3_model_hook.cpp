@@ -9104,6 +9104,10 @@ bool CopyBlendedPaletteBytesBySlotIndexExact(
   return true;
 }
 
+uint64_t QueryBlendedPaletteExactHitCount() noexcept {
+  return g_queryBlendedPaletteExactHitCount.load(std::memory_order_relaxed);
+}
+
 // Phase 7.34：诊断用的 best-effort 查询，允许 partial 返回。
 // **不应用于 Ready palette 仲裁**，仅在 counter / 调试日志中使用。
 bool QueryBlendedPaletteBySlotIndexBestEffort(uint32_t slotIndex,

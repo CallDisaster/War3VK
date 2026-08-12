@@ -433,7 +433,6 @@ std::atomic<uint64_t> g_paletteAttributionSnapshotHitCount{0u};
 // Phase 7.30 Action B 第二刀：capture 端 trusted palette 源使用情况。
 // TrustedHit = Hook_RuntimeMatrixWrite 缓存命中，作为 snapshot 的真源；
 // TrustedMiss = 未命中，回退到 globalPaletteBuffer raw memcpy（老路径）。
-std::atomic<uint64_t> g_paletteCaptureTrustedSourceHitCount{0u};
 std::atomic<uint64_t> g_paletteCaptureTrustedSourceMissCount{0u};
 // Phase 7.34 线 A：严格仲裁拒绝 raw arena 时的丢弃次数。
 // 数值越高说明 trusted 覆盖率越低；应配合 `runtimeMatrixRangeCopyPalettePublishHitCount`
@@ -2309,8 +2308,6 @@ void PublishCurrentDrawContract(const CurrentDrawContractRecord& record,
       paletteSource = snapshot.bytes.data();
       provenance = PaletteProvenance::TrustedBlendedWriter;
       paletteAlreadyStoredInSnapshot = true;
-      g_paletteCaptureTrustedSourceHitCount.fetch_add(
-          1u, std::memory_order_relaxed);
       if (CurrentDrawRedundantAtomicsLegacyRuntime()) {
         g_publishTrustedHitCumulative.fetch_add(
             1u, std::memory_order_relaxed);
@@ -2533,7 +2530,7 @@ QueryCurrentDrawContractDiagnosticsSummary() {
   summary.paletteAttributionSnapshotHitCount =
       g_paletteAttributionSnapshotHitCount.load(std::memory_order_relaxed);
   summary.paletteCaptureTrustedSourceHitCount =
-      g_paletteCaptureTrustedSourceHitCount.load(std::memory_order_relaxed);
+      dxvk::war3::model::QueryBlendedPaletteExactHitCount();
   summary.paletteCaptureTrustedSourceMissCount =
       g_paletteCaptureTrustedSourceMissCount.load(std::memory_order_relaxed);
   // Phase 7.34：严格仲裁下 raw-arena 拒绝次数。
@@ -2676,8 +2673,7 @@ QueryCurrentDrawContractDiagnosticsSummary() {
   summary.publishTrustedHitCumulative =
       CurrentDrawRedundantAtomicsLegacyRuntime()
           ? g_publishTrustedHitCumulative.load(std::memory_order_relaxed)
-          : g_paletteCaptureTrustedSourceHitCount.load(
-                std::memory_order_relaxed);
+          : dxvk::war3::model::QueryBlendedPaletteExactHitCount();
   summary.publishRawFallbackCumulative =
       g_publishRawFallbackCumulative.load(std::memory_order_relaxed);
   summary.publishRejectedNoTrustedCumulative =

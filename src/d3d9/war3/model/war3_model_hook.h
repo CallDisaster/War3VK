@@ -472,6 +472,10 @@ bool CopyBlendedPaletteBytesBySlotIndexExact(uint32_t slotIndex,
                                              void* outPaletteBytes,
                                              size_t outPaletteByteCapacity);
 
+// Canonical cumulative successful Exact-query count. CurrentDraw diagnostics
+// borrow this value instead of issuing a second 64-bit atomic RMW per publish.
+uint64_t QueryBlendedPaletteExactHitCount() noexcept;
+
 // Phase 7.34：诊断用 best-effort 查询，允许 partial。
 // **不应用于 Ready palette 仲裁**，仅在 counter / 调试日志中使用。
 bool QueryBlendedPaletteBySlotIndexBestEffort(uint32_t slotIndex,
