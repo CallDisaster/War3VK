@@ -19,6 +19,23 @@ class CurrentDrawIndexSliceHashCacheContracts(unittest.TestCase):
         self.assertIn("uint64_t contentHash = 0u", cache)
         self.assertIn("contentHash};", cache)
 
+    def test_slice_borrows_generation_owned_indices_without_copying(self) -> None:
+        start = DEVICE.index("bool War3TryAttachCurrentDrawVisibleIndexSlice(")
+        end = DEVICE.index(
+            "inline bool War3CasterIsAnonymousSmallPathBlockerMarker", start
+        )
+        attach = DEVICE[start:end]
+        self.assertNotIn("std::make_shared<std::vector<uint16_t>>", attach)
+        self.assertIn(
+            "resource.dynamicIndexStream = geoset.indices.data() + baseIndex",
+            attach,
+        )
+        self.assertIn("resource.dynamicIndexCount = count", attach)
+        self.assertIn(
+            "resource.dynamicIndexBackedByResourceKeepAlive = true", attach
+        )
+        self.assertIn("resource.ownedDynamicIndices.reset()", attach)
+
     def test_index_bytes_are_hashed_only_when_the_slice_misses(self) -> None:
         start = DEVICE.index("bool War3TryAttachCurrentDrawVisibleIndexSlice(")
         end = DEVICE.index(

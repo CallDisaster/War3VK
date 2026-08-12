@@ -50,6 +50,10 @@ struct ShadowPacketResource {
   uint32_t dynamicPrimitiveBaseIndex = 0;
   ShadowDynamicIndexSource dynamicIndexSource =
       ShadowDynamicIndexSource::None;
+  // True only when dynamicIndexStream addresses the immutable `indices`
+  // vector owned by resourceKeepAlive. Consumers must still range-check the
+  // slice; a generic raw pointer or an unrelated keep-alive never qualifies.
+  bool dynamicIndexBackedByResourceKeepAlive = false;
   std::shared_ptr<const std::vector<uint16_t>> ownedDynamicIndices;
   std::shared_ptr<const void> resourceKeepAlive;
   std::vector<float> ownedPositions;

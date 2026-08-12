@@ -5567,7 +5567,6 @@ public:
 
   bool find(const dxvk::war3::model::ShadowGeosetResourceRecord* geoset,
             uint32_t primitiveIndex,
-            std::shared_ptr<const std::vector<uint16_t>>& outIndices,
             uint32_t& outBaseIndex,
             uint32_t& outIndexCount,
             dxvk::war3::shadow::ShadowPrimitiveTopology& outTopology,
@@ -5588,7 +5587,6 @@ public:
             frameEntry.primitiveIndex != primitiveIndex) {
           continue;
         }
-        outIndices = frameEntry.indices;
         outBaseIndex = frameEntry.baseIndex;
         outIndexCount = frameEntry.indexCount;
         outTopology = frameEntry.topology;
@@ -5603,8 +5601,7 @@ public:
     if (entry.geoset == geoset &&
         entry.mapEpoch == geoset->mapEpoch &&
         entry.immutableModelGeneration == geoset->immutableModelGeneration &&
-        entry.primitiveIndex == primitiveIndex && entry.indices != nullptr) {
-      outIndices = entry.indices;
+        entry.primitiveIndex == primitiveIndex) {
       outBaseIndex = entry.baseIndex;
       outIndexCount = entry.indexCount;
       outTopology = entry.topology;
@@ -5618,19 +5615,19 @@ public:
 
   void store(const dxvk::war3::model::ShadowGeosetResourceRecord* geoset,
              uint32_t primitiveIndex,
-             std::shared_ptr<const std::vector<uint16_t>> indices,
              uint32_t baseIndex,
              uint32_t indexCount,
              dxvk::war3::shadow::ShadowPrimitiveTopology topology,
              uint64_t contentHash) {
     if (!m_enabled || geoset == nullptr || !geoset->readyForShadowConsumer() ||
         geoset->mapEpoch == 0u || geoset->immutableModelGeneration == 0u ||
-        indices == nullptr || indices->empty()) {
+        indexCount == 0u || indexCount > geoset->indices.size() ||
+        baseIndex > geoset->indices.size() - indexCount) {
       return;
     }
     const Entry stored = {
         geoset, geoset->mapEpoch, geoset->immutableModelGeneration,
-        primitiveIndex, std::move(indices), baseIndex, indexCount, topology,
+        primitiveIndex, baseIndex, indexCount, topology,
         contentHash};
     if (m_generationReuseEnabled) {
       generationEntries()[slotFor(geoset, primitiveIndex)] = stored;
@@ -5653,7 +5650,6 @@ private:
     uint64_t mapEpoch = 0u;
     uint64_t immutableModelGeneration = 0u;
     uint32_t primitiveIndex = 0u;
-    std::shared_ptr<const std::vector<uint16_t>> indices;
     uint32_t baseIndex = 0u;
     uint32_t indexCount = 0u;
     dxvk::war3::shadow::ShadowPrimitiveTopology topology =
@@ -5664,7 +5660,7 @@ private:
   static constexpr size_t kEntryCount = 256u;
 
   static std::array<Entry, kEntryCount>& generationEntries() {
-    // The sub-vector owns its CPU bytes. Reuse is admitted only when the
+    // The immutable geoset owns the CPU bytes. Reuse is admitted only when the
     // process-monotonic immutable model generation and map epoch both match;
     // a recycled Warcraft pointer or a same-address replacement therefore
     // cannot revive an old slice. This is not a content-hash/fingerprint
@@ -6051,13 +6047,12 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
     uint32_t count = 0u;
     dxvk::war3::shadow::ShadowPrimitiveTopology topology =
         dxvk::war3::shadow::ShadowPrimitiveTopology::TriangleList;
-    std::shared_ptr<const std::vector<uint16_t>> owned;
     uint64_t immutableSliceContentHash = 0u;
     if (packetBuildTiming != nullptr)
       packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::CacheLookup);
     const bool cacheHit =
         sliceCache != nullptr &&
-        sliceCache->find(&geoset, primitiveIndex, owned, baseIndex, count,
+        sliceCache->find(&geoset, primitiveIndex, baseIndex, count,
                          topology, immutableSliceContentHash);
     if (!cacheHit) {
       if (packetBuildTiming != nullptr)
@@ -6079,22 +6074,14 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
         return false;
       }
 
-      if (packetBuildTiming != nullptr)
-        packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::AllocateCopy);
-      auto mutableOwned = std::make_shared<std::vector<uint16_t>>(
-          geoset.indices.begin() + baseIndex,
-          geoset.indices.begin() + baseIndex + count);
-      if (mutableOwned->empty())
-        return false;
-      owned = std::move(mutableOwned);
       topology = War3MapCurrentDrawPrimitiveTypeToTopology(
           primitive.primitiveTypeOrMaterialSlot);
       immutableSliceContentHash =
           War3ComputeCurrentDrawVisibleIndexSliceContentHash(
               geoset, primitiveIndex, baseIndex, count, topology,
-              owned->data());
+              geoset.indices.data() + baseIndex);
       if (sliceCache != nullptr) {
-        sliceCache->store(&geoset, primitiveIndex, owned, baseIndex, count,
+        sliceCache->store(&geoset, primitiveIndex, baseIndex, count,
                           topology, immutableSliceContentHash);
       }
     }
@@ -6106,9 +6093,9 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
             record, renderable, immutableSliceContentHash);
     if (packetBuildTiming != nullptr)
       packetBuildTiming->enterIndexSlice(War3IndexSlicePhase::ResourceWrite);
-    resource.ownedDynamicIndices = owned;
-    resource.dynamicIndexStream = owned->data();
-    resource.dynamicIndexCount = uint32_t(owned->size());
+    resource.ownedDynamicIndices.reset();
+    resource.dynamicIndexStream = geoset.indices.data() + baseIndex;
+    resource.dynamicIndexCount = count;
     resource.dynamicPrimitiveBaseIndex = baseIndex;
     resource.dynamicIndexHash = dynamicIndexHash;
     if (preparedHash != 0u)
@@ -6116,6 +6103,7 @@ bool War3TryAttachCurrentDrawVisibleIndexSlice(
           bit::fnv1a_iter(resource.dynamicIndexHash, preparedHash);
     resource.topology = topology;
     resource.dynamicIndexSource = source;
+    resource.dynamicIndexBackedByResourceKeepAlive = true;
     return true;
   };
 
@@ -21560,6 +21548,37 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       packet, directCurrentDrawSample, fromStalePoseRestore, false);
 }
 
+bool War3PacketResourceHasImmutableDynamicIndexSlice(
+    const dxvk::war3::shadow::ShadowPacketResource& resource) {
+  if (!resource.dynamicIndexBackedByResourceKeepAlive ||
+      resource.resourceKeepAlive == nullptr || resource.mapEpoch == 0u ||
+      resource.immutableModelGeneration == 0u ||
+      resource.dynamicIndexStream == nullptr ||
+      resource.dynamicIndexCount == 0u) {
+    return false;
+  }
+
+  const auto* owner = static_cast<
+      const dxvk::war3::model::ShadowGeosetResourceRecord*>(
+          resource.resourceKeepAlive.get());
+  if (owner == nullptr || !owner->readyForShadowConsumer() ||
+      owner->mapEpoch != resource.mapEpoch ||
+      owner->immutableModelGeneration != resource.immutableModelGeneration ||
+      owner->geosetIndex != resource.geosetIndex ||
+      owner->modelKey != resource.modelKey ||
+      owner->contentHash != resource.contentHash || owner->indices.empty()) {
+    return false;
+  }
+
+  const size_t baseIndex = size_t(resource.dynamicPrimitiveBaseIndex);
+  const size_t indexCount = size_t(resource.dynamicIndexCount);
+  if (baseIndex > owner->indices.size() ||
+      indexCount > owner->indices.size() - baseIndex) {
+    return false;
+  }
+  return resource.dynamicIndexStream == owner->indices.data() + baseIndex;
+}
+
 bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     const dxvk::war3::shadow::ShadowDrawPacket& packet,
     const dxvk::war3::render::CurrentDrawAuthoritativeSample*
@@ -21777,13 +21796,15 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   const auto ownedDynamicIndices = packet.resource.ownedDynamicIndices;
   const bool hasOwnedDynamicIndexStream =
       ownedDynamicIndices != nullptr && !ownedDynamicIndices->empty();
+  const bool hasImmutableDynamicIndexStream =
+      War3PacketResourceHasImmutableDynamicIndexSlice(packet.resource);
   const bool hasDynamicPositionStream =
       packet.usesDynamicMeshPositions &&
       packet.resource.dynamicPositionStream != nullptr &&
       packet.resource.dynamicPositionStride >= 12u &&
       packet.resource.vertexCount != 0u;
   const bool hasDynamicIndexStream =
-      hasOwnedDynamicIndexStream ||
+      hasOwnedDynamicIndexStream || hasImmutableDynamicIndexStream ||
       (packet.resource.dynamicIndexStream != nullptr &&
        packet.resource.dynamicIndexCount != 0u);
   const uint32_t positionVertexCount =
@@ -21880,6 +21901,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     return false;
   }
   if (hasDynamicIndexStream && !hasOwnedDynamicIndexStream &&
+      !hasImmutableDynamicIndexStream &&
       !dxvk::war3::IsReadableRange(effectiveIndexData,
                                    size_t(effectiveIndexCount) *
                                        sizeof(uint16_t))) {
@@ -26843,7 +26865,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (packet.resource.dynamicIndexStream != nullptr &&
         packet.resource.dynamicIndexCount != 0u &&
         (packet.resource.ownedDynamicIndices == nullptr ||
-         packet.resource.ownedDynamicIndices->empty())) {
+         packet.resource.ownedDynamicIndices->empty()) &&
+        !War3PacketResourceHasImmutableDynamicIndexSlice(packet.resource)) {
       stats.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount++;
       stats.semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount++;
       return false;
@@ -28049,7 +28072,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           leased.packet.resource.dynamicIndexStream != nullptr &&
           leased.packet.resource.dynamicIndexCount != 0u &&
           (leased.packet.resource.ownedDynamicIndices == nullptr ||
-           leased.packet.resource.ownedDynamicIndices->empty())) {
+           leased.packet.resource.ownedDynamicIndices->empty()) &&
+          !War3PacketResourceHasImmutableDynamicIndexSlice(
+              leased.packet.resource)) {
         m_war3Scene.shadowStats
             .semanticSceneShadowManifestPartLeaseRejectedSliceStaleCount++;
         continue;
@@ -29137,6 +29162,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           hash = bit::fnv1a_iter(hash, resource.dynamicPrimitiveBaseIndex);
           hash = bit::fnv1a_iter(
               hash, uint32_t(resource.dynamicIndexSource));
+          hash = bit::fnv1a_iter(
+              hash, uint32_t(resource.dynamicIndexBackedByResourceKeepAlive));
           hash = appendSubmitPermutationPointerHash(
               hash, resource.ownedDynamicIndices.get());
           if (resource.ownedDynamicIndices != nullptr) {
@@ -29393,6 +29420,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               ag.dynamicIndexHash == bg.dynamicIndexHash &&
               ag.dynamicPrimitiveBaseIndex == bg.dynamicPrimitiveBaseIndex &&
               ag.dynamicIndexSource == bg.dynamicIndexSource &&
+              ag.dynamicIndexBackedByResourceKeepAlive ==
+                  bg.dynamicIndexBackedByResourceKeepAlive &&
               bool(ag.ownedDynamicIndices) ==
                   bool(bg.ownedDynamicIndices) &&
               (!ag.ownedDynamicIndices ||

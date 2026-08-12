@@ -80,8 +80,14 @@ class DirectExactManifestHandoffContracts(unittest.TestCase):
             self.grouped,
         )
         self.assertIn(
-            "exactSubmittedManifestRecords.begin(),\n"
-            "      exactSubmittedManifestRecords.end()",
+            "publishShadowManifestSummary(exactSubmittedManifestRecords,\n"
+            "                               shadowEligibleManifestRecords)",
+            self.grouped,
+        )
+        self.assertNotIn(
+            "shadowEligibleManifestRecords.insert(\n"
+            "      shadowEligibleManifestRecords.end(),\n"
+            "      exactSubmittedManifestRecords.begin()",
             self.grouped,
         )
 
