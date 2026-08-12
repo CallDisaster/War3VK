@@ -7329,6 +7329,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             directCurrentDrawSample.paletteCount;
         outDirectCurrentDrawSample->paletteHash =
             directCurrentDrawSample.paletteHash;
+        outDirectCurrentDrawSample->paletteProvenance =
+            directCurrentDrawSample.paletteProvenance;
         // The packet becomes the sole owner of decoded palette/group payload.
         // Callers only need the sample's immutable contract and hashes once
         // packetAuthoritativeSkinnedContractReady is true. Keeping a second
@@ -22176,6 +22178,10 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           ? packet.runtimeGroupPaletteMaxFrameTag
           : currentDrawSample != nullptr ? currentDrawSample->contract.frameTag
                                          : 0u;
+  const auto drawTimeCapturedPaletteProvenance =
+      currentDrawSample != nullptr
+          ? currentDrawSample->paletteProvenance
+          : dxvk::war3::render::PaletteProvenance::Unknown;
   // Phase 7.35 路径 2：submit 端 live palette rebuild。
   // 背景：Phase 7.35 诊断 counter 证实 50.2% 的 submit 在用 >=1 帧旧的 palette
   // （Lag>=1），其中 Lag>=3 占 38.2%，视觉上对应"Pose 停一下再追帧"。
@@ -22238,13 +22244,24 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           dxvk::war3::state::RenderState::instance().getFrameIndex());
       const uint64_t recordFrame =
           uint64_t(currentDrawSample->contract.renderFrameIndex);
+      uint32_t currentPaletteFrameTag = 0u;
+      const bool capturedPaletteCurrentFrameProven =
+          drawTimeCapturedPaletteProvenance ==
+              dxvk::war3::render::PaletteProvenance::TrustedBlendedWriter &&
+          drawTimeCapturedPaletteMinFrameTag != 0u &&
+          drawTimeCapturedPaletteMinFrameTag ==
+              drawTimeCapturedPaletteMaxFrameTag &&
+          dxvk::war3::model::QueryCurrentPaletteFrameTag(
+              currentPaletteFrameTag) &&
+          currentPaletteFrameTag == drawTimeCapturedPaletteMinFrameTag;
       // Phase 7.51：改为 (EveryFrame OR LagExceedsThreshold)。
       // EveryFrame=1（默认）时即使 lag=0 也尝试 rebuild，用 hash 对比决定是否覆盖。
       const bool shouldAttempt =
-          kSubmitLiveRebuildEveryFrame ||
-          (currentFrame > recordFrame &&
-           (currentFrame - recordFrame) >=
-               uint64_t(kSubmitLiveRebuildLagThreshold));
+          !capturedPaletteCurrentFrameProven &&
+          (kSubmitLiveRebuildEveryFrame ||
+           (currentFrame > recordFrame &&
+            (currentFrame - recordFrame) >=
+                uint64_t(kSubmitLiveRebuildLagThreshold)));
       if (shouldAttempt) {
         dxvk::war3::render::NoteSubmitLiveRebuildAttempt();
         submitLiveRebuildScratchTls.clear();
