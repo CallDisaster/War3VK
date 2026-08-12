@@ -26108,53 +26108,36 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           .semanticSceneDirectCurrentDrawLayerIndexNonZeroCount++;
   }
 
-  const auto currentFrameDrawTimeProducerEntry =
-      [&](const dxvk::war3::render::CurrentDrawContractRecord& record)
-          -> const War3DrawTimeVBEntry* {
-        const int16_t effectiveProducerStage =
-            record.producerStage >= 0 ? record.producerStage : record.stage;
-        if (!War3DrawTimeCurrentFrameGeometryRuntime() ||
-            effectiveProducerStage != 11 || record.renderablePart == nullptr ||
-            !War3CurrentDrawContractNamesExactSlice(
-                record.renderablePart, record.layerIndex, record)) {
-          return nullptr;
-        }
-        const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
-            record.renderablePart, record.layerIndex, &record,
-            m_war3GpuSkinMapEpoch);
-        const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
-        if (vbIt == m_war3DrawTimeVBCache.end() ||
-            !vbIt->second.MatchesKey(cacheKey) ||
-            vbIt->second.frameSerial != m_war3ShadowPersistentFrameSerial ||
-            vbIt->second.exactOwnerFrameSerial !=
-                m_war3ShadowPersistentFrameSerial) {
-          return nullptr;
-        }
-        return &vbIt->second;
-      };
   const auto currentFrameDrawTimeProducerOwnsRecord =
       [&](const dxvk::war3::render::CurrentDrawContractRecord& record) {
         const int16_t effectiveProducerStage =
             record.producerStage >= 0 ? record.producerStage : record.stage;
-        if (War3DrawTimeCurrentFrameGeometryRuntime() &&
-            effectiveProducerStage == 11 &&
-            record.renderablePart != nullptr) {
-          const War3DrawTimeVBCacheKey cacheKey =
-              War3MakeDrawTimeVBCacheKey(
-                  record.renderablePart, record.layerIndex, &record,
-                  m_war3GpuSkinMapEpoch);
-          if (War3DrawTimeAnonymousMarkerRejectionActive(
-                  record.renderablePart, record.meshPayloadPtr,
-                  record.layerIndex)) {
-            return true;
-          }
-          if (War3CurrentDrawContractNamesExactSlice(
-                  record.renderablePart, record.layerIndex, record) &&
-              War3DrawTimeExactRejectedCurrentFrame(cacheKey)) {
-            return true;
-          }
-        }
-        return currentFrameDrawTimeProducerEntry(record) != nullptr;
+        if (!War3DrawTimeCurrentFrameGeometryRuntime() ||
+            effectiveProducerStage != 11 || record.renderablePart == nullptr)
+          return false;
+        if (War3DrawTimeAnonymousMarkerRejectionActive(
+                record.renderablePart, record.meshPayloadPtr,
+                record.layerIndex))
+          return true;
+        if (!War3CurrentDrawContractNamesExactSlice(
+                record.renderablePart, record.layerIndex, record))
+          return false;
+
+        // Exact rejection and exact ownership use the same immutable key.
+        // Probe them together so SnapshotPreselect does not rebuild/hash the
+        // key and look up the current-frame cache twice for every Stage11
+        // record.
+        const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
+            record.renderablePart, record.layerIndex, &record,
+            m_war3GpuSkinMapEpoch);
+        if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
+          return true;
+        const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
+        return vbIt != m_war3DrawTimeVBCache.end() &&
+            vbIt->second.MatchesKey(cacheKey) &&
+            vbIt->second.frameSerial == m_war3ShadowPersistentFrameSerial &&
+            vbIt->second.exactOwnerFrameSerial ==
+                m_war3ShadowPersistentFrameSerial;
       };
 
   struct DirectObjectCompletenessBucket {

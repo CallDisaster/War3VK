@@ -1098,7 +1098,7 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
 
         current_owner = source_block(
             self.grouped,
-            "const auto currentFrameDrawTimeProducerEntry =",
+            "const auto currentFrameDrawTimeProducerOwnsRecord =",
             "struct DirectObjectCompletenessBucket",
         )
         self.assertIn(
