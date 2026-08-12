@@ -8448,12 +8448,20 @@ bool War3TryBuildLiveRuntimeGroupPalette(
       uint32_t slotMinFrameTag = 0u;
       uint32_t slotMaxFrameTag = 0u;
       uint32_t slotMissingCount = 0u;
-      buildTiming.enter(War3LivePaletteBuildPhase::FrameTagQuery);
-      const bool slotFrameTagReady =
-          dxvk::war3::model::QueryBlendedPaletteFrameTagRange(
-              slotIndex, requiredPaletteCount, slotMinFrameTag,
-              slotMaxFrameTag, slotMissingCount);
+      bool slotFrameTagQueried = false;
+      bool slotFrameTagReady = false;
+      auto ensureSlotFrameTags = [&]() {
+        if (slotFrameTagQueried)
+          return;
+        slotFrameTagQueried = true;
+        buildTiming.enter(War3LivePaletteBuildPhase::FrameTagQuery);
+        slotFrameTagReady =
+            dxvk::war3::model::QueryBlendedPaletteFrameTagRange(
+                slotIndex, requiredPaletteCount, slotMinFrameTag,
+                slotMaxFrameTag, slotMissingCount);
+      };
       auto publishSlotFrameTags = [&]() {
+        ensureSlotFrameTags();
         if (!slotFrameTagReady)
           return;
         if (outPaletteMinFrameTag != nullptr)
