@@ -21548,6 +21548,16 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
     const dxvk::war3::render::CurrentDrawAuthoritativeSample*
         directCurrentDrawSample,
     bool fromStalePoseRestore) {
+  return War3TryAppendSemanticShadowPacket(
+      packet, directCurrentDrawSample, fromStalePoseRestore, false);
+}
+
+bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
+    const dxvk::war3::shadow::ShadowDrawPacket& packet,
+    const dxvk::war3::render::CurrentDrawAuthoritativeSample*
+        directCurrentDrawSample,
+    bool fromStalePoseRestore,
+    bool currentFrameExactOwnerPrefiltered) {
   if (!m_war3ShadowSessionReady.load(std::memory_order_acquire) ||
       m_war3ShadowMapResetRequestedSerial.load(std::memory_order_acquire) !=
           m_war3ShadowMapResetAppliedSerial ||
@@ -21575,7 +21585,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   // remove exact-owned Stage11 records earlier, but a restored/alternate
   // caller must not append a generic representation for the same logical
   // slice after the current-frame producer has claimed it.
-  if (War3DrawTimeCurrentFrameGeometryRuntime() &&
+  if (!currentFrameExactOwnerPrefiltered &&
+      War3DrawTimeCurrentFrameGeometryRuntime() &&
       directCurrentDrawSample != nullptr) {
     const auto& contract = directCurrentDrawSample->contract;
     const int16_t effectiveProducerStage =
@@ -26735,6 +26746,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // BuildPacket 的 bind-pose/palette 数据层构建。该 packet 只供 fast append
     // 消费，不允许写入跨帧 part lease。
     bool fromDrawTimePrebuildBypass = false;
+    // The grouped preselector already queried the current-frame exact Stage11
+    // ownership contract for this record. Nothing between preselection and
+    // append mutates that render-thread-owned table, so the final append gate
+    // need not rebuild the key and repeat the same negative cache lookup.
+    // Restored leases and sealed development work never receive this proof.
+    bool currentFrameExactOwnerPrefiltered = false;
     // The units-only direct eligibility gate duplicates the complete dynamic
     // unit evidence contract (apart from the explicit transparent-queue
     // predicate recorded below). Carry that already-proved diagnostic fact
@@ -27250,6 +27267,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       }
     }
     EligibleRecord eligible = {};
+    eligible.currentFrameExactOwnerPrefiltered =
+        recordsForBuildCanonicalPrefiltered && !useSealedWork;
     // Completeness buckets are development-only diagnostics. The canonical
     // object key normally requires an exact VisibleRenderable lookup, which
     // the grouped preselector has already performed. Do not repeat that
@@ -28839,7 +28858,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       if (traceSample)
         fallbackAppendTrace.arm(submitAppendTracePeriod);
       appended = War3TryAppendSemanticShadowPacket(
-          eligible.packet, &eligible.sample, eligible.fromStalePoseRestore);
+          eligible.packet, &eligible.sample, eligible.fromStalePoseRestore,
+          eligible.currentFrameExactOwnerPrefiltered);
       if (traceSample)
         fallbackAppendTrace.disarm();
     }

@@ -3047,6 +3047,12 @@ private:
       const dxvk::war3::render::CurrentDrawAuthoritativeSample*
           directCurrentDrawSample,
       bool fromStalePoseRestore);
+  bool War3TryAppendSemanticShadowPacket(
+      const dxvk::war3::shadow::ShadowDrawPacket& packet,
+      const dxvk::war3::render::CurrentDrawAuthoritativeSample*
+          directCurrentDrawSample,
+      bool fromStalePoseRestore,
+      bool currentFrameExactOwnerPrefiltered);
   void War3MarkDrawTimeExactRejectedCurrentFrame(
       const War3DrawTimeVBCacheKey& key);
   void War3RecordRequiredCasterOmission(
