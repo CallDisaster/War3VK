@@ -32,22 +32,25 @@ class DirectPreselectedVisibleHandoffStaticTests(unittest.TestCase):
         copy = selector.index("*outVisibleHint = visible", query)
         self.assertLess(query, copy)
 
-    def test_hint_storage_is_current_call_scratch_indexed_by_record(self) -> None:
+    def test_hint_storage_is_dense_current_call_value_scratch(self) -> None:
         start = DEVICE.index(
             "static thread_local std::vector<uint32_t> s_recordIndicesForBuild"
         )
         end = DEVICE.index("// --- Step 2: build eligible record list", start)
         block = DEVICE[start:end]
         for token in (
-            "s_recordVisibleHintsByIndex",
-            "s_recordVisibleHintValidByIndex",
-            "recordVisibleHintValidByIndex.clear()",
-            "recordVisibleHintsByIndex.resize(directRecords.size())",
-            "recordVisibleHintValidByIndex.assign(directRecords.size(), uint8_t(0u))",
-                "record, &visibleHint, &visiblePartLayerQueryCache",
-            "recordVisibleHintsByIndex[recordIndex] = visibleHint",
+            "s_preselectedVisibleHints",
+            "s_recordVisibleHintIndicesForBuild",
+            "preselectedVisibleHints.clear()",
+            "recordVisibleHintIndicesForBuild.clear()",
+            "record, &visibleHint, &visiblePartLayerQueryCache",
+            "preselectedVisibleHints.push_back(std::move(visibleHint))",
+            "preselectedRecords[i].visibleHintIndex",
         ):
             self.assertIn(token, block)
+        self.assertNotIn(
+            "recordVisibleHintsByIndex.resize(directRecords.size())", block
+        )
 
     def test_builder_uses_matching_hint_and_keeps_canonical_fallback(self) -> None:
         builder = function_body(
@@ -74,7 +77,10 @@ class DirectPreselectedVisibleHandoffStaticTests(unittest.TestCase):
         self.assertIn("preselectedVisibleRecord", call_block)
         fallback = DEVICE.index('enterDirectDetailPhase("SnapshotFallbackCopy")')
         fallback_end = DEVICE.index("// --- Step 2: build eligible record list", fallback)
-        self.assertNotIn("recordVisibleHintValidByIndex.assign", DEVICE[fallback:fallback_end])
+        self.assertIn(
+            "recordVisibleHintIndicesForBuild.assign(directRecords.size(), UINT32_MAX)",
+            DEVICE[fallback:fallback_end],
+        )
 
 
 if __name__ == "__main__":

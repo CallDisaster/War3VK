@@ -26552,15 +26552,18 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   static thread_local std::vector<uint64_t> s_recordSelectionKeysForBuild;
   static thread_local std::vector<
       dxvk::war3::render::VisibleRenderableRecord>
-      s_recordVisibleHintsByIndex;
-  static thread_local std::vector<uint8_t> s_recordVisibleHintValidByIndex;
+      s_preselectedVisibleHints;
+  static thread_local std::vector<uint32_t>
+      s_recordVisibleHintIndicesForBuild;
   auto& recordIndicesForBuild = s_recordIndicesForBuild;
   auto& recordSelectionKeysForBuild = s_recordSelectionKeysForBuild;
-  auto& recordVisibleHintsByIndex = s_recordVisibleHintsByIndex;
-  auto& recordVisibleHintValidByIndex = s_recordVisibleHintValidByIndex;
+  auto& preselectedVisibleHints = s_preselectedVisibleHints;
+  auto& recordVisibleHintIndicesForBuild =
+      s_recordVisibleHintIndicesForBuild;
   recordIndicesForBuild.clear();
   recordSelectionKeysForBuild.clear();
-  recordVisibleHintValidByIndex.clear();
+  preselectedVisibleHints.clear();
+  recordVisibleHintIndicesForBuild.clear();
   const War3CompactWorkTableMode compactWorkTableMode =
       War3SemanticCompactWorkTableModeRuntime();
   const bool observeCompactWorkTable =
@@ -26681,10 +26684,15 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   bool recordsForBuildCanonicalPrefiltered = false;
   if (useObjectGrouped && directRecordCap != 0u) {
     enterDirectDetailPhase("PreselectScan");
-    recordVisibleHintsByIndex.resize(directRecords.size());
-    recordVisibleHintValidByIndex.assign(directRecords.size(), uint8_t(0u));
+    // Store only successful value snapshots. The old sparse array
+    // default-initialized one full VisibleRenderableRecord per raw record,
+    // including records rejected before BuildEligible. A compact index follows
+    // the candidate through sorting and final selection instead.
+    preselectedVisibleHints.reserve(rawRecordCount);
+    recordVisibleHintIndicesForBuild.reserve(directStickyRecordBudget);
     struct PreselectedRecord {
       uint32_t recordIndex = 0u;
+      uint32_t visibleHintIndex = UINT32_MAX;
       War3CompactWorkItem work = {};
       uint64_t selectionKey = 0u;
       uint32_t priorityScore = 0u;
@@ -26806,9 +26814,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           ? work.selectionKey
           : War3SemanticDirectRecordSelectionKey(
                 record, &visibleHint, &visiblePartLayerQueryCache);
+      uint32_t visibleHintIndex = UINT32_MAX;
       if (!useSealedWork && visibleHint.renderablePart == record.renderablePart) {
-        recordVisibleHintsByIndex[recordIndex] = visibleHint;
-        recordVisibleHintValidByIndex[recordIndex] = uint8_t(1u);
+        visibleHintIndex = uint32_t(preselectedVisibleHints.size());
+        preselectedVisibleHints.push_back(std::move(visibleHint));
       }
       const uint32_t priorityScore = useSealedWork
           ? work.priorityScore
@@ -26827,6 +26836,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       }
       preselectedRecords.push_back(
           {recordIndex,
+           visibleHintIndex,
            work,
            selectionKey,
            priorityScore,
@@ -26912,6 +26922,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         recordIndicesForBuild.push_back(preselectedRecords[i].recordIndex);
         recordSelectionKeysForBuild.push_back(
             preselectedRecords[i].selectionKey);
+        recordVisibleHintIndicesForBuild.push_back(
+            preselectedRecords[i].visibleHintIndex);
         if (compactWorkTableMode != War3CompactWorkTableMode::Off)
           m_war3CompactWorkTable.append(preselectedRecords[i].work);
       }
@@ -26961,6 +26973,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // Zero means the uncapped fallback did not run the grouped preselector;
     // BuildEligible retains its historical on-demand identity resolution.
     recordSelectionKeysForBuild.assign(directRecords.size(), 0u);
+    recordVisibleHintIndicesForBuild.assign(directRecords.size(), UINT32_MAX);
   }
 
   // --- Step 2: build eligible record list (per-record filtering) ---
@@ -27473,11 +27486,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     if (recordIndex >= directRecords.size())
       continue;
     const auto& record = directRecords[recordIndex];
+    const uint32_t preselectedVisibleHintIndex =
+        buildIndex < recordVisibleHintIndicesForBuild.size()
+        ? recordVisibleHintIndicesForBuild[buildIndex]
+        : UINT32_MAX;
     const dxvk::war3::render::VisibleRenderableRecord*
         preselectedVisibleRecord =
-            recordIndex < recordVisibleHintValidByIndex.size() &&
-                recordVisibleHintValidByIndex[recordIndex] != 0u
-            ? &recordVisibleHintsByIndex[recordIndex]
+            preselectedVisibleHintIndex < preselectedVisibleHints.size()
+            ? &preselectedVisibleHints[preselectedVisibleHintIndex]
             : nullptr;
     const uint64_t preselectedRecordSelectionKey =
         buildIndex < recordSelectionKeysForBuild.size()
