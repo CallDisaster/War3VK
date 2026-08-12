@@ -50,8 +50,10 @@ assert "std::array<Entry, kEntryCount> m_entries" in cache
 assert "unordered_map" not in cache
 assert "thread_local" not in cache
 assert "registry.mutationGeneration()" in cache
+assert cache.count("registry.mutationGeneration()") >= 3
 assert "(currentGeneration & 1u) == 0u" in cache
 assert "observedGeneration == publishedGeneration" in cache
+assert "registry.mutationGeneration() == currentGeneration" in cache
 
 builder = body(DEVICE, "bool War3TryBuildShadowPacketFromCurrentDrawRecord(")
 assert "shadowObjectSnapshotCache->find" in builder

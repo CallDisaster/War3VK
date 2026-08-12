@@ -5757,9 +5757,13 @@ public:
         entry.sceneNode == sceneNode && entry.unitPtr == unitPtr &&
         entry.worldObjectEntry == worldObjectEntry &&
         entry.runtimeModelPtr == runtimeModelPtr) {
-      out = entry.value;
-      ++m_hitCount;
-      return entry.found;
+      const auto cachedValue = entry.value;
+      const bool cachedFound = entry.found;
+      if (registry.mutationGeneration() == currentGeneration) {
+        out = cachedValue;
+        ++m_hitCount;
+        return cachedFound;
+      }
     }
 
     uint64_t observedGeneration = 0u;
@@ -5835,9 +5839,13 @@ public:
         entry.sceneNode == sceneNode && entry.jHandle == jHandle &&
         entry.primaryRuntimeModelPtr == primaryRuntimeModelPtr &&
         entry.secondaryRuntimeModelPtr == secondaryRuntimeModelPtr) {
-      out = entry.value;
-      ++m_hitCount;
-      return entry.found;
+      const auto cachedValue = entry.value;
+      const bool cachedFound = entry.found;
+      if (registry.mutationGeneration() == currentGeneration) {
+        out = cachedValue;
+        ++m_hitCount;
+        return cachedFound;
+      }
     }
 
     uint64_t observedGeneration = 0u;
