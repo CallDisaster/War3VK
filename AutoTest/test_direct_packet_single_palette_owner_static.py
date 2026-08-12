@@ -22,7 +22,19 @@ class DirectPacketSinglePaletteOwnerStaticTests(unittest.TestCase):
         )
         self.assertIn(
             "resource.ownedVertexGroupIndices =\n"
-            "            std::move(directCurrentDrawSample.groupSlots)",
+            "              std::move(directCurrentDrawSample.groupSlots)",
+            block,
+        )
+        self.assertIn(
+            "if (directCurrentDrawSample.groupSlotsBorrowedFromImmutableHint)",
+            block,
+        )
+        self.assertIn(
+            "resource.currentDrawGroupSlotsBackedByResourceKeepAlive = true",
+            block,
+        )
+        self.assertIn(
+            "if (!War3PacketResourceHasImmutableCurrentDrawGroupSlots(resource))",
             block,
         )
         self.assertNotIn(

@@ -32,6 +32,7 @@
 #include "war3/render/war3_visible_renderables.h"
 #include "war3/render/war3_canonical_draw.h"
 #include "war3/render/war3_current_draw_contract.h"
+#include "war3/render/war3_immutable_group_slot_binding.h"
 #include "war3/render/war3_current_draw_group_slot_summary.h"
 #include "war3/render/war3_direct_packet_scratch.h"
 #include "war3/render/war3_lightning_runtime.h"
@@ -5088,6 +5089,38 @@ using War3DirectPacketGeosetCache =
     std::unordered_map<void*,
                        std::shared_ptr<const War3DirectPacketGeosetRecord>>;
 
+bool War3PacketResourceHasImmutableCurrentDrawGroupSlots(
+    const dxvk::war3::shadow::ShadowPacketResource& resource) {
+  if (!resource.currentDrawGroupSlotsBackedByResourceKeepAlive ||
+      resource.resourceKeepAlive == nullptr ||
+      resource.vertexGroupIndices == nullptr) {
+    return false;
+  }
+
+  const auto* owner = static_cast<const War3DirectPacketGeosetRecord*>(
+      resource.resourceKeepAlive.get());
+  if (owner == nullptr)
+    return false;
+
+  const dxvk::war3::render::ImmutableGroupSlotBindingProof proof = {
+      resource.currentDrawGroupSlotsBackedByResourceKeepAlive,
+      owner->readyForShadowConsumer(),
+      resource.resourceKeepAlive.get(),
+      owner,
+      resource.vertexGroupIndices,
+      &owner->vertexGroupIndices,
+      resource.mapEpoch,
+      owner->mapEpoch,
+      resource.immutableModelGeneration,
+      owner->immutableModelGeneration,
+      resource.geosetIndex,
+      owner->geosetIndex,
+      resource.vertexCount,
+      owner->vertexGroupIndices.size(),
+  };
+  return dxvk::war3::render::ValidateImmutableGroupSlotBinding(proof);
+}
+
 // Phase 7.76：从 std::mutex 切到 shared_mutex 让 Find 走 shared_lock，
 // 同帧 BuildPacket 的并发 lookup 不再相互排队。Get 的 read-only 命中分支也
 // 走 shared，只有 cache miss/insert 才升级到 unique_lock。
@@ -7386,16 +7419,18 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             directCurrentDrawSample.paletteHash;
         outDirectCurrentDrawSample->paletteProvenance =
             directCurrentDrawSample.paletteProvenance;
-        // The packet becomes the sole owner of decoded palette/group payload.
-        // Callers only need the sample's immutable contract and hashes once
-        // packetAuthoritativeSkinnedContractReady is true. Keeping a second
-        // vector copy here charged BuildEligible for every skinned record and
-        // duplicated the same bytes again inside part-lease records.
-        outDirectCurrentDrawSample->groupHash = directCurrentDrawSample.groupHash;
+        // The packet owns the decoded palette and either owns group bytes or
+        // retains their exact immutable geoset owner. Callers only need the
+        // sample's immutable contract, provenance and hashes once that packet
+        // authority is proven.
+        outDirectCurrentDrawSample->groupHash =
+            directCurrentDrawSample.groupHash;
         outDirectCurrentDrawSample->stableGroupHash =
             directCurrentDrawSample.stableGroupHash;
         outDirectCurrentDrawSample->maxGroupSlot =
             directCurrentDrawSample.maxGroupSlot;
+        outDirectCurrentDrawSample->groupSlotsBorrowedFromImmutableHint =
+            directCurrentDrawSample.groupSlotsBorrowedFromImmutableHint;
         outDirectCurrentDrawSample->status = directCurrentDrawSample.status;
       }
       out.runtimeGroupPalette = std::move(directCurrentDrawSample.palette);
@@ -7408,9 +7443,22 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
           directCurrentDrawSample.contract.frameTag;
       out.hasRuntimeGroupPalette = true;
       if (directGroupSlotsReady) {
-        resource.ownedVertexGroupIndices =
-            std::move(directCurrentDrawSample.groupSlots);
-        resource.vertexGroupIndices = &resource.ownedVertexGroupIndices;
+        if (directCurrentDrawSample.groupSlotsBorrowedFromImmutableHint) {
+          resource.currentDrawGroupSlotsBackedByResourceKeepAlive = true;
+          // Keep the historical owned representation if any packet field does
+          // not prove the exact retained owner. The immutable match avoided a
+          // decode copy, so materialize only on this rare proof failure.
+          if (!War3PacketResourceHasImmutableCurrentDrawGroupSlots(resource)) {
+            resource.currentDrawGroupSlotsBackedByResourceKeepAlive = false;
+            resource.ownedVertexGroupIndices.assign(
+                geo.vertexGroupIndices.begin(), geo.vertexGroupIndices.end());
+            resource.vertexGroupIndices = &resource.ownedVertexGroupIndices;
+          }
+        } else {
+          resource.ownedVertexGroupIndices =
+              std::move(directCurrentDrawSample.groupSlots);
+          resource.vertexGroupIndices = &resource.ownedVertexGroupIndices;
+        }
       }
     } else if (liveRebuildUsed && !liveRebuiltPalette.empty()) {
       // Phase 7.50：Resolve 不 Ready 但 live rebuild 成功，用 fresh palette 组装。
@@ -7712,7 +7760,8 @@ bool War3LooksSubmitEligibleForDirectCurrentDrawFast(
           : uint32_t(packet.resource.positionVec().size() / 3u);
   if (vertexCount == 0u || !packet.hasRuntimeGroupPalette ||
       packet.runtimeGroupPalette.empty() ||
-      packet.resource.ownedVertexGroupIndices.size() < size_t(vertexCount)) {
+      (packet.resource.ownedVertexGroupIndices.size() < size_t(vertexCount) &&
+       !War3PacketResourceHasImmutableCurrentDrawGroupSlots(packet.resource))) {
     return false;
   }
   if (renderable.groupIdx > 0)
@@ -22019,6 +22068,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       ownedDynamicIndices != nullptr && !ownedDynamicIndices->empty();
   const bool hasImmutableDynamicIndexStream =
       War3PacketResourceHasImmutableDynamicIndexSlice(packet.resource);
+  const bool hasImmutableCurrentDrawGroupSlots =
+      War3PacketResourceHasImmutableCurrentDrawGroupSlots(packet.resource);
   const bool hasDynamicPositionStream =
       packet.usesDynamicMeshPositions &&
       packet.resource.dynamicPositionStream != nullptr &&
@@ -22080,7 +22131,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
         directAuthoritativeCurrentDrawReady &&
         War3SemanticPacketUsesDirectGeosetData(packet) &&
         packet.hasRuntimeGroupPalette &&
-        packet.resource.ownedVertexGroupIndices.size() >= size_t(vertexCount);
+        (packet.resource.ownedVertexGroupIndices.size() >= size_t(vertexCount) ||
+         hasImmutableCurrentDrawGroupSlots);
     if (skinned && hasLiveVisibleMeshContext && !hasDynamicIndexStream &&
         !packetIndices.empty() &&
         War3SemanticRequireVisibleIndexSliceForSkinnedRuntime() &&
@@ -22177,7 +22229,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
   void* liveRuntimePoseModelPtr = nullptr;
   const bool packetAuthoritativeSkinnedContractReady =
       skinned && packet.hasRuntimeGroupPalette &&
-      packet.resource.ownedVertexGroupIndices.size() >= size_t(vertexCount);
+      (packet.resource.ownedVertexGroupIndices.size() >= size_t(vertexCount) ||
+       hasImmutableCurrentDrawGroupSlots);
   dxvk::war3::render::CurrentDrawAuthoritativeSample currentDrawSampleStorage =
       {};
   const dxvk::war3::render::CurrentDrawAuthoritativeSample*
@@ -22377,7 +22430,7 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
       War3FallbackAppendPhase::InputGroupContract);
   const std::vector<uint8_t>* authoritativeGroupSlots =
       packetAuthoritativeSkinnedContractReady
-          ? &packet.resource.ownedVertexGroupIndices
+          ? packet.resource.vertexGroupIndices
           : currentDrawSample != nullptr ? &currentDrawSample->groupSlots
                                          : nullptr;
   // BuildPacket and Append receive the same authoritative sample as one
@@ -22394,8 +22447,8 @@ bool D3D9DeviceEx::War3TryAppendSemanticShadowPacket(
           ? sealedCurrentDrawGroupHash != 0u
               ? sealedCurrentDrawGroupHash
               : bit::fnv1a_hash(
-                    packet.resource.ownedVertexGroupIndices.data(),
-                    packet.resource.ownedVertexGroupIndices.size())
+                    authoritativeGroupSlots->data(),
+                    authoritativeGroupSlots->size())
           : sealedCurrentDrawGroupHash;
   // Phase 7.2: stable group hash（不含 stream1Ptr），用于 geometry key 稳定身份
   const uint64_t authoritativeStableGroupHash =
@@ -27151,7 +27204,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       return false;
     }
     if (!packet.hasRuntimeGroupPalette || packet.runtimeGroupPalette.empty() ||
-        packet.resource.ownedVertexGroupIndices.empty()) {
+        (packet.resource.ownedVertexGroupIndices.empty() &&
+         !War3PacketResourceHasImmutableCurrentDrawGroupSlots(
+             packet.resource))) {
       stats.semanticSceneDirectPartLeaseRejectedNotSelfContainedCount++;
       stats.semanticSceneShadowManifestPartLeaseRejectedNotSelfContainedCount++;
       return false;
@@ -29569,6 +29624,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               hash, uint32_t(resource.dynamicIndexSource));
           hash = bit::fnv1a_iter(
               hash, uint32_t(resource.dynamicIndexBackedByResourceKeepAlive));
+          hash = bit::fnv1a_iter(
+              hash,
+              uint32_t(
+                  resource.currentDrawGroupSlotsBackedByResourceKeepAlive));
           hash = appendSubmitPermutationPointerHash(
               hash, resource.ownedDynamicIndices.get());
           if (resource.ownedDynamicIndices != nullptr) {
@@ -29658,6 +29717,10 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           hash = bit::fnv1a_iter(hash, eligible.sample.paletteHash);
           hash = appendSubmitPermutationVectorHash(
               hash, eligible.sample.groupSlots);
+          hash = bit::fnv1a_iter(
+              hash,
+              uint32_t(
+                  eligible.sample.groupSlotsBorrowedFromImmutableHint));
           hash = bit::fnv1a_iter(hash, eligible.sample.groupHash);
           hash = bit::fnv1a_iter(hash, eligible.sample.stableGroupHash);
           hash = bit::fnv1a_iter(
@@ -29827,6 +29890,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               ag.dynamicIndexSource == bg.dynamicIndexSource &&
               ag.dynamicIndexBackedByResourceKeepAlive ==
                   bg.dynamicIndexBackedByResourceKeepAlive &&
+              ag.currentDrawGroupSlotsBackedByResourceKeepAlive ==
+                  bg.currentDrawGroupSlotsBackedByResourceKeepAlive &&
               bool(ag.ownedDynamicIndices) ==
                   bool(bg.ownedDynamicIndices) &&
               (!ag.ownedDynamicIndices ||
@@ -29910,6 +29975,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               a.sample.paletteHash == b.sample.paletteHash &&
               submitPermutationVectorsEqual(
                   a.sample.groupSlots, b.sample.groupSlots) &&
+              a.sample.groupSlotsBorrowedFromImmutableHint ==
+                  b.sample.groupSlotsBorrowedFromImmutableHint &&
               a.sample.groupHash == b.sample.groupHash &&
               a.sample.stableGroupHash == b.sample.stableGroupHash &&
               a.sample.status == b.sample.status &&

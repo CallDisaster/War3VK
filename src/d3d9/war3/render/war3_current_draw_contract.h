@@ -129,6 +129,10 @@ struct CurrentDrawAuthoritativeSample {
   uint64_t groupHash = 0u;         // 诊断 hash（含 stream1Ptr）
   uint64_t stableGroupHash = 0u;   // 稳定 hash（不含 stream1Ptr），用于 geometry key
   uint32_t maxGroupSlot = 0u;      // 与 group hash 在同一次验证遍历中生成
+  // True only when the complete current-draw stream matched a generation-
+  // backed immutable geoset byte-for-byte. The sample owns no bytes in this
+  // case; the packet must independently retain and validate that geoset.
+  bool groupSlotsBorrowedFromImmutableHint = false;
   CurrentDrawResolveStatus status = CurrentDrawResolveStatus::MissingContract;
   // Phase 1：palette bytes 的来源标记。
   PaletteProvenance paletteProvenance = PaletteProvenance::Unknown;
@@ -143,7 +147,7 @@ struct CurrentDrawAuthoritativeSample {
   }
 
   bool groupSlotsReady() const {
-    return !groupSlots.empty();
+    return groupSlotsBorrowedFromImmutableHint || !groupSlots.empty();
   }
 };
 
@@ -467,7 +471,8 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  const CurrentDrawRangeValidator* rangeValidator =
                                      nullptr,
                                  const CurrentDrawImmutableGroupSlotHint*
-                                     immutableHint = nullptr);
+                                     immutableHint = nullptr,
+                                 bool* outBorrowedImmutableHint = nullptr);
 
 /**
  * @brief Legacy diagnostic normalization for the raw +0x58 bind value.

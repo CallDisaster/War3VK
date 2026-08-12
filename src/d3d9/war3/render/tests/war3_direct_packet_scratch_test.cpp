@@ -29,6 +29,7 @@ bool testPacketReset() {
       reinterpret_cast<const uint16_t*>(uintptr_t(0x20u));
   packet.resource.dynamicIndexCount = 4u;
   packet.resource.dynamicIndexBackedByResourceKeepAlive = true;
+  packet.resource.currentDrawGroupSlotsBackedByResourceKeepAlive = true;
   packet.resource.resourceKeepAlive = std::make_shared<uint32_t>(17u);
   packet.resource.ownedDynamicIndices =
       std::make_shared<const std::vector<uint16_t>>(
@@ -75,8 +76,9 @@ bool testPacketReset() {
                   packet.resource.dynamicIndexStream == nullptr,
               "raw pointer alias survived reset") &&
       require(packet.resource.dynamicIndexCount == 0u &&
-                  !packet.resource.dynamicIndexBackedByResourceKeepAlive,
-              "dynamic index provenance survived reset") &&
+                  !packet.resource.dynamicIndexBackedByResourceKeepAlive &&
+                  !packet.resource.currentDrawGroupSlotsBackedByResourceKeepAlive,
+               "dynamic index provenance survived reset") &&
       require(!packet.resource.resourceKeepAlive &&
                   !packet.resource.ownedDynamicIndices,
               "shared owner survived reset") &&
@@ -114,6 +116,7 @@ bool testSampleReset() {
   sample.palette.emplace_back();
   sample.groupSlots.reserve(128u);
   sample.groupSlots.push_back(3u);
+  sample.groupSlotsBorrowedFromImmutableHint = true;
   sample.paletteCount = 1u;
   sample.paletteHash = 0x55u;
   sample.groupHash = 0x66u;
@@ -127,7 +130,9 @@ bool testSampleReset() {
                      sample.contract.renderablePart == nullptr,
                  "sample identity survived reset") &&
       require(sample.palette.empty() && sample.groupSlots.empty(),
-              "sample content survived reset") &&
+               "sample content survived reset") &&
+      require(!sample.groupSlotsBorrowedFromImmutableHint,
+              "sample immutable group-slot proof survived reset") &&
       require(sample.paletteCount == 0u && sample.paletteHash == 0u &&
                   sample.groupHash == 0u && sample.maxGroupSlot == 0u,
               "sample scalar state survived reset") &&

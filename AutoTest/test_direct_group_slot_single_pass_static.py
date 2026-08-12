@@ -35,7 +35,8 @@ assert "CurrentDrawGroupSlotSummary summary" in decode
 assert "summary.include(groupSlot)" in decode
 assert "immutableHint->matches(streamBase, vertexCount, paletteCount)" in decode
 assert decode.index("immutableHint->matches") < decode.index("for (uint32_t i = 0u; i < vertexCount; ++i)")
-assert "outGroupSlots.assign(immutableHint->bytes" in decode
+assert "*outBorrowedImmutableHint = true" in decode
+assert "else\n      outGroupSlots.assign(immutableHint->bytes" in decode
 assert "outStableGroupHash = summary.stableHash(" in decode
 assert "outMaxGroupSlot = summary.maxGroupSlot" in decode
 assert "ComputeStableGroupContentHash(out.contract, out.groupSlots)" not in resolve_record

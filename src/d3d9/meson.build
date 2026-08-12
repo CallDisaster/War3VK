@@ -392,6 +392,22 @@ test(
   timeout : 30,
 )
 
+# Immutable CurrentDraw group-slot aliases are accepted only when the packet's
+# retained generation-backed owner proves the exact pointer and full range.
+war3_immutable_group_slot_binding_test = executable(
+  'war3_immutable_group_slot_binding_test',
+  [
+    'war3/render/tests/war3_immutable_group_slot_binding_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_immutable_group_slot_binding',
+  war3_immutable_group_slot_binding_test,
+  timeout : 30,
+)
+
 # Byte-exact War3 palette 3x4 pack contract. The hot publish path writes this
 # representation directly instead of materializing an intermediate vector.
 war3_palette_pack_test = executable(

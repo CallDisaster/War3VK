@@ -2910,8 +2910,11 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
                                  const CurrentDrawResolveTrace* trace,
                                  const CurrentDrawRangeValidator* rangeValidator,
                                  const CurrentDrawImmutableGroupSlotHint*
-                                     immutableHint) {
+                                     immutableHint,
+                                 bool* outBorrowedImmutableHint) {
   outGroupSlots.clear();
+  if (outBorrowedImmutableHint != nullptr)
+    *outBorrowedImmutableHint = false;
   outGroupHash = 0u;
   outStableGroupHash = 0u;
   outMaxGroupSlot = 0u;
@@ -2961,8 +2964,11 @@ bool DecodeCurrentDrawGroupSlots(const CurrentDrawContractRecord& record,
     trace->note(CurrentDrawResolveTracePhase::GroupDecodeLoop);
   if (immutableHint != nullptr &&
       immutableHint->matches(streamBase, vertexCount, paletteCount)) {
-    outGroupSlots.assign(immutableHint->bytes,
-                         immutableHint->bytes + vertexCount);
+    if (outBorrowedImmutableHint != nullptr)
+      *outBorrowedImmutableHint = true;
+    else
+      outGroupSlots.assign(immutableHint->bytes,
+                           immutableHint->bytes + vertexCount);
     const CurrentDrawGroupSlotSummary summary = immutableHint->summary();
     outGroupHash = summary.diagnosticHash(
         reinterpret_cast<uintptr_t>(record.stream1Ptr),
@@ -3614,7 +3620,8 @@ CurrentDrawResolveStatus ResolveCurrentDrawAuthoritativeSampleFromRecord(
                                    out.groupSlots, out.groupHash,
                                    out.stableGroupHash, out.maxGroupSlot, trace,
                                    rangeValidator,
-                                   immutableGroupSlotHint)) {
+                                   immutableGroupSlotHint,
+                                   &out.groupSlotsBorrowedFromImmutableHint)) {
     out.status = CurrentDrawResolveStatus::MissingGroupSlots;
     return out.status;
   }
