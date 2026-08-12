@@ -6944,7 +6944,18 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
         directResolveStatus ==
             dxvk::war3::render::CurrentDrawResolveStatus::Ready &&
         out.hasRuntimeGroupPalette && !out.runtimeGroupPalette.empty()) {
-      dxvk::war3::shadow::ShadowPoseRecord explicitPose = pose;
+      // Explicit-blend resolution consumes the current authoritative group
+      // palette below.  Copying `pose` here first deep-copied its (potentially
+      // 256-matrix) fallback palette only to overwrite that vector on the next
+      // line.  Preserve the identical scalar identity/world-transform fields
+      // while leaving the redundant fallback payload out of this temporary.
+      dxvk::war3::shadow::ShadowPoseRecord explicitPose = {};
+      explicitPose.runtimeModelPtr = pose.runtimeModelPtr;
+      explicitPose.sceneNode = pose.sceneNode;
+      explicitPose.unitPtr = pose.unitPtr;
+      explicitPose.hasWorldTransform = pose.hasWorldTransform;
+      explicitPose.worldTransform = pose.worldTransform;
+      explicitPose.frameSerial = pose.frameSerial;
       explicitPose.matrixPalette = out.runtimeGroupPalette;
       explicitPose.matrixCount = uint32_t(out.runtimeGroupPalette.size());
       explicitPose.matrixHash = out.runtimeGroupPaletteHash;
