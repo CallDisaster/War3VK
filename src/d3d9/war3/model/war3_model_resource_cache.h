@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -187,6 +188,17 @@ struct ShadowModelResourceRecord {
   bool readyForShadowConsumer() const { return readyGeosetCount != 0; }
 };
 
+// ResourceStore alias binding only consumes these three scalar fields.  A
+// dedicated snapshot prevents that hot path from cloning the full model
+// record and its geoset pointer vectors merely to enumerate alias slots.
+struct ShadowModelAliasSnapshotRecord {
+  void* runtimeModelPtr = nullptr;
+  void* modelResourcePtr = nullptr;
+  uint32_t geosetCount = 0u;
+};
+
+static_assert(std::is_trivially_copyable_v<ShadowModelAliasSnapshotRecord>);
+
 // 基于 capacity 的账本刻意排除 unordered_map 的节点和桶开销。这里只统计重复
 // Game.dll 模型数据的自有载荷数组，采集时无需再次复制这些数组。
 struct ShadowModelResourceMemorySnapshot {
@@ -267,6 +279,9 @@ public:
   std::vector<ShadowGeosetResourceRecord> snapshotGeosets() const;
   std::vector<ShadowModelResourceRecord> snapshotModels() const;
   std::vector<ShadowModelResourceRecord> snapshotRuntimeModels() const;
+  std::vector<ShadowModelAliasSnapshotRecord> snapshotModelAliases() const;
+  std::vector<ShadowModelAliasSnapshotRecord>
+  snapshotRuntimeModelAliases() const;
   size_t geosetRecordCount() const;
   size_t readyGeosetCount() const;
   size_t modelResourceCount() const;

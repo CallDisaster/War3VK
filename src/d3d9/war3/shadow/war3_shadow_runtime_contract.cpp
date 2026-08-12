@@ -1268,7 +1268,8 @@ void SupplementPosesFromLiveCModels(
           kMaxDirectPoseAttemptsPerFrame) {
     constexpr size_t kColdStartSweepBudget = 64u;
     size_t coldStartAttempts = 0u;
-    for (const auto& runtimeRecord : resourceCache.snapshotRuntimeModels()) {
+    for (const auto& runtimeRecord :
+         resourceCache.snapshotRuntimeModelAliases()) {
       if (coldStartAttempts >= kColdStartSweepBudget)
         break;
       const size_t attemptsBefore = stats.directPoseSupplementAttemptCount;
@@ -3955,13 +3956,14 @@ void ShadowRuntimeContractCache::captureLiveState() {
       freshResources->add(ConvertGeoset(geoset, manifest.frameSerial));
 
     // 先补 modelResource->runtimeModel alias，再补纯 runtimeModel alias。
-    for (const auto& modelRecord : resourceCache.snapshotModels()) {
+    for (const auto& modelRecord : resourceCache.snapshotModelAliases()) {
       for (uint32_t i = 0; i < modelRecord.geosetCount; ++i) {
         freshResources->bindRuntimeModelAlias(modelRecord.runtimeModelPtr, i,
                                               modelRecord.modelResourcePtr);
       }
     }
-    for (const auto& runtimeRecord : resourceCache.snapshotRuntimeModels()) {
+    for (const auto& runtimeRecord :
+         resourceCache.snapshotRuntimeModelAliases()) {
       for (uint32_t i = 0; i < runtimeRecord.geosetCount; ++i) {
         freshResources->bindRuntimeModelAlias(runtimeRecord.runtimeModelPtr, i,
                                               runtimeRecord.modelResourcePtr);

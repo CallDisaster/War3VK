@@ -2165,6 +2165,32 @@ ShadowModelResourceCache::snapshotRuntimeModels() const {
   return out;
 }
 
+std::vector<ShadowModelAliasSnapshotRecord>
+ShadowModelResourceCache::snapshotModelAliases() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  std::vector<ShadowModelAliasSnapshotRecord> out;
+  out.reserve(m_byModelResource.size());
+  for (const auto& entry : m_byModelResource) {
+    const auto& record = entry.second;
+    out.push_back({record.runtimeModelPtr, record.modelResourcePtr,
+                   record.geosetCount});
+  }
+  return out;
+}
+
+std::vector<ShadowModelAliasSnapshotRecord>
+ShadowModelResourceCache::snapshotRuntimeModelAliases() const {
+  std::shared_lock<std::shared_mutex> lock(m_mutex);
+  std::vector<ShadowModelAliasSnapshotRecord> out;
+  out.reserve(m_byRuntimeModel.size());
+  for (const auto& entry : m_byRuntimeModel) {
+    const auto& record = entry.second;
+    out.push_back({record.runtimeModelPtr, record.modelResourcePtr,
+                   record.geosetCount});
+  }
+  return out;
+}
+
 size_t ShadowModelResourceCache::geosetRecordCount() const {
   std::shared_lock<std::shared_mutex> lock(m_mutex);
   size_t count = m_byGeoset.size();
