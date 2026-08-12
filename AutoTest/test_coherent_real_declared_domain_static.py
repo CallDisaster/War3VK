@@ -37,9 +37,9 @@ class CoherentRealDeclaredDomainStaticTest(unittest.TestCase):
         )
         self.assertIn("kCoherentRealIndexTrimDevelopmentEnabled", gate)
         self.assertIn("return false", gate)
-        self.assertIn(
-            'War3GetEnvU32("DXVK_WAR3_COHERENT_REAL_HINT_DOMAIN", 0u)', gate
-        )
+        self.assertIn('"DXVK_WAR3_COHERENT_REAL_HINT_DOMAIN"', gate)
+        self.assertIn("DefaultWar3CoherentRealHintDomainEnabled()", gate)
+        self.assertIn("kCoherentRealPerformanceCandidateEnabled = false", TRIM)
 
     def test_policy_checks_declared_raw_and_position_domains(self) -> None:
         body = function_body(POLICY, "War3ResolveTerrainIndexedDeclaredDomain(")

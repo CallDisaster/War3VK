@@ -3181,7 +3181,9 @@ War3CoherentRealIndexTrimModeRuntime() {
   if constexpr (!kCoherentRealIndexTrimDevelopmentEnabled)
     return War3CoherentRealIndexTrimMode::Off;
   static const auto s_mode = ParseWar3CoherentRealIndexTrimMode(
-      War3GetEnvU32("DXVK_WAR3_COHERENT_REAL_INDEX_TRIM_MODE", 0u));
+      War3GetEnvU32(
+          "DXVK_WAR3_COHERENT_REAL_INDEX_TRIM_MODE",
+          DefaultWar3CoherentRealIndexTrimConfiguredMode()));
   return s_mode;
 }
 
@@ -3199,7 +3201,10 @@ inline bool War3CoherentRealHintDomainRuntime() {
                     kCoherentRealIndexTrimDevelopmentEnabled)
     return false;
   static const bool s_enabled =
-      War3GetEnvU32("DXVK_WAR3_COHERENT_REAL_HINT_DOMAIN", 0u) == 1u;
+      War3GetEnvU32(
+          "DXVK_WAR3_COHERENT_REAL_HINT_DOMAIN",
+          dxvk::war3::memory::DefaultWar3CoherentRealHintDomainEnabled()
+              ? 1u : 0u) == 1u;
   return s_enabled;
 }
 

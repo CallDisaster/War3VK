@@ -238,7 +238,12 @@ endif
 if get_option('warvk_current_up_shadow_replay_dev')
   d3d9_cpp_args += [ '-DWARVK_ENABLE_CURRENT_UP_SHADOW_REPLAY_DEV=1' ]
 endif
-if get_option('warvk_coherent_real_index_trim_dev')
+if get_option('warvk_coherent_real_perf_candidate_dev')
+  d3d9_cpp_args += [
+    '-DWARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV=1',
+    '-DWARVK_ENABLE_COHERENT_REAL_PERF_CANDIDATE_DEV=1',
+  ]
+elif get_option('warvk_coherent_real_index_trim_dev')
   d3d9_cpp_args += [ '-DWARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV=1' ]
 endif
 if get_option('warvk_device_address_binding_report_dev')
@@ -831,6 +836,26 @@ war3_cpu_readable_buffer_span_test = executable(
 test(
   'war3_cpu_readable_buffer_span',
   war3_cpu_readable_buffer_span_test,
+  timeout : 30,
+)
+
+# Development-candidate policy test. The production/default D3D9 target never
+# receives these macros unless the dedicated Meson option is selected.
+war3_coherent_real_perf_candidate_policy_test = executable(
+  'war3_coherent_real_perf_candidate_policy_test',
+  [
+    'war3/memory/tests/war3_coherent_real_perf_candidate_policy_test.cpp',
+  ],
+  cpp_args            : [
+    '-DWARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV=1',
+    '-DWARVK_ENABLE_COHERENT_REAL_PERF_CANDIDATE_DEV=1',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_coherent_real_perf_candidate_policy',
+  war3_coherent_real_perf_candidate_policy_test,
   timeout : 30,
 )
 

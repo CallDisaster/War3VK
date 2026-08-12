@@ -18,6 +18,23 @@ inline constexpr bool kCoherentRealIndexTrimDevelopmentEnabled = true;
 inline constexpr bool kCoherentRealIndexTrimDevelopmentEnabled = false;
 #endif
 
+#if defined(WARVK_ENABLE_COHERENT_REAL_PERF_CANDIDATE_DEV) && \
+    WARVK_ENABLE_COHERENT_REAL_PERF_CANDIDATE_DEV && \
+    defined(WARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV) && \
+    WARVK_ENABLE_COHERENT_REAL_INDEX_TRIM_DEV
+inline constexpr bool kCoherentRealPerformanceCandidateEnabled = true;
+#else
+inline constexpr bool kCoherentRealPerformanceCandidateEnabled = false;
+#endif
+
+constexpr uint32_t DefaultWar3CoherentRealIndexTrimConfiguredMode() noexcept {
+  return kCoherentRealPerformanceCandidateEnabled ? 2u : 0u;
+}
+
+constexpr bool DefaultWar3CoherentRealHintDomainEnabled() noexcept {
+  return kCoherentRealPerformanceCandidateEnabled;
+}
+
 constexpr War3CoherentRealIndexTrimMode ParseWar3CoherentRealIndexTrimMode(
     uint32_t configuredMode) noexcept {
   if (!kCoherentRealIndexTrimDevelopmentEnabled)
