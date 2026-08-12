@@ -417,12 +417,10 @@ std::atomic<uint64_t> g_publishMissNoGlobalPalette{0u};
 std::atomic<uint64_t> g_publishSkippedNonWorldContext{0u};
 std::atomic<uint64_t> g_publishSkippedSmallViewport{0u};
 std::atomic<uint64_t> g_queryAttemptCount{0u};
-std::atomic<uint64_t> g_queryHitCount{0u};
 std::atomic<uint64_t> g_queryMissNoRecord{0u};
 std::atomic<uint64_t> g_queryMissFrameTagMismatch{0u};
 std::atomic<uint64_t> g_queryMissCacheCollision{0u};
 std::atomic<uint64_t> g_capturedPaletteQueryAttemptCount{0u};
-std::atomic<uint64_t> g_capturedPaletteQueryHitCount{0u};
 std::atomic<uint64_t> g_capturedPaletteMissNoContract{0u};
 std::atomic<uint64_t> g_capturedPaletteMissInvalidCount{0u};
 std::atomic<uint64_t> g_capturedPaletteMissNoSnapshot{0u};
@@ -1364,7 +1362,6 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
        snapshot->frameTag == record.frameTag)) {
     decodePaletteBytes(snapshot->bytes.data());
     outGroupCount = record.capturedPaletteCount;
-    g_capturedPaletteQueryHitCount.fetch_add(1u, std::memory_order_relaxed);
     g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                            std::memory_order_relaxed);
     return true;
@@ -1382,8 +1379,6 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
            globalSnapshot.frameTag == record.frameTag)) {
         decodePaletteBytes(globalSnapshot.bytes.data());
         outGroupCount = record.capturedPaletteCount;
-        g_capturedPaletteQueryHitCount.fetch_add(1u,
-                                                 std::memory_order_relaxed);
         g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
                                std::memory_order_relaxed);
         return true;
@@ -1408,8 +1403,6 @@ bool DecodeCapturedPaletteForRecord(const CurrentDrawContractRecord& record,
                attrSnapshot.frameTag == record.frameTag)) {
             decodePaletteBytes(attrSnapshot.bytes.data());
             outGroupCount = record.capturedPaletteCount;
-            g_capturedPaletteQueryHitCount.fetch_add(
-                1u, std::memory_order_relaxed);
             g_paletteAttributionSnapshotHitCount.fetch_add(
                 1u, std::memory_order_relaxed);
             g_lastMissReason.store(uint32_t(CurrentDrawMissReason::None),
@@ -1703,12 +1696,10 @@ void ResetCurrentDrawContractCache() {
   g_publishSkippedNonWorldContext.store(0u, std::memory_order_relaxed);
   g_publishSkippedSmallViewport.store(0u, std::memory_order_relaxed);
   g_queryAttemptCount.store(0u, std::memory_order_relaxed);
-  g_queryHitCount.store(0u, std::memory_order_relaxed);
   g_queryMissNoRecord.store(0u, std::memory_order_relaxed);
   g_queryMissFrameTagMismatch.store(0u, std::memory_order_relaxed);
   g_queryMissCacheCollision.store(0u, std::memory_order_relaxed);
   g_capturedPaletteQueryAttemptCount.store(0u, std::memory_order_relaxed);
-  g_capturedPaletteQueryHitCount.store(0u, std::memory_order_relaxed);
   g_capturedPaletteMissNoContract.store(0u, std::memory_order_relaxed);
   g_capturedPaletteMissInvalidCount.store(0u, std::memory_order_relaxed);
   g_capturedPaletteMissNoSnapshot.store(0u, std::memory_order_relaxed);
@@ -2511,18 +2502,20 @@ QueryCurrentDrawContractDiagnosticsSummary() {
       g_publishSkippedSmallViewport.load(std::memory_order_relaxed);
   summary.queryAttemptCount =
       g_queryAttemptCount.load(std::memory_order_relaxed);
-  summary.queryHitCount =
-      g_queryHitCount.load(std::memory_order_relaxed);
   summary.queryMissNoRecord =
       g_queryMissNoRecord.load(std::memory_order_relaxed);
   summary.queryMissFrameTagMismatch =
       g_queryMissFrameTagMismatch.load(std::memory_order_relaxed);
   summary.queryMissCacheCollision =
       g_queryMissCacheCollision.load(std::memory_order_relaxed);
+  summary.queryHitCount = DeriveClassifiedSuccessCount(
+      summary.queryAttemptCount,
+      std::array<uint64_t, 3>{
+          summary.queryMissNoRecord,
+          summary.queryMissFrameTagMismatch,
+          summary.queryMissCacheCollision});
   summary.capturedPaletteQueryAttemptCount =
       g_capturedPaletteQueryAttemptCount.load(std::memory_order_relaxed);
-  summary.capturedPaletteQueryHitCount =
-      g_capturedPaletteQueryHitCount.load(std::memory_order_relaxed);
   summary.capturedPaletteMissNoContract =
       g_capturedPaletteMissNoContract.load(std::memory_order_relaxed);
   summary.capturedPaletteMissInvalidCount =
@@ -2531,6 +2524,13 @@ QueryCurrentDrawContractDiagnosticsSummary() {
       g_capturedPaletteMissNoSnapshot.load(std::memory_order_relaxed);
   summary.capturedPaletteMissUnreadablePalette =
       g_capturedPaletteMissUnreadablePalette.load(std::memory_order_relaxed);
+  summary.capturedPaletteQueryHitCount = DeriveClassifiedSuccessCount(
+      summary.capturedPaletteQueryAttemptCount,
+      std::array<uint64_t, 4>{
+          summary.capturedPaletteMissNoContract,
+          summary.capturedPaletteMissInvalidCount,
+          summary.capturedPaletteMissNoSnapshot,
+          summary.capturedPaletteMissUnreadablePalette});
   summary.paletteAttributionSnapshotHitCount =
       g_paletteAttributionSnapshotHitCount.load(std::memory_order_relaxed);
   summary.paletteCaptureTrustedSourceHitCount =
@@ -2814,7 +2814,6 @@ bool QueryCurrentDrawContract(void* renderablePart,
 
   out = *entry;
   out.known = true;
-  g_queryHitCount.fetch_add(1u, std::memory_order_relaxed);
   return true;
 }
 
