@@ -133,6 +133,13 @@ thread_local std::array<PaletteSnapshotEntry, kPaletteSnapshotCacheSize>
 thread_local std::array<CurrentDrawPreparedSliceRecord,
                         kPreparedSliceCacheSize>
     g_preparedSliceCache = {};
+// Exact (part, layer) misses historically scanned all 1024 prepared records to
+// locate the newest slice for the part. Keep a second direct-mapped projection
+// keyed only by part. It contains the same value the scan would select; cache
+// collisions fail back to that scan and therefore cannot create a false hit.
+thread_local std::array<CurrentDrawPreparedSliceRecord,
+                        kPreparedSliceCacheSize>
+    g_latestPreparedSliceByPart = {};
 thread_local std::array<CurrentDrawPreparedSliceInterest,
                         kPreparedSliceInterestCacheSize>
     g_preparedSliceInterestCache = {};
@@ -1687,6 +1694,8 @@ void ResetCurrentDrawContractCache() {
     snapshot = {};
   for (auto& prepared : g_preparedSliceCache)
     prepared = {};
+  for (auto& prepared : g_latestPreparedSliceByPart)
+    prepared = {};
   for (auto& interest : g_preparedSliceInterestCache)
     interest = {};
   for (auto& entry : g_currentDrawGeometryLedger)
@@ -1809,6 +1818,15 @@ CurrentDrawRetireResult RetireCurrentDrawContracts(
         retiredParts.find(prepared.renderablePart) != retiredParts.end()) {
       prepared = {};
       result.localPreparedSliceCount++;
+    }
+  }
+  for (auto& prepared : g_latestPreparedSliceByPart) {
+    const bool directPartMatch =
+        tombstone.identity.renderablePart != nullptr &&
+        prepared.renderablePart == tombstone.identity.renderablePart;
+    if (directPartMatch ||
+        retiredParts.find(prepared.renderablePart) != retiredParts.end()) {
+      prepared = {};
     }
   }
   for (auto& interest : g_preparedSliceInterestCache) {
@@ -1944,6 +1962,9 @@ void PublishCurrentDrawPreparedSlice(
       ((key >> 4u) ^ uint64_t(stored.layerIndex)) &
       (g_preparedSliceCache.size() - 1u);
   g_preparedSliceCache[slot] = stored;
+  const size_t partSlot =
+      (key >> 4u) & (g_latestPreparedSliceByPart.size() - 1u);
+  g_latestPreparedSliceByPart[partSlot] = stored;
   g_preparedSliceRecordedCount.fetch_add(1u, std::memory_order_relaxed);
 }
 
@@ -2001,13 +2022,29 @@ bool QueryCurrentDrawPreparedSlice(void* renderablePart,
   if (!record.known || record.renderablePart != renderablePart ||
       record.layerIndex != layerIndex || record.preparedCount == 0u ||
       record.primitiveType == 0u) {
-    const CurrentDrawPreparedSliceRecord* best = nullptr;
-    for (const auto& candidate : g_preparedSliceCache) {
-      if (!candidate.known || candidate.renderablePart != renderablePart ||
-          candidate.preparedCount == 0u || candidate.primitiveType == 0u)
-        continue;
-      if (best == nullptr || candidate.captureSerial > best->captureSerial)
-        best = &candidate;
+    const size_t partSlot =
+        (key >> 4u) & (g_latestPreparedSliceByPart.size() - 1u);
+    const auto& latest = g_latestPreparedSliceByPart[partSlot];
+    const size_t latestExactSlot =
+        ((key >> 4u) ^ uint64_t(latest.layerIndex)) &
+        (g_preparedSliceCache.size() - 1u);
+    const auto& latestExact = g_preparedSliceCache[latestExactSlot];
+    const CurrentDrawPreparedSliceRecord* best =
+        latest.known && latest.renderablePart == renderablePart &&
+                latest.preparedCount != 0u && latest.primitiveType != 0u
+                && latestExact.renderablePart == renderablePart &&
+                latestExact.layerIndex == latest.layerIndex &&
+                latestExact.captureSerial == latest.captureSerial
+            ? &latest
+            : nullptr;
+    if (best == nullptr) {
+      for (const auto& candidate : g_preparedSliceCache) {
+        if (!candidate.known || candidate.renderablePart != renderablePart ||
+            candidate.preparedCount == 0u || candidate.primitiveType == 0u)
+          continue;
+        if (best == nullptr || candidate.captureSerial > best->captureSerial)
+          best = &candidate;
+      }
     }
     if (best != nullptr) {
       out = *best;
