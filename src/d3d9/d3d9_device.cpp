@@ -42399,24 +42399,30 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       }
 
       // Safe metadata-only capture must run before the Stage11 semantic
-      // early-return below. It restores native alpha/UV/texture and anonymous
-      // blocker classification without touching the fail-closed draw-time
-      // position/index cache. A positive return is an authoritative blocker
-      // rejection for this exact current-frame part/layer.
-      // About six samples per frame in the current pressure scene. This keeps
-      // A/B variance low while adding only a handful of paired QPC reads.
+      // early-return below for non-indexed draws. Indexed alpha UV cannot be
+      // sized from MinVertexIndex/NumVertices and is therefore handled only
+      // by the exact IB-domain path later in this function. The anonymous
+      // indexed blocker probe is diagnostic-only for the same reason and the
+      // exact path performs its authoritative test. Do not pay the contract,
+      // material and declaration walk here for a bridge that must reject.
+      bool metadataRejectedBlocker = false;
       constexpr uint32_t kShadowMetadataTimingSamplePeriod = 16u;
-      ++g_war3CaptureCpuTls.shadowMetadataCaptureCalls;
+      const bool runShadowMetadataBridge = !indexed;
       const bool sampleShadowMetadata =
+          runShadowMetadataBridge && trackShadowCaptureCpu &&
           (++g_war3ShadowMetadataTimingOrdinal %
            kShadowMetadataTimingSamplePeriod) == 0u;
       const int64_t shadowMetadataBegin = sampleShadowMetadata
           ? dxvk::high_resolution_clock::get_counter()
           : 0;
-      const bool metadataRejectedBlocker = War3CaptureShadowDrawMetadata(
-          PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices,
-          StartVal, CountVal, indexed, DynamicSysmemVBOs, semantic,
-          stage, cat, earlyTag);
+      if (runShadowMetadataBridge) {
+        if (trackShadowCaptureCpu)
+          ++g_war3CaptureCpuTls.shadowMetadataCaptureCalls;
+        metadataRejectedBlocker = War3CaptureShadowDrawMetadata(
+            PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices,
+            StartVal, CountVal, indexed, DynamicSysmemVBOs, semantic,
+            stage, cat, earlyTag);
+      }
       if (sampleShadowMetadata) {
         const int64_t shadowMetadataEnd =
             dxvk::high_resolution_clock::get_counter();

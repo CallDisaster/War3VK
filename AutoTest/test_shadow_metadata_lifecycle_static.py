@@ -441,11 +441,20 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             self.assertEqual(MONITOR.count(f'\\"{field}\\"'), 2, field)
 
     def test_stage11_capture_precedes_semantic_early_return(self) -> None:
+        bridge_gate = DEVICE.index(
+            "const bool runShadowMetadataBridge = !indexed"
+        )
         capture = DEVICE.index(
-            "const bool metadataRejectedBlocker = War3CaptureShadowDrawMetadata("
+            "metadataRejectedBlocker = War3CaptureShadowDrawMetadata(",
+            bridge_gate,
         )
         early_gate = DEVICE.index("earlySemanticSceneUnitLikeCandidate", capture)
         early_return = DEVICE.index("return;", early_gate)
+        self.assertLess(bridge_gate, capture)
+        self.assertIn(
+            "if (runShadowMetadataBridge) {",
+            DEVICE[bridge_gate:capture],
+        )
         self.assertLess(capture, early_gate)
         self.assertLess(capture, early_return)
 
