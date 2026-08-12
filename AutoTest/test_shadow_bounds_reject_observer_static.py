@@ -127,7 +127,7 @@ class ShadowBoundsRejectObserverContracts(unittest.TestCase):
             "if (exactIndexedDomainScanCandidate)", 1
         )[1].split("ShadowArena_NoteExactIndexTrim", 1)[0]
         self.assertIn(
-            "if (exactIndexedFreezeTrimCandidate && allStreamsFit &&",
+            "if ((exactIndexedFreezeTrimCandidate || consumeCoherentRealTrim) &&",
             trim,
         )
         self.assertIn(

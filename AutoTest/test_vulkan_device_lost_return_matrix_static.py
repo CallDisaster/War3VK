@@ -76,9 +76,11 @@ class VulkanDeviceLostReturnMatrixStaticTests(unittest.TestCase):
     def test_latency_sleep_reports_direct_wait_result_without_changing_timing_order(self):
         body = function_body(PRESENTER, "Presenter::latencySleepNv")
         wait = body.index("VkResult vr = m_vkd->vkWaitSemaphores")
-        notify = body.index("m_device->notifyDeviceErrorFromDriverResult(vr);")
+        notify = body.index("m_device->notifyDeviceErrorFromDriverResult(")
+        binding_sequence = body.index("bindingSequenceBeforeWait", notify)
         elapsed = body.index("auto t1 = dxvk::high_resolution_clock::now();")
         self.assertLess(wait, notify)
+        self.assertLess(notify, binding_sequence)
         self.assertLess(notify, elapsed)
         self.assertLess(body.index("lock.unlock();"), wait)
 

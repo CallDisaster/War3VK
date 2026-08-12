@@ -62,14 +62,19 @@ class ExactIndexDomainObserverCacheStaticTest(unittest.TestCase):
 
     def test_observer_cache_cannot_authorize_freeze_or_consume(self) -> None:
         observer_gate = re.search(
-            r"const bool useObserverDomainCache\s*=\s*"
+            r"const bool useBoundsObserverDomainCache\s*=\s*"
             r"exactIndexedTerrainBoundsAuditSample\s*&&\s*"
-            r"!exactIndexedFreezeTrimCandidate;",
+            r"!exactIndexedFreezeTrimCandidate\s*&&\s*"
+            r"!exactDomainFromDeclaredHint;",
             self.device,
         )
         self.assertIsNotNone(observer_gate)
         self.assertIn(
-            "if (exactIndexedFreezeTrimCandidate && allStreamsFit",
+            "const bool needsRebasedIndex = exactIndexedFreezeTrimCandidate",
+            self.device,
+        )
+        self.assertIn(
+            "if ((exactIndexedFreezeTrimCandidate || consumeCoherentRealTrim)",
             self.device,
         )
         self.assertIn("kReleaseFreezeExperimentalShadowRoutes = true", self.release)
@@ -100,8 +105,8 @@ class ExactIndexDomainObserverCacheStaticTest(unittest.TestCase):
 
     def test_miss_scans_and_hit_does_not(self) -> None:
         block = re.search(
-            r"if \(useObserverDomainCache\) \{(?P<body>.*?)\n\s*\}"
-            r"\n\s*if \(!useObserverDomainCache",
+            r"if \(useGenerationBackedDomainCache\) \{(?P<body>.*?)\n\s*\}"
+            r"\n\s*if \(!exactDomainFromDeclaredHint",
             self.device,
             re.S,
         )
