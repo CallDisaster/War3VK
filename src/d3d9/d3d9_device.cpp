@@ -27093,7 +27093,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     }
   }
   auto packetSafeForDirectPartLease = [this](
-      const EligibleRecord& eligible,
+      EligibleRecord& eligible,
       bool forLiveLeaseUpdate) {
     auto& stats = m_war3Scene.shadowStats;
     if (eligible.fromDrawTimePrebuildBypass)
@@ -27150,6 +27150,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         ? backingStatus == War3SemanticDirectMainWorldBackingStatus::Pass
         : War3SemanticDirectPacketHasMainWorldVisibleBacking(
               packet, &backingStatus);
+    eligible.mainWorldBackingStatus = backingStatus;
     if (!hasMainWorldVisibleBacking) {
       stats.semanticSceneDirectPartLeaseRejectedUnsafeBackingCount++;
       stats.semanticSceneShadowManifestPartLeaseRejectedUnsafeBackingCount++;
@@ -28699,7 +28700,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   uint32_t genericStatsDynamicEvidenceSkippedCount = 0u;
 
   auto noteSubmittedKeys = [&](
-      const EligibleRecord& eligible,
+      EligibleRecord& eligible,
       War3SubmitAppendNestedRawTiming* nestedTiming,
       bool fastAppended,
       dxvk::war3::render::ObjectKind appendedObjectKind,
