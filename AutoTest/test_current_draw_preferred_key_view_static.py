@@ -38,8 +38,13 @@ populate = device.split(
 assert "static thread_local std::vector<uint64_t> s_leasedSelectionKeys;" in populate
 assert "static thread_local std::vector<uint64_t> s_preferredSelectionKeys;" in populate
 assert "leasedSelectionKeys.clear();" in populate
-assert "preferredSelectionKeys.assign(previousSubmittedSelectionKeys.begin()," in populate
-assert "snapshotOptions.preferredSelectionKeysView = &preferredSelectionKeys;" in populate
+assert "preferredSelectionKeysScratch.clear();" in populate
+assert "const std::vector<uint64_t>* preferredSelectionKeysView =" in populate
+assert "&previousSubmittedSelectionKeys;" in populate
+assert "if (mergeLeasedSelectionKeys)" in populate
+assert "preferredSelectionKeysScratch.assign(" in populate
+assert "preferredSelectionKeysView = &preferredSelectionKeysScratch;" in populate
+assert "snapshotOptions.preferredSelectionKeysView = preferredSelectionKeysView;" in populate
 assert "snapshotOptions.preferredSelectionKeysViewSortedUnique = true;" in populate
 assert "snapshotOptions.preferredSelectionKeys = preferredSelectionKeys;" not in populate
 

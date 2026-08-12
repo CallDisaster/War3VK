@@ -26204,10 +26204,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   static thread_local std::vector<uint64_t> s_leasedSelectionKeys;
   static thread_local std::vector<uint64_t> s_preferredSelectionKeys;
   auto& leasedSelectionKeys = s_leasedSelectionKeys;
-  auto& preferredSelectionKeys = s_preferredSelectionKeys;
+  auto& preferredSelectionKeysScratch = s_preferredSelectionKeys;
   leasedSelectionKeys.clear();
-  preferredSelectionKeys.assign(previousSubmittedSelectionKeys.begin(),
-                                previousSubmittedSelectionKeys.end());
+  preferredSelectionKeysScratch.clear();
   if (stickySelectionLease) {
     const uint64_t currentFrame = m_war3ShadowPersistentFrameSerial;
     const uint64_t leaseFrames = War3SemanticStickySelectionLeaseFramesRuntime();
@@ -26225,28 +26224,33 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       }
     }
   }
-  if (stickySelectionLease &&
-      (preferredSelectionKeys.empty() ||
-       War3SemanticStickySelectionBroadLeasePreferenceRuntime())) {
-    preferredSelectionKeys.insert(preferredSelectionKeys.end(),
-                                  leasedSelectionKeys.begin(),
-                                  leasedSelectionKeys.end());
+  // Previous-submitted keys are published sorted/unique below, and tombstone
+  // erasure preserves that order. Borrow that immutable vector in the common
+  // path instead of copying and revalidating it every frame. Only broad lease
+  // preference changes the set, so only that path materializes and normalizes
+  // the TLS merge scratch.
+  const bool mergeLeasedSelectionKeys =
+      stickySelectionLease && !leasedSelectionKeys.empty() &&
+      (previousSubmittedSelectionKeys.empty() ||
+       War3SemanticStickySelectionBroadLeasePreferenceRuntime());
+  const std::vector<uint64_t>* preferredSelectionKeysView =
+      &previousSubmittedSelectionKeys;
+  if (mergeLeasedSelectionKeys) {
+    preferredSelectionKeysScratch.assign(
+        previousSubmittedSelectionKeys.begin(),
+        previousSubmittedSelectionKeys.end());
+    preferredSelectionKeysScratch.insert(
+        preferredSelectionKeysScratch.end(), leasedSelectionKeys.begin(),
+        leasedSelectionKeys.end());
+    std::sort(preferredSelectionKeysScratch.begin(),
+              preferredSelectionKeysScratch.end());
+    preferredSelectionKeysScratch.erase(
+        std::unique(preferredSelectionKeysScratch.begin(),
+                    preferredSelectionKeysScratch.end()),
+        preferredSelectionKeysScratch.end());
+    preferredSelectionKeysView = &preferredSelectionKeysScratch;
   }
-  // Previous-submitted vectors are published sorted/unique below and
-  // tombstone erasure preserves that order. Most frames therefore need only a
-  // linear verification, not another O(N log N) sort. Broad lease insertion
-  // and defensive future callers still fall back to canonical normalization.
-  const bool preferredSelectionKeysAlreadySortedUnique =
-      std::adjacent_find(
-          preferredSelectionKeys.begin(), preferredSelectionKeys.end(),
-          [](uint64_t a, uint64_t b) { return a >= b; }) ==
-      preferredSelectionKeys.end();
-  if (!preferredSelectionKeysAlreadySortedUnique) {
-    std::sort(preferredSelectionKeys.begin(), preferredSelectionKeys.end());
-    preferredSelectionKeys.erase(
-        std::unique(preferredSelectionKeys.begin(), preferredSelectionKeys.end()),
-        preferredSelectionKeys.end());
-  }
+  const auto& preferredSelectionKeys = *preferredSelectionKeysView;
   // The preferred key list is already sorted/unique and remains immutable for
   // this populate.  Reuse it directly for both preselection and submit-group
   // membership instead of building and destroying two node-based hash sets
@@ -26267,7 +26271,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   snapshotOptions.readyOnly = readyOnly;
   snapshotOptions.maxRecords = useObjectFirstSnapshot ? 0u : directScanCap;
   snapshotOptions.unitsOnly = unitsOnly;
-  snapshotOptions.preferredSelectionKeysView = &preferredSelectionKeys;
+  snapshotOptions.preferredSelectionKeysView = preferredSelectionKeysView;
   snapshotOptions.preferredSelectionKeysViewSortedUnique = true;
   static thread_local dxvk::war3::render::
       VisibleRenderablePartLayerQueryCache s_visiblePartLayerQueryCache;

@@ -10,18 +10,20 @@ populate = DEVICE.split(
     "uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(", 1
 )[1].split("uint32_t D3D9DeviceEx::War3TryPopulateSemanticShadowScene(", 1)[0]
 
-# Previous submitted sets are immutable references. The normal path performs a
-# single strict-order check and sorts only if broad lease insertion (or a
-# future invariant regression) introduced disorder/duplicates.
+# Previous submitted sets are immutable references and are already published
+# sorted/unique. The common path borrows that storage directly. Only broad
+# lease insertion materializes and normalizes a TLS merge scratch.
 assert "const std::vector<uint64_t>& previousSubmittedSelectionKeys" in populate
-assert "preferredSelectionKeysAlreadySortedUnique" in populate
-assert "std::adjacent_find(" in populate
-assert "return a >= b;" in populate
-normalize = populate.index("if (!preferredSelectionKeysAlreadySortedUnique)")
-sort = populate.index("std::sort(preferredSelectionKeys.begin()", normalize)
-unique = populate.index("std::unique(preferredSelectionKeys.begin()", sort)
+assert "const bool mergeLeasedSelectionKeys" in populate
+borrow = populate.index("&previousSubmittedSelectionKeys;")
+merge = populate.index("if (mergeLeasedSelectionKeys)", borrow)
+copy = populate.index("preferredSelectionKeysScratch.assign(", merge)
+sort = populate.index("std::sort(preferredSelectionKeysScratch.begin()", copy)
+unique = populate.index("std::unique(preferredSelectionKeysScratch.begin()", sort)
 binary = populate.index("std::binary_search(preferredSelectionKeys.begin()", unique)
-assert normalize < sort < unique < binary
+assert borrow < merge < copy < sort < unique < binary
+assert "preferredSelectionKeysAlreadySortedUnique" not in populate
+assert "std::adjacent_find(" not in populate
 
 # Submitted sets are normalized once. Jaccard consumes those sorted references
 # directly and must not take vectors by value or sort inside the metric.
