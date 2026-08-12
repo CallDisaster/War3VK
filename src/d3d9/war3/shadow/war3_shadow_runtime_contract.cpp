@@ -4036,11 +4036,6 @@ void ShadowRuntimeContractCache::captureLiveState() {
     }
   }
 
-  if (resourcesPtr == nullptr) {
-    resourcesPtr = buildResourceStore();
-    rebuiltResourceStore = true;
-  }
-
   auto& instanceRegistry = model::ModelInstanceRegistry::instance();
   auto& shadowRegistry = render::ShadowObjectRegistry::instance();
   {
@@ -4068,9 +4063,18 @@ void ShadowRuntimeContractCache::captureLiveState() {
   }
   const uint64_t postAttachmentResourceRevision = resourceCache.revision();
   if (postAttachmentResourceRevision != resourceRevision) {
+    // Attachment/pose supplementation may publish new immutable geoset or
+    // alias facts. Any store selected above belongs to the earlier revision;
+    // discard that reference, but do not build twice in one capture.
+    resourcesPtr.reset();
+    resourceRevision = postAttachmentResourceRevision;
+  }
+  // No stage between the initial coverage check and this point consumes the
+  // resource store. Build at the final resource revision exactly once, after
+  // all pose/attachment cache mutations have settled for this capture.
+  if (resourcesPtr == nullptr) {
     resourcesPtr = buildResourceStore();
     rebuiltResourceStore = true;
-    resourceRevision = postAttachmentResourceRevision;
   }
   {
     auto rootSupplementScope = ContractCpuScope(
