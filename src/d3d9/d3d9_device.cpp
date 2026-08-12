@@ -6654,14 +6654,14 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   // Object-grouped preselection resolves this exact part/layer from the
   // immutable current-frame visible snapshot. Keep the value copy alive for
   // both instance projection and the later visible-record setup.
-  dxvk::war3::render::VisibleRenderableRecord visibleRecord = {};
+  dxvk::war3::render::VisibleRenderableRecord visibleRecordStorage = {};
   const bool preselectedVisibleMatches =
       record.renderablePart != nullptr && preselectedVisibleRecord != nullptr &&
       preselectedVisibleRecord->renderablePart == record.renderablePart &&
       preselectedVisibleRecord->layerIndex == record.layerIndex;
   bool visibleHit = preselectedVisibleMatches;
-  if (visibleHit)
-    visibleRecord = *preselectedVisibleRecord;
+  const dxvk::war3::render::VisibleRenderableRecord* visibleRecord =
+      visibleHit ? preselectedVisibleRecord : nullptr;
 
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enter(War3PacketBuildPhase::GeosetLookup);
@@ -6705,25 +6705,25 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       visibleHit && record.worldObjectEntry != nullptr &&
       record.sceneNode != nullptr && record.unitPtr != nullptr &&
       record.jHandle != 0u && record.rawcode != 0u &&
-      visibleRecord.identity.worldObjectEntry == record.worldObjectEntry &&
-      visibleRecord.sceneNode == record.sceneNode &&
-      visibleRecord.identity.sceneNode == record.sceneNode &&
-      visibleRecord.identity.unitPtr == record.unitPtr &&
-      visibleRecord.identity.jHandle == record.jHandle &&
-      visibleRecord.identity.rawcode == record.rawcode &&
-      visibleRecord.runtimeModelPtr != nullptr &&
-      visibleRecord.modelResourcePtr != nullptr &&
-      visibleRecord.modelKey != 0u;
+      visibleRecord->identity.worldObjectEntry == record.worldObjectEntry &&
+      visibleRecord->sceneNode == record.sceneNode &&
+      visibleRecord->identity.sceneNode == record.sceneNode &&
+      visibleRecord->identity.unitPtr == record.unitPtr &&
+      visibleRecord->identity.jHandle == record.jHandle &&
+      visibleRecord->identity.rawcode == record.rawcode &&
+      visibleRecord->runtimeModelPtr != nullptr &&
+      visibleRecord->modelResourcePtr != nullptr &&
+      visibleRecord->modelKey != 0u;
   bool instanceHit = visibleProvesInstance;
   if (visibleProvesInstance) {
     instanceRecord.worldObjectEntry = record.worldObjectEntry;
     instanceRecord.sceneNode = record.sceneNode;
     instanceRecord.unitPtr = record.unitPtr;
-    instanceRecord.runtimeModelPtr = visibleRecord.runtimeModelPtr;
-    instanceRecord.modelResourcePtr = visibleRecord.modelResourcePtr;
+    instanceRecord.runtimeModelPtr = visibleRecord->runtimeModelPtr;
+    instanceRecord.modelResourcePtr = visibleRecord->modelResourcePtr;
     instanceRecord.jHandle = record.jHandle;
     instanceRecord.rawcode = record.rawcode;
-    instanceRecord.modelKey = visibleRecord.modelKey;
+    instanceRecord.modelKey = visibleRecord->modelKey;
   }
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enterNested(War3PacketBuildNestedPhase::InstanceLookup);
@@ -6915,8 +6915,10 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     // mismatching hint retain the canonical fallback below.
     auto& visibleRegistry =
         dxvk::war3::render::VisibleRenderableRegistry::instance();
-    visibleHit = visibleRegistry.queryFirstForDirectPacket(record,
-                                                           visibleRecord);
+    visibleHit = visibleRegistry.queryFirstForDirectPacket(
+        record, visibleRecordStorage);
+    if (visibleHit)
+      visibleRecord = &visibleRecordStorage;
   }
 
   // CurrentDraw is already backfilled from the exact visible part at publish
@@ -6931,8 +6933,8 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       record.worldObjectEntry != nullptr && record.sceneNode != nullptr &&
       record.unitPtr != nullptr && record.jHandle != 0u &&
       record.rawcode != 0u && currentDrawHasUnitKind && visibleHit &&
-      visibleRecord.identity.groupIdx >= 0 &&
-      visibleRecord.identity.flags5C != 0u;
+      visibleRecord->identity.groupIdx >= 0 &&
+      visibleRecord->identity.flags5C != 0u;
   if (packetBuildTiming != nullptr)
     packetBuildTiming->enterNested(
         War3PacketBuildNestedPhase::RenderObjectLookup);
@@ -7030,11 +7032,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     renderable.meshData = record.meshPayloadPtr;
     if (visibleHit) {
       if (renderable.payload == nullptr)
-        renderable.payload = visibleRecord.payload;
-      renderable.layerState = visibleRecord.layerState;
-      renderable.transparentType = visibleRecord.transparentType;
-      renderable.transparentSortKey = visibleRecord.transparentSortKey;
-      renderable.queueKind = visibleRecord.queueKind;
+        renderable.payload = visibleRecord->payload;
+      renderable.layerState = visibleRecord->layerState;
+      renderable.transparentType = visibleRecord->transparentType;
+      renderable.transparentSortKey = visibleRecord->transparentSortKey;
+      renderable.queueKind = visibleRecord->queueKind;
     }
     renderable.runtimeModelPtr = const_cast<void*>(effectiveRuntimeModelPtr);
     renderable.modelResourcePtr =
@@ -7078,11 +7080,11 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
                                     : 0u;
     renderable.stage = record.stage;
     renderable.pathBlocker =
-        record.pathBlocker || (visibleHit && visibleRecord.pathBlocker) ||
+        record.pathBlocker || (visibleHit && visibleRecord->pathBlocker) ||
         IsLosBlockerFourCc(renderable.rawcode);
     renderable.unitFlags5C =
         currentDrawObjectIdentityComplete
-            ? visibleRecord.identity.flags5C
+            ? visibleRecord->identity.flags5C
             : renderObject != nullptr && renderObject->flags5C != 0u
                   ? renderObject->flags5C
                   : 0u;
@@ -7091,9 +7093,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
     // visible registry does not provide a layer, default to layer 0; using the
     // selector as a layer made first-layer cutout/alpha records read the wrong
     // material contract and collapse to opaque.
-    renderable.layerIndex = visibleHit ? visibleRecord.layerIndex
+    renderable.layerIndex = visibleHit ? visibleRecord->layerIndex
                                        : record.layerIndex;
-    renderable.subIndex = visibleHit ? visibleRecord.subIndex
+    renderable.subIndex = visibleHit ? visibleRecord->subIndex
                                      : record.layerIndex;
     if (!visibleHit) {
       renderable.transparentType = 0u;
@@ -7107,9 +7109,9 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             : geoset->geosetIndex;
     renderable.meshIndex =
         visibleHit &&
-                visibleRecord.meshIndex !=
+                visibleRecord->meshIndex !=
                     dxvk::war3::render::kInvalidVisibleMeshIndex
-            ? visibleRecord.meshIndex
+            ? visibleRecord->meshIndex
             : drawMeshSelector;
     renderable.geosetIndex = geoset->geosetIndex;
     renderable.objectKind =
@@ -7120,7 +7122,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
                   : shadowHit ? shadowRecord.kind
                               : dxvk::war3::render::ObjectKind::Unknown;
     renderable.groupIdx =
-        visibleHit ? visibleRecord.identity.groupIdx
+        visibleHit ? visibleRecord->identity.groupIdx
                    : renderObject != nullptr ? int8_t(renderObject->groupIdx)
                                              : int8_t(0);
     renderable.frameSerial =
@@ -7139,7 +7141,7 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (outPrevalidatedMainWorldBackingStatus != nullptr &&
       preselectedVisibleMatches) {
     War3SemanticDirectPacketMatchesMainWorldVisibleRecord(
-        out, visibleRecord, outPrevalidatedMainWorldBackingStatus);
+        out, *visibleRecord, outPrevalidatedMainWorldBackingStatus);
   }
 
   if (packetBuildTiming != nullptr)

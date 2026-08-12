@@ -57,11 +57,13 @@ class DirectPreselectedVisibleHandoffStaticTests(unittest.TestCase):
             "bool War3TryBuildShadowPacketFromCurrentDrawRecord("
         )
         hint = builder.index("const bool preselectedVisibleMatches")
-        copy = builder.index("visibleRecord = *preselectedVisibleRecord", hint)
-        fallback = builder.index("queryFirstForDirectPacket(record", copy)
-        self.assertLess(hint, copy)
-        self.assertLess(copy, fallback)
-        gate = builder[hint:copy]
+        borrow = builder.index(
+            "visibleHit ? preselectedVisibleRecord : nullptr", hint)
+        fallback = builder.index("queryFirstForDirectPacket(", borrow)
+        self.assertLess(hint, borrow)
+        self.assertLess(borrow, fallback)
+        self.assertNotIn("visibleRecord = *preselectedVisibleRecord", builder)
+        gate = builder[hint:borrow]
         self.assertIn("record.renderablePart != nullptr", gate)
         self.assertIn(
             "preselectedVisibleRecord->renderablePart == record.renderablePart",

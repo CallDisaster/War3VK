@@ -50,8 +50,8 @@ class DirectCompleteShadowAugmentBypassStaticTests(unittest.TestCase):
             "record.rawcode != 0u",
             "currentDrawHasUnitKind",
             "visibleHit",
-            "visibleRecord.identity.groupIdx >= 0",
-            "visibleRecord.identity.flags5C != 0u",
+            "visibleRecord->identity.groupIdx >= 0",
+            "visibleRecord->identity.flags5C != 0u",
         ):
             self.assertIn(token, identity)
 

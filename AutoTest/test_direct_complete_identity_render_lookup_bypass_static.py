@@ -38,8 +38,8 @@ for proof in (
     "record.rawcode != 0u",
     "currentDrawHasUnitKind",
     "visibleHit",
-    "visibleRecord.identity.groupIdx >= 0",
-    "visibleRecord.identity.flags5C != 0u",
+    "visibleRecord->identity.groupIdx >= 0",
+    "visibleRecord->identity.flags5C != 0u",
 ):
     assert proof in gate_body
 
@@ -61,7 +61,7 @@ shadow_proof = builder[shadow_gate:shadow_lookup]
 assert "currentDrawObjectIdentityComplete && ownerSatisfiedByInstance" in shadow_proof
 assert "if (!currentDrawShadowAugmentComplete)" in shadow_proof
 assert "War3TryReadUnitFlags5CCached" in builder[render:]
-assert "visibleRecord.identity.groupIdx" in builder[render:]
-assert "? visibleRecord.identity.flags5C" in builder[render:]
+assert "visibleRecord->identity.groupIdx" in builder[render:]
+assert "? visibleRecord->identity.flags5C" in builder[render:]
 
 print("direct complete-identity RenderObject bypass static tests passed")
