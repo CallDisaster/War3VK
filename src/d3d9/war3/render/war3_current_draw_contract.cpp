@@ -774,6 +774,22 @@ struct CurrentDrawSnapshotPartKeyHash {
   }
 };
 
+// A snapshot can visit at most kContractCacheSize TLS records in the common
+// release path. Keep the exact part-slice index at <= 50% load so lookup does
+// not allocate nodes or buckets. Global publication is a diagnostic fallback
+// and may exceed that bound; callers retain an exact linear fallback when the
+// fixed table cannot accept another unique key.
+static constexpr size_t kCurrentDrawSnapshotDedupeIndexSize =
+    kContractCacheSize * 2u;
+static_assert((kCurrentDrawSnapshotDedupeIndexSize &
+               (kCurrentDrawSnapshotDedupeIndexSize - 1u)) == 0u);
+
+struct CurrentDrawSnapshotDedupeIndexEntry {
+  CurrentDrawSnapshotPartKey key = {};
+  size_t recordIndex = 0u;
+  uint64_t generation = 0u;
+};
+
 class CurrentDrawSnapshotRecordRawTiming final {
 public:
   CurrentDrawSnapshotRecordRawTiming(
@@ -3176,30 +3192,67 @@ void SnapshotPublishedCurrentDrawContracts(
       return pa;
     return BetterSnapshotRecord(a, b, options.unitsOnly);
   };
-  // Phase 7.81：thread_local 复用 unlimitedDedupeIndex，避免每帧多次调用
-  // SnapshotPublishedCurrentDrawContracts 时反复 alloc/free + reserve(4096)。
-  static thread_local std::unordered_map<uint64_t, size_t>
-      s_unlimitedDedupeIndex;
-  s_unlimitedDedupeIndex.clear();
-  auto& unlimitedDedupeIndex = s_unlimitedDedupeIndex;
-  auto unlimitedDedupeKey = [](const CurrentDrawContractRecord& r) -> uint64_t {
-    uint64_t h = bit::fnv1a_init();
-    h = bit::fnv1a_iter(h, uint64_t(reinterpret_cast<uintptr_t>(r.renderablePart)));
-    h = bit::fnv1a_iter(h, r.layerIndex);
-    h = bit::fnv1a_iter(h, r.payloadWord108);
-    h = bit::fnv1a_iter(h, r.payloadWord11C);
-    return h;
+  // Unlimited and batched-bounded snapshots both need the same exact
+  // part-slice dedupe semantics. A generation-tagged fixed index avoids the
+  // per-snapshot unordered_map clear/node work and also removes the old
+  // unlimited path's folded-hash-as-identity collision risk.
+  static thread_local std::array<CurrentDrawSnapshotDedupeIndexEntry,
+                                 kCurrentDrawSnapshotDedupeIndexSize>
+      s_snapshotDedupeIndex = {};
+  static thread_local uint64_t s_snapshotDedupeIndexGeneration = 0u;
+  uint64_t snapshotDedupeIndexGeneration =
+      ++s_snapshotDedupeIndexGeneration;
+  if (snapshotDedupeIndexGeneration == 0u) {
+    s_snapshotDedupeIndex = {};
+    snapshotDedupeIndexGeneration = ++s_snapshotDedupeIndexGeneration;
+  }
+  bool snapshotDedupeIndexOverflowed = false;
+  const auto snapshotDedupeKey = [](const CurrentDrawContractRecord& record) {
+    return CurrentDrawSnapshotPartKey{
+        uintptr_t(record.renderablePart), record.layerIndex,
+        record.payloadWord108, record.payloadWord11C};
   };
-  if (options.maxRecords == 0u)
-    unlimitedDedupeIndex.reserve(kContractCacheSize);
-
-  static thread_local std::unordered_map<
-      CurrentDrawSnapshotPartKey, size_t, CurrentDrawSnapshotPartKeyHash>
-      s_batchedBoundedDedupeIndex;
-  s_batchedBoundedDedupeIndex.clear();
-  auto& batchedBoundedDedupeIndex = s_batchedBoundedDedupeIndex;
-  if (batchedBoundedSnapshot)
-    batchedBoundedDedupeIndex.reserve(kContractCacheSize);
+  const auto findSnapshotDedupeIndex =
+      [&](const CurrentDrawSnapshotPartKey& key) -> size_t {
+    const size_t first = CurrentDrawSnapshotPartKeyHash{}(key) &
+        (kCurrentDrawSnapshotDedupeIndexSize - 1u);
+    for (size_t probe = 0u;
+         probe < kCurrentDrawSnapshotDedupeIndexSize; ++probe) {
+      const auto& entry = s_snapshotDedupeIndex[
+          (first + probe) & (kCurrentDrawSnapshotDedupeIndexSize - 1u)];
+      if (entry.generation != snapshotDedupeIndexGeneration)
+        return std::numeric_limits<size_t>::max();
+      if (entry.key == key)
+        return entry.recordIndex;
+    }
+    return std::numeric_limits<size_t>::max();
+  };
+  const auto storeSnapshotDedupeIndex =
+      [&](const CurrentDrawSnapshotPartKey& key, size_t recordIndex) {
+    const size_t first = CurrentDrawSnapshotPartKeyHash{}(key) &
+        (kCurrentDrawSnapshotDedupeIndexSize - 1u);
+    for (size_t probe = 0u;
+         probe < kCurrentDrawSnapshotDedupeIndexSize; ++probe) {
+      auto& entry = s_snapshotDedupeIndex[
+          (first + probe) & (kCurrentDrawSnapshotDedupeIndexSize - 1u)];
+      if (entry.generation != snapshotDedupeIndexGeneration ||
+          entry.key == key) {
+        entry = {key, recordIndex, snapshotDedupeIndexGeneration};
+        return true;
+      }
+    }
+    return false;
+  };
+  const auto findSnapshotDedupeLinear =
+      [&](const CurrentDrawSnapshotPartKey& key) -> size_t {
+    const auto duplicate = std::find_if(
+        out.begin(), out.end(), [&](const CurrentDrawContractRecord& existing) {
+          return snapshotDedupeKey(existing) == key;
+        });
+    return duplicate != out.end()
+        ? size_t(std::distance(out.begin(), duplicate))
+        : std::numeric_limits<size_t>::max();
+  };
 
   enterSnapshotPhase("SnapshotRecordPolicySetup");
   auto considerRecord = [&](const CurrentDrawContractRecord& record) {
@@ -3220,14 +3273,15 @@ void SnapshotPublishedCurrentDrawContracts(
       return;
     if (batchedBoundedSnapshot) {
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeKey);
-      const CurrentDrawSnapshotPartKey dedupeKey = {
-          uintptr_t(record.renderablePart), record.layerIndex,
-          record.payloadWord108, record.payloadWord11C};
+      const CurrentDrawSnapshotPartKey dedupeKey = snapshotDedupeKey(record);
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeLookup);
-      const auto duplicate = batchedBoundedDedupeIndex.find(dedupeKey);
-      if (duplicate != batchedBoundedDedupeIndex.end() &&
-          duplicate->second < out.size()) {
-        CurrentDrawContractRecord& existing = out[duplicate->second];
+      size_t duplicateIndex = findSnapshotDedupeIndex(dedupeKey);
+      if (duplicateIndex == std::numeric_limits<size_t>::max() &&
+          snapshotDedupeIndexOverflowed) {
+        duplicateIndex = findSnapshotDedupeLinear(dedupeKey);
+      }
+      if (duplicateIndex < out.size()) {
+        CurrentDrawContractRecord& existing = out[duplicateIndex];
         recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateCompare);
         if (betterRecord(record, existing)) {
           recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateReplace);
@@ -3236,19 +3290,23 @@ void SnapshotPublishedCurrentDrawContracts(
         return;
       }
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::IndexPublish);
-      batchedBoundedDedupeIndex.emplace(dedupeKey, out.size());
+      if (!storeSnapshotDedupeIndex(dedupeKey, out.size()))
+        snapshotDedupeIndexOverflowed = true;
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::RecordAppend);
       out.push_back(SnapshotRecordWithGrace(record));
       return;
     }
     if (options.maxRecords == 0u) {
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeKey);
-      const uint64_t dedupeKey = unlimitedDedupeKey(record);
+      const CurrentDrawSnapshotPartKey dedupeKey = snapshotDedupeKey(record);
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::DedupeLookup);
-      const auto duplicate = unlimitedDedupeIndex.find(dedupeKey);
-      if (duplicate != unlimitedDedupeIndex.end() &&
-          duplicate->second < out.size()) {
-        CurrentDrawContractRecord& existing = out[duplicate->second];
+      size_t duplicateIndex = findSnapshotDedupeIndex(dedupeKey);
+      if (duplicateIndex == std::numeric_limits<size_t>::max() &&
+          snapshotDedupeIndexOverflowed) {
+        duplicateIndex = findSnapshotDedupeLinear(dedupeKey);
+      }
+      if (duplicateIndex < out.size()) {
+        CurrentDrawContractRecord& existing = out[duplicateIndex];
         recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateCompare);
         const bool replaceExisting = betterRecord(record, existing);
         if (replaceExisting) {
@@ -3258,7 +3316,8 @@ void SnapshotPublishedCurrentDrawContracts(
         return;
       }
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::IndexPublish);
-      unlimitedDedupeIndex.emplace(dedupeKey, out.size());
+      if (!storeSnapshotDedupeIndex(dedupeKey, out.size()))
+        snapshotDedupeIndexOverflowed = true;
       recordTiming.enter(CurrentDrawSnapshotRecordPhase::RecordAppend);
       out.push_back(SnapshotRecordWithGrace(record));
       return;
