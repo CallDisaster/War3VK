@@ -3216,37 +3216,28 @@ void ShadowModelResourceStore::bindRuntimeModelAlias(void* runtimeModelPtr,
 
   if (modelResourcePtr != nullptr) {
     const auto it = m_byModelResource.find({modelResourcePtr, geosetIndex});
-    if (it != m_byModelResource.end() && it->second < m_records.size() &&
-        m_records[it->second].prefersRuntimeContract) {
+    if (it != m_byModelResource.end() && it->second < m_records.size()) {
       m_byRuntimeModel[{runtimeModelPtr, geosetIndex}] = it->second;
-      return;
     }
+    // add() keeps this exact-key index pointed at a runtime-preferred record
+    // whenever one exists.  A miss therefore cannot be repaired by scanning
+    // records with the same non-null model resource, and a hit is already the
+    // best available fallback for the alias.
+    return;
   }
 
   for (size_t i = 0; i < m_records.size(); ++i) {
     const auto& record = m_records[i];
     if (record.geosetIndex == geosetIndex &&
-        record.prefersRuntimeContract &&
-        (modelResourcePtr == nullptr ||
-         record.modelResourcePtr == modelResourcePtr)) {
+        record.prefersRuntimeContract) {
       m_byRuntimeModel[{runtimeModelPtr, geosetIndex}] = i;
       return;
     }
   }
 
-  if (modelResourcePtr != nullptr) {
-    const auto it = m_byModelResource.find({modelResourcePtr, geosetIndex});
-    if (it != m_byModelResource.end()) {
-      m_byRuntimeModel[{runtimeModelPtr, geosetIndex}] = it->second;
-      return;
-    }
-  }
-
   for (size_t i = 0; i < m_records.size(); ++i) {
     const auto& record = m_records[i];
-    if (record.geosetIndex == geosetIndex &&
-        (modelResourcePtr == nullptr ||
-         record.modelResourcePtr == modelResourcePtr)) {
+    if (record.geosetIndex == geosetIndex) {
       m_byRuntimeModel[{runtimeModelPtr, geosetIndex}] = i;
       return;
     }
