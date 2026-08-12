@@ -14,12 +14,14 @@ body = source.split(
 for name in (
     "s_submittedPartPacketLeaseRecords",
     "s_eligibleRecords",
+    "s_shadowEligibleManifestRecords",
     "s_objectGroups",
     "s_originalIndices",
 ):
     assert f"static thread_local std::vector" in body
 
 assert "auto& eligibleRecords = s_eligibleRecords;" in body
+assert "auto& shadowEligibleManifestRecords = s_shadowEligibleManifestRecords;" in body
 assert (
     "auto& submittedPartPacketLeaseRecords =\n"
     "      s_submittedPartPacketLeaseRecords;"
@@ -27,6 +29,7 @@ assert (
 assert "auto& objectGroups = s_objectGroups;" in body
 assert "submittedPartPacketLeaseRecords.clear();" in body
 assert "eligibleRecords.clear();" in body
+assert "shadowEligibleManifestRecords.clear();" in body
 assert "objectGroups.clear();" in body
 assert "static thread_local std::unordered_set<uint64_t> s_currentPartKeys;" in body
 assert "auto& currentPartKeys = s_currentPartKeys;" in body
@@ -42,6 +45,9 @@ assert "originalIndices.resize(eligibleRecordCount);" in body
 # remove the existing budget-bound reserves and pointer rebinds after moves.
 assert body.index("eligibleRecords.clear();") < body.index(
     "eligibleRecords.reserve("
+)
+assert body.index("shadowEligibleManifestRecords.clear();") < body.index(
+    "shadowEligibleManifestRecords.reserve("
 )
 assert body.index("submittedPartPacketLeaseRecords.clear();") < body.index(
     "submittedPartPacketLeaseRecords.reserve(eligibleRecordCount);"

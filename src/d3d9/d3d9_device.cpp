@@ -105,6 +105,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -26402,18 +26403,21 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   static thread_local std::vector<EligibleRecord>
       s_submittedPartPacketLeaseRecords;
   static thread_local std::vector<EligibleRecord> s_eligibleRecords;
+  static thread_local std::vector<
+      dxvk::war3::render::CurrentDrawContractRecord>
+      s_shadowEligibleManifestRecords;
   auto& submittedPartPacketLeaseRecords =
       s_submittedPartPacketLeaseRecords;
   auto& eligibleRecords = s_eligibleRecords;
+  auto& shadowEligibleManifestRecords = s_shadowEligibleManifestRecords;
   submittedPartPacketLeaseRecords.clear();
   eligibleRecords.clear();
+  shadowEligibleManifestRecords.clear();
   // 使用固定大小预分配避免多次 realloc
   eligibleRecords.reserve(std::min<uint32_t>(
       uint32_t(recordIndicesForBuild.size()),
       directRecordCap != 0u ? directRecordCap * 2u
                             : uint32_t(recordIndicesForBuild.size())));
-  std::vector<dxvk::war3::render::CurrentDrawContractRecord>
-      shadowEligibleManifestRecords;
   shadowEligibleManifestRecords.reserve(recordIndicesForBuild.size() +
                                          exactSubmittedManifestRecords.size());
   shadowEligibleManifestRecords.insert(
@@ -27221,7 +27225,9 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       leaseKeys.push_back(key);
     std::sort(leaseKeys.begin(), leaseKeys.end());
     enterBuildEligibleLeasePhase("LeaseRestoreScan");
-    std::vector<EligibleRecord> restoredLeaseRecords;
+    static thread_local std::vector<EligibleRecord> s_restoredLeaseRecords;
+    auto& restoredLeaseRecords = s_restoredLeaseRecords;
+    restoredLeaseRecords.clear();
     restoredLeaseRecords.reserve(leaseKeys.size());
     auto tryRefreshLeasedPaletteFromProducerFacts =
         [&](EligibleRecord& leased,
@@ -27621,18 +27627,19 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
     enterBuildEligibleLeasePhase("LeaseMerge");
     if (!restoredLeaseRecords.empty()) {
-      std::vector<EligibleRecord> mergedRecords;
-      mergedRecords.reserve(restoredLeaseRecords.size() +
-                            eligibleRecords.size());
-      for (auto& restored : restoredLeaseRecords) {
-        mergedRecords.push_back(std::move(restored));
-        War3RebindEligibleRecordPacket(mergedRecords.back());
-      }
-      for (auto& live : eligibleRecords) {
-        mergedRecords.push_back(std::move(live));
-        War3RebindEligibleRecordPacket(mergedRecords.back());
-      }
-      eligibleRecords = std::move(mergedRecords);
+      // Preserve the historical [restored, live] ordering directly in the
+      // reusable primary vector. Any reserve/insert move may invalidate packet
+      // self-aliases, so no consumer observes the range before the full rebind.
+      eligibleRecords.reserve(
+          restoredLeaseRecords.size() + eligibleRecords.size());
+      eligibleRecords.insert(
+          eligibleRecords.begin(),
+          std::make_move_iterator(restoredLeaseRecords.begin()),
+          std::make_move_iterator(restoredLeaseRecords.end()));
+      // Release moved-from packet ownership now while retaining allocator
+      // capacity for the next frame. Scratch storage must never extend a
+      // logical resource reference across calls.
+      restoredLeaseRecords.clear();
       War3RebindEligibleRecordPackets(eligibleRecords);
     }
   }
