@@ -109,6 +109,9 @@ namespace dxvk {
         uint64_t deviceEpoch = 0u;
         uint64_t sourceGeneration = 0u;
         uint64_t captureStorageGeneration = 0u;
+        VkBuffer captureInfoBuffer = VK_NULL_HANDLE;
+        war3::render::War3ShadowReplayCapturedRangeIdentity
+            captureRangeIdentity = {};
         War3ShadowReplayStreamType stream =
             War3ShadowReplayStreamType::Position;
         bool pinned = false;
@@ -129,6 +132,10 @@ namespace dxvk {
           sourceGeneration = drawSourceGeneration;
           captureStorageGeneration =
               storage != nullptr ? storage->diagnosticStorageGeneration() : 0u;
+          captureInfoBuffer = capturedInfo.buffer;
+          captureRangeIdentity =
+              war3::render::MakeWar3ShadowReplayCapturedRangeIdentity(
+                  uint64_t(capturedInfo.offset), uint64_t(capturedInfo.size));
           stream = streamType;
           pinned = allocation != nullptr;
           captured = false;
@@ -152,6 +159,29 @@ namespace dxvk {
               uint64_t(capturedInfo.offset), uint64_t(capturedInfo.size));
           captured = logicalRange.valid;
           return captured;
+        }
+
+        bool matchesCapture(
+            const Rc<DxvkBuffer>& storage,
+            const Rc<DxvkResourceAllocation>& allocation,
+            const DxvkResourceBufferInfo& capturedInfo,
+            uint64_t drawMapEpoch, uint64_t drawDeviceEpoch,
+            uint64_t drawSourceGeneration,
+            War3ShadowReplayStreamType streamType) const noexcept {
+          // Do not compare diagnosticStorageGeneration here. A defrag may
+          // change the owner's physical backing after capture while the saved
+          // producer slice and logical range remain valid. Conversely, a new
+          // suballocation within the same Stage11 page changes capturedInfo
+          // and must force recapture even though owner/source are unchanged.
+          return captured && owner == storage &&
+              pinnedAllocation == allocation &&
+              mapEpoch == drawMapEpoch && deviceEpoch == drawDeviceEpoch &&
+              sourceGeneration == drawSourceGeneration &&
+              stream == streamType &&
+              captureInfoBuffer == capturedInfo.buffer &&
+              war3::render::War3ShadowReplayCapturedRangeMatches(
+                  captureRangeIdentity, uint64_t(capturedInfo.offset),
+                  uint64_t(capturedInfo.size));
         }
 
         bool resolve(
@@ -425,16 +455,17 @@ namespace dxvk {
       const auto needsCapture = [&](
           const War3ShadowReplayBufferBinding& binding,
           const Rc<DxvkBuffer>& owner,
-          const Rc<DxvkResourceAllocation>& pinned) {
-        return !binding.captured || binding.owner != owner ||
-            binding.pinnedAllocation != pinned ||
-            binding.mapEpoch != mapEpoch ||
-            binding.deviceEpoch != deviceEpoch ||
-            binding.sourceGeneration != sourceGeneration;
+          const Rc<DxvkResourceAllocation>& pinned,
+          const DxvkResourceBufferInfo& capturedInfo,
+          War3ShadowReplayStreamType streamType) {
+        return !binding.matchesCapture(
+            owner, pinned, capturedInfo, mapEpoch, deviceEpoch,
+            sourceGeneration, streamType);
       };
 
       if (needsCapture(draw.positionReplayBinding, draw.positionStorage,
-                       draw.positionPinnedAllocation)) {
+                       draw.positionPinnedAllocation, draw.positionInfo,
+                       War3ShadowReplayStreamType::Position)) {
         draw.positionReplayBinding.capture(
             draw.positionStorage, draw.positionPinnedAllocation,
             draw.positionInfo, mapEpoch, deviceEpoch, sourceGeneration,
@@ -442,14 +473,17 @@ namespace dxvk {
       }
       if (draw.indexed &&
           needsCapture(draw.indexReplayBinding, draw.indexStorage,
-                       draw.indexPinnedAllocation)) {
+                       draw.indexPinnedAllocation, draw.indexInfo,
+                       War3ShadowReplayStreamType::Index)) {
         draw.indexReplayBinding.capture(
             draw.indexStorage, draw.indexPinnedAllocation, draw.indexInfo,
             mapEpoch, deviceEpoch, sourceGeneration,
             War3ShadowReplayStreamType::Index);
       }
       if (draw.blendBinding == 1u &&
-          needsCapture(draw.blendReplayBinding, draw.blendStorage, nullptr)) {
+          needsCapture(draw.blendReplayBinding, draw.blendStorage, nullptr,
+                       draw.blendInfo,
+                       War3ShadowReplayStreamType::Blend)) {
         draw.blendReplayBinding.capture(
             draw.blendStorage, nullptr, draw.blendInfo,
             mapEpoch, deviceEpoch, sourceGeneration,
@@ -458,7 +492,8 @@ namespace dxvk {
       if (draw.alphaTestEnabled && draw.uvBinding != 0u &&
           !(draw.uvBinding == 1u && draw.blendBinding == 1u) &&
           needsCapture(draw.uvReplayBinding, draw.uvStorage,
-                       draw.uvPinnedAllocation)) {
+                       draw.uvPinnedAllocation, draw.uvInfo,
+                       War3ShadowReplayStreamType::Uv)) {
         draw.uvReplayBinding.capture(
             draw.uvStorage, draw.uvPinnedAllocation, draw.uvInfo,
             mapEpoch, deviceEpoch, sourceGeneration,

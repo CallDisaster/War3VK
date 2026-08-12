@@ -5,7 +5,11 @@
 高压“生与死”隔离桌面 A/B 表明，严格的 Stage11 静态源直绑可以停止静态
 缓存工作集的循环驱逐，并显著减少 32 次分配门造成的 required-caster omission。
 该路径现在成为 Release 源码默认；开发 observer 构建仍可用
-`DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE=0` 做单变量回退。
+物理画面复查发现建筑/树木可能被上层静态身份误判；当 Warcraft 复用父模型
+VB/IB 时，直接绑定会把后续写入暴露给阴影 replay。该路线已重新冻结为仅开发
+构建显式 `DXVK_WAR3_STAGE11_DIRECT_STATIC_SOURCE_MODE=1` 可达；Release 默认
+使用有序 copy 写入 WarVK 自有 Stage11 snapshot page。离线 generation proof
+不能替代动画子部件的物理不变性证明。
 
 这不是恢复旧的跨帧 VB/IB fingerprint cache。准入仍要求：
 

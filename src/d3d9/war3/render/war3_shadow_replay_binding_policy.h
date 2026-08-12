@@ -22,6 +22,30 @@ struct War3ShadowReplayLogicalRange {
   bool valid = false;
 };
 
+// Identifies the producer-visible physical slice that was used to derive a
+// logical replay range. Several exact Stage11 snapshots may share one paged
+// DxvkBuffer owner, so owner identity alone cannot distinguish their offsets.
+// This identity is diagnostic/capture state only: replay still resolves the
+// logical range against the owner's current backing after defrag.
+struct War3ShadowReplayCapturedRangeIdentity {
+  uint64_t offset = 0u;
+  uint64_t length = 0u;
+  bool valid = false;
+};
+
+inline constexpr War3ShadowReplayCapturedRangeIdentity
+MakeWar3ShadowReplayCapturedRangeIdentity(
+    uint64_t offset, uint64_t length) noexcept {
+  return {offset, length, length != 0u};
+}
+
+inline constexpr bool War3ShadowReplayCapturedRangeMatches(
+    const War3ShadowReplayCapturedRangeIdentity& captured,
+    uint64_t offset, uint64_t length) noexcept {
+  return captured.valid && length != 0u &&
+      captured.offset == offset && captured.length == length;
+}
+
 inline War3ShadowReplayLogicalRange MakeWar3ShadowReplayLogicalRange(
     uint64_t backingOffset, uint64_t backingSize,
     uint64_t capturedOffset, uint64_t capturedLength) noexcept {

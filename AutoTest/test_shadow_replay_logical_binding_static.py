@@ -37,6 +37,23 @@ class ShadowReplayLogicalBindingStaticTest(unittest.TestCase):
             "backingOffset > std::numeric_limits<uint64_t>::max() - logical.offset",
             POLICY,
         )
+        self.assertIn("War3ShadowReplayCapturedRangeIdentity", POLICY)
+        self.assertIn("captured.offset == offset", POLICY)
+        self.assertIn("captured.length == length", POLICY)
+
+    def test_same_owner_different_suballocation_forces_recapture(self):
+        capture = function_body(SCENE, "inline void War3CaptureShadowReplayBindings(")
+        matcher = function_body(SCENE, "bool matchesCapture(")
+        self.assertIn("captureInfoBuffer == capturedInfo.buffer", matcher)
+        self.assertIn("War3ShadowReplayCapturedRangeMatches", matcher)
+        self.assertIn("capturedInfo.offset", matcher)
+        self.assertIn("capturedInfo.size", matcher)
+        self.assertIn("binding.matchesCapture(", capture)
+        for stream in ("Position", "Index", "Blend", "Uv"):
+            self.assertIn(f"War3ShadowReplayStreamType::{stream}", capture)
+        # Defrag changes the owner's current backing generation, not the
+        # producer-visible capture slice. It must remain resolvable.
+        self.assertNotIn("captureStorageGeneration ==", matcher)
 
     def test_scene_seal_captures_logical_bindings_before_seal(self):
         body = function_body(

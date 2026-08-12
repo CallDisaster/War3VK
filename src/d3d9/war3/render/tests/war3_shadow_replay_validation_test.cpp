@@ -55,6 +55,22 @@ int main() {
       std::numeric_limits<uint64_t>::max() - 8u, 4096u,
       logical, resolvedOffset, resolvedLength));
 
+  // Paged Stage11 snapshots share one buffer owner. Moving a draw from one
+  // suballocation to another must invalidate the capture identity, while a
+  // defrag that only changes the backing base leaves this producer identity
+  // and its logical range intact.
+  const auto capturedRange =
+      MakeWar3ShadowReplayCapturedRangeIdentity(1128u, 512u);
+  assert(capturedRange.valid);
+  assert(War3ShadowReplayCapturedRangeMatches(
+      capturedRange, 1128u, 512u));
+  assert(!War3ShadowReplayCapturedRangeMatches(
+      capturedRange, 1640u, 512u));
+  assert(!War3ShadowReplayCapturedRangeMatches(
+      capturedRange, 1128u, 256u));
+  assert(!War3ShadowReplayCapturedRangeMatches(
+      MakeWar3ShadowReplayCapturedRangeIdentity(1128u, 0u), 1128u, 0u));
+
   auto input = ValidIndexed();
   assert(ValidateWar3ShadowReplayDraw(input));
 

@@ -146,11 +146,14 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         for token in (
             "drawTimeIndexSlice.buffer() != nullptr",
             "idxSrcOffset",
-            "entry.indexCapacity = idxInfoCi.size;",
+            "War3AllocateStage11Snapshot(",
+            "entry.indexCapacity = snapshotCapacity;",
+            "entry.indexSnapshotOffset",
             "entry.firstIndex = 0u;",
             "ctx->copyBuffer",
         ):
             self.assertIn(token, backing)
+        self.assertIn("cDstOff = entry.indexSnapshotOffset", backing)
         self.assertNotIn("drawTimeIndexCpuSnapshot", backing)
         self.assertNotIn("indexHostSnapshot", backing)
 
@@ -691,11 +694,9 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
             "War3ShadowDrawTimeCapturePhase::PositionBacking",
             "War3ShadowDrawTimeCapturePhase::UvBacking",
         )
-        budget = source_block(
-            backing,
-            "if (needsNewPositionBuffer &&",
-            "if (needsNewPositionBuffer) {",
-        )
+        budget = backing[
+            backing.index("bool positionPageBudgetDeferred = false;") :
+        ]
         self.assertIn(
             "War3MarkDrawTimeExactRejectedCurrentFrame(vbCacheKey)",
             budget,
@@ -703,7 +704,7 @@ class Stage11ExactIndexBlockerStaticTests(unittest.TestCase):
         no_buffer = source_block(
             backing,
             "if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly &&\n"
-            "            (entry.positionBuffer == nullptr",
+            "            !directStaticPositionSource &&",
             "if (!gpuSkinSemanticBacking && !gpuSkinSemanticDirectOnly) {",
         )
         self.assertIn(
