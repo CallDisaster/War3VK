@@ -73,7 +73,7 @@ class CompactWorkTableContracts(unittest.TestCase):
 
     def test_consume_requires_seal_and_generation_match(self):
         loop = DEVICE.index(
-            "for (size_t recordIndex = 0u; recordIndex < recordsForBuild.size();"
+            "for (size_t buildIndex = 0u;"
         )
         block = DEVICE[loop : DEVICE.index("// --- Step 3: submit ---", loop)]
         self.assertIn("consumeCompactWorkTable", block)
@@ -90,7 +90,7 @@ class CompactWorkTableContracts(unittest.TestCase):
 
     def test_observe_compares_every_cached_early_gate(self):
         block = DEVICE[
-            DEVICE.index("for (const auto& record : directRecords)") :
+            DEVICE.index("for (uint32_t recordIndex = 0u;") :
             DEVICE.index('enterDirectDetailPhase("PreselectRecordSort")')
         ]
         for cached, canonical in (
@@ -103,6 +103,51 @@ class CompactWorkTableContracts(unittest.TestCase):
         self.assertIn("work.selectionKey != selectionKey", block)
         self.assertIn("work.priorityScore != priorityScore", block)
         self.assertIn("semanticSceneCompactWorkTableMismatchCount++", block)
+
+    def test_grouped_selection_moves_indices_not_contract_records(self):
+        start = DEVICE.index("struct PreselectedRecord")
+        end = DEVICE.index("// --- Step 2: build eligible record list", start)
+        block = DEVICE[start:end]
+        self.assertIn("uint32_t recordIndex = 0u", block)
+        self.assertNotIn("CurrentDrawContractRecord record", block)
+        self.assertIn("directRecords[a.recordIndex]", block)
+        self.assertIn("directRecords[b.recordIndex]", block)
+        self.assertIn(
+            "recordIndicesForBuild.push_back(preselectedRecords[i].recordIndex)",
+            block,
+        )
+        record_loop = DEVICE[
+            DEVICE.index('enterBuildEligiblePhase("RecordLoop")') :
+            DEVICE.index("if (traceBuildEligible)", DEVICE.index('enterBuildEligiblePhase("RecordLoop")'))
+        ]
+        self.assertIn("const auto& record = directRecords[recordIndex]", record_loop)
+        self.assertIn("m_war3CompactWorkTable.load(buildIndex", record_loop)
+
+    def test_reused_grouped_scratch_contains_no_resource_owners(self):
+        grouped = DEVICE[
+            DEVICE.index("// Keep the immutable snapshot as the only owner") :
+            DEVICE.index("// --- Step 2: build eligible record list")
+        ]
+        self.assertIn(
+            "static thread_local std::vector<uint32_t> s_recordIndicesForBuild",
+            grouped,
+        )
+        self.assertIn(
+            "static thread_local std::vector<PreselectedRecord> s_preselectedRecords",
+            grouped,
+        )
+        self.assertIn(
+            "static thread_local std::vector<PreselectedGroup> s_preselectedGroups",
+            grouped,
+        )
+        self.assertIn("recordIndicesForBuild.clear()", grouped)
+        self.assertIn("preselectedRecords.clear()", grouped)
+        self.assertIn("preselectedGroups.clear()", grouped)
+        self.assertNotIn(
+            "static thread_local std::vector<dxvk::war3::render::CurrentDrawContractRecord>",
+            grouped,
+        )
+        self.assertNotIn("static thread_local std::vector<ShadowDrawPacket>", grouped)
 
     def test_unsealed_and_early_rejected_items_skip_expensive_identity_work(self):
         start = DEVICE.index("const auto buildCompactWorkEvidence")

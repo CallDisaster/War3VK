@@ -25,7 +25,7 @@ class Stage11StaticWorldGenericFailClosedTests(unittest.TestCase):
     def test_preselect_rejects_known_static_world_before_policy_and_budget(self) -> None:
         preselect = self.grouped.index("War3SemanticScene/Direct/Preselect")
         loop = self.grouped.index(
-            "for (const auto& record : directRecords)", preselect
+            "for (uint32_t recordIndex = 0u;", preselect
         )
         policy = self.grouped.index(
             "ShadowProducerPolicyContext producerContext", loop
