@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 namespace dxvk::war3::shadow {
@@ -238,6 +239,26 @@ struct ShadowExplicitBlendSkinningResult {
   uint8_t blendCount = 0;
   bool usedSpanRemap = false;
 };
+
+inline void ResetShadowExplicitBlendSkinningResultPreserveScratch(
+    ShadowExplicitBlendSkinningResult& result) noexcept {
+  auto weights = std::move(result.weights);
+  auto indices = std::move(result.indices);
+  auto runtimeGroupPalette = std::move(result.runtimeGroupPalette);
+  result = {};
+  weights.clear();
+  indices.clear();
+  runtimeGroupPalette.clear();
+  if (weights.capacity() > 200000u)
+    std::vector<std::array<float, 3>>().swap(weights);
+  if (indices.capacity() > 200000u)
+    std::vector<std::array<uint8_t, 4>>().swap(indices);
+  if (runtimeGroupPalette.capacity() > 256u)
+    std::vector<Matrix4>().swap(runtimeGroupPalette);
+  result.weights = std::move(weights);
+  result.indices = std::move(indices);
+  result.runtimeGroupPalette = std::move(runtimeGroupPalette);
+}
 
 // Non-owning input for the synchronous explicit-blend resolver. The caller
 // retains ownership for the duration of the call; the resolver copies only

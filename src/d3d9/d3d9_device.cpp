@@ -7439,6 +7439,10 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       const uint32_t maxExpectedGroupSize = geo.maxMatrixGroupSize;
 
       dxvk::war3::shadow::ShadowExplicitBlendSkinningResult explicitBlend = {};
+      explicitBlend.weights =
+          std::move(resource.ownedVertexBlendWeights);
+      explicitBlend.indices =
+          std::move(resource.ownedVertexBlendIndices);
       const uint32_t explicitVertexCount =
           resource.vertexCount != 0u
               ? resource.vertexCount
@@ -7467,6 +7471,13 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
             uint32_t(out.runtimeGroupPalette.size()));
         directExplicitBlendResolved = true;
         directExplicitBlendMaxGroupSlot = explicitBlend.maxGroupSlot;
+      } else {
+        explicitBlend.weights.clear();
+        explicitBlend.indices.clear();
+        resource.ownedVertexBlendWeights =
+            std::move(explicitBlend.weights);
+        resource.ownedVertexBlendIndices =
+            std::move(explicitBlend.indices);
       }
     }
   }

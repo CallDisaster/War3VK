@@ -11,6 +11,8 @@ using dxvk::war3::render::RecycleScratchElements;
 using dxvk::war3::render::ResetCurrentDrawAuthoritativeSamplePreserveScratch;
 using dxvk::war3::render::ResetShadowDrawPacketPreserveScratch;
 using dxvk::war3::shadow::ShadowDrawPacket;
+using dxvk::war3::shadow::ShadowExplicitBlendSkinningResult;
+using dxvk::war3::shadow::ResetShadowExplicitBlendSkinningResultPreserveScratch;
 
 bool require(bool condition, const char* message) {
   if (!condition)
@@ -53,18 +55,12 @@ bool testPacketReset() {
   packet.resource.vertexGroupIndices =
       &packet.resource.ownedVertexGroupIndices;
 
-  const size_t positionCapacity = packet.resource.ownedPositions.capacity();
   const size_t groupCapacity =
       packet.resource.ownedVertexGroupIndices.capacity();
   const size_t blendWeightCapacity =
       packet.resource.ownedVertexBlendWeights.capacity();
   const size_t blendIndexCapacity =
       packet.resource.ownedVertexBlendIndices.capacity();
-  const size_t indexCapacity = packet.resource.ownedIndices.capacity();
-  const size_t groupSizeCapacity =
-      packet.resource.ownedMatrixGroupSizes.capacity();
-  const size_t matrixIndexCapacity =
-      packet.resource.ownedMatrixIndices.capacity();
   const size_t poseCapacity = packet.pose.matrixPalette.capacity();
   const size_t runtimeCapacity = packet.runtimeGroupPalette.capacity();
 
@@ -94,18 +90,17 @@ bool testPacketReset() {
                   packet.pose.matrixPalette.empty() &&
                   packet.runtimeGroupPalette.empty(),
               "owned content survived reset") &&
-      require(packet.resource.ownedPositions.capacity() >= positionCapacity &&
-                  packet.resource.ownedVertexGroupIndices.capacity() >=
+      require(packet.resource.ownedPositions.capacity() == 0u &&
+                  packet.resource.ownedIndices.capacity() == 0u &&
+                  packet.resource.ownedMatrixGroupSizes.capacity() == 0u &&
+                  packet.resource.ownedMatrixIndices.capacity() == 0u,
+              "non-hot packet capacity was retained") &&
+      require(packet.resource.ownedVertexGroupIndices.capacity() >=
                       groupCapacity &&
                   packet.resource.ownedVertexBlendWeights.capacity() >=
                       blendWeightCapacity &&
                   packet.resource.ownedVertexBlendIndices.capacity() >=
                       blendIndexCapacity &&
-                  packet.resource.ownedIndices.capacity() >= indexCapacity &&
-                  packet.resource.ownedMatrixGroupSizes.capacity() >=
-                      groupSizeCapacity &&
-                  packet.resource.ownedMatrixIndices.capacity() >=
-                      matrixIndexCapacity &&
                   packet.pose.matrixPalette.capacity() >= poseCapacity &&
                   packet.runtimeGroupPalette.capacity() >= runtimeCapacity,
               "vector capacity was not retained");
@@ -178,9 +173,71 @@ bool testElementRecycler() {
               "recycled palette scratch was not retained");
 }
 
+bool testExplicitBlendReset() {
+  ShadowExplicitBlendSkinningResult result = {};
+  result.weights.reserve(77u);
+  result.weights.push_back({0.5f, 0.25f, 0.0f});
+  result.indices.reserve(78u);
+  result.indices.push_back({1u, 2u, 3u, 0u});
+  result.runtimeGroupPalette.reserve(19u);
+  result.runtimeGroupPalette.emplace_back();
+  result.maxGroupSlot = 3u;
+  result.dynamicHash = 0x1234u;
+  result.blendCount = 2u;
+  result.usedSpanRemap = true;
+  const size_t weightCapacity = result.weights.capacity();
+  const size_t indexCapacity = result.indices.capacity();
+  const size_t paletteCapacity = result.runtimeGroupPalette.capacity();
+
+  ResetShadowExplicitBlendSkinningResultPreserveScratch(result);
+  return require(result.weights.empty() && result.indices.empty() &&
+                     result.runtimeGroupPalette.empty(),
+                 "explicit blend content survived reset") &&
+      require(result.maxGroupSlot == 0u && result.dynamicHash == 0u &&
+                  result.blendCount == 0u && !result.usedSpanRemap,
+              "explicit blend authority survived reset") &&
+      require(result.weights.capacity() >= weightCapacity &&
+                  result.indices.capacity() >= indexCapacity &&
+                  result.runtimeGroupPalette.capacity() >= paletteCapacity,
+              "explicit blend scratch capacity was not retained");
+}
+
+bool testOversizedScratchIsReleased() {
+  std::vector<uint8_t> bytes;
+  bytes.reserve(dxvk::war3::render::kDirectPacketScratchMaxVertexEntries + 1u);
+  dxvk::war3::render::ClearBoundedDirectPacketScratch(
+      bytes, dxvk::war3::render::kDirectPacketScratchMaxVertexEntries);
+  if (!require(bytes.empty() && bytes.capacity() == 0u,
+               "oversized packet scratch remained resident")) {
+    return false;
+  }
+
+  CurrentDrawAuthoritativeSample sample = {};
+  sample.palette.reserve(257u);
+  sample.groupSlots.reserve(200001u);
+  ResetCurrentDrawAuthoritativeSamplePreserveScratch(sample);
+  if (!require(sample.palette.capacity() == 0u &&
+                   sample.groupSlots.capacity() == 0u,
+               "oversized sample scratch remained resident")) {
+    return false;
+  }
+
+  ShadowExplicitBlendSkinningResult blend = {};
+  blend.weights.reserve(200001u);
+  blend.indices.reserve(200001u);
+  blend.runtimeGroupPalette.reserve(257u);
+  ResetShadowExplicitBlendSkinningResultPreserveScratch(blend);
+  return require(blend.weights.capacity() == 0u &&
+                     blend.indices.capacity() == 0u &&
+                     blend.runtimeGroupPalette.capacity() == 0u,
+                 "oversized blend scratch remained resident");
+}
+
 } // namespace
 
 int main() {
-  return testPacketReset() && testSampleReset() && testElementRecycler() ? 0
-                                                                         : 1;
+  return testPacketReset() && testSampleReset() && testElementRecycler() &&
+          testExplicitBlendReset() && testOversizedScratchIsReleased()
+      ? 0
+      : 1;
 }

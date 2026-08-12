@@ -5940,7 +5940,16 @@ bool TryResolveMeshDynamicExplicitBlendSkinning(
     bool materializeRuntimeGroupPalette,
     const MeshLayerBindingContract* layerContract,
     ExplicitBlendSkinResult& outResult, ShadowResolveStats* ioStats = nullptr) {
+  auto weightsScratch = std::move(outResult.weights);
+  auto indicesScratch = std::move(outResult.indices);
+  auto paletteScratch = std::move(outResult.runtimeGroupPalette);
   outResult = {};
+  weightsScratch.clear();
+  indicesScratch.clear();
+  paletteScratch.clear();
+  outResult.weights = std::move(weightsScratch);
+  outResult.indices = std::move(indicesScratch);
+  outResult.runtimeGroupPalette = std::move(paletteScratch);
 
   if (ioStats != nullptr)
     ioStats->explicitBlendAttempts++;
@@ -6979,17 +6988,31 @@ bool TryResolveExplicitBlendSkinningForRenderable(
     bool materializeRuntimeGroupPalette,
     ShadowExplicitBlendSkinningResult& outResult,
     ShadowResolveStats* ioStats) {
-  outResult = {};
+  ExplicitBlendSkinResult internal = {};
+  internal.weights = std::move(outResult.weights);
+  internal.indices = std::move(outResult.indices);
+  internal.runtimeGroupPalette = std::move(outResult.runtimeGroupPalette);
+  ResetShadowExplicitBlendSkinningResultPreserveScratch(outResult);
+  const auto restoreScratch = [&]() {
+    outResult.weights = std::move(internal.weights);
+    outResult.indices = std::move(internal.indices);
+    outResult.runtimeGroupPalette = std::move(internal.runtimeGroupPalette);
+    outResult.weights.clear();
+    outResult.indices.clear();
+    outResult.runtimeGroupPalette.clear();
+  };
 
   MeshLayerBindingContract layerContract = {};
-  if (!TryResolveMeshLayerBindingContract(renderable, layerContract))
+  if (!TryResolveMeshLayerBindingContract(renderable, layerContract)) {
+    restoreScratch();
     return false;
+  }
 
-  ExplicitBlendSkinResult internal = {};
   if (!TryResolveMeshDynamicExplicitBlendSkinning(
           renderable, vertexCount, posePaletteLimit, maxExpectedGroupSize,
           posePalette, materializeRuntimeGroupPalette, &layerContract,
           internal, ioStats)) {
+    restoreScratch();
     return false;
   }
 

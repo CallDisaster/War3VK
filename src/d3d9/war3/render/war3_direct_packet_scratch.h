@@ -8,6 +8,17 @@
 
 namespace dxvk::war3::render {
 
+constexpr size_t kDirectPacketScratchMaxPaletteMatrices = 256u;
+constexpr size_t kDirectPacketScratchMaxVertexEntries = 200000u;
+
+template <typename T>
+inline void ClearBoundedDirectPacketScratch(std::vector<T>& values,
+                                            size_t maxCapacity) noexcept {
+  values.clear();
+  if (values.capacity() > maxCapacity)
+    std::vector<T>().swap(values);
+}
+
 /**
  * Clears a DirectGrouped packet while retaining only caller-owned vector
  * capacity. No geometry bytes, pointer aliases, shared owners, identities or
@@ -16,43 +27,34 @@ namespace dxvk::war3::render {
  */
 inline void ResetShadowDrawPacketPreserveScratch(
     shadow::ShadowDrawPacket& packet) noexcept {
-  auto ownedPositions = std::move(packet.resource.ownedPositions);
   auto ownedVertexGroupIndices =
       std::move(packet.resource.ownedVertexGroupIndices);
   auto ownedVertexBlendWeights =
       std::move(packet.resource.ownedVertexBlendWeights);
   auto ownedVertexBlendIndices =
       std::move(packet.resource.ownedVertexBlendIndices);
-  auto ownedIndices = std::move(packet.resource.ownedIndices);
-  auto ownedMatrixGroupSizes =
-      std::move(packet.resource.ownedMatrixGroupSizes);
-  auto ownedMatrixIndices = std::move(packet.resource.ownedMatrixIndices);
   auto posePalette = std::move(packet.pose.matrixPalette);
   auto runtimeGroupPalette = std::move(packet.runtimeGroupPalette);
 
   packet = {};
 
-  ownedPositions.clear();
-  ownedVertexGroupIndices.clear();
-  ownedVertexBlendWeights.clear();
-  ownedVertexBlendIndices.clear();
-  ownedIndices.clear();
-  ownedMatrixGroupSizes.clear();
-  ownedMatrixIndices.clear();
-  posePalette.clear();
-  runtimeGroupPalette.clear();
+  ClearBoundedDirectPacketScratch(
+      ownedVertexGroupIndices, kDirectPacketScratchMaxVertexEntries);
+  ClearBoundedDirectPacketScratch(
+      ownedVertexBlendWeights, kDirectPacketScratchMaxVertexEntries);
+  ClearBoundedDirectPacketScratch(
+      ownedVertexBlendIndices, kDirectPacketScratchMaxVertexEntries);
+  ClearBoundedDirectPacketScratch(
+      posePalette, kDirectPacketScratchMaxPaletteMatrices);
+  ClearBoundedDirectPacketScratch(
+      runtimeGroupPalette, kDirectPacketScratchMaxPaletteMatrices);
 
-  packet.resource.ownedPositions = std::move(ownedPositions);
   packet.resource.ownedVertexGroupIndices =
       std::move(ownedVertexGroupIndices);
   packet.resource.ownedVertexBlendWeights =
       std::move(ownedVertexBlendWeights);
   packet.resource.ownedVertexBlendIndices =
       std::move(ownedVertexBlendIndices);
-  packet.resource.ownedIndices = std::move(ownedIndices);
-  packet.resource.ownedMatrixGroupSizes =
-      std::move(ownedMatrixGroupSizes);
-  packet.resource.ownedMatrixIndices = std::move(ownedMatrixIndices);
   packet.pose.matrixPalette = std::move(posePalette);
   packet.runtimeGroupPalette = std::move(runtimeGroupPalette);
 }

@@ -156,6 +156,10 @@ inline void ResetCurrentDrawAuthoritativeSamplePreserveScratch(
   sample = {};
   palette.clear();
   groupSlots.clear();
+  if (palette.capacity() > 256u)
+    std::vector<Matrix4>().swap(palette);
+  if (groupSlots.capacity() > 200000u)
+    std::vector<uint8_t>().swap(groupSlots);
   sample.palette = std::move(palette);
   sample.groupSlots = std::move(groupSlots);
 }
