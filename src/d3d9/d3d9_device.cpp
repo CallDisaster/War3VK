@@ -6647,11 +6647,14 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
       sharedGeoset;
   const dxvk::war3::model::ShadowGeosetResourceRecord* geoset = nullptr;
   bool geosetHit = false;
+  bool geosetSnapshotCacheHit = false;
   {
     auto geosetLookupScope =
         War3SemanticSubmitScope("War3SemanticScene/Direct/GeosetLookup");
-    if (geosetSnapshotCache != nullptr)
+    if (geosetSnapshotCache != nullptr) {
       sharedGeoset = geosetSnapshotCache->find(record.meshPayloadPtr);
+      geosetSnapshotCacheHit = sharedGeoset != nullptr;
+    }
     if (sharedGeoset == nullptr)
       sharedGeoset = War3FindDirectPacketGeosetResource(record.meshPayloadPtr);
     geoset = sharedGeoset.get();
@@ -7113,7 +7116,10 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   if (sharedGeoset == nullptr)
     sharedGeoset =
         War3GetDirectPacketGeosetResource(std::move(geosetLocal));
-  if (geosetSnapshotCache != nullptr)
+  // A cache hit already leaves the same immutable shared owner in its slot.
+  // Re-storing it would hash the key again and perform an otherwise useless
+  // shared_ptr increment/decrement pair for every adjacent instance part.
+  if (geosetSnapshotCache != nullptr && !geosetSnapshotCacheHit)
     geosetSnapshotCache->store(record.meshPayloadPtr, sharedGeoset);
   const auto& geo = *sharedGeoset;
 

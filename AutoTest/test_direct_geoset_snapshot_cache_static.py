@@ -47,6 +47,8 @@ store = builder.index("geosetSnapshotCache->store")
 resource_use = builder.index("const auto& geo = *sharedGeoset")
 assert local_find < global_find < store < resource_use
 assert "if (sharedGeoset == nullptr)\n      sharedGeoset = War3Find" in builder
+assert "geosetSnapshotCacheHit = sharedGeoset != nullptr;" in builder
+assert "geosetSnapshotCache != nullptr && !geosetSnapshotCacheHit" in builder
 
 populate = body("uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(")
 construct = populate.index("War3CurrentDrawGeosetSnapshotCache")

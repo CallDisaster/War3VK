@@ -13,12 +13,14 @@ BUILDER = DEVICE[START:END]
 cache_store = BUILDER.index(
     "geosetSnapshotCache->store(record.meshPayloadPtr, sharedGeoset)"
 )
+cache_store_gate = BUILDER.rfind("if (geosetSnapshotCache", 0, cache_store)
 geo_ref = BUILDER.index("const auto& geo = *sharedGeoset", cache_store)
 owner_move = BUILDER.index(
     "resource.resourceKeepAlive = std::move(sharedGeoset)", geo_ref
 )
 
 assert cache_store < geo_ref < owner_move
+assert "!geosetSnapshotCacheHit" in BUILDER[cache_store_gate:cache_store]
 assert "resource.resourceKeepAlive = sharedGeoset;" not in BUILDER
 assert "resource.resourceKeepAlive = std::move(sharedGeoset);" in BUILDER
 assert BUILDER[owner_move:].count("sharedGeoset") == 1  # the move expression
