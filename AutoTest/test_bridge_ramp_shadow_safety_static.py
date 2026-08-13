@@ -527,7 +527,30 @@ class BridgeRampShadowSafetyTests(unittest.TestCase):
             "sourceFingerprint != s1SourceFingerprint", hit_guard
         )
         self.assertIn("s1EarlySourceMismatchEvictCount", hit_guard)
-        # 指纹必须在查找之前从当前 draw 状态计算，两个 store 站点都必须记录。
+        # Empty and key-miss probes must not scan every active stream. The
+        # fingerprint is computed only inside the hit branch, before the
+        # fail-closed source comparison. Both store sites still record it.
+        early_block_start = self.device.rindex(
+            "if (isTerrainS1Draw &&", 0, hit_start
+        )
+        early_block = self.device[early_block_start:hit_publish]
+        self.assertIn("!m_war3S1TerrainEarlyCache.empty()", early_block)
+        fingerprint = early_block.index(
+            "War3ComputeS1TerrainSourceFingerprint(indexed, BaseVertexIndex,"
+        )
+        lookup = early_block.index(
+            "auto earlyIt = m_war3S1TerrainEarlyCache.find"
+        )
+        hit_if = early_block.index(
+            "if (earlyIt != m_war3S1TerrainEarlyCache.end())", lookup
+        )
+        compare = early_block.index(
+            "sourceFingerprint != s1SourceFingerprint", hit_if
+        )
+        self.assertLess(lookup, hit_if)
+        self.assertLess(hit_if, fingerprint)
+        self.assertLess(fingerprint, compare)
+        self.assertNotIn("return;", early_block[:lookup])
         self.assertIn(
             "War3ComputeS1TerrainSourceFingerprint(indexed, BaseVertexIndex,",
             self.device,

@@ -20,6 +20,7 @@
 #include "war3/render/war3_renderer.h"
 #include "war3/render/war3_shadow_capture_frontend.h"
 #include "war3/render/war3_shadow_drawtime_cache_policy.h"
+#include "war3/render/war3_shadow_fallback_breakdown.h"
 #include "war3/render/war3_shadow_lifecycle.h"
 #include "war3/render/war3_shadow_object_registry.h"
 #include "war3/render/war3_shadow_observer_build_policy.h"
@@ -4660,22 +4661,12 @@ uint32_t War3NormalizeShadowHandle(uint32_t handle) {
 }
 
 void War3RecomputeFallbackBreakdown(War3FrameScene& scene) {
-  scene.shadowStats.fallbackDrawCount =
-      static_cast<uint32_t>(scene.shadowFallbacks.size());
-  scene.shadowStats.fallbackDrawCountTerrain = 0u;
-  scene.shadowStats.fallbackDrawCountWorldObject = 0u;
-  scene.shadowStats.fallbackDrawCountUnitObject = 0u;
+  war3::render::War3ResetShadowFallbackBreakdown(
+      scene.shadowStats, scene.shadowFallbacks.size());
   for (const auto& fallback : scene.shadowFallbacks) {
-    if (fallback.snapshot.category == War3RenderState::StageCategory::Terrain)
-      scene.shadowStats.fallbackDrawCountTerrain++;
-    if (fallback.snapshot.category == War3RenderState::StageCategory::WorldObject ||
-        fallback.snapshot.category == War3RenderState::StageCategory::Effect) {
-      scene.shadowStats.fallbackDrawCountWorldObject++;
-    }
-    if (fallback.snapshot.objectKind ==
-        static_cast<uint8_t>(dxvk::war3::render::ObjectKind::Unit)) {
-      scene.shadowStats.fallbackDrawCountUnitObject++;
-    }
+    war3::render::War3AccumulateShadowFallbackClassification(
+        scene.shadowStats, fallback.snapshot.category,
+        fallback.snapshot.objectKind);
   }
 }
 
@@ -46096,7 +46087,8 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       m_state.renderStates[D3DRS_ALPHATESTENABLE] == FALSE &&
       m_state.renderStates[D3DRS_ALPHABLENDENABLE] == FALSE &&
       War3S1TerrainPersistentGeometryRuntime() &&
-      captureSettings.shadows.enabled) {
+      captureSettings.shadows.enabled &&
+      !m_war3S1TerrainEarlyCache.empty()) {
     War3CaptureCpuSample s1EarlySample(trackShadowCaptureCpu);
     if (trackShadowCaptureCpu) {
       s1EarlySample.bucketTicks =
@@ -46111,11 +46103,14 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
     const uint64_t s1EarlyKey = War3BuildS1TerrainEarlyKey(
         s1World, indexed, PrimitiveType, NumVertices, CountVal);
-    const uint64_t s1SourceFingerprint =
-        War3ComputeS1TerrainSourceFingerprint(indexed, BaseVertexIndex,
-                                              MinVertexIndex, StartVal);
     auto earlyIt = m_war3S1TerrainEarlyCache.find(s1EarlyKey);
     if (earlyIt != m_war3S1TerrainEarlyCache.end()) {
+      // Computing the source fingerprint walks every active vertex stream.
+      // It only distinguishes a true key hit from an alias, so an empty cache
+      // or a key miss must continue directly to the canonical slow path.
+      const uint64_t s1SourceFingerprint =
+          War3ComputeS1TerrainSourceFingerprint(indexed, BaseVertexIndex,
+                                                MinVertexIndex, StartVal);
       bool backingValid = true;
       const War3ShadowPersistentGeometry* earlyPersistentGeometry = nullptr;
       if (earlyIt->second.sourceFingerprint != s1SourceFingerprint) {
@@ -46231,10 +46226,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                nullptr,
                nullptr,
                0u});
+          const auto& appendedFallback =
+              m_war3Scene.shadowFallbacks.back().snapshot;
+          war3::render::War3NoteShadowFallbackAppended(
+              m_war3Scene.shadowStats, m_war3Scene.shadowFallbacks.size(),
+              appendedFallback.category, appendedFallback.objectKind);
           m_war3Scene.shadowStats.fallbackSnapshotCount++;
-          m_war3Scene.shadowStats.fallbackDrawCount =
-              static_cast<uint32_t>(m_war3Scene.shadowFallbacks.size());
-          m_war3Scene.shadowStats.fallbackDrawCountTerrain++;
           persistentDiagnostics.s1EarlyReplayFallbackCount++;
         }
         m_war3Scene.shadowCasters.emplace_back(std::move(hitDraw));
@@ -51991,8 +51988,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
            : semantic.sceneNode,
        semantic.runtimeModelPtr,
        semantic.modelKey});
+  const auto& appendedFallback =
+      m_war3Scene.shadowFallbacks.back().snapshot;
+  war3::render::War3NoteShadowFallbackAppended(
+      m_war3Scene.shadowStats, m_war3Scene.shadowFallbacks.size(),
+      appendedFallback.category, appendedFallback.objectKind);
   m_war3Scene.shadowStats.fallbackSnapshotCount++;
-  War3RecomputeFallbackBreakdown(m_war3Scene);
   m_war3Scene.shadowStats.fallbackArenaBytes =
       dxvk::war3::memory::ShadowArena_UsedBytes();
   // S1 period 诊断路径：仅 period>1 时在采集帧写入 stash（默认 period=1 跳过，

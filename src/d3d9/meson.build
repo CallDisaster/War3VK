@@ -622,6 +622,22 @@ test(
   timeout : 30,
 )
 
+# Value-only live fallback diagnostics. Append is O(1); the production path
+# performs a full scan only after its sole semantic-prune erase operation.
+war3_shadow_fallback_breakdown_test = executable(
+  'war3_shadow_fallback_breakdown_test',
+  [
+    'war3/render/tests/war3_shadow_fallback_breakdown_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_shadow_fallback_breakdown',
+  war3_shadow_fallback_breakdown_test,
+  timeout : 30,
+)
+
 # Exact terrain bounds may consume a non-indexed draw range directly, but an
 # indexed draw must first prove its real domain from current IB bytes. This
 # policy test deliberately has no D3D9/Vulkan dependency.
