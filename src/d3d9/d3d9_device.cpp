@@ -26869,7 +26869,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     struct PreselectedRecord {
       uint32_t recordIndex = 0u;
       uint32_t visibleHintIndex = UINT32_MAX;
-      War3CompactWorkItem work = {};
       uint64_t selectionKey = 0u;
       uint32_t priorityScore = 0u;
       bool previouslySelected = false;
@@ -26884,19 +26883,27 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
     static thread_local std::vector<PreselectedRecord> s_preselectedRecords;
     static thread_local std::vector<PreselectedGroup> s_preselectedGroups;
+    static thread_local std::vector<War3CompactWorkItem>
+        s_preselectedWorkByRecordIndex;
     auto& preselectedRecords = s_preselectedRecords;
     auto& preselectedGroups = s_preselectedGroups;
+    auto& preselectedWorkByRecordIndex = s_preselectedWorkByRecordIndex;
     preselectedRecords.clear();
     preselectedGroups.clear();
+    preselectedWorkByRecordIndex.clear();
     preselectedRecords.reserve(rawRecordCount);
+    if (compactWorkTableMode != War3CompactWorkTableMode::Off)
+      preselectedWorkByRecordIndex.resize(directRecords.size());
     auto preselectScope = War3SemanticSubmitScope(
         "War3SemanticScene/Direct/Preselect");
     for (uint32_t recordIndex = 0u;
          recordIndex < uint32_t(directRecords.size()); ++recordIndex) {
       const auto& record = directRecords[recordIndex];
       War3CompactWorkItem work = {};
-      if (compactWorkTableMode != War3CompactWorkTableMode::Off)
+      if (compactWorkTableMode != War3CompactWorkTableMode::Off) {
         work = buildCompactWorkEvidence(record);
+        preselectedWorkByRecordIndex[recordIndex] = work;
+      }
       const bool workSealed =
           War3CompactWorkHasFlag(work, War3CompactWorkSealed);
       const bool useSealedWork = consumeCompactWorkTable && workSealed;
@@ -27015,7 +27022,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       preselectedRecords.push_back(
           {recordIndex,
            visibleHintIndex,
-           work,
            selectionKey,
            priorityScore,
            previouslySelected});
@@ -27102,8 +27108,15 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
             preselectedRecords[i].selectionKey);
         recordVisibleHintIndicesForBuild.push_back(
             preselectedRecords[i].visibleHintIndex);
-        if (compactWorkTableMode != War3CompactWorkTableMode::Off)
-          m_war3CompactWorkTable.append(preselectedRecords[i].work);
+        if (compactWorkTableMode != War3CompactWorkTableMode::Off) {
+          const uint32_t sourceRecordIndex =
+              preselectedRecords[i].recordIndex;
+          if (sourceRecordIndex < preselectedWorkByRecordIndex.size())
+            m_war3CompactWorkTable.append(
+                preselectedWorkByRecordIndex[sourceRecordIndex]);
+          else
+            m_war3CompactWorkTable.appendInvalid(1u);
+        }
       }
       if (stickySelectionFill && group.previouslySelected &&
           recordIndicesForBuild.size() > size_t(directRecordCap)) {
