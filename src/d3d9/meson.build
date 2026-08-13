@@ -475,6 +475,22 @@ test(
   timeout : 30,
 )
 
+# Current-frame visible owner projection requires at least one exact instance
+# alias and rejects every conflicting alias before bypassing registry lookup.
+war3_visible_instance_projection_test = executable(
+  'war3_visible_instance_projection_test',
+  [
+    'war3/render/tests/war3_visible_instance_projection_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_visible_instance_projection',
+  war3_visible_instance_projection_test,
+  timeout : 30,
+)
+
 # High-frequency classified counters keep only attempts and mutually exclusive
 # failure buckets; successful counts are derived when diagnostics are sampled.
 war3_classified_counter_test = executable(

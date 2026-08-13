@@ -30,6 +30,7 @@
 #include "war3/render/war3_terrain_bounds_provenance.h"
 #include "war3/render/war3_upper_layer_shadow.h"
 #include "war3/render/war3_visible_renderables.h"
+#include "war3/render/war3_visible_instance_projection.h"
 #include "war3/render/war3_canonical_draw.h"
 #include "war3/render/war3_current_draw_contract.h"
 #include "war3/render/war3_immutable_group_slot_binding.h"
@@ -6736,32 +6737,46 @@ bool War3TryBuildShadowPacketFromCurrentDrawRecord(
   bool ownerHit = false;
   dxvk::war3::model::ModelInstanceDirectPacketView instanceRecord = {};
   auto& instanceRegistry = dxvk::war3::model::ModelInstanceRegistry::instance();
-  // A fully populated exact visible record is already the current-frame value
-  // projection of the same instance identity. Reuse it only when every alias
-  // agrees with CurrentDraw; attachments and partial records retain the
-  // generation-checked registry lookup below.
+  // An exact visible record is already the current-frame value projection of
+  // this part/layer. Reuse its model owner when CurrentDraw carries at least
+  // one strong instance alias and every alias it does carry agrees. Shared
+  // model parts without instance proof retain the generation-checked lookup.
+  const dxvk::war3::render::War3VisibleInstanceProjectionFacts
+      visibleInstanceFacts = {
+          record.worldObjectEntry,
+          record.sceneNode,
+          record.unitPtr,
+          record.jHandle,
+          record.rawcode,
+          visibleHit ? visibleRecord->identity.worldObjectEntry : nullptr,
+          visibleHit ? visibleRecord->sceneNode : nullptr,
+          visibleHit ? visibleRecord->identity.sceneNode : nullptr,
+          visibleHit ? visibleRecord->identity.unitPtr : nullptr,
+          visibleHit ? visibleRecord->identity.jHandle : 0u,
+          visibleHit ? visibleRecord->identity.rawcode : 0u,
+          visibleHit ? visibleRecord->runtimeModelPtr : nullptr,
+          visibleHit ? visibleRecord->modelResourcePtr : nullptr,
+          visibleHit ? visibleRecord->modelKey : 0u,
+      };
   const bool visibleProvesInstance =
-      visibleHit && record.worldObjectEntry != nullptr &&
-      record.sceneNode != nullptr && record.unitPtr != nullptr &&
-      record.jHandle != 0u && record.rawcode != 0u &&
-      visibleRecord->identity.worldObjectEntry == record.worldObjectEntry &&
-      visibleRecord->sceneNode == record.sceneNode &&
-      visibleRecord->identity.sceneNode == record.sceneNode &&
-      visibleRecord->identity.unitPtr == record.unitPtr &&
-      visibleRecord->identity.jHandle == record.jHandle &&
-      visibleRecord->identity.rawcode == record.rawcode &&
-      visibleRecord->runtimeModelPtr != nullptr &&
-      visibleRecord->modelResourcePtr != nullptr &&
-      visibleRecord->modelKey != 0u;
+      visibleHit && dxvk::war3::render::War3CanProjectVisibleInstance(
+                        visibleInstanceFacts);
   bool instanceHit = visibleProvesInstance;
   if (visibleProvesInstance) {
-    instanceRecord.worldObjectEntry = record.worldObjectEntry;
-    instanceRecord.sceneNode = record.sceneNode;
-    instanceRecord.unitPtr = record.unitPtr;
+    instanceRecord.worldObjectEntry =
+        visibleRecord->identity.worldObjectEntry != nullptr
+            ? visibleRecord->identity.worldObjectEntry
+            : record.worldObjectEntry;
+    instanceRecord.sceneNode = visibleRecord->sceneNode != nullptr
+        ? visibleRecord->sceneNode : record.sceneNode;
+    instanceRecord.unitPtr = visibleRecord->identity.unitPtr != nullptr
+        ? visibleRecord->identity.unitPtr : record.unitPtr;
     instanceRecord.runtimeModelPtr = visibleRecord->runtimeModelPtr;
     instanceRecord.modelResourcePtr = visibleRecord->modelResourcePtr;
-    instanceRecord.jHandle = record.jHandle;
-    instanceRecord.rawcode = record.rawcode;
+    instanceRecord.jHandle = visibleRecord->identity.jHandle != 0u
+        ? visibleRecord->identity.jHandle : record.jHandle;
+    instanceRecord.rawcode = visibleRecord->identity.rawcode != 0u
+        ? visibleRecord->identity.rawcode : record.rawcode;
     instanceRecord.modelKey = visibleRecord->modelKey;
   }
   if (packetBuildTiming != nullptr)

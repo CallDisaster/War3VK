@@ -12,20 +12,24 @@ body = DEVICE[start:end]
 assert "preselectedVisibleRecord->renderablePart == record.renderablePart" in body
 assert "preselectedVisibleRecord->layerIndex == record.layerIndex" in body
 
-# Instance projection is restricted to complete current-frame aliases and
-# immutable model identity. Any missing or mismatched field falls back to the
-# existing generation-checked registry query.
+# A pure contract accepts partial CurrentDraw identity only when at least one
+# strong alias exists, every supplied alias agrees, and the visible model owner
+# is complete. Shared parts without instance identity retain registry lookup.
+assert "War3VisibleInstanceProjectionFacts" in body
+assert "War3CanProjectVisibleInstance(" in body
+policy = (ROOT / "src/d3d9/war3/render/war3_visible_instance_projection.h").read_text(
+    encoding="utf-8"
+)
 for proof in (
-    "visibleRecord->identity.worldObjectEntry == record.worldObjectEntry",
-    "visibleRecord->identity.sceneNode == record.sceneNode",
-    "visibleRecord->identity.unitPtr == record.unitPtr",
-    "visibleRecord->identity.jHandle == record.jHandle",
-    "visibleRecord->identity.rawcode == record.rawcode",
-    "visibleRecord->runtimeModelPtr != nullptr",
-    "visibleRecord->modelResourcePtr != nullptr",
-    "visibleRecord->modelKey != 0u",
+    "facts.recordWorldObjectEntry != nullptr",
+    "facts.recordSceneNode != nullptr",
+    "facts.recordUnitPtr != nullptr",
+    "facts.recordJHandle != 0u",
+    "facts.visibleRuntimeModelPtr == nullptr",
+    "facts.visibleModelResourcePtr == nullptr",
+    "facts.visibleModelKey == 0u",
 ):
-    assert proof in body
+    assert proof in policy
 
 projection = body[body.index("if (visibleProvesInstance) {") :]
 fallback = projection.index("if (!instanceHit) {")
