@@ -5855,12 +5855,13 @@ public:
         entry.sceneNode == sceneNode && entry.unitPtr == unitPtr &&
         entry.worldObjectEntry == worldObjectEntry &&
         entry.runtimeModelPtr == runtimeModelPtr) {
-      const auto cachedValue = entry.value;
-      const bool cachedFound = entry.found;
       if (registry.mutationGeneration() == currentGeneration) {
-        out = cachedValue;
+        // The Populate-local cache is single-thread owned. Registry writers
+        // can invalidate its generation but cannot mutate this entry, so copy
+        // the POD projection only after the second generation check.
+        out = entry.value;
         ++m_hitCount;
-        return cachedFound;
+        return entry.found;
       }
     }
 
@@ -5933,12 +5934,10 @@ public:
         entry.generation == currentGeneration &&
         entry.runtimeModelPtr == runtimeModelPtr &&
         entry.sceneNode == sceneNode && entry.unitPtr == unitPtr) {
-      const auto cachedValue = entry.value;
-      const bool cachedFound = entry.found;
       if (registry.mutationGeneration() == currentGeneration) {
-        out = cachedValue;
+        out = entry.value;
         ++m_hitCount;
-        return cachedFound;
+        return entry.found;
       }
     }
 
@@ -6010,12 +6009,10 @@ public:
         entry.sceneNode == sceneNode && entry.jHandle == jHandle &&
         entry.primaryRuntimeModelPtr == primaryRuntimeModelPtr &&
         entry.secondaryRuntimeModelPtr == secondaryRuntimeModelPtr) {
-      const auto cachedValue = entry.value;
-      const bool cachedFound = entry.found;
       if (registry.mutationGeneration() == currentGeneration) {
-        out = cachedValue;
+        out = entry.value;
         ++m_hitCount;
-        return cachedFound;
+        return entry.found;
       }
     }
 
