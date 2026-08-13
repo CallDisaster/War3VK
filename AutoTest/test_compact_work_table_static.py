@@ -113,7 +113,8 @@ class CompactWorkTableContracts(unittest.TestCase):
         self.assertIn("directRecords[a.recordIndex]", block)
         self.assertIn("directRecords[b.recordIndex]", block)
         self.assertIn(
-            "recordIndicesForBuild.push_back(preselectedRecords[i].recordIndex)",
+            "recordBuildRefs.push_back(\n"
+            "            {preselectedRecords[i].selectionKey",
             block,
         )
         record_loop = DEVICE[
@@ -129,7 +130,7 @@ class CompactWorkTableContracts(unittest.TestCase):
             DEVICE.index("// --- Step 2: build eligible record list")
         ]
         self.assertIn(
-            "static thread_local std::vector<uint32_t> s_recordIndicesForBuild",
+            "static thread_local std::vector<DirectRecordBuildRef> s_recordBuildRefs",
             grouped,
         )
         self.assertIn(
@@ -140,7 +141,7 @@ class CompactWorkTableContracts(unittest.TestCase):
             "static thread_local std::vector<PreselectedGroup> s_preselectedGroups",
             grouped,
         )
-        self.assertIn("recordIndicesForBuild.clear()", grouped)
+        self.assertIn("recordBuildRefs.clear()", grouped)
         self.assertIn("preselectedRecords.clear()", grouped)
         self.assertIn("preselectedGroups.clear()", grouped)
         self.assertNotIn(

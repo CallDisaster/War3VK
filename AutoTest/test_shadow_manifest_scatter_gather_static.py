@@ -69,7 +69,7 @@ class ShadowManifestScatterGatherStaticTests(unittest.TestCase):
             "publishShadowManifestSummary(exactSubmittedManifestRecords,",
             body,
         )
-        self.assertIn("shadowEligibleManifestRecords.reserve(recordIndicesForBuild.size())", body)
+        self.assertIn("shadowEligibleManifestRecords.reserve(recordBuildRefs.size())", body)
 
 
 if __name__ == "__main__":

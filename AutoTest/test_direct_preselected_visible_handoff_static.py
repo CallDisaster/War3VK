@@ -34,15 +34,15 @@ class DirectPreselectedVisibleHandoffStaticTests(unittest.TestCase):
 
     def test_hint_storage_is_dense_current_call_value_scratch(self) -> None:
         start = DEVICE.index(
-            "static thread_local std::vector<uint32_t> s_recordIndicesForBuild"
+            "struct DirectRecordBuildRef"
         )
         end = DEVICE.index("// --- Step 2: build eligible record list", start)
         block = DEVICE[start:end]
         for token in (
             "s_preselectedVisibleHints",
-            "s_recordVisibleHintIndicesForBuild",
+            "uint32_t visibleHintIndex = UINT32_MAX",
             "preselectedVisibleHints.clear()",
-            "recordVisibleHintIndicesForBuild.clear()",
+            "recordBuildRefs.clear()",
             "record, &visibleHint, &visiblePartLayerQueryCache",
             "preselectedVisibleHints.push_back(*visibleHint)",
             "preselectedRecords[i].visibleHintIndex",
@@ -75,12 +75,16 @@ class DirectPreselectedVisibleHandoffStaticTests(unittest.TestCase):
         packet_call = DEVICE.index(
             "War3TryBuildShadowPacketFromCurrentDrawRecord(", loop
         )
-        call_block = DEVICE[packet_call : DEVICE.index("packetBuildTiming.finish()", packet_call)]
+        call_block = DEVICE[
+            packet_call : DEVICE.index(
+                "if (packetBuildTiming.has_value())", packet_call
+            )
+        ]
         self.assertIn("preselectedVisibleRecord", call_block)
         fallback = DEVICE.index('enterDirectDetailPhase("SnapshotFallbackCopy")')
         fallback_end = DEVICE.index("// --- Step 2: build eligible record list", fallback)
         self.assertIn(
-            "recordVisibleHintIndicesForBuild.assign(directRecords.size(), UINT32_MAX)",
+            "recordBuildRefs.resize(directRecords.size())",
             DEVICE[fallback:fallback_end],
         )
 

@@ -26724,22 +26724,20 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   // selected records once more into recordsForBuild.  Carry snapshot indices
   // instead: all policy/order keys and the eventual packet builder still read
   // the exact same record, while the hot path moves only a uint32_t.
-  static thread_local std::vector<uint32_t> s_recordIndicesForBuild;
-  static thread_local std::vector<uint64_t> s_recordSelectionKeysForBuild;
+  struct DirectRecordBuildRef {
+    uint64_t selectionKey = 0u;
+    uint32_t recordIndex = 0u;
+    uint32_t visibleHintIndex = UINT32_MAX;
+  };
+  static_assert(sizeof(DirectRecordBuildRef) == 16u);
+  static thread_local std::vector<DirectRecordBuildRef> s_recordBuildRefs;
   static thread_local std::vector<
       dxvk::war3::render::VisibleRenderableRecord>
       s_preselectedVisibleHints;
-  static thread_local std::vector<uint32_t>
-      s_recordVisibleHintIndicesForBuild;
-  auto& recordIndicesForBuild = s_recordIndicesForBuild;
-  auto& recordSelectionKeysForBuild = s_recordSelectionKeysForBuild;
+  auto& recordBuildRefs = s_recordBuildRefs;
   auto& preselectedVisibleHints = s_preselectedVisibleHints;
-  auto& recordVisibleHintIndicesForBuild =
-      s_recordVisibleHintIndicesForBuild;
-  recordIndicesForBuild.clear();
-  recordSelectionKeysForBuild.clear();
+  recordBuildRefs.clear();
   preselectedVisibleHints.clear();
-  recordVisibleHintIndicesForBuild.clear();
   const War3CompactWorkTableMode compactWorkTableMode =
       War3SemanticCompactWorkTableModeRuntime();
   const bool observeCompactWorkTable =
@@ -26865,7 +26863,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     // including records rejected before BuildEligible. A compact index follows
     // the candidate through sorting and final selection instead.
     preselectedVisibleHints.reserve(rawRecordCount);
-    recordVisibleHintIndicesForBuild.reserve(directStickyRecordBudget);
+    recordBuildRefs.reserve(directStickyRecordBudget);
     struct PreselectedRecord {
       uint32_t recordIndex = 0u;
       uint32_t visibleHintIndex = UINT32_MAX;
@@ -27081,8 +27079,6 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               });
 
     enterDirectDetailPhase("PreselectSelection");
-    recordIndicesForBuild.reserve(directStickyRecordBudget);
-    recordSelectionKeysForBuild.reserve(directStickyRecordBudget);
     const bool stickyLease =
         War3SemanticStickySelectionLeaseRuntime() &&
         !preferredSelectionKeys.empty();
@@ -27092,7 +27088,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
     auto tryAppendPreselectedGroup = [&](const PreselectedGroup& group,
                                          size_t groupBudget) {
-      if (recordIndicesForBuild.size() + group.count > groupBudget) {
+      if (recordBuildRefs.size() + group.count > groupBudget) {
         m_war3Scene.shadowStats.semanticSceneDirectObjectGroupedSkipCount++;
         m_war3Scene.shadowStats.semanticSceneDirectRecordCapTruncatedRecordCount +=
             group.count;
@@ -27101,13 +27097,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
               group.count;
         return false;
       }
-      const size_t beforeSize = recordIndicesForBuild.size();
+      const size_t beforeSize = recordBuildRefs.size();
       for (uint32_t i = group.startIdx; i < group.startIdx + group.count; ++i) {
-        recordIndicesForBuild.push_back(preselectedRecords[i].recordIndex);
-        recordSelectionKeysForBuild.push_back(
-            preselectedRecords[i].selectionKey);
-        recordVisibleHintIndicesForBuild.push_back(
-            preselectedRecords[i].visibleHintIndex);
+        recordBuildRefs.push_back(
+            {preselectedRecords[i].selectionKey,
+             preselectedRecords[i].recordIndex,
+             preselectedRecords[i].visibleHintIndex});
         if (compactWorkTableMode != War3CompactWorkTableMode::Off) {
           const uint32_t sourceRecordIndex =
               preselectedRecords[i].recordIndex;
@@ -27119,21 +27114,21 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         }
       }
       if (stickySelectionFill && group.previouslySelected &&
-          recordIndicesForBuild.size() > size_t(directRecordCap)) {
+          recordBuildRefs.size() > size_t(directRecordCap)) {
         const size_t extraBefore =
             beforeSize > size_t(directRecordCap)
                 ? beforeSize - size_t(directRecordCap)
                 : 0u;
         const size_t extraAfter =
-            recordIndicesForBuild.size() - size_t(directRecordCap);
+            recordBuildRefs.size() - size_t(directRecordCap);
         m_war3Scene.shadowStats.semanticSceneDirectStickyFillAppendedCount +=
             uint32_t(extraAfter - extraBefore);
       }
       if (beforeSize < size_t(directRecordCap) &&
-          recordIndicesForBuild.size() >= size_t(directRecordCap)) {
+          recordBuildRefs.size() >= size_t(directRecordCap)) {
         m_war3Scene.shadowStats.semanticSceneDirectRecordCapHitCount++;
       }
-      return recordIndicesForBuild.size() < groupBudget;
+      return recordBuildRefs.size() < groupBudget;
     };
 
     if (stickyLease) {
@@ -27148,7 +27143,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       }
     }
 
-    if (!stickyLease || recordIndicesForBuild.size() < stickyMinRecords) {
+    if (!stickyLease || recordBuildRefs.size() < stickyMinRecords) {
       for (const auto& group : preselectedGroups) {
         if (stickyLease && group.previouslySelected)
           continue;
@@ -27159,12 +27154,12 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     recordsForBuildCanonicalPrefiltered = true;
   } else {
     enterDirectDetailPhase("SnapshotFallbackCopy");
-    recordIndicesForBuild.resize(directRecords.size());
-    std::iota(recordIndicesForBuild.begin(), recordIndicesForBuild.end(), 0u);
-    // Zero means the uncapped fallback did not run the grouped preselector;
-    // BuildEligible retains its historical on-demand identity resolution.
-    recordSelectionKeysForBuild.assign(directRecords.size(), 0u);
-    recordVisibleHintIndicesForBuild.assign(directRecords.size(), UINT32_MAX);
+    recordBuildRefs.resize(directRecords.size());
+    // Zero selection and UINT32_MAX hint mean the uncapped fallback did not
+    // run the grouped preselector; BuildEligible retains its historical
+    // on-demand identity and visible-record resolution.
+    for (uint32_t i = 0u; i < uint32_t(recordBuildRefs.size()); ++i)
+      recordBuildRefs[i].recordIndex = i;
   }
 
   // --- Step 2: build eligible record list (per-record filtering) ---
@@ -27375,14 +27370,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   shadowEligibleManifestRecords.clear();
   // 使用固定大小预分配避免多次 realloc
   eligibleRecords.reserve(std::min<uint32_t>(
-      uint32_t(recordIndicesForBuild.size()),
+      uint32_t(recordBuildRefs.size()),
       directRecordCap != 0u ? directRecordCap * 2u
-                            : uint32_t(recordIndicesForBuild.size())));
+                            : uint32_t(recordBuildRefs.size())));
   // Exact Stage11 records already live in their caller-owned immutable range.
   // Keep only DirectGrouped records here; manifest refresh consumes both
   // ranges in the historical exact-then-direct order without cloning exact
   // CurrentDrawContractRecord values into this scratch vector every frame.
-  shadowEligibleManifestRecords.reserve(recordIndicesForBuild.size());
+  shadowEligibleManifestRecords.reserve(recordBuildRefs.size());
   std::vector<uint64_t> producerClaimStrictKeys;
   std::vector<uint64_t> producerClaimLogicalKeys;
   if (observeProducerClaims) {
@@ -27683,24 +27678,19 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
 
   enterBuildEligiblePhase("RecordLoop");
   for (size_t buildIndex = 0u;
-       buildIndex < recordIndicesForBuild.size(); ++buildIndex) {
-    const uint32_t recordIndex = recordIndicesForBuild[buildIndex];
+       buildIndex < recordBuildRefs.size(); ++buildIndex) {
+    const DirectRecordBuildRef& buildRef = recordBuildRefs[buildIndex];
+    const uint32_t recordIndex = buildRef.recordIndex;
     if (recordIndex >= directRecords.size())
       continue;
     const auto& record = directRecords[recordIndex];
-    const uint32_t preselectedVisibleHintIndex =
-        buildIndex < recordVisibleHintIndicesForBuild.size()
-        ? recordVisibleHintIndicesForBuild[buildIndex]
-        : UINT32_MAX;
+    const uint32_t preselectedVisibleHintIndex = buildRef.visibleHintIndex;
     const dxvk::war3::render::VisibleRenderableRecord*
         preselectedVisibleRecord =
             preselectedVisibleHintIndex < preselectedVisibleHints.size()
             ? &preselectedVisibleHints[preselectedVisibleHintIndex]
             : nullptr;
-    const uint64_t preselectedRecordSelectionKey =
-        buildIndex < recordSelectionKeysForBuild.size()
-            ? recordSelectionKeysForBuild[buildIndex]
-            : 0u;
+    const uint64_t preselectedRecordSelectionKey = buildRef.selectionKey;
     War3CompactWorkItem compactWork = {};
     const bool hasCompactWork = consumeCompactWorkTable &&
         m_war3CompactWorkTable.load(buildIndex, compactWork);
