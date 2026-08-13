@@ -5841,6 +5841,16 @@ private:
 // identity lifetime.
 class War3CurrentDrawInstanceSnapshotCache final {
 public:
+  void reset() noexcept {
+    ++m_populationGeneration;
+    if (m_populationGeneration == 0u) {
+      m_entries = {};
+      ++m_populationGeneration;
+    }
+    m_hitCount = 0u;
+    m_missCount = 0u;
+  }
+
   bool find(
       const dxvk::war3::model::ModelInstanceRegistry& registry,
       void* sceneNode, void* unitPtr, void* worldObjectEntry,
@@ -5851,7 +5861,8 @@ public:
                                 runtimeModelPtr);
     const auto& entry = m_entries[slot];
     if ((currentGeneration & 1u) == 0u &&
-        entry.generation == currentGeneration &&
+        entry.populationGeneration == m_populationGeneration &&
+        entry.registryGeneration == currentGeneration &&
         entry.sceneNode == sceneNode && entry.unitPtr == unitPtr &&
         entry.worldObjectEntry == worldObjectEntry &&
         entry.runtimeModelPtr == runtimeModelPtr) {
@@ -5874,8 +5885,8 @@ public:
     if ((observedGeneration & 1u) == 0u &&
         observedGeneration == publishedGeneration) {
       m_entries[slot] = Entry{sceneNode, unitPtr, worldObjectEntry,
-                              runtimeModelPtr, observedGeneration, out,
-                              found};
+                              runtimeModelPtr, m_populationGeneration,
+                              observedGeneration, out, found};
     }
     ++m_missCount;
     return found;
@@ -5890,7 +5901,8 @@ private:
     void* unitPtr = nullptr;
     void* worldObjectEntry = nullptr;
     void* runtimeModelPtr = nullptr;
-    uint64_t generation = ~uint64_t(0u);
+    uint64_t populationGeneration = 0u;
+    uint64_t registryGeneration = ~uint64_t(0u);
     dxvk::war3::model::ModelInstanceDirectPacketView value = {};
     bool found = false;
   };
@@ -5912,6 +5924,7 @@ private:
   }
 
   std::array<Entry, kEntryCount> m_entries = {};
+  uint64_t m_populationGeneration = 0u;
   uint32_t m_hitCount = 0u;
   uint32_t m_missCount = 0u;
 };
@@ -5922,6 +5935,16 @@ private:
 // generation. Full matrix-palette fallback records are deliberately excluded.
 class War3CurrentDrawPoseAugmentSnapshotCache final {
 public:
+  void reset() noexcept {
+    ++m_populationGeneration;
+    if (m_populationGeneration == 0u) {
+      m_entries = {};
+      ++m_populationGeneration;
+    }
+    m_hitCount = 0u;
+    m_missCount = 0u;
+  }
+
   bool find(
       const dxvk::war3::model::PoseRegistry& registry,
       void* runtimeModelPtr, void* sceneNode, void* unitPtr,
@@ -5930,7 +5953,8 @@ public:
     const size_t slot = slotFor(runtimeModelPtr, sceneNode, unitPtr);
     const auto& entry = m_entries[slot];
     if ((currentGeneration & 1u) == 0u &&
-        entry.generation == currentGeneration &&
+        entry.populationGeneration == m_populationGeneration &&
+        entry.registryGeneration == currentGeneration &&
         entry.runtimeModelPtr == runtimeModelPtr &&
         entry.sceneNode == sceneNode && entry.unitPtr == unitPtr) {
       if (registry.mutationGeneration() == currentGeneration) {
@@ -5948,7 +5972,8 @@ public:
     if ((observedGeneration & 1u) == 0u &&
         observedGeneration == publishedGeneration) {
       m_entries[slot] = Entry{runtimeModelPtr, sceneNode, unitPtr,
-                              observedGeneration, out, found};
+                              m_populationGeneration, observedGeneration,
+                              out, found};
     }
     ++m_missCount;
     return found;
@@ -5962,7 +5987,8 @@ private:
     void* runtimeModelPtr = nullptr;
     void* sceneNode = nullptr;
     void* unitPtr = nullptr;
-    uint64_t generation = ~uint64_t(0u);
+    uint64_t populationGeneration = 0u;
+    uint64_t registryGeneration = ~uint64_t(0u);
     dxvk::war3::model::PoseAugmentView value = {};
     bool found = false;
   };
@@ -5982,6 +6008,7 @@ private:
   }
 
   std::array<Entry, kEntryCount> m_entries = {};
+  uint64_t m_populationGeneration = 0u;
   uint32_t m_hitCount = 0u;
   uint32_t m_missCount = 0u;
 };
@@ -5991,6 +6018,16 @@ private:
 // seqlock-style mutation generation as the authority for every hit.
 class War3CurrentDrawShadowObjectSnapshotCache final {
 public:
+  void reset() noexcept {
+    ++m_populationGeneration;
+    if (m_populationGeneration == 0u) {
+      m_entries = {};
+      ++m_populationGeneration;
+    }
+    m_hitCount = 0u;
+    m_missCount = 0u;
+  }
+
   bool find(
       const dxvk::war3::render::ShadowObjectRegistry& registry,
       void* worldObjectEntry, void* sceneNode, uint32_t jHandle,
@@ -6002,7 +6039,8 @@ public:
                                 secondaryRuntimeModelPtr);
     const auto& entry = m_entries[slot];
     if ((currentGeneration & 1u) == 0u &&
-        entry.generation == currentGeneration &&
+        entry.populationGeneration == m_populationGeneration &&
+        entry.registryGeneration == currentGeneration &&
         entry.worldObjectEntry == worldObjectEntry &&
         entry.sceneNode == sceneNode && entry.jHandle == jHandle &&
         entry.primaryRuntimeModelPtr == primaryRuntimeModelPtr &&
@@ -6024,8 +6062,9 @@ public:
         observedGeneration == publishedGeneration) {
       m_entries[slot] = Entry{worldObjectEntry, sceneNode, jHandle,
                               primaryRuntimeModelPtr,
-                              secondaryRuntimeModelPtr, observedGeneration,
-                              out, found};
+                              secondaryRuntimeModelPtr,
+                              m_populationGeneration, observedGeneration, out,
+                              found};
     }
     ++m_missCount;
     return found;
@@ -6041,7 +6080,8 @@ private:
     uint32_t jHandle = 0u;
     void* primaryRuntimeModelPtr = nullptr;
     void* secondaryRuntimeModelPtr = nullptr;
-    uint64_t generation = ~uint64_t(0u);
+    uint64_t populationGeneration = 0u;
+    uint64_t registryGeneration = ~uint64_t(0u);
     dxvk::war3::render::ShadowObjectAugmentView value = {};
     bool found = false;
   };
@@ -6065,6 +6105,7 @@ private:
   }
 
   std::array<Entry, kEntryCount> m_entries = {};
+  uint64_t m_populationGeneration = 0u;
   uint32_t m_hitCount = 0u;
   uint32_t m_missCount = 0u;
 };
@@ -27582,11 +27623,17 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       War3CurrentDrawGenerationIndexSliceCacheRuntime());
   War3CurrentDrawGeosetSnapshotCache currentDrawGeosetSnapshotCache(
       dxvk::war3::model::ShadowModelResourceCache::instance().mapEpoch());
-  War3CurrentDrawInstanceSnapshotCache currentDrawInstanceSnapshotCache;
-  War3CurrentDrawShadowObjectSnapshotCache
+  static thread_local War3CurrentDrawInstanceSnapshotCache
+      currentDrawInstanceSnapshotCache;
+  static thread_local War3CurrentDrawShadowObjectSnapshotCache
       currentDrawShadowObjectSnapshotCache;
-  War3CurrentDrawPoseAugmentSnapshotCache
+  static thread_local War3CurrentDrawPoseAugmentSnapshotCache
       currentDrawPoseAugmentSnapshotCache;
+  // Retain the fixed entry storage across frames, but advance an independent
+  // Populate generation so no registry result can ever be reused cross-frame.
+  currentDrawInstanceSnapshotCache.reset();
+  currentDrawShadowObjectSnapshotCache.reset();
+  currentDrawPoseAugmentSnapshotCache.reset();
 
   const auto acquireEligibleRecord = [&]() {
     EligibleRecord eligible = dxvk::war3::render::AcquireScratchElement(
