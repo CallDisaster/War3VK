@@ -27743,11 +27743,17 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     const bool traceBuildRecord =
         traceBuildEligible &&
         War3SampleSemanticBuildEligibleTrace(buildEligibleTracePeriod);
-    War3BuildEligibleRecordRawTiming buildRecordTiming(
-        traceBuildRecord, buildEligibleTracePeriod,
-        buildEligibleQpcOverheadTicks,
-        buildEligibleRecordPhaseTicks, buildEligibleRecordPhaseCalls);
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::GateFilter);
+    std::optional<War3BuildEligibleRecordRawTiming> buildRecordTiming;
+    if (traceBuildRecord) {
+      buildRecordTiming.emplace(
+          true, buildEligibleTracePeriod, buildEligibleQpcOverheadTicks,
+          buildEligibleRecordPhaseTicks, buildEligibleRecordPhaseCalls);
+    }
+    const auto enterBuildRecordPhase = [&](War3BuildEligibleRecordPhase phase) {
+      if (buildRecordTiming.has_value())
+        buildRecordTiming->enter(phase);
+    };
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::GateFilter);
     DirectObjectCompletenessBucket* bucket = trackCompletenessBuckets
         ? &completenessBucketForRecord(record)
         : nullptr;
@@ -27815,24 +27821,27 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
                ? carriedRecordSelectionKey
                : completenessKeyForRecord(record))
         : 0u;
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::Prebuild);
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::Prebuild);
     const bool drawTimePrebuildBypassed =
         tryBuildDrawTimePrebuildBypassEligible(record, eligible);
     if (!drawTimePrebuildBypassed) {
-      buildRecordTiming.enter(War3BuildEligibleRecordPhase::PacketBuild);
+      enterBuildRecordPhase(War3BuildEligibleRecordPhase::PacketBuild);
       auto buildPacketScope =
           War3SemanticSubmitScope("War3SemanticScene/Direct/BuildPacketCall");
-      War3PacketBuildRawTiming packetBuildTiming(
-          traceBuildRecord, buildEligibleTracePeriod,
-          buildEligibleQpcOverheadTicks, buildEligiblePacketPhaseTicks,
-          buildEligiblePacketPhaseCalls, buildEligiblePacketNestedPhaseTicks,
-          buildEligiblePacketNestedPhaseCalls,
-          buildEligibleIndexSlicePhaseTicks,
-          buildEligibleIndexSlicePhaseCalls);
+      std::optional<War3PacketBuildRawTiming> packetBuildTiming;
+      if (traceBuildRecord) {
+        packetBuildTiming.emplace(
+            true, buildEligibleTracePeriod, buildEligibleQpcOverheadTicks,
+            buildEligiblePacketPhaseTicks, buildEligiblePacketPhaseCalls,
+            buildEligiblePacketNestedPhaseTicks,
+            buildEligiblePacketNestedPhaseCalls,
+            buildEligibleIndexSlicePhaseTicks,
+            buildEligibleIndexSlicePhaseCalls);
+      }
       const bool packetBuilt = War3TryBuildShadowPacketFromCurrentDrawRecord(
           record, currentDrawMinVisibleFrameSerial, eligible.packet,
           &eligible.sample,
-          traceBuildRecord ? &packetBuildTiming : nullptr,
+          packetBuildTiming.has_value() ? &*packetBuildTiming : nullptr,
           &currentDrawGroupRangeValidator,
           &currentDrawVisibleIndexSliceCache,
           &currentDrawGeosetSnapshotCache,
@@ -27842,7 +27851,8 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           preselectedVisibleRecord,
           &eligible.mainWorldBackingStatus,
           recordsForBuildCanonicalPrefiltered && !useSealedWork);
-      packetBuildTiming.finish();
+      if (packetBuildTiming.has_value())
+        packetBuildTiming->finish();
       if (!packetBuilt) {
         if (bucket != nullptr)
           bucket->packetBuildFailParts++;
@@ -27887,7 +27897,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       recycleRejectedEligibleRecord(std::move(eligible));
       continue;
     }
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::Eligibility);
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::Eligibility);
     // unitsOnly eligibility 过滤
     War3SemanticDirectMainWorldBackingStatus mainWorldBackingStatus =
         War3SemanticDirectMainWorldBackingStatus::NotChecked;
@@ -27931,7 +27941,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
           eligible.packet.renderable.queueKind !=
           dxvk::war3::render::VisibleRenderableQueueKind::Transparent;
     }
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::Manifest);
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::Manifest);
     const auto manifestRecord =
         manifestRecordForEligible(record, eligible.packet, eligible.sample);
     eligible.manifestPartLeaseKey =
@@ -27960,7 +27970,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
         bucket->missingSliceParts++;
       }
     }
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::Identity);
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::Identity);
     eligible.sceneNode = eligible.packet.renderable.sceneNode;
     eligible.recordSelectionKey = carriedRecordSelectionKey != 0u
         ? carriedRecordSelectionKey
@@ -28018,7 +28028,7 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     case War3SemanticDirectSelectionKeySource::None:
       break;
     }
-    buildRecordTiming.enter(War3BuildEligibleRecordPhase::Append);
+    enterBuildRecordPhase(War3BuildEligibleRecordPhase::Append);
     eligibleRecords.push_back(std::move(eligible));
     War3RebindEligibleRecordPacket(eligibleRecords.back());
   }
