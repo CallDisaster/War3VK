@@ -26,7 +26,7 @@ class ShadowPaletteCompactStorageTests(unittest.TestCase):
         self.assertNotIn("std::array<Matrix4, 256> worldMatrices", self.scene)
         bounded = self.device.index("const uint32_t boundedCount")
         append = self.device.index("palette.worldMatrices.resize(boundedCount)", bounded)
-        publish = self.device.index("m_war3ShadowPaletteHashIndex.emplace", append)
+        publish = self.device.index("m_war3ShadowPaletteHashIndex.insert", append)
         self.assertLess(bounded, append)
         self.assertLess(append, publish)
 

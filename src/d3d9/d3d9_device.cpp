@@ -20035,6 +20035,9 @@ void D3D9DeviceEx::War3MaybeInsertBeforeUi(bool forceFrameEnd) {
   }
   if (m_shadowPaletteReserveHint > 0) {
     m_war3Scene.shadowPalettes.reserve(m_shadowPaletteReserveHint);
+    m_war3ShadowPaletteHashIndex.reserve(m_shadowPaletteReserveHint);
+    m_war3SemanticPaletteCache.reserve(m_shadowPaletteReserveHint);
+    m_war3SemanticPaletteCacheHashIndex.reserve(m_shadowPaletteReserveHint);
   }
   War3ResetShadowAllocator();
   const uint64_t pipelineFrameSerial =
@@ -20525,11 +20528,11 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPalette() {
     m_war3ShadowPaletteHashIndex.clear();
 
   const size_t bytes = sizeof(Matrix4) * 256;
-  const auto range = m_war3ShadowPaletteHashIndex.equal_range(h);
-  for (auto it = range.first; it != range.second; ++it) {
-    const uint32_t idx = it->second;
+  uint32_t matchingIndex =
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode;
+  m_war3ShadowPaletteHashIndex.forEach(h, [&](uint32_t idx) {
     if (idx >= m_war3Scene.shadowPalettes.size())
-      continue;
+      return true;
 
     auto& p = m_war3Scene.shadowPalettes[idx];
     if (p.worldMatrices.size() == 256u &&
@@ -20537,9 +20540,14 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPalette() {
             p.worldMatrices.data(),
             &m_state.transforms[GetTransformIndex(D3DTS_WORLDMATRIX(0))],
             bytes) == 0) {
-      return idx;
+      matchingIndex = idx;
+      return false;
     }
-  }
+    return true;
+  });
+  if (matchingIndex !=
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode)
+    return matchingIndex;
 
   War3ShadowMatrixPalette palette = {};
   palette.hash = h;
@@ -20550,7 +20558,7 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPalette() {
   }
   m_war3Scene.shadowPalettes.emplace_back(std::move(palette));
   const uint32_t newIndex = uint32_t(m_war3Scene.shadowPalettes.size() - 1);
-  m_war3ShadowPaletteHashIndex.emplace(h, newIndex);
+  m_war3ShadowPaletteHashIndex.insert(h, newIndex);
   return newIndex;
 }
 
@@ -20581,17 +20589,23 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
     m_war3ShadowPaletteHashIndex.clear();
 
   const size_t bytes = sizeof(Matrix4) * boundedCount;
-  const auto range = m_war3ShadowPaletteHashIndex.equal_range(h);
-  for (auto it = range.first; it != range.second; ++it) {
-    const uint32_t idx = it->second;
+  uint32_t matchingIndex =
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode;
+  m_war3ShadowPaletteHashIndex.forEach(h, [&](uint32_t idx) {
     if (idx >= m_war3Scene.shadowPalettes.size())
-      continue;
+      return true;
 
     auto& existing = m_war3Scene.shadowPalettes[idx];
     if (existing.worldMatrices.size() == boundedCount &&
-        std::memcmp(existing.worldMatrices.data(), matrices, bytes) == 0)
-      return idx;
-  }
+        std::memcmp(existing.worldMatrices.data(), matrices, bytes) == 0) {
+      matchingIndex = idx;
+      return false;
+    }
+    return true;
+  });
+  if (matchingIndex !=
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode)
+    return matchingIndex;
 
   uint32_t newIndex = 0u;
   if (War3SemanticPaletteInPlaceAppendRuntime()) {
@@ -20623,7 +20637,7 @@ uint32_t D3D9DeviceEx::War3GetOrCreateShadowMatrixPaletteFromData(
   }
   War3EnterFallbackAppendPhase(
       War3FallbackAppendPhase::PaletteStorageIndexPublish);
-  m_war3ShadowPaletteHashIndex.emplace(h, newIndex);
+  m_war3ShadowPaletteHashIndex.insert(h, newIndex);
   return newIndex;
 }
 
@@ -20686,22 +20700,31 @@ uint32_t D3D9DeviceEx::War3GetOrCreateSemanticShadowPalette(
   if (directGeosetUnitPalette && worldHash != 0u)
     matrixHash = bit::fnv1a_iter(matrixHash, worldHash);
 
-  // Phase 7.121：通过 m_war3SemanticPaletteCacheHashIndex 做 O(1) 查找，
-  // 替代原本的 O(N) 线性扫描。同 matrixHash 多个 entry 时（极少发生）
-  // 仍然走完整字段比较，确保命中语义和原线性扫描一致。
+  // Retained frame-local hash nodes keep O(1) candidate lookup without
+  // allocating one unordered-map node for every packet on every frame.
+  // Complete semantic comparison remains authoritative for collisions.
   War3EnterFallbackAppendPhase(War3FallbackAppendPhase::PaletteCacheLookup);
-  auto hashRange = m_war3SemanticPaletteCacheHashIndex.equal_range(matrixHash);
-  for (auto it = hashRange.first; it != hashRange.second; ++it) {
-    const auto& entry = m_war3SemanticPaletteCache[it->second];
+  uint32_t matchingPaletteIndex =
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode;
+  m_war3SemanticPaletteCacheHashIndex.forEach(
+      matrixHash, [&](uint32_t cacheIndex) {
+    if (cacheIndex >= m_war3SemanticPaletteCache.size())
+      return true;
+    const auto& entry = m_war3SemanticPaletteCache[cacheIndex];
     if (entry.runtimeModelPtr == packet.renderable.runtimeModelPtr &&
         entry.matrixHash == matrixHash &&
         entry.worldHash == worldHash &&
         entry.matrixCount == matrixCount &&
         entry.objectKind == static_cast<uint8_t>(resolvedObjectKind) &&
         entry.composedWorldPalette == composeWorldPalette) {
-      return entry.paletteIndex;
+      matchingPaletteIndex = entry.paletteIndex;
+      return false;
     }
-  }
+    return true;
+  });
+  if (matchingPaletteIndex !=
+      dxvk::war3::render::War3FrameHashIndex::InvalidNode)
+    return matchingPaletteIndex;
 
   War3EnterFallbackAppendPhase(War3FallbackAppendPhase::PaletteMissBuild);
   War3SemanticPaletteCacheEntry entry = {};
@@ -20731,11 +20754,11 @@ uint32_t D3D9DeviceEx::War3GetOrCreateSemanticShadowPalette(
       War3GetOrCreateShadowMatrixPaletteFromData(effectiveMatrices, matrixCount,
                                                  uploadMatrixHash);
   const uint32_t paletteIndex = entry.paletteIndex;
-  // Phase 7.121：写入向量同时更新 hash index，保证下一次命中走 O(1)。
+  // Publish into the retained frame-local index for subsequent O(1) probes.
   War3EnterFallbackAppendPhase(War3FallbackAppendPhase::PaletteCachePublish);
   const uint32_t cacheIndex = uint32_t(m_war3SemanticPaletteCache.size());
   m_war3SemanticPaletteCache.emplace_back(std::move(entry));
-  m_war3SemanticPaletteCacheHashIndex.emplace(matrixHash, cacheIndex);
+  m_war3SemanticPaletteCacheHashIndex.insert(matrixHash, cacheIndex);
   return paletteIndex;
 }
 

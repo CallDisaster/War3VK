@@ -459,6 +459,22 @@ test(
   timeout : 30,
 )
 
+# Frame-local palette indexes retain their contiguous nodes across clear and
+# preserve multi-value collision lookup without per-entry map allocations.
+war3_frame_hash_index_test = executable(
+  'war3_frame_hash_index_test',
+  [
+    'war3/render/tests/war3_frame_hash_index_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_frame_hash_index',
+  war3_frame_hash_index_test,
+  timeout : 30,
+)
+
 # High-frequency classified counters keep only attempts and mutually exclusive
 # failure buckets; successful counts are derived when diagnostics are sampled.
 war3_classified_counter_test = executable(
