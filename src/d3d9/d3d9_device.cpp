@@ -21521,6 +21521,9 @@ void D3D9DeviceEx::War3GcS1TerrainEarlyCache() {
 }
 
 void D3D9DeviceEx::War3GcS1GenerationProofObservations() {
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled)
+    return;
+
   const uint64_t currentFrame = m_war3ShadowPersistentFrameSerial;
   if (currentFrame < m_war3S1GenerationProofLastGcFrame ||
       currentFrame - m_war3S1GenerationProofLastGcFrame < 120u) {
@@ -35693,7 +35696,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
     auto phaseScope =
         War3PresentFrameTransitionScope("S1TerrainEarlyCacheGc");
     War3GcS1TerrainEarlyCache();
-    War3GcS1GenerationProofObservations();
+    if constexpr (dxvk::war3::render::kDevelopmentShadowObserversEnabled)
+      War3GcS1GenerationProofObservations();
   }
   {
     auto phaseScope =
@@ -35715,8 +35719,12 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
         m_war3S1TerrainEarlyFallbackBackedCount;
     m_war3ShadowPersistentDiagnosticsFrame.s1EarlyLogicalReferencedBytes =
         m_war3S1TerrainEarlyLogicalReferencedBytes;
-    m_war3ShadowPersistentDiagnosticsFrame.s1GenerationProofEntryCount =
-        static_cast<uint64_t>(m_war3S1GenerationProofObservations.size());
+    if constexpr (dxvk::war3::render::kDevelopmentShadowObserversEnabled) {
+      m_war3ShadowPersistentDiagnosticsFrame.s1GenerationProofEntryCount =
+          static_cast<uint64_t>(m_war3S1GenerationProofObservations.size());
+    } else {
+      m_war3ShadowPersistentDiagnosticsFrame.s1GenerationProofEntryCount = 0u;
+    }
     const auto completed =
         std::exchange(m_war3ShadowPersistentDiagnosticsFrame, {});
     war3::War3PerfMonitor::PersistentGeometryFrameStats stats = {};
@@ -48658,10 +48666,10 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   };
   Matrix4 shadowWorldMatrix = chooseShadowWorldMatrix(currentWorldMatrix);
 
-  // Observe whether opaque S1 terrain has an exact source generation that is
-  // genuinely stable across adjacent frames. This does not change routing:
-  // the existing stable-static persistent path and exact Arena fallback remain
-  // authoritative until a separate consume candidate is built and validated.
+  // Development-only observation of whether opaque S1 terrain has an exact
+  // source generation stable across adjacent frames. Release builds compile
+  // out the observer; routing always remains on the established paths.
+  if constexpr (dxvk::war3::render::kDevelopmentShadowObserversEnabled) {
   using GenerationBackedGeometryProof =
       dxvk::war3::render::War3ShadowGenerationBackedGeometryProof;
   using GenerationBackedStreamProof =
@@ -48894,6 +48902,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
     }
   }
   (void)s1GenerationProofPromotionReady;
+  }
   if (terrainDoodadCaster) {
     const float translationLenSq =
         matrixTranslationLenSq(shadowWorldMatrix);
@@ -49098,20 +49107,24 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
   const VkDeviceSize stage13IndexRangeBytes =
       VkDeviceSize(CountVal) * stage13IndexElementBytes;
 
-  uint64_t stage13WorldMatrixHash = bit::fnv1a_init();
-  for (uint32_t col = 0u; col < 4u; ++col) {
-    for (uint32_t row = 0u; row < 4u; ++row) {
-      stage13WorldMatrixHash = bit::fnv1a_iter(
-          stage13WorldMatrixHash,
-          bit::cast<uint32_t>(shadowWorldMatrix[col][row]));
+  uint64_t stage13WorldMatrixHash = 0u;
+  uint64_t stage13MaterialHash = 0u;
+  if (stage13BaseRetentionEligible) {
+    stage13WorldMatrixHash = bit::fnv1a_init();
+    for (uint32_t col = 0u; col < 4u; ++col) {
+      for (uint32_t row = 0u; row < 4u; ++row) {
+        stage13WorldMatrixHash = bit::fnv1a_iter(
+            stage13WorldMatrixHash,
+            bit::cast<uint32_t>(shadowWorldMatrix[col][row]));
+      }
     }
+    stage13MaterialHash = bit::fnv1a_init();
+    stage13MaterialHash = bit::fnv1a_iter(
+        stage13MaterialHash,
+        reinterpret_cast<uintptr_t>(GetCommonTexture(m_state.textures[0])));
+    stage13MaterialHash = bit::fnv1a_iter(
+        stage13MaterialHash, uint32_t(m_state.renderStates[D3DRS_CULLMODE]));
   }
-  uint64_t stage13MaterialHash = bit::fnv1a_init();
-  stage13MaterialHash = bit::fnv1a_iter(
-      stage13MaterialHash,
-      reinterpret_cast<uintptr_t>(GetCommonTexture(m_state.textures[0])));
-  stage13MaterialHash = bit::fnv1a_iter(
-      stage13MaterialHash, uint32_t(m_state.renderStates[D3DRS_CULLMODE]));
 
   const auto buildStage13RetentionKey =
       [&](uint32_t identityTag, uint64_t identityHash) {
@@ -49452,9 +49465,11 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
       };
 
   uint64_t stage13CanonicalReferencedContentHash = 0u;
-  computeStage13ReferencedContentHash(
-      stage13CanonicalPositionBytes, stage13CanonicalIndexBytes,
-      stage13CanonicalReferencedContentHash, nullptr);
+  if (stage13BaseRetentionEligible) {
+    computeStage13ReferencedContentHash(
+        stage13CanonicalPositionBytes, stage13CanonicalIndexBytes,
+        stage13CanonicalReferencedContentHash, nullptr);
+  }
   const bool stage13CanonicalReferencedContentHashValid =
       stage13CanonicalReferencedContentHash != 0u;
   const bool stage13PositionSourceValid =
@@ -49739,10 +49754,12 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
                      ? stage13PositionReadableSpan.data : nullptr)
           : nullptr;
   stage13SourceTiming.pause();
-  const bool stage13ReferencedPositionEligible =
-      computeStage13ReferencedContentHash(
-          stage13MappedPositionBytes, stage13MappedIndexBytes,
-          stage13ReferencedVertexContentHash, &stage13StrongTiming);
+  bool stage13ReferencedPositionEligible = false;
+  if (stage13NeedsReferencedPositionIdentity) {
+    stage13ReferencedPositionEligible = computeStage13ReferencedContentHash(
+        stage13MappedPositionBytes, stage13MappedIndexBytes,
+        stage13ReferencedVertexContentHash, &stage13StrongTiming);
+  }
   stage13StrongTiming.enter(
       War3ShadowStage13StrongPhase::VerifyAndLookup);
 

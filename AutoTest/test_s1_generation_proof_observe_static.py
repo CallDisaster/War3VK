@@ -14,6 +14,9 @@ DEVICE_H = (ROOT / "src/d3d9/d3d9_device.h").read_text(
 PROOF_H = (
     ROOT / "src/d3d9/war3/render/war3_shadow_generation_backed_stream.h"
 ).read_text(encoding="utf-8", errors="replace")
+OBSERVER_POLICY_H = (
+    ROOT / "src/d3d9/war3/render/war3_shadow_observer_build_policy.h"
+).read_text(encoding="utf-8", errors="replace")
 PERF_H = (ROOT / "src/d3d9/war3/tools/war3_perf_monitor.h").read_text(
     encoding="utf-8", errors="replace"
 )
@@ -23,6 +26,14 @@ PERF_CPP = (ROOT / "src/d3d9/war3/tools/war3_perf_monitor.cpp").read_text(
 
 
 class S1GenerationProofObserveStaticTest(unittest.TestCase):
+    @staticmethod
+    def _observer_block() -> str:
+        marker = "Development-only observation of whether opaque S1 terrain"
+        begin = DEVICE_CPP.index(marker)
+        return DEVICE_CPP[
+            begin : DEVICE_CPP.index("if (terrainDoodadCaster)", begin)
+        ]
+
     def test_observer_is_value_semantic_and_two_distinct_frames(self):
         self.assertIn("War3ShadowGenerationBackedGeometryProof", PROOF_H)
         self.assertIn("War3ShadowGenerationObservationClock", PROOF_H)
@@ -44,10 +55,7 @@ class S1GenerationProofObserveStaticTest(unittest.TestCase):
             "m_war3GpuSkinDeviceEpoch",
         ):
             self.assertIn(token, DEVICE_CPP)
-        observe = DEVICE_CPP[
-            DEVICE_CPP.index("Observe whether opaque S1 terrain") :
-            DEVICE_CPP.index("if (terrainDoodadCaster)", DEVICE_CPP.index("Observe whether opaque S1 terrain"))
-        ]
+        observe = self._observer_block()
         self.assertIn("s1GenerationProof.valid()", observe)
         self.assertIn("ObserveWar3ShadowGenerationStability", observe)
         self.assertIn("AdvanceWar3ShadowGenerationObservationClock", observe)
@@ -58,14 +66,48 @@ class S1GenerationProofObserveStaticTest(unittest.TestCase):
         self.assertIn("!alphaTestEnabled && !alphaBlend", observe)
 
     def test_observer_does_not_enable_persistent_or_arena_consume(self):
-        observe = DEVICE_CPP[
-            DEVICE_CPP.index("Observe whether opaque S1 terrain") :
-            DEVICE_CPP.index("if (terrainDoodadCaster)", DEVICE_CPP.index("Observe whether opaque S1 terrain"))
-        ]
+        observe = self._observer_block()
         self.assertNotIn("War3CreateShadowPersistent", observe)
         self.assertNotIn("ShadowArena_BeginBundle", observe)
         self.assertNotIn("s1TerrainPersistentPath =", observe)
         self.assertRegex(observe, r"\(void\)s1GenerationProofPromotionReady;")
+
+    def test_release_compiles_out_observer_gc_and_live_gauge(self):
+        self.assertIn(
+            "inline constexpr bool kDevelopmentShadowObserversEnabled = false;",
+            OBSERVER_POLICY_H,
+        )
+        observe = self._observer_block()
+        self.assertIn(
+            "if constexpr (dxvk::war3::render::"
+            "kDevelopmentShadowObserversEnabled)",
+            observe,
+        )
+        gc = DEVICE_CPP[
+            DEVICE_CPP.index("void D3D9DeviceEx::War3GcS1GenerationProofObservations") :
+            DEVICE_CPP.index(
+                "bool D3D9DeviceEx::War3CreateShadowPersistentBuffer",
+                DEVICE_CPP.index("void D3D9DeviceEx::War3GcS1GenerationProofObservations"),
+            )
+        ]
+        self.assertIn(
+            "if constexpr (!dxvk::war3::render::"
+            "kDevelopmentShadowObserversEnabled)",
+            gc,
+        )
+        self.assertRegex(
+            DEVICE_CPP,
+            r"if constexpr \(dxvk::war3::render::"
+            r"kDevelopmentShadowObserversEnabled\)\s+"
+            r"War3GcS1GenerationProofObservations\(\);",
+        )
+        self.assertRegex(
+            DEVICE_CPP,
+            r"if constexpr \(dxvk::war3::render::"
+            r"kDevelopmentShadowObserversEnabled\) \{\s+"
+            r"m_war3ShadowPersistentDiagnosticsFrame\."
+            r"s1GenerationProofEntryCount",
+        )
 
     def test_observer_is_bounded_and_map_reset_clears_it(self):
         self.assertIn("kMaxS1GenerationProofObservations = 16384u", DEVICE_CPP)
