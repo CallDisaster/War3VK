@@ -186,10 +186,12 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
         self.assertLess(exact_records, manifest_publish)
         for contract in (
             "for (const auto& exactRecord : exactSubmittedManifestRecords)",
-            "currentPartKeys.insert(partKey)",
+            "currentPartKeys.push_back(partKey)",
+            "std::sort(currentPartKeys.begin(), currentPartKeys.end())",
+            "std::unique(currentPartKeys.begin(), currentPartKeys.end())",
             "eligibleRecordCount == 0u && exactSubmittedManifestRecords.empty()",
             "drawTimeSemanticProducerLifecycleMergedCount++",
-            "liveSubmittedCorePartsByObject[selectionKey].push_back(",
+            "appendLiveSubmittedCorePart(selectionKey, manifestPartKey)",
             "exactCorePartCount",
         ):
             self.assertIn(contract, grouped_block, contract)
@@ -202,7 +204,12 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             "shadowEligibleManifestRecords.insert(", grouped_block
         )
         for producer_contract in (
-            "for (auto& [cacheKey, entry] : m_war3DrawTimeVBCache)",
+            "const auto& activeDrawTimeRecords =",
+            "const bool useActiveDrawTimeLedger =",
+            "auto nextDrawTimeEntry =",
+            "m_war3DrawTimeVBCache.find(activeRecord.key)",
+            "auto cacheIt = m_war3DrawTimeVBCache.begin()",
+            "while (nextDrawTimeEntry(cacheKeyPtr, entryPtr))",
             "entry.exactSubmittedFrameSerial",
             "exactRecord.producerFreshThisFrame = true",
             "ShadowProducerKind::DrawTimeGeometry",
@@ -390,7 +397,7 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
         refresh_block = DEVICE[refresh:refresh_end]
         proof = refresh_block.index("producerPaletteCurrentFrameProven")
         apply_palette = refresh_block.index(
-            "leased.packet.runtimeGroupPalette =", proof
+            "installLeaseLivePalette(", proof
         )
         proof_block = refresh_block[proof:apply_palette]
         for contract in (
@@ -404,6 +411,10 @@ class ShadowMetadataLifecycleStaticTests(unittest.TestCase):
             "return false;",
         ):
             self.assertIn(contract, proof_block, contract)
+        helper = DEVICE[
+            DEVICE.index("const auto installLeaseLivePalette =") : refresh
+        ]
+        self.assertIn("leased.packet.runtimeGroupPalette =", helper)
 
     def test_unsafe_drawtime_consumers_still_require_legacy_master(self) -> None:
         self.assertIn(
