@@ -25274,6 +25274,12 @@ void D3D9DeviceEx::War3ObservePersistentPackageStage11Evidence(
   }
 }
 
+void D3D9DeviceEx::War3ActivateDrawTimeCacheEntry(
+    const War3DrawTimeVBCacheKey& key, War3DrawTimeVBEntry& entry) {
+  m_war3DrawTimeActiveLedger.activate(
+      m_war3ShadowPersistentFrameSerial, key, entry.activeLedgerStamp);
+}
+
 uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(
     std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
         exactSubmittedManifestRecords) {
@@ -25283,7 +25289,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(
   if (m_war3DrawTimeVBCache.empty())
     return 0u;
 
-  exactSubmittedManifestRecords.reserve(m_war3DrawTimeVBCache.size());
+  const auto& activeDrawTimeRecords =
+      m_war3DrawTimeActiveLedger.records();
+  const bool useActiveDrawTimeLedger =
+      m_war3DrawTimeActiveLedger.usableForFrame(
+          m_war3ShadowPersistentFrameSerial);
+  exactSubmittedManifestRecords.reserve(
+      useActiveDrawTimeLedger ? activeDrawTimeRecords.size()
+                              : m_war3DrawTimeVBCache.size());
   const uint64_t manifestFrame = visibleRegistry.getFrameNumber();
   const uint32_t currentRenderFrameIndex =
       dxvk::war3::state::RenderState::instance().getFrameIndex();
@@ -25338,7 +25351,38 @@ uint32_t D3D9DeviceEx::War3TryPopulateDrawTimeSemanticProducer(
     return 0u;
   const auto packageStage11EvidenceMode =
       War3PersistentPackageStage11EvidenceModeRuntime();
-  for (auto& [cacheKey, entry] : m_war3DrawTimeVBCache) {
+  auto activeRecordIt = activeDrawTimeRecords.begin();
+  auto cacheIt = m_war3DrawTimeVBCache.begin();
+  auto nextDrawTimeEntry = [&](const War3DrawTimeVBCacheKey*& outKey,
+                               War3DrawTimeVBEntry*& outEntry) {
+    if (useActiveDrawTimeLedger) {
+      while (activeRecordIt != activeDrawTimeRecords.end()) {
+        const auto& activeRecord = *activeRecordIt++;
+        auto found = m_war3DrawTimeVBCache.find(activeRecord.key);
+        if (found == m_war3DrawTimeVBCache.end() ||
+            !War3DrawTimeActiveLedger::matches(
+                activeRecord, found->second.activeLedgerStamp)) {
+          continue;
+        }
+        outKey = &found->first;
+        outEntry = &found->second;
+        return true;
+      }
+      return false;
+    }
+    if (cacheIt == m_war3DrawTimeVBCache.end())
+      return false;
+    auto current = cacheIt++;
+    outKey = &current->first;
+    outEntry = &current->second;
+    return true;
+  };
+
+  const War3DrawTimeVBCacheKey* cacheKeyPtr = nullptr;
+  War3DrawTimeVBEntry* entryPtr = nullptr;
+  while (nextDrawTimeEntry(cacheKeyPtr, entryPtr)) {
+    const auto& cacheKey = *cacheKeyPtr;
+    auto& entry = *entryPtr;
     void* const renderablePart = cacheKey.renderablePart;
     if (renderablePart == nullptr)
       continue;
@@ -25924,6 +25968,7 @@ void D3D9DeviceEx::War3ResetShadowSessionState(uint64_t retireSerial) {
   retired.persistentExpiryQueue =
       std::move(m_war3ShadowPersistentExpiryQueue);
   retired.drawTimeVbCache = std::move(m_war3DrawTimeVBCache);
+  m_war3DrawTimeActiveLedger.resetSession();
   War3ResetStage11SnapshotPages();
   retired.s1TerrainCasterStash = std::move(m_war3S1TerrainCasterStash);
   retired.s1TerrainEarlyCache = std::move(m_war3S1TerrainEarlyCache);
@@ -35685,6 +35730,8 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceEx::PresentEx(const RECT *pSourceRect,
       m_war3SemanticPaletteCacheHashIndex.clear();
     }
     m_war3ShadowPersistentFrameSerial++;
+    m_war3DrawTimeActiveLedger.beginFrame(
+        m_war3ShadowPersistentFrameSerial);
     // 报告元数据：把业务帧主序号登记到 perf monitor，与 frameEpoch 建立对齐点。
     war3::War3PerfMonitor::instance().noteBusinessFrameSerial(
         m_war3ShadowPersistentFrameSerial);
@@ -44735,6 +44782,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
               // 跨帧复用时必须把 frameSerial 刷到本帧，否则 consume/producer
               // 会因 entryFresh 失败而漏提交。
               cached.frameSerial = m_war3ShadowPersistentFrameSerial;
+              War3ActivateDrawTimeCacheEntry(vbCacheKey, cached);
               cached.lastAccessFrameSerial = m_war3ShadowPersistentFrameSerial;
               if (sameFrame) {
                 m_war3Scene.shadowStats.drawTimeVBCacheSameFrameDedupHit++;
@@ -44844,6 +44892,7 @@ void D3D9DeviceEx::War3TryCaptureShadowCaster(
             exactUnitIdentityProven && !entry.pathBlocker;
         entry.vertexCount = vRangeCount;
         entry.frameSerial = m_war3ShadowPersistentFrameSerial;
+        War3ActivateDrawTimeCacheEntry(vbCacheKey, entry);
         entry.packageCaptureOrdinal = packageCurrentCaptureOrdinal;
         entry.positionStride = posStride;
         entry.positionOffset = capturePositionOffset;

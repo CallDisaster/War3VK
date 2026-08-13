@@ -46,6 +46,7 @@
 #include "d3d9_war3_ssao.h"
 #include "war3/shadow/war3_shadow_backend_dxvk.h"
 #include "war3/render/war3_shadow_generation_backed_stream.h"
+#include "war3/render/war3_drawtime_active_ledger.h"
 #include "war3/render/war3_stage11_snapshot_page_policy.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_d3d9_observe_owner.h"
 #include "war3/gpu_skin/war3_persistent_gpu_package_stage11_observe_adapter.h"
@@ -146,6 +147,9 @@ struct War3DrawTimeVBCacheKeyHash {
     return hash;
   }
 };
+
+using War3DrawTimeActiveLedger =
+    war3::render::War3DrawTimeActiveLedger<War3DrawTimeVBCacheKey>;
 
 // A verified anonymous LOSBlocker rejection must also outrank a short-lived
 // CurrentDraw/packet representation captured before the exact Stage11 draw.
@@ -2573,6 +2577,7 @@ private:
   // 拷贝到我们自己的 device-local buffer。以后再有 draw 覆盖原 buffer 也
   // 不影响我们的 buffer。
   struct War3DrawTimeVBEntry {
+    War3DrawTimeActiveLedger::EntryStamp activeLedgerStamp = {};
     uint64_t mapEpoch = 0u;
     void* renderablePart = nullptr;
     uint32_t layerIndex = 0u;
@@ -2778,6 +2783,7 @@ private:
   std::unordered_map<War3DrawTimeVBCacheKey, War3DrawTimeVBEntry,
                      War3DrawTimeVBCacheKeyHash>
       m_war3DrawTimeVBCache;
+  War3DrawTimeActiveLedger m_war3DrawTimeActiveLedger;
 #if defined(WARVK_ENABLE_SHADOW_OBSERVERS_DEV) && \
     WARVK_ENABLE_SHADOW_OBSERVERS_DEV
   struct War3Stage11AllocationObserverProofHash {
@@ -3071,6 +3077,8 @@ private:
   bool War3DrawTimeAnonymousMarkerRejectionActive(
       void* renderablePart, void* meshPayloadPtr,
       uint32_t layerIndex) const;
+  void War3ActivateDrawTimeCacheEntry(
+      const War3DrawTimeVBCacheKey& key, War3DrawTimeVBEntry& entry);
   uint32_t War3TryPopulateDrawTimeSemanticProducer(
       std::vector<dxvk::war3::render::CurrentDrawContractRecord>&
           exactSubmittedManifestRecords);

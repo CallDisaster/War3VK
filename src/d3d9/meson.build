@@ -605,6 +605,23 @@ test(
   timeout : 30,
 )
 
+# Frame-local exact Stage11 cache keys are value records with monotonic
+# activation ordinals. This locks rehash/erase/ABA behavior without creating a
+# D3D9 device or touching Vulkan.
+war3_drawtime_active_ledger_test = executable(
+  'war3_drawtime_active_ledger_test',
+  [
+    'war3/render/tests/war3_drawtime_active_ledger_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_drawtime_active_ledger',
+  war3_drawtime_active_ledger_test,
+  timeout : 30,
+)
+
 # Exact terrain bounds may consume a non-indexed draw range directly, but an
 # indexed draw must first prove its real domain from current IB bytes. This
 # policy test deliberately has no D3D9/Vulkan dependency.
