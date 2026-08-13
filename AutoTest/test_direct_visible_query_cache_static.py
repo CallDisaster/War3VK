@@ -16,6 +16,7 @@ VISIBLE = (ROOT / "src/d3d9/war3/render/war3_visible_renderables.cpp").read_text
 
 assert "class VisibleRenderablePartLayerQueryCache" in HEADER
 assert "static constexpr size_t kEntryCount = 512u" in HEADER
+assert "valid only until the next query or reset" in HEADER
 assert "entry.renderablePart == renderablePart" in VISIBLE
 assert "entry.layerIndex == layerIndex" in VISIBLE
 assert "registry.queryByRenderablePartAndLayer(" in VISIBLE
@@ -43,7 +44,7 @@ assert reset < snapshot_publish < selection
 builder_start = DEVICE.index("uint64_t War3SemanticDirectRecordSelectionKey(")
 builder_end = DEVICE.index("uint64_t War3ProducerClaimObserveObjectKey(", builder_start)
 builder = DEVICE[builder_start:builder_end]
-assert "visibleQueryCache->query(" in builder
-assert ": registry.queryByRenderablePartAndLayer(" in builder
+assert "visibleQueryCache->queryPtr(" in builder
+assert "registry.queryByRenderablePartAndLayer(" in builder
 
 print("direct visible part/layer query cache static checks passed")

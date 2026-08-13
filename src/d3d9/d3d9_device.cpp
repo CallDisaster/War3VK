@@ -2773,27 +2773,31 @@ uint64_t War3SemanticDirectRecordSelectionKey(
   // churns every frame under cap pressure. Resolve only the current renderable
   // record here; this is bounded by the direct scan cap, not every draw hook.
   if (record.renderablePart != nullptr) {
-    dxvk::war3::render::VisibleRenderableRecord visible = {};
     const auto& registry =
         dxvk::war3::render::VisibleRenderableRegistry::instance();
-    const bool foundVisible = visibleQueryCache != nullptr
-        ? visibleQueryCache->query(registry, record.renderablePart,
-                                   record.layerIndex, visible)
-        : registry.queryByRenderablePartAndLayer(
-              record.renderablePart, record.layerIndex, visible);
-    if (foundVisible) {
+    dxvk::war3::render::VisibleRenderableRecord visibleStorage = {};
+    const dxvk::war3::render::VisibleRenderableRecord* visible = nullptr;
+    if (visibleQueryCache != nullptr) {
+      visible = visibleQueryCache->queryPtr(
+          registry, record.renderablePart, record.layerIndex);
+    } else if (registry.queryByRenderablePartAndLayer(
+                   record.renderablePart, record.layerIndex,
+                   visibleStorage)) {
+      visible = &visibleStorage;
+    }
+    if (visible != nullptr) {
       if (outVisibleHint != nullptr)
-        *outVisibleHint = visible;
-      if (visible.identity.jHandle != 0u)
-        return makeKey(2u, visible.identity.jHandle);
-      if (visible.identity.handleId != 0u)
-        return makeKey(2u, visible.identity.handleId | 0x100000u);
-      if (visible.identity.unitPtr != nullptr)
-        return makeKey(1u, ptrValue(visible.identity.unitPtr));
-      if (visible.identity.worldObjectEntry != nullptr)
-        return makeKey(4u, ptrValue(visible.identity.worldObjectEntry));
-      if (visible.sceneNode != nullptr)
-        return makeKey(5u, ptrValue(visible.sceneNode));
+        *outVisibleHint = *visible;
+      if (visible->identity.jHandle != 0u)
+        return makeKey(2u, visible->identity.jHandle);
+      if (visible->identity.handleId != 0u)
+        return makeKey(2u, visible->identity.handleId | 0x100000u);
+      if (visible->identity.unitPtr != nullptr)
+        return makeKey(1u, ptrValue(visible->identity.unitPtr));
+      if (visible->identity.worldObjectEntry != nullptr)
+        return makeKey(4u, ptrValue(visible->identity.worldObjectEntry));
+      if (visible->sceneNode != nullptr)
+        return makeKey(5u, ptrValue(visible->sceneNode));
     }
   }
 

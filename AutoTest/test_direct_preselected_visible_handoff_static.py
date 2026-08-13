@@ -28,8 +28,8 @@ class DirectPreselectedVisibleHandoffStaticTests(unittest.TestCase):
         selector = function_body("uint64_t War3SemanticDirectRecordSelectionKey(")
         self.assertIn("VisibleRenderableRecord* outVisibleHint", selector)
         self.assertIn("*outVisibleHint = {};", selector)
-        query = selector.index("queryByRenderablePartAndLayer(")
-        copy = selector.index("*outVisibleHint = visible", query)
+        query = selector.index("visibleQueryCache->queryPtr(")
+        copy = selector.index("*outVisibleHint = *visible", query)
         self.assertLess(query, copy)
 
     def test_hint_storage_is_dense_current_call_value_scratch(self) -> None:

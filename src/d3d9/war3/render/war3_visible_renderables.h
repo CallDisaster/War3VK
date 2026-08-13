@@ -366,6 +366,11 @@ private:
 class VisibleRenderablePartLayerQueryCache {
 public:
   void reset() noexcept;
+  // The pointer remains valid only until the next query or reset. Callers that
+  // retain the value must copy it immediately; the fixed cache entry owns it.
+  const VisibleRenderableRecord* queryPtr(
+      const VisibleRenderableRegistry& registry,
+      void* renderablePart, uint32_t layerIndex) noexcept;
   bool query(const VisibleRenderableRegistry& registry,
              void* renderablePart, uint32_t layerIndex,
              VisibleRenderableRecord& out) noexcept;

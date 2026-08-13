@@ -2987,13 +2987,11 @@ void VisibleRenderablePartLayerQueryCache::reset() noexcept {
   }
 }
 
-bool VisibleRenderablePartLayerQueryCache::query(
+const VisibleRenderableRecord* VisibleRenderablePartLayerQueryCache::queryPtr(
     const VisibleRenderableRegistry& registry,
-    void* renderablePart, uint32_t layerIndex,
-    VisibleRenderableRecord& out) noexcept {
-  out = {};
+    void* renderablePart, uint32_t layerIndex) noexcept {
   if (renderablePart == nullptr)
-    return false;
+    return nullptr;
 
   uint64_t hash = bit::fnv1a_init();
   hash = bit::fnv1a_iter(
@@ -3003,22 +3001,29 @@ bool VisibleRenderablePartLayerQueryCache::query(
   if (entry.generation == m_generation &&
       entry.renderablePart == renderablePart &&
       entry.layerIndex == layerIndex) {
-    if (entry.found)
-      out = entry.record;
-    return entry.found;
+    return entry.found ? &entry.record : nullptr;
   }
 
-  VisibleRenderableRecord record = {};
+  entry.record = {};
   const bool found = registry.queryByRenderablePartAndLayer(
-      renderablePart, layerIndex, record);
+      renderablePart, layerIndex, entry.record);
   entry.renderablePart = renderablePart;
   entry.layerIndex = layerIndex;
   entry.generation = m_generation;
   entry.found = found;
-  entry.record = found ? record : VisibleRenderableRecord{};
-  if (found)
-    out = record;
-  return found;
+  return found ? &entry.record : nullptr;
+}
+
+bool VisibleRenderablePartLayerQueryCache::query(
+    const VisibleRenderableRegistry& registry,
+    void* renderablePart, uint32_t layerIndex,
+    VisibleRenderableRecord& out) noexcept {
+  out = {};
+  const VisibleRenderableRecord* record =
+      queryPtr(registry, renderablePart, layerIndex);
+  if (record != nullptr)
+    out = *record;
+  return record != nullptr;
 }
 
 bool VisibleRenderableRegistry::queryFirstForDirectPacket(
