@@ -26,11 +26,11 @@ def function_body(signature: str) -> str:
 class DirectPreselectedVisibleHandoffStaticTests(unittest.TestCase):
     def test_selection_lookup_returns_a_value_copy_only_on_hit(self) -> None:
         selector = function_body("uint64_t War3SemanticDirectRecordSelectionKey(")
-        self.assertIn("VisibleRenderableRecord* outVisibleHint", selector)
-        self.assertIn("*outVisibleHint = {};", selector)
+        self.assertIn("VisibleRenderableRecord** outVisibleHint", selector)
+        self.assertIn("*outVisibleHint = nullptr;", selector)
         query = selector.index("visibleQueryCache->queryPtr(")
-        copy = selector.index("*outVisibleHint = *visible", query)
-        self.assertLess(query, copy)
+        handoff = selector.index("*outVisibleHint = visible", query)
+        self.assertLess(query, handoff)
 
     def test_hint_storage_is_dense_current_call_value_scratch(self) -> None:
         start = DEVICE.index(
@@ -44,7 +44,7 @@ class DirectPreselectedVisibleHandoffStaticTests(unittest.TestCase):
             "preselectedVisibleHints.clear()",
             "recordVisibleHintIndicesForBuild.clear()",
             "record, &visibleHint, &visiblePartLayerQueryCache",
-            "preselectedVisibleHints.push_back(std::move(visibleHint))",
+            "preselectedVisibleHints.push_back(*visibleHint)",
             "preselectedRecords[i].visibleHintIndex",
         ):
             self.assertIn(token, block)

@@ -2751,11 +2751,11 @@ uint64_t War3SemanticDirectSelectionKey(
 
 uint64_t War3SemanticDirectRecordSelectionKey(
     const dxvk::war3::render::CurrentDrawContractRecord& record,
-    dxvk::war3::render::VisibleRenderableRecord* outVisibleHint = nullptr,
+    const dxvk::war3::render::VisibleRenderableRecord** outVisibleHint = nullptr,
     dxvk::war3::render::VisibleRenderablePartLayerQueryCache*
         visibleQueryCache = nullptr) {
   if (outVisibleHint != nullptr)
-    *outVisibleHint = {};
+    *outVisibleHint = nullptr;
   auto ptrValue = [](const void* ptr) -> uint64_t {
     return uint64_t(reinterpret_cast<uintptr_t>(ptr));
   };
@@ -2786,8 +2786,10 @@ uint64_t War3SemanticDirectRecordSelectionKey(
       visible = &visibleStorage;
     }
     if (visible != nullptr) {
-      if (outVisibleHint != nullptr)
-        *outVisibleHint = *visible;
+      // A pointer can be handed off only when the caller supplied the
+      // Populate-local cache owner. It must be copied before the next query.
+      if (outVisibleHint != nullptr && visibleQueryCache != nullptr)
+        *outVisibleHint = visible;
       if (visible->identity.jHandle != 0u)
         return makeKey(2u, visible->identity.jHandle);
       if (visible->identity.handleId != 0u)
@@ -26983,15 +26985,17 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
       if (bucket != nullptr)
         bucket->shadowEligibleParts++;
 
-      dxvk::war3::render::VisibleRenderableRecord visibleHint = {};
+      const dxvk::war3::render::VisibleRenderableRecord* visibleHint = nullptr;
       const uint64_t selectionKey = useSealedWork
           ? work.selectionKey
           : War3SemanticDirectRecordSelectionKey(
                 record, &visibleHint, &visiblePartLayerQueryCache);
       uint32_t visibleHintIndex = UINT32_MAX;
-      if (!useSealedWork && visibleHint.renderablePart == record.renderablePart) {
+      if (!useSealedWork && visibleHint != nullptr &&
+          visibleHint->renderablePart == record.renderablePart) {
         visibleHintIndex = uint32_t(preselectedVisibleHints.size());
-        preselectedVisibleHints.push_back(std::move(visibleHint));
+        // Consume the cache-owned pointer before the next selection query.
+        preselectedVisibleHints.push_back(*visibleHint);
       }
       const uint32_t priorityScore = useSealedWork
           ? work.priorityScore

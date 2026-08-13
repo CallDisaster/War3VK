@@ -31,7 +31,7 @@ selection = DEVICE.split("uint64_t War3SemanticDirectRecordSelectionKey(", 1)[1]
     "uint64_t War3ProducerClaimObserveObjectKey", 1
 )[0]
 assert "visibleQueryCache->queryPtr(" in selection
-assert "*outVisibleHint = *visible;" in selection
+assert "*outVisibleHint = visible;" in selection
 assert "visibleQueryCache->query(registry" not in selection
 
 print("visible part/layer query cache value-copy static checks passed")
