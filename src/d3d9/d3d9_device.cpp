@@ -26523,6 +26523,37 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
            std::binary_search(preferredSelectionKeys.begin(),
                               preferredSelectionKeys.end(), selectionKey);
   };
+  const auto currentFrameDrawTimeProducerOwnsRecord =
+      [&](const dxvk::war3::render::CurrentDrawContractRecord& record) noexcept {
+        const int16_t effectiveProducerStage =
+            record.producerStage >= 0 ? record.producerStage : record.stage;
+        if (!War3DrawTimeCurrentFrameGeometryRuntime() ||
+            effectiveProducerStage != 11 || record.renderablePart == nullptr)
+          return false;
+        if (War3DrawTimeAnonymousMarkerRejectionActive(
+                record.renderablePart, record.meshPayloadPtr,
+                record.layerIndex))
+          return true;
+        if (!War3CurrentDrawContractNamesExactSlice(
+                record.renderablePart, record.layerIndex, record))
+          return false;
+
+        // Exact rejection and exact ownership use the same immutable key.
+        // Probe them together so SnapshotPreselect does not rebuild/hash the
+        // key and look up the current-frame cache twice for every Stage11
+        // record.
+        const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
+            record.renderablePart, record.layerIndex, &record,
+            m_war3GpuSkinMapEpoch);
+        if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
+          return true;
+        const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
+        return vbIt != m_war3DrawTimeVBCache.end() &&
+            vbIt->second.MatchesKey(cacheKey) &&
+            vbIt->second.frameSerial == m_war3ShadowPersistentFrameSerial &&
+            vbIt->second.exactOwnerFrameSerial ==
+                m_war3ShadowPersistentFrameSerial;
+      };
   m_war3Scene.shadowStats.semanticSceneDirectSelectionLeaseActiveKeyCount =
       stickySelectionLease ? uint32_t(leasedSelectionKeys.size()) : 0u;
 
@@ -26542,6 +26573,33 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
   visiblePartLayerQueryCache.reset();
   snapshotOptions.visiblePartLayerQueryCache =
       &visiblePartLayerQueryCache;
+  dxvk::war3::render::CurrentDrawContractSnapshotOptions::SnapshotSummary
+      snapshotSummary = {};
+  snapshotOptions.summary = &snapshotSummary;
+  // Release DirectGrouped can discard an exact-owned canonical winner before
+  // copying its large value record. Observer builds and full pose traces keep
+  // the historical complete snapshot. The snapshot implementation applies the
+  // callback only after exact dedupe and bounded ordering, so this cannot
+  // revive a weaker duplicate or backfill across the original cap.
+  if constexpr (!dxvk::war3::render::kDevelopmentShadowObserversEnabled) {
+    if (useObjectGrouped && directRecordCap != 0u &&
+        snapshotOptions.maxRecords != 0u &&
+        !dxvk::war3::render::
+             ShadowPoseFullTraceFastEnabledForRenderThread()) {
+      using ExactOwnerPredicate =
+          decltype(currentFrameDrawTimeProducerOwnsRecord);
+      snapshotOptions.canonicalWinnerFilter.context =
+          &currentFrameDrawTimeProducerOwnsRecord;
+      snapshotOptions.canonicalWinnerFilter.keep =
+          [](const void* context,
+             const dxvk::war3::render::CurrentDrawContractRecord& record)
+                 noexcept {
+            const auto& exactOwner =
+                *static_cast<const ExactOwnerPredicate*>(context);
+            return !exactOwner(record);
+          };
+    }
+  }
   // Contract records are non-owning scalar values. Reuse only the vector
   // allocation on this render thread; the snapshot routine clears every
   // logical element and rebuilds all visibility/generation evidence before
@@ -26563,8 +26621,13 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     dxvk::war3::render::SnapshotPublishedCurrentDrawContracts(
         snapshotOptions, directRecords);
   }
-  dxvk::war3::render::NoteCurrentDrawSnapshotFrame(
-      directRecords, m_war3ShadowPersistentFrameSerial);
+  // A trace can be armed concurrently after the lock-free pre-snapshot probe.
+  // Never label a filtered vector as the complete upstream CurrentDraw set;
+  // skip that racing frame and the next frame will take the unfiltered route.
+  if (!snapshotSummary.canonicalWinnerFilterApplied) {
+    dxvk::war3::render::NoteCurrentDrawSnapshotFrame(
+        directRecords, m_war3ShadowPersistentFrameSerial);
+  }
   enterDirectDetailPhase("SnapshotDiagnostics");
   auto& visibleRegistry =
       dxvk::war3::render::VisibleRenderableRegistry::instance();
@@ -26629,7 +26692,14 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     stats.semanticSceneVisibleLookupMissCount =
         uint32_t(manifestSummary.visibleLookupMissCount);
   };
-  const uint32_t rawRecordCount = uint32_t(directRecords.size());
+  const uint32_t rawRecordCount = snapshotSummary.canonicalWinnerFilterApplied
+      ? snapshotSummary.canonicalWinnerCount
+      : uint32_t(directRecords.size());
+  if (snapshotSummary.canonicalWinnerFilterApplied) {
+    m_war3Scene.shadowStats
+        .drawTimeSemanticProducerOwnedDirectGroupedSkipCount +=
+        snapshotSummary.filteredCanonicalWinnerCount;
+  }
   // 诊断: raw 层
   m_war3Scene.shadowStats.semanticSceneDirectLastRawRecordCount = rawRecordCount;
   m_war3Scene.shadowStats.semanticSceneDirectCurrentDrawRecordCount +=
@@ -26642,43 +26712,15 @@ uint32_t D3D9DeviceEx::War3TryPopulateDirectCurrentDrawGrouped(
     m_war3Scene.shadowStats.semanticSceneDirectScanCapHitCount++;
   }
 
-  for (const auto& record : directRecords) {
-    if (record.layerIndex != 0u)
-      m_war3Scene.shadowStats
-          .semanticSceneDirectCurrentDrawLayerIndexNonZeroCount++;
-  }
-
-  const auto currentFrameDrawTimeProducerOwnsRecord =
-      [&](const dxvk::war3::render::CurrentDrawContractRecord& record) {
-        const int16_t effectiveProducerStage =
-            record.producerStage >= 0 ? record.producerStage : record.stage;
-        if (!War3DrawTimeCurrentFrameGeometryRuntime() ||
-            effectiveProducerStage != 11 || record.renderablePart == nullptr)
-          return false;
-        if (War3DrawTimeAnonymousMarkerRejectionActive(
-                record.renderablePart, record.meshPayloadPtr,
-                record.layerIndex))
-          return true;
-        if (!War3CurrentDrawContractNamesExactSlice(
-                record.renderablePart, record.layerIndex, record))
-          return false;
-
-        // Exact rejection and exact ownership use the same immutable key.
-        // Probe them together so SnapshotPreselect does not rebuild/hash the
-        // key and look up the current-frame cache twice for every Stage11
-        // record.
-        const War3DrawTimeVBCacheKey cacheKey = War3MakeDrawTimeVBCacheKey(
-            record.renderablePart, record.layerIndex, &record,
-            m_war3GpuSkinMapEpoch);
-        if (War3DrawTimeExactRejectedCurrentFrame(cacheKey))
-          return true;
-        const auto vbIt = m_war3DrawTimeVBCache.find(cacheKey);
-        return vbIt != m_war3DrawTimeVBCache.end() &&
-            vbIt->second.MatchesKey(cacheKey) &&
-            vbIt->second.frameSerial == m_war3ShadowPersistentFrameSerial &&
-            vbIt->second.exactOwnerFrameSerial ==
-                m_war3ShadowPersistentFrameSerial;
-      };
+  m_war3Scene.shadowStats
+      .semanticSceneDirectCurrentDrawLayerIndexNonZeroCount +=
+      snapshotSummary.canonicalWinnerFilterApplied
+      ? snapshotSummary.canonicalLayerNonZeroCount
+      : uint32_t(std::count_if(
+            directRecords.begin(), directRecords.end(),
+            [](const dxvk::war3::render::CurrentDrawContractRecord& record) {
+              return record.layerIndex != 0u;
+            }));
 
   struct DirectObjectCompletenessBucket {
     uint32_t observedParts = 0u;

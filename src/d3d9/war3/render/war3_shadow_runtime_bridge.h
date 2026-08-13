@@ -2448,6 +2448,9 @@ void NoteFinalShadowCasterFrame(
 void NoteCurrentDrawSnapshotFrame(
     const std::vector<CurrentDrawContractRecord>& records,
     uint64_t frameSerial);
+// Lock-free render-thread probe used to keep full CurrentDraw trace snapshots
+// byte-for-byte complete. It performs no trace initialization or I/O.
+bool ShadowPoseFullTraceFastEnabledForRenderThread() noexcept;
 void StartShadowPoseFullTrace(uint32_t maxSeconds = 15u,
                               bool includeMatrixBytes = false,
                               uint32_t maxPoseRecords = 0u,

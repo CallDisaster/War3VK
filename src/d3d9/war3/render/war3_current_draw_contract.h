@@ -382,6 +382,31 @@ struct CurrentDrawContractSnapshotOptions {
   // VisibleRenderable snapshot and is reset by its caller for every populate;
   // it never grants cross-frame identity or lifetime authority.
   VisibleRenderablePartLayerQueryCache* visiblePartLayerQueryCache = nullptr;
+  // The Release DirectGrouped path may reject a canonical winner that is
+  // already owned by the exact Stage11 producer. The callback is synchronous
+  // and non-owning: it runs only after exact part-slice dedupe and bounded
+  // ordering have selected the final winner. Rejecting a winner never revives
+  // a weaker duplicate or backfills a lower-priority record.
+  struct CanonicalWinnerFilter {
+    const void* context = nullptr;
+    bool (*keep)(const void* context,
+                 const CurrentDrawContractRecord& record) noexcept = nullptr;
+
+    inline bool valid() const noexcept {
+      return keep != nullptr;
+    }
+
+    inline bool accepts(const CurrentDrawContractRecord& record) const noexcept {
+      return keep == nullptr || keep(context, record);
+    }
+  } canonicalWinnerFilter;
+
+  struct SnapshotSummary {
+    uint32_t canonicalWinnerCount = 0u;
+    uint32_t filteredCanonicalWinnerCount = 0u;
+    uint32_t canonicalLayerNonZeroCount = 0u;
+    bool canonicalWinnerFilterApplied = false;
+  }* summary = nullptr;
 };
 
 struct CurrentDrawRetireResult {

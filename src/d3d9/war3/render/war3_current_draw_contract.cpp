@@ -2,6 +2,7 @@
 #include "war3_classified_counter.h"
 #include "war3_current_draw_group_slot_summary.h"
 #include "war3_current_draw_palette_hash.h"
+#include "war3_current_draw_winner_filter_policy.h"
 
 #include "../../d3d9_war3_debug.h"
 #include "../../d3d9_war3_hook.h"
@@ -3097,6 +3098,8 @@ void SnapshotPublishedCurrentDrawContracts(
     const CurrentDrawContractSnapshotOptions& options,
     std::vector<CurrentDrawContractRecord>& out) {
   out.clear();
+  if (options.summary != nullptr)
+    *options.summary = {};
   const bool traceSnapshot = CurrentDrawSnapshotBreakdownEnabled();
   const uint32_t snapshotTracePeriod = traceSnapshot
       ? CurrentDrawSnapshotTraceSamplePeriod()
@@ -3121,6 +3124,12 @@ void SnapshotPublishedCurrentDrawContracts(
   const bool batchedBoundedSnapshot = batchedBoundedSnapshotRequested &&
       !globalPublishEnabled &&
       localSnapshotUpperBound <= size_t(options.maxRecords);
+  // The deferred route retains only TLS slot indexes until canonical dedupe and
+  // ordering have finished. It is deliberately absent from profiler traces,
+  // global compatibility publication and the historical online top-K route.
+  const bool deferredCanonicalWinnerFilter =
+      batchedBoundedSnapshot && activeSlotSnapshot && !traceSnapshot &&
+      options.canonicalWinnerFilter.valid();
   std::array<uint64_t, kCurrentDrawSnapshotRecordPhaseCount>
       snapshotRecordPhaseTicks = {};
   std::array<uint32_t, kCurrentDrawSnapshotRecordPhaseCount>
@@ -3268,13 +3277,62 @@ void SnapshotPublishedCurrentDrawContracts(
                                    SnapshotStableIdentityKey(record));
   };
   const auto betterRecord = [&](const CurrentDrawContractRecord& a,
-                                const CurrentDrawContractRecord& b) {
+                                 const CurrentDrawContractRecord& b) {
     const bool pa = isPreferred(a);
     const bool pb = isPreferred(b);
     if (pa != pb)
       return pa;
     return BetterSnapshotRecord(a, b, options.unitsOnly);
   };
+  struct SnapshotSortKey {
+    bool preferred = false;
+    uint32_t priority = 0u;
+    uint64_t identity = 0u;
+    uint64_t part = 0u;
+    uint64_t visibleFrameSerial = 0u;
+    uint32_t renderFrameIndex = 0u;
+    uint64_t captureSerial = 0u;
+    size_t sourceIndex = 0u;
+  };
+  const auto makeSortKey = [&](const CurrentDrawContractRecord& record,
+                               size_t sourceIndex) {
+    const uint64_t identity = SnapshotStableIdentityKey(record);
+    return SnapshotSortKey{
+        isPreferredWithIdentity(record, identity),
+        SnapshotPriorityOf(record, options.unitsOnly),
+        identity,
+        SnapshotStablePartKey(record),
+        record.visibleFrameSerial,
+        record.renderFrameIndex,
+        record.captureSerial,
+        sourceIndex,
+    };
+  };
+  const auto sortKeyLess = [](const SnapshotSortKey& a,
+                              const SnapshotSortKey& b) {
+    if (a.preferred != b.preferred)
+      return a.preferred;
+    if (a.priority != b.priority)
+      return a.priority > b.priority;
+    if (a.identity != b.identity)
+      return a.identity < b.identity;
+    if (a.part != b.part)
+      return a.part < b.part;
+    if (a.visibleFrameSerial != b.visibleFrameSerial)
+      return a.visibleFrameSerial > b.visibleFrameSerial;
+    if (a.renderFrameIndex != b.renderFrameIndex)
+      return a.renderFrameIndex > b.renderFrameIndex;
+    if (a.captureSerial != b.captureSerial)
+      return a.captureSerial > b.captureSerial;
+    return a.sourceIndex < b.sourceIndex;
+  };
+  static thread_local std::vector<SnapshotSortKey> s_sortKeys;
+  // The cache is thread-local and the whole snapshot is synchronous, so an
+  // ascending slot index remains stable until this function returns. Retain
+  // only those scalar indexes; copying the large record here would recreate
+  // the very SnapshotPreselect cost this route removes.
+  static thread_local std::vector<size_t> s_deferredWinnerSlots;
+  s_deferredWinnerSlots.clear();
   // Unlimited and batched-bounded snapshots both need the same exact
   // part-slice dedupe semantics. A generation-tagged fixed index avoids the
   // per-snapshot unordered_map clear/node work and also removes the old
@@ -3328,6 +3386,17 @@ void SnapshotPublishedCurrentDrawContracts(
   };
   const auto findSnapshotDedupeLinear =
       [&](const CurrentDrawSnapshotPartKey& key) -> size_t {
+    if (deferredCanonicalWinnerFilter) {
+      const auto duplicate = std::find_if(
+          s_deferredWinnerSlots.begin(), s_deferredWinnerSlots.end(),
+          [&](size_t slot) {
+            return slot < g_currentDrawContractCache.size() &&
+                snapshotDedupeKey(g_currentDrawContractCache[slot]) == key;
+          });
+      return duplicate != s_deferredWinnerSlots.end()
+          ? size_t(std::distance(s_deferredWinnerSlots.begin(), duplicate))
+          : std::numeric_limits<size_t>::max();
+    }
     const auto duplicate = std::find_if(
         out.begin(), out.end(), [&](const CurrentDrawContractRecord& existing) {
           return snapshotDedupeKey(existing) == key;
@@ -3338,7 +3407,9 @@ void SnapshotPublishedCurrentDrawContracts(
   };
 
   enterSnapshotPhase("SnapshotRecordPolicySetup");
-  auto considerRecord = [&](const CurrentDrawContractRecord& record) {
+  const size_t invalidLocalSlot = std::numeric_limits<size_t>::max();
+  auto considerRecord = [&](const CurrentDrawContractRecord& record,
+                            size_t localSlot) {
     const bool traceRecord = traceActiveSlotRecords &&
         SampleCurrentDrawSnapshotRecord(snapshotTracePeriod);
     CurrentDrawSnapshotRecordRawTiming recordTiming(
@@ -3362,6 +3433,25 @@ void SnapshotPublishedCurrentDrawContracts(
       if (duplicateIndex == std::numeric_limits<size_t>::max() &&
           snapshotDedupeIndexOverflowed) {
         duplicateIndex = findSnapshotDedupeLinear(dedupeKey);
+      }
+      if (deferredCanonicalWinnerFilter) {
+        if (duplicateIndex < s_deferredWinnerSlots.size()) {
+          const size_t existingSlot = s_deferredWinnerSlots[duplicateIndex];
+          const auto& existing = g_currentDrawContractCache[existingSlot];
+          recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateCompare);
+          if (betterRecord(record, existing)) {
+            recordTiming.enter(CurrentDrawSnapshotRecordPhase::DuplicateReplace);
+            s_deferredWinnerSlots[duplicateIndex] = localSlot;
+          }
+          return;
+        }
+        recordTiming.enter(CurrentDrawSnapshotRecordPhase::IndexPublish);
+        if (!storeSnapshotDedupeIndex(dedupeKey,
+                                      s_deferredWinnerSlots.size()))
+          snapshotDedupeIndexOverflowed = true;
+        recordTiming.enter(CurrentDrawSnapshotRecordPhase::RecordAppend);
+        s_deferredWinnerSlots.push_back(localSlot);
+        return;
       }
       if (duplicateIndex < out.size()) {
         CurrentDrawContractRecord& existing = out[duplicateIndex];
@@ -3445,13 +3535,13 @@ void SnapshotPublishedCurrentDrawContracts(
         const uint32_t bitIndex = uint32_t(__builtin_ctzll(occupied));
         const size_t slot = (wordIndex << 6u) + bitIndex;
         if (slot < g_currentDrawContractCache.size())
-          considerRecord(g_currentDrawContractCache[slot]);
+          considerRecord(g_currentDrawContractCache[slot], slot);
         occupied &= occupied - 1u;
       }
     }
   } else {
-    for (const auto& record : g_currentDrawContractCache)
-      considerRecord(record);
+    for (size_t slot = 0u; slot < g_currentDrawContractCache.size(); ++slot)
+      considerRecord(g_currentDrawContractCache[slot], slot);
   }
   traceActiveSlotRecords = false;
 
@@ -3488,65 +3578,65 @@ void SnapshotPublishedCurrentDrawContracts(
         options.readyOnly ? g_publishedCurrentDrawReadyByPart
                           : g_publishedCurrentDrawByPart;
     for (const auto& [_, record] : source)
-      considerRecord(record);
+      considerRecord(record, invalidLocalSlot);
   }
 
   if (batchedBoundedSnapshot) {
     enterSnapshotPhase("SnapshotBatchedOrder");
+    if (deferredCanonicalWinnerFilter) {
+      s_sortKeys.clear();
+      s_sortKeys.reserve(s_deferredWinnerSlots.size());
+      for (size_t i = 0u; i < s_deferredWinnerSlots.size(); ++i) {
+        const size_t slot = s_deferredWinnerSlots[i];
+        s_sortKeys.push_back(
+            makeSortKey(g_currentDrawContractCache[slot], i));
+      }
+      std::sort(s_sortKeys.begin(), s_sortKeys.end(), sortKeyLess);
+
+      uint32_t canonicalLayerNonZeroCount = 0u;
+      const auto outcome = MaterializeCurrentDrawCanonicalWinnerPrefix(
+          s_sortKeys, size_t(options.maxRecords),
+          [&](const SnapshotSortKey& key)
+              -> const CurrentDrawContractRecord& {
+            return g_currentDrawContractCache[
+                s_deferredWinnerSlots[key.sourceIndex]];
+          },
+          [&](const CurrentDrawContractRecord& record) {
+            if (record.layerIndex != 0u)
+              canonicalLayerNonZeroCount++;
+          },
+          [&](const CurrentDrawContractRecord& record) {
+            return options.canonicalWinnerFilter.accepts(record);
+          },
+          [&](const CurrentDrawContractRecord& record) {
+            out.push_back(SnapshotRecordWithGrace(record));
+          });
+      if (options.summary != nullptr) {
+        options.summary->canonicalWinnerCount = outcome.canonicalWinnerCount;
+        options.summary->filteredCanonicalWinnerCount =
+            outcome.filteredWinnerCount;
+        options.summary->canonicalLayerNonZeroCount =
+            canonicalLayerNonZeroCount;
+        options.summary->canonicalWinnerFilterApplied = true;
+      }
+      enterSnapshotPhase("SnapshotFinalize");
+      return;
+    }
     if (out.size() > 1u) {
     // The old stable_sort comparator recomputed preferred membership,
     // priority and three stable hashes O(N log N) times. Decorate every
     // immutable snapshot record once, sort the compact keys, then copy records
     // in key order. sourceIndex is the final ascending tie-break, which is
     // exactly stable_sort's input-order rule for otherwise equivalent keys.
-    struct SnapshotSortKey {
-      bool preferred = false;
-      uint32_t priority = 0u;
-      uint64_t identity = 0u;
-      uint64_t part = 0u;
-      uint64_t visibleFrameSerial = 0u;
-      uint32_t renderFrameIndex = 0u;
-      uint64_t captureSerial = 0u;
-      size_t sourceIndex = 0u;
-    };
-    static thread_local std::vector<SnapshotSortKey> s_sortKeys;
     static thread_local std::vector<CurrentDrawContractRecord>
         s_sortedSnapshotScratch;
     s_sortKeys.clear();
     s_sortKeys.reserve(out.size());
     for (size_t i = 0u; i < out.size(); ++i) {
       const auto& record = out[i];
-      const uint64_t identity = SnapshotStableIdentityKey(record);
-      s_sortKeys.push_back({
-          isPreferredWithIdentity(record, identity),
-          SnapshotPriorityOf(record, options.unitsOnly),
-          identity,
-          SnapshotStablePartKey(record),
-          record.visibleFrameSerial,
-          record.renderFrameIndex,
-          record.captureSerial,
-          i,
-      });
+      s_sortKeys.push_back(makeSortKey(record, i));
     }
-    std::sort(
-        s_sortKeys.begin(), s_sortKeys.end(),
-        [](const SnapshotSortKey& a, const SnapshotSortKey& b) {
-          if (a.preferred != b.preferred)
-            return a.preferred;
-          if (a.priority != b.priority)
-            return a.priority > b.priority;
-          if (a.identity != b.identity)
-            return a.identity < b.identity;
-          if (a.part != b.part)
-            return a.part < b.part;
-          if (a.visibleFrameSerial != b.visibleFrameSerial)
-            return a.visibleFrameSerial > b.visibleFrameSerial;
-          if (a.renderFrameIndex != b.renderFrameIndex)
-            return a.renderFrameIndex > b.renderFrameIndex;
-          if (a.captureSerial != b.captureSerial)
-            return a.captureSerial > b.captureSerial;
-          return a.sourceIndex < b.sourceIndex;
-        });
+    std::sort(s_sortKeys.begin(), s_sortKeys.end(), sortKeyLess);
 
     s_sortedSnapshotScratch.clear();
     s_sortedSnapshotScratch.reserve(out.size());
@@ -3556,6 +3646,16 @@ void SnapshotPublishedCurrentDrawContracts(
     }
     if (out.size() > size_t(options.maxRecords))
       out.resize(size_t(options.maxRecords));
+  }
+
+  if (options.summary != nullptr) {
+    options.summary->canonicalWinnerCount = uint32_t(out.size());
+    options.summary->filteredCanonicalWinnerCount = 0u;
+    options.summary->canonicalLayerNonZeroCount = uint32_t(std::count_if(
+        out.begin(), out.end(), [](const CurrentDrawContractRecord& record) {
+          return record.layerIndex != 0u;
+        }));
+    options.summary->canonicalWinnerFilterApplied = false;
   }
 
   enterSnapshotPhase("SnapshotFinalize");

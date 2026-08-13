@@ -2898,6 +2898,10 @@ void MergeRenderObject(dxvk::War3ShadowSemanticContext& semantic,
 
 } // namespace
 
+bool ShadowPoseFullTraceFastEnabledForRenderThread() noexcept {
+  return ShadowPoseFullTraceFastEnabled();
+}
+
 SemanticAugmentTlsCacheStats QuerySemanticAugmentTlsCacheStats() noexcept {
   const auto& source = g_semanticAugmentTlsCacheStats;
   SemanticAugmentTlsCacheStats result = {};

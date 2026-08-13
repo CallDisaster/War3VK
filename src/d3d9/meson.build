@@ -392,6 +392,23 @@ test(
   timeout : 30,
 )
 
+# Exact-owner snapshot filtering is applied only to the already fixed canonical
+# prefix. A rejected winner never revives a weaker duplicate or backfills a
+# lower-priority record across the historical bound.
+war3_current_draw_winner_filter_policy_test = executable(
+  'war3_current_draw_winner_filter_policy_test',
+  [
+    'war3/render/tests/war3_current_draw_winner_filter_policy_test.cpp',
+  ],
+  include_directories : [ dxvk_include_path ],
+  install             : false,
+)
+test(
+  'war3_current_draw_winner_filter_policy',
+  war3_current_draw_winner_filter_policy_test,
+  timeout : 30,
+)
+
 # Immutable CurrentDraw group-slot aliases are accepted only when the packet's
 # retained generation-backed owner proves the exact pointer and full range.
 war3_immutable_group_slot_binding_test = executable(
