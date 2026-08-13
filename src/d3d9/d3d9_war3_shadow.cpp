@@ -3784,19 +3784,20 @@ bool War3ShadowReceiverPass::renderShadowMap(const Rc<DxvkCommandList> &ctx,
   reconciliation.skinnedPreparedCount = 0u;
   reconciliation.skinnedDrawnCount = 0u;
 
-  const std::vector<const War3ShadowCasterDraw*>* capturedReplayDrawsPtr =
-      replayDrawOverride;
-  if (capturedReplayDrawsPtr == nullptr) {
-    capturedReplayDrawsPtr =
-        &BuildShadowReplayDraws(input.scene, input.frameSerial);
-  }
   std::vector<War3ShadowCasterDraw> resolvedReplayStorage;
   std::vector<const War3ShadowCasterDraw*> resolvedReplayDraws;
-  ResolveWar3ShadowReplayDraws(
-      *capturedReplayDrawsPtr, input.frameSerial,
-      input.mapEpoch, input.deviceEpoch,
-      resolvedReplayStorage, resolvedReplayDraws);
-  const auto& replayDraws = resolvedReplayDraws;
+  const std::vector<const War3ShadowCasterDraw*>* replayDrawsPtr =
+      replayDrawOverride;
+  if (replayDrawsPtr == nullptr) {
+    const auto& capturedReplayDraws =
+        BuildShadowReplayDraws(input.scene, input.frameSerial);
+    ResolveWar3ShadowReplayDraws(
+        capturedReplayDraws, input.frameSerial,
+        input.mapEpoch, input.deviceEpoch,
+        resolvedReplayStorage, resolvedReplayDraws);
+    replayDrawsPtr = &resolvedReplayDraws;
+  }
+  const auto& replayDraws = *replayDrawsPtr;
   const uint32_t replayCasterCount = static_cast<uint32_t>(
       std::min<size_t>(replayDraws.size(),
                        std::numeric_limits<uint32_t>::max()));
@@ -7753,19 +7754,20 @@ void War3ShadowReceiverPass::renderPointShadow(
       input.settings ? input.settings.get() : &defaultSettings;
   const bool alphaShadowHashed = settings->shadows.alphaShadowHashed;
 
-  const std::vector<const War3ShadowCasterDraw *> *capturedReplayDrawsPtr =
-      replayDrawsOverride;
-  if (capturedReplayDrawsPtr == nullptr) {
-    capturedReplayDrawsPtr =
-        &BuildShadowReplayDraws(input.scene, input.frameSerial);
-  }
   std::vector<War3ShadowCasterDraw> resolvedReplayStorage;
   std::vector<const War3ShadowCasterDraw*> resolvedReplayDraws;
-  ResolveWar3ShadowReplayDraws(
-      *capturedReplayDrawsPtr, input.frameSerial,
-      input.mapEpoch, input.deviceEpoch,
-      resolvedReplayStorage, resolvedReplayDraws);
-  const auto &replayDraws = resolvedReplayDraws;
+  const std::vector<const War3ShadowCasterDraw*>* replayDrawsPtr =
+      replayDrawsOverride;
+  if (replayDrawsPtr == nullptr) {
+    const auto& capturedReplayDraws =
+        BuildShadowReplayDraws(input.scene, input.frameSerial);
+    ResolveWar3ShadowReplayDraws(
+        capturedReplayDraws, input.frameSerial,
+        input.mapEpoch, input.deviceEpoch,
+        resolvedReplayStorage, resolvedReplayDraws);
+    replayDrawsPtr = &resolvedReplayDraws;
+  }
+  const auto& replayDraws = *replayDrawsPtr;
   if (replayDraws.empty()) {
     invalidatePointShadowPublishedState();
     m_pointShadowCpuPlan.shouldRender = false;

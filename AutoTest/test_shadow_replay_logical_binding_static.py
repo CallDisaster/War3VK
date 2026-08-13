@@ -92,17 +92,38 @@ class ShadowReplayLogicalBindingStaticTest(unittest.TestCase):
         directional = function_body(
             SHADOW, "bool War3ShadowReceiverPass::renderShadowMap("
         )
-        self.assertLess(
-            directional.index("ResolveWar3ShadowReplayDraws("),
-            directional.index("validateShadowReplayDraws("),
-        )
         point = function_body(
             SHADOW, "void War3ShadowReceiverPass::renderPointShadow("
         )
-        self.assertLess(
-            point.index("ResolveWar3ShadowReplayDraws("),
-            point.index("validateShadowReplayDraws("),
+        for consumer in (directional, point):
+            fallback = function_body(consumer, "if (replayDrawsPtr == nullptr)")
+            build = fallback.index("BuildShadowReplayDraws(")
+            resolve = fallback.index("ResolveWar3ShadowReplayDraws(")
+            publish = fallback.index("replayDrawsPtr = &resolvedReplayDraws;")
+            self.assertLess(build, resolve)
+            self.assertLess(resolve, publish)
+            self.assertEqual(consumer.count("BuildShadowReplayDraws("), 1)
+            self.assertEqual(consumer.count("ResolveWar3ShadowReplayDraws("), 1)
+            outside_fallback = consumer.replace(fallback, "", 1)
+            self.assertNotIn("BuildShadowReplayDraws(", outside_fallback)
+            self.assertNotIn("ResolveWar3ShadowReplayDraws(", outside_fallback)
+            alias = consumer.index("const auto& replayDraws = *replayDrawsPtr;")
+            validate = consumer.index("validateShadowReplayDraws(", alias)
+            self.assertLess(alias, validate)
+
+        self.assertIn("renderShadowMap(ctx, input, &replayDraws)", run)
+        self.assertIn("renderVolumeSunShadow(ctx, input, &replayDraws)", run)
+        self.assertIn(
+            "renderPointShadow(ctx, input, pointLightSnapshot, &replayDraws)",
+            run,
         )
+
+        volume = function_body(
+            SHADOW, "bool War3ShadowReceiverPass::renderVolumeSunShadow("
+        )
+        self.assertIn("renderShadowMap(ctx, input, replayDraws)", volume)
+        self.assertNotIn("BuildShadowReplayDraws(", volume)
+        self.assertNotIn("ResolveWar3ShadowReplayDraws(", volume)
 
     def test_outline_resolves_before_validation(self):
         for signature in (
