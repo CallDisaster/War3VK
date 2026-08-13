@@ -7368,7 +7368,10 @@ def launch_war3_test(
 
     env = os.environ.copy()
     if auto_perf_record:
-        env.setdefault("DXVK_WAR3_PERF_HISTORY_FRAMES", "7200")
+        # FrameSnapshot retains dynamic section/timestamp arrays.  Keep the
+        # unattended x86 process below the production-side 4000-frame cap so
+        # long gates do not trade renderer stability for report history.
+        env.setdefault("DXVK_WAR3_PERF_HISTORY_FRAMES", "4000")
         if record_after_game_started:
             env["DXVK_WAR3_PERF_RECORD_AFTER_GAME_START"] = "1"
             env.pop("DXVK_WAR3_PERF_RECORD_ON_START", None)

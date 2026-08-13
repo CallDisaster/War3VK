@@ -1039,14 +1039,16 @@ War3PerfMonitor::War3PerfMonitor()
   if (!historyFrames.empty()) {
     const int frames = std::max(0, std::atoi(historyFrames.c_str()));
     if (frames > 0)
-      m_maxHistorySize = static_cast<size_t>(frames);
+      m_maxHistorySize =
+          ClampWar3PerfHistoryFrames(static_cast<size_t>(frames));
   } else {
     const std::string historySec = env::getEnvVar("DXVK_WAR3_PERF_HISTORY_SEC");
     if (!historySec.empty()) {
       const int sec = std::max(0, std::atoi(historySec.c_str()));
       if (sec > 0) {
         const int maxFrames = std::clamp(sec * 120, 600, 200000);
-        m_maxHistorySize = static_cast<size_t>(maxFrames);
+        m_maxHistorySize =
+            ClampWar3PerfHistoryFrames(static_cast<size_t>(maxFrames));
       }
     }
   }

@@ -8,6 +8,7 @@
 #include "../gpu_skin/war3_gpu_skin_native_bridge.h"
 #include "../render/war3_shadow_runtime_bridge.h"
 #include "war3_resource_residency_census.h"
+#include "war3_perf_history_policy.h"
 
 #include "../../dxvk/dxvk_cmdlist.h"
 #include "../../dxvk/dxvk_device.h"
@@ -503,7 +504,9 @@ public:
     // 获取统计
     const std::deque<FrameSnapshot>& getFrameHistory() const { return m_frameHistory; }
     size_t getMaxHistorySize() const { return m_maxHistorySize; }
-    void setMaxHistorySize(size_t size) { m_maxHistorySize = size; }
+    void setMaxHistorySize(size_t size) {
+      m_maxHistorySize = ClampWar3PerfHistoryFrames(size);
+    }
 
 private:
     War3PerfMonitor();
