@@ -31,5 +31,14 @@ for cache in caches:
     copy = cache.index("out = entry.value", generation)
     result = cache.index("return entry.found", copy)
     assert generation < copy < result
+    miss_reset = cache.index("out = {};", result)
+    observed = cache.index("&observedGeneration", miss_reset)
+    miss_return = cache.index("return found", observed)
+    miss = cache[miss_reset:miss_return]
+    assert " value = {}" not in miss
+    assert "out," in miss or "out, &observedGeneration" in miss
+    assert "out = value" not in miss
+    assert "observedGeneration" in miss and ", out" in miss
+    assert miss_reset < observed < miss_return
 
 print("direct snapshot cache single-copy static checks passed")

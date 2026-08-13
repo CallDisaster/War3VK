@@ -5866,18 +5866,17 @@ public:
     }
 
     uint64_t observedGeneration = 0u;
-    dxvk::war3::model::ModelInstanceDirectPacketView value = {};
+    out = {};
     const bool found = registry.findFirstForDirectPacketView(
-        sceneNode, unitPtr, worldObjectEntry, runtimeModelPtr, value,
+        sceneNode, unitPtr, worldObjectEntry, runtimeModelPtr, out,
         &observedGeneration);
     const uint64_t publishedGeneration = registry.mutationGeneration();
     if ((observedGeneration & 1u) == 0u &&
         observedGeneration == publishedGeneration) {
       m_entries[slot] = Entry{sceneNode, unitPtr, worldObjectEntry,
-                              runtimeModelPtr, observedGeneration, value,
+                              runtimeModelPtr, observedGeneration, out,
                               found};
     }
-    out = value;
     ++m_missCount;
     return found;
   }
@@ -5942,16 +5941,15 @@ public:
     }
 
     uint64_t observedGeneration = 0u;
-    dxvk::war3::model::PoseAugmentView value = {};
+    out = {};
     const bool found = registry.findFirstForDirectPacketAugment(
-        runtimeModelPtr, sceneNode, unitPtr, value, &observedGeneration);
+        runtimeModelPtr, sceneNode, unitPtr, out, &observedGeneration);
     const uint64_t publishedGeneration = registry.mutationGeneration();
     if ((observedGeneration & 1u) == 0u &&
         observedGeneration == publishedGeneration) {
       m_entries[slot] = Entry{runtimeModelPtr, sceneNode, unitPtr,
-                              observedGeneration, value, found};
+                              observedGeneration, out, found};
     }
-    out = value;
     ++m_missCount;
     return found;
   }
@@ -6017,19 +6015,18 @@ public:
     }
 
     uint64_t observedGeneration = 0u;
-    dxvk::war3::render::ShadowObjectAugmentView value = {};
+    out = {};
     const bool found = registry.findFirstForDirectPacketView(
         worldObjectEntry, sceneNode, jHandle, primaryRuntimeModelPtr,
-        secondaryRuntimeModelPtr, value, &observedGeneration);
+        secondaryRuntimeModelPtr, out, &observedGeneration);
     const uint64_t publishedGeneration = registry.mutationGeneration();
     if ((observedGeneration & 1u) == 0u &&
         observedGeneration == publishedGeneration) {
       m_entries[slot] = Entry{worldObjectEntry, sceneNode, jHandle,
                               primaryRuntimeModelPtr,
                               secondaryRuntimeModelPtr, observedGeneration,
-                              value, found};
+                              out, found};
     }
-    out = value;
     ++m_missCount;
     return found;
   }
